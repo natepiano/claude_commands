@@ -1,0 +1,11 @@
+- make a PR message for all the commits in the current branch in worktree folder $ARGUMENTS
+- **don't** include references to Claude in the message
+- STOP and validate the message
+- create the PR
+- STOP ask the user when it's been merged into main so that afterwards you can pull it into main
+- switch to the main worktree that you branched from - you'll have to discover this
+- do a `git pull`
+- STOP ask the user if they're done with the worktree branch
+- if they say no, then STOP
+- if they say yes, then `cd ..`
+- `git worktree remove $ARGUMENTS`

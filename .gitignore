@@ -1,0 +1,12 @@
+# Ignore everything
+*
+
+# But track these specific files/folders
+!commands/
+!commands/**
+!CLAUDE.md
+!settings.json
+!.gitignore
+
+# Still ignore .DS_Store files everywhere
+**/.DS_Store
