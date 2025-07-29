@@ -22,36 +22,45 @@ Optional: Plan document filename (e.g., plan-feature.md)
 </Steps>
 
 <SubagentInstructions>
-**CRITICAL: VERIFY WORKING DIRECTORY**
+**STEP 1: VERIFY WORKING DIRECTORY**
 - Current working directory: [REPLACE WITH ACTUAL pwd OUTPUT]
 - FIRST ACTION: Run `pwd` to confirm you're in the correct directory
 - If wrong directory, STOP and ask user to clarify
 
+**STEP 2: READ .todo.json**
+- MANDATORY: Read .todo.json file to understand all tasks
+- This file contains your work queue - you MUST follow it
+
 [IF $ARGUMENTS PROVIDED, ADD THIS SECTION:]
-**PLAN DOCUMENT**
+**STEP 3: READ PLAN DOCUMENT**
 - Read [PLAN_DOCUMENT_NAME] for implementation plan
 - Follow the plan's specifications and requirements
 
-**CRITICAL: TODO TRACKING (.todo.json)**
-- **UPDATE STATUS IMMEDIATELY** as you work: pending → in_progress → completed
-- Update the file BEFORE starting each task, DURING work, and AFTER completion
-- Use 'notes' field to document progress, blockers, and partial completion
-- Structure: [
-    {
-      "id": "string",
-      "content": "string",
-      "status": "pending|in_progress|completed",
-      "priority": "high|medium|low",
-      "notes": "string"
-    }
-  ]
+**STEP 4: BEGIN TODO WORKFLOW - NEVER SKIP THIS**
 
-**WORKFLOW:**
-1. Read .todo.json to understand current state
-2. Update task status to 'in_progress' BEFORE starting work
-3. Work on the task
-4. Update status to 'completed' IMMEDIATELY after finishing
-5. Move to next task and repeat
+**MANDATORY 3-STEP PROCESS FOR EVERY TASK:**
+
+**STEP A**: Update .todo.json - change task status from "pending" to "in_progress"
+**STEP B**: Do the actual work for that task  
+**STEP C**: Update .todo.json - change task status to "completed"
+
+**YOU CANNOT PROCEED TO STEP B WITHOUT COMPLETING STEP A**
+**YOU CANNOT MOVE TO NEXT TASK WITHOUT COMPLETING STEP C**
+
+**If you do ANY work without first updating .todo.json to "in_progress", you are violating instructions.**
+
+.todo.json structure:
+[
+  {
+    "id": "string",
+    "content": "string", 
+    "status": "pending|in_progress|completed",
+    "priority": "high|medium|low",
+    "notes": "string"
+  }
+]
+
+**REMINDER: If you work on ANY task without updating .todo.json status, you are failing to follow instructions.**
 
 TECH_DEBT.md usage:
 - Update when creating technical debt
@@ -59,16 +68,26 @@ TECH_DEBT.md usage:
 - Track identified duplication/complexity
 - **MANDATORY**: If you remove/disable code or write TODO due to complexity, document it in TECH_DEBT.md with the decision and reasoning
 
+**MANDATORY TODO UPDATE CHECKPOINTS:**
+- Before ANY work: Update .todo.json status to "in_progress"
+- After completing ANY task: Update .todo.json status to "completed"
+- When documenting progress: Update "notes" field in .todo.json
+- When encountering blockers: Update "notes" field with details
+
+**BEFORE YOU DO ANYTHING ELSE: Update the .todo.json file status for the task you're about to work on**
+
 When approaching context window limit:
-1. Update current todo with detailed notes about progress
+1. **UPDATE .todo.json**: Add detailed notes about progress to current task
 2. Save all work but DO NOT commit (except .todo.json updates)
 3. Tell main agent: "Context limit reached. Please task new subagent to continue from .todo.json"
 4. DO NOT delete .todo.json - next subagent needs it
 
 Continue working unless:
-- Context window nearly full → Request handoff to new subagent
-- Missing required information → Document in notes, request from main agent
-- User intervention needed → Explain issue, stop for user input
+- Context window nearly full → **UPDATE .todo.json FIRST**, then request handoff to new subagent  
+- Missing required information → **UPDATE .todo.json notes**, then request from main agent
+- User intervention needed → **UPDATE .todo.json notes**, then explain issue and stop
+
+**FINAL REMINDER: Every single task transition must involve updating .todo.json. If you complete any work without updating the file, you have failed.**
 
 </SubagentInstructions>
 
