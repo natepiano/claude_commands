@@ -21,14 +21,14 @@ Exception: Code you just added that you'll use immediately
 <ImplementationTodos>
 For each plan item, create paired todos:
 - [ ] Implement the specific feature/change from plan
-- [ ] Run `cargo build` and fix errors following <WarningRules>
+- [ ] Run `cargo build && cargo +nightly fmt` and fix errors following <WarningRules>
 
 Build Heuristic:
 - Build after changes that should compile independently (new functions, modules, types)
 - For breaking changes (API changes, renames, signature changes):
   - If few callers (1-3): Fix them together, then build
   - If many callers (4+): Fix ONE caller first, build to verify approach, then fix rest
-- Always build before moving to unrelated changes to catch errors early
+- Always `cargo build && cargo +nightly fmt` before moving to unrelated changes to catch errors early
 - When uncertain if approach will work: implement minimal case first and build
 
 After every 3-5 implementation items, add:
@@ -38,7 +38,6 @@ After every 3-5 implementation items, add:
 
 <ValidationTodos>
 After all implementation todos, add:
-- [ ] Run `cargo +nightly fmt`
 - [ ] Run `cargo nextest run`
 - [ ] STOP if test failures - review with user
 </ValidationTodos>

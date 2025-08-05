@@ -6,3 +6,4 @@
 - when i ask you to do a worktree always branch from main and do it this way:  `git pull && git worktree add -b {{new-feature}} ../{{new-feature}}`
 
 **IMPORTANT** don't mention Claude in commit messages
+**IMPORTANT** when running tests use `cargo nextest run`
