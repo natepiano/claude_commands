@@ -1,6 +1,6 @@
 # Actionable Design Review Command
 
-Use the Task tool with a general-purpose agent to conduct a comprehensive design review that produces **actionable recommendations for discussion**.
+Use the Task tool with a general-purpose agent to conduct a comprehensive design review that produces **actionable recommendations for discussion**. Be sure to instruct the agent to think hard about the items in the <ReviewScope/> .
 
 **CRITICAL**: After receiving the subagent's review, create a todo list for interactive review. Present each recommendation one at a time, STOPPING after each one for the user to decide whether to skip or implement it.
 
@@ -27,7 +27,7 @@ Brief overview of findings (2-3 sentences max)
 - **Rationale**: [Why this change improves the design]
 
 **IMPLEMENTATION-[ID]**: [Brief title of recommendation]
-- **Issue**: [Implementation gap or complexity issue]  
+- **Issue**: [Implementation gap or complexity issue]
 - **Recommendation**: [Specific implementation change]
 - **Files Affected**: [Exact file paths]
 - **Priority**: [High/Medium/Low]
@@ -72,9 +72,17 @@ Brief overview of findings (2-3 sentences max)
 
 ## Prompt Template
 ```
-Task a general-purpose subagent to review our implementation plan and provide actionable recommendations in the exact format specified above. 
+Task a general-purpose subagent to review [REVIEW TARGET: plan document, specific files, or focus area] and provide actionable recommendations in the exact format specified above.
 
-**CRITICAL FIRST PASS - TYPE SYSTEM VIOLATIONS**:
+**MANDATORY FIRST STEP - UNDERSTAND THE REVIEW SCOPE**:
+<ReviewScope>
+1. Carefully read and understand what you're reviewing (plan, files, or specific focus area)
+2. Note what is already present, implemented, or explicitly planned in the review scope
+3. DO NOT suggest things that are already part of what you're reviewing
+4. Focus on genuine gaps, improvements, and issues not already addressed
+</ReviewScope>
+
+**CRITICAL SECOND PASS - TYPE SYSTEM VIOLATIONS**:
 Before ANY other analysis, audit for type system misuse:
 - Every if-else chain checking type/kind/variant strings should be an enum with pattern matching
 - Every utility function should be questioned - why isn't this a method on a type?
@@ -85,24 +93,28 @@ Before ANY other analysis, audit for type system misuse:
 TREAT CONDITIONALS AS THE ENEMY. Each conditional is a missed opportunity to use the type system.
 
 Then proceed with standard analysis:
-1. Identifying specific gaps and missing components
+1. Identifying ACTUAL gaps and missing components (not things already present in the review scope)
 2. Finding breaking changes not explicitly called out
 3. Spotting over-engineering and unnecessary complexity
 4. Ensuring implementation order makes sense
-5. Creating concrete, discussable recommendations
+5. Creating concrete, discussable recommendations for improvements NOT already addressed
+
+**IMPORTANT FILTER**: Before including any recommendation, verify it's not already handled in what you're reviewing. Only suggest genuine improvements and additions.
 
 Return results in the structured format with TYPE-SYSTEM-*, DESIGN-*, IMPLEMENTATION-*, and SIMPLIFICATION-* categories. TYPE-SYSTEM recommendations should come FIRST and be treated as highest priority.
 
-Current plan to review: [path to plan-type-context.md]
+[INSERT REVIEW TARGET AND ANY CUSTOM INSTRUCTIONS HERE]
 ```
 
 ## Post-Review Instructions
 
 **IMPORTANT**: After the subagent returns the review:
-1. Create a todo list using TodoWrite with each recommendation as a separate todo item
-2. Present the FIRST recommendation and STOP
-3. Wait for user to decide: skip or implement
-4. If implement: update the plan immediately, then show next item
-5. If skip: mark complete and show next item
-6. STOP after each item for user decision
-7. Continue this process iteratively through all recommendations
+1. **FILTER STEP**: Review each recommendation and exclude any that are already addressed in the review scope (plan, files, or focus area being reviewed)
+2. Create a todo list using TodoWrite with ONLY the filtered recommendations as separate todo items
+3. If a recommendation seems redundant with what's already planned/implemented, skip it entirely
+4. Present the FIRST non-redundant recommendation and STOP
+5. Wait for user to decide: skip or implement
+6. If implement: update the plan/code immediately, then show next item
+7. If skip: mark complete and show next item
+8. STOP after each item for user decision
+9. Continue this process iteratively through all recommendations

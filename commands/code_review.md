@@ -2,6 +2,7 @@ For each area in the code base that has been defined for review, do the followin
 
 <CodeReview>
     - Task a subagent to do a review and provide it the following context
+    - it should think deeply about the code it is reviewing
     - it should examine just this area of the code base defined
     - it should focus on areas of complexity, duplication and code organization
     - it should provide a summary of the findings

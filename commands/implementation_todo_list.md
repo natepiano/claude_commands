@@ -1,5 +1,7 @@
 Create a todo list for this plan using your todo tool, then STOP.
 
+It is **CRITICAL** that you think deeply about the implementation according to the instructions given here so that you make the best possible implementation todo list.
+
 **CRITICAL DIRECTIVE**: If during implementation you need to structurally deviate from what the user asked for in the planning phase, you MUST immediately STOP and clarify with the user how to proceed. Do not continue with structural changes without explicit approval.
 
 **CRITICAL DIRECTIVE**: If you reach a context threshold, and are not complete, you must not stop. You must continue. If you are about to auto-compact, you must write out a file indicating what you need to know to continue correctly after the auto-compact. Unless you reach the condition above about structurally deviating from the plan and require guidance, under no other circumstance should you stop until finish the plan.

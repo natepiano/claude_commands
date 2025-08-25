@@ -29,12 +29,23 @@ Optional: Plan document filename (e.g., plan-*.md)
 
 2. Commit `.todo.json` if there are any other files uncommitted DO NOT COMMIT THEM
 3. Task subagent with the content between <SubagentInstructions> and </SubagentInstructions> tags AND the current plan/context needed to work effectively, including current working directory
-4. If the subagent returns before finishing, use <HandoffInstructions/> from below.
-5. Read updated `.todo.json` after completion
-6. Sync to TodoWrite tool
-7. Do the code review if instructed.
-8. Display final status
-9. Delete `.todo.json` ONLY if all tasks completed
+
+4. **MANDATORY AUTO-CONTINUATION**: When subagent returns:
+   a. Read `.todo.json` to check remaining tasks
+   b. If ANY tasks have status "pending" or "in_progress", IMMEDIATELY task another subagent:
+      - DO NOT stop to ask user about progress
+      - DO NOT treat context limits as a blocking issue
+      - Use <HandoffInstructions/> to continue seamlessly
+   c. ONLY stop the chain when:
+      - All tasks show "completed" status, OR
+      - Subagent reports actual blocking issue (test failures, missing critical info, explicit errors)
+   
+5. After ALL tasks completed:
+   a. Read final `.todo.json`
+   b. Sync to TodoWrite tool
+   c. Do code review if instructed
+   d. Display final status
+   e. Delete `.todo.json`
 </Instructions>
 
 
@@ -66,7 +77,16 @@ Following is the workflow that you must do:
 - Read for implementation plan and additional details.
 - Follow the plan's specifications and requirements
 
-**STEP 4: BEGIN TODO WORKFLOW - NEVER SKIP THIS**
+**STEP 4: THINK HARD ABOUT IMPLEMENTATION - CRITICAL**
+- Before starting ANY task, think deeply about:
+  - What the task is actually asking for
+  - The best approach to implement it correctly
+  - Edge cases and potential issues
+  - How it fits with the overall architecture
+- DO NOT rush into coding - proper planning prevents poor implementation
+- Consider multiple approaches and choose the best one
+
+**STEP 5: BEGIN TODO WORKFLOW - NEVER SKIP THIS**
 Follow instructions in <UpdateToodoJson/>
 
 **If you do ANY work without first updating .todo.json to "in_progress", you are violating instructions.**
@@ -86,17 +106,18 @@ TECH_DEBT.md usage:
 </TechDebtDocument>
 
 <ContextWindow>
-When approaching context window limit:
+When approaching context window limit (THIS IS NORMAL - NOT AN ERROR):
 1. **UPDATE .todo.json**: Add detailed notes about progress to current task
 2. Save all work but DO NOT commit (except .todo.json updates)
-3. Tell main agent: "Context limit reached. Please task new subagent to continue from .todo.json"
+3. Return to main agent with message: "Context limit reached - ready for handoff to continue from .todo.json"
 4. DO NOT delete .todo.json - next subagent needs it
+5. Main agent will automatically continue with fresh subagent - this is expected behavior
 </ContextWindow>
 
 Continue working unless:
-- Context window nearly full → **UPDATE .todo.json FIRST**, then request handoff to new subagent as described in <ContextWindow/>
-- Missing required information → **UPDATE .todo.json notes**, then STOP and request from main agent
-- User intervention needed → **UPDATE .todo.json notes**, then STOP and explain issue to the main agent
+- Context window nearly full → **UPDATE .todo.json FIRST**, then return for handoff as described in <ContextWindow/> (main agent will auto-continue)
+- Missing required information → **UPDATE .todo.json notes**, then STOP and request from main agent (blocking issue)
+- User intervention needed → **UPDATE .todo.json notes**, then STOP and explain issue to main agent (blocking issue)
 
 **FINAL REMINDERS**:
 - Every single task transition must involve updating .todo.json. If you complete any work without updating the file, you have failed.
@@ -108,9 +129,11 @@ Continue working unless:
 The following are main agent instructions in the case of a hand off:
 
 <HandoffInstructions>
-Optional: When tasking continuation subagent:
-- Use subagent with the content between <SubagentInstructions> and </SubagentInstructions> tags AND the current plan/context needed to work effectively, including current working directory
+REQUIRED procedure when continuing (subagent returned with tasks remaining):
+- Task new subagent with content between <SubagentInstructions> and </SubagentInstructions> tags
+- Include same plan/context and current working directory
 - Add: "Continue from existing .todo.json - do not create new one"
 - Emphasize: Read .todo.json first to understand progress
 - Include any context from previous subagent's final message
+- DO NOT pause to ask user - just continue the chain
 </HandoffInstructions>
