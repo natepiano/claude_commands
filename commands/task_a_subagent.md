@@ -93,6 +93,23 @@ Follow instructions in <UpdateToodoJson/>
 
 **REMINDER: If you work on ANY task without updating .todo.json status, you are failing to follow instructions.**
 
+**STEP 6: BUILD AND ASSESS WARNINGS - MANDATORY AFTER IMPLEMENTATION**
+After completing implementation tasks (but before marking final task complete):
+1. Run `cargo build 2>&1 | grep -E "warning:|error:"` to check for warnings
+2. For each warning, determine:
+   - **Option 1: Code not yet implemented** - Warning indicates missing implementation that's needed
+     → **UPDATE .todo.json**: Add new tasks with "pending" status for each missing implementation
+     → Mark current task complete with notes about warnings found
+     → Continue implementing these new tasks immediately following the standard workflow
+   - **Option 2: Dead code that will never be used** - Warning is for code that won't be utilized
+     → Remove the dead code immediately before proceeding
+     → Do NOT add to .todo.json - just fix it now
+3. Examples:
+   - "field `bar` is never read" → Check if this field should be used somewhere in the code (Option 1) or if it's truly unnecessary (Option 2)
+   - "function `foo` is never used" → Determine if it should be called somewhere (Option 1) or deleted (Option 2)
+4. After addressing all warnings, run build again to confirm clean compilation
+5. Only mark implementation complete when build has no relevant warnings
+
 The following <TechDebtDocument/>, <ContextWindow/> and <HandoffInstructions/> sections are only to be followed if the situation they describe is occurring.
 
 </Workflow>

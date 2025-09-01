@@ -1,6 +1,15 @@
 # Actionable Design Review Command
 
-Use the Task tool with a general-purpose agent to conduct a comprehensive design review that produces **actionable recommendations for discussion**. Be sure to instruct the agent to think hard about the items in the <ReviewScope/> .
+## Arguments
+If `$ARGUMENTS` is provided, it should be the name of a `plan*.md` file in the project root that will be the target of the design review. For example:
+- `plan_enum_generation.md`
+- `plan_mutation_system.md`
+- `plan_api_redesign.md`
+
+If no arguments are provided, the design review will target the plan markdown document currently being worked on.
+
+## Overview
+Use the Task tool with a general-purpose agent to conduct a comprehensive design review that produces **actionable recommendations for discussion**. Be sure to instruct the agent to think hard about the items in the <ReviewScope/>. The primary goal is to edit the plan markdown file being reviewed with approved suggestions and track skipped items.
 
 **CRITICAL**: After receiving the subagent's review, create a todo list for interactive review. Present each recommendation one at a time, STOPPING after each one for the user to decide whether to skip or implement it.
 
@@ -21,10 +30,18 @@ Brief overview of findings (2-3 sentences max)
 
 **DESIGN-[ID]**: [Brief title of recommendation]
 - **Issue**: [What specific problem this addresses]
-- **Recommendation**: [Specific action to take]
-- **Files Affected**: [Exact file paths if applicable]
+- **Recommendation**: [Specific action to take - include where in the plan document to add/edit]
+- **Files Affected**: [Plan document section and/or code file paths]
 - **Priority**: [High/Medium/Low]
 - **Rationale**: [Why this change improves the design]
+- **Implementation Proposal**:
+  ```rust
+  // Current:
+  [Show actual current code from the file]
+  
+  // Proposed:
+  [Show exactly what the code should look like after the change]
+  ```
 
 **IMPLEMENTATION-[ID]**: [Brief title of recommendation]
 - **Issue**: [Implementation gap or complexity issue]
@@ -32,6 +49,14 @@ Brief overview of findings (2-3 sentences max)
 - **Files Affected**: [Exact file paths]
 - **Priority**: [High/Medium/Low]
 - **Dependencies**: [What must be done first, if anything]
+- **Implementation Proposal**:
+  ```rust
+  // Current:
+  [Show actual current code from the file, or "// Missing implementation" if gap]
+  
+  // Proposed:
+  [Show exactly what the code should look like after the change]
+  ```
 
 **SIMPLIFICATION-[ID]**: [Brief title of recommendation]
 - **Issue**: [Over-engineered or complex area]
@@ -39,6 +64,14 @@ Brief overview of findings (2-3 sentences max)
 - **Files Affected**: [Exact file paths]
 - **Priority**: [High/Medium/Low]
 - **Benefits**: [What this simplification achieves]
+- **Implementation Proposal**:
+  ```rust
+  // Current:
+  [Show actual current complex code from the file]
+  
+  // Proposed:
+  [Show simplified version that preserves functionality]
+  ```
 
 **TYPE-SYSTEM-[ID]**: [Brief title - e.g., "Replace conditional chain with enum"]
 - **Issue**: [Specific conditional or function that violates type system principles]
@@ -46,7 +79,14 @@ Brief overview of findings (2-3 sentences max)
 - **Proposed Type Design**: [Specific enum/trait/struct to introduce]
 - **Files Affected**: [Exact file paths]
 - **Priority**: [High - these are ALWAYS high priority]
-- **Example**: [Small code snippet showing the type-driven approach]
+- **Implementation Proposal**:
+  ```rust
+  // Current:
+  [Show actual current conditional/stringly-typed code from the file]
+  
+  // Proposed:
+  [Show the type-driven approach with enums/pattern matching]
+  ```
 
 ## Analysis Requirements
 
@@ -72,17 +112,31 @@ Brief overview of findings (2-3 sentences max)
 
 ## Prompt Template
 ```
-Task a general-purpose subagent to review [REVIEW TARGET: plan document, specific files, or focus area] and provide actionable recommendations in the exact format specified above.
+Task a general-purpose subagent to review [REVIEW TARGET: plan markdown document (default), specific files, or focus area] and provide actionable recommendations in the exact format specified above.
 
-**MANDATORY FIRST STEP - UNDERSTAND THE REVIEW SCOPE**:
+**TARGET SELECTION**: 
+- If `$ARGUMENTS` is provided, review the specified `plan*.md` file in the project root
+- If no arguments are provided, review the plan markdown document currently being worked on
+- Include specific section names where edits should be made in the target document
+
+**MANDATORY FIRST STEP - CHECK SKIP NOTES**:
+<SkipNotesCheck>
+1. **IMMEDIATELY** look for a "Design Review Skip Notes" section in the document
+2. **READ AND MEMORIZE** all skipped items - these are OFF LIMITS
+3. **PAY SPECIAL ATTENTION** to items marked with "⚠️ PREJUDICE WARNING" - suggesting these again is a CRITICAL FAILURE
+4. **DO NOT PROCEED** until you have confirmed what has been previously skipped
+</SkipNotesCheck>
+
+**MANDATORY SECOND STEP - UNDERSTAND THE REVIEW SCOPE**:
 <ReviewScope>
 1. Carefully read and understand what you're reviewing (plan, files, or specific focus area)
 2. Note what is already present, implemented, or explicitly planned in the review scope
 3. DO NOT suggest things that are already part of what you're reviewing
-4. Focus on genuine gaps, improvements, and issues not already addressed
+4. DO NOT suggest anything that appears in the Skip Notes section
+5. Focus on genuine gaps, improvements, and issues not already addressed
 </ReviewScope>
 
-**CRITICAL SECOND PASS - TYPE SYSTEM VIOLATIONS**:
+**CRITICAL THIRD PASS - TYPE SYSTEM VIOLATIONS**:
 Before ANY other analysis, audit for type system misuse:
 - Every if-else chain checking type/kind/variant strings should be an enum with pattern matching
 - Every utility function should be questioned - why isn't this a method on a type?
@@ -99,22 +153,188 @@ Then proceed with standard analysis:
 4. Ensuring implementation order makes sense
 5. Creating concrete, discussable recommendations for improvements NOT already addressed
 
-**IMPORTANT FILTER**: Before including any recommendation, verify it's not already handled in what you're reviewing. Only suggest genuine improvements and additions.
+**IMPORTANT FILTER**: Before including any recommendation:
+1. **FIRST**: Verify it's not in the Skip Notes section (especially ⚠️ PREJUDICE WARNING items)
+2. **SECOND**: Verify it's not already handled in what you're reviewing
+3. **THIRD**: Only suggest genuine improvements and additions NOT already addressed
+
+**CRITICAL**: Suggesting something from the Skip Notes section, especially items with ⚠️ PREJUDICE WARNING, constitutes a review failure and wastes everyone's time.
 
 Return results in the structured format with TYPE-SYSTEM-*, DESIGN-*, IMPLEMENTATION-*, and SIMPLIFICATION-* categories. TYPE-SYSTEM recommendations should come FIRST and be treated as highest priority.
+
+**CRITICAL - IMPLEMENTATION PROPOSALS REQUIRED**: For each recommendation, you MUST include an "Implementation Proposal" section with concrete code examples:
+- **Current**: Show the actual existing code from the relevant files (read the files to get real code)
+- **Proposed**: Show exactly what the code should look like after implementing the recommendation
+- Use proper syntax highlighting with ```rust code blocks
+- For implementation gaps, use "// Missing implementation" in the Current section
+- Make the code examples specific and actionable, not pseudo-code
+
+For each recommendation, specify the exact location in the plan document where it should be added or edited (e.g., "Add to Section 3.2 Implementation Details" or "Edit the API Design section").
 
 [INSERT REVIEW TARGET AND ANY CUSTOM INSTRUCTIONS HERE]
 ```
 
-## Post-Review Instructions
+## Post-Review Instructions - Keyword-Driven Implementation Process
 
-**IMPORTANT**: After the subagent returns the review:
-1. **FILTER STEP**: Review each recommendation and exclude any that are already addressed in the review scope (plan, files, or focus area being reviewed)
+**CRITICAL**: After the subagent returns the review, use ONLY these four keywords for user decisions:
+
+### Initial Review Summary (MANDATORY)
+After receiving the subagent's review and filtering:
+
+1. **Present Summary Statistics**:
+   ```
+   Design Review Summary:
+   - Total recommendations found: [X]
+   - Already addressed (filtered): [Y]
+   - Recommendations to review: [Z]
+   ```
+
+2. **Present Recommendation Overview Table**:
+   ```
+   | ID | Priority | Category | Brief Description |
+   |----|----------|----------|------------------|
+   | TYPE-SYSTEM-1 | High | Type System | Replace conditional chain with enum for X |
+   | DESIGN-1 | Medium | Design | Add missing error handling for Y |
+   | IMPLEMENTATION-1 | Low | Implementation | Consolidate duplicate logic in Z |
+   | SIMPLIFICATION-1 | Medium | Simplification | Remove unnecessary abstraction layer |
+   ```
+
+3. **Transition Statement**:
+   "Let's review each recommendation. I'll present them one at a time for your decision."
+
+### Keyword Decision Process
+1. **FILTER STEP**: Review each recommendation and exclude any that are already addressed in the review scope
 2. Create a todo list using TodoWrite with ONLY the filtered recommendations as separate todo items
-3. If a recommendation seems redundant with what's already planned/implemented, skip it entirely
-4. Present the FIRST non-redundant recommendation and STOP
-5. Wait for user to decide: skip or implement
-6. If implement: update the plan/code immediately, then show next item
-7. If skip: mark complete and show next item
-8. STOP after each item for user decision
-9. Continue this process iteratively through all recommendations
+3. After presenting the summary and table above, present the FIRST recommendation and STOP
+4. **MANDATORY**: Wait for user to respond with EXACTLY one of these keywords:
+   - **"agree"** - Approve and integrate the recommendation into the plan
+   - **"skip"** - Reject and document the recommendation  
+   - **"investigate"** - Deep dive analysis to validate the recommendation's value
+   - **"skip with prejudice"** - Permanently reject with strong warning against future suggestions
+
+### Keyword Response Actions
+
+**When user responds "agree"**:
+1. **UPDATE PLAN DOCUMENT ONLY**: Add a new dedicated section for the agreed recommendation with:
+   - Full implementation details from the recommendation
+   - Specific code changes required (to be implemented later)
+   - File paths and line numbers to modify (for future reference)
+   - Step-by-step implementation instructions (for when implementation begins)
+   - Integration points with existing plan sections
+2. **CROSS-REFERENCE**: Add references between the new plan section and existing implementation phases
+3. **Mark current todo as completed**
+4. Present next recommendation and STOP
+
+**When user responds "skip"**:
+1. **UPDATE SKIP NOTES**: Add/update "Design Review Skip Notes" section in the plan document using this EXACT format:
+   ```markdown
+   ## Design Review Skip Notes
+   
+   ### [RECOMMENDATION-ID]: [Title]
+   - **Status**: SKIPPED
+   - **Category**: [TYPE-SYSTEM/DESIGN/IMPLEMENTATION/SIMPLIFICATION]
+   - **Description**: [Brief description of what was skipped]
+   - **Reason**: User decision - not needed for current implementation
+   ```
+2. **Mark current todo as completed**
+3. Present next recommendation and STOP
+
+**When user responds "skip with prejudice"**:
+1. **UPDATE SKIP NOTES WITH PREJUDICE FLAG**: 
+   - If this recommendation was already skipped, APPEND prejudice warning to existing entry
+   - If new, add full entry to "Design Review Skip Notes" section
+   
+   For existing skipped entry, append:
+   ```markdown
+   - **⚠️ PREJUDICE WARNING**: PERMANENTLY REJECTED
+   - **Critical Note**: DO NOT SUGGEST THIS AGAIN - Reviewer repeatedly suggested this despite prior rejections
+   ```
+   
+   For new entry, use full format:
+   ```markdown
+   ## Design Review Skip Notes
+   
+   ### ⚠️ PREJUDICE WARNING - [RECOMMENDATION-ID]: [Title]
+   - **Status**: PERMANENTLY REJECTED
+   - **Category**: [TYPE-SYSTEM/DESIGN/IMPLEMENTATION/SIMPLIFICATION]
+   - **Description**: [Brief description of what was skipped]
+   - **Reason**: Reviewer repeatedly suggested this despite prior rejections
+   - **Critical Note**: DO NOT SUGGEST THIS AGAIN - This recommendation has been permanently rejected due to reviewer repetition
+   ```
+2. **Mark current todo as completed**
+3. Present next recommendation and STOP
+
+**When user responds "investigate"**:
+1. **TASK INVESTIGATION AGENT**: Use Task tool to deep-dive investigate the recommendation with a general-purpose agent acting as a **responsible judge balancing aesthetics and utility**:
+   - **CRITICAL JUDGMENT MANDATE**: Act as a responsible engineering judge who values both code elegance AND practical utility
+   - **Balance aesthetics vs pragmatism**: Weigh the beauty of clean abstractions against real-world implementation costs
+   - **Provide sound engineering judgment**: Consider maintenance burden, team cognitive load, and actual business value
+   - **Analyze whether the recommendation provides genuine value vs over-engineering**: Be skeptical of complexity for complexity's sake
+   - **Research alternative approaches and trade-offs**: Find the sweet spot between perfectionism and pragmatism
+   - **Examine real-world impact and complexity costs**: Consider developer time, debugging difficulty, and onboarding friction
+   - **Check if simpler solutions exist that achieve the same goals**: Sometimes "good enough" is better than perfect
+   - **Provide evidence-based assessment of necessity**: Ground your judgment in concrete examples and real scenarios
+2. **PRESENT INVESTIGATION FINDINGS**: Return with:
+   - **Value Assessment**: Clear judgment on whether this is worth implementing
+   - **Alternative Approaches**: If multiple valid approaches exist, present 2-3 options with trade-offs
+   - **Complexity Analysis**: Honest assessment of implementation and maintenance costs
+   - **Recommendation**: Updated recommendation based on investigation
+3. **WAIT FOR NEW KEYWORD**: Present findings and wait for user to respond with "agree", "skip", or "skip with prejudice" (no longer "investigate")
+
+### Keyword Enforcement Rules
+- **NO OTHER RESPONSES ACCEPTED**: Only "agree", "skip", "investigate", or "skip with prejudice" keywords trigger actions
+- **MANDATORY STOPPING**: ALWAYS stop after each recommendation presentation
+- **NO ASSUMPTIONS**: Never assume user intent - wait for explicit keyword
+- **NO BATCHING**: Process exactly one recommendation per user keyword response
+- **INVESTIGATE LIMITATION**: "investigate" keyword only available on first presentation of a recommendation - after investigation, only "agree", "skip", or "skip with prejudice" are accepted
+
+### Plan Update Template for "agree" Keyword
+
+When user says "agree" for a recommendation, add this new section to the plan document (NOTE: No code changes are made during design review - only plan updates):
+
+```markdown
+## DESIGN REVIEW AGREEMENT: [RECOMMENDATION-ID] - [Title]
+
+**Plan Status**: ✅ APPROVED - Ready for future implementation
+
+### Problem Addressed
+[Copy the "Issue" field from the recommendation]
+
+### Solution Overview  
+[Copy the "Proposed Type Design" or "Recommendation" field]
+
+### Required Code Changes
+
+#### Files to Modify:
+[List each file path with specific changes]
+
+**File**: `/path/to/file.rs`
+- **Lines to change**: [specific line numbers]  
+- **Current code pattern**: 
+```rust
+[exact current code from recommendation]
+```
+- **New code implementation**:
+```rust  
+[exact proposed code from recommendation]
+```
+
+### Integration with Existing Plan
+- **Phase dependency**: This change should be implemented during [specific phase]
+- **Prerequisites**: [Any dependencies on other recommendations]
+- **Impact on existing sections**: [How this affects other parts of the plan]
+
+### Implementation Priority: [High/Medium/Low from recommendation]
+
+### Verification Steps
+1. Compile successfully after changes
+2. Run existing tests
+3. [Any specific validation steps]
+
+---
+**Design Review Decision**: Approved for inclusion in plan on [current date]
+**Next Steps**: Code changes will be implemented in a future development phase
+```
+
+## Default Review Target
+**DEFAULT**: When not specified otherwise, the design reviewer should review and edit the plan markdown file currently being worked on. The subagent should be instructed to review this document and provide recommendations for improving it.
