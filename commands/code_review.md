@@ -89,19 +89,13 @@ Brief overview of the changes reviewed (1-2 sentences max)
 
 ## Analysis Requirements
 
-### Type System Architecture (MANDATORY FIRST ANALYSIS)
-1. **Conditional Audit**: Flag string-based conditionals that could be replaced with enums (NOT string accessors on typed data)
-2. **Error Handling**: Check for proper Result/Option usage vs bare `.unwrap()` (NOT `unwrap_or` or `unwrap_or_else`)
-3. **String Typing**: Identify stringly-typed APIs that need proper types (NOT strings already in type-safe wrappers)
-4. **State Machines**: Find boolean flags that should be state enums
-5. **Method vs Function**: Flag utility functions that should be methods
+**CRITICAL**: Read and follow `~/.claude/commands/shared/keyword_review_pattern.txt` section `<TypeSystemDesignPrinciples>` for comprehensive analysis guidance.
 
-### Standard Analysis
+### Code Review Specific Analysis
+Beyond the shared principles, also analyze:
 1. **Code Quality**: Naming, formatting, idioms, best practices
-2. **Complexity**: Nested conditionals, long functions, unclear logic
-3. **Duplication**: Copy-pasted code, similar patterns
-4. **Error Handling**: Missing contexts, unclear error messages
-5. **Documentation**: Missing or incorrect comments for complex logic
+2. **Documentation**: Missing or incorrect comments for complex logic
+3. **Test Coverage**: Areas that need better test coverage
 
 ## Prompt Template
 ```
@@ -117,18 +111,7 @@ Task a general-purpose subagent to review [REVIEW TARGET: git diff or specific f
 - If arguments provided: Use Read tool to examine all code in specified files/directories
 
 **CRITICAL SECOND STEP - TYPE SYSTEM VIOLATIONS**:
-Before ANY other analysis, audit the code for type system misuse:
-- Every if-else chain checking strings should be an enum with pattern matching
-- Every utility function should be questioned - why isn't this a method?
-- Every boolean flag tracking state should be part of a state enum
-- Every stringly-typed parameter should use proper types
-- ONLY bare .unwrap() calls should be flagged - unwrap_or() and unwrap_or_else() are acceptable
-
-TREAT STRING-BASED CONDITIONALS AS CODE SMELL: Flag string equality checks against known constants that could be enums. Do NOT flag:
-- String accessor methods on typed data (e.g., enum.name())  
-- String data already contained in type-safe structures
-- Format validation patterns (email, URL parsing, etc.)
-- Arbitrary text processing where enums don't make sense
+Follow `<TypeSystemDesignPrinciples>` from the shared pattern file exactly. This includes all primary type system violations, error handling standards, and what NOT to flag.
 
 Then proceed with standard analysis:
 1. Identifying code quality issues in the code

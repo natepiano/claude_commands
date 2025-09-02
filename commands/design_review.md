@@ -91,20 +91,10 @@ Brief overview of findings (2-3 sentences max)
 
 ## Analysis Requirements
 
-### Type System Architecture (MANDATORY FIRST ANALYSIS)
-1. **Conditional Audit**: Every if-else chain is a design failure. Flag ALL conditionals that could be:
-   - Replaced with enum variants and pattern matching
-   - Eliminated through trait implementations
-   - Removed by making illegal states unrepresentable
-2. **Function Audit**: Every standalone utility function is suspect. Flag functions that should be:
-   - Methods on a type that owns the behavior
-   - Trait implementations for polymorphic behavior
-   - Eliminated by better type design
-3. **String Typing**: Every string that represents a finite set of values should be an enum
-4. **State Machines**: Any code tracking state with booleans/strings should use state enums
-5. **Builder Pattern**: Complex construction logic should use builders, not functions with many parameters
+**CRITICAL**: Read and follow `~/.claude/commands/shared/keyword_review_pattern.txt` section `<TypeSystemDesignPrinciples>` for comprehensive analysis guidance.
 
-### Standard Analysis
+### Design Review Specific Analysis
+Beyond the shared principles, also analyze:
 1. **Gap Analysis**: Missing components, unclear specifications
 2. **Breaking Changes**: API changes, signature modifications, structural changes
 3. **Over-engineering**: Unnecessary complexity that can be simplified
@@ -138,15 +128,8 @@ Task a general-purpose subagent to review [REVIEW TARGET: plan markdown document
 5. Focus on genuine gaps, improvements, and issues not already addressed
 </ReviewScope>
 
-**CRITICAL THIRD PASS - TYPE SYSTEM VIOLATIONS**:
-Before ANY other analysis, audit for type system misuse:
-- Every if-else chain checking type/kind/variant strings should be an enum with pattern matching
-- Every utility function should be questioned - why isn't this a method on a type?
-- Every boolean flag tracking state should be part of a state enum
-- Every stringly-typed API should use proper types
-- Every deeply nested conditional is a failure to model the domain
-
-TREAT CONDITIONALS AS THE ENEMY. Each conditional is a missed opportunity to use the type system.
+**CRITICAL THIRD STEP - TYPE SYSTEM VIOLATIONS**:
+Follow `<TypeSystemDesignPrinciples>` from the shared pattern file exactly. This includes all primary type system violations, error handling standards, and analysis priority order.
 
 Then proceed with standard analysis:
 1. Identifying ACTUAL gaps and missing components (not things already present in the review scope)

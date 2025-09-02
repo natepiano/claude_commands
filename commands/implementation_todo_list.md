@@ -1,5 +1,12 @@
 Create a todo list for this plan using your todo tool, then STOP.
 
+<PlanDocumentEvaluation>
+If the user is working on a plan document:
+- Check if the plan document is checked into git
+- If it is not checked in, create an appropriate commit message for it and check it in
+- This ensures the plan is preserved before implementation begins
+</PlanDocumentEvaluation>
+
 It is **CRITICAL** that you think deeply about the implementation according to the instructions given here so that you make the best possible implementation todo list.
 
 **CRITICAL DIRECTIVE**: If during implementation you need to structurally deviate from what the user asked for in the planning phase, you MUST immediately STOP and clarify with the user how to proceed. Do not continue with structural changes without explicit approval.
@@ -51,5 +58,11 @@ Final todos:
   - Use the plan document that was basis for implementation
   - Review discrepancies between plan and actual implementation
 </ReviewTodos>
+
+<PlanDocumentCleanup>
+If there is a plan document being worked on:
+- [ ] Ask the user if it is okay to remove the plan document
+- [ ] If approved, delete the plan document file and run `git rm` on it
+</PlanDocumentCleanup>
 
 IMPORTANT: After creating the todo list, STOP. Do not begin implementation.

@@ -271,6 +271,91 @@ Some reviews have more complex verdict structures:
 Each verdict type should have appropriate keyword options that make semantic sense.
 </SpecialCaseHandling>
 
+<TypeSystemDesignPrinciples>
+## Type System Design Principles (Shared)
+
+These principles form the foundation for design and code reviews focused on type-driven development:
+
+### Primary Type System Violations (ALWAYS High Priority)
+
+1. **Conditional Audit**: Every if-else chain is a design failure
+   - String-based conditionals that could be replaced with enums and pattern matching
+   - Boolean flags tracking state that should use state enums
+   - Deeply nested conditionals indicating failure to model the domain properly
+   - TREAT CONDITIONALS AS THE ENEMY - each one is a missed opportunity
+
+2. **Function vs Method Audit**: Every standalone utility function is suspect
+   - Functions that should be methods on a type that owns the behavior
+   - Utility functions that should be trait implementations for polymorphic behavior
+   - Functions that could be eliminated through better type design
+
+3. **String Typing Violations**: Every string representing finite values should be an enum
+   - Stringly-typed APIs that should use proper types
+   - String parameters that represent known constants or variants
+   - String data that should be wrapped in type-safe structures
+   - **EXCEPTIONS**: Format validation (email, URLs), arbitrary text processing, string accessors on typed data
+
+4. **State Machine Failures**: State tracking with primitives instead of types
+   - Boolean flags that should be part of state enums
+   - Multiple booleans that represent mutually exclusive states
+   - String values tracking application state
+
+5. **Builder Pattern Opportunities**: Complex construction that needs structure
+   - Functions with many parameters that should use builder pattern
+   - Complex initialization logic scattered across multiple calls
+
+### Error Handling Standards
+
+1. **Safe vs Unsafe Patterns**:
+   - **ACCEPTABLE**: `unwrap_or()` and `unwrap_or_else()` with fallbacks
+   - **FLAG FOR FIXING**: Bare `.unwrap()` calls without fallbacks
+   - **PREFERRED**: Proper Result/Option usage with explicit error handling
+
+2. **Error Context Requirements**:
+   - Missing error contexts that make debugging difficult
+   - Generic error messages that don't help identify root causes
+
+### Design Quality Standards
+
+1. **Complexity Reduction**:
+   - Unnecessary nesting that can be simplified
+   - Long functions that should be broken down
+   - Unclear logic that needs refactoring
+
+2. **Code Duplication**:
+   - Copy-pasted patterns that should be abstracted
+   - Similar logic that should share common implementations
+
+3. **API Design**:
+   - Inconsistent naming conventions
+   - Missing documentation for complex public APIs
+   - Type signatures that don't express intent clearly
+
+### Analysis Priority Order
+
+1. **FIRST**: Type system violations (highest priority, always flag)
+2. **SECOND**: Error handling and safety concerns  
+3. **THIRD**: Code complexity and clarity issues
+4. **FOURTH**: Duplication and maintenance concerns
+5. **FIFTH**: Documentation and API design
+
+### What NOT to Flag
+
+1. **Acceptable String Usage**:
+   - String accessor methods on well-typed data (e.g., `enum.name()`)
+   - String data already contained in type-safe structures
+   - Format validation patterns (email, URL parsing, etc.)
+   - Arbitrary text processing where enums don't make sense
+
+2. **Acceptable Error Patterns**:
+   - `unwrap_or()` and `unwrap_or_else()` with proper fallbacks
+   - Standard boilerplate error handling in tests
+
+3. **Standard Patterns**:
+   - Conventional project structure and imports
+   - Standard library usage following established patterns
+</TypeSystemDesignPrinciples>
+
 <CustomizationInstructions>
 ## How to Use This Pattern File
 
@@ -278,6 +363,7 @@ When implementing a review command, reference this file and specify:
 
 1. **Which tagged sections to follow** completely:
    - Example: "Follow <CorePresentationFlow> exactly as specified"
+   - Example: "Follow <TypeSystemDesignPrinciples> for analysis requirements"
    
 2. **Your specific values for placeholders**:
    - [Review Type]: "Design Review", "Code Review", "Plan Alignment Review"
