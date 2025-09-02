@@ -213,12 +213,16 @@ After receiving the subagent's review and filtering:
 ### Keyword Decision Process
 1. **FILTER STEP**: Review each recommendation and exclude any that are already addressed in the review scope
 2. Create a todo list using TodoWrite with ONLY the filtered recommendations as separate todo items
-3. After presenting the summary and table above, present the FIRST recommendation and STOP
-4. **MANDATORY**: Wait for user to respond with EXACTLY one of these keywords:
-   - **"agree"** - Approve and integrate the recommendation into the plan
-   - **"skip"** - Reject and document the recommendation  
-   - **"investigate"** - Deep dive analysis to validate the recommendation's value
-   - **"skip with prejudice"** - Permanently reject with strong warning against future suggestions
+3. After presenting the summary and table above, present the FIRST recommendation and then EXPLICITLY state:
+   ```
+   Please respond with one of these keywords:
+   - "agree" - Approve and integrate the recommendation into the plan
+   - "skip" - Reject and document the recommendation
+   - "investigate" - Deep dive analysis to validate the recommendation's value
+   - "skip with prejudice" - Permanently reject with strong warning against future suggestions
+   ```
+   Then STOP
+4. **MANDATORY**: Wait for user to respond with EXACTLY one of these keywords
 
 ### Keyword Response Actions
 
@@ -232,7 +236,15 @@ After receiving the subagent's review and filtering:
 2. **CROSS-REFERENCE**: Add references between the new plan section and related implementation sections
 3. **Mark current todo as completed**
 4. **CRITICAL**: Before presenting the next recommendation, review ALL changes accepted in this session so far. Update the suggestion to account for the cumulative effect of these changes - leverage newly added patterns, avoid redundant suggestions, and ensure consistency with what has already been approved.
-5. Present next recommendation and STOP
+5. Present next recommendation, then EXPLICITLY state the available keywords:
+   ```
+   Please respond with one of these keywords:
+   - "agree" - Approve and integrate the recommendation into the plan
+   - "skip" - Reject and document the recommendation
+   - "investigate" - Deep dive analysis to validate the recommendation's value
+   - "skip with prejudice" - Permanently reject with strong warning against future suggestions
+   ```
+   Then STOP
 
 **When user responds "skip"**:
 1. **UPDATE SKIP NOTES**: Add/update "Design Review Skip Notes" section in the plan document using this EXACT format:
@@ -247,7 +259,15 @@ After receiving the subagent's review and filtering:
    ```
 2. **Mark current todo as completed**
 3. **CRITICAL**: Before presenting the next recommendation, review ALL changes accepted/skipped in this session so far. Ensure you don't re-suggest anything already addressed or marked as skipped.
-4. Present next recommendation and STOP
+4. Present next recommendation, then EXPLICITLY state the available keywords:
+   ```
+   Please respond with one of these keywords:
+   - "agree" - Approve and integrate the recommendation into the plan
+   - "skip" - Reject and document the recommendation
+   - "investigate" - Deep dive analysis to validate the recommendation's value
+   - "skip with prejudice" - Permanently reject with strong warning against future suggestions
+   ```
+   Then STOP
 
 **When user responds "skip with prejudice"**:
 1. **UPDATE SKIP NOTES WITH PREJUDICE FLAG**: 
@@ -273,7 +293,15 @@ After receiving the subagent's review and filtering:
    ```
 2. **Mark current todo as completed**
 3. **CRITICAL**: Before presenting the next recommendation, review ALL changes accepted/skipped/rejected in this session so far. Never suggest anything marked with prejudice or already handled.
-4. Present next recommendation and STOP
+4. Present next recommendation, then EXPLICITLY state the available keywords:
+   ```
+   Please respond with one of these keywords:
+   - "agree" - Approve and integrate the recommendation into the plan
+   - "skip" - Reject and document the recommendation
+   - "investigate" - Deep dive analysis to validate the recommendation's value
+   - "skip with prejudice" - Permanently reject with strong warning against future suggestions
+   ```
+   Then STOP
 
 **When user responds "investigate"**:
 1. **TASK INVESTIGATION AGENT**: Use Task tool to deep-dive investigate the recommendation with a general-purpose agent acting as a **responsible judge balancing aesthetics and utility**:
@@ -290,7 +318,14 @@ After receiving the subagent's review and filtering:
    - **Alternative Approaches**: If multiple valid approaches exist, present 2-3 options with trade-offs
    - **Complexity Analysis**: Honest assessment of implementation and maintenance costs
    - **Recommendation**: Updated recommendation based on investigation
-3. **WAIT FOR NEW KEYWORD**: Present findings and wait for user to respond with "agree", "skip", or "skip with prejudice" (no longer "investigate")
+3. **WAIT FOR NEW KEYWORD**: Present findings and then EXPLICITLY state:
+   ```
+   Please respond with one of these keywords:
+   - "agree" - Approve and integrate the recommendation
+   - "skip" - Reject and document the recommendation
+   - "skip with prejudice" - Permanently reject with strong warning
+   ```
+   Then wait for user response
 
 ### Keyword Enforcement Rules
 - **NO OTHER RESPONSES ACCEPTED**: Only "agree", "skip", "investigate", or "skip with prejudice" keywords trigger actions
