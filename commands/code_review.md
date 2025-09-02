@@ -2,9 +2,9 @@
 
 ## Arguments
 - **Default (no arguments)**: Reviews all uncommitted changes via `git diff`
-- **With file/directory paths**: Reviews only changes in specified files or directories
-  - Example: `/code_review src/parser/*.rs` - reviews changes only in parser files
-  - Example: `/code_review lib/utils.js tests/` - reviews changes in utils.js and all test files
+- **With file/directory paths**: Reviews all code in specified files or directories (as-built review)
+  - Example: `/code_review src/parser/*.rs` - reviews all code in parser files
+  - Example: `/code_review lib/utils.js tests/` - reviews all code in utils.js and all test files
 
 ## Overview
 Use the Task tool with a general-purpose agent to conduct a comprehensive code review of the specified scope. The review produces **actionable recommendations for immediate fixing**.
@@ -12,7 +12,8 @@ Use the Task tool with a general-purpose agent to conduct a comprehensive code r
 **CRITICAL**: After receiving the subagent's review, create a todo list for interactive review. Present each issue one at a time, STOPPING after each one for the user to decide whether to fix, skip, or investigate it.
 
 ## Review Scope
-- Analyze the current git diff (uncommitted changes)
+- **Default**: Analyze the current git diff (uncommitted changes)
+- **With arguments**: Analyze all code in specified files/directories (as-built review)
 - Identify code quality issues, complexity, duplication, and type system misuse
 - Focus on actionable improvements that can be immediately fixed
 - Provide concrete, specific recommendations with code samples
@@ -107,15 +108,16 @@ Brief overview of the changes reviewed (1-2 sentences max)
 Task a general-purpose subagent to review [REVIEW TARGET: git diff or specific files] and provide actionable code review feedback in the exact format specified above.
 
 **TARGET SELECTION**:
-- If `$ARGUMENTS` is provided: Review changes only in specified files/directories
+- If `$ARGUMENTS` is provided: Review all code in specified files/directories (as-built review)
 - If no arguments: Review all uncommitted changes via `git diff`
-- Use `git diff [files]` when specific paths are provided
+- Use Read tool to examine all files when specific paths are provided
 
-**FIRST STEP - Get the diff**:
-Run appropriate git diff command based on arguments. Focus only on these changes, not the entire codebase.
+**FIRST STEP - Get the code**:
+- If no arguments: Run `git diff` to get uncommitted changes
+- If arguments provided: Use Read tool to examine all code in specified files/directories
 
 **CRITICAL SECOND STEP - TYPE SYSTEM VIOLATIONS**:
-Before ANY other analysis, audit the changes for type system misuse:
+Before ANY other analysis, audit the code for type system misuse:
 - Every if-else chain checking strings should be an enum with pattern matching
 - Every utility function should be questioned - why isn't this a method?
 - Every boolean flag tracking state should be part of a state enum
@@ -129,14 +131,15 @@ TREAT STRING-BASED CONDITIONALS AS CODE SMELL: Flag string equality checks again
 - Arbitrary text processing where enums don't make sense
 
 Then proceed with standard analysis:
-1. Identifying code quality issues in the changes
+1. Identifying code quality issues in the code
 2. Finding unnecessary complexity that can be simplified
-3. Spotting code duplication across the changes
+3. Spotting code duplication
 4. Checking error handling and safety
 5. Creating concrete, fixable recommendations
 
 **IMPORTANT**: 
-- Only review code that appears in the git diff
+- For git diff mode: Only review code that appears in the diff
+- For as-built mode: Review all code in specified files/directories
 - Provide actual code snippets for current and suggested versions
 - Make suggestions that can be immediately implemented
 - Prioritize issues by their impact on code quality and maintainability
@@ -192,14 +195,17 @@ After receiving the subagent's review:
 
 **When user responds "fix"**:
 1. **IMPLEMENT IMMEDIATELY**: Apply the suggested code change
-2. Show the implemented change with a brief confirmation
-3. Mark current todo as completed
-4. Present next issue and STOP
+2. **RUN BUILD AND FORMAT**: Execute `cargo build && cargo +nightly fmt` to ensure the fix works
+3. Show the implemented change with a brief confirmation
+4. Mark current todo as completed
+5. **CRITICAL**: Before presenting the next issue, review ALL fixes applied in this session so far. Update remaining issues to account for the cumulative changes - adjust line numbers, remove issues already resolved by previous fixes, and modify suggestions to align with the current state of the code.
+6. Present next issue and STOP
 
 **When user responds "skip"**:
 1. Mark current todo as completed
 2. Add to skipped issues list (in memory for final summary)
-3. Present next issue and STOP
+3. **CRITICAL**: Before presenting the next issue, review ALL fixes applied and issues skipped in this session so far. Ensure remaining issues are still relevant given the accumulated changes.
+4. Present next issue and STOP
 
 **When user responds "investigate"**:
 1. **TASK INVESTIGATION AGENT**: Use Task tool to deep-dive with a general-purpose agent:

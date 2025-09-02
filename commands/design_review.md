@@ -18,6 +18,7 @@ Use the Task tool with a general-purpose agent to conduct a comprehensive design
 - Identify gaps, missing components, and implementation issues
 - Focus on breaking changes, over-engineering, and simplification opportunities
 - Provide concrete, specific recommendations that can be turned into todo items
+- **CRITICAL**: Do NOT include any timing, schedules, timelines, or time estimates in recommendations
 
 ## Required Output Format
 
@@ -107,8 +108,9 @@ Brief overview of findings (2-3 sentences max)
 1. **Gap Analysis**: Missing components, unclear specifications
 2. **Breaking Changes**: API changes, signature modifications, structural changes
 3. **Over-engineering**: Unnecessary complexity that can be simplified
-4. **Implementation Order**: Dependencies and sequencing issues
+4. **Implementation Order**: Dependencies and sequencing issues (NO time estimates)
 5. **Code Examples**: Only when essential for clarity (prefer brief descriptions)
+6. **NO TIMING**: Never include schedules, timelines, deadlines, or time estimates
 
 ## Prompt Template
 ```
@@ -161,6 +163,12 @@ Then proceed with standard analysis:
 **CRITICAL**: Suggesting something from the Skip Notes section, especially items with ⚠️ PREJUDICE WARNING, constitutes a review failure and wastes everyone's time.
 
 Return results in the structured format with TYPE-SYSTEM-*, DESIGN-*, IMPLEMENTATION-*, and SIMPLIFICATION-* categories. TYPE-SYSTEM recommendations should come FIRST and be treated as highest priority.
+
+**CRITICAL REMINDER**: Do NOT include any timing information in recommendations:
+- NO schedules, deadlines, or milestones
+- NO time estimates or durations
+- NO timeline or project phases with dates
+- Focus ONLY on technical design and implementation structure
 
 **CRITICAL - IMPLEMENTATION PROPOSALS REQUIRED**: For each recommendation, you MUST include an "Implementation Proposal" section with concrete code examples:
 - **Current**: Show the actual existing code from the relevant files (read the files to get real code)
@@ -221,9 +229,10 @@ After receiving the subagent's review and filtering:
    - File paths and line numbers to modify (for future reference)
    - Step-by-step implementation instructions (for when implementation begins)
    - Integration points with existing plan sections
-2. **CROSS-REFERENCE**: Add references between the new plan section and existing implementation phases
+2. **CROSS-REFERENCE**: Add references between the new plan section and related implementation sections
 3. **Mark current todo as completed**
-4. Present next recommendation and STOP
+4. **CRITICAL**: Before presenting the next recommendation, review ALL changes accepted in this session so far. Update the suggestion to account for the cumulative effect of these changes - leverage newly added patterns, avoid redundant suggestions, and ensure consistency with what has already been approved.
+5. Present next recommendation and STOP
 
 **When user responds "skip"**:
 1. **UPDATE SKIP NOTES**: Add/update "Design Review Skip Notes" section in the plan document using this EXACT format:
@@ -237,7 +246,8 @@ After receiving the subagent's review and filtering:
    - **Reason**: User decision - not needed for current implementation
    ```
 2. **Mark current todo as completed**
-3. Present next recommendation and STOP
+3. **CRITICAL**: Before presenting the next recommendation, review ALL changes accepted/skipped in this session so far. Ensure you don't re-suggest anything already addressed or marked as skipped.
+4. Present next recommendation and STOP
 
 **When user responds "skip with prejudice"**:
 1. **UPDATE SKIP NOTES WITH PREJUDICE FLAG**: 
@@ -262,7 +272,8 @@ After receiving the subagent's review and filtering:
    - **Critical Note**: DO NOT SUGGEST THIS AGAIN - This recommendation has been permanently rejected due to reviewer repetition
    ```
 2. **Mark current todo as completed**
-3. Present next recommendation and STOP
+3. **CRITICAL**: Before presenting the next recommendation, review ALL changes accepted/skipped/rejected in this session so far. Never suggest anything marked with prejudice or already handled.
+4. Present next recommendation and STOP
 
 **When user responds "investigate"**:
 1. **TASK INVESTIGATION AGENT**: Use Task tool to deep-dive investigate the recommendation with a general-purpose agent acting as a **responsible judge balancing aesthetics and utility**:
@@ -320,9 +331,9 @@ When user says "agree" for a recommendation, add this new section to the plan do
 ```
 
 ### Integration with Existing Plan
-- **Phase dependency**: This change should be implemented during [specific phase]
-- **Prerequisites**: [Any dependencies on other recommendations]
+- **Dependencies**: [Any prerequisites or dependencies on other recommendations]
 - **Impact on existing sections**: [How this affects other parts of the plan]
+- **Related components**: [Other components that interact with this change]
 
 ### Implementation Priority: [High/Medium/Low from recommendation]
 
@@ -333,7 +344,7 @@ When user says "agree" for a recommendation, add this new section to the plan do
 
 ---
 **Design Review Decision**: Approved for inclusion in plan on [current date]
-**Next Steps**: Code changes will be implemented in a future development phase
+**Next Steps**: Code changes ready for implementation when needed
 ```
 
 ## Default Review Target
