@@ -47,9 +47,9 @@ After all implementation todos, add:
 <ReviewTodos>
 Final todos:
 - [ ] Subagent: STOP and return control
-- [ ] Main: Task new subagent for code review (read-only)
-  - Focus: duplication, complexity, plan adherence
-- [ ] Review suggestions with user
+- [ ] Main: Run plan alignment review using ~/.claude/commands/plan_alignment_review.md
+  - Use the plan document that was basis for implementation
+  - Review discrepancies between plan and actual implementation
 </ReviewTodos>
 
 IMPORTANT: After creating the todo list, STOP. Do not begin implementation.

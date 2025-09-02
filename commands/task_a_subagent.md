@@ -1,18 +1,14 @@
-<PreChecks>
-1. Display current working directory: `pwd`
-2. Confirm working directory with user
-3. Check for TECH_DEBT.md - read if exists
-</PreChecks>
-
-<OptionalPlanDocument>
-Optional: Plan document filename (e.g., plan-*.md)
-- If we are working on a document from a plan*.md instruct the subagent to read and work from the plan document.
-- If not provided, subagent will work from the plan/context you provide directly
-</OptionalPlanDocument>
-
+<MainAgentSetup>
+The main agent is responsible for:
+1. Determining the working directory
+2. Creating or deciding to continue with existing `.todo.json`
+3. Specifying if there's a plan*.md document to follow
+4. Handling all user interactions and confirmations
+</MainAgentSetup>
 
 <Instructions>
-1. Write todo list to `.todo.json` using this format:
+1. **For NEW tasks**: Write todo list to `.todo.json` using this format:
+   **For CONTINUING tasks**: Skip to step 3 (subagent will be told to continue from existing `.todo.json`)
 
 .todo.json structure - each line separated by newlines to make the file easier to read:
 ```json
@@ -43,9 +39,13 @@ Optional: Plan document filename (e.g., plan-*.md)
 5. After ALL tasks completed:
    a. Read final `.todo.json`
    b. Sync to TodoWrite tool
-   c. Do code review if instructed
-   d. Display final status
-   e. Delete `.todo.json`
+   c. Display final status
+   d. Delete `.todo.json`
+   e. Summarize the subagent's implementation work
+   f. **MANDATORY FOR MAIN AGENT (NOT SUBAGENT)**: YOU (the main agent) must personally conduct an interactive plan alignment review with the user using ~/.claude/commands/plan_alignment_review.md
+      - Use Task tool to get alignment analysis from a subagent
+      - Then conduct the interactive keyword-driven review process with the user
+      - This is NOT delegated - YOU must do this interactively
 </Instructions>
 
 
@@ -63,19 +63,19 @@ Repeat steps 2 and 3 until done.
 Following is the workflow that you must do:
 
 <Workflow>
-**STEP 1: VERIFY WORKING DIRECTORY**
-- Current working directory: [REPLACE WITH ACTUAL pwd OUTPUT]
-- FIRST ACTION: Run `pwd` to confirm you're in the correct directory
-- If wrong directory, STOP and ask user to clarify
+**STEP 1: UNDERSTAND YOUR CONTEXT**
+- The main agent has already set up your working directory: [PROVIDED BY MAIN AGENT]
+- The main agent has created or identified `.todo.json` for you to work with
+- Trust the setup - focus on executing the tasks
 
 **STEP 2: READ .todo.json**
 - MANDATORY: Read .todo.json file to understand all tasks
 - This file contains your work queue - you MUST follow it
 
-[if we're working from a plan*.md then instruct the agent to read the plan document]
-**STEP 3: READ PLAN DOCUMENT**
-- Read for implementation plan and additional details.
+**STEP 3: READ PLAN DOCUMENT (if specified by main agent)**
+- If main agent mentioned a plan*.md file, read it for implementation details
 - Follow the plan's specifications and requirements
+- If no plan document mentioned, work from the context provided by main agent
 
 **STEP 4: THINK HARD ABOUT IMPLEMENTATION - CRITICAL**
 - Before starting ANY task, think deeply about:
@@ -110,17 +110,9 @@ After completing implementation tasks (but before marking final task complete):
 4. After addressing all warnings, run build again to confirm clean compilation
 5. Only mark implementation complete when build has no relevant warnings
 
-The following <TechDebtDocument/>, <ContextWindow/> and <HandoffInstructions/> sections are only to be followed if the situation they describe is occurring.
+The following <ContextWindow/> and <HandoffInstructions/> sections are only to be followed if the situation they describe is occurring.
 
 </Workflow>
-
-<TechDebtDocument>
-TECH_DEBT.md usage:
-- Update when creating technical debt
-- Document context before hitting limits
-- Track identified duplication/complexity
-- **MANDATORY**: If you remove/disable code or write TODO due to complexity, document it in TECH_DEBT.md with the decision and reasoning
-</TechDebtDocument>
 
 <ContextWindow>
 When approaching context window limit (THIS IS NORMAL - NOT AN ERROR):
@@ -138,7 +130,6 @@ Continue working unless:
 
 **FINAL REMINDERS**:
 - Every single task transition must involve updating .todo.json. If you complete any work without updating the file, you have failed.
-- Watch for technical debt and use <TechDebtDocument/> to track it if you identify any.
 - Watch for reaching context window and follow instructions in <ContextWindow/>
 
 </SubagentInstructions>

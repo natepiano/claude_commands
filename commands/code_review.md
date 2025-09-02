@@ -155,43 +155,21 @@ Each issue must include the exact location, current code, and suggested code to 
 
 ## Post-Review Instructions - Keyword-Driven Fix Process
 
-**CRITICAL**: After the subagent returns the review, use ONLY these three keywords for user decisions:
+**CRITICAL**: Read `~/.claude/commands/shared/keyword_review_pattern.txt` and follow the shared patterns with these customizations:
 
-### Initial Review Summary (MANDATORY)
-After receiving the subagent's review:
+### Pattern Application for Code Review
+- Follow `<CorePresentationFlow>` with [Review Type] = "Code Review" and [items] = "issues"
+- Follow `<KeywordDecisionProcess>` with keywords: fix, skip, investigate
+- Follow `<InvestigationPattern>` with [DOMAIN VALUES] = "code quality and pragmatism"
+- Follow `<CumulativeUpdateRule>` for code changes (line numbers, resolved issues)
+- Follow `<EnforcementRules>` completely
+- Use `<FinalSummaryTemplate>` with issue categories (TYPE-SYSTEM, QUALITY, COMPLEXITY, etc.)
 
-1. **Present Summary Statistics**:
-   ```
-   Code Review Summary:
-   - Total issues found: [X]
-   - Positive findings: [Y]
-   - Issues to review: [Z]
-   ```
+### Code Review Specific Keywords
+**Primary keywords**: fix, skip, investigate
+**After investigation**: fix, skip (for RECOMMENDED/MODIFIED), accept, override (for NOT RECOMMENDED)
 
-2. **Present Issues Overview Table**:
-   ```
-   | ID | Priority | Category | Brief Description |
-   |----|----------|----------|------------------|
-   | TYPE-SYSTEM-1 | High | Type System | Replace string conditionals with enum |
-   | QUALITY-1 | Medium | Quality | Improve error message context |
-   | COMPLEXITY-1 | Low | Complexity | Simplify nested conditionals |
-   ```
-
-3. **Acknowledge Positive Findings**:
-   List the positive findings as bullet points to acknowledge good practices
-
-4. **Transition Statement**:
-   "Let's review each issue. I'll present them one at a time for your decision."
-
-### Keyword Decision Process
-1. Create a todo list using TodoWrite with ONLY the actionable issues
-2. Present the FIRST issue with full details and STOP
-3. **MANDATORY**: Wait for user to respond with EXACTLY one of these keywords:
-   - **"fix"** - Implement the fix immediately
-   - **"skip"** - Skip this issue
-   - **"investigate"** - Deep dive analysis before deciding
-
-### Keyword Response Actions
+### Code Review Keyword Response Actions
 
 **When user responds "fix"**:
 1. **IMPLEMENT IMMEDIATELY**: Apply the suggested code change
@@ -199,35 +177,75 @@ After receiving the subagent's review:
 3. Show the implemented change with a brief confirmation
 4. Mark current todo as completed
 5. **CRITICAL**: Before presenting the next issue, review ALL fixes applied in this session so far. Update remaining issues to account for the cumulative changes - adjust line numbers, remove issues already resolved by previous fixes, and modify suggestions to align with the current state of the code.
-6. Present next issue and STOP
+6. Present next issue, then EXPLICITLY state the available keywords:
+   ```
+   Please respond with one of these keywords:
+   - "fix" - ACTION: Implement the suggested fix immediately
+   - "skip" - ACTION: Skip this issue without fixing
+   - "investigate" - ACTION: Launch deep analysis to validate if this is worth fixing
+   ```
+   Then STOP
 
 **When user responds "skip"**:
 1. Mark current todo as completed
 2. Add to skipped issues list (in memory for final summary)
 3. **CRITICAL**: Before presenting the next issue, review ALL fixes applied and issues skipped in this session so far. Ensure remaining issues are still relevant given the accumulated changes.
-4. Present next issue and STOP
+4. Present next issue, then EXPLICITLY state the available keywords:
+   ```
+   Please respond with one of these keywords:
+   - "fix" - ACTION: Implement the suggested fix immediately
+   - "skip" - ACTION: Skip this issue without fixing
+   - "investigate" - ACTION: Launch deep analysis to validate if this is worth fixing
+   ```
+   Then STOP
 
 **When user responds "investigate"**:
-1. **TASK INVESTIGATION AGENT**: Use Task tool to deep-dive with a general-purpose agent:
-   - Act as a responsible judge balancing code quality and pragmatism
-   - Analyze whether the fix provides genuine value vs over-complication
-   - Research alternative approaches and trade-offs
-   - Examine real-world impact and complexity costs
-   - Check if simpler solutions exist
-   - Provide evidence-based assessment
-2. **PRESENT INVESTIGATION FINDINGS**:
-   - **Value Assessment**: Is this worth fixing?
-   - **Alternative Approaches**: 2-3 options if applicable
-   - **Complexity Analysis**: Implementation cost vs benefit
-   - **Recommendation**: Updated suggestion based on investigation
-3. **WAIT FOR NEW KEYWORD**: Present findings and wait for "fix" or "skip" (no longer "investigate")
-
-### Keyword Enforcement Rules
-- **NO OTHER RESPONSES ACCEPTED**: Only "fix", "skip", or "investigate" trigger actions
-- **MANDATORY STOPPING**: ALWAYS stop after each issue presentation
-- **NO ASSUMPTIONS**: Never assume user intent - wait for explicit keyword
-- **NO BATCHING**: Process exactly one issue per user keyword response
-- **INVESTIGATE LIMITATION**: "investigate" only available on first presentation - after investigation, only "fix" or "skip" accepted
+1. **TASK INVESTIGATION AGENT**: Use Task tool to deep-dive with a general-purpose agent acting as a **responsible judge balancing code quality and pragmatism**:
+   - **CRITICAL JUDGMENT MANDATE**: Act as a responsible engineering judge who values both code elegance AND practical utility
+   - **Balance aesthetics vs pragmatism**: Weigh the beauty of clean code against real-world implementation costs
+   - **Provide sound engineering judgment**: Consider maintenance burden, team cognitive load, and actual business value
+   - **Analyze whether the fix provides genuine value vs over-complication**: Be skeptical of perfectionism for perfectionism's sake
+   - **Research alternative approaches and trade-offs**: Find the sweet spot between ideal and practical
+   - **Examine real-world impact and complexity costs**: Consider developer time, debugging difficulty, and onboarding friction
+   - **Check if simpler solutions exist that achieve the same goals**: Sometimes "good enough" is better than perfect
+   - **Provide evidence-based assessment**: Ground your judgment in concrete examples and real scenarios
+2. **PRESENT INVESTIGATION FINDINGS**: Return with:
+   - **Value Assessment**: Clear judgment on whether this is worth fixing
+   - **Alternative Approaches**: If multiple valid approaches exist, present 2-3 options with trade-offs
+   - **Complexity Analysis**: Honest assessment of implementation cost vs benefit
+   - **Investigation Verdict**: One of:
+     - **FIX RECOMMENDED**: Investigation supports implementing the fix
+     - **FIX MODIFIED**: Investigation suggests a modified approach (specify the changes)
+     - **FIX NOT RECOMMENDED**: Investigation recommends NOT fixing this issue
+3. **WAIT FOR NEW KEYWORD WITH CONTEXT-APPROPRIATE MEANING**: Present findings and then EXPLICITLY state based on the investigation verdict:
+   
+   **If FIX RECOMMENDED**:
+   ```
+   Investigation verdict: FIX RECOMMENDED - Investigation supports implementing this fix
+   
+   Please respond with one of these keywords:
+   - "fix" - ACTION: Implement the recommended fix
+   - "skip" - ACTION: Skip despite investigation support
+   ```
+   
+   **If FIX MODIFIED**:
+   ```
+   Investigation verdict: FIX MODIFIED - Investigation suggests implementing with changes: [describe changes]
+   
+   Please respond with one of these keywords:
+   - "fix" - ACTION: Implement the MODIFIED fix
+   - "skip" - ACTION: Skip both original and modified versions
+   ```
+   
+   **If FIX NOT RECOMMENDED**:
+   ```
+   Investigation verdict: FIX NOT RECOMMENDED - Investigation recommends NOT fixing this issue
+   Reason: [specific reason from investigation]
+   
+   Please respond with one of these keywords:
+   - "accept" - ACTION: Accept investigation's recommendation to not fix (equivalent to "skip")
+   - "override" - ACTION: Ignore investigation and implement fix anyway
+   ```
 
 ### Final Summary
 When all issues are addressed, provide:

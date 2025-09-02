@@ -184,47 +184,21 @@ For each recommendation, specify the exact location in the plan document where i
 
 ## Post-Review Instructions - Keyword-Driven Implementation Process
 
-**CRITICAL**: After the subagent returns the review, use ONLY these four keywords for user decisions:
+**CRITICAL**: Read `~/.claude/commands/shared/keyword_review_pattern.txt` and follow the shared patterns with these customizations:
 
-### Initial Review Summary (MANDATORY)
-After receiving the subagent's review and filtering:
+### Pattern Application for Design Review
+- Follow `<CorePresentationFlow>` with [Review Type] = "Design Review" and [items] = "recommendations"
+- Follow `<KeywordDecisionProcess>` with keywords: agree, skip, investigate, skip with prejudice
+- Follow `<InvestigationPattern>` with [DOMAIN VALUES] = "code elegance AND practical utility"
+- Follow `<CumulativeUpdateRule>` for plan document updates
+- Follow `<EnforcementRules>` completely
+- Use `<FinalSummaryTemplate>` with appropriate design review categories
 
-1. **Present Summary Statistics**:
-   ```
-   Design Review Summary:
-   - Total recommendations found: [X]
-   - Already addressed (filtered): [Y]
-   - Recommendations to review: [Z]
-   ```
+### Design Review Specific Keywords
+**Primary keywords**: agree, skip, investigate, skip with prejudice
+**After investigation**: agree, skip, skip with prejudice, override (for REJECTED verdict only)
 
-2. **Present Recommendation Overview Table**:
-   ```
-   | ID | Priority | Category | Brief Description |
-   |----|----------|----------|------------------|
-   | TYPE-SYSTEM-1 | High | Type System | Replace conditional chain with enum for X |
-   | DESIGN-1 | Medium | Design | Add missing error handling for Y |
-   | IMPLEMENTATION-1 | Low | Implementation | Consolidate duplicate logic in Z |
-   | SIMPLIFICATION-1 | Medium | Simplification | Remove unnecessary abstraction layer |
-   ```
-
-3. **Transition Statement**:
-   "Let's review each recommendation. I'll present them one at a time for your decision."
-
-### Keyword Decision Process
-1. **FILTER STEP**: Review each recommendation and exclude any that are already addressed in the review scope
-2. Create a todo list using TodoWrite with ONLY the filtered recommendations as separate todo items
-3. After presenting the summary and table above, present the FIRST recommendation and then EXPLICITLY state:
-   ```
-   Please respond with one of these keywords:
-   - "agree" - Approve and integrate the recommendation into the plan
-   - "skip" - Reject and document the recommendation
-   - "investigate" - Deep dive analysis to validate the recommendation's value
-   - "skip with prejudice" - Permanently reject with strong warning against future suggestions
-   ```
-   Then STOP
-4. **MANDATORY**: Wait for user to respond with EXACTLY one of these keywords
-
-### Keyword Response Actions
+### Design Review Keyword Response Actions
 
 **When user responds "agree"**:
 1. **UPDATE PLAN DOCUMENT ONLY**: Add a new dedicated section for the agreed recommendation with:
@@ -239,10 +213,10 @@ After receiving the subagent's review and filtering:
 5. Present next recommendation, then EXPLICITLY state the available keywords:
    ```
    Please respond with one of these keywords:
-   - "agree" - Approve and integrate the recommendation into the plan
-   - "skip" - Reject and document the recommendation
-   - "investigate" - Deep dive analysis to validate the recommendation's value
-   - "skip with prejudice" - Permanently reject with strong warning against future suggestions
+   - "agree" - ACTION: Add this recommendation to the plan document as an approved item
+   - "skip" - ACTION: Reject this recommendation and add it to Skip Notes
+   - "investigate" - ACTION: Launch deep analysis to validate if this is worth implementing
+   - "skip with prejudice" - ACTION: Permanently reject with ⚠️ warning against future suggestions
    ```
    Then STOP
 
@@ -262,10 +236,10 @@ After receiving the subagent's review and filtering:
 4. Present next recommendation, then EXPLICITLY state the available keywords:
    ```
    Please respond with one of these keywords:
-   - "agree" - Approve and integrate the recommendation into the plan
-   - "skip" - Reject and document the recommendation
-   - "investigate" - Deep dive analysis to validate the recommendation's value
-   - "skip with prejudice" - Permanently reject with strong warning against future suggestions
+   - "agree" - ACTION: Add this recommendation to the plan document as an approved item
+   - "skip" - ACTION: Reject this recommendation and add it to Skip Notes
+   - "investigate" - ACTION: Launch deep analysis to validate if this is worth implementing
+   - "skip with prejudice" - ACTION: Permanently reject with ⚠️ warning against future suggestions
    ```
    Then STOP
 
@@ -296,10 +270,10 @@ After receiving the subagent's review and filtering:
 4. Present next recommendation, then EXPLICITLY state the available keywords:
    ```
    Please respond with one of these keywords:
-   - "agree" - Approve and integrate the recommendation into the plan
-   - "skip" - Reject and document the recommendation
-   - "investigate" - Deep dive analysis to validate the recommendation's value
-   - "skip with prejudice" - Permanently reject with strong warning against future suggestions
+   - "agree" - ACTION: Add this recommendation to the plan document as an approved item
+   - "skip" - ACTION: Reject this recommendation and add it to Skip Notes
+   - "investigate" - ACTION: Launch deep analysis to validate if this is worth implementing
+   - "skip with prejudice" - ACTION: Permanently reject with ⚠️ warning against future suggestions
    ```
    Then STOP
 
@@ -317,22 +291,66 @@ After receiving the subagent's review and filtering:
    - **Value Assessment**: Clear judgment on whether this is worth implementing
    - **Alternative Approaches**: If multiple valid approaches exist, present 2-3 options with trade-offs
    - **Complexity Analysis**: Honest assessment of implementation and maintenance costs
-   - **Recommendation**: Updated recommendation based on investigation
-3. **WAIT FOR NEW KEYWORD**: Present findings and then EXPLICITLY state:
+   - **Investigation Verdict**: One of:
+     - **RECOMMENDATION CONFIRMED**: Investigation supports implementing the original recommendation
+     - **RECOMMENDATION MODIFIED**: Investigation suggests a modified approach (specify the changes)
+     - **RECOMMENDATION REJECTED**: Investigation recommends NOT implementing this suggestion
+3. **WAIT FOR NEW KEYWORD WITH CONTEXT-APPROPRIATE MEANING**: Present findings and then EXPLICITLY state based on the investigation verdict:
+   
+   **If RECOMMENDATION CONFIRMED**:
    ```
+   Investigation verdict: CONFIRMED - Investigation supports implementing this recommendation
+   
    Please respond with one of these keywords:
-   - "agree" - Approve and integrate the recommendation
-   - "skip" - Reject and document the recommendation
-   - "skip with prejudice" - Permanently reject with strong warning
+   - "agree" - ACTION: Add recommendation to plan document as approved implementation item
+   - "skip" - ACTION: Reject recommendation and add to Skip Notes despite investigation support
+   - "skip with prejudice" - ACTION: Permanently reject with warning in Skip Notes
    ```
-   Then wait for user response
-
-### Keyword Enforcement Rules
-- **NO OTHER RESPONSES ACCEPTED**: Only "agree", "skip", "investigate", or "skip with prejudice" keywords trigger actions
-- **MANDATORY STOPPING**: ALWAYS stop after each recommendation presentation
-- **NO ASSUMPTIONS**: Never assume user intent - wait for explicit keyword
-- **NO BATCHING**: Process exactly one recommendation per user keyword response
-- **INVESTIGATE LIMITATION**: "investigate" keyword only available on first presentation of a recommendation - after investigation, only "agree", "skip", or "skip with prejudice" are accepted
+   
+   **If RECOMMENDATION MODIFIED**:
+   ```
+   Investigation verdict: MODIFIED - Investigation suggests implementing with changes: [describe changes]
+   
+   Please respond with one of these keywords:
+   - "agree" - ACTION: Add MODIFIED version to plan document as approved implementation item
+   - "skip" - ACTION: Reject both original and modified versions, add to Skip Notes
+   - "skip with prejudice" - ACTION: Permanently reject all versions with warning in Skip Notes
+   ```
+   
+   **If RECOMMENDATION REJECTED**:
+   ```
+   Investigation verdict: REJECTED - Investigation recommends NOT implementing this suggestion
+   Reason: [specific reason from investigation]
+   
+   Please respond with one of these keywords:
+   - "agree" - ACTION: Accept investigation's rejection, add to Skip Notes as "Investigated and Rejected"
+   - "override" - ACTION: Ignore investigation results, add original recommendation to plan anyway
+   - "skip with prejudice" - ACTION: Permanently reject with extra warning in Skip Notes
+   ```
+   
+4. **KEYWORD ACTIONS AFTER INVESTIGATION** (detailed behaviors):
+   - **"agree" after CONFIRMED verdict**: 
+     - Add recommendation to plan document with "DESIGN REVIEW AGREEMENT" section
+     - Mark as investigated and approved
+     - Include investigation findings as justification
+   - **"agree" after MODIFIED verdict**: 
+     - Add MODIFIED version to plan document
+     - Include investigation's proposed changes
+     - Document why modifications were needed
+   - **"agree" after REJECTED verdict**: 
+     - Add to Skip Notes with special "Investigated and Rejected" status
+     - Include investigation's reasoning for rejection
+     - This is functionally equivalent to "skip" but documents the investigation
+   - **"override" (only after REJECTED verdict)**: 
+     - Add original recommendation to plan despite negative investigation
+     - Document that investigation advised against but was overridden
+     - Include both investigation findings and override rationale
+   - **"skip"**: 
+     - Always means reject the recommendation
+     - Add to Skip Notes as regular skip
+   - **"skip with prejudice"**: 
+     - Always means permanently reject with ⚠️ PREJUDICE WARNING
+     - Add strong warning against future suggestions
 
 ### Plan Update Template for "agree" Keyword
 

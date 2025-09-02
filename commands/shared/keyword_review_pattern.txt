@@ -1,0 +1,306 @@
+# Shared Keyword Review Pattern Instructions
+# This file contains common patterns for interactive keyword-driven review processes
+# Reference specific tagged sections from review command files
+
+<CorePresentationFlow>
+## Initial Review Summary (MANDATORY)
+After receiving the subagent's review and filtering:
+
+1. **Present Summary Statistics**:
+   ```
+   [Review Type] Summary:
+   - Total [items] found: [X]
+   - Already addressed (filtered): [Y]  
+   - [Items] to review: [Z]
+   ```
+   Note: Replace [Review Type] with "Design Review", "Code Review", or "Plan Alignment Review"
+   Replace [items] with "recommendations", "issues", or "discrepancies" as appropriate
+
+2. **Present Overview Table**:
+   ```
+   | ID | Priority | Category | Brief Description |
+   |----|----------|----------|------------------|
+   | [TYPE]-1 | High | [Category] | [Brief description of item] |
+   | [TYPE]-2 | Medium | [Category] | [Brief description of item] |
+   ```
+   Categories vary by review type but follow pattern: TYPE-SYSTEM, QUALITY, COMPLEXITY, etc.
+
+3. **Acknowledge Positive Findings** (if applicable):
+   List positive findings as bullet points to acknowledge good practices/alignment
+   Use section title appropriate to review type:
+   - "Positive Findings (Good Practices Observed)" for code review
+   - "Well-Aligned Areas (Following Plan Correctly)" for alignment review
+   - Skip this step if no positive findings to report
+
+4. **Transition Statement**:
+   "Let's review each [item]. I'll present them one at a time for your decision."
+   Replace [item] with "recommendation", "issue", or "discrepancy" as appropriate
+</CorePresentationFlow>
+
+<KeywordDecisionProcess>
+## Keyword Decision Process
+
+1. **FILTER STEP**: Review each item and exclude any that are already addressed in the review scope
+   - For design review: Check Skip Notes section for previously skipped items
+   - For code review: Check if issue was already fixed by previous changes
+   - For alignment review: Check if discrepancy was resolved by prior alignments
+
+2. **Create todo list** using TodoWrite with ONLY the filtered items as separate todo items
+   Each todo should be the item ID and brief description
+
+3. **Present the FIRST item** with full details from the subagent's structured output
+
+4. **EXPLICITLY state available keywords** using this format:
+   ```
+   Please respond with one of these keywords:
+   - "[keyword1]" - ACTION: [Specific action that will be taken]
+   - "[keyword2]" - ACTION: [Specific action that will be taken]
+   - "[keyword3]" - ACTION: [Specific action that will be taken]
+   - "[keyword4]" - ACTION: [Specific action that will be taken if applicable]
+   ```
+   Then STOP
+
+5. **MANDATORY**: Wait for user to respond with EXACTLY one of the specified keywords
+</KeywordDecisionProcess>
+
+<KeywordResponseFlow>
+## Standard Keyword Response Flow
+
+For each keyword response:
+
+1. **Execute the specified action** for that keyword
+2. **Mark current todo as completed**
+3. **CRITICAL UPDATE STEP**: Before presenting the next item, review ALL changes made in this session so far:
+   - For code changes: Update line numbers, remove resolved issues, adjust suggestions for current state
+   - For plan updates: Account for newly added sections, avoid redundant suggestions
+   - For alignment fixes: Check if other discrepancies are now resolved
+4. **Present next item** with full details
+5. **EXPLICITLY state available keywords** with ACTION descriptions (same format as initial presentation)
+6. **STOP and wait** for user response
+
+Continue this cycle until all todos are completed.
+</KeywordResponseFlow>
+
+<InvestigationPattern>
+## Investigation Pattern
+
+When user responds with investigation keyword:
+
+1. **TASK INVESTIGATION AGENT**: Use Task tool to deep-dive investigate with a general-purpose agent acting as a **responsible judge balancing [DOMAIN VALUES]**:
+   
+   **CRITICAL JUDGMENT MANDATE**: Act as a responsible engineering judge who values both [PRIMARY VALUE] AND [BALANCING VALUE]
+   
+   Standard investigation criteria (customize per review type):
+   - **Balance aesthetics vs pragmatism**: Weigh the beauty of clean abstractions against real-world implementation costs
+   - **Provide sound engineering judgment**: Consider maintenance burden, team cognitive load, and actual business value
+   - **Analyze whether the recommendation provides genuine value vs over-engineering**: Be skeptical of complexity for complexity's sake
+   - **Research alternative approaches and trade-offs**: Find the sweet spot between perfectionism and pragmatism
+   - **Examine real-world impact and complexity costs**: Consider developer time, debugging difficulty, and onboarding friction
+   - **Check if simpler solutions exist that achieve the same goals**: Sometimes "good enough" is better than perfect
+   - **Provide evidence-based assessment of necessity**: Ground your judgment in concrete examples and real scenarios
+
+2. **PRESENT INVESTIGATION FINDINGS**: Return with:
+   - **Value Assessment**: Clear judgment on whether this is worth implementing/fixing/aligning
+   - **Alternative Approaches**: If multiple valid approaches exist, present 2-3 options with trade-offs
+   - **Complexity Analysis**: Honest assessment of implementation and maintenance costs
+   - **Investigation Verdict**: One of the verdict types specific to your review type
+
+3. **WAIT FOR NEW KEYWORD WITH CONTEXT-APPROPRIATE MEANING**: 
+   Present findings and then EXPLICITLY state keywords based on the investigation verdict.
+   The verdict determines which keywords are available and what they mean.
+</InvestigationPattern>
+
+<InvestigationVerdictHandling>
+## Investigation Verdict Presentation Format
+
+After investigation, present verdict and context-appropriate keywords:
+
+### For POSITIVE verdicts (Recommended/Confirmed):
+```
+Investigation verdict: [VERDICT_TYPE] - Investigation supports [action]
+[Include brief reason if verdict was modified from original]
+
+Please respond with one of these keywords:
+- "[primary_action]" - ACTION: [Implement the recommendation]
+- "[skip_action]" - ACTION: [Decline despite investigation support]
+```
+
+### For NEGATIVE verdicts (Not Recommended/Rejected):
+```
+Investigation verdict: [VERDICT_TYPE] - Investigation recommends NOT [action]
+Reason: [specific reason from investigation]
+
+Please respond with one of these keywords:
+- "[accept_rejection]" - ACTION: Accept investigation's recommendation to not [action]
+- "[override]" - ACTION: Ignore investigation results and [action] anyway
+```
+
+### For MODIFIED verdicts:
+```
+Investigation verdict: MODIFIED - Investigation suggests implementing with changes: [describe changes]
+
+Please respond with one of these keywords:
+- "[primary_action]" - ACTION: Implement the MODIFIED version
+- "[skip_action]" - ACTION: Decline both original and modified versions
+```
+
+Note: After investigation, "investigate" keyword is no longer available - only decision keywords.
+</InvestigationVerdictHandling>
+
+<CumulativeUpdateRule>
+## CRITICAL Cumulative Update Rule
+
+**This rule is MANDATORY and must be applied after EVERY keyword response before presenting the next item:**
+
+Before presenting the next item, you MUST:
+
+1. **Review ALL changes** made in this session so far:
+   - What has been implemented/modified/accepted/skipped
+   - How these changes affect remaining items
+   
+2. **Update remaining items** to account for cumulative effects:
+   - **Line number adjustments**: If code was modified, line numbers in remaining items may have shifted
+   - **Resolution detection**: Some items may have been indirectly resolved by previous changes
+   - **Dependency updates**: If an item depended on something now changed, update its description
+   - **Context changes**: Suggestions may need modification based on newly accepted patterns
+   
+3. **Filter out resolved items**: Don't present items that were fixed as a side effect of other changes
+
+4. **Modify suggestions if needed**: Update recommendations to align with decisions already made
+
+Example scenarios:
+- If you accepted a new enum pattern, update other recommendations to use that pattern
+- If you fixed an error handling approach, apply it consistently in remaining suggestions
+- If you aligned one API, check if others need the same alignment
+
+**NEVER present an item without considering how previous session changes affect it.**
+</CumulativeUpdateRule>
+
+<EnforcementRules>
+## Keyword Enforcement Rules
+
+These rules are MANDATORY and apply to all review types:
+
+1. **NO OTHER RESPONSES ACCEPTED**: 
+   - Only the specified keywords trigger actions
+   - If user types anything else, politely restate the keyword options
+   - Do not interpret or guess user intent from non-keyword responses
+
+2. **MANDATORY STOPPING**: 
+   - ALWAYS stop after each item presentation
+   - Never continue to the next item without user keyword response
+   - Even if only one item remains, still stop and wait
+
+3. **NO ASSUMPTIONS**: 
+   - Never assume user intent - wait for explicit keyword
+   - Don't skip items assuming user doesn't care
+   - Don't batch similar items together
+
+4. **NO BATCHING**: 
+   - Process exactly one item per user keyword response
+   - Never group items even if they seem related
+   - Each item gets its own presentation and decision
+
+5. **INVESTIGATE LIMITATION**: 
+   - "investigate" keyword only available on first presentation of an item
+   - After investigation completes, only decision keywords are accepted
+   - Cannot investigate the same item twice
+
+6. **KEYWORD CONSISTENCY**:
+   - Use the exact keywords defined for your review type
+   - Don't create variations or shortcuts
+   - Keywords must match exactly (case-insensitive is acceptable)
+</EnforcementRules>
+
+<FinalSummaryTemplate>
+## Final Summary Template
+
+When all items are addressed, provide a summary using this structure:
+
+```
+[Review Type] Complete!
+
+**Results Summary:**
+- [Primary Action Taken]: [X]
+  - [Subcategory 1]: [count]
+  - [Subcategory 2]: [count]
+  
+- [Secondary Action Taken]: [Y]
+  - [List items with brief descriptions]
+  - [Note where documented if applicable]
+  
+- [Positive Aspect Maintained]: [Z]
+  - [Quick recap of what was good]
+
+[Closing statement appropriate to review type]
+```
+
+Examples:
+- Design Review: "Plan document has been updated with approved recommendations."
+- Code Review: "All changes have been applied to your working directory."
+- Alignment Review: "Plan and implementation are now synchronized."
+</FinalSummaryTemplate>
+
+<SpecialCaseHandling>
+## Special Case Handling
+
+Some review types have unique keywords or special handling:
+
+### "skip with prejudice" (Design Review only)
+- Used when reviewer repeatedly suggests already-rejected items
+- Creates permanent rejection with ⚠️ PREJUDICE WARNING
+- Strongest form of rejection
+- Include warning: "DO NOT SUGGEST THIS AGAIN"
+
+### "override" keyword (After negative investigation verdict)
+- Only available when investigation recommends NOT doing something
+- Allows user to proceed despite negative recommendation
+- Document both investigation findings and override rationale
+
+### "accept as built" (Alignment Review only)
+- Unique to alignment review where deviation can be accepted
+- Updates plan to match implementation rather than vice versa
+- Documents the accepted deviation with rationale
+
+### Multiple verdict types
+Some reviews have more complex verdict structures:
+- Design Review: CONFIRMED, MODIFIED, REJECTED
+- Code Review: FIX RECOMMENDED, FIX MODIFIED, FIX NOT RECOMMENDED  
+- Alignment Review: ALIGN RECOMMENDED, ACCEPT RECOMMENDED, DEFER RECOMMENDED
+
+Each verdict type should have appropriate keyword options that make semantic sense.
+</SpecialCaseHandling>
+
+<CustomizationInstructions>
+## How to Use This Pattern File
+
+When implementing a review command, reference this file and specify:
+
+1. **Which tagged sections to follow** completely:
+   - Example: "Follow <CorePresentationFlow> exactly as specified"
+   
+2. **Your specific values for placeholders**:
+   - [Review Type]: "Design Review", "Code Review", "Plan Alignment Review"
+   - [items]: "recommendations", "issues", "discrepancies"
+   - [DOMAIN VALUES]: "code elegance AND practical utility"
+   
+3. **Your specific keywords and their actions**:
+   - List exact keywords for your review type
+   - Define precise ACTION descriptions
+   
+4. **Your investigation verdicts**:
+   - Define verdict types specific to your domain
+   - Specify which keywords are available for each verdict
+   
+5. **Any special cases** unique to your review type:
+   - Additional keywords like "skip with prejudice"
+   - Special handling rules
+   
+6. **What to keep in your file**:
+   - Unique keyword response actions
+   - Specific document/code modifications
+   - Review-specific analysis requirements
+   - Custom prompt templates for the subagent
+
+This pattern file provides the structure; your review file provides the specifics.
+</CustomizationInstructions>
