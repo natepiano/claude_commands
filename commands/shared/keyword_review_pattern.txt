@@ -61,10 +61,17 @@ After receiving the subagent's review and filtering:
    Then STOP
 
 5. **MANDATORY**: Wait for user to respond with EXACTLY one of the specified keywords
+
+### Auto-Investigation Mode
+When using parallel investigation pattern:
+- Follow <ParallelInvestigationPattern> after initial review
+- All findings come pre-investigated with verdicts
+- Post-investigation keywords are presented based on verdict
+- "investigate further" is available for targeted follow-up analysis when user needs deeper exploration
 </KeywordDecisionProcess>
 
 <KeywordResponseFlow>
-## Standard Keyword Response Flow
+## Keyword Response Flow
 
 For each keyword response:
 
@@ -123,6 +130,8 @@ Investigation verdict: [VERDICT_TYPE] - Investigation supports [action]
 Please respond with one of these keywords:
 - "[primary_action]" - ACTION: [Implement the recommendation]
 - "[skip_action]" - ACTION: [Decline despite investigation support]
+- "[skip_with_prejudice]" - ACTION: [Permanently reject if applicable to review type]
+- "investigate further" - ACTION: Request targeted deeper analysis
 ```
 
 ### For NEGATIVE verdicts (Not Recommended/Rejected):
@@ -132,7 +141,9 @@ Reason: [specific reason from investigation]
 
 Please respond with one of these keywords:
 - "[accept_rejection]" - ACTION: Accept investigation's recommendation to not [action]
-- "[override]" - ACTION: Ignore investigation results and [action] anyway
+- "override" - ACTION: Ignore investigation results and [action] anyway
+- "[skip_with_prejudice]" - ACTION: [Permanently reject if applicable to review type]
+- "investigate further" - ACTION: Request targeted deeper analysis
 ```
 
 ### For MODIFIED verdicts:
@@ -142,10 +153,209 @@ Investigation verdict: MODIFIED - Investigation suggests implementing with chang
 Please respond with one of these keywords:
 - "[primary_action]" - ACTION: Implement the MODIFIED version
 - "[skip_action]" - ACTION: Decline both original and modified versions
+- "[skip_with_prejudice]" - ACTION: [Permanently reject if applicable to review type]
+- "investigate further" - ACTION: Request targeted deeper analysis
 ```
 
 Note: After investigation, "investigate" keyword is no longer available - only decision keywords.
 </InvestigationVerdictHandling>
+
+<InvestigationAgentInstructions>
+## Shared Investigation Agent Instructions
+
+When launching investigation agents, combine these shared requirements with review-specific focus areas:
+
+### Core Investigation Principles (All Review Types)
+All investigation agents must act as **responsible engineering judges** who:
+1. **Balance ideal vs pragmatic**: Find the sweet spot between perfect design and practical implementation
+2. **Be evidence-based**: Ground all judgments in concrete code examples and real scenarios
+3. **Consider trade-offs**: Present pros/cons rather than absolute judgments
+4. **Suggest alternatives**: When rejecting, propose simpler or better approaches
+5. **Think long-term**: Consider maintenance, onboarding, and evolution costs
+6. **Avoid perfectionism**: Recognize when "good enough" is better than perfect
+7. **Respect pragmatism**: Value working code and team velocity alongside elegance
+8. **Check for over-engineering**: Be skeptical of complexity for complexity's sake
+
+### CRITICAL Tool Usage Restrictions for Investigations
+**NEVER run commands that could block or hang**:
+- ❌ DO NOT launch applications (`cargo run`, `npm start`, app launchers)
+- ❌ DO NOT run interactive commands that wait for input
+- ❌ DO NOT execute long-running processes or servers
+- ❌ DO NOT run watch commands or continuous monitors
+
+**ONLY use these safe tools**:
+- ✅ Read tool - examine files
+- ✅ Grep/Glob tools - search codebase
+- ✅ WebSearch/WebFetch - research information
+- ✅ Quick analysis commands that return immediately (`cargo check --message-format json`, `git log -1`)
+
+**If you need runtime information**: Read existing logs, test outputs, or documentation instead of running the application
+
+### Investigation Process
+Each investigation should:
+1. Analyze the specific finding/issue/discrepancy in context
+2. **PRESERVE the current and proposed code examples from the original finding**
+3. Apply the review-specific investigation focus (provided by each review command)
+4. Consider both immediate and long-term implications
+5. Evaluate alternative approaches if relevant
+6. If suggesting modifications, provide **MODIFIED CODE** showing the improved version
+7. Provide a clear verdict with rationale
+
+### MANDATORY Investigation Output Template - CRITICAL COMPLIANCE
+
+**TEMPLATE ENFORCEMENT**: Investigation agents MUST copy and fill out this EXACT template. Any response not using this structure is INVALID and will be rejected.
+
+**START TEMPLATE - COPY EXACTLY:**
+
+```
+Investigation Verdict: [VERDICT_TYPE - e.g., CONFIRMED, MODIFIED, REJECTED]
+
+Rationale: [2-3 sentence explanation of verdict]
+
+## Current State
+[Choose appropriate format based on review type]
+
+### For Design Review - Current Plan:
+```markdown
+[Quote what the plan currently says about this area]
+```
+
+### For Design/Code Review - Current Code:
+```[language]
+// File: path/to/file.rs (lines X-Y)
+[Exact code from files showing the current state]
+```
+
+## Proposed Change
+[Choose appropriate format based on review type]
+
+### For Design Review - Proposed Plan Addition:
+```markdown
+[Exact text to add to the plan document]
+```
+
+### For All Reviews - Proposed Code:
+```[language]
+// This code demonstrates the proposed solution:
+[Concrete code example showing the improvement]
+```
+
+Trade-offs:
+- Pro: [Main benefit]
+- Con: [Main drawback if any]
+
+Complexity: [Low/Medium/High] - [Brief explanation]
+
+[If MODIFIED verdict, include:]
+Alternative Approach:
+[Describe the modification to the original recommendation]
+```
+**END TEMPLATE**
+
+**MANDATORY COMPLIANCE CHECKLIST** - Investigation agents must verify:
+- [ ] Used exact template structure above
+- [ ] Included Current State section with code blocks
+- [ ] Included Proposed Change section with code blocks  
+- [ ] All code blocks show concrete examples, not descriptions
+- [ ] Template sections are complete, not summarized
+
+**ENFORCEMENT**: Any investigation missing these elements will be immediately rejected and must be redone.
+
+### Placeholder Values for Review Commands
+Each review command should provide:
+- **[DOMAIN VALUES]**: The specific balance to maintain (e.g., "code elegance AND practical utility")
+- **[INVESTIGATION FOCUS]**: Specific criteria for that review type
+- **[EXPECTED VERDICTS]**: The verdict types for that review
+</InvestigationAgentInstructions>
+
+<ParallelInvestigationPattern>
+## Parallel Investigation Pattern (Auto-Investigation Mode)
+
+When configured for auto-investigation, the review process changes:
+
+1. **INITIAL SUBAGENT REVIEW**: Get findings from initial review agent as normal
+
+2. **FILTER RESULTS**: Remove any items already addressed:
+   - For design review: Check Skip Notes section for previously skipped items
+   - For code review: Check if issue was already fixed by previous changes
+   - For alignment review: Check if discrepancy was resolved by prior alignments
+
+3. **AUTOMATIC PARALLEL INVESTIGATION**: 
+   - Launch parallel investigation agents for ALL filtered findings simultaneously
+   - Create parallel Task tool invocations in a single response
+   - Each agent MUST be instructed to:
+     - Follow the Required Investigation Output Template from <InvestigationAgentInstructions>
+     - Include Current State and Proposed Change sections WITH CODE BLOCKS
+     - Return INVALID if unable to provide code examples
+   - Each agent receives:
+     - The specific finding/issue/discrepancy with its code examples
+     - Standard investigation criteria from <InvestigationPattern>
+     - Domain-specific balance values (elegance vs utility, quality vs pragmatism, etc.)
+     - EXPLICIT instruction: "You MUST use the Required Investigation Output Template with code blocks"
+   - Wait for all investigations to complete
+
+4. **COLLECT AND MERGE**:
+   - **VALIDATION STEP**: Check each investigation result for required template compliance
+   - **REJECT** investigations missing Current State or Proposed Change sections with code blocks
+   - For compliant investigations: Combine original finding with investigation results
+   - Include verdict, value assessment, alternatives, complexity analysis
+   - Prepare enriched findings for presentation
+
+5. **CREATE TODO LIST**: Build todos with enriched findings
+
+6. **PRESENT PRE-INVESTIGATED FINDINGS**:
+   Present each finding using this structure:
+   
+   ```
+   [CATEGORY-ID]: [Title]
+   
+   Investigation Verdict: [VERDICT] ✅/⚠️/❌
+   
+   [Rationale from investigation]
+   
+   ## Current State
+   [Current Plan/Code from investigation - MUST include code blocks]
+   
+   ## Proposed Change  
+   [Proposed Plan/Code from investigation - MUST include code blocks]
+   
+   Trade-offs:
+   [From investigation]
+   
+   Complexity: [From investigation]
+   
+   Available keywords for [VERDICT] verdict:
+   - [keyword] - [action]
+   - [keyword] - [action]
+   ```
+   
+   **CRITICAL**: If investigation results don't include Current State and Proposed Change sections with code blocks, DO NOT present the finding - request investigation correction first
+</ParallelInvestigationPattern>
+
+<InvestigateFurtherPattern>
+## Investigate Further Pattern
+
+When user responds "investigate further" (available after initial investigation):
+
+1. **PROMPT FOR GUIDANCE**: Ask user:
+   "What specific aspect would you like me to investigate further?"
+   
+2. **TASK FOCUSED INVESTIGATION**: Launch new investigation with:
+   - Original finding context
+   - Previous investigation results
+   - User's specific guidance
+   - Targeted analysis based on user direction
+
+3. **PRESENT SUPPLEMENTAL FINDINGS**: 
+   - Show new insights from focused investigation
+   - Update verdict if findings change recommendation
+   - Present same keyword options (excluding "investigate further" to prevent loops)
+
+4. **KEYWORD OPTIONS AFTER FURTHER INVESTIGATION**:
+   - Same as original post-investigation keywords
+   - No additional "investigate further" to prevent infinite loops
+   - User must make decision after one round of further investigation
+</InvestigateFurtherPattern>
 
 <CumulativeUpdateRule>
 ## CRITICAL Cumulative Update Rule

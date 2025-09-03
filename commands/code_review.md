@@ -99,7 +99,12 @@ Beyond the shared principles, also analyze:
 
 ## Prompt Template
 ```
-Task a general-purpose subagent to review [REVIEW TARGET: git diff or specific files] and provide actionable code review feedback in the exact format specified above.
+Task a general-purpose subagent to review ACTUAL CODE [REVIEW TARGET: git diff or specific files] and provide actionable code review feedback in the exact format specified above.
+
+**CRITICAL CONTEXT**: You are reviewing ACTUAL CODE for quality issues, NOT a plan.
+- You're looking at real implementation code
+- Your job is to find bugs, quality issues, and improvements IN THE CODE
+- You are NOT comparing against a plan or reviewing documentation
 
 **TARGET SELECTION**:
 - If `$ARGUMENTS` is provided: Review all code in specified files/directories (as-built review)
@@ -136,21 +141,55 @@ TYPE-SYSTEM recommendations should come FIRST and be treated as highest priority
 Each issue must include the exact location, current code, and suggested code to make fixes straightforward.
 ```
 
-## Post-Review Instructions - Keyword-Driven Fix Process
+## Post-Review Instructions - Auto-Investigation and Fix Process
 
-**CRITICAL**: Read `~/.claude/commands/shared/keyword_review_pattern.txt` and follow the shared patterns with these customizations:
+**STEP 1: RECEIVE SUBAGENT'S REVIEW**
+Get the initial code review findings from the subagent.
 
-### Pattern Application for Code Review
+**STEP 2: EXECUTE PARALLEL INVESTIGATION**
+IMMEDIATELY after receiving the subagent's review:
+1. Filter out any issues already fixed by previous changes
+2. Launch parallel investigation agents for ALL remaining issues using multiple Task tool invocations in a single response
+3. **CRITICAL**: Pass the COMPLETE issue to each investigation agent, including the Current and Proposed code examples
+4. **CRITICAL**: Instruct each investigation agent with these EXACT words:
+   "You MUST use the MANDATORY Investigation Output Template from <InvestigationAgentInstructions>. Copy the exact template structure and fill it out completely. Include Current State and Proposed Change sections with code blocks. Any response not following this template is INVALID."
+   
+   **Investigation specifics**:
+   - **DOMAIN VALUES**: "code quality AND pragmatism"
+   - **INVESTIGATION FOCUS**:
+     - Assess actual bug risk vs stylistic preference
+     - Evaluate fix complexity and refactoring scope
+     - Consider impact on code clarity and readability
+     - Check for performance implications
+     - Analyze maintenance burden reduction
+     - Verify fix won't introduce new issues
+     - Consider alignment with team conventions
+   - **EXPECTED VERDICTS**: FIX RECOMMENDED, FIX MODIFIED, or FIX NOT RECOMMENDED
+
+5. Wait for all investigations to complete
+6. **VALIDATION**: Check each investigation result - REJECT any that don't use the template with code blocks
+7. Merge compliant issues with their investigation results
+
+**STEP 3: BEGIN KEYWORD-DRIVEN REVIEW**
+Now follow the shared patterns from `~/.claude/commands/shared/keyword_review_pattern.txt`:
 - Follow `<CorePresentationFlow>` with [Review Type] = "Code Review" and [items] = "issues"
-- Follow `<KeywordDecisionProcess>` with keywords: fix, skip, investigate
-- Follow `<InvestigationPattern>` with [DOMAIN VALUES] = "code quality and pragmatism"
+- Follow `<ParallelInvestigationPattern>` Step 6 for presenting pre-investigated findings
+- Follow `<InvestigateFurtherPattern>` if user requests deeper analysis
+- Follow `<KeywordDecisionProcess>` for keyword enforcement
 - Follow `<CumulativeUpdateRule>` for code changes (line numbers, resolved issues)
 - Follow `<EnforcementRules>` completely
-- Use `<FinalSummaryTemplate>` with issue categories (TYPE-SYSTEM, QUALITY, COMPLEXITY, etc.)
+- Use `<FinalSummaryTemplate>` with issue categories
 
-### Code Review Specific Keywords
-**Primary keywords**: fix, skip, investigate
-**After investigation**: fix, skip (for RECOMMENDED/MODIFIED), accept, override (for NOT RECOMMENDED)
+### Code Review Specific Keywords (Based on Verdict)
+**For FIX RECOMMENDED/MODIFIED verdicts**:
+- `fix` - Implement the fix immediately
+- `skip` - Don't fix this issue
+- `investigate further` - Get targeted deeper analysis
+
+**For FIX NOT RECOMMENDED verdicts**:
+- `accept` - Accept recommendation to not fix
+- `override` - Fix anyway despite recommendation
+- `investigate further` - Get targeted deeper analysis
 
 ### Code Review Keyword Response Actions
 
@@ -160,75 +199,22 @@ Each issue must include the exact location, current code, and suggested code to 
 3. Show the implemented change with a brief confirmation
 4. Mark current todo as completed
 5. **CRITICAL**: Before presenting the next issue, review ALL fixes applied in this session so far. Update remaining issues to account for the cumulative changes - adjust line numbers, remove issues already resolved by previous fixes, and modify suggestions to align with the current state of the code.
-6. Present next issue, then EXPLICITLY state the available keywords:
-   ```
-   Please respond with one of these keywords:
-   - "fix" - ACTION: Implement the suggested fix immediately
-   - "skip" - ACTION: Skip this issue without fixing
-   - "investigate" - ACTION: Launch deep analysis to validate if this is worth fixing
-   ```
-   Then STOP
+6. Present next issue with its investigation verdict, then EXPLICITLY state the available keywords based on verdict
+7. STOP and wait for user response
 
 **When user responds "skip"**:
 1. Mark current todo as completed
 2. Add to skipped issues list (in memory for final summary)
 3. **CRITICAL**: Before presenting the next issue, review ALL fixes applied and issues skipped in this session so far. Ensure remaining issues are still relevant given the accumulated changes.
-4. Present next issue, then EXPLICITLY state the available keywords:
-   ```
-   Please respond with one of these keywords:
-   - "fix" - ACTION: Implement the suggested fix immediately
-   - "skip" - ACTION: Skip this issue without fixing
-   - "investigate" - ACTION: Launch deep analysis to validate if this is worth fixing
-   ```
-   Then STOP
+4. Present next issue with its investigation verdict, then EXPLICITLY state the available keywords based on verdict
+5. STOP and wait for user response
 
-**When user responds "investigate"**:
-1. **TASK INVESTIGATION AGENT**: Use Task tool to deep-dive with a general-purpose agent acting as a **responsible judge balancing code quality and pragmatism**:
-   - **CRITICAL JUDGMENT MANDATE**: Act as a responsible engineering judge who values both code elegance AND practical utility
-   - **Balance aesthetics vs pragmatism**: Weigh the beauty of clean code against real-world implementation costs
-   - **Provide sound engineering judgment**: Consider maintenance burden, team cognitive load, and actual business value
-   - **Analyze whether the fix provides genuine value vs over-complication**: Be skeptical of perfectionism for perfectionism's sake
-   - **Research alternative approaches and trade-offs**: Find the sweet spot between ideal and practical
-   - **Examine real-world impact and complexity costs**: Consider developer time, debugging difficulty, and onboarding friction
-   - **Check if simpler solutions exist that achieve the same goals**: Sometimes "good enough" is better than perfect
-   - **Provide evidence-based assessment**: Ground your judgment in concrete examples and real scenarios
-2. **PRESENT INVESTIGATION FINDINGS**: Return with:
-   - **Value Assessment**: Clear judgment on whether this is worth fixing
-   - **Alternative Approaches**: If multiple valid approaches exist, present 2-3 options with trade-offs
-   - **Complexity Analysis**: Honest assessment of implementation cost vs benefit
-   - **Investigation Verdict**: One of:
-     - **FIX RECOMMENDED**: Investigation supports implementing the fix
-     - **FIX MODIFIED**: Investigation suggests a modified approach (specify the changes)
-     - **FIX NOT RECOMMENDED**: Investigation recommends NOT fixing this issue
-3. **WAIT FOR NEW KEYWORD WITH CONTEXT-APPROPRIATE MEANING**: Present findings and then EXPLICITLY state based on the investigation verdict:
-   
-   **If FIX RECOMMENDED**:
-   ```
-   Investigation verdict: FIX RECOMMENDED - Investigation supports implementing this fix
-   
-   Please respond with one of these keywords:
-   - "fix" - ACTION: Implement the recommended fix
-   - "skip" - ACTION: Skip despite investigation support
-   ```
-   
-   **If FIX MODIFIED**:
-   ```
-   Investigation verdict: FIX MODIFIED - Investigation suggests implementing with changes: [describe changes]
-   
-   Please respond with one of these keywords:
-   - "fix" - ACTION: Implement the MODIFIED fix
-   - "skip" - ACTION: Skip both original and modified versions
-   ```
-   
-   **If FIX NOT RECOMMENDED**:
-   ```
-   Investigation verdict: FIX NOT RECOMMENDED - Investigation recommends NOT fixing this issue
-   Reason: [specific reason from investigation]
-   
-   Please respond with one of these keywords:
-   - "accept" - ACTION: Accept investigation's recommendation to not fix (equivalent to "skip")
-   - "override" - ACTION: Ignore investigation and implement fix anyway
-   ```
+**When user responds "investigate further"**:
+1. **ASK FOR GUIDANCE**: "What specific aspect would you like me to investigate further?"
+2. **WAIT FOR USER INPUT**: Get their specific investigation focus
+3. **TASK FOCUSED INVESTIGATION**: Launch new investigation with user's guidance
+4. **PRESENT SUPPLEMENTAL FINDINGS**: Show new insights
+5. **OFFER SAME KEYWORDS**: Present keywords based on updated verdict (no more "investigate further" to prevent loops)
 
 ### Final Summary
 When all issues are addressed, provide:

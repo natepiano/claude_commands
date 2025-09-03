@@ -1,10 +1,22 @@
-Create a todo list for this plan using your todo tool, then STOP.
+## Arguments
+If `$ARGUMENTS` is provided, it should be the name of a `plan*.md` file in the project root that will be the basis for implementation. For example:
+- `plan_enum_generation.md`
+- `plan_mutation_system.md`
+- `plan_api_redesign.md`
+
+If no arguments are provided, the command will work with the plan document currently being worked on in the session.
+
+## Overview
+Create a todo list for the specified plan using your todo tool, then STOP.
 
 <PlanDocumentEvaluation>
-If the user is working on a plan document:
-- Check if the plan document is checked into git
-- If it is not checked in, create an appropriate commit message for it and check it in
-- This ensures the plan is preserved before implementation begins
+**MANDATORY FIRST STEP - PLAN DOCUMENT SELECTION**:
+1. If `$ARGUMENTS` is provided: Read the specified plan document from the project root
+2. If no arguments: Use the plan document currently being worked on in the session
+3. Verify the plan document exists and is readable
+4. Check if the plan document is checked into git
+5. If it is not checked in, create an appropriate commit message for it and check it in
+6. This ensures the plan is preserved before implementation begins
 </PlanDocumentEvaluation>
 
 It is **CRITICAL** that you think deeply about the implementation according to the instructions given here so that you make the best possible implementation todo list.

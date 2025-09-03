@@ -109,7 +109,13 @@ Brief overview of alignment status (2-3 sentences max)
 
 ## Prompt Template
 ```
-Task a general-purpose subagent to review implementation alignment with [PLAN DOCUMENT NAME] and provide actionable discrepancies in the exact format specified above.
+Task a general-purpose subagent to review whether IMPLEMENTED CODE matches [PLAN DOCUMENT NAME] and provide actionable discrepancies in the exact format specified above.
+
+**CRITICAL CONTEXT**: You are checking if the ACTUAL IMPLEMENTATION matches what was planned.
+- The plan describes what SHOULD have been built
+- The code shows what WAS ACTUALLY built
+- Your job is to find where they don't match
+- You are NOT reviewing the quality of the plan itself
 
 **MANDATORY FIRST STEP - READ PLAN DOCUMENT**:
 1. Read the complete plan document: `$ARGUMENTS`
@@ -167,21 +173,63 @@ Each finding must be actionable - provide enough detail for immediate correction
 Include positive findings in the "Well-Aligned Areas" section to acknowledge good adherence.
 ```
 
-## Post-Review Instructions - Keyword-Driven Alignment Process
+## Post-Review Instructions - Auto-Investigation and Alignment Process
 
-**CRITICAL**: Read `~/.claude/commands/shared/keyword_review_pattern.txt` and follow the shared patterns with these customizations:
+**STEP 1: RECEIVE SUBAGENT'S REVIEW**
+Get the initial alignment discrepancy findings from the subagent.
 
-### Pattern Application for Plan Alignment Review
+**STEP 2: EXECUTE PARALLEL INVESTIGATION**
+IMMEDIATELY after receiving the subagent's review:
+1. Filter out any discrepancies already resolved by prior alignments
+2. Launch parallel investigation agents for ALL remaining discrepancies using multiple Task tool invocations in a single response
+3. **CRITICAL**: Pass the COMPLETE discrepancy to each investigation agent, including the Plan vs Actual code examples
+4. **CRITICAL**: Instruct each investigation agent with these EXACT words:
+   "You MUST use the MANDATORY Investigation Output Template from <InvestigationAgentInstructions>. Copy the exact template structure and fill it out completely. Include Current State and Proposed Change sections with code blocks. Any response not following this template is INVALID."
+   
+   **Investigation specifics**:
+   - **DOMAIN VALUES**: "plan adherence AND pragmatism"
+   - **INVESTIGATION FOCUS**:
+     - Understand why the implementation diverged from plan
+     - Evaluate technical merit of both approaches
+     - Check if implementation discovered improvements
+     - Assess complexity/risk of alignment effort
+     - Consider unforeseen technical constraints
+     - Analyze business/functional impact
+     - Determine if plan should be updated instead
+   - **EXPECTED VERDICTS**: ALIGN RECOMMENDED, ACCEPT RECOMMENDED, or DEFER RECOMMENDED
+
+5. Wait for all investigations to complete
+6. **VALIDATION**: Check each investigation result - REJECT any that don't use the template with code blocks
+7. Merge compliant discrepancies with their investigation results
+
+**STEP 3: BEGIN KEYWORD-DRIVEN REVIEW**
+Now follow the shared patterns from `~/.claude/commands/shared/keyword_review_pattern.txt`:
 - Follow `<CorePresentationFlow>` with [Review Type] = "Plan Alignment Review" and [items] = "discrepancies"
-- Follow `<KeywordDecisionProcess>` with keywords: align to plan, skip, accept as built, investigate
-- Follow `<InvestigationPattern>` with [DOMAIN VALUES] = "plan adherence and pragmatism"
+- Follow `<ParallelInvestigationPattern>` Step 6 for presenting pre-investigated findings
+- Follow `<InvestigateFurtherPattern>` if user requests deeper analysis
+- Follow `<KeywordDecisionProcess>` for keyword enforcement
 - Follow `<CumulativeUpdateRule>` for both code and plan updates
 - Follow `<EnforcementRules>` completely
-- Use `<FinalSummaryTemplate>` with alignment categories (MISSING, MISMATCH, UNPLANNED, etc.)
+- Use `<FinalSummaryTemplate>` with alignment categories
 
-### Alignment Review Specific Keywords
-**Primary keywords**: align to plan, skip, accept as built, investigate
-**After investigation**: Varies by verdict (see investigation verdict handling below)
+### Alignment Review Specific Keywords (Based on Verdict)
+**For ALIGN RECOMMENDED verdict**:
+- `align to plan` - Modify code to match plan
+- `skip` - Defer to TECH_DEBT.md
+- `accept as built` - Update plan to match implementation
+- `investigate further` - Get targeted deeper analysis
+
+**For ACCEPT RECOMMENDED verdict**:
+- `accept as built` - Update plan to match implementation
+- `align to plan` - Modify code anyway
+- `skip` - Defer decision
+- `investigate further` - Get targeted deeper analysis
+
+**For DEFER RECOMMENDED verdict**:
+- `skip` - Add to TECH_DEBT.md
+- `align to plan` - Align now despite recommendation
+- `accept as built` - Accept deviation instead
+- `investigate further` - Get targeted deeper analysis
 
 ### Alignment Review Keyword Response Actions
 
@@ -190,15 +238,8 @@ Include positive findings in the "Well-Aligned Areas" section to acknowledge goo
 2. Show the implemented change with before/after comparison
 3. Mark current todo as completed
 4. **CRITICAL**: Before presenting the next discrepancy, review ALL alignments made in this session so far. Update remaining discrepancies to account for the cumulative changes - some mismatches may now be resolved, line numbers may have shifted, and new considerations may apply.
-5. Present next discrepancy, then EXPLICITLY state the available keywords:
-   ```
-   Please respond with one of these keywords:
-   - "align to plan" - ACTION: Modify implementation to match the plan specification
-   - "skip" - ACTION: Defer alignment to later and document in TECH_DEBT.md
-   - "accept as built" - ACTION: Accept deviation and update plan documentation
-   - "investigate" - ACTION: Launch deep analysis to understand the discrepancy
-   ```
-   Then STOP
+5. Present next discrepancy with its investigation verdict, then EXPLICITLY state the available keywords based on verdict
+6. STOP and wait for user response
 
 **When user responds "skip"**:
 1. **DOCUMENT IN TECH_DEBT.md**: Add entry for deferred alignment:
@@ -207,20 +248,13 @@ Include positive findings in the "Well-Aligned Areas" section to acknowledge goo
    - **Plan Section**: [Reference]
    - **Current State**: [Brief description]
    - **Required Change**: [What needs to be done]
-   - **Deferral Date**: [Today's date]
+   - **Status**: Deferred
    - **Reason**: User decision - alignment deferred
    ```
 2. Mark current todo as completed
 3. **CRITICAL**: Before presenting the next discrepancy, review ALL changes (alignments, deferrals, acceptances) made in this session so far. Adjust remaining discrepancies based on the cumulative state.
-4. Present next discrepancy, then EXPLICITLY state the available keywords:
-   ```
-   Please respond with one of these keywords:
-   - "align to plan" - ACTION: Modify implementation to match the plan specification
-   - "skip" - ACTION: Defer alignment to later and document in TECH_DEBT.md
-   - "accept as built" - ACTION: Accept deviation and update plan documentation
-   - "investigate" - ACTION: Launch deep analysis to understand the discrepancy
-   ```
-   Then STOP
+4. Present next discrepancy with its investigation verdict, then EXPLICITLY state the available keywords based on verdict
+5. STOP and wait for user response
 
 **When user responds "accept as built"**:
 1. **UPDATE PLAN DOCUMENT**: Add deviation note to the plan:
@@ -230,69 +264,19 @@ Include positive findings in the "Well-Aligned Areas" section to acknowledge goo
    - **Original**: [What was planned]
    - **Actual**: [What was implemented]
    - **Rationale**: Accepted deviation - [reason if provided]
-   - **Date**: [Today's date]
+   - **Status**: Accepted
    ```
 2. Mark current todo as completed
 3. **CRITICAL**: Before presenting the next discrepancy, review ALL changes (alignments, deferrals, acceptances) made in this session so far. Adjust remaining discrepancies based on the cumulative state.
-4. Present next discrepancy, then EXPLICITLY state the available keywords:
-   ```
-   Please respond with one of these keywords:
-   - "align to plan" - ACTION: Modify implementation to match the plan specification
-   - "skip" - ACTION: Defer alignment to later and document in TECH_DEBT.md
-   - "accept as built" - ACTION: Accept deviation and update plan documentation
-   - "investigate" - ACTION: Launch deep analysis to understand the discrepancy
-   ```
-   Then STOP
+4. Present next discrepancy with its investigation verdict, then EXPLICITLY state the available keywords based on verdict
+5. STOP and wait for user response
 
-**When user responds "investigate"**:
-1. **TASK INVESTIGATION AGENT**: Use Task tool to deep-dive with a general-purpose agent acting as a **responsible judge balancing plan adherence and pragmatism**:
-   - **CRITICAL JUDGMENT MANDATE**: Act as a responsible engineering judge who values both plan adherence AND practical implementation realities
-   - **Understand why the deviation occurred**: Research the technical or practical reasons
-   - **Analyze benefits/drawbacks of both approaches**: Weigh plan approach vs actual implementation
-   - **Check if plan was unrealistic or implementation is better**: Sometimes reality improves on the plan
-   - **Research if technical constraints forced the change**: Understand if deviation was necessary
-   - **Provide evidence-based recommendation**: Ground your judgment in concrete technical facts
-2. **PRESENT INVESTIGATION FINDINGS**: Return with:
-   - **Root Cause**: Why the discrepancy exists
-   - **Trade-offs**: Plan approach vs actual approach with clear pros/cons
-   - **Technical Analysis**: Constraints and considerations discovered
-   - **Investigation Verdict**: One of:
-     - **ALIGN RECOMMENDED**: Investigation supports aligning to the plan
-     - **ACCEPT RECOMMENDED**: Investigation supports accepting the as-built deviation
-     - **DEFER RECOMMENDED**: Investigation suggests deferring due to complexity/risk
-3. **WAIT FOR NEW KEYWORD WITH CONTEXT-APPROPRIATE MEANING**: Present findings and then EXPLICITLY state based on the investigation verdict:
-   
-   **If ALIGN RECOMMENDED**:
-   ```
-   Investigation verdict: ALIGN RECOMMENDED - Investigation supports aligning implementation to plan
-   
-   Please respond with one of these keywords:
-   - "align to plan" - ACTION: Implement the alignment to match plan specification
-   - "skip" - ACTION: Defer alignment despite recommendation
-   - "accept as built" - ACTION: Accept deviation despite recommendation
-   ```
-   
-   **If ACCEPT RECOMMENDED**:
-   ```
-   Investigation verdict: ACCEPT RECOMMENDED - Investigation supports accepting the as-built deviation
-   Reason: [specific reason from investigation]
-   
-   Please respond with one of these keywords:
-   - "accept as built" - ACTION: Accept the deviation and update plan documentation
-   - "align to plan" - ACTION: Override recommendation and align to plan anyway
-   - "skip" - ACTION: Defer decision to later
-   ```
-   
-   **If DEFER RECOMMENDED**:
-   ```
-   Investigation verdict: DEFER RECOMMENDED - Investigation suggests deferring this alignment
-   Reason: [complexity/risk reason from investigation]
-   
-   Please respond with one of these keywords:
-   - "skip" - ACTION: Accept recommendation to defer and document in TECH_DEBT.md
-   - "align to plan" - ACTION: Override recommendation and align now
-   - "accept as built" - ACTION: Accept deviation instead of deferring
-   ```
+**When user responds "investigate further"**:
+1. **ASK FOR GUIDANCE**: "What specific aspect would you like me to investigate further?"
+2. **WAIT FOR USER INPUT**: Get their specific investigation focus  
+3. **TASK FOCUSED INVESTIGATION**: Launch new investigation with user's guidance
+4. **PRESENT SUPPLEMENTAL FINDINGS**: Show new insights
+5. **OFFER SAME KEYWORDS**: Present keywords based on updated verdict (no more "investigate further" to prevent loops)
 
 ### Final Summary
 When all discrepancies are addressed, provide:
