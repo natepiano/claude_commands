@@ -42,10 +42,6 @@ The main agent is responsible for:
    c. Display final status
    d. Delete `.todo.json`
    e. Summarize the subagent's implementation work
-   f. **MANDATORY FOR MAIN AGENT (NOT SUBAGENT)**: YOU (the main agent) must personally conduct an interactive plan alignment review with the user using ~/.claude/commands/plan_alignment_review.md
-      - Use Task tool to get alignment analysis from a subagent
-      - Then conduct the interactive keyword-driven review process with the user
-      - This is NOT delegated - YOU must do this interactively
 </Instructions>
 
 
@@ -95,7 +91,7 @@ Follow instructions in <UpdateToodoJson/>
 
 **STEP 6: BUILD AND ASSESS WARNINGS - MANDATORY AFTER IMPLEMENTATION**
 After completing implementation tasks (but before marking final task complete):
-1. Run `cargo build 2>&1 | grep -E "warning:|error:"` to check for warnings
+1. Run `~/.claude/commands/bash/build-check.sh` to check for warnings
 2. For each warning, determine:
    - **Option 1: Code not yet implemented** - Warning indicates missing implementation that's needed
      → **UPDATE .todo.json**: Add new tasks with "pending" status for each missing implementation

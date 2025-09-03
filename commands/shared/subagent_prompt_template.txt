@@ -1,0 +1,91 @@
+# Shared Subagent Prompt Template
+
+## Universal Review Agent Instructions Template
+
+This template provides the common prompting structure used by all review commands when tasking subagents.
+
+```
+Task a general-purpose subagent to review [REVIEW_TARGET] and provide [OUTPUT_DESCRIPTION] in the exact format specified above.
+
+**CRITICAL CONTEXT**: [REVIEW_CONTEXT]
+[CONTEXT_DETAILS]
+
+**TARGET SELECTION**: [TARGET_SELECTION_INSTRUCTIONS]
+
+**[STEP_1_LABEL]**: [STEP_1_INSTRUCTIONS]
+
+**[STEP_2_LABEL]**: [STEP_2_INSTRUCTIONS]
+
+**[STEP_3_LABEL]**: [STEP_3_INSTRUCTIONS]
+
+**[STEP_4_LABEL]**: [STEP_4_INSTRUCTIONS]
+
+**[FINAL_FILTER_LABEL]**: [FINAL_FILTER_INSTRUCTIONS]
+
+**[SHARED_ANALYSIS_REFERENCE]**: [SHARED_REFERENCE_INSTRUCTIONS]
+
+Then proceed with standard analysis:
+[STANDARD_ANALYSIS_STEPS]
+
+**IMPORTANT**: [REVIEW_SPECIFIC_REQUIREMENTS]
+
+Return results in the structured format with:
+[OUTPUT_FORMAT_REQUIREMENTS]
+
+[PRIORITY_INSTRUCTIONS]
+[DETAILED_REQUIREMENTS]
+
+[INSERT REVIEW TARGET AND ANY CUSTOM INSTRUCTIONS HERE]
+```
+
+## Parameter Definitions
+
+When using this template, each review command must provide these parameters:
+
+### Core Parameters
+- **[REVIEW_TARGET]**: What is being reviewed (e.g., "plan markdown document", "ACTUAL CODE", "IMPLEMENTED CODE matches [PLAN DOCUMENT NAME]")
+- **[OUTPUT_DESCRIPTION]**: What the subagent should return (e.g., "recommendations for IMPROVING THE PLAN", "actionable code review feedback", "actionable discrepancies")
+- **[REVIEW_CONTEXT]**: Primary context statement explaining what type of review this is
+- **[CONTEXT_DETAILS]**: Bullet points explaining the review purpose and scope
+
+### Target Selection
+- **[TARGET_SELECTION_INSTRUCTIONS]**: How to determine what to review based on arguments
+
+### Step Structure
+- **[STEP_1_LABEL]**: First step name (e.g., "MANDATORY FIRST STEP - CHECK SKIP NOTES", "FIRST STEP - Get the code", "MANDATORY FIRST STEP - READ PLAN DOCUMENT")
+- **[STEP_1_INSTRUCTIONS]**: First step detailed instructions
+- **[STEP_2_LABEL]**: Second step name
+- **[STEP_2_INSTRUCTIONS]**: Second step detailed instructions
+- **[STEP_3_LABEL]**: Third step name (optional)
+- **[STEP_3_INSTRUCTIONS]**: Third step detailed instructions (optional)
+- **[STEP_4_LABEL]**: Fourth step name (optional)
+- **[STEP_4_INSTRUCTIONS]**: Fourth step detailed instructions (optional)
+
+### Analysis and Filtering
+- **[FINAL_FILTER_LABEL]**: Final validation step name
+- **[FINAL_FILTER_INSTRUCTIONS]**: Final validation step instructions
+- **[SHARED_ANALYSIS_REFERENCE]**: Reference to shared analysis principles (typically `<TypeSystemDesignPrinciples>`)
+- **[SHARED_REFERENCE_INSTRUCTIONS]**: Instructions for using shared principles
+- **[STANDARD_ANALYSIS_STEPS]**: Numbered list of analysis steps specific to the review type
+
+### Output Requirements
+- **[REVIEW_SPECIFIC_REQUIREMENTS]**: Special requirements for the review type
+- **[OUTPUT_FORMAT_REQUIREMENTS]**: How to structure the output
+- **[PRIORITY_INSTRUCTIONS]**: Priority and ordering requirements
+- **[DETAILED_REQUIREMENTS]**: Additional detailed requirements
+
+## Usage Instructions
+
+Each review command file should:
+1. Reference this shared template with their specific parameters
+2. Define all required parameters for their review type
+3. Include their unique step instructions while leveraging shared structure
+4. Provide their specific analysis requirements and output formats
+
+## Template Benefits
+
+This shared template ensures:
+- **Consistency**: All subagent instructions follow the same structural pattern
+- **Quality**: Common prompting best practices applied across all review types
+- **Maintenance**: Single place to improve complex prompting logic
+- **Clarity**: Standardized step progression and requirement specification

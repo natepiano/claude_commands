@@ -1,0 +1,17 @@
+#!/bin/bash
+
+# build-check.sh - Check for cargo build warnings and errors
+# Usage: build-check.sh [build-args...]
+# 
+# This script runs cargo build and filters output to show only warnings and errors.
+# It's designed to be used by Claude Code subagents to check build status without 
+# requiring permission approval for the grep pipeline.
+
+set -euo pipefail
+
+# Run cargo build and capture both stdout and stderr
+# Pass any additional arguments to cargo build
+cargo build "$@" 2>&1 | grep -E "warning:|error:" || true
+
+# Note: The '|| true' ensures the script doesn't fail if grep finds no matches
+# (which happens when there are no warnings/errors - a good thing!)

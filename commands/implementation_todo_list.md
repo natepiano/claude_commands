@@ -42,14 +42,14 @@ Exception: Code you just added that you'll use immediately
 <ImplementationTodos>
 For each plan item, create paired todos:
 - [ ] Implement the specific feature/change from plan
-- [ ] Run `cargo build && cargo +nightly fmt` and fix errors following <WarningRules>
+- [ ] Run `~/.claude/commands/bash/build-check.sh && cargo +nightly fmt` and fix errors following <WarningRules>
 
 Build Heuristic:
 - Build after changes that should compile independently (new functions, modules, types)
 - For breaking changes (API changes, renames, signature changes):
   - If few callers (1-3): Fix them together, then build
   - If many callers (4+): Fix ONE caller first, build to verify approach, then fix rest
-- Always `cargo build && cargo +nightly fmt` before moving to unrelated changes to catch errors early
+- Always `~/.claude/commands/bash/build-check.sh && cargo +nightly fmt` before moving to unrelated changes to catch errors early
 - When uncertain if approach will work: implement minimal case first and build
 
 After every 3-5 implementation items, add:
@@ -66,15 +66,7 @@ After all implementation todos, add:
 <ReviewTodos>
 Final todos:
 - [ ] Subagent: STOP and return control
-- [ ] Main: Run plan alignment review using ~/.claude/commands/plan_alignment_review.md
-  - Use the plan document that was basis for implementation
-  - Review discrepancies between plan and actual implementation
 </ReviewTodos>
 
-<PlanDocumentCleanup>
-If there is a plan document being worked on:
-- [ ] Ask the user if it is okay to remove the plan document
-- [ ] If approved, delete the plan document file and run `git rm` on it
-</PlanDocumentCleanup>
 
 IMPORTANT: After creating the todo list, STOP. Do not begin implementation.

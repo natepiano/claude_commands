@@ -11,7 +11,11 @@ If no arguments are provided, the design review will target the plan markdown do
 ## Overview
 Use the Task tool with a general-purpose agent to conduct a comprehensive design review that produces **actionable recommendations for discussion**. Be sure to instruct the agent to think hard about the items in the <ReviewScope/>. The primary goal is to edit the plan markdown file being reviewed with approved suggestions and track skipped items.
 
-**CRITICAL**: After receiving the subagent's review, create a todo list for interactive review. Present each recommendation one at a time, STOPPING after each one for the user to decide whether to skip or implement it.
+**CRITICAL**: After receiving the subagent's review, follow the 4-step workflow from @shared/post_review_workflow.txt:
+1. **RECEIVE SUBAGENT'S REVIEW**: Get the structured findings with code examples
+2. **PRESENT INITIAL SUMMARY**: Show summary statistics and overview table using `<CorePresentationFlow>` 
+3. **EXECUTE PARALLEL INVESTIGATION**: Auto-investigate all findings with verdicts
+4. **BEGIN KEYWORD-DRIVEN REVIEW**: Present each recommendation one at a time with keywords
 
 ## Review Scope
 - Analyze the current implementation plan for completeness and feasibility
@@ -22,85 +26,42 @@ Use the Task tool with a general-purpose agent to conduct a comprehensive design
 
 ## Required Output Format
 
-The subagent must return recommendations in this **exact format** for easy todo list creation:
+Use the standard output format from `<StandardOutputFormat>` in @shared/keyword_review_pattern.txt with these parameters:
 
-### Summary
-Brief overview of findings (2-3 sentences max)
+**Summary Parameters:**
+- **[REVIEW_SUMMARY_TITLE]**: "Summary"
+- **[REVIEW_TARGET_DESCRIPTION]**: "findings"
+- **[POSITIVE_METRIC_LABEL]**: "Positive findings"
+- **[ACTION_METRIC_LABEL]**: "Suggested improvements"
+- **[POSITIVE_FINDINGS_SECTION_TITLE]**: "Positive Findings (Good Design Practices Observed)"
 
-### Actionable Recommendations
+**Findings Parameters:**
+- **[FINDINGS_SECTION_TITLE]**: "Actionable Recommendations"
+- **[PROBLEMS_DESCRIPTION]**: "design gaps or improvements"
+- **[ACTION_TYPE]**: "plan improvement"
+- **[FINDINGS_TYPE]**: "recommendations"
 
-**DESIGN-[ID]**: [Brief title of plan improvement]
-- **Plan Issue**: [What design aspect the PLAN doesn't address adequately]
-- **Recommendation**: [How to improve THE PLAN - specify section to add/edit]
-- **Plan Section**: [Exact section name/number in the plan document]
-- **Priority**: [High/Medium/Low]
-- **Rationale**: [Why this plan improvement matters]
-- **Plan Improvement Proposal**:
-  ```markdown
-  # Current Plan Text:
-  [Quote what the plan currently says about this]
-  
-  # Proposed Plan Text:
-  [Show the improved plan section/addition]
-  ```
-  ```rust
-  // Supporting Code Context (if relevant):
-  [Show existing code that helps explain why this plan change is needed]
-  ```
+**Category Parameters:**
+- **[CATEGORY-TYPE]**: TYPE-SYSTEM-*, DESIGN-*, IMPLEMENTATION-*, SIMPLIFICATION-*
+- **[PRIMARY_FIELD_LABEL]**: Varies by category:
+  - TYPE-SYSTEM: "Type System Gap"
+  - DESIGN: "Plan Issue" 
+  - IMPLEMENTATION: "Plan Gap"
+  - SIMPLIFICATION: "Over-Engineering in Plan"
+- **[LOCATION_FIELD]**: "Plan Section"
+- **[CURRENT_STATE_FIELD]**: "Current Plan Text" or "Plan's Current Approach"  
+- **[PROPOSED_CHANGE_FIELD]**: "Proposed Plan Enhancement" or "Plan Improvement Proposal"
+- **[IMPACT_FIELD_LABEL]**: "Rationale" or "Benefits"
 
-**IMPLEMENTATION-[ID]**: [Brief title of missing plan detail]
-- **Plan Gap**: [What implementation detail THE PLAN is missing]
-- **Recommendation**: [What to add to THE PLAN about implementation]
-- **Plan Section**: [Where in the plan this detail should go]
-- **Priority**: [High/Medium/Low]
-- **Dependencies**: [What plan sections this relates to]
-- **Plan Addition Proposal**:
-  ```markdown
-  # Missing from Plan:
-  [Describe what implementation detail is not covered]
-  
-  # Proposed Plan Addition:
-  [Show the implementation details to add to the plan]
-  ```
-  ```rust
-  // Code Context:
-  [Show existing code that the plan should address]
-  ```
-
-**SIMPLIFICATION-[ID]**: [Brief title of plan simplification]
-- **Over-Engineering in Plan**: [What THE PLAN over-complicates]
-- **Recommendation**: [How to simplify THE PLAN's approach]
-- **Plan Section**: [Which section of the plan is over-engineered]
-- **Priority**: [High/Medium/Low]
-- **Benefits**: [What this plan simplification achieves]
-- **Simplification Proposal**:
-  ```markdown
-  # Current Plan Approach:
-  [Quote the complex approach from the plan]
-  
-  # Simplified Plan Approach:
-  [Show the simplified version for the plan]
-  ```
-
-**TYPE-SYSTEM-[ID]**: [Brief title - e.g., "Plan should specify enum for X"]
-- **Type System Gap**: [Where THE PLAN misses type-driven design opportunity]
-- **Current Code Pattern**: [Existing code that needs better type design]
-- **Plan's Current Approach**: [What the plan says about this (or notes if missing)]
-- **Proposed Plan Enhancement**: [How the plan should specify type-driven solution]
-- **Priority**: [High - these are ALWAYS high priority]
-- **Type Design Proposal for Plan**:
-  ```markdown
-  # Plan Should Specify:
-  [Describe the type-driven approach the plan should mandate]
-  ```
-  ```rust
-  // The plan should include this type design:
-  [Show the enum/trait/struct the plan should specify]
-  ```
+**Design Review Specific Requirements:**
+- Include exact section names where plan edits should be made
+- Provide markdown quotes for plan text and ```rust code blocks for code examples
+- Focus recommendations on improving THE PLAN DOCUMENT, not implementing code
+- All TYPE-SYSTEM recommendations must be HIGH priority
 
 ## Analysis Requirements
 
-**CRITICAL**: Read and follow `~/.claude/commands/shared/keyword_review_pattern.txt` section `<TypeSystemDesignPrinciples>` for comprehensive analysis guidance.
+**CRITICAL**: Read and follow @shared/keyword_review_pattern.txt section `<TypeSystemDesignPrinciples>` for comprehensive analysis guidance.
 
 ### Design Review Specific Analysis
 Beyond the shared principles, also analyze:
@@ -110,145 +71,133 @@ Beyond the shared principles, also analyze:
 4. **Implementation Order**: Dependencies and sequencing issues (NO time estimates)
 5. **Code Examples**: Only when essential for clarity (prefer brief descriptions)
 6. **NO TIMING**: Never include schedules, timelines, deadlines, or time estimates
+7. **NO BACKWARDS COMPATIBILITY SUGGESTIONS**: Never suggest adding backwards compatibility - our designs are always complete changes. If the plan needs backwards compatibility, it will specify it explicitly
 
 ## Prompt Template
-```
-Task a general-purpose subagent to review [REVIEW TARGET: plan markdown document (default), specific files, or focus area] to evaluate THE PLAN'S DESIGN QUALITY and provide recommendations for IMPROVING THE PLAN ITSELF.
 
-**CRITICAL CONTEXT**: You are reviewing a PLAN DOCUMENT to improve its design, NOT checking if it has been implemented.
-- The plan describes FUTURE work to be done
-- Your job is to identify gaps, over-engineering, or improvements IN THE PLAN
-- You should read current code to understand context, but you're improving THE PLAN, not the code
+Use the shared subagent prompt template from @shared/subagent_prompt_template.txt with these parameters:
 
-**TARGET SELECTION**: 
-- If `$ARGUMENTS` is provided, review the specified `plan*.md` file in the project root
-- If no arguments are provided, review the plan markdown document currently being worked on
-- Include specific section names where edits should be made in the target document
-
-**MANDATORY FIRST STEP - CHECK SKIP NOTES**:
-<SkipNotesCheck>
-1. **IMMEDIATELY** look for a "Design Review Skip Notes" section in the document
-2. **READ EVERY SINGLE SKIPPED ITEM** - extract the core concept, not just the ID
-3. **UNDERSTAND REJECTION REASONS** - if something was rejected for being "already covered", don't suggest similar items
-4. **CHECK FOR SIMILAR CONCEPTS** - don't re-suggest the same idea with different wording
-5. **PAY SPECIAL ATTENTION** to items marked with "⚠️ PREJUDICE WARNING" - suggesting these again is a CRITICAL FAILURE
-6. **CROSS-REFERENCE YOUR IDEAS** - before making any recommendation, verify it's not a variation of something already rejected
-7. **WHEN IN DOUBT, DON'T SUGGEST** - if your idea is remotely similar to a skipped item, skip it
-8. **DO NOT PROCEED** until you have confirmed what has been previously skipped AND checked your recommendations against them
-</SkipNotesCheck>
-
-**MANDATORY SECOND STEP - THOROUGH DOCUMENT READING**:
-<DocumentComprehension>
-1. **READ THE ENTIRE PLAN** from beginning to end before making any recommendations
-2. **SEARCH FOR EXISTING SOLUTIONS** - before claiming something is missing, search the document for related content
-3. **QUOTE SPECIFIC SECTIONS** - when claiming gaps exist, quote the relevant plan sections and explain exactly what's missing
-4. **CROSS-REFERENCE SECTIONS** - many topics span multiple sections, check all related areas
-5. **VERIFICATION REQUIREMENT**: For every "missing" claim, you MUST either:
-   - Quote the plan section that should contain it but doesn't, OR
-   - Explain why the existing content is insufficient with specific examples
-</DocumentComprehension>
-
-**MANDATORY THIRD STEP - UNDERSTAND THE REVIEW SCOPE**:
-<ReviewScope>
-1. Carefully read and understand what you're reviewing (plan, files, or specific focus area)
-2. Note what is already present, implemented, or explicitly planned in the review scope
-3. DO NOT suggest things that are already part of what you're reviewing
-4. DO NOT suggest anything that appears in the Skip Notes section
-5. Focus on genuine gaps, improvements, and issues not already addressed
-</ReviewScope>
-
-**CRITICAL FOURTH STEP - TYPE SYSTEM VIOLATIONS**:
-Follow `<TypeSystemDesignPrinciples>` from the shared pattern file exactly. This includes all primary type system violations, error handling standards, and analysis priority order.
-
-Then proceed with standard analysis:
-1. Identifying ACTUAL gaps and missing components (not things already present in the review scope)
-2. Finding breaking changes not explicitly called out
-3. Spotting over-engineering and unnecessary complexity
-4. Ensuring implementation order makes sense
-5. Creating concrete, discussable recommendations for improvements NOT already addressed
-
-**MANDATORY FINAL FILTER - DUPLICATE PREVENTION**:
-Before including ANY recommendation in your output:
-
-1. **SKIP NOTES VERIFICATION**: 
-   - Check if the core concept appears in Skip Notes (even with different wording)
-   - If ANYTHING similar was rejected, DO NOT suggest it
-   - Pay special attention to rejection reasons like "already covered" or "already detailed"
-
-2. **CONTENT VERIFICATION**: 
-   - Verify it's not already handled in what you're reviewing
-   - Search the document for existing solutions to the same problem
-
-3. **FINAL CHECK**: 
-   - Only suggest genuine improvements NOT already addressed
-   - When in doubt about similarity to skipped items, SKIP IT
-
-**CRITICAL FAILURE MODES TO AVOID**:
-- ❌ Re-suggesting rejected concepts with different IDs or wording
-- ❌ Suggesting items that were rejected because "plan already covers this"
-- ❌ Ignoring Skip Notes rejection reasons
-- ❌ Suggesting something with ⚠️ PREJUDICE WARNING - this is a CRITICAL FAILURE
-
-**ENFORCEMENT**: Any recommendation that's a variation of a Skip Notes item will be immediately rejected and may result in prejudice warnings.
-
-Return results in the structured format with TYPE-SYSTEM-*, DESIGN-*, IMPLEMENTATION-*, and SIMPLIFICATION-* categories. TYPE-SYSTEM recommendations should come FIRST and be treated as highest priority.
-
-**CRITICAL REMINDER**: Do NOT include any timing information in recommendations:
-- NO schedules, deadlines, or milestones
-- NO time estimates or durations
-- NO timeline or project phases with dates
-- Focus ONLY on technical design and implementation structure
-
-**CRITICAL - IMPLEMENTATION PROPOSALS REQUIRED**: For each recommendation to improve THE PLAN, you MUST include concrete examples:
-- **Current Plan**: Show what the plan currently says about this area (quote from the plan document)
-- **Current Code**: Show the actual existing code that the plan is trying to improve (read files to get real code)  
-- **Proposed Plan Change**: Show how THE PLAN should be modified to address your recommendation
-- Use proper syntax highlighting with ```rust code blocks for code examples
-- Use markdown quotes for plan text
-- Your recommendations are for improving THE PLAN DOCUMENT, not for implementing code
-
-For each recommendation, specify the exact location in the plan document where it should be added or edited (e.g., "Add to Section 3.2 Implementation Details" or "Edit the API Design section").
-
-[INSERT REVIEW TARGET AND ANY CUSTOM INSTRUCTIONS HERE]
-```
+- **[REVIEW_TARGET]**: "[REVIEW TARGET: plan markdown document (default), specific files, or focus area] to evaluate THE PLAN'S DESIGN QUALITY"
+- **[OUTPUT_DESCRIPTION]**: "recommendations for IMPROVING THE PLAN ITSELF"
+- **[REVIEW_CONTEXT]**: "You are reviewing a PLAN DOCUMENT to improve its design, NOT checking if it has been implemented."
+- **[CONTEXT_DETAILS]**: 
+  - The plan describes FUTURE work to be done
+  - Your job is to identify gaps, over-engineering, or improvements IN THE PLAN
+  - You should read current code to understand context, but you're improving THE PLAN, not the code
+- **[TARGET_SELECTION_INSTRUCTIONS]**: 
+  - If `$ARGUMENTS` is provided, review the specified `plan*.md` file in the project root
+  - If no arguments are provided, review the plan markdown document currently being worked on
+  - Include specific section names where edits should be made in the target document
+- **[STEP_1_LABEL]**: "MANDATORY FIRST STEP - CHECK SKIP NOTES"
+- **[STEP_1_INSTRUCTIONS]**: 
+  ```
+  <SkipNotesCheck>
+  1. **IMMEDIATELY** look for a "Design Review Skip Notes" section in the document
+  2. **READ EVERY SINGLE SKIPPED ITEM** - extract the core concept, not just the ID
+  3. **UNDERSTAND REJECTION REASONS** - if something was rejected for being "already covered", don't suggest similar items
+  4. **CHECK FOR SIMILAR CONCEPTS** - don't re-suggest the same idea with different wording
+  5. **PAY SPECIAL ATTENTION** to items marked with "⚠️ PREJUDICE WARNING" - suggesting these again is a CRITICAL FAILURE
+  6. **CROSS-REFERENCE YOUR IDEAS** - before making any recommendation, verify it's not a variation of something already rejected
+  7. **WHEN IN DOUBT, DON'T SUGGEST** - if your idea is remotely similar to a skipped item, skip it
+  8. **DO NOT PROCEED** until you have confirmed what has been previously skipped AND checked your recommendations against them
+  </SkipNotesCheck>
+  ```
+- **[STEP_2_LABEL]**: "MANDATORY SECOND STEP - THOROUGH DOCUMENT READING"
+- **[STEP_2_INSTRUCTIONS]**: 
+  ```
+  <DocumentComprehension>
+  1. **READ THE ENTIRE PLAN** from beginning to end before making any recommendations
+  2. **SEARCH FOR EXISTING SOLUTIONS** - before claiming something is missing, search the document for related content
+  3. **QUOTE SPECIFIC SECTIONS** - when claiming gaps exist, quote the relevant plan sections and explain exactly what's missing
+  4. **CROSS-REFERENCE SECTIONS** - many topics span multiple sections, check all related areas
+  5. **VERIFICATION REQUIREMENT**: For every "missing" claim, you MUST either:
+     - Quote the plan section that should contain it but doesn't, OR
+     - Explain why the existing content is insufficient with specific examples
+  </DocumentComprehension>
+  ```
+- **[STEP_3_LABEL]**: "MANDATORY THIRD STEP - UNDERSTAND THE REVIEW SCOPE"
+- **[STEP_3_INSTRUCTIONS]**: 
+  ```
+  <ReviewScope>
+  1. Carefully read and understand what you're reviewing (plan, files, or specific focus area)
+  2. Note what is already present, implemented, or explicitly planned in the review scope
+  3. DO NOT suggest things that are already part of what you're reviewing
+  4. DO NOT suggest anything that appears in the Skip Notes section
+  5. Focus on genuine gaps, improvements, and issues not already addressed
+  </ReviewScope>
+  ```
+- **[STEP_4_LABEL]**: "CRITICAL FOURTH STEP - TYPE SYSTEM VIOLATIONS"
+- **[STEP_4_INSTRUCTIONS]**: "Follow `<TypeSystemDesignPrinciples>` from the shared pattern file exactly. This includes all primary type system violations, error handling standards, and analysis priority order."
+- **[FINAL_FILTER_LABEL]**: "MANDATORY FINAL FILTER - DUPLICATE PREVENTION"
+- **[FINAL_FILTER_INSTRUCTIONS]**: 
+  ```
+  Before including ANY recommendation in your output:
+  1. **SKIP NOTES VERIFICATION**: 
+     - Check if the core concept appears in Skip Notes (even with different wording)
+     - If ANYTHING similar was rejected, DO NOT suggest it
+     - Pay special attention to rejection reasons like "already covered" or "already detailed"
+  2. **CONTENT VERIFICATION**: 
+     - Verify it's not already handled in what you're reviewing
+     - Search the document for existing solutions to the same problem
+  3. **FINAL CHECK**: 
+     - Only suggest genuine improvements NOT already addressed
+     - When in doubt about similarity to skipped items, SKIP IT
+  
+  **CRITICAL FAILURE MODES TO AVOID**:
+  - ❌ Re-suggesting rejected concepts with different IDs or wording
+  - ❌ Suggesting items that were rejected because "plan already covers this"
+  - ❌ Ignoring Skip Notes rejection reasons
+  - ❌ Suggesting something with ⚠️ PREJUDICE WARNING - this is a CRITICAL FAILURE
+  - ❌ Suggesting backwards compatibility additions - designs are complete changes, not incremental
+  
+  **ENFORCEMENT**: Any recommendation that's a variation of a Skip Notes item will be immediately rejected and may result in prejudice warnings.
+  ```
+- **[SHARED_ANALYSIS_REFERENCE]**: "CRITICAL FOURTH STEP - TYPE SYSTEM VIOLATIONS"
+- **[SHARED_REFERENCE_INSTRUCTIONS]**: "Follow `<TypeSystemDesignPrinciples>` from the shared pattern file exactly. This includes all primary type system violations, error handling standards, and analysis priority order."
+- **[STANDARD_ANALYSIS_STEPS]**: 
+  1. Identifying ACTUAL gaps and missing components (not things already present in the review scope)
+  2. Finding breaking changes not explicitly called out
+  3. Spotting over-engineering and unnecessary complexity
+  4. Ensuring implementation order makes sense
+  5. Creating concrete, discussable recommendations for improvements NOT already addressed
+- **[REVIEW_SPECIFIC_REQUIREMENTS]**: 
+  - **CRITICAL REMINDER**: Do NOT include any timing information in recommendations:
+    - NO schedules, deadlines, or milestones
+    - NO time estimates or durations
+    - NO timeline or project phases with dates
+    - Focus ONLY on technical design and implementation structure
+  - **CRITICAL - IMPLEMENTATION PROPOSALS REQUIRED**: For each recommendation to improve THE PLAN, you MUST include concrete examples:
+    - **Current Plan**: Show what the plan currently says about this area (quote from the plan document)
+    - **Current Code**: Show the actual existing code that the plan is trying to improve (read files to get real code)  
+    - **Proposed Plan Change**: Show how THE PLAN should be modified to address your recommendation
+    - **Proposed Code Implementation**: Show concrete code examples of what the improved plan would produce
+    - Use proper syntax highlighting with ```rust code blocks for code examples
+    - Use markdown quotes for plan text
+    - **ENFORCEMENT**: Any recommendation without Current Code and Proposed Code sections will be REJECTED
+    - Your recommendations are for improving THE PLAN DOCUMENT, not for implementing code
+- **[OUTPUT_FORMAT_REQUIREMENTS]**: "Return results in the structured format with TYPE-SYSTEM-*, DESIGN-*, IMPLEMENTATION-*, and SIMPLIFICATION-* categories."
+- **[PRIORITY_INSTRUCTIONS]**: "TYPE-SYSTEM recommendations should come FIRST and be treated as highest priority."
+- **[DETAILED_REQUIREMENTS]**: "For each recommendation, specify the exact location in the plan document where it should be added or edited (e.g., \"Add to Section 3.2 Implementation Details\" or \"Edit the API Design section\")."
 
 ## Post-Review Instructions - Auto-Investigation and Keyword Process
 
-**STEP 1: RECEIVE SUBAGENT'S REVIEW**
-Get the initial design review findings from the subagent.
-
-**STEP 2: EXECUTE PARALLEL INVESTIGATION**
-IMMEDIATELY after receiving the subagent's review:
-1. Filter out any findings already in Skip Notes or already addressed
-2. Launch parallel investigation agents for ALL remaining findings using multiple Task tool invocations in a single response
-3. **CRITICAL**: Pass the COMPLETE finding to each investigation agent, including the Current and Proposed code examples
-4. **CRITICAL**: Instruct each investigation agent with these EXACT words:
-   "You MUST use the MANDATORY Investigation Output Template from <InvestigationAgentInstructions>. Copy the exact template structure and fill it out completely. Include Current State and Proposed Change sections with code blocks. Any response not following this template is INVALID."
-   
-   **Investigation specifics**:
-   - **DOMAIN VALUES**: "code elegance AND practical utility"
-   - **INVESTIGATION FOCUS**:
-     - Evaluate architectural merit and system design improvements
-     - Assess type system usage to eliminate bugs and express intent
-     - Consider API elegance and interface design quality
-     - Analyze pattern consistency with existing codebase
-     - Check for over-engineering vs solving real problems
-     - Consider how this affects future evolution and extensions
-   - **EXPECTED VERDICTS**: CONFIRMED, MODIFIED, or REJECTED
-
-5. Wait for all investigations to complete
-6. **VALIDATION**: Check each investigation result - REJECT any that don't use the template with code blocks
-7. Merge compliant findings with their investigation results
-
-**STEP 3: BEGIN KEYWORD-DRIVEN REVIEW**
-Now follow the shared patterns from `~/.claude/commands/shared/keyword_review_pattern.txt`:
-- Follow `<CorePresentationFlow>` with [Review Type] = "Design Review" and [items] = "recommendations"
-- Follow `<ParallelInvestigationPattern>` Step 6 for presenting pre-investigated findings
-- Follow `<InvestigateFurtherPattern>` if user requests deeper analysis
-- Follow `<KeywordDecisionProcess>` for keyword enforcement
-- Follow `<CumulativeUpdateRule>` for plan document updates
-- Follow `<EnforcementRules>` completely
-- Use `<FinalSummaryTemplate>` with design review categories
+Follow the 4-step workflow from @shared/post_review_workflow.txt with these parameters:
+- **[REVIEW_TYPE]**: "Design Review"
+- **[FINDINGS_TYPE]**: "design review findings"
+- **[ITEMS]**: "recommendations"
+- **[ITEM]**: "recommendation"
+- **[RESOLUTION_STATE]**: "already in Skip Notes or already addressed"
+- **[DOMAIN_VALUES]**: "code elegance AND practical utility"
+- **[INVESTIGATION_FOCUS_LIST]**:
+  - Evaluate architectural merit and system design improvements
+  - Assess type system usage to eliminate bugs and express intent
+  - Consider API elegance and interface design quality
+  - Analyze pattern consistency with existing codebase
+  - Check for over-engineering vs solving real problems
+  - Consider how this affects future evolution and extensions
+- **[EXPECTED_VERDICTS]**: "CONFIRMED, MODIFIED, or REJECTED"
+- **[UPDATE_TARGET]**: "plan document updates"
+- **[CATEGORY_SET]**: "design review categories"
 
 ### Design Review Specific Keywords (Based on Verdict)
 **For CONFIRMED/MODIFIED verdicts**: 
@@ -265,68 +214,55 @@ Now follow the shared patterns from `~/.claude/commands/shared/keyword_review_pa
 
 ### Design Review Keyword Response Actions
 
+Follow `<KeywordResponseWorkflow>` from @shared/keyword_review_pattern.txt with these parameters:
+- **[ITEM]**: "recommendation"
+- **[CUMULATIVE_REVIEW_SPECIFICS]**: "Update the suggestion to account for the cumulative effect of these changes - leverage newly added patterns, avoid redundant suggestions, and ensure consistency with what has already been approved."
+
+**Review-Specific Actions**:
+
 **When user responds "agree"**:
-1. **UPDATE PLAN DOCUMENT ONLY**: Add a new dedicated section for the agreed recommendation with:
-   - Full implementation details from the recommendation
-   - Specific code changes required (to be implemented later)
-   - File paths and line numbers to modify (for future reference)
-   - Step-by-step implementation instructions (for when implementation begins)
-   - Integration points with existing plan sections
-2. **CROSS-REFERENCE**: Add references between the new plan section and related implementation sections
-3. **Mark current todo as completed**
-4. **CRITICAL**: Before presenting the next recommendation, review ALL changes accepted in this session so far. Update the suggestion to account for the cumulative effect of these changes - leverage newly added patterns, avoid redundant suggestions, and ensure consistency with what has already been approved.
-5. Present next recommendation with its investigation verdict, then EXPLICITLY state the available keywords based on verdict
-6. STOP and wait for user response
+**[REVIEW_SPECIFIC_ACTION]**: **UPDATE PLAN DOCUMENT ONLY**: Add a new dedicated section for the agreed recommendation with:
+- Full implementation details from the recommendation
+- Specific code changes required (to be implemented later)
+- File paths and line numbers to modify (for future reference)
+- Step-by-step implementation instructions (for when implementation begins)
+- Integration points with existing plan sections
+**CROSS-REFERENCE**: Add references between the new plan section and related implementation sections
 
 **When user responds "skip"**:
-1. **UPDATE SKIP NOTES**: Add/update "Design Review Skip Notes" section in the plan document using this EXACT format:
-   ```markdown
-   ## Design Review Skip Notes
-   
-   ### [RECOMMENDATION-ID]: [Title]
-   - **Status**: SKIPPED
-   - **Category**: [TYPE-SYSTEM/DESIGN/IMPLEMENTATION/SIMPLIFICATION]
-   - **Description**: [Brief description of what was skipped]
-   - **Reason**: User decision - not needed for current implementation
-   ```
-2. **Mark current todo as completed**
-3. **CRITICAL**: Before presenting the next recommendation, review ALL changes accepted/skipped in this session so far. Ensure you don't re-suggest anything already addressed or marked as skipped.
-4. Present next recommendation with its investigation verdict, then EXPLICITLY state the available keywords based on verdict
-5. STOP and wait for user response
+**[REVIEW_SPECIFIC_ACTION]**: **UPDATE SKIP NOTES**: Add/update "Design Review Skip Notes" section in the plan document using this EXACT format:
+```markdown
+## Design Review Skip Notes
+
+### [RECOMMENDATION-ID]: [Title]
+- **Status**: SKIPPED
+- **Category**: [TYPE-SYSTEM/DESIGN/IMPLEMENTATION/SIMPLIFICATION]
+- **Description**: [Brief description of what was skipped]
+- **Reason**: User decision - not needed for current implementation
+```
 
 **When user responds "skip with prejudice"**:
-1. **UPDATE SKIP NOTES WITH PREJUDICE FLAG**: 
-   - If this recommendation was already skipped, APPEND prejudice warning to existing entry
-   - If new, add full entry to "Design Review Skip Notes" section
-   
-   For existing skipped entry, append:
-   ```markdown
-   - **⚠️ PREJUDICE WARNING**: PERMANENTLY REJECTED
-   - **Critical Note**: DO NOT SUGGEST THIS AGAIN - Reviewer repeatedly suggested this despite prior rejections
-   ```
-   
-   For new entry, use full format:
-   ```markdown
-   ## Design Review Skip Notes
-   
-   ### ⚠️ PREJUDICE WARNING - [RECOMMENDATION-ID]: [Title]
-   - **Status**: PERMANENTLY REJECTED
-   - **Category**: [TYPE-SYSTEM/DESIGN/IMPLEMENTATION/SIMPLIFICATION]
-   - **Description**: [Brief description of what was skipped]
-   - **Reason**: Reviewer repeatedly suggested this despite prior rejections
-   - **Critical Note**: DO NOT SUGGEST THIS AGAIN - This recommendation has been permanently rejected due to reviewer repetition
-   ```
-2. **Mark current todo as completed**
-3. **CRITICAL**: Before presenting the next recommendation, review ALL changes accepted/skipped/rejected in this session so far. Never suggest anything marked with prejudice or already handled.
-4. Present next recommendation with its investigation verdict, then EXPLICITLY state the available keywords based on verdict
-5. STOP and wait for user response
+**[REVIEW_SPECIFIC_ACTION]**: **UPDATE SKIP NOTES WITH PREJUDICE FLAG**: 
+- If this recommendation was already skipped, APPEND prejudice warning to existing entry
+- If new, add full entry to "Design Review Skip Notes" section
 
-**When user responds "investigate further"**:
-1. **ASK FOR GUIDANCE**: "What specific aspect would you like me to investigate further?"
-2. **WAIT FOR USER INPUT**: Get their specific investigation focus
-3. **TASK FOCUSED INVESTIGATION**: Launch new investigation with user's guidance
-4. **PRESENT SUPPLEMENTAL FINDINGS**: Show new insights
-5. **OFFER SAME KEYWORDS**: Present keywords based on updated verdict (no more "investigate further" to prevent loops)
+For existing skipped entry, append:
+```markdown
+- **⚠️ PREJUDICE WARNING**: PERMANENTLY REJECTED
+- **Critical Note**: DO NOT SUGGEST THIS AGAIN - Reviewer repeatedly suggested this despite prior rejections
+```
+
+For new entry, use full format:
+```markdown
+## Design Review Skip Notes
+
+### ⚠️ PREJUDICE WARNING - [RECOMMENDATION-ID]: [Title]
+- **Status**: PERMANENTLY REJECTED
+- **Category**: [TYPE-SYSTEM/DESIGN/IMPLEMENTATION/SIMPLIFICATION]
+- **Description**: [Brief description of what was skipped]
+- **Reason**: Reviewer repeatedly suggested this despite prior rejections
+- **Critical Note**: DO NOT SUGGEST THIS AGAIN - This recommendation has been permanently rejected due to reviewer repetition
+```
 
 ### Plan Update Template for "agree" Keyword
 
@@ -375,6 +311,24 @@ When user says "agree" for a recommendation, add this new section to the plan do
 **Design Review Decision**: Approved for inclusion in plan
 **Next Steps**: Code changes ready for implementation when needed
 ```
+
+### Final Summary
+
+Use the `<FinalSummaryTemplate>` from @shared/keyword_review_pattern.txt with these parameters:
+- **[REVIEW_TYPE]**: "Design Review"
+- **[PRIMARY_ACTION_ITEMS]**: "Recommendations Agreed"
+- **[PRIMARY_CATEGORY_BREAKDOWN]**: 
+  ```
+  - TYPE-SYSTEM: [count]
+  - DESIGN: [count]
+  - IMPLEMENTATION: [count]
+  - SIMPLIFICATION: [count]
+  ```
+- **[SECONDARY_ACTION_ITEMS]**: "Recommendations Skipped"
+- **[SECONDARY_ITEMS_LIST]**: "[List with brief descriptions]"
+- **[MAINTAINED_ITEMS]**: "Deviations Accepted"
+- **[MAINTAINED_ITEMS_DESCRIPTION]**: "[List with brief descriptions] - Plan document updated with notes"
+- **[COMPLETION_STATEMENT]**: "Plan document is now ready for implementation."
 
 ## Default Review Target
 **DEFAULT**: When not specified otherwise, the design reviewer should review and edit the plan markdown file currently being worked on. The subagent should be instructed to review this document and provide recommendations for improving it.

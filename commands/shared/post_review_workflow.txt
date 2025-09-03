@@ -1,0 +1,64 @@
+# Shared Post-Review Workflow Template
+
+## 4-Step Post-Review Workflow (All Review Types)
+
+This template provides the common workflow structure used by all review commands after receiving subagent findings.
+
+**STEP 1: RECEIVE SUBAGENT'S REVIEW**
+Get the initial [FINDINGS_TYPE] from the subagent.
+
+**STEP 2: PRESENT INITIAL SUMMARY**
+Follow `<CorePresentationFlow>` from @shared/keyword_review_pattern.txt EXACTLY:
+1. Present summary statistics showing total [ITEMS] found
+2. Acknowledge any positive findings from the subagent's review (if applicable)
+3. Present Items Overview using the exact format from `<CorePresentationFlow>` section
+4. **CRITICAL**: This summary must be shown to the user BEFORE proceeding to investigations
+
+**STEP 3: EXECUTE PARALLEL INVESTIGATION**
+IMMEDIATELY after receiving the subagent's review, follow `<UnifiedInvestigationInstructions>` from @shared/keyword_review_pattern.txt with these parameters:
+- **[ITEM]**: [ITEM]
+- **[ITEMS]**: [ITEMS]
+- **[RESOLUTION_STATE]**: [RESOLUTION_STATE]
+- **[DOMAIN_VALUES]**: [DOMAIN_VALUES]
+- **[INVESTIGATION_FOCUS_LIST]**: [INVESTIGATION_FOCUS_LIST]
+- **[EXPECTED_VERDICTS]**: [EXPECTED_VERDICTS]
+
+**CRITICAL INVESTIGATION ENFORCEMENT**: 
+- Each investigation agent MUST use the template from `<InvestigationAgentInstructions>`
+- Each investigation agent MUST include Current State and Proposed Change sections with code blocks
+- Any investigation response without proper code blocks MUST be rejected per Step 5.5 "PRE-PRESENTATION VALIDATION GATE"
+
+**STEP 4: BEGIN KEYWORD-DRIVEN REVIEW**
+Now follow the shared patterns from @shared/keyword_review_pattern.txt:
+- Follow `<ParallelInvestigationPattern>` Step 6 for presenting pre-investigated findings
+- **CRITICAL REMINDER**: Step 6 requires presenting findings ONE AT A TIME - never batch multiple [ITEMS] together
+- **MANDATORY**: Use the exact format from `<KeywordPresentationTemplate>` when presenting keywords to user
+- **CRITICAL**: DO NOT show verbose auto-investigation results to the user - only show the final investigated findings
+- Follow `<InvestigateFurtherPattern>` if user requests deeper analysis
+- Follow `<KeywordDecisionProcess>` for keyword enforcement
+- Follow `<CumulativeUpdateRule>` for [UPDATE_TARGET] updates
+- Follow `<EnforcementRules>` completely
+- Use `<FinalSummaryTemplate>` with [CATEGORY_SET] categories
+
+## Parameter Definitions
+
+When using this workflow template, each review command must provide these parameters:
+
+- **[REVIEW_TYPE]**: The name of the review (e.g., "Design Review", "Code Review", "Plan Alignment Review")
+- **[FINDINGS_TYPE]**: What the subagent returns (e.g., "design review findings", "code review findings", "alignment discrepancy findings")
+- **[ITEMS]**: Plural name for review items (e.g., "recommendations", "issues", "discrepancies")
+- **[ITEM]**: Singular name for review item (e.g., "recommendation", "issue", "discrepancy")
+- **[RESOLUTION_STATE]**: How items get resolved (e.g., "already addressed", "already fixed", "already resolved")
+- **[DOMAIN_VALUES]**: Investigation domain focus (e.g., "code elegance AND practical utility")
+- **[INVESTIGATION_FOCUS_LIST]**: Bullet points of specific investigation criteria
+- **[EXPECTED_VERDICTS]**: Possible investigation outcomes (e.g., "CONFIRMED, MODIFIED, or REJECTED")
+- **[UPDATE_TARGET]**: What gets updated (e.g., "plan document", "code changes", "both code and plan")
+- **[CATEGORY_SET]**: Review-specific categories (e.g., "design review", "issue", "alignment")
+
+## Usage Instructions
+
+Each review command file should:
+1. Reference this shared workflow with their specific parameters
+2. Define their review-specific keywords and response actions after Step 4
+3. Implement their unique keyword response workflows
+4. Provide their final summary templates with appropriate categories
