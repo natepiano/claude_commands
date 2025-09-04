@@ -21,6 +21,7 @@
 <ReviewConstraints>
     - <SkipNotesCheck/>
     - <TypeSystemPrinciples/>
+    - <DuplicationPrevention/>
     - <DocumentComprehension/>
     - <DesignConsistency/>
 </ReviewConstraints>

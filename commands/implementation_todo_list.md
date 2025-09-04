@@ -17,9 +17,34 @@ Create a todo list for the specified plan using your todo tool, then STOP.
 4. Check if the plan document is checked into git
 5. If it is not checked in, create an appropriate commit message for it and check it in
 6. This ensures the plan is preserved before implementation begins
+
+**CRITICAL - REVIEW FINDINGS PROCESSING**:
+After reading the plan document, you MUST:
+1. Search for ALL review sections (e.g., "Design Review Skip Notes", review findings)
+2. For EACH review finding, READ and UNDERSTAND:
+   - What specific suggestion or change is being addressed
+   - WHY it has its current status
+   - Whether it affects the original plan or is a new suggestion
+   
+3. Interpret findings CONTEXTUALLY:
+   - **PREJUDICE WARNING**: Read the issue description - it might be rejecting a SUGGESTION to change something already approved, not rejecting the feature itself
+   - **SKIPPED**: Understand if this skips a suggested modification or an entire feature
+   - **APPROVED**: This adds or modifies something - implement the approved version
+   - **ACCEPTED AS BUILT**: The implementation differs from plan but was accepted - don't change it
+   
+4. Create todos based on UNDERSTANDING, not keywords:
+   - Implement features from the original plan that weren't rejected
+   - Implement approved modifications from reviews
+   - DON'T implement suggestions that were skipped/rejected
+   - DON'T undo things marked as "accepted as built"
 </PlanDocumentEvaluation>
 
 It is **CRITICAL** that you think deeply about the implementation according to the instructions given here so that you make the best possible implementation todo list.
+
+**REVIEW CROSS-REFERENCE**: When creating todos, include references to review findings:
+- For approved items: "Implement TYPE-SYSTEM-1 (approved version): [description]"
+- For modified items: "Implement DESIGN-4 with review modifications: [description]"
+- This helps track which review decisions are being implemented
 
 **CRITICAL DIRECTIVE**: If during implementation you need to structurally deviate from what the user asked for in the planning phase, you MUST immediately STOP and clarify with the user how to proceed. Do not continue with structural changes without explicit approval.
 
@@ -47,9 +72,64 @@ Exception: Code you just added that you'll use immediately
 </WarningRules>
 
 
+<ReviewFindingsInterpretation>
+**How to interpret review findings for todo generation - READ CAREFULLY:**
+
+Example 1 - PREJUDICE WARNING rejecting a suggestion about an approved feature:
+```
+### ⚠️ PREJUDICE WARNING - TYPE-SYSTEM-2: Use enum instead of string matching
+- **Issue**: Suggests replacing approved string matching with enum
+- **Status**: PERMANENTLY REJECTED
+- **Critical Note**: DO NOT SUGGEST THIS AGAIN - User approved string approach
+```
+→ IMPLEMENT the original string matching feature (it was approved)
+→ DON'T implement the enum suggestion (that's what was rejected)
+
+Example 2 - SKIPPED suggestion that doesn't affect core plan:
+```
+### DESIGN-3: Add extra validation layer
+- **Issue**: Suggests adding validation beyond what plan specifies
+- **Status**: SKIPPED
+- **Decision**: User elected to skip this additional validation
+```
+→ IMPLEMENT the feature as originally planned
+→ DON'T add the extra validation layer
+
+Example 3 - APPROVED modification to original plan:
+```
+## TYPE-SYSTEM-1: String-based type checking ✅
+- **Status**: APPROVED - To be implemented
+- **Issue**: Plan uses string matching but should use WrapperType::detect
+### Approved Change:
+[Use WrapperType::detect instead of string matching]
+```
+→ CREATE todo to implement the APPROVED change (WrapperType::detect)
+→ DON'T implement the original proposal (string matching)
+
+Example 4 - PREJUDICE WARNING about reverting something already done:
+```
+### ⚠️ PREJUDICE WARNING - DESIGN-1: Remove the new error handling
+- **Issue**: Reviewer keeps suggesting we remove error handling we added
+- **Status**: PERMANENTLY REJECTED  
+- **Critical Note**: The error handling stays - stop suggesting removal
+```
+→ KEEP the error handling (the suggestion to remove it was rejected)
+→ This doesn't affect implementation - the feature is already correct
+
+Example 5 - ACCEPTED AS BUILT deviation:
+```
+## Deviation from Plan: IMPLEMENTATION-2
+- **Plan Specification**: Use async/await pattern
+- **Actual Implementation**: Used callback pattern instead
+- **Status**: ACCEPTED AS BUILT
+```
+→ DON'T change the callback pattern to async/await
+→ The deviation was accepted
+</ReviewFindingsInterpretation>
+
 <ImplementationTodos>
-For each plan item, create paired todos:
-- [ ] Implement the specific feature/change from plan
+For each plan item that passes review filtering, create paired todos:
+- [ ] Implement the specific feature/change from plan (or approved version if modified)
 - [ ] Run `~/.claude/commands/bash/build-check.sh` and fix errors following <WarningRules>
 
 Build Heuristic:
