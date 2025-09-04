@@ -201,7 +201,8 @@ Requirements:
 
 <UserOutput>
 Present the investigation findings to the user using this format
-(derived from the ReviewFollowupJson data):
+(derived from the ReviewFollowupJson data).
+**Note**: Use appropriate language identifier in code blocks (rust, python, javascript, etc.):
 
 # **[id]**: [title] ([current_number] of [total_findings])
 **Issue**: [issue]
@@ -212,12 +213,12 @@ Present the investigation findings to the user using this format
 **Risk**: [risk]
 
 ## Current Code
-```
+```rust
 [current_code]
 ```
 
 ## Suggested Code Change
-```
+```rust
 [suggested_code - only include if verdict recommends action]
 ```
 
