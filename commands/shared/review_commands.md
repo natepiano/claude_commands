@@ -80,6 +80,7 @@ Requirements:
 - TYPE-SYSTEM issues always have priority: "High"
 - Sort findings array with TYPE-SYSTEM issues first
 - current_code MUST contain enough context (5-10+ lines, complete functions when relevant)
+- current_code must be PURE CODE ONLY - no markdown headers, instructions, or prose
 - Return ONLY the JSON object, no additional text
 </InitialReviewJson>
 
@@ -111,14 +112,14 @@ Provide a high-level summary of the subagent's findings:
 
     Launch parallel investigations:
     **CRITICAL**: You MUST launch ALL investigations in a SINGLE response using multiple Task tool calls.
-    
+
     1. **SINGLE MESSAGE WITH MULTIPLE TASK CALLS**: For EACH finding from the initial review, create a separate Task tool invocation with:
        - description: "Investigate [CATEGORY-ID]: [Brief title of finding]"
        - subagent_type: "general-purpose"
        - prompt: Use the template from <ReviewFollowupPrompt/> with the specific finding details
-    
+
     2. **EXAMPLE**: If you have 3 findings, your response should contain exactly 3 Task tool calls, all in one message
-    
+
     3. Wait for ALL investigation subagents to complete (they will return ReviewFollowupJson)
     4. Parse the JSON results and merge with original findings
     5. Prepare to present each investigated finding to the user in the next step
@@ -146,7 +147,7 @@ Provide a high-level summary of the subagent's findings:
     4. Provide a verdict: [EXPECTED_VERDICTS]
     5. Include detailed reasoning for your verdict
     6. Be sure to include suggested code changes when recommending action
-    7. **CRITICAL**: If the original finding has insufficient code context (less than 5 lines), 
+    7. **CRITICAL**: If the original finding has insufficient code context (less than 5 lines),
        you MUST read the file and provide the full context in your response
 
     **CRITICAL RESTRICTIONS - You may ONLY:**
@@ -194,6 +195,7 @@ Requirements:
 - For verdicts recommending action: suggested_code is REQUIRED
 - For verdicts NOT recommending action: omit suggested_code field
 - current_code field MUST be expanded if original had insufficient context (minimum 5-10 lines)
+- current_code must be PURE CODE ONLY - no markdown headers, instructions, or prose
 - Return ONLY the JSON object, no additional text
 </ReviewFollowupJson>
 
@@ -208,18 +210,16 @@ Present the investigation findings to the user using this format
 **Issue**: [issue]
 **Location**: [location]
 **Impact**: [impact]
-**Priority**: [priority]
-**Complexity**: [complexity]
-**Risk**: [risk]
+**Priority**: [priority] - **Complexity**: [complexity] - **Risk**: [risk]
 
 ## Current Code
 ```rust
-[current_code]
+[current_code - ONLY the actual code, no markdown headers or explanations]
 ```
 
 ## Suggested Code Change
 ```rust
-[suggested_code - only include if verdict recommends action]
+[suggested_code - ONLY the actual code, no markdown headers or explanations - only include if verdict recommends action]
 ```
 
 ## Analysis
@@ -235,7 +235,7 @@ Present the investigation findings to the user using this format
 
     **FIRST**: Create a TodoWrite list to track the review process:
     - Create one todo item for each finding with status "pending"
-    - Format: "Review [id]: [title]" 
+    - Format: "Review [id]: [title]"
     - Mark each as "in_progress" when presenting it
     - Mark as "completed" after user responds with a keyword
 
@@ -266,7 +266,7 @@ Present the investigation findings to the user using this format
     - The verdict from the investigation
     - The reasoning from the investigation verdict
     - Any relevant code or suggested changes
-    
+
     Use the appropriate template below based on the keyword action.
 </PlanUpdateFormat>
 
