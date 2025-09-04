@@ -7,3 +7,4 @@
 
 **IMPORTANT** don't mention Claude in commit messages
 **IMPORTANT** when running tests use `cargo nextest run`
+- never commit code unless i ask you to

@@ -110,22 +110,17 @@ Provide a high-level summary of the subagent's findings:
     2. Filter out any findings that no longer apply or have been addressed
     3. Group the remaining findings by category
 
-    Launch parallel investigations:
-    **CRITICAL**: You MUST launch ALL investigations in a SINGLE response using multiple Task tool calls.
-
-    1. **SINGLE MESSAGE WITH MULTIPLE TASK CALLS**: For EACH finding from the initial review, create a separate Task tool invocation with:
+    **Launch ALL investigations in parallel:**
+    1. For EACH finding from the initial review, launch a Task tool with:
        - description: "Investigate [CATEGORY-ID]: [Brief title of finding]"
        - subagent_type: "general-purpose"
        - prompt: Use the template from <ReviewFollowupPrompt/> with the specific finding details
 
-    2. **EXAMPLE**: If you have 3 findings, your response should contain exactly 3 Task tool calls, all in one message
-
-    3. Wait for ALL investigation subagents to complete (they will return ReviewFollowupJson)
-    4. Parse the JSON results and merge with original findings
-    5. Prepare to present each investigated finding to the user in the next step
+    2. Wait for ALL investigation subagents to complete (they will return ReviewFollowupJson)
+    3. Parse the JSON results and merge with original findings
+    4. Prepare to present each investigated finding to the user in the next step
 
     **CRITICAL**: Do NOT present findings to the user yet - just complete the investigations and compile results.
-    **CRITICAL**: Do NOT wait between Task calls - send them all at once for true parallel execution.
 </ReviewFollowup>
 
 <ReviewFollowupPrompt>
@@ -146,7 +141,9 @@ Provide a high-level summary of the subagent's findings:
     3. Consider maintenance and long-term implications
     4. Provide a verdict: [EXPECTED_VERDICTS]
     5. Include detailed reasoning for your verdict
-    6. Be sure to include suggested code changes when recommending action
+    6. **CRITICAL**: For any verdict that recommends action (CONFIRMED, FIX RECOMMENDED, MODIFIED, etc.),
+       you MUST include concrete suggested_code showing the improved implementation
+       - For MODIFIED verdicts: Show your alternative approach as actual code, not just a description
     7. **CRITICAL**: If the original finding has insufficient code context (less than 5 lines),
        you MUST read the file and provide the full context in your response
 
@@ -192,8 +189,10 @@ Requirements:
 - Include ALL fields from the original finding
 - verdict must be one of: [EXPECTED_VERDICTS]
 - alternative_approach is OPTIONAL - omit if not applicable
-- For verdicts recommending action: suggested_code is REQUIRED
+- For verdicts recommending action: suggested_code is REQUIRED with concrete implementation
+- **CRITICAL FOR MODIFIED VERDICT**: Must include suggested_code showing the alternative approach in concrete code
 - For verdicts NOT recommending action: omit suggested_code field
+- suggested_code must show the actual fixed/improved code, not instructions about what to change
 - current_code field MUST be expanded if original had insufficient context (minimum 5-10 lines)
 - current_code must be PURE CODE ONLY - no markdown headers, instructions, or prose
 - Return ONLY the JSON object, no additional text
@@ -206,11 +205,10 @@ Present the investigation findings to the user using this format
 (derived from the ReviewFollowupJson data).
 **Note**: Use appropriate language identifier in code blocks (rust, python, javascript, etc.):
 
-# **[id]**: [title] ([current_number] of [total_findings])
+# **[id]**: [title] ([current_number] of [total_findings]) - **Priority**: [priority] - **Complexity**: [complexity] - **Risk**: [risk]
 **Issue**: [issue]
 **Location**: [location]
 **Impact**: [impact]
-**Priority**: [priority] - **Complexity**: [complexity] - **Risk**: [risk]
 
 ## Current Code
 ```rust
@@ -239,20 +237,29 @@ Present the investigation findings to the user using this format
     - Mark each as "in_progress" when presenting it
     - Mark as "completed" after user responds with a keyword
 
+    **TRACK DECISIONS**: Maintain a list of all decisions made and what changes they caused.
+
     For each investigated finding (in order, starting with TYPE-SYSTEM):
 
     1. Update TodoWrite to mark current finding as "in_progress"
-    2. Present the finding using the format from <UserOutput/> (from the investigation results)
+    2. **ADJUST FOR CONTEXT**: If prior decisions affect this finding, modify the presentation:
+       - Update the current_code if it was changed by a prior fix
+       - Note if the issue may already be addressed by a prior decision
+       - Adjust the suggested_code if it needs to account for prior changes
+    3. Present the finding using the format from <UserOutput/> (from the investigation results)
        - Include the (n of m) counter in the title
-    3. Display available keywords using <KeywordPresentation/> format based on the verdict:
+       - Add any relevant notes about how prior decisions affect this finding
+    4. Display available keywords using <KeywordPresentation/> format based on the verdict:
        - Identify the verdict from investigation (e.g., CONFIRMED, FIX RECOMMENDED)
        - Look in your command file's <ReviewKeywords/> section for that specific verdict
        - Present ONLY the keywords listed for that verdict
        - Use the exact descriptions provided in <ReviewKeywords/>
-    4. STOP and wait for user's keyword response
-    5. Execute the action from your command file's <KeywordExecution/> section
-    6. Update TodoWrite to mark current finding as "completed"
-    7. Continue to next finding
+    5. STOP and wait for user's keyword response
+    6. Execute the action from your command file's <KeywordExecution/> section
+       - **SPECIAL CASE FOR "investigate" KEYWORD**: After investigation completes,
+         present the same finding again with updated information and wait for a new keyword response
+    7. Update TodoWrite to mark current finding as "completed"
+    8. Continue to next finding
 
     After all findings are reviewed, provide a summary using <FinalSummary/>
 </UserReview>
@@ -322,7 +329,7 @@ Present the investigation findings to the user using this format
 </AcceptAsBuiltTemplate>
 
 <KeywordPresentation>
-    ## Available Actions
+    # Available Actions
     Look up the appropriate keywords from the <ReviewKeywords/> section in your command file
     based on the verdict, then display them using this EXACT format:
 
@@ -372,6 +379,16 @@ For plan document reviews:
 4. Cross-reference sections as many topics span multiple areas
 5. For every "missing" claim, either quote the section that should contain it or explain why existing content is insufficient
 </DocumentComprehension>
+
+<DesignConsistency>
+For design document reviews:
+1. **Internal Consistency**: Verify that all sections of the plan are consistent with each other
+2. **Decision Alignment**: Check that design decisions in one section don't contradict decisions in another
+3. **Terminology Consistency**: Ensure the same terms are used consistently throughout
+4. **Architectural Coherence**: Verify that the overall architecture remains coherent across all sections
+5. **Example Consistency**: Ensure code examples align with the described approach
+6. **Flag Inconsistencies**: Report when a change in one section would require updates to other sections
+</DesignConsistency>
 
 <PlanDocumentAnalysis>
 For plan alignment reviews:

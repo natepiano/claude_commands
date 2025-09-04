@@ -14,16 +14,22 @@ The main agent is responsible for:
 ```json
 [
   {
-    "id": "string",
+    "sequence_number": "number",
     "content": "string",
     "status": "pending|in_progress|completed",
-    "priority": "high|medium|low",
     "notes": "string"
   }
 ]
 ```
 
-2. Commit `.todo.json` if there are any other files uncommitted DO NOT COMMIT THEM
+**IMPORTANT**: 
+- `sequence_number` should be 1, 2, 3, etc. in order
+- This sequencing represents our best attempt at dependency ordering to minimize build issues
+- If during implementation you discover a better ordering, you may resequence tasks:
+  - Update the sequence_numbers to reflect the new order
+  - Add a note to any resequenced item explaining why it was moved
+
+2. Commit `.todo.json` only (if there are other uncommitted files, DO NOT include them in this commit)
 3. Task subagent with the content between <SubagentInstructions> and </SubagentInstructions> tags AND the current plan/context needed to work effectively, including current working directory
 
 4. **MANDATORY AUTO-CONTINUATION**: When subagent returns:

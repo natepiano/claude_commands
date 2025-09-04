@@ -22,6 +22,7 @@
     - <SkipNotesCheck/>
     - <TypeSystemPrinciples/>
     - <DocumentComprehension/>
+    - <DesignConsistency/>
 </ReviewConstraints>
 
 <ReviewKeywords>
