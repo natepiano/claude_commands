@@ -7,7 +7,7 @@
 <ReviewContext>
 [PLAN_DOCUMENT] <PlanDocument/>
 [REVIEW_TARGET]: the feature design in [PLAN_DOCUMENT]
-[REVIEW_CONTEXT]: We are reviewing a plan to improve its design, NOT checking if it has been implemented. The plan describes future work - our goal is to identify gaps, over-engineering, and improvements to the plan.
+[REVIEW_CONTEXT]: We are reviewing a plan to improve its design. Our goal is to identify gaps, over-engineering, and improvements to the plan.
 </ReviewContext>
 
 
@@ -30,15 +30,16 @@
     - **skip**: Add to "Design Review Skip Notes" section and continue
     - **skip with prejudice**: Permanently reject with ⚠️ PREJUDICE WARNING
     - **investigate**: Launch deeper investigation of the design issue
-    
+
     **For MODIFIED verdicts:**
     - **agree**: Update plan document with the modified version
     - **skip**: Add to "Design Review Skip Notes" section and continue
     - **skip with prejudice**: Permanently reject with ⚠️ PREJUDICE WARNING
     - **investigate**: Launch deeper investigation
-    
+
     **For REJECTED verdicts:**
     - **skip**: Accept the rejection and continue (default)
+    - **skip with prejudice**: Permanently reject with ⚠️ PREJUDICE WARNING
     - **investigate**: Launch investigation to reconsider
 </ReviewKeywords>
 
@@ -48,8 +49,10 @@
 </ReviewFollowupParameters>
 
 <KeywordExecution>
-    **agree**: Use Edit tool to add the suggested_code content to the plan document in an appropriate section
-    **skip**: Use Edit tool to add this finding to the "Design Review Skip Notes" section with the reasoning
-    **skip with prejudice**: Use Edit tool to add to "Design Review Skip Notes" with "⚠️ PREJUDICE WARNING - DO NOT SUGGEST AGAIN"
+    **CRITICAL**: Follow <PlanUpdateFormat/> from review_commands.md for all plan updates.
+    
+    **agree**: Use Edit tool to add to plan document using <AgreeTemplate/> format from review_commands.md
+    **skip**: Use Edit tool to add to "Design Review Skip Notes" section using <SkipTemplate/> format from review_commands.md
+    **skip with prejudice**: Use Edit tool to add to "Design Review Skip Notes" section using <SkipWithPrejudiceTemplate/> format from review_commands.md
     **investigate**: Ask user "What specific aspect would you like me to investigate?", then launch Task tool with their focus
 </KeywordExecution>

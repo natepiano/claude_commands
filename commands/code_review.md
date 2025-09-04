@@ -26,15 +26,14 @@
     - **fix**: Apply the suggested code change immediately
     - **skip**: Skip this fix and continue
     - **investigate**: Launch deeper investigation of the code issue
-    
+
     **For FIX MODIFIED verdicts:**
     - **fix**: Apply the modified code change
     - **skip**: Skip this fix and continue
     - **investigate**: Launch deeper investigation
-    
+
     **For FIX NOT RECOMMENDED verdicts:**
     - **accept**: Accept the recommendation to not fix (default)
-    - **skip**: Skip and continue 
     - **override**: Apply the fix despite the recommendation
     - **investigate**: Launch investigation to reconsider
 </ReviewKeywords>

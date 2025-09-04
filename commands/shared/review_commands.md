@@ -41,6 +41,13 @@
     <ReviewConstraints/>
 
     Review [REVIEW_TARGET] using the categories defined above and provide structured findings.
+    It is important that you think very hard about this review task.
+
+    **CODE CONTEXT REQUIREMENT**: When reporting code issues, you MUST provide enough context to understand the problem:
+    - Include at least 5-10 lines of surrounding code (more if needed for complex logic)
+    - Show the complete function/method containing the issue when possible
+    - Include relevant imports, type definitions, or related structures
+    - A single line of code is NEVER sufficient - provide the full context
 
     **CRITICAL**: Return your findings using the exact format specified in <InitialReviewJson/>
 </InitialReviewPrompt>
@@ -72,6 +79,7 @@ Requirements:
 - [NUMBER] is sequential within category (1, 2, 3...)
 - TYPE-SYSTEM issues always have priority: "High"
 - Sort findings array with TYPE-SYSTEM issues first
+- current_code MUST contain enough context (5-10+ lines, complete functions when relevant)
 - Return ONLY the JSON object, no additional text
 </InitialReviewJson>
 
@@ -102,17 +110,21 @@ Provide a high-level summary of the subagent's findings:
     3. Group the remaining findings by category
 
     Launch parallel investigations:
-    1. Use multiple Task tool invocations in a SINGLE response to investigate ALL findings simultaneously
-    2. For EACH finding from the initial review, launch a separate investigation subagent with:
+    **CRITICAL**: You MUST launch ALL investigations in a SINGLE response using multiple Task tool calls.
+    
+    1. **SINGLE MESSAGE WITH MULTIPLE TASK CALLS**: For EACH finding from the initial review, create a separate Task tool invocation with:
        - description: "Investigate [CATEGORY-ID]: [Brief title of finding]"
        - subagent_type: "general-purpose"
        - prompt: Use the template from <ReviewFollowupPrompt/> with the specific finding details
-
+    
+    2. **EXAMPLE**: If you have 3 findings, your response should contain exactly 3 Task tool calls, all in one message
+    
     3. Wait for ALL investigation subagents to complete (they will return ReviewFollowupJson)
     4. Parse the JSON results and merge with original findings
     5. Prepare to present each investigated finding to the user in the next step
 
     **CRITICAL**: Do NOT present findings to the user yet - just complete the investigations and compile results.
+    **CRITICAL**: Do NOT wait between Task calls - send them all at once for true parallel execution.
 </ReviewFollowup>
 
 <ReviewFollowupPrompt>
@@ -125,7 +137,7 @@ Provide a high-level summary of the subagent's findings:
     [Insert the complete finding object from the InitialReviewJson findings array]
     ```
 
-    Analyze this finding and provide an investigation verdict.
+    Analyze this finding and provide an investigation verdict. It is important that you think very hard about this review task.
 
     **Your Investigation Tasks:**
     1. Verify if this is a real issue or false positive
@@ -134,6 +146,8 @@ Provide a high-level summary of the subagent's findings:
     4. Provide a verdict: [EXPECTED_VERDICTS]
     5. Include detailed reasoning for your verdict
     6. Be sure to include suggested code changes when recommending action
+    7. **CRITICAL**: If the original finding has insufficient code context (less than 5 lines), 
+       you MUST read the file and provide the full context in your response
 
     **CRITICAL RESTRICTIONS - You may ONLY:**
     - Read files to understand context
@@ -179,6 +193,7 @@ Requirements:
 - alternative_approach is OPTIONAL - omit if not applicable
 - For verdicts recommending action: suggested_code is REQUIRED
 - For verdicts NOT recommending action: omit suggested_code field
+- current_code field MUST be expanded if original had insufficient context (minimum 5-10 lines)
 - Return ONLY the JSON object, no additional text
 </ReviewFollowupJson>
 
@@ -188,7 +203,7 @@ Requirements:
 Present the investigation findings to the user using this format
 (derived from the ReviewFollowupJson data):
 
-# **[id]**: [title]
+# **[id]**: [title] ([current_number] of [total_findings])
 **Issue**: [issue]
 **Location**: [location]
 **Impact**: [impact]
@@ -217,20 +232,93 @@ Present the investigation findings to the user using this format
 <UserReview>
     **Present Findings to User for Interactive Review**
 
+    **FIRST**: Create a TodoWrite list to track the review process:
+    - Create one todo item for each finding with status "pending"
+    - Format: "Review [id]: [title]" 
+    - Mark each as "in_progress" when presenting it
+    - Mark as "completed" after user responds with a keyword
+
     For each investigated finding (in order, starting with TYPE-SYSTEM):
 
-    1. Present the finding using the format from <UserOutput/> (from the investigation results)
-    2. Display available keywords using <KeywordPresentation/> format based on the verdict:
+    1. Update TodoWrite to mark current finding as "in_progress"
+    2. Present the finding using the format from <UserOutput/> (from the investigation results)
+       - Include the (n of m) counter in the title
+    3. Display available keywords using <KeywordPresentation/> format based on the verdict:
        - Identify the verdict from investigation (e.g., CONFIRMED, FIX RECOMMENDED)
        - Look in your command file's <ReviewKeywords/> section for that specific verdict
        - Present ONLY the keywords listed for that verdict
        - Use the exact descriptions provided in <ReviewKeywords/>
-    3. STOP and wait for user's keyword response
-    4. Execute the action from your command file's <KeywordExecution/> section
-    5. Continue to next finding
+    4. STOP and wait for user's keyword response
+    5. Execute the action from your command file's <KeywordExecution/> section
+    6. Update TodoWrite to mark current finding as "completed"
+    7. Continue to next finding
 
     After all findings are reviewed, provide a summary using <FinalSummary/>
 </UserReview>
+
+<PlanUpdateFormat>
+    **CRITICAL**: When updating plan documents with review findings, you MUST include:
+    - The finding ID and title
+    - The category
+    - The location where the issue was found
+    - The actual issue description
+    - The verdict from the investigation
+    - The reasoning from the investigation verdict
+    - Any relevant code or suggested changes
+    
+    Use the appropriate template below based on the keyword action.
+</PlanUpdateFormat>
+
+<SkipTemplate>
+### [id]: [title]
+- **Status**: SKIPPED
+- **Category**: [category]
+- **Location**: [location from finding]
+- **Issue**: [issue from finding]
+- **Proposed Change**: [Brief summary of suggested_code if available]
+- **Verdict**: [verdict from investigation]
+- **Reasoning**: [reasoning from investigation]
+- **Decision**: User elected to skip this recommendation
+</SkipTemplate>
+
+<SkipWithPrejudiceTemplate>
+### ⚠️ PREJUDICE WARNING - [id]: [title]
+- **Status**: PERMANENTLY REJECTED
+- **Category**: [category]
+- **Location**: [location from finding]
+- **Issue**: [issue from finding]
+- **Verdict**: [verdict from investigation]
+- **Reasoning**: [reasoning from investigation]
+- **Critical Note**: DO NOT SUGGEST THIS AGAIN - Permanently rejected by user
+</SkipWithPrejudiceTemplate>
+
+<AgreeTemplate>
+## [id]: [title] ✅
+- **Category**: [category]
+- **Status**: APPROVED - To be implemented
+- **Location**: [location from finding]
+- **Issue Identified**: [issue from finding]
+- **Verdict**: [verdict from investigation]
+- **Reasoning**: [reasoning from investigation]
+
+### Approved Change:
+[suggested_code or description from finding]
+
+### Implementation Notes:
+[Any additional context about how this should be implemented]
+</AgreeTemplate>
+
+<AcceptAsBuiltTemplate>
+## Deviation from Plan: [id] - [title]
+- **Category**: [category]
+- **Status**: ACCEPTED AS BUILT
+- **Location**: [location in code]
+- **Plan Specification**: [What the plan originally specified]
+- **Actual Implementation**: [current_code or description]
+- **Verdict**: [verdict from investigation]
+- **Reasoning**: [reasoning from investigation]
+- **Decision**: Implementation deviation accepted and documented
+</AcceptAsBuiltTemplate>
 
 <KeywordPresentation>
     ## Available Actions

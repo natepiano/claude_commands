@@ -49,8 +49,10 @@
 </ReviewFollowupParameters>
 
 <KeywordExecution>
+    **CRITICAL**: Follow <PlanUpdateFormat/> from review_commands.md for all plan updates.
+    
     **align to plan**: Use Edit tool to modify code to match the plan specification (apply suggested_code)
     **skip**: Mark as skipped and continue (maintain list for final summary)
-    **accept as built**: Use Edit tool to update plan document with a deviation note explaining why implementation differs
+    **accept as built**: Use Edit tool to update plan document using <AcceptAsBuiltTemplate/> format from review_commands.md
     **investigate**: Ask user "What specific aspect would you like me to investigate?", then launch Task tool with their focus
 </KeywordExecution>
