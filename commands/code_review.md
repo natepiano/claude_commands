@@ -4,10 +4,21 @@
 
 <ExecutionSteps/>
 
-<ReviewContext>
-[REVIEW_TARGET]: the code changes in the current git diff
-[REVIEW_CONTEXT]: We are reviewing ACTUAL CODE for quality issues, NOT a plan. We're looking at real implementation code to find bugs, quality issues, and improvements IN THE CODE.
-</ReviewContext>
+<DetermineReviewTarget>
+**Execute this step to determine what to review:**
+
+If $ARGUMENTS is provided:
+- Set [REVIEW_TARGET] to: the code at path $ARGUMENTS (and all files below it if it's a directory)  
+- Set [REVIEW_MODE] to: static code review (reviewing actual code as-is, not changes)
+- Use glob/grep tools to find all code files under $ARGUMENTS path
+
+If $ARGUMENTS is empty:
+- Set [REVIEW_TARGET] to: the code changes from running: git diff -- . ':(exclude,top)*.md'
+- Set [REVIEW_MODE] to: diff review (reviewing uncommitted changes only)
+- Execute git diff to get the changes
+
+Set [REVIEW_CONTEXT] to: We are reviewing ACTUAL CODE for quality issues, NOT a plan. We're looking at real implementation code to find bugs, quality issues, and improvements IN THE CODE.
+</DetermineReviewTarget>
 
 <ReviewCategories>
 - **TYPE-SYSTEM**: Type system violations - missed opportunities for better type safety
@@ -19,6 +30,7 @@
 
 <ReviewConstraints>
     - <TypeSystemPrinciples/>
+    - <CodeDuplicationDetection/>
 </ReviewConstraints>
 
 <ReviewKeywords>

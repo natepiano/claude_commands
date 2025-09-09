@@ -8,3 +8,5 @@
 **IMPORTANT** don't mention Claude in commit messages
 **IMPORTANT** when running tests use `cargo nextest run`
 - never commit code unless i ask you to
+- if you need a field renamed, ask the user to do it - they can do it through their editor much faster than I can
+- don't use /tmp directory when you need temporary file processing, use $TEMPDIR which will automatically clean up temporary files

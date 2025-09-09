@@ -4,11 +4,13 @@
 
 <ExecutionSteps/>
 
-<ReviewContext>
-[PLAN_DOCUMENT] <PlanDocument/>
-[REVIEW_TARGET]: alignment between [PLAN_DOCUMENT] and current git diff changes
-[REVIEW_CONTEXT]: We are verifying that the actual implementation aligns with the plan. Compare specifications against implementation to identify missing features, unauthorized additions, and specification mismatches.
-</ReviewContext>
+<DetermineReviewTarget>
+**Execute this step to determine what to review:**
+
+Set [PLAN_DOCUMENT] using <PlanDocument/>
+Set [REVIEW_TARGET] to: alignment between [PLAN_DOCUMENT] and current git diff changes
+Set [REVIEW_CONTEXT] to: We are verifying that the actual implementation aligns with the plan. Compare specifications against implementation to identify missing features, unauthorized additions, and specification mismatches.
+</DetermineReviewTarget>
 
 <ReviewCategories>
 - **MISSING**: Planned features not implemented - functionality specified in plan but absent from code
@@ -25,22 +27,25 @@
 
 <ReviewKeywords>
     **For ALIGN RECOMMENDED verdicts:**
-    - **align to plan**: Modify code to match plan specification
-    - **skip**: Skip this alignment and continue
-    - **accept as built**: Update plan to document the deviation
+    - **align to plan**: Implement the recommended code alignment
+    - **skip**: Reject the alignment recommendation - document and continue
+    - **skip silently**: Reject without updating the plan document
+    - **accept as built**: Accept the deviation - update plan to document it
     - **investigate**: Launch deeper investigation of the discrepancy
     
     **For ACCEPT RECOMMENDED verdicts:**
-    - **accept as built**: Update plan to document the accepted deviation (default)
-    - **align to plan**: Align code to plan anyway
-    - **skip**: Skip without documenting
-    - **investigate**: Launch deeper investigation
+    - **accept as built**: Accept the recommendation - update plan to document the deviation (default)
+    - **align to plan**: Override recommendation - align code to plan anyway
+    - **skip**: Reject the acceptance recommendation - document and continue
+    - **skip silently**: Reject without updating the plan document
+    - **investigate**: Launch deeper investigation of alternatives
     
     **For DEFER RECOMMENDED verdicts:**
-    - **skip**: Defer this alignment for later (default)
-    - **align to plan**: Align code to plan now despite recommendation
-    - **accept as built**: Update plan to document the deviation
-    - **investigate**: Launch deeper investigation
+    - **skip**: Accept the deferral recommendation - document for later (default)
+    - **skip silently**: Accept the deferral without updating the plan document
+    - **align to plan**: Override recommendation - align code to plan now
+    - **accept as built**: Override recommendation - accept deviation and document it
+    - **investigate**: Challenge the deferral and investigate further
 </ReviewKeywords>
 
 <ReviewFollowupParameters>
@@ -53,6 +58,7 @@
     
     **align to plan**: Use Edit tool to modify code to match the plan specification (apply suggested_code)
     **skip**: Mark as skipped and continue (maintain list for final summary)
+    **skip silently**: Skip without any plan updates - continue to next finding
     **accept as built**: Use Edit tool to update plan document using <AcceptAsBuiltTemplate/> format from review_commands.md
     **investigate**: Ask user "What specific aspect would you like me to investigate?", then launch Task tool with their focus
 </KeywordExecution>

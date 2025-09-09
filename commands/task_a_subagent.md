@@ -41,7 +41,7 @@
 <TaskCreation>
     **For NEW tasks only:**
     
-    1. Create `.todo.json` using <TodoJsonFormat/>
+    1. Create `.todo.json` using format defined in <TodoJsonFormat/>
     2. Order tasks by dependency to minimize build issues
     3. If plan document exists, ensure todos align with plan specifications
     4. Stage and commit `.todo.json` only:
@@ -60,26 +60,6 @@
     3. Skip directly to <SubagentExecution/>
 </TaskContinuation>
 
-<TodoJsonFormat>
-    **Required JSON structure (one task per line for readability):**
-    ```json
-    [
-      {
-        "sequence_number": 1,
-        "content": "Task description",
-        "status": "pending",
-        "notes": ""
-      }
-    ]
-    ```
-    
-    **Field specifications:**
-    - sequence_number: Integer, sequential (1, 2, 3...)
-    - content: Clear task description
-    - status: "pending" | "in_progress" | "completed"
-    - notes: Implementation notes, warnings found, or resequencing reasons
-</TodoJsonFormat>
-
 ## STEP 3: SUBAGENT EXECUTION
 
 <SubagentExecution>
@@ -88,12 +68,14 @@
     1. Use the Task tool with EXACTLY these parameters:
        - description: "Execute tasks from .todo.json"
        - subagent_type: "general-purpose"
-       - prompt: The ENTIRE content between <SubagentPrompt> and </SubagentPrompt> tags below
+       - prompt: The content between <SubagentPrompt> and </SubagentPrompt> tags below
     
-    2. Include in the prompt:
-       - Current working directory: [WORKING_DIRECTORY]
-       - Plan document reference: [PLAN_DOCUMENT] (if exists)
-       - For continuations: "Continue from existing .todo.json - do not create new one"
+    2. **CRITICAL**: When building the prompt, expand ALL tagged references:
+       - Replace <TodoJsonFormat/> with the full content from the <TodoJsonFormat> definition
+       - Replace <SubagentCriticalRules/> with the full content from that definition
+       - Replace <WarningCategorizationLogic/> with the full content from that definition
+       - Include actual values for [WORKING_DIRECTORY] and [PLAN_DOCUMENT]
+       - For continuations: Add "Continue from existing .todo.json - do not create new one"
     
     3. Wait for subagent to complete
     
@@ -114,7 +96,7 @@
     **YOUR WORKFLOW:**
     
     <Step1_ReadContext>
-        1. Read .todo.json to understand all tasks (format described in <TodoJsonFormat/>)
+        1. Read .todo.json to understand all tasks (see <TodoJsonFormat/> for structure)
         2. If [PLAN_DOCUMENT] specified, read it for implementation requirements
         3. Identify first incomplete task (status: "pending" or "in_progress")
     </Step1_ReadContext>
@@ -138,16 +120,10 @@
         After implementation tasks (before marking final task complete):
         
         1. Run `~/.claude/commands/bash/build-check.sh`
-        2. For each warning, determine:
-           - **Missing implementation**: Warning shows incomplete work
-             → Add new tasks to .todo.json with "pending" status
-             → Continue implementing these tasks
-           - **Dead code**: Unnecessary code that won't be used
-             → Delete immediately (don't add to .todo.json)
-        3. Examples:
-           - "field `x` is never read" → Check if should be used or deleted
-           - "function `y` is never used" → Determine if needed or removable
-        4. Only mark complete when build is clean
+        2. Apply <WarningCategorizationLogic/> to each warning
+        3. For missing implementation: Add new tasks to .todo.json and continue
+        4. For unnecessary code: Delete immediately
+        5. Only mark complete when build is clean
     </Step3_BuildValidation>
     
     <Step4_ContextManagement>
@@ -166,35 +142,7 @@
     - Every task transition MUST update .todo.json
     - Build validation is MANDATORY before completion
     - Context limits trigger handoff, not failure
-    
-    <SubagentCriticalRules>
-        **NEVER violate these rules:**
-        1. Always update .todo.json to "in_progress" BEFORE working on any task
-        2. Never skip build validation after implementation
-        3. Always add detailed notes when hitting context limits
-        4. Never commit code (only .todo.json updates allowed)
-        5. Never assume dead code is intentional - check or remove it
-    </SubagentCriticalRules>
-    
-    <TodoJsonFormat>
-        **Expected JSON structure (one task per line for readability):**
-        ```json
-        [
-          {
-            "sequence_number": 1,
-            "content": "Task description",
-            "status": "pending",
-            "notes": ""
-          }
-        ]
-        ```
-        
-        **Field specifications:**
-        - sequence_number: Integer, sequential (1, 2, 3...)
-        - content: Clear task description
-        - status: "pending" | "in_progress" | "completed"
-        - notes: Implementation notes, warnings found, or resequencing reasons
-    </TodoJsonFormat>
+    - Follow all rules in <SubagentCriticalRules/>
 </SubagentPrompt>
 
 ## STEP 4: HANDOFF (IF NEEDED)
@@ -221,24 +169,16 @@
     
     1. Run `~/.claude/commands/bash/build-check.sh`
     
-    2. If warnings exist about unused code/fields/functions:
-       a. Read the original [PLAN_DOCUMENT] (if exists)
-       b. For each warning, compare against plan to determine:
-          
-          **Unfinished Work** (warning indicates missing implementation):
-          - Example: "field `config` never read" but plan requires "use config to initialize"
-          - Action: Create new tasks in .todo.json for missing implementation
+    2. If warnings exist:
+       a. Read the original [PLAN_DOCUMENT] (if exists) for context
+       b. Apply <WarningCategorizationLogic/> to each warning
+       c. For missing implementation:
+          - Create new tasks in .todo.json
           - Execute <SubagentExecution/> to complete these tasks
-          
-          **Unnecessary Code** (code not needed per plan or logic):
-          - Example: "function `helper` never used" and plan doesn't mention this helper
-          - Action: Delete the unused code immediately
+       d. For unnecessary code:
+          - Delete the unused code immediately
     
-    3. Check for elided fields (prefixed with `_`):
-       - If plan requires using field: Remove `_` prefix and implement usage
-       - If field truly unused: Delete entirely
-    
-    4. Only proceed when build is clean or all warnings are justified
+    3. Only proceed when build is clean or all warnings are justified
 </PostImplementationReview>
 
 ## STEP 6: COMPLETION
@@ -278,3 +218,64 @@
     5. Delete unnecessary code immediately (don't leave dead code)
     6. Only request user input for true blocking issues or plan deviations
 </MainAgentCriticalRules>
+
+<TodoJsonFormat>
+    **Expected JSON structure (each field on its own line for readability):**
+    ```json
+    [
+      {
+        "sequence_number": 1,
+        "content": "Task description",
+        "status": "pending",
+        "notes": ""
+      },
+      {
+        "sequence_number": 2,
+        "content": "Another task description",
+        "status": "pending",
+        "notes": ""
+      }
+    ]
+    ```
+    
+    **Field specifications:**
+    - sequence_number: Integer, sequential (1, 2, 3...)
+    - content: Clear task description
+    - status: "pending" | "in_progress" | "completed"
+    - notes: Implementation notes, warnings found, or resequencing reasons
+    
+    **Formatting requirements:**
+    - Each field must be on its own line
+    - Proper indentation (2 spaces) for fields within objects
+    - Comma after each object except the last
+</TodoJsonFormat>
+
+<SubagentCriticalRules>
+    **NEVER violate these rules:**
+    1. Always update .todo.json to "in_progress" BEFORE working on any task
+    2. Never skip build validation after implementation
+    3. Always add detailed notes when hitting context limits
+    4. Never commit code (only .todo.json updates allowed)
+    5. Never assume dead code is intentional - check or remove it
+</SubagentCriticalRules>
+
+<WarningCategorizationLogic>
+    **How to categorize build warnings:**
+    
+    For each warning about unused code/fields/functions, determine:
+    
+    **Missing Implementation** (warning indicates incomplete work):
+    - Example: "field `config` is never read" but plan/logic requires using config
+    - Example: "field `x` is never read" when x should be used in calculations
+    - Action: Add new tasks to implement the missing functionality
+    
+    **Unnecessary Code** (code not needed per plan or logic):
+    - Example: "function `helper` is never used" and plan doesn't require this helper
+    - Example: "field `y` is never read" and no logic needs this field
+    - Action: Delete the unused code immediately
+    
+    **Special cases:**
+    - Elided fields (prefixed with `_`): If truly unused, delete entirely. If needed, remove prefix and implement.
+    - Test helpers: May be intentionally unused in production code
+    - Public API: May be unused internally but needed for external consumers
+</WarningCategorizationLogic>
