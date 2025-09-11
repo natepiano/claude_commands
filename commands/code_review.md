@@ -1,14 +1,24 @@
 # Code Review
 
-**CRITICAL** before doing anything else, read the contents of ~/.claude/commands/shared/review_commands.md and use the tagged sections wherever they are referenced.
+**MANDATORY FIRST STEP**: 
+1. Use the Read tool to read /Users/natemccoy/.claude/commands/shared/review_commands.md
+2. Find and follow the <ExecutionSteps> section from that file
+3. When you see tags like <ExecutionSteps/> below, these refer to sections in review_commands.md
 
 <ExecutionSteps/>
 
 <DetermineReviewTarget>
 **Execute this step to determine what to review:**
 
-If $ARGUMENTS is provided:
-- Set [REVIEW_TARGET] to: the code at path $ARGUMENTS (and all files below it if it's a directory)  
+If $ARGUMENTS starts with "commit:":
+- Extract the commit hash by removing the "commit:" prefix
+- Set [REVIEW_TARGET] to: the code changes from git commit [COMMIT_HASH]
+- Set [REVIEW_MODE] to: commit review (reviewing changes from a specific commit)
+- Execute: git show [COMMIT_HASH] --name-only to get affected files
+- Execute: git show [COMMIT_HASH] to get the changes
+
+If $ARGUMENTS is provided and does NOT start with "commit:":
+- Set [REVIEW_TARGET] to: the code at path $ARGUMENTS (and all files below it if it's a directory)
 - Set [REVIEW_MODE] to: static code review (reviewing actual code as-is, not changes)
 - Use glob/grep tools to find all code files under $ARGUMENTS path
 

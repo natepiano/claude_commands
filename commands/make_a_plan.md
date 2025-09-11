@@ -8,8 +8,9 @@ Create a structured plan document based on our discussion.
     **EXECUTE THESE STEPS IN ORDER:**
 
     **STEP 1:** Execute <ShowPlanLocation/>
-    **STEP 2:** Execute <InteractivePlanBuilding/>
-    **STEP 3:** Execute <PlanFinalization/>
+    **STEP 2:** Execute <SelectPlanType/>
+    **STEP 3:** Execute <InteractivePlanBuilding/>
+    **STEP 4:** Execute <PlanFinalization/>
 </ExecutionSteps>
 
 ## STEP 1: SETUP
@@ -23,10 +24,43 @@ Create a structured plan document based on our discussion.
     Then immediately proceed to Step 2.
 </ShowPlanLocation>
 
-## STEP 2: INTERACTIVE PLAN BUILDING
+## STEP 2: SELECT PLAN TYPE
+
+<SelectPlanType>
+    Ask the user:
+    ```
+    What type of implementation plan would you like to create?
+    
+    **collaborative** - A plan with step-by-step validation checkpoints where we work together
+                       (includes execution protocol for guided implementation)
+    
+    **agent** - A plan for independent implementation by the coder
+              (traditional plan without execution protocol)
+    
+    Please type: collaborative or agent
+    ```
+    
+    Store the response as PLAN_TYPE for use in subsequent steps.
+    
+    **Keyword Handling**:
+    - "collaborative", "collab", "together" → PLAN_TYPE = collaborative
+    - "agent", "solo", "independent" → PLAN_TYPE = agent
+    - Any other response → Ask for clarification
+</SelectPlanType>
+
+## STEP 3: INTERACTIVE PLAN BUILDING
 
 <InteractivePlanBuilding>
     **Context**: Since we've been discussing this feature/refactoring, use the conversation context to generate intelligent suggestions for each section.
+
+    **IF PLAN_TYPE = collaborative**:
+    - First, build the <CollaborativeExecutionProtocol/> section (see definition below)
+    - Then proceed with standard sections from <PlanSections/>
+    - Ensure Implementation Strategy references the execution protocol
+    
+    **IF PLAN_TYPE = agent**:
+    - Skip <CollaborativeExecutionProtocol/>
+    - Proceed with standard sections from <PlanSections/>
 
     For each section defined in <PlanSections/>:
 
@@ -46,10 +80,20 @@ Create a structured plan document based on our discussion.
     **CRITICAL**: Make suggestions specific and detailed based on what we've discussed. Don't generate generic placeholder content.
 </InteractivePlanBuilding>
 
-## STEP 3: FINALIZATION
+## STEP 4: FINALIZATION
 
 <PlanFinalization>
-    1. Compile all accepted/revised sections into final plan document
+    **IF PLAN_TYPE = collaborative**:
+    1. Place <CollaborativeExecutionProtocol/> content at the TOP of the document
+    2. Follow with all other accepted/revised sections
+    3. Ensure Implementation Strategy references the execution protocol steps
+    4. Show user a preview of the complete plan structure
+    5. Ask for confirmation before writing
+    6. Write the plan document to the specified location
+    7. Provide summary emphasizing this is a collaborative implementation plan
+    
+    **IF PLAN_TYPE = agent**:
+    1. Compile all accepted/revised sections into final plan document (standard flow)
     2. Show user a preview of the complete plan structure
     3. Ask for confirmation before writing
     4. Write the plan document to the specified location
@@ -59,6 +103,7 @@ Create a structured plan document based on our discussion.
 ## PLAN STRUCTURE DEFINITIONS
 
 <PlanSections>
+    <CollaborativeExecutionProtocol/> <!-- Only for collaborative plans -->
     <TitleAndOverview/>
     <ProblemStatement/>
     <ProposedSolution/>
@@ -72,6 +117,91 @@ Create a structured plan document based on our discussion.
 </PlanSections>
 
 ### Section Definitions
+
+<CollaborativeExecutionProtocol>
+    **Section**: Collaborative Execution Protocol
+    **Purpose**: Define the step-by-step collaborative implementation process with validation checkpoints
+    **Only For**: COLLABORATIVE plans (not included in agent-only plans)
+
+    **Format**:
+    ```markdown
+    ## EXECUTION PROTOCOL
+
+    <Instructions>
+    For each step in the implementation sequence:
+
+    1. **DESCRIBE**: Present the changes with:
+       - Summary of what will change and why
+       - Code examples showing before/after
+       - List of files to be modified
+       - Expected impact on the system
+
+    2. **AWAIT APPROVAL**: Stop and wait for user confirmation ("go ahead" or similar)
+
+    3. **IMPLEMENT**: Make the changes and stop
+
+    4. **BUILD & VALIDATE**: Execute the build process:
+       ```bash
+       [project-specific build commands, e.g., cargo build && cargo test]
+       ```
+       Then inform user to run any necessary reconnection commands
+
+    5. **CONFIRM**: Wait for user to confirm the build succeeded
+
+    6. **TEST** (if applicable): Run validation tests specific to that step
+
+    7. **MARK COMPLETE**: Update this document to mark the step as ✅ COMPLETED
+
+    8. **PROCEED**: Move to next step only after confirmation
+    </Instructions>
+
+    ## INTERACTIVE IMPLEMENTATION SEQUENCE
+
+    ### STEP 1: [Step Name]
+    **Status:** ⏳ PENDING
+    
+    **Objective:** [Clear goal for this step]
+    
+    **Changes to make:**
+    1. [Specific change 1]
+    2. [Specific change 2]
+    
+    **Files to modify:**
+    - `[file path 1]`
+    - `[file path 2]`
+    
+    **Expected outcome:**
+    - [What should work after this step]
+    - [How to verify success]
+
+    ### STEP 2: [Step Name]
+    **Status:** ⏳ PENDING
+    
+    [Similar structure...]
+
+    ### STEP N: Final Validation
+    **Status:** ⏳ PENDING
+    
+    **Objective:** Verify all changes work correctly
+    
+    **Validation checklist:**
+    - [ ] [Specific test 1]
+    - [ ] [Specific test 2]
+    - [ ] All tests pass
+    - [ ] No regressions
+    
+    **Expected outcome:**
+    - System fully migrated/implemented
+    - Ready for production use
+    ```
+
+    **Guidelines**:
+    - Each step should be independently testable
+    - Status markers: ⏳ PENDING, 🔄 IN PROGRESS, ✅ COMPLETED, ❌ BLOCKED
+    - Include specific build/test commands for the project
+    - Reference this protocol in the Implementation Strategy section
+    - Steps should align with phases defined in Implementation Strategy
+</CollaborativeExecutionProtocol>
 
 <TitleAndOverview>
     **Section**: Title and Overview
@@ -145,7 +275,7 @@ Create a structured plan document based on our discussion.
     **Section**: Implementation Strategy
     **Purpose**: Detail how to implement the solution
 
-    **Format**:
+    **Format for AGENT-ONLY plans**:
     ```markdown
     ## Implementation Strategy
 
@@ -160,11 +290,30 @@ Create a structured plan document based on our discussion.
     [Similar structure]
     ```
 
+    **Format for COLLABORATIVE plans**:
+    ```markdown
+    ## Implementation Strategy
+
+    **NOTE:** This plan follows the Collaborative Execution Protocol defined above.
+    Each phase below corresponds to steps in the INTERACTIVE IMPLEMENTATION SEQUENCE.
+
+    ### Phase 1: [Phase Name] → See STEP 1 in Execution Protocol
+    **Goal**: [What this phase accomplishes]
+
+    #### Steps:
+    1. [Specific action with code example if relevant]
+    2. [Specific action with code example if relevant]
+
+    ### Phase 2: [Phase Name] → See STEP 2 in Execution Protocol
+    [Similar structure with references to protocol steps]
+    ```
+
     **Guidelines**:
     - Break into logical phases
     - Include code examples showing changes
     - Specify dependencies between phases
     - Be specific about file modifications
+    - **For collaborative plans**: Each phase should map to a step in the execution protocol
 </Implementation>
 
 <MigrationStrategy>

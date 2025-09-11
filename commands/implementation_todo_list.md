@@ -14,8 +14,11 @@ Create a todo list for the specified plan using your todo tool, then STOP.
 1. If `$ARGUMENTS` is provided: Read the specified plan document from the project root
 2. If no arguments: Use the plan document currently being worked on in the session
 3. Verify the plan document exists and is readable
-4. Check if the plan document is checked into git
-5. If it is not checked in, create an appropriate commit message for it and check it in
+4. Check if the plan document is checked into git using: `git status [PLAN_FILE_PATH]`
+5. If it is not checked in, commit ONLY the plan file:
+   - Run: `git add [PLAN_FILE_PATH]` (ONLY the plan file, nothing else)
+   - Run: `git commit -m "docs: add implementation plan for [feature name]"`
+   - DO NOT use `git add .` or `git add -A`
 6. This ensures the plan is preserved before implementation begins
 
 **CRITICAL - REVIEW FINDINGS PROCESSING**:
@@ -71,6 +74,22 @@ NEVER fix warnings by:
 Exception: Code you just added that you'll use immediately
 </WarningRules>
 
+<CodingGuidelines>
+**CRITICAL CODING STYLE REQUIREMENTS**:
+
+1. **Function Length Limits**:
+   - Functions MUST NOT exceed 100 lines
+   - If you find yourself writing a function longer than 100 lines, STOP and refactor:
+     - Extract logical sections into well-named helper functions
+     - Each helper should have a single, clear responsibility
+     - The main function should read like a high-level overview
+   - This is a hard requirement - violating it is a coding style error
+
+2. **Code Organization**:
+   - Keep functions focused on a single purpose
+   - Use descriptive names for helper functions that explain what they do
+   - Group related helper functions together
+</CodingGuidelines>
 
 <ReviewFindingsInterpretation>
 **How to interpret review findings for todo generation - READ CAREFULLY:**
@@ -129,7 +148,7 @@ Example 5 - ACCEPTED AS BUILT deviation:
 
 <ImplementationTodos>
 For each plan item that passes review filtering, create paired todos:
-- [ ] Implement the specific feature/change from plan (or approved version if modified)
+- [ ] Implement the specific feature/change from plan (or approved version if modified) following <CodingGuidelines>
 - [ ] Run `~/.claude/commands/bash/build-check.sh` and fix errors following <WarningRules>
 
 Build Heuristic:

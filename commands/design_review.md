@@ -1,6 +1,9 @@
 # Design Review
 
-**CRITICAL** before doing anything else, read the contents of ~/.claude/commands/shared/review_commands.md and use the tagged sections wherever they are referenced.
+**MANDATORY FIRST STEP**: 
+1. Use the Read tool to read /Users/natemccoy/.claude/commands/shared/review_commands.md
+2. Find and follow the <ExecutionSteps> section from that file
+3. When you see tags like <ExecutionSteps/> below, these refer to sections in review_commands.md
 
 <ExecutionSteps/>
 

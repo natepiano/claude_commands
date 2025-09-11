@@ -1,11 +1,13 @@
 ## MAIN WORKFLOW
 
 <ExecutionSteps>
+    **CRITICAL: You MUST use the Task tool for reviews. Do NOT review code directly.**
+    
     **EXECUTE THESE STEPS IN ORDER:**
 
-    **STEP 1:** Execute the <InitialReview/>
+    **STEP 1:** Execute the <InitialReview/> - MUST use Task tool
     **STEP 2:** Summarize the subagent's findings using <InitialReviewSummary/>
-    **STEP 3:** Execute the <ReviewFollowup/>
+    **STEP 3:** Execute the <ReviewFollowup/> - MUST use Task tool for each finding
     **STEP 4:** Execute the <UserReview/>
 </ExecutionSteps>
 
@@ -17,21 +19,20 @@
 ## STEP 1: INITIAL REVIEW
 
 <InitialReview>
+    **1. Execute <DetermineReviewTarget/> from the specific review command**
+    
+    **2. Show user what you're reviewing:**
+    # Step 1: Initial Review
+    ## Review Target: [REVIEW_TARGET]
+    ## Review Context: [REVIEW_CONTEXT]
+    [If PLAN_DOCUMENT exists: ## Plan Document: [PLAN_DOCUMENT]]
 
-    Before using the Task tool:
-  - Execute the <DetermineReviewTarget/> section from the specific review command to set [REVIEW_TARGET] and [REVIEW_CONTEXT]
-  - If there is a [PLAN_DOCUMENT] tell the user that we are going to review it.
-  - If there is not a plan document then tell the user what is the [REVIEW_TARGET]
-  - Summarize the [REVIEW_CONTEXT] for the user.
-  - Construct a [TASK_DESCRIPTION] - if there is a [PLAN_DOCUMENT] then use "review [PLAN_DOCUMENT]" otherwise use "review [REVIEW_TARGET]"
-
-  Then use the Task tool with EXACTLY these parameters:
-    - description: [TASK_DESCRIPTION]
+    **3. MANDATORY: Launch Task tool (DO NOT skip this):**
+    - description: "review [PLAN_DOCUMENT]" OR "review [REVIEW_TARGET]"
     - subagent_type: "general-purpose"
-    - prompt: The ENTIRE content between <InitialReviewPrompt> and </InitialReviewPrompt> tags below, replacing any placeholders with their actual values from the determined [REVIEW_TARGET] and [REVIEW_CONTEXT]. And also substituting any tags that are referenced so that the full text of <ReviewConstraints/> are included.
+    - prompt: Everything in <InitialReviewPrompt> below with placeholders replaced
 
-    Wait for the subagent to complete before proceeding to Step 2.
-
+    **4. Wait for subagent completion before Step 2**
 </InitialReview>
 
 <InitialReviewPrompt>
@@ -242,8 +243,9 @@ Present the investigation findings to the user using this format
 (derived from the ReviewFollowupJson data).
 **Note**: Use appropriate language identifier in code blocks (rust, python, javascript, etc.):
 
-# **[id]**: [title] ([current_number] of [total_findings]) - **Priority**: [priority] - **Complexity**: [complexity] - **Risk**: [risk]
+# **[id]**: [title] ([current_number] of [total_findings])
 **Issue**: [issue]
+**Priority**: [priority] - **Complexity**: [complexity] - **Risk**: [risk]
 **Location**: [relative path from location.code_file]:[location.line_start]-[location.line_end]
 [if location.function exists: **Function**: [location.function]]
 [if location.module exists: **Module**: [location.module]]
@@ -290,8 +292,16 @@ Present the investigation findings to the user using this format
        - Add any relevant notes about how prior decisions affect this finding
     4. Display available keywords using <KeywordPresentation/> format based on the verdict
        - **CRITICAL**: If returning from an investigation, use the UPDATED verdict from the investigation result, NOT the original verdict
-    5. STOP and wait for user's keyword response
-    6. Execute the action from your command file's <KeywordExecution/> section
+    5. STOP and wait for user's response
+    6. **CRITICAL USER RESPONSE HANDLING**:
+       - **IF USER PROVIDES A KEYWORD**: Execute the action from your command file's <KeywordExecution/> section
+       - **IF USER PROVIDES ANY OTHER RESPONSE** (discussion, alternative proposal, question, clarification):
+         a. Engage with the user's input appropriately
+         b. If discussion leads to agreement/resolution, summarize the agreed approach
+         c. **MANDATORY**: Present keywords using <KeywordPresentation/> format
+         d. **MANDATORY**: State "Please select one of the keywords above to proceed."
+         e. **DO NOT CONTINUE** to next finding until user provides a keyword
+         f. If user continues discussion instead of selecting keyword, repeat steps a-e
        - **SPECIAL CASE FOR "investigate" KEYWORD**: After investigation completes,
          a. Parse the investigation JSON result to extract updated verdict and reasoning
          b. Update the finding object with new verdict, reasoning, complexity, risk, etc.
@@ -299,16 +309,19 @@ Present the investigation findings to the user using this format
          d. Present keywords appropriate for the NEW verdict (not the original verdict)
          e. Wait for user's new keyword response before proceeding
          f. Do NOT mark the todo as completed until user provides a keyword for the updated finding
-       - **FOR ALL EDIT ACTIONS** (agree, skip, skip with prejudice, accept as built):
+    7. After keyword execution:
+       - **FOR ALL EDIT ACTIONS** (agree, skip, skip with prejudice, accept as built, redundant):
          a. After executing the Edit tool to modify the plan
          b. STOP and ask "Edit complete. Type 'continue' to proceed to the next finding."
          c. Wait for user confirmation before proceeding
-    7. Update TodoWrite to mark current finding as "completed" ONLY after user confirms continuation
-    8. **USER CONTROL REQUIREMENTS**:
+    8. Update TodoWrite to mark current finding as "completed" ONLY after user confirms continuation
+    9. **USER CONTROL REQUIREMENTS**:
        - Wait for explicit user keyword input for all decisions
+       - If user engages in discussion, always return to keyword selection
        - Stop after plan edits and wait for "continue" confirmation
        - Never auto-select keywords or assume user intentions
-       - The user controls ALL decisions
+       - Never proceed to next finding without explicit user control
+       - The user controls ALL decisions and progression
 
     After all findings are reviewed, provide a summary using <FinalSummary/>
 </UserReview>
