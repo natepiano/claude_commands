@@ -68,8 +68,10 @@ Create a structured plan document based on our discussion.
     2. Generate suggested content based on our discussion so far
     3. **For Problem Statement section specifically**: Before presenting the suggestion, ask user:
        "Are there any specific metrics (file sizes, performance numbers, complexity measures, etc.) we should document as current state? These help establish baselines for measuring success."
-    4. **For Migration Strategy section specifically**: Before presenting the suggestion, ask user:
-       "Is this change simple enough to be implemented as one conceptual unit (Atomic), or does it require a phased approach with intermediate review points (Phased)? Complex changes affecting multiple systems typically benefit from phased implementation."
+    4. **For Migration Strategy section specifically**: 
+       - **If PLAN_TYPE = collaborative**: Skip asking - automatically use phased template
+       - **If PLAN_TYPE = agent**: Before presenting the suggestion, ask user:
+         "Is this change simple enough to be implemented as one conceptual unit (Atomic), or does it require a phased approach with intermediate review points (Phased)? Complex changes affecting multiple systems typically benefit from phased implementation."
     5. Present the suggestion to the user with these options:
        - **accept**: Use the suggested content as-is
        - **revise**: User provides modifications or replacement text
@@ -320,7 +322,25 @@ Create a structured plan document based on our discussion.
     **Section**: Migration Strategy
     **Purpose**: Define whether this is an atomic change or requires phased implementation
 
-    **Format**:
+    **Format for COLLABORATIVE plans**:
+    ```markdown
+    ## Migration Strategy
+
+    **Migration Strategy: Phased**
+
+    This collaborative plan uses phased implementation by design. The Collaborative Execution Protocol above defines the phase boundaries with validation checkpoints between each step.
+
+    #### Phase Overview
+    Each step in the INTERACTIVE IMPLEMENTATION SEQUENCE represents a phase with:
+    - User approval before implementation
+    - Build validation after changes
+    - Explicit confirmation before proceeding
+
+    #### Review Points
+    Review points are built into the execution protocol at each step transition.
+    ```
+
+    **Format for AGENT plans**:
     ```markdown
     ## Migration Strategy
 
@@ -352,6 +372,7 @@ Create a structured plan document based on our discussion.
 
     **Guidelines**:
     - Start with clear marker: "**Migration Strategy: Atomic**" or "**Migration Strategy: Phased**"
+    - **For Collaborative plans**: Always use "Phased" - the execution protocol inherently creates phases
     - For Atomic: Keep explanation brief - emphasize conceptual unity
     - For Phased: Define clear commit groups with validation points
     - Ensure each phase can compile, build, and test independently

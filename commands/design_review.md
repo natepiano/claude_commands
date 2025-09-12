@@ -1,6 +1,6 @@
 # Design Review
 
-**MANDATORY FIRST STEP**: 
+**MANDATORY FIRST STEP**:
 1. Use the Read tool to read /Users/natemccoy/.claude/commands/shared/review_commands.md
 2. Find and follow the <ExecutionSteps> section from that file
 3. When you see tags like <ExecutionSteps/> below, these refer to sections in review_commands.md
@@ -11,7 +11,7 @@
 **Execute this step to determine what to review:**
 
 Set [PLAN_DOCUMENT] using <PlanDocument/>
-Set [REVIEW_TARGET] to: the feature design in [PLAN_DOCUMENT]  
+Set [REVIEW_TARGET] to: the feature design in [PLAN_DOCUMENT]
 Set [REVIEW_CONTEXT] to: We are reviewing a plan to improve its design. Our goal is to identify gaps, over-engineering, and improvements to the plan.
 </DetermineReviewTarget>
 
@@ -50,8 +50,9 @@ Set [REVIEW_CONTEXT] to: We are reviewing a plan to improve its design. Our goal
     - **investigate**: Launch deeper investigation of alternatives
 
     **For REJECTED verdicts:**
-    - **skip**: Accept and document the rejection and continue (default)
-    - **skip silently**: Accept the rejection without updating the plan document
+    - **override**: Override the rejection - treat as CONFIRMED and implement the suggestion
+    - **agree**: Accept and document the rejection and continue (default)
+    - **agree silently**: Accept the rejection without updating the plan document
     - **skip with prejudice**: Permanently reject with ⚠️ PREJUDICE WARNING
     - **redundant**: Mark as redundant - the suggestion already exists in the plan
     - **investigate**: Challenge the rejection and investigate further
@@ -65,7 +66,11 @@ Set [REVIEW_CONTEXT] to: We are reviewing a plan to improve its design. Our goal
 <KeywordExecution>
     **CRITICAL**: Follow <PlanUpdateFormat/> from review_commands.md for all plan updates.
 
-    - **agree**: Use Edit tool to add to plan document using <AgreeTemplate/> format from review_commands.md
+    - **agree**: 
+      - For CONFIRMED/MODIFIED verdicts: Use Edit tool to add to plan document using <AgreeTemplate/> format from review_commands.md
+      - For REJECTED verdicts: Use Edit tool to add to "Design Review Skip Notes" section using <SkipTemplate/> format from review_commands.md (agreeing with the rejection)
+    - **agree silently**: (For REJECTED verdicts) Skip without any plan updates - continue to next finding
+    - **override**: (For REJECTED verdicts) Use Edit tool to add to plan document using <AgreeTemplate/> format from review_commands.md - treat as if verdict was CONFIRMED
     - **skip**: Use Edit tool to add to "Design Review Skip Notes" section using <SkipTemplate/> format from review_commands.md
     - **skip silently**: Skip without any plan updates - continue to next finding
     - **skip with prejudice**: Use Edit tool to add to "Design Review Skip Notes" section using <SkipWithPrejudiceTemplate/> format from review_commands.md

@@ -2,7 +2,7 @@
 
 <ExecutionSteps>
     **CRITICAL: You MUST use the Task tool for reviews. Do NOT review code directly.**
-    
+
     **EXECUTE THESE STEPS IN ORDER:**
 
     **STEP 1:** Execute the <InitialReview/> - MUST use Task tool
@@ -20,7 +20,7 @@
 
 <InitialReview>
     **1. Execute <DetermineReviewTarget/> from the specific review command**
-    
+
     **2. Show user what you're reviewing:**
     # Step 1: Initial Review
     ## Review Target: [REVIEW_TARGET]
@@ -85,7 +85,6 @@ GOOD Example - Properly identified code:
     "line_start": 312,
     "line_end": 328,
     "function": "build_paths",
-    "module": "impl MutationPathBuilder"
   },
   "issue": "Plan proposes using boolean flag is_option_type in build_paths function...",
   "current_code": "[Actual code from mutation_path_builder.rs:312-328]"
@@ -192,6 +191,7 @@ Provide a high-level summary of the subagent's findings:
        you MUST read the file and provide the full context following <CodeExtractionRequirements/>
     8. **CRITICAL FOR PLAN REVIEWS**: If the original finding references a plan document,
        follow <PlanCodeIdentification/> requirements.
+    9. **CRITICAL FOR ANY REVIEW** do the review and follow <TypeSystemPrinciples/>
 
     **CRITICAL RESTRICTIONS - You may ONLY:**
     - Read files to understand context
@@ -248,7 +248,6 @@ Present the investigation findings to the user using this format
 **Priority**: [priority] - **Complexity**: [complexity] - **Risk**: [risk]
 **Location**: [relative path from location.code_file]:[location.line_start]-[location.line_end]
 [if location.function exists: **Function**: [location.function]]
-[if location.module exists: **Module**: [location.module]]
 [if location.plan_reference exists: **Plan Reference**: [location.plan_reference]]
 
 ## Current Code
@@ -373,7 +372,7 @@ Use <ReviewFindingBaseTemplate/> with:
 Use <ReviewFindingBaseTemplate/> with:
 - [additional_status_suffix]: "- REDUNDANT"
 - [ACTION_STATUS]: "REDUNDANT - Already addressed in plan"
-- [action_specific_sections]: 
+- [action_specific_sections]:
   "- **Existing Implementation**: [Quote the relevant section from the plan that already addresses this]
   - **Plan Section**: [Section title where this is already covered]
   - **Critical Note**: This functionality/design already exists in the plan - future reviewers should check for existing coverage before suggesting"
@@ -383,11 +382,11 @@ Use <ReviewFindingBaseTemplate/> with:
 Use <ReviewFindingBaseTemplate/> with:
 - [additional_status_suffix]: " ✅"
 - [ACTION_STATUS]: "APPROVED - To be implemented"
-- [action_specific_sections]: 
+- [action_specific_sections]:
   "
   ### Approved Change:
   [finding.suggested_code or description from finding]
-  
+
   ### Implementation Notes:
   [Any additional context about how this should be implemented]"
 </AgreeTemplate>
@@ -396,7 +395,7 @@ Use <ReviewFindingBaseTemplate/> with:
 Use <ReviewFindingBaseTemplate/> with:
 - [additional_status_suffix]: "- DEVIATION ACCEPTED"
 - [ACTION_STATUS]: "ACCEPTED AS BUILT"
-- [action_specific_sections]: 
+- [action_specific_sections]:
   "- **Plan Specification**: [What the plan originally specified]
   - **Actual Implementation**: [finding.current_code or description]
   - **Decision**: Implementation deviation accepted and documented"
@@ -440,7 +439,6 @@ Base JSON structure for review findings:
     "line_start": [number in code file],
     "line_end": [number in code file],
     "function": "[Function/method name if applicable]",
-    "module": "[Module/struct/trait name if applicable]"
   },
   "issue": "[Specific problem description]",
   "current_code": "[Code snippet or text showing the issue]",
@@ -633,7 +631,7 @@ For plan alignment reviews:
 When reviewing plan documents:
 1. Identify which actual code file(s) the plan discusses
 2. Read those files to understand current implementation
-3. Extract specific line numbers, function names, and module details for JSON location fields
+3. Extract specific line numbers function names for JSON location fields
 4. Compare current code with proposed changes
 5. Report findings with references to both plan location and code location
 6. If code file cannot be identified, mark as "NEEDS_INVESTIGATION"
