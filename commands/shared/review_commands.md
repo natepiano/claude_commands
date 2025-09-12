@@ -494,6 +494,7 @@ Follow these type system design principles as highest priority:
 3. **String Typing Violations**: Every string representing finite values should be an enum (exceptions: format validation, arbitrary text processing)
 4. **State Machine Failures**: State tracking with primitives instead of types - boolean flags that should be part of state enums
 5. **Builder Pattern Opportunities**: Complex construction that needs structure
+6. **No Magic Values**: Never allow magic values - use enums that can serialize - ideally with conversion traits for ease of use. If an enum is not appropriate, a constant should be used.
 </TypeSystemPrinciples>
 
 <SkipNotesCheck>
