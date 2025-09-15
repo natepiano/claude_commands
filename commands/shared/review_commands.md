@@ -132,7 +132,7 @@ Provide a high-level summary of the subagent's findings:
 ## Key themes:
 [2-3 bullet points about main issues identified]
 
-**CRITICAL** Do not output anyting else after this summary as we will next be doing a review followup.
+**Next we will proceed with a deep review followup on each finding**
 
 </InitialReviewSummary>
 
@@ -378,18 +378,6 @@ Use <ReviewFindingBaseTemplate/> with:
   - **Critical Note**: This functionality/design already exists in the plan - future reviewers should check for existing coverage before suggesting"
 </RedundantTemplate>
 
-<AgreeTemplate>
-Use <ReviewFindingBaseTemplate/> with:
-- [additional_status_suffix]: " ✅"
-- [ACTION_STATUS]: "APPROVED - To be implemented"
-- [action_specific_sections]:
-  "
-  ### Approved Change:
-  [finding.suggested_code or description from finding]
-
-  ### Implementation Notes:
-  [Any additional context about how this should be implemented]"
-</AgreeTemplate>
 
 <AcceptAsBuiltTemplate>
 Use <ReviewFindingBaseTemplate/> with:
