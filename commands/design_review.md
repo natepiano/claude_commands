@@ -64,13 +64,13 @@ Set [REVIEW_CONTEXT] to: We are reviewing a plan to improve its design. Our goal
 </ReviewFollowupParameters>
 
 <KeywordExecution>
-    **CRITICAL**: Follow <PlanUpdateFormat/> from review_commands.md for all plan updates.
+    **CRITICAL**: For **agree** keyword, do NOT add verdict sections to the plan - just update the plan to match the agreed suggestion.
 
-    - **agree**: 
-      - For CONFIRMED/MODIFIED verdicts: Use Edit tool to add to plan document using <AgreeTemplate/> format from review_commands.md
+    - **agree**:
+      - For CONFIRMED/MODIFIED verdicts: Use Edit tool to update the plan document directly with the suggested changes (no verdict sections added)
       - For REJECTED verdicts: Use Edit tool to add to "Design Review Skip Notes" section using <SkipTemplate/> format from review_commands.md (agreeing with the rejection)
     - **agree silently**: (For REJECTED verdicts) Skip without any plan updates - continue to next finding
-    - **override**: (For REJECTED verdicts) Use Edit tool to add to plan document using <AgreeTemplate/> format from review_commands.md - treat as if verdict was CONFIRMED
+    - **override**: (For REJECTED verdicts) Use Edit tool to update the plan document directly with the suggested changes (no verdict sections added) - treat as if verdict was CONFIRMED
     - **skip**: Use Edit tool to add to "Design Review Skip Notes" section using <SkipTemplate/> format from review_commands.md
     - **skip silently**: Skip without any plan updates - continue to next finding
     - **skip with prejudice**: Use Edit tool to add to "Design Review Skip Notes" section using <SkipWithPrejudiceTemplate/> format from review_commands.md

@@ -119,7 +119,7 @@
     <Step3_BuildValidation>
         After implementation tasks (before marking final task complete):
         
-        1. Run `~/.claude/commands/bash/build-check.sh`
+        1. Run `cargo build 2>&1 | grep -A1 -E "warning:|error:|-->" || true`
         2. Apply <WarningCategorizationLogic/> to each warning
         3. For missing implementation: Add new tasks to .todo.json and continue
         4. For unnecessary code: Delete immediately
@@ -167,7 +167,7 @@
     
     **Follow <MainAgentCriticalRules/> during this review**
     
-    1. Run `~/.claude/commands/bash/build-check.sh`
+    1. Run `cargo build 2>&1 | grep -A1 -E "warning:|error:|-->" || true`
     
     2. If warnings exist:
        a. Read the original [PLAN_DOCUMENT] (if exists) for context
