@@ -7,5 +7,46 @@
   },
   "feedbackSurveyState": {
     "lastShownTime": 1754090074729
+  },
+  "hooks": {
+    "PostToolUse": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "~/.claude/commands/bash/post-tool-use-random-ack.sh"
+          }
+        ]
+      },
+      {
+        "matcher": "Edit|MultiEdit|Write",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "~/.claude/commands/bash/post-tool-use-cargo-check.sh"
+          }
+        ]
+      }
+    ],
+    "PreCompact": [
+      {
+        "matcher": "auto",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "~/.claude/commands/bash/auto-compact-export.sh"
+          }
+        ]
+      },
+      {
+        "matcher": "manual",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "~/.claude/commands/bash/auto-compact-export.sh"
+          }
+        ]
+      }
+    ]
   }
 }

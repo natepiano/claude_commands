@@ -23,9 +23,7 @@
 
     **2. Show user what you're reviewing:**
     # Step 1: Initial Review
-    ## Review Target: [REVIEW_TARGET]
-    ## Review Context: [REVIEW_CONTEXT]
-    [If PLAN_DOCUMENT exists: ## Plan Document: [PLAN_DOCUMENT]]
+    Plan Document: [PLAN_DOCUMENT]
 
     **3. MANDATORY: Launch Task tool (DO NOT skip this):**
     - description: "review [PLAN_DOCUMENT]" OR "review [REVIEW_TARGET]"
@@ -38,6 +36,7 @@
 <InitialReviewPrompt>
     **Target:** [REVIEW_TARGET]
     **CRITICAL CONTEXT**: [REVIEW_CONTEXT]
+    **WARNING**: This is a plan for FUTURE changes. Do NOT report issues about planned features not existing in current code - they don't exist because they haven't been built yet!
     **Review Constraints**: Follow these analysis principles:
     <ReviewConstraints/>
 
@@ -83,7 +82,6 @@ GOOD Example - Properly identified code:
     "plan_reference": "Section: Mutation Path Builder Refactoring",
     "code_file": "mcp/src/brp_tools/mutation_path_builder.rs",
     "line_start": 312,
-    "line_end": 328,
     "function": "build_paths",
   },
   "issue": "Plan proposes using boolean flag is_option_type in build_paths function...",
@@ -246,11 +244,11 @@ Present the investigation findings to the user using this format
 # **[id]**: [title] ([current_number] of [total_findings])
 **Issue**: [issue]
 **Priority**: [priority] - **Complexity**: [complexity] - **Risk**: [risk]
-**Location**: [relative path from location.code_file]:[location.line_start]-[location.line_end]
 [if location.function exists: **Function**: [location.function]]
 [if location.plan_reference exists: **Plan Reference**: [location.plan_reference]]
 
 ## Current Code
+**Location**: [relative path from location.code_file]:[location.line_start]
 ```rust
 [current_code - ONLY the actual code from the real file, not the plan's proposal]
 ```
@@ -282,10 +280,7 @@ Present the investigation findings to the user using this format
     For each investigated finding (in order, starting with TYPE-SYSTEM):
 
     1. Update TodoWrite to mark current finding as "in_progress"
-    2. **ADJUST FOR CONTEXT**: If prior decisions affect this finding, modify the presentation:
-       - Update the current_code if it was changed by a prior fix
-       - Note if the issue may already be addressed by a prior decision
-       - Adjust the suggested_code if it needs to account for prior changes
+    2. **MANDATORY**: Apply <PriorDecisionReconciliation/> before presenting any finding
     3. Present the finding using the format from <UserOutput/> (from the investigation results)
        - Include the (n of m) counter in the title
        - Add any relevant notes about how prior decisions affect this finding
@@ -297,10 +292,15 @@ Present the investigation findings to the user using this format
        - **IF USER PROVIDES ANY OTHER RESPONSE** (discussion, alternative proposal, question, clarification):
          a. Engage with the user's input appropriately
          b. If discussion leads to agreement/resolution, summarize the agreed approach
-         c. **MANDATORY**: Present keywords using <KeywordPresentation/> format
-         d. **MANDATORY**: State "Please select one of the keywords above to proceed."
-         e. **DO NOT CONTINUE** to next finding until user provides a keyword
-         f. If user continues discussion instead of selecting keyword, repeat steps a-e
+         c. **CRITICAL**: If you take any action that modifies the plan (via Edit/Write tools):
+            - Mark the current todo as "completed"
+            - Ask "Edit complete. Type 'continue' to proceed to the next finding."
+            - Wait for user confirmation before proceeding
+            - Skip steps d-f below and continue from step 8
+         d. **MANDATORY**: Present keywords using <KeywordPresentation/> format
+         e. **MANDATORY**: State "Please select one of the keywords above to proceed."
+         f. **DO NOT CONTINUE** to next finding until user provides a keyword
+         g. If user continues discussion instead of selecting keyword, repeat steps a-f
        - **SPECIAL CASE FOR "investigate" KEYWORD**: After investigation completes,
          a. Parse the investigation JSON result to extract updated verdict and reasoning
          b. Update the finding object with new verdict, reasoning, complexity, risk, etc.
@@ -411,6 +411,57 @@ Use <ReviewFindingBaseTemplate/> with:
     - Categories addressed: [list with counts]
 </FinalSummary>
 
+## PRIOR DECISION RECONCILIATION
+
+<PriorDecisionReconciliation>
+**CRITICAL AUTHORITY DIRECTIVE**: Before presenting any finding, you MUST actively reconcile it against ALL prior decisions made in this review session. This is not optional.
+
+**Your Authority and Responsibility:**
+- You have FULL AUTHORITY to modify, invalidate, or completely rewrite any finding based on prior decisions
+- You MUST change verdicts if prior decisions make the original verdict inappropriate
+- You MUST completely rewrite reasoning when context has changed
+- You MUST invalidate findings that become obsolete due to prior decisions
+- You are the synthesis agent - act decisively, not passively
+
+**Mandatory Analysis Steps:**
+1. **Decision Impact Assessment**: For each prior decision, explicitly evaluate:
+   - Does this decision solve the current finding? → Change verdict to OBSOLETE
+   - Does this decision conflict with the current finding? → Rewrite or invalidate
+   - Does this decision change the priority/risk of the current finding? → Update accordingly
+   - Does this decision require changes to the suggested solution? → Rewrite suggested_code
+
+2. **Verdict Authority**: You MUST change verdicts when warranted:
+   - CONFIRMED → OBSOLETE (if prior decision already addresses this)
+   - CONFIRMED → MODIFIED (if prior decision requires different approach)
+   - CONFIRMED → REJECTED (if prior decision makes this inappropriate)
+   - Any verdict → Any other verdict based on new context
+
+3. **Reasoning Rewrite**: When prior decisions change context:
+   - COMPLETELY rewrite the reasoning section to reflect current reality
+   - Reference specific prior decisions and their implications
+   - Explain how the finding has been affected by previous choices
+   - Do NOT just "note" changes - fully integrate them into new reasoning
+
+4. **Finding Synthesis**: Look for cross-finding implications:
+   - Do multiple findings become redundant after prior decisions?
+   - Are there new issues created by the combination of prior decisions?
+   - Should findings be merged or split based on evolving context?
+
+**Examples of Decisive Action:**
+- "Due to prior decision to implement StateEnum approach in DESIGN-2, this finding is now OBSOLETE - the type safety issue is already resolved."
+- "Given the user's rejection of the wrapper removal in TYPE-SYSTEM-1, this finding's verdict changes from CONFIRMED to MODIFIED - we must work within the existing wrapper structure."
+- "Prior decisions to use enum-based validation make this finding's suggested approach incompatible. Verdict changed to REJECTED with new alternative approach."
+
+**Language Requirements:**
+- Use decisive language: "This finding is now...", "Verdict changed to...", "Due to prior decision..."
+- Avoid passive language: "may be affected", "could potentially", "might need adjustment"
+- State changes authoritatively, not tentatively
+- Take ownership of the synthesis process
+
+**When to Skip a Finding Entirely:**
+If a finding becomes completely irrelevant due to prior decisions, mark it as completed in TodoWrite and skip to the next finding. Document the skip decision in your tracking.
+</PriorDecisionReconciliation>
+
 ## SHARED DEFINITIONS
 Reusable components and definitions used throughout the review workflow
 
@@ -425,7 +476,6 @@ Base JSON structure for review findings:
     "plan_reference": "[If reviewing a plan: section title, NOT line numbers - e.g., 'Section: Mutation Path Implementation']",
     "code_file": "[Relative path to actual code file from project root]",
     "line_start": [number in code file],
-    "line_end": [number in code file],
     "function": "[Function/method name if applicable]",
   },
   "issue": "[Specific problem description]",
@@ -615,6 +665,22 @@ For plan alignment reviews:
 4. Document what exists vs what was promised
 5. Identify additions beyond the original plan scope
 </ImplementationMapping>
+
+<PlanNotImplementation>
+**CRITICAL - THIS IS A PLAN REVIEW, NOT A CODE AUDIT**:
+The plan describes FUTURE changes that haven't been implemented yet.
+
+NEVER report as issues:
+- "Proposed types/functions don't exist in codebase"
+- "Current code doesn't match the plan"
+- "Planned changes haven't been made"
+
+ONLY evaluate:
+- Is the plan internally consistent?
+- Are the proposed changes well-designed?
+- Will the plan achieve its stated goals?
+- Are there better approaches?
+</PlanNotImplementation>
 
 <PlanCodeIdentification>
 When reviewing plan documents:

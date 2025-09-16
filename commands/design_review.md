@@ -12,7 +12,7 @@
 
 Set [PLAN_DOCUMENT] using <PlanDocument/>
 Set [REVIEW_TARGET] to: the feature design in [PLAN_DOCUMENT]
-Set [REVIEW_CONTEXT] to: We are reviewing a plan to improve its design. Our goal is to identify gaps, over-engineering, and improvements to the plan.
+Set [REVIEW_CONTEXT] to: We are reviewing a FUTURE PLAN that has NOT been implemented yet. Our goal is to evaluate the DESIGN QUALITY of the proposed changes, NOT to check if they exist in current code.
 </DetermineReviewTarget>
 
 
@@ -30,6 +30,7 @@ Set [REVIEW_CONTEXT] to: We are reviewing a plan to improve its design. Our goal
     - <DuplicationPrevention/>
     - <DocumentComprehension/>
     - <DesignConsistency/>
+    - <PlanNotImplementation/>
 </ReviewConstraints>
 
 <ReviewKeywords>
@@ -54,7 +55,6 @@ Set [REVIEW_CONTEXT] to: We are reviewing a plan to improve its design. Our goal
     - **agree**: Accept and document the rejection and continue (default)
     - **agree silently**: Accept the rejection without updating the plan document
     - **skip with prejudice**: Permanently reject with ⚠️ PREJUDICE WARNING
-    - **redundant**: Mark as redundant - the suggestion already exists in the plan
     - **investigate**: Challenge the rejection and investigate further
 </ReviewKeywords>
 
@@ -74,6 +74,6 @@ Set [REVIEW_CONTEXT] to: We are reviewing a plan to improve its design. Our goal
     - **skip**: Use Edit tool to add to "Design Review Skip Notes" section using <SkipTemplate/> format from review_commands.md
     - **skip silently**: Skip without any plan updates - continue to next finding
     - **skip with prejudice**: Use Edit tool to add to "Design Review Skip Notes" section using <SkipWithPrejudiceTemplate/> format from review_commands.md
-    - **redundant**: Use Edit tool to add to "Design Review Skip Notes" section using <RedundantTemplate/> format from review_commands.md
+    - **redundant**: Use Edit tool to add to "Design Review Skip Notes" section using <RedundantTemplate/> format from review_commands.md (only for CONFIRMED/MODIFIED verdicts)
     - **investigate**: Ask user "What specific aspect would you like me to investigate?", then launch Task tool with their focus
 </KeywordExecution>
