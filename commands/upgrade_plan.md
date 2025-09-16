@@ -33,6 +33,7 @@ Convert an existing plan document into a collaborative mode plan with step-by-st
     - All files to be created/modified
     - Build and test commands
     - Dependencies between changes
+    - Current document section order
 
     Analyze dependencies and create optimal build sequence:
     1. Group related changes that should be tested together
@@ -40,7 +41,12 @@ Convert an existing plan document into a collaborative mode plan with step-by-st
     3. Ensure each step can be independently validated
     4. Minimize context switching between components
 
-    Create PROPOSED_SEQUENCE with the execution steps.
+    **IMPORTANT**: The PROPOSED_SEQUENCE will become the new document order. Design it so that:
+    - Each step corresponds to detailed implementation sections that will be reordered
+    - The execution sequence can be followed linearly through the document
+    - Related content from multiple original sections can be merged into logical steps
+
+    Create PROPOSED_SEQUENCE with the execution steps and note which original sections map to each step.
     Proceed to Step 2.
 </AnalyzeAndSequence>
 
@@ -157,35 +163,73 @@ Convert an existing plan document into a collaborative mode plan with step-by-st
 
     2. Restructure the original plan:
        - Place EXECUTION_PROTOCOL at the top (making it executable)
-       - Keep all original sections
+       - **REORDER ALL IMPLEMENTATION SECTIONS**: Rearrange the original detailed implementation sections to match the PROPOSED_SEQUENCE order exactly
+         * Extract each original implementation section/task
+         * Reorder them to follow the same sequence as the execution steps
+         * Merge related sections if multiple original sections map to one execution step
+         * Ensure the document flows in the same order as the execution sequence
+         * This means readers can follow the document linearly and it matches the build order
        - Update or add Migration Strategy section:
          * Set to "**Migration Strategy: Phased**"
          * Add note: "This collaborative plan uses phased implementation by design. The Collaborative Execution Protocol above defines the phase boundaries with validation checkpoints between each step."
        - Update Implementation Strategy to reference protocol steps
        - Add Design Review Skip Notes section if missing
+       - **CRITICAL**: The final document structure should be:
+         1. Title
+         2. EXECUTION PROTOCOL
+         3. INTERACTIVE IMPLEMENTATION SEQUENCE
+         4. Reordered implementation sections matching execution sequence
+         5. Supporting sections (Migration Strategy, Testing, etc.)
 
     3. Save the upgraded plan:
-       Ask: "Save as: **[original-name]-collaborative.md** or **overwrite** original?"
+       Generate the new filename by replacing .md with -upgraded.md:
+       - Example: "plan-something.md" becomes "plan-something-upgraded.md"
+       - If no .md extension, append "-upgraded.md"
 
-       If overwrite:
-           Write to $ARGUMENTS
-           Display: "✅ Plan upgraded to collaborative mode: $ARGUMENTS"
-           Display: "📝 The plan is now executable - run it to start implementation"
+       Write the complete restructured plan to the new filename.
 
-       If save-as:
-           Write to suggested filename (or user-provided name)
-           Display: "✅ Collaborative plan created: [filename]"
-           Display: "📝 The plan is now executable - run it to start implementation"
+       Display: "✅ Collaborative plan created: [new-filename]"
+       Display: "📝 The plan is now executable - run it to start implementation"
+
+    4. Validate the upgrade:
+       Use the Task tool with general-purpose subagent to validate the upgrade:
+
+       Prompt: "Compare the original plan file '$ARGUMENTS' with the new upgraded file '[new-filename]' and verify:
+
+       1. **Content Completeness**: Does the upgraded file contain all the content from the original? List any missing sections, details, or information.
+
+       2. **Structural Changes**: The upgraded file should have:
+          - EXECUTION PROTOCOL section at the top
+          - INTERACTIVE IMPLEMENTATION SEQUENCE section
+          - All original implementation sections reordered to match execution sequence
+          - Supporting sections (Migration Strategy, Testing, etc.) preserved
+
+       3. **Content Accuracy**: Are the technical details, code examples, file lists, and specifications identical between files? Note any changes beyond reordering.
+
+       4. **Discrepancies**: Highlight any content that appears in the original but not in the upgraded version, or vice versa.
+
+       Expected: The upgraded file should contain 100% of the original content, just reorganized with added execution protocol. Report any deviations."
+
+       If validation finds issues:
+           Display the validation results
+           Ask: "Validation found discrepancies. Fix automatically or manual review?"
+           If fix: Address the issues and re-validate
+           If manual: Display validation results for user review
 
     Display final summary:
     ```
     Upgrade Complete
     ----------------
+    ✓ Created [new-filename] with collaborative execution protocol
     ✓ Created [N] collaborative execution steps
     ✓ Organized [X] tasks into buildable chunks
     ✓ Each step includes validation commands
+    ✓ Content validated against original plan
     ✓ Plan is now executable as a command
 
-    To start implementation, run: @[filename]
+    Original: $ARGUMENTS (preserved)
+    Upgraded: [new-filename] (ready to execute)
+
+    To start implementation, run: @[new-filename]
     ```
 </GenerateCollaborativePlan>
