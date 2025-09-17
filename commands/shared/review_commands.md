@@ -116,6 +116,25 @@ Your new findings should be: DESIGN-4, DESIGN-5, TYPE-SYSTEM-3, etc.
 BAD Example - Reusing existing IDs:
 If the plan already contains: DESIGN-1, DESIGN-2, DESIGN-3
 DO NOT generate: DESIGN-1, DESIGN-2 (even if reviewing different sections)
+
+GOOD Example - IMPLEMENTATION-GAP finding:
+```json
+{
+  "id": "IMPLEMENTATION-GAP-1",
+  "title": "Query batching use case lacks implementation",
+  "location": {
+    "plan_reference": "Section: Use Cases - Efficient Query Batching",
+    "code_file": "MISSING - No implementation section exists",
+    "line_start": 0,
+    "function": "N/A"
+  },
+  "issue": "Plan describes 'support for batching multiple queries in a single request for efficiency' as a use case, but no implementation section covers how to add batching support",
+  "current_code": "N/A - Implementation missing from plan",
+  "suggested_code": "Add implementation section:\n1. Add BatchedQuery struct to types.rs\n2. Modify execute_query() to detect and split batches\n3. Add batch_results() aggregation function\n4. Update API to accept array of queries",
+  "priority": "High",
+  "impact": "Critical feature will be completely missed during implementation"
+}
+```
 </CodeIdentificationExamples>
 
 <InitialReviewSummary>
@@ -681,6 +700,38 @@ ONLY evaluate:
 - Will the plan achieve its stated goals?
 - Are there better approaches?
 </PlanNotImplementation>
+
+<ImplementationCoverageCheck>
+**MANDATORY IMPLEMENTATION COVERAGE ANALYSIS**:
+Every stated goal, use case, requirement, or necessary feature MUST have corresponding implementation steps.
+
+1. **Extract All Commitments**: Identify every:
+   - Stated goal or objective
+   - Use case or user story
+   - Requirement (functional or non-functional)
+   - "Must have" or "should support" statement
+   - Example usage that implies functionality
+   - "The system will..." or "This enables..." statements
+
+2. **Trace to Implementation**: For each commitment, verify:
+   - Concrete implementation steps exist
+   - Steps are specific and actionable
+   - No vague "implement X" without details
+   - Clear file changes are specified
+   - Data structures and functions are defined
+
+3. **Flag Gaps as IMPLEMENTATION-GAP Issues**: Report when:
+   - A goal has no implementation section
+   - A use case lacks corresponding code changes
+   - A requirement is stated but not addressed
+   - Examples show functionality not in implementation
+   - "Future work" items that should be current scope
+
+4. **Priority**: All IMPLEMENTATION-GAP issues are HIGH priority
+   - These represent broken promises
+   - Users expect these features based on the plan
+   - Missing these undermines trust
+</ImplementationCoverageCheck>
 
 <PlanCodeIdentification>
 When reviewing plan documents:

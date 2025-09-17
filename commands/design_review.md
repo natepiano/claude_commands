@@ -20,6 +20,7 @@ Set [REVIEW_CONTEXT] to: We are reviewing a FUTURE PLAN that has NOT been implem
 - **TYPE-SYSTEM**: Type system gaps - missing type-driven design opportunities in the plan
 - **DESIGN**: Plan issues - architecture gaps and design completeness problems
 - **IMPLEMENTATION**: Plan gaps - missing implementation details or considerations
+- **IMPLEMENTATION-GAP**: Missing implementation steps - goals, use cases, or requirements stated in the plan that lack corresponding concrete implementation details
 - **SIMPLIFICATION**: Over-engineering in plan - unnecessarily complex approaches that could be simplified
 </ReviewCategories>
 
@@ -31,6 +32,7 @@ Set [REVIEW_CONTEXT] to: We are reviewing a FUTURE PLAN that has NOT been implem
     - <DocumentComprehension/>
     - <DesignConsistency/>
     - <PlanNotImplementation/>
+    - <ImplementationCoverageCheck/>
 </ReviewConstraints>
 
 <ReviewKeywords>
