@@ -3,9 +3,27 @@
 # that it shows the output twice which we definitely don't want
 # so for now we're just doing this post tool - such a drag
 
+# Percentage chance to emit acknowledgement (0 or less = never, 100 or more = always)
+ACK_CHANCE=50
+
 # Path to acknowledgements file
 ACK_FILE="$HOME/.claude/commands/bash/acknowledgements.txt"
 
+
+# Check acknowledgement chance first
+if [ "$ACK_CHANCE" -le 0 ]; then
+    echo '{"continue": true}'
+    exit 0
+fi
+
+# Generate random number 1-100 for percentage check
+CHANCE_ROLL=$((RANDOM % 100 + 1))
+
+# If roll is higher than our chance, don't emit
+if [ "$CHANCE_ROLL" -gt "$ACK_CHANCE" ] && [ "$ACK_CHANCE" -lt 100 ]; then
+    echo '{"continue": true}'
+    exit 0
+fi
 
 # Check if file exists
 if [ ! -f "$ACK_FILE" ]; then
