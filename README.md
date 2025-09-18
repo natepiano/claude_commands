@@ -33,4 +33,4 @@ there is some rust specific stuff in the reviews so if you try this out you may 
 - `settings.json` - my hook configurations and preferences
 
 ## Finally
-There's more stuff you can check out. Try it out in a project branch. I use this as my "User" level with Claude - in the ~/.claude directory.
+There's more stuff you can check out. Try it out in a project branch. I use this as my "User" level with Claude - in the ~/.claude directory and probably if you like any of it you should pick and choose what you push to your user level - as Claude makes that available in every project.
