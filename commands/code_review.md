@@ -7,8 +7,24 @@
 
 <ExecutionSteps/>
 
+<InitialReviewOutput>
+Step 1: Initial Code Review
+
+  Review Target: [REVIEW_TARGET]
+
+  Now I'll launch the Task tool for the initial review:
+</InitialReviewOutput>
+
 <DetermineReviewTarget>
 **Execute this step to determine what to review:**
+
+If $ARGUMENTS starts with "tag:":
+- Extract the tag name by removing the "tag:" prefix
+- Set [REVIEW_TARGET] to: all code changes since git tag [TAG_NAME] to current working state
+- Set [REVIEW_MODE] to: tag review (reviewing all changes since a tagged release)
+- Execute: git diff [TAG_NAME] HEAD --name-only to get all affected files
+- Execute: git diff [TAG_NAME] HEAD to get all changes since the tag
+- Note: This includes both committed and uncommitted changes since the tag
 
 If $ARGUMENTS starts with "commit:":
 - Extract the commit hash by removing the "commit:" prefix
@@ -17,7 +33,7 @@ If $ARGUMENTS starts with "commit:":
 - Execute: git show [COMMIT_HASH] --name-only to get affected files
 - Execute: git show [COMMIT_HASH] to get the changes
 
-If $ARGUMENTS is provided and does NOT start with "commit:":
+If $ARGUMENTS is provided and does NOT start with "commit:" or "tag:":
 - Set [REVIEW_TARGET] to: the code at path $ARGUMENTS (and all files below it if it's a directory)
 - Set [REVIEW_MODE] to: static code review (reviewing actual code as-is, not changes)
 - Use glob/grep tools to find all code files under $ARGUMENTS path

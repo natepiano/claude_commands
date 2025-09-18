@@ -7,6 +7,15 @@
 
 <ExecutionSteps/>
 
+<InitialReviewOutput>
+Step 1: Initial Alignment Review
+
+  Plan Document: [PLAN_DOCUMENT]
+  Implementation: Current git diff changes
+
+  Now I'll launch the Task tool for the alignment review:
+</InitialReviewOutput>
+
 <DetermineReviewTarget>
 **Execute this step to determine what to review:**
 

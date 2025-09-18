@@ -7,6 +7,14 @@
 
 <ExecutionSteps/>
 
+<InitialReviewOutput>
+Step 1: Initial Design Review
+
+  Plan Document: [PLAN_DOCUMENT]
+
+  Now I'll launch the Task tool for the initial review:
+</InitialReviewOutput>
+
 <DetermineReviewTarget>
 **Execute this step to determine what to review:**
 

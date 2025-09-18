@@ -22,8 +22,7 @@
     **1. Execute <DetermineReviewTarget/> from the specific review command**
 
     **2. Show user what you're reviewing:**
-    # Step 1: Initial Review
-    Plan Document: [PLAN_DOCUMENT]
+    <InitialReviewOutput/>
 
     **3. MANDATORY: Launch Task tool (DO NOT skip this):**
     - description: "review [PLAN_DOCUMENT]" OR "review [REVIEW_TARGET]"
@@ -192,6 +191,9 @@ Provide a high-level summary of the subagent's findings:
 
     Analyze this finding and provide an investigation verdict. It is important that you think very hard about this review task.
 
+    **Review Constraints**: Follow these analysis principles:
+    <ReviewConstraints/>
+
     **Your Investigation Tasks:**
     1. Verify if this is a real issue or false positive
     2. Assess the fix complexity
@@ -207,8 +209,7 @@ Provide a high-level summary of the subagent's findings:
     7. **CRITICAL**: If the original finding has insufficient code context,
        you MUST read the file and provide the full context following <CodeExtractionRequirements/>
     8. **CRITICAL FOR PLAN REVIEWS**: If the original finding references a plan document,
-       follow <PlanCodeIdentification/> requirements.
-    9. **CRITICAL FOR ANY REVIEW** do the review and follow <TypeSystemPrinciples/>
+       follow <PlanCodeIdentification/> requirements
 
     **CRITICAL RESTRICTIONS - You may ONLY:**
     - Read files to understand context
