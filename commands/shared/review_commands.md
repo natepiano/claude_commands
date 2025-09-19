@@ -210,6 +210,17 @@ Provide a high-level summary of the subagent's findings:
        you MUST read the file and provide the full context following <CodeExtractionRequirements/>
     8. **CRITICAL FOR PLAN REVIEWS**: If the original finding references a plan document,
        follow <PlanCodeIdentification/> requirements
+    9. **CRITICAL FOR REJECTED VERDICTS**: You MUST clearly explain:
+       - What the current plan/code does
+       - What the finding incorrectly suggested
+       - Why the current approach is actually correct
+       - Use the format "The finding is incorrect because..." to be explicit
+    10. **CRITICAL FOR ALL VERDICTS**: Structure your reasoning to clearly separate:
+        - What problem the finding identified
+        - What the current code/plan actually does
+        - What change is being proposed
+        - Why you agree/disagree/modify the proposal
+        - Use plain language that a developer can quickly understand
 
     **CRITICAL RESTRICTIONS - You may ONLY:**
     - Read files to understand context
@@ -267,21 +278,54 @@ Present the investigation findings to the user using this format
 [if location.function exists: **Function**: [location.function]]
 [if location.plan_reference exists: **Plan Reference**: [location.plan_reference]]
 
+### What the finding is saying:
+[Clear, concise summary of what problem or improvement the finding identified]
+
 ## Current Code
 **Location**: [relative path from location.code_file]:[location.line_start]
 ```rust
 [current_code - ONLY the actual code from the real file, not the plan's proposal]
 ```
 
+### Commentary on current code:
+[Brief explanation of what the current code does and why it might be problematic according to the finding]
+
+### What the finding is proposing:
+[Clear, concise summary of the suggested change and how it will be used]
+
 ## Suggested Code Change
 ```rust
 [suggested_code - ONLY the actual code, no markdown headers or explanations - only include if verdict recommends action]
 ```
 
-## Analysis
-**Reasoning**: [reasoning]
+## Reviewer's Assessment
 
-**Alternative Approach**: [alternative_approach - only include if present in JSON]
+[FOR CONFIRMED/FIX RECOMMENDED verdicts:]
+### Why this change is needed:
+[Explain why the finding is correct and the change should be made]
+
+### Expected impact:
+[What will improve after making this change]
+
+[FOR MODIFIED/FIX MODIFIED verdicts:]
+### Original suggestion issue:
+[What was problematic about the original suggestion]
+
+### Better approach:
+[Why the modified version is superior]
+
+### Expected impact:
+[What will improve with the modified approach]
+
+[FOR REJECTED/FIX NOT RECOMMENDED verdicts:]
+### What the current approach does:
+[Clear explanation of the existing code/plan's approach]
+
+### Why the finding is incorrect:
+[Specific reasons why the suggested change is unnecessary or wrong]
+
+### Recommendation: Keep as-is
+The current approach is correct. No changes needed.
 
 ## **Verdict**: [verdict]
 </UserOutput>

@@ -70,8 +70,8 @@ Set [REVIEW_CONTEXT] to: We are reviewing ACTUAL CODE for quality issues, NOT a 
     - **skip**: Skip this fix and continue
     - **investigate**: Launch deeper investigation
 
-    **For FIX NOT RECOMMENDED verdicts:**
-    - **accept**: Accept the recommendation to not fix (default)
+    **For FIX NOT RECOMMENDED verdicts (finding incorrect, code is fine):**
+    - **accept**: Accept that the code is correct as-is (default)
     - **override**: Apply the fix despite the recommendation
     - **investigate**: Launch investigation to reconsider
 </ReviewKeywords>

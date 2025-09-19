@@ -60,9 +60,9 @@ Set [REVIEW_CONTEXT] to: We are reviewing a FUTURE PLAN that has NOT been implem
     - **redundant**: Mark as redundant - the suggestion already exists in the plan
     - **investigate**: Launch deeper investigation of alternatives
 
-    **For REJECTED verdicts:**
+    **For REJECTED verdicts (finding is wrong, plan is correct):**
     - **override**: Override the rejection - treat as CONFIRMED and implement the suggestion
-    - **agree**: Accept and document the rejection and continue (default)
+    - **agree**: Accept that the finding was incorrect - plan stays unchanged (default)
     - **agree silently**: Accept the rejection without updating the plan document
     - **skip with prejudice**: Permanently reject with ⚠️ PREJUDICE WARNING
     - **investigate**: Challenge the rejection and investigate further
