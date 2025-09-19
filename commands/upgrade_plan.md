@@ -12,6 +12,7 @@ Convert an existing plan document into a collaborative mode plan with step-by-st
     **STEP 1:** Execute <AnalyzeAndSequence/>
     **STEP 2:** Execute <ReviewAndConfirm/>
     **STEP 3:** Execute <GenerateCollaborativePlan/>
+    **STEP 4:** Execute <ValidateCompleteness/>
 </ExecutionSteps>
 
 ## STEP 1: ANALYZE AND SEQUENCE
@@ -41,12 +42,37 @@ Convert an existing plan document into a collaborative mode plan with step-by-st
     3. Ensure each step can be independently validated
     4. Minimize context switching between components
 
+    **BREAKING CHANGE ANALYSIS** (Critical for Rust/compiled languages):
+    For each proposed change, analyze:
+    - Type signature changes that would break compilation
+    - Struct/enum field modifications that affect other files
+    - Function signature changes that break callers
+    - Trait implementation changes
+    - Module visibility or path changes
+
+    Identify change groups that MUST be atomic:
+    - If changing a type definition used elsewhere, group with all usage updates
+    - If modifying a function signature, group with all call site updates
+    - If changing an enum variant, group with all match statement updates
+    - Mark these as "ATOMIC GROUP - must be done together to avoid breakage"
+
+    Reorganize sequence to:
+    1. **Additive changes first** (new types, functions, fields) - won't break anything
+    2. **Atomic breaking change groups** - all related changes together
+    3. **Dependent changes** - that rely on previous steps
+    4. **Cleanup/removal changes last** - removing deprecated items
+
     **IMPORTANT**: The PROPOSED_SEQUENCE will become the new document order. Design it so that:
     - Each step corresponds to detailed implementation sections that will be reordered
     - The execution sequence can be followed linearly through the document
     - Related content from multiple original sections can be merged into logical steps
+    - **Every step should compile successfully** - no intermediate breakage
 
-    Create PROPOSED_SEQUENCE with the execution steps and note which original sections map to each step.
+    Create PROPOSED_SEQUENCE with:
+    - Clear indication of which changes are additive (safe)
+    - Which changes form atomic groups (must be done together)
+    - Compilation status after each step (✅ builds or ❌ would break)
+
     Proceed to Step 2.
 </AnalyzeAndSequence>
 
@@ -64,18 +90,28 @@ Convert an existing plan document into a collaborative mode plan with step-by-st
     - [Y] files to be modified
     - Migration type: [Atomic/Phased]
 
+    Breaking Change Analysis:
+    - [N] additive changes (safe to do independently)
+    - [M] atomic change groups (must be done together)
+    - All steps verified to compile successfully ✅
+
     Proposed Collaborative Execution Sequence:
 
-    Step 1: [Name]
+    Step 1: [Name] [SAFE/ATOMIC GROUP]
       Tasks: [brief description]
       Files: [file1, file2]
+      Change Type: [Additive/Breaking/Mixed]
+      Build Status: ✅ Compiles successfully
       Build: [build command]
 
-    Step 2: [Name]
+    Step 2: [Name] [SAFE/ATOMIC GROUP]
       Tasks: [brief description]
       Files: [file3, file4]
+      Change Type: [Additive/Breaking/Mixed]
+      Build Status: ✅ Compiles successfully
       Build: [build command]
       Dependencies: Requires Step 1
+      Notes: [Any special considerations for atomic groups]
 
     [... continue for all steps ...]
 
@@ -191,32 +227,7 @@ Convert an existing plan document into a collaborative mode plan with step-by-st
        Display: "✅ Collaborative plan created: [new-filename]"
        Display: "📝 The plan is now executable - run it to start implementation"
 
-    4. Validate the upgrade:
-       Use the Task tool with general-purpose subagent to validate the upgrade:
-
-       Prompt: "Compare the original plan file '$ARGUMENTS' with the new upgraded file '[new-filename]' and verify:
-
-       1. **Content Completeness**: Does the upgraded file contain all the content from the original? List any missing sections, details, or information.
-
-       2. **Structural Changes**: The upgraded file should have:
-          - EXECUTION PROTOCOL section at the top
-          - INTERACTIVE IMPLEMENTATION SEQUENCE section
-          - All original implementation sections reordered to match execution sequence
-          - Supporting sections (Migration Strategy, Testing, etc.) preserved
-
-       3. **Content Accuracy**: Are the technical details, code examples, file lists, and specifications identical between files? Note any changes beyond reordering.
-
-       4. **Discrepancies**: Highlight any content that appears in the original but not in the upgraded version, or vice versa.
-
-       Expected: The upgraded file should contain 100% of the original content, just reorganized with added execution protocol. Report any deviations."
-
-       If validation finds issues:
-           Display the validation results
-           Ask: "Validation found discrepancies. Fix automatically or manual review?"
-           If fix: Address the issues and re-validate
-           If manual: Display validation results for user review
-
-    Display final summary:
+    Display initial summary:
     ```
     Upgrade Complete
     ----------------
@@ -224,12 +235,129 @@ Convert an existing plan document into a collaborative mode plan with step-by-st
     ✓ Created [N] collaborative execution steps
     ✓ Organized [X] tasks into buildable chunks
     ✓ Each step includes validation commands
-    ✓ Content validated against original plan
-    ✓ Plan is now executable as a command
 
     Original: $ARGUMENTS (preserved)
-    Upgraded: [new-filename] (ready to execute)
-
-    To start implementation, run: @[new-filename]
+    Upgraded: [new-filename] (created)
     ```
+
+    Store new-filename in UPGRADED_FILE variable for Step 4.
+    Proceed to Step 4.
 </GenerateCollaborativePlan>
+
+## STEP 4: VALIDATE COMPLETENESS
+
+<ValidateCompleteness>
+    Use the Task tool with general-purpose subagent to perform comprehensive validation:
+
+    Prompt: "You are tasked with performing a thorough comparison between an original plan document and its upgraded collaborative version. Your goal is to ensure nothing was lost during the transformation.
+
+    Original file: $ARGUMENTS
+    Upgraded file: [UPGRADED_FILE]
+
+    Please analyze and report on the following:
+
+    1. **MISSING CONTENT ANALYSIS**
+       - List ANY technical details, code snippets, or specifications from the original that are missing in the upgraded version
+       - Check for missing comments, notes, warnings, or considerations
+       - Verify all file paths, function names, and variable names are preserved
+       - Ensure all edge cases and error handling mentions are retained
+
+    2. **IMPLEMENTATION DETAILS CHECK**
+       - Compare code examples line by line - are they identical?
+       - Check if all TODO items, FIXME notes, or warnings made it through
+       - Verify all configuration values, constants, and magic numbers are preserved
+       - Ensure all mentioned dependencies and imports are included
+
+    3. **STRUCTURAL INTEGRITY**
+       - Confirm all original sections exist (even if reordered)
+       - Check that no subsections were accidentally merged or lost
+       - Verify all bullet points and numbered lists are complete
+       - Ensure all tables, diagrams references, or external links are preserved
+
+    4. **SEMANTIC COMPLETENESS**
+       - Check if the upgraded version maintains the same level of detail
+       - Verify no explanations or rationales were summarized away
+       - Ensure all alternative approaches or rejected solutions are still documented
+       - Confirm all success criteria and acceptance tests are preserved
+
+    5. **VERDICT**
+       Provide one of these assessments:
+       - ✅ COMPLETE: The upgraded file contains 100% of the original content
+       - ⚠️ MINOR GAPS: Small formatting or non-critical details missing (list them)
+       - ❌ MAJOR GAPS: Important implementation details or sections missing (list them)
+
+    Format your response as:
+    ```
+    VALIDATION REPORT
+    =================
+
+    Missing Content:
+    - [List any missing items, or 'None found']
+
+    Implementation Differences:
+    - [List any code/detail differences, or 'All details preserved']
+
+    Structural Changes:
+    - [List any concerning structural issues, or 'Structure intact']
+
+    Verdict: [COMPLETE/MINOR GAPS/MAJOR GAPS]
+
+    [If gaps found, provide specific file:line references where possible]
+    ```"
+
+    Display: "🔍 Validating content preservation..."
+
+    After receiving the validation report from the subagent:
+
+    If verdict is COMPLETE:
+        Display:
+        ```
+        ✅ Validation Complete - No Content Lost
+        =========================================
+        The upgraded plan contains all original content.
+
+        Final Summary:
+        - Original: $ARGUMENTS (preserved)
+        - Upgraded: [UPGRADED_FILE] (ready to execute)
+
+        To start implementation, run: @[UPGRADED_FILE]
+        ```
+
+    If verdict is MINOR GAPS:
+        Display:
+        ```
+        ⚠️ Validation Complete - Minor Gaps Found
+        ==========================================
+
+        The following minor items may need attention:
+        [List the minor gaps]
+
+        These gaps are non-critical and the plan is usable.
+
+        Final Summary:
+        - Original: $ARGUMENTS (preserved)
+        - Upgraded: [UPGRADED_FILE] (ready to execute)
+
+        To start implementation, run: @[UPGRADED_FILE]
+        ```
+
+    If verdict is MAJOR GAPS:
+        Display:
+        ```
+        ❌ Validation Failed - Major Content Missing
+        ============================================
+
+        Critical content was lost during upgrade:
+        [List the major gaps with details]
+
+        Action Required:
+        The upgraded file has significant gaps and should be reviewed.
+        Please manually inspect both files or re-run the upgrade.
+
+        Files:
+        - Original: $ARGUMENTS
+        - Upgraded: [UPGRADED_FILE] (needs review)
+        ```
+
+    Exit after displaying the appropriate summary.
+</ValidateCompleteness>
