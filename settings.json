@@ -7,7 +7,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "~/.claude/commands/bash/post-tool-use-random-ack.sh"
+            "command": "~/.claude/commands/bash/post-tool-use-random-ack.sh --hook"
           }
         ]
       },

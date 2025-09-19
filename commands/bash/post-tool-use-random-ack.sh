@@ -3,6 +3,12 @@
 # that it shows the output twice which we definitely don't want
 # so for now we're just doing this post tool - such a drag
 
+# Check if called with --hook flag (for JSON output to hook system)
+HOOK_MODE=false
+if [ "$1" = "--hook" ]; then
+    HOOK_MODE=true
+fi
+
 # Percentage chance to emit acknowledgement (0 or less = never, 100 or more = always)
 ACK_CHANCE=50
 
@@ -12,7 +18,7 @@ ACK_FILE="$HOME/.claude/commands/bash/acknowledgements.txt"
 
 # Check acknowledgement chance first
 if [ "$ACK_CHANCE" -le 0 ]; then
-    echo '{"continue": true}'
+    # Don't output anything - continue:true is the default
     exit 0
 fi
 
@@ -21,13 +27,13 @@ CHANCE_ROLL=$((RANDOM % 100 + 1))
 
 # If roll is higher than our chance, don't emit
 if [ "$CHANCE_ROLL" -gt "$ACK_CHANCE" ] && [ "$ACK_CHANCE" -lt 100 ]; then
-    echo '{"continue": true}'
+    # Don't output anything - continue:true is the default
     exit 0
 fi
 
 # Check if file exists
 if [ ! -f "$ACK_FILE" ]; then
-    echo '{"continue": true}'
+    # Don't output anything - continue:true is the default
     exit 0
 fi
 
@@ -37,7 +43,7 @@ LINE_COUNT=$(grep -cv '^$' "$ACK_FILE")
 
 # If no lines, exit
 if [ "$LINE_COUNT" -eq 0 ]; then
-    echo '{"continue": true}'
+    # Don't output anything - continue:true is the default
     exit 0
 fi
 
@@ -47,18 +53,25 @@ RANDOM_LINE=$((RANDOM % LINE_COUNT + 1))
 # Get that specific line and trim whitespace
 RANDOM_ACK=$(grep -v '^$' "$ACK_FILE" | sed -n "${RANDOM_LINE}p" | tr -d '\n')
 
-# If we got an acknowledgement, output it as JSON with systemMessage
+# If we got an acknowledgement, output it
 if [ -n "$RANDOM_ACK" ]; then
-    # Use jq if available for proper JSON escaping
-    if command -v jq >/dev/null 2>&1; then
-        echo "{\"systemMessage\": $(echo -n "🎯 $RANDOM_ACK" | jq -Rs .)}"
+    if [ "$HOOK_MODE" = true ]; then
+        # JSON output for hook system
+        # Use jq if available for proper JSON escaping
+        if command -v jq >/dev/null 2>&1; then
+            echo "{\"systemMessage\": $(echo -n "🎯 $RANDOM_ACK" | jq -Rs .)}"
+        else
+            # Fallback: basic escaping
+            ESCAPED=$(echo -n "🎯 $RANDOM_ACK" | sed 's/\\/\\\\/g; s/"/\\"/g')
+            echo "{ \"systemMessage\": \"$ESCAPED\"}"
+        fi
     else
-        # Fallback: basic escaping
-        ESCAPED=$(echo -n "🎯 $RANDOM_ACK" | sed 's/\\/\\\\/g; s/"/\\"/g')
-        echo "{ \"systemMessage\": \"$ESCAPED\"}"
+        # Direct output for command line usage (default)
+        echo "🎯 $RANDOM_ACK"
     fi
 else
-    echo '{"continue": true}'
+    # Don't output anything - continue:true is the default
+    exit 0
 fi
 
 exit 0

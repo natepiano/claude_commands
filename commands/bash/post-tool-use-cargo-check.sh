@@ -7,6 +7,20 @@ INPUT=$(cat)
 # The file path is in tool_input.file_path or tool_response.filePath depending on the tool
 FILE_PATH=$(echo "$INPUT" | jq -r '.tool_input.file_path // .tool_response.filePath // ""')
 
+# Auto-detect bevy_brp project by checking workspace Cargo.toml for specific members
+SHOW_ADDITIONAL_CONTEXT=false
+SEARCH_DIR=$(dirname "$FILE_PATH")
+while [[ "$SEARCH_DIR" != "/" ]]; do
+    if [[ -f "$SEARCH_DIR/Cargo.toml" ]]; then
+        # Check if this Cargo.toml has the bevy_brp workspace members (must be actual TOML, not logs)
+        if grep -q '^\s*members\s*=\s*\["extras",\s*"mcp",\s*"mcp_macros",\s*"test-app"\]' "$SEARCH_DIR/Cargo.toml" 2>/dev/null; then
+            SHOW_ADDITIONAL_CONTEXT=true
+            break
+        fi
+    fi
+    SEARCH_DIR=$(dirname "$SEARCH_DIR")
+done
+
 # Check if the file has a .rs extension
 if [[ ! "$FILE_PATH" =~ \.rs$ ]]; then
     # Not a Rust file - exit silently
@@ -61,6 +75,10 @@ WARNING_LOCATIONS=$(echo "$OUTPUT" | grep "^warning:" -A 1 | grep "^ *-->" | sed
 ERROR_COUNT=$(echo "$ERRORS" | grep -c . || echo "0")
 WARNING_COUNT=$(echo "$WARNINGS" | grep -c . || echo "0")
 
+# Build messages for both user (systemMessage) and agent (additionalContext)
+USER_MESSAGE=""
+AGENT_MESSAGE=""
+
 if [ $CHECK_RESULT -eq 0 ]; then
     # Check passed - might have warnings
     if [ -n "$WARNING_LOCATIONS" ]; then
@@ -74,13 +92,18 @@ if [ $CHECK_RESULT -eq 0 ]; then
                 WARNING_LIST="${WARNING_LIST}  ⚠️ ${LOCATION_ARRAY[$i]}: ${WARNING_ARRAY[$i]}\n"
             fi
         done
-        MESSAGE="✅ cargo check passed with $WARNING_COUNT warning(s):\n${WARNING_LIST%\\n}"
+        USER_MESSAGE="✅ cargo check passed with $WARNING_COUNT warning(s):\n${WARNING_LIST%\\n}"
     else
-        MESSAGE="🚀 cargo check passed"
+        USER_MESSAGE="🚀 cargo check passed"
     fi
     cargo +nightly fmt >/dev/null 2>&1
+
+    # Add agent context for bevy_brp project
+    if [ "$SHOW_ADDITIONAL_CONTEXT" = true ]; then
+        AGENT_MESSAGE="\\nChanges will not be testable until you run \`cargo install --path mcp\`\\nand ask the user to do \`/mcp reconnect brp\`\\n"
+    fi
 else
-    # Check failed - show errors (and warnings if present)
+    # Check failed - build detailed error message
     if [ -n "$ERROR_LOCATIONS" ]; then
         # Combine errors with their locations
         ERROR_LIST=""
@@ -92,7 +115,7 @@ else
                 ERROR_LIST="${ERROR_LIST}  ❌ ${LOCATION_ARRAY[$i]}: ${ERROR_ARRAY[$i]}\n"
             fi
         done
-        MESSAGE="💥 cargo check failed with $ERROR_COUNT error(s):\n${ERROR_LIST%\\n}"
+        FULL_ERROR_MESSAGE="💥 cargo check failed with $ERROR_COUNT error(s):\n${ERROR_LIST%\\n}"
 
         if [ -n "$WARNING_LOCATIONS" ]; then
             WARNING_LIST=""
@@ -103,21 +126,30 @@ else
                     WARNING_LIST="${WARNING_LIST}  ⚠️ ${WLOCATION_ARRAY[$i]}: ${WARNING_ARRAY[$i]}\n"
                 fi
             done
-            MESSAGE="$MESSAGE\nand $WARNING_COUNT warning(s):\n${WARNING_LIST%\\n}"
+            FULL_ERROR_MESSAGE="$FULL_ERROR_MESSAGE\nand $WARNING_COUNT warning(s):\n${WARNING_LIST%\\n}"
         fi
     else
-        MESSAGE="💥 cargo check failed"
+        FULL_ERROR_MESSAGE="💥 cargo check failed"
     fi
+
+    # For failures: show brief message to user, detailed message to agent
+    USER_MESSAGE="💥 cargo check failed"
+    AGENT_MESSAGE="\\nCARGO CHECK FAILED:\\n$FULL_ERROR_MESSAGE\\n"
 fi
 
-# Output JSON with systemMessage that will be shown to user
-# Use jq to properly escape the message for JSON if available, otherwise use sed
+# Build JSON output with conditional additionalContext
+ADDITIONAL_CONTEXT=""
+if [ -n "$AGENT_MESSAGE" ]; then
+    ADDITIONAL_CONTEXT=", \"hookSpecificOutput\": {\"hookEventName\": \"PostToolUse\", \"additionalContext\": \"$AGENT_MESSAGE\"}"
+fi
+
+# Output JSON with proper escaping
 if command -v jq >/dev/null 2>&1; then
-    echo "{\"continue\": true, \"systemMessage\": $(printf "%b" "$MESSAGE" | jq -Rs .)}"
+    echo "{\"systemMessage\": $(printf "%b" "$USER_MESSAGE" | jq -Rs .)$ADDITIONAL_CONTEXT}"
 else
     # Fallback: escape quotes and preserve newlines as \n
-    ESCAPED_MESSAGE=$(printf "%b" "$MESSAGE" | sed 's/\\/\\\\/g; s/"/\\"/g' | awk '{printf "%s\\n", $0}' | sed 's/\\n$//')
-    echo "{\"continue\": true, \"systemMessage\": \"$ESCAPED_MESSAGE\"}"
+    ESCAPED_MESSAGE=$(printf "%b" "$USER_MESSAGE" | sed 's/\\/\\\\/g; s/"/\\"/g' | awk '{printf "%s\\n", $0}' | sed 's/\\n$//')
+    echo "{\"systemMessage\": \"$ESCAPED_MESSAGE\"$ADDITIONAL_CONTEXT}"
 fi
 
 # Always exit successfully
