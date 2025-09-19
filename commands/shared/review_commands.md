@@ -587,7 +587,7 @@ Return ONLY the JSON object, no additional text.
 </JsonFormatInstructions>
 
 ## REVIEW CONSTRAINTS
-Constraints to be included in specific review scenarios (referenced by design_review, code_review, alignment_review)
+Constraints to be included in specific review scenarios (referenced by design_review and code_review)
 
 <TypeSystemPrinciples>
 Follow these type system design principles as highest priority:
@@ -713,22 +713,6 @@ For design document reviews:
    - Inconsistent patterns confuse developers and create bugs
 </CodeDuplicationDetection>
 
-<PlanDocumentAnalysis>
-For plan alignment reviews:
-1. **Structured Reading**: Parse plan document section by section
-2. **Feature Extraction**: List all promised features, APIs, and behaviors
-3. **Specification Capture**: Note all technical requirements and constraints
-4. **Scope Boundaries**: Identify what's explicitly excluded or marked as future work
-</PlanDocumentAnalysis>
-
-<ImplementationMapping>
-For plan alignment reviews:
-1. Search the codebase for each planned feature
-2. Read the actual implementation files
-3. Compare implementation approach against planned approach
-4. Document what exists vs what was promised
-5. Identify additions beyond the original plan scope
-</ImplementationMapping>
 
 <PlanNotImplementation>
 **CRITICAL - THIS IS A PLAN REVIEW, NOT A CODE AUDIT**:
