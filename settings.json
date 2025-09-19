@@ -40,16 +40,6 @@
           }
         ]
       }
-    ],
-    "UserPromptSubmit": [
-      {
-        "hooks": [
-          {
-            "type": "command",
-            "command": "~/.claude/commands/bash/user-prompt-submit-test.sh"
-          }
-        ]
-      }
     ]
   },
   "statusLine": {
