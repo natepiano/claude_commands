@@ -96,11 +96,17 @@ if [ $CHECK_RESULT -eq 0 ]; then
     else
         USER_MESSAGE="🚀 cargo check passed"
     fi
+
+    # Run formatter and add status to message
     cargo +nightly fmt >/dev/null 2>&1
+    FMT_RESULT=$?
+    if [ $FMT_RESULT -eq 0 ]; then
+        USER_MESSAGE="$USER_MESSAGE ✨ formatted"
+    fi
 
     # Add agent context for bevy_brp project
     if [ "$SHOW_ADDITIONAL_CONTEXT" = true ]; then
-        AGENT_MESSAGE="\\nChanges will not be testable until you run \`cargo install --path mcp\`\\nand ask the user to do \`/mcp reconnect brp\`\\n"
+        AGENT_MESSAGE="\\nChanges will not be testable until the agent runs \`cargo install --path mcp\`\\nand asks the user to do \`/mcp reconnect brp\`\\n"
     fi
 else
     # Check failed - build detailed error message

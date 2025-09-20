@@ -10,7 +10,7 @@ if [ "$1" = "--hook" ]; then
 fi
 
 # Percentage chance to emit acknowledgement (0 or less = never, 100 or more = always)
-ACK_CHANCE=50
+ACK_CHANCE=25
 
 # Path to acknowledgements file
 ACK_FILE="$HOME/.claude/commands/bash/acknowledgements.txt"

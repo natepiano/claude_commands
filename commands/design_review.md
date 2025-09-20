@@ -41,6 +41,7 @@ Set [REVIEW_CONTEXT] to: We are reviewing a FUTURE PLAN that has NOT been implem
     - <DesignConsistency/>
     - <PlanNotImplementation/>
     - <ImplementationCoverageCheck/>
+    - <ImplementationSpecificity/>
 </ReviewConstraints>
 
 <ReviewKeywords>

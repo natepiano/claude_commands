@@ -6,7 +6,6 @@
 ## What This Command Does
 1. Receives context information via $ARGUMENTS
 2. Reads and processes that context internally
-3. Runs `commands/bash/post-tool-use-random-ack.sh` to provide acknowledgement
 4. **STOPS AND WAITS** for the next user prompt
 
 ## MANDATORY RULES
@@ -19,7 +18,6 @@
 
 ## The ONLY Acceptable Response Pattern
 1. Acknowledge that you've received the context (brief, 1 line max)
-2. Execute `commands/bash/post-tool-use-random-ack.sh`
 3. **FULL STOP** - Wait for the next user prompt
 
 ## Important
@@ -33,7 +31,6 @@
 ```
 User: /ack The build is failing on line 42 with a type error
 Assistant: Context received.
-[Runs commands/bash/post-tool-use-random-ack.sh]
 [STOPS - waits for next prompt]
 ```
 

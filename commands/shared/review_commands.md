@@ -358,7 +358,7 @@ The current approach is correct. No changes needed.
          b. If discussion leads to agreement/resolution, summarize the agreed approach
          c. **CRITICAL**: If you take any action that modifies the plan (via Edit/Write tools):
             - Mark the current todo as "completed"
-            - Ask "Edit complete. Type 'continue' to proceed to the next finding."
+            - Ask "Edit complete. Type 'continue' to proceed to the next finding. ([current_number] of [total_findings])"
             - Wait for user confirmation before proceeding
             - Skip steps d-f below and continue from step 8
          d. **MANDATORY**: Present keywords using <KeywordPresentation/> format
@@ -375,7 +375,7 @@ The current approach is correct. No changes needed.
     7. After keyword execution:
        - **FOR ALL EDIT ACTIONS** (agree, skip, skip with prejudice, accept as built, redundant):
          a. After executing the Edit tool to modify the plan
-         b. STOP and ask "Edit complete. Type 'continue' to proceed to the next finding."
+         b. STOP and ask "Edit complete. Type 'continue' to proceed to the next finding. ([current_number] of [total_findings])"
          c. Wait for user confirmation before proceeding
     8. Update TodoWrite to mark current finding as "completed" ONLY after user confirms continuation
     9. **USER CONTROL REQUIREMENTS**:
@@ -591,13 +591,22 @@ Constraints to be included in specific review scenarios (referenced by design_re
 
 <TypeSystemPrinciples>
 Follow these type system design principles as highest priority:
-1. **Conditional Audit**: Every if-else chain is a potential design failure - look for string-based conditionals that could be replaced with enums and pattern matching
+1. **Conditional Audit**: Look for problematic conditionals that could be improved with better type design
+   - **PROBLEMATIC**: String comparisons (e.g., `if kind == "enum"` or `if type_name.contains("Vec")`)
+   - **PROBLEMATIC**: Boolean combinations that represent states (e.g., `if is_valid && !is_empty && has_data`)
+   - **PROBLEMATIC**: Numeric comparisons for state (e.g., `if status == 1` or `if phase > 3`)
+   - **CORRECT**: Enum pattern matching with `match` or `matches!` macro - this is proper type-driven design
+   - **CORRECT**: Simple boolean checks for actual binary states
+   - **DO NOT REPORT**: Proper enum pattern matching as a violation - `matches!(value, Enum::Variant)` is idiomatic Rust
 2. **Function vs Method Audit**: Every standalone utility function is suspect - functions that should be methods on a type that owns the behavior
-3. **String Typing Violations**: Every string representing finite values should be an enum (exceptions: format validation, arbitrary text processing)
+3. **String Typing Violations**: Every string representing finite values should be an enum (exceptions: format validation, arbitrary text processing, actual text content)
+   - **PROBLEMATIC**: Using strings for type names, kinds, or categories
+   - **CORRECT**: Using strings for user messages, file paths, or actual text data
 4. **State Machine Failures**: State tracking with primitives instead of types - boolean flags that should be part of state enums
+   - **PROBLEMATIC**: Multiple booleans that together represent a state
+   - **CORRECT**: Single boolean for truly binary conditions
 5. **Builder Pattern Opportunities**: Complex construction that needs structure
-6. **No Magic Values**: Never allow magic values - use enums that can serialize - ideally with conversion traits for ease of use. If an enum is not appropriate, a constant should be used.
-</TypeSystemPrinciples>
+6. **No Magic Values**: Never allow magic literals - use named constants or enums that can serialize - ideally with conversion traits for ease of use
 
 <SkipNotesCheck>
 **MANDATORY** DO THIS FIRST
@@ -611,20 +620,30 @@ Check for a "Design Review Skip Notes" section in the document:
 <DocumentComprehension>
 For plan document reviews:
 1. Read the entire plan from beginning to end before making recommendations
-2. Search for existing solutions before claiming something is missing
-3. Quote specific sections when claiming gaps exist
-4. Cross-reference sections as many topics span multiple areas
-5. For every "missing" claim, either quote the section that should contain it or explain why existing content is insufficient
+2. **MANDATORY REDUNDANCY CHECK**: Before suggesting ANY fix or improvement:
+   - Search the ENTIRE plan for "Proposed Fix", "Solution", "Implementation", or similar sections
+   - Check if your suggested code already exists ANYWHERE in the plan (even partially)
+   - If found, you MUST mark as REDUNDANT, not CONFIRMED
+   - Quote the exact section containing the existing solution when claiming redundancy
+3. **CRITICAL**: A finding is REDUNDANT if:
+   - The plan already contains the same or similar code solution
+   - The plan already describes fixing this exact issue
+   - The "Proposed Fix" section addresses the problem you identified
+   - Even if the current code doesn't have it yet (remember: plans describe FUTURE changes)
+4. Quote specific sections when claiming gaps exist
+5. Understand how topics connect across different sections
+6. For every "missing" claim, either quote the section that should contain it or explain why existing content is insufficient
+7. **NEVER** suggest code that already appears in the plan's "Proposed Fix" or solution sections
 </DocumentComprehension>
 
 <DesignConsistency>
 For design document reviews:
-1. **Internal Consistency**: Verify that all sections of the plan are consistent with each other
-2. **Decision Alignment**: Check that design decisions in one section don't contradict decisions in another
+1. **Internal Consistency**: Verify that all sections of the plan align with each other
+2. **Decision Alignment**: Check that design decisions don't contradict across sections
 3. **Terminology Consistency**: Ensure the same terms are used consistently throughout
-4. **Architectural Coherence**: Verify that the overall architecture remains coherent across all sections
-5. **Example Consistency**: Ensure code examples align with the described approach
-6. **Flag Inconsistencies**: Report when a change in one section would require updates to other sections
+4. **Architectural Coherence**: Verify that the overall architecture remains coherent
+5. **Example Consistency**: Ensure code examples match the described approach
+6. **Impact Analysis**: Flag when changes in one section require updates to others
 </DesignConsistency>
 
 <AtomicChangeRequirement>
@@ -653,16 +672,13 @@ For design document reviews:
       - New function that duplicates an existing function
       - Copy-pasted logic with minor variations
       - Redundant data structures or types
+      - Inconsistent reimplementation of existing patterns
 
    c) **Plan-Introduced Overlap** - Plan creates parallel/competing paths
       - New call flow that overlaps with existing flow
       - Alternative way to accomplish same goal
       - Multiple entry points for same functionality
-
-   d) **Pattern Duplication** - Plan inconsistently reimplements patterns
-      - Error handling done differently than existing patterns
-      - Validation logic that doesn't follow established approach
-      - State management that conflicts with existing patterns
+      - Conflicting approaches to similar problems
 
 2. **Resolution Requirements**:
    - If ANY duplication is detected, the plan MUST be redesigned
@@ -742,12 +758,11 @@ Every stated goal, use case, requirement, or necessary feature MUST have corresp
    - Example usage that implies functionality
    - "The system will..." or "This enables..." statements
 
-2. **Trace to Implementation**: For each commitment, verify:
-   - Concrete implementation steps exist
-   - Steps are specific and actionable
-   - No vague "implement X" without details
-   - Clear file changes are specified
-   - Data structures and functions are defined
+2. **Verify Coverage**: For each commitment, check:
+   - Implementation section exists for this feature
+   - No goals left unaddressed
+   - All use cases have corresponding sections
+   - Requirements map to concrete plans
 
 3. **Flag Gaps as IMPLEMENTATION-GAP Issues**: Report when:
    - A goal has no implementation section
@@ -771,3 +786,12 @@ When reviewing plan documents:
 5. Report findings with references to both plan location and code location
 6. If code file cannot be identified, mark as "NEEDS_INVESTIGATION"
 </PlanCodeIdentification>
+
+<ImplementationSpecificity>
+**MANDATORY**: All proposed code changes must specify:
+1. **File path**: Full relative path from project root (e.g., `src/types.rs`)
+2. **Target element**: Function/type/trait being modified (e.g., `validate_input()`)
+3. **Context markers**: Parent function/unique patterns since line numbers shift with edits
+4. **Concrete changes**: Not "update validation" but "replace string comparison with enum match"
+5. **New code location**: For additions, specify where (e.g., "after ValidationError enum")
+</ImplementationSpecificity>
