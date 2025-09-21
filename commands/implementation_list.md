@@ -147,17 +147,15 @@ Example 5 - ACCEPTED AS BUILT deviation:
 </ReviewFindingsInterpretation>
 
 <ImplementationTodos>
-For each plan item that passes review filtering, create paired todos:
+For each plan item that passes review filtering, create todos:
 - [ ] Implement the specific feature/change from plan (or approved version if modified) following <CodingGuidelines>
-- [ ] Run `cargo build 2>&1 | grep -A1 -E "warning:|error:|-->" || true` and fix errors following <WarningRules>
 
-Build Heuristic:
-- Build after changes that should compile independently (new functions, modules, types)
-- For breaking changes (API changes, renames, signature changes):
-  - If few callers (1-3): Fix them together, then build
-  - If many callers (4+): Fix ONE caller first, build to verify approach, then fix rest
-- Always run `cargo build 2>&1 | grep -A1 -E "warning:|error:|-->" || true` before moving to unrelated changes to catch errors early
-- When uncertain if approach will work: implement minimal case first and build
+Note: Cargo check runs automatically after each edit via hook - manual builds are no longer needed.
+
+Breaking Change Strategy:
+- For API changes with few callers (1-3): Fix them together in one go
+- For API changes with many callers (4+): Fix ONE caller first to verify approach, then fix rest
+- When uncertain if approach will work: implement minimal case first
 
 After every 3-5 implementation items, add:
 - [ ] Run `cargo clippy --workspace --all-targets --all-features -- -D warnings`
