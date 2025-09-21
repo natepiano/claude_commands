@@ -143,7 +143,6 @@ Provide a high-level summary of the subagent's findings:
 # Review Summary
 ## Total findings: [number]
 - Categories found: [list categories with counts, e.g., TYPE-SYSTEM (3), QUALITY (2)]
-- Priority breakdown: [High: X, Medium: Y, Low: Z]
 
 ## Key themes:
 [2-3 bullet points about main issues identified]
@@ -196,10 +195,9 @@ Provide a high-level summary of the subagent's findings:
 
     **Your Investigation Tasks:**
     1. Verify if this is a real issue or false positive
-    2. Assess the fix complexity
-    3. Consider maintenance and long-term implications
-    4. Provide a verdict: [EXPECTED_VERDICTS]
-    5. Include detailed reasoning for your verdict in simple, easy-to-understand terms
+    2. Consider maintenance and long-term implications
+    3. Provide a verdict: [EXPECTED_VERDICTS]
+    4. Include detailed reasoning for your verdict in simple, easy-to-understand terms
        - Avoid technical jargon where possible
        - Explain the "why" in plain language
        - Focus on practical impact rather than theoretical concepts
@@ -248,8 +246,6 @@ Return EXACTLY this JSON structure (extending the <BaseReviewJson/> structure):
   // Additional fields for investigation followup:
   "verdict": "[CONFIRMED | MODIFIED | REJECTED | etc.]",
   "reasoning": "[Clear explanation of verdict decision in simple, easy-to-understand terms - avoid jargon, focus on practical impact]",
-  "complexity": "[Simple | Moderate | Complex]",
-  "risk": "[Low | Medium | High]",
   "alternative_approach": "[Optional - describe alternatives if applicable]"
 }
 ```
@@ -274,7 +270,6 @@ Present the investigation findings to the user using this format
 
 # **[id]**: [title] ([current_number] of [total_findings])
 **Issue**: [issue]
-**Priority**: [priority] - **Complexity**: [complexity] - **Risk**: [risk]
 [if location.function exists: **Function**: [location.function]]
 [if location.plan_reference exists: **Plan Reference**: [location.plan_reference]]
 
@@ -367,7 +362,7 @@ The current approach is correct. No changes needed.
          g. If user continues discussion instead of selecting keyword, repeat steps a-f
        - **SPECIAL CASE FOR "investigate" KEYWORD**: After investigation completes,
          a. Parse the investigation JSON result to extract updated verdict and reasoning
-         b. Update the finding object with new verdict, reasoning, complexity, risk, etc.
+         b. Update the finding object with new verdict, reasoning, etc.
          c. Present the finding again using the same <UserOutput/> format but with updated information
          d. Present keywords appropriate for the NEW verdict (not the original verdict)
          e. Wait for user's new keyword response before proceeding
@@ -545,7 +540,6 @@ Base JSON structure for review findings:
   "issue": "[Specific problem description]",
   "current_code": "[Code snippet or text showing the issue]",
   "suggested_code": "[Improved version or recommendation]",
-  "priority": "[High/Medium/Low]",
   "impact": "[Why this matters]"
 }
 ```
@@ -553,7 +547,7 @@ Base JSON structure for review findings:
 Base Requirements:
 - [CATEGORY] must be from <ReviewCategories/> (e.g., TYPE-SYSTEM, QUALITY, DESIGN)
 - [NUMBER] must follow <IDGenerationRules/>
-- TYPE-SYSTEM issues always have priority: "High"
+- TYPE-SYSTEM issues should be sorted first in findings array
 - For plan/design reviews: location MUST include both plan_reference AND code_file
 - current_code must be from the ACTUAL code file, not copied from the plan
 - If code file cannot be identified, set location.code_file to "UNKNOWN - NEEDS INVESTIGATION"
