@@ -156,26 +156,33 @@ Provide a high-level summary of the subagent's findings:
 <ReviewFollowup>
     **Execute Parallel Investigation of All Findings**
 
-    Before proceeding:
-    1. Review the findings from the initial review subagent
-    2. Filter out any findings that no longer apply or have been addressed
-    3. Group the remaining findings by category
+    **MANDATORY PARALLEL EXECUTION - NO EXCEPTIONS:**
 
-    **Launch ALL investigations in PARALLEL using MULTIPLE Task tool calls:**
-    1. **CRITICAL**: Create a SINGLE response containing ALL Task tool invocations at once
-       - Do NOT send tasks one at a time
-       - Do NOT wait between task launches
-       - ALL Task tool calls must be in the SAME message
-    2. Each Task tool call should have:
+    **STEP 1**: Quickly review findings and count how many investigations are needed (do NOT wait or filter extensively)
+
+    **STEP 2**: IMMEDIATELY launch ALL investigations in ONE SINGLE MESSAGE:
+    1. **ABSOLUTE REQUIREMENT**: Your next response MUST contain ALL Task tool calls at once
+       - COUNT the findings first, then create that many Task tool calls in ONE message
+       - ZERO tolerance for sequential execution
+       - If you send Task calls one at a time, you are VIOLATING this command
+       - ONE message = ALL investigations launched simultaneously
+    2. Each Task tool call in that SINGLE message should have:
        - description: "Investigate [CATEGORY-ID]: [Brief title of finding] ([INDEX] of [TOTAL])"
        - subagent_type: "general-purpose"
        - prompt: Use the template from <ReviewFollowupPrompt/> with the specific finding details
-    3. Example: If you have 5 findings, your ONE response must contain 5 Task tool calls sent together
-    4. Only AFTER sending all tasks, wait for ALL investigation subagents to complete
-    5. Parse the JSON results and merge with original findings
-    6. Prepare to present each investigated finding to the user in the next step
+    3. **MANDATORY EXAMPLE FORMAT**: For 3 findings, your SINGLE response must look like:
+       ```
+       I'll investigate all 3 findings in parallel:
 
-    **CRITICAL**: Do NOT present findings to the user yet - just complete the investigations and compile results.
+       [Task tool call 1]
+       [Task tool call 2]
+       [Task tool call 3]
+       ```
+       NOT: Send task 1, wait, send task 2, wait, send task 3
+    4. Only AFTER sending ALL tasks in ONE message, wait for ALL subagents to complete
+    5. Parse all JSON results and compile for user presentation
+
+    **ENFORCEMENT**: Sequential execution defeats the purpose of parallel review and wastes significant time. This is a critical performance requirement.
 </ReviewFollowup>
 
 <ReviewFollowupPrompt>
@@ -789,3 +796,29 @@ When reviewing plan documents:
 4. **Concrete changes**: Not "update validation" but "replace string comparison with enum match"
 5. **New code location**: For additions, specify where (e.g., "after ValidationError enum")
 </ImplementationSpecificity>
+
+<LineNumberProhibition>
+**CRITICAL - NO LINE NUMBERS IN DESIGN DOCUMENTS**:
+Design documents must NEVER contain line number references because they become stale immediately as code evolves.
+
+**PROHIBITED PATTERNS**:
+- "Add after line 64"
+- "Insert at line 429"
+- "Between lines 66-98"
+- "See line 312 for context"
+
+**REQUIRED ALTERNATIVES**:
+- **Section references**: "Add to Section: Type Definitions"
+- **Structural landmarks**: "After the VariantSignature Display implementation"
+- **Function scope**: "Add to the validate_input() function"
+- **Code patterns**: "Insert after the MutationStatus enum definition"
+- **Relative positioning**: "Before the MutationPathInternal struct"
+
+**ENFORCEMENT**:
+- Flag ANY line number reference in plans as a DESIGN issue
+- Suggest conversion to structural references
+- Line numbers may only appear in JSON location fields for actual code files
+- ALL plan text must use structural/semantic references
+
+**RATIONALE**: Line numbers change with every edit, making design documents immediately obsolete and causing implementation confusion.
+</LineNumberProhibition>
