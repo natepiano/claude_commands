@@ -377,7 +377,9 @@ The current approach is correct. No changes needed.
     7. After keyword execution:
        - **FOR ALL EDIT ACTIONS** (agree, skip, skip with prejudice, accept as built, redundant):
          a. After executing the Edit tool to modify the plan
-         b. STOP and ask "Edit complete. Type 'continue' to proceed to the next finding. ([current_number] of [total_findings])"
+         b. STOP and ask:
+            - If not the last finding: "Edit complete for [current_finding_id]. Type 'continue' to proceed to [next_finding_id] ([next_number] of [total_findings])"
+            - If this is the last finding: "Edit complete for [current_finding_id]. Type 'continue' to complete the review - this was the final finding"
          c. Wait for user confirmation before proceeding
     8. Update TodoWrite to mark current finding as "completed" ONLY after user confirms continuation
     9. **USER CONTROL REQUIREMENTS**:
