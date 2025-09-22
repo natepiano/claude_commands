@@ -167,7 +167,7 @@ Provide a high-level summary of the subagent's findings:
        - Do NOT wait between task launches
        - ALL Task tool calls must be in the SAME message
     2. Each Task tool call should have:
-       - description: "Investigate [CATEGORY-ID]: [Brief title of finding]"
+       - description: "Investigate [CATEGORY-ID]: [Brief title of finding] ([INDEX] of [TOTAL])"
        - subagent_type: "general-purpose"
        - prompt: Use the template from <ReviewFollowupPrompt/> with the specific finding details
     3. Example: If you have 5 findings, your ONE response must contain 5 Task tool calls sent together
