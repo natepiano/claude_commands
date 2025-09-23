@@ -44,6 +44,7 @@ Use [REVIEW_CONTEXT]: We are reviewing a COMMAND FILE for structural improvement
     - <StructuralAssessment/>
     - <CommandClarityPrinciples/>
     - <TaggedSectionRequirements/>
+    - <ExecutionStepsPatterns/>
     - <ExecuteOnlyPatterns/>
     - <InteractiveCommandPatterns/>
     - <PatternConsistencyCheck/>
@@ -109,6 +110,31 @@ Commands must use tagged sections effectively for clarity and maintainability:
    - **TOO COARSE**: <DoEverything/>
    - **JUST RIGHT**: <ProcessFileContents/> (contains open, read, process, close)
 </TaggedSectionRequirements>
+
+<ExecutionStepsPatterns>
+Multi-step commands MUST use the standardized ExecutionSteps format for consistency:
+1. **Detection**: Look for commands with sequential operations, multi-phase workflows, or step-by-step procedures
+   - **INDICATORS**: Words like "step", "phase", "then", "next", "first", "finally"
+   - **PATTERNS**: Multiple tagged sections that build on each other
+   - **EXAMPLES**: Data processing pipelines, review workflows, setup procedures
+2. **Required Format** (when steps are detected):
+   ```markdown
+   <ExecutionSteps>
+       **EXECUTE THESE STEPS IN ORDER:**
+
+       **STEP 1:** Execute <TaggedSection/>
+       **STEP 2:** Execute <TaggedSection/>
+       **STEP 3:** Execute <TaggedSection/>
+   </ExecutionSteps>
+   ```
+3. **Format Rules**:
+   - Must be wrapped in `<ExecutionSteps>` tags
+   - Must include "**EXECUTE THESE STEPS IN ORDER:**" header
+   - Must use `**STEP N:** Execute <TaggedSection/>` format
+   - Each step must reference a specific tagged section
+4. **When This Applies**: Any command that has 3+ sequential operations or phases
+5. **Action**: If multi-step workflow detected, ensure it follows this exact format or recommend conversion
+</ExecutionStepsPatterns>
 
 <ExecuteOnlyPatterns>
 Commands that run to completion without user interaction:
