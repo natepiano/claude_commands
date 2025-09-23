@@ -4,6 +4,8 @@
 # But track these specific files/folders
 !commands/
 !commands/**
+!shared/
+!shared/**
 !CLAUDE.md
 !settings.json
 !.gitignore
