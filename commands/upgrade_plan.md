@@ -4,6 +4,15 @@ Convert an existing plan document into a collaborative mode plan with step-by-st
 
 **Arguments**: $ARGUMENTS (path to existing plan document to upgrade)
 
+<ValidateUserResponse>
+    # Parameters: expected_keywords (array), option_descriptions (array)
+    If response is not one of expected_keywords:
+        Display: "Unrecognized response '[user_input]'. Please select from:"
+        For each option in option_descriptions:
+            Display: option
+        STOP and wait for valid input
+</ValidateUserResponse>
+
 <ExecutionSteps>
     **EXECUTE THESE STEPS IN ORDER:**
 
@@ -16,6 +25,15 @@ Convert an existing plan document into a collaborative mode plan with step-by-st
 ## STEP 1: ANALYZE AND SEQUENCE
 
 <AnalyzeAndSequence>
+    Use TodoWrite tool to create tracking:
+    [
+        {content: "Validate input arguments and read plan document", status: "pending", activeForm: "Validating input arguments and reading plan document"},
+        {content: "Parse plan content and extract components", status: "pending", activeForm: "Parsing plan content and extracting components"},
+        {content: "Analyze dependencies and breaking changes", status: "pending", activeForm: "Analyzing dependencies and breaking changes"},
+        {content: "Create optimized build sequence", status: "pending", activeForm: "Creating optimized build sequence"}
+    ]
+
+    Mark "Validate input arguments and read plan document" as in_progress.
 
     If $ARGUMENTS is empty:
         Display error: "Usage: upgrade_plan <path-to-plan-file>"
@@ -30,12 +48,18 @@ Convert an existing plan document into a collaborative mode plan with step-by-st
     If "## EXECUTION PROTOCOL" already exists:
         Execute <HandleExistingCollaborativePlan/>
 
+    Mark "Validate input arguments and read plan document" as completed.
+    Mark "Parse plan content and extract components" as in_progress.
+
     Parse the plan to extract:
     - All implementation tasks and phases
     - All files to be created/modified
     - Build and test commands
     - Dependencies between changes
     - Current document section order
+
+    Mark "Parse plan content and extract components" as completed.
+    Mark "Analyze dependencies and breaking changes" as in_progress.
 
     Analyze dependencies and create optimal build sequence:
     1. Group related changes that should be tested together
@@ -162,12 +186,13 @@ Convert an existing plan document into a collaborative mode plan with step-by-st
         Mark "Process user feedback" as completed.
         Exit without changes
 
-    If response is not one of [approve, adjust, abort]:
-        Display: "Unrecognized response '[user_input]'. Please select from:"
-        Display: "- **approve** - Generate the collaborative plan"
-        Display: "- **adjust** - Describe what needs to change"
-        Display: "- **abort** - Cancel the upgrade"
-        STOP and wait for valid input
+    Execute <ValidateUserResponse/> with:
+        expected_keywords: [approve, adjust, abort]
+        option_descriptions: [
+            "- **approve** - Generate the collaborative plan",
+            "- **adjust** - Describe what needs to change",
+            "- **abort** - Cancel the upgrade"
+        ]
 </ReviewAndConfirm>
 
 ## STEP 3: GENERATE COLLABORATIVE PLAN
@@ -435,9 +460,10 @@ Convert an existing plan document into a collaborative mode plan with step-by-st
         Mark "Process user decision" as completed.
         Exit
 
-    If response is not one of [continue, exit]:
-        Display: "Unrecognized response '[user_input]'. Please select from:"
-        Display: "- **continue** - Proceed with upgrading the existing collaborative plan"
-        Display: "- **exit** - Stop the upgrade process and keep the plan unchanged"
-        STOP and wait for valid input
+    Execute <ValidateUserResponse/> with:
+        expected_keywords: [continue, exit]
+        option_descriptions: [
+            "- **continue** - Proceed with upgrading the existing collaborative plan",
+            "- **exit** - Stop the upgrade process and keep the plan unchanged"
+        ]
 </HandleExistingCollaborativePlan>
