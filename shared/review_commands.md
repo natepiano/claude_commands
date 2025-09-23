@@ -592,6 +592,30 @@ Return ONLY the JSON object, no additional text.
 ## REVIEW CONSTRAINTS
 Constraints to be included in specific review scenarios (referenced by design_review and code_review)
 
+<RustIdiomsCompliance>
+**MANDATORY CLIPPY COMPLIANCE CHECK**:
+Before suggesting any Rust code changes, verify they align with current clippy lints:
+
+1. **Functional Patterns (APPROVED by clippy)**:
+   - `result.map_or_else(|e| error_case, |v| success_case)` - KEEP THIS
+   - `option.map_or(default, |v| transform)` - KEEP THIS
+   - `iterator.filter_map()` over `filter().map()` - KEEP THIS
+
+2. **Pattern Matching**:
+   - DO NOT suggest replacing functional patterns with verbose match statements
+   - `match` is for complex control flow, not simple transformations
+
+3. **Iterator Patterns**:
+   - Prefer iterator combinators over manual loops
+   - `collect()` when the full collection is needed
+
+4. **Error Handling**:
+   - `?` operator over explicit match on Result
+   - `map_err()` for error transformation
+
+**CRITICAL**: If unsure about a pattern, DO NOT suggest changes to idiomatic Rust code.
+</RustIdiomsCompliance>
+
 <TypeSystemPrinciples>
 Follow these type system design principles as highest priority:
 1. **Conditional Audit**: Look for problematic conditionals that could be improved with better type design

@@ -55,6 +55,7 @@ Set [REVIEW_CONTEXT] to: We are reviewing ACTUAL CODE for quality issues, NOT a 
 </ReviewCategories>
 
 <ReviewConstraints>
+    - <RustIdiomsCompliance/>
     - <TypeSystemPrinciples/>
     - <CodeDuplicationDetection/>
 </ReviewConstraints>
