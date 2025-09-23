@@ -17,6 +17,10 @@
           {
             "type": "command",
             "command": "~/.claude/commands/bash/post-tool-use-cargo-check.sh"
+          },
+          {
+            "type": "command",
+            "command": "python3 ~/.claude/commands/bash/post-tool-use-basedpyright.py"
           }
         ]
       }
