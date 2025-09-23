@@ -7,8 +7,6 @@ Convert an existing plan document into a collaborative mode plan with step-by-st
 <ExecutionSteps>
     **EXECUTE THESE STEPS IN ORDER:**
 
-    It's import to think harder about all steps!
-
     **STEP 1:** Execute <AnalyzeAndSequence/>
     **STEP 2:** Execute <ReviewAndConfirm/>
     **STEP 3:** Execute <GenerateCollaborativePlan/>
@@ -19,15 +17,18 @@ Convert an existing plan document into a collaborative mode plan with step-by-st
 
 <AnalyzeAndSequence>
 
-    Read the plan document from $ARGUMENTS.
+    If $ARGUMENTS is empty:
+        Display error: "Usage: upgrade_plan <path-to-plan-file>"
+        Exit
+
+    Use Read tool to read the plan document from $ARGUMENTS.
 
     If file doesn't exist:
         Display error: "Plan file not found: $ARGUMENTS"
         Exit
 
     If "## EXECUTION PROTOCOL" already exists:
-        Display: "This plan is already in collaborative mode."
-        Exit
+        Execute <HandleExistingCollaborativePlan/>
 
     Parse the plan to extract:
     - All implementation tasks and phases
@@ -79,6 +80,15 @@ Convert an existing plan document into a collaborative mode plan with step-by-st
 ## STEP 2: REVIEW AND CONFIRM
 
 <ReviewAndConfirm>
+    Use TodoWrite tool to create tracking:
+    [
+        {content: "Present analysis for review", status: "pending", activeForm: "Presenting analysis for review"},
+        {content: "Wait for user decision on execution sequence", status: "pending", activeForm: "Waiting for user decision on execution sequence"},
+        {content: "Process user feedback", status: "pending", activeForm: "Processing user feedback"}
+    ]
+
+    Mark "Present analysis for review" as in_progress.
+
     Display the proposed collaborative structure:
 
     ```
@@ -121,25 +131,43 @@ Convert an existing plan document into a collaborative mode plan with step-by-st
       - Check success criteria
     ```
 
-    Ask user:
-    ```
-    Does this execution sequence look correct?
+    Mark "Present analysis for review" as completed.
+    Mark "Wait for user decision on execution sequence" as in_progress.
 
+    Ask user: "Does this execution sequence look correct?"
+
+    ## Available Actions
     - **approve** - Generate the collaborative plan
     - **adjust** - Describe what needs to change
     - **abort** - Cancel the upgrade
-    ```
 
-    If adjust:
+    Please select one of the keywords above.
+    STOP.
+
+    Mark "Wait for user decision on execution sequence" as completed.
+    Mark "Process user feedback" as in_progress.
+
+    Handle user response:
+    If response is "approve":
+        Mark "Process user feedback" as completed.
+        Proceed to Step 3
+
+    If response is "adjust":
         Ask: "What needs to be changed in the sequence?"
         Update PROPOSED_SEQUENCE based on feedback
+        Mark "Process user feedback" as completed.
         Return to display and ask again
 
-    If abort:
+    If response is "abort":
+        Mark "Process user feedback" as completed.
         Exit without changes
 
-    If approve:
-        Proceed to Step 3
+    If response is not one of [approve, adjust, abort]:
+        Display: "Unrecognized response '[user_input]'. Please select from:"
+        Display: "- **approve** - Generate the collaborative plan"
+        Display: "- **adjust** - Describe what needs to change"
+        Display: "- **abort** - Cancel the upgrade"
+        STOP and wait for valid input
 </ReviewAndConfirm>
 
 ## STEP 3: GENERATE COLLABORATIVE PLAN
@@ -361,3 +389,55 @@ Convert an existing plan document into a collaborative mode plan with step-by-st
 
     Exit after displaying the appropriate summary.
 </ValidateCompleteness>
+
+## EXISTING COLLABORATIVE PLAN HANDLING
+
+<HandleExistingCollaborativePlan>
+    Use TodoWrite tool to create tracking:
+    [
+        {content: "Check existing collaborative plan status", status: "pending", activeForm: "Checking existing collaborative plan status"},
+        {content: "Present options to user", status: "pending", activeForm: "Presenting options to user"},
+        {content: "Process user decision", status: "pending", activeForm: "Processing user decision"}
+    ]
+
+    Mark "Check existing collaborative plan status" as in_progress.
+
+    Display: "This plan already contains an EXECUTION PROTOCOL section (collaborative mode)."
+    Display: ""
+    Display: "You can either:"
+    Display: "- Revise the existing collaborative plan according to current upgrade specifications"
+    Display: "- Exit and work with the plan as-is"
+    Display: ""
+
+    Mark "Check existing collaborative plan status" as completed.
+    Mark "Present options to user" as in_progress.
+
+    Ask: "Do you want to continue upgrading this collaborative plan?"
+
+    ## Available Actions
+    - **continue** - Proceed with upgrading the existing collaborative plan
+    - **exit** - Stop the upgrade process and keep the plan unchanged
+
+    Please select one of the keywords above.
+    STOP.
+
+    Mark "Present options to user" as completed.
+    Mark "Process user decision" as in_progress.
+
+    Handle user response:
+    If response is "continue":
+        Display: "Proceeding with collaborative plan upgrade..."
+        Mark "Process user decision" as completed.
+        Continue to plan parsing
+
+    If response is "exit":
+        Display: "Upgrade cancelled. Plan remains unchanged."
+        Mark "Process user decision" as completed.
+        Exit
+
+    If response is not one of [continue, exit]:
+        Display: "Unrecognized response '[user_input]'. Please select from:"
+        Display: "- **continue** - Proceed with upgrading the existing collaborative plan"
+        Display: "- **exit** - Stop the upgrade process and keep the plan unchanged"
+        STOP and wait for valid input
+</HandleExistingCollaborativePlan>
