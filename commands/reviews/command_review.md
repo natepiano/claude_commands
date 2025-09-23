@@ -19,15 +19,15 @@ Step 1: Initial Command Review
 **Execute this step to determine what to review:**
 
 If $ARGUMENTS is provided:
-- Set [COMMAND_FILE] to: $ARGUMENTS
+- Use $ARGUMENTS as [COMMAND_FILE]
 - Verify it's a .md file in commands/ directory
 
 If $ARGUMENTS is empty:
 - Ask user: "Which command file would you like to review?"
-- Set [COMMAND_FILE] to their response
+- Use their response as [COMMAND_FILE]
 
-Set [REVIEW_TARGET] to: the command structure in [COMMAND_FILE]
-Set [REVIEW_CONTEXT] to: We are reviewing a COMMAND FILE for structural improvements, clarity, and reliability. Commands are instructions for AI agents, not code.
+Use [COMMAND_FILE] to set [REVIEW_TARGET] to: the command structure in [COMMAND_FILE]
+Use [REVIEW_CONTEXT]: We are reviewing a COMMAND FILE for structural improvements, clarity, and reliability. Commands are instructions for AI agents, not code.
 </DetermineReviewTarget>
 
 <ReviewCategories>
