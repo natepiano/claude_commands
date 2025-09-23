@@ -7,7 +7,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "~/.claude/commands/bash/post-tool-use-random-ack.sh --hook"
+            "command": "~/.claude/scripts/post-tool-use-random-ack.sh --hook"
           }
         ]
       },
@@ -16,11 +16,11 @@
         "hooks": [
           {
             "type": "command",
-            "command": "~/.claude/commands/bash/post-tool-use-cargo-check.sh"
+            "command": "~/.claude/scripts/post-tool-use-cargo-check.sh"
           },
           {
             "type": "command",
-            "command": "python3 ~/.claude/commands/bash/post-tool-use-basedpyright.py"
+            "command": "python3 ~/.claude/scripts/post-tool-use-basedpyright.py"
           }
         ]
       }
@@ -31,7 +31,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "~/.claude/commands/bash/auto-compact-export.sh"
+            "command": "~/.claude/scripts/auto-compact-export.sh"
           }
         ]
       },
@@ -40,7 +40,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "~/.claude/commands/bash/auto-compact-export.sh"
+            "command": "~/.claude/scripts/auto-compact-export.sh"
           }
         ]
       }

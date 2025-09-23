@@ -4,12 +4,11 @@
 # But track these specific files/folders
 !commands/
 !commands/**
+!scripts/
+!scripts/**
 !shared/
 !shared/**
 !CLAUDE.md
 !settings.json
 !.gitignore
 !README.md
-
-# Still ignore .DS_Store files everywhere
-**/.DS_Store

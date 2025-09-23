@@ -121,12 +121,24 @@ def main() -> None:
             print(json.dumps({"systemMessage": "🐍 Python file edited (no basedpyright)"}))
             return
 
-        # Run basedpyright
+        # Run basedpyright from .claude directory for consistent config
+        cwd_path = Path(hook_input['cwd'])
+        claude_dir = cwd_path / '.claude'
+
+        # Convert file_path to relative to .claude directory if possible
+        try:
+            relative_path = Path(file_path).relative_to(cwd_path)
+            relative_to_claude = Path('..') / relative_path
+        except ValueError:
+            # If file is outside cwd, use absolute path
+            relative_to_claude = Path(file_path)
+
         result = subprocess.run(
-            [basedpyright_path, file_path, '--outputjson'],
+            [basedpyright_path, str(relative_to_claude), '--outputjson'],
             capture_output=True,
             text=True,
-            timeout=10
+            timeout=10,
+            cwd=str(claude_dir) if claude_dir.exists() else None
         )
 
         # Parse output with proper types
@@ -136,9 +148,10 @@ def main() -> None:
         if error_count == 0 and warning_count == 0:
             response = {"systemMessage": "✅ basedpyright passed"}
         elif error_count == 0:
-            context = f"\n{warning_count} warnings\n"
+            context = "\n"
             if warning_lines:
                 context += "\n".join(warning_lines) + "\n"
+            context += f"{warning_count} warnings\n"
 
             response = {
                 "systemMessage": f"⚠️ basedpyright passed with {warning_count} warning(s)",
@@ -148,11 +161,12 @@ def main() -> None:
                 }
             }
         else:
-            context = f"\n{error_count} errors, {warning_count} warnings\n"
+            context = "\n"
             if error_lines:
                 context += "\n".join(error_lines) + "\n"
             if warning_lines:
                 context += "\n".join(warning_lines) + "\n"
+            context += f"{error_count} errors, {warning_count} warnings\n"
 
             response = {
                 "systemMessage": "💥 basedpyright failed",
