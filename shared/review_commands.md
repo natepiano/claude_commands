@@ -154,35 +154,23 @@ Provide a high-level summary of the subagent's findings:
 ## STEP 2: INVESTIGATION
 
 <ReviewFollowup>
-    **Execute Parallel Investigation of All Findings**
+    **CRITICAL**: You MUST send a single message containing ALL Task tool calls.
 
-    **MANDATORY PARALLEL EXECUTION - NO EXCEPTIONS:**
+    **EXECUTION**:
+    1. Count findings: [N] findings found
+    2. Send ONE message with [N] Task tool calls in this exact format:
 
-    **STEP 1**: Quickly review findings and count how many investigations are needed (do NOT wait or filter extensively)
+    ```
+    I'll investigate all [N] findings in parallel:
 
-    **STEP 2**: IMMEDIATELY launch ALL investigations in ONE SINGLE MESSAGE:
-    1. **ABSOLUTE REQUIREMENT**: Your next response MUST contain ALL Task tool calls at once
-       - COUNT the findings first, then create that many Task tool calls in ONE message
-       - ZERO tolerance for sequential execution
-       - If you send Task calls one at a time, you are VIOLATING this command
-       - ONE message = ALL investigations launched simultaneously
-    2. Each Task tool call in that SINGLE message should have:
-       - description: "Investigate [CATEGORY-ID]: [Brief title of finding] ([INDEX] of [TOTAL])"
-       - subagent_type: "general-purpose"
-       - prompt: Use the template from <ReviewFollowupPrompt/> with the specific finding details
-    3. **MANDATORY EXAMPLE FORMAT**: For 3 findings, your SINGLE response must look like:
-       ```
-       I'll investigate all 3 findings in parallel:
+    [Use antml:function_calls block with multiple antml:invoke name="Task" calls]
+    [Each invoke gets: description="Investigate FINDING-X: Title (X of N)", subagent_type="general-purpose", prompt="ReviewFollowupPrompt with finding details"]
+    [Continue for ALL findings in the SAME message]
+    ```
 
-       [Task tool call 1]
-       [Task tool call 2]
-       [Task tool call 3]
-       ```
-       NOT: Send task 1, wait, send task 2, wait, send task 3
-    4. Only AFTER sending ALL tasks in ONE message, wait for ALL subagents to complete
-    5. Parse all JSON results and compile for user presentation
+    3. Wait for ALL subagents to complete, then parse results
 
-    **ENFORCEMENT**: Sequential execution defeats the purpose of parallel review and wastes significant time. This is a critical performance requirement.
+    **VIOLATION**: Sending fewer than [N] Task calls means you failed this step.
 </ReviewFollowup>
 
 <ReviewFollowupPrompt>
