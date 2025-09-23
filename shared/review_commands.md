@@ -530,6 +530,29 @@ Use <ReviewFindingBaseTemplate/> with:
 If a finding becomes completely irrelevant due to prior decisions, mark it as completed in TodoWrite and skip to the next finding. Document the skip decision in your tracking.
 </PriorDecisionReconciliation>
 
+## SHARED CONSTRAINTS
+Constraints used by multiple review types
+
+<TypeSystemPrinciples>
+Follow these type system design principles as highest priority:
+1. **Conditional Audit**: Look for problematic conditionals that could be improved with better type design
+   - **PROBLEMATIC**: String comparisons (e.g., `if kind == "enum"` or `if type_name.contains("Vec")`)
+   - **PROBLEMATIC**: Boolean combinations that represent states (e.g., `if is_valid && !is_empty && has_data`)
+   - **PROBLEMATIC**: Numeric comparisons for state (e.g., `if status == 1` or `if phase > 3`)
+   - **CORRECT**: Enum pattern matching with `match` or `matches!` macro - this is proper type-driven design
+   - **CORRECT**: Simple boolean checks for actual binary states
+   - **DO NOT REPORT**: Proper enum pattern matching as a violation - `matches!(value, Enum::Variant)` is idiomatic Rust
+2. **Function vs Method Audit**: Every standalone utility function is suspect - functions that should be methods on a type that owns the behavior
+3. **String Typing Violations**: Every string representing finite values should be an enum (exceptions: format validation, arbitrary text processing, actual text content)
+   - **PROBLEMATIC**: Using strings for type names, kinds, or categories
+   - **CORRECT**: Using strings for user messages, file paths, or actual text data
+4. **State Machine Failures**: State tracking with primitives instead of types - boolean flags that should be part of state enums
+   - **PROBLEMATIC**: Multiple booleans that together represent a state
+   - **CORRECT**: Single boolean for truly binary conditions
+5. **Builder Pattern Opportunities**: Complex construction that needs structure
+6. **No Magic Values**: Never allow magic literals - use named constants or enums that can serialize - ideally with conversion traits for ease of use
+</TypeSystemPrinciples>
+
 ## SHARED DEFINITIONS
 Reusable components and definitions used throughout the review workflow
 
@@ -589,262 +612,3 @@ Example: If the plan already contains DESIGN-1 through DESIGN-7, start your new 
 Return ONLY the JSON object, no additional text.
 </JsonFormatInstructions>
 
-## REVIEW CONSTRAINTS
-Constraints to be included in specific review scenarios (referenced by design_review and code_review)
-
-<RustIdiomsCompliance>
-**MANDATORY CLIPPY COMPLIANCE CHECK**:
-Before suggesting any Rust code changes, verify they align with current clippy lints:
-
-1. **Functional Patterns (APPROVED by clippy)**:
-   - `result.map_or_else(|e| error_case, |v| success_case)` - KEEP THIS
-   - `option.map_or(default, |v| transform)` - KEEP THIS
-   - `iterator.filter_map()` over `filter().map()` - KEEP THIS
-
-2. **Pattern Matching**:
-   - DO NOT suggest replacing functional patterns with verbose match statements
-   - `match` is for complex control flow, not simple transformations
-
-3. **Iterator Patterns**:
-   - Prefer iterator combinators over manual loops
-   - `collect()` when the full collection is needed
-
-4. **Error Handling**:
-   - `?` operator over explicit match on Result
-   - `map_err()` for error transformation
-
-**CRITICAL**: If unsure about a pattern, DO NOT suggest changes to idiomatic Rust code.
-</RustIdiomsCompliance>
-
-<TypeSystemPrinciples>
-Follow these type system design principles as highest priority:
-1. **Conditional Audit**: Look for problematic conditionals that could be improved with better type design
-   - **PROBLEMATIC**: String comparisons (e.g., `if kind == "enum"` or `if type_name.contains("Vec")`)
-   - **PROBLEMATIC**: Boolean combinations that represent states (e.g., `if is_valid && !is_empty && has_data`)
-   - **PROBLEMATIC**: Numeric comparisons for state (e.g., `if status == 1` or `if phase > 3`)
-   - **CORRECT**: Enum pattern matching with `match` or `matches!` macro - this is proper type-driven design
-   - **CORRECT**: Simple boolean checks for actual binary states
-   - **DO NOT REPORT**: Proper enum pattern matching as a violation - `matches!(value, Enum::Variant)` is idiomatic Rust
-2. **Function vs Method Audit**: Every standalone utility function is suspect - functions that should be methods on a type that owns the behavior
-3. **String Typing Violations**: Every string representing finite values should be an enum (exceptions: format validation, arbitrary text processing, actual text content)
-   - **PROBLEMATIC**: Using strings for type names, kinds, or categories
-   - **CORRECT**: Using strings for user messages, file paths, or actual text data
-4. **State Machine Failures**: State tracking with primitives instead of types - boolean flags that should be part of state enums
-   - **PROBLEMATIC**: Multiple booleans that together represent a state
-   - **CORRECT**: Single boolean for truly binary conditions
-5. **Builder Pattern Opportunities**: Complex construction that needs structure
-6. **No Magic Values**: Never allow magic literals - use named constants or enums that can serialize - ideally with conversion traits for ease of use
-
-<SkipNotesCheck>
-**MANDATORY** DO THIS FIRST
-Check for a "Design Review Skip Notes" section in the document:
-1. Read every single skipped item to understand rejection reasons
-2. Cross-reference your ideas against previously rejected concepts
-3. Do not re-suggest items marked with "⚠️ PREJUDICE WARNING"
-4. Only proceed after confirming recommendations don't duplicate rejected items
-</SkipNotesCheck>
-
-<DocumentComprehension>
-For plan document reviews:
-1. Read the entire plan from beginning to end before making recommendations
-2. **MANDATORY REDUNDANCY CHECK**: Before suggesting ANY fix or improvement:
-   - Search the ENTIRE plan for "Proposed Fix", "Solution", "Implementation", or similar sections
-   - Check if your suggested code already exists ANYWHERE in the plan (even partially)
-   - If found, you MUST mark as REDUNDANT, not CONFIRMED
-   - Quote the exact section containing the existing solution when claiming redundancy
-3. **CRITICAL**: A finding is REDUNDANT if:
-   - The plan already contains the same or similar code solution
-   - The plan already describes fixing this exact issue
-   - The "Proposed Fix" section addresses the problem you identified
-   - Even if the current code doesn't have it yet (remember: plans describe FUTURE changes)
-4. Quote specific sections when claiming gaps exist
-5. Understand how topics connect across different sections
-6. For every "missing" claim, either quote the section that should contain it or explain why existing content is insufficient
-7. **NEVER** suggest code that already appears in the plan's "Proposed Fix" or solution sections
-</DocumentComprehension>
-
-<DesignConsistency>
-For design document reviews:
-1. **Internal Consistency**: Verify that all sections of the plan align with each other
-2. **Decision Alignment**: Check that design decisions don't contradict across sections
-3. **Terminology Consistency**: Ensure the same terms are used consistently throughout
-4. **Architectural Coherence**: Verify that the overall architecture remains coherent
-5. **Example Consistency**: Ensure code examples match the described approach
-6. **Impact Analysis**: Flag when changes in one section require updates to others
-</DesignConsistency>
-
-<AtomicChangeRequirement>
-**MIGRATION STRATEGY COMPLIANCE**: Check the plan document for a Migration Strategy marker:
-
-- If you find "**Migration Strategy: Atomic**": Plans must represent complete, indivisible changes. Reject any suggestions for incremental rollouts, backward compatibility, gradual migrations, or hybrid approaches. Either keep current design unchanged OR replace it entirely - no middle ground.
-
-- If you find "**Migration Strategy: Phased**": The plan has explicitly chosen a phased approach. Validate that the phased implementation makes sense and provides appropriate review points and validation steps between phases.
-
-- If neither marker is present: **Default to Atomic** - Apply the atomic change requirements above.
-
-**No Hybrid Approaches**: Do not suggest mixing atomic and phased strategies within the same plan. The migration strategy choice applies to the entire plan.
-</AtomicChangeRequirement>
-
-<DuplicationPrevention>
-**MANDATORY DUPLICATION DETECTION AND ELIMINATION FOR PLAN DOCUMENTS**:
-
-1. **Types of Duplication to Detect**:
-
-   a) **Existing Duplication** - Already present in the code area being modified
-      - Multiple functions doing the same thing
-      - Repeated logic across methods
-      - The plan should consolidate these, not perpetuate them
-
-   b) **Plan-Introduced Identical** - Plan creates exact copies
-      - New function that duplicates an existing function
-      - Copy-pasted logic with minor variations
-      - Redundant data structures or types
-      - Inconsistent reimplementation of existing patterns
-
-   c) **Plan-Introduced Overlap** - Plan creates parallel/competing paths
-      - New call flow that overlaps with existing flow
-      - Alternative way to accomplish same goal
-      - Multiple entry points for same functionality
-      - Conflicting approaches to similar problems
-
-2. **Resolution Requirements**:
-   - If ANY duplication is detected, the plan MUST be redesigned
-   - No "letting them coexist" - eliminate the duplication
-   - Choose ONE approach: enhance existing OR fully replace
-   - Create a single source of truth
-
-3. **Priority**:
-   - All duplication issues are HIGH priority
-   - Duplication compounds over time into technical debt
-   - Prevention now saves major refactoring later
-</DuplicationPrevention>
-
-<CodeDuplicationDetection>
-**MANDATORY CODE DUPLICATION DETECTION FOR CODE REVIEWS**:
-
-1. **Types of Code Duplication to Detect**:
-
-   a) **Identical Functions** - Multiple functions with same or nearly identical implementation
-      - Copy-pasted functions with minor parameter differences
-      - Functions that could be generalized with parameters
-      - Utility functions scattered across modules
-
-   b) **Logic Block Duplication** - Repeated code patterns within or across functions
-      - Same validation logic in multiple places
-      - Identical error handling blocks
-      - Repeated data transformation patterns
-
-   c) **Type/Structure Duplication** - Redundant data structures or types
-      - Multiple structs representing the same concept
-      - Enums with overlapping variants
-      - Traits that duplicate behavior
-
-   d) **Pattern Inconsistency** - Same functionality implemented different ways
-      - Multiple approaches to same problem in the codebase
-      - Inconsistent error handling strategies
-      - Different state management patterns for similar use cases
-
-2. **Resolution Requirements**:
-   - If ANY duplication is detected, recommend consolidation
-   - Extract common functionality into shared utilities
-   - Choose ONE canonical implementation approach
-   - Remove or refactor duplicate code paths
-
-3. **Priority**:
-   - All code duplication issues are HIGH priority
-   - Code duplication creates maintenance burden
-   - Inconsistent patterns confuse developers and create bugs
-</CodeDuplicationDetection>
-
-
-<PlanNotImplementation>
-**CRITICAL - THIS IS A PLAN REVIEW, NOT A CODE AUDIT**:
-The plan describes FUTURE changes that haven't been implemented yet.
-
-NEVER report as issues:
-- "Proposed types/functions don't exist in codebase"
-- "Current code doesn't match the plan"
-- "Planned changes haven't been made"
-
-ONLY evaluate:
-- Is the plan internally consistent?
-- Are the proposed changes well-designed?
-- Will the plan achieve its stated goals?
-- Are there better approaches?
-</PlanNotImplementation>
-
-<ImplementationCoverageCheck>
-**MANDATORY IMPLEMENTATION COVERAGE ANALYSIS**:
-Every stated goal, use case, requirement, or necessary feature MUST have corresponding implementation steps.
-
-1. **Extract All Commitments**: Identify every:
-   - Stated goal or objective
-   - Use case or user story
-   - Requirement (functional or non-functional)
-   - "Must have" or "should support" statement
-   - Example usage that implies functionality
-   - "The system will..." or "This enables..." statements
-
-2. **Verify Coverage**: For each commitment, check:
-   - Implementation section exists for this feature
-   - No goals left unaddressed
-   - All use cases have corresponding sections
-   - Requirements map to concrete plans
-
-3. **Flag Gaps as IMPLEMENTATION-GAP Issues**: Report when:
-   - A goal has no implementation section
-   - A use case lacks corresponding code changes
-   - A requirement is stated but not addressed
-   - Examples show functionality not in implementation
-   - "Future work" items that should be current scope
-
-4. **Priority**: All IMPLEMENTATION-GAP issues are HIGH priority
-   - These represent broken promises
-   - Users expect these features based on the plan
-   - Missing these undermines trust
-</ImplementationCoverageCheck>
-
-<PlanCodeIdentification>
-When reviewing plan documents:
-1. Identify which actual code file(s) the plan discusses
-2. Read those files to understand current implementation
-3. Extract specific line numbers function names for JSON location fields
-4. Compare current code with proposed changes
-5. Report findings with references to both plan location and code location
-6. If code file cannot be identified, mark as "NEEDS_INVESTIGATION"
-</PlanCodeIdentification>
-
-<ImplementationSpecificity>
-**MANDATORY**: All proposed code changes must specify:
-1. **File path**: Full relative path from project root (e.g., `src/types.rs`)
-2. **Target element**: Function/type/trait being modified (e.g., `validate_input()`)
-3. **Context markers**: Parent function/unique patterns since line numbers shift with edits
-4. **Concrete changes**: Not "update validation" but "replace string comparison with enum match"
-5. **New code location**: For additions, specify where (e.g., "after ValidationError enum")
-</ImplementationSpecificity>
-
-<LineNumberProhibition>
-**CRITICAL - NO LINE NUMBERS IN DESIGN DOCUMENTS**:
-Design documents must NEVER contain line number references because they become stale immediately as code evolves.
-
-**PROHIBITED PATTERNS**:
-- "Add after line 64"
-- "Insert at line 429"
-- "Between lines 66-98"
-- "See line 312 for context"
-
-**REQUIRED ALTERNATIVES**:
-- **Section references**: "Add to Section: Type Definitions"
-- **Structural landmarks**: "After the VariantSignature Display implementation"
-- **Function scope**: "Add to the validate_input() function"
-- **Code patterns**: "Insert after the MutationStatus enum definition"
-- **Relative positioning**: "Before the MutationPathInternal struct"
-
-**ENFORCEMENT**:
-- Flag ANY line number reference in plans as a DESIGN issue
-- Suggest conversion to structural references
-- Line numbers may only appear in JSON location fields for actual code files
-- ALL plan text must use structural/semantic references
-
-**RATIONALE**: Line numbers change with every edit, making design documents immediately obsolete and causing implementation confusion.
-</LineNumberProhibition>

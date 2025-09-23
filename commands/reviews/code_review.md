@@ -54,11 +54,75 @@ Set [REVIEW_CONTEXT] to: We are reviewing ACTUAL CODE for quality issues, NOT a 
 - **SAFETY**: Safety concerns - error handling and potential runtime issues
 </ReviewCategories>
 
+## REVIEW CONSTRAINTS
+
 <ReviewConstraints>
     - <RustIdiomsCompliance/>
     - <TypeSystemPrinciples/>
     - <CodeDuplicationDetection/>
 </ReviewConstraints>
+
+<RustIdiomsCompliance>
+**MANDATORY CLIPPY COMPLIANCE CHECK**:
+Before suggesting any Rust code changes, verify they align with current clippy lints:
+
+1. **Functional Patterns (APPROVED by clippy)**:
+   - `result.map_or_else(|e| error_case, |v| success_case)` - KEEP THIS
+   - `option.map_or(default, |v| transform)` - KEEP THIS
+   - `iterator.filter_map()` over `filter().map()` - KEEP THIS
+
+2. **Pattern Matching**:
+   - DO NOT suggest replacing functional patterns with verbose match statements
+   - `match` is for complex control flow, not simple transformations
+
+3. **Iterator Patterns**:
+   - Prefer iterator combinators over manual loops
+   - `collect()` when the full collection is needed
+
+4. **Error Handling**:
+   - `?` operator over explicit match on Result
+   - `map_err()` for error transformation
+
+**CRITICAL**: If unsure about a pattern, DO NOT suggest changes to idiomatic Rust code.
+</RustIdiomsCompliance>
+
+
+<CodeDuplicationDetection>
+**MANDATORY CODE DUPLICATION DETECTION FOR CODE REVIEWS**:
+
+1. **Types of Code Duplication to Detect**:
+
+   a) **Identical Functions** - Multiple functions with same or nearly identical implementation
+      - Copy-pasted functions with minor parameter differences
+      - Functions that could be generalized with parameters
+      - Utility functions scattered across modules
+
+   b) **Logic Block Duplication** - Repeated code patterns within or across functions
+      - Same validation logic in multiple places
+      - Identical error handling blocks
+      - Repeated data transformation patterns
+
+   c) **Type/Structure Duplication** - Redundant data structures or types
+      - Multiple structs representing the same concept
+      - Enums with overlapping variants
+      - Traits that duplicate behavior
+
+   d) **Pattern Inconsistency** - Same functionality implemented different ways
+      - Multiple approaches to same problem in the codebase
+      - Inconsistent error handling strategies
+      - Different state management patterns for similar use cases
+
+2. **Resolution Requirements**:
+   - If ANY duplication is detected, recommend consolidation
+   - Extract common functionality into shared utilities
+   - Choose ONE canonical implementation approach
+   - Remove or refactor duplicate code paths
+
+3. **Priority**:
+   - All code duplication issues are HIGH priority
+   - Code duplication creates maintenance burden
+   - Inconsistent patterns confuse developers and create bugs
+</CodeDuplicationDetection>
 
 <ReviewKeywords>
     **For FIX RECOMMENDED verdicts:**

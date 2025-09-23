@@ -32,6 +32,8 @@ Set [REVIEW_CONTEXT] to: We are reviewing a FUTURE PLAN that has NOT been implem
 - **SIMPLIFICATION**: Over-engineering in plan - unnecessarily complex approaches that could be simplified
 </ReviewCategories>
 
+## REVIEW CONSTRAINTS
+
 <ReviewConstraints>
     - <SkipNotesCheck/>
     - <TypeSystemPrinciples/>
@@ -44,6 +46,173 @@ Set [REVIEW_CONTEXT] to: We are reviewing a FUTURE PLAN that has NOT been implem
     - <ImplementationSpecificity/>
     - <LineNumberProhibition/>
 </ReviewConstraints>
+
+
+<SkipNotesCheck>
+**MANDATORY** DO THIS FIRST
+Check for a "Design Review Skip Notes" section in the document:
+1. Read every single skipped item to understand rejection reasons
+2. Cross-reference your ideas against previously rejected concepts
+3. Do not re-suggest items marked with "⚠️ PREJUDICE WARNING"
+4. Only proceed after confirming recommendations don't duplicate rejected items
+</SkipNotesCheck>
+
+<DocumentComprehension>
+For plan document reviews:
+1. Read the entire plan from beginning to end before making recommendations
+2. **MANDATORY REDUNDANCY CHECK**: Before suggesting ANY fix or improvement:
+   - Search the ENTIRE plan for "Proposed Fix", "Solution", "Implementation", or similar sections
+   - Check if your suggested code already exists ANYWHERE in the plan (even partially)
+   - If found, you MUST mark as REDUNDANT, not CONFIRMED
+   - Quote the exact section containing the existing solution when claiming redundancy
+3. **CRITICAL**: A finding is REDUNDANT if:
+   - The plan already contains the same or similar code solution
+   - The plan already describes fixing this exact issue
+   - The "Proposed Fix" section addresses the problem you identified
+   - Even if the current code doesn't have it yet (remember: plans describe FUTURE changes)
+4. Quote specific sections when claiming gaps exist
+5. Understand how topics connect across different sections
+6. For every "missing" claim, either quote the section that should contain it or explain why existing content is insufficient
+7. **NEVER** suggest code that already appears in the plan's "Proposed Fix" or solution sections
+</DocumentComprehension>
+
+<DesignConsistency>
+For design document reviews:
+1. **Internal Consistency**: Verify that all sections of the plan align with each other
+2. **Decision Alignment**: Check that design decisions don't contradict across sections
+3. **Terminology Consistency**: Ensure the same terms are used consistently throughout
+4. **Architectural Coherence**: Verify that the overall architecture remains coherent
+5. **Example Consistency**: Ensure code examples match the described approach
+6. **Impact Analysis**: Flag when changes in one section require updates to others
+</DesignConsistency>
+
+<AtomicChangeRequirement>
+**MIGRATION STRATEGY COMPLIANCE**: Check the plan document for a Migration Strategy marker:
+
+- If you find "**Migration Strategy: Atomic**": Plans must represent complete, indivisible changes. Reject any suggestions for incremental rollouts, backward compatibility, gradual migrations, or hybrid approaches. Either keep current design unchanged OR replace it entirely - no middle ground.
+
+- If you find "**Migration Strategy: Phased**": The plan has explicitly chosen a phased approach. Validate that the phased implementation makes sense and provides appropriate review points and validation steps between phases.
+
+- If neither marker is present: **Default to Atomic** - Apply the atomic change requirements above.
+
+**No Hybrid Approaches**: Do not suggest mixing atomic and phased strategies within the same plan. The migration strategy choice applies to the entire plan.
+</AtomicChangeRequirement>
+
+<DuplicationPrevention>
+**MANDATORY DUPLICATION DETECTION AND ELIMINATION FOR PLAN DOCUMENTS**:
+
+1. **Types of Duplication to Detect**:
+
+   a) **Existing Duplication** - Already present in the code area being modified
+      - Multiple functions doing the same thing
+      - Repeated logic across methods
+      - The plan should consolidate these, not perpetuate them
+
+   b) **Plan-Introduced Identical** - Plan creates exact copies
+      - New function that duplicates an existing function
+      - Copy-pasted logic with minor variations
+      - Redundant data structures or types
+      - Inconsistent reimplementation of existing patterns
+
+   c) **Plan-Introduced Overlap** - Plan creates parallel/competing paths
+      - New call flow that overlaps with existing flow
+      - Alternative way to accomplish same goal
+      - Multiple entry points for same functionality
+      - Conflicting approaches to similar problems
+
+2. **Resolution Requirements**:
+   - If ANY duplication is detected, the plan MUST be redesigned
+   - No "letting them coexist" - eliminate the duplication
+   - Choose ONE approach: enhance existing OR fully replace
+   - Create a single source of truth
+
+3. **Priority**:
+   - All duplication issues are HIGH priority
+   - Duplication compounds over time into technical debt
+   - Prevention now saves major refactoring later
+</DuplicationPrevention>
+
+<PlanNotImplementation>
+**CRITICAL - THIS IS A PLAN REVIEW, NOT A CODE AUDIT**:
+The plan describes FUTURE changes that haven't been implemented yet.
+
+NEVER report as issues:
+- "Proposed types/functions don't exist in codebase"
+- "Current code doesn't match the plan"
+- "Planned changes haven't been made"
+
+ONLY evaluate:
+- Is the plan internally consistent?
+- Are the proposed changes well-designed?
+- Will the plan achieve its stated goals?
+- Are there better approaches?
+</PlanNotImplementation>
+
+<ImplementationCoverageCheck>
+**MANDATORY IMPLEMENTATION COVERAGE ANALYSIS**:
+Every stated goal, use case, requirement, or necessary feature MUST have corresponding implementation steps.
+
+1. **Extract All Commitments**: Identify every:
+   - Stated goal or objective
+   - Use case or user story
+   - Requirement (functional or non-functional)
+   - "Must have" or "should support" statement
+   - Example usage that implies functionality
+   - "The system will..." or "This enables..." statements
+
+2. **Verify Coverage**: For each commitment, check:
+   - Implementation section exists for this feature
+   - No goals left unaddressed
+   - All use cases have corresponding sections
+   - Requirements map to concrete plans
+
+3. **Flag Gaps as IMPLEMENTATION-GAP Issues**: Report when:
+   - A goal has no implementation section
+   - A use case lacks corresponding code changes
+   - A requirement is stated but not addressed
+   - Examples show functionality not in implementation
+   - "Future work" items that should be current scope
+
+4. **Priority**: All IMPLEMENTATION-GAP issues are HIGH priority
+   - These represent broken promises
+   - Users expect these features based on the plan
+   - Missing these undermines trust
+</ImplementationCoverageCheck>
+
+<ImplementationSpecificity>
+**MANDATORY**: All proposed code changes must specify:
+1. **File path**: Full relative path from project root (e.g., `src/types.rs`)
+2. **Target element**: Function/type/trait being modified (e.g., `validate_input()`)
+3. **Context markers**: Parent function/unique patterns since line numbers shift with edits
+4. **Concrete changes**: Not "update validation" but "replace string comparison with enum match"
+5. **New code location**: For additions, specify where (e.g., "after ValidationError enum")
+</ImplementationSpecificity>
+
+<LineNumberProhibition>
+**CRITICAL - NO LINE NUMBERS IN DESIGN DOCUMENTS**:
+Design documents must NEVER contain line number references because they become stale immediately as code evolves.
+
+**PROHIBITED PATTERNS**:
+- "Add after line 64"
+- "Insert at line 429"
+- "Between lines 66-98"
+- "See line 312 for context"
+
+**REQUIRED ALTERNATIVES**:
+- **Section references**: "Add to Section: Type Definitions"
+- **Structural landmarks**: "After the VariantSignature Display implementation"
+- **Function scope**: "Add to the validate_input() function"
+- **Code patterns**: "Insert after the MutationStatus enum definition"
+- **Relative positioning**: "Before the MutationPathInternal struct"
+
+**ENFORCEMENT**:
+- Flag ANY line number reference in plans as a DESIGN issue
+- Suggest conversion to structural references
+- Line numbers may only appear in JSON location fields for actual code files
+- ALL plan text must use structural/semantic references
+
+**RATIONALE**: Line numbers change with every edit, making design documents immediately obsolete and causing implementation confusion.
+</LineNumberProhibition>
 
 <ReviewKeywords>
     **For CONFIRMED verdicts:**
