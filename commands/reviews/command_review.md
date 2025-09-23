@@ -212,7 +212,7 @@ Commands should be concise and avoid repetitive instructions to the agent:
     - **investigate**: Launch deeper investigation
 
     **For REVISE verdicts:**
-    - **improve**: Apply the revised improvements
+    - **agree**: Apply the revised improvements
     - **skip**: Skip this improvement and continue
     - **investigate**: Launch deeper investigation
 
@@ -229,6 +229,7 @@ Commands should be concise and avoid repetitive instructions to the agent:
 
 <KeywordExecution>
     **improve**: Use Edit tool to apply the suggested improvements to the command file specified in location
+    **agree**: Use Edit tool to apply the revised improvements to the command file specified in location
     **skip**: Mark as skipped and continue (maintain list for final summary)
     **accept**: Mark as accepted (agreeing with SOLID verdict) and continue
     **override**: Use Edit tool to apply the improvements despite SOLID verdict
