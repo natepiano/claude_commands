@@ -171,6 +171,7 @@ Provide a high-level summary of the subagent's findings:
     3. Wait for ALL subagents to complete, then parse results
 
     **VIOLATION**: Sending fewer than [N] Task calls means you failed this step.
+    **CRITICAL ENFORCEMENT**: If you send only ONE Task call instead of [N] parallel calls, you are violating the parallel execution requirement. You MUST send ALL [N] Task calls in a SINGLE message using multiple antml:invoke blocks.
 </ReviewFollowup>
 
 <ReviewFollowupPrompt>

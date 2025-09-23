@@ -81,6 +81,11 @@ Follow these command clarity principles as highest priority:
 5. **Tool Usage**: Specific tool requirements stated clearly
    - **PROBLEMATIC**: "Search for the pattern"
    - **CORRECT**: "Use Grep tool with pattern X in directory Y"
+6. **Realistic Error Handling**: Focus on user errors and edge cases, not tool failures
+   - **PROBLEMATIC**: "Handle Task tool failure or unexpected output format"
+   - **PROBLEMATIC**: "Add error handling for file write failures, disk space, or permissions"
+   - **CORRECT**: "If user provides invalid file path, display error and ask for correction"
+   - **RULE**: Don't suggest error handling for core tool failures (Read, Task, Edit, Write, etc.) or system-level file operations - these indicate environmental issues beyond command scope
 </CommandClarityPrinciples>
 
 <TaggedSectionRequirements>
