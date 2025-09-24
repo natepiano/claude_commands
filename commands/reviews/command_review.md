@@ -66,6 +66,7 @@ Use [REVIEW_CONTEXT]: We are reviewing a COMMAND FILE for structural improvement
     - <PatternConsistencyCheck/>
     - <CommandVerbosityCheck/>
     - <TemplateVariableStandards/>
+    - <ScriptManagement/>
 </ReviewConstraints>
 
 <StructuralAssessment>
@@ -298,6 +299,59 @@ Command files use template variables for maintainability and clarity. These are 
    Launch subagents on ports ${BASE_PORT} through ${MAX_PORT}
    ```
 </TemplateVariableStandards>
+
+<ScriptManagement>
+Commands should delegate complex operations to dedicated scripts for cleaner permission management:
+
+1. **Script Delegation Threshold**: When operations exceed simple commands
+   - **REQUIRES SCRIPT**: Multi-line logic, argument parsing, complex validation, data processing
+   - **INLINE OK**: Single commands like `echo`, `ls`, simple conditionals
+   - **EXAMPLES OF COMPLEX**: Array manipulation, loops, extensive error checking, API calls, file processing
+
+2. **Script Organization**: Place scripts in peer scripts/ directory
+   - **STRUCTURE**: For `.claude/commands/some_command.md`, use `.claude/scripts/some_command_*.sh` or `.claude/scripts/some_command_*.py`
+   - **NAMING**: Prefix with command name: `mutation_test_validation.sh`, `code_review_parser.py`, `design_review_formatter.sh`
+   - **LANGUAGE**: Use bash (.sh) or python (.py) as appropriate for the task
+   - **REFERENCE**: Commands invoke scripts via path: `bash .claude/scripts/mutation_test_validation.sh "$ARGUMENTS"`
+
+3. **When Suggesting Complex Logic**: Always propose script creation
+   - **PROBLEMATIC**: Embedding bash argument parsing directly in command:
+     ```bash
+     args=($ARGUMENTS)
+     TYPE_NAME="${args[0]}"
+     if [[ -z "$TYPE_NAME" ]]; then...
+     ```
+   - **CORRECT**: Propose new script and its invocation:
+     ```
+     Create .claude/scripts/compare_mutation_path_validation.sh:
+     [script contents]
+
+     Invoke from command:
+     bash .claude/scripts/compare_mutation_path_validation.sh "$ARGUMENTS"
+     ```
+
+4. **Script Proposal Format**: Include full script creation details
+   - Specify exact script path with command name prefix
+   - Provide complete script contents in suggested_code
+   - Show how command invokes the script (bash/python as appropriate)
+   - Explain permission benefits of this approach
+
+5. **Language Selection Guidelines**:
+   - **BASH**: Simple validation, file operations, command orchestration
+   - **PYTHON**: Complex parsing, JSON processing, data transformation, API interactions
+
+6. **Benefits to Emphasize**:
+   - **CLEANER PERMISSIONS**: User manages script permissions in one place
+   - **REUSABILITY**: Scripts can be shared across related commands
+   - **TESTABILITY**: Scripts can be tested independently
+   - **MAINTAINABILITY**: Complex logic separated from command flow
+
+7. **Review Enforcement**:
+   - Flag any command with embedded complex operations as STRUCTURE issue
+   - Suggest script extraction with full implementation
+   - Title finding as "Complex operations should be in scripts/ directory"
+   - Always include command name prefix in suggested script names
+</ScriptManagement>
 
 <ReviewKeywords>
     **For ENHANCE verdicts:**
