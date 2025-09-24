@@ -56,12 +56,12 @@
 
     **CODE CONTEXT REQUIREMENT**: <CodeExtractionRequirements/>
 
-    **CRITICAL**: Return your findings using the exact format specified in <InitialReviewJson/>
+    **CRITICAL**: Format your response message using the exact JSON structure specified in <InitialReviewJson/>. Include the JSON directly in your message response text - do not create any files.
 </InitialReviewPrompt>
 
 <InitialReviewJson>
     <JsonFormatInstructions/>
-Return EXACTLY this JSON structure:
+Format your response message with EXACTLY this JSON structure:
 ```json
 {
   "findings": [
@@ -234,12 +234,12 @@ Provide a high-level summary of the subagent's findings:
     - Run tests or build commands
     - Make any changes to the codebase
 
-    **CRITICAL**: Return your findings using the EXACT format specified in <ReviewFollowupJson/>
+    **CRITICAL**: Format your response message using the EXACT JSON structure specified in <ReviewFollowupJson/>. Include the JSON directly in your message response text - do not create any files.
 </ReviewFollowupPrompt>
 
 <ReviewFollowupJson>
-<JsonFormatInstructions>
-Return EXACTLY this JSON structure (extending the <BaseReviewJson/> structure):
+<JsonFormatInstructions/>
+Format your response message with EXACTLY this JSON structure (extending the <BaseReviewJson/> structure):
 ```json
 {
   // All fields from <BaseReviewJson/> (keep original values unless updating)
@@ -603,7 +603,10 @@ Example: If the plan already contains DESIGN-1 through DESIGN-7, start your new 
 </IDGenerationRules>
 
 <JsonFormatInstructions>
-**CRITICAL**: Return results as JSON. Do NOT use markdown formatting or narrative text.
-Return ONLY the JSON object, no additional text.
+**CRITICAL**: Format your response message as JSON text for the main agent to parse. Do NOT create, write, or save any files. Do NOT use the Write, Edit, or any file creation tools.
+
+Include the JSON structure directly in your response message text. The main agent will extract and parse this JSON from your message response.
+
+**RESPONSE FORMAT**: Your message response must contain ONLY the JSON object as text, with no markdown code blocks, no additional narrative, and no file operations.
 </JsonFormatInstructions>
 
