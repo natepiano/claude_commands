@@ -4,6 +4,11 @@ Convert an existing plan document into a collaborative mode plan with step-by-st
 
 **Arguments**: $ARGUMENTS (path to existing plan document to upgrade)
 
+STATUS_PENDING = ⏳ PENDING
+STATUS_COMPLETED = ✅ COMPLETED
+STATUS_SUCCESS = ✅
+UPGRADE_SUFFIX = -upgraded.md
+
 <ValidateUserResponse>
     # Parameters: expected_keywords (array), option_descriptions (array)
     If response is not one of expected_keywords:
@@ -224,21 +229,21 @@ Convert an existing plan document into a collaborative mode plan with step-by-st
 
        5. **CONFIRM**: Wait for user to confirm the build succeeded
 
-       6. **MARK COMPLETE**: Update this document to mark the step as ✅ COMPLETED
+       6. **MARK COMPLETE**: Update this document to mark the step as ${STATUS_COMPLETED}
 
        7. **PROCEED**: Move to next step only after confirmation
        </Instructions>
 
        <ExecuteImplementation>
-           Find the next ⏳ PENDING step in the INTERACTIVE IMPLEMENTATION SEQUENCE below.
+           Find the next ${STATUS_PENDING} step in the INTERACTIVE IMPLEMENTATION SEQUENCE below.
 
            For the current step:
            1. Follow the <Instructions/> above for executing the step
-           2. When step is complete, use Edit tool to mark it as ✅ COMPLETED
+           2. When step is complete, use Edit tool to mark it as ${STATUS_COMPLETED}
            3. Continue to next PENDING step
 
            If all steps are COMPLETED:
-               Display: "✅ Implementation complete! All steps have been executed."
+               Display: "${STATUS_SUCCESS} Implementation complete! All steps have been executed."
        </ExecuteImplementation>
 
        ## INTERACTIVE IMPLEMENTATION SEQUENCE
@@ -246,7 +251,7 @@ Convert an existing plan document into a collaborative mode plan with step-by-st
 
        For each step in PROPOSED_SEQUENCE:
          * Create STEP entry with objective, changes, files, build commands
-         * Include ⏳ PENDING status marker
+         * Include ${STATUS_PENDING} status marker
 
        Add final validation step
 
@@ -271,23 +276,23 @@ Convert an existing plan document into a collaborative mode plan with step-by-st
          5. Supporting sections (Migration Strategy, Testing, etc.)
 
     3. Save the upgraded plan:
-       Generate the new filename by replacing .md with -upgraded.md:
-       - Example: "plan-something.md" becomes "plan-something-upgraded.md"
-       - If no .md extension, append "-upgraded.md"
+       Generate the new filename by replacing .md with ${UPGRADE_SUFFIX}:
+       - Example: "plan-something.md" becomes "plan-something${UPGRADE_SUFFIX}"
+       - If no .md extension, append "${UPGRADE_SUFFIX}"
 
        Write the complete restructured plan to the new filename.
 
-       Display: "✅ Collaborative plan created: [new-filename]"
+       Display: "${STATUS_SUCCESS} Collaborative plan created: [new-filename]"
        Display: "📝 The plan is now executable - run it to start implementation"
 
     Display initial summary:
     ```
     Upgrade Complete
     ----------------
-    ✓ Created [new-filename] with collaborative execution protocol
-    ✓ Created [N] collaborative execution steps
-    ✓ Organized [X] tasks into buildable chunks
-    ✓ Each step includes validation commands
+    ${STATUS_SUCCESS} Created [new-filename] with collaborative execution protocol
+    ${STATUS_SUCCESS} Created [N] collaborative execution steps
+    ${STATUS_SUCCESS} Organized [X] tasks into buildable chunks
+    ${STATUS_SUCCESS} Each step includes validation commands
 
     Original: $ARGUMENTS (preserved)
     Upgraded: [new-filename] (created)
@@ -365,7 +370,7 @@ Convert an existing plan document into a collaborative mode plan with step-by-st
     If verdict is COMPLETE:
         Display:
         ```
-        ✅ Validation Complete - No Content Lost
+        ${STATUS_SUCCESS} Validation Complete - No Content Lost
         =========================================
         The upgraded plan contains all original content.
 

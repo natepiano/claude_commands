@@ -331,8 +331,9 @@ The current approach is correct. No changes needed.
     **Present Findings to User for Interactive Review**
 
     **FIRST**: Create a TodoWrite list to track the review process:
-    - Create one todo item for each finding with status "pending"
-    - Format: "Review [id]: [title]"
+    - Use TodoWrite tool to create todos for each finding
+    - Simply describe the todo content and status - don't encode the JSON format
+    - Example: "Create todos for: 'Review [id]: [title]' with status pending for each finding"
     - Mark each as "in_progress" when presenting it
     - Mark as "completed" after user responds with a keyword
 
@@ -345,7 +346,7 @@ The current approach is correct. No changes needed.
     3. Present the finding using the format from <UserOutput/> (from the investigation results)
        - Include the (n of m) counter in the title
        - Add any relevant notes about how prior decisions affect this finding
-    4. Display available keywords using <KeywordPresentation/> format based on the verdict
+    4. Display available keywords using <FormatKeywords verdict="[VERDICT]"/> based on the verdict
        - **CRITICAL**: If returning from an investigation, use the UPDATED verdict from the investigation result, NOT the original verdict
     5. STOP and wait for user's response
     6. **CRITICAL USER RESPONSE HANDLING**:
@@ -358,7 +359,7 @@ The current approach is correct. No changes needed.
             - Ask "Edit complete. Type 'continue' to proceed to the next finding. ([current_number] of [total_findings])"
             - Wait for user confirmation before proceeding
             - Skip steps d-f below and continue from step 8
-         d. **MANDATORY**: Present keywords using <KeywordPresentation/> format
+         d. **MANDATORY**: Present keywords using <FormatKeywords verdict="[CURRENT_VERDICT]"/>
          e. **MANDATORY**: State "Please select one of the keywords above to proceed."
          f. **DO NOT CONTINUE** to next finding until user provides a keyword
          g. If user continues discussion instead of selecting keyword, repeat steps a-f
@@ -452,20 +453,70 @@ Use <ReviewFindingBaseTemplate/> with:
   - **Decision**: Implementation deviation accepted and documented"
 </AcceptAsBuiltTemplate>
 
-<KeywordPresentation>
-    # Available Actions
-    Look up the appropriate keywords from the <ReviewKeywords/> section in your command file
-    based on the verdict, then display them using this EXACT format:
+<FormatKeywords>
+**CRITICAL**: This section produces user-facing output. Always ensure output starts at column 0 for proper markdown formatting.
 
-    - **[keyword]** - [description of what this action will do]
+Based on the verdict parameter, format the appropriate keywords for the current review type:
 
-    Example for CONFIRMED verdict in design review:
-    ## Available Actions
-    - **agree** - Update plan document with the suggested design improvement
-    - **skip** - Add to "Design Review Skip Notes" section and continue
-    - **skip with prejudice** - Permanently reject with ⚠️ PREJUDICE WARNING
-    - **investigate** - Launch deeper investigation of the design issue
-</KeywordPresentation>
+**For Design Review:**
+- CONFIRMED/MODIFIED verdicts: <DesignConfirmedKeywords/>
+- REJECTED verdicts: <DesignRejectedKeywords/>
+
+**For Code Review:**
+- FIX RECOMMENDED/FIX MODIFIED verdicts: <CodeFixKeywords/>
+- FIX NOT RECOMMENDED verdicts: <CodeNoFixKeywords/>
+
+**For Command Review:**
+- ENHANCE/REVISE verdicts: <CommandEnhanceKeywords/>
+- SOLID verdicts: <CommandSolidKeywords/>
+</FormatKeywords>
+
+<DesignConfirmedKeywords>
+## Available Actions
+- **agree** - Update plan document with the suggested design improvement
+- **skip** - Add to "Design Review Skip Notes" section and continue
+- **skip silently** - Reject without updating the plan document
+- **skip with prejudice** - Permanently reject with ⚠️ PREJUDICE WARNING
+- **redundant** - Mark as redundant - the suggestion already exists in the plan
+- **investigate** - Launch deeper investigation of the design issue
+</DesignConfirmedKeywords>
+
+<DesignRejectedKeywords>
+## Available Actions
+- **override** - Override the rejection - treat as CONFIRMED and implement the suggestion
+- **agree** - Accept that the finding was incorrect - plan stays unchanged
+- **agree silently** - Accept the rejection without updating the plan document
+- **skip with prejudice** - Permanently reject with ⚠️ PREJUDICE WARNING
+- **investigate** - Challenge the rejection and investigate further
+</DesignRejectedKeywords>
+
+<CodeFixKeywords>
+## Available Actions
+- **fix** - Apply the suggested code change
+- **skip** - Skip this fix and continue
+- **investigate** - Launch deeper investigation of the code issue
+</CodeFixKeywords>
+
+<CodeNoFixKeywords>
+## Available Actions
+- **accept** - Accept that the code is correct as-is
+- **override** - Apply the fix despite the recommendation
+- **investigate** - Launch investigation to reconsider
+</CodeNoFixKeywords>
+
+<CommandEnhanceKeywords>
+## Available Actions
+- **improve** - Apply the suggested improvements to the command
+- **skip** - Skip this improvement and continue
+- **investigate** - Launch deeper investigation
+</CommandEnhanceKeywords>
+
+<CommandSolidKeywords>
+## Available Actions
+- **accept** - Accept that the command is well-structured
+- **override** - Apply the improvement despite the recommendation
+- **investigate** - Launch investigation to reconsider
+</CommandSolidKeywords>
 
 <FinalSummary>
     Review Complete!

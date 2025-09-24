@@ -234,27 +234,27 @@ Design documents must NEVER contain line number references because they become s
 
 <ReviewKeywords>
     **For CONFIRMED verdicts:**
-    - **agree**: Implement the confirmed design improvement
-    - **skip**: Reject the suggestion - add to Skip Notes and continue
-    - **skip silently**: Reject without updating the plan document
-    - **skip with prejudice**: Permanently reject with ⚠️ PREJUDICE WARNING
-    - **redundant**: Mark as redundant - the suggestion already exists in the plan
-    - **investigate**: Launch deeper investigation of the design issue
+    - agree: Implement the confirmed design improvement
+    - skip: Reject the suggestion - add to Skip Notes and continue
+    - skip silently: Reject without updating the plan document
+    - skip with prejudice: Permanently reject with ⚠️ PREJUDICE WARNING
+    - redundant: Mark as redundant - the suggestion already exists in the plan
+    - investigate: Launch deeper investigation of the design issue
 
     **For MODIFIED verdicts:**
-    - **agree**: Implement the modified version of the suggestion
-    - **skip**: Reject the modified suggestion - add to Skip Notes and continue
-    - **skip silently**: Reject without updating the plan document
-    - **skip with prejudice**: Permanently reject with ⚠️ PREJUDICE WARNING
-    - **redundant**: Mark as redundant - the suggestion already exists in the plan
-    - **investigate**: Launch deeper investigation of alternatives
+    - agree: Implement the modified version of the suggestion
+    - skip: Reject the modified suggestion - add to Skip Notes and continue
+    - skip silently: Reject without updating the plan document
+    - skip with prejudice: Permanently reject with ⚠️ PREJUDICE WARNING
+    - redundant: Mark as redundant - the suggestion already exists in the plan
+    - investigate: Launch deeper investigation of alternatives
 
     **For REJECTED verdicts (finding is wrong, plan is correct):**
-    - **override**: Override the rejection - treat as CONFIRMED and implement the suggestion
-    - **agree**: Accept that the finding was incorrect - plan stays unchanged (default)
-    - **agree silently**: Accept the rejection without updating the plan document
-    - **skip with prejudice**: Permanently reject with ⚠️ PREJUDICE WARNING
-    - **investigate**: Challenge the rejection and investigate further
+    - override: Override the rejection - treat as CONFIRMED and implement the suggestion
+    - agree: Accept that the finding was incorrect - plan stays unchanged (default)
+    - agree silently: Accept the rejection without updating the plan document
+    - skip with prejudice: Permanently reject with ⚠️ PREJUDICE WARNING
+    - investigate: Challenge the rejection and investigate further
 </ReviewKeywords>
 
 <ReviewFollowupParameters>

@@ -9,18 +9,35 @@ If no arguments are provided, the command will work with the plan document curre
 ## Overview
 Create a todo list for the specified plan using your todo tool, then STOP.
 
-<PlanDocumentEvaluation>
+<ExecutionSteps>
+    **EXECUTE THESE STEPS IN ORDER:**
+
+    **STEP 1:** Execute <PlanDocumentSelection/>
+    **STEP 2:** Execute <ReviewFindingsProcessing/>
+    **STEP 3:** Execute <Setup/>
+    **STEP 4:** Execute <ImplementationTodos/>
+    **STEP 5:** Execute <ValidationTodos/>
+    **STEP 6:** Execute <ReviewTodos/>
+</ExecutionSteps>
+
+<PlanDocumentSelection>
 **MANDATORY FIRST STEP - PLAN DOCUMENT SELECTION**:
+
+PLAN_FILE_PATH = ${selected plan document path}
+FEATURE_NAME = ${extracted from plan title}
+
 1. If `$ARGUMENTS` is provided: Read the specified plan document from the project root
 2. If no arguments: Use the plan document currently being worked on in the session
 3. Verify the plan document exists and is readable
-4. Check if the plan document is checked into git using: `git status [PLAN_FILE_PATH]`
+4. Check if the plan document is checked into git using: `git status ${PLAN_FILE_PATH}`
 5. If it is not checked in, commit ONLY the plan file:
-   - Run: `git add [PLAN_FILE_PATH]` (ONLY the plan file, nothing else)
-   - Run: `git commit -m "docs: add implementation plan for [feature name]"`
+   - Run: `git add ${PLAN_FILE_PATH}` (ONLY the plan file, nothing else)
+   - Run: `git commit -m "docs: add implementation plan for ${FEATURE_NAME}"`
    - DO NOT use `git add .` or `git add -A`
 6. This ensures the plan is preserved before implementation begins
+</PlanDocumentSelection>
 
+<ReviewFindingsProcessing>
 **CRITICAL - REVIEW FINDINGS PROCESSING**:
 After reading the plan document, you MUST:
 1. Search for ALL review sections (e.g., "Design Review Skip Notes", review findings)
@@ -28,25 +45,28 @@ After reading the plan document, you MUST:
    - What specific suggestion or change is being addressed
    - WHY it has its current status
    - Whether it affects the original plan or is a new suggestion
-   
+
 3. Interpret findings CONTEXTUALLY:
    - **PREJUDICE WARNING**: Read the issue description - it might be rejecting a SUGGESTION to change something already approved, not rejecting the feature itself
    - **SKIPPED**: Understand if this skips a suggested modification or an entire feature
    - **APPROVED**: This adds or modifies something - implement the approved version
    - **ACCEPTED AS BUILT**: The implementation differs from plan but was accepted - don't change it
-   
+
 4. Create todos based on UNDERSTANDING, not keywords:
    - Implement features from the original plan that weren't rejected
    - Implement approved modifications from reviews
    - DON'T implement suggestions that were skipped/rejected
    - DON'T undo things marked as "accepted as built"
-</PlanDocumentEvaluation>
+</ReviewFindingsProcessing>
 
 It is **CRITICAL** that you think deeply about the implementation according to the instructions given here so that you make the best possible implementation todo list.
 
 **REVIEW CROSS-REFERENCE**: When creating todos, include references to review findings:
-- For approved items: "Implement TYPE-SYSTEM-1 (approved version): [description]"
-- For modified items: "Implement DESIGN-4 with review modifications: [description]"
+
+DESCRIPTION = ${specific feature description}
+
+- For approved items: "Implement TYPE-SYSTEM-1 (approved version): ${DESCRIPTION}"
+- For modified items: "Implement DESIGN-4 with review modifications: ${DESCRIPTION}"
 - This helps track which review decisions are being implemented
 
 **CRITICAL DIRECTIVE**: If during implementation you need to structurally deviate from what the user asked for in the planning phase, you MUST immediately STOP and clarify with the user how to proceed. Do not continue with structural changes without explicit approval.
@@ -63,7 +83,8 @@ It is **CRITICAL** that you think deeply about the implementation according to t
 Unless you reach the condition about structurally deviating from the plan and require guidance, under no other circumstance should you stop until you finish the plan.
 
 <Setup>
-- Set terminal title: `echo -e "\e]2;Implementation: [brief description]\007"`
+BRIEF_DESCRIPTION = ${summary of implementation scope}
+
 - Order todos by dependency to minimize compiler errors
 </Setup>
 
@@ -129,7 +150,7 @@ Example 4 - PREJUDICE WARNING about reverting something already done:
 ```
 ### ⚠️ PREJUDICE WARNING - DESIGN-1: Remove the new error handling
 - **Issue**: Reviewer keeps suggesting we remove error handling we added
-- **Status**: PERMANENTLY REJECTED  
+- **Status**: PERMANENTLY REJECTED
 - **Critical Note**: The error handling stays - stop suggesting removal
 ```
 → KEEP the error handling (the suggestion to remove it was rejected)
@@ -148,7 +169,9 @@ Example 5 - ACCEPTED AS BUILT deviation:
 
 <ImplementationTodos>
 For each plan item that passes review filtering, create todos:
-- [ ] Implement the specific feature/change from plan (or approved version if modified) following <CodingGuidelines>
+FEATURE_CHANGE = ${specific feature or change from plan}
+
+- [ ] Implement ${FEATURE_CHANGE} (or approved version if modified) following <CodingGuidelines>
 
 Note: Cargo check runs automatically after each edit via hook - manual builds are no longer needed.
 

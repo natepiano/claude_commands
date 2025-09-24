@@ -144,19 +144,19 @@ Before suggesting any Rust code changes, verify they align with current clippy l
 
 <ReviewKeywords>
     **For FIX RECOMMENDED verdicts:**
-    - **fix**: Apply the suggested code change immediately
-    - **skip**: Skip this fix and continue
-    - **investigate**: Launch deeper investigation of the code issue
+    - fix: Apply the suggested code change immediately
+    - skip: Skip this fix and continue
+    - investigate: Launch deeper investigation of the code issue
 
     **For FIX MODIFIED verdicts:**
-    - **fix**: Apply the modified code change
-    - **skip**: Skip this fix and continue
-    - **investigate**: Launch deeper investigation
+    - fix: Apply the modified code change
+    - skip: Skip this fix and continue
+    - investigate: Launch deeper investigation
 
     **For FIX NOT RECOMMENDED verdicts (finding incorrect, code is fine):**
-    - **accept**: Accept that the code is correct as-is (default)
-    - **override**: Apply the fix despite the recommendation
-    - **investigate**: Launch investigation to reconsider
+    - accept: Accept that the code is correct as-is (default)
+    - override: Apply the fix despite the recommendation
+    - investigate: Launch investigation to reconsider
 </ReviewKeywords>
 
 <ReviewFollowupParameters>

@@ -18,9 +18,9 @@
 </ExecutionSteps>
 
 <TaskContext>
-[WORKING_DIRECTORY]: The directory where task will be executed
-[PLAN_DOCUMENT]: Optional plan*.md document with implementation specifications
-[TODO_FILE]: .todo.json file for tracking task progress
+${WORKING_DIRECTORY}: The directory where task will be executed
+${PLAN_DOCUMENT}: Optional plan*.md document with implementation specifications
+${TODO_FILE}: .todo.json file for tracking task progress
 </TaskContext>
 
 ## STEP 1: SETUP
@@ -33,7 +33,7 @@
        - If exists: Prepare for continuation (go to <TaskContinuation/>)
        - If not exists: Prepare for new task (go to <TaskCreation/>)
     3. Identify any plan*.md documents mentioned by user
-    4. Set terminal title if applicable: `echo -e "\e]2;Task: [brief description]\007"`
+    4. Set terminal title if applicable: `echo -e "\e]2;Task: ${brief description}\007"`
 </TaskSetup>
 
 ## STEP 2: TASK INITIALIZATION
@@ -47,7 +47,7 @@
     4. Stage and commit `.todo.json` only:
        ```bash
        git add .todo.json
-       git commit -m "Initialize task tracking for [task description]"
+       git commit -m "Initialize task tracking for ${task description}"
        ```
     5. Proceed to <SubagentExecution/>
 </TaskCreation>
@@ -74,7 +74,7 @@
        - Replace <TodoJsonFormat/> with the full content from the <TodoJsonFormat> definition
        - Replace <SubagentCriticalRules/> with the full content from that definition
        - Replace <WarningCategorizationLogic/> with the full content from that definition
-       - Include actual values for [WORKING_DIRECTORY] and [PLAN_DOCUMENT]
+       - Include actual values for ${WORKING_DIRECTORY} and ${PLAN_DOCUMENT}
        - For continuations: Add "Continue from existing .todo.json - do not create new one"
     
     3. Wait for subagent to complete
@@ -87,23 +87,23 @@
 
 <SubagentPrompt>
     **CONTEXT:**
-    - Working directory: [WORKING_DIRECTORY]
-    - Plan document: [PLAN_DOCUMENT] (read this for implementation details)
+    - Working directory: ${WORKING_DIRECTORY}
+    - Plan document: ${PLAN_DOCUMENT} (read this for implementation details)
     - Task tracking: .todo.json file in working directory
     
     **CRITICAL:** Read and follow <SubagentCriticalRules/> throughout execution
     
     **YOUR WORKFLOW:**
     
-    <Step1_ReadContext>
+    <ContextAnalysis>
         1. Read .todo.json to understand all tasks (see <TodoJsonFormat/> for structure)
-        2. If [PLAN_DOCUMENT] specified, read it for implementation requirements
+        2. If ${PLAN_DOCUMENT} specified, read it for implementation requirements
         3. Identify first incomplete task (status: "pending" or "in_progress")
-    </Step1_ReadContext>
-    
-    <Step2_ImplementationCycle>
+    </ContextAnalysis>
+
+    <TaskImplementation>
         For each task in .todo.json:
-        
+
         1. **CRITICAL**: Update .todo.json - mark current task "in_progress"
         2. **THINK DEEPLY** about implementation:
            - What the task actually requires
@@ -112,31 +112,31 @@
         3. Implement the task
         4. Update .todo.json - mark "completed" with notes, mark next task "in_progress"
         5. Continue to next task
-        
+
         **MANDATORY**: Never work on ANY task without first updating .todo.json status
-    </Step2_ImplementationCycle>
-    
-    <Step3_BuildValidation>
+    </TaskImplementation>
+
+    <BuildValidation>
         After implementation tasks (before marking final task complete):
-        
-        1. Run `cargo build 2>&1 | grep -A1 -E "warning:|error:|-->" || true`
+
+        1. Run `<BuildValidationCommand/>`
         2. Apply <WarningCategorizationLogic/> to each warning
         3. For missing implementation: Add new tasks to .todo.json and continue
         4. For unnecessary code: Delete immediately
         5. Only mark complete when build is clean
-    </Step3_BuildValidation>
-    
-    <Step4_ContextManagement>
+    </BuildValidation>
+
+    <ContextLimitHandling>
         If approaching context limit (THIS IS NORMAL):
         1. Update .todo.json with detailed progress notes
         2. Save all work (don't commit except .todo.json)
         3. Return: "Context limit reached - ready for handoff to continue from .todo.json"
-        
+
         Continue working unless:
         - Context window nearly full → Return for handoff (main agent will auto-continue)
         - Missing critical information → Stop and request from main agent
         - User intervention needed → Stop and explain issue
-    </Step4_ContextManagement>
+    </ContextLimitHandling>
     
     **FINAL REMINDERS:**
     - Every task transition MUST update .todo.json
@@ -167,10 +167,10 @@
     
     **Follow <MainAgentCriticalRules/> during this review**
     
-    1. Run `cargo build 2>&1 | grep -A1 -E "warning:|error:|-->" || true`
+    1. Run `<BuildValidationCommand/>`
     
     2. If warnings exist:
-       a. Read the original [PLAN_DOCUMENT] (if exists) for context
+       a. Read the original ${PLAN_DOCUMENT} (if exists) for context
        b. Apply <WarningCategorizationLogic/> to each warning
        c. For missing implementation:
           - Create new tasks in .todo.json
@@ -189,14 +189,18 @@
     1. Read final .todo.json
     2. Sync completed tasks to TodoWrite tool
     3. Display summary:
-       - Tasks completed: [count]
-       - Build status: [clean/warnings remaining]
+       - Tasks completed: ${count}
+       - Build status: ${clean/warnings remaining}
        - Any deviations from plan
     4. Delete .todo.json
     5. Provide implementation summary for user
 </TaskCompletion>
 
 ## REFERENCE BLOCKS
+
+<BuildValidationCommand>
+cargo build 2>&1 | grep -A1 -E "warning:|error:|-->" || true
+</BuildValidationCommand>
 
 <MainAgentResponsibilities>
     **As the main agent, you are responsible for:**

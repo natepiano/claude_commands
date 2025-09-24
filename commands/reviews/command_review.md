@@ -284,19 +284,26 @@ Command files use template variables for maintainability and clarity. These are 
    - **CORRECT**: `MAX_PORT = ${BASE_PORT + MAX_SUBAGENTS - 1}`
    - **PURPOSE**: Self-documenting mathematical relationships
 
-4. **Critical Rules**:
+4. **CRITICAL EXCEPTION - $ARGUMENTS**:
+   - **$ARGUMENTS is ALWAYS CORRECT** - this is a special replacement value handled by the Claude Code agent software
+   - **NEVER** suggest changing $ARGUMENTS to ${ARGUMENTS} - this will break substitution
+   - **NEVER** flag $ARGUMENTS usage as inconsistent or incorrect
+   - **RULE**: $ARGUMENTS is the ONLY variable that should use $VARIABLE format instead of ${VARIABLE}
+
+5. **Critical Rules**:
    - **NEVER** flag ${} syntax as shell execution confusion - these are template placeholders
    - **NEVER** suggest replacing ${VARIABLE} with hardcoded values
    - **ALWAYS** recognize this as a documentation/templating system for AI agents
    - **WHY**: Makes relationships explicit, improves maintainability, helps AI agents understand value dependencies
 
-5. **Example**:
+6. **Example**:
    ```markdown
    MAX_SUBAGENTS = 10
    BASE_PORT = 30001
    MAX_PORT = ${BASE_PORT + MAX_SUBAGENTS - 1}
 
    Launch subagents on ports ${BASE_PORT} through ${MAX_PORT}
+   Process command arguments: $ARGUMENTS
    ```
 </TemplateVariableStandards>
 
@@ -355,19 +362,19 @@ Commands should delegate complex operations to dedicated scripts for cleaner per
 
 <ReviewKeywords>
     **For ENHANCE verdicts:**
-    - **improve**: Apply the suggested improvements to the command
-    - **skip**: Skip this improvement and continue
-    - **investigate**: Launch deeper investigation
+    - improve: Apply the suggested improvements to the command
+    - skip: Skip this improvement and continue
+    - investigate: Launch deeper investigation
 
     **For REVISE verdicts:**
-    - **agree**: Apply the revised improvements
-    - **skip**: Skip this improvement and continue
-    - **investigate**: Launch deeper investigation
+    - agree: Apply the revised improvements
+    - skip: Skip this improvement and continue
+    - investigate: Launch deeper investigation
 
     **For SOLID verdicts (finding incorrect, command is fine):**
-    - **accept**: Accept that the command is well-structured (default)
-    - **override**: Apply the improvement despite the recommendation
-    - **investigate**: Launch investigation to reconsider
+    - accept: Accept that the command is well-structured (default)
+    - override: Apply the improvement despite the recommendation
+    - investigate: Launch investigation to reconsider
 </ReviewKeywords>
 
 <ReviewFollowupParameters>

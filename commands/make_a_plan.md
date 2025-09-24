@@ -39,7 +39,9 @@ Create a structured plan document based on our discussion.
     
     Please type: collaborative or agent
     ```
-    
+
+    **STOP** and wait for user response. Do not proceed until valid input received.
+
     Store the response as PLAN_TYPE for use in subsequent steps.
     
     **Keyword Handling**:
@@ -51,6 +53,14 @@ Create a structured plan document based on our discussion.
 ## STEP 3: INTERACTIVE PLAN BUILDING
 
 <InteractivePlanBuilding>
+    **Create TodoWrite with sections to process:**
+    - Create todos for each section that will be processed based on PLAN_TYPE
+    - If PLAN_TYPE = collaborative: Include CollaborativeExecutionProtocol + standard sections
+    - If PLAN_TYPE = agent: Include only standard sections from PlanSections
+    - Mark each section as 'in_progress' when presenting to user
+    - Mark as 'completed' when user makes their choice (accept/revise/skip)
+    - Track PLAN_TYPE and section inclusion decisions for final document
+
     **Context**: Since we've been discussing this feature/refactoring, use the conversation context to generate intelligent suggestions for each section.
 
     **IF PLAN_TYPE = collaborative**:
@@ -77,6 +87,18 @@ Create a structured plan document based on our discussion.
        - **revise**: User provides modifications or replacement text
        - **skip**: Omit this section from the plan
        - **expand**: Request more detailed suggestions
+
+       **Response Handling**:
+       - "accept", "ok", "yes", "use it" → accept
+       - "revise", "modify", "change", "edit" → revise
+       - "skip", "omit", "no", "ignore" → skip
+       - "expand", "more", "detail", "elaborate" → expand
+       - Any other response → Ask for clarification with examples
+
+       **Error Recovery**: If user provides invalid response:
+       - Show: "Please respond with one of: accept, revise, skip, or expand"
+       - After 2 invalid attempts, inform user: "Defaulting to 'skip' to continue" and proceed
+
     6. Track which sections are included for the final document
 
     **CRITICAL**: Make suggestions specific and detailed based on what we've discussed. Don't generate generic placeholder content.
@@ -111,7 +133,7 @@ Create a structured plan document based on our discussion.
     <ProposedSolution/>
     <Implementation/>
     <MigrationStrategy/>
-    <Testinging/>
+    <Testing/>
     <RiskAssessment/>
     <SuccessCriteria/>
     <OpenQuestions/>
@@ -121,131 +143,39 @@ Create a structured plan document based on our discussion.
 ### Section Definitions
 
 <CollaborativeExecutionProtocol>
-    **Section**: Collaborative Execution Protocol
-    **Purpose**: Define the step-by-step collaborative implementation process with validation checkpoints
-    **Only For**: COLLABORATIVE plans (not included in agent-only plans)
+    **Purpose**: Define collaborative implementation process with validation checkpoints
+    **Only For**: COLLABORATIVE plans
 
-    **Format**:
+    **Template**:
     ```markdown
     ## EXECUTION PROTOCOL
-
-    <Instructions>
-    For each step in the implementation sequence:
-
-    1. **DESCRIBE**: Present the changes with:
-       - Summary of what will change and why
-       - Code examples showing before/after
-       - List of files to be modified
-       - Expected impact on the system
-
-    2. **AWAIT APPROVAL**: Stop and wait for user confirmation ("go ahead" or similar)
-
-    3. **IMPLEMENT**: Make the changes and stop
-
-    4. **BUILD & VALIDATE**: Execute the build process:
-       ```bash
-       [project-specific build commands, e.g., cargo build && cargo test]
-       ```
-       Then inform user to run any necessary reconnection commands
-
-    5. **CONFIRM**: Wait for user to confirm the build succeeded
-
-    6. **TEST** (if applicable): Run validation tests specific to that step
-
-    7. **MARK COMPLETE**: Update this document to mark the step as ✅ COMPLETED
-
-    8. **PROCEED**: Move to next step only after confirmation
-    </Instructions>
+    For each step: DESCRIBE → AWAIT APPROVAL → IMPLEMENT → BUILD & VALIDATE → CONFIRM → PROCEED
 
     ## INTERACTIVE IMPLEMENTATION SEQUENCE
-
     ### STEP 1: [Step Name]
     **Status:** ⏳ PENDING
-    
-    **Objective:** [Clear goal for this step]
-    
-    **Changes to make:**
-    1. [Specific change 1]
-    2. [Specific change 2]
-    
-    **Files to modify:**
-    - `[file path 1]`
-    - `[file path 2]`
-    
-    **Expected outcome:**
-    - [What should work after this step]
-    - [How to verify success]
-
-    ### STEP 2: [Step Name]
-    **Status:** ⏳ PENDING
-    
-    [Similar structure...]
+    **Objective:** [Clear goal]
+    **Changes:** [List specific changes]
+    **Files:** [List files to modify]
+    **Expected outcome:** [What should work]
 
     ### STEP N: Final Validation
     **Status:** ⏳ PENDING
-    
-    **Objective:** Verify all changes work correctly
-    
     **Validation checklist:**
-    - [ ] [Specific test 1]
-    - [ ] [Specific test 2]
+    - [ ] [Specific tests]
     - [ ] All tests pass
-    - [ ] No regressions
-    
-    **Expected outcome:**
-    - System fully migrated/implemented
-    - Ready for production use
     ```
-
-    **Guidelines**:
-    - Each step should be independently testable
-    - Status markers: ⏳ PENDING, 🔄 IN PROGRESS, ✅ COMPLETED, ❌ BLOCKED
-    - Include specific build/test commands for the project
-    - Reference this protocol in the Implementation Strategy section
-    - Steps should align with phases defined in Implementation Strategy
+    **Status markers:** ⏳ PENDING, 🔄 IN PROGRESS, ✅ COMPLETED, ❌ BLOCKED
 </CollaborativeExecutionProtocol>
 
 <TitleAndOverview>
-    **Section**: Title and Overview
-    **Purpose**: Provide immediate understanding of the plan's goal
-
-    **Format**:
-    ```markdown
-    # [Plan Title]
-
-    ## Overview
-    [1-3 sentence description of what this plan accomplishes]
-    ```
-
-    **Guidelines**:
-    - Title should be specific and action-oriented
-    - Overview must be concise but complete
-    - Include the primary goal and scope
+    **Purpose**: Provide immediate understanding of plan's goal
+    **Template**: `# [Title]` + `## Overview` with 1-3 sentence description
 </TitleAndOverview>
 
 <ProblemStatement>
-    **Section**: Problem Statement / Current State Analysis
-    **Purpose**: Document what's wrong and why change is needed
-
-    **Format**:
-    ```markdown
-    ## Problem Statement
-
-    ### Current Issues
-    - [Specific problem 1 with evidence/examples]
-    - [Specific problem 2 with evidence/examples]
-
-    ### Current State Metrics (if applicable)
-    - File sizes: [relevant metrics]
-    - Performance: [relevant metrics]
-    - Complexity: [relevant metrics]
-    ```
-
-    **Guidelines**:
-    - Be specific with concrete examples from our discussion
-    - Include code snippets showing problems we've identified
-    - Quantify issues where possible (file sizes, performance metrics, etc.)
-    - Reference actual files and line numbers we've examined
+    **Purpose**: Document current issues with evidence
+    **Template**: List specific problems with examples, include metrics where applicable
 </ProblemStatement>
 
 <ProposedSolution>
@@ -379,7 +309,7 @@ Create a structured plan document based on our discussion.
     - Include specific review checkpoints between phases
 </MigrationStrategy>
 
-<Testinging>
+<Testing>
     **Section**: Testing Strategy
     **Purpose**: Define how to validate the implementation
 
@@ -406,7 +336,7 @@ Create a structured plan document based on our discussion.
     - Define expected outputs
     - Cover edge cases
     - Include regression tests
-</Testinging>
+</Testing>
 
 <RiskAssessment>
     **Section**: Risk Assessment

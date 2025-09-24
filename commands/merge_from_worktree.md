@@ -1,61 +1,107 @@
 I'll discover available worktrees and help you safely merge changes from another worktree.
 
-<WorktreeMergeTodos>
-- [ ] Verify current working directory is in a git worktree
-- [ ] Display current worktree location and branch
-- [ ] List all available worktrees
-- [ ] Ask user which worktree to merge from
-- [ ] Check if current worktree is clean (no uncommitted changes)
-- [ ] Fetch latest changes from remote
-- [ ] Verify current branch is up to date with its remote tracking branch
-- [ ] Validate the source worktree path exists and is a valid git worktree
-- [ ] Check if source worktree has uncommitted changes
-- [ ] Test if merge would have conflicts
-- [ ] If all checks pass, perform the merge
-- [ ] If any issues found, stop and ask user for guidance
-</WorktreeMergeTodos>
+SELECTED_WORKTREE = [User selected worktree path from step 1]
+SOURCE_BRANCH = [Branch name from selected worktree]
 
-Steps to execute:
+First, create a todo list to track our progress using the TodoWrite tool:
+- "Discover and validate worktree options"
+- "Get user worktree selection"
+- "Validate working tree status"
+- "Sync with remote if needed"
+- "Validate source worktree"
+- "Test merge feasibility"
+- "Perform actual merge"
 
-1. First, verify we're in a git worktree and discover available options:
-   - Run `git rev-parse --show-toplevel` to confirm we're in a git repo
-   - Run `git branch --show-current` to get current branch name
-   - Run `pwd` to show current working directory
-   - Run `git worktree list` to show all worktrees
-   - Parse the output to identify other worktrees (excluding current one)
-   - Display current worktree and available source worktrees clearly
-   - **STOP HERE AND ASK: "Which worktree would you like to merge from?" Wait for user response before continuing.**
-   - If not in a git repo, STOP and inform user
+Mark each todo as "in_progress" when starting that step, and "completed" when finished.
 
-**IMPORTANT** YOU MUST STOP before doing any further work and wait for user confirmation!!
+<ExecutionSteps>
+    **EXECUTE THESE STEPS IN ORDER:**
 
-2. Check working tree status:
-   - Run `git status --porcelain` to check for uncommitted changes
-   - If there are uncommitted changes, STOP and ask user to commit or stash first
+    **STEP 1:** Execute <DiscoverWorktreeOptions/>
+    **STEP 2:** Execute <CheckWorkingTreeStatusStep/>
+    **STEP 3:** Execute <SyncWithRemote/>
+    **STEP 4:** Execute <ValidateSourceWorktree/>
+    **STEP 5:** Execute <TestMergeFeasibility/>
+    **STEP 6:** Execute <PerformActualMerge/>
+</ExecutionSteps>
 
-3. Sync with remote (if exists):
-   - Check if 'origin' remote exists with `git remote get-url origin`
-   - If origin exists, run `git fetch origin` to get latest remote changes
-   - Check if current branch has upstream with `git rev-parse --abbrev-ref @{upstream}`
-   - If has upstream, check if behind with `git rev-list HEAD..@{upstream} --count`
-   - If behind remote, STOP and ask user if they want to pull first
-   - If no origin remote, skip remote sync steps and continue
+<DiscoverWorktreeOptions>
+    - Execute <ValidateGitRepo/>
+    - Execute <GetCurrentBranch/>
+    - Run `pwd` to show current working directory
+    - Run `git worktree list` to show all worktrees
+    - Parse the output to identify other worktrees (excluding current one)
+    - Display current worktree and available source worktrees clearly
 
-4. Validate source worktree from user selection:
-   - Check if selected worktree path exists
-   - Run `git -C $SELECTED_WORKTREE rev-parse --show-toplevel` to verify it's a git repo
-   - Run `git -C $SELECTED_WORKTREE branch --show-current` to get source branch
-   - Run `git -C $SELECTED_WORKTREE status --porcelain` to check for uncommitted changes
-   - If source has uncommitted changes, STOP and inform user
+## Available Actions
+- **select** - Choose a worktree to merge from by entering its path or number
+- **cancel** - Exit without performing merge
 
-5. Test merge feasibility:
-   - Run `git merge --no-commit --no-ff $SOURCE_BRANCH` where SOURCE_BRANCH is from step 4
-   - If merge would have conflicts, run `git merge --abort` and STOP to ask user
-   - If no conflicts, run `git merge --abort` to undo test merge
+Please select one of the keywords above.
 
-6. Perform actual merge (only if all checks pass):
-   - Run `git merge $SOURCE_BRANCH -m "Merge branch '$SOURCE_BRANCH' from worktree $SELECTED_WORKTREE"`
-   - Report success to user
+[STOP and wait for user response]
+
+**CAPTURE USER SELECTION:** Store the user's response as SELECTED_WORKTREE variable
+**VALIDATE USER INPUT:** Verify SELECTED_WORKTREE matches one of the available worktree paths from `git worktree list`
+If user input doesn't match available worktrees, display error and re-ask
+</DiscoverWorktreeOptions>
+
+<CheckWorkingTreeStatusStep>
+    - Execute <CheckWorkingTreeStatus/>
+    - If there are uncommitted changes, STOP and ask user to commit or stash first
+</CheckWorkingTreeStatusStep>
+
+<SyncWithRemote>
+    - Check if 'origin' remote exists with `git remote get-url origin`
+    - If origin exists, run `git fetch origin` to get latest remote changes
+    - Check if current branch has upstream with `git rev-parse --abbrev-ref @{upstream}`
+    - If has upstream, check if behind with `git rev-list HEAD..@{upstream} --count`
+    - If behind remote, STOP and ask user if they want to pull first
+    - If no origin remote, skip remote sync steps and continue
+</SyncWithRemote>
+
+<ValidateSourceWorktree>
+    - Check if selected worktree path exists: `test -d "${SELECTED_WORKTREE}"`
+    - Execute <ValidateGitRepo REPO_PATH="${SELECTED_WORKTREE}"/>
+    - Execute <GetCurrentBranch REPO_PATH="${SELECTED_WORKTREE}"/> and store result as SOURCE_BRANCH
+    - Execute <CheckWorkingTreeStatus REPO_PATH="${SELECTED_WORKTREE}"/>
+    - If source has uncommitted changes, STOP and inform user
+</ValidateSourceWorktree>
+
+<TestMergeFeasibility>
+    - Run `git merge --no-commit --no-ff ${SOURCE_BRANCH}` where SOURCE_BRANCH is from ValidateSourceWorktree
+    - If merge would have conflicts, run `git merge --abort` and STOP to ask user
+    - If no conflicts, run `git merge --abort` to undo test merge
+</TestMergeFeasibility>
+
+<PerformActualMerge>
+    - Run `git merge ${SOURCE_BRANCH} -m "Merge branch '${SOURCE_BRANCH}' from worktree ${SELECTED_WORKTREE}"`
+    - Report success to user
+</PerformActualMerge>
+
+<ValidateGitRepo>
+**Parameters:** REPO_PATH (optional, defaults to current directory)
+**Purpose:** Verify location is a valid git repository
+- If REPO_PATH provided: Run `git -C ${REPO_PATH} rev-parse --show-toplevel`
+- If REPO_PATH not provided: Run `git rev-parse --show-toplevel`
+- If command fails, STOP and inform user location is not a git repository
+</ValidateGitRepo>
+
+<GetCurrentBranch>
+**Parameters:** REPO_PATH (optional, defaults to current directory)
+**Purpose:** Get current branch name from git repository
+- If REPO_PATH provided: Run `git -C ${REPO_PATH} branch --show-current`
+- If REPO_PATH not provided: Run `git branch --show-current`
+- Store result as CURRENT_BRANCH variable
+</GetCurrentBranch>
+
+<CheckWorkingTreeStatus>
+**Parameters:** REPO_PATH (optional, defaults to current directory)
+**Purpose:** Check for uncommitted changes in working tree
+- If REPO_PATH provided: Run `git -C ${REPO_PATH} status --porcelain`
+- If REPO_PATH not provided: Run `git status --porcelain`
+- If output is not empty, repository has uncommitted changes
+</CheckWorkingTreeStatus>
 
 HAPPY PATH: If all validations pass, proceed with merge without stopping
 UNHAPPY PATH: Stop and ask user for guidance if:
