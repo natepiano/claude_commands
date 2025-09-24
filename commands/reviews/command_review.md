@@ -84,8 +84,17 @@ Follow these command clarity principles as highest priority:
 6. **Realistic Error Handling**: Focus on user errors and edge cases, not tool failures
    - **PROBLEMATIC**: "Handle Task tool failure or unexpected output format"
    - **PROBLEMATIC**: "Add error handling for file write failures, disk space, or permissions"
+   - **PROBLEMATIC**: "Add timeout handling for tool operations or long-running processes"
    - **CORRECT**: "If user provides invalid file path, display error and ask for correction"
-   - **RULE**: Don't suggest error handling for core tool failures (Read, Task, Edit, Write, etc.) or system-level file operations - these indicate environmental issues beyond command scope
+   - **RULE**: Don't suggest error handling for core tool failures (Read, Task, Edit, Write, etc.), system-level file operations, or timeout specifications - these indicate environmental issues beyond command scope. Users will specify timeout requirements when actually needed.
+7. **Trust User Environment**: Never suggest prerequisite validation for specified tools/scripts
+   - **PROBLEMATIC**: "Check if required scripts exist before using them"
+   - **PROBLEMATIC**: "Validate Python/tool availability before execution"
+   - **PROBLEMATIC**: "Test BRP connectivity before starting operations"
+   - **PROBLEMATIC**: "Verify directory permissions before writing"
+   - **CORRECT**: "Use the script at .claude/scripts/example.sh directly"
+   - **RULE**: If the user specifies a tool, script, or path in the command, it exists and works. The user has ensured this. Never suggest checking availability or adding fallbacks.
+   - **ENFORCEMENT**: Commands must use specified tools exactly as documented without modification or validation checks
 </CommandClarityPrinciples>
 
 <TaggedSectionRequirements>
