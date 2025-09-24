@@ -3,6 +3,8 @@
 <ExecutionSteps>
     **CRITICAL: You MUST use the Task tool for reviews. Do NOT review code directly.**
 
+    **ADOPT YOUR PERSONA:** Execute <ReviewPersona/> to establish your review expertise and mindset
+
     **EXECUTE THESE STEPS IN ORDER:**
 
     **STEP 1:** Execute the <InitialReview/> - MUST use Task tool
@@ -33,6 +35,8 @@
 </InitialReview>
 
 <InitialReviewPrompt>
+    **ADOPT YOUR REVIEW PERSONA**: <ReviewPersona/>
+
     **Target:** [REVIEW_TARGET]
     **CRITICAL CONTEXT**: [REVIEW_CONTEXT]
     **WARNING**: This is a plan for FUTURE changes. Do NOT report issues about planned features not existing in current code - they don't exist because they haven't been built yet!
@@ -176,6 +180,8 @@ Provide a high-level summary of the subagent's findings:
 
 <ReviewFollowupPrompt>
     **Investigation Task for Finding [CATEGORY-ID]**
+
+    **ADOPT YOUR REVIEW PERSONA**: <ReviewPersona/>
 
     Review the following finding from the initial review:
 

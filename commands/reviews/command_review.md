@@ -7,6 +7,22 @@
 
 <ExecutionSteps/>
 
+<ReviewPersona>
+You are an expert in AI agent command design and instruction clarity with deep experience in:
+- Creating unambiguous, reliable command structures for LLM agents
+- Identifying workflow gaps and edge cases in procedural instructions
+- Optimizing command maintainability and reusability patterns
+- Ensuring perfect clarity in agent-to-user interaction flows
+
+Your expertise allows you to:
+- Instantly recognize anti-patterns in command organization
+- Spot missing error handling and user control points
+- Identify opportunities for tagged section extraction
+- Detect verbosity and redundancy that impacts agent performance
+
+Review with the meticulous attention of someone who has debugged hundreds of failed agent executions due to unclear instructions.
+</ReviewPersona>
+
 <InitialReviewOutput>
 Step 1: Initial Command Review
 
@@ -49,6 +65,7 @@ Use [REVIEW_CONTEXT]: We are reviewing a COMMAND FILE for structural improvement
     - <InteractiveCommandPatterns/>
     - <PatternConsistencyCheck/>
     - <CommandVerbosityCheck/>
+    - <TemplateVariableStandards/>
 </ReviewConstraints>
 
 <StructuralAssessment>
@@ -127,11 +144,13 @@ Commands must use tagged sections effectively for clarity and maintainability:
 
 <ExecutionStepsPatterns>
 Multi-step commands MUST use the standardized ExecutionSteps format for consistency:
-1. **Detection**: Look for commands with sequential operations, multi-phase workflows, or step-by-step procedures
-   - **INDICATORS**: Words like "step", "phase", "then", "next", "first", "finally"
-   - **PATTERNS**: Multiple tagged sections that build on each other
+1. **Detection Threshold**: Commands with 3+ sequential operations requiring execution
+   - **EXEMPT**: Simple 2-step commands (e.g., acknowledge-and-stop patterns)
+   - **EXEMPT**: Commands with single purpose that explicitly state "ONE purpose" or similar
+   - **INDICATORS**: Words like "step", "phase", "then", "next", "first", "finally" (3+ occurrences)
+   - **PATTERNS**: Multiple tagged sections that build on each other sequentially
    - **EXAMPLES**: Data processing pipelines, review workflows, setup procedures
-2. **Required Format** (when steps are detected):
+2. **Required Format** (when 3+ steps detected):
    ```markdown
    <ExecutionSteps>
        **EXECUTE THESE STEPS IN ORDER:**
@@ -146,8 +165,11 @@ Multi-step commands MUST use the standardized ExecutionSteps format for consiste
    - Must include "**EXECUTE THESE STEPS IN ORDER:**" header
    - Must use `**STEP N:** Execute <TaggedSection/>` format
    - Each step must reference a specific tagged section
-4. **When This Applies**: Any command that has 3+ sequential operations or phases
-5. **Action**: If multi-step workflow detected, ensure it follows this exact format or recommend conversion
+4. **When This Does NOT Apply**:
+   - Commands with only 1-2 steps
+   - Simple acknowledgment or status commands
+   - Commands that explicitly state minimal/single purpose
+5. **Action**: If 3+ step workflow detected, ensure it follows this exact format or recommend conversion
 </ExecutionStepsPatterns>
 
 <ExecuteOnlyPatterns>
@@ -244,6 +266,38 @@ Commands should be concise and avoid repetitive instructions to the agent:
    - **PROBLEMATIC**: "This section defines how you should handle errors, which is important for..."
    - **CORRECT**: Just provide the error handling instructions directly
 </CommandVerbosityCheck>
+
+<TemplateVariableStandards>
+**THIS IS THE STANDARD FOR ALL COMMANDS**: If a command uses the ${VARIABLE_NAME} pattern below, it is correct - report NO findings. If a command uses ANY other template variable approach, report a STRUCTURE finding to migrate to this standard.
+
+Command files use template variables for maintainability and clarity. These are documentation placeholders, NOT shell variables:
+
+1. **Declaration**: `SCREAMING_SNAKE_CASE = value` at top of file/section
+   - **CORRECT**: `MAX_RETRIES = 3`, `BASE_PORT = 30001`
+
+2. **Reference**: Always use `${VARIABLE_NAME}` syntax
+   - **CORRECT**: `Port range: ${BASE_PORT} to ${MAX_PORT}`
+   - **INCORRECT**: `$BASE_PORT`, `{BASE_PORT}`, `[BASE_PORT]`
+
+3. **Computed Values**: Show relationships with `${expression}`
+   - **CORRECT**: `MAX_PORT = ${BASE_PORT + MAX_SUBAGENTS - 1}`
+   - **PURPOSE**: Self-documenting mathematical relationships
+
+4. **Critical Rules**:
+   - **NEVER** flag ${} syntax as shell execution confusion - these are template placeholders
+   - **NEVER** suggest replacing ${VARIABLE} with hardcoded values
+   - **ALWAYS** recognize this as a documentation/templating system for AI agents
+   - **WHY**: Makes relationships explicit, improves maintainability, helps AI agents understand value dependencies
+
+5. **Example**:
+   ```markdown
+   MAX_SUBAGENTS = 10
+   BASE_PORT = 30001
+   MAX_PORT = ${BASE_PORT + MAX_SUBAGENTS - 1}
+
+   Launch subagents on ports ${BASE_PORT} through ${MAX_PORT}
+   ```
+</TemplateVariableStandards>
 
 <ReviewKeywords>
     **For ENHANCE verdicts:**
