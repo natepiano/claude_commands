@@ -158,24 +158,25 @@ Provide a high-level summary of the subagent's findings:
 ## STEP 2: INVESTIGATION
 
 <ReviewFollowup>
-    **CRITICAL**: You MUST send a single message containing ALL Task tool calls.
+    **CRITICAL PARALLEL EXECUTION REQUIREMENT**:
+    You MUST send ALL [N] Task tool calls in a SINGLE message with MULTIPLE antml:invoke blocks.
 
-    **EXECUTION**:
-    1. Count findings: [N] findings found
-    2. Send ONE message with [N] Task tool calls in this exact format:
+    **VIOLATION EXAMPLES**:
+    - ❌ Sending one Task, waiting for completion, then sending another
+    - ❌ Using multiple messages to send Tasks
+    - ❌ Starting with "I'll investigate finding 1" instead of "I'll investigate all [N] findings"
 
-    ```
-    I'll investigate all [N] findings in parallel:
+    **CORRECT EXECUTION**:
+    1. Count ALL findings first: "[N] findings to investigate"
+    2. Send ONE message containing:
+       - Statement: "I'll investigate all [N] findings in parallel:"
+       - Single antml:function_calls block
+       - [N] antml:invoke name="Task" elements (ALL in the same block)
+       - Each with: description="Investigate FINDING-X: Title (X of N)"
+    3. Wait for ALL [N] subagents to complete simultaneously
+    4. Only then parse and process results
 
-    [Use antml:function_calls block with multiple antml:invoke name="Task" calls]
-    [Each invoke gets: description="Investigate FINDING-X: Title (X of N)", subagent_type="general-purpose", prompt="ReviewFollowupPrompt with finding details"]
-    [Continue for ALL findings in the SAME message]
-    ```
-
-    3. Wait for ALL subagents to complete, then parse results
-
-    **VIOLATION**: Sending fewer than [N] Task calls means you failed this step.
-    **CRITICAL ENFORCEMENT**: If you send only ONE Task call instead of [N] parallel calls, you are violating the parallel execution requirement. You MUST send ALL [N] Task calls in a SINGLE message using multiple antml:invoke blocks.
+    **ENFORCEMENT**: If you send even ONE Task alone, you have FAILED. All [N] Tasks MUST launch together.
 </ReviewFollowup>
 
 <ReviewFollowupPrompt>
