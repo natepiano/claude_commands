@@ -22,9 +22,10 @@ UPGRADE_SUFFIX = -upgraded.md
     **EXECUTE THESE STEPS IN ORDER:**
 
     **STEP 1:** Execute <AnalyzeAndSequence/>
-    **STEP 2:** Execute <ReviewAndConfirm/>
-    **STEP 3:** Execute <GenerateCollaborativePlan/>
-    **STEP 4:** Execute <ValidateCompleteness/>
+    **STEP 2:** Execute <ImplementationGapAnalysis/>
+    **STEP 3:** Execute <ReviewAndConfirm/>
+    **STEP 4:** Execute <GenerateCollaborativePlan/>
+    **STEP 5:** Execute <ValidateCompleteness/>
 </ExecutionSteps>
 
 ## STEP 1: ANALYZE AND SEQUENCE
@@ -106,7 +107,62 @@ UPGRADE_SUFFIX = -upgraded.md
     Proceed to Step 2.
 </AnalyzeAndSequence>
 
-## STEP 2: REVIEW AND CONFIRM
+## STEP 2: IMPLEMENTATION GAP ANALYSIS
+
+<ImplementationGapAnalysis>
+    Use TodoWrite tool to track: analyzing completeness, comparing code, identifying gaps, user review.
+
+    Display: "🔍 Thinking harder about implementation completeness..."
+
+    Use Task tool:
+    - description: "Deep implementation gap analysis"
+    - subagent_type: "general-purpose"
+    - prompt: <GapAnalysisPrompt/>
+
+    Parse response. If no gaps found:
+        Display: "✅ Plan Completeness Check: PASSED"
+        Proceed to Step 3.
+
+    If gaps found, display summary and for each gap show:
+        - Type, severity, file affected
+        - What plan says vs what's missing
+        - Relevant current code
+
+    ## Available Actions
+    - **fix** - Stop and fix the plan first
+    - **ignore** - Continue despite gaps
+    - **abort** - Cancel upgrade
+
+    Please select one of the keywords above.
+    STOP.
+
+    If "fix": Show priority gaps to address, exit.
+    If "ignore": Warn and proceed to Step 3.
+    If "abort": Exit.
+</ImplementationGapAnalysis>
+
+<GapAnalysisPrompt>
+Think harder about whether this implementation plan is actually complete.
+Read actual current code for each file to be modified.
+
+Check for:
+1. Vague changes without concrete implementation ("refactor X" without HOW)
+2. Missing function signatures, error handling, edge cases
+3. Dependencies/integrations the plan doesn't mention
+4. Code that will break but isn't updated
+
+For each gap, provide: gap_type, file, current_code, plan_proposal, what's_missing, severity (CRITICAL/HIGH/MEDIUM/LOW)
+
+Return JSON:
+{
+  "gaps_found": boolean,
+  "gap_count": number,
+  "gaps": [...],
+  "summary": "assessment"
+}
+</GapAnalysisPrompt>
+
+## STEP 3: REVIEW AND CONFIRM
 
 <ReviewAndConfirm>
     Use TodoWrite tool to create tracking:
@@ -179,7 +235,7 @@ UPGRADE_SUFFIX = -upgraded.md
     Handle user response:
     If response is "approve":
         Mark "Process user feedback" as completed.
-        Proceed to Step 3
+        Proceed to Step 4
 
     If response is "adjust":
         Ask: "What needs to be changed in the sequence?"
@@ -200,7 +256,7 @@ UPGRADE_SUFFIX = -upgraded.md
         ]
 </ReviewAndConfirm>
 
-## STEP 3: GENERATE COLLABORATIVE PLAN
+## STEP 4: GENERATE COLLABORATIVE PLAN
 
 <GenerateCollaborativePlan>
     Build the complete collaborative plan as an executable document:
@@ -298,11 +354,11 @@ UPGRADE_SUFFIX = -upgraded.md
     Upgraded: [new-filename] (created)
     ```
 
-    Store new-filename in UPGRADED_FILE variable for Step 4.
-    Proceed to Step 4.
+    Store new-filename in UPGRADED_FILE variable for Step 5.
+    Proceed to Step 5.
 </GenerateCollaborativePlan>
 
-## STEP 4: VALIDATE COMPLETENESS
+## STEP 5: VALIDATE COMPLETENESS
 
 <ValidateCompleteness>
     Use the Task tool with general-purpose subagent to perform comprehensive validation:

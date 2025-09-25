@@ -58,6 +58,7 @@ Conduct an interactive review of issues or topics by organizing them into a todo
        - **Reviewing item [current_number] of [total_items]**
        - **Item**: [todo content]
        - **Context**: [relevant background or details]
+       - **Action Type**: [If actionable: describe action | If discussion: "Discussion only"]
        - **Discussion Points**: [key aspects to consider]
     3. Facilitate discussion:
        - Present relevant information
@@ -66,23 +67,22 @@ Conduct an interactive review of issues or topics by organizing them into a todo
     4. Present action options:
 
        ## Available Actions
-       - **apply** - Take the recommended action on this item
-       - **skip** - Skip this item and continue to next
-       - **modify** - Propose a different action for this item
+       - **continue** - Proceed with this item (take action if applicable)
+       - **skip** - Skip without discussion/action
+       - **discuss** - Further discuss this item before deciding
        - **stop** - Exit the review process
 
        Please select one of the keywords above.
     5. Wait for user keyword response
     6. Execute based on keyword:
-       - If **apply**: Take the agreed action and update todo with notes
-       - If **skip**: Mark as skipped and continue
-       - If **modify**: Ask for user's alternative action, then execute
+       - If **continue**: Execute any applicable action, mark completed, proceed to next
+       - If **skip**: Mark as skipped, proceed to next
+       - If **discuss**: Continue discussion until user provides continue/skip/stop
        - If **stop**: Exit review process
-    7. Update todo to "completed" with action taken
-    8. If not stopping, ask: "Ready to proceed to the next item? Type 'continue' to proceed."
-    9. Wait for explicit "continue" before moving to next item
+    7. Update todo to "completed" with outcome noted
+    8. Automatically proceed to next item (no second prompt needed)
 
-    **CRITICAL**: Never proceed to next item without user approval
+    **CRITICAL**: Each item requires explicit user decision via keyword
 </InteractiveReview>
 
 ## STEP 4: COMPLETION
