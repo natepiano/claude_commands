@@ -40,8 +40,21 @@ After user responds, proceed to next step.
 - run `git status` to ensure you're within a git repository that has uncommitted changes
 - create a full commit message using the established commit title
 - stage the changes with `git add`
-- STOP - do not run `git commit`
 - Show the user the staged changes and proposed commit message
+- Execute <FinalCommitDecision/>
 </CommitPrep>
 
-**CRITICAL** Never run `git commit` - only prepare and show the commit message to the user
+<FinalCommitDecision>
+Present to user:
+
+## Available Actions
+- **commit** - Execute the git commit with the prepared message
+- **abandon** - Unstage all changes and stop without committing
+
+Wait for user response.
+
+If user selects **commit**: Run `git commit` with the prepared message and confirm success
+If user selects **abandon**: Run `git reset` to unstage changes and stop
+
+After user responds, execute their choice.
+</FinalCommitDecision>
