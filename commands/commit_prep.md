@@ -25,13 +25,13 @@ If no $ARGUMENTS provided:
 Present to user:
 
 ## Available Actions
-- **confirm** - Use the suggested commit title
+- **use** - Use the suggested commit title
 - **change** - Provide a different commit title
 
 Wait for user response.
 
 If user selects **change**: Ask for new title and use their provided title.
-If user selects **confirm**: Use the suggested title.
+If user selects **use**: Use the suggested title.
 
 After user responds, proceed to next step.
 </UserTitleConfirmation>
