@@ -85,7 +85,7 @@ Before reviewing, determine the command's current structural state:
 Follow these command clarity principles as highest priority:
 1. **Execution Steps**: Every step must be actionable and unambiguous
    - **PROBLEMATIC**: "Review the file and make appropriate changes"
-   - **CORRECT**: "Use Read tool to read [FILE], identify X patterns, then use Edit tool to change Y"
+   - **CORRECT**: "Use Read tool to read ${FILE}, identify X patterns, then use Edit tool to change Y"
 2. **Decision Points**: Clear keywords and user control points
    - **PROBLEMATIC**: "Handle the user's response appropriately"
    - **CORRECT**: "If user types 'continue', proceed to step 3. If user types 'stop', exit"
@@ -134,8 +134,8 @@ Commands must use tagged sections effectively for clarity and maintainability:
    - **CORRECT**: <ExtractMethodSignatures/>, <BuildTypeMap/>, <GenerateOutput/>
    - **TEST**: Tag name should make sense without reading the contents
 5. **Placeholder Discipline**: Use consistent placeholders for variable content
-   - **PROBLEMATIC**: Mixing [FILE], {FILE}, $FILE, or hardcoding paths
-   - **CORRECT**: Pick one style ([PLACEHOLDER]) and use consistently
+   - **PROBLEMATIC**: Mixing ${FILE}, {FILE}, $FILE, or hardcoding paths
+   - **CORRECT**: Pick one style (${PLACEHOLDER}) and use consistently
    - **SCOPE**: Define placeholder meaning at first use
 6. **Section Granularity**: Balance between too many tiny sections and too few large ones
    - **TOO GRANULAR**: <OpenFile/>, <ReadLine/>, <ClosFile/>
@@ -212,11 +212,11 @@ Commands with user decision points MUST follow these patterns:
    - **LANGUAGE**: "Please select one of the keywords above" (then actually STOP)
    - **VIOLATION**: Proceeding without user input or assuming defaults
 4. **State Communication**: User always knows their position
-   - **MULTI-ITEM**: "Finding 3 of 7: [description]"
+   - **MULTI-ITEM**: "Finding 3 of 7: ${description}"
    - **CHECKPOINTS**: "Completed section X. Type 'continue' to proceed to section Y"
    - **CONTEXT**: Before keywords, remind user what they're deciding about
 5. **Response Validation**: Handle unexpected input gracefully
-   - **UNEXPECTED INPUT**: "Unrecognized response '[input]'. Please select from:"
+   - **UNEXPECTED INPUT**: "Unrecognized response '${input}'. Please select from:"
    - **RE-PRESENT**: Show keyword menu again, don't guess intent
    - **LOOP**: Stay at decision point until valid keyword received
 6. **Decision Tracking**: Maintain record of user choices
@@ -242,7 +242,7 @@ Ensure the command follows consistent patterns internally and adheres to establi
    - **THRESHOLD**: 2+ similar operations = extract to tagged section and reference
 4. **Style Consistency**: Uniform presentation within the command
    - **HEADERS**: Don't mix # and ## for same hierarchy level
-   - **PLACEHOLDERS**: Use [FILE] throughout, not [FILE] then {file} then $FILE
+   - **PLACEHOLDERS**: Use ${FILE} throughout, not ${FILE} then {file} then $FILE
    - **KEYWORDS**: Bold them all consistently per <InteractiveCommandPatterns/> format
 </PatternConsistencyCheck>
 
@@ -250,7 +250,7 @@ Ensure the command follows consistent patterns internally and adheres to establi
 Commands should be concise and avoid repetitive instructions to the agent:
 1. **Eliminate Redundant Explanations**: Don't over-explain obvious actions
    - **PROBLEMATIC**: "Use the Read tool to read the file. This will open the file and return its contents so you can see what's inside."
-   - **CORRECT**: "Use Read tool to read [FILE]"
+   - **CORRECT**: "Use Read tool to read ${FILE}"
    - **RULE**: If the tool description is clear, don't re-explain what it does
 2. **Avoid Repetitive Reminders**: Don't repeat the same instruction multiple times
    - **PROBLEMATIC**: "Wait for user response" said in steps 3, 7, 12, and 15
@@ -258,11 +258,11 @@ Commands should be concise and avoid repetitive instructions to the agent:
    - **THRESHOLD**: Same instruction 2+ times = extract to tagged section
 3. **Cut Unnecessary Context**: Focus on actionable instructions
    - **PROBLEMATIC**: "Files are important because they contain information that we need to process in order to..."
-   - **CORRECT**: "Process each file in [DIRECTORY]"
+   - **CORRECT**: "Process each file in ${DIRECTORY}"
    - **RULE**: Skip the "why" unless it affects the "how"
 4. **Streamline Decision Logic**: Use clear conditionals without over-explanation
    - **PROBLEMATIC**: "If the user provides arguments, which means they gave you something when they called the command, then you should..."
-   - **CORRECT**: "If $ARGUMENTS provided: [action]. If $ARGUMENTS empty: [alternative action]"
+   - **CORRECT**: "If $ARGUMENTS provided: ${action}. If $ARGUMENTS empty: ${alternative_action}"
 5. **Remove Meta-Commentary**: Don't explain the command structure to the agent
    - **PROBLEMATIC**: "This section defines how you should handle errors, which is important for..."
    - **CORRECT**: Just provide the error handling instructions directly
@@ -278,7 +278,7 @@ Command files use template variables for maintainability and clarity. These are 
 
 2. **Reference**: Always use `${VARIABLE_NAME}` syntax
    - **CORRECT**: `Port range: ${BASE_PORT} to ${MAX_PORT}`
-   - **INCORRECT**: `$BASE_PORT`, `{BASE_PORT}`, `[BASE_PORT]`
+   - **INCORRECT**: `$BASE_PORT`, `{BASE_PORT}`, `${BASE_PORT}` (wrong - use declaration at top)
 
 3. **Computed Values**: Show relationships with `${expression}`
    - **CORRECT**: `MAX_PORT = ${BASE_PORT + MAX_SUBAGENTS - 1}`

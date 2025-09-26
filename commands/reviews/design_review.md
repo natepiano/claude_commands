@@ -50,6 +50,23 @@ Set [REVIEW_CONTEXT] to: We are reviewing a FUTURE PLAN that has NOT been implem
 - **SIMPLIFICATION**: Over-engineering in plan - unnecessarily complex approaches that could be simplified
 </ReviewCategories>
 
+<NamedFindings>
+Registry of named findings that bypass investigation due to self-evident violations:
+
+- **line_number_violation**: Line number references in design documents
+  - Auto-verdict: CONFIRMED
+  - Output template: LineNumberViolationOutput
+  - Detection: Any reference like "line 123", "lines 45-67", etc. in plan text
+</NamedFindings>
+
+<NamedFindingDetection>
+**CRITICAL**: When detecting violations that match patterns in <NamedFindings/>, you MUST:
+1. Include the standard finding fields as usual
+2. ADD a "named_finding" field to your JSON with the appropriate value
+3. For line number violations per <LineNumberProhibition/>, set: "named_finding": "line_number_violation"
+4. Named findings will skip investigation as the violation is self-evident
+</NamedFindingDetection>
+
 ## REVIEW CONSTRAINTS
 
 <ReviewConstraints>
@@ -276,3 +293,40 @@ Design documents must NEVER contain line number references because they become s
     - **redundant**: Use Edit tool to add to "Design Review Skip Notes" section using <RedundantTemplate/> format from review_commands.md (only for CONFIRMED/MODIFIED verdicts)
     - **investigate**: Ask user "What specific aspect would you like me to investigate?", then launch Task tool with their focus
 </KeywordExecution>
+
+<NamedFindingOutputTemplates>
+Specialized output templates for named findings that bypass investigation:
+
+<LineNumberViolationOutput>
+# **${id}**: Line Number References in Design Document (${current_number} of ${total_findings})
+
+## Self-Evident Violation
+This finding requires no investigation - line number references become stale immediately as code evolves.
+
+**Location**: ${location.plan_reference}
+
+## Current Issue
+```
+${current_code}
+```
+
+## Required Fix
+Replace all line number references with structural/semantic references:
+
+**Instead of line numbers, use:**
+- **Section references**: "Add to Section: Type Definitions"
+- **Structural landmarks**: "After the VariantSignature Display implementation"
+- **Function scope**: "Add to the validate_input() function"
+- **Code patterns**: "Insert after the MutationStatus enum definition"
+- **Relative positioning**: "Before the MutationPathInternal struct"
+
+## Suggested Replacement
+```
+${suggested_code}
+```
+
+**Note**: This is a CONFIRMED finding - line numbers in design documents are always incorrect.
+
+## **Verdict**: CONFIRMED
+</LineNumberViolationOutput>
+</NamedFindingOutputTemplates>

@@ -43,6 +43,8 @@
     **Review Constraints**: Follow these analysis principles:
     <ReviewConstraints/>
 
+    **NAMED FINDING DETECTION** (if applicable): <NamedFindingDetection/>
+
     Review [REVIEW_TARGET] using the categories defined above and provide structured findings.
     It is important that you think very hard about this review task.
 
@@ -145,31 +147,41 @@ GOOD Example - IMPLEMENTATION-GAP finding:
 Provide a high-level summary of the subagent's findings:
 
 # Review Summary
-## Total findings: [number]
-- Categories found: [list categories with counts, e.g., TYPE-SYSTEM (3), QUALITY (2)]
+## Total findings: ${number}
+- Categories found: ${list_categories_with_counts}
+[If any named findings exist: - Named findings (skip investigation): ${count}]
 
 ## Key themes:
 [2-3 bullet points about main issues identified]
 
 **Next we will proceed with a deep review followup on each finding**
+[If named findings exist: **Note: ${count} named finding(s) will skip investigation as they are self-evident violations**]
 
 </InitialReviewSummary>
 
 ## STEP 2: INVESTIGATION
 
 <ReviewFollowup>
+    **NAMED FINDING FILTERING**:
+    Before launching investigations, separate named findings from regular findings:
+    1. Identify findings with "named_finding" field - these skip investigation
+    2. Named findings already have a verdict (check calling command's <NamedFindings/>)
+    3. Only investigate findings WITHOUT "named_finding" field
+    4. If all findings are named findings: Skip to Step 3 (User Review)
+
     **CRITICAL PARALLEL EXECUTION REQUIREMENT**:
-    You MUST send ALL [N] Task tool calls in a SINGLE message with MULTIPLE antml:invoke blocks.
+    You MUST send ALL [N] Task tool calls for NON-NAMED findings in a SINGLE message with MULTIPLE antml:invoke blocks.
 
     **VIOLATION EXAMPLES**:
     - ❌ Sending one Task, waiting for completion, then sending another
     - ❌ Using multiple messages to send Tasks
     - ❌ Starting with "I'll investigate finding 1" instead of "I'll investigate all [N] findings"
+    - ❌ Investigating findings that have "named_finding" field
 
     **CORRECT EXECUTION**:
-    1. Count ALL findings first: "[N] findings to investigate"
+    1. Count findings to investigate: "[N] findings need investigation, [M] are named findings"
     2. Send ONE message containing:
-       - Statement: "I'll investigate all [N] findings in parallel:"
+       - Statement: "I'll investigate all [N] non-named findings in parallel:"
        - Single antml:function_calls block
        - [N] antml:invoke name="Task" elements (ALL in the same block)
        - Each with: description="Investigate FINDING-X: Title (X of N)"
@@ -271,18 +283,18 @@ Present the investigation findings to the user using this format
 (derived from the ReviewFollowupJson data).
 **Note**: Use appropriate language identifier in code blocks (rust, python, javascript, etc.):
 
-# **[id]**: [title] ([current_number] of [total_findings])
-**Issue**: [issue]
-[if location.function exists: **Function**: [location.function]]
-[if location.plan_reference exists: **Plan Reference**: [location.plan_reference]]
+# **${id}**: ${title} (${current_number} of ${total_findings})
+**Issue**: ${issue}
+[if location.function exists: **Function**: ${location.function}]
+[if location.plan_reference exists: **Plan Reference**: ${location.plan_reference}]
 
 ### What the finding is saying:
 [Clear, concise summary of what problem or improvement the finding identified]
 
 ## Current Code
-**Location**: [relative path from location.code_file]:[location.line_start]
+**Location**: ${location.code_file}:${location.line_start}
 ```rust
-[current_code - ONLY the actual code from the real file, not the plan's proposal]
+${current_code}
 ```
 
 ### Commentary on current code:
@@ -293,7 +305,7 @@ Present the investigation findings to the user using this format
 
 ## Suggested Code Change
 ```rust
-[suggested_code - ONLY the actual code, no markdown headers or explanations - only include if verdict recommends action]
+${suggested_code}
 ```
 
 ## Reviewer's Assessment
@@ -325,8 +337,29 @@ Present the investigation findings to the user using this format
 ### Recommendation: Keep as-is
 The current approach is correct. No changes needed.
 
-## **Verdict**: [verdict]
+## **Verdict**: ${verdict}
 </UserOutput>
+
+<NamedFindingOutput>
+    **For Named Findings (findings with "named_finding" field)**:
+
+    1. **Lookup Template**: Find the output template in calling command's <NamedFindingOutputTemplates/>
+       - Match ${finding.named_finding} to the template name
+       - Example: "line_number_violation" → <LineNumberViolationOutput/>
+
+    2. **Use Specialized Template**: Present using the named finding template
+       - Replace placeholders with finding data
+       - Template already includes verdict (no investigation needed)
+       - Skip investigation Task for this finding
+
+    3. **Fallback**: If template not found, use standard <UserOutput/> format
+       - Use the auto-verdict from calling command's <NamedFindings/>
+       - Add note: "Named finding - investigation skipped"
+
+    4. **Keywords**: Still present appropriate keywords based on the auto-verdict
+       - Named findings typically have CONFIRMED verdict
+       - User can still choose to skip, investigate, etc.
+</NamedFindingOutput>
 
 <UserReview>
     **Present Findings to User for Interactive Review**
@@ -334,30 +367,37 @@ The current approach is correct. No changes needed.
     **FIRST**: Create a TodoWrite list to track the review process:
     - Use TodoWrite tool to create todos for each finding
     - Simply describe the todo content and status - don't encode the JSON format
-    - Example: "Create todos for: 'Review [id]: [title]' with status pending for each finding"
+    - Example: "Create todos for: 'Review ${id}: ${title}' with status pending for each finding"
     - Mark each as "in_progress" when presenting it
     - Mark as "completed" after user responds with a keyword
 
     **TRACK DECISIONS**: Maintain a list of all decisions made and what changes they caused.
 
-    For each investigated finding (in order, starting with TYPE-SYSTEM):
+    For each finding (in order, starting with TYPE-SYSTEM):
 
     1. Update TodoWrite to mark current finding as "in_progress"
     2. **MANDATORY**: Apply <PriorDecisionReconciliation/> before presenting any finding
-    3. Present the finding using the format from <UserOutput/> (from the investigation results)
-       - Include the (n of m) counter in the title
+    3. **Check for Named Finding**:
+       - If finding has "named_finding" field:
+         a. Note: "Named finding detected: ${finding.named_finding} - using specialized output"
+         b. Use template from <NamedFindingOutputTemplates/> in calling command
+         c. Set verdict from calling command's <NamedFindings/> registry
+         d. Skip to step 4 (no investigation results to use)
+       - Otherwise: Present using format from <UserOutput/> (from investigation results)
+    4. Include the (n of m) counter in the title
        - Add any relevant notes about how prior decisions affect this finding
-    4. Display available keywords using <FormatKeywords verdict="[VERDICT]"/> based on the verdict
-       - **CRITICAL**: If returning from an investigation, use the UPDATED verdict from the investigation result, NOT the original verdict
-    5. STOP and wait for user's response
-    6. **CRITICAL USER RESPONSE HANDLING**:
+    5. Display available keywords using <FormatKeywords verdict="[VERDICT]"/> based on the verdict
+       - **CRITICAL**: For named findings, use auto-verdict from <NamedFindings/>
+       - **CRITICAL**: For investigated findings, use UPDATED verdict from investigation result
+    6. STOP and wait for user's response
+    7. **CRITICAL USER RESPONSE HANDLING**:
        - **IF USER PROVIDES A KEYWORD**: Execute the action from your command file's <KeywordExecution/> section
        - **IF USER PROVIDES ANY OTHER RESPONSE** (discussion, alternative proposal, question, clarification):
          a. Engage with the user's input appropriately
          b. If discussion leads to agreement/resolution, summarize the agreed approach
          c. **CRITICAL**: If you take any action that modifies the plan (via Edit/Write tools):
             - Mark the current todo as "completed"
-            - Ask "Edit complete. Type 'continue' to proceed to the next finding. ([current_number] of [total_findings])"
+            - Ask "Edit complete. Type 'continue' to proceed to the next finding. (${current_number} of ${total_findings})"
             - Wait for user confirmation before proceeding
             - Skip steps d-f below and continue from step 8
          d. **MANDATORY**: Present keywords using <FormatKeywords verdict="[CURRENT_VERDICT]"/>
@@ -371,15 +411,15 @@ The current approach is correct. No changes needed.
          d. Present keywords appropriate for the NEW verdict (not the original verdict)
          e. Wait for user's new keyword response before proceeding
          f. Do NOT mark the todo as completed until user provides a keyword for the updated finding
-    7. After keyword execution:
+    8. After keyword execution:
        - **FOR ALL EDIT ACTIONS** (agree, skip, skip with prejudice, accept as built, redundant):
          a. After executing the Edit tool to modify the plan
          b. STOP and ask:
-            - If not the last finding: "Edit complete for [current_finding_id]. Type 'continue' to proceed to [next_finding_id] ([next_number] of [total_findings])"
-            - If this is the last finding: "Edit complete for [current_finding_id]. Type 'continue' to complete the review - this was the final finding"
+            - If not the last finding: "Edit complete for ${current_finding_id}. Type 'continue' to proceed to ${next_finding_id} (${next_number} of ${total_findings})"
+            - If this is the last finding: "Edit complete for ${current_finding_id}. Type 'continue' to complete the review - this was the final finding"
          c. Wait for user confirmation before proceeding
-    8. Update TodoWrite to mark current finding as "completed" ONLY after user confirms continuation
-    9. **USER CONTROL REQUIREMENTS**:
+    9. Update TodoWrite to mark current finding as "completed" ONLY after user confirms continuation
+    10. **USER CONTROL REQUIREMENTS**:
        - Wait for explicit user keyword input for all decisions
        - If user engages in discussion, always return to keyword selection
        - Stop after plan edits and wait for "continue" confirmation
@@ -394,18 +434,18 @@ The current approach is correct. No changes needed.
     **Standard base format for all review finding updates:**
 
     ```
-    ## [finding.id]: [finding.title] - **Verdict**: [finding.verdict] [additional_status_suffix]
-    - **Status**: [ACTION_STATUS]
-    - **Location**: [finding.location.plan_reference]
-    - **Issue**: [finding.issue]
-    - **Reasoning**: [finding.reasoning]
-    [action_specific_sections]
+    ## ${finding.id}: ${finding.title} - **Verdict**: ${finding.verdict} ${additional_status_suffix}
+    - **Status**: ${ACTION_STATUS}
+    - **Location**: ${finding.location.plan_reference}
+    - **Issue**: ${finding.issue}
+    - **Reasoning**: ${finding.reasoning}
+    ${action_specific_sections}
     ```
 
     Where:
-    - [additional_status_suffix]: Optional suffix like "✅", "- REDUNDANT", "- DEVIATION ACCEPTED"
-    - [ACTION_STATUS]: "SKIPPED", "APPROVED - To be implemented", "PERMANENTLY REJECTED", etc.
-    - [action_specific_sections]: Additional sections based on the specific action
+    - ${additional_status_suffix}: Optional suffix like "✅", "- REDUNDANT", "- DEVIATION ACCEPTED"
+    - ${ACTION_STATUS}: "SKIPPED", "APPROVED - To be implemented", "PERMANENTLY REJECTED", etc.
+    - ${action_specific_sections}: Additional sections based on the specific action
 </ReviewFindingBaseTemplate>
 
 <PlanUpdateFormat>
@@ -421,36 +461,36 @@ The current approach is correct. No changes needed.
 
 <SkipTemplate>
 Use <ReviewFindingBaseTemplate/> with:
-- [additional_status_suffix]: (none)
-- [ACTION_STATUS]: "SKIPPED"
-- [action_specific_sections]: "- **Decision**: User elected to skip this recommendation"
+- ${additional_status_suffix}: (none)
+- ${ACTION_STATUS}: "SKIPPED"
+- ${action_specific_sections}: "- **Decision**: User elected to skip this recommendation"
 </SkipTemplate>
 
 <SkipWithPrejudiceTemplate>
 Use <ReviewFindingBaseTemplate/> with:
-- [additional_status_suffix]: (none, but prefix with "⚠️ PREJUDICE WARNING - " before finding.id)
-- [ACTION_STATUS]: "PERMANENTLY REJECTED"
-- [action_specific_sections]: "- **Critical Note**: DO NOT SUGGEST THIS AGAIN - Permanently rejected by user"
+- ${additional_status_suffix}: (none, but prefix with "⚠️ PREJUDICE WARNING - " before finding.id)
+- ${ACTION_STATUS}: "PERMANENTLY REJECTED"
+- ${action_specific_sections}: "- **Critical Note**: DO NOT SUGGEST THIS AGAIN - Permanently rejected by user"
 </SkipWithPrejudiceTemplate>
 
 <RedundantTemplate>
 Use <ReviewFindingBaseTemplate/> with:
-- [additional_status_suffix]: "- REDUNDANT"
-- [ACTION_STATUS]: "REDUNDANT - Already addressed in plan"
-- [action_specific_sections]:
-  "- **Existing Implementation**: [Quote the relevant section from the plan that already addresses this]
-  - **Plan Section**: [Section title where this is already covered]
+- ${additional_status_suffix}: "- REDUNDANT"
+- ${ACTION_STATUS}: "REDUNDANT - Already addressed in plan"
+- ${action_specific_sections}:
+  "- **Existing Implementation**: ${quote_relevant_section}
+  - **Plan Section**: ${section_title}
   - **Critical Note**: This functionality/design already exists in the plan - future reviewers should check for existing coverage before suggesting"
 </RedundantTemplate>
 
 
 <AcceptAsBuiltTemplate>
 Use <ReviewFindingBaseTemplate/> with:
-- [additional_status_suffix]: "- DEVIATION ACCEPTED"
-- [ACTION_STATUS]: "ACCEPTED AS BUILT"
-- [action_specific_sections]:
-  "- **Plan Specification**: [What the plan originally specified]
-  - **Actual Implementation**: [finding.current_code or description]
+- ${additional_status_suffix}: "- DEVIATION ACCEPTED"
+- ${ACTION_STATUS}: "ACCEPTED AS BUILT"
+- ${action_specific_sections}:
+  "- **Plan Specification**: ${plan_specification}
+  - **Actual Implementation**: ${finding.current_code}
   - **Decision**: Implementation deviation accepted and documented"
 </AcceptAsBuiltTemplate>
 
@@ -521,8 +561,8 @@ Based on the verdict parameter, format the appropriate keywords for the current 
 
 <FinalSummary>
     Review Complete!
-    - Total findings reviewed: [count]
-    - Actions taken: [Count each keyword from <ReviewKeywords/> that was used]
+    - Total findings reviewed: ${count}
+    - Actions taken: ${actions_taken}
     - Categories addressed: [list with counts]
 </FinalSummary>
 
@@ -619,7 +659,8 @@ Base JSON structure for review findings:
   "issue": "[Specific problem description]",
   "current_code": "[Code snippet or text showing the issue]",
   "suggested_code": "[Improved version or recommendation]",
-  "impact": "[Why this matters]"
+  "impact": "[Why this matters]",
+  "named_finding": "[Optional - for self-evident violations like 'line_number_violation']"
 }
 ```
 
@@ -632,6 +673,7 @@ Base Requirements:
 - If code file cannot be identified, set location.code_file to "UNKNOWN - NEEDS INVESTIGATION"
 - current_code must follow <CodeExtractionRequirements/>
 - current_code must be PURE CODE ONLY - no markdown headers, instructions, or prose
+- named_finding is OPTIONAL - only include for violations defined in calling command's <NamedFindings/>
 </BaseReviewJson>
 
 <CodeExtractionRequirements>
