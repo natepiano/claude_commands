@@ -179,9 +179,13 @@ Provide a high-level summary of the subagent's findings:
     - ❌ Investigating findings that have "named_finding" field
 
     **CORRECT EXECUTION**:
-    1. Count findings to investigate: "[N] findings need investigation, [M] are named findings"
+    1. Count findings to investigate:
+       - If named findings exist: "[M] named finding(s) will skip investigation, investigating the remaining [N] findings"
+       - If no named findings: "Investigating [N] findings"
     2. Send ONE message containing:
-       - Statement: "I'll investigate all [N] non-named findings in parallel:"
+       - Statement:
+         - If named findings exist: "I'll investigate the remaining [N] findings in parallel:"
+         - If no named findings: "I'll investigate the [N] findings in parallel:"
        - Single antml:function_calls block
        - [N] antml:invoke name="Task" elements (ALL in the same block)
        - Each with: description="Investigate FINDING-X: Title (X of N)"

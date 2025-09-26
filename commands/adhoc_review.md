@@ -54,12 +54,9 @@ Conduct an interactive review of issues or topics by organizing them into a todo
     For each todo item:
 
     1. Update current item to "in_progress" status
-    2. Present the item clearly with progress indicator:
-       - **Reviewing item [current_number] of [total_items]**
-       - **Item**: [todo content]
-       - **Context**: [relevant background or details]
-       - **Action Type**: [If actionable: describe action | If discussion: "Discussion only"]
-       - **Discussion Points**: [key aspects to consider]
+    2. Present the item with progress indicator:
+       - **Reviewing item [current_number] of [total_items]**: [todo content]
+       - [Present relevant context and discussion points as needed]
     3. Facilitate discussion:
        - Present relevant information
        - Ask clarifying questions if needed
@@ -74,12 +71,28 @@ Conduct an interactive review of issues or topics by organizing them into a todo
 
        Please select one of the keywords above.
     5. Wait for user keyword response
-    6. Execute based on keyword:
+    6. Execute based on flexible keyword matching:
+
+       **Input Processing Rules:**
+       - Normalize input: lowercase, trim whitespace
+       - Match against primary keywords and accepted variations
+
+       **Accepted Keywords and Variations:**
+       - For **continue**: "continue", "next", "proceed", "yes", "go", "ok", "okay", "y"
+       - For **skip**: "skip", "no", "pass", "ignore", "omit", "n"
+       - For **discuss**: "discuss", "talk", "elaborate", "explain", "more", "detail"
+       - For **stop**: "stop", "exit", "quit", "halt", "end", "done", "cancel"
+
+       **Error Recovery**:
+       - If unrecognized: "Please respond with one of: continue, skip, discuss, or stop"
+       - After 2 invalid attempts: Default to 'discuss' to allow further consideration
+
+    7. Execute based on matched keyword:
        - If **continue**: Execute any applicable action, mark completed, proceed to next
        - If **skip**: Mark as skipped, proceed to next
-       - If **discuss**: Continue discussion until user provides continue/skip/stop
+       - If **discuss**: Continue discussion, then re-present Available Actions menu
        - If **stop**: Exit review process
-    7. Update todo to "completed" with outcome noted
+    8. Update todo to "completed" with outcome noted
     8. Automatically proceed to next item (no second prompt needed)
 
     **CRITICAL**: Each item requires explicit user decision via keyword

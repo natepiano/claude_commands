@@ -322,9 +322,12 @@ Specialized output templates for named findings that bypass investigation:
 **❌ Issue**: Design plan missing required migration strategy marker
 **📍 Location**: ${location.plan_reference}
 
-**🔧 Choose ONE marker to add:**
-- `**Migration Strategy: Atomic**` - All-at-once implementation
-- `**Migration Strategy: Phased**` - Multi-step implementation with phases
+**Analysis**: ${issue}
+
+**🔧 Recommended marker to add:**
+${suggested_code}
+
+**Why this strategy**: Plans with breaking changes, signature modifications, or tightly coupled updates typically need **Atomic**. Plans with independent features or gradual rollouts suit **Phased**.
 
 **Verdict**: CONFIRMED
 </MissingMigrationStrategyOutput>
