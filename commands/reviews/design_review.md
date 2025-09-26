@@ -57,6 +57,11 @@ Registry of named findings that bypass investigation due to self-evident violati
   - Auto-verdict: CONFIRMED
   - Output template: LineNumberViolationOutput
   - Detection: Any reference like "line 123", "lines 45-67", etc. in plan text
+
+- **missing_migration_strategy**: Design plan lacks required Migration Strategy marker
+  - Auto-verdict: CONFIRMED
+  - Output template: MissingMigrationStrategyOutput
+  - Detection: Plan document missing both "**Migration Strategy: Atomic**" and "**Migration Strategy: Phased**"
 </NamedFindings>
 
 <NamedFindingDetection>
@@ -64,7 +69,8 @@ Registry of named findings that bypass investigation due to self-evident violati
 1. Include the standard finding fields as usual
 2. ADD a "named_finding" field to your JSON with the appropriate value
 3. For line number violations per <LineNumberProhibition/>, set: "named_finding": "line_number_violation"
-4. Named findings will skip investigation as the violation is self-evident
+4. For missing migration strategy per <AtomicChangeRequirement/>, set: "named_finding": "missing_migration_strategy"
+5. Named findings will skip investigation as the violation is self-evident
 </NamedFindingDetection>
 
 ## REVIEW CONSTRAINTS
@@ -329,4 +335,48 @@ ${suggested_code}
 
 ## **Verdict**: CONFIRMED
 </LineNumberViolationOutput>
+
+<MissingMigrationStrategyOutput>
+# **${id}**: Missing Migration Strategy Declaration (${current_number} of ${total_findings})
+
+## Self-Evident Violation
+This plan lacks the required Migration Strategy marker - every design plan must explicitly declare its migration approach.
+
+**Location**: ${location.plan_reference}
+
+## Current Issue
+The plan document is missing both migration strategy markers:
+```
+**Migration Strategy: Atomic**
+**Migration Strategy: Phased**
+```
+
+## Required Fix
+Add exactly one of these markers to the plan document:
+
+**For complete, indivisible changes:**
+```
+**Migration Strategy: Atomic**
+```
+- Use when the entire change must be implemented and deployed as one unit
+- No gradual rollouts, backward compatibility, or hybrid approaches
+- Either keep current design unchanged OR replace it entirely
+
+**For multi-step implementations:**
+```
+**Migration Strategy: Phased**
+```
+- Use when change requires multiple implementation phases
+- Must include appropriate review points and validation steps between phases
+- Each phase should be clearly defined with success criteria
+
+## Decision Required
+Please clarify your intent:
+- If this should be implemented atomically (all-at-once), add the Atomic marker
+- If this requires phased implementation, add the Phased marker and define phases
+
+**Note**: This is a CONFIRMED finding - migration strategy declaration is mandatory.
+
+## **Verdict**: CONFIRMED
+</MissingMigrationStrategyOutput>
 </NamedFindingOutputTemplates>
