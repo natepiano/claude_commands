@@ -304,79 +304,28 @@ Design documents must NEVER contain line number references because they become s
 Specialized output templates for named findings that bypass investigation:
 
 <LineNumberViolationOutput>
-# **${id}**: Line Number References in Design Document (${current_number} of ${total_findings})
+# **${id}**: Line Number References Detected (${current_number} of ${total_findings})
 
-## Self-Evident Violation
-This finding requires no investigation - line number references become stale immediately as code evolves.
+**❌ Issue**: Line numbers in design documents become stale immediately
+**📍 Location**: ${location.plan_reference}
+**🔧 Fix**: Replace with structural references (sections, function names, landmarks)
 
-**Location**: ${location.plan_reference}
+**Current**: `${current_code}`
+**Instead use**: `${suggested_code}`
 
-## Current Issue
-```
-${current_code}
-```
-
-## Required Fix
-Replace all line number references with structural/semantic references:
-
-**Instead of line numbers, use:**
-- **Section references**: "Add to Section: Type Definitions"
-- **Structural landmarks**: "After the VariantSignature Display implementation"
-- **Function scope**: "Add to the validate_input() function"
-- **Code patterns**: "Insert after the MutationStatus enum definition"
-- **Relative positioning**: "Before the MutationPathInternal struct"
-
-## Suggested Replacement
-```
-${suggested_code}
-```
-
-**Note**: This is a CONFIRMED finding - line numbers in design documents are always incorrect.
-
-## **Verdict**: CONFIRMED
+**Verdict**: CONFIRMED
 </LineNumberViolationOutput>
 
 <MissingMigrationStrategyOutput>
-# **${id}**: Missing Migration Strategy Declaration (${current_number} of ${total_findings})
+# **${id}**: Missing Migration Strategy (${current_number} of ${total_findings})
 
-## Self-Evident Violation
-This plan lacks the required Migration Strategy marker - every design plan must explicitly declare its migration approach.
+**❌ Issue**: Design plan missing required migration strategy marker
+**📍 Location**: ${location.plan_reference}
 
-**Location**: ${location.plan_reference}
+**🔧 Choose ONE marker to add:**
+- `**Migration Strategy: Atomic**` - All-at-once implementation
+- `**Migration Strategy: Phased**` - Multi-step implementation with phases
 
-## Current Issue
-The plan document is missing both migration strategy markers:
-```
-**Migration Strategy: Atomic**
-**Migration Strategy: Phased**
-```
-
-## Required Fix
-Add exactly one of these markers to the plan document:
-
-**For complete, indivisible changes:**
-```
-**Migration Strategy: Atomic**
-```
-- Use when the entire change must be implemented and deployed as one unit
-- No gradual rollouts, backward compatibility, or hybrid approaches
-- Either keep current design unchanged OR replace it entirely
-
-**For multi-step implementations:**
-```
-**Migration Strategy: Phased**
-```
-- Use when change requires multiple implementation phases
-- Must include appropriate review points and validation steps between phases
-- Each phase should be clearly defined with success criteria
-
-## Decision Required
-Please clarify your intent:
-- If this should be implemented atomically (all-at-once), add the Atomic marker
-- If this requires phased implementation, add the Phased marker and define phases
-
-**Note**: This is a CONFIRMED finding - migration strategy declaration is mandatory.
-
-## **Verdict**: CONFIRMED
+**Verdict**: CONFIRMED
 </MissingMigrationStrategyOutput>
 </NamedFindingOutputTemplates>
