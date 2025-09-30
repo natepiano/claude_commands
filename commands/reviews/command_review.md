@@ -1,9 +1,9 @@
 # Command Review
 
 **MANDATORY FIRST STEP**:
-1. Use the Read tool to read /Users/natemccoy/.claude/shared/review_commands.md
-2. Find and follow the <ExecutionSteps> section from that file
-3. When you see tags like <ExecutionSteps/> below, these refer to sections in review_commands.md
+1. Use the Read tool to read ~/.claude/shared/review_commands.md
+2. That file provides the required <ExecutionSteps> for this command
+3. Some tagged sections reference review_commands.md (e.g., <ExecutionSteps/>), others are defined in this file (e.g., <ReviewPersona/>)
 
 <ExecutionSteps/>
 
@@ -26,24 +26,26 @@ Review with the meticulous attention of someone who has debugged hundreds of fai
 <InitialReviewOutput>
 Step 1: Initial Command Review
 
-  Command File: [COMMAND_FILE]
-
-  Now I'll launch the Task tool for the initial review:
+Command File: ${COMMAND_FILE}
 </InitialReviewOutput>
 
 <DetermineReviewTarget>
 **Execute this step to determine what to review:**
 
+COMMAND_FILE = command file path determined from $ARGUMENTS or user input
+REVIEW_TARGET = the command structure in ${COMMAND_FILE}
+REVIEW_CONTEXT = We are reviewing a COMMAND FILE for structural improvements, clarity, and reliability. Commands are instructions for AI agents, not code.
+
 If $ARGUMENTS is provided:
-- Use $ARGUMENTS as [COMMAND_FILE]
-- Verify it's a .md file in commands/ directory
+- Set COMMAND_FILE = $ARGUMENTS
+- Verify ${COMMAND_FILE} is a .md file in commands/ directory
 
 If $ARGUMENTS is empty:
 - Ask user: "Which command file would you like to review?"
-- Use their response as [COMMAND_FILE]
+- Set COMMAND_FILE = user's response
 
-Use [COMMAND_FILE] to set [REVIEW_TARGET] to: the command structure in [COMMAND_FILE]
-Use [REVIEW_CONTEXT]: We are reviewing a COMMAND FILE for structural improvements, clarity, and reliability. Commands are instructions for AI agents, not code.
+REVIEW_TARGET is set to: the command structure in ${COMMAND_FILE}
+REVIEW_CONTEXT is set to: We are reviewing a COMMAND FILE for structural improvements, clarity, and reliability. Commands are instructions for AI agents, not code.
 </DetermineReviewTarget>
 
 <ReviewCategories>
@@ -57,10 +59,14 @@ Use [REVIEW_CONTEXT]: We are reviewing a COMMAND FILE for structural improvement
 ## REVIEW CONSTRAINTS
 
 <ReviewConstraints>
+    **Note**: All constraint sections below are defined within this command file (command_review.md), not in external files.
+
+    - <SharedWorkflowPattern/> ← CHECK THIS FIRST
     - <StructuralAssessment/>
     - <CommandClarityPrinciples/>
     - <TaggedSectionRequirements/>
-    - <ExecutionStepsPatterns/>
+    - <ExecutionStepsRequired/>
+    - <ExecutionStepsFormat/>
     - <ExecuteOnlyPatterns/>
     - <InteractiveCommandPatterns/>
     - <PatternConsistencyCheck/>
@@ -143,35 +149,87 @@ Commands must use tagged sections effectively for clarity and maintainability:
    - **JUST RIGHT**: <ProcessFileContents/> (contains open, read, process, close)
 </TaggedSectionRequirements>
 
-<ExecutionStepsPatterns>
-Multi-step commands MUST use the standardized ExecutionSteps format for consistency:
-1. **Detection Threshold**: Commands with 3+ sequential operations requiring execution
-   - **EXEMPT**: Simple 2-step commands (e.g., acknowledge-and-stop patterns)
-   - **EXEMPT**: Commands with single purpose that explicitly state "ONE purpose" or similar
-   - **INDICATORS**: Words like "step", "phase", "then", "next", "first", "finally" (3+ occurrences)
-   - **PATTERNS**: Multiple tagged sections that build on each other sequentially
-   - **EXAMPLES**: Data processing pipelines, review workflows, setup procedures
-2. **Required Format** (when 3+ steps detected):
-   ```markdown
-   <ExecutionSteps>
-       **EXECUTE THESE STEPS IN ORDER:**
+<SharedWorkflowPattern>
+**CRITICAL - CHECK THIS FIRST**: Commands using shared workflows reference sections from shared files using self-closing tag syntax.
 
-       **STEP 1:** Execute <TaggedSection/>
-       **STEP 2:** Execute <TaggedSection/>
-       **STEP 3:** Execute <TaggedSection/>
-   </ExecutionSteps>
-   ```
-3. **Format Rules**:
-   - Must be wrapped in `<ExecutionSteps>` tags
-   - Must include "**EXECUTE THESE STEPS IN ORDER:**" header
-   - Must use `**STEP N:** Execute <TaggedSection/>` format
-   - Each step must reference a specific tagged section
-4. **When This Does NOT Apply**:
-   - Commands with only 1-2 steps
-   - Simple acknowledgment or status commands
-   - Commands that explicitly state minimal/single purpose
-5. **Action**: If 3+ step workflow detected, ensure it follows this exact format or recommend conversion
-</ExecutionStepsPatterns>
+**XML-Style Tag Syntax Convention**:
+- `<TagName/>` (self-closing) = **REFERENCE** to section defined elsewhere
+- `<TagName>content</TagName>` (with content) = **LOCAL DEFINITION** of section
+
+**VERIFICATION STEPS - Execute before flagging any "duplication" or "missing" issues**:
+1. **Locate the tag in question** (e.g., `<TypeSystemPrinciples/>`)
+2. **Check the syntax**: Does it have a closing slash `/>`?
+   - YES (self-closing) → It's a REFERENCE. Skip to step 4.
+   - NO (has opening/closing tags) → It's a DEFINITION. Continue to step 3.
+3. **For definitions**: Is there another definition of the same tag elsewhere?
+   - YES → This is genuine duplication. Flag it.
+   - NO → This is the canonical definition. Do not flag.
+4. **For references (self-closing tags)**: Search the ENTIRE file for a local definition
+   - Found `<TagName>content</TagName>` in the same file? → Flag as redundant (reference + definition in same file)
+   - NOT found? → This is correct usage of shared reference. **DO NOT FLAG**.
+
+**Pattern Recognition**:
+If a command file has:
+1. **MANDATORY FIRST STEP** documentation directing to a shared workflow file
+2. Self-closing tag references: `<TagName/>` (with trailing slash)
+3. Local sections with content between opening/closing tags
+
+Then this is **CORRECTLY IMPLEMENTED** - do NOT flag as missing, duplicated, or inconsistent.
+
+**Common self-closing references** (these are NOT local definitions):
+- `<ExecutionSteps/>` - Shared workflow steps
+- `<PlanDocument/>` - Shared document resolution
+- `<TypeSystemPrinciples/>` - Shared type system design principles
+- `<DuplicationPrevention/>` - Shared duplication detection rules
+- Any other `<Tag/>` documented in MANDATORY FIRST STEP
+
+**DO NOT FLAG**:
+- "Missing ExecutionSteps" when `<ExecutionSteps/>` reference exists
+- "Missing definitions" for self-closing tags like `<TypeSystemPrinciples/>`
+- "Duplication" or "inconsistency" when mixing self-closing references with local definitions
+- "Undefined references" for any self-closing tags documented in MANDATORY FIRST STEP
+- "Duplication" when you see `<TypeSystemPrinciples/>` (reference) but NO `<TypeSystemPrinciples>content</TypeSystemPrinciples>` (definition)
+
+**The syntax IS the documentation**: Self-closing = reference, with-content = definition. This is intentional architecture, not inconsistency.
+
+**Example**: review_commands.md defines shared sections referenced by command_review, design_review, code_review
+</SharedWorkflowPattern>
+
+<ExecutionStepsRequired>
+Commands with 3+ sequential operations MUST have ExecutionSteps (unless using <SharedWorkflowPattern/>):
+
+**Detection Threshold**:
+- 3+ sequential operations requiring execution
+- Words like "step", "phase", "then", "next", "first", "finally" (3+ occurrences)
+- Multiple tagged sections that build on each other sequentially
+
+**EXEMPT** (no ExecutionSteps needed):
+- Simple 2-step commands (e.g., acknowledge-and-stop patterns)
+- Commands explicitly stating "ONE purpose" or similar
+- Commands using <SharedWorkflowPattern/>
+
+**Examples needing ExecutionSteps**: Data processing pipelines, review workflows, setup procedures
+</ExecutionStepsRequired>
+
+<ExecutionStepsFormat>
+When ExecutionSteps are required (per <ExecutionStepsRequired/>), use this exact format:
+
+```markdown
+<ExecutionSteps>
+    **EXECUTE THESE STEPS IN ORDER:**
+
+    **STEP 1:** Execute <TaggedSection/>
+    **STEP 2:** Execute <TaggedSection/>
+    **STEP 3:** Execute <TaggedSection/>
+</ExecutionSteps>
+```
+
+**Format Rules**:
+- Must be wrapped in `<ExecutionSteps>` tags (with content inside, not just `<ExecutionSteps/>`)
+- Must include "**EXECUTE THESE STEPS IN ORDER:**" header
+- Must use `**STEP N:** Execute <TaggedSection/>` format
+- Each step must reference a specific tagged section
+</ExecutionStepsFormat>
 
 <ExecuteOnlyPatterns>
 Commands that run to completion without user interaction:
@@ -197,6 +255,7 @@ Commands with user decision points MUST follow these patterns:
    - **FORMAT**: One todo per decision point or major step
    - **UPDATES**: Mark in_progress when presenting, completed after user responds
    - **NO EXCEPTIONS**: Keywords = Todos, always
+   - **DELEGATION EXCEPTION**: Commands using shared workflows (see ExecutionStepsPatterns item 4) may delegate TodoWrite to the shared workflow file if the shared <UserReview/> or equivalent section implements TodoWrite as its first step
 2. **Keyword Presentation**: Consistent format for proper markdown rendering
    - **CRITICAL**: No indentation - keywords must be at column 0 for formatting
    - **CORRECT FORMAT**:

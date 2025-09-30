@@ -50,6 +50,7 @@
     "type": "command",
     "command": "printf \"%s%% Press ? for shortcuts\" \"$(basename \"$(pwd)\")\""
   },
+  "alwaysThinkingEnabled": false,
   "feedbackSurveyState": {
     "lastShownTime": 1754090074729
   }

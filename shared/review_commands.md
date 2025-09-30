@@ -9,12 +9,13 @@
 
     **STEP 1:** Execute the <InitialReview/> - MUST use Task tool
     **STEP 2:** Summarize the subagent's findings using <InitialReviewSummary/>
-    **STEP 3:** Execute the <ReviewFollowup/> - MUST use Task tool for each finding
-    **STEP 4:** Execute the <UserReview/>
+    **STEP 3:** Execute <FindingPrioritization/> - select top 6 findings if needed
+    **STEP 4:** Execute the <ReviewFollowup/> - MUST use Task tool for each finding
+    **STEP 5:** Execute the <UserReview/>
 </ExecutionSteps>
 
 <PlanDocument>
-  The [PLAN_DOCUMENT] is either the plan we've been working on or is in
+  The ${PLAN_DOCUMENT} is either the plan we've been working on or is in
   $ARGUMENTS if it is provided.
 </PlanDocument>
 
@@ -27,7 +28,7 @@
     <InitialReviewOutput/>
 
     **3. MANDATORY: Launch Task tool (DO NOT skip this):**
-    - description: "review [PLAN_DOCUMENT]" OR "review [REVIEW_TARGET]"
+    - description: "review ${PLAN_DOCUMENT}" OR "review ${REVIEW_TARGET}"
     - subagent_type: "general-purpose"
     - prompt: Everything in <InitialReviewPrompt> below with placeholders replaced
 
@@ -37,15 +38,15 @@
 <InitialReviewPrompt>
     **ADOPT YOUR REVIEW PERSONA**: <ReviewPersona/>
 
-    **Target:** [REVIEW_TARGET]
-    **CRITICAL CONTEXT**: [REVIEW_CONTEXT]
+    **Target:** ${REVIEW_TARGET}
+    **CRITICAL CONTEXT**: ${REVIEW_CONTEXT}
     **WARNING**: This is a plan for FUTURE changes. Do NOT report issues about planned features not existing in current code - they don't exist because they haven't been built yet!
     **Review Constraints**: Follow these analysis principles:
     <ReviewConstraints/>
 
     **NAMED FINDING DETECTION** (if applicable): <NamedFindingDetection/>
 
-    Review [REVIEW_TARGET] using the categories defined above and provide structured findings.
+    Review ${REVIEW_TARGET} using the categories defined above and provide structured findings.
     It is important that you think very hard about this review task.
 
     **CRITICAL ID GENERATION REQUIREMENT**: <IDGenerationRules/>
@@ -154,12 +155,44 @@ Provide a high-level summary of the subagent's findings:
 ## Key themes:
 [2-3 bullet points about main issues identified]
 
-**Next we will proceed with a deep review followup on each finding**
+**IMMEDIATELY CONTINUE TO STEP 3**: Now execute <FindingPrioritization/> followed by <ReviewFollowup/>
 [If named findings exist: **Note: ${count} named finding(s) will skip investigation as they are self-evident violations**]
 
 </InitialReviewSummary>
 
-## STEP 2: INVESTIGATION
+<FindingPrioritization>
+**MAXIMUM FINDINGS LIMIT**: Reviews process a maximum of 6 findings for quality and focus.
+
+**If findings ≤ 6**: Proceed with all findings
+
+**If findings > 6**: Execute prioritization:
+
+1. **Separate named findings** (if any) - these always have priority
+2. **Score remaining findings** by:
+   - Priority: HIGH (3 points) > MEDIUM (2 points) > LOW (1 point)
+   - Category importance: TYPE-SYSTEM (3) > DESIGN/QUALITY (2) > others (1)
+   - Impact severity: Critical/High (3) > Medium (2) > Low (1)
+3. **Select top 6**:
+   - Include all named findings first (up to 6)
+   - Fill remaining slots with highest-scoring regular findings
+4. **Track deferred findings**:
+   - Store: Finding IDs, titles, categories, and priority of findings NOT reviewed
+   - Report in <FinalSummary/>
+
+**Output prioritization decision**:
+```
+Prioritizing findings: ${total_findings} findings received, reviewing top 6 by priority and impact.
+
+**Reviewing**: ${list_of_6_finding_ids_and_titles}
+
+**Deferred** (${count} findings - available for future review):
+${list_of_deferred_finding_ids_and_titles}
+```
+
+**THEN IMMEDIATELY**: Proceed to <ReviewFollowup/> with the selected 6 findings.
+</FindingPrioritization>
+
+## STEP 4: INVESTIGATION
 
 <ReviewFollowup>
     **NAMED FINDING FILTERING**:
@@ -170,29 +203,29 @@ Provide a high-level summary of the subagent's findings:
     4. If all findings are named findings: Skip to Step 3 (User Review)
 
     **CRITICAL PARALLEL EXECUTION REQUIREMENT**:
-    You MUST send ALL [N] Task tool calls for NON-NAMED findings in a SINGLE message with MULTIPLE antml:invoke blocks.
+    You MUST send ALL ${N} Task tool calls for NON-NAMED findings in a SINGLE message with MULTIPLE antml:invoke blocks.
 
     **VIOLATION EXAMPLES**:
     - ❌ Sending one Task, waiting for completion, then sending another
     - ❌ Using multiple messages to send Tasks
-    - ❌ Starting with "I'll investigate finding 1" instead of "I'll investigate all [N] findings"
+    - ❌ Starting with "I'll investigate finding 1" instead of "I'll investigate all ${N} findings"
     - ❌ Investigating findings that have "named_finding" field
 
     **CORRECT EXECUTION**:
-    1. Count findings to investigate:
-       - If named findings exist: "[M] named finding(s) will skip investigation, investigating the remaining [N] findings"
-       - If no named findings: "Investigating [N] findings"
+    1. Count findings to investigate (after <FindingPrioritization/> has selected top 6):
+       - If named findings exist: "${M} named finding(s) will skip investigation, investigating the remaining ${N} findings"
+       - If no named findings: "Investigating ${N} findings"
     2. Send ONE message containing:
        - Statement:
-         - If named findings exist: "I'll investigate the remaining [N] findings in parallel:"
-         - If no named findings: "I'll investigate the [N] findings in parallel:"
+         - If named findings exist: "I'll investigate the remaining ${N} findings in parallel:"
+         - If no named findings: "I'll investigate the ${N} findings in parallel:"
        - Single antml:function_calls block
-       - [N] antml:invoke name="Task" elements (ALL in the same block)
+       - ${N} antml:invoke name="Task" elements (ALL in the same block)
        - Each with: description="Investigate FINDING-X: Title (X of N)"
-    3. Wait for ALL [N] subagents to complete simultaneously
+    3. Wait for ALL ${N} subagents to complete simultaneously
     4. Only then parse and process results
 
-    **ENFORCEMENT**: If you send even ONE Task alone, you have FAILED. All [N] Tasks MUST launch together.
+    **ENFORCEMENT**: If you send even ONE Task alone, you have FAILED. All ${N} Tasks MUST launch together.
 </ReviewFollowup>
 
 <ReviewFollowupPrompt>
@@ -215,7 +248,7 @@ Provide a high-level summary of the subagent's findings:
     **Your Investigation Tasks:**
     1. Verify if this is a real issue or false positive
     2. Consider maintenance and long-term implications
-    3. Provide a verdict: [EXPECTED_VERDICTS]
+    3. Provide a verdict: ${EXPECTED_VERDICTS}
     4. Include detailed reasoning for your verdict in simple, easy-to-understand terms
        - Avoid technical jargon where possible
        - Explain the "why" in plain language
@@ -271,7 +304,7 @@ Format your response message with EXACTLY this JSON structure (extending the <Ba
 
 Additional Requirements for Followup:
 - Include ALL fields from the original finding (as defined in <BaseReviewJson/>)
-- verdict must be one of: [EXPECTED_VERDICTS]
+- verdict must be one of: ${EXPECTED_VERDICTS}
 - alternative_approach is OPTIONAL - omit if not applicable
 - For verdicts recommending action: suggested_code is REQUIRED with concrete implementation
 - **CRITICAL FOR MODIFIED VERDICT**: Must include suggested_code showing the alternative approach in concrete code
@@ -280,7 +313,7 @@ Additional Requirements for Followup:
 - current_code field MUST be expanded if original had insufficient context (minimum 5-10 lines)
 </ReviewFollowupJson>
 
-## STEP 3: USER INTERACTION
+## STEP 5: USER INTERACTION
 
 <UserOutput>
 Present the investigation findings to the user using this format
@@ -390,7 +423,7 @@ The current approach is correct. No changes needed.
        - Otherwise: Present using format from <UserOutput/> (from investigation results)
     4. Include the (n of m) counter in the title
        - Add any relevant notes about how prior decisions affect this finding
-    5. Display available keywords using <FormatKeywords verdict="[VERDICT]"/> based on the verdict
+    5. Display available keywords using <FormatKeywords verdict="${VERDICT}"/> based on the verdict
        - **CRITICAL**: For named findings, use auto-verdict from <NamedFindings/>
        - **CRITICAL**: For investigated findings, use UPDATED verdict from investigation result
     6. STOP and wait for user's response
@@ -404,7 +437,7 @@ The current approach is correct. No changes needed.
             - Ask "Edit complete. Type 'continue' to proceed to the next finding. (${current_number} of ${total_findings})"
             - Wait for user confirmation before proceeding
             - Skip steps d-f below and continue from step 8
-         d. **MANDATORY**: Present keywords using <FormatKeywords verdict="[CURRENT_VERDICT]"/>
+         d. **MANDATORY**: Present keywords using <FormatKeywords verdict="${CURRENT_VERDICT}"/>
          e. **MANDATORY**: State "Please select one of the keywords above to proceed."
          f. **DO NOT CONTINUE** to next finding until user provides a keyword
          g. If user continues discussion instead of selecting keyword, repeat steps a-f
@@ -568,6 +601,14 @@ Based on the verdict parameter, format the appropriate keywords for the current 
     - Total findings reviewed: ${count}
     - Actions taken: ${actions_taken}
     - Categories addressed: [list with counts]
+
+    [If findings were deferred:]
+
+    **Deferred Findings** (not reviewed in this session):
+    The following ${count} findings were prioritized lower and not reviewed. You can run the review again to address these:
+    ${list_each_deferred_finding_with_id_title_category_priority}
+
+    To review deferred findings, run this command again and I will pick up where we left off.
 </FinalSummary>
 
 ## PRIOR DECISION RECONCILIATION
@@ -651,8 +692,8 @@ Reusable components and definitions used throughout the review workflow
 Base JSON structure for review findings:
 ```json
 {
-  "id": "[CATEGORY]-[NUMBER]",
-  "category": "[CATEGORY]",
+  "id": "${CATEGORY}-${NUMBER}",
+  "category": "${CATEGORY}",
   "title": "[Brief descriptive title]",
   "location": {
     "plan_reference": "[If reviewing a plan: section title, NOT line numbers - e.g., 'Section: Mutation Path Implementation']",
@@ -669,8 +710,8 @@ Base JSON structure for review findings:
 ```
 
 Base Requirements:
-- [CATEGORY] must be from <ReviewCategories/> (e.g., TYPE-SYSTEM, QUALITY, DESIGN)
-- [NUMBER] must follow <IDGenerationRules/>
+- ${CATEGORY} must be from <ReviewCategories/> (e.g., TYPE-SYSTEM, QUALITY, DESIGN)
+- ${NUMBER} must follow <IDGenerationRules/>
 - TYPE-SYSTEM issues should be sorted first in findings array
 - For plan/design reviews: location MUST include both plan_reference AND code_file
 - current_code must be from the ACTUAL code file, not copied from the plan

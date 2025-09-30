@@ -26,7 +26,11 @@ Create a todo list for the specified plan using your todo tool, then STOP.
 PLAN_FILE_PATH = ${selected plan document path}
 FEATURE_NAME = ${extracted from plan title}
 
-1. If `$ARGUMENTS` is provided: Read the specified plan document from the project root
+1. If `$ARGUMENTS` is provided:
+   - Set PLAN_FILE_PATH = $ARGUMENTS
+   - Read the specified plan document from the project root
+   - If file not found, display error: "Plan file ${PLAN_FILE_PATH} not found in project root. Please verify the filename and try again."
+   - If file exists but is not readable, display error: "Plan file ${PLAN_FILE_PATH} exists but cannot be read. Please check file permissions."
 2. If no arguments: Use the plan document currently being worked on in the session
 3. Verify the plan document exists and is readable
 4. Check if the plan document is checked into git using: `git status ${PLAN_FILE_PATH}`
@@ -115,56 +119,32 @@ Exception: Code you just added that you'll use immediately
 <ReviewFindingsInterpretation>
 **How to interpret review findings for todo generation - READ CAREFULLY:**
 
-Example 1 - PREJUDICE WARNING rejecting a suggestion about an approved feature:
-```
-### ⚠️ PREJUDICE WARNING - TYPE-SYSTEM-2: Use enum instead of string matching
-- **Issue**: Suggests replacing approved string matching with enum
-- **Status**: PERMANENTLY REJECTED
-- **Critical Note**: DO NOT SUGGEST THIS AGAIN - User approved string approach
-```
-→ IMPLEMENT the original string matching feature (it was approved)
-→ DON'T implement the enum suggestion (that's what was rejected)
+**Key Interpretation Patterns**:
 
-Example 2 - SKIPPED suggestion that doesn't affect core plan:
-```
-### DESIGN-3: Add extra validation layer
-- **Issue**: Suggests adding validation beyond what plan specifies
-- **Status**: SKIPPED
-- **Decision**: User elected to skip this additional validation
-```
-→ IMPLEMENT the feature as originally planned
-→ DON'T add the extra validation layer
+1. **PREJUDICE WARNING**: Rejects suggestions about approved features
+   - IMPLEMENT: Original approved feature (it was already approved)
+   - DON'T: The suggested change that was rejected
+   - Example: If warning rejects "use enum instead of string", implement the string approach
 
-Example 3 - APPROVED modification to original plan:
-```
-## TYPE-SYSTEM-1: String-based type checking ✅
-- **Status**: APPROVED - To be implemented
-- **Issue**: Plan uses string matching but should use WrapperType::detect
-### Approved Change:
-[Use WrapperType::detect instead of string matching]
-```
-→ CREATE todo to implement the APPROVED change (WrapperType::detect)
-→ DON'T implement the original proposal (string matching)
+2. **SKIPPED**: Declines additional suggestions beyond plan scope
+   - IMPLEMENT: Feature as originally planned
+   - DON'T: The extra suggestions that were skipped
+   - Example: If extra validation skipped, implement without that validation
 
-Example 4 - PREJUDICE WARNING about reverting something already done:
-```
-### ⚠️ PREJUDICE WARNING - DESIGN-1: Remove the new error handling
-- **Issue**: Reviewer keeps suggesting we remove error handling we added
-- **Status**: PERMANENTLY REJECTED
-- **Critical Note**: The error handling stays - stop suggesting removal
-```
-→ KEEP the error handling (the suggestion to remove it was rejected)
-→ This doesn't affect implementation - the feature is already correct
+3. **APPROVED**: Modifies original plan with new approach
+   - IMPLEMENT: The approved modified version
+   - DON'T: Original plan approach that was replaced
+   - Example: If WrapperType::detect approved over string matching, use WrapperType::detect
 
-Example 5 - ACCEPTED AS BUILT deviation:
-```
-## Deviation from Plan: IMPLEMENTATION-2
-- **Plan Specification**: Use async/await pattern
-- **Actual Implementation**: Used callback pattern instead
-- **Status**: ACCEPTED AS BUILT
-```
-→ DON'T change the callback pattern to async/await
-→ The deviation was accepted
+4. **ACCEPTED AS BUILT**: Implementation differs from plan but accepted
+   - DON'T CHANGE: Keep the existing implementation
+   - The deviation was reviewed and accepted
+   - Example: If callback pattern accepted over planned async/await, keep callbacks
+
+5. **PREJUDICE WARNING about reverting**: Rejects removing something already done
+   - KEEP: The existing implementation that someone suggested removing
+   - This doesn't create new todos - the feature is already correct
+   - Example: If warning about removing error handling, the error handling stays
 </ReviewFindingsInterpretation>
 
 <ImplementationTodos>

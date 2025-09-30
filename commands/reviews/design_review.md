@@ -1,7 +1,7 @@
 # Design Review
 
 **MANDATORY FIRST STEP**:
-1. Use the Read tool to read /Users/natemccoy/.claude/shared/review_commands.md
+1. Use the Read tool to read ~/.claude/shared/review_commands.md
 2. Find and follow the <ExecutionSteps> section from that file
 3. When you see tags like <ExecutionSteps/> below, these refer to sections in review_commands.md
 
@@ -28,7 +28,7 @@ Review with the foresight of someone who has seen countless projects fail due to
 <InitialReviewOutput>
 Step 1: Initial Design Review
 
-  Plan Document: [PLAN_DOCUMENT]
+  Plan Document: ${PLAN_DOCUMENT}
 
   Now I'll launch the Task tool for the initial review:
 </InitialReviewOutput>
@@ -36,9 +36,13 @@ Step 1: Initial Design Review
 <DetermineReviewTarget>
 **Execute this step to determine what to review:**
 
-Set [PLAN_DOCUMENT] using <PlanDocument/>
-Set [REVIEW_TARGET] to: the feature design in [PLAN_DOCUMENT]
-Set [REVIEW_CONTEXT] to: We are reviewing a FUTURE PLAN that has NOT been implemented yet. Our goal is to evaluate the DESIGN QUALITY of the proposed changes, NOT to check if they exist in current code.
+PLAN_DOCUMENT = The plan document path (from ongoing work context or $ARGUMENTS)
+REVIEW_TARGET = the feature design in ${PLAN_DOCUMENT}
+REVIEW_CONTEXT = We are reviewing a FUTURE PLAN that has NOT been implemented yet. Our goal is to evaluate the DESIGN QUALITY of the proposed changes, NOT to check if they exist in current code.
+
+Set PLAN_DOCUMENT using <PlanDocument/>
+Set REVIEW_TARGET to: the feature design in ${PLAN_DOCUMENT}
+Set REVIEW_CONTEXT to: We are reviewing a FUTURE PLAN that has NOT been implemented yet. Our goal is to evaluate the DESIGN QUALITY of the proposed changes, NOT to check if they exist in current code.
 </DetermineReviewTarget>
 
 
@@ -282,7 +286,7 @@ Design documents must NEVER contain line number references because they become s
 
 <ReviewFollowupParameters>
     When using ReviewFollowup from review_commands.md, substitute:
-    - [EXPECTED_VERDICTS]: CONFIRMED, MODIFIED, or REJECTED
+    - EXPECTED_VERDICTS: CONFIRMED, MODIFIED, or REJECTED
 </ReviewFollowupParameters>
 
 <KeywordExecution>
