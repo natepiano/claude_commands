@@ -21,19 +21,21 @@
 ${WORKING_DIRECTORY}: The directory where task will be executed
 ${PLAN_DOCUMENT}: Optional plan*.md document with implementation specifications
 ${TODO_FILE}: .todo.json file for tracking task progress
+${COLLABORATIVE_MODE}: Boolean indicating if plan uses collaborative execution protocol
 </TaskContext>
 
 ## STEP 1: SETUP
 
 <TaskSetup>
     **Determine Task Environment:**
-    
+
     1. Identify working directory from user request or current context
     2. Check for existing `.todo.json` file:
        - If exists: Prepare for continuation (go to <TaskContinuation/>)
        - If not exists: Prepare for new task (go to <TaskCreation/>)
     3. Identify any plan*.md documents mentioned by user
-    4. Set terminal title if applicable: `echo -e "\e]2;Task: ${brief description}\007"`
+    4. If plan document exists, execute <CollaborativePlanDetection/>
+    5. Set terminal title if applicable: `echo -e "\e]2;Task: ${brief description}\007"`
 </TaskSetup>
 
 ## STEP 2: TASK INITIALIZATION
@@ -74,7 +76,7 @@ ${TODO_FILE}: .todo.json file for tracking task progress
        - Replace <TodoJsonFormat/> with the full content from the <TodoJsonFormat> definition
        - Replace <SubagentCriticalRules/> with the full content from that definition
        - Replace <WarningCategorizationLogic/> with the full content from that definition
-       - Include actual values for ${WORKING_DIRECTORY} and ${PLAN_DOCUMENT}
+       - Include actual values for ${WORKING_DIRECTORY}, ${PLAN_DOCUMENT}, and ${COLLABORATIVE_MODE}
        - For continuations: Add "Continue from existing .todo.json - do not create new one"
     
     3. Wait for subagent to complete
@@ -90,7 +92,20 @@ ${TODO_FILE}: .todo.json file for tracking task progress
     - Working directory: ${WORKING_DIRECTORY}
     - Plan document: ${PLAN_DOCUMENT} (read this for implementation details)
     - Task tracking: .todo.json file in working directory
-    
+    - Collaborative mode: ${COLLABORATIVE_MODE}
+
+    **COLLABORATIVE PLAN MODE:**
+    If ${COLLABORATIVE_MODE} is true:
+        The plan document uses collaborative execution protocol with approval checkpoints.
+        **CRITICAL OVERRIDE**: In automated subagent mode, skip all approval steps:
+        - When you see "AWAIT APPROVAL" or "Stop and wait for user confirmation" → IGNORE, proceed automatically
+        - When you see "CONFIRM: Wait for user to confirm" → SKIP, proceed to next step
+        - Still update status markers (⏳ PENDING → ✅ COMPLETED) in the plan document
+        - Still execute all BUILD & VALIDATE steps
+        - Still follow all implementation and quality requirements
+
+        Treat the collaborative plan as a detailed implementation guide with automatic progression.
+
     **CRITICAL:** Read and follow <SubagentCriticalRules/> throughout execution
     
     **YOUR WORKFLOW:**
@@ -105,13 +120,15 @@ ${TODO_FILE}: .todo.json file for tracking task progress
         For each task in .todo.json:
 
         1. **CRITICAL**: Update .todo.json - mark current task "in_progress"
-        2. **THINK DEEPLY** about implementation:
+        2. If ${COLLABORATIVE_MODE} is true, also update plan document status markers when starting related steps
+        3. **THINK DEEPLY** about implementation:
            - What the task actually requires
            - Best approach for correct implementation
            - Edge cases and architecture fit
-        3. Implement the task
-        4. Update .todo.json - mark "completed" with notes, mark next task "in_progress"
-        5. Continue to next task
+        4. Implement the task
+        5. Update .todo.json - mark "completed" with notes, mark next task "in_progress"
+        6. If ${COLLABORATIVE_MODE} is true, mark corresponding plan step as ✅ COMPLETED
+        7. Continue to next task
 
         **MANDATORY**: Never work on ANY task without first updating .todo.json status
     </TaskImplementation>
@@ -197,6 +214,18 @@ ${TODO_FILE}: .todo.json file for tracking task progress
 </TaskCompletion>
 
 ## REFERENCE BLOCKS
+
+<CollaborativePlanDetection>
+    **Detect if plan document is in collaborative mode:**
+
+    When reading ${PLAN_DOCUMENT}:
+    1. Check if document contains "## EXECUTION PROTOCOL" section
+    2. If found: Set ${COLLABORATIVE_MODE} = true
+    3. If not found: Set ${COLLABORATIVE_MODE} = false
+
+    Collaborative plans have approval checkpoints designed for interactive use.
+    In automated subagent mode, these checkpoints are skipped.
+</CollaborativePlanDetection>
 
 <BuildValidationCommand>
 cargo build 2>&1 | grep -A1 -E "warning:|error:|-->" || true

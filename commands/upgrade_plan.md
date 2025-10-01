@@ -123,31 +123,15 @@ UPGRADE_SUFFIX = -upgraded.md
         Display: "✅ Plan Completeness Check: PASSED"
         Proceed to Step 3.
 
-    If gaps found, display summary and for each gap show:
-        - Type, severity, file affected
-        - What plan says vs what's missing
-        - Relevant current code
+    If gaps found:
+        Count critical gaps.
+        Display summary:
+        ```
+        ⏺ ✅ Plan Completeness Check: GAPS FOUND (${gap_count} issues, ${critical_count} CRITICAL)
+        ```
 
-    ## Available Actions
-    - **fix** - Stop and fix the plan first
-    - **ignore** - Continue despite gaps
-    - **abort** - Cancel upgrade
-
-    Please select one of the keywords above.
-    STOP.
-
-    Execute <ValidateUserResponse/> with:
-        expected_keywords: [fix, ignore, abort]
-        option_descriptions: [
-            "- **fix** - Stop and fix the plan first",
-            "- **ignore** - Continue despite gaps",
-            "- **abort** - Cancel upgrade"
-        ]
-
-    Handle validated response:
-    If "fix": Show priority gaps to address, exit.
-    If "ignore": Warn and proceed to Step 3.
-    If "abort": Exit.
+        Execute <GapReview/> with parsed gaps array.
+        After gap review completes, proceed to Step 3.
 </ImplementationGapAnalysis>
 
 <GapAnalysisPrompt>
@@ -179,6 +163,67 @@ Return JSON:
   "summary": "assessment"
 }
 </GapAnalysisPrompt>
+
+<GapReview>
+    **Interactive Gap Review - One at a Time**
+
+    Use TodoWrite tool to create tracking for each gap:
+    - Create todos for each gap: "Review gap: ${gap_type} in ${file}"
+    - Status: "pending" for all initially
+
+    For each gap (in order of severity: CRITICAL → HIGH → MEDIUM → LOW):
+
+    1. Mark current gap todo as "in_progress"
+    2. Present gap using <GapOutput/> format
+    3. Include counter: "(Gap ${current_number} of ${total_gaps})"
+    4. Display keywords at column 0:
+
+## Available Actions
+- **fix** - Address this gap in the plan before continuing
+- **skip** - Accept this gap and continue anyway
+- **investigate** - Launch deeper investigation of the gap
+- **stop** - Cancel the upgrade process
+
+    5. STOP and wait for user's keyword response
+    6. Handle keyword:
+       - **fix**: Display the gap details for reference, exit upgrade process for manual fixes
+       - **skip**: Mark gap as skipped, continue to next gap
+       - **investigate**: Launch Task tool to verify gap and suggest solutions, then re-present keywords
+       - **stop**: Exit upgrade process
+    7. Mark current gap todo as "completed"
+    8. Continue to next gap
+
+    After all gaps reviewed, display summary:
+    ```
+    Gap Review Complete
+    -------------------
+    Total gaps: ${total_count}
+    Fixed/Will fix: ${fix_count}
+    Skipped: ${skip_count}
+
+    Proceeding to execution sequence proposal...
+    ```
+</GapReview>
+
+<GapOutput>
+# Gap ${current_number} of ${total_gaps}: ${gap_type}
+**Severity**: ${severity}
+**File**: ${file}
+
+## What the plan says:
+${plan_proposal}
+
+## What's actually needed:
+${what's_missing}
+
+## Current code context:
+```rust
+${current_code}
+```
+
+## Why this matters:
+[Explain the compilation/runtime impact if this gap isn't addressed]
+</GapOutput>
 
 ## STEP 3: REVIEW AND CONFIRM
 

@@ -25,6 +25,8 @@ Your expertise allows you to:
 - Detect verbosity and redundancy that impacts agent performance
 
 Review with the meticulous attention of someone who has debugged hundreds of failed agent executions due to unclear instructions.
+
+**Your review approach must adhere to <PrimeDirective/>**: Prioritize accuracy and correctness, then minimize token usage through the strategies defined therein.
 </ReviewPersona>
 
 <InitialReviewOutput>
@@ -106,9 +108,10 @@ REVIEW_CONTEXT is set to: We are reviewing a COMMAND FILE for structural improve
 </InvestigationConstraints>
 
 <PrimeDirective>
-**FirstAndForemost** Do the most correct and accurate work
-**AndThen** Use the least amount of input tokens, output tokens and thinking tokens.
-**SuchThat** Accuracy is never sacrificed to token count.
+**FirstAndForemost**: Do the most correct and accurate work
+**AndThen**: Use the least amount of input tokens, output tokens and thinking tokens.
+**SuchThat**: Accuracy is never sacrificed to token count.
+**WithThisInMind**: the user prefers to focus on output tokens and correctness. A few extra input tokens to prevent output tokens and get things right is a good tradeoff.
 
 Strategies: Tagged section reuse, shared workflows, template variables, script delegation, verbosity elimination, pattern consistency.
 
@@ -227,6 +230,9 @@ Commands must use tagged sections effectively for clarity and maintainability:
 - `<TagName>content</TagName>` (with content) = **LOCAL DEFINITION** of section
 
 **VERIFICATION STEPS - Execute before flagging any "duplication" or "missing" issues**:
+
+**CRITICAL**: Reference in FileA + definition in FileB = CORRECT cross-file architecture. Only flag when both are in the SAME file.
+
 1. **Locate the tag in question** (e.g., `<TypeSystemPrinciples/>`)
 2. **Check the syntax**: Does it have a closing slash `/>`?
    - YES (self-closing) → It's a REFERENCE. Skip to step 4.

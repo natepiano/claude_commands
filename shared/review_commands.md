@@ -48,8 +48,6 @@
     **Review Constraints**: Follow these analysis principles:
     <InitialReviewConstraints/>
 
-    **NOTE**: If <InitialReviewConstraints/> is not defined in the review command file, it will automatically fall back to <ReviewConstraints/>. Commands like design_review.md use phase-specific constraints, while code_review.md and command_review.md use a single constraint set for both phases.
-
     **NAMED FINDING DETECTION** (if applicable): <NamedFindingDetection/>
 
     Review ${REVIEW_TARGET} using the categories defined above and provide structured findings.
@@ -265,8 +263,6 @@ Extract exactly ${SELECTED_COUNT} findings and proceed immediately to <ReviewFol
 
     **Review Constraints**: Follow these analysis principles:
     <InvestigationConstraints/>
-
-    **NOTE**: If <InvestigationConstraints/> is not defined in the review command file, it will automatically fall back to <ReviewConstraints/>. Commands like design_review.md use phase-specific constraints (with different verification gates for investigation), while code_review.md and command_review.md use the same constraints for both phases.
 
     **Your Investigation Tasks:**
     1. Verify if this is a real issue or false positive
@@ -771,4 +767,3 @@ Include the JSON structure directly in your response message text. The main agen
 
 **RESPONSE FORMAT**: Your message response must contain ONLY the JSON object as text, with no markdown code blocks, no additional narrative, and no file operations.
 </JsonFormatInstructions>
-
