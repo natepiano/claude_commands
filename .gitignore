@@ -8,6 +8,7 @@
 !commands/**
 !scripts/
 !scripts/**
+scripts/__pycache__/
 !shared/
 !shared/**
 !CLAUDE.md
