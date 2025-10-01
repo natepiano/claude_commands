@@ -161,28 +161,32 @@ Provide a high-level summary of the subagent's findings:
 ## Key themes:
 [2-3 bullet points about main issues identified]
 
-**STOP HERE - DO NOT PROCEED TO STEP 4 YET**
+[If named findings exist: **Note**: ${count} named finding(s) will skip investigation as they are self-evident violations]
 
-**STEP 3 REQUIRED NEXT**: Execute <FindingPrioritization/> now. You MUST complete this step and output the prioritization decision before proceeding to Step 4.
-[If named findings exist: **Note: ${count} named finding(s) will skip investigation as they are self-evident violations**]
+**Next**: Proceeding to Step 3 (Finding Prioritization) and then Step 4 (Investigation)
 
 </InitialReviewSummary>
 
 <FindingPrioritization>
-**MAXIMUM FINDINGS LIMIT**: Reviews process a maximum of 6 findings for quality and focus.
+**INTERNAL STEP - Execute silently, output only the final decision**
 
-**MANDATORY FIRST STEP - COUNT YOUR FINDINGS**:
+**Step 1: Count findings**
 Count the total findings from the initial review: ${TOTAL_COUNT}
 
+**Step 2: Determine if prioritization is needed**
+
 **If findings ≤ 6**:
-State: "Found ${TOTAL_COUNT} findings - all will be reviewed (within limit)."
-**DO NOT WAIT** - Immediately execute <ReviewFollowup/> with all findings.
+- No prioritization needed
+- Proceed immediately to <ReviewFollowup/> with all findings
+- DO NOT output anything to the user for this step
+- DO NOT display "Found X findings" messages
+- Silently continue to Step 4
 
 **If findings > 6**:
-**CRITICAL ENFORCEMENT**: You have ${TOTAL_COUNT} findings but can only review 6.
-You MUST execute prioritization - proceeding with all findings is a violation.
+- Prioritization is REQUIRED
+- You MUST select exactly 6 findings to review
 
-Execute prioritization:
+**Step 3: Execute prioritization (only if > 6 findings)**
 
 1. **Separate named findings** (if any) - these always have priority
 2. **Score remaining findings** by:
@@ -196,34 +200,33 @@ Execute prioritization:
    - Store: Finding IDs, titles, categories, and priority of findings NOT reviewed
    - Report in <FinalSummary/>
 
-**MANDATORY OUTPUT - You MUST display this prioritization decision**:
-```
-Prioritizing findings: ${total_findings} findings received, reviewing top 6 by priority and impact.
+**Step 4: Output prioritization decision (only if > 6 findings)**
 
-**Selected for Review** (6 findings only):
+Display this to the user:
+```
+Prioritization required: ${total_findings} findings identified, reviewing top 6 by priority and impact.
+
+**Selected for Review**:
 ${list_of_exactly_6_finding_ids_and_titles}
 
-**Deferred** (${count} findings - available for future review):
+**Deferred**:
 ${list_of_deferred_finding_ids_and_titles}
 ```
 
-**CRITICAL VERIFICATION BEFORE PROCEEDING**:
-- Count the findings you're about to investigate in ReviewFollowup
-- The count MUST be exactly 6 (or fewer if total findings < 6)
-- If you're about to investigate more than 6, STOP - you violated prioritization
-
-**CRITICAL - CREATE FILTERED FINDINGS LIST AND PROCEED**:
-After displaying prioritization, you MUST immediately:
+**Step 5: Create filtered findings list**
 1. Extract only the 6 selected findings from the original findings array
-2. Store them in a variable: FILTERED_FINDINGS = [the 6 selected finding objects]
+2. Store them: FILTERED_FINDINGS = [the 6 selected finding objects]
 3. Verify count: len(FILTERED_FINDINGS) must equal 6 (or total if < 6)
-4. **WITHOUT STOPPING**, execute <ReviewFollowup/> with the filtered findings
 
-**ENFORCEMENT**:
+**Step 6: Proceed to investigation**
+**WITHOUT STOPPING**, execute <ReviewFollowup/> with the filtered findings (or all findings if ≤ 6)
+
+**CRITICAL ENFORCEMENT**:
 - If you proceed with more than 6 findings, you have FAILED
-- If you stop after verification instead of proceeding to Step 4, you have FAILED
-
-**YOU MUST NOT STOP BETWEEN STEP 3 AND STEP 4** - No status messages, no waiting, proceed directly to investigation.
+- If findings ≤ 6, output NOTHING for this step - proceed silently to Step 4
+- If findings > 6, output ONLY the prioritization decision above
+- No "STOP HERE" messages, no "DO NOT WAIT" instructions to user
+- These are internal instructions for you, not user-facing output
 </FindingPrioritization>
 
 ## STEP 4: INVESTIGATION
