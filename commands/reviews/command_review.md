@@ -58,6 +58,9 @@ REVIEW_CONTEXT is set to: We are reviewing a COMMAND FILE for structural improve
 
 ## REVIEW CONSTRAINTS
 
+**ARCHITECTURE NOTE**: This command uses the same constraints for both initial review and investigation phases.
+The phase-specific constraint sections below reference the shared <ReviewConstraints> section.
+
 <ReviewConstraints>
     **Note**: All constraint sections below are defined within this command file (command_review.md), not in external files.
 
@@ -74,6 +77,15 @@ REVIEW_CONTEXT is set to: We are reviewing a COMMAND FILE for structural improve
     - <TemplateVariableStandards/>
     - <ScriptManagement/>
 </ReviewConstraints>
+
+<!-- Phase-specific constraint sections (both reference the same constraints above) -->
+<InitialReviewConstraints>
+    <ReviewConstraints/>
+</InitialReviewConstraints>
+
+<InvestigationConstraints>
+    <ReviewConstraints/>
+</InvestigationConstraints>
 
 <StructuralAssessment>
 Before reviewing, determine the command's current structural state:

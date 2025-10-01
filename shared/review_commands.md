@@ -42,7 +42,9 @@
     **CRITICAL CONTEXT**: ${REVIEW_CONTEXT}
     **WARNING**: This is a plan for FUTURE changes. Do NOT report issues about planned features not existing in current code - they don't exist because they haven't been built yet!
     **Review Constraints**: Follow these analysis principles:
-    <ReviewConstraints/>
+    <InitialReviewConstraints/>
+
+    **NOTE**: If <InitialReviewConstraints/> is not defined in the review command file, it will automatically fall back to <ReviewConstraints/>. Commands like design_review.md use phase-specific constraints, while code_review.md and command_review.md use a single constraint set for both phases.
 
     **NAMED FINDING DETECTION** (if applicable): <NamedFindingDetection/>
 
@@ -155,7 +157,9 @@ Provide a high-level summary of the subagent's findings:
 ## Key themes:
 [2-3 bullet points about main issues identified]
 
-**IMMEDIATELY CONTINUE TO STEP 3**: Now execute <FindingPrioritization/> followed by <ReviewFollowup/>
+**STOP HERE - DO NOT PROCEED TO STEP 4 YET**
+
+**STEP 3 REQUIRED NEXT**: Execute <FindingPrioritization/> now. You MUST complete this step and output the prioritization decision before proceeding to Step 4.
 [If named findings exist: **Note: ${count} named finding(s) will skip investigation as they are self-evident violations**]
 
 </InitialReviewSummary>
@@ -163,9 +167,18 @@ Provide a high-level summary of the subagent's findings:
 <FindingPrioritization>
 **MAXIMUM FINDINGS LIMIT**: Reviews process a maximum of 6 findings for quality and focus.
 
-**If findings ≤ 6**: Proceed with all findings
+**MANDATORY FIRST STEP - COUNT YOUR FINDINGS**:
+Count the total findings from the initial review: ${TOTAL_COUNT}
 
-**If findings > 6**: Execute prioritization:
+**If findings ≤ 6**:
+State: "Found ${TOTAL_COUNT} findings - all will be reviewed (within limit)."
+Proceed directly to <ReviewFollowup/> with all findings.
+
+**If findings > 6**:
+**CRITICAL ENFORCEMENT**: You have ${TOTAL_COUNT} findings but can only review 6.
+You MUST execute prioritization - proceeding with all findings is a violation.
+
+Execute prioritization:
 
 1. **Separate named findings** (if any) - these always have priority
 2. **Score remaining findings** by:
@@ -179,17 +192,32 @@ Provide a high-level summary of the subagent's findings:
    - Store: Finding IDs, titles, categories, and priority of findings NOT reviewed
    - Report in <FinalSummary/>
 
-**Output prioritization decision**:
+**MANDATORY OUTPUT - You MUST display this prioritization decision**:
 ```
 Prioritizing findings: ${total_findings} findings received, reviewing top 6 by priority and impact.
 
-**Reviewing**: ${list_of_6_finding_ids_and_titles}
+**Selected for Review** (6 findings only):
+${list_of_exactly_6_finding_ids_and_titles}
 
 **Deferred** (${count} findings - available for future review):
 ${list_of_deferred_finding_ids_and_titles}
 ```
 
-**THEN IMMEDIATELY**: Proceed to <ReviewFollowup/> with the selected 6 findings.
+**CRITICAL VERIFICATION BEFORE PROCEEDING**:
+- Count the findings you're about to investigate in ReviewFollowup
+- The count MUST be exactly 6 (or fewer if total findings < 6)
+- If you're about to investigate more than 6, STOP - you violated prioritization
+
+**CRITICAL - CREATE FILTERED FINDINGS LIST**:
+After displaying prioritization, you MUST:
+1. Extract only the 6 selected findings from the original findings array
+2. Store them in a variable: FILTERED_FINDINGS = [the 6 selected finding objects]
+3. Verify count: len(FILTERED_FINDINGS) must equal 6 (or total if < 6)
+4. Display: "Filtered findings count verified: ${count} findings ready for review"
+
+**ENFORCEMENT**: If you proceed to ReviewFollowup with more than 6 findings, you have FAILED.
+
+**THEN PROCEED**: Continue to <ReviewFollowup/> with ONLY the 6 selected findings.
 </FindingPrioritization>
 
 ## STEP 4: INVESTIGATION
@@ -212,6 +240,12 @@ ${list_of_deferred_finding_ids_and_titles}
     - ❌ Investigating findings that have "named_finding" field
 
     **CORRECT EXECUTION**:
+    **MANDATORY PRE-FLIGHT CHECK**:
+    1. Count the findings you're about to investigate
+    2. If count > 6, STOP - you violated <FindingPrioritization/>
+    3. If count ≤ 6, display: "Pre-flight check passed: ${count} findings to investigate"
+
+    **THEN EXECUTE INVESTIGATION**:
     1. Count findings to investigate (after <FindingPrioritization/> has selected top 6):
        - If named findings exist: "${M} named finding(s) will skip investigation, investigating the remaining ${N} findings"
        - If no named findings: "Investigating ${N} findings"
@@ -243,7 +277,9 @@ ${list_of_deferred_finding_ids_and_titles}
     Analyze this finding and provide an investigation verdict. It is important that you think very hard about this review task.
 
     **Review Constraints**: Follow these analysis principles:
-    <ReviewConstraints/>
+    <InvestigationConstraints/>
+
+    **NOTE**: If <InvestigationConstraints/> is not defined in the review command file, it will automatically fall back to <ReviewConstraints/>. Commands like design_review.md use phase-specific constraints (with different verification gates for investigation), while code_review.md and command_review.md use the same constraints for both phases.
 
     **Your Investigation Tasks:**
     1. Verify if this is a real issue or false positive

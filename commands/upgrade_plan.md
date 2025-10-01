@@ -136,6 +136,15 @@ UPGRADE_SUFFIX = -upgraded.md
     Please select one of the keywords above.
     STOP.
 
+    Execute <ValidateUserResponse/> with:
+        expected_keywords: [fix, ignore, abort]
+        option_descriptions: [
+            "- **fix** - Stop and fix the plan first",
+            "- **ignore** - Continue despite gaps",
+            "- **abort** - Cancel upgrade"
+        ]
+
+    Handle validated response:
     If "fix": Show priority gaps to address, exit.
     If "ignore": Warn and proceed to Step 3.
     If "abort": Exit.
@@ -157,7 +166,16 @@ Return JSON:
 {
   "gaps_found": boolean,
   "gap_count": number,
-  "gaps": [...],
+  "gaps": [
+    {
+      "gap_type": "string",
+      "file": "path/to/file",
+      "current_code": "code snippet",
+      "plan_proposal": "what plan says",
+      "what's_missing": "specific details",
+      "severity": "CRITICAL|HIGH|MEDIUM|LOW"
+    }
+  ],
   "summary": "assessment"
 }
 </GapAnalysisPrompt>
@@ -400,6 +418,8 @@ Return JSON:
        - ⚠️ MINOR GAPS: Small formatting or non-critical details missing (list them)
        - ❌ MAJOR GAPS: Important implementation details or sections missing (list them)
 
+    **CRITICAL**: You MUST format your response EXACTLY as specified below. The verdict line must match one of the three exact formats for proper parsing.
+
     Format your response as:
     ```
     VALIDATION REPORT
@@ -417,7 +437,14 @@ Return JSON:
     Verdict: [COMPLETE/MINOR GAPS/MAJOR GAPS]
 
     [If gaps found, provide specific file:line references where possible]
-    ```"
+    ```
+
+    **PARSING REQUIREMENT**: The verdict line MUST be EXACTLY one of these three options:
+    - "Verdict: COMPLETE"
+    - "Verdict: MINOR GAPS"
+    - "Verdict: MAJOR GAPS"
+
+    Do NOT add emojis, parenthetical notes, or any other text to the verdict line."
 
     Display: "🔍 Validating content preservation..."
 

@@ -79,8 +79,27 @@ Registry of named findings that bypass investigation due to self-evident violati
 
 ## REVIEW CONSTRAINTS
 
-<ReviewConstraints>
-    - <SkipNotesCheck/>
+**ARCHITECTURE NOTE**: This command uses phase-specific constraints because design reviews have unique risks:
+- Initial Review generates findings from plans (high risk of scope/intent misunderstanding)
+- Investigation validates those findings (different verification needs)
+
+The split allows PlanComprehensionPhase (forcing plan understanding) to run ONLY during initial review,
+while both phases share common principles like TypeSystemPrinciples and PlanNotImplementation.
+
+Commands without this split (code_review.md, command_review.md) use single <ReviewConstraints> for both phases.
+
+<InitialReviewConstraints>
+    **Phase: Initial Review (Finding Generation)**
+
+    <!-- Phase-Specific: Execute before generating findings -->
+    - <PlanComprehensionPhase/>  <!-- Forces plan understanding BEFORE critique -->
+    - <SkipNotesCheck/>  <!-- Check previously rejected suggestions -->
+
+    <!-- Quality Gates -->
+    - <InitialFindingVerificationGates/>  <!-- Verify findings before including them -->
+
+    <!-- Review Principles (shared with Investigation phase) -->
+    - <PlanTypeReviewPrinciples/>  <!-- Tailor review to plan type -->
     - <TypeSystemPrinciples/>
     - <AtomicChangeRequirement/>
     - <DuplicationPrevention/>
@@ -90,7 +109,26 @@ Registry of named findings that bypass investigation due to self-evident violati
     - <ImplementationCoverageCheck/>
     - <ImplementationSpecificity/>
     - <LineNumberProhibition/>
-</ReviewConstraints>
+</InitialReviewConstraints>
+
+<InvestigationConstraints>
+    **Phase: Investigation (Finding Validation)**
+
+    <!-- Quality Gates for Investigation -->
+    - <InvestigationVerificationGates/>  <!-- Re-verify during validation -->
+
+    <!-- Review Principles (shared with Initial Review phase) -->
+    - <PlanTypeReviewPrinciples/>  <!-- Tailor verdict reasoning to plan type -->
+    - <TypeSystemPrinciples/>
+    - <AtomicChangeRequirement/>
+    - <DuplicationPrevention/>
+    - <DocumentComprehension/>
+    - <DesignConsistency/>
+    - <PlanNotImplementation/>
+    - <ImplementationCoverageCheck/>
+    - <ImplementationSpecificity/>
+    - <LineNumberProhibition/>
+</InvestigationConstraints>
 
 
 <SkipNotesCheck>
@@ -197,6 +235,13 @@ ONLY evaluate:
 **MANDATORY IMPLEMENTATION COVERAGE ANALYSIS**:
 Every stated goal, use case, requirement, or necessary feature MUST have corresponding implementation steps.
 
+**CRITICAL - Plan Type Matters**:
+- **Internal Refactoring**: Don't look for user documentation or usage examples - check technical goals only
+- **Documentation Plans**: Don't look for feature implementations - check documentation completeness
+- **API Design**: Look for contract specifications, not internal implementation details
+- **Feature Implementation**: Check user-facing goals against implementation sections
+- **NEVER** flag missing features that were never in the plan's stated scope
+
 1. **Extract All Commitments**: Identify every:
    - Stated goal or objective
    - Use case or user story
@@ -218,7 +263,12 @@ Every stated goal, use case, requirement, or necessary feature MUST have corresp
    - Examples show functionality not in implementation
    - "Future work" items that should be current scope
 
-4. **Priority**: All IMPLEMENTATION-GAP issues are HIGH priority
+4. **DO NOT Flag**:
+   - User-facing examples in internal refactoring plans (not needed)
+   - Implementation details in documentation plans (out of scope)
+   - Features never claimed by the plan (scope creep)
+
+5. **Priority**: All IMPLEMENTATION-GAP issues are HIGH priority
    - These represent broken promises
    - Users expect these features based on the plan
    - Missing these undermines trust
@@ -258,6 +308,147 @@ Design documents must NEVER contain line number references because they become s
 
 **RATIONALE**: Line numbers change with every edit, making design documents immediately obsolete and causing implementation confusion.
 </LineNumberProhibition>
+
+<PlanComprehensionPhase>
+**MANDATORY PRE-WORK - COMPLETE BEFORE GENERATING ANY FINDINGS**:
+
+You MUST complete these steps and output the results BEFORE generating any findings:
+
+**Step 1: Read the Complete Plan**
+- Use Read tool to read the entire plan document from start to finish
+- Do NOT skim or keyword search - read every section
+
+**Step 2: Extract Plan Fundamentals**
+Output the following in a structured format:
+- **Purpose**: What is this plan trying to achieve? (1-2 sentences)
+- **Scope**: What specific area/component does this change? (list)
+- **In-Scope**: What does the plan explicitly address? (list)
+- **Out-of-Scope**: What does the plan explicitly exclude? (list from plan or inferred)
+- **Plan Type**: Classify as ONE of:
+  * Internal Refactoring (code structure improvement, no external API changes)
+  * API Design (new or modified public APIs)
+  * Feature Implementation (new user-facing functionality)
+  * Documentation (type guides, examples, internal docs)
+  * Bug Fix (correcting incorrect behavior)
+
+**Step 3: Review Approach Selection**
+Based on plan type, state which review principles apply:
+- Internal Refactoring → Focus on: consistency, duplication elimination, architectural coherence
+- API Design → Focus on: type safety, error handling, backward compatibility
+- Feature Implementation → Focus on: completeness, user experience, edge cases
+- Documentation → Focus on: accuracy, clarity, completeness of examples
+- Bug Fix → Focus on: root cause addressed, no regressions, test coverage
+
+**Step 4: Terminology Check**
+List any domain-specific terms and their meaning in THIS plan's context.
+Example: "root example" in this plan means: [definition from plan context]
+
+**CRITICAL**: If you cannot complete these steps, you MUST NOT proceed with findings generation.
+Output this analysis BEFORE generating any findings JSON.
+</PlanComprehensionPhase>
+
+<InitialFindingVerificationGates>
+**MANDATORY SELF-VALIDATION - CHECK EVERY FINDING BEFORE INCLUDING IT**:
+
+For EACH potential finding, verify ALL of these gates pass. If ANY gate fails, DISCARD the finding:
+
+**Gate 1: File Existence**
+- If location.code_file is specified:
+  * Use Read tool to verify file exists
+  * Extract ACTUAL code snippet for current_code
+  * If file doesn't exist AND isn't marked as "PLANNED NEW FILE", DISCARD finding
+
+**Gate 2: Section Existence**
+- If location.plan_reference cites a section name:
+  * Use Grep to search plan for that section heading
+  * Confirm section discusses the topic you claim
+  * If section doesn't exist, DISCARD finding
+
+**Gate 3: Scope Relevance**
+- Is this concern within the plan's stated scope?
+- Does the plan claim to address this area?
+- If NO to both: DISCARD finding (unless it's a scope gap issue)
+
+**Gate 4: Not Already Implemented**
+- If suggesting new functionality:
+  * Use Grep to search codebase for existing implementation
+  * Check if the plan already describes this fix
+  * If already exists, DISCARD finding (not a gap)
+
+**Gate 5: Plan Type Alignment**
+- Does this finding match the review approach for this plan type?
+- Example: Don't apply API design principles to documentation plans
+- If misaligned, DISCARD finding
+
+**Gate 6: Not In Skip Notes**
+- Check if this suggestion appears in "Design Review Skip Notes"
+- If previously rejected, DISCARD finding
+
+**ENFORCEMENT**: Only include findings that pass ALL six gates.
+If more than 50% of your draft findings fail these gates, STOP and re-read the plan.
+</InitialFindingVerificationGates>
+
+<InvestigationVerificationGates>
+**MANDATORY VALIDATION - VERIFY THE FINDING IS LEGITIMATE**:
+
+Before assigning a CONFIRMED or MODIFIED verdict, verify:
+
+**Gate 1: Evidence Exists**
+- Can you confirm the issue exists where claimed?
+- If file path was cited, does the actual code match the finding's claim?
+- If not verifiable, verdict should be REJECTED
+
+**Gate 2: Within Scope**
+- Is this issue within the plan's stated scope per PlanComprehensionPhase analysis?
+- If outside scope and not a scope gap issue, verdict should be REJECTED
+
+**Gate 3: Not Already Addressed**
+- Does the plan already address this in another section?
+- Use Grep to search plan for related solutions
+- If already addressed, verdict should be REJECTED with "redundant" reasoning
+
+**Gate 4: Actual Problem**
+- Is this a real design issue or misunderstanding?
+- Does it align with plan type review principles?
+- If misunderstood or category error, verdict should be REJECTED
+
+**ENFORCEMENT**: Only CONFIRM findings that pass all gates.
+Use REJECTED verdict liberally when findings fail verification.
+</InvestigationVerificationGates>
+
+<PlanTypeReviewPrinciples>
+**TAILOR YOUR REVIEW TO THE PLAN TYPE**:
+
+**For Internal Refactoring Plans**:
+✓ DO review: Code duplication, consistency, architectural coherence
+✓ DO check: Data structure design, function organization
+✗ DON'T expect: User documentation, usage examples, backward compatibility concerns
+✗ DON'T suggest: New user-facing features, API expansions
+
+**For API Design Plans**:
+✓ DO review: Type safety, error handling, backward compatibility
+✓ DO check: API surface design, contract clarity
+✗ DON'T focus on: Internal implementation details, refactoring opportunities
+
+**For Documentation Plans**:
+✓ DO review: Accuracy, clarity, completeness of examples
+✓ DO check: Example code correctness, coverage of use cases
+✗ DON'T suggest: Implementation changes, type system redesigns
+✗ DON'T apply: Runtime validation concerns (handled by subject code)
+
+**For Feature Implementation Plans**:
+✓ DO review: Completeness, user experience, edge cases
+✓ DO check: Integration points, migration strategy
+✗ DON'T confuse: Internal tooling plans with user-facing features
+
+**For Bug Fix Plans**:
+✓ DO review: Root cause analysis, regression prevention
+✓ DO check: Test coverage, edge case handling
+✗ DON'T suggest: Architectural redesigns beyond the fix scope
+
+**CRITICAL**: Applying the wrong review lens is a category error that invalidates findings.
+Always reference the Plan Type from PlanComprehensionPhase when evaluating findings.
+</PlanTypeReviewPrinciples>
 
 <ReviewKeywords>
     **For CONFIRMED verdicts:**

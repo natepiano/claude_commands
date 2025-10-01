@@ -79,11 +79,23 @@ REVIEW_CONTEXT = We are reviewing ACTUAL CODE for quality issues, NOT a plan. We
 
 ## REVIEW CONSTRAINTS
 
+**ARCHITECTURE NOTE**: This command uses the same constraints for both initial review and investigation phases.
+The phase-specific constraint sections below reference the shared <ReviewConstraints> section.
+
 <ReviewConstraints>
     - <RustIdiomsCompliance/>
     - <TypeSystemPrinciples/>
     - <CodeDuplicationDetection/>
 </ReviewConstraints>
+
+<!-- Phase-specific constraint sections (both reference the same constraints above) -->
+<InitialReviewConstraints>
+    <ReviewConstraints/>
+</InitialReviewConstraints>
+
+<InvestigationConstraints>
+    <ReviewConstraints/>
+</InvestigationConstraints>
 
 <RustIdiomsCompliance>
 **MANDATORY CLIPPY COMPLIANCE CHECK**:
