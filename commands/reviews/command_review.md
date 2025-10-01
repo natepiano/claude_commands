@@ -64,7 +64,9 @@ The phase-specific constraint sections below reference the shared <ReviewConstra
 <ReviewConstraints>
     **Note**: All constraint sections below are defined within this command file (command_review.md), not in external files.
 
-    - <SharedWorkflowPattern/> ← CHECK THIS FIRST
+    - <PrimaryGoal/> ← CHECK THIS FIRST
+    - <ReferenceBeforeDefinition/>
+    - <SharedWorkflowPattern/>
     - <StructuralAssessment/>
     - <CommandClarityPrinciples/>
     - <TaggedSectionRequirements/>
@@ -77,6 +79,42 @@ The phase-specific constraint sections below reference the shared <ReviewConstra
     - <TemplateVariableStandards/>
     - <ScriptManagement/>
 </ReviewConstraints>
+
+<PrimaryGoal>
+Do the most correct thing using the least amount of input tokens, output tokens and thinking tokens.
+
+Strategies: Tagged section reuse, shared workflows, template variables, script delegation, verbosity elimination, pattern consistency.
+
+All other <ReviewConstraints/> are subject to this goal.
+</PrimaryGoal>
+
+<ReferenceBeforeDefinition>
+Command structure must present references before their definitions.
+
+**Rule**: `<TagName/>` references appear before `<TagName>content</TagName>` definitions in file order.
+
+**Why**: Token efficiency and reduced cognitive load.
+
+**Correct structure**:
+```
+<ExecutionSteps>
+    STEP 1: Execute <ParseInput/>
+    STEP 2: Execute <ValidateData/>
+</ExecutionSteps>
+
+<ParseInput>
+[definition]
+</ParseInput>
+
+<ValidateData>
+[definition]
+</ValidateData>
+```
+
+**Action**: Propose reorganization plan moving definitions after their references, with concise summary using command-specific context.
+
+**Flag for reorganization**: Any definition appearing before its first reference.
+</ReferenceBeforeDefinition>
 
 <!-- Phase-specific constraint sections (both reference the same constraints above) -->
 <InitialReviewConstraints>
