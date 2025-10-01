@@ -26,23 +26,25 @@ Review with the foresight of someone who has seen countless projects fail due to
 </ReviewPersona>
 
 <InitialReviewOutput>
-Step 1: Initial Design Review
-
-  Plan Document: ${PLAN_DOCUMENT}
-
-  Now I'll launch the Task tool for the initial review:
+Step 1: **Initial Design Review**
+**Plan Document**: ${PLAN_DOCUMENT_RELATIVE}
+Now I'll begin the initial review:
 </InitialReviewOutput>
 
 <DetermineReviewTarget>
-**Execute this step to determine what to review:**
+**Execute this step to determine what to review (internal use only - do not output):**
 
-PLAN_DOCUMENT = The plan document path (from ongoing work context or $ARGUMENTS)
+PLAN_DOCUMENT = The absolute plan document path (from ongoing work context or $ARGUMENTS)
+PLAN_DOCUMENT_RELATIVE = Convert PLAN_DOCUMENT to a path relative to the current working directory
 REVIEW_TARGET = the feature design in ${PLAN_DOCUMENT}
 REVIEW_CONTEXT = We are reviewing a FUTURE PLAN that has NOT been implemented yet. Our goal is to evaluate the DESIGN QUALITY of the proposed changes, NOT to check if they exist in current code.
 
 Set PLAN_DOCUMENT using <PlanDocument/>
+Calculate PLAN_DOCUMENT_RELATIVE as the relative path from current working directory
 Set REVIEW_TARGET to: the feature design in ${PLAN_DOCUMENT}
 Set REVIEW_CONTEXT to: We are reviewing a FUTURE PLAN that has NOT been implemented yet. Our goal is to evaluate the DESIGN QUALITY of the proposed changes, NOT to check if they exist in current code.
+
+These are internal execution variables - only output PLAN_DOCUMENT_RELATIVE to the user per InitialReviewOutput template.
 </DetermineReviewTarget>
 
 
