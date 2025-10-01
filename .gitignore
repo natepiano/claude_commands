@@ -2,6 +2,8 @@
 *
 
 # But track these specific files/folders
+!bevy_migration/
+!bevy_migration/**
 !commands/
 !commands/**
 !scripts/
