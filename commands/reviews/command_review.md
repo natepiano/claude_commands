@@ -5,6 +5,10 @@
 2. That file provides the required <ExecutionSteps> for this command
 3. Some tagged sections reference review_commands.md (e.g., <ExecutionSteps/>), others are defined in this file (e.g., <ReviewPersona/>)
 
+<ReviewConfiguration>
+MAX_FOLLOWUP_REVIEWS = 8
+</ReviewConfiguration>
+
 <ExecutionSteps/>
 
 <ReviewPersona>
@@ -24,9 +28,10 @@ Review with the meticulous attention of someone who has debugged hundreds of fai
 </ReviewPersona>
 
 <InitialReviewOutput>
-Step 1: Initial Command Review
-
-Command File: ${COMMAND_FILE}
+**Step 1**: Initial Command Review
+**Command File**: ${COMMAND_FILE}
+**Max Followup Reviews**: ${MAX_FOLLOWUP_REVIEWS}
+Now I'll launch the Task tool for the initial command review:
 </InitialReviewOutput>
 
 <DetermineReviewTarget>
@@ -58,13 +63,12 @@ REVIEW_CONTEXT is set to: We are reviewing a COMMAND FILE for structural improve
 
 ## REVIEW CONSTRAINTS
 
-**ARCHITECTURE NOTE**: This command uses the same constraints for both initial review and investigation phases.
-The phase-specific constraint sections below reference the shared <ReviewConstraints> section.
+<InitialReviewConstraints>
+    **Phase: Initial Review (Finding Generation)**
 
-<ReviewConstraints>
     **Note**: All constraint sections below are defined within this command file (command_review.md), not in external files.
 
-    - <PrimaryGoal/> ← CHECK THIS FIRST
+    - <PrimeDirective/> ← CHECK THIS FIRST
     - <ReferenceBeforeDefinition/>
     - <SharedWorkflowPattern/>
     - <StructuralAssessment/>
@@ -78,18 +82,41 @@ The phase-specific constraint sections below reference the shared <ReviewConstra
     - <CommandVerbosityCheck/>
     - <TemplateVariableStandards/>
     - <ScriptManagement/>
-</ReviewConstraints>
+</InitialReviewConstraints>
 
-<PrimaryGoal>
-Do the most correct thing using the least amount of input tokens, output tokens and thinking tokens.
+<InvestigationConstraints>
+    **Phase: Investigation (Finding Validation)**
+
+    **Note**: All constraint sections below are defined within this command file (command_review.md), not in external files.
+
+    - <PrimeDirective/> ← CHECK THIS FIRST
+    - <ReferenceBeforeDefinition/>
+    - <SharedWorkflowPattern/>
+    - <StructuralAssessment/>
+    - <CommandClarityPrinciples/>
+    - <TaggedSectionRequirements/>
+    - <ExecutionStepsRequired/>
+    - <ExecutionStepsFormat/>
+    - <ExecuteOnlyPatterns/>
+    - <InteractiveCommandPatterns/>
+    - <PatternConsistencyCheck/>
+    - <CommandVerbosityCheck/>
+    - <TemplateVariableStandards/>
+    - <ScriptManagement/>
+</InvestigationConstraints>
+
+<PrimeDirective>
+**FirstAndForemost** Do the most correct and accurate work
+**AndThen** Use the least amount of input tokens, output tokens and thinking tokens.
+**SuchThat** Accuracy is never sacrificed to token count.
 
 Strategies: Tagged section reuse, shared workflows, template variables, script delegation, verbosity elimination, pattern consistency.
 
-All other <ReviewConstraints/> are subject to this goal.
-</PrimaryGoal>
+All other constraints are subject to this goal.
+</PrimeDirective>
 
 <ReferenceBeforeDefinition>
-Command structure must present references before their definitions.
+Command structure must present references before their definitions **within the same file**.
 
 **Rule**: `<TagName/>` references appear before `<TagName>content</TagName>` definitions in file order.
 
@@ -114,16 +141,9 @@ Command structure must present references before their definitions.
 **Action**: Propose reorganization plan moving definitions after their references, with concise summary using command-specific context.
 
 **Flag for reorganization**: Any definition appearing before its first reference.
+
+**DO NOT FLAG**: Sections defined for external reference by other command files (e.g., `<InitialReviewConstraints>` in command_review.md referenced from review_commands.md).
 </ReferenceBeforeDefinition>
-
-<!-- Phase-specific constraint sections (both reference the same constraints above) -->
-<InitialReviewConstraints>
-    <ReviewConstraints/>
-</InitialReviewConstraints>
-
-<InvestigationConstraints>
-    <ReviewConstraints/>
-</InvestigationConstraints>
 
 <StructuralAssessment>
 Before reviewing, determine the command's current structural state:

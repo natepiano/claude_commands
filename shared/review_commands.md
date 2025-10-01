@@ -1,9 +1,3 @@
-## CONFIGURATION
-
-<ReviewConfiguration>
-MAX_FOLLOWUP_REVIEWS = 6
-</ReviewConfiguration>
-
 ## MAIN WORKFLOW
 
 <ExecutionSteps>
@@ -248,6 +242,8 @@ Extract exactly ${SELECTED_COUNT} findings and proceed immediately to <ReviewFol
     - Each with: description="Investigate FINDING-X: Title (X of INVESTIGATION_COUNT)"
 
     **ENFORCEMENT**: All ${INVESTIGATION_COUNT} Tasks MUST launch together in one message.
+
+    **CRITICAL**: Investigations update verdicts only. DO NOT execute keyword actions or use Edit/Write tools. Present updated findings to user and wait for keyword selection.
 
     **5. After ALL investigation subagents complete: IMMEDIATELY PROCEED TO STEP 5**
     **DO NOT STOP HERE** - Parse all investigation JSON responses and continue to <UserReview/>

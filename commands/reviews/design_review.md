@@ -5,6 +5,10 @@
 2. Find and follow the <ExecutionSteps> section from that file
 3. When you see tags like <ExecutionSteps/> below, these refer to sections in review_commands.md
 
+<ReviewConfiguration>
+MAX_FOLLOWUP_REVIEWS = 6
+</ReviewConfiguration>
+
 <ExecutionSteps/>
 
 <ReviewPersona>
@@ -28,7 +32,8 @@ Review with the foresight of someone who has seen countless projects fail due to
 <InitialReviewOutput>
 Step 1: **Initial Design Review**
 **Plan Document**: ${PLAN_DOCUMENT_RELATIVE}
-Now I'll begin the initial review:
+**Max Followup Reviews**: ${MAX_FOLLOWUP_REVIEWS}
+Now I'll begin the initial design review:
 </InitialReviewOutput>
 
 <DetermineReviewTarget>
@@ -88,7 +93,7 @@ Registry of named findings that bypass investigation due to self-evident violati
 The split allows PlanComprehensionPhase (forcing plan understanding) to run ONLY during initial review,
 while both phases share common principles like TypeSystemPrinciples and PlanNotImplementation.
 
-Commands without this split (code_review.md, command_review.md) use single <ReviewConstraints> for both phases.
+All review commands now use explicit phase-specific constraint sections for consistency, even when phases share identical constraints.
 
 <InitialReviewConstraints>
     **Phase: Initial Review (Finding Generation)**

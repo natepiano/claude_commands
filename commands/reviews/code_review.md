@@ -5,6 +5,10 @@
 2. Find and follow the <ExecutionSteps> section from that file
 3. When you see tags like <ExecutionSteps/> below, these refer to sections in review_commands.md
 
+<ReviewConfiguration>
+MAX_FOLLOWUP_REVIEWS = 7
+</ReviewConfiguration>
+
 <ExecutionSteps/>
 
 <ReviewPersona>
@@ -26,11 +30,10 @@ Review with the critical eye of someone responsible for maintaining mission-crit
 </ReviewPersona>
 
 <InitialReviewOutput>
-Step 1: Initial Code Review
-
-  Review Target: ${REVIEW_TARGET}
-
-  Now I'll launch the Task tool for the initial review:
+**Step 1**: Initial Code Review
+**Review Target**: ${REVIEW_TARGET}
+**Max Followup Reviews**: ${MAX_FOLLOWUP_REVIEWS}
+Now I'll launch the Task tool for the initial codereview:
 </InitialReviewOutput>
 
 <DetermineReviewTarget>
@@ -79,22 +82,20 @@ REVIEW_CONTEXT = We are reviewing ACTUAL CODE for quality issues, NOT a plan. We
 
 ## REVIEW CONSTRAINTS
 
-**ARCHITECTURE NOTE**: This command uses the same constraints for both initial review and investigation phases.
-The phase-specific constraint sections below reference the shared <ReviewConstraints> section.
+<InitialReviewConstraints>
+    **Phase: Initial Review (Finding Generation)**
 
-<ReviewConstraints>
     - <RustIdiomsCompliance/>
     - <TypeSystemPrinciples/>
     - <CodeDuplicationDetection/>
-</ReviewConstraints>
-
-<!-- Phase-specific constraint sections (both reference the same constraints above) -->
-<InitialReviewConstraints>
-    <ReviewConstraints/>
 </InitialReviewConstraints>
 
 <InvestigationConstraints>
-    <ReviewConstraints/>
+    **Phase: Investigation (Finding Validation)**
+
+    - <RustIdiomsCompliance/>
+    - <TypeSystemPrinciples/>
+    - <CodeDuplicationDetection/>
 </InvestigationConstraints>
 
 <RustIdiomsCompliance>
