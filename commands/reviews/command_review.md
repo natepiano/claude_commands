@@ -72,7 +72,8 @@ REVIEW_CONTEXT is set to: We are reviewing a COMMAND FILE for structural improve
 
     - <PrimeDirective/> ← CHECK THIS FIRST
     - <ReferenceBeforeDefinition/>
-    - <SharedWorkflowPattern/>
+    - <TaggedSectionPairing/>
+    - <TaggedSectionUsage/>
     - <StructuralAssessment/>
     - <CommandClarityPrinciples/>
     - <TaggedSectionRequirements/>
@@ -93,7 +94,8 @@ REVIEW_CONTEXT is set to: We are reviewing a COMMAND FILE for structural improve
 
     - <PrimeDirective/> ← CHECK THIS FIRST
     - <ReferenceBeforeDefinition/>
-    - <SharedWorkflowPattern/>
+    - <TaggedSectionPairing/>
+    - <TaggedSectionUsage/>
     - <StructuralAssessment/>
     - <CommandClarityPrinciples/>
     - <TaggedSectionRequirements/>
@@ -222,57 +224,40 @@ Commands must use tagged sections effectively for clarity and maintainability:
    - **JUST RIGHT**: <ProcessFileContents/> (contains open, read, process, close)
 </TaggedSectionRequirements>
 
-<SharedWorkflowPattern>
-**CRITICAL - CHECK THIS FIRST**: Commands using shared workflows reference sections from shared files using self-closing tag syntax.
+<TaggedSectionPairing>
+**CONSTRAINT**: Every reference must have exactly one definition.
 
-**XML-Style Tag Syntax Convention**:
-- `<TagName/>` (self-closing) = **REFERENCE** to section defined elsewhere
-- `<TagName>content</TagName>` (with content) = **LOCAL DEFINITION** of section
+**Pattern**:
+- `<TagName/>` = REFERENCE (invocation)
+- `<TagName>content</TagName>` = DEFINITION (instructions)
 
-**VERIFICATION STEPS - Execute before flagging any "duplication" or "missing" issues**:
+**Verification**:
+1. **Found reference `<TagName/>`?**
+   - Search current file for `<TagName>content</TagName>`
+   - Found? Valid. **DO NOT FLAG**.
+   - Not found? Check MANDATORY FIRST STEP for shared workflow
+     - Has shared workflow? Valid cross-file pairing. **DO NOT FLAG**.
+     - No shared workflow? Missing definition. **FLAG IT**.
 
-**CRITICAL**: Reference in FileA + definition in FileB = CORRECT cross-file architecture. Only flag when both are in the SAME file.
+2. **Found definition `<TagName>content</TagName>`?**
+   - Search for duplicate definitions of same tag
+   - Found duplicate? **FLAG IT**.
+   - No duplicate? Valid. **DO NOT FLAG**.
 
-1. **Locate the tag in question** (e.g., `<TypeSystemPrinciples/>`)
-2. **Check the syntax**: Does it have a closing slash `/>`?
-   - YES (self-closing) → It's a REFERENCE. Skip to step 4.
-   - NO (has opening/closing tags) → It's a DEFINITION. Continue to step 3.
-3. **For definitions**: Is there another definition of the same tag elsewhere?
-   - YES → This is genuine duplication. Flag it.
-   - NO → This is the canonical definition. Do not flag.
-4. **For references (self-closing tags)**: Search the ENTIRE file for a local definition
-   - Found `<TagName>content</TagName>` in the same file? → Flag as redundant (reference + definition in same file)
-   - NOT found? → This is correct usage of shared reference. **DO NOT FLAG**.
+**DO NOT FLAG**: Reference + definition in same file OR across files via shared workflow.
+</TaggedSectionPairing>
 
-**Pattern Recognition**:
-If a command file has:
-1. **MANDATORY FIRST STEP** documentation directing to a shared workflow file
-2. Self-closing tag references: `<TagName/>` (with trailing slash)
-3. Local sections with content between opening/closing tags
+<TaggedSectionUsage>
+**CONSTRAINT**: References invoke, definitions instruct.
 
-Then this is **CORRECTLY IMPLEMENTED** - do NOT flag as missing, duplicated, or inconsistent.
-
-**Common self-closing references** (these are NOT local definitions):
-- `<ExecutionSteps/>` - Shared workflow steps
-- `<PlanDocument/>` - Shared document resolution
-- `<TypeSystemPrinciples/>` - Shared type system design principles
-- `<DuplicationPrevention/>` - Shared duplication detection rules
-- Any other `<Tag/>` documented in MANDATORY FIRST STEP
-
-**DO NOT FLAG**:
-- "Missing ExecutionSteps" when `<ExecutionSteps/>` reference exists
-- "Missing definitions" for self-closing tags like `<TypeSystemPrinciples/>`
-- "Duplication" or "inconsistency" when mixing self-closing references with local definitions
-- "Undefined references" for any self-closing tags documented in MANDATORY FIRST STEP
-- "Duplication" when you see `<TypeSystemPrinciples/>` (reference) but NO `<TypeSystemPrinciples>content</TypeSystemPrinciples>` (definition)
-
-**The syntax IS the documentation**: Self-closing = reference, with-content = definition. This is intentional architecture, not inconsistency.
-
-**Example**: review_commands.md defines shared sections referenced by command_review, design_review, code_review
-</SharedWorkflowPattern>
+**Verify** (only if TaggedSectionPairing passes):
+- References `<TagName/>` appear in execution contexts (ExecutionSteps, workflow orchestration)
+- Definitions `<TagName>content</TagName>` contain instructions/content
+- **FLAG** if pattern is inverted (definition used for execution, reference contains instructions)
+</TaggedSectionUsage>
 
 <ExecutionStepsRequired>
-Commands with 3+ sequential operations MUST have ExecutionSteps (unless using <SharedWorkflowPattern/>):
+Commands with 3+ sequential operations MUST have ExecutionSteps (unless using shared workflow reference):
 
 **Detection Threshold**:
 - 3+ sequential operations requiring execution
@@ -282,7 +267,7 @@ Commands with 3+ sequential operations MUST have ExecutionSteps (unless using <S
 **EXEMPT** (no ExecutionSteps needed):
 - Simple 2-step commands (e.g., acknowledge-and-stop patterns)
 - Commands explicitly stating "ONE purpose" or similar
-- Commands using <SharedWorkflowPattern/>
+- Commands using `<ExecutionSteps/>` reference to shared workflow
 
 **Examples needing ExecutionSteps**: Data processing pipelines, review workflows, setup procedures
 </ExecutionStepsRequired>
