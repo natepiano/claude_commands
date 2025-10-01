@@ -71,7 +71,6 @@ REVIEW_CONTEXT is set to: We are reviewing a COMMAND FILE for structural improve
     **Note**: All constraint sections below are defined within this command file (command_review.md), not in external files.
 
     - <PrimeDirective/> ← CHECK THIS FIRST
-    - <ReferenceBeforeDefinition/>
     - <TaggedSectionPairing/>
     - <TaggedSectionUsage/>
     - <StructuralAssessment/>
@@ -93,7 +92,6 @@ REVIEW_CONTEXT is set to: We are reviewing a COMMAND FILE for structural improve
     **Note**: All constraint sections below are defined within this command file (command_review.md), not in external files.
 
     - <PrimeDirective/> ← CHECK THIS FIRST
-    - <ReferenceBeforeDefinition/>
     - <TaggedSectionPairing/>
     - <TaggedSectionUsage/>
     - <StructuralAssessment/>
@@ -119,36 +117,6 @@ Strategies: Tagged section reuse, shared workflows, template variables, script d
 
 All other constraints are subject to this goal.
 </PrimeDirective>
-
-<ReferenceBeforeDefinition>
-Command structure must present references before their definitions **within the same file**.
-
-**Rule**: `<TagName/>` references appear before `<TagName>content</TagName>` definitions in file order.
-
-**Why**: Token efficiency and reduced cognitive load.
-
-**Correct structure**:
-```
-<ExecutionSteps>
-    STEP 1: Execute <ParseInput/>
-    STEP 2: Execute <ValidateData/>
-</ExecutionSteps>
-
-<ParseInput>
-[definition]
-</ParseInput>
-
-<ValidateData>
-[definition]
-</ValidateData>
-```
-
-**Action**: Propose reorganization plan moving definitions after their references, with concise summary using command-specific context.
-
-**Flag for reorganization**: Any definition appearing before its first reference.
-
-**DO NOT FLAG**: Sections defined for external reference by other command files (e.g., `<InitialReviewConstraints>` in command_review.md referenced from review_commands.md).
-</ReferenceBeforeDefinition>
 
 <StructuralAssessment>
 Before reviewing, determine the command's current structural state:
@@ -225,7 +193,7 @@ Commands must use tagged sections effectively for clarity and maintainability:
 </TaggedSectionRequirements>
 
 <TaggedSectionPairing>
-**CONSTRAINT**: Every reference must have exactly one definition.
+**CONSTRAINT**: Every reference must have exactly one definition, and every definition must have exactly one reference.
 
 **Pattern**:
 - `<TagName/>` = REFERENCE (invocation)
@@ -240,20 +208,38 @@ Commands must use tagged sections effectively for clarity and maintainability:
      - No shared workflow? Missing definition. **FLAG IT**.
 
 2. **Found definition `<TagName>content</TagName>`?**
+   - Search current file for corresponding `<TagName/>` reference
+   - Found? Valid. **DO NOT FLAG**.
+   - Not found? Check if this file is referenced as shared workflow by another command
+     - Is shared workflow? Valid cross-file pairing. **DO NOT FLAG**.
+     - Not shared workflow? Orphaned definition. **FLAG IT**.
    - Search for duplicate definitions of same tag
    - Found duplicate? **FLAG IT**.
-   - No duplicate? Valid. **DO NOT FLAG**.
 
-**DO NOT FLAG**: Reference + definition in same file OR across files via shared workflow.
+**DO NOT FLAG**: Reference + definition in same file OR across files via shared workflow (reference in caller, definition in callee).
 </TaggedSectionPairing>
 
 <TaggedSectionUsage>
-**CONSTRAINT**: References invoke, definitions instruct.
+**CONSTRAINT**: References invoke, definitions instruct, and references must appear before definitions.
 
 **Verify** (only if TaggedSectionPairing passes):
-- References `<TagName/>` appear in execution contexts (ExecutionSteps, workflow orchestration)
-- Definitions `<TagName>content</TagName>` contain instructions/content
-- **FLAG** if pattern is inverted (definition used for execution, reference contains instructions)
+
+1. **Semantic correctness**:
+   - References `<TagName/>` appear in execution contexts (ExecutionSteps, workflow orchestration)
+   - Definitions `<TagName>content</TagName>` contain instructions/content
+   - **FLAG** if pattern is inverted (definition used for execution, reference contains instructions)
+
+2. **Ordering (same file)**:
+   - Reference `<TagName/>` must appear BEFORE definition `<TagName>content</TagName>` in file order
+   - **FLAG** if definition appears before its reference in the same file
+
+3. **Ordering (cross-file via shared workflow)**:
+   - Reference `<TagName/>` appears in caller file
+   - Definition `<TagName>content</TagName>` appears in callee file (shared workflow)
+   - Ordering is inherently correct (caller read before callee)
+   - **DO NOT FLAG** cross-file references
+
+**Why**: Token efficiency (read reference context before definition) and reduced cognitive load.
 </TaggedSectionUsage>
 
 <ExecutionStepsRequired>
