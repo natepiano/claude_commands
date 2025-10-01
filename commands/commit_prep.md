@@ -2,7 +2,6 @@
 
 <ExecutionSteps>
     **EXECUTE THESE STEPS IN ORDER:**
-
     **STEP 1:** Execute <CommitTitleHandling/>
     **STEP 2:** Execute <CommitPrep/>
 </ExecutionSteps>
@@ -53,8 +52,28 @@ Present to user:
 
 Wait for user response.
 
-If user selects **commit**: Run `git commit` with the prepared message and confirm success
+If user selects **commit**: Run `git commit` with the prepared message, then execute <CommitOutput/>
 If user selects **abandon**: Run `git reset` to unstage changes and stop
 
 After user responds, execute their choice.
 </FinalCommitDecision>
+
+<CommitOutput>
+After successful commit, format output as:
+
+```
+✅ **Commit successful**
+
+**Commit hash**: `[short hash]`
+**Changes**: [files changed summary]
+
+[additional git status info]
+```
+
+**Formatting requirements**:
+- Each field on its own line
+- Commit hash in code backticks
+- Blank line between commit info and additional status
+- Extract commit hash from git commit output
+- Extract changes summary from git commit output
+</CommitOutput>
