@@ -1,3 +1,9 @@
+## CONFIGURATION
+
+<ReviewConfiguration>
+MAX_FOLLOWUP_REVIEWS = 6
+</ReviewConfiguration>
+
 ## MAIN WORKFLOW
 
 <ExecutionSteps>
@@ -9,7 +15,7 @@
 
     **STEP 1:** Execute the <InitialReview/> - MUST use Task tool
     **STEP 2:** Summarize the subagent's findings using <InitialReviewSummary/>
-    **STEP 3:** Execute <FindingPrioritization/> - select top 6 findings if needed
+    **STEP 3:** Execute <FindingPrioritization/> - select top findings if needed
     **STEP 4:** Execute the <ReviewFollowup/> - MUST use Task tool for each finding
     **STEP 5:** Execute the <UserReview/>
 
@@ -168,65 +174,39 @@ Provide a high-level summary of the subagent's findings:
 </InitialReviewSummary>
 
 <FindingPrioritization>
-**INTERNAL STEP - Execute silently, output only the final decision**
+**MANDATORY: Display this structured output to force correct calculation:**
 
-**Step 1: Count findings**
-Count the total findings from the initial review: ${TOTAL_COUNT}
-
-**Step 2: Determine if prioritization is needed**
-
-**If findings ≤ 6**:
-- No prioritization needed
-- Proceed immediately to <ReviewFollowup/> with all findings
-- DO NOT output anything to the user for this step
-- DO NOT display "Found X findings" messages
-- Silently continue to Step 4
-
-**If findings > 6**:
-- Prioritization is REQUIRED
-- You MUST select exactly 6 findings to review
-
-**Step 3: Execute prioritization (only if > 6 findings)**
-
-1. **Separate named findings** (if any) - these always have priority
-2. **Score remaining findings** by:
-   - Priority: HIGH (3 points) > MEDIUM (2 points) > LOW (1 point)
-   - Category importance: TYPE-SYSTEM (3) > DESIGN/QUALITY (2) > others (1)
-   - Impact severity: Critical/High (3) > Medium (2) > Low (1)
-3. **Select top 6**:
-   - Include all named findings first (up to 6)
-   - Fill remaining slots with highest-scoring regular findings
-4. **Track deferred findings**:
-   - Store: Finding IDs, titles, categories, and priority of findings NOT reviewed
-   - Report in <FinalSummary/>
-
-**Step 4: Output prioritization decision (only if > 6 findings)**
-
-Display this to the user:
 ```
-Prioritization required: ${total_findings} findings identified, reviewing top 6 by priority and impact.
+Step 3: Finding Prioritization
 
-**Selected for Review**:
-${list_of_exactly_6_finding_ids_and_titles}
-
-**Deferred**:
-${list_of_deferred_finding_ids_and_titles}
+Total Findings: ${TOTAL_FINDINGS}
+Max Followup Reviews: ${MAX_FOLLOWUP_REVIEWS}
+Findings to Review: min(${TOTAL_FINDINGS}, ${MAX_FOLLOWUP_REVIEWS}) = ${SELECTED_COUNT}
 ```
 
-**Step 5: Create filtered findings list**
-1. Extract only the 6 selected findings from the original findings array
-2. Store them: FILTERED_FINDINGS = [the 6 selected finding objects]
-3. Verify count: len(FILTERED_FINDINGS) must equal 6 (or total if < 6)
+**If SELECTED_COUNT < TOTAL_FINDINGS (prioritization needed):**
 
-**Step 6: Proceed to investigation**
-**WITHOUT STOPPING**, execute <ReviewFollowup/> with the filtered findings (or all findings if ≤ 6)
+Display the prioritization:
+```
+Selected for Review (${SELECTED_COUNT} findings):
+${list_each_selected_finding_id_and_title}
 
-**CRITICAL ENFORCEMENT**:
-- If you proceed with more than 6 findings, you have FAILED
-- If findings ≤ 6, output NOTHING for this step - proceed silently to Step 4
-- If findings > 6, output ONLY the prioritization decision above
-- No "STOP HERE" messages, no "DO NOT WAIT" instructions to user
-- These are internal instructions for you, not user-facing output
+Deferred (${TOTAL_FINDINGS - SELECTED_COUNT} findings):
+${list_each_deferred_finding_id_and_title}
+```
+
+**Selection criteria** (execute internally, don't output):
+1. Include all named findings first (up to MAX_FOLLOWUP_REVIEWS)
+2. Score remaining by: Priority (HIGH=3, MEDIUM=2, LOW=1) + Category (TYPE-SYSTEM=3, DESIGN/QUALITY=2, other=1) + Impact (High=3, Medium=2, Low=1)
+3. Select top ${MAX_FOLLOWUP_REVIEWS} by score
+4. Store deferred findings for <FinalSummary/>
+
+**If SELECTED_COUNT = TOTAL_FINDINGS (no prioritization needed):**
+
+No output needed - silently proceed to Step 4
+
+**Create FILTERED_FINDINGS list:**
+Extract exactly ${SELECTED_COUNT} findings and proceed immediately to <ReviewFollowup/>
 </FindingPrioritization>
 
 ## STEP 4: INVESTIGATION
@@ -248,27 +228,26 @@ ${list_of_deferred_finding_ids_and_titles}
     - ❌ Starting with "I'll investigate finding 1" instead of "I'll investigate all ${N} findings"
     - ❌ Investigating findings that have "named_finding" field
 
-    **CORRECT EXECUTION**:
-    **MANDATORY PRE-FLIGHT CHECK**:
-    1. Count the findings you're about to investigate
-    2. If count > 6, STOP - you violated <FindingPrioritization/>
-    3. If count ≤ 6, display: "Pre-flight check passed: ${count} findings to investigate"
+    **MANDATORY: Display this structured output before launching investigations:**
+
+    ```
+    Step 4: Investigation
+
+    Total Findings: ${TOTAL_FINDINGS_FROM_STEP3}
+    Findings to Investigate: ${INVESTIGATION_COUNT}
+    ```
+
+    Where:
+    - TOTAL_FINDINGS_FROM_STEP3 = The count from Step 3 (should be ≤ MAX_FOLLOWUP_REVIEWS)
+    - INVESTIGATION_COUNT = TOTAL_FINDINGS_FROM_STEP3 minus any named findings
 
     **THEN EXECUTE INVESTIGATION**:
-    1. Count findings to investigate (after <FindingPrioritization/> has selected top 6):
-       - If named findings exist: "${M} named finding(s) will skip investigation, investigating the remaining ${N} findings"
-       - If no named findings: "Investigating ${N} findings"
-    2. Send ONE message containing:
-       - Statement:
-         - If named findings exist: "I'll investigate the remaining ${N} findings in parallel:"
-         - If no named findings: "I'll investigate the ${N} findings in parallel:"
-       - Single antml:function_calls block
-       - ${N} antml:invoke name="Task" elements (ALL in the same block)
-       - Each with: description="Investigate FINDING-X: Title (X of N)"
-    3. Wait for ALL ${N} subagents to complete simultaneously
-    4. Only then parse and process results
+    Send ONE message with ALL Task calls:
+    - Single antml:function_calls block
+    - ${INVESTIGATION_COUNT} antml:invoke elements (ALL in the same block)
+    - Each with: description="Investigate FINDING-X: Title (X of INVESTIGATION_COUNT)"
 
-    **ENFORCEMENT**: If you send even ONE Task alone, you have FAILED. All ${N} Tasks MUST launch together.
+    **ENFORCEMENT**: All ${INVESTIGATION_COUNT} Tasks MUST launch together in one message.
 
     **5. After ALL investigation subagents complete: IMMEDIATELY PROCEED TO STEP 5**
     **DO NOT STOP HERE** - Parse all investigation JSON responses and continue to <UserReview/>

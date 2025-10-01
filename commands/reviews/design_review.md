@@ -312,16 +312,18 @@ Design documents must NEVER contain line number references because they become s
 </LineNumberProhibition>
 
 <PlanComprehensionPhase>
+**FOR SUBAGENT USE ONLY - Main agent: pass this constraint to the subagent, do NOT execute it yourself**
+
 **MANDATORY PRE-WORK - COMPLETE BEFORE GENERATING ANY FINDINGS**:
 
-You MUST complete these steps and output the results BEFORE generating any findings:
+The review subagent MUST complete these steps internally BEFORE generating any findings:
 
 **Step 1: Read the Complete Plan**
 - Use Read tool to read the entire plan document from start to finish
 - Do NOT skim or keyword search - read every section
 
-**Step 2: Extract Plan Fundamentals**
-Output the following in a structured format:
+**Step 2: Extract Plan Fundamentals (internal analysis - do not output to user)**
+Determine the following internally to guide your review:
 - **Purpose**: What is this plan trying to achieve? (1-2 sentences)
 - **Scope**: What specific area/component does this change? (list)
 - **In-Scope**: What does the plan explicitly address? (list)
@@ -333,20 +335,18 @@ Output the following in a structured format:
   * Documentation (type guides, examples, internal docs)
   * Bug Fix (correcting incorrect behavior)
 
-**Step 3: Review Approach Selection**
-Based on plan type, state which review principles apply:
+**Step 3: Review Approach Selection (internal - do not output)**
+Based on plan type, internally determine which review principles apply:
 - Internal Refactoring → Focus on: consistency, duplication elimination, architectural coherence
 - API Design → Focus on: type safety, error handling, backward compatibility
 - Feature Implementation → Focus on: completeness, user experience, edge cases
 - Documentation → Focus on: accuracy, clarity, completeness of examples
 - Bug Fix → Focus on: root cause addressed, no regressions, test coverage
 
-**Step 4: Terminology Check**
-List any domain-specific terms and their meaning in THIS plan's context.
-Example: "root example" in this plan means: [definition from plan context]
+**Step 4: Terminology Check (internal - do not output)**
+Internally identify any domain-specific terms and their meaning in THIS plan's context.
 
-**CRITICAL**: If you cannot complete these steps, you MUST NOT proceed with findings generation.
-Output this analysis BEFORE generating any findings JSON.
+**CRITICAL**: Complete these steps internally to inform your review approach, then proceed directly to generating findings JSON. Do NOT output this analysis to the user - it is internal pre-work only.
 </PlanComprehensionPhase>
 
 <InitialFindingVerificationGates>
