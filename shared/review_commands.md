@@ -5,13 +5,15 @@
 
     **ADOPT YOUR PERSONA:** Execute <ReviewPersona/> to establish your review expertise and mindset
 
-    **EXECUTE THESE STEPS IN ORDER:**
+    **EXECUTE THESE STEPS IN ORDER - ALL 5 STEPS ARE MANDATORY:**
 
     **STEP 1:** Execute the <InitialReview/> - MUST use Task tool
     **STEP 2:** Summarize the subagent's findings using <InitialReviewSummary/>
     **STEP 3:** Execute <FindingPrioritization/> - select top 6 findings if needed
     **STEP 4:** Execute the <ReviewFollowup/> - MUST use Task tool for each finding
     **STEP 5:** Execute the <UserReview/>
+
+    **DO NOT STOP until all 5 steps are complete.** Each step must flow directly into the next.
 </ExecutionSteps>
 
 <PlanDocument>
@@ -32,7 +34,9 @@
     - subagent_type: "general-purpose"
     - prompt: Everything in <InitialReviewPrompt> below with placeholders replaced
 
-    **4. Wait for subagent completion before Step 2**
+    **4. After subagent completes: IMMEDIATELY PROCEED TO STEP 2**
+    **DO NOT STOP HERE** - The review workflow requires all 5 steps to complete.
+    Parse the subagent's JSON response and continue to <InitialReviewSummary/>
 </InitialReview>
 
 <InitialReviewPrompt>
@@ -172,7 +176,7 @@ Count the total findings from the initial review: ${TOTAL_COUNT}
 
 **If findings ≤ 6**:
 State: "Found ${TOTAL_COUNT} findings - all will be reviewed (within limit)."
-Proceed directly to <ReviewFollowup/> with all findings.
+**DO NOT WAIT** - Immediately execute <ReviewFollowup/> with all findings.
 
 **If findings > 6**:
 **CRITICAL ENFORCEMENT**: You have ${TOTAL_COUNT} findings but can only review 6.
@@ -208,16 +212,18 @@ ${list_of_deferred_finding_ids_and_titles}
 - The count MUST be exactly 6 (or fewer if total findings < 6)
 - If you're about to investigate more than 6, STOP - you violated prioritization
 
-**CRITICAL - CREATE FILTERED FINDINGS LIST**:
-After displaying prioritization, you MUST:
+**CRITICAL - CREATE FILTERED FINDINGS LIST AND PROCEED**:
+After displaying prioritization, you MUST immediately:
 1. Extract only the 6 selected findings from the original findings array
 2. Store them in a variable: FILTERED_FINDINGS = [the 6 selected finding objects]
 3. Verify count: len(FILTERED_FINDINGS) must equal 6 (or total if < 6)
-4. Display: "Filtered findings count verified: ${count} findings ready for review"
+4. **WITHOUT STOPPING**, execute <ReviewFollowup/> with the filtered findings
 
-**ENFORCEMENT**: If you proceed to ReviewFollowup with more than 6 findings, you have FAILED.
+**ENFORCEMENT**:
+- If you proceed with more than 6 findings, you have FAILED
+- If you stop after verification instead of proceeding to Step 4, you have FAILED
 
-**THEN PROCEED**: Continue to <ReviewFollowup/> with ONLY the 6 selected findings.
+**YOU MUST NOT STOP BETWEEN STEP 3 AND STEP 4** - No status messages, no waiting, proceed directly to investigation.
 </FindingPrioritization>
 
 ## STEP 4: INVESTIGATION
@@ -228,7 +234,7 @@ After displaying prioritization, you MUST:
     1. Identify findings with "named_finding" field - these skip investigation
     2. Named findings already have a verdict (check calling command's <NamedFindings/>)
     3. Only investigate findings WITHOUT "named_finding" field
-    4. If all findings are named findings: Skip to Step 3 (User Review)
+    4. If all findings are named findings: Skip to Step 5 (User Review)
 
     **CRITICAL PARALLEL EXECUTION REQUIREMENT**:
     You MUST send ALL ${N} Task tool calls for NON-NAMED findings in a SINGLE message with MULTIPLE antml:invoke blocks.
@@ -260,6 +266,9 @@ After displaying prioritization, you MUST:
     4. Only then parse and process results
 
     **ENFORCEMENT**: If you send even ONE Task alone, you have FAILED. All ${N} Tasks MUST launch together.
+
+    **5. After ALL investigation subagents complete: IMMEDIATELY PROCEED TO STEP 5**
+    **DO NOT STOP HERE** - Parse all investigation JSON responses and continue to <UserReview/>
 </ReviewFollowup>
 
 <ReviewFollowupPrompt>
