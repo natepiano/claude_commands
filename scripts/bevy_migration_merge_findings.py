@@ -7,6 +7,7 @@ Sequentially merges agent findings into final enhanced checklist.
 
 import argparse
 import re
+import shutil
 import sys
 from pathlib import Path
 from typing import cast
@@ -113,6 +114,12 @@ def main() -> None:
         default=10,
         help='Number of agents (default: 10)'
     )
+    _ = parser.add_argument(
+        '--work-dir',
+        type=Path,
+        required=False,
+        help='Work directory to clean up after merging (optional)'
+    )
 
     args = parser.parse_args()
 
@@ -120,6 +127,7 @@ def main() -> None:
     output_path = cast(Path, args.output)
     version = cast(str, args.version)
     num_agents = cast(int, args.num_agents)
+    work_dir = cast(Path | None, args.work_dir)
 
     if not agent_findings_dir.exists():
         print(f"Error: Agent findings directory not found: {agent_findings_dir}", file=sys.stderr)
@@ -136,6 +144,11 @@ def main() -> None:
 
     print(f"\n✓ Final checklist generated: {output_path}", file=sys.stderr)
     print(f"✓ Ready for use in Bevy {version} migration", file=sys.stderr)
+
+    # Clean up work directory if specified
+    if work_dir and work_dir.exists():
+        shutil.rmtree(work_dir)
+        print(f"✓ Cleaned up work directory: {work_dir}", file=sys.stderr)
 
 
 if __name__ == '__main__':

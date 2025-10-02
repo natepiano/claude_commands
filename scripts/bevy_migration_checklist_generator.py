@@ -334,24 +334,23 @@ def main() -> None:
         help='Path to migration-guides directory'
     )
     _ = parser.add_argument(
-        '--output',
+        '--work-dir',
         type=Path,
         required=True,
-        help='Output markdown file path'
-    )
-    _ = parser.add_argument(
-        '--json-output',
-        type=Path,
-        required=False,
-        help='Output JSON file path (optional)'
+        help='Working directory for transient files'
     )
 
     args = parser.parse_args()
 
     version = cast(str, args.version)
     guides_dir = cast(Path, args.guides_dir)
-    output_path = cast(Path, args.output)
-    json_output_path = cast(Path | None, args.json_output)
+    work_dir = cast(Path, args.work_dir)
+
+    # Create work directory
+    work_dir.mkdir(parents=True, exist_ok=True)
+
+    output_path = work_dir / f"bevy-{version}-checklist-pass1.md"
+    json_output_path = work_dir / f"bevy-{version}-checklist-pass1.json"
 
     # Generate checklist
     generator = ChecklistGenerator(guides_dir, version)
@@ -359,18 +358,15 @@ def main() -> None:
 
     # Write markdown
     markdown = generator.generate_markdown()
-    output_path.parent.mkdir(parents=True, exist_ok=True)
     _ = output_path.write_text(markdown, encoding='utf-8')
 
-    print(f"✓ Basic checklist generated: {output_path}", file=sys.stderr)
-    print(f"✓ Found {len(generator.guides)} migration items", file=sys.stderr)
+    # Write JSON (always needed for Pass 2)
+    json_data = generator.generate_json()
+    _ = json_output_path.write_text(json_data, encoding='utf-8')
 
-    # Write JSON if requested
-    if json_output_path:
-        json_data = generator.generate_json()
-        json_output_path.parent.mkdir(parents=True, exist_ok=True)
-        _ = json_output_path.write_text(json_data, encoding='utf-8')
-        print(f"✓ JSON data generated: {json_output_path}", file=sys.stderr)
+    print(f"✓ Basic checklist generated: {output_path}", file=sys.stderr)
+    print(f"✓ JSON data generated: {json_output_path}", file=sys.stderr)
+    print(f"✓ Found {len(generator.guides)} migration items", file=sys.stderr)
 
 
 if __name__ == '__main__':

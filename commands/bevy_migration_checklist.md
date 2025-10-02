@@ -9,7 +9,7 @@ Generates a comprehensive migration checklist by parsing official Bevy migration
 **Usage:** `/bevy_migration_checklist <version>`
 **Example:** `/bevy_migration_checklist 0.17.0`
 
-**Output:** `~/.claude/bevy_migration/bevy-{version}-migration-checklist.md`
+**Output:** `~/.claude/bevy_migration/bevy-{version}-checklist.md`
 
 ---
 
@@ -48,14 +48,19 @@ Extract the version and derive all paths. When executing bash commands in subseq
 VERSION = $ARGUMENTS (e.g., "0.17.0")
 BEVY_REPO_DIR = ~/rust/bevy-${VERSION}
 GUIDES_DIR = ~/rust/bevy-${VERSION}/release-content/migration-guides
+
+# Transient working directory (will be cleaned up at end)
+WORK_DIR = $(echo $TMPDIR)bevy-migration-${VERSION}
+AGENT_FINDINGS_DIR = ${WORK_DIR}/agent-findings
+
+# Final output directory (persists after execution)
 OUTPUT_DIR = ~/.claude/bevy_migration
-PASS1_MARKDOWN = ~/.claude/bevy_migration/bevy-${VERSION}-checklist-pass1.md
-PASS1_JSON = ~/.claude/bevy_migration/bevy-${VERSION}-checklist-pass1.json
-AGENT_FINDINGS_DIR = ~/.claude/bevy_migration/agent-findings
-FINAL_OUTPUT = ~/.claude/bevy_migration/bevy-${VERSION}-checklist-final.md
+FINAL_OUTPUT = ${OUTPUT_DIR}/bevy-${VERSION}-checklist.md
 ```
 
-**Example:** If VERSION is "0.17.0", then when you see `${VERSION}` in bash commands, substitute it with "0.17.0". The command `gh api repos/bevyengine/bevy/releases/tags/v${VERSION}` becomes `gh api repos/bevyengine/bevy/releases/tags/v0.17.0`.
+**Example:** If VERSION is "0.17.0" and TMPDIR is "/var/folders/.../T/", then WORK_DIR becomes "/var/folders/.../T/bevy-migration-0.17.0/"
+
+**Important:** All intermediate files (pass1 markdown/JSON, agent findings) go into WORK_DIR and are deleted after the final checklist is created. Only FINAL_OUTPUT persists.
 
 </ParseArguments>
 
@@ -108,30 +113,37 @@ Three-Pass Processing:
   Pass 2: 10 parallel agents for semantic review
   Pass 3: Sequential merge into final checklist
 
-File Outputs:
-  Pass 1 Markdown: ~/.claude/bevy_migration/bevy-${VERSION}-checklist-pass1.md
-  Pass 1 JSON:     ~/.claude/bevy_migration/bevy-${VERSION}-checklist-pass1.json
-  Agent Findings:  ~/.claude/bevy_migration/agent-findings/agent-{01..10}-findings.md
-  Final Checklist: ~/.claude/bevy_migration/bevy-${VERSION}-checklist-final.md
+Working Directory (Transient):
+  ${WORK_DIR}/bevy-${VERSION}-checklist-pass1.md
+  ${WORK_DIR}/bevy-${VERSION}-checklist-pass1.json
+  ${WORK_DIR}/agent-findings/agent-{01..10}-findings.md
+  ${WORK_DIR}/agent-findings/prompts/agent-{01..10}-prompt.txt
+
+Final Output (Persistent):
+  ~/.claude/bevy_migration/bevy-${VERSION}-checklist.md
 
 Execution Steps:
-  1. Remove existing directory (if present)
+  1. Create transient work directory
+     → mkdir -p ${WORK_DIR}
+
+  2. Remove existing Bevy repo (if present)
      → rm -rf ~/rust/bevy-${VERSION}
 
-  2. Clone Bevy repository
+  3. Clone Bevy repository
      → git clone https://github.com/bevyengine/bevy.git ~/rust/bevy-${VERSION}
 
-  3. Checkout version tag v${VERSION}
+  4. Checkout version tag v${VERSION}
      → git -C ~/rust/bevy-${VERSION} checkout v${VERSION}
 
-  4. PASS 1: Basic extraction (Python)
+  5. PASS 1: Basic extraction (Python)
      → python3 ~/.claude/scripts/bevy_migration_checklist_generator.py
 
-  5. PASS 2: Semantic review (10 parallel agents)
+  6. PASS 2: Semantic review (10 parallel agents)
      → Launch agents to enhance actionability
 
-  6. PASS 3: Merge findings (Sequential)
+  7. PASS 3: Merge findings + cleanup
      → python3 ~/.claude/scripts/bevy_migration_merge_findings.py
+     → Removes ${WORK_DIR} after creating final checklist
 
 ═══════════════════════════════════════════════════════════
 Proceeding with execution...
@@ -191,9 +203,9 @@ Proceeding with execution...
 
 **Run Pass 1: Basic extraction with Python**
 
-1. **Create output directory:**
+1. **Create work directory:**
    ```bash
-   mkdir -p ${OUTPUT_DIR}
+   mkdir -p ${WORK_DIR}
    ```
 
 2. **Run the generator:**
@@ -201,25 +213,24 @@ Proceeding with execution...
    python3 ~/.claude/scripts/bevy_migration_checklist_generator.py \
      --version ${VERSION} \
      --guides-dir ${GUIDES_DIR} \
-     --output ${PASS1_MARKDOWN} \
-     --json-output ${PASS1_JSON}
+     --work-dir ${WORK_DIR}
    ```
 
 **The script will:**
 - Parse all `*.md` files in the migration-guides directory
 - Extract titles, descriptions, bullet points, code blocks
 - Generate search patterns from code and text
-- Output basic markdown checklist AND structured JSON
+- Output basic markdown and JSON to ${WORK_DIR}
 
-**Output files:**
-- `${PASS1_MARKDOWN}` - Basic checklist for review
-- `${PASS1_JSON}` - Structured data for Pass 2
+**Output files (transient):**
+- `${WORK_DIR}/bevy-${VERSION}-checklist-pass1.md` - Basic checklist
+- `${WORK_DIR}/bevy-${VERSION}-checklist-pass1.json` - Structured data for Pass 2
 
 **Progress messages:**
 - "Parsing X migration guides..."
-- "Parsed X migration guides"
 - "✓ Basic checklist generated"
 - "✓ JSON data generated"
+- "✓ Found X migration items"
 
 </Pass1_BasicExtraction>
 
@@ -237,7 +248,7 @@ Proceeding with execution...
 2. **Generate agent prompts:**
    ```bash
    python3 ~/.claude/scripts/bevy_migration_semantic_review.py \
-     --json-input ${PASS1_JSON} \
+     --json-input ${WORK_DIR}/bevy-${VERSION}-checklist-pass1.json \
      --output-dir ${AGENT_FINDINGS_DIR} \
      --num-agents 10
    ```
@@ -245,7 +256,7 @@ Proceeding with execution...
    This script:
    - Divides guides into 10 balanced batches
    - Creates prompts for each agent
-   - Saves prompts to `${AGENT_FINDINGS_DIR}/prompts/`
+   - Saves prompts to `${WORK_DIR}/agent-findings/prompts/`
 
 3. **Launch 10 agents in parallel using Task tool:**
 
@@ -291,15 +302,17 @@ Proceeding with execution...
 
 <Pass3_MergeFindings>
 
-**Run Pass 3: Merge findings sequentially**
+**Run Pass 3: Merge findings and cleanup**
 
 1. **Run the merge script:**
    ```bash
+   mkdir -p ${OUTPUT_DIR}
    python3 ~/.claude/scripts/bevy_migration_merge_findings.py \
      --agent-findings-dir ${AGENT_FINDINGS_DIR} \
      --output ${FINAL_OUTPUT} \
      --version ${VERSION} \
-     --num-agents 10
+     --num-agents 10 \
+     --work-dir ${WORK_DIR}
    ```
 
 **The script will:**
@@ -307,9 +320,10 @@ Proceeding with execution...
 - Parse enhanced guide sections
 - Merge into final checklist preserving guide order
 - Add header with processing statistics
-- Write final enhanced checklist
+- Write final enhanced checklist to ${FINAL_OUTPUT}
+- **Clean up ${WORK_DIR} and all transient files**
 
-**Output:**
+**Output (persistent):**
 - `${FINAL_OUTPUT}` - Final enhanced migration checklist
 
 **Progress messages:**
@@ -318,6 +332,7 @@ Proceeding with execution...
 - "✓ Agent 02: X guides"
 - ... through agent 10
 - "✓ Final checklist generated"
+- "✓ Cleaned up work directory"
 
 </Pass3_MergeFindings>
 
@@ -337,15 +352,10 @@ Show a summary of what was generated:
 Final Enhanced Checklist:
   ${FINAL_OUTPUT}
 
-Intermediate Files:
-  Pass 1 Basic:    ${PASS1_MARKDOWN}
-  Pass 1 JSON:     ${PASS1_JSON}
-  Agent Findings:  ${AGENT_FINDINGS_DIR}/agent-{01..10}-findings.md
-
 Processing Summary:
 - Pass 1: Parsed X migration guides
-- Pass 2: 10 agents enhanced Y checklist items
-- Pass 3: Merged into comprehensive final checklist
+- Pass 2: 10 parallel agents enhanced actionability
+- Pass 3: Merged findings and cleaned up transient files
 
 Features:
 ✓ Granular, actionable checklist items
