@@ -6,14 +6,15 @@
 
 <ExecutionSteps>
     **EXECUTE THESE STEPS IN ORDER:**
-    
+
     **PREREQUISITE:** Read <MainAgentResponsibilities/> to understand your role
     **STEP 1:** Execute <TaskSetup/>
     **STEP 2:** Execute <TaskCreation/> OR <TaskContinuation/>
     **STEP 3:** Execute <SubagentExecution/>
     **STEP 4:** Execute <SubagentHandoff/> (if needed)
     **STEP 5:** Execute <PostImplementationReview/>
-    **STEP 6:** Execute <TaskCompletion/>
+    **STEP 6:** Execute <FinalDeadCodeAudit/>
+    **STEP 7:** Execute <TaskCompletion/>
     **THROUGHOUT:** Follow <MainAgentCriticalRules/> at all times
 </ExecutionSteps>
 
@@ -181,11 +182,11 @@ ${COLLABORATIVE_MODE}: Boolean indicating if plan uses collaborative execution p
 
 <PostImplementationReview>
     **CRITICAL validation after all tasks report completed:**
-    
+
     **Follow <MainAgentCriticalRules/> during this review**
-    
+
     1. Run `<BuildValidationCommand/>`
-    
+
     2. If warnings exist:
        a. Read the original ${PLAN_DOCUMENT} (if exists) for context
        b. Apply <WarningCategorizationLogic/> to each warning
@@ -194,11 +195,94 @@ ${COLLABORATIVE_MODE}: Boolean indicating if plan uses collaborative execution p
           - Execute <SubagentExecution/> to complete these tasks
        d. For unnecessary code:
           - Delete the unused code immediately
-    
-    3. Only proceed when build is clean or all warnings are justified
+
+    3. After all warnings addressed, proceed to <FinalDeadCodeAudit/>
 </PostImplementationReview>
 
-## STEP 6: COMPLETION
+## STEP 6: FINAL DEAD CODE AUDIT
+
+<FinalDeadCodeAudit>
+    **MANDATORY audit after post-implementation review:**
+
+    **CRITICAL**: A properly implemented plan has ZERO dead code warnings. Any dead code indicates either:
+    1. Missing implementation that needs to be completed
+    2. Unnecessary code that must be deleted
+    3. A logical inconsistency requiring user clarification
+
+    **Audit Process:**
+
+    1. Run `<BuildValidationCommand/>` one final time
+
+    2. Extract ALL unused/dead code warnings:
+       - unused variables
+       - unused functions
+       - unused struct fields
+       - unused imports
+       - never-read fields
+       - never-called methods
+
+    3. For EACH dead code warning found:
+
+       a. **Deep Investigation:**
+          - Read the code context around the unused element
+          - Read the ${PLAN_DOCUMENT} to understand intended behavior
+          - Determine: Should this code be used or deleted?
+
+       b. **Resolution Decision Tree:**
+
+          **IF** plan specifies this element should be used:
+             - Add specific task to .todo.json: "Implement usage of ${element} per plan requirements"
+             - Execute <SubagentExecution/> to complete the task
+             - Return to step 1 (re-audit after fix)
+
+          **ELSE IF** code is clearly unnecessary per plan:
+             - Delete the unused code immediately
+             - Return to step 1 (re-audit after deletion)
+
+          **ELSE** (cannot determine why code exists):
+             - STOP and execute <UnexplainedDeadCodeReport/>
+
+    4. **Success Criteria:**
+       - Build must have ZERO dead code warnings
+       - Only proceed to <TaskCompletion/> when build is completely clean
+
+    **NEVER** skip this audit or proceed with unexplained warnings.
+</FinalDeadCodeAudit>
+
+<UnexplainedDeadCodeReport>
+    **When dead code cannot be categorized, report to user:**
+
+    **Format:**
+    ```
+    ⚠️ IMPLEMENTATION ISSUE: Unexplained Dead Code Detected
+
+    I've completed the implementation but found dead code that I cannot categorize:
+
+    Warning: ${exact warning message}
+    Location: ${file}:${line}
+    Code: ${code snippet}
+
+    Investigation Results:
+    - Plan requirement: ${what plan says about this element, or "not mentioned"}
+    - Current usage: ${where/how it's used, or "never used"}
+    - My analysis: ${why this is unclear}
+
+    Possible reasons:
+    1. ${hypothesis 1}
+    2. ${hypothesis 2}
+
+    Required Action:
+    Should I:
+    A) Implement usage of this element (explain how)
+    B) Delete this element as unnecessary
+    C) Other (explain)
+    ```
+
+    **STOP execution and await user decision.**
+    **DO NOT** proceed to <TaskCompletion/> until resolved.
+</UnexplainedDeadCodeReport>
+
+## STEP 7: COMPLETION
 
 <TaskCompletion>
     **Final steps after implementation truly complete:**

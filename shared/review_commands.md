@@ -268,7 +268,13 @@ Extract exactly ${SELECTED_COUNT} findings and proceed immediately to <ReviewFol
     1. Verify if this is a real issue or false positive
     2. Consider maintenance and long-term implications
     3. Provide a verdict: ${EXPECTED_VERDICTS}
-    4. Include detailed reasoning for your verdict in simple, easy-to-understand terms
+    4. **CRITICAL FOR VERDICT SELECTION**:
+       - Use REJECTED/FIX NOT RECOMMENDED/SOLID only when: Original finding is wrong AND no changes are needed to the plan/code
+       - Use MODIFIED/FIX MODIFIED/REVISE when: Original finding is wrong OR incomplete BUT investigation reveals different issues that DO need fixing
+       - Use CONFIRMED/FIX RECOMMENDED/ENHANCE when: Original finding is correct and should be implemented as suggested
+       - **If you discover any issues during investigation (even if the original finding misdiagnosed them), you MUST use a verdict that recommends action (CONFIRMED/MODIFIED/etc.), NOT a rejection verdict**
+       - For MODIFIED verdicts: Rewrite the issue description and suggested_code to address the newly discovered problems, not the original finding's incorrect diagnosis
+    5. Include detailed reasoning for your verdict in simple, easy-to-understand terms
        - Avoid technical jargon where possible
        - Explain the "why" in plain language
        - Focus on practical impact rather than theoretical concepts
@@ -282,8 +288,9 @@ Extract exactly ${SELECTED_COUNT} findings and proceed immediately to <ReviewFol
     9. **CRITICAL FOR REJECTED VERDICTS**: You MUST clearly explain:
        - What the current plan/code does
        - What the finding incorrectly suggested
-       - Why the current approach is actually correct
+       - Why the current approach is actually correct AND why no alternative changes are needed
        - Use the format "The finding is incorrect because..." to be explicit
+       - Remember: REJECTED means NO changes needed at all - if ANY issue exists, use MODIFIED instead
     10. **CRITICAL FOR ALL VERDICTS**: Structure your reasoning to clearly separate:
         - What problem the finding identified
         - What the current code/plan actually does
