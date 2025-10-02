@@ -166,6 +166,15 @@ For plan document reviews:
 7. **NEVER** suggest code that already appears in the plan's "Proposed Fix" or solution sections
 </DocumentComprehension>
 
+<GrepForPlanRedundancy>
+**How to check if plan already contains your suggestion:**
+1. Use Grep tool to search the PLAN DOCUMENT (not codebase)
+2. Search for keywords from your proposed suggestion
+   - Example: Suggesting "add Ord derive to VariantName" → search: "Ord|PartialOrd|VariantName"
+3. If Grep finds matches, use Read tool on those line ranges to verify what plan says
+4. **CRITICAL**: Plans describe FUTURE changes. Current code NOT matching plan is EXPECTED.
+</GrepForPlanRedundancy>
+
 <DesignConsistency>
 For design document reviews:
 1. **Internal Consistency**: Verify that all sections of the plan align with each other
@@ -376,11 +385,12 @@ For EACH potential finding, verify ALL of these gates pass. If ANY gate fails, D
 - Does the plan claim to address this area?
 - If NO to both: DISCARD finding (unless it's a scope gap issue)
 
-**Gate 4: Not Already Implemented**
-- If suggesting new functionality:
-  * Use Grep to search codebase for existing implementation
-  * Check if the plan already describes this fix
-  * If already exists, DISCARD finding (not a gap)
+**Gate 4: Not Already In Plan**
+- **MANDATORY**: Execute <GrepForPlanRedundancy/>
+- **DECISION**:
+  * If plan already proposes this change: DISCARD finding
+  * If plan addresses concern differently: Note for investigation phase, don't discard yet
+  * If plan doesn't mention this: Finding passes Gate 4
 
 **Gate 5: Plan Type Alignment**
 - Does this finding match the review approach for this plan type?
@@ -410,9 +420,11 @@ Before assigning a CONFIRMED or MODIFIED verdict, verify:
 - If outside scope and not a scope gap issue, verdict should be REJECTED
 
 **Gate 3: Not Already Addressed**
-- Does the plan already address this in another section?
-- Use Grep to search plan for related solutions
-- If already addressed, verdict should be REJECTED with "redundant" reasoning
+- **MANDATORY**: Execute <GrepForPlanRedundancy/>
+- **DECISION**:
+  * If plan already includes this: verdict = REJECTED, reasoning = "Plan already addresses this in [Section Title]"
+  * If plan addresses differently: verdict = REJECTED or MODIFIED, explain plan's approach
+  * If plan doesn't address: verdict = CONFIRMED (if otherwise valid)
 
 **Gate 4: Actual Problem**
 - Is this a real design issue or misunderstanding?

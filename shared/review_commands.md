@@ -457,15 +457,15 @@ The current approach is correct. No changes needed.
        - **IF USER PROVIDES A KEYWORD**: Execute the action from your command file's <KeywordExecution/> section
        - **IF USER PROVIDES ANY OTHER RESPONSE** (discussion, alternative proposal, question, clarification):
          a. Engage with the user's input appropriately
-         b. If discussion leads to agreement/resolution, summarize the agreed approach
-         c. **CRITICAL**: If you take any action that modifies the plan (via Edit/Write tools):
-            - Mark the current todo as "completed"
-            - Ask "Edit complete. Type 'continue' to proceed to the next finding. (${current_number} of ${total_findings})"
-            - Wait for user confirmation before proceeding
-            - Skip steps d-f below and continue from step 8
+         b. If discussion reveals new information (discovery, analysis), present it clearly
+         c. **CRITICAL - NO KEYWORD AUTO-EXECUTION**:
+            - If you discover something (e.g., "this is redundant", "plan already has this"), present your discovery
+            - **DO NOT** execute keyword actions (Edit/Write tools) based on your discoveries
+            - Discoveries are NOT the same as user keyword selection
+            - Wait for user to explicitly type a keyword before any Edit/Write actions
          d. **MANDATORY**: Present keywords using <FormatKeywords verdict="${CURRENT_VERDICT}"/>
          e. **MANDATORY**: State "Please select one of the keywords above to proceed."
-         f. **DO NOT CONTINUE** to next finding until user provides a keyword
+         f. **DO NOT CONTINUE** to next finding or take Edit/Write actions until user provides a keyword
          g. If user continues discussion instead of selecting keyword, repeat steps a-f
        - **SPECIAL CASE FOR "investigate" KEYWORD**: After investigation completes,
          a. Parse the investigation JSON result to extract updated verdict and reasoning
