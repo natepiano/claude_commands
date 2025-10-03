@@ -150,36 +150,77 @@ Check for a "Design Review Skip Notes" section in the document:
 <DocumentComprehension>
 For plan document reviews:
 1. Read the entire plan from beginning to end before making recommendations
-2. **MANDATORY REDUNDANCY CHECK**: Before suggesting ANY fix or improvement:
-   - Search the ENTIRE plan for "Proposed Fix", "Solution", "Implementation", or similar sections
-   - Check if your suggested code already exists ANYWHERE in the plan (even partially)
-   - Apply <RedundancyCriteria/> to determine if finding is redundant
+2. Before suggesting any fix or improvement:
+   - Search the plan for "Proposed Fix", "Solution", "Implementation", or similar sections
+   - Check if your suggested code already exists in the plan (even partially)
+   - Use <RedundancyCriteria/> and <GrepForPlanRedundancy/> to evaluate the finding
 3. Quote specific sections when claiming gaps exist
 4. Understand how topics connect across different sections
 5. For every "missing" claim, either quote the section that should contain it or explain why existing content is insufficient
 </DocumentComprehension>
 
 <RedundancyCriteria>
-**What makes a finding REDUNDANT:**
+**Understanding redundant findings:**
+
+A finding is REDUNDANT when:
 - The plan already contains the same or similar code solution
 - The plan already describes fixing this exact issue
 - A "Proposed Fix" or "Implementation" section addresses the problem you identified
-- **CRITICAL**: Plans describe FUTURE changes. Current code NOT matching plan is EXPECTED.
-- If your suggested code already appears ANYWHERE in the plan (even partially): REDUNDANT
+- Your suggested code already appears in the plan (even partially)
 
-**When you find redundancy:**
-- Quote the exact section containing the existing solution
-- Mark as REDUNDANT, not CONFIRMED
-- **NEVER** suggest code that already appears in the plan
+**Important context:**
+- Plans describe FUTURE changes, so current code NOT matching the plan is EXPECTED
+- Don't confuse "current code has a problem" with "plan doesn't address it"
+- The redundancy check looks at what the PLAN proposes, not what exists in current code
+
+**How to document redundancy:**
+In the redundancy_check field, quote the section where the plan addresses this issue.
 </RedundancyCriteria>
 
 <GrepForPlanRedundancy>
-**How to check if plan already contains your suggestion:**
-1. Use Grep tool to search the PLAN DOCUMENT (not codebase)
-2. Search for keywords from your proposed suggestion
-   - Example: Suggesting "add Ord derive to VariantName" → search: "Ord|PartialOrd|VariantName"
-3. If Grep finds matches, use Read tool on those line ranges to verify what plan says
-4. Apply <RedundancyCriteria/> to determine if your finding is redundant
+**How to check if the plan already addresses an issue:**
+
+**Procedure:**
+1. Use Grep to search PLAN DOCUMENT for keywords from your concern
+   - Example: Concern about Ord derives → search: "Ord|PartialOrd|VariantName"
+2. If Grep finds matches, Read those sections to verify what the plan proposes
+3. Fill out the redundancy_check field in your JSON based on what you find
+
+**Decision Guide for redundancy_check.assessment:**
+
+```
+Plan proposes correct solution
+  → assessment: "REDUNDANT"
+  → plan_addresses_this: "YES_IDENTICAL"
+
+Plan proposes a solution BUT it's wrong or incomplete
+  → assessment: "ALTERNATIVE_NEEDED"
+  → plan_addresses_this: "YES_DIFFERENT"
+
+Plan doesn't mention this issue at all
+  → assessment: "GAP"
+  → plan_addresses_this: "NO"
+```
+
+**Examples:**
+
+Example 1: Plan already has the fix
+- You notice VariantName needs Ord derives
+- You grep and find Phase 1a proposes adding Ord/PartialOrd
+- redundancy_check.assessment = "REDUNDANT"
+- This finding does not appear in your final results
+
+Example 2: Plan's fix is incomplete
+- You notice VariantName needs Ord AND Hash derives
+- You grep and find Phase 1a only proposes Ord/PartialOrd (missing Hash)
+- redundancy_check.assessment = "ALTERNATIVE_NEEDED"
+- Include this finding with your improved suggestion
+
+Example 3: Plan has a gap
+- You notice VariantName needs Ord derives
+- You grep and find no mention of this in the plan
+- redundancy_check.assessment = "GAP"
+- Include this finding
 </GrepForPlanRedundancy>
 
 <DesignConsistency>
@@ -392,23 +433,16 @@ For EACH potential finding, verify ALL of these gates pass. If ANY gate fails, D
 - Does the plan claim to address this area?
 - If NO to both: DISCARD finding (unless it's a scope gap issue)
 
-**Gate 4: Not Already In Plan**
-- **MANDATORY**: Execute <GrepForPlanRedundancy/>
-- **DECISION**:
-  * If plan already proposes this change: DISCARD finding
-  * If plan addresses concern differently: Note for investigation phase, don't discard yet
-  * If plan doesn't mention this: Finding passes Gate 4
-
-**Gate 5: Plan Type Alignment**
+**Gate 4: Plan Type Alignment**
 - Does this finding match the review approach for this plan type?
 - Example: Don't apply API design principles to documentation plans
 - If misaligned, DISCARD finding
 
-**Gate 6: Not In Skip Notes**
+**Gate 5: Not In Skip Notes**
 - Check if this suggestion appears in "Design Review Skip Notes"
 - If previously rejected, DISCARD finding
 
-**ENFORCEMENT**: Only include findings that pass ALL six gates.
+**ENFORCEMENT**: Only include findings that pass ALL five gates.
 If more than 50% of your draft findings fail these gates, STOP and re-read the plan.
 </InitialFindingVerificationGates>
 
@@ -427,11 +461,11 @@ Before assigning a CONFIRMED or MODIFIED verdict, verify:
 - If outside scope and not a scope gap issue, verdict should be REJECTED
 
 **Gate 3: Not Already Addressed**
-- **MANDATORY**: Execute <GrepForPlanRedundancy/>
-- **DECISION**:
-  * If plan already includes this: verdict = REJECTED, reasoning = "Plan already addresses this in [Section Title]"
-  * If plan addresses differently: verdict = REJECTED or MODIFIED, explain plan's approach
-  * If plan doesn't address: verdict = CONFIRMED (if otherwise valid)
+- Check if the plan already correctly addresses this issue (see step 2 in investigation tasks)
+- Verdict guidance:
+  * Plan already includes correct solution: verdict = REJECTED
+  * Plan addresses it but solution is wrong/incomplete: verdict = MODIFIED
+  * Plan doesn't address it: verdict = CONFIRMED (if otherwise valid)
 
 **Gate 4: Actual Problem**
 - Is this a real design issue or misunderstanding?

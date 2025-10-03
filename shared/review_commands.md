@@ -21,6 +21,26 @@
   $ARGUMENTS if it is provided.
 </PlanDocument>
 
+<TaskLaunchInstructions>
+**How to construct prompts for Task tool subagents:**
+
+When launching Task tool with a prompt template (like <InitialReviewPrompt> or <ReviewFollowupPrompt>):
+1. **Replace all ${PLACEHOLDERS}** with actual values from context
+   - Example: ${REVIEW_TARGET} → "plan-document.md"
+   - Example: ${CATEGORY-ID} → "TYPE-SYSTEM-1"
+2. **Recursively expand all <TaggedSections/>** to their full content
+   - Find the tagged section definition in the command file
+   - Replace the reference with the complete section content
+   - If that section contains other tagged references, expand those too
+   - Continue until no tagged references remain
+3. **Include the fully expanded prompt** as the Task tool's prompt parameter
+
+**Why expansion is critical:**
+- Subagents cannot access tagged section definitions from other files
+- Sending unexpanded tags like `<InitialReviewConstraints/>` will fail
+- Subagent must receive complete, self-contained instructions
+</TaskLaunchInstructions>
+
 ## STEP 1: INITIAL REVIEW
 
 <InitialReview>
@@ -32,7 +52,7 @@
     **3. MANDATORY: Launch Task tool (DO NOT skip this):**
     - description: "review ${PLAN_DOCUMENT}" OR "review ${REVIEW_TARGET}"
     - subagent_type: "general-purpose"
-    - prompt: Everything in <InitialReviewPrompt> below with placeholders replaced
+    - prompt: <InitialReviewPrompt> below, processed per <TaskLaunchInstructions>
 
     **4. After subagent completes: IMMEDIATELY PROCEED TO STEP 2**
     **DO NOT STOP HERE** - The review workflow requires all 5 steps to complete.
@@ -50,8 +70,25 @@
 
     **NAMED FINDING DETECTION** (if applicable): <NamedFindingDetection/>
 
-    Review ${REVIEW_TARGET} using the categories defined above and provide structured findings.
-    It is important that you think very hard about this review task.
+    **YOUR TASK**: Find ONLY issues that the plan does NOT already correctly address.
+
+    **DO NOT create findings for issues the plan already proposes correct solutions for.**
+
+    **Provide structured findings ONLY for:**
+    - **Gaps**: Issues the plan doesn't mention at all
+    - **Errors**: Issues where the plan's proposed solution is wrong or incomplete
+    - **Better alternatives**: Issues where you have a superior approach to what the plan proposes
+
+    **If the plan already has the correct fix for an issue: that is NOT a finding. Do not create it.**
+
+    It is important that you think very hard about this review task and carefully verify that each finding represents something the plan needs to improve, not something it already handles correctly.
+
+    **MANDATORY REDUNDANCY CHECK FOR EVERY FINDING:**
+    Before including any finding in your results:
+    1. Use Grep tool to search the plan document for keywords related to your concern
+    2. If matches found, use Read tool to examine what the plan proposes
+    3. Fill out the "redundancy_check" field in your JSON (see <BaseReviewJson/>)
+    4. If assessment = "REDUNDANT", discard the finding entirely
 
     **CRITICAL ID GENERATION REQUIREMENT**: <IDGenerationRules/>
 
@@ -80,6 +117,31 @@ Format your response message with EXACTLY this JSON structure:
 Additional Requirements for Initial Review:
 - Sort findings array with TYPE-SYSTEM issues first
 - Include "impact" field as specified in <BaseReviewJson/>
+- **MANDATORY**: Include "redundancy_check" field for EVERY potential finding
+- **CRITICAL FILTERING**: Before adding a finding to the array, check its redundancy_check.assessment:
+  * If assessment = "REDUNDANT" → DO NOT add to findings array
+  * If assessment = "ALTERNATIVE_NEEDED" or "GAP" → Add to findings array
+
+**Example of Redundancy Check in Practice:**
+
+You identify that VariantName needs Ord derives. You grep the plan and find Phase 1a already proposes this:
+
+```json
+{
+  "id": "TYPE-SYSTEM-1",
+  "title": "Missing Ord derives on VariantName",
+  "redundancy_check": {
+    "grep_performed": true,
+    "plan_addresses_this": "YES_IDENTICAL",
+    "plan_section": "Phase 1a: Update VariantName to support BTreeMap keys",
+    "plan_solution": "Plan proposes adding PartialOrd and Ord derives to VariantName",
+    "assessment": "REDUNDANT"
+  },
+  ...
+}
+```
+
+Since assessment = "REDUNDANT", you DISCARD this finding. It does not appear in your final findings array.
 </InitialReviewJson>
 
 <CodeIdentificationExamples>
@@ -237,7 +299,10 @@ Extract exactly ${SELECTED_COUNT} findings and proceed immediately to <ReviewFol
     Send ONE message with ALL Task calls:
     - Single antml:function_calls block
     - ${INVESTIGATION_COUNT} antml:invoke elements (ALL in the same block)
-    - Each with: description="Investigate FINDING-X: Title (X of INVESTIGATION_COUNT)"
+    - Each Task call must specify:
+      * description: "Investigate FINDING-X: Title (X of INVESTIGATION_COUNT)"
+      * subagent_type: "general-purpose"
+      * prompt: <ReviewFollowupPrompt> below, processed per <TaskLaunchInstructions>
 
     **ENFORCEMENT**: All ${INVESTIGATION_COUNT} Tasks MUST launch together in one message.
 
@@ -266,32 +331,37 @@ Extract exactly ${SELECTED_COUNT} findings and proceed immediately to <ReviewFol
 
     **Your Investigation Tasks:**
     1. Verify if this is a real issue or false positive
-    2. Consider maintenance and long-term implications
-    3. Provide a verdict: ${EXPECTED_VERDICTS}
-    4. **CRITICAL FOR VERDICT SELECTION**:
-       - Use REJECTED/FIX NOT RECOMMENDED/SOLID only when: Original finding is wrong AND no changes are needed to the plan/code
+    2. **MANDATORY REDUNDANCY CHECK**: Check if the plan already correctly addresses this issue
+       - Use Grep to search for keywords from the finding in the plan document
+       - If the plan already proposes the correct solution: This is NOT a valid finding → verdict must be REJECTED
+    3. Consider maintenance and long-term implications
+    4. Provide a verdict: ${EXPECTED_VERDICTS}
+    5. **CRITICAL FOR VERDICT SELECTION**:
+       - Use REJECTED/FIX NOT RECOMMENDED/SOLID when:
+         * Original finding is wrong AND no changes are needed, OR
+         * **Plan already correctly addresses this issue (redundant finding)**
        - Use MODIFIED/FIX MODIFIED/REVISE when: Original finding is wrong OR incomplete BUT investigation reveals different issues that DO need fixing
-       - Use CONFIRMED/FIX RECOMMENDED/ENHANCE when: Original finding is correct and should be implemented as suggested
+       - Use CONFIRMED/FIX RECOMMENDED/ENHANCE when: Original finding is correct AND plan does not already address it
        - **If you discover any issues during investigation (even if the original finding misdiagnosed them), you MUST use a verdict that recommends action (CONFIRMED/MODIFIED/etc.), NOT a rejection verdict**
        - For MODIFIED verdicts: Rewrite the issue description and suggested_code to address the newly discovered problems, not the original finding's incorrect diagnosis
-    5. Include detailed reasoning for your verdict in simple, easy-to-understand terms
+    6. Include detailed reasoning for your verdict in simple, easy-to-understand terms
        - Avoid technical jargon where possible
        - Explain the "why" in plain language
        - Focus on practical impact rather than theoretical concepts
-    6. **CRITICAL**: For any verdict that recommends action (CONFIRMED, FIX RECOMMENDED, MODIFIED, etc.),
+    7. **CRITICAL**: For any verdict that recommends action (CONFIRMED, FIX RECOMMENDED, MODIFIED, etc.),
        you MUST include concrete suggested_code showing the improved implementation
        - For MODIFIED verdicts: Show your alternative approach as actual code, not just a description
-    7. **CRITICAL**: If the original finding has insufficient code context,
+    8. **CRITICAL**: If the original finding has insufficient code context,
        you MUST read the file and provide the full context following <CodeExtractionRequirements/>
-    8. **CRITICAL FOR PLAN REVIEWS**: If the original finding references a plan document,
+    9. **CRITICAL FOR PLAN REVIEWS**: If the original finding references a plan document,
        follow <PlanCodeIdentification/> requirements
-    9. **CRITICAL FOR REJECTED VERDICTS**: You MUST clearly explain:
+    10. **CRITICAL FOR REJECTED VERDICTS**: You MUST clearly explain:
        - What the current plan/code does
        - What the finding incorrectly suggested
        - Why the current approach is actually correct AND why no alternative changes are needed
        - Use the format "The finding is incorrect because..." to be explicit
        - Remember: REJECTED means NO changes needed at all - if ANY issue exists, use MODIFIED instead
-    10. **CRITICAL FOR ALL VERDICTS**: Structure your reasoning to clearly separate:
+    11. **CRITICAL FOR ALL VERDICTS**: Structure your reasoning to clearly separate:
         - What problem the finding identified
         - What the current code/plan actually does
         - What change is being proposed
@@ -721,6 +791,13 @@ Base JSON structure for review findings:
   "id": "${CATEGORY}-${NUMBER}",
   "category": "${CATEGORY}",
   "title": "[Brief descriptive title]",
+  "redundancy_check": {
+    "grep_performed": true,
+    "plan_addresses_this": "YES_IDENTICAL" | "YES_DIFFERENT" | "NO",
+    "plan_section": "[Section title if found, or 'NOT FOUND']",
+    "plan_solution": "[What the plan proposes, or 'Plan does not address this']",
+    "assessment": "REDUNDANT" | "ALTERNATIVE_NEEDED" | "GAP"
+  },
   "location": {
     "plan_reference": "[If reviewing a plan: section title, NOT line numbers - e.g., 'Section: Mutation Path Implementation']",
     "code_file": "[Relative path to actual code file from project root]",
@@ -745,6 +822,21 @@ Base Requirements:
 - current_code must follow <CodeExtractionRequirements/>
 - current_code must be PURE CODE ONLY - no markdown headers, instructions, or prose
 - named_finding is OPTIONAL - only include for violations defined in calling command's <NamedFindings/>
+
+**Redundancy Check Field (MANDATORY for Initial Review):**
+- **grep_performed**: Must be true - confirms you searched the plan document
+- **plan_addresses_this**:
+  * "YES_IDENTICAL": Plan proposes the exact same solution you're suggesting
+  * "YES_DIFFERENT": Plan addresses this issue but with a different approach
+  * "NO": Plan does not mention this issue at all
+- **plan_section**: The section title where the plan discusses this (e.g., "Phase 1a: Update VariantName")
+- **plan_solution**: Brief summary of what the plan proposes
+- **assessment**:
+  * "REDUNDANT": Plan already has the correct fix → DO NOT include this finding
+  * "ALTERNATIVE_NEEDED": Plan's approach is wrong/incomplete, your alternative is better → Include finding
+  * "GAP": Plan doesn't address this at all → Include finding
+
+**CRITICAL**: If assessment = "REDUNDANT", you MUST discard this finding entirely. Do not include it in the findings array.
 </BaseReviewJson>
 
 <CodeExtractionRequirements>
