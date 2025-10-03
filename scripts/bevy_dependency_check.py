@@ -95,15 +95,17 @@ def get_bevy_internal_crates(bevy_version: str) -> set[str]:
 
 def get_bevy_dependencies(codebase: Path, bevy_version: str) -> list[tuple[str, str]]:
     """
-    Run cargo tree to find all crates that depend on bevy.
+    Run cargo tree to find all DIRECT dependencies (from Cargo.toml) that depend on bevy.
     Returns list of (crate_name, version) tuples, excluding bevy internal crates.
+    Uses --depth=1 to only get direct dependencies, not transitive ones.
     """
     # Get the definitive list of bevy internal crates
     internal_crates = get_bevy_internal_crates(bevy_version)
 
     try:
+        # Use --depth=1 to only get direct dependencies
         result = subprocess.run(
-            ['cargo', 'tree', '--format', '{p}'],
+            ['cargo', 'tree', '--depth=1', '--format', '{p}'],
             cwd=codebase,
             capture_output=True,
             text=True,
@@ -206,23 +208,34 @@ def get_bevy_dependency_requirement(crate_name: str, version: str) -> str | None
 def version_matches_requirement(requirement: str, target_version: str) -> bool:
     """
     Check if a target version matches a cargo version requirement.
-    This is a simplified check - handles common patterns like "0.17", "^0.17.0", "=0.17.1"
+    Handles caret (^), tilde (~), exact (=), and bare version requirements.
+
+    Examples:
+      ^0.17.0 matches 0.17.1 (same major.minor)
+      ~0.17.0 matches 0.17.1 (same major.minor)
+      0.17 matches 0.17.1 (same major.minor prefix)
+      =0.17.1 matches 0.17.1 only (exact)
     """
-    # Remove common requirement operators
-    req_clean = requirement.strip().lstrip('^=~><')
+    req_stripped = requirement.strip()
 
-    # For "0.17" requirement, check if target starts with "0.17"
-    # For "0.17.1" requirement, check exact match or compatible
-    if target_version.startswith(req_clean):
-        return True
+    # Handle exact version (=0.17.1)
+    if req_stripped.startswith('='):
+        return req_stripped[1:].strip() == target_version
 
-    # Check if requirement matches target's major.minor
+    # Remove caret ^ or tilde ~ operators
+    req_clean = req_stripped.lstrip('^~')
+
+    # Parse version parts
     target_parts = target_version.split('.')
     req_parts = req_clean.split('.')
 
-    # Match on major.minor
+    # Match on major.minor - this handles ^0.17.0 matching 0.17.1
     if len(target_parts) >= 2 and len(req_parts) >= 2:
         return target_parts[0] == req_parts[0] and target_parts[1] == req_parts[1]
+
+    # Fallback: check prefix match for "0.17" style requirements
+    if target_version.startswith(req_clean):
+        return True
 
     return False
 
@@ -244,11 +257,8 @@ def find_bevy_compatible_version(
     for version in recent_versions:
         bevy_req = get_bevy_dependency_requirement(crate_name, version)
 
-        if bevy_req:
-            print(f"  {crate_name} {version} requires bevy {bevy_req}", file=sys.stderr)
-            if version_matches_requirement(bevy_req, target_bevy_version):
-                print(f"  → Match found: {version}", file=sys.stderr)
-                return version
+        if bevy_req and version_matches_requirement(bevy_req, target_bevy_version):
+            return version
 
     return None
 
