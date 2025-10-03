@@ -21,10 +21,8 @@ Generates a comprehensive migration checklist by parsing official Bevy migration
 **STEP 2:** Execute <ValidateVersion/>
 **STEP 3:** Execute <DisplayExecutionPlan/>
 **STEP 4:** Execute <CloneBevyRepo/>
-**STEP 5:** Execute <Pass1_BasicExtraction/>
-**STEP 6:** Execute <Pass2_SemanticReview/>
-**STEP 7:** Execute <Pass3_MergeFindings/>
-**STEP 8:** Execute <PresentResults/>
+**STEP 5:** Execute <GenerateChecklist/>
+**STEP 6:** Execute <PresentResults/>
 
 </ExecutionSteps>
 
@@ -49,18 +47,10 @@ VERSION = $ARGUMENTS (e.g., "0.17.0")
 BEVY_REPO_DIR = ~/rust/bevy-${VERSION}
 GUIDES_DIR = ~/rust/bevy-${VERSION}/release-content/migration-guides
 
-# Transient working directory (will be cleaned up at end)
-WORK_DIR = $(echo $TMPDIR)bevy-migration-${VERSION}
-AGENT_FINDINGS_DIR = ${WORK_DIR}/agent-findings
-
-# Final output directory (persists after execution)
+# Final output directory and file
 OUTPUT_DIR = ~/.claude/bevy_migration
 FINAL_OUTPUT = ${OUTPUT_DIR}/bevy-${VERSION}-checklist.md
 ```
-
-**Example:** If VERSION is "0.17.0" and TMPDIR is "/var/folders/.../T/", then WORK_DIR becomes "/var/folders/.../T/bevy-migration-0.17.0/"
-
-**Important:** All intermediate files (pass1 markdown/JSON, agent findings) go into WORK_DIR and are deleted after the final checklist is created. Only FINAL_OUTPUT persists.
 
 </ParseArguments>
 
@@ -108,42 +98,27 @@ Bevy ${VERSION} Migration Checklist Generation Plan
 Version: ${VERSION}
 Tag: v${VERSION}
 
-Three-Pass Processing:
-  Pass 1: Python extraction of structure and content
-  Pass 2: 10 parallel agents for semantic review
-  Pass 3: Sequential merge into final checklist
+Processing Approach:
+  Single-pass deterministic Python generation
+  Direct extraction from official migration guides
+  No LLM enhancement (guarantees accuracy)
 
-Working Directory (Transient):
-  ${WORK_DIR}/bevy-${VERSION}-checklist-pass1.md
-  ${WORK_DIR}/bevy-${VERSION}-checklist-pass1.json
-  ${WORK_DIR}/agent-findings/agent-{01..10}-findings.md
-  ${WORK_DIR}/agent-findings/prompts/agent-{01..10}-prompt.txt
-
-Final Output (Persistent):
+Final Output:
   ~/.claude/bevy_migration/bevy-${VERSION}-checklist.md
 
 Execution Steps:
-  1. Create transient work directory
-     → mkdir -p ${WORK_DIR}
-
-  2. Remove existing Bevy repo (if present)
+  1. Remove existing Bevy repo (if present)
      → rm -rf ~/rust/bevy-${VERSION}
 
-  3. Clone Bevy repository
+  2. Clone Bevy repository
      → git clone https://github.com/bevyengine/bevy.git ~/rust/bevy-${VERSION}
 
-  4. Checkout version tag v${VERSION}
+  3. Checkout version tag v${VERSION}
      → git -C ~/rust/bevy-${VERSION} checkout v${VERSION}
 
-  5. PASS 1: Basic extraction (Python)
+  4. Generate checklist (Python)
      → python3 ~/.claude/scripts/bevy_migration_checklist_generator.py
-
-  6. PASS 2: Semantic review (10 parallel agents)
-     → Launch agents to enhance actionability
-
-  7. PASS 3: Merge findings + cleanup
-     → python3 ~/.claude/scripts/bevy_migration_merge_findings.py
-     → Removes ${WORK_DIR} after creating final checklist
+     → Processes all migration guides deterministically
 
 ═══════════════════════════════════════════════════════════
 Proceeding with execution...
@@ -175,19 +150,7 @@ Proceeding with execution...
 
 4. **Verify migration guides exist:**
    ```bash
-   if [ ! -d "${GUIDES_DIR}" ]; then
-     echo "Error: Migration guides directory not found at ${GUIDES_DIR}"
-     echo "The Bevy ${VERSION} release may not include migration guides, or the repository structure may have changed."
-     exit 1
-   fi
-
-   if [ -z "$(ls -A "${GUIDES_DIR}" 2>/dev/null)" ]; then
-     echo "Error: Migration guides directory is empty at ${GUIDES_DIR}"
-     echo "The Bevy ${VERSION} release may not include migration guides."
-     exit 1
-   fi
-
-   echo "Found $(ls "${GUIDES_DIR}" | wc -l) migration guide(s)"
+   ~/.claude/scripts/verify_migration_guides.sh ${GUIDES_DIR}
    ```
 
 **Progress messages:**
@@ -199,13 +162,13 @@ Proceeding with execution...
 
 ---
 
-<Pass1_BasicExtraction>
+<GenerateChecklist>
 
-**Run Pass 1: Basic extraction with Python**
+**Run the checklist generator (single-pass Python)**
 
-1. **Create work directory:**
+1. **Ensure output directory exists:**
    ```bash
-   mkdir -p ${WORK_DIR}
+   mkdir -p ${OUTPUT_DIR}
    ```
 
 2. **Run the generator:**
@@ -213,128 +176,28 @@ Proceeding with execution...
    python3 ~/.claude/scripts/bevy_migration_checklist_generator.py \
      --version ${VERSION} \
      --guides-dir ${GUIDES_DIR} \
-     --work-dir ${WORK_DIR}
+     --output ${FINAL_OUTPUT}
    ```
 
 **The script will:**
 - Parse all `*.md` files in the migration-guides directory
-- Extract titles, descriptions, bullet points, code blocks
-- Generate search patterns from code and text
-- Output basic markdown and JSON to ${WORK_DIR}
+- Extract titles, PR numbers, descriptions, bullet points, code blocks
+- Identify change types (rename, remove, move, etc.)
+- Generate actionable checklist items from code diffing and descriptions
+- Extract and prioritize search patterns (old code first)
+- Add contextual guidance based on change type
+- Write final checklist directly to output
 
-**Output files (transient):**
-- `${WORK_DIR}/bevy-${VERSION}-checklist-pass1.md` - Basic checklist
-- `${WORK_DIR}/bevy-${VERSION}-checklist-pass1.json` - Structured data for Pass 2
+**Output:**
+- `${FINAL_OUTPUT}` - Complete migration checklist
 
 **Progress messages:**
 - "Parsing X migration guides..."
-- "✓ Basic checklist generated"
-- "✓ JSON data generated"
-- "✓ Found X migration items"
+- "✓ Parsed X migration guides"
+- "✓ Final checklist generated: ${FINAL_OUTPUT}"
+- "✓ Total sections: X"
 
-</Pass1_BasicExtraction>
-
----
-
-<Pass2_SemanticReview>
-
-**Run Pass 2: Semantic review with 10 parallel agents**
-
-1. **Create agent findings directory:**
-   ```bash
-   mkdir -p ${AGENT_FINDINGS_DIR}
-   ```
-
-2. **Generate agent prompts:**
-   ```bash
-   python3 ~/.claude/scripts/bevy_migration_semantic_review.py \
-     --json-input ${WORK_DIR}/bevy-${VERSION}-checklist-pass1.json \
-     --output-dir ${AGENT_FINDINGS_DIR} \
-     --num-agents 10
-   ```
-
-   This script:
-   - Divides guides into 10 balanced batches
-   - Creates prompts for each agent
-   - Saves prompts to `${WORK_DIR}/agent-findings/prompts/`
-
-3. **Launch 10 agents in parallel using Task tool:**
-
-   Read the 10 agent prompts from `${AGENT_FINDINGS_DIR}/prompts/agent-{01..10}-prompt.txt`
-
-   Use a **single message with 10 Task tool calls** to launch all agents in parallel:
-
-   ```python
-   # Pseudo-code for parallel launch
-   for agent_id in 1..10:
-       Task(
-           description=f"Semantic review agent {agent_id}",
-           subagent_type="general-purpose",
-           prompt=read_file(f"${AGENT_FINDINGS_DIR}/prompts/agent-{agent_id:02d}-prompt.txt")
-       )
-   ```
-
-   Each agent will write enhanced findings to:
-   - `${AGENT_FINDINGS_DIR}/agent-01-findings.md`
-   - `${AGENT_FINDINGS_DIR}/agent-02-findings.md`
-   - ... through agent-10-findings.md
-
-**What agents do:**
-- Break complex changes into granular checklist items
-- Extract concrete search patterns
-- Identify required vs optional changes
-- Clarify ambiguous descriptions
-- Preserve all code examples
-- Add helpful context
-
-**Wait for all agents to complete before proceeding to Pass 3.**
-
-**Progress messages:**
-- "Loaded X migration guides for Bevy ${VERSION}"
-- "Divided into 10 batches"
-- "✓ Generated 10 agent prompts"
-- "Launching 10 parallel agents..."
-- "✓ All agents completed"
-
-</Pass2_SemanticReview>
-
----
-
-<Pass3_MergeFindings>
-
-**Run Pass 3: Merge findings and cleanup**
-
-1. **Run the merge script:**
-   ```bash
-   mkdir -p ${OUTPUT_DIR}
-   python3 ~/.claude/scripts/bevy_migration_merge_findings.py \
-     --agent-findings-dir ${AGENT_FINDINGS_DIR} \
-     --output ${FINAL_OUTPUT} \
-     --version ${VERSION} \
-     --num-agents 10 \
-     --work-dir ${WORK_DIR}
-   ```
-
-**The script will:**
-- Read all 10 agent finding files sequentially
-- Parse enhanced guide sections
-- Merge into final checklist preserving guide order
-- Add header with processing statistics
-- Write final enhanced checklist to ${FINAL_OUTPUT}
-- **Clean up ${WORK_DIR} and all transient files**
-
-**Output (persistent):**
-- `${FINAL_OUTPUT}` - Final enhanced migration checklist
-
-**Progress messages:**
-- "Merging findings from 10 agents..."
-- "✓ Agent 01: X guides"
-- "✓ Agent 02: X guides"
-- ... through agent 10
-- "✓ Final checklist generated"
-- "✓ Cleaned up work directory"
-
-</Pass3_MergeFindings>
+</GenerateChecklist>
 
 ---
 
@@ -349,24 +212,25 @@ Show a summary of what was generated:
 ✓ Bevy ${VERSION} Migration Checklist Generated
 ═══════════════════════════════════════════════════════════
 
-Final Enhanced Checklist:
+Final Checklist:
   ${FINAL_OUTPUT}
 
-Processing Summary:
-- Pass 1: Parsed X migration guides
-- Pass 2: 10 parallel agents enhanced actionability
-- Pass 3: Merged findings and cleaned up transient files
+Processing:
+- Parsed all migration guides from official Bevy repository
+- Generated deterministic, accurate checklist
+- 100% faithful to source migration guides
 
 Features:
-✓ Granular, actionable checklist items
-✓ Concrete search patterns for your code
+✓ Complete coverage of all migration guides
+✓ Actionable checklist items with specific changes
+✓ Search patterns to find affected code
 ✓ Required vs optional changes identified
 ✓ Official code examples preserved
-✓ Clear migration guidance
+✓ No hallucinated content (deterministic generation)
 
 Next Steps:
-1. Review the final checklist: ${FINAL_OUTPUT}
-2. Run /bevy_migration_plan ${VERSION} to generate a project-specific plan
+1. Review the checklist: ${FINAL_OUTPUT}
+2. Run /bevy_migration_plan ${VERSION} to create a project-specific migration plan
 
 The checklist is reusable across all your Bevy projects.
 ═══════════════════════════════════════════════════════════
@@ -421,7 +285,8 @@ commands.add_observer(|trigger: On<Add, Player>| {
 
 ## Notes
 
-- The checklist is generated from official Bevy migration guides
+- The checklist is generated from official Bevy migration guides using deterministic Python extraction
+- No LLM enhancement ensures 100% accuracy and zero hallucination
 - It's saved globally in `~/.claude/bevy_migration/` for reuse across projects
 - The Bevy repo is cloned to `~/rust/bevy-{version}/` for reference
 - Run this command once per Bevy version
