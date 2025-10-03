@@ -419,6 +419,14 @@ def main() -> None:
     codebase = cast(Path, args.codebase)
     output_path = cast(Path | None, args.output)
 
+    # Defense in depth: Delete output file at start to prevent stale cached data
+    if output_path and output_path.exists():
+        try:
+            output_path.unlink()
+            print(f"Cleaned up stale output file: {output_path}", file=sys.stderr)
+        except OSError as e:
+            print(f"Warning: Could not delete stale output file {output_path}: {e}", file=sys.stderr)
+
     if not codebase.exists():
         print(f"Error: Codebase path does not exist: {codebase}", file=sys.stderr)
         sys.exit(1)
@@ -430,10 +438,16 @@ def main() -> None:
     if not deps:
         print("No bevy-related dependencies found.", file=sys.stderr)
         # Still output a minimal report
-        print("\n## ⚠️ Dependency Compatibility Review")
-        print("")
-        print("**Status:** No bevy-related dependencies found in this project")
-        print("")
+        report = "## ⚠️ Dependency Compatibility Review\n\n"
+        report += "**Status:** No bevy-related dependencies found in this project\n"
+
+        # Output to file or stdout
+        if output_path:
+            _ = output_path.write_text(report)
+            print(f"✓ Report written to {output_path}", file=sys.stderr)
+        else:
+            print(report)
+
         sys.exit(0)
 
     print(f"Found {len(deps)} bevy-related dependencies", file=sys.stderr)
