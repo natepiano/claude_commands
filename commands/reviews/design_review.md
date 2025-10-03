@@ -184,7 +184,33 @@ In the redundancy_check field, quote the section where the plan addresses this i
 1. Use Grep to search PLAN DOCUMENT for keywords from your concern
    - Example: Concern about Ord derives → search: "Ord|PartialOrd|VariantName"
 2. If Grep finds matches, Read those sections to verify what the plan proposes
-3. Fill out the redundancy_check field in your JSON based on what you find
+3. Extract the exact quote and location that supports your assessment
+4. Fill out the redundancy_check field in your JSON based on what you find
+
+**MANDATORY redundancy_check JSON fields:**
+
+```json
+"redundancy_check": {
+  "grep_performed": true,
+  "grep_pattern": "Hash|Ord|VariantName",
+  "grep_results_summary": "Found 3 matches in Phase 1a section",
+  "plan_addresses_this": "YES_IDENTICAL",
+  "supporting_quote": "#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]",
+  "quote_location": "Phase 1a code block, VariantName struct definition",
+  "assessment": "REDUNDANT"
+}
+```
+
+**Field Requirements:**
+
+1. **grep_pattern** (required): The exact pattern you searched for
+2. **grep_results_summary** (required): Brief summary of what grep found
+3. **supporting_quote** (required):
+   - For "YES_IDENTICAL" or "YES_DIFFERENT": Quote the plan text that addresses this issue
+   - For "NO": Quote the section where this SHOULD have been mentioned but wasn't
+4. **quote_location** (required): Section name and context (e.g., "Phase 1a, VariantName definition")
+5. **plan_addresses_this** (required): "YES_IDENTICAL", "YES_DIFFERENT", or "NO"
+6. **assessment** (required): "REDUNDANT", "ALTERNATIVE_NEEDED", or "GAP"
 
 **Decision Guide for redundancy_check.assessment:**
 
@@ -192,35 +218,77 @@ In the redundancy_check field, quote the section where the plan addresses this i
 Plan proposes correct solution
   → assessment: "REDUNDANT"
   → plan_addresses_this: "YES_IDENTICAL"
+  → supporting_quote: Extract the exact code/text from the plan showing the solution
+  → quote_location: Cite the specific section
 
 Plan proposes a solution BUT it's wrong or incomplete
   → assessment: "ALTERNATIVE_NEEDED"
   → plan_addresses_this: "YES_DIFFERENT"
+  → supporting_quote: Extract what the plan currently proposes
+  → quote_location: Cite where the incomplete solution appears
 
 Plan doesn't mention this issue at all
   → assessment: "GAP"
   → plan_addresses_this: "NO"
+  → supporting_quote: Quote the section where this SHOULD appear but doesn't
+  → quote_location: Cite the section that lacks this information
 ```
 
 **Examples:**
 
 Example 1: Plan already has the fix
 - You notice VariantName needs Ord derives
-- You grep and find Phase 1a proposes adding Ord/PartialOrd
-- redundancy_check.assessment = "REDUNDANT"
+- You grep with pattern "Ord|PartialOrd|VariantName" and find Phase 1a
+- You read Phase 1a and extract: `#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]`
+- redundancy_check:
+  ```json
+  {
+    "grep_pattern": "Ord|PartialOrd|VariantName",
+    "grep_results_summary": "Found Phase 1a proposing VariantName derive changes",
+    "plan_addresses_this": "YES_IDENTICAL",
+    "supporting_quote": "#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Default, Serialize, Deserialize)]",
+    "quote_location": "Phase 1a: Update VariantName, struct definition",
+    "assessment": "REDUNDANT"
+  }
+  ```
 - This finding does not appear in your final results
 
 Example 2: Plan's fix is incomplete
 - You notice VariantName needs Ord AND Hash derives
-- You grep and find Phase 1a only proposes Ord/PartialOrd (missing Hash)
-- redundancy_check.assessment = "ALTERNATIVE_NEEDED"
+- You grep and find Phase 1a proposes only Ord/PartialOrd (missing Hash)
+- redundancy_check:
+  ```json
+  {
+    "grep_pattern": "Ord|PartialOrd|Hash|VariantName",
+    "grep_results_summary": "Found Phase 1a with Ord/PartialOrd but no Hash",
+    "plan_addresses_this": "YES_DIFFERENT",
+    "supporting_quote": "#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]",
+    "quote_location": "Phase 1a: Update VariantName, struct definition",
+    "assessment": "ALTERNATIVE_NEEDED"
+  }
+  ```
 - Include this finding with your improved suggestion
 
 Example 3: Plan has a gap
 - You notice VariantName needs Ord derives
 - You grep and find no mention of this in the plan
-- redundancy_check.assessment = "GAP"
+- redundancy_check:
+  ```json
+  {
+    "grep_pattern": "Ord|PartialOrd|VariantName",
+    "grep_results_summary": "No matches found - plan doesn't address VariantName derives",
+    "plan_addresses_this": "NO",
+    "supporting_quote": "// Type Definitions section discusses VariantName but no derive changes proposed",
+    "quote_location": "Type Definitions section",
+    "assessment": "GAP"
+  }
+  ```
 - Include this finding
+
+**CRITICAL ENFORCEMENT:**
+- You CANNOT claim a plan lacks something if you cannot provide a supporting_quote showing the absence or inadequacy
+- The supporting_quote must be extracted from the actual plan document using Read tool
+- If your supporting_quote contradicts your assessment, your finding is INVALID and must be DISCARDED
 </GrepForPlanRedundancy>
 
 <DesignConsistency>
