@@ -55,6 +55,43 @@ cargo nextest run
 ```
 </correct>
 
+## python
+
+<python_requirements>
+
+### type safety with basedpyright
+- our editor, zed, uses basedpyright as the lsp for python
+- **CRITICAL**: ALL errors and warnings must be fixed - zero tolerance
+- **NEVER** use file-level type ignores (e.g., `# pyright: reportAny=false` at top of file)
+- **ALWAYS** provide explicit type definitions to avoid `Any` types
+
+### avoiding Any types
+1. **First priority**: Create proper type definitions
+   - Use `TypedDict` for dictionary structures with known keys
+   - Use specific types instead of generic containers
+   - Add type annotations to all function signatures
+
+2. **Standard library Any types**: When stdlib functions return `Any` (e.g., `json.loads()`, `urllib.request.urlopen()`):
+   - Create `TypedDict` definitions for expected structures
+   - Cast to specific types with annotations
+   - Use type assertions where the type is known at runtime
+
+3. **Last resort only**: If `Any` is genuinely unavoidable from stdlib, use line-level suppression:
+   ```python
+   data: MyType = json.loads(response.read())  # pyright: ignore[reportAny]
+   ```
+   - Use `# pyright: ignore[reportAny]` on the specific line only
+   - Only use after exhausting all other type-safe approaches
+   - Each suppression should be justified by unavoidable stdlib limitations
+
+### example from bevy_dependency_check.py
+See `~/.claude/scripts/bevy_dependency_check.py` for reference implementation with:
+- `TypedDict` definitions for API responses
+- Line-level suppressions only where stdlib returns `Any`
+- Zero errors, zero warnings achieved
+
+</python_requirements>
+
 ## working with the user
 
 ### renaming code
@@ -86,4 +123,3 @@ rustc /tmp/test.rs -o /tmp/test && /tmp/test
 # Or better: avoid creating test files altogether during reviews - just analyze the code logic
 ```
 </correct>
-- our editor, zed, uses basedpyright as the lsp for python - always fix all errors and warnings in any python file you make
