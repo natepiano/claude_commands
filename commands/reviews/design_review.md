@@ -153,18 +153,25 @@ For plan document reviews:
 2. **MANDATORY REDUNDANCY CHECK**: Before suggesting ANY fix or improvement:
    - Search the ENTIRE plan for "Proposed Fix", "Solution", "Implementation", or similar sections
    - Check if your suggested code already exists ANYWHERE in the plan (even partially)
-   - If found, you MUST mark as REDUNDANT, not CONFIRMED
-   - Quote the exact section containing the existing solution when claiming redundancy
-3. **CRITICAL**: A finding is REDUNDANT if:
-   - The plan already contains the same or similar code solution
-   - The plan already describes fixing this exact issue
-   - The "Proposed Fix" section addresses the problem you identified
-   - Even if the current code doesn't have it yet (remember: plans describe FUTURE changes)
-4. Quote specific sections when claiming gaps exist
-5. Understand how topics connect across different sections
-6. For every "missing" claim, either quote the section that should contain it or explain why existing content is insufficient
-7. **NEVER** suggest code that already appears in the plan's "Proposed Fix" or solution sections
+   - Apply <RedundancyCriteria/> to determine if finding is redundant
+3. Quote specific sections when claiming gaps exist
+4. Understand how topics connect across different sections
+5. For every "missing" claim, either quote the section that should contain it or explain why existing content is insufficient
 </DocumentComprehension>
+
+<RedundancyCriteria>
+**What makes a finding REDUNDANT:**
+- The plan already contains the same or similar code solution
+- The plan already describes fixing this exact issue
+- A "Proposed Fix" or "Implementation" section addresses the problem you identified
+- **CRITICAL**: Plans describe FUTURE changes. Current code NOT matching plan is EXPECTED.
+- If your suggested code already appears ANYWHERE in the plan (even partially): REDUNDANT
+
+**When you find redundancy:**
+- Quote the exact section containing the existing solution
+- Mark as REDUNDANT, not CONFIRMED
+- **NEVER** suggest code that already appears in the plan
+</RedundancyCriteria>
 
 <GrepForPlanRedundancy>
 **How to check if plan already contains your suggestion:**
@@ -172,7 +179,7 @@ For plan document reviews:
 2. Search for keywords from your proposed suggestion
    - Example: Suggesting "add Ord derive to VariantName" → search: "Ord|PartialOrd|VariantName"
 3. If Grep finds matches, use Read tool on those line ranges to verify what plan says
-4. **CRITICAL**: Plans describe FUTURE changes. Current code NOT matching plan is EXPECTED.
+4. Apply <RedundancyCriteria/> to determine if your finding is redundant
 </GrepForPlanRedundancy>
 
 <DesignConsistency>
