@@ -86,3 +86,4 @@ rustc /tmp/test.rs -o /tmp/test && /tmp/test
 # Or better: avoid creating test files altogether during reviews - just analyze the code logic
 ```
 </correct>
+- our editor, zed, uses basedpyright as the lsp for python - always fix all errors and warnings in any python file you make
