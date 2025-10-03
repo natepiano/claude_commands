@@ -88,6 +88,7 @@ Generate markdown section with this EXACT structure:
 **Guide File:** `${BEVY_REPO_DIR}/${GUIDE_FILE_PATH}`
 **Requirement Level:** [REQUIRED/HIGH/MEDIUM/LOW]
 **Occurrences:** [X] locations across [Y] files
+**Pass 1 Count:** [Z] | **Pass 2 Count:** [X] | **Status:** [MATCH/ANOMALY: ±N%]
 
 ### Migration Guide Summary
 
@@ -135,6 +136,29 @@ rg "pattern" --type rust
 - **CRITICAL**: Include the "**Requirement Level:**" field - required for sorting
 - **CRITICAL**: End with the triple-dash separator (---) - nothing after
 </Pass2OutputTemplate>
+
+---
+
+<ApplicableGuidesSummary>
+Output a formatted list showing all applicable guides found in Pass 1:
+
+```
+## Pass 1: Applicable Guides Found
+
+From the 10 subagent outputs, I found these applicable guides:
+  1. [guide_name.md] ([total_occurrences] occurrences)
+  2. [guide_name.md] ([total_occurrences] occurrences)
+  ...
+
+Launching Pass 2 deep analysis for [N] guides...
+```
+
+**Requirements:**
+- Number each guide sequentially
+- Show guide filename (basename only)
+- Show Pass 1 total occurrence count in parentheses
+- Sort by occurrence count (highest first)
+</ApplicableGuidesSummary>
 
 ---
 
@@ -306,6 +330,11 @@ For EACH guide file in your assigned_guides:
    - Merge all "applicable_guides" arrays into single list
    - Store this as APPLICABLE_GUIDES_DATA (list of objects with guide_path, matched_patterns, total_occurrences)
 
+2. **Output applicable guides summary using <ApplicableGuidesSummary/>:**
+   - Sort APPLICABLE_GUIDES_DATA by total_occurrences (highest first)
+   - Display formatted list with guide names and occurrence counts
+   - This provides visibility into what Pass 2 will analyze
+
 **Handle zero applicable guides edge case:**
 
 If APPLICABLE_GUIDES_DATA is empty (no applicable guides found):
@@ -389,7 +418,10 @@ Expected total occurrences from Pass 1: ${PASS1_TOTAL_OCCURRENCES}
 5. Generate output using <Pass2OutputTemplate/> format
    - In the output, include a link to the guide file: ${BEVY_REPO_DIR}/${GUIDE_FILE_PATH}
    - Use the guide filename (without .md extension) as the title if no title is in the guide
-   - Report actual occurrence count you found vs Pass 1 count
+   - **CRITICAL**: Report occurrence counts:
+     - Pass 1 Count: ${PASS1_TOTAL_OCCURRENCES}
+     - Pass 2 Count: [your actual count]
+     - Status: "MATCH" if within 20%, otherwise "ANOMALY: ±X%"
 
 **Working directory:** ${CODEBASE}
 **Bevy repository:** ${BEVY_REPO_DIR}
@@ -424,11 +456,13 @@ For each section, verify it contains a parseable "**Requirement Level:**" field 
    Use Read tool to read `/tmp/bevy_migration_deps_$(basename ${CODEBASE}).md`.
    Store this content to insert after the Summary section.
 
-3. **Sort sections by requirement level:**
-   - REQUIRED guides first
-   - Then HIGH
-   - Then MEDIUM
-   - Then LOW
+3. **Sort sections by requirement level and identify anomalies:**
+   - REQUIRED guides first, then HIGH, then MEDIUM, then LOW
+   - For each section, parse the occurrence counts from the header:
+     - Extract Pass 1 Count and Pass 2 Count values
+     - Check Status field for "ANOMALY" markers
+   - Track any sections marked with "ANOMALY" status
+   - Aggregate list of anomalies for Summary section
 
 4. **Generate final document structure:**
 
@@ -447,6 +481,9 @@ For each section, verify it contains a parseable "**Requirement Level:**" field 
 - **HIGH priority:** [X] guides ([Y] total occurrences)
 - **MEDIUM priority:** [X] guides ([Y] total occurrences)
 - **LOW priority:** [X] guides ([Y] total occurrences)
+
+**Count Anomalies:** [N] guides with >20% variance between Pass 1 and Pass 2
+[If N > 0, list them: "- guide_name.md: Pass 1=[X], Pass 2=[Y] (±Z%)"]
 
 **Estimated effort:** [Based on occurrence counts]
 - REQUIRED: [Large/Medium/Small] (must fix to compile)
