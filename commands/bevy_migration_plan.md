@@ -456,6 +456,11 @@ For each section, verify it contains a parseable "**Requirement Level:**" field 
    Use Read tool to read `/tmp/bevy_migration_deps_$(basename ${CODEBASE}).md`.
    Store this content to insert after the Summary section.
 
+   **Important:** After reading, delete the temp file to prevent stale data in future runs:
+   ```bash
+   rm -f "/tmp/bevy_migration_deps_$(basename ${CODEBASE}).md"
+   ```
+
 3. **Sort sections by requirement level and identify anomalies:**
    - REQUIRED guides first, then HIGH, then MEDIUM, then LOW
    - For each section, parse the occurrence counts from the header:
