@@ -398,11 +398,13 @@ def main() -> None:
     )
     _ = parser.add_argument('--bevy-version', required=True, help='Target Bevy version (e.g., 0.17.1)')
     _ = parser.add_argument('--codebase', type=Path, required=True, help='Path to Bevy project')
+    _ = parser.add_argument('--output', type=Path, required=False, help='Output file path (default: stdout)')
 
     args = parser.parse_args()
 
     bevy_version = cast(str, args.bevy_version)
     codebase = cast(Path, args.codebase)
+    output_path = cast(Path | None, args.output)
 
     if not codebase.exists():
         print(f"Error: Codebase path does not exist: {codebase}", file=sys.stderr)
@@ -473,8 +475,12 @@ def main() -> None:
     # Generate markdown report
     report = generate_markdown_report(dependency_infos, bevy_version, codebase)
 
-    # Output to stdout
-    print(report)
+    # Output to file or stdout
+    if output_path:
+        _ = output_path.write_text(report)
+        print(f"✓ Report written to {output_path}", file=sys.stderr)
+    else:
+        print(report)
 
     print(f"✓ Dependency check complete", file=sys.stderr)
 

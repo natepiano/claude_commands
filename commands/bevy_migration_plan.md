@@ -17,21 +17,12 @@ Analyzes your codebase against official Bevy migration guides using a two-pass p
 
 ---
 
-## Execution Strategy
-
-**Two-Pass Parallel Subagent Analysis:**
-
-1. **Pass 1 - Quick Applicability Filter**: 10 subagents analyze 11-12 guides each to identify which guides apply to this codebase (fast pattern matching)
-2. **Pass 2 - Deep Analysis**: N subagents (one per applicable guide) perform detailed code analysis and generate migration instructions
-
----
-
 <ExecutionSteps>
 
 **EXECUTE THESE STEPS IN ORDER:**
 
 **STEP 1:** Execute <ParseArguments/>
-**STEP 2:** Execute <GenerateCombinedGuides/>
+**STEP 2:** Execute <CloneRepository/>
 **STEP 3:** Execute <DependencyCompatibilityCheck/>
 **STEP 4:** Execute <Pass1_ApplicabilityFilter/>
 **STEP 5:** Execute <Pass2_DetailedAnalysis/>
@@ -67,7 +58,6 @@ VERSION = [first argument] (e.g., "0.17.1")
 CODEBASE = [second argument or $PWD] (e.g., "~/rust/my_game" or current directory)
 BEVY_REPO_DIR = ${HOME}/rust/bevy-${VERSION} (global, reusable across projects)
 GUIDES_DIR = ${BEVY_REPO_DIR}/release-content/migration-guides
-COMBINED_GUIDES = ${CODEBASE}/.claude/bevy_migration/bevy-${VERSION}-guides.md
 MIGRATION_PLAN = ${CODEBASE}/.claude/bevy_migration/bevy-${VERSION}-migration-plan.md
 ```
 
@@ -77,13 +67,76 @@ MIGRATION_PLAN = ${CODEBASE}/.claude/bevy_migration/bevy-${VERSION}-migration-pl
 - Use `${HOME}` instead of `~` in all template definitions to avoid ambiguity
 - BEVY_REPO_DIR already uses `${HOME}` for reliable path resolution across all contexts
 
-**Note:** The Bevy repository is cloned to a global location (`${HOME}/rust/bevy-${VERSION}`) to avoid duplicate clones, but the output files (combined guides and migration plan) are saved in the target project's `.claude/bevy_migration/` directory.
+**Note:** The Bevy repository is cloned to a global location (`${HOME}/rust/bevy-${VERSION}`) to avoid duplicate clones. The migration plan is saved in the target project's `.claude/bevy_migration/` directory.
 
 </ParseArguments>
 
 ---
 
-<GenerateCombinedGuides>
+<UpdateTodoProgress old_task="..." new_task="...">
+Use TodoWrite tool to update the todo list - mark "${old_task}" as completed and "${new_task}" as in_progress.
+</UpdateTodoProgress>
+
+---
+
+<Pass2OutputTemplate>
+Generate markdown section with this EXACT structure:
+
+```markdown
+## [Title from guide or filename without .md]
+
+**Guide File:** `${BEVY_REPO_DIR}/${GUIDE_FILE_PATH}`
+**Requirement Level:** [REQUIRED/HIGH/MEDIUM/LOW]
+**Occurrences:** [X] locations across [Y] files
+
+### Migration Guide Summary
+
+[2-3 sentence summary of what changed and why]
+
+### Affected Code Locations
+
+**File: `[path/to/file.rs]`** ([N] occurrences)
+```rust
+// Context from surrounding code (3-5 lines)
+[actual code snippet from your search]
+// More context
+```
+
+[Repeat for each affected file, limit to top 10 files if more]
+
+### Migration Instructions
+
+1. [Specific step-by-step instructions for this codebase]
+2. [Reference the official guide for details: see guide file above]
+3. [Note any special considerations for this project]
+
+### Search Pattern
+
+To find all occurrences:
+```bash
+rg "pattern" --type rust
+```
+
+---
+```
+
+**Output Requirements:**
+- Generate ONLY the markdown section above
+- Include actual code snippets from ${CODEBASE}
+- Use relative paths from ${CODEBASE}
+- Limit to top 10 most important locations if there are many
+- Be specific to THIS codebase, not generic
+- Do NOT use line numbers (they become stale)
+- Use 3-5 lines of context around each match
+- **CRITICAL**: Start your response with "##" followed by the title - no preamble or commentary
+- **CRITICAL**: Include the "**Guide File:**" line with full path to the guide
+- **CRITICAL**: Include the "**Requirement Level:**" field - required for sorting
+- **CRITICAL**: End with the triple-dash separator (---) - nothing after
+</Pass2OutputTemplate>
+
+---
+
+<CloneRepository>
 
 **Create TODO list:**
 
@@ -91,7 +144,6 @@ MIGRATION_PLAN = ${CODEBASE}/.claude/bevy_migration/bevy-${VERSION}-migration-pl
 [
   {"content": "Validate Bevy version exists on GitHub", "status": "in_progress", "activeForm": "Validating Bevy version exists on GitHub"},
   {"content": "Clone Bevy repository (if needed)", "status": "pending", "activeForm": "Cloning Bevy repository"},
-  {"content": "Generate combined migration guides file", "status": "pending", "activeForm": "Generating combined migration guides file"},
   {"content": "Check dependency compatibility", "status": "pending", "activeForm": "Checking dependency compatibility"},
   {"content": "Pass 1: Filter applicable guides (10 parallel subagents)", "status": "pending", "activeForm": "Pass 1: Filtering applicable guides"},
   {"content": "Pass 2: Deep analysis (N parallel subagents)", "status": "pending", "activeForm": "Pass 2: Deep analysis of applicable guides"},
@@ -114,21 +166,12 @@ gh api repos/bevyengine/bevy/releases/tags/v${VERSION}
 - Show message: "Available recent versions: ..."
 - Stop execution
 
-**Mark TODO as completed and next as in_progress**
+<UpdateTodoProgress old_task="Validate Bevy version exists on GitHub" new_task="Clone Bevy repository (if needed)"/>
 
 **Clone repository if needed:**
 
 ```bash
-if [ -d "${BEVY_REPO_DIR}/.git" ]; then
-  echo "Repository already exists at ${BEVY_REPO_DIR}"
-  git -C "${BEVY_REPO_DIR}" checkout "v${VERSION}"
-else
-  echo "Cloning Bevy ${VERSION} to ${BEVY_REPO_DIR}"
-  rm -rf "${BEVY_REPO_DIR}"  # Clean any partial/corrupt directories
-  mkdir -p "$(dirname "${BEVY_REPO_DIR}")"
-  git clone https://github.com/bevyengine/bevy.git "${BEVY_REPO_DIR}"
-  git -C "${BEVY_REPO_DIR}" checkout "v${VERSION}"
-fi
+~/.claude/scripts/bevy_migration_ensure_repo.sh "${VERSION}"
 ```
 
 **Verify migration guides exist:**
@@ -137,38 +180,25 @@ fi
 ~/.claude/scripts/verify_migration_guides.sh "${GUIDES_DIR}"
 ```
 
-**Mark TODO as completed and next as in_progress**
-
-**Generate combined guides file:**
+**Create output directory:**
 
 ```bash
 mkdir -p "${CODEBASE}/.claude/bevy_migration"
-echo "Generating combined guides file..."
-~/.claude/scripts/bevy_migration_combine_guides.py "${VERSION}" "${GUIDES_DIR}" "${COMBINED_GUIDES}"
 ```
 
-**The script outputs:**
-- Combined markdown file with all 114 migration guides
-- Table of Contents with 10 subagent sections
-- Each guide marked with its line number for easy reference
+<UpdateTodoProgress old_task="Clone Bevy repository (if needed)" new_task="Check dependency compatibility"/>
 
-**Verify the file was created:**
-```bash
-ls -lh "${COMBINED_GUIDES}"
-```
-
-**Mark TODO as completed and next as in_progress**
-
-</GenerateCombinedGuides>
+</CloneRepository>
 
 ---
 
 <DependencyCompatibilityCheck>
 
-**Run dependency compatibility check:**
+**Run dependency compatibility check and save output:**
 
 ```bash
-~/.claude/scripts/bevy_dependency_check.py --bevy-version "${VERSION}" --codebase "${CODEBASE}"
+DEPENDENCY_OUTPUT="/tmp/bevy_deps_${VERSION}.md"
+~/.claude/scripts/bevy_migration_dependency_check.py --bevy-version "${VERSION}" --codebase "${CODEBASE}" --output "${DEPENDENCY_OUTPUT}"
 ```
 
 **The script will:**
@@ -179,17 +209,13 @@ ls -lh "${COMBINED_GUIDES}"
   - **🔄 UPDATE_REQUIRED**: Compatible version exists - must update Cargo.toml
   - **⚠️ CHECK_NEEDED**: Compatibility unclear - needs manual testing
   - **✅ OK**: Already compatible
-
-**Output:**
-- Markdown section with dependency compatibility review
+- Output markdown section with dependency compatibility review
 - Includes clear explanations of each classification category
 - Lists specific actions needed for each dependency
 
-**Capture the output:**
+The output file will be read during MergeMigrationPlan step and inserted after the Summary section.
 
-Store the script's stdout output in a variable for later merging into the final migration plan. This section will appear immediately after the Summary section and before the REQUIRED Changes section.
-
-**Mark TODO as completed and next as in_progress**
+<UpdateTodoProgress old_task="Check dependency compatibility" new_task="Pass 1: Filter applicable guides (10 parallel subagents)"/>
 
 </DependencyCompatibilityCheck>
 
@@ -203,19 +229,31 @@ Use the Task tool to launch 10 general-purpose subagents **in a single message**
 
 **For each subagent (1-10):**
 
+Create a Task tool call with description: `"Pass 1: Subagent ${N}"`
+
+**Task prompt:**
+
 ```
-Subagent ${N} Task:
+Pass 1 Analysis - Subagent ${N} of 10:
 
 You are analyzing Bevy ${VERSION} migration guides to determine which ones apply to this codebase.
 
-**Your assigned guides:**
-Read the "Subagent ${N}" section from the Table of Contents in ${COMBINED_GUIDES}. This lists your assigned migration guide numbers and their line numbers.
+**Get your assigned guides:**
+
+Run this script to get your tranche of migration guide files:
+```bash
+~/.claude/scripts/bevy_migration_get_tranche.py \
+  --guides-dir "${GUIDES_DIR}" \
+  --subagent-index ${N}
+```
+
+This outputs JSON with "assigned_guides" array containing the guide file paths you should analyze.
 
 **Your task:**
 
-For EACH of your assigned guides:
+For EACH guide file in your assigned_guides:
 
-1. Read the guide at the specified line number in ${COMBINED_GUIDES}
+1. Read the guide file from ${BEVY_REPO_DIR}/<path from assigned_guides>
 2. Extract 3-5 key search patterns from the guide (types, functions, modules mentioned)
 3. Run quick ripgrep searches in ${CODEBASE} for these patterns:
    ```bash
@@ -223,33 +261,49 @@ For EACH of your assigned guides:
    ```
 4. Determine: APPLICABLE or NOT_APPLICABLE
 
-**Output format (respond with ONLY this structured list):**
+**Output format (respond with ONLY this JSON):**
 
-```
-APPLICABLE_GUIDES:
-- Guide N: [title] - Found [X] occurrences of [key_pattern]
-- Guide M: [title] - Found [Y] occurrences of [key_pattern]
-
-NOT_APPLICABLE_GUIDES:
-- Guide K: [title] - No matches found
-- Guide L: [title] - No matches found
+```json
+{
+  "applicable_files": [
+    "release-content/migration-guides/some_guide.md",
+    "release-content/migration-guides/another_guide.md"
+  ],
+  "not_applicable_files": [
+    "release-content/migration-guides/irrelevant_guide.md"
+  ]
+}
 ```
 
 **Rules:**
-- Mark as APPLICABLE if you find ANY occurrences of relevant patterns
-- Mark as NOT_APPLICABLE only if you find ZERO occurrences
+- Include file path in "applicable_files" array if you find ANY occurrences
+- Include file path in "not_applicable_files" array if you find ZERO occurrences
 - Do NOT include detailed analysis in Pass 1 - just presence/absence
 - Do NOT read the entire codebase - use targeted ripgrep searches only
-- Your response should be concise (1-2 lines per guide)
+- Output MUST be valid JSON
 
 **Working directory:** ${CODEBASE}
+**Bevy repository:** ${BEVY_REPO_DIR}
 ```
 
 **Wait for all 10 subagents to complete:**
 
-Collect results from all subagents. Parse the APPLICABLE_GUIDES lists to build a master list of applicable guide numbers.
+**Extract applicable guide files:**
 
-**Mark TODO as completed and next as in_progress**
+1. Parse JSON from all 10 subagent outputs:
+   - Each subagent returns JSON with "applicable_files" and "not_applicable_files" arrays
+   - Merge all "applicable_files" arrays into single list of unique file paths
+   - Store this as APPLICABLE_GUIDE_FILES (list of file paths)
+
+**Handle zero applicable guides edge case:**
+
+If APPLICABLE_GUIDE_FILES is empty (no applicable guides found):
+1. Skip Pass 2 entirely
+2. Create minimal migration plan at ${MIGRATION_PLAN} stating no guides apply
+3. Update TODO: mark "Pass 1" completed, mark "Pass 2" completed (skipped)
+4. Jump to PresentResults with appropriate messaging
+
+<UpdateTodoProgress old_task="Pass 1: Filter applicable guides (10 parallel subagents)" new_task="Pass 2: Deep analysis (N parallel subagents)"/>
 
 </Pass1_ApplicabilityFilter>
 
@@ -259,23 +313,39 @@ Collect results from all subagents. Parse the APPLICABLE_GUIDES lists to build a
 
 **Launch N parallel subagents (one per applicable guide):**
 
-From Pass 1, you now have a list of applicable guide numbers. For each applicable guide, launch ONE general-purpose subagent to perform deep analysis.
+From Pass 1, you now have APPLICABLE_GUIDE_FILES - a list of guide file paths like:
+- `release-content/migration-guides/some_guide.md`
+- `release-content/migration-guides/another_guide.md`
 
 **IMPORTANT:** Launch all subagents in a **single message** with multiple Task tool calls for maximum parallelism.
 
-**For each applicable guide:**
+**For each guide file in APPLICABLE_GUIDE_FILES:**
+
+Iterate through APPLICABLE_GUIDE_FILES. For each file path, create a Task tool call with:
+
+**Task description parameter:**
+```
+"Deep Analysis: ${GUIDE_FILENAME} (${CURRENT_INDEX} of ${TOTAL_COUNT})"
+```
+
+Where:
+- `${GUIDE_FILENAME}` is the basename of the guide file (e.g., "some_guide.md")
+- `${CURRENT_INDEX}` is the 1-based position in APPLICABLE_GUIDE_FILES
+- `${TOTAL_COUNT}` is the total number of applicable guides
+
+**Task prompt parameter (substitute ${GUIDE_FILE_PATH} from current iteration):**
 
 ```
-Deep Analysis Task for Guide ${GUIDE_NUM}:
+Deep Analysis Task for ${GUIDE_FILE_PATH}:
 
 You are performing detailed migration analysis for a single Bevy ${VERSION} migration guide.
 
 **Your guide:**
-Guide ${GUIDE_NUM} in ${COMBINED_GUIDES} at line ${LINE_NUM}
+${BEVY_REPO_DIR}/${GUIDE_FILE_PATH}
 
 **Your task:**
 
-1. **Read the full guide** from ${COMBINED_GUIDES}
+1. **Read the full guide** from ${BEVY_REPO_DIR}/${GUIDE_FILE_PATH}
 2. **Extract ALL identifiers** mentioned in the guide:
    - Types, traits, functions, methods, modules
    - Old names (being removed/renamed)
@@ -292,59 +362,13 @@ Guide ${GUIDE_NUM} in ${COMBINED_GUIDES} at line ${LINE_NUM}
    - MEDIUM: Optional improvements or new features
    - LOW: Minor changes or optimizations
 
-5. **Generate markdown section** with this EXACT structure:
-
-```markdown
-## Guide ${GUIDE_NUM}: [Title from guide]
-
-**Requirement Level:** [REQUIRED/HIGH/MEDIUM/LOW]
-**Occurrences:** [X] locations across [Y] files
-
-### Migration Guide Summary
-
-[2-3 sentence summary of what changed and why]
-
-### Affected Code Locations
-
-**File: `[path/to/file.rs]`** ([N] occurrences)
-```rust
-// Context from surrounding code (3-5 lines)
-[actual code snippet from your search]
-// More context
-```
-
-[Repeat for each affected file, limit to top 10 files if more]
-
-### Migration Instructions
-
-1. [Specific step-by-step instructions for this codebase]
-2. [Reference the official guide for details]
-3. [Note any special considerations for this project]
-
-### Search Pattern
-
-To find all occurrences:
-```bash
-rg "pattern" --type rust
-```
-
----
-```
-
-**Output Requirements:**
-- Generate ONLY the markdown section above
-- Include actual code snippets from ${CODEBASE}
-- Use relative paths from ${CODEBASE}
-- Limit to top 10 most important locations if there are many
-- Be specific to THIS codebase, not generic
-- Do NOT use line numbers (they become stale)
-- Use 3-5 lines of context around each match
-- **CRITICAL**: Start your response with "## Guide" - no preamble or commentary
-- **CRITICAL**: Include the "**Requirement Level:**" field - required for sorting
-- **CRITICAL**: End with the triple-dash separator (---) - nothing after
+5. Generate output using <Pass2OutputTemplate/> format
+   - In the output, include a link to the guide file: ${BEVY_REPO_DIR}/${GUIDE_FILE_PATH}
+   - Use the guide filename (without .md extension) as the title if no title is in the guide
 
 **Working directory:** ${CODEBASE}
-**Combined guides:** ${COMBINED_GUIDES}
+**Bevy repository:** ${BEVY_REPO_DIR}
+**Guide file:** ${GUIDE_FILE_PATH}
 ```
 
 **Wait for all N subagents to complete:**
@@ -355,7 +379,7 @@ Collect markdown sections from each subagent.
 
 For each section, verify it contains a parseable "**Requirement Level:**" field (REQUIRED/HIGH/MEDIUM/LOW). If a section is missing this field or has unparseable content, report an error message indicating which guide failed validation and skip that guide with a note in the final plan's "Issues During Analysis" section.
 
-**Mark TODO as completed and next as in_progress**
+<UpdateTodoProgress old_task="Pass 2: Deep analysis (N parallel subagents)" new_task="Merge and present migration plan"/>
 
 </Pass2_DetailedAnalysis>
 
@@ -370,13 +394,18 @@ For each section, verify it contains a parseable "**Requirement Level:**" field 
    mkdir -p "${CODEBASE}/.claude/bevy_migration"
    ```
 
-2. **Sort sections by requirement level:**
+2. **Read dependency compatibility output:**
+
+   Use Read tool to read ${DEPENDENCY_OUTPUT}.
+   Store this content to insert after the Summary section.
+
+3. **Sort sections by requirement level:**
    - REQUIRED guides first
    - Then HIGH
    - Then MEDIUM
    - Then LOW
 
-3. **Generate final document structure:**
+4. **Generate final document structure:**
 
 ```markdown
 # Bevy ${VERSION} Migration Plan
@@ -402,41 +431,39 @@ For each section, verify it contains a parseable "**Requirement Level:**" field 
 
 ---
 
-[INSERT DEPENDENCY COMPATIBILITY CHECK OUTPUT HERE]
+[Read and insert dependency output from ${DEPENDENCY_OUTPUT} here]
 
 ---
 
 ## REQUIRED Changes
 
-[Sections from Pass 2 for REQUIRED guides]
+[Sections from Pass 2 for REQUIRED guides - each section includes **Guide File:** link]
 
 ---
 
 ## HIGH Priority Changes
 
-[Sections from Pass 2 for HIGH guides]
+[Sections from Pass 2 for HIGH guides - each section includes **Guide File:** link]
 
 ---
 
 ## MEDIUM Priority Changes
 
-[Sections from Pass 2 for MEDIUM guides]
+[Sections from Pass 2 for MEDIUM guides - each section includes **Guide File:** link]
 
 ---
 
 ## LOW Priority Changes
 
-[Sections from Pass 2 for LOW guides]
+[Sections from Pass 2 for LOW guides - each section includes **Guide File:** link]
 
 ---
 
 ## Guides Not Applicable to This Codebase
 
-The following [X] guides from Bevy ${VERSION} do not apply to this codebase:
+The following [X] guides from Bevy ${VERSION} do not apply to this codebase.
 
-- Guide N: [title]
-- Guide M: [title]
-[etc.]
+[List file paths from Pass 1 not_applicable_files arrays - no need to read the files, just list them]
 
 ---
 
@@ -452,16 +479,27 @@ The following [X] guides from Bevy ${VERSION} do not apply to this codebase:
 
 ## Reference
 
-- **Official guides:** ${COMBINED_GUIDES}
+- **Migration guides directory:** ${GUIDES_DIR}
 - **Bevy ${VERSION} release notes:** https://github.com/bevyengine/bevy/releases/tag/v${VERSION}
 ```
 
-4. **Write final migration plan:**
-   ```bash
-   # Write the merged content to ${MIGRATION_PLAN}
-   ```
+5. **Write final migration plan:**
 
-**Mark TODO as completed and next as in_progress**
+   Use Write tool to create ${MIGRATION_PLAN} with the following structure:
+   - Header with metadata (generated timestamp, codebase path, total guides)
+   - Summary section with occurrence counts by priority level
+   - Dependency compatibility section (content from ${DEPENDENCY_OUTPUT})
+   - REQUIRED Changes section (Pass 2 sections with REQUIRED level - each includes **Guide File:** link)
+   - HIGH Priority Changes section (Pass 2 sections with HIGH level - each includes **Guide File:** link)
+   - MEDIUM Priority Changes section (Pass 2 sections with MEDIUM level - each includes **Guide File:** link)
+   - LOW Priority Changes section (Pass 2 sections with LOW level - each includes **Guide File:** link)
+   - Guides Not Applicable section (file paths from Pass 1 not_applicable_files - just list the paths)
+   - Next Steps section
+   - Reference section (link to ${GUIDES_DIR})
+
+   Concatenate all sections in this order and write to ${MIGRATION_PLAN} using Write tool.
+
+**Note:** The final TODO update happens in PresentResults after displaying the summary.
 
 </MergeMigrationPlan>
 
@@ -507,45 +545,7 @@ code locations, snippets, and targeted instructions.
 ═══════════════════════════════════════════════════════════
 ```
 
-**Mark final TODO as completed**
+Use TodoWrite tool to mark "Merge and present migration plan" as completed.
 
 </PresentResults>
 
----
-
-## What Gets Generated
-
-The migration plan includes for each applicable guide:
-
-- **Requirement Level**: REQUIRED/HIGH/MEDIUM/LOW
-- **Occurrence Count**: How many places in YOUR code are affected
-- **Migration Summary**: What changed and why
-- **Affected Locations**: Actual code snippets from YOUR codebase with context
-- **Migration Instructions**: Step-by-step guide specific to YOUR code
-- **Search Patterns**: ripgrep commands to find all occurrences
-
----
-
-## Key Features
-
-✅ **Two-pass parallel analysis** - Fast filtering then deep analysis
-✅ **Project-specific** - Analyzes YOUR actual codebase
-✅ **Prioritized** - REQUIRED → HIGH → MEDIUM → LOW
-✅ **Code snippets** - Real code from your project with context
-✅ **No stale line numbers** - Uses greppable context instead
-✅ **Scalable** - Handles 100+ guides efficiently
-✅ **Fault-tolerant** - Each guide analyzed independently
-✅ **Progress visible** - TODO list tracks each step
-
----
-
-## Notes
-
-- The Bevy repo is cloned globally to `~/rust/bevy-{version}/` (reusable across all projects)
-- Both the combined guides file and migration plan are saved to the target project's `.claude/bevy_migration/` directory
-- Pass 1 is fast (simple pattern matching across 10 subagents)
-- Pass 2 is thorough (one subagent per applicable guide does deep analysis)
-- Run this command once per Bevy version per project
-- Re-running overwrites both files (useful for testing or as you make progress)
-- Can analyze different projects by specifying the path argument
-- Useful for comparing migration needs across multiple Bevy projects
