@@ -93,14 +93,42 @@ def get_bevy_internal_crates(bevy_version: str) -> set[str]:
     return internal_crates
 
 
+def get_workspace_members(codebase: Path) -> set[str]:
+    """
+    Get list of workspace member crate names using cargo metadata.
+    Returns empty set if not a workspace or on error.
+    """
+    try:
+        result = subprocess.run(
+            ['cargo', 'metadata', '--no-deps', '--format-version', '1'],
+            cwd=codebase,
+            capture_output=True,
+            text=True,
+            check=True
+        )
+
+        data: dict[str, list[dict[str, str]]] = json.loads(result.stdout)  # pyright: ignore[reportAny]
+        packages: list[dict[str, str]] = data.get('packages', [])  # type: ignore[assignment]
+
+        # Extract package names from workspace members
+        return {pkg['name'] for pkg in packages}
+
+    except (subprocess.CalledProcessError, json.JSONDecodeError, KeyError):
+        # Not a workspace or error - return empty set
+        return set()
+
+
 def get_bevy_dependencies(codebase: Path, bevy_version: str) -> list[tuple[str, str]]:
     """
     Run cargo tree to find all DIRECT dependencies (from Cargo.toml) that depend on bevy.
-    Returns list of (crate_name, version) tuples, excluding bevy internal crates.
+    Returns list of (crate_name, version) tuples, excluding bevy internal crates and workspace members.
     Uses --depth=1 to only get direct dependencies, not transitive ones.
     """
     # Get the definitive list of bevy internal crates
     internal_crates = get_bevy_internal_crates(bevy_version)
+
+    # Get workspace members to exclude
+    workspace_members = get_workspace_members(codebase)
 
     try:
         # Use --depth=1 to only get direct dependencies
@@ -124,8 +152,9 @@ def get_bevy_dependencies(codebase: Path, bevy_version: str) -> list[tuple[str, 
                     crate_name = match.group(1)
                     version = match.group(2)
 
-                    # Only include third-party bevy ecosystem crates (not bevy internal crates)
-                    if crate_name not in internal_crates:
+                    # Only include third-party bevy ecosystem crates
+                    # (not bevy internal crates, not workspace members)
+                    if crate_name not in internal_crates and crate_name not in workspace_members:
                         dependencies.add((crate_name, version))
 
         return sorted(list(dependencies))
@@ -264,11 +293,9 @@ def find_bevy_compatible_version(
 
 
 def classify_dependency(
-    _dep_name: str,
     current_version: str,
     latest_version: str,
     bevy_compatible_version: str | None,
-    _updated_at: str,
     target_bevy_version: str
 ) -> tuple[str, str]:
     """
@@ -299,9 +326,7 @@ def classify_dependency(
 
 
 def generate_markdown_report(
-    dependencies: list[DependencyInfo],
-    bevy_version: str,
-    _codebase: Path
+    dependencies: list[DependencyInfo]
 ) -> str:
     """Generate markdown report of dependency compatibility."""
 
@@ -320,18 +345,6 @@ def generate_markdown_report(
     lines.append(f"- 🔄 Updates available: {len(updates_required)}")
     lines.append(f"- ⚠️  Needs verification: {len(check_needed)}")
     lines.append(f"- 🚫 Blockers: {len(blockers)}")
-    lines.append("")
-
-    # Add explanation of classifications
-    lines.append("### Classification Guide")
-    lines.append("")
-    lines.append(f"**🚫 BLOCKER**: No version exists that's compatible with Bevy {bevy_version}. Cannot migrate until resolved.")
-    lines.append("")
-    lines.append("**🔄 UPDATE_REQUIRED**: Current version is incompatible, but a newer compatible version exists. Must update Cargo.toml.")
-    lines.append("")
-    lines.append("**⚠️ CHECK_NEEDED**: Compatibility unclear - needs manual verification through testing or checking maintainer updates.")
-    lines.append("")
-    lines.append(f"**✅ OK**: Already compatible with Bevy {bevy_version}.")
     lines.append("")
     lines.append("---")
     lines.append("")
@@ -448,18 +461,15 @@ def main() -> None:
 
         latest_version = crate_info['latest_version']
         all_versions = crate_info['all_versions']
-        updated_at = crate_info['updated_at']
 
         # Find compatible version
         compatible_version = find_bevy_compatible_version(dep_name, all_versions, bevy_version)
 
         # Classify
         classification, reason = classify_dependency(
-            dep_name,
             current_version,
             latest_version,
             compatible_version,
-            updated_at,
             bevy_version
         )
 
@@ -473,7 +483,7 @@ def main() -> None:
         ))
 
     # Generate markdown report
-    report = generate_markdown_report(dependency_infos, bevy_version, codebase)
+    report = generate_markdown_report(dependency_infos)
 
     # Output to file or stdout
     if output_path:

@@ -93,22 +93,21 @@ Generate markdown section with this EXACT structure:
 
 [2-3 sentence summary of what changed and why]
 
-### Affected Code Locations
+### Required Changes
 
-**File: `[path/to/file.rs]`** ([N] occurrences)
-```rust
-// Context from surrounding code (3-5 lines)
-[actual code snippet from your search]
-// More context
+**1. Update [description] in `path/to/file.rs`**
+```diff
+- [old code]
++ [new code]
 ```
 
-[Repeat for each affected file, limit to top 10 files if more]
+**2. Update [description] in `path/to/other_file.rs`**
+```diff
+- [old code]
++ [new code]
+```
 
-### Migration Instructions
-
-1. [Specific step-by-step instructions for this codebase]
-2. [Reference the official guide for details: see guide file above]
-3. [Note any special considerations for this project]
+[Repeat for EVERY occurrence - do not limit to top 10]
 
 ### Search Pattern
 
@@ -122,12 +121,15 @@ rg "pattern" --type rust
 
 **Output Requirements:**
 - Generate ONLY the markdown section above
-- Include actual code snippets from ${CODEBASE}
+- Show actual before/after diff for EVERY occurrence (no "top 10" limit)
 - Use relative paths from ${CODEBASE}
-- Limit to top 10 most important locations if there are many
-- Be specific to THIS codebase, not generic
-- Do NOT use line numbers (they become stale)
-- Use 3-5 lines of context around each match
+- Use diff format with `-` for old code, `+` for new code
+- Be specific to THIS codebase's actual code
+- Each change should have:
+  - Numbered entry (1, 2, 3, ...)
+  - Brief description of what's being updated
+  - File path
+  - Concrete before/after diff from the actual codebase
 - **CRITICAL**: Start your response with "##" followed by the title - no preamble or commentary
 - **CRITICAL**: Include the "**Guide File:**" line with full path to the guide
 - **CRITICAL**: Include the "**Requirement Level:**" field - required for sorting
@@ -177,7 +179,7 @@ gh api repos/bevyengine/bevy/releases/tags/v${VERSION}
 **Verify migration guides exist:**
 
 ```bash
-~/.claude/scripts/verify_migration_guides.sh "${GUIDES_DIR}"
+~/.claude/scripts/bevy_migration_verify_guides.sh "${GUIDES_DIR}"
 ```
 
 **Create output directory:**
@@ -197,8 +199,7 @@ mkdir -p "${CODEBASE}/.claude/bevy_migration"
 **Run dependency compatibility check and save output:**
 
 ```bash
-DEPENDENCY_OUTPUT="/tmp/bevy_deps_${VERSION}.md"
-~/.claude/scripts/bevy_migration_dependency_check.py --bevy-version "${VERSION}" --codebase "${CODEBASE}" --output "${DEPENDENCY_OUTPUT}"
+~/.claude/scripts/bevy_migration_dependency_check.py --bevy-version "${VERSION}" --codebase "${CODEBASE}" --output "/tmp/bevy_migration_deps_$(basename ${CODEBASE}).md"
 ```
 
 **The script will:**
@@ -213,7 +214,7 @@ DEPENDENCY_OUTPUT="/tmp/bevy_deps_${VERSION}.md"
 - Includes clear explanations of each classification category
 - Lists specific actions needed for each dependency
 
-The output file will be read during MergeMigrationPlan step and inserted after the Summary section.
+The output file will be `/tmp/bevy_migration_deps_$(basename ${CODEBASE}).md` and will be read during MergeMigrationPlan step and inserted after the Summary section.
 
 <UpdateTodoProgress old_task="Check dependency compatibility" new_task="Pass 1: Filter applicable guides (10 parallel subagents)"/>
 
@@ -265,22 +266,32 @@ For EACH guide file in your assigned_guides:
 
 ```json
 {
-  "applicable_files": [
-    "release-content/migration-guides/some_guide.md",
-    "release-content/migration-guides/another_guide.md"
+  "applicable_guides": [
+    {
+      "guide_path": "release-content/migration-guides/some_guide.md",
+      "matched_patterns": [
+        {"pattern": "SomeType", "occurrences": 15},
+        {"pattern": "some_function", "occurrences": 8}
+      ],
+      "total_occurrences": 23
+    }
   ],
-  "not_applicable_files": [
-    "release-content/migration-guides/irrelevant_guide.md"
+  "not_applicable_guides": [
+    {
+      "guide_path": "release-content/migration-guides/irrelevant_guide.md",
+      "reason": "No matches for any searched patterns"
+    }
   ]
 }
 ```
 
 **Rules:**
-- Include file path in "applicable_files" array if you find ANY occurrences
-- Include file path in "not_applicable_files" array if you find ZERO occurrences
-- Do NOT include detailed analysis in Pass 1 - just presence/absence
+- For APPLICABLE guides: Include guide_path, ALL patterns you searched, occurrence count for each, and total
+- For NOT_APPLICABLE guides: Include guide_path and brief reason
+- Track EVERY pattern you search for, even if it has 0 occurrences
+- Do NOT include detailed analysis in Pass 1 - just pattern matching results
 - Do NOT read the entire codebase - use targeted ripgrep searches only
-- Output MUST be valid JSON
+- Output MUST be valid JSON with the exact structure shown above
 
 **Working directory:** ${CODEBASE}
 **Bevy repository:** ${BEVY_REPO_DIR}
@@ -288,16 +299,16 @@ For EACH guide file in your assigned_guides:
 
 **Wait for all 10 subagents to complete:**
 
-**Extract applicable guide files:**
+**Extract applicable guide data:**
 
 1. Parse JSON from all 10 subagent outputs:
-   - Each subagent returns JSON with "applicable_files" and "not_applicable_files" arrays
-   - Merge all "applicable_files" arrays into single list of unique file paths
-   - Store this as APPLICABLE_GUIDE_FILES (list of file paths)
+   - Each subagent returns JSON with "applicable_guides" and "not_applicable_guides" arrays
+   - Merge all "applicable_guides" arrays into single list
+   - Store this as APPLICABLE_GUIDES_DATA (list of objects with guide_path, matched_patterns, total_occurrences)
 
 **Handle zero applicable guides edge case:**
 
-If APPLICABLE_GUIDE_FILES is empty (no applicable guides found):
+If APPLICABLE_GUIDES_DATA is empty (no applicable guides found):
 1. Skip Pass 2 entirely
 2. Create minimal migration plan at ${MIGRATION_PLAN} stating no guides apply
 3. Update TODO: mark "Pass 1" completed, mark "Pass 2" completed (skipped)
@@ -313,15 +324,16 @@ If APPLICABLE_GUIDE_FILES is empty (no applicable guides found):
 
 **Launch N parallel subagents (one per applicable guide):**
 
-From Pass 1, you now have APPLICABLE_GUIDE_FILES - a list of guide file paths like:
-- `release-content/migration-guides/some_guide.md`
-- `release-content/migration-guides/another_guide.md`
+From Pass 1, you now have APPLICABLE_GUIDES_DATA - a list of objects containing:
+- `guide_path`: Path to the guide file
+- `matched_patterns`: Array of {pattern, occurrences} objects showing what matched in Pass 1
+- `total_occurrences`: Total occurrence count from Pass 1
 
 **IMPORTANT:** Launch all subagents in a **single message** with multiple Task tool calls for maximum parallelism.
 
-**For each guide file in APPLICABLE_GUIDE_FILES:**
+**For each guide in APPLICABLE_GUIDES_DATA:**
 
-Iterate through APPLICABLE_GUIDE_FILES. For each file path, create a Task tool call with:
+Iterate through APPLICABLE_GUIDES_DATA. For each guide object, create a Task tool call with:
 
 **Task description parameter:**
 ```
@@ -330,10 +342,10 @@ Iterate through APPLICABLE_GUIDE_FILES. For each file path, create a Task tool c
 
 Where:
 - `${GUIDE_FILENAME}` is the basename of the guide file (e.g., "some_guide.md")
-- `${CURRENT_INDEX}` is the 1-based position in APPLICABLE_GUIDE_FILES
+- `${CURRENT_INDEX}` is the 1-based position in APPLICABLE_GUIDES_DATA
 - `${TOTAL_COUNT}` is the total number of applicable guides
 
-**Task prompt parameter (substitute ${GUIDE_FILE_PATH} from current iteration):**
+**Task prompt parameter (substitute values from current guide object):**
 
 ```
 Deep Analysis Task for ${GUIDE_FILE_PATH}:
@@ -343,28 +355,41 @@ You are performing detailed migration analysis for a single Bevy ${VERSION} migr
 **Your guide:**
 ${BEVY_REPO_DIR}/${GUIDE_FILE_PATH}
 
+**Pass 1 Results (use these patterns):**
+Matched patterns from Pass 1:
+${MATCHED_PATTERNS_JSON}
+
+Expected total occurrences from Pass 1: ${PASS1_TOTAL_OCCURRENCES}
+
 **Your task:**
 
 1. **Read the full guide** from ${BEVY_REPO_DIR}/${GUIDE_FILE_PATH}
-2. **Extract ALL identifiers** mentioned in the guide:
-   - Types, traits, functions, methods, modules
-   - Old names (being removed/renamed)
-   - New names (replacements)
 
-3. **Search the codebase** for EVERY identifier:
+2. **Use Pass 1 patterns for your searches:**
+   - DO NOT re-extract patterns from the guide
+   - Use the EXACT patterns provided in the matched_patterns list above
+   - Search each pattern with context:
    ```bash
-   rg "identifier" --type rust -C 3 "${CODEBASE}"
+   rg "pattern_from_pass1" --type rust -C 3 "${CODEBASE}"
    ```
+
+3. **Validate occurrence counts:**
+   - Your total should be similar to Pass 1's ${PASS1_TOTAL_OCCURRENCES}
+   - If significantly different (>20% variance), include a note explaining why
+   - If you find 0 occurrences but Pass 1 found ${PASS1_TOTAL_OCCURRENCES}, STOP and report:
+     "ERROR: Pass 1 found ${PASS1_TOTAL_OCCURRENCES} but Pass 2 found 0. Search commands used: [list them]"
 
 4. **Classify requirement level:**
    - REQUIRED: Breaking changes that will cause compilation failures
    - HIGH: Deprecated features that still compile but need migration
    - MEDIUM: Optional improvements or new features
    - LOW: Minor changes or optimizations
+   - **If 0 occurrences found:** Classify as LOW (informational only)
 
 5. Generate output using <Pass2OutputTemplate/> format
    - In the output, include a link to the guide file: ${BEVY_REPO_DIR}/${GUIDE_FILE_PATH}
    - Use the guide filename (without .md extension) as the title if no title is in the guide
+   - Report actual occurrence count you found vs Pass 1 count
 
 **Working directory:** ${CODEBASE}
 **Bevy repository:** ${BEVY_REPO_DIR}
@@ -396,7 +421,7 @@ For each section, verify it contains a parseable "**Requirement Level:**" field 
 
 2. **Read dependency compatibility output:**
 
-   Use Read tool to read ${DEPENDENCY_OUTPUT}.
+   Use Read tool to read `/tmp/bevy_migration_deps_$(basename ${CODEBASE}).md`.
    Store this content to insert after the Summary section.
 
 3. **Sort sections by requirement level:**
@@ -431,7 +456,7 @@ For each section, verify it contains a parseable "**Requirement Level:**" field 
 
 ---
 
-[Read and insert dependency output from ${DEPENDENCY_OUTPUT} here]
+[Read and insert dependency output from /tmp/bevy_migration_deps_$(basename ${CODEBASE}).md here]
 
 ---
 
