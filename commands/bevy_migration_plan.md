@@ -444,37 +444,57 @@ Expected total occurrences from Pass 1: ${PASS1_TOTAL_OCCURRENCES}
    - Look for code snippets showing `Foo<T>` vs `Foo { field: HashMap<K,V> }`
    - Don't assume - verify against the guide's own examples
 
-3. **Use Pass 1 patterns for your searches:**
+3. **Inspect code with Pass 1 patterns (for writing diffs):**
    - DO NOT re-extract patterns from the guide
    - Use the EXACT patterns provided in the matched_patterns list above
-   - Search each pattern with context using rg for code review:
+   - Use rg with context to inspect actual code (needed for writing before/after diffs):
    ```bash
    rg "pattern_from_pass1" --type rust -C 3 "${CODEBASE}"
    ```
-   - Count occurrences using <CountingProcedure/>:
-   ```bash
-   count=$(~/.claude/scripts/bevy_migration_count_pattern.sh "pattern_from_pass1" "${CODEBASE}" rust)
+   - **DO NOT count manually** - counting happens in step 4
+   - This step is ONLY for inspecting code context to write accurate diffs
+
+4. **Count ALL patterns and validate (single step):**
+
+   **STEP A: Construct and declare your exact command**
+
+   First, build your command using this template:
+   ```
+   ~/.claude/scripts/bevy_migration_count_pattern.sh --verify --pass1-total [N] --patterns "p1" "p2" "p3" -- "${CODEBASE}" rust
    ```
 
-4. **Validate occurrence counts:**
-
-   Use the verify mode from <CountingProcedure/> to validate your counts against Pass 1:
-   ```bash
-   ~/.claude/scripts/bevy_migration_count_pattern.sh --verify \
-     --pass1-total ${PASS1_TOTAL_OCCURRENCES} \
-     --patterns "pattern1" "pattern2" "pattern3" -- "${CODEBASE}" rust
+   Then output this declaration with your EXACT command:
+   ```
+   I will now run this exact command with ZERO modifications:
+   ~/.claude/scripts/bevy_migration_count_pattern.sh --verify --pass1-total [actual number] --patterns [actual patterns] -- [actual path] rust
    ```
 
-   This returns JSON with:
-   - `pass2_total`: Your actual count
-   - `variance_percent`: Percentage difference from Pass 1
-   - `status`: "MATCH" (≤20% variance) or "ANOMALY" (>20% variance)
+   **STEP B: Run the command and immediately describe what you see**
+
+   Copy the EXACT command from Step A and run it. IMMEDIATELY after the Bash tool runs, describe the output you see:
+
+   "The Bash tool shows me this JSON output:
+   ```json
+   {
+     "pass1_total": [number],
+     "breakdown": {
+       "pattern1": [count],
+       "pattern2": [count]
+     },
+     "pass2_total": [number],
+     "variance_percent": [number],
+     "status": "[MATCH or ANOMALY]"
+   }
+   ```"
+
+   You must describe what you SEE in the Bash tool output - do not save to files or redirect.
+   If you save to a file, you cannot describe what you see, so just run the command directly.
+
+   **STEP C: Use the output in your analysis**
+   - `pass2_total`: Your total occurrence count
    - `breakdown`: Individual pattern counts
-
-   **IMPORTANT:**
-   - Use ALL patterns from Pass 1's matched_patterns list
-   - Do NOT create custom echo commands or nested command substitutions
-   - If status is "ANOMALY", include explanation in your output
+   - `status`: "MATCH" (≤20% variance) or "ANOMALY" (>20% variance)
+   - Include variance explanation if status is "ANOMALY"
    - If pass2_total is 0 but Pass 1 found ${PASS1_TOTAL_OCCURRENCES}, STOP and report error
 
 5. **Classify requirement level:**
