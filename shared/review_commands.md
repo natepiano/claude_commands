@@ -65,8 +65,13 @@ When launching Task tool with a prompt template (like <InitialReviewPrompt> or <
     **Target:** ${REVIEW_TARGET}
     **CRITICAL CONTEXT**: ${REVIEW_CONTEXT}
     **WARNING**: This is a plan for FUTURE changes. Do NOT report issues about planned features not existing in current code - they don't exist because they haven't been built yet!
-    **Review Constraints**: Follow these analysis principles:
-    <InitialReviewConstraints/>
+
+    **Review Constraints**: Follow these analysis principles from ${CONSTRAINTS_FILE}:
+    <ReviewConstraints/>
+
+    **CRITICAL - Initial Review Phase Behavior**:
+    When a finding fails validation gates: DISCARD it completely. Do NOT include it in your findings array.
+    Only include findings that pass ALL validation gates.
 
     **NAMED FINDING DETECTION** (if applicable): <NamedFindingDetection/>
 
@@ -326,8 +331,12 @@ Extract exactly ${SELECTED_COUNT} findings and proceed immediately to <ReviewFol
 
     Analyze this finding and provide an investigation verdict. It is important that you think very hard about this review task.
 
-    **Review Constraints**: Follow these analysis principles:
-    <InvestigationConstraints/>
+    **Review Constraints**: Follow these analysis principles from ${CONSTRAINTS_FILE}:
+    <ReviewConstraints/>
+
+    **CRITICAL - Investigation Phase Behavior**:
+    When a finding fails validation gates: Use REJECTED verdict (explain why the finding is invalid).
+    Findings that pass validation get CONFIRMED or MODIFIED verdicts as appropriate.
 
     **Your Investigation Tasks:**
     1. Verify if this is a real issue or false positive
