@@ -469,7 +469,42 @@ For each section, verify it contains a parseable "**Requirement Level:**" field 
    - Track any sections marked with "ANOMALY" status
    - Aggregate list of anomalies for Summary section
 
-4. **Generate final document structure:**
+4. **Collect literal Pass 2 subagent outputs - NO SUMMARIZATION:**
+
+   **CRITICAL CONSTRAINTS:**
+   - Take the EXACT markdown output from EACH Pass 2 subagent response
+   - DO NOT summarize, abbreviate, or truncate any subagent output
+   - DO NOT substitute references to guide files instead of actual content
+   - DO NOT omit diff blocks due to "length concerns"
+   - MUST include EVERY numbered change, EVERY diff block, EVERY code snippet from every subagent
+   - If a guide has 50 occurrences, ALL 50 must be listed with their specific diffs
+
+   **Collection process:**
+   - For each Pass 2 subagent response, extract the complete markdown section starting with "##" and ending with "---"
+   - Verify each section contains the full <Pass2OutputTemplate/> structure
+   - Group sections by their **Requirement Level:** field (REQUIRED, HIGH, MEDIUM, LOW)
+   - Within each group, maintain the sections in their original order
+
+   **Validation:**
+   - Count total numbered changes across all sections
+   - Verify this matches expected occurrence counts from Summary
+   - If any section appears truncated or summarized, REJECT it and report error
+
+4a. **Extract anomaly explanations for detailed reporting:**
+
+   For each guide marked with ANOMALY status (>20% variance):
+   - Extract the guide filename (basename only, e.g., "observer_and_event_changes.md")
+   - Extract Pass 1 count, Pass 2 count, and variance percentage
+   - Look for explanatory text in the Pass 2 subagent output explaining the discrepancy
+   - Common explanations to look for:
+     - "Pass 1 false positives from..."
+     - "Pass 1 counted generic/common terms..."
+     - "Pass 2 found additional..."
+     - Context about what patterns matched incorrectly in Pass 1
+   - Store these as ANOMALY_DETAILS (list of objects with: guide_name, pass1_count, pass2_count, variance_percent, explanation)
+   - If no anomalies detected (empty list), this will be used to conditionally omit the Anomaly Analysis section
+
+5. **Generate final document structure:**
 
 ```markdown
 # Bevy ${VERSION} Migration Plan
@@ -495,6 +530,24 @@ For each section, verify it contains a parseable "**Requirement Level:**" field 
 - HIGH: [Large/Medium/Small] (should fix soon)
 - MEDIUM: [Large/Medium/Small] (optional improvements)
 - LOW: [Large/Medium/Small] (nice to have)
+
+---
+
+[If anomalies detected (N > 0), insert the following section:]
+
+## 🔍 Anomaly Analysis
+
+During the two-pass analysis, [N] guide(s) showed significant variance (>20%) between initial pattern matching and deep contextual analysis:
+
+[For each anomaly, include:]
+
+### [guide_name.md]
+- **Pass 1 Count:** [X] occurrences
+- **Pass 2 Count:** [Y] occurrences
+- **Variance:** ±[Z]%
+- **Explanation:** [Detailed explanation of why the discrepancy occurred - what Pass 1 patterns matched that weren't actually relevant, or what Pass 2 found that Pass 1 missed]
+
+[End conditional section - omit entire "## 🔍 Anomaly Analysis" section if N = 0]
 
 ---
 
@@ -550,19 +603,24 @@ The following [X] guides from Bevy ${VERSION} do not apply to this codebase.
 - **Bevy ${VERSION} release notes:** https://github.com/bevyengine/bevy/releases/tag/v${VERSION}
 ```
 
-5. **Write final migration plan:**
+6. **Write final migration plan:**
 
    Use Write tool to create ${MIGRATION_PLAN} with the following structure:
    - Header with metadata (generated timestamp, codebase path, total guides)
    - Summary section with occurrence counts by priority level
+   - Anomaly Analysis section (ONLY if ANOMALY_DETAILS is non-empty - include detailed explanations for each anomaly)
    - Dependency compatibility section (content from ${DEPENDENCY_OUTPUT})
-   - REQUIRED Changes section (Pass 2 sections with REQUIRED level - each includes **Guide File:** link)
-   - HIGH Priority Changes section (Pass 2 sections with HIGH level - each includes **Guide File:** link)
-   - MEDIUM Priority Changes section (Pass 2 sections with MEDIUM level - each includes **Guide File:** link)
-   - LOW Priority Changes section (Pass 2 sections with LOW level - each includes **Guide File:** link)
+   - REQUIRED Changes section (LITERAL COMPLETE Pass 2 markdown sections - ALL diffs, ALL changes)
+   - HIGH Priority Changes section (LITERAL COMPLETE Pass 2 markdown sections - ALL diffs, ALL changes)
+   - MEDIUM Priority Changes section (LITERAL COMPLETE Pass 2 markdown sections - ALL diffs, ALL changes)
+   - LOW Priority Changes section (LITERAL COMPLETE Pass 2 markdown sections - ALL diffs, ALL changes)
    - Guides Not Applicable section (file paths from Pass 1 not_applicable_files - just list the paths)
    - Next Steps section
    - Reference section (link to ${GUIDES_DIR})
+
+   **Conditional Logic:**
+   - If ANOMALY_DETAILS is empty, skip the entire "## 🔍 Anomaly Analysis" section
+   - If ANOMALY_DETAILS has entries, generate the section with one subsection per anomaly
 
    Concatenate all sections in this order and write to ${MIGRATION_PLAN} using Write tool.
 
