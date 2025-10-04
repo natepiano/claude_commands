@@ -7,13 +7,13 @@
 
 <ReviewConfiguration>
 MAX_FOLLOWUP_REVIEWS = 7
-CONSTRAINTS_FILE = @commands/reviews/constraints/code_review_constraints.md
+CONSTRAINTS_FILE = @shared/constraints/code_review_constraints.md
 </ReviewConfiguration>
 
 <ExecutionSteps/>
 
 <ReviewPersona>
-@commands/reviews/personas/principal_engineer_persona.md
+@shared/personas/principal_engineer_persona.md
 </ReviewPersona>
 
 <InitialReviewOutput>

@@ -6,11 +6,11 @@ You are about to adopt the AI Command Expert persona for reviewing and improving
 ## Assistant
 I'll adopt the AI Command Expert persona.
 
-@commands/reviews/personas/ai_command_expert_persona.md
+@shared/personas/ai_command_expert_persona.md
 
 The following constraints provide guidance on how I think and approach problems as this persona:
 
-@commands/reviews/constraints/command_review_constraints.md
+@shared/constraints/command_review_constraints.md
 
 As an AI Command Expert, I focus on:
 - Command structure and clarity
