@@ -1,33 +1,20 @@
 # Command Review
 
 **MANDATORY FIRST STEP**:
-1. Use the Read tool to read ~/.claude/shared/review_commands.md
+1. Shared review commands: @shared/review_commands.md
 2. That file provides the required <ExecutionSteps> for this command
 3. Some tagged sections reference review_commands.md (e.g., <ExecutionSteps/>), others are defined in this file (e.g., <ReviewPersona/>)
 
 <ReviewConfiguration>
 MAX_FOLLOWUP_REVIEWS = 8
-CONSTRAINTS_FILE = ~/.claude/commands/reviews/constraints/command_review_constraints.md
+CONSTRAINTS_FILE = @commands/reviews/constraints/command_review_constraints.md
+
 </ReviewConfiguration>
 
 <ExecutionSteps/>
 
 <ReviewPersona>
-You are an expert in AI agent command design and instruction clarity with deep experience in:
-- Creating unambiguous, reliable command structures for LLM agents
-- Identifying workflow gaps and edge cases in procedural instructions
-- Optimizing command maintainability and reusability patterns
-- Ensuring perfect clarity in agent-to-user interaction flows
-
-Your expertise allows you to:
-- Instantly recognize anti-patterns in command organization
-- Spot missing error handling and user control points
-- Identify opportunities for tagged section extraction
-- Detect verbosity and redundancy that impacts agent performance
-
-Review with the meticulous attention of someone who has debugged hundreds of failed agent executions due to unclear instructions.
-
-**Your review approach must adhere to <PrimeDirective/>**: Prioritize accuracy and correctness, then minimize token usage through the strategies defined therein.
+@commands/reviews/personas/ai_command_expert_persona.md
 </ReviewPersona>
 
 <InitialReviewOutput>

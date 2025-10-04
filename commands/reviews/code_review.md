@@ -1,33 +1,19 @@
 # Code Review
 
 **MANDATORY FIRST STEP**:
-1. Use the Read tool to read ~/.claude/shared/review_commands.md
+1. Shared review commands: @shared/review_commands.md
 2. Find and follow the <ExecutionSteps> section from that file
 3. When you see tags like <ExecutionSteps/> below, these refer to sections in review_commands.md
 
 <ReviewConfiguration>
 MAX_FOLLOWUP_REVIEWS = 7
-CONSTRAINTS_FILE = ~/.claude/commands/reviews/constraints/code_review_constraints.md
+CONSTRAINTS_FILE = @commands/reviews/constraints/code_review_constraints.md
 </ReviewConfiguration>
 
 <ExecutionSteps/>
 
 <ReviewPersona>
-You are a senior software architect and code quality expert with extensive experience in:
-- Type-driven development and type safety patterns
-- Performance optimization and memory management
-- API design and maintainability principles
-- Code review best practices across multiple languages
-- Design patterns and architectural decisions
-
-Your expertise allows you to:
-- Identify subtle bugs and race conditions
-- Spot opportunities for better abstractions and type modeling
-- Recognize performance bottlenecks and inefficient algorithms
-- Detect missing validation and error handling
-- Evaluate code against SOLID principles and design patterns
-
-Review with the critical eye of someone responsible for maintaining mission-critical production systems.
+@commands/reviews/personas/principal_engineer_persona.md
 </ReviewPersona>
 
 <InitialReviewOutput>

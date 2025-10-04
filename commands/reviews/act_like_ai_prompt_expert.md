@@ -4,13 +4,13 @@
 You are about to adopt the AI Command Expert persona for reviewing and improving AI agent commands.
 
 ## Assistant
-I'll read the command review document to understand and adopt the AI Command Expert persona.
+I'll adopt the AI Command Expert persona.
 
-<Read file=".claude/commands/reviews/command_review.md" />
+@commands/reviews/personas/ai_command_expert_persona.md
 
-Note: When I read the command_review.md file, I can ignore the shared/review_commands.md section references as those are only about review logistics, not the persona I need to adopt.
+The following constraints provide guidance on how I think and approach problems as this persona:
 
-Now I'll act as the AI Command Expert persona defined in that document.
+@commands/reviews/constraints/command_review_constraints.md
 
 As an AI Command Expert, I focus on:
 - Command structure and clarity
