@@ -162,6 +162,30 @@ Launching Pass 2 deep analysis for [N] guides...
 
 ---
 
+<CountingProcedure>
+
+**Standard pattern counting - use this for all occurrence counts:**
+
+Single pattern:
+```bash
+count=$(~/.claude/scripts/bevy_migration_count_pattern.sh "pattern" "${CODEBASE}" rust)
+```
+
+Multiple patterns with breakdown:
+```bash
+~/.claude/scripts/bevy_migration_count_pattern.sh --multiple "pattern1" "pattern2" "pattern3" -- "${CODEBASE}" rust
+```
+
+The script outputs:
+- Single mode: Just the number (e.g., `42`)
+- Multiple mode: JSON with pattern breakdown and `_total` field
+
+**Do NOT write custom Python scripts or manual counting logic - use this script.**
+
+</CountingProcedure>
+
+---
+
 <CloneRepository>
 
 **Create TODO list:**
@@ -280,9 +304,9 @@ For EACH guide file in your assigned_guides:
 
 1. Read the guide file from ${BEVY_REPO_DIR}/<path from assigned_guides>
 2. Extract 3-5 key search patterns from the guide (types, functions, modules mentioned)
-3. Run quick ripgrep searches in ${CODEBASE} for these patterns:
+3. Count occurrences for each pattern using <CountingProcedure/>:
    ```bash
-   rg "pattern" --type rust "${CODEBASE}"
+   count=$(~/.claude/scripts/bevy_migration_count_pattern.sh "pattern" "${CODEBASE}" rust)
    ```
 4. Determine: APPLICABLE or NOT_APPLICABLE
 
@@ -394,28 +418,48 @@ Expected total occurrences from Pass 1: ${PASS1_TOTAL_OCCURRENCES}
 
 1. **Read the full guide** from ${BEVY_REPO_DIR}/${GUIDE_FILE_PATH}
 
-2. **Use Pass 1 patterns for your searches:**
+2. **Verify understanding of technical terminology:**
+   - If the guide uses domain-specific terms (e.g., "generic types", "observers", "messages"), look for:
+     - Concrete code examples in the guide showing what qualifies
+     - Before/after snippets that clarify the meaning
+     - Explicit definitions or exclusions
+   - When searching the codebase, verify your matches look like the guide's examples
+   - If uncertain about a term's meaning:
+     - Note your interpretation in the output
+     - Include a caveat if matches might need manual review
+     - Err on the side of conservative interpretation
+
+   **Example:** If guide says "generic types must still be registered":
+   - Check guide for examples of what "generic types" means in this context
+   - Look for code snippets showing `Foo<T>` vs `Foo { field: HashMap<K,V> }`
+   - Don't assume - verify against the guide's own examples
+
+3. **Use Pass 1 patterns for your searches:**
    - DO NOT re-extract patterns from the guide
    - Use the EXACT patterns provided in the matched_patterns list above
-   - Search each pattern with context:
+   - Search each pattern with context using rg for code review:
    ```bash
    rg "pattern_from_pass1" --type rust -C 3 "${CODEBASE}"
    ```
+   - Count occurrences using <CountingProcedure/>:
+   ```bash
+   count=$(~/.claude/scripts/bevy_migration_count_pattern.sh "pattern_from_pass1" "${CODEBASE}" rust)
+   ```
 
-3. **Validate occurrence counts:**
+4. **Validate occurrence counts:**
    - Your total should be similar to Pass 1's ${PASS1_TOTAL_OCCURRENCES}
    - If significantly different (>20% variance), include a note explaining why
    - If you find 0 occurrences but Pass 1 found ${PASS1_TOTAL_OCCURRENCES}, STOP and report:
      "ERROR: Pass 1 found ${PASS1_TOTAL_OCCURRENCES} but Pass 2 found 0. Search commands used: [list them]"
 
-4. **Classify requirement level:**
+5. **Classify requirement level:**
    - REQUIRED: Breaking changes that will cause compilation failures
    - HIGH: Deprecated features that still compile but need migration
    - MEDIUM: Optional improvements or new features
    - LOW: Minor changes or optimizations
    - **If 0 occurrences found:** Classify as LOW (informational only)
 
-5. Generate output using <Pass2OutputTemplate/> format
+6. Generate output using <Pass2OutputTemplate/> format
    - In the output, include a link to the guide file: ${BEVY_REPO_DIR}/${GUIDE_FILE_PATH}
    - Use the guide filename (without .md extension) as the title if no title is in the guide
    - **CRITICAL**: Report occurrence counts:
