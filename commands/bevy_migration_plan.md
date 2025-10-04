@@ -15,6 +15,8 @@ Analyzes your codebase against official Bevy migration guides using a two-pass p
 - `{path}/.claude/bevy_migration/bevy-{version}-guides.md` (combined guides)
 - `{path}/.claude/bevy_migration/bevy-{version}-migration-plan.md` (migration plan)
 
+For this command, I should act like @commands/personas/principal_engineer.md
+
 ---
 
 <ExecutionSteps>
@@ -176,11 +178,19 @@ Multiple patterns with breakdown:
 ~/.claude/scripts/bevy_migration_count_pattern.sh --multiple "pattern1" "pattern2" "pattern3" -- "${CODEBASE}" rust
 ```
 
+Verify Pass 2 counts against Pass 1 total (for Pass 2 validation):
+```bash
+~/.claude/scripts/bevy_migration_count_pattern.sh --verify \
+  --pass1-total ${PASS1_TOTAL} \
+  --patterns "pattern1" "pattern2" "pattern3" -- "${CODEBASE}" rust
+```
+
 The script outputs:
 - Single mode: Just the number (e.g., `42`)
 - Multiple mode: JSON with pattern breakdown and `_total` field
+- Verify mode: JSON with `pass1_total`, `pass2_total`, `breakdown`, `variance_percent`, and `status` ("MATCH" or "ANOMALY")
 
-**Do NOT write custom Python scripts or manual counting logic - use this script.**
+**Do NOT write custom Python scripts, echo commands with nested substitutions, or manual counting logic - use this script.**
 
 </CountingProcedure>
 
@@ -447,10 +457,25 @@ Expected total occurrences from Pass 1: ${PASS1_TOTAL_OCCURRENCES}
    ```
 
 4. **Validate occurrence counts:**
-   - Your total should be similar to Pass 1's ${PASS1_TOTAL_OCCURRENCES}
-   - If significantly different (>20% variance), include a note explaining why
-   - If you find 0 occurrences but Pass 1 found ${PASS1_TOTAL_OCCURRENCES}, STOP and report:
-     "ERROR: Pass 1 found ${PASS1_TOTAL_OCCURRENCES} but Pass 2 found 0. Search commands used: [list them]"
+
+   Use the verify mode from <CountingProcedure/> to validate your counts against Pass 1:
+   ```bash
+   ~/.claude/scripts/bevy_migration_count_pattern.sh --verify \
+     --pass1-total ${PASS1_TOTAL_OCCURRENCES} \
+     --patterns "pattern1" "pattern2" "pattern3" -- "${CODEBASE}" rust
+   ```
+
+   This returns JSON with:
+   - `pass2_total`: Your actual count
+   - `variance_percent`: Percentage difference from Pass 1
+   - `status`: "MATCH" (≤20% variance) or "ANOMALY" (>20% variance)
+   - `breakdown`: Individual pattern counts
+
+   **IMPORTANT:**
+   - Use ALL patterns from Pass 1's matched_patterns list
+   - Do NOT create custom echo commands or nested command substitutions
+   - If status is "ANOMALY", include explanation in your output
+   - If pass2_total is 0 but Pass 1 found ${PASS1_TOTAL_OCCURRENCES}, STOP and report error
 
 5. **Classify requirement level:**
    - REQUIRED: Breaking changes that will cause compilation failures
