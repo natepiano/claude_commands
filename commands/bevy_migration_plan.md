@@ -498,7 +498,7 @@ For each section, verify it contains a parseable "**Requirement Level:**" field 
 2. **Read dependency compatibility output:**
 
    Use Read tool to read `/tmp/bevy_migration_deps_$(basename ${CODEBASE}).md`.
-   Store this content to insert after the Summary section.
+   Store this content as DEPENDENCY_OUTPUT to insert after the Summary section.
 
    **Important:** After reading, delete the temp file to prevent stale data in future runs:
    ```bash
@@ -595,7 +595,7 @@ During the two-pass analysis, [N] guide(s) showed significant variance (>20%) be
 
 ---
 
-[Read and insert dependency output from /tmp/bevy_migration_deps_$(basename ${CODEBASE}).md here]
+[Insert DEPENDENCY_OUTPUT content here]
 
 ---
 
@@ -627,7 +627,7 @@ During the two-pass analysis, [N] guide(s) showed significant variance (>20%) be
 
 The following [X] guides from Bevy ${VERSION} do not apply to this codebase.
 
-[List file paths from Pass 1 not_applicable_files arrays - no need to read the files, just list them]
+[List file paths from Pass 1 not_applicable_guides arrays - no need to read the files, just list them]
 
 ---
 
@@ -658,7 +658,7 @@ The following [X] guides from Bevy ${VERSION} do not apply to this codebase.
    - HIGH Priority Changes section (LITERAL COMPLETE Pass 2 markdown sections - ALL diffs, ALL changes)
    - MEDIUM Priority Changes section (LITERAL COMPLETE Pass 2 markdown sections - ALL diffs, ALL changes)
    - LOW Priority Changes section (LITERAL COMPLETE Pass 2 markdown sections - ALL diffs, ALL changes)
-   - Guides Not Applicable section (file paths from Pass 1 not_applicable_files - just list the paths)
+   - Guides Not Applicable section (file paths from Pass 1 not_applicable_guides - just list the paths)
    - Next Steps section
    - Reference section (link to ${GUIDES_DIR})
 
