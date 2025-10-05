@@ -1,20 +1,20 @@
 # Design Review
 
 **MANDATORY FIRST STEP**:
-1. Shared review commands: @shared/review_commands.md
+1. Shared review commands: @~/.claude/shared/review_commands.md
 2. Find and follow the <ExecutionSteps> section from that file
 3. When you see tags like <ExecutionSteps/> below, these refer to sections in review_commands.md
 
 <ReviewConfiguration>
 MAX_FOLLOWUP_REVIEWS = 6
-CONSTRAINTS_FILE = @shared/constraints/design_review_constraints.md
+CONSTRAINTS_FILE = @~/.claude/shared/constraints/design_review_constraints.md
 
 </ReviewConfiguration>
 
 <ExecutionSteps/>
 
 <ReviewPersona>
-@shared/personas/architect_persona.md
+@~/.claude/shared/personas/architect_persona.md
 </ReviewPersona>
 
 <InitialReviewOutput>

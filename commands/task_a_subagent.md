@@ -2,11 +2,20 @@
 
 **CRITICAL** This command orchestrates task execution through subagents with automatic continuation and post-implementation review.
 
+<Persona>
+@~/.claude/shared/personas/principal_engineer_persona.md
+
+The following constraints provide guidance on how I think and approach problems:
+
+@~/.claude/shared/constraints/code_review_constraints.md
+</Persona>
+
 ## MAIN WORKFLOW
 
 <ExecutionSteps>
     **EXECUTE THESE STEPS IN ORDER:**
 
+    **STEP 0:** Execute <Persona/> to adopt the Principal Engineer persona
     **PREREQUISITE:** Read <MainAgentResponsibilities/> to understand your role
     **STEP 1:** Execute <TaskSetup/>
     **STEP 2:** Execute <TaskCreation/> OR <TaskContinuation/>

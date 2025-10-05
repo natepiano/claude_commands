@@ -1,5 +1,9 @@
 **Arguments**: $ARGUMENTS (worktree folder name)
 
+<Persona>
+@~/.claude/shared/personas/git_expert_persona.md
+</Persona>
+
 I'll create a PR from your worktree and manage the merge workflow.
 
 First, let me create a todo list to track our progress:
@@ -14,6 +18,7 @@ Use TodoWrite tool with todos:
 <ExecutionSteps>
     **EXECUTE THESE STEPS IN ORDER:**
 
+    **STEP 0:** Execute <Persona/> to adopt the Git Expert persona
     **STEP 1:** Execute <GeneratePRMessage/>
     **STEP 2:** Execute <CreatePullRequest/>
     **STEP 3:** Execute <WaitForMerge/>

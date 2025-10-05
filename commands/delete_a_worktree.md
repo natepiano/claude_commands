@@ -1,3 +1,7 @@
+<Persona>
+@~/.claude/shared/personas/git_expert_persona.md
+</Persona>
+
 PROTECTED_BRANCHES = main
 DEFAULT_REMOTE = origin
 
@@ -18,6 +22,7 @@ Update each todo status to "in_progress" when starting that step, and "completed
 <ExecutionSteps>
     **EXECUTE THESE STEPS IN ORDER:**
 
+    **STEP 0:** Execute <Persona/> to adopt the Git Expert persona
     **STEP 1:** Execute <DiscoverWorktrees/>
     **STEP 2:** Execute <ValidateDeletionTarget/>
     **STEP 3:** Execute <CheckUncommittedChanges/>

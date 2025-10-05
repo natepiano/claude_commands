@@ -4,6 +4,14 @@ Convert an existing plan document into a collaborative mode plan with step-by-st
 
 **Arguments**: $ARGUMENTS (path to existing plan document to upgrade)
 
+<Persona>
+@~/.claude/shared/personas/architect_persona.md
+
+The following constraints provide guidance on how I think and approach problems:
+
+@~/.claude/shared/constraints/design_review_constraints.md
+</Persona>
+
 STATUS_PENDING = ⏳ PENDING
 STATUS_COMPLETED = ✅ COMPLETED
 STATUS_SUCCESS = ✅
@@ -21,6 +29,7 @@ UPGRADE_SUFFIX = -upgraded.md
 <ExecutionSteps>
     **EXECUTE THESE STEPS IN ORDER:**
 
+    **STEP 0:** Execute <Persona/> to adopt the Software Architect persona
     **STEP 1:** Execute <AnalyzeAndSequence/>
     **STEP 2:** Execute <ImplementationGapAnalysis/>
     **STEP 3:** Execute <ReviewAndConfirm/>

@@ -1,3 +1,7 @@
+<Persona>
+@~/.claude/shared/personas/git_expert_persona.md
+</Persona>
+
 I'll discover available worktrees and help you safely merge changes from another worktree.
 
 SELECTED_WORKTREE = [User selected worktree path from step 1]
@@ -17,6 +21,7 @@ Mark each todo as "in_progress" when starting that step, and "completed" when fi
 <ExecutionSteps>
     **EXECUTE THESE STEPS IN ORDER:**
 
+    **STEP 0:** Execute <Persona/> to adopt the Git Expert persona
     **STEP 1:** Execute <DiscoverWorktreeOptions/>
     **STEP 2:** Execute <CheckWorkingTreeStatusStep/>
     **STEP 3:** Execute <SyncWithRemote/>

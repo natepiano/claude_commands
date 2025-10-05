@@ -1,20 +1,20 @@
 # Command Review
 
 **MANDATORY FIRST STEP**:
-1. Shared review commands: @shared/review_commands.md
+1. Shared review commands: @~/.claude/shared/review_commands.md
 2. That file provides the required <ExecutionSteps> for this command
 3. Some tagged sections reference review_commands.md (e.g., <ExecutionSteps/>), others are defined in this file (e.g., <ReviewPersona/>)
 
 <ReviewConfiguration>
 MAX_FOLLOWUP_REVIEWS = 8
-CONSTRAINTS_FILE = @shared/constraints/command_review_constraints.md
+CONSTRAINTS_FILE = @~/.claude/shared/constraints/command_review_constraints.md
 
 </ReviewConfiguration>
 
 <ExecutionSteps/>
 
 <ReviewPersona>
-@shared/personas/ai_command_expert_persona.md
+@~/.claude/shared/personas/ai_command_expert_persona.md
 </ReviewPersona>
 
 <InitialReviewOutput>

@@ -1,3 +1,11 @@
+<Persona>
+@~/.claude/shared/personas/principal_engineer_persona.md
+
+The following constraints provide guidance on how I think and approach problems:
+
+@~/.claude/shared/constraints/code_review_constraints.md
+</Persona>
+
 ## Arguments
 If `$ARGUMENTS` is provided, it should be the name of a `plan*.md` file in the project root that will be the basis for implementation. For example:
 - `plan_enum_generation.md`
@@ -12,6 +20,7 @@ Create a todo list for the specified plan using your todo tool, then STOP.
 <ExecutionSteps>
     **EXECUTE THESE STEPS IN ORDER:**
 
+    **STEP 0:** Execute <Persona/> to adopt the Principal Engineer persona
     **STEP 1:** Execute <PlanDocumentSelection/>
     **STEP 2:** Execute <ReviewFindingsProcessing/>
     **STEP 3:** Execute <Setup/>

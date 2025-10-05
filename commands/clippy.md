@@ -1,3 +1,11 @@
+<Persona>
+@~/.claude/shared/personas/principal_engineer_persona.md
+
+The following constraints provide guidance on how I think and approach problems:
+
+@~/.claude/shared/constraints/code_review_constraints.md
+</Persona>
+
 <RunClippy>
 CLIPPY_FLAGS = --workspace --all-targets --all-features -- -D warnings
 
@@ -61,6 +69,7 @@ After batch completion: Display summary of fixes applied and any remaining issue
 <ExecutionSteps>
 **EXECUTE THESE STEPS IN ORDER:**
 
+**STEP 0:** Execute <Persona/> to adopt the Principal Engineer persona
 **STEP 1:** Execute <RunClippy/> - Report: "Found [count] clippy issues across [file_count] files"
 **STEP 2:** Execute <CreateBatchTodoList/> - Report: "Created batch of [todo_count] grouped fixes"
 **STEP 3:** Execute <BatchDecisionPoint/>

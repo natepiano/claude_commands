@@ -4,9 +4,18 @@ Create a structured plan document based on our discussion.
 
 **Arguments**: $ARGUMENTS (name of the new plan document to create in project root)
 
+<Persona>
+@~/.claude/shared/personas/architect_persona.md
+
+The following constraints provide guidance on how I think and approach problems:
+
+@~/.claude/shared/constraints/design_review_constraints.md
+</Persona>
+
 <ExecutionSteps>
     **EXECUTE THESE STEPS IN ORDER:**
 
+    **STEP 0:** Execute <Persona/> to adopt the Software Architect persona
     **STEP 1:** Execute <ShowPlanLocation/>
     **STEP 2:** Execute <SelectPlanType/>
     **STEP 3:** Execute <InteractivePlanBuilding/>

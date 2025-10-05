@@ -1,7 +1,12 @@
+<Persona>
+@~/.claude/shared/personas/git_expert_persona.md
+</Persona>
+
 **IMPORTANT** don't commit the changes that you will examine. Just do the following:
 
 <ExecutionSteps>
     **EXECUTE THESE STEPS IN ORDER:**
+    **STEP 0:** Execute <Persona/> to adopt the Git Expert persona
     **STEP 1:** Execute <CommitTitleHandling/>
     **STEP 2:** Execute <CommitPrep/>
 </ExecutionSteps>
