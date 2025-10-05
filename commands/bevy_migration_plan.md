@@ -15,7 +15,13 @@ Analyzes your codebase against official Bevy migration guides using a two-pass p
 - `{path}/.claude/bevy_migration/bevy-{version}-guides.md` (combined guides)
 - `{path}/.claude/bevy_migration/bevy-{version}-migration-plan.md` (migration plan)
 
-For this command, I should act like @commands/personas/principal_engineer.md
+<Persona>
+@~/.claude/shared/personas/principal_engineer_persona.md
+
+The following constraints provide guidance on how I think and approach problems:
+
+@~/.claude/shared/constraints/code_review_constraints.md
+</Persona>
 
 ---
 
@@ -23,6 +29,7 @@ For this command, I should act like @commands/personas/principal_engineer.md
 
 **EXECUTE THESE STEPS IN ORDER:**
 
+**STEP 0:** Execute <Persona/> to adopt the Principal Engineer persona
 **STEP 1:** Execute <ParseArguments/>
 **STEP 2:** Execute <CloneRepository/>
 **STEP 3:** Execute <DependencyCompatibilityCheck/>
