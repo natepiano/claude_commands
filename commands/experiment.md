@@ -26,14 +26,57 @@ The following constraints provide guidance on how I think and approach problems:
 <ExecutionSteps>
 **EXECUTE THESE STEPS IN ORDER:**
 
-**STEP 0:** Execute <Persona/> to adopt the Principal Engineer persona
-**STEP 1:** Execute <LoadPlanDocument/>
-**STEP 2:** Execute <DetectWorkflowState/>
-**STEP 3:** Based on detected state, execute appropriate workflow:
+**STEP 1:** Execute <Persona/> to adopt the Principal Engineer persona
+**STEP 2:** Execute <InitializeExperimentTodos/>
+**STEP 3:** Execute <LoadPlanDocument/>
+**STEP 4:** Execute <DetectWorkflowState/>
+**STEP 5:** Based on detected state, execute appropriate workflow:
   - If **new_experiment**: Execute <ProposeCodeWithContext/> → <UserApprovalProposal/> → <DocumentExperimentToPlan/> → <ImplementChange/> → <CompleteImplementationAndStop/>
   - If **awaiting_results**: Execute <TestAndDocumentResults/> → <UpdateExperimentEntry/>
   - If **ready_for_next**: Execute <ProposeCodeWithContext/> (start next experiment)
 </ExecutionSteps>
+
+---
+
+<InitializeExperimentTodos>
+**Goal:** Create todo tracking for experiment workflow visibility
+
+**Steps:**
+1. Determine which workflow path will be executed (from <DetectWorkflowState/>)
+2. Create TodoWrite with appropriate workflow todos:
+
+**For new_experiment workflow:**
+```
+TodoWrite with todos:
+- "Load plan document" (in_progress)
+- "Detect workflow state" (pending)
+- "Propose code changes" (pending)
+- "Get user approval" (pending)
+- "Document experiment to plan" (pending)
+- "Implement changes" (pending)
+- "Complete implementation" (pending)
+```
+
+**For awaiting_results workflow:**
+```
+TodoWrite with todos:
+- "Load plan document" (in_progress)
+- "Detect workflow state" (pending)
+- "Test and gather results" (pending)
+- "Update experiment entry" (pending)
+```
+
+**For ready_for_next workflow:**
+```
+TodoWrite with todos:
+- "Load plan document" (in_progress)
+- "Detect workflow state" (pending)
+- "Propose next experiment" (pending)
+```
+
+3. Update todos as in_progress when entering each step
+4. Mark completed when step finishes successfully
+</InitializeExperimentTodos>
 
 ---
 
@@ -178,7 +221,9 @@ Agent must provide:
 <UserApprovalProposal>
 **Goal:** Get user approval before proceeding
 
-Present to user:
+**Steps:**
+1. Mark "Get user approval" todo as in_progress
+2. Present to user:
 
 ## Experiment Proposal
 
@@ -189,11 +234,18 @@ Present to user:
 - **revise** - Modify the proposal
 - **cancel** - Abort this experiment
 
-Wait for user response.
+Please select one of the keywords above.
 
-**If approve**: Proceed to <DocumentExperimentToPlan/>
-**If revise**: Return to <ProposeCodeWithContext/> with user's feedback
-**If cancel**: Stop execution
+3. **STOP and wait for user response.** Do NOT proceed until user provides their decision.
+4. Update todos based on response:
+   - **If approve**: Mark "Get user approval" as completed, proceed to <DocumentExperimentToPlan/>
+   - **If revise**: Keep "Get user approval" in_progress, return to <ProposeCodeWithContext/> with user's feedback
+   - **If cancel**: Mark all remaining todos as cancelled, stop execution
+   - **If unrecognized input**: Display message:
+     ```
+     Unrecognized response '${USER_INPUT}'. Please select from: approve, revise, or cancel.
+     ```
+     Then re-present the Available Actions menu and wait for valid keyword. Loop until valid response received.
 </UserApprovalProposal>
 
 ---
@@ -248,7 +300,7 @@ When proposing and implementing fixes:
 - Document results (success/failure/partial) in the experiment entry
 - Analyze what worked and what didn't
 ```
-5. Generate experiment entry using <ExperimentTemplate/> with auto-incremented number
+5. Execute <ExperimentTemplate/> to generate experiment entry with auto-incremented number
 6. Insert entry at the END of the "Experiment History" section
 7. Use Edit tool to add the entry to the plan document
 8. Confirm to user: "Documented as Attempt N in [plan_path]"
@@ -363,17 +415,18 @@ Based on the documented test approach, determine what the agent can do:
 **DECISION:** Context determines whether agent runs tests or asks user for results
 
 **Steps:**
-1. **Read the experiment entry** to understand documented test approach
-2. **Determine testing capability:**
+1. Mark "Test and gather results" todo as in_progress
+2. **Read the experiment entry** to understand documented test approach
+3. **Determine testing capability:**
    - Parse test approach from experiment entry
    - Identify what agent can do vs what requires user
-3. **Execute agent-capable tests:**
+4. **Execute agent-capable tests:**
    - If test approach includes commands agent can run:
      - Execute those commands
      - Capture output
      - Present results to user
    - Examples: `cargo test`, `cargo build`, MCP tool calls (after reload)
-4. **Gather user test results:**
+5. **Gather user test results:**
    - If test approach requires user actions:
      - Ask user for test results:
 ```
@@ -390,14 +443,17 @@ After selecting status, please provide:
 - What you observed
 - Any relevant output, logs, or error messages
 - Comparison with expected outcome
+
+Please select one of the keywords above.
 ```
-   - Wait for user response
-5. **Analyze all results:**
+   - **STOP and wait for user response.** Do NOT proceed until user provides test results.
+6. **Analyze all results:**
    - Combine agent-executed results with user-provided results
    - Compare against expected outcome in experiment entry
    - Identify what worked and what didn't
    - If failed/partial: Identify root cause
-6. Proceed to <UpdateExperimentEntry/>
+7. Mark "Test and gather results" as completed
+8. Proceed to <UpdateExperimentEntry/>
 </TestAndDocumentResults>
 
 ---
@@ -504,34 +560,6 @@ After selecting status, please provide:
 - **Test approach:** Split into agent-executable commands vs user verification steps
 - **Result:** Start with awaiting status, update after testing
 </ExperimentTemplate>
-
----
-
-<ExperimentWorkflowReminder>
-**General Experiment Workflow:**
-
-The experiment command supports any type of experimental change with automatic state detection:
-
-1. **Implementation phase** (state: new_experiment or ready_for_next):
-   - Propose changes
-   - Document to plan
-   - Implement code
-   - Build/install as needed
-   - Stop at natural checkpoint (sets state to awaiting_results)
-
-2. **User tests/verifies** (manual step):
-   - For MCP changes: Reload server
-   - For code changes: Run tests
-   - For other experiments: Verify results
-
-3. **Results phase** (state: awaiting_results):
-   - Report test results (agent-gathered or user-provided)
-   - Document outcomes
-   - Analyze what worked/failed
-   - Updates state to ready_for_next
-
-This approach ensures each experiment is tested before proceeding to the next, maintaining experimental rigor.
-</ExperimentWorkflowReminder>
 
 ---
 
