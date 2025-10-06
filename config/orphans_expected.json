@@ -1,0 +1,7 @@
+{
+  "scripts": [
+    "scripts/blender_add_mcp.sh",
+    "scripts/blender_remove_mcp.sh"
+  ],
+  "config": []
+}

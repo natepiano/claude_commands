@@ -54,9 +54,8 @@ When launching Task tool with a prompt template (like <InitialReviewPrompt> or <
     - subagent_type: "general-purpose"
     - prompt: <InitialReviewPrompt> below, processed per <TaskLaunchInstructions>
 
-    **4. After subagent completes: IMMEDIATELY PROCEED TO STEP 2**
-    **DO NOT STOP HERE** - The review workflow requires all 5 steps to complete.
-    Parse the subagent's JSON response and continue to <InitialReviewSummary/>
+    **4. After subagent completes: Parse JSON and IMMEDIATELY execute Step 2**
+    **DO NOT STOP** - All 5 steps are mandatory. Execute <InitialReviewSummary/> next.
 </InitialReview>
 
 <InitialReviewPrompt>
@@ -216,7 +215,7 @@ GOOD Example - IMPLEMENTATION-GAP finding:
 
 <InitialReviewSummary>
 
-Provide a high-level summary of the subagent's findings:
+**1. Provide a high-level summary of the subagent's findings:**
 
 # Review Summary
 ## Total findings: ${number}
@@ -228,12 +227,13 @@ Provide a high-level summary of the subagent's findings:
 
 [If named findings exist: **Note**: ${count} named finding(s) will skip investigation as they are self-evident violations]
 
-**Next**: Proceeding to Step 3 (Finding Prioritization) and then Step 4 (Investigation)
+**2. IMMEDIATELY execute Step 3:**
+After presenting this summary, DO NOT WAIT for user input. Immediately execute <FindingPrioritization/> to continue the workflow.
 
 </InitialReviewSummary>
 
 <FindingPrioritization>
-**MANDATORY: Display this structured output to force correct calculation:**
+**1. Display this structured output to force correct calculation:**
 
 ```
 Step 3: Finding Prioritization
@@ -264,8 +264,9 @@ ${list_each_deferred_finding_id_and_title}
 
 No output needed - silently proceed to Step 4
 
-**Create FILTERED_FINDINGS list:**
-Extract exactly ${SELECTED_COUNT} findings and proceed immediately to <ReviewFollowup/>
+**2. Create FILTERED_FINDINGS list and IMMEDIATELY execute Step 4:**
+Extract exactly ${SELECTED_COUNT} findings. DO NOT WAIT for user input. Immediately execute <ReviewFollowup/> to continue the workflow.
+
 </FindingPrioritization>
 
 ## STEP 4: INVESTIGATION
@@ -313,8 +314,8 @@ Extract exactly ${SELECTED_COUNT} findings and proceed immediately to <ReviewFol
 
     **CRITICAL**: Investigations update verdicts only. DO NOT execute keyword actions or use Edit/Write tools. Present updated findings to user and wait for keyword selection.
 
-    **5. After ALL investigation subagents complete: IMMEDIATELY PROCEED TO STEP 5**
-    **DO NOT STOP HERE** - Parse all investigation JSON responses and continue to <UserReview/>
+    **5. After ALL investigation subagents complete: Parse all JSON and IMMEDIATELY execute Step 5**
+    **DO NOT STOP** - All 5 steps are mandatory. Execute <UserReview/> next to present findings to the user.
 </ReviewFollowup>
 
 <ReviewFollowupPrompt>

@@ -2,15 +2,16 @@
 
 **Purpose:** Guide structured experimentation for bug fixes and feature implementations with automatic documentation to plan files. Designed for MCP development workflows requiring server reloads.
 
-**Usage:** `/experiment [plan_path] [mode]`
+**Usage:** `/experiment [plan_path]`
 
 **Arguments:**
 - `plan_path` (optional): Path to plan document (defaults to `.claude/plans/` search)
-- `mode` (optional): `propose` | `document` (defaults to `propose`)
 
-**Modes:**
-- `propose`: Start new experiment (Steps 0-3: propose → document → implement → install)
-- `document`: Document results after testing (Step 4: test and update plan)
+**Workflow:**
+The command automatically detects what to do based on document state:
+- No file exists: Create new experiment document → run first experiment
+- File exists without Experiment History: Convert to experiment format → run first experiment
+- File exists with Experiment History: Detect state from latest entry → continue workflow
 
 <Persona>
 @~/.claude/shared/personas/principal_engineer_persona.md
@@ -26,19 +27,12 @@ The following constraints provide guidance on how I think and approach problems:
 **EXECUTE THESE STEPS IN ORDER:**
 
 **STEP 0:** Execute <Persona/> to adopt the Principal Engineer persona
-
-**If mode is `propose` (or default):**
-1. Execute <LoadPlanDocument/>
-2. Execute <ProposeCodeWithContext/>
-3. Execute <UserApprovalProposal/>
-4. If approved: Execute <DocumentExperimentToPlan/>
-5. Execute <ImplementChange/>
-6. Execute <CompleteImplementationAndStop/>
-
-**If mode is `document`:**
-1. Execute <LoadPlanDocument/>
-2. Execute <TestAndDocumentResults/>
-3. Execute <UpdateExperimentEntry/>
+**STEP 1:** Execute <LoadPlanDocument/>
+**STEP 2:** Execute <DetectWorkflowState/>
+**STEP 3:** Based on detected state, execute appropriate workflow:
+  - If **new_experiment**: Execute <ProposeCodeWithContext/> → <UserApprovalProposal/> → <DocumentExperimentToPlan/> → <ImplementChange/> → <CompleteImplementationAndStop/>
+  - If **awaiting_results**: Execute <TestAndDocumentResults/> → <UpdateExperimentEntry/>
+  - If **ready_for_next**: Execute <ProposeCodeWithContext/> (start next experiment)
 </ExecutionSteps>
 
 ---
@@ -70,6 +64,22 @@ The following constraints provide guidance on how I think and approach problems:
    - If no: Stop (cannot proceed without Experiment History)
 6. Store plan path for later updates
 </LoadPlanDocument>
+
+---
+
+<DetectWorkflowState>
+**Goal:** Determine next action based on document state
+
+**Steps:**
+1. Check if Experiment History section exists:
+   - If NO section found: Set state = **new_experiment**
+   - If YES: Proceed to step 2
+2. Scan Experiment History for latest experiment entry (highest attempt number):
+   - If no entries exist yet: Set state = **new_experiment**
+   - If latest entry contains "⏸️ Awaiting testing": Set state = **awaiting_results**
+   - If latest experiment is complete (✅/❌/⚠️): Set state = **ready_for_next**
+3. Store detected state for ExecutionSteps branching
+</DetectWorkflowState>
 
 ---
 
@@ -195,6 +205,8 @@ Wait for user response.
 
 **DECISION:** Ask user for test approach if not clear from context
 
+**DECISION:** Include execution step protocol at top of plan for context recovery
+
 **Steps:**
 1. Scan "Experiment History" section for all entries matching "### Attempt N:"
 2. Find highest N and use N+1 as the next attempt number
@@ -206,10 +218,40 @@ Wait for user response.
      - Ask user: "How will you test this change?"
      - Wait for user response
    - Document the test approach in experiment entry
-4. Generate experiment entry using <ExperimentTemplate/> with auto-incremented number
-5. Insert entry at the END of the "Experiment History" section
-6. Use Edit tool to add the entry to the plan document
-7. Confirm to user: "Documented as Attempt N in [plan_path]"
+4. **If this is the first experiment in the plan:**
+   - Add "## Experiment Protocol" section before "## Experiment History"
+   - Include the standard protocol so agents can understand the workflow:
+```markdown
+## Experiment Protocol
+
+When proposing and implementing fixes:
+
+**Step 0: Propose Code with Context**
+- Show the exact code change with file location and line numbers
+- Include enough surrounding context to understand what's being changed
+- Explain why the change should work
+
+**Step 1: Add Experiment to Plan**
+- Document the hypothesis, proposed fix, and expected outcome in the Experiment History section
+- Wait for user approval before proceeding
+
+**Step 2: Make the Change**
+- Implement the proposed code changes
+- Build and format the code
+
+**Step 3: Install and Stop**
+- Run `cargo install --path mcp`
+- Stop and wait for user to reconnect MCP server
+
+**Step 4: Test and Update Plan**
+- User reconnects and runs debug protocol
+- Document results (success/failure/partial) in the experiment entry
+- Analyze what worked and what didn't
+```
+5. Generate experiment entry using <ExperimentTemplate/> with auto-incremented number
+6. Insert entry at the END of the "Experiment History" section
+7. Use Edit tool to add the entry to the plan document
+8. Confirm to user: "Documented as Attempt N in [plan_path]"
 
 **DO NOT:**
 - Modify existing experiment entries
@@ -224,11 +266,10 @@ Wait for user response.
 
 **Steps:**
 1. Use Edit tool to implement the proposed changes
-2. Run `cargo build` to verify compilation
-3. Run `cargo +nightly fmt` to format code
-4. Show user compilation results
-5. If compilation fails: Ask user whether to fix or abort
-6. If compilation succeeds: Proceed to <InstallAndWaitForReload/>
+2. Run `cargo build && cargo +nightly fmt` to verify compilation and format code
+3. Show user compilation results
+4. If compilation fails: Ask user whether to fix or abort
+5. If compilation succeeds: Proceed to <CompleteImplementationAndStop/>
 
 **Important:**
 - Make ONLY the changes proposed in <ProposeCodeWithContext/>
@@ -257,7 +298,7 @@ The stopping point depends on what type of experiment was performed:
 **Next steps:**
 1. Exit this conversation
 2. Reload the MCP server (your editor will automatically restart the subprocess)
-3. Return and run: `/experiment [plan_path] document`
+3. Return and run: `/experiment [plan_path]`
 
 **What to test:** [Brief description]
 **Test command:** [Exact command if applicable]
@@ -274,7 +315,7 @@ The stopping point depends on what type of experiment was performed:
 
 **Next steps:**
 1. Test the changes: [specific test instructions]
-2. When ready to document results, run: `/experiment [plan_path] document`
+2. When ready to document results, run: `/experiment [plan_path]`
 
 **What to test:** [Brief description]
 **Test command:** [Exact command if applicable]
@@ -291,7 +332,7 @@ The stopping point depends on what type of experiment was performed:
 
 **Next steps:**
 1. Verify the results: [specific verification steps]
-2. When ready to document results, run: `/experiment [plan_path] document`
+2. When ready to document results, run: `/experiment [plan_path]`
 
 **What to verify:** [Brief description]
 ```
@@ -306,10 +347,10 @@ The stopping point depends on what type of experiment was performed:
 Based on the documented test approach, determine what the agent can do:
 - **Agent can test:** Running commands, checking output, comparing results
   - Example: `mcp__brp__brp_type_guide`, `cargo test`, `cargo build`
-  - Agent runs these automatically in "document" mode
+  - Agent runs these automatically when state is **awaiting_results**
 - **User must test:** Manual verification, visual inspection, MCP reload required
   - Example: "Verify in editor", "Check that root_example appears", "Reload MCP and test"
-  - Agent asks user for results in "document" mode
+  - Agent asks user for results when state is **awaiting_results**
 - **Combination:** Agent runs commands, user verifies output
   - Agent runs what it can, then asks user to verify results
 </CompleteImplementationAndStop>
@@ -469,46 +510,50 @@ After selecting status, please provide:
 <ExperimentWorkflowReminder>
 **General Experiment Workflow:**
 
-The experiment command supports any type of experimental change with a two-phase workflow:
+The experiment command supports any type of experimental change with automatic state detection:
 
-1. **Propose** mode (implementation phase):
+1. **Implementation phase** (state: new_experiment or ready_for_next):
    - Propose changes
    - Document to plan
    - Implement code
    - Build/install as needed
-   - Stop at natural checkpoint
+   - Stop at natural checkpoint (sets state to awaiting_results)
 
-2. **User tests/verifies** (manual step)
+2. **User tests/verifies** (manual step):
    - For MCP changes: Reload server
    - For code changes: Run tests
    - For other experiments: Verify results
 
-3. **Document** mode (after verification):
-   - Report test results
+3. **Results phase** (state: awaiting_results):
+   - Report test results (agent-gathered or user-provided)
    - Document outcomes
    - Analyze what worked/failed
+   - Updates state to ready_for_next
 
-This two-phase approach ensures each experiment is tested before proceeding to the next, maintaining experimental rigor.
+This approach ensures each experiment is tested before proceeding to the next, maintaining experimental rigor.
 </ExperimentWorkflowReminder>
 
 ---
 
 ## Examples
 
-**Start new experiment:**
-```
-/experiment .claude/plans/root-example-assembly-approach.md
-```
-Agent proposes code, documents to plan, implements, installs, and waits for reload.
-
-**Document results after testing:**
-```
-/experiment .claude/plans/root-example-assembly-approach.md document
-```
-Agent asks for test results, analyzes, and updates the plan.
-
-**Auto-detect plan:**
+**Start new experiment (creates plan and runs first experiment):**
 ```
 /experiment
 ```
-Finds most recent plan in `.claude/plans/` and starts proposal mode.
+Agent detects no plan exists, creates experiment document, proposes code, implements, and waits for testing.
+
+**Continue experiment (auto-detects state):**
+```
+/experiment .claude/plans/root-example-assembly-approach.md
+```
+Agent reads plan, detects state from Experiment History:
+- If awaiting_results: Asks for test results and updates plan
+- If ready_for_next: Proposes next experiment
+- If new (no entries): Proposes first experiment
+
+**Convert existing document to experiment format:**
+```
+/experiment .claude/plans/my-design.md
+```
+Agent detects document has no Experiment History, adds it, then runs first experiment.

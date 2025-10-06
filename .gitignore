@@ -6,6 +6,8 @@
 !bevy_migration/**
 !commands/
 !commands/**
+!config/
+!config/**
 !scripts/
 !scripts/**
 scripts/__pycache__/
