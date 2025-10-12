@@ -13,7 +13,7 @@ SEARCH_DIR=$(dirname "$FILE_PATH")
 while [[ "$SEARCH_DIR" != "/" ]]; do
     if [[ -f "$SEARCH_DIR/Cargo.toml" ]]; then
         # Check if this Cargo.toml has the bevy_brp workspace members (must be actual TOML, not logs)
-        if grep -q '^\s*members\s*=\s*\["extras",\s*"mcp",\s*"mcp_macros",\s*"test-app"\]' "$SEARCH_DIR/Cargo.toml" 2>/dev/null; then
+        if grep -q '^\s*members\s*=\s*\[.*"extras".*"mcp".*"mcp_macros"' "$SEARCH_DIR/Cargo.toml" 2>/dev/null; then
             SHOW_ADDITIONAL_CONTEXT=true
             break
         fi
@@ -82,7 +82,7 @@ AGENT_MESSAGE=""
 if [ $CHECK_RESULT -eq 0 ]; then
     # Check passed - might have warnings
     if [ -n "$WARNING_LOCATIONS" ]; then
-        # Combine warnings with their locations
+        # Combine warnings with their locations for agent only
         WARNING_LIST=""
         IFS=$'\n'
         WARNING_ARRAY=($WARNINGS)
@@ -92,7 +92,10 @@ if [ $CHECK_RESULT -eq 0 ]; then
                 WARNING_LIST="${WARNING_LIST}  ⚠️ ${LOCATION_ARRAY[$i]}: ${WARNING_ARRAY[$i]}\n"
             fi
         done
-        USER_MESSAGE="✅ cargo check passed with $WARNING_COUNT warning(s):\n${WARNING_LIST%\\n}"
+        # User message just shows simple status
+        USER_MESSAGE="✅ cargo check passed with $WARNING_COUNT warning(s)"
+        # Agent gets the detailed warnings
+        AGENT_MESSAGE="\\nCARGO CHECK WARNINGS:\\n✅ cargo check passed with $WARNING_COUNT warning(s):\\n${WARNING_LIST%\\n}\\n"
     else
         USER_MESSAGE="🚀 cargo check passed"
     fi
@@ -106,10 +109,10 @@ if [ $CHECK_RESULT -eq 0 ]; then
 
     # Add agent context for bevy_brp project
     if [ "$SHOW_ADDITIONAL_CONTEXT" = true ]; then
-        AGENT_MESSAGE="\\nChanges will not be testable until the agent runs \`cargo install --path mcp\`\\nand asks the user to do \`/mcp reconnect brp\`\\n"
+        AGENT_MESSAGE="${AGENT_MESSAGE}\\nChanges will not be testable until the agent runs \`cargo install --path mcp\`\\nand asks the user to do \`/mcp reconnect brp\`\\n"
     fi
 else
-    # Check failed - build detailed error message
+    # Check failed - build detailed error message for agent only
     if [ -n "$ERROR_LOCATIONS" ]; then
         # Combine errors with their locations
         ERROR_LIST=""
@@ -138,8 +141,8 @@ else
         FULL_ERROR_MESSAGE="💥 cargo check failed"
     fi
 
-    # For failures: show brief message to user, detailed message to agent
-    USER_MESSAGE="💥 cargo check failed"
+    # For failures: show brief message to user, detailed errors/warnings to agent
+    USER_MESSAGE="💥 cargo check failed with $ERROR_COUNT error(s)"
     AGENT_MESSAGE="\\nCARGO CHECK FAILED:\\n$FULL_ERROR_MESSAGE\\n"
 fi
 
