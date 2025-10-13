@@ -194,20 +194,74 @@ Return JSON:
 - **stop** - Cancel the upgrade process
 
     5. STOP and wait for user's keyword response
-    6. Handle keyword:
-       - **fix**: Display the gap details for reference, exit upgrade process for manual fixes
-       - **skip**: Mark gap as skipped, continue to next gap
-       - **investigate**: Launch Task tool to verify gap and suggest solutions, then re-present keywords
-       - **stop**: Exit upgrade process
-    7. Mark current gap todo as "completed"
-    8. Continue to next gap
+    6. Handle keyword response:
+
+       **If user says "fix":**
+       a. Display: "Fixing gap in the plan..."
+       b. Use Read tool to read the plan document from $ARGUMENTS
+       c. Analyze the gap and determine what needs to be added/clarified in the plan
+       d. Use Edit tool to update the plan document with the missing details:
+          - Add missing function signatures with complete before/after examples
+          - Clarify vague instructions with concrete implementation steps
+          - Add missing edge case handling or error handling details
+          - Include line-specific references or code snippets
+          - Ensure the fix addresses the "what's_missing" from the gap
+       e. Display: "✅ Gap fixed in ${$ARGUMENTS}"
+       f. Ask: "Ready to continue to the next gap?"
+       g. Display keywords:
+          - **continue** - Move to next gap
+          - **stop** - Cancel the upgrade process
+       h. STOP and wait for user response
+       i. If user says "continue", mark gap as completed and continue to next gap
+       j. If user says "stop", exit upgrade process
+       k. Execute <ValidateUserResponse/> with expected_keywords: [continue, stop]
+
+       **If user says "skip":**
+       a. Display: "Skipping this gap - accepting it as-is"
+       b. Mark gap as skipped
+       c. Mark gap todo as completed
+       d. Continue to next gap
+
+       **If user says "investigate":**
+       a. Display: "🔍 Launching deeper investigation..."
+       b. Use Task tool with general-purpose subagent:
+          - description: "Investigate gap: ${gap_type}"
+          - prompt: "Analyze this implementation gap in detail:
+                     File: ${file}
+                     Gap type: ${gap_type}
+                     What plan says: ${plan_proposal}
+                     What's missing: ${what's_missing}
+                     Current code: ${current_code}
+
+                     Provide:
+                     1. Root cause analysis of why this gap exists
+                     2. Specific code snippets needed to fill the gap
+                     3. Recommended fix with exact text to add to plan
+                     4. Verification steps to confirm fix is complete"
+       c. Display the investigation results
+       d. Re-present the same gap with keywords (user can now choose fix, skip, investigate again, or stop)
+       e. STOP and wait for user response
+       f. Return to step 6 to handle the new keyword
+
+       **If user says "stop":**
+       a. Display: "Gap review cancelled by user"
+       b. Exit upgrade process
+
+    7. Execute <ValidateUserResponse/> for initial response with:
+       expected_keywords: [fix, skip, investigate, stop]
+       option_descriptions: [
+           "- **fix** - Address this gap in the plan before continuing",
+           "- **skip** - Accept this gap and continue anyway",
+           "- **investigate** - Launch deeper investigation of the gap",
+           "- **stop** - Cancel the upgrade process"
+       ]
 
     After all gaps reviewed, display summary:
     ```
     Gap Review Complete
     -------------------
     Total gaps: ${total_count}
-    Fixed/Will fix: ${fix_count}
+    Fixed: ${fix_count}
     Skipped: ${skip_count}
 
     Proceeding to execution sequence proposal...

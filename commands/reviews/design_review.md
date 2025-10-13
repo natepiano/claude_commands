@@ -7,15 +7,10 @@
 
 <ReviewConfiguration>
 MAX_FOLLOWUP_REVIEWS = 6
-CONSTRAINTS_FILE = @~/.claude/shared/constraints/design_review_constraints.md
-
+PERSONA_FILE = ~/.claude/shared/personas/architect_persona.md
 </ReviewConfiguration>
 
 <ExecutionSteps/>
-
-<ReviewPersona>
-@~/.claude/shared/personas/architect_persona.md
-</ReviewPersona>
 
 <InitialReviewOutput>
 Step 1: **Initial Design Review**
@@ -74,9 +69,9 @@ Registry of named findings that bypass investigation due to self-evident violati
 
 ## REVIEW CONSTRAINTS
 
-Review constraints are defined in: ${CONSTRAINTS_FILE}
+Review constraints are defined in: ~/.claude/shared/subagent_instructions/design_review_instructions.md
 
-The constraints file is used by both initial review and investigation phases.
+The instructions file is used by both initial review and investigation phases.
 The main difference is how each phase handles validation failures:
 - **Initial Review**: Discard findings that fail validation
 - **Investigation**: Use REJECTED verdict for findings that fail validation

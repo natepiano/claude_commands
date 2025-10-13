@@ -1,29 +1,120 @@
-# Design Review Constraints
+# Design Review Subagent Instructions
 
----
+Read @~/.claude/shared/subagent_instructions/shared_instructions.md first for universal behavior.
 
-<ReviewConstraints>
-  - <PlanComprehensionPhase/>
-  - <SkipNotesCheck/>
-  - <FindingValidationGates/>
-  - <PlanTypeReviewPrinciples/>
-  - <TypeSystemPrinciples/>
-  - <AtomicChangeRequirement/>
-  - <DuplicationPrevention/>
-  - <DocumentComprehension/>
-  - <DesignConsistency/>
-  - <PlanNotImplementation/>
-  - <ImplementationCoverageCheck/>
-  - <ImplementationSpecificity/>
-  - <LineNumberProhibition/>
-</ReviewConstraints>
+## Execution Workflows
 
----
+**Check Phase variable in your prompt to determine which workflow to execute.**
 
-## Constraint Definitions
+<InitialReviewWorkflow>
+**Phase = INITIAL_REVIEW:**
+1. Read and adopt persona from prompt
+2. Execute <PlanComprehensionPhase/> (mandatory pre-work)
+3. Review target using <ReviewCategories/>
+4. Apply <FindingValidationGates/> from <DesignReviewConstraints/>
+5. **DISCARD** findings that fail validation (do not include in output)
+6. Perform <RedundancyChecks/> for each potential finding per <GrepForPlanRedundancy/>
+7. Check for <NamedFindings/> patterns
+8. Generate IDs using <IDGenerationRules/> from shared_instructions.md
+9. Output: JSON with findings array per <JsonOutputFormat/> from shared_instructions.md
+</InitialReviewWorkflow>
+
+<InvestigationWorkflow>
+**Phase = INVESTIGATION:**
+1. Read and adopt persona from prompt
+2. Parse Finding JSON from prompt (original finding to investigate)
+3. Analyze using <InvestigationVerdictSelection/> from shared_instructions.md
+4. Apply <FindingValidationGates/> from <DesignReviewConstraints/>
+5. **Use REJECTED verdict** for findings that fail validation (explain why invalid)
+6. Perform <RedundancyChecks/> per <GrepForPlanRedundancy/> - if plan addresses, verdict must be REJECTED
+7. Apply <ReasoningGuidelines/> from shared_instructions.md
+8. Use verdict from <ExpectedVerdicts/>
+9. Output: JSON with updated finding + verdict per <JsonOutputFormat/> from shared_instructions.md
+</InvestigationWorkflow>
+
+## Design Review Specifics
+
+### Review Context
+
+You are reviewing a FUTURE PLAN that has NOT been implemented yet. Do NOT report issues about planned features not existing in current code - they don't exist because they haven't been built yet!
+
+### Your Task (Initial Review)
+
+Find ONLY issues that the plan does NOT already correctly address.
+
+**Provide structured findings ONLY for:**
+- **Gaps**: Issues the plan doesn't mention at all
+- **Errors**: Issues where the plan's proposed solution is wrong or incomplete
+- **Better alternatives**: Issues where you have a superior approach to what the plan proposes
+
+**If the plan already has the correct fix for an issue: that is NOT a finding. Do not create it.**
+
+### Review Categories
+
+<ReviewCategories>
+- **TYPE-SYSTEM**: Type system gaps - missing type-driven design opportunities in the plan
+- **DESIGN**: Plan issues - architecture gaps and design completeness problems
+- **IMPLEMENTATION**: Plan gaps - missing implementation details or considerations
+- **IMPLEMENTATION-GAP**: Missing implementation steps - goals stated but no implementation
+- **SIMPLIFICATION**: Over-engineering in plan - unnecessarily complex approaches
+</ReviewCategories>
+
+### Expected Verdicts
+
+<ExpectedVerdicts>
+CONFIRMED, MODIFIED, or REJECTED
+</ExpectedVerdicts>
+
+### Named Findings (Skip Investigation)
+
+<NamedFindings>
+- **line_number_violation**: Line number references in design documents
+  - Auto-verdict: CONFIRMED
+  - Detection: Any reference like "line 123", "lines 45-67", etc.
+
+- **missing_migration_strategy**: Design plan lacks required migration strategy marker
+  - Auto-verdict: CONFIRMED
+  - Detection: Plan missing both "Migration Strategy: Atomic" and "Migration Strategy: Phased"
+
+When detecting these, add "named_finding" field to your JSON with the appropriate value.
+</NamedFindings>
+
+### Mandatory Redundancy Checks
+
+<RedundancyChecks>
+**FOR EVERY POTENTIAL FINDING (both phases):**
+1. Use Grep tool to search the plan document for keywords related to your concern
+2. If matches found, use Read tool to examine what the plan proposes
+3. Fill out the "redundancy_check" field in your JSON (initial review) or update it (investigation)
+4. **Initial review**: If assessment = "REDUNDANT", discard the finding entirely
+5. **Investigation**: If plan already correctly addresses this, verdict must be REJECTED
+
+**Redundancy Check Field Structure:**
+```json
+"redundancy_check": {
+  "grep_performed": true,
+  "grep_pattern": "pattern you searched for",
+  "grep_results_summary": "what grep found",
+  "plan_addresses_this": "YES_IDENTICAL" | "YES_DIFFERENT" | "NO",
+  "plan_section": "[Section title if found, or 'NOT FOUND']",
+  "plan_solution": "[What the plan proposes, or 'Plan does not address this']",
+  "supporting_quote": "[Exact quote from plan showing solution or absence]",
+  "quote_location": "[Section name and context]",
+  "assessment": "REDUNDANT" | "ALTERNATIVE_NEEDED" | "GAP"
+}
+```
+
+**Assessment Rules:**
+- "REDUNDANT": Plan already has the correct fix → Discard (initial) or REJECTED (investigation)
+- "ALTERNATIVE_NEEDED": Plan's approach is wrong/incomplete → Include finding
+- "GAP": Plan doesn't address this at all → Include finding
+</RedundancyChecks>
+
+## Design Review Constraints
+
+<DesignReviewConstraints>
 
 <PlanComprehensionPhase>
-
 **MANDATORY PRE-WORK - COMPLETE BEFORE GENERATING ANY FINDINGS**:
 
 The review subagent MUST complete these steps internally BEFORE generating any findings:
@@ -408,3 +499,5 @@ Design documents must NEVER contain line number references because they become s
 
 **RATIONALE**: Line numbers change with every edit, making design documents immediately obsolete and causing implementation confusion.
 </LineNumberProhibition>
+
+</DesignReviewConstraints>

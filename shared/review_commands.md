@@ -3,8 +3,6 @@
 <ExecutionSteps>
     **CRITICAL: You MUST use the Task tool for reviews. Do NOT review code directly.**
 
-    **ADOPT YOUR PERSONA:** Execute <ReviewPersona/> to establish your review expertise and mindset
-
     **EXECUTE THESE STEPS IN ORDER - ALL 5 STEPS ARE MANDATORY:**
 
     **STEP 1:** Execute the <InitialReview/> - MUST use Task tool
@@ -24,21 +22,42 @@
 <TaskLaunchInstructions>
 **How to construct prompts for Task tool subagents:**
 
-When launching Task tool with a prompt template (like <InitialReviewPrompt> or <ReviewFollowupPrompt>):
-1. **Replace all ${PLACEHOLDERS}** with actual values from context
-   - Example: ${REVIEW_TARGET} → "plan-document.md"
-   - Example: ${CATEGORY-ID} → "TYPE-SYSTEM-1"
-2. **Recursively expand all <TaggedSections/>** to their full content
-   - Find the tagged section definition in the command file
-   - Replace the reference with the complete section content
-   - If that section contains other tagged references, expand those too
-   - Continue until no tagged references remain
-3. **Include the fully expanded prompt** as the Task tool's prompt parameter
+Build minimal prompt with @file references and let subagent read files:
 
-**Why expansion is critical:**
-- Subagents cannot access tagged section definitions from other files
-- Sending unexpanded tags like `<InitialReviewConstraints/>` will fail
-- Subagent must receive complete, self-contained instructions
+**For Initial Review:**
+```
+Read and follow @~/.claude/shared/subagent_instructions/shared_instructions.md
+Read and follow @~/.claude/shared/subagent_instructions/${REVIEW_TYPE}_review_instructions.md
+Persona: Read and adopt @${PERSONA_FILE}
+
+Phase: INITIAL_REVIEW
+Target: ${REVIEW_TARGET}
+Context: ${REVIEW_CONTEXT}
+
+Your task: Perform initial review per the instructions. Output JSON only.
+```
+
+**For Investigation:**
+```
+Read and follow @~/.claude/shared/subagent_instructions/shared_instructions.md
+Read and follow @~/.claude/shared/subagent_instructions/${REVIEW_TYPE}_review_instructions.md
+Persona: Read and adopt @${PERSONA_FILE}
+
+Phase: INVESTIGATION
+Original Finding:
+```json
+${FINDING_JSON}
+```
+
+Your task: Investigate this finding per the instructions. Output JSON only.
+```
+
+**Variable Substitution:**
+- ${REVIEW_TYPE} = "design", "code", or "command"
+- ${PERSONA_FILE} = From calling command's <ReviewPersona/>
+- ${REVIEW_TARGET} = From <DetermineReviewTarget/> in calling command
+- ${REVIEW_CONTEXT} = From <DetermineReviewTarget/> in calling command
+- ${FINDING_JSON} = Complete finding object from initial review
 </TaskLaunchInstructions>
 
 ## STEP 1: INITIAL REVIEW
@@ -52,60 +71,15 @@ When launching Task tool with a prompt template (like <InitialReviewPrompt> or <
     **3. MANDATORY: Launch Task tool (DO NOT skip this):**
     - description: "review ${PLAN_DOCUMENT}" OR "review ${REVIEW_TARGET}"
     - subagent_type: "general-purpose"
-    - prompt: <InitialReviewPrompt> below, processed per <TaskLaunchInstructions>
+    - prompt: Construct per <TaskLaunchInstructions> using:
+      * shared_instructions.md
+      * {type}_review_instructions.md (design/code/command)
+      * persona file from ${PERSONA_FILE}
+      * Variables: REVIEW_TARGET, REVIEW_CONTEXT
 
     **4. After subagent completes: Parse JSON and IMMEDIATELY execute Step 2**
     **DO NOT STOP** - All 5 steps are mandatory. Execute <InitialReviewSummary/> next.
 </InitialReview>
-
-<InitialReviewPrompt>
-    **ADOPT YOUR REVIEW PERSONA**: <ReviewPersona/>
-
-    **Target:** ${REVIEW_TARGET}
-    **CRITICAL CONTEXT**: ${REVIEW_CONTEXT}
-    **WARNING**: This is a plan for FUTURE changes. Do NOT report issues about planned features not existing in current code - they don't exist because they haven't been built yet!
-
-    **Review Constraints**: Follow these analysis principles from ${CONSTRAINTS_FILE}:
-    <ReviewConstraints/>
-
-    **CRITICAL - Initial Review Phase Behavior**:
-    When a finding fails validation gates: DISCARD it completely. Do NOT include it in your findings array.
-    Only include findings that pass ALL validation gates.
-
-    **NAMED FINDING DETECTION** (if applicable): <NamedFindingDetection/>
-
-    **YOUR TASK**: Find ONLY issues that the plan does NOT already correctly address.
-
-    **DO NOT create findings for issues the plan already proposes correct solutions for.**
-
-    **Provide structured findings ONLY for:**
-    - **Gaps**: Issues the plan doesn't mention at all
-    - **Errors**: Issues where the plan's proposed solution is wrong or incomplete
-    - **Better alternatives**: Issues where you have a superior approach to what the plan proposes
-
-    **If the plan already has the correct fix for an issue: that is NOT a finding. Do not create it.**
-
-    It is important that you think very hard about this review task and carefully verify that each finding represents something the plan needs to improve, not something it already handles correctly.
-
-    **MANDATORY REDUNDANCY CHECK FOR EVERY FINDING:**
-    Before including any finding in your results:
-    1. Use Grep tool to search the plan document for keywords related to your concern
-    2. If matches found, use Read tool to examine what the plan proposes
-    3. Fill out the "redundancy_check" field in your JSON (see <BaseReviewJson/>)
-    4. If assessment = "REDUNDANT", discard the finding entirely
-
-    **CRITICAL ID GENERATION REQUIREMENT**: <IDGenerationRules/>
-
-    **CRITICAL CODE IDENTIFICATION REQUIREMENT**:
-    **For DESIGN/PLAN REVIEWS**: <PlanCodeIdentification/>
-
-    **For CODE REVIEWS**:
-    1. Focus on implementation quality, safety, and design issues in the code
-
-    **CODE CONTEXT REQUIREMENT**: <CodeExtractionRequirements/>
-
-    **CRITICAL**: Format your response message using the exact JSON structure specified in <InitialReviewJson/>. Include the JSON directly in your message response text - do not create any files.
-</InitialReviewPrompt>
 
 <InitialReviewJson>
     <JsonFormatInstructions/>
@@ -308,7 +282,11 @@ Extract exactly ${SELECTED_COUNT} findings. DO NOT WAIT for user input. Immediat
     - Each Task call must specify:
       * description: "Investigate FINDING-X: Title (X of INVESTIGATION_COUNT)"
       * subagent_type: "general-purpose"
-      * prompt: <ReviewFollowupPrompt> below, processed per <TaskLaunchInstructions>
+      * prompt: Construct per <TaskLaunchInstructions> using:
+        - shared_instructions.md
+        - {type}_review_instructions.md (design/code/command)
+        - persona file from ${PERSONA_FILE}
+        - Variable: FINDING_JSON (complete finding object)
 
     **ENFORCEMENT**: All ${INVESTIGATION_COUNT} Tasks MUST launch together in one message.
 
@@ -317,81 +295,6 @@ Extract exactly ${SELECTED_COUNT} findings. DO NOT WAIT for user input. Immediat
     **5. After ALL investigation subagents complete: Parse all JSON and IMMEDIATELY execute Step 5**
     **DO NOT STOP** - All 5 steps are mandatory. Execute <UserReview/> next to present findings to the user.
 </ReviewFollowup>
-
-<ReviewFollowupPrompt>
-    **Investigation Task for Finding [CATEGORY-ID]**
-
-    **ADOPT YOUR REVIEW PERSONA**: <ReviewPersona/>
-
-    Review the following finding from the initial review:
-
-    **Original Finding (JSON):**
-    ```json
-    [Insert the complete finding object from the InitialReviewJson findings array]
-    ```
-
-    Analyze this finding and provide an investigation verdict. It is important that you think very hard about this review task.
-
-    **Review Constraints**: Follow these analysis principles from ${CONSTRAINTS_FILE}:
-    <ReviewConstraints/>
-
-    **CRITICAL - Investigation Phase Behavior**:
-    When a finding fails validation gates: Use REJECTED verdict (explain why the finding is invalid).
-    Findings that pass validation get CONFIRMED or MODIFIED verdicts as appropriate.
-
-    **Your Investigation Tasks:**
-    1. Verify if this is a real issue or false positive
-    2. **MANDATORY REDUNDANCY CHECK**: Check if the plan already correctly addresses this issue
-       - Use Grep to search for keywords from the finding in the plan document
-       - If the plan already proposes the correct solution: This is NOT a valid finding → verdict must be REJECTED
-    3. Consider maintenance and long-term implications
-    4. Provide a verdict: ${EXPECTED_VERDICTS}
-    5. **CRITICAL FOR VERDICT SELECTION**:
-       - Use REJECTED/FIX NOT RECOMMENDED/SOLID when:
-         * Original finding is wrong AND no changes are needed, OR
-         * **Plan already correctly addresses this issue (redundant finding)**
-       - Use MODIFIED/FIX MODIFIED/REVISE when: Original finding is wrong OR incomplete BUT investigation reveals different issues that DO need fixing
-       - Use CONFIRMED/FIX RECOMMENDED/ENHANCE when: Original finding is correct AND plan does not already address it
-       - **If you discover any issues during investigation (even if the original finding misdiagnosed them), you MUST use a verdict that recommends action (CONFIRMED/MODIFIED/etc.), NOT a rejection verdict**
-       - For MODIFIED verdicts: Rewrite the issue description and suggested_code to address the newly discovered problems, not the original finding's incorrect diagnosis
-    6. Include detailed reasoning for your verdict in simple, easy-to-understand terms
-       - Avoid technical jargon where possible
-       - Explain the "why" in plain language
-       - Focus on practical impact rather than theoretical concepts
-    7. **CRITICAL**: For any verdict that recommends action (CONFIRMED, FIX RECOMMENDED, MODIFIED, etc.),
-       you MUST include concrete suggested_code showing the improved implementation
-       - For MODIFIED verdicts: Show your alternative approach as actual code, not just a description
-    8. **CRITICAL**: If the original finding has insufficient code context,
-       you MUST read the file and provide the full context following <CodeExtractionRequirements/>
-    9. **CRITICAL FOR PLAN REVIEWS**: If the original finding references a plan document,
-       follow <PlanCodeIdentification/> requirements
-    10. **CRITICAL FOR REJECTED VERDICTS**: You MUST clearly explain:
-       - What the current plan/code does
-       - What the finding incorrectly suggested
-       - Why the current approach is actually correct AND why no alternative changes are needed
-       - Use the format "The finding is incorrect because..." to be explicit
-       - Remember: REJECTED means NO changes needed at all - if ANY issue exists, use MODIFIED instead
-    11. **CRITICAL FOR ALL VERDICTS**: Structure your reasoning to clearly separate:
-        - What problem the finding identified
-        - What the current code/plan actually does
-        - What change is being proposed
-        - Why you agree/disagree/modify the proposal
-        - Use plain language that a developer can quickly understand
-
-    **CRITICAL RESTRICTIONS - You may ONLY:**
-    - Read files to understand context
-    - Analyze code structure and patterns
-    - Evaluate the proposed change
-
-    **You may NOT:**
-    - Run any applications or servers (cargo run, npm start, etc.)
-    - Execute blocking or interactive commands
-    - Create or modify any files
-    - Run tests or build commands
-    - Make any changes to the codebase
-
-    **CRITICAL**: Format your response message using the EXACT JSON structure specified in <ReviewFollowupJson/>. Include the JSON directly in your message response text - do not create any files.
-</ReviewFollowupPrompt>
 
 <ReviewFollowupJson>
 <JsonFormatInstructions/>

@@ -123,3 +123,4 @@ rustc /tmp/test.rs -o /tmp/test && /tmp/test
 # Or better: avoid creating test files altogether during reviews - just analyze the code logic
 ```
 </correct>
+- when we use types i never want to see inline module paths, use them at the top of the file and not inline in the code

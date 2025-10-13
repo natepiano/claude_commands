@@ -4,8 +4,61 @@
 INPUT=$(cat)
 
 # Extract the file path from the JSON input
-# The file path is in tool_input.file_path or tool_response.filePath depending on the tool
 FILE_PATH=$(echo "$INPUT" | jq -r '.tool_input.file_path // .tool_response.filePath // ""')
+
+# Throttling mechanism using mkdir (atomic on all systems)
+LOCK_DIR="$TMPDIR/claude_cargo_check_locks"
+mkdir -p "$LOCK_DIR"
+LOCK_FILE="$LOCK_DIR/cargo_check.lock"
+LOCK_TIMEOUT=30  # seconds
+
+# Clean up function
+cleanup() {
+    rm -rf "$LOCK_FILE" 2>/dev/null
+}
+
+# Check if lock is stale
+is_lock_stale() {
+    if [ ! -d "$LOCK_FILE" ]; then
+        return 1  # No lock exists
+    fi
+
+    # Get lock creation time
+    if [ -f "$LOCK_FILE/.timestamp" ]; then
+        local lock_time=$(cat "$LOCK_FILE/.timestamp")
+        local current_time=$(date +%s)
+        local lock_age=$((current_time - lock_time))
+
+        if [ $lock_age -gt $LOCK_TIMEOUT ]; then
+            return 0  # Stale
+        fi
+    fi
+    return 1  # Not stale
+}
+
+# Try to acquire lock
+if mkdir "$LOCK_FILE" 2>/dev/null; then
+    # We got the lock
+    echo $$ > "$LOCK_FILE/pid"
+    date +%s > "$LOCK_FILE/.timestamp"
+    trap cleanup EXIT
+elif is_lock_stale; then
+    # Stale lock - force remove and retry
+    rm -rf "$LOCK_FILE"
+    if mkdir "$LOCK_FILE" 2>/dev/null; then
+        echo $$ > "$LOCK_FILE/pid"
+        date +%s > "$LOCK_FILE/.timestamp"
+        trap cleanup EXIT
+    else
+        # Race condition - another process got it
+        echo '{"systemMessage": "⏭️  cargo check skipped (already running)", "continue": true}'
+        exit 0
+    fi
+else
+    # Active lock - skip
+    echo '{"systemMessage": "⏭️  cargo check skipped (already running)", "continue": true}'
+    exit 0
+fi
 
 # Auto-detect bevy_brp project by checking workspace Cargo.toml for specific members
 SHOW_ADDITIONAL_CONTEXT=false

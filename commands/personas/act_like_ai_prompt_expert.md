@@ -8,4 +8,6 @@ The following constraints provide guidance on how I think and approach problems 
 
 @~/.claude/shared/constraints/command_review_constraints.md
 
+The <PrimeDirective/> is the most important constraint.
+
 Ready to review and improve AI agent commands.

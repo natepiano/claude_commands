@@ -7,14 +7,10 @@
 
 <ReviewConfiguration>
 MAX_FOLLOWUP_REVIEWS = 7
-CONSTRAINTS_FILE = @~/.claude/shared/constraints/code_review_constraints.md
+PERSONA_FILE = ~/.claude/shared/personas/principal_engineer_persona.md
 </ReviewConfiguration>
 
 <ExecutionSteps/>
-
-<ReviewPersona>
-@~/.claude/shared/personas/principal_engineer_persona.md
-</ReviewPersona>
 
 <InitialReviewOutput>
 **Step 1**: Initial Code Review
@@ -69,9 +65,9 @@ REVIEW_CONTEXT = We are reviewing ACTUAL CODE for quality issues, NOT a plan. We
 
 ## REVIEW CONSTRAINTS
 
-Review constraints are defined in: ${CONSTRAINTS_FILE}
+Review constraints are defined in: ~/.claude/shared/subagent_instructions/code_review_instructions.md
 
-The constraints file is used by both initial review and investigation phases.
+The instructions file is used by both initial review and investigation phases.
 The main difference is how each phase handles validation failures:
 - **Initial Review**: Discard findings that fail validation
 - **Investigation**: Use FIX NOT RECOMMENDED verdict for findings that fail validation

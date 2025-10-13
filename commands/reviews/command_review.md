@@ -3,19 +3,14 @@
 **MANDATORY FIRST STEP**:
 1. Shared review commands: @~/.claude/shared/review_commands.md
 2. That file provides the required <ExecutionSteps> for this command
-3. Some tagged sections reference review_commands.md (e.g., <ExecutionSteps/>), others are defined in this file (e.g., <ReviewPersona/>)
+3. Some tagged sections reference review_commands.md (e.g., <ExecutionSteps/>), others are defined in this file (e.g., <ReviewCategories/>)
 
 <ReviewConfiguration>
 MAX_FOLLOWUP_REVIEWS = 8
-CONSTRAINTS_FILE = @~/.claude/shared/constraints/command_review_constraints.md
-
+PERSONA_FILE = ~/.claude/shared/personas/ai_command_expert_persona.md
 </ReviewConfiguration>
 
 <ExecutionSteps/>
-
-<ReviewPersona>
-@~/.claude/shared/personas/ai_command_expert_persona.md
-</ReviewPersona>
 
 <InitialReviewOutput>
 **Step 1**: Initial Command Review
@@ -53,9 +48,9 @@ REVIEW_CONTEXT is set to: We are reviewing a COMMAND FILE for structural improve
 
 ## REVIEW CONSTRAINTS
 
-Review constraints are defined in: ${CONSTRAINTS_FILE}
+Review constraints are defined in: ~/.claude/shared/subagent_instructions/command_review_instructions.md
 
-The constraints file is used by both initial review and investigation phases.
+The instructions file is used by both initial review and investigation phases.
 The main difference is how each phase handles validation failures:
 - **Initial Review**: Discard findings that fail validation
 - **Investigation**: Use SOLID verdict for findings that fail validation

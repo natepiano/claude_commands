@@ -1,27 +1,62 @@
-# Command Review Constraints
+# Command Review Subagent Instructions
 
----
+Read @~/.claude/shared/subagent_instructions/shared_instructions.md first for universal behavior.
 
-<ReviewConstraints>
-  - <PrimeDirective/>
-  - <TaggedSectionPairing/>
-  - <TaggedSectionUsage/>
-  - <StructuralAssessment/>
-  - <CommandClarityPrinciples/>
-  - <TaggedSectionRequirements/>
-  - <ExecutionStepsRequired/>
-  - <ExecutionStepsFormat/>
-  - <ExecuteOnlyPatterns/>
-  - <InteractiveCommandPatterns/>
-  - <PatternConsistencyCheck/>
-  - <CommandVerbosityCheck/>
-  - <TemplateVariableStandards/>
-  - <ScriptManagement/>
-</ReviewConstraints>
+## Execution Workflows
 
----
+**Check Phase variable in your prompt to determine which workflow to execute.**
 
-## Constraint Definitions
+<InitialReviewWorkflow>
+**Phase = INITIAL_REVIEW:**
+1. Read and adopt persona from prompt
+2. Review target using <ReviewCategories/>
+3. Apply <CommandReviewConstraints/> validation gates
+4. **DISCARD** findings that fail validation (do not include in output)
+5. Generate IDs using <IDGenerationRules/> from shared_instructions.md
+6. Output: JSON with findings array per <JsonOutputFormat/> from shared_instructions.md
+</InitialReviewWorkflow>
+
+<InvestigationWorkflow>
+**Phase = INVESTIGATION:**
+1. Read and adopt persona from prompt
+2. Parse Finding JSON from prompt (original finding to investigate)
+3. Analyze using <InvestigationVerdictSelection/> from shared_instructions.md
+4. Apply <CommandReviewConstraints/> validation gates
+5. **Use SOLID verdict** for findings that fail validation (explain why invalid)
+6. Apply <ReasoningGuidelines/> from shared_instructions.md
+7. Use verdict from <ExpectedVerdicts/>
+8. Output: JSON with updated finding + verdict per <JsonOutputFormat/> from shared_instructions.md
+</InvestigationWorkflow>
+
+## Command Review Specifics
+
+### Review Context
+
+You are reviewing a COMMAND FILE for structural improvements, clarity, and reliability. Commands are instructions for AI agents, not code.
+
+### Your Task (Initial Review)
+
+Look for structural issues, reliability gaps, workflow problems, and reusability improvements.
+
+### Review Categories
+
+<ReviewCategories>
+- **STRUCTURE**: Command organization and flow issues
+- **RELIABILITY**: Error handling and edge case gaps
+- **WORKFLOW**: User interaction and control problems
+- **TAGGING**: Missing or improper tagged sections
+- **REUSABILITY**: Duplication and pattern inconsistencies
+</ReviewCategories>
+
+### Expected Verdicts
+
+<ExpectedVerdicts>
+ENHANCE, REVISE, or SOLID
+</ExpectedVerdicts>
+
+## Command Review Constraints
+
+<CommandReviewConstraints>
 
 <PrimeDirective>
 **FirstAndForemost**: Do the most correct and accurate work
@@ -103,7 +138,7 @@ Commands must use tagged sections effectively for clarity and maintainability:
    - **CORRECT**: Pick one style (${PLACEHOLDER}) and use consistently
    - **SCOPE**: Define placeholder meaning at first use
 6. **Section Granularity**: Balance between too many tiny sections and too few large ones
-   - **TOO GRANULAR**: <OpenFile/>, <ReadLine/>, <ClosFile/>
+   - **TOO GRANULAR**: <OpenFile/>, <ReadLine/>, <CloseFile/>
    - **TOO COARSE**: <DoEverything/>
    - **JUST RIGHT**: <ProcessFileContents/> (contains open, read, process, close)
 </TaggedSectionRequirements>
@@ -381,3 +416,5 @@ Commands should delegate complex operations to dedicated scripts for cleaner per
    - Title finding as "Complex operations should be in scripts/ directory"
    - Always include command name prefix in suggested script names
 </ScriptManagement>
+
+</CommandReviewConstraints>
