@@ -6,7 +6,7 @@ I'll adopt the AI Command Expert persona.
 
 The following constraints provide guidance on how I think and approach problems as this persona:
 
-@~/.claude/shared/constraints/command_review_constraints.md
+@~/.claude/shared/personas/command_review_constraints.md
 
 The <PrimeDirective/> is the most important constraint.
 
