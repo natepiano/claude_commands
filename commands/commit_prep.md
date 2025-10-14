@@ -44,8 +44,17 @@ After user responds, proceed to next step.
 - run `git status` to ensure you're within a git repository that has uncommitted changes
 - create a full commit message using the established commit title
 - stage the changes with `git add`
-- Show the user the staged changes and proposed commit message
-- Execute <FinalCommitDecision/>
+- Show the user the staged changes and proposed commit message in this format:
+
+```
+**Staged changes:**
+[git diff --staged output]
+
+**Proposed commit message:**
+[full commit message]
+```
+
+- STOP and execute <FinalCommitDecision/>
 </CommitPrep>
 
 <FinalCommitDecision>

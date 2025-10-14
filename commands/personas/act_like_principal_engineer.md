@@ -6,6 +6,6 @@ I'll adopt the Principal Engineer persona.
 
 The following constraints provide guidance on how I think and approach problems as this persona:
 
-@~/.claude/shared/personas/code_review_constraints.md
+@~/.claude/shared/subagent_instructions/code_review_instructions.md
 
 Ready to review code and implementation details.

@@ -87,11 +87,7 @@ The following constraints provide guidance on how I think and approach problems:
     2. Generate suggested content based on our discussion so far
     3. **For Problem Statement section specifically**: Before presenting the suggestion, ask user:
        "Are there any specific metrics (file sizes, performance numbers, complexity measures, etc.) we should document as current state? These help establish baselines for measuring success."
-    4. **For Migration Strategy section specifically**: 
-       - **If PLAN_TYPE = collaborative**: Skip asking - automatically use phased template
-       - **If PLAN_TYPE = agent**: Before presenting the suggestion, ask user:
-         "Is this change simple enough to be implemented as one conceptual unit (Atomic), or does it require a phased approach with intermediate review points (Phased)? Complex changes affecting multiple systems typically benefit from phased implementation."
-    5. Present the suggestion to the user with these options:
+    4. Present the suggestion to the user with these options:
        - **accept**: Use the suggested content as-is
        - **revise**: User provides modifications or replacement text
        - **skip**: Omit this section from the plan
@@ -141,7 +137,6 @@ The following constraints provide guidance on how I think and approach problems:
     <ProblemStatement/>
     <ProposedSolution/>
     <Implementation/>
-    <MigrationStrategy/>
     <Testing/>
     <RiskAssessment/>
     <SuccessCriteria/>
@@ -256,67 +251,6 @@ The following constraints provide guidance on how I think and approach problems:
     - Be specific about file modifications
     - **For collaborative plans**: Each phase should map to a step in the execution protocol
 </Implementation>
-
-<MigrationStrategy>
-    **Section**: Migration Strategy
-    **Purpose**: Define whether this is an atomic change or requires phased implementation
-
-    **Format for COLLABORATIVE plans**:
-    ```markdown
-    ## Migration Strategy
-
-    **Migration Strategy: Phased**
-
-    This collaborative plan uses phased implementation by design. The Collaborative Execution Protocol above defines the phase boundaries with validation checkpoints between each step.
-
-    #### Phase Overview
-    Each step in the INTERACTIVE IMPLEMENTATION SEQUENCE represents a phase with:
-    - User approval before implementation
-    - Build validation after changes
-    - Explicit confirmation before proceeding
-
-    #### Review Points
-    Review points are built into the execution protocol at each step transition.
-    ```
-
-    **Format for AGENT plans**:
-    ```markdown
-    ## Migration Strategy
-
-    **Migration Strategy: [Atomic|Phased]**
-
-    ### [If Atomic]
-    This plan represents one conceptual unit that doesn't require backwards compatibility. Even if implemented across multiple commits, we start and work on it until completion without intermediate compatibility layers.
-
-    ### [If Phased - include the following subsections]
-    
-    #### Phase Overview
-    [Brief description of why phased approach is needed]
-    
-    #### Commit Groups
-    **Phase 1**: [Commit Group Name]
-    - Commits: [List of related commits]
-    - Goal: [What this group accomplishes]
-    - Validation: [How to verify this phase works]
-    
-    **Phase 2**: [Commit Group Name]
-    - Commits: [List of related commits]
-    - Goal: [What this group accomplishes]
-    - Validation: [How to verify this phase works]
-    
-    #### Review Points
-    - After Phase 1: [What to check before proceeding]
-    - After Phase 2: [What to check before proceeding]
-    ```
-
-    **Guidelines**:
-    - Start with clear marker: "**Migration Strategy: Atomic**" or "**Migration Strategy: Phased**"
-    - **For Collaborative plans**: Always use "Phased" - the execution protocol inherently creates phases
-    - For Atomic: Keep explanation brief - emphasize conceptual unity
-    - For Phased: Define clear commit groups with validation points
-    - Ensure each phase can compile, build, and test independently
-    - Include specific review checkpoints between phases
-</MigrationStrategy>
 
 <Testing>
     **Section**: Testing Strategy

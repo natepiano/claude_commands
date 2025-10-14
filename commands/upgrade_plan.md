@@ -445,9 +445,6 @@ ${current_code}
          * Merge related sections if multiple original sections map to one execution step
          * Ensure the document flows in the same order as the execution sequence
          * This means readers can follow the document linearly and it matches the build order
-       - Update or add Migration Strategy section:
-         * Set to "**Migration Strategy: Phased**"
-         * Add note: "This collaborative plan uses phased implementation by design. The Collaborative Execution Protocol above defines the phase boundaries with validation checkpoints between each step."
        - Update Implementation Strategy to reference protocol steps
        - Add Design Review Skip Notes section if missing
        - **CRITICAL**: The final document structure should be:
@@ -455,7 +452,7 @@ ${current_code}
          2. EXECUTION PROTOCOL
          3. INTERACTIVE IMPLEMENTATION SEQUENCE
          4. Reordered implementation sections matching execution sequence
-         5. Supporting sections (Migration Strategy, Testing, etc.)
+         5. Supporting sections (Testing, Risk Assessment, Success Criteria, etc.)
 
     3. Save the upgraded plan:
        Generate the new filename by replacing .md with ${UPGRADE_SUFFIX}:

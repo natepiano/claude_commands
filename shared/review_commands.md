@@ -194,12 +194,9 @@ GOOD Example - IMPLEMENTATION-GAP finding:
 # Review Summary
 ## Total findings: ${number}
 - Categories found: ${list_categories_with_counts}
-[If any named findings exist: - Named findings (skip investigation): ${count}]
 
 ## Key themes:
 [2-3 bullet points about main issues identified]
-
-[If named findings exist: **Note**: ${count} named finding(s) will skip investigation as they are self-evident violations]
 
 **2. IMMEDIATELY execute Step 3:**
 After presenting this summary, DO NOT WAIT for user input. Immediately execute <FindingPrioritization/> to continue the workflow.
@@ -229,10 +226,9 @@ ${list_each_deferred_finding_id_and_title}
 ```
 
 **Selection criteria** (execute internally, don't output):
-1. Include all named findings first (up to MAX_FOLLOWUP_REVIEWS)
-2. Score remaining by: Priority (HIGH=3, MEDIUM=2, LOW=1) + Category (TYPE-SYSTEM=3, DESIGN/QUALITY=2, other=1) + Impact (High=3, Medium=2, Low=1)
-3. Select top ${MAX_FOLLOWUP_REVIEWS} by score
-4. Store deferred findings for <FinalSummary/>
+1. Score by: Priority (HIGH=3, MEDIUM=2, LOW=1) + Category (TYPE-SYSTEM=3, DESIGN/QUALITY=2, other=1) + Impact (High=3, Medium=2, Low=1)
+2. Select top ${MAX_FOLLOWUP_REVIEWS} by score
+3. Store deferred findings for <FinalSummary/>
 
 **If SELECTED_COUNT = TOTAL_FINDINGS (no prioritization needed):**
 
@@ -246,21 +242,13 @@ Extract exactly ${SELECTED_COUNT} findings. DO NOT WAIT for user input. Immediat
 ## STEP 4: INVESTIGATION
 
 <ReviewFollowup>
-    **NAMED FINDING FILTERING**:
-    Before launching investigations, separate named findings from regular findings:
-    1. Identify findings with "named_finding" field - these skip investigation
-    2. Named findings already have a verdict (check calling command's <NamedFindings/>)
-    3. Only investigate findings WITHOUT "named_finding" field
-    4. If all findings are named findings: Skip to Step 5 (User Review)
-
     **CRITICAL PARALLEL EXECUTION REQUIREMENT**:
-    You MUST send ALL ${N} Task tool calls for NON-NAMED findings in a SINGLE message with MULTIPLE antml:invoke blocks.
+    You MUST send ALL ${N} Task tool calls in a SINGLE message with MULTIPLE antml:invoke blocks.
 
     **VIOLATION EXAMPLES**:
     - ❌ Sending one Task, waiting for completion, then sending another
     - ❌ Using multiple messages to send Tasks
     - ❌ Starting with "I'll investigate finding 1" instead of "I'll investigate all ${N} findings"
-    - ❌ Investigating findings that have "named_finding" field
 
     **MANDATORY: Display this structured output before launching investigations:**
 
@@ -268,19 +256,15 @@ Extract exactly ${SELECTED_COUNT} findings. DO NOT WAIT for user input. Immediat
     Step 4: Investigation
 
     Total Findings: ${TOTAL_FINDINGS_FROM_STEP3}
-    Findings to Investigate: ${INVESTIGATION_COUNT}
+    Findings to Investigate: ${TOTAL_FINDINGS_FROM_STEP3}
     ```
-
-    Where:
-    - TOTAL_FINDINGS_FROM_STEP3 = The count from Step 3 (should be ≤ MAX_FOLLOWUP_REVIEWS)
-    - INVESTIGATION_COUNT = TOTAL_FINDINGS_FROM_STEP3 minus any named findings
 
     **THEN EXECUTE INVESTIGATION**:
     Send ONE message with ALL Task calls:
     - Single antml:function_calls block
-    - ${INVESTIGATION_COUNT} antml:invoke elements (ALL in the same block)
+    - ${TOTAL_FINDINGS_FROM_STEP3} antml:invoke elements (ALL in the same block)
     - Each Task call must specify:
-      * description: "Investigate FINDING-X: Title (X of INVESTIGATION_COUNT)"
+      * description: "Investigate FINDING-X: Title (X of TOTAL_FINDINGS_FROM_STEP3)"
       * subagent_type: "general-purpose"
       * prompt: Construct per <TaskLaunchInstructions> using:
         - shared_instructions.md
@@ -288,7 +272,7 @@ Extract exactly ${SELECTED_COUNT} findings. DO NOT WAIT for user input. Immediat
         - persona file from ${PERSONA_FILE}
         - Variable: FINDING_JSON (complete finding object)
 
-    **ENFORCEMENT**: All ${INVESTIGATION_COUNT} Tasks MUST launch together in one message.
+    **ENFORCEMENT**: All ${TOTAL_FINDINGS_FROM_STEP3} Tasks MUST launch together in one message.
 
     **CRITICAL**: Investigations update verdicts only. DO NOT execute keyword actions or use Edit/Write tools. Present updated findings to user and wait for keyword selection.
 
@@ -386,27 +370,6 @@ The current approach is correct. No changes needed.
 ## **Verdict**: ${verdict}
 </UserOutput>
 
-<NamedFindingOutput>
-    **For Named Findings (findings with "named_finding" field)**:
-
-    1. **Lookup Template**: Find the output template in calling command's <NamedFindingOutputTemplates/>
-       - Match ${finding.named_finding} to the template name
-       - Example: "line_number_violation" → <LineNumberViolationOutput/>
-
-    2. **Use Specialized Template**: Present using the named finding template
-       - Replace placeholders with finding data
-       - Template already includes verdict (no investigation needed)
-       - Skip investigation Task for this finding
-
-    3. **Fallback**: If template not found, use standard <UserOutput/> format
-       - Use the auto-verdict from calling command's <NamedFindings/>
-       - Add note: "Named finding - investigation skipped"
-
-    4. **Keywords**: Still present appropriate keywords based on the auto-verdict
-       - Named findings typically have CONFIRMED verdict
-       - User can still choose to skip, investigate, etc.
-</NamedFindingOutput>
-
 <UserReview>
     **Present Findings to User for Interactive Review**
 
@@ -423,18 +386,11 @@ The current approach is correct. No changes needed.
 
     1. Update TodoWrite to mark current finding as "in_progress"
     2. **MANDATORY**: Apply <PriorDecisionReconciliation/> before presenting any finding
-    3. **Check for Named Finding**:
-       - If finding has "named_finding" field:
-         a. Note: "Named finding detected: ${finding.named_finding} - using specialized output"
-         b. Use template from <NamedFindingOutputTemplates/> in calling command
-         c. Set verdict from calling command's <NamedFindings/> registry
-         d. Skip to step 4 (no investigation results to use)
-       - Otherwise: Present using format from <UserOutput/> (from investigation results)
+    3. Present using format from <UserOutput/> (from investigation results)
     4. Include the (n of m) counter in the title
        - Add any relevant notes about how prior decisions affect this finding
     5. Display available keywords using <FormatKeywords verdict="${VERDICT}"/> based on the verdict
-       - **CRITICAL**: For named findings, use auto-verdict from <NamedFindings/>
-       - **CRITICAL**: For investigated findings, use UPDATED verdict from investigation result
+       - **CRITICAL**: Use UPDATED verdict from investigation result
     6. STOP and wait for user's response
     7. **CRITICAL USER RESPONSE HANDLING**:
        - **IF USER PROVIDES A KEYWORD**: Execute the action from your command file's <KeywordExecution/> section
@@ -712,7 +668,7 @@ Base JSON structure for review findings:
     "assessment": "REDUNDANT" | "ALTERNATIVE_NEEDED" | "GAP"
   },
   "location": {
-    "plan_reference": "[If reviewing a plan: section title, NOT line numbers - e.g., 'Section: Mutation Path Implementation']",
+    "plan_reference": "[If reviewing a plan: section title - e.g., 'Section: Mutation Path Implementation']",
     "code_file": "[Relative path to actual code file from project root]",
     "line_start": [number in code file],
     "function": "[Function/method name if applicable]",
@@ -720,8 +676,7 @@ Base JSON structure for review findings:
   "issue": "[Specific problem description]",
   "current_code": "[Code snippet or text showing the issue]",
   "suggested_code": "[Improved version or recommendation]",
-  "impact": "[Why this matters]",
-  "named_finding": "[Optional - for self-evident violations like 'line_number_violation']"
+  "impact": "[Why this matters]"
 }
 ```
 
@@ -734,7 +689,6 @@ Base Requirements:
 - If code file cannot be identified, set location.code_file to "UNKNOWN - NEEDS INVESTIGATION"
 - current_code must follow <CodeExtractionRequirements/>
 - current_code must be PURE CODE ONLY - no markdown headers, instructions, or prose
-- named_finding is OPTIONAL - only include for violations defined in calling command's <NamedFindings/>
 
 **Redundancy Check Field (MANDATORY for Initial Review):**
 - **grep_performed**: Must be true - confirms you searched the plan document

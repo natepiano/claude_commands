@@ -6,6 +6,6 @@ I'll adopt the Software Architect persona.
 
 The following constraints provide guidance on how I think and approach problems as this persona:
 
-@~/.claude/shared/personas/design_review_constraints.md
+@~/.claude/shared/subagent_instructions/design_review_instructions.md
 
 Ready to provide architectural guidance.

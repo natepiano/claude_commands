@@ -14,8 +14,7 @@ Read @~/.claude/shared/subagent_instructions/shared_instructions.md first for un
 4. Apply <FindingValidationGates/> from <DesignReviewConstraints/>
 5. **DISCARD** findings that fail validation (do not include in output)
 6. Perform <RedundancyChecks/> for each potential finding per <GrepForPlanRedundancy/>
-7. Check for <NamedFindings/> patterns
-8. Generate IDs using <IDGenerationRules/> from shared_instructions.md
+7. Generate IDs using <IDGenerationRules/> from shared_instructions.md
 9. Output: JSON with findings array per <JsonOutputFormat/> from shared_instructions.md
 </InitialReviewWorkflow>
 
@@ -64,20 +63,6 @@ Find ONLY issues that the plan does NOT already correctly address.
 <ExpectedVerdicts>
 CONFIRMED, MODIFIED, or REJECTED
 </ExpectedVerdicts>
-
-### Named Findings (Skip Investigation)
-
-<NamedFindings>
-- **line_number_violation**: Line number references in design documents
-  - Auto-verdict: CONFIRMED
-  - Detection: Any reference like "line 123", "lines 45-67", etc.
-
-- **missing_migration_strategy**: Design plan lacks required migration strategy marker
-  - Auto-verdict: CONFIRMED
-  - Detection: Plan missing both "Migration Strategy: Atomic" and "Migration Strategy: Phased"
-
-When detecting these, add "named_finding" field to your JSON with the appropriate value.
-</NamedFindings>
 
 ### Mandatory Redundancy Checks
 
@@ -225,7 +210,7 @@ For EACH potential finding, verify all gates. The calling workflow determines wh
 
 **For Feature Implementation Plans**:
 ✓ DO review: Completeness, user experience, edge cases
-✓ DO check: Integration points, migration strategy
+✓ DO check: Integration points, implementation steps
 ✗ DON'T confuse: Internal tooling plans with user-facing features
 
 **For Bug Fix Plans**:
@@ -256,18 +241,6 @@ Follow these type system design principles as highest priority:
 5. **Builder Pattern Opportunities**: Complex construction that needs structure
 6. **No Magic Values**: Never allow magic literals - use named constants or enums that can serialize - ideally with conversion traits for ease of use
 </TypeSystemPrinciples>
-
-<AtomicChangeRequirement>
-**MIGRATION STRATEGY COMPLIANCE**: Check the plan document for a Migration Strategy marker:
-
-- If you find "**Migration Strategy: Atomic**": Plans must represent complete, indivisible changes. Reject any suggestions for incremental rollouts, backward compatibility, gradual migrations, or hybrid approaches. Either keep current design unchanged OR replace it entirely - no middle ground.
-
-- If you find "**Migration Strategy: Phased**": The plan has explicitly chosen a phased approach. Validate that the phased implementation makes sense and provides appropriate review points and validation steps between phases.
-
-- If neither marker is present: **Default to Atomic** - Apply the atomic change requirements above.
-
-**No Hybrid Approaches**: Do not suggest mixing atomic and phased strategies within the same plan. The migration strategy choice applies to the entire plan.
-</AtomicChangeRequirement>
 
 <DuplicationPrevention>
 **MANDATORY DUPLICATION DETECTION AND ELIMINATION FOR PLAN DOCUMENTS**:
@@ -473,31 +446,5 @@ Every stated goal, use case, requirement, or necessary feature MUST have corresp
 4. **Concrete changes**: Not "update validation" but "replace string comparison with enum match"
 5. **New code location**: For additions, specify where (e.g., "after ValidationError enum")
 </ImplementationSpecificity>
-
-<LineNumberProhibition>
-**CRITICAL - NO LINE NUMBERS IN DESIGN DOCUMENTS**:
-Design documents must NEVER contain line number references because they become stale immediately as code evolves.
-
-**PROHIBITED PATTERNS**:
-- "Add after line 64"
-- "Insert at line 429"
-- "Between lines 66-98"
-- "See line 312 for context"
-
-**REQUIRED ALTERNATIVES**:
-- **Section references**: "Add to Section: Type Definitions"
-- **Structural landmarks**: "After the VariantSignature Display implementation"
-- **Function scope**: "Add to the validate_input() function"
-- **Code patterns**: "Insert after the MutationStatus enum definition"
-- **Relative positioning**: "Before the MutationPathInternal struct"
-
-**ENFORCEMENT**:
-- Flag ANY line number reference in plans as a DESIGN issue
-- Suggest conversion to structural references
-- Line numbers may only appear in JSON location fields for actual code files
-- ALL plan text must use structural/semantic references
-
-**RATIONALE**: Line numbers change with every edit, making design documents immediately obsolete and causing implementation confusion.
-</LineNumberProhibition>
 
 </DesignReviewConstraints>

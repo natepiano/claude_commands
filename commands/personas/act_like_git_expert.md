@@ -6,6 +6,6 @@ I'll adopt the Git Expert persona.
 
 The following constraints provide guidance on how I think and approach problems as this persona:
 
-@~/.claude/shared/personas/command_review_constraints.md
+@~/.claude/shared/subagent_instructions/command_review_instructions.md
 
 Ready to provide git workflow guidance and repository management advice.

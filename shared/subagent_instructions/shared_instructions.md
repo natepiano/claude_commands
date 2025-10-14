@@ -71,7 +71,7 @@ Include the JSON structure directly in your response message text. The main agen
     "assessment": "REDUNDANT" | "ALTERNATIVE_NEEDED" | "GAP"
   },
   "location": {
-    "plan_reference": "[If reviewing a plan: section title, NOT line numbers - e.g., 'Section: Mutation Path Implementation']",
+    "plan_reference": "[If reviewing a plan: section title - e.g., 'Section: Mutation Path Implementation']",
     "code_file": "[Relative path to actual code file from project root]",
     "line_start": [number in code file],
     "function": "[Function/method name if applicable]",
@@ -79,8 +79,7 @@ Include the JSON structure directly in your response message text. The main agen
   "issue": "[Specific problem description]",
   "current_code": "[Code snippet or text showing the issue]",
   "suggested_code": "[Improved version or recommendation]",
-  "impact": "[Why this matters]",
-  "named_finding": "[Optional - for self-evident violations like 'line_number_violation']"
+  "impact": "[Why this matters]"
 }
 ```
 
@@ -93,7 +92,6 @@ Include the JSON structure directly in your response message text. The main agen
 - If code file cannot be identified, set location.code_file to "UNKNOWN - NEEDS INVESTIGATION"
 - current_code must follow <CodeExtractionRequirements/>
 - current_code must be PURE CODE ONLY - no markdown headers, instructions, or prose
-- named_finding is OPTIONAL - only include for violations defined in calling command's <NamedFindings/>
 
 **Redundancy Check Field (MANDATORY for Initial Review):**
 - **grep_performed**: Must be true - confirms you searched the plan document
