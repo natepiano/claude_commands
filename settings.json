@@ -24,33 +24,13 @@
           }
         ]
       }
-    ],
-    "PreCompact": [
-      {
-        "matcher": "auto",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "~/.claude/scripts/auto-compact-export.sh"
-          }
-        ]
-      },
-      {
-        "matcher": "manual",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "~/.claude/scripts/auto-compact-export.sh"
-          }
-        ]
-      }
     ]
   },
   "statusLine": {
     "type": "command",
     "command": "printf \"%s%% Press ? for shortcuts\" \"$(basename \"$(pwd)\")\""
   },
-  "alwaysThinkingEnabled": false,
+  "alwaysThinkingEnabled": true,
   "feedbackSurveyState": {
     "lastShownTime": 1754090074729
   }

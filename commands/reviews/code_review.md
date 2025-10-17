@@ -10,6 +10,8 @@ MAX_FOLLOWUP_REVIEWS = 7
 PERSONA_FILE = ~/.claude/shared/personas/principal_engineer_persona.md
 </ReviewConfiguration>
 
+Read and adopt persona from ${PERSONA_FILE}
+
 <ExecutionSteps/>
 
 <InitialReviewOutput>

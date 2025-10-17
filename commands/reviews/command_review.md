@@ -10,6 +10,8 @@ MAX_FOLLOWUP_REVIEWS = 8
 PERSONA_FILE = ~/.claude/shared/personas/ai_command_expert_persona.md
 </ReviewConfiguration>
 
+Read and adopt persona from ${PERSONA_FILE}
+
 <ExecutionSteps/>
 
 <InitialReviewOutput>

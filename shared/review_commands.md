@@ -22,13 +22,13 @@
 <TaskLaunchInstructions>
 **How to construct prompts for Task tool subagents:**
 
-Build minimal prompt with @file references and let subagent read files:
+Build minimal prompt and let subagent read files:
 
 **For Initial Review:**
 ```
-Read and follow @~/.claude/shared/subagent_instructions/shared_instructions.md
-Read and follow @~/.claude/shared/subagent_instructions/${REVIEW_TYPE}_review_instructions.md
-Persona: Read and adopt @${PERSONA_FILE}
+Read and follow ~/.claude/shared/subagent_instructions/shared_instructions.md
+Read and follow ~/.claude/shared/subagent_instructions/${REVIEW_TYPE}_review_instructions.md
+Read and adopt persona from ${PERSONA_FILE}
 
 Phase: INITIAL_REVIEW
 Target: ${REVIEW_TARGET}
@@ -39,9 +39,9 @@ Your task: Perform initial review per the instructions. Output JSON only.
 
 **For Investigation:**
 ```
-Read and follow @~/.claude/shared/subagent_instructions/shared_instructions.md
-Read and follow @~/.claude/shared/subagent_instructions/${REVIEW_TYPE}_review_instructions.md
-Persona: Read and adopt @${PERSONA_FILE}
+Read and follow ~/.claude/shared/subagent_instructions/shared_instructions.md
+Read and follow ~/.claude/shared/subagent_instructions/${REVIEW_TYPE}_review_instructions.md
+Read and adopt persona from ${PERSONA_FILE}
 
 Phase: INVESTIGATION
 Original Finding:
@@ -54,7 +54,7 @@ Your task: Investigate this finding per the instructions. Output JSON only.
 
 **Variable Substitution:**
 - ${REVIEW_TYPE} = "design", "code", or "command"
-- ${PERSONA_FILE} = From calling command's <ReviewPersona/>
+- ${PERSONA_FILE} = From calling command's <ReviewConfiguration>
 - ${REVIEW_TARGET} = From <DetermineReviewTarget/> in calling command
 - ${REVIEW_CONTEXT} = From <DetermineReviewTarget/> in calling command
 - ${FINDING_JSON} = Complete finding object from initial review

@@ -17,14 +17,9 @@ STATUS_COMPLETED = ✅ COMPLETED
 STATUS_SUCCESS = ✅
 UPGRADE_SUFFIX = -upgraded.md
 
-<ValidateUserResponse>
-    # Parameters: expected_keywords (array), option_descriptions (array)
-    If response is not one of expected_keywords:
-        Display: "Unrecognized response '[user_input]'. Please select from:"
-        For each option in option_descriptions:
-            Display: option
-        STOP and wait for valid input
-</ValidateUserResponse>
+<SharedWorkflows>
+@~/.claude/shared/gap_analysis_workflow.md
+</SharedWorkflows>
 
 <ExecutionSteps>
     **EXECUTE THESE STEPS IN ORDER:**
@@ -123,10 +118,12 @@ UPGRADE_SUFFIX = -upgraded.md
 
     Display: "🔍 Thinking harder about implementation completeness..."
 
+    Set PLAN_DOCUMENT to $ARGUMENTS for gap analysis workflow.
+
     Use Task tool:
     - description: "Deep implementation gap analysis"
     - subagent_type: "general-purpose"
-    - prompt: <GapAnalysisPrompt/>
+    - prompt: <GapAnalysisPrompt/> (from shared workflow)
 
     Parse response. If no gaps found:
         Display: "✅ Plan Completeness Check: PASSED"
@@ -139,154 +136,9 @@ UPGRADE_SUFFIX = -upgraded.md
         ⏺ ✅ Plan Completeness Check: GAPS FOUND (${gap_count} issues, ${critical_count} CRITICAL)
         ```
 
-        Execute <GapReview/> with parsed gaps array.
+        Execute <GapReview/> (from shared workflow) with parsed gaps array.
         After gap review completes, proceed to Step 3.
 </ImplementationGapAnalysis>
-
-<GapAnalysisPrompt>
-Think harder about whether this implementation plan is actually complete.
-Read actual current code for each file to be modified.
-
-Check for:
-1. Vague changes without concrete implementation ("refactor X" without HOW)
-2. Missing function signatures, error handling, edge cases
-3. Dependencies/integrations the plan doesn't mention
-4. Code that will break but isn't updated
-
-For each gap, provide: gap_type, file, current_code, plan_proposal, what's_missing, severity (CRITICAL/HIGH/MEDIUM/LOW)
-
-Return JSON:
-{
-  "gaps_found": boolean,
-  "gap_count": number,
-  "gaps": [
-    {
-      "gap_type": "string",
-      "file": "path/to/file",
-      "current_code": "code snippet",
-      "plan_proposal": "what plan says",
-      "what's_missing": "specific details",
-      "severity": "CRITICAL|HIGH|MEDIUM|LOW"
-    }
-  ],
-  "summary": "assessment"
-}
-</GapAnalysisPrompt>
-
-<GapReview>
-    **Interactive Gap Review - One at a Time**
-
-    Use TodoWrite tool to create tracking for each gap:
-    - Create todos for each gap: "Review gap: ${gap_type} in ${file}"
-    - Status: "pending" for all initially
-
-    For each gap (in order of severity: CRITICAL → HIGH → MEDIUM → LOW):
-
-    1. Mark current gap todo as "in_progress"
-    2. Present gap using <GapOutput/> format
-    3. Include counter: "(Gap ${current_number} of ${total_gaps})"
-    4. Display keywords at column 0:
-
-## Available Actions
-- **fix** - Address this gap in the plan before continuing
-- **skip** - Accept this gap and continue anyway
-- **investigate** - Launch deeper investigation of the gap
-- **stop** - Cancel the upgrade process
-
-    5. STOP and wait for user's keyword response
-    6. Handle keyword response:
-
-       **If user says "fix":**
-       a. Display: "Fixing gap in the plan..."
-       b. Use Read tool to read the plan document from $ARGUMENTS
-       c. Analyze the gap and determine what needs to be added/clarified in the plan
-       d. Use Edit tool to update the plan document with the missing details:
-          - Add missing function signatures with complete before/after examples
-          - Clarify vague instructions with concrete implementation steps
-          - Add missing edge case handling or error handling details
-          - Include line-specific references or code snippets
-          - Ensure the fix addresses the "what's_missing" from the gap
-       e. Display: "✅ Gap fixed in ${$ARGUMENTS}"
-       f. Ask: "Ready to continue to the next gap?"
-       g. Display keywords:
-          - **continue** - Move to next gap
-          - **stop** - Cancel the upgrade process
-       h. STOP and wait for user response
-       i. If user says "continue", mark gap as completed and continue to next gap
-       j. If user says "stop", exit upgrade process
-       k. Execute <ValidateUserResponse/> with expected_keywords: [continue, stop]
-
-       **If user says "skip":**
-       a. Display: "Skipping this gap - accepting it as-is"
-       b. Mark gap as skipped
-       c. Mark gap todo as completed
-       d. Continue to next gap
-
-       **If user says "investigate":**
-       a. Display: "🔍 Launching deeper investigation..."
-       b. Use Task tool with general-purpose subagent:
-          - description: "Investigate gap: ${gap_type}"
-          - prompt: "Analyze this implementation gap in detail:
-                     File: ${file}
-                     Gap type: ${gap_type}
-                     What plan says: ${plan_proposal}
-                     What's missing: ${what's_missing}
-                     Current code: ${current_code}
-
-                     Provide:
-                     1. Root cause analysis of why this gap exists
-                     2. Specific code snippets needed to fill the gap
-                     3. Recommended fix with exact text to add to plan
-                     4. Verification steps to confirm fix is complete"
-       c. Display the investigation results
-       d. Re-present the same gap with keywords (user can now choose fix, skip, investigate again, or stop)
-       e. STOP and wait for user response
-       f. Return to step 6 to handle the new keyword
-
-       **If user says "stop":**
-       a. Display: "Gap review cancelled by user"
-       b. Exit upgrade process
-
-    7. Execute <ValidateUserResponse/> for initial response with:
-       expected_keywords: [fix, skip, investigate, stop]
-       option_descriptions: [
-           "- **fix** - Address this gap in the plan before continuing",
-           "- **skip** - Accept this gap and continue anyway",
-           "- **investigate** - Launch deeper investigation of the gap",
-           "- **stop** - Cancel the upgrade process"
-       ]
-
-    After all gaps reviewed, display summary:
-    ```
-    Gap Review Complete
-    -------------------
-    Total gaps: ${total_count}
-    Fixed: ${fix_count}
-    Skipped: ${skip_count}
-
-    Proceeding to execution sequence proposal...
-    ```
-</GapReview>
-
-<GapOutput>
-# Gap ${current_number} of ${total_gaps}: ${gap_type}
-**Severity**: ${severity}
-**File**: ${file}
-
-## What the plan says:
-${plan_proposal}
-
-## What's actually needed:
-${what's_missing}
-
-## Current code context:
-```rust
-${current_code}
-```
-
-## Why this matters:
-[Explain the compilation/runtime impact if this gap isn't addressed]
-</GapOutput>
 
 ## STEP 3: REVIEW AND CONFIRM
 

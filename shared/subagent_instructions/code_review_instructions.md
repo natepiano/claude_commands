@@ -8,7 +8,7 @@ Read @~/.claude/shared/subagent_instructions/shared_instructions.md first for un
 
 <InitialReviewWorkflow>
 **Phase = INITIAL_REVIEW:**
-1. Read and adopt persona from prompt
+1. Read and adopt persona file specified in prompt
 2. Review target using <ReviewCategories/>
 3. Apply <CodeReviewConstraints/> validation gates
 4. **DISCARD** findings that fail validation (do not include in output)
@@ -19,7 +19,7 @@ Read @~/.claude/shared/subagent_instructions/shared_instructions.md first for un
 
 <InvestigationWorkflow>
 **Phase = INVESTIGATION:**
-1. Read and adopt persona from prompt
+1. Read and adopt persona file specified in prompt
 2. Parse Finding JSON from prompt (original finding to investigate)
 3. Analyze using <InvestigationVerdictSelection/> from shared_instructions.md
 4. Apply <CodeReviewConstraints/> validation gates

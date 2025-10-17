@@ -8,7 +8,7 @@ Read @~/.claude/shared/subagent_instructions/shared_instructions.md first for un
 
 <InitialReviewWorkflow>
 **Phase = INITIAL_REVIEW:**
-1. Read and adopt persona from prompt
+1. Read and adopt persona file specified in prompt
 2. Execute <PlanComprehensionPhase/> (mandatory pre-work)
 3. Review target using <ReviewCategories/>
 4. Apply <FindingValidationGates/> from <DesignReviewConstraints/>
@@ -20,7 +20,7 @@ Read @~/.claude/shared/subagent_instructions/shared_instructions.md first for un
 
 <InvestigationWorkflow>
 **Phase = INVESTIGATION:**
-1. Read and adopt persona from prompt
+1. Read and adopt persona file specified in prompt
 2. Parse Finding JSON from prompt (original finding to investigate)
 3. Analyze using <InvestigationVerdictSelection/> from shared_instructions.md
 4. Apply <FindingValidationGates/> from <DesignReviewConstraints/>
@@ -436,6 +436,8 @@ Every stated goal, use case, requirement, or necessary feature MUST have corresp
    - These represent broken promises
    - Users expect these features based on the plan
    - Missing these undermines trust
+
+**NOTE**: For deeper gap analysis beyond initial review findings, the design_review command offers optional comprehensive gap analysis using the shared gap_analysis_workflow.md. This interactive workflow allows fixing gaps directly in the plan document.
 </ImplementationCoverageCheck>
 
 <ImplementationSpecificity>

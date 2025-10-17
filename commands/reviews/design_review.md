@@ -9,6 +9,12 @@ MAX_FOLLOWUP_REVIEWS = 6
 PERSONA_FILE = ~/.claude/shared/personas/architect_persona.md
 </ReviewConfiguration>
 
+Read and adopt persona from ${PERSONA_FILE}
+
+<SharedWorkflows>
+@~/.claude/shared/gap_analysis_workflow.md
+</SharedWorkflows>
+
 <ExecutionSteps/>
 
 <InitialReviewOutput>
@@ -96,4 +102,44 @@ The main difference is how each phase handles validation failures:
     - **redundant**: Use Edit tool to add to "Design Review Skip Notes" section using <RedundantTemplate/> format from review_commands.md (only for CONFIRMED/MODIFIED verdicts)
     - **investigate**: Ask user "What specific aspect would you like me to investigate?", then launch Task tool with their focus
 </KeywordExecution>
+
+## GAP ANALYSIS
+
+<GapAnalysis>
+    **When to run gap analysis:**
+    - After completing all findings review in Step 5 (User Review)
+    - Before presenting <FinalSummary/>
+    - Always offered, regardless of whether IMPLEMENTATION-GAP findings were identified
+
+    Display: "Would you like to run a comprehensive gap analysis?"
+    Display: ""
+
+    ## Available Actions
+    - **analyze** - Run deep gap analysis with interactive review
+    - **skip** - Complete the design review without gap analysis
+
+    STOP and wait for user response.
+
+    **If user says "analyze":**
+    1. Set PLAN_DOCUMENT to the plan document path being reviewed
+    2. Display: "🔍 Launching comprehensive gap analysis..."
+    3. Use Task tool:
+       - description: "Deep implementation gap analysis"
+       - subagent_type: "general-purpose"
+       - prompt: <GapAnalysisPrompt/> (from shared workflow)
+    4. Parse response. If gaps found:
+       - Display summary with gap count and severity breakdown
+       - Execute <GapReview/> (from shared workflow) with parsed gaps array
+    5. After gap review completes, proceed to <FinalSummary/>
+
+    **If user says "skip":**
+    - Proceed directly to <FinalSummary/>
+
+    Execute <ValidateUserResponse/> with:
+        expected_keywords: [analyze, skip]
+        option_descriptions: [
+            "- **analyze** - Run deep gap analysis with interactive review",
+            "- **skip** - Complete the design review without gap analysis"
+        ]
+</GapAnalysis>
 

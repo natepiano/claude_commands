@@ -62,12 +62,23 @@ fi
 
 # Auto-detect bevy_brp project by checking workspace Cargo.toml for specific members
 SHOW_ADDITIONAL_CONTEXT=false
+WORKSPACE_ROOT=""
 SEARCH_DIR=$(dirname "$FILE_PATH")
 while [[ "$SEARCH_DIR" != "/" ]]; do
     if [[ -f "$SEARCH_DIR/Cargo.toml" ]]; then
-        # Check if this Cargo.toml has the bevy_brp workspace members (must be actual TOML, not logs)
-        if grep -q '^\s*members\s*=\s*\[.*"extras".*"mcp".*"mcp_macros"' "$SEARCH_DIR/Cargo.toml" 2>/dev/null; then
-            SHOW_ADDITIONAL_CONTEXT=true
+        # Check if this Cargo.toml has the bevy_brp workspace members
+        # Look for members array containing all three: extras, mcp, mcp_macros (order independent, multiline safe)
+        TOML_CONTENT=$(cat "$SEARCH_DIR/Cargo.toml")
+        if echo "$TOML_CONTENT" | grep -q 'members\s*=' && \
+           echo "$TOML_CONTENT" | grep -q '"extras"' && \
+           echo "$TOML_CONTENT" | grep -q '"mcp"' && \
+           echo "$TOML_CONTENT" | grep -q '"mcp_macros"'; then
+            WORKSPACE_ROOT="$SEARCH_DIR"
+            # Check if the edited file is under mcp/ directory relative to workspace root
+            RELATIVE_PATH="${FILE_PATH#$WORKSPACE_ROOT/}"
+            if [[ "$RELATIVE_PATH" == mcp/* ]]; then
+                SHOW_ADDITIONAL_CONTEXT=true
+            fi
             break
         fi
     fi
@@ -160,9 +171,10 @@ if [ $CHECK_RESULT -eq 0 ]; then
         USER_MESSAGE="$USER_MESSAGE ✨ formatted"
     fi
 
-    # Add agent context for bevy_brp project
+    # Add agent context for bevy_brp project - use systemMessage since additionalContext may not work
     if [ "$SHOW_ADDITIONAL_CONTEXT" = true ]; then
-        AGENT_MESSAGE="${AGENT_MESSAGE}\\nChanges will not be testable until the agent runs \`cargo install --path mcp\`\\nand asks the user to do \`/mcp reconnect brp\`\\n"
+        USER_MESSAGE="${USER_MESSAGE} 🔧 MCP changes require reinstall"
+        AGENT_MESSAGE="${AGENT_MESSAGE}\\nℹ️  MCP Tool Changes Detected:\\nChanges will not be testable until the agent runs \`cargo install --path mcp\`\\nand asks the user to do \`/mcp reconnect brp\`\\n"
     fi
 else
     # Check failed - build detailed error message for agent only
@@ -207,11 +219,11 @@ fi
 
 # Output JSON with proper escaping
 if command -v jq >/dev/null 2>&1; then
-    echo "{\"systemMessage\": $(printf "%b" "$USER_MESSAGE" | jq -Rs .)$ADDITIONAL_CONTEXT}"
+    echo "{\"continue\": true, \"systemMessage\": $(printf "%b" "$USER_MESSAGE" | jq -Rs .)$ADDITIONAL_CONTEXT}"
 else
     # Fallback: escape quotes and preserve newlines as \n
     ESCAPED_MESSAGE=$(printf "%b" "$USER_MESSAGE" | sed 's/\\/\\\\/g; s/"/\\"/g' | awk '{printf "%s\\n", $0}' | sed 's/\\n$//')
-    echo "{\"systemMessage\": \"$ESCAPED_MESSAGE\"$ADDITIONAL_CONTEXT}"
+    echo "{\"continue\": true, \"systemMessage\": \"$ESCAPED_MESSAGE\"$ADDITIONAL_CONTEXT}"
 fi
 
 # Always exit successfully
