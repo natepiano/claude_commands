@@ -3,7 +3,7 @@
 
 The following constraints provide guidance on how I think and approach problems:
 
-@~/.claude/shared/constraints/code_review_constraints.md
+@~/.claude/shared/subagent_instructions/code_review_instructions.md
 </Persona>
 
 ## Arguments

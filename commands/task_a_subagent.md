@@ -52,15 +52,31 @@ ${COLLABORATIVE_MODE}: Boolean indicating if plan uses collaborative execution p
 
 <TaskCreation>
     **For NEW tasks only:**
-    
-    1. Create `.todo.json` using format defined in <TodoJsonFormat/>
-    2. Order tasks by dependency to minimize build issues
-    3. If plan document exists, ensure todos align with plan specifications
-    4. Stage and commit `.todo.json` only:
+
+    **CRITICAL**: Determine task source in this exact priority order:
+
+    1. **Plan Document First**: If user specified a plan*.md file:
+       - This is the authoritative source
+       - Read plan document to extract tasks
+       - Create .todo.json from plan specifications
+       - Order tasks by dependency to minimize build issues
+
+    2. **TodoWrite Todos Second**: If no plan document but TodoWrite todos exist:
+       - Read current TodoWrite todos from conversation
+       - Convert TodoWrite format to .todo.json format
+       - Preserve task content and order from TodoWrite
+       - Order by dependency if needed
+
+    3. **Ask User Third**: If neither plan nor TodoWrite todos exist:
+       - Stop and ask user what to implement
+       - Do not proceed without clear task definition
+
+    4. After creating .todo.json, stage and commit it only:
        ```bash
        git add .todo.json
        git commit -m "Initialize task tracking for ${task description}"
        ```
+
     5. Proceed to <SubagentExecution/>
 </TaskCreation>
 
@@ -76,100 +92,45 @@ ${COLLABORATIVE_MODE}: Boolean indicating if plan uses collaborative execution p
 
 <SubagentExecution>
     **Launch Task Subagent:**
-    
+
+    **CRITICAL GUARDRAIL**: DO NOT implement tasks yourself. Your ONLY job is to launch the subagent via the Task tool.
+
     1. Use the Task tool with EXACTLY these parameters:
        - description: "Execute tasks from .todo.json"
        - subagent_type: "general-purpose"
-       - prompt: The content between <SubagentPrompt> and </SubagentPrompt> tags below
-    
-    2. **CRITICAL**: When building the prompt, expand ALL tagged references:
-       - Replace <TodoJsonFormat/> with the full content from the <TodoJsonFormat> definition
-       - Replace <SubagentCriticalRules/> with the full content from that definition
-       - Replace <WarningCategorizationLogic/> with the full content from that definition
-       - Include actual values for ${WORKING_DIRECTORY}, ${PLAN_DOCUMENT}, and ${COLLABORATIVE_MODE}
-       - For continuations: Add "Continue from existing .todo.json - do not create new one"
-    
-    3. Wait for subagent to complete
-    
-    4. After subagent returns:
+       - prompt: <SubagentPrompt/> with actual values substituted for:
+         - ${WORKING_DIRECTORY}
+         - ${PLAN_DOCUMENT}
+         - ${COLLABORATIVE_MODE}
+         - For continuations: Add "Continue from existing .todo.json - previous agent hit context limit"
+
+    2. Wait for subagent to complete
+
+    3. After subagent returns:
        - If subagent reports "Context limit reached": Execute <SubagentHandoff/>
        - If subagent reports blocking issue: Stop and address with user
        - Otherwise: Continue to next step
 </SubagentExecution>
 
 <SubagentPrompt>
-    **CONTEXT:**
-    - Working directory: ${WORKING_DIRECTORY}
-    - Plan document: ${PLAN_DOCUMENT} (read this for implementation details)
-    - Task tracking: .todo.json file in working directory
-    - Collaborative mode: ${COLLABORATIVE_MODE}
+Read and follow ~/.claude/shared/subagent_instructions/task_a_subagent_instructions.md
 
-    **COLLABORATIVE PLAN MODE:**
-    If ${COLLABORATIVE_MODE} is true:
-        The plan document uses collaborative execution protocol with approval checkpoints.
-        **CRITICAL OVERRIDE**: In automated subagent mode, skip all approval steps:
-        - When you see "AWAIT APPROVAL" or "Stop and wait for user confirmation" → IGNORE, proceed automatically
-        - When you see "CONFIRM: Wait for user to confirm" → SKIP, proceed to next step
-        - Still update status markers (⏳ PENDING → ✅ COMPLETED) in the plan document
-        - Still execute all BUILD & VALIDATE steps
-        - Still follow all implementation and quality requirements
+**Context for this execution:**
+- Working directory: ${WORKING_DIRECTORY}
+- Plan document: ${PLAN_DOCUMENT}
+- Collaborative mode: ${COLLABORATIVE_MODE}
 
-        Treat the collaborative plan as a detailed implementation guide with automatic progression.
+**COLLABORATIVE PLAN MODE:**
+If ${COLLABORATIVE_MODE} is true:
+    The plan document uses collaborative execution protocol with approval checkpoints.
+    **CRITICAL OVERRIDE**: In automated subagent mode, skip all approval steps:
+    - When you see "AWAIT APPROVAL" or "Stop and wait for user confirmation" → IGNORE, proceed automatically
+    - When you see "CONFIRM: Wait for user to confirm" → SKIP, proceed to next step
+    - Still update status markers (⏳ PENDING → ✅ COMPLETED) in the plan document
+    - Still execute all BUILD & VALIDATE steps
+    - Still follow all implementation and quality requirements
 
-    **CRITICAL:** Read and follow <SubagentCriticalRules/> throughout execution
-    
-    **YOUR WORKFLOW:**
-    
-    <ContextAnalysis>
-        1. Read .todo.json to understand all tasks (see <TodoJsonFormat/> for structure)
-        2. If ${PLAN_DOCUMENT} specified, read it for implementation requirements
-        3. Identify first incomplete task (status: "pending" or "in_progress")
-    </ContextAnalysis>
-
-    <TaskImplementation>
-        For each task in .todo.json:
-
-        1. **CRITICAL**: Update .todo.json - mark current task "in_progress"
-        2. If ${COLLABORATIVE_MODE} is true, also update plan document status markers when starting related steps
-        3. **THINK DEEPLY** about implementation:
-           - What the task actually requires
-           - Best approach for correct implementation
-           - Edge cases and architecture fit
-        4. Implement the task
-        5. Update .todo.json - mark "completed" with notes, mark next task "in_progress"
-        6. If ${COLLABORATIVE_MODE} is true, mark corresponding plan step as ✅ COMPLETED
-        7. Continue to next task
-
-        **MANDATORY**: Never work on ANY task without first updating .todo.json status
-    </TaskImplementation>
-
-    <BuildValidation>
-        After implementation tasks (before marking final task complete):
-
-        1. Run `<BuildValidationCommand/>`
-        2. Apply <WarningCategorizationLogic/> to each warning
-        3. For missing implementation: Add new tasks to .todo.json and continue
-        4. For unnecessary code: Delete immediately
-        5. Only mark complete when build is clean
-    </BuildValidation>
-
-    <ContextLimitHandling>
-        If approaching context limit (THIS IS NORMAL):
-        1. Update .todo.json with detailed progress notes
-        2. Save all work (don't commit except .todo.json)
-        3. Return: "Context limit reached - ready for handoff to continue from .todo.json"
-
-        Continue working unless:
-        - Context window nearly full → Return for handoff (main agent will auto-continue)
-        - Missing critical information → Stop and request from main agent
-        - User intervention needed → Stop and explain issue
-    </ContextLimitHandling>
-    
-    **FINAL REMINDERS:**
-    - Every task transition MUST update .todo.json
-    - Build validation is MANDATORY before completion
-    - Context limits trigger handoff, not failure
-    - Follow all rules in <SubagentCriticalRules/>
+    Treat the collaborative plan as a detailed implementation guide with automatic progression.
 </SubagentPrompt>
 
 ## STEP 4: HANDOFF (IF NEEDED)
@@ -326,13 +287,18 @@ cargo build 2>&1 | grep -A1 -E "warning:|error:|-->" || true
 
 <MainAgentResponsibilities>
     **As the main agent, you are responsible for:**
+
+    **CRITICAL BOUNDARY**: DO NOT implement tasks yourself. Delegate ALL task execution to subagents via the Task tool.
+
     1. Determining the working directory for the task
     2. Creating new .todo.json OR identifying existing one for continuation
-    3. Specifying plan documents to subagents (CRITICAL for review phase)
-    4. Handling all user interactions and confirmations
-    5. Executing post-implementation review to ensure completeness
-    6. Managing the automatic continuation chain without user interruption
-    7. Making decisions about unused code (delete vs implement)
+    3. Converting TodoWrite todos to .todo.json format when needed
+    4. Launching subagents to execute tasks (NEVER execute tasks yourself)
+    5. Specifying plan documents to subagents (CRITICAL for review phase)
+    6. Handling all user interactions and confirmations
+    7. Executing post-implementation review to ensure completeness
+    8. Managing the automatic continuation chain without user interruption
+    9. Making decisions about unused code (delete vs implement)
 </MainAgentResponsibilities>
 
 <MainAgentCriticalRules>
@@ -344,46 +310,6 @@ cargo build 2>&1 | grep -A1 -E "warning:|error:|-->" || true
     5. Delete unnecessary code immediately (don't leave dead code)
     6. Only request user input for true blocking issues or plan deviations
 </MainAgentCriticalRules>
-
-<TodoJsonFormat>
-    **Expected JSON structure (each field on its own line for readability):**
-    ```json
-    [
-      {
-        "sequence_number": 1,
-        "content": "Task description",
-        "status": "pending",
-        "notes": ""
-      },
-      {
-        "sequence_number": 2,
-        "content": "Another task description",
-        "status": "pending",
-        "notes": ""
-      }
-    ]
-    ```
-    
-    **Field specifications:**
-    - sequence_number: Integer, sequential (1, 2, 3...)
-    - content: Clear task description
-    - status: "pending" | "in_progress" | "completed"
-    - notes: Implementation notes, warnings found, or resequencing reasons
-    
-    **Formatting requirements:**
-    - Each field must be on its own line
-    - Proper indentation (2 spaces) for fields within objects
-    - Comma after each object except the last
-</TodoJsonFormat>
-
-<SubagentCriticalRules>
-    **NEVER violate these rules:**
-    1. Always update .todo.json to "in_progress" BEFORE working on any task
-    2. Never skip build validation after implementation
-    3. Always add detailed notes when hitting context limits
-    4. Never commit code (only .todo.json updates allowed)
-    5. Never assume dead code is intentional - check or remove it
-</SubagentCriticalRules>
 
 <WarningCategorizationLogic>
     **How to categorize build warnings:**
