@@ -12,7 +12,7 @@ If `$ARGUMENTS` is provided, it should be the name of a `plan*.md` file in the p
 - `plan_mutation_system.md`
 - `plan_api_redesign.md`
 
-If no arguments are provided, the command will work with the plan document currently being worked on in the session.
+If no arguments are provided, the command will first check if we're working on a plan document in the session. If so, it uses that plan. If not, it creates a todo list from conversational context (suitable for small tasks that don't require a formal plan document).
 
 ## Overview
 Create a todo list for the specified plan using your todo tool, then STOP.
@@ -40,7 +40,10 @@ FEATURE_NAME = ${extracted from plan title}
    - Read the specified plan document from the project root
    - If file not found, display error: "Plan file ${PLAN_FILE_PATH} not found in project root. Please verify the filename and try again."
    - If file exists but is not readable, display error: "Plan file ${PLAN_FILE_PATH} exists but cannot be read. Please check file permissions."
-2. If no arguments: Use the plan document currently being worked on in the session
+2. If no arguments provided:
+   - Check if we're working on a plan document in the current session
+   - If yes: Use that plan document and proceed to step 3
+   - If no: Set PLAN_FILE_PATH = "CONTEXT_ONLY" and skip to step 7 (create todos from conversational context)
 3. Verify the plan document exists and is readable
 4. Check if the plan document is checked into git using: `git status ${PLAN_FILE_PATH}`
 5. If it is not checked in, commit ONLY the plan file:
@@ -48,10 +51,11 @@ FEATURE_NAME = ${extracted from plan title}
    - Run: `git commit -m "docs: add implementation plan for ${FEATURE_NAME}"`
    - DO NOT use `git add .` or `git add -A`
 6. This ensures the plan is preserved before implementation begins
+7. Proceed to next step (ReviewFindingsProcessing or Setup, depending on whether using plan document or context)
 </PlanDocumentSelection>
 
 <ReviewFindingsProcessing>
-**CRITICAL - REVIEW FINDINGS PROCESSING**:
+**CRITICAL - REVIEW FINDINGS PROCESSING** (skip this step if PLAN_FILE_PATH = "CONTEXT_ONLY"):
 After reading the plan document, you MUST:
 1. Search for ALL review sections (e.g., "Design Review Skip Notes", review findings)
 2. For EACH review finding, READ and UNDERSTAND:

@@ -26,7 +26,7 @@ Build minimal prompt and let subagent read files:
 
 **For Initial Review:**
 ```
-Read and follow ~/.claude/shared/subagent_instructions/shared_instructions.md
+Read and follow ~/.claude/shared/subagent_instructions/shared_review_instructions.md
 Read and follow ~/.claude/shared/subagent_instructions/${REVIEW_TYPE}_review_instructions.md
 Read and adopt persona from ${PERSONA_FILE}
 
@@ -39,7 +39,7 @@ Your task: Perform initial review per the instructions. Output JSON only.
 
 **For Investigation:**
 ```
-Read and follow ~/.claude/shared/subagent_instructions/shared_instructions.md
+Read and follow ~/.claude/shared/subagent_instructions/shared_review_instructions.md
 Read and follow ~/.claude/shared/subagent_instructions/${REVIEW_TYPE}_review_instructions.md
 Read and adopt persona from ${PERSONA_FILE}
 
@@ -72,7 +72,7 @@ Your task: Investigate this finding per the instructions. Output JSON only.
     - description: "review ${PLAN_DOCUMENT}" OR "review ${REVIEW_TARGET}"
     - subagent_type: "general-purpose"
     - prompt: Construct per <TaskLaunchInstructions> using:
-      * shared_instructions.md
+      * shared_review_instructions.md
       * {type}_review_instructions.md (design/code/command)
       * persona file from ${PERSONA_FILE}
       * Variables: REVIEW_TARGET, REVIEW_CONTEXT
@@ -267,7 +267,7 @@ Extract exactly ${SELECTED_COUNT} findings. DO NOT WAIT for user input. Immediat
       * description: "Investigate FINDING-X: Title (X of TOTAL_FINDINGS_FROM_STEP3)"
       * subagent_type: "general-purpose"
       * prompt: Construct per <TaskLaunchInstructions> using:
-        - shared_instructions.md
+        - shared_review_instructions.md
         - {type}_review_instructions.md (design/code/command)
         - persona file from ${PERSONA_FILE}
         - Variable: FINDING_JSON (complete finding object)

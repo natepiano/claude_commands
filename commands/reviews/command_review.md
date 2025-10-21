@@ -64,7 +64,7 @@ The main difference is how each phase handles validation failures:
     - investigate: Launch deeper investigation
 
     **For REVISE verdicts:**
-    - agree: Apply the revised improvements
+    - improve: Apply the revised improvements
     - skip: Skip this improvement and continue
     - investigate: Launch deeper investigation
 
@@ -73,6 +73,16 @@ The main difference is how each phase handles validation failures:
     - override: Apply the improvement despite the recommendation
     - investigate: Launch investigation to reconsider
 </ReviewKeywords>
+
+<FormatKeywords>
+**Route to appropriate keywords based on verdict:**
+
+If verdict is "ENHANCE" or "REVISE":
+    Use <CommandEnhanceKeywords/> from shared review_commands.md
+
+If verdict is "SOLID":
+    Use <CommandSolidKeywords/> from shared review_commands.md
+</FormatKeywords>
 
 <ReviewFollowupParameters>
     When using ReviewFollowup from review_commands.md, substitute:

@@ -91,6 +91,16 @@ The main difference is how each phase handles validation failures:
     - investigate: Launch investigation to reconsider
 </ReviewKeywords>
 
+<FormatKeywords>
+**Route to appropriate keywords based on verdict:**
+
+If verdict is "FIX RECOMMENDED" or "FIX MODIFIED":
+    Use <CodeFixKeywords/> from shared review_commands.md
+
+If verdict is "FIX NOT RECOMMENDED":
+    Use <CodeNoFixKeywords/> from shared review_commands.md
+</FormatKeywords>
+
 <ReviewFollowupParameters>
     When using ReviewFollowup from review_commands.md, substitute:
     - [EXPECTED_VERDICTS]: FIX RECOMMENDED, FIX MODIFIED, or FIX NOT RECOMMENDED

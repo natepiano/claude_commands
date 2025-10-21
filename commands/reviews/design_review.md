@@ -83,6 +83,16 @@ The main difference is how each phase handles validation failures:
     - investigate: Challenge the rejection and investigate further
 </ReviewKeywords>
 
+<FormatKeywords>
+**Route to appropriate keywords based on verdict:**
+
+If verdict is "CONFIRMED" or "MODIFIED":
+    Use <DesignConfirmedKeywords/> from shared review_commands.md
+
+If verdict is "REJECTED":
+    Use <DesignRejectedKeywords/> from shared review_commands.md
+</FormatKeywords>
+
 <ReviewFollowupParameters>
     When using ReviewFollowup from review_commands.md, substitute:
     - EXPECTED_VERDICTS: CONFIRMED, MODIFIED, or REJECTED

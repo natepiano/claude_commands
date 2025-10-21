@@ -174,7 +174,7 @@ if [ $CHECK_RESULT -eq 0 ]; then
     # Add agent context for bevy_brp project - use systemMessage since additionalContext may not work
     if [ "$SHOW_ADDITIONAL_CONTEXT" = true ]; then
         USER_MESSAGE="${USER_MESSAGE} 🔧 MCP changes require reinstall"
-        AGENT_MESSAGE="${AGENT_MESSAGE}\\nℹ️  MCP Tool Changes Detected:\\nChanges will not be testable until the agent runs \`cargo install --path mcp --features mcp-debug\`\\nand asks the user to do \`/mcp reconnect brp\`\\n"
+        AGENT_MESSAGE="${AGENT_MESSAGE}\\nℹ️  MCP Tool Changes Detected:\\nChanges will not be testable until the agent runs \`cargo install --path mcp\`\\nand asks the user to do \`/mcp reconnect brp\`\\n"
     fi
 else
     # Check failed - build detailed error message for agent only

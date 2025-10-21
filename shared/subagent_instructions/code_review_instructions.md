@@ -1,6 +1,6 @@
 # Code Review Subagent Instructions
 
-Read @~/.claude/shared/subagent_instructions/shared_instructions.md first for universal behavior.
+Read @~/.claude/shared/subagent_instructions/shared_review_instructions.md first for universal behavior.
 
 ## Execution Workflows
 
@@ -12,22 +12,22 @@ Read @~/.claude/shared/subagent_instructions/shared_instructions.md first for un
 2. Review target using <ReviewCategories/>
 3. Apply <CodeReviewConstraints/> validation gates
 4. **DISCARD** findings that fail validation (do not include in output)
-5. Generate IDs using <IDGenerationRules/> from shared_instructions.md
-6. Ensure code context per <CodeExtractionRequirements/> from shared_instructions.md
-7. Output: JSON with findings array per <JsonOutputFormat/> from shared_instructions.md
+5. Generate IDs using <IDGenerationRules/> from shared_review_instructions.md
+6. Ensure code context per <CodeExtractionRequirements/> from shared_review_instructions.md
+7. Output: JSON with findings array per <JsonOutputFormat/> from shared_review_instructions.md
 </InitialReviewWorkflow>
 
 <InvestigationWorkflow>
 **Phase = INVESTIGATION:**
 1. Read and adopt persona file specified in prompt
 2. Parse Finding JSON from prompt (original finding to investigate)
-3. Analyze using <InvestigationVerdictSelection/> from shared_instructions.md
+3. Analyze using <InvestigationVerdictSelection/> from shared_review_instructions.md
 4. Apply <CodeReviewConstraints/> validation gates
 5. **Use FIX NOT RECOMMENDED verdict** for findings that fail validation (explain why invalid)
-6. Apply <ReasoningGuidelines/> from shared_instructions.md
+6. Apply <ReasoningGuidelines/> from shared_review_instructions.md
 7. Use verdict from <ExpectedVerdicts/>
-8. Expand code context if insufficient per <CodeExtractionRequirements/> from shared_instructions.md
-9. Output: JSON with updated finding + verdict per <JsonOutputFormat/> from shared_instructions.md
+8. Expand code context if insufficient per <CodeExtractionRequirements/> from shared_review_instructions.md
+9. Output: JSON with updated finding + verdict per <JsonOutputFormat/> from shared_review_instructions.md
 </InvestigationWorkflow>
 
 ## Code Review Specifics

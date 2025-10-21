@@ -1,6 +1,6 @@
 # Design Review Subagent Instructions
 
-Read @~/.claude/shared/subagent_instructions/shared_instructions.md first for universal behavior.
+Read @~/.claude/shared/subagent_instructions/shared_review_instructions.md first for universal behavior.
 
 ## Execution Workflows
 
@@ -14,21 +14,21 @@ Read @~/.claude/shared/subagent_instructions/shared_instructions.md first for un
 4. Apply <FindingValidationGates/> from <DesignReviewConstraints/>
 5. **DISCARD** findings that fail validation (do not include in output)
 6. Perform <RedundancyChecks/> for each potential finding per <GrepForPlanRedundancy/>
-7. Generate IDs using <IDGenerationRules/> from shared_instructions.md
-9. Output: JSON with findings array per <JsonOutputFormat/> from shared_instructions.md
+7. Generate IDs using <IDGenerationRules/> from shared_review_instructions.md
+9. Output: JSON with findings array per <JsonOutputFormat/> from shared_review_instructions.md
 </InitialReviewWorkflow>
 
 <InvestigationWorkflow>
 **Phase = INVESTIGATION:**
 1. Read and adopt persona file specified in prompt
 2. Parse Finding JSON from prompt (original finding to investigate)
-3. Analyze using <InvestigationVerdictSelection/> from shared_instructions.md
+3. Analyze using <InvestigationVerdictSelection/> from shared_review_instructions.md
 4. Apply <FindingValidationGates/> from <DesignReviewConstraints/>
 5. **Use REJECTED verdict** for findings that fail validation (explain why invalid)
 6. Perform <RedundancyChecks/> per <GrepForPlanRedundancy/> - if plan addresses, verdict must be REJECTED
-7. Apply <ReasoningGuidelines/> from shared_instructions.md
+7. Apply <ReasoningGuidelines/> from shared_review_instructions.md
 8. Use verdict from <ExpectedVerdicts/>
-9. Output: JSON with updated finding + verdict per <JsonOutputFormat/> from shared_instructions.md
+9. Output: JSON with updated finding + verdict per <JsonOutputFormat/> from shared_review_instructions.md
 </InvestigationWorkflow>
 
 ## Design Review Specifics

@@ -4,7 +4,7 @@ I'll adopt the AI Command Expert persona.
 
 @~/.claude/shared/personas/ai_command_expert_persona.md
 
-The following constraints provide guidance on how I think and approach problems as this persona:
+The following instructions file contains a section <CommandReviewConstraints/> that provides guidance on how I think and approach problems as this persona. Only use the constraints and ignore the rest of the execution instructions.
 
 @~/.claude/shared/subagent_instructions/command_review_instructions.md
 
