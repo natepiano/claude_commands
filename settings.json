@@ -7,7 +7,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "~/.claude/scripts/post-tool-use-random-ack.sh --hook"
+            "command": "~/.claude/hooks/post-tool-use-random-ack.sh --hook"
           }
         ]
       },
@@ -16,11 +16,11 @@
         "hooks": [
           {
             "type": "command",
-            "command": "~/.claude/scripts/post-tool-use-cargo-check.sh"
+            "command": "~/.claude/hooks/post-tool-use-cargo-check.sh"
           },
           {
             "type": "command",
-            "command": "python3 ~/.claude/scripts/post-tool-use-basedpyright.py"
+            "command": "python3 ~/.claude/hooks/post-tool-use-basedpyright.py"
           }
         ]
       }
