@@ -1,23 +1,20 @@
-# Ignore everything
-*
+# Claude Code system directories
+.claude/
+debug/
+file-history/
+session-env/
+shell-snapshots/
+statsig/
+todos/
+ide/
+plugins/
+projects/
 
-# But track these specific files/folders
-!.claude/
-!.claude/**
-!agents/
-!agents/**
-!bevy_migration/
-!bevy_migration/**
-!commands/
-!commands/**
-!config/
-!config/**
-!scripts/
-!scripts/**
+# Conversation history
+history.jsonl
+
+# Python cache
 scripts/__pycache__/
-!shared/
-!shared/**
-!CLAUDE.md
-!settings.json
-!.gitignore
-!README.md
+
+# macOS system files
+.DS_Store
