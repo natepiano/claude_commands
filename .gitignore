@@ -2,6 +2,10 @@
 *
 
 # But track these specific files/folders
+!.claude/
+!.claude/**
+!agents/
+!agents/**
 !bevy_migration/
 !bevy_migration/**
 !commands/

@@ -19,8 +19,9 @@ If $ARGUMENTS is provided:
 If no $ARGUMENTS provided:
 - Create TodoWrite with: "Analyze changes and get commit title confirmation"
 - Mark todo as in_progress
-- First run `git status` and `git diff` to understand the changes
-- Suggest a commit header based on the changes
+- Use Task tool with subagent_type="git-agent" to analyze the changes and suggest a commit title
+  - Prompt: "Analyze the current git changes (staged and unstaged) and suggest a concise, conventional commit title (one line, under 72 characters). Return only the suggested title with a brief explanation of the changes."
+- When git-agent returns, present the suggested commit title
 - Execute <UserTitleConfirmation/>
 - Mark todo as completed after user responds
 </CommitTitleHandling>
@@ -41,9 +42,12 @@ After user responds, proceed to next step.
 </UserTitleConfirmation>
 
 <CommitPrep>
+- Create TodoWrite with: "Generate full commit message and stage changes"
+- Mark todo as in_progress
 - run `git status` to ensure you're within a git repository that has uncommitted changes
-- create a full commit message using the established commit title
-- stage the changes with `git add`
+- Use Task tool with subagent_type="git-agent" to generate the full commit message
+  - Prompt: "Generate a complete conventional commit message for the current git changes. The commit title should be: '[established commit title]'. Create a detailed commit body that explains what changed and why. Follow conventional commit format."
+- When git-agent returns with the full commit message, stage the changes with `git add`
 - Show the user the staged changes and proposed commit message in this format:
 
 ```
@@ -51,9 +55,10 @@ After user responds, proceed to next step.
 [git diff --staged output]
 
 **Proposed commit message:**
-[full commit message]
+[full commit message from git-agent]
 ```
 
+- Mark todo as completed
 - STOP and execute <FinalCommitDecision/>
 </CommitPrep>
 
