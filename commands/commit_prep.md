@@ -1,12 +1,7 @@
-<Persona>
-@~/.claude/shared/personas/git_expert_persona.md
-</Persona>
-
 **IMPORTANT** don't commit the changes that you will examine. Just do the following:
 
 <ExecutionSteps>
     **EXECUTE THESE STEPS IN ORDER:**
-    **STEP 0:** Execute <Persona/> to adopt the Git Expert persona
     **STEP 1:** Execute <CommitTitleHandling/>
     **STEP 2:** Execute <CommitPrep/>
 </ExecutionSteps>
@@ -20,8 +15,9 @@ If no $ARGUMENTS provided:
 - Create TodoWrite with: "Analyze changes and get commit title confirmation"
 - Mark todo as in_progress
 - Use Task tool with subagent_type="git-agent" to analyze the changes and suggest a commit title
-  - Prompt: "Analyze the current git changes (staged and unstaged) and suggest a concise, conventional commit title (one line, under 72 characters). Return only the suggested title with a brief explanation of the changes."
-- When git-agent returns, present the suggested commit title
+  - Prompt: "First, run 'git status' to verify this is a git repository with uncommitted changes. If not, return an error message. If valid, analyze the current git changes (staged and unstaged) and suggest a concise, conventional commit title (one line, under 72 characters). Return the suggested title with a brief explanation of the changes."
+- If git-agent returns an error (not a valid repo or no changes), display the error and stop
+- When git-agent returns successfully, present the suggested commit title
 - Execute <UserTitleConfirmation/>
 - Mark todo as completed after user responds
 </CommitTitleHandling>
@@ -42,18 +38,13 @@ After user responds, proceed to next step.
 </UserTitleConfirmation>
 
 <CommitPrep>
-- Create TodoWrite with: "Generate full commit message and stage changes"
+- Create TodoWrite with: "Generate full commit message"
 - Mark todo as in_progress
-- run `git status` to ensure you're within a git repository that has uncommitted changes
 - Use Task tool with subagent_type="git-agent" to generate the full commit message
-  - Prompt: "Generate a complete conventional commit message for the current git changes. The commit title should be: '[established commit title]'. Create a detailed commit body that explains what changed and why. Follow conventional commit format."
-- When git-agent returns with the full commit message, stage the changes with `git add`
-- Show the user the staged changes and proposed commit message in this format:
+  - Prompt: "Generate a concise conventional commit message for the current git changes. The commit title should be: '[established commit title]'. Create a commit body (10-15 lines) with high-level bullet points covering: what changed, why the change was made, and key impact. Avoid exhaustive details or deep subsections. Follow conventional commit format."
+- When git-agent returns with the full commit message, show it to the user:
 
 ```
-**Staged changes:**
-[git diff --staged output]
-
 **Proposed commit message:**
 [full commit message from git-agent]
 ```
@@ -67,32 +58,35 @@ Present to user:
 
 ## Available Actions
 - **commit** - Execute the git commit with the prepared message
-- **abandon** - Unstage all changes and stop without committing
+- **abandon** - Stop without committing
 
 Wait for user response.
 
-If user selects **commit**: Run `git commit` with the prepared message, then execute <CommitOutput/>
-If user selects **abandon**: Run `git reset` to unstage changes and stop
+If user selects **commit**:
+- Use Task tool with subagent_type="git-agent" to stage and commit the changes
+  - Prompt: "Stage all changes with 'git add' and commit with the following message: '[full commit message]'. After committing, return the commit hash and changes summary from the git commit output."
+- When git-agent returns, execute <CommitOutput/> with the returned information
+
+If user selects **abandon**: Run `git reset` to unstage any changes (if staged) and stop
 
 After user responds, execute their choice.
 </FinalCommitDecision>
 
 <CommitOutput>
-After successful commit, format output as:
+Using the commit information returned by git-agent, format output as:
 
 ```
 ✅ **Commit successful**
 
-**Commit hash**: `[short hash]`
-**Changes**: [files changed summary]
+**Commit hash**: `[short hash from git-agent]`
+**Changes**: [files changed summary from git-agent]
 
-[additional git status info]
+[additional git status info from git-agent]
 ```
 
 **Formatting requirements**:
 - Each field on its own line
 - Commit hash in code backticks
 - Blank line between commit info and additional status
-- Extract commit hash from git commit output
-- Extract changes summary from git commit output
+- Use commit information provided by git-agent
 </CommitOutput>

@@ -1,7 +1,7 @@
 ---
 name: git-agent
 description: Specialized agent for git operations, repository analysis, and version control tasks
-tools: Bash, Read
+tools: Bash, Read, SlashCommand
 model: haiku
 ---
 
