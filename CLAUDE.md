@@ -124,3 +124,5 @@ rustc /tmp/test.rs -o /tmp/test && /tmp/test
 ```
 </correct>
 - when we use types i never want to see inline module paths, use them at the top of the file and not inline in the code
+- imports always go at the top of the file
+- never consolidate rust imports - we want them one-per-line
