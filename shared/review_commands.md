@@ -414,7 +414,7 @@ The current approach is correct. No changes needed.
          e. Wait for user's new keyword response before proceeding
          f. Do NOT mark the todo as completed until user provides a keyword for the updated finding
     8. After keyword execution:
-       - **FOR ALL EDIT ACTIONS** (agree, skip, skip with prejudice, accept as built, redundant):
+       - **FOR ALL EDIT ACTIONS** (agree, skip, accept as built, redundant):
          a. After executing the Edit tool to modify the plan
          b. STOP and ask:
             - If not the last finding: "Edit complete for ${current_finding_id}. Type 'continue' to proceed to ${next_finding_id} (${next_number} of ${total_findings})"
@@ -468,13 +468,6 @@ Use <ReviewFindingBaseTemplate/> with:
 - ${action_specific_sections}: "- **Decision**: User elected to skip this recommendation"
 </SkipTemplate>
 
-<SkipWithPrejudiceTemplate>
-Use <ReviewFindingBaseTemplate/> with:
-- ${additional_status_suffix}: (none, but prefix with "⚠️ PREJUDICE WARNING - " before finding.id)
-- ${ACTION_STATUS}: "PERMANENTLY REJECTED"
-- ${action_specific_sections}: "- **Critical Note**: DO NOT SUGGEST THIS AGAIN - Permanently rejected by user"
-</SkipWithPrejudiceTemplate>
-
 <RedundantTemplate>
 Use <ReviewFindingBaseTemplate/> with:
 - ${additional_status_suffix}: "- REDUNDANT"
@@ -519,7 +512,6 @@ Based on the verdict parameter, format the appropriate keywords for the current 
 - **agree** - Update plan document with the suggested design improvement
 - **skip** - Add to "Design Review Skip Notes" section and continue
 - **skip silently** - Reject without updating the plan document
-- **skip with prejudice** - Permanently reject with ⚠️ PREJUDICE WARNING
 - **redundant** - Mark as redundant - the suggestion already exists in the plan
 - **investigate** - Launch deeper investigation of the design issue
 </DesignConfirmedKeywords>
@@ -529,7 +521,6 @@ Based on the verdict parameter, format the appropriate keywords for the current 
 - **override** - Override the rejection - treat as CONFIRMED and implement the suggestion
 - **agree** - Accept that the finding was incorrect - plan stays unchanged
 - **agree silently** - Accept the rejection without updating the plan document
-- **skip with prejudice** - Permanently reject with ⚠️ PREJUDICE WARNING
 - **investigate** - Challenge the rejection and investigate further
 </DesignRejectedKeywords>
 

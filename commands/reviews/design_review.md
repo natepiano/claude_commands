@@ -63,7 +63,6 @@ The main difference is how each phase handles validation failures:
     - agree: Implement the confirmed design improvement
     - skip: Reject the suggestion - add to Skip Notes and continue
     - skip silently: Reject without updating the plan document
-    - skip with prejudice: Permanently reject with ⚠️ PREJUDICE WARNING
     - redundant: Mark as redundant - the suggestion already exists in the plan
     - investigate: Launch deeper investigation of the design issue
 
@@ -71,7 +70,6 @@ The main difference is how each phase handles validation failures:
     - agree: Implement the modified version of the suggestion
     - skip: Reject the modified suggestion - add to Skip Notes and continue
     - skip silently: Reject without updating the plan document
-    - skip with prejudice: Permanently reject with ⚠️ PREJUDICE WARNING
     - redundant: Mark as redundant - the suggestion already exists in the plan
     - investigate: Launch deeper investigation of alternatives
 
@@ -79,7 +77,6 @@ The main difference is how each phase handles validation failures:
     - override: Override the rejection - treat as CONFIRMED and implement the suggestion
     - agree: Accept that the finding was incorrect - plan stays unchanged (default)
     - agree silently: Accept the rejection without updating the plan document
-    - skip with prejudice: Permanently reject with ⚠️ PREJUDICE WARNING
     - investigate: Challenge the rejection and investigate further
 </ReviewKeywords>
 
@@ -108,7 +105,6 @@ If verdict is "REJECTED":
     - **override**: (For REJECTED verdicts) Use Edit tool to update the plan document directly with the suggested changes (no verdict sections added) - treat as if verdict was CONFIRMED
     - **skip**: Use Edit tool to add to "Design Review Skip Notes" section using <SkipTemplate/> format from review_commands.md
     - **skip silently**: Skip without any plan updates - continue to next finding
-    - **skip with prejudice**: Use Edit tool to add to "Design Review Skip Notes" section using <SkipWithPrejudiceTemplate/> format from review_commands.md
     - **redundant**: Use Edit tool to add to "Design Review Skip Notes" section using <RedundantTemplate/> format from review_commands.md (only for CONFIRMED/MODIFIED verdicts)
     - **investigate**: Ask user "What specific aspect would you like me to investigate?", then launch Task tool with their focus
 </KeywordExecution>

@@ -64,7 +64,6 @@ After reading the plan document, you MUST:
    - Whether it affects the original plan or is a new suggestion
 
 3. Interpret findings CONTEXTUALLY:
-   - **PREJUDICE WARNING**: Read the issue description - it might be rejecting a SUGGESTION to change something already approved, not rejecting the feature itself
    - **SKIPPED**: Understand if this skips a suggested modification or an entire feature
    - **APPROVED**: This adds or modifies something - implement the approved version
    - **ACCEPTED AS BUILT**: The implementation differs from plan but was accepted - don't change it
@@ -134,27 +133,22 @@ Exception: Code you just added that you'll use immediately
 
 **Key Interpretation Patterns**:
 
-1. **PREJUDICE WARNING**: Rejects suggestions about approved features
-   - IMPLEMENT: Original approved feature (it was already approved)
-   - DON'T: The suggested change that was rejected
-   - Example: If warning rejects "use enum instead of string", implement the string approach
-
-2. **SKIPPED**: Declines additional suggestions beyond plan scope
+1. **SKIPPED**: Declines additional suggestions beyond plan scope
    - IMPLEMENT: Feature as originally planned
    - DON'T: The extra suggestions that were skipped
    - Example: If extra validation skipped, implement without that validation
 
-3. **APPROVED**: Modifies original plan with new approach
+2. **APPROVED**: Modifies original plan with new approach
    - IMPLEMENT: The approved modified version
    - DON'T: Original plan approach that was replaced
    - Example: If WrapperType::detect approved over string matching, use WrapperType::detect
 
-4. **ACCEPTED AS BUILT**: Implementation differs from plan but accepted
+3. **ACCEPTED AS BUILT**: Implementation differs from plan but accepted
    - DON'T CHANGE: Keep the existing implementation
    - The deviation was reviewed and accepted
    - Example: If callback pattern accepted over planned async/await, keep callbacks
 
-5. **PREJUDICE WARNING about reverting**: Rejects removing something already done
+4. **PREJUDICE WARNING about reverting**: Rejects removing something already done
    - KEEP: The existing implementation that someone suggested removing
    - This doesn't create new todos - the feature is already correct
    - Example: If warning about removing error handling, the error handling stays

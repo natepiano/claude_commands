@@ -140,8 +140,7 @@ Internally identify any domain-specific terms and their meaning in THIS plan's c
 Check for a "Design Review Skip Notes" section in the document:
 1. Read every single skipped item to understand rejection reasons
 2. Cross-reference your ideas against previously rejected concepts
-3. Do not re-suggest items marked with "⚠️ PREJUDICE WARNING"
-4. Only proceed after confirming recommendations don't duplicate rejected items
+3. Only proceed after confirming recommendations don't duplicate rejected items
 </SkipNotesCheck>
 
 <FindingValidationGates>
@@ -179,7 +178,6 @@ For EACH potential finding, verify all gates. The calling workflow determines wh
 
 **Gate 5: Not In Skip Notes**
 - Check if this suggestion appears in "Design Review Skip Notes"
-- Verify not marked with "⚠️ PREJUDICE WARNING"
 - Confirm not previously rejected
 
 **Gate 6: Actual Problem**
