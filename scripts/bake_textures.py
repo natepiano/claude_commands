@@ -58,13 +58,13 @@ class BlenderMaterial(Protocol):
 # === CONFIGURATION LOADING ===
 
 
-def get_config_path() -> str:
-    """Extract config path from command line or use default"""
+def get_config_path() -> str | None:
+    """Extract config path from command line"""
     if "--" in sys.argv:
         idx = sys.argv.index("--")
         if idx + 1 < len(sys.argv):
             return sys.argv[idx + 1]
-    return str(Path.home() / ".claude/commands/blender/bake_textures.json")
+    return None
 
 
 def resolve_path(path: str, base_dir: str) -> str:
@@ -122,18 +122,34 @@ def get_image_for_mode(map_name: str, obj_name: str | None) -> Any:
         return created_images.get(map_name)
 
 
-def load_configuration() -> ConfigDict:
-    """Load and validate configuration from command line or default path"""
-    config_path = os.path.abspath(get_config_path())
+def load_configuration() -> tuple[ConfigDict, str]:
+    """Load and validate configuration from command line
+
+    Returns:
+        Tuple of (config dict, config directory path)
+    """
+    config_path_str = get_config_path()
+
+    if config_path_str is None:
+        example_path = Path.home() / ".claude/config/bake_textures_example.json"
+        print("ERROR: No configuration file specified")
+        print("\nUsage:")
+        print("  blender --background --python bake_textures.py -- /path/to/your_config.json")
+        print(f"\nExample configuration available at:")
+        print(f"  {example_path}")
+        print("\nCopy and modify the example to create your own configuration.")
+        sys.exit(1)
+
+    config_path = os.path.abspath(config_path_str)
+    config_dir = os.path.dirname(config_path)
     print(f"Loading configuration from: {config_path}")
 
     try:
         with open(config_path) as f:
             config: ConfigDict = json.load(f)
-        return config
+        return config, config_dir
     except FileNotFoundError:
         print(f"ERROR: Configuration file not found at {config_path}")
-        print("Usage: python bake_textures.py [path/to/bake_textures.json]")
         sys.exit(1)
     except json.JSONDecodeError as e:
         print(f"ERROR: Invalid JSON in configuration file: {e}")
@@ -143,8 +159,7 @@ def load_configuration() -> ConfigDict:
 # === GLOBAL STATE ===
 # (Loaded once at startup)
 
-config = load_configuration()
-config_dir = os.path.dirname(os.path.abspath(get_config_path()))
+config, config_dir = load_configuration()
 
 # Resolve paths
 blend_file = resolve_path(config["blend_file"], config_dir)

@@ -1,13 +1,13 @@
 {
-  "blend_file": "/Users/natemccoy/rust/Jack1_4/jack.blend",
-  "objects": ["jack_body_nut"],
-  "output_name": "chrome_jack",
-  "texture_resolution": 512,
-  "output_directory": "/Users/natemccoy/rust/hana-brp-extras-2-1/crates/hana/assets/models/chrome_jack",
+  "blend_file": "./path/to/your/model.blend",
+  "objects": ["object_name_1", "object_name_2"],
+  "output_name": "my_model",
+  "texture_resolution": 1024,
+  "output_directory": "./output",
   "settings": {
     "bake_margin": 16,
     "use_gpu": true,
-    "export_individual_textures": true,
+    "bake_separate_per_object": true,
     "export_metallic_roughness_packed": true,
     "save_individual_metallic_roughness": false,
     "export_glb": true
