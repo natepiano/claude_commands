@@ -29,9 +29,39 @@ usage() {
     echo "  --add, -a <name>     Add MCP server from config"
     echo "  --remove, -r <name>  Remove MCP server from config"
     echo ""
-    echo "Available servers (defined in ~/.claude/config/mcp.json):"
+
+    # Show currently configured servers
+    echo -e "${GREEN}Currently configured servers:${NC}"
+    if [ -f "$CONFIG_FILE" ]; then
+        CONFIGURED=$(jq -r '.mcpServers // {} | keys[]' "$CONFIG_FILE" 2>/dev/null)
+        if [ -n "$CONFIGURED" ]; then
+            echo "$CONFIGURED" | sed 's/^/  ✓ /'
+        else
+            echo "  (none)"
+        fi
+    else
+        echo "  (config file not found)"
+    fi
+    echo ""
+
+    # Show available servers
+    echo -e "${BLUE}Available servers (defined in ~/.claude/config/mcp.json):${NC}"
     if [ -f "$MCP_CONFIG_FILE" ]; then
-        jq -r 'keys[]' "$MCP_CONFIG_FILE" 2>/dev/null | sed 's/^/  - /' || echo "  (unable to list servers)"
+        if [ -f "$CONFIG_FILE" ]; then
+            # Get configured servers for comparison
+            CONFIGURED=$(jq -r '.mcpServers // {} | keys[]' "$CONFIG_FILE" 2>/dev/null || echo "")
+
+            # List all available servers with status
+            jq -r 'keys[]' "$MCP_CONFIG_FILE" 2>/dev/null | while read -r server; do
+                if echo "$CONFIGURED" | grep -q "^${server}$"; then
+                    echo "  ✓ $server (configured)"
+                else
+                    echo "  - $server"
+                fi
+            done
+        else
+            jq -r 'keys[]' "$MCP_CONFIG_FILE" 2>/dev/null | sed 's/^/  - /' || echo "  (unable to list servers)"
+        fi
     else
         echo "  (config file not found)"
     fi
