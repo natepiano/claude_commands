@@ -4,10 +4,13 @@ import json
 import os
 import platform
 import sys
+from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, TypedDict
+from typing import Any, Iterator, Protocol, TypedDict
 
-import bpy  # pyright: ignore[reportMissingImports]
+import bpy  # type: ignore[import-not-found]
+
+# === TYPE DEFINITIONS ===
 
 
 class ConfigDict(TypedDict):
@@ -20,52 +23,156 @@ class ConfigDict(TypedDict):
     texture_maps: dict[str, bool]
 
 
-# Get configuration path from command line argument or use default
-# In Blender, sys.argv includes all Blender's arguments
-# Arguments after '--' separator are for the script
-config_path: str | None = None
-if '--' in sys.argv:
-    idx = sys.argv.index('--')
-    if idx + 1 < len(sys.argv):
-        config_path = sys.argv[idx + 1]
+class BlenderObject(Protocol):
+    """Protocol for Blender objects"""
 
-if not config_path:
-    # Default path for backward compatibility
-    config_path = str(Path.home() / ".claude/commands/blender/bake_textures.json")
+    name: str
+    type: str
+    children: Any
+    material_slots: Any
+    data: Any
 
-# Convert to absolute path
-config_path = os.path.abspath(config_path)
-config_dir = os.path.dirname(config_path)
+    def select_set(self, state: bool) -> None: ...
 
-print(f"Loading configuration from: {config_path}")
 
-try:
-    with open(config_path) as f:
-        config: ConfigDict = json.load(f)  # pyright: ignore[reportAny]
-except FileNotFoundError:
-    print(f"ERROR: Configuration file not found at {config_path}")
-    print("Usage: python bake_textures.py [path/to/bake_textures.json]")
-    exit(1)
-except json.JSONDecodeError as e:
-    print(f"ERROR: Invalid JSON in configuration file: {e}")
-    exit(1)
+class BlenderImage(Protocol):
+    """Protocol for Blender images"""
 
-# Extract configuration - resolve relative paths from config directory
-blend_file: str = config['blend_file']
-if not os.path.isabs(blend_file):
-    blend_file = os.path.join(config_dir, blend_file)
-object_names: list[str] = config['objects']
-output_name: str = config['output_name']
-resolution: int = config['texture_resolution']
-output_dir: str = config['output_directory']
-if not os.path.isabs(output_dir):
-    output_dir = os.path.join(config_dir, output_dir)
-settings: dict[str, Any] = config['settings']
-texture_maps: dict[str, bool] = config['texture_maps']
+    name: str
+    size: tuple[int, int]
+    pixels: Any
+    filepath_raw: str
+    colorspace_settings: Any
 
-# Extract specific settings for clarity
-bake_separate_per_object: bool = settings.get('bake_separate_per_object', True)
-save_individual_metallic_roughness: bool = settings.get('save_individual_metallic_roughness', False)
+    def save(self) -> None: ...
+
+
+class BlenderMaterial(Protocol):
+    """Protocol for Blender materials"""
+
+    name: str
+    use_nodes: bool
+    node_tree: Any
+
+
+# === CONFIGURATION LOADING ===
+
+
+def get_config_path() -> str:
+    """Extract config path from command line or use default"""
+    if "--" in sys.argv:
+        idx = sys.argv.index("--")
+        if idx + 1 < len(sys.argv):
+            return sys.argv[idx + 1]
+    return str(Path.home() / ".claude/commands/blender/bake_textures.json")
+
+
+def resolve_path(path: str, base_dir: str) -> str:
+    """Resolve relative paths against base directory"""
+    if os.path.isabs(path):
+        return path
+    return os.path.join(base_dir, path)
+
+
+def generate_name(suffix: str, obj_name: str | None = None, extension: str = "") -> str:
+    """Generate consistent names for images, materials, files
+
+    Args:
+        suffix: The suffix/type (e.g., 'albedo', 'normal', 'baked')
+        obj_name: Object name for separate mode, None for combined mode
+        extension: Optional file extension (e.g., '.png')
+
+    Returns:
+        Formatted name string
+
+    Examples:
+        >>> generate_name("albedo", "donut", ".png")
+        "nateroid_donut_albedo.png"
+        >>> generate_name("baked", None)
+        "nateroid_baked"
+    """
+    # Note: output_name is a global variable set at module load time
+    if obj_name:
+        name = f"{output_name}_{obj_name}_{suffix}"
+    else:
+        name = f"{output_name}_{suffix}"
+    return f"{name}{extension}" if extension else name
+
+
+def get_image_for_mode(map_name: str, obj_name: str | None) -> Any:
+    """Get image from created_images based on mode
+
+    Args:
+        map_name: The texture map name (e.g., 'albedo', 'roughness', 'metallic')
+        obj_name: Object name for separate mode, None for combined mode
+
+    Returns:
+        Blender Image object or None
+
+    Examples:
+        >>> get_image_for_mode("albedo", "donut")  # separate mode
+        <Image 'nateroid_donut_albedo'>
+        >>> get_image_for_mode("albedo", None)  # combined mode
+        <Image 'nateroid_albedo'>
+    """
+    # Note: created_images is a global dict populated during image creation
+    if obj_name:
+        return created_images.get(obj_name, {}).get(map_name)
+    else:
+        return created_images.get(map_name)
+
+
+def load_configuration() -> ConfigDict:
+    """Load and validate configuration from command line or default path"""
+    config_path = os.path.abspath(get_config_path())
+    print(f"Loading configuration from: {config_path}")
+
+    try:
+        with open(config_path) as f:
+            config: ConfigDict = json.load(f)
+        return config
+    except FileNotFoundError:
+        print(f"ERROR: Configuration file not found at {config_path}")
+        print("Usage: python bake_textures.py [path/to/bake_textures.json]")
+        sys.exit(1)
+    except json.JSONDecodeError as e:
+        print(f"ERROR: Invalid JSON in configuration file: {e}")
+        sys.exit(1)
+
+
+# === GLOBAL STATE ===
+# (Loaded once at startup)
+
+config = load_configuration()
+config_dir = os.path.dirname(os.path.abspath(get_config_path()))
+
+# Resolve paths
+blend_file = resolve_path(config["blend_file"], config_dir)
+output_dir = resolve_path(config["output_directory"], config_dir)
+
+object_names: list[str] = config["objects"]
+output_name: str = config["output_name"]
+resolution: int = config["texture_resolution"]
+settings: dict[str, Any] = config["settings"]
+texture_maps: dict[str, bool] = config["texture_maps"]
+
+# Mode settings
+bake_separate_per_object: bool = settings.get("bake_separate_per_object", True)
+save_individual_metallic_roughness: bool = settings.get(
+    "save_individual_metallic_roughness", False
+)
+
+# Output paths
+output_path = Path(output_dir)
+textures_path = output_path / "textures"
+
+# Image storage
+# Separate mode: created_images[obj_name][map_name] = image
+# Combined mode: created_images[map_name] = image
+created_images: dict[str, Any] = {}
+
+# Selected objects (populated during setup)
+selected_objects: list[Any] = []
 
 print("\n=== Configuration ===")
 print(f"Blend file: {blend_file}")
@@ -73,259 +180,288 @@ print(f"Objects: {', '.join(object_names)}")
 print(f"Output name: {output_name}")
 print(f"Resolution: {resolution}x{resolution}")
 print(f"Output directory: {output_dir}")
-
-# Validate blend file exists
-if not os.path.exists(blend_file):
-    print(f"ERROR: Blend file not found: {blend_file}")
-    exit(1)
-
-# Create output directories
-output_path = Path(output_dir)
-textures_path = output_path / "textures"
-output_path.mkdir(parents=True, exist_ok=True)
-textures_path.mkdir(exist_ok=True)
-print(f"\nCreated output directories at: {output_path}")
-
-# Open blend file
-print(f"\nOpening blend file: {blend_file}")
-bpy.ops.wm.open_mainfile(filepath=blend_file)
-
-# Validate objects exist
-missing_objects = []
-for obj_name in object_names:
-    if obj_name not in bpy.data.objects:
-        missing_objects.append(obj_name)
-
-if missing_objects:
-    print(f"ERROR: Objects not found in scene: {', '.join(missing_objects)}")
-    available_meshes = [obj.name for obj in bpy.data.objects if obj.type == 'MESH']
-    print(f"Available objects: {', '.join(available_meshes)}")
-    exit(1)
-
-# Select target objects and their children
-bpy.ops.object.select_all(action='DESELECT')
+print(f"Mode: {'Separate per object' if bake_separate_per_object else 'Combined'}")
 
 
-def select_with_children(obj: Any) -> None:  # pyright: ignore[reportAny]
-    """Recursively select object and all its children"""
-    obj.select_set(True)
-    for child in obj.children:
-        select_with_children(child)
+# === BLENDER SETUP ===
 
 
-for obj_name in object_names:
-    obj = bpy.data.objects[obj_name]
-    select_with_children(obj)
-    bpy.context.view_layer.objects.active = obj
+def setup_blender_environment() -> None:
+    """Initialize Blender environment: open file, select objects, configure rendering"""
+    global selected_objects
 
-# Get list of all selected objects including children
-all_selected = [obj.name for obj in bpy.context.selected_objects]
-print(f"\nSelected objects for baking: {', '.join(all_selected)}")
+    # Validate blend file
+    if not os.path.exists(blend_file):
+        print(f"ERROR: Blend file not found: {blend_file}")
+        sys.exit(1)
 
-# Set a mesh object as active if the current active is not a mesh
-if bpy.context.view_layer.objects.active and bpy.context.view_layer.objects.active.type != 'MESH':
-    # Find first mesh object and make it active
-    for obj in bpy.context.selected_objects:
-        if obj.type == 'MESH':
-            bpy.context.view_layer.objects.active = obj
-            break
+    # Create output directories
+    output_path.mkdir(parents=True, exist_ok=True)
+    textures_path.mkdir(exist_ok=True)
+    print(f"\nCreated output directories at: {output_path}")
 
-# Set up rendering for baking
-bpy.context.scene.render.engine = 'CYCLES'
-bpy.context.scene.cycles.bake_margin = settings['bake_margin']
+    # Open blend file
+    print(f"\nOpening blend file: {blend_file}")
+    bpy.ops.wm.open_mainfile(filepath=blend_file)
 
-if settings['use_gpu']:
-    # Enable GPU rendering if available
-    prefs = bpy.context.preferences.addons['cycles'].preferences
-    # Detect platform and use appropriate device type
-    if platform.system() == 'Darwin':  # macOS
-        prefs.compute_device_type = 'METAL'
-    else:
-        prefs.compute_device_type = 'CUDA'
-    bpy.context.scene.cycles.device = 'GPU'
-    print("GPU rendering enabled")
+    # Validate objects exist
+    missing_objects = [name for name in object_names if name not in bpy.data.objects]
+    if missing_objects:
+        print(f"ERROR: Objects not found in scene: {', '.join(missing_objects)}")
+        available_meshes = [obj.name for obj in bpy.data.objects if obj.type == "MESH"]
+        print(f"Available objects: {', '.join(available_meshes)}")
+        sys.exit(1)
 
-# Get or create material for selected objects - ONLY MESH objects
-selected_objects = [obj for obj in bpy.context.selected_objects if obj.type == 'MESH']
-print(f"Mesh objects for baking: {[obj.name for obj in selected_objects]}")
-if bpy.context.view_layer.objects.active:
-    print(f"Current active object: {bpy.context.view_layer.objects.active.name}")
-else:
-    print("Current active object: None")
+    # Select target objects and their children
+    bpy.ops.object.select_all(action="DESELECT")
 
-# Ensure all objects have materials
-for obj in selected_objects:
-    if not obj.data.materials:
-        print(f"ERROR: Object {obj.name} has no material")
-        exit(1)
+    def select_with_children(obj: Any) -> None:
+        """Recursively select object and all its children"""
+        obj.select_set(True)
+        for child in obj.children:
+            select_with_children(child)
 
-# Ensure all objects have UV maps
-print("\n--- Checking UV Maps ---")
-for obj in selected_objects:
-    if not obj.data.uv_layers:
-        print(f"Creating UV map for {obj.name}")
+    for obj_name in object_names:
+        obj = bpy.data.objects[obj_name]
+        select_with_children(obj)
         bpy.context.view_layer.objects.active = obj
-        bpy.ops.object.mode_set(mode='EDIT')
-        bpy.ops.mesh.select_all(action='SELECT')
-        bpy.ops.uv.smart_project(angle_limit=66.0, island_margin=0.02)
-        bpy.ops.object.mode_set(mode='OBJECT')
-    else:
-        print(f"{obj.name} already has UV map: {obj.data.uv_layers[0].name}")
 
-# Determine baking mode
-bake_separate_per_object: bool = settings.get('bake_separate_per_object', False)
+    # Get list of all selected mesh objects
+    selected_objects = [
+        obj for obj in bpy.context.selected_objects if obj.type == "MESH"
+    ]
+    print(
+        f"\nSelected mesh objects for baking: {[obj.name for obj in selected_objects]}"
+    )
 
-# Create image textures for baking
-# Structure depends on baking mode:
-# - Separate: created_images[obj_name][map_name] = image
-# - Combined: created_images[map_name] = image
-created_images: dict[str, Any] = {}
+    # Set a mesh object as active
+    if selected_objects:
+        bpy.context.view_layer.objects.active = selected_objects[0]
+
+    # Configure rendering
+    bpy.context.scene.render.engine = "CYCLES"
+    bpy.context.scene.cycles.bake_margin = settings["bake_margin"]
+
+    if settings.get("use_gpu"):
+        prefs = bpy.context.preferences.addons["cycles"].preferences
+        if platform.system() == "Darwin":
+            prefs.compute_device_type = "METAL"
+        else:
+            prefs.compute_device_type = "CUDA"
+        bpy.context.scene.cycles.device = "GPU"
+        print("GPU rendering enabled")
+
+    # Validate materials
+    for obj in selected_objects:
+        if not obj.data.materials:
+            print(f"ERROR: Object {obj.name} has no material")
+            sys.exit(1)
+
+    # Ensure UV maps
+    print("\n--- Checking UV Maps ---")
+    for obj in selected_objects:
+        if not obj.data.uv_layers:
+            print(f"Creating UV map for {obj.name}")
+            bpy.context.view_layer.objects.active = obj
+            bpy.ops.object.mode_set(mode="EDIT")
+            bpy.ops.mesh.select_all(action="SELECT")
+            bpy.ops.uv.smart_project(angle_limit=66.0, island_margin=0.02)
+            bpy.ops.object.mode_set(mode="OBJECT")
+        else:
+            print(f"{obj.name} already has UV map: {obj.data.uv_layers[0].name}")
 
 
-def create_bake_image(map_name: str, color_space: str = 'sRGB', obj_name: str | None = None) -> Any:  # pyright: ignore[reportAny]
+# === LAYER 1: IMAGE MANAGEMENT ===
+
+
+def create_bake_image(map_name: str, obj_name: str | None = None) -> Any:
     """Create a new image for baking
 
     Args:
-        map_name: Type of texture map (e.g., 'albedo', 'normal')
-        color_space: Color space setting ('sRGB' or 'Non-Color')
-        obj_name: Object name (only used when bake_separate_per_object=True)
-    """
-    if bake_separate_per_object and obj_name:
-        img_name = f"{output_name}_{obj_name}_{map_name}"
-    else:
-        img_name = f"{output_name}_{map_name}"
+        map_name: Type of texture map (albedo, normal, roughness, metallic, ao)
+        obj_name: Object name (required in separate mode, None in combined mode)
 
+    Returns:
+        Blender Image object
+    """
+    # Determine image name
+    img_name = generate_name(map_name, obj_name)
+
+    # Determine color space
+    color_space = "sRGB" if map_name in ("albedo", "emission") else "Non-Color"
+
+    # Create image
     img = bpy.data.images.new(
         name=img_name,
         width=resolution,
         height=resolution,
-        float_buffer=(map_name == 'normal')
+        float_buffer=(map_name == "normal"),
     )
     img.colorspace_settings.name = color_space
 
     # Store in appropriate structure
-    if bake_separate_per_object and obj_name:
+    if obj_name:
         if obj_name not in created_images:
             created_images[obj_name] = {}
         created_images[obj_name][map_name] = img
     else:
         created_images[map_name] = img
 
-    print(f"Created image: {img_name} ({resolution}x{resolution}, {color_space})")
+    print(f"  Created: {img_name} ({resolution}x{resolution}, {color_space})")
     return img
 
 
-# Create images based on baking mode
-print(f"\n=== Creating Bake Images (mode: {'separate per object' if bake_separate_per_object else 'combined'}) ===")
+def get_bake_image(map_name: str, obj_name: str | None = None) -> Any | None:
+    """Get the appropriate bake image for a map type
 
-if bake_separate_per_object:
-    # Create separate images for each object
-    for obj in selected_objects:
-        print(f"\nImages for '{obj.name}':")
-        if texture_maps['albedo']:
-            create_bake_image('albedo', 'sRGB', obj.name)
-        if texture_maps['normal']:
-            create_bake_image('normal', 'Non-Color', obj.name)
+    Args:
+        map_name: Type of texture map
+        obj_name: Object name (used in separate mode)
 
-        if settings.get('export_metallic_roughness_packed', True):
-            if texture_maps['roughness']:
-                create_bake_image('roughness', 'Non-Color', obj.name)
-            if texture_maps['metallic']:
-                create_bake_image('metallic', 'Non-Color', obj.name)
-        else:
-            if texture_maps['roughness']:
-                create_bake_image('roughness', 'Non-Color', obj.name)
-            if texture_maps['metallic']:
-                create_bake_image('metallic', 'Non-Color', obj.name)
-
-        if texture_maps['ambient_occlusion']:
-            create_bake_image('ao', 'Non-Color', obj.name)
-        if texture_maps['emission']:
-            create_bake_image('emission', 'sRGB', obj.name)
-
-    total_images = sum(len(images) for images in created_images.values())
-    print(f"\nCreated {total_images} texture images for {len(created_images)} objects")
-else:
-    # Create shared images for all objects (original behavior)
-    print("\nShared images for all objects:")
-    if texture_maps['albedo']:
-        create_bake_image('albedo', 'sRGB')
-    if texture_maps['normal']:
-        create_bake_image('normal', 'Non-Color')
-
-    if settings.get('export_metallic_roughness_packed', True):
-        if texture_maps['roughness']:
-            create_bake_image('roughness', 'Non-Color')
-        if texture_maps['metallic']:
-            create_bake_image('metallic', 'Non-Color')
-    else:
-        if texture_maps['roughness']:
-            create_bake_image('roughness', 'Non-Color')
-        if texture_maps['metallic']:
-            create_bake_image('metallic', 'Non-Color')
-
-    if texture_maps['ambient_occlusion']:
-        create_bake_image('ao', 'Non-Color')
-    if texture_maps['emission']:
-        create_bake_image('emission', 'sRGB')
-
-    print(f"\nCreated {len(created_images)} shared texture images")
-
-
-# Helper functions for mode-aware image handling
-def get_bake_image(map_name: str, obj_name: str | None = None) -> Any:  # pyright: ignore[reportAny]
-    """Get the appropriate bake image based on mode"""
-    if bake_separate_per_object and obj_name:
+    Returns:
+        Blender Image object or None if not found
+    """
+    if obj_name:
         return created_images.get(obj_name, {}).get(map_name)
     else:
         return created_images.get(map_name)
 
 
-def save_bake_image(image: Any, map_name: str, obj_name: str | None = None) -> None:  # pyright: ignore[reportAny]
-    """Save the bake image with appropriate filename"""
-    if bake_separate_per_object and obj_name:
-        filename = f"{output_name}_{obj_name}_{map_name}.png"
-    else:
-        filename = f"{output_name}_{map_name}.png"
+def save_bake_image(image: Any, map_name: str, obj_name: str | None = None) -> None:
+    """Save a baked image to disk
+
+    Args:
+        image: Blender Image object
+        map_name: Type of texture map
+        obj_name: Object name (used in separate mode)
+    """
+    filename = generate_name(map_name, obj_name, ".png")
+
     image.filepath_raw = str(textures_path / filename)
     image.save()
-    print(f"Saved: {image.filepath_raw}")
+    print(f"  Saved: {image.filepath_raw}")
 
 
-# Setup material nodes for baking
-def setup_bake_nodes(material: Any, image: Any) -> Any:  # pyright: ignore[reportAny]
-    """Add image texture node for baking"""
+# === LAYER 2: PRIMITIVE BAKING OPERATIONS ===
+
+
+def setup_bake_nodes(material: Any, image: Any) -> Any:
+    """Add image texture node for baking to a material
+
+    Args:
+        material: Blender Material
+        image: Blender Image to bake to
+
+    Returns:
+        Created image texture node
+    """
     nodes = material.node_tree.nodes
-
-    # Create image texture node
-    img_node = nodes.new(type='ShaderNodeTexImage')
+    img_node = nodes.new(type="ShaderNodeTexImage")
     img_node.image = image
-    img_node.location = (-400, 0)
     img_node.select = True
     nodes.active = img_node
-
     return img_node
 
 
-# Core baking helper functions
-def fill_image_with_value(img: Any, value: float) -> None:  # pyright: ignore[reportAny]
-    """Fill an image with a solid scalar value - avoids circular dependencies"""
-    # Create flat list of pixel values (RGBA)
-    pixel_count = img.size[0] * img.size[1]
-    pixels = [value, value, value, 1.0] * pixel_count
-    img.pixels = pixels
+@contextmanager
+def bake_nodes_context(
+    materials: list[Any], img: Any
+) -> Iterator[list[tuple[Any, Any]]]:
+    """Context manager for bake node setup and cleanup
+
+    Args:
+        materials: List of Blender Materials
+        img: Blender Image to bake to
+
+    Yields:
+        List of (material, bake_node) tuples
+    """
+    bake_nodes: list[tuple[Any, Any]] = []
+    try:
+        for mat in materials:
+            bake_node = setup_bake_nodes(mat, img)
+            bake_nodes.append((mat, bake_node))
+        yield bake_nodes
+    finally:
+        for mat, bake_node in bake_nodes:
+            mat.node_tree.nodes.remove(bake_node)
 
 
-def bake_with_emission_workaround(
-    obj: Any,  # pyright: ignore[reportAny]
-    img: Any,  # pyright: ignore[reportAny]
-    source_input_name: str,
-) -> None:
-    """Bake using emission workaround for non-bake properties like albedo or metallic"""
-    # Set up emission for ALL materials before baking
-    temp_nodes = []
-    bake_nodes = []
+def select_only(obj: Any) -> None:
+    """Select only the specified object, deselecting all others"""
+    bpy.ops.object.select_all(action="DESELECT")
+    obj.select_set(True)
+    bpy.context.view_layer.objects.active = obj
 
+
+def select_all(objects: list[Any]) -> None:
+    """Select all specified objects"""
+    bpy.ops.object.select_all(action="DESELECT")
+    for obj in objects:
+        obj.select_set(True)
+    if objects:
+        bpy.context.view_layer.objects.active = objects[0]
+
+
+def bake_object_to_image(obj: Any, img: Any, map_type: str) -> None:
+    """Bake a standard map type for one object to an image
+
+    This handles albedo, normal, roughness, and metallic.
+    AO requires special handling (see bake_ao_separate/combined).
+
+    Args:
+        obj: Blender Object to bake
+        img: Blender Image to bake to
+        map_type: Type of map (albedo, normal, roughness, metallic)
+    """
+    select_only(obj)
+
+    if map_type == "albedo":
+        bake_with_emission_workaround(obj, img, "Base Color")
+    elif map_type == "normal":
+        bake_simple(obj, img, "NORMAL")
+    elif map_type in ("roughness", "metallic"):
+        bake_with_emission_workaround(obj, img, map_type.title())
+    else:
+        print(f"  WARNING: Unknown map type '{map_type}'")
+
+
+def bake_simple(obj: Any, img: Any, bake_type: str) -> None:
+    """Simple bake operation for types that support direct baking
+
+    Args:
+        obj: Blender Object
+        img: Blender Image
+        bake_type: Blender bake type (NORMAL, ROUGHNESS, DIFFUSE, etc.)
+    """
+    materials = [slot.material for slot in obj.material_slots if slot.material]
+    with bake_nodes_context(materials, img):
+        # Bake
+        if bake_type == "NORMAL":
+            bpy.ops.object.bake(type="NORMAL", normal_space="TANGENT")
+        elif bake_type == "ROUGHNESS":
+            bpy.ops.object.bake(type="ROUGHNESS")
+        elif bake_type == "DIFFUSE":
+            bpy.ops.object.bake(type="DIFFUSE")
+        elif bake_type == "METALLIC":
+            bpy.ops.object.bake(type="METALLIC")
+        else:
+            bpy.ops.object.bake(type=bake_type)
+
+
+def bake_with_emission_workaround(obj: Any, img: Any, source_input_name: str) -> None:
+    """Bake using emission workaround for properties like Roughness/Metallic
+
+    This connects the source input to an Emission shader and bakes using EMIT.
+
+    Args:
+        obj: Blender Object
+        img: Blender Image
+        source_input_name: Name of BSDF input socket (e.g., 'Roughness', 'Metallic')
+    """
+    temp_nodes: list[tuple[Any, Any, list[tuple[Any, Any]]]] = []
+
+    # Set up emission for all materials
     for mat_slot in obj.material_slots:
         if not mat_slot.material or not mat_slot.material.use_nodes:
             continue
@@ -337,7 +473,7 @@ def bake_with_emission_workaround(
         # Find Principled BSDF
         bsdf = None
         for node in nodes:
-            if node.type == 'BSDF_PRINCIPLED':
+            if node.type == "BSDF_PRINCIPLED":
                 bsdf = node
                 break
 
@@ -345,666 +481,552 @@ def bake_with_emission_workaround(
             continue
 
         # Store original source connection
-        source_links = []
+        source_links: list[tuple[Any, Any]] = []
         if bsdf.inputs[source_input_name].is_linked:
             for link in bsdf.inputs[source_input_name].links:
                 source_links.append((link.from_socket, link.to_socket))
 
-        # Find material output node
+        # Find material output
         output_node = None
         for node in nodes:
-            if node.type == 'OUTPUT_MATERIAL':
+            if node.type == "OUTPUT_MATERIAL":
                 output_node = node
                 break
 
         # Store original output connection
-        original_output_links = []
-        if output_node and output_node.inputs['Surface'].is_linked:
-            for link in output_node.inputs['Surface'].links:
+        original_output_links: list[tuple[Any, Any]] = []
+        if output_node and output_node.inputs["Surface"].is_linked:
+            for link in output_node.inputs["Surface"].links:
                 original_output_links.append((link.from_socket, link.to_socket))
                 links.remove(link)
 
         # Create emission node
-        emission = nodes.new(type='ShaderNodeEmission')
-        emission.location = (bsdf.location[0], bsdf.location[1] - 200)
+        emission = nodes.new(type="ShaderNodeEmission")
 
         # Connect source to emission
         if source_links:
-            links.new(source_links[0][0], emission.inputs['Color'])
-        elif source_input_name == 'Base Color':
-            emission.inputs['Color'].default_value = bsdf.inputs[source_input_name].default_value
+            links.new(source_links[0][0], emission.inputs["Color"])
         else:
-            # For metallic/roughness with no source link: convert scalar to color
-            scalar_value = bsdf.inputs[source_input_name].default_value
-            emission.inputs['Color'].default_value = (scalar_value,) * 3 + (1.0,)
+            # Use default value - handle both scalar (roughness/metallic) and color (base color) inputs
+            default_val = bsdf.inputs[source_input_name].default_value
+            if hasattr(default_val, "__len__"):
+                # Color input (already RGBA tuple)
+                emission.inputs["Color"].default_value = default_val
+            else:
+                # Scalar input (roughness/metallic) - convert to grayscale
+                emission.inputs["Color"].default_value = (
+                    default_val,
+                    default_val,
+                    default_val,
+                    1.0,
+                )
 
         # Connect emission to output
         if output_node:
-            links.new(emission.outputs['Emission'], output_node.inputs['Surface'])
+            links.new(emission.outputs["Emission"], output_node.inputs["Surface"])
 
-        # Store for cleanup
         temp_nodes.append((mat, emission, original_output_links))
 
-        # Add bake node
-        bake_node = setup_bake_nodes(mat, img)
-        bake_nodes.append((mat, bake_node))
+    # Collect materials for bake node setup
+    materials = [mat for mat, _, _ in temp_nodes]
 
-    # Bake once with all materials set up
-    # Deselect all objects and select only the target object
-    bpy.ops.object.select_all(action='DESELECT')
-    obj.select_set(True)
-    bpy.context.view_layer.objects.active = obj
-    bpy.ops.object.bake(type='EMIT')
+    # Bake with context-managed bake nodes
+    with bake_nodes_context(materials, img):
+        bpy.ops.object.bake(type="EMIT")
 
-    # Cleanup - remove temporary nodes from all materials
-    for mat, bake_node in bake_nodes:
-        mat.node_tree.nodes.remove(bake_node)
-
-    for mat, emission, original_output_links in temp_nodes:
-        nodes = mat.node_tree.nodes
-        links = mat.node_tree.links
-        nodes.remove(emission)
-        # Restore original output connection
-        for from_socket, to_socket in original_output_links:
-            links.new(from_socket, to_socket)
+    cleanup_emission_nodes(temp_nodes)
 
 
-def bake_simple(obj: Any, img: Any, bake_type: str) -> None:  # pyright: ignore[reportAny]
-    """Simple bake operation for types that support direct baking"""
-    # Deselect all objects first
-    bpy.ops.object.select_all(action='DESELECT')
-    obj.select_set(True)
-    bpy.context.view_layer.objects.active = obj
-
-    if obj.material_slots:
-        # Set up bake nodes for ALL materials on the object
-        bake_nodes = []
-        for mat_slot in obj.material_slots:
-            if mat_slot.material:
-                bake_node = setup_bake_nodes(mat_slot.material, img)
-                bake_nodes.append((mat_slot.material, bake_node))
-
-        if bake_type == 'NORMAL':
-            bpy.ops.object.bake(type='NORMAL', normal_space='TANGENT')
-        elif bake_type == 'ROUGHNESS':
-            bpy.ops.object.bake(type='ROUGHNESS')
-        elif bake_type == 'AO':
-            bpy.ops.object.bake(type='AO', use_selected_to_active=False)
-        elif bake_type == 'DIFFUSE':
-            bpy.ops.object.bake(type='DIFFUSE')
-        elif bake_type == 'METALLIC':
-            bpy.ops.object.bake(type='METALLIC')
-
-        # Clean up bake nodes from all materials
-        for mat, bake_node in bake_nodes:
-            mat.node_tree.nodes.remove(bake_node)
-
-
-# Generic baking function that handles mode branching
-def bake_texture_map(
-    map_name: str,
-    bake_fn: Any,  # Callable[[Any, Any], None] but avoid complex types  # pyright: ignore[reportAny]
-    should_save: bool = True,
-) -> None:
-    """Generic texture map baking with mode-aware iteration
+def bake_ao(objects: list[Any], img: Any, select_all_objects: bool) -> None:
+    """Unified AO baking with configurable selection mode
 
     Args:
-        map_name: Name of the texture map (albedo, normal, etc.)
-        bake_fn: Function to call for baking each object. Signature: (obj, img) -> None
-        should_save: Whether to save individual textures (for roughness/metallic)
+        objects: Objects to bake
+        img: Target image
+        select_all_objects: If True, select all (inter-object occlusion)
+                           If False, bake each separately (self-occlusion)
     """
-    print(f"\n--- Baking {map_name.title()} ---")
+    if select_all_objects:
+        # Combined mode - all objects selected for inter-object occlusion
+        materials = [
+            obj.material_slots[0].material for obj in objects if obj.material_slots
+        ]
 
-    if bake_separate_per_object:
-        # Separate mode: bake each object to its own image
-        for obj in selected_objects:
-            img = get_bake_image(map_name, obj.name)
-            if not img:
-                continue
-
-            bake_fn(obj, img)
-            if should_save:
-                save_bake_image(img, map_name, obj.name)
+        with bake_nodes_context(materials, img):
+            select_all(objects)
+            bpy.ops.object.bake(type="AO", use_selected_to_active=False)
     else:
-        # Combined mode: all objects bake to one shared image
-        img = get_bake_image(map_name)
-        if not img:
-            return
+        # Separate mode - bake each object individually for self-occlusion only
+        for obj in objects:
+            if obj.material_slots:
+                mat = obj.material_slots[0].material
+                with bake_nodes_context([mat], img):
+                    select_only(obj)
+                    bpy.ops.object.bake(type="AO", use_selected_to_active=False)
 
-        for obj in selected_objects:
-            bake_fn(obj, img)
+
+# === LAYER 3: MAP TYPE WORKFLOWS ===
+
+STANDARD_MAPS = ["albedo", "normal", "roughness", "metallic"]
+
+
+def bake_standard_maps(objects: list[Any], obj_name: str | None) -> None:
+    """Bake all standard maps for a set of objects
+
+    Standard maps (albedo, normal, roughness, metallic) are baked to one image.
+    In separate mode, obj_name identifies the target object.
+    In combined mode, obj_name is None and all objects bake to one shared image.
+
+    Args:
+        objects: List of objects to bake
+        obj_name: Object name for image naming (None in combined mode)
+    """
+    for map_type in STANDARD_MAPS:
+        if not texture_maps.get(map_type):
+            continue
+
+        print(
+            f"\n--- Baking {map_type.title()} {'for ' + obj_name if obj_name else 'Combined'} ---"
+        )
+
+        img = get_bake_image(map_type, obj_name)
+        if not img:
+            continue
+
+        # Bake all objects to this image
+        for obj in objects:
+            print(f"  Baking {obj.name}")
+            bake_object_to_image(obj, img, map_type)
+
+        # Save if configured
+        should_save = True
+        if map_type in ("roughness", "metallic"):
+            should_save = save_individual_metallic_roughness
 
         if should_save:
-            save_bake_image(img, map_name)
+            save_bake_image(img, map_type, obj_name)
 
 
-# Baking functions using the generic pattern
-def bake_albedo() -> None:
-    """Bake albedo/base color using DIFFUSE bake type"""
-    def bake_fn(obj: Any, img: Any) -> None:  # pyright: ignore[reportAny]
-        # Always use EMIT baking to capture base color without lighting
-        print(f"  Object '{obj.name}' using EMIT baking for albedo")
-        bake_albedo_with_emission(obj, img)
-
-    bake_texture_map('albedo', bake_fn)
+# === LAYER 4: MODE-SPECIFIC WORKFLOWS ===
 
 
-def bake_albedo_with_emission(obj: Any, img: Any) -> None:  # pyright: ignore[reportAny]
-    """Bake albedo using EMIT for objects with vertex colors"""
-    # Deselect all objects first
-    bpy.ops.object.select_all(action='DESELECT')
-    obj.select_set(True)
-    bpy.context.view_layer.objects.active = obj
+def process_object_separate(obj: Any) -> None:
+    """Complete baking workflow for one object in separate mode
 
-    # Set up temporary emission nodes for each material
-    temp_nodes = []
+    Args:
+        obj: Blender Object to process
+    """
+    print(f"\n{'=' * 60}")
+    print(f"Processing object: {obj.name}")
+    print("=" * 60)
 
-    for mat_slot in obj.material_slots:
-        if not mat_slot.material or not mat_slot.material.use_nodes:
-            continue
+    # Bake standard maps
+    bake_standard_maps([obj], obj.name)
 
-        mat = mat_slot.material
-        nodes = mat.node_tree.nodes
-        links = mat.node_tree.links
+    # Bake AO (special handling)
+    if texture_maps.get("ambient_occlusion"):
+        print(f"\n--- Baking Ambient Occlusion for {obj.name} ---")
+        img = get_bake_image("ao", obj.name)
+        if img:
+            print(f"  Baking {obj.name} (self-occlusion only)")
+            bake_ao([obj], img, select_all_objects=False)
+            save_bake_image(img, "ao", obj.name)
 
-        # Find BSDF and output
-        bsdf = None
-        output = None
-        for node in nodes:
-            if node.type == 'BSDF_PRINCIPLED':
-                bsdf = node
-            elif node.type == 'OUTPUT_MATERIAL':
-                output = node
 
-        if not bsdf or not output:
-            continue
+def process_all_objects_combined(objects: list[Any]) -> None:
+    """Complete baking workflow for all objects in combined mode
 
-        # Store original connection
-        original_links = []
-        if output.inputs['Surface'].is_linked:
-            for link in output.inputs['Surface'].links:
-                original_links.append((link.from_socket, link.to_socket))
-                links.remove(link)
+    Args:
+        objects: List of Blender Objects to process together
+    """
+    print(f"\n{'=' * 60}")
+    print(f"Processing all objects combined: {[obj.name for obj in objects]}")
+    print("=" * 60)
 
-        # Create emission node
-        emission = nodes.new(type='ShaderNodeEmission')
-        emission.location = (bsdf.location[0], bsdf.location[1] - 200)
+    # Bake standard maps
+    bake_standard_maps(objects, None)
 
-        # Connect Base Color source to emission
-        base_color_input = bsdf.inputs['Base Color']
-        if base_color_input.is_linked:
-            source_socket = base_color_input.links[0].from_socket
-            links.new(source_socket, emission.inputs['Color'])
-        else:
-            emission.inputs['Color'].default_value = base_color_input.default_value
+    # Bake AO (special handling)
+    if texture_maps.get("ambient_occlusion"):
+        print("\n--- Baking Ambient Occlusion Combined ---")
+        img = get_bake_image("ao")
+        if img:
+            print("  Baking all objects (inter-object occlusion)")
+            bake_ao(objects, img, select_all_objects=True)
+            save_bake_image(img, "ao")
 
-        # Connect emission to output
-        links.new(emission.outputs['Emission'], output.inputs['Surface'])
 
-        # Store for cleanup
-        temp_nodes.append((mat, emission, original_links))
+def cleanup_emission_nodes(
+    temp_nodes: list[tuple[Any, Any, list[tuple[Any, Any]]]],
+) -> None:
+    """Clean up temporary emission nodes and restore original connections
 
-    # Set up bake nodes for all materials
-    bake_nodes = []
-    for mat_slot in obj.material_slots:
-        if mat_slot.material:
-            bake_node = setup_bake_nodes(mat_slot.material, img)
-            bake_nodes.append((mat_slot.material, bake_node))
-
-    # Bake using EMIT
-    bpy.ops.object.bake(type='EMIT')
-
-    # Clean up bake nodes
-    for mat, bake_node in bake_nodes:
-        mat.node_tree.nodes.remove(bake_node)
-
-    # Restore original material connections
+    Args:
+        temp_nodes: List of (material, emission_node, original_links) tuples
+    """
     for mat, emission, original_links in temp_nodes:
         nodes = mat.node_tree.nodes
         links = mat.node_tree.links
-
-        # Remove emission node
         nodes.remove(emission)
-
-        # Restore original links
         for from_socket, to_socket in original_links:
             links.new(from_socket, to_socket)
 
 
-def bake_normal() -> None:
-    """Bake normal map"""
-    def bake_fn(obj: Any, img: Any) -> None:  # pyright: ignore[reportAny]
-        bake_simple(obj, img, 'NORMAL')
+def pack_metallic_roughness_for_object(obj_name: str | None) -> None:
+    """Pack metallic and roughness textures into glTF format
 
-    bake_texture_map('normal', bake_fn)
-
-
-def bake_pbr_property(socket_name: str, should_save: bool) -> None:
-    """Bake a PBR property (roughness/metallic) using emission workaround
+    glTF format: R=unused, G=roughness, B=metallic, A=1.0
 
     Args:
-        socket_name: Blender socket name (e.g., 'Roughness', 'Metallic')
-        should_save: Whether to save individual texture files
+        obj_name: Object name (None in combined mode)
     """
-    property_name = socket_name.lower()  # Convert to lowercase for file naming
+    # Get images
+    rough_img = get_image_for_mode("roughness", obj_name)
+    metal_img = get_image_for_mode("metallic", obj_name)
 
-    def bake_fn(obj: Any, img: Any) -> None:  # pyright: ignore[reportAny]
-        bake_with_emission_workaround(obj, img, socket_name)
-
-    bake_texture_map(property_name, bake_fn, should_save=should_save)
-
-
-def bake_roughness() -> None:
-    """Bake roughness map using emission workaround"""
-    bake_pbr_property('Roughness', save_individual_metallic_roughness)
-
-
-def bake_metallic() -> None:
-    """Bake metallic using emission workaround"""
-    bake_pbr_property('Metallic', save_individual_metallic_roughness)
-
-
-def bake_ao() -> None:
-    """Bake ambient occlusion - special handling for inter-object occlusion"""
-    print("\n--- Baking Ambient Occlusion ---")
-
-    if bake_separate_per_object:
-        # Separate mode: bake each object's AO separately
-        for target_obj in selected_objects:
-            img = get_bake_image('ao', target_obj.name)
-            if not img:
-                continue
-
-            # Set up bake node ONLY on the target object
-            if not target_obj.material_slots:
-                continue
-
-            mat = target_obj.material_slots[0].material
-            bake_node = setup_bake_nodes(mat, img)
-
-            # Select only the target object for baking
-            bpy.ops.object.select_all(action='DESELECT')
-            target_obj.select_set(True)
-
-            # Bake with only target object selected
-            bpy.context.view_layer.objects.active = target_obj
-            bpy.ops.object.bake(type='AO', use_selected_to_active=False)
-
-            # Clean up bake node
-            mat.node_tree.nodes.remove(bake_node)
-
-            # Save this object's AO texture
-            save_bake_image(img, 'ao', target_obj.name)
+    if obj_name:
+        print(f"  Packing for {obj_name}")
     else:
-        # Combined mode: all objects bake to one shared AO image
-        img = get_bake_image('ao')
-        if not img:
-            return
+        print("  Packing combined")
 
-        # Set up bake nodes on all materials
-        bake_nodes = []
-        for obj in selected_objects:
-            if obj.material_slots:
-                mat = obj.material_slots[0].material
-                bake_node = setup_bake_nodes(mat, img)
-                bake_nodes.append((mat, bake_node))
+    output_filename = generate_name("metallic_roughness", obj_name, ".png")
 
-        # Select all objects for AO baking
-        bpy.ops.object.select_all(action='DESELECT')
-        for obj in selected_objects:
-            obj.select_set(True)
+    # Configure compositor
+    tree = bpy.context.scene.node_tree
+    nodes = tree.nodes
+    links = tree.links
+    nodes.clear()
 
-        # Bake AO with all objects selected
-        if selected_objects:
-            bpy.context.view_layer.objects.active = selected_objects[0]
-            bpy.ops.object.bake(type='AO', use_selected_to_active=False)
+    # Ensure Non-Color colorspace
+    rough_img.colorspace_settings.name = "Non-Color"
+    metal_img.colorspace_settings.name = "Non-Color"
 
-        # Clean up bake nodes
-        for mat, bake_node in bake_nodes:
-            mat.node_tree.nodes.remove(bake_node)
+    # Create nodes
+    rough_node = nodes.new(type="CompositorNodeImage")
+    rough_node.image = rough_img
 
-        # Save once after all objects have been baked
-        save_bake_image(img, 'ao')
+    metal_node = nodes.new(type="CompositorNodeImage")
+    metal_node.image = metal_img
+
+    sep_rough = nodes.new(type="CompositorNodeSeparateColor")
+
+    sep_metal = nodes.new(type="CompositorNodeSeparateColor")
+
+    combine = nodes.new(type="CompositorNodeCombineColor")
+
+    output = nodes.new(type="CompositorNodeComposite")
+
+    # Connect
+    links.new(rough_node.outputs["Image"], sep_rough.inputs["Image"])
+    links.new(metal_node.outputs["Image"], sep_metal.inputs["Image"])
+
+    combine.inputs["Red"].default_value = 1.0
+    links.new(sep_rough.outputs["Red"], combine.inputs["Green"])
+    links.new(sep_metal.outputs["Red"], combine.inputs["Blue"])
+    combine.inputs["Alpha"].default_value = 1.0
+
+    links.new(combine.outputs["Image"], output.inputs["Image"])
+
+    # Render
+    bpy.context.scene.render.filepath = str(textures_path / output_filename)
+    bpy.ops.render.render(write_still=True)
+    print(f"  Saved: {bpy.context.scene.render.filepath}")
 
 
-# Execute baking
-print("\n=== Starting Texture Baking ===")
+def setup_baked_material_shader_nodes(mat: Any, obj_name: str | None) -> None:
+    """Set up shader nodes for a baked material
 
-if texture_maps['albedo']:
-    bake_albedo()
+    Args:
+        mat: Blender Material to configure
+        obj_name: Object name (None in combined mode) for image retrieval
+    """
+    nodes = mat.node_tree.nodes
+    links = mat.node_tree.links
+    nodes.clear()
 
-if texture_maps['normal']:
-    bake_normal()
+    # Create base nodes
+    tex_coord = nodes.new(type="ShaderNodeTexCoord")
 
-if texture_maps['roughness']:
-    bake_roughness()
+    bsdf = nodes.new(type="ShaderNodeBsdfPrincipled")
 
-if texture_maps['metallic']:
-    bake_metallic()
+    output = nodes.new(type="ShaderNodeOutputMaterial")
 
-if texture_maps['ambient_occlusion']:
-    bake_ao()
+    # Get images based on mode
+    albedo_img = get_image_for_mode("albedo", obj_name)
+    normal_img = get_image_for_mode("normal", obj_name)
 
-# Create Bevy-compatible metallic-roughness texture if requested
-if settings.get('export_metallic_roughness_packed', True) and all([texture_maps['roughness'], texture_maps['metallic']]):
-    print("\n--- Creating Metallic-Roughness Packed Texture (Bevy/glTF format) ---")
+    mr_path = str(textures_path / generate_name("metallic_roughness", obj_name, ".png"))
 
-    # Set render resolution to match texture resolution
+    # Albedo
+    if texture_maps["albedo"] and albedo_img:
+        albedo_tex = nodes.new(type="ShaderNodeTexImage")
+        albedo_tex.image = albedo_img
+        albedo_tex.label = "Albedo"
+        links.new(tex_coord.outputs["UV"], albedo_tex.inputs["Vector"])
+        links.new(albedo_tex.outputs["Color"], bsdf.inputs["Base Color"])
+
+    # Normal
+    if texture_maps["normal"] and normal_img:
+        normal_tex = nodes.new(type="ShaderNodeTexImage")
+        normal_tex.image = normal_img
+        normal_tex.label = "Normal"
+        normal_tex.image.colorspace_settings.name = "Non-Color"
+
+        normal_map = nodes.new(type="ShaderNodeNormalMap")
+
+        links.new(tex_coord.outputs["UV"], normal_tex.inputs["Vector"])
+        links.new(normal_tex.outputs["Color"], normal_map.inputs["Color"])
+        links.new(normal_map.outputs["Normal"], bsdf.inputs["Normal"])
+
+    # Metallic-Roughness
+    if settings.get("export_metallic_roughness_packed") and os.path.exists(mr_path):
+        mr_tex = nodes.new(type="ShaderNodeTexImage")
+        mr_tex.label = "Metallic-Roughness"
+        mr_img = bpy.data.images.load(mr_path)
+        mr_tex.image = mr_img
+        mr_img.colorspace_settings.name = "Non-Color"
+
+        separate_rgb = nodes.new(type="ShaderNodeSeparateColor")
+
+        links.new(tex_coord.outputs["UV"], mr_tex.inputs["Vector"])
+        links.new(mr_tex.outputs["Color"], separate_rgb.inputs["Color"])
+        links.new(separate_rgb.outputs["Green"], bsdf.inputs["Roughness"])
+        links.new(separate_rgb.outputs["Blue"], bsdf.inputs["Metallic"])
+
+    links.new(bsdf.outputs["BSDF"], output.inputs["Surface"])
+
+
+def create_and_apply_material(obj_name: str | None, target_objects: list[Any]) -> None:
+    """Create baked material and apply to objects
+
+    Args:
+        obj_name: Object name for naming (None for combined)
+        target_objects: Objects to apply material to
+    """
+    # Create material
+    mat_name = generate_name("baked", obj_name)
+    mat = bpy.data.materials.new(name=mat_name)
+    mat.use_nodes = True
+    setup_baked_material_shader_nodes(mat, obj_name)
+
+    # Apply to objects
+    for obj in target_objects:
+        if obj.type == "MESH" and obj.data:
+            obj.data.materials.clear()
+            obj.data.materials.append(mat)
+
+    if obj_name:
+        print(f"  Created and applied material for {obj_name}")
+    else:
+        print("  Created and applied combined material")
+
+
+def create_images_for_maps(obj_name: str | None) -> None:
+    """Create bake images for all configured map types
+
+    Args:
+        obj_name: Object name (separate mode) or None (combined mode)
+    """
+    for map_type in STANDARD_MAPS:
+        if texture_maps.get(map_type):
+            create_bake_image(map_type, obj_name)
+    if texture_maps.get("ambient_occlusion"):
+        create_bake_image("ao", obj_name)
+    if texture_maps.get("emission"):
+        create_bake_image("emission", obj_name)
+
+
+def configure_compositor_for_packing() -> dict[str, Any]:
+    """Configure Blender compositor for metallic-roughness packing
+
+    Returns:
+        Dict of original settings to restore later
+    """
     bpy.context.scene.render.resolution_x = resolution
     bpy.context.scene.render.resolution_y = resolution
     bpy.context.scene.render.resolution_percentage = 100
-
-    # Enable compositor nodes
     bpy.context.scene.use_nodes = True
 
-    # Save current view transform and switch to Standard for accurate data texture rendering
-    # (AgX/Filmic tone mapping would alter pixel values)
-    original_view_transform = bpy.context.scene.view_settings.view_transform
-    bpy.context.scene.view_settings.view_transform = 'Standard'
+    return {
+        "view_transform": bpy.context.scene.view_settings.view_transform,
+        "file_format": bpy.context.scene.render.image_settings.file_format,
+        "color_mode": bpy.context.scene.render.image_settings.color_mode,
+        "color_depth": bpy.context.scene.render.image_settings.color_depth,
+        "compression": bpy.context.scene.render.image_settings.compression,
+    }
 
-    # Save current file format settings and configure for linear output
-    original_file_format = bpy.context.scene.render.image_settings.file_format
-    original_color_mode = bpy.context.scene.render.image_settings.color_mode
-    original_color_depth = bpy.context.scene.render.image_settings.color_depth
-    original_compression = bpy.context.scene.render.image_settings.compression
 
-    # Set to PNG with no color management (saves raw linear data)
-    bpy.context.scene.render.image_settings.file_format = 'PNG'
-    bpy.context.scene.render.image_settings.color_mode = 'RGBA'
-    bpy.context.scene.render.image_settings.color_depth = '16'  # 16-bit for precision
-    bpy.context.scene.render.image_settings.compression = 15  # Max compression
+def apply_packing_settings() -> None:
+    """Apply compositor settings for metallic-roughness packing"""
+    bpy.context.scene.view_settings.view_transform = "Standard"
+    bpy.context.scene.render.image_settings.file_format = "PNG"
+    bpy.context.scene.render.image_settings.color_mode = "RGBA"
+    bpy.context.scene.render.image_settings.color_depth = "16"
+    bpy.context.scene.render.image_settings.compression = 15
 
-    # Determine which objects to pack
-    objects_to_pack = [obj.name for obj in selected_objects] if bake_separate_per_object else [None]
 
-    for obj_name in objects_to_pack:
-        tree = bpy.context.scene.node_tree
-        nodes = tree.nodes
-        links = tree.links
+def restore_compositor_settings(original: dict[str, Any]) -> None:
+    """Restore original compositor settings
 
-        # Clear existing nodes
-        nodes.clear()
+    Args:
+        original: Dict of original settings from configure_compositor_for_packing
+    """
+    bpy.context.scene.view_settings.view_transform = original["view_transform"]
+    bpy.context.scene.render.image_settings.file_format = original["file_format"]
+    bpy.context.scene.render.image_settings.color_mode = original["color_mode"]
+    bpy.context.scene.render.image_settings.color_depth = original["color_depth"]
+    bpy.context.scene.render.image_settings.compression = original["compression"]
 
-        # Get the roughness and metallic images for this object
-        if bake_separate_per_object and obj_name is not None:
-            rough_img = created_images[obj_name]['roughness']
-            metal_img = created_images[obj_name]['metallic']
-            output_filename = f"{output_name}_{obj_name}_metallic_roughness.png"
-            print(f"  Packing metallic-roughness for {obj_name}")
-        else:
-            rough_img = created_images['roughness']
-            metal_img = created_images['metallic']
-            output_filename = f"{output_name}_metallic_roughness.png"
 
-        # Load individual maps
-        # Ensure roughness and metallic use Non-Color colorspace (data textures, not colors)
-        rough_img.colorspace_settings.name = 'Non-Color'
-        metal_img.colorspace_settings.name = 'Non-Color'
+def pack_metallic_roughness_if_needed(obj_names: list[str] | None) -> None:
+    """Pack metallic-roughness textures if configured
 
-        rough_node = nodes.new(type='CompositorNodeImage')
-        rough_node.image = rough_img
-        rough_node.location = (0, 100)
+    Args:
+        obj_names: List of object names (separate mode) or None (combined mode)
+    """
+    if not (
+        settings.get("export_metallic_roughness_packed")
+        and texture_maps.get("roughness")
+        and texture_maps.get("metallic")
+    ):
+        return
 
-        metal_node = nodes.new(type='CompositorNodeImage')
-        metal_node.image = metal_img
-        metal_node.location = (0, -100)
+    is_separate = obj_names is not None
+    print(
+        f"\n--- Creating Metallic-Roughness Packed Texture{'s' if is_separate else ''} ---"
+    )
 
-        # Separate RGB nodes
-        sep_rough = nodes.new(type='CompositorNodeSeparateColor')
-        sep_rough.location = (200, 100)
+    original_settings = configure_compositor_for_packing()
+    apply_packing_settings()
 
-        sep_metal = nodes.new(type='CompositorNodeSeparateColor')
-        sep_metal.location = (200, -100)
+    if is_separate:
+        for obj_name in obj_names:
+            pack_metallic_roughness_for_object(obj_name)
+    else:
+        pack_metallic_roughness_for_object(None)
 
-        # Combine RGB
-        combine = nodes.new(type='CompositorNodeCombineColor')
-        combine.location = (400, 0)
+    restore_compositor_settings(original_settings)
 
-        # Output
-        output = nodes.new(type='CompositorNodeComposite')
-        output.location = (600, 0)
 
-        # Connect nodes
-        links.new(rough_node.outputs['Image'], sep_rough.inputs['Image'])
-        links.new(metal_node.outputs['Image'], sep_metal.inputs['Image'])
+# === LAYER 5: POST-PROCESSING ===
 
-        # Bevy/glTF format: Roughness in Green, Metallic in Blue
-        # Red channel is unused (set to 1.0)
-        combine.inputs['Red'].default_value = 1.0  # Unused channel
-        links.new(sep_rough.outputs['Red'], combine.inputs['Green'])   # Roughness in G
-        links.new(sep_metal.outputs['Red'], combine.inputs['Blue'])   # Metallic in B
-        combine.inputs['Alpha'].default_value = 1.0  # Full alpha
 
-        links.new(combine.outputs['Image'], output.inputs['Image'])
-
-        # Render to create metallic-roughness texture
-        bpy.context.scene.render.filepath = str(textures_path / output_filename)
-        bpy.ops.render.render(write_still=True)
-        print(f"  Saved: {bpy.context.scene.render.filepath}")
-
-    # Restore original view transform and file format settings
-    bpy.context.scene.view_settings.view_transform = original_view_transform
-    bpy.context.scene.render.image_settings.file_format = original_file_format
-    bpy.context.scene.render.image_settings.color_mode = original_color_mode
-    bpy.context.scene.render.image_settings.color_depth = original_color_depth
-    bpy.context.scene.render.image_settings.compression = original_compression
-
-# Create material with baked textures
-print("\n--- Creating Baked Material ---")
-
-if bake_separate_per_object:
-    # Create separate materials for each object
-    for obj_name in object_names:
-        obj = bpy.data.objects.get(obj_name)
-        if not obj or obj.type != 'MESH' or not obj.data:
-            continue
-
-        baked_mat = bpy.data.materials.new(name=f"{output_name}_{obj_name}_baked")
-        baked_mat.use_nodes = True
-
-        nodes = baked_mat.node_tree.nodes
-        links = baked_mat.node_tree.links
-        nodes.clear()
-
-        # Create nodes
-        tex_coord = nodes.new(type='ShaderNodeTexCoord')
-        tex_coord.location = (-800, 300)
-
-        # Create texture nodes conditionally and store references
-        albedo_tex = None
-        if texture_maps['albedo'] and obj_name in created_images and 'albedo' in created_images[obj_name]:
-            albedo_tex = nodes.new(type='ShaderNodeTexImage')
-            albedo_tex.location = (-600, 500)
-            albedo_tex.image = created_images[obj_name]['albedo']
-            albedo_tex.label = "Albedo"
-
-        normal_tex = None
-        normal_map = None
-        if texture_maps['normal'] and obj_name in created_images and 'normal' in created_images[obj_name]:
-            normal_tex = nodes.new(type='ShaderNodeTexImage')
-            normal_tex.location = (-600, 200)
-            normal_tex.image = created_images[obj_name]['normal']
-            normal_tex.label = "Normal"
-            normal_tex.image.colorspace_settings.name = 'Non-Color'
-
-            normal_map = nodes.new(type='ShaderNodeNormalMap')
-            normal_map.location = (-300, 200)
-
-        mr_tex = None
-        separate_rgb = None
-        if settings.get('export_metallic_roughness_packed', True):
-            mr_tex = nodes.new(type='ShaderNodeTexImage')
-            mr_tex.location = (-600, -100)
-            mr_tex.label = "Metallic-Roughness"
-            # Load the saved metallic-roughness image
-            mr_path = str(textures_path / f"{output_name}_{obj_name}_metallic_roughness.png")
-            if os.path.exists(mr_path):
-                mr_img = bpy.data.images.load(mr_path)
-                mr_tex.image = mr_img
-                mr_img.colorspace_settings.name = 'Non-Color'
-
-            separate_rgb = nodes.new(type='ShaderNodeSeparateColor')
-            separate_rgb.location = (-300, -100)
-
-        bsdf = nodes.new(type='ShaderNodeBsdfPrincipled')
-        bsdf.location = (0, 300)
-
-        output = nodes.new(type='ShaderNodeOutputMaterial')
-        output.location = (300, 300)
-
-        # Connect nodes
-        if albedo_tex:
-            links.new(tex_coord.outputs['UV'], albedo_tex.inputs['Vector'])
-            links.new(albedo_tex.outputs['Color'], bsdf.inputs['Base Color'])
-
-        if normal_tex and normal_map:
-            links.new(tex_coord.outputs['UV'], normal_tex.inputs['Vector'])
-            links.new(normal_tex.outputs['Color'], normal_map.inputs['Color'])
-            links.new(normal_map.outputs['Normal'], bsdf.inputs['Normal'])
-
-        if mr_tex and separate_rgb:
-            links.new(tex_coord.outputs['UV'], mr_tex.inputs['Vector'])
-            links.new(mr_tex.outputs['Color'], separate_rgb.inputs['Color'])
-            links.new(separate_rgb.outputs['Green'], bsdf.inputs['Roughness'])  # Green = Roughness
-            links.new(separate_rgb.outputs['Blue'], bsdf.inputs['Metallic'])   # Blue = Metallic
-
-        links.new(bsdf.outputs['BSDF'], output.inputs['Surface'])
-
-        # Apply material to this object
-        obj.data.materials.clear()
-        obj.data.materials.append(baked_mat)
-
-        print(f"Created and applied material for {obj_name}")
-else:
-    # Create single shared material for combined mode
-    baked_mat = bpy.data.materials.new(name=f"{output_name}_baked")
-    baked_mat.use_nodes = True
-
-    nodes = baked_mat.node_tree.nodes
-    links = baked_mat.node_tree.links
-    nodes.clear()
-
-    # Create nodes
-    tex_coord = nodes.new(type='ShaderNodeTexCoord')
-    tex_coord.location = (-800, 300)
-
-    # Create texture nodes conditionally and store references
-    albedo_tex = None
-    if texture_maps['albedo']:
-        albedo_tex = nodes.new(type='ShaderNodeTexImage')
-        albedo_tex.location = (-600, 500)
-        albedo_tex.image = created_images['albedo']
-        albedo_tex.label = "Albedo"
-
-    normal_tex = None
-    normal_map = None
-    if texture_maps['normal']:
-        normal_tex = nodes.new(type='ShaderNodeTexImage')
-        normal_tex.location = (-600, 200)
-        normal_tex.image = created_images['normal']
-        normal_tex.label = "Normal"
-        normal_tex.image.colorspace_settings.name = 'Non-Color'
-
-        normal_map = nodes.new(type='ShaderNodeNormalMap')
-        normal_map.location = (-300, 200)
-
-    mr_tex = None
-    separate_rgb = None
-    if settings.get('export_metallic_roughness_packed', True):
-        mr_tex = nodes.new(type='ShaderNodeTexImage')
-        mr_tex.location = (-600, -100)
-        mr_tex.label = "Metallic-Roughness"
-        # Load the saved metallic-roughness image
-        mr_path = str(textures_path / f"{output_name}_metallic_roughness.png")
-        if os.path.exists(mr_path):
-            mr_img = bpy.data.images.load(mr_path)
-            mr_tex.image = mr_img
-            mr_img.colorspace_settings.name = 'Non-Color'
-
-        separate_rgb = nodes.new(type='ShaderNodeSeparateColor')
-        separate_rgb.location = (-300, -100)
-
-    bsdf = nodes.new(type='ShaderNodeBsdfPrincipled')
-    bsdf.location = (0, 300)
-
-    output = nodes.new(type='ShaderNodeOutputMaterial')
-    output.location = (300, 300)
-
-    # Connect nodes
-    if albedo_tex:
-        links.new(tex_coord.outputs['UV'], albedo_tex.inputs['Vector'])
-        links.new(albedo_tex.outputs['Color'], bsdf.inputs['Base Color'])
-
-    if normal_tex and normal_map:
-        links.new(tex_coord.outputs['UV'], normal_tex.inputs['Vector'])
-        links.new(normal_tex.outputs['Color'], normal_map.inputs['Color'])
-        links.new(normal_map.outputs['Normal'], bsdf.inputs['Normal'])
-
-    if mr_tex and separate_rgb:
-        links.new(tex_coord.outputs['UV'], mr_tex.inputs['Vector'])
-        links.new(mr_tex.outputs['Color'], separate_rgb.inputs['Color'])
-        links.new(separate_rgb.outputs['Green'], bsdf.inputs['Roughness'])  # Green = Roughness
-        links.new(separate_rgb.outputs['Blue'], bsdf.inputs['Metallic'])   # Blue = Metallic
-
-    links.new(bsdf.outputs['BSDF'], output.inputs['Surface'])
-
-    # Apply baked material to objects
-    for obj_name in object_names:
-        obj = bpy.data.objects[obj_name]
-        # Only apply materials to mesh objects
-        if obj.type == 'MESH' and obj.data:
-            obj.data.materials.clear()
-            obj.data.materials.append(baked_mat)
-
-    print("Applied baked material to objects")
-
-# Export GLB if requested
-if settings['export_glb']:
+def export_glb() -> None:
+    """Export selected objects as GLB"""
     print("\n--- Exporting GLB ---")
 
-    # Select only our objects for export
-    bpy.ops.object.select_all(action='DESELECT')
+    # Select objects
+    bpy.ops.object.select_all(action="DESELECT")
     for obj_name in object_names:
         obj = bpy.data.objects[obj_name]
         obj.select_set(True)
-        # If it's an Empty with children, also select all children recursively
-        if obj.type == 'EMPTY':
-            def select_children(parent: Any) -> None:  # pyright: ignore[reportAny]
+        if obj.type == "EMPTY":
+
+            def select_children(parent: Any) -> None:
                 for child in parent.children:
                     child.select_set(True)
                     select_children(child)
+
             select_children(obj)
 
     glb_path = str(output_path / f"{output_name}.glb")
 
     bpy.ops.export_scene.gltf(
         filepath=glb_path,
-        export_format='GLB',
+        export_format="GLB",
         use_selection=True,
         export_texcoords=True,
         export_normals=True,
         export_tangents=True,
-        export_materials='EXPORT',
-        export_image_format='AUTO'
+        export_materials="EXPORT",
+        export_image_format="AUTO",
     )
 
-    print(f"Exported: {glb_path}")
+    print(f"  Exported: {glb_path}")
 
-# Generate manifest
-manifest_path = output_path / "bake_manifest.txt"
-with open(manifest_path, 'w') as f:
-    _ = f.write("PBR Texture Baking Manifest\n")
-    _ = f.write("===========================\n\n")
-    _ = f.write(f"Source: {blend_file}\n")
-    _ = f.write(f"Objects: {', '.join(object_names)}\n")
-    _ = f.write(f"Resolution: {resolution}x{resolution}\n")
-    _ = f.write(f"Bake Margin: {settings['bake_margin']}px\n\n")
-    _ = f.write("Generated Files:\n")
 
-    for file in sorted(output_path.rglob("*")):
-        if file.is_file() and file != manifest_path:
-            _ = f.write(f"  - {file.relative_to(output_path)}\n")
+def generate_manifest() -> None:
+    """Generate manifest file listing all baked outputs"""
+    manifest_path = output_path / "bake_manifest.txt"
+    with open(manifest_path, "w") as f:
+        _ = f.write("PBR Texture Baking Manifest\n")
+        _ = f.write("===========================\n\n")
+        _ = f.write(f"Source: {blend_file}\n")
+        _ = f.write(f"Objects: {', '.join(object_names)}\n")
+        _ = f.write(f"Resolution: {resolution}x{resolution}\n")
+        _ = f.write(f"Bake Margin: {settings['bake_margin']}px\n")
+        _ = f.write(
+            f"Mode: {'Separate per object' if bake_separate_per_object else 'Combined'}\n\n"
+        )
+        _ = f.write("Generated Files:\n")
 
-print(f"\n=== Baking Complete ===")
-print(f"Output directory: {output_path}")
-print(f"Manifest: {manifest_path}")
+        for file in sorted(output_path.rglob("*")):
+            if file.is_file() and file != manifest_path:
+                _ = f.write(f"  - {file.relative_to(output_path)}\n")
+
+    print("\n=== Baking Complete ===")
+    print(f"Output directory: {output_path}")
+    print(f"Manifest: {manifest_path}")
+
+
+# === LAYER 6: MAIN EXECUTION ===
+
+
+def main() -> None:
+    """Main execution: set up environment, bake textures, post-process"""
+    # Setup
+    setup_blender_environment()
+
+    # Create images based on mode
+    print("\n=== Creating Bake Images ===")
+
+    if bake_separate_per_object:
+        for obj in selected_objects:
+            print(f"\nImages for '{obj.name}':")
+            create_images_for_maps(obj.name)
+
+        total_images = sum(len(images) for images in created_images.values())
+        print(f"\nCreated {total_images} images for {len(created_images)} objects")
+    else:
+        print("\nShared images for all objects:")
+        create_images_for_maps(None)
+        print(f"\nCreated {len(created_images)} shared images")
+
+    # Execute baking based on mode (SINGLE DECISION POINT)
+    print("\n=== Starting Texture Baking ===")
+
+    if bake_separate_per_object:
+        # SEPARATE MODE: Process each object independently
+        for obj in selected_objects:
+            process_object_separate(obj)
+
+        # Post-processing per object
+        pack_metallic_roughness_if_needed([obj.name for obj in selected_objects])
+
+        # Create materials per object
+        print("\n--- Creating Baked Materials ---")
+        for obj in selected_objects:
+            create_and_apply_material(obj.name, [obj])
+
+    else:
+        # COMBINED MODE: Process all objects together
+        process_all_objects_combined(selected_objects)
+
+        # Post-processing combined
+        pack_metallic_roughness_if_needed(None)
+
+        # Create shared material
+        print("\n--- Creating Baked Material ---")
+        create_and_apply_material(None, selected_objects)
+
+    # GLB export (mode-independent)
+    if settings.get("export_glb"):
+        export_glb()
+
+    # Generate manifest
+    generate_manifest()
+
+
+# Execute
+if __name__ == "__main__":
+    main()

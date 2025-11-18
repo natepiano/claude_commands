@@ -1,7 +1,9 @@
 {
   "permissions": {
     "allow": [
-      "Bash(git -C /Users/natemccoy/.claude log --oneline -1)"
+      "Bash(git -C /Users/natemccoy/.claude log --oneline -1)",
+      "Bash(/opt/homebrew/bin/blender:*)",
+      "Bash(git add:*)"
     ],
     "deny": [],
     "ask": []
