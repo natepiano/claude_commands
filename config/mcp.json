@@ -1,0 +1,14 @@
+{
+  "blender": {
+    "type": "stdio",
+    "command": "uvx",
+    "args": ["blender-mcp"],
+    "env": {}
+  },
+  "brp": {
+    "type": "stdio",
+    "command": "bevy_brp_mcp",
+    "args": [],
+    "env": {}
+  }
+}
