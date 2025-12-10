@@ -10,6 +10,9 @@ ide/
 plugins/
 projects/
 
+# Credentials
+.credentials.json
+
 # Conversation history
 history.jsonl
 
