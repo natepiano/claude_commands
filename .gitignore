@@ -13,6 +13,9 @@ projects/
 # Credentials
 .credentials.json
 
+# Local settings
+settings.local.json
+
 # Conversation history
 history.jsonl
 
