@@ -9,12 +9,16 @@ todos/
 ide/
 plugins/
 projects/
+plans/
 
 # Credentials
 .credentials.json
 
 # Local settings
 settings.local.json
+
+# Cache files
+stats-cache.json
 
 # Conversation history
 history.jsonl

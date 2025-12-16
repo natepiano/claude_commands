@@ -876,7 +876,7 @@ def apply_packing_settings() -> None:
     bpy.context.scene.view_settings.view_transform = "Standard"
     bpy.context.scene.render.image_settings.file_format = "PNG"
     bpy.context.scene.render.image_settings.color_mode = "RGBA"
-    bpy.context.scene.render.image_settings.color_depth = "16"
+    bpy.context.scene.render.image_settings.color_depth = "8"
     bpy.context.scene.render.image_settings.compression = 15
 
 
