@@ -20,7 +20,7 @@ Analyzes your codebase against official Bevy migration guides using a two-pass p
 
 The following constraints provide guidance on how I think and approach problems:
 
-@~/.claude/shared/constraints/code_review_constraints.md
+@~/.claude/shared/subagent_instructions/code_review_instructions.md
 </Persona>
 
 ---
@@ -175,9 +175,9 @@ Launching Pass 2 deep analysis for [N] guides...
 
 **Standard pattern counting - use this for all occurrence counts:**
 
-Single pattern:
+Single pattern (returns just the number, e.g., `42`):
 ```bash
-count=$(~/.claude/scripts/bevy_migration_count_pattern.sh "pattern" "${CODEBASE}" rust)
+~/.claude/scripts/bevy_migration_count_pattern.sh "pattern" "${CODEBASE}" rust
 ```
 
 Multiple patterns with breakdown:
@@ -323,8 +323,9 @@ For EACH guide file in your assigned_guides:
 2. Extract 3-5 key search patterns from the guide (types, functions, modules mentioned)
 3. Count occurrences for each pattern using <CountingProcedure/>:
    ```bash
-   count=$(~/.claude/scripts/bevy_migration_count_pattern.sh "pattern" "${CODEBASE}" rust)
+   ~/.claude/scripts/bevy_migration_count_pattern.sh "pattern" "${CODEBASE}" rust
    ```
+   The output is the count (e.g., `42`) - read it directly from the Bash tool result.
 4. Determine: APPLICABLE or NOT_APPLICABLE
 
 **Output format (respond with ONLY this JSON):**
