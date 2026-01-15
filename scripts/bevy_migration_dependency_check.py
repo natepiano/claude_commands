@@ -118,9 +118,9 @@ def get_workspace_members(codebase: Path) -> set[str]:
         return set()
 
 
-def get_bevy_dependencies(codebase: Path, bevy_version: str) -> list[tuple[str, str]]:
+def get_all_direct_dependencies(codebase: Path, bevy_version: str) -> list[tuple[str, str]]:
     """
-    Run cargo tree to find all DIRECT dependencies (from Cargo.toml) that depend on bevy.
+    Run cargo tree to find all DIRECT dependencies (from Cargo.toml).
     Returns list of (crate_name, version) tuples, excluding bevy internal crates and workspace members.
     Uses --depth=1 to only get direct dependencies, not transitive ones.
     """
@@ -129,6 +129,14 @@ def get_bevy_dependencies(codebase: Path, bevy_version: str) -> list[tuple[str, 
 
     # Get workspace members to exclude
     workspace_members = get_workspace_members(codebase)
+
+    # Also exclude non-bevy ecosystem crates (standard utility crates)
+    utility_crates = {
+        'rand', 'serde', 'serde_json', 'tokio', 'async-std', 'futures',
+        'log', 'tracing', 'anyhow', 'thiserror', 'clap', 'strum',
+        'itertools', 'regex', 'chrono', 'uuid', 'parking_lot',
+        'crossbeam', 'rayon', 'nalgebra', 'glam', 'bytemuck',
+    }
 
     try:
         # Use --depth=1 to only get direct dependencies
@@ -144,18 +152,17 @@ def get_bevy_dependencies(codebase: Path, bevy_version: str) -> list[tuple[str, 
 
         stdout: str = result.stdout
         for line in stdout.splitlines():
-            # Match pattern like "bevy_egui v0.29.0" or "bevy v0.16.0"
-            if 'bevy' in line.lower():
-                # Extract crate name and version, handling tree characters (├──, │, etc.)
-                match = re.search(r'([a-zA-Z0-9_-]+)\s+v([0-9.]+)', line)
-                if match:
-                    crate_name = match.group(1)
-                    version = match.group(2)
+            # Extract crate name and version, handling tree characters (├──, │, etc.)
+            match = re.search(r'([a-zA-Z0-9_-]+)\s+v([0-9.]+)', line)
+            if match:
+                crate_name = match.group(1)
+                version = match.group(2)
 
-                    # Only include third-party bevy ecosystem crates
-                    # (not bevy internal crates, not workspace members)
-                    if crate_name not in internal_crates and crate_name not in workspace_members:
-                        dependencies.add((crate_name, version))
+                # Exclude bevy internal crates, workspace members, and common utility crates
+                if (crate_name not in internal_crates
+                    and crate_name not in workspace_members
+                    and crate_name not in utility_crates):
+                    dependencies.add((crate_name, version))
 
         return sorted(list(dependencies))
 
@@ -167,6 +174,40 @@ def get_bevy_dependencies(codebase: Path, bevy_version: str) -> list[tuple[str, 
     except FileNotFoundError:
         print("Error: cargo not found. Make sure Rust is installed.", file=sys.stderr)
         return []
+
+
+def has_bevy_dependency(crate_name: str, version: str) -> bool:
+    """
+    Check if a crate version has bevy as a dependency via crates.io API.
+    Returns True if the crate depends on bevy, False otherwise.
+    """
+    bevy_req = get_bevy_dependency_requirement(crate_name, version)
+    return bevy_req is not None
+
+
+def get_bevy_dependencies(codebase: Path, bevy_version: str) -> list[tuple[str, str]]:
+    """
+    Find all DIRECT dependencies that depend on Bevy.
+    Returns list of (crate_name, version) tuples.
+
+    This function checks ALL direct dependencies (not just ones with 'bevy' in the name)
+    against crates.io to determine if they depend on Bevy.
+    """
+    all_deps = get_all_direct_dependencies(codebase, bevy_version)
+
+    bevy_deps: list[tuple[str, str]] = []
+
+    for crate_name, version in all_deps:
+        # Quick heuristic: if name contains 'bevy', it's definitely a bevy ecosystem crate
+        if 'bevy' in crate_name.lower():
+            bevy_deps.append((crate_name, version))
+        else:
+            # Check crates.io to see if this crate depends on bevy
+            print(f"  Checking if {crate_name} depends on bevy...", file=sys.stderr)
+            if has_bevy_dependency(crate_name, version):
+                bevy_deps.append((crate_name, version))
+
+    return bevy_deps
 
 
 def query_crates_io(crate_name: str) -> QueryResult | None:

@@ -164,11 +164,31 @@ if [ $CHECK_RESULT -eq 0 ]; then
         USER_MESSAGE="🚀 cargo check passed"
     fi
 
-    # Run formatter and add status to message
-    cargo +nightly fmt >/dev/null 2>&1
-    FMT_RESULT=$?
-    if [ $FMT_RESULT -eq 0 ]; then
-        USER_MESSAGE="$USER_MESSAGE ✨ formatted"
+    # Check if project should be excluded from auto-formatting
+    EXCLUSIONS_FILE="$HOME/.claude/config/cargo-fmt-exclusions.txt"
+    SKIP_FMT=false
+    if [[ -f "$EXCLUSIONS_FILE" ]]; then
+        # Get project name from Cargo.toml or directory name
+        PROJECT_NAME=""
+        if [[ -f "$CARGO_DIR/Cargo.toml" ]]; then
+            PROJECT_NAME=$(grep -m1 '^name' "$CARGO_DIR/Cargo.toml" | sed 's/.*"\([^"]*\)".*/\1/')
+        fi
+        if [[ -z "$PROJECT_NAME" ]]; then
+            PROJECT_NAME=$(basename "$CARGO_DIR")
+        fi
+        # Check if project name is in exclusions file (one project per line)
+        if grep -qx "$PROJECT_NAME" "$EXCLUSIONS_FILE" 2>/dev/null; then
+            SKIP_FMT=true
+        fi
+    fi
+
+    # Run formatter and add status to message (unless excluded)
+    if [ "$SKIP_FMT" = false ]; then
+        cargo +nightly fmt >/dev/null 2>&1
+        FMT_RESULT=$?
+        if [ $FMT_RESULT -eq 0 ]; then
+            USER_MESSAGE="$USER_MESSAGE ✨ formatted"
+        fi
     fi
 
     # Add agent context for bevy_brp project - use systemMessage since additionalContext may not work

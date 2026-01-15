@@ -1,5 +1,6 @@
 # Claude Code system directories
 .claude/
+cache/
 debug/
 file-history/
 session-env/
