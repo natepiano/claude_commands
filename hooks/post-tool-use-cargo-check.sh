@@ -165,7 +165,7 @@ if [ $CHECK_RESULT -eq 0 ]; then
     fi
 
     # Check if project should be excluded from auto-formatting
-    EXCLUSIONS_FILE="$HOME/.claude/config/cargo-fmt-exclusions.txt"
+    EXCLUSIONS_FILE="$HOME/.claude/config/cargo-fmt-exclusions.json"
     SKIP_FMT=false
     if [[ -f "$EXCLUSIONS_FILE" ]]; then
         # Get project name from Cargo.toml or directory name
@@ -176,8 +176,8 @@ if [ $CHECK_RESULT -eq 0 ]; then
         if [[ -z "$PROJECT_NAME" ]]; then
             PROJECT_NAME=$(basename "$CARGO_DIR")
         fi
-        # Check if project name is in exclusions file (one project per line)
-        if grep -qx "$PROJECT_NAME" "$EXCLUSIONS_FILE" 2>/dev/null; then
+        # Check if project name is in exclusions JSON array
+        if jq -e --arg name "$PROJECT_NAME" 'any(. == $name)' "$EXCLUSIONS_FILE" >/dev/null 2>&1; then
             SKIP_FMT=true
         fi
     fi
