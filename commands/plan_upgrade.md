@@ -255,6 +255,8 @@ UPGRADE_SUFFIX = -upgraded.md
        2. **AWAIT APPROVAL**: Stop and wait for user confirmation ("go ahead" or similar)
 
        3. **IMPLEMENT**: Make the changes and stop
+          - Use the LSP tool (`findReferences`, `goToDefinition`, `incomingCalls`) to locate all usages before modifying types, functions, or signatures
+          - LSP is faster and more accurate than grep/search for Rust codebases
 
        4. **BUILD & VALIDATE**: Execute the build process:
           ```bash

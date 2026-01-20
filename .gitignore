@@ -3,6 +3,7 @@
 cache/
 debug/
 file-history/
+paste-cache/
 session-env/
 shell-snapshots/
 statsig/
