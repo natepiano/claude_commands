@@ -1,4 +1,5 @@
 [
+  "bevy",
   "bevy_tween",
   "bevy_debug_grid",
   "bevy_lookup_curve"
