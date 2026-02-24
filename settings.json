@@ -63,6 +63,8 @@
   },
   "writePaths": [
     "/Users/natemccoy/Library/Caches/Mozilla.sccache",
-    "/Users/natemccoy/rust"
+    "/Users/natemccoy/rust",
+    "/tmp",
+    "/Users/natemccoy/.claude/"
   ]
 }
