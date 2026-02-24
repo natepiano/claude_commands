@@ -1,5 +1,8 @@
 {
   "$schema": "https://json.schemastore.org/claude-code-settings.json",
+  "env": {
+    "CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS": "1"
+  },
   "includeCoAuthoredBy": false,
   "hooks": {
     "PostToolUse": [
@@ -30,11 +33,35 @@
     "type": "command",
     "command": "printf \"%s%% Press ? for shortcuts\" \"$(basename \"$(pwd)\")\""
   },
+  "enabledPlugins": {
+    "rust-analyzer-lsp@claude-plugins-official": true
+  },
   "alwaysThinkingEnabled": true,
+  "additionalDirectories": [
+    "/Users/natemccoy/rust",
+    "/Users/natemccoy/Library",
+    "/tmp"
+  ],
+  "teammateMode": "tmux",
   "feedbackSurveyState": {
     "lastShownTime": 1754090074729
   },
-  "enabledPlugins": {
-    "rust-analyzer-lsp@claude-plugins-official": true
-  }
+  "effortLevel": "medium",
+  "sandbox": {
+    "enabled": true,
+    "autoAllowBashIfSandboxed": true,
+    "allowUnsandboxedCommands": true
+  },
+  "permissions": {
+    "allow": [
+      "Edit(//Users/natemccoy/.claude/**)",
+      "Edit(//Users/natemccoy/rust/**)",
+      "Read(//Users/natemccoy/.cargo/registry/src**)",
+      "Bash(//Users/natemccoy/rust/**/.git/**)",
+      "Bash(//Users/natemccoy/Library/Caches/Mozilla.sccache/**)"
+    ]
+  },
+  "writePaths": [
+    "/Users/natemccoy/Library/Caches/Mozilla.sccache"
+  ]
 }

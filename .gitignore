@@ -12,6 +12,8 @@ ide/
 plugins/
 projects/
 plans/
+tasks/
+teams/
 
 # Credentials
 .credentials.json

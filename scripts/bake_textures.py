@@ -255,7 +255,7 @@ def setup_blender_environment() -> None:
 
     # Configure rendering
     bpy.context.scene.render.engine = "CYCLES"
-    bpy.context.scene.cycles.bake_margin = settings["bake_margin"]
+    bpy.context.scene.render.bake.margin = settings["bake_margin"]
 
     if settings.get("use_gpu"):
         prefs = bpy.context.preferences.addons["cycles"].preferences
@@ -706,11 +706,21 @@ def pack_metallic_roughness_for_object(obj_name: str | None) -> None:
 
     output_filename = generate_name("metallic_roughness", obj_name, ".png")
 
-    # Configure compositor
-    tree = bpy.context.scene.node_tree
+    # Configure compositor (Blender 5.0+: scene.node_tree replaced by compositing_node_group)
+    bpy.context.scene.use_nodes = True
+    if bpy.context.scene.compositing_node_group is None:
+        group = bpy.data.node_groups.new("Compositing", "CompositorNodeTree")
+        bpy.context.scene.compositing_node_group = group
+    tree = bpy.context.scene.compositing_node_group
     nodes = tree.nodes
     links = tree.links
     nodes.clear()
+
+    # Set up tree interface with an Image output socket (Blender 5.0+)
+    iface = tree.interface
+    for item in list(iface.items_tree):
+        iface.remove(item)
+    iface.new_socket("Image", in_out="OUTPUT", socket_type="NodeSocketColor")
 
     # Ensure Non-Color colorspace
     rough_img.colorspace_settings.name = "Non-Color"
@@ -729,7 +739,7 @@ def pack_metallic_roughness_for_object(obj_name: str | None) -> None:
 
     combine = nodes.new(type="CompositorNodeCombineColor")
 
-    output = nodes.new(type="CompositorNodeComposite")
+    output = nodes.new(type="NodeGroupOutput")
 
     # Connect
     links.new(rough_node.outputs["Image"], sep_rough.inputs["Image"])

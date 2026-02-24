@@ -92,7 +92,33 @@ See `~/.claude/scripts/bevy_dependency_check.py` for reference implementation wi
 
 </python_requirements>
 
+### package management
+- **ALWAYS** use `uv` instead of `pip` for installing Python packages
+
+<incorrect>
+```bash
+pip install some-package
+```
+</incorrect>
+
+<correct>
+```bash
+uv pip install some-package
+```
+</correct>
+
+## LSP
+- **ALWAYS** prefer LSP tools (go-to-definition, find references, hover types) over grep/glob when working in any language that has LSP support
+- Use LSP for finding definitions, references, and type info before resorting to text search
+
+## bevy BRP MCP
+- when the user says "launch", just launch the app directly — don't try to shut down first. The user has already shut it down.
+- when the user says "relaunch", shut down the app first, then launch it.
+
 ## working with the user
+
+### iterative problem solving
+When iterating on a problem that doesn't resolve within a couple of attempts, **always** create an attempts log in the project memory directory. Log every approach tried — what was changed, the reasoning, and the result. Update the log **before** moving to the next attempt. Inform the user whenever a new entry is added (e.g. "Updated attempts log — attempt #N: ...") so they know progress is being tracked without having to ask.
 
 ### renaming code
 if you need something renamed such as a type or a function or whatever, the user can use the editor's ability to do a global change very quickly. in such situations, ask the user if they wish to rename the field so it can be done quickly and accurately.
