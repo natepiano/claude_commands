@@ -1,34 +1,22 @@
-# Claude Code system directories
-.claude/
-cache/
-debug/
-file-history/
-paste-cache/
-session-env/
-shell-snapshots/
-statsig/
-todos/
-ide/
-plugins/
-projects/
-plans/
-tasks/
-teams/
+# Ignore everything
+*
 
-# Credentials
-.credentials.json
+# Allow what we track
+!.gitignore
+!CLAUDE.md
+!README.md
+!settings.json
+!keybindings.json
+!commands/
+!commands/**
+!config/
+!config/**
+!scripts/
+!scripts/**
+!shared/
+!shared/**
+!agents/
+!agents/**
 
-# Local settings
-settings.local.json
-
-# Cache files
-stats-cache.json
-
-# Conversation history
-history.jsonl
-
-# Python cache
+# Python cache (inside allowed dirs)
 scripts/__pycache__/
-
-# macOS system files
-.DS_Store

@@ -49,7 +49,7 @@ Update each todo status to "in_progress" when starting that step, and "completed
 </DiscoverWorktrees>
 
 <ValidateDeletionTarget>
-    - Run validation script: `bash .claude/scripts/delete_a_worktree_validation.sh "$SELECTED_WORKTREE"`
+    - Run validation script: `bash ~/.claude/scripts/delete_a_worktree_validation.sh "$SELECTED_WORKTREE"`
     - Parse JSON result to check validation status
     - If status is "error", display the message and STOP
     - Store validation results for later use
