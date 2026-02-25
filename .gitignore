@@ -6,7 +6,10 @@
 !CLAUDE.md
 !README.md
 !settings.json
+!settings.local.json
 !keybindings.json
+!.claude/
+!.claude/settings.local.json
 !commands/
 !commands/**
 !config/
