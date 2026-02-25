@@ -51,18 +51,23 @@
   "sandbox": {
     "enabled": true,
     "autoAllowBashIfSandboxed": true,
-    "allowUnsandboxedCommands": true
+    "allowUnsandboxedCommands": true,
+    "network": {
+      "allowLocalBinding": true
+    }
   },
   "permissions": {
     "allow": [
+      "Bash(cargo *)",
+      "Bash(sccache *)",
+      "Bash(//Users/natemccoy/Library/Caches/Mozilla.sccache/**)",
+      "Bash(//Users/natemccoy/rust/**/.git/**)",
       "Edit(//Users/natemccoy/.claude/**)",
       "Edit(//Users/natemccoy/rust/**)",
       "Edit(//Users/natemccoy/rust/bevy_brp/.claude/commands/**)",
-      "Write(//Users/natemccoy/rust/bevy_brp/.claude/commands/**)",
       "Read(//Users/natemccoy/.cargo/registry/src**)",
       "Read(//tmp/**)",
-      "Bash(//Users/natemccoy/rust/**/.git/**)",
-      "Bash(//Users/natemccoy/Library/Caches/Mozilla.sccache/**)"
+      "Write(//Users/natemccoy/rust/bevy_brp/.claude/commands/**)"
     ]
   },
   "writePaths": [
