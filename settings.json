@@ -57,6 +57,8 @@
     "allow": [
       "Edit(//Users/natemccoy/.claude/**)",
       "Edit(//Users/natemccoy/rust/**)",
+      "Edit(//Users/natemccoy/rust/bevy_brp/.claude/commands/**)",
+      "Write(//Users/natemccoy/rust/bevy_brp/.claude/commands/**)",
       "Read(//Users/natemccoy/.cargo/registry/src**)",
       "Read(//tmp/**)",
       "Bash(//Users/natemccoy/rust/**/.git/**)",
