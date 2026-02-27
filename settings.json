@@ -5,7 +5,42 @@
     "TMPPREFIX": "/tmp/claude/zsh"
   },
   "includeCoAuthoredBy": false,
+  "permissions": {
+    "allow": [
+      "Bash(cargo *)",
+      "Bash(git *)",
+      "Bash(sccache *)",
+      "Bash(//Users/natemccoy/Library/Caches/Mozilla.sccache/**)",
+      "Bash(//Users/natemccoy/rust/**/.git/**)",
+      "Edit(//Users/natemccoy/.claude/**)",
+      "Edit(//Users/natemccoy/rust/**)",
+      "Edit(//Users/natemccoy/rust/bevy_brp/.claude/commands/**)",
+      "Read(//Users/natemccoy/.cargo/registry/src**)",
+      "Read(//tmp/**)",
+      "Read(//var/folders/rf/twhh0jfd243fpltn5k0w1t980000gn/T/**)"
+    ]
+  },
   "hooks": {
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "~/.claude/hooks/session-start-lsp-check.sh"
+          }
+        ]
+      }
+    ],
+    "SessionEnd": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "~/.claude/hooks/session-end-lsp-cleanup.sh"
+          }
+        ]
+      }
+    ],
     "PostToolUse": [
       {
         "hooks": [
@@ -37,6 +72,20 @@
   "enabledPlugins": {
     "rust-analyzer-lsp@claude-plugins-official": true
   },
+  "sandbox": {
+    "enabled": true,
+    "autoAllowBashIfSandboxed": true,
+    "allowUnsandboxedCommands": true,
+    "network": {
+      "allowedDomains": [
+        "index.crates.io",
+        "static.crates.io",
+        "raw.githubusercontent.com",
+        "api.github.com"
+      ],
+      "allowLocalBinding": true
+    }
+  },
   "alwaysThinkingEnabled": true,
   "additionalDirectories": [
     "/Users/natemccoy/rust",
@@ -48,32 +97,6 @@
     "lastShownTime": 1754090074729
   },
   "effortLevel": "medium",
-  "sandbox": {
-    "enabled": true,
-    "autoAllowBashIfSandboxed": true,
-    "allowUnsandboxedCommands": true,
-    "network": {
-      "allowLocalBinding": true,
-      "allowedDomains": [
-        "index.crates.io",
-        "static.crates.io"
-      ]
-    }
-  },
-  "permissions": {
-    "allow": [
-      "Bash(cargo *)",
-      "Bash(git *)",
-      "Bash(sccache *)",
-      "Bash(//Users/natemccoy/Library/Caches/Mozilla.sccache/**)",
-      "Bash(//Users/natemccoy/rust/**/.git/**)",
-      "Edit(//Users/natemccoy/.claude/**)",
-      "Edit(//Users/natemccoy/rust/**)",
-      "Edit(//Users/natemccoy/rust/bevy_brp/.claude/commands/**)",
-      "Read(//Users/natemccoy/.cargo/registry/src**)",
-      "Read(//tmp/**)"
-    ]
-  },
   "writePaths": [
     "/Users/natemccoy/.cargo",
     "/Users/natemccoy/Library/Caches/Mozilla.sccache",

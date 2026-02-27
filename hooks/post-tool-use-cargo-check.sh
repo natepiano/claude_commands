@@ -232,18 +232,20 @@ else
 fi
 
 # Build JSON output with conditional additionalContext
-ADDITIONAL_CONTEXT=""
-if [ -n "$AGENT_MESSAGE" ]; then
-    ADDITIONAL_CONTEXT=", \"hookSpecificOutput\": {\"hookEventName\": \"PostToolUse\", \"additionalContext\": \"$AGENT_MESSAGE\"}"
-fi
+# NOTE: additionalContext disabled — agent now relies on LSP diagnostics instead.
+# Leaving hook output as user-facing only (systemMessage) to avoid conflicting signals.
+# ADDITIONAL_CONTEXT=""
+# if [ -n "$AGENT_MESSAGE" ]; then
+#     ADDITIONAL_CONTEXT=", \"hookSpecificOutput\": {\"hookEventName\": \"PostToolUse\", \"additionalContext\": \"$AGENT_MESSAGE\"}"
+# fi
 
-# Output JSON with proper escaping
+# Output JSON with proper escaping (user-facing systemMessage only)
 if command -v jq >/dev/null 2>&1; then
-    echo "{\"continue\": true, \"systemMessage\": $(printf "%b" "$USER_MESSAGE" | jq -Rs .)$ADDITIONAL_CONTEXT}"
+    echo "{\"continue\": true, \"systemMessage\": $(printf "%b" "$USER_MESSAGE" | jq -Rs .)}"
 else
     # Fallback: escape quotes and preserve newlines as \n
     ESCAPED_MESSAGE=$(printf "%b" "$USER_MESSAGE" | sed 's/\\/\\\\/g; s/"/\\"/g' | awk '{printf "%s\\n", $0}' | sed 's/\\n$//')
-    echo "{\"continue\": true, \"systemMessage\": \"$ESCAPED_MESSAGE\"$ADDITIONAL_CONTEXT}"
+    echo "{\"continue\": true, \"systemMessage\": \"$ESCAPED_MESSAGE\"}"
 fi
 
 # Always exit successfully

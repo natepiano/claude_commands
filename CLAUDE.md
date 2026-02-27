@@ -111,6 +111,7 @@ uv pip install some-package
 - **ALWAYS** prefer LSP tools (go-to-definition, find references, hover types) over grep/glob when working in any language that has LSP support
 - Use LSP for finding definitions, references, and type info before resorting to text search
 
+
 ## bevy BRP MCP
 - when the user says "launch", just launch the app directly — don't try to shut down first. The user has already shut it down.
 - when the user says "relaunch", shut down the app first, then launch it.
