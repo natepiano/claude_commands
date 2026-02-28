@@ -21,26 +21,6 @@
     ]
   },
   "hooks": {
-    "UserPromptSubmit": [
-      {
-        "hooks": [
-          {
-            "type": "command",
-            "command": "~/.claude/hooks/session-start-lsp-check.sh"
-          }
-        ]
-      }
-    ],
-    "SessionEnd": [
-      {
-        "hooks": [
-          {
-            "type": "command",
-            "command": "~/.claude/hooks/session-end-lsp-cleanup.sh"
-          }
-        ]
-      }
-    ],
     "PostToolUse": [
       {
         "hooks": [
