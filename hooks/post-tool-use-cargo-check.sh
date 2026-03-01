@@ -164,10 +164,10 @@ if [ $CHECK_RESULT -eq 0 ]; then
         USER_MESSAGE="🚀 cargo check passed"
     fi
 
-    # Check if project should be excluded from auto-formatting
-    EXCLUSIONS_FILE="$HOME/.claude/config/cargo-fmt-exclusions.json"
-    SKIP_FMT=false
-    if [[ -f "$EXCLUSIONS_FILE" ]]; then
+    # Check if project is in the formatting allowlist
+    ALLOWLIST_FILE="$HOME/.claude/config/cargo-fmt-allowlist.json"
+    RUN_FMT=false
+    if [[ -f "$ALLOWLIST_FILE" ]]; then
         # Get project name from Cargo.toml or directory name
         PROJECT_NAME=""
         if [[ -f "$CARGO_DIR/Cargo.toml" ]]; then
@@ -176,14 +176,14 @@ if [ $CHECK_RESULT -eq 0 ]; then
         if [[ -z "$PROJECT_NAME" ]]; then
             PROJECT_NAME=$(basename "$CARGO_DIR")
         fi
-        # Check if project name is in exclusions JSON array
-        if jq -e --arg name "$PROJECT_NAME" 'any(. == $name)' "$EXCLUSIONS_FILE" >/dev/null 2>&1; then
-            SKIP_FMT=true
+        # Check if project name is in allowlist JSON array
+        if jq -e --arg name "$PROJECT_NAME" 'any(. == $name)' "$ALLOWLIST_FILE" >/dev/null 2>&1; then
+            RUN_FMT=true
         fi
     fi
 
-    # Run formatter and add status to message (unless excluded)
-    if [ "$SKIP_FMT" = false ]; then
+    # Run formatter and add status to message (only if allowlisted)
+    if [ "$RUN_FMT" = true ]; then
         cargo +nightly fmt >/dev/null 2>&1
         FMT_RESULT=$?
         if [ $FMT_RESULT -eq 0 ]; then

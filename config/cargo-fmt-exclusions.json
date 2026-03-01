@@ -1,8 +1,0 @@
-[
-  "bevy",
-  "bevy_tween",
-  "bevy_debug_grid",
-  "bevy_lookup_curve",
-  "bevy_mesh_outline",
-  "bevy_mesh_outline_inverted_hull"
-]
