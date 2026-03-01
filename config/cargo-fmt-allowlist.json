@@ -1,6 +1,7 @@
 [
   "bevy_brp",
   "bevy_mesh_outline_benchmark",
+  "bevy_panorbit_camera",
   "bevy_panorbit_camera_ext",
   "bevy_silhouette",
   "bevy_window_manager",

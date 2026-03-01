@@ -20,6 +20,8 @@
 !shared/**
 !agents/
 !agents/**
+!hooks/
+!hooks/**
 
 # Python cache (inside allowed dirs)
 scripts/__pycache__/
