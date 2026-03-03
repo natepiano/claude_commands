@@ -164,9 +164,9 @@ if [ $CHECK_RESULT -eq 0 ]; then
         USER_MESSAGE="🚀 cargo check passed"
     fi
 
-    # Check if project is in the formatting allowlist
+    # Determine formatter: nightly for allowlisted projects, stable for others
     ALLOWLIST_FILE="$HOME/.claude/config/cargo-fmt-allowlist.json"
-    RUN_FMT=false
+    USE_NIGHTLY=false
     if [[ -f "$ALLOWLIST_FILE" ]]; then
         # Get project name from Cargo.toml or directory name
         PROJECT_NAME=""
@@ -178,17 +178,19 @@ if [ $CHECK_RESULT -eq 0 ]; then
         fi
         # Check if project name is in allowlist JSON array
         if jq -e --arg name "$PROJECT_NAME" 'any(. == $name)' "$ALLOWLIST_FILE" >/dev/null 2>&1; then
-            RUN_FMT=true
+            USE_NIGHTLY=true
         fi
     fi
 
-    # Run formatter and add status to message (only if allowlisted)
-    if [ "$RUN_FMT" = true ]; then
+    # Run formatter: nightly for allowlisted, stable for everything else
+    if [ "$USE_NIGHTLY" = true ]; then
         cargo +nightly fmt >/dev/null 2>&1
-        FMT_RESULT=$?
-        if [ $FMT_RESULT -eq 0 ]; then
-            USER_MESSAGE="$USER_MESSAGE ✨ formatted"
-        fi
+    else
+        cargo fmt >/dev/null 2>&1
+    fi
+    FMT_RESULT=$?
+    if [ $FMT_RESULT -eq 0 ]; then
+        USER_MESSAGE="$USER_MESSAGE ✨ formatted"
     fi
 
     # Add agent context for bevy_brp project - use systemMessage since additionalContext may not work

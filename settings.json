@@ -8,8 +8,10 @@
   "permissions": {
     "allow": [
       "Bash(cargo *)",
+      "Bash(gh *)",
       "Bash(git *)",
       "Bash(sccache *)",
+      "Bash(~/.claude/scripts/release/*)",
       "Bash(//Users/natemccoy/Library/Caches/Mozilla.sccache/**)",
       "Bash(//Users/natemccoy/rust/**/.git/**)",
       "Edit(//Users/natemccoy/.claude/**)",
@@ -56,12 +58,16 @@
     "enabled": true,
     "autoAllowBashIfSandboxed": true,
     "allowUnsandboxedCommands": true,
+    "excludedCommands": [
+      "gh"
+    ],
     "network": {
       "allowedDomains": [
         "index.crates.io",
         "static.crates.io",
         "raw.githubusercontent.com",
-        "api.github.com"
+        "api.github.com",
+        "github.com"
       ],
       "allowLocalBinding": true
     }
@@ -81,6 +87,7 @@
     "/Users/natemccoy/.cargo",
     "/Users/natemccoy/Library/Caches/Mozilla.sccache",
     "/Users/natemccoy/rust",
+    "/Users/natemccoy/rust/**/.git",
     "/tmp"
   ]
 }
