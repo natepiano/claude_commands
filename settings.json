@@ -15,14 +15,26 @@
       "Bash(//Users/natemccoy/Library/Caches/Mozilla.sccache/**)",
       "Bash(//Users/natemccoy/rust/**/.git/**)",
       "Edit(//Users/natemccoy/.claude/**)",
+      "Edit(//Users/natemccoy/Library/Application Support/**)",
       "Edit(//Users/natemccoy/rust/**)",
       "Edit(//Users/natemccoy/rust/bevy_brp/.claude/commands/**)",
       "Read(//Users/natemccoy/.cargo/registry/src**)",
+      "Read(//Users/natemccoy/Library/Application Support/**)",
       "Read(//tmp/**)",
       "Read(//var/folders/rf/twhh0jfd243fpltn5k0w1t980000gn/T/**)"
     ]
   },
   "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "mkdir -p /tmp/claude"
+          }
+        ]
+      }
+    ],
     "PostToolUse": [
       {
         "hooks": [
@@ -85,6 +97,7 @@
   "effortLevel": "medium",
   "writePaths": [
     "/Users/natemccoy/.cargo",
+    "/Users/natemccoy/Library/Application Support/**",
     "/Users/natemccoy/Library/Caches/Mozilla.sccache",
     "/Users/natemccoy/rust",
     "/Users/natemccoy/rust/**/.git",

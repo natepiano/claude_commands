@@ -10,6 +10,7 @@
 
 <AnalyzeChanges>
 Run `git status` and `git diff` (staged and unstaged) to understand the current changes.
+**CRITICAL**: You must evaluate EVERY uncommitted file for inclusion in the commit — regardless of file type (.md, .yml, .toml, .rs, etc.) and regardless of what task you were working on prior to this command. Do not carry over any file exclusions from previous operations. The commit candidate set is determined solely by `git status`, not by what you were previously focused on.
 If no uncommitted changes exist, inform the user and stop.
 </AnalyzeChanges>
 
