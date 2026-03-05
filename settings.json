@@ -10,7 +10,9 @@
       "Bash(cargo *)",
       "Bash(gh *)",
       "Bash(git *)",
+      "Bash(mkdir *)",
       "Bash(sccache *)",
+      "Bash(run_test.sh *)",
       "Bash(~/.claude/scripts/release/*)",
       "Bash(//Users/natemccoy/Library/Caches/Mozilla.sccache/**)",
       "Bash(//Users/natemccoy/rust/**/.git/**)",
@@ -70,9 +72,6 @@
     "enabled": true,
     "autoAllowBashIfSandboxed": true,
     "allowUnsandboxedCommands": true,
-    "excludedCommands": [
-      "gh"
-    ],
     "network": {
       "allowedDomains": [
         "index.crates.io",
@@ -82,13 +81,18 @@
         "github.com"
       ],
       "allowLocalBinding": true
-    }
+    },
+    "excludedCommands": [
+      "gh"
+    ]
   },
   "alwaysThinkingEnabled": true,
+  "skipDangerousModePermissionPrompt": true,
   "additionalDirectories": [
     "/Users/natemccoy/rust",
     "/Users/natemccoy/Library",
-    "/tmp"
+    "/tmp",
+    "/tmp/claude/"
   ],
   "teammateMode": "tmux",
   "feedbackSurveyState": {
@@ -102,5 +106,6 @@
     "/Users/natemccoy/rust",
     "/Users/natemccoy/rust/**/.git",
     "/tmp"
-  ]
+  ],
+  "voiceEnabled": true
 }
