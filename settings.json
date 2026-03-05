@@ -11,6 +11,7 @@
       "Bash(gh *)",
       "Bash(git *)",
       "Bash(mkdir *)",
+      "Bash(rm *)",
       "Bash(sccache *)",
       "Bash(run_test.sh *)",
       "Bash(~/.claude/scripts/release/*)",
@@ -23,6 +24,7 @@
       "Read(//Users/natemccoy/.cargo/registry/src**)",
       "Read(//Users/natemccoy/Library/Application Support/**)",
       "Read(//tmp/**)",
+      "Read(/private/tmp*)",
       "Read(//var/folders/rf/twhh0jfd243fpltn5k0w1t980000gn/T/**)"
     ]
   },
@@ -87,6 +89,7 @@
     ]
   },
   "alwaysThinkingEnabled": true,
+  "voiceEnabled": true,
   "skipDangerousModePermissionPrompt": true,
   "additionalDirectories": [
     "/Users/natemccoy/rust",
@@ -98,14 +101,15 @@
   "feedbackSurveyState": {
     "lastShownTime": 1754090074729
   },
-  "effortLevel": "medium",
+  "effortLevel": "high",
   "writePaths": [
     "/Users/natemccoy/.cargo",
     "/Users/natemccoy/Library/Application Support/**",
     "/Users/natemccoy/Library/Caches/Mozilla.sccache",
     "/Users/natemccoy/rust",
     "/Users/natemccoy/rust/**/.git",
-    "/tmp"
-  ],
-  "voiceEnabled": true
+    "/tmp",
+    "/tmp/**",
+    "/private/tmp/**"
+  ]
 }

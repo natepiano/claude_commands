@@ -11,7 +11,12 @@
       "WebFetch(domain:localhost)",
       "Bash(GH_DEBUG=1 gh repo view:*)",
       "WebFetch(domain:github.com)",
-      "Bash(unset:*)"
+      "Bash(unset:*)",
+      "Bash(codex exec:*)",
+      "WebFetch(domain:developers.openai.com)",
+      "WebFetch(domain:aseemshrey.in)",
+      "WebFetch(domain:api.anthropic.com)",
+      "WebFetch(domain:http-intake.logs.us5.datadoghq.com)"
     ],
     "deny": [],
     "ask": []
