@@ -11,6 +11,7 @@
       "Bash(gh *)",
       "Bash(git *)",
       "Bash(mkdir *)",
+      "Bash(rg *)",
       "Bash(rm *)",
       "Bash(sccache *)",
       "Bash(run_test.sh *)",
@@ -85,7 +86,8 @@
       "allowLocalBinding": true
     },
     "excludedCommands": [
-      "gh"
+      "gh",
+      "git"
     ]
   },
   "alwaysThinkingEnabled": true,
@@ -101,7 +103,6 @@
   "feedbackSurveyState": {
     "lastShownTime": 1754090074729
   },
-  "effortLevel": "high",
   "writePaths": [
     "/Users/natemccoy/.cargo",
     "/Users/natemccoy/Library/Application Support/**",

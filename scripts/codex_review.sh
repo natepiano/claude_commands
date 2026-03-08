@@ -30,13 +30,30 @@ echo "reviewing" > "${STATUS_FILE}"
 # Run codex from the project directory so it picks up the correct repo context
 cd "${WORKING_DIR}"
 
-# Build the codex command — file mode uses `codex exec` (general), others use `codex exec review`
+# Build the codex command.
+#
+# `codex exec review` with --uncommitted/--base does NOT accept a [PROMPT] argument.
+# When a custom prompt is provided, fall back to `codex exec` (general) with the diff
+# piped via stdin — same approach used for file mode.
 USE_STDIN=false
-CMD=(codex exec review -c model_reasoning_effort='"high"' --ephemeral -o "${REVIEW_FILE}")
+DIFF_FILE="${SESSION_DIR}/diff.patch"
 
 case "${MODE}" in
   uncommitted)
-    CMD+=(--uncommitted)
+    if [[ -n "${CUSTOM_PROMPT}" ]]; then
+      # Generate diff ourselves so we can use `codex exec` with the custom prompt
+      { git diff; git diff --staged; } > "${DIFF_FILE}" 2>> "${LOG_FILE}"
+      # Append untracked files if any exist
+      for f in $(git ls-files --others --exclude-standard 2>/dev/null); do
+        git diff --no-index /dev/null "$f" >> "${DIFF_FILE}" 2>/dev/null || true
+      done
+      USE_STDIN=true
+      CMD=(codex exec -c model_reasoning_effort='"high"' --ephemeral --full-auto -o "${REVIEW_FILE}")
+      CMD+=("Review the following uncommitted changes. ${CUSTOM_PROMPT}")
+    else
+      CMD=(codex exec review -c model_reasoning_effort='"high"' --ephemeral -o "${REVIEW_FILE}")
+      CMD+=(--uncommitted)
+    fi
     ;;
   base)
     if [[ -z "${MODE_ARG}" ]]; then
@@ -44,7 +61,15 @@ case "${MODE}" in
       echo "base mode requires a branch argument" > "${LOG_FILE}"
       exit 1
     fi
-    CMD+=(--base "${MODE_ARG}")
+    if [[ -n "${CUSTOM_PROMPT}" ]]; then
+      git diff "${MODE_ARG}"...HEAD > "${DIFF_FILE}" 2>> "${LOG_FILE}"
+      USE_STDIN=true
+      CMD=(codex exec -c model_reasoning_effort='"high"' --ephemeral --full-auto -o "${REVIEW_FILE}")
+      CMD+=("Review the following changes against ${MODE_ARG}. ${CUSTOM_PROMPT}")
+    else
+      CMD=(codex exec review -c model_reasoning_effort='"high"' --ephemeral -o "${REVIEW_FILE}")
+      CMD+=(--base "${MODE_ARG}")
+    fi
     ;;
   file)
     if [[ -z "${MODE_ARG}" ]]; then
@@ -55,7 +80,6 @@ case "${MODE}" in
     # Generate the diff for this specific file and pipe via stdin
     FILE_PATH="${MODE_ARG}"
     BASE_BRANCH="${CUSTOM_PROMPT:-}"
-    DIFF_FILE="${SESSION_DIR}/file_diff.patch"
     if [[ -n "${BASE_BRANCH}" ]]; then
       git diff "${BASE_BRANCH}"...HEAD -- "${FILE_PATH}" > "${DIFF_FILE}" 2>> "${LOG_FILE}"
     else
@@ -73,12 +97,8 @@ case "${MODE}" in
       exit 1
     fi
     USE_STDIN=true
-    # File mode uses general `codex exec` instead of `codex exec review` — review subcommand
-    # expects git-based modes, not arbitrary file content via stdin
     CMD=(codex exec -c model_reasoning_effort='"high"' --ephemeral --full-auto -o "${REVIEW_FILE}")
     CMD+=("Review the following file content for ${FILE_PATH}. Provide a thorough code/design review with actionable findings.")
-    # Clear CUSTOM_PROMPT since it was used as base_branch
-    CUSTOM_PROMPT=""
     ;;
   *)
     echo "error" > "${STATUS_FILE}"
@@ -86,11 +106,6 @@ case "${MODE}" in
     exit 1
     ;;
 esac
-
-# Append custom review prompt if provided (not used by file mode)
-if [[ -n "${CUSTOM_PROMPT}" ]]; then
-  CMD+=("${CUSTOM_PROMPT}")
-fi
 
 if [[ "${USE_STDIN}" == "true" ]]; then
   if cat "${DIFF_FILE}" | "${CMD[@]}" > "${LOG_FILE}" 2>&1; then

@@ -49,6 +49,7 @@ install_verify = "crate_dir"
 name = "Display name"
 crates = ["crate_dir"]
 wait_seconds = 30
+workspace_dep_updates = ["dep_name"]
 post_script = ".claude/scripts/release/my_script.sh"
 
 [[publish_phases]]
@@ -75,6 +76,7 @@ All scriptable steps use shell scripts. The agent orchestrates script execution 
 - `bump_versions.sh` — update [package] version fields
 - `finalize_changelogs.sh` — replace [Unreleased] with version header
 - `publish_crate.sh` — dry-run and publish a single crate ⊘
+- `update_workspace_deps.sh` — update workspace dependency versions between publish phases ⊘
 - `push_release.sh` — tag, push branch, push tag ⊘
 - `verify_published.sh` — check crates.io versions ⊘
 - `create_github_release.sh` — create GitHub release ⊘
@@ -152,7 +154,7 @@ This applies to ALL bash commands and script invocations in this process.
 [ ] STEP 5:  Create Release Branch
 [ ] STEP 6:  Publish to crates.io
       ◇ pre_publish — API docs sync
-      [ ] Phase 1: Publish macros → update_workspace_dep.sh
+      [ ] Phase 1: Publish macros → update workspace deps
       [ ] Phase 2: Publish extras and mcp
 [ ] STEP 7:  Push Release Branch and Tag
 [ ] STEP 8:  Create GitHub Release
@@ -371,22 +373,18 @@ This produces a clean commit label visible in GitHub's file list for both CHANGE
 <PublishPhases>
 ## STEP 6: Publish to crates.io
 
-### Dry-Run All Crates First
+**IMPORTANT**: When `[[publish_phases]]` config exists, dry-runs and publishing happen **per-phase**, not all-upfront. This is critical for workspace dependency chains where later phases depend on earlier phases being published first (e.g., Phase 2 crates may depend on Phase 1 crates via workspace dependencies that get updated between phases).
 
-Run `publish_crate.sh --dry-run` for every crate to verify they all pass before publishing any of them (with `dangerouslyDisableSandbox: true`):
+### If no config — single crate or simple workspace
 
-**If `[[publish_phases]]` config exists:**
-For each phase in order, for each crate in the phase:
+**Dry-run** (with `dangerouslyDisableSandbox: true`):
+
+Single crate:
 ```bash
 ~/.claude/scripts/release/publish_crate.sh ${PACKAGE_NAME} --dry-run
 ```
 
-**If no config — single crate:**
-```bash
-~/.claude/scripts/release/publish_crate.sh ${PACKAGE_NAME} --dry-run
-```
-
-**If no config — workspace:**
+Workspace (no config):
 For each non-excluded workspace member:
 ```bash
 ~/.claude/scripts/release/publish_crate.sh ${PACKAGE_NAME} --dry-run
@@ -396,47 +394,66 @@ For each non-excluded workspace member:
 
 **If this is a dry-run release (`${DRY_RUN_FLAG}` is `--dry-run`), skip the rest of STEP 6 — do not publish.**
 
-### Hard Stop Before Publishing
-
 → **Manual confirmation required**: All dry-run checks passed. Type **publish** to publish to crates.io. This is irreversible.
 
-### Publish
+**Publish** (with `dangerouslyDisableSandbox: true`):
 
-**If `[[publish_phases]]` config exists:**
-
-Execute each phase in order:
-
-**For each phase:**
-1. Display: `Publishing phase: ${PHASE_NAME}`
-2. For each crate in the phase, publish (with `dangerouslyDisableSandbox: true`):
-```bash
-~/.claude/scripts/release/publish_crate.sh ${PACKAGE_NAME}
-```
-→ Report the script output to the user. Stop if any publish fails.
-
-3. If `wait_seconds` is set:
-```bash
-echo "Waiting ${WAIT_SECONDS} seconds for crates.io indexing..."
-sleep ${WAIT_SECONDS}
-```
-
-4. If `post_script` is set, execute the project-specific script (with `dangerouslyDisableSandbox: true`):
-```bash
-${POST_SCRIPT_PATH} ${VERSION}
-```
-→ Report the script output to the user. Stop if script fails.
-
-**If no config — single crate** (with `dangerouslyDisableSandbox: true`):
+Single crate:
 ```bash
 ~/.claude/scripts/release/publish_crate.sh ${PACKAGE_NAME}
 ```
 
-**If no config — workspace** (with `dangerouslyDisableSandbox: true`):
+Workspace:
 For each non-excluded workspace member:
 ```bash
 ~/.claude/scripts/release/publish_crate.sh ${PACKAGE_NAME}
 ```
 → Members are published in `[workspace.members]` order. If this fails due to dependency ordering, the project needs a `[[publish_phases]]` config.
+
+### If `[[publish_phases]]` config exists
+
+Execute each phase in order. **Each phase does its own dry-run before publishing.**
+
+**For each phase:**
+
+1. Display: `Publishing phase: ${PHASE_NAME}`
+
+2. **Dry-run** this phase's crates (with `dangerouslyDisableSandbox: true`):
+```bash
+~/.claude/scripts/release/publish_crate.sh ${PACKAGE_NAME} --dry-run
+```
+→ Report dry-run results. Stop if any dry-run fails.
+
+3. **If this is a dry-run release (`${DRY_RUN_FLAG}` is `--dry-run`)**: report what would be published for remaining phases, then skip the rest of STEP 6 — do not publish.
+
+4. **Hard stop before first publish only** (skip for subsequent phases):
+→ **Manual confirmation required**: Dry-run checks passed. Type **publish** to publish to crates.io. This is irreversible.
+
+5. **Publish** this phase's crates (with `dangerouslyDisableSandbox: true`):
+```bash
+~/.claude/scripts/release/publish_crate.sh ${PACKAGE_NAME}
+```
+→ Report the script output to the user. Stop if any publish fails.
+
+6. If `wait_seconds` is set:
+```bash
+echo "Waiting ${WAIT_SECONDS} seconds for crates.io indexing..."
+sleep ${WAIT_SECONDS}
+```
+
+7. If `workspace_dep_updates` is set, update the named workspace dependencies to the release version (with `dangerouslyDisableSandbox: true`):
+```bash
+~/.claude/scripts/release/update_workspace_deps.sh ${VERSION} ${DRY_RUN_FLAG} ${DEP_NAMES}
+```
+→ This updates `[workspace.dependencies]` entries in root `Cargo.toml`, waits for crates.io indexing with fibonacci backoff, verifies the build, and commits. Report the script output. Stop if it fails.
+
+8. If `post_script` is set, execute the project-specific script (with `dangerouslyDisableSandbox: true`):
+```bash
+${POST_SCRIPT_PATH} ${VERSION}
+```
+→ Report the script output to the user. Stop if script fails.
+
+→ **Then proceed to the next phase** (which will dry-run against the now-updated workspace state).
 </PublishPhases>
 
 <PushReleaseBranch>

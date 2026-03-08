@@ -182,15 +182,12 @@ if [ $CHECK_RESULT -eq 0 ]; then
         fi
     fi
 
-    # Run formatter: nightly for allowlisted, stable for everything else
+    # Run nightly formatter only for allowlisted projects
     if [ "$USE_NIGHTLY" = true ]; then
         cargo +nightly fmt >/dev/null 2>&1
-    else
-        cargo fmt >/dev/null 2>&1
-    fi
-    FMT_RESULT=$?
-    if [ $FMT_RESULT -eq 0 ]; then
-        USER_MESSAGE="$USER_MESSAGE ✨ formatted"
+        if [ $? -eq 0 ]; then
+            USER_MESSAGE="$USER_MESSAGE ✨ formatted"
+        fi
     fi
 
     # Add agent context for bevy_brp project - use systemMessage since additionalContext may not work
