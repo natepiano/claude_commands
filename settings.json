@@ -2,6 +2,7 @@
   "$schema": "https://json.schemastore.org/claude-code-settings.json",
   "env": {
     "CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS": "1",
+    "RUSTC_WRAPPER": "",
     "TMPPREFIX": "/tmp/claude/zsh"
   },
   "includeCoAuthoredBy": false,
@@ -87,7 +88,10 @@
     },
     "excludedCommands": [
       "gh",
-      "git"
+      "git",
+      "taplo",
+      "cargo",
+      ".github/scripts/validate_ci.sh"
     ]
   },
   "alwaysThinkingEnabled": true,
@@ -112,5 +116,6 @@
     "/tmp",
     "/tmp/**",
     "/private/tmp/**"
-  ]
+  ],
+  "effortLevel": "high"
 }
