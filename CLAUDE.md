@@ -129,27 +129,16 @@ if you need something renamed such as a type or a function or whatever, the user
 ### use $TMPDIR rather than /tmp
 don't use /tmp directory when you need temporary file processing, use $TEMPDIR which will automatically clean up temporary files
 
+## sandbox
+
+### gh CLI must always run unsandboxed
+- **ALWAYS** use `dangerouslyDisableSandbox: true` when running any `gh` command
+- The sandbox network proxy breaks TLS certificate verification for `gh` (`x509: OSStatus -26276`)
+- `excludedCommands` only bypasses the filesystem sandbox, not the network proxy
+- Do NOT try `gh` in the sandbox first — it will always fail. Use `dangerouslyDisableSandbox` from the start.
+
 ## bash commands
 
-### never use cat with heredoc in combined commands
-**CRITICAL**: NEVER use `cat > file << 'EOF'` patterns combined with other commands in a single Bash call.
-This breaks up command execution requiring permission gates.
-
-<incorrect>
-```bash
-cat > /tmp/test.rs << 'EOF'
-fn main() {}
-EOF
-rustc /tmp/test.rs -o /tmp/test && /tmp/test
-```
-</incorrect>
-
-<correct>
-```bash
-# Use Write tool for file creation, then separate Bash command for compilation
-# Or better: avoid creating test files altogether during reviews - just analyze the code logic
-```
-</correct>
 - when we use types i never want to see inline module paths, use them at the top of the file and not inline in the code
 - imports always go at the top of the file
 - never consolidate rust imports - we want them one-per-line
