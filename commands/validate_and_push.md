@@ -2,7 +2,7 @@
 description: Run local CI validation, push to origin, and monitor GitHub CI
 ---
 
-Run `.github/scripts/validate_ci.sh` from the project root.
+Run `~/.claude/scripts/validate_ci.sh` 
 
 **On validation failure:**
 - Do NOT push

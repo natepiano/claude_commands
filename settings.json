@@ -91,7 +91,7 @@
       "git",
       "taplo",
       "cargo",
-      ".github/scripts/validate_ci.sh"
+      "~/.claude/scripts/validate_ci.sh"
     ]
   },
   "alwaysThinkingEnabled": true,
