@@ -126,9 +126,6 @@ if you need something renamed such as a type or a function or whatever, the user
 
 ## working with files
 
-### use $TMPDIR rather than /tmp
-don't use /tmp directory when you need temporary file processing, use $TEMPDIR which will automatically clean up temporary files
-
 ## sandbox
 
 ### gh CLI must always run unsandboxed
@@ -137,8 +134,12 @@ don't use /tmp directory when you need temporary file processing, use $TEMPDIR w
 - `excludedCommands` only bypasses the filesystem sandbox, not the network proxy
 - Do NOT try `gh` in the sandbox first — it will always fail. Use `dangerouslyDisableSandbox` from the start.
 
-## bash commands
+### git branch-switching operations must run unsandboxed
+- **ALWAYS** use `dangerouslyDisableSandbox: true` for git operations that involve branch switching: `checkout`, `merge`, `rebase`, `stash`
+- These operations rewrite files under `.claude/` which the sandbox write restrictions block
+- Do NOT try these in the sandbox first — use `dangerouslyDisableSandbox` from the start.
 
+## rust
 - when we use types i never want to see inline module paths, use them at the top of the file and not inline in the code
 - imports always go at the top of the file
 - never consolidate rust imports - we want them one-per-line
