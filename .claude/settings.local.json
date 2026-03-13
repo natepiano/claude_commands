@@ -33,7 +33,8 @@
       "Bash(/Users/natemccoy/.cargo/sccache-wrapper.sh:*)",
       "Bash(RUSTC_WRAPPER=/Users/natemccoy/.cargo/sccache-wrapper.sh cargo check:*)",
       "Bash(python3:*)",
-      "Bash(SCCACHE_SERVER_UDS=/private/tmp/claude-501/sccache.sock:*)"
+      "Bash(SCCACHE_SERVER_UDS=/private/tmp/claude-501/sccache.sock:*)",
+      "WebFetch(domain:cargo-generate.github.io)"
     ],
     "deny": [],
     "ask": []
