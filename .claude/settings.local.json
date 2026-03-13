@@ -34,7 +34,12 @@
       "Bash(RUSTC_WRAPPER=/Users/natemccoy/.cargo/sccache-wrapper.sh cargo check:*)",
       "Bash(python3:*)",
       "Bash(SCCACHE_SERVER_UDS=/private/tmp/claude-501/sccache.sock:*)",
-      "WebFetch(domain:cargo-generate.github.io)"
+      "WebFetch(domain:cargo-generate.github.io)",
+      "Read(//Users/natemccoy/rust/**)",
+      "Bash(~/.claude/scripts/new_rust_project.sh cargo-port:*)",
+      "Bash(cd ~/rust/cargo-port && taplo fmt Cargo.toml 2>&1)",
+      "WebFetch(domain:docs.rs)",
+      "WebFetch(domain:killercup.github.io)"
     ],
     "deny": [],
     "ask": []

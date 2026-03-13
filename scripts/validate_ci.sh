@@ -21,7 +21,7 @@ cargo clippy --workspace --all-targets --all-features -- -D warnings
 
 cargo build --release --workspace --all-features --examples
 
-cargo nextest run --workspace --all-features
+cargo nextest run --workspace --all-features --tests
 
 if [ -d benches ] && find benches -type f \( -name '*.rs' -o -name '*.bench' \) | grep -q .; then
   cargo bench --workspace --all-features
@@ -30,5 +30,5 @@ fi
 if [ "$IS_SELF_MEND" -eq 1 ]; then
   cargo run -- --fail-on-warn
 else
-  cargo mend
+  cargo mend --fail-on-warn
 fi

@@ -35,8 +35,19 @@ if [[ -d "$DEST" ]]; then
   exit 1
 fi
 
+CARGO_GEN_CONFIG="${CARGO_HOME:-$HOME/.cargo}/cargo-generate.toml"
+if ! grep -q 'favorites.rust-template' "$CARGO_GEN_CONFIG" 2>/dev/null; then
+  echo "=== Adding rust-template to cargo-generate favorites ==="
+  cat >> "$CARGO_GEN_CONFIG" <<'EOF'
+
+[favorites.rust-template]
+git = "https://github.com/natepiano/rust-template"
+description = "natepiano's Rust project template"
+EOF
+fi
+
 echo "=== Generating project from template ==="
-cargo generate natepiano/rust-template \
+cargo generate rust-template \
   --name "$PROJECT_NAME" \
   --destination "$HOME/rust" \
   --define "bevy=$BEVY" \
@@ -44,8 +55,16 @@ cargo generate natepiano/rust-template \
 
 cd "$DEST"
 
+if ! command -v cargo-mend &>/dev/null; then
+  echo "=== Installing cargo-mend ==="
+  cargo install cargo-mend
+fi
+
 echo "=== Formatting Cargo.toml ==="
 taplo fmt Cargo.toml
+
+echo "=== Generating Cargo.lock ==="
+cargo generate-lockfile
 
 echo "=== Creating initial commit ==="
 git add -A
