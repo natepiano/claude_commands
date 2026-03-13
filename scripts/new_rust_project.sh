@@ -22,6 +22,7 @@ while [[ $# -gt 0 ]]; do
   case "$1" in
     --lib)     CRATE_TYPE="lib" ;;
     --no-bevy) BEVY="false" ;;
+    -h|--help) usage ;;
     *)         echo "Unknown option: $1" >&2; usage ;;
   esac
   shift
