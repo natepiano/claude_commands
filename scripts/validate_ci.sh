@@ -13,22 +13,37 @@ if [ "$REPO_NAME" = "cargo-mend" ]; then
   IS_SELF_MEND=1
 fi
 
-cargo +nightly fmt --all --check
+run_step() {
+  local label="$1"
+  shift
+  echo "=== STEP: ${label} ==="
+  if ! "$@"; then
+    echo ""
+    echo "!!! VALIDATION FAILED at step: ${label} !!!"
+    echo "!!! Command: $* !!!"
+    exit 1
+  fi
+}
 
-taplo fmt --check
+run_step "rustfmt" cargo +nightly fmt --all --check
 
-cargo clippy --workspace --all-targets --all-features -- -D warnings
+run_step "taplo" taplo fmt --check
 
-cargo build --release --workspace --all-features --examples
+run_step "clippy" cargo clippy --workspace --all-targets --all-features -- -D warnings
 
-cargo nextest run --workspace --all-features --tests
+run_step "build examples" cargo build --release --workspace --all-features --examples
+
+run_step "nextest" cargo nextest run --workspace --all-features --tests
 
 if [ -d benches ] && find benches -type f \( -name '*.rs' -o -name '*.bench' \) | grep -q .; then
-  cargo bench --workspace --all-features
+  run_step "bench" cargo bench --workspace --all-features
 fi
 
 if [ "$IS_SELF_MEND" -eq 1 ]; then
-  cargo run -- --fail-on-warn
+  run_step "cargo-mend" cargo run -- --fail-on-warn
 else
-  cargo mend --fail-on-warn
+  run_step "cargo-mend" cargo mend --fail-on-warn
 fi
+
+echo ""
+echo "=== ALL VALIDATION STEPS PASSED ==="

@@ -6,15 +6,22 @@
 
 set -euo pipefail
 
-branch="${1:-}"
-count="${2:-1}"
-
-branch_flag=()
-if [[ -n "$branch" ]]; then
-    branch_flag=(--branch "$branch")
+# If only one arg and it's a number, treat it as count (not branch)
+if [[ $# -eq 1 && "$1" =~ ^[0-9]+$ ]]; then
+    branch=""
+    count="$1"
+else
+    branch="${1:-}"
+    count="${2:-1}"
 fi
 
-run_ids=$(gh run list "${branch_flag[@]}" --limit "$count" --status completed --json databaseId,createdAt,headBranch --jq '.[] | "\(.databaseId) \(.createdAt) \(.headBranch)"')
+repo_url=$(gh repo view --json url --jq '.url')
+
+if [[ -n "$branch" ]]; then
+    run_ids=$(gh run list --branch "$branch" --limit "$count" --status completed --json databaseId,createdAt,headBranch --jq '.[] | "\(.databaseId) \(.createdAt) \(.headBranch)"')
+else
+    run_ids=$(gh run list --limit "$count" --status completed --json databaseId,createdAt,headBranch --jq '.[] | "\(.databaseId) \(.createdAt) \(.headBranch)"')
+fi
 
 if [[ -z "$run_ids" ]]; then
     if [[ -n "$branch" ]]; then
@@ -30,11 +37,7 @@ while IFS= read -r line; do
     created=$(echo "$line" | cut -d' ' -f2)
     run_branch=$(echo "$line" | cut -d' ' -f3-)
 
-    if [[ -n "$branch" ]]; then
-        echo "=== Run $run_id ($created) ==="
-    else
-        echo "=== Run $run_id ($created) [$run_branch] ==="
-    fi
+    echo "=== Run $run_id ($created) [$run_branch] $repo_url/actions/runs/$run_id ==="
     gh run view "$run_id" --json jobs --jq '
         .jobs | sort_by(.name) | .[] |
         (if .startedAt and .completedAt then
