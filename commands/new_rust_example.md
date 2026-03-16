@@ -24,7 +24,7 @@ If `$ARGUMENTS` is empty:
 Run the scaffolding script with the `--example` flag from the current working directory.
 
 ```bash
-~/.claude/scripts/rust_generate.sh <example-name> --example
+~/.claude/scripts/new_rust_project/rust_generate.sh <example-name> --example
 ```
 
 Use `dangerouslyDisableSandbox: true` for this command.

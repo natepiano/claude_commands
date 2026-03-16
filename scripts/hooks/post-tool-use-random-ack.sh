@@ -13,7 +13,7 @@ fi
 ACK_CHANCE=25
 
 # Path to acknowledgements file
-ACK_FILE="$HOME/.claude/scripts/acknowledgements.txt"
+ACK_FILE="$HOME/.claude/config/acknowledgements.txt"
 
 
 # Check acknowledgement chance first

@@ -33,7 +33,7 @@ Wait for the answer before proceeding.
 Run the scaffolding script with the resolved arguments. If `--include-github-repo` is used, this script uses `gh` so it **must** run unsandboxed.
 
 ```bash
-~/.claude/scripts/rust_generate.sh <project-name> [--lib] [--no-bevy] [--include-github-repo]
+~/.claude/scripts/new_rust_project/rust_generate.sh <project-name> [--lib] [--no-bevy] [--include-github-repo]
 ```
 
 Use `dangerouslyDisableSandbox: true` for this command.

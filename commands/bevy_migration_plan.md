@@ -177,17 +177,17 @@ Launching Pass 2 deep analysis for [N] guides...
 
 Single pattern (returns just the number, e.g., `42`):
 ```bash
-~/.claude/scripts/bevy_migration_count_pattern.sh "pattern" "${CODEBASE}" rust
+~/.claude/scripts/bevy_migration_plan/bevy_migration_count_pattern.sh "pattern" "${CODEBASE}" rust
 ```
 
 Multiple patterns with breakdown:
 ```bash
-~/.claude/scripts/bevy_migration_count_pattern.sh --multiple "pattern1" "pattern2" "pattern3" -- "${CODEBASE}" rust
+~/.claude/scripts/bevy_migration_plan/bevy_migration_count_pattern.sh --multiple "pattern1" "pattern2" "pattern3" -- "${CODEBASE}" rust
 ```
 
 Verify Pass 2 counts against Pass 1 total (for Pass 2 validation):
 ```bash
-~/.claude/scripts/bevy_migration_count_pattern.sh --verify \
+~/.claude/scripts/bevy_migration_plan/bevy_migration_count_pattern.sh --verify \
   --pass1-total ${PASS1_TOTAL} \
   --patterns "pattern1" "pattern2" "pattern3" -- "${CODEBASE}" rust
 ```
@@ -238,13 +238,13 @@ gh api repos/bevyengine/bevy/releases/tags/v${VERSION}
 **Clone repository if needed:**
 
 ```bash
-~/.claude/scripts/bevy_migration_ensure_repo.sh "${VERSION}"
+~/.claude/scripts/bevy_migration_plan/bevy_migration_ensure_repo.sh "${VERSION}"
 ```
 
 **Verify migration guides exist:**
 
 ```bash
-~/.claude/scripts/bevy_migration_verify_guides.sh "${GUIDES_DIR}"
+~/.claude/scripts/bevy_migration_plan/bevy_migration_verify_guides.sh "${GUIDES_DIR}"
 ```
 
 **Create output directory:**
@@ -264,7 +264,7 @@ mkdir -p "${CODEBASE}/.claude/bevy_migration"
 **Run dependency compatibility check and save output:**
 
 ```bash
-~/.claude/scripts/bevy_migration_dependency_check.py --bevy-version "${VERSION}" --codebase "${CODEBASE}" --output "/tmp/bevy_migration_deps_$(basename ${CODEBASE}).md"
+~/.claude/scripts/bevy_migration_plan/bevy_migration_dependency_check.py --bevy-version "${VERSION}" --codebase "${CODEBASE}" --output "/tmp/bevy_migration_deps_$(basename ${CODEBASE}).md"
 ```
 
 **The script will:**
@@ -308,7 +308,7 @@ You are analyzing Bevy ${VERSION} migration guides to determine which ones apply
 
 Run this script to get your tranche of migration guide files:
 ```bash
-~/.claude/scripts/bevy_migration_get_tranche.py \
+~/.claude/scripts/bevy_migration_plan/bevy_migration_get_tranche.py \
   --guides-dir "${GUIDES_DIR}" \
   --subagent-index ${N}
 ```
@@ -323,7 +323,7 @@ For EACH guide file in your assigned_guides:
 2. Extract 3-5 key search patterns from the guide (types, functions, modules mentioned)
 3. Count occurrences for each pattern using <CountingProcedure/>:
    ```bash
-   ~/.claude/scripts/bevy_migration_count_pattern.sh "pattern" "${CODEBASE}" rust
+   ~/.claude/scripts/bevy_migration_plan/bevy_migration_count_pattern.sh "pattern" "${CODEBASE}" rust
    ```
    The output is the count (e.g., `42`) - read it directly from the Bash tool result.
 4. Determine: APPLICABLE or NOT_APPLICABLE
@@ -468,13 +468,13 @@ Expected total occurrences from Pass 1: ${PASS1_TOTAL_OCCURRENCES}
 
    First, build your command using this template:
    ```
-   ~/.claude/scripts/bevy_migration_count_pattern.sh --verify --pass1-total [N] --patterns "p1" "p2" "p3" -- "${CODEBASE}" rust
+   ~/.claude/scripts/bevy_migration_plan/bevy_migration_count_pattern.sh --verify --pass1-total [N] --patterns "p1" "p2" "p3" -- "${CODEBASE}" rust
    ```
 
    Then output this declaration with your EXACT command:
    ```
    I will now run this exact command with ZERO modifications:
-   ~/.claude/scripts/bevy_migration_count_pattern.sh --verify --pass1-total [actual number] --patterns [actual patterns] -- [actual path] rust
+   ~/.claude/scripts/bevy_migration_plan/bevy_migration_count_pattern.sh --verify --pass1-total [actual number] --patterns [actual patterns] -- [actual path] rust
    ```
 
    **STEP B: Run the command and immediately describe what you see**

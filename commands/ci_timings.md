@@ -2,7 +2,7 @@
 description: Show CI job durations for recent runs, optionally filtered by branch
 ---
 
-Run `~/.claude/scripts/ci_timings.sh $ARGUMENTS` and display the output as a markdown table.
+Run `~/.claude/scripts/ci_timings/ci_timings.sh $ARGUMENTS` and display the output as a markdown table.
 
 - If no arguments are provided, shows the latest run across all branches (with branch name in output).
 - First argument: branch name (filters to that branch only)

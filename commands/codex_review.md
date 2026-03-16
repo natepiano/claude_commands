@@ -12,7 +12,7 @@
   - Any remaining text after the mode keyword(s) is passed as custom review instructions to Codex
 
 SESSION_DIR = /tmp/claude/codex_review
-SCRIPT_PATH = ~/.claude/scripts/codex_review.sh
+SCRIPT_PATH = ~/.claude/scripts/codex_review/codex_review.sh
 
 ---
 
@@ -83,7 +83,7 @@ Optional: append custom instructions after the mode, e.g.:
 
 1. Run the script using the Bash tool with `run_in_background: true` and `dangerouslyDisableSandbox: true` (Codex CLI requires unsandboxed access to macOS system APIs):
    ```
-   bash ~/.claude/scripts/codex_review.sh "/tmp/claude/codex_review" "${WORKING_DIR}" "${MODE}" "${MODE_ARG}" "${CUSTOM_PROMPT}"
+   bash ~/.claude/scripts/codex_review/codex_review.sh "/tmp/claude/codex_review" "${WORKING_DIR}" "${MODE}" "${MODE_ARG}" "${CUSTOM_PROMPT}"
    ```
 2. Inform the user: "Codex is reviewing... I'll read the same diff while we wait."
 </LaunchCodexReview>

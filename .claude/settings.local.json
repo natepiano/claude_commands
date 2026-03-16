@@ -40,7 +40,9 @@
       "Bash(cd ~/rust/cargo-port && taplo fmt Cargo.toml 2>&1)",
       "WebFetch(domain:docs.rs)",
       "WebFetch(domain:killercup.github.io)",
-      "WebFetch(domain:users.rust-lang.org)"
+      "WebFetch(domain:users.rust-lang.org)",
+      "Bash(mv:*)",
+      "Bash(mkdir:*)"
     ],
     "deny": [],
     "ask": []

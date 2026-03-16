@@ -46,7 +46,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "~/.claude/hooks/post-tool-use-random-ack.sh --hook"
+            "command": "~/.claude/scripts/hooks/post-tool-use-random-ack.sh --hook"
           }
         ]
       },
@@ -55,11 +55,11 @@
         "hooks": [
           {
             "type": "command",
-            "command": "~/.claude/hooks/post-tool-use-cargo-check.sh"
+            "command": "~/.claude/scripts/hooks/post-tool-use-cargo-check.sh"
           },
           {
             "type": "command",
-            "command": "python3 ~/.claude/hooks/post-tool-use-basedpyright.py"
+            "command": "python3 ~/.claude/scripts/hooks/post-tool-use-basedpyright.py"
           }
         ]
       }
@@ -91,7 +91,7 @@
       "git",
       "taplo",
       "cargo",
-      "~/.claude/scripts/validate_ci.sh"
+      "~/.claude/scripts/validate_and_push/validate_ci.sh"
     ]
   },
   "alwaysThinkingEnabled": true,

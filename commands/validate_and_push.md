@@ -9,7 +9,7 @@ description: Run local CI validation, push to origin, and monitor GitHub CI
 - Do NOT proceed to validation
 
 **Run validation:**
-- Run `~/.claude/scripts/validate_ci.sh`
+- Run `~/.claude/scripts/validate_and_push/validate_ci.sh`
 
 **On validation failure:**
 - Do NOT push

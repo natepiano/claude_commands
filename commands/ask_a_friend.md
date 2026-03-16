@@ -8,7 +8,7 @@
 - $ARGUMENTS (optional): Specific question or additional context for Codex. If empty, the agent infers the question from the current conversation.
 
 SESSION_DIR = /tmp/claude/ask_a_friend
-SCRIPT_PATH = ~/.claude/scripts/ask_a_friend.sh
+SCRIPT_PATH = ~/.claude/scripts/ask_a_friend/ask_a_friend.sh
 
 ---
 
@@ -80,7 +80,7 @@ so Codex can agree, disagree, or suggest alternatives.]
 <LaunchCodex>
 **Goal:** Launch Codex in the background and return control immediately.
 
-1. Run `bash ~/.claude/scripts/ask_a_friend.sh "/tmp/claude/ask_a_friend" "${WORKING_DIR}"` using the Bash tool with `run_in_background: true` and `dangerouslyDisableSandbox: true` (Codex CLI requires unsandboxed access to macOS system APIs)
+1. Run `bash ~/.claude/scripts/ask_a_friend/ask_a_friend.sh "/tmp/claude/ask_a_friend" "${WORKING_DIR}"` using the Bash tool with `run_in_background: true` and `dangerouslyDisableSandbox: true` (Codex CLI requires unsandboxed access to macOS system APIs)
 2. Inform the user: "Consulting with Codex... I'll check back shortly."
 </LaunchCodex>
 
