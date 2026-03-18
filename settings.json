@@ -95,6 +95,7 @@
     ]
   },
   "alwaysThinkingEnabled": true,
+  "effortLevel": "medium",
   "voiceEnabled": true,
   "skipDangerousModePermissionPrompt": true,
   "additionalDirectories": [
@@ -116,6 +117,5 @@
     "/tmp",
     "/tmp/**",
     "/private/tmp/**"
-  ],
-  "effortLevel": "high"
+  ]
 }
