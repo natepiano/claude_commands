@@ -6,12 +6,11 @@ set -euo pipefail
 EXAMPLE_TEMPLATE="$HOME/.claude/templates/example.rs"
 
 usage() {
-  echo "Usage: $0 <name> [--lib] [--no-bevy] [--example] [--include-github-repo]" >&2
+  echo "Usage: $0 <name> [--lib] [--no-bevy] [--example]" >&2
   echo "" >&2
-  echo "  --example              Copy example template into \$PWD/examples/<name>.rs and add dev-dependencies" >&2
-  echo "  --include-github-repo  Create a GitHub repo and push (project only, off by default)" >&2
-  echo "  --lib                  Generate a library crate (project only)" >&2
-  echo "  --no-bevy              Skip Bevy CI support (project only)" >&2
+  echo "  --example    Copy example template into \$PWD/examples/<name>.rs and add dev-dependencies" >&2
+  echo "  --lib        Generate a library crate (project only)" >&2
+  echo "  --no-bevy    Skip Bevy CI support (project only)" >&2
   exit 1
 }
 
@@ -25,16 +24,14 @@ shift
 CRATE_TYPE="bin"
 BEVY="true"
 EXAMPLE="false"
-INCLUDE_GITHUB="false"
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --lib)                  CRATE_TYPE="lib" ;;
-    --no-bevy)              BEVY="false" ;;
-    --example)              EXAMPLE="true" ;;
-    --include-github-repo)  INCLUDE_GITHUB="true" ;;
-    -h|--help)              usage ;;
-    *)                      echo "Unknown option: $1" >&2; usage ;;
+    --lib)      CRATE_TYPE="lib" ;;
+    --no-bevy)  BEVY="false" ;;
+    --example)  EXAMPLE="true" ;;
+    -h|--help)  usage ;;
+    *)          echo "Unknown option: $1" >&2; usage ;;
   esac
   shift
 done
@@ -107,6 +104,17 @@ cargo generate rust-template \
 
 cd "$DEST"
 
+if [[ "$BEVY" == "true" ]]; then
+  echo "=== Adding Bevy dependencies ==="
+  cargo add bevy --no-default-features
+  if [[ "$CRATE_TYPE" == "lib" ]]; then
+    cargo add --dev bevy
+  fi
+fi
+
+echo "=== Excluding settings.local.json from git ==="
+echo "settings.local.json" >> .git/info/exclude
+
 if ! command -v cargo-mend &>/dev/null; then
   echo "=== Installing cargo-mend ==="
   cargo install cargo-mend
@@ -122,21 +130,5 @@ echo "=== Creating initial commit ==="
 git add -A
 git commit -m "Initial commit"
 
-if [[ "$INCLUDE_GITHUB" == "true" ]]; then
-  echo "=== Creating GitHub repo ==="
-  if ! gh repo create "natepiano/$NAME" --public --source . --push; then
-    echo "" >&2
-    echo "GitHub repo creation failed. Local project is intact at: $DEST" >&2
-    echo "To recover manually:" >&2
-    echo "  cd $DEST" >&2
-    echo "  gh repo create natepiano/$NAME --public --source . --push" >&2
-    exit 1
-  fi
-
-  echo "=== Done! ==="
-  echo "Project: $DEST"
-  echo "GitHub:  https://github.com/natepiano/$NAME"
-else
-  echo "=== Done! ==="
-  echo "Project: $DEST"
-fi
+echo "=== Done! ==="
+echo "Project: $DEST"

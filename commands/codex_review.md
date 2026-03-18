@@ -1,6 +1,6 @@
 # Codex Review
 
-**Purpose:** Run a code review via Codex CLI (OpenAI) on the current working tree changes, then synthesize the findings with your own analysis.
+**Purpose:** Run a code review via Codex CLI (OpenAI) on working tree changes or committed source files, then synthesize the findings with your own analysis.
 
 **Usage:** `/codex_review <mode> [options]`
 
@@ -9,6 +9,7 @@
   - `uncommitted` — review staged, unstaged, and untracked changes
   - `base <branch>` — review changes against a base branch (e.g. `base main`)
   - `file <path> [base_branch]` — review changes to a specific file (optionally against a base branch)
+  - `path <dir>` — review all committed (git-tracked) source files under a directory
   - Any remaining text after the mode keyword(s) is passed as custom review instructions to Codex
 
 SESSION_DIR = /tmp/claude/codex_review
@@ -55,9 +56,11 @@ SCRIPT_PATH = ~/.claude/scripts/codex_review/codex_review.sh
 /codex_review base <branch>            — review changes against a base branch
 /codex_review file <path>              — review uncommitted changes to a specific file
 /codex_review file <path> <branch>     — review changes to a file against a base branch
+/codex_review path <dir>               — review all committed files under a directory
 
 Optional: append custom instructions after the mode, e.g.:
 /codex_review uncommitted Focus on error handling
+/codex_review path src Focus on error handling and API design
 ```
 
 **Stop execution after displaying usage.**
@@ -67,13 +70,15 @@ Optional: append custom instructions after the mode, e.g.:
 1. **If $ARGUMENTS starts with `uncommitted`:** Set ${MODE} = `uncommitted`, remainder is ${CUSTOM_PROMPT}
 2. **If $ARGUMENTS starts with `base`:** Set ${MODE} = `base`, next word is ${MODE_ARG} (the branch name), remainder is ${CUSTOM_PROMPT}
 3. **If $ARGUMENTS starts with `file`:** Set ${MODE} = `file`, next word is ${MODE_ARG} (the file path), next word (if present) is ${CUSTOM_PROMPT} (used as base branch by the script)
-4. **If $ARGUMENTS doesn't match any mode keyword:** Set ${MODE} = `uncommitted`, entire $ARGUMENTS is ${CUSTOM_PROMPT}
+4. **If $ARGUMENTS starts with `path`:** Set ${MODE} = `path`, next word is ${MODE_ARG} (the directory path), remainder is ${CUSTOM_PROMPT}
+5. **If $ARGUMENTS doesn't match any mode keyword:** Set ${MODE} = `uncommitted`, entire $ARGUMENTS is ${CUSTOM_PROMPT}
 
 **Inform the user** what will be reviewed:
 - For uncommitted: "Reviewing uncommitted changes via Codex..."
 - For base: "Reviewing changes against ${MODE_ARG} via Codex..."
 - For file: "Reviewing changes to ${MODE_ARG} via Codex..."
-- If custom prompt (non-file modes): append "Focus: ${CUSTOM_PROMPT}"
+- For path: "Reviewing all committed code under ${MODE_ARG} via Codex..."
+- If custom prompt (non-file/path modes): append "Focus: ${CUSTOM_PROMPT}"
 </ParseArguments>
 
 ---
@@ -85,7 +90,7 @@ Optional: append custom instructions after the mode, e.g.:
    ```
    bash ~/.claude/scripts/codex_review/codex_review.sh "/tmp/claude/codex_review" "${WORKING_DIR}" "${MODE}" "${MODE_ARG}" "${CUSTOM_PROMPT}"
    ```
-2. Inform the user: "Codex is reviewing... I'll read the same diff while we wait."
+2. Inform the user: "Codex is reviewing... I'll read the same code while we wait."
 </LaunchCodexReview>
 
 ---
@@ -110,8 +115,9 @@ The background Bash task launched in <LaunchCodexReview/> will automatically sen
 - For `uncommitted` mode: Run `git diff` and `git diff --staged` in ${WORKING_DIR}
 - For `base` mode: Run `git diff ${MODE_ARG}...HEAD` in ${WORKING_DIR}
 - For `file` mode: Read the file at ${MODE_ARG} directly. If a base branch was given, run `git diff <branch>...HEAD -- ${MODE_ARG}` in ${WORKING_DIR}
+- For `path` mode: Read the source files under ${MODE_ARG} in ${WORKING_DIR}. Use Glob and Read to skim the key files. You don't need to read every file — focus on the ones Codex flagged.
 
-Skim the diff to understand what changed. You do not need to analyze exhaustively — focus on the areas Codex flagged so you can agree or push back.
+Skim the code to understand what's there. You do not need to analyze exhaustively — focus on the areas Codex flagged so you can agree or push back.
 </ReadDiffContext>
 
 ---

@@ -42,7 +42,8 @@
       "WebFetch(domain:killercup.github.io)",
       "WebFetch(domain:users.rust-lang.org)",
       "Bash(mv:*)",
-      "Bash(mkdir:*)"
+      "Bash(mkdir:*)",
+      "WebFetch(domain:raw.githubusercontent.com)"
     ],
     "deny": [],
     "ask": []

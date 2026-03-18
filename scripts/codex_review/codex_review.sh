@@ -7,6 +7,7 @@
 #   uncommitted                     — review uncommitted changes
 #   base <branch>                   — review changes against a base branch
 #   file <path> [base_branch]       — review changes to a specific file (diff piped via stdin)
+#   path <dir> [custom_prompt]      — review all committed files under a directory
 #
 # Produces:
 #   <session_dir>/status       — "reviewing" while running, "done" on success, "error" on failure
@@ -17,7 +18,7 @@ set -euo pipefail
 
 SESSION_DIR="${1:?Usage: codex_review.sh <session_dir> <working_dir> <mode> [mode_arg] [custom_prompt]}"
 WORKING_DIR="${2:?Missing working_dir}"
-MODE="${3:?Missing mode (uncommitted|base|file)}"
+MODE="${3:?Missing mode (uncommitted|base|file|path)}"
 MODE_ARG="${4:-}"
 CUSTOM_PROMPT="${5:-}"
 
@@ -100,9 +101,42 @@ case "${MODE}" in
     CMD=(codex exec -c model_reasoning_effort='"high"' --ephemeral --full-auto -o "${REVIEW_FILE}")
     CMD+=("Review the following file content for ${FILE_PATH}. Provide a thorough code/design review with actionable findings.")
     ;;
+  path)
+    if [[ -z "${MODE_ARG}" ]]; then
+      echo "error" > "${STATUS_FILE}"
+      echo "path mode requires a directory argument" > "${LOG_FILE}"
+      exit 1
+    fi
+    TARGET_DIR="${MODE_ARG}"
+    if [[ ! -d "${TARGET_DIR}" ]]; then
+      echo "error" > "${STATUS_FILE}"
+      echo "Directory not found: ${TARGET_DIR}" > "${LOG_FILE}"
+      exit 1
+    fi
+    # Collect all git-tracked files under the directory into a single content file
+    CONTENT_FILE="${SESSION_DIR}/content.txt"
+    while IFS= read -r filepath; do
+      echo "===== FILE: ${filepath} =====" >> "${CONTENT_FILE}"
+      cat "${filepath}" >> "${CONTENT_FILE}"
+      echo "" >> "${CONTENT_FILE}"
+    done < <(git ls-files -- "${TARGET_DIR}" 2>> "${LOG_FILE}")
+    if [[ ! -s "${CONTENT_FILE}" ]]; then
+      echo "error" > "${STATUS_FILE}"
+      echo "No git-tracked files found under: ${TARGET_DIR}" > "${LOG_FILE}"
+      exit 1
+    fi
+    DIFF_FILE="${CONTENT_FILE}"
+    USE_STDIN=true
+    REVIEW_PROMPT="Review all of the following source files under ${TARGET_DIR}. Provide a thorough code/design review with actionable findings."
+    if [[ -n "${CUSTOM_PROMPT}" ]]; then
+      REVIEW_PROMPT="${REVIEW_PROMPT} ${CUSTOM_PROMPT}"
+    fi
+    CMD=(codex exec -c model_reasoning_effort='"high"' --ephemeral --full-auto -o "${REVIEW_FILE}")
+    CMD+=("${REVIEW_PROMPT}")
+    ;;
   *)
     echo "error" > "${STATUS_FILE}"
-    echo "Unknown mode: ${MODE}. Expected: uncommitted, base, file" > "${LOG_FILE}"
+    echo "Unknown mode: ${MODE}. Expected: uncommitted, base, file, path" > "${LOG_FILE}"
     exit 1
     ;;
 esac
