@@ -10,6 +10,8 @@ Perform a release for any Rust crate or workspace project.
 - `/release X.Y.Z-rc.N` - Release as RC version (e.g., `0.18.0-rc.1`)
 - `/release X.Y.Z dry-run` - Rehearse release without mutations
 
+**Hotfix mode**: Auto-detected when the current branch is not `main`. Skips steps that modify main (README updates, branch creation, unreleased restore, dev version bump) and adds a post-release cherry-pick cleanup step.
+
 **If `$ARGUMENTS` is empty or `help`**: First read `.claude/config/release.toml` if it exists and display the progress checklist (with config-aware sub-items), then display the usage block above, then stop. Do not proceed with any release steps beyond displaying the checklist and usage.
 
 ## Dry-Run Mode
@@ -27,6 +29,7 @@ All projects use a **branch-first release model**:
 - **release branches**: Created BEFORE publishing, contain actual release versions
 - **Publishing**: Always happens from release branches, never from main
 - **No merge back**: Release branches are fire-and-forget snapshots
+- **Hotfix releases**: When releasing from a non-main branch (e.g., a branch based on a previous release tag), the command auto-detects hotfix mode. Changes are published from the current branch, then cherry-picked back to main with user verification before the hotfix branch is cleaned up.
 
 ## Configuration
 
@@ -164,11 +167,33 @@ This applies to ALL bash commands and script invocations in this process.
 ═══════════════════════════════════════════════════════════════
 ```
 
+**Example hotfix mode:**
+```
+═══════════════════════════════════════════════════════════════
+          HOTFIX RELEASE ${VERSION} - PROGRESS
+              (from branch: ${HOTFIX_BRANCH})
+═══════════════════════════════════════════════════════════════
+[ ] STEP 0:  Argument Validation
+[ ] STEP 1:  Project Discovery
+[ ] STEP 2:  Pre-Release Validation
+[—] STEP 3:  Update READMEs (skipped — hotfix)
+[ ] STEP 4:  Finalize Changelogs and Bump Versions (on hotfix branch)
+[—] STEP 5:  Create Release Branch (skipped — hotfix)
+[ ] STEP 6:  Publish to crates.io
+[ ] STEP 7:  Push Release Branch and Tag
+[ ] STEP 8:  Create GitHub Release
+[ ] STEP 9:  Post-Release Verification
+[—] STEP 10: Restore [Unreleased] Sections (skipped — hotfix)
+[—] STEP 11: Bump to Next Dev Version (skipped — hotfix)
+[ ] STEP 12: Cherry-pick to main
+═══════════════════════════════════════════════════════════════
+```
+
 **BEFORE EACH STEP**: Re-render the full checklist showing:
 - `[x]` for completed steps (and their sub-items)
 - `[>]` for the step about to start
 - `[ ]` for pending steps
-- `[—]` for skipped steps (e.g., STEP 10 on patch releases)
+- `[—]` for skipped steps (e.g., hotfix-skipped steps)
 
 **AFTER FINAL STEP**: Re-render one last time with all steps showing `[x]` (or `[—]` if skipped).
 </ProgressBehavior>
@@ -180,6 +205,9 @@ This applies to ALL bash commands and script invocations in this process.
     **STEP 1:** Execute <ProjectDiscovery/>
 
     Display <ProgressBehavior/> full list (requires project discovery to have completed first), then proceed:
+
+    **If normal mode (on main):**
+
     **STEP 2:** Execute <PreReleaseChecks/>
     → Checkpoint: `quality_checks_complete`
     **STEP 3:** Execute <UpdateReadmesOnMain/>
@@ -197,7 +225,27 @@ This applies to ALL bash commands and script invocations in this process.
     **STEP 8:** Execute <CreateGitHubRelease/>
     **STEP 9:** Execute <PostReleaseVerification/>
     **STEP 10:** Execute <RestoreUnreleasedSections/>
-    **STEP 11:** Execute <BumpToNextDev/> **(Skip if patch release)**
+    **STEP 11:** Execute <BumpToNextDev/>
+
+    **If hotfix mode (not on main):**
+
+    **STEP 2:** Execute <PreReleaseChecks/>
+    → Checkpoint: `quality_checks_complete`
+    **STEP 3:** [—] Skip (hotfix — READMEs already updated on hotfix branch)
+    **STEP 4:** Execute <FinalizeOnHotfixBranch/>
+    → Checkpoint: `changelogs_finalized`
+    → Checkpoint: `versions_bumped`
+    **STEP 5:** [—] Skip (hotfix — already on release branch)
+    **STEP 6:** Execute <PublishPhases/>
+    → Checkpoint: `pre_publish` (before first publish)
+    → Checkpoint: `post_publish` (after last publish)
+    **STEP 7:** Execute <PushReleaseBranch/>
+    → Checkpoint: `release_pushed`
+    **STEP 8:** Execute <CreateGitHubRelease/>
+    **STEP 9:** Execute <PostReleaseVerification/>
+    **STEP 10:** [—] Skip (hotfix — main manages its own unreleased sections)
+    **STEP 11:** [—] Skip (hotfix — main manages its own dev version)
+    **STEP 12:** Execute <HotfixCleanup/>
 
     At each checkpoint, check if the config defines any `[[judgment_checks]]` with a matching `checkpoint` value. If so, execute the agent judgment check and report findings before continuing. Stop and consult the user if the check reveals issues.
 </ExecutionSteps>
@@ -256,6 +304,14 @@ curl -s "https://crates.io/api/v1/crates/${CRATE_NAME}" | jq -r '.crate.max_vers
 git remote get-url origin | sed 's|.*github.com[:/]||;s|\.git$||'
 ```
 
+**Detect release mode** from current branch:
+```bash
+git branch --show-current
+```
+- If branch is `main`: **normal mode**
+- If branch starts with `release-`: **possible stale release branch** — warn the user: "You are on branch `${BRANCH}` which looks like an existing release branch. Are you sure this is a hotfix? Type **yes** to continue in hotfix mode or **no** to abort." Stop if user says no.
+- If branch is anything else: **hotfix mode** — set `${HOTFIX_MODE}` to `true` and `${HOTFIX_BRANCH}` to the branch name
+
 **Display discovered project info:**
 ```
 Project: ${GITHUB_REPO}
@@ -263,6 +319,7 @@ Type: single crate | workspace
 Crates: ${CRATE_LIST}
 Config: found | using defaults
 Dry-run: yes | no
+Mode: normal | hotfix (from branch: ${HOTFIX_BRANCH})
 ```
 </ProjectDiscovery>
 
@@ -524,24 +581,39 @@ cargo install ${INSTALL_CRATE_NAME} --version "${VERSION}"
 </RestoreUnreleasedSections>
 
 <BumpToNextDev>
-## STEP 11: Bump to Next Dev Version
+## STEP 11: Restore Dev Version on Main
 
-**Skip this step if this is a patch release** — main is already at the correct dev version.
+**This step always runs.** Step 4 set versions to the release version on main before branching. Main must be restored to a dev version.
 
-**Determine next dev version:**
-- If released `X.Y.Z-rc.N`, next dev is `X.Y.Z-dev`
-- If released final `X.Y.Z`, next dev is `X.Y+1.0-dev`
+**Determine the dev version to restore:**
+- **Patch release** (`/release patch`): Restore the dev version that was on main *before* Step 4 changed it. This is the version from the commit prior to the changelog/version bump commit. Check `git show HEAD~1:${FIRST_VERSION_FILE}` to find it. If it was already a dev version (e.g., `0.19.0-dev`), use that. If it wasn't (indicating a prior release also missed this step), determine the correct next dev version as below.
+- **Minor/major release** (e.g., `0.18.0`): Next dev is `X.Y+1.0-dev`
+- **RC release** (e.g., `0.18.0-rc.1`): Next dev is `X.Y.Z-dev`
 
-→ **Ask the user**: What should the next dev version be? (with the above as the suggested default)
+→ **Ask the user**: The dev version will be set to `${NEXT_DEV_VERSION}`. Confirm or provide a different version.
 
 **Run version bump:**
 ```bash
 ~/.claude/scripts/release/bump_versions.sh ${NEXT_DEV_VERSION} ${DRY_RUN_FLAG} ${ALL_VERSION_FILES}
 ```
 
+**Update workspace dependencies** (if config has `workspace_dep_updates`):
+Any `workspace_dep_updates` entries from `[[publish_phases]]` in the config represent internal cross-crate dependencies declared in root `Cargo.toml`. These must also be updated to the dev version, otherwise the workspace won't build.
+
+For each unique dependency name across all publish phases' `workspace_dep_updates`:
+- Update root `Cargo.toml` `[workspace.dependencies]` entry to `version = "${NEXT_DEV_VERSION}"`
+- This is a simple text replacement — no crates.io waiting needed (unlike during publish)
+
+```bash
+# For each workspace dep, update the version in root Cargo.toml
+sed -i'' "s/bevy_brp_mcp_macros = \".*\"/bevy_brp_mcp_macros = \"${NEXT_DEV_VERSION}\"/" Cargo.toml
+```
+
+→ Verify `cargo check` passes after updating (skip in dry-run mode).
+
 **Commit and push** (skip in dry-run mode; push with `dangerouslyDisableSandbox: true`):
 ```bash
-git add ${ALL_VERSION_FILES} Cargo.lock
+git add ${ALL_VERSION_FILES} Cargo.toml Cargo.lock
 git commit -m "chore: bump to ${NEXT_DEV_VERSION}"
 git push origin main
 ```
@@ -550,6 +622,131 @@ git push origin main
 
 **Release complete!** All crates published from release branch. Release branch is fire-and-forget. Main now at next dev version.
 </BumpToNextDev>
+
+<FinalizeOnHotfixBranch>
+## STEP 4 (Hotfix): Finalize Changelogs and Bump Versions (on hotfix branch)
+
+**This step runs on the current hotfix branch instead of main.**
+
+### Verify Changelog Entries
+
+**This is an agent judgment step.** For each discovered changelog file:
+
+1. Display the content under `## [Unreleased]` to the user
+2. Review the entries and verify:
+   - Entries exist (not empty)
+   - Entries accurately reflect the actual code changes in the hotfix
+   - Categories are correct (Added, Changed, Fixed, Removed, etc.)
+   - Entries are clear and useful to someone reading the changelog
+3. Report any concerns to the user
+
+→ **Manual verification**: Verify all changelogs have accurate entries under `[Unreleased]`
+  - Type **continue** to proceed
+  - Type **stop** to add or fix entries
+
+**Note**: For coordinated workspace releases where some crates have no feature changes, add:
+```markdown
+### Changed
+- Version bump to X.Y.Z to maintain workspace version synchronization
+```
+
+### Finalize Changelogs
+
+**Run changelog finalization:**
+```bash
+~/.claude/scripts/release/finalize_changelogs.sh ${VERSION} ${DRY_RUN_FLAG} ${ALL_CHANGELOG_FILES}
+```
+
+→ Report the script output to the user.
+
+### Bump Versions
+
+**Run version bumps** (only touches `[package] version` fields, not workspace dependency declarations):
+```bash
+~/.claude/scripts/release/bump_versions.sh ${VERSION} ${DRY_RUN_FLAG} ${ALL_VERSION_FILES}
+```
+
+→ Report the script output to the user.
+
+### Commit
+
+**Commit everything in a single clean commit with just the version as the message** (skip in dry-run mode):
+```bash
+git add ${ALL_CHANGELOG_FILES} ${ALL_VERSION_FILES} Cargo.lock
+git commit -m "${VERSION}"
+```
+
+### Rename Branch
+
+**Rename the hotfix branch to the standard release naming convention** (with `dangerouslyDisableSandbox: true`):
+```bash
+git branch -m ${HOTFIX_BRANCH} release-${VERSION}
+```
+
+→ Report: "Renamed branch `${HOTFIX_BRANCH}` → `release-${VERSION}`"
+→ Update `${HOTFIX_BRANCH}` to `release-${VERSION}` for subsequent steps (push, cleanup).
+</FinalizeOnHotfixBranch>
+
+<HotfixCleanup>
+## STEP 12: Hotfix Cleanup (cherry-pick to main)
+
+**This step only runs in hotfix mode.** It ensures the hotfix changes reach main.
+
+### Identify commits to cherry-pick
+
+Find all commits on the release branch that are not on the parent tag. The branch was created from a release tag, so identify the fix commits (excluding the version bump and workspace dep update commits which main doesn't need):
+
+```bash
+git log --oneline release-${VERSION} --not $(git describe --tags --abbrev=0 release-${VERSION}~1)
+```
+
+The fix commit(s) are everything before the version bump commit. The version bump commit itself and any workspace dependency update commits should NOT be cherry-picked — main has its own version management.
+
+### Cherry-pick to main
+
+Switch to main and cherry-pick the fix commit(s) using `--no-commit` to allow version restoration before committing (with `dangerouslyDisableSandbox: true`):
+```bash
+git checkout main
+git pull origin main
+git cherry-pick --no-commit ${FIX_COMMIT_HASHES}
+```
+
+→ If cherry-pick has conflicts, report them to the user and help resolve them interactively.
+→ If the fix commit already exists on main (e.g., from a prior cherry-pick attempt), skip and note it.
+
+### Restore main's version state
+
+The cherry-pick may have overwritten main's dev versions (e.g., `0.19.0-dev`) with the release branch's versions (e.g., `0.18.8`). Restore all version files and Cargo.lock to their pre-cherry-pick state:
+
+```bash
+git checkout HEAD -- ${ALL_VERSION_FILES} Cargo.lock
+```
+
+Check if the staging area still has changes (the fix itself, minus version files):
+```bash
+git diff --cached --stat
+```
+
+→ If no changes remain after restoring versions, the fix commit only touched version files — skip committing and report this to the user.
+
+**Commit the cherry-pick** with the original commit message:
+```bash
+git commit -m "fix: <original commit message from fix commit>"
+```
+
+### User verification
+
+→ **Manual verification required**: The hotfix has been cherry-picked to main. Please verify:
+  - The cherry-pick applied cleanly (or conflicts were resolved correctly)
+  - Version files still have the correct dev versions (e.g., `0.19.0-dev`)
+  - `cargo build` succeeds
+  - The changes look correct on main
+
+  Type **verified** to proceed.
+  Type **abort** to stop (you can clean up manually later).
+
+**Hotfix release complete!** Published from release branch, changes cherry-picked to main. The `release-${VERSION}` branch remains on local and remote as a permanent record, same as all release branches.
+</HotfixCleanup>
 
 ## Rollback Instructions
 
@@ -577,7 +774,7 @@ If already published to crates.io, you cannot unpublish. Release a new patch ver
 1. **"Version already exists"**: Already published on crates.io
 2. **"Version gap"**: Skipped a version number — use the next sequential version
 3. **"Uncommitted changes"**: Run `git status` and commit or stash changes
-4. **"Not on main branch"**: Switch to main with `git checkout main`
+4. **"Not on main branch"**: Hotfix mode is auto-detected — if intentional, proceed. If not, switch to main with `git checkout main`
 5. **Build failures**: Fix compilation errors before releasing
 6. **Workspace dependency ordering**: If publish fails due to dependency ordering, add `[[publish_phases]]` to `.claude/config/release.toml`
 7. **crates.io indexing delay**: If a later phase fails because a just-published crate isn't indexed yet, increase `wait_seconds` in the config

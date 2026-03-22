@@ -2,14 +2,9 @@
 description: Run local CI validation, push to origin, and monitor GitHub CI
 ---
 
-**Before anything else:**
-- Run `git status` to check for tracked or untracked changes
-- If there are ANY uncommitted changes (staged, unstaged, or untracked files), stop immediately
-- Report: "Cannot validate — there are uncommitted changes. Please commit or discard them first."
-- Do NOT proceed to validation
-
 **Run validation:**
 - Run `~/.claude/scripts/validate_and_push/validate_ci.sh`
+- The script will abort automatically if there are uncommitted changes
 
 **On validation failure:**
 - Do NOT push

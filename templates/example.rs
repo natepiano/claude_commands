@@ -1,10 +1,12 @@
 //! Example scaffold — replace this doc comment with a description.
 
+use std::env;
 use std::time::Duration;
 
 use bevy::picking::mesh_picking::MeshPickingPlugin;
 use bevy::prelude::*;
 use bevy_brp_extras::BrpExtrasPlugin;
+use bevy_brp_extras::DEFAULT_REMOTE_PORT;
 use bevy_panorbit_camera::PanOrbitCamera;
 use bevy_panorbit_camera::PanOrbitCameraPlugin;
 use bevy_panorbit_camera::TrackpadBehavior;
@@ -20,9 +22,22 @@ const ZOOM_DURATION_MS: u64 = 1000;
 struct SceneBounds(Entity);
 
 fn main() {
+    let title = match env::var("BRP_EXTRAS_PORT") {
+        Ok(port) if port.parse::<u16>().is_ok_and(|p| p != DEFAULT_REMOTE_PORT) => {
+            format!("{} (port {port})", env!("CARGO_BIN_NAME"))
+        }
+        _ => (*env!("CARGO_BIN_NAME")).to_string(),
+    };
+
     App::new()
         .add_plugins((
-            DefaultPlugins,
+            DefaultPlugins.set(WindowPlugin {
+                primary_window: Some(Window {
+                    title,
+                    ..default()
+                }),
+                ..default()
+            }),
             PanOrbitCameraPlugin,
             PanOrbitCameraExtPlugin,
             BrpExtrasPlugin::default(),
@@ -43,7 +58,8 @@ fn setup(
         .spawn((
             Mesh3d(meshes.add(Plane3d::default().mesh().size(12.0, 12.0))),
             MeshMaterial3d(materials.add(StandardMaterial {
-                base_color: Color::srgb(0.3, 0.5, 0.3),
+                base_color: Color::srgba(0.3, 0.5, 0.3, 0.8),
+                alpha_mode: AlphaMode::Blend,
                 double_sided: true,
                 cull_mode: None,
                 ..default()

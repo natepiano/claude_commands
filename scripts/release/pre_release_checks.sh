@@ -3,17 +3,17 @@ set -euo pipefail
 
 # Usage: pre_release_checks.sh
 # Runs all pre-release quality checks from the project root.
-# Must be on main branch with clean working directory.
+# Must be on main branch (or a hotfix branch) with clean working directory.
 # Exit 0 = all checks pass, Exit 1 = failure (prints reason to stderr)
 
 echo "=== Git Status Check ==="
 
 BRANCH=$(git rev-parse --abbrev-ref HEAD)
-if [[ "$BRANCH" != "main" ]]; then
-  echo "ERROR: Must be on main branch, currently on: $BRANCH" >&2
-  exit 1
+if [[ "$BRANCH" == "main" ]]; then
+  echo "  Branch: main ✓"
+else
+  echo "  Branch: $BRANCH (hotfix mode) ✓"
 fi
-echo "  Branch: main ✓"
 
 STATUS=$(git status --porcelain)
 if [[ -n "$STATUS" ]]; then

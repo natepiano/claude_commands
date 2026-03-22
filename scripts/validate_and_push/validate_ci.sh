@@ -7,6 +7,12 @@ set -euo pipefail
 # - In all other repos, final step uses installed `cargo mend`
 # - If `benches/` exists, Criterion benches are run as a smoke check
 
+# Abort if the worktree is dirty (staged, unstaged, or untracked files).
+if ! git diff --quiet || ! git diff --cached --quiet || [ -n "$(git ls-files --others --exclude-standard)" ]; then
+  echo "!!! Cannot validate — there are uncommitted changes. Please commit or discard them first."
+  exit 1
+fi
+
 REPO_NAME="$(basename "$PWD")"
 IS_SELF_MEND=0
 if [ "$REPO_NAME" = "cargo-mend" ]; then

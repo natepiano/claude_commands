@@ -8,6 +8,7 @@ Generate a crate example (`examples/<name>.rs`) in the current project.
 **EXECUTE THESE STEPS IN ORDER:**
 **STEP 1:** Execute <ParseArguments/>
 **STEP 2:** Execute <RunScript/>
+**STEP 3:** Execute <AskToBuild/>
 </ExecutionSteps>
 
 <ParseArguments>
@@ -32,3 +33,14 @@ Use `dangerouslyDisableSandbox: true` for this command.
 If the script fails, show the error output and stop.
 If it succeeds, report the path to the generated example.
 </RunScript>
+
+<AskToBuild>
+Ask the user if they want to build the example now.
+
+If yes, run:
+```bash
+cargo build --example <example-name>
+```
+
+If no, skip the build.
+</AskToBuild>
