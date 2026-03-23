@@ -1,12 +1,12 @@
+//! @generated bevy_example_template
 //! Example scaffold — replace this doc comment with a description.
 
-use std::env;
 use std::time::Duration;
 
 use bevy::picking::mesh_picking::MeshPickingPlugin;
 use bevy::prelude::*;
 use bevy_brp_extras::BrpExtrasPlugin;
-use bevy_brp_extras::DEFAULT_REMOTE_PORT;
+use bevy_brp_extras::PortDisplay;
 use bevy_panorbit_camera::PanOrbitCamera;
 use bevy_panorbit_camera::PanOrbitCameraPlugin;
 use bevy_panorbit_camera::TrackpadBehavior;
@@ -22,25 +22,12 @@ const ZOOM_DURATION_MS: u64 = 1000;
 struct SceneBounds(Entity);
 
 fn main() {
-    let title = match env::var("BRP_EXTRAS_PORT") {
-        Ok(port) if port.parse::<u16>().is_ok_and(|p| p != DEFAULT_REMOTE_PORT) => {
-            format!("{} (port {port})", env!("CARGO_BIN_NAME"))
-        }
-        _ => (*env!("CARGO_BIN_NAME")).to_string(),
-    };
-
     App::new()
         .add_plugins((
-            DefaultPlugins.set(WindowPlugin {
-                primary_window: Some(Window {
-                    title,
-                    ..default()
-                }),
-                ..default()
-            }),
+            DefaultPlugins,
             PanOrbitCameraPlugin,
             PanOrbitCameraExtPlugin,
-            BrpExtrasPlugin::default(),
+            BrpExtrasPlugin::default().port_in_title(PortDisplay::NonDefault),
             WindowManagerPlugin,
             MeshPickingPlugin,
         ))
@@ -117,11 +104,7 @@ fn on_mesh_clicked(click: On<Pointer<Click>>, mut commands: Commands) {
     );
 }
 
-fn on_ground_clicked(
-    click: On<Pointer<Click>>,
-    mut commands: Commands,
-    scene: Res<SceneBounds>,
-) {
+fn on_ground_clicked(click: On<Pointer<Click>>, mut commands: Commands, scene: Res<SceneBounds>) {
     let camera = click.hit.camera;
     commands.trigger(
         ZoomToFit::new(camera, scene.0)

@@ -38,7 +38,7 @@ The command works with **zero config** by convention. It auto-detects:
 - Crate names from each `Cargo.toml` `[package].name`
 - Version files: `{crate_dir}/Cargo.toml`
 - Changelogs: `{crate_dir}/CHANGELOG.md`
-- READMEs: Root `README.md` plus `{crate_dir}/README.md` if they exist
+- Published READMEs: determined per-crate from `Cargo.toml` `readme` field or `{crate_dir}/README.md` auto-discovery
 - GitHub repo via `gh repo view`
 
 **Optional config** at `.claude/config/release.toml` for projects that need overrides:
@@ -287,7 +287,7 @@ curl -s "https://crates.io/api/v1/crates/${CRATE_NAME}" | jq -r '.crate.max_vers
 - One crate at `.` (root directory)
 - Version file: `Cargo.toml`
 - Changelog: `CHANGELOG.md`
-- README: `README.md`
+- Published README: Check `Cargo.toml` for explicit `readme` field → use that path. Otherwise `README.md` if it exists. This is what ships to crates.io.
 
 **Workspace** (`[workspace]` section present):
 - Read `[workspace.members]` to find crate directories
@@ -296,8 +296,8 @@ curl -s "https://crates.io/api/v1/crates/${CRATE_NAME}" | jq -r '.crate.max_vers
   - Read crate name from `{dir}/Cargo.toml` `[package].name`
   - Version file: `{dir}/Cargo.toml`
   - Changelog: `{dir}/CHANGELOG.md` (if exists)
-  - README: `{dir}/README.md` (if exists)
-- Root README: `README.md` (always included)
+  - Published README: Check `{dir}/Cargo.toml` for explicit `readme` field → resolve path relative to crate dir. Otherwise `{dir}/README.md` if it exists. Only these ship to crates.io.
+- Root README (`README.md`): tracked separately as **project README** — not published to crates.io for workspace projects. Only included in STEP 3 if it contains hardcoded version references.
 
 **Detect GitHub repo** (uses git remote to avoid sandbox TLS issues with `gh`):
 ```bash
@@ -341,18 +341,27 @@ Mode: normal | hotfix (from branch: ${HOTFIX_BRANCH})
 
 **IMPORTANT**: This step happens on main BEFORE creating the release branch. This ensures README updates are on main and included in the release branch.
 
-**This is an agent judgment step.** Update compatibility/version information in all discovered README files:
+**Only published READMEs matter here.** The root `README.md` in a workspace is NOT published to crates.io — only per-crate READMEs ship with `cargo publish`.
+
+**This is an agent judgment step.** For each **published README** (discovered in STEP 1):
+- Update compatibility/version information
 - Update the version range for the current series (e.g., `0.17.0` → `0.17.0-0.17.1` for patch releases)
 - Update example version numbers in installation instructions
 - Any version-specific notes
 
-→ **Manual verification**: Confirm all READMEs updated with new version info
+**For the root README** (workspace projects only):
+- Check if it contains hardcoded version numbers (e.g., in installation instructions, compatibility tables)
+- If yes, update them. If no hardcoded versions (e.g., uses dynamic badges), skip it.
+
+**If no published READMEs exist or none need changes**, report that and move on — do not prompt the user unnecessarily.
+
+→ **Manual verification** (only if changes were made): Confirm all READMEs updated with new version info
   - Type **continue** to proceed
   - Type **skip** if no README changes needed
 
 **If changes were made, commit on main** (skip commit in dry-run mode):
 ```bash
-git add ${ALL_README_FILES}
+git add ${CHANGED_README_FILES}
 git commit -m "docs: update compatibility tables for v${VERSION}"
 ```
 </UpdateReadmesOnMain>

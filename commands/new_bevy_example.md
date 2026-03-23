@@ -1,4 +1,4 @@
-# New Rust Example
+# New Bevy Example
 
 Generate a crate example (`examples/<name>.rs`) in the current project.
 
