@@ -1,6 +1,6 @@
 # Ask A Friend
 
-**Purpose:** Consult with Codex CLI (OpenAI) as a second opinion on the current design discussion or a specific question. Launches Codex non-interactively, polls for its response, then synthesizes the best answer from both perspectives.
+**Purpose:** Have a back-and-forth consultation with Codex CLI (OpenAI) on design decisions, bugs, or architectural questions. Each round sends a question to Codex, presents both perspectives, and lets you continue the dialog or wrap up with a final synthesis.
 
 **Usage:** `/ask_a_friend [optional question or elaboration]`
 
@@ -9,6 +9,8 @@
 
 SESSION_DIR = /tmp/claude/ask_a_friend
 SCRIPT_PATH = ~/.claude/scripts/ask_a_friend/ask_a_friend.sh
+HISTORY_FILE = /tmp/claude/ask_a_friend/history.md
+ROUND_NUMBER = 1
 
 ---
 
@@ -16,14 +18,10 @@ SCRIPT_PATH = ~/.claude/scripts/ask_a_friend/ask_a_friend.sh
 **EXECUTE THESE STEPS IN ORDER:**
 
 **STEP 1:** Execute <PrepareSessionDirectory/>
-**STEP 2:** Execute <ComposeQuestion/>
-**STEP 3:** Execute <LaunchCodex/>
-**STEP 4:** Execute <PollForAnswer/>
-**STEP 5:** Execute <SynthesizeResponse/>
-**STEP 6:** Execute <StructureFindings/>
-**STEP 7:** Execute <FindingsSummaryTable/> from @~/.claude/shared/findings_walkthrough.md
-**STEP 8:** Execute <FindingsWalkthrough/> from @~/.claude/shared/findings_walkthrough.md
-**STEP 9:** Execute <FindingsCompletion/> from @~/.claude/shared/findings_walkthrough.md
+**STEP 2:** Execute <ComposeInitialQuestion/>
+**STEP 3:** Execute <AskCodex/>
+**STEP 4:** Execute <PresentRound/>
+**STEP 5:** Execute <PromptForFollowUp/>
 </ExecutionSteps>
 
 ---
@@ -34,18 +32,19 @@ SCRIPT_PATH = ~/.claude/scripts/ask_a_friend/ask_a_friend.sh
 1. Run: `rm -rf /tmp/claude/ask_a_friend && mkdir -p /tmp/claude/ask_a_friend` using Bash with `dangerouslyDisableSandbox: true`
 2. Identify the current working directory (the project the user is working in)
 3. Store as ${WORKING_DIR} for later use
+4. Initialize ${HISTORY_FILE} as empty using Bash with `dangerouslyDisableSandbox: true`
 </PrepareSessionDirectory>
 
 ---
 
-<ComposeQuestion>
+<ComposeInitialQuestion>
 **Goal:** Write a well-formed question file that gives Codex enough context to provide a useful answer.
 
 **If $ARGUMENTS provided:** Use it as the primary question. Still add conversation context if relevant.
 
 **If $ARGUMENTS empty:** Infer the question from the current conversation — identify the design decision, bug, or architectural question being discussed.
 
-**Write the question file** using Bash with `dangerouslyDisableSandbox: true` (e.g. `cat > /tmp/claude/ask_a_friend/question.md << 'QUESTION_EOF' ... QUESTION_EOF`) with this structure:
+**Write the question file** to ${SESSION_DIR}/question.md using Bash with `dangerouslyDisableSandbox: true` with this structure:
 
 ```
 You are being consulted as a second opinion on a software engineering question.
@@ -73,85 +72,144 @@ so Codex can agree, disagree, or suggest alternatives.]
 - Frame as a specific, answerable question — not a vague "what do you think?"
 - Include the current thinking so Codex can push back on it if warranted
 - Do NOT include full file contents — summarize relevant code patterns
-</ComposeQuestion>
+</ComposeInitialQuestion>
 
 ---
 
-<LaunchCodex>
-**Goal:** Launch Codex in the background and return control immediately.
+<AskCodex>
+**Goal:** Launch Codex, wait for the answer, and return it.
 
-1. Run `bash ~/.claude/scripts/ask_a_friend/ask_a_friend.sh "/tmp/claude/ask_a_friend" "${WORKING_DIR}"` using the Bash tool with `run_in_background: true` and `dangerouslyDisableSandbox: true` (Codex CLI requires unsandboxed access to macOS system APIs)
-2. Inform the user: "Consulting with Codex... I'll check back shortly."
-</LaunchCodex>
-
----
-
-<PollForAnswer>
-**Goal:** Wait for Codex to finish and retrieve the answer.
-
-1. Read the file `/tmp/claude/ask_a_friend/status` using Bash with `dangerouslyDisableSandbox: true`
-2. **If "asking":** Wait a few seconds, then check status again. Repeat until status changes.
-3. **If "answered":** Read `/tmp/claude/ask_a_friend/answer.txt` using Bash with `dangerouslyDisableSandbox: true` — proceed to <SynthesizeResponse/>
-4. **If "error":** Read `/tmp/claude/ask_a_friend/codex.log` using Bash with `dangerouslyDisableSandbox: true` for diagnostics. Inform the user:
-   ```
-   Codex consultation failed. Log output:
-   [relevant log lines]
-   ```
-   Stop execution.
-</PollForAnswer>
+1. Run `bash ~/.claude/scripts/ask_a_friend/ask_a_friend.sh "/tmp/claude/ask_a_friend" "${WORKING_DIR}"` using the Bash tool with `run_in_background: true` and `dangerouslyDisableSandbox: true`
+2. Inform the user: "Consulting with Codex (round ${ROUND_NUMBER})..."
+3. Poll ${SESSION_DIR}/status using Bash with `dangerouslyDisableSandbox: true`:
+   - **If "asking":** Wait a few seconds, check again. Repeat until status changes.
+   - **If "answered":** Read ${SESSION_DIR}/answer.txt using Bash with `dangerouslyDisableSandbox: true`. Store as ${CODEX_ANSWER}. Continue.
+   - **If "error":** Read ${SESSION_DIR}/codex.log using Bash with `dangerouslyDisableSandbox: true`. Show the user the error and stop execution.
+</AskCodex>
 
 ---
 
-<SynthesizeResponse>
-**Goal:** Present a synthesized answer combining Codex's perspective with your own.
+<PresentRound>
+**Goal:** Show Codex's answer with Claude's commentary, and record the round in history.
 
-**Format:**
+1. **Append to ${HISTORY_FILE}** using Bash with `dangerouslyDisableSandbox: true`:
 
 ```
-## Codex Says
+## Round ${ROUND_NUMBER}
 
-[Codex's answer, quoted or closely paraphrased. Keep it faithful to their response.]
+### Question
+[The question that was asked this round]
 
-## My Take
+### Codex
+[${CODEX_ANSWER}]
 
-[Your own perspective on the same question. Where do you agree? Disagree?
-What additional considerations does Codex miss or what do they add that you hadn't considered?]
+### Claude
+[Your brief take on Codex's answer]
+```
 
-## Recommendation
+2. **Present to the user:**
 
-[A clear, synthesized recommendation. If both agree, say so confidently.
-If they diverge, explain the tradeoffs and give your honest recommendation.]
+```
+## Round ${ROUND_NUMBER}
+
+### Codex Says
+[Codex's answer, quoted or closely paraphrased. Keep it faithful.]
+
+### My Take
+[Brief commentary — where you agree, disagree, or see gaps. Be honest, not diplomatic.]
+```
+</PresentRound>
+
+---
+
+<PromptForFollowUp>
+**Goal:** Let the user decide whether to continue or wrap up.
+
+Present:
+```
+**follow up** — ask Codex a follow-up question (or just type your question)
+**done** — wrap up the consultation
+```
+
+**STOP and wait for user response.**
+
+**Handle response:**
+
+- **"done"** (also: "wrap up", "finish", "end", "wrap"): Execute <FinalSynthesis/>
+
+- **Anything else** — treat the user's response as a follow-up question/direction:
+  1. Increment ${ROUND_NUMBER}
+  2. Execute <ComposeFollowUp/> using the user's message
+  3. Execute <AskCodex/>
+  4. Execute <PresentRound/>
+  5. Execute <PromptForFollowUp/>
+</PromptForFollowUp>
+
+---
+
+<ComposeFollowUp>
+**Goal:** Write a follow-up question that includes conversation history so Codex has full context.
+
+Write to ${SESSION_DIR}/question.md using Bash with `dangerouslyDisableSandbox: true`:
+
+```
+You are being consulted as a second opinion on a software engineering question.
+This is a continuing conversation. You have the full history below.
+Give a direct, opinionated answer. Be specific and concrete.
+
+## Conversation History
+
+[Contents of ${HISTORY_FILE}]
+
+## Follow-Up
+
+[The user's follow-up message, with any additional context Claude adds to make the question clearer for Codex]
+```
+
+**Key principles:**
+- Include the full history so Codex can reference prior rounds
+- Keep Claude's additions minimal — the user's follow-up is the primary content
+- If the user's message is vague (e.g. "what about testing?"), add enough context from the conversation to make it answerable
+</ComposeFollowUp>
+
+---
+
+<FinalSynthesis>
+**Goal:** Produce a final synthesized recommendation from the full dialog.
+
+**If only 1 round was conducted:** Present a standard synthesis:
+
+```
+## Consultation Complete (1 round)
+
+### Codex Says
+[Codex's answer, faithful to their response]
+
+### My Take
+[Your perspective — agreements, disagreements, additional considerations]
+
+### Recommendation
+[Clear, synthesized recommendation. If both agree, say so. If they diverge, explain tradeoffs and give your honest take.]
+```
+
+**If multiple rounds were conducted:** Synthesize across all rounds:
+
+```
+## Consultation Complete (${ROUND_NUMBER} rounds)
+
+### Key Points from Codex
+[Most important points Codex raised across all rounds — not a per-round recap, but a distilled summary]
+
+### Key Points from Claude
+[Most important points you raised across all rounds]
+
+### Recommendation
+[Clear, synthesized recommendation incorporating the full dialog. Note where consensus was reached and any unresolved disagreements.]
 ```
 
 **Principles:**
-- Be honest about disagreements — don't just rubber-stamp Codex's answer
-- If Codex raises a point you hadn't considered, acknowledge it
-- If Codex is wrong about something, explain why
-- The user wants the best answer, not diplomatic consensus
-</SynthesizeResponse>
-
----
-
-<StructureFindings>
-**Goal:** Extract actionable points from the synthesized response into ${FINDINGS_LIST} format for the shared walkthrough.
-
-Analyze the Recommendation section from <SynthesizeResponse/> and decompose into individual findings:
-
-1. For each distinct actionable point, create a finding with:
-   - `id`: Sequential (F1, F2, F3...)
-   - `title`: Brief name for the point
-   - `severity`: critical / important / minor — based on how strongly both perspectives agree
-   - `problem`: The issue or consideration being raised
-   - `impact`: Why it matters for the current decision
-   - `recommendation`: The specific actionable suggestion
-   - `source`: "Codex", "Claude", or "Both" depending on origin
-
-2. Order by severity: critical first, then important, then minor
-
-3. Store as ${FINDINGS_LIST}
-
-4. Set ${SOURCE_SUMMARY} = "Codex and Claude perspectives synthesized"
-5. Set ${REVIEW_TOPIC} = the question that was asked
-
-**If Codex's answer is a single coherent recommendation with no decomposable points** (e.g. a straightforward yes/no answer, or a single design recommendation), skip the walkthrough entirely and end with the synthesis output from <SynthesizeResponse/>.
-</StructureFindings>
+- Be honest about disagreements — don't manufacture consensus
+- If Codex raised something you hadn't considered, acknowledge it
+- If Codex was wrong about something, explain why
+- The user wants the best answer, not diplomatic politeness
+</FinalSynthesis>
