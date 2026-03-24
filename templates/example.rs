@@ -97,6 +97,9 @@ fn setup(
 }
 
 fn on_mesh_clicked(click: On<Pointer<Click>>, mut commands: Commands) {
+    if click.button != PointerButton::Primary {
+        return;
+    }
     let camera = click.hit.camera;
     commands.trigger(
         ZoomToFit::new(camera, click.entity)
@@ -106,6 +109,9 @@ fn on_mesh_clicked(click: On<Pointer<Click>>, mut commands: Commands) {
 }
 
 fn on_ground_clicked(click: On<Pointer<Click>>, mut commands: Commands, scene: Res<SceneBounds>) {
+    if click.button != PointerButton::Primary {
+        return;
+    }
     let camera = click.hit.camera;
     commands.trigger(
         ZoomToFit::new(camera, scene.0)
