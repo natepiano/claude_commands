@@ -27,10 +27,7 @@ Update each todo status to "in_progress" when starting that step, and "completed
 </ExecutionSteps>
 
 <DiscoverWorktrees>
-    - Execute <VerifyGitRepository/>
-    - Run `git branch --show-current` to get current branch name
-    - Run `pwd` to show current working directory
-    - Run `git worktree list` to show all worktrees
+    - Run `bash ~/.claude/scripts/delete_a_worktree/discover_worktrees.sh` to get current context and all worktrees
     - Parse the output to identify deletable worktrees (excluding current one and ${PROTECTED_BRANCHES})
     - Display current worktree and available worktrees for deletion
 
@@ -61,8 +58,7 @@ Update each todo status to "in_progress" when starting that step, and "completed
 </CheckUnpushedCommits>
 
 <VerifyGitRepository>
-    - Run `git rev-parse --show-toplevel` to confirm we're in a git repo
-    - If not in a git repo, STOP and inform user
+    - Handled by discover_worktrees.sh — if not in a git repo, the script reports an error
 </VerifyGitRepository>
 
 <GetFinalConfirmation>
@@ -81,8 +77,7 @@ Update each todo status to "in_progress" when starting that step, and "completed
 </GetFinalConfirmation>
 
 <PerformDeletion>
-    - Run `git worktree remove $SELECTED_WORKTREE` to remove the worktree
-    - Run `git branch -D $TARGET_BRANCH` to delete the branch
+    - Run `bash ~/.claude/scripts/delete_a_worktree/perform_deletion.sh $SELECTED_WORKTREE $TARGET_BRANCH` to remove the worktree and delete the branch
     - Report success to user
 </PerformDeletion>
 

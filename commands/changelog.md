@@ -12,9 +12,8 @@
 </ExecutionSteps>
 
 <AnalyzeChanges>
-Run `git status` and `git diff` (staged and unstaged) to understand the current changes.
-Also run `git remote get-url origin` to determine the GitHub repo URL for constructing links.
-If no uncommitted changes exist, inform the user and stop.
+Run `bash ~/.claude/scripts/changelog/analyze_changes.sh` to gather git status, diffs, and remote URL in a single command.
+If the script reports no uncommitted changes, inform the user and stop.
 </AnalyzeChanges>
 
 <ResolveContext>
