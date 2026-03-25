@@ -20,13 +20,14 @@ fi
 CURRENT_WORKTREE=$(git rev-parse --show-toplevel)
 
 # Check for uncommitted changes
-IS_CLEAN=True
+IS_CLEAN=true
 if [[ -n "$(git status --porcelain)" ]]; then
-    IS_CLEAN=False
+    IS_CLEAN=false
 fi
 
 # Parse worktree list, excluding current
-WORKTREES_JSON="[]"
+WORKTREE_ENTRIES=""
+WORKTREE_COUNT=0
 while IFS= read -r line; do
     WT_PATH=$(echo "$line" | awk '{print $1}')
     WT_BRANCH=$(echo "$line" | grep -o '\[.*\]' | tr -d '[]')
@@ -41,29 +42,22 @@ while IFS= read -r line; do
         continue
     fi
 
-    WORKTREES_JSON=$(echo "$WORKTREES_JSON" | python3 -c "
-import json, sys
-wts = json.load(sys.stdin)
-wts.append({'path': '$WT_PATH', 'branch': '$WT_BRANCH'})
-print(json.dumps(wts))
-")
+    if [[ -n "$WORKTREE_ENTRIES" ]]; then
+        WORKTREE_ENTRIES="$WORKTREE_ENTRIES, "
+    fi
+    WORKTREE_ENTRIES="$WORKTREE_ENTRIES{\"path\": \"$WT_PATH\", \"branch\": \"$WT_BRANCH\"}"
+    WORKTREE_COUNT=$((WORKTREE_COUNT + 1))
 done < <(git worktree list)
 
-# Check if any worktrees available
-WT_COUNT=$(echo "$WORKTREES_JSON" | python3 -c "import json,sys; print(len(json.load(sys.stdin)))")
-if [[ "$WT_COUNT" -eq 0 ]]; then
+if [[ "$WORKTREE_COUNT" -eq 0 ]]; then
     echo '{"status": "error", "message": "No other worktrees available to merge from"}'
     exit 1
 fi
 
-python3 -c "
-import json
-result = {
-    'status': 'success',
-    'current_worktree': '$CURRENT_WORKTREE',
-    'current_branch': '$CURRENT_BRANCH',
-    'is_clean': $IS_CLEAN,
-    'worktrees': $WORKTREES_JSON
-}
-print(json.dumps(result, indent=2))
-"
+echo "{
+  \"status\": \"success\",
+  \"current_worktree\": \"$CURRENT_WORKTREE\",
+  \"current_branch\": \"$CURRENT_BRANCH\",
+  \"is_clean\": $IS_CLEAN,
+  \"worktrees\": [$WORKTREE_ENTRIES]
+}"

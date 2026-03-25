@@ -30,45 +30,41 @@ if [[ -z "$SOURCE_BRANCH" ]]; then
 fi
 
 # Check source for uncommitted changes
-SOURCE_IS_CLEAN=True
+SOURCE_IS_CLEAN=true
 if [[ -n "$(git -C "$SELECTED_WORKTREE" status --porcelain)" ]]; then
-    SOURCE_IS_CLEAN=False
+    SOURCE_IS_CLEAN=false
 fi
 
 # Check if current branch is behind remote
-HAS_REMOTE=False
-CURRENT_BEHIND_REMOTE=False
+HAS_REMOTE=false
+CURRENT_BEHIND_REMOTE=false
 BEHIND_COUNT=0
 
 if git remote get-url origin >/dev/null 2>&1; then
-    HAS_REMOTE=True
+    HAS_REMOTE=true
     git fetch origin >/dev/null 2>&1
     if git rev-parse --abbrev-ref @{upstream} >/dev/null 2>&1; then
         BEHIND_COUNT=$(git rev-list HEAD..@{upstream} --count 2>/dev/null || echo "0")
         if [[ "$BEHIND_COUNT" -gt 0 ]]; then
-            CURRENT_BEHIND_REMOTE=True
+            CURRENT_BEHIND_REMOTE=true
         fi
     fi
 fi
 
 # Test merge feasibility (dry-run)
-MERGE_FEASIBLE=True
+MERGE_FEASIBLE=true
 if ! git merge --no-commit --no-ff "$SOURCE_BRANCH" >/dev/null 2>&1; then
-    MERGE_FEASIBLE=False
+    MERGE_FEASIBLE=false
 fi
 git merge --abort >/dev/null 2>&1
 
-python3 -c "
-import json
-result = {
-    'status': 'success',
-    'source_path': '$SELECTED_WORKTREE',
-    'source_branch': '$SOURCE_BRANCH',
-    'source_is_clean': $SOURCE_IS_CLEAN,
-    'has_remote': $HAS_REMOTE,
-    'current_behind_remote': $CURRENT_BEHIND_REMOTE,
-    'behind_count': $BEHIND_COUNT,
-    'merge_feasible': $MERGE_FEASIBLE
-}
-print(json.dumps(result, indent=2))
-"
+echo "{
+  \"status\": \"success\",
+  \"source_path\": \"$SELECTED_WORKTREE\",
+  \"source_branch\": \"$SOURCE_BRANCH\",
+  \"source_is_clean\": $SOURCE_IS_CLEAN,
+  \"has_remote\": $HAS_REMOTE,
+  \"current_behind_remote\": $CURRENT_BEHIND_REMOTE,
+  \"behind_count\": $BEHIND_COUNT,
+  \"merge_feasible\": $MERGE_FEASIBLE
+}"
