@@ -1,10 +1,4 @@
-<Persona>
-@~/.claude/shared/personas/git_expert_persona.md
-</Persona>
-
 I'll discover available worktrees and help you safely merge changes from another worktree.
-
-**STEP 0:** Execute <Persona/> to adopt the Git Expert persona
 
 **STEP 1: Discovery**
 

@@ -3,57 +3,7 @@
 **NEVER** commit changes unless i ask you to
 
 ## rust
-
-### variables should be used within a format string:
-
-<incorrect>
-```rust
-details:   Some(format!("Element index: {}", index)),
-```
-</incorrect>
-
-<correct>
-```rust
-details:   Some(format!("Element index: {index}")),
-```
-</correct>
-
-### edition
-- we are using rust edition 2024 now
-
-### dead code
-- **IMPORTANT** never add #[allow(dead_code)] to fix a warning. if there already is #[allow(dead_code)] in the code base, it's because I put it there so you can leave it alone. But you never add it.
-
-### pub mod use
-- never use pub mod, always use mod with pub use statements
-
-<incorrect>
-```rust
-pub mod some_module;
-```
-</incorrect>
-
-<correct>
-```rust
-mod some_module;
-pub use some_module::{SomeOtherType, SomeType};
-```
-</correct>
-
-### always use nextest
-always use `cargo nextest run`
-
-<incorrect>
-```bash
-cargo test
-```
-</incorrect>
-
-<correct>
-```bash
-cargo nextest run
-```
-</correct>
+- Before writing Rust code, run `/rust-style` to load the full style guide from `~/rust/hanadocs/topics/developer/rust/`
 
 ## python
 
@@ -139,7 +89,3 @@ if you need something renamed such as a type or a function or whatever, the user
 - These operations rewrite files under `.claude/` which the sandbox write restrictions block
 - Do NOT try these in the sandbox first — use `dangerouslyDisableSandbox` from the start.
 
-## rust
-- when we use types i never want to see inline module paths, use them at the top of the file and not inline in the code
-- imports always go at the top of the file
-- never consolidate rust imports - we want them one-per-line

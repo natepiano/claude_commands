@@ -1,7 +1,3 @@
-<Persona>
-@~/.claude/shared/personas/git_expert_persona.md
-</Persona>
-
 Use TodoWrite tool to create initial todos:
 - "Suggest worktree and branch name to user"
 - "Get user approval for worktree creation"
@@ -10,7 +6,6 @@ Use TodoWrite tool to create initial todos:
 <ExecutionSteps>
 **EXECUTE THESE STEPS IN ORDER:**
 
-**STEP 0:** Execute <Persona/> to adopt the Git Expert persona
 **STEP 1:** Execute <SuggestWorktreeName/>
 **STEP 2:** Execute <GetUserApproval/>
 **STEP 3:** Execute <CreateWorktreeAndSwitch/>
