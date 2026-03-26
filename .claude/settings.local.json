@@ -43,7 +43,11 @@
       "WebFetch(domain:users.rust-lang.org)",
       "Bash(mv:*)",
       "Bash(mkdir:*)",
-      "WebFetch(domain:raw.githubusercontent.com)"
+      "WebFetch(domain:raw.githubusercontent.com)",
+      "Bash(bash ~/.claude/scripts/nightly/setup.sh)",
+      "WebFetch(domain:mcp-proxy.anthropic.com)",
+      "WebFetch(domain:downloads.claude.ai)",
+      "Bash(bash ~/.claude/scripts/nightly/style-eval-all.sh)"
     ],
     "deny": [],
     "ask": []
