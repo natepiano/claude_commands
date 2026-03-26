@@ -29,10 +29,9 @@ ROUND_NUMBER = 1
 <PrepareSessionDirectory>
 **Goal:** Create a clean session directory for this consultation.
 
-1. Run: `rm -rf /tmp/claude/ask_a_friend && mkdir -p /tmp/claude/ask_a_friend` using Bash with `dangerouslyDisableSandbox: true`
+1. Run: `bash ~/.claude/scripts/ask_a_friend/prepare_session.sh` using Bash with `dangerouslyDisableSandbox: true`
 2. Identify the current working directory (the project the user is working in)
 3. Store as ${WORKING_DIR} for later use
-4. Initialize ${HISTORY_FILE} as empty using Bash with `dangerouslyDisableSandbox: true`
 </PrepareSessionDirectory>
 
 ---
@@ -44,7 +43,7 @@ ROUND_NUMBER = 1
 
 **If $ARGUMENTS empty:** Infer the question from the current conversation — identify the design decision, bug, or architectural question being discussed.
 
-**Write the question file** to ${SESSION_DIR}/question.md using Bash with `dangerouslyDisableSandbox: true` with this structure:
+**Write the question file** to ${SESSION_DIR}/question.md using the **Write tool** (NOT Bash heredoc) with this structure:
 
 ```
 You are being consulted as a second opinion on a software engineering question.
@@ -81,10 +80,10 @@ so Codex can agree, disagree, or suggest alternatives.]
 
 1. Run `bash ~/.claude/scripts/ask_a_friend/ask_a_friend.sh "/tmp/claude/ask_a_friend" "${WORKING_DIR}"` using the Bash tool with `run_in_background: true` and `dangerouslyDisableSandbox: true`
 2. Inform the user: "Consulting with Codex (round ${ROUND_NUMBER})..."
-3. Poll ${SESSION_DIR}/status using Bash with `dangerouslyDisableSandbox: true`:
+3. Poll ${SESSION_DIR}/status using the **Read tool**:
    - **If "asking":** Wait a few seconds, check again. Repeat until status changes.
-   - **If "answered":** Read ${SESSION_DIR}/answer.txt using Bash with `dangerouslyDisableSandbox: true`. Store as ${CODEX_ANSWER}. Continue.
-   - **If "error":** Read ${SESSION_DIR}/codex.log using Bash with `dangerouslyDisableSandbox: true`. Show the user the error and stop execution.
+   - **If "answered":** Read ${SESSION_DIR}/answer.txt using the **Read tool**. Store as ${CODEX_ANSWER}. Continue.
+   - **If "error":** Read ${SESSION_DIR}/codex.log using the **Read tool**. Show the user the error and stop execution.
 </AskCodex>
 
 ---
@@ -92,7 +91,7 @@ so Codex can agree, disagree, or suggest alternatives.]
 <PresentRound>
 **Goal:** Show Codex's answer with Claude's commentary, and record the round in history.
 
-1. **Append to ${HISTORY_FILE}** using Bash with `dangerouslyDisableSandbox: true`:
+1. **Append to ${HISTORY_FILE}** — read the current contents with Read, then rewrite the full file with the Write tool (NOT Bash heredoc):
 
 ```
 ## Round ${ROUND_NUMBER}
@@ -150,7 +149,7 @@ Present:
 <ComposeFollowUp>
 **Goal:** Write a follow-up question that includes conversation history so Codex has full context.
 
-Write to ${SESSION_DIR}/question.md using Bash with `dangerouslyDisableSandbox: true`:
+Write to ${SESSION_DIR}/question.md using the **Write tool** (NOT Bash heredoc):
 
 ```
 You are being consulted as a second opinion on a software engineering question.

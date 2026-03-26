@@ -44,6 +44,8 @@
       "Read(//Users/natemccoy/rust/**)",
       "Read(//Users/natemccoy/.cargo/registry/src**)",
       "Read(//Users/natemccoy/Library/Application Support/**)",
+      "Write(//tmp/claude/**)",
+      "Edit(//tmp/claude/**)",
       "Read(//tmp/**)",
       "Read(/private/tmp*)",
       "Read(//var/folders/rf/twhh0jfd243fpltn5k0w1t980000gn/T/**)"
