@@ -89,3 +89,10 @@ if you need something renamed such as a type or a function or whatever, the user
 - These operations rewrite files under `.claude/` which the sandbox write restrictions block
 - Do NOT try these in the sandbox first — use `dangerouslyDisableSandbox` from the start.
 
+### taplo must always run unsandboxed
+- **ALWAYS** use `dangerouslyDisableSandbox: true` when running `taplo` or any script that invokes `taplo`
+- taplo 0.10.0 → reqwest 0.11.9 → `system-configuration` unconditionally calls macOS `SCDynamicStoreCreate` at startup for proxy detection, which panics when the sandbox blocks the `configd` Mach service
+- `excludedCommands` does NOT help — it only bypasses filesystem restrictions, not Mach IPC
+- This includes the `/validate_and_push` script which calls `taplo fmt --check`
+- Do NOT try taplo in the sandbox first — it will always fail. Use `dangerouslyDisableSandbox` from the start.
+
