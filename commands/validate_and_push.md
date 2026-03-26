@@ -6,10 +6,17 @@ description: Run local CI validation, push to origin, and monitor GitHub CI
 - Run `~/.claude/scripts/validate_and_push/validate_ci.sh` with `dangerouslyDisableSandbox: true` (required because the script calls `taplo`, which crashes in the sandbox due to macOS Mach IPC restrictions)
 - The script will abort automatically if there are uncommitted changes
 
-**On validation failure:**
+**On validation failure — formatting (rustfmt or taplo):**
+- If the failed step is `rustfmt` or `taplo`, auto-fix:
+  1. Run `cargo +nightly fmt --all` and/or `taplo fmt` (unsandboxed) to apply formatting
+  2. Verify the fix worked by re-running the same check command(s) that failed
+  3. Commit the changes with message: `style: apply formatting`
+  4. Re-run the full validation script from the top
+- If validation fails again on a non-formatting step, fall through to the general failure handling below
+
+**On validation failure — anything else:**
 - Do NOT push
 - Do NOT attempt to fix the errors — stop immediately and report
-- Do NOT run taplo fmt, cargo fmt, or any other command to try to resolve the failure
 - Do NOT suggest fixes, do NOT apply fixes, do NOT continue to the next step
 - Report the validation errors to the user with a clear summary of what step failed and why
 - Wait for the user to decide next steps
