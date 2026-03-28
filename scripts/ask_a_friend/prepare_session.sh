@@ -1,17 +1,19 @@
 #!/usr/bin/env bash
-# prepare_session.sh — Clean and initialize an ask_a_friend session directory.
+# prepare_session.sh — Create a unique ask_a_friend session directory.
 #
 # Usage: prepare_session.sh
 #
 # Produces:
-#   /tmp/claude/ask_a_friend/          — clean session directory
-#   /tmp/claude/ask_a_friend/history.md — empty history file
+#   /tmp/claude/ask_a_friend/<uuid>/          — unique session directory
+#   /tmp/claude/ask_a_friend/<uuid>/history.md — empty history file
+#
+# Prints the session directory path to stdout (last line) for the caller to capture.
 
 set -euo pipefail
 
-SESSION_DIR="/tmp/claude/ask_a_friend"
+SESSION_ID="$(uuidgen | tr '[:upper:]' '[:lower:]')"
+SESSION_DIR="/tmp/claude/ask_a_friend/${SESSION_ID}"
 
-rm -rf "${SESSION_DIR}"
 mkdir -p "${SESSION_DIR}"
 : > "${SESSION_DIR}/history.md"
 

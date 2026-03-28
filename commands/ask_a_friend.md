@@ -7,9 +7,9 @@
 **Arguments:**
 - $ARGUMENTS (optional): Specific question or additional context for Codex. If empty, the agent infers the question from the current conversation.
 
-SESSION_DIR = /tmp/claude/ask_a_friend
+SESSION_DIR = (captured from prepare_session.sh output — see PrepareSessionDirectory)
 SCRIPT_PATH = ~/.claude/scripts/ask_a_friend/ask_a_friend.sh
-HISTORY_FILE = /tmp/claude/ask_a_friend/history.md
+HISTORY_FILE = ${SESSION_DIR}/history.md
 ROUND_NUMBER = 1
 
 ---
@@ -32,8 +32,10 @@ Note: When the consultation concludes via "done", <FinalSynthesis/> will determi
 **Goal:** Create a clean session directory for this consultation.
 
 1. Run: `bash ~/.claude/scripts/ask_a_friend/prepare_session.sh` using Bash with `dangerouslyDisableSandbox: true`
-2. Identify the current working directory (the project the user is working in)
-3. Store as ${WORKING_DIR} for later use
+2. **Capture ${SESSION_DIR}** from the last line of output (format: `Session ready at <path>`) — extract the path after "Session ready at "
+3. Set ${HISTORY_FILE} = ${SESSION_DIR}/history.md
+4. Identify the current working directory (the project the user is working in)
+5. Store as ${WORKING_DIR} for later use
 </PrepareSessionDirectory>
 
 ---
@@ -80,7 +82,7 @@ so Codex can agree, disagree, or suggest alternatives.]
 <AskCodex>
 **Goal:** Launch Codex, wait for the answer, and return it.
 
-1. Run `bash ~/.claude/scripts/ask_a_friend/ask_a_friend.sh "/tmp/claude/ask_a_friend" "${WORKING_DIR}"` using the Bash tool with `run_in_background: true` and `dangerouslyDisableSandbox: true`
+1. Run `bash ~/.claude/scripts/ask_a_friend/ask_a_friend.sh "${SESSION_DIR}" "${WORKING_DIR}"` using the Bash tool with `run_in_background: true` and `dangerouslyDisableSandbox: true`
 2. Inform the user: "Consulting with Codex (round ${ROUND_NUMBER})..."
 3. Poll ${SESSION_DIR}/status using the **Read tool**:
    - **If "asking":** Wait a few seconds, check again. Repeat until status changes.
@@ -291,7 +293,7 @@ Include:
 <LaunchCodexImplementation>
 **Goal:** Launch Codex to implement the code, then wait for completion.
 
-1. Run `bash ~/.claude/scripts/ask_a_friend/codex_implement.sh "/tmp/claude/ask_a_friend" "${WORKING_DIR}"` using the Bash tool with `run_in_background: true` and `dangerouslyDisableSandbox: true`
+1. Run `bash ~/.claude/scripts/ask_a_friend/codex_implement.sh "${SESSION_DIR}" "${WORKING_DIR}"` using the Bash tool with `run_in_background: true` and `dangerouslyDisableSandbox: true`
 2. Inform the user: "Codex is implementing... I'll review the code when it's done."
 3. **Wait for the background Bash task notification.** Do NOT poll in a loop.
 4. When the notification arrives:
