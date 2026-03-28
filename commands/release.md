@@ -412,6 +412,17 @@ git commit -m "docs: update compatibility tables for v${VERSION}"
 
 → Report the script output to the user.
 
+### Update Cargo.lock
+
+**Regenerate the lockfile** to reflect the bumped versions (skip in dry-run mode):
+```bash
+cargo update --workspace
+```
+
+This syncs `Cargo.lock` with the new `[package] version` fields. Without this step, `Cargo.lock` remains stale and the next cargo command (publish dry-run, etc.) would create uncommitted changes that break the process.
+
+→ Report that the lockfile was updated.
+
 ### Commit
 
 **Commit everything in a single clean commit with just the version as the message** (skip in dry-run mode):
@@ -606,6 +617,11 @@ cargo install ${INSTALL_CRATE_NAME} --version "${VERSION}"
 ~/.claude/scripts/release/bump_versions.sh ${NEXT_DEV_VERSION} ${DRY_RUN_FLAG} ${ALL_VERSION_FILES}
 ```
 
+**Regenerate the lockfile** to reflect the dev versions (skip in dry-run mode):
+```bash
+cargo update --workspace
+```
+
 **Update workspace dependencies** (if config has `workspace_dep_updates`):
 Any `workspace_dep_updates` entries from `[[publish_phases]]` in the config represent internal cross-crate dependencies declared in root `Cargo.toml`. These must also be updated to the dev version, otherwise the workspace won't build.
 
@@ -676,6 +692,17 @@ git push origin main
 ```
 
 → Report the script output to the user.
+
+### Update Cargo.lock
+
+**Regenerate the lockfile** to reflect the bumped versions (skip in dry-run mode):
+```bash
+cargo update --workspace
+```
+
+This syncs `Cargo.lock` with the new `[package] version` fields. Without this step, `Cargo.lock` remains stale and the next cargo command (publish dry-run, etc.) would create uncommitted changes that break the process.
+
+→ Report that the lockfile was updated.
 
 ### Commit
 
