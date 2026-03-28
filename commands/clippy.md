@@ -82,7 +82,7 @@ After batch completion: Display summary of fixes applied and any remaining issue
 **EXECUTE THESE STEPS IN ORDER:**
 
 **STEP 0:** Execute <Persona/> to adopt the Principal Engineer persona
-**STEP 1:** Execute <RunClippy/> AND <RunMend/> (run both to collect all issues) - Report: "Found [clippy_count] clippy issues and [mend_count] mend issues"
+**STEP 1:** Execute <RunClippy/> first, then <RunMend/> (sequentially — do NOT run in parallel) - Report: "Found [clippy_count] clippy issues and [mend_count] mend issues"
 **STEP 2:** Execute <CreateBatchTodoList/> - Report: "Created batch of [todo_count] grouped fixes"
 **STEP 3:** Execute <BatchDecisionPoint/>
 **STEP 4:** Execute <BatchExecution/> with progress: "Processing fix [current] of [total]: [description]"
