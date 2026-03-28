@@ -12,6 +12,7 @@ TIMESTAMP_DIR="$HOME/.local/state/nightly-rust"
 CONF_FILE="$SCRIPT_DIR/nightly-rust.conf"
 
 source "$HOME/.cargo/env"
+export PATH="$HOME/.local/bin:$PATH"
 export SCCACHE_CACHE_SIZE="30G"
 
 mkdir -p "$(dirname "$LOG_FILE")"
@@ -114,6 +115,6 @@ log "=== Nightly Rust clean + rebuild complete (${MINUTES}m ${SECS}s) ==="
 # Generate the nightly report via Claude CLI
 REPORT_FILE="/tmp/nightly-rust-report.txt"
 log "Generating nightly report..."
-claude --print --dangerously-skip-permissions -- "$(sed 's/\$ARGUMENTS/rebuild/g' "$HOME/.claude/commands/nightly_report.md")" > "$REPORT_FILE" 2>> "$LOG_FILE" || {
+claude --print --dangerously-skip-permissions --settings '{"sandbox":{"enabled":false}}' -- "$(sed 's/\$ARGUMENTS/rebuild/g' "$HOME/.claude/commands/nightly_report.md")" > "$REPORT_FILE" 2>> "$LOG_FILE" || {
     log "WARNING: failed to generate nightly report"
 }

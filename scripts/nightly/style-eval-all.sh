@@ -5,6 +5,8 @@
 
 set -euo pipefail
 
+export PATH="$HOME/.local/bin:$PATH"
+
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 RUST_DIR="$HOME/rust"
 CONF_FILE="$SCRIPT_DIR/nightly-rust.conf"
@@ -60,7 +62,7 @@ pids=()
 names=()
 for proj in "${projects[@]}"; do
     prompt="$(sed "s|\$ARGUMENTS|${RUST_DIR}/${proj}|g" "$CMD_FILE")"
-    claude --print --dangerously-skip-permissions -- "$prompt" > "$LOG_DIR/style_eval_${proj}.log" 2>&1 &
+    claude --print --dangerously-skip-permissions --settings '{"sandbox":{"enabled":false}}' -- "$prompt" > "$LOG_DIR/style_eval_${proj}.log" 2>&1 &
     pids+=($!)
     names+=("$proj")
     echo "Launched: $proj (PID $!)"
@@ -75,8 +77,7 @@ succeeded=0
 idx=0
 for pid in "${pids[@]}"; do
     name="${names[$idx]}"
-    wait "$pid"
-    code=$?
+    wait "$pid" && code=0 || code=$?
     if [[ $code -ne 0 ]]; then
         echo "FAILED: $name (exit $code)"
         failed=$((failed + 1))

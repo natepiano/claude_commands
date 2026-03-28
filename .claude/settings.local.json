@@ -57,7 +57,13 @@
       "WebFetch(domain:crates.io)",
       "WebFetch(domain:taplo.tamasfe.dev)",
       "Bash(bash ~/.claude/scripts/ask_a_friend/ask_a_friend.sh \"/tmp/claude/ask_a_friend\" \"/Users/natemccoy/.claude\")",
-      "WebFetch(domain:lib.rs)"
+      "WebFetch(domain:lib.rs)",
+      "Bash(bash ~/.claude/scripts/ask_a_friend/ask_a_friend.sh \"/tmp/claude/ask_a_friend\" \"/tmp/claude/test_project\")",
+      "Bash(bash /Users/natemccoy/.claude/scripts/nightly/nightly-rust-clean-build.sh)",
+      "Bash(bash ~/.claude/scripts/ask_a_friend/codex_implement.sh \"/tmp/claude/ask_a_friend\" \"/tmp/claude/test_project\")",
+      "Bash(pkill -f 'nightly-rust-clean-build.sh')",
+      "Bash(pkill -f 'style-eval-all.sh')",
+      "Bash(pkill -f 'claude --print')"
     ],
     "deny": [],
     "ask": []

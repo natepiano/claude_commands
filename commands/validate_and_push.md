@@ -3,7 +3,7 @@ description: Run local CI validation, push to origin, and monitor GitHub CI
 ---
 
 **Run validation:**
-- Run `~/.claude/scripts/validate_and_push/validate_ci.sh` with `dangerouslyDisableSandbox: true` (required because the script calls `taplo`, which crashes in the sandbox due to macOS Mach IPC restrictions)
+- Run `~/.claude/scripts/validate_and_push/run_validation.sh` — this launches an unsandboxed Claude CLI subprocess that executes `validate_ci.sh` and returns its output
 - The script will abort automatically if there are uncommitted changes
 
 **On validation failure — formatting (rustfmt or taplo):**
