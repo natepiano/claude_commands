@@ -1,5 +1,6 @@
-Load the Rust style guide before writing Rust code. Read every file in `~/rust/rust_style/style/` and apply all rules when writing or reviewing Rust code in this session.
+Load the Rust style guide before writing Rust code. Use **one single Bash command** to concatenate all style files and read the output. Do NOT use the Read tool on individual files.
 
+Run this exact command with Bash:
 ```bash
 cat ~/rust/rust_style/style/*.md
 ```

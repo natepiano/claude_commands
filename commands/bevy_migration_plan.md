@@ -15,16 +15,6 @@ Analyzes your codebase against official Bevy migration guides using a two-pass p
 - `{path}/.claude/bevy_migration/bevy-{version}-guides.md` (combined guides)
 - `{path}/.claude/bevy_migration/bevy-{version}-migration-plan.md` (migration plan)
 
-<Persona>
-@~/.claude/shared/personas/principal_engineer_persona.md
-
-The following constraints provide guidance on how I think and approach problems:
-
-@~/.claude/shared/subagent_instructions/code_review_instructions.md
-</Persona>
-
----
-
 <ExecutionSteps>
 
 **EXECUTE THESE STEPS IN ORDER:**
