@@ -23,7 +23,7 @@ ROUND_NUMBER = 1
 **STEP 4:** Execute <PresentRound/>
 **STEP 5:** Execute <PromptForFollowUp/>
 
-Note: When the consultation concludes via "done", <FinalSynthesis/> will determine whether to offer implementation. If the consultation was about **how to code something** (design, implementation approach, bug fix strategy, etc.), it will offer <OfferImplementation/>. If it was purely conceptual (architecture discussion, tradeoff analysis, technology choice), it ends after synthesis.
+Note: <PromptForFollowUp/> now offers all options (follow-up, implement, quit) in a single survey after each round. When the user chooses "quit", <FinalSynthesis/> presents the final summary. Implementation choices (options 2 and 3) are handled directly from <PromptForFollowUp/>.
 </ExecutionSteps>
 
 ---
@@ -126,26 +126,37 @@ so Codex can agree, disagree, or suggest alternatives.]
 ---
 
 <PromptForFollowUp>
-**Goal:** Let the user decide whether to continue or wrap up.
+**Goal:** Let the user decide what to do next.
 
-Present:
+Present using a numbered survey:
 ```
-**follow up** — ask Codex a follow-up question (or just type your question)
-**done** — wrap up the consultation
+What next?
+
+1. **Ask a follow-up** — type your question below
+2. **You implement** — I'll implement the recommendation now
+3. **Let your friend implement** — Codex implements it, then I review the code
+4. **Quit** — end the consultation
 ```
 
 **STOP and wait for user response.**
 
 **Handle response:**
 
-- **"done"** (also: "wrap up", "finish", "end", "wrap"): Execute <FinalSynthesis/>
-
-- **Anything else** — treat the user's response as a follow-up question/direction:
+- **1 or any follow-up question text** — treat the user's response as a follow-up question/direction:
   1. Increment ${ROUND_NUMBER}
   2. Execute <ComposeFollowUp/> using the user's message
   3. Execute <AskCodex/>
   4. Execute <PresentRound/>
   5. Execute <PromptForFollowUp/>
+
+- **2** (also: "you", "you implement", "claude", "you do it", "go ahead"): Stop the ask_a_friend skill. The user expects you to proceed with normal implementation in the main conversation.
+
+- **3** (also: "friend", "codex", "them", "the friend", "let your friend"):
+  1. Execute <PrepareImplementationPrompt/>
+  2. Execute <LaunchCodexImplementation/>
+  3. Execute <ReviewCodexImplementation/>
+
+- **4** (also: "quit", "done", "wrap up", "finish", "end", "wrap"): Execute <FinalSynthesis/>
 </PromptForFollowUp>
 
 ---
@@ -216,33 +227,8 @@ Give a direct, opinionated answer. Be specific and concrete.
 - If Codex was wrong about something, explain why
 - The user wants the best answer, not diplomatic politeness
 
-**After presenting the synthesis:** Determine whether the consultation was about **how to code something** — i.e., the question involved implementation approach, writing code, fixing a bug, building a feature, or refactoring. If so, execute <OfferImplementation/>. If the consultation was purely conceptual (architecture comparison, technology choice, design philosophy), stop here.
+**After presenting the synthesis:** Stop. The consultation is complete. (Implementation options were already offered in <PromptForFollowUp/> during the conversation.)
 </FinalSynthesis>
-
----
-
-<OfferImplementation>
-**Goal:** Ask the user whether they want Claude or Codex to implement the recommendation.
-
-Present:
-```
-### Who should implement this?
-
-**me** — I'll implement it now
-**friend** — Codex implements it, then I review the code
-```
-
-**STOP and wait for user response.**
-
-**Handle response:**
-
-- **"me"** (also: "you", "claude", "you do it", "go ahead"): Stop the ask_a_friend skill. The user expects you to proceed with normal implementation in the main conversation.
-
-- **"friend"** (also: "codex", "them", "the friend"):
-  1. Execute <PrepareImplementationPrompt/>
-  2. Execute <LaunchCodexImplementation/>
-  3. Execute <ReviewCodexImplementation/>
-</OfferImplementation>
 
 ---
 

@@ -68,8 +68,7 @@ EOF
   fi
 
   echo "=== Adding dev-dependencies ==="
-  cargo add --dev bevy bevy_brp_extras bevy_panorbit_camera bevy_window_manager
-  cargo add --dev --git https://github.com/natepiano/bevy_panorbit_camera_ext bevy_panorbit_camera_ext
+  cargo add --dev bevy bevy_brp_extras bevy_lagrange bevy_window_manager
 
   echo "=== Done! ==="
   echo "Example: $DEST"

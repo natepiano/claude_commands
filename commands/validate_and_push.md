@@ -23,6 +23,9 @@ description: Run local CI validation, push to origin, and monitor GitHub CI
 
 **On validation success:**
 - Push the current branch to origin
-- Monitor the GitHub CI workflow run using `gh run watch` on the most recent run for the current branch
-- Report the final CI status to the user
-- If CI fails, summarize which jobs/steps failed
+- Monitor CI in the background using the watch script:
+  1. Get the HEAD commit SHA and current branch name
+  2. Launch `~/.claude/scripts/validate_and_push/watch_ci.sh <branch> <sha>` via Bash with `run_in_background: true` and `dangerouslyDisableSandbox: true`
+  3. Tell the user: "Pushed to origin. CI is being watched in the background — I'll report when it finishes."
+  4. When the background task notification arrives, read its output and report the final CI status
+  5. If CI fails, summarize which jobs/steps failed

@@ -7,11 +7,10 @@ use bevy::picking::mesh_picking::MeshPickingPlugin;
 use bevy::prelude::*;
 use bevy_brp_extras::BrpExtrasPlugin;
 use bevy_brp_extras::PortDisplay;
-use bevy_panorbit_camera::PanOrbitCamera;
-use bevy_panorbit_camera::PanOrbitCameraPlugin;
-use bevy_panorbit_camera::TrackpadBehavior;
-use bevy_panorbit_camera_ext::PanOrbitCameraExtPlugin;
-use bevy_panorbit_camera_ext::ZoomToFit;
+use bevy_lagrange::LagrangePlugin;
+use bevy_lagrange::OrbitCam;
+use bevy_lagrange::TrackpadBehavior;
+use bevy_lagrange::ZoomToFit;
 use bevy_window_manager::WindowManagerPlugin;
 
 const ZOOM_MARGIN_MESH: f32 = 0.15;
@@ -25,8 +24,7 @@ fn main() {
     App::new()
         .add_plugins((
             DefaultPlugins,
-            PanOrbitCameraPlugin,
-            PanOrbitCameraExtPlugin,
+            LagrangePlugin,
             BrpExtrasPlugin::default().port_in_title(PortDisplay::NonDefault),
             WindowManagerPlugin,
             MeshPickingPlugin,
@@ -80,7 +78,7 @@ fn setup(
 
     // Camera
     commands.spawn((
-        PanOrbitCamera {
+        OrbitCam {
             button_orbit: MouseButton::Middle,
             button_pan: MouseButton::Middle,
             modifier_pan: Some(KeyCode::ShiftLeft),
