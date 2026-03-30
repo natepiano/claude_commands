@@ -1,5 +1,5 @@
 ---
-description: Evaluate a Rust project against the style guide and write EVALUATION.md with top 3 improvements
+description: Evaluate a Rust project against the style guide and write EVALUATION.md with top 5 improvements
 ---
 
 **IMPORTANT**: Do NOT modify any source code. This is a read-only evaluation.
@@ -41,7 +41,7 @@ Compare what you've read against every rule in the style guide. Look for systemi
 - Bevy-specific conventions (if applicable)
 - Project setup conventions
 
-Identify up to 3 **new** violations not already carried forward from the existing evaluation.
+Identify up to 5 **new** violations not already carried forward from the existing evaluation.
 
 ## Step 5: Write EVALUATION.md
 
