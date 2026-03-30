@@ -21,20 +21,28 @@ SINGLE_PROJECT="${1:-}"
 
 mkdir -p "$LOG_DIR"
 
-# Parse exclude list from conf file
+# Parse conf file for excludes and settings
 excludes=()
+MAX_NEW_FINDINGS=5
 if [[ -f "$CONF_FILE" ]]; then
-    in_exclude=false
+    current_section=""
     while IFS= read -r line || [[ -n "$line" ]]; do
         stripped="${line%%#*}"
         stripped="${stripped## }"
         stripped="${stripped%% }"
         [[ -z "$stripped" ]] && continue
         if [[ "$stripped" =~ ^\[(.+)\]$ ]]; then
-            [[ "${BASH_REMATCH[1]}" == "exclude" ]] && in_exclude=true || in_exclude=false
+            current_section="${BASH_REMATCH[1]}"
             continue
         fi
-        $in_exclude && excludes+=("$stripped")
+        case "$current_section" in
+            exclude) excludes+=("$stripped") ;;
+            style_eval)
+                if [[ "$stripped" =~ ^max_new_findings=([0-9]+)$ ]]; then
+                    MAX_NEW_FINDINGS="${BASH_REMATCH[1]}"
+                fi
+                ;;
+        esac
     done < "$CONF_FILE"
 fi
 
@@ -158,7 +166,7 @@ Step 2: Read the evaluation
 Read the file: $worktree_dir/EVALUATION.md
 
 Step 3: Apply ALL numbered findings from the evaluation.
-Each evaluation run adds up to 3 new findings, but findings accumulate
+Each evaluation run adds up to $MAX_NEW_FINDINGS new findings, but findings accumulate
 across nightly runs via carry-forward. Apply every finding present.
 - Read every file cited in the finding
 - Apply the changes described in "Recommended pattern"

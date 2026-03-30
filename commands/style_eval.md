@@ -1,5 +1,5 @@
 ---
-description: Evaluate a Rust project against the style guide and write EVALUATION.md with top 5 improvements
+description: Evaluate a Rust project against the style guide and write EVALUATION.md with top improvements
 ---
 
 **IMPORTANT**: Do NOT modify any source code. This is a read-only evaluation.

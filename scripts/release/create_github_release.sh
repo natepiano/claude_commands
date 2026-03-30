@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Usage: create_github_release.sh <version> <repo> <project_name> <notes_content> [--dry-run]
+# Usage: create_github_release.sh <version> <repo> <project_name> <notes_file> [--dry-run]
 # Creates a GitHub release using the gh CLI.
 # Must be run with dangerouslyDisableSandbox: true (gh has TLS issues in sandbox).
 # Exit 0 = created, Exit 1 = failure
@@ -9,15 +9,15 @@ set -euo pipefail
 VERSION="$1"
 REPO="$2"
 PROJECT_NAME="$3"
-NOTES_CONTENT="$4"
+NOTES_FILE="$4"
 DRY_RUN="${5:-}"
 
 TAG="v${VERSION}"
 
-# Write notes to a temp file the script controls (same $TMPDIR context)
-NOTES_FILE="$(mktemp)"
-trap 'rm -f "$NOTES_FILE"' EXIT
-printf '%s\n' "$NOTES_CONTENT" > "$NOTES_FILE"
+if [[ ! -f "$NOTES_FILE" ]]; then
+  echo "ERROR: Notes file not found: $NOTES_FILE" >&2
+  exit 1
+fi
 
 echo "=== Create GitHub Release ==="
 

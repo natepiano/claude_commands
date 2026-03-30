@@ -15,20 +15,28 @@ LOG_DIR="/private/tmp/claude"
 
 mkdir -p "$LOG_DIR"
 
-# Parse exclude list from conf file
+# Parse conf file for excludes and settings
 excludes=()
+MAX_NEW_FINDINGS=5
 if [[ -f "$CONF_FILE" ]]; then
-    in_exclude=false
+    current_section=""
     while IFS= read -r line || [[ -n "$line" ]]; do
         stripped="${line%%#*}"
         stripped="${stripped## }"
         stripped="${stripped%% }"
         [[ -z "$stripped" ]] && continue
         if [[ "$stripped" =~ ^\[(.+)\]$ ]]; then
-            [[ "${BASH_REMATCH[1]}" == "exclude" ]] && in_exclude=true || in_exclude=false
+            current_section="${BASH_REMATCH[1]}"
             continue
         fi
-        $in_exclude && excludes+=("$stripped")
+        case "$current_section" in
+            exclude) excludes+=("$stripped") ;;
+            style_eval)
+                if [[ "$stripped" =~ ^max_new_findings=([0-9]+)$ ]]; then
+                    MAX_NEW_FINDINGS="${BASH_REMATCH[1]}"
+                fi
+                ;;
+        esac
     done < "$CONF_FILE"
 fi
 
@@ -63,7 +71,7 @@ echo "=== Style evaluation: ${#projects[@]} projects ==="
 pids=()
 names=()
 for proj in "${projects[@]}"; do
-    prompt="$(sed "s|\$ARGUMENTS|${RUST_DIR}/${proj}|g" "$CMD_FILE")"
+    prompt="$(sed -e "s|\$ARGUMENTS|${RUST_DIR}/${proj}|g" -e "s|up to 5 \*\*new\*\*|up to $MAX_NEW_FINDINGS **new**|g" "$CMD_FILE")"
     claude --print --dangerously-skip-permissions --settings '{"sandbox":{"enabled":false}}' -- "$prompt" > "$LOG_DIR/style_eval_${proj}.log" 2>&1 &
     pids+=($!)
     names+=("$proj")
