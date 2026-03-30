@@ -59,6 +59,12 @@ for project_dir in "$RUST_DIR"/*/; do
         continue
     fi
 
+    # Skip automation worktrees
+    if [[ "$project_name" == *_style_fix ]]; then
+        log "SKIP: $project_name (style-fix worktree)"
+        continue
+    fi
+
     # Skip non-Rust projects
     if [[ ! -f "$project_dir/Cargo.toml" ]]; then
         log "SKIP: $project_name (no Cargo.toml)"
@@ -105,6 +111,12 @@ done
 log "Starting style evaluations..."
 "$SCRIPT_DIR/style-eval-all.sh" 2>&1 | tee -a "$LOG_FILE" || {
     log "WARNING: style evaluation script failed"
+}
+
+# Create style-fix worktrees for projects with findings
+log "Creating style-fix worktrees..."
+"$SCRIPT_DIR/style-fix-worktrees.sh" 2>&1 | tee -a "$LOG_FILE" || {
+    log "WARNING: style-fix worktree script failed"
 }
 
 ELAPSED=$(( SECONDS - START_TIME ))

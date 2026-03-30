@@ -111,8 +111,9 @@ if [[ "$BEVY" == "true" ]]; then
   fi
 fi
 
-echo "=== Excluding settings.local.json from git ==="
+echo "=== Excluding settings.local.json and EVALUATION.md from git ==="
 echo "settings.local.json" >> .git/info/exclude
+echo "EVALUATION.md" >> .git/info/exclude
 
 if ! command -v cargo-mend &>/dev/null; then
   echo "=== Installing cargo-mend ==="

@@ -9,7 +9,7 @@ description: Evaluate a Rust project against the style guide and write EVALUATIO
 
 ## Step 1: Load the style guide
 
-Read every file in `~/rust/hanadocs/topics/developer/rust/` to understand the full set of style rules.
+Read every file in `~/rust/nate_style/rust/` to understand the full set of style rules.
 
 ## Step 2: Survey the project
 
