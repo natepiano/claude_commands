@@ -3,6 +3,10 @@
 # For each eligible project: create a worktree, launch Claude to apply fixes + clippy.
 # Uses the same exclude list as the nightly build from nightly-rust.conf.
 # Can be run standalone or called from nightly-rust-clean-build.sh.
+#
+# Usage: style-fix-worktrees.sh [project_name]
+#   If project_name is given, only process that single project.
+#   If omitted, process all eligible projects under ~/rust/.
 
 set -euo pipefail
 
@@ -13,6 +17,7 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 RUST_DIR="$HOME/rust"
 CONF_FILE="$SCRIPT_DIR/nightly-rust.conf"
 LOG_DIR="/private/tmp/claude"
+SINGLE_PROJECT="${1:-}"
 
 mkdir -p "$LOG_DIR"
 
@@ -40,9 +45,21 @@ for project_dir in "$RUST_DIR"/*/; do
     name=$(basename "$project_dir")
     [[ ! -f "$project_dir/Cargo.toml" ]] && continue
 
+    # If single project specified, skip all others
+    if [[ -n "$SINGLE_PROJECT" && "$name" != "$SINGLE_PROJECT" ]]; then
+        continue
+    fi
+
     # Skip automation worktrees (prevent recursion)
     if [[ "$name" == *_style_fix ]]; then
         echo "SKIP: $name (style-fix worktree)"
+        skipped=$((skipped + 1))
+        continue
+    fi
+
+    # Skip worktree checkouts (only process primary repos)
+    if [[ -f "$project_dir/.git" ]]; then
+        echo "SKIP: $name (worktree, not primary checkout)"
         skipped=$((skipped + 1))
         continue
     fi
@@ -150,6 +167,10 @@ across nightly runs via carry-forward. Apply every finding present.
 Step 4: Run clippy and fix any issues
 Run: cargo clippy --workspace --all-targets --all-features --manifest-path $worktree_dir/Cargo.toml -- -D warnings
 If clippy reports errors or warnings, fix them.
+
+Step 5: Run tests and fix any failures
+Run: cargo nextest run --workspace --manifest-path $worktree_dir/Cargo.toml
+If any tests fail, fix them.
 
 Rules:
 - Modify ONLY files inside $worktree_dir

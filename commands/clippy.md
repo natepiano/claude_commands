@@ -1,3 +1,24 @@
+<RunMend>
+Execute: `cargo mend`
+
+Error Handling:
+- **Environmental Issues (Stop execution):** If mend fails due to missing Cargo.toml or missing toolchain, inform user: "cargo mend cannot run - environment setup required." Then exit.
+
+Analyze output:
+- If mend reports **fixable items**, proceed to <RunMendFix/>.
+- If mend reports **zero issues**, skip to <RunClippy/>.
+- If mend reports **only unfixable items**, note them and skip to <RunClippy/>.
+</RunMend>
+
+<RunMendFix>
+Execute: `cargo mend --fix`
+
+Error Handling:
+- **Any failure** (non-zero exit, error output, unexpected behavior): **STOP immediately**. Report the error output to the user and ask what to do. Do NOT proceed to clippy.
+
+If successful: Note any remaining unfixable items from the earlier `cargo mend` run and proceed to <RunClippy/>.
+</RunMendFix>
+
 <RunClippy>
 CLIPPY_FLAGS = --workspace --all-targets --all-features -- -D warnings
 
@@ -13,18 +34,8 @@ Error Handling:
 Capture all output for analysis - both successful warnings and compilation errors become todos.
 </RunClippy>
 
-<RunMend>
-Execute: `cargo mend`
-
-Error Handling:
-- **Environmental Issues (Stop execution):** If mend fails due to missing Cargo.toml or missing toolchain, inform user: "cargo mend cannot run - environment setup required." Then exit.
-- **Warnings/Issues (Process as todos):** All visibility issues reported by mend become todos alongside clippy issues.
-
-Capture all output for analysis.
-</RunMend>
-
 <CreateBatchTodoList>
-Create a comprehensive todo list combining all clippy AND mend issues:
+Create a comprehensive todo list combining all clippy AND unfixable mend issues:
 - Group related issues in same function/struct into single todos when logical
 - Each todo includes fix description and affected file locations
 - Label each todo with its source (clippy or mend) for clarity
@@ -33,17 +44,17 @@ Create a comprehensive todo list combining all clippy AND mend issues:
 </CreateBatchTodoList>
 
 <BatchDecisionPoint>
-Present the complete batch of clippy fixes:
+Present the complete batch of fixes:
 
 ## Issues Found
 **Clippy**: [clippy_count] issues across [clippy_file_count] files
-**Mend**: [mend_count] issues across [mend_file_count] files
+**Mend (unfixable)**: [mend_count] issues across [mend_file_count] files
 [List all todos with descriptions, grouped by source]
 
 ## Available Actions
 - **proceed** - Fix all issues using standard clippy guidance
 - **change** - Modify the approach (specify changes)
-- **stop** - Cancel clippy fixes without making changes
+- **stop** - Cancel fixes without making changes
 
 Please select one of the keywords above.
 </BatchDecisionPoint>
@@ -73,9 +84,11 @@ After batch completion: Display summary of fixes applied and any remaining issue
 <ExecutionSteps>
 **EXECUTE THESE STEPS IN ORDER:**
 
-**STEP 1:** Execute <RunClippy/> first, then <RunMend/> (sequentially — do NOT run in parallel) - Report: "Found [clippy_count] clippy issues and [mend_count] mend issues"
-**STEP 2:** Execute <CreateBatchTodoList/> - Report: "Created batch of [todo_count] grouped fixes"
-**STEP 3:** Execute <BatchDecisionPoint/>
-**STEP 4:** Execute <BatchExecution/> with progress: "Processing fix [current] of [total]: [description]"
-**STEP 5:** Completion summary: "✓ Fixes complete. Applied: [applied_count], Hook feedback cycles: [cycle_count], Issues resolved: [resolved_count]"
+**STEP 1:** Execute <RunMend/> — run `cargo mend` to check for issues
+**STEP 2:** If fixable items found, execute <RunMendFix/> — run `cargo mend --fix`. If it fails, STOP and ask user.
+**STEP 3:** Execute <RunClippy/> — Report: "Found [clippy_count] clippy issues and [mend_count] unfixable mend issues"
+**STEP 4:** Execute <CreateBatchTodoList/> - Report: "Created batch of [todo_count] grouped fixes"
+**STEP 5:** Execute <BatchDecisionPoint/>
+**STEP 6:** Execute <BatchExecution/> with progress: "Processing fix [current] of [total]: [description]"
+**STEP 7:** Completion summary: "✓ Fixes complete. Applied: [applied_count], Hook feedback cycles: [cycle_count], Issues resolved: [resolved_count]"
 </ExecutionSteps>

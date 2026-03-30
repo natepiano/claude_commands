@@ -65,6 +65,12 @@ for project_dir in "$RUST_DIR"/*/; do
         continue
     fi
 
+    # Skip worktree checkouts (only process primary repos)
+    if [[ -f "$project_dir/.git" ]]; then
+        log "SKIP: $project_name (worktree, not primary checkout)"
+        continue
+    fi
+
     # Skip non-Rust projects
     if [[ ! -f "$project_dir/Cargo.toml" ]]; then
         log "SKIP: $project_name (no Cargo.toml)"

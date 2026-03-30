@@ -38,6 +38,7 @@ for project_dir in "$RUST_DIR"/*/; do
     name=$(basename "$project_dir")
     [[ ! -f "$project_dir/Cargo.toml" ]] && continue
     [[ "$name" == *_style_fix ]] && continue
+    [[ -f "$project_dir/.git" ]] && continue
 
     skip=false
     for exclude in "${excludes[@]}"; do
