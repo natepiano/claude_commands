@@ -2,7 +2,7 @@ Load the Rust style guide before writing Rust code. Use **one single Bash comman
 
 Run this exact command with Bash:
 ```bash
-cat ~/rust/rust_style/style/*.md
+cat ~/rust/nate_style/rust/*.md
 ```
 
 After loading, confirm: "Rust style guide loaded — N rules across M files." Then proceed with the user's request.

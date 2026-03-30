@@ -3,7 +3,7 @@
 **NEVER** commit changes unless i ask you to
 
 ## rust
-- Before writing Rust code, run `/rust_style` to load the full style guide from `~/rust/rust_style/style/`
+- Before writing Rust code, run `/nate_style` to load the full style guide from `~/rust/nate_style/rust/`
 
 ## python
 
