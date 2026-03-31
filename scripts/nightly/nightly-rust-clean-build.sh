@@ -109,6 +109,11 @@ for project_dir in "$RUST_DIR"/*/; do
         continue
     }
 
+    log "MEND: $project_name"
+    cargo mend --manifest-path "$project_dir/Cargo.toml" 2>> "$LOG_FILE" || {
+        log "WARNING: cargo mend failed for $project_name"
+    }
+
     log "CLIPPY: $project_name"
     cargo clippy --workspace --all-targets --all-features --manifest-path "$project_dir/Cargo.toml" -- -D warnings 2>> "$LOG_FILE" || {
         log "WARNING: clippy failed for $project_name"

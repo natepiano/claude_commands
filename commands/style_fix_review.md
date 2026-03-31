@@ -34,21 +34,23 @@ For each numbered finding in EVALUATION.md, assess:
 - **Complete?** — Were all instances listed in "Scope" handled, or were some missed?
 - **Side effects?** — Did the change introduce any bugs, break any patterns, or change behavior?
 
-## Step 5: Report
+## Step 5: Summary table
 
-For each finding, provide:
-
-### Finding N: [Title]
-**What was done:** [1-2 sentence summary of the actual changes]
-**Verdict:** Applied / Correct / Complete (or note what's missing)
-**Issues:** [any problems, or "None"]
-
-Then provide an overall summary table:
+Output an overall summary table:
 
 | # | Finding | Applied | Correct | Complete | Issues |
 |---|---------|---------|---------|----------|--------|
 
-Finally, list any issues that need attention before this can be merged — or state that it's ready.
+## Step 6: Walk through each finding
+
+Immediately after the summary table, begin presenting findings one at a time. For each finding, output a short narrative (3-5 sentences) covering:
+- What the automation actually changed
+- Whether it was applied correctly and completely
+- Any issues or concerns
+
+Then **stop and wait for user feedback** before moving to the next finding. The user may have corrections, questions, or want you to fix something before proceeding.
+
+After the user responds (or says to continue), move to the next finding and repeat.
 
 **Rules:**
 - Do NOT make any changes — this is a read-only review

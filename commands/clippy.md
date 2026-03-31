@@ -6,6 +6,31 @@ cat ~/rust/nate_style/rust/*.md
 Confirm: "Rust style guide loaded." Then proceed.
 </LoadStyleGuide>
 
+<CheckCachedResults>
+Check if the background lint watcher has fresh results before running mend + clippy.
+
+1. Check if `target/port-report.log` exists in the current project. If not → skip to <RunMend/>.
+
+2. Read the last line of the file. It will be in the format: `{ISO-8601-timestamp}\t{status}` where status is `started`, `passed`, or `failed`.
+
+3. If the last line status is `started`:
+   - Check the timestamp. If it's more than 30 minutes old, treat as stale → skip to <RunMend/>.
+   - Otherwise, inform the user: "Lint watcher is running, waiting for results..."
+   - Poll the file every 2 seconds (up to 5 minutes) until the last line changes to `passed` or `failed`.
+   - If timeout → inform user and proceed to <RunMend/>.
+
+4. If the last line status is `passed` or `failed`:
+   - Find the newest `.rs` or `Cargo.toml` file in the project (excluding `target/`):
+     ```bash
+     find . -path ./target -prune -o \( -name '*.rs' -o -name 'Cargo.toml' \) -print0 | xargs -0 stat -f '%m %N' | sort -rn | head -1
+     ```
+   - Compare the file's mtime to the log entry timestamp. If any source file is newer than the log entry → results are stale, skip to <RunMend/>.
+
+5. If results are fresh:
+   - **passed**: Report "All lint checks passed (cached from {timestamp}). Skipping re-run." → skip to <StyleReview/>.
+   - **failed**: Read `target/port-report/clippy-latest.log` and `target/port-report/mend-latest.log`. Present any issues found as if mend + clippy had just run → skip to <CreateBatchTodoList/>.
+</CheckCachedResults>
+
 <RunMend>
 Execute: `cargo mend`
 
@@ -103,10 +128,11 @@ After batch completion: Display summary of fixes applied and any remaining issue
 **EXECUTE THESE STEPS IN ORDER:**
 
 **STEP 1:** Execute <LoadStyleGuide/> — load the Rust style guide
-**STEP 2:** Execute <RunMend/> — run `cargo mend` to check for issues
-**STEP 3:** If fixable items found, execute <RunMendFix/> — run `cargo mend --fix`. If it fails, STOP and ask user.
-**STEP 4:** Execute <RunClippy/> — Report: "Found [clippy_count] clippy issues and [mend_count] unfixable mend issues"
-**STEP 5:** If issues found in steps 2-4, execute <CreateBatchTodoList/>, <BatchDecisionPoint/>, <BatchExecution/>
-**STEP 6:** **Always** execute <StyleReview/> — evaluate the diff against style guide rules and fix any violations
-**STEP 7:** Completion summary
+**STEP 2:** Execute <CheckCachedResults/> — check for fresh lint watcher results. If fresh, skip to STEP 7 (passed) or STEP 6 (failed).
+**STEP 3:** Execute <RunMend/> — run `cargo mend` to check for issues
+**STEP 4:** If fixable items found, execute <RunMendFix/> — run `cargo mend --fix`. If it fails, STOP and ask user.
+**STEP 5:** Execute <RunClippy/> — Report: "Found [clippy_count] clippy issues and [mend_count] unfixable mend issues"
+**STEP 6:** If issues found in steps 3-5, execute <CreateBatchTodoList/>, <BatchDecisionPoint/>, <BatchExecution/>
+**STEP 7:** **Always** execute <StyleReview/> — evaluate the diff against style guide rules and fix any violations
+**STEP 8:** Completion summary
 </ExecutionSteps>

@@ -1,0 +1,97 @@
+digraph lint_watcher {
+    // ┌─────────────────────────────────────────────────────────────────┐
+    // │ LAYOUT GUIDE                                                    │
+    // │                                                                 │
+    // │ Render:  python3 render-flow.py                                 │
+    // │          (runs neato -n2, then injects cluster borders + viewBox)│
+    // │                                                                 │
+    // │ Positions use Graphviz points (1 inch = 72pt).                  │
+    // │ Node width=2.4 → 172.8pt. Y spacing between rows: ~60-70pt.    │
+    // │                                                                 │
+    // │ Column layout:                                                  │
+    // │   Watcher column center  = 130                                  │
+    // │   Output column center   = 400                                  │
+    // │   Consumer column center = 400                                  │
+    // │   port-report.log center = 265 (between columns)                │
+    // └─────────────────────────────────────────────────────────────────┘
+    fontname="Helvetica"
+    node [fontname="Helvetica" fontsize=10 style=filled shape=box margin="0.12,0.06" width=2.4 height=0.5]
+    edge [fontname="Helvetica" fontsize=8]
+    overlap=false
+    splines=true
+
+    node [fillcolor="#e8f4f8" color="#2980b9"]
+
+    start [label="Login / launchd" shape=oval fillcolor="#f0e6ff" color="#8e44ad" width=2.0 pos="130,920!"]
+
+    // ══════ Background Watcher (x center = 130) ══════
+    subgraph cluster_watcher {
+        label="Background Watcher (always running)"
+        style=dashed color="#95a5a6" fontcolor="#7f8c8d" fontsize=9
+        margin=12
+
+        orchestrator [label="lint-watcher.sh\n(scan ~/rust/*, spawn watchers)" height=0.55 pos="130,830!"]
+        cargo_watch [label="cargo-watch per project\n(watches .rs + Cargo.toml)" height=0.55 pos="130,760!"]
+        file_saved [label="File saved" shape=oval fillcolor="#fef9e7" color="#f39c12" width=1.4 pos="130,690!"]
+        flock [label="flock\n(one lint at a time)" height=0.55 fillcolor="#fadbd8" color="#e74c3c" pos="130,620!"]
+        write_started [label="Append 'started'\nto port-report.log" height=0.55 pos="130,550!"]
+        run_mend [label="cargo mend" pos="130,480!"]
+        run_clippy [label="cargo clippy -D warnings" pos="130,410!"]
+        write_result [label="Append 'passed' or 'failed'\nto port-report.log" height=0.55 pos="130,340!"]
+        release_lock [label="Release flock" fillcolor="#d5f5e3" color="#27ae60" pos="130,270!"]
+    }
+
+    // ══════ Output Files (x center = 400, top half) ══════
+    subgraph cluster_output {
+        label="Output (target/port-report/)"
+        style=dashed color="#95a5a6" fontcolor="#7f8c8d" fontsize=9
+        margin=12
+
+        mend_log [label="mend-latest.log" width=1.8 pos="400,480!"]
+        clippy_log [label="clippy-latest.log" width=1.8 pos="400,410!"]
+    }
+
+    // ══════ Protocol File (between columns) ══════
+    port_report [label="target/port-report.log\n(last line = status)" shape=note fillcolor="#fef9e7" color="#f39c12" height=0.55 width=2.6 pos="265,170!"]
+
+    // ══════ Consumers (x center = 400, bottom half) ══════
+    subgraph cluster_consumers {
+        label="Consumers (read-only)"
+        style=dashed color="#95a5a6" fontcolor="#7f8c8d" fontsize=9
+        margin=12
+
+        clippy_cmd [label="/clippy command\n(check cache before running)" height=0.55 pos="400,280!"]
+        cargo_port [label="cargo-port TUI\n(green/red/spinner dot)" height=0.55 pos="400,170!"]
+        status_sh [label="status.sh\n(CLI dashboard)" height=0.55 pos="400,80!"]
+    }
+
+    // ── Edges ──
+
+    // Start → Watcher
+    start -> orchestrator
+
+    // Watcher internal
+    orchestrator -> cargo_watch
+    cargo_watch -> file_saved [style=dotted label="change\ndetected"]
+    file_saved -> flock
+
+    // Kill+restart annotation
+    file_saved -> flock [style=dotted label="kills running\nlint if same\nproject" color="#e74c3c" fontcolor="#e74c3c"]
+
+    flock -> write_started -> run_mend -> run_clippy -> write_result -> release_lock
+
+    // Watcher → Output Files
+    run_mend -> mend_log [style=dotted label="stdout+stderr"]
+    run_clippy -> clippy_log [style=dotted label="stdout+stderr"]
+
+    // Watcher → Protocol File
+    write_result -> port_report [style=dotted]
+
+    // Protocol File → Consumers
+    port_report -> clippy_cmd [style=dotted label="read last line"]
+    port_report -> cargo_port [style=dotted label="watch for\nchanges"]
+    port_report -> status_sh [style=dotted label="read last line"]
+
+    // Consumers → Output Files
+    clippy_cmd -> clippy_log [style=dotted label="read on\ncache hit"]
+}
