@@ -21,4 +21,4 @@
 !templates/
 !templates/**
 # Python cache (inside allowed dirs)
-scripts/__pycache__/
+**/__pycache__/
