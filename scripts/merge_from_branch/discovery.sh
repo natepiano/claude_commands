@@ -1,5 +1,6 @@
 #!/bin/bash
 # Discovers available local branches and validates current working tree for merge
+# Also detects worktrees associated with each branch
 # Usage: discovery.sh
 # Returns: JSON with current state and available branch targets
 
@@ -22,6 +23,18 @@ if [[ -n "$(git status --porcelain)" ]]; then
     IS_CLEAN=false
 fi
 
+# Capture worktree list once (paths and branches)
+WORKTREE_PATHS=()
+WORKTREE_BRANCHES=()
+while IFS= read -r line; do
+    WT_PATH=$(echo "$line" | awk '{print $1}')
+    WT_BRANCH=$(echo "$line" | grep -o '\[.*\]' | tr -d '[]')
+    if [[ -n "$WT_BRANCH" && "$WT_BRANCH" != "detached HEAD" ]]; then
+        WORKTREE_PATHS+=("$WT_PATH")
+        WORKTREE_BRANCHES+=("$WT_BRANCH")
+    fi
+done < <(git worktree list)
+
 # List local branches with last commit, excluding current
 BRANCH_ENTRIES=""
 BRANCH_COUNT=0
@@ -35,10 +48,19 @@ while IFS= read -r branch; do
     # Escape double quotes in commit message
     LAST_COMMIT=$(echo "$LAST_COMMIT" | sed 's/"/\\"/g')
 
+    # Check if this branch has an associated worktree
+    WT_FIELD=""
+    for i in "${!WORKTREE_BRANCHES[@]}"; do
+        if [[ "${WORKTREE_BRANCHES[$i]}" == "$branch" ]]; then
+            WT_FIELD=", \"worktree\": \"${WORKTREE_PATHS[$i]}\""
+            break
+        fi
+    done
+
     if [[ -n "$BRANCH_ENTRIES" ]]; then
         BRANCH_ENTRIES="$BRANCH_ENTRIES, "
     fi
-    BRANCH_ENTRIES="$BRANCH_ENTRIES{\"name\": \"$branch\", \"last_commit\": \"$LAST_COMMIT\"}"
+    BRANCH_ENTRIES="$BRANCH_ENTRIES{\"name\": \"$branch\", \"last_commit\": \"$LAST_COMMIT\"$WT_FIELD}"
     BRANCH_COUNT=$((BRANCH_COUNT + 1))
 done < <(git branch --format='%(refname:short)')
 

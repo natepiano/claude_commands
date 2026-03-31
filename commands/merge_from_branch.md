@@ -1,4 +1,4 @@
-I'll discover available branches and help you safely merge changes from another branch.
+I'll discover available branches and help you safely merge changes.
 
 **STEP 1: Discovery**
 
@@ -7,6 +7,7 @@ Run `bash ~/.claude/scripts/merge_from_branch/discovery.sh`
 - If `status` is `"error"`, report the message and STOP
 - If `is_clean` is `false`, STOP and ask user to commit or stash first
 - Present the branches list to the user clearly, numbered for easy selection, showing the last commit for each
+- If a branch has a `worktree` field, show the worktree path next to it (e.g. "[worktree: /path/to/wt]")
 
 ## Available Actions
 - **select** - Choose a branch to merge from by entering its name or number
@@ -22,6 +23,7 @@ If user input doesn't match, display error and re-ask.
 Run `bash ~/.claude/scripts/merge_from_branch/validate.sh ${SOURCE_BRANCH}`
 
 - If `status` is `"error"`, report the message and STOP
+- If `source_is_clean` is `false`, STOP and inform user the source worktree has uncommitted changes
 - If `current_behind_remote` is `true`, STOP and ask user if they want to pull first
 - If `merge_feasible` is `false`, STOP and inform user of merge conflicts
 

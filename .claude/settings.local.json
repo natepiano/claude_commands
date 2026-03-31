@@ -63,7 +63,16 @@
       "WebFetch(domain:users.rust-lang.org)",
       "WebFetch(domain:www.npmjs.com)",
       "WebSearch",
-      "Bash(bash ~/.claude/scripts/nightly/style-fix-worktrees.sh obsidian_knife)"
+      "Bash(bash ~/.claude/scripts/nightly/style-fix-worktrees.sh obsidian_knife)",
+      "Bash(brew install:*)",
+      "Bash(open -a \"Google Chrome\" /Users/natemccoy/.claude/scripts/nightly/nightly-style-flow.svg)",
+      "Bash(open -a Safari /Users/natemccoy/.claude/scripts/nightly/nightly-style-flow.svg)",
+      "Bash(open -a Preview /Users/natemccoy/.claude/scripts/nightly/nightly-style-flow.svg)",
+      "Bash(dot -Tsvg /Users/natemccoy/.claude/scripts/nightly/nightly-style-flow.dot -o /Users/natemccoy/.claude/scripts/nightly/nightly-style-flow.svg)",
+      "Bash(neato -n2 -Tsvg /Users/natemccoy/.claude/scripts/nightly/nightly-style-flow.dot -o /Users/natemccoy/.claude/scripts/nightly/nightly-style-flow.svg)",
+      "Bash(bash ~/.claude/scripts/ask_a_friend/ask_a_friend.sh:*)",
+      "Bash(bash ~/.claude/scripts/ask_a_friend/codex_implement.sh \"/tmp/claude/ask_a_friend/65d874a0-e3f1-4653-b498-ff5b2bb31e5c\" \"/Users/natemccoy/.claude\")",
+      "Bash(open -a \"Google Chrome\" nightly-style-flow.svg)"
     ],
     "deny": [],
     "ask": []

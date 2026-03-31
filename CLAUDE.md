@@ -84,9 +84,9 @@ if you need something renamed such as a type or a function or whatever, the user
 - `excludedCommands` only bypasses the filesystem sandbox, not the network proxy
 - Do NOT try `gh` in the sandbox first — it will always fail. Use `dangerouslyDisableSandbox` from the start.
 
-### git branch-switching operations must run unsandboxed
-- **ALWAYS** use `dangerouslyDisableSandbox: true` for git operations that involve branch switching: `checkout`, `merge`, `rebase`, `stash`
-- These operations rewrite files under `.claude/` which the sandbox write restrictions block
+### git branch-switching and worktree operations must run unsandboxed
+- **ALWAYS** use `dangerouslyDisableSandbox: true` for git operations that involve branch switching or worktree management: `checkout`, `merge`, `rebase`, `stash`, `worktree remove`
+- These operations rewrite or delete files outside the sandbox's allowed write paths
 - Do NOT try these in the sandbox first — use `dangerouslyDisableSandbox` from the start.
 
 ### taplo must always run unsandboxed

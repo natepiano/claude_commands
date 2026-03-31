@@ -31,6 +31,12 @@ If `$ARGUMENTS/EVALUATION.md` exists, read it. For each previously listed improv
 
 Carry forward any still-valid findings — they do not count against the limit of new findings in Step 4.
 
+## Step 3.5: Exclude findings already being fixed in a worktree
+
+Derive the worktree evaluation path: take the project directory name, append `_style_fix`, and check for `EVALUATION.md` there. For example, if `$ARGUMENTS` is `~/rust/my_project`, check `~/rust/my_project_style_fix/EVALUATION.md`.
+
+If that file exists, read it. These findings are already being addressed in a style-fix branch. When evaluating in Step 4, **do not re-discover** any finding that matches a worktree finding by title or by the same style rule applied to the same files. This prevents duplicate work between the primary evaluation and the in-progress worktree fixes.
+
 ## Step 4: Evaluate
 
 Compare what you've read against every rule in the style guide. Look for systemic patterns, not one-off issues. Consider:
@@ -74,6 +80,7 @@ Otherwise, write:
 
 ### 1. [Title]
 
+**Style file**: `~/rust/nate_style/rust/[filename].md`
 **Style rule**: [which rule from the guide]
 **Current pattern**: [what the code does now, with 1-2 concrete examples showing file paths and line numbers]
 **Recommended pattern**: [what it should look like]
@@ -81,7 +88,7 @@ Otherwise, write:
 
 ### 2. [Title]
 
-[same structure]
+[same structure, including Style file]
 
 [...continue numbering for all findings]
 
@@ -94,3 +101,4 @@ Requirements for each finding:
 - Be specific: include actual file paths and line numbers from the project
 - Be actionable: someone should be able to act on each item without re-reading the style guide
 - Only flag things that genuinely violate the style guide — do not invent rules
+- Always include the full path to the style guide file each finding comes from (e.g., `~/rust/nate_style/rust/one-use-per-line.md`)

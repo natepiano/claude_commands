@@ -10,13 +10,11 @@ description: Review changes in a style-fix worktree against its EVALUATION.md fi
 
 **Your task:** Review the changes the automation made and determine whether each finding was correctly and completely addressed.
 
-## Step 1: Load the style guide
+## Step 1: Load relevant style guide files
 
-Run this command to read the full style guide:
-```bash
-cat ~/rust/nate_style/rust/*.md
-```
-Use this as your reference for evaluating whether the changes conform to the style rules.
+Each finding in EVALUATION.md includes a **Style file** field with the full path to the relevant style guide file (e.g., `~/rust/nate_style/rust/one-use-per-line.md`).
+
+Read each unique style file referenced by the findings. These are your authoritative references for evaluating whether the changes conform to the style rules.
 
 ## Step 2: Read the evaluation
 

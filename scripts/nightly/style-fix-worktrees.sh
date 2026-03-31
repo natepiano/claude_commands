@@ -114,8 +114,8 @@ for project_dir in "$RUST_DIR"/*/; do
         continue
     fi
 
-    # Check B: Working tree is clean (filter out EVALUATION.md from check)
-    dirty=$(git -C "$project_dir" status --porcelain 2>/dev/null | grep -v 'EVALUATION.md' || true)
+    # Check B: Working tree is clean
+    dirty=$(git -C "$project_dir" status --porcelain 2>/dev/null || true)
     if [[ -n "$dirty" ]]; then
         echo "SKIP: $name (working tree dirty)"
         skipped=$((skipped + 1))
@@ -149,8 +149,8 @@ create_and_fix() {
         return 1
     fi
 
-    # Copy EVALUATION.md into worktree (keep original for carry-forward)
-    cp "$eval_file" "$worktree_dir/EVALUATION.md"
+    # Move EVALUATION.md into worktree so primary starts fresh
+    mv "$eval_file" "$worktree_dir/EVALUATION.md"
 
     # Build prompt for Claude
     local prompt
@@ -158,9 +158,9 @@ create_and_fix() {
 You are applying automated style fixes to a Rust project.
 Working directory: $worktree_dir
 
-Step 1: Load the style guide
-Run this command to read the full style guide:
-cat ~/rust/nate_style/rust/*.md
+Step 1: Load relevant style guide files
+Each finding in EVALUATION.md includes a **Style file** field with the full path to the style guide file (e.g., ~/rust/nate_style/rust/one-use-per-line.md).
+Read each unique style file referenced by the findings.
 
 Step 2: Read the evaluation
 Read the file: $worktree_dir/EVALUATION.md
@@ -208,7 +208,8 @@ PROMPT_EOF
     # Launch Claude to apply fixes
     if ! claude --print --dangerously-skip-permissions --settings '{"sandbox":{"enabled":false}}' -- "$prompt" > "$log_file" 2>&1; then
         echo "ERROR: $proj (claude fix application failed)"
-        # Cleanup: remove worktree (EVALUATION.md safe in main repo since we cp'd)
+        # Cleanup: move EVALUATION.md back before removing worktree
+        [[ -f "$worktree_dir/EVALUATION.md" ]] && mv "$worktree_dir/EVALUATION.md" "$eval_file"
         git -C "$project_dir" worktree remove "$worktree_dir" --force 2>/dev/null || true
         return 1
     fi

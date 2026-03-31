@@ -1,7 +1,7 @@
 #!/bin/bash
 # Nightly Rust clean + rebuild script
 # Cleans target directories and rebuilds to prevent incremental bloat
-# Runs via launchd at 3:00 AM
+# Runs via launchd at 4:00 AM
 
 set -euo pipefail
 
@@ -23,20 +23,30 @@ log() {
     echo "$(date '+%Y-%m-%d %H:%M:%S') $1" | tee -a "$LOG_FILE"
 }
 
-# Parse exclude list from conf file
+# Parse conf file
 EXCLUDE=()
+STYLE_EVAL_ENABLED=true
 if [[ -f "$CONF_FILE" ]]; then
-    in_exclude=false
+    current_section=""
     while IFS= read -r line || [[ -n "$line" ]]; do
         stripped="${line%%#*}"
         stripped="${stripped## }"
         stripped="${stripped%% }"
         [[ -z "$stripped" ]] && continue
         if [[ "$stripped" =~ ^\[(.+)\]$ ]]; then
-            [[ "${BASH_REMATCH[1]}" == "exclude" ]] && in_exclude=true || in_exclude=false
+            current_section="${BASH_REMATCH[1]}"
             continue
         fi
-        $in_exclude && EXCLUDE+=("$stripped")
+        case "$current_section" in
+            exclude)
+                EXCLUDE+=("$stripped")
+                ;;
+            style_eval)
+                if [[ "$stripped" =~ ^enabled=(.+)$ ]]; then
+                    STYLE_EVAL_ENABLED="${BASH_REMATCH[1]}"
+                fi
+                ;;
+        esac
     done < "$CONF_FILE"
 fi
 
@@ -113,17 +123,20 @@ done
     log "WARNING: warmup script failed"
 }
 
-# Run style evaluations on all projects in parallel
-log "Starting style evaluations..."
-"$SCRIPT_DIR/style-eval-all.sh" 2>&1 | tee -a "$LOG_FILE" || {
-    log "WARNING: style evaluation script failed"
-}
+# Run style evaluations and fixes (if enabled)
+if [[ "$STYLE_EVAL_ENABLED" == "true" ]]; then
+    log "Starting style evaluations..."
+    "$SCRIPT_DIR/style-eval-all.sh" 2>&1 | tee -a "$LOG_FILE" || {
+        log "WARNING: style evaluation script failed"
+    }
 
-# Create style-fix worktrees for projects with findings
-log "Creating style-fix worktrees..."
-"$SCRIPT_DIR/style-fix-worktrees.sh" 2>&1 | tee -a "$LOG_FILE" || {
-    log "WARNING: style-fix worktree script failed"
-}
+    log "Creating style-fix worktrees..."
+    "$SCRIPT_DIR/style-fix-worktrees.sh" 2>&1 | tee -a "$LOG_FILE" || {
+        log "WARNING: style-fix worktree script failed"
+    }
+else
+    log "SKIP: style evaluations disabled in nightly-rust.conf"
+fi
 
 ELAPSED=$(( SECONDS - START_TIME ))
 MINUTES=$(( ELAPSED / 60 ))

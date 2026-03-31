@@ -77,6 +77,7 @@ Update each todo status to "in_progress" when starting that step, and "completed
 </GetFinalConfirmation>
 
 <PerformDeletion>
+    - **IMPORTANT**: Use `dangerouslyDisableSandbox: true` — `git worktree remove` deletes files outside the sandbox's allowed write paths
     - Run `bash ~/.claude/scripts/delete_a_worktree/perform_deletion.sh $SELECTED_WORKTREE $TARGET_BRANCH` to remove the worktree and delete the branch
     - Report success to user
 </PerformDeletion>
