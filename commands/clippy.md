@@ -1,3 +1,11 @@
+<LoadStyleGuide>
+Load the Rust style guide by running:
+```bash
+cat ~/rust/nate_style/rust/*.md
+```
+Confirm: "Rust style guide loaded." Then proceed.
+</LoadStyleGuide>
+
 <RunMend>
 Execute: `cargo mend`
 
@@ -81,14 +89,24 @@ After batch completion: Display summary of fixes applied and any remaining issue
 - Do not fix warnings by prefixing arguments/variables with _ - remove if unused
 </FixingGuidelines>
 
+<StyleReview>
+**This step runs unconditionally** — even if mend and clippy found zero issues.
+
+1. Run `git diff` to see all uncommitted changes
+2. If the diff is empty, report: "No uncommitted changes to review." and skip.
+3. Evaluate every change against the loaded style guide rules
+4. If any changes violate the style guide, fix them
+5. If no violations found, report: "Style review passed — all changes conform to the style guide."
+</StyleReview>
+
 <ExecutionSteps>
 **EXECUTE THESE STEPS IN ORDER:**
 
-**STEP 1:** Execute <RunMend/> — run `cargo mend` to check for issues
-**STEP 2:** If fixable items found, execute <RunMendFix/> — run `cargo mend --fix`. If it fails, STOP and ask user.
-**STEP 3:** Execute <RunClippy/> — Report: "Found [clippy_count] clippy issues and [mend_count] unfixable mend issues"
-**STEP 4:** Execute <CreateBatchTodoList/> - Report: "Created batch of [todo_count] grouped fixes"
-**STEP 5:** Execute <BatchDecisionPoint/>
-**STEP 6:** Execute <BatchExecution/> with progress: "Processing fix [current] of [total]: [description]"
-**STEP 7:** Completion summary: "✓ Fixes complete. Applied: [applied_count], Hook feedback cycles: [cycle_count], Issues resolved: [resolved_count]"
+**STEP 1:** Execute <LoadStyleGuide/> — load the Rust style guide
+**STEP 2:** Execute <RunMend/> — run `cargo mend` to check for issues
+**STEP 3:** If fixable items found, execute <RunMendFix/> — run `cargo mend --fix`. If it fails, STOP and ask user.
+**STEP 4:** Execute <RunClippy/> — Report: "Found [clippy_count] clippy issues and [mend_count] unfixable mend issues"
+**STEP 5:** If issues found in steps 2-4, execute <CreateBatchTodoList/>, <BatchDecisionPoint/>, <BatchExecution/>
+**STEP 6:** **Always** execute <StyleReview/> — evaluate the diff against style guide rules and fix any violations
+**STEP 7:** Completion summary
 </ExecutionSteps>

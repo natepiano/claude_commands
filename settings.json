@@ -116,7 +116,7 @@
     ]
   },
   "alwaysThinkingEnabled": true,
-  "effortLevel": "high",
+  "effortLevel": "medium",
   "voiceEnabled": true,
   "skipDangerousModePermissionPrompt": true,
   "additionalDirectories": [

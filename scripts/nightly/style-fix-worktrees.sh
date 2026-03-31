@@ -172,13 +172,29 @@ across nightly runs via carry-forward. Apply every finding present.
 - Apply the changes described in "Recommended pattern"
 - Skip any finding whose cited files no longer exist or whose pattern no longer matches
 
-Step 4: Run clippy and fix any issues
-Run: cargo clippy --workspace --all-targets --all-features --manifest-path $worktree_dir/Cargo.toml -- -D warnings
-If clippy reports errors or warnings, fix them.
+Step 4: Run cargo mend and fix issues
+Run: cargo mend --manifest-path $worktree_dir/Cargo.toml
+- If mend fails due to missing Cargo.toml or missing toolchain, report the error and skip to Step 5.
+- If mend reports fixable items, run: cargo mend --fix --manifest-path $worktree_dir/Cargo.toml
+  - If mend --fix fails, report the error and skip to Step 5.
+- If mend reports only unfixable items, note them and continue.
 
-Step 5: Run tests and fix any failures
+Step 5: Run clippy and fix any issues
+Run: cargo clippy --workspace --all-targets --all-features --manifest-path $worktree_dir/Cargo.toml -- -D warnings
+If clippy reports errors or warnings, fix them. Include any unfixable mend items from Step 4.
+
+Step 6: Run tests and fix any failures
 Run: cargo nextest run --workspace --manifest-path $worktree_dir/Cargo.toml
 If any tests fail, fix them.
+
+Step 7: Style review of the diff
+Run: git -C $worktree_dir diff
+If the diff is non-empty, evaluate every change against the style guide loaded in Step 1.
+Fix any violations found. If no violations, move on.
+
+Fixing guidelines:
+- Do NOT fix warnings by marking code as dead — remove dead code entirely
+- Do NOT fix warnings by prefixing arguments/variables with _ — remove them if unused
 
 Rules:
 - Modify ONLY files inside $worktree_dir
