@@ -7,28 +7,16 @@ Confirm: "Rust style guide loaded." Then proceed.
 </LoadStyleGuide>
 
 <CheckCachedResults>
-Check if the background lint watcher has fresh results before running mend + clippy.
+Run the cache check script:
+```bash
+bash ~/.claude/scripts/clippy/check_cache.sh .
+```
 
-1. Check if `target/port-report.log` exists in the current project. If not → skip to <RunMend/>.
+- **Exit 0, first line "passed"**: Report "All lint checks passed (cached from {timestamp})." → skip to <StyleReview/>.
+- **Exit 0, first line "failed"**: The remaining output contains the cached mend + clippy output. Present issues as if mend + clippy had just run → skip to <CreateBatchTodoList/>.
+- **Exit 1**: Cache miss — proceed to <RunMend/>.
 
-2. Read the last line of the file. It will be in the format: `{ISO-8601-timestamp}\t{status}` where status is `started`, `passed`, or `failed`.
-
-3. If the last line status is `started`:
-   - Check the timestamp. If it's more than 30 minutes old, treat as stale → skip to <RunMend/>.
-   - Otherwise, inform the user: "Lint watcher is running, waiting for results..."
-   - Poll the file every 2 seconds (up to 5 minutes) until the last line changes to `passed` or `failed`.
-   - If timeout → inform user and proceed to <RunMend/>.
-
-4. If the last line status is `passed` or `failed`:
-   - Find the newest `.rs` or `Cargo.toml` file in the project (excluding `target/`):
-     ```bash
-     find . -path ./target -prune -o \( -name '*.rs' -o -name 'Cargo.toml' \) -print0 | xargs -0 stat -f '%m %N' | sort -rn | head -1
-     ```
-   - Compare the file's mtime to the log entry timestamp. If any source file is newer than the log entry → results are stale, skip to <RunMend/>.
-
-5. If results are fresh:
-   - **passed**: Report "All lint checks passed (cached from {timestamp}). Skipping re-run." → skip to <StyleReview/>.
-   - **failed**: Read `target/port-report/clippy-latest.log` and `target/port-report/mend-latest.log`. Present any issues found as if mend + clippy had just run → skip to <CreateBatchTodoList/>.
+The script handles all the logic: checking for the log file, waiting if a lint is in progress, comparing timestamps to source files, and outputting cached results.
 </CheckCachedResults>
 
 <RunMend>

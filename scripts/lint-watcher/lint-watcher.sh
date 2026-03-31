@@ -2,6 +2,7 @@
 # Orchestrator: spawns a cargo-watch process per eligible Rust project.
 # Each cargo-watch watches for .rs and Cargo.toml changes and runs run-lint.sh.
 # Stays alive as a long-running process managed by launchd.
+# Detects new projects appearing under ~/rust/ every 10 seconds.
 #
 # Compatible with macOS bash 3.x (no associative arrays).
 #
@@ -42,26 +43,43 @@ is_excluded() {
     return 1
 }
 
-# Build eligible project list
-projects=()
-for project_dir in "$RUST_DIR"/*/; do
+is_watched() {
+    local dir="$1"
+    local i=0
+    while [[ $i -lt ${#project_dirs[@]} ]]; do
+        [[ "${project_dirs[$i]}" == "$dir" ]] && return 0
+        i=$((i + 1))
+    done
+    return 1
+}
+
+# Spawn a cargo-watch for a project directory. Appends to project_dirs/child_pids.
+spawn_watcher() {
+    local project_dir="$1"
+    local name
     name=$(basename "$project_dir")
 
-    # Skip non-Rust
-    [[ ! -f "$project_dir/Cargo.toml" ]] && continue
+    # Build -w flags for all directories containing .rs or .toml files
+    local watch_flags=()
+    while IFS= read -r dir; do
+        watch_flags+=(-w "$dir")
+    done < <(rg --files -g '*.rs' -g '*.toml' "$project_dir" 2>/dev/null | xargs -n1 dirname | sort -u)
 
-    # Skip excluded
-    is_excluded "$name" && continue
+    if [[ ${#watch_flags[@]} -eq 0 ]]; then
+        echo "SKIP: $name (no .rs or .toml files found)"
+        return 1
+    fi
 
-    projects+=("${project_dir%/}")
-done
-
-if [[ ${#projects[@]} -eq 0 ]]; then
-    echo "No eligible projects found."
-    exit 0
-fi
-
-echo "=== Lint watcher: ${#projects[@]} projects ==="
+    cargo-watch \
+        "${watch_flags[@]}" \
+        -s "$RUN_LINT $project_dir" \
+        -C "$project_dir" \
+        --delay 2 \
+        &
+    project_dirs+=("$project_dir")
+    child_pids+=($!)
+    echo "Watching: $name (PID $!)"
+}
 
 # Parallel arrays: project_dirs[i] <-> child_pids[i]
 project_dirs=()
@@ -70,9 +88,7 @@ child_pids=()
 cleanup() {
     echo "Shutting down lint watcher..."
     for pid in "${child_pids[@]}"; do
-        # Kill grandchildren (run-lint.sh, cargo mend, cargo clippy) first
         pkill -P "$pid" 2>/dev/null || true
-        # Then kill cargo-watch itself
         kill "$pid" 2>/dev/null || true
     done
     wait 2>/dev/null
@@ -81,47 +97,53 @@ cleanup() {
 }
 trap cleanup SIGTERM SIGINT
 
-# Spawn cargo-watch per project
-for project_dir in "${projects[@]}"; do
+# Initial scan
+for project_dir in "$RUST_DIR"/*/; do
     name=$(basename "$project_dir")
-    cargo-watch \
-        -w "$project_dir/src" \
-        -w "$project_dir/Cargo.toml" \
-        -s "$RUN_LINT $project_dir" \
-        --no-vcs-ignores \
-        -C "$project_dir" \
-        --delay 2 \
-        --postpone \
-        &
-    project_dirs+=("$project_dir")
-    child_pids+=($!)
-    echo "Watching: $name (PID $!)"
+    [[ ! -f "$project_dir/Cargo.toml" ]] && continue
+    is_excluded "$name" && continue
+    spawn_watcher "${project_dir%/}"
 done
 
 echo ""
-echo "All watchers started. Waiting..."
+echo "=== Lint watcher: ${#project_dirs[@]} projects. Waiting... ==="
 
-# Monitor children — restart any that die unexpectedly
+# Monitor loop: restart dead watchers + detect new projects
 while true; do
+    # Restart dead watchers
     i=0
     while [[ $i -lt ${#project_dirs[@]} ]]; do
         pid="${child_pids[$i]}"
         if ! kill -0 "$pid" 2>/dev/null; then
             project_dir="${project_dirs[$i]}"
             name=$(basename "$project_dir")
-            echo "Restarting watcher for $name (PID $pid died)"
-            cargo-watch \
-                -w "$project_dir/src" \
-                -w "$project_dir/Cargo.toml" \
-                -s "$RUN_LINT $project_dir" \
-                --no-vcs-ignores \
-                -C "$project_dir" \
-                --delay 2 \
-                &
-            child_pids[$i]=$!
-            echo "Restarted: $name (PID $!)"
+            if [[ -f "$project_dir/Cargo.toml" ]]; then
+                echo "Restarting watcher for $name (PID $pid died)"
+                # Remove old entry, spawn fresh
+                project_dirs=("${project_dirs[@]:0:$i}" "${project_dirs[@]:$((i+1))}")
+                child_pids=("${child_pids[@]:0:$i}" "${child_pids[@]:$((i+1))}")
+                spawn_watcher "$project_dir"
+                continue  # don't increment i — array shifted
+            else
+                echo "Removing watcher for $name (project gone)"
+                project_dirs=("${project_dirs[@]:0:$i}" "${project_dirs[@]:$((i+1))}")
+                child_pids=("${child_pids[@]:0:$i}" "${child_pids[@]:$((i+1))}")
+                continue
+            fi
         fi
         i=$((i + 1))
     done
-    sleep 10
+
+    # Detect new projects — run lint immediately to catch current state
+    for project_dir in "$RUST_DIR"/*/; do
+        name=$(basename "$project_dir")
+        project_dir="${project_dir%/}"
+        [[ ! -f "$project_dir/Cargo.toml" ]] && continue
+        is_excluded "$name" && continue
+        is_watched "$project_dir" && continue
+        echo "New project detected: $name"
+        spawn_watcher "$project_dir"
+    done
+
+    sleep 1
 done

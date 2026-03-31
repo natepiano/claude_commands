@@ -79,7 +79,20 @@
       "Bash(open:*)",
       "Read(//private/tmp/claude/**)",
       "Bash(flock -n /private/tmp/claude/lint-watcher.lock echo \"lock is free\")",
-      "Bash(kill 11633 11639)"
+      "Bash(kill 11633 11639)",
+      "Bash(pgrep -lf cargo-watch.*hana)",
+      "Bash(bash /Users/natemccoy/.claude/scripts/lint-watcher/status.sh stop)",
+      "Bash(rm /tmp/lint-watcher-stdout.log /tmp/lint-watcher-stderr.log)",
+      "Bash(bash /Users/natemccoy/.claude/scripts/lint-watcher/status.sh start)",
+      "Bash(find /Users/natemccoy/rust -name \"port-report.log\" -path \"*/target/*\" -delete)",
+      "Bash(bash ~/.claude/scripts/clippy/check_cache.sh .)",
+      "Bash(echo \"exit: $?\")",
+      "Bash(rm /Users/natemccoy/rust/obsidian_knife/src/lib.rs)",
+      "Bash(git -C /Users/natemccoy/rust/obsidian_knife checkout -- src/lib.rs)",
+      "Bash(for proj:*)",
+      "Bash(do rm:*)",
+      "Bash(echo \"cleared $proj\")",
+      "Bash(done)"
     ],
     "deny": [],
     "ask": []
