@@ -9,6 +9,7 @@ Use TodoWrite tool to create initial todos:
 **STEP 1:** Execute <SuggestWorktreeName/>
 **STEP 2:** Execute <GetUserApproval/>
 **STEP 3:** Execute <CreateWorktreeAndSwitch/>
+**STEP 4:** Execute <CopySettingsLocal/>
 </ExecutionSteps>
 
 <SuggestWorktreeName>
@@ -63,3 +64,14 @@ Mark third todo as in_progress.
 
 Mark third todo as completed when finished.
 </CreateWorktreeAndSwitch>
+
+<CopySettingsLocal>
+**Copy settings.local.json to the new worktree:**
+
+- Check if the source project (the directory you were in before creating the worktree) has `.claude/settings.local.json`
+- If yes: `mkdir -p ../[worktree-name]/.claude && cp .claude/settings.local.json ../[worktree-name]/.claude/settings.local.json`
+- If no: `mkdir -p ../[worktree-name]/.claude && cp ~/.claude/templates/settings_local.json ../[worktree-name]/.claude/settings.local.json`
+- Resolve the new worktree's actual gitdir with `git -C ../[worktree-name] rev-parse --git-dir`, ensure its `info` directory exists, and add `settings.local.json` to that worktree-local exclude if not already present:
+  `git_dir=$(git -C ../[worktree-name] rev-parse --git-dir) && mkdir -p "$git_dir/info" && if ! grep -qxF 'settings.local.json' "$git_dir/info/exclude" 2>/dev/null; then echo 'settings.local.json' >> "$git_dir/info/exclude"; fi`
+- Inform user: "Copied settings.local.json to worktree."
+</CopySettingsLocal>

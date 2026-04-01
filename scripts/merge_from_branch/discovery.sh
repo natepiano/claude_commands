@@ -35,12 +35,12 @@ while IFS= read -r line; do
     fi
 done < <(git worktree list)
 
-# List local branches with last commit, excluding current
+# List local branches with last commit, excluding current and release branches
 BRANCH_ENTRIES=""
 BRANCH_COUNT=0
 while IFS= read -r branch; do
-    # Skip current branch
-    if [[ "$branch" == "$CURRENT_BRANCH" ]]; then
+    # Skip current branch and release branches
+    if [[ "$branch" == "$CURRENT_BRANCH" || "$branch" == release-* ]]; then
         continue
     fi
 

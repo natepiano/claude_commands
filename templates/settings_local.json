@@ -1,0 +1,41 @@
+{
+  "permissions": {
+    "allow": [
+      "WebSearch",
+      "WebFetch(domain:crates.io)",
+      "WebFetch(domain:docs.rs)",
+      "WebFetch(domain:github.com)",
+      "WebFetch(domain:raw.githubusercontent.com)",
+      "Bash(taplo fmt:*)",
+      "Bash(cargo nextest:*)",
+      "Bash(bash ~/.claude/scripts/validate_and_push/validate_ci.sh:*)",
+      "Bash(~/.claude/scripts/validate_and_push/validate_ci.sh:*)",
+      "Bash(bash ~/.claude/scripts/validate_and_push/run_validation.sh:*)",
+      "Bash(~/.claude/scripts/validate_and_push/run_validation.sh:*)",
+      "Bash(bash ~/.claude/scripts/validate_and_push/watch_ci.sh:*)",
+      "Bash(~/.claude/scripts/validate_and_push/watch_ci.sh:*)",
+      "Bash(bash ~/.claude/scripts/ask_a_friend/ask_a_friend.sh:*)",
+      "Bash(bash ~/.claude/scripts/ask_a_friend/prepare_session.sh:*)",
+      "Bash(bash ~/.claude/scripts/ask_a_friend/codex_implement.sh:*)",
+      "Bash(bash ~/.claude/scripts/commit_prep/analyze_changes.sh:*)",
+      "Bash(bash ~/.claude/scripts/delete_a_worktree/discover_worktrees.sh:*)",
+      "Bash(bash ~/.claude/scripts/delete_a_worktree/delete_a_worktree_validation.sh:*)",
+      "Bash(bash ~/.claude/scripts/delete_a_worktree/perform_deletion.sh:*)",
+      "Bash(bash ~/.claude/scripts/merge_from_branch/discovery.sh:*)",
+      "Bash(bash ~/.claude/scripts/merge_from_branch/validate.sh:*)",
+      "Bash(bash ~/.claude/scripts/codex_review/codex_review.sh:*)",
+      "Bash(~/.claude/scripts/new_rust_project/rust_generate.sh:*)",
+      "mcp__brp__brp_launch",
+      "mcp__brp__brp_shutdown",
+      "mcp__brp__brp_status",
+      "mcp__brp__brp_read_log",
+      "mcp__brp__brp_extras_screenshot",
+      "mcp__brp__brp_extras_send_keys",
+      "mcp__brp__brp_list_bevy_examples",
+      "mcp__brp__brp_list_brp_apps",
+      "mcp__brp__brp_list_bevy_apps",
+      "mcp__brp__world_query",
+      "mcp__brp__brp_type_guide"
+    ]
+  }
+}

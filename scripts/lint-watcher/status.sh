@@ -8,10 +8,25 @@
 
 set -euo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+source "$SCRIPT_DIR/cache-root.sh"
+
 RUST_DIR="$HOME/rust"
 LABEL="com.natemccoy.lint-watcher"
 PLIST="$HOME/Library/LaunchAgents/com.natemccoy.lint-watcher.plist"
 CMD="${1:-status}"
+TEMP_ROOT="$(cache_root)/port-report"
+
+project_key() {
+    printf '%s' "$1" | od -An -tx1 | tr -d ' \n'
+}
+
+project_log_file() {
+    local project_dir="$1"
+    local abs_project_dir
+    abs_project_dir="$(cd "$project_dir" && pwd -P)"
+    printf '%s\n' "$TEMP_ROOT/$(project_key "$abs_project_dir")/port-report.log"
+}
 
 do_stop() {
     if launchctl list "$LABEL" &>/dev/null; then
@@ -80,7 +95,7 @@ do_status() {
 
     for project_dir in "$RUST_DIR"/*/; do
         name=$(basename "$project_dir")
-        log_file="$project_dir/target/port-report.log"
+        log_file="$(project_log_file "$project_dir")"
 
         [[ ! -f "$project_dir/Cargo.toml" ]] && continue
 

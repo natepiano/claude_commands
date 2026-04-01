@@ -16,10 +16,20 @@
 
 set -euo pipefail
 
-PROJECT_DIR="${1:-.}"
-LOG_FILE="$PROJECT_DIR/target/port-report.log"
-OUTPUT_DIR="$PROJECT_DIR/target/port-report"
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+source "$SCRIPT_DIR/../lint-watcher/cache-root.sh"
+
+PROJECT_DIR="$(cd "${1:-.}" && pwd -P)"
+TEMP_ROOT="$(cache_root)/port-report"
 STALE_SECONDS=1800  # 30 minutes
+
+project_key() {
+    printf '%s' "$1" | od -An -tx1 | tr -d ' \n'
+}
+
+STATE_DIR="$TEMP_ROOT/$(project_key "$PROJECT_DIR")"
+LOG_FILE="$STATE_DIR/port-report.log"
+OUTPUT_DIR="$STATE_DIR/port-report"
 
 # --- No log file → cache miss
 if [[ ! -f "$LOG_FILE" ]]; then

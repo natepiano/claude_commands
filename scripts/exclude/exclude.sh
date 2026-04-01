@@ -15,11 +15,10 @@ if ! git rev-parse --show-toplevel >/dev/null 2>&1; then
     exit 1
 fi
 
-GIT_DIR=$(git rev-parse --git-dir)
-EXCLUDE_FILE="$GIT_DIR/info/exclude"
+EXCLUDE_FILE=$(git rev-parse --git-path info/exclude)
 
 # Ensure .git/info/exclude exists
-mkdir -p "$GIT_DIR/info"
+mkdir -p "$(dirname "$EXCLUDE_FILE")"
 touch "$EXCLUDE_FILE"
 
 # Check if already excluded

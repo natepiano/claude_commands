@@ -34,8 +34,9 @@ CLUSTER_DASH_ARRAY = "6,4"
 CLUSTER_CORNER_RADIUS = 4.0
 SVG_OUTER_PAD = 15.0
 
-# These clusters get aligned tops
-PHASE_CLUSTER_IDS = ("cluster_watcher", "cluster_consumers", "cluster_output")
+# This diagram has vertically stacked clusters on the right, so forcing a
+# shared top line causes label overlap. Leave cluster tops independent.
+PHASE_CLUSTER_IDS: tuple[str, ...] = ()
 
 SVG_NS = "http://www.w3.org/2000/svg"
 Bbox = tuple[float, float, float, float]

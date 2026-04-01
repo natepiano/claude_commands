@@ -53,6 +53,12 @@ fi
 START_TIME=$SECONDS
 log "=== Starting nightly Rust clean + rebuild ==="
 
+# Back-populate canonical settings.local.json permissions
+log "SETTINGS: back-populating canonical permissions..."
+python3 "$SCRIPT_DIR/backpopulate_settings.py" --apply >> "$LOG_FILE" 2>&1 || {
+    log "WARNING: settings back-population failed"
+}
+
 for project_dir in "$RUST_DIR"/*/; do
     project_name=$(basename "$project_dir")
 

@@ -115,6 +115,10 @@ echo "=== Excluding settings.local.json and EVALUATION.md from git ==="
 echo "settings.local.json" >> .git/info/exclude
 echo "EVALUATION.md" >> .git/info/exclude
 
+echo "=== Creating default settings.local.json ==="
+mkdir -p .claude
+cp "$HOME/.claude/templates/settings_local.json" .claude/settings.local.json
+
 if ! command -v cargo-mend &>/dev/null; then
   echo "=== Installing cargo-mend ==="
   cargo install cargo-mend

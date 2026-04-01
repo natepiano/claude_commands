@@ -61,10 +61,19 @@ fi
 
 # Test merge feasibility (dry-run)
 MERGE_FEASIBLE=true
-if ! git merge --no-commit --no-ff "$SOURCE_BRANCH" >/dev/null 2>&1; then
+MERGE_CHECK_ERROR=""
+if ! MERGE_OUTPUT=$(git merge --no-commit --no-ff "$SOURCE_BRANCH" 2>&1); then
     MERGE_FEASIBLE=false
+    if echo "$MERGE_OUTPUT" | grep -qiE 'Operation not permitted|cannot lock ref|Unable to create .+\.lock|unable to create temporary file'; then
+        MERGE_CHECK_ERROR="Merge feasibility check was blocked by the environment. Git could not write temporary merge state under .git; rerun this validation outside the sandbox."
+    fi
 fi
-git merge --abort >/dev/null 2>&1
+git merge --abort >/dev/null 2>&1 || true
+
+if [[ -n "$MERGE_CHECK_ERROR" ]]; then
+    echo "{\"status\": \"error\", \"message\": \"$MERGE_CHECK_ERROR\"}"
+    exit 1
+fi
 
 # Build worktree fields for JSON
 WT_FIELDS=""

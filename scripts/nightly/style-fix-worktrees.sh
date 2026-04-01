@@ -192,6 +192,29 @@ Run: git -C $worktree_dir diff
 If the diff is non-empty, evaluate every change against the style guide loaded in Step 1.
 Fix any violations found. If no violations, move on.
 
+Step 8: Write fix summary to EVALUATION.md
+Append a section to the END of $worktree_dir/EVALUATION.md with the following format:
+
+---
+
+## Fix Summary
+
+For each numbered finding, add a line:
+
+### Finding N: [title from finding]
+**Status:** Applied | Partially applied | Skipped
+**What was done:** [1-2 sentences describing the actual changes made]
+**Issues:** [If partially applied or skipped, explain WHY — e.g., "file no longer exists",
+"pattern didn't match", "fixing this would require removing a public API method",
+"clippy's suggested fix conflicts with one-use-per-line style rule", etc.]
+[Omit Issues line if status is Applied with no complications]
+
+After all findings, add:
+
+### Build Status
+- **clippy:** pass | fail (with summary of remaining warnings/errors if fail)
+- **tests:** pass | fail (with summary of failures if fail)
+
 Fixing guidelines:
 - Do NOT fix warnings by marking code as dead — remove dead code entirely
 - Do NOT fix warnings by prefixing arguments/variables with _ — remove them if unused
@@ -199,9 +222,9 @@ Fixing guidelines:
 Rules:
 - Modify ONLY files inside $worktree_dir
 - Do NOT commit anything (no git add, no git commit)
-- Do NOT modify EVALUATION.md itself
+- EVALUATION.md may ONLY be modified by appending the Fix Summary section (Step 8)
 - Apply each fix completely — no partial changes
-- If a finding references files that don't exist or patterns that don't match, skip that finding silently
+- If a finding references files that don't exist or patterns that don't match, skip that finding and document why in the Fix Summary
 PROMPT_EOF
     )
 

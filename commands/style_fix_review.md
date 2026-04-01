@@ -10,15 +10,19 @@ description: Review changes in a style-fix worktree against its EVALUATION.md fi
 
 **Your task:** Review the changes the automation made and determine whether each finding was correctly and completely addressed.
 
-## Step 1: Load relevant style guide files
+## Step 1: Read the evaluation and fix summary
+
+Read `EVALUATION.md` in this worktree. It contains two parts:
+1. **Findings** — the numbered style violations identified by `/style_eval`
+2. **Fix Summary** — appended by the fix agent, documenting what it did, what it skipped, and why
+
+Start by reading the Fix Summary section at the bottom. This gives you the agent's own account of what happened — which findings were applied, which were skipped or partially applied, and any issues encountered (build failures, pattern mismatches, style conflicts, etc.). Use this as your starting point: you'll verify these claims against the actual diff.
+
+## Step 2: Load relevant style guide files
 
 Each finding in EVALUATION.md includes a **Style file** field with the full path to the relevant style guide file (e.g., `~/rust/nate_style/rust/one-use-per-line.md`).
 
 Read each unique style file referenced by the findings. These are your authoritative references for evaluating whether the changes conform to the style rules.
-
-## Step 2: Read the evaluation
-
-Read `EVALUATION.md` in this worktree. Note each numbered finding — what it asked for, which files it cited, and the recommended pattern.
 
 ## Step 3: Read the diff
 

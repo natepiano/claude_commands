@@ -92,7 +92,8 @@
       "Bash(for proj:*)",
       "Bash(do rm:*)",
       "Bash(echo \"cleared $proj\")",
-      "Bash(done)"
+      "Bash(done)",
+      "Bash(grep -E '^\\\\s+\\\\w|^={10,}|^Total|^Canonical')"
     ],
     "deny": [],
     "ask": []
