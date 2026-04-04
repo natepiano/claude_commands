@@ -3,7 +3,7 @@
 **NEVER** commit changes unless i ask you to
 
 ## rust
-- Before writing Rust code, run `/nate_style` to load the full style guide from `~/rust/nate_style/rust/`
+- Before writing Rust code, run `/nate_style`, which uses `~/.claude/scripts/load-rust-style.sh` to load the shared style guide plus any repo-local `docs/style/*.md` overlay
 
 ## python
 
@@ -93,4 +93,3 @@ if you need something renamed such as a type or a function or whatever, the user
 - **ALWAYS** use `dangerouslyDisableSandbox: true` when running `taplo` directly (e.g. `taplo fmt` for auto-fixing)
 - taplo panics in the sandbox due to macOS Mach IPC restrictions (`SCDynamicStoreCreate`)
 - `excludedCommands` does NOT help — it only bypasses filesystem restrictions, not Mach IPC
-

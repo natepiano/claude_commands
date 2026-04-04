@@ -10,9 +10,9 @@ digraph lint_watcher {
     // │                                                                 │
     // │ Column layout:                                                  │
     // │   Watcher column center  = 130                                  │
-    // │   shared log center      = 380                                  │
-    // │   Output column center   = 730                                  │
-    // │   Consumer column center = 730                                  │
+    // │   shared log center      = 400                                  │
+    // │   Output column center   = 680                                  │
+    // │   Consumer column center = 680                                  │
     // └─────────────────────────────────────────────────────────────────┘
     fontname="Helvetica"
     node [fontname="Helvetica" fontsize=10 style=filled shape=box margin="0.12,0.06" width=2.4 height=0.5]
@@ -33,6 +33,7 @@ digraph lint_watcher {
         orchestrator [label="lint-watcher.sh\n(scan ~/rust/*, manage watchers)" height=0.55 pos="130,820!"]
         cargo_watch [label="cargo-watch per project\n(watches .rs + Cargo.toml)" height=0.55 pos="130,745!"]
         file_saved [label="File saved" shape=oval fillcolor="#fef9e7" color="#f39c12" width=1.55 pos="130,682!"]
+        restart_note [label="if lint is already running,\ncargo-watch restarts it" shape=plaintext style="" color="#e74c3c" fontcolor="#e74c3c" fontsize=8 pos="130,645!"]
         run_lint [label="run-lint.sh\n(per-project lint worker)" height=0.6 pos="130,595!"]
         write_started [label="Append 'started'\nto status log" height=0.55 pos="130,520!"]
         run_mend [label="cargo mend" pos="130,445!"]
@@ -46,12 +47,12 @@ digraph lint_watcher {
         style=dashed color="#95a5a6" fontcolor="#7f8c8d" fontsize=9
         margin=12
 
-        mend_log [label="mend-latest.log\n(raw output)" width=1.95 height=0.55 pos="730,655!"]
-        clippy_log [label="clippy-latest.log\n(raw output)" width=1.95 height=0.55 pos="730,575!"]
+        mend_log [label="mend-latest.log\n(raw output)" width=1.95 height=0.55 pos="680,670!"]
+        clippy_log [label="clippy-latest.log\n(raw output)" width=1.95 height=0.55 pos="680,590!"]
     }
 
     // ══════ Protocol File (between columns) ══════
-    port_report [label="shared temp cache\nport-report.log\nappend-only status log" shape=note fillcolor="#fef9e7" color="#f39c12" height=0.8 width=2.55 pos="380,305!"]
+    port_report [label="shared temp cache\nport-report.log\nappend-only status log" shape=note fillcolor="#fef9e7" color="#f39c12" height=0.8 width=2.55 pos="400,305!"]
 
     // ══════ Consumers (x center = 620, bottom half) ══════
     subgraph cluster_consumers {
@@ -59,9 +60,9 @@ digraph lint_watcher {
         style=dashed color="#95a5a6" fontcolor="#7f8c8d" fontsize=9
         margin=12
 
-        clippy_cmd [label="/clippy command\n(check cache before running)" height=0.55 pos="730,450!"]
-        cargo_port [label="cargo-port TUI\nwatches status log,\nshows spinner / pass / fail" height=0.72 width=2.85 pos="730,340!"]
-        status_sh [label="status.sh\n(CLI status table)" height=0.55 pos="730,305!"]
+        clippy_cmd [label="/clippy command\n(check cache before running)" height=0.55 pos="680,430!"]
+        cargo_port [label="cargo-port TUI\nwatches status log,\nshows spinner / pass / fail" height=0.72 width=2.85 pos="680,320!"]
+        status_sh [label="status.sh\n(CLI status table)" height=0.55 pos="680,225!"]
     }
 
     // ── Edges ──
@@ -73,7 +74,7 @@ digraph lint_watcher {
     orchestrator -> cargo_watch
     cargo_watch -> run_lint [style=dotted label="startup run"]
     cargo_watch -> file_saved [style=dotted label="later\nchange"]
-    file_saved -> run_lint [style=dotted label="start / restart\nsame-project lint" color="#e74c3c" fontcolor="#e74c3c"]
+    file_saved -> run_lint [style=dotted]
     run_lint -> write_started -> run_mend -> run_clippy -> write_result
 
     // Watcher → Output Files

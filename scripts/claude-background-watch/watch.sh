@@ -30,11 +30,23 @@ notify_user() {
 }
 
 matches_background_claude() {
-    local tty="$1"
-    local args="$2"
+    local pid="$1"
+    local tty="$2"
+    local args="$3"
 
     [[ "$tty" == "?" || "$tty" == "??" ]] || return 1
     [[ "$args" == *"claude-background-watch"* ]] && return 1
+    [[ "$args" == *"--remote-control"* ]] && return 1
+
+    # Skip subagents: if any ancestor has a TTY, it's a child of an interactive session
+    local check_pid="$pid"
+    for _ in 1 2 3 4; do
+        check_pid="$(ps -p "$check_pid" -o ppid= 2>/dev/null | tr -d ' ')" || break
+        [[ -n "$check_pid" && "$check_pid" != "1" ]] || break
+        local ancestor_tty
+        ancestor_tty="$(ps -p "$check_pid" -o tty= 2>/dev/null | tr -d ' ')" || continue
+        [[ "$ancestor_tty" == "??" || "$ancestor_tty" == "?" || -z "$ancestor_tty" ]] || return 1
+    done
 
     [[ "$args" == *"$CLAUDE_BIN"* ]] && return 0
     [[ "$args" == *"$CLAUDE_VERSION_DIR"* ]] && return 0
@@ -96,7 +108,7 @@ while true; do
     while read -r pid ppid tty args; do
         [[ -n "${pid:-}" ]] || continue
 
-        if matches_background_claude "$tty" "$args"; then
+        if matches_background_claude "$pid" "$tty" "$args"; then
             printf '%s\n' "$pid" >> "$current_file"
             if ! grep -qx "$pid" "$SEEN_FILE" 2>/dev/null; then
                 snapshot_process "$pid" "$ppid" "$tty" "$args"

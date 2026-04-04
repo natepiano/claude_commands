@@ -24,9 +24,43 @@ if [[ "$SOURCE_BRANCH" == "$CURRENT_BRANCH" ]]; then
     exit 1
 fi
 
+json_escape() {
+    local value="$1"
+    value=${value//\\/\\\\}
+    value=${value//\"/\\\"}
+    value=${value//$'\t'/\\t}
+    value=${value//$'\r'/\\r}
+    value=${value//$'\n'/\\n}
+    printf '%s' "$value"
+}
+
+json_array_from_lines() {
+    local input="$1"
+    local first=true
+    local line
+
+    if [[ -z "$input" ]]; then
+        printf '[]'
+        return
+    fi
+
+    printf '['
+    while IFS= read -r line; do
+        if [[ "$first" == true ]]; then
+            first=false
+        else
+            printf ', '
+        fi
+        printf '"%s"' "$(json_escape "$line")"
+    done <<< "$input"
+    printf ']'
+}
+
 # Check if this branch has an associated worktree
 WORKTREE_PATH=""
 SOURCE_IS_CLEAN=true
+SOURCE_STATUS_OUTPUT=""
+SOURCE_STATUS_ENTRIES='[]'
 while IFS= read -r line; do
     WT_PATH=$(echo "$line" | awk '{print $1}')
     WT_BRANCH=$(echo "$line" | grep -o '\[.*\]' | tr -d '[]')
@@ -38,8 +72,10 @@ done < <(git worktree list)
 
 # If worktree exists, check for uncommitted changes in it
 if [[ -n "$WORKTREE_PATH" ]]; then
-    if [[ -n "$(git -C "$WORKTREE_PATH" status --porcelain)" ]]; then
+    SOURCE_STATUS_OUTPUT=$(git -C "$WORKTREE_PATH" status --porcelain)
+    if [[ -n "$SOURCE_STATUS_OUTPUT" ]]; then
         SOURCE_IS_CLEAN=false
+        SOURCE_STATUS_ENTRIES=$(json_array_from_lines "$SOURCE_STATUS_OUTPUT")
     fi
 fi
 
@@ -79,7 +115,8 @@ fi
 WT_FIELDS=""
 if [[ -n "$WORKTREE_PATH" ]]; then
     WT_FIELDS="\"worktree\": \"$WORKTREE_PATH\",
-  \"source_is_clean\": $SOURCE_IS_CLEAN,"
+  \"source_is_clean\": $SOURCE_IS_CLEAN,
+  \"source_status_entries\": $SOURCE_STATUS_ENTRIES,"
 fi
 
 echo "{

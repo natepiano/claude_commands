@@ -61,7 +61,7 @@ digraph nightly_style {
         margin=12
 
         eval_foreach [label="For each project (parallel)" pos="394.2,790!"]
-        load_style [label="Load style guide\n~/rust/nate_style/rust/" height=0.55 pos="394.2,725!"]
+        load_style [label="Load style guide\n~/.claude/scripts/load-rust-style.sh" height=0.55 pos="394.2,725!"]
         survey [label="Survey project source" pos="394.2,665!"]
         carry_forward [label="Read existing EVALUATION.md\n(carry forward valid findings)" height=0.55 pos="394.2,600!"]
         check_wt_eval [label="_style_fix/\nEVALUATION.md\nexists?" shape=diamond fillcolor="#fef9e7" color="#f39c12" width=1.5 height=0.9 pos="394.2,520!"]

@@ -116,7 +116,7 @@
 <title>load_style</title>
 <polygon fill="#e8f4f8" stroke="#2980b9" points="425.6,-782.8 252.8,-782.8 252.8,-743.2 425.6,-743.2 425.6,-782.8" />
 <text xml:space="preserve" text-anchor="middle" x="339.2" y="-764.75" font-family="Helvetica,sans-Serif" font-size="10.00">Load style guide</text>
-<text xml:space="preserve" text-anchor="middle" x="339.2" y="-753.5" font-family="Helvetica,sans-Serif" font-size="10.00">~/rust/nate_style/rust/</text>
+<text xml:space="preserve" text-anchor="middle" x="339.2" y="-753.5" font-family="Helvetica,sans-Serif" font-size="10.00">~/.claude/scripts/load-rust-style.sh</text>
 </g>
 
 <g id="edge9" class="edge">

@@ -1,230 +1,234 @@
 <?xml version='1.0' encoding='UTF-8'?>
-<svg xmlns="http://www.w3.org/2000/svg" width="855.0pt" height="730.8pt" viewBox="-29.00 -11.00 855.00 730.80">
-<g id="graph0" class="graph" transform="scale(1 1) rotate(0) translate(4 683.8)">
+<svg xmlns="http://www.w3.org/2000/svg" width="805.0pt" height="810.8pt" viewBox="-29.00 -11.00 805.00 810.80">
+<g id="graph0" class="graph" transform="scale(1 1) rotate(0) translate(4 754.8)">
 <title>lint_watcher</title>
-<polygon fill="white" stroke="none" points="-4,4 -4,-683.8 793,-683.8 793,4 -4,4" />
+<polygon fill="white" stroke="none" points="-4,4 -4,-754.8 743,-754.8 743,4 -4,4" />
 
-<rect x="-18.0" y="-607.6" width="208.8" height="628.6" fill="none" stroke="#95a5a6" stroke-width="1.5" stroke-dasharray="6,4" rx="4.0" /><rect x="598.2" y="-442.6" width="176.4" height="193.6" fill="none" stroke="#95a5a6" stroke-width="1.5" stroke-dasharray="6,4" rx="4.0" /><rect x="565.8" y="-237.6" width="241.2" height="258.6" fill="none" stroke="#95a5a6" stroke-width="1.5" stroke-dasharray="6,4" rx="4.0" /><g id="node1" class="node">
+<rect x="-18.0" y="-678.6" width="208.8" height="628.6" fill="none" stroke="#95a5a6" stroke-width="1.5" stroke-dasharray="6,4" rx="4.0" /><rect x="548.2" y="-528.6" width="176.4" height="193.6" fill="none" stroke="#95a5a6" stroke-width="1.5" stroke-dasharray="6,4" rx="4.0" /><rect x="515.8" y="-288.6" width="241.2" height="318.6" fill="none" stroke="#95a5a6" stroke-width="1.5" stroke-dasharray="6,4" rx="4.0" /><g id="node1" class="node">
 <title>start</title>
-<ellipse fill="#f0e6ff" stroke="#8e44ad" cx="86.4" cy="-661.8" rx="72" ry="18" />
-<text xml:space="preserve" text-anchor="middle" x="86.4" y="-657.93" font-family="Helvetica,sans-Serif" font-size="10.00">Login / launchd</text>
+<ellipse fill="#f0e6ff" stroke="#8e44ad" cx="86.4" cy="-732.8" rx="72" ry="18" />
+<text xml:space="preserve" text-anchor="middle" x="86.4" y="-728.93" font-family="Helvetica,sans-Serif" font-size="10.00">Login / launchd</text>
 </g>
 
 <g id="node2" class="node">
 <title>orchestrator</title>
-<polygon fill="#e8f4f8" stroke="#2980b9" points="172.8,-563.6 0,-563.6 0,-524 172.8,-524 172.8,-563.6" />
-<text xml:space="preserve" text-anchor="middle" x="86.4" y="-545.55" font-family="Helvetica,sans-Serif" font-size="10.00">lint-watcher.sh</text>
-<text xml:space="preserve" text-anchor="middle" x="86.4" y="-534.3" font-family="Helvetica,sans-Serif" font-size="10.00">(scan ~/rust/*, manage watchers)</text>
+<polygon fill="#e8f4f8" stroke="#2980b9" points="172.8,-634.6 0,-634.6 0,-595 172.8,-595 172.8,-634.6" />
+<text xml:space="preserve" text-anchor="middle" x="86.4" y="-616.55" font-family="Helvetica,sans-Serif" font-size="10.00">lint-watcher.sh</text>
+<text xml:space="preserve" text-anchor="middle" x="86.4" y="-605.3" font-family="Helvetica,sans-Serif" font-size="10.00">(scan ~/rust/*, manage watchers)</text>
 </g>
 
 <g id="edge1" class="edge">
 <title>start-&gt;orchestrator</title>
-<path fill="none" stroke="black" d="M86.4,-643.36C86.4,-625.2 86.4,-597.11 86.4,-575.39" />
-<polygon fill="black" stroke="black" points="89.9,-575.6 86.4,-565.6 82.9,-575.6 89.9,-575.6" />
+<path fill="none" stroke="black" d="M86.4,-714.36C86.4,-696.2 86.4,-668.11 86.4,-646.39" />
+<polygon fill="black" stroke="black" points="89.9,-646.6 86.4,-636.6 82.9,-646.6 89.9,-646.6" />
 </g>
 
 <g id="node3" class="node">
 <title>cargo_watch</title>
-<polygon fill="#e8f4f8" stroke="#2980b9" points="172.8,-488.6 0,-488.6 0,-449 172.8,-449 172.8,-488.6" />
-<text xml:space="preserve" text-anchor="middle" x="86.4" y="-470.55" font-family="Helvetica,sans-Serif" font-size="10.00">cargo-watch per project</text>
-<text xml:space="preserve" text-anchor="middle" x="86.4" y="-459.3" font-family="Helvetica,sans-Serif" font-size="10.00">(watches .rs + Cargo.toml)</text>
+<polygon fill="#e8f4f8" stroke="#2980b9" points="172.8,-559.6 0,-559.6 0,-520 172.8,-520 172.8,-559.6" />
+<text xml:space="preserve" text-anchor="middle" x="86.4" y="-541.55" font-family="Helvetica,sans-Serif" font-size="10.00">cargo-watch per project</text>
+<text xml:space="preserve" text-anchor="middle" x="86.4" y="-530.3" font-family="Helvetica,sans-Serif" font-size="10.00">(watches .rs + Cargo.toml)</text>
 </g>
 
 <g id="edge2" class="edge">
 <title>orchestrator-&gt;cargo_watch</title>
-<path fill="none" stroke="black" d="M86.4,-523.7C86.4,-516.56 86.4,-508.33 86.4,-500.45" />
-<polygon fill="black" stroke="black" points="89.9,-500.47 86.4,-490.47 82.9,-500.47 89.9,-500.47" />
+<path fill="none" stroke="black" d="M86.4,-594.7C86.4,-587.56 86.4,-579.33 86.4,-571.45" />
+<polygon fill="black" stroke="black" points="89.9,-571.47 86.4,-561.47 82.9,-571.47 89.9,-571.47" />
 </g>
 
 <g id="node4" class="node">
 <title>file_saved</title>
-<ellipse fill="#fef9e7" stroke="#f39c12" cx="86.4" cy="-405.8" rx="55.8" ry="18" />
-<text xml:space="preserve" text-anchor="middle" x="86.4" y="-401.93" font-family="Helvetica,sans-Serif" font-size="10.00">File saved</text>
+<ellipse fill="#fef9e7" stroke="#f39c12" cx="86.4" cy="-476.8" rx="55.8" ry="18" />
+<text xml:space="preserve" text-anchor="middle" x="86.4" y="-472.92" font-family="Helvetica,sans-Serif" font-size="10.00">File saved</text>
 </g>
 
 <g id="edge4" class="edge">
 <title>cargo_watch-&gt;file_saved</title>
-<path fill="none" stroke="black" stroke-dasharray="1,5" d="M86.4,-448.52C86.4,-444.32 86.4,-439.8 86.4,-435.35" />
-<polygon fill="black" stroke="black" points="89.9,-435.43 86.4,-425.43 82.9,-435.43 89.9,-435.43" />
-<text xml:space="preserve" text-anchor="middle" x="73.27" y="-446.58" font-family="Helvetica,sans-Serif" font-size="8.00">later</text>
-<text xml:space="preserve" text-anchor="middle" x="73.27" y="-437.58" font-family="Helvetica,sans-Serif" font-size="8.00">change</text>
+<path fill="none" stroke="black" stroke-dasharray="1,5" d="M86.4,-519.52C86.4,-515.32 86.4,-510.8 86.4,-506.35" />
+<polygon fill="black" stroke="black" points="89.9,-506.43 86.4,-496.43 82.9,-506.43 89.9,-506.43" />
+<text xml:space="preserve" text-anchor="middle" x="73.27" y="-517.58" font-family="Helvetica,sans-Serif" font-size="8.00">later</text>
+<text xml:space="preserve" text-anchor="middle" x="73.27" y="-508.58" font-family="Helvetica,sans-Serif" font-size="8.00">change</text>
 </g>
 
-<g id="node5" class="node">
+<g id="node6" class="node">
 <title>run_lint</title>
-<polygon fill="#e8f4f8" stroke="#2980b9" points="172.8,-340.4 0,-340.4 0,-297.2 172.8,-297.2 172.8,-340.4" />
-<text xml:space="preserve" text-anchor="middle" x="86.4" y="-320.55" font-family="Helvetica,sans-Serif" font-size="10.00">run-lint.sh</text>
-<text xml:space="preserve" text-anchor="middle" x="86.4" y="-309.3" font-family="Helvetica,sans-Serif" font-size="10.00">(per-project lint worker)</text>
+<polygon fill="#e8f4f8" stroke="#2980b9" points="172.8,-411.4 0,-411.4 0,-368.2 172.8,-368.2 172.8,-411.4" />
+<text xml:space="preserve" text-anchor="middle" x="86.4" y="-391.55" font-family="Helvetica,sans-Serif" font-size="10.00">run-lint.sh</text>
+<text xml:space="preserve" text-anchor="middle" x="86.4" y="-380.3" font-family="Helvetica,sans-Serif" font-size="10.00">(per-project lint worker)</text>
 </g>
 
 <g id="edge3" class="edge">
 <title>cargo_watch-&gt;run_lint</title>
-<path fill="none" stroke="black" stroke-dasharray="1,5" d="M86.4,-448.57C86.4,-423.9 86.4,-381.85 86.4,-352.31" />
-<polygon fill="black" stroke="black" points="89.9,-352.41 86.4,-342.41 82.9,-352.41 89.9,-352.41" />
-<text xml:space="preserve" text-anchor="middle" x="66.9" y="-387.35" font-family="Helvetica,sans-Serif" font-size="8.00">startup run</text>
+<path fill="none" stroke="black" stroke-dasharray="1,5" d="M86.4,-519.57C86.4,-494.9 86.4,-452.85 86.4,-423.31" />
+<polygon fill="black" stroke="black" points="89.9,-423.41 86.4,-413.41 82.9,-423.41 89.9,-423.41" />
+<text xml:space="preserve" text-anchor="middle" x="66.9" y="-467.35" font-family="Helvetica,sans-Serif" font-size="8.00">startup run</text>
 </g>
 
 <g id="edge5" class="edge">
 <title>file_saved-&gt;run_lint</title>
-<path fill="none" stroke="#e74c3c" stroke-dasharray="1,5" d="M86.4,-387.35C86.4,-377.1 86.4,-364.03 86.4,-352.07" />
-<polygon fill="#e74c3c" stroke="#e74c3c" points="89.9,-352.12 86.4,-342.12 82.9,-352.12 89.9,-352.12" />
-<text xml:space="preserve" text-anchor="middle" x="57.15" y="-374.46" font-family="Helvetica,sans-Serif" font-size="8.00" fill="#e74c3c">start / restart</text>
-<text xml:space="preserve" text-anchor="middle" x="57.15" y="-365.46" font-family="Helvetica,sans-Serif" font-size="8.00" fill="#e74c3c">same-project lint</text>
+<path fill="none" stroke="black" stroke-dasharray="1,5" d="M86.4,-458.35C86.4,-448.1 86.4,-435.03 86.4,-423.07" />
+<polygon fill="black" stroke="black" points="89.9,-423.12 86.4,-413.12 82.9,-423.12 89.9,-423.12" />
 </g>
 
-<g id="node6" class="node">
+<g id="node5" class="node">
+<title>restart_note</title>
+<text xml:space="preserve" text-anchor="middle" x="86.4" y="-441.2" font-family="Helvetica,sans-Serif" font-size="8.00" fill="#e74c3c">if lint is already running,</text>
+<text xml:space="preserve" text-anchor="middle" x="86.4" y="-432.2" font-family="Helvetica,sans-Serif" font-size="8.00" fill="#e74c3c">cargo-watch restarts it</text>
+</g>
+
+<g id="node7" class="node">
 <title>write_started</title>
-<polygon fill="#e8f4f8" stroke="#2980b9" points="172.8,-263.6 0,-263.6 0,-224 172.8,-224 172.8,-263.6" />
-<text xml:space="preserve" text-anchor="middle" x="86.4" y="-245.55" font-family="Helvetica,sans-Serif" font-size="10.00">Append 'started'</text>
-<text xml:space="preserve" text-anchor="middle" x="86.4" y="-234.3" font-family="Helvetica,sans-Serif" font-size="10.00">to status log</text>
+<polygon fill="#e8f4f8" stroke="#2980b9" points="172.8,-334.6 0,-334.6 0,-295 172.8,-295 172.8,-334.6" />
+<text xml:space="preserve" text-anchor="middle" x="86.4" y="-316.55" font-family="Helvetica,sans-Serif" font-size="10.00">Append 'started'</text>
+<text xml:space="preserve" text-anchor="middle" x="86.4" y="-305.3" font-family="Helvetica,sans-Serif" font-size="10.00">to status log</text>
 </g>
 
 <g id="edge6" class="edge">
 <title>run_lint-&gt;write_started</title>
-<path fill="none" stroke="black" d="M86.4,-296.7C86.4,-289.98 86.4,-282.45 86.4,-275.24" />
-<polygon fill="black" stroke="black" points="89.9,-275.46 86.4,-265.46 82.9,-275.46 89.9,-275.46" />
+<path fill="none" stroke="black" d="M86.4,-367.7C86.4,-360.98 86.4,-353.45 86.4,-346.24" />
+<polygon fill="black" stroke="black" points="89.9,-346.46 86.4,-336.46 82.9,-346.46 89.9,-346.46" />
 </g>
 
-<g id="node7" class="node">
+<g id="node8" class="node">
 <title>run_mend</title>
-<polygon fill="#e8f4f8" stroke="#2980b9" points="172.8,-186.8 0,-186.8 0,-150.8 172.8,-150.8 172.8,-186.8" />
-<text xml:space="preserve" text-anchor="middle" x="86.4" y="-164.93" font-family="Helvetica,sans-Serif" font-size="10.00">cargo mend</text>
+<polygon fill="#e8f4f8" stroke="#2980b9" points="172.8,-257.8 0,-257.8 0,-221.8 172.8,-221.8 172.8,-257.8" />
+<text xml:space="preserve" text-anchor="middle" x="86.4" y="-235.93" font-family="Helvetica,sans-Serif" font-size="10.00">cargo mend</text>
 </g>
 
 <g id="edge7" class="edge">
 <title>write_started-&gt;run_mend</title>
-<path fill="none" stroke="black" d="M86.4,-223.7C86.4,-215.97 86.4,-206.98 86.4,-198.54" />
-<polygon fill="black" stroke="black" points="89.9,-198.67 86.4,-188.67 82.9,-198.67 89.9,-198.67" />
+<path fill="none" stroke="black" d="M86.4,-294.7C86.4,-286.97 86.4,-277.98 86.4,-269.54" />
+<polygon fill="black" stroke="black" points="89.9,-269.67 86.4,-259.67 82.9,-269.67 89.9,-269.67" />
 </g>
 
-<g id="node12" class="node">
+<g id="node13" class="node">
 <title>port_report</title>
-<polygon fill="#fef9e7" stroke="#f39c12" points="422.2,-57.6 244.6,-57.6 244.6,0 428.2,0 428.2,-51.6 422.2,-57.6" />
-<polyline fill="none" stroke="#f39c12" points="422.2,-57.6 422.2,-51.6" />
-<polyline fill="none" stroke="#f39c12" points="428.2,-51.6 422.2,-51.6" />
-<text xml:space="preserve" text-anchor="middle" x="336.4" y="-36.17" font-family="Helvetica,sans-Serif" font-size="10.00">shared temp cache</text>
-<text xml:space="preserve" text-anchor="middle" x="336.4" y="-24.92" font-family="Helvetica,sans-Serif" font-size="10.00">port-report.log</text>
-<text xml:space="preserve" text-anchor="middle" x="336.4" y="-13.67" font-family="Helvetica,sans-Serif" font-size="10.00">append-only status log</text>
+<polygon fill="#fef9e7" stroke="#f39c12" points="442.2,-128.6 264.6,-128.6 264.6,-71 448.2,-71 448.2,-122.6 442.2,-128.6" />
+<polyline fill="none" stroke="#f39c12" points="442.2,-128.6 442.2,-122.6" />
+<polyline fill="none" stroke="#f39c12" points="448.2,-122.6 442.2,-122.6" />
+<text xml:space="preserve" text-anchor="middle" x="356.4" y="-107.17" font-family="Helvetica,sans-Serif" font-size="10.00">shared temp cache</text>
+<text xml:space="preserve" text-anchor="middle" x="356.4" y="-95.92" font-family="Helvetica,sans-Serif" font-size="10.00">port-report.log</text>
+<text xml:space="preserve" text-anchor="middle" x="356.4" y="-84.67" font-family="Helvetica,sans-Serif" font-size="10.00">append-only status log</text>
 </g>
 
 <g id="edge12" class="edge">
 <title>write_started-&gt;port_report</title>
-<path fill="none" stroke="black" stroke-dasharray="1,5" d="M109.92,-223.57C152.06,-187.33 240.98,-110.86 294,-65.26" />
-<polygon fill="black" stroke="black" points="296.06,-68.11 301.36,-58.93 291.5,-62.8 296.06,-68.11" />
-<text xml:space="preserve" text-anchor="middle" x="183.05" y="-133.09" font-family="Helvetica,sans-Serif" font-size="8.00">write running</text>
-<text xml:space="preserve" text-anchor="middle" x="183.05" y="-124.09" font-family="Helvetica,sans-Serif" font-size="8.00">status</text>
+<path fill="none" stroke="black" stroke-dasharray="1,5" d="M111.8,-294.57C157.41,-258.26 253.74,-181.55 310.96,-135.98" />
+<polygon fill="black" stroke="black" points="312.97,-138.86 318.61,-129.89 308.61,-133.38 312.97,-138.86" />
+<text xml:space="preserve" text-anchor="middle" x="192.89" y="-203.89" font-family="Helvetica,sans-Serif" font-size="8.00">write running</text>
+<text xml:space="preserve" text-anchor="middle" x="192.89" y="-194.89" font-family="Helvetica,sans-Serif" font-size="8.00">status</text>
 </g>
 
-<g id="node8" class="node">
+<g id="node9" class="node">
 <title>run_clippy</title>
-<polygon fill="#e8f4f8" stroke="#2980b9" points="172.8,-111.8 0,-111.8 0,-75.8 172.8,-75.8 172.8,-111.8" />
-<text xml:space="preserve" text-anchor="middle" x="86.4" y="-89.93" font-family="Helvetica,sans-Serif" font-size="10.00">cargo clippy -D warnings</text>
+<polygon fill="#e8f4f8" stroke="#2980b9" points="172.8,-182.8 0,-182.8 0,-146.8 172.8,-146.8 172.8,-182.8" />
+<text xml:space="preserve" text-anchor="middle" x="86.4" y="-160.93" font-family="Helvetica,sans-Serif" font-size="10.00">cargo clippy -D warnings</text>
 </g>
 
 <g id="edge8" class="edge">
 <title>run_mend-&gt;run_clippy</title>
-<path fill="none" stroke="black" d="M86.4,-150.64C86.4,-142.51 86.4,-132.69 86.4,-123.53" />
-<polygon fill="black" stroke="black" points="89.9,-123.56 86.4,-113.56 82.9,-123.56 89.9,-123.56" />
+<path fill="none" stroke="black" d="M86.4,-221.64C86.4,-213.51 86.4,-203.69 86.4,-194.53" />
+<polygon fill="black" stroke="black" points="89.9,-194.56 86.4,-184.56 82.9,-194.56 89.9,-194.56" />
 </g>
 
-<g id="node10" class="node">
+<g id="node11" class="node">
 <title>mend_log</title>
-<polygon fill="#e8f4f8" stroke="#2980b9" points="756.6,-398.6 616.2,-398.6 616.2,-359 756.6,-359 756.6,-398.6" />
-<text xml:space="preserve" text-anchor="middle" x="686.4" y="-380.55" font-family="Helvetica,sans-Serif" font-size="10.00">mend-latest.log</text>
-<text xml:space="preserve" text-anchor="middle" x="686.4" y="-369.3" font-family="Helvetica,sans-Serif" font-size="10.00">(raw output)</text>
+<polygon fill="#e8f4f8" stroke="#2980b9" points="706.6,-484.6 566.2,-484.6 566.2,-445 706.6,-445 706.6,-484.6" />
+<text xml:space="preserve" text-anchor="middle" x="636.4" y="-466.55" font-family="Helvetica,sans-Serif" font-size="10.00">mend-latest.log</text>
+<text xml:space="preserve" text-anchor="middle" x="636.4" y="-455.3" font-family="Helvetica,sans-Serif" font-size="10.00">(raw output)</text>
 </g>
 
 <g id="edge10" class="edge">
 <title>run_mend-&gt;mend_log</title>
-<path fill="none" stroke="black" stroke-dasharray="1,5" d="M139.12,-187.25C247.93,-225.34 497.29,-312.61 618.19,-354.93" />
-<polygon fill="black" stroke="black" points="616.75,-358.13 627.35,-358.13 619.07,-351.52 616.75,-358.13" />
-<text xml:space="preserve" text-anchor="middle" x="360.64" y="-274.45" font-family="Helvetica,sans-Serif" font-size="8.00">stdout+stderr</text>
+<path fill="none" stroke="black" stroke-dasharray="1,5" d="M131.41,-258.21C230.08,-298.58 465.45,-394.87 576.48,-440.29" />
+<polygon fill="black" stroke="black" points="574.85,-443.4 585.43,-443.95 577.5,-436.92 574.85,-443.4" />
+<text xml:space="preserve" text-anchor="middle" x="335.16" y="-352.63" font-family="Helvetica,sans-Serif" font-size="8.00">stdout+stderr</text>
 </g>
 
-<g id="node9" class="node">
+<g id="node10" class="node">
 <title>write_result</title>
-<polygon fill="#e8f4f8" stroke="#2980b9" points="172.8,-48.6 0,-48.6 0,-9 172.8,-9 172.8,-48.6" />
-<text xml:space="preserve" text-anchor="middle" x="86.4" y="-30.55" font-family="Helvetica,sans-Serif" font-size="10.00">Append 'passed' or 'failed'</text>
-<text xml:space="preserve" text-anchor="middle" x="86.4" y="-19.3" font-family="Helvetica,sans-Serif" font-size="10.00">to status log</text>
+<polygon fill="#e8f4f8" stroke="#2980b9" points="172.8,-119.6 0,-119.6 0,-80 172.8,-80 172.8,-119.6" />
+<text xml:space="preserve" text-anchor="middle" x="86.4" y="-101.55" font-family="Helvetica,sans-Serif" font-size="10.00">Append 'passed' or 'failed'</text>
+<text xml:space="preserve" text-anchor="middle" x="86.4" y="-90.3" font-family="Helvetica,sans-Serif" font-size="10.00">to status log</text>
 </g>
 
 <g id="edge9" class="edge">
 <title>run_clippy-&gt;write_result</title>
-<path fill="none" stroke="black" d="M86.4,-75.35C86.4,-70.57 86.4,-65.3 86.4,-60.07" />
-<polygon fill="black" stroke="black" points="89.9,-60.41 86.4,-50.41 82.9,-60.41 89.9,-60.41" />
+<path fill="none" stroke="black" d="M86.4,-146.35C86.4,-141.57 86.4,-136.3 86.4,-131.07" />
+<polygon fill="black" stroke="black" points="89.9,-131.41 86.4,-121.41 82.9,-131.41 89.9,-131.41" />
 </g>
 
-<g id="node11" class="node">
+<g id="node12" class="node">
 <title>clippy_log</title>
-<polygon fill="#e8f4f8" stroke="#2980b9" points="756.6,-318.6 616.2,-318.6 616.2,-279 756.6,-279 756.6,-318.6" />
-<text xml:space="preserve" text-anchor="middle" x="686.4" y="-300.55" font-family="Helvetica,sans-Serif" font-size="10.00">clippy-latest.log</text>
-<text xml:space="preserve" text-anchor="middle" x="686.4" y="-289.3" font-family="Helvetica,sans-Serif" font-size="10.00">(raw output)</text>
+<polygon fill="#e8f4f8" stroke="#2980b9" points="706.6,-404.6 566.2,-404.6 566.2,-365 706.6,-365 706.6,-404.6" />
+<text xml:space="preserve" text-anchor="middle" x="636.4" y="-386.55" font-family="Helvetica,sans-Serif" font-size="10.00">clippy-latest.log</text>
+<text xml:space="preserve" text-anchor="middle" x="636.4" y="-375.3" font-family="Helvetica,sans-Serif" font-size="10.00">(raw output)</text>
 </g>
 
 <g id="edge11" class="edge">
 <title>run_clippy-&gt;clippy_log</title>
-<path fill="none" stroke="black" stroke-dasharray="1,5" d="M140.44,-112.26C249.49,-149.52 495.76,-233.66 616.71,-274.99" />
-<polygon fill="black" stroke="black" points="615.29,-278.2 625.88,-278.12 617.55,-271.58 615.29,-278.2" />
-<text xml:space="preserve" text-anchor="middle" x="360.55" y="-196.94" font-family="Helvetica,sans-Serif" font-size="8.00">stdout+stderr</text>
+<path fill="none" stroke="black" stroke-dasharray="1,5" d="M132.35,-183.18C231.26,-222.75 464.4,-316 575.48,-360.43" />
+<polygon fill="black" stroke="black" points="573.86,-363.55 584.44,-364.02 576.46,-357.05 573.86,-363.55" />
+<text xml:space="preserve" text-anchor="middle" x="335.14" y="-275.15" font-family="Helvetica,sans-Serif" font-size="8.00">stdout+stderr</text>
 </g>
 
 <g id="edge13" class="edge">
 <title>write_result-&gt;port_report</title>
-<path fill="none" stroke="black" stroke-dasharray="1,5" d="M173.14,-28.8C192.44,-28.8 213.1,-28.8 233,-28.8" />
-<polygon fill="black" stroke="black" points="232.77,-32.3 242.77,-28.8 232.77,-25.3 232.77,-32.3" />
-<text xml:space="preserve" text-anchor="middle" x="192.11" y="-39.2" font-family="Helvetica,sans-Serif" font-size="8.00">write final</text>
-<text xml:space="preserve" text-anchor="middle" x="192.11" y="-30.2" font-family="Helvetica,sans-Serif" font-size="8.00">status</text>
+<path fill="none" stroke="black" stroke-dasharray="1,5" d="M172.94,-99.8C198.45,-99.8 226.62,-99.8 253.07,-99.8" />
+<polygon fill="black" stroke="black" points="252.78,-103.3 262.78,-99.8 252.78,-96.3 252.78,-103.3" />
+<text xml:space="preserve" text-anchor="middle" x="201.5" y="-110.2" font-family="Helvetica,sans-Serif" font-size="8.00">write final</text>
+<text xml:space="preserve" text-anchor="middle" x="201.5" y="-101.2" font-family="Helvetica,sans-Serif" font-size="8.00">status</text>
 </g>
 
-<g id="node13" class="node">
+<g id="node14" class="node">
 <title>clippy_cmd</title>
-<polygon fill="#e8f4f8" stroke="#2980b9" points="772.8,-193.6 600,-193.6 600,-154 772.8,-154 772.8,-193.6" />
-<text xml:space="preserve" text-anchor="middle" x="686.4" y="-175.55" font-family="Helvetica,sans-Serif" font-size="10.00">/clippy command</text>
-<text xml:space="preserve" text-anchor="middle" x="686.4" y="-164.3" font-family="Helvetica,sans-Serif" font-size="10.00">(check cache before running)</text>
+<polygon fill="#e8f4f8" stroke="#2980b9" points="722.8,-244.6 550,-244.6 550,-205 722.8,-205 722.8,-244.6" />
+<text xml:space="preserve" text-anchor="middle" x="636.4" y="-226.55" font-family="Helvetica,sans-Serif" font-size="10.00">/clippy command</text>
+<text xml:space="preserve" text-anchor="middle" x="636.4" y="-215.3" font-family="Helvetica,sans-Serif" font-size="10.00">(check cache before running)</text>
 </g>
 
 <g id="edge14" class="edge">
 <title>port_report-&gt;clippy_cmd</title>
-<path fill="none" stroke="black" stroke-dasharray="1,5" d="M406.81,-57.97C471.4,-84.73 566.02,-123.93 626.91,-149.16" />
-<polygon fill="black" stroke="black" points="625.53,-152.37 636.1,-152.96 628.21,-145.9 625.53,-152.37" />
-<text xml:space="preserve" text-anchor="middle" x="499.89" y="-107.25" font-family="Helvetica,sans-Serif" font-size="8.00">read last line</text>
+<path fill="none" stroke="black" stroke-dasharray="1,5" d="M421.69,-128.95C469.97,-150.5 535,-179.53 580.8,-199.98" />
+<polygon fill="black" stroke="black" points="579.2,-203.1 589.76,-203.98 582.05,-196.7 579.2,-203.1" />
+<text xml:space="preserve" text-anchor="middle" x="483.94" y="-168.18" font-family="Helvetica,sans-Serif" font-size="8.00">read last line</text>
 </g>
 
-<g id="node14" class="node">
+<g id="node15" class="node">
 <title>cargo_port</title>
-<polygon fill="#e8f4f8" stroke="#2980b9" points="789,-89.72 583.8,-89.72 583.8,-37.88 789,-37.88 789,-89.72" />
-<text xml:space="preserve" text-anchor="middle" x="686.4" y="-71.18" font-family="Helvetica,sans-Serif" font-size="10.00">cargo-port TUI</text>
-<text xml:space="preserve" text-anchor="middle" x="686.4" y="-59.93" font-family="Helvetica,sans-Serif" font-size="10.00">watches status log,</text>
-<text xml:space="preserve" text-anchor="middle" x="686.4" y="-48.68" font-family="Helvetica,sans-Serif" font-size="10.00">shows spinner / pass / fail</text>
+<polygon fill="#e8f4f8" stroke="#2980b9" points="739,-140.72 533.8,-140.72 533.8,-88.88 739,-88.88 739,-140.72" />
+<text xml:space="preserve" text-anchor="middle" x="636.4" y="-122.18" font-family="Helvetica,sans-Serif" font-size="10.00">cargo-port TUI</text>
+<text xml:space="preserve" text-anchor="middle" x="636.4" y="-110.93" font-family="Helvetica,sans-Serif" font-size="10.00">watches status log,</text>
+<text xml:space="preserve" text-anchor="middle" x="636.4" y="-99.68" font-family="Helvetica,sans-Serif" font-size="10.00">shows spinner / pass / fail</text>
 </g>
 
 <g id="edge15" class="edge">
 <title>port_report-&gt;cargo_port</title>
-<path fill="none" stroke="black" stroke-dasharray="1,5" d="M428.36,-38C472.33,-42.39 525.41,-47.7 571.96,-52.36" />
-<polygon fill="black" stroke="black" points="571.53,-55.83 581.83,-53.34 572.23,-48.86 571.53,-55.83" />
-<text xml:space="preserve" text-anchor="middle" x="472.53" y="-47.11" font-family="Helvetica,sans-Serif" font-size="8.00">watch + refresh UI</text>
+<path fill="none" stroke="black" stroke-dasharray="1,5" d="M448.47,-104.73C472.11,-106 497.82,-107.38 522.41,-108.69" />
+<polygon fill="black" stroke="black" points="521.94,-112.17 532.12,-109.21 522.32,-105.18 521.94,-112.17" />
+<text xml:space="preserve" text-anchor="middle" x="490.93" y="-99.41" font-family="Helvetica,sans-Serif" font-size="8.00">watch + refresh UI</text>
 </g>
 
-<g id="node15" class="node">
+<g id="node16" class="node">
 <title>status_sh</title>
-<polygon fill="#e8f4f8" stroke="#2980b9" points="772.8,-48.6 600,-48.6 600,-9 772.8,-9 772.8,-48.6" />
-<text xml:space="preserve" text-anchor="middle" x="686.4" y="-30.55" font-family="Helvetica,sans-Serif" font-size="10.00">status.sh</text>
-<text xml:space="preserve" text-anchor="middle" x="686.4" y="-19.3" font-family="Helvetica,sans-Serif" font-size="10.00">(CLI status table)</text>
+<polygon fill="#e8f4f8" stroke="#2980b9" points="722.8,-39.6 550,-39.6 550,0 722.8,0 722.8,-39.6" />
+<text xml:space="preserve" text-anchor="middle" x="636.4" y="-21.55" font-family="Helvetica,sans-Serif" font-size="10.00">status.sh</text>
+<text xml:space="preserve" text-anchor="middle" x="636.4" y="-10.3" font-family="Helvetica,sans-Serif" font-size="10.00">(CLI status table)</text>
 </g>
 
 <g id="edge16" class="edge">
 <title>port_report-&gt;status_sh</title>
-<path fill="none" stroke="black" stroke-dasharray="1,5" d="M428.36,-28.8C477.49,-28.8 538,-28.8 588.07,-28.8" />
-<polygon fill="black" stroke="black" points="588.06,-32.3 598.06,-28.8 588.06,-25.3 588.06,-32.3" />
-<text xml:space="preserve" text-anchor="middle" x="491.17" y="-30.2" font-family="Helvetica,sans-Serif" font-size="8.00">read last line</text>
+<path fill="none" stroke="black" stroke-dasharray="1,5" d="M448.47,-73.49C482.7,-63.72 521.27,-52.69 554.52,-43.19" />
+<polygon fill="black" stroke="black" points="555.47,-46.56 564.13,-40.45 553.55,-39.83 555.47,-46.56" />
+<text xml:space="preserve" text-anchor="middle" x="484.44" y="-58.19" font-family="Helvetica,sans-Serif" font-size="8.00">read last line</text>
 </g>
 
 <g id="edge17" class="edge">
 <title>clippy_cmd-&gt;clippy_log</title>
-<path fill="none" stroke="black" stroke-dasharray="1,5" d="M686.4,-193.88C686.4,-213.75 686.4,-244.43 686.4,-267.5" />
-<polygon fill="black" stroke="black" points="682.9,-267.25 686.4,-277.25 689.9,-267.25 682.9,-267.25" />
-<text xml:space="preserve" text-anchor="middle" x="657.9" y="-246.64" font-family="Helvetica,sans-Serif" font-size="8.00">read raw output</text>
-<text xml:space="preserve" text-anchor="middle" x="657.9" y="-237.64" font-family="Helvetica,sans-Serif" font-size="8.00">on cache hit</text>
+<path fill="none" stroke="black" stroke-dasharray="1,5" d="M636.4,-245.06C636.4,-272.35 636.4,-321.19 636.4,-353.3" />
+<polygon fill="black" stroke="black" points="632.9,-353.19 636.4,-363.19 639.9,-353.19 632.9,-353.19" />
+<text xml:space="preserve" text-anchor="middle" x="607.9" y="-315.62" font-family="Helvetica,sans-Serif" font-size="8.00">read raw output</text>
+<text xml:space="preserve" text-anchor="middle" x="607.9" y="-306.62" font-family="Helvetica,sans-Serif" font-size="8.00">on cache hit</text>
 </g>
-<text x="-10.0" y="-595.6" font-family="Helvetica,sans-Serif" font-size="9" fill="#7f8c8d">Background Watcher (always running)</text><text x="606.2" y="-430.6" font-family="Helvetica,sans-Serif" font-size="9" fill="#7f8c8d">Output (shared temp cache)</text><text x="573.8" y="-225.6" font-family="Helvetica,sans-Serif" font-size="9" fill="#7f8c8d">Consumers (read-only)</text></g>
+<text x="-10.0" y="-666.6" font-family="Helvetica,sans-Serif" font-size="9" fill="#7f8c8d">Background Watcher (always running)</text><text x="556.2" y="-516.6" font-family="Helvetica,sans-Serif" font-size="9" fill="#7f8c8d">Output (shared temp cache)</text><text x="523.8" y="-276.6" font-family="Helvetica,sans-Serif" font-size="9" fill="#7f8c8d">Consumers (read-only)</text></g>
 </svg>

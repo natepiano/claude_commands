@@ -135,6 +135,11 @@ fi
 echo ""
 echo "=== Style-fix worktrees: ${#eligible[@]} eligible projects ==="
 
+# Create per-run temp directory for isolated logging
+mkdir -p ~/rust/nate_style/usage
+RUN_DIR="$LOG_DIR/style_run_$(date +%s)_$$"
+mkdir -p "$RUN_DIR"
+
 # Per-project function: create worktree and launch Claude to apply fixes
 create_and_fix() {
     local proj="$1"
@@ -143,11 +148,23 @@ create_and_fix() {
     local eval_file="$project_dir/EVALUATION.md"
     local log_file="$LOG_DIR/style_fix_${proj}.log"
 
+    # Capture base branch and write metadata for style usage logging
+    local base_branch
+    base_branch=$(git -C "$project_dir" branch --show-current)
+    local meta_file="$RUN_DIR/style_meta_${proj}.txt"
+    echo "base_branch=$base_branch" > "$meta_file"
+    echo "project=$proj" >> "$meta_file"
+    echo "timestamp=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$meta_file"
+
     # Create worktree (-b fails if branch exists, which is intentional)
     if ! git -C "$project_dir" worktree add -b refactor/style "$worktree_dir" 2>>"$log_file"; then
         echo "ERROR: $proj (worktree creation failed — branch refactor/style may already exist)"
         return 1
     fi
+
+    # Apply canonical settings.local.json so manual review has permissions
+    mkdir -p "$worktree_dir/.claude"
+    cp "$HOME/.claude/templates/settings_local.json" "$worktree_dir/.claude/settings.local.json"
 
     # Move EVALUATION.md into worktree so primary starts fresh
     mv "$eval_file" "$worktree_dir/EVALUATION.md"
@@ -158,9 +175,9 @@ create_and_fix() {
 You are applying automated style fixes to a Rust project.
 Working directory: $worktree_dir
 
-Step 1: Load relevant style guide files
-Each finding in EVALUATION.md includes a **Style file** field with the full path to the style guide file (e.g., ~/rust/nate_style/rust/one-use-per-line.md).
-Read each unique style file referenced by the findings.
+Step 1: Load the style guide and read referenced files
+Run: bash ~/.claude/scripts/load-rust-style.sh --project-root $worktree_dir
+Then read each unique style file referenced by the findings in EVALUATION.md. Each finding includes a **Style file** field with the full path to the style guide file (e.g., ~/rust/nate_style/rust/one-use-per-line.md or a repo-local docs/style/*.md file).
 
 Step 2: Read the evaluation
 Read the file: $worktree_dir/EVALUATION.md
@@ -219,8 +236,33 @@ Fixing guidelines:
 - Do NOT fix warnings by marking code as dead — remove dead code entirely
 - Do NOT fix warnings by prefixing arguments/variables with _ — remove them if unused
 
+Step 9: Log style usage.
+
+Read the metadata file at $RUN_DIR/style_meta_${proj}.txt for base_branch, project, and timestamp values.
+Each line is key=value format. Parse them to get the values.
+
+For each unique style file referenced by findings in EVALUATION.md, append one JSON line
+to $RUN_DIR/style_usage_${proj}.jsonl.
+
+Use the Fix Summary you wrote in Step 8 to populate the findings array:
+- "applied" for Status: Applied
+- "partial" for Status: Partially applied (include reason from Issues field)
+- "skipped" for Status: Skipped (include reason from Issues field)
+
+Each JSON line must have these fields:
+- timestamp: from the metadata file
+- style_id: "shared:rust/<filename>" if the style file path is under ~/rust/nate_style/, or "local:<project>:<filename>" if under docs/style/
+- style_file: just the filename (basename)
+- local: true if under docs/style/, false if under ~/rust/nate_style/
+- project: from the metadata file
+- base_branch: from the metadata file
+- findings: array of objects with finding (number), status ("applied"/"partial"/"skipped"), and reason (string, only for partial/skipped)
+
+Keep skip/partial reasons to one sentence.
+Write one valid JSON object per line, no trailing commas, no markdown fencing.
+
 Rules:
-- Modify ONLY files inside $worktree_dir
+- Modify ONLY files inside $worktree_dir (except the JSONL output to $RUN_DIR)
 - Do NOT commit anything (no git add, no git commit)
 - EVALUATION.md may ONLY be modified by appending the Fix Summary section (Step 8)
 - Apply each fix completely — no partial changes
@@ -273,3 +315,38 @@ done
 
 echo ""
 echo "=== Done: $succeeded created, $failed failed, $skipped skipped out of $((${#eligible[@]} + skipped)) ==="
+
+# Validate and merge per-project usage logs into the permanent log
+if ls "$RUN_DIR"/style_usage_*.jsonl 1>/dev/null 2>&1; then
+    echo "Merging style usage logs..."
+    python3 -c "
+import json, sys, pathlib
+run_dir = pathlib.Path('$RUN_DIR')
+merged = 0
+rejected = 0
+for f in sorted(run_dir.glob('style_usage_*.jsonl')):
+    for i, line in enumerate(f.read_text().splitlines()):
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            json.loads(line)
+        except json.JSONDecodeError:
+            print(f'WARN: skipping malformed line {i} in {f.name}', file=sys.stderr)
+            rejected += 1
+        else:
+            print(line)
+            merged += 1
+print(f'Merged {merged} entries ({rejected} rejected)', file=sys.stderr)
+" >> ~/rust/nate_style/usage/log.jsonl
+else
+    echo "No style usage logs to merge."
+fi
+
+# Clean up per-run temp directory
+rm -rf "$RUN_DIR"
+
+# Update Obsidian summary
+python3 ~/rust/nate_style/usage/summary.py --obsidian 2>&1 || {
+    echo "WARNING: failed to update Obsidian summary"
+}

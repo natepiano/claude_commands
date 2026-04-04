@@ -7,7 +7,7 @@ The following constraints provide guidance on how I think and approach problems:
 </Persona>
 
 <LoadStyleGuide>
-Run: `cat ~/rust/rust_style/style/*.md`
+Run: `bash ~/.claude/scripts/load-rust-style.sh`
 Internalize all rules. You will compare each clippy/mend fix against this set.
 </LoadStyleGuide>
 
@@ -37,7 +37,7 @@ Wait for user response.
 </UserDecision>
 
 <WriteRules>
-For new rules: write to `~/rust/rust_style/style/[kebab-case-name].md` with standard frontmatter.
+For new rules: write to `~/rust/nate_style/rust/[kebab-case-name].md` with standard frontmatter.
 For updates: edit the existing file in place.
 </WriteRules>
 

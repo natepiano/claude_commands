@@ -9,7 +9,19 @@ description: Evaluate a Rust project against the style guide and write EVALUATIO
 
 ## Step 1: Load the style guide
 
-Read every file in `~/rust/nate_style/rust/` to understand the full set of style rules.
+Run:
+
+```bash
+bash ~/.claude/scripts/load-rust-style.sh --project-root "$ARGUMENTS"
+```
+
+This loads the shared style guide plus any repo-local `docs/style/*.md` files for the project being evaluated.
+
+If you need exact style file paths for citations, run:
+
+```bash
+bash ~/.claude/scripts/load-rust-style.sh --list-files --project-root "$ARGUMENTS"
+```
 
 ## Step 2: Survey the project
 
@@ -80,7 +92,7 @@ Otherwise, write:
 
 ### 1. [Title]
 
-**Style file**: `~/rust/nate_style/rust/[filename].md`
+**Style file**: `[full path from the loader file list]`
 **Style rule**: [which rule from the guide]
 **Current pattern**: [what the code does now, with 1-2 concrete examples showing file paths and line numbers]
 **Recommended pattern**: [what it should look like]
@@ -101,4 +113,4 @@ Requirements for each finding:
 - Be specific: include actual file paths and line numbers from the project
 - Be actionable: someone should be able to act on each item without re-reading the style guide
 - Only flag things that genuinely violate the style guide — do not invent rules
-- Always include the full path to the style guide file each finding comes from (e.g., `~/rust/nate_style/rust/one-use-per-line.md`)
+- Always include the full path to the exact style guide file each finding comes from, using the loader file list (e.g., `~/rust/nate_style/rust/one-use-per-line.md` or `$ARGUMENTS/docs/style/frontend-boundaries.md`)

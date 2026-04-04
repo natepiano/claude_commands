@@ -1,5 +1,5 @@
 #!/bin/bash
-# Check lint watcher cache and return actionable results.
+# Check Port Report cache and return actionable results.
 # Called by the /clippy command as a single step.
 #
 # Exit codes:
@@ -7,9 +7,11 @@
 #   1 = cache miss (agent should run mend + clippy)
 #
 # Output format (on exit 0):
-#   Line 1: "passed" or "failed"
-#   Line 2: timestamp of the result
-#   If failed: remaining lines are the cached clippy + mend output
+#   Line 1: "cached: <timestamp>"
+#   Lines 2-4: status table (cargo mend, cargo +nightly fmt, clippy)
+#   If passed: Line 5 is git diff status ("clean" or "has changes")
+#     If has changes: "=== git diff ===" followed by diff output
+#   If failed: "=== cargo mend ===" and/or "=== cargo clippy ===" with details
 #
 # Usage: check_cache.sh [project_dir]
 #   project_dir defaults to current directory
@@ -28,62 +30,106 @@ project_key() {
 }
 
 STATE_DIR="$TEMP_ROOT/$(project_key "$PROJECT_DIR")"
-LOG_FILE="$STATE_DIR/port-report.log"
+LATEST_FILE="$STATE_DIR/latest.json"
 OUTPUT_DIR="$STATE_DIR/port-report"
 
-# --- No log file → cache miss
-if [[ ! -f "$LOG_FILE" ]]; then
-    echo "No port-report.log found." >&2
+if [[ ! -f "$LATEST_FILE" ]]; then
+    echo "No latest.json found." >&2
     exit 1
 fi
 
-last_line=$(tail -1 "$LOG_FILE")
-if [[ -z "$last_line" ]]; then
-    echo "port-report.log is empty." >&2
+read_json_field() {
+    local key="$1"
+    python3 - "$LATEST_FILE" "$key" <<'PY2'
+import json
+import sys
+from pathlib import Path
+
+path = Path(sys.argv[1])
+key = sys.argv[2]
+try:
+    data = json.loads(path.read_text())
+except Exception:
+    print("")
+    raise SystemExit(0)
+value = data.get(key)
+if value is None:
+    print("")
+elif isinstance(value, str):
+    print(value)
+else:
+    print(value)
+PY2
+}
+
+parse_timestamp_epoch() {
+    local timestamp="$1"
+    python3 - "$timestamp" <<'PY2'
+from datetime import datetime
+import sys
+
+value = sys.argv[1].strip()
+if not value:
+    print(0)
+    raise SystemExit(0)
+
+try:
+    dt = datetime.fromisoformat(value.replace("Z", "+00:00"))
+except ValueError:
+    print(0)
+    raise SystemExit(0)
+
+print(int(dt.timestamp()))
+PY2
+}
+
+raw_timestamp="$(read_json_field started_at)"
+status="$(read_json_field status)"
+finished_at="$(read_json_field finished_at)"
+
+if [[ -z "$raw_timestamp" || -z "$status" ]]; then
+    echo "latest.json is missing required fields." >&2
     exit 1
 fi
 
-raw_timestamp=$(echo "$last_line" | cut -f1)
-status=$(echo "$last_line" | cut -f2)
-
-# --- Currently running → wait for it
-if [[ "$status" == "started" ]]; then
-    # Check for stale
-    file_mtime=$(stat -f '%m' "$LOG_FILE" 2>/dev/null || echo 0)
+if [[ "$status" == "running" ]]; then
+    start_epoch=$(parse_timestamp_epoch "$raw_timestamp")
     now_epoch=$(date "+%s")
-    age=$(( now_epoch - file_mtime ))
-    if (( age > STALE_SECONDS )); then
-        echo "Lint watcher started but stale (${age}s ago)." >&2
+    age=$(( now_epoch - start_epoch ))
+    if (( start_epoch == 0 || age > STALE_SECONDS )); then
+        echo "Port Report run is stale (${age}s ago)." >&2
         exit 1
     fi
 
-    echo "Lint watcher is running, waiting for results..." >&2
-    timeout=300  # 5 minutes
+    echo "Port Report is running, waiting for results..." >&2
+    timeout=300
     elapsed=0
     while (( elapsed < timeout )); do
         sleep 2
         elapsed=$(( elapsed + 2 ))
-        last_line=$(tail -1 "$LOG_FILE")
-        status=$(echo "$last_line" | cut -f2)
-        if [[ "$status" != "started" ]]; then
-            raw_timestamp=$(echo "$last_line" | cut -f1)
+        raw_timestamp="$(read_json_field started_at)"
+        status="$(read_json_field status)"
+        finished_at="$(read_json_field finished_at)"
+        if [[ "$status" != "running" ]]; then
             break
         fi
     done
 
-    if [[ "$status" == "started" ]]; then
-        echo "Timed out waiting for lint watcher (${timeout}s)." >&2
+    if [[ "$status" == "running" ]]; then
+        echo "Timed out waiting for Port Report (${timeout}s)." >&2
         exit 1
     fi
 fi
 
-# --- Check freshness: compare log timestamp to newest source file
-# Strip colon from timezone for macOS date -j (-04:00 → -0400)
-tz_fixed="${raw_timestamp%:*}${raw_timestamp##*:}"
-log_epoch=$(date -j -f "%Y-%m-%dT%H:%M:%S%z" "$tz_fixed" "+%s" 2>/dev/null || echo 0)
+fresh_timestamp="$finished_at"
+if [[ -z "$fresh_timestamp" ]]; then
+    fresh_timestamp="$raw_timestamp"
+fi
+
+log_epoch=$(parse_timestamp_epoch "$fresh_timestamp")
 
 if (( log_epoch == 0 )); then
-    echo "Could not parse timestamp: $raw_timestamp" >&2
+    echo "Could not parse timestamp: $fresh_timestamp" >&2
     exit 1
 fi
 
@@ -100,24 +146,73 @@ if [[ -z "$newest_source_mtime" ]]; then
 fi
 
 if (( newest_source_mtime > log_epoch )); then
-    echo "Cache stale — source files changed after last lint." >&2
+    echo "Cache stale — source files changed after last Port Report." >&2
     exit 1
 fi
 
-# --- Cache hit
-display_timestamp=$(echo "$raw_timestamp" | sed 's/T/ /;s/[-+][0-9][0-9]:[0-9][0-9]$//')
-echo "$status"
-echo "$display_timestamp"
+case "$status" in
+    passed|failed) ;;
+    *)
+        echo "Unsupported Port Report status: $status" >&2
+        exit 1
+        ;;
+esac
+
+display_timestamp=$(echo "$fresh_timestamp" | sed 's/T/ /;s/[-+][0-9][0-9]:[0-9][0-9]$//')
+
+if [[ "$status" == "passed" ]]; then
+    diff_output=$(git -C "$PROJECT_DIR" diff 2>/dev/null)
+    echo "cached: $display_timestamp"
+    echo "cargo mend        : passed"
+    echo "cargo +nightly fmt: passed"
+    echo "clippy            : passed"
+    if [[ -z "$diff_output" ]]; then
+        echo "git diff          : clean"
+    else
+        echo "git diff          : has changes"
+        echo "=== git diff ==="
+        echo "$diff_output"
+    fi
+fi
 
 if [[ "$status" == "failed" ]]; then
+    echo "cached: $display_timestamp"
+    # Determine mend status
+    mend_has_issues=false
     if [[ -f "$OUTPUT_DIR/mend-latest.log" ]]; then
         mend_output=$(cat "$OUTPUT_DIR/mend-latest.log")
         if [[ -n "$mend_output" ]] && ! echo "$mend_output" | grep -q "No findings"; then
-            echo "=== cargo mend ==="
-            cat "$OUTPUT_DIR/mend-latest.log"
+            mend_has_issues=true
         fi
     fi
+
+    # Determine clippy status
+    clippy_has_issues=false
     if [[ -f "$OUTPUT_DIR/clippy-latest.log" ]]; then
+        clippy_output=$(cat "$OUTPUT_DIR/clippy-latest.log")
+        if [[ -n "$clippy_output" ]]; then
+            clippy_has_issues=true
+        fi
+    fi
+
+    if [[ "$mend_has_issues" == true ]]; then
+        echo "cargo mend        : issues found"
+    else
+        echo "cargo mend        : passed"
+    fi
+    echo "cargo +nightly fmt: unknown (not cached)"
+    if [[ "$clippy_has_issues" == true ]]; then
+        echo "clippy            : issues found"
+    else
+        echo "clippy            : passed"
+    fi
+
+    # Output details
+    if [[ "$mend_has_issues" == true ]]; then
+        echo "=== cargo mend ==="
+        cat "$OUTPUT_DIR/mend-latest.log"
+    fi
+    if [[ "$clippy_has_issues" == true ]]; then
         echo "=== cargo clippy ==="
         cat "$OUTPUT_DIR/clippy-latest.log"
     fi

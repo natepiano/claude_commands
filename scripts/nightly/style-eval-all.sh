@@ -2,6 +2,10 @@
 # Run style evaluations on all eligible Rust projects in parallel.
 # Uses the same exclude list as the nightly build from nightly-rust.conf.
 # Can be run standalone or called from nightly-rust-clean-build.sh.
+#
+# Usage: style-eval-all.sh [project_name]
+#   If project_name is given, only evaluate that single project.
+#   If omitted, evaluate all eligible projects under ~/rust/.
 
 set -euo pipefail
 
@@ -12,6 +16,7 @@ RUST_DIR="$HOME/rust"
 CONF_FILE="$SCRIPT_DIR/nightly-rust.conf"
 CMD_FILE="$HOME/.claude/commands/style_eval.md"
 LOG_DIR="/private/tmp/claude"
+SINGLE_PROJECT="${1:-}"
 
 mkdir -p "$LOG_DIR"
 
@@ -47,6 +52,11 @@ for project_dir in "$RUST_DIR"/*/; do
     [[ ! -f "$project_dir/Cargo.toml" ]] && continue
     [[ "$name" == *_style_fix ]] && continue
     [[ -f "$project_dir/.git" ]] && continue
+
+    # If single project specified, skip all others
+    if [[ -n "$SINGLE_PROJECT" && "$name" != "$SINGLE_PROJECT" ]]; then
+        continue
+    fi
 
     skip=false
     for exclude in "${excludes[@]}"; do

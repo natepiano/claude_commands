@@ -560,11 +560,15 @@ For workspace projects with multiple changelogs, format as:
 
 For single-crate projects, use the entries directly.
 
-**Write the combined release notes to a temp file**, then run the script with `dangerouslyDisableSandbox: true`:
+**Write the release notes and run the script in a single unsandboxed command** (combining them avoids sandbox `$TMPDIR` mismatches):
 ```bash
-~/.claude/scripts/release/create_github_release.sh ${VERSION} ${GITHUB_REPO} ${PROJECT_NAME} ${NOTES_FILE} ${DRY_RUN_FLAG}
+NOTES_FILE="$TMPDIR/release-notes-${VERSION}.md"
+cat > "$NOTES_FILE" << 'NOTES_EOF'
+<release notes content here>
+NOTES_EOF
+~/.claude/scripts/release/create_github_release.sh ${VERSION} ${GITHUB_REPO} ${PROJECT_NAME} "$NOTES_FILE" ${DRY_RUN_FLAG}
 ```
-→ Report the script output to the user.
+→ This must use `dangerouslyDisableSandbox: true`. Report the script output to the user.
 </CreateGitHubRelease>
 
 <PostReleaseVerification>
