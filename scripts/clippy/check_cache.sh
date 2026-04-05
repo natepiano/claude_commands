@@ -1,5 +1,5 @@
 #!/bin/bash
-# Check Port Report cache and return actionable results.
+# Check lint-runs cache and return actionable results.
 # Called by the /clippy command as a single step.
 #
 # Exit codes:
@@ -18,20 +18,34 @@
 
 set -euo pipefail
 
-SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-source "$SCRIPT_DIR/../lint-watcher/cache-root.sh"
+cache_root() {
+    if [[ -n "${XDG_CACHE_HOME:-}" ]]; then
+        printf '%s\n' "$XDG_CACHE_HOME/cargo-port"
+    elif [[ -n "${LOCALAPPDATA:-}" ]]; then
+        printf '%s\n' "$LOCALAPPDATA/cargo-port"
+    elif [[ "$OSTYPE" == darwin* ]]; then
+        printf '%s\n' "$HOME/Library/Caches/cargo-port"
+    else
+        printf '%s\n' "$HOME/.cache/cargo-port"
+    fi
+}
 
 PROJECT_DIR="$(cd "${1:-.}" && pwd -P)"
-TEMP_ROOT="$(cache_root)/port-report"
+TEMP_ROOT="$(cache_root)/lint-runs"
 STALE_SECONDS=1800  # 30 minutes
 
+# SYNC: must match cargo-port's project_key() in src/lint/paths.rs.
+# Format: {basename}-{first 16 hex chars of SHA-256 of absolute path}
 project_key() {
-    printf '%s' "$1" | od -An -tx1 | tr -d ' \n'
+    local name hash
+    name="$(basename "$1")"
+    hash="$(printf '%s' "$1" | shasum -a 256 | cut -c1-16)"
+    printf '%s' "${name}-${hash}"
 }
 
 STATE_DIR="$TEMP_ROOT/$(project_key "$PROJECT_DIR")"
 LATEST_FILE="$STATE_DIR/latest.json"
-OUTPUT_DIR="$STATE_DIR/port-report"
+OUTPUT_DIR="$STATE_DIR"
 
 if [[ ! -f "$LATEST_FILE" ]]; then
     echo "No latest.json found." >&2
@@ -97,11 +111,11 @@ if [[ "$status" == "running" ]]; then
     now_epoch=$(date "+%s")
     age=$(( now_epoch - start_epoch ))
     if (( start_epoch == 0 || age > STALE_SECONDS )); then
-        echo "Port Report run is stale (${age}s ago)." >&2
+        echo "lint-runs run is stale (${age}s ago)." >&2
         exit 1
     fi
 
-    echo "Port Report is running, waiting for results..." >&2
+    echo "lint-runs is running, waiting for results..." >&2
     timeout=300
     elapsed=0
     while (( elapsed < timeout )); do
@@ -116,7 +130,7 @@ if [[ "$status" == "running" ]]; then
     done
 
     if [[ "$status" == "running" ]]; then
-        echo "Timed out waiting for Port Report (${timeout}s)." >&2
+        echo "Timed out waiting for lint-runs (${timeout}s)." >&2
         exit 1
     fi
 fi
@@ -146,14 +160,14 @@ if [[ -z "$newest_source_mtime" ]]; then
 fi
 
 if (( newest_source_mtime > log_epoch )); then
-    echo "Cache stale — source files changed after last Port Report." >&2
+    echo "Cache stale — source files changed after last lint-runs." >&2
     exit 1
 fi
 
 case "$status" in
     passed|failed) ;;
     *)
-        echo "Unsupported Port Report status: $status" >&2
+        echo "Unsupported lint-runs status: $status" >&2
         exit 1
         ;;
 esac

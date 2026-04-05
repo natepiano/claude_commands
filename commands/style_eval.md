@@ -7,20 +7,22 @@ description: Evaluate a Rust project against the style guide and write EVALUATIO
 ## Arguments
 - `$ARGUMENTS` is the absolute path to a Rust project root (must contain a `Cargo.toml`)
 
-## Step 1: Load the style guide
+## Step 1: Load the style guide (shuffled)
 
 Run:
 
 ```bash
-bash ~/.claude/scripts/load-rust-style.sh --project-root "$ARGUMENTS"
+bash ~/.claude/scripts/load-rust-style.sh --shuffle --project-root "$ARGUMENTS"
 ```
 
-This loads the shared style guide plus any repo-local `docs/style/*.md` files for the project being evaluated.
+This loads the shared style guide plus any repo-local `docs/style/*.md` files, filtered for the project type (bevy rules excluded for non-bevy projects), in **random order** so evaluations rotate across rules over multiple nightly runs.
+
+The output ends with a `=== STYLE_CHECKLIST ===` section listing every rule by number and name. This is your evaluation order — work through it sequentially.
 
 If you need exact style file paths for citations, run:
 
 ```bash
-bash ~/.claude/scripts/load-rust-style.sh --list-files --project-root "$ARGUMENTS"
+bash ~/.claude/scripts/load-rust-style.sh --list-files --shuffle --project-root "$ARGUMENTS"
 ```
 
 ## Step 2: Survey the project
@@ -49,17 +51,24 @@ Derive the worktree evaluation path: take the project directory name, append `_s
 
 If that file exists, read it. These findings are already being addressed in a style-fix branch. When evaluating in Step 4, **do not re-discover** any finding that matches a worktree finding by title or by the same style rule applied to the same files. This prevents duplicate work between the primary evaluation and the in-progress worktree fixes.
 
-## Step 4: Evaluate
+## Step 4: Evaluate — systematic sequential walk
 
-Compare what you've read against every rule in the style guide. Look for systemic patterns, not one-off issues. Consider:
-- Import organization and style
-- Visibility practices
-- Lint configuration
-- Code patterns (error handling, iterators, trait usage, etc.)
-- Bevy-specific conventions (if applicable)
-- Project setup conventions
+Work through the `=== STYLE_CHECKLIST ===` from Step 1, **one rule at a time**, in the order listed.
 
-Identify up to 5 **new** violations not already carried forward from the existing evaluation.
+For each rule:
+1. Read the full rule content (already loaded in Step 1)
+2. Check the **entire codebase** you surveyed in Step 2 for violations of that specific rule
+3. If you find a violation:
+   - Confirm it is not already carried forward from Step 3
+   - Confirm it is not excluded by Step 3.5
+   - If it's a genuine new finding, **write it immediately** (increment your count)
+   - **Stop after 5 new findings** — do not continue checking more rules
+4. If no violation: move to the next rule
+
+This ensures:
+- Every rule gets a fair chance to surface (the shuffle ensures different rules go first each run)
+- You don't waste effort scanning for more violations after hitting the cap
+- Coverage rotates naturally across nightly runs
 
 ## Step 5: Write EVALUATION.md
 
@@ -73,6 +82,7 @@ If there are **no violations** (nothing carried forward and nothing new), write:
 **Project**: [project name]
 **Date**: [YYYY-MM-DD]
 **Files reviewed**: [count]
+**Rules checked**: [how many rules were checked before stopping or exhausting the list]
 
 ## No violations found
 
@@ -87,6 +97,7 @@ Otherwise, write:
 **Project**: [project name]
 **Date**: [YYYY-MM-DD]
 **Files reviewed**: [count]
+**Rules checked**: [how many rules were checked before stopping or exhausting the list]
 
 ## Improvements
 

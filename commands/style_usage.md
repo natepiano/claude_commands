@@ -18,5 +18,6 @@ Available flags:
 - `--local` — include repo-local styles
 - `--skips` — show skip/partial reasons
 - `--style foo.md` — detail view for a single style
+- `--generate` — write Obsidian reports (style_report_usage.md + style_report.md)
 
 If `$ARGUMENTS` is empty, run with no flags (all shared styles, all time).

@@ -93,7 +93,12 @@
       "Bash(do rm:*)",
       "Bash(echo \"cleared $proj\")",
       "Bash(done)",
-      "Bash(grep -E '^\\\\s+\\\\w|^={10,}|^Total|^Canonical')"
+      "Bash(grep -E '^\\\\s+\\\\w|^={10,}|^Total|^Canonical')",
+      "Bash(log show:*)",
+      "Bash(/usr/bin/log show:*)",
+      "Bash(codesign:*)",
+      "Bash(sudo tee:*)",
+      "Bash(sudo kill:*)"
     ],
     "deny": [],
     "ask": []

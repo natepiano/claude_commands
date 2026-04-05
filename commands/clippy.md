@@ -130,12 +130,28 @@ After batch completion: Display summary of fixes applied and any remaining issue
 <StyleReview>
 **This step runs unconditionally** — even if mend and clippy found zero issues.
 
-1. Run `git diff` to see all uncommitted changes
-2. If the diff is empty, report: "No uncommitted changes to review." and skip remaining steps.
-3. Load the Rust style guide by running: `bash ~/.claude/scripts/load-rust-style.sh`
-4. Evaluate every change against the loaded style guide rules
-5. If any changes violate the style guide, fix them
-6. If no violations found, report: "Style review passed — all changes conform to the style guide."
+1. Get the additions-only diff (only review code that was added or modified, not deleted):
+   ```bash
+   git diff | grep '^+' | grep -v '^+++' > /tmp/claude/style-review-additions.txt
+   ```
+   If the file is empty, report: "No uncommitted changes to review." and skip remaining steps.
+
+2. The style guide was already loaded in STEP 1. Find the `=== STYLE_CHECKLIST ===` section from that output — it lists every rule by number and name.
+
+3. **Systematic walk**: For each rule in the checklist, check the additions-only diff. Present results in a table:
+
+   ```
+   | # | Rule | Result |
+   |---|---|---|
+   | 1 | Rule name | Pass / **VIOLATION: description** / Skip (reason) |
+   ```
+
+   - **Pass**: additions conform to this rule
+   - **VIOLATION**: describe what violates and where
+   - **Skip**: rule does not apply to anything in the diff (e.g., "no module declarations changed", "no format strings", "no `#[allow]` added"). Use a short reason.
+
+4. Fix all violations found.
+5. After fixes, report: "Style review complete — N violations fixed." or "Style review passed — all changes conform to the style guide."
 </StyleReview>
 
 <ExecutionSteps>

@@ -36,11 +36,28 @@ Write the updated content back to `log.jsonl`. Count how many entries were updat
 
 Scan `~/rust/*/EVALUATION.md` for references to the old style file path. Update any matches to use the new filename. Count how many files were updated.
 
-### Step 5: Report
+### Step 5: Update wikilinks across the Obsidian vault
+
+Strip `.md` from both old and new names to get the wikilink stems (e.g., `cargo-toml-lints`).
+
+Search `~/rust/nate_style/` recursively for files containing `[[{old_stem}]]` or `[[{old_stem}|`. Replace all occurrences:
+- `[[{old_stem}]]` → `[[{new_stem}]]`
+- `[[{old_stem}|` → `[[{new_stem}|`
+
+This covers `style_report.md`, diary archives, and any other Obsidian files referencing the style.
+
+Count how many files were updated.
+
+### Step 6: Regenerate reports
+
+Run: `python3 ~/rust/nate_style/usage/summary.py --generate`
+
+### Step 7: Report
 
 Display a summary:
 ```
 Renamed: {old_name} → {new_name}
 Log entries updated: {count}
 EVALUATION.md files updated: {count}
+Obsidian wikilinks updated: {count} files
 ```

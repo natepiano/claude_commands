@@ -90,14 +90,24 @@ for project_dir in "$RUST_DIR"/*/; do
     worktree_dir="$RUST_DIR/${name}_style_fix"
 
     # Check 0: EVALUATION.md exists with numbered findings
-    if [[ ! -f "$eval_file" ]]; then
-        echo "SKIP: $name (no EVALUATION.md)"
-        skipped=$((skipped + 1))
-        continue
+    if [[ ! -f "$eval_file" ]] || [[ $(grep -c '^### [0-9]' "$eval_file" 2>/dev/null || echo 0) -eq 0 ]]; then
+        if [[ -n "$SINGLE_PROJECT" ]]; then
+            echo "EVAL: $name (no evaluation, running style eval...)"
+            "$SCRIPT_DIR/style-eval-all.sh" "$name"
+            if [[ ! -f "$eval_file" ]]; then
+                echo "SKIP: $name (eval produced no EVALUATION.md)"
+                skipped=$((skipped + 1))
+                continue
+            fi
+        else
+            echo "SKIP: $name (no EVALUATION.md or no findings)"
+            skipped=$((skipped + 1))
+            continue
+        fi
     fi
     finding_count=$(grep -c '^### [0-9]' "$eval_file" || true)
     if [[ "$finding_count" -eq 0 ]]; then
-        echo "SKIP: $name (no findings)"
+        echo "SKIP: $name (eval produced no findings)"
         skipped=$((skipped + 1))
         continue
     fi
@@ -205,8 +215,11 @@ Run: cargo nextest run --workspace --manifest-path $worktree_dir/Cargo.toml
 If any tests fail, fix them.
 
 Step 7: Style review of the diff
-Run: git -C $worktree_dir diff
-If the diff is non-empty, evaluate every change against the style guide loaded in Step 1.
+Run: git -C $worktree_dir diff | grep '^+' | grep -v '^+++' > /tmp/claude/style-review-additions.txt
+If the file is empty, skip to Step 8.
+
+Find the === STYLE_CHECKLIST === section from the style guide output in Step 1.
+For each rule in the checklist, check the additions-only diff for violations.
 Fix any violations found. If no violations, move on.
 
 Step 8: Write fix summary to EVALUATION.md
@@ -347,6 +360,6 @@ fi
 rm -rf "$RUN_DIR"
 
 # Update Obsidian summary
-python3 ~/rust/nate_style/usage/summary.py --obsidian 2>&1 || {
-    echo "WARNING: failed to update Obsidian summary"
+python3 ~/rust/nate_style/usage/summary.py --generate 2>&1 || {
+    echo "WARNING: failed to generate style reports"
 }

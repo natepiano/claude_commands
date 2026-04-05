@@ -134,6 +134,13 @@ done
     log "WARNING: warmup script failed"
 }
 
+# TCC investigation: trace file access during claude --print phases
+FS_USAGE_LOG="$HOME/.local/logs/nightly-fs-usage-trace.log"
+log "Starting fs_usage trace for TCC investigation..."
+CLAUDE_VERSION=$(basename "$(readlink "$HOME/.local/bin/claude" 2>/dev/null || echo "claude")")
+sudo /usr/bin/fs_usage -w -f filesys -e "$CLAUDE_VERSION" 2>/dev/null > "$FS_USAGE_LOG" &
+FS_USAGE_PID=$!
+
 # Run style evaluations and fixes (if enabled)
 if [[ "$STYLE_EVAL_ENABLED" == "true" ]]; then
     log "Starting style evaluations..."
@@ -160,3 +167,10 @@ log "Generating nightly report..."
 claude --print --dangerously-skip-permissions --settings '{"sandbox":{"enabled":false}}' -- "$(sed 's/\$ARGUMENTS/rebuild/g' "$HOME/.claude/commands/nightly_report.md")" > "$REPORT_FILE" 2>> "$LOG_FILE" || {
     log "WARNING: failed to generate nightly report"
 }
+
+# Stop fs_usage trace
+if kill -0 "$FS_USAGE_PID" 2>/dev/null; then
+    sudo kill "$FS_USAGE_PID" 2>/dev/null
+    wait "$FS_USAGE_PID" 2>/dev/null || true
+    log "fs_usage trace saved to $FS_USAGE_LOG"
+fi
