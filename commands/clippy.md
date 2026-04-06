@@ -13,8 +13,8 @@ bash ~/.claude/scripts/clippy/check_cache.sh .
 ```
 
 - **Exit 0, all passed + "git diff: clean"**: Print the status table and exit (complete no-op).
-- **Exit 0, all passed + "git diff: has changes"**: Print the status table, then skip to STEP 8 (<StyleReview/>) using the included diff.
-- **Exit 0, issues found**: Print the status table and the `=== cargo mend ===` / `=== cargo clippy ===` details. Present issues as if mend + clippy had just run → skip to STEP 7 (<CreateBatchTodoList/>).
+- **Exit 0, all passed + "git diff: has changes"**: Print the status table, then resume at STEP 4 and continue through remaining steps in order (4 → 5 → 6 → 8 → 9).
+- **Exit 0, issues found**: Print the status table and the `=== cargo mend ===` / `=== cargo clippy ===` details. Present issues as if mend + clippy had just run → resume at STEP 7 and continue through remaining steps in order.
 - **Exit 1**: Cache miss — proceed to STEP 2 (<RunMend/>).
 
 The script reads Port Report's `latest.json`, waits if a run is still in progress, compares the cached timestamp to source files, and outputs formatted results.
@@ -69,14 +69,14 @@ Capture all output for analysis - both successful warnings and compilation error
 </RunClippy>
 
 <ReportFindings>
-Present a summary of all three steps before proceeding to todos:
+Present a summary before proceeding to todos:
 
 ## Findings
 **Mend**: [one of: "Fixed N issues via `cargo mend --fix`" | "No issues found" | "No fixable issues found"] [if unfixable: "| N unfixable issues remaining"]
-**Formatting**: [one of: "`cargo +nightly fmt` applied changes" | "No changes needed"]
+**Style review**: [one of: "N violations fixed" | "All changes conform" | "No uncommitted changes to review"]
 **Clippy**: [one of: "N issues across M files" | "No issues found"]
 
-Mend and fmt fixes are informational only — they are already applied, not action items.
+Mend and style fixes are already applied, not action items.
 Only unfixable mend issues and clippy issues become todos below.
 </ReportFindings>
 
@@ -157,13 +157,13 @@ After batch completion: Display summary of fixes applied and any remaining issue
 <ExecutionSteps>
 **EXECUTE THESE STEPS IN ORDER:**
 
-**STEP 1:** Execute <CheckCachedResults/> — check for fresh Port Report results. If fresh, skip to STEP 6 (passed) or STEP 5 (failed).
+**STEP 1:** Execute <CheckCachedResults/> — check for fresh Port Report results. Follow its resume instructions (may skip ahead but always continues through remaining steps in order).
 **STEP 2:** Execute <RunMend/> — run `cargo mend` to check for issues
 **STEP 3:** If fixable items found, execute <RunMendFix/> — run `cargo mend --fix`. If it fails, STOP and ask user.
-**STEP 4:** Execute <RunFmt/> — run `cargo +nightly fmt --all` unconditionally
+**STEP 4:** **Always** execute <StyleReview/> — evaluate diff against style guide rules (loads style guide only if diff is non-empty)
 **STEP 5:** Execute <RunClippy/>
 **STEP 6:** Execute <ReportFindings/> — present mend, fmt, and clippy summary
 **STEP 7:** If unfixable mend or clippy issues found, execute <CreateBatchTodoList/>, <BatchDecisionPoint/>, <BatchExecution/>
-**STEP 8:** **Always** execute <StyleReview/> — evaluate diff against style guide rules (loads style guide only if diff is non-empty)
+**STEP 8:** Execute <RunFmt/> — run `cargo +nightly fmt --all` unconditionally
 **STEP 9:** Completion summary
 </ExecutionSteps>
