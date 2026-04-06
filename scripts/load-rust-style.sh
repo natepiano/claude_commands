@@ -127,28 +127,55 @@ pluralize_file() {
   fi
 }
 
-# ── Output rule content ──────────────────────────���──────────────
+# ── Count lines first (summary must appear before content) ──────
 total_lines=0
 global_lines=0
 repo_lines=0
 
-if [[ ${#style_files[@]} -gt 0 ]]; then
-  for file in "${style_files[@]}"; do
-    stripped="$(strip_frontmatter "$file")"
-    printf '%s\n' "$stripped"
-    total_lines=$((total_lines + $(printf '%s\n' "$stripped" | wc -l)))
-  done
-fi
-
 if [[ ${#global_style_files[@]} -gt 0 ]]; then
   for file in "${global_style_files[@]}"; do
-    global_lines=$((global_lines + $(strip_frontmatter "$file" | wc -l)))
+    lines=$(strip_frontmatter "$file" | wc -l)
+    global_lines=$((global_lines + lines))
+    total_lines=$((total_lines + lines))
   done
 fi
 
 if [[ ${#repo_style_files[@]} -gt 0 ]]; then
   for file in "${repo_style_files[@]}"; do
-    repo_lines=$((repo_lines + $(strip_frontmatter "$file" | wc -l)))
+    lines=$(strip_frontmatter "$file" | wc -l)
+    repo_lines=$((repo_lines + lines))
+    total_lines=$((total_lines + lines))
+  done
+fi
+
+# ── Summary line (first, so it survives output truncation) ──────
+total_files="${#style_files[@]}"
+global_files="${#global_style_files[@]}"
+repo_files="${#repo_style_files[@]}"
+
+bevy_note=""
+if [[ "$is_bevy" == true ]]; then
+  bevy_note=" (bevy project)"
+elif [[ "$skipped_bevy" -gt 0 ]]; then
+  bevy_note=" (skipped $skipped_bevy bevy rules)"
+fi
+
+printf 'Rust style guide loaded — %d %s, %d lines (shared: %d %s, %d lines; project: %d %s, %d lines)%s.\n\n' \
+  "$total_files" \
+  "$(pluralize_file "$total_files")" \
+  "$total_lines" \
+  "$global_files" \
+  "$(pluralize_file "$global_files")" \
+  "$global_lines" \
+  "$repo_files" \
+  "$(pluralize_file "$repo_files")" \
+  "$repo_lines" \
+  "$bevy_note"
+
+# ── Output rule content ─────────────────────────────────────────
+if [[ ${#style_files[@]} -gt 0 ]]; then
+  for file in "${style_files[@]}"; do
+    strip_frontmatter "$file"
   done
 fi
 
@@ -162,27 +189,3 @@ for file in "${style_files[@]}"; do
     printf '%d. %s\n' "$rule_num" "$title"
   fi
 done
-
-# ── Summary line ────────────────────────────────────────────────
-total_files="${#style_files[@]}"
-global_files="${#global_style_files[@]}"
-repo_files="${#repo_style_files[@]}"
-
-bevy_note=""
-if [[ "$is_bevy" == true ]]; then
-  bevy_note=" (bevy project)"
-elif [[ "$skipped_bevy" -gt 0 ]]; then
-  bevy_note=" (skipped $skipped_bevy bevy rules)"
-fi
-
-printf 'Rust style guide loaded — %d %s, %d lines (shared: %d %s, %d lines; project: %d %s, %d lines)%s.\n' \
-  "$total_files" \
-  "$(pluralize_file "$total_files")" \
-  "$total_lines" \
-  "$global_files" \
-  "$(pluralize_file "$global_files")" \
-  "$global_lines" \
-  "$repo_files" \
-  "$(pluralize_file "$repo_files")" \
-  "$repo_lines" \
-  "$bevy_note"

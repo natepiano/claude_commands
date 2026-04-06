@@ -77,7 +77,7 @@ Immediately after the summary table, output a short `Allow Audit` section that l
 
 ## Step 7: Walk through each finding
 
-Immediately after the summary table, begin presenting findings one at a time. For each finding, output a short narrative (3-5 sentences) covering:
+Immediately after the summary table, begin presenting findings one at a time. For each finding, start by outputting the path to the relevant style guide file (from the finding's **Style file** field), then a short narrative (3-5 sentences) covering:
 - A brief re-summary of the original finding itself so the user has context before your review. Restate the core issue, the requested style change, and the relevant scope/locations in 1-2 sentences before discussing what the automation did.
 - What the automation actually changed
 - Whether it was applied correctly and completely

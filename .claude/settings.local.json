@@ -98,7 +98,8 @@
       "Bash(/usr/bin/log show:*)",
       "Bash(codesign:*)",
       "Bash(sudo tee:*)",
-      "Bash(sudo kill:*)"
+      "Bash(sudo kill:*)",
+      "Bash(ps -co pid,comm)"
     ],
     "deny": [],
     "ask": []

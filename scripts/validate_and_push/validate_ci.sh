@@ -37,7 +37,7 @@ run_step "taplo" taplo fmt --check
 
 run_step "clippy" cargo clippy --workspace --all-targets --all-features -- -D warnings
 
-run_step "build examples" cargo build --release --workspace --all-features --examples
+run_step "build examples" cargo build --workspace --all-features --examples
 
 run_step "nextest" cargo nextest run --workspace --all-features --tests
 

@@ -120,11 +120,6 @@ for project_dir in "$RUST_DIR"/*/; do
         log "WARNING: cargo mend failed for $project_name"
     }
 
-    log "CLIPPY: $project_name"
-    cargo clippy --workspace --all-targets --all-features --manifest-path "$project_dir/Cargo.toml" -- -D warnings 2>> "$LOG_FILE" || {
-        log "WARNING: clippy failed for $project_name"
-    }
-
     touch "$timestamp_file"
     log "DONE: $project_name"
 done
@@ -134,11 +129,13 @@ done
     log "WARNING: warmup script failed"
 }
 
-# TCC investigation: trace file access during claude --print phases
+# TCC investigation: trace file access to TCC-protected dirs during claude --print phases
 FS_USAGE_LOG="$HOME/.local/logs/nightly-fs-usage-trace.log"
 log "Starting fs_usage trace for TCC investigation..."
-CLAUDE_VERSION=$(basename "$(readlink "$HOME/.local/bin/claude" 2>/dev/null || echo "claude")")
-sudo /usr/bin/fs_usage -w -f filesys -e "$CLAUDE_VERSION" 2>/dev/null > "$FS_USAGE_LOG" &
+sudo /usr/bin/fs_usage -w -f filesys 2>/dev/null \
+    | grep -E 'Downloads|Documents|Desktop|Music' \
+    | head -c 50M \
+    > "$FS_USAGE_LOG" &
 FS_USAGE_PID=$!
 
 # Run style evaluations and fixes (if enabled)

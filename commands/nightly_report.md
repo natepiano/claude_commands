@@ -20,20 +20,18 @@ Read the nightly build log at `~/.local/logs/nightly-rust-clean-build.log` and p
 ### 2. Project table
 Display a markdown table with one row per project that appeared in the log. Columns:
 
-| Project | Status | Clean | Build | Clippy |
-|---------|--------|-------|-------|--------|
+| Project | Status | Clean | Build |
+|---------|--------|-------|-------|
 
 - **Status**: one of `OK`, `SKIPPED (reason)`, or `ERROR (stage)`
-- **Clean / Build / Clippy**: show duration for each stage by computing the difference between consecutive log timestamps. Show `—` if the stage was skipped or not reached.
+- **Clean / Build**: show duration for each stage by computing the difference between consecutive log timestamps. Show `—` if the stage was skipped or not reached.
 
 ### 3. Summary statistics
 - Repeat the run date and total elapsed time so the user doesn't have to scroll back up
 - Total projects processed (non-skipped)
 - Total projects skipped (with breakdown by reason: excluded, no Cargo.toml, not modified)
 - Projects with errors (list them)
-- Projects with clippy warnings (list them)
 - Long builds: list any project whose build stage exceeded 5 minutes (project name + duration). If none, say "None".
-- Longest clippy (project name + duration)
 
 ## Saving the report
 
