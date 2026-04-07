@@ -286,8 +286,29 @@ Rules:
 PROMPT_EOF
     )
 
-    # Launch Claude to apply fixes
-    if ! claude --print --dangerously-skip-permissions --settings '{"sandbox":{"enabled":false}}' -- "$prompt" > "$log_file" 2>&1; then
+    # Launch Claude to apply fixes (60 min timeout to prevent hanging the pipeline)
+    local claude_pid
+    claude --print --dangerously-skip-permissions --settings '{"sandbox":{"enabled":false}}' -- "$prompt" > "$log_file" 2>&1 &
+    claude_pid=$!
+
+    local elapsed=0
+    local timeout_secs=3600
+    while kill -0 "$claude_pid" 2>/dev/null; do
+        sleep 10
+        elapsed=$((elapsed + 10))
+        if [[ $elapsed -ge $timeout_secs ]]; then
+            kill "$claude_pid" 2>/dev/null
+            sleep 5
+            kill -9 "$claude_pid" 2>/dev/null
+            wait "$claude_pid" 2>/dev/null
+            echo "TIMEOUT: $proj (claude exceeded 30 minute limit)"
+            [[ -f "$worktree_dir/EVALUATION.md" ]] && mv "$worktree_dir/EVALUATION.md" "$eval_file"
+            git -C "$project_dir" worktree remove "$worktree_dir" --force 2>/dev/null || true
+            return 1
+        fi
+    done
+
+    if ! wait "$claude_pid"; then
         echo "ERROR: $proj (claude fix application failed)"
         # Cleanup: move EVALUATION.md back before removing worktree
         [[ -f "$worktree_dir/EVALUATION.md" ]] && mv "$worktree_dir/EVALUATION.md" "$eval_file"

@@ -99,7 +99,14 @@
       "Bash(codesign:*)",
       "Bash(sudo tee:*)",
       "Bash(sudo kill:*)",
-      "Bash(ps -co pid,comm)"
+      "Bash(ps -co pid,comm)",
+      "Bash(ps:*)",
+      "Bash(kill 18026 17994)",
+      "Bash(nohup /bin/bash /Users/natemccoy/.claude/scripts/nightly/nightly-rust-clean-build.sh)",
+      "Bash(echo \"Launched PID: $!\")",
+      "Bash(kill %1)",
+      "Bash(pkill -f \"for i in 1 2 3 4 5\")",
+      "Bash(xargs -I{} ps -o pid,etime,command -p {})"
     ],
     "deny": [],
     "ask": []
