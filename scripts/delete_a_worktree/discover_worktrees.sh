@@ -12,5 +12,15 @@ echo "=== Current Context ==="
 echo "Directory: $(pwd)"
 echo "Branch: $(git branch --show-current)"
 echo ""
-echo "=== All Worktrees ==="
-git worktree list
+CURRENT_DIR=$(pwd)
+PROTECTED_BRANCH="main"
+
+echo "=== Deletable Worktrees ==="
+git worktree list | while IFS= read -r line; do
+    # Skip the current worktree
+    wt_path=$(echo "$line" | awk '{print $1}')
+    [ "$wt_path" = "$CURRENT_DIR" ] && continue
+    # Skip protected branch (main)
+    echo "$line" | grep -q "\[$PROTECTED_BRANCH\]" && continue
+    echo "$line"
+done

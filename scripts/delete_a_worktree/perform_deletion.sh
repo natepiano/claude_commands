@@ -23,13 +23,14 @@ cleanup_residual_directory() {
 }
 
 echo "Removing worktree: $WORKTREE_PATH"
-if ! git worktree remove "$WORKTREE_PATH"; then
-    echo "Error: Failed to remove worktree"
-    exit 1
+if ! git worktree remove "$WORKTREE_PATH" 2>/dev/null; then
+    echo "Standard removal failed, forcing..."
+    if ! git worktree remove --force "$WORKTREE_PATH" 2>/dev/null; then
+        echo "Force removal failed, pruning and cleaning up manually..."
+        git worktree prune
+    fi
 fi
-echo "Worktree removed."
 
-echo ""
 cleanup_residual_directory "$WORKTREE_PATH"
 
 if [[ -e "$WORKTREE_PATH" ]]; then

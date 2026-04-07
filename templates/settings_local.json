@@ -24,6 +24,7 @@
       "Bash(bash ~/.claude/scripts/merge_from_branch/discovery.sh:*)",
       "Bash(bash ~/.claude/scripts/merge_from_branch/validate.sh:*)",
       "Bash(bash ~/.claude/scripts/codex_review/codex_review.sh:*)",
+      "Bash(bash ~/.claude/scripts/copy_settings_local.sh:*)",
       "Bash(~/.claude/scripts/new_rust_project/rust_generate.sh:*)",
       "mcp__brp__brp_launch",
       "mcp__brp__brp_shutdown",

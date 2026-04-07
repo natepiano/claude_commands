@@ -216,13 +216,16 @@ If any tests fail, fix them.
 
 Step 7: Style review of the diff
 Run: git -C $worktree_dir diff | grep '^+' | grep -v '^+++' > /tmp/claude/style-review-additions.txt
-If the file is empty, skip to Step 8.
+If the file is empty, skip to Step 8 (fmt).
 
 Find the === STYLE_CHECKLIST === section from the style guide output in Step 1.
 For each rule in the checklist, check the additions-only diff for violations.
 Fix any violations found. If no violations, move on.
 
-Step 8: Write fix summary to EVALUATION.md
+Step 8: Run cargo +nightly fmt
+Run: cargo +nightly fmt --all --manifest-path $worktree_dir/Cargo.toml
+
+Step 9: Write fix summary to EVALUATION.md
 Append a section to the END of $worktree_dir/EVALUATION.md with the following format:
 
 ---
@@ -249,7 +252,7 @@ Fixing guidelines:
 - Do NOT fix warnings by marking code as dead — remove dead code entirely
 - Do NOT fix warnings by prefixing arguments/variables with _ — remove them if unused
 
-Step 9: Log style usage.
+Step 10: Log style usage.
 
 Read the metadata file at $RUN_DIR/style_meta_${proj}.txt for base_branch, project, and timestamp values.
 Each line is key=value format. Parse them to get the values.

@@ -1,68 +1,12 @@
 {
   "$schema": "https://json.schemastore.org/claude-code-settings.json",
-
-  "alwaysThinkingEnabled": true,
-  "effortLevel": "medium",
-
-  "enabledPlugins": {
-    "rust-analyzer-lsp@claude-plugins-official": true
-  },
-
   "env": {
     "CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS": "1",
     "RUSTC_WRAPPER": "",
     "TMPPREFIX": "/tmp/claude/zsh"
   },
-
-  "feedbackSurveyState": {
-    "lastShownTime": 1754090074729
-  },
-
-  "hooks": {
-    "SessionStart": [
-      {
-        "hooks": [
-          {
-            "type": "command",
-            "command": "mkdir -p /tmp/claude"
-          }
-        ]
-      }
-    ],
-    "PostToolUse": [
-      {
-        "hooks": [
-          {
-            "type": "command",
-            "command": "~/.claude/scripts/hooks/post-tool-use-random-ack.sh --hook"
-          }
-        ]
-      },
-      {
-        "matcher": "Edit|MultiEdit|Write",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "~/.claude/scripts/hooks/post-tool-use-cargo-check.sh"
-          },
-          {
-            "type": "command",
-            "command": "python3 ~/.claude/scripts/hooks/post-tool-use-basedpyright.py"
-          }
-        ]
-      }
-    ]
-  },
-
   "includeCoAuthoredBy": false,
-
   "permissions": {
-    "additionalDirectories": [
-      "/Users/natemccoy/Library",
-      "/Users/natemccoy/rust",
-      "/tmp",
-      "/tmp/claude/"
-    ],
     "allow": [
       "Bash(cargo *)",
       "Bash(gh *)",
@@ -105,20 +49,70 @@
       "Read(//var/folders/rf/twhh0jfd243fpltn5k0w1t980000gn/T/**)",
       "Read(/private/tmp*)",
       "Write(//tmp/claude/**)"
+    ],
+    "additionalDirectories": [
+      "/Users/natemccoy/Library",
+      "/Users/natemccoy/rust",
+      "/tmp",
+      "/tmp/claude/"
     ]
   },
-
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "mkdir -p /tmp/claude"
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "~/.claude/scripts/hooks/post-tool-use-random-ack.sh --hook"
+          }
+        ]
+      },
+      {
+        "matcher": "Edit|MultiEdit|Write",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "~/.claude/scripts/hooks/post-tool-use-cargo-check.sh"
+          },
+          {
+            "type": "command",
+            "command": "python3 ~/.claude/scripts/hooks/post-tool-use-basedpyright.py"
+          }
+        ]
+      }
+    ]
+  },
+  "statusLine": {
+    "type": "command",
+    "command": "printf \"%s%% Press ? for shortcuts\" \"$(basename \"$(pwd)\")\""
+  },
+  "enabledPlugins": {
+    "rust-analyzer-lsp@claude-plugins-official": true
+  },
   "sandbox": {
     "enabled": true,
     "autoAllowBashIfSandboxed": true,
     "allowUnsandboxedCommands": true,
-    "excludedCommands": [
-      "cargo",
-      "gh",
-      "git",
-      "taplo",
-      "~/.claude/scripts/validate_and_push/validate_ci.sh"
-    ],
+    "network": {
+      "allowedDomains": [
+        "api.github.com",
+        "github.com",
+        "index.crates.io",
+        "raw.githubusercontent.com",
+        "static.crates.io"
+      ],
+      "allowLocalBinding": true
+    },
     "filesystem": {
       "allowWrite": [
         "/Users/natemccoy/.cargo",
@@ -129,25 +123,20 @@
         "/tmp"
       ]
     },
-    "network": {
-      "allowedDomains": [
-        "api.github.com",
-        "github.com",
-        "index.crates.io",
-        "raw.githubusercontent.com",
-        "static.crates.io"
-      ],
-      "allowLocalBinding": true
-    }
+    "excludedCommands": [
+      "cargo",
+      "gh",
+      "git",
+      "taplo",
+      "~/.claude/scripts/validate_and_push/validate_ci.sh"
+    ]
   },
-
+  "alwaysThinkingEnabled": true,
+  "effortLevel": "high",
+  "voiceEnabled": true,
   "skipDangerousModePermissionPrompt": true,
-
-  "statusLine": {
-    "type": "command",
-    "command": "printf \"%s%% Press ? for shortcuts\" \"$(basename \"$(pwd)\")\""
+  "feedbackSurveyState": {
+    "lastShownTime": 1754090074729
   },
-
-  "teammateMode": "tmux",
-  "voiceEnabled": true
+  "teammateMode": "tmux"
 }

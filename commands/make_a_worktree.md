@@ -8,7 +8,7 @@ Use TodoWrite tool to create initial todos:
 
 **STEP 1:** Execute <SuggestWorktreeName/>
 **STEP 2:** Execute <GetUserApproval/>
-**STEP 3:** Execute <CreateWorktreeAndSwitch/>
+**STEP 3:** Execute <CreateWorktree/>
 **STEP 4:** Execute <CopySettingsLocal/>
 </ExecutionSteps>
 
@@ -50,28 +50,24 @@ Please select one of the keywords above.
 STOP and wait for user response. If user provides alternative name, use their name. If user approves, use suggested name. Mark second todo as completed after receiving user confirmation.
 </GetUserApproval>
 
-<CreateWorktreeAndSwitch>
+<CreateWorktree>
 Mark third todo as in_progress.
 
 **Create Worktree:**
 - Use Bash tool to run `git worktree add ../[worktree-name] -b [branch-name]` to create worktree and branch
 - If command fails, display error message and ask user for guidance
 
-**Switch and Verify:**
-- Use Bash tool to run `cd ../[worktree-name]` to switch to new worktree directory
-- Confirm success by running `pwd` and `git branch --show-current` to verify location and branch
-- Inform user: "Worktree '[worktree-name]' created successfully. You are now working in the new worktree on branch '[branch-name]'."
+**Verify (without changing directory):**
+- Confirm success by running `git -C ../[worktree-name] branch --show-current` to verify the branch
+- Do NOT cd into the new worktree — stay in the current working directory
+- Inform user: "Worktree '[worktree-name]' created at ../[worktree-name] on branch '[branch-name]'. You remain in [current-directory]."
 
 Mark third todo as completed when finished.
-</CreateWorktreeAndSwitch>
+</CreateWorktree>
 
 <CopySettingsLocal>
 **Copy settings.local.json to the new worktree:**
 
-- Check if the source project (the directory you were in before creating the worktree) has `.claude/settings.local.json`
-- If yes: `mkdir -p ../[worktree-name]/.claude && cp .claude/settings.local.json ../[worktree-name]/.claude/settings.local.json`
-- If no: `mkdir -p ../[worktree-name]/.claude && cp ~/.claude/templates/settings_local.json ../[worktree-name]/.claude/settings.local.json`
-- Resolve the new worktree's actual gitdir with `git -C ../[worktree-name] rev-parse --git-dir`, ensure its `info` directory exists, and add `settings.local.json` to that worktree-local exclude if not already present:
-  `git_dir=$(git -C ../[worktree-name] rev-parse --git-dir) && mkdir -p "$git_dir/info" && if ! grep -qxF 'settings.local.json' "$git_dir/info/exclude" 2>/dev/null; then echo 'settings.local.json' >> "$git_dir/info/exclude"; fi`
+- Run `bash ~/.claude/scripts/copy_settings_local.sh ../[worktree-name]`
 - Inform user: "Copied settings.local.json to worktree."
 </CopySettingsLocal>
