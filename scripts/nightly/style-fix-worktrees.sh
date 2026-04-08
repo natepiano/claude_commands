@@ -244,6 +244,12 @@ For each numbered finding, add a line:
 
 After all findings, add:
 
+### Cargo Mend Changes
+If cargo mend --fix was run in Step 4 and made any changes, summarize them here:
+- List the files modified by cargo mend
+- Describe the types of changes (e.g., "narrowed pub to pub(crate)", "shortened import paths")
+- If cargo mend was skipped or found nothing to fix, say so explicitly
+
 ### Build Status
 - **clippy:** pass | fail (with summary of remaining warnings/errors if fail)
 - **tests:** pass | fail (with summary of failures if fail)

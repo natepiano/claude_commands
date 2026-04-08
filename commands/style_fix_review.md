@@ -16,7 +16,7 @@ Read `EVALUATION.md` in this worktree. It contains two parts:
 1. **Findings** — the numbered style violations identified by `/style_eval`
 2. **Fix Summary** — appended by the fix agent, documenting what it did, what it skipped, and why
 
-Start by reading the Fix Summary section at the bottom. This gives you the agent's own account of what happened — which findings were applied, which were skipped or partially applied, and any issues encountered (build failures, pattern mismatches, style conflicts, etc.). Use this as your starting point: you'll verify these claims against the actual diff.
+Start by reading the Fix Summary section at the bottom. This gives you the agent's own account of what happened — which findings were applied, which were skipped or partially applied, and any issues encountered (build failures, pattern mismatches, style conflicts, etc.). Also look for the **Cargo Mend Changes** subsection, which documents any automatic visibility/import fixes made by `cargo mend --fix`. Use this as your starting point: you'll verify these claims against the actual diff.
 
 ## Step 2: Load the style guide and read referenced files
 
@@ -55,7 +55,18 @@ Use the style guide as the source of truth here, especially `agent-must-review-a
 
 If there are no new allows in the diff, say so explicitly.
 
-## Step 5: Review each finding
+## Step 5: Review cargo mend changes
+
+Check the Fix Summary for a **Cargo Mend Changes** section. If cargo mend made changes:
+
+- Identify which parts of the diff are from cargo mend (typically: `pub` narrowed to `pub(crate)`/`pub(super)`, import paths shortened)
+- Verify these changes are correct — narrowed visibility shouldn't break anything since mend proves safety before fixing
+- Note any overlap with numbered findings (a mend fix might partially or fully address a finding)
+- Report the mend changes to the user as a separate category so they aren't confused when they appear in the diff without a corresponding finding number
+
+If the Cargo Mend Changes section says mend was skipped or found nothing, say so and move on.
+
+## Step 6: Review each finding
 
 For each numbered finding in EVALUATION.md, assess:
 
@@ -66,7 +77,7 @@ For each numbered finding in EVALUATION.md, assess:
 - **Side effects?** — Did the change introduce any bugs, break any patterns, or change behavior?
 - **New allows?** — Did addressing this finding introduce any new allow that should be surfaced to the user?
 
-## Step 6: Summary table
+## Step 7: Summary table
 
 Output an overall summary table:
 
@@ -75,7 +86,7 @@ Output an overall summary table:
 
 Immediately after the summary table, output a short `Allow Audit` section that lists every new allow found in the diff, or explicitly says `No new allows found in diff.` if none were added.
 
-## Step 7: Walk through each finding
+## Step 8: Walk through each finding
 
 Immediately after the summary table, begin presenting findings one at a time. For each finding, start by outputting the path to the relevant style guide file (from the finding's **Style file** field), then a short narrative (3-5 sentences) covering:
 - A brief re-summary of the original finding itself so the user has context before your review. Restate the core issue, the requested style change, and the relevant scope/locations in 1-2 sentences before discussing what the automation did.
