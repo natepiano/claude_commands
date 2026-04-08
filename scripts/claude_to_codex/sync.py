@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import argparse
+import os
 import pathlib
 import re
 import shutil
 import sys
+import tempfile
 from dataclasses import dataclass
 
 
@@ -184,6 +186,31 @@ def write_reference_file(mode: str, source_path: pathlib.Path, reference_path: p
     shutil.copy2(source_path, reference_path)
 
 
+def atomic_write_text(path: pathlib.Path, content: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.", suffix=".tmp")
+    tmp_path = pathlib.Path(tmp_name)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(content)
+        os.replace(tmp_path, path)
+    except Exception:
+        tmp_path.unlink(missing_ok=True)
+        raise
+
+
+def atomic_write_reference_file(mode: str, source_path: pathlib.Path, reference_path: pathlib.Path) -> None:
+    reference_path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = reference_path.parent / f".{reference_path.name}.tmp"
+    tmp_path.unlink(missing_ok=True)
+    try:
+        write_reference_file(mode, source_path, tmp_path)
+        os.replace(tmp_path, reference_path)
+    except Exception:
+        tmp_path.unlink(missing_ok=True)
+        raise
+
+
 def render_plan(commands: list[CommandDoc], dest_root: pathlib.Path) -> str:
     lines = [f"Generate {len(commands)} Codex skills into {dest_root}:"]
     for command in commands:
@@ -226,11 +253,10 @@ def main() -> int:
             if not args.force:
                 print(f"skip: {skill_dir} already exists", file=sys.stderr)
                 continue
-            shutil.rmtree(skill_dir)
 
         references_dir.mkdir(parents=True, exist_ok=True)
-        skill_file.write_text(build_skill_markdown(command), encoding="utf-8")
-        write_reference_file(args.reference_mode, command.source_path, reference_file)
+        atomic_write_text(skill_file, build_skill_markdown(command))
+        atomic_write_reference_file(args.reference_mode, command.source_path, reference_file)
         generated += 1
 
     print(f"generated {generated} skills in {dest_root}")
