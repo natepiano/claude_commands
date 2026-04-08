@@ -37,19 +37,28 @@ matches_background_claude() {
     [[ "$tty" == "?" || "$tty" == "??" ]] || return 1
     [[ "$args" == *"claude-background-watch"* ]] && return 1
     [[ "$args" == *"--remote-control"* ]] && return 1
+    [[ "$args" == *"--dangerously-skip-permissions"* ]] && return 1
 
     # Skip subagents and nightly jobs by walking the ancestor tree
     local check_pid="$pid"
-    for _ in 1 2 3 4 5 6; do
+    for _depth in 1 2 3 4 5 6; do
         check_pid="$(ps -p "$check_pid" -o ppid= 2>/dev/null | tr -d ' ')" || break
         [[ -n "$check_pid" && "$check_pid" != "1" ]] || break
         local ancestor_tty ancestor_args
-        ancestor_tty="$(ps -p "$check_pid" -o tty= 2>/dev/null | tr -d ' ')" || continue
+        ancestor_tty="$(ps -p "$check_pid" -o tty= 2>/dev/null | tr -d ' ')" || {
+            log_run "ancestor_walk pid=$pid depth=$_depth check=$check_pid tty=FAILED"
+            continue
+        }
         # If any ancestor has a TTY, it's a child of an interactive session
         [[ "$ancestor_tty" == "??" || "$ancestor_tty" == "?" || -z "$ancestor_tty" ]] || return 1
-        # If any ancestor is the nightly job, skip it
-        ancestor_args="$(ps -p "$check_pid" -o args= 2>/dev/null)" || continue
+        # If any ancestor is the nightly job or its scripts, skip it
+        ancestor_args="$(ps -p "$check_pid" -o command= 2>/dev/null)" || {
+            log_run "ancestor_walk pid=$pid depth=$_depth check=$check_pid args=FAILED"
+            continue
+        }
         [[ "$ancestor_args" == *"nightly-rust-clean-build"* ]] && return 1
+        [[ "$ancestor_args" == *"style-eval-all"* ]] && return 1
+        [[ "$ancestor_args" == *"style-fix-worktrees"* ]] && return 1
     done
 
     [[ "$args" == *"$CLAUDE_BIN"* ]] && return 0
