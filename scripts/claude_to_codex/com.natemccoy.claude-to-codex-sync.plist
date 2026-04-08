@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.natemccoy.claude-to-codex-sync</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>/Users/natemccoy/.claude/scripts/claude_to_codex/run_sync.sh</string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>WatchPaths</key>
+    <array>
+        <string>/Users/natemccoy/.claude/commands</string>
+    </array>
+    <key>StandardOutPath</key>
+    <string>/tmp/claude-to-codex-sync/launchd.stdout.log</string>
+    <key>StandardErrorPath</key>
+    <string>/tmp/claude-to-codex-sync/launchd.stderr.log</string>
+</dict>
+</plist>
