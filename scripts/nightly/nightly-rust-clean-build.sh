@@ -116,7 +116,7 @@ for project_dir in "$RUST_DIR"/*/; do
     }
 
     log "MEND: $project_name"
-    cargo mend --manifest-path "$project_dir/Cargo.toml" 2>> "$LOG_FILE" || {
+    cargo mend --workspace --all-targets --manifest-path "$project_dir/Cargo.toml" 2>> "$LOG_FILE" || {
         log "WARNING: cargo mend failed for $project_name"
     }
 

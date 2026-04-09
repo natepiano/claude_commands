@@ -21,7 +21,7 @@ The script reads Port Report's `latest.json`, waits if a run is still in progres
 </CheckCachedResults>
 
 <RunMend>
-Execute: `cargo mend`
+Execute: `cargo mend --workspace --all-targets`
 
 Error Handling:
 - **Environmental Issues (Stop execution):** If mend fails due to missing Cargo.toml or missing toolchain, inform user: "cargo mend cannot run - environment setup required." Then exit.
@@ -33,7 +33,7 @@ Analyze output:
 </RunMend>
 
 <RunMendFix>
-Execute: `cargo mend --fix`
+Execute: `cargo mend --workspace --all-targets --fix`
 
 Error Handling:
 - **Any failure** (non-zero exit, error output, unexpected behavior): **STOP immediately**. Report the error output to the user and ask what to do. Do NOT proceed to clippy.
@@ -72,7 +72,7 @@ Capture all output for analysis - both successful warnings and compilation error
 Present a summary before proceeding to todos:
 
 ## Findings
-**Mend**: [one of: "Fixed N issues via `cargo mend --fix`" | "No issues found" | "No fixable issues found"] [if unfixable: "| N unfixable issues remaining"]
+**Mend**: [one of: "Fixed N issues via `cargo mend --workspace --all-targets --fix`" | "No issues found" | "No fixable issues found"] [if unfixable: "| N unfixable issues remaining"]
 **Style review**: [one of: "N violations fixed" | "All changes conform" | "No uncommitted changes to review"]
 **Clippy**: [one of: "N issues across M files" | "No issues found"]
 
@@ -158,8 +158,8 @@ After batch completion: Display summary of fixes applied and any remaining issue
 **EXECUTE THESE STEPS IN ORDER:**
 
 **STEP 1:** Execute <CheckCachedResults/> — check for fresh Port Report results. Follow its resume instructions (may skip ahead but always continues through remaining steps in order).
-**STEP 2:** Execute <RunMend/> — run `cargo mend` to check for issues
-**STEP 3:** If fixable items found, execute <RunMendFix/> — run `cargo mend --fix`. If it fails, STOP and ask user.
+**STEP 2:** Execute <RunMend/> — run `cargo mend --workspace --all-targets` to check for issues
+**STEP 3:** If fixable items found, execute <RunMendFix/> — run `cargo mend --workspace --all-targets --fix`. If it fails, STOP and ask user.
 **STEP 4:** **Always** execute <StyleReview/> — evaluate diff against style guide rules (loads style guide only if diff is non-empty)
 **STEP 5:** Execute <RunClippy/>
 **STEP 6:** Execute <ReportFindings/> — present mend, fmt, and clippy summary

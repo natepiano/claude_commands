@@ -200,9 +200,9 @@ across nightly runs via carry-forward. Apply every finding present.
 - Skip any finding whose cited files no longer exist or whose pattern no longer matches
 
 Step 4: Run cargo mend and fix issues
-Run: cargo mend --manifest-path $worktree_dir/Cargo.toml
+Run: cargo mend --workspace --all-targets --manifest-path $worktree_dir/Cargo.toml
 - If mend fails due to missing Cargo.toml or missing toolchain, report the error and skip to Step 5.
-- If mend reports fixable items, run: cargo mend --fix --manifest-path $worktree_dir/Cargo.toml
+- If mend reports fixable items, run: cargo mend --workspace --all-targets --fix --manifest-path $worktree_dir/Cargo.toml
   - If mend --fix fails, report the error and skip to Step 5.
 - If mend reports only unfixable items, note them and continue.
 
