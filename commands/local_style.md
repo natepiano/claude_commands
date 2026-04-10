@@ -28,7 +28,7 @@ Local style docs must:
 5. Verify the style loader picks it up:
 
 ```bash
-bash ~/.claude/scripts/load-rust-style.sh --list-files
+zsh ~/.claude/scripts/load-rust-style.sh --list-files
 ```
 
 The new file should appear in the output.

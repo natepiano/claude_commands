@@ -7,7 +7,7 @@ The following constraints provide guidance on how I think and approach problems:
 </Persona>
 
 <LoadStyleGuide>
-Run: `bash ~/.claude/scripts/load-rust-style.sh`
+Run: `zsh ~/.claude/scripts/load-rust-style.sh`
 Internalize all rules. You will compare each clippy/mend fix against this set.
 </LoadStyleGuide>
 

@@ -1,7 +1,7 @@
 <LoadStyleGuide>
 Load the Rust style guide by running:
 ```bash
-bash ~/.claude/scripts/load-rust-style.sh
+zsh ~/.claude/scripts/load-rust-style.sh
 ```
 Confirm using the script summary line. Then proceed.
 </LoadStyleGuide>

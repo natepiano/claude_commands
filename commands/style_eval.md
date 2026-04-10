@@ -12,7 +12,7 @@ description: Evaluate a Rust project against the style guide and write EVALUATIO
 Run:
 
 ```bash
-bash ~/.claude/scripts/load-rust-style.sh --shuffle --project-root "$ARGUMENTS"
+zsh ~/.claude/scripts/load-rust-style.sh --shuffle --project-root "$ARGUMENTS"
 ```
 
 This loads the shared style guide plus any repo-local `docs/style/*.md` files, filtered for the project type (bevy rules excluded for non-bevy projects), in **random order** so evaluations rotate across rules over multiple nightly runs.
@@ -22,7 +22,7 @@ The output ends with a `=== STYLE_CHECKLIST ===` section listing every rule by n
 If you need exact style file paths for citations, run:
 
 ```bash
-bash ~/.claude/scripts/load-rust-style.sh --list-files --shuffle --project-root "$ARGUMENTS"
+zsh ~/.claude/scripts/load-rust-style.sh --list-files --shuffle --project-root "$ARGUMENTS"
 ```
 
 ## Step 2: Survey the project
@@ -55,7 +55,18 @@ If that file exists, read it. These findings are already being addressed in a st
 
 Work through the `=== STYLE_CHECKLIST ===` from Step 1, **one rule at a time**, in the order listed.
 
-For each rule:
+### Grouped rules
+
+Some rules in the checklist are annotated with `[group: name]`. These rules are **cross-referential** — they form a decision framework where one rule's guidance depends on understanding the others.
+
+When you encounter a grouped rule:
+- Evaluate **all rules in that group** together before moving to the next ungrouped rule
+- The entire group counts as **one checklist item** — not N items. A group of 3 rules consumes 1 slot, not 3
+- Findings from grouped rules still count individually toward the 5-finding cap (each violation is one finding)
+
+### Evaluation procedure
+
+For each rule (or group of rules):
 1. Read the full rule content (already loaded in Step 1)
 2. Check the **entire codebase** you surveyed in Step 2 for violations of that specific rule
 3. If you find a violation:
@@ -63,10 +74,11 @@ For each rule:
    - Confirm it is not excluded by Step 3.5
    - If it's a genuine new finding, **write it immediately** (increment your count)
    - **Stop after 5 new findings** — do not continue checking more rules
-4. If no violation: move to the next rule
+4. If no violation: move to the next rule (or next group)
 
 This ensures:
 - Every rule gets a fair chance to surface (the shuffle ensures different rules go first each run)
+- Grouped rules always get evaluated with their full context
 - You don't waste effort scanning for more violations after hitting the cap
 - Coverage rotates naturally across nightly runs
 

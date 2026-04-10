@@ -23,7 +23,7 @@ Start by reading the Fix Summary section at the bottom. This gives you the agent
 Run:
 
 ```bash
-bash ~/.claude/scripts/load-rust-style.sh
+zsh ~/.claude/scripts/load-rust-style.sh
 ```
 
 Then read each unique style file referenced by the findings. Each finding in EVALUATION.md includes a **Style file** field with the full path to the relevant style guide file (e.g., `~/rust/nate_style/rust/one-use-per-line.md` or a repo-local `docs/style/*.md` file).

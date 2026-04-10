@@ -186,7 +186,7 @@ You are applying automated style fixes to a Rust project.
 Working directory: $worktree_dir
 
 Step 1: Load the style guide and read referenced files
-Run: bash ~/.claude/scripts/load-rust-style.sh --project-root $worktree_dir
+Run: zsh ~/.claude/scripts/load-rust-style.sh --project-root $worktree_dir
 Then read each unique style file referenced by the findings in EVALUATION.md. Each finding includes a **Style file** field with the full path to the style guide file (e.g., ~/rust/nate_style/rust/one-use-per-line.md or a repo-local docs/style/*.md file).
 
 Step 2: Read the evaluation

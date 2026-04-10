@@ -1,4 +1,4 @@
-#!/usr/bin/env bash
+#!/bin/zsh
 set -euo pipefail
 
 list_files=false
@@ -69,6 +69,15 @@ has_bevy_tag() {
   ' "$1" 2>/dev/null
 }
 
+# Extract the group name from frontmatter, or print nothing if ungrouped.
+extract_group() {
+  awk '
+    NR==1 && /^---$/ { in_fm=1; next }
+    in_fm && /^---$/ { exit }
+    in_fm && /^group:/ { sub(/^group:[[:space:]]*/, ""); print; exit }
+  ' "$1"
+}
+
 # ── Collect style files ─────────────────────────────────────────
 declare -a style_files=()
 declare -a global_style_files=()
@@ -93,13 +102,64 @@ if [[ -n "$repo_style_dir" && -d "$repo_style_dir" ]]; then
   done < <(find "$repo_style_dir" -maxdepth 1 -type f -name '*.md' -print | LC_ALL=C sort)
 fi
 
-# ── Shuffle if requested ────────────────────────────────────────
+# ── Shuffle if requested (group-aware) ──────────────────────────
 if [[ "$shuffle" == true && ${#style_files[@]} -gt 1 ]]; then
+  # Phase 1: classify files into groups and ungrouped
+  typeset -A group_members=()  # group_name -> newline-separated file list
+  typeset -A group_seen=()     # track whether we've added a group unit
+  typeset -A file_groups=()    # file -> group name (for checklist annotation)
+  shuffle_units=()             # each entry: "file:/path" or "group:name"
+
+  for file in "${style_files[@]}"; do
+    grp="$(extract_group "$file")"
+    if [[ -z "$grp" ]]; then
+      shuffle_units+=("file:$file")
+    else
+      file_groups[$file]="$grp"
+      if [[ -n "${group_members[$grp]+x}" ]]; then
+        group_members[$grp]+=$'\n'"$file"
+      else
+        group_members[$grp]="$file"
+      fi
+      if [[ -z "${group_seen[$grp]+x}" ]]; then
+        shuffle_units+=("group:$grp")
+        group_seen[$grp]=1
+      fi
+    fi
+  done
+
+  # Phase 2: shuffle the units
+  shuffled_units=()
+  while IFS= read -r unit; do
+    shuffled_units+=("$unit")
+  done < <(printf '%s\n' "${shuffle_units[@]}" | sort -R)
+
+  # Phase 3: expand groups back into individual files
   shuffled=()
-  while IFS= read -r file; do
-    shuffled+=("$file")
-  done < <(printf '%s\n' "${style_files[@]}" | sort -R)
+  for unit in "${shuffled_units[@]}"; do
+    case "$unit" in
+      file:*)
+        shuffled+=("${unit#file:}")
+        ;;
+      group:*)
+        grp_name="${unit#group:}"
+        while IFS= read -r member; do
+          shuffled+=("$member")
+        done <<< "${group_members[$grp_name]}"
+        ;;
+    esac
+  done
+
   style_files=("${shuffled[@]}")
+else
+  # Even without shuffle, build file_groups for checklist annotation
+  typeset -A file_groups=()
+  for file in "${style_files[@]}"; do
+    grp="$(extract_group "$file")"
+    if [[ -n "$grp" ]]; then
+      file_groups[$file]="$grp"
+    fi
+  done
 fi
 
 if [[ "$list_files" == true ]]; then
@@ -186,6 +246,11 @@ for file in "${style_files[@]}"; do
   title="$(extract_title "$file")"
   if [[ -n "$title" ]]; then
     rule_num=$((rule_num + 1))
-    printf '%d. %s\n' "$rule_num" "$title"
+    grp="${file_groups[$file]:-}"
+    if [[ -n "$grp" ]]; then
+      printf '%d. %s [group: %s]\n' "$rule_num" "$title" "$grp"
+    else
+      printf '%d. %s\n' "$rule_num" "$title"
+    fi
   fi
 done
