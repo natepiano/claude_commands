@@ -307,18 +307,29 @@ PROMPT_EOF
             sleep 5
             kill -9 "$claude_pid" 2>/dev/null
             wait "$claude_pid" 2>/dev/null
-            echo "TIMEOUT: $proj (claude exceeded 30 minute limit)"
+            echo "TIMEOUT: $proj (claude exceeded 60 minute timeout)"
             [[ -f "$worktree_dir/EVALUATION.md" ]] && mv "$worktree_dir/EVALUATION.md" "$eval_file"
-            git -C "$project_dir" worktree remove "$worktree_dir" --force 2>/dev/null || true
+            git -C "$project_dir" worktree remove "$worktree_dir" --force 2>/dev/null || rm -rf "$worktree_dir"
+            git -C "$project_dir" worktree prune 2>/dev/null || true
+            echo "{\"timestamp\":\"$(date -u +%Y-%m-%dT%H:%M:%SZ)\",\"project\":\"$proj\",\"base_branch\":\"$base_branch\",\"status\":\"error\",\"reason\":\"claude exceeded 60 minute timeout\"}" >> "$RUN_DIR/style_usage_${proj}.jsonl"
             return 1
         fi
     done
 
     if ! wait "$claude_pid"; then
-        echo "ERROR: $proj (claude fix application failed)"
+        # Determine failure reason from log content
+        local fail_reason
+        if [[ ! -s "$log_file" ]]; then
+            fail_reason="claude exited immediately with no output"
+        else
+            fail_reason="claude failed after producing output (see $log_file)"
+        fi
+        echo "ERROR: $proj ($fail_reason)"
         # Cleanup: move EVALUATION.md back before removing worktree
         [[ -f "$worktree_dir/EVALUATION.md" ]] && mv "$worktree_dir/EVALUATION.md" "$eval_file"
-        git -C "$project_dir" worktree remove "$worktree_dir" --force 2>/dev/null || true
+        git -C "$project_dir" worktree remove "$worktree_dir" --force 2>/dev/null || rm -rf "$worktree_dir"
+        git -C "$project_dir" worktree prune 2>/dev/null || true
+        echo "{\"timestamp\":\"$(date -u +%Y-%m-%dT%H:%M:%SZ)\",\"project\":\"$proj\",\"base_branch\":\"$base_branch\",\"status\":\"error\",\"reason\":\"$fail_reason\"}" >> "$RUN_DIR/style_usage_${proj}.jsonl"
         return 1
     fi
 
@@ -342,6 +353,7 @@ echo "Waiting for ${#pids[@]} processes..."
 # Wait for all and track results
 failed=0
 succeeded=0
+failed_names=()
 idx=0
 for pid in "${pids[@]}"; do
     name="${names[$idx]}"
@@ -349,12 +361,32 @@ for pid in "${pids[@]}"; do
     if [[ $code -ne 0 ]]; then
         echo "FAILED: $name (exit $code)"
         failed=$((failed + 1))
+        failed_names+=("$name")
     else
         echo "OK: $name"
         succeeded=$((succeeded + 1))
     fi
     idx=$((idx + 1))
 done
+
+# Retry failed projects sequentially
+if [[ ${#failed_names[@]} -gt 0 ]]; then
+    echo ""
+    echo "=== Retrying ${#failed_names[@]} failed projects sequentially ==="
+    for proj in "${failed_names[@]}"; do
+        # Delete the branch from the failed first attempt so worktree add -b can recreate it
+        git -C "$RUST_DIR/$proj" branch -D refactor/style 2>/dev/null || true
+
+        echo "RETRY: $proj"
+        if create_and_fix "$proj"; then
+            echo "RETRY OK: $proj"
+            failed=$((failed - 1))
+            succeeded=$((succeeded + 1))
+        else
+            echo "RETRY FAILED: $proj"
+        fi
+    done
+fi
 
 echo ""
 echo "=== Done: $succeeded created, $failed failed, $skipped skipped out of $((${#eligible[@]} + skipped)) ==="
