@@ -46,6 +46,8 @@ The command works with **zero config** by convention. It auto-detects:
 ```toml
 # Post-release install verification (binary crates only)
 install_verify = "crate_dir"
+# Optional: custom install script (overrides default `cargo install`)
+install_verify_script = ".claude/scripts/release/install_verify.sh"
 
 # Ordered publish phases (workspace dependency chains only)
 [[publish_phases]]
@@ -276,9 +278,9 @@ curl -s "https://crates.io/api/v1/crates/${CRATE_NAME}" | jq -r '.crate.max_vers
 <ProjectDiscovery>
 ## STEP 1: Project Discovery
 
-**Read optional config** from `.claude/config/release.toml` if it exists. Store any `install_verify`, `publish_phases`, and `judgment_checks` settings.
+**Read optional config** from `.claude/config/release.toml` if it exists. Store any `install_verify`, `install_verify_script`, `publish_phases`, and `judgment_checks` settings.
 
-**If config references any `post_script` files, verify they exist:**
+**If config references any `post_script` or `install_verify_script` files, verify they exist:**
 → Stop with clear error if any referenced script is missing.
 
 **Detect project structure** from root `Cargo.toml`:
@@ -583,6 +585,13 @@ NOTES_EOF
   - If any crate doesn't show the correct version, ask the user to **retry** or **continue**
 
 **If `install_verify` is set in config** (skip in dry-run mode, with `dangerouslyDisableSandbox: true`):
+
+If `install_verify_script` is also set, run the custom script instead of the default `cargo install`:
+```bash
+${INSTALL_VERIFY_SCRIPT} ${VERSION}
+```
+
+Otherwise, use the default:
 ```bash
 cargo install ${INSTALL_CRATE_NAME} --version "${VERSION}"
 ```

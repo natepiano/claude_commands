@@ -129,18 +129,6 @@ done
     log "WARNING: warmup script failed"
 }
 
-# TCC investigation: trace file access to TCC-protected dirs during claude --print phases
-FS_USAGE_LOG="$HOME/.local/logs/nightly-fs-usage-trace.log"
-FS_USAGE_ERR="$HOME/.local/logs/nightly-fs-usage-errors.log"
-log "Starting fs_usage trace for TCC investigation..."
-# Capture all TCC-protected paths: ~/Downloads, ~/Documents, ~/Desktop, ~/Music, /Volumes
-# Use --line-buffered to flush matches immediately (prevents data loss on kill)
-sudo /usr/bin/fs_usage -w -f filesys 2> >(head -c 1M > "$FS_USAGE_ERR") \
-    | grep --line-buffered -E 'Downloads|Documents|Desktop|Music|/Volumes' \
-    | head -c 50M \
-    > "$FS_USAGE_LOG" &
-FS_USAGE_PID=$!
-
 # Run style evaluations and fixes (if enabled)
 if [[ "$STYLE_EVAL_ENABLED" == "true" ]]; then
     log "Starting style evaluations..."
@@ -168,9 +156,3 @@ claude --print --dangerously-skip-permissions --settings '{"sandbox":{"enabled":
     log "WARNING: failed to generate nightly report"
 }
 
-# Stop fs_usage trace
-if kill -0 "$FS_USAGE_PID" 2>/dev/null; then
-    sudo kill "$FS_USAGE_PID" 2>/dev/null
-    wait "$FS_USAGE_PID" 2>/dev/null || true
-    log "fs_usage trace saved to $FS_USAGE_LOG"
-fi
