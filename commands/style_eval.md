@@ -6,24 +6,37 @@ description: Evaluate a Rust project against the style guide and write EVALUATIO
 
 ## Arguments
 - `$ARGUMENTS` is the absolute path to a Rust project root (must contain a `Cargo.toml`)
+- `__SELECTION_MANIFEST__` is the absolute path to the nightly selection manifest for this project
 
-## Step 1: Load the style guide (shuffled)
+## Step 1: Load the full style guide
 
 Run:
 
 ```bash
-zsh ~/.claude/scripts/load-rust-style.sh --shuffle --project-root "$ARGUMENTS"
+zsh ~/.claude/scripts/load-rust-style.sh --project-root "$ARGUMENTS"
 ```
 
-This loads the shared style guide plus any repo-local `docs/style/*.md` files, filtered for the project type (bevy rules excluded for non-bevy projects), in **random order** so evaluations rotate across rules over multiple nightly runs.
+This loads the shared style guide plus any repo-local `docs/style/*.md` files, filtered for the project type.
 
 The output ends with a `=== STYLE_CHECKLIST ===` section listing every rule by number and name. Rules may be annotated with `[non-negotiable]` and/or `[group: name]`. This is your evaluation order — work through it sequentially.
 
 If you need exact style file paths for citations, run:
 
 ```bash
-zsh ~/.claude/scripts/load-rust-style.sh --list-files --shuffle --project-root "$ARGUMENTS"
+zsh ~/.claude/scripts/load-rust-style.sh --list-files --project-root "$ARGUMENTS"
 ```
+
+## Step 1.5: Read the nightly selection manifest
+
+Read the JSON file at `__SELECTION_MANIFEST__`.
+
+It contains the specific guideline units selected for this run. Only these units may produce **new** findings in this evaluation.
+
+Selection rules:
+- a `rule` unit is a single style rule
+- a `group` unit must be evaluated as one unit across all of its member style files
+- a `non_negotiable` budget kind still counts as selected work for this run even though it consumes `0` nightly budget
+- the manifest order is authoritative for this run
 
 ## Step 2: Survey the project
 
@@ -51,56 +64,28 @@ Derive the worktree evaluation path: take the project directory name, append `_s
 
 If that file exists, read it. These findings are already being addressed in a style-fix branch. When evaluating in Step 4, **do not re-discover** any finding that matches a worktree finding by title or by the same style rule applied to the same files. This prevents duplicate work between the primary evaluation and the in-progress worktree fixes.
 
-## Step 4: Evaluate — systematic sequential walk
+## Step 4: Evaluate only the selected guideline units
 
-Work through the `=== STYLE_CHECKLIST ===` from Step 1 in two phases:
+Use the selection manifest from Step 1.5.
 
-1. Evaluate every rule annotated with `[non-negotiable]` first, in checklist order.
-2. Then evaluate the remaining rules, one rule at a time, in checklist order.
+For this nightly run:
+- carry forward still-valid findings from the previous `EVALUATION.md`
+- discover **new** findings only from the selected units in the manifest
+- do not search for new findings outside the selected units
 
-Non-negotiable rules are overarching constraints. Findings from them do **not** count against the 5-finding cap for new findings, and they constrain what later rules may recommend.
+Evaluation procedure for each selected unit, in manifest order:
+1. Read the full rule content for that selected unit
+2. If the unit is a group, evaluate every member rule in that group together
+3. Check the relevant codebase for violations of that selected unit
+4. If you find a violation:
+   - confirm it is not already carried forward from Step 3
+   - confirm it is not excluded by Step 3.5
+   - write it as a new finding
+5. If the selected unit is non-negotiable:
+   - treat it as binding on all recommendations
+   - do not recommend any change that would violate it
 
-### Grouped rules
-
-Some rules in the checklist are annotated with `[group: name]`. These rules are **cross-referential** — they form a decision framework where one rule's guidance depends on understanding the others.
-
-When you encounter a grouped rule:
-- Evaluate **all rules in that group** together before moving to the next ungrouped rule
-- The entire group counts as **one checklist item** — not N items. A group of 3 rules consumes 1 slot, not 3
-- Findings from grouped rules still count individually toward the 5-finding cap (each violation is one finding)
-
-### Non-negotiable rules
-
-Rules annotated with `[non-negotiable]` are mandatory, overarching constraints on the entire evaluation.
-
-When you encounter a non-negotiable rule:
-- Evaluate it even if you have already found 5 other new findings
-- Record every genuine violation you find; these do **not** consume the 5-finding budget
-- Treat the rule as binding on later findings from other rules
-- Do **not** recommend a pattern under another style rule if that recommendation would violate a non-negotiable rule
-
-If a non-negotiable rule is also grouped, evaluate the entire group together during the non-negotiable phase. The group still counts as one checklist item for `Rules checked`.
-
-### Evaluation procedure
-
-For each rule (or group of rules):
-1. Read the full rule content (already loaded in Step 1)
-2. Check the **entire codebase** you surveyed in Step 2 for violations of that specific rule
-3. If you find a violation:
-   - Confirm it is not already carried forward from Step 3
-   - Confirm it is not excluded by Step 3.5
-   - If it's a genuine new finding, **write it immediately**
-   - If the rule is not marked `[non-negotiable]`, increment your 5-finding budget count
-   - If the rule is marked `[non-negotiable]`, do **not** increment your 5-finding budget count
-   - **Stop after 5 new findings from rules that are not marked `[non-negotiable]`** — do not continue checking more normal rules
-4. If no violation: move to the next rule (or next group)
-
-This ensures:
-- Every rule gets a fair chance to surface (the shuffle ensures different rules go first each run)
-- Non-negotiable rules are always evaluated first and never crowded out by the normal finding cap
-- Grouped rules always get evaluated with their full context
-- You don't waste effort scanning for more violations after hitting the cap
-- Coverage rotates naturally across nightly runs
+For this prompt, the manifest already handles nightly budgeting. Do not apply any separate "stop after 5 findings" rule inside the evaluation itself.
 
 ## Step 5: Write EVALUATION.md
 

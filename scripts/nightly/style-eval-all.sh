@@ -15,6 +15,7 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 RUST_DIR="$HOME/rust"
 CONF_FILE="$SCRIPT_DIR/nightly-rust.conf"
 CMD_FILE="$HOME/.claude/commands/style_eval.md"
+STATE_HELPER="$SCRIPT_DIR/style_review_state.py"
 LOG_DIR="/private/tmp/claude"
 SINGLE_PROJECT="${1:-}"
 
@@ -77,11 +78,45 @@ fi
 
 echo "=== Style evaluation: ${#projects[@]} projects ==="
 
+# Ensure the review ledger exists before selection begins
+if [[ ! -f "$HOME/rust/nate_style/usage/review_ledger.json" ]]; then
+    python3 "$STATE_HELPER" bootstrap || {
+        echo "FAILED: could not bootstrap review ledger"
+        exit 1
+    }
+fi
+
+RUN_DIR="$LOG_DIR/style_eval_run_$(date +%s)_$$"
+mkdir -p "$RUN_DIR"
+
 # Launch all evaluations in parallel
 pids=()
 names=()
 for proj in "${projects[@]}"; do
-    prompt="$(sed -e "s|\$ARGUMENTS|${RUST_DIR}/${proj}|g" -e "s|up to 5 \*\*new\*\*|up to $MAX_NEW_FINDINGS **new**|g" "$CMD_FILE")"
+    project_root="${RUST_DIR}/${proj}"
+    manifest_path="$RUN_DIR/${proj}_selection.json"
+    prior_eval_path="$RUN_DIR/${proj}_prior_evaluation.md"
+
+    python3 "$STATE_HELPER" select \
+        --project-root "$project_root" \
+        --budget "$MAX_NEW_FINDINGS" \
+        --output "$manifest_path" || {
+        echo "FAILED: $proj (selection generation failed)"
+        continue
+    }
+
+    if [[ -f "$project_root/EVALUATION.md" ]]; then
+        cp "$project_root/EVALUATION.md" "$prior_eval_path"
+    else
+        : > "$prior_eval_path"
+    fi
+
+    prompt="$(
+        sed \
+            -e "s|\$ARGUMENTS|$project_root|g" \
+            -e "s|__SELECTION_MANIFEST__|$manifest_path|g" \
+            "$CMD_FILE"
+    )"
     claude --print --dangerously-skip-permissions --settings '{"sandbox":{"enabled":false}}' -- "$prompt" > "$LOG_DIR/style_eval_${proj}.log" 2>&1 &
     pids+=($!)
     names+=("$proj")
@@ -102,6 +137,15 @@ for pid in "${pids[@]}"; do
         echo "FAILED: $name (exit $code)"
         failed=$((failed + 1))
     elif [[ -f "$RUST_DIR/$name/EVALUATION.md" ]]; then
+        python3 "$STATE_HELPER" append-events \
+            --project-root "$RUST_DIR/$name" \
+            --manifest "$RUN_DIR/${name}_selection.json" \
+            --prior-eval "$RUN_DIR/${name}_prior_evaluation.md" \
+            --current-eval "$RUST_DIR/$name/EVALUATION.md" || {
+            echo "FAILED: $name (could not append evaluation events)"
+            failed=$((failed + 1))
+            continue
+        }
         lines=$(wc -l < "$RUST_DIR/$name/EVALUATION.md")
         echo "OK: $name ($lines lines)"
         succeeded=$((succeeded + 1))
@@ -114,3 +158,5 @@ done
 
 echo ""
 echo "=== Done: $succeeded succeeded, $failed failed out of ${#projects[@]} ==="
+
+rm -rf "$RUN_DIR"

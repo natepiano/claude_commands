@@ -398,26 +398,11 @@ echo "=== Done: $succeeded created, $failed failed, $skipped skipped out of $(($
 # Validate and merge per-project usage logs into the permanent log
 if ls "$RUN_DIR"/style_usage_*.jsonl 1>/dev/null 2>&1; then
     echo "Merging style usage logs..."
-    python3 -c "
-import json, sys, pathlib
-run_dir = pathlib.Path('$RUN_DIR')
-merged = 0
-rejected = 0
-for f in sorted(run_dir.glob('style_usage_*.jsonl')):
-    for i, line in enumerate(f.read_text().splitlines()):
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            json.loads(line)
-        except json.JSONDecodeError:
-            print(f'WARN: skipping malformed line {i} in {f.name}', file=sys.stderr)
-            rejected += 1
-        else:
-            print(line)
-            merged += 1
-print(f'Merged {merged} entries ({rejected} rejected)', file=sys.stderr)
-" >> ~/rust/nate_style/usage/log.jsonl
+    python3 "$SCRIPT_DIR/style_usage_merge.py" \
+        --run-dir "$RUN_DIR" \
+        --log-file "$HOME/rust/nate_style/usage/log.jsonl" || {
+        echo "WARNING: failed to merge style usage logs"
+    }
 else
     echo "No style usage logs to merge."
 fi
@@ -426,6 +411,6 @@ fi
 rm -rf "$RUN_DIR"
 
 # Update Obsidian summary
-python3 ~/rust/nate_style/usage/summary.py --generate 2>&1 || {
+python3 "$SCRIPT_DIR/style_usage_summary.py" --generate 2>&1 || {
     echo "WARNING: failed to generate style reports"
 }

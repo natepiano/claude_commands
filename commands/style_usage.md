@@ -9,7 +9,7 @@ Show style guide usage analytics from nightly style fix runs.
 Run the summary script and display its output:
 
 ```bash
-python3 ~/rust/nate_style/usage/summary.py $ARGUMENTS
+python3 ~/.claude/scripts/nightly/style_usage_summary.py $ARGUMENTS
 ```
 
 Available flags:

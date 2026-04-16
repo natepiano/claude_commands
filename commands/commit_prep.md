@@ -60,7 +60,11 @@ Present to user:
 Wait for user response.
 
 If user selects **commit**:
-- Stage all changes with `git add` and commit with the prepared message
+- Write the prepared commit message to a system temporary file outside the repository (for example via `mktemp`)
+- Execute `bash ~/.claude/scripts/commit_prep/stage_and_commit.sh /path/to/temp-message.txt` unsandboxed, because the helper stages files and writes `.git/index.lock`
+- In Claude/Bash-tool terms: use `dangerouslyDisableSandbox: true`
+- In Codex terms: request escalation with `sandbox_permissions: "require_escalated"` and a justification, then rerun the helper outside the sandbox
+- Do not fail the workflow on the first sandbox denial; retry with the appropriate unsandboxed/elevated mechanism for the current agent
 - Execute <CommitOutput/>
 
 If user selects **abandon**: Run `git reset` to unstage any changes (if staged) and stop
