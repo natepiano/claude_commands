@@ -58,15 +58,28 @@ if [[ -n "$repo_root" ]]; then
 fi
 
 # Check frontmatter tags for the bevy tag. Returns 0 if tagged bevy.
-has_bevy_tag() {
-  # Read lines between the first --- and the second ---.
-  # Look for "- bevy" in that range.
+has_tag() {
+  local file="$1"
+  local tag="$2"
+
   awk '
     NR==1 && /^---$/ { in_fm=1; next }
-    in_fm && /^---$/ { exit 1 }
-    in_fm && /^- bevy$/ { found=1; exit 0 }
+    in_fm && /^---$/ { exit }
+    in_fm && /^[[:space:]]*-[[:space:]]*/ {
+      value=$0
+      sub(/^[[:space:]]*-[[:space:]]*/, "", value)
+      if (value == tag) {
+        found=1
+        exit
+      }
+    }
     END { exit (found ? 0 : 1) }
-  ' "$1" 2>/dev/null
+  ' tag="$tag" "$file" 2>/dev/null
+}
+
+# Check frontmatter tags for the bevy tag. Returns 0 if tagged bevy.
+has_bevy_tag() {
+  has_tag "$1" bevy
 }
 
 # Extract the group name from frontmatter, or print nothing if ungrouped.
@@ -82,6 +95,7 @@ extract_group() {
 declare -a style_files=()
 declare -a global_style_files=()
 declare -a repo_style_files=()
+declare -a non_negotiable_files=()
 skipped_bevy=0
 
 if [[ -d "$global_style_dir" ]]; then
@@ -91,40 +105,73 @@ if [[ -d "$global_style_dir" ]]; then
       continue
     fi
     global_style_files+=("$file")
+    if has_tag "$file" non-negotiable; then
+      non_negotiable_files+=("$file")
+    fi
     style_files+=("$file")
   done < <(find "$global_style_dir" -maxdepth 1 -type f -name '*.md' -print | LC_ALL=C sort)
 fi
 
 if [[ -n "$repo_style_dir" && -d "$repo_style_dir" ]]; then
   while IFS= read -r file; do
+    if has_tag "$file" non-negotiable; then
+      non_negotiable_files+=("$file")
+    fi
     repo_style_files+=("$file")
     style_files+=("$file")
   done < <(find "$repo_style_dir" -maxdepth 1 -type f -name '*.md' -print | LC_ALL=C sort)
 fi
+
+typeset -A file_groups=()
+typeset -A file_non_negotiable=()
+for file in "${style_files[@]}"; do
+  grp="$(extract_group "$file")"
+  if [[ -n "$grp" ]]; then
+    file_groups[$file]="$grp"
+  fi
+  if has_tag "$file" non-negotiable; then
+    file_non_negotiable[$file]=1
+  fi
+done
 
 # ── Shuffle if requested (group-aware) ──────────────────────────
 if [[ "$shuffle" == true && ${#style_files[@]} -gt 1 ]]; then
   # Phase 1: classify files into groups and ungrouped
   typeset -A group_members=()  # group_name -> newline-separated file list
   typeset -A group_seen=()     # track whether we've added a group unit
-  typeset -A file_groups=()    # file -> group name (for checklist annotation)
-  shuffle_units=()             # each entry: "file:/path" or "group:name"
+  typeset -A group_non_negotiable=()  # group_name -> 1 if any member is non-negotiable
+  pinned_units=()              # always first, stable order
+  shuffle_units=()             # randomized after pinned units; each entry: "file:/path" or "group:name"
 
   for file in "${style_files[@]}"; do
-    grp="$(extract_group "$file")"
-    if [[ -z "$grp" ]]; then
-      shuffle_units+=("file:$file")
-    else
-      file_groups[$file]="$grp"
+    grp="${file_groups[$file]:-}"
+    if [[ -n "$grp" ]]; then
       if [[ -n "${group_members[$grp]+x}" ]]; then
         group_members[$grp]+=$'\n'"$file"
       else
         group_members[$grp]="$file"
       fi
-      if [[ -z "${group_seen[$grp]+x}" ]]; then
-        shuffle_units+=("group:$grp")
-        group_seen[$grp]=1
+      if [[ -n "${file_non_negotiable[$file]:-}" ]]; then
+        group_non_negotiable[$grp]=1
       fi
+    fi
+  done
+
+  for file in "${style_files[@]}"; do
+    grp="${file_groups[$file]:-}"
+    if [[ -z "$grp" ]]; then
+      if [[ -n "${file_non_negotiable[$file]:-}" ]]; then
+        pinned_units+=("file:$file")
+      else
+        shuffle_units+=("file:$file")
+      fi
+    elif [[ -z "${group_seen[$grp]+x}" ]]; then
+        if [[ -n "${group_non_negotiable[$grp]:-}" ]]; then
+          pinned_units+=("group:$grp")
+        else
+          shuffle_units+=("group:$grp")
+        fi
+        group_seen[$grp]=1
     fi
   done
 
@@ -136,7 +183,7 @@ if [[ "$shuffle" == true && ${#style_files[@]} -gt 1 ]]; then
 
   # Phase 3: expand groups back into individual files
   shuffled=()
-  for unit in "${shuffled_units[@]}"; do
+  for unit in "${pinned_units[@]}" "${shuffled_units[@]}"; do
     case "$unit" in
       file:*)
         shuffled+=("${unit#file:}")
@@ -151,15 +198,6 @@ if [[ "$shuffle" == true && ${#style_files[@]} -gt 1 ]]; then
   done
 
   style_files=("${shuffled[@]}")
-else
-  # Even without shuffle, build file_groups for checklist annotation
-  typeset -A file_groups=()
-  for file in "${style_files[@]}"; do
-    grp="$(extract_group "$file")"
-    if [[ -n "$grp" ]]; then
-      file_groups[$file]="$grp"
-    fi
-  done
 fi
 
 if [[ "$list_files" == true ]]; then
@@ -212,6 +250,7 @@ fi
 total_files="${#style_files[@]}"
 global_files="${#global_style_files[@]}"
 repo_files="${#repo_style_files[@]}"
+non_negotiable_count="${#non_negotiable_files[@]}"
 
 bevy_note=""
 if [[ "$is_bevy" == true ]]; then
@@ -220,7 +259,7 @@ elif [[ "$skipped_bevy" -gt 0 ]]; then
   bevy_note=" (skipped $skipped_bevy bevy rules)"
 fi
 
-printf 'Rust style guide loaded — %d %s, %d lines (shared: %d %s, %d lines; project: %d %s, %d lines)%s.\n\n' \
+printf 'Rust style guide loaded — %d %s, %d lines (shared: %d %s, %d lines; project: %d %s, %d lines; non-negotiable: %d)%s.\n\n' \
   "$total_files" \
   "$(pluralize_file "$total_files")" \
   "$total_lines" \
@@ -230,6 +269,7 @@ printf 'Rust style guide loaded — %d %s, %d lines (shared: %d %s, %d lines; pr
   "$repo_files" \
   "$(pluralize_file "$repo_files")" \
   "$repo_lines" \
+  "$non_negotiable_count" \
   "$bevy_note"
 
 # ── Output rule content ─────────────────────────────────────────
@@ -247,8 +287,15 @@ for file in "${style_files[@]}"; do
   if [[ -n "$title" ]]; then
     rule_num=$((rule_num + 1))
     grp="${file_groups[$file]:-}"
+    annotations=()
+    if [[ -n "${file_non_negotiable[$file]:-}" ]]; then
+      annotations+=("[non-negotiable]")
+    fi
     if [[ -n "$grp" ]]; then
-      printf '%d. %s [group: %s]\n' "$rule_num" "$title" "$grp"
+      annotations+=("[group: $grp]")
+    fi
+    if [[ ${#annotations[@]} -gt 0 ]]; then
+      printf '%d. %s %s\n' "$rule_num" "$title" "${(j: :)annotations}"
     else
       printf '%d. %s\n' "$rule_num" "$title"
     fi

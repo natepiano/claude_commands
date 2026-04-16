@@ -17,7 +17,7 @@ zsh ~/.claude/scripts/load-rust-style.sh --shuffle --project-root "$ARGUMENTS"
 
 This loads the shared style guide plus any repo-local `docs/style/*.md` files, filtered for the project type (bevy rules excluded for non-bevy projects), in **random order** so evaluations rotate across rules over multiple nightly runs.
 
-The output ends with a `=== STYLE_CHECKLIST ===` section listing every rule by number and name. This is your evaluation order — work through it sequentially.
+The output ends with a `=== STYLE_CHECKLIST ===` section listing every rule by number and name. Rules may be annotated with `[non-negotiable]` and/or `[group: name]`. This is your evaluation order — work through it sequentially.
 
 If you need exact style file paths for citations, run:
 
@@ -53,7 +53,12 @@ If that file exists, read it. These findings are already being addressed in a st
 
 ## Step 4: Evaluate — systematic sequential walk
 
-Work through the `=== STYLE_CHECKLIST ===` from Step 1, **one rule at a time**, in the order listed.
+Work through the `=== STYLE_CHECKLIST ===` from Step 1 in two phases:
+
+1. Evaluate every rule annotated with `[non-negotiable]` first, in checklist order.
+2. Then evaluate the remaining rules, one rule at a time, in checklist order.
+
+Non-negotiable rules are overarching constraints. Findings from them do **not** count against the 5-finding cap for new findings, and they constrain what later rules may recommend.
 
 ### Grouped rules
 
@@ -64,6 +69,18 @@ When you encounter a grouped rule:
 - The entire group counts as **one checklist item** — not N items. A group of 3 rules consumes 1 slot, not 3
 - Findings from grouped rules still count individually toward the 5-finding cap (each violation is one finding)
 
+### Non-negotiable rules
+
+Rules annotated with `[non-negotiable]` are mandatory, overarching constraints on the entire evaluation.
+
+When you encounter a non-negotiable rule:
+- Evaluate it even if you have already found 5 other new findings
+- Record every genuine violation you find; these do **not** consume the 5-finding budget
+- Treat the rule as binding on later findings from other rules
+- Do **not** recommend a pattern under another style rule if that recommendation would violate a non-negotiable rule
+
+If a non-negotiable rule is also grouped, evaluate the entire group together during the non-negotiable phase. The group still counts as one checklist item for `Rules checked`.
+
 ### Evaluation procedure
 
 For each rule (or group of rules):
@@ -72,12 +89,15 @@ For each rule (or group of rules):
 3. If you find a violation:
    - Confirm it is not already carried forward from Step 3
    - Confirm it is not excluded by Step 3.5
-   - If it's a genuine new finding, **write it immediately** (increment your count)
-   - **Stop after 5 new findings** — do not continue checking more rules
+   - If it's a genuine new finding, **write it immediately**
+   - If the rule is not marked `[non-negotiable]`, increment your 5-finding budget count
+   - If the rule is marked `[non-negotiable]`, do **not** increment your 5-finding budget count
+   - **Stop after 5 new findings from rules that are not marked `[non-negotiable]`** — do not continue checking more normal rules
 4. If no violation: move to the next rule (or next group)
 
 This ensures:
 - Every rule gets a fair chance to surface (the shuffle ensures different rules go first each run)
+- Non-negotiable rules are always evaluated first and never crowded out by the normal finding cap
 - Grouped rules always get evaluated with their full context
 - You don't waste effort scanning for more violations after hitting the cap
 - Coverage rotates naturally across nightly runs

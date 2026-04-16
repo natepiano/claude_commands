@@ -188,6 +188,7 @@ Working directory: $worktree_dir
 Step 1: Load the style guide and read referenced files
 Run: zsh ~/.claude/scripts/load-rust-style.sh --project-root $worktree_dir
 Then read each unique style file referenced by the findings in EVALUATION.md. Each finding includes a **Style file** field with the full path to the style guide file (e.g., ~/rust/nate_style/rust/one-use-per-line.md or a repo-local docs/style/*.md file).
+Also read each style file marked [non-negotiable] in the loaded checklist, even if no finding cites it directly. Those rules apply to every fix.
 
 Step 2: Read the evaluation
 Read the file: $worktree_dir/EVALUATION.md
@@ -198,6 +199,7 @@ across nightly runs via carry-forward. Apply every finding present.
 - Read every file cited in the finding
 - Apply the changes described in "Recommended pattern"
 - Skip any finding whose cited files no longer exist or whose pattern no longer matches
+- If applying a finding as written would violate any [non-negotiable] rule, do NOT apply that conflicting change. Preserve the non-negotiable rule, make any safe partial progress you can, and document the conflict in the Fix Summary.
 
 Step 4: Run cargo mend and fix issues
 Run: cargo mend --workspace --all-targets --manifest-path $worktree_dir/Cargo.toml
@@ -221,6 +223,7 @@ If the file is empty, skip to Step 8 (fmt).
 Find the === STYLE_CHECKLIST === section from the style guide output in Step 1.
 For each rule in the checklist, check the additions-only diff for violations.
 Fix any violations found. If no violations, move on.
+For rules marked [non-negotiable], review the full diff intent, not just added lines. Reversions, deletions, or signature changes that violate a non-negotiable rule must be fixed or the conflicting finding must be marked partial/skipped with an explanation.
 
 Step 8: Run cargo +nightly fmt
 Run: cargo +nightly fmt --all --manifest-path $worktree_dir/Cargo.toml
@@ -257,6 +260,7 @@ If cargo mend --fix was run in Step 4 and made any changes, summarize them here:
 Fixing guidelines:
 - Do NOT fix warnings by marking code as dead — remove dead code entirely
 - Do NOT fix warnings by prefixing arguments/variables with _ — remove them if unused
+- Non-negotiable style rules override any conflicting recommended pattern in a finding
 
 Step 10: Log style usage.
 
