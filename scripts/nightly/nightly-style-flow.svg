@@ -229,8 +229,8 @@
 <title>prechecks</title>
 <polygon fill="#e8f4f8" stroke="#2980b9" points="731.6,-781.4 558.8,-781.4 558.8,-734.6 731.6,-734.6 731.6,-781.4" />
 <text xml:space="preserve" text-anchor="middle" x="645.2" y="-765.38" font-family="Helvetica,sans-Serif" font-size="10.00">Prechecks:</text>
-<text xml:space="preserve" text-anchor="middle" x="645.2" y="-754.12" font-family="Helvetica,sans-Serif" font-size="10.00">- no _style_fix dir</text>
-<text xml:space="preserve" text-anchor="middle" x="645.2" y="-742.88" font-family="Helvetica,sans-Serif" font-size="10.00">- tree is clean</text>
+<text xml:space="preserve" text-anchor="middle" x="645.2" y="-754.12" font-family="Helvetica,sans-Serif" font-size="10.00">- target _style_fix path is free</text>
+<text xml:space="preserve" text-anchor="middle" x="645.2" y="-742.88" font-family="Helvetica,sans-Serif" font-size="10.00">- primary tree is clean</text>
 </g>
 
 <g id="edge18" class="edge">

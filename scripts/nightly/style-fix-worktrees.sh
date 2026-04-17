@@ -16,6 +16,7 @@ source "$HOME/.cargo/env"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 RUST_DIR="$HOME/rust"
 CONF_FILE="$SCRIPT_DIR/nightly-rust.conf"
+HISTORY_HELPER="$SCRIPT_DIR/style_history.py"
 LOG_DIR="/private/tmp/claude"
 SINGLE_PROJECT="${1:-}"
 
@@ -112,19 +113,33 @@ for project_dir in "$RUST_DIR"/*/; do
         continue
     fi
 
-    # Check A: No existing style_fix worktree or directory
+    # Check A: The target _style_fix path must be free.
+    # Other linked worktrees are allowed; only the style-fix target itself blocks creation.
     if [[ -d "$worktree_dir" ]]; then
         echo "SKIP: $name (style_fix directory exists)"
         skipped=$((skipped + 1))
         continue
     fi
-    if git -C "$project_dir" worktree list 2>/dev/null | grep -q "${name}_style_fix"; then
-        echo "SKIP: $name (style_fix worktree registered)"
+
+    # If Git still has stale metadata for a missing style-fix worktree, prune it first.
+    if git -C "$project_dir" worktree list 2>/dev/null | grep -Fq "$worktree_dir"; then
+        git -C "$project_dir" worktree prune 2>/dev/null || true
+        if git -C "$project_dir" worktree list 2>/dev/null | grep -Fq "$worktree_dir"; then
+            echo "SKIP: $name (style_fix worktree registered at target path)"
+            skipped=$((skipped + 1))
+            continue
+        fi
+    fi
+
+    # Check A2: Any other auxiliary worktree checkout blocks nightly fixes for this project.
+    worktree_count=$(git -C "$project_dir" worktree list --porcelain 2>/dev/null | grep -c '^worktree ' || true)
+    if [[ "$worktree_count" -gt 1 ]]; then
+        echo "SKIP: $name (another worktree checkout already exists)"
         skipped=$((skipped + 1))
         continue
     fi
 
-    # Check B: Working tree is clean
+    # Check B: The primary checkout is clean.
     dirty=$(git -C "$project_dir" status --porcelain 2>/dev/null || true)
     if [[ -n "$dirty" ]]; then
         echo "SKIP: $name (working tree dirty)"
@@ -145,8 +160,6 @@ fi
 echo ""
 echo "=== Style-fix worktrees: ${#eligible[@]} eligible projects ==="
 
-# Create per-run temp directory for isolated logging
-mkdir -p ~/rust/nate_style/usage
 RUN_DIR="$LOG_DIR/style_run_$(date +%s)_$$"
 mkdir -p "$RUN_DIR"
 
@@ -157,14 +170,6 @@ create_and_fix() {
     local worktree_dir="$RUST_DIR/${proj}_style_fix"
     local eval_file="$project_dir/EVALUATION.md"
     local log_file="$LOG_DIR/style_fix_${proj}.log"
-
-    # Capture base branch and write metadata for style usage logging
-    local base_branch
-    base_branch=$(git -C "$project_dir" branch --show-current)
-    local meta_file="$RUN_DIR/style_meta_${proj}.txt"
-    echo "base_branch=$base_branch" > "$meta_file"
-    echo "project=$proj" >> "$meta_file"
-    echo "timestamp=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$meta_file"
 
     # Create worktree (-b fails if branch exists, which is intentional)
     if ! git -C "$project_dir" worktree add -b refactor/style "$worktree_dir" 2>>"$log_file"; then
@@ -262,33 +267,8 @@ Fixing guidelines:
 - Do NOT fix warnings by prefixing arguments/variables with _ — remove them if unused
 - Non-negotiable style rules override any conflicting recommended pattern in a finding
 
-Step 10: Log style usage.
-
-Read the metadata file at $RUN_DIR/style_meta_${proj}.txt for base_branch, project, and timestamp values.
-Each line is key=value format. Parse them to get the values.
-
-For each unique style file referenced by findings in EVALUATION.md, append one JSON line
-to $RUN_DIR/style_usage_${proj}.jsonl.
-
-Use the Fix Summary you wrote in Step 8 to populate the findings array:
-- "applied" for Status: Applied
-- "partial" for Status: Partially applied (include reason from Issues field)
-- "skipped" for Status: Skipped (include reason from Issues field)
-
-Each JSON line must have these fields:
-- timestamp: from the metadata file
-- style_id: "shared:rust/<filename>" if the style file path is under ~/rust/nate_style/, or "local:<project>:<filename>" if under docs/style/
-- style_file: just the filename (basename)
-- local: true if under docs/style/, false if under ~/rust/nate_style/
-- project: from the metadata file
-- base_branch: from the metadata file
-- findings: array of objects with finding (number), status ("applied"/"partial"/"skipped"), and reason (string, only for partial/skipped)
-
-Keep skip/partial reasons to one sentence.
-Write one valid JSON object per line, no trailing commas, no markdown fencing.
-
 Rules:
-- Modify ONLY files inside $worktree_dir (except the JSONL output to $RUN_DIR)
+- Modify ONLY files inside $worktree_dir
 - Do NOT commit anything (no git add, no git commit)
 - EVALUATION.md may ONLY be modified by appending the Fix Summary section (Step 8)
 - Apply each fix completely — no partial changes
@@ -312,10 +292,10 @@ PROMPT_EOF
             kill -9 "$claude_pid" 2>/dev/null
             wait "$claude_pid" 2>/dev/null
             echo "TIMEOUT: $proj (claude exceeded 60 minute timeout)"
+            python3 "$HISTORY_HELPER" finalize-failure --project "$proj" --reason "claude exceeded 60 minute timeout" || true
             [[ -f "$worktree_dir/EVALUATION.md" ]] && mv "$worktree_dir/EVALUATION.md" "$eval_file"
             git -C "$project_dir" worktree remove "$worktree_dir" --force 2>/dev/null || rm -rf "$worktree_dir"
             git -C "$project_dir" worktree prune 2>/dev/null || true
-            echo "{\"timestamp\":\"$(date -u +%Y-%m-%dT%H:%M:%SZ)\",\"project\":\"$proj\",\"base_branch\":\"$base_branch\",\"status\":\"error\",\"reason\":\"claude exceeded 60 minute timeout\"}" >> "$RUN_DIR/style_usage_${proj}.jsonl"
             return 1
         fi
     done
@@ -329,13 +309,18 @@ PROMPT_EOF
             fail_reason="claude failed after producing output (see $log_file)"
         fi
         echo "ERROR: $proj ($fail_reason)"
+        python3 "$HISTORY_HELPER" finalize-failure --project "$proj" --reason "$fail_reason" || true
         # Cleanup: move EVALUATION.md back before removing worktree
         [[ -f "$worktree_dir/EVALUATION.md" ]] && mv "$worktree_dir/EVALUATION.md" "$eval_file"
         git -C "$project_dir" worktree remove "$worktree_dir" --force 2>/dev/null || rm -rf "$worktree_dir"
         git -C "$project_dir" worktree prune 2>/dev/null || true
-        echo "{\"timestamp\":\"$(date -u +%Y-%m-%dT%H:%M:%SZ)\",\"project\":\"$proj\",\"base_branch\":\"$base_branch\",\"status\":\"error\",\"reason\":\"$fail_reason\"}" >> "$RUN_DIR/style_usage_${proj}.jsonl"
         return 1
     fi
+
+    python3 "$HISTORY_HELPER" finalize-fix --project-root "$worktree_dir" --evaluation "$worktree_dir/EVALUATION.md" || {
+        echo "ERROR: $proj (could not finalize history)"
+        return 1
+    }
 
     echo "OK: $proj (worktree created, fixes applied)"
     return 0
@@ -395,22 +380,10 @@ fi
 echo ""
 echo "=== Done: $succeeded created, $failed failed, $skipped skipped out of $((${#eligible[@]} + skipped)) ==="
 
-# Validate and merge per-project usage logs into the permanent log
-if ls "$RUN_DIR"/style_usage_*.jsonl 1>/dev/null 2>&1; then
-    echo "Merging style usage logs..."
-    python3 "$SCRIPT_DIR/style_usage_merge.py" \
-        --run-dir "$RUN_DIR" \
-        --log-file "$HOME/rust/nate_style/usage/log.jsonl" || {
-        echo "WARNING: failed to merge style usage logs"
-    }
-else
-    echo "No style usage logs to merge."
-fi
-
 # Clean up per-run temp directory
 rm -rf "$RUN_DIR"
 
 # Update Obsidian summary
-python3 "$SCRIPT_DIR/style_usage_summary.py" --generate 2>&1 || {
+python3 "$SCRIPT_DIR/style_report.py" --generate 2>&1 || {
     echo "WARNING: failed to generate style reports"
 }

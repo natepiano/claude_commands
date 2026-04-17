@@ -25,7 +25,7 @@ Runs daily at **4:00 AM** via launchd.
 
 | File | Purpose |
 |------|---------|
-| `style-fix-worktrees.sh` | For each project with `EVALUATION.md` findings: creates a `_style_fix` worktree, moves `EVALUATION.md` into it, launches Claude to apply fixes (cargo mend, clippy, tests, style review). Can target a single project by name. |
+| `style-fix-worktrees.sh` | For each project with `EVALUATION.md` findings: creates a `_style_fix` worktree, moves `EVALUATION.md` into it, launches Claude to apply fixes (cargo mend, clippy, tests, style review). Other linked worktrees are allowed; the primary checkout still must be clean. Can target a single project by name. |
 
 ### Warmup
 
@@ -73,7 +73,8 @@ Nightly Build (4:00 AM)
   │    → find new violations → write EVALUATION.md
   │
   ├─ Phase 3: Style-Fix Worktrees (per project, parallel)
-  │    Create worktree → mv EVALUATION.md into it
+  │    Create _style_fix worktree (other linked worktrees allowed if primary is clean)
+  │    → mv EVALUATION.md into it
   │    → Claude applies fixes, runs clippy/tests/style review
   │
   └─ Generate Nightly Report
