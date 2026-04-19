@@ -6,7 +6,6 @@ description: Evaluate a Rust project against the style guide and write EVALUATIO
 
 ## Arguments
 - `$ARGUMENTS` is the absolute path to a Rust project root (must contain a `Cargo.toml`)
-- `__SELECTION_MANIFEST__` is the absolute path to the nightly selection manifest for this project
 
 ## Step 1: Load the full style guide
 
@@ -26,17 +25,56 @@ If you need exact style file paths for citations, run:
 zsh ~/.claude/scripts/load-rust-style.sh --list-files --project-root "$ARGUMENTS"
 ```
 
-## Step 1.5: Read the nightly selection manifest
+## Step 1.5: Use the nightly selection helper
 
-Read the JSON file at `__SELECTION_MANIFEST__`.
+You must pull evaluation units one at a time from:
 
-It contains the specific guideline units selected for this run. Only these units may produce **new** findings in this evaluation.
+```bash
+python3 ~/.claude/scripts/nightly/style_history.py next-unit --project-root "$ARGUMENTS"
+```
 
-Selection rules:
-- a `rule` unit is a single style rule
-- a `group` unit must be evaluated as one unit across all of its member style files
-- a `non_negotiable` budget kind still counts as selected work for this run even though it consumes `0` nightly budget
-- the manifest order is authoritative for this run
+The helper returns JSON.
+
+Rules:
+- `status=next` means review exactly that returned unit next
+- `status=complete` means stop immediately
+- `stop_reason=budget_reached` means you have reached 5 scored units
+- `stop_reason=exhausted` means there are no unseen eligible units left for this run
+- `non_negotiable_guideline_ids` are binding on every unit review and are returned every time
+- a group is still one selected unit, but you must review every guideline in the returned group before recording results
+
+After reviewing a unit, you must record its result immediately with:
+
+```bash
+python3 ~/.claude/scripts/nightly/style_history.py record-unit --project-root "$ARGUMENTS" --results /tmp/style-eval-results.json
+```
+
+The results JSON must have this shape:
+
+```json
+{
+  "unit_id": "group::module-splitting",
+  "results": [
+    {
+      "guideline_id": "rust/module-splitting-1-when-to-split.md",
+      "outcome": {
+        "status": "no_findings"
+      }
+    },
+    {
+      "guideline_id": "rust/module-splitting-2-anchor-types.md",
+      "finding_source": "new"
+    }
+  ]
+}
+```
+
+Recording rules:
+- use `outcome.status = no_findings` when that guideline produced no finding
+- use `finding_source = new | carried_forward` when that guideline produced a finding to keep in `EVALUATION.md`
+- if any guideline in the returned unit produces a finding, that unit counts as `1`
+- if every guideline in the returned unit is `no_findings`, that unit counts as `0`
+- do not review the next unit until the current unit has been recorded
 
 ## Step 2: Survey the project
 
@@ -66,26 +104,27 @@ If that file exists, read it. These findings are already being addressed in a st
 
 ## Step 4: Evaluate only the selected guideline units
 
-Use the selection manifest from Step 1.5.
+Loop until the helper returns `status=complete`.
 
-For this nightly run:
-- carry forward still-valid findings from the previous `EVALUATION.md`
-- discover **new** findings only from the selected units in the manifest
-- do not search for new findings outside the selected units
-
-Evaluation procedure for each selected unit, in manifest order:
+For each returned unit:
 1. Read the full rule content for that selected unit
-2. If the unit is a group, evaluate every member rule in that group together
-3. Check the relevant codebase for violations of that selected unit
-4. If you find a violation:
-   - confirm it is not already carried forward from Step 3
-   - confirm it is not excluded by Step 3.5
-   - write it as a new finding
-5. If the selected unit is non-negotiable:
-   - treat it as binding on all recommendations
-   - do not recommend any change that would violate it
+2. Read every guideline in that unit if it is a group
+3. Re-read the returned `non_negotiable_guideline_ids` and treat them as binding for this unit
+4. Check the relevant codebase for violations of that selected unit
+5. For each guideline in the unit:
+   - if it has no issue, record `outcome.status = no_findings`
+   - if it has an issue that is still valid from Step 3, keep it and record `finding_source = carried_forward`
+   - if it has a genuinely new issue, record `finding_source = new`
+   - if it matches an in-progress `_style_fix` finding from Step 3.5, do not include it
+6. Record the unit immediately with `record-unit`
+7. Then ask the helper for the next unit
 
-For this prompt, the manifest already handles nightly budgeting. Do not apply any separate "stop after 5 findings" rule inside the evaluation itself.
+Important:
+- do not invent your own stopping rule
+- do not stop after 5 helper calls
+- keep pulling units until the helper says `budget_reached` or `exhausted`
+- `no_findings` units do not consume the 5-unit scored budget
+- groups must be fully reviewed before being recorded
 
 ## Step 5: Write EVALUATION.md
 

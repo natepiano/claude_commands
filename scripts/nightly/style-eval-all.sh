@@ -13,11 +13,13 @@ export PATH="$HOME/.local/bin:$PATH"
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 RUST_DIR="$HOME/rust"
+HISTORY_DIR="$HOME/rust/nate_style/.history"
 CONF_FILE="$SCRIPT_DIR/nightly-rust.conf"
 CMD_FILE="$HOME/.claude/commands/style_eval.md"
-STATE_HELPER="$SCRIPT_DIR/style_review_state.py"
+HISTORY_HELPER="$SCRIPT_DIR/style_history.py"
 LOG_DIR="/private/tmp/claude"
 SINGLE_PROJECT="${1:-}"
+STYLE_AGENT_MODE="claude"
 
 mkdir -p "$LOG_DIR"
 
@@ -38,12 +40,54 @@ if [[ -f "$CONF_FILE" ]]; then
         case "$current_section" in
             exclude) excludes+=("$stripped") ;;
             style_eval)
+                if [[ "$stripped" =~ ^mode=(.+)$ ]]; then
+                    STYLE_AGENT_MODE="${BASH_REMATCH[1]}"
+                elif [[ "$stripped" =~ ^enabled=(.+)$ ]]; then
+                    if [[ "${BASH_REMATCH[1]}" == "true" ]]; then
+                        STYLE_AGENT_MODE="claude"
+                    else
+                        STYLE_AGENT_MODE="off"
+                    fi
+                fi
                 if [[ "$stripped" =~ ^max_new_findings=([0-9]+)$ ]]; then
                     MAX_NEW_FINDINGS="${BASH_REMATCH[1]}"
                 fi
                 ;;
         esac
     done < "$CONF_FILE"
+fi
+
+run_style_agent() {
+    local project_root="$1"
+    local prompt="$2"
+    local log_file="$3"
+    local final_prompt="$prompt"
+
+    case "$STYLE_AGENT_MODE" in
+        claude)
+            claude --print --dangerously-skip-permissions --settings '{"sandbox":{"enabled":false}}' -- "$final_prompt" > "$log_file" 2>&1
+            ;;
+        codex)
+            final_prompt=$'IMPORTANT: Do NOT spawn sub-agents, delegate, or parallelize through helper agents. Complete this evaluation yourself in a single agent run.\nIMPORTANT: Do NOT create, replace, repair, or symlink the workspace path or any parent/peer repo path. If the expected workspace path is missing or invalid, fail and report it instead of trying to reconstruct it.\n\n'"$prompt"
+            codex exec \
+                -c model_reasoning_effort='"high"' \
+                --ephemeral \
+                --full-auto \
+                -C "$project_root" \
+                --add-dir "$HISTORY_DIR" \
+                -- "$final_prompt" \
+                > "$log_file" 2>&1
+            ;;
+        *)
+            echo "unsupported style_eval mode: $STYLE_AGENT_MODE" > "$log_file"
+            return 1
+            ;;
+    esac
+}
+
+if [[ "$STYLE_AGENT_MODE" == "off" ]]; then
+    echo "Style evaluation mode is off."
+    exit 0
 fi
 
 # Build project list
@@ -78,49 +122,27 @@ fi
 
 echo "=== Style evaluation: ${#projects[@]} projects ==="
 
-# Ensure the review ledger exists before selection begins
-if [[ ! -f "$HOME/rust/nate_style/usage/review_ledger.json" ]]; then
-    python3 "$STATE_HELPER" bootstrap || {
-        echo "FAILED: could not bootstrap review ledger"
-        exit 1
-    }
-fi
-
-RUN_DIR="$LOG_DIR/style_eval_run_$(date +%s)_$$"
-mkdir -p "$RUN_DIR"
-
 # Launch all evaluations in parallel
 pids=()
 names=()
 for proj in "${projects[@]}"; do
     project_root="${RUST_DIR}/${proj}"
-    manifest_path="$RUN_DIR/${proj}_selection.json"
-    prior_eval_path="$RUN_DIR/${proj}_prior_evaluation.md"
-
-    python3 "$STATE_HELPER" select \
+    python3 "$HISTORY_HELPER" start-run \
         --project-root "$project_root" \
-        --budget "$MAX_NEW_FINDINGS" \
-        --output "$manifest_path" || {
-        echo "FAILED: $proj (selection generation failed)"
+        --budget "$MAX_NEW_FINDINGS" || {
+        echo "FAILED: $proj (could not start pending run)"
         continue
     }
-
-    if [[ -f "$project_root/EVALUATION.md" ]]; then
-        cp "$project_root/EVALUATION.md" "$prior_eval_path"
-    else
-        : > "$prior_eval_path"
-    fi
 
     prompt="$(
         sed \
             -e "s|\$ARGUMENTS|$project_root|g" \
-            -e "s|__SELECTION_MANIFEST__|$manifest_path|g" \
             "$CMD_FILE"
     )"
-    claude --print --dangerously-skip-permissions --settings '{"sandbox":{"enabled":false}}' -- "$prompt" > "$LOG_DIR/style_eval_${proj}.log" 2>&1 &
+    run_style_agent "$project_root" "$prompt" "$LOG_DIR/style_eval_${proj}.log" &
     pids+=($!)
     names+=("$proj")
-    echo "Launched: $proj (PID $!)"
+    echo "Launched: $proj via $STYLE_AGENT_MODE (PID $!)"
 done
 
 echo ""
@@ -133,30 +155,34 @@ idx=0
 for pid in "${pids[@]}"; do
     name="${names[$idx]}"
     wait "$pid" && code=0 || code=$?
-    if [[ $code -ne 0 ]]; then
-        echo "FAILED: $name (exit $code)"
+    if [[ ! -f "$RUST_DIR/$name/EVALUATION.md" ]]; then
+        if [[ $code -ne 0 ]]; then
+            echo "FAILED: $name (exit $code, no EVALUATION.md produced)"
+        else
+            echo "FAILED: $name (no EVALUATION.md produced)"
+        fi
+        python3 "$HISTORY_HELPER" discard-pending --project "$name" || true
         failed=$((failed + 1))
-    elif [[ -f "$RUST_DIR/$name/EVALUATION.md" ]]; then
-        python3 "$STATE_HELPER" append-events \
-            --project-root "$RUST_DIR/$name" \
-            --manifest "$RUN_DIR/${name}_selection.json" \
-            --prior-eval "$RUN_DIR/${name}_prior_evaluation.md" \
-            --current-eval "$RUST_DIR/$name/EVALUATION.md" || {
-            echo "FAILED: $name (could not append evaluation events)"
+        idx=$((idx + 1))
+        continue
+    fi
+
+    if [[ $code -ne 0 ]]; then
+        echo "WARN: $name (exit $code, but EVALUATION.md was produced)"
+    fi
+    if [[ $(grep -c '^### [0-9]' "$RUST_DIR/$name/EVALUATION.md" || true) -eq 0 ]]; then
+        python3 "$HISTORY_HELPER" finalize-no-findings --project "$name" || {
+            echo "FAILED: $name (could not finalize no-findings history)"
             failed=$((failed + 1))
+            idx=$((idx + 1))
             continue
         }
-        lines=$(wc -l < "$RUST_DIR/$name/EVALUATION.md")
-        echo "OK: $name ($lines lines)"
-        succeeded=$((succeeded + 1))
-    else
-        echo "FAILED: $name (no EVALUATION.md produced)"
-        failed=$((failed + 1))
     fi
+    lines=$(wc -l < "$RUST_DIR/$name/EVALUATION.md")
+    echo "OK: $name ($lines lines)"
+    succeeded=$((succeeded + 1))
     idx=$((idx + 1))
 done
 
 echo ""
 echo "=== Done: $succeeded succeeded, $failed failed out of ${#projects[@]} ==="
-
-rm -rf "$RUN_DIR"

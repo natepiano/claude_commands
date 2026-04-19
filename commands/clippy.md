@@ -14,7 +14,7 @@ bash ~/.claude/scripts/clippy/check_cache.sh .
 
 - **Exit 0, all passed + "git diff: clean"**: Print the status table and exit (complete no-op).
 - **Exit 0, all passed + "git diff: has changes"**: Print the status table, then resume at STEP 4 and continue through remaining steps in order (4 → 5 → 6 → 8 → 9).
-- **Exit 0, issues found**: Print the status table and the `=== cargo mend ===` / `=== cargo clippy ===` details. Present issues as if mend + clippy had just run → resume at STEP 7 and continue through remaining steps in order.
+- **Exit 0, issues found**: Print the status table and the `=== cargo mend ===` / `=== cargo clippy ===` details. Then resume at STEP 7 and execute it in full — **including stopping at `<BatchDecisionPoint/>` and waiting for user approval before any edits**. "Resuming at STEP 7" does not mean skipping the decision gate.
 - **Exit 1**: Cache miss — proceed to STEP 2 (<RunMend/>).
 
 The script reads Port Report's `latest.json`, waits if a run is still in progress, compares the cached timestamp to source files, and outputs formatted results.
@@ -85,17 +85,30 @@ Create a comprehensive todo list combining all clippy AND unfixable mend issues:
 - Group related issues in same function/struct into single todos when logical
 - Each todo includes fix description and affected file locations
 - Label each todo with its source (clippy or mend) for clarity
+- For each clippy todo, run the `clippy:` frontmatter lookup described in
+  `<FixingGuidelines/>` and include the matched rule file in the todo (e.g.
+  `rule: never-allowclippytoomanylines.md`). Only include this field when a
+  matching rule file exists — omit it otherwise rather than writing "none".
 - Present complete batch for user decision
 - Note: Hook automatically provides cargo check feedback on edit - no explicit build commands needed
 </CreateBatchTodoList>
 
 <BatchDecisionPoint>
-Present the complete batch of fixes:
+**This is a hard gate. STOP here. Do NOT edit any files until the user has
+selected one of the Available Actions below. This applies even if there is
+only one issue — the user must approve every fix before execution.**
+
+Present the complete batch of fixes exactly as follows:
 
 ## Issues Found
 **Clippy**: [clippy_count] issues across [clippy_file_count] files
 **Mend (unfixable)**: [mend_count] issues across [mend_file_count] files
-[List all todos with descriptions, grouped by source]
+
+For each todo, show:
+- file:line and lint name
+- the fix approach in one sentence
+- `rule:` with the matched style-guide filename from the `clippy:`
+  frontmatter lookup, when a match exists (omit the field otherwise)
 
 ## Available Actions
 - **proceed** - Fix all issues using standard clippy guidance
@@ -103,6 +116,9 @@ Present the complete batch of fixes:
 - **stop** - Cancel fixes without making changes
 
 Please select one of the keywords above.
+
+**After printing this block, end your turn. Wait for the user's next message.
+Do not call any Edit/Write/Bash tools until then.**
 </BatchDecisionPoint>
 
 <BatchExecution>
@@ -125,6 +141,26 @@ After batch completion: Display summary of fixes applied and any remaining issue
 **Important rules:**
 - Do not fix warnings by marking code as dead - remove dead code
 - Do not fix warnings by prefixing arguments/variables with _ - remove if unused
+
+**Consult the style guide per-lint before fixing.** For every clippy finding,
+before proposing a fix, grep the loaded style guide for the lint name in the
+`clippy:` frontmatter property:
+
+```bash
+grep -l "^clippy:.*\b<lint_name>\b" ~/rust/nate_style/rust/*.md docs/style/*.md 2>/dev/null
+```
+
+If a file matches, read it and apply the rule it prescribes (often the
+"extract helpers / orchestrator pattern", "no bare allow", or
+"test-module allow boilerplate"). Cite the rule file in your fix
+description.
+
+If no file matches, state that explicitly ("no style-guide rule governs
+`<lint_name>`") and proceed with a judgment call.
+
+Rationale: the style guide has been known to be skipped at fix time even
+when loaded. The `clippy:` frontmatter property is the single source of
+truth that maps clippy lints to the rule that governs them.
 </FixingGuidelines>
 
 <StyleReview>

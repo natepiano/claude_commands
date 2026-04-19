@@ -10,6 +10,20 @@ description: Review changes in a style-fix worktree against its EVALUATION.md fi
 
 **Your task:** Review the changes the automation made and determine whether each finding was correctly and completely addressed.
 
+## Writing style for the review output
+
+The user sees only what you write. They have **not** read the `EVALUATION.md` Fix Summary, the `cargo mend` output, the diff, or any style file. Every section of your review must stand on its own for a reader starting cold.
+
+Follow these rules in every section you write (summary table, Cargo Mend section, Allow Audit, per-finding walkthrough):
+
+- **Show the evidence before drawing a conclusion.** Quote the specific diff hunk, Fix Summary bullet, or style-guide line first, then interpret it. Never lead with a conclusion and expect the reader to back-derive the facts.
+- **Introduce every term the first time it appears.** Tool names (`cargo mend`), lint names (`forbidden_pub_crate`, `redundant_closure`), internal concepts ("ux movable", "inspector switch"), and file-local identifiers (`tests/support.rs`) all need a one-clause gloss the first time you use them — even if they're obvious to you.
+- **Attribute new information to its source out loud.** Never write "a known issue" or "as expected" — the user does not know what is known or expected. Write "The Fix Summary reports that..." or "`cargo mend` warns on this file because..." so the user can see where the claim came from.
+- **Split multi-step inferences into separate sentences.** If a statement chains together "what the tool does" + "what the file contains" + "why the agent chose X", the reader cannot follow it. Give each fact its own sentence and name each one.
+- **Avoid insider shorthand.** Do not write "mend-attributed edits" — write "edits the Fix Summary credits to `cargo mend --fix`". Do not write "the forbidden_pub_crate rule re-fails" — write "after mend rewrites `pub` to `pub(crate)`, a separate lint called `forbidden_pub_crate` then complains about that `pub(crate)`, so the fix cycles".
+- **Prefer concrete over abstract.** When describing what the automation changed, name the actual before/after (e.g. "the `SetCursorExt` trait method `set_cursor` became a free function `cursor::set_cursor(&mut commands, cursor)`"), not a generalization ("the single-impl trait was replaced with a free function").
+- **Don't assume the Fix Summary is trustworthy context for the user.** If a Fix Summary claim is load-bearing for your assessment, paraphrase what it says before using it — don't cite it by reference.
+
 ## Step 1: Read the evaluation and fix summary
 
 Read `EVALUATION.md` in this worktree. It contains two parts:
@@ -57,14 +71,24 @@ If there are no new allows in the diff, say so explicitly.
 
 ## Step 5: Review cargo mend changes
 
-Check the Fix Summary for a **Cargo Mend Changes** section. If cargo mend made changes:
+Check the Fix Summary for a **Cargo Mend Changes** section. If cargo mend made changes, write the review section for the user as follows.
 
-- Identify which parts of the diff are from cargo mend (typically: `pub` narrowed to `pub(crate)`/`pub(super)`, import paths shortened)
-- Verify these changes are correct — narrowed visibility shouldn't break anything since mend proves safety before fixing
-- Note any overlap with numbered findings (a mend fix might partially or fully address a finding)
-- Report the mend changes to the user as a separate category so they aren't confused when they appear in the diff without a corresponding finding number
+**First, set the stage for the user.** Assume the user does not know what `cargo mend` is or what `--fix` did. Begin the Cargo Mend section with one or two plain sentences that explain: `cargo mend` is a workspace visibility/import auditor; `cargo mend --fix` applied automatic corrections (commonly narrowing `pub` to `pub(crate)`/`pub(super)` when nothing outside the crate/module needs the wider visibility, or rewriting imports to match the repo's import-style rules).
 
-If the Cargo Mend Changes section says mend was skipped or found nothing, say so and move on.
+**Then, for each file the Fix Summary credits to mend:**
+
+- Name the file and describe the concrete change by quoting or paraphrasing the diff (e.g. "`use crate::cursor::SetCursorExt;` became `use crate::cursor;` with call sites rewritten to `cursor::set_cursor(&mut commands, ...)`").
+- State what that change type is (visibility narrowing, import-path rewrite, etc.) so the user can pattern-match across files.
+- If the mend change overlaps with a numbered finding, say so explicitly: "This aligns with Finding N because <explanation of the connection>." Do not make the user infer the link.
+
+**For any mend issue the Fix Summary flags as unfixable or cycling:**
+
+- Quote the Fix Summary's description of the problem before interpreting it.
+- Spell out in your own words the mechanism (e.g. "mend wants to narrow `pub` to `pub(crate)`, but a separate lint called `forbidden_pub_crate` is configured to reject `pub(crate)` on exported test helpers, so mend's fix is reverted on every run").
+- State what the agent chose to do and why, concretely.
+- Never describe this as "a known issue" without explaining *what* the issue is and *how you know* it (e.g. "The Fix Summary reports that...").
+
+If the Cargo Mend Changes section says mend was skipped or found nothing, say so and move on — but in a full sentence that names what was skipped, not as shorthand.
 
 ## Step 6: Review each finding
 
@@ -88,12 +112,16 @@ Immediately after the summary table, output a short `Allow Audit` section that l
 
 ## Step 8: Walk through each finding
 
-Immediately after the summary table, begin presenting findings one at a time. For each finding, start by outputting the path to the relevant style guide file (from the finding's **Style file** field), then a short narrative (3-5 sentences) covering:
-- A brief re-summary of the original finding itself so the user has context before your review. Restate the core issue, the requested style change, and the relevant scope/locations in 1-2 sentences before discussing what the automation did.
-- What the automation actually changed
-- Whether it was applied correctly and completely
-- Any issues or concerns
-- Any new allow introduced while addressing this finding, even if it includes a reason
+Immediately after the summary table, begin presenting findings one at a time. For each finding, output:
+
+1. The path to the relevant style guide file (from the finding's **Style file** field).
+2. A **restatement of the original finding in plain language** — what style rule was violated, where it lived in the code, and what the evaluation asked for. Do not just say "Finding 2 was about single-impl traits" — name the traits, the files, and the recommended fix shape.
+3. A **concrete description of what the automation changed**. Name the before and after by their actual identifiers. Example: "The trait `SetCursorExt` (declared in `cursor.rs`) and its single `impl SetCursorExt for Commands<'_, '_>` were deleted. In their place is a free function `cursor::set_cursor(commands: &mut Commands, cursor: Cursor)`. All call sites were rewritten from `commands.set_cursor(...)` to `cursor::set_cursor(&mut commands, ...)`." Do not collapse this into "the trait was replaced by a free function".
+4. A **correctness and completeness assessment**, citing the style guide rule being applied and the specific places the fix landed or missed.
+5. **Concerns, side effects, or risks**, each introduced as its own point with the evidence that raised the concern (diff quote, style rule, etc.) before the interpretation. If a concern is speculative, say so.
+6. **Any new allow introduced while addressing this finding**, even if it includes a `reason` field.
+
+Keep the prose tight but follow the writing-style rules at the top of this document — every term named, every claim evidenced, no shorthand.
 
 Then **stop and wait for user feedback** before moving to the next finding. The user may have corrections, questions, or want you to fix something before proceeding.
 

@@ -10,8 +10,8 @@ Runs daily at **4:00 AM** via launchd.
 
 | File | Purpose |
 |------|---------|
-| `nightly-rust-clean-build.sh` | Main entry point. For each eligible project: clean, build, clippy. Then runs style eval + style-fix if enabled. Generates the nightly report at the end. |
-| `nightly-rust.conf` | Configuration: excluded projects, style eval settings (`enabled`, `max_new_findings`), warmup targets. |
+| `nightly-rust-clean-build.sh` | Main entry point. For each eligible project: clean, build, clippy. Then runs style eval + style-fix if the style mode is not `off`. Generates the nightly report at the end. |
+| `nightly-rust.conf` | Configuration: excluded projects, style eval settings (`mode`, `max_new_findings`), warmup targets. |
 | `com.natemccoy.nightly-rust-clean-build.plist` | launchd plist — schedules the nightly job at 4:00 AM. |
 | `setup.sh` | Idempotent setup script — installs the launchd agent, creates runtime directories. |
 
@@ -25,7 +25,7 @@ Runs daily at **4:00 AM** via launchd.
 
 | File | Purpose |
 |------|---------|
-| `style-fix-worktrees.sh` | For each project with `EVALUATION.md` findings: creates a `_style_fix` worktree, moves `EVALUATION.md` into it, launches Claude to apply fixes (cargo mend, clippy, tests, style review). Other linked worktrees are allowed; the primary checkout still must be clean. Can target a single project by name. |
+| `style-fix-worktrees.sh` | For each project with `EVALUATION.md` findings: creates a `_style_fix` worktree, moves `EVALUATION.md` into it, launches the configured style agent to apply fixes (cargo mend, clippy, tests, style review). Other linked worktrees are allowed; the primary checkout still must be clean. Can target a single project by name. |
 
 ### Warmup
 
@@ -75,7 +75,7 @@ Nightly Build (4:00 AM)
   ├─ Phase 3: Style-Fix Worktrees (per project, parallel)
   │    Create _style_fix worktree (other linked worktrees allowed if primary is clean)
   │    → mv EVALUATION.md into it
-  │    → Claude applies fixes, runs clippy/tests/style review
+  │    → Configured style agent applies fixes, runs clippy/tests/style review
   │
   └─ Generate Nightly Report
 

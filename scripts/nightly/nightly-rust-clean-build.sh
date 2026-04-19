@@ -25,7 +25,7 @@ log() {
 
 # Parse conf file
 EXCLUDE=()
-STYLE_EVAL_ENABLED=true
+STYLE_EVAL_MODE=claude
 if [[ -f "$CONF_FILE" ]]; then
     current_section=""
     while IFS= read -r line || [[ -n "$line" ]]; do
@@ -42,8 +42,14 @@ if [[ -f "$CONF_FILE" ]]; then
                 EXCLUDE+=("$stripped")
                 ;;
             style_eval)
-                if [[ "$stripped" =~ ^enabled=(.+)$ ]]; then
-                    STYLE_EVAL_ENABLED="${BASH_REMATCH[1]}"
+                if [[ "$stripped" =~ ^mode=(.+)$ ]]; then
+                    STYLE_EVAL_MODE="${BASH_REMATCH[1]}"
+                elif [[ "$stripped" =~ ^enabled=(.+)$ ]]; then
+                    if [[ "${BASH_REMATCH[1]}" == "true" ]]; then
+                        STYLE_EVAL_MODE="claude"
+                    else
+                        STYLE_EVAL_MODE="off"
+                    fi
                 fi
                 ;;
         esac
@@ -129,9 +135,9 @@ done
     log "WARNING: warmup script failed"
 }
 
-# Run style evaluations and fixes (if enabled)
-if [[ "$STYLE_EVAL_ENABLED" == "true" ]]; then
-    log "Starting style evaluations..."
+# Run style evaluations and fixes when the style mode is enabled
+if [[ "$STYLE_EVAL_MODE" != "off" ]]; then
+    log "Starting style evaluations with $STYLE_EVAL_MODE..."
     "$SCRIPT_DIR/style-eval-all.sh" 2>&1 | tee -a "$LOG_FILE" || {
         log "WARNING: style evaluation script failed"
     }
@@ -155,4 +161,3 @@ log "Generating nightly report..."
 claude --print --dangerously-skip-permissions --settings '{"sandbox":{"enabled":false}}' -- "$(sed 's/\$ARGUMENTS/rebuild/g' "$HOME/.claude/commands/nightly_report.md")" > "$REPORT_FILE" 2>> "$LOG_FILE" || {
     log "WARNING: failed to generate nightly report"
 }
-

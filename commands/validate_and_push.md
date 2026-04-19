@@ -14,6 +14,14 @@ description: Run local CI validation, push to origin, and monitor GitHub CI
   4. Re-run the full validation script from the top
 - If validation fails again on a non-formatting step, fall through to the general failure handling below
 
+**On validation failure — `cargo mend` (auto-fixable):**
+- If the failed step is `cargo mend` and the warnings indicate they are auto-fixable (e.g. "this warning is auto-fixable with `cargo mend --fix`"):
+  1. Run `cargo mend --fix` (unsandboxed) to apply fixes
+  2. Verify the fix worked by re-running `cargo mend`
+  3. If clean, commit the changes with message: `style: apply cargo mend fixes`
+  4. Re-run the full validation script from the top
+- If `cargo mend --fix` does not resolve all warnings, fall through to the general failure handling below
+
 **On validation failure — anything else:**
 - Do NOT push
 - Do NOT attempt to fix the errors — stop immediately and report

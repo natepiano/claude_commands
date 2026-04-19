@@ -60,12 +60,44 @@ Present to user:
 Wait for user response.
 
 If user selects **commit**:
-- Write the prepared commit message to a system temporary file outside the repository (for example via `mktemp`)
-- Execute `bash ~/.claude/scripts/commit_prep/stage_and_commit.sh /path/to/temp-message.txt` unsandboxed, because the helper stages files and writes `.git/index.lock`
-- In Claude/Bash-tool terms: use `dangerouslyDisableSandbox: true`
-- In Codex terms: request escalation with `sandbox_permissions: "require_escalated"` and a justification, then rerun the helper outside the sandbox
-- Do not fail the workflow on the first sandbox denial; retry with the appropriate unsandboxed/elevated mechanism for the current agent
-- Execute <CommitOutput/>
+
+Pick the path for your agent:
+
+**If you are Claude (Bash tool):**
+- Stage files with `git add <paths>` (one or more explicit paths — do not use `git add -A` or `git add .`).
+- Commit directly with `git commit -m "$(cat <<'EOF' ... EOF)"` using a quoted heredoc for the multi-line message. `Bash(git add *)` and `Bash(git commit *)` are in the user allowlist, so this runs without a secondary permission prompt.
+- Do NOT use the helper scripts (`create_message_file.sh`, `stage_and_commit.sh`). They exist for Codex's sandbox model and only add a permission prompt when invoked from Claude, because the shell wrapper (`MSG_FILE=$(...)` or `bash <script>`) prevents the allowlist prefix match from firing.
+
+**If you are Codex (or another agent whose sandbox blocks `git add` / `git commit` from writing `.git/index.lock`):**
+- Write the prepared commit message to a system temp file via
+  `~/.claude/scripts/commit_prep/create_message_file.sh`. The helper reads the
+  message from **stdin** and prints the temp file path to stdout when
+  `--stdout-path` is passed:
+
+  ```bash
+  MSG_FILE=$(~/.claude/scripts/commit_prep/create_message_file.sh --stdout-path <<'EOF'
+  <title line>
+
+  <body line 1>
+  <body line 2>
+  ...
+  EOF
+  )
+  ```
+
+  Notes:
+  - Never run the helper with no stdin — it exits 1 with "commit message is empty".
+  - Keep the heredoc delimiter quoted (`<<'EOF'`) so `$`, backticks, and backslashes are preserved literally.
+
+- Then run the stage+commit helper, passing the captured path:
+
+  ```bash
+  bash ~/.claude/scripts/commit_prep/stage_and_commit.sh "$MSG_FILE"
+  ```
+
+  Request escalation with `sandbox_permissions: "require_escalated"` (or equivalent) so the helper can write `.git/index.lock`. Do not fail the workflow on the first sandbox denial — retry once with escalation.
+
+Then execute <CommitOutput/>
 
 If user selects **abandon**: Run `git reset` to unstage any changes (if staged) and stop
 </FinalCommitDecision>

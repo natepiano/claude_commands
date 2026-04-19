@@ -1,6 +1,6 @@
 #!/bin/bash
 # Create style-fix worktrees for projects with EVALUATION.md findings.
-# For each eligible project: create a worktree, launch Claude to apply fixes + clippy.
+# For each eligible project: create a worktree, launch the configured style agent to apply fixes + clippy.
 # Uses the same exclude list as the nightly build from nightly-rust.conf.
 # Can be run standalone or called from nightly-rust-clean-build.sh.
 #
@@ -19,6 +19,7 @@ CONF_FILE="$SCRIPT_DIR/nightly-rust.conf"
 HISTORY_HELPER="$SCRIPT_DIR/style_history.py"
 LOG_DIR="/private/tmp/claude"
 SINGLE_PROJECT="${1:-}"
+STYLE_AGENT_MODE="claude"
 
 mkdir -p "$LOG_DIR"
 
@@ -39,12 +40,53 @@ if [[ -f "$CONF_FILE" ]]; then
         case "$current_section" in
             exclude) excludes+=("$stripped") ;;
             style_eval)
+                if [[ "$stripped" =~ ^mode=(.+)$ ]]; then
+                    STYLE_AGENT_MODE="${BASH_REMATCH[1]}"
+                elif [[ "$stripped" =~ ^enabled=(.+)$ ]]; then
+                    if [[ "${BASH_REMATCH[1]}" == "true" ]]; then
+                        STYLE_AGENT_MODE="claude"
+                    else
+                        STYLE_AGENT_MODE="off"
+                    fi
+                fi
                 if [[ "$stripped" =~ ^max_new_findings=([0-9]+)$ ]]; then
                     MAX_NEW_FINDINGS="${BASH_REMATCH[1]}"
                 fi
                 ;;
         esac
     done < "$CONF_FILE"
+fi
+
+run_style_agent() {
+    local project_root="$1"
+    local prompt="$2"
+    local log_file="$3"
+    local final_prompt="$prompt"
+
+    case "$STYLE_AGENT_MODE" in
+        claude)
+            claude --print --dangerously-skip-permissions --settings '{"sandbox":{"enabled":false}}' -- "$final_prompt" > "$log_file" 2>&1
+            ;;
+        codex)
+            final_prompt=$'IMPORTANT: Do NOT spawn sub-agents, delegate, or parallelize through helper agents. Complete this fix pass yourself in a single agent run.\nIMPORTANT: Do NOT create, replace, repair, or symlink the workspace path or any parent/peer repo path. If the expected workspace path is missing or invalid, fail and report it instead of trying to reconstruct it.\n\n'"$prompt"
+            codex exec \
+                -c model_reasoning_effort='"high"' \
+                --ephemeral \
+                --full-auto \
+                -C "$project_root" \
+                -- "$final_prompt" \
+                > "$log_file" 2>&1
+            ;;
+        *)
+            echo "unsupported style_eval mode: $STYLE_AGENT_MODE" > "$log_file"
+            return 1
+            ;;
+    esac
+}
+
+if [[ "$STYLE_AGENT_MODE" == "off" ]]; then
+    echo "Style evaluation mode is off."
+    exit 0
 fi
 
 # Build eligible project list with precondition checks
@@ -89,9 +131,13 @@ for project_dir in "$RUST_DIR"/*/; do
 
     eval_file="$project_dir/EVALUATION.md"
     worktree_dir="$RUST_DIR/${name}_style_fix"
+    finding_count=0
 
     # Check 0: EVALUATION.md exists with numbered findings
-    if [[ ! -f "$eval_file" ]] || [[ $(grep -c '^### [0-9]' "$eval_file" 2>/dev/null || echo 0) -eq 0 ]]; then
+    if [[ -f "$eval_file" ]]; then
+        finding_count=$(grep -c '^### [0-9]' "$eval_file" 2>/dev/null || true)
+    fi
+    if [[ ! -f "$eval_file" ]] || [[ "$finding_count" -eq 0 ]]; then
         if [[ -n "$SINGLE_PROJECT" ]]; then
             echo "EVAL: $name (no evaluation, running style eval...)"
             "$SCRIPT_DIR/style-eval-all.sh" "$name"
@@ -100,13 +146,13 @@ for project_dir in "$RUST_DIR"/*/; do
                 skipped=$((skipped + 1))
                 continue
             fi
+            finding_count=$(grep -c '^### [0-9]' "$eval_file" 2>/dev/null || true)
         else
             echo "SKIP: $name (no EVALUATION.md or no findings)"
             skipped=$((skipped + 1))
             continue
         fi
     fi
-    finding_count=$(grep -c '^### [0-9]' "$eval_file" || true)
     if [[ "$finding_count" -eq 0 ]]; then
         echo "SKIP: $name (eval produced no findings)"
         skipped=$((skipped + 1))
@@ -117,6 +163,7 @@ for project_dir in "$RUST_DIR"/*/; do
     # Other linked worktrees are allowed; only the style-fix target itself blocks creation.
     if [[ -d "$worktree_dir" ]]; then
         echo "SKIP: $name (style_fix directory exists)"
+        python3 "$HISTORY_HELPER" discard-pending --project "$name" 2>/dev/null || true
         skipped=$((skipped + 1))
         continue
     fi
@@ -126,6 +173,7 @@ for project_dir in "$RUST_DIR"/*/; do
         git -C "$project_dir" worktree prune 2>/dev/null || true
         if git -C "$project_dir" worktree list 2>/dev/null | grep -Fq "$worktree_dir"; then
             echo "SKIP: $name (style_fix worktree registered at target path)"
+            python3 "$HISTORY_HELPER" discard-pending --project "$name" 2>/dev/null || true
             skipped=$((skipped + 1))
             continue
         fi
@@ -135,6 +183,7 @@ for project_dir in "$RUST_DIR"/*/; do
     worktree_count=$(git -C "$project_dir" worktree list --porcelain 2>/dev/null | grep -c '^worktree ' || true)
     if [[ "$worktree_count" -gt 1 ]]; then
         echo "SKIP: $name (another worktree checkout already exists)"
+        python3 "$HISTORY_HELPER" discard-pending --project "$name" 2>/dev/null || true
         skipped=$((skipped + 1))
         continue
     fi
@@ -143,6 +192,7 @@ for project_dir in "$RUST_DIR"/*/; do
     dirty=$(git -C "$project_dir" status --porcelain 2>/dev/null || true)
     if [[ -n "$dirty" ]]; then
         echo "SKIP: $name (working tree dirty)"
+        python3 "$HISTORY_HELPER" discard-pending --project "$name" 2>/dev/null || true
         skipped=$((skipped + 1))
         continue
     fi
@@ -163,7 +213,7 @@ echo "=== Style-fix worktrees: ${#eligible[@]} eligible projects ==="
 RUN_DIR="$LOG_DIR/style_run_$(date +%s)_$$"
 mkdir -p "$RUN_DIR"
 
-# Per-project function: create worktree and launch Claude to apply fixes
+# Per-project function: create worktree and launch the configured style agent
 create_and_fix() {
     local proj="$1"
     local project_dir="$RUST_DIR/$proj"
@@ -184,11 +234,15 @@ create_and_fix() {
     # Move EVALUATION.md into worktree so primary starts fresh
     mv "$eval_file" "$worktree_dir/EVALUATION.md"
 
+    python3 "$HISTORY_HELPER" set-phase --project "$proj" --phase fix || true
+
     # Build prompt for Claude
     local prompt
     prompt=$(cat <<PROMPT_EOF
 You are applying automated style fixes to a Rust project.
 Working directory: $worktree_dir
+
+IMPORTANT: Do NOT spawn sub-agents, delegate, or parallelize through helper agents. Complete this fix pass yourself in a single agent run.
 
 Step 1: Load the style guide and read referenced files
 Run: zsh ~/.claude/scripts/load-rust-style.sh --project-root $worktree_dir
@@ -276,45 +330,61 @@ Rules:
 PROMPT_EOF
     )
 
-    # Launch Claude to apply fixes (60 min timeout to prevent hanging the pipeline)
-    local claude_pid
-    claude --print --dangerously-skip-permissions --settings '{"sandbox":{"enabled":false}}' -- "$prompt" > "$log_file" 2>&1 &
-    claude_pid=$!
+    # Launch selected agent to apply fixes (60 min timeout to prevent hanging the pipeline)
+    local agent_pid
+    run_style_agent "$worktree_dir" "$prompt" "$log_file" &
+    agent_pid=$!
 
     local elapsed=0
     local timeout_secs=3600
-    while kill -0 "$claude_pid" 2>/dev/null; do
+    while kill -0 "$agent_pid" 2>/dev/null; do
         sleep 10
         elapsed=$((elapsed + 10))
         if [[ $elapsed -ge $timeout_secs ]]; then
-            kill "$claude_pid" 2>/dev/null
+            kill "$agent_pid" 2>/dev/null
             sleep 5
-            kill -9 "$claude_pid" 2>/dev/null
-            wait "$claude_pid" 2>/dev/null
-            echo "TIMEOUT: $proj (claude exceeded 60 minute timeout)"
-            python3 "$HISTORY_HELPER" finalize-failure --project "$proj" --reason "claude exceeded 60 minute timeout" || true
+            kill -9 "$agent_pid" 2>/dev/null
+            wait "$agent_pid" 2>/dev/null
+            echo "TIMEOUT: $proj ($STYLE_AGENT_MODE exceeded 60 minute timeout)"
+            python3 "$HISTORY_HELPER" finalize-failure --project "$proj" --reason "$STYLE_AGENT_MODE exceeded 60 minute timeout" || true
             [[ -f "$worktree_dir/EVALUATION.md" ]] && mv "$worktree_dir/EVALUATION.md" "$eval_file"
             git -C "$project_dir" worktree remove "$worktree_dir" --force 2>/dev/null || rm -rf "$worktree_dir"
             git -C "$project_dir" worktree prune 2>/dev/null || true
+            if [[ "$(git -C "$project_dir" rev-list --count main..refactor/style 2>/dev/null)" == "0" ]]; then
+                git -C "$project_dir" branch -D refactor/style 2>/dev/null || true
+            else
+                echo "WARN: $proj (kept refactor/style branch — has unmerged commits)"
+            fi
             return 1
         fi
     done
 
-    if ! wait "$claude_pid"; then
-        # Determine failure reason from log content
-        local fail_reason
-        if [[ ! -s "$log_file" ]]; then
-            fail_reason="claude exited immediately with no output"
+    wait "$agent_pid" && agent_code=0 || agent_code=$?
+
+    if [[ $agent_code -ne 0 ]]; then
+        if [[ -f "$worktree_dir/EVALUATION.md" ]] && rg -q '^## Fix Summary$' "$worktree_dir/EVALUATION.md"; then
+            echo "WARN: $proj ($STYLE_AGENT_MODE exited $agent_code, but Fix Summary was produced)"
         else
-            fail_reason="claude failed after producing output (see $log_file)"
+        # Determine failure reason from log content
+            local fail_reason
+            if [[ ! -s "$log_file" ]]; then
+                fail_reason="$STYLE_AGENT_MODE exited immediately with no output"
+            else
+                fail_reason="$STYLE_AGENT_MODE failed after producing output (see $log_file)"
+            fi
+            echo "ERROR: $proj ($fail_reason)"
+            python3 "$HISTORY_HELPER" finalize-failure --project "$proj" --reason "$fail_reason" || true
+            # Cleanup: move EVALUATION.md back before removing worktree
+            [[ -f "$worktree_dir/EVALUATION.md" ]] && mv "$worktree_dir/EVALUATION.md" "$eval_file"
+            git -C "$project_dir" worktree remove "$worktree_dir" --force 2>/dev/null || rm -rf "$worktree_dir"
+            git -C "$project_dir" worktree prune 2>/dev/null || true
+            if [[ "$(git -C "$project_dir" rev-list --count main..refactor/style 2>/dev/null)" == "0" ]]; then
+                git -C "$project_dir" branch -D refactor/style 2>/dev/null || true
+            else
+                echo "WARN: $proj (kept refactor/style branch — has unmerged commits)"
+            fi
+            return 1
         fi
-        echo "ERROR: $proj ($fail_reason)"
-        python3 "$HISTORY_HELPER" finalize-failure --project "$proj" --reason "$fail_reason" || true
-        # Cleanup: move EVALUATION.md back before removing worktree
-        [[ -f "$worktree_dir/EVALUATION.md" ]] && mv "$worktree_dir/EVALUATION.md" "$eval_file"
-        git -C "$project_dir" worktree remove "$worktree_dir" --force 2>/dev/null || rm -rf "$worktree_dir"
-        git -C "$project_dir" worktree prune 2>/dev/null || true
-        return 1
     fi
 
     python3 "$HISTORY_HELPER" finalize-fix --project-root "$worktree_dir" --evaluation "$worktree_dir/EVALUATION.md" || {
