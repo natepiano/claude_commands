@@ -42,6 +42,7 @@ Rules:
 - `stop_reason=exhausted` means there are no unseen eligible units left for this run
 - `non_negotiable_guideline_ids` are binding on every unit review and are returned every time
 - a group is still one selected unit, but you must review every guideline in the returned group before recording results
+- `see_also_guideline_ids` on a unit lists additional guidelines whose content you must consult as context when reviewing this unit — do NOT record results for them (they are scored on their own separate review cycle)
 
 After reviewing a unit, you must record its result immediately with:
 
@@ -109,8 +110,9 @@ Loop until the helper returns `status=complete`.
 For each returned unit:
 1. Read the full rule content for that selected unit
 2. Read every guideline in that unit if it is a group
-3. Re-read the returned `non_negotiable_guideline_ids` and treat them as binding for this unit
-4. Check the relevant codebase for violations of that selected unit
+3. Read the content of any `see_also_guideline_ids` on the unit as review context — apply the selected unit's rule, informed by that context, but do not record findings against the see_also'd guidelines (they get their own review cycle)
+4. Re-read the returned `non_negotiable_guideline_ids` and treat them as binding for this unit
+5. Check the relevant codebase for violations of that selected unit
 5. For each guideline in the unit:
    - if it has no issue, record `outcome.status = no_findings`
    - if it has an issue that is still valid from Step 3, keep it and record `finding_source = carried_forward`

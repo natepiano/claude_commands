@@ -55,7 +55,8 @@
       "/Users/natemccoy/rust",
       "/tmp",
       "/tmp/claude/"
-    ]
+    ],
+    "defaultMode": "auto"
   },
   "hooks": {
     "SessionStart": [
@@ -138,5 +139,6 @@
   "feedbackSurveyState": {
     "lastShownTime": 1754090074729
   },
-  "teammateMode": "tmux"
+  "teammateMode": "tmux",
+  "skipAutoPermissionPrompt": true
 }

@@ -35,7 +35,13 @@ while IFS= read -r line; do
     fi
 done < <(git worktree list)
 
-# List local branches with last commit, excluding current and release branches
+# Load user-excluded branches from git config (merge-from-branch.exclude)
+EXCLUDED_BRANCHES=()
+while IFS= read -r excluded; do
+    [[ -n "$excluded" ]] && EXCLUDED_BRANCHES+=("$excluded")
+done < <(git config --get-all merge-from-branch.exclude 2>/dev/null)
+
+# List local branches with last commit, excluding current, release, and user-excluded branches
 BRANCH_ENTRIES=""
 BRANCH_COUNT=0
 while IFS= read -r branch; do
@@ -43,6 +49,16 @@ while IFS= read -r branch; do
     if [[ "$branch" == "$CURRENT_BRANCH" || "$branch" == release-* ]]; then
         continue
     fi
+
+    # Skip branches in the user exclude list
+    SKIP_BRANCH=false
+    for excluded in "${EXCLUDED_BRANCHES[@]+"${EXCLUDED_BRANCHES[@]}"}"; do
+        if [[ "$branch" == "$excluded" ]]; then
+            SKIP_BRANCH=true
+            break
+        fi
+    done
+    [[ "$SKIP_BRANCH" == true ]] && continue
 
     LAST_COMMIT=$(git log -1 --pretty=format:'%h %s' "$branch" 2>/dev/null)
     # Escape double quotes in commit message

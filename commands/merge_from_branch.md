@@ -23,7 +23,6 @@ If user input doesn't match, display error and re-ask.
 Run `bash ~/.claude/scripts/merge_from_branch/validate.sh ${SOURCE_BRANCH}`
 
 - If `status` is `"error"`, report the message and STOP
-- If `source_is_clean` is `false`, STOP and inform user the source worktree has uncommitted changes
 - If `current_behind_remote` is `true`, STOP and ask user if they want to pull first
 - If `merge_feasible` is `false`, STOP and inform user of merge conflicts
 

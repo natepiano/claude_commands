@@ -91,6 +91,56 @@ extract_group() {
   ' "$1"
 }
 
+# Emit one wikilink stem per line from a file's `see_also:` frontmatter entry.
+# Supports single-line `see_also: "[[stem]]"` and multi-line list forms:
+#   see_also:
+#     - "[[stem-one]]"
+#     - "[[stem-two]]"
+extract_see_also() {
+  awk '
+    function unwrap(v) {
+      sub(/^[[:space:]]+/, "", v)
+      sub(/[[:space:]]+$/, "", v)
+      if (v ~ /^".*"$/ || v ~ /^'\''.*'\''$/) {
+        v = substr(v, 2, length(v) - 2)
+      }
+      if (v ~ /^\[\[.*\]\]$/) {
+        v = substr(v, 3, length(v) - 4)
+      }
+      sub(/^[[:space:]]+/, "", v)
+      sub(/[[:space:]]+$/, "", v)
+      return v
+    }
+    NR==1 && /^---$/ { in_fm=1; next }
+    in_fm && /^---$/ { exit }
+    in_fm {
+      # New top-level key closes any list-collection state
+      if ($0 ~ /^[a-z_]+:/) {
+        if ($0 ~ /^see_also:/) {
+          value = $0
+          sub(/^see_also:[[:space:]]*/, "", value)
+          if (value != "") {
+            v = unwrap(value)
+            if (v != "") print v
+            in_see_also = 0
+          } else {
+            in_see_also = 1
+          }
+        } else {
+          in_see_also = 0
+        }
+        next
+      }
+      if (in_see_also && $0 ~ /^[[:space:]]*-[[:space:]]*/) {
+        value = $0
+        sub(/^[[:space:]]*-[[:space:]]*/, "", value)
+        v = unwrap(value)
+        if (v != "") print v
+      }
+    }
+  ' "$1"
+}
+
 # ── Collect style files ─────────────────────────────────────────
 declare -a style_files=()
 declare -a global_style_files=()
@@ -124,6 +174,8 @@ fi
 
 typeset -A file_groups=()
 typeset -A file_non_negotiable=()
+typeset -A file_see_also=()  # file -> newline-separated wikilink stems
+typeset -A stem_to_file=()   # wikilink stem -> resolved file path
 for file in "${style_files[@]}"; do
   grp="$(extract_group "$file")"
   if [[ -n "$grp" ]]; then
@@ -131,6 +183,12 @@ for file in "${style_files[@]}"; do
   fi
   if has_tag "$file" non-negotiable; then
     file_non_negotiable[$file]=1
+  fi
+  stem="${file:t:r}"  # basename without .md
+  stem_to_file[$stem]="$file"
+  refs="$(extract_see_also "$file")"
+  if [[ -n "$refs" ]]; then
+    file_see_also[$file]="$refs"
   fi
 done
 
@@ -276,6 +334,16 @@ printf 'Rust style guide loaded — %d %s, %d lines (shared: %d %s, %d lines; pr
 if [[ ${#style_files[@]} -gt 0 ]]; then
   for file in "${style_files[@]}"; do
     strip_frontmatter "$file"
+    if [[ -n "${file_see_also[$file]:-}" ]]; then
+      while IFS= read -r stem; do
+        [[ -z "$stem" ]] && continue
+        ref_file="${stem_to_file[$stem]:-}"
+        if [[ -n "$ref_file" && -f "$ref_file" ]]; then
+          printf '\n### Related style guidance (via see_also → %s)\n\n' "$stem"
+          strip_frontmatter "$ref_file"
+        fi
+      done <<< "${file_see_also[$file]}"
+    fi
   done
 fi
 

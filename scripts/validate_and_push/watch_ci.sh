@@ -32,3 +32,8 @@ fi
 
 echo "Found CI run $RUN_ID for commit $SHA"
 gh run watch "$RUN_ID"
+
+# Nudge cargo-port's filesystem watcher (notify-based, no polling) to re-fetch
+# CI status: updating .git/FETCH_HEAD + refs/remotes/origin/<branch> triggers
+# its git-refresh path, which auto-fetches GitHub run data.
+git fetch --quiet origin "$BRANCH" || true

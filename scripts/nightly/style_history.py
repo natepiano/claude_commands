@@ -39,6 +39,7 @@ class Unit:
     checklist_index: int
     display_name: str
     guideline_ids: tuple[str, ...]
+    see_also_guideline_ids: tuple[str, ...]
 
 
 def utc_now() -> str:
@@ -64,21 +65,60 @@ def normalize_guideline_id(raw_path: str, project_root: Path | None = None) -> s
     return path_obj.name
 
 
+def _extract_wikilink(raw: str) -> str:
+    value = raw.strip()
+    if value.startswith(('"', "'")) and value.endswith(('"', "'")) and len(value) >= 2:
+        value = value[1:-1]
+    if value.startswith("[[") and value.endswith("]]"):
+        return value[2:-2].strip()
+    return ""
+
+
 def parse_frontmatter(path: Path) -> dict[str, list[str] | str]:
     tags: list[str] = []
     group = ""
+    see_also: list[str] = []
     lines = path.read_text().splitlines()
     if not lines or lines[0].strip() != "---":
-        return {"tags": tags, "group": group}
+        return {"tags": tags, "group": group, "see_also": see_also}
+    current_key = ""
     for line in lines[1:]:
         stripped = line.strip()
         if stripped == "---":
             break
-        if stripped.startswith("group:"):
-            group = stripped.split(":", 1)[1].strip()
-        elif stripped.startswith("-"):
-            tags.append(stripped.lstrip("-").strip())
-    return {"tags": tags, "group": group}
+        if not stripped:
+            continue
+        if stripped.startswith("-") and current_key:
+            value = stripped.lstrip("-").strip()
+            if current_key == "tags":
+                tags.append(value)
+            elif current_key == "see_also":
+                extracted = _extract_wikilink(value)
+                if extracted:
+                    see_also.append(extracted)
+            continue
+        if ":" not in stripped:
+            current_key = ""
+            continue
+        key, _, value = stripped.partition(":")
+        key = key.strip()
+        value = value.strip()
+        if key == "group":
+            group = value
+            current_key = ""
+        elif key == "tags":
+            current_key = "tags" if not value else ""
+        elif key == "see_also":
+            if value:
+                extracted = _extract_wikilink(value)
+                if extracted:
+                    see_also.append(extracted)
+                current_key = ""
+            else:
+                current_key = "see_also"
+        else:
+            current_key = ""
+    return {"tags": tags, "group": group, "see_also": see_also}
 
 
 def extract_title(path: Path) -> str:
@@ -168,10 +208,16 @@ def build_units(project_root: Path) -> list[Unit]:
     style_files = list_style_files(project_root)
     grouped: dict[str, dict[str, Any]] = {}
     ordered_ids: list[str] = []
+    # Resolve see_also wikilink stems to guideline_ids by matching file stems.
+    stem_to_guideline_id: dict[str, str] = {
+        style_file.stem: normalize_guideline_id(str(style_file), project_root)
+        for style_file in style_files
+    }
     for index, style_file in enumerate(style_files, start=1):
         frontmatter = parse_frontmatter(style_file)
         tags = set(frontmatter["tags"])
         group = str(frontmatter["group"])
+        see_also_stems = list(frontmatter["see_also"])
         guideline_id = normalize_guideline_id(str(style_file), project_root)
         unit_id = f"group::{group}" if group else guideline_id
         if unit_id not in grouped:
@@ -182,8 +228,13 @@ def build_units(project_root: Path) -> list[Unit]:
                 "checklist_index": index,
                 "display_name": extract_title(style_file) if not group else group,
                 "guideline_ids": [],
+                "see_also_guideline_ids": [],
             }
         grouped[unit_id]["guideline_ids"].append(guideline_id)
+        for stem in see_also_stems:
+            resolved = stem_to_guideline_id.get(stem)
+            if resolved and resolved not in grouped[unit_id]["see_also_guideline_ids"]:
+                grouped[unit_id]["see_also_guideline_ids"].append(resolved)
         if "non-negotiable" in tags:
             grouped[unit_id]["budget_cost"] = 0
     return [
@@ -193,6 +244,7 @@ def build_units(project_root: Path) -> list[Unit]:
             checklist_index=int(grouped[unit_id]["checklist_index"]),
             display_name=str(grouped[unit_id]["display_name"]),
             guideline_ids=tuple(grouped[unit_id]["guideline_ids"]),
+            see_also_guideline_ids=tuple(grouped[unit_id]["see_also_guideline_ids"]),
         )
         for unit_id in ordered_ids
     ]
@@ -303,6 +355,7 @@ def next_unit(project_root: Path) -> dict[str, Any]:
             "display_name": unit.display_name,
             "guideline_ids": list(unit.guideline_ids),
             "review_count_before": unit_count,
+            "see_also_guideline_ids": list(unit.see_also_guideline_ids),
             "unit_id": unit.unit_id,
         },
     }

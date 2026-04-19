@@ -1,3 +1,6 @@
+## writing style
+- **NEVER** use the word "honest" (or "honestly", "to be honest", etc.) in output to the user. Drop it entirely — don't substitute "truthfully" or similar either. State the claim directly.
+
 ## git
 ### commit
 **NEVER** commit changes unless i ask you to
