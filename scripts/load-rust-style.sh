@@ -82,15 +82,6 @@ has_bevy_tag() {
   has_tag "$1" bevy
 }
 
-# Extract the group name from frontmatter, or print nothing if ungrouped.
-extract_group() {
-  awk '
-    NR==1 && /^---$/ { in_fm=1; next }
-    in_fm && /^---$/ { exit }
-    in_fm && /^group:/ { sub(/^group:[[:space:]]*/, ""); print; exit }
-  ' "$1"
-}
-
 # Emit one wikilink stem per line from a file's `see_also:` frontmatter entry.
 # Supports single-line `see_also: "[[stem]]"` and multi-line list forms:
 #   see_also:
@@ -172,15 +163,10 @@ if [[ -n "$repo_style_dir" && -d "$repo_style_dir" ]]; then
   done < <(find "$repo_style_dir" -maxdepth 1 -type f -name '*.md' -print | LC_ALL=C sort)
 fi
 
-typeset -A file_groups=()
 typeset -A file_non_negotiable=()
 typeset -A file_see_also=()  # file -> newline-separated wikilink stems
 typeset -A stem_to_file=()   # wikilink stem -> resolved file path
 for file in "${style_files[@]}"; do
-  grp="$(extract_group "$file")"
-  if [[ -n "$grp" ]]; then
-    file_groups[$file]="$grp"
-  fi
   if has_tag "$file" non-negotiable; then
     file_non_negotiable[$file]=1
   fi
@@ -192,70 +178,25 @@ for file in "${style_files[@]}"; do
   fi
 done
 
-# ── Shuffle if requested (group-aware) ──────────────────────────
+# ── Shuffle if requested ────────────────────────────────────────
+# Non-negotiable files pin to the top in stable order; everything else shuffles.
 if [[ "$shuffle" == true && ${#style_files[@]} -gt 1 ]]; then
-  # Phase 1: classify files into groups and ungrouped
-  typeset -A group_members=()  # group_name -> newline-separated file list
-  typeset -A group_seen=()     # track whether we've added a group unit
-  typeset -A group_non_negotiable=()  # group_name -> 1 if any member is non-negotiable
-  pinned_units=()              # always first, stable order
-  shuffle_units=()             # randomized after pinned units; each entry: "file:/path" or "group:name"
-
+  pinned=()
+  shuffle_pool=()
   for file in "${style_files[@]}"; do
-    grp="${file_groups[$file]:-}"
-    if [[ -n "$grp" ]]; then
-      if [[ -n "${group_members[$grp]+x}" ]]; then
-        group_members[$grp]+=$'\n'"$file"
-      else
-        group_members[$grp]="$file"
-      fi
-      if [[ -n "${file_non_negotiable[$file]:-}" ]]; then
-        group_non_negotiable[$grp]=1
-      fi
+    if [[ -n "${file_non_negotiable[$file]:-}" ]]; then
+      pinned+=("$file")
+    else
+      shuffle_pool+=("$file")
     fi
   done
 
-  for file in "${style_files[@]}"; do
-    grp="${file_groups[$file]:-}"
-    if [[ -z "$grp" ]]; then
-      if [[ -n "${file_non_negotiable[$file]:-}" ]]; then
-        pinned_units+=("file:$file")
-      else
-        shuffle_units+=("file:$file")
-      fi
-    elif [[ -z "${group_seen[$grp]+x}" ]]; then
-        if [[ -n "${group_non_negotiable[$grp]:-}" ]]; then
-          pinned_units+=("group:$grp")
-        else
-          shuffle_units+=("group:$grp")
-        fi
-        group_seen[$grp]=1
-    fi
-  done
+  shuffled_pool=()
+  while IFS= read -r entry; do
+    shuffled_pool+=("$entry")
+  done < <(printf '%s\n' "${shuffle_pool[@]}" | sort -R)
 
-  # Phase 2: shuffle the units
-  shuffled_units=()
-  while IFS= read -r unit; do
-    shuffled_units+=("$unit")
-  done < <(printf '%s\n' "${shuffle_units[@]}" | sort -R)
-
-  # Phase 3: expand groups back into individual files
-  shuffled=()
-  for unit in "${pinned_units[@]}" "${shuffled_units[@]}"; do
-    case "$unit" in
-      file:*)
-        shuffled+=("${unit#file:}")
-        ;;
-      group:*)
-        grp_name="${unit#group:}"
-        while IFS= read -r member; do
-          shuffled+=("$member")
-        done <<< "${group_members[$grp_name]}"
-        ;;
-    esac
-  done
-
-  style_files=("${shuffled[@]}")
+  style_files=("${pinned[@]}" "${shuffled_pool[@]}")
 fi
 
 if [[ "$list_files" == true ]]; then
@@ -354,16 +295,8 @@ for file in "${style_files[@]}"; do
   title="$(extract_title "$file")"
   if [[ -n "$title" ]]; then
     rule_num=$((rule_num + 1))
-    grp="${file_groups[$file]:-}"
-    annotations=()
     if [[ -n "${file_non_negotiable[$file]:-}" ]]; then
-      annotations+=("[non-negotiable]")
-    fi
-    if [[ -n "$grp" ]]; then
-      annotations+=("[group: $grp]")
-    fi
-    if [[ ${#annotations[@]} -gt 0 ]]; then
-      printf '%d. %s %s\n' "$rule_num" "$title" "${(j: :)annotations}"
+      printf '%d. %s [non-negotiable]\n' "$rule_num" "$title"
     else
       printf '%d. %s\n' "$rule_num" "$title"
     fi

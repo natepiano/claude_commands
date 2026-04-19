@@ -58,7 +58,7 @@ description: Run local CI validation, push to origin, and monitor GitHub CI
 - Once the user confirms or provides a name:
   1. `git switch -c <name>` (current HEAD is already at the commits to push; the new branch inherits them)
   2. Reset local default branch back to origin so the commits only live on the new branch: `git branch -f $DEFAULT origin/$DEFAULT`
-  3. Push the branch: `git push -u origin <name>` (unsandboxed)
+  3. Push the branch: `git push -u origin <name>`
   4. Open the PR: `gh pr create --fill` (unsandboxed) — fills title/body from the commit messages
   5. Capture the PR number from `gh pr view --json number -q .number`
   6. Watch CI: `gh pr checks <pr-number> --watch` (unsandboxed) — blocks until all checks finish

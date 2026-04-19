@@ -74,13 +74,12 @@ def _extract_wikilink(raw: str) -> str:
     return ""
 
 
-def parse_frontmatter(path: Path) -> dict[str, list[str] | str]:
+def parse_frontmatter(path: Path) -> dict[str, list[str]]:
     tags: list[str] = []
-    group = ""
     see_also: list[str] = []
     lines = path.read_text().splitlines()
     if not lines or lines[0].strip() != "---":
-        return {"tags": tags, "group": group, "see_also": see_also}
+        return {"tags": tags, "see_also": see_also}
     current_key = ""
     for line in lines[1:]:
         stripped = line.strip()
@@ -103,10 +102,7 @@ def parse_frontmatter(path: Path) -> dict[str, list[str] | str]:
         key, _, value = stripped.partition(":")
         key = key.strip()
         value = value.strip()
-        if key == "group":
-            group = value
-            current_key = ""
-        elif key == "tags":
+        if key == "tags":
             current_key = "tags" if not value else ""
         elif key == "see_also":
             if value:
@@ -118,7 +114,7 @@ def parse_frontmatter(path: Path) -> dict[str, list[str] | str]:
                 current_key = "see_also"
         else:
             current_key = ""
-    return {"tags": tags, "group": group, "see_also": see_also}
+    return {"tags": tags, "see_also": see_also}
 
 
 def extract_title(path: Path) -> str:
@@ -205,49 +201,97 @@ def list_style_files(project_root: Path) -> list[Path]:
 
 
 def build_units(project_root: Path) -> list[Unit]:
-    style_files = list_style_files(project_root)
-    grouped: dict[str, dict[str, Any]] = {}
-    ordered_ids: list[str] = []
-    # Resolve see_also wikilink stems to guideline_ids by matching file stems.
+    all_files = list_style_files(project_root)
+    return _build_units_from_files(all_files, project_root, all_files)
+
+
+def _build_units_from_files(
+    style_files: list[Path],
+    project_root: Path,
+    resolution_corpus: list[Path],
+) -> list[Unit]:
+    # Resolve see_also wikilink stems against the full style-file population,
+    # not just the subset being built into units. This matters for focused evals
+    # where only a handful of guidelines are requested but their see_alsos may
+    # point anywhere in the guide.
     stem_to_guideline_id: dict[str, str] = {
         style_file.stem: normalize_guideline_id(str(style_file), project_root)
-        for style_file in style_files
+        for style_file in resolution_corpus
     }
+    units: list[Unit] = []
     for index, style_file in enumerate(style_files, start=1):
         frontmatter = parse_frontmatter(style_file)
         tags = set(frontmatter["tags"])
-        group = str(frontmatter["group"])
         see_also_stems = list(frontmatter["see_also"])
         guideline_id = normalize_guideline_id(str(style_file), project_root)
-        unit_id = f"group::{group}" if group else guideline_id
-        if unit_id not in grouped:
-            ordered_ids.append(unit_id)
-            grouped[unit_id] = {
-                "unit_id": unit_id,
-                "budget_cost": 0 if "non-negotiable" in tags else 1,
-                "checklist_index": index,
-                "display_name": extract_title(style_file) if not group else group,
-                "guideline_ids": [],
-                "see_also_guideline_ids": [],
-            }
-        grouped[unit_id]["guideline_ids"].append(guideline_id)
+        see_also_ids: list[str] = []
         for stem in see_also_stems:
             resolved = stem_to_guideline_id.get(stem)
-            if resolved and resolved not in grouped[unit_id]["see_also_guideline_ids"]:
-                grouped[unit_id]["see_also_guideline_ids"].append(resolved)
-        if "non-negotiable" in tags:
-            grouped[unit_id]["budget_cost"] = 0
-    return [
-        Unit(
-            unit_id=grouped[unit_id]["unit_id"],
-            budget_cost=int(grouped[unit_id]["budget_cost"]),
-            checklist_index=int(grouped[unit_id]["checklist_index"]),
-            display_name=str(grouped[unit_id]["display_name"]),
-            guideline_ids=tuple(grouped[unit_id]["guideline_ids"]),
-            see_also_guideline_ids=tuple(grouped[unit_id]["see_also_guideline_ids"]),
+            if resolved and resolved not in see_also_ids:
+                see_also_ids.append(resolved)
+        units.append(
+            Unit(
+                unit_id=guideline_id,
+                budget_cost=0 if "non-negotiable" in tags else 1,
+                checklist_index=index,
+                display_name=extract_title(style_file),
+                guideline_ids=(guideline_id,),
+                see_also_guideline_ids=tuple(see_also_ids),
+            )
         )
-        for unit_id in ordered_ids
-    ]
+    return units
+
+
+def resolve_focus_targets(requested: list[str], project_root: Path) -> list[Path]:
+    """Resolve user-supplied guideline identifiers to absolute style-file paths.
+
+    Accepts any mix of:
+      - bare stems (`when-to-split-a-module`)
+      - filenames (`when-to-split-a-module.md`)
+      - guideline IDs (`rust/when-to-split-a-module.md`)
+      - absolute paths
+    Raises SystemExit with the first unresolvable entry so the caller can fix input.
+    """
+    style_files = list_style_files(project_root)
+    by_stem: dict[str, Path] = {p.stem: p for p in style_files}
+    by_name: dict[str, Path] = {p.name: p for p in style_files}
+    by_guideline_id: dict[str, Path] = {
+        normalize_guideline_id(str(p), project_root): p for p in style_files
+    }
+    resolved: list[Path] = []
+    seen: set[str] = set()
+    for raw in requested:
+        value = raw.strip()
+        if not value:
+            continue
+        candidates: list[Path | None] = [
+            by_guideline_id.get(value),
+            by_name.get(value),
+            by_stem.get(value),
+        ]
+        if value.endswith(".md"):
+            candidates.append(by_stem.get(value[:-3]))
+        else:
+            candidates.append(by_name.get(f"{value}.md"))
+        absolute = Path(value).expanduser()
+        if absolute.is_absolute() and absolute.exists():
+            candidates.append(absolute)
+        path = next((c for c in candidates if c is not None), None)
+        if path is None:
+            raise SystemExit(f"Could not resolve guideline: {raw}")
+        key = str(path.resolve())
+        if key in seen:
+            continue
+        seen.add(key)
+        resolved.append(path)
+    return resolved
+
+
+def focused_units(project_root: Path, requested: list[str]) -> list[Unit]:
+    """Build units for an explicit subset of guidelines — read-only, no state writes."""
+    targets = resolve_focus_targets(requested, project_root)
+    all_files = list_style_files(project_root)
+    return _build_units_from_files(targets, project_root, all_files)
 
 
 def review_counts(project_root: Path) -> dict[str, int]:
@@ -594,6 +638,17 @@ def parse_args() -> argparse.Namespace:
     phase = subparsers.add_parser("set-phase")
     phase.add_argument("--project", required=True)
     phase.add_argument("--phase", required=True)
+    focused = subparsers.add_parser(
+        "focused-eval",
+        help="Read-only: emit one JSON unit per requested guideline (no pending/history state).",
+    )
+    focused.add_argument("--project-root", required=True)
+    focused.add_argument(
+        "--guideline",
+        action="append",
+        required=True,
+        help="Guideline to include. Accepts stem, filename, or guideline id. Repeatable.",
+    )
     return parser.parse_args()
 
 
@@ -619,6 +674,20 @@ def main() -> None:
         return
     if args.command == "set-phase":
         set_phase(args.project, args.phase)
+        return
+    if args.command == "focused-eval":
+        project_root = Path(args.project_root).expanduser().resolve()
+        units = focused_units(project_root, list(args.guideline))
+        for unit in units:
+            print(json.dumps(
+                {
+                    "unit_id": unit.unit_id,
+                    "display_name": unit.display_name,
+                    "guideline_ids": list(unit.guideline_ids),
+                    "see_also_guideline_ids": list(unit.see_also_guideline_ids),
+                },
+                sort_keys=True,
+            ))
         return
     finalize_failure(args.project, args.reason)
 

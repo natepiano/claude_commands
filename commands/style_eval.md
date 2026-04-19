@@ -17,7 +17,7 @@ zsh ~/.claude/scripts/load-rust-style.sh --project-root "$ARGUMENTS"
 
 This loads the shared style guide plus any repo-local `docs/style/*.md` files, filtered for the project type.
 
-The output ends with a `=== STYLE_CHECKLIST ===` section listing every rule by number and name. Rules may be annotated with `[non-negotiable]` and/or `[group: name]`. This is your evaluation order — work through it sequentially.
+The output ends with a `=== STYLE_CHECKLIST ===` section listing every rule by number and name. Rules may be annotated with `[non-negotiable]`. This is your evaluation order — work through it sequentially.
 
 If you need exact style file paths for citations, run:
 
@@ -41,7 +41,7 @@ Rules:
 - `stop_reason=budget_reached` means you have reached 5 scored units
 - `stop_reason=exhausted` means there are no unseen eligible units left for this run
 - `non_negotiable_guideline_ids` are binding on every unit review and are returned every time
-- a group is still one selected unit, but you must review every guideline in the returned group before recording results
+- each unit is exactly one guideline file — its `unit_id` equals the `guideline_id`
 - `see_also_guideline_ids` on a unit lists additional guidelines whose content you must consult as context when reviewing this unit — do NOT record results for them (they are scored on their own separate review cycle)
 
 After reviewing a unit, you must record its result immediately with:
@@ -54,17 +54,13 @@ The results JSON must have this shape:
 
 ```json
 {
-  "unit_id": "group::module-splitting",
+  "unit_id": "rust/when-to-split-a-module.md",
   "results": [
     {
-      "guideline_id": "rust/module-splitting-1-when-to-split.md",
+      "guideline_id": "rust/when-to-split-a-module.md",
       "outcome": {
         "status": "no_findings"
       }
-    },
-    {
-      "guideline_id": "rust/module-splitting-2-anchor-types.md",
-      "finding_source": "new"
     }
   ]
 }
@@ -73,8 +69,7 @@ The results JSON must have this shape:
 Recording rules:
 - use `outcome.status = no_findings` when that guideline produced no finding
 - use `finding_source = new | carried_forward` when that guideline produced a finding to keep in `EVALUATION.md`
-- if any guideline in the returned unit produces a finding, that unit counts as `1`
-- if every guideline in the returned unit is `no_findings`, that unit counts as `0`
+- if the guideline produces a finding, the unit counts as `1`; otherwise it counts as `0`
 - do not review the next unit until the current unit has been recorded
 
 ## Step 2: Survey the project
@@ -109,11 +104,10 @@ Loop until the helper returns `status=complete`.
 
 For each returned unit:
 1. Read the full rule content for that selected unit
-2. Read every guideline in that unit if it is a group
-3. Read the content of any `see_also_guideline_ids` on the unit as review context — apply the selected unit's rule, informed by that context, but do not record findings against the see_also'd guidelines (they get their own review cycle)
-4. Re-read the returned `non_negotiable_guideline_ids` and treat them as binding for this unit
-5. Check the relevant codebase for violations of that selected unit
-5. For each guideline in the unit:
+2. Read the content of any `see_also_guideline_ids` on the unit as review context — apply the selected unit's rule, informed by that context, but do not record findings against the see_also'd guidelines (they get their own review cycle)
+3. Re-read the returned `non_negotiable_guideline_ids` and treat them as binding for this unit
+4. Check the relevant codebase for violations of that selected unit
+5. Record the result for the unit's single guideline:
    - if it has no issue, record `outcome.status = no_findings`
    - if it has an issue that is still valid from Step 3, keep it and record `finding_source = carried_forward`
    - if it has a genuinely new issue, record `finding_source = new`
@@ -126,7 +120,6 @@ Important:
 - do not stop after 5 helper calls
 - keep pulling units until the helper says `budget_reached` or `exhausted`
 - `no_findings` units do not consume the 5-unit scored budget
-- groups must be fully reviewed before being recorded
 
 ## Step 5: Write EVALUATION.md
 

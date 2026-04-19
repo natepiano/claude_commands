@@ -86,6 +86,84 @@ def replace_wikilinks_for_delete(text: str, stem: str) -> str:
     return text
 
 
+def resolve_source_name(name: str) -> str:
+    """Resolve a style filename, auto-appending .md if missing and that file exists."""
+    as_given = RUST_STYLE_DIR / name
+    if as_given.exists():
+        return name
+    if not name.endswith(".md"):
+        with_suffix = f"{name}.md"
+        if (RUST_STYLE_DIR / with_suffix).exists():
+            return with_suffix
+    raise SystemExit(f"Source style file not found: {name}")
+
+
+def ensure_md_suffix(name: str) -> str:
+    """Append .md to a target name if it isn't already there."""
+    return name if name.endswith(".md") else f"{name}.md"
+
+
+def strip_frontmatter_see_also(text: str, stem: str) -> tuple[str, int]:
+    """Remove `see_also` references to `stem` from the frontmatter only.
+    Handles both single-value (`see_also: "[[stem]]"`) and list-item
+    (`  - "[[stem]]"`) forms. Returns (new_text, references_removed).
+    Body content is not touched — callers do that separately."""
+    if not text.startswith("---"):
+        return text, 0
+    # Split into [pre-fm, frontmatter, rest]
+    parts = text.split("---\n", 2)
+    if len(parts) < 3:
+        return text, 0
+    _, frontmatter, rest = parts
+
+    single_re = re.compile(
+        rf'^see_also:\s*"?\[\[{re.escape(stem)}(\|[^\]]+)?\]\]"?\s*$'
+    )
+    list_item_re = re.compile(
+        rf'^\s*-\s*"?\[\[{re.escape(stem)}(\|[^\]]+)?\]\]"?\s*$'
+    )
+    key_re = re.compile(r"^[a-z_]+:")
+
+    removed = 0
+    new_lines: list[str] = []
+    in_see_also_list = False
+    for line in frontmatter.splitlines():
+        if single_re.match(line):
+            removed += 1
+            in_see_also_list = False
+            continue
+        if in_see_also_list and list_item_re.match(line):
+            removed += 1
+            continue
+        if re.match(r"^see_also:\s*$", line):
+            in_see_also_list = True
+        elif key_re.match(line):
+            in_see_also_list = False
+        new_lines.append(line)
+
+    if removed == 0:
+        return text, 0
+    new_frontmatter = "\n".join(new_lines)
+    if not new_frontmatter.endswith("\n"):
+        new_frontmatter += "\n"
+    new_text = f"---\n{new_frontmatter}---\n{rest}"
+    return new_text, removed
+
+
+def remove_see_also_references(stem: str) -> tuple[int, int]:
+    """Strip see_also references to `stem` from every style file's frontmatter."""
+    files_updated = 0
+    references_removed = 0
+    for path in sorted(NATE_STYLE_DIR.rglob("*.md")):
+        original = path.read_text()
+        rewritten, removed = strip_frontmatter_see_also(original, stem)
+        if removed:
+            path.write_text(rewritten)
+            files_updated += 1
+            references_removed += removed
+    return files_updated, references_removed
+
+
 def load_jsonl(path: Path) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     for line in path.read_text().splitlines():
@@ -337,10 +415,10 @@ def regenerate_report() -> None:
 
 
 def run_rename(old_name: str, new_name: str) -> None:
+    old_name = resolve_source_name(old_name)
+    new_name = ensure_md_suffix(new_name)
     source = RUST_STYLE_DIR / old_name
     target = RUST_STYLE_DIR / new_name
-    if not source.exists():
-        raise SystemExit(f"Source style file not found: {old_name}")
     if target.exists():
         raise SystemExit(f"Target style file already exists: {new_name}")
 
@@ -356,19 +434,21 @@ def run_rename(old_name: str, new_name: str) -> None:
     print(f".history files updated: {history_files}")
     print(f".history entries updated: {entries_updated}")
     print(f"EVALUATION.md files updated: {evaluation_files}")
-    print(f"Obsidian files updated: {wikilink_files}")
+    print(f"Obsidian files updated: {wikilink_files} (covers see_also frontmatter)")
 
 
 def run_delete(style_name: str) -> None:
+    style_name = resolve_source_name(style_name)
     source = RUST_STYLE_DIR / style_name
-    if not source.exists():
-        raise SystemExit(f"Style file not found: {style_name}")
 
     guideline_id = f"rust/{style_name}"
+    stem = Path(style_name).stem
+    see_also_files, see_also_refs = remove_see_also_references(stem)
+
     source.unlink()
     history_files, entries_removed, runs_removed = update_history_for_delete(guideline_id)
     evaluation_files = update_evaluations_for_delete(guideline_id)
-    wikilink_files = update_markdown_wikilinks_for_delete(Path(style_name).stem)
+    wikilink_files = update_markdown_wikilinks_for_delete(stem)
     regenerate_report()
 
     print(f"Deleted: {style_name}")
@@ -376,6 +456,7 @@ def run_delete(style_name: str) -> None:
     print(f".history entries removed: {entries_removed}")
     print(f"Run records removed: {runs_removed}")
     print(f"EVALUATION.md files updated: {evaluation_files}")
+    print(f"see_also frontmatter cleaned: {see_also_files} file(s), {see_also_refs} reference(s)")
     print(f"Obsidian files updated: {wikilink_files}")
 
 

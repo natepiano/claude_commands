@@ -62,9 +62,7 @@ def guideline_metadata(project: str) -> dict[str, dict[str, Any]]:
         guideline_id = normalize_guideline_id(str(style_file), project_root)
         frontmatter = parse_frontmatter(style_file)
         tags = frontmatter["tags"] if isinstance(frontmatter["tags"], list) else []
-        group = str(frontmatter["group"]) if frontmatter.get("group") else ""
         metadata[guideline_id] = {
-            "group": group or None,
             "non_negotiable": "non-negotiable" in tags,
         }
     return metadata
@@ -207,7 +205,6 @@ def build_run_views(rows: list[tuple[str, dict[str, Any]]]) -> list[dict[str, An
             if not isinstance(reviewed_units, list):
                 continue
             detailed_units: list[dict[str, Any]] = []
-            group_keys: set[str] = set()
             status_counts: dict[str, int] = defaultdict(int)
             findings_produced = 0
             for reviewed in reviewed_units:
@@ -219,16 +216,12 @@ def build_run_views(rows: list[tuple[str, dict[str, Any]]]) -> list[dict[str, An
                     continue
                 status = str(outcome.get("status", "unknown"))
                 meta = metadata.get(guideline_id, {})
-                group = meta.get("group")
                 non_negotiable = bool(meta.get("non_negotiable"))
-                group_key = f"group:{group}" if group else f"guideline:{guideline_id}"
-                group_keys.add(group_key)
                 status_counts[status] += 1
                 if status != "no_findings":
                     findings_produced += 1
                 detailed_units.append({
                     "guideline_id": guideline_id,
-                    "group": group,
                     "non_negotiable": non_negotiable,
                     "status": status,
                     "finding_source": outcome.get("finding_source"),
@@ -239,7 +232,7 @@ def build_run_views(rows: list[tuple[str, dict[str, Any]]]) -> list[dict[str, An
                 "project": project,
                 "start_time": row.get("start_time"),
                 "end_time": row.get("end_time"),
-                "selected_unit_count": len(group_keys),
+                "selected_unit_count": len(detailed_units),
                 "reviewed_guideline_count": len(detailed_units),
                 "findings_produced": findings_produced,
                 "status_counts": dict(status_counts),
@@ -304,8 +297,6 @@ def print_run_views(run_views: list[dict[str, Any]]) -> None:
             print(f"  outcomes: {rendered_counts}")
         for unit in run["units"]:
             extras: list[str] = []
-            if unit.get("group"):
-                extras.append(f"group={unit['group']}")
             if unit.get("non_negotiable"):
                 extras.append("non_negotiable")
             if unit.get("finding_source"):
