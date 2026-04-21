@@ -20,7 +20,9 @@ If user input doesn't match, display error and re-ask.
 
 **STEP 2: Validation**
 
-Run `bash ~/.claude/scripts/merge_from_branch/validate.sh ${SOURCE_BRANCH}`
+Run `bash ~/.claude/scripts/merge_from_branch/validate.sh ${SOURCE_BRANCH}` with `dangerouslyDisableSandbox: true`.
+
+This script performs a real `git merge --no-commit --no-ff` followed by `git merge --abort` to test feasibility. The sandbox blocks git from writing `.git/*.lock` files mid-merge, which leaves the working tree in a half-merged state with untracked files that `git merge --abort` cannot clean up. Always disable the sandbox for this call.
 
 - If `status` is `"error"`, report the message and STOP
 - If `current_behind_remote` is `true`, STOP and ask user if they want to pull first
@@ -28,6 +30,6 @@ Run `bash ~/.claude/scripts/merge_from_branch/validate.sh ${SOURCE_BRANCH}`
 
 **STEP 3: Merge**
 
-Run `git merge ${SOURCE_BRANCH} -m "Merge branch '${SOURCE_BRANCH}'"`
+Run `git merge ${SOURCE_BRANCH} -m "Merge branch '${SOURCE_BRANCH}'"` with `dangerouslyDisableSandbox: true` (merging writes under `.git` and will fail in the sandbox the same way validation does).
 
 Report success to user.

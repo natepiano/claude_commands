@@ -50,13 +50,13 @@
       "Read(/private/tmp*)",
       "Write(//tmp/claude/**)"
     ],
+    "defaultMode": "auto",
     "additionalDirectories": [
       "/Users/natemccoy/Library",
       "/Users/natemccoy/rust",
       "/tmp",
       "/tmp/claude/"
-    ],
-    "defaultMode": "auto"
+    ]
   },
   "hooks": {
     "SessionStart": [
@@ -133,12 +133,12 @@
     ]
   },
   "alwaysThinkingEnabled": true,
-  "effortLevel": "xhigh",
+  "effortLevel": "medium",
   "skipDangerousModePermissionPrompt": true,
+  "skipAutoPermissionPrompt": true,
   "voiceEnabled": true,
   "feedbackSurveyState": {
     "lastShownTime": 1754090074729
   },
-  "teammateMode": "tmux",
-  "skipAutoPermissionPrompt": true
+  "teammateMode": "tmux"
 }
