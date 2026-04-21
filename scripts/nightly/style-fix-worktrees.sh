@@ -457,3 +457,11 @@ rm -rf "$RUN_DIR"
 python3 "$SCRIPT_DIR/style_report.py" --generate 2>&1 || {
     echo "WARNING: failed to generate style reports"
 }
+
+# Commit the nightly history + report in ~/rust/nate_style only when every
+# worktree fix succeeded. On any failure, leave nate_style dirty for review.
+if (( failed == 0 )); then
+    "$SCRIPT_DIR/commit-style-results.sh" 2>&1 || echo "WARNING: commit-style-results.sh failed"
+else
+    echo "SKIP commit-style-results: $failed worktree run(s) failed; leaving nate_style dirty for review"
+fi
