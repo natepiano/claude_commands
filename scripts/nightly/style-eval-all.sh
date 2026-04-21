@@ -127,9 +127,20 @@ pids=()
 names=()
 for proj in "${projects[@]}"; do
     project_root="${RUST_DIR}/${proj}"
+
+    existing_findings=0
+    if [[ -f "$project_root/EVALUATION.md" ]]; then
+        existing_findings=$(grep -c '^### [0-9]' "$project_root/EVALUATION.md" 2>/dev/null || true)
+    fi
+    if [[ "$existing_findings" -ge "$MAX_NEW_FINDINGS" ]]; then
+        echo "SKIP: $proj (already at cap of $MAX_NEW_FINDINGS findings)"
+        continue
+    fi
+    effective_budget=$((MAX_NEW_FINDINGS - existing_findings))
+
     python3 "$HISTORY_HELPER" start-run \
         --project-root "$project_root" \
-        --budget "$MAX_NEW_FINDINGS" || {
+        --budget "$effective_budget" || {
         echo "FAILED: $proj (could not start pending run)"
         continue
     }
