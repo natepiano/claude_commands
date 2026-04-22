@@ -405,8 +405,19 @@ Run: cargo mend $cargo_scope_flag --all-targets --manifest-path $worktree_dir/Ca
 - If mend reports only unfixable items, note them and continue.
 
 Step 5: Run clippy and fix any issues
-Run: cargo clippy $cargo_scope_flag --all-targets --all-features --manifest-path $worktree_dir/Cargo.toml -- -D warnings
-If clippy reports errors or warnings, fix them. Include any unfixable mend items from Step 4.
+Step 5a (preview): Run: cargo clippy $cargo_scope_flag --all-targets --all-features --manifest-path $worktree_dir/Cargo.toml -- -D warnings
+- Capture the list of warnings/errors reported. This is the baseline of what clippy sees.
+- If clippy reports nothing, skip to Step 6.
+- If clippy fails for infrastructure reasons (missing toolchain, compile error unrelated to lints), report the error and skip to Step 6.
+
+Step 5b (auto-fix): If Step 5a reported any fixable items, run: cargo clippy --fix $cargo_scope_flag --all-targets --all-features --allow-dirty --manifest-path $worktree_dir/Cargo.toml -- -D warnings
+- This auto-applies every fix clippy can make on its own. Do NOT manually fix anything clippy could have auto-fixed.
+- If --fix fails, report the error and fall through to Step 5c to handle remaining items manually.
+
+Step 5c (verify + manual): Re-run: cargo clippy $cargo_scope_flag --all-targets --all-features --manifest-path $worktree_dir/Cargo.toml -- -D warnings
+- Anything still reported after 5b is either unfixable by clippy or a fix that conflicts with style. Manually fix those now.
+- Include any unfixable mend items from Step 4 in this manual pass.
+- After fixing, re-run clippy one more time to confirm clean; only spend evaluation effort on items that actually remain.
 
 Step 6: Run tests and fix any failures
 Run: cargo nextest run $cargo_scope_flag --manifest-path $worktree_dir/Cargo.toml
@@ -448,6 +459,12 @@ If cargo mend --fix was run in Step 4 and made any changes, summarize them here:
 - List the files modified by cargo mend
 - Describe the types of changes (e.g., "narrowed pub to pub(crate)", "shortened import paths")
 - If cargo mend was skipped or found nothing to fix, say so explicitly
+
+### Clippy Changes
+Summarize Step 5:
+- **Preview (5a):** count and types of warnings/errors clippy reported, or "clean"
+- **Auto-fix (5b):** files modified by `cargo clippy --fix` and the categories of fixes applied, or "not run" if 5a was clean
+- **Manual (5c):** anything that remained after --fix and had to be hand-fixed (or that was left unfixed because the suggested fix conflicts with a style rule — explain)
 
 ### Build Status
 - **clippy:** pass | fail (with summary of remaining warnings/errors if fail)
