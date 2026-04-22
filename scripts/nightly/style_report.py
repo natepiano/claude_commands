@@ -12,7 +12,7 @@ from datetime import timezone
 from pathlib import Path
 from typing import Any
 
-from style_history import HISTORY_DIR, RUST_DIR, build_units, list_style_files, normalize_guideline_id, parse_frontmatter
+from style_history import HISTORY_DIR, RUST_DIR, build_units, list_style_files, normalize_guideline_id, parse_frontmatter, resolve_project_root
 
 REPORT_FILE = RUST_DIR / "nate_style" / "style_report.md"
 
@@ -50,8 +50,8 @@ def list_projects() -> list[str]:
 
 
 def guideline_metadata(project: str) -> dict[str, dict[str, Any]]:
-    project_root = RUST_DIR / project
-    if not project_root.exists():
+    project_root = resolve_project_root(project)
+    if project_root is None:
         return {}
     metadata: dict[str, dict[str, Any]] = {}
     try:
@@ -126,8 +126,8 @@ def build_coverage_view(project_filter: str | None) -> list[dict[str, Any]]:
     for project in list_projects():
         if project_filter and project != project_filter:
             continue
-        project_root = RUST_DIR / project
-        if not project_root.exists():
+        project_root = resolve_project_root(project)
+        if project_root is None:
             continue
         counts: dict[str, int] = defaultdict(int)
         for row in load_project_history(project):

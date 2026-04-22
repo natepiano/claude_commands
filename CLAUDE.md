@@ -96,3 +96,9 @@ if you need something renamed such as a type or a function or whatever, the user
 - **ALWAYS** use `dangerouslyDisableSandbox: true` when running `taplo` directly (e.g. `taplo fmt` for auto-fixing)
 - taplo panics in the sandbox due to macOS Mach IPC restrictions (`SCDynamicStoreCreate`)
 - `excludedCommands` does NOT help — it only bypasses filesystem restrictions, not Mach IPC
+
+### codex and nightly style scripts must run unsandboxed
+- **ALWAYS** use `dangerouslyDisableSandbox: true` when invoking `codex` directly or any script that launches codex: `style-eval-all.sh`, `style-fix-worktrees.sh`, `nightly-rust-clean-build.sh`
+- codex requires write access to `~/.codex/sessions` which the sandbox blocks (`Operation not permitted (os error 1)`)
+- `excludedCommands` does NOT help — codex needs filesystem access outside the sandbox's allowlist
+- The nightly launchd job runs outside Claude Code entirely, so no changes to the scripts themselves are needed; this rule only affects how to invoke them during testing from a Claude Code session

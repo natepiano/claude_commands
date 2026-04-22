@@ -94,7 +94,11 @@ Carry forward any still-valid findings — they do not count against the limit o
 
 ## Step 3.5: Exclude findings already being fixed in a worktree
 
-Derive the worktree evaluation path: take the project directory name, append `_style_fix`, and check for `EVALUATION.md` there. For example, if `$ARGUMENTS` is `~/rust/my_project`, check `~/rust/my_project_style_fix/EVALUATION.md`.
+The worktree evaluation path for this project is: `$WORKTREE_EVAL_PATH`
+
+If the line above shows a real filesystem path, check whether that file exists.
+
+If the line above shows the literal string `$WORKTREE_EVAL_PATH` (i.e. no substitution was made, because this command was invoked directly rather than via the nightly), derive the path instead: take the project directory name, append `_style_fix`, and check for `EVALUATION.md` there. For example, if `$ARGUMENTS` is `~/rust/my_project`, check `~/rust/my_project_style_fix/EVALUATION.md`.
 
 If that file exists, read it. These findings are already being addressed in a style-fix branch. When evaluating in Step 4, **do not re-discover** any finding that matches a worktree finding by title or by the same style rule applied to the same files. This prevents duplicate work between the primary evaluation and the in-progress worktree fixes.
 

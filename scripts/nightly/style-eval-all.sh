@@ -6,6 +6,10 @@
 # Usage: style-eval-all.sh [project_name]
 #   If project_name is given, only evaluate that single project.
 #   If omitted, evaluate all eligible projects under ~/rust/.
+#
+# Projects come from two sources:
+#   1. Standalone repos under ~/rust/*/ (traditional)
+#   2. [workspace_members] in nightly-rust.conf (members of a cargo workspace)
 
 set -euo pipefail
 
@@ -23,9 +27,14 @@ STYLE_AGENT_MODE="claude"
 
 mkdir -p "$LOG_DIR"
 
-# Parse conf file for excludes and settings
+# Parse conf file for excludes, settings, and workspace members.
+# Workspace-member entries are stored in three parallel arrays indexed by position.
 excludes=()
 MAX_NEW_FINDINGS=5
+ws_names=()   # project_name
+ws_paths=()   # workspace_dir/subpath
+ws_pkgs=()    # package_name
+
 if [[ -f "$CONF_FILE" ]]; then
     current_section=""
     while IFS= read -r line || [[ -n "$line" ]]; do
@@ -51,6 +60,30 @@ if [[ -f "$CONF_FILE" ]]; then
                 fi
                 if [[ "$stripped" =~ ^max_new_findings=([0-9]+)$ ]]; then
                     MAX_NEW_FINDINGS="${BASH_REMATCH[1]}"
+                fi
+                ;;
+            workspace_members)
+                if [[ "$stripped" =~ ^([^=]+)=(.+)$ ]]; then
+                    wm_name="${BASH_REMATCH[1]}"
+                    wm_rhs="${BASH_REMATCH[2]}"
+                    wm_name="${wm_name## }"
+                    wm_name="${wm_name%% }"
+                    wm_rhs="${wm_rhs## }"
+                    wm_rhs="${wm_rhs%% }"
+                    if [[ "$wm_rhs" == *":"* ]]; then
+                        wm_path="${wm_rhs%%:*}"
+                        wm_pkg="${wm_rhs#*:}"
+                    else
+                        wm_path="$wm_rhs"
+                        wm_pkg=""
+                    fi
+                    wm_path="${wm_path%/}"
+                    if [[ -z "$wm_pkg" ]]; then
+                        wm_pkg="${wm_path##*/}"
+                    fi
+                    ws_names+=("$wm_name")
+                    ws_paths+=("$wm_path")
+                    ws_pkgs+=("$wm_pkg")
                 fi
                 ;;
         esac
@@ -90,15 +123,21 @@ if [[ "$STYLE_AGENT_MODE" == "off" ]]; then
     exit 0
 fi
 
-# Build project list
+# Build project list. Parallel arrays indexed by position:
+#   projects[i]             -- project name
+#   project_roots[i]        -- absolute path to project root (for $ARGUMENTS)
+#   project_worktree_evals[i] -- EVALUATION.md path inside the style-fix worktree
 projects=()
+project_roots=()
+project_worktree_evals=()
+
+# Pass 1: standalone projects from directory scan
 for project_dir in "$RUST_DIR"/*/; do
     name=$(basename "$project_dir")
     [[ ! -f "$project_dir/Cargo.toml" ]] && continue
     [[ "$name" == *_style_fix ]] && continue
     [[ -f "$project_dir/.git" ]] && continue
 
-    # If single project specified, skip all others
     if [[ -n "$SINGLE_PROJECT" && "$name" != "$SINGLE_PROJECT" ]]; then
         continue
     fi
@@ -113,6 +152,30 @@ for project_dir in "$RUST_DIR"/*/; do
     $skip && continue
 
     projects+=("$name")
+    project_roots+=("${RUST_DIR}/${name}")
+    project_worktree_evals+=("${RUST_DIR}/${name}_style_fix/EVALUATION.md")
+done
+
+# Pass 2: workspace members from conf
+for i in "${!ws_names[@]}"; do
+    name="${ws_names[$i]}"
+    if [[ -n "$SINGLE_PROJECT" && "$name" != "$SINGLE_PROJECT" ]]; then
+        continue
+    fi
+    wm_path="${ws_paths[$i]}"
+    member_root="${RUST_DIR}/${wm_path}"
+    if [[ ! -d "$member_root" ]]; then
+        echo "SKIP: $name (member path not found: $member_root)"
+        continue
+    fi
+    if [[ ! -f "$member_root/Cargo.toml" ]]; then
+        echo "SKIP: $name (no Cargo.toml at $member_root)"
+        continue
+    fi
+    subpath="${wm_path#*/}"
+    projects+=("$name")
+    project_roots+=("$member_root")
+    project_worktree_evals+=("${RUST_DIR}/${name}_style_fix/${subpath}/EVALUATION.md")
 done
 
 if [[ ${#projects[@]} -eq 0 ]]; then
@@ -122,11 +185,15 @@ fi
 
 echo "=== Style evaluation: ${#projects[@]} projects ==="
 
-# Launch all evaluations in parallel
+# Launch all evaluations in parallel.
+# Use parallel arrays for the wait loop.
 pids=()
 names=()
-for proj in "${projects[@]}"; do
-    project_root="${RUST_DIR}/${proj}"
+roots_for_wait=()
+for i in "${!projects[@]}"; do
+    proj="${projects[$i]}"
+    project_root="${project_roots[$i]}"
+    worktree_eval="${project_worktree_evals[$i]}"
 
     existing_findings=0
     if [[ -f "$project_root/EVALUATION.md" ]]; then
@@ -148,11 +215,13 @@ for proj in "${projects[@]}"; do
     prompt="$(
         sed \
             -e "s|\$ARGUMENTS|$project_root|g" \
+            -e "s|\$WORKTREE_EVAL_PATH|$worktree_eval|g" \
             "$CMD_FILE"
     )"
     run_style_agent "$project_root" "$prompt" "$LOG_DIR/style_eval_${proj}.log" &
     pids+=($!)
     names+=("$proj")
+    roots_for_wait+=("$project_root")
     echo "Launched: $proj via $STYLE_AGENT_MODE (PID $!)"
 done
 
@@ -165,8 +234,9 @@ succeeded=0
 idx=0
 for pid in "${pids[@]}"; do
     name="${names[$idx]}"
+    project_root="${roots_for_wait[$idx]}"
     wait "$pid" && code=0 || code=$?
-    if [[ ! -f "$RUST_DIR/$name/EVALUATION.md" ]]; then
+    if [[ ! -f "$project_root/EVALUATION.md" ]]; then
         if [[ $code -ne 0 ]]; then
             echo "FAILED: $name (exit $code, no EVALUATION.md produced)"
         else
@@ -181,7 +251,7 @@ for pid in "${pids[@]}"; do
     if [[ $code -ne 0 ]]; then
         echo "WARN: $name (exit $code, but EVALUATION.md was produced)"
     fi
-    if [[ $(grep -c '^### [0-9]' "$RUST_DIR/$name/EVALUATION.md" || true) -eq 0 ]]; then
+    if [[ $(grep -c '^### [0-9]' "$project_root/EVALUATION.md" || true) -eq 0 ]]; then
         python3 "$HISTORY_HELPER" finalize-no-findings --project "$name" || {
             echo "FAILED: $name (could not finalize no-findings history)"
             failed=$((failed + 1))
@@ -189,7 +259,7 @@ for pid in "${pids[@]}"; do
             continue
         }
     fi
-    lines=$(wc -l < "$RUST_DIR/$name/EVALUATION.md")
+    lines=$(wc -l < "$project_root/EVALUATION.md")
     echo "OK: $name ($lines lines)"
     succeeded=$((succeeded + 1))
     idx=$((idx + 1))

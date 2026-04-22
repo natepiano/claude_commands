@@ -155,6 +155,59 @@ def excluded_projects() -> set[str]:
     return excluded
 
 
+@dataclass(frozen=True)
+class WorkspaceMember:
+    workspace_dir: str
+    member_subpath: str
+    package_name: str
+
+
+def workspace_members() -> dict[str, WorkspaceMember]:
+    if not NIGHTLY_CONF_FILE.exists():
+        return {}
+    members: dict[str, WorkspaceMember] = {}
+    current_section = ""
+    for raw_line in NIGHTLY_CONF_FILE.read_text().splitlines():
+        stripped = raw_line.split("#", 1)[0].strip()
+        if not stripped:
+            continue
+        if stripped.startswith("[") and stripped.endswith("]"):
+            current_section = stripped[1:-1]
+            continue
+        if current_section != "workspace_members" or "=" not in stripped:
+            continue
+        name, _, rhs = stripped.partition("=")
+        name = name.strip()
+        rhs = rhs.strip()
+        if not name or not rhs:
+            continue
+        path_part, _, pkg_part = rhs.partition(":")
+        path_part = path_part.strip().strip("/")
+        pkg_part = pkg_part.strip()
+        if "/" not in path_part:
+            continue
+        ws_dir, _, subpath = path_part.partition("/")
+        if not ws_dir or not subpath:
+            continue
+        package_name = pkg_part if pkg_part else Path(subpath).name
+        members[name] = WorkspaceMember(
+            workspace_dir=ws_dir,
+            member_subpath=subpath,
+            package_name=package_name,
+        )
+    return members
+
+
+def resolve_project_root(project_name: str) -> Path | None:
+    members = workspace_members()
+    if project_name in members:
+        m = members[project_name]
+        path = RUST_DIR / m.workspace_dir / m.member_subpath
+        return path if path.exists() else None
+    default = RUST_DIR / project_name
+    return default if default.exists() else None
+
+
 def eligible_project_roots() -> list[Path]:
     excluded = excluded_projects()
     return sorted(
