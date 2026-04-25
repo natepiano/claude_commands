@@ -240,8 +240,8 @@ For each finding, output a compact block with these parts. Keep the whole thing 
      ```
    - **Prose form** — use for file moves, splits, deletions, or renames of whole files. Pattern: `` `old/path.rs` → `new/path.rs` `` with a one-clause description of why. Never write "X was renamed to Y" without paths.
 4. **Assessment** — a single line or short sentence: applied / correct / complete, and one phrase citing the style rule.
-5. **Concerns** — bullet list only if there are any. Each bullet: the concern + the evidence (diff snippet, style-guide phrase) that raised it. Say "speculative" if it is.
-6. **New allows** — one line. `None.` if none.
+5. **Implications** — bullet list only if there is a non-actionable consequence the user should genuinely benefit from knowing (e.g. "this rename narrows the public API surface — downstream callers in <crate> will need to be updated separately"). High bar: if you would not raise it spontaneously in conversation, do not write it. Omit the section entirely when empty. Never use this section as a softer home for passed checks.
+6. **Concerns** — bullet list only if there are items that need the user's attention. Each bullet: the concern + the evidence (diff snippet, style-guide phrase) that raised it. Say "speculative" if it is. Any newly added `#[allow(...)]`, `#![allow(...)]`, or `Cargo.toml` lint set to `"allow"` introduced by this finding's fix MUST appear here as its own bullet (not in a separate section) — name the lint, the file:line, and what should be done about it. **Do not list passed checks here.** If a check passed, the user does not need to see it — silence is the signal that something was done well. If you find yourself writing a bullet that ends in "OK", "good fit", "correct", or any other affirmation, delete it. Resolved checks belong in your own reasoning, not the review output. If there are no real concerns and no new allows, omit the section entirely.
 
 Then **stop the response**. Do not preview the next finding. Do not list upcoming findings. Do not write an end-of-review summary.
 
