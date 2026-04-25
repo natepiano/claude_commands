@@ -56,6 +56,27 @@ This skill is a strictly sequential walkthrough. After the initial header output
 - If the remaining findings look mechanical, trivial, or redundant — still output them one at a time. The user is pacing the review, not you.
 - This rule overrides any instinct toward "efficiency" or "wrapping up."
 
+## Hard rule: the last finding stops like every other finding
+
+The final finding is **not special**. It gets the same treatment as every other finding: walkthrough, then stop. No end-of-review summary, no recap table, no "all 5 findings have been walked," no follow-up task list, no "want me to do anything before you commit?" — *nothing* in the same response as Finding N's walkthrough.
+
+The model's instinct will be to "wrap up" because there are no more findings. Resist it. The user has just spent N turns reading findings one at a time, deliberately pacing the review. Appending a summary in the same response as the last finding scrolls the last finding off-screen and dumps cognitive load on top of fresh content — exactly the failure mode the one-finding-per-response rule exists to prevent.
+
+After the last finding's walkthrough, end with **one short closing line** that explicitly asks whether the user wants the end-of-review summary:
+
+> *"That's the last finding. Want the end-of-review summary, or are we done?"*
+
+Then stop. Do not produce the summary in the same response under any circumstances. The summary appears only in the *next* response, and only if the user asks for it.
+
+This rule applies regardless of:
+- whether `auto mode` is active
+- whether previous findings looked similar to this one
+- whether the user said "continue" with no further instruction
+- whether the changes were trivial
+- whether you feel the wrap-up would be brief
+
+If you find yourself starting to write "End of review" or a recap table in the same turn as Finding N, stop, delete it, and replace it with the closing question above.
+
 ## Hard rule: read the governing style file before every fix proposal
 
 Every fix proposal must be preceded by reading the governing style file and quoting its prescription. Do not brainstorm options when the style guide has already ruled on the case.
@@ -240,14 +261,31 @@ For each finding, output a compact block with these parts. Keep the whole thing 
      ```
    - **Prose form** — use for file moves, splits, deletions, or renames of whole files. Pattern: `` `old/path.rs` → `new/path.rs` `` with a one-clause description of why. Never write "X was renamed to Y" without paths.
 4. **Assessment** — a single line or short sentence: applied / correct / complete, and one phrase citing the style rule.
-5. **Implications** — bullet list only if there is a non-actionable consequence the user should genuinely benefit from knowing (e.g. "this rename narrows the public API surface — downstream callers in <crate> will need to be updated separately"). High bar: if you would not raise it spontaneously in conversation, do not write it. Omit the section entirely when empty. Never use this section as a softer home for passed checks.
+5. **Implications** — bullet list only when the fix has a downstream consequence the user should weigh, even if no immediate action is required. An implication is something that may shape a *decision* the user makes next: a tradeoff, a precedent set, a knock-on effect on callers, a constraint added to future work. The user reading the bullet should be able to think "ah, that's a thing I now have to consider" — not "yes, the rule was followed." High bar: if it is just restating that a rule was satisfied, drop it. Omit the section entirely when empty. Never use this section as a softer home for passed checks.
 6. **Concerns** — bullet list only if there are items that need the user's attention. Each bullet: the concern + the evidence (diff snippet, style-guide phrase) that raised it. Say "speculative" if it is. Any newly added `#[allow(...)]`, `#![allow(...)]`, or `Cargo.toml` lint set to `"allow"` introduced by this finding's fix MUST appear here as its own bullet (not in a separate section) — name the lint, the file:line, and what should be done about it. **Do not list passed checks here.** If a check passed, the user does not need to see it — silence is the signal that something was done well. If you find yourself writing a bullet that ends in "OK", "good fit", "correct", or any other affirmation, delete it. Resolved checks belong in your own reasoning, not the review output. If there are no real concerns and no new allows, omit the section entirely.
+
+### Voice and audience for Implications, Concerns, and Assessment
+
+The reader is a working engineer who has read EVALUATION.md once, has not re-read the style guide today, and is not deep in the diff right now. Write for that reader.
+
+- **Plain language over guide-jargon.** If a bullet uses internal style-guide vocabulary ("anchor type," "domain cohort," "behavior owner," "anchor-named module," "dictionary file") without translating, rewrite it in domain words from this codebase. Example — replace *"`mutability.rs` is a domain-cohort module rather than an anchor-type module"* with *"`mutability.rs` holds three small types (`Mutability`, `MutabilityIssue`, `MutabilityIssueTarget`) instead of one — fine for now, but if a fourth unrelated type lands here, it has slid back into a junk drawer."* The second sentence tells the reader something they can act on; the first only labels what's there.
+- **Lead with what the user can do or decide.** Concerns must be actionable: name the file:line, what's wrong, and the proposed fix. Implications must inform a *decision* the user might make next — a tradeoff, a precedent, a constraint on future work, a knock-on effect on callers. If a bullet does not change behavior or shape a decision, drop it.
+- **One-pass readability test.** Before submitting any bullet, ask: would the reader, on first read, know what was changed and why this bullet is in front of them? If they would have to re-read the style guide or scroll back to the diff to parse it, rewrite it.
+- **Never use the rule's name as the answer.** "The style file allows this" or "the rule's fallback applies" is not informative. State what was specifically done and what it costs or implies — concretely, in this codebase's vocabulary.
+- **Anti-patterns to delete on sight:**
+  - Bullets that end in an affirmation ("OK," "good fit," "correct," "this is fine"). These are passed checks; silence is the signal.
+  - Bullets that label the kind of module/type/pattern without saying what follows from that label.
+  - Speculative future-proofing ("if X happens later, watch out") without a current trigger in the diff. If it is genuinely worth flagging, tie it to something the user is deciding *now*.
+
+Apply this voice to **Assessment** as well — keep it to a sentence a non-immersed reader can parse on first pass.
 
 Then **stop the response**. Do not preview the next finding. Do not list upcoming findings. Do not write an end-of-review summary.
 
 The user may have corrections, questions, or want you to fix something before proceeding. If a finding is incomplete, incorrect, or otherwise needs follow-up changes, explicitly ask whether the user wants to fix it now or wait until the end of the review before continuing.
 
 When the user's next message arrives, produce exactly one finding walkthrough — the next numbered one — and stop again. Repeat until the user has seen every finding individually.
+
+**On the last finding** — see the "Hard rule: the last finding stops like every other finding" section above. The walkthrough still ends with stop; the only addition is a single closing question asking whether the user wants the end-of-review summary. Do **not** produce the summary in that turn. Wait for the user to ask.
 
 **Rules:**
 - Do NOT make any changes — this is a read-only review
