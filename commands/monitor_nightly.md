@@ -72,7 +72,7 @@ After Monitor returns its task id, tell the user: `Monitor armed (task <id>). I 
 Single alternation covering every meaningful state-transition line across all phases. Lines matching this regex are the events the user wants to know about; everything else is noise.
 
 ```
-^(CLEAN|BUILD|MEND|DONE|ERROR|WARNING|TIMEOUT|RETRY|RETRY OK|RETRY FAILED|FAILED|WARN|OK):|^WARMUP (OK|FAIL|SKIP):|^Launched: |^=== |^SKIP commit-style-results
+^(CLEAN|BUILD|MEND|DONE|ERROR|WARNING|TIMEOUT|RETRY|RETRY OK|RETRY FAILED|FAILED|WARN|OK):|^WARMUP (OK|FAIL|SKIP):|^Launched: |^=== |^commit-style-results: |^Wrote /Users/natemccoy/rust/nate_style/style_report\.md$
 ```
 
 Coverage rationale (do not narrow this without restoring all categories):
@@ -82,7 +82,8 @@ Coverage rationale (do not narrow this without restoring all categories):
 - Style eval / fix: `OK:`, `WARN:`, `ERROR:`, `FAILED:`, `RETRY:`, `RETRY OK:`, `RETRY FAILED:`, `TIMEOUT:`
 - Per-project launches across both eval and fix: `Launched:`
 - Section markers and final summary: any `=== ` line (`=== Style evaluation`, `=== Style-fix worktrees`, `=== Done:`, `=== Nightly Rust clean + rebuild complete`)
-- Commit-step skip notice: `SKIP commit-style-results` (signals the run finished but with failures, so commit was suppressed)
+- Commit-step status: `commit-style-results: ` (matches both `commit-style-results: skipped — unexpected changes` and any future success/error variants from `commit-style-results.sh`)
+- Style report write: `Wrote /Users/natemccoy/rust/nate_style/style_report.md` is the marker that `style_report.py --generate` finished writing the Obsidian summary; precise anchoring keeps unrelated `Wrote ` lines out
 
 `SKIP:` (project-skipped lines from the clean phase) is intentionally **not** matched — those are high-volume and low-signal. If the user later asks for full visibility, add `|^SKIP: ` to the alternation.
 
