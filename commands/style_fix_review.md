@@ -82,7 +82,7 @@ If you find yourself starting to write "End of review" or a recap table in the s
 Every fix proposal must be preceded by reading the governing style file and quoting its prescription. Do not brainstorm options when the style guide has already ruled on the case.
 
 - **Follow-up tasks derived from a finding** — the governing file is the finding's `Style file:` field in `EVALUATION.md`. Read it; cite it.
-- **Follow-up tasks tied to a clippy lint** — the governing file is whichever style doc has the lint name in its frontmatter `clippy:` field. Find it by grepping the loaded style files for the lint name.
+- **Follow-up tasks tied to a clippy lint** — the governing file is whichever style doc has the lint name in its frontmatter `lint:` field. Find it by grepping the loaded style files for the lint name.
 - **Every proposal must start with a `**Style rule:**` line** quoting the relevant prescription, or stating "no specific rule; proposing by analogy to X."
 
 If you find yourself listing options (a)/(b)/(c) before citing the rule, stop and do the lookup first. The rule often names the answer.
@@ -274,6 +274,7 @@ The reader is a working engineer who has read EVALUATION.md once, has not re-rea
 - **Never use the rule's name as the answer.** "The style file allows this" or "the rule's fallback applies" is not informative. State what was specifically done and what it costs or implies — concretely, in this codebase's vocabulary.
 - **Anti-patterns to delete on sight:**
   - Bullets that end in an affirmation ("OK," "good fit," "correct," "this is fine"). These are passed checks; silence is the signal.
+    - Negative example — delete on sight: *"Public-facade visibility unchanged. Items retain their original `pub(crate)` visibility... `pub(crate)` is the correct choice... No change needed — flagging only because Finding 1's restructuring made me check every visibility decision in the diff."* This is a passed check the reviewer self-flagged as non-actionable ("No change needed — flagging only because..."). Omit the bullet — and if it was the only bullet, omit the entire Concerns section.
   - Bullets that label the kind of module/type/pattern without saying what follows from that label.
   - Speculative future-proofing ("if X happens later, watch out") without a current trigger in the diff. If it is genuinely worth flagging, tie it to something the user is deciding *now*.
 

@@ -85,7 +85,7 @@ Create a comprehensive todo list combining all clippy AND unfixable mend issues:
 - Group related issues in same function/struct into single todos when logical
 - Each todo includes fix description and affected file locations
 - Label each todo with its source (clippy or mend) for clarity
-- For each clippy todo, run the `clippy:` frontmatter lookup described in
+- For each clippy todo, run the `lint:` frontmatter lookup described in
   `<FixingGuidelines/>` and include the matched rule file in the todo (e.g.
   `rule: never-allowclippytoomanylines.md`). Only include this field when a
   matching rule file exists — omit it otherwise rather than writing "none".
@@ -107,7 +107,7 @@ Present the complete batch of fixes exactly as follows:
 For each todo, show:
 - file:line and lint name
 - the fix approach in one sentence
-- `rule:` with the matched style-guide filename from the `clippy:`
+- `rule:` with the matched style-guide filename from the `lint:`
   frontmatter lookup, when a match exists (omit the field otherwise)
 
 ## Available Actions
@@ -144,10 +144,10 @@ After batch completion: Display summary of fixes applied and any remaining issue
 
 **Consult the style guide per-lint before fixing.** For every clippy finding,
 before proposing a fix, grep the loaded style guide for the lint name in the
-`clippy:` frontmatter property:
+`lint:` frontmatter property:
 
 ```bash
-grep -l "^clippy:.*\b<lint_name>\b" ~/rust/nate_style/rust/*.md docs/style/*.md 2>/dev/null
+grep -l "^lint:.*\b<lint_name>\b" ~/rust/nate_style/rust/*.md docs/style/*.md 2>/dev/null
 ```
 
 If a file matches, read it and apply the rule it prescribes (often the
@@ -159,7 +159,7 @@ If no file matches, state that explicitly ("no style-guide rule governs
 `<lint_name>`") and proceed with a judgment call.
 
 Rationale: the style guide has been known to be skipped at fix time even
-when loaded. The `clippy:` frontmatter property is the single source of
+when loaded. The `lint:` frontmatter property is the single source of
 truth that maps clippy lints to the rule that governs them.
 </FixingGuidelines>
 
