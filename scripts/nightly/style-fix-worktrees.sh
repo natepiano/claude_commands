@@ -392,7 +392,7 @@ Read the file: $worktree_eval
 Step 3: Apply ALL numbered findings from the evaluation.
 Each evaluation run adds up to $MAX_NEW_FINDINGS new findings, but findings accumulate
 across nightly runs via carry-forward. Apply every finding present.
-- Read every file in the finding's **Locations** list
+- Read every file in the **Locations** list of the finding
 - Apply the "Recommended pattern" at **every listed location** — the eval enumerated all violations of this guideline, so all of them must be fixed in this pass
 - Skip any individual location whose file no longer exists or whose pattern no longer matches; if a finding has zero matching locations remaining, skip it and document why in the Fix Summary
 - If applying a finding as written would violate any [non-negotiable] rule, do NOT apply that conflicting change. Preserve the non-negotiable rule, make any safe partial progress you can, and document the conflict in the Fix Summary.
@@ -448,8 +448,8 @@ For each numbered finding, add a line:
 **Status:** Applied | Partially applied | Skipped
 **What was done:** [1-2 sentences describing the actual changes made]
 **Issues:** [If partially applied or skipped, explain WHY — e.g., "file no longer exists",
-"pattern didn't match", "fixing this would require removing a public API method",
-"clippy's suggested fix conflicts with one-use-per-line style rule", etc.]
+"pattern did not match", "fixing this would require removing a public API method",
+"the clippy-suggested fix conflicts with one-use-per-line style rule", etc.]
 [Omit Issues line if status is Applied with no complications]
 
 After all findings, add:
