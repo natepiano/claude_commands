@@ -110,7 +110,7 @@ For each returned unit:
 1. Read the full rule content for that selected unit
 2. Read the content of any `see_also_guideline_ids` on the unit as review context — apply the selected unit's rule, informed by that context, but do not record findings against the see_also'd guidelines (they get their own review cycle)
 3. Re-read the returned `non_negotiable_guideline_ids` and treat them as binding for this unit
-4. Check the relevant codebase for violations of that selected unit
+4. Check the *entire project* for violations of that selected unit. A finding for a guideline must enumerate **every** instance of the violation across the codebase, not a sample. Use ripgrep / AST search project-wide to confirm exhaustiveness — do not rely on the files you happened to read in Step 2. **One guideline = one finding = all of its violations.**
 5. Record the result for the unit's single guideline:
    - if it has no issue, record `outcome.status = no_findings`
    - if it has an issue that is still valid from Step 3, keep it and record `finding_source = carried_forward`
@@ -160,9 +160,11 @@ Otherwise, write:
 
 **Style file**: `[full path from the loader file list]`
 **Style rule**: [which rule from the guide]
-**Current pattern**: [what the code does now, with 1-2 concrete examples showing file paths and line numbers]
-**Recommended pattern**: [what it should look like]
-**Scope**: [how many files / how widespread]
+**Locations** (every violation found project-wide):
+- `path/to/file.rs:42` — [optional brief note about this site, only if it differs materially from the others]
+- `path/to/other.rs:15` — [...]
+- `path/to/third.rs:88-94` — [...]
+**Recommended pattern**: [what it should look like — written once, applies to every location]
 
 ### 2. [Title]
 
@@ -175,8 +177,8 @@ Otherwise, write:
 Do NOT include an "Overall Assessment" section — just list the findings.
 
 Requirements for each finding:
-- Rank by impact: most files affected and most deviation from the guide comes first
-- Be specific: include actual file paths and line numbers from the project
+- Rank by impact: most violations / most deviation from the guide comes first
+- **Locations must enumerate every match.** Before writing the finding, run a project-wide search (ripgrep / AST) and verify you have caught all instances. A finding represents one guideline; missing locations means the next nightly will re-flag the same guideline instead of clearing it.
 - Be actionable: someone should be able to act on each item without re-reading the style guide
 - Only flag things that genuinely violate the style guide — do not invent rules
 - Always include the full path to the exact style guide file each finding comes from, using the loader file list (e.g., `~/rust/nate_style/rust/one-use-per-line.md` or `$ARGUMENTS/docs/style/frontend-boundaries.md`)

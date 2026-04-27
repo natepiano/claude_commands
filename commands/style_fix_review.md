@@ -190,7 +190,7 @@ For each numbered finding in EVALUATION.md, assess:
 - **What was done** — Summarize the actual changes made for this finding (files touched, what was moved/renamed/rewritten)
 - **Applied?** — Was the finding addressed in the diff?
 - **Correct?** — Does the change match the recommended pattern and conform to the style guide? Is the transformation accurate?
-- **Complete?** — Were all instances listed in "Scope" handled, or were some missed?
+- **Complete?** — Were all entries in the finding's "Locations" list handled, or were some missed?
 - **Side effects?** — Did the change introduce any bugs, break any patterns, or change behavior?
 - **New allows?** — Did addressing this finding introduce any new allow that should be surfaced to the user?
 
