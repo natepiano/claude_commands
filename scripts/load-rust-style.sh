@@ -82,6 +82,48 @@ has_bevy_tag() {
   has_tag "$1" bevy
 }
 
+# Read a top-level scalar frontmatter value (e.g. `mechanism: clippy`).
+# Prints the value to stdout, or empty string if absent.
+frontmatter_value() {
+  local file="$1"
+  local key="$2"
+
+  awk '
+    NR==1 && /^---$/ { in_fm=1; next }
+    in_fm && /^---$/ { exit }
+    in_fm {
+      # Match `key: value` at top level (no leading whitespace).
+      if ($0 ~ "^"key":[[:space:]]") {
+        value=$0
+        sub("^"key":[[:space:]]+", "", value)
+        sub(/[[:space:]]+$/, "", value)
+        # Strip surrounding quotes if any.
+        if (value ~ /^".*"$/ || value ~ /^'\''.*'\''$/) {
+          value = substr(value, 2, length(value) - 2)
+        }
+        print value
+        exit
+      }
+    }
+  ' key="$key" "$file" 2>/dev/null
+}
+
+# Returns 0 if the file is enforced by tooling that auto-fixes (no LLM needed).
+# Skipped by the loader so /rust_style does not waste context on rules
+# clippy/mend/rustfmt apply mechanically.
+is_auto_fix() {
+  local file="$1"
+  local mech mode
+  mech="$(frontmatter_value "$file" mechanism)"
+  mode="$(frontmatter_value "$file" mode)"
+  case "$mech" in
+    clippy|mend|rustfmt)
+      [[ "$mode" == "auto" ]] && return 0
+      ;;
+  esac
+  return 1
+}
+
 # Emit one wikilink stem per line from a file's `see_also:` frontmatter entry.
 # Supports single-line `see_also: "[[stem]]"` and multi-line list forms:
 #   see_also:
@@ -138,11 +180,16 @@ declare -a global_style_files=()
 declare -a repo_style_files=()
 declare -a non_negotiable_files=()
 skipped_bevy=0
+skipped_auto_fix=0
 
 if [[ -d "$global_style_dir" ]]; then
   while IFS= read -r file; do
     if [[ "$is_bevy" == false ]] && has_bevy_tag "$file"; then
       skipped_bevy=$((skipped_bevy + 1))
+      continue
+    fi
+    if is_auto_fix "$file"; then
+      skipped_auto_fix=$((skipped_auto_fix + 1))
       continue
     fi
     global_style_files+=("$file")
@@ -155,6 +202,10 @@ fi
 
 if [[ -n "$repo_style_dir" && -d "$repo_style_dir" ]]; then
   while IFS= read -r file; do
+    if is_auto_fix "$file"; then
+      skipped_auto_fix=$((skipped_auto_fix + 1))
+      continue
+    fi
     if has_tag "$file" non-negotiable; then
       non_negotiable_files+=("$file")
     fi
@@ -257,8 +308,12 @@ if [[ "$is_bevy" == true ]]; then
 elif [[ "$skipped_bevy" -gt 0 ]]; then
   bevy_note=" (skipped $skipped_bevy bevy rules)"
 fi
+auto_fix_note=""
+if [[ "$skipped_auto_fix" -gt 0 ]]; then
+  auto_fix_note=" (skipped $skipped_auto_fix tool-enforced rules)"
+fi
 
-printf 'Rust style guide loaded — %d %s, %d lines (shared: %d %s, %d lines; project: %d %s, %d lines; non-negotiable: %d)%s.\n\n' \
+printf 'Rust style guide loaded — %d %s, %d lines (shared: %d %s, %d lines; project: %d %s, %d lines; non-negotiable: %d)%s%s.\n\n' \
   "$total_files" \
   "$(pluralize_file "$total_files")" \
   "$total_lines" \
@@ -269,7 +324,8 @@ printf 'Rust style guide loaded — %d %s, %d lines (shared: %d %s, %d lines; pr
   "$(pluralize_file "$repo_files")" \
   "$repo_lines" \
   "$non_negotiable_count" \
-  "$bevy_note"
+  "$bevy_note" \
+  "$auto_fix_note"
 
 # ── Output rule content ─────────────────────────────────────────
 if [[ ${#style_files[@]} -gt 0 ]]; then

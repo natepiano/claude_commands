@@ -10,7 +10,7 @@ description: Run local CI validation, push to origin, and monitor GitHub CI
 - If the failed step is `rustfmt` or `taplo`, auto-fix:
   1. Run `cargo +nightly fmt --all` and/or `taplo fmt` (unsandboxed) to apply formatting
   2. Verify the fix worked by re-running the same check command(s) that failed
-  3. Commit the changes with message: `style: apply formatting`
+  3. Amend the most recent commit with the formatting changes: `git add -u && git commit --amend --no-edit`
   4. Re-run the full validation script from the top
 - If validation fails again on a non-formatting step, fall through to the general failure handling below
 
@@ -18,7 +18,7 @@ description: Run local CI validation, push to origin, and monitor GitHub CI
 - If the failed step is `cargo mend` and the warnings indicate they are auto-fixable (e.g. "this warning is auto-fixable with `cargo mend --fix`"):
   1. Run `cargo mend --fix` (unsandboxed) to apply fixes
   2. Verify the fix worked by re-running `cargo mend`
-  3. If clean, commit the changes with message: `style: apply cargo mend fixes`
+  3. If clean, amend the most recent commit: `git add -u && git commit --amend --no-edit`
   4. Re-run the full validation script from the top
 - If `cargo mend --fix` does not resolve all warnings, fall through to the general failure handling below
 

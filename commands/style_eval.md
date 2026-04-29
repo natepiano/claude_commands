@@ -47,8 +47,10 @@ Rules:
 After reviewing a unit, you must record its result immediately with:
 
 ```bash
-python3 ~/.claude/scripts/nightly/style_history.py record-unit --project-root "$ARGUMENTS" --results /tmp/style-eval-results.json
+python3 ~/.claude/scripts/nightly/style_history.py record-unit --project-root "$ARGUMENTS" --results "/tmp/style-eval-results-$(basename "$ARGUMENTS").json"
 ```
+
+The results path **must** be project-scoped (`/tmp/style-eval-results-<project>.json`). The nightly launches up to 4 codex evals in parallel, all writing to `/tmp`; a shared results file would clobber other agents' in-flight results. Always use `$(basename "$ARGUMENTS")` to derive the path so each agent has its own.
 
 The results JSON must have this shape:
 
@@ -110,6 +112,7 @@ For each returned unit:
 1. Read the full rule content for that selected unit
 2. Read the content of any `see_also_guideline_ids` on the unit as review context — apply the selected unit's rule, informed by that context, but do not record findings against the see_also'd guidelines (they get their own review cycle)
 3. Re-read the returned `non_negotiable_guideline_ids` and treat them as binding for this unit
+3a. **If the unit's frontmatter has `mechanism: clippy` and `mode: auto`,** the rule is clippy-owned. Treat the `lint:` list in the frontmatter as the source of truth: only sites that clippy actually flags for one of those lints may be raised as findings for this unit. If the project's `Cargo.toml` already enables the lint at `warn`/`deny`, the existing `cargo clippy --all-targets` output is sufficient. Otherwise, run `cargo clippy --all-targets -- -W <lint_name>` (one `-W` per lint) and use that output. If clippy is silent project-wide for every lint in the unit's `lint:` list, record `outcome.status = no_findings` and move on. Do not visual-inspect for this category of rule — visual matches that clippy does not fire on are by definition not violations (e.g. `|x| x.method()` reached via `Deref`).
 4. Check the *entire project* for violations of that selected unit. A finding for a guideline must enumerate **every** instance of the violation across the codebase, not a sample. Use ripgrep / AST search project-wide to confirm exhaustiveness — do not rely on the files you happened to read in Step 2. **One guideline = one finding = all of its violations.**
 5. Record the result for the unit's single guideline:
    - if it has no issue, record `outcome.status = no_findings`

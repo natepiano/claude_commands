@@ -96,11 +96,13 @@ Report format:
 ...
 ```
 
-For each guideline, a "finding" is a concrete violation the user could act on:
+For each guideline, a "finding" is a concrete violation the user could act on. A finding represents one guideline and must enumerate **every** instance of the violation across the in-scope files — not a sample. Use ripgrep / AST search to confirm exhaustiveness before reporting.
 
-- `**Current pattern**:` concrete file paths and line numbers
-- `**Recommended pattern**:` what to change
-- `**Scope of fix**:` how many files, which ones
+- `**Locations**` (every violation found in scope):
+  - `path/to/file.rs:42` — [optional brief note about this site, only if it differs materially from the others]
+  - `path/to/other.rs:15` — [...]
+  - `path/to/third.rs:88-94` — [...]
+- `**Recommended pattern**:` what to change (written once, applies to every location)
 
 If a guideline produces nothing, write `No finding.` and move on. Do not invent violations to fill space.
 

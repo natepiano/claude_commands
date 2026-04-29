@@ -27,6 +27,14 @@ STYLE_AGENT_MODE="claude"
 
 mkdir -p "$LOG_DIR"
 
+# Diagnostic: change cwd to $RUST_DIR so any unanchored `cargo` call from this
+# process or its children no longer references /Users/natemccoy/.claude. If the
+# nightly log still shows that path tomorrow, the cargo invocation is coming
+# from a process *outside* this script's tree (e.g. an IDE/LSP/watcher).
+echo "[diag] style-fix-worktrees.sh starting: pid=$$ ppid=$PPID cwd_before=$(pwd)"
+cd "$RUST_DIR"
+echo "[diag] cwd_after_chdir=$(pwd)"
+
 # Parse conf file for excludes, settings, and workspace members
 excludes=()
 MAX_NEW_FINDINGS=5
@@ -342,21 +350,28 @@ create_and_fix() {
     local branch_name="$R_branch"
     local log_file="$LOG_DIR/style_fix_${proj}.log"
 
+    echo "[diag $proj] create_and_fix start: pid=$BASHPID cwd=$(pwd)"
+
     # Create worktree (-b fails if branch exists, which is intentional)
+    echo "[diag $proj] before git worktree add"
     if ! git -C "$repo_dir" worktree add -b "$branch_name" "$worktree_dir" 2>>"$log_file"; then
         echo "ERROR: $proj (worktree creation failed — branch $branch_name may already exist)"
         return 1
     fi
+    echo "[diag $proj] after git worktree add"
 
     # Apply canonical settings.local.json so manual review has permissions
     mkdir -p "$worktree_dir/.claude"
     cp "$HOME/.claude/templates/settings_local.json" "$worktree_dir/.claude/settings.local.json"
+    echo "[diag $proj] after settings.local.json copy"
 
     # Move EVALUATION.md into worktree so primary starts fresh.
     mkdir -p "$(dirname "$worktree_eval")"
     mv "$eval_file" "$worktree_eval"
+    echo "[diag $proj] after EVALUATION.md mv"
 
     python3 "$HISTORY_HELPER" set-phase --project "$proj" --phase fix || true
+    echo "[diag $proj] after set-phase (about to build prompt + launch agent)"
 
     # Scoping values for the fix prompt
     local cargo_scope_flag
@@ -389,13 +404,31 @@ Also read each style file marked [non-negotiable] in the loaded checklist, even 
 Step 2: Read the evaluation
 Read the file: $worktree_eval
 
-Step 3: Apply ALL numbered findings from the evaluation.
+Step 3: Apply numbered findings from the evaluation.
 Each evaluation run adds up to $MAX_NEW_FINDINGS new findings, but findings accumulate
-across nightly runs via carry-forward. Apply every finding present.
-- Read every file in the **Locations** list of the finding
-- Apply the "Recommended pattern" at **every listed location** — the eval enumerated all violations of this guideline, so all of them must be fixed in this pass
-- Skip any individual location whose file no longer exists or whose pattern no longer matches; if a finding has zero matching locations remaining, skip it and document why in the Fix Summary
-- If applying a finding as written would violate any [non-negotiable] rule, do NOT apply that conflicting change. Preserve the non-negotiable rule, make any safe partial progress you can, and document the conflict in the Fix Summary.
+across nightly runs via carry-forward. Process every finding present, but how you process
+it depends on the governing guideline's frontmatter \`mode:\` field.
+
+**For each finding, before touching code:** open the guideline file from the finding's
+**Style file** field and read its frontmatter \`mode:\` value.
+
+- If \`mode: propose\` (or any \`mode:\` other than the listed apply-modes below):
+  - Do **NOT** modify any code for this finding.
+  - In the Fix Summary, set Status to **Proposed** (not Applied or Skipped).
+  - Write a "What I would change" paragraph describing the recommended edits site-by-site
+    using the Locations list, plus a "Why" paragraph naming the tradeoff the user needs to
+    weigh in on. The user reviews and decides during \`/style_fix_review\`.
+
+- If \`mode: auto\`, \`mode: flag\`, or no \`mode:\` field (default for \`mechanism: llm\`):
+  - Read every file in the finding's **Locations** list.
+  - Apply the "Recommended pattern" at **every listed location** — the eval enumerated
+    all violations of this guideline, so all of them must be fixed in this pass.
+  - Skip any individual location whose file no longer exists or whose pattern no longer
+    matches; if a finding has zero matching locations remaining, skip it and document why
+    in the Fix Summary.
+  - If applying a finding as written would violate any [non-negotiable] rule, do NOT apply
+    that conflicting change. Preserve the non-negotiable rule, make any safe partial
+    progress you can, and document the conflict in the Fix Summary.
 
 Step 4: Run cargo mend and fix issues
 Run: cargo mend $cargo_scope_flag --all-targets --manifest-path $worktree_dir/Cargo.toml
@@ -445,12 +478,15 @@ Append a section to the END of $worktree_eval with the following format:
 For each numbered finding, add a line:
 
 ### Finding N: [title from finding]
-**Status:** Applied | Partially applied | Skipped
+**Status:** Applied | Partially applied | Skipped | Proposed
 **What was done:** [1-2 sentences describing the actual changes made]
+**What I would change** (Proposed only): [paragraph describing recommended edits per Location]
+**Why** (Proposed only): [paragraph naming the tradeoff for the user to weigh in on]
 **Issues:** [If partially applied or skipped, explain WHY — e.g., "file no longer exists",
 "pattern did not match", "fixing this would require removing a public API method",
 "the clippy-suggested fix conflicts with one-use-per-line style rule", etc.]
 [Omit Issues line if status is Applied with no complications]
+[Use Proposed when the guideline's frontmatter has `mode: propose` — no code changes were made]
 
 After all findings, add:
 
@@ -485,9 +521,11 @@ PROMPT_EOF
     )
 
     # Launch selected agent to apply fixes (60 min timeout to prevent hanging the pipeline)
+    echo "[diag $proj] launching style agent ($STYLE_AGENT_MODE) in background"
     local agent_pid
     run_style_agent "$agent_work_dir" "$prompt" "$log_file" &
     agent_pid=$!
+    echo "[diag $proj] agent launched: agent_pid=$agent_pid"
 
     local elapsed=0
     local timeout_secs=3600
