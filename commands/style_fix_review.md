@@ -191,7 +191,7 @@ For each numbered finding in EVALUATION.md, assess:
 - **Applied?** — Was the finding addressed in the diff?
 - **Correct?** — Does the change match the recommended pattern and conform to the style guide? Is the transformation accurate?
 - **Complete?** — Were all entries in the finding's "Locations" list handled, or were some missed?
-- **Side effects?** — Did the change introduce any bugs, break any patterns, or change behavior?
+- **Side effects?** — Did the change introduce any bugs, break any patterns, or change behavior? When verifying renames or visibility narrowing, prefer LSP `findReferences` to ripgrep — references through type aliases, re-exports, or generic dispatch are invisible to text search. If LSP is unavailable, expand the ripgrep scope and note the limitation.
 - **New allows?** — Did addressing this finding introduce any new allow that should be surfaced to the user?
 
 ## Step 7: Output order

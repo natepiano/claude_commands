@@ -96,7 +96,10 @@ Report format:
 ...
 ```
 
-For each guideline, a "finding" is a concrete violation the user could act on. A finding represents one guideline and must enumerate **every** instance of the violation across the in-scope files — not a sample. Use ripgrep / AST search to confirm exhaustiveness before reporting.
+For each guideline, a "finding" is a concrete violation the user could act on. A finding represents one guideline and must enumerate **every** instance of the violation across the in-scope files — not a sample. Tool precedence for the scan:
+- **LSP** (`workspaceSymbol`, `findReferences`, `documentSymbol`, `hover`) for any semantic query — types, signatures, trait impls, callers. ripgrep cannot answer those structurally.
+- **ripgrep** for textual queries (keywords, attribute strings, identifier patterns).
+- **Read source files** only to verify a specific site found via the tools above.
 
 - `**Locations**` (every violation found in scope):
   - `path/to/file.rs:42` — [optional brief note about this site, only if it differs materially from the others]

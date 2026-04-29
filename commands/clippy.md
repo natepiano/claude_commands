@@ -142,6 +142,18 @@ After batch completion: Display summary of fixes applied and any remaining issue
 - Do not fix warnings by marking code as dead - remove dead code
 - Do not fix warnings by prefixing arguments/variables with _ - remove if unused
 
+**Use LSP before any fix that changes a name or signature.** When the fix is a
+rename, removal, visibility narrowing, or type change, run LSP `findReferences`
+on the target first to enumerate every call site. ripgrep misses references
+through type aliases, re-exports, and generic dispatch — LSP doesn't. Apply
+the fix at every reference returned. For pure intra-function fixes (rewriting
+a closure, inlining a return, removing a needless `&`) LSP is unnecessary.
+
+LSP availability: `LSP` tool is loaded when `ENABLE_LSP_TOOL=1` is in env (in
+your settings.json). If unreachable, fall back to ripgrep but expand the scope
+to the whole crate (not just the cited file) and note the limitation in the
+fix description.
+
 **Consult the style guide per-lint before fixing.** For every clippy finding,
 before proposing a fix, grep the loaded style guide for the lint name in the
 `lint:` frontmatter property:

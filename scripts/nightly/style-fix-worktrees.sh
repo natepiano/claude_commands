@@ -421,6 +421,11 @@ it depends on the governing guideline's frontmatter \`mode:\` field.
 
 - If \`mode: auto\`, \`mode: flag\`, or no \`mode:\` field (default for \`mechanism: llm\`):
   - Read every file in the finding's **Locations** list.
+  - **Before renaming a symbol or changing a public signature, use LSP \`findReferences\`**
+    on the target to enumerate every call site you'll need to update. ripgrep misses
+    references that go through type aliases, re-exports, or generic dispatch; LSP doesn't.
+    Apply the rename and update every reference returned. Same applies to relocations
+    and visibility narrowing — \`findReferences\` first, then edit.
   - Apply the "Recommended pattern" at **every listed location** — the eval enumerated
     all violations of this guideline, so all of them must be fixed in this pass.
   - Skip any individual location whose file no longer exists or whose pattern no longer
@@ -429,6 +434,29 @@ it depends on the governing guideline's frontmatter \`mode:\` field.
   - If applying a finding as written would violate any [non-negotiable] rule, do NOT apply
     that conflicting change. Preserve the non-negotiable rule, make any safe partial
     progress you can, and document the conflict in the Fix Summary.
+
+LSP availability: claude has the \`LSP\` tool when \`ENABLE_LSP_TOOL=1\` is in env;
+codex has equivalent coverage via the \`mcp-language-server\` MCP server. If neither
+is reachable, fall back to ripgrep but expand the scope (search the whole crate, not
+just the cited file) and document the limitation in the Fix Summary.
+
+**Do NOT delete or rewrite existing documentation as a side effect of any fix.**
+Each finding's recommended pattern is a structural code change (split a module,
+bundle parameters, rename a binding, switch to a \`From\` impl). None of those
+patterns require touching comments or doc strings. Specifically:
+
+- **Preserve** all \`///\` doc comments on items, fields, and uniform/\`ShaderType\`
+  struct fields — these document the GPU contract or public API and live nowhere else.
+- **Preserve** inline \`//\` comments that explain coordinate-space conversions,
+  shader semantics, or other non-obvious WHYs.
+- **Update** only the comments your edit makes literally inaccurate (e.g. a
+  parameter name you just renamed). Update; do not delete.
+- The "default to no comments" guidance in the global instructions applies to
+  *writing new code*. It does NOT authorize pruning existing documentation.
+
+If you believe a comment is genuinely stale (describes code that no longer
+exists), leave it and note it in the Fix Summary as a comment-only follow-up.
+The user reviews comment changes during \`/style_fix_review\`.
 
 Step 4: Run cargo mend and fix issues
 Run: cargo mend $cargo_scope_flag --all-targets --manifest-path $worktree_dir/Cargo.toml
