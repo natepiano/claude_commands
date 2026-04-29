@@ -203,6 +203,33 @@ for i in "${!projects[@]}"; do
         echo "SKIP: $proj (already at cap of $MAX_NEW_FINDINGS findings)"
         continue
     fi
+
+    # Incremental skip: if EVALUATION.md exists and neither the project source
+    # nor the style guide tree has been touched since EVALUATION.md was written,
+    # last night's findings are still authoritative — no need to re-eval. Use
+    # mtime-based comparison against EVALUATION.md as the "last eval" timestamp.
+    eval_md="$project_root/EVALUATION.md"
+    if [[ -f "$eval_md" ]]; then
+        nate_style_dir="$HOME/rust/nate_style/rust"
+        # Candidate paths that would invalidate the cache. find's stderr is
+        # silenced so missing dirs (e.g. no examples/, no tests/) don't surface.
+        source_changed=$(find \
+            "$project_root/src" \
+            "$project_root/examples" \
+            "$project_root/tests" \
+            "$project_root/Cargo.toml" \
+            -newer "$eval_md" -type f -print -quit 2>/dev/null || true)
+        guideline_changed=$(find \
+            "$nate_style_dir" \
+            "$project_root/docs/style" \
+            -newer "$eval_md" -type f -print -quit 2>/dev/null || true)
+        if [[ -z "$source_changed" && -z "$guideline_changed" ]]; then
+            eval_ts=$(stat -f '%Sm' -t '%Y-%m-%dT%H:%M:%SZ' "$eval_md" 2>/dev/null || stat -c '%y' "$eval_md" 2>/dev/null)
+            echo "SKIP: $proj (UNCHANGED — no source or guideline edits since EVALUATION.md@${eval_ts})"
+            continue
+        fi
+    fi
+
     effective_budget=$((MAX_NEW_FINDINGS - existing_findings))
 
     python3 "$HISTORY_HELPER" start-run \
