@@ -40,6 +40,7 @@ class Unit:
     display_name: str
     guideline_ids: tuple[str, ...]
     see_also_guideline_ids: tuple[str, ...]
+    pre_filter: str = ""
 
 
 def utc_now() -> str:
@@ -122,6 +123,70 @@ def extract_title(path: Path) -> str:
         if line.startswith("#"):
             return line.lstrip("#").strip()
     return path.name
+
+
+def read_pre_filter(path: Path) -> str:
+    """Extract a top-level scalar `pre_filter:` field from the frontmatter.
+
+    Returns the regex string, or empty string when absent. Strips surrounding
+    quotes (single or double) so the value can be passed directly to ripgrep.
+    """
+    lines = path.read_text().splitlines()
+    if not lines or lines[0].strip() != "---":
+        return ""
+    for line in lines[1:]:
+        stripped = line.strip()
+        if stripped == "---":
+            break
+        if not stripped.startswith("pre_filter:"):
+            continue
+        value = stripped.split(":", 1)[1].strip()
+        if (value.startswith("'") and value.endswith("'")) or (
+            value.startswith('"') and value.endswith('"')
+        ):
+            value = value[1:-1]
+        return value
+    return ""
+
+
+def pre_filter_has_candidates(pattern: str, project_root: Path) -> bool:
+    """Run `rg` against project_root with the pattern. Return True if any match."""
+    if not pattern:
+        return True
+    try:
+        result = subprocess.run(
+            ["rg", "--quiet", "--type", "rust", pattern, str(project_root)],
+            check=False,
+            capture_output=True,
+        )
+    except FileNotFoundError:
+        return True
+    return result.returncode == 0
+
+
+def auto_record_pre_filter_skip(project: str, unit: "Unit") -> None:
+    """Record `no_findings` for a unit whose pre_filter found zero candidate sites."""
+    pending = load_pending(project)
+    if not pending:
+        return
+    reviewed_units = list(pending.get("reviewed_units", []))
+    reviewed_unit_ids = list(pending.get("reviewed_unit_ids", []))
+    if unit.unit_id in reviewed_unit_ids:
+        return
+    for guideline_id in unit.guideline_ids:
+        reviewed_units.append(
+            {
+                "guideline_id": guideline_id,
+                "outcome": {"status": "no_findings", "skipped_by": "pre_filter"},
+            }
+        )
+    reviewed_unit_ids.append(unit.unit_id)
+    pending["reviewed_units"] = reviewed_units
+    pending["reviewed_unit_ids"] = reviewed_unit_ids
+    pending["last_unit_id"] = unit.unit_id
+    pending["last_unit_result"] = "no_findings"
+    pending["updated_at"] = utc_now()
+    write_pending(project, pending)
 
 
 def history_file(project: str) -> Path:
@@ -290,6 +355,7 @@ def _build_units_from_files(
                 display_name=extract_title(style_file),
                 guideline_ids=(guideline_id,),
                 see_also_guideline_ids=tuple(see_also_ids),
+                pre_filter=read_pre_filter(style_file),
             )
         )
     return units
@@ -432,7 +498,18 @@ def next_unit(project_root: Path) -> dict[str, Any]:
         sortable.append((unit_count, unit.checklist_index, unit.unit_id, unit))
     sortable.sort(key=lambda item: (item[0], item[1], item[2]))
 
-    if not sortable:
+    # Walk candidates in sort order. For each, run its pre_filter (if any) against
+    # the project tree. If the pattern finds zero matches, the violation cannot be
+    # present — auto-record `no_findings` for the unit and continue to the next
+    # candidate without invoking the LLM.
+    while sortable:
+        unit_count, _, _, unit = sortable[0]
+        if unit.pre_filter and not pre_filter_has_candidates(unit.pre_filter, project_root):
+            auto_record_pre_filter_skip(project, unit)
+            sortable.pop(0)
+            continue
+        break
+    else:
         return {
             "budget": budget,
             "non_negotiable_guideline_ids": non_negotiable_guideline_ids(project_root),
@@ -441,7 +518,6 @@ def next_unit(project_root: Path) -> dict[str, Any]:
             "stop_reason": "exhausted",
         }
 
-    unit_count, _, _, unit = sortable[0]
     return {
         "budget": budget,
         "non_negotiable_guideline_ids": non_negotiable_guideline_ids(project_root),

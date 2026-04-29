@@ -2,6 +2,7 @@
   "$schema": "https://json.schemastore.org/claude-code-settings.json",
   "env": {
     "CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS": "1",
+    "ENABLE_LSP_TOOL": "1",
     "RUSTC_WRAPPER": "",
     "TMPPREFIX": "/tmp/claude/zsh"
   },
@@ -136,10 +137,10 @@
   "effortLevel": "high",
   "skipDangerousModePermissionPrompt": true,
   "teammateMode": "tmux",
+  "agentPushNotifEnabled": true,
   "skipAutoPermissionPrompt": true,
   "voiceEnabled": true,
   "feedbackSurveyState": {
     "lastShownTime": 1754090074729
-  },
-  "agentPushNotifEnabled": true
+  }
 }
