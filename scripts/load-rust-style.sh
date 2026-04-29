@@ -48,6 +48,15 @@ if [[ -n "$repo_root" ]]; then
   repo_style_dir="$repo_root/docs/style"
 fi
 
+# Workspace member style dirs: $repo_root/docs/<member>/style/
+declare -a member_style_dirs=()
+if [[ -n "$repo_root" && -d "$repo_root/docs" ]]; then
+  while IFS= read -r d; do
+    [[ -z "$d" ]] && continue
+    member_style_dirs+=("$d")
+  done < <(find "$repo_root/docs" -mindepth 2 -maxdepth 2 -type d -name style -print 2>/dev/null | LC_ALL=C sort)
+fi
+
 # ── Bevy detection ──────────────────────────────────────────────
 # Check if any Cargo.toml in the repo depends on bevy.
 is_bevy=false
@@ -178,6 +187,7 @@ extract_see_also() {
 declare -a style_files=()
 declare -a global_style_files=()
 declare -a repo_style_files=()
+declare -a member_style_files=()
 declare -a non_negotiable_files=()
 skipped_bevy=0
 skipped_auto_fix=0
@@ -213,6 +223,20 @@ if [[ -n "$repo_style_dir" && -d "$repo_style_dir" ]]; then
     style_files+=("$file")
   done < <(find "$repo_style_dir" -maxdepth 1 -type f -name '*.md' -print | LC_ALL=C sort)
 fi
+
+for dir in "${member_style_dirs[@]}"; do
+  while IFS= read -r file; do
+    if is_auto_fix "$file"; then
+      skipped_auto_fix=$((skipped_auto_fix + 1))
+      continue
+    fi
+    if has_tag "$file" non-negotiable; then
+      non_negotiable_files+=("$file")
+    fi
+    member_style_files+=("$file")
+    style_files+=("$file")
+  done < <(find "$dir" -maxdepth 1 -type f -name '*.md' -print | LC_ALL=C sort)
+done
 
 typeset -A file_non_negotiable=()
 typeset -A file_see_also=()  # file -> newline-separated wikilink stems
@@ -279,6 +303,7 @@ pluralize_file() {
 total_lines=0
 global_lines=0
 repo_lines=0
+member_lines=0
 
 if [[ ${#global_style_files[@]} -gt 0 ]]; then
   for file in "${global_style_files[@]}"; do
@@ -296,10 +321,19 @@ if [[ ${#repo_style_files[@]} -gt 0 ]]; then
   done
 fi
 
+if [[ ${#member_style_files[@]} -gt 0 ]]; then
+  for file in "${member_style_files[@]}"; do
+    lines=$(strip_frontmatter "$file" | wc -l)
+    member_lines=$((member_lines + lines))
+    total_lines=$((total_lines + lines))
+  done
+fi
+
 # ── Summary line (first, so it survives output truncation) ──────
 total_files="${#style_files[@]}"
 global_files="${#global_style_files[@]}"
 repo_files="${#repo_style_files[@]}"
+member_files="${#member_style_files[@]}"
 non_negotiable_count="${#non_negotiable_files[@]}"
 
 bevy_note=""
@@ -313,7 +347,7 @@ if [[ "$skipped_auto_fix" -gt 0 ]]; then
   auto_fix_note=" (skipped $skipped_auto_fix tool-enforced rules)"
 fi
 
-printf 'Rust style guide loaded — %d %s, %d lines (shared: %d %s, %d lines; project: %d %s, %d lines; non-negotiable: %d)%s%s.\n\n' \
+printf 'Rust style guide loaded — %d %s, %d lines (shared: %d %s, %d lines; project: %d %s, %d lines; members: %d %s, %d lines; non-negotiable: %d)%s%s.\n\n' \
   "$total_files" \
   "$(pluralize_file "$total_files")" \
   "$total_lines" \
@@ -323,9 +357,20 @@ printf 'Rust style guide loaded — %d %s, %d lines (shared: %d %s, %d lines; pr
   "$repo_files" \
   "$(pluralize_file "$repo_files")" \
   "$repo_lines" \
+  "$member_files" \
+  "$(pluralize_file "$member_files")" \
+  "$member_lines" \
   "$non_negotiable_count" \
   "$bevy_note" \
   "$auto_fix_note"
+
+if [[ ${#member_style_dirs[@]} -gt 0 ]]; then
+  printf 'Workspace member style dirs loaded (some rules may not apply to the file you are editing — judge from context):\n'
+  for dir in "${member_style_dirs[@]}"; do
+    printf '  - %s\n' "${dir#$repo_root/}"
+  done
+  printf '\n'
+fi
 
 # ── Output rule content ─────────────────────────────────────────
 if [[ ${#style_files[@]} -gt 0 ]]; then
