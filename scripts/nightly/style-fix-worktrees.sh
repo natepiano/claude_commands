@@ -350,7 +350,7 @@ create_and_fix() {
     local branch_name="$R_branch"
     local log_file="$LOG_DIR/style_fix_${proj}.log"
 
-    echo "[diag $proj] create_and_fix start: pid=$BASHPID cwd=$(pwd)"
+    echo "[diag $proj] create_and_fix start: pid=$$ cwd=$(pwd)"
 
     # Create worktree (-b fails if branch exists, which is intentional)
     echo "[diag $proj] before git worktree add"
@@ -387,9 +387,14 @@ create_and_fix() {
         review_dir_description="Modify ONLY files inside $worktree_dir"
     fi
 
-    # Build prompt for the agent
-    local prompt
-    prompt=$(cat <<PROMPT_EOF
+    # Build prompt for the agent.
+    # Write to a temp file then slurp it back. Do NOT use `$(cat <<EOF ... EOF)`
+    # — macOS bash 3.2 misparses backticks and apostrophes in the heredoc body
+    # when the heredoc is inside command substitution, emitting spurious
+    # "command not found" errors at runtime.
+    local prompt prompt_file
+    prompt_file="$LOG_DIR/style_fix_prompt_${proj}_$$.txt"
+    cat > "$prompt_file" <<PROMPT_EOF
 You are applying automated style fixes to a Rust project.
 Working directory: $agent_work_dir
 Worktree root: $worktree_dir
@@ -407,10 +412,10 @@ Read the file: $worktree_eval
 Step 3: Apply numbered findings from the evaluation.
 Each evaluation run adds up to $MAX_NEW_FINDINGS new findings, but findings accumulate
 across nightly runs via carry-forward. Process every finding present, but how you process
-it depends on the governing guideline's frontmatter \`mode:\` field.
+it depends on the governing guideline frontmatter \`mode:\` field.
 
-**For each finding, before touching code:** open the guideline file from the finding's
-**Style file** field and read its frontmatter \`mode:\` value.
+**For each finding, before touching code:** open the guideline file from the
+**Style file** field of the finding and read its frontmatter \`mode:\` value.
 
 - If \`mode: propose\` (or any \`mode:\` other than the listed apply-modes below):
   - Do **NOT** modify any code for this finding.
@@ -420,10 +425,10 @@ it depends on the governing guideline's frontmatter \`mode:\` field.
     weigh in on. The user reviews and decides during \`/style_fix_review\`.
 
 - If \`mode: auto\`, \`mode: flag\`, or no \`mode:\` field (default for \`mechanism: llm\`):
-  - Read every file in the finding's **Locations** list.
+  - Read every file in the **Locations** list of the finding.
   - **Before renaming a symbol or changing a public signature, use LSP \`findReferences\`**
-    on the target to enumerate every call site you'll need to update. ripgrep misses
-    references that go through type aliases, re-exports, or generic dispatch; LSP doesn't.
+    on the target to enumerate every call site you will need to update. ripgrep misses
+    references that go through type aliases, re-exports, or generic dispatch; LSP does not.
     Apply the rename and update every reference returned. Same applies to relocations
     and visibility narrowing — \`findReferences\` first, then edit.
   - Apply the "Recommended pattern" at **every listed location** — the eval enumerated
@@ -441,7 +446,7 @@ is reachable, fall back to ripgrep but expand the scope (search the whole crate,
 just the cited file) and document the limitation in the Fix Summary.
 
 **Do NOT delete or rewrite existing documentation as a side effect of any fix.**
-Each finding's recommended pattern is a structural code change (split a module,
+Each recommended pattern in a finding is a structural code change (split a module,
 bundle parameters, rename a binding, switch to a \`From\` impl). None of those
 patterns require touching comments or doc strings. Specifically:
 
@@ -514,7 +519,7 @@ For each numbered finding, add a line:
 "pattern did not match", "fixing this would require removing a public API method",
 "the clippy-suggested fix conflicts with one-use-per-line style rule", etc.]
 [Omit Issues line if status is Applied with no complications]
-[Use Proposed when the guideline's frontmatter has `mode: propose` — no code changes were made]
+[Use Proposed when the guideline frontmatter has `mode: propose` — no code changes were made]
 
 After all findings, add:
 
@@ -544,9 +549,10 @@ Rules:
 - Do NOT commit anything (no git add, no git commit)
 - EVALUATION.md ($worktree_eval) may ONLY be modified by appending the Fix Summary section (Step 9)
 - Apply each fix completely — no partial changes
-- If a finding references files that don't exist or patterns that don't match, skip that finding and document why in the Fix Summary
+- If a finding references files that do not exist or patterns that do not match, skip that finding and document why in the Fix Summary
 PROMPT_EOF
-    )
+    prompt=$(<"$prompt_file")
+    rm -f "$prompt_file"
 
     # Launch selected agent to apply fixes (60 min timeout to prevent hanging the pipeline)
     echo "[diag $proj] launching style agent ($STYLE_AGENT_MODE) in background"

@@ -424,6 +424,54 @@ def review_counts(project_root: Path) -> dict[str, int]:
     return counts
 
 
+def cross_project_hit_rates() -> dict[str, float]:
+    """Per-guideline finding rate across every project's .history JSONL.
+
+    Returns a {guideline_id: hit_rate} map where hit_rate ∈ [0.0, 1.0] is
+    findings_count / reviews_count. Used by `next_unit` to walk high-yield
+    guidelines first so dirty projects hit the budget cap and exit early
+    instead of plowing through guidelines that never produce findings.
+
+    Pre-filter skips (`outcome.skipped_by == "pre_filter"`) are excluded from
+    both numerator and denominator — they aren't real LLM reviews.
+    """
+    reviews: dict[str, int] = defaultdict(int)
+    findings: dict[str, int] = defaultdict(int)
+    if not HISTORY_DIR.exists():
+        return {}
+    for jsonl_path in HISTORY_DIR.glob("*.jsonl"):
+        try:
+            text = jsonl_path.read_text()
+        except OSError:
+            continue
+        for line in text.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                row = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            for reviewed in row.get("reviewed_units", []):
+                if not isinstance(reviewed, dict):
+                    continue
+                guideline_id = reviewed.get("guideline_id")
+                if not isinstance(guideline_id, str):
+                    continue
+                raw_outcome = reviewed.get("outcome")
+                outcome: dict[str, Any] = raw_outcome if isinstance(raw_outcome, dict) else {}
+                if outcome.get("skipped_by") == "pre_filter":
+                    continue
+                reviews[guideline_id] += 1
+                if reviewed.get("finding_source") or outcome.get("status") not in (None, "no_findings"):
+                    findings[guideline_id] += 1
+    return {
+        guideline_id: findings.get(guideline_id, 0) / count
+        for guideline_id, count in reviews.items()
+        if count > 0
+    }
+
+
 def non_negotiable_guideline_ids(project_root: Path) -> list[str]:
     return [
         guideline_id
@@ -488,22 +536,29 @@ def next_unit(project_root: Path) -> dict[str, Any]:
     seen_unit_ids = set(pending.get("reviewed_unit_ids", []))
     units = build_units(project_root)
     counts = review_counts(project_root)
-    sortable: list[tuple[int, int, str, Unit]] = []
+    # Cross-project hit rates — high-yield guidelines walk first so dirty
+    # projects hit the budget cap and exit early instead of plowing through
+    # guidelines that never produce findings.
+    hit_rates = cross_project_hit_rates()
+    sortable: list[tuple[float, int, int, str, Unit]] = []
     for unit in units:
         if unit.budget_cost == 0:
             continue
         if unit.unit_id in seen_unit_ids:
             continue
         unit_count = min(counts.get(guideline_id, 0) for guideline_id in unit.guideline_ids) if unit.guideline_ids else 0
-        sortable.append((unit_count, unit.checklist_index, unit.unit_id, unit))
-    sortable.sort(key=lambda item: (item[0], item[1], item[2]))
+        # Negate hit-rate so higher rates sort earlier under ascending sort.
+        # Unseen guidelines (no history yet) get rate 0.0 → sort to the end.
+        unit_hit_rate = max((hit_rates.get(guideline_id, 0.0) for guideline_id in unit.guideline_ids), default=0.0)
+        sortable.append((-unit_hit_rate, unit_count, unit.checklist_index, unit.unit_id, unit))
+    sortable.sort(key=lambda item: (item[0], item[1], item[2], item[3]))
 
     # Walk candidates in sort order. For each, run its pre_filter (if any) against
     # the project tree. If the pattern finds zero matches, the violation cannot be
     # present — auto-record `no_findings` for the unit and continue to the next
     # candidate without invoking the LLM.
     while sortable:
-        unit_count, _, _, unit = sortable[0]
+        _, unit_count, _, _, unit = sortable[0]
         if unit.pre_filter and not pre_filter_has_candidates(unit.pre_filter, project_root):
             auto_record_pre_filter_skip(project, unit)
             sortable.pop(0)
