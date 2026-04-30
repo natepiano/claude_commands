@@ -7,7 +7,9 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 RUST_DIR="$HOME/rust"
-LOG_FILE="$HOME/.local/logs/nightly-rust-clean-build.log"
+LOG_DIR="$HOME/.local/logs/nightly"
+LOG_FILE="$LOG_DIR/nightly-$(date '+%Y%m%d-%H%M%S').log"
+LEGACY_LOG="$HOME/.local/logs/nightly-rust-clean-build.log"
 TIMESTAMP_DIR="$HOME/.local/state/nightly-rust"
 CONF_FILE="$SCRIPT_DIR/nightly-rust.conf"
 
@@ -15,9 +17,12 @@ source "$HOME/.cargo/env"
 export PATH="/opt/homebrew/bin:$HOME/.local/bin:$PATH"
 export SCCACHE_CACHE_SIZE="30G"
 
-mkdir -p "$(dirname "$LOG_FILE")"
+mkdir -p "$LOG_DIR"
 mkdir -p "$TIMESTAMP_DIR"
 > "$LOG_FILE"
+# Maintain legacy single-file path as a symlink to the latest run so existing
+# tooling and the launchd plist stdout sink keep working.
+ln -sfn "$LOG_FILE" "$LEGACY_LOG"
 
 log() {
     echo "$(date '+%Y-%m-%d %H:%M:%S') $1" | tee -a "$LOG_FILE"

@@ -519,7 +519,7 @@ For each numbered finding, add a line:
 "pattern did not match", "fixing this would require removing a public API method",
 "the clippy-suggested fix conflicts with one-use-per-line style rule", etc.]
 [Omit Issues line if status is Applied with no complications]
-[Use Proposed when the guideline frontmatter has `mode: propose` — no code changes were made]
+[Use Proposed when the guideline frontmatter has \`mode: propose\` — no code changes were made]
 
 After all findings, add:
 
@@ -532,7 +532,7 @@ If cargo mend --fix was run in Step 4 and made any changes, summarize them here:
 ### Clippy Changes
 Summarize Step 5:
 - **Preview (5a):** count and types of warnings/errors clippy reported, or "clean"
-- **Auto-fix (5b):** files modified by `cargo clippy --fix` and the categories of fixes applied, or "not run" if 5a was clean
+- **Auto-fix (5b):** files modified by \`cargo clippy --fix\` and the categories of fixes applied, or "not run" if 5a was clean
 - **Manual (5c):** anything that remained after --fix and had to be hand-fixed (or that was left unfixed because the suggested fix conflicts with a style rule — explain)
 
 ### Build Status
