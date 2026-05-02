@@ -1,5 +1,13 @@
 ## writing style
 - **NEVER** use the word "honest" (or "honestly", "to be honest", etc.) in output to the user. Drop it entirely — don't substitute "truthfully" or similar either. State the claim directly.
+- **NEVER** use the word "shape" (or "shaped", "shapes", "reshape", "reshaping", etc.) in output to the user, in code, or in identifiers. It is nails on a chalkboard. Name the actual concrete artifact instead:
+  - If it is a **function**, say "function" (and name it).
+  - If it is a **pattern** (in the design / convention sense), say "pattern".
+  - If it is a **struct** or **enum**, say "struct" or "enum" (and name it).
+  - If it is a **function with specific arguments**, say "function signature" and write the signature.
+  - If it is a **trait**, say "trait".
+  - If it is a **type**, say "type" and name the type.
+  Never substitute "form" or "structure" — same hedge with different letters. State what the thing actually is.
 
 ## git
 ### commit
