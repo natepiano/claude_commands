@@ -72,8 +72,10 @@ After Monitor returns its task id, tell the user: `Monitor armed (task <id>). I 
 Single alternation covering every meaningful state-transition line across all phases. Lines matching this regex are the events the user wants to know about; everything else is noise.
 
 ```
-^(CLEAN|BUILD|MEND|DONE|ERROR|WARNING|TIMEOUT|RETRY|RETRY OK|RETRY FAILED|FAILED|WARN|OK):|^WARMUP (OK|FAIL|SKIP):|^Launched: |^=== |^commit-style-results: |^Wrote /Users/natemccoy/rust/nate_style/style_report\.md$
+(^|[[:space:]])(CLEAN|BUILD|MEND|DONE|ERROR|WARNING|TIMEOUT|RETRY|RETRY OK|RETRY FAILED|FAILED|WARN|OK):|(^|[[:space:]])WARMUP (OK|FAIL|SKIP):|(^|[[:space:]])Launched: |^=== |(^|[[:space:]])commit-style-results: |^Wrote /Users/natemccoy/rust/nate_style/style_report\.md$
 ```
+
+Anchoring note: the orchestrator's `log()` function timestamps every clean+rebuild line (`YYYY-MM-DD HH:MM:SS CLEAN: …`), but the eval/fix sub-scripts `echo` bare keywords (`OK: …`). The keyword-prefix alternation accepts either start-of-line **or** preceding whitespace so both forms match. Using a pure `^` anchor here silently drops every clean-phase event — do not narrow.
 
 Coverage rationale (do not narrow this without restoring all categories):
 
