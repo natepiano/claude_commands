@@ -8,6 +8,13 @@
   - If it is a **trait**, say "trait".
   - If it is a **type**, say "type" and name the type.
   Never substitute "form" or "structure" — same hedge with different letters. State what the thing actually is.
+- **NEVER** use the word "carve" (or "carving", "carved", "carve-out", "carve out", etc.) in output to the user, in code, or in identifiers. It is metaphor filler that hides what the change actually does. Name the concrete operation instead:
+  - **Extract** a type / module / subsystem from a larger one (when the body of code is moved into a new home).
+  - **Split** A into B and C (when one thing becomes two).
+  - **Move** field X from A to B (when a single field relocates).
+  - **Refactor** A into B (when behavior is preserved but the structure changes).
+  - **Introduce** type T (when the change is purely additive).
+  Pick the verb that names what's happening. Never substitute "sculpt", "tease apart", or other artisanal-craft metaphors — same hedge.
 
 ## git
 ### commit

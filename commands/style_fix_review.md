@@ -115,7 +115,7 @@ This rule applies to **every section the user reads** — Original issue, What c
 
 **Banned guide-jargon** (from the style guide; opaque to a reader who hasn't reread the docs today):
 
-`anchor type`, `anchor-type`, `anchor-named`, `domain cohort`, `domain-cohort`, `domain-noun cohort`, `behavior owner`, `dictionary file`, `data dictionary`, `junk drawer`, `cohort name`.
+`domain cohort`, `domain-cohort`, `domain-noun cohort`, `behavior owner`, `dictionary file`, `data dictionary`, `junk drawer`, `cohort name`.
 
 **Banned metaphor verbs and adjectives** (vague, decorative, tell the reader nothing concrete):
 
@@ -125,8 +125,8 @@ If a banned guide term appears, it must be translated in the same sentence into 
 
 **Canonical delete-on-sight examples** (do not ship anything resembling these):
 
-1. *"`controller.rs` is a domain-noun cohort name rather than an anchor-type name."*
-   Pure guide-jargon, nothing actionable. Either drop the bullet, or rewrite concretely: *"`controller.rs` holds the `orbit_cam` runtime system plus its private input/transform helpers — one weight-bearing item, not several peers. A name like `runtime.rs` or `pipeline.rs` would predict the contents better."*
+1. *"`controller.rs` is a domain-noun cohort name rather than an anchor type name."*
+   `domain-noun cohort` is pure guide-jargon, nothing actionable. Either drop the bullet, or rewrite concretely: *"`controller.rs` holds the `orbit_cam` runtime system plus its private input/transform helpers — one weight-bearing item, not several peers. A name like `runtime.rs` or `pipeline.rs` would predict the contents better."*
 
 2. *"The restore subtree was carved by pipeline phase (`apply/bootstrap.rs`, `apply/cross_dpi.rs`, …)."*
    `carved` is a decorative verb that says nothing the file list doesn't already say. Rewrite: *"The restore subtree is split into one file per pipeline phase: `apply/bootstrap.rs`, `apply/cross_dpi.rs`, …"* — or just *"The restore subtree has one file per pipeline phase: …"*.
