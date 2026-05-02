@@ -409,6 +409,11 @@ Also read each style file marked [non-negotiable] in the loaded checklist, even 
 Step 2: Read the evaluation
 Read the file: $worktree_eval
 
+IMPORTANT — review-stage exclusions:
+- Any finding wrapped in \`<!-- REMOVED-BY-REVIEW: ... -->\` ... \`<!-- /REMOVED-BY-REVIEW -->\` markers has been struck by the review pass. Treat it as if absent. Do NOT apply it. Do NOT mention it in the Fix Summary except to note it was removed-by-review.
+- The \`## Review Log\` section at the bottom of EVALUATION.md is reporting-only metadata for the human reviewer. Do NOT act on anything it says. Do NOT modify it.
+- Apply only the numbered findings whose body is NOT inside REMOVED-BY-REVIEW markers.
+
 Step 3: Apply numbered findings from the evaluation.
 Each evaluation run adds up to $MAX_NEW_FINDINGS new findings, but findings accumulate
 across nightly runs via carry-forward. Process every finding present, but how you process
@@ -547,7 +552,7 @@ Fixing guidelines:
 Rules:
 - $review_dir_description
 - Do NOT commit anything (no git add, no git commit)
-- EVALUATION.md ($worktree_eval) may ONLY be modified by appending the Fix Summary section (Step 9)
+- EVALUATION.md ($worktree_eval) may ONLY be modified by appending the Fix Summary section (Step 9). Do NOT edit findings, REMOVED-BY-REVIEW blocks, or the Review Log. Append the Fix Summary AFTER the Review Log if one is present.
 - Apply each fix completely — no partial changes
 - If a finding references files that do not exist or patterns that do not match, skip that finding and document why in the Fix Summary
 PROMPT_EOF

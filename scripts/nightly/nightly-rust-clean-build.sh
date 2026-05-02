@@ -147,6 +147,14 @@ if [[ "$STYLE_EVAL_MODE" != "off" ]]; then
         log "WARNING: style evaluation script failed"
     }
 
+    # Always-Claude review pass over each project's EVALUATION.md before the
+    # fix stage spawns. Tightens, scopes, or removes findings that the eval
+    # agent surfaced. Not gated by STYLE_EVAL_MODE — review is always claude.
+    log "Reviewing EVALUATION.md files (always claude)..."
+    "$SCRIPT_DIR/style-eval-review-all.sh" 2>&1 | tee -a "$LOG_FILE" || {
+        log "WARNING: style eval review script failed"
+    }
+
     log "Creating style-fix worktrees..."
     "$SCRIPT_DIR/style-fix-worktrees.sh" 2>&1 | tee -a "$LOG_FILE" || {
         log "WARNING: style-fix worktree script failed"

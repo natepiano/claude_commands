@@ -109,13 +109,40 @@ If the Allow Audit surfaces **any** new allow that is not pre-authorized by the 
 - Only proceed with Cargo Mend Changes + Finding 1 in the next response, after the user has directed how to resolve (or accept) each flagged allow.
 - If the Allow Audit is `No new allows in the diff.`, this halt does not apply — continue to Cargo Mend Changes + Finding 1 as usual.
 
+## Hard rule: banned vocabulary in review output
+
+This rule applies to **every section the user reads** — Original issue, What changed, Assessment, Implications, Concerns, and any narration around the summary table. Not just Concerns/Implications.
+
+**Banned guide-jargon** (from the style guide; opaque to a reader who hasn't reread the docs today):
+
+`anchor type`, `anchor-type`, `anchor-named`, `domain cohort`, `domain-cohort`, `domain-noun cohort`, `behavior owner`, `dictionary file`, `data dictionary`, `junk drawer`, `cohort name`.
+
+**Banned metaphor verbs and adjectives** (vague, decorative, tell the reader nothing concrete):
+
+`carved`, `carve`, `sculpted`, `woven`, `threaded`, `surfaced` (as a transitive verb meaning "exposed"), `crystallized`, `distilled`, `pipeline-shaped`, `module-shaped`, anything-`-shaped`, anything-`-flavored`. The word `shape` itself is already banned project-wide (see global writing rules) — do not slip it in here.
+
+If a banned guide term appears, it must be translated in the same sentence into concrete codebase nouns (file names, type names, function names) and a thing the user can do or decide. If a banned metaphor verb appears, replace it with the literal verb (`split`, `grouped`, `organized`, `divided`, `extracted`, `moved into`).
+
+**Canonical delete-on-sight examples** (do not ship anything resembling these):
+
+1. *"`controller.rs` is a domain-noun cohort name rather than an anchor-type name."*
+   Pure guide-jargon, nothing actionable. Either drop the bullet, or rewrite concretely: *"`controller.rs` holds the `orbit_cam` runtime system plus its private input/transform helpers — one weight-bearing item, not several peers. A name like `runtime.rs` or `pipeline.rs` would predict the contents better."*
+
+2. *"The restore subtree was carved by pipeline phase (`apply/bootstrap.rs`, `apply/cross_dpi.rs`, …)."*
+   `carved` is a decorative verb that says nothing the file list doesn't already say. Rewrite: *"The restore subtree is split into one file per pipeline phase: `apply/bootstrap.rs`, `apply/cross_dpi.rs`, …"* — or just *"The restore subtree has one file per pipeline phase: …"*.
+
+Before submitting any review text, scan for both banned lists. If a banned word appears without a concrete translation in the same sentence, rewrite the sentence or delete it. This check is not optional.
+
 ## Step 1: Read the evaluation and fix summary
 
-Read `EVALUATION.md` in this worktree. It contains two parts:
+Read `EVALUATION.md` in this worktree. It contains up to three parts:
 1. **Findings** — the numbered style violations identified by `/style_eval`
-2. **Fix Summary** — appended by the fix agent, documenting what it did, what it skipped, and why
+2. **Review Log** — appended by `/style_eval_review`, documenting which findings the review pass kept, improved, amended, or removed, and why
+3. **Fix Summary** — appended by the fix agent, documenting what it did, what it skipped, and why
 
 Start by reading the Fix Summary section at the bottom. This gives you the agent's own account of what happened — which findings were applied, which were skipped or partially applied, and any issues encountered (build failures, pattern mismatches, style conflicts, etc.). Also look for the **Cargo Mend Changes** subsection, which documents any automatic visibility/import fixes made by `cargo mend --fix`. Use this as your starting point: you'll verify these claims against the actual diff.
+
+**Removed-by-review findings are reporting-only.** Findings whose body is wrapped in `<!-- REMOVED-BY-REVIEW: ... -->` ... `<!-- /REMOVED-BY-REVIEW -->` markers were struck by the review pass before the fix agent ran. The fix agent did not act on them and you should not evaluate the diff against them. Surface them in the Review Log section of your output (Step 5.5) so the user can see what was cut, but do not produce a finding walkthrough for them in Step 6.
 
 ## Step 2: Load the style guide and read referenced files
 
@@ -183,9 +210,25 @@ Name any project-specific lint the first time it appears (one clause is enough �
 
 One sentence. Done.
 
+## Step 5.5: Surface the Review Log
+
+If `EVALUATION.md` contains a `## Review Log` section, summarize it under a `## Review Log` heading in your output. The user has not read it. Format:
+
+- One line stating totals: `N findings reviewed: K kept, I improved, A amended, R removed.`
+- If anything was improved, amended, or removed, render a short table:
+
+  | # | Action | Reason |
+  |---|---|---|
+  | 1 | improved | tightened Recommended pattern wording |
+  | 3 | removed | rule cited does not exist in the loaded style file |
+
+Only include rows for non-`kept` actions. If every finding was kept, write one sentence: `Review pass kept all N findings as written.` and skip the table.
+
+If `EVALUATION.md` has no `## Review Log` section, omit this section entirely — the eval predates the review stage or the review failed.
+
 ## Step 6: Review each finding
 
-For each numbered finding in EVALUATION.md, assess:
+For each numbered finding in EVALUATION.md that is **not** wrapped in `<!-- REMOVED-BY-REVIEW -->` markers, assess:
 
 - **What was done** — Summarize the actual changes made for this finding (files touched, what was moved/renamed/rewritten)
 - **Applied?** — Was the finding addressed in the diff?
@@ -200,24 +243,26 @@ The first response branches based on whether the Allow Audit is clean.
 
 **Case A — Allow Audit is clean (`No new allows in the diff.`):**
 
-1. Summary table with columns: `# | Finding | Applied | Correct | Complete | Issues`
-2. `## Allow Audit` (per Step 4 format — one sentence)
-3. `## Cargo Mend Changes` (per Step 5 format)
-4. `## Finding 1` walkthrough (per Step 8 format)
+1. Summary table with columns: `# | Finding | Applied | Correct | Complete | Issues` — list only findings NOT wrapped in REMOVED-BY-REVIEW markers; the row number is the finding's original number
+2. `## Review Log` (per Step 5.5 format — omit if EVALUATION.md has no Review Log section)
+3. `## Allow Audit` (per Step 4 format — one sentence)
+4. `## Cargo Mend Changes` (per Step 5 format)
+5. `## Finding N` walkthrough — N is the lowest-numbered finding NOT removed-by-review (per Step 8 format)
 
 Then **stop**. Do not output Finding 2 or anything else in the same response. Wait for the user to reply before producing Finding 2 — and then Finding 2 only.
 
 **Case B — Allow Audit flagged one or more non-pre-authorized allows:**
 
-1. Summary table with columns: `# | Finding | Applied | Correct | Complete | Issues`
-2. `## Allow Audit` (per Step 4 format — itemized list)
-3. `## Recommendations` (one concrete proposed action per flagged allow)
-4. A direct question asking the user how to proceed.
+1. Summary table with columns: `# | Finding | Applied | Correct | Complete | Issues` — list only findings NOT wrapped in REMOVED-BY-REVIEW markers
+2. `## Review Log` (per Step 5.5 format — omit if EVALUATION.md has no Review Log section)
+3. `## Allow Audit` (per Step 4 format — itemized list)
+4. `## Recommendations` (one concrete proposed action per flagged allow)
+5. A direct question asking the user how to proceed.
 
 Then **stop**. Do **not** output Cargo Mend Changes or Finding 1 in this response. Once the user has resolved the allow question in a subsequent turn, the next response outputs:
 
 1. `## Cargo Mend Changes` (per Step 5 format)
-2. `## Finding 1` walkthrough (per Step 8 format)
+2. `## Finding N` walkthrough — N is the lowest-numbered finding NOT removed-by-review (per Step 8 format)
 
 — and then stops, following the one-finding-per-response rule.
 
@@ -261,14 +306,14 @@ For each finding, output a compact block with these parts. Keep the whole thing 
      ```
    - **Prose form** — use for file moves, splits, deletions, or renames of whole files. Pattern: `` `old/path.rs` → `new/path.rs` `` with a one-clause description of why. Never write "X was renamed to Y" without paths.
 4. **Assessment** — a single line or short sentence: applied / correct / complete, and one phrase citing the style rule.
-5. **Implications** — bullet list only when the fix has a downstream consequence the user should weigh, even if no immediate action is required. An implication is something that may shape a *decision* the user makes next: a tradeoff, a precedent set, a knock-on effect on callers, a constraint added to future work. The user reading the bullet should be able to think "ah, that's a thing I now have to consider" — not "yes, the rule was followed." High bar: if it is just restating that a rule was satisfied, drop it. Omit the section entirely when empty. Never use this section as a softer home for passed checks.
+5. **Implications** — bullet list only when the fix has a downstream consequence the user should weigh, even if no immediate action is required. An implication is something that may shape a *decision* the user makes next: a tradeoff, a precedent set, a knock-on effect on callers, a constraint added to future work. The user reading the bullet should be able to think "ah, that's a thing I now have to consider" — not "yes, the rule was followed." High bar: if it is just restating that a rule was satisfied, or if a competent reader would predict the consequence from the change itself (e.g. "narrower visibility means widening later if scope grows"), drop it. Omit the section entirely when empty. Never use this section as a softer home for passed checks.
 6. **Concerns** — bullet list only if there are items that need the user's attention. Each bullet: the concern + the evidence (diff snippet, style-guide phrase) that raised it. Say "speculative" if it is. Any newly added `#[allow(...)]`, `#![allow(...)]`, or `Cargo.toml` lint set to `"allow"` introduced by this finding's fix MUST appear here as its own bullet (not in a separate section) — name the lint, the file:line, and what should be done about it. **Do not list passed checks here.** If a check passed, the user does not need to see it — silence is the signal that something was done well. If you find yourself writing a bullet that ends in "OK", "good fit", "correct", or any other affirmation, delete it. Resolved checks belong in your own reasoning, not the review output. If there are no real concerns and no new allows, omit the section entirely.
 
 ### Voice and audience for Implications, Concerns, and Assessment
 
 The reader is a working engineer who has read EVALUATION.md once, has not re-read the style guide today, and is not deep in the diff right now. Write for that reader.
 
-- **Plain language over guide-jargon.** If a bullet uses internal style-guide vocabulary ("anchor type," "domain cohort," "behavior owner," "anchor-named module," "dictionary file") without translating, rewrite it in domain words from this codebase. Example — replace *"`mutability.rs` is a domain-cohort module rather than an anchor-type module"* with *"`mutability.rs` holds three small types (`Mutability`, `MutabilityIssue`, `MutabilityIssueTarget`) instead of one — fine for now, but if a fourth unrelated type lands here, it has slid back into a junk drawer."* The second sentence tells the reader something they can act on; the first only labels what's there.
+- **Plain language over guide-jargon.** Banned-vocabulary list and rewrite rule are in the "Hard rule: banned vocabulary in Concerns, Implications, and Assessment" section above. Apply it before submitting.
 - **Lead with what the user can do or decide.** Concerns must be actionable: name the file:line, what's wrong, and the proposed fix. Implications must inform a *decision* the user might make next — a tradeoff, a precedent, a constraint on future work, a knock-on effect on callers. If a bullet does not change behavior or shape a decision, drop it.
 - **One-pass readability test.** Before submitting any bullet, ask: would the reader, on first read, know what was changed and why this bullet is in front of them? If they would have to re-read the style guide or scroll back to the diff to parse it, rewrite it.
 - **Never use the rule's name as the answer.** "The style file allows this" or "the rule's fallback applies" is not informative. State what was specifically done and what it costs or implies — concretely, in this codebase's vocabulary.

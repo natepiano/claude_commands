@@ -1,5 +1,5 @@
 ---
-description: Show a per-project nightly status table across clean / warmup / evaluation / style-fix phases, with commentary
+description: Show a per-project nightly status table across clean / warmup / evaluation / review / style-fix phases, with commentary
 ---
 
 ## Arguments
@@ -29,8 +29,8 @@ Manual runs that cover only one phase produce a partial log — the matrix shoul
 
 Summarize one run as a single matrix the user can scan in one glance:
 
-- **Rows** = every project that appeared in any phase (union of the clean-phase iteration list, the warmup targets, the style-evaluation list, and the style-fix eligible list).
-- **Columns** = **Clean**, **Warmup**, **Eval**, **Fix**.
+- **Rows** = every project that appeared in any phase (union of the clean-phase iteration list, the warmup targets, the style-evaluation list, the eval-review list, and the style-fix eligible list).
+- **Columns** = **Clean**, **Warmup**, **Eval**, **Review**, **Fix**.
 - **Cells** = `OK`, `FAIL`, `SKIP`, or `—` when the phase did not apply (or the log did not cover that phase).
 
 Below the table, write a Commentary section that names every failure, every script-level crash, and aggregate skip counts. The user should be able to tell from this report alone *what ran, what did not, what failed, and why*.
@@ -61,8 +61,9 @@ Phase boundaries (in order):
 
 1. **Clean+rebuild** — from start until the first `WARMUP` line or `=== Style evaluation` header, whichever comes first. (Absent in style-fix-manual logs.)
 2. **Warmup** — all `WARMUP*` lines (these are scattered between clean and eval). (Absent in style-fix-manual logs.)
-3. **Style evaluation** — between `=== Style evaluation: N projects ===` and `=== Done: A succeeded, B failed out of N ===`. (Absent in style-fix-manual logs.)
-4. **Style fix** — between `=== Style-fix worktrees: N eligible projects ===` and end-of-run. (This is the only phase a style-fix-manual log contains.)
+3. **Style evaluation** — between `=== Style evaluation: N projects ===` and the matching `=== Done: A succeeded, B failed out of N ===`. (Absent in style-fix-manual logs.)
+4. **Style eval review** — between `=== Style eval review: N projects ===` and the matching `=== Done: A reviewed, B failed out of N ===`. (Absent in style-fix-manual logs and in old logs that predate the review stage.)
+5. **Style fix** — between `=== Style-fix worktrees: N eligible projects ===` and end-of-run. (This is the only phase a style-fix-manual log contains.)
 
 If a phase header is missing entirely, mark every project's cell for that phase as `—` and add a Notes line saying which phases the log does not cover.
 
@@ -86,6 +87,15 @@ If a phase header is missing entirely, mark every project's cell for that phase 
 - Project not listed → `—`
 - Cross-check the phase footer: `=== Done: A succeeded, B failed out of N ===` — A and B should equal the cells you marked OK/FAIL.
 
+**Style eval review phase**
+- `OK: <project>` → `OK`
+- `FAILED: <project> \((reason)\)` → `FAIL` (capture reason)
+- `SKIP: <project> \((reason)\)` → `SKIP` (capture reason — most commonly `already reviewed`)
+- `Launched: <project>` with no later result → `FAIL (no result; run ended mid-phase)`
+- Project not listed in this phase → `—`
+- If the phase header is absent (old log predating the review stage), every cell in the Review column is `—`. Add a Notes line saying so and do not treat it as failure.
+- Cross-check the phase footer: `=== Done: A reviewed, B failed out of N ===` — A and B should equal the cells you marked OK/FAIL.
+
 **Style fix phase** — for each project listed as `ELIGIBLE: <project>`, resolve the cell by walking these sources in order and stopping at the first hit:
 
 1. **Log result line** in the fix-phase slice:
@@ -107,11 +117,11 @@ Crash detection (for commentary, not cell resolution): if the phase header appea
 Render a markdown table sorted alphabetically by project. Keep cells short — only `OK`, `FAIL`, `SKIP`, or `—`. Put reasons in commentary, not cells.
 
 ```
-| Project | Clean | Warmup | Eval | Fix |
-|---|---|---|---|---|
-| bevy_brp | OK | — | SKIP | SKIP |
-| bevy_catenary | OK | — | SKIP | FAIL |
-| ... | ... | ... | ... | ... |
+| Project | Clean | Warmup | Eval | Review | Fix |
+|---|---|---|---|---|---|
+| bevy_brp | OK | — | SKIP | — | SKIP |
+| bevy_catenary | OK | — | OK | OK | FAIL |
+| ... | ... | ... | ... | ... | ... |
 ```
 
 ### 5. Commentary
@@ -124,6 +134,7 @@ After the table, write these sub-sections (omit any that have nothing to report)
 - `Clean: P processed, S skipped`
 - `Warmup: O ok, F fail, S skip` (with the names of any FAIL)
 - `Eval: A/N evaluated` (matching the `=== Done:` footer)
+- `Review: A reviewed, B failed of N` (matching the review-stage `=== Done:` footer; omit if the phase header is absent)
 - `Fix: ran on E/E eligible` or `Fix: did not run — <reason>` if the script crashed
 - For phases the log does not cover (e.g. clean/warmup/eval in a style-fix-manual log), write `<phase>: not in this log`.
 
