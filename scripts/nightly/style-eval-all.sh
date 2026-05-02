@@ -259,6 +259,8 @@ echo "Waiting for ${#pids[@]} processes..."
 failed=0
 succeeded=0
 idx=0
+# Bash 3.2 trips set -u on empty arrays expanded as "${pids[@]}", so guard.
+if [[ ${#pids[@]} -gt 0 ]]; then
 for pid in "${pids[@]}"; do
     name="${names[$idx]}"
     project_root="${roots_for_wait[$idx]}"
@@ -291,6 +293,7 @@ for pid in "${pids[@]}"; do
     succeeded=$((succeeded + 1))
     idx=$((idx + 1))
 done
+fi
 
 echo ""
 echo "=== Done: $succeeded succeeded, $failed failed out of ${#projects[@]} ==="
