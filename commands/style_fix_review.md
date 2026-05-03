@@ -99,6 +99,36 @@ A single fix may touch concerns the finding's style file does not cover — e.g.
 3. **Cite each governing file** with a `**Style rule (<concern>):**` line in the proposal. A fix touching three concerns should cite three rules (or explicitly note which have no governing rule).
 4. **Never propose a pattern for a secondary concern without doing the lookup**, even if the concern feels minor. A one-line allow placement or a two-word rename can violate an explicit rule just as loudly as a big restructure.
 
+## Hard rule: read the governing style file before every Concern bullet
+
+This is the review-time mirror of the "read the governing style file before every fix proposal" rule. It applies to every Concern bullet you write during a finding walkthrough, including bullets about details the finding itself did not raise (visibility, imports, mod declarations, naming, allows, observers, error handling, etc.).
+
+No Concern bullet may be written from intuition. Every Concern bullet must begin with one of:
+
+- `**Style rule:**` — quote the relevant prescription and cite the file (e.g. `leaf-module-visibility.md`).
+- `**No rule found:**` — state the search you actually performed (which files you grepped, which lint names you looked up) and why you are raising the concern anyway.
+
+If you cannot produce one of those two prefixes after a real lookup, delete the bullet. "It feels off" is not a Concern; it is a prompt to do the lookup or drop the worry.
+
+This rule is the strongest signal in the skill. It overrides the instinct to free-form a Concern when the rest of the walkthrough is going smoothly. A Concern without a cited rule is a defect — it leaks bad guidance into the user's review of every future style fix.
+
+### Visibility-trigger checklist
+
+If the diff contains **any** of the following, you must read the listed files before writing any Concern that touches visibility, module structure, or import paths:
+
+- a new or changed `pub(...)` modifier
+- a new `mod` declaration (whether `pub`, `pub(super)`, `pub(crate)`, or private)
+- a new or changed `pub use` / `pub(super) use` / `pub(crate) use` re-export
+- a new leaf file under an existing module directory
+
+Required reading on those triggers:
+
+- `~/rust/nate_style/rust/leaf-module-visibility.md`
+- `~/rust/nate_style/rust/no-pub-in-path.md`
+- `~/rust/nate_style/rust/no-pubcrate-in-nested-modules.md`
+
+Read them even when the finding's own `Style file:` points elsewhere. The mend loader includes these files (they are `mode: flag`, not `mode: auto`), but inclusion in the loader does not guarantee you consulted them — this checklist forces the consult.
+
 ## Hard rule: Allow Audit halt
 
 If the Allow Audit surfaces **any** new allow that is not pre-authorized by the style guide, the skill **must halt after the Allow Audit section** — before Cargo Mend Changes, before Finding 1. New allows are a direct violation of `agent-must-review-allows.md` and must be resolved with the user before the rest of the review proceeds.
