@@ -339,7 +339,31 @@ For each finding, output a compact block with these parts. Keep the whole thing 
    - **Prose form** — use for file moves, splits, deletions, or renames of whole files. Pattern: `` `old/path.rs` → `new/path.rs` `` with a one-clause description of why. Never write "X was renamed to Y" without paths.
 4. **Assessment** — a single line or short sentence: applied / correct / complete, and one phrase citing the style rule.
 5. **Implications** — bullet list only when the fix has a downstream consequence the user should weigh, even if no immediate action is required. An implication is something that may shape a *decision* the user makes next: a tradeoff, a precedent set, a knock-on effect on callers, a constraint added to future work. The user reading the bullet should be able to think "ah, that's a thing I now have to consider" — not "yes, the rule was followed." High bar: if it is just restating that a rule was satisfied, or if a competent reader would predict the consequence from the change itself (e.g. "narrower visibility means widening later if scope grows"), drop it. Omit the section entirely when empty. Never use this section as a softer home for passed checks.
-6. **Concerns** — bullet list only if there are items that need the user's attention. Each bullet: the concern + the evidence (diff snippet, style-guide phrase) that raised it. Say "speculative" if it is. Any newly added `#[allow(...)]`, `#![allow(...)]`, or `Cargo.toml` lint set to `"allow"` introduced by this finding's fix MUST appear here as its own bullet (not in a separate section) — name the lint, the file:line, and what should be done about it. **Do not list passed checks here.** If a check passed, the user does not need to see it — silence is the signal that something was done well. If you find yourself writing a bullet that ends in "OK", "good fit", "correct", or any other affirmation, delete it. Resolved checks belong in your own reasoning, not the review output. If there are no real concerns and no new allows, omit the section entirely.
+6. **Concerns** — bullet list only if there are items that need the user's attention. Use the terse, scannable format below — not dense prose. If there are no real concerns and no new allows, omit the section entirely.
+
+   **Required format per concern:**
+
+   - **`<file or short identifier>`** — one short sentence stating what the agent did and what's wrong. One short line citing the rule (only if non-obvious from the first line). End with an explicit action question.
+
+   **Hard limits:**
+   - Each concern body: ≤ 3 short lines. If you need more, you're explaining too much — cut the history and the citation chain, keep the verdict.
+   - No multi-clause sentences strung together with em-dashes. Two short sentences beat one long one.
+   - The action question is mandatory. It must name the user's options (e.g. "Reorder?", "Revert, keep wrapper, or amend the guide?", "Move back to file scope or accept in-fn?").
+   - No "Decision needed:" preamble. The question itself signals the decision.
+
+   **Good (the format the user can read):**
+
+   > **`animation_poc_lerp.rs`** — agent moved `const CURSOR_NAME` *inside* `fn setup`. Style guide says example targets get constants at top-of-file after imports — not inside functions. Move to file top, leave inside fn, or amend style guide?
+
+   **Bad (delete on sight — paragraph-shaped, decision buried):**
+
+   > **`animation_poc_lerp.rs`: function-local `const` invokes an exception that doesn't exist.** The Fix Summary cites a "const inside the single function that uses it" exception. `no-magic-values.md` lists three exceptions: `impl Type` constants, single-file binary targets... so the example-target exception applies — the const should be at the top of the file (right after `use bevy::window::PrimaryWindow;` on line 12), not inside `setup`. Decision needed: either move it back to file scope after imports, or accept the function-local placement and amend the style file to permit it.
+
+   **Special cases (still follow the format):**
+   - Newly added `#[allow(...)]`, `#![allow(...)]`, or `Cargo.toml` `"allow"`: name the lint and `file:line` in the headline; one line on what should be done; action question.
+   - Speculative concerns: prefix the body with `(speculative)`.
+
+   **Do not list passed checks here.** Silence is the signal that something was done well. Bullets ending in "OK", "good fit", "correct" — delete.
 
 ### Voice and audience for Implications, Concerns, and Assessment
 
@@ -349,6 +373,7 @@ The reader is a working engineer who has read EVALUATION.md once, has not re-rea
 - **Lead with what the user can do or decide.** Concerns must be actionable: name the file:line, what's wrong, and the proposed fix. Implications must inform a *decision* the user might make next — a tradeoff, a precedent, a constraint on future work, a knock-on effect on callers. If a bullet does not change behavior or shape a decision, drop it.
 - **One-pass readability test.** Before submitting any bullet, ask: would the reader, on first read, know what was changed and why this bullet is in front of them? If they would have to re-read the style guide or scroll back to the diff to parse it, rewrite it.
 - **Never use the rule's name as the answer.** "The style file allows this" or "the rule's fallback applies" is not informative. State what was specifically done and what it costs or implies — concretely, in this codebase's vocabulary.
+- **Format check before submitting.** Read each Concerns bullet aloud. If it takes more than ~10 seconds to say, or if the action question isn't the last thing, rewrite it. The Concerns bullet format is enforced — long-form prose is a bug.
 - **Anti-patterns to delete on sight:**
   - Bullets that end in an affirmation ("OK," "good fit," "correct," "this is fine"). These are passed checks; silence is the signal.
     - Negative example — delete on sight: *"Public-facade visibility unchanged. Items retain their original `pub(crate)` visibility... `pub(crate)` is the correct choice... No change needed — flagging only because Finding 1's restructuring made me check every visibility decision in the diff."* This is a passed check the reviewer self-flagged as non-actionable ("No change needed — flagging only because..."). Omit the bullet — and if it was the only bullet, omit the entire Concerns section.
