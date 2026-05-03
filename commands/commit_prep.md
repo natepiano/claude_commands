@@ -3,10 +3,26 @@
 <ExecutionSteps>
     **EXECUTE THESE STEPS IN ORDER:**
     **STEP 1:** Execute <AnalyzeChanges/>
-    **STEP 2:** Execute <CommitTitleHandling/>
-    **STEP 3:** Execute <GenerateCommitBody/>
-    **STEP 4:** Execute <FinalCommitDecision/>
+    **STEP 2:** Execute <ClippyPrecheck/>
+    **STEP 3:** Execute <CommitTitleHandling/>
+    **STEP 4:** Execute <GenerateCommitBody/>
+    **STEP 5:** Execute <FinalCommitDecision/>
 </ExecutionSteps>
+
+<ClippyPrecheck>
+First, look at the file list from <AnalyzeChanges/>. If none of the uncommitted files are Rust source (`.rs`) or Cargo manifests (`Cargo.toml`, `Cargo.lock`), skip this step silently — clippy is irrelevant.
+
+Otherwise, check your own conversation context to determine whether `/clippy` has been run recently — i.e., whether the `clippy` skill has been invoked in this session **after the most recent Rust code changes**.
+
+- **If `/clippy` has been run recently after the latest Rust edits**: Proceed silently to the next step. Do NOT ask the user. Do NOT mention clippy. Do not take an extra turn.
+- **If `/clippy` has NOT been run recently** (or no clippy run is visible in context at all): Ask the user exactly once:
+
+  > Run `/clippy` first? (yes/no)
+
+  Wait for the user's response.
+  - If **yes**: Invoke the `clippy` skill, then continue to the next step.
+  - If **no**: Continue to the next step without running clippy.
+</ClippyPrecheck>
 
 <AnalyzeChanges>
 Run `bash ~/.claude/scripts/commit_prep/analyze_changes.sh` to gather git status and diffs in a single command.
