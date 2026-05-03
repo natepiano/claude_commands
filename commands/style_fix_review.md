@@ -119,7 +119,9 @@ This rule applies to **every section the user reads** — Original issue, What c
 
 **Banned metaphor verbs and adjectives** (vague, decorative, tell the reader nothing concrete):
 
-`carved`, `carve`, `sculpted`, `woven`, `threaded`, `surfaced` (as a transitive verb meaning "exposed"), `crystallized`, `distilled`, `pipeline-shaped`, `module-shaped`, anything-`-shaped`, anything-`-flavored`. The word `shape` itself is already banned project-wide (see global writing rules) — do not slip it in here.
+`carve`, `carves`, `carved`, `carving`, `carve-out`, `carve out`, `sculpted`, `woven`, `threaded`, `surfaced` (as a transitive verb meaning "exposed"), `crystallized`, `distilled`, `pipeline-shaped`, `module-shaped`, anything-`-shaped`, anything-`-flavored`. The word `shape` itself is already banned project-wide (see global writing rules) — do not slip it in here.
+
+**`carve` and its inflections are a hard ban with zero exceptions.** This includes figurative uses like "the rule does not carve an exception" or "the style file carves out a subset." Never substitute another metaphor — use the literal verb that names the operation: `extract`, `split`, `move`, `refactor`, `introduce`, `define`, `permit`, `exempt`, `name as an exception`. Before submitting any response, grep your draft for `carv` as a substring and rewrite every hit.
 
 If a banned guide term appears, it must be translated in the same sentence into concrete codebase nouns (file names, type names, function names) and a thing the user can do or decide. If a banned metaphor verb appears, replace it with the literal verb (`split`, `grouped`, `organized`, `divided`, `extracted`, `moved into`).
 

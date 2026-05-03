@@ -37,57 +37,42 @@ Decision:
 
 ## <ArmMonitor/>
 
-Inspect the last ~30 lines of `${LOG_PATH}` to identify which phase is currently running. This shapes what the user will see next, so report it before arming:
+Identify the current phase by calling the parser:
 
 ```bash
-tail -30 ${LOG_PATH}
+python3 ~/.claude/scripts/nightly/nightly_report_parse.py --phase-detect ${LOG_PATH}
 ```
 
-Classify the current phase from the most recent matching keyword:
+Output is two lines:
 
-- `CLEAN:` / `BUILD:` / `MEND:` / `DONE:` → **clean+rebuild phase**
-- `WARMUP` → **warmup phase**
-- `=== Style evaluation` or `Launched: <project> via codex` → **style eval phase**
-- `=== Style-fix worktrees` or `Launched: <project> (PID` → **style-fix phase**
-- `=== Nightly Rust clean + rebuild complete` → **already finished** — tell the user the run is done, do not arm a monitor, stop.
+```
+PHASE <name>          # one of: clean+rebuild, warmup, style-eval, style-eval-review, style-fix, done, unknown
+LATEST_EVENT "<line>"
+```
 
-Tell the user: `Detected phase: <phase>. Arming monitor on ${LOG_PATH}.`
+If `PHASE done`, tell the user the run is finished and stop — do not arm a monitor.
 
-Then call the Monitor tool with these exact parameters:
+Otherwise tell the user: `Detected phase: <name>. Arming monitor on ${LOG_PATH}.`
 
-- `description`: `nightly: <phase>` (e.g. `nightly: style-fix worktrees`)
+Fetch the live-monitor filter regex from the parser (single source of truth — keeps phase classification and live filtering in lockstep):
+
+```bash
+FILTER_REGEX=$(python3 ~/.claude/scripts/nightly/nightly_report_parse.py --filter-regex)
+```
+
+Call the Monitor tool with these exact parameters:
+
+- `description`: `nightly: <phase>` (e.g. `nightly: style-fix`)
 - `persistent`: `true`
 - `timeout_ms`: `3600000`
 - `command`:
   ```
-  tail -F -n 0 ${LOG_PATH} 2>/dev/null | grep -E --line-buffered "<FILTER_REGEX>"
+  tail -F -n 0 ${LOG_PATH} 2>/dev/null | grep -E --line-buffered "${FILTER_REGEX}"
   ```
 
-Where `<FILTER_REGEX>` is the single combined alternation defined in <FilterRegex/>. Always use the combined regex regardless of detected phase — the regex is cheap and the phase can transition mid-run (e.g. clean→build→eval→fix all in one orchestrator run).
+Always use the parser's regex regardless of detected phase — the regex is cheap and phases transition mid-run (clean → eval → fix all in one orchestrator run).
 
 After Monitor returns its task id, tell the user: `Monitor armed (task <id>). I will report state transitions as they arrive.` Then yield — do not poll, do not sleep, do not re-read the log.
-
-## <FilterRegex/>
-
-Single alternation covering every meaningful state-transition line across all phases. Lines matching this regex are the events the user wants to know about; everything else is noise.
-
-```
-(^|[[:space:]])(CLEAN|BUILD|MEND|DONE|ERROR|WARNING|TIMEOUT|RETRY|RETRY OK|RETRY FAILED|FAILED|WARN|OK):|(^|[[:space:]])WARMUP (OK|FAIL|SKIP):|(^|[[:space:]])Launched: |^=== |(^|[[:space:]])commit-style-results: |^Wrote /Users/natemccoy/rust/nate_style/style_report\.md$
-```
-
-Anchoring note: the orchestrator's `log()` function timestamps every clean+rebuild line (`YYYY-MM-DD HH:MM:SS CLEAN: …`), but the eval/fix sub-scripts `echo` bare keywords (`OK: …`). The keyword-prefix alternation accepts either start-of-line **or** preceding whitespace so both forms match. Using a pure `^` anchor here silently drops every clean-phase event — do not narrow.
-
-Coverage rationale (do not narrow this without restoring all categories):
-
-- Clean+rebuild: `CLEAN:`, `BUILD:`, `MEND:`, `DONE:`, `ERROR:`, `WARNING:`
-- Warmup: `WARMUP OK`, `WARMUP FAIL`, `WARMUP SKIP`
-- Style eval / fix: `OK:`, `WARN:`, `ERROR:`, `FAILED:`, `RETRY:`, `RETRY OK:`, `RETRY FAILED:`, `TIMEOUT:`
-- Per-project launches across both eval and fix: `Launched:`
-- Section markers and final summary: any `=== ` line (`=== Style evaluation`, `=== Style-fix worktrees`, `=== Done:`, `=== Nightly Rust clean + rebuild complete`)
-- Commit-step status: `commit-style-results: ` (matches both `commit-style-results: skipped — unexpected changes` and any future success/error variants from `commit-style-results.sh`)
-- Style report write: `Wrote /Users/natemccoy/rust/nate_style/style_report.md` is the marker that `style_report.py --generate` finished writing the Obsidian summary; precise anchoring keeps unrelated `Wrote ` lines out
-
-`SKIP:` (project-skipped lines from the clean phase) is intentionally **not** matched — those are high-volume and low-signal. If the user later asks for full visibility, add `|^SKIP: ` to the alternation.
 
 ## <EventReporting/>
 

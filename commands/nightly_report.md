@@ -2,160 +2,134 @@
 description: Show a per-project nightly status table across clean / warmup / evaluation / review / style-fix phases, with commentary
 ---
 
+# Nightly Report
+
+Render a status view of one nightly run from a parsed log. All log discovery, regex matching, phase slicing, and bookkeeping suppression lives in `~/.claude/scripts/nightly/nightly_report_parse.py`. This command only routes arguments and renders the parsed output.
+
 ## Arguments
 
 `$ARGUMENTS` may be:
 
-1. **Empty** — pick the newest log in `~/.local/logs/nightly/` by **filename timestamp** (the `YYYYMMDD-HHMMSS` embedded in the filename) and report on it. Filename timestamp is preferred over mtime because copying or rewriting a file changes mtime but not the encoded run-start.
-2. **The literal word `list`** — enumerate available logs in `~/.local/logs/nightly/` (newest first by filename timestamp, with run-age delta and a one-word phase summary), ask the user to pick one, then report on the chosen log. Do not produce a matrix on this turn.
-3. **A path** — report on that exact file. If the file does not exist, tell the user `No log at <path>` and stop.
+1. **Empty** — call `nightly_report_parse.py` with no arguments. The parser picks the newest log in `~/.local/logs/nightly/`.
+2. **The literal word `list`** — call `nightly_report_parse.py --list`. Print the numbered list (path, age, status, phases). Ask the user to pick by index, then call `nightly_report_parse.py <chosen-path>` and render.
+3. **A path** — call `nightly_report_parse.py <path>`. If the parser exits with `ERROR: log not found`, surface that and stop.
 
-If `~/.local/logs/nightly/` is empty or missing, fall back to:
-- `~/.local/logs/nightly-rust-clean-build.log` (legacy single-file path; may be a symlink to the latest run)
-- `/tmp/nightly-rust-clean-build-stdout.log` (launchd plist sink)
-
-If none exist, tell the user `No nightly logs available` and stop.
-
-## Log accumulation
-
-Every run that produces a log lives under `~/.local/logs/nightly/`:
-
-- `nightly-YYYYMMDD-HHMMSS.log` — full orchestrator runs (clean + warmup + eval + fix), produced by `nightly-rust-clean-build.sh`
-- `style-fix-manual-YYYYMMDD-HHMMSS.log` — manual style-fix runs launched via `~/.claude/scripts/nightly/style-fix-manual.sh`
-
-Manual runs that cover only one phase produce a partial log — the matrix should still render, but with `—` in every column the log does not have data for, and a Notes line saying which phases are absent.
-
-## Goal
-
-Summarize one run as a single matrix the user can scan in one glance:
-
-- **Rows** = every project that appeared in any phase (union of the clean-phase iteration list, the warmup targets, the style-evaluation list, the eval-review list, and the style-fix eligible list).
-- **Columns** = **Clean**, **Warmup**, **Eval**, **Review**, **Fix**.
-- **Cells** = `OK`, `FAIL`, `SKIP`, or `—` when the phase did not apply (or the log did not cover that phase).
-
-Below the table, write a Commentary section that names every failure, every script-level crash, and aggregate skip counts. The user should be able to tell from this report alone *what ran, what did not, what failed, and why*.
-
-## Steps
-
-### 0. Resolve the log path
-
-Apply the rules in **Arguments** to pick `${LOG_PATH}`. State it in one line at the top of the report:
-```
-Report for: <path> (mtime: Ns ago)
-```
-
-For the `list` argument:
-- Enumerate `~/.local/logs/nightly/*.log`, sort by the `YYYYMMDD-HHMMSS` substring in the filename (descending — newest first).
-- For each file, compute the run-age delta from the filename timestamp (parse with `date -j -f '%Y%m%d-%H%M%S' <ts>`) against `$(date +%s)` and format as `Nm Ns ago` / `Nh Nm ago` / `Nd Nh ago`.
-- For each file, peek `head -1` for the run start timestamp and `tail -3` for the run-complete marker. Tag the entry with one of: `complete`, `crashed`, `partial (style-fix only)`, or `in progress`.
-- Print a numbered list. Ask the user to pick by index. Wait for the answer; on this turn, do not produce a matrix.
-
-### 1. Read and bound the run
-
-- **Start**: first line matching `^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}` — extract the timestamp.
-- **End**: line matching `=== Nightly Rust clean \+ rebuild complete \((\d+m \d+s)\) ===`. If absent, the run is still in progress or it is a partial (single-phase) log — note that in commentary and proceed with whatever data exists.
-
-### 2. Slice the log into phases
-
-Phase boundaries (in order):
-
-1. **Clean+rebuild** — from start until the first `WARMUP` line or `=== Style evaluation` header, whichever comes first. (Absent in style-fix-manual logs.)
-2. **Warmup** — all `WARMUP*` lines (these are scattered between clean and eval). (Absent in style-fix-manual logs.)
-3. **Style evaluation** — between `=== Style evaluation: N projects ===` and the matching `=== Done: A succeeded, B failed out of N ===`. (Absent in style-fix-manual logs.)
-4. **Style eval review** — between `=== Style eval review: N projects ===` and the matching `=== Done: A reviewed, B failed out of N ===`. (Absent in style-fix-manual logs and in old logs that predate the review stage.)
-5. **Style fix** — between `=== Style-fix worktrees: N eligible projects ===` and end-of-run. (This is the only phase a style-fix-manual log contains.)
-
-If a phase header is missing entirely, mark every project's cell for that phase as `—` and add a Notes line saying which phases the log does not cover.
-
-### 3. Parse each phase per project
-
-**Clean+rebuild phase**
-- `^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2} CLEAN: <project>` and the matching `BUILD: <project>` line mean the project was processed. Without an explicit per-project DONE marker, treat it as `OK` unless an `ERROR:` or `WARNING:` line for that project appears in this phase slice.
-- `^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2} SKIP: <project> \((reason)\)` → `SKIP` (capture reason for commentary).
-
-**Warmup phase**
-- `WARMUP OK: <project>` → `OK`
-- `WARMUP FAIL: <project> \((reason)\)` → `FAIL` (capture reason)
-- `WARMUP SKIP: <project> \((reason)\)` → `SKIP` (capture reason)
-- Project not listed in warmup at all → `—`
-
-**Style evaluation phase**
-- `OK: <project> \(\s*\d+ lines\)` → `OK`
-- `FAILED: <project>` / `ERROR: <project>` / `TIMEOUT: <project>` → `FAIL` (capture trailing parenthetical as reason)
-- `SKIP: <project> \((reason)\)` → `SKIP`
-- `Launched: <project> via codex (PID …)` with no later result → `FAIL (no result; run ended mid-phase)`
-- Project not listed → `—`
-- Cross-check the phase footer: `=== Done: A succeeded, B failed out of N ===` — A and B should equal the cells you marked OK/FAIL.
-
-**Style eval review phase**
-- `OK: <project>` → `OK`
-- `FAILED: <project> \((reason)\)` → `FAIL` (capture reason)
-- `SKIP: <project> \((reason)\)` → `SKIP` (capture reason — most commonly `already reviewed`)
-- `Launched: <project>` with no later result → `FAIL (no result; run ended mid-phase)`
-- Project not listed in this phase → `—`
-- If the phase header is absent (old log predating the review stage), every cell in the Review column is `—`. Add a Notes line saying so and do not treat it as failure.
-- Cross-check the phase footer: `=== Done: A reviewed, B failed out of N ===` — A and B should equal the cells you marked OK/FAIL.
-
-**Style fix phase** — for each project listed as `ELIGIBLE: <project>`, resolve the cell by walking these sources in order and stopping at the first hit:
-
-1. **Log result line** in the fix-phase slice:
-   - `OK: <project>` → `OK`
-   - `ERROR: <project>` / `FAILED: <project>` / `TIMEOUT: <project>` / `WARN: <project>` → `FAIL` (capture reason)
-2. **Worktree on disk** at `~/rust/<project>_style_fix/` (or `~/rust/<project>_style_fix/<subpath>/` for workspace members):
-   - `EVALUATION.md` contains `^## Fix Summary` → `OK` (annotate commentary: "OK from disk; supervisor did not log result")
-   - Worktree exists but no Fix Summary → `FAIL (work did not complete)`
-3. **Nothing on disk, nothing in log**:
-   - If the phase header appeared with no per-project work → `FAIL (script crashed before run)`
-   - Otherwise → `FAIL (no result; cause unknown)`
-
-`SKIP: <project> \((reason)\)` lines override everything → `SKIP`. Project not in the eligible list → `—`.
-
-Crash detection (for commentary, not cell resolution): if the phase header appeared and no project produced any work, look for `WARNING: style-fix worktree script failed` or a bash syntax error like `unexpected EOF while looking for matching` and surface the exact line.
-
-### 4. Build the table
-
-Render a markdown table sorted alphabetically by project. Keep cells short — only `OK`, `FAIL`, `SKIP`, or `—`. Put reasons in commentary, not cells.
+## Parser output format
 
 ```
-| Project | Clean | Warmup | Eval | Review | Fix |
-|---|---|---|---|---|---|
-| bevy_brp | OK | — | SKIP | — | SKIP |
-| bevy_catenary | OK | — | OK | OK | FAIL |
-| ... | ... | ... | ... | ... | ... |
+PATH: <path>
+MTIME_AGO: <age>
+RUN_START: <ts>
+RUN_END: <ts>
+ELAPSED: <duration | "-">
+STATUS: complete | crashed | partial | in-progress
+
+PHASE <name> present=<bool> ok=N fail=N skip=N [footer_ok=N footer_fail=N footer_total=N]
+ROW <project>  clean=<cell> warmup=<cell> eval=<cell> review=<cell> fix=<cell>
+ALWAYS_EXCLUDED "<reason>" count=N projects=<a,b,c>   ← user opted these out via [exclude] in nightly-rust.conf
+FILTERED_OUT "<reason>" count=N projects=<a,b,c>      ← would be eligible, but framework state / project layout filtered them out
+WARNING <phase> <project> "<message>"                 ← real project failures
+TOOL_WARNING <phase> <project> "<message>"            ← sub-tool failed but project itself is healthy
+SKIP_REASON <phase> "<reason>" count=N projects=<a,b,c>  ← only meaningful skips survive
+NOTE <free-text>
 ```
 
-### 5. Commentary
+`ALWAYS_EXCLUDED` and `FILTERED_OUT` are different audiences. The first is settled (user chose to exclude them, nothing to act on). The second is project state the user might want to clean up (stale worktree, missing Cargo.toml, etc.). Render them separately — never combine into one list.
 
-After the table, write these sub-sections (omit any that have nothing to report):
+Only real participants appear in `ROW`.
 
-**Run window** — `start → end (elapsed)`. If still running or partial, say `start → in progress` or `start → ended (partial log; no run-complete marker)`.
+Cell values are `OK`, `FAIL`, `SKIP`, `-` (rendered as `—`). They may carry a `:slug` suffix — strip that for the table; the full reason is in commentary.
 
-**Phase summary** — one line per phase that ran:
-- `Clean: P processed, S skipped`
-- `Warmup: O ok, F fail, S skip` (with the names of any FAIL)
-- `Eval: A/N evaluated` (matching the `=== Done:` footer)
-- `Review: A reviewed, B failed of N` (matching the review-stage `=== Done:` footer; omit if the phase header is absent)
-- `Fix: ran on E/E eligible` or `Fix: did not run — <reason>` if the script crashed
-- For phases the log does not cover (e.g. clean/warmup/eval in a style-fix-manual log), write `<phase>: not in this log`.
+## Rendering
 
-**Failures** — bullet every FAIL cell with project, phase, and reason from the parenthetical.
+Use plain language. No "matrix", "cell", "flag", "footer", or "reconcile" jargon.
 
-**Skips by reason** — aggregate counts grouped by reason text, e.g.
-- excluded: 8
-- already at cap of 2 findings: 10
-- another worktree checkout already exists: 2
-- no Cargo.toml: 2
+### 1. Header
 
-**Notes** — anything that does not fit above:
-- Partial logs (which phases are absent).
-- Script-level crashes with the exact error line.
-- Mismatches between the footer counts and per-project markers.
-- Anything the user should investigate.
+```
+Report for: <PATH>
+Run: <RUN_START> → <RUN_END> (<ELAPSED>, <STATUS>)
+```
 
-## Notes
+If `STATUS` is `partial` or `in-progress`, replace the parenthetical with `partial log` or `still running`.
 
-- The orchestrator log mixes timestamped lines (`YYYY-MM-DD HH:MM:SS PREFIX:`) and bare echoes from sub-scripts (`PREFIX:`). Match both — anchor regexes loosely on the prefix, not the start of line.
-- This report is regenerated every call. Do not cache to disk; print directly.
-- Do not invoke Monitor or stream the log — this is a snapshot, not a live view. For live updates use `/monitor_nightly`.
-- Do not use markdown links — they do not render in the terminal.
-- Manual style-fix runs should be launched via `~/.claude/scripts/nightly/style-fix-manual.sh` so their logs land in the accumulation directory.
+### 2. Not-run sections (two distinct groups)
+
+Render these as **two separate sections**, never one combined list. They have different audiences.
+
+**Excluded** — render only if `ALWAYS_EXCLUDED` or `FILTERED_OUT` records exist. The orchestrator picks up every directory under `~/rust/` automatically (no allowlist) so anything not under "Excluded" is implicitly in. Render as a header line followed by one bullet per reason, with the **category name in bold**. Use these category names (map from the parser's raw reason text):
+
+| Parser reason text                            | Bullet category                            |
+|-----------------------------------------------|--------------------------------------------|
+| `excluded`                                    | `by config`                                |
+| `no Cargo.toml`                               | `no Cargo.toml`                            |
+| `style-fix worktree`                          | `style_fix worktree already exists`        |
+| `worktree, not primary checkout`              | `not the primary checkout`                 |
+| `no bevy_panorbit_camera/Cargo.toml`          | `stale config (source dir missing)`        |
+| `style_fix directory exists`                  | `existing _style_fix worktree`             |
+| `another worktree checkout already exists`    | `another worktree checkout already exists` |
+
+Format:
+
+```
+**Excluded:**
+- **by config** — bevy, bevy_hana, bevy_mod_outline, ...
+- **no Cargo.toml** — cache-apt-pkgs-action, nate_style
+- **style_fix worktree already exists** — bevy_window_manager_style_fix, hana_style_fix, ...
+- **not the primary checkout** — cargo-port-api-fix
+- **stale config (source dir missing)** — bevy_panorbit_camera_extras
+```
+
+Skip any bullet whose project list is empty. Sort projects alphabetically within each bullet. Order the bullets in the order the rows appear above (config → no Cargo.toml → worktree categories → stale config).
+
+If neither `ALWAYS_EXCLUDED` nor `FILTERED_OUT` has records, omit the Excluded section entirely.
+
+### 3. Status table
+
+Markdown table with columns `Project | Clean | Warmup | Eval | Review | Fix`. Sort alphabetically (parser already does). Each cell is `OK`, `FAIL`, `SKIP`, or `—`. **Strip the `:reason` suffix.** If `cargo-mend` shows `clean=OK:warning`, render the cell as `OK*` and add a footnote line under the table: `* cargo-mend built fine, but the cargo mend tool itself failed against it. The build is healthy; the linter is not.`
+
+### 4. What failed
+
+Only render this section if there are `WARNING` records. Use full sentences:
+
+```
+What failed
+- bevy_catenary at the fix step: worktree creation failed because the branch `refactor/style` already exists. The retry didn't recover. Manual cleanup needed before the next run.
+```
+
+Combine multiple `WARNING` records about the same project into a single sentence — don't print the same project twice.
+
+### 5. Sub-tool warnings
+
+Only if `TOOL_WARNING` records exist. Heading: `Tool issues (not project failures)`. One bullet per tool warning, e.g. `cargo-mend: the cargo mend linter failed against this project. The build itself succeeded.`
+
+### 6. Skipped on purpose
+
+Only if `SKIP_REASON` records exist (the parser already drops bookkeeping reasons; whatever survives is a real workflow decision). Heading: `Skipped on purpose`. Render as bullets in plain English, naming the projects:
+
+```
+Skipped on purpose
+- cargo-mend, cargo-port: already at the per-project cap of 2 style findings, so no new evaluation this run.
+```
+
+### 7. Heads up
+
+Render any `NOTE` records as bullets under the heading `**Heads up**`. Phrase each as a one-line user-facing call to action — name the path, name what's needed.
+
+Examples of NOTEs the parser emits:
+- `~/rust/nate_style left dirty: 1 worktree run(s) failed; leaving nate_style dirty for review` → `nate_style is in a dirty state because a worktree fix failed. Review and commit (or discard) ~/rust/nate_style before the next run.`
+- `style-fix script failed before per-project work` → `the style-fix script crashed before doing any work — investigate the orchestrator log.`
+- `phases not in this log: clean,warmup,eval,review` → omit (this is a partial-log informational, already implied by the empty cells).
+
+Also synthesize NOTEs for:
+- **Footer mismatches**: a `PHASE` line where `ok + fail` doesn't equal the count of per-project results in the matrix for that phase. Phrase as `Eval phase: footer says 12 in scope, 10 produced results, 2 unaccounted for.`
+- **Status anomalies**: if `STATUS` is `crashed`, lead with `The run crashed mid-phase.` if `partial`, lead with `Partial log — only the <phase> phase ran.`
+
+If there's nothing to surface, omit the section entirely.
+
+## Notes for the renderer
+
+- Do not render any section that has no data. A clean run with only OK rows should be a header + excluded line + table, nothing else.
+- Do not invent commentary. If the parser doesn't emit it, don't write it.
+- Do not `grep`/`awk`/`tail` the log. If the parser is missing something you need, fix the parser.
+- Markdown links don't render in the terminal — don't use them.

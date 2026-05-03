@@ -568,9 +568,20 @@ PROMPT_EOF
 
     local elapsed=0
     local timeout_secs=3600
+    local summary_seen_at=""
+    local post_summary_grace=300
     while kill -0 "$agent_pid" 2>/dev/null; do
         sleep 10
         elapsed=$((elapsed + 10))
+        if [[ -z "$summary_seen_at" ]] && rg -q '^## Fix Summary$' "$worktree_eval" 2>/dev/null; then
+            summary_seen_at=$elapsed
+            echo "[diag $proj] Fix Summary detected at ${elapsed}s; agent has ${post_summary_grace}s to exit before SIGTERM"
+        fi
+        if [[ -n "$summary_seen_at" ]] && (( elapsed - summary_seen_at >= post_summary_grace )); then
+            echo "[diag $proj] agent still alive ${post_summary_grace}s after Fix Summary; sending SIGTERM"
+            kill "$agent_pid" 2>/dev/null
+            break
+        fi
         if [[ $elapsed -ge $timeout_secs ]]; then
             kill "$agent_pid" 2>/dev/null
             sleep 5
