@@ -2,55 +2,63 @@
 description: Walk through a list of items (typically just presented by another agent) one at a time for user feedback, optionally syncing decisions into a working doc.
 ---
 
-Use this when the user has just received a long list — recommendations, findings, options, todos — and wants to review them deliberately one by one rather than respond to the wall of text.
+Use this when the user has just received a long list — recommendations, findings, options, todos — and wants to review them deliberately one by one instead of responding to the whole wall of text.
 
 ## Step 1: Identify the items
 
-Before doing anything else, identify the list to review. Sources, in order of preference:
+Find the list to review. Look in this order:
 
-1. The user's invocation provided the list explicitly (e.g. they pasted it or pointed at a section above).
-2. The most recent assistant message in this conversation contained an enumerated list — bullets, numbered items, table rows.
-3. If neither is true, ask the user where the items are.
+1. The user's invocation contains the list (pasted in, or pointing at a section).
+2. The most recent assistant message had an enumerated list — bullets, numbered items, table rows.
+3. Neither — ask the user where the list is.
 
-Echo back a short count: "Found N items to review." Do not list them yet.
+Reply with a short count: `Found N items to review.` Do not list them yet.
 
-## Step 2: Establish the working doc (or skip)
+## Step 2: Set up where decisions get recorded
 
-Check whether a working doc is already in scope for this conversation — a path the user has been editing or named this session.
+Decide whether there is a working doc in this conversation — a file path the user has been editing or named this session.
 
-Ask one combined question:
+Then ask **one** question, picking the form that matches the situation:
 
-> "N items. Doc to record decisions in? (existing path, suggest one, or `none`)"
+- **A doc is already in scope:** name it.
+  > `N items. Record decisions in <relative/path/to/doc.md>? (yes / different path / none)`
+- **No doc is in scope:** say so.
+  > `N items. No working doc in this conversation. Record decisions in a doc? (path to use / suggest one / none)`
 
-Wait for the answer. If they give a path that doesn't exist, create it with a one-line header noting the date and the source of the items.
+Rules:
+- Never use the placeholder phrase "existing path" — either name the doc or say there isn't one.
+- If the user gives a path that doesn't exist, create it with a one-line header (today's date + where the items came from).
+- If the user picks `none`, skip the doc-writing step in Step 4 and just summarize at the end.
 
 ## Step 3: Build the todo list
 
-If a harness todo tool is available (e.g. `TaskCreate`), add one task per item in order — each task name a short label, all `pending`. If no todo tool is available, track the list inline as a numbered checklist in your own notes and reference items by number.
+If a todo tool is available (e.g. `TaskCreate`), add one task per item, in order, each with a short label and status `pending`. If not, keep an inline numbered checklist and refer to items by number.
 
 ## Step 4: Walk the list
 
 For each item, in order:
 
-1. Mark the task `in_progress` (or note position in your inline list).
-2. **Quote the item verbatim.** Add context only if the item references something not contained in itself. End with a short prompt for feedback ("Take?" / "Keep, drop, modify?" / a question tailored to the item's shape).
-3. **Wait for the user's feedback.** Do not move on until they respond.
-4. Once the user signals to continue (their next message after feedback, or an explicit "next"), append the decision to the working doc if one is in scope, then mark the task `completed` and move to the next item.
+1. Mark the task `in_progress`.
+2. **Quote the item verbatim.** Add context only if the item references something not contained in itself.
+3. **End with a short, clear prompt for feedback.** Pick one that matches the item — examples: `Keep, drop, or modify?` / `Skip or dig in?` / `Any thoughts?` / a question tailored to the item. Avoid one-word jargon prompts like `Take?` — terse is good, cryptic is not.
+4. **Wait for the user's response.** Do not move on until they reply.
+5. When they signal continue (any reply that isn't "stop" or "go back"), record the decision to the working doc if one is in scope, mark the task `completed`, and move to the next item.
 
-Do not ask "continue or add more?" between items — assume continue unless the user volunteers more. Late additions before the doc-write step will be captured; that's the point of writing after the continue signal, not before.
+Do not ask "continue or add more?" between items — assume continue unless the user volunteers something. Late additions before the next doc-write are captured naturally.
 
 ## Step 5: Wrap up
 
-When all items are done:
+When every item is done:
 
-- If a working doc was used, summarize what got written (one line — file path + count of decisions captured).
-- Otherwise, summarize the decisions inline (one line per item: "1. <label> → <decision>").
-- Mark all tasks completed.
+- If a working doc was used: one-line summary — `Wrote N decisions to <path>`.
+- Otherwise: summarize inline, one line per item — `1. <label> → <decision>`.
+- Mark all tasks `completed`.
 
 ## Rules
 
 - One item at a time. Never present two items in the same turn.
-- Don't summarize the user's feedback back to them unless they ask — just record it.
-- If the user wants to skip an item, mark its task `cancelled` and move on; don't argue.
-- If they want to revisit an earlier item, jump back; don't insist on linear order.
-- Keep prompts terse — the user is reviewing a long list, every extra word costs them.
+- Don't echo the user's feedback back to them unless asked — just record it.
+- If the user says skip, mark the task `cancelled` and move on. Don't argue.
+- If they want to revisit an earlier item, jump back. Don't insist on linear order.
+- Keep prompts terse but readable. Every extra word costs them — but so does cryptic shorthand.
+- If the user asks for plain-English explanation of an item, give it without abandoning the one-at-a-time rhythm.

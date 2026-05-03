@@ -10,6 +10,8 @@
 </ExecutionSteps>
 
 <ClippyPrecheck>
+If `$ARGUMENTS` contains the token `noclippy` (case-insensitive, matched as a whole word), skip this step silently. Strip the `noclippy` token from `$ARGUMENTS` before any later step uses it (so it is not treated as part of the commit title).
+
 First, look at the file list from <AnalyzeChanges/>. If none of the uncommitted files are Rust source (`.rs`) or Cargo manifests (`Cargo.toml`, `Cargo.lock`), skip this step silently — clippy is irrelevant.
 
 Otherwise, check your own conversation context to determine whether `/clippy` has been run recently — i.e., whether the `clippy` skill has been invoked in this session **after the most recent Rust code changes**.
