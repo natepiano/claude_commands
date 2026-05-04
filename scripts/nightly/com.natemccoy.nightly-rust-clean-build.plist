@@ -9,10 +9,13 @@
         <string>/bin/bash</string>
         <string>/Users/natemccoy/.claude/scripts/nightly/nightly-rust-clean-build.sh</string>
     </array>
+    <!-- Hour=10 maps to 04:00 EDT because UserEventAgent's TZ cache is stuck on
+         Europe/Madrid (CEST, UTC+2) from prior travel; system TZ is America/New_York.
+         A reboot should clear it; until then, Hour = (desired_local_hour + 6) mod 24. -->
     <key>StartCalendarInterval</key>
     <dict>
         <key>Hour</key>
-        <integer>4</integer>
+        <integer>10</integer>
         <key>Minute</key>
         <integer>0</integer>
     </dict>
