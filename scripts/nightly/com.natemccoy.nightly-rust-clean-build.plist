@@ -4,21 +4,20 @@
 <dict>
     <key>Label</key>
     <string>com.natemccoy.nightly-rust-clean-build</string>
+    <!-- StartCalendarInterval is unusable on this machine: UserEventAgent
+         caches a stale Europe/Madrid TZ from prior travel and applies a
+         6-hour offset to the scheduled hour. We trigger via StartInterval
+         instead (raw seconds, no TZ involvement) and let the wrapper script
+         gate on `date +%H`, which correctly reads /etc/localtime. The
+         wrapper records the date of the most recent run so that only the
+         first eligible fire of the day actually executes the build. -->
     <key>ProgramArguments</key>
     <array>
         <string>/bin/bash</string>
-        <string>/Users/natemccoy/.claude/scripts/nightly/nightly-rust-clean-build.sh</string>
+        <string>/Users/natemccoy/.claude/scripts/nightly/nightly-trigger.sh</string>
     </array>
-    <!-- Hour=10 maps to 04:00 EDT because UserEventAgent's TZ cache is stuck on
-         Europe/Madrid (CEST, UTC+2) from prior travel; system TZ is America/New_York.
-         A reboot should clear it; until then, Hour = (desired_local_hour + 6) mod 24. -->
-    <key>StartCalendarInterval</key>
-    <dict>
-        <key>Hour</key>
-        <integer>10</integer>
-        <key>Minute</key>
-        <integer>0</integer>
-    </dict>
+    <key>StartInterval</key>
+    <integer>600</integer>
     <key>StandardOutPath</key>
     <string>/tmp/nightly-rust-clean-build-stdout.log</string>
     <key>StandardErrorPath</key>
