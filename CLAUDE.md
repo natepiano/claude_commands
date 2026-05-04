@@ -1,5 +1,11 @@
 ## writing style
-- **NEVER** use the word "honest" (or "honestly", "to be honest", etc.) in output to the user. Drop it entirely — don't substitute "truthfully" or similar either. State the claim directly.
+- **NEVER** use the word "honest" (or "honestly", "more honest", "more honestly", "to be honest", "in all honesty", "the honest X", "an honest Y", etc.) in output to the user, in code, in commit messages, in design docs, or anywhere else. **This is a permanent, non-negotiable, repeat-offense rule.** It has been violated across multiple sessions in multiple projects despite explicit memories and CLAUDE.md entries banning it. The user's word: "forever."
+  - **Reminder counter: 10.** Increment this number every time the user has to ask again. Each increment is evidence that the pre-send check below failed; treat a rising counter as a serious defect, not a casual tally.
+  - Drop it entirely. Do not substitute "truthfully", "frankly", "candidly", or any near-synonym that does the same rhetorical work.
+  - Applying the word to a *thing* (an API, a design, a list, an abstraction) is just as banned as applying it to a claim. "The abstraction is honest", "an honest list", "the design is more honest" are all violations.
+  - The word smuggles in a virtue claim ("look how truthful this is") and implies the alternative is dishonest. Both are wrong moves.
+  - **Pre-send check:** before sending any reply, scan the draft for the substring `honest`. If present, identify which of {direct, explicit, one-to-one, single-source-of-truth, simple, accurate} you actually mean and substitute the precise word. If none of those fit, the sentence is not making a real claim — delete it.
+  - When the impulse appears mid-draft, delete the whole sentence and rewrite from scratch. Do not try to surgically swap one word; the underlying intent was almost always self-praise that needs to be removed wholesale.
 - **NEVER** use the word "shape" (or "shaped", "shapes", "reshape", "reshaping", etc.) in output to the user, in code, or in identifiers. It is nails on a chalkboard. Name the actual concrete artifact instead:
   - If it is a **function**, say "function" (and name it).
   - If it is a **pattern** (in the design / convention sense), say "pattern".

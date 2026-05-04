@@ -37,10 +37,16 @@ echo "[diag] cwd_after_chdir=$(pwd)"
 
 # Parse conf file for excludes, settings, and workspace members
 excludes=()
-MAX_NEW_FINDINGS=5
+MAX_NEW_FINDINGS=""
 ws_names=()
 ws_paths=()
 ws_pkgs=()
+
+if [[ ! -f "$CONF_FILE" ]]; then
+    echo "ERROR: conf file not found: $CONF_FILE" >&2
+    echo "       [style_eval] max_new_findings must be set there." >&2
+    exit 1
+fi
 
 if [[ -f "$CONF_FILE" ]]; then
     current_section=""
@@ -95,6 +101,11 @@ if [[ -f "$CONF_FILE" ]]; then
                 ;;
         esac
     done < "$CONF_FILE"
+fi
+
+if [[ -z "$MAX_NEW_FINDINGS" ]]; then
+    echo "ERROR: [style_eval] max_new_findings is not set in $CONF_FILE" >&2
+    exit 1
 fi
 
 run_style_agent() {

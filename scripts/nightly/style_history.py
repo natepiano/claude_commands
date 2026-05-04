@@ -12,7 +12,8 @@ from dataclasses import dataclass
 from datetime import datetime
 from datetime import timezone
 from pathlib import Path
-from typing import Any
+from typing import TypedDict
+from typing import cast
 
 RUST_DIR = Path(os.environ.get("STYLE_HISTORY_RUST_DIR", str(Path.home() / "rust")))
 NATE_STYLE_DIR = Path(os.environ.get("STYLE_HISTORY_NATE_STYLE_DIR", str(RUST_DIR / "nate_style")))
@@ -30,6 +31,49 @@ NIGHTLY_CONF_FILE = Path(
         str(Path.home() / ".claude" / "scripts" / "nightly" / "nightly-rust.conf"),
     )
 )
+
+
+class Outcome(TypedDict, total=False):
+    status: str
+    reason: str
+    summary: str
+    finding_source: str
+    skipped_by: str
+
+
+class ReviewedUnit(TypedDict, total=False):
+    guideline_id: str
+    outcome: Outcome
+    finding_source: str
+
+
+class PendingState(TypedDict, total=False):
+    budget: int
+    phase: str
+    reviewed_unit_ids: list[str]
+    reviewed_units: list[ReviewedUnit]
+    scored_count: int
+    start_time: str
+    updated_at: str
+    last_unit_id: str
+    last_unit_result: str
+
+
+class ResultEntry(TypedDict, total=False):
+    guideline_id: str
+    outcome: Outcome
+    finding_source: str
+
+
+class ResultPayload(TypedDict, total=False):
+    unit_id: str
+    results: list[ResultEntry]
+
+
+class HistoryRow(TypedDict, total=False):
+    start_time: str
+    end_time: str
+    reviewed_units: list[ReviewedUnit]
 
 
 @dataclass(frozen=True)
@@ -169,8 +213,8 @@ def auto_record_pre_filter_skip(project: str, unit: "Unit") -> None:
     pending = load_pending(project)
     if not pending:
         return
-    reviewed_units = list(pending.get("reviewed_units", []))
-    reviewed_unit_ids = list(pending.get("reviewed_unit_ids", []))
+    reviewed_units: list[ReviewedUnit] = list(pending.get("reviewed_units", []))
+    reviewed_unit_ids: list[str] = list(pending.get("reviewed_unit_ids", []))
     if unit.unit_id in reviewed_unit_ids:
         return
     for guideline_id in unit.guideline_ids:
@@ -195,12 +239,6 @@ def history_file(project: str) -> Path:
 
 def pending_file(project: str) -> Path:
     return PENDING_DIR / f"{project}.json"
-
-
-def load_json(path: Path, default: Any) -> Any:
-    if not path.exists():
-        return default
-    return json.loads(path.read_text())
 
 
 def excluded_projects() -> set[str]:
@@ -286,25 +324,27 @@ def eligible_project_roots() -> list[Path]:
     )
 
 
-def append_jsonl(path: Path, payload: dict[str, Any]) -> None:
+def append_jsonl_history(path: Path, payload: HistoryRow) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("a") as handle:
-        handle.write(json.dumps(payload, sort_keys=True) + "\n")
+        _ = handle.write(json.dumps(payload, sort_keys=True) + "\n")
 
 
-def load_history(project: str) -> list[dict[str, Any]]:
+def load_history(project: str) -> list[HistoryRow]:
     path = history_file(project)
     if not path.exists():
         return []
-    rows: list[dict[str, Any]] = []
-    for line in path.read_text().splitlines():
-        line = line.strip()
+    rows: list[HistoryRow] = []
+    for raw_line in path.read_text().splitlines():
+        line = raw_line.strip()
         if not line:
             continue
         try:
-            rows.append(json.loads(line))
+            parsed: object = json.loads(line)  # pyright: ignore[reportAny]
         except json.JSONDecodeError:
             continue
+        if isinstance(parsed, dict):
+            rows.append(cast(HistoryRow, cast(object, parsed)))
     return rows
 
 
@@ -444,22 +484,22 @@ def cross_project_hit_rates() -> dict[str, float]:
             text = jsonl_path.read_text()
         except OSError:
             continue
-        for line in text.splitlines():
-            line = line.strip()
+        for raw_line in text.splitlines():
+            line = raw_line.strip()
             if not line:
                 continue
             try:
-                row = json.loads(line)
+                parsed: object = json.loads(line)  # pyright: ignore[reportAny]
             except json.JSONDecodeError:
                 continue
+            if not isinstance(parsed, dict):
+                continue
+            row = cast(HistoryRow, cast(object, parsed))
             for reviewed in row.get("reviewed_units", []):
-                if not isinstance(reviewed, dict):
-                    continue
                 guideline_id = reviewed.get("guideline_id")
                 if not isinstance(guideline_id, str):
                     continue
-                raw_outcome = reviewed.get("outcome")
-                outcome: dict[str, Any] = raw_outcome if isinstance(raw_outcome, dict) else {}
+                outcome: Outcome = reviewed.get("outcome", {})
                 if outcome.get("skipped_by") == "pre_filter":
                     continue
                 reviews[guideline_id] += 1
@@ -485,7 +525,7 @@ def start_run(project_root: Path, budget: int) -> None:
     HISTORY_DIR.mkdir(parents=True, exist_ok=True)
     PENDING_DIR.mkdir(parents=True, exist_ok=True)
     project = project_root.name.removesuffix("_style_fix")
-    payload = {
+    payload: PendingState = {
         "budget": budget,
         "phase": "evaluation",
         "reviewed_unit_ids": [],
@@ -497,14 +537,21 @@ def start_run(project_root: Path, budget: int) -> None:
     write_pending(project, payload)
 
 
-def load_pending(project: str) -> dict[str, Any]:
-    return load_json(pending_file(project), {})
+def load_pending(project: str) -> PendingState:
+    path = pending_file(project)
+    empty: PendingState = {}
+    if not path.exists():
+        return empty
+    parsed: object = json.loads(path.read_text())  # pyright: ignore[reportAny]
+    if isinstance(parsed, dict):
+        return cast(PendingState, cast(object, parsed))
+    return empty
 
 
-def write_pending(project: str, payload: dict[str, Any]) -> None:
+def write_pending(project: str, payload: PendingState) -> None:
     path = pending_file(project)
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
+    _ = path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
 
 
 def set_phase(project: str, phase: str) -> None:
@@ -516,7 +563,7 @@ def set_phase(project: str, phase: str) -> None:
     write_pending(project, pending)
 
 
-def next_unit(project_root: Path) -> dict[str, Any]:
+def next_unit(project_root: Path) -> dict[str, object]:
     project = project_root.name.removesuffix("_style_fix")
     pending = load_pending(project)
     if not pending:
@@ -533,7 +580,7 @@ def next_unit(project_root: Path) -> dict[str, Any]:
             "stop_reason": "budget_reached",
         }
 
-    seen_unit_ids = set(pending.get("reviewed_unit_ids", []))
+    seen_unit_ids: set[str] = set(pending.get("reviewed_unit_ids", []))
     units = build_units(project_root)
     counts = review_counts(project_root)
     # Cross-project hit rates — high-yield guidelines walk first so dirty
@@ -561,7 +608,7 @@ def next_unit(project_root: Path) -> dict[str, Any]:
         _, unit_count, _, _, unit = sortable[0]
         if unit.pre_filter and not pre_filter_has_candidates(unit.pre_filter, project_root):
             auto_record_pre_filter_skip(project, unit)
-            sortable.pop(0)
+            _ = sortable.pop(0)
             continue
         break
     else:
@@ -589,44 +636,63 @@ def next_unit(project_root: Path) -> dict[str, Any]:
     }
 
 
-def record_unit(project_root: Path, results_path: Path) -> None:
+def record_unit(project_root: Path, results_path: Path, eval_path: Path) -> None:
     project = project_root.name.removesuffix("_style_fix")
     pending = load_pending(project)
     if not pending:
         raise SystemExit(f"No pending run for {project}. Start a run first.")
 
-    payload = load_json(results_path, {})
+    raw_payload: object = json.loads(results_path.read_text())  # pyright: ignore[reportAny]
+    if not isinstance(raw_payload, dict):
+        raise SystemExit("Results file must contain a JSON object with unit_id and results.")
+    payload = cast(ResultPayload, cast(object, raw_payload))
     unit_id = payload.get("unit_id")
-    results = payload.get("results", [])
-    if not isinstance(unit_id, str) or not isinstance(results, list):
+    results: list[ResultEntry] = list(payload.get("results", []))
+    if not isinstance(unit_id, str):
         raise SystemExit("Results file must contain unit_id and results.")
 
-    reviewed_units = list(pending.get("reviewed_units", []))
-    reviewed_unit_ids = list(pending.get("reviewed_unit_ids", []))
+    reviewed_units: list[ReviewedUnit] = list(pending.get("reviewed_units", []))
+    reviewed_unit_ids: list[str] = list(pending.get("reviewed_unit_ids", []))
     if unit_id in reviewed_unit_ids:
         raise SystemExit(f"Unit already recorded in this run: {unit_id}")
+
+    eval_guidelines: set[str] = (
+        set(parse_eval_guidelines(eval_path, project_root).values())
+        if eval_path.exists()
+        else set()
+    )
 
     scored_increment = 0
     found_countable = False
     for result in results:
-        if not isinstance(result, dict):
-            continue
         guideline_id = result.get("guideline_id")
         if not isinstance(guideline_id, str):
             continue
-        reviewed_entry: dict[str, Any] = {"guideline_id": guideline_id}
+        reviewed_entry: ReviewedUnit = {"guideline_id": guideline_id}
         outcome = result.get("outcome")
+        is_finding = False
         if isinstance(outcome, dict):
             reviewed_entry["outcome"] = outcome
-            if outcome.get("status") != "no_findings":
+            status = outcome.get("status")
+            if status != "no_findings":
                 found_countable = True
+            if status in {"finding", "fixed", "partial", "skipped"} or outcome.get("finding_source") in {"new", "carried_forward"}:
+                is_finding = True
         else:
             finding_source = result.get("finding_source")
             if isinstance(finding_source, str):
                 reviewed_entry["finding_source"] = finding_source
                 found_countable = True
+                is_finding = finding_source in {"new", "carried_forward"}
             else:
                 raise SystemExit(f"Result for {guideline_id} must include outcome or finding_source.")
+        if is_finding and guideline_id not in eval_guidelines:
+            message = (
+                f"Refusing to record finding for {guideline_id}: not present under "
+                + f"'## Improvements' in {eval_path}. Append the finding to "
+                + "EVALUATION.md before calling record-unit."
+            )
+            raise SystemExit(message)
         reviewed_units.append(reviewed_entry)
     if found_countable:
         scored_increment = 1
@@ -666,7 +732,7 @@ def parse_eval_guidelines(path: Path, project_root: Path) -> dict[str, str]:
     return guideline_by_title
 
 
-def parse_fix_results(eval_path: Path, project_root: Path) -> dict[str, dict[str, Any]]:
+def parse_fix_results(eval_path: Path, project_root: Path) -> dict[str, Outcome]:
     finding_guidelines: dict[int, str] = {}
     in_improvements = False
     current_finding = 0
@@ -719,9 +785,9 @@ def parse_fix_results(eval_path: Path, project_root: Path) -> dict[str, dict[str
     for finding_num, guideline_id in finding_guidelines.items():
         if finding_num in fix_entries:
             per_guideline[guideline_id].append(fix_entries[finding_num])
-    aggregated: dict[str, dict[str, Any]] = {}
+    aggregated: dict[str, Outcome] = {}
     for guideline_id, entries in per_guideline.items():
-        statuses = []
+        statuses: list[str] = []
         for entry in entries:
             raw_status = entry.get("status", "").lower()
             if raw_status.startswith("applied"):
@@ -740,7 +806,7 @@ def parse_fix_results(eval_path: Path, project_root: Path) -> dict[str, dict[str
             final_status = "partial"
         summaries = [entry.get("summary", "") for entry in entries if entry.get("summary")]
         reasons = [entry.get("reason", "") for entry in entries if entry.get("reason")]
-        outcome: dict[str, Any] = {"status": final_status}
+        outcome: Outcome = {"status": final_status}
         if summaries:
             outcome["summary"] = " ".join(dict.fromkeys(summaries))
         if reasons:
@@ -753,7 +819,12 @@ def finalize_no_findings(project: str) -> None:
     pending = load_pending(project)
     if not pending:
         return
-    append_jsonl(history_file(project), {"start_time": pending["start_time"], "end_time": utc_now(), "reviewed_units": pending["reviewed_units"]})
+    row: HistoryRow = {
+        "start_time": pending.get("start_time", ""),
+        "end_time": utc_now(),
+        "reviewed_units": list(pending.get("reviewed_units", [])),
+    }
+    append_jsonl_history(history_file(project), row)
     pending_file(project).unlink(missing_ok=True)
 
 
@@ -763,17 +834,34 @@ def finalize_fix(project_root: Path, eval_path: Path) -> None:
     if not pending:
         return
     fix_results = parse_fix_results(eval_path, project_root)
-    reviewed_units = []
+    eval_guidelines: set[str] = set(parse_eval_guidelines(eval_path, project_root).values())
+    reviewed_units: list[ReviewedUnit] = []
     for reviewed in pending.get("reviewed_units", []):
-        guideline_id = reviewed["guideline_id"]
+        guideline_id = reviewed.get("guideline_id", "")
         if "outcome" in reviewed:
             reviewed_units.append(reviewed)
             continue
-        outcome = dict(fix_results.get(guideline_id, {"status": "fix_failed", "reason": "Missing Fix Summary entry for reviewed guideline."}))
+        if guideline_id in fix_results:
+            outcome: Outcome = cast(Outcome, cast(object, dict(fix_results[guideline_id])))
+        elif guideline_id in eval_guidelines:
+            outcome = {
+                "status": "fix_failed",
+                "reason": "Finding present in EVALUATION.md ## Improvements but no matching ## Fix Summary entry.",
+            }
+        else:
+            outcome = {
+                "status": "eval_dropped",
+                "reason": "Recorded as a finding via record-unit but absent from EVALUATION.md ## Improvements.",
+            }
         if "finding_source" in reviewed:
             outcome["finding_source"] = reviewed["finding_source"]
         reviewed_units.append({"guideline_id": guideline_id, "outcome": outcome})
-    append_jsonl(history_file(project), {"start_time": pending["start_time"], "end_time": utc_now(), "reviewed_units": reviewed_units})
+    row: HistoryRow = {
+        "start_time": pending.get("start_time", ""),
+        "end_time": utc_now(),
+        "reviewed_units": reviewed_units,
+    }
+    append_jsonl_history(history_file(project), row)
     pending_file(project).unlink(missing_ok=True)
 
 
@@ -781,16 +869,23 @@ def finalize_failure(project: str, reason: str) -> None:
     pending = load_pending(project)
     if not pending:
         return
-    reviewed_units = []
+    reviewed_units: list[ReviewedUnit] = []
     for reviewed in pending.get("reviewed_units", []):
         if "outcome" in reviewed:
             reviewed_units.append(reviewed)
             continue
-        outcome = {"status": "fix_failed", "reason": reason}
+        outcome: Outcome = {"status": "fix_failed", "reason": reason}
         if "finding_source" in reviewed:
             outcome["finding_source"] = reviewed["finding_source"]
-        reviewed_units.append({"guideline_id": reviewed["guideline_id"], "outcome": outcome})
-    append_jsonl(history_file(project), {"start_time": pending["start_time"], "end_time": utc_now(), "reviewed_units": reviewed_units})
+        reviewed_units.append(
+            {"guideline_id": reviewed.get("guideline_id", ""), "outcome": outcome}
+        )
+    row: HistoryRow = {
+        "start_time": pending.get("start_time", ""),
+        "end_time": utc_now(),
+        "reviewed_units": reviewed_units,
+    }
+    append_jsonl_history(history_file(project), row)
     pending_file(project).unlink(missing_ok=True)
 
 
@@ -802,32 +897,37 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     subparsers = parser.add_subparsers(dest="command", required=True)
     start = subparsers.add_parser("start-run")
-    start.add_argument("--project-root", required=True)
-    start.add_argument("--budget", required=True, type=int)
+    _ = start.add_argument("--project-root", required=True)
+    _ = start.add_argument("--budget", required=True, type=int)
     next_parser = subparsers.add_parser("next-unit")
-    next_parser.add_argument("--project-root", required=True)
+    _ = next_parser.add_argument("--project-root", required=True)
     record = subparsers.add_parser("record-unit")
-    record.add_argument("--project-root", required=True)
-    record.add_argument("--results", required=True)
+    _ = record.add_argument("--project-root", required=True)
+    _ = record.add_argument("--results", required=True)
+    _ = record.add_argument(
+        "--eval-path",
+        required=True,
+        help="Path to EVALUATION.md. record-unit refuses to record a finding whose guideline is not present under ## Improvements.",
+    )
     no_findings = subparsers.add_parser("finalize-no-findings")
-    no_findings.add_argument("--project", required=True)
+    _ = no_findings.add_argument("--project", required=True)
     finalize = subparsers.add_parser("finalize-fix")
-    finalize.add_argument("--project-root", required=True)
-    finalize.add_argument("--evaluation", required=True)
+    _ = finalize.add_argument("--project-root", required=True)
+    _ = finalize.add_argument("--evaluation", required=True)
     failure = subparsers.add_parser("finalize-failure")
-    failure.add_argument("--project", required=True)
-    failure.add_argument("--reason", required=True)
+    _ = failure.add_argument("--project", required=True)
+    _ = failure.add_argument("--reason", required=True)
     discard = subparsers.add_parser("discard-pending")
-    discard.add_argument("--project", required=True)
+    _ = discard.add_argument("--project", required=True)
     phase = subparsers.add_parser("set-phase")
-    phase.add_argument("--project", required=True)
-    phase.add_argument("--phase", required=True)
+    _ = phase.add_argument("--project", required=True)
+    _ = phase.add_argument("--phase", required=True)
     focused = subparsers.add_parser(
         "focused-eval",
         help="Read-only: emit one JSON unit per requested guideline (no pending/history state).",
     )
-    focused.add_argument("--project-root", required=True)
-    focused.add_argument(
+    _ = focused.add_argument("--project-root", required=True)
+    _ = focused.add_argument(
         "--guideline",
         action="append",
         required=True,
@@ -836,32 +936,66 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def _arg_str(args: argparse.Namespace, name: str) -> str:
+    value: object = getattr(args, name)  # pyright: ignore[reportAny]
+    if not isinstance(value, str):
+        raise SystemExit(f"Argument --{name.replace('_', '-')} must be a string.")
+    return value
+
+
+def _arg_int(args: argparse.Namespace, name: str) -> int:
+    value: object = getattr(args, name)  # pyright: ignore[reportAny]
+    if not isinstance(value, int):
+        raise SystemExit(f"Argument --{name.replace('_', '-')} must be an int.")
+    return value
+
+
+def _arg_str_list(args: argparse.Namespace, name: str) -> list[str]:
+    value: object = getattr(args, name)  # pyright: ignore[reportAny]
+    if not isinstance(value, list):
+        raise SystemExit(f"Argument --{name.replace('_', '-')} must be a list.")
+    items: list[str] = []
+    for entry in cast(list[object], value):
+        if not isinstance(entry, str):
+            raise SystemExit(f"Argument --{name.replace('_', '-')} must contain strings.")
+        items.append(entry)
+    return items
+
+
 def main() -> None:
     args = parse_args()
-    if args.command == "start-run":
-        start_run(Path(args.project_root).expanduser().resolve(), args.budget)
+    command = _arg_str(args, "command")
+    if command == "start-run":
+        start_run(Path(_arg_str(args, "project_root")).expanduser().resolve(), _arg_int(args, "budget"))
         return
-    if args.command == "next-unit":
-        print(json.dumps(next_unit(Path(args.project_root).expanduser().resolve()), indent=2, sort_keys=True))
+    if command == "next-unit":
+        print(json.dumps(next_unit(Path(_arg_str(args, "project_root")).expanduser().resolve()), indent=2, sort_keys=True))
         return
-    if args.command == "record-unit":
-        record_unit(Path(args.project_root).expanduser().resolve(), Path(args.results).expanduser().resolve())
+    if command == "record-unit":
+        record_unit(
+            Path(_arg_str(args, "project_root")).expanduser().resolve(),
+            Path(_arg_str(args, "results")).expanduser().resolve(),
+            Path(_arg_str(args, "eval_path")).expanduser().resolve(),
+        )
         return
-    if args.command == "finalize-no-findings":
-        finalize_no_findings(args.project)
+    if command == "finalize-no-findings":
+        finalize_no_findings(_arg_str(args, "project"))
         return
-    if args.command == "finalize-fix":
-        finalize_fix(Path(args.project_root).expanduser().resolve(), Path(args.evaluation).expanduser().resolve())
+    if command == "finalize-fix":
+        finalize_fix(
+            Path(_arg_str(args, "project_root")).expanduser().resolve(),
+            Path(_arg_str(args, "evaluation")).expanduser().resolve(),
+        )
         return
-    if args.command == "discard-pending":
-        discard_pending(args.project)
+    if command == "discard-pending":
+        discard_pending(_arg_str(args, "project"))
         return
-    if args.command == "set-phase":
-        set_phase(args.project, args.phase)
+    if command == "set-phase":
+        set_phase(_arg_str(args, "project"), _arg_str(args, "phase"))
         return
-    if args.command == "focused-eval":
-        project_root = Path(args.project_root).expanduser().resolve()
-        units = focused_units(project_root, list(args.guideline))
+    if command == "focused-eval":
+        project_root = Path(_arg_str(args, "project_root")).expanduser().resolve()
+        units = focused_units(project_root, _arg_str_list(args, "guideline"))
         for unit in units:
             print(json.dumps(
                 {
@@ -873,7 +1007,7 @@ def main() -> None:
                 sort_keys=True,
             ))
         return
-    finalize_failure(args.project, args.reason)
+    finalize_failure(_arg_str(args, "project"), _arg_str(args, "reason"))
 
 
 if __name__ == "__main__":
