@@ -39,7 +39,31 @@ if git remote get-url origin >/dev/null 2>&1; then
     fi
 fi
 
-# Test merge feasibility (dry-run)
+# Detect "already up to date": SOURCE_BRANCH is an ancestor of HEAD, so the merge is a no-op.
+ALREADY_UP_TO_DATE=false
+if git merge-base --is-ancestor "$SOURCE_BRANCH" HEAD 2>/dev/null; then
+    ALREADY_UP_TO_DATE=true
+fi
+
+# Determine whether a fast-forward merge is possible.
+# ff is possible iff HEAD is an ancestor of SOURCE_BRANCH (source already contains every commit on HEAD).
+FF_POSSIBLE=false
+if git merge-base --is-ancestor HEAD "$SOURCE_BRANCH" 2>/dev/null; then
+    FF_POSSIBLE=true
+fi
+
+# Locate source branch's worktree, if any (rebase needs to happen wherever the branch is checked out).
+SOURCE_WORKTREE=""
+while IFS= read -r line; do
+    WT_PATH=$(echo "$line" | awk '{print $1}')
+    WT_BRANCH=$(echo "$line" | grep -o '\[.*\]' | tr -d '[]')
+    if [[ "$WT_BRANCH" == "$SOURCE_BRANCH" ]]; then
+        SOURCE_WORKTREE="$WT_PATH"
+        break
+    fi
+done < <(git worktree list)
+
+# Test merge feasibility (dry-run). Predicts conflicts on either an --no-ff merge or a rebase.
 MERGE_FEASIBLE=true
 MERGE_CHECK_ERROR=""
 if ! MERGE_OUTPUT=$(git merge --no-commit --no-ff "$SOURCE_BRANCH" 2>&1); then
@@ -58,8 +82,12 @@ fi
 echo "{
   \"status\": \"success\",
   \"source_branch\": \"$SOURCE_BRANCH\",
+  \"current_branch\": \"$CURRENT_BRANCH\",
   \"has_remote\": $HAS_REMOTE,
   \"current_behind_remote\": $CURRENT_BEHIND_REMOTE,
   \"behind_count\": $BEHIND_COUNT,
+  \"ff_possible\": $FF_POSSIBLE,
+  \"already_up_to_date\": $ALREADY_UP_TO_DATE,
+  \"source_worktree\": \"$SOURCE_WORKTREE\",
   \"merge_feasible\": $MERGE_FEASIBLE
 }"
