@@ -346,56 +346,72 @@ For each finding, output a compact block with these parts. Keep the whole thing 
    **Required format per concern — copy this template exactly:**
 
    ```
-   - **`<file:line or short identifier>`** — <statement of what's wrong, one short sentence with inline rule citation, e.g. "(rule: pixel-units-in-names.md)">. **Recommend:** <single recommended action, one short sentence>.
+   - **`<file:line or short identifier>`**
+
+     **Issue:** <one short sentence naming what's wrong, with inline rule citation, e.g. "(rule: pixel-units-in-names.md)">.
+
+     **Recommend:** <single recommended action, one short sentence>.
    ```
 
-   The bullet has three parts in this order: **headline** (file path in backticks), **statement** (one short sentence naming what's wrong with an inline rule citation), **recommendation** (a single recommended action, prefixed with `**Recommend:**`).
+   The bullet has three parts, each on its own line and **separated by a blank line**: **headline** (file path in backticks), **`Issue:`** sub-section (one short sentence naming what's wrong, with an inline rule citation), **`Recommend:`** sub-section (a single recommended action). Do not run the parts together into one paragraph — the blank lines between them are mandatory and are what makes the bullet scannable.
 
    The bullet is **not** a proposal asking the user to choose between options. It is a clear statement of the defect plus a single recommendation. The user can override the recommendation in their reply if they disagree — but the bullet itself does not enumerate alternatives.
 
    **Hard limits:**
-   - Each concern body: ≤ 3 short lines total. If you need more, cut history and citation chains; keep the verdict.
-   - No multi-clause sentences chained with em-dashes. Two short sentences beat one long one.
-   - **The recommendation is mandatory and must be the last thing in the bullet.** It is a single declarative action, not a question. Do not list multiple options; pick one.
+   - Each sub-section (`Issue:` and `Recommend:`) is one short sentence. If you need more, cut history and citation chains; keep the verdict.
+   - **Blank lines between the headline, `Issue:`, and `Recommend:` are mandatory.** Running them together into one paragraph is a format violation, even if the content is otherwise correct.
+   - No multi-clause sentences chained with em-dashes or "but". Each sub-section is one statement.
+   - **The `Recommend:` sub-section is mandatory and must be the last sub-section.** It is a single declarative action, not a question. Do not list multiple options; pick one.
    - **No question-form action prompts.** Bullets ending in "Rename, leave for follow-up, or accept?" or "Reorder?" or "Revert, keep wrapper, or amend the guide?" are the old format and are now banned. Replace them with `**Recommend:** rename to <name>.` or similar.
-   - No "Decision needed:" preamble. The recommendation itself signals what action is suggested.
-   - **No `**Style rule:**` or `**No rule found:**` paragraph preamble.** The lookup happens before you write the bullet (see the "do the style-rule lookup" hard rule above); the citation appears inline as `(rule: <file.md>)` or `(no rule found)` only — never as a leading bold block that competes with the headline.
+   - No "Decision needed:" preamble. The `Recommend:` sub-section itself signals what action is suggested.
+   - **No `**Style rule:**` or `**No rule found:**` paragraph preamble.** The lookup happens before you write the bullet (see the "do the style-rule lookup" hard rule above); the citation appears inline inside the `Issue:` sub-section as `(rule: <file.md>)` or `(no rule found)` only — never as a leading bold block that competes with the headline.
 
    **Good — canonical example. Copy this rhythm:**
 
-   > - **`animation_poc_lerp.rs`** — agent moved `const CURSOR_NAME` inside `fn setup`; example targets get constants at top-of-file after imports (rule: `no-magic-values.md`). **Recommend:** move the const back to file scope after the imports.
+   > - **`animation_poc_lerp.rs`**
+   >
+   >   **Issue:** agent moved `const CURSOR_NAME` inside `fn setup`; example targets get constants at top-of-file after imports (rule: `no-magic-values.md`).
+   >
+   >   **Recommend:** move the const back to file scope after the imports.
 
    **Good — second example with a missed-rename concern:**
 
-   > - **`src/restore/winit_info.rs:95`** — `let monitor_position = current_monitor.position();` is a pixel-valued local that the eval missed and the agent did not rename (rule: `pixel-units-in-names.md`). **Recommend:** rename to `physical_monitor_position` as a follow-up to this finding.
+   > - **`src/restore/winit_info.rs:95`**
+   >
+   >   **Issue:** `let monitor_position = current_monitor.position();` is a pixel-valued local that the eval missed and the agent did not rename (rule: `pixel-units-in-names.md`).
+   >
+   >   **Recommend:** rename to `physical_monitor_position` as a follow-up to this finding.
 
-   **Bad — delete on sight (paragraph-shaped, recommendation buried):**
+   **Bad — delete on sight (paragraph-shaped, no sub-section breaks):**
 
-   > - **`animation_poc_lerp.rs`: function-local `const` invokes an exception that doesn't exist.** The Fix Summary cites a "const inside the single function that uses it" exception. `no-magic-values.md` lists three exceptions: `impl Type` constants, single-file binary targets... so the example-target exception applies — the const should be at the top of the file. Decision needed: either move it back to file scope after imports, or accept the function-local placement and amend the style file to permit it.
+   > - **`src/restore/winit_info.rs:95`** — `let monitor_position = current_monitor.position();` is a same-kind pixel-valued local from the same `current_monitor.position()` call the eval flagged in `debug.rs:39`, but the eval's Locations list did not name it and the agent did not rename it (rule: `pixel-units-in-names.md`). **Recommend:** rename to `physical_monitor_position` as a follow-up to this finding.
+
+   The above is wrong because the headline, issue, and recommendation are run together on one line as an em-dash-joined paragraph. Even though it ends in `**Recommend:**`, the lack of blank-line breaks between sub-sections makes it unscannable. Split into the three-part block shown in the Good examples.
 
    **Bad — delete on sight (multi-option question form; old format):**
 
    > - **`src/restore/winit_info.rs:95`** — `let monitor_position = current_monitor.position();` is a pixel-valued local the agent did not rename (rule: `pixel-units-in-names.md`). Rename to `physical_monitor_position`, leave for follow-up, or accept?
 
-   The second Bad example follows the old "propose options" format. The new format requires a single `**Recommend:**` statement instead — let the user override in reply if they disagree.
+   The above follows the old "propose options" format. The new format requires a single `**Recommend:**` sub-section instead — let the user override in reply if they disagree.
 
    **Bad — delete on sight (`**Style rule:**` preamble; format violation):**
 
    > - **`src/restore/winit_info.rs:95`** — agent did not rename `let monitor_position = current_monitor.position();`. **Style rule (pixel-units-in-names.md):** *"every field whose value is a pixel count — position, width, height, size — must carry an explicit `logical_` or `physical_` prefix."* The exception covers locals where the qualifier is already present, which `monitor_position` is not. **Recommend:** rename to `physical_monitor_position`.
 
-   The lookup happens internally; the bullet output uses the inline `(rule: <file>)` form.
+   The lookup happens internally; the bullet output uses the inline `(rule: <file>)` form inside the `Issue:` sub-section.
 
    **Pre-submit checklist for every Concerns bullet:**
-   1. Does the bullet start with `**`<file>`**` — and nothing else before it?
-   2. Is there any `**Style rule` or `**No rule found` block-bold preamble? If yes, delete it; rewrite the citation as inline `(rule: <file.md>)`.
-   3. Is the rule citation a single short parenthetical, not a quoted prescription?
-   4. Does the bullet end with `**Recommend:** <single action>.` — not a question, not a list of options?
-   5. If you wrote a question mark or comma-separated options at the end, rewrite as a single recommendation. The user can override in reply.
-   6. Read the bullet aloud — does it take more than ~10 seconds? If yes, cut.
+   1. Does the bullet start with `**`<file>`**` on its own line — and nothing else on that line?
+   2. Are the headline, `**Issue:**` line, and `**Recommend:**` line **separated by blank lines**? (If they are on one line joined by em-dashes, the format is wrong — split them.)
+   3. Is there any `**Style rule` or `**No rule found` block-bold preamble? If yes, delete it; rewrite the citation as inline `(rule: <file.md>)` inside the `Issue:` sub-section.
+   4. Is the rule citation a single short parenthetical, not a quoted prescription?
+   5. Does the bullet end with a `**Recommend:** <single action>.` sub-section — not a question, not a list of options?
+   6. If you wrote a question mark or comma-separated options at the end, rewrite as a single recommendation. The user can override in reply.
+   7. Read each sub-section aloud — does either sub-section take more than ~10 seconds? If yes, cut.
 
-   **Special cases (still follow the format):**
-   - Newly added `#[allow(...)]`, `#![allow(...)]`, or `Cargo.toml` `"allow"`: name the lint and `file:line` in the headline; one short statement of what's wrong; `**Recommend:**` clause.
-   - Speculative concerns: prefix the statement (after the headline) with `(speculative)`.
+   **Special cases (still follow the three-part block format):**
+   - Newly added `#[allow(...)]`, `#![allow(...)]`, or `Cargo.toml` `"allow"`: name the lint and `file:line` in the headline; one short `**Issue:**` sub-section; one `**Recommend:**` sub-section.
+   - Speculative concerns: prefix the `Issue:` sub-section with `(speculative)`.
 
    **Do not list passed checks here.** Silence is the signal that something was done well. Bullets ending in "OK", "good fit", "correct" — delete.
 
