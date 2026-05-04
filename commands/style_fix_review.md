@@ -99,18 +99,20 @@ A single fix may touch concerns the finding's style file does not cover — e.g.
 3. **Cite each governing file** with a `**Style rule (<concern>):**` line in the proposal. A fix touching three concerns should cite three rules (or explicitly note which have no governing rule).
 4. **Never propose a pattern for a secondary concern without doing the lookup**, even if the concern feels minor. A one-line allow placement or a two-word rename can violate an explicit rule just as loudly as a big restructure.
 
-## Hard rule: read the governing style file before every Concern bullet
+## Hard rule: do the style-rule lookup before every Concern bullet
 
 This is the review-time mirror of the "read the governing style file before every fix proposal" rule. It applies to every Concern bullet you write during a finding walkthrough, including bullets about details the finding itself did not raise (visibility, imports, mod declarations, naming, allows, observers, error handling, etc.).
 
-No Concern bullet may be written from intuition. Every Concern bullet must begin with one of:
+**The lookup is mandatory. The way the lookup appears in the bullet is not a prefix.** Before writing any Concern bullet, you must have performed one of:
 
-- `**Style rule:**` — quote the relevant prescription and cite the file (e.g. `leaf-module-visibility.md`).
-- `**No rule found:**` — state the search you actually performed (which files you grepped, which lint names you looked up) and why you are raising the concern anyway.
+- Found the governing style file and identified the relevant prescription, or
+- Searched and found nothing applicable (record which files you grepped and which lint names you looked up).
 
-If you cannot produce one of those two prefixes after a real lookup, delete the bullet. "It feels off" is not a Concern; it is a prompt to do the lookup or drop the worry.
+If you cannot do one of those two things after a real lookup, delete the bullet. "It feels off" is not a Concern; it is a prompt to do the lookup or drop the worry.
 
-This rule is the strongest signal in the skill. It overrides the instinct to free-form a Concern when the rest of the walkthrough is going smoothly. A Concern without a cited rule is a defect — it leaks bad guidance into the user's review of every future style fix.
+**How the lookup shows up in the bullet output:** as a single short inline tag, not a leading preamble. See "Required format per concern" below for the exact template — typically `(rule: <file.md>)` or `(no rule found)` placed inside the bullet's body as a parenthetical on the statement sentence. Never as a `**Style rule:**` block that competes with the headline. The lookup is process; the citation is a one-token tag.
+
+A Concern without an internally-completed lookup is a defect — it leaks bad guidance into the user's review of every future style fix. A Concern that ships with a `**Style rule:**` paragraph preamble is also a defect — it violates the format and buries the recommendation under prose.
 
 ### Visibility-trigger checklist
 
@@ -341,27 +343,59 @@ For each finding, output a compact block with these parts. Keep the whole thing 
 5. **Implications** — bullet list only when the fix has a downstream consequence the user should weigh, even if no immediate action is required. An implication is something that may shape a *decision* the user makes next: a tradeoff, a precedent set, a knock-on effect on callers, a constraint added to future work. The user reading the bullet should be able to think "ah, that's a thing I now have to consider" — not "yes, the rule was followed." High bar: if it is just restating that a rule was satisfied, or if a competent reader would predict the consequence from the change itself (e.g. "narrower visibility means widening later if scope grows"), drop it. Omit the section entirely when empty. Never use this section as a softer home for passed checks.
 6. **Concerns** — bullet list only if there are items that need the user's attention. Use the terse, scannable format below — not dense prose. If there are no real concerns and no new allows, omit the section entirely.
 
-   **Required format per concern:**
+   **Required format per concern — copy this template exactly:**
 
-   - **`<file or short identifier>`** — one short sentence stating what the agent did and what's wrong. One short line citing the rule (only if non-obvious from the first line). End with an explicit action question.
+   ```
+   - **`<file:line or short identifier>`** — <statement of what's wrong, one short sentence with inline rule citation, e.g. "(rule: pixel-units-in-names.md)">. **Recommend:** <single recommended action, one short sentence>.
+   ```
+
+   The bullet has three parts in this order: **headline** (file path in backticks), **statement** (one short sentence naming what's wrong with an inline rule citation), **recommendation** (a single recommended action, prefixed with `**Recommend:**`).
+
+   The bullet is **not** a proposal asking the user to choose between options. It is a clear statement of the defect plus a single recommendation. The user can override the recommendation in their reply if they disagree — but the bullet itself does not enumerate alternatives.
 
    **Hard limits:**
-   - Each concern body: ≤ 3 short lines. If you need more, you're explaining too much — cut the history and the citation chain, keep the verdict.
-   - No multi-clause sentences strung together with em-dashes. Two short sentences beat one long one.
-   - The action question is mandatory. It must name the user's options (e.g. "Reorder?", "Revert, keep wrapper, or amend the guide?", "Move back to file scope or accept in-fn?").
-   - No "Decision needed:" preamble. The question itself signals the decision.
+   - Each concern body: ≤ 3 short lines total. If you need more, cut history and citation chains; keep the verdict.
+   - No multi-clause sentences chained with em-dashes. Two short sentences beat one long one.
+   - **The recommendation is mandatory and must be the last thing in the bullet.** It is a single declarative action, not a question. Do not list multiple options; pick one.
+   - **No question-form action prompts.** Bullets ending in "Rename, leave for follow-up, or accept?" or "Reorder?" or "Revert, keep wrapper, or amend the guide?" are the old format and are now banned. Replace them with `**Recommend:** rename to <name>.` or similar.
+   - No "Decision needed:" preamble. The recommendation itself signals what action is suggested.
+   - **No `**Style rule:**` or `**No rule found:**` paragraph preamble.** The lookup happens before you write the bullet (see the "do the style-rule lookup" hard rule above); the citation appears inline as `(rule: <file.md>)` or `(no rule found)` only — never as a leading bold block that competes with the headline.
 
-   **Good (the format the user can read):**
+   **Good — canonical example. Copy this rhythm:**
 
-   > **`animation_poc_lerp.rs`** — agent moved `const CURSOR_NAME` *inside* `fn setup`. Style guide says example targets get constants at top-of-file after imports — not inside functions. Move to file top, leave inside fn, or amend style guide?
+   > - **`animation_poc_lerp.rs`** — agent moved `const CURSOR_NAME` inside `fn setup`; example targets get constants at top-of-file after imports (rule: `no-magic-values.md`). **Recommend:** move the const back to file scope after the imports.
 
-   **Bad (delete on sight — paragraph-shaped, decision buried):**
+   **Good — second example with a missed-rename concern:**
 
-   > **`animation_poc_lerp.rs`: function-local `const` invokes an exception that doesn't exist.** The Fix Summary cites a "const inside the single function that uses it" exception. `no-magic-values.md` lists three exceptions: `impl Type` constants, single-file binary targets... so the example-target exception applies — the const should be at the top of the file (right after `use bevy::window::PrimaryWindow;` on line 12), not inside `setup`. Decision needed: either move it back to file scope after imports, or accept the function-local placement and amend the style file to permit it.
+   > - **`src/restore/winit_info.rs:95`** — `let monitor_position = current_monitor.position();` is a pixel-valued local that the eval missed and the agent did not rename (rule: `pixel-units-in-names.md`). **Recommend:** rename to `physical_monitor_position` as a follow-up to this finding.
+
+   **Bad — delete on sight (paragraph-shaped, recommendation buried):**
+
+   > - **`animation_poc_lerp.rs`: function-local `const` invokes an exception that doesn't exist.** The Fix Summary cites a "const inside the single function that uses it" exception. `no-magic-values.md` lists three exceptions: `impl Type` constants, single-file binary targets... so the example-target exception applies — the const should be at the top of the file. Decision needed: either move it back to file scope after imports, or accept the function-local placement and amend the style file to permit it.
+
+   **Bad — delete on sight (multi-option question form; old format):**
+
+   > - **`src/restore/winit_info.rs:95`** — `let monitor_position = current_monitor.position();` is a pixel-valued local the agent did not rename (rule: `pixel-units-in-names.md`). Rename to `physical_monitor_position`, leave for follow-up, or accept?
+
+   The second Bad example follows the old "propose options" format. The new format requires a single `**Recommend:**` statement instead — let the user override in reply if they disagree.
+
+   **Bad — delete on sight (`**Style rule:**` preamble; format violation):**
+
+   > - **`src/restore/winit_info.rs:95`** — agent did not rename `let monitor_position = current_monitor.position();`. **Style rule (pixel-units-in-names.md):** *"every field whose value is a pixel count — position, width, height, size — must carry an explicit `logical_` or `physical_` prefix."* The exception covers locals where the qualifier is already present, which `monitor_position` is not. **Recommend:** rename to `physical_monitor_position`.
+
+   The lookup happens internally; the bullet output uses the inline `(rule: <file>)` form.
+
+   **Pre-submit checklist for every Concerns bullet:**
+   1. Does the bullet start with `**`<file>`**` — and nothing else before it?
+   2. Is there any `**Style rule` or `**No rule found` block-bold preamble? If yes, delete it; rewrite the citation as inline `(rule: <file.md>)`.
+   3. Is the rule citation a single short parenthetical, not a quoted prescription?
+   4. Does the bullet end with `**Recommend:** <single action>.` — not a question, not a list of options?
+   5. If you wrote a question mark or comma-separated options at the end, rewrite as a single recommendation. The user can override in reply.
+   6. Read the bullet aloud — does it take more than ~10 seconds? If yes, cut.
 
    **Special cases (still follow the format):**
-   - Newly added `#[allow(...)]`, `#![allow(...)]`, or `Cargo.toml` `"allow"`: name the lint and `file:line` in the headline; one line on what should be done; action question.
-   - Speculative concerns: prefix the body with `(speculative)`.
+   - Newly added `#[allow(...)]`, `#![allow(...)]`, or `Cargo.toml` `"allow"`: name the lint and `file:line` in the headline; one short statement of what's wrong; `**Recommend:**` clause.
+   - Speculative concerns: prefix the statement (after the headline) with `(speculative)`.
 
    **Do not list passed checks here.** Silence is the signal that something was done well. Bullets ending in "OK", "good fit", "correct" — delete.
 
@@ -373,7 +407,7 @@ The reader is a working engineer who has read EVALUATION.md once, has not re-rea
 - **Lead with what the user can do or decide.** Concerns must be actionable: name the file:line, what's wrong, and the proposed fix. Implications must inform a *decision* the user might make next — a tradeoff, a precedent, a constraint on future work, a knock-on effect on callers. If a bullet does not change behavior or shape a decision, drop it.
 - **One-pass readability test.** Before submitting any bullet, ask: would the reader, on first read, know what was changed and why this bullet is in front of them? If they would have to re-read the style guide or scroll back to the diff to parse it, rewrite it.
 - **Never use the rule's name as the answer.** "The style file allows this" or "the rule's fallback applies" is not informative. State what was specifically done and what it costs or implies — concretely, in this codebase's vocabulary.
-- **Format check before submitting.** Read each Concerns bullet aloud. If it takes more than ~10 seconds to say, or if the action question isn't the last thing, rewrite it. The Concerns bullet format is enforced — long-form prose is a bug.
+- **Format check before submitting.** Read each Concerns bullet aloud. If it takes more than ~10 seconds to say, or if the bullet does not end with a single `**Recommend:**` clause (no question mark, no comma-separated options), rewrite it. The Concerns bullet format is enforced — long-form prose and multi-option questions are bugs.
 - **Anti-patterns to delete on sight:**
   - Bullets that end in an affirmation ("OK," "good fit," "correct," "this is fine"). These are passed checks; silence is the signal.
     - Negative example — delete on sight: *"Public-facade visibility unchanged. Items retain their original `pub(crate)` visibility... `pub(crate)` is the correct choice... No change needed — flagging only because Finding 1's restructuring made me check every visibility decision in the diff."* This is a passed check the reviewer self-flagged as non-actionable ("No change needed — flagging only because..."). Omit the bullet — and if it was the only bullet, omit the entire Concerns section.
