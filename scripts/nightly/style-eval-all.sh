@@ -241,11 +241,8 @@ for i in "${!projects[@]}"; do
         fi
     fi
 
-    effective_budget=$((MAX_NEW_FINDINGS - existing_findings))
-
     python3 "$HISTORY_HELPER" start-run \
-        --project-root "$project_root" \
-        --budget "$effective_budget" || {
+        --project-root "$project_root" || {
         echo "FAILED: $proj (could not start pending run)"
         continue
     }

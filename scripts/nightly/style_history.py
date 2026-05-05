@@ -241,6 +241,52 @@ def pending_file(project: str) -> Path:
     return PENDING_DIR / f"{project}.json"
 
 
+def max_new_findings() -> int:
+    """Read `[style_eval] max_new_findings` from `nightly-rust.conf`.
+
+    Single source of truth for the per-run finding cap. Errors loudly if
+    missing — both the nightly script and the ad-hoc agent path depend on
+    this value, so silent defaulting would let arbitrary numbers leak in
+    (the bug that motivated centralizing this).
+    """
+    if not NIGHTLY_CONF_FILE.exists():
+        raise SystemExit(
+            f"nightly-rust.conf not found at {NIGHTLY_CONF_FILE}; [style_eval] max_new_findings must be set there."
+        )
+    current_section = ""
+    for raw_line in NIGHTLY_CONF_FILE.read_text().splitlines():
+        stripped = raw_line.split("#", 1)[0].strip()
+        if not stripped:
+            continue
+        if stripped.startswith("[") and stripped.endswith("]"):
+            current_section = stripped[1:-1]
+            continue
+        if current_section != "style_eval" or "=" not in stripped:
+            continue
+        key, _, value = stripped.partition("=")
+        if key.strip() == "max_new_findings":
+            try:
+                return int(value.strip())
+            except ValueError as exc:
+                raise SystemExit(
+                    f"[style_eval] max_new_findings in {NIGHTLY_CONF_FILE} is not an int: {value.strip()!r}"
+                ) from exc
+    raise SystemExit(
+        f"[style_eval] max_new_findings is not set in {NIGHTLY_CONF_FILE}"
+    )
+
+
+def existing_findings_in_eval(project_root: Path) -> int:
+    eval_path = project_root / "EVALUATION.md"
+    if not eval_path.exists():
+        return 0
+    return sum(
+        1
+        for line in eval_path.read_text().splitlines()
+        if line.startswith("### ") and len(line) > 4 and line[4].isdigit()
+    )
+
+
 def excluded_projects() -> set[str]:
     if not NIGHTLY_CONF_FILE.exists():
         return set()
@@ -521,10 +567,18 @@ def non_negotiable_guideline_ids(project_root: Path) -> list[str]:
     ]
 
 
-def start_run(project_root: Path, budget: int) -> None:
+def start_run(project_root: Path) -> None:
     HISTORY_DIR.mkdir(parents=True, exist_ok=True)
     PENDING_DIR.mkdir(parents=True, exist_ok=True)
     project = project_root.name.removesuffix("_style_fix")
+    # Total findings in EVALUATION.md are capped at `max_new_findings`.
+    # The per-run budget is the room left after carry-forwards, and
+    # only NEW findings consume it (carry-forwards are free since they
+    # were already represented by the subtraction). With existing=1 and
+    # max=2, budget=1 → up to 1 net-new finding → total ends at 2.
+    cap = max_new_findings()
+    existing = existing_findings_in_eval(project_root)
+    budget = max(0, cap - existing)
     payload: PendingState = {
         "budget": budget,
         "phase": "evaluation",
@@ -663,7 +717,7 @@ def record_unit(project_root: Path, results_path: Path, eval_path: Path) -> None
     )
 
     scored_increment = 0
-    found_countable = False
+    found_new_finding = False
     for result in results:
         guideline_id = result.get("guideline_id")
         if not isinstance(guideline_id, str):
@@ -671,19 +725,21 @@ def record_unit(project_root: Path, results_path: Path, eval_path: Path) -> None
         reviewed_entry: ReviewedUnit = {"guideline_id": guideline_id}
         outcome = result.get("outcome")
         is_finding = False
+        finding_source = ""
         if isinstance(outcome, dict):
             reviewed_entry["outcome"] = outcome
             status = outcome.get("status")
-            if status != "no_findings":
-                found_countable = True
-            if status in {"finding", "fixed", "partial", "skipped"} or outcome.get("finding_source") in {"new", "carried_forward"}:
+            outcome_source = outcome.get("finding_source")
+            if isinstance(outcome_source, str):
+                finding_source = outcome_source
+            if status in {"finding", "fixed", "partial", "skipped"} or finding_source in {"new", "carried_forward"}:
                 is_finding = True
         else:
-            finding_source = result.get("finding_source")
-            if isinstance(finding_source, str):
-                reviewed_entry["finding_source"] = finding_source
-                found_countable = True
-                is_finding = finding_source in {"new", "carried_forward"}
+            top_source = result.get("finding_source")
+            if isinstance(top_source, str):
+                reviewed_entry["finding_source"] = top_source
+                finding_source = top_source
+                is_finding = top_source in {"new", "carried_forward"}
             else:
                 raise SystemExit(f"Result for {guideline_id} must include outcome or finding_source.")
         if is_finding and guideline_id not in eval_guidelines:
@@ -693,18 +749,38 @@ def record_unit(project_root: Path, results_path: Path, eval_path: Path) -> None
                 + "EVALUATION.md before calling record-unit."
             )
             raise SystemExit(message)
+        # Only NEW findings consume the per-run budget. Carry-forwards are
+        # already represented in EVALUATION.md from prior runs; charging
+        # them again would shrink the per-run new-finding allowance for
+        # every project that still has unresolved findings.
+        if finding_source == "new":
+            found_new_finding = True
         reviewed_units.append(reviewed_entry)
-    if found_countable:
+    if found_new_finding:
         scored_increment = 1
 
     pending["reviewed_units"] = reviewed_units
     reviewed_unit_ids.append(unit_id)
     pending["reviewed_unit_ids"] = reviewed_unit_ids
+    has_carry_forward = False
+    for result in results:
+        if result.get("finding_source") == "carried_forward":
+            has_carry_forward = True
+            break
+        outcome_value = result.get("outcome")
+        if isinstance(outcome_value, dict) and outcome_value.get("finding_source") == "carried_forward":
+            has_carry_forward = True
+            break
     pending["scored_count"] = int(pending.get("scored_count", 0)) + scored_increment
     pending["phase"] = "evaluation"
     pending["updated_at"] = utc_now()
     pending["last_unit_id"] = unit_id
-    pending["last_unit_result"] = "counted" if scored_increment else "no_findings"
+    if scored_increment:
+        pending["last_unit_result"] = "counted"
+    elif has_carry_forward:
+        pending["last_unit_result"] = "carried_forward"
+    else:
+        pending["last_unit_result"] = "no_findings"
     write_pending(project, pending)
 
 
@@ -898,7 +974,6 @@ def parse_args() -> argparse.Namespace:
     subparsers = parser.add_subparsers(dest="command", required=True)
     start = subparsers.add_parser("start-run")
     _ = start.add_argument("--project-root", required=True)
-    _ = start.add_argument("--budget", required=True, type=int)
     next_parser = subparsers.add_parser("next-unit")
     _ = next_parser.add_argument("--project-root", required=True)
     record = subparsers.add_parser("record-unit")
@@ -943,13 +1018,6 @@ def _arg_str(args: argparse.Namespace, name: str) -> str:
     return value
 
 
-def _arg_int(args: argparse.Namespace, name: str) -> int:
-    value: object = getattr(args, name)  # pyright: ignore[reportAny]
-    if not isinstance(value, int):
-        raise SystemExit(f"Argument --{name.replace('_', '-')} must be an int.")
-    return value
-
-
 def _arg_str_list(args: argparse.Namespace, name: str) -> list[str]:
     value: object = getattr(args, name)  # pyright: ignore[reportAny]
     if not isinstance(value, list):
@@ -966,7 +1034,7 @@ def main() -> None:
     args = parse_args()
     command = _arg_str(args, "command")
     if command == "start-run":
-        start_run(Path(_arg_str(args, "project_root")).expanduser().resolve(), _arg_int(args, "budget"))
+        start_run(Path(_arg_str(args, "project_root")).expanduser().resolve())
         return
     if command == "next-unit":
         print(json.dumps(next_unit(Path(_arg_str(args, "project_root")).expanduser().resolve()), indent=2, sort_keys=True))

@@ -31,6 +31,14 @@ zsh ~/.claude/scripts/load-rust-style.sh --list-files --project-root "$ARGUMENTS
 
 ## Step 1.5: Use the nightly selection helper
 
+If no pending run exists yet (i.e. `next-unit` errors with "No pending run for ..."), initialize one first. The budget is derived from `[style_eval] max_new_findings` in `~/.claude/scripts/nightly/nightly-rust.conf` minus the count of existing `### N` findings in `EVALUATION.md` — there is no `--budget` flag, by design, so no caller can invent a number:
+
+```bash
+python3 ~/.claude/scripts/nightly/style_history.py start-run --project-root "$ARGUMENTS"
+```
+
+The nightly (`style-eval-all.sh`) calls `start-run` itself, so this is only needed for ad-hoc agent invocations.
+
 You must pull evaluation units one at a time from:
 
 ```bash
@@ -211,16 +219,28 @@ Requirements for each finding:
 
 Skip this step entirely if `--fix` is not in the original arguments — `/style_eval` ends at Step 5. The nightly never passes `--fix`, so its behavior is unchanged.
 
-If `--fix` was passed:
+If `--fix` was passed, you are running interactively and the user is waiting on the fix to finish. Use the foreground launcher so the harness can deliver a real completion event, and arm `Monitor` on the log so you can surface progress in chat as the fix runs.
 
 1. Re-read `$ARGUMENTS/EVALUATION.md`. If it has the "No violations found" section (no `## Improvements`), print `nothing to fix` and stop. Do not launch the fix script.
 
-2. Otherwise, derive the project name and invoke the fix script directly. Per CLAUDE.md, codex / nightly style scripts must run unsandboxed:
+2. Otherwise, derive the project name and invoke the fix script in the foreground via Bash with **both** `run_in_background: true` and `dangerouslyDisableSandbox: true`. Per CLAUDE.md, codex / nightly style scripts must run unsandboxed; `run_in_background` is what gives you the completion notification when the fix actually finishes (same pattern as `/validate_and_push` with `watch_ci.sh`):
 
    ```bash
-   ~/.claude/scripts/nightly/style-fix-manual.sh "$(basename "$ARGUMENTS")"
+   ~/.claude/scripts/nightly/style-fix-manual.sh --foreground "$(basename "$ARGUMENTS")"
    ```
 
-   Use `dangerouslyDisableSandbox: true` for this Bash call. `style-fix-manual.sh` runs `style-fix-worktrees.sh` in the background via `nohup`, accumulates the log under `~/.local/logs/nightly/`, and prints the log path + PID. Relay those to the user so they can `tail -f` or `/monitor_nightly` it.
+   The launcher prints `Log: <path>` on its first line of stdout (visible in the Bash tool's initial output before backgrounding) — capture that path; you'll arm a Monitor on it next.
 
-3. Do **not** wait for the fix to finish. The script disowns itself; report the log path and exit.
+3. **Immediately** arm the `Monitor` tool on the log path with a regex that matches the progress contract emitted by `style-fix-worktrees.sh`. Phase markers have the stable form:
+
+   ```
+   [progress <project>] phase=<name> [k=v ...]
+   ```
+
+   Phase names emitted by the script: `worktree-create`, `worktree-ready`, `agent-launch`, `agent-running` (heartbeat every 60s, with `elapsed=Xs`), `agent-fix-summary-detected`, `agent-exit`, `done`, and `failed` (with a `reason=` key). The Monitor regex should match the `[progress ` prefix.
+
+4. Tell the user the fix is running, quote the log path, and explain that you'll surface phase events as they arrive and post a final summary when the harness reports completion. Then **yield** — do not sleep, do not poll, do not re-read the log yourself.
+
+5. As Monitor events arrive, emit one short line per event mapping the phase to a human label (e.g. `worktree ready`, `agent launched (codex pid …)`, `agent running 60s`, `Fix Summary detected`, `agent exited code=0`). Skip the `worktree-create` line if it is immediately followed by `worktree-ready` to keep chatter low.
+
+6. When the harness delivers the `run_in_background` completion event for the launcher (the `exec`'d `style-fix-worktrees.sh` returned), stop the Monitor and read `~/rust/<project>_style_fix/EVALUATION.md`'s `## Fix Summary` section plus the tail of the log. Post a final summary covering: applied/skipped/proposed findings, `cargo mend` status, clippy status, and any `commit-style-results: skipped` notice. If the final progress phase was `failed`, surface the `reason=` value first.

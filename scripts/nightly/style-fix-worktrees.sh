@@ -27,6 +27,15 @@ STYLE_AGENT_MODE="claude"
 
 mkdir -p "$LOG_DIR"
 
+# Stable phase markers a `Monitor` consumer (e.g. /style_eval --fix) can grep
+# for line-by-line. Format: `[progress <project>] phase=<name> [k=v ...]`.
+# Kept on its own line and on stdout so the manual launcher's log captures it.
+progress() {
+    local proj="$1"
+    shift
+    printf '[progress %s] %s\n' "$proj" "$*"
+}
+
 # Diagnostic: change cwd to $RUST_DIR so any unanchored `cargo` call from this
 # process or its children no longer references /Users/natemccoy/.claude. If the
 # nightly log still shows that path tomorrow, the cargo invocation is coming
@@ -366,11 +375,13 @@ create_and_fix() {
     local log_file="$LOG_DIR/style_fix_${proj}.log"
 
     echo "[diag $proj] create_and_fix start: pid=$$ cwd=$(pwd)"
+    progress "$proj" "phase=worktree-create kind=$kind"
 
     # Create worktree (-b fails if branch exists, which is intentional)
     echo "[diag $proj] before git worktree add"
     if ! git -C "$repo_dir" worktree add -b "$branch_name" "$worktree_dir" 2>>"$log_file"; then
         echo "ERROR: $proj (worktree creation failed — branch $branch_name may already exist)"
+        progress "$proj" "phase=failed reason=worktree-create"
         return 1
     fi
     echo "[diag $proj] after git worktree add"
@@ -384,6 +395,7 @@ create_and_fix() {
     mkdir -p "$(dirname "$worktree_eval")"
     mv "$eval_file" "$worktree_eval"
     echo "[diag $proj] after EVALUATION.md mv"
+    progress "$proj" "phase=worktree-ready dir=$worktree_dir"
 
     python3 "$HISTORY_HELPER" set-phase --project "$proj" --phase fix || true
     echo "[diag $proj] after set-phase (about to build prompt + launch agent)"
@@ -580,17 +592,25 @@ PROMPT_EOF
     run_style_agent "$agent_work_dir" "$prompt" "$log_file" &
     agent_pid=$!
     echo "[diag $proj] agent launched: agent_pid=$agent_pid"
+    progress "$proj" "phase=agent-launch mode=$STYLE_AGENT_MODE pid=$agent_pid log=$log_file"
 
     local elapsed=0
     local timeout_secs=3600
     local summary_seen_at=""
     local post_summary_grace=300
+    local last_heartbeat=0
+    local heartbeat_interval=60
     while kill -0 "$agent_pid" 2>/dev/null; do
         sleep 10
         elapsed=$((elapsed + 10))
+        if (( elapsed - last_heartbeat >= heartbeat_interval )); then
+            progress "$proj" "phase=agent-running elapsed=${elapsed}s"
+            last_heartbeat=$elapsed
+        fi
         if [[ -z "$summary_seen_at" ]] && rg -q '^## Fix Summary$' "$worktree_eval" 2>/dev/null; then
             summary_seen_at=$elapsed
             echo "[diag $proj] Fix Summary detected at ${elapsed}s; agent has ${post_summary_grace}s to exit before SIGTERM"
+            progress "$proj" "phase=agent-fix-summary-detected elapsed=${elapsed}s"
         fi
         if [[ -n "$summary_seen_at" ]] && (( elapsed - summary_seen_at >= post_summary_grace )); then
             echo "[diag $proj] agent still alive ${post_summary_grace}s after Fix Summary; sending SIGTERM"
@@ -603,6 +623,7 @@ PROMPT_EOF
             kill -9 "$agent_pid" 2>/dev/null
             wait "$agent_pid" 2>/dev/null
             echo "TIMEOUT: $proj ($STYLE_AGENT_MODE exceeded 60 minute timeout)"
+            progress "$proj" "phase=failed reason=timeout elapsed=${elapsed}s"
             python3 "$HISTORY_HELPER" finalize-failure --project "$proj" --reason "$STYLE_AGENT_MODE exceeded 60 minute timeout" || true
             [[ -f "$worktree_eval" ]] && mv "$worktree_eval" "$eval_file"
             git -C "$repo_dir" worktree remove "$worktree_dir" --force 2>/dev/null || rm -rf "$worktree_dir"
@@ -617,6 +638,7 @@ PROMPT_EOF
     done
 
     wait "$agent_pid" && agent_code=0 || agent_code=$?
+    progress "$proj" "phase=agent-exit code=$agent_code elapsed=${elapsed}s"
 
     if [[ $agent_code -ne 0 ]]; then
         if [[ -f "$worktree_eval" ]] && rg -q '^## Fix Summary$' "$worktree_eval"; then
@@ -629,6 +651,7 @@ PROMPT_EOF
                 fail_reason="$STYLE_AGENT_MODE failed after producing output (see $log_file)"
             fi
             echo "ERROR: $proj ($fail_reason)"
+            progress "$proj" "phase=failed reason=agent-exit code=$agent_code"
             python3 "$HISTORY_HELPER" finalize-failure --project "$proj" --reason "$fail_reason" || true
             [[ -f "$worktree_eval" ]] && mv "$worktree_eval" "$eval_file"
             git -C "$repo_dir" worktree remove "$worktree_dir" --force 2>/dev/null || rm -rf "$worktree_dir"
@@ -644,10 +667,12 @@ PROMPT_EOF
 
     python3 "$HISTORY_HELPER" finalize-fix --project-root "$agent_work_dir" --evaluation "$worktree_eval" || {
         echo "ERROR: $proj (could not finalize history)"
+        progress "$proj" "phase=failed reason=finalize-history"
         return 1
     }
 
     echo "OK: $proj (worktree created, fixes applied)"
+    progress "$proj" "phase=done eval=$worktree_eval"
     return 0
 }
 
