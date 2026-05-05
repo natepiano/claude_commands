@@ -428,6 +428,27 @@ Worktree root: $worktree_dir
 
 IMPORTANT: Do NOT spawn sub-agents, delegate, or parallelize through helper agents. Complete this fix pass yourself in a single agent run.
 
+**Progress markers (REQUIRED — emit before doing each step).** Print one line of the exact form below on stdout immediately before you begin each named phase. The orchestrator's log watcher reads these lines and forwards them to the user's chat as live progress; without them, the user sees only a 60s heartbeat and has no idea which phase you're in.
+
+    >>> phase: <name> [extra=value …]
+
+Required phase names, in order:
+
+- \`>>> phase: read-style-guide\` — before Step 1 (load style guide).
+- \`>>> phase: read-evaluation\` — before Step 2 (read \$worktree_eval).
+- \`>>> phase: apply-finding n=<N> id=<short-id>\` — once per finding before its first edit (\`<short-id>\` = the guideline filename stem from the **Style file** field, e.g. \`enums-over-bool-for-owned-booleans\`).
+- \`>>> phase: cargo-mend-preview\` — before \`cargo mend ... --manifest-path\` in Step 4.
+- \`>>> phase: cargo-mend-fix\` — before \`cargo mend ... --fix --manifest-path\` (skip if no fixable items).
+- \`>>> phase: clippy-preview\` — before Step 5a.
+- \`>>> phase: clippy-auto-fix\` — before Step 5b (skip if 5a was clean).
+- \`>>> phase: clippy-manual\` — before Step 5c.
+- \`>>> phase: tests\` — before Step 6.
+- \`>>> phase: style-review\` — before Step 7.
+- \`>>> phase: fmt\` — before Step 8.
+- \`>>> phase: write-fix-summary\` — before Step 9.
+
+Emit each marker on its own line, with no other text on the line. Do not skip markers even when a step has nothing to do — emit the marker and proceed (the user wants to see the step ran).
+
 Step 1: Load the style guide and read referenced files
 Run: zsh ~/.claude/scripts/load-rust-style.sh --project-root $agent_work_dir
 Then read each unique style file referenced by the findings in EVALUATION.md. Each finding includes a **Style file** field with the full path to the style guide file (e.g., ~/rust/nate_style/rust/one-use-per-line.md or a repo-local docs/style/*.md file).
@@ -594,6 +615,26 @@ PROMPT_EOF
     echo "[diag $proj] agent launched: agent_pid=$agent_pid"
     progress "$proj" "phase=agent-launch mode=$STYLE_AGENT_MODE pid=$agent_pid log=$log_file"
 
+    # Forwarder: tail the agent's own log, watch for the `>>> phase: <name>`
+    # sentinel lines the prompt instructs codex to emit, and republish each
+    # one to *this* script's stdout (which the manual launcher captures into
+    # the manual log a Monitor is tailing). This is what gives the user
+    # live, step-level visibility instead of only the 60s heartbeat.
+    # The watcher exits as soon as we kill it after `wait "$agent_pid"`.
+    : > "$log_file"  # ensure file exists so tail -F doesn't race
+    local watcher_pid
+    (
+        tail -F -n 0 -q "$log_file" 2>/dev/null \
+            | while IFS= read -r line; do
+                case "$line" in
+                    ">>> phase: "*)
+                        progress "$proj" "phase=agent-step ${line#>>> phase: }"
+                        ;;
+                esac
+            done
+    ) &
+    watcher_pid=$!
+
     local elapsed=0
     local timeout_secs=3600
     local summary_seen_at=""
@@ -622,6 +663,8 @@ PROMPT_EOF
             sleep 5
             kill -9 "$agent_pid" 2>/dev/null
             wait "$agent_pid" 2>/dev/null
+            kill "$watcher_pid" 2>/dev/null
+            wait "$watcher_pid" 2>/dev/null
             echo "TIMEOUT: $proj ($STYLE_AGENT_MODE exceeded 60 minute timeout)"
             progress "$proj" "phase=failed reason=timeout elapsed=${elapsed}s"
             python3 "$HISTORY_HELPER" finalize-failure --project "$proj" --reason "$STYLE_AGENT_MODE exceeded 60 minute timeout" || true
@@ -638,6 +681,9 @@ PROMPT_EOF
     done
 
     wait "$agent_pid" && agent_code=0 || agent_code=$?
+    # Stop the phase-marker forwarder; tail+pipe persists otherwise.
+    kill "$watcher_pid" 2>/dev/null
+    wait "$watcher_pid" 2>/dev/null
     progress "$proj" "phase=agent-exit code=$agent_code elapsed=${elapsed}s"
 
     if [[ $agent_code -ne 0 ]]; then
