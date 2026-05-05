@@ -341,6 +341,21 @@ For each finding, output a compact block with these parts. Keep the whole thing 
    - **Prose form** — use for file moves, splits, deletions, or renames of whole files. Pattern: `` `old/path.rs` → `new/path.rs` `` with a one-clause description of why. Never write "X was renamed to Y" without paths.
 4. **Assessment** — a single line or short sentence: applied / correct / complete, and one phrase citing the style rule.
 5. **Implications** — bullet list only when the fix has a downstream consequence the user should weigh, even if no immediate action is required. An implication is something that may shape a *decision* the user makes next: a tradeoff, a precedent set, a knock-on effect on callers, a constraint added to future work. The user reading the bullet should be able to think "ah, that's a thing I now have to consider" — not "yes, the rule was followed." High bar: if it is just restating that a rule was satisfied, or if a competent reader would predict the consequence from the change itself (e.g. "narrower visibility means widening later if scope grows"), drop it. Omit the section entirely when empty. Never use this section as a softer home for passed checks.
+
+   **Hard rule — no readability implications for clippy-driven rewrites.** When a change in the diff is attributable to a clippy lint (auto-fix in phase 5b, manual fix in 5c, or any rewrite citing a lint name in the Fix Summary), the user has already opted into clippy's preference by allowing the lint in `Cargo.toml`. Do **not** flag the rewritten form as harder to read, less direct, more verbose, or aesthetically worse than the pre-clippy form. Do **not** propose `#[allow(...)]` to revert it. Silence is the correct default for clippy-driven changes. Examples that would be filtered out by this rule: "the `mul_add` form reads less directly than `(a - b * c).abs()`," "the `unwrap_or` rewrite obscures the closure's intent," "the rewritten `&impl AsRef<str>` signature is less explicit than `&str`."
+
+   **Exception — surface a clippy-driven change only if it has a non-readability consequence the user must reason about**:
+   - **Behavioral or numerical divergence** — the rewrite is not bit-identical or changes observable semantics (iteration order, panic conditions, overflow behavior, NaN handling, evaluation order of side effects).
+   - **API or visibility change** — the rewrite alters a public signature, exported type, or visibility modifier that callers depend on.
+   - **Lint-vs-lint conflict** — the clippy fix re-introduces a violation of another lint or style rule, creating a cycle or producing a follow-up edit elsewhere in the diff.
+   - **Performance regression in a hot path** — the rewrite is measurably slower in a code path that matters; flag only with concrete evidence, not speculation.
+   - **Constraint added to future work** — the rewrite locks in a pattern that a planned refactor (named in the project context) will need to undo.
+
+   Pure readability is **never** on the list. If the only thing you'd say is "this reads worse than before," delete the bullet.
+
+   **How to detect a clippy-driven change:**
+   1. The Fix Summary's `Clippy Changes` subsection names the file and/or lint.
+   2. The fix sequence is eval-driven edits → `cargo mend` → `cargo clippy --fix` → manual clippy. Anything appearing post-eval that matches a known clippy rewrite pattern (`mul_add`, `unwrap_or_else` → `unwrap_or`, `&str` → `impl AsRef<str>`, `if let Some(_) =` → `is_some()`, etc.) is presumptively clippy-driven.
 6. **Concerns** — bullet list only if there are items that need the user's attention. Use the terse, scannable format below — not dense prose. If there are no real concerns and no new allows, omit the section entirely.
 
    **Required format per concern — copy this template exactly:**
