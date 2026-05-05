@@ -290,6 +290,10 @@ for ci in "${!candidates[@]}"; do
     # For workspace_member projects, other worktrees of the workspace are expected
     # (concurrent style-fix worktrees for sibling members live off the same repo).
     if [[ "$kind" == "standalone" ]]; then
+        # Prune stale worktree metadata first — entries whose directories were
+        # deleted out from under git still appear in `worktree list` and would
+        # otherwise trip the count check below.
+        git -C "$repo_dir" worktree prune 2>/dev/null || true
         worktree_count=$(git -C "$repo_dir" worktree list --porcelain 2>/dev/null | grep -c '^worktree ' || true)
         if [[ "$worktree_count" -gt 1 ]]; then
             echo "SKIP: $name (another worktree checkout already exists)"
