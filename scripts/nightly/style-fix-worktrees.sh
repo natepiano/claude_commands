@@ -14,6 +14,18 @@
 
 set -euo pipefail
 
+# Emit a final sentinel line on every exit path so a Monitor tailing the log
+# can self-terminate (awk-on-match) and any /style_eval --fix orchestrator
+# knows the script is gone, not just quiet. Format mirrors progress() so
+# downstream consumers don't need a second regex.
+__final_exit_code=0
+__emit_launcher_exit() {
+    __final_exit_code=$?
+    local proj="${SINGLE_PROJECT:-all}"
+    printf '[progress %s] phase=launcher-exit code=%s\n' "$proj" "$__final_exit_code"
+}
+trap __emit_launcher_exit EXIT
+
 export PATH="$HOME/.local/bin:$PATH"
 source "$HOME/.cargo/env"
 
@@ -539,8 +551,9 @@ Step 5c (verify + manual): Re-run: cargo clippy $cargo_scope_flag --all-targets 
 - After fixing, re-run clippy one more time to confirm clean; only spend evaluation effort on items that actually remain.
 
 Step 6: Run tests and fix any failures
-Run: cargo nextest run $cargo_scope_flag --manifest-path $worktree_dir/Cargo.toml
-If any tests fail, fix them.
+Run: CARGO_MEND_SKIP_NETWORK_TESTS=1 cargo nextest run $cargo_scope_flag --manifest-path $worktree_dir/Cargo.toml
+The CARGO_MEND_SKIP_NETWORK_TESTS env var asks tests that require localhost TCP (e.g. nested \`cargo fix\` invocations) to skip themselves; the sandbox blocks those binds with \`Operation not permitted (os error 1)\` and they cannot succeed here.
+If any non-skipped tests fail, fix them.
 
 Step 7: Style review of the diff
 Run: git -C $worktree_dir diff | grep '^+' | grep -v '^+++' > /tmp/claude/style-review-additions.txt
@@ -638,9 +651,16 @@ PROMPT_EOF
     local elapsed=0
     local timeout_secs=3600
     local summary_seen_at=""
-    local post_summary_grace=300
+    local post_summary_grace=600
     local last_heartbeat=0
     local heartbeat_interval=60
+    # Track agent log activity so we can defer SIGTERM while the agent is still
+    # writing (e.g. expanding the Fix Summary section). The grace period is
+    # measured from the LAST observed log activity, not the moment Fix Summary
+    # first appeared, so a verbose write-fix-summary phase doesn't get cut off.
+    local last_log_size=0
+    local last_activity_at=0
+    [[ -f "$log_file" ]] && last_log_size=$(wc -c < "$log_file" 2>/dev/null || echo 0)
     while kill -0 "$agent_pid" 2>/dev/null; do
         sleep 10
         elapsed=$((elapsed + 10))
@@ -648,23 +668,34 @@ PROMPT_EOF
             progress "$proj" "phase=agent-running elapsed=${elapsed}s"
             last_heartbeat=$elapsed
         fi
+        local current_log_size=0
+        [[ -f "$log_file" ]] && current_log_size=$(wc -c < "$log_file" 2>/dev/null || echo 0)
+        if (( current_log_size > last_log_size )); then
+            last_log_size=$current_log_size
+            last_activity_at=$elapsed
+        fi
         if [[ -z "$summary_seen_at" ]] && rg -q '^## Fix Summary$' "$worktree_eval" 2>/dev/null; then
             summary_seen_at=$elapsed
-            echo "[diag $proj] Fix Summary detected at ${elapsed}s; agent has ${post_summary_grace}s to exit before SIGTERM"
+            echo "[diag $proj] Fix Summary detected at ${elapsed}s; grace window resets on each agent log write"
             progress "$proj" "phase=agent-fix-summary-detected elapsed=${elapsed}s"
         fi
-        if [[ -n "$summary_seen_at" ]] && (( elapsed - summary_seen_at >= post_summary_grace )); then
-            echo "[diag $proj] agent still alive ${post_summary_grace}s after Fix Summary; sending SIGTERM"
-            kill "$agent_pid" 2>/dev/null
+        # Only SIGTERM after Fix Summary is seen AND agent has been silent
+        # for the full grace window. Active agents resetting the activity
+        # timer keep working past the original 300s ceiling.
+        if [[ -n "$summary_seen_at" ]] \
+            && (( elapsed - summary_seen_at >= post_summary_grace )) \
+            && (( elapsed - last_activity_at >= post_summary_grace )); then
+            echo "[diag $proj] agent silent ${post_summary_grace}s after Fix Summary AND last log write at ${last_activity_at}s; sending SIGTERM"
+            kill "$agent_pid" 2>/dev/null || true
             break
         fi
         if [[ $elapsed -ge $timeout_secs ]]; then
-            kill "$agent_pid" 2>/dev/null
+            kill "$agent_pid" 2>/dev/null || true
             sleep 5
-            kill -9 "$agent_pid" 2>/dev/null
-            wait "$agent_pid" 2>/dev/null
-            kill "$watcher_pid" 2>/dev/null
-            wait "$watcher_pid" 2>/dev/null
+            kill -9 "$agent_pid" 2>/dev/null || true
+            wait "$agent_pid" 2>/dev/null || true
+            kill "$watcher_pid" 2>/dev/null || true
+            wait "$watcher_pid" 2>/dev/null || true
             echo "TIMEOUT: $proj ($STYLE_AGENT_MODE exceeded 60 minute timeout)"
             progress "$proj" "phase=failed reason=timeout elapsed=${elapsed}s"
             python3 "$HISTORY_HELPER" finalize-failure --project "$proj" --reason "$STYLE_AGENT_MODE exceeded 60 minute timeout" || true
@@ -680,10 +711,12 @@ PROMPT_EOF
         fi
     done
 
+    # Tolerant cleanup: if any of these fail under `set -e`, the cleanup
+    # branches below would never execute and the worktree would leak.
     wait "$agent_pid" && agent_code=0 || agent_code=$?
     # Stop the phase-marker forwarder; tail+pipe persists otherwise.
-    kill "$watcher_pid" 2>/dev/null
-    wait "$watcher_pid" 2>/dev/null
+    kill "$watcher_pid" 2>/dev/null || true
+    wait "$watcher_pid" 2>/dev/null || true
     progress "$proj" "phase=agent-exit code=$agent_code elapsed=${elapsed}s"
 
     if [[ $agent_code -ne 0 ]]; then
@@ -759,9 +792,40 @@ if [[ ${#failed_names[@]} -gt 0 ]]; then
     echo ""
     echo "=== Retrying ${#failed_names[@]} failed projects sequentially ==="
     for proj in "${failed_names[@]}"; do
-        # Delete the branch from the failed first attempt so worktree add -b can recreate it
         if load_record "$proj"; then
+            # If the first attempt already produced a worktree with a Fix
+            # Summary in EVALUATION.md, the run is effectively done. The
+            # "failure" was almost certainly a SIGTERM-on-grace race or a
+            # tolerant-cleanup gap. Finalize history and treat as success
+            # instead of recreating the worktree.
+            if [[ -d "$R_worktree_dir" ]] \
+                && [[ -f "$R_worktree_eval" ]] \
+                && rg -q '^## Fix Summary$' "$R_worktree_eval" 2>/dev/null; then
+                echo "RETRY-SKIP: $proj (worktree at $R_worktree_dir already has Fix Summary; finalizing without re-running agent)"
+                progress "$proj" "phase=already-applied dir=$R_worktree_dir"
+                already_work_dir="$R_worktree_dir"
+                if [[ -n "$R_subpath" ]]; then
+                    already_work_dir="$R_worktree_dir/$R_subpath"
+                fi
+                if python3 "$HISTORY_HELPER" finalize-fix --project-root "$already_work_dir" --evaluation "$R_worktree_eval"; then
+                    echo "RETRY OK: $proj (already applied)"
+                    progress "$proj" "phase=done eval=$R_worktree_eval"
+                    failed=$((failed - 1))
+                    succeeded=$((succeeded + 1))
+                    continue
+                else
+                    echo "RETRY FAILED: $proj (finalize-history error)"
+                    progress "$proj" "phase=failed reason=finalize-history"
+                    continue
+                fi
+            fi
+
+            # Worktree did NOT carry a finished fix; clean up before recreating.
             git -C "$R_repo_dir" branch -D "$R_branch" 2>/dev/null || true
+            if [[ -d "$R_worktree_dir" ]]; then
+                git -C "$R_repo_dir" worktree remove "$R_worktree_dir" --force 2>/dev/null || rm -rf "$R_worktree_dir"
+                git -C "$R_repo_dir" worktree prune 2>/dev/null || true
+            fi
         fi
 
         echo "RETRY: $proj"

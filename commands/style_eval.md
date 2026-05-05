@@ -130,7 +130,26 @@ For each returned unit:
 2. Read the content of any `see_also_guideline_ids` on the unit as review context — apply the selected unit's rule, informed by that context, but do not record findings against the see_also'd guidelines (they get their own review cycle)
 3. Re-read the returned `non_negotiable_guideline_ids` and treat them as binding for this unit
 3a. **If the unit's frontmatter has `mechanism: clippy` and `mode: auto`,** the rule is clippy-owned. Treat the `lint:` list in the frontmatter as the source of truth: only sites that clippy actually flags for one of those lints may be raised as findings for this unit. If the project's `Cargo.toml` already enables the lint at `warn`/`deny`, the existing `cargo clippy --all-targets` output is sufficient. Otherwise, run `cargo clippy --all-targets -- -W <lint_name>` (one `-W` per lint) and use that output. If clippy is silent project-wide for every lint in the unit's `lint:` list, record `outcome.status = no_findings` and move on. Do not visual-inspect for this category of rule — visual matches that clippy does not fire on are by definition not violations (e.g. `|x| x.method()` reached via `Deref`).
-4. Check the *entire project* for violations of that selected unit. A finding for a guideline must enumerate **every** instance of the violation across the codebase, not a sample. **One guideline = one finding = all of its violations.** Tool precedence — pick the cheapest tool that can answer the question precisely:
+4. Apply the unit's **rule** to the entire project. The unit of exhaustiveness is the rule, not the first example you notice.
+
+   Concretely: derive the abstract pattern the rule prohibits or requires (e.g. "any field/parameter/binding whose name doesn't match the snake_case form of its type", "any raw literal at a call site that should be a named constant"), then search the codebase for every distinct match of that pattern — across all files, all binding positions, all literal kinds the rule covers.
+
+   **Mandatory enumeration artifact.** Before deciding the unit's `outcome.status`, you must produce two written lines for the unit, regardless of whether the outcome is `finding` or `no_findings`:
+
+   - **Surface searched** — one sentence naming the abstract pattern, derived from the rule (not from the first example). If the guideline file has a `### Surface` section, use it as the source of truth and quote it back; do not narrow it.
+   - **Search** — the exact rg / LSP / grep command(s) executed against the project, plus the raw match count those commands produced.
+
+   For `outcome.status = finding`, both lines must appear under the finding in `EVALUATION.md` (see Step 5 template), and `len(Locations)` must equal the Search match count. A Locations list shorter than the match count means the finding is malformed — expand it to cover every match before recording.
+
+   For `outcome.status = no_findings`, both lines must appear in your assistant-visible reasoning before calling `record-unit`, and the Search match count must be `0`. If the search returns matches but you believe none of them are genuine violations, the unit is a `finding` whose Recommended pattern explains the per-site reason each "match" is actually exempt — not a `no_findings`.
+
+   This artifact is the failure-prevention mechanism. Prose alone has not been enough — past evals have stopped at the first cluster and recorded one-site findings while other sites of the same rule went unlisted. Writing the Surface and Search lines down forces the project-wide enumeration to happen before the outcome is fixed.
+
+   If you spot one match (e.g. `color: ColorMode`), that is a trigger to enumerate the rule across the codebase, not the scope of the finding. The finding's Locations list must include every match of the rule, not just every site of the first example.
+
+   **One guideline = one finding = every site in the project that violates the rule.** Stopping at the first cluster is the failure mode this step exists to prevent.
+
+   Tool precedence — pick the cheapest tool that can answer the question precisely:
    - **Use the LSP tool** for any *semantic* query — anything about types, method signatures, trait implementations, references, or callers. Examples: "find every method whose body never references `self`" (`documentSymbol` per file → inspect signatures), "find every function that takes `&Vec<T>`" (`workspaceSymbol` → `hover` for type), "count the impls of trait `T`" (`findReferences` on the trait declaration), "find every caller of fn `f`" (`prepareCallHierarchy` + `incomingCalls`). LSP answers structurally; ripgrep cannot.
    - **Use ripgrep** for *textual* queries — keywords, attribute strings, identifier patterns. Examples: `pub mod`, `MessageReader<`, `#[reflect(Component)]`, `register_type::<`. The pre_filter system already handles the universally-textual cases; for the rest, ripgrep is fine.
    - **Read source files directly** only when LSP and ripgrep can't express the question or you need to verify a specific site found via the tools above. Never rely on the files you happened to read in Step 2 — they are not exhaustive.
@@ -192,7 +211,9 @@ Otherwise, write:
 
 **Style file**: `[full path from the loader file list]`
 **Style rule**: [which rule from the guide]
-**Locations** (every violation found project-wide):
+**Surface searched**: [one sentence naming the abstract pattern the rule covers — e.g. "any string or numeric literal at a call site that names a domain entity (file name, path keyword, target kind, port, threshold)"]
+**Search**: `[the exact rg / LSP / grep command(s) actually run]` — **N matches**
+**Locations** (every violation found project-wide; count must equal **N** above):
 - `path/to/file.rs:42` — [optional brief note about this site, only if it differs materially from the others]
 - `path/to/other.rs:15` — [...]
 - `path/to/third.rs:88-94` — [...]
@@ -210,7 +231,9 @@ Do NOT include an "Overall Assessment" section — just list the findings.
 
 Requirements for each finding:
 - Rank by impact: most violations / most deviation from the guide comes first
-- **Locations must enumerate every match.** Before writing the finding, run a project-wide search (ripgrep / AST) and verify you have caught all instances. A finding represents one guideline; missing locations means the next nightly will re-flag the same guideline instead of clearing it.
+- **Locations must enumerate every site that violates the rule project-wide.** Before writing the finding, name the abstract pattern the rule covers (not the first example you found), run a project-wide search for that pattern, and list every match. A finding scoped to one cluster of sites — when other sites elsewhere violate the same rule — is a defective finding, not a partial one. The next nightly will re-flag the same guideline instead of clearing it.
+- **`Surface searched` and `Search` are required fields** alongside `Locations`. The Search line must contain the literal command(s) you ran (not "I searched") and the resulting match count. `len(Locations)` must equal that match count. A finding without these fields, or with a Locations count that disagrees with the Search count, is malformed.
+- If the guideline file contains a `### Surface` section, copy or paraphrase it into the `Surface searched` field — the rule's own surface is the source of truth, not your interpretation of the rule's lead example.
 - Be actionable: someone should be able to act on each item without re-reading the style guide
 - Only flag things that genuinely violate the style guide — do not invent rules
 - Always include the full path to the exact style guide file each finding comes from, using the loader file list (e.g., `~/rust/nate_style/rust/one-use-per-line.md` or `$ARGUMENTS/docs/style/frontend-boundaries.md`)
@@ -239,13 +262,13 @@ If `--fix` was passed, you are running interactively and the user is waiting on 
       ~/.claude/scripts/nightly/style-fix-manual.sh --foreground "$(basename "$ARGUMENTS")"
       ```
 
-   b. Arm a `Monitor` on the manual log file in the same response. The script also writes its agent's own log under `/private/tmp/claude/style_fix_<project>.log`; tail both. Use this regex — it covers the `[progress …]` orchestrator phases plus the agent's own phase sentinels (translated by the orchestrator into `phase=agent-step name=<...>`), cargo/clippy/test markers, and compiler errors so you see real activity, not just the 60s heartbeat:
+   b. Arm a `Monitor` on the manual log file in the same response. Use the Python helper at `~/.claude/scripts/nightly/style-fix-monitor.py` — it tails both the manual log (latest `~/.local/logs/nightly/style-fix-manual-*.log`) and the agent's own log under `/private/tmp/claude/style_fix_<project>.log`, emits matching lines (the `[progress …]` orchestrator phases plus the agent's phase sentinels translated to `phase=agent-step name=<...>`, cargo/clippy/test markers, and compiler errors — so you see real activity, not just the 60s heartbeat), and exits 0 the moment the orchestrator writes its `phase=launcher-exit` sentinel. Use:
 
-      ```
-      ^\[progress |^cargo |^Compiling |^    Finished |^    Checking |^    Running |^test result:|^thread .* panicked|^warning:|^error:|^error\[|^Fix Summary
+      ```bash
+      python3 ~/.claude/scripts/nightly/style-fix-monitor.py <project>
       ```
 
-      Use `tail -F -n 0 -q <manual-log> /private/tmp/claude/style_fix_<project>.log 2>/dev/null | grep --line-buffered -E '<regex>'`.
+      The previous `tail -F | awk` pipeline used `system("pkill -f …")` to terminate the tail at launcher-exit, but inside the Claude Code sandbox `pkill` is denied access to macOS's `sysmond` process-list service and silently fails (exit 3, "Cannot get process list"). Job-control via `&` / `$!` is also broken in the sandbox, so capturing the tail's PID isn't an option either. The Python helper avoids both: no `tail` subprocess, no `pkill`, no shell job-control — just file reads and a regex match in the same process. The Monitor's last event is `phase=launcher-exit code=N` and the helper exits within ~1s — no manual TaskStop needed.
 
 4. Tell the user once: "fix running, log: `<path>`. I'll surface phases as they arrive and post a final summary when codex finishes." Then **yield** — do not sleep, do not poll, do not re-read the log yourself.
 
@@ -256,7 +279,9 @@ If `--fix` was passed, you are running interactively and the user is waiting on 
    - `phase=agent-step name=<name>` → `agent step: <name>` (these are the phase sentinels codex prints inside the prompt — `read-evaluation`, `apply-finding`, `cargo-mend-preview`, `clippy-preview`, `tests`, `fmt`, `write-fix-summary`, etc.)
    - `phase=agent-fix-summary-detected …` → `Fix Summary detected`
    - `phase=agent-exit code=N` → `agent exited code=N`
+   - `phase=already-applied …` → `already-applied (retry detected finished worktree)`
+   - `phase=launcher-exit code=N` → `launcher exited code=N` (this is also the Monitor's last event; the awk filter terminates here)
    - cargo/clippy/test/error/warning lines → echo verbatim; they're already short
    - Skip `worktree-create` if immediately followed by `worktree-ready` to keep chatter low.
 
-6. When the harness delivers the `run_in_background` completion event for the launcher (the `exec`'d `style-fix-worktrees.sh` returned), stop the Monitor and read `~/rust/<project>_style_fix/EVALUATION.md`'s `## Fix Summary` section plus the tail of the manual log. Post a final summary covering: applied/skipped/proposed findings, `cargo mend` status, clippy status, and any `commit-style-results: skipped` notice. If the final progress phase was `failed`, surface the `reason=` value first.
+6. When the harness delivers the `run_in_background` completion event for the launcher (the `exec`'d `style-fix-worktrees.sh` returned), the Monitor will already have terminated on its own via the `phase=launcher-exit` sentinel. If for any reason it has not (e.g. the trap did not fire), call `TaskStop` on the Monitor's task id. Then read `~/rust/<project>_style_fix/EVALUATION.md`'s `## Fix Summary` section plus the tail of the manual log. Post a final summary covering: applied/skipped/proposed findings, `cargo mend` status, clippy status, and any `commit-style-results: skipped` notice. If the final progress phase was `failed`, surface the `reason=` value first.
