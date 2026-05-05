@@ -89,6 +89,20 @@
           {
             "type": "command",
             "command": "python3 ~/.claude/scripts/hooks/post-tool-use-basedpyright.py"
+          },
+          {
+            "type": "command",
+            "command": "python3 ~/.claude/scripts/hooks/post-tool-use-banned-words.py"
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 ~/.claude/scripts/hooks/stop-banned-words.py"
           }
         ]
       }
