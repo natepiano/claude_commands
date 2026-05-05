@@ -5,7 +5,11 @@ description: Evaluate a Rust project against the style guide and write EVALUATIO
 **IMPORTANT**: Do NOT modify any source code. This is a read-only evaluation.
 
 ## Arguments
-- `$ARGUMENTS` is the absolute path to a Rust project root (must contain a `Cargo.toml`)
+- `$ARGUMENTS` is `<project-path> [--fix]`:
+  - `<project-path>` — absolute path to a Rust project root (must contain a `Cargo.toml`)
+  - `--fix` (optional) — after the evaluation completes, launch the style-fix worktree for this project (Step 6). Without `--fix`, the command stops after writing `EVALUATION.md`.
+
+Throughout the rest of this command, `$ARGUMENTS` refers to **just the project path** — strip the `--fix` flag before substituting it into any path or helper invocation below.
 
 ## Step 1: Load the full style guide
 
@@ -202,3 +206,21 @@ Requirements for each finding:
 - Be actionable: someone should be able to act on each item without re-reading the style guide
 - Only flag things that genuinely violate the style guide — do not invent rules
 - Always include the full path to the exact style guide file each finding comes from, using the loader file list (e.g., `~/rust/nate_style/rust/one-use-per-line.md` or `$ARGUMENTS/docs/style/frontend-boundaries.md`)
+
+## Step 6: If `--fix` was passed, launch the style-fix worktree
+
+Skip this step entirely if `--fix` is not in the original arguments — `/style_eval` ends at Step 5. The nightly never passes `--fix`, so its behavior is unchanged.
+
+If `--fix` was passed:
+
+1. Re-read `$ARGUMENTS/EVALUATION.md`. If it has the "No violations found" section (no `## Improvements`), print `nothing to fix` and stop. Do not launch the fix script.
+
+2. Otherwise, derive the project name and invoke the fix script directly. Per CLAUDE.md, codex / nightly style scripts must run unsandboxed:
+
+   ```bash
+   ~/.claude/scripts/nightly/style-fix-manual.sh "$(basename "$ARGUMENTS")"
+   ```
+
+   Use `dangerouslyDisableSandbox: true` for this Bash call. `style-fix-manual.sh` runs `style-fix-worktrees.sh` in the background via `nohup`, accumulates the log under `~/.local/logs/nightly/`, and prints the log path + PID. Relay those to the user so they can `tail -f` or `/monitor_nightly` it.
+
+3. Do **not** wait for the fix to finish. The script disowns itself; report the log path and exit.
