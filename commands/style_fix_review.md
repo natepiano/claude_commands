@@ -167,99 +167,45 @@ The reader is a working engineer who has read EVALUATION.md once, has not re-rea
 
 <ConcernFormat>
 
-**Hard rule — only actionable concerns ship.** Every Concern must propose a concrete change to the diff: a rename, a rewrite, a move, a deletion, an added test, a removed allow, etc. If the `Recommend:` would be "leave as-is," "no change needed," "accept," "flagging only because…," or any equivalent — **do not emit the entry.** Silence is the signal that the diff is fine. Applies even if the eval's recommended pattern differs from what shipped, even if you noticed a stylistic alternative, even if the lookup turned up an analogy without a governing rule. No-action concerns waste the user's review pass and train them to skim future Concerns sections.
-
-Examples that must be dropped on sight:
-- "Variant order is mechanically equivalent and no style rule prescribes it. Surfaced only because the eval's recommended pattern differs."
-- "Reads cleanly because the type name carries the context. If a future field gates a different mode, rename then."
-- "No change needed — flagging only because Finding 1's restructuring made me check every visibility decision in the diff."
-
-Each of those ends in `Recommend: leave as-is` (or equivalent). Delete the entire entry.
-
-**Numbering.** Number concerns within each finding starting at 1: `1.`, `2.`, `3.`, … so the user can refer to them by number in their reply ("drop concern 2", "apply concern 1"). Restarts at 1 for each finding. If a finding has only one concern, still number it `1.`.
-
-**Required format per concern — copy this template exactly:**
+**Template — copy this literally. The headline is the only numbered line.**
 
 ```
-1. **`<file:line or short identifier>`**
+1. **`<file:line>`**
 
-   **Issue:** <one short sentence naming what's wrong, with inline rule citation, e.g. "(rule: pixel-units-in-names.md)">.
+   **Issue:** <one short sentence>. (rule: `<file.md>`)
 
-   **Recommend:** <single recommended action, one short sentence>.
+   **Recommend:** <one short imperative sentence>.
 ```
 
-Three parts, each on its own line, **separated by a blank line**: **headline** (file path in backticks), **`Issue:`** sub-section (one sentence + inline rule citation), **`Recommend:`** sub-section (single recommended action). Do not run them together — blank lines are mandatory.
+Three blocks separated by blank lines. The headline is a numbered list item with the file path in backticks and bolded. The `**Issue:**` and `**Recommend:**` lines are continuation paragraphs indented by 3 spaces — they are **not** numbered, do not start with a digit, and have no list marker.
 
-The entry is **not** a proposal asking the user to choose between options. It is a clear statement of the defect plus a single recommendation. The user can override in reply if they disagree — but the entry itself does not enumerate alternatives.
+If the lookup turned up no governing rule, write `(no rule found)` instead of the citation.
 
-**Hard limits:**
-- Each sub-section is one short sentence. Cut history and citation chains; keep the verdict.
-- **Blank lines between headline, `Issue:`, and `Recommend:` are mandatory.**
-- No multi-clause sentences chained with em-dashes or "but". Each sub-section is one statement.
-- **`Recommend:` is mandatory and last.** Single declarative action, not a question. No multiple options.
-- **`Recommend:` must be actionable.** "Leave as-is," "no change needed," "accept," "flag only" — delete the entire entry.
-- **No question-form action prompts.** "Rename, leave for follow-up, or accept?" / "Reorder?" / "Revert, keep wrapper, or amend the guide?" — banned. Replace with `**Recommend:** rename to <name>.`
-- No "Decision needed:" preamble. The `Recommend:` itself signals the suggested action.
-- **No `**Style rule:**` or `**No rule found:**` paragraph preamble.** The lookup happens before writing the entry; the citation appears inline as `(rule: <file.md>)` or `(no rule found)` inside `Issue:` only — never a leading bold block.
+**Numbering.** Restart at `1.` for each finding. Even a single concern is `1.`.
 
-**Good — canonical example. Copy this rhythm:**
+**Silence is the signal.** A Concern must propose a concrete change to the diff: rename, rewrite, move, delete, add a test, remove an allow. If the recommendation would be "leave as-is," "accept," "flagging only," or any equivalent, **do not emit the entry.** Drop it. If the finding has no actionable concerns, omit the Concerns section entirely. Passed checks belong in silence, not in the output.
+
+**Example:**
 
 > 1. **`animation_poc_lerp.rs`**
 >
->    **Issue:** agent moved `const CURSOR_NAME` inside `fn setup`; example targets get constants at top-of-file after imports (rule: `no-magic-values.md`).
+>    **Issue:** agent moved `const CURSOR_NAME` inside `fn setup`; example targets get constants at top-of-file after imports. (rule: `no-magic-values.md`)
 >
 >    **Recommend:** move the const back to file scope after the imports.
 
-**Good — second example with a missed-rename concern:**
+**Common mistakes — re-read your draft for these:**
 
-> 2. **`src/restore/winit_info.rs:95`**
->
->    **Issue:** `let monitor_position = current_monitor.position();` is a pixel-valued local that the eval missed and the agent did not rename (rule: `pixel-units-in-names.md`).
->
->    **Recommend:** rename to `physical_monitor_position` as a follow-up to this finding.
+- Numbered `Issue:` or `Recommend:` lines (`1. Issue:`, `2. Recommend:`). Only the headline is numbered.
+- Bare file path in the headline without backticks or bold.
+- Missing blank lines between the three blocks.
+- `**Style rule:**` or `**No rule found:**` paragraph preamble. The citation goes inline as `(rule: <file.md>)` inside `Issue:`.
+- `Recommend:` phrased as a question or multi-option list ("rename, leave for follow-up, or accept?"). Single imperative sentence.
+- Concern that recommends no action. Drop the entire entry.
 
-**Bad — delete on sight (non-actionable; recommends leave as-is):**
+**Special cases (still follow the template):**
 
-> 1. **`src/cli.rs:18, 24`**
->
->    **Issue:** enum variant order lists default-first; eval's recommended pattern listed positive-flag variant first (no rule found).
->
->    **Recommend:** leave as-is — variant order is mechanically equivalent and no style rule prescribes it.
-
-The above must not ship. The diff is fine; the entry only exists because the eval's recommended pattern was different. Delete the entire entry — and if it was the only entry, omit the entire Concerns section.
-
-**Bad — delete on sight (run-on paragraph, no sub-section breaks):**
-
-> 1. **`src/restore/winit_info.rs:95`** — `let monitor_position = current_monitor.position();` is a same-kind pixel-valued local from the same `current_monitor.position()` call the eval flagged in `debug.rs:39`, but the eval's Locations list did not name it and the agent did not rename it (rule: `pixel-units-in-names.md`). **Recommend:** rename to `physical_monitor_position` as a follow-up to this finding.
-
-The above is wrong because the headline, issue, and recommendation are run together on one line. Even though it ends in `**Recommend:**`, the lack of blank-line breaks makes it unscannable.
-
-**Bad — delete on sight (multi-option question form; old format):**
-
-> 1. **`src/restore/winit_info.rs:95`** — `let monitor_position = current_monitor.position();` is a pixel-valued local the agent did not rename (rule: `pixel-units-in-names.md`). Rename to `physical_monitor_position`, leave for follow-up, or accept?
-
-The above follows the old "propose options" format. The new format requires a single `**Recommend:**` instead.
-
-**Bad — delete on sight (`**Style rule:**` preamble; format violation):**
-
-> 1. **`src/restore/winit_info.rs:95`** — agent did not rename `let monitor_position = current_monitor.position();`. **Style rule (pixel-units-in-names.md):** *"every field whose value is a pixel count — position, width, height, size — must carry an explicit `logical_` or `physical_` prefix."* The exception covers locals where the qualifier is already present, which `monitor_position` is not. **Recommend:** rename to `physical_monitor_position`.
-
-The lookup happens internally; the entry uses inline `(rule: <file>)` only.
-
-**Pre-submit checklist for every Concerns entry:**
-1. **Is the `Recommend:` actionable?** "Leave as-is," "no change needed," "accept," "flag only" → delete the entire entry.
-2. Does the entry start with a number followed by `**`<file>`**` on its own line?
-3. Are headline, `**Issue:**`, and `**Recommend:**` **separated by blank lines**?
-4. Any `**Style rule` or `**No rule found` block-bold preamble? If yes, delete; rewrite as inline `(rule: <file.md>)` inside `Issue:`.
-5. Is the rule citation a single short parenthetical, not a quoted prescription?
-6. Does the entry end with a `**Recommend:** <single action>.` — not a question, not a list of options?
-7. If you wrote a question mark or comma-separated options at the end, rewrite as a single recommendation.
-8. Read each sub-section aloud — does either take more than ~10 seconds? If yes, cut.
-9. Are entries numbered starting at 1 within this finding?
-
-**Special cases (still follow the three-part block format):**
-- Newly added `#[allow(...)]`, `#![allow(...)]`, or `Cargo.toml` `"allow"`: name the lint and `file:line` in the headline. (Allows are inherently actionable — either remove, restructure, or relocate.)
-- Speculative concerns: prefix `Issue:` with `(speculative)`. Still must end in an actionable `**Recommend:**` — if no concrete action, drop it.
+- Newly added `#[allow(...)]`, `#![allow(...)]`, or `Cargo.toml` `"allow"` entries: name the lint and `file:line` in the headline.
+- Speculative concerns: prefix `Issue:` with `(speculative)`. Still must end in an actionable `Recommend:` — if no concrete action, drop it.
 
 **Do not list passed checks here.** Silence is the signal that something was done well. Entries ending in "OK", "good fit", "correct" — delete.
 

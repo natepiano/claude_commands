@@ -41,9 +41,19 @@ def load_exemptions() -> list[str]:
     return [p.strip() for p in parts if p.strip()]
 
 
+# Per-stem overrides for cases where the default silent-e stem produces a root
+# short enough to collide with unrelated common words ("bite"→"bit" matches
+# "bit", "rabbit", "orbit", "bit-identical", etc.). Map stem → explicit regex.
+_STEM_OVERRIDES: dict[str, str] = {
+    "bite": r"\bbit(e|es|ing|ten)\b",
+}
+
+
 def _stem_pattern(stem: str) -> re.Pattern[str]:
     # Strip trailing silent 'e' so verb forms collapse: shape→shap matches shape/shaping/reshape;
     # carve→carv matches carve/carving/carved. Stems not ending in 'e' (honest/gloss) are unchanged.
+    if stem in _STEM_OVERRIDES:
+        return re.compile(_STEM_OVERRIDES[stem], re.IGNORECASE)
     root = stem[:-1] if stem.endswith("e") and len(stem) > 2 else stem
     return re.compile(rf"\b\w*{re.escape(root)}\w*\b", re.IGNORECASE)
 
