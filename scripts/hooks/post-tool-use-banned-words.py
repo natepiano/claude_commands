@@ -17,6 +17,7 @@ from banned_words_lib import (
     bump_counters,
     find_violations,
     get_stem_guidance,
+    is_introspection_command,
 )
 
 
@@ -88,6 +89,9 @@ def main() -> None:
         "commands/add-banned-word.md",
     )
     if any(s in file_path for s in skip_substrings):
+        sys.exit(0)
+
+    if tool_name == "Bash" and is_introspection_command(tool_input.get("command", "") or ""):
         sys.exit(0)
 
     text: str = extract_text(tool_name, tool_input, tool_response)

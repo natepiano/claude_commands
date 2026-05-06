@@ -10,16 +10,16 @@ Append a new banned-word section to `~/rust/nate_style/rust/forbidden-words.md`.
 Arguments: $ARGUMENTS
 
 If $ARGUMENTS is empty, ask the user for:
-1. The stem (e.g. `honest`, `shape`).
-2. The forms list (e.g. honest/honestly/honesty).
+1. The stem or phrase (e.g. `honest`, `shape`, `plain English`). A value with whitespace is treated as a phrase — literal case-insensitive match, no form-folding.
+2. The forms list (e.g. honest/honestly/honesty). For a phrase, list the variants you actually want flagged.
 3. A one-sentence reason it's banned.
 4. The substitute set (precise replacements).
 5. Near-miss words that should also be rejected (the "Not …" list).
 
 Then:
 
-1. Read `~/rust/nate_style/rust/forbidden-words.md` to confirm the stem isn't already present.
-2. **Decide if a custom regex is needed.** The default matcher strips a trailing silent `e` and matches `\b\w*<root>\w*\b` (case-insensitive). That is fine for most stems. A custom `regex:` line is required when the default root would collide with unrelated common English words — for example, a stem that strips to a 3-letter root which appears as a substring inside many ordinary words. If in doubt, ask the user; otherwise propose a regex that only matches the listed forms (with `\b` word boundaries) and have the user confirm.
+1. Read `~/rust/nate_style/rust/forbidden-words.md` to confirm the entry isn't already present.
+2. **Decide if a custom regex is needed.** For a single stem the default matcher strips a trailing silent `e` and matches `\b\w*<root>\w*\b` (case-insensitive). That is fine for most stems. A custom `regex:` line is required when the default root would collide with unrelated common English words — for example, a stem that strips to a 3-letter root which appears as a substring inside many ordinary words. If in doubt, ask the user; otherwise propose a regex that only matches the listed forms (with `\b` word boundaries) and have the user confirm. For a phrase entry the default phrase matcher (literal, case-insensitive, `\s+` between tokens, `\b` on word-character edges) is almost always correct — a `regex:` line should be rare.
 3. If absent, append a new section before the `### Review pass` section, in this format:
 
 ```

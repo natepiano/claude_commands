@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import TypedDict, cast
 
 sys.path.insert(0, str(Path(__file__).parent))
-from banned_words_lib import STYLE_GUIDE, find_violations
+from banned_words_lib import STYLE_GUIDE, find_violations, is_introspection_command
 
 
 class EditEntry(TypedDict, total=False):
@@ -85,6 +85,9 @@ def main() -> None:
         "commands/add-banned-word.md",
     )
     if any(s in file_path for s in skip_substrings):
+        sys.exit(0)
+
+    if tool_name == "Bash" and is_introspection_command(tool_input.get("command", "") or ""):
         sys.exit(0)
 
     text = extract_text(tool_name, tool_input, tool_response)

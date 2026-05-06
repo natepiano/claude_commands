@@ -13,6 +13,28 @@ from typing import NamedTuple
 
 STYLE_GUIDE = Path.home() / "rust" / "nate_style" / "rust" / "forbidden-words.md"
 ALLOW_MARKER = "allow-banned:"
+INTROSPECTION_TOKENS = (
+    "banned_words_lib",
+    "forbidden-words.md",
+    "analyze_changes.sh",
+    "git diff",
+    "git status",
+    "git log",
+    "git show",
+)
+
+
+def is_introspection_command(command: str) -> bool:
+    """True if a Bash command's output is unsafe to scan for banned words.
+
+    Two cases:
+    1. Commands that print the banned-words machinery itself (importing the
+       lib, catting the style guide) — output naturally contains every stem.
+    2. Commands that print diff/status/log content — the output mirrors the
+       repo's own files, which were already gated when authored. Re-scanning
+       the diff would flag the same content twice and double-bump counters.
+    """
+    return any(tok in command for tok in INTROSPECTION_TOKENS)
 
 
 class Violation(NamedTuple):
@@ -66,6 +88,21 @@ def load_overrides() -> dict[str, str]:
         if rm:
             out[stem] = rm.group(1)
     return out
+
+
+def _is_phrase(stem: str) -> bool:
+    return bool(re.search(r"\s", stem))
+
+
+def _phrase_pattern(phrase: str) -> re.Pattern[str]:
+    # Literal case-insensitive match. Interior whitespace becomes \s+ so extra
+    # spacing or line wraps don't dodge the match. Word boundaries are added
+    # only on edges that are word characters; punctuation edges anchor themselves.
+    parts = re.split(r"\s+", phrase.strip())
+    body = r"\s+".join(re.escape(p) for p in parts)
+    left = r"\b" if phrase[:1].isalnum() or phrase[:1] == "_" else ""
+    right = r"\b" if phrase[-1:].isalnum() or phrase[-1:] == "_" else ""
+    return re.compile(rf"{left}{body}{right}", re.IGNORECASE)
 
 
 def _stem_pattern(stem: str, override: str | None = None) -> re.Pattern[str]:
@@ -138,7 +175,10 @@ def find_violations(text: str) -> list[Violation]:
     stems = load_banned_words()
     exemptions = load_exemptions()
     overrides = load_overrides()
-    patterns = [(s, _stem_pattern(s, overrides.get(s))) for s in stems]
+    patterns = [
+        (s, _phrase_pattern(s) if _is_phrase(s) else _stem_pattern(s, overrides.get(s)))
+        for s in stems
+    ]
 
     out: list[Violation] = []
     for line_no, line in enumerate(text.splitlines(), start=1):
