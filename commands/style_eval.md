@@ -139,9 +139,11 @@ For each returned unit:
    - **Surface searched** — one sentence naming the abstract pattern, derived from the rule (not from the first example). If the guideline file has a `### Surface` section, use it as the source of truth and quote it back; do not narrow it.
    - **Search** — the exact rg / LSP / grep command(s) executed against the project, plus the raw match count those commands produced.
 
-   For `outcome.status = finding`, both lines must appear under the finding in `EVALUATION.md` (see Step 5 template), and `len(Locations)` must equal the Search match count. A Locations list shorter than the match count means the finding is malformed — expand it to cover every match before recording.
+   For `outcome.status = finding`, both lines must appear under the finding in `EVALUATION.md` (see Step 5 template), and `len(Locations)` must equal the post-exception-filter match count. A Locations list shorter than the filtered count means the finding is malformed — expand it to cover every real violation before recording.
 
-   For `outcome.status = no_findings`, both lines must appear in your assistant-visible reasoning before calling `record-unit`, and the Search match count must be `0`. If the search returns matches but you believe none of them are genuine violations, the unit is a `finding` whose Recommended pattern explains the per-site reason each "match" is actually exempt — not a `no_findings`.
+   For `outcome.status = no_findings`, both lines must appear in your assistant-visible reasoning before calling `record-unit`, and the post-exception-filter match count must be `0`.
+
+   **Apply the rule's own `Exceptions` clause as a filter, not as commentary.** If the guideline file lists exceptions (init/identity literals, format-macro args, `#[cfg(test)]` blocks, match-arm enum-paired labels, origins like `Vec3::new(0.0, y, 0.0)`, range starts `0..n`, etc.), filter the raw regex matches against those clauses *before* fixing `Locations`. Report both numbers under Search: `N raw matches → M after exception filter`. The Locations list contains only the post-filter set — never raw regex hits with prose explaining "most are exempt." If the post-filter count is `0`, record `no_findings`.
 
    This artifact is the failure-prevention mechanism. Prose alone has not been enough — past evals have stopped at the first cluster and recorded one-site findings while other sites of the same rule went unlisted. Writing the Surface and Search lines down forces the project-wide enumeration to happen before the outcome is fixed.
 
