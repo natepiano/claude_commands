@@ -81,10 +81,6 @@ def main() -> None:
             pass
 
     skip_substrings = (
-        "banned_words_lib.py",
-        "post-tool-use-banned-words.py",
-        "post-tool-use-banned-words-block.py",
-        "stop-banned-words.py",
         "banned-words-check/SKILL.md",
         "commands/add-banned-word.md",
     )
@@ -99,14 +95,27 @@ def main() -> None:
     if not violations:
         sys.exit(0)
 
-    stems: list[str] = []
+    seen: set[tuple[str, int]] = set()
+    stems_in_order: list[str] = []
+    lines_by_stem: dict[str, list[int]] = {}
     for v in violations:
-        if v.stem not in stems:
-            stems.append(v.stem)
+        key = (v.stem, v.line_no)
+        if key in seen:
+            continue
+        seen.add(key)
+        if v.stem not in stems_in_order:
+            stems_in_order.append(v.stem)
+            lines_by_stem[v.stem] = []
+        lines_by_stem[v.stem].append(v.line_no)
+
+    parts = [
+        f"{stem} (line{'s' if len(lines_by_stem[stem]) > 1 else ''} {', '.join(str(n) for n in lines_by_stem[stem])})"
+        for stem in stems_in_order
+    ]
 
     print(json.dumps({
         "decision": "block",
-        "reason": f"⛔ fix banned word(s): {', '.join(stems)}",
+        "reason": f"⛔ fix banned word(s): {', '.join(parts)}",
     }))
 
 

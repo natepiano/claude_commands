@@ -87,8 +87,8 @@ def main() -> None:
         sys.exit(0)
 
     seen: set[tuple[str, int]] = set()
-    bullets: list[str] = []
     stems_in_order: list[str] = []
+    lines_by_stem: dict[str, list[int]] = {}
     for v in violations:
         key = (v.stem, v.line_no)
         if key in seen:
@@ -96,16 +96,15 @@ def main() -> None:
         seen.add(key)
         if v.stem not in stems_in_order:
             stems_in_order.append(v.stem)
-        snippet = v.line[:140]
-        bullets.append(
-            f"  - line {v.line_no}: matched {v.match!r} (banned stem: {v.stem!r})\n      > {snippet}"
-        )
+            lines_by_stem[v.stem] = []
+        lines_by_stem[v.stem].append(v.line_no)
 
     _ = bump_counters(stems_in_order)
-    _ = bullets
-    stems_label = ", ".join(stems_in_order)
-
-    reason = f"⛔ banned word(s): {stems_label}"
+    parts = [
+        f"{stem} (line{'s' if len(lines_by_stem[stem]) > 1 else ''} {', '.join(str(n) for n in lines_by_stem[stem])})"
+        for stem in stems_in_order
+    ]
+    reason = f"⛔ banned word(s): {', '.join(parts)}"
 
     print(json.dumps({"decision": "block", "reason": reason}))
 

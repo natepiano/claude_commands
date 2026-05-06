@@ -84,9 +84,6 @@ def main() -> None:
             pass
 
     skip_substrings = (
-        "banned_words_lib.py",
-        "post-tool-use-banned-words.py",
-        "stop-banned-words.py",
         "banned-words-check/SKILL.md",
         "commands/add-banned-word.md",
     )

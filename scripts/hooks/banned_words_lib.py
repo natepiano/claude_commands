@@ -42,19 +42,38 @@ def load_exemptions() -> list[str]:
     return [p.strip() for p in parts if p.strip()]
 
 
-# Per-stem overrides for cases where the default silent-e stem produces a root
-# short enough to collide with unrelated common words ("bite"→"bit" matches
-# "bit", "rabbit", "orbit", "bit-identical", etc.). Map stem → explicit regex.
-_STEM_OVERRIDES: dict[str, str] = {
-    "bite": r"\bbit(e|es|ing|ten)\b",
-}
+def load_overrides() -> dict[str, str]:
+    """Parse optional `regex: <pattern>` lines from the canonical guide.
+
+    Each banned-word section may include a single `regex:` line under its
+    `### "<stem>"` heading. When present, that pattern replaces the default
+    silent-e algorithm for that stem (used when the default root would be
+    too short and collide with unrelated common words).
+    """
+    guide = _read_guide()
+    if not guide:
+        return {}
+    out: dict[str, str] = {}
+    section_pat = re.compile(
+        r'^###\s+"([^"]+)".*?\n(.*?)(?=^###\s+"|\Z)',
+        re.MULTILINE | re.DOTALL,
+    )
+    regex_pat = re.compile(r"^regex:\s*(.+?)\s*$", re.MULTILINE)
+    for m in section_pat.finditer(guide):
+        stem = m.group(1)
+        body = m.group(2)
+        rm = regex_pat.search(body)
+        if rm:
+            out[stem] = rm.group(1)
+    return out
 
 
-def _stem_pattern(stem: str) -> re.Pattern[str]:
-    # Strip trailing silent 'e' so verb forms collapse: shape→shap matches shape/shaping/reshape;
-    # carve→carv matches carve/carving/carved. Stems not ending in 'e' (honest/gloss) are unchanged.
-    if stem in _STEM_OVERRIDES:
-        return re.compile(_STEM_OVERRIDES[stem], re.IGNORECASE)
+def _stem_pattern(stem: str, override: str | None = None) -> re.Pattern[str]:
+    # If the canonical guide supplied an explicit regex for this stem, use it.
+    # Otherwise, strip a trailing silent 'e' so verb forms collapse to a single
+    # root pattern (the stem itself works for stems that don't end in 'e').
+    if override:
+        return re.compile(override, re.IGNORECASE)
     root = stem[:-1] if stem.endswith("e") and len(stem) > 2 else stem
     return re.compile(rf"\b\w*{re.escape(root)}\w*\b", re.IGNORECASE)
 
@@ -118,7 +137,8 @@ def get_stem_guidance(stem: str) -> str:
 def find_violations(text: str) -> list[Violation]:
     stems = load_banned_words()
     exemptions = load_exemptions()
-    patterns = [(s, _stem_pattern(s)) for s in stems]
+    overrides = load_overrides()
+    patterns = [(s, _stem_pattern(s, overrides.get(s))) for s in stems]
 
     out: list[Violation] = []
     for line_no, line in enumerate(text.splitlines(), start=1):

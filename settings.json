@@ -116,7 +116,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python3 ~/.claude/scripts/hooks/stop-banned-words.py"
+            "command": "python3 ~/.claude/scripts/hooks/stop-assistant-prose-banned-words.py"
           }
         ]
       }
