@@ -167,17 +167,17 @@ The reader is a working engineer who has read EVALUATION.md once, has not re-rea
 
 <ConcernFormat>
 
-**Template — copy this literally. The headline is the only numbered line.**
+**Template — copy this literally. The headline is the only numbered line. The Issue and Recommend lines are bullets (`- `) nested under the headline.**
 
 ```
 1. **`<file:line>`**
-
-   **Issue:** <one short sentence>. (rule: `<file.md>`)
-
-   **Recommend:** <one short imperative sentence>.
+   - **Issue:** <one short sentence>. (rule: `<file.md>`)
+   - **Recommend:** <one short imperative sentence>.
 ```
 
-Three blocks separated by blank lines. The headline is a numbered list item with the file path in backticks and bolded. The `**Issue:**` and `**Recommend:**` lines are continuation paragraphs indented by 3 spaces — they are **not** numbered, do not start with a digit, and have no list marker.
+The headline is a numbered list item with the file path in backticks and bolded. `**Issue:**` and `**Recommend:**` are bullets nested under the headline — each line starts with exactly 3 spaces, then `- `, then the bold label. They are **not** numbered. No blank line between the three lines of one concern; one blank line between concerns.
+
+**Why bullets, not continuation paragraphs.** Earlier versions used 3-space-indented continuation paragraphs separated by blank lines. That pattern reliably drifted into sibling numbered items (`1. Issue:` / `1. Recommend:`) which renderers then auto-renumbered into a flat list, destroying the grouping. Bullets nested under a numbered item are visually unambiguous and survive every renderer.
 
 If the lookup turned up no governing rule, write `(no rule found)` instead of the citation.
 
@@ -188,19 +188,27 @@ If the lookup turned up no governing rule, write `(no rule found)` instead of th
 **Example:**
 
 > 1. **`animation_poc_lerp.rs`**
->
->    **Issue:** agent moved `const CURSOR_NAME` inside `fn setup`; example targets get constants at top-of-file after imports. (rule: `no-magic-values.md`)
->
->    **Recommend:** move the const back to file scope after the imports.
+>    - **Issue:** agent moved `const CURSOR_NAME` inside `fn setup`; example targets get constants at top-of-file after imports. (rule: `no-magic-values.md`)
+>    - **Recommend:** move the const back to file scope after the imports.
 
 **Common mistakes — re-read your draft for these:**
 
-- Numbered `Issue:` or `Recommend:` lines (`1. Issue:`, `2. Recommend:`). Only the headline is numbered.
+- Numbered `Issue:` or `Recommend:` lines (`1. Issue:`, `2. Recommend:`). Only the headline is numbered. Sub-lines are `- ` bullets.
+- Issue/Recommend emitted as plain indented text or as their own numbered list items instead of `- ` bullets nested under the headline.
 - Bare file path in the headline without backticks or bold.
-- Missing blank lines between the three blocks.
+- Wrong indent on the bullets — use exactly 3 spaces before `- ` so the bullet nests under the numbered headline. Two spaces or four will render as a sibling list, not a child.
 - `**Style rule:**` or `**No rule found:**` paragraph preamble. The citation goes inline as `(rule: <file.md>)` inside `Issue:`.
 - `Recommend:` phrased as a question or multi-option list ("rename, leave for follow-up, or accept?"). Single imperative sentence.
 - Concern that recommends no action. Drop the entire entry.
+
+**Pre-send scan — mandatory before emitting any Concerns block.** Run these checks against your draft and rewrite if any match:
+
+1. Any line matching `^\s*\d+\.\s+(Issue|Recommend):` — that is the auto-renumber failure mode. Rewrite as `   - **Issue:** ...` / `   - **Recommend:** ...`.
+2. Any headline line not starting with `N. **\``. Add the backticks-and-bold wrapper.
+3. Any Issue/Recommend line that does not begin with `   - **`. Re-anchor to the bullet form.
+4. Any Concern entry whose Recommend would be "leave as-is" or equivalent. Delete the entry.
+
+If the draft fails any of these, do not send — fix and re-scan.
 
 **Special cases (still follow the template):**
 
@@ -399,6 +407,8 @@ For each finding, output a compact block with these parts. Keep it tight — a p
    1. The Fix Summary's `Clippy Changes` subsection names the file and/or lint.
    2. The fix sequence is eval-driven edits → `cargo mend` → `cargo clippy --fix` → manual clippy. Anything appearing post-eval matching a known clippy rewrite pattern (`mul_add`, `unwrap_or_else` → `unwrap_or`, `&str` → `impl AsRef<str>`, `if let Some(_) =` → `is_some()`, etc.) is presumptively clippy-driven.
 6. **Concerns** — numbered list only if there are items that need the user's attention. Use `<ConcernFormat/>` exactly. If there are no real concerns and no new allows, omit the section entirely.
+
+   **Before sending the response, run the `<ConcernFormat/>` pre-send scan against every Concern entry in your draft.** This is mandatory, not optional. The four checks (auto-renumber, headline wrapper, bullet anchor, no-action drop) catch the failure modes that recur across reviews. Do not send until the draft passes all four.
 
 After the walkthrough, **stop the response**. Do not preview the next finding. Do not list upcoming findings. Do not write an end-of-review summary.
 
