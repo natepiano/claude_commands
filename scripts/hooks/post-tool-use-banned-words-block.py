@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
-"""PostToolUse hook: check Write/Edit/MultiEdit content for banned words.
+"""PostToolUse hook companion: forces a block when banned words are present.
 
-User sees a one-line systemMessage; agent sees the full violation list and
-recovery instructions via hookSpecificOutput.additionalContext. Counters in
-forbidden-words.md are bumped by the hook itself.
+The sibling messaging hook (post-tool-use-banned-words.py) already shows the
+user a one-line systemMessage and gives the agent verbose correction guidance
+via additionalContext. This hook only emits `decision: block` with a minimal
+reason so the agent must address the violation before moving on. The reason
+is intentionally short — the messaging hook already carried the detail.
 """
 
 import json
@@ -12,12 +14,7 @@ from pathlib import Path
 from typing import TypedDict, cast
 
 sys.path.insert(0, str(Path(__file__).parent))
-from banned_words_lib import (
-    STYLE_GUIDE,
-    bump_counters,
-    find_violations,
-    get_stem_guidance,
-)
+from banned_words_lib import STYLE_GUIDE, find_violations
 
 
 class EditEntry(TypedDict, total=False):
@@ -86,6 +83,7 @@ def main() -> None:
     skip_substrings = (
         "banned_words_lib.py",
         "post-tool-use-banned-words.py",
+        "post-tool-use-banned-words-block.py",
         "stop-banned-words.py",
         "banned-words-check/SKILL.md",
         "commands/add-banned-word.md",
@@ -93,7 +91,7 @@ def main() -> None:
     if any(s in file_path for s in skip_substrings):
         sys.exit(0)
 
-    text: str = extract_text(tool_name, tool_input, tool_response)
+    text = extract_text(tool_name, tool_input, tool_response)
     if not text:
         sys.exit(0)
 
@@ -101,62 +99,15 @@ def main() -> None:
     if not violations:
         sys.exit(0)
 
-    seen: set[tuple[str, int]] = set()
-    bullets: list[str] = []
-    stems_in_order: list[str] = []
+    stems: list[str] = []
     for v in violations:
-        key = (v.stem, v.line_no)
-        if key in seen:
-            continue
-        seen.add(key)
-        if v.stem not in stems_in_order:
-            stems_in_order.append(v.stem)
-        snippet = v.line[:140]
-        bullets.append(
-            f"  - line {v.line_no}: matched {v.match!r} (banned stem: {v.stem!r})\n      > {snippet}"
-        )
+        if v.stem not in stems:
+            stems.append(v.stem)
 
-    bumped = bump_counters(stems_in_order)
-
-    short_file = Path(file_path).name if file_path else tool_name
-    stems_label = ", ".join(stems_in_order)
-    system_msg = f"⛔ banned word(s) [{stems_label}] in {short_file} — counter(s) bumped"
-
-    guidance_blocks: list[str] = []
-    for stem in stems_in_order:
-        body = get_stem_guidance(stem)
-        if body:
-            guidance_blocks.append(f"=== rule for '{stem}' ===\n{body}")
-
-    additional_context = "\n".join(
-        [
-            f"BANNED WORDS DETECTED in {tool_name} to {file_path or '(unknown path)'}.",
-            "",
-            "Violations:",
-            *bullets,
-            "",
-            "How to correct your behavior:",
-            "  • Rewrite the sentence — don't just swap one word.",
-            "  • If no precise substitute fits, the sentence isn't making a claim — delete it.",
-            "  • Use `allow-banned: <reason>` on the line if the use is genuinely legitimate (quoting the user, naming the rule itself).",
-            "  • Do NOT edit forbidden-words.md — the hook auto-bumps the counter.",
-            "",
-            *guidance_blocks,
-            "",
-            f"Counter(s) bumped by the hook: {bumped or '(no matching headings found)'}.",
-            f"Style guide: {STYLE_GUIDE}. Skill: `banned-words-check` for full mechanism.",
-        ]
-    )
-
-    output = {
-        "continue": True,
-        "systemMessage": system_msg,
-        "hookSpecificOutput": {
-            "hookEventName": "PostToolUse",
-            "additionalContext": additional_context,
-        },
-    }
-    print(json.dumps(output))
+    print(json.dumps({
+        "decision": "block",
+        "reason": f"⛔ fix banned word(s): {', '.join(stems)}",
+    }))
 
 
 if __name__ == "__main__":

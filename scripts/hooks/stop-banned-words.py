@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import TypedDict, cast
 
 sys.path.insert(0, str(Path(__file__).parent))
-from banned_words_lib import STYLE_GUIDE, find_violations
+from banned_words_lib import bump_counters, find_violations
 
 
 class TextBlock(TypedDict, total=False):
@@ -88,29 +88,24 @@ def main() -> None:
 
     seen: set[tuple[str, int]] = set()
     bullets: list[str] = []
+    stems_in_order: list[str] = []
     for v in violations:
         key = (v.stem, v.line_no)
         if key in seen:
             continue
         seen.add(key)
+        if v.stem not in stems_in_order:
+            stems_in_order.append(v.stem)
         snippet = v.line[:140]
         bullets.append(
             f"  - line {v.line_no}: matched {v.match!r} (banned stem: {v.stem!r})\n      > {snippet}"
         )
 
-    reason = "\n".join(
-        [
-            "BANNED WORDS DETECTED in your last response.",
-            f"Source of truth: {STYLE_GUIDE}",
-            "Recovery: invoke the `banned-words-check` skill (Skill tool) for the full mechanism + fix path.",
-            "If a use is legitimate (e.g. quoting the user, naming the rule itself), put the response inside a context with `allow-banned:` markers, or rephrase.",
-            "",
-            "Violations:",
-            *bullets,
-            "",
-            "Action: rewrite the response with substitutes/deletions. Then bump the counter for each stem in the style guide — the rising counter is the signal that the pre-send check failed.",
-        ]
-    )
+    _ = bump_counters(stems_in_order)
+    _ = bullets
+    stems_label = ", ".join(stems_in_order)
+
+    reason = f"⛔ banned word(s): {stems_label}"
 
     print(json.dumps({"decision": "block", "reason": reason}))
 

@@ -28,7 +28,8 @@
       "Bash(git reset *)",
       "Bash(git rev-parse *)",
       "Bash(git show *)",
-      "Bash(git stash *)",
+      "Bash(git stash list)",
+      "Bash(git stash list *)",
       "Bash(git status *)",
       "Bash(git tag *)",
       "Bash(git worktree *)",
@@ -50,6 +51,11 @@
       "Read(//var/folders/rf/twhh0jfd243fpltn5k0w1t980000gn/T/**)",
       "Read(/private/tmp*)",
       "Write(//tmp/claude/**)"
+    ],
+    "deny": [
+      "Bash(git stash)",
+      "Bash(git stash *)",
+      "Bash(git stash:*)"
     ],
     "defaultMode": "auto",
     "additionalDirectories": [
@@ -89,10 +95,18 @@
           {
             "type": "command",
             "command": "python3 ~/.claude/scripts/hooks/post-tool-use-basedpyright.py"
-          },
+          }
+        ]
+      },
+      {
+        "hooks": [
           {
             "type": "command",
             "command": "python3 ~/.claude/scripts/hooks/post-tool-use-banned-words.py"
+          },
+          {
+            "type": "command",
+            "command": "python3 ~/.claude/scripts/hooks/post-tool-use-banned-words-block.py"
           }
         ]
       }

@@ -7,6 +7,7 @@ Per-line override: any line containing `allow-banned:` is skipped.
 """
 
 import re
+from collections.abc import Iterable
 from pathlib import Path
 from typing import NamedTuple
 
@@ -56,6 +57,62 @@ def _stem_pattern(stem: str) -> re.Pattern[str]:
         return re.compile(_STEM_OVERRIDES[stem], re.IGNORECASE)
     root = stem[:-1] if stem.endswith("e") and len(stem) > 2 else stem
     return re.compile(rf"\b\w*{re.escape(root)}\w*\b", re.IGNORECASE)
+
+
+def bump_counters(stems: Iterable[str]) -> dict[str, int]:
+    """Increment the `counter: N` value in each `### "<stem>" — counter: N` heading.
+
+    Returns a mapping of stem → new counter value for the stems that were bumped.
+    Stems with no counter heading are skipped silently.
+    """
+    unique = list(dict.fromkeys(stems))
+    if not unique:
+        return {}
+    try:
+        guide = STYLE_GUIDE.read_text()
+    except OSError:
+        return {}
+
+    bumped: dict[str, int] = {}
+    new_text = guide
+    for stem in unique:
+        pattern = re.compile(
+            rf'(^###\s+"{re.escape(stem)}"\s+\S+\s+counter:\s*)(\d+)',
+            re.MULTILINE,
+        )
+
+        def _inc(m: re.Match[str], stem: str = stem) -> str:
+            n = int(m.group(2)) + 1
+            bumped[stem] = n
+            return f"{m.group(1)}{n}"
+
+        new_text = pattern.sub(_inc, new_text, count=1)
+
+    if bumped:
+        try:
+            _ = STYLE_GUIDE.write_text(new_text)
+        except OSError:
+            return {}
+    return bumped
+
+
+def get_stem_guidance(stem: str) -> str:
+    """Return the per-stem body from the style guide (between this heading and the next ###).
+
+    Used by the messaging hook so the agent gets the substitutes and rule prose
+    inline without needing to open the style guide on every violation.
+    """
+    guide = _read_guide()
+    if not guide:
+        return ""
+    pattern = re.compile(
+        rf'^###\s+"{re.escape(stem)}".*?\n(.*?)(?=^###\s+"|\Z)',
+        re.MULTILINE | re.DOTALL,
+    )
+    m = pattern.search(guide)
+    if not m:
+        return ""
+    return m.group(1).strip()
 
 
 def find_violations(text: str) -> list[Violation]:
