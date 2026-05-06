@@ -64,6 +64,38 @@ def load_exemptions() -> list[str]:
     return [p.strip() for p in parts if p.strip()]
 
 
+def load_per_stem_exemptions() -> dict[str, list[str]]:
+    """Parse per-section `except:` lines from the canonical guide.
+
+    Each `### "<stem>"` section may declare its own exemptions on a line
+    starting with `except:` followed by a comma-separated list of substrings.
+    Matches that fall inside any of those substrings are skipped for that
+    stem only — useful when a word is banned as a metaphor but legitimate
+    as domain vocabulary.
+    """
+    guide = _read_guide()
+    if not guide:
+        return {}
+    out: dict[str, list[str]] = {}
+    section_pat = re.compile(
+        r'^###\s+"([^"]+)".*?\n(.*?)(?=^###\s+"|\Z)',
+        re.MULTILINE | re.DOTALL,
+    )
+    except_pat = re.compile(r"^except(?:ions?)?:\s*(.+?)\s*$", re.MULTILINE)
+    for m in section_pat.finditer(guide):
+        stem = m.group(1)
+        body = m.group(2)
+        em = except_pat.search(body)
+        if not em:
+            continue
+        raw = em.group(1).strip()
+        parts = re.split(r"[,;]", raw) if ("," in raw or ";" in raw) else [raw]
+        items = [p.strip() for p in parts if p.strip()]
+        if items:
+            out[stem] = items
+    return out
+
+
 def load_overrides() -> dict[str, str]:
     """Parse optional `regex: <pattern>` lines from the canonical guide.
 
@@ -174,6 +206,7 @@ def get_stem_guidance(stem: str) -> str:
 def find_violations(text: str) -> list[Violation]:
     stems = load_banned_words()
     exemptions = load_exemptions()
+    per_stem_exemptions = load_per_stem_exemptions()
     overrides = load_overrides()
     patterns = [
         (s, _phrase_pattern(s) if _is_phrase(s) else _stem_pattern(s, overrides.get(s)))
@@ -184,14 +217,26 @@ def find_violations(text: str) -> list[Violation]:
     for line_no, line in enumerate(text.splitlines(), start=1):
         if ALLOW_MARKER in line:
             continue
-        exempt_spans: list[tuple[int, int]] = []
+        global_exempt_spans: list[tuple[int, int]] = []
         for ex in exemptions:
             for em in re.finditer(re.escape(ex), line, re.IGNORECASE):
-                exempt_spans.append((em.start(), em.end()))
+                global_exempt_spans.append((em.start(), em.end()))
+
+        per_stem_spans: dict[str, list[tuple[int, int]]] = {}
+        for stem, ex_list in per_stem_exemptions.items():
+            spans: list[tuple[int, int]] = []
+            for ex in ex_list:
+                for em in re.finditer(re.escape(ex), line, re.IGNORECASE):
+                    spans.append((em.start(), em.end()))
+            if spans:
+                per_stem_spans[stem] = spans
 
         for stem, pat in patterns:
+            stem_spans = per_stem_spans.get(stem, [])
             for m in pat.finditer(line):
-                if any(m.start() >= s and m.end() <= e for s, e in exempt_spans):
+                if any(m.start() >= s and m.end() <= e for s, e in global_exempt_spans):
+                    continue
+                if any(m.start() >= s and m.end() <= e for s, e in stem_spans):
                     continue
                 out.append(Violation(stem, m.group(0), line_no, line.strip()))
     return out
