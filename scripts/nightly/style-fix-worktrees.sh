@@ -628,25 +628,14 @@ PROMPT_EOF
     echo "[diag $proj] agent launched: agent_pid=$agent_pid"
     progress "$proj" "phase=agent-launch mode=$STYLE_AGENT_MODE pid=$agent_pid log=$log_file"
 
-    # Forwarder: tail the agent's own log, watch for the `>>> phase: <name>`
-    # sentinel lines the prompt instructs codex to emit, and republish each
-    # one to *this* script's stdout (which the manual launcher captures into
-    # the manual log a Monitor is tailing). This is what gives the user
-    # live, step-level visibility instead of only the 60s heartbeat.
-    # The watcher exits as soon as we kill it after `wait "$agent_pid"`.
-    : > "$log_file"  # ensure file exists so tail -F doesn't race
-    local watcher_pid
-    (
-        tail -F -n 0 -q "$log_file" 2>/dev/null \
-            | while IFS= read -r line; do
-                case "$line" in
-                    ">>> phase: "*)
-                        progress "$proj" "phase=agent-step ${line#>>> phase: }"
-                        ;;
-                esac
-            done
-    ) &
-    watcher_pid=$!
+    # Phase-marker forwarding: scan new bytes of the agent log inside the
+    # main poll loop below. We previously did this with a backgrounded
+    # `( tail -F | while read ) &` subshell, but `kill $watcher_pid` only
+    # killed the wrapping subshell — `tail -F` and the `while read` bash
+    # were reparented to PID 1, kept inheriting our stdout (the pipe to
+    # tee in the parent nightly script), and held the pipeline open for
+    # 26+ hours, blocking launchd from firing the next night's run.
+    : > "$log_file"  # ensure file exists so the offset math starts at 0
 
     local elapsed=0
     local timeout_secs=3600
@@ -671,8 +660,23 @@ PROMPT_EOF
         local current_log_size=0
         [[ -f "$log_file" ]] && current_log_size=$(wc -c < "$log_file" 2>/dev/null || echo 0)
         if (( current_log_size > last_log_size )); then
+            # Synchronously scan the new bytes for `>>> phase: <name>`
+            # markers and republish each as a `progress` line on this
+            # script's stdout. awk runs to completion in a foreground
+            # pipeline — no background processes, no orphan risk.
+            local delta=$((current_log_size - last_log_size))
+            tail -c "$delta" "$log_file" 2>/dev/null \
+                | awk -v proj="$proj" '
+                    /^>>> phase: / {
+                        sub(/^>>> phase: /, "")
+                        printf "[progress %s] phase=agent-step %s\n", proj, $0
+                        fflush()
+                    }
+                ' || true
             last_log_size=$current_log_size
             last_activity_at=$elapsed
+        elif (( current_log_size < last_log_size )); then
+            last_log_size=$current_log_size
         fi
         if [[ -z "$summary_seen_at" ]] && rg -q '^## Fix Summary$' "$worktree_eval" 2>/dev/null; then
             summary_seen_at=$elapsed
@@ -694,8 +698,6 @@ PROMPT_EOF
             sleep 5
             kill -9 "$agent_pid" 2>/dev/null || true
             wait "$agent_pid" 2>/dev/null || true
-            kill "$watcher_pid" 2>/dev/null || true
-            wait "$watcher_pid" 2>/dev/null || true
             echo "TIMEOUT: $proj ($STYLE_AGENT_MODE exceeded 60 minute timeout)"
             progress "$proj" "phase=failed reason=timeout elapsed=${elapsed}s"
             python3 "$HISTORY_HELPER" finalize-failure --project "$proj" --reason "$STYLE_AGENT_MODE exceeded 60 minute timeout" || true
@@ -714,9 +716,22 @@ PROMPT_EOF
     # Tolerant cleanup: if any of these fail under `set -e`, the cleanup
     # branches below would never execute and the worktree would leak.
     wait "$agent_pid" && agent_code=0 || agent_code=$?
-    # Stop the phase-marker forwarder; tail+pipe persists otherwise.
-    kill "$watcher_pid" 2>/dev/null || true
-    wait "$watcher_pid" 2>/dev/null || true
+    # Final scan of any bytes the agent appended after the loop saw
+    # `kill -0` fail (e.g. the very last write before exit).
+    local final_log_size=0
+    [[ -f "$log_file" ]] && final_log_size=$(wc -c < "$log_file" 2>/dev/null || echo 0)
+    if (( final_log_size > last_log_size )); then
+        local delta=$((final_log_size - last_log_size))
+        tail -c "$delta" "$log_file" 2>/dev/null \
+            | awk -v proj="$proj" '
+                /^>>> phase: / {
+                    sub(/^>>> phase: /, "")
+                    printf "[progress %s] phase=agent-step %s\n", proj, $0
+                    fflush()
+                }
+            ' || true
+        last_log_size=$final_log_size
+    fi
     progress "$proj" "phase=agent-exit code=$agent_code elapsed=${elapsed}s"
 
     if [[ $agent_code -ne 0 ]]; then
