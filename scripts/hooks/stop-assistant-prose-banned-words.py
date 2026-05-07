@@ -33,36 +33,45 @@ class StopPayload(TypedDict, total=False):
     stop_hook_active: bool
 
 
-def last_assistant_text(transcript_path: str) -> str:
-    last = ""
+def current_turn_assistant_text(transcript_path: str) -> str:
+    """Return only the assistant text produced in the current turn.
+
+    Scope is everything after the last non-assistant entry (user / tool result).
+    If no assistant text has been written in the current turn yet — e.g. the
+    JSONL flush is racing the Stop hook — return "" so the hook exits cleanly
+    instead of blocking on stale text from a prior turn.
+    """
+    entries: list[TranscriptEntry] = []
     try:
         with open(transcript_path) as f:
             for raw_line in f:
                 try:
-                    entry: TranscriptEntry = cast(
-                        TranscriptEntry,
-                        json.loads(raw_line),
-                    )
+                    entries.append(cast(TranscriptEntry, json.loads(raw_line)))
                 except json.JSONDecodeError:
                     continue
-                if entry.get("type") != "assistant":
-                    continue
-                msg: AssistantMessage = entry.get("message", {}) or {}
-                content: list[TextBlock] | str = msg.get("content", []) or []
-                if isinstance(content, list):
-                    parts: list[str] = [
-                        b.get("text", "") or ""
-                        for b in content
-                        if b.get("type") == "text"
-                    ]
-                    text = "\n".join(p for p in parts if p)
-                    if text.strip():
-                        last = text
-                elif content.strip():
-                    last = content
     except OSError:
         return ""
-    return last
+
+    last_non_assistant = -1
+    for i, e in enumerate(entries):
+        if e.get("type") != "assistant":
+            last_non_assistant = i
+
+    parts: list[str] = []
+    for e in entries[last_non_assistant + 1:]:
+        if e.get("type") != "assistant":
+            continue
+        msg: AssistantMessage = e.get("message", {}) or {}
+        content: list[TextBlock] | str = msg.get("content", []) or []
+        if isinstance(content, list):
+            for b in content:
+                if b.get("type") == "text":
+                    t = b.get("text", "") or ""
+                    if t:
+                        parts.append(t)
+        elif content.strip():
+            parts.append(content)
+    return "\n".join(parts)
 
 
 def main() -> None:
@@ -78,7 +87,7 @@ def main() -> None:
     if not transcript_path:
         sys.exit(0)
 
-    text = last_assistant_text(transcript_path)
+    text = current_turn_assistant_text(transcript_path)
     if not text:
         sys.exit(0)
 

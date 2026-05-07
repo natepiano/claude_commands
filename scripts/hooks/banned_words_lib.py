@@ -240,3 +240,45 @@ def find_violations(text: str) -> list[Violation]:
                     continue
                 out.append(Violation(stem, m.group(0), line_no, line.strip()))
     return out
+
+
+def _main() -> int:
+    """CLI entry point for ad-hoc scans (e.g. /clippy style review, nightly).
+
+    Usage:
+        python3 banned_words_lib.py [path ...]      # scan each file
+        python3 banned_words_lib.py                 # scan stdin
+
+    Output: one line per violation as `path:lineno: stem: <line>`.
+    Exit 1 if any violations found, 0 if clean. Errors go to stderr (exit 2).
+
+    Safe to call from inside Claude Code: the script path contains
+    `banned_words_lib`, so `is_introspection_command()` exempts the command
+    from the PostToolUse hook — output is not re-scanned and counters are
+    not bumped.
+    """
+    import sys
+
+    paths: list[str] = sys.argv[1:]
+    sources: list[tuple[str, str]] = []
+    if paths:
+        for p in paths:
+            try:
+                sources.append((p, Path(p).read_text()))
+            except OSError as exc:
+                print(f"{p}: error: {exc}", file=sys.stderr)
+                return 2
+    else:
+        sources.append(("<stdin>", sys.stdin.read()))
+
+    found = 0
+    for label, text in sources:
+        for v in find_violations(text):
+            print(f"{label}:{v.line_no}: {v.stem}: {v.line}")
+            found += 1
+    return 1 if found else 0
+
+
+if __name__ == "__main__":
+    import sys
+    sys.exit(_main())

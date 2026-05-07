@@ -198,6 +198,21 @@ truth that maps clippy lints to the rule that governs them.
    - **VIOLATION**: describe what violates and where
    - **Skip**: rule does not apply to anything in the diff (e.g., "no module declarations changed", "no format strings", "no `#[allow]` added"). Use a short reason.
 
+   **Banned-words rule (special handling):** When the checklist contains a "no
+   banned words" / "forbidden words" rule, do **not** enumerate the stems
+   yourself, do **not** write a patterns file, and do **not** build an inline
+   regex — the bare stems will trip the PostToolUse hook. Instead, call the
+   canonical scanner against the additions file:
+
+   ```bash
+   python3 ~/.claude/scripts/hooks/banned_words_lib.py /tmp/claude/style-review-additions.txt
+   ```
+
+   Exit 0 = Pass. Exit 1 = VIOLATION; each output line is `path:lineno: stem:
+   <line>`. The script path contains `banned_words_lib`, which the hook's
+   introspection bypass recognizes, so neither the command nor its output
+   re-trips the scanner or bumps counters.
+
 4. Fix all violations found.
 5. After fixes, report: "Style review complete — N violations fixed." or "Style review passed — all changes conform to the style guide."
 </StyleReview>

@@ -124,7 +124,7 @@
   },
   "statusLine": {
     "type": "command",
-    "command": "printf \"%s%% Press ? for shortcuts\" \"$(basename \"$(pwd)\")\""
+    "command": "input=$(cat); tok=$(echo \"$input\" | jq -r '.context_window.total_input_tokens // 0'); tok_fmt=$(LC_ALL=en_US.UTF-8 printf \"%'d\" \"$tok\"); pct=$(echo \"$input\" | jq -r '.context_window.used_percentage // 0' | cut -d. -f1); printf \"%s | %s %s%%\" \"$(basename \"$(pwd)\")\" \"$tok_fmt\" \"$pct\""
   },
   "enabledPlugins": {
     "rust-analyzer-lsp@claude-plugins-official": true
