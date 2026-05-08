@@ -24,6 +24,7 @@ HISTORY_HELPER="$SCRIPT_DIR/style_history.py"
 LOG_DIR="/private/tmp/claude"
 SINGLE_PROJECT="${1:-}"
 STYLE_AGENT_MODE="claude"
+CODEX_BIN="${CODEX_BIN:-$HOME/.nvm/versions/node/v20.19.1/bin/codex}"
 
 mkdir -p "$LOG_DIR"
 
@@ -31,6 +32,7 @@ mkdir -p "$LOG_DIR"
 # Workspace-member entries are stored in three parallel arrays indexed by position.
 excludes=()
 MAX_NEW_FINDINGS=""
+STYLE_AGENT_MODEL=""
 ws_names=()   # project_name
 ws_paths=()   # workspace_dir/subpath
 ws_pkgs=()    # package_name
@@ -57,6 +59,8 @@ if [[ -f "$CONF_FILE" ]]; then
             style_eval)
                 if [[ "$stripped" =~ ^mode=(.+)$ ]]; then
                     STYLE_AGENT_MODE="${BASH_REMATCH[1]}"
+                elif [[ "$stripped" =~ ^model=(.+)$ ]]; then
+                    STYLE_AGENT_MODEL="${BASH_REMATCH[1]}"
                 elif [[ "$stripped" =~ ^enabled=(.+)$ ]]; then
                     if [[ "${BASH_REMATCH[1]}" == "true" ]]; then
                         STYLE_AGENT_MODE="claude"
@@ -113,7 +117,12 @@ run_style_agent() {
             ;;
         codex)
             final_prompt=$'IMPORTANT: Do NOT spawn sub-agents, delegate, or parallelize through helper agents. Complete this evaluation yourself in a single agent run.\nIMPORTANT: Do NOT create, replace, repair, or symlink the workspace path or any parent/peer repo path. If the expected workspace path is missing or invalid, fail and report it instead of trying to reconstruct it.\n\n'"$prompt"
-            codex exec \
+            local codex_args=()
+            if [[ -n "$STYLE_AGENT_MODEL" ]]; then
+                codex_args+=("-m" "$STYLE_AGENT_MODEL")
+            fi
+            "$CODEX_BIN" exec \
+                "${codex_args[@]}" \
                 -c model_reasoning_effort='"high"' \
                 --ephemeral \
                 --full-auto \
@@ -132,6 +141,11 @@ run_style_agent() {
 if [[ "$STYLE_AGENT_MODE" == "off" ]]; then
     echo "Style evaluation mode is off."
     exit 0
+fi
+
+if [[ "$STYLE_AGENT_MODE" == "codex" && ! -x "$CODEX_BIN" ]]; then
+    echo "ERROR: configured Codex binary is not executable: $CODEX_BIN" >&2
+    exit 1
 fi
 
 # Build project list. Parallel arrays indexed by position:
