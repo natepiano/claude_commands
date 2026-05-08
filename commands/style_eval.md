@@ -31,7 +31,7 @@ zsh ~/.claude/scripts/load-rust-style.sh --list-files --project-root "$ARGUMENTS
 
 ## Step 1.5: Use the nightly selection helper
 
-If no pending run exists yet (i.e. `next-unit` errors with "No pending run for ..."), initialize one first. The budget is derived from `[style_eval] max_new_findings` in `~/.claude/scripts/nightly/nightly-rust.conf` minus the count of existing `### N` findings in `EVALUATION.md` — there is no `--budget` flag, by design, so no caller can invent a number:
+If no pending run exists yet (i.e. `next-unit` errors with "No pending run for ..."), initialize one first. The budget is the configured `[style_eval] max_new_findings` in `~/.claude/scripts/nightly/nightly-rust.conf`; `next-unit` stops once `EVALUATION.md` contains that many numbered findings.
 
 ```bash
 python3 ~/.claude/scripts/nightly/style_history.py start-run --project-root "$ARGUMENTS"
@@ -50,11 +50,11 @@ The helper returns JSON.
 Rules:
 - `status=next` means review exactly that returned unit next
 - `status=complete` means stop immediately
-- `stop_reason=budget_reached` means you have reached the configured scored-unit budget
+- `stop_reason=budget_reached` means `EVALUATION.md` has reached the configured numbered-finding cap
 - `stop_reason=exhausted` means there are no unseen eligible units left for this run
 - `non_negotiable_guideline_ids` are binding on every unit review and are returned every time
 - each unit is exactly one guideline file — its `unit_id` equals the `guideline_id`
-- `see_also_guideline_ids` on a unit lists additional guidelines whose content you must consult as context when reviewing this unit — do NOT record results for them (they are scored on their own separate review cycle)
+- `see_also_guideline_ids` on a unit lists additional guidelines whose content you must consult as context when reviewing this unit — do NOT record results for them
 
 After reviewing a unit, you must record its result immediately with:
 
@@ -65,11 +65,11 @@ python3 ~/.claude/scripts/nightly/style_history.py record-unit \
     --eval-path "$ARGUMENTS/EVALUATION.md"
 ```
 
-**Ordering rule for findings:** if the unit produced a finding (`new` or `carried_forward`), append the finding under `## Improvements` in `EVALUATION.md` **before** calling `record-unit`. `record-unit` re-reads EVALUATION.md and refuses to record a finding whose guideline is not present there. This prevents recorded findings from going missing.
+**Ordering rule for findings:** if the unit produced a finding, append it under `## Improvements` in `EVALUATION.md` **before** calling `record-unit`. `record-unit` re-reads EVALUATION.md and refuses to record a finding whose guideline is not present there.
 
 The results path **must** be project-scoped (`/tmp/style-eval-results-<project>.json`). The nightly launches up to 4 codex evals in parallel, all writing to `/tmp`; a shared results file would clobber other agents' in-flight results. Always use `$(basename "$ARGUMENTS")` to derive the path so each agent has its own.
 
-The results JSON must have this shape:
+The results JSON for a unit with no finding must have this shape:
 
 ```json
 {
@@ -87,8 +87,8 @@ The results JSON must have this shape:
 
 Recording rules:
 - use `outcome.status = no_findings` when that guideline produced no finding
-- use `finding_source = new | carried_forward` when that guideline produced a finding to keep in `EVALUATION.md`
-- if the guideline produces a finding, the unit counts as `1`; otherwise it counts as `0`
+- use `outcome.status = finding` when that guideline produced a finding
+- `EVALUATION.md` is the budget source of truth; `next-unit` counts its numbered findings
 - do not review the next unit until the current unit has been recorded
 
 ## Step 2: Survey the project
@@ -109,7 +109,7 @@ If `$ARGUMENTS/EVALUATION.md` exists, read it. For each previously listed improv
 - **Keep** it if the violation is still present (update file paths and line numbers if they've shifted)
 - **Remove** it if the code has been fixed
 
-Carry forward any still-valid findings — they do not count against the limit of new findings in Step 4.
+Keep any still-valid findings. They count toward the same `EVALUATION.md` numbered-finding cap as newly found issues.
 
 ## Step 3.5: Exclude findings already being fixed in a worktree
 
@@ -158,21 +158,20 @@ For each returned unit:
    - LSP availability: claude has the `LSP` tool when `ENABLE_LSP_TOOL=1` is in env; codex has the same coverage via the `mcp-language-server` MCP. If neither is reachable, fall back to ripgrep + AST and document the limitation in the finding.
 5. Decide the result for the unit's single guideline:
    - if it has no issue, the result is `outcome.status = no_findings`
-   - if it has an issue that is still valid from Step 3, keep it as `finding_source = carried_forward`
-   - if it has a genuinely new issue, mark it `finding_source = new`
+   - if it has an issue, append the finding to `EVALUATION.md`
    - if it matches an in-progress `_style_fix` finding from Step 3.5, do not include it
-6. **If this unit produced a finding (`new` or `carried_forward`), append it to `EVALUATION.md` under `## Improvements` BEFORE recording.** `record-unit` will refuse to record a finding whose guideline is not present in EVALUATION.md. This ordering is what prevents recorded findings from being dropped from the file.
+6. **If this unit produced a finding, append it to `EVALUATION.md` under `## Improvements` BEFORE recording.** `record-unit` will refuse to record a finding whose guideline is not present in EVALUATION.md.
 7. Record the unit immediately with `record-unit` (which now requires `--eval-path`)
 8. Then ask the helper for the next unit
 
 Important:
 - do not invent your own stopping rule
 - keep pulling units until the helper says `budget_reached` or `exhausted`
-- `no_findings` units do not consume the configured scored-unit budget
+- `no_findings` units do not change the numbered-finding count in `EVALUATION.md`
 
 ## Step 4.5: Verify recorded findings are in EVALUATION.md
 
-After the helper returns `status=complete` (i.e. `budget_reached` or `exhausted`), re-read `EVALUATION.md` and confirm that **every** unit recorded with `finding_source = new` or `finding_source = carried_forward` appears under `## Improvements` with a matching `**Style file**:` line.
+After the helper returns `status=complete` (i.e. `budget_reached` or `exhausted`), re-read `EVALUATION.md` and confirm that every recorded finding appears under `## Improvements` with a matching `**Style file**:` line.
 
 If any recorded finding is missing from `EVALUATION.md`, append it under `## Improvements` before finalizing. A missing entry here means the file is out of sync with what was recorded — finalization downstream will mark it as `eval_dropped` in history if you don't fix it now.
 
@@ -180,9 +179,9 @@ This is a backstop on top of the per-unit ordering rule in Step 4 step 6 — `re
 
 ## Step 5: Write EVALUATION.md
 
-Write `$ARGUMENTS/EVALUATION.md` combining carried-forward findings and new findings.
+Write `$ARGUMENTS/EVALUATION.md` with the findings currently allowed by the helper.
 
-If there are **no violations** (nothing carried forward and nothing new), write:
+If there are **no violations**, write:
 
 ```markdown
 # Style Evaluation

@@ -571,20 +571,17 @@ def start_run(project_root: Path) -> None:
     HISTORY_DIR.mkdir(parents=True, exist_ok=True)
     PENDING_DIR.mkdir(parents=True, exist_ok=True)
     project = project_root.name.removesuffix("_style_fix")
-    # Total findings in EVALUATION.md are capped at `max_new_findings`.
-    # The per-run budget is the room left after carry-forwards, and
-    # only NEW findings consume it (carry-forwards are free since they
-    # were already represented by the subtraction). With existing=1 and
-    # max=2, budget=1 → up to 1 net-new finding → total ends at 2.
+    # EVALUATION.md is the budget source of truth because review/fix stages
+    # consume that file directly. Once it has `max_new_findings` numbered
+    # findings, next-unit stops.
     cap = max_new_findings()
-    existing = existing_findings_in_eval(project_root)
-    budget = max(0, cap - existing)
+    finding_count = existing_findings_in_eval(project_root)
     payload: PendingState = {
-        "budget": budget,
+        "budget": cap,
         "phase": "evaluation",
         "reviewed_unit_ids": [],
         "reviewed_units": [],
-        "scored_count": 0,
+        "scored_count": finding_count,
         "start_time": utc_now(),
         "updated_at": utc_now(),
     }
@@ -623,13 +620,16 @@ def next_unit(project_root: Path) -> dict[str, object]:
     if not pending:
         raise SystemExit(f"No pending run for {project}. Start a run first.")
 
-    scored_count = int(pending.get("scored_count", 0))
-    budget = int(pending.get("budget", 0))
-    if scored_count >= budget:
+    budget = max_new_findings()
+    finding_count = existing_findings_in_eval(project_root)
+    pending["budget"] = budget
+    pending["scored_count"] = finding_count
+    write_pending(project, pending)
+    if finding_count >= budget:
         return {
             "budget": budget,
             "non_negotiable_guideline_ids": non_negotiable_guideline_ids(project_root),
-            "scored_count": scored_count,
+            "scored_count": finding_count,
             "status": "complete",
             "stop_reason": "budget_reached",
         }
@@ -669,7 +669,7 @@ def next_unit(project_root: Path) -> dict[str, object]:
         return {
             "budget": budget,
             "non_negotiable_guideline_ids": non_negotiable_guideline_ids(project_root),
-            "scored_count": scored_count,
+            "scored_count": finding_count,
             "status": "complete",
             "stop_reason": "exhausted",
         }
@@ -677,7 +677,7 @@ def next_unit(project_root: Path) -> dict[str, object]:
     return {
         "budget": budget,
         "non_negotiable_guideline_ids": non_negotiable_guideline_ids(project_root),
-        "scored_count": scored_count,
+        "scored_count": finding_count,
         "status": "next",
         "unit": {
             "budget_cost": unit.budget_cost,
@@ -716,8 +716,7 @@ def record_unit(project_root: Path, results_path: Path, eval_path: Path) -> None
         else set()
     )
 
-    scored_increment = 0
-    found_new_finding = False
+    found_finding = False
     for result in results:
         guideline_id = result.get("guideline_id")
         if not isinstance(guideline_id, str):
@@ -726,6 +725,10 @@ def record_unit(project_root: Path, results_path: Path, eval_path: Path) -> None
         outcome = result.get("outcome")
         is_finding = False
         finding_source = ""
+        top_source = result.get("finding_source")
+        if isinstance(top_source, str):
+            reviewed_entry["finding_source"] = top_source
+            finding_source = top_source
         if isinstance(outcome, dict):
             reviewed_entry["outcome"] = outcome
             status = outcome.get("status")
@@ -735,10 +738,7 @@ def record_unit(project_root: Path, results_path: Path, eval_path: Path) -> None
             if status in {"finding", "fixed", "partial", "skipped"} or finding_source in {"new", "carried_forward"}:
                 is_finding = True
         else:
-            top_source = result.get("finding_source")
             if isinstance(top_source, str):
-                reviewed_entry["finding_source"] = top_source
-                finding_source = top_source
                 is_finding = top_source in {"new", "carried_forward"}
             else:
                 raise SystemExit(f"Result for {guideline_id} must include outcome or finding_source.")
@@ -749,36 +749,19 @@ def record_unit(project_root: Path, results_path: Path, eval_path: Path) -> None
                 + "EVALUATION.md before calling record-unit."
             )
             raise SystemExit(message)
-        # Only NEW findings consume the per-run budget. Carry-forwards are
-        # already represented in EVALUATION.md from prior runs; charging
-        # them again would shrink the per-run new-finding allowance for
-        # every project that still has unresolved findings.
-        if finding_source == "new":
-            found_new_finding = True
+        if is_finding:
+            found_finding = True
         reviewed_units.append(reviewed_entry)
-    if found_new_finding:
-        scored_increment = 1
 
     pending["reviewed_units"] = reviewed_units
     reviewed_unit_ids.append(unit_id)
     pending["reviewed_unit_ids"] = reviewed_unit_ids
-    has_carry_forward = False
-    for result in results:
-        if result.get("finding_source") == "carried_forward":
-            has_carry_forward = True
-            break
-        outcome_value = result.get("outcome")
-        if isinstance(outcome_value, dict) and outcome_value.get("finding_source") == "carried_forward":
-            has_carry_forward = True
-            break
-    pending["scored_count"] = int(pending.get("scored_count", 0)) + scored_increment
+    pending["scored_count"] = existing_findings_in_eval(project_root)
     pending["phase"] = "evaluation"
     pending["updated_at"] = utc_now()
     pending["last_unit_id"] = unit_id
-    if scored_increment:
-        pending["last_unit_result"] = "counted"
-    elif has_carry_forward:
-        pending["last_unit_result"] = "carried_forward"
+    if found_finding:
+        pending["last_unit_result"] = "finding"
     else:
         pending["last_unit_result"] = "no_findings"
     write_pending(project, pending)
