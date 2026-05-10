@@ -60,10 +60,38 @@ The subagent does **not** edit the plan. It returns findings only.
 
 ## Step 5: Fold findings back into the plan
 
-Walk the returned findings:
+<MinorFindings>
+Edit each minor finding straight into the plan — inline amendment to the affected remaining phase or a short note under that phase. No user gate.
+</MinorFindings>
 
-- **Minor findings** — edit them straight into the plan. Inline amendments to the affected remaining phase, or a short note under that phase. Do not ask the user for permission for these.
-- **Significant findings** — do not edit yet. Present each one to the user with the proposed plan change and ask for approval. After approval, apply the edit. After rejection, drop it (or apply a user-directed alternative).
+<SignificantFindings>
+**Forbidden tool: `AskUserQuestion`.** Surveys collapse the finding to a one-line label and strip the four required sub-sections. If you reach for `AskUserQuestion` for a significant finding, you are about to violate this rule — stop and route through one of the two paths below instead.
+
+**Count first, then route:**
+
+- 0 significant findings → skip this block.
+- 1 significant finding → execute `<PresentInlineSingle/>`.
+- 2+ significant findings → execute `<DispatchAdhocReview/>`.
+
+**Every significant finding presented (inline or via `/adhoc_review`) must include all four sub-sections.** See `<RequiredSubSections/>`.
+
+Do not assume the user has read the subagent output. Do not write "the architect flagged X" without first explaining X. Do not ask the user to choose between abstract options ("A vs B") without showing the concrete trade-off in code or plan terms.
+</SignificantFindings>
+
+<RequiredSubSections>
+1. **What the plan currently says** — quote the exact line(s) being changed.
+2. **What just shipped** — concrete files / types / line numbers; the gap that triggered the finding.
+3. **Why it matters** — what breaks, what regresses, what re-blesses, what test fires if left as-is.
+4. **The proposed plan change** — exact replacement or insertion text.
+</RequiredSubSections>
+
+<PresentInlineSingle>
+Write the four-sub-section prose to the user inline. Ask once for approve / reject / redirect. Apply on approve. Drop or apply the user's redirect on rejection.
+</PresentInlineSingle>
+
+<DispatchAdhocReview>
+Invoke `/adhoc_review` with the list of findings. Each finding's body must include the four sub-sections from `<RequiredSubSections/>` so the user can decide one at a time without flipping back to source. Apply each user decision (approve / reject / redirect) into the plan as the walkthrough completes that item.
+</DispatchAdhocReview>
 
 Then append a **Phase N Review** block under the just-completed phase summarizing what the review changed:
 
@@ -101,4 +129,5 @@ Style rules for the summary:
 - Do not commit any changes.
 - Do not relitigate the just-completed phase's implementation. The retrospective records what was learned; the review is about what comes next.
 - Significant findings always go through the user before being written into the plan. Minor findings do not.
+- Significant findings never use `AskUserQuestion`. Single finding → inline four-sub-section prose; two or more → `/adhoc_review`. See `<SignificantFindings/>` and `<RequiredSubSections/>` in Step 5.
 - If the subagent returns nothing actionable, still append the **Phase N Review** block with a single line stating the remaining phases were reviewed and need no changes.
