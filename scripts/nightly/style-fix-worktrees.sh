@@ -145,7 +145,7 @@ run_style_agent() {
             "$CODEX_BIN" exec \
                 -c model_reasoning_effort='"high"' \
                 --ephemeral \
-                --full-auto \
+                --dangerously-bypass-approvals-and-sandbox \
                 -C "$project_root" \
                 -- "$final_prompt" \
                 > "$log_file" 2>&1

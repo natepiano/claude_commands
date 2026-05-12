@@ -18,6 +18,7 @@ export PATH="$HOME/.local/bin:$PATH"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 RUST_DIR="$HOME/rust"
 HISTORY_DIR="$HOME/rust/nate_style/.history"
+FAILURE_LOG_DIR="$HISTORY_DIR/.failures"
 CONF_FILE="$SCRIPT_DIR/nightly-rust.conf"
 CMD_FILE="$HOME/.claude/commands/style_eval.md"
 HISTORY_HELPER="$SCRIPT_DIR/style_history.py"
@@ -27,6 +28,7 @@ STYLE_AGENT_MODE="claude"
 CODEX_BIN="${CODEX_BIN:-$HOME/.nvm/versions/node/v20.19.1/bin/codex}"
 
 mkdir -p "$LOG_DIR"
+mkdir -p "$FAILURE_LOG_DIR"
 
 # Parse conf file for excludes, settings, and workspace members.
 # Workspace-member entries are stored in three parallel arrays indexed by position.
@@ -104,6 +106,75 @@ if [[ -z "$MAX_NEW_FINDINGS" ]]; then
     echo "ERROR: [style_eval] max_new_findings is not set in $CONF_FILE" >&2
     exit 1
 fi
+
+# True if the agent's log shows at least one real invocation of
+# style_history.py next-unit/record-unit. The prompt text quotes these
+# commands too, so we filter to codex's exec marker — codex appends
+# ` in <cwd>` after every shell command it actually runs. For claude,
+# match the bash tool result preamble. Both narrow past prompt mentions.
+agent_called_helper() {
+    local log_file="$1"
+    [[ -f "$log_file" ]] || return 1
+    grep -Eq 'style_history\.py[^\n]*(next-unit|record-unit)[^\n]*in /Users/' "$log_file" && return 0
+    grep -Eq '<bash-stdout>[^<]*style_history\.py[^<]*(next-unit|record-unit)' "$log_file"
+}
+
+# Persist a per-failure report so nightly issues don't require re-investigation
+# from the raw codex/claude transcript. Written even when a retry recovers,
+# so trends in agent reliability are visible over time.
+write_failure_report() {
+    local proj="$1"
+    local a1_log="$2" a1_code="$3" a1_helper="$4"
+    local a2_log="$5" a2_code="$6" a2_helper="$7"
+    local outcome="$8"
+    local ts
+    ts=$(date -u +'%Y%m%dT%H%M%SZ')
+    local report="$FAILURE_LOG_DIR/${ts}_${proj}.md"
+    {
+        echo "# Style eval failure: $proj"
+        echo
+        echo "- Timestamp (UTC): $ts"
+        echo "- Agent mode: $STYLE_AGENT_MODE"
+        echo "- Model: ${STYLE_AGENT_MODEL:-<default>}"
+        echo "- Final outcome: $outcome"
+        echo
+        echo "## Attempt 1"
+        echo "- log: $a1_log"
+        echo "- exit code: $a1_code"
+        echo "- helper invoked: $a1_helper"
+        echo
+        echo "### Last 30 lines"
+        echo '```'
+        tail -30 "$a1_log" 2>/dev/null || echo "(log missing)"
+        echo '```'
+        if [[ -n "$a2_log" ]]; then
+            echo
+            echo "## Attempt 2 (retry)"
+            echo "- log: $a2_log"
+            echo "- exit code: $a2_code"
+            echo "- helper invoked: $a2_helper"
+            echo
+            echo "### Last 30 lines"
+            echo '```'
+            tail -30 "$a2_log" 2>/dev/null || echo "(log missing)"
+            echo '```'
+        fi
+    } > "$report"
+    echo "  failure report: $report"
+}
+
+# Build the per-project prompt and invoke the configured style agent.
+launch_eval() {
+    local project_root="$1" worktree_eval="$2" log_file="$3"
+    local prompt
+    prompt="$(
+        sed \
+            -e "s|\$ARGUMENTS|$project_root|g" \
+            -e "s|\$WORKTREE_EVAL_PATH|$worktree_eval|g" \
+            "$CMD_FILE"
+    )"
+    run_style_agent "$project_root" "$prompt" "$log_file"
+}
 
 run_style_agent() {
     local project_root="$1"
@@ -215,6 +286,7 @@ echo "=== Style evaluation: ${#projects[@]} projects ==="
 pids=()
 names=()
 roots_for_wait=()
+worktrees_for_wait=()
 for i in "${!projects[@]}"; do
     proj="${projects[$i]}"
     project_root="${project_roots[$i]}"
@@ -261,40 +333,76 @@ for i in "${!projects[@]}"; do
         continue
     }
 
-    prompt="$(
-        sed \
-            -e "s|\$ARGUMENTS|$project_root|g" \
-            -e "s|\$WORKTREE_EVAL_PATH|$worktree_eval|g" \
-            "$CMD_FILE"
-    )"
-    run_style_agent "$project_root" "$prompt" "$LOG_DIR/style_eval_${proj}.log" &
+    launch_eval "$project_root" "$worktree_eval" "$LOG_DIR/style_eval_${proj}.log" &
     pids+=($!)
     names+=("$proj")
     roots_for_wait+=("$project_root")
+    worktrees_for_wait+=("$worktree_eval")
     echo "Launched: $proj via $STYLE_AGENT_MODE (PID $!)"
 done
 
 echo ""
 echo "Waiting for ${#pids[@]} processes..."
 
-# Wait for all and track results
+# Wait for all and track results. On a missing EVALUATION.md, retry once
+# serially before recording the failure. Every failure (recovered or not)
+# writes a persistent report under $FAILURE_LOG_DIR so the next-morning
+# triage doesn't require re-reading a 350 KB codex transcript.
 failed=0
 succeeded=0
+recovered=0
 idx=0
 # Bash 3.2 trips set -u on empty arrays expanded as "${pids[@]}", so guard.
 if [[ ${#pids[@]} -gt 0 ]]; then
 for pid in "${pids[@]}"; do
     name="${names[$idx]}"
     project_root="${roots_for_wait[$idx]}"
+    worktree_eval="${worktrees_for_wait[$idx]}"
+    log_file="$LOG_DIR/style_eval_${name}.log"
     wait "$pid" && code=0 || code=$?
+
     if [[ ! -f "$project_root/EVALUATION.md" ]]; then
-        if [[ $code -ne 0 ]]; then
-            echo "FAILED: $name (exit $code, no EVALUATION.md produced)"
-        else
-            echo "FAILED: $name (no EVALUATION.md produced)"
-        fi
+        a1_helper="no"
+        if agent_called_helper "$log_file"; then a1_helper="yes"; fi
+        echo "FAILED attempt 1: $name (exit $code, helper-invoked=$a1_helper) — retrying once"
+
+        # Preserve attempt-1 log next to attempt-2 so both end up in the report.
+        a1_log="${log_file%.log}.attempt1.log"
+        mv -f "$log_file" "$a1_log" 2>/dev/null || a1_log="$log_file"
+
+        # Clean pending state and start a fresh run before the retry. If start-run
+        # itself fails we still write a report so the cause is captured.
         python3 "$HISTORY_HELPER" discard-pending --project "$name" || true
-        failed=$((failed + 1))
+        if ! python3 "$HISTORY_HELPER" start-run --project-root "$project_root"; then
+            write_failure_report "$name" "$a1_log" "$code" "$a1_helper" \
+                "" "" "" "failed-no-retry (start-run rejected)"
+            echo "FAILED: $name (could not start retry — start-run rejected)"
+            failed=$((failed + 1))
+            idx=$((idx + 1))
+            continue
+        fi
+
+        launch_eval "$project_root" "$worktree_eval" "$log_file" && retry_code=0 || retry_code=$?
+        a2_helper="no"
+        if agent_called_helper "$log_file"; then a2_helper="yes"; fi
+
+        if [[ -f "$project_root/EVALUATION.md" ]]; then
+            if [[ $(grep -c '^### [0-9]' "$project_root/EVALUATION.md" || true) -eq 0 ]]; then
+                python3 "$HISTORY_HELPER" finalize-no-findings --project "$name" || true
+            fi
+            lines=$(wc -l < "$project_root/EVALUATION.md")
+            echo "RECOVERED: $name ($lines lines, retry succeeded)"
+            write_failure_report "$name" "$a1_log" "$code" "$a1_helper" \
+                "$log_file" "$retry_code" "$a2_helper" "recovered-after-retry"
+            recovered=$((recovered + 1))
+            succeeded=$((succeeded + 1))
+        else
+            python3 "$HISTORY_HELPER" discard-pending --project "$name" || true
+            echo "FAILED: $name (retry also failed, exit=$retry_code helper-invoked=$a2_helper)"
+            write_failure_report "$name" "$a1_log" "$code" "$a1_helper" \
+                "$log_file" "$retry_code" "$a2_helper" "failed-after-retry"
+            failed=$((failed + 1))
+        fi
         idx=$((idx + 1))
         continue
     fi
@@ -318,4 +426,11 @@ done
 fi
 
 echo ""
-echo "=== Done: $succeeded succeeded, $failed failed out of ${#projects[@]} ==="
+if [[ $recovered -gt 0 ]]; then
+    echo "=== Done: $succeeded succeeded ($recovered after retry), $failed failed out of ${#projects[@]} ==="
+else
+    echo "=== Done: $succeeded succeeded, $failed failed out of ${#projects[@]} ==="
+fi
+if [[ $failed -gt 0 || $recovered -gt 0 ]]; then
+    echo "Failure reports: $FAILURE_LOG_DIR"
+fi

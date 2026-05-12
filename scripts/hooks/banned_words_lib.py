@@ -17,6 +17,7 @@ INTROSPECTION_TOKENS = (
     "banned_words_lib",
     "forbidden-words.md",
     "analyze_changes.sh",
+    "load-rust-style.sh",
     "git diff",
     "git status",
     "git log",

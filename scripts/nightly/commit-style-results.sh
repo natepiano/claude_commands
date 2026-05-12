@@ -6,6 +6,7 @@
 # Expected dirty files (nothing else may be dirty, staged, or untracked):
 #   - .history/<project>.jsonl (worktree-modified; each +1 insertion, 0 deletions)
 #   - style_report.md          (worktree-modified; total changed lines <= 200)
+#   - NIGHTLY_COMMIT_SKIPPED.md staged deletion, only for one-time untracking
 #
 # On any violation: write NIGHTLY_COMMIT_SKIPPED.md at the repo root (untracked)
 # describing what blocked the commit, then exit 0. The caller is expected to
@@ -47,16 +48,40 @@ fi
 
 cd "$NATE_STYLE_DIR"
 
+sentinel_exclude_added=false
+
+sentinel_is_excluded() {
+    local exclude_file
+    exclude_file="$(git rev-parse --git-path info/exclude)"
+    [[ -f "$exclude_file" ]] && grep -qxF "$SENTINEL_NAME" "$exclude_file"
+}
+
+ensure_sentinel_excluded() {
+    local exclude_file
+    exclude_file="$(git rev-parse --git-path info/exclude)"
+    if sentinel_is_excluded; then
+        return
+    fi
+    if $DRY_RUN; then
+        sentinel_exclude_added=true
+        return
+    fi
+    mkdir -p "$(dirname "$exclude_file")"
+    touch "$exclude_file"
+    printf '%s\n' "$SENTINEL_NAME" >>"$exclude_file"
+}
+
+ensure_sentinel_excluded
+
+if git ls-files --error-unmatch "$SENTINEL_NAME" >/dev/null 2>&1; then
+    echo "commit-style-results: skipped — $SENTINEL_NAME is tracked; run exclude in $NATE_STYLE_DIR first"
+    exit 0
+fi
+
 # Remove any prior sentinel so it does not contaminate the "other files" check
 # and does not linger across runs. In dry-run mode, temporarily hide it instead
 # so the script stays side-effect-free.
-if $DRY_RUN; then
-    if [[ -f "$SENTINEL" ]]; then
-        SENTINEL_BACKUP="$(mktemp)"
-        mv "$SENTINEL" "$SENTINEL_BACKUP"
-        trap 'mv "$SENTINEL_BACKUP" "$SENTINEL"' EXIT
-    fi
-else
+if ! $DRY_RUN; then
     rm -f "$SENTINEL"
 fi
 
@@ -100,11 +125,21 @@ fi
 unexpected=()
 history_files=()
 has_report=false
+has_sentinel_removal=false
 
 while IFS= read -r line; do
     [[ -z "$line" ]] && continue
     status="${line:0:2}"
     path="${line:3}"
+    if [[ "$path" == "$SENTINEL_NAME" ]]; then
+        if [[ "$status" == "D " ]]; then
+            has_sentinel_removal=true
+            continue
+        fi
+        if $DRY_RUN && $sentinel_exclude_added && [[ "$status" == "??" ]]; then
+            continue
+        fi
+    fi
     # Only accept worktree-only modifications ( M) of allowed paths.
     if [[ "$status" != " M" ]]; then
         unexpected+=("$line")
@@ -172,13 +207,29 @@ if $DRY_RUN; then
     echo "commit-style-results: DRY RUN"
     echo "  repo:           $NATE_STYLE_DIR"
     echo "  commit message: $COMMIT_MSG"
+    if $sentinel_exclude_added; then
+        echo "  would exclude:"
+        echo "    $SENTINEL_NAME"
+    fi
     echo "  would stage:"
-    printf '    %s\n' "${paths_to_add[@]}"
+    if (( ${#paths_to_add[@]} > 0 )); then
+        printf '    %s\n' "${paths_to_add[@]}"
+    else
+        echo "    (none)"
+    fi
+    if $has_sentinel_removal; then
+        echo "  would keep staged removal:"
+        echo "    $SENTINEL_NAME"
+    fi
     echo ""
     git diff --stat -- "${paths_to_add[@]}"
     exit 0
 fi
 
-git add -- "${paths_to_add[@]}"
+if (( ${#paths_to_add[@]} > 0 )); then
+    git add -- "${paths_to_add[@]}"
+fi
 git commit -m "$COMMIT_MSG"
-echo "commit-style-results: committed ${#paths_to_add[@]} file(s)"
+committed_count=${#paths_to_add[@]}
+$has_sentinel_removal && committed_count=$((committed_count + 1))
+echo "commit-style-results: committed $committed_count file(s)"

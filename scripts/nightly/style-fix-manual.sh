@@ -8,7 +8,7 @@
 #                   caller (e.g. an agent invoking via Bash with
 #                   run_in_background:true) gets a real completion event when
 #                   the fix actually finishes. Without this flag the launcher
-#                   detaches via nohup + disown (the original nightly shape).
+#                   detaches via nohup + disown (the original nightly pattern).
 #   project_name (optional) — pass through to style-fix-worktrees.sh to
 #                             restrict the run to a single project.
 #
