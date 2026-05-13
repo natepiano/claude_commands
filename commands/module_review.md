@@ -12,8 +12,10 @@ description: Three-pass module-structure evaluation. Three agents review a direc
 /module_review [scope] [doc-path]
 ```
 
-- `scope` — directory to evaluate, relative to repo root. Examples: `src/`, `tui_pane/src/`, `crates/foo/src/`.
-- `doc-path` — where the plan is written. Example: `docs/source_modules.md`.
+- `scope` — directory to evaluate, relative to repo root. Accepts either an `src/` directory or a workspace-member root (in which case `src/` is appended automatically).
+  - Single-crate examples: `src/`, `crates/foo/src/`.
+  - Workspace-member examples: `crates/bevy_diegetic`, `crates/bevy_diegetic/src/`.
+- `doc-path` — where the plan is written. Examples: `docs/source_modules.md`, `crates/bevy_diegetic/docs/modules.md`.
 
 If either is missing, infer from the current conversation; if inference fails, ask.
 
@@ -41,15 +43,22 @@ Doc already exists at <path>. Overwrite / append / cancel?
 ---
 
 <ResolveScope>
-**Goal:** Pin down what is being reviewed and where the plan lands.
+**Goal:** Pin down what is being reviewed, detect workspace context, and decide where the plan lands.
 
-- Resolve `scope` to an absolute directory under the repo. Verify it exists.
-- Resolve `doc-path`. If missing, propose one derived from `scope` (e.g. `src/` → `docs/source_modules.md`, `tui_pane/src/` → `docs/tui_pane_modules.md`) and ask the user to confirm.
+- Resolve `scope` to an absolute directory under the repo. If the user passed a workspace-member root (a directory containing `Cargo.toml` but no `src/` suffix), append `src/`. Verify the final directory exists.
+- Detect workspace membership: starting from `scope`, walk up looking for a `Cargo.toml`. If the nearest `Cargo.toml` is a workspace member (its parent or some ancestor has a `[workspace]` `Cargo.toml`), capture:
+  - `${CRATE_ROOT}` — directory containing the member `Cargo.toml`.
+  - `${CRATE_NAME}` — value of `name = "..."` in `[package]`.
+  - `${IS_WORKSPACE_MEMBER}` — `true`.
+  Otherwise set `${IS_WORKSPACE_MEMBER}` to `false` and leave the other two empty.
+- Resolve `doc-path`. If missing, propose one and ask the user to confirm:
+  - Workspace member → `${CRATE_ROOT}/docs/modules.md`.
+  - Single crate → `docs/source_modules.md` (or `docs/<segment>_modules.md` when `scope` has a clearer name segment).
 - If `doc-path` exists, ask: `Doc already exists at <path>. Overwrite / append / cancel?` and act accordingly. On cancel, stop.
 
-State one line: `Reviewing <scope>. Plan will be written to <doc-path>.`
+State one line: `Reviewing <scope>[ (crate: <CRATE_NAME>)]. Plan will be written to <doc-path>.`
 
-Store `${SCOPE}` and `${DOC_PATH}` for later steps.
+Store `${SCOPE}`, `${DOC_PATH}`, `${CRATE_NAME}`, `${CRATE_ROOT}`, and `${IS_WORKSPACE_MEMBER}` for later steps.
 </ResolveScope>
 
 ---
@@ -85,6 +94,8 @@ Then the per-agent body. Pass `${INVENTORY}` verbatim into each prompt.
 
 **Agent B — Coupling and boundaries**
 > Evaluate **module coupling and boundary discipline** across `${SCOPE}`. Map who-imports-whom. Surface unhealthy directions (domain → UI, leaf → aggregator). For library/binary boundaries: identify generic code stuck in app-specific homes and app-specific code leaked into generic homes. Output findings same format as Agent A; cite actual `use` paths.
+>
+> If `${IS_WORKSPACE_MEMBER}` is true, also search **sibling workspace crates** for inbound imports via `rg "use ${CRATE_NAME}(::|;|\s+as\s+)" --type rust` across the whole repo (excluding `${CRATE_ROOT}`). Flag public API surface that's wider than its actual external use, and inbound paths that reach into deep submodules instead of crate-root re-exports.
 
 **Agent C — Root-vs-submodule placement**
 > Evaluate **root-vs-submodule placement** across `${SCOPE}`. Policy: every file lives either at the crate root (genuinely top-level concerns) or inside a directory submodule that groups files by responsibility. No flat sprawl of unrelated single-file modules at any layer. For each layer, name singletons that should move into existing subdirs, files that should form a new subdir together, and directories too small to justify themselves. Output findings same format. End with a final tree sketch of the proposed layout (directories only, plus one or two example files per directory).
@@ -132,8 +143,11 @@ Write `${DOC_PATH}` with this skeleton:
 
 ### Sequencing
 <numbered steps; explain dependency ordering. Steps are in-flight
-checkpoints — run `cargo build` + `cargo nextest run` between them —
-and the whole phase lands as a single commit once green.>
+checkpoints — run the cargo checkpoint commands between them — and
+the whole phase lands as a single commit once green. Use
+`cargo build -p ${CRATE_NAME}` + `cargo nextest run -p ${CRATE_NAME}`
+when reviewing a workspace member; bare `cargo build` +
+`cargo nextest run` otherwise.>
 ```
 
 Do not cite agent reports. Do not include "options A vs B". State the recommendation.
@@ -155,12 +169,20 @@ Otherwise, launch **3 Explore agents in parallel**, each loading the style guide
 > For each file in `${OVERSIZE_FILES}`: compute production-line vs inline-test-line counts (use `awk '/^#\[cfg\(test\)\]/{print NR; exit}'` to find the test block boundary). If a file is >50% tests, the right action is test extraction (move tests to a `tests/` directory), not a module split. Flag any such file and propose the test-extraction target path. For genuine production-heavy files, confirm the split is warranted by `when-to-split-a-module.md`.
 
 **Agent F — Call-site impact**
-> For each file in `${OVERSIZE_FILES}` and each proposed submodule from Agent D: count external `use` statements that reference the file (`rg "use crate::<path>::<file>" --type rust`) and predict which submodule each caller now needs. Identify dependencies between proposed submodules (which import which) to determine extraction order. Surface any cycle or visibility hazard.
+> For each file in `${OVERSIZE_FILES}` and each proposed submodule from Agent D: count caller `use` statements that reference the file and predict which submodule each caller now needs.
+>
+> Search both intra-crate and (when applicable) external workspace callers:
+> - Intra-crate: `rg "use crate::<path>::<file>" --type rust` inside `${CRATE_ROOT}` (or repo root for single-crate projects).
+> - External workspace (only when `${IS_WORKSPACE_MEMBER}` is true): `rg "use ${CRATE_NAME}::<path>::<file>" --type rust` across the whole repo, excluding `${CRATE_ROOT}`. Also check for re-exports at the crate root that would shield external callers from the move.
+>
+> Identify dependencies between proposed submodules (which import which) to determine extraction order. Surface any cycle or visibility hazard.
 
 Synthesize: append a `## Phase N — Split <file>` section to `${DOC_PATH}` for each file, in order of size or risk. Each phase contains:
 - Target layout (directory tree).
 - What goes where (line ranges + items).
-- Sequencing (leaves first, with dependency reasoning). Steps are in-flight checkpoints — run `cargo build` + `cargo nextest run` between them — and the whole phase lands as a single commit once green.
+- Sequencing (leaves first, with dependency reasoning). Steps are in-flight checkpoints — run the cargo checkpoint commands between them — and the whole phase lands as a single commit once green.
+  - When `${IS_WORKSPACE_MEMBER}` is true, the checkpoint commands are `cargo build -p ${CRATE_NAME}` + `cargo nextest run -p ${CRATE_NAME}`.
+  - Otherwise, `cargo build` + `cargo nextest run`.
 
 For test-extraction-only files (Agent E's verdict), the phase has no internal sequencing steps — it's a straight test move. Say so.
 
@@ -178,7 +200,7 @@ Launch **3 Explore agents in parallel**, each loading the style guide. Each agen
 > Walk every `.rs` file in `${SCOPE}` (the inventory from step 2). Confirm each is either explicitly moved, explicitly kept where it is, or covered by a "stays where" section. Check rename consistency across the doc. Check that each new directory's `mod.rs` re-export block accounts for every type currently imported via the old path. Flag sequencing chicken-and-egg cases (e.g. directory A imports from directory B but is sequenced first).
 
 **Agent H — Risk**
-> For each proposed move and split, count broken `use` statements via `rg`. Surface `pub(super)` visibility shifts when files move into nested directories. Identify hidden cycles, deferred items that actually block earlier phases, and tests that reach into module internals via paths that will move.
+> For each proposed move and split, count broken `use` statements via `rg`. Search both `use crate::...` (intra-crate) and, when `${IS_WORKSPACE_MEMBER}` is true, `use ${CRATE_NAME}::...` across sibling crates. Surface `pub(super)` visibility shifts when files move into nested directories, and `pub(crate)` items that need to become `pub` to remain reachable from external workspace callers (or vice versa). Identify hidden cycles, deferred items that actually block earlier phases, and tests that reach into module internals via paths that will move.
 
 **Agent I — Simpler alternatives**
 > For each new directory: does it earn its weight, or is it two files that happen to share a vibe? Read each member's header (top 30 lines) and judge if the grouping name describes what they all *do*, not what they all *are not*. Propose dissolutions, membership changes, or rename when a clearer home exists. Do not manufacture dissent — say "keep as proposed" when right.
