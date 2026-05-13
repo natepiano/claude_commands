@@ -29,6 +29,7 @@ class EditEntry(TypedDict, total=False):
 
 class ToolInput(TypedDict, total=False):
     content: str
+    cmd: str
     new_string: str
     edits: list[EditEntry]
     file_path: str
@@ -59,6 +60,7 @@ def extract_text(tool_name: str, tool_input: ToolInput, tool_response: ToolRespo
         parts.extend(e.get("new_string", "") or "" for e in edits)
     else:
         parts.append(tool_input.get("command", "") or "")
+        parts.append(tool_input.get("cmd", "") or "")
         parts.append(tool_input.get("description", "") or "")
         parts.append(tool_input.get("content", "") or "")
         parts.append(tool_input.get("new_string", "") or "")
@@ -93,7 +95,14 @@ def main() -> None:
     if any(s in file_path for s in skip_substrings):
         sys.exit(0)
 
-    if tool_name == "Bash" and is_introspection_command(tool_input.get("command", "") or ""):
+    command = tool_input.get("command", "") or tool_input.get("cmd", "") or ""
+    if is_introspection_command(command):
+        sys.exit(0)
+
+    if (
+        "Counter state:" in (tool_response.get("output", "") or "")
+        and "forbidden-word-counts.json" in (tool_response.get("output", "") or "")
+    ):
         sys.exit(0)
 
     text: str = extract_text(tool_name, tool_input, tool_response)

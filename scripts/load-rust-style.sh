@@ -379,16 +379,28 @@ except (OSError, json.JSONDecodeError):
 
 items = []
 if isinstance(raw, dict):
-    for key, value in raw.items():
+    source = raw.get("words") if isinstance(raw.get("words"), dict) else raw
+    for key, value in source.items():
+        if not isinstance(key, str):
+            continue
+        if isinstance(value, dict):
+            count_value = value.get("count")
+            timestamp = value.get("last_triggered_at") or "never"
+        else:
+            count_value = value
+            timestamp = "unknown"
         try:
-            count = int(value)
+            count = int(count_value)
         except (TypeError, ValueError):
             continue
         if count >= 0:
-            items.append((str(key), count))
+            items.append((key, count, str(timestamp)))
 
 if items:
-    joined = ", ".join(f"{key}={count}" for key, count in sorted(items))
+    joined = ", ".join(
+        f"{key}={count} last={timestamp}"
+        for key, count, timestamp in sorted(items)
+    )
     print(f"Local forbidden-word counters: {joined} ({path})")
 PY
 )"

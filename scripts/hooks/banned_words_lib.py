@@ -5,6 +5,7 @@ import os
 import re
 from collections.abc import Iterable
 from contextlib import contextmanager
+from datetime import datetime
 from pathlib import Path
 from typing import NamedTuple
 
@@ -50,6 +51,11 @@ class Violation(NamedTuple):
     line: str
 
 
+class CounterRecord(NamedTuple):
+    count: int
+    last_triggered_at: str | None
+
+
 def _read_guide() -> str:
     try:
         return STYLE_GUIDE.read_text()
@@ -68,28 +74,57 @@ def _style_guide_counters() -> dict[str, int]:
     return out
 
 
-def _normalize_counters(raw: object) -> dict[str, int]:
+def _initial_timestamp() -> str:
+    return _trigger_timestamp()
+
+
+def _trigger_timestamp() -> str:
+    return datetime.now().astimezone().isoformat(timespec="seconds")
+
+
+def _normalize_counter_records(raw: object) -> dict[str, CounterRecord]:
     if not isinstance(raw, dict):
         return {}
-    out: dict[str, int] = {}
-    for key, value in raw.items():
+
+    if isinstance(raw.get("words"), dict):
+        source = raw["words"]
+    else:
+        source = raw
+
+    out: dict[str, CounterRecord] = {}
+    for key, value in source.items():
         if not isinstance(key, str):
             continue
+        if isinstance(value, dict):
+            count_value = value.get("count")
+            timestamp_value = value.get("last_triggered_at")
+        else:
+            count_value = value
+            timestamp_value = _initial_timestamp()
+
         try:
-            count = int(value)
+            count = int(count_value)
         except (TypeError, ValueError):
             continue
         if count >= 0:
-            out[key] = count
+            timestamp = timestamp_value if isinstance(timestamp_value, str) else None
+            out[key] = CounterRecord(count=count, last_triggered_at=timestamp)
     return out
 
 
-def load_counters() -> dict[str, int]:
+def load_counter_records() -> dict[str, CounterRecord]:
     try:
         raw = json.loads(COUNTER_STATE.read_text())
     except (OSError, json.JSONDecodeError):
         return {}
-    return _normalize_counters(raw)
+    return _normalize_counter_records(raw)
+
+
+def load_counters() -> dict[str, int]:
+    return {
+        stem: record.count
+        for stem, record in load_counter_records().items()
+    }
 
 
 @contextmanager
@@ -105,18 +140,40 @@ def _counter_file_lock():
                 fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
 
 
-def _write_counters(counters: dict[str, int]) -> None:
+def _write_counter_records(records: dict[str, CounterRecord]) -> None:
     COUNTER_STATE.parent.mkdir(parents=True, exist_ok=True)
-    payload = json.dumps(counters, indent=2, sort_keys=True) + "\n"
+    payload = {
+        "version": 1,
+        "words": {
+            stem: {
+                "count": record.count,
+                "last_triggered_at": record.last_triggered_at,
+            }
+            for stem, record in sorted(records.items())
+        },
+    }
+    text = json.dumps(payload, indent=2, sort_keys=True) + "\n"
     tmp_path = COUNTER_STATE.with_name(f".{COUNTER_STATE.name}.{os.getpid()}.tmp")
-    tmp_path.write_text(payload)
+    tmp_path.write_text(text)
     tmp_path.replace(COUNTER_STATE)
 
 
-def format_counter_totals(counters: dict[str, int]) -> str:
-    if not counters:
+def format_counter_totals(records: dict[str, CounterRecord]) -> str:
+    if not records:
         return "(none)"
-    return ", ".join(f"{stem}={count}" for stem, count in counters.items())
+    return ", ".join(
+        f"{stem}={record.count} (last {record.last_triggered_at or 'never'})"
+        for stem, record in records.items()
+    )
+
+
+def counter_analysis_rows() -> list[tuple[str, int, str]]:
+    records = load_counter_records()
+    rows: list[tuple[str, int, str]] = []
+    for stem in load_banned_words():
+        record = records.get(stem, CounterRecord(count=0, last_triggered_at=None))
+        rows.append((stem, record.count, record.last_triggered_at or "never"))
+    return rows
 
 
 def load_banned_words() -> list[str]:
@@ -215,24 +272,33 @@ def _stem_pattern(stem: str, override: str | None = None) -> re.Pattern[str]:
     return re.compile(rf"\b\w*{re.escape(root)}\w*\b", re.IGNORECASE)
 
 
-def bump_counters(stems: Iterable[str]) -> dict[str, int]:
+def bump_counters(stems: Iterable[str]) -> dict[str, CounterRecord]:
     """Increment local hit counters and return new totals for bumped stems."""
     unique = list(dict.fromkeys(stems))
     if not unique:
         return {}
     with _counter_file_lock():
-        counters = load_counters()
+        records = load_counter_records()
         legacy = _style_guide_counters()
         for stem, count in legacy.items():
-            counters.setdefault(stem, count)
+            records.setdefault(
+                stem,
+                CounterRecord(count=count, last_triggered_at=_initial_timestamp()),
+            )
 
-        bumped: dict[str, int] = {}
+        bumped: dict[str, CounterRecord] = {}
+        timestamp = _trigger_timestamp()
         for stem in unique:
-            counters[stem] = counters.get(stem, 0) + 1
-            bumped[stem] = counters[stem]
+            current = records.get(stem, CounterRecord(count=0, last_triggered_at=None))
+            updated = CounterRecord(
+                count=current.count + 1,
+                last_triggered_at=timestamp,
+            )
+            records[stem] = updated
+            bumped[stem] = updated
 
         try:
-            _write_counters(counters)
+            _write_counter_records(records)
         except OSError:
             return {}
         return bumped
@@ -300,6 +366,7 @@ def _main() -> int:
     """CLI entry point for ad-hoc scans (e.g. /clippy style review, nightly).
 
     Usage:
+        python3 banned_words_lib.py --analysis     # print local counter state
         python3 banned_words_lib.py [path ...]      # scan each file
         python3 banned_words_lib.py                 # scan stdin
 
@@ -314,6 +381,16 @@ def _main() -> int:
     import sys
 
     paths: list[str] = sys.argv[1:]
+    if paths == ["--analysis"] or paths == ["--counters"]:
+        rows = counter_analysis_rows()
+        width = max([len("word"), *(len(stem) for stem, _, _ in rows)])
+        print(f"Counter state: {COUNTER_STATE}")
+        print(f"{'word'.ljust(width)}  count  last_triggered_at")
+        print(f"{'-' * width}  -----  -----------------")
+        for stem, count, timestamp in rows:
+            print(f"{stem.ljust(width)}  {str(count).rjust(5)}  {timestamp}")
+        return 0
+
     sources: list[tuple[str, str]] = []
     if paths:
         for p in paths:
