@@ -1,21 +1,26 @@
-"""Shared banned-words detection.
+"""Shared banned-words detection."""
 
-Source of truth: ~/rust/nate_style/rust/forbidden-words.md
-Banned words come from `### "<word>"` headings.
-Exemption phrases come from the `exceptions:` frontmatter field.
-Per-line override: any line containing `allow-banned:` is skipped.
-"""
-
+import json
+import os
 import re
 from collections.abc import Iterable
+from contextlib import contextmanager
 from pathlib import Path
 from typing import NamedTuple
 
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - non-Unix fallback
+    fcntl = None  # type: ignore[assignment]
+
 STYLE_GUIDE = Path.home() / "rust" / "nate_style" / "rust" / "forbidden-words.md"
+COUNTER_STATE = Path.home() / ".claude" / "state" / "forbidden-word-counts.json"
+COUNTER_LOCK = COUNTER_STATE.with_suffix(".lock")
 ALLOW_MARKER = "allow-banned:"
 INTROSPECTION_TOKENS = (
     "banned_words_lib",
     "forbidden-words.md",
+    "forbidden-word-counts.json",
     "analyze_changes.sh",
     "load-rust-style.sh",
     "git diff",
@@ -50,6 +55,68 @@ def _read_guide() -> str:
         return STYLE_GUIDE.read_text()
     except OSError:
         return ""
+
+
+def _style_guide_counters() -> dict[str, int]:
+    guide = _read_guide()
+    if not guide:
+        return {}
+    out: dict[str, int] = {}
+    pattern = re.compile(r'^###\s+"([^"]+)".*?\bcounter:\s*(\d+)', re.MULTILINE)
+    for stem, raw_count in pattern.findall(guide):
+        out[stem] = int(raw_count)
+    return out
+
+
+def _normalize_counters(raw: object) -> dict[str, int]:
+    if not isinstance(raw, dict):
+        return {}
+    out: dict[str, int] = {}
+    for key, value in raw.items():
+        if not isinstance(key, str):
+            continue
+        try:
+            count = int(value)
+        except (TypeError, ValueError):
+            continue
+        if count >= 0:
+            out[key] = count
+    return out
+
+
+def load_counters() -> dict[str, int]:
+    try:
+        raw = json.loads(COUNTER_STATE.read_text())
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return _normalize_counters(raw)
+
+
+@contextmanager
+def _counter_file_lock():
+    COUNTER_STATE.parent.mkdir(parents=True, exist_ok=True)
+    with COUNTER_LOCK.open("a+") as lock_file:
+        if fcntl is not None:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            if fcntl is not None:
+                fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+
+
+def _write_counters(counters: dict[str, int]) -> None:
+    COUNTER_STATE.parent.mkdir(parents=True, exist_ok=True)
+    payload = json.dumps(counters, indent=2, sort_keys=True) + "\n"
+    tmp_path = COUNTER_STATE.with_name(f".{COUNTER_STATE.name}.{os.getpid()}.tmp")
+    tmp_path.write_text(payload)
+    tmp_path.replace(COUNTER_STATE)
+
+
+def format_counter_totals(counters: dict[str, int]) -> str:
+    if not counters:
+        return "(none)"
+    return ", ".join(f"{stem}={count}" for stem, count in counters.items())
 
 
 def load_banned_words() -> list[str]:
@@ -149,40 +216,26 @@ def _stem_pattern(stem: str, override: str | None = None) -> re.Pattern[str]:
 
 
 def bump_counters(stems: Iterable[str]) -> dict[str, int]:
-    """Increment the `counter: N` value in each `### "<stem>" — counter: N` heading.
-
-    Returns a mapping of stem → new counter value for the stems that were bumped.
-    Stems with no counter heading are skipped silently.
-    """
+    """Increment local hit counters and return new totals for bumped stems."""
     unique = list(dict.fromkeys(stems))
     if not unique:
         return {}
-    try:
-        guide = STYLE_GUIDE.read_text()
-    except OSError:
-        return {}
+    with _counter_file_lock():
+        counters = load_counters()
+        legacy = _style_guide_counters()
+        for stem, count in legacy.items():
+            counters.setdefault(stem, count)
 
-    bumped: dict[str, int] = {}
-    new_text = guide
-    for stem in unique:
-        pattern = re.compile(
-            rf'(^###\s+"{re.escape(stem)}"\s+\S+\s+counter:\s*)(\d+)',
-            re.MULTILINE,
-        )
+        bumped: dict[str, int] = {}
+        for stem in unique:
+            counters[stem] = counters.get(stem, 0) + 1
+            bumped[stem] = counters[stem]
 
-        def _inc(m: re.Match[str], stem: str = stem) -> str:
-            n = int(m.group(2)) + 1
-            bumped[stem] = n
-            return f"{m.group(1)}{n}"
-
-        new_text = pattern.sub(_inc, new_text, count=1)
-
-    if bumped:
         try:
-            _ = STYLE_GUIDE.write_text(new_text)
+            _write_counters(counters)
         except OSError:
             return {}
-    return bumped
+        return bumped
 
 
 def get_stem_guidance(stem: str) -> str:

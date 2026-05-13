@@ -364,6 +364,39 @@ printf 'Rust style guide loaded — %d %s, %d lines (shared: %d %s, %d lines; pr
   "$bevy_note" \
   "$auto_fix_note"
 
+counter_state="${HOME}/.claude/state/forbidden-word-counts.json"
+if [[ -s "$counter_state" ]]; then
+  counter_summary="$(python3 - "$counter_state" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+path = Path(sys.argv[1])
+try:
+    raw = json.loads(path.read_text())
+except (OSError, json.JSONDecodeError):
+    sys.exit(0)
+
+items = []
+if isinstance(raw, dict):
+    for key, value in raw.items():
+        try:
+            count = int(value)
+        except (TypeError, ValueError):
+            continue
+        if count >= 0:
+            items.append((str(key), count))
+
+if items:
+    joined = ", ".join(f"{key}={count}" for key, count in sorted(items))
+    print(f"Local forbidden-word counters: {joined} ({path})")
+PY
+)"
+  if [[ -n "$counter_summary" ]]; then
+    printf '%s\n\n' "$counter_summary"
+  fi
+fi
+
 if [[ ${#member_style_dirs[@]} -gt 0 ]]; then
   printf 'Workspace member style dirs loaded (some rules may not apply to the file you are editing — judge from context):\n'
   for dir in "${member_style_dirs[@]}"; do

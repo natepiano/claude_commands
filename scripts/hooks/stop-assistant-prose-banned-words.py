@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import TypedDict, cast
 
 sys.path.insert(0, str(Path(__file__).parent))
-from banned_words_lib import bump_counters, find_violations
+from banned_words_lib import COUNTER_STATE, bump_counters, find_violations, format_counter_totals
 
 
 class TextBlock(TypedDict, total=False):
@@ -108,12 +108,15 @@ def main() -> None:
             lines_by_stem[v.stem] = []
         lines_by_stem[v.stem].append(v.line_no)
 
-    _ = bump_counters(stems_in_order)
+    bumped = bump_counters(stems_in_order)
     parts = [
         f"{stem} (line{'s' if len(lines_by_stem[stem]) > 1 else ''} {', '.join(str(n) for n in lines_by_stem[stem])})"
         for stem in stems_in_order
     ]
-    reason = f"⛔ banned word(s): {', '.join(parts)}"
+    reason = (
+        f"⛔ banned word(s): {', '.join(parts)}; "
+        f"local totals: {format_counter_totals(bumped)}; state: {COUNTER_STATE}"
+    )
 
     print(json.dumps({"decision": "block", "reason": reason}))
 

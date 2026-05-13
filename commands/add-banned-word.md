@@ -23,7 +23,7 @@ Then:
 3. If absent, append a new section before the `### Review pass` section, in this format:
 
 ```
-### "<stem>" — counter: 0
+### "<stem>"
 
 regex: <pattern>          # optional — include only if a custom matcher is needed (see step 2)
 
@@ -35,7 +35,7 @@ Substitute: <substitutes> — or delete. **Not** <near-misses>.
 The `regex:` line is read by `~/.claude/scripts/hooks/banned_words_lib.py` (`load_overrides`). Omit it entirely when the default matcher suffices — there is no placeholder.
 
 4. If the new stem has a global exemption phrase (e.g. domain term that should always be allowed), also add the phrase to the `exceptions:` frontmatter line.
-5. Confirm to the user: stem added, counter starts at 0, hooks will pick it up immediately on next run (no restart needed — the lib re-reads the file each invocation).
+5. Confirm to the user: stem added, local counter starts at 0 on first hook hit, hooks will pick it up immediately on next run (no restart needed — the lib re-reads the file each invocation).
 6. Do **not** commit the change. Per the user's global rule, never commit unless explicitly asked.
 
 If the stem already exists, tell the user and ask whether they want to amend the existing entry instead.

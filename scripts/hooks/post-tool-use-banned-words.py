@@ -2,8 +2,8 @@
 """PostToolUse hook: check Write/Edit/MultiEdit content for banned words.
 
 User sees a one-line systemMessage; agent sees the full violation list and
-recovery instructions via hookSpecificOutput.additionalContext. Counters in
-forbidden-words.md are bumped by the hook itself.
+recovery instructions via hookSpecificOutput.additionalContext. Local counters
+are updated by the hook itself.
 """
 
 import json
@@ -13,9 +13,11 @@ from typing import TypedDict, cast
 
 sys.path.insert(0, str(Path(__file__).parent))
 from banned_words_lib import (
+    COUNTER_STATE,
     STYLE_GUIDE,
     bump_counters,
     find_violations,
+    format_counter_totals,
     get_stem_guidance,
     is_introspection_command,
 )
@@ -121,7 +123,7 @@ def main() -> None:
 
     short_file = Path(file_path).name if file_path else tool_name
     stems_label = ", ".join(stems_in_order)
-    system_msg = f"⛔ banned word(s) [{stems_label}] in {short_file} — counter(s) bumped"
+    system_msg = f"⛔ banned word(s) [{stems_label}] in {short_file} — local counter(s) updated"
 
     guidance_blocks: list[str] = []
     for stem in stems_in_order:
@@ -140,11 +142,12 @@ def main() -> None:
             "  • Rewrite the sentence — don't just swap one word.",
             "  • If no precise substitute fits, the sentence isn't making a claim — delete it.",
             "  • Use `allow-banned: <reason>` on the line if the use is genuinely legitimate (quoting the user, naming the rule itself).",
-            "  • Do NOT edit forbidden-words.md — the hook auto-bumps the counter.",
+            "  • Do NOT edit forbidden-words.md just to update counters.",
             "",
             *guidance_blocks,
             "",
-            f"Counter(s) bumped by the hook: {bumped or '(no matching headings found)'}.",
+            f"Local counter totals updated by the hook: {format_counter_totals(bumped)}.",
+            f"Counter state file: {COUNTER_STATE}.",
             f"Style guide: {STYLE_GUIDE}. Skill: `banned-words-check` for full mechanism.",
         ]
     )
