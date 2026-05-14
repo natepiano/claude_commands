@@ -77,8 +77,18 @@ def main() -> None:
         sys.exit(0)
 
     tool_name: str = data.get("tool_name", "") or ""
-    tool_input: ToolInput = data.get("tool_input", {}) or {}
-    tool_response: ToolResponse = data.get("tool_response", {}) or {}
+    # Some MCP tools deliver `tool_input`/`tool_response` as a string instead
+    # of a dict — defend against that before calling .get() on them.
+    raw_tool_input: object = data.get("tool_input", {})
+    tool_input: ToolInput = (
+        cast(ToolInput, raw_tool_input) if isinstance(raw_tool_input, dict) else ToolInput()
+    )
+    raw_tool_response: object = data.get("tool_response", {})
+    tool_response: ToolResponse = (
+        cast(ToolResponse, raw_tool_response)
+        if isinstance(raw_tool_response, dict)
+        else ToolResponse()
+    )
     file_path: str = tool_input.get("file_path", "") or ""
 
     if file_path:

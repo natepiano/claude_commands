@@ -17,7 +17,12 @@ except ImportError:  # pragma: no cover - non-Unix fallback
 STYLE_GUIDE = Path.home() / "rust" / "nate_style" / "rust" / "forbidden-words.md"
 COUNTER_STATE = Path.home() / ".claude" / "state" / "forbidden-word-counts.json"
 COUNTER_LOCK = COUNTER_STATE.with_suffix(".lock")
-ALLOW_MARKER = "allow-banned:"
+# Per-line allowance marker. Must be preceded by a comment opener (`#`, `//`,
+# or `<!--`) so casual prose mentions of the literal `allow-banned:` — e.g.
+# documentation describing the mechanism, or a backticked reference in chat —
+# do NOT silently disable the line. This is the only escape hatch; tightening
+# it is intentional.
+ALLOW_MARKER_RE = re.compile(r"(?:#|//|<!--)\s*allow-banned:", re.IGNORECASE)
 INTROSPECTION_TOKENS = (
     "banned_words_lib",
     "forbidden-words.md",
@@ -335,7 +340,7 @@ def find_violations(text: str) -> list[Violation]:
 
     out: list[Violation] = []
     for line_no, line in enumerate(text.splitlines(), start=1):
-        if ALLOW_MARKER in line:
+        if ALLOW_MARKER_RE.search(line):
             continue
         global_exempt_spans: list[tuple[int, int]] = []
         for ex in exemptions:
