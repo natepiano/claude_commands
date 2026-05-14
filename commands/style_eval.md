@@ -181,7 +181,7 @@ This is a backstop on top of the per-unit ordering rule in Step 4 step 6 — `re
 
 Write `$ARGUMENTS/EVALUATION.md` with the findings currently allowed by the helper.
 
-If there are **no violations**, write:
+If there are **no violations**, write the minimum that signals completion — the orchestrator removes this file after recording the run in history, so prose is wasted bytes:
 
 ```markdown
 # Style Evaluation
@@ -192,8 +192,6 @@ If there are **no violations**, write:
 **Rules checked**: [how many rules were checked before stopping or exhausting the list]
 
 ## No violations found
-
-This project fully conforms to the style guide.
 ```
 
 Otherwise, write:

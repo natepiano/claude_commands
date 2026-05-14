@@ -267,29 +267,15 @@ for ci in "${!candidates[@]}"; do
         branch_name="refactor/style"
     fi
 
-    # Check 0: EVALUATION.md exists with numbered findings
+    # Check 0: EVALUATION.md exists with numbered findings. The eval phase
+    # deletes EVALUATION.md on no-findings runs and records the outcome in
+    # history, so a missing file means "no open findings" — skip cleanly.
     finding_count=0
     if [[ -f "$eval_file" ]]; then
         finding_count=$(grep -c '^### [0-9]' "$eval_file" 2>/dev/null || true)
     fi
     if [[ ! -f "$eval_file" ]] || [[ "$finding_count" -eq 0 ]]; then
-        if [[ -n "$SINGLE_PROJECT" ]]; then
-            echo "EVAL: $name (no evaluation, running style eval...)"
-            "$SCRIPT_DIR/style-eval-all.sh" "$name"
-            if [[ ! -f "$eval_file" ]]; then
-                echo "SKIP: $name (eval produced no EVALUATION.md)"
-                skipped=$((skipped + 1))
-                continue
-            fi
-            finding_count=$(grep -c '^### [0-9]' "$eval_file" 2>/dev/null || true)
-        else
-            echo "SKIP: $name (no EVALUATION.md or no findings)"
-            skipped=$((skipped + 1))
-            continue
-        fi
-    fi
-    if [[ "$finding_count" -eq 0 ]]; then
-        echo "SKIP: $name (eval produced no findings)"
+        echo "SKIP: $name (no open findings)"
         skipped=$((skipped + 1))
         continue
     fi

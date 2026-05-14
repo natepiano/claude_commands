@@ -301,10 +301,11 @@ for i in "${!projects[@]}"; do
         continue
     fi
 
-    # Incremental skip: if EVALUATION.md exists and neither the project source
-    # nor the style guide tree has been touched since EVALUATION.md was written,
-    # last night's findings are still authoritative — no need to re-eval. Use
-    # mtime-based comparison against EVALUATION.md as the "last eval" timestamp.
+    # Incremental skip: EVALUATION.md exists only when there are OPEN findings.
+    # If neither the project source nor the style guide tree has been touched
+    # since it was written, the listed findings are still authoritative — no
+    # need to re-eval. Clean projects (no EVALUATION.md) always re-run; their
+    # "last clean" timestamp lives in history, not on disk.
     eval_md="$project_root/EVALUATION.md"
     if [[ -f "$eval_md" ]]; then
         nate_style_dir="$HOME/rust/nate_style/rust"
@@ -389,9 +390,12 @@ for pid in "${pids[@]}"; do
         if [[ -f "$project_root/EVALUATION.md" ]]; then
             if [[ $(grep -c '^### [0-9]' "$project_root/EVALUATION.md" || true) -eq 0 ]]; then
                 python3 "$HISTORY_HELPER" finalize-no-findings --project "$name" || true
+                rm -f "$project_root/EVALUATION.md"
+                echo "RECOVERED: $name (no findings — recorded in history, EVALUATION.md removed, retry succeeded)"
+            else
+                lines=$(wc -l < "$project_root/EVALUATION.md")
+                echo "RECOVERED: $name ($lines lines, retry succeeded)"
             fi
-            lines=$(wc -l < "$project_root/EVALUATION.md")
-            echo "RECOVERED: $name ($lines lines, retry succeeded)"
             write_failure_report "$name" "$a1_log" "$code" "$a1_helper" \
                 "$log_file" "$retry_code" "$a2_helper" "recovered-after-retry"
             recovered=$((recovered + 1))
@@ -417,9 +421,12 @@ for pid in "${pids[@]}"; do
             idx=$((idx + 1))
             continue
         }
+        rm -f "$project_root/EVALUATION.md"
+        echo "OK: $name (no findings — recorded in history, EVALUATION.md removed)"
+    else
+        lines=$(wc -l < "$project_root/EVALUATION.md")
+        echo "OK: $name ($lines lines)"
     fi
-    lines=$(wc -l < "$project_root/EVALUATION.md")
-    echo "OK: $name ($lines lines)"
     succeeded=$((succeeded + 1))
     idx=$((idx + 1))
 done

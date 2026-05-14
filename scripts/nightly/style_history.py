@@ -887,6 +887,19 @@ def finalize_no_findings(project: str) -> None:
     pending_file(project).unlink(missing_ok=True)
 
 
+def last_findings(project: str) -> str:
+    rows = load_history(project)
+    for row in reversed(rows):
+        for reviewed in row.get("reviewed_units", []):
+            outcome: Outcome = reviewed.get("outcome", {})
+            if outcome.get("skipped_by") == "pre_filter":
+                continue
+            if reviewed.get("finding_source") or outcome.get("status") not in (None, "no_findings"):
+                end_time = row.get("end_time", "")
+                return end_time or "unknown"
+    return "never"
+
+
 def finalize_fix(project_root: Path, eval_path: Path) -> None:
     project = project_root.name.removesuffix("_style_fix")
     pending = load_pending(project)
@@ -969,6 +982,11 @@ def parse_args() -> argparse.Namespace:
     )
     no_findings = subparsers.add_parser("finalize-no-findings")
     _ = no_findings.add_argument("--project", required=True)
+    last = subparsers.add_parser(
+        "last-findings",
+        help="Print end_time of the most recent history row with a real finding outcome, or 'never'.",
+    )
+    _ = last.add_argument("--project", required=True)
     finalize = subparsers.add_parser("finalize-fix")
     _ = finalize.add_argument("--project-root", required=True)
     _ = finalize.add_argument("--evaluation", required=True)
@@ -1031,6 +1049,9 @@ def main() -> None:
         return
     if command == "finalize-no-findings":
         finalize_no_findings(_arg_str(args, "project"))
+        return
+    if command == "last-findings":
+        print(last_findings(_arg_str(args, "project")))
         return
     if command == "finalize-fix":
         finalize_fix(
