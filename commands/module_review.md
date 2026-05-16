@@ -98,7 +98,27 @@ Then the per-agent body. Pass `${INVENTORY}` verbatim into each prompt.
 > If `${IS_WORKSPACE_MEMBER}` is true, also search **sibling workspace crates** for inbound imports via `rg "use ${CRATE_NAME}(::|;|\s+as\s+)" --type rust` across the whole repo (excluding `${CRATE_ROOT}`). Flag public API surface that's wider than its actual external use, and inbound paths that reach into deep submodules instead of crate-root re-exports.
 
 **Agent C — Root-vs-submodule placement**
-> Evaluate **root-vs-submodule placement** across `${SCOPE}`. Policy: every file lives either at the crate root (genuinely top-level concerns) or inside a directory submodule that groups files by responsibility. No flat sprawl of unrelated single-file modules at any layer. For each layer, name singletons that should move into existing subdirs, files that should form a new subdir together, and directories too small to justify themselves. Output findings same format. End with a final tree sketch of the proposed layout (directories only, plus one or two example files per directory).
+> Evaluate **root-vs-submodule placement** across `${SCOPE}`. Policy: every file lives either at the crate root (genuinely top-level concerns) or inside a directory submodule that groups files by responsibility. No flat sprawl of unrelated single-file modules at any layer.
+>
+> **Hard rule — singleton budget of 6 per layer.** If any layer has more than 6 singleton `.rs` files, you MUST propose organizing principles that bring the count down. "Top-level concern" is the *exception*, not the default — most files have peers along some responsibility axis if you look.
+>
+> Method:
+> 1. **Enumerate.** For every singleton at every layer, list its filename plus a one-line statement of what it *does* (read the top 30 lines if the name is ambiguous — names like `runner.rs`, `selection.rs`, `outcome.rs` rarely tell you enough).
+> 2. **Try every axis.** Walk through these axes and group singletons that share one:
+>    - **Entry & orchestration** — main, lib, top-level runner, exit-code/outcome types
+>    - **CLI surface** — argv parsing, flag types, mode enums
+>    - **Configuration & constants** — config loading, constants, env var names, feature flags
+>    - **Domain types** — the central nouns the rest of the code passes around (findings, reports, the core enum the whole crate revolves around)
+>    - **I/O & rendering** — JSON output, human-readable output, filters, formatters
+>    - **Persistence & caching** — disk layout, serde formats, cache invalidation
+>    - **External-process drivers** — wrappers around cargo, rustc, git, the shell
+>    - **Generic utilities** — path helpers, string helpers, byte-offset helpers, AST helpers
+>    - **Cross-cutting metadata** — diagnostic codes, severity, support tables consulted from many places
+>    - **Tests-vs-production** — test fixtures, golden files, snapshot infrastructure
+> 3. **Propose groupings.** Whenever two or more singletons share an axis, propose a directory. Aim for the singleton count at every layer to drop to ≤6 after grouping. If it can't, say why explicitly.
+> 4. **Defend any remaining singleton.** A file may stay at root only if it satisfies BOTH: (a) it is referenced directly from `main.rs` or the crate-root `lib.rs`, AND (b) it has no peer along any axis in the same layer. Generic "this is a top-level concern" is not a defense — name the axis the file is alone on, and confirm no other root-level file shares it.
+>
+> Output findings same format. End with a final tree sketch of the proposed layout (directories only, plus one or two example files per directory). The tree MUST show ≤6 singletons at every layer that started above the threshold, OR include an explicit per-file defense for every singleton above the budget.
 
 **Each agent must additionally:**
 - List every over-large file it finds in `${SCOPE}`, citing `when-to-split-a-module.md` and which criteria are met. Use `wc -l` plus an `awk` test-block boundary check (`/^#\[cfg\(test\)\]/`) to separate production-line count from inline tests.
@@ -112,6 +132,15 @@ Collect findings as `${PASS1_FINDINGS}` and the union of flagged over-large file
 **Goal:** Synthesize pass 1 into a confident placement plan and write it as Phase 1 of `${DOC_PATH}`.
 
 Merge and dedupe findings. Resolve disagreements with judgment — pick the cleanest layout, not the union of all proposals. Do **not** list dismissed alternatives. The plan is the recommendation.
+
+**Singleton-count gate (blocking).** Before writing the plan, count singletons at every layer of the proposed tree, including the root. If any layer has more than 6, the placement work is unfinished:
+
+- Return to Agent C's per-axis enumeration and pick at least one more grouping until the count drops to ≤6, **or**
+- For each remaining singleton above the budget, write an explicit defense in the doc citing BOTH criteria: (a) referenced from `main.rs`/`lib.rs`, AND (b) no responsibility-peer along any axis in that layer. The defense names the axis the file is alone on.
+
+A blanket "the remaining files are top-level concerns" sentence is not acceptable. If the gate fails, do not proceed to write the doc — re-do the synthesis with stronger grouping pressure first.
+
+The proposed tree is a hypothesis the gate is testing. Treat a layer with >6 singletons after gating as a finding that needs an answer, never as the resting state.
 
 Write `${DOC_PATH}` with this skeleton:
 
@@ -202,8 +231,17 @@ Launch **3 Explore agents in parallel**, each loading the style guide. Each agen
 **Agent H — Risk**
 > For each proposed move and split, count broken `use` statements via `rg`. Search both `use crate::...` (intra-crate) and, when `${IS_WORKSPACE_MEMBER}` is true, `use ${CRATE_NAME}::...` across sibling crates. Surface `pub(super)` visibility shifts when files move into nested directories, and `pub(crate)` items that need to become `pub` to remain reachable from external workspace callers (or vice versa). Identify hidden cycles, deferred items that actually block earlier phases, and tests that reach into module internals via paths that will move.
 
-**Agent I — Simpler alternatives**
-> For each new directory: does it earn its weight, or is it two files that happen to share a vibe? Read each member's header (top 30 lines) and judge if the grouping name describes what they all *do*, not what they all *are not*. Propose dissolutions, membership changes, or rename when a clearer home exists. Do not manufacture dissent — say "keep as proposed" when right.
+**Agent I — Two-sided membership audit**
+> Apply symmetric pressure: question overgroupings AND missed groupings. The plan's conservatism bias is to leave root sprawl in place — counter it.
+>
+> **Side 1 — overgroupings.** For each new directory proposed: does it justify itself, or is it two files that happen to share a vibe? Read each member's header (top 30 lines) and judge if the grouping name describes what they all *do*, not what they all *are not*. Propose dissolutions, membership changes, or rename when a clearer home exists.
+>
+> **Side 2 — missed groupings.** Count singletons at every layer of the proposed tree. If any layer still has more than 6, that is a finding, not a passing grade. For each such layer:
+> - List every remaining singleton with its one-line responsibility.
+> - Walk the responsibility axes from Agent C's instructions (entry/CLI/config/domain/I-O/persistence/external-drivers/utilities/cross-cutting).
+> - Propose at least one further grouping that drops the count, OR write a per-file defense citing both gate criteria from `WritePlacementPlan` (referenced from `main.rs`/`lib.rs` AND no axis-peer).
+>
+> Do not manufacture dissent on side 1, but do not pull punches on side 2. "Keep as proposed" is only a valid verdict when both sides pass — overgroupings hold AND every layer is within the singleton budget.
 
 Collect findings as `${PASS3_FINDINGS}`.
 </Pass3Validation>
