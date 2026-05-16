@@ -220,7 +220,17 @@ If the draft fails any of these, do not send — fix and re-scan.
 </ConcernFormat>
 
 <ReadEvaluation>
-Read `EVALUATION.md` in this worktree. It contains up to three parts:
+**Locate `EVALUATION.md`.** It is **not** always at the worktree root. For workspace-member projects (e.g. a crate inside `bevy_hana/crates/<member>/`), the nightly launcher places `EVALUATION.md` inside the member's subdirectory, not at the worktree root. Standalone repos have it at the root.
+
+Run this from the worktree root to find it — do not assume the path:
+
+```bash
+find . -maxdepth 4 -name EVALUATION.md -not -path '*/target/*' -not -path '*/.git/*'
+```
+
+Expect exactly one match. If zero matches, stop and report that EVALUATION.md is missing — do **not** claim the worktree has no findings; that is a launcher bug, not a clean run. If multiple matches, use the one closest to the worktree root and note the others.
+
+Read the file at the path you found. It contains up to three parts:
 
 1. **Findings** — numbered style violations identified by `/style_eval`
 2. **Review Log** — appended by `/style_eval_review`, documenting which findings the review pass kept, improved, amended, or removed, and why
