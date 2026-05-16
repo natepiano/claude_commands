@@ -4,13 +4,10 @@
 <dict>
     <key>Label</key>
     <string>com.natemccoy.nightly-rust-clean-build</string>
-    <!-- StartCalendarInterval is unusable on this machine: UserEventAgent
-         caches a stale Europe/Madrid TZ from prior travel and applies a
-         6-hour offset to the scheduled hour. We trigger via StartInterval
-         instead (raw seconds, no TZ involvement) and let the wrapper script
-         gate on `date +%H`, which correctly reads /etc/localtime. The
-         wrapper records the date of the most recent run so that only the
-         first eligible fire of the day actually executes the build. -->
+    <!-- Fires every StartInterval seconds. The wrapper script checks HID
+         idle time (via ioreg) and runs the nightly build whenever the user
+         has been away from keyboard for >= 1 hour AND no previous run is
+         still in flight (pgrep guard against the build script's path). -->
     <key>ProgramArguments</key>
     <array>
         <string>/bin/bash</string>
