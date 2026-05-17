@@ -22,7 +22,10 @@ if pgrep -f "$NIGHTLY_SCRIPT" >/dev/null 2>&1; then
     exit 0
 fi
 
-idle_seconds=$(ioreg -c IOHIDSystem | awk '/HIDIdleTime/ {print int($NF/1000000000); exit}')
+# `awk … exit` closes the pipe early, so ioreg gets SIGPIPE and the pipeline
+# returns 141 under pipefail. `|| true` swallows that without disabling pipefail
+# for the rest of the script.
+idle_seconds=$(ioreg -c IOHIDSystem | awk '/HIDIdleTime/ {print int($NF/1000000000); exit}' || true)
 
 if [ -z "$idle_seconds" ] || [ "$idle_seconds" -lt "$IDLE_THRESHOLD_SECONDS" ]; then
     exit 0
