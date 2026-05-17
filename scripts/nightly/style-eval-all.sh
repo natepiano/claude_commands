@@ -396,8 +396,9 @@ for pid in "${pids[@]}"; do
                 lines=$(wc -l < "$project_root/EVALUATION.md")
                 echo "RECOVERED: $name ($lines lines, retry succeeded)"
             fi
-            write_failure_report "$name" "$a1_log" "$code" "$a1_helper" \
-                "$log_file" "$retry_code" "$a2_helper" "recovered-after-retry"
+            # No failure report on recovery — the jsonl already records the retry
+            # and attempt-1 log persists in $LOG_DIR for same-session inspection.
+            # Reports are written only when retry also failed (see else branch).
             recovered=$((recovered + 1))
             succeeded=$((succeeded + 1))
         else
