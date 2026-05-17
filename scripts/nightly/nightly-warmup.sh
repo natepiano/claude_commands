@@ -12,7 +12,7 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 RUST_DIR="$HOME/rust"
 WARMUP_CONF="$SCRIPT_DIR/nightly-rust.conf"
 TIMESTAMP_DIR="$HOME/.local/state/nightly-rust"
-WARMUP_TIMEOUT=60
+WARMUP_TIMEOUT=120
 WARMUP_PORT=15799
 WARMUP_RUN_SECONDS=1
 

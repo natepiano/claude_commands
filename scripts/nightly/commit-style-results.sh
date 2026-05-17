@@ -7,6 +7,7 @@
 #   - .history/<project>.jsonl (worktree-modified; each +1 insertion, 0 deletions)
 #   - style_report.md          (worktree-modified; total changed lines <= 200)
 #   - NIGHTLY_COMMIT_SKIPPED.md staged deletion, only for one-time untracking
+#   - .history/.failures/...   (untracked retry-diagnostic dumps; ignored)
 #
 # On any violation: write NIGHTLY_COMMIT_SKIPPED.md at the repo root (untracked)
 # describing what blocked the commit, then exit 0. The caller is expected to
@@ -140,6 +141,11 @@ while IFS= read -r line; do
             continue
         fi
     fi
+    # `.history/.failures/` holds per-retry diagnostic dumps written by the
+    # style-eval retry path. Local-only, never committed — skip without flagging.
+    case "$path" in
+        .history/.failures/|.history/.failures/*) continue ;;
+    esac
     # Only accept worktree-only modifications ( M) of allowed paths.
     if [[ "$status" != " M" ]]; then
         unexpected+=("$line")
@@ -153,7 +159,7 @@ while IFS= read -r line; do
 done <<<"$porcelain"
 
 if (( ${#unexpected[@]} > 0 )); then
-    details=$'Unexpected working-tree entries (only worktree-modified `.history/*.jsonl` and `style_report.md` are permitted):\n\n```\n'
+    details=$'Unexpected working-tree entries (permitted: worktree-modified `.history/*.jsonl`, `style_report.md`, and untracked `.history/.failures/`):\n\n```\n'
     details+="$(printf '%s\n' "${unexpected[@]}")"
     details+=$'\n```'
     write_sentinel "unexpected working-tree changes" "$details"
