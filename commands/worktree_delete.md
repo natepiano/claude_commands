@@ -31,6 +31,12 @@ Update each todo status to "in_progress" when starting that step, and "completed
     - Parse the output to identify deletable worktrees (excluding current one and ${PROTECTED_BRANCHES})
     - Display current worktree and available worktrees for deletion
 
+    **If exactly one eligible worktree exists:** auto-select it, announce the selection (e.g. "Only one eligible worktree found: [PATH] — proceeding to confirmation"), and continue to <ValidateDeletionTarget/> without prompting.
+
+    **If zero eligible worktrees exist:** inform the user and STOP.
+
+    **If multiple eligible worktrees exist:**
+
     ## Worktree Selection
     - **select** - Choose a worktree to delete by entering its number
     - **cancel** - Exit without deleting any worktrees
