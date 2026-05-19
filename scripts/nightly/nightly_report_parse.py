@@ -60,6 +60,13 @@ FRAMEWORK_FILTER_REASONS: frozenset[str] = frozenset(
     }
 )
 
+# Orphan-stub skip reasons start with this prefix. The script emits the full
+# path after it (e.g. "style_fix orphan stub — manual cleanup required at
+# /Users/.../nateroids_style_fix") so the user has actionable detail in the
+# log. The parser normalizes the reason to the prefix for grouping and emits
+# a NOTE per project so the path surfaces under "Heads up" in the report.
+ORPHAN_STUB_PREFIX: str = "style_fix orphan stub"
+
 # Combined set used during pruning — a row whose only cells are SKIPs in either
 # bucket gets pulled out of the matrix.
 BOOKKEEPING_REASONS: frozenset[str] = ALWAYS_EXCLUDED_REASONS | FRAMEWORK_FILTER_REASONS
@@ -626,7 +633,15 @@ def _prune_bookkeeping_rows(result: ParseResult) -> None:
             continue
         if all(cell.state == "SKIP" for cell in non_dash):
             reason = reasons_by_project.get(project, "")
-            if reason in ALWAYS_EXCLUDED_REASONS:
+            if reason.startswith(ORPHAN_STUB_PREFIX):
+                to_remove.append(project)
+                result.filtered_out.append((project, ORPHAN_STUB_PREFIX))
+                # Surface the full reason (with path) under "Heads up" so the
+                # user gets the directory to clean up, not just a category.
+                result.notes.append(
+                    f"{project}: orphaned _style_fix stub from a half-failed cleanup — {reason}. Remove the directory by hand before the next run."
+                )
+            elif reason in ALWAYS_EXCLUDED_REASONS:
                 to_remove.append(project)
                 result.always_excluded.append((project, reason))
             elif reason in FRAMEWORK_FILTER_REASONS:

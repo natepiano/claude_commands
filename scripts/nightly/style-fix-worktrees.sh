@@ -49,6 +49,35 @@ progress() {
     printf '[progress %s] %s\n' "$proj" "$*"
 }
 
+# Validate that $dir is a real git-linked worktree of $repo, not just a leftover
+# directory. A directory with EVALUATION.md and target/ but no .git linkage is
+# an orphan stub from a partially-failed cleanup — treating it as a worktree
+# turns a recoverable hiccup into a permanent self-skipping state.
+is_real_worktree() {
+    local dir="$1"
+    local repo="$2"
+    [[ -d "$dir" ]] || return 1
+    git -C "$dir" rev-parse --git-dir >/dev/null 2>&1 || return 1
+    git -C "$repo" worktree list --porcelain 2>/dev/null \
+        | grep -qF "worktree $dir"
+}
+
+# Remove a worktree and verify it's gone. Tries `git worktree remove --force`
+# first, falls back to `rm -rf`, then asserts the directory no longer exists.
+# Returns 0 on success, 1 if the directory persists (a child process holding
+# files open, permissions, etc.) — in which case the caller must fail loud so
+# the next nightly doesn't silently skip on the leftover stub.
+safe_remove_worktree() {
+    local repo="$1"
+    local dir="$2"
+    git -C "$repo" worktree remove "$dir" --force 2>/dev/null || rm -rf "$dir"
+    git -C "$repo" worktree prune 2>/dev/null || true
+    if [[ -d "$dir" ]]; then
+        rm -rf "$dir"
+    fi
+    [[ ! -d "$dir" ]]
+}
+
 # Diagnostic: change cwd to $RUST_DIR so any unanchored `cargo` call from this
 # process or its children no longer references /Users/natemccoy/.claude. If the
 # nightly log still shows that path tomorrow, the cargo invocation is coming
@@ -60,6 +89,9 @@ echo "[diag] cwd_after_chdir=$(pwd)"
 # Parse conf file for excludes, settings, and workspace members
 excludes=()
 MAX_NEW_FINDINGS=""
+AGENT_TIMEOUT_SECS=""
+POST_SUMMARY_GRACE_SECS=""
+HEARTBEAT_INTERVAL_SECS=""
 ws_names=()
 ws_paths=()
 ws_pkgs=()
@@ -97,6 +129,15 @@ if [[ -f "$CONF_FILE" ]]; then
                     MAX_NEW_FINDINGS="${BASH_REMATCH[1]}"
                 fi
                 ;;
+            style_fix)
+                if [[ "$stripped" =~ ^agent_timeout_secs=([0-9]+)$ ]]; then
+                    AGENT_TIMEOUT_SECS="${BASH_REMATCH[1]}"
+                elif [[ "$stripped" =~ ^post_summary_grace_secs=([0-9]+)$ ]]; then
+                    POST_SUMMARY_GRACE_SECS="${BASH_REMATCH[1]}"
+                elif [[ "$stripped" =~ ^heartbeat_interval_secs=([0-9]+)$ ]]; then
+                    HEARTBEAT_INTERVAL_SECS="${BASH_REMATCH[1]}"
+                fi
+                ;;
             workspace_members)
                 if [[ "$stripped" =~ ^([^=]+)=(.+)$ ]]; then
                     wm_name="${BASH_REMATCH[1]}"
@@ -129,6 +170,12 @@ if [[ -z "$MAX_NEW_FINDINGS" ]]; then
     echo "ERROR: [style_eval] max_new_findings is not set in $CONF_FILE" >&2
     exit 1
 fi
+
+# Default any [style_fix] tunables the user didn't set in the conf. Defaults
+# match the values these were hard-coded to before the conf section existed.
+: "${AGENT_TIMEOUT_SECS:=7200}"
+: "${POST_SUMMARY_GRACE_SECS:=600}"
+: "${HEARTBEAT_INTERVAL_SECS:=60}"
 
 run_style_agent() {
     local project_root="$1"
@@ -282,7 +329,16 @@ for ci in "${!candidates[@]}"; do
 
     # Check A: The target _style_fix path must be free.
     if [[ -d "$worktree_dir" ]]; then
-        echo "SKIP: $name (style_fix directory exists)"
+        # Distinguish a legitimate in-flight worktree (skip silently, expected)
+        # from an orphan stub left by a partially-failed cleanup (surface loud).
+        # An orphan looks like a worktree on disk but has no .git linkage and
+        # isn't registered with the parent repo — every future nightly will
+        # otherwise keep skipping the project until someone removes it by hand.
+        if is_real_worktree "$worktree_dir" "$repo_dir"; then
+            echo "SKIP: $name (style_fix worktree)"
+        else
+            echo "SKIP: $name (style_fix orphan stub — manual cleanup required at $worktree_dir)"
+        fi
         python3 "$HISTORY_HELPER" discard-pending --project "$name" 2>/dev/null || true
         skipped=$((skipped + 1))
         continue
@@ -612,7 +668,7 @@ PROMPT_EOF
     prompt=$(<"$prompt_file")
     rm -f "$prompt_file"
 
-    # Launch selected agent to apply fixes (60 min timeout to prevent hanging the pipeline)
+    # Launch selected agent to apply fixes (timeout from [style_fix] agent_timeout_secs).
     echo "[diag $proj] launching style agent ($STYLE_AGENT_MODE) in background"
     local agent_pid
     run_style_agent "$agent_work_dir" "$prompt" "$log_file" &
@@ -630,11 +686,11 @@ PROMPT_EOF
     : > "$log_file"  # ensure file exists so the offset math starts at 0
 
     local elapsed=0
-    local timeout_secs=3600
+    local timeout_secs="$AGENT_TIMEOUT_SECS"
     local summary_seen_at=""
-    local post_summary_grace=600
+    local post_summary_grace="$POST_SUMMARY_GRACE_SECS"
     local last_heartbeat=0
-    local heartbeat_interval=60
+    local heartbeat_interval="$HEARTBEAT_INTERVAL_SECS"
     # Track agent log activity so we can defer SIGTERM while the agent is still
     # writing (e.g. expanding the Fix Summary section). The grace period is
     # measured from the LAST observed log activity, not the moment Fix Summary
@@ -690,12 +746,14 @@ PROMPT_EOF
             sleep 5
             kill -9 "$agent_pid" 2>/dev/null || true
             wait "$agent_pid" 2>/dev/null || true
-            echo "TIMEOUT: $proj ($STYLE_AGENT_MODE exceeded 60 minute timeout)"
+            echo "TIMEOUT: $proj ($STYLE_AGENT_MODE exceeded ${timeout_secs}s timeout)"
             progress "$proj" "phase=failed reason=timeout elapsed=${elapsed}s"
-            python3 "$HISTORY_HELPER" finalize-failure --project "$proj" --reason "$STYLE_AGENT_MODE exceeded 60 minute timeout" || true
+            python3 "$HISTORY_HELPER" finalize-failure --project "$proj" --reason "$STYLE_AGENT_MODE exceeded ${timeout_secs}s timeout" || true
             [[ -f "$worktree_eval" ]] && mv "$worktree_eval" "$eval_file"
-            git -C "$repo_dir" worktree remove "$worktree_dir" --force 2>/dev/null || rm -rf "$worktree_dir"
-            git -C "$repo_dir" worktree prune 2>/dev/null || true
+            if ! safe_remove_worktree "$repo_dir" "$worktree_dir"; then
+                echo "ERROR: $proj (worktree directory persists at $worktree_dir after cleanup — manual intervention needed)"
+                progress "$proj" "phase=failed reason=cleanup-leftover dir=$worktree_dir"
+            fi
             if [[ "$(git -C "$repo_dir" rev-list --count "main..$branch_name" 2>/dev/null)" == "0" ]]; then
                 git -C "$repo_dir" branch -D "$branch_name" 2>/dev/null || true
             else
@@ -740,8 +798,10 @@ PROMPT_EOF
             progress "$proj" "phase=failed reason=agent-exit code=$agent_code"
             python3 "$HISTORY_HELPER" finalize-failure --project "$proj" --reason "$fail_reason" || true
             [[ -f "$worktree_eval" ]] && mv "$worktree_eval" "$eval_file"
-            git -C "$repo_dir" worktree remove "$worktree_dir" --force 2>/dev/null || rm -rf "$worktree_dir"
-            git -C "$repo_dir" worktree prune 2>/dev/null || true
+            if ! safe_remove_worktree "$repo_dir" "$worktree_dir"; then
+                echo "ERROR: $proj (worktree directory persists at $worktree_dir after cleanup — manual intervention needed)"
+                progress "$proj" "phase=failed reason=cleanup-leftover dir=$worktree_dir"
+            fi
             if [[ "$(git -C "$repo_dir" rev-list --count "main..$branch_name" 2>/dev/null)" == "0" ]]; then
                 git -C "$repo_dir" branch -D "$branch_name" 2>/dev/null || true
             else
@@ -805,7 +865,17 @@ if [[ ${#failed_names[@]} -gt 0 ]]; then
             # "failure" was almost certainly a SIGTERM-on-grace race or a
             # tolerant-cleanup gap. Finalize history and treat as success
             # instead of recreating the worktree.
-            if [[ -d "$R_worktree_dir" ]] \
+            #
+            # Require a real git-linked worktree, not just a directory: an
+            # orphan stub left by a half-failed cleanup will also have
+            # EVALUATION.md + Fix Summary on disk but no `.git` linkage. Taking
+            # the shortcut on a stub silently finalizes a phantom success and
+            # locks every future nightly out of the project (the May 18
+            # nateroids regression — TIMEOUT cleanup left target/, EVALUATION.md,
+            # .claude/, .DS_Store behind; this branch then ran `finalize-fix`
+            # on the stub and the next nightly skipped on "style_fix directory
+            # exists" forever).
+            if is_real_worktree "$R_worktree_dir" "$R_repo_dir" \
                 && [[ -f "$R_worktree_eval" ]] \
                 && rg -q '^## Fix Summary$' "$R_worktree_eval" 2>/dev/null; then
                 echo "RETRY-SKIP: $proj (worktree at $R_worktree_dir already has Fix Summary; finalizing without re-running agent)"
@@ -830,8 +900,11 @@ if [[ ${#failed_names[@]} -gt 0 ]]; then
             # Worktree did NOT carry a finished fix; clean up before recreating.
             git -C "$R_repo_dir" branch -D "$R_branch" 2>/dev/null || true
             if [[ -d "$R_worktree_dir" ]]; then
-                git -C "$R_repo_dir" worktree remove "$R_worktree_dir" --force 2>/dev/null || rm -rf "$R_worktree_dir"
-                git -C "$R_repo_dir" worktree prune 2>/dev/null || true
+                if ! safe_remove_worktree "$R_repo_dir" "$R_worktree_dir"; then
+                    echo "ERROR: $proj (worktree directory persists at $R_worktree_dir before retry — skipping retry)"
+                    progress "$proj" "phase=failed reason=cleanup-leftover dir=$R_worktree_dir"
+                    continue
+                fi
             fi
         fi
 
