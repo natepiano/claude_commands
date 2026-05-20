@@ -587,7 +587,8 @@ Step 5: Run clippy and fix any issues
 Step 5a (preview): Run: cargo clippy $cargo_scope_flag --all-targets --all-features --manifest-path $worktree_dir/Cargo.toml -- -D warnings
 - Capture the list of warnings/errors reported. This is the baseline of what clippy sees.
 - If clippy reports nothing, skip to Step 6.
-- If clippy fails for infrastructure reasons (missing toolchain, compile error unrelated to lints), report the error and skip to Step 6.
+- If clippy fails because the toolchain itself is missing, report the error and skip to Step 6.
+- If clippy fails with a COMPILE error, the tree is broken — almost always because an earlier step (a module split, rename, extraction, or move) left a dangling reference or missing import. STOP. Do NOT proceed to Step 5b, 5c, 6, or beyond until the tree compiles. Fix the cause directly (restore the missing import, re-add the dropped item, repoint the reference). If the breakage came from a finding you applied and you cannot fix it in place, revert that finding's edits and mark the finding `Skipped` in the Fix Summary with the compile error as the reason. Compile errors are NEVER "infrastructure" — they are caused by the edits in this run.
 
 Step 5b (auto-fix): If Step 5a reported any fixable items, run: cargo clippy --fix $cargo_scope_flag --all-targets --all-features --allow-dirty --manifest-path $worktree_dir/Cargo.toml -- -D warnings
 - This auto-applies every fix clippy can make on its own. Do NOT manually fix anything clippy could have auto-fixed.
@@ -809,6 +810,27 @@ PROMPT_EOF
             fi
             return 1
         fi
+    fi
+
+    # Build gate: the agent self-reports build status in its Fix Summary, but
+    # the field is free text and the runner has historically trusted it. Re-run
+    # cargo check from outside the agent so a broken tree cannot be declared
+    # successful. Matches the scope the agent itself uses for clippy.
+    local build_check_log="$RUN_DIR/$proj.build-check.log"
+    progress "$proj" "phase=build-gate log=$build_check_log"
+    if ! cargo check $cargo_scope_flag --all-targets --all-features \
+            --manifest-path "$worktree_dir/Cargo.toml" \
+            >"$build_check_log" 2>&1; then
+        echo "FAIL: $proj (cargo check failed after style-fix; worktree left for review at $worktree_dir; see $build_check_log)"
+        progress "$proj" "phase=failed reason=build-broken-after-fix log=$build_check_log"
+        python3 "$HISTORY_HELPER" finalize-failure --project "$proj" \
+            --reason "cargo check failed after style-fix; worktree left at $worktree_dir for review" || true
+        # Intentionally do NOT remove the worktree or branch here. The agent
+        # finished writing its Fix Summary, the diff is reviewable, and the
+        # user needs to see what broke. The failure paths elsewhere in this
+        # script clean up because the agent never produced reviewable output;
+        # this path is the opposite case.
+        return 1
     fi
 
     python3 "$HISTORY_HELPER" finalize-fix --project-root "$agent_work_dir" --evaluation "$worktree_eval" || {
