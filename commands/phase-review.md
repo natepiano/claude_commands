@@ -65,32 +65,78 @@ Edit each minor finding straight into the plan — inline amendment to the affec
 </MinorFindings>
 
 <SignificantFindings>
-**Forbidden tool: `AskUserQuestion`.** Surveys collapse the finding to a one-line label and strip the four required sub-sections. If you reach for `AskUserQuestion` for a significant finding, you are about to violate this rule — stop and route through one of the two paths below instead.
+**Forbidden tool: `AskUserQuestion`.** Surveys collapse the decision to a one-line label and strip the concrete recommendation. If you reach for `AskUserQuestion`, stop and route through `<FilterFindingsForUserReview/>` first.
 
-**Count first, then route:**
+Execute `<FilterFindingsForUserReview/>` before presenting anything to the user. Subagent `Severity: significant` means "needs filtering," not automatically "ask the user."
 
-- 0 significant findings → skip this block.
-- 1 significant finding → execute `<PresentInlineSingle/>`.
-- 2+ significant findings → execute `<DispatchAdhocReview/>`.
+After filtering, count unresolved user decisions, not raw subagent findings:
 
-**Every significant finding presented (inline or via `/adhoc_review`) must include all four sub-sections.** See `<RequiredSubSections/>`.
+- 0 unresolved user decisions → skip this block.
+- 1 unresolved user decision → execute `<PresentInlineSingle/>`.
+- 2+ unresolved user decisions → execute `<DispatchAdhocReview/>`.
 
-Do not assume the user has read the subagent output. Do not write "the architect flagged X" without first explaining X. Do not ask the user to choose between abstract options ("A vs B") without showing the concrete trade-off in code or plan terms.
+There is no fixed maximum number of user decisions. If filtering leaves a large list, think harder about grouping, mechanical edits, and already-implied work before invoking `/adhoc_review`; if a decision is truly distinct, present it.
 </SignificantFindings>
 
+<FilterFindingsForUserReview>
+Convert raw significant findings into real user decisions:
+
+1. Apply mechanical plan-doc findings directly.
+2. Merge duplicate findings that point to the same actual decision.
+3. Drop findings that only restate work already implied by the current phase.
+4. Convert abstract findings into the concrete implementation problem:
+   - What code, file, type, module, phase, or behavior is missing or wrong?
+   - Which phase should create or change it?
+   - What exact plan text should be added or replaced?
+5. If a finding says an abstraction, contract, API, or boundary is incomplete, determine whether:
+   - the completed phase was supposed to create it,
+   - the next phase is supposed to create it,
+   - or the plan is missing a task or phase that should create it.
+   Present that answer directly.
+6. Make a recommendation. Do not ask the user to reason from labels.
+
+Only decisions that change product behavior, architecture direction, phase ordering, or implementation scope survive this filter.
+</FilterFindingsForUserReview>
+
+<DecisionPresentationTemplate>
+Every user-facing decision must use this structure:
+
+```markdown
+**Decision N: <concrete thing to decide>**
+
+Actual problem:
+<one or two sentences about the implementation issue, naming files/types/phases>
+
+What exists now:
+- <concrete current code/doc state>
+
+What should change:
+- <recommended plan/code direction>
+
+Recommendation:
+<direct recommendation, with the exact phase/doc placement>
+
+Approve this direction, or modify it?
+```
+
+Do not present a finding as "the architect flagged X". The user should not have to infer the actual task from review vocabulary.
+</DecisionPresentationTemplate>
+
 <RequiredSubSections>
+When a decision needs source detail, include it inside `<DecisionPresentationTemplate/>` using these facts:
+
 1. **What the plan currently says** — quote the exact line(s) being changed.
 2. **What just shipped** — concrete files / types / line numbers; the gap that triggered the finding.
-3. **Why it matters** — what breaks, what regresses, what re-blesses, what test fires if left as-is.
+3. **Why it matters** — what breaks, what regresses, or what test fires if left as-is.
 4. **The proposed plan change** — exact replacement or insertion text.
 </RequiredSubSections>
 
 <PresentInlineSingle>
-Write the four-sub-section prose to the user inline. Ask once for approve / reject / redirect. Apply on approve. Drop or apply the user's redirect on rejection.
+Write the decision using `<DecisionPresentationTemplate/>`. Ask once for approve / reject / redirect. Apply on approve. Drop or apply the user's redirect on rejection.
 </PresentInlineSingle>
 
 <DispatchAdhocReview>
-Invoke `/adhoc_review` with the list of findings. Each finding's body must include the four sub-sections from `<RequiredSubSections/>` so the user can decide one at a time without flipping back to source. Apply each user decision (approve / reject / redirect) into the plan as the walkthrough completes that item.
+Invoke `/adhoc_review` with the filtered user decisions. Each item must already use `<DecisionPresentationTemplate/>` so the user can decide one at a time without translating abstract review language. Apply each user decision into the plan as the walkthrough completes that item.
 </DispatchAdhocReview>
 
 Then append a **Phase N Review** block under the just-completed phase summarizing what the review changed:
@@ -128,6 +174,6 @@ Style rules for the summary:
 - Do not modify implementation code in this command — this is plan-doc maintenance only. Code changes belong to the next phase or to a follow-up.
 - Do not commit any changes.
 - Do not relitigate the just-completed phase's implementation. The retrospective records what was learned; the review is about what comes next.
-- Significant findings always go through the user before being written into the plan. Minor findings do not.
-- Significant findings never use `AskUserQuestion`. Single finding → inline four-sub-section prose; two or more → `/adhoc_review`. See `<SignificantFindings/>` and `<RequiredSubSections/>` in Step 5.
+- Raw significant findings must be filtered before user review. Only unresolved user decisions go through the user; mechanical changes and already-implied work go straight into the plan.
+- User decisions never use `AskUserQuestion`. Single decision → inline decision template; two or more → `/adhoc_review`. See `<SignificantFindings/>`, `<FilterFindingsForUserReview/>`, and `<DecisionPresentationTemplate/>` in Step 5.
 - If the subagent returns nothing actionable, still append the **Phase N Review** block with a single line stating the remaining phases were reviewed and need no changes.
