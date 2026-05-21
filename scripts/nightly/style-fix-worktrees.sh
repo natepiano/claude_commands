@@ -49,6 +49,24 @@ progress() {
     printf '[progress %s] %s\n' "$proj" "$*"
 }
 
+finish_style_results() {
+    local failed_count="$1"
+
+    # Update Obsidian summary even when no fix worktrees were created. The eval
+    # phase may still have appended no-finding history rows.
+    python3 "$SCRIPT_DIR/style_report.py" --generate 2>&1 || {
+        echo "WARNING: failed to generate style reports"
+    }
+
+    # Commit the nightly history + report in ~/rust/nate_style only when every
+    # worktree fix succeeded. On any failure, leave nate_style dirty for review.
+    if (( failed_count == 0 )); then
+        "$SCRIPT_DIR/commit-style-results.sh" 2>&1 || echo "WARNING: commit-style-results.sh failed"
+    else
+        echo "SKIP commit-style-results: $failed_count worktree run(s) failed; leaving nate_style dirty for review"
+    fi
+}
+
 # Validate that $dir is a real git-linked worktree of $repo, not just a leftover
 # directory. A directory with EVALUATION.md and target/ but no .git linkage is
 # an orphan stub from a partially-failed cleanup — treating it as a worktree
@@ -397,6 +415,7 @@ done
 if [[ ${#eligible[@]} -eq 0 ]]; then
     echo "No projects eligible for style-fix worktrees."
     echo "=== Done: 0 created, 0 failed, $skipped skipped ==="
+    finish_style_results 0
     exit 0
 fi
 
@@ -947,15 +966,4 @@ echo "=== Done: $succeeded created, $failed failed, $skipped skipped out of $(($
 # Clean up per-run temp directory
 rm -rf "$RUN_DIR"
 
-# Update Obsidian summary
-python3 "$SCRIPT_DIR/style_report.py" --generate 2>&1 || {
-    echo "WARNING: failed to generate style reports"
-}
-
-# Commit the nightly history + report in ~/rust/nate_style only when every
-# worktree fix succeeded. On any failure, leave nate_style dirty for review.
-if (( failed == 0 )); then
-    "$SCRIPT_DIR/commit-style-results.sh" 2>&1 || echo "WARNING: commit-style-results.sh failed"
-else
-    echo "SKIP commit-style-results: $failed worktree run(s) failed; leaving nate_style dirty for review"
-fi
+finish_style_results "$failed"
