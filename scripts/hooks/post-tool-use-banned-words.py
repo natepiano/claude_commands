@@ -19,6 +19,7 @@ from banned_words_lib import (
     find_violations,
     format_counter_totals,
     get_stem_guidance,
+    is_guide_reproduction,
     is_introspection_command,
 )
 
@@ -137,6 +138,11 @@ def main() -> None:
         bullets.append(
             f"  - line {v.line_no}: matched {v.match!r} (banned stem: {v.stem!r})\n      > {snippet}"
         )
+
+    # Skip content that reproduces the banned-word list/machinery (docs about
+    # the mechanism, a copy of the guide) so it does not bump every counter.
+    if is_guide_reproduction(text, len(stems_in_order)):
+        sys.exit(0)
 
     bumped = bump_counters(stems_in_order)
 

@@ -5,9 +5,10 @@ import os
 import re
 from collections.abc import Iterable
 from contextlib import contextmanager
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import NamedTuple
+from typing import NamedTuple, cast
 
 try:
     import fcntl
@@ -49,6 +50,40 @@ def is_introspection_command(command: str) -> bool:
     return any(tok in command for tok in INTROSPECTION_TOKENS)
 
 
+# ── Exception manager: guide-reproduction detection ─────────────────────────
+# `is_introspection_command` only covers Bash command strings. It cannot see
+# the assistant's own prose (scanned by the Stop hook) or arbitrary content
+# written to non-Bash tools. Those paths legitimately reproduce the whole
+# banned-word list whenever a message is *about* the machinery — an analysis
+# report, a mechanism explanation, or an echo of the loaded style guide. When
+# that happens the naive scan bumps every counter at once (the "all 12 at the
+# same timestamp" pattern). Two signals mark such reproduction so the hooks
+# skip both the block and the counter-bump:
+#
+#   1. Density — natural prose does not trip a large fraction of the entire
+#      list in a single message; a reproduction trips nearly all of it.
+#   2. Self-reference — the text names the machinery itself (the counter-state
+#      file, the guide, the library module, or the report header).
+DENSITY_MIN_STEMS = 6
+SELF_REFERENCE_MARKERS = (
+    "Counter state:",
+    "forbidden-word-counts.json",
+    "forbidden-words.md",
+    "banned_words_lib",
+)
+
+
+def is_guide_reproduction(text: str, distinct_stem_count: int) -> bool:
+    """True when `text` reproduces the banned-word list/machinery rather than
+    using the words in prose. See the DENSITY_MIN_STEMS / SELF_REFERENCE_MARKERS
+    note above. Callers pass the distinct-stem count they already computed from
+    `find_violations`, so this stays a pure decision with no re-scan.
+    """
+    if distinct_stem_count >= DENSITY_MIN_STEMS:
+        return True
+    return any(marker in text for marker in SELF_REFERENCE_MARKERS)
+
+
 class Violation(NamedTuple):
     stem: str
     match: str
@@ -56,7 +91,8 @@ class Violation(NamedTuple):
     line: str
 
 
-class CounterRecord(NamedTuple):
+@dataclass(frozen=True)
+class CounterRecord:
     count: int
     last_triggered_at: str | None
 
@@ -74,7 +110,8 @@ def _style_guide_counters() -> dict[str, int]:
         return {}
     out: dict[str, int] = {}
     pattern = re.compile(r'^###\s+"([^"]+)".*?\bcounter:\s*(\d+)', re.MULTILINE)
-    for stem, raw_count in pattern.findall(guide):
+    matches = cast("list[tuple[str, str]]", pattern.findall(guide))
+    for stem, raw_count in matches:
         out[stem] = int(raw_count)
     return out
 
@@ -87,49 +124,57 @@ def _trigger_timestamp() -> str:
     return datetime.now().astimezone().isoformat(timespec="seconds")
 
 
+def _coerce_int(value: object) -> int | None:
+    """Best-effort int from untrusted JSON. `bool` is rejected (it would parse
+    as 0/1 and silently corrupt a count); `int`/`str`/`float` are accepted."""
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, (str, float)):
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return None
+    return None
+
+
 def _normalize_counter_records(raw: object) -> dict[str, CounterRecord]:
     if not isinstance(raw, dict):
         return {}
+    raw_dict = cast("dict[str, object]", raw)
 
-    if isinstance(raw.get("words"), dict):
-        source = raw["words"]
-    else:
-        source = raw
+    words = raw_dict.get("words")
+    source = cast("dict[str, object]", words) if isinstance(words, dict) else raw_dict
 
     out: dict[str, CounterRecord] = {}
     for key, value in source.items():
-        if not isinstance(key, str):
-            continue
         if isinstance(value, dict):
-            count_value = value.get("count")
-            timestamp_value = value.get("last_triggered_at")
+            value_dict = cast("dict[str, object]", value)
+            count_value = value_dict.get("count")
+            timestamp_value: object = value_dict.get("last_triggered_at")
         else:
             count_value = value
             timestamp_value = _initial_timestamp()
 
-        try:
-            count = int(count_value)
-        except (TypeError, ValueError):
+        count = _coerce_int(count_value)
+        if count is None or count < 0:
             continue
-        if count >= 0:
-            timestamp = timestamp_value if isinstance(timestamp_value, str) else None
-            out[key] = CounterRecord(count=count, last_triggered_at=timestamp)
+        timestamp = timestamp_value if isinstance(timestamp_value, str) else None
+        out[key] = CounterRecord(count=count, last_triggered_at=timestamp)
     return out
 
 
 def load_counter_records() -> dict[str, CounterRecord]:
     try:
-        raw = json.loads(COUNTER_STATE.read_text())
+        raw: object = json.loads(COUNTER_STATE.read_text())  # pyright: ignore[reportAny]
     except (OSError, json.JSONDecodeError):
         return {}
     return _normalize_counter_records(raw)
 
 
 def load_counters() -> dict[str, int]:
-    return {
-        stem: record.count
-        for stem, record in load_counter_records().items()
-    }
+    return {stem: record.count for stem, record in load_counter_records().items()}
 
 
 @contextmanager
@@ -159,8 +204,8 @@ def _write_counter_records(records: dict[str, CounterRecord]) -> None:
     }
     text = json.dumps(payload, indent=2, sort_keys=True) + "\n"
     tmp_path = COUNTER_STATE.with_name(f".{COUNTER_STATE.name}.{os.getpid()}.tmp")
-    tmp_path.write_text(text)
-    tmp_path.replace(COUNTER_STATE)
+    _ = tmp_path.write_text(text)
+    _ = tmp_path.replace(COUNTER_STATE)
 
 
 def format_counter_totals(records: dict[str, CounterRecord]) -> str:
@@ -286,7 +331,7 @@ def bump_counters(stems: Iterable[str]) -> dict[str, CounterRecord]:
         records = load_counter_records()
         legacy = _style_guide_counters()
         for stem, count in legacy.items():
-            records.setdefault(
+            _ = records.setdefault(
                 stem,
                 CounterRecord(count=count, last_triggered_at=_initial_timestamp()),
             )
@@ -417,4 +462,5 @@ def _main() -> int:
 
 if __name__ == "__main__":
     import sys
+
     sys.exit(_main())

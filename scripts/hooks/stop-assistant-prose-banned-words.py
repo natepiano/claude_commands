@@ -16,7 +16,13 @@ from pathlib import Path
 from typing import TypedDict, cast
 
 sys.path.insert(0, str(Path(__file__).parent))
-from banned_words_lib import COUNTER_STATE, bump_counters, find_violations, format_counter_totals
+from banned_words_lib import (
+    COUNTER_STATE,
+    bump_counters,
+    find_violations,
+    format_counter_totals,
+    is_guide_reproduction,
+)
 
 
 class StopPayload(TypedDict, total=False):
@@ -53,6 +59,12 @@ def main() -> None:
             stems_in_order.append(v.stem)
             lines_by_stem[v.stem] = []
         lines_by_stem[v.stem].append(v.line_no)
+
+    # Skip messages that reproduce the banned-word list/machinery (analysis
+    # reports, mechanism explanations, echoes of the loaded guide) so a single
+    # such message does not bump every counter at once.
+    if is_guide_reproduction(text, len(stems_in_order)):
+        sys.exit(0)
 
     bumped = bump_counters(stems_in_order)
     parts = [

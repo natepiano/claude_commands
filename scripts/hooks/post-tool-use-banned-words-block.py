@@ -14,7 +14,12 @@ from pathlib import Path
 from typing import TypedDict, cast
 
 sys.path.insert(0, str(Path(__file__).parent))
-from banned_words_lib import STYLE_GUIDE, find_violations, is_introspection_command
+from banned_words_lib import (
+    STYLE_GUIDE,
+    find_violations,
+    is_guide_reproduction,
+    is_introspection_command,
+)
 
 
 class EditEntry(TypedDict, total=False):
@@ -129,6 +134,11 @@ def main() -> None:
             stems_in_order.append(v.stem)
             lines_by_stem[v.stem] = []
         lines_by_stem[v.stem].append(v.line_no)
+
+    # Skip content that reproduces the banned-word list/machinery so it does
+    # not block on its own self-reference.
+    if is_guide_reproduction(text, len(stems_in_order)):
+        sys.exit(0)
 
     parts = [
         f"{stem} (line{'s' if len(lines_by_stem[stem]) > 1 else ''} {', '.join(str(n) for n in lines_by_stem[stem])})"
