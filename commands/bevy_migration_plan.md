@@ -26,7 +26,8 @@ Analyzes your codebase against official Bevy migration guides using a two-pass p
 **STEP 4:** Execute <Pass1_ApplicabilityFilter/>
 **STEP 5:** Execute <Pass2_DetailedAnalysis/>
 **STEP 6:** Execute <MergeMigrationPlan/>
-**STEP 7:** Execute <PresentResults/>
+**STEP 7:** Execute <ExcludeMigrationPlan/>
+**STEP 8:** Execute <PresentResults/>
 
 </ExecutionSteps>
 
@@ -717,6 +718,24 @@ The following [X] guides from Bevy ${VERSION} do not apply to this codebase.
 **Note:** The final TODO update happens in PresentResults after displaying the summary.
 
 </MergeMigrationPlan>
+
+---
+
+<ExcludeMigrationPlan>
+
+**Exclude the generated migration plan from git tracking:**
+
+The migration plan is a generated artifact specific to one migration and should not be committed. Run the exclude script so the plan is added to `.git/info/exclude` (local-only, never shows up in `git status`).
+
+The exclude script resolves the git repository from its working directory, so run it from inside `${CODEBASE}` and pass the path relative to the repo root:
+
+```bash
+(cd "${CODEBASE}" && bash ~/.claude/scripts/exclude/exclude.sh ".claude/bevy_migration/bevy-${VERSION}-migration-plan.md")
+```
+
+Report the script's output (e.g. `EXCLUDED: ...` or `ALREADY_EXCLUDED: ...`) to the user.
+
+</ExcludeMigrationPlan>
 
 ---
 
