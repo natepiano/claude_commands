@@ -9,11 +9,7 @@ set -euo pipefail
 echo "=== Git Status Check ==="
 
 BRANCH=$(git rev-parse --abbrev-ref HEAD)
-if [[ "$BRANCH" == "main" ]]; then
-  echo "  Branch: main ✓"
-else
-  echo "  Branch: $BRANCH (hotfix mode) ✓"
-fi
+echo "  Branch: $BRANCH ✓"
 
 STATUS=$(git status --porcelain)
 if [[ -n "$STATUS" ]]; then

@@ -10,7 +10,9 @@ Perform a release for any Rust crate or workspace project.
 - `/release X.Y.Z-rc.N` - Release as RC version (e.g., `0.18.0-rc.1`)
 - `/release X.Y.Z dry-run` - Rehearse release without mutations
 
-**Hotfix mode**: Auto-detected when the current branch is not `main`. Skips steps that modify main (README updates, branch creation, unreleased restore, dev version bump) and adds a post-release cherry-pick cleanup step.
+**Releasing from a non-`main` branch**: When the current branch is not `main`, the branch alone can't say whether it's a hotfix or an isolated release, so STEP 1 asks which mode applies:
+- **Hotfix mode** — a fix branched off an old release tag. Finalizes and publishes from the current branch, then cherry-picks the fix back to main (STEP 12). The branch is a fire-and-forget record.
+- **Isolated branch release** — the current branch is the future mainline (e.g. a Bevy-update branch you'll merge to main yourself later). Runs the full normal-mode sequence rooted on the current branch in place of main: finalizes there, cuts a `release-X.Y.Z` snapshot off it, publishes, then restores `[Unreleased]` and bumps the branch to the next `-dev`. **Main is never touched and nothing is cherry-picked.**
 
 **If `$ARGUMENTS` is empty or `help`**: First read `.claude/config/release.toml` if it exists and display the progress checklist (with config-aware sub-items), then display the usage block above, then stop. Do not proceed with any release steps beyond displaying the checklist and usage.
 
@@ -29,7 +31,8 @@ All projects use a **branch-first release model**:
 - **release branches**: Created BEFORE publishing, contain actual release versions
 - **Publishing**: Always happens from release branches, never from main
 - **No merge back**: Release branches are fire-and-forget snapshots
-- **Hotfix releases**: When releasing from a non-main branch (e.g., a branch based on a previous release tag), the command auto-detects hotfix mode. Changes are published from the current branch, then cherry-picked back to main with user verification before the hotfix branch is cleaned up.
+- **Hotfix releases**: When releasing from a non-main branch (e.g., a branch based on a previous release tag), STEP 1 offers hotfix mode. Changes are published from the current branch, then cherry-picked back to main with user verification before the hotfix branch is cleaned up.
+- **Isolated branch releases**: When releasing from a branch that will later merge to main (not a hotfix), STEP 1 offers isolated mode. The whole model above applies with the current branch playing main's role: it keeps the `-dev` version and `[Unreleased]` section, and a fire-and-forget `release-X.Y.Z` snapshot is cut from it. Main is left untouched — you merge the branch when ready.
 
 ## Configuration
 
@@ -96,7 +99,7 @@ Named checkpoints are defined at key points in the release sequence. The config 
 Available checkpoints:
 - `quality_checks_complete` — after pre-release validation passes
 - `readmes_updated` — after README changes committed
-- `changelogs_finalized` — after changelogs finalized on main
+- `changelogs_finalized` — after changelogs finalized on `${BASE_BRANCH}`
 - `branch_created` — after release branch exists
 - `versions_bumped` — after version bump commit
 - `pre_publish` — before any crate is published
@@ -191,6 +194,28 @@ This applies to ALL bash commands and script invocations in this process.
 ═══════════════════════════════════════════════════════════════
 ```
 
+**Example isolated branch release:**
+```
+═══════════════════════════════════════════════════════════════
+        ISOLATED BRANCH RELEASE ${VERSION} - PROGRESS
+              (base branch: ${BASE_BRANCH})
+═══════════════════════════════════════════════════════════════
+[ ] STEP 0:  Argument Validation
+[ ] STEP 1:  Project Discovery
+[ ] STEP 2:  Pre-Release Validation
+[ ] STEP 3:  Update READMEs (on ${BASE_BRANCH})
+[ ] STEP 4:  Finalize Changelogs and Bump Versions (on ${BASE_BRANCH})
+[ ] STEP 5:  Create Release Branch
+[ ] STEP 6:  Publish to crates.io
+[ ] STEP 7:  Push Release Branch and Tag
+[ ] STEP 8:  Create GitHub Release
+[ ] STEP 9:  Post-Release Verification
+[ ] STEP 10: Restore [Unreleased] Sections (on ${BASE_BRANCH})
+[ ] STEP 11: Bump to Next Dev Version (on ${BASE_BRANCH})
+═══════════════════════════════════════════════════════════════
+```
+Same sequence as normal mode, but every "on main" step runs on `${BASE_BRANCH}` and main is never modified. There is no STEP 12.
+
 **BEFORE EACH STEP**: Re-render the full checklist showing:
 - `[x]` for completed steps (and their sub-items)
 - `[>]` for the step about to start
@@ -208,13 +233,15 @@ This applies to ALL bash commands and script invocations in this process.
 
     Display <ProgressBehavior/> full list (requires project discovery to have completed first), then proceed:
 
-    **If normal mode (on main):**
+    **If normal mode (on `main`) or isolated branch release (on your branch):**
+
+    These two modes run the identical sequence; only the base branch differs. `${BASE_BRANCH}` is `main` in normal mode and your current branch in isolated mode. In isolated mode, main is never modified.
 
     **STEP 2:** Execute <PreReleaseChecks/>
     → Checkpoint: `quality_checks_complete`
-    **STEP 3:** Execute <UpdateReadmesOnMain/>
+    **STEP 3:** Execute <UpdateReadmesOnBase/>
     → Checkpoint: `readmes_updated`
-    **STEP 4:** Execute <FinalizeOnMain/>
+    **STEP 4:** Execute <FinalizeOnBase/>
     → Checkpoint: `changelogs_finalized`
     **STEP 5:** Execute <CreateReleaseBranch/>
     → Checkpoint: `branch_created`
@@ -310,9 +337,20 @@ git remote get-url origin | sed 's|.*github.com[:/]||;s|\.git$||'
 ```bash
 git branch --show-current
 ```
-- If branch is `main`: **normal mode**
+- If branch is `main`: **normal mode**. Set `${BASE_BRANCH}` to `main`.
 - If branch starts with `release-`: **possible stale release branch** — warn the user: "You are on branch `${BRANCH}` which looks like an existing release branch. Are you sure this is a hotfix? Type **yes** to continue in hotfix mode or **no** to abort." Stop if user says no.
-- If branch is anything else: **hotfix mode** — set `${HOTFIX_MODE}` to `true` and `${HOTFIX_BRANCH}` to the branch name
+- If branch is anything else: **ask which mode applies** — the branch alone can't distinguish a hotfix from an isolated release, so present both with their behavior and let the user choose:
+
+  > You're on branch `${BRANCH}`, not `main`. Which kind of release is this?
+  >
+  > **hotfix** — a fix branched off an old release tag. I finalize and publish from this branch, then cherry-pick the fix back onto main (with your verification). The branch stays as a fire-and-forget record. Pick this to patch an already-released version without pulling in main's newer work.
+  >
+  > **isolated** — this branch is the future mainline (e.g. a Bevy-update branch you'll merge to main yourself later). I run the full release here exactly as on main: finalize, cut a `release-${VERSION}` snapshot, publish, then restore `[Unreleased]` and bump this branch to the next `-dev`. **Main is never touched and nothing is cherry-picked.** Pick this when the release must not modify main at all.
+  >
+  > Type **hotfix** or **isolated**.
+
+  - If **hotfix**: set `${HOTFIX_MODE}` to `true` and `${HOTFIX_BRANCH}` to the branch name.
+  - If **isolated**: set `${ISOLATED_MODE}` to `true` and `${BASE_BRANCH}` to the current branch name. The release follows the normal-mode step sequence with `${BASE_BRANCH}` substituted for `main` everywhere.
 
 **Display discovered project info:**
 ```
@@ -321,12 +359,12 @@ Type: single crate | workspace
 Crates: ${CRATE_LIST}
 Config: found | using defaults
 Dry-run: yes | no
-Mode: normal | hotfix (from branch: ${HOTFIX_BRANCH})
+Mode: normal | hotfix (from branch: ${HOTFIX_BRANCH}) | isolated (base branch: ${BASE_BRANCH})
 ```
 </ProjectDiscovery>
 
 <PreReleaseChecks>
-## STEP 2: Pre-Release Validation (on main)
+## STEP 2: Pre-Release Validation
 
 **Run pre-release checks** (with `dangerouslyDisableSandbox: true`):
 ```bash
@@ -338,10 +376,10 @@ Mode: normal | hotfix (from branch: ${HOTFIX_BRANCH})
 **Note**: This script is read-only — runs the same in dry-run mode.
 </PreReleaseChecks>
 
-<UpdateReadmesOnMain>
-## STEP 3: Update READMEs (on main)
+<UpdateReadmesOnBase>
+## STEP 3: Update READMEs (on ${BASE_BRANCH})
 
-**IMPORTANT**: This step happens on main BEFORE creating the release branch. This ensures README updates are on main and included in the release branch.
+**IMPORTANT**: This step happens on `${BASE_BRANCH}` BEFORE creating the release branch. This ensures README updates are on `${BASE_BRANCH}` and included in the release branch.
 
 **Only published READMEs matter here.** The root `README.md` in a workspace is NOT published to crates.io — only per-crate READMEs ship with `cargo publish`.
 
@@ -361,17 +399,17 @@ Mode: normal | hotfix (from branch: ${HOTFIX_BRANCH})
   - Type **continue** to proceed
   - Type **skip** if no README changes needed
 
-**If changes were made, commit on main** (skip commit in dry-run mode):
+**If changes were made, commit on `${BASE_BRANCH}`** (skip commit in dry-run mode):
 ```bash
 git add ${CHANGED_README_FILES}
 git commit -m "docs: update compatibility tables for v${VERSION}"
 ```
-</UpdateReadmesOnMain>
+</UpdateReadmesOnBase>
 
-<FinalizeOnMain>
-## STEP 4: Finalize Changelogs and Bump Versions (on main)
+<FinalizeOnBase>
+## STEP 4: Finalize Changelogs and Bump Versions (on ${BASE_BRANCH})
 
-**This step creates the clean version commit on main before branching.**
+**This step creates the clean version commit on `${BASE_BRANCH}` before branching.**
 
 ### Verify Changelog Entries
 
@@ -434,7 +472,7 @@ git commit -m "${VERSION}"
 ```
 
 This produces a clean commit label visible in GitHub's file list for both CHANGELOG.md and Cargo.toml.
-</FinalizeOnMain>
+</FinalizeOnBase>
 
 <CreateReleaseBranch>
 ## STEP 5: Create Release Branch
@@ -446,7 +484,7 @@ This produces a clean commit label visible in GitHub's file list for both CHANGE
 
 → Report the script output to the user.
 
-**Note**: All subsequent steps happen on this release branch. Main is done — it already has the finalized changelogs and bumped versions.
+**Note**: All subsequent steps happen on this release branch (cut from `${BASE_BRANCH}`). `${BASE_BRANCH}` is done for now — it already has the finalized changelogs and bumped versions; STEP 10 and 11 return to it at the end.
 </CreateReleaseBranch>
 
 <PublishPhases>
@@ -603,23 +641,23 @@ cargo install ${INSTALL_CRATE_NAME} --version "${VERSION}"
 <RestoreUnreleasedSections>
 ## STEP 10: Restore [Unreleased] Sections
 
-**This step always runs** — after STEP 4 finalized the changelogs on main, they need `[Unreleased]` sections added back.
+**This step always runs** (normal and isolated modes) — after STEP 4 finalized the changelogs on `${BASE_BRANCH}`, they need `[Unreleased]` sections added back. The script checks out `${BASE_BRANCH}`, restores the sections, commits, and pushes `${BASE_BRANCH}`.
 
 **Run restore:**
 ```bash
-~/.claude/scripts/release/restore_unreleased.sh ${VERSION} ${DRY_RUN_FLAG} ${ALL_CHANGELOG_FILES}
+~/.claude/scripts/release/restore_unreleased.sh ${VERSION} ${DRY_RUN_FLAG} --base-branch ${BASE_BRANCH} ${ALL_CHANGELOG_FILES}
 ```
 
 → Report the script output to the user.
 </RestoreUnreleasedSections>
 
 <BumpToNextDev>
-## STEP 11: Restore Dev Version on Main
+## STEP 11: Restore Dev Version on ${BASE_BRANCH}
 
-**This step always runs.** Step 4 set versions to the release version on main before branching. Main must be restored to a dev version.
+**This step always runs** (normal and isolated modes). Step 4 set versions to the release version on `${BASE_BRANCH}` before branching. `${BASE_BRANCH}` must be restored to a dev version.
 
 **Determine the dev version to restore:**
-- **Patch release** (`/release patch`): Restore the dev version that was on main *before* Step 4 changed it. This is the version from the commit prior to the changelog/version bump commit. Check `git show HEAD~1:${FIRST_VERSION_FILE}` to find it. If it was already a dev version (e.g., `0.19.0-dev`), use that. If it wasn't (indicating a prior release also missed this step), determine the correct next dev version as below.
+- **Patch release** (`/release patch`): Restore the dev version that was on `${BASE_BRANCH}` *before* Step 4 changed it. This is the version from the commit prior to the changelog/version bump commit. Check `git show HEAD~1:${FIRST_VERSION_FILE}` to find it. If it was already a dev version (e.g., `0.19.0-dev`), use that. If it wasn't (indicating a prior release also missed this step), determine the correct next dev version as below.
 - **Minor/major release** (e.g., `0.18.0`): Next dev is `X.Y+1.0-dev`
 - **RC release** (e.g., `0.18.0-rc.1`): Next dev is `X.Y.Z-dev`
 
@@ -653,12 +691,12 @@ sed -i'' "s/bevy_brp_mcp_macros = \".*\"/bevy_brp_mcp_macros = \"${NEXT_DEV_VERS
 ```bash
 git add ${ALL_VERSION_FILES} Cargo.toml Cargo.lock
 git commit -m "chore: bump to ${NEXT_DEV_VERSION}"
-git push origin main
+git push origin ${BASE_BRANCH}
 ```
 
 → Report the script output to the user.
 
-**Release complete!** All crates published from release branch. Release branch is fire-and-forget. Main now at next dev version.
+**Release complete!** All crates published from release branch. Release branch is fire-and-forget. `${BASE_BRANCH}` now at next dev version. In isolated mode, main was never touched — merge `${BASE_BRANCH}` into main yourself when ready.
 </BumpToNextDev>
 
 <FinalizeOnHotfixBranch>
@@ -823,7 +861,7 @@ If already published to crates.io, you cannot unpublish. Release a new patch ver
 1. **"Version already exists"**: Already published on crates.io
 2. **"Version gap"**: Skipped a version number — use the next sequential version
 3. **"Uncommitted changes"**: Run `git status` and commit or stash changes
-4. **"Not on main branch"**: Hotfix mode is auto-detected — if intentional, proceed. If not, switch to main with `git checkout main`
+4. **"Not on main branch"**: Releasing from a non-main branch makes STEP 1 prompt for **hotfix** vs **isolated** mode — if intentional, pick the right mode. If not, switch to main with `git checkout main`
 5. **Build failures**: Fix compilation errors before releasing
 6. **Workspace dependency ordering**: If publish fails due to dependency ordering, add `[[publish_phases]]` to `.claude/config/release.toml`
 7. **crates.io indexing delay**: If a later phase fails because a just-published crate isn't indexed yet, increase `wait_seconds` in the config
