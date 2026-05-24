@@ -1,6 +1,6 @@
 # Style Report Summary
 
-Show style guide history and reporting derived from nightly style runs.
+Show style guide history and reporting derived from clean-fix style runs.
 
 **Arguments**: `$ARGUMENTS` — optional flags passed to `style_report.py`
 
@@ -9,7 +9,7 @@ Show style guide history and reporting derived from nightly style runs.
 Run the summary script and display its output:
 
 ```bash
-python3 ~/.claude/scripts/nightly/style_report.py $ARGUMENTS
+python3 ~/.claude/scripts/clean-fix/style_report.py $ARGUMENTS
 ```
 
 Available flags:

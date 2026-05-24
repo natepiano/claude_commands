@@ -29,20 +29,20 @@ If you need exact style file paths for citations, run:
 zsh ~/.claude/scripts/load-rust-style.sh --list-files --project-root "$ARGUMENTS"
 ```
 
-## Step 1.5: Use the nightly selection helper
+## Step 1.5: Use the clean-fix selection helper
 
-If no pending run exists yet (i.e. `next-unit` errors with "No pending run for ..."), initialize one first. The budget is the configured `[style_eval] max_new_findings` in `~/.claude/scripts/nightly/nightly-rust.conf`; `next-unit` stops once `EVALUATION.md` contains that many numbered findings.
+If no pending run exists yet (i.e. `next-unit` errors with "No pending run for ..."), initialize one first. The budget is the configured `[style_eval] max_new_findings` in `~/.claude/scripts/clean-fix/clean-fix.conf`; `next-unit` stops once `EVALUATION.md` contains that many numbered findings.
 
 ```bash
-python3 ~/.claude/scripts/nightly/style_history.py start-run --project-root "$ARGUMENTS"
+python3 ~/.claude/scripts/clean-fix/style_history.py start-run --project-root "$ARGUMENTS"
 ```
 
-The nightly (`style-eval-all.sh`) calls `start-run` itself, so this is only needed for ad-hoc agent invocations.
+The clean-fix (`style-eval-all.sh`) calls `start-run` itself, so this is only needed for ad-hoc agent invocations.
 
 You must pull evaluation units one at a time from:
 
 ```bash
-python3 ~/.claude/scripts/nightly/style_history.py next-unit --project-root "$ARGUMENTS"
+python3 ~/.claude/scripts/clean-fix/style_history.py next-unit --project-root "$ARGUMENTS"
 ```
 
 The helper returns JSON.
@@ -59,7 +59,7 @@ Rules:
 After reviewing a unit, you must record its result immediately with:
 
 ```bash
-python3 ~/.claude/scripts/nightly/style_history.py record-unit \
+python3 ~/.claude/scripts/clean-fix/style_history.py record-unit \
     --project-root "$ARGUMENTS" \
     --results "/tmp/style-eval-results-$(basename "$ARGUMENTS").json" \
     --eval-path "$ARGUMENTS/EVALUATION.md"
@@ -67,9 +67,9 @@ python3 ~/.claude/scripts/nightly/style_history.py record-unit \
 
 **Ordering rule for findings:** if the unit produced a finding, append it under `## Improvements` in `EVALUATION.md` **before** calling `record-unit`. `record-unit` re-reads EVALUATION.md and refuses to record a finding whose guideline is not present there.
 
-The results path **must** be project-scoped (`/tmp/style-eval-results-<project>.json`). The nightly launches up to 4 codex evals in parallel, all writing to `/tmp`; a shared results file would clobber other agents' in-flight results. Always use `$(basename "$ARGUMENTS")` to derive the path so each agent has its own.
+The results path **must** be project-scoped (`/tmp/style-eval-results-<project>.json`). The clean-fix launches up to 4 codex evals in parallel, all writing to `/tmp`; a shared results file would clobber other agents' in-flight results. Always use `$(basename "$ARGUMENTS")` to derive the path so each agent has its own.
 
-The results JSON for a unit with no finding must have this shape:
+The results JSON for a unit with no finding must look like this:
 
 ```json
 {
@@ -117,7 +117,7 @@ The worktree evaluation path for this project is: `$WORKTREE_EVAL_PATH`
 
 If the line above shows a real filesystem path, check whether that file exists.
 
-If the line above shows the literal string `$WORKTREE_EVAL_PATH` (i.e. no substitution was made, because this command was invoked directly rather than via the nightly), derive the path instead: take the project directory name, append `_style_fix`, and check for `EVALUATION.md` there. For example, if `$ARGUMENTS` is `~/rust/my_project`, check `~/rust/my_project_style_fix/EVALUATION.md`.
+If the line above shows the literal string `$WORKTREE_EVAL_PATH` (i.e. no substitution was made, because this command was invoked directly rather than via the clean-fix), derive the path instead: take the project directory name, append `_style_fix`, and check for `EVALUATION.md` there. For example, if `$ARGUMENTS` is `~/rust/my_project`, check `~/rust/my_project_style_fix/EVALUATION.md`.
 
 If that file exists, read it. These findings are already being addressed in a style-fix branch. When evaluating in Step 4, **do not re-discover** any finding that matches a worktree finding by title or by the same style rule applied to the same files. This prevents duplicate work between the primary evaluation and the in-progress worktree fixes.
 
@@ -230,7 +230,7 @@ Do NOT include an "Overall Assessment" section — just list the findings.
 
 Requirements for each finding:
 - Rank by impact: most violations / most deviation from the guide comes first
-- **Locations must enumerate every site that violates the rule project-wide.** Before writing the finding, name the abstract pattern the rule covers (not the first example you found), run a project-wide search for that pattern, and list every match. A finding scoped to one cluster of sites — when other sites elsewhere violate the same rule — is a defective finding, not a partial one. The next nightly will re-flag the same guideline instead of clearing it.
+- **Locations must enumerate every site that violates the rule project-wide.** Before writing the finding, name the abstract pattern the rule covers (not the first example you found), run a project-wide search for that pattern, and list every match. A finding scoped to one cluster of sites — when other sites elsewhere violate the same rule — is a defective finding, not a partial one. The next clean-fix will re-flag the same guideline instead of clearing it.
 - **`Surface searched` and `Search` are required fields** alongside `Locations`. The Search line must contain the literal command(s) you ran (not "I searched") and the resulting match count. `len(Locations)` must equal that match count. A finding without these fields, or with a Locations count that disagrees with the Search count, is malformed.
 - If the guideline file contains a `### Surface` section, copy or paraphrase it into the `Surface searched` field — the rule's own surface is the source of truth, not your interpretation of the rule's lead example.
 - Be actionable: someone should be able to act on each item without re-reading the style guide
@@ -239,7 +239,7 @@ Requirements for each finding:
 
 ## Step 6: If `--fix` was passed, launch the style-fix worktree
 
-Skip this step entirely if `--fix` is not in the original arguments — `/style_eval` ends at Step 5. The nightly never passes `--fix`, so its behavior is unchanged.
+Skip this step entirely if `--fix` is not in the original arguments — `/style_eval` ends at Step 5. The clean-fix never passes `--fix`, so its behavior is unchanged.
 
 If `--fix` was passed, you are running interactively and the user is waiting on the fix to finish. The fix takes 10–20 minutes; do all of the following without narration in between so the user hits a single "running, you'll be notified" message instead of two.
 
@@ -248,7 +248,7 @@ If `--fix` was passed, you are running interactively and the user is waiting on 
 2. Compute the log path deterministically — do not wait to read it from stdout:
 
    ```
-   LOG_PATH=$HOME/.local/logs/nightly/style-fix-manual-$(date '+%Y%m%d-%H%M%S').log
+   LOG_PATH=$HOME/.local/logs/clean-fix/style-fix-manual-$(date '+%Y%m%d-%H%M%S').log
    ```
 
    The manual launcher names its log using `date '+%Y%m%d-%H%M%S'` taken at invocation time, so as long as you compute the same expression in the same shell second the path matches. (You can verify after the fact by reading the launcher's first stdout line.)
@@ -258,13 +258,13 @@ If `--fix` was passed, you are running interactively and the user is waiting on 
    a. Run the foreground launcher via Bash with `run_in_background: true` + `dangerouslyDisableSandbox: true` (codex needs unsandboxed):
 
       ```bash
-      ~/.claude/scripts/nightly/style-fix-manual.sh --foreground "$(basename "$ARGUMENTS")"
+      ~/.claude/scripts/clean-fix/style-fix-manual.sh --foreground "$(basename "$ARGUMENTS")"
       ```
 
-   b. Arm a `Monitor` on the manual log file in the same response. Use the Python helper at `~/.claude/scripts/nightly/style-fix-monitor.py` — it tails both the manual log (latest `~/.local/logs/nightly/style-fix-manual-*.log`) and the agent's own log under `/private/tmp/claude/style_fix_<project>.log`, emits matching lines (the `[progress …]` orchestrator phases plus the agent's phase sentinels translated to `phase=agent-step name=<...>`, cargo/clippy/test markers, and compiler errors — so you see real activity, not just the 60s heartbeat), and exits 0 the moment the orchestrator writes its `phase=launcher-exit` sentinel. Use:
+   b. Arm a `Monitor` on the manual log file in the same response. Use the Python helper at `~/.claude/scripts/clean-fix/style-fix-monitor.py` — it tails both the manual log (latest `~/.local/logs/clean-fix/style-fix-manual-*.log`) and the agent's own log under `/private/tmp/claude/style_fix_<project>.log`, emits matching lines (the `[progress …]` orchestrator phases plus the agent's phase sentinels translated to `phase=agent-step name=<...>`, cargo/clippy/test markers, and compiler errors — so you see real activity, not just the 60s heartbeat), and exits 0 the moment the orchestrator writes its `phase=launcher-exit` sentinel. Use:
 
       ```bash
-      python3 ~/.claude/scripts/nightly/style-fix-monitor.py <project>
+      python3 ~/.claude/scripts/clean-fix/style-fix-monitor.py <project>
       ```
 
       The previous `tail -F | awk` pipeline used `system("pkill -f …")` to terminate the tail at launcher-exit, but inside the Claude Code sandbox `pkill` is denied access to macOS's `sysmond` process-list service and silently fails (exit 3, "Cannot get process list"). Job-control via `&` / `$!` is also broken in the sandbox, so capturing the tail's PID isn't an option either. The Python helper avoids both: no `tail` subprocess, no `pkill`, no shell job-control — just file reads and a regex match in the same process. The Monitor's last event is `phase=launcher-exit code=N` and the helper exits within ~1s — no manual TaskStop needed.

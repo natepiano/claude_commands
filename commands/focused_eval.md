@@ -1,5 +1,5 @@
 ---
-description: Ad hoc targeted style evaluation — check a directory scope against a specific subset of style guidelines (no nightly scheduler, no budget, no history writes)
+description: Ad hoc targeted style evaluation — check a directory scope against a specific subset of style guidelines (no clean-fix scheduler, no budget, no history writes)
 ---
 
 **IMPORTANT**: Do NOT modify any source code. This is a read-only evaluation.
@@ -30,10 +30,10 @@ Example:
 
 ## Step 1: Resolve the guidelines
 
-Run the read-only `focused-eval` helper — it does **not** touch the nightly scheduler's pending or history state:
+Run the read-only `focused-eval` helper — it does **not** touch the clean-fix scheduler's pending or history state:
 
 ```bash
-python3 ~/.claude/scripts/nightly/style_history.py focused-eval \
+python3 ~/.claude/scripts/clean-fix/style_history.py focused-eval \
     --project-root "<project-root>" \
     --guideline <guideline-1> \
     [--guideline <guideline-2> ...]
@@ -117,5 +117,5 @@ After the per-guideline sections, add one short closing paragraph only if the fi
 
 - **Read-only.** Never edit source. Never touch `style_history` beyond the one `focused-eval` call.
 - **No invented rules.** Only flag what the guideline's text supports.
-- **No budget.** The nightly scheduler is bypassed entirely; evaluate every requested guideline.
+- **No budget.** The clean-fix scheduler is bypassed entirely; evaluate every requested guideline.
 - **No EVALUATION.md.** This is ad hoc — findings live in chat, not on disk.

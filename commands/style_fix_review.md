@@ -2,7 +2,7 @@
 description: Review changes in a style-fix worktree against its EVALUATION.md findings
 ---
 
-**Context:** You are in a `_style_fix` worktree created by the nightly automation. The nightly pipeline:
+**Context:** You are in a `_style_fix` worktree created by the clean-fix automation. The clean-fix pipeline:
 1. Ran `/style_eval` on the main branch, producing `EVALUATION.md` with numbered findings
 2. Created this worktree on branch `refactor/style`
 3. Launched Claude to apply every finding, run clippy, and run tests
@@ -220,7 +220,7 @@ If the draft fails any of these, do not send — fix and re-scan.
 </ConcernFormat>
 
 <ReadEvaluation>
-**Locate `EVALUATION.md`.** It is **not** always at the worktree root. For workspace-member projects (e.g. a crate inside `bevy_hana/crates/<member>/`), the nightly launcher places `EVALUATION.md` inside the member's subdirectory, not at the worktree root. Standalone repos have it at the root.
+**Locate `EVALUATION.md`.** It is **not** always at the worktree root. For workspace-member projects (e.g. a crate inside `bevy_hana/crates/<member>/`), the clean-fix launcher places `EVALUATION.md` inside the member's subdirectory, not at the worktree root. Standalone repos have it at the root.
 
 Run this from the worktree root to find it — do not assume the path:
 
@@ -233,7 +233,7 @@ Expect exactly one match. If zero matches, stop and report that EVALUATION.md is
 Read the file at the path you found. It contains up to three parts:
 
 1. **Findings** — numbered style violations identified by `/style_eval`
-2. **Review Log** — appended by `/style_eval_review`, documenting which findings the review pass kept, improved, amended, or removed, and why
+2. **Review Log** — appended by the clean-fix style-eval-review stage, documenting which findings the review pass kept, improved, amended, or removed, and why
 3. **Fix Summary** — appended by the fix agent, documenting what it did, what it skipped, and why
 
 Start by reading the Fix Summary section at the bottom. This is the agent's account of what happened — applied / skipped / partially applied, plus issues encountered (build failures, pattern mismatches, style conflicts, etc.). Also look for **Cargo Mend Changes**, which documents automatic visibility/import fixes made by `cargo mend --fix`. Use this as your starting point: you'll verify these claims against the actual diff.

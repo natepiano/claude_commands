@@ -1,8 +1,13 @@
 #!/usr/bin/env bash
 # Ensure Bevy repository is cloned and migration guides are available.
 #
-# For RC versions: guides are in release-content/migration-guides/
+# For RC versions: guides ship in the repo. The containing directory was named
+#   release-content/migration-guides/ (<= 0.18) and renamed to
+#   _release-content/migration-guides/ (0.19+); both are detected.
 # For final releases: guides are fetched from bevy-website and split into files
+#
+# Prints the resolved migration-guides directory as the final stdout line;
+# all progress output goes to stderr.
 #
 # Usage: bevy_migration_ensure_repo.sh <version>
 # Example: bevy_migration_ensure_repo.sh 0.18.0
@@ -21,7 +26,6 @@ fi
 
 VERSION="$1"
 BEVY_REPO_DIR="${HOME}/rust/bevy-${VERSION}"
-GUIDES_DIR="${BEVY_REPO_DIR}/release-content/migration-guides"
 
 # Clone or update repository
 if [ -d "${BEVY_REPO_DIR}/.git" ]; then
@@ -34,13 +38,27 @@ else
     git clone --depth 1 --branch "v${VERSION}" https://github.com/bevyengine/bevy.git "${BEVY_REPO_DIR}"
 fi
 
-# Check if migration guides exist in repo (RC versions have them, final releases don't)
-GUIDE_COUNT=$(find "${GUIDES_DIR}" -maxdepth 1 -name "*.md" 2>/dev/null | wc -l | tr -d ' ')
+# Resolve the migration-guides directory. The containing dir was renamed from
+# release-content (<= 0.18) to _release-content (0.19+); detect whichever holds
+# guides. RC versions ship guides in the repo; final releases do not.
+GUIDES_DIR=""
+for candidate in \
+    "${BEVY_REPO_DIR}/release-content/migration-guides" \
+    "${BEVY_REPO_DIR}/_release-content/migration-guides"; do
+    if [ -d "${candidate}" ] \
+       && [ "$(find "${candidate}" -maxdepth 1 -name '*.md' 2>/dev/null | wc -l | tr -d ' ')" -ne 0 ]; then
+        GUIDES_DIR="${candidate}"
+        break
+    fi
+done
 
-if [ "${GUIDE_COUNT}" -eq 0 ]; then
+if [ -n "${GUIDES_DIR}" ]; then
+    GUIDE_COUNT=$(find "${GUIDES_DIR}" -maxdepth 1 -name "*.md" 2>/dev/null | wc -l | tr -d ' ')
+    echo "Found ${GUIDE_COUNT} migration guides in ${GUIDES_DIR}" >&2
+else
+    # Final releases ship no guides in the repo; fetch and split from bevy-website.
     echo "No migration guides in repo, fetching from bevy-website..." >&2
-
-    # Ensure the directory exists
+    GUIDES_DIR="${BEVY_REPO_DIR}/release-content/migration-guides"
     mkdir -p "${GUIDES_DIR}"
 
     # Use the split script to fetch and split the consolidated guide
@@ -55,8 +73,7 @@ if [ "${GUIDE_COUNT}" -eq 0 ]; then
         exit 1
     fi
     echo "Fetched ${GUIDE_COUNT} migration guides from bevy-website" >&2
-else
-    echo "Found ${GUIDE_COUNT} migration guides in repository" >&2
 fi
 
-echo "${BEVY_REPO_DIR}"
+# Final stdout line: the resolved migration-guides directory (callers capture this).
+echo "${GUIDES_DIR}"

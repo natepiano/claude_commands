@@ -56,7 +56,7 @@ The command receives `$ARGUMENTS` containing:
 VERSION = [first argument] (e.g., "0.17.1")
 CODEBASE = [second argument or $PWD] (e.g., "~/rust/my_game" or current directory)
 BEVY_REPO_DIR = ${HOME}/rust/bevy-${VERSION} (global, reusable across projects)
-GUIDES_DIR = ${BEVY_REPO_DIR}/release-content/migration-guides
+GUIDES_DIR = [resolved at clone time — captured from the final stdout line of bevy_migration_ensure_repo.sh in CloneRepository. The migration-guides directory moved from release-content/ (<= 0.18) to _release-content/ (0.19+), so do NOT hardcode it.]
 MIGRATION_PLAN = ${CODEBASE}/.claude/bevy_migration/bevy-${VERSION}-migration-plan.md
 ```
 
@@ -225,10 +225,13 @@ gh api repos/bevyengine/bevy/releases/tags/v${VERSION}
 
 <UpdateTodoProgress old_task="Validate Bevy version exists on GitHub" new_task="Clone Bevy repository (if needed)"/>
 
-**Clone repository if needed:**
+**Clone repository if needed (and resolve GUIDES_DIR):**
+
+The script prints the resolved migration-guides directory as its final stdout line. Capture it into `GUIDES_DIR` and use that literal path for the rest of the run — it may be `${BEVY_REPO_DIR}/release-content/migration-guides` (<= 0.18) or `${BEVY_REPO_DIR}/_release-content/migration-guides` (0.19+).
 
 ```bash
-~/.claude/scripts/bevy_migration_plan/bevy_migration_ensure_repo.sh "${VERSION}"
+GUIDES_DIR=$(~/.claude/scripts/bevy_migration_plan/bevy_migration_ensure_repo.sh "${VERSION}" | tail -1)
+echo "Resolved GUIDES_DIR: ${GUIDES_DIR}"
 ```
 
 **Verify migration guides exist:**

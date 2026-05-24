@@ -118,11 +118,50 @@ def get_workspace_members(codebase: Path) -> set[str]:
         return set()
 
 
+def run_cargo_tree(codebase: Path) -> str | None:
+    """
+    Run `cargo tree` for direct dependencies and return its stdout.
+
+    Tries `--all-features` first so optional / feature-gated dependencies are
+    included; without it, deps behind a non-default feature are invisible to
+    the tree. Falls back to the default feature set if `--all-features` fails
+    (e.g. mutually exclusive features). Returns None on error.
+    """
+    base_cmd = ['cargo', 'tree', '--depth=1', '--format', '{p}']
+
+    for extra_args in (['--all-features'], []):
+        try:
+            result = subprocess.run(
+                base_cmd + extra_args,
+                cwd=codebase,
+                capture_output=True,
+                text=True,
+                check=True
+            )
+            stdout: str = result.stdout
+            return stdout
+        except subprocess.CalledProcessError as e:
+            if extra_args:
+                # `--all-features` failed (likely conflicting features); retry
+                # with the default feature set.
+                continue
+            # stderr is str because we use text=True - stdlib types as Any
+            error_msg = e.stderr if isinstance(e.stderr, str) else str(e)  # pyright: ignore[reportAny]
+            print(f"Error running cargo tree: {error_msg}", file=sys.stderr)
+            return None
+        except FileNotFoundError:
+            print("Error: cargo not found. Make sure Rust is installed.", file=sys.stderr)
+            return None
+
+    return None
+
+
 def get_all_direct_dependencies(codebase: Path, bevy_version: str) -> list[tuple[str, str]]:
     """
     Run cargo tree to find all DIRECT dependencies (from Cargo.toml).
     Returns list of (crate_name, version) tuples, excluding bevy internal crates and workspace members.
-    Uses --depth=1 to only get direct dependencies, not transitive ones.
+    Uses --depth=1 to only get direct dependencies, not transitive ones, and
+    --all-features so optional dependencies are not missed.
     """
     # Get the definitive list of bevy internal crates
     internal_crates = get_bevy_internal_crates(bevy_version)
@@ -138,42 +177,26 @@ def get_all_direct_dependencies(codebase: Path, bevy_version: str) -> list[tuple
         'crossbeam', 'rayon', 'nalgebra', 'glam', 'bytemuck',
     }
 
-    try:
-        # Use --depth=1 to only get direct dependencies
-        result = subprocess.run(
-            ['cargo', 'tree', '--depth=1', '--format', '{p}'],
-            cwd=codebase,
-            capture_output=True,
-            text=True,
-            check=True
-        )
-
-        dependencies: set[tuple[str, str]] = set()
-
-        stdout: str = result.stdout
-        for line in stdout.splitlines():
-            # Extract crate name and version, handling tree characters (├──, │, etc.)
-            match = re.search(r'([a-zA-Z0-9_-]+)\s+v([0-9.]+)', line)
-            if match:
-                crate_name = match.group(1)
-                version = match.group(2)
-
-                # Exclude bevy internal crates, workspace members, and common utility crates
-                if (crate_name not in internal_crates
-                    and crate_name not in workspace_members
-                    and crate_name not in utility_crates):
-                    dependencies.add((crate_name, version))
-
-        return sorted(list(dependencies))
-
-    except subprocess.CalledProcessError as e:
-        # stderr is str because we use text=True - stdlib types as Any
-        error_msg = e.stderr if isinstance(e.stderr, str) else str(e)  # pyright: ignore[reportAny]
-        print(f"Error running cargo tree: {error_msg}", file=sys.stderr)
+    stdout = run_cargo_tree(codebase)
+    if stdout is None:
         return []
-    except FileNotFoundError:
-        print("Error: cargo not found. Make sure Rust is installed.", file=sys.stderr)
-        return []
+
+    dependencies: set[tuple[str, str]] = set()
+
+    for line in stdout.splitlines():
+        # Extract crate name and version, handling tree characters (├──, │, etc.)
+        match = re.search(r'([a-zA-Z0-9_-]+)\s+v([0-9.]+)', line)
+        if match:
+            crate_name = match.group(1)
+            version = match.group(2)
+
+            # Exclude bevy internal crates, workspace members, and common utility crates
+            if (crate_name not in internal_crates
+                and crate_name not in workspace_members
+                and crate_name not in utility_crates):
+                dependencies.add((crate_name, version))
+
+    return sorted(list(dependencies))
 
 
 def has_bevy_dependency(crate_name: str, version: str) -> bool:
