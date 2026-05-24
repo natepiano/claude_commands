@@ -21,9 +21,9 @@ Decide whether there is a working doc in this conversation — a file path the u
 Then ask **one** question, picking the form that matches the situation:
 
 - **A doc is already in scope:** name it.
-  > `N items. Record decisions in <relative/path/to/doc.md>? (yes / different path / none)`
+  > `N items. Record decisions in <relative/path/to/doc.md> (recommended)? (yes / different path / none)`
 - **No doc is in scope:** say so.
-  > `N items. No working doc in this conversation. Record decisions in a doc? (path to use / suggest one / none)`
+  > `N items. No working doc in this conversation. Record decisions in a doc? (suggest one (recommended) / path to use / none)`
 
 Rules:
 - Never use the placeholder phrase "existing path" — either name the doc or say there isn't one.
@@ -39,10 +39,11 @@ If a todo tool is available (e.g. `TaskCreate`), add one task per item, in order
 For each item, in order:
 
 1. Mark the task `in_progress`.
-2. **Quote the item verbatim.** Add context only if the item references something not contained in itself.
-3. **End with a short, clear prompt for feedback.** Pick one that matches the item — examples: `Keep, drop, or modify?` / `Skip or dig in?` / `Any thoughts?` / a question tailored to the item. Avoid one-word jargon prompts like `Take?` — terse is good, cryptic is not.
+2. **Lead with a high-level summary of the item** — one or two lines, concrete (name the file / type / change), enough to decide on without reading the full text. This is the coarsest level; deeper detail is revealed one notch at a time via `elaborate`, never as a wholesale dump of the raw item (which is usually too noisy to be useful).
+3. **Present the choices, and always mark one as recommended.** Pick a choice set that fits the item — `keep / drop / modify`, `approve / reject / redirect`, etc. — append `(recommended)` to exactly one option with a one-line reason, and always include `elaborate` as a choice. Terse is good, cryptic is not.
 4. **Wait for the user's response.** Do not move on until they reply.
-5. When they signal continue (any reply that isn't "stop" or "go back"), record the decision to the working doc if one is in scope, mark the task `completed`, and move to the next item.
+   - If the user picks `elaborate` (also: "more", "detail", "expand", "why"): take the *current* explanation and add exactly one notch more detail — do not jump to the full raw item, which is usually too verbose. Then re-present the same choices (still marking the recommendation). Do not advance. Each `elaborate` goes one level deeper, so the user can iteratively dig in as far as they want before making a terminal choice.
+5. When they make a terminal choice (any reply that isn't `elaborate`, "stop", or "go back"), record the decision to the working doc if one is in scope, mark the task `completed`, and move to the next item.
 
 Do not ask "continue or add more?" between items — assume continue unless the user volunteers something. Late additions before the next doc-write are captured naturally.
 
@@ -57,6 +58,8 @@ When every item is done:
 ## Rules
 
 - One item at a time. Never present two items in the same turn.
+- Default presentation is a high-level summary, not the full item. `elaborate` is always available and adds one notch more detail to the current explanation each time — progressive, never a wholesale dump of the raw item — then re-prompts.
+- Whenever you present discrete choices — here or in Step 2 — always mark exactly one as recommended with a one-line reason. Open prompts ("any thoughts?") are exempt.
 - Don't echo the user's feedback back to them unless asked — just record it.
 - If the user says skip, mark the task `cancelled` and move on. Don't argue.
 - If they want to revisit an earlier item, jump back. Don't insist on linear order.

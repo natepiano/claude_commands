@@ -15,9 +15,9 @@
 **STEP 1:** Execute <DetermineReviewScope/>
 **STEP 2:** Execute <LaunchExpertTeam/>
 **STEP 3:** Execute <SynthesizeFindings/>
-**STEP 4:** Execute <FindingsSummaryTable/> from @~/.claude/shared/findings_walkthrough.md
-**STEP 5:** Execute <FindingsWalkthrough/> from @~/.claude/shared/findings_walkthrough.md
-**STEP 6:** Execute <FindingsCompletion/> from @~/.claude/shared/findings_walkthrough.md
+**STEP 4:** Execute <EstablishWorkingDoc/>
+**STEP 5:** Execute <RecordMechanicalFindings/>
+**STEP 6:** Execute <SurfaceDecisions/>
 </ExecutionSteps>
 
 ---
@@ -78,8 +78,34 @@ Launch **3-5 agents in parallel** using the Agent tool, each with a distinct ana
 
 ---
 
-<TeamReviewContext>
-**Context for shared walkthrough:**
-- ${SOURCE_SUMMARY} = "Reviewed by ${N} expert agents"
-- Each finding's `source` field should name the expert dimension that identified it
-</TeamReviewContext>
+<EstablishWorkingDoc>
+**Goal:** One working doc holds both auto-recorded mechanical findings and the user's decisions.
+
+Default to `.claude/reviews/team-review-${brief-topic}.md`. Ask once:
+> `${TOTAL} findings (${M} mechanical, ${D} need a decision). Record everything in .claude/reviews/team-review-${brief-topic}.md (recommended), a different path, or none?`
+
+Create the file with a one-line header (today's date + ${REVIEW_TOPIC}). If the user picks `none`, ${WORKING_DOC} is unset and findings stay in conversation.
+</EstablishWorkingDoc>
+
+---
+
+<RecordMechanicalFindings>
+**Goal:** Record strictly mechanical findings into ${WORKING_DOC} with no prompt.
+
+A finding is **mechanical** only when its recommendation needs no judgment: one deterministic, low-risk action with a single correct outcome — a typo, a dead import, a naming-consistency rename, a formatting fix, a refactor with one valid result. Anything with a tradeoff, more than one valid approach, behavioral/API impact, or any risk is a **decision** (Step 6). When unsure, treat it as a decision.
+
+For each mechanical finding, append to ${WORKING_DOC} under a `## Mechanical (auto-recorded)` section: finding id, title, recommendation, marked accepted. Do not edit source code — this records the decision; applying it is a separate step. If ${WORKING_DOC} is unset, list them inline instead.
+</RecordMechanicalFindings>
+
+---
+
+<SurfaceDecisions>
+**Goal:** Surface only judgment-call findings, reusing /adhoc_review.
+
+Decision findings = ${FINDINGS_LIST} minus the mechanical ones.
+
+- 0 decisions → skip; tell the user every finding was mechanical and recorded.
+- Otherwise → invoke `/adhoc_review` on the decision findings with ${WORKING_DOC} already in scope, so it records each decision there.
+
+Each handed-off item must carry title, severity, source dimension (the expert lens that found it), the concrete problem, impact, and a recommendation — so adhoc_review can show its summary, expand on `elaborate`, and mark the recommended choice. Do not run a separate walkthrough; adhoc_review owns the per-item interaction.
+</SurfaceDecisions>
