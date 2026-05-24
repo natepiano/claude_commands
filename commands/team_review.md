@@ -79,12 +79,17 @@ Launch **3-5 agents in parallel** using the Agent tool, each with a distinct ana
 ---
 
 <EstablishWorkingDoc>
-**Goal:** One working doc holds the auto-recorded mechanical findings and the evolving proposed user decisions. It is the memory that carries state across cycles, so establish it before the first cycle.
+**Goal:** Settle which doc to work in. It holds the auto-recorded mechanical findings and the evolving proposed user decisions, and carries state across cycles — so settle it before the first cycle. **Default to the doc already in scope; do not spin up a separate file.**
 
-Default to `.claude/reviews/team-review-${brief-topic}.md`. Ask once:
-> `Team review of ${REVIEW_TOPIC}, ${ITERATIONS} cycle(s). Record findings and proposed decisions in .claude/reviews/team-review-${brief-topic}.md (recommended), a different path, or none?`
+Find ${WORKING_DOC} in this order:
+1. ${REVIEW_TOPIC} is itself a doc (a file path the review was pointed at) → that file is ${WORKING_DOC}.
+2. A doc the user has been editing or named this session → use it.
+3. Neither → suggest one and ask once:
+   > `Team review of ${REVIEW_TOPIC}, ${ITERATIONS} cycle(s). No doc in scope — record findings and proposed decisions in .claude/reviews/team-review-${brief-topic}.md, a different path, or none?`
 
-Create the file with a one-line header (today's date + ${REVIEW_TOPIC} + cycle count). If the user picks `none`, ${WORKING_DOC} is unset and the accumulator lives in conversation instead — workable for a single cycle, but with ${ITERATIONS} > 1 recommend the doc so each cycle can build on the last.
+When a doc is already in scope (cases 1-2): do **not** create a separate file and do **not** ask — just confirm `Working in <path>.` and record everything into that doc (inline in the appropriate sections, or a dedicated section where that reads better).
+
+If the user picks `none` (case 3 only), ${WORKING_DOC} is unset and the accumulator lives in conversation instead — workable for a single cycle, but with ${ITERATIONS} > 1 a doc is better so each cycle can build on the last.
 </EstablishWorkingDoc>
 
 ---
@@ -94,7 +99,7 @@ Create the file with a one-line header (today's date + ${REVIEW_TOPIC} + cycle c
 
 A finding is **mechanical** only when its recommendation needs no judgment: one deterministic, low-risk action with a single correct outcome — a typo, a dead import, a naming-consistency rename, a formatting fix, a refactor with one valid result. Anything with a tradeoff, more than one valid approach, behavioral/API impact, or any risk is a **decision** (Step 6). When unsure, treat it as a decision.
 
-For each mechanical finding, append to ${WORKING_DOC} under a `## Mechanical (auto-recorded)` section: finding id, title, recommendation, marked accepted. Skip any finding an earlier cycle already recorded there. Do not edit source code — this records the decision; applying it is a separate step. If ${WORKING_DOC} is unset, list them inline instead.
+Incorporate each mechanical finding into ${WORKING_DOC} where it belongs — fold it into the appropriate existing section, or collect it under a dedicated `## Mechanical (auto-recorded)` section when there is no natural home. Record finding id, title, recommendation, marked accepted. Skip any finding an earlier cycle already recorded. Do not edit source code — this records the decision in the doc; applying it to code is a separate step. If ${WORKING_DOC} is unset, list them inline in the conversation instead.
 </RecordMechanicalFindings>
 
 ---

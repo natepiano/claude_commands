@@ -8,7 +8,6 @@
     **STEP 2:** Execute <ResolveContext/>
     **STEP 3:** Execute <GenerateEntry/>
     **STEP 4:** Execute <UserEntryConfirmation/>
-    **STEP 5:** Execute <FinalDecision/>
 </ExecutionSteps>
 
 <AnalyzeChanges>
@@ -56,33 +55,22 @@ Present the proposed entry to the user:
 Present to user:
 
 ## Available Actions
-- **use** - Use the proposed changelog entry
+- **use** - Approve the proposed entry and append it to CHANGELOG.md
 - **change** - Provide a different entry
 
 Wait for user response.
 
-If user selects **change**: Ask for their revised entry and use it.
-If user selects **use**: Use the proposed entry.
+If user selects **use**: "use" means approve — append the proposed entry immediately per <AppendEntry/>, with no further confirmation.
+If user selects **change**: Ask for their revised entry, then append that entry per <AppendEntry/>.
 </UserEntryConfirmation>
 
-<FinalDecision>
-Present to user:
-
-## Available Actions
-- **append** - Prepend the entry to CHANGELOG.md under the `[Unreleased]` section
-- **abandon** - Stop without modifying any files
-
-Wait for user response.
-
-If user selects **append**:
+<AppendEntry>
 - If CHANGELOG.md exists in the repo root, find the `[Unreleased]` section
   - If the matching category heading (e.g. `### Added`) already exists under `[Unreleased]`, append the entry there
   - If not, create the category heading under `[Unreleased]` and add the entry
 - If CHANGELOG.md does not exist, create it with the Keep a Changelog header and the entry under `[Unreleased]`
 - Execute <AppendOutput/>
-
-If user selects **abandon**: Stop without changes.
-</FinalDecision>
+</AppendEntry>
 
 <AppendOutput>
 Format output as:
