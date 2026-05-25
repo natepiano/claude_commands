@@ -2,6 +2,8 @@
 
 **Purpose:** Launch a team of expert agents to analyze a topic from multiple dimensions across one or more refinement cycles. Mechanical findings are auto-recorded to a working doc; judgment-call findings accumulate as proposed user decisions that later cycles can add to, sharpen, or drop. After the final cycle, the surviving proposed decisions are surfaced through `/adhoc_review`.
 
+When the topic is a design/plan/spec, the review is **bound to that design's stated intent**: by default it strengthens the design to achieve that intent and does *not* relitigate whether to pursue it. Challenges to the premise are quarantined, not run as the default mode — see `<IntentFirewall/>`. This exists because an unbound multi-cycle review will, given enough cycles, talk itself into "should this exist?" and bury the work that was actually asked for.
+
 **Usage:** `/team_review [topic or question to review] [N]`
 
 **Arguments:**
@@ -18,6 +20,8 @@
 **STEP 4:** Execute <SurfaceDecisions/>
 
 `<RunReviewCycles/>` repeats `<LaunchExpertTeam/>`, `<SynthesizeFindings/>`, `<RecordMechanicalFindings/>`, and `<ReconcileProposedDecisions/>` once per cycle.
+
+`<IntentFirewall/>` is established in STEP 1 and governs every cycle and the surfacing step whenever ${REVIEW_POSTURE} = `strengthen`.
 </ExecutionSteps>
 
 ---
@@ -34,7 +38,40 @@
 **If no topic remains:**
 - Summarize the current conversation topic in 1-2 sentences as ${REVIEW_TOPIC}
 - Inform the user: "Launching team review of the current topic: [summary] (${ITERATIONS} cycle(s))"
+
+**Capture the stated intent and posture (this governs the whole review).**
+If ${REVIEW_TOPIC} is a design/plan/spec (a doc, or one in the conversation), read its goal and set:
+- ${REVIEW_INTENT} = the design's stated objective in the document's own words — what it is trying to achieve and the approach it has committed to.
+- ${REVIEW_POSTURE}:
+  - **strengthen** (default) — the approach is decided; the review's job is to make the design correctly and robustly achieve ${REVIEW_INTENT}. Challenges to whether/what to do are quarantined (see `<IntentFirewall/>`).
+  - **open** — the document or the user explicitly invites deciding whether to do it at all, or choosing among approaches.
+
+Choose **strengthen** unless the doc or the user explicitly says the premise is open. State both back in one line and accept a one-word correction:
+> `Reviewing ${REVIEW_TOPIC} — intent: <one line>; posture: strengthen. (Premise-challenges are quarantined; reply "open" to relitigate the approach.)`
+
+If there is no committed design to extract (e.g. an open-ended "review this code area"), set ${REVIEW_POSTURE}=open and ${REVIEW_INTENT}=the topic itself.
 </DetermineReviewScope>
+
+---
+
+<IntentFirewall>
+**Goal:** Keep the review serving the design's stated intent; stop premise-relitigation from hijacking cycles or becoming the headline. Applies whenever ${REVIEW_POSTURE} = **strengthen**.
+
+Every finding is one of three classes:
+1. **mechanical** — deterministic, single correct action (see `<RecordMechanicalFindings/>`).
+2. **design-improvement** — an in-intent judgment call: the design is committed to ${REVIEW_INTENT}; this makes it more correct, more robust, simpler *within the chosen approach*, or safer. This is the review's job and the bulk of every cycle.
+3. **premise-challenge** — asserts the approach is wrong, unnecessary, or should be deferred/abandoned, or proposes a *different* approach to the same intent.
+
+Rules under **strengthen**:
+- A premise-challenge is admissible **only** with decisive, evidence-backed proof that the committed design *cannot* achieve ${REVIEW_INTENT} — a concrete correctness or feasibility defect, not a preference. The following are **not** admissible grounds and must be dropped on sight: "a simpler alternative exists," "the benefit is marginal/cosmetic," "the original motivating bug is already fixed," "it is more code / more risk," "the scope is large." Those are tradeoffs the *author* already weighed by committing to the intent — they are not the review's call.
+- At most **one** premise-challenge survives a cycle; merge any others into it. Label it `PREMISE-CHALLENGE`; never weave it through design-improvement findings.
+- A premise-challenge must **never** be presented as, or folded into, the recommendation for a design-improvement decision (no "defer" / "don't do it" recommendation attached to an in-intent item).
+- The orchestrator must not author agent prompts that ask "is this worth doing," "should we defer," or "is some other approach better than this whole one." If an agent volunteers such framing, down-weight it to a premise-challenge subject to the rule above — do not amplify it in the next cycle.
+
+If a premise-challenge looks decisive, do **not** silently act on it and do **not** let it consume the remaining cycles. Carry it to `<SurfaceDecisions/>` in its own flagged slot for the user to rule on.
+
+Under ${REVIEW_POSTURE} = **open**: premise-challenges are first-class; this firewall does not apply.
+</IntentFirewall>
 
 ---
 
@@ -43,18 +80,20 @@
 
 Launch **3-5 agents in parallel** using the Agent tool, each with a distinct analytical lens. Choose dimensions appropriate to ${REVIEW_TOPIC}. Common dimensions include:
 
-- **Correctness & Completeness** — Is the approach correct? What's missing? Are there logic errors, edge cases, or gaps?
-- **Architecture & Design** — Is the structure sound? Are responsibilities well-separated? Will it scale? Are there simpler alternatives?
+- **Correctness & Completeness** — Does the design correctly and completely achieve ${REVIEW_INTENT}? What's missing, what edge cases or gaps would stop it working as intended? (Whether the *approach itself* is correct is a premise-challenge — see `<IntentFirewall/>`.)
+- **Architecture & Design** — Given the committed approach, is the structure sound, are responsibilities well-separated, does it achieve ${REVIEW_INTENT} cleanly, and will it scale *within that approach*? A "simpler alternative" or "don't do this" is a premise-challenge — raise it only under `<IntentFirewall/>`, not as a default lens.
 - **Risk & Failure Modes** — What can go wrong? What are the assumptions? Where are the fragile points? What happens under unexpected conditions?
 - **Implementation Quality** — Is the code clean? Are there performance concerns? Dead code? Unnecessary complexity?
 - **Type System & Changeability** (Rust projects) — As an advanced Rust type system expert, evaluate: Are types encoding invariants that the compiler can enforce? Could newtypes, enums, or marker types replace runtime checks? Are state transitions modeled in the type system? Would generics or trait bounds make the code more flexible without sacrificing clarity? Are there stringly-typed patterns or primitive obsession that types could eliminate? Focus on how type-level design affects readability and how easy it is to change the code safely.
 - **User Impact & Ergonomics** — How does this affect the end user or developer experience? Is the API intuitive? Are error messages helpful?
 
 **Each agent prompt must include:**
+0. **The stated intent and the mandate.** Include ${REVIEW_INTENT} and ${REVIEW_POSTURE}. Under `strengthen`, state verbatim: _"This intent and approach are a given. Your job is to make the design correctly and robustly achieve it — not to decide whether to do it or to propose a different approach. Only if you have decisive proof the design cannot achieve the intent, raise exactly one finding labeled PREMISE-CHALLENGE (see firewall). 'A simpler alternative exists', 'marginal benefit', 'the original bug is already fixed', and 'more code/risk' are not grounds to challenge."_
 1. The ${REVIEW_TOPIC} and relevant context (file paths, code patterns, architectural decisions)
 2. Their specific analytical dimension
 3. Instruction to return findings as a structured list where each finding has:
    - **Title**: Brief name for the finding
+   - **Class**: `design-improvement` or `PREMISE-CHALLENGE` (omit for mechanical findings)
    - **Problem**: What is wrong or concerning — explain the actual issue with enough context that someone unfamiliar would understand
    - **Impact**: Why it matters (severity: critical / important / minor)
    - **Recommendation**: Specific, actionable suggestion
@@ -109,7 +148,7 @@ Incorporate each mechanical finding into ${WORKING_DOC} where it belongs — fol
 
 Repeat for cycle `i` from 1 to ${ITERATIONS}:
 
-1. Execute <LaunchExpertTeam/>. On cycle 2+, include the current ${WORKING_DOC} contents in every agent prompt — the recorded mechanical findings and the running **Proposed user decisions** — and instruct agents to build on them: confirm, sharpen, merge, refute, or supersede prior proposed decisions, and surface anything new. Agents may argue that a proposed decision is unnecessary.
+1. Execute <LaunchExpertTeam/>. On cycle 2+, include the current ${WORKING_DOC} contents in every agent prompt — the recorded mechanical findings and the running **Proposed user decisions** — and instruct agents to build on them: confirm, sharpen, merge, refute, or supersede prior proposed decisions, and surface anything new. Under `strengthen`, hold every cycle to `<IntentFirewall/>`: build *within* ${REVIEW_INTENT}; do not author prompts that ask "is this worth it / should we defer / is another approach better," and do not let a premise-challenge grow cycle-over-cycle. (Under `open`, agents may argue an approach is unnecessary.)
 2. Execute <SynthesizeFindings/>.
 3. Execute <RecordMechanicalFindings/>.
 4. Execute <ReconcileProposedDecisions/>.
@@ -123,7 +162,9 @@ Never invoke `/adhoc_review` inside the loop — surfacing happens once, after t
 <ReconcileProposedDecisions>
 **Goal:** Maintain one evolving set of proposed user decisions in ${WORKING_DOC} across cycles.
 
-Keep proposed decisions under a `## Proposed user decisions` section — or inline under the appropriate section of the doc when that reads better. Each entry carries: a stable id, title, severity, source dimension, the concrete problem, impact, recommendation, and a status (`proposed` / `superseded` / `dropped`).
+Keep proposed decisions under a `## Proposed user decisions` section — or inline under the appropriate section of the doc when that reads better. Each entry carries: a stable id, title, severity, source dimension, **class** (`design-improvement` / `premise-challenge`), the concrete problem, impact, recommendation, and a status (`proposed` / `superseded` / `dropped`).
+
+Under `strengthen`, keep premise-challenges in their own short sub-list, capped at one (merge or drop the rest per `<IntentFirewall/>`), and never let a premise-challenge attach a "defer / don't do it" recommendation to a `design-improvement` entry.
 
 For this cycle's judgment findings, reconcile against the existing entries:
 - **New** (not already represented) → add as `proposed`.
@@ -141,7 +182,9 @@ Only entries still `proposed` after the final cycle get surfaced; keep `dropped`
 The decision set = every `## Proposed user decisions` entry still marked `proposed` (dropped/superseded entries are not surfaced).
 
 - 0 surviving decisions → skip; tell the user every finding was mechanical or was dropped across cycles, all recorded in ${WORKING_DOC}.
-- Otherwise → invoke `/adhoc_review` on the surviving decisions with ${WORKING_DOC} already in scope, so it records each decision there.
+- Otherwise → invoke `/adhoc_review` on the surviving `design-improvement` decisions with ${WORKING_DOC} already in scope, so it records each decision there.
+
+**A surviving `premise-challenge` (strengthen posture) is surfaced separately, not mixed into the `/adhoc_review` list.** Present it once, explicitly flagged: `This contradicts the document's stated intent (${REVIEW_INTENT}). It is admitted only because <decisive evidence>. Confirm the premise is open before I treat it as actionable.` Do not give it a recommendation that presumes the answer, and do not let it override the in-intent decisions. If the user does not open the premise, it stays recorded as a flagged note, not an action.
 
 Each handed-off item must carry title, severity, source dimension (the expert lens that found it), the concrete problem, impact, and a recommendation — so adhoc_review can show its summary, expand on `elaborate`, and mark the recommended choice. Do not run a separate walkthrough; adhoc_review owns the per-item interaction.
 </SurfaceDecisions>
