@@ -1,17 +1,21 @@
 #!/bin/bash
-# Commit clean-fix style history + report in ~/rust/nate_style when the working
-# tree contains only the expected clean-fix outputs. Otherwise leave a sentinel
-# markdown file explaining why and exit 0.
+# Commit clean-fix style history + report in ~/rust/nate_style. The commit is
+# pathspec-scoped to clean-fix's own outputs, so any other dirty, staged, or
+# untracked file in the repo (e.g. a hand-edited style guide) is left untouched
+# and never blocks the commit.
 #
-# Expected dirty files (nothing else may be dirty, staged, or untracked):
+# Committed paths (pathspec-scoped; nothing else is touched):
 #   - .history/<project>.jsonl (worktree-modified; each +1 insertion, 0 deletions)
 #   - style_report.md          (worktree-modified; total changed lines <= 200)
 #   - CLEAN_FIX_COMMIT_SKIPPED.md staged deletion, only for one-time untracking
-#   - .history/.failures/...   (untracked retry-diagnostic dumps; ignored)
 #
-# On any violation: write CLEAN_FIX_COMMIT_SKIPPED.md at the repo root (untracked)
-# describing what blocked the commit, then exit 0. The caller is expected to
-# run this only when the upstream style-fix pass had zero failures.
+# .history/.failures/ (untracked retry-diagnostic dumps) is always ignored.
+#
+# Size guard: if a committed path exceeds its diff-size limit (history must be
+# +1 -0; report <= 200 changed lines), write CLEAN_FIX_COMMIT_SKIPPED.md at the
+# repo root (untracked) describing the violation, then exit 0 without committing.
+# The caller is expected to run this only when the upstream style-fix pass had
+# zero failures.
 #
 # Usage: commit-style-results.sh [--dry-run]
 #   --dry-run   Print the plan and `git diff --stat` instead of committing.
@@ -158,13 +162,12 @@ while IFS= read -r line; do
     esac
 done <<<"$porcelain"
 
+# Unrelated working-tree changes no longer block the commit: the commit below
+# is pathspec-scoped to clean-fix's own outputs, so nothing else can be swept
+# in. Report what is being left alone so it stays visible in the run log.
 if (( ${#unexpected[@]} > 0 )); then
-    details=$'Unexpected working-tree entries (permitted: worktree-modified `.history/*.jsonl`, `style_report.md`, and untracked `.history/.failures/`):\n\n```\n'
-    details+="$(printf '%s\n' "${unexpected[@]}")"
-    details+=$'\n```'
-    write_sentinel "unexpected working-tree changes" "$details"
-    echo "commit-style-results: skipped — unexpected changes (sentinel written)"
-    exit 0
+    echo "commit-style-results: leaving ${#unexpected[@]} unrelated working-tree change(s) untouched:"
+    printf '  %s\n' "${unexpected[@]}"
 fi
 
 # --- Size checks -------------------------------------------------------------
@@ -232,10 +235,19 @@ if $DRY_RUN; then
     exit 0
 fi
 
-if (( ${#paths_to_add[@]} > 0 )); then
-    git add -- "${paths_to_add[@]}"
+# Scope the commit by pathspec to clean-fix's own outputs. A partial commit
+# (`git commit -- <paths>`) records only those paths from the working tree and
+# leaves every other dirty, staged, or untracked file exactly as-is — there is
+# no path by which an unrelated edit can be swept into this commit.
+commit_paths=("${paths_to_add[@]}")
+$has_sentinel_removal && commit_paths+=("$SENTINEL_NAME")
+
+if (( ${#commit_paths[@]} == 0 )); then
+    echo "commit-style-results: nothing of ours to commit (only unrelated changes present)"
+    exit 0
 fi
-git commit -m "$COMMIT_MSG"
+
+git commit -m "$COMMIT_MSG" -- "${commit_paths[@]}"
 committed_count=${#paths_to_add[@]}
 $has_sentinel_removal && committed_count=$((committed_count + 1))
 echo "commit-style-results: committed $committed_count file(s)"

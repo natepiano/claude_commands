@@ -27,6 +27,42 @@ fi
 VERSION="$1"
 BEVY_REPO_DIR="${HOME}/rust/bevy-${VERSION}"
 
+# Register this Bevy clone in the clean-fix skip list (idempotent).
+# The clone lives under ~/rust/, which the nightly clean-fix automation scans by
+# directory name and would otherwise clean/build/style-eval. clean-fix.sh parses
+# bare lines under the conf's [exclude] section, so insert the clone's directory
+# name there if absent. All output goes to stderr; callers capture only stdout.
+register_in_clean_fix_skiplist() {
+    local conf="${HOME}/.claude/scripts/clean-fix/clean-fix.conf"
+    local name="$1"
+    [ -f "${conf}" ] || return 0
+    if grep -qxF "${name}" "${conf}"; then
+        echo "clean-fix skip list already excludes ${name}" >&2
+        return 0
+    fi
+    if grep -qxF "[exclude]" "${conf}"; then
+        :
+    else
+        echo "Warning: no [exclude] section in ${conf}; skip-list not updated" >&2
+        return 0
+    fi
+    # Write the temp alongside the conf so it shares the filesystem (atomic mv)
+    # and stays within a writable directory rather than a restricted TMPDIR.
+    local tmp="${conf}.tmp.$$"
+    if awk -v entry="${name}" '
+        { print }
+        $0 == "[exclude]" && !inserted { print entry; inserted = 1 }
+    ' "${conf}" > "${tmp}"; then
+        mv "${tmp}" "${conf}"
+        echo "Added ${name} to clean-fix skip list" >&2
+    else
+        rm -f "${tmp}"
+        echo "Warning: failed to update clean-fix skip list for ${name}" >&2
+    fi
+}
+
+register_in_clean_fix_skiplist "$(basename "${BEVY_REPO_DIR}")" || true
+
 # Clone or update repository
 if [ -d "${BEVY_REPO_DIR}/.git" ]; then
     echo "Repository already exists at ${BEVY_REPO_DIR}" >&2

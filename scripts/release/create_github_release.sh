@@ -14,6 +14,14 @@ DRY_RUN="${5:-}"
 
 TAG="v${VERSION}"
 
+# A semver pre-release (anything after a hyphen, e.g. -rc.1, -beta.2) must be
+# flagged so GitHub does not mark it as the latest stable release.
+if [[ "$VERSION" == *-* ]]; then
+  PRERELEASE="true"
+else
+  PRERELEASE="false"
+fi
+
 if [[ ! -f "$NOTES_FILE" ]]; then
   echo "ERROR: Notes file not found: $NOTES_FILE" >&2
   exit 1
@@ -26,6 +34,7 @@ if [[ "$DRY_RUN" == "--dry-run" ]]; then
   echo "    Tag: $TAG"
   echo "    Repo: $REPO"
   echo "    Title: $PROJECT_NAME $TAG"
+  echo "    Prerelease: $PRERELEASE"
   echo "    Notes:"
   sed 's/^/      /' "$NOTES_FILE"
   echo ""
@@ -33,11 +42,19 @@ if [[ "$DRY_RUN" == "--dry-run" ]]; then
   exit 0
 fi
 
-echo "  Creating release: $TAG on $REPO"
-gh release create "$TAG" \
-  --repo "$REPO" \
-  --title "$PROJECT_NAME $TAG" \
-  --notes-file "$NOTES_FILE"
+echo "  Creating release: $TAG on $REPO (prerelease: $PRERELEASE)"
+if [[ "$PRERELEASE" == "true" ]]; then
+  gh release create "$TAG" \
+    --repo "$REPO" \
+    --title "$PROJECT_NAME $TAG" \
+    --notes-file "$NOTES_FILE" \
+    --prerelease
+else
+  gh release create "$TAG" \
+    --repo "$REPO" \
+    --title "$PROJECT_NAME $TAG" \
+    --notes-file "$NOTES_FILE"
+fi
 
 echo ""
 echo "GitHub release created: $TAG ✓"
