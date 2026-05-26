@@ -10,6 +10,14 @@ Perform a release for any Rust crate or workspace project.
 - `/release X.Y.Z-rc.N` - Release as RC version (e.g., `0.18.0-rc.1`)
 - `/release X.Y.Z dry-run` - Rehearse release without mutations
 
+**Releasing a single package from a multi-crate workspace** (only when the workspace does NOT use coordinated `[[publish_phases]]` config):
+- `/release <package> X.Y.Z` - Release only that crate (e.g., `/release bevy_lagrange 0.0.4`)
+- `/release <package> patch` - Patch-bump and release only that crate
+- `/release <package> X.Y.Z-rc.N` - Release only that crate as an RC
+- `/release <package> X.Y.Z dry-run` - Rehearse a single-package release without mutations
+
+The package token is optional and identified by name — any argument that is not `help`, `patch`, `dry-run`, or a version. Argument order does not matter. Without it, the whole workspace releases together (unchanged). In single-package mode the release branch is `release-<package>-<version>` and the tag is `<package>-v<version>`, so single-package releases never collide with whole-workspace ones.
+
 **Releasing from a non-`main` branch**: When the current branch is not `main`, the branch alone can't say whether it's a hotfix or an isolated release, so STEP 1 asks which mode applies:
 - **Hotfix mode** — a fix branched off an old release tag. Finalizes and publishes from the current branch, then cherry-picks the fix back to main (STEP 12). The branch is a fire-and-forget record.
 - **Isolated branch release** — the current branch is the future mainline (e.g. a Bevy-update branch you'll merge to main yourself later). Runs the full normal-mode sequence rooted on the current branch in place of main: finalizes there, cuts a `release-X.Y.Z` snapshot off it, publishes, then restores `[Unreleased]` and bumps the branch to the next `-dev`. **Main is never touched and nothing is cherry-picked.**
@@ -23,6 +31,14 @@ When `dry-run` is present in `$ARGUMENTS`, set `${DRY_RUN_FLAG}` to `--dry-run` 
 **All mutating scripts accept `--dry-run`** as a parameter. In dry-run mode, pass `${DRY_RUN_FLAG}` to every script call. The scripts themselves handle reporting what they would do without making changes.
 
 For agent judgment steps (README updates, changelog review, GitHub release notes), describe what would be done without making changes. For git commits, report what would be committed without running the command.
+
+## Single-Package Mode
+
+When a package selector is present in `$ARGUMENTS` (validated in STEP 1), set `${PACKAGE}` to that crate name and `${PACKAGE_FLAG}` to `--package ${PACKAGE}`. Otherwise both are empty and every step behaves exactly as a whole-workspace release.
+
+In single-package mode the entire pipeline is scoped to the one crate: `${ALL_CRATE_NAMES}`, `${ALL_VERSION_FILES}`, `${ALL_CHANGELOG_FILES}`, the published README, and `${PROJECT_NAME}` all narrow to that crate. The release branch becomes `release-${PACKAGE}-${VERSION}` and the tag `${PACKAGE}-v${VERSION}`. All three modes (normal, isolated, hotfix) run unchanged apart from this scoping. `pre_release_checks.sh` (STEP 2) still runs workspace-wide — the whole workspace must build, lint, and test before any single crate ships.
+
+**Single-package mode is incompatible with `[[publish_phases]]` config.** A workspace that defines publish phases releases its crates together with ordered cross-dependency updates; STEP 1 stops if a package is named there.
 
 ## Versioning Strategy
 
@@ -127,7 +143,8 @@ This applies to ALL bash commands and script invocations in this process.
 4. If config has `[[judgment_checks]]`, show them as sub-items under the step whose checkpoint they target
 5. If config has `install_verify`, append it to STEP 9's description
 6. Only show checkpoint sub-items when they have judgment checks or publish phases attached — bare checkpoints with nothing configured are invisible
-7. Display the full checklist
+7. If `${SINGLE_PACKAGE_MODE}`, add a `Package: ${PACKAGE}` line beneath the `RELEASE ${VERSION}` title
+8. Display the full checklist
 
 **Example with no config (e.g., bevy_window_manager):**
 ```
@@ -282,8 +299,13 @@ Same sequence as normal mode, but every "on main" step runs on `${BASE_BRANCH}` 
 <ArgumentValidation>
 ## STEP 0: Argument Validation
 
+**Parse `$ARGUMENTS`** — it may contain, in any order: an optional package selector, exactly one of a version (`X.Y.Z` / `X.Y.Z-rc.N`) or the literal `patch`, and an optional `dry-run`.
+- The token matching `^[0-9]+\.[0-9]+\.[0-9]+(-rc\.[0-9]+)?$` is the version.
+- `patch` selects patch mode; `dry-run` sets `${DRY_RUN_FLAG}`; `help` or empty shows usage.
+- Any remaining token is the **package selector** — set `${PACKAGE}` to it. It is validated against workspace members in STEP 1 (and rejected there if the workspace uses `[[publish_phases]]`).
+
 **If argument is `patch` (with or without `dry-run`):**
-1. Detect the primary crate name (single crate: from root `Cargo.toml`; workspace: from first `[workspace.members]` entry or first publish phase crate if config exists)
+1. Detect the crate name: if `${PACKAGE}` is set, use it; otherwise the primary crate (single crate: from root `Cargo.toml`; workspace: from first `[workspace.members]` entry or first publish phase crate if config exists)
 2. Query crates.io for the latest published version:
 ```bash
 curl -s "https://crates.io/api/v1/crates/${CRATE_NAME}" | jq -r '.crate.max_version'
@@ -352,11 +374,20 @@ git branch --show-current
   - If **hotfix**: set `${HOTFIX_MODE}` to `true` and `${HOTFIX_BRANCH}` to the branch name.
   - If **isolated**: set `${ISOLATED_MODE}` to `true` and `${BASE_BRANCH}` to the current branch name. The release follows the normal-mode step sequence with `${BASE_BRANCH}` substituted for `main` everywhere.
 
+**Single-package scoping** (only when `${PACKAGE}` is set from STEP 0):
+1. **Guard:** if the config defines any `[[publish_phases]]`, STOP with: "This workspace uses coordinated publish_phases — its crates release together with ordered cross-dependency updates, so a single-package release isn't supported here. Run `/release ${VERSION}` to release the whole workspace." Do not proceed.
+2. Verify `${PACKAGE}` matches exactly one discovered member's `[package].name`. If it matches none, STOP and list the available member crate names.
+3. If the matched crate's `Cargo.toml` uses `version.workspace = true`, WARN: its version is shared with the whole workspace, so releasing it alone forces the shared version onto its siblings. Ask the user to confirm or pick an independently-versioned crate before continuing.
+4. Narrow every "all crates" value to the matched crate only — `${ALL_CRATE_NAMES}`, `${ALL_VERSION_FILES}`, `${ALL_CHANGELOG_FILES}`, the published README list, and `${PROJECT_NAME}`. Set `${SINGLE_PACKAGE_MODE}` = true and `${PACKAGE_FLAG}` = `--package ${PACKAGE}`.
+
+When `${PACKAGE}` is not set, `${SINGLE_PACKAGE_MODE}` is false and `${PACKAGE_FLAG}` is empty — discovery keeps every non-excluded member as before.
+
 **Display discovered project info:**
 ```
 Project: ${GITHUB_REPO}
 Type: single crate | workspace
 Crates: ${CRATE_LIST}
+Package: ${PACKAGE} (single-package release) | (whole workspace)
 Config: found | using defaults
 Dry-run: yes | no
 Mode: normal | hotfix (from branch: ${HOTFIX_BRANCH}) | isolated (base branch: ${BASE_BRANCH})
@@ -479,7 +510,7 @@ This produces a clean commit label visible in GitHub's file list for both CHANGE
 
 **Run branch creation:**
 ```bash
-~/.claude/scripts/release/create_release_branch.sh ${VERSION} ${DRY_RUN_FLAG}
+~/.claude/scripts/release/create_release_branch.sh ${VERSION} ${DRY_RUN_FLAG} ${PACKAGE_FLAG}
 ```
 
 → Report the script output to the user.
@@ -578,7 +609,7 @@ ${POST_SCRIPT_PATH} ${VERSION}
 
 **Run push** (with `dangerouslyDisableSandbox: true`):
 ```bash
-~/.claude/scripts/release/push_release.sh ${VERSION} ${DRY_RUN_FLAG}
+~/.claude/scripts/release/push_release.sh ${VERSION} ${DRY_RUN_FLAG} ${PACKAGE_FLAG}
 ```
 
 → Report the script output to the user. Stop if push fails.
@@ -598,7 +629,7 @@ For workspace projects with multiple changelogs, format as:
 <entries from that crate's changelog>
 ```
 
-For single-crate projects, use the entries directly.
+For single-crate projects, use the entries directly. In single-package mode, use the selected crate's entries directly (treat it like a single-crate project).
 
 **Write the release notes and run the script in a single unsandboxed command** (combining them avoids sandbox `$TMPDIR` mismatches):
 ```bash
@@ -606,7 +637,7 @@ NOTES_FILE="$TMPDIR/release-notes-${VERSION}.md"
 cat > "$NOTES_FILE" << 'NOTES_EOF'
 <release notes content here>
 NOTES_EOF
-~/.claude/scripts/release/create_github_release.sh ${VERSION} ${GITHUB_REPO} ${PROJECT_NAME} "$NOTES_FILE" ${DRY_RUN_FLAG}
+~/.claude/scripts/release/create_github_release.sh ${VERSION} ${GITHUB_REPO} ${PROJECT_NAME} "$NOTES_FILE" ${DRY_RUN_FLAG} ${PACKAGE_FLAG}
 ```
 → This must use `dangerouslyDisableSandbox: true`. Report the script output to the user.
 </CreateGitHubRelease>
@@ -765,7 +796,7 @@ git commit -m "${VERSION}"
 
 ### Rename Branch
 
-**Rename the hotfix branch to the standard release naming convention** (with `dangerouslyDisableSandbox: true`):
+**Rename the hotfix branch to the standard release naming convention** (with `dangerouslyDisableSandbox: true`). In single-package mode the release branch is `release-${PACKAGE}-${VERSION}` — use that name in place of `release-${VERSION}` here and in every later step (push, cleanup):
 ```bash
 git branch -m ${HOTFIX_BRANCH} release-${VERSION}
 ```
@@ -785,6 +816,11 @@ Find all commits on the release branch that are not on the parent tag. The branc
 
 ```bash
 git log --oneline release-${VERSION} --not $(git describe --tags --abbrev=0 release-${VERSION}~1)
+```
+
+**In single-package mode**, the branch is `release-${PACKAGE}-${VERSION}` and tags are package-prefixed, so add `--match "${PACKAGE}-v*"` to `git describe` to find the crate's own previous tag:
+```bash
+git log --oneline release-${PACKAGE}-${VERSION} --not $(git describe --tags --abbrev=0 --match "${PACKAGE}-v*" release-${PACKAGE}-${VERSION}~1)
 ```
 
 The fix commit(s) are everything before the version bump commit. The version bump commit itself and any workspace dependency update commits should NOT be cherry-picked — main has its own version management.
@@ -853,6 +889,8 @@ git push origin :release-${VERSION}
 # Return to main
 git checkout main
 ```
+
+**Single-package releases** use the package-scoped names instead: tag `${PACKAGE}-v${VERSION}` and branch `release-${PACKAGE}-${VERSION}`. Substitute those in the commands above.
 
 If already published to crates.io, you cannot unpublish. Release a new patch version instead.
 
