@@ -97,10 +97,7 @@ def main() -> None:
         except OSError:
             pass
 
-    skip_substrings = (
-        "banned-words-check/SKILL.md",
-        "commands/add-banned-word.md",
-    )
+    skip_substrings = ("commands/add-banned-word.md",)
     if any(s in file_path for s in skip_substrings):
         sys.exit(0)
 

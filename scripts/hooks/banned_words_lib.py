@@ -431,8 +431,20 @@ def _main() -> int:
     import sys
 
     paths: list[str] = sys.argv[1:]
-    if paths == ["--analysis"] or paths == ["--counters"]:
+    if paths and paths[0] in ("--analysis", "--counters"):
+        rest = [a.lower() for a in paths[1:]]
+        by_last_triggered = any(
+            a in ("last-triggered", "last_triggered", "last", "triggered")
+            for a in rest
+        )
         rows = counter_analysis_rows()
+        if by_last_triggered:
+            # newest first; never-triggered (no timestamp) sorts last.
+            # Stable sort: order by timestamp desc, then push "never" to the end.
+            rows.sort(key=lambda r: r[2], reverse=True)
+            rows.sort(key=lambda r: r[2] == "never")
+        else:
+            rows.sort(key=lambda r: r[1], reverse=True)
         width = max([len("word"), *(len(stem) for stem, _, _ in rows)])
         print(f"Counter state: {COUNTER_STATE}")
         print(f"{'word'.ljust(width)}  count  last_triggered_at")

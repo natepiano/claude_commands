@@ -36,7 +36,23 @@ Analyze output:
 Execute: `cargo mend --workspace --all-targets --fix`
 
 Error Handling:
-- **Any failure** (non-zero exit, error output, unexpected behavior): **STOP immediately**. Report the error output to the user and ask what to do. Do NOT proceed to clippy.
+- **Fix reverted due to compiler error (HARD STOP — capture reproduction):** If
+  mend applies a fix, the resulting code fails to compile, and mend reverts it,
+  this is a bug in cargo mend — it should never fail on a fix it claims it can
+  apply. **STOP immediately. Do NOT proceed, do NOT retry, do NOT attempt the
+  fix manually.** The working tree is now back at its pre-fix state, which is
+  exactly the state needed to reproduce the bug. Present the following so the
+  user can copy it verbatim and reproduce / fix cargo mend:
+    1. The full `cargo mend --workspace --all-targets --fix` output, including
+       the lint(s) mend tried to fix and the compiler error(s) that triggered
+       the revert.
+    2. The exact command that reproduces it: `cargo mend --workspace --all-targets --fix`
+    3. `git rev-parse HEAD` and `git status --short` output, confirming the
+       working tree matches the reproduction state.
+  Then end your turn and wait for the user. Do NOT proceed to clippy.
+- **Any other failure** (non-zero exit, error output, unexpected behavior):
+  **STOP immediately**. Report the error output to the user and ask what to do.
+  Do NOT proceed to clippy.
 
 If successful: Note any remaining unfixable items from the earlier `cargo mend` run and proceed to <RunFmt/>.
 </RunMendFix>

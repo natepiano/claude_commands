@@ -2,6 +2,11 @@
 
 **Purpose:** Launch a team of expert agents to analyze a topic from multiple dimensions across one or more refinement cycles. Mechanical findings are auto-recorded to a working doc; judgment-call findings accumulate as proposed user decisions that later cycles can add to, sharpen, or drop. After the final cycle, the surviving proposed decisions are surfaced through `/adhoc_review`.
 
+**Critical execution guards:**
+- The working doc established by `<EstablishWorkingDoc/>` is final for this workflow and for the `/adhoc_review` handoff. Do not ask where to record decisions again.
+- Hard-filter proposed decisions before surfacing. If a finding has converged into a concrete in-intent plan refinement with no meaningful user choice left, record it in `${WORKING_DOC}` and do not send it to `/adhoc_review`.
+- Surface only unresolved product/design choices where the user must choose among plausible alternatives or explicitly approve a scope/behavior change.
+
 When the topic is a design/plan/spec, the review is **bound to that design's stated intent**: by default it strengthens the design to achieve that intent and does *not* relitigate whether to pursue it. Challenges to the premise are quarantined, not run as the default mode — see `<IntentFirewall/>`. This exists because an unbound multi-cycle review will, given enough cycles, talk itself into "should this exist?" and bury the work that was actually asked for.
 
 **Usage:** `/team_review [topic or question to review] [N]`
@@ -58,8 +63,8 @@ If there is no committed design to extract (e.g. an open-ended "review this code
 **Goal:** Keep the review serving the design's stated intent; stop premise-relitigation from hijacking cycles or becoming the headline. Applies whenever ${REVIEW_POSTURE} = **strengthen**.
 
 Every finding is one of three classes:
-1. **mechanical** — deterministic, single correct action (see `<RecordMechanicalFindings/>`).
-2. **design-improvement** — an in-intent judgment call: the design is committed to ${REVIEW_INTENT}; this makes it more correct, more robust, simpler *within the chosen approach*, or safer. This is the review's job and the bulk of every cycle.
+1. **auto-recorded** — single correct outcome that doesn't change plan structure or intended behavior; includes mechanical fixes *and* determined correctness/bug fixes (see `<RecordMechanicalFindings/>`).
+2. **design-improvement** — an in-intent judgment call: the design is committed to ${REVIEW_INTENT}; this makes it more correct, more robust, simpler *within the chosen approach*, or safer. This is the review's job and the bulk of every cycle. It is surfaced to the user only if it changes plan structure or intended behavior; a correctness fix that doesn't is auto-recorded, not surfaced.
 3. **premise-challenge** — asserts the approach is wrong, unnecessary, or should be deferred/abandoned, or proposes a *different* approach to the same intent.
 
 Rules under **strengthen**:
@@ -128,6 +133,8 @@ Find ${WORKING_DOC} in this order:
 
 When a doc is already in scope (cases 1-2): do **not** create a separate file and do **not** ask — just confirm `Working in <path>.` and record everything into that doc (inline in the appropriate sections, or a dedicated section where that reads better).
 
+This working-doc choice also governs `<SurfaceDecisions/>`. If `/adhoc_review` is invoked by this workflow, skip its document-selection/setup question and use `${WORKING_DOC}` directly.
+
 If the user picks `none` (case 3 only), ${WORKING_DOC} is unset and the accumulator lives in conversation instead — workable for a single cycle, but with ${ITERATIONS} > 1 a doc is better so each cycle can build on the last.
 </EstablishWorkingDoc>
 
@@ -136,7 +143,7 @@ If the user picks `none` (case 3 only), ${WORKING_DOC} is unset and the accumula
 <RecordMechanicalFindings>
 **Goal:** Record strictly mechanical findings into ${WORKING_DOC} with no prompt.
 
-A finding is **mechanical** only when its recommendation needs no judgment: one deterministic, low-risk action with a single correct outcome — a typo, a dead import, a naming-consistency rename, a formatting fix, a refactor with one valid result. Anything with a tradeoff, more than one valid approach, behavioral/API impact, or any risk is a **decision** (Step 6). When unsure, treat it as a decision.
+A finding is **auto-recorded** (no prompt) when its recommendation has a single correct outcome *and* does not change the plan's structure or its intended behavior. This covers both (a) mechanical fixes — typo, dead import, naming-consistency rename, formatting, a refactor with one valid result — and (b) **correctness/bug fixes** where the right fix is determined even if finding it took judgment (a compile break, a missing guard, a wrong read path, a stale doc reference). A finding becomes a **decision** (Step 6) surfaced to the user *only* when it changes the plan's structure or the intended behavior — more than one valid answer, a new API/feature, or a scope/ordering change. When unsure whether it changes intended behavior, treat it as a decision.
 
 Incorporate each mechanical finding into ${WORKING_DOC} where it belongs — fold it into the appropriate existing section, or collect it under a dedicated `## Mechanical (auto-recorded)` section when there is no natural home. Record finding id, title, recommendation, marked accepted. Skip any finding an earlier cycle already recorded. Do not edit source code — this records the decision in the doc; applying it to code is a separate step. If ${WORKING_DOC} is unset, list them inline in the conversation instead.
 </RecordMechanicalFindings>
@@ -171,7 +178,12 @@ For this cycle's judgment findings, reconcile against the existing entries:
 - **Duplicate or refinement** of an existing entry → merge into it, keeping the sharper wording.
 - **Contradicts or obsoletes** an existing entry → mark that entry `dropped` (or `superseded`) with a one-line reason. A later cycle marking an earlier proposed decision unnecessary is expected and allowed.
 
-Only entries still `proposed` after the final cycle get surfaced; keep `dropped`/`superseded` ones in the doc with their reason so a future run does not relitigate them. If ${WORKING_DOC} is unset, hold this set in conversation instead.
+Before the final surface step, apply a hard decision gate:
+- **Record, do not surface:** converged refinements, correctness fixes, implementation constraints, acceptance-test additions, or API clarifications that have one sensible in-intent outcome after review.
+- **Surface:** unresolved choices where the user must pick among plausible alternatives, approve a scope/behavior change, or decide whether to accept a tradeoff the team could not settle.
+- **Drop/supersede:** items made redundant by sharper later-cycle wording.
+
+Only entries still `proposed` after this gate get surfaced; keep `dropped`/`superseded` ones in the doc with their reason so a future run does not relitigate them. If ${WORKING_DOC} is unset, hold this set in conversation instead.
 </ReconcileProposedDecisions>
 
 ---
@@ -182,9 +194,9 @@ Only entries still `proposed` after the final cycle get surfaced; keep `dropped`
 The decision set = every `## Proposed user decisions` entry still marked `proposed` (dropped/superseded entries are not surfaced).
 
 - 0 surviving decisions → skip; tell the user every finding was mechanical or was dropped across cycles, all recorded in ${WORKING_DOC}.
-- Otherwise → invoke `/adhoc_review` on the surviving `design-improvement` decisions with ${WORKING_DOC} already in scope, so it records each decision there.
+- Otherwise → invoke `/adhoc_review` on the surviving `design-improvement` decisions with ${WORKING_DOC} already in scope, so it records each decision there. This is a handoff, not a fresh command invocation: do **not** run `adhoc_review`'s document-selection/setup prompt, and do **not** ask where to record decisions.
 
 **A surviving `premise-challenge` (strengthen posture) is surfaced separately, not mixed into the `/adhoc_review` list.** Present it once, explicitly flagged: `This contradicts the document's stated intent (${REVIEW_INTENT}). It is admitted only because <decisive evidence>. Confirm the premise is open before I treat it as actionable.` Do not give it a recommendation that presumes the answer, and do not let it override the in-intent decisions. If the user does not open the premise, it stays recorded as a flagged note, not an action.
 
-Each handed-off item must carry title, severity, source dimension (the expert lens that found it), the concrete problem, impact, and a recommendation — so adhoc_review can show its summary, expand on `elaborate`, and mark the recommended choice. Do not run a separate walkthrough; adhoc_review owns the per-item interaction.
+Each handed-off item must carry title, severity, source dimension (the expert lens that found it), the concrete problem, impact, and a recommendation — so adhoc_review can show its summary, expand on `elaborate`, and mark the recommended choice. Start the handoff at `adhoc_review`'s item walkthrough using `${WORKING_DOC}`; do not run a separate walkthrough and do not repeat adhoc setup.
 </SurfaceDecisions>
