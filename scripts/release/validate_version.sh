@@ -9,6 +9,12 @@ VERSION="$1"
 shift
 CRATES=("$@")
 
+# crates.io's /api/v1 enforces a data-access policy that rejects requests
+# without an identifying User-Agent (curl's default UA fails). Without this the
+# call returns an errors object, which the `.errors` check below misreads as
+# "crate not yet published". See https://crates.io/data-access.
+CRATES_IO_UA="cargo-mend-release (https://github.com/natepiano/cargo-mend)"
+
 # --- Format check ---
 if [[ ! "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-rc\.[0-9]+)?$ ]]; then
   echo "ERROR: Invalid version format: $VERSION" >&2
@@ -27,7 +33,7 @@ for CRATE in "${CRATES[@]}"; do
   echo "Checking $CRATE..."
 
   # Query crates.io
-  RESPONSE=$(curl -s "https://crates.io/api/v1/crates/$CRATE")
+  RESPONSE=$(curl -s -A "$CRATES_IO_UA" "https://crates.io/api/v1/crates/$CRATE")
 
   # Check if crate exists on crates.io
   if echo "$RESPONSE" | jq -e '.errors' > /dev/null 2>&1; then

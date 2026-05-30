@@ -43,6 +43,14 @@ the point (for a camera example, spawning and driving the camera; for a shader
 example, the material/shader wiring; for an ECS example, the systems/queries).
 That code is **primary**.
 
+**Write down the demonstrated API by name** — the specific types, triggers,
+components, traits, or systems whose use is the point (e.g. "`ZoomToFit`,
+`LookAt`, `LookAtAndZoomToFit` triggers" or "`OrbitCam` with `RenderTarget` +
+per-camera viewport override"). The module doc, the primary section banner, and
+(if the flow spans systems) the section's "How it works" paragraph must all name
+this API. A reader skimming any one of them should be able to answer "what does
+this example teach?"
+
 Everything that only supports the demo is **supporting**: UI/HUD panels, scene
 scaffolding (ground, lights, placeholder meshes), decorative animation, and input
 plumbing not specific to the API. When unsure which bucket a piece falls in, ask
@@ -51,28 +59,54 @@ rather than guess.
 
 <Reorganize>
 Target order, top to bottom:
-1. **Module doc** — a short paragraph on what the example shows, the controls, and
-   a "Code layout" note pointing the reader at the primary section.
+1. **Module doc** — a short paragraph on what the example shows, naming the
+   demonstrated API from `<IdentifyPurpose>` by name, plus the controls. Do
+   **not** add a "Code layout" / "this section is below" navigation note —
+   the named banner below already does that job, and meta-commentary about
+   the file's structure is noise.
 2. **Imports.**
 3. **`main()`** — the entry point / app wiring, so the whole app is visible at a
    glance. Comment the non-obvious wiring (system ordering, observers).
-4. **Primary section(s)** — the code demonstrating the API. Lead with setup/spawn,
-   then the systems/observers that drive it, then local helpers.
+4. **Primary section(s)** — the code demonstrating the API. The banner must name
+   the demonstrated API from `<IdentifyPurpose>` (not just the subsystem — e.g.
+   `CAMERA TRIGGERS — ZoomToFit / LookAt / LookAtAndZoomToFit`, not just
+   `CAMERA`). If the demonstrated flow spans more than one system (a startup
+   spawn + an observer + an update system, for instance), open the section with
+   a short **"How it works"** paragraph immediately under the banner that
+   sketches the order in which they fire and what each step contributes — the
+   runtime story the per-fn doc comments can't tell on their own. Lead with
+   setup/spawn, then the systems/observers that drive it, then local helpers.
 5. **Supporting section(s)** — UI panels and scaffolding, then decorative animation
    last.
 
-Within every section, order items: constants → components/resources/types →
-spawn/startup systems → update systems & observers → helper fns.
+**Constants placement** depends on whether the example has more than one banner
+section below `main()`:
+- **Multi-section examples** (banner-delimited subsystems like CAMERA / GROUND /
+  GIZMO): constants live at the top of the section that owns them, just above
+  that section's types. A reader hitting a constant for the first time has the
+  surrounding context. `main()` can reference them by name — Rust resolves
+  forward refs without issue.
+- **Single-subsystem examples** (one camera, one target, a few tunables — no
+  banner sections below `main()`): constants in one block above `main()`,
+  grouped with `//` section headers (camera, cube, labels, timing).
 
-Delimit each section with a banner comment naming it and stating whether it's
-essential to the demonstrated API, e.g.:
+Within every section *below* `main()`, order items: constants (when section-local)
+→ components/resources/types → spawn/startup systems → update systems & observers
+→ helper fns.
+
+Delimit each section with a banner comment that names the section and, in one
+clause, says what it does — nothing more. e.g.:
 
 ```rust
 // ═════════════════════════════════════════════════════════════════════════════
 // CAMERA — spawning the OrbitCam, the per-engine axis, and the fly between views.
-// This is the part to read to learn how the camera is driven.
 // ═════════════════════════════════════════════════════════════════════════════
 ```
+
+Do **not** add editorial framing about importance ("this is the part to read",
+"not essential to the demonstrated API", "visualization aid"). The section
+ordering already conveys primary vs. supporting; restating it is noise. The
+banner title plus its one-line description is the whole banner.
 
 Comments: explain **behavior** — what the code does and the effect it produces —
 where a reader would otherwise have to guess. Do **not** write comments that

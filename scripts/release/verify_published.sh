@@ -10,10 +10,17 @@ shift
 CRATES=("$@")
 ALL_OK=true
 
+# crates.io's /api/v1 enforces a data-access policy that rejects requests
+# without an identifying User-Agent (curl's default UA fails). Without this the
+# call returns an errors object with no `.crate`, so `.crate.max_version`
+# yields null and every crate reads as a version mismatch. See
+# https://crates.io/data-access.
+CRATES_IO_UA="cargo-mend-release (https://github.com/natepiano/cargo-mend)"
+
 echo "=== Verifying Published Versions ==="
 
 for CRATE in "${CRATES[@]}"; do
-  PUBLISHED=$(curl -s "https://crates.io/api/v1/crates/$CRATE" | jq -r '.crate.max_version')
+  PUBLISHED=$(curl -s -A "$CRATES_IO_UA" "https://crates.io/api/v1/crates/$CRATE" | jq -r '.crate.max_version')
   if [[ "$PUBLISHED" == "$VERSION" ]]; then
     echo "  $CRATE: $PUBLISHED ✓"
   else
