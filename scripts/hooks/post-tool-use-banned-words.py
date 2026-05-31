@@ -161,6 +161,7 @@ def main() -> None:
             *bullets,
             "",
             "How to correct your behavior:",
+            "  • Re-emit your ENTIRE previous output verbatim, with every banned word corrected in place — do NOT reply with only the fixed sentence or a surrounding snippet. The user needs the whole message reproduced so they don't have to splice the correction back into the original.",
             "  • Rewrite the sentence — don't just swap one word.",
             "  • If no precise substitute fits, the sentence isn't making a claim — delete it.",
             "  • Use `allow-banned: <reason>` on the line if the use is genuinely legitimate (quoting the user, naming the rule itself).",

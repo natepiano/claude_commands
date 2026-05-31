@@ -72,8 +72,12 @@ def main() -> None:
         for stem in stems_in_order
     ]
     reason = (
-        f"⛔ banned word(s): {', '.join(parts)}; "
-        f"local totals: {format_counter_totals(bumped)}; state: {COUNTER_STATE}"
+        f"⛔ banned word(s): {', '.join(parts)}. "
+        "Re-emit your ENTIRE previous message verbatim, with every banned word corrected in place "
+        "(rewrite the sentence — don't just swap one word). Do NOT reply with only the fixed sentence "
+        "or a surrounding snippet; reproduce the whole message so the user doesn't have to splice the "
+        "correction back into the original. "
+        f"Local totals: {format_counter_totals(bumped)}; state: {COUNTER_STATE}"
     )
 
     print(json.dumps({"decision": "block", "reason": reason}))
