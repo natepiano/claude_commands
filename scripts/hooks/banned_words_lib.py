@@ -50,6 +50,48 @@ def is_introspection_command(command: str) -> bool:
     return any(tok in command for tok in INTROSPECTION_TOKENS)
 
 
+# Tools that only read — they never author content this turn. The PostToolUse
+# hook has no matcher, so it runs on every tool and scans `tool_response.output`;
+# for these that output is just file/search content the agent is inspecting, so
+# scanning it only produces false positives (a Read of a file that legitimately
+# uses a banned term, a Grep whose pattern is the term itself).
+READ_ONLY_TOOLS = frozenset({"Read", "Grep", "Glob", "NotebookRead", "LS"})
+
+
+def is_read_only_tool(tool_name: str) -> bool:
+    return tool_name in READ_ONLY_TOOLS
+
+
+# Read-only shell programs: the command string is a search pattern or path and
+# the output mirrors existing files — neither is content the agent authored this
+# turn. Matched as whole words so `cat` does not fire inside `duplicate`/`truncate`.
+READ_ONLY_PROGRAMS = (
+    "grep", "rg", "ag", "cat", "bat", "head", "tail", "less", "more",
+    "ls", "find", "fd", "wc", "tree", "diff", "stat", "file",
+)
+_READ_ONLY_PROG_RE = re.compile(r"\b(" + "|".join(READ_ONLY_PROGRAMS) + r")\b")
+# A redirection to a real file (not /dev/null, not an fd dup like `2>&1` /
+# `2>/dev/null`) means the command writes — disqualifies the read-only fast path.
+_WRITE_REDIRECT_RE = re.compile(r"(?<![0-9&])>>?\s*(?!/dev/null\b)(?!&)\S")
+# Programs that mutate even without a `>` redirection.
+_WRITE_PROGRAM_RE = re.compile(r"\b(tee|dd)\b|\bsed\s+-i|\bgit\s+(commit|add|tag)\b")
+
+
+def is_read_only_command(command: str) -> bool:
+    """True when a Bash command only reads/searches and writes nothing.
+
+    Used to skip the banned-word scan for inspection commands run through Bash
+    (a `grep`/`rg`/`cat` over the repo). A command qualifies only if it invokes a
+    read-only program AND carries no file-writing redirection or mutating program,
+    so `echo ... > f`, `git commit -m`, and `sed -i` are still scanned.
+    """
+    if not command:
+        return False
+    if _WRITE_REDIRECT_RE.search(command) or _WRITE_PROGRAM_RE.search(command):
+        return False
+    return bool(_READ_ONLY_PROG_RE.search(command))
+
+
 # ── Exception manager: guide-reproduction detection ─────────────────────────
 # `is_introspection_command` only covers Bash command strings. It cannot see
 # the assistant's own prose (scanned by the Stop hook) or arbitrary content

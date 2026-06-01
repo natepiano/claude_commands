@@ -21,6 +21,8 @@ from banned_words_lib import (
     get_stem_guidance,
     is_guide_reproduction,
     is_introspection_command,
+    is_read_only_command,
+    is_read_only_tool,
 )
 
 
@@ -78,6 +80,8 @@ def main() -> None:
         sys.exit(0)
 
     tool_name: str = data.get("tool_name", "") or ""
+    if is_read_only_tool(tool_name):
+        sys.exit(0)
     # Some MCP tools deliver `tool_input`/`tool_response` as a string instead
     # of a dict — defend against that before calling .get() on them.
     raw_tool_input: object = data.get("tool_input", {})
@@ -104,7 +108,7 @@ def main() -> None:
         sys.exit(0)
 
     command = tool_input.get("command", "") or tool_input.get("cmd", "") or ""
-    if is_introspection_command(command):
+    if is_introspection_command(command) or is_read_only_command(command):
         sys.exit(0)
 
     if (

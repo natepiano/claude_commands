@@ -49,6 +49,8 @@ The `regex:` line is read by `load_overrides` in `banned_words_lib.py`.
 
 6. **Register the pattern in the `pre_filter:` frontmatter** (pipe-separated, appended after the last alternative). This is the gate the clean-fix LLM style-eval pass uses to decide whether to evaluate a project — without it the new word is invisible to that subsystem. Use the same alternation as the `regex:` line minus the `\b` anchors, e.g. append `|pressure[\s-]+test(s|ed|ing)?`.
 
+   **Never put a literal `'` (apostrophe) in the pre_filter alternation.** The `pre_filter:` value is a single-quoted YAML scalar; a literal apostrophe breaks Obsidian's frontmatter parser (a lone `'` is read as the closing quote). If a form needs to match an apostrophe (e.g. `you're`, `one's`), encode it as `\x27` in the pre_filter line — ripgrep reads `\x27` as an apostrophe, so matching is unchanged. The `regex:` line in the body section is *not* YAML and may keep the literal `'`.
+
 7. If the new stem has a global exemption phrase (e.g. a domain term that should always be allowed), also add it to the `exceptions:` frontmatter line.
 
 8. Bump `date_modified` in the frontmatter to today.
