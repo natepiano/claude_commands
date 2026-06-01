@@ -17,7 +17,7 @@ bash ~/.claude/scripts/clippy/check_cache.sh .
 - **Exit 0, issues found**: Print the status table and the `=== cargo mend ===` / `=== cargo clippy ===` details. Then resume at STEP 7 and execute it in full — **including stopping at `<BatchDecisionPoint/>` and waiting for user approval before any edits**. "Resuming at STEP 7" does not mean skipping the decision gate.
 - **Exit 1**: Cache miss — proceed to STEP 2 (<RunMend/>).
 
-The script reads Port Report's `latest.json`, waits if a run is still in progress, compares the cached timestamp to source files, and outputs formatted results.
+The script reads lint-runs' `latest.json`, waits if a run is still in progress, compares the cached timestamp to source files, and outputs formatted results.
 </CheckCachedResults>
 
 <RunMend>
@@ -236,7 +236,7 @@ truth that maps clippy lints to the rule that governs them.
 <ExecutionSteps>
 **EXECUTE THESE STEPS IN ORDER:**
 
-**STEP 1:** Execute <CheckCachedResults/> — check for fresh Port Report results. Follow its resume instructions (may skip ahead but always continues through remaining steps in order).
+**STEP 1:** Execute <CheckCachedResults/> — check for fresh lint-runs results. Follow its resume instructions (may skip ahead but always continues through remaining steps in order).
 **STEP 2:** Execute <RunMend/> — run `cargo mend --workspace --all-targets` to check for issues
 **STEP 3:** If fixable items found, execute <RunMendFix/> — run `cargo mend --workspace --all-targets --fix`. If it fails, STOP and ask user.
 **STEP 4:** **Always** execute <StyleReview/> — evaluate diff against style guide rules (loads style guide only if diff is non-empty)
