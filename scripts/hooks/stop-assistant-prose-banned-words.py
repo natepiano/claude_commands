@@ -17,7 +17,6 @@ from typing import TypedDict, cast
 
 sys.path.insert(0, str(Path(__file__).parent))
 from banned_words_lib import (
-    COUNTER_STATE,
     bump_counters,
     find_violations,
     format_counter_totals,
@@ -71,14 +70,15 @@ def main() -> None:
         f"{stem} (line{'s' if len(lines_by_stem[stem]) > 1 else ''} {', '.join(str(n) for n in lines_by_stem[stem])})"
         for stem in stems_in_order
     ]
-    reason = (
-        f"⛔ banned word(s): {', '.join(parts)}. "
-        "Re-emit your ENTIRE previous message verbatim, with every banned word corrected in place "
-        "(rewrite the sentence — don't just swap one word). Do NOT reply with only the fixed sentence "
-        "or a surrounding snippet; reproduce the whole message so the user doesn't have to splice the "
-        "correction back into the original. "
-        f"Local totals: {format_counter_totals(bumped)}; state: {COUNTER_STATE}"
-    )
+    flagged = ", ".join(parts)
+    # A Stop hook has no model-only output channel — its only text fields are
+    # `reason`, `systemMessage`, and `stopReason`, and `reason` is shown to both
+    # the user and the model (there is no `hookSpecificOutput.additionalContext`
+    # for Stop; that field is rejected by the schema). So `reason` carries the
+    # short summary the user wants — which word fired and the running local
+    # totals — and the verbose re-emit protocol lives as a standing agent
+    # instruction (CLAUDE.md / the forbidden-words guide), not per-fire text.
+    reason = f"⛔ banned word(s): {flagged}. Local totals: {format_counter_totals(bumped)}"
 
     print(json.dumps({"decision": "block", "reason": reason}))
 

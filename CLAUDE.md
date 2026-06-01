@@ -2,6 +2,9 @@
 
 @/Users/natemccoy/rust/nate_style/rust/forbidden-words.md
 
+### banned-word re-emit protocol
+When the Stop hook reports a banned word (you'll see a short `⛔ banned word(s): … Local totals: …` summary), re-emit your ENTIRE previous message verbatim, with every banned word corrected in place — rewrite the sentence, don't just swap one word. Reproduce the whole message so the user doesn't have to splice the correction back into the original; do NOT reply with only the fixed sentence or a surrounding snippet.
+
 ## git
 ### commit
 **NEVER** commit changes unless i ask you to
