@@ -1,20 +1,19 @@
 # Skip Style Fix
 
-Skip or re-enable a workspace member for the **style eval/fix** pass, by
-commenting its line in the `[workspace_members]` section of
-`~/.claude/scripts/clean-fix/clean-fix.conf`.
+Skip or re-enable a target for the **style eval/fix** pass, by commenting its
+line in the `[targets]` allowlist of `~/.claude/scripts/clean-fix/clean-fix.conf`.
 
-This pass reads `[workspace_members]` for the members of a cargo workspace (e.g.
-`bevy_diegetic`, `bevy_lagrange`, `fairy_dust`). Clean never reads this section,
-so a style skip leaves the clean pass untouched. (Standalone repos are skipped
-via `[exclude]` — use `/skip_clean`.)
+`[targets]` is an opt-in allowlist. A target is either a whole directory or a
+workspace member (`<dir>/<subpath>`); a member is named by its last path segment
+(e.g. `bevy_diegetic`). It is independent of the clean pass's `[build]` list, so
+a style skip leaves clean untouched (use `/skip_clean` for that).
 
 **Arguments**: `$ARGUMENTS` — one of:
 
-- empty → show which members are currently skipped from style
-- `<member> [<member> ...]` → skip those members
-- `enable <member> [<member> ...]` → re-enable those members
-- `enable-all` (or `reset`) → re-enable every temp-skipped member
+- empty → show which targets are currently skipped from style
+- `<target> [<target> ...]` → skip those targets
+- `enable <target> [<target> ...]` → re-enable those targets
+- `enable-all` (or `reset`) → re-enable every temp-skipped target
 
 ## Instructions
 
@@ -23,7 +22,7 @@ relay its output verbatim. The helper is the single source of truth — do not
 edit the conf with Edit/Write.
 
 ```bash
-python3 ~/.claude/scripts/clean-fix/phase_skip.py style <action> [member ...]
+python3 ~/.claude/scripts/clean-fix/phase_skip.py style <action> [target ...]
 ```
 
 Map `$ARGUMENTS` → action:
@@ -33,6 +32,6 @@ Map `$ARGUMENTS` → action:
 - first token is `enable` → `enable` with the remaining tokens
 - anything else → `skip` with all tokens
 
-A commented member line is invisible to the conf parser, so the member drops out
-of the style eval and fix passes. The helper exits non-zero on an unknown name
-or a wrong-scope name (a standalone repo), printing a pointer to `/skip_clean`.
+A commented `[targets]` line is invisible to the conf parser, so the target
+drops out of the style eval, review, and fix passes. The helper exits non-zero
+on a name with no matching `[targets]` entry.

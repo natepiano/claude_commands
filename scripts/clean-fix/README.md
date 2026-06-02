@@ -10,8 +10,8 @@ Runs daily at **4:00 AM** via launchd.
 
 | File | Purpose |
 |------|---------|
-| `clean-fix.sh` | Main entry point. For each eligible project: clean, build, clippy. Then runs style eval + style-fix if the style mode is not `off`. Generates the clean-fix report at the end. |
-| `clean-fix.conf` | Configuration: excluded projects, style eval settings (`mode`, `max_new_findings`), warmup targets. |
+| `clean-fix.sh` | Main entry point. For each `[build]` target: clean, build, mend. Then runs style eval + style-fix if the style mode is not `off`. Generates the clean-fix report at the end. |
+| `clean-fix.conf` | Configuration. Two opt-in allowlists: `[build]` (clean/build/mend) and `[targets]` (style eval/review/fix). Plus style eval settings (`mode`, `max_new_findings`) and warmup targets. No deny list — nothing runs unless listed. |
 | `com.natemccoy.clean-fix.plist` | launchd plist — schedules the clean-fix job at 4:00 AM. |
 | `setup.sh` | Idempotent setup script — installs the launchd agent, creates runtime directories. |
 
@@ -19,7 +19,7 @@ Runs daily at **4:00 AM** via launchd.
 
 | File | Purpose |
 |------|---------|
-| `style-eval-all.sh` | Runs `/style_eval` on all eligible projects in parallel. Produces/updates `EVALUATION.md` in each project root. Checks for an existing `_style_fix` worktree and excludes those findings from re-evaluation. |
+| `style-eval-all.sh` | Runs `/style_eval` on every `[targets]` entry in parallel. Produces/updates `EVALUATION.md` in each target's work dir. Checks for an existing `_style_fix` worktree and omits those findings from re-evaluation. |
 
 ### Style-Fix Worktrees
 

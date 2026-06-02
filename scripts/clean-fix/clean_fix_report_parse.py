@@ -39,8 +39,9 @@ PHASES: tuple[str, ...] = ("clean", "warmup", "eval", "review", "fix")
 CELL_DASH = "-"
 
 # Permanent exclusions: directory will never be a candidate while it exists in
-# its current form. Includes both the user's `[exclude]` config and structural
-# reasons (not a Rust project, framework-managed worktree, etc.).
+# its current form. Covers directories not opted into the `[build]` / `[targets]`
+# allowlists plus structural reasons (not a Rust project, framework-managed
+# worktree, etc.).
 ALWAYS_EXCLUDED_REASONS: frozenset[str] = frozenset(
     {
         "excluded",

@@ -26,7 +26,7 @@ STATUS: complete | crashed | partial | in-progress
 
 PHASE <name> present=<bool> ok=N fail=N skip=N [footer_ok=N footer_fail=N footer_total=N]
 ROW <project>  clean=<cell> warmup=<cell> eval=<cell> review=<cell> fix=<cell>
-ALWAYS_EXCLUDED "<reason>" count=N projects=<a,b,c>   ← user opted these out via [exclude] in clean-fix.conf
+ALWAYS_EXCLUDED "<reason>" count=N projects=<a,b,c>   ← directories under ~/rust not opted into the relevant allowlist ([build] / [targets]) in clean-fix.conf
 FILTERED_OUT "<reason>" count=N projects=<a,b,c>      ← would be eligible, but framework state / project layout filtered them out
 WARNING <phase> <project> "<message>"                 ← real project failures
 TOOL_WARNING <phase> <project> "<message>"            ← sub-tool failed but project itself is healthy
@@ -34,7 +34,7 @@ SKIP_REASON <phase> "<reason>" count=N projects=<a,b,c>  ← only meaningful ski
 NOTE <free-text>
 ```
 
-`ALWAYS_EXCLUDED` and `FILTERED_OUT` are different audiences. The first is settled (user chose to exclude them, nothing to act on). The second is project state the user might want to clean up (stale worktree, missing Cargo.toml, etc.). Render them separately — never combine into one list.
+`ALWAYS_EXCLUDED` and `FILTERED_OUT` are different audiences. The first is settled (the directory was never opted into the allowlist, nothing to act on). The second is project state the user might want to clean up (stale worktree, missing Cargo.toml, etc.). Render them separately — never combine into one list.
 
 Only real participants appear in `ROW`.
 

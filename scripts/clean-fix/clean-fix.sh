@@ -28,8 +28,8 @@ log() {
     echo "$(date '+%Y-%m-%d %H:%M:%S') $1" | tee -a "$LOG_FILE"
 }
 
-# Parse conf file
-EXCLUDE=()
+# Parse conf file. [build] is an opt-in allowlist of directories to clean/build.
+BUILD_TARGETS=()
 STYLE_EVAL_MODE=claude
 if [[ -f "$CONF_FILE" ]]; then
     current_section=""
@@ -43,8 +43,8 @@ if [[ -f "$CONF_FILE" ]]; then
             continue
         fi
         case "$current_section" in
-            exclude)
-                EXCLUDE+=("$stripped")
+            build)
+                BUILD_TARGETS+=("$stripped")
                 ;;
             style_eval)
                 if [[ "$stripped" =~ ^mode=(.+)$ ]]; then
@@ -70,37 +70,18 @@ python3 "$SCRIPT_DIR/backpopulate_settings.py" --apply >> "$LOG_FILE" 2>&1 || {
     log "WARNING: settings back-population failed"
 }
 
-for project_dir in "$RUST_DIR"/*/; do
-    project_name=$(basename "$project_dir")
+# Guard so set -u doesn't trip on an empty allowlist expansion.
+if [[ ${#BUILD_TARGETS[@]} -eq 0 ]]; then
+    log "No [build] targets configured — skipping clean/build pass."
+fi
+for project_name in ${BUILD_TARGETS[@]+"${BUILD_TARGETS[@]}"}; do
+    project_dir="$RUST_DIR/$project_name"
 
-    # Skip excluded projects
-    skip=false
-    for exclude in "${EXCLUDE[@]}"; do
-        if [[ "$project_name" == "$exclude" ]]; then
-            skip=true
-            break
-        fi
-    done
-    if $skip; then
-        log "SKIP: $project_name (excluded)"
-        continue
-    fi
-
-    # Skip automation worktrees
-    if [[ "$project_name" == *_style_fix ]]; then
-        log "SKIP: $project_name (style-fix worktree)"
-        continue
-    fi
-
-    # Skip worktree checkouts (only process primary repos)
-    if [[ -f "$project_dir/.git" ]]; then
-        log "SKIP: $project_name (worktree, not primary checkout)"
-        continue
-    fi
-
-    # Skip non-Rust projects
+    # A listed target must be a Rust crate/workspace. A missing Cargo.toml means
+    # the opt-in name is wrong, so surface it rather than skip silently. Worktree
+    # checkouts (.git is a file) are valid build targets — each has its own target/.
     if [[ ! -f "$project_dir/Cargo.toml" ]]; then
-        log "SKIP: $project_name (no Cargo.toml)"
+        log "SKIP: $project_name (no Cargo.toml at $project_dir)"
         continue
     fi
 

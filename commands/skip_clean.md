@@ -1,19 +1,18 @@
 # Skip Clean
 
-Skip or re-enable a project for the **clean + build** pass, by editing the
-`[exclude]` section of `~/.claude/scripts/clean-fix/clean-fix.conf`.
+Skip or re-enable a directory for the **clean + build** pass, by commenting its
+line in the `[build]` allowlist of `~/.claude/scripts/clean-fix/clean-fix.conf`.
 
-The clean pass operates on top-level repo directories under `~/rust`. Standalone
-repos share `[exclude]` with the style pass, so a clean skip also removes a
-standalone repo from style. (Workspace members are not handled here — use
-`/skip_fix`.)
+`[build]` is an opt-in allowlist, so "skip" comments the entry out and "enable"
+uncomments it. It is independent of the style pass's `[targets]` list — skipping
+a directory from clean has no effect on style (use `/skip_fix` for that).
 
 **Arguments**: `$ARGUMENTS` — one of:
 
-- empty → show which repos are currently skipped from clean
-- `<repo> [<repo> ...]` → skip those repos
-- `enable <repo> [<repo> ...]` → re-enable those repos
-- `enable-all` (or `reset`) → re-enable every temp-skipped repo
+- empty → show which directories are currently skipped from clean
+- `<dir> [<dir> ...]` → skip those directories
+- `enable <dir> [<dir> ...]` → re-enable those directories
+- `enable-all` (or `reset`) → re-enable every temp-skipped directory
 
 ## Instructions
 
@@ -32,6 +31,6 @@ Map `$ARGUMENTS` → action:
 - first token is `enable` → `enable` with the remaining tokens
 - anything else → `skip` with all tokens
 
-The helper tags its edits so `enable-all` only reverses temp skips and never
-touches permanent `[exclude]` entries. It exits non-zero on an unknown repo or a
-wrong-scope name (a workspace member), printing a pointer to `/skip_fix`.
+The helper tags its edits with `#CLEAN_FIX_SKIP#` so `enable-all` only reverses
+temp skips and never touches plain doc comments. It exits non-zero on a name
+with no matching `[build]` entry.

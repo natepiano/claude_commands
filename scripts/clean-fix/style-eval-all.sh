@@ -1,15 +1,16 @@
 #!/bin/bash
-# Run style evaluations on all eligible Rust projects in parallel.
-# Uses the same exclude list as the clean-fix build from clean-fix.conf.
+# Run style evaluations on all opt-in targets in parallel.
+# Targets come from the [targets] allowlist in clean-fix.conf.
 # Can be run standalone or called from clean-fix.sh.
 #
 # Usage: style-eval-all.sh [project_name]
-#   If project_name is given, only evaluate that single project.
-#   If omitted, evaluate all eligible projects under ~/rust/.
+#   If project_name is given, only evaluate that single target.
+#   If omitted, evaluate every [targets] entry.
 #
-# Projects come from two sources:
-#   1. Standalone repos under ~/rust/*/ (traditional)
-#   2. [workspace_members] in clean-fix.conf (members of a cargo workspace)
+# Each [targets] line is either:
+#   <dir>            a whole directory (single crate, or --workspace)
+#   <dir>/<subpath>  one workspace member crate inside <dir>
+# <dir> may be a primary repo or a worktree checkout (e.g. *_bevy_update).
 
 set -euo pipefail
 
@@ -30,14 +31,10 @@ CODEX_BIN="${CODEX_BIN:-$HOME/.nvm/versions/node/v20.19.1/bin/codex}"
 mkdir -p "$LOG_DIR"
 mkdir -p "$FAILURE_LOG_DIR"
 
-# Parse conf file for excludes, settings, and workspace members.
-# Workspace-member entries are stored in three parallel arrays indexed by position.
-excludes=()
+# Parse conf file for the [targets] allowlist and style_eval settings.
+targets=()    # opt-in eval targets: <dir> or <dir>/<subpath>
 MAX_NEW_FINDINGS=""
 STYLE_AGENT_MODEL=""
-ws_names=()   # project_name
-ws_paths=()   # workspace_dir/subpath
-ws_pkgs=()    # package_name
 
 if [[ ! -f "$CONF_FILE" ]]; then
     echo "ERROR: conf file not found: $CONF_FILE" >&2
@@ -57,7 +54,7 @@ if [[ -f "$CONF_FILE" ]]; then
             continue
         fi
         case "$current_section" in
-            exclude) excludes+=("$stripped") ;;
+            targets) targets+=("$stripped") ;;
             style_eval)
                 if [[ "$stripped" =~ ^mode=(.+)$ ]]; then
                     STYLE_AGENT_MODE="${BASH_REMATCH[1]}"
@@ -72,30 +69,6 @@ if [[ -f "$CONF_FILE" ]]; then
                 fi
                 if [[ "$stripped" =~ ^max_new_findings=([0-9]+)$ ]]; then
                     MAX_NEW_FINDINGS="${BASH_REMATCH[1]}"
-                fi
-                ;;
-            workspace_members)
-                if [[ "$stripped" =~ ^([^=]+)=(.+)$ ]]; then
-                    wm_name="${BASH_REMATCH[1]}"
-                    wm_rhs="${BASH_REMATCH[2]}"
-                    wm_name="${wm_name## }"
-                    wm_name="${wm_name%% }"
-                    wm_rhs="${wm_rhs## }"
-                    wm_rhs="${wm_rhs%% }"
-                    if [[ "$wm_rhs" == *":"* ]]; then
-                        wm_path="${wm_rhs%%:*}"
-                        wm_pkg="${wm_rhs#*:}"
-                    else
-                        wm_path="$wm_rhs"
-                        wm_pkg=""
-                    fi
-                    wm_path="${wm_path%/}"
-                    if [[ -z "$wm_pkg" ]]; then
-                        wm_pkg="${wm_path##*/}"
-                    fi
-                    ws_names+=("$wm_name")
-                    ws_paths+=("$wm_path")
-                    ws_pkgs+=("$wm_pkg")
                 fi
                 ;;
         esac
@@ -227,51 +200,38 @@ projects=()
 project_roots=()
 project_worktree_evals=()
 
-# Pass 1: standalone projects from directory scan
-for project_dir in "$RUST_DIR"/*/; do
-    name=$(basename "$project_dir")
-    [[ ! -f "$project_dir/Cargo.toml" ]] && continue
-    [[ "$name" == *_style_fix ]] && continue
-    [[ -f "$project_dir/.git" ]] && continue
+# Resolve each [targets] entry into (name, project_root, worktree_eval).
+#   <dir>            -> whole directory; name=<dir>
+#   <dir>/<subpath>  -> workspace member; name=last path segment
+# <dir> may be a primary repo or a worktree checkout — the eval reads source
+# and never touches git, so the two are indistinguishable here.
+for entry in ${targets[@]+"${targets[@]}"}; do
+    if [[ "$entry" == */* ]]; then
+        name="${entry##*/}"
+        subpath="${entry#*/}"
+        project_root="${RUST_DIR}/${entry}"
+        worktree_eval="${RUST_DIR}/${name}_style_fix/${subpath}/EVALUATION.md"
+    else
+        name="$entry"
+        project_root="${RUST_DIR}/${entry}"
+        worktree_eval="${RUST_DIR}/${name}_style_fix/EVALUATION.md"
+    fi
 
     if [[ -n "$SINGLE_PROJECT" && "$name" != "$SINGLE_PROJECT" ]]; then
         continue
     fi
-
-    skip=false
-    for exclude in "${excludes[@]}"; do
-        if [[ "$name" == "$exclude" ]]; then
-            skip=true
-            break
-        fi
-    done
-    $skip && continue
+    if [[ ! -d "$project_root" ]]; then
+        echo "SKIP: $name (target path not found: $project_root)"
+        continue
+    fi
+    if [[ ! -f "$project_root/Cargo.toml" ]]; then
+        echo "SKIP: $name (no Cargo.toml at $project_root)"
+        continue
+    fi
 
     projects+=("$name")
-    project_roots+=("${RUST_DIR}/${name}")
-    project_worktree_evals+=("${RUST_DIR}/${name}_style_fix/EVALUATION.md")
-done
-
-# Pass 2: workspace members from conf
-for i in "${!ws_names[@]}"; do
-    name="${ws_names[$i]}"
-    if [[ -n "$SINGLE_PROJECT" && "$name" != "$SINGLE_PROJECT" ]]; then
-        continue
-    fi
-    wm_path="${ws_paths[$i]}"
-    member_root="${RUST_DIR}/${wm_path}"
-    if [[ ! -d "$member_root" ]]; then
-        echo "SKIP: $name (member path not found: $member_root)"
-        continue
-    fi
-    if [[ ! -f "$member_root/Cargo.toml" ]]; then
-        echo "SKIP: $name (no Cargo.toml at $member_root)"
-        continue
-    fi
-    subpath="${wm_path#*/}"
-    projects+=("$name")
-    project_roots+=("$member_root")
-    project_worktree_evals+=("${RUST_DIR}/${name}_style_fix/${subpath}/EVALUATION.md")
+    project_roots+=("$project_root")
+    project_worktree_evals+=("$worktree_eval")
 done
 
 if [[ ${#projects[@]} -eq 0 ]]; then

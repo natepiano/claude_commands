@@ -34,11 +34,9 @@ CODEX_BIN="${CODEX_BIN:-$HOME/.nvm/versions/node/v20.19.1/bin/codex}"
 
 mkdir -p "$LOG_DIR"
 
-# Parse conf for the agent mode/model, excludes, and workspace members. We honor
-# [exclude] and [workspace_members] so the project list matches the eval stage.
-excludes=()
-ws_names=()
-ws_paths=()
+# Parse conf for the agent mode/model and the [targets] allowlist, so the review
+# project list matches the eval stage.
+targets=()
 
 if [[ -f "$CONF_FILE" ]]; then
     current_section=""
@@ -52,30 +50,12 @@ if [[ -f "$CONF_FILE" ]]; then
             continue
         fi
         case "$current_section" in
-            exclude) excludes+=("$stripped") ;;
+            targets) targets+=("$stripped") ;;
             style_eval)
                 if [[ "$stripped" =~ ^mode=(.+)$ ]]; then
                     STYLE_AGENT_MODE="${BASH_REMATCH[1]}"
                 elif [[ "$stripped" =~ ^model=(.+)$ ]]; then
                     STYLE_AGENT_MODEL="${BASH_REMATCH[1]}"
-                fi
-                ;;
-            workspace_members)
-                if [[ "$stripped" =~ ^([^=]+)=(.+)$ ]]; then
-                    wm_name="${BASH_REMATCH[1]}"
-                    wm_rhs="${BASH_REMATCH[2]}"
-                    wm_name="${wm_name## }"
-                    wm_name="${wm_name%% }"
-                    wm_rhs="${wm_rhs## }"
-                    wm_rhs="${wm_rhs%% }"
-                    if [[ "$wm_rhs" == *":"* ]]; then
-                        wm_path="${wm_rhs%%:*}"
-                    else
-                        wm_path="$wm_rhs"
-                    fi
-                    wm_path="${wm_path%/}"
-                    ws_names+=("$wm_name")
-                    ws_paths+=("$wm_path")
                 fi
                 ;;
         esac
@@ -133,38 +113,22 @@ run_review_agent() {
 names=()
 eval_files=()
 
-# Pass 1: standalone projects
-for project_dir in "$RUST_DIR"/*/; do
-    name=$(basename "$project_dir")
-    [[ ! -f "$project_dir/Cargo.toml" ]] && continue
-    [[ "$name" == *_style_fix ]] && continue
-    [[ -f "$project_dir/.git" ]] && continue
+# Resolve each [targets] entry into (name, eval_file). <dir> or <dir>/<subpath>;
+# a member's name is its last path segment. Matches the eval stage's resolution.
+for entry in ${targets[@]+"${targets[@]}"}; do
+    if [[ "$entry" == */* ]]; then
+        name="${entry##*/}"
+    else
+        name="$entry"
+    fi
+    project_root="${RUST_DIR}/${entry}"
     if [[ -n "$SINGLE_PROJECT" && "$name" != "$SINGLE_PROJECT" ]]; then
         continue
     fi
-    skip=false
-    for exclude in "${excludes[@]}"; do
-        if [[ "$name" == "$exclude" ]]; then
-            skip=true
-            break
-        fi
-    done
-    $skip && continue
+    [[ ! -d "$project_root" ]] && continue
+    [[ ! -f "$project_root/Cargo.toml" ]] && continue
     names+=("$name")
-    eval_files+=("${project_dir%/}/EVALUATION.md")
-done
-
-# Pass 2: workspace members
-for i in "${!ws_names[@]}"; do
-    name="${ws_names[$i]}"
-    if [[ -n "$SINGLE_PROJECT" && "$name" != "$SINGLE_PROJECT" ]]; then
-        continue
-    fi
-    member_root="${RUST_DIR}/${ws_paths[$i]}"
-    [[ ! -d "$member_root" ]] && continue
-    [[ ! -f "$member_root/Cargo.toml" ]] && continue
-    names+=("$name")
-    eval_files+=("$member_root/EVALUATION.md")
+    eval_files+=("$project_root/EVALUATION.md")
 done
 
 if [[ ${#names[@]} -eq 0 ]]; then

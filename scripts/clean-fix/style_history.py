@@ -312,6 +312,13 @@ class WorkspaceMember:
 
 
 def workspace_members() -> dict[str, WorkspaceMember]:
+    """Workspace-member targets from the ``[targets]`` allowlist.
+
+    A member line is any ``[targets]`` entry containing a ``/`` — the part
+    before the first slash is the workspace directory, the rest is the member
+    subpath. The history key, package name, and ``_style_fix`` dir name all come
+    from the last path segment (e.g. ``bevy_diegetic``).
+    """
     if not CLEAN_FIX_CONF_FILE.exists():
         return {}
     members: dict[str, WorkspaceMember] = {}
@@ -323,26 +330,17 @@ def workspace_members() -> dict[str, WorkspaceMember]:
         if stripped.startswith("[") and stripped.endswith("]"):
             current_section = stripped[1:-1]
             continue
-        if current_section != "workspace_members" or "=" not in stripped:
+        if current_section != "targets" or "/" not in stripped:
             continue
-        name, _, rhs = stripped.partition("=")
-        name = name.strip()
-        rhs = rhs.strip()
-        if not name or not rhs:
-            continue
-        path_part, _, pkg_part = rhs.partition(":")
-        path_part = path_part.strip().strip("/")
-        pkg_part = pkg_part.strip()
-        if "/" not in path_part:
-            continue
+        path_part = stripped.strip("/")
         ws_dir, _, subpath = path_part.partition("/")
         if not ws_dir or not subpath:
             continue
-        package_name = pkg_part if pkg_part else Path(subpath).name
+        name = Path(subpath).name
         members[name] = WorkspaceMember(
             workspace_dir=ws_dir,
             member_subpath=subpath,
-            package_name=package_name,
+            package_name=name,
         )
     return members
 

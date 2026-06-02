@@ -1,16 +1,17 @@
 #!/bin/bash
-# Create style-fix worktrees for projects with EVALUATION.md findings.
-# For each eligible project: create a worktree, launch the configured style agent to apply fixes + clippy.
-# Uses the same exclude list as the clean-fix build from clean-fix.conf.
+# Create style-fix worktrees for targets with EVALUATION.md findings.
+# For each eligible target: create a worktree, launch the configured style agent to apply fixes + clippy.
+# Targets come from the [targets] allowlist in clean-fix.conf.
 # Can be run standalone or called from clean-fix.sh.
 #
 # Usage: style-fix-worktrees.sh [project_name]
-#   If project_name is given, only process that single project.
-#   If omitted, process all eligible projects under ~/rust/.
+#   If project_name is given, only process that single target.
+#   If omitted, process every eligible [targets] entry.
 #
-# Projects come from two sources:
-#   1. Standalone repos under ~/rust/*/ (traditional)
-#   2. [workspace_members] in clean-fix.conf (members of a cargo workspace)
+# Each [targets] line is either:
+#   <dir>            a whole directory (single crate, or --workspace)
+#   <dir>/<subpath>  one workspace member crate inside <dir>
+# <dir> may be a primary repo or a worktree checkout (e.g. *_bevy_update).
 
 set -euo pipefail
 
@@ -101,15 +102,12 @@ echo "[diag] style-fix-worktrees.sh starting: pid=$$ ppid=$PPID cwd_before=$(pwd
 cd "$RUST_DIR"
 echo "[diag] cwd_after_chdir=$(pwd)"
 
-# Parse conf file for excludes, settings, and workspace members
-excludes=()
+# Parse conf file for the [targets] allowlist and settings.
+targets=()
 MAX_NEW_FINDINGS=""
 AGENT_TIMEOUT_SECS=""
 POST_SUMMARY_GRACE_SECS=""
 HEARTBEAT_INTERVAL_SECS=""
-ws_names=()
-ws_paths=()
-ws_pkgs=()
 
 if [[ ! -f "$CONF_FILE" ]]; then
     echo "ERROR: conf file not found: $CONF_FILE" >&2
@@ -129,7 +127,7 @@ if [[ -f "$CONF_FILE" ]]; then
             continue
         fi
         case "$current_section" in
-            exclude) excludes+=("$stripped") ;;
+            targets) targets+=("$stripped") ;;
             style_eval)
                 if [[ "$stripped" =~ ^mode=(.+)$ ]]; then
                     STYLE_AGENT_MODE="${BASH_REMATCH[1]}"
@@ -151,30 +149,6 @@ if [[ -f "$CONF_FILE" ]]; then
                     POST_SUMMARY_GRACE_SECS="${BASH_REMATCH[1]}"
                 elif [[ "$stripped" =~ ^heartbeat_interval_secs=([0-9]+)$ ]]; then
                     HEARTBEAT_INTERVAL_SECS="${BASH_REMATCH[1]}"
-                fi
-                ;;
-            workspace_members)
-                if [[ "$stripped" =~ ^([^=]+)=(.+)$ ]]; then
-                    wm_name="${BASH_REMATCH[1]}"
-                    wm_rhs="${BASH_REMATCH[2]}"
-                    wm_name="${wm_name## }"
-                    wm_name="${wm_name%% }"
-                    wm_rhs="${wm_rhs## }"
-                    wm_rhs="${wm_rhs%% }"
-                    if [[ "$wm_rhs" == *":"* ]]; then
-                        wm_path="${wm_rhs%%:*}"
-                        wm_pkg="${wm_rhs#*:}"
-                    else
-                        wm_path="$wm_rhs"
-                        wm_pkg=""
-                    fi
-                    wm_path="${wm_path%/}"
-                    if [[ -z "$wm_pkg" ]]; then
-                        wm_pkg="${wm_path##*/}"
-                    fi
-                    ws_names+=("$wm_name")
-                    ws_paths+=("$wm_path")
-                    ws_pkgs+=("$wm_pkg")
                 fi
                 ;;
         esac
@@ -229,22 +203,6 @@ if [[ "$STYLE_AGENT_MODE" == "codex" && ! -x "$CODEX_BIN" ]]; then
     exit 1
 fi
 
-# Collect candidate project names from both sources
-candidates=()
-candidate_is_ws_idx=()  # for each candidate, the index into ws_names[] if it came from there, or -1
-
-for project_dir in "$RUST_DIR"/*/; do
-    name=$(basename "$project_dir")
-    [[ ! -f "$project_dir/Cargo.toml" ]] && continue
-    candidates+=("$name")
-    candidate_is_ws_idx+=("-1")
-done
-
-for i in "${!ws_names[@]}"; do
-    candidates+=("${ws_names[$i]}")
-    candidate_is_ws_idx+=("$i")
-done
-
 # Eligibility pass. Parallel arrays:
 #   eligible[] -- project names
 #   records[]  -- fields joined by ASCII Unit Separator (0x1F):
@@ -257,76 +215,57 @@ eligible=()
 records=()
 skipped=0
 
-for ci in "${!candidates[@]}"; do
-    name="${candidates[$ci]}"
-    ws_idx="${candidate_is_ws_idx[$ci]}"
+# Resolve each [targets] entry:
+#   <dir>            -> standalone: repo_dir = work_dir = ~/rust/<dir>, --workspace
+#   <dir>/<subpath>  -> workspace_member: repo_dir = ~/rust/<dir>, work_dir = repo_dir/subpath
+# <dir> may be a primary repo or a worktree checkout; `git rev-parse` accepts both.
+for entry in ${targets[@]+"${targets[@]}"}; do
+    if [[ "$entry" == */* ]]; then
+        kind="workspace_member"
+        subpath="${entry#*/}"
+        pkg="${entry##*/}"
+        name="$pkg"
+        repo_dir="${RUST_DIR}/${entry%%/*}"
+        work_dir="${RUST_DIR}/${entry}"
+        worktree_dir="${RUST_DIR}/${name}_style_fix"
+        worktree_eval="${worktree_dir}/${subpath}/EVALUATION.md"
+        branch_name="refactor/style/${name}"
+    else
+        kind="standalone"
+        subpath=""
+        pkg=""
+        name="$entry"
+        repo_dir="${RUST_DIR}/${entry}"
+        work_dir="$repo_dir"
+        worktree_dir="${RUST_DIR}/${name}_style_fix"
+        worktree_eval="${worktree_dir}/EVALUATION.md"
+        branch_name="refactor/style"
+    fi
+    eval_file="${work_dir}/EVALUATION.md"
 
     if [[ -n "$SINGLE_PROJECT" && "$name" != "$SINGLE_PROJECT" ]]; then
         continue
     fi
 
-    if [[ "$ws_idx" != "-1" ]]; then
-        # Workspace member
-        kind="workspace_member"
-        wm_path="${ws_paths[$ws_idx]}"
-        pkg="${ws_pkgs[$ws_idx]}"
-        subpath="${wm_path#*/}"
-        workspace_dir_name="${wm_path%%/*}"
-        repo_dir="${RUST_DIR}/${workspace_dir_name}"
-        member_dir="${RUST_DIR}/${wm_path}"
-        eval_file="${member_dir}/EVALUATION.md"
-        worktree_dir="${RUST_DIR}/${name}_style_fix"
-        worktree_eval="${worktree_dir}/${subpath}/EVALUATION.md"
-        branch_name="refactor/style/${name}"
+    # Rule: the work dir must exist and be a crate/workspace.
+    if [[ ! -d "$work_dir" ]]; then
+        echo "SKIP: $name (target path not found: $work_dir)"
+        skipped=$((skipped + 1))
+        continue
+    fi
+    if [[ ! -f "$work_dir/Cargo.toml" ]]; then
+        echo "SKIP: $name (no Cargo.toml at $work_dir)"
+        skipped=$((skipped + 1))
+        continue
+    fi
 
-        if [[ ! -d "$repo_dir/.git" ]]; then
-            echo "SKIP: $name (workspace repo not a git repo: $repo_dir)"
-            skipped=$((skipped + 1))
-            continue
-        fi
-        if [[ ! -d "$member_dir" ]]; then
-            echo "SKIP: $name (member path not found: $member_dir)"
-            skipped=$((skipped + 1))
-            continue
-        fi
-    else
-        # Standalone project
-        project_dir="${RUST_DIR}/${name}"
-
-        if [[ "$name" == *_style_fix ]]; then
-            echo "SKIP: $name (style-fix worktree)"
-            skipped=$((skipped + 1))
-            continue
-        fi
-
-        if [[ -f "$project_dir/.git" ]]; then
-            echo "SKIP: $name (worktree, not primary checkout)"
-            skipped=$((skipped + 1))
-            continue
-        fi
-
-        skip=false
-        for exclude in "${excludes[@]}"; do
-            if [[ "$name" == "$exclude" ]]; then
-                skip=true
-                break
-            fi
-        done
-        if $skip; then
-            echo "SKIP: $name (excluded)"
-            skipped=$((skipped + 1))
-            continue
-        fi
-
-        kind="standalone"
-        pkg=""
-        subpath=""
-        repo_dir="$project_dir"
-        member_dir="$project_dir"
-        eval_file="$project_dir/EVALUATION.md"
-        worktree_dir="${RUST_DIR}/${name}_style_fix"
-        worktree_eval="${worktree_dir}/EVALUATION.md"
-        branch_name="refactor/style"
+    # Rule: repo_dir must resolve to a git repo. `rev-parse` is true for a
+    # primary checkout (.git dir) and a linked worktree (.git file) alike, so
+    # worktree checkouts like *_bevy_update qualify without special-casing.
+    if ! git -C "$repo_dir" rev-parse --git-dir >/dev/null 2>&1; then
+        echo "SKIP: $name (not a git repo: $repo_dir)"
+        skipped=$((skipped + 1))
+        continue
     fi
 
     # Check 0: EVALUATION.md exists with numbered findings. The eval phase
@@ -370,24 +309,12 @@ for ci in "${!candidates[@]}"; do
         fi
     fi
 
-    # Check A2: For standalone projects, no other worktree can exist on the primary repo.
-    # For workspace_member projects, other worktrees of the workspace are expected
-    # (concurrent style-fix worktrees for sibling members live off the same repo).
-    if [[ "$kind" == "standalone" ]]; then
-        # Prune stale worktree metadata first — entries whose directories were
-        # deleted out from under git still appear in `worktree list` and would
-        # otherwise trip the count check below.
-        git -C "$repo_dir" worktree prune 2>/dev/null || true
-        worktree_count=$(git -C "$repo_dir" worktree list --porcelain 2>/dev/null | grep -c '^worktree ' || true)
-        if [[ "$worktree_count" -gt 1 ]]; then
-            echo "SKIP: $name (another worktree checkout already exists)"
-            python3 "$HISTORY_HELPER" discard-pending --project "$name" 2>/dev/null || true
-            skipped=$((skipped + 1))
-            continue
-        fi
-    fi
+    # (The old "no other worktree may exist" guard is gone: worktree checkouts
+    # are now first-class targets, so the parent repo legitimately has several
+    # worktrees. Check A above already guards the only slot that matters — the
+    # <name>_style_fix path must be free.)
 
-    # Check B: The primary checkout is clean.
+    # Check B: The working tree is clean.
     # For workspace_member, scope the dirty check to the member subpath.
     if [[ "$kind" == "workspace_member" ]]; then
         dirty=$(git -C "$repo_dir" status --porcelain -- "$subpath" 2>/dev/null || true)
