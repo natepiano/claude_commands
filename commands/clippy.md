@@ -13,8 +13,8 @@ bash ~/.claude/scripts/clippy/check_cache.sh .
 ```
 
 - **Exit 0, all passed + "git diff: clean"**: Print the status table and exit (complete no-op).
-- **Exit 0, all passed + "git diff: has changes"**: Print the status table, then resume at STEP 4 and continue through remaining steps in order (4 → 5 → 6 → 8 → 9).
-- **Exit 0, issues found**: Print the status table and the `=== cargo mend ===` / `=== cargo clippy ===` details. Then resume at STEP 7 and execute it in full — **including stopping at `<BatchDecisionPoint/>` and waiting for user approval before any edits**. "Resuming at STEP 7" does not mean skipping the decision gate.
+- **Exit 0, all passed + "git diff: has changes"**: Print the status table, then resume at STEP 4 and continue through remaining steps in order (4 → 5 → 5b → 6 → 8 → 9).
+- **Exit 0, issues found**: Print the status table and the `=== cargo mend ===` / `=== cargo clippy ===` / `=== cargo doc ===` details. Then resume at STEP 7 and execute it in full — **including stopping at `<BatchDecisionPoint/>` and waiting for user approval before any edits**. "Resuming at STEP 7" does not mean skipping the decision gate.
 - **Exit 1**: Cache miss — proceed to STEP 2 (<RunMend/>).
 
 The script reads lint-runs' `latest.json`, waits if a run is still in progress, compares the cached timestamp to source files, and outputs formatted results.
@@ -84,6 +84,23 @@ Error Handling:
 Capture all output for analysis - both successful warnings and compilation errors become todos.
 </RunClippy>
 
+<RunDoc>
+Execute: `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace --all-features`
+
+This mirrors the cargo-port `doc` lint command. `-D warnings` promotes every
+rustdoc lint (broken intra-doc links, invalid codeblock attributes, bare URLs,
+unescaped backticks, …) to an error, so a non-zero exit means a doc problem.
+`--no-deps` keeps dependencies' docs (and their warnings) out of the run.
+
+Error Handling:
+- **Environmental Issues (Stop execution):** If the command fails due to a missing Cargo.toml, network issues, or missing toolchain, inform user: "cargo doc cannot run - environment setup required." Then exit.
+- **Doc Errors (Process as todos):** rustdoc errors become todos alongside clippy findings.
+
+Note: `missing_docs` is a rustc compile-time lint, not a rustdoc one — it does NOT surface here. It is caught by clippy/check when configured in `[lints.rust]`.
+
+Capture all output for analysis - rustdoc errors become todos.
+</RunDoc>
+
 <ReportFindings>
 Present a summary before proceeding to todos:
 
@@ -91,16 +108,17 @@ Present a summary before proceeding to todos:
 **Mend**: [one of: "Fixed N issues via `cargo mend --workspace --all-targets --fix`" | "No issues found" | "No fixable issues found"] [if unfixable: "| N unfixable issues remaining"]
 **Style review**: [one of: "N violations fixed" | "All changes conform" | "No uncommitted changes to review"]
 **Clippy**: [one of: "N issues across M files" | "No issues found"]
+**Doc**: [one of: "N rustdoc errors across M files" | "No issues found"]
 
 Mend and style fixes are already applied, not action items.
-Only unfixable mend issues and clippy issues become todos below.
+Only unfixable mend issues, clippy issues, and rustdoc errors become todos below.
 </ReportFindings>
 
 <CreateBatchTodoList>
-Create a comprehensive todo list combining all clippy AND unfixable mend issues:
+Create a comprehensive todo list combining all clippy, rustdoc, AND unfixable mend issues:
 - Group related issues in same function/struct into single todos when logical
 - Each todo includes fix description and affected file locations
-- Label each todo with its source (clippy or mend) for clarity
+- Label each todo with its source (clippy, doc, or mend) for clarity
 - For each clippy todo, run the `lint:` frontmatter lookup described in
   `<FixingGuidelines/>` and include the matched rule file in the todo (e.g.
   `rule: never-allowclippytoomanylines.md`). Only include this field when a
@@ -118,6 +136,7 @@ Present the complete batch of fixes exactly as follows:
 
 ## Issues Found
 **Clippy**: [clippy_count] issues across [clippy_file_count] files
+**Doc**: [doc_count] rustdoc errors across [doc_file_count] files
 **Mend (unfixable)**: [mend_count] issues across [mend_file_count] files
 
 For each todo, show:
@@ -241,7 +260,8 @@ truth that maps clippy lints to the rule that governs them.
 **STEP 3:** If fixable items found, execute <RunMendFix/> — run `cargo mend --workspace --all-targets --fix`. If it fails, STOP and ask user.
 **STEP 4:** **Always** execute <StyleReview/> — evaluate diff against style guide rules (loads style guide only if diff is non-empty)
 **STEP 5:** Execute <RunClippy/>
-**STEP 6:** Execute <ReportFindings/> — present mend, fmt, and clippy summary
+**STEP 5b:** Execute <RunDoc/> — run rustdoc as a lint with `RUSTDOCFLAGS="-D warnings"`
+**STEP 6:** Execute <ReportFindings/> — present mend, fmt, clippy, and doc summary
 **STEP 7:** If unfixable mend or clippy issues found, execute <CreateBatchTodoList/>, <BatchDecisionPoint/>, <BatchExecution/>
 **STEP 8:** Execute <RunFmt/> — run `cargo +nightly fmt --all` unconditionally
 **STEP 9:** Completion summary

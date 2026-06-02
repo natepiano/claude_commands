@@ -180,6 +180,7 @@ if [[ "$status" == "passed" ]]; then
     echo "cargo mend        : passed"
     echo "cargo +nightly fmt: passed"
     echo "clippy            : passed"
+    echo "cargo doc         : passed"
     if [[ -z "$diff_output" ]]; then
         echo "git diff          : clean"
     else
@@ -209,6 +210,17 @@ if [[ "$status" == "failed" ]]; then
         fi
     fi
 
+    # Determine doc status. Unlike mend/clippy, a clean `cargo doc` run still
+    # writes "Documenting.../Finished" chatter to its log, so a non-empty log is
+    # not a failure signal. Look for rustdoc problem lines instead — with
+    # RUSTDOCFLAGS="-D warnings", denied lints surface as `error:` lines.
+    doc_has_issues=false
+    if [[ -f "$OUTPUT_DIR/doc-latest.log" ]]; then
+        if grep -qiE "^(warning|error)" "$OUTPUT_DIR/doc-latest.log"; then
+            doc_has_issues=true
+        fi
+    fi
+
     if [[ "$mend_has_issues" == true ]]; then
         echo "cargo mend        : issues found"
     else
@@ -220,6 +232,11 @@ if [[ "$status" == "failed" ]]; then
     else
         echo "clippy            : passed"
     fi
+    if [[ "$doc_has_issues" == true ]]; then
+        echo "cargo doc         : issues found"
+    else
+        echo "cargo doc         : passed"
+    fi
 
     # Output details
     if [[ "$mend_has_issues" == true ]]; then
@@ -229,5 +246,9 @@ if [[ "$status" == "failed" ]]; then
     if [[ "$clippy_has_issues" == true ]]; then
         echo "=== cargo clippy ==="
         cat "$OUTPUT_DIR/clippy-latest.log"
+    fi
+    if [[ "$doc_has_issues" == true ]]; then
+        echo "=== cargo doc ==="
+        cat "$OUTPUT_DIR/doc-latest.log"
     fi
 fi
