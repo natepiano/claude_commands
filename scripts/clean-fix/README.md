@@ -20,6 +20,7 @@ Runs daily at **4:00 AM** via launchd.
 | File | Purpose |
 |------|---------|
 | `style-eval-all.sh` | Runs `/style_eval` on every `[targets]` entry in parallel. Produces/updates `EVALUATION.md` in each target's work dir. Checks for an existing `_style_fix` worktree and omits those findings from re-evaluation. |
+| `rg-shim.sh` | Timeout shim for `ripgrep`. Bounds every non-interactive `rg` so a path-less search blocked on stdin can't hang forever. See **Reliability guards** below. |
 
 ### Style-Fix Worktrees
 
@@ -40,6 +41,43 @@ Runs daily at **4:00 AM** via launchd.
 | `clean-fix-style-flow.dot` | Graphviz source for the pipeline flowchart. Defines nodes, edges, positions, and cluster membership. |
 | `render-flow.py` | Renders the dot file to SVG. Parses cluster definitions from the dot file, runs `neato -n2`, then injects dashed cluster borders and rewrites the SVG viewBox. |
 | `clean-fix-style-flow.svg` | Generated output — do not edit by hand. |
+
+## Reliability guards (the rg-hang)
+
+On **2026-06-02** a nightly run wedged for 12+ hours and produced no style-fix
+worktrees. Two style-eval agents had issued pipelines like
+`rg PATTERN -g '*.rs' | rg -v X | head` where the first `rg` has glob filters
+but **no path argument**. With no path, `rg` searches stdin whenever stdin is
+not a terminal; claude's Bash tool hands each command an open stdin pipe that
+never delivers data and never closes, so that first `rg` blocked on `read()`
+forever. The eval stage's serial `wait` then stalled, the parent `clean-fix.sh`
+stayed alive, and the launchd trigger's `pgrep` concurrency guard suppressed
+every subsequent run all night.
+
+Two layers now prevent a recurrence:
+
+1. **Eval-stage watchdog** (`style-eval-all.sh`). The per-agent wait is
+   `wait_or_timeout`, which kills the agent's whole process tree (subshell +
+   `claude`/`codex` + any `rg`/`zsh` grandchildren) after `agent_timeout_secs`
+   (from `[style_fix]` in `clean-fix.conf`, default 2h). Containment: one hung
+   agent can no longer stall the pipeline.
+
+2. **`rg` timeout shim** (`rg-shim.sh`) — the source-level guard. Interactive
+   `rg` (stdin is a tty) is a transparent passthrough; non-interactive `rg`
+   runs under a watchdog that kills it after `RG_SHIM_TIMEOUT` seconds
+   (default 60). A path-less `rg` blocked on a dead pipe dies in seconds; normal
+   searches finish in milliseconds and never hit the cap.
+
+   **Activation** is a symlink:
+
+   ```
+   ~/.claude/scripts/rg -> clean-fix/rg-shim.sh
+   ```
+
+   `~/.claude/scripts` sits ahead of `/opt/homebrew/bin` on PATH (set in
+   `.zshrc`), for both the launchd agent's snapshot PATH and interactive shells,
+   so the shim wins `rg` resolution everywhere. To deactivate, remove the
+   symlink (`rm ~/.claude/scripts/rg`) — real `rg` resolves again immediately.
 
 ## Generating the flowchart
 

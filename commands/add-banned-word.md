@@ -57,6 +57,8 @@ The `regex:` line is read by `load_overrides` in `banned_words_lib.py`.
 
 9. Confirm to the user: heading added, both spellings blocked, local counter starts at 0 on first hook hit, hooks pick it up immediately on next run (no restart — the lib re-reads the file each invocation).
 
+   **Do NOT reproduce the new banned word/phrase — in any spelling — in your confirmation message.** The Stop hook scans the prose *you* emit; the `allow-banned` marker at the top of this command exempts the command file and the edits you write into the style guide, NOT the chat reply. Echoing the heading would flag the hook and bump the very counter you just created. Refer to the entry indirectly: "the entry you requested", "the new heading", "the stem you provided" — the user already knows the word, they asked for it. If you genuinely need to show the exact pattern, paste ONLY the `regex:` line of a *multi-word phrase* (e.g. `\brather[\s-]+than[\s-]+guess(es|ing|ed)?\b`) — there each token is followed by `[` or `\b`, so the matcher does not fire. For a single-word stem even the regex contains the bare root, so do not show it at all — confirm indirectly.
+
 10. Do **not** commit the change. Per the user's global rule, never commit unless explicitly asked.
 
 If the stem already exists, tell the user and ask whether they want to amend the existing entry instead.

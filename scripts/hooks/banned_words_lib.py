@@ -3,6 +3,7 @@
 import json
 import os
 import re
+import shutil
 from collections.abc import Iterable
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -18,6 +19,10 @@ except ImportError:  # pragma: no cover - non-Unix fallback
 STYLE_GUIDE = Path.home() / "rust" / "nate_style" / "rust" / "forbidden-words.md"
 COUNTER_STATE = Path.home() / ".claude" / "state" / "forbidden-word-counts.json"
 COUNTER_LOCK = COUNTER_STATE.with_suffix(".lock")
+# Snapshot of the counter file as it was *before* the most recent write. Each
+# write copies the live file here first, so `revert_to_backup()` undoes exactly
+# the last bump — used when a hit is deemed not to count (e.g. quoting a stem).
+COUNTER_BACKUP = COUNTER_STATE.with_name(COUNTER_STATE.name + ".bak")
 # Per-line allowance marker. Must be preceded by a comment opener (`#`, `//`,
 # or `<!--`) so casual prose mentions of the literal `allow-banned:` — e.g.
 # documentation describing the mechanism, or a backticked reference in chat —
@@ -234,6 +239,15 @@ def _counter_file_lock():
 
 def _write_counter_records(records: dict[str, CounterRecord]) -> None:
     COUNTER_STATE.parent.mkdir(parents=True, exist_ok=True)
+    # Back up the current on-disk state before overwriting it, so a bump the
+    # user later decides should not count can be undone with `--revert`. The
+    # backup stays exactly one write behind the live file. A failed copy must
+    # not block the counter write, so a missing backup is tolerated.
+    if COUNTER_STATE.exists():
+        try:
+            _ = shutil.copy2(COUNTER_STATE, COUNTER_BACKUP)
+        except OSError:
+            pass
     payload = {
         "version": 1,
         "words": {
@@ -248,6 +262,20 @@ def _write_counter_records(records: dict[str, CounterRecord]) -> None:
     tmp_path = COUNTER_STATE.with_name(f".{COUNTER_STATE.name}.{os.getpid()}.tmp")
     _ = tmp_path.write_text(text)
     _ = tmp_path.replace(COUNTER_STATE)
+
+
+def revert_to_backup() -> bool:
+    """Restore the counter file from the last backup (the snapshot taken before
+    the most recent write). Returns True if a backup existed and was restored,
+    False if there was nothing to restore. Takes the counter lock so it cannot
+    race a concurrent bump. The backup is left in place, so a second revert is a
+    no-op rather than restoring a staler state.
+    """
+    with _counter_file_lock():
+        if not COUNTER_BACKUP.exists():
+            return False
+        _ = shutil.copy2(COUNTER_BACKUP, COUNTER_STATE)
+        return True
 
 
 def format_counter_totals(records: dict[str, CounterRecord]) -> str:
@@ -473,6 +501,14 @@ def _main() -> int:
     import sys
 
     paths: list[str] = sys.argv[1:]
+    if paths and paths[0] in ("--revert", "--restore", "--undo"):
+        if revert_to_backup():
+            print(f"Reverted {COUNTER_STATE} from backup {COUNTER_BACKUP}")
+            print(f"Restored totals: {format_counter_totals(load_counter_records())}")
+            return 0
+        print(f"No backup found at {COUNTER_BACKUP}", file=sys.stderr)
+        return 2
+
     if paths and paths[0] in ("--analysis", "--counters"):
         rest = [a.lower() for a in paths[1:]]
         by_last_triggered = any(

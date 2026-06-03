@@ -363,6 +363,21 @@ load_record() {
     return 1
 }
 
+# Per-project environment from [project_env] in clean-fix.conf. Echoes the
+# space-separated KEY=VALUE assignments for the given project, or nothing.
+project_env_for() {
+    local proj="$1" line section=""
+    [[ -f "$CONF_FILE" ]] || return 0
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        line="${line%%#*}"; line="${line## }"; line="${line%% }"
+        [[ -z "$line" ]] && continue
+        if [[ "$line" =~ ^\[(.+)\]$ ]]; then section="${BASH_REMATCH[1]}"; continue; fi
+        if [[ "$section" == "project_env" && "$line" == "$proj="* ]]; then
+            echo "${line#*=}"; return 0
+        fi
+    done < "$CONF_FILE"
+}
+
 # Per-project function: create worktree and launch the configured style agent
 create_and_fix() {
     local proj="$1"
@@ -376,6 +391,17 @@ create_and_fix() {
     local pkg="$R_pkg"
     local branch_name="$R_branch"
     local log_file="$LOG_DIR/style_fix_${proj}.log"
+
+    # Per-project env (e.g. cargo-mend needs RUSTC_BOOTSTRAP=1 on stable). Exported
+    # here so it reaches both the style-fix agent's cargo runs and the build-gate;
+    # create_and_fix runs as its own backgrounded subshell, so this is scoped to
+    # this project only.
+    local proj_env
+    proj_env=$(project_env_for "$proj")
+    if [[ -n "$proj_env" ]]; then
+        echo "[diag $proj] project_env: $proj_env"
+        export $proj_env
+    fi
 
     echo "[diag $proj] create_and_fix start: pid=$$ cwd=$(pwd)"
     progress "$proj" "phase=worktree-create kind=$kind"
@@ -430,6 +456,8 @@ Working directory: $agent_work_dir
 Worktree root: $worktree_dir
 
 IMPORTANT: Do NOT spawn sub-agents, delegate, or parallelize through helper agents. Complete this fix pass yourself in a single agent run.
+
+IMPORTANT: Run every cargo command (mend, clippy, tests) in the FOREGROUND and read its output directly. Do NOT run cargo in the background and poll for it to finish with \`pgrep -f "cargo ..."\` — that substring matches this very fix prompt (your own claude process argv contains these cargo command names) and the polling command itself, so \`! pgrep ...\` is never true and the wait loop spins forever.
 
 **Progress markers (REQUIRED — emit before doing each step).** Print one line of the exact form below on stdout immediately before you begin each named phase. The orchestrator's log watcher reads these lines and forwards them to the user's chat as live progress; without them, the user sees only a 60s heartbeat and has no idea which phase you're in.
 
@@ -531,7 +559,7 @@ Step 5a (preview): Run: cargo clippy $cargo_scope_flag --all-targets --all-featu
 - Capture the list of warnings/errors reported. This is the baseline of what clippy sees.
 - If clippy reports nothing, skip to Step 6.
 - If clippy fails because the toolchain itself is missing, report the error and skip to Step 6.
-- If clippy fails with a COMPILE error, the tree is broken — almost always because an earlier step (a module split, rename, extraction, or move) left a dangling reference or missing import. STOP. Do NOT proceed to Step 5b, 5c, 6, or beyond until the tree compiles. Fix the cause directly (restore the missing import, re-add the dropped item, repoint the reference). If the breakage came from a finding you applied and you cannot fix it in place, revert that finding's edits and mark the finding `Skipped` in the Fix Summary with the compile error as the reason. Compile errors are NEVER "infrastructure" — they are caused by the edits in this run.
+- If clippy fails with a COMPILE error, the tree is broken — almost always because an earlier step (a module split, rename, extraction, or move) left a dangling reference or missing import. STOP. Do NOT proceed to Step 5b, 5c, 6, or beyond until the tree compiles. Fix the cause directly (restore the missing import, re-add the dropped item, repoint the reference). If the breakage came from a finding you applied and you cannot fix it in place, revert that finding's edits and mark the finding \`Skipped\` in the Fix Summary with the compile error as the reason. Compile errors are NEVER "infrastructure" — they are caused by the edits in this run.
 
 Step 5b (auto-fix): If Step 5a reported any fixable items, run: cargo clippy --fix $cargo_scope_flag --all-targets --all-features --allow-dirty --manifest-path $worktree_dir/Cargo.toml -- -D warnings
 - This auto-applies every fix clippy can make on its own. Do NOT manually fix anything clippy could have auto-fixed.

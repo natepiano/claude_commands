@@ -35,6 +35,7 @@ mkdir -p "$FAILURE_LOG_DIR"
 targets=()    # opt-in eval targets: <dir> or <dir>/<subpath>
 MAX_NEW_FINDINGS=""
 STYLE_AGENT_MODEL=""
+AGENT_TIMEOUT_SECS=""
 
 if [[ ! -f "$CONF_FILE" ]]; then
     echo "ERROR: conf file not found: $CONF_FILE" >&2
@@ -71,6 +72,11 @@ if [[ -f "$CONF_FILE" ]]; then
                     MAX_NEW_FINDINGS="${BASH_REMATCH[1]}"
                 fi
                 ;;
+            style_fix)
+                if [[ "$stripped" =~ ^agent_timeout_secs=([0-9]+)$ ]]; then
+                    AGENT_TIMEOUT_SECS="${BASH_REMATCH[1]}"
+                fi
+                ;;
         esac
     done < "$CONF_FILE"
 fi
@@ -79,6 +85,15 @@ if [[ -z "$MAX_NEW_FINDINGS" ]]; then
     echo "ERROR: [style_eval] max_new_findings is not set in $CONF_FILE" >&2
     exit 1
 fi
+
+# Backstop timeout for a single eval agent. Reuses the [style_fix] agent cap
+# (defaults to 2h if unset). Bounds a wedged agent so it cannot stall the serial
+# wait loop forever — the failure that left a 12h-old run holding the launchd
+# trigger's pgrep concurrency guard open, which suppressed every nightly run.
+# The common trigger is the model issuing `rg PATTERN` with no path argument:
+# run non-interactively, rg reads from stdin, and that stdin is a pipe that
+# never closes, so rg blocks on read() indefinitely.
+AGENT_TIMEOUT_SECS="${AGENT_TIMEOUT_SECS:-7200}"
 
 # True if the agent's log shows at least one real invocation of
 # style_history.py next-unit/record-unit. The prompt text quotes these
@@ -134,6 +149,63 @@ write_failure_report() {
         fi
     } > "$report"
     echo "  failure report: $report"
+}
+
+# Signal a PID and every descendant in one ps snapshot. Used to tear down a
+# wedged eval agent: the backgrounded subshell, its claude/codex child, and any
+# rg/zsh grandchildren. Killing only the subshell orphans a stuck `rg` (blocked
+# reading a never-closing stdin), so it keeps running — which is what left four
+# orphaned rg pipelines alive for 11h in the incident this guards against.
+kill_tree() {
+    local root="$1" sig="${2:-TERM}"
+    local pids
+    pids=$(python3 - "$root" <<'PY'
+import subprocess, sys
+root = int(sys.argv[1])
+out = subprocess.run(["ps", "-axo", "pid=,ppid="], capture_output=True, text=True).stdout
+kids = {}
+for line in out.split("\n"):
+    f = line.split()
+    if len(f) >= 2:
+        kids.setdefault(int(f[1]), []).append(int(f[0]))
+seen, stack = [], [root]
+while stack:
+    p = stack.pop()
+    if p in seen:
+        continue
+    seen.append(p)
+    stack += kids.get(p, [])
+print(" ".join(str(p) for p in seen))
+PY
+) || return 0
+    [[ -n "$pids" ]] && kill "-$sig" $pids 2>/dev/null || true
+}
+
+# Wait for an eval agent, killing its whole process tree if it overruns
+# $timeout seconds. A background watchdog polls liveness and, on overrun, sends
+# SIGTERM then SIGKILL to the tree; the foreground `wait` returns the moment the
+# agent exits or is killed. Without this, a single hung agent blocks the serial
+# wait loop indefinitely (see AGENT_TIMEOUT_SECS above).
+wait_or_timeout() {
+    local pid="$1" timeout="$2"
+    (
+        local waited=0
+        while [[ $waited -lt $timeout ]]; do
+            kill -0 "$pid" 2>/dev/null || exit 0
+            sleep 5
+            waited=$((waited + 5))
+        done
+        echo "TIMEOUT: eval agent (pid $pid) exceeded ${timeout}s — killing process tree"
+        kill_tree "$pid" TERM
+        sleep 5
+        kill_tree "$pid" KILL
+    ) &
+    local watchdog=$!
+    local code=0
+    wait "$pid" || code=$?
+    kill "$watchdog" 2>/dev/null || true
+    wait "$watchdog" 2>/dev/null || true
+    return $code
 }
 
 # Build the per-project prompt and invoke the configured style agent.
@@ -320,7 +392,7 @@ for pid in "${pids[@]}"; do
     project_root="${roots_for_wait[$idx]}"
     worktree_eval="${worktrees_for_wait[$idx]}"
     log_file="$LOG_DIR/style_eval_${name}.log"
-    wait "$pid" && code=0 || code=$?
+    wait_or_timeout "$pid" "$AGENT_TIMEOUT_SECS" && code=0 || code=$?
 
     if [[ ! -f "$project_root/EVALUATION.md" ]]; then
         a1_helper="no"

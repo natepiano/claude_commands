@@ -28,6 +28,23 @@ log() {
     echo "$(date '+%Y-%m-%d %H:%M:%S') $1" | tee -a "$LOG_FILE"
 }
 
+# Per-project build environment from [project_env] in clean-fix.conf. Echoes the
+# space-separated KEY=VALUE assignments for the given project, or nothing.
+# cargo-mend needs RUSTC_BOOTSTRAP=1 to compile its rustc_private features on
+# stable (the `imend` trick) — the global toolchain is stable.
+project_env_for() {
+    local proj="$1" line section=""
+    [[ -f "$CONF_FILE" ]] || return 0
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        line="${line%%#*}"; line="${line## }"; line="${line%% }"
+        [[ -z "$line" ]] && continue
+        if [[ "$line" =~ ^\[(.+)\]$ ]]; then section="${BASH_REMATCH[1]}"; continue; fi
+        if [[ "$section" == "project_env" && "$line" == "$proj="* ]]; then
+            echo "${line#*=}"; return 0
+        fi
+    done < "$CONF_FILE"
+}
+
 # Parse conf file. [build] is an opt-in allowlist of directories to clean/build.
 BUILD_TARGETS=()
 STYLE_EVAL_MODE=claude
@@ -95,20 +112,24 @@ for project_name in ${BUILD_TARGETS[@]+"${BUILD_TARGETS[@]}"}; do
         fi
     fi
 
+    # Per-project build env (e.g. cargo-mend needs RUSTC_BOOTSTRAP=1 on stable).
+    proj_env=$(project_env_for "$project_name")
+    [[ -n "$proj_env" ]] && log "ENV: $project_name ($proj_env)"
+
     log "CLEAN: $project_name"
-    cargo clean --manifest-path "$project_dir/Cargo.toml" 2>> "$LOG_FILE" || {
+    env $proj_env cargo clean --manifest-path "$project_dir/Cargo.toml" 2>> "$LOG_FILE" || {
         log "ERROR: cargo clean failed for $project_name"
         continue
     }
 
     log "BUILD: $project_name"
-    cargo build --workspace --examples --manifest-path "$project_dir/Cargo.toml" 2>> "$LOG_FILE" || {
+    env $proj_env cargo build --workspace --examples --manifest-path "$project_dir/Cargo.toml" 2>> "$LOG_FILE" || {
         log "ERROR: cargo build failed for $project_name"
         continue
     }
 
     log "MEND: $project_name"
-    cargo mend --workspace --all-targets --manifest-path "$project_dir/Cargo.toml" 2>> "$LOG_FILE" || {
+    env $proj_env cargo mend --workspace --all-targets --manifest-path "$project_dir/Cargo.toml" 2>> "$LOG_FILE" || {
         log "WARNING: cargo mend failed for $project_name"
     }
 

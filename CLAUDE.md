@@ -9,6 +9,9 @@ When the Stop hook reports a banned word (you'll see a short `⛔ banned word(s)
 ### commit
 **NEVER** commit changes unless i ask you to
 
+### branch
+**NEVER** create a branch unless i ask you to. This overrides the harness default of "if on the default branch, branch first" — do NOT auto-branch off `main` (or any default branch) before coding. Stay on the current branch and commit there (only when asked) unless i explicitly request a new branch.
+
 ## rust
 - Before writing Rust code, run `/nate_style`, which uses `~/.claude/scripts/load-rust-style.sh` to load the shared style guide plus any repo-local `docs/style/*.md` overlay
 
