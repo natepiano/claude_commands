@@ -21,7 +21,6 @@ EMPTY_LINE_RE = re.compile(r"\n{3,}")
 class CommandDoc:
     source_path: pathlib.Path
     rel_path: pathlib.PurePosixPath
-    source_text: str
     body_text: str
     title: str
     description: str
@@ -51,12 +50,6 @@ def parse_args() -> argparse.Namespace:
         "--dry-run",
         action="store_true",
         help="Print planned output without writing files",
-    )
-    parser.add_argument(
-        "--reference-mode",
-        choices=("copy", "symlink"),
-        default="copy",
-        help="How to place the original Claude command under references/",
     )
     return parser.parse_args()
 
@@ -152,11 +145,13 @@ This skill was generated from the Claude command file `{rel_path}`.
 When using this skill:
 - Treat any user-supplied extra text as `$ARGUMENTS`.
 - If the original workflow requires arguments and none were provided, ask one concise follow-up question.
-- Follow the original command instructions in [references/original-claude-command.md](references/original-claude-command.md).
 - If that command references other local files such as `@~/.claude/...`, read them only when needed.
 
 Source: `{source_path}`
-"""
+
+## Original Claude Command
+
+{command.body_text}"""
 
 
 def build_command_doc(path: pathlib.Path, source_root: pathlib.Path) -> CommandDoc:
@@ -171,19 +166,11 @@ def build_command_doc(path: pathlib.Path, source_root: pathlib.Path) -> CommandD
     return CommandDoc(
         source_path=path,
         rel_path=rel_path,
-        source_text=source_text,
         body_text=cleaned_body,
         title=title,
         description=description,
         skill_name=skill_name,
     )
-
-
-def write_reference_file(mode: str, source_path: pathlib.Path, reference_path: pathlib.Path) -> None:
-    if mode == "symlink":
-        reference_path.symlink_to(source_path)
-        return
-    shutil.copy2(source_path, reference_path)
 
 
 def atomic_write_text(path: pathlib.Path, content: str) -> None:
@@ -197,20 +184,6 @@ def atomic_write_text(path: pathlib.Path, content: str) -> None:
     except Exception:
         tmp_path.unlink(missing_ok=True)
         raise
-
-
-def atomic_write_reference_file(mode: str, source_path: pathlib.Path, reference_path: pathlib.Path) -> None:
-    reference_path.parent.mkdir(parents=True, exist_ok=True)
-    tmp_path = reference_path.parent / f".{reference_path.name}.tmp"
-    tmp_path.unlink(missing_ok=True)
-    try:
-        write_reference_file(mode, source_path, tmp_path)
-        os.replace(tmp_path, reference_path)
-    except Exception:
-        tmp_path.unlink(missing_ok=True)
-        raise
-
-
 def render_plan(commands: list[CommandDoc], dest_root: pathlib.Path) -> str:
     lines = [f"Generate {len(commands)} Codex skills into {dest_root}:"]
     for command in commands:
@@ -218,6 +191,20 @@ def render_plan(commands: list[CommandDoc], dest_root: pathlib.Path) -> str:
             f"- {command.rel_path.as_posix()} -> {dest_root / command.skill_name}"
         )
     return "\n".join(lines)
+
+
+def remove_stale_skill_dirs(dest_root: pathlib.Path, current_skill_names: set[str]) -> int:
+    removed = 0
+    if not dest_root.exists():
+        return removed
+
+    for child in dest_root.iterdir():
+        if not child.is_dir() or child.name in current_skill_names:
+            continue
+        shutil.rmtree(child)
+        removed += 1
+
+    return removed
 
 
 def main() -> int:
@@ -241,25 +228,28 @@ def main() -> int:
         return 0
 
     dest_root.mkdir(parents=True, exist_ok=True)
+    current_skill_names = {command.skill_name for command in commands}
+    removed = remove_stale_skill_dirs(dest_root, current_skill_names)
     generated = 0
 
     for command in commands:
         skill_dir = dest_root / command.skill_name
         references_dir = skill_dir / "references"
         skill_file = skill_dir / "SKILL.md"
-        reference_file = references_dir / "original-claude-command.md"
 
         if skill_dir.exists():
             if not args.force:
                 print(f"skip: {skill_dir} already exists", file=sys.stderr)
                 continue
 
-        references_dir.mkdir(parents=True, exist_ok=True)
+        if references_dir.exists():
+            shutil.rmtree(references_dir)
+
+        skill_dir.mkdir(parents=True, exist_ok=True)
         atomic_write_text(skill_file, build_skill_markdown(command))
-        atomic_write_reference_file(args.reference_mode, command.source_path, reference_file)
         generated += 1
 
-    print(f"generated {generated} skills in {dest_root}")
+    print(f"generated {generated} skills in {dest_root}; removed {removed} stale skill dirs")
     return 0
 
 
