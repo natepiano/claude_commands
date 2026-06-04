@@ -76,13 +76,13 @@ digraph clean_fix_style {
         style=dashed color="#95a5a6" fontcolor="#7f8c8d" fontsize=9
         margin=12
 
-        fix_foreach [label="For each project with\nEVALUATION.md findings" height=0.55 pos="700.2,790!"]
+        fix_foreach [label="For each project with\npending eval findings" height=0.55 pos="700.2,790!"]
         prechecks [label="Prechecks:\n- target _style_fix path is free\n- primary tree is clean" height=0.65 pos="700.2,720!"]
         create_wt [label="git worktree add\n-b refactor/style\n{project}_style_fix" height=0.65 pos="700.2,645!"]
-        mv_eval [label="mv EVALUATION.md → worktree\n(primary starts fresh)" height=0.55 pos="700.2,575!"]
+        mv_eval [label="export pending markdown\n→ worktree EVALUATION.md" height=0.55 pos="700.2,575!"]
         claude_fix [label="Launch Claude\n(fixes, cargo mend, clippy,\ntests, style review)" fillcolor="#d5f5e3" color="#27ae60" height=0.65 pos="700.2,500!"]
         fix_ok [label="Worktree ready\nfor review" fillcolor="#d5f5e3" color="#27ae60" height=0.55 width=1.8 pos="625.4,425!"]
-        fix_fail [label="Failure: mv EVAL\nback, rm worktree" fillcolor="#fadbd8" color="#e74c3c" height=0.55 width=1.8 pos="775.0,425!"]
+        fix_fail [label="Failure: finalize\nor keep pending" fillcolor="#fadbd8" color="#e74c3c" height=0.55 width=1.8 pos="775.0,425!"]
     }
 
     report [label="Generate Clean-fix Report" shape=oval fillcolor="#f0e6ff" color="#8e44ad" width=2.2 pos="447.4,195!"]

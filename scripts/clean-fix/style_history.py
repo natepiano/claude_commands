@@ -49,6 +49,8 @@ class ReviewedUnit(TypedDict, total=False):
 
 class PendingState(TypedDict, total=False):
     budget: int
+    evaluation_markdown: str
+    evaluation_updated_at: str
     phase: str
     reviewed_unit_ids: list[str]
     reviewed_units: list[ReviewedUnit]
@@ -280,11 +282,19 @@ def existing_findings_in_eval(project_root: Path) -> int:
     eval_path = project_root / "EVALUATION.md"
     if not eval_path.exists():
         return 0
+    return count_findings_in_markdown(eval_path.read_text())
+
+
+def count_findings_in_markdown(markdown: str) -> int:
     return sum(
         1
-        for line in eval_path.read_text().splitlines()
+        for line in markdown.splitlines()
         if line.startswith("### ") and len(line) > 4 and line[4].isdigit()
     )
+
+
+def has_no_violations_marker(markdown: str) -> bool:
+    return any(line.strip() == "## No violations found" for line in markdown.splitlines())
 
 
 def excluded_projects() -> set[str]:
@@ -569,13 +579,17 @@ def start_run(project_root: Path) -> None:
     HISTORY_DIR.mkdir(parents=True, exist_ok=True)
     PENDING_DIR.mkdir(parents=True, exist_ok=True)
     project = project_root.name.removesuffix("_style_fix")
-    # EVALUATION.md is the budget source of truth because review/fix stages
-    # consume that file directly. Once it has `max_new_findings` numbered
-    # findings, next-unit stops.
+    # Pending JSON is the budget source of truth. A project-root EVALUATION.md
+    # from an older run is still imported for compatibility, but new runs keep
+    # evaluation markdown in .history/.pending/<project>.json.
     cap = max_new_findings()
-    finding_count = existing_findings_in_eval(project_root)
+    legacy_eval = project_root / "EVALUATION.md"
+    evaluation_markdown = legacy_eval.read_text() if legacy_eval.exists() else ""
+    finding_count = count_findings_in_markdown(evaluation_markdown)
     payload: PendingState = {
         "budget": cap,
+        "evaluation_markdown": evaluation_markdown,
+        "evaluation_updated_at": utc_now() if evaluation_markdown else "",
         "phase": "evaluation",
         "reviewed_unit_ids": [],
         "reviewed_units": [],
@@ -612,6 +626,53 @@ def set_phase(project: str, phase: str) -> None:
     write_pending(project, pending)
 
 
+def save_evaluation(project_root: Path, eval_path: Path) -> None:
+    project = project_root.name.removesuffix("_style_fix")
+    pending = load_pending(project)
+    if not pending:
+        raise SystemExit(f"No pending run for {project}. Start a run first.")
+    if not eval_path.exists():
+        raise SystemExit(f"Evaluation markdown not found: {eval_path}")
+    markdown = eval_path.read_text()
+    pending["evaluation_markdown"] = markdown
+    pending["evaluation_updated_at"] = utc_now()
+    pending["scored_count"] = count_findings_in_markdown(markdown)
+    pending["updated_at"] = utc_now()
+    write_pending(project, pending)
+
+
+def export_evaluation(project: str, output: Path) -> None:
+    pending = load_pending(project)
+    markdown = pending.get("evaluation_markdown", "") if pending else ""
+    if not markdown:
+        raise SystemExit(f"No pending evaluation markdown for {project}.")
+    output.parent.mkdir(parents=True, exist_ok=True)
+    output.write_text(markdown)
+
+
+def evaluation_status_payload(project: str) -> dict[str, object]:
+    pending = load_pending(project)
+    markdown = pending.get("evaluation_markdown", "") if pending else ""
+    finding_count = count_findings_in_markdown(markdown)
+    has_review_log = "## Review Log" in markdown
+    if not markdown:
+        status = "missing"
+    elif finding_count > 0 and has_review_log:
+        status = "reviewed_findings"
+    elif finding_count > 0:
+        status = "findings"
+    else:
+        status = "no_findings"
+    return {
+        "finding_count": finding_count,
+        "has_no_violations": has_no_violations_marker(markdown),
+        "has_pending": bool(pending),
+        "has_review_log": has_review_log,
+        "line_count": len(markdown.splitlines()) if markdown else 0,
+        "status": status,
+    }
+
+
 def next_unit(project_root: Path) -> dict[str, object]:
     project = project_root.name.removesuffix("_style_fix")
     pending = load_pending(project)
@@ -619,7 +680,8 @@ def next_unit(project_root: Path) -> dict[str, object]:
         raise SystemExit(f"No pending run for {project}. Start a run first.")
 
     budget = max_new_findings()
-    finding_count = existing_findings_in_eval(project_root)
+    evaluation_markdown = pending.get("evaluation_markdown", "")
+    finding_count = count_findings_in_markdown(evaluation_markdown)
     pending["budget"] = budget
     pending["scored_count"] = finding_count
     write_pending(project, pending)
@@ -708,10 +770,13 @@ def record_unit(project_root: Path, results_path: Path, eval_path: Path) -> None
     if unit_id in reviewed_unit_ids:
         raise SystemExit(f"Unit already recorded in this run: {unit_id}")
 
-    eval_guidelines: set[str] = (
-        set(parse_eval_guidelines(eval_path, project_root).values())
+    evaluation_markdown = (
+        eval_path.read_text()
         if eval_path.exists()
-        else set()
+        else pending.get("evaluation_markdown", "")
+    )
+    eval_guidelines: set[str] = set(
+        parse_eval_guidelines_text(evaluation_markdown, project_root).values()
     )
 
     found_finding = False
@@ -754,7 +819,9 @@ def record_unit(project_root: Path, results_path: Path, eval_path: Path) -> None
     pending["reviewed_units"] = reviewed_units
     reviewed_unit_ids.append(unit_id)
     pending["reviewed_unit_ids"] = reviewed_unit_ids
-    pending["scored_count"] = existing_findings_in_eval(project_root)
+    pending["evaluation_markdown"] = evaluation_markdown
+    pending["evaluation_updated_at"] = utc_now()
+    pending["scored_count"] = count_findings_in_markdown(evaluation_markdown)
     pending["phase"] = "evaluation"
     pending["updated_at"] = utc_now()
     pending["last_unit_id"] = unit_id
@@ -768,10 +835,14 @@ def record_unit(project_root: Path, results_path: Path, eval_path: Path) -> None
 def parse_eval_guidelines(path: Path, project_root: Path) -> dict[str, str]:
     if not path.exists():
         return {}
+    return parse_eval_guidelines_text(path.read_text(), project_root)
+
+
+def parse_eval_guidelines_text(markdown: str, project_root: Path) -> dict[str, str]:
     guideline_by_title: dict[str, str] = {}
     current_title = ""
     in_improvements = False
-    for raw_line in path.read_text().splitlines():
+    for raw_line in markdown.splitlines():
         line = raw_line.strip()
         if line == "## Improvements":
             in_improvements = True
@@ -978,6 +1049,18 @@ def parse_args() -> argparse.Namespace:
         required=True,
         help="Path to EVALUATION.md. record-unit refuses to record a finding whose guideline is not present under ## Improvements.",
     )
+    save_eval = subparsers.add_parser("save-evaluation")
+    _ = save_eval.add_argument("--project-root", required=True)
+    _ = save_eval.add_argument("--evaluation", required=True)
+    export_eval = subparsers.add_parser("export-evaluation")
+    _ = export_eval.add_argument("--project", required=True)
+    _ = export_eval.add_argument("--output", required=True)
+    status_eval = subparsers.add_parser("evaluation-status")
+    _ = status_eval.add_argument("--project", required=True)
+    _ = status_eval.add_argument(
+        "--field",
+        choices=("finding_count", "has_no_violations", "has_pending", "has_review_log", "line_count", "status"),
+    )
     no_findings = subparsers.add_parser("finalize-no-findings")
     _ = no_findings.add_argument("--project", required=True)
     last = subparsers.add_parser(
@@ -1044,6 +1127,26 @@ def main() -> None:
             Path(_arg_str(args, "results")).expanduser().resolve(),
             Path(_arg_str(args, "eval_path")).expanduser().resolve(),
         )
+        return
+    if command == "save-evaluation":
+        save_evaluation(
+            Path(_arg_str(args, "project_root")).expanduser().resolve(),
+            Path(_arg_str(args, "evaluation")).expanduser().resolve(),
+        )
+        return
+    if command == "export-evaluation":
+        export_evaluation(
+            _arg_str(args, "project"),
+            Path(_arg_str(args, "output")).expanduser().resolve(),
+        )
+        return
+    if command == "evaluation-status":
+        payload = evaluation_status_payload(_arg_str(args, "project"))
+        field = getattr(args, "field")  # pyright: ignore[reportAny]
+        if isinstance(field, str):
+            print(payload[field])
+        else:
+            print(json.dumps(payload, indent=2, sort_keys=True))
         return
     if command == "finalize-no-findings":
         finalize_no_findings(_arg_str(args, "project"))

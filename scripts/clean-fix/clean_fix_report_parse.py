@@ -22,12 +22,16 @@ from pathlib import Path
 from typing import cast
 
 LOG_DIR = Path.home() / ".local" / "logs" / "clean-fix"
+RUST_DIR = Path.home() / "rust"
+CONF_FILE = Path.home() / ".claude" / "scripts" / "clean-fix" / "clean-fix.conf"
+HISTORY_DIR = RUST_DIR / "nate_style" / ".history"
+PENDING_DIR = HISTORY_DIR / ".pending"
 
 # Single source of truth for the live-monitor filter regex.
 # Kept identical in spirit to the alternation that previously lived in
 # commands/monitor_clean_fix.md so /monitor_clean_fix can consume it via --filter-regex.
 MONITOR_FILTER_REGEX = (
-    r"(^|[[:space:]])(CLEAN|BUILD|MEND|DONE|ERROR|WARNING|TIMEOUT|RETRY|RETRY OK|RETRY FAILED|FAILED|WARN|OK):"
+    r"(^|[[:space:]])(CLEAN|BUILD|MEND|DONE|ERROR|WARNING|TIMEOUT|RETRY|RETRY OK|RETRY FAILED|FAILED|WARN|OK|AUTOFINALIZE):"
     r"|(^|[[:space:]])WARMUP (OK|FAIL|SKIP):"
     r"|(^|[[:space:]])Launched: "
     r"|^=== "
@@ -37,6 +41,12 @@ MONITOR_FILTER_REGEX = (
 
 PHASES: tuple[str, ...] = ("clean", "warmup", "eval", "review", "fix")
 CELL_DASH = "-"
+EVAL_SORT_ORDER: dict[str, int] = {
+    "FAIL": 0,
+    "OK": 1,
+    "SKIP": 2,
+    CELL_DASH: 3,
+}
 
 # Permanent exclusions: directory will never be a candidate while it exists in
 # its current form. Covers directories not opted into the `[build]` / `[targets]`
@@ -76,11 +86,11 @@ TS_RE = re.compile(r"^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}) ")
 COMPLETE_RE = re.compile(r"=== Clean-fix Rust clean \+ rebuild complete \(([^)]+)\) ===")
 EVAL_HEADER_RE = re.compile(r"=== Style evaluation: (\d+) projects ===")
 EVAL_DONE_RE = re.compile(r"=== Done: (\d+) succeeded, (\d+) failed out of (\d+) ===")
-REVIEW_HEADER_RE = re.compile(r"=== Style eval review: (\d+) projects ===")
+REVIEW_HEADER_RE = re.compile(r"=== Style eval review(?: \([^)]+\))?: (\d+) projects ===")
 REVIEW_DONE_RE = re.compile(r"=== Done: (\d+) reviewed, (\d+) failed out of (\d+) ===")
 FIX_HEADER_RE = re.compile(r"=== Style-fix worktrees: (\d+) eligible projects ===")
 FIX_DONE_RE = re.compile(
-    r"=== Done: (\d+) created, (\d+) failed, (\d+) skipped out of (\d+) ==="
+    r"=== Done: (\d+) created, (\d+) failed, (\d+) skipped(?: out of (\d+))? ==="
 )
 FILENAME_TS_RE = re.compile(r"(\d{8}-\d{6})")
 
@@ -178,6 +188,129 @@ def find_newest_log() -> Path | None:
 def _filename_ts_key(path: Path) -> str:
     match = FILENAME_TS_RE.search(path.name)
     return match.group(1) if match else ""
+
+
+def target_roots_by_project() -> dict[str, Path]:
+    """Return style-eval target-name to project-root mapping from clean-fix.conf."""
+    roots: dict[str, Path] = {}
+    if not CONF_FILE.exists():
+        return roots
+    current_section = ""
+    for raw_line in CONF_FILE.read_text(errors="replace").splitlines():
+        stripped = raw_line.split("#", 1)[0].strip()
+        if not stripped:
+            continue
+        if stripped.startswith("[") and stripped.endswith("]"):
+            current_section = stripped[1:-1]
+            continue
+        if current_section != "targets":
+            continue
+        if "/" in stripped:
+            name = stripped.rsplit("/", 1)[1]
+            root = RUST_DIR / stripped
+        else:
+            name = stripped
+            root = RUST_DIR / stripped
+        roots.setdefault(name, root)
+    return roots
+
+
+def run_start_epoch(result: ParseResult) -> float | None:
+    if not result.run_start:
+        return None
+    try:
+        return time.mktime(time.strptime(result.run_start, "%Y-%m-%d %H:%M:%S"))
+    except ValueError:
+        return None
+
+
+def markdown_has_no_violations(text: str) -> bool:
+    return (
+        re.search(r"^## No violations found\s*$", text, re.MULTILINE) is not None
+        and re.search(r"^### [0-9]", text, re.MULTILINE) is None
+    )
+
+
+def pending_evaluation_markdown(project: str) -> str:
+    pending_path = PENDING_DIR / f"{project}.json"
+    if not pending_path.exists():
+        return ""
+    try:
+        import json
+
+        parsed = json.loads(pending_path.read_text(errors="replace"))
+    except (OSError, ValueError):
+        return ""
+    if isinstance(parsed, dict):
+        markdown = parsed.get("evaluation_markdown", "")
+        if isinstance(markdown, str):
+            return markdown
+    return ""
+
+
+def history_has_no_findings_for_run(project: str, result: ParseResult) -> bool:
+    history_path = HISTORY_DIR / f"{project}.jsonl"
+    if not history_path.exists():
+        return False
+    start_epoch = run_start_epoch(result)
+    if start_epoch is None:
+        return False
+    try:
+        import json
+
+        rows = [
+            json.loads(line)
+            for line in history_path.read_text(errors="replace").splitlines()
+            if line.strip()
+        ]
+    except (OSError, ValueError):
+        return False
+    for row in reversed(rows):
+        if not isinstance(row, dict):
+            continue
+        start_time = row.get("start_time", "")
+        if not isinstance(start_time, str) or not start_time:
+            continue
+        try:
+            row_epoch = time.mktime(time.strptime(start_time, "%Y-%m-%dT%H:%M:%SZ"))
+        except ValueError:
+            continue
+        if row_epoch < start_epoch - 1:
+            continue
+        reviewed = row.get("reviewed_units", [])
+        if not isinstance(reviewed, list) or not reviewed:
+            continue
+        for entry in reviewed:
+            if not isinstance(entry, dict):
+                return False
+            outcome = entry.get("outcome", {})
+            if not isinstance(outcome, dict):
+                return False
+            if outcome.get("skipped_by") == "pre_filter":
+                continue
+            if outcome.get("status") not in (None, "no_findings"):
+                return False
+        return True
+    return False
+
+
+def evaluation_has_no_violations(project: str, result: ParseResult) -> bool:
+    """Infer no-finding completion from pending/history/legacy eval state."""
+    markdown = pending_evaluation_markdown(project)
+    if markdown and markdown_has_no_violations(markdown):
+        return True
+    if history_has_no_findings_for_run(project, result):
+        return True
+
+    # Legacy fallback for logs produced before pending JSON owned the handoff.
+    project_root = target_roots_by_project().get(project, RUST_DIR / project)
+    eval_path = project_root / "EVALUATION.md"
+    if not eval_path.exists():
+        return False
+    start_epoch = run_start_epoch(result)
+    if start_epoch is not None and eval_path.stat().st_mtime < start_epoch - 1:
+        return False
+    return markdown_has_no_violations(eval_path.read_text(errors="replace"))
 
 
 def detect_phase_boundaries(lines: list[str]) -> dict[str, tuple[int, int]]:
@@ -363,17 +496,30 @@ def parse_eval_phase(lines: list[str], result: ParseResult) -> None:
     stats.present = True
     launched: set[str] = set()
     resolved: set[str] = set()
-    ok_re = re.compile(r"^OK: (\S+) \(\s*\d+ lines\)")
+    ok_re = re.compile(r"^OK: (\S+) \((?:\s*\d+ lines|no findings\b)")
+    autofinalize_re = re.compile(r"^AUTOFINALIZE: (\S+) \(no findings\b")
     fail_re = re.compile(r"^(FAILED|ERROR|TIMEOUT): (\S+)(?:\s*\(([^)]+)\))?")
     skip_re = re.compile(r"^SKIP: (\S+) \(([^)]+)\)")
     launched_re = re.compile(r"^Launched: (\S+) ")
 
     for line in lines:
+        if line.startswith("TIMEOUT: eval agent "):
+            continue
         m = ok_re.match(line)
         if m:
             project = m.group(1)
-            get_row(result.rows, project)["eval"] = Cell("OK")
-            stats.ok += 1
+            reason = "no-findings" if "no findings" in line else ""
+            get_row(result.rows, project)["eval"] = Cell("OK", reason)
+            if project not in resolved:
+                stats.ok += 1
+            resolved.add(project)
+            continue
+        m = autofinalize_re.match(line)
+        if m:
+            project = m.group(1)
+            get_row(result.rows, project)["eval"] = Cell("OK", "no-findings")
+            if project not in resolved:
+                stats.ok += 1
             resolved.add(project)
             continue
         m = fail_re.match(line)
@@ -381,7 +527,8 @@ def parse_eval_phase(lines: list[str], result: ParseResult) -> None:
             project = m.group(2)
             reason = m.group(3) or m.group(1).lower()
             get_row(result.rows, project)["eval"] = Cell("FAIL", slugify_reason(reason))
-            stats.fail += 1
+            if project not in resolved:
+                stats.fail += 1
             resolved.add(project)
             result.warnings.append(Warning("eval", project, reason))
             continue
@@ -389,8 +536,10 @@ def parse_eval_phase(lines: list[str], result: ParseResult) -> None:
         if m:
             project, reason = m.group(1), m.group(2)
             get_row(result.rows, project)["eval"] = Cell("SKIP", slugify_reason(reason))
-            stats.skip += 1
+            if project not in resolved:
+                stats.skip += 1
             result.skip_reasons.append(SkipReason("eval", reason, project))
+            resolved.add(project)
             continue
         m = launched_re.match(line)
         if m:
@@ -403,9 +552,13 @@ def parse_eval_phase(lines: list[str], result: ParseResult) -> None:
 
     # Launched but never resolved → no result; treat as fail.
     for project in launched - resolved:
-        get_row(result.rows, project)["eval"] = Cell("FAIL", "no-result")
-        stats.fail += 1
-        result.warnings.append(Warning("eval", project, "launched but no result"))
+        if evaluation_has_no_violations(project, result):
+            get_row(result.rows, project)["eval"] = Cell("OK", "no-findings")
+            stats.ok += 1
+        else:
+            get_row(result.rows, project)["eval"] = Cell("FAIL", "no-result")
+            stats.fail += 1
+            result.warnings.append(Warning("eval", project, "launched but no result"))
 
 
 def parse_review_phase(lines: list[str], result: ParseResult) -> None:
@@ -514,7 +667,12 @@ def parse_fix_phase(lines: list[str], result: ParseResult) -> None:
         if m:
             stats.footer_ok = int(m.group(1))
             stats.footer_fail = int(m.group(2))
-            stats.footer_total = int(m.group(4))
+            footer_total = m.group(4)
+            stats.footer_total = (
+                int(footer_total)
+                if footer_total is not None
+                else stats.footer_ok + stats.footer_fail + int(m.group(3))
+            )
 
     for project in eligible:
         cell = fix_results.get(project)
@@ -661,6 +819,78 @@ def _prune_bookkeeping_rows(result: ParseResult) -> None:
     ]
 
 
+def row_reason(result: ParseResult, project: str) -> str:
+    """Return a compact reason for the row's non-OK state."""
+    row = result.rows[project]
+    reasons: list[str] = []
+    seen: set[str] = set()
+
+    def add(reason: str) -> None:
+        reason = reason.strip()
+        if reason and reason not in seen:
+            seen.add(reason)
+            reasons.append(reason)
+
+    warnings_by_phase = {
+        warning.phase: warning.message
+        for warning in result.warnings
+        if warning.project == project
+    }
+    skips_by_phase = {
+        skip.phase: skip.reason
+        for skip in result.skip_reasons
+        if skip.project == project
+    }
+    tool_warnings_by_phase = {
+        warning.phase: warning.message
+        for warning in result.tool_warnings
+        if warning.project == project
+    }
+
+    for phase in PHASES:
+        cell = row[phase]
+        if cell.state == "FAIL":
+            reason = (
+                warnings_by_phase.get(phase)
+                or humanize_cell_reason(cell.reason)
+                or "failed"
+            )
+            add(f"{phase}: {reason}")
+        elif cell.state == "SKIP":
+            reason = (
+                skips_by_phase.get(phase)
+                or humanize_cell_reason(cell.reason)
+                or "skipped"
+            )
+            add(f"{phase}: {reason}")
+        elif phase == "eval" and cell.state == "OK" and cell.reason == "no-findings":
+            add("eval: no violations found")
+        elif cell.reason == "warning":
+            add(f"{phase}: {tool_warnings_by_phase.get(phase) or 'tool warning'}")
+
+    if not reasons and row["eval"].state == "OK":
+        missing_after_eval = [
+            phase for phase in ("review", "fix") if not result.stats[phase].present
+        ]
+        if missing_after_eval:
+            add(f"{'/'.join(missing_after_eval)} not in log")
+
+    return "; ".join(reasons)
+
+
+def humanize_cell_reason(reason: str) -> str:
+    """Turn internal cell slugs into short report text."""
+    if not reason:
+        return ""
+    known = {
+        "from-disk": "found Fix Summary on disk",
+        "no-fix-summary": "no Fix Summary",
+        "no-result": "no result",
+        "retry-failed": "retry failed",
+    }
+    return known.get(reason, reason.replace("-", " "))
+
+
 def detect_current_phase(path: Path) -> tuple[str, str]:
     """Return (current_phase, latest_meaningful_line)."""
     text = path.read_text(errors="replace")
@@ -726,10 +956,15 @@ def emit_full_report(result: ParseResult) -> None:
         print(" ".join(parts))
     print()
 
-    for project in sorted(result.rows.keys()):
+    def row_sort_key(project: str) -> tuple[int, str]:
+        eval_state = result.rows[project]["eval"].state
+        return (EVAL_SORT_ORDER.get(eval_state, len(EVAL_SORT_ORDER)), project)
+
+    for project in sorted(result.rows.keys(), key=row_sort_key):
         row = result.rows[project]
         cells = " ".join(f"{p}={row[p].render()}" for p in PHASES)
-        print(f"ROW {project}  {cells}")
+        reason = row_reason(result, project).replace('"', "'") or "-"
+        print(f'ROW {project}  {cells} reason="{reason}"')
     print()
 
     def _emit_grouped(record: str, items: list[tuple[str, str]]) -> None:

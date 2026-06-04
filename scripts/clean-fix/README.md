@@ -108,11 +108,11 @@ Clean-fix Build (4:00 AM)
   ├─ Phase 2: Style Evaluation (per project, parallel)
   │    Load style guide → survey code → carry forward valid findings
   │    → check for _style_fix worktree findings (exclude them)
-  │    → find new violations → write EVALUATION.md
+  │    → find new violations → store pending evaluation markdown
   │
   ├─ Phase 3: Style-Fix Worktrees (per project, parallel)
   │    Create _style_fix worktree (other linked worktrees allowed if primary is clean)
-  │    → mv EVALUATION.md into it
+  │    → materialize pending evaluation markdown into the worktree
   │    → Configured style agent applies fixes, runs clippy/tests/style review
   │
   └─ Generate Clean-fix Report

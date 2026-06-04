@@ -1,5 +1,5 @@
 #!/bin/bash
-# Run the style-eval-review prompt on every project with a fresh EVALUATION.md.
+# Run the style-eval-review prompt on every project with fresh pending evaluation markdown.
 # Runs after style-eval-all.sh and before style-fix-worktrees.sh in the
 # clean-fix pipeline.
 #
@@ -8,13 +8,13 @@
 # at style-eval-review-prompt.md in this directory — it is not a slash command.
 #
 # Usage: style-eval-review-all.sh [project_name]
-#   If project_name is given, only review that single project's EVALUATION.md.
-#   If omitted, review every eligible project's EVALUATION.md.
+#   If project_name is given, only review that single project's pending evaluation.
+#   If omitted, review every eligible pending evaluation.
 #
 # Eligibility:
-#   - EVALUATION.md exists at the project root (or workspace-member subpath)
-#   - EVALUATION.md has at least one `### N.` numbered finding
-#   - EVALUATION.md does not yet contain a `## Review Log` section
+#   - pending JSON has evaluation markdown
+#   - the markdown has at least one `### N.` numbered finding
+#   - the markdown does not yet contain a `## Review Log` section
 #     (review is idempotent — already-reviewed evals are skipped)
 
 set -euo pipefail
@@ -26,6 +26,7 @@ RUST_DIR="$HOME/rust"
 NATE_STYLE_DIR="$HOME/rust/nate_style"
 CONF_FILE="$SCRIPT_DIR/clean-fix.conf"
 CMD_FILE="$SCRIPT_DIR/style-eval-review-prompt.md"
+HISTORY_HELPER="$SCRIPT_DIR/style_history.py"
 LOG_DIR="/private/tmp/claude"
 SINGLE_PROJECT="${1:-}"
 STYLE_AGENT_MODE="claude"
@@ -74,7 +75,7 @@ fi
 
 # Substitute $ARGUMENTS into the prompt, then invoke the configured review agent.
 # Mirrors run_style_agent in style-eval-all.sh; the review only edits
-# EVALUATION.md, so codex gets the workspace dir plus the style guide tree.
+# evaluation markdown, so codex gets the workspace dir plus the style guide tree.
 run_review_agent() {
     local project_root="$1" prompt="$2" log_file="$3"
     local final_prompt="$prompt"
@@ -85,7 +86,7 @@ run_review_agent() {
                 -- "$final_prompt" > "$log_file" 2>&1
             ;;
         codex)
-            final_prompt=$'IMPORTANT: Do NOT spawn sub-agents, delegate, or parallelize through helper agents. Complete this review yourself in a single agent run.\nIMPORTANT: Edit only EVALUATION.md. Do NOT modify source code or any style guide file.\n\n'"$prompt"
+            final_prompt=$'IMPORTANT: Do NOT spawn sub-agents, delegate, or parallelize through helper agents. Complete this review yourself in a single agent run.\nIMPORTANT: Edit only the provided evaluation markdown file. Do NOT modify source code or any style guide file.\n\n'"$prompt"
             local codex_args=()
             if [[ -n "$STYLE_AGENT_MODEL" ]]; then
                 codex_args+=("-m" "$STYLE_AGENT_MODEL")
@@ -109,9 +110,10 @@ run_review_agent() {
 
 # Build the project list. Parallel arrays:
 #   names[i]        -- project name
-#   eval_files[i]   -- absolute path to that project's EVALUATION.md
+#   eval_files[i]   -- scratch path for that project's pending evaluation markdown
 names=()
 eval_files=()
+project_roots=()
 
 # Resolve each [targets] entry into (name, eval_file). <dir> or <dir>/<subpath>;
 # a member's name is its last path segment. Matches the eval stage's resolution.
@@ -128,7 +130,8 @@ for entry in ${targets[@]+"${targets[@]}"}; do
     [[ ! -d "$project_root" ]] && continue
     [[ ! -f "$project_root/Cargo.toml" ]] && continue
     names+=("$name")
-    eval_files+=("$project_root/EVALUATION.md")
+    eval_files+=("$LOG_DIR/style_eval_review_${name}_EVALUATION.md")
+    project_roots+=("$project_root")
 done
 
 if [[ ${#names[@]} -eq 0 ]]; then
@@ -136,7 +139,7 @@ if [[ ${#names[@]} -eq 0 ]]; then
     exit 0
 fi
 
-# Eligibility filter: EVALUATION.md must exist, have findings, and not yet
+# Eligibility filter: pending evaluation must exist, have findings, and not yet
 # carry a Review Log. Build the launch list.
 launch_names=()
 launch_roots=()
@@ -148,20 +151,26 @@ skipped_already_reviewed=0
 for i in "${!names[@]}"; do
     name="${names[$i]}"
     eval_file="${eval_files[$i]}"
-    project_root="$(dirname "$eval_file")"
+    project_root="${project_roots[$i]}"
 
-    if [[ ! -f "$eval_file" ]]; then
+    status=$(python3 "$HISTORY_HELPER" evaluation-status --project "$name" --field status 2>/dev/null || echo "missing")
+    if [[ "$status" == "missing" ]]; then
         skipped_no_eval=$((skipped_no_eval + 1))
         continue
     fi
-    finding_count=$(grep -c '^### [0-9]' "$eval_file" 2>/dev/null || true)
-    if [[ "$finding_count" -eq 0 ]]; then
+    if [[ "$status" == "no_findings" ]]; then
         skipped_no_findings=$((skipped_no_findings + 1))
         continue
     fi
-    if grep -q '^## Review Log$' "$eval_file" 2>/dev/null; then
+    if [[ "$status" == "reviewed_findings" ]]; then
         skipped_already_reviewed=$((skipped_already_reviewed + 1))
         echo "SKIP: $name (already reviewed)"
+        continue
+    fi
+    rm -f "$eval_file"
+    if ! python3 "$HISTORY_HELPER" export-evaluation --project "$name" --output "$eval_file"; then
+        echo "FAILED: $name (could not export pending evaluation)"
+        skipped_no_eval=$((skipped_no_eval + 1))
         continue
     fi
     launch_names+=("$name")
@@ -170,7 +179,7 @@ for i in "${!names[@]}"; do
 done
 
 if [[ ${#launch_names[@]} -eq 0 ]]; then
-    echo "No EVALUATION.md files eligible for review."
+    echo "No pending evaluations eligible for review."
     echo "  no eval: $skipped_no_eval"
     echo "  no findings: $skipped_no_findings"
     echo "  already reviewed: $skipped_already_reviewed"
@@ -188,7 +197,10 @@ for i in "${!launch_names[@]}"; do
     project_root="${launch_roots[$i]}"
     log_file="$LOG_DIR/style_eval_review_${proj}.log"
 
-    prompt="$(sed "s|\$ARGUMENTS|$project_root|g" "$CMD_FILE")"
+    prompt="$(sed \
+        -e "s|\$ARGUMENTS|$project_root|g" \
+        -e "s|\$EVALUATION_PATH|$eval_file|g" \
+        "$CMD_FILE")"
 
     run_review_agent "$project_root" "$prompt" "$log_file" &
     pids+=($!)
@@ -212,6 +224,9 @@ for pid in "${pids[@]}"; do
         echo "WARN: $name (review agent exited $code)"
     fi
     if grep -q '^## Review Log$' "$eval_file" 2>/dev/null; then
+        python3 "$HISTORY_HELPER" save-evaluation \
+            --project-root "${launch_roots[$idx]}" \
+            --evaluation "$eval_file"
         echo "OK: $name"
         succeeded=$((succeeded + 1))
     else

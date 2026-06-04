@@ -1,8 +1,9 @@
-**IMPORTANT**: This is a review of an existing `EVALUATION.md`. You may modify `EVALUATION.md` (improve, amend, or remove findings). You may NOT modify any source code. You may NOT modify any style guide file. You may NOT add new findings the eval did not surface — adding new findings is the job of `/style_eval`, not this pass.
+**IMPORTANT**: This is a review of existing pending evaluation markdown. You may modify only the scratch evaluation file (improve, amend, or remove findings). You may NOT modify any source code. You may NOT modify any style guide file. You may NOT add new findings the eval did not surface — adding new findings is the job of `/style_eval`, not this pass.
 
 ## Arguments
 
-- `$ARGUMENTS` is the absolute path to the project root (the directory containing the `EVALUATION.md` to review).
+- `$ARGUMENTS` is the absolute path to the project root.
+- `$EVALUATION_PATH` is the scratch markdown file exported from `.history/.pending/<project>.json`.
 
 ## Goal
 
@@ -14,9 +15,9 @@
 
 Removed findings stay in the file (wrapped in a marker block) so the human reviewing the worktree can see what you cut and why. They are reporting-only; downstream agents must not act on them.
 
-## Step 1: Read EVALUATION.md
+## Step 1: Read the evaluation markdown
 
-Read `$ARGUMENTS/EVALUATION.md`. If the file does not exist, or contains no `### N.` numbered findings under `## Improvements`, write nothing and exit — there is nothing to review.
+Read `$EVALUATION_PATH`. If the file does not exist, or contains no `### N.` numbered findings under `## Improvements`, write nothing and exit — there is nothing to review.
 
 If the file already contains a `## Review Log` section, this evaluation has already been reviewed. Exit without changes.
 
@@ -40,7 +41,7 @@ For each numbered finding, in order:
 
 Be conservative on removal. A finding that is merely awkwardly worded should be improved, not removed. Removal is for findings a competent human reviewer would reject outright.
 
-## Step 4: Apply edits to EVALUATION.md
+## Step 4: Apply edits to the evaluation markdown
 
 For findings you keep or improve in place, edit the relevant lines directly.
 
@@ -64,7 +65,7 @@ The numbering of remaining findings is preserved — do **not** renumber. A remo
 
 ## Step 5: Append the Review Log
 
-Append a `## Review Log` section to the END of `EVALUATION.md`. Format:
+Append a `## Review Log` section to the END of `$EVALUATION_PATH`. Format:
 
 ```markdown
 ---

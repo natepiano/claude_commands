@@ -215,7 +215,7 @@
 <title>fix_foreach</title>
 <polygon fill="#e8f4f8" stroke="#2980b9" points="731.6,-847.8 558.8,-847.8 558.8,-808.2 731.6,-808.2 731.6,-847.8" />
 <text xml:space="preserve" text-anchor="middle" x="645.2" y="-829.75" font-family="Helvetica,sans-Serif" font-size="10.00">For each project with</text>
-<text xml:space="preserve" text-anchor="middle" x="645.2" y="-818.5" font-family="Helvetica,sans-Serif" font-size="10.00">EVALUATION.md findings</text>
+<text xml:space="preserve" text-anchor="middle" x="645.2" y="-818.5" font-family="Helvetica,sans-Serif" font-size="10.00">pending eval findings</text>
 </g>
 
 <g id="edge17" class="edge">
@@ -256,8 +256,8 @@
 <g id="node19" class="node">
 <title>mv_eval</title>
 <polygon fill="#e8f4f8" stroke="#2980b9" points="731.6,-632.8 558.8,-632.8 558.8,-593.2 731.6,-593.2 731.6,-632.8" />
-<text xml:space="preserve" text-anchor="middle" x="645.2" y="-615.5" font-family="Helvetica,sans-Serif" font-size="10.00">mv EVALUATION.md → worktree</text>
-<text xml:space="preserve" text-anchor="middle" x="645.2" y="-602.75" font-family="Helvetica,sans-Serif" font-size="10.00">(primary starts fresh)</text>
+<text xml:space="preserve" text-anchor="middle" x="645.2" y="-615.5" font-family="Helvetica,sans-Serif" font-size="10.00">export pending markdown</text>
+<text xml:space="preserve" text-anchor="middle" x="645.2" y="-604.25" font-family="Helvetica,sans-Serif" font-size="10.00">→ worktree EVALUATION.md</text>
 </g>
 
 <g id="edge20" class="edge">
@@ -297,8 +297,8 @@
 <g id="node22" class="node">
 <title>fix_fail</title>
 <polygon fill="#fadbd8" stroke="#e74c3c" points="784.8,-482.8 655.2,-482.8 655.2,-443.2 784.8,-443.2 784.8,-482.8" />
-<text xml:space="preserve" text-anchor="middle" x="720" y="-464.75" font-family="Helvetica,sans-Serif" font-size="10.00">Failure: mv EVAL</text>
-<text xml:space="preserve" text-anchor="middle" x="720" y="-453.5" font-family="Helvetica,sans-Serif" font-size="10.00">back, rm worktree</text>
+<text xml:space="preserve" text-anchor="middle" x="720" y="-464.75" font-family="Helvetica,sans-Serif" font-size="10.00">Failure: finalize</text>
+<text xml:space="preserve" text-anchor="middle" x="720" y="-453.5" font-family="Helvetica,sans-Serif" font-size="10.00">or keep pending</text>
 </g>
 
 <g id="edge23" class="edge">

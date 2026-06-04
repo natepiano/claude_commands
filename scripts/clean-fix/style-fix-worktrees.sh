@@ -1,5 +1,5 @@
 #!/bin/bash
-# Create style-fix worktrees for targets with EVALUATION.md findings.
+# Create style-fix worktrees for targets with pending evaluation findings.
 # For each eligible target: create a worktree, launch the configured style agent to apply fixes + clippy.
 # Targets come from the [targets] allowlist in clean-fix.conf.
 # Can be run standalone or called from clean-fix.sh.
@@ -241,7 +241,7 @@ for entry in ${targets[@]+"${targets[@]}"}; do
         worktree_eval="${worktree_dir}/EVALUATION.md"
         branch_name="refactor/style"
     fi
-    eval_file="${work_dir}/EVALUATION.md"
+    eval_file="$LOG_DIR/style_fix_${name}_source_EVALUATION.md"
 
     if [[ -n "$SINGLE_PROJECT" && "$name" != "$SINGLE_PROJECT" ]]; then
         continue
@@ -268,14 +268,11 @@ for entry in ${targets[@]+"${targets[@]}"}; do
         continue
     fi
 
-    # Check 0: EVALUATION.md exists with numbered findings. The eval phase
-    # deletes EVALUATION.md on no-findings runs and records the outcome in
-    # history, so a missing file means "no open findings" — skip cleanly.
-    finding_count=0
-    if [[ -f "$eval_file" ]]; then
-        finding_count=$(grep -c '^### [0-9]' "$eval_file" 2>/dev/null || true)
-    fi
-    if [[ ! -f "$eval_file" ]] || [[ "$finding_count" -eq 0 ]]; then
+    # Check 0: pending evaluation markdown exists with numbered findings.
+    # No project-root EVALUATION.md is used as a sentinel anymore.
+    eval_status=$(python3 "$HISTORY_HELPER" evaluation-status --project "$name" --field status 2>/dev/null || echo "missing")
+    finding_count=$(python3 "$HISTORY_HELPER" evaluation-status --project "$name" --field finding_count 2>/dev/null || echo 0)
+    if [[ "$eval_status" != "findings" && "$eval_status" != "reviewed_findings" ]]; then
         echo "SKIP: $name (no open findings)"
         skipped=$((skipped + 1))
         continue
@@ -293,7 +290,6 @@ for entry in ${targets[@]+"${targets[@]}"}; do
         else
             echo "SKIP: $name (style_fix orphan stub — manual cleanup required at $worktree_dir)"
         fi
-        python3 "$HISTORY_HELPER" discard-pending --project "$name" 2>/dev/null || true
         skipped=$((skipped + 1))
         continue
     fi
@@ -303,7 +299,6 @@ for entry in ${targets[@]+"${targets[@]}"}; do
         git -C "$repo_dir" worktree prune 2>/dev/null || true
         if git -C "$repo_dir" worktree list 2>/dev/null | grep -Fq "$worktree_dir"; then
             echo "SKIP: $name (style_fix worktree registered at target path)"
-            python3 "$HISTORY_HELPER" discard-pending --project "$name" 2>/dev/null || true
             skipped=$((skipped + 1))
             continue
         fi
@@ -323,7 +318,6 @@ for entry in ${targets[@]+"${targets[@]}"}; do
     fi
     if [[ -n "$dirty" ]]; then
         echo "SKIP: $name (working tree dirty)"
-        python3 "$HISTORY_HELPER" discard-pending --project "$name" 2>/dev/null || true
         skipped=$((skipped + 1))
         continue
     fi
@@ -420,10 +414,10 @@ create_and_fix() {
     cp "$HOME/.claude/templates/settings_local.json" "$worktree_dir/.claude/settings.local.json"
     echo "[diag $proj] after settings.local.json copy"
 
-    # Move EVALUATION.md into worktree so primary starts fresh.
+    # Materialize pending evaluation markdown only inside the style-fix worktree.
     mkdir -p "$(dirname "$worktree_eval")"
-    mv "$eval_file" "$worktree_eval"
-    echo "[diag $proj] after EVALUATION.md mv"
+    python3 "$HISTORY_HELPER" export-evaluation --project "$proj" --output "$worktree_eval"
+    echo "[diag $proj] after pending evaluation export"
     progress "$proj" "phase=worktree-ready dir=$worktree_dir"
 
     python3 "$HISTORY_HELPER" set-phase --project "$proj" --phase fix || true
@@ -721,7 +715,6 @@ PROMPT_EOF
             echo "TIMEOUT: $proj ($STYLE_AGENT_MODE exceeded ${timeout_secs}s timeout)"
             progress "$proj" "phase=failed reason=timeout elapsed=${elapsed}s"
             python3 "$HISTORY_HELPER" finalize-failure --project "$proj" --reason "$STYLE_AGENT_MODE exceeded ${timeout_secs}s timeout" || true
-            [[ -f "$worktree_eval" ]] && mv "$worktree_eval" "$eval_file"
             if ! safe_remove_worktree "$repo_dir" "$worktree_dir"; then
                 echo "ERROR: $proj (worktree directory persists at $worktree_dir after cleanup — manual intervention needed)"
                 progress "$proj" "phase=failed reason=cleanup-leftover dir=$worktree_dir"
@@ -769,7 +762,6 @@ PROMPT_EOF
             echo "ERROR: $proj ($fail_reason)"
             progress "$proj" "phase=failed reason=agent-exit code=$agent_code"
             python3 "$HISTORY_HELPER" finalize-failure --project "$proj" --reason "$fail_reason" || true
-            [[ -f "$worktree_eval" ]] && mv "$worktree_eval" "$eval_file"
             if ! safe_remove_worktree "$repo_dir" "$worktree_dir"; then
                 echo "ERROR: $proj (worktree directory persists at $worktree_dir after cleanup — manual intervention needed)"
                 progress "$proj" "phase=failed reason=cleanup-leftover dir=$worktree_dir"

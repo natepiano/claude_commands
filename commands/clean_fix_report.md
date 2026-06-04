@@ -25,7 +25,7 @@ ELAPSED: <duration | "-">
 STATUS: complete | crashed | partial | in-progress
 
 PHASE <name> present=<bool> ok=N fail=N skip=N [footer_ok=N footer_fail=N footer_total=N]
-ROW <project>  clean=<cell> warmup=<cell> eval=<cell> review=<cell> fix=<cell>
+ROW <project>  clean=<cell> warmup=<cell> eval=<cell> review=<cell> fix=<cell> reason="<short reason | ->"
 ALWAYS_EXCLUDED "<reason>" count=N projects=<a,b,c>   ← directories under ~/rust not opted into the relevant allowlist ([build] / [targets]) in clean-fix.conf
 FILTERED_OUT "<reason>" count=N projects=<a,b,c>      ← would be eligible, but framework state / project layout filtered them out
 WARNING <phase> <project> "<message>"                 ← real project failures
@@ -38,7 +38,7 @@ NOTE <free-text>
 
 Only real participants appear in `ROW`.
 
-Cell values are `OK`, `FAIL`, `SKIP`, `-` (rendered as `—`). They may carry a `:slug` suffix — strip that for the table; the full reason is in commentary.
+Cell values are `OK`, `FAIL`, `SKIP`, `-` (rendered as `—`). They may carry a `:slug` suffix such as `OK:no-findings` — strip that for the phase columns. Render the quoted `reason` field as the final table column; render `-` as `—`.
 
 ## Rendering
 
@@ -86,7 +86,7 @@ If neither `ALWAYS_EXCLUDED` nor `FILTERED_OUT` has records, omit the Excluded s
 
 ### 3. Status table
 
-Markdown table with columns `Project | Clean | Warmup | Eval | Review | Fix`. Sort alphabetically (parser already does). Each cell is `OK`, `FAIL`, `SKIP`, or `—`. **Strip the `:reason` suffix.** If `cargo-mend` shows `clean=OK:warning`, render the cell as `OK*` and add a footnote line under the table: `* cargo-mend built fine, but the cargo mend tool itself failed against it. The build is healthy; the linter is not.`
+Markdown table with columns `Project | Clean | Warmup | Eval | Review | Fix | Reason`. Preserve parser row order: `Eval` status first (`FAIL`, `OK`, `SKIP`, then `—`), then project name alphabetically. Each phase cell is `OK`, `FAIL`, `SKIP`, or `—`. **Strip the `:reason` suffix from phase cells.** Render the parser's quoted `reason` value in the final column, using `—` when the value is `-`. If `cargo-mend` shows `clean=OK:warning`, render the cell as `OK*` and add a footnote line under the table: `* cargo-mend built fine, but the cargo mend tool itself failed against it. The build is healthy; the linter is not.`
 
 ### 4. What failed
 

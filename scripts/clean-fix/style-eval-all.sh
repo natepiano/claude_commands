@@ -23,10 +23,12 @@ FAILURE_LOG_DIR="$HISTORY_DIR/.failures"
 CONF_FILE="$SCRIPT_DIR/clean-fix.conf"
 CMD_FILE="$HOME/.claude/commands/style_eval.md"
 HISTORY_HELPER="$SCRIPT_DIR/style_history.py"
+HEARTBEAT_HELPER="$SCRIPT_DIR/style-eval-heartbeat.sh"
 LOG_DIR="/private/tmp/claude"
 SINGLE_PROJECT="${1:-}"
 STYLE_AGENT_MODE="claude"
 CODEX_BIN="${CODEX_BIN:-$HOME/.nvm/versions/node/v20.19.1/bin/codex}"
+HEARTBEAT_INTERVAL_SECS=60
 
 mkdir -p "$LOG_DIR"
 mkdir -p "$FAILURE_LOG_DIR"
@@ -181,13 +183,112 @@ PY
     [[ -n "$pids" ]] && kill "-$sig" $pids 2>/dev/null || true
 }
 
+WRAPPER_HEARTBEAT_PID=""
+NO_FINDINGS_CLEANUP_PID=""
+
+start_wrapper_heartbeat() {
+    local pid="$1" project="$2" project_root="$3" eval_path="$4" log_file="$5" launch_message="$6"
+    local results_file="/tmp/style-eval-results-${project}.json"
+
+    "$HEARTBEAT_HELPER" \
+        --project "$project" \
+        --record heartbeat \
+        --pid "$pid" \
+        --project-root "$project_root" \
+        --log-file "$log_file" \
+        --eval-path "$eval_path" \
+        --results-file "$results_file" \
+        --message "$launch_message" || true
+
+    (
+        local waited=0
+        while kill -0 "$pid" 2>/dev/null; do
+            sleep "$HEARTBEAT_INTERVAL_SECS"
+            kill -0 "$pid" 2>/dev/null || exit 0
+            waited=$((waited + HEARTBEAT_INTERVAL_SECS))
+            "$HEARTBEAT_HELPER" \
+                --project "$project" \
+                --record heartbeat \
+                --pid "$pid" \
+                --project-root "$project_root" \
+                --log-file "$log_file" \
+                --eval-path "$eval_path" \
+                --results-file "$results_file" \
+                --message "wrapper running ${waited}s" || true
+        done
+    ) &
+    WRAPPER_HEARTBEAT_PID=$!
+}
+
+no_findings_marker() {
+    local project="$1"
+    echo "$LOG_DIR/style_eval_${project}.no_findings_finalized"
+}
+
+evaluation_status_field() {
+    local project="$1" field="$2"
+    python3 "$HISTORY_HELPER" evaluation-status --project "$project" --field "$field" 2>/dev/null || echo "missing"
+}
+
+pending_evaluation_has_no_findings() {
+    local project="$1"
+    [[ "$(evaluation_status_field "$project" status)" == "no_findings" ]]
+}
+
+pid_is_live_non_zombie() {
+    local pid="$1"
+    local stat
+    kill -0 "$pid" 2>/dev/null || return 1
+    stat=$(ps -p "$pid" -o stat= 2>/dev/null | tr -d '[:space:]')
+    [[ -n "$stat" && "$stat" != Z* ]]
+}
+
+finalize_no_findings_if_ready() {
+    local project="$1" eval_path="$2" marker="$3"
+    pending_evaluation_has_no_findings "$project" || return 1
+    if python3 "$HISTORY_HELPER" finalize-no-findings --project "$project"; then
+        rm -f "$eval_path"
+        : > "$marker"
+        echo "AUTOFINALIZE: $project (no findings — recorded in history, pending finalized)"
+        return 0
+    fi
+    echo "WARN: $project (could not auto-finalize no-findings history)"
+    return 1
+}
+
+start_no_findings_cleanup() {
+    local pid="$1" project="$2" eval_path="$3"
+    local marker
+    marker=$(no_findings_marker "$project")
+    rm -f "$marker"
+
+    (
+        while true; do
+            if finalize_no_findings_if_ready "$project" "$eval_path" "$marker"; then
+                if pid_is_live_non_zombie "$pid"; then
+                    sleep 2
+                    if pid_is_live_non_zombie "$pid"; then
+                        echo "AUTOFINALIZE: $project (agent pid $pid still alive after final no-findings file — terminating)"
+                        kill_tree "$pid" TERM
+                    fi
+                fi
+                exit 0
+            fi
+            pid_is_live_non_zombie "$pid" || exit 0
+            sleep 5
+        done
+    ) &
+    NO_FINDINGS_CLEANUP_PID=$!
+}
+
 # Wait for an eval agent, killing its whole process tree if it overruns
 # $timeout seconds. A background watchdog polls liveness and, on overrun, sends
 # SIGTERM then SIGKILL to the tree; the foreground `wait` returns the moment the
 # agent exits or is killed. Without this, a single hung agent blocks the serial
 # wait loop indefinitely (see AGENT_TIMEOUT_SECS above).
 wait_or_timeout() {
-    local pid="$1" timeout="$2"
+    local pid="$1" timeout="$2" project="$3" project_root="$4" eval_path="$5" log_file="$6"
+    local results_file="/tmp/style-eval-results-${project}.json"
     (
         local waited=0
         while [[ $waited -lt $timeout ]]; do
@@ -195,6 +296,15 @@ wait_or_timeout() {
             sleep 5
             waited=$((waited + 5))
         done
+        "$HEARTBEAT_HELPER" \
+            --project "$project" \
+            --record heartbeat \
+            --pid "$pid" \
+            --project-root "$project_root" \
+            --log-file "$log_file" \
+            --eval-path "$eval_path" \
+            --results-file "$results_file" \
+            --message "wrapper timeout after ${timeout}s" || true
         echo "TIMEOUT: eval agent (pid $pid) exceeded ${timeout}s — killing process tree"
         kill_tree "$pid" TERM
         sleep 5
@@ -210,12 +320,13 @@ wait_or_timeout() {
 
 # Build the per-project prompt and invoke the configured style agent.
 launch_eval() {
-    local project_root="$1" worktree_eval="$2" log_file="$3"
+    local project_root="$1" worktree_eval="$2" eval_path="$3" log_file="$4"
     local prompt
     prompt="$(
         sed \
             -e "s|\$ARGUMENTS|$project_root|g" \
             -e "s|\$WORKTREE_EVAL_PATH|$worktree_eval|g" \
+            -e "s|\$EVALUATION_PATH|$eval_path|g" \
             "$CMD_FILE"
     )"
     run_style_agent "$project_root" "$prompt" "$log_file"
@@ -319,45 +430,33 @@ pids=()
 names=()
 roots_for_wait=()
 worktrees_for_wait=()
+evals_for_wait=()
+heartbeats_for_wait=()
+cleanups_for_wait=()
 for i in "${!projects[@]}"; do
     proj="${projects[$i]}"
     project_root="${project_roots[$i]}"
     worktree_eval="${project_worktree_evals[$i]}"
+    eval_path="$LOG_DIR/style_eval_${proj}_EVALUATION.md"
 
-    existing_findings=0
-    if [[ -f "$project_root/EVALUATION.md" ]]; then
-        existing_findings=$(grep -c '^### [0-9]' "$project_root/EVALUATION.md" 2>/dev/null || true)
+    pending_status=$(evaluation_status_field "$proj" status)
+    if [[ "$pending_status" == "findings" || "$pending_status" == "reviewed_findings" ]]; then
+        echo "SKIP: $proj (pending findings)"
+        continue
     fi
-    if [[ "$existing_findings" -ge "$MAX_NEW_FINDINGS" ]]; then
-        echo "SKIP: $proj (already at cap of $MAX_NEW_FINDINGS findings)"
+    if [[ "$pending_status" == "no_findings" ]]; then
+        if python3 "$HISTORY_HELPER" finalize-no-findings --project "$proj"; then
+            echo "OK: $proj (no findings — recorded in history, pending finalized)"
+        else
+            echo "FAILED: $proj (could not finalize no-findings history)"
+        fi
         continue
     fi
 
-    # Incremental skip: EVALUATION.md exists only when there are OPEN findings.
-    # If neither the project source nor the style guide tree has been touched
-    # since it was written, the listed findings are still authoritative — no
-    # need to re-eval. Clean projects (no EVALUATION.md) always re-run; their
-    # "last clean" timestamp lives in history, not on disk.
-    eval_md="$project_root/EVALUATION.md"
-    if [[ -f "$eval_md" ]]; then
-        nate_style_dir="$HOME/rust/nate_style/rust"
-        # Candidate paths that would invalidate the cache. find's stderr is
-        # silenced so missing dirs (e.g. no examples/, no tests/) don't surface.
-        source_changed=$(find \
-            "$project_root/src" \
-            "$project_root/examples" \
-            "$project_root/tests" \
-            "$project_root/Cargo.toml" \
-            -newer "$eval_md" -type f -print -quit 2>/dev/null || true)
-        guideline_changed=$(find \
-            "$nate_style_dir" \
-            "$project_root/docs/style" \
-            -newer "$eval_md" -type f -print -quit 2>/dev/null || true)
-        if [[ -z "$source_changed" && -z "$guideline_changed" ]]; then
-            eval_ts=$(stat -f '%Sm' -t '%Y-%m-%dT%H:%M:%SZ' "$eval_md" 2>/dev/null || stat -c '%y' "$eval_md" 2>/dev/null)
-            echo "SKIP: $proj (UNCHANGED — no source or guideline edits since EVALUATION.md@${eval_ts})"
-            continue
-        fi
+    existing_findings=0
+    if [[ "$existing_findings" -ge "$MAX_NEW_FINDINGS" ]]; then
+        echo "SKIP: $proj (already at cap of $MAX_NEW_FINDINGS findings)"
+        continue
     fi
 
     python3 "$HISTORY_HELPER" start-run \
@@ -365,13 +464,21 @@ for i in "${!projects[@]}"; do
         echo "FAILED: $proj (could not start pending run)"
         continue
     }
+    rm -f "$eval_path"
 
-    launch_eval "$project_root" "$worktree_eval" "$LOG_DIR/style_eval_${proj}.log" &
-    pids+=($!)
+    log_file="$LOG_DIR/style_eval_${proj}.log"
+    launch_eval "$project_root" "$worktree_eval" "$eval_path" "$log_file" &
+    agent_pid=$!
+    start_wrapper_heartbeat "$agent_pid" "$proj" "$project_root" "$eval_path" "$log_file" "wrapper launched"
+    start_no_findings_cleanup "$agent_pid" "$proj" "$eval_path"
+    pids+=("$agent_pid")
     names+=("$proj")
     roots_for_wait+=("$project_root")
     worktrees_for_wait+=("$worktree_eval")
-    echo "Launched: $proj via $STYLE_AGENT_MODE (PID $!)"
+    evals_for_wait+=("$eval_path")
+    heartbeats_for_wait+=("$WRAPPER_HEARTBEAT_PID")
+    cleanups_for_wait+=("$NO_FINDINGS_CLEANUP_PID")
+    echo "Launched: $proj via $STYLE_AGENT_MODE (PID $agent_pid)"
 done
 
 echo ""
@@ -391,10 +498,26 @@ for pid in "${pids[@]}"; do
     name="${names[$idx]}"
     project_root="${roots_for_wait[$idx]}"
     worktree_eval="${worktrees_for_wait[$idx]}"
+    eval_path="${evals_for_wait[$idx]}"
+    heartbeat_pid="${heartbeats_for_wait[$idx]}"
+    cleanup_pid="${cleanups_for_wait[$idx]}"
     log_file="$LOG_DIR/style_eval_${name}.log"
-    wait_or_timeout "$pid" "$AGENT_TIMEOUT_SECS" && code=0 || code=$?
+    no_findings_done_marker=$(no_findings_marker "$name")
+    wait_or_timeout "$pid" "$AGENT_TIMEOUT_SECS" "$name" "$project_root" "$eval_path" "$log_file" && code=0 || code=$?
+    kill "$heartbeat_pid" 2>/dev/null || true
+    wait "$heartbeat_pid" 2>/dev/null || true
+    kill "$cleanup_pid" 2>/dev/null || true
+    wait "$cleanup_pid" 2>/dev/null || true
 
-    if [[ ! -f "$project_root/EVALUATION.md" ]]; then
+    if [[ -f "$no_findings_done_marker" ]]; then
+        echo "OK: $name (no findings — already recorded in history, pending finalized)"
+        succeeded=$((succeeded + 1))
+        idx=$((idx + 1))
+        continue
+    fi
+
+    eval_status=$(evaluation_status_field "$name" status)
+    if [[ "$eval_status" == "missing" ]]; then
         a1_helper="no"
         if agent_called_helper "$log_file"; then a1_helper="yes"; fi
         echo "FAILED attempt 1: $name (exit $code, helper-invoked=$a1_helper) — retrying once"
@@ -414,50 +537,66 @@ for pid in "${pids[@]}"; do
             idx=$((idx + 1))
             continue
         fi
+        rm -f "$eval_path"
 
-        launch_eval "$project_root" "$worktree_eval" "$log_file" && retry_code=0 || retry_code=$?
+        launch_eval "$project_root" "$worktree_eval" "$eval_path" "$log_file" &
+        retry_pid=$!
+        start_wrapper_heartbeat "$retry_pid" "$name" "$project_root" "$eval_path" "$log_file" "wrapper retry launched"
+        retry_heartbeat_pid="$WRAPPER_HEARTBEAT_PID"
+        start_no_findings_cleanup "$retry_pid" "$name" "$eval_path"
+        retry_cleanup_pid="$NO_FINDINGS_CLEANUP_PID"
+        no_findings_done_marker=$(no_findings_marker "$name")
+        wait_or_timeout "$retry_pid" "$AGENT_TIMEOUT_SECS" "$name" "$project_root" "$eval_path" "$log_file" && retry_code=0 || retry_code=$?
+        kill "$retry_heartbeat_pid" 2>/dev/null || true
+        wait "$retry_heartbeat_pid" 2>/dev/null || true
+        kill "$retry_cleanup_pid" 2>/dev/null || true
+        wait "$retry_cleanup_pid" 2>/dev/null || true
         a2_helper="no"
         if agent_called_helper "$log_file"; then a2_helper="yes"; fi
 
-        if [[ -f "$project_root/EVALUATION.md" ]]; then
-            if [[ $(grep -c '^### [0-9]' "$project_root/EVALUATION.md" || true) -eq 0 ]]; then
-                python3 "$HISTORY_HELPER" finalize-no-findings --project "$name" || true
-                rm -f "$project_root/EVALUATION.md"
-                echo "RECOVERED: $name (no findings — recorded in history, EVALUATION.md removed, retry succeeded)"
-            else
-                lines=$(wc -l < "$project_root/EVALUATION.md")
-                echo "RECOVERED: $name ($lines lines, retry succeeded)"
-            fi
-            # No failure report on recovery — the jsonl already records the retry
-            # and attempt-1 log persists in $LOG_DIR for same-session inspection.
-            # Reports are written only when retry also failed (see else branch).
+        if [[ -f "$no_findings_done_marker" ]]; then
+            echo "RECOVERED: $name (no findings — already recorded in history, pending finalized, retry succeeded)"
             recovered=$((recovered + 1))
             succeeded=$((succeeded + 1))
         else
-            python3 "$HISTORY_HELPER" discard-pending --project "$name" || true
-            echo "FAILED: $name (retry also failed, exit=$retry_code helper-invoked=$a2_helper)"
-            write_failure_report "$name" "$a1_log" "$code" "$a1_helper" \
-                "$log_file" "$retry_code" "$a2_helper" "failed-after-retry"
-            failed=$((failed + 1))
+            retry_status=$(evaluation_status_field "$name" status)
+            if [[ "$retry_status" == "no_findings" ]]; then
+                python3 "$HISTORY_HELPER" finalize-no-findings --project "$name" || true
+                rm -f "$eval_path"
+                echo "RECOVERED: $name (no findings — recorded in history, pending finalized, retry succeeded)"
+                recovered=$((recovered + 1))
+                succeeded=$((succeeded + 1))
+            elif [[ "$retry_status" == "findings" || "$retry_status" == "reviewed_findings" ]]; then
+                lines=$(evaluation_status_field "$name" line_count)
+                echo "RECOVERED: $name ($lines lines, retry succeeded)"
+                recovered=$((recovered + 1))
+                succeeded=$((succeeded + 1))
+            else
+                python3 "$HISTORY_HELPER" discard-pending --project "$name" || true
+                echo "FAILED: $name (retry also failed, exit=$retry_code helper-invoked=$a2_helper)"
+                write_failure_report "$name" "$a1_log" "$code" "$a1_helper" \
+                    "$log_file" "$retry_code" "$a2_helper" "failed-after-retry"
+                failed=$((failed + 1))
+            fi
         fi
         idx=$((idx + 1))
         continue
     fi
 
     if [[ $code -ne 0 ]]; then
-        echo "WARN: $name (exit $code, but EVALUATION.md was produced)"
+        echo "WARN: $name (exit $code, but pending evaluation was produced)"
     fi
-    if [[ $(grep -c '^### [0-9]' "$project_root/EVALUATION.md" || true) -eq 0 ]]; then
+    if [[ "$eval_status" == "no_findings" ]]; then
         python3 "$HISTORY_HELPER" finalize-no-findings --project "$name" || {
             echo "FAILED: $name (could not finalize no-findings history)"
             failed=$((failed + 1))
             idx=$((idx + 1))
             continue
         }
-        rm -f "$project_root/EVALUATION.md"
-        echo "OK: $name (no findings — recorded in history, EVALUATION.md removed)"
+        rm -f "$eval_path"
+        echo "OK: $name (no findings — recorded in history, pending finalized)"
     else
-        lines=$(wc -l < "$project_root/EVALUATION.md")
+        lines=$(evaluation_status_field "$name" line_count)
         echo "OK: $name ($lines lines)"
     fi
     succeeded=$((succeeded + 1))
