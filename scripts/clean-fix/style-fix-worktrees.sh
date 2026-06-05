@@ -56,13 +56,14 @@ finish_style_results() {
     # style_report.md is NOT auto-generated here. Run `/style_usage --generate`
     # ad-hoc to refresh it. Only the .history data is committed below.
 
-    # Commit the clean-fix history in ~/rust/nate_style only when every worktree
-    # fix succeeded. On any failure, leave nate_style dirty for review.
-    if (( failed_count == 0 )); then
-        "$SCRIPT_DIR/commit-style-results.sh" 2>&1 || echo "WARNING: commit-style-results.sh failed"
-    else
-        echo "SKIP commit-style-results: $failed_count worktree run(s) failed; leaving nate_style dirty for review"
+    # Commit the clean-fix history in ~/rust/nate_style after every pass,
+    # failures included: finalize-failure rows are history data, and the
+    # _style_fix worktrees (not nate_style) are the review surface. Skipping
+    # here used to let appends accumulate until the size guard wedged the repo.
+    if (( failed_count > 0 )); then
+        echo "WARNING: $failed_count worktree run(s) failed; failure rows committed to history, worktrees left for review"
     fi
+    "$SCRIPT_DIR/commit-style-results.sh" 2>&1 || echo "WARNING: commit-style-results.sh failed"
 }
 
 # Validate that $dir is a real git-linked worktree of $repo, not just a leftover

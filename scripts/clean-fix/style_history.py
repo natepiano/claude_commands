@@ -243,6 +243,20 @@ def pending_file(project: str) -> Path:
     return PENDING_DIR / f"{project}.json"
 
 
+def remove_pending(project: str) -> None:
+    """Remove a project's pending file and its heartbeat flock file together.
+
+    The `.json.lock` sibling is created by style-eval-heartbeat.sh; leaving it
+    behind after the pending file is finalized litters `.pending/` with
+    zero-byte locks forever. A heartbeat that re-creates the lock after this
+    runs re-checks `pending_file.exists()` under the lock and exits without
+    writing, so deleting both here is safe.
+    """
+    path = pending_file(project)
+    path.unlink(missing_ok=True)
+    path.with_suffix(path.suffix + ".lock").unlink(missing_ok=True)
+
+
 def max_new_findings() -> int:
     """Read `[style_eval] max_new_findings` from `clean-fix.conf`.
 
@@ -647,7 +661,7 @@ def export_evaluation(project: str, output: Path) -> None:
     if not markdown:
         raise SystemExit(f"No pending evaluation markdown for {project}.")
     output.parent.mkdir(parents=True, exist_ok=True)
-    output.write_text(markdown)
+    _ = output.write_text(markdown)
 
 
 def evaluation_status_payload(project: str) -> dict[str, object]:
@@ -953,7 +967,7 @@ def finalize_no_findings(project: str) -> None:
         "reviewed_units": list(pending.get("reviewed_units", [])),
     }
     append_jsonl_history(history_file(project), row)
-    pending_file(project).unlink(missing_ok=True)
+    remove_pending(project)
 
 
 def last_findings(project: str) -> str:
@@ -1003,7 +1017,7 @@ def finalize_fix(project_root: Path, eval_path: Path) -> None:
         "reviewed_units": reviewed_units,
     }
     append_jsonl_history(history_file(project), row)
-    pending_file(project).unlink(missing_ok=True)
+    remove_pending(project)
 
 
 def finalize_failure(project: str, reason: str) -> None:
@@ -1027,11 +1041,11 @@ def finalize_failure(project: str, reason: str) -> None:
         "reviewed_units": reviewed_units,
     }
     append_jsonl_history(history_file(project), row)
-    pending_file(project).unlink(missing_ok=True)
+    remove_pending(project)
 
 
 def discard_pending(project: str) -> None:
-    pending_file(project).unlink(missing_ok=True)
+    remove_pending(project)
 
 
 def parse_args() -> argparse.Namespace:

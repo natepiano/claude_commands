@@ -5,17 +5,20 @@
 # and never blocks the commit.
 #
 # Committed paths (pathspec-scoped; nothing else is touched):
-#   - .history/<project>.jsonl (worktree-modified; each +1 insertion, 0 deletions)
+#   - .history/<project>.jsonl (worktree-modified; append-only, 0 deletions,
+#     at most MAX_HISTORY_APPENDS insertions — catch-up commits after skipped
+#     cycles are expected and legal)
 #   - style_report.md          (worktree-modified; total changed lines <= 200)
 #   - CLEAN_FIX_COMMIT_SKIPPED.md staged deletion, only for one-time untracking
 #
 # .history/.failures/ (untracked retry-diagnostic dumps) is always ignored.
 #
 # Size guard: if a committed path exceeds its diff-size limit (history must be
-# +1 -0; report <= 200 changed lines), write CLEAN_FIX_COMMIT_SKIPPED.md at the
-# repo root (untracked) describing the violation, then exit 0 without committing.
-# The caller is expected to run this only when the upstream style-fix pass had
-# zero failures.
+# append-only and within MAX_HISTORY_APPENDS lines; report <= 200 changed
+# lines), write CLEAN_FIX_COMMIT_SKIPPED.md at the repo root (untracked)
+# describing the violation, then exit 0 without committing. The caller runs
+# this at the end of every style-fix pass — including passes with failures,
+# since finalize-failure rows are history data like any other.
 #
 # Usage: commit-style-results.sh [--dry-run]
 #   --dry-run   Print the plan and `git diff --stat` instead of committing.
@@ -29,6 +32,11 @@ NATE_STYLE_DIR="${NATE_STYLE_DIR:-$HOME/rust/nate_style}"
 SENTINEL_NAME="CLEAN_FIX_COMMIT_SKIPPED.md"
 SENTINEL="$NATE_STYLE_DIR/$SENTINEL_NAME"
 MAX_REPORT_LINES=200
+# History files are append-only JSONL: one row per finalized run. More than one
+# new row per file is normal whenever a previous cycle's commit was skipped
+# (failures, crash mid-run) — the next commit catches up. The cap exists only
+# to catch a runaway loop appending rows every cycle.
+MAX_HISTORY_APPENDS=20
 COMMIT_MSG="chore(style): clean-fix style history + report"
 
 DRY_RUN=false
@@ -179,8 +187,10 @@ while IFS=$'\t' read -r added deleted path; do
     numstat_rows+=("$(printf '%s\t%s\t%s' "$added" "$deleted" "$path")")
     case "$path" in
         .history/*.jsonl)
-            if [[ "$added" != "1" || "$deleted" != "0" ]]; then
-                violations+=("$path: +$added -$deleted (expected +1 -0; multi-line diffs suggest accumulation across nights)")
+            if [[ "$deleted" != "0" ]]; then
+                violations+=("$path: +$added -$deleted (history is append-only; deletions mean rows were rewritten or truncated)")
+            elif (( added > MAX_HISTORY_APPENDS )); then
+                violations+=("$path: +$added -$deleted (exceeds $MAX_HISTORY_APPENDS appended rows; suggests a runaway append loop)")
             fi
             ;;
         style_report.md)
@@ -206,11 +216,20 @@ if (( ${#violations[@]} > 0 )); then
 fi
 
 # --- Commit ------------------------------------------------------------------
+# macOS bash 3.2 + `set -u`: expanding an empty array with "${arr[@]}" is an
+# unbound-variable error, so every expansion below is guarded by a length check.
 paths_to_add=()
 $has_report && paths_to_add+=("style_report.md")
-for f in "${history_files[@]}"; do
-    paths_to_add+=("$f")
-done
+if (( ${#history_files[@]} > 0 )); then
+    for f in "${history_files[@]}"; do
+        paths_to_add+=("$f")
+    done
+fi
+
+if (( ${#paths_to_add[@]} == 0 )) && ! $has_sentinel_removal; then
+    echo "commit-style-results: nothing of ours to commit (only unrelated changes present)"
+    exit 0
+fi
 
 if $DRY_RUN; then
     echo "commit-style-results: DRY RUN"
@@ -231,7 +250,9 @@ if $DRY_RUN; then
         echo "    $SENTINEL_NAME"
     fi
     echo ""
-    git diff --stat -- "${paths_to_add[@]}"
+    if (( ${#paths_to_add[@]} > 0 )); then
+        git diff --stat -- "${paths_to_add[@]}"
+    fi
     exit 0
 fi
 
@@ -239,13 +260,11 @@ fi
 # (`git commit -- <paths>`) records only those paths from the working tree and
 # leaves every other dirty, staged, or untracked file exactly as-is — there is
 # no path by which an unrelated edit can be swept into this commit.
-commit_paths=("${paths_to_add[@]}")
-$has_sentinel_removal && commit_paths+=("$SENTINEL_NAME")
-
-if (( ${#commit_paths[@]} == 0 )); then
-    echo "commit-style-results: nothing of ours to commit (only unrelated changes present)"
-    exit 0
+commit_paths=()
+if (( ${#paths_to_add[@]} > 0 )); then
+    commit_paths=("${paths_to_add[@]}")
 fi
+$has_sentinel_removal && commit_paths+=("$SENTINEL_NAME")
 
 git commit -m "$COMMIT_MSG" -- "${commit_paths[@]}"
 committed_count=${#paths_to_add[@]}
