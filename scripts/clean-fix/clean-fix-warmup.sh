@@ -40,10 +40,22 @@ brp_shutdown() {
     brp_request "brp_extras/shutdown" > /dev/null 2>&1 || true
 }
 
+# Bevy apps die at window/Metal creation when the screen is locked, so warmup
+# can only succeed with an unlocked GUI session. loginwindow maintains
+# IOConsoleLocked at the IORegistry root; grep it rather than depend on pyobjc.
+screen_locked() {
+    ioreg -n Root -d1 2>/dev/null | grep -q '"IOConsoleLocked" = Yes'
+}
+
 warmup_run() {
     local name="$1"
     local cargo_args="$2"
     local project_name="$3"
+
+    if screen_locked; then
+        log "WARMUP SKIP: $name (screen locked)"
+        return
+    fi
 
     log "WARMUP: $name"
     BRP_EXTRAS_PORT=$WARMUP_PORT cargo run $cargo_args > /dev/null 2>&1 &

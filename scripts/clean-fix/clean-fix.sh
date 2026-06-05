@@ -105,7 +105,7 @@ for project_name in ${BUILD_TARGETS[@]+"${BUILD_TARGETS[@]}"}; do
     # Skip projects not modified since last run
     timestamp_file="$TIMESTAMP_DIR/$project_name"
     if [[ -f "$timestamp_file" ]]; then
-        changed=$(find "$project_dir" -path "$project_dir/target" -prune -o -newer "$timestamp_file" -type f -print -quit)
+        changed=$(find "$project_dir" \( -path "$project_dir/target" -o -path "$project_dir/.claude" \) -prune -o -newer "$timestamp_file" -type f -print -quit)
         if [[ -z "$changed" ]]; then
             log "SKIP: $project_name (not modified since last run)"
             continue

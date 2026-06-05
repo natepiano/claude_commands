@@ -199,7 +199,7 @@ for i in "${!launch_names[@]}"; do
 
     prompt="$(sed \
         -e "s|\$ARGUMENTS|$project_root|g" \
-        -e "s|\$EVALUATION_PATH|$eval_file|g" \
+        -e "s|\$EVALUATION_PATH|${launch_evals[$i]}|g" \
         "$CMD_FILE")"
 
     run_review_agent "$project_root" "$prompt" "$log_file" &
