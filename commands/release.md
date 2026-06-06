@@ -68,6 +68,12 @@ install_verify = "crate_dir"
 # Optional: custom install script (overrides default `cargo install`)
 install_verify_script = ".claude/scripts/release/install_verify.sh"
 
+# Publish all workspace members in one `cargo publish --workspace` call
+# (cargo >= 1.90). Members excluded by discovery get --exclude flags;
+# publish = false members are skipped by cargo automatically.
+# Incompatible with [[publish_phases]]. Ignored in single-package mode.
+workspace_publish = true
+
 # Ordered publish phases (workspace dependency chains only)
 [[publish_phases]]
 name = "Display name"
@@ -327,7 +333,9 @@ curl -s "https://crates.io/api/v1/crates/${CRATE_NAME}" | jq -r '.crate.max_vers
 <ProjectDiscovery>
 ## STEP 1: Project Discovery
 
-**Read optional config** from `.claude/config/release.toml` if it exists. Store any `install_verify`, `install_verify_script`, `publish_phases`, and `judgment_checks` settings.
+**Read optional config** from `.claude/config/release.toml` if it exists. Store any `install_verify`, `install_verify_script`, `workspace_publish`, `publish_phases`, and `judgment_checks` settings.
+
+**If config sets both `workspace_publish = true` and `[[publish_phases]]`**, STOP with a clear error: the two are mutually exclusive — `workspace_publish` is for workspaces whose members publish together with no between-phase scripts or dep rewrites; `[[publish_phases]]` is for ordered chains that need them.
 
 **If config references any `post_script` or `install_verify_script` files, verify they exist:**
 → Stop with clear error if any referenced script is missing.
@@ -556,7 +564,31 @@ For each non-excluded workspace member:
 ```bash
 ~/.claude/scripts/release/publish_crate.sh ${PACKAGE_NAME}
 ```
-→ Members are published in `[workspace.members]` order. If this fails due to dependency ordering, the project needs a `[[publish_phases]]` config.
+→ Members are published in `[workspace.members]` order. If this fails due to dependency ordering, the project needs either `workspace_publish = true` (cargo >= 1.90, no between-phase scripts) or a `[[publish_phases]]` config.
+
+### If config sets `workspace_publish = true`
+
+Publish every member in a single cargo invocation. Cargo resolves intra-workspace dependency order itself and verifies later crates against a locally patched registry, so members that depend on not-yet-published siblings dry-run cleanly — no indexing waits or ordering config needed. This requires cargo >= 1.90 (check `cargo --version`; if older, fall back to the no-config per-crate flow and tell the user).
+
+Build `${EXCLUDE_FLAGS}` as one `--exclude <name>` per member that STEP 1 discovery excluded (test/example/benchmark paths). `publish = false` members are skipped by cargo automatically. Single-package mode ignores `workspace_publish` entirely (it uses the single-crate flow).
+
+**Dry-run** (with `dangerouslyDisableSandbox: true`):
+```bash
+cargo publish --workspace --dry-run ${EXCLUDE_FLAGS}
+```
+
+→ Report dry-run results to the user. Stop if the dry-run fails.
+
+**If this is a dry-run release (`${DRY_RUN_FLAG}` is `--dry-run`), skip the rest of STEP 6 — do not publish.**
+
+→ **Manual confirmation required**: Dry-run checks passed. Type **publish** to publish to crates.io. This is irreversible.
+
+**Publish** (with `dangerouslyDisableSandbox: true`):
+```bash
+cargo publish --workspace ${EXCLUDE_FLAGS}
+```
+
+→ Cargo publishes members in dependency order and waits for each upload before the next. Report the output to the user. Stop if it fails.
 
 ### If `[[publish_phases]]` config exists
 
@@ -901,6 +933,6 @@ If already published to crates.io, you cannot unpublish. Release a new patch ver
 3. **"Uncommitted changes"**: Run `git status` and commit or stash changes
 4. **"Not on main branch"**: Releasing from a non-main branch makes STEP 1 prompt for **hotfix** vs **isolated** mode — if intentional, pick the right mode. If not, switch to main with `git checkout main`
 5. **Build failures**: Fix compilation errors before releasing
-6. **Workspace dependency ordering**: If publish fails due to dependency ordering, add `[[publish_phases]]` to `.claude/config/release.toml`
+6. **Workspace dependency ordering**: If publish fails due to dependency ordering, set `workspace_publish = true` in `.claude/config/release.toml` (cargo >= 1.90, members publish together, no between-phase scripts) or add `[[publish_phases]]` (ordered chains needing scripts or dep rewrites between phases, e.g. bevy_brp)
 7. **crates.io indexing delay**: If a later phase fails because a just-published crate isn't indexed yet, increase `wait_seconds` in the config
 8. **Missing post_script**: The config references a script that doesn't exist — create it or fix the path
