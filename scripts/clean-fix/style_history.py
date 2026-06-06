@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import subprocess
 from collections import defaultdict
 from dataclasses import dataclass
@@ -290,13 +291,6 @@ def max_new_findings() -> int:
     raise SystemExit(
         f"[style_eval] max_new_findings is not set in {CLEAN_FIX_CONF_FILE}"
     )
-
-
-def existing_findings_in_eval(project_root: Path) -> int:
-    eval_path = project_root / "EVALUATION.md"
-    if not eval_path.exists():
-        return 0
-    return count_findings_in_markdown(eval_path.read_text())
 
 
 def count_findings_in_markdown(markdown: str) -> int:
@@ -593,21 +587,15 @@ def start_run(project_root: Path) -> None:
     HISTORY_DIR.mkdir(parents=True, exist_ok=True)
     PENDING_DIR.mkdir(parents=True, exist_ok=True)
     project = project_root.name.removesuffix("_style_fix")
-    # Pending JSON is the budget source of truth. A project-root EVALUATION.md
-    # from an older run is still imported for compatibility, but new runs keep
-    # evaluation markdown in .history/.pending/<project>.json.
     cap = max_new_findings()
-    legacy_eval = project_root / "EVALUATION.md"
-    evaluation_markdown = legacy_eval.read_text() if legacy_eval.exists() else ""
-    finding_count = count_findings_in_markdown(evaluation_markdown)
     payload: PendingState = {
         "budget": cap,
-        "evaluation_markdown": evaluation_markdown,
-        "evaluation_updated_at": utc_now() if evaluation_markdown else "",
+        "evaluation_markdown": "",
+        "evaluation_updated_at": "",
         "phase": "evaluation",
         "reviewed_unit_ids": [],
         "reviewed_units": [],
-        "scored_count": finding_count,
+        "scored_count": 0,
         "start_time": utc_now(),
         "updated_at": utc_now(),
     }
@@ -823,7 +811,7 @@ def record_unit(project_root: Path, results_path: Path, eval_path: Path) -> None
             message = (
                 f"Refusing to record finding for {guideline_id}: not present under "
                 + f"'## Improvements' in {eval_path}. Append the finding to "
-                + "EVALUATION.md before calling record-unit."
+                + "the scratch evaluation markdown before calling record-unit."
             )
             raise SystemExit(message)
         if is_finding:
@@ -915,13 +903,16 @@ def parse_fix_results(eval_path: Path, project_root: Path) -> dict[str, Outcome]
                     fix_entries[current_fix] = {}
                 continue
             if line.startswith("**Status:**") and current_fix:
-                fix_entries[current_fix]["status"] = line.split(":", 1)[1].strip()
+                fix_entries[current_fix]["status"] = line.removeprefix("**Status:**").strip()
                 continue
             if line.startswith("**What was done:**") and current_fix:
-                fix_entries[current_fix]["summary"] = line.split(":", 1)[1].strip()
+                fix_entries[current_fix]["summary"] = line.removeprefix("**What was done:**").strip()
+                continue
+            if line.startswith("**Post-fix search:**") and current_fix:
+                fix_entries[current_fix]["post_fix_search"] = line.removeprefix("**Post-fix search:**").strip()
                 continue
             if line.startswith("**Issues:**") and current_fix:
-                fix_entries[current_fix]["reason"] = line.split(":", 1)[1].strip()
+                fix_entries[current_fix]["reason"] = line.removeprefix("**Issues:**").strip()
                 continue
     per_guideline: dict[str, list[dict[str, str]]] = defaultdict(list)
     for finding_num, guideline_id in finding_guidelines.items():
@@ -933,7 +924,17 @@ def parse_fix_results(eval_path: Path, project_root: Path) -> dict[str, Outcome]
         for entry in entries:
             raw_status = entry.get("status", "").lower()
             if raw_status.startswith("applied"):
-                statuses.append("fixed")
+                post_fix_search = entry.get("post_fix_search", "")
+                if re.search(r"(^|[^0-9])0\s+remaining\b", post_fix_search.lower()):
+                    statuses.append("fixed")
+                else:
+                    statuses.append("partial")
+                    reason = entry.get("reason", "")
+                    if post_fix_search:
+                        coverage_reason = f"Post-fix search did not report 0 remaining: {post_fix_search}"
+                    else:
+                        coverage_reason = "Applied finding is missing required Post-fix search: 0 remaining."
+                    entry["reason"] = " ".join(part for part in (reason, coverage_reason) if part)
             elif raw_status.startswith("partially"):
                 statuses.append("partial")
             elif raw_status.startswith("skipped"):
@@ -1001,12 +1002,12 @@ def finalize_fix(project_root: Path, eval_path: Path) -> None:
         elif guideline_id in eval_guidelines:
             outcome = {
                 "status": "fix_failed",
-                "reason": "Finding present in EVALUATION.md ## Improvements but no matching ## Fix Summary entry.",
+                "reason": "Finding present in evaluation markdown ## Improvements but no matching ## Fix Summary entry.",
             }
         else:
             outcome = {
                 "status": "eval_dropped",
-                "reason": "Recorded as a finding via record-unit but absent from EVALUATION.md ## Improvements.",
+                "reason": "Recorded as a finding via record-unit but absent from evaluation markdown ## Improvements.",
             }
         if "finding_source" in reviewed:
             outcome["finding_source"] = reviewed["finding_source"]
@@ -1061,7 +1062,7 @@ def parse_args() -> argparse.Namespace:
     _ = record.add_argument(
         "--eval-path",
         required=True,
-        help="Path to EVALUATION.md. record-unit refuses to record a finding whose guideline is not present under ## Improvements.",
+        help="Path to the scratch evaluation markdown. record-unit refuses to record a finding whose guideline is not present under ## Improvements.",
     )
     save_eval = subparsers.add_parser("save-evaluation")
     _ = save_eval.add_argument("--project-root", required=True)

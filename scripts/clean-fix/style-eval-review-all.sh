@@ -130,7 +130,7 @@ for entry in ${targets[@]+"${targets[@]}"}; do
     [[ ! -d "$project_root" ]] && continue
     [[ ! -f "$project_root/Cargo.toml" ]] && continue
     names+=("$name")
-    eval_files+=("$LOG_DIR/style_eval_review_${name}_EVALUATION.md")
+    eval_files+=("$LOG_DIR/style_eval_review_${name}_evaluation.md")
     project_roots+=("$project_root")
 done
 

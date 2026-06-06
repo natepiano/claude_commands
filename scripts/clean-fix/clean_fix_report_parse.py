@@ -302,15 +302,7 @@ def evaluation_has_no_violations(project: str, result: ParseResult) -> bool:
     if history_has_no_findings_for_run(project, result):
         return True
 
-    # Legacy fallback for logs produced before pending JSON owned the handoff.
-    project_root = target_roots_by_project().get(project, RUST_DIR / project)
-    eval_path = project_root / "EVALUATION.md"
-    if not eval_path.exists():
-        return False
-    start_epoch = run_start_epoch(result)
-    if start_epoch is not None and eval_path.stat().st_mtime < start_epoch - 1:
-        return False
-    return markdown_has_no_violations(eval_path.read_text(errors="replace"))
+    return False
 
 
 def detect_phase_boundaries(lines: list[str]) -> dict[str, tuple[int, int]]:
@@ -342,10 +334,7 @@ def detect_phase_boundaries(lines: list[str]) -> dict[str, tuple[int, int]]:
             eval_end = i + 1
             eval_done_seen = True
             continue
-        if review_start == -1 and (
-            REVIEW_HEADER_RE.search(line)
-            or "Reviewing EVALUATION.md" in line
-        ):
+        if review_start == -1 and REVIEW_HEADER_RE.search(line):
             review_start = i
             continue
         if review_start != -1 and not review_done_seen and REVIEW_DONE_RE.search(line):
@@ -677,16 +666,7 @@ def parse_fix_phase(lines: list[str], result: ParseResult) -> None:
     for project in eligible:
         cell = fix_results.get(project)
         if cell is None:
-            # Eligible but no result — try worktree on disk fallback.
-            worktree = Path.home() / "rust" / f"{project}_style_fix" / "EVALUATION.md"
-            if worktree.exists():
-                text = worktree.read_text(errors="replace")
-                if re.search(r"^## Fix Summary", text, re.MULTILINE):
-                    cell = Cell("OK", "from-disk")
-                else:
-                    cell = Cell("FAIL", "no-fix-summary")
-            else:
-                cell = Cell("FAIL", "no-result")
+            cell = Cell("FAIL", "no-result")
         get_row(result.rows, project)["fix"] = cell
         if cell.state == "OK":
             stats.ok += 1

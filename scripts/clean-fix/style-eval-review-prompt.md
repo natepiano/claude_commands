@@ -1,4 +1,4 @@
-**IMPORTANT**: This is a review of existing pending evaluation markdown. You may modify only the scratch evaluation file (improve, amend, or remove findings). You may NOT modify any source code. You may NOT modify any style guide file. You may NOT add new findings the eval did not surface — adding new findings is the job of `/style_eval`, not this pass.
+**IMPORTANT**: This is a review of existing pending evaluation markdown. You may modify only the scratch evaluation file (improve, amend, or remove findings). You may NOT modify any source code. You may NOT modify any style guide file. You may NOT add new findings for unrelated rules the eval did not surface — adding new findings is the job of `/style_eval`, not this pass. You MAY add missing locations to an existing finding when they are the same style file, same rule, and same searched surface.
 
 ## Arguments
 
@@ -10,7 +10,7 @@
 `/style_eval` produces a list of style-guideline findings. Some are sharp; some are vague, wrong, or out of scope. Before `/style_fix` spawns a coding agent against the file, walk every finding once with the governing style guide in hand and:
 
 - **Improve** — tighten wording, sharpen the rule citation, clarify the suggested change.
-- **Amend** — narrow scope, correct misattributions, fix wrong file paths or line refs, drop locations that no longer match.
+- **Amend** — narrow scope, correct misattributions, fix wrong file paths or line refs, drop locations that no longer match, or add same-rule locations that the eval missed.
 - **Remove** — strike findings that are wrong, already-followed, or out of scope.
 
 Removed findings stay in the file (wrapped in a marker block) so the human reviewing the worktree can see what you cut and why. They are reporting-only; downstream agents must not act on them.
@@ -32,11 +32,12 @@ If a cited style file does not exist on disk, treat that finding as a candidate 
 For each numbered finding, in order:
 
 1. Read the **Style file** for that finding. Re-read its frontmatter (`mode:`, `mechanism:`, `lint:`) and its prescription.
-2. Open every path in the finding's **Locations** list and verify the cited site still exhibits the violation.
-3. Decide one of four actions:
+2. Rerun the finding's **Search** command when it is safe and still applies in this checkout. If the command is stale, derive an equivalent project-wide search from the **Surface searched** line and the style rule. This is a same-finding coverage check, not a new evaluation pass.
+3. Open every path in the finding's **Locations** list and verify the cited site still exhibits the violation.
+4. Decide one of four actions:
    - **Keep as-is** — the finding is accurate, well-scoped, and clearly written. No edit.
-   - **Improve** — the finding is correct but the title, **Recommended pattern**, or per-location notes are vague, jargon-heavy, or hard to act on. Rewrite for clarity. Do not change which sites are listed; do not change the rule cited.
-   - **Amend** — the finding is partly right. Drop locations that no longer match, fix wrong line numbers, narrow an over-broad scope claim, or correct a wrong rule citation (only when the **same** style file actually has the right rule — switching to a different style file is removal-plus-no-add, not an amendment).
+   - **Improve** — the finding is correct but the title, **Recommended pattern**, or per-location notes are vague, jargon-heavy, or hard to act on. Rewrite for clarity. Do not change which sites are listed unless the coverage check found same-rule missing locations.
+   - **Amend** — the finding is partly right. Add locations found by the same-rule coverage check, drop locations that no longer match, fix wrong line numbers, narrow an over-broad scope claim, or correct a wrong rule citation (only when the **same** style file actually has the right rule — switching to a different style file is removal-plus-no-add, not an amendment).
    - **Remove** — the finding is wrong, the rule no longer exists, every cited location is invalid, or the finding contradicts a `[non-negotiable]` rule from the same style file. Wrap (do not delete) per Step 4.
 
 Be conservative on removal. A finding that is merely awkwardly worded should be improved, not removed. Removal is for findings a competent human reviewer would reject outright.
@@ -89,7 +90,7 @@ Every numbered finding gets exactly one bullet, even if you took no action (`kep
 
 ## Hard rules
 
-- Do **not** add new findings. If, while reviewing, you notice an unrelated violation, ignore it — `/style_eval` will catch it on the next clean-fix.
+- Do **not** add new findings for unrelated rules. If the same style file and same rule has missing locations, add those locations to the existing finding as an amendment. If you notice an unrelated violation, ignore it — `/style_eval` will catch it on the next clean-fix.
 - Do **not** edit source code. Do **not** edit any style guide file.
 - Do **not** delete a removed finding's text — wrap it in `REMOVED-BY-REVIEW` markers.
 - Do **not** renumber findings.

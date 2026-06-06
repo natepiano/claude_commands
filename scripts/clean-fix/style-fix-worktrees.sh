@@ -67,7 +67,7 @@ finish_style_results() {
 }
 
 # Validate that $dir is a real git-linked worktree of $repo, not just a leftover
-# directory. A directory with EVALUATION.md and target/ but no .git linkage is
+# directory. A directory with target/ but no .git linkage is
 # an orphan stub from a partially-failed cleanup — treating it as a worktree
 # turns a recoverable hiccup into a permanent self-skipping state.
 is_real_worktree() {
@@ -207,7 +207,7 @@ fi
 # Eligibility pass. Parallel arrays:
 #   eligible[] -- project names
 #   records[]  -- fields joined by ASCII Unit Separator (0x1F):
-#     name | kind | repo_dir | eval_file | worktree_dir | worktree_eval | subpath | pkg | branch
+#     name | kind | repo_dir | eval_file | worktree_dir | unused | subpath | pkg | branch
 # Using 0x1F (not tab) so that empty fields in the middle (standalone projects
 # have empty subpath and pkg) survive `read` without being collapsed by
 # IFS whitespace-consolidation.
@@ -229,7 +229,7 @@ for entry in ${targets[@]+"${targets[@]}"}; do
         repo_dir="${RUST_DIR}/${entry%%/*}"
         work_dir="${RUST_DIR}/${entry}"
         worktree_dir="${RUST_DIR}/${name}_style_fix"
-        worktree_eval="${worktree_dir}/${subpath}/EVALUATION.md"
+        unused=""
         branch_name="refactor/style/${name}"
     else
         kind="standalone"
@@ -239,10 +239,10 @@ for entry in ${targets[@]+"${targets[@]}"}; do
         repo_dir="${RUST_DIR}/${entry}"
         work_dir="$repo_dir"
         worktree_dir="${RUST_DIR}/${name}_style_fix"
-        worktree_eval="${worktree_dir}/EVALUATION.md"
+        unused=""
         branch_name="refactor/style"
     fi
-    eval_file="$LOG_DIR/style_fix_${name}_source_EVALUATION.md"
+    eval_file="$LOG_DIR/style_fix_${name}_evaluation.md"
 
     if [[ -n "$SINGLE_PROJECT" && "$name" != "$SINGLE_PROJECT" ]]; then
         continue
@@ -270,7 +270,7 @@ for entry in ${targets[@]+"${targets[@]}"}; do
     fi
 
     # Check 0: pending evaluation markdown exists with numbered findings.
-    # No project-root EVALUATION.md is used as a sentinel anymore.
+    # No project-root evaluation markdown file is used as a sentinel anymore.
     eval_status=$(python3 "$HISTORY_HELPER" evaluation-status --project "$name" --field status 2>/dev/null || echo "missing")
     finding_count=$(python3 "$HISTORY_HELPER" evaluation-status --project "$name" --field finding_count 2>/dev/null || echo 0)
     if [[ "$eval_status" != "findings" && "$eval_status" != "reviewed_findings" ]]; then
@@ -325,7 +325,7 @@ for entry in ${targets[@]+"${targets[@]}"}; do
 
     # Record eligibility. Delimited with 0x1F (unit separator) so empty middle
     # fields (subpath/pkg for standalone projects) survive `read` intact.
-    record="${name}${RS}${kind}${RS}${repo_dir}${RS}${eval_file}${RS}${worktree_dir}${RS}${worktree_eval}${RS}${subpath}${RS}${pkg}${RS}${branch_name}"
+    record="${name}${RS}${kind}${RS}${repo_dir}${RS}${eval_file}${RS}${worktree_dir}${RS}${unused}${RS}${subpath}${RS}${pkg}${RS}${branch_name}"
     eligible+=("$name")
     records+=("$record")
     echo "ELIGIBLE: $name ($finding_count findings, kind=$kind)"
@@ -345,13 +345,13 @@ RUN_DIR="$LOG_DIR/style_run_$(date +%s)_$$"
 mkdir -p "$RUN_DIR"
 
 # Look up the record for a project name.
-# Sets globals: R_name R_kind R_repo_dir R_eval_file R_worktree_dir R_worktree_eval R_subpath R_pkg R_branch
+# Sets globals: R_name R_kind R_repo_dir R_eval_file R_worktree_dir R_unused R_subpath R_pkg R_branch
 load_record() {
     local target="$1"
     local i
     for i in "${!eligible[@]}"; do
         if [[ "${eligible[$i]}" == "$target" ]]; then
-            IFS="$RS" read -r R_name R_kind R_repo_dir R_eval_file R_worktree_dir R_worktree_eval R_subpath R_pkg R_branch <<< "${records[$i]}"
+            IFS="$RS" read -r R_name R_kind R_repo_dir R_eval_file R_worktree_dir R_unused R_subpath R_pkg R_branch <<< "${records[$i]}"
             return 0
         fi
     done
@@ -381,7 +381,9 @@ create_and_fix() {
     local repo_dir="$R_repo_dir"
     local eval_file="$R_eval_file"
     local worktree_dir="$R_worktree_dir"
-    local worktree_eval="$R_worktree_eval"
+    # Keep evaluation markdown out of the worktree. Pending JSON owns durable
+    # state; this scratch file is only the agent handoff + Fix Summary surface.
+    local scratch_eval="$eval_file"
     local subpath="$R_subpath"
     local pkg="$R_pkg"
     local branch_name="$R_branch"
@@ -415,9 +417,10 @@ create_and_fix() {
     cp "$HOME/.claude/templates/settings_local.json" "$worktree_dir/.claude/settings.local.json"
     echo "[diag $proj] after settings.local.json copy"
 
-    # Materialize pending evaluation markdown only inside the style-fix worktree.
-    mkdir -p "$(dirname "$worktree_eval")"
-    python3 "$HISTORY_HELPER" export-evaluation --project "$proj" --output "$worktree_eval"
+    # Materialize pending evaluation markdown only as a scratch handoff. Do not
+    # write an evaluation markdown file into the style-fix worktree.
+    mkdir -p "$(dirname "$scratch_eval")"
+    python3 "$HISTORY_HELPER" export-evaluation --project "$proj" --output "$scratch_eval"
     echo "[diag $proj] after pending evaluation export"
     progress "$proj" "phase=worktree-ready dir=$worktree_dir"
 
@@ -461,7 +464,7 @@ IMPORTANT: Run every cargo command (mend, clippy, tests) in the FOREGROUND and r
 Required phase names, in order:
 
 - \`>>> phase: read-style-guide\` — before Step 1 (load style guide).
-- \`>>> phase: read-evaluation\` — before Step 2 (read \$worktree_eval).
+- \`>>> phase: read-evaluation\` — before Step 2 (read the scratch evaluation file).
 - \`>>> phase: apply-finding n=<N> id=<short-id>\` — once per finding before its first edit (\`<short-id>\` = the guideline filename stem from the **Style file** field, e.g. \`enums-over-bool-for-owned-booleans\`).
 - \`>>> phase: cargo-mend-preview\` — before \`cargo mend ... --manifest-path\` in Step 4.
 - \`>>> phase: cargo-mend-fix\` — before \`cargo mend ... --fix --manifest-path\` (skip if no fixable items).
@@ -477,15 +480,15 @@ Emit each marker on its own line, with no other text on the line. Do not skip ma
 
 Step 1: Load the style guide and read referenced files
 Run: zsh ~/.claude/scripts/load-rust-style.sh --project-root $agent_work_dir
-Then read each unique style file referenced by the findings in EVALUATION.md. Each finding includes a **Style file** field with the full path to the style guide file (e.g., ~/rust/nate_style/rust/one-use-per-line.md or a repo-local docs/style/*.md file).
+Then read each unique style file referenced by the findings in the scratch evaluation file. Each finding includes a **Style file** field with the full path to the style guide file (e.g., ~/rust/nate_style/rust/one-use-per-line.md or a repo-local docs/style/*.md file).
 Also read each style file marked [non-negotiable] in the loaded checklist, even if no finding cites it directly. Those rules apply to every fix.
 
 Step 2: Read the evaluation
-Read the file: $worktree_eval
+Read the scratch evaluation file: $scratch_eval
 
 IMPORTANT — review-stage exclusions:
 - Any finding wrapped in \`<!-- REMOVED-BY-REVIEW: ... -->\` ... \`<!-- /REMOVED-BY-REVIEW -->\` markers has been struck by the review pass. Treat it as if absent. Do NOT apply it. Do NOT mention it in the Fix Summary except to note it was removed-by-review.
-- The \`## Review Log\` section at the bottom of EVALUATION.md is reporting-only metadata for the human reviewer. Do NOT act on anything it says. Do NOT modify it.
+- The \`## Review Log\` section at the bottom of the scratch evaluation file is reporting-only metadata for the human reviewer. Do NOT act on anything it says. Do NOT modify it.
 - Apply only the numbered findings whose body is NOT inside REMOVED-BY-REVIEW markers.
 
 Step 3: Apply numbered findings from the evaluation.
@@ -505,19 +508,25 @@ it depends on the governing guideline frontmatter \`mode:\` field.
 
 - If \`mode: auto\`, \`mode: flag\`, or no \`mode:\` field (default for \`mechanism: llm\`):
   - Read every file in the **Locations** list of the finding.
+  - Before editing, rerun the finding's **Search** command when it is safe and still applies in this worktree. If the command is stale, derive an equivalent project-wide search from the **Surface searched** line and the style rule. Any still-valid same-rule matches you find are part of this finding's work set, even if the eval missed them.
   - **Before renaming a symbol or changing a public signature, use LSP \`findReferences\`**
     on the target to enumerate every call site you will need to update. ripgrep misses
     references that go through type aliases, re-exports, or generic dispatch; LSP does not.
     Apply the rename and update every reference returned. Same applies to relocations
     and visibility narrowing — \`findReferences\` first, then edit.
-  - Apply the "Recommended pattern" at **every listed location** — the eval enumerated
-    all violations of this guideline, so all of them must be fixed in this pass.
+  - Apply the "Recommended pattern" at **every listed location and every same-rule
+    match found by the pre-fix search**. Do not stop after the listed examples if
+    the project-wide search shows more matches for this same finding.
   - Skip any individual location whose file no longer exists or whose pattern no longer
     matches; if a finding has zero matching locations remaining, skip it and document why
     in the Fix Summary.
   - If applying a finding as written would violate any [non-negotiable] rule, do NOT apply
     that conflicting change. Preserve the non-negotiable rule, make any safe partial
     progress you can, and document the conflict in the Fix Summary.
+  - After editing, rerun the same project-wide search. If it reports any remaining
+    violation for this finding, set Status to **Partially applied** and list the
+    remaining sites in **Post-fix search** or **Issues**. Only use **Applied** when
+    the post-fix search says \`0 remaining\`.
 
 LSP availability: claude has the \`LSP\` tool when \`ENABLE_LSP_TOOL=1\` is in env;
 codex has equivalent coverage via the \`mcp-language-server\` MCP server. If neither
@@ -582,8 +591,8 @@ For rules marked [non-negotiable], review the full diff intent, not just added l
 Step 8: Run cargo +clean-fix fmt
 Run: cargo +clean-fix fmt $cargo_scope_flag --manifest-path $worktree_dir/Cargo.toml
 
-Step 9: Write fix summary to EVALUATION.md
-Append a section to the END of $worktree_eval with the following format:
+Step 9: Write fix summary to the scratch evaluation file
+Append a section to the END of $scratch_eval with the following format:
 
 ---
 
@@ -594,12 +603,13 @@ For each numbered finding, add a line:
 ### Finding N: [title from finding]
 **Status:** Applied | Partially applied | Skipped | Proposed
 **What was done:** [1-2 sentences describing the actual changes made]
+**Post-fix search:** [exact command or equivalent search used] — [0 remaining | N remaining: `path:line`, ...]
 **What I would change** (Proposed only): [paragraph describing recommended edits per Location]
 **Why** (Proposed only): [paragraph naming the tradeoff for the user to weigh in on]
 **Issues:** [If partially applied or skipped, explain WHY — e.g., "file no longer exists",
 "pattern did not match", "fixing this would require removing a public API method",
 "the clippy-suggested fix conflicts with one-use-per-line style rule", etc.]
-[Omit Issues line if status is Applied with no complications]
+[Omit Issues line if status is Applied with no complications, but do not omit Post-fix search for Applied findings]
 [Use Proposed when the guideline frontmatter has \`mode: propose\` — no code changes were made]
 
 After all findings, add:
@@ -628,7 +638,7 @@ Fixing guidelines:
 Rules:
 - $review_dir_description
 - Do NOT commit anything (no git add, no git commit)
-- EVALUATION.md ($worktree_eval) may ONLY be modified by appending the Fix Summary section (Step 9). Do NOT edit findings, REMOVED-BY-REVIEW blocks, or the Review Log. Append the Fix Summary AFTER the Review Log if one is present.
+- The scratch evaluation file ($scratch_eval) may ONLY be modified by appending the Fix Summary section (Step 9). Do NOT edit findings, REMOVED-BY-REVIEW blocks, or the Review Log. Append the Fix Summary AFTER the Review Log if one is present. Do NOT create an evaluation markdown file in the worktree.
 - Apply each fix completely — no partial changes
 - If a finding references files that do not exist or patterns that do not match, skip that finding and document why in the Fix Summary
 PROMPT_EOF
@@ -693,7 +703,7 @@ PROMPT_EOF
         elif (( current_log_size < last_log_size )); then
             last_log_size=$current_log_size
         fi
-        if [[ -z "$summary_seen_at" ]] && rg -q '^## Fix Summary$' "$worktree_eval" 2>/dev/null; then
+        if [[ -z "$summary_seen_at" ]] && rg -q '^## Fix Summary$' "$scratch_eval" 2>/dev/null; then
             summary_seen_at=$elapsed
             echo "[diag $proj] Fix Summary detected at ${elapsed}s; grace window resets on each agent log write"
             progress "$proj" "phase=agent-fix-summary-detected elapsed=${elapsed}s"
@@ -751,7 +761,7 @@ PROMPT_EOF
     progress "$proj" "phase=agent-exit code=$agent_code elapsed=${elapsed}s"
 
     if [[ $agent_code -ne 0 ]]; then
-        if [[ -f "$worktree_eval" ]] && rg -q '^## Fix Summary$' "$worktree_eval"; then
+        if [[ -f "$scratch_eval" ]] && rg -q '^## Fix Summary$' "$scratch_eval"; then
             echo "WARN: $proj ($STYLE_AGENT_MODE exited $agent_code, but Fix Summary was produced)"
         else
             local fail_reason
@@ -797,14 +807,14 @@ PROMPT_EOF
         return 1
     fi
 
-    python3 "$HISTORY_HELPER" finalize-fix --project-root "$agent_work_dir" --evaluation "$worktree_eval" || {
+    python3 "$HISTORY_HELPER" finalize-fix --project-root "$agent_work_dir" --evaluation "$scratch_eval" || {
         echo "ERROR: $proj (could not finalize history)"
         progress "$proj" "phase=failed reason=finalize-history"
         return 1
     }
 
     echo "OK: $proj (worktree created, fixes applied)"
-    progress "$proj" "phase=done eval=$worktree_eval"
+    progress "$proj" "phase=done eval=$scratch_eval"
     return 0
 }
 
@@ -846,33 +856,27 @@ if [[ ${#failed_names[@]} -gt 0 ]]; then
     echo "=== Retrying ${#failed_names[@]} failed projects sequentially ==="
     for proj in "${failed_names[@]}"; do
         if load_record "$proj"; then
-            # If the first attempt already produced a worktree with a Fix
-            # Summary in EVALUATION.md, the run is effectively done. The
+            # If the first attempt already produced a scratch evaluation with
+            # a Fix Summary, the run is effectively done. The
             # "failure" was almost certainly a SIGTERM-on-grace race or a
             # tolerant-cleanup gap. Finalize history and treat as success
             # instead of recreating the worktree.
             #
-            # Require a real git-linked worktree, not just a directory: an
-            # orphan stub left by a half-failed cleanup will also have
-            # EVALUATION.md + Fix Summary on disk but no `.git` linkage. Taking
-            # the shortcut on a stub silently finalizes a phantom success and
-            # locks every future clean-fix out of the project (the May 18
-            # nateroids regression — TIMEOUT cleanup left target/, EVALUATION.md,
-            # .claude/, .DS_Store behind; this branch then ran `finalize-fix`
-            # on the stub and the next clean-fix skipped on "style_fix directory
-            # exists" forever).
+            # Require a real git-linked worktree, not just a directory. The
+            # scratch evaluation proves the agent reached the summary phase;
+            # the worktree check proves the diff belongs to a real worktree.
             if is_real_worktree "$R_worktree_dir" "$R_repo_dir" \
-                && [[ -f "$R_worktree_eval" ]] \
-                && rg -q '^## Fix Summary$' "$R_worktree_eval" 2>/dev/null; then
-                echo "RETRY-SKIP: $proj (worktree at $R_worktree_dir already has Fix Summary; finalizing without re-running agent)"
+                && [[ -f "$R_eval_file" ]] \
+                && rg -q '^## Fix Summary$' "$R_eval_file" 2>/dev/null; then
+                echo "RETRY-SKIP: $proj (scratch evaluation already has Fix Summary; finalizing without re-running agent)"
                 progress "$proj" "phase=already-applied dir=$R_worktree_dir"
                 already_work_dir="$R_worktree_dir"
                 if [[ -n "$R_subpath" ]]; then
                     already_work_dir="$R_worktree_dir/$R_subpath"
                 fi
-                if python3 "$HISTORY_HELPER" finalize-fix --project-root "$already_work_dir" --evaluation "$R_worktree_eval"; then
+                if python3 "$HISTORY_HELPER" finalize-fix --project-root "$already_work_dir" --evaluation "$R_eval_file"; then
                     echo "RETRY OK: $proj (already applied)"
-                    progress "$proj" "phase=done eval=$R_worktree_eval"
+                    progress "$proj" "phase=done eval=$R_eval_file"
                     failed=$((failed - 1))
                     succeeded=$((succeeded + 1))
                     continue

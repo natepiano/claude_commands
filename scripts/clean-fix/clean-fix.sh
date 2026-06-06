@@ -149,10 +149,10 @@ if [[ "$STYLE_EVAL_MODE" != "off" ]]; then
         log "WARNING: style evaluation script failed"
     }
 
-    # Review pass over each project's EVALUATION.md before the fix stage spawns.
+    # Review pass over each project's pending evaluation markdown before the fix stage spawns.
     # Tightens, scopes, or removes findings the eval agent surfaced. Runs under
     # the same agent as the eval stage (claude or codex per STYLE_EVAL_MODE).
-    log "Reviewing EVALUATION.md files ($STYLE_EVAL_MODE)..."
+    log "Reviewing pending evaluation markdown ($STYLE_EVAL_MODE)..."
     "$SCRIPT_DIR/style-eval-review-all.sh" 2>&1 | tee -a "$LOG_FILE" || {
         log "WARNING: style eval review script failed"
     }

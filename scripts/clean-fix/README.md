@@ -19,14 +19,14 @@ Runs daily at **4:00 AM** via launchd.
 
 | File | Purpose |
 |------|---------|
-| `style-eval-all.sh` | Runs `/style_eval` on every `[targets]` entry in parallel. Produces/updates `EVALUATION.md` in each target's work dir. Checks for an existing `_style_fix` worktree and omits those findings from re-evaluation. |
+| `style-eval-all.sh` | Runs `/style_eval` on every `[targets]` entry in parallel. Stores pending evaluation markdown in `.history/.pending/<project>.json`. Checks for an active style-fix scratch evaluation and omits those findings from re-evaluation. |
 | `rg-shim.sh` | Timeout shim for `ripgrep`. Bounds every non-interactive `rg` so a path-less search blocked on stdin can't hang forever. See **Reliability guards** below. |
 
 ### Style-Fix Worktrees
 
 | File | Purpose |
 |------|---------|
-| `style-fix-worktrees.sh` | For each project with `EVALUATION.md` findings: creates a `_style_fix` worktree, moves `EVALUATION.md` into it, launches the configured style agent to apply fixes (cargo mend, clippy, tests, style review). Other linked worktrees are allowed; the primary checkout still must be clean. Can target a single project by name. |
+| `style-fix-worktrees.sh` | For each project with pending findings: creates a `_style_fix` worktree, exports evaluation markdown to a scratch file under `/private/tmp/claude`, launches the configured style agent to apply fixes (cargo mend, clippy, tests, style review), and keeps `EVALUATION.md` out of the worktree. Other linked worktrees are allowed; the primary checkout still must be clean. Can target a single project by name. |
 
 ### Warmup
 
@@ -112,7 +112,7 @@ Clean-fix Build (4:00 AM)
   │
   ├─ Phase 3: Style-Fix Worktrees (per project, parallel)
   │    Create _style_fix worktree (other linked worktrees allowed if primary is clean)
-  │    → materialize pending evaluation markdown into the worktree
+  │    → export pending evaluation markdown to scratch storage
   │    → Configured style agent applies fixes, runs clippy/tests/style review
   │
   └─ Generate Clean-fix Report

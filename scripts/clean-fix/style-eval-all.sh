@@ -378,12 +378,12 @@ fi
 # Build project list. Parallel arrays indexed by position:
 #   projects[i]             -- project name
 #   project_roots[i]        -- absolute path to project root (for $ARGUMENTS)
-#   project_worktree_evals[i] -- EVALUATION.md path inside the style-fix worktree
+#   project_worktree_evals[i] -- scratch evaluation path used by the style-fix worktree
 projects=()
 project_roots=()
 project_worktree_evals=()
 
-# Resolve each [targets] entry into (name, project_root, worktree_eval).
+# Resolve each [targets] entry into (name, project_root, scratch eval path).
 #   <dir>            -> whole directory; name=<dir>
 #   <dir>/<subpath>  -> workspace member; name=last path segment
 # <dir> may be a primary repo or a worktree checkout — the eval reads source
@@ -393,11 +393,11 @@ for entry in ${targets[@]+"${targets[@]}"}; do
         name="${entry##*/}"
         subpath="${entry#*/}"
         project_root="${RUST_DIR}/${entry}"
-        worktree_eval="${RUST_DIR}/${name}_style_fix/${subpath}/EVALUATION.md"
+        worktree_eval="${LOG_DIR}/style_fix_${name}_evaluation.md"
     else
         name="$entry"
         project_root="${RUST_DIR}/${entry}"
-        worktree_eval="${RUST_DIR}/${name}_style_fix/EVALUATION.md"
+        worktree_eval="${LOG_DIR}/style_fix_${name}_evaluation.md"
     fi
 
     if [[ -n "$SINGLE_PROJECT" && "$name" != "$SINGLE_PROJECT" ]]; then
@@ -437,7 +437,7 @@ for i in "${!projects[@]}"; do
     proj="${projects[$i]}"
     project_root="${project_roots[$i]}"
     worktree_eval="${project_worktree_evals[$i]}"
-    eval_path="$LOG_DIR/style_eval_${proj}_EVALUATION.md"
+    eval_path="$LOG_DIR/style_eval_${proj}_evaluation.md"
 
     pending_status=$(evaluation_status_field "$proj" status)
     if [[ "$pending_status" == "findings" || "$pending_status" == "reviewed_findings" ]]; then
@@ -484,7 +484,7 @@ done
 echo ""
 echo "Waiting for ${#pids[@]} processes..."
 
-# Wait for all and track results. On a missing EVALUATION.md, retry once
+# Wait for all and track results. On a missing pending evaluation, retry once
 # serially before recording the failure. Every failure (recovered or not)
 # writes a persistent report under $FAILURE_LOG_DIR so the next-morning
 # triage doesn't require re-reading a 350 KB codex transcript.

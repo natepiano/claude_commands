@@ -6,74 +6,13 @@ from __future__ import annotations
 import argparse
 import json
 import re
-from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from style_history import HISTORY_DIR, NATE_STYLE_DIR, RUST_DIR, normalize_guideline_id
+from style_history import HISTORY_DIR, NATE_STYLE_DIR
 from style_report import REPORT_FILE, build_blocked_view, build_coverage_view, build_style_summary, iter_rows, render_report
 
 RUST_STYLE_DIR = NATE_STYLE_DIR / "rust"
-
-
-@dataclass
-class FindingSection:
-    number: int
-    title: str
-    lines: list[str]
-    guideline_id: str | None
-
-
-@dataclass
-class FixSection:
-    number: int
-    title: str
-    lines: list[str]
-
-
-@dataclass
-class EvaluationDocument:
-    header_lines: list[str]
-    findings: list[FindingSection]
-    tail_lines: list[str]
-    fix_sections: list[FixSection]
-    post_fix_lines: list[str]
-
-
-def trim_blank_edges(lines: list[str]) -> list[str]:
-    start = 0
-    end = len(lines)
-    while start < end and lines[start] == "":
-        start += 1
-    while end > start and lines[end - 1] == "":
-        end -= 1
-    return lines[start:end]
-
-
-def compact_blank_lines(lines: list[str]) -> list[str]:
-    compacted: list[str] = []
-    previous_blank = False
-    for line in lines:
-        is_blank = line == ""
-        if is_blank and previous_blank:
-            continue
-        compacted.append(line)
-        previous_blank = is_blank
-    return compacted
-
-
-def update_rules_checked_line(header_lines: list[str], count: int) -> list[str]:
-    updated: list[str] = []
-    replaced = False
-    for line in header_lines:
-        if line.startswith("**Rules checked**:"):
-            updated.append(f"**Rules checked**: {count}")
-            replaced = True
-        else:
-            updated.append(line)
-    if not replaced:
-        updated.append(f"**Rules checked**: {count}")
-    return updated
 
 
 def replace_wikilinks_for_rename(text: str, old_stem: str, new_stem: str) -> str:
@@ -183,119 +122,6 @@ def write_jsonl(path: Path, rows: list[dict[str, Any]]) -> None:
             handle.write(json.dumps(row, sort_keys=True) + "\n")
 
 
-def parse_evaluation_document(path: Path) -> EvaluationDocument:
-    lines = path.read_text().splitlines()
-    try:
-        improvements_index = lines.index("## Improvements")
-    except ValueError:
-        return EvaluationDocument(lines, [], [], [], [])
-
-    header_lines = lines[: improvements_index + 1]
-    index = improvements_index + 1
-    findings: list[FindingSection] = []
-    tail_lines: list[str] = []
-    fix_sections: list[FixSection] = []
-    post_fix_lines: list[str] = []
-
-    while index < len(lines):
-        line = lines[index]
-        if line == "## Fix Summary":
-            break
-        if line.startswith("### "):
-            heading = line.removeprefix("### ").strip()
-            number_text, _, title = heading.partition(".")
-            if not number_text.isdigit():
-                tail_lines.append(line)
-                index += 1
-                continue
-            index += 1
-            section_lines: list[str] = []
-            guideline_id: str | None = None
-            while index < len(lines):
-                current = lines[index]
-                if current.startswith("### ") or current == "## Fix Summary":
-                    break
-                if current.startswith("**Style file**:"):
-                    raw_path = current.split(":", 1)[1].strip().strip("`")
-                    guideline_id = normalize_guideline_id(raw_path)
-                section_lines.append(current)
-                index += 1
-            findings.append(FindingSection(int(number_text), title.strip(), section_lines, guideline_id))
-            continue
-        tail_lines.append(line)
-        index += 1
-
-    if index >= len(lines):
-        return EvaluationDocument(header_lines, findings, tail_lines, fix_sections, post_fix_lines)
-
-    index += 1
-    while index < len(lines):
-        line = lines[index]
-        if line.startswith("## ") and not line.startswith("### "):
-            post_fix_lines = lines[index:]
-            break
-        if line.startswith("### Finding "):
-            match = re.match(r"### Finding (\d+):\s*(.*)", line)
-            if not match:
-                post_fix_lines = lines[index:]
-                break
-            number = int(match.group(1))
-            title = match.group(2).strip()
-            index += 1
-            section_lines: list[str] = []
-            while index < len(lines):
-                current = lines[index]
-                if current.startswith("### Finding ") or (current.startswith("## ") and not current.startswith("### ")):
-                    break
-                section_lines.append(current)
-                index += 1
-            fix_sections.append(FixSection(number, title, section_lines))
-            continue
-        index += 1
-
-    return EvaluationDocument(header_lines, findings, tail_lines, fix_sections, post_fix_lines)
-
-
-def render_evaluation_document(doc: EvaluationDocument) -> str:
-    lines: list[str] = []
-    lines.extend(update_rules_checked_line(doc.header_lines, len(doc.findings)))
-    if doc.findings:
-        if lines and lines[-1] != "":
-            lines.append("")
-        for idx, finding in enumerate(doc.findings, start=1):
-            lines.append(f"### {idx}. {finding.title}")
-            lines.append("")
-            lines.extend(trim_blank_edges(finding.lines))
-            if idx != len(doc.findings):
-                lines.append("")
-        if doc.tail_lines:
-            if lines and lines[-1] != "":
-                lines.append("")
-            lines.extend(trim_blank_edges(doc.tail_lines))
-    elif doc.tail_lines:
-        if lines and lines[-1] != "":
-            lines.append("")
-        lines.extend(trim_blank_edges(doc.tail_lines))
-
-    if doc.fix_sections:
-        if lines and lines[-1] != "":
-            lines.append("")
-        lines.append("## Fix Summary")
-        lines.append("")
-        for idx, section in enumerate(doc.fix_sections, start=1):
-            lines.append(f"### Finding {idx}: {section.title}")
-            lines.extend(trim_blank_edges(section.lines))
-            if idx != len(doc.fix_sections):
-                lines.append("")
-
-    if doc.post_fix_lines:
-        if lines and lines[-1] != "":
-            lines.append("")
-        lines.extend(trim_blank_edges(doc.post_fix_lines))
-
-    return "\n".join(compact_blank_lines(lines)).rstrip() + "\n"
-
-
 def update_history_for_rename(old_guideline_id: str, new_guideline_id: str) -> tuple[int, int]:
     files_changed = 0
     entries_updated = 0
@@ -340,44 +166,6 @@ def update_history_for_delete(guideline_id: str) -> tuple[int, int, int]:
             write_jsonl(path, new_rows)
             files_changed += 1
     return files_changed, entries_removed, runs_removed
-
-
-def update_evaluations_for_rename(old_guideline_id: str, new_guideline_id: str) -> int:
-    old_abs = str(NATE_STYLE_DIR / old_guideline_id)
-    new_abs = str(NATE_STYLE_DIR / new_guideline_id)
-    updated = 0
-    for path in sorted(RUST_DIR.glob("*/EVALUATION.md")):
-        original = path.read_text()
-        rewritten = original.replace(old_abs, new_abs).replace(old_guideline_id, new_guideline_id)
-        if rewritten != original:
-            path.write_text(rewritten)
-            updated += 1
-    return updated
-
-
-def update_evaluations_for_delete(guideline_id: str) -> int:
-    updated = 0
-    for path in sorted(RUST_DIR.glob("*/EVALUATION.md")):
-        doc = parse_evaluation_document(path)
-        if not doc.findings:
-            continue
-        remaining_findings = [finding for finding in doc.findings if finding.guideline_id != guideline_id]
-        removed_numbers = {finding.number for finding in doc.findings if finding.guideline_id == guideline_id}
-        if not removed_numbers:
-            continue
-        remaining_fix_sections = [section for section in doc.fix_sections if section.number not in removed_numbers]
-        rewritten = render_evaluation_document(
-            EvaluationDocument(
-                header_lines=doc.header_lines,
-                findings=remaining_findings,
-                tail_lines=doc.tail_lines,
-                fix_sections=remaining_fix_sections,
-                post_fix_lines=doc.post_fix_lines,
-            )
-        )
-        path.write_text(rewritten)
-        updated += 1
-    return updated
 
 
 def update_markdown_wikilinks_for_rename(old_stem: str, new_stem: str) -> int:
@@ -426,14 +214,12 @@ def run_rename(old_name: str, new_name: str) -> None:
     new_guideline_id = f"rust/{new_name}"
     source.rename(target)
     history_files, entries_updated = update_history_for_rename(old_guideline_id, new_guideline_id)
-    evaluation_files = update_evaluations_for_rename(old_guideline_id, new_guideline_id)
     wikilink_files = update_markdown_wikilinks_for_rename(Path(old_name).stem, Path(new_name).stem)
     regenerate_report()
 
     print(f"Renamed: {old_name} -> {new_name}")
     print(f".history files updated: {history_files}")
     print(f".history entries updated: {entries_updated}")
-    print(f"EVALUATION.md files updated: {evaluation_files}")
     print(f"Obsidian files updated: {wikilink_files} (covers see_also frontmatter)")
 
 
@@ -447,7 +233,6 @@ def run_delete(style_name: str) -> None:
 
     source.unlink()
     history_files, entries_removed, runs_removed = update_history_for_delete(guideline_id)
-    evaluation_files = update_evaluations_for_delete(guideline_id)
     wikilink_files = update_markdown_wikilinks_for_delete(stem)
     regenerate_report()
 
@@ -455,7 +240,6 @@ def run_delete(style_name: str) -> None:
     print(f".history files updated: {history_files}")
     print(f".history entries removed: {entries_removed}")
     print(f"Run records removed: {runs_removed}")
-    print(f"EVALUATION.md files updated: {evaluation_files}")
     print(f"see_also frontmatter cleaned: {see_also_files} file(s), {see_also_refs} reference(s)")
     print(f"Obsidian files updated: {wikilink_files}")
 

@@ -4,7 +4,7 @@
 <title>clean_fix_style</title>
 <polygon fill="white" stroke="none" points="-4,4 -4,-950 788.8,-950 788.8,4 -4,4" />
 
-<rect x="-18.0" y="-895.4" width="208.8" height="461.2" fill="none" stroke="#95a5a6" stroke-width="1.5" stroke-dasharray="6,4" rx="4.0" /><rect x="232.1" y="-895.4" width="214.2" height="607.2" fill="none" stroke="#95a5a6" stroke-width="1.5" stroke-dasharray="6,4" rx="4.0" /><rect x="487.6" y="-895.4" width="315.2" height="482.2" fill="none" stroke="#95a5a6" stroke-width="1.5" stroke-dasharray="6,4" rx="4.0" /><rect x="288.0" y="-200.0" width="208.8" height="230.0" fill="none" stroke="#95a5a6" stroke-width="1.5" stroke-dasharray="6,4" rx="4.0" /><g id="node1" class="node">
+<rect x="-18.0" y="-895.4" width="208.8" height="461.2" fill="none" stroke="#95a5a6" stroke-width="1.5" stroke-dasharray="6,4" rx="4.0" /><rect x="234.8" y="-895.4" width="208.8" height="607.2" fill="none" stroke="#95a5a6" stroke-width="1.5" stroke-dasharray="6,4" rx="4.0" /><rect x="487.6" y="-895.4" width="315.2" height="482.2" fill="none" stroke="#95a5a6" stroke-width="1.5" stroke-dasharray="6,4" rx="4.0" /><rect x="288.0" y="-200.0" width="208.8" height="230.0" fill="none" stroke="#95a5a6" stroke-width="1.5" stroke-dasharray="6,4" rx="4.0" /><g id="node1" class="node">
 <title>start</title>
 <ellipse fill="#f0e6ff" stroke="#8e44ad" cx="86.4" cy="-928" rx="79.2" ry="18" />
 <text xml:space="preserve" text-anchor="middle" x="86.4" y="-924.12" font-family="Helvetica,sans-Serif" font-size="10.00">Clean-fix Build (4:00 AM)</text>
@@ -140,7 +140,7 @@
 <g id="node11" class="node">
 <title>carry_forward</title>
 <polygon fill="#e8f4f8" stroke="#2980b9" points="425.6,-657.8 252.8,-657.8 252.8,-618.2 425.6,-618.2 425.6,-657.8" />
-<text xml:space="preserve" text-anchor="middle" x="339.2" y="-639.75" font-family="Helvetica,sans-Serif" font-size="10.00">Read existing EVALUATION.md</text>
+<text xml:space="preserve" text-anchor="middle" x="339.2" y="-639.75" font-family="Helvetica,sans-Serif" font-size="10.00">Read pending JSON</text>
 <text xml:space="preserve" text-anchor="middle" x="339.2" y="-628.5" font-family="Helvetica,sans-Serif" font-size="10.00">(carry forward valid findings)</text>
 </g>
 
@@ -152,10 +152,9 @@
 
 <g id="node12" class="node">
 <title>check_wt_eval</title>
-<polygon fill="#fef9e7" stroke="#f39c12" points="339.2,-590.4 250.12,-558 339.2,-525.6 428.28,-558 339.2,-590.4" />
-<text xml:space="preserve" text-anchor="middle" x="339.2" y="-565.38" font-family="Helvetica,sans-Serif" font-size="10.00">_style_fix/</text>
-<text xml:space="preserve" text-anchor="middle" x="339.2" y="-554.12" font-family="Helvetica,sans-Serif" font-size="10.00">EVALUATION.md</text>
-<text xml:space="preserve" text-anchor="middle" x="339.2" y="-542.88" font-family="Helvetica,sans-Serif" font-size="10.00">exists?</text>
+<polygon fill="#fef9e7" stroke="#f39c12" points="339.2,-590.4 261.77,-558 339.2,-525.6 416.63,-558 339.2,-590.4" />
+<text xml:space="preserve" text-anchor="middle" x="339.2" y="-559.75" font-family="Helvetica,sans-Serif" font-size="10.00">style-fix scratch</text>
+<text xml:space="preserve" text-anchor="middle" x="339.2" y="-548.5" font-family="Helvetica,sans-Serif" font-size="10.00">evaluation exists?</text>
 </g>
 
 <g id="edge12" class="edge">
@@ -167,7 +166,7 @@
 <g id="node13" class="node">
 <title>load_wt_eval</title>
 <polygon fill="#e8f4f8" stroke="#2980b9" points="425.6,-497.8 252.8,-497.8 252.8,-458.2 425.6,-458.2 425.6,-497.8" />
-<text xml:space="preserve" text-anchor="middle" x="339.2" y="-479.75" font-family="Helvetica,sans-Serif" font-size="10.00">Read worktree EVALUATION.md</text>
+<text xml:space="preserve" text-anchor="middle" x="339.2" y="-479.75" font-family="Helvetica,sans-Serif" font-size="10.00">Read style-fix scratch</text>
 <text xml:space="preserve" text-anchor="middle" x="339.2" y="-468.5" font-family="Helvetica,sans-Serif" font-size="10.00">(exclude these findings)</text>
 </g>
 
@@ -187,9 +186,9 @@
 
 <g id="edge14" class="edge">
 <title>check_wt_eval-&gt;evaluate</title>
-<path fill="none" stroke="black" d="M294.78,-541.41C277.28,-532.44 259.02,-519.43 249.1,-501.5 238.99,-483.22 238.23,-472.34 249.1,-454.5 253.97,-446.5 260.71,-439.82 268.32,-434.26" />
+<path fill="none" stroke="black" d="M297.61,-542.84C279.28,-533.83 259.56,-520.4 249.1,-501.5 238.99,-483.22 238.23,-472.34 249.1,-454.5 253.97,-446.5 260.71,-439.82 268.32,-434.26" />
 <polygon fill="black" stroke="black" points="269.86,-437.43 276.34,-429.05 266.05,-431.56 269.86,-437.43" />
-<text xml:space="preserve" text-anchor="middle" x="244.57" y="-502.85" font-family="Helvetica,sans-Serif" font-size="8.00">no</text>
+<text xml:space="preserve" text-anchor="middle" x="244.59" y="-502.87" font-family="Helvetica,sans-Serif" font-size="8.00">no</text>
 </g>
 
 <g id="edge15" class="edge">
@@ -201,7 +200,7 @@
 <g id="node15" class="node">
 <title>write_eval</title>
 <polygon fill="#e8f4f8" stroke="#2980b9" points="425.6,-357.8 252.8,-357.8 252.8,-318.2 425.6,-318.2 425.6,-357.8" />
-<text xml:space="preserve" text-anchor="middle" x="339.2" y="-339.75" font-family="Helvetica,sans-Serif" font-size="10.00">Write EVALUATION.md</text>
+<text xml:space="preserve" text-anchor="middle" x="339.2" y="-339.75" font-family="Helvetica,sans-Serif" font-size="10.00">Write pending JSON</text>
 <text xml:space="preserve" text-anchor="middle" x="339.2" y="-328.5" font-family="Helvetica,sans-Serif" font-size="10.00">(carried + new)</text>
 </g>
 
@@ -257,7 +256,7 @@
 <title>mv_eval</title>
 <polygon fill="#e8f4f8" stroke="#2980b9" points="731.6,-632.8 558.8,-632.8 558.8,-593.2 731.6,-593.2 731.6,-632.8" />
 <text xml:space="preserve" text-anchor="middle" x="645.2" y="-615.5" font-family="Helvetica,sans-Serif" font-size="10.00">export pending markdown</text>
-<text xml:space="preserve" text-anchor="middle" x="645.2" y="-604.25" font-family="Helvetica,sans-Serif" font-size="10.00">→ worktree EVALUATION.md</text>
+<text xml:space="preserve" text-anchor="middle" x="645.2" y="-604.25" font-family="Helvetica,sans-Serif" font-size="10.00">→ scratch evaluation</text>
 </g>
 
 <g id="edge20" class="edge">
@@ -357,5 +356,5 @@
 <path fill="none" stroke="black" stroke-dasharray="1,5" d="M392.4,-59.67C392.4,-55.83 392.4,-51.69 392.4,-47.56" />
 <polygon fill="black" stroke="black" points="395.9,-47.73 392.4,-37.73 388.9,-47.73 395.9,-47.73" />
 </g>
-<text x="-10.0" y="-883.4" font-family="Helvetica,sans-Serif" font-size="9" fill="#7f8c8d">Phase 1: Clean + Rebuild</text><text x="240.1" y="-883.4" font-family="Helvetica,sans-Serif" font-size="9" fill="#7f8c8d">Phase 2: Style Evaluation</text><text x="495.6" y="-883.4" font-family="Helvetica,sans-Serif" font-size="9" fill="#7f8c8d">Phase 3: Style-Fix Worktrees</text><text x="296.0" y="-188.0" font-family="Helvetica,sans-Serif" font-size="9" fill="#7f8c8d">Post-Clean-fix (Manual)</text></g>
+<text x="-10.0" y="-883.4" font-family="Helvetica,sans-Serif" font-size="9" fill="#7f8c8d">Phase 1: Clean + Rebuild</text><text x="242.8" y="-883.4" font-family="Helvetica,sans-Serif" font-size="9" fill="#7f8c8d">Phase 2: Style Evaluation</text><text x="495.6" y="-883.4" font-family="Helvetica,sans-Serif" font-size="9" fill="#7f8c8d">Phase 3: Style-Fix Worktrees</text><text x="296.0" y="-188.0" font-family="Helvetica,sans-Serif" font-size="9" fill="#7f8c8d">Post-Clean-fix (Manual)</text></g>
 </svg>

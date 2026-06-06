@@ -47,7 +47,7 @@ PROJECT_NAME="${PROJECT_NAME%_style_fix}"
 RESULTS_FILE="/tmp/style-eval-results-${PROJECT_NAME}.json"
 EVAL_PATH="$EVALUATION_PATH"
 if [[ -z "$EVAL_PATH" ]]; then
-    EVAL_PATH="/tmp/style-eval-${PROJECT_NAME}-EVALUATION.md"
+    EVAL_PATH="/tmp/style-eval-${PROJECT_NAME}-evaluation.md"
 fi
 ~/.claude/scripts/clean-fix/style-eval-heartbeat.sh \
     --project "$PROJECT_NAME" \
@@ -140,13 +140,13 @@ Keep any still-valid findings. They count toward the same pending evaluation num
 
 ## Step 3.5: Exclude findings already being fixed in a worktree
 
-The worktree evaluation path for this project is: `$WORKTREE_EVAL_PATH`
+The active style-fix scratch evaluation path for this project is: `$WORKTREE_EVAL_PATH`
 
 If the line above shows a real filesystem path, check whether that file exists.
 
-If the line above shows the literal string `$WORKTREE_EVAL_PATH` (i.e. no substitution was made, because this command was invoked directly rather than via the clean-fix), derive the path instead: take the project directory name, append `_style_fix`, and check for `EVALUATION.md` there. For example, if `$ARGUMENTS` is `~/rust/my_project`, check `~/rust/my_project_style_fix/EVALUATION.md`.
+If the line above shows the literal string `$WORKTREE_EVAL_PATH` (i.e. no substitution was made, because this command was invoked directly rather than via the clean-fix), derive the scratch path instead: take the project directory name and check `/private/tmp/claude/style_fix_<project>_evaluation.md`. For example, if `$ARGUMENTS` is `~/rust/my_project`, check `/private/tmp/claude/style_fix_my_project_evaluation.md`.
 
-If that file exists, read it. These findings are already being addressed in a style-fix branch. When evaluating in Step 4, **do not re-discover** any finding that matches a worktree finding by title or by the same style rule applied to the same files. This prevents duplicate work between the primary evaluation and the in-progress worktree fixes.
+If that file exists, read it. These findings are already being addressed in a style-fix branch. When evaluating in Step 4, **do not re-discover** any finding that matches a style-fix scratch finding by title or by the same style rule applied to the same files. This prevents duplicate work between the primary evaluation and the in-progress worktree fixes.
 
 ## Step 4: Evaluate only the selected guideline units
 
@@ -160,7 +160,7 @@ For each returned unit:
    RESULTS_FILE="/tmp/style-eval-results-${PROJECT_NAME}.json"
    EVAL_PATH="$EVALUATION_PATH"
    if [[ -z "$EVAL_PATH" ]]; then
-       EVAL_PATH="/tmp/style-eval-${PROJECT_NAME}-EVALUATION.md"
+       EVAL_PATH="/tmp/style-eval-${PROJECT_NAME}-evaluation.md"
    fi
    ~/.claude/scripts/clean-fix/style-eval-heartbeat.sh \
        --project "$PROJECT_NAME" \
@@ -338,4 +338,4 @@ If `--fix` was passed, you are running interactively and the user is waiting on 
    - cargo/clippy/test/error/warning lines → echo verbatim; they're already short
    - Skip `worktree-create` if immediately followed by `worktree-ready` to keep chatter low.
 
-6. When the harness delivers the `run_in_background` completion event for the launcher (the `exec`'d `style-fix-worktrees.sh` returned), the Monitor will already have terminated on its own via the `phase=launcher-exit` sentinel. If for any reason it has not (e.g. the trap did not fire), call `TaskStop` on the Monitor's task id. Then read `~/rust/<project>_style_fix/EVALUATION.md`'s `## Fix Summary` section plus the tail of the manual log. Post a final summary covering: applied/skipped/proposed findings, `cargo mend` status, clippy status, and any `commit-style-results: skipped` notice. If the final progress phase was `failed`, surface the `reason=` value first.
+6. When the harness delivers the `run_in_background` completion event for the launcher (the `exec`'d `style-fix-worktrees.sh` returned), the Monitor will already have terminated on its own via the `phase=launcher-exit` sentinel. If for any reason it has not (e.g. the trap did not fire), call `TaskStop` on the Monitor's task id. Then read `/private/tmp/claude/style_fix_<project>_evaluation.md`'s `## Fix Summary` section plus the tail of the manual log. Post a final summary covering: applied/skipped/proposed findings, `cargo mend` status, clippy status, and any `commit-style-results: skipped` notice. If the final progress phase was `failed`, surface the `reason=` value first.

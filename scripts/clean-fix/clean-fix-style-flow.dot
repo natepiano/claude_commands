@@ -63,11 +63,11 @@ digraph clean_fix_style {
         eval_foreach [label="For each project (parallel)" pos="394.2,790!"]
         load_style [label="Load style guide\n~/.claude/scripts/load-rust-style.sh" height=0.55 pos="394.2,725!"]
         survey [label="Survey project source" pos="394.2,665!"]
-        carry_forward [label="Read existing EVALUATION.md\n(carry forward valid findings)" height=0.55 pos="394.2,600!"]
-        check_wt_eval [label="_style_fix/\nEVALUATION.md\nexists?" shape=diamond fillcolor="#fef9e7" color="#f39c12" width=1.5 height=0.9 pos="394.2,520!"]
-        load_wt_eval [label="Read worktree EVALUATION.md\n(exclude these findings)" height=0.55 pos="394.2,440!"]
+        carry_forward [label="Read pending JSON\n(carry forward valid findings)" height=0.55 pos="394.2,600!"]
+        check_wt_eval [label="style-fix scratch\nevaluation exists?" shape=diamond fillcolor="#fef9e7" color="#f39c12" width=1.5 height=0.9 pos="394.2,520!"]
+        load_wt_eval [label="Read style-fix scratch\n(exclude these findings)" height=0.55 pos="394.2,440!"]
         evaluate [label="Find up to 5 NEW violations\n(skip worktree findings)" height=0.55 pos="394.2,370!"]
-        write_eval [label="Write EVALUATION.md\n(carried + new)" height=0.55 pos="394.2,300!"]
+        write_eval [label="Write pending JSON\n(carried + new)" height=0.55 pos="394.2,300!"]
     }
 
     // ══════ Phase 3: Style-Fix Worktrees (x center = 700.2) ══════
@@ -79,7 +79,7 @@ digraph clean_fix_style {
         fix_foreach [label="For each project with\npending eval findings" height=0.55 pos="700.2,790!"]
         prechecks [label="Prechecks:\n- target _style_fix path is free\n- primary tree is clean" height=0.65 pos="700.2,720!"]
         create_wt [label="git worktree add\n-b refactor/style\n{project}_style_fix" height=0.65 pos="700.2,645!"]
-        mv_eval [label="export pending markdown\n→ worktree EVALUATION.md" height=0.55 pos="700.2,575!"]
+        mv_eval [label="export pending markdown\n→ scratch evaluation" height=0.55 pos="700.2,575!"]
         claude_fix [label="Launch Claude\n(fixes, cargo mend, clippy,\ntests, style review)" fillcolor="#d5f5e3" color="#27ae60" height=0.65 pos="700.2,500!"]
         fix_ok [label="Worktree ready\nfor review" fillcolor="#d5f5e3" color="#27ae60" height=0.55 width=1.8 pos="625.4,425!"]
         fix_fail [label="Failure: finalize\nor keep pending" fillcolor="#fadbd8" color="#e74c3c" height=0.55 width=1.8 pos="775.0,425!"]

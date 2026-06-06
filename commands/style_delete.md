@@ -16,7 +16,7 @@ The admin script:
 - auto-appends `.md` when the file exists with that suffix,
 - strips `see_also` references to the deleted file from every other style file's frontmatter (handles both single-value and list forms),
 - rewrites remaining body wikilinks pointing at the deleted file to plain text, and
-- cleans history and EVALUATION.md entries.
+- cleans style history entries.
 
 Run:
 ```bash
