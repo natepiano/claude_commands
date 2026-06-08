@@ -19,14 +19,14 @@ Runs daily at **4:00 AM** via launchd.
 
 | File | Purpose |
 |------|---------|
-| `style-eval-all.sh` | Runs `/style_eval` on every `[targets]` entry in parallel. Stores pending evaluation markdown in `.history/.pending/<project>.json`. Checks for an active style-fix scratch evaluation and omits those findings from re-evaluation. |
+| `style-eval-all.sh` | Runs `/style_eval` on every `[targets]` entry in parallel. Stores pending evaluation markdown in `.history/.pending/<project>.json`. Skips projects with pending findings or a real `_style_fix` worktree so pending JSON cannot be replaced while fixes are awaiting review. |
 | `rg-shim.sh` | Timeout shim for `ripgrep`. Bounds every non-interactive `rg` so a path-less search blocked on stdin can't hang forever. See **Reliability guards** below. |
 
 ### Style-Fix Worktrees
 
 | File | Purpose |
 |------|---------|
-| `style-fix-worktrees.sh` | For each project with pending findings: creates a `_style_fix` worktree, exports evaluation markdown to a scratch file under `/private/tmp/claude`, launches the configured style agent to apply fixes (cargo mend, clippy, tests, style review), and keeps `EVALUATION.md` out of the worktree. Other linked worktrees are allowed; the primary checkout still must be clean. Can target a single project by name. |
+| `style-fix-worktrees.sh` | For each project with pending findings: creates a `_style_fix` worktree, exports evaluation markdown to a scratch file under `/private/tmp/claude`, launches the configured style agent to apply fixes (cargo mend, clippy, tests, style review), saves the Fix Summary back into pending JSON, and keeps `EVALUATION.md` out of the worktree. Other linked worktrees are allowed; the primary checkout still must be clean. Can target a single project by name. |
 
 ### Warmup
 
@@ -107,7 +107,7 @@ Clean-fix Build (4:00 AM)
   │
   ├─ Phase 2: Style Evaluation (per project, parallel)
   │    Load style guide → survey code → carry forward valid findings
-  │    → check for _style_fix worktree findings (exclude them)
+  │    → skip any project with pending findings or a _style_fix worktree
   │    → find new violations → store pending evaluation markdown
   │
   ├─ Phase 3: Style-Fix Worktrees (per project, parallel)
@@ -124,8 +124,11 @@ Post-clean-fix (manual):
 ## Evaluation State
 
 The durable style-eval state is `~/rust/nate_style/.history/.pending/<project>.json`
-while a project is waiting for review/fix, then `~/rust/nate_style/.history/<project>.jsonl`
-after it is finalized. The JSON records:
+while a project is waiting for review/fix. When style-fix writes `## Fix Summary`,
+that scratch markdown is saved back into the same pending JSON and the JSON
+stays in place until the `_style_fix` worktree is reviewed. History rows are
+still appended to `~/rust/nate_style/.history/<project>.jsonl` for reporting.
+The JSON records:
 
 - `reviewable_unit_total`: how many style-guide units this run could check
 - `checked_unit_count`: how many units were disposed by the agent or pre-filter
@@ -146,3 +149,12 @@ When a new eval run starts, stale eval/review scratch files are removed. A stale
 `style_fix_<project>_evaluation.md` is removed only when no real
 `~/rust/<project>_style_fix` git worktree owns it; active style-fix scratch files
 are preserved so the next eval can avoid duplicating in-flight findings.
+
+If a timing bug leaves a `_style_fix` worktree but pending JSON no longer
+contains that worktree's `## Fix Summary`, `/style_fix_review` enters recovered
+handoff mode. It writes a salvage markdown file with
+`style_history.py recover-evaluation`, preferring the old scratch fix export
+when present and otherwise reconstructing the review surface from the latest
+history row with finding-like style guideline outcomes. The review must state
+that this is an error recovery path and evaluate the current diff against the
+recovered style files.

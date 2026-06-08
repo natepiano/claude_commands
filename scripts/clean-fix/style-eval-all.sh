@@ -477,8 +477,15 @@ for i in "${!projects[@]}"; do
     eval_path="$LOG_DIR/style_eval_${proj}_evaluation.md"
 
     pending_status=$(evaluation_status_field "$proj" status)
-    if [[ "$pending_status" == "findings" || "$pending_status" == "reviewed_findings" ]]; then
-        echo "SKIP: $proj (pending findings)"
+    if [[ "$pending_status" == "findings" \
+        || "$pending_status" == "reviewed_findings" \
+        || "$pending_status" == "fixed_findings" \
+        || "$pending_status" == "fix_failed_findings" ]]; then
+        echo "SKIP: $proj (pending $pending_status)"
+        continue
+    fi
+    if has_real_style_fix_worktree "$proj" "$project_root"; then
+        echo "SKIP: $proj (style_fix worktree; preserving pending handoff)"
         continue
     fi
     if [[ "$pending_status" == "no_findings" ]]; then
@@ -606,7 +613,10 @@ for pid in "${pids[@]}"; do
                 echo "RECOVERED: $name (no findings — $summary; recorded in history, pending finalized, retry succeeded)"
                 recovered=$((recovered + 1))
                 succeeded=$((succeeded + 1))
-            elif [[ "$retry_status" == "findings" || "$retry_status" == "reviewed_findings" ]]; then
+            elif [[ "$retry_status" == "findings" \
+                || "$retry_status" == "reviewed_findings" \
+                || "$retry_status" == "fixed_findings" \
+                || "$retry_status" == "fix_failed_findings" ]]; then
                 summary=$(evaluation_status_summary "$name")
                 rm -f "$eval_path"
                 echo "RECOVERED: $name ($summary, retry succeeded)"

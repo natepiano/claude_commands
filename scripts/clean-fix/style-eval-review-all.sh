@@ -108,6 +108,15 @@ run_review_agent() {
     esac
 }
 
+has_real_style_fix_worktree() {
+    local project="$1" project_root="$2"
+    local worktree_dir="$RUST_DIR/${project}_style_fix"
+    [[ -d "$worktree_dir" ]] || return 1
+    git -C "$worktree_dir" rev-parse --git-dir >/dev/null 2>&1 || return 1
+    git -C "$project_root" worktree list --porcelain 2>/dev/null \
+        | grep -qF "worktree $worktree_dir"
+}
+
 # Build the project list. Parallel arrays:
 #   names[i]        -- project name
 #   eval_files[i]   -- scratch path for that project's pending evaluation markdown
@@ -147,11 +156,18 @@ launch_evals=()
 skipped_no_eval=0
 skipped_no_findings=0
 skipped_already_reviewed=0
+skipped_style_fix_worktree=0
 
 for i in "${!names[@]}"; do
     name="${names[$i]}"
     eval_file="${eval_files[$i]}"
     project_root="${project_roots[$i]}"
+
+    if has_real_style_fix_worktree "$name" "$project_root"; then
+        skipped_style_fix_worktree=$((skipped_style_fix_worktree + 1))
+        echo "SKIP: $name (style_fix worktree; preserving pending handoff)"
+        continue
+    fi
 
     status=$(python3 "$HISTORY_HELPER" evaluation-status --project "$name" --field status 2>/dev/null || echo "missing")
     if [[ "$status" == "missing" ]]; then
@@ -165,6 +181,11 @@ for i in "${!names[@]}"; do
     if [[ "$status" == "reviewed_findings" ]]; then
         skipped_already_reviewed=$((skipped_already_reviewed + 1))
         echo "SKIP: $name (already reviewed)"
+        continue
+    fi
+    if [[ "$status" == "fixed_findings" || "$status" == "fix_failed_findings" ]]; then
+        skipped_already_reviewed=$((skipped_already_reviewed + 1))
+        echo "SKIP: $name ($status)"
         continue
     fi
     rm -f "$eval_file"
@@ -183,6 +204,7 @@ if [[ ${#launch_names[@]} -eq 0 ]]; then
     echo "  no eval: $skipped_no_eval"
     echo "  no findings: $skipped_no_findings"
     echo "  already reviewed: $skipped_already_reviewed"
+    echo "  style_fix worktree: $skipped_style_fix_worktree"
     exit 0
 fi
 

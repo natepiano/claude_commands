@@ -277,12 +277,6 @@ for entry in ${targets[@]+"${targets[@]}"}; do
     stop_reason=$(python3 "$HISTORY_HELPER" evaluation-status --project "$name" --field stop_reason 2>/dev/null || echo "unknown")
     [[ -z "$coverage" ]] && coverage="unknown"
     [[ -z "$stop_reason" ]] && stop_reason="in_progress"
-    if [[ "$eval_status" != "findings" && "$eval_status" != "reviewed_findings" ]]; then
-        echo "SKIP: $name (no open findings)"
-        skipped=$((skipped + 1))
-        continue
-    fi
-
     # Check A: The target _style_fix path must be free.
     if [[ -d "$worktree_dir" ]]; then
         # Distinguish a legitimate in-flight worktree (skip silently, expected)
@@ -291,10 +285,35 @@ for entry in ${targets[@]+"${targets[@]}"}; do
         # isn't registered with the parent repo — every future clean-fix will
         # otherwise keep skipping the project until someone removes it by hand.
         if is_real_worktree "$worktree_dir" "$repo_dir"; then
-            echo "SKIP: $name (style_fix worktree)"
+            if [[ -f "$eval_file" ]] && rg -q '^## Fix Summary$' "$eval_file" 2>/dev/null; then
+                finalized_work_dir="$worktree_dir"
+                if [[ -n "$subpath" ]]; then
+                    finalized_work_dir="$worktree_dir/$subpath"
+                fi
+                if python3 "$HISTORY_HELPER" finalize-fix --project-root "$finalized_work_dir" --evaluation "$eval_file"; then
+                    echo "SKIP: $name (style_fix worktree already has Fix Summary; pending JSON updated)"
+                else
+                    echo "SKIP: $name (style_fix worktree has Fix Summary but pending update failed)"
+                fi
+            elif [[ "$eval_status" == "missing" ]]; then
+                echo "SKIP: $name (style_fix worktree without pending JSON — manual state repair required)"
+            else
+                echo "SKIP: $name (style_fix worktree)"
+            fi
         else
             echo "SKIP: $name (style_fix orphan stub — manual cleanup required at $worktree_dir)"
         fi
+        skipped=$((skipped + 1))
+        continue
+    fi
+
+    if [[ "$eval_status" == "fixed_findings" || "$eval_status" == "fix_failed_findings" ]]; then
+        echo "SKIP: $name (pending $eval_status)"
+        skipped=$((skipped + 1))
+        continue
+    fi
+    if [[ "$eval_status" != "findings" && "$eval_status" != "reviewed_findings" ]]; then
+        echo "SKIP: $name (no open findings)"
         skipped=$((skipped + 1))
         continue
     fi
@@ -802,6 +821,11 @@ PROMPT_EOF
             >"$build_check_log" 2>&1; then
         echo "FAIL: $proj (cargo check failed after style-fix; worktree left for review at $worktree_dir; see $build_check_log)"
         progress "$proj" "phase=failed reason=build-broken-after-fix log=$build_check_log"
+        if [[ -f "$scratch_eval" ]]; then
+            python3 "$HISTORY_HELPER" save-evaluation \
+                --project-root "$agent_work_dir" \
+                --evaluation "$scratch_eval" || true
+        fi
         python3 "$HISTORY_HELPER" finalize-failure --project "$proj" \
             --reason "cargo check failed after style-fix; worktree left at $worktree_dir for review" || true
         # Intentionally do NOT remove the worktree or branch here. The agent

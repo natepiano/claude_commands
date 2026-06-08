@@ -32,6 +32,7 @@ CLEAN_FIX_CONF_FILE = Path(
         str(Path.home() / ".claude" / "scripts" / "clean-fix" / "clean-fix.conf"),
     )
 )
+LOG_DIR = Path(os.environ.get("STYLE_HISTORY_LOG_DIR", "/private/tmp/claude"))
 
 
 class Outcome(TypedDict, total=False):
@@ -55,7 +56,12 @@ class PendingState(TypedDict, total=False):
     evaluation_complete: bool
     evaluation_summary: dict[str, object]
     evaluation_updated_at: str
+    failure_finalized_at: str
+    failure_history_recorded_at: str
+    failure_reason: str
     finding_count: int
+    fix_finalized_at: str
+    fix_history_recorded_at: str
     guideline_total: int
     phase: str
     project_root: str
@@ -314,6 +320,10 @@ def count_findings_in_markdown(markdown: str) -> int:
 
 def has_no_violations_marker(markdown: str) -> bool:
     return any(line.strip() == "## No violations found" for line in markdown.splitlines())
+
+
+def has_fix_summary_marker(markdown: str) -> bool:
+    return any(line.strip() == "## Fix Summary" for line in markdown.splitlines())
 
 
 def excluded_projects() -> set[str]:
@@ -737,13 +747,28 @@ def export_evaluation(project: str, output: Path, kind: str = "scratch") -> None
     write_pending(project, pending)
 
 
+def pending_summary_root(pending: PendingState, fallback: Path) -> Path:
+    raw_root = pending.get("project_root", "")
+    if isinstance(raw_root, str) and raw_root:
+        stored_root = Path(raw_root).expanduser()
+        if stored_root.exists():
+            return stored_root.resolve()
+    return fallback
+
+
 def evaluation_status_payload(project: str) -> dict[str, object]:
     pending = load_pending(project)
     markdown = pending.get("evaluation_markdown", "") if pending else ""
     finding_count = count_findings_in_markdown(markdown)
     has_review_log = "## Review Log" in markdown
+    has_fix_summary = has_fix_summary_marker(markdown)
+    phase = str(pending.get("phase", "")) if pending else ""
     if not markdown:
         status = "missing"
+    elif finding_count > 0 and has_fix_summary and phase == "fix_failed":
+        status = "fix_failed_findings"
+    elif finding_count > 0 and has_fix_summary:
+        status = "fixed_findings"
     elif finding_count > 0 and has_review_log:
         status = "reviewed_findings"
     elif finding_count > 0:
@@ -777,8 +802,10 @@ def evaluation_status_payload(project: str) -> dict[str, object]:
         "guideline_total": guideline_total,
         "has_no_violations": has_no_violations_marker(markdown),
         "has_pending": bool(pending),
+        "has_fix_summary": has_fix_summary,
         "has_review_log": has_review_log,
         "line_count": len(markdown.splitlines()) if markdown else 0,
+        "phase": phase,
         "reviewable_unit_total": reviewable_unit_total,
         "scratch_exports": pending.get("scratch_exports", {}) if pending else {},
         "status": status,
@@ -1116,18 +1143,169 @@ def last_findings(project: str) -> str:
     return "never"
 
 
+def is_finding_like(reviewed: ReviewedUnit) -> bool:
+    outcome: Outcome = reviewed.get("outcome", {})
+    if outcome.get("skipped_by") == "pre_filter":
+        return False
+    status = outcome.get("status")
+    finding_source = reviewed.get("finding_source") or outcome.get("finding_source")
+    return bool(finding_source) or status not in (None, "", "no_findings")
+
+
+def guideline_path(guideline_id: str, project_root: Path) -> Path:
+    if guideline_id.startswith("docs/style/"):
+        return project_root / guideline_id
+    return NATE_STYLE_DIR / guideline_id
+
+
+def guideline_title(guideline_id: str, project_root: Path) -> str:
+    path = guideline_path(guideline_id, project_root)
+    if path.exists():
+        return extract_title(path)
+    return guideline_id
+
+
+def latest_finding_history_row(project: str) -> HistoryRow:
+    rows = load_history(project)
+    for row in reversed(rows):
+        if any(is_finding_like(reviewed) for reviewed in row.get("reviewed_units", [])):
+            return row
+    raise SystemExit(f"No history row with findings for {project}.")
+
+
+def json_block(value: object) -> str:
+    return json.dumps(value, indent=2, sort_keys=True)
+
+
+def recovery_notice(project: str, source: str) -> list[str]:
+    status = evaluation_status_payload(project)
+    pending = load_pending(project)
+    lines = [
+        "## Handoff Recovery",
+        "",
+        "ERROR STATE: pending JSON did not contain the fix agent's `## Fix Summary` for this worktree.",
+        f"Recovery source: {source}.",
+        "",
+        "Review this as a salvage pass: evaluate the current worktree diff against the recovered style rules, and state in user-facing output that the normal pending handoff was stale or incomplete.",
+        "",
+        "### Pending Status At Recovery",
+        "",
+        "```json",
+        json_block(
+            {
+                "status": status.get("status"),
+                "phase": status.get("phase"),
+                "has_fix_summary": status.get("has_fix_summary"),
+                "updated_at": pending.get("updated_at", "") if pending else "",
+                "scratch_exports": status.get("scratch_exports", {}),
+            }
+        ),
+        "```",
+    ]
+    return lines
+
+
+def recover_evaluation(project: str, project_root: Path, output: Path) -> None:
+    output.parent.mkdir(parents=True, exist_ok=True)
+    scratch = LOG_DIR / f"style_fix_{project}_evaluation.md"
+    if scratch.exists():
+        scratch_markdown = scratch.read_text()
+        if has_fix_summary_marker(scratch_markdown):
+            markdown = "\n".join(recovery_notice(project, f"scratch file `{scratch}`"))
+            markdown += "\n\n"
+            markdown += scratch_markdown
+            output.write_text(markdown)
+            print(f"Recovered {project} style-fix evaluation from {scratch}")
+            return
+
+    row = latest_finding_history_row(project)
+    finding_units = [
+        reviewed for reviewed in row.get("reviewed_units", []) if is_finding_like(reviewed)
+    ]
+    lines = recovery_notice(project, f"history row ending `{row.get('end_time', '')}`")
+    lines += [
+        "",
+        "## Improvements",
+        "",
+    ]
+    for index, reviewed in enumerate(finding_units, start=1):
+        guideline_id = reviewed.get("guideline_id", "")
+        path = guideline_path(guideline_id, project_root)
+        outcome: Outcome = reviewed.get("outcome", {})
+        title = guideline_title(guideline_id, project_root)
+        lines += [
+            f"### {index}. Recovered style rule: {title}",
+            "",
+            f"**Style file**: `{path}`",
+            f"**Recovered guideline id**: `{guideline_id}`",
+            f"**Recovered from history row**: `{row.get('end_time', '')}`",
+            "",
+            "Original numbered evaluation text was not available. Verify the current worktree diff against this style file and the recorded outcome below.",
+            "",
+            "**Recorded outcome**:",
+            "",
+            "```json",
+            json_block(outcome),
+            "```",
+            "",
+        ]
+    lines += [
+        "## Fix Summary",
+        "",
+    ]
+    for index, reviewed in enumerate(finding_units, start=1):
+        guideline_id = reviewed.get("guideline_id", "")
+        outcome = reviewed.get("outcome", {})
+        status = outcome.get("status", "finding")
+        summary = outcome.get("summary", "")
+        reason = outcome.get("reason", "")
+        lines += [
+            f"### Finding {index}: Recovered style rule: {guideline_title(guideline_id, project_root)}",
+            f"**Status:** Recovered from history (`{status}`)",
+            f"**What was done:** {summary or 'Original Fix Summary text was unavailable; review the current diff directly.'}",
+            "**Post-fix search:** unavailable in recovered history row",
+        ]
+        if reason:
+            lines.append(f"**Issues:** {reason}")
+        lines.append("")
+    lines += [
+        "### Cargo Mend Changes",
+        "Original Cargo Mend section was unavailable in the recovered history row.",
+        "",
+        "### Clippy Changes",
+        "Original Clippy section was unavailable in the recovered history row.",
+        "",
+        "### Build Status",
+        "- **clippy:** unknown from recovered history row",
+        "- **tests:** unknown from recovered history row",
+        "",
+    ]
+    output.write_text("\n".join(lines))
+    print(f"Recovered {project} style-fix evaluation from history row {row.get('end_time', '')}")
+
+
 def finalize_fix(project_root: Path, eval_path: Path) -> None:
     project = project_root.name.removesuffix("_style_fix")
     pending = load_pending(project)
     if not pending:
         return
-    refresh_evaluation_summary(pending, project_root)
+    if not eval_path.exists():
+        raise SystemExit(f"Evaluation markdown not found: {eval_path}")
+    markdown = eval_path.read_text()
+    if not has_fix_summary_marker(markdown):
+        raise SystemExit(f"Fix Summary not found in evaluation markdown: {eval_path}")
+    now = utc_now()
+    pending["evaluation_markdown"] = markdown
+    pending["evaluation_updated_at"] = now
+    summary_root = pending_summary_root(pending, project_root)
+    refresh_evaluation_summary(pending, summary_root)
     fix_results = parse_fix_results(eval_path, project_root)
     eval_guidelines: set[str] = set(parse_eval_guidelines(eval_path, project_root).values())
     reviewed_units: list[ReviewedUnit] = []
     for reviewed in pending.get("reviewed_units", []):
         guideline_id = reviewed.get("guideline_id", "")
-        if "outcome" in reviewed:
+        existing_outcome: Outcome = reviewed.get("outcome", {})
+        if existing_outcome and existing_outcome.get("status") != "fix_failed":
             reviewed_units.append(reviewed)
             continue
         if guideline_id in fix_results:
@@ -1145,24 +1323,35 @@ def finalize_fix(project_root: Path, eval_path: Path) -> None:
         if "finding_source" in reviewed:
             outcome["finding_source"] = reviewed["finding_source"]
         reviewed_units.append({"guideline_id": guideline_id, "outcome": outcome})
-    row: HistoryRow = {
-        "start_time": pending.get("start_time", ""),
-        "end_time": utc_now(),
-        "evaluation_summary": history_summary(pending),
-        "reviewed_units": reviewed_units,
-    }
-    append_jsonl_history(history_file(project), row)
-    remove_pending(project)
+    pending["reviewed_units"] = reviewed_units
+    pending["phase"] = "fixed"
+    pending["fix_finalized_at"] = now
+    exports = dict(pending.get("scratch_exports", {}))
+    exports["fix"] = {"exported_at": now, "finalized_at": now, "path": str(eval_path)}
+    pending["scratch_exports"] = exports
+    pending["updated_at"] = now
+    if not pending.get("fix_history_recorded_at"):
+        row: HistoryRow = {
+            "start_time": pending.get("start_time", ""),
+            "end_time": now,
+            "evaluation_summary": history_summary(pending),
+            "reviewed_units": reviewed_units,
+        }
+        append_jsonl_history(history_file(project), row)
+        pending["fix_history_recorded_at"] = now
+    write_pending(project, pending)
 
 
 def finalize_failure(project: str, reason: str) -> None:
     pending = load_pending(project)
     if not pending:
         return
+    now = utc_now()
     refresh_evaluation_summary(pending)
     reviewed_units: list[ReviewedUnit] = []
     for reviewed in pending.get("reviewed_units", []):
-        if "outcome" in reviewed:
+        existing_outcome: Outcome = reviewed.get("outcome", {})
+        if existing_outcome and existing_outcome.get("status") != "fix_failed":
             reviewed_units.append(reviewed)
             continue
         outcome: Outcome = {"status": "fix_failed", "reason": reason}
@@ -1171,14 +1360,21 @@ def finalize_failure(project: str, reason: str) -> None:
         reviewed_units.append(
             {"guideline_id": reviewed.get("guideline_id", ""), "outcome": outcome}
         )
-    row: HistoryRow = {
-        "start_time": pending.get("start_time", ""),
-        "end_time": utc_now(),
-        "evaluation_summary": history_summary(pending),
-        "reviewed_units": reviewed_units,
-    }
-    append_jsonl_history(history_file(project), row)
-    remove_pending(project)
+    pending["reviewed_units"] = reviewed_units
+    pending["phase"] = "fix_failed"
+    pending["failure_reason"] = reason
+    pending["failure_finalized_at"] = now
+    pending["updated_at"] = now
+    if not pending.get("failure_history_recorded_at"):
+        row: HistoryRow = {
+            "start_time": pending.get("start_time", ""),
+            "end_time": now,
+            "evaluation_summary": history_summary(pending),
+            "reviewed_units": reviewed_units,
+        }
+        append_jsonl_history(history_file(project), row)
+        pending["failure_history_recorded_at"] = now
+    write_pending(project, pending)
 
 
 def discard_pending(project: str) -> None:
@@ -1207,6 +1403,13 @@ def parse_args() -> argparse.Namespace:
     _ = export_eval.add_argument("--project", required=True)
     _ = export_eval.add_argument("--output", required=True)
     _ = export_eval.add_argument("--kind", default="scratch")
+    recover_eval = subparsers.add_parser(
+        "recover-evaluation",
+        help="Write a salvage review markdown for a style-fix worktree whose pending Fix Summary was lost.",
+    )
+    _ = recover_eval.add_argument("--project", required=True)
+    _ = recover_eval.add_argument("--project-root", required=True)
+    _ = recover_eval.add_argument("--output", required=True)
     status_eval = subparsers.add_parser("evaluation-status")
     _ = status_eval.add_argument("--project", required=True)
     _ = status_eval.add_argument(
@@ -1218,10 +1421,12 @@ def parse_args() -> argparse.Namespace:
             "evaluation_complete",
             "finding_count",
             "guideline_total",
+            "has_fix_summary",
             "has_no_violations",
             "has_pending",
             "has_review_log",
             "line_count",
+            "phase",
             "reviewable_unit_total",
             "scratch_exports",
             "status",
@@ -1306,6 +1511,13 @@ def main() -> None:
             _arg_str(args, "project"),
             Path(_arg_str(args, "output")).expanduser().resolve(),
             _arg_str(args, "kind"),
+        )
+        return
+    if command == "recover-evaluation":
+        recover_evaluation(
+            _arg_str(args, "project"),
+            Path(_arg_str(args, "project_root")).expanduser().resolve(),
+            Path(_arg_str(args, "output")).expanduser().resolve(),
         )
         return
     if command == "evaluation-status":
