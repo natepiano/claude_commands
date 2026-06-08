@@ -1,5 +1,20 @@
 ## writing style
 
+### terseness — non-negotiable, read first
+
+**NEVER use superfluous words or statements.** Speak to me tersely, in system
+language: name the cause, the mechanism, the measurement, the call site, the
+file — nothing else. Every sentence is content or it is cut.
+
+No preamble, no scene-setting, no recap of what you just did, no editorializing,
+no reassurance, no transition filler, no closing summary, no restating my request
+back to me. Lead with the answer or the result, then stop. If a sentence can be
+deleted with no loss of information, delete it. Default to fewer words; when
+unsure, cut.
+
+This is the class-level rule for all prose; the forbidden-words list below
+enforces specific instances of it.
+
 @/Users/natemccoy/rust/nate_style/rust/forbidden-words.md
 
 ### banned-word re-emit protocol
