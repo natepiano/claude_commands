@@ -120,3 +120,29 @@ Clean-fix Build (4:00 AM)
 Post-clean-fix (manual):
   /style_fix_review → /merge_from_branch → /delete_a_worktree
 ```
+
+## Evaluation State
+
+The durable style-eval state is `~/rust/nate_style/.history/.pending/<project>.json`
+while a project is waiting for review/fix, then `~/rust/nate_style/.history/<project>.jsonl`
+after it is finalized. The JSON records:
+
+- `reviewable_unit_total`: how many style-guide units this run could check
+- `checked_unit_count`: how many units were disposed by the agent or pre-filter
+- `stop_reason`: `budget_reached` or `exhausted`
+- `finding_count`: numbered findings currently in the evaluation markdown
+- `scratch_exports`: the scratch markdown files freshly exported from pending JSON
+
+The scratch files under `/private/tmp/claude` are phase handoffs, not source of
+truth:
+
+| Scratch file | Owner | Cleanup rule |
+|--------------|-------|--------------|
+| `style_eval_<project>_evaluation.md` | eval agent writes, pending JSON saves | deleted after the eval stage saves pending JSON |
+| `style_eval_review_<project>_evaluation.md` | review agent edits a pending export | deleted after the review stage saves pending JSON |
+| `style_fix_<project>_evaluation.md` | fix agent appends `## Fix Summary` | kept while the `_style_fix` worktree exists for `/style_fix_review` |
+
+When a new eval run starts, stale eval/review scratch files are removed. A stale
+`style_fix_<project>_evaluation.md` is removed only when no real
+`~/rust/<project>_style_fix` git worktree owns it; active style-fix scratch files
+are preserved so the next eval can avoid duplicating in-flight findings.

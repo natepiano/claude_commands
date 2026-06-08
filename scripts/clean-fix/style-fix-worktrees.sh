@@ -273,6 +273,10 @@ for entry in ${targets[@]+"${targets[@]}"}; do
     # No project-root evaluation markdown file is used as a sentinel anymore.
     eval_status=$(python3 "$HISTORY_HELPER" evaluation-status --project "$name" --field status 2>/dev/null || echo "missing")
     finding_count=$(python3 "$HISTORY_HELPER" evaluation-status --project "$name" --field finding_count 2>/dev/null || echo 0)
+    coverage=$(python3 "$HISTORY_HELPER" evaluation-status --project "$name" --field coverage 2>/dev/null || echo "unknown")
+    stop_reason=$(python3 "$HISTORY_HELPER" evaluation-status --project "$name" --field stop_reason 2>/dev/null || echo "unknown")
+    [[ -z "$coverage" ]] && coverage="unknown"
+    [[ -z "$stop_reason" ]] && stop_reason="in_progress"
     if [[ "$eval_status" != "findings" && "$eval_status" != "reviewed_findings" ]]; then
         echo "SKIP: $name (no open findings)"
         skipped=$((skipped + 1))
@@ -328,7 +332,7 @@ for entry in ${targets[@]+"${targets[@]}"}; do
     record="${name}${RS}${kind}${RS}${repo_dir}${RS}${eval_file}${RS}${worktree_dir}${RS}${unused}${RS}${subpath}${RS}${pkg}${RS}${branch_name}"
     eligible+=("$name")
     records+=("$record")
-    echo "ELIGIBLE: $name ($finding_count findings, kind=$kind)"
+    echo "ELIGIBLE: $name ($finding_count findings, coverage=$coverage, stop=$stop_reason, kind=$kind)"
 done
 
 if [[ ${#eligible[@]} -eq 0 ]]; then
@@ -420,7 +424,8 @@ create_and_fix() {
     # Materialize pending evaluation markdown only as a scratch handoff. Do not
     # write an evaluation markdown file into the style-fix worktree.
     mkdir -p "$(dirname "$scratch_eval")"
-    python3 "$HISTORY_HELPER" export-evaluation --project "$proj" --output "$scratch_eval"
+    rm -f "$scratch_eval"
+    python3 "$HISTORY_HELPER" export-evaluation --project "$proj" --kind fix --output "$scratch_eval"
     echo "[diag $proj] after pending evaluation export"
     progress "$proj" "phase=worktree-ready dir=$worktree_dir"
 

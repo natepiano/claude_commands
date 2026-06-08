@@ -71,6 +71,8 @@ Rules:
 - `status=complete` means stop immediately
 - `stop_reason=budget_reached` means the pending evaluation markdown has reached the configured numbered-finding cap
 - `stop_reason=exhausted` means there are no unseen eligible units left for this run
+- `coverage` is the checked/reviewable style-unit count for this run, in `<checked>/<reviewable>` form
+- `reviewable_unit_total` is the denominator for the run; use it to distinguish a full sweep from an early stop
 - `non_negotiable_guideline_ids` are binding on every unit review and are returned every time
 - each unit is exactly one guideline file — its `unit_id` equals the `guideline_id`
 - `see_also_guideline_ids` on a unit lists additional guidelines whose content you must consult as context when reviewing this unit — do NOT record results for them
@@ -234,7 +236,7 @@ If there are **no violations**, write the minimum that signals completion:
 **Project**: [project name]
 **Date**: [YYYY-MM-DD]
 **Files reviewed**: [count]
-**Rules checked**: [how many rules were checked before stopping or exhausting the list]
+**Rules checked**: [coverage from the final `next-unit` response, plus stop reason in `<checked>/<reviewable> (<stop_reason>)` form]
 
 ## No violations found
 ```
@@ -247,7 +249,7 @@ Otherwise, write:
 **Project**: [project name]
 **Date**: [YYYY-MM-DD]
 **Files reviewed**: [count]
-**Rules checked**: [how many rules were checked before stopping or exhausting the list]
+**Rules checked**: [coverage from the final `next-unit` response, plus stop reason in `<checked>/<reviewable> (<stop_reason>)` form]
 
 ## Improvements
 
@@ -273,7 +275,7 @@ Otherwise, write:
 
 Do NOT include an "Overall Assessment" section — just list the findings.
 
-After writing the final markdown, save it into pending JSON:
+After writing the final markdown, save it into pending JSON. The helper also stores the authoritative `checked_unit_count`, `reviewable_unit_total`, `coverage`, and `stop_reason` in pending JSON; do not rely on scratch-file mtimes to infer what ran:
 
 ```bash
 python3 ~/.claude/scripts/clean-fix/style_history.py save-evaluation \

@@ -50,13 +50,22 @@ class ReviewedUnit(TypedDict, total=False):
 
 class PendingState(TypedDict, total=False):
     budget: int
+    checked_unit_count: int
     evaluation_markdown: str
+    evaluation_complete: bool
+    evaluation_summary: dict[str, object]
     evaluation_updated_at: str
+    finding_count: int
+    guideline_total: int
     phase: str
+    project_root: str
+    reviewable_unit_total: int
     reviewed_unit_ids: list[str]
     reviewed_units: list[ReviewedUnit]
+    scratch_exports: dict[str, dict[str, str]]
     scored_count: int
     start_time: str
+    stop_reason: str
     updated_at: str
     last_unit_id: str
     last_unit_result: str
@@ -77,6 +86,7 @@ class HistoryRow(TypedDict, total=False):
     start_time: str
     end_time: str
     reviewed_units: list[ReviewedUnit]
+    evaluation_summary: dict[str, object]
 
 
 @dataclass(frozen=True)
@@ -233,6 +243,7 @@ def auto_record_pre_filter_skip(project: str, unit: "Unit") -> None:
     pending["last_unit_id"] = unit.unit_id
     pending["last_unit_result"] = "no_findings"
     pending["updated_at"] = utc_now()
+    refresh_evaluation_summary(pending)
     write_pending(project, pending)
 
 
@@ -515,6 +526,64 @@ def focused_units(project_root: Path, requested: list[str]) -> list[Unit]:
     return _build_units_from_files(targets, project_root, all_files)
 
 
+def unit_totals(project_root: Path) -> dict[str, int]:
+    units = build_units(project_root)
+    reviewable = [unit for unit in units if unit.budget_cost > 0]
+    return {
+        "guideline_total": len(units),
+        "reviewable_unit_total": len(reviewable),
+        "non_negotiable_unit_total": len(units) - len(reviewable),
+    }
+
+
+def refresh_evaluation_summary(
+    pending: PendingState,
+    project_root: Path | None = None,
+    stop_reason: str | None = None,
+) -> dict[str, object]:
+    if project_root is not None:
+        totals = unit_totals(project_root)
+        pending["project_root"] = str(project_root)
+        pending["guideline_total"] = totals["guideline_total"]
+        pending["reviewable_unit_total"] = totals["reviewable_unit_total"]
+
+    if stop_reason is not None:
+        pending["stop_reason"] = stop_reason
+
+    markdown = pending.get("evaluation_markdown", "")
+    finding_count = count_findings_in_markdown(markdown)
+    checked_unit_count = len(pending.get("reviewed_unit_ids", []))
+    reviewable_unit_total = int(pending.get("reviewable_unit_total", 0) or 0)
+    stop = pending.get("stop_reason", "")
+    evaluation_complete = bool(stop == "exhausted")
+
+    pending["checked_unit_count"] = checked_unit_count
+    pending["finding_count"] = finding_count
+    pending["scored_count"] = finding_count
+    pending["evaluation_complete"] = evaluation_complete
+
+    summary: dict[str, object] = {
+        "budget": pending.get("budget", max_new_findings()),
+        "checked_unit_count": checked_unit_count,
+        "evaluation_complete": evaluation_complete,
+        "finding_count": finding_count,
+        "guideline_total": pending.get("guideline_total", 0),
+        "reviewable_unit_total": reviewable_unit_total,
+        "stop_reason": stop,
+    }
+    if reviewable_unit_total:
+        summary["coverage"] = f"{checked_unit_count}/{reviewable_unit_total}"
+    pending["evaluation_summary"] = summary
+    return summary
+
+
+def history_summary(pending: PendingState) -> dict[str, object]:
+    summary = dict(pending.get("evaluation_summary", {}))
+    if not summary:
+        summary = refresh_evaluation_summary(pending)
+    return summary
+
+
 def review_counts(project_root: Path) -> dict[str, int]:
     project = project_root.name.removesuffix("_style_fix")
     counts: dict[str, int] = defaultdict(int)
@@ -588,17 +657,28 @@ def start_run(project_root: Path) -> None:
     PENDING_DIR.mkdir(parents=True, exist_ok=True)
     project = project_root.name.removesuffix("_style_fix")
     cap = max_new_findings()
+    totals = unit_totals(project_root)
     payload: PendingState = {
         "budget": cap,
+        "checked_unit_count": 0,
         "evaluation_markdown": "",
+        "evaluation_complete": False,
+        "evaluation_summary": {},
         "evaluation_updated_at": "",
+        "finding_count": 0,
+        "guideline_total": totals["guideline_total"],
         "phase": "evaluation",
+        "project_root": str(project_root),
+        "reviewable_unit_total": totals["reviewable_unit_total"],
         "reviewed_unit_ids": [],
         "reviewed_units": [],
+        "scratch_exports": {},
         "scored_count": 0,
         "start_time": utc_now(),
+        "stop_reason": "",
         "updated_at": utc_now(),
     }
+    refresh_evaluation_summary(payload, project_root)
     write_pending(project, payload)
 
 
@@ -638,18 +718,23 @@ def save_evaluation(project_root: Path, eval_path: Path) -> None:
     markdown = eval_path.read_text()
     pending["evaluation_markdown"] = markdown
     pending["evaluation_updated_at"] = utc_now()
-    pending["scored_count"] = count_findings_in_markdown(markdown)
+    refresh_evaluation_summary(pending, project_root)
     pending["updated_at"] = utc_now()
     write_pending(project, pending)
 
 
-def export_evaluation(project: str, output: Path) -> None:
+def export_evaluation(project: str, output: Path, kind: str = "scratch") -> None:
     pending = load_pending(project)
     markdown = pending.get("evaluation_markdown", "") if pending else ""
     if not markdown:
         raise SystemExit(f"No pending evaluation markdown for {project}.")
     output.parent.mkdir(parents=True, exist_ok=True)
     _ = output.write_text(markdown)
+    exports = dict(pending.get("scratch_exports", {}))
+    exports[kind] = {"exported_at": utc_now(), "path": str(output)}
+    pending["scratch_exports"] = exports
+    pending["updated_at"] = utc_now()
+    write_pending(project, pending)
 
 
 def evaluation_status_payload(project: str) -> dict[str, object]:
@@ -665,13 +750,39 @@ def evaluation_status_payload(project: str) -> dict[str, object]:
         status = "findings"
     else:
         status = "no_findings"
+    checked_unit_count = (
+        int(pending.get("checked_unit_count", 0) or 0)
+        if pending
+        else 0
+    )
+    reviewable_unit_total = (
+        int(pending.get("reviewable_unit_total", 0) or 0)
+        if pending
+        else 0
+    )
+    guideline_total = int(pending.get("guideline_total", 0) or 0) if pending else 0
+    stop_reason = pending.get("stop_reason", "") if pending else ""
+    budget = int(pending.get("budget", 0) or 0) if pending else 0
+    coverage = (
+        f"{checked_unit_count}/{reviewable_unit_total}"
+        if reviewable_unit_total
+        else ""
+    )
     return {
+        "budget": budget,
+        "checked_unit_count": checked_unit_count,
+        "coverage": coverage,
+        "evaluation_complete": bool(pending.get("evaluation_complete", False)) if pending else False,
         "finding_count": finding_count,
+        "guideline_total": guideline_total,
         "has_no_violations": has_no_violations_marker(markdown),
         "has_pending": bool(pending),
         "has_review_log": has_review_log,
         "line_count": len(markdown.splitlines()) if markdown else 0,
+        "reviewable_unit_total": reviewable_unit_total,
+        "scratch_exports": pending.get("scratch_exports", {}) if pending else {},
         "status": status,
+        "stop_reason": stop_reason,
     }
 
 
@@ -685,12 +796,18 @@ def next_unit(project_root: Path) -> dict[str, object]:
     evaluation_markdown = pending.get("evaluation_markdown", "")
     finding_count = count_findings_in_markdown(evaluation_markdown)
     pending["budget"] = budget
-    pending["scored_count"] = finding_count
+    refresh_evaluation_summary(pending, project_root)
     write_pending(project, pending)
     if finding_count >= budget:
+        summary = refresh_evaluation_summary(pending, project_root, "budget_reached")
+        pending["updated_at"] = utc_now()
+        write_pending(project, pending)
         return {
             "budget": budget,
+            "checked_unit_count": summary.get("checked_unit_count", 0),
+            "coverage": summary.get("coverage", ""),
             "non_negotiable_guideline_ids": non_negotiable_guideline_ids(project_root),
+            "reviewable_unit_total": summary.get("reviewable_unit_total", 0),
             "scored_count": finding_count,
             "status": "complete",
             "stop_reason": "budget_reached",
@@ -728,17 +845,30 @@ def next_unit(project_root: Path) -> dict[str, object]:
             continue
         break
     else:
+        pending = load_pending(project)
+        evaluation_markdown = pending.get("evaluation_markdown", "")
+        finding_count = count_findings_in_markdown(evaluation_markdown)
+        summary = refresh_evaluation_summary(pending, project_root, "exhausted")
+        pending["updated_at"] = utc_now()
+        write_pending(project, pending)
         return {
             "budget": budget,
+            "checked_unit_count": summary.get("checked_unit_count", 0),
+            "coverage": summary.get("coverage", ""),
             "non_negotiable_guideline_ids": non_negotiable_guideline_ids(project_root),
+            "reviewable_unit_total": summary.get("reviewable_unit_total", 0),
             "scored_count": finding_count,
             "status": "complete",
             "stop_reason": "exhausted",
         }
 
+    summary = refresh_evaluation_summary(pending, project_root)
     return {
         "budget": budget,
+        "checked_unit_count": summary.get("checked_unit_count", 0),
+        "coverage": summary.get("coverage", ""),
         "non_negotiable_guideline_ids": non_negotiable_guideline_ids(project_root),
+        "reviewable_unit_total": summary.get("reviewable_unit_total", 0),
         "scored_count": finding_count,
         "status": "next",
         "unit": {
@@ -823,7 +953,6 @@ def record_unit(project_root: Path, results_path: Path, eval_path: Path) -> None
     pending["reviewed_unit_ids"] = reviewed_unit_ids
     pending["evaluation_markdown"] = evaluation_markdown
     pending["evaluation_updated_at"] = utc_now()
-    pending["scored_count"] = count_findings_in_markdown(evaluation_markdown)
     pending["phase"] = "evaluation"
     pending["updated_at"] = utc_now()
     pending["last_unit_id"] = unit_id
@@ -831,6 +960,7 @@ def record_unit(project_root: Path, results_path: Path, eval_path: Path) -> None
         pending["last_unit_result"] = "finding"
     else:
         pending["last_unit_result"] = "no_findings"
+    refresh_evaluation_summary(pending, project_root)
     write_pending(project, pending)
 
 
@@ -962,9 +1092,11 @@ def finalize_no_findings(project: str) -> None:
     pending = load_pending(project)
     if not pending:
         return
+    refresh_evaluation_summary(pending)
     row: HistoryRow = {
         "start_time": pending.get("start_time", ""),
         "end_time": utc_now(),
+        "evaluation_summary": history_summary(pending),
         "reviewed_units": list(pending.get("reviewed_units", [])),
     }
     append_jsonl_history(history_file(project), row)
@@ -989,6 +1121,7 @@ def finalize_fix(project_root: Path, eval_path: Path) -> None:
     pending = load_pending(project)
     if not pending:
         return
+    refresh_evaluation_summary(pending, project_root)
     fix_results = parse_fix_results(eval_path, project_root)
     eval_guidelines: set[str] = set(parse_eval_guidelines(eval_path, project_root).values())
     reviewed_units: list[ReviewedUnit] = []
@@ -1015,6 +1148,7 @@ def finalize_fix(project_root: Path, eval_path: Path) -> None:
     row: HistoryRow = {
         "start_time": pending.get("start_time", ""),
         "end_time": utc_now(),
+        "evaluation_summary": history_summary(pending),
         "reviewed_units": reviewed_units,
     }
     append_jsonl_history(history_file(project), row)
@@ -1025,6 +1159,7 @@ def finalize_failure(project: str, reason: str) -> None:
     pending = load_pending(project)
     if not pending:
         return
+    refresh_evaluation_summary(pending)
     reviewed_units: list[ReviewedUnit] = []
     for reviewed in pending.get("reviewed_units", []):
         if "outcome" in reviewed:
@@ -1039,6 +1174,7 @@ def finalize_failure(project: str, reason: str) -> None:
     row: HistoryRow = {
         "start_time": pending.get("start_time", ""),
         "end_time": utc_now(),
+        "evaluation_summary": history_summary(pending),
         "reviewed_units": reviewed_units,
     }
     append_jsonl_history(history_file(project), row)
@@ -1070,11 +1206,27 @@ def parse_args() -> argparse.Namespace:
     export_eval = subparsers.add_parser("export-evaluation")
     _ = export_eval.add_argument("--project", required=True)
     _ = export_eval.add_argument("--output", required=True)
+    _ = export_eval.add_argument("--kind", default="scratch")
     status_eval = subparsers.add_parser("evaluation-status")
     _ = status_eval.add_argument("--project", required=True)
     _ = status_eval.add_argument(
         "--field",
-        choices=("finding_count", "has_no_violations", "has_pending", "has_review_log", "line_count", "status"),
+        choices=(
+            "budget",
+            "checked_unit_count",
+            "coverage",
+            "evaluation_complete",
+            "finding_count",
+            "guideline_total",
+            "has_no_violations",
+            "has_pending",
+            "has_review_log",
+            "line_count",
+            "reviewable_unit_total",
+            "scratch_exports",
+            "status",
+            "stop_reason",
+        ),
     )
     no_findings = subparsers.add_parser("finalize-no-findings")
     _ = no_findings.add_argument("--project", required=True)
@@ -1153,6 +1305,7 @@ def main() -> None:
         export_evaluation(
             _arg_str(args, "project"),
             Path(_arg_str(args, "output")).expanduser().resolve(),
+            _arg_str(args, "kind"),
         )
         return
     if command == "evaluation-status":

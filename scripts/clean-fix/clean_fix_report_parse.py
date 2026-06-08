@@ -485,7 +485,7 @@ def parse_eval_phase(lines: list[str], result: ParseResult) -> None:
     stats.present = True
     launched: set[str] = set()
     resolved: set[str] = set()
-    ok_re = re.compile(r"^OK: (\S+) \((?:\s*\d+ lines|no findings\b)")
+    ok_re = re.compile(r"^OK: (\S+) \((.*)\)")
     autofinalize_re = re.compile(r"^AUTOFINALIZE: (\S+) \(no findings\b")
     fail_re = re.compile(r"^(FAILED|ERROR|TIMEOUT): (\S+)(?:\s*\(([^)]+)\))?")
     skip_re = re.compile(r"^SKIP: (\S+) \(([^)]+)\)")
@@ -497,8 +497,19 @@ def parse_eval_phase(lines: list[str], result: ParseResult) -> None:
         m = ok_re.match(line)
         if m:
             project = m.group(1)
-            reason = "no-findings" if "no findings" in line else ""
+            details = m.group(2)
+            if not (details.lstrip().startswith(tuple(str(n) for n in range(10))) or details.startswith("no findings")):
+                continue
+            reason = ""
+            if "no findings" in details:
+                reason = "no-findings"
+            elif "stop=budget_reached" in details:
+                reason = "budget-reached"
+            elif "stop=exhausted" in details:
+                reason = "exhausted"
             get_row(result.rows, project)["eval"] = Cell("OK", reason)
+            if "coverage=" in details or "stop=" in details:
+                result.notes.append(f"{project}: style eval {details}")
             if project not in resolved:
                 stats.ok += 1
             resolved.add(project)
@@ -845,6 +856,8 @@ def row_reason(result: ParseResult, project: str) -> str:
             add(f"{phase}: {reason}")
         elif phase == "eval" and cell.state == "OK" and cell.reason == "no-findings":
             add("eval: no violations found")
+        elif phase == "eval" and cell.state == "OK" and cell.reason in {"budget-reached", "exhausted"}:
+            add(f"eval: {humanize_cell_reason(cell.reason)}")
         elif cell.reason == "warning":
             add(f"{phase}: {tool_warnings_by_phase.get(phase) or 'tool warning'}")
 
@@ -863,6 +876,8 @@ def humanize_cell_reason(reason: str) -> str:
     if not reason:
         return ""
     known = {
+        "budget-reached": "budget reached",
+        "exhausted": "all eligible style rules checked",
         "from-disk": "found Fix Summary on disk",
         "no-fix-summary": "no Fix Summary",
         "no-result": "no result",

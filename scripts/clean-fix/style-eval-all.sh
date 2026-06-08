@@ -225,9 +225,41 @@ no_findings_marker() {
     echo "$LOG_DIR/style_eval_${project}.no_findings_finalized"
 }
 
+has_real_style_fix_worktree() {
+    local project="$1" project_root="$2"
+    local worktree_dir="$RUST_DIR/${project}_style_fix"
+    [[ -d "$worktree_dir" ]] || return 1
+    git -C "$worktree_dir" rev-parse --git-dir >/dev/null 2>&1 || return 1
+    git -C "$project_root" worktree list --porcelain 2>/dev/null \
+        | grep -qF "worktree $worktree_dir"
+}
+
+clean_project_scratch() {
+    local project="$1" project_root="$2"
+    rm -f \
+        "$LOG_DIR/style_eval_${project}_evaluation.md" \
+        "$LOG_DIR/style_eval_review_${project}_evaluation.md" \
+        "$(no_findings_marker "$project")"
+    if ! has_real_style_fix_worktree "$project" "$project_root"; then
+        rm -f "$LOG_DIR/style_fix_${project}_evaluation.md"
+    fi
+}
+
 evaluation_status_field() {
     local project="$1" field="$2"
     python3 "$HISTORY_HELPER" evaluation-status --project "$project" --field "$field" 2>/dev/null || echo "missing"
+}
+
+evaluation_status_summary() {
+    local project="$1"
+    local lines findings coverage stop
+    lines=$(evaluation_status_field "$project" line_count)
+    findings=$(evaluation_status_field "$project" finding_count)
+    coverage=$(evaluation_status_field "$project" coverage)
+    stop=$(evaluation_status_field "$project" stop_reason)
+    [[ -z "$coverage" || "$coverage" == "missing" ]] && coverage="unknown"
+    [[ -z "$stop" || "$stop" == "missing" ]] && stop="in_progress"
+    echo "${lines} lines; findings=${findings}; coverage=${coverage}; stop=${stop}"
 }
 
 pending_evaluation_has_no_findings() {
@@ -244,12 +276,17 @@ pid_is_live_non_zombie() {
 }
 
 finalize_no_findings_if_ready() {
-    local project="$1" eval_path="$2" marker="$3"
+    local project="$1" eval_path="$2" marker="$3" project_root="${4:-}"
     pending_evaluation_has_no_findings "$project" || return 1
+    local summary
+    summary=$(evaluation_status_summary "$project")
     if python3 "$HISTORY_HELPER" finalize-no-findings --project "$project"; then
+        if [[ -n "$project_root" ]]; then
+            clean_project_scratch "$project" "$project_root"
+        fi
         rm -f "$eval_path"
         : > "$marker"
-        echo "AUTOFINALIZE: $project (no findings — recorded in history, pending finalized)"
+        echo "AUTOFINALIZE: $project (no findings — $summary; recorded in history, pending finalized)"
         return 0
     fi
     echo "WARN: $project (could not auto-finalize no-findings history)"
@@ -257,14 +294,14 @@ finalize_no_findings_if_ready() {
 }
 
 start_no_findings_cleanup() {
-    local pid="$1" project="$2" eval_path="$3"
+    local pid="$1" project="$2" eval_path="$3" project_root="$4"
     local marker
     marker=$(no_findings_marker "$project")
     rm -f "$marker"
 
     (
         while true; do
-            if finalize_no_findings_if_ready "$project" "$eval_path" "$marker"; then
+            if finalize_no_findings_if_ready "$project" "$eval_path" "$marker" "$project_root"; then
                 if pid_is_live_non_zombie "$pid"; then
                     sleep 2
                     if pid_is_live_non_zombie "$pid"; then
@@ -445,8 +482,10 @@ for i in "${!projects[@]}"; do
         continue
     fi
     if [[ "$pending_status" == "no_findings" ]]; then
+        summary=$(evaluation_status_summary "$proj")
         if python3 "$HISTORY_HELPER" finalize-no-findings --project "$proj"; then
-            echo "OK: $proj (no findings — recorded in history, pending finalized)"
+            clean_project_scratch "$proj" "$project_root"
+            echo "OK: $proj (no findings — $summary; recorded in history, pending finalized)"
         else
             echo "FAILED: $proj (could not finalize no-findings history)"
         fi
@@ -464,13 +503,13 @@ for i in "${!projects[@]}"; do
         echo "FAILED: $proj (could not start pending run)"
         continue
     }
-    rm -f "$eval_path"
+    clean_project_scratch "$proj" "$project_root"
 
     log_file="$LOG_DIR/style_eval_${proj}.log"
     launch_eval "$project_root" "$worktree_eval" "$eval_path" "$log_file" &
     agent_pid=$!
     start_wrapper_heartbeat "$agent_pid" "$proj" "$project_root" "$eval_path" "$log_file" "wrapper launched"
-    start_no_findings_cleanup "$agent_pid" "$proj" "$eval_path"
+    start_no_findings_cleanup "$agent_pid" "$proj" "$eval_path" "$project_root"
     pids+=("$agent_pid")
     names+=("$proj")
     roots_for_wait+=("$project_root")
@@ -537,13 +576,13 @@ for pid in "${pids[@]}"; do
             idx=$((idx + 1))
             continue
         fi
-        rm -f "$eval_path"
+        clean_project_scratch "$name" "$project_root"
 
         launch_eval "$project_root" "$worktree_eval" "$eval_path" "$log_file" &
         retry_pid=$!
         start_wrapper_heartbeat "$retry_pid" "$name" "$project_root" "$eval_path" "$log_file" "wrapper retry launched"
         retry_heartbeat_pid="$WRAPPER_HEARTBEAT_PID"
-        start_no_findings_cleanup "$retry_pid" "$name" "$eval_path"
+        start_no_findings_cleanup "$retry_pid" "$name" "$eval_path" "$project_root"
         retry_cleanup_pid="$NO_FINDINGS_CLEANUP_PID"
         no_findings_done_marker=$(no_findings_marker "$name")
         wait_or_timeout "$retry_pid" "$AGENT_TIMEOUT_SECS" "$name" "$project_root" "$eval_path" "$log_file" && retry_code=0 || retry_code=$?
@@ -561,14 +600,16 @@ for pid in "${pids[@]}"; do
         else
             retry_status=$(evaluation_status_field "$name" status)
             if [[ "$retry_status" == "no_findings" ]]; then
+                summary=$(evaluation_status_summary "$name")
                 python3 "$HISTORY_HELPER" finalize-no-findings --project "$name" || true
-                rm -f "$eval_path"
-                echo "RECOVERED: $name (no findings — recorded in history, pending finalized, retry succeeded)"
+                clean_project_scratch "$name" "$project_root"
+                echo "RECOVERED: $name (no findings — $summary; recorded in history, pending finalized, retry succeeded)"
                 recovered=$((recovered + 1))
                 succeeded=$((succeeded + 1))
             elif [[ "$retry_status" == "findings" || "$retry_status" == "reviewed_findings" ]]; then
-                lines=$(evaluation_status_field "$name" line_count)
-                echo "RECOVERED: $name ($lines lines, retry succeeded)"
+                summary=$(evaluation_status_summary "$name")
+                rm -f "$eval_path"
+                echo "RECOVERED: $name ($summary, retry succeeded)"
                 recovered=$((recovered + 1))
                 succeeded=$((succeeded + 1))
             else
@@ -587,17 +628,19 @@ for pid in "${pids[@]}"; do
         echo "WARN: $name (exit $code, but pending evaluation was produced)"
     fi
     if [[ "$eval_status" == "no_findings" ]]; then
+        summary=$(evaluation_status_summary "$name")
         python3 "$HISTORY_HELPER" finalize-no-findings --project "$name" || {
             echo "FAILED: $name (could not finalize no-findings history)"
             failed=$((failed + 1))
             idx=$((idx + 1))
             continue
         }
-        rm -f "$eval_path"
-        echo "OK: $name (no findings — recorded in history, pending finalized)"
+        clean_project_scratch "$name" "$project_root"
+        echo "OK: $name (no findings — $summary; recorded in history, pending finalized)"
     else
-        lines=$(evaluation_status_field "$name" line_count)
-        echo "OK: $name ($lines lines)"
+        summary=$(evaluation_status_summary "$name")
+        rm -f "$eval_path"
+        echo "OK: $name ($summary)"
     fi
     succeeded=$((succeeded + 1))
     idx=$((idx + 1))

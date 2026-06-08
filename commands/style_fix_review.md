@@ -3,7 +3,7 @@ description: Review changes in a style-fix worktree against its clean-fix evalua
 ---
 
 **Context:** You are in a `_style_fix` worktree created by the clean-fix automation. The clean-fix pipeline:
-1. Ran `/style_eval` on the main branch, storing numbered findings in pending JSON and a style-fix scratch evaluation
+1. Ran `/style_eval` on the main branch, storing numbered findings in pending JSON
 2. Created this worktree on branch `refactor/style`
 3. Launched Claude to apply every finding, run clippy, and run tests
 4. Left the worktree with uncommitted changes for human review
@@ -11,7 +11,7 @@ description: Review changes in a style-fix worktree against its clean-fix evalua
 **Your task:** Review the changes the automation made and determine whether each finding was correctly and completely addressed.
 
 <Audience>
-The user sees only what you write. They have **not** read the scratch evaluation's Fix Summary, the `cargo mend` output, the diff, or any style file. Your job is to surface what they *don't* know — without padding out what they already do know.
+The user sees only what you write. They have **not** read the pending evaluation's Fix Summary, the `cargo mend` output, the diff, or any style file. Your job is to state what they *don't* know — without padding out what they already do know.
 
 **Trust the reader on common ground.** Assume the user knows:
 - Standard Rust and Cargo tooling (`cargo`, `clippy`, `cargo mend`, `rustfmt`, `nextest`)
@@ -21,7 +21,7 @@ The user sees only what you write. They have **not** read the scratch evaluation
 
 Do **not** re-introduce these. No "cargo mend is a workspace auditor..." preamble, no explaining what `#[allow]` does.
 
-**The user does not know** (and you must surface explicitly):
+**The user does not know** (and you must state explicitly):
 - What the Fix Summary actually says — quote or paraphrase, don't reference by name
 - Project-specific lints, configs, or files (`forbidden_pub_crate`, `tests/support.rs` helpers) the first time they appear
 - Cross-tool interactions (e.g. mend's fix being reverted by another lint)
@@ -76,7 +76,7 @@ This rule applies regardless of whether `auto mode` is active, whether previous 
 
 Every fix proposal must be preceded by reading the governing style file and quoting its prescription. Do not brainstorm options when the style guide has already ruled.
 
-- **Follow-up tasks derived from a finding** — the governing file is the finding's `Style file:` field in the scratch evaluation. Read it; cite it.
+- **Follow-up tasks derived from a finding** — the governing file is the finding's `Style file:` field in the pending evaluation markdown. Read it; cite it.
 - **Follow-up tasks tied to a clippy lint** — the governing file is whichever style doc has the lint name in its frontmatter `lint:` field. Find it by grepping the loaded style files for the lint name.
 - **Every proposal must start with a `**Style rule:**` line** quoting the relevant prescription, or stating "no specific rule; proposing by analogy to X."
 
@@ -220,27 +220,41 @@ If the draft fails any of these, do not send — fix and re-scan.
 </ConcernFormat>
 
 <ReadEvaluation>
-**Locate the style-fix evaluation scratch file.** Clean-fix no longer writes `EVALUATION.md` into style-fix worktrees. The launcher exports the pending evaluation markdown to `/private/tmp/claude/style_fix_<project>_evaluation.md`, and the fix agent appends `## Fix Summary` there.
+**Load the style-fix evaluation from pending JSON.** Clean-fix no longer writes `EVALUATION.md` into style-fix worktrees. The durable evaluation markdown lives in `~/rust/nate_style/.history/.pending/<project>.json` under `evaluation_markdown`. Scratch files under `/private/tmp/claude` are exports only; their absence is not a reason to stop.
 
-Run this from anywhere inside the style-fix worktree to derive the project name and locate the scratch file:
+Run this from anywhere inside the style-fix worktree to derive the project name, inspect the pending state, and export the pending markdown to a temporary review file:
 
 ```bash
 worktree_dir="$(git rev-parse --show-toplevel)"
 project="$(basename "$worktree_dir")"
 project="${project%_style_fix}"
-eval_path="/private/tmp/claude/style_fix_${project}_evaluation.md"
-printf '%s\n' "$eval_path"
+status_json="$(python3 ~/.claude/scripts/clean-fix/style_history.py evaluation-status --project "$project")"
+eval_path="/private/tmp/claude/style_fix_review_${project}_evaluation.md"
+python3 ~/.claude/scripts/clean-fix/style_history.py export-evaluation \
+  --project "$project" \
+  --kind review \
+  --output "$eval_path"
+printf 'project=%s\neval_path=%s\nstatus=%s\n' "$project" "$eval_path" "$status_json"
 ```
 
-If that file does not exist, stop and report that the style-fix scratch evaluation is missing — do **not** claim the worktree has no findings; that is a launcher bug or temp-file cleanup issue, not a clean run.
+If `export-evaluation` fails with `No pending evaluation markdown for <project>.`, stop and report that the pending evaluation markdown is missing. Do **not** search for repo-root `EVALUATION.md`; those files are stale artifacts and must not be used as review input.
 
-Read the scratch file. It contains up to three parts:
+Read the exported pending markdown. It contains up to three parts:
 
 1. **Findings** — numbered style violations identified by `/style_eval`
 2. **Review Log** — appended by the clean-fix style-eval-review stage, documenting which findings the review pass kept, improved, amended, or removed, and why
 3. **Fix Summary** — appended by the fix agent, documenting what it did, what it skipped, and why
 
-Start by reading the Fix Summary section at the bottom. This is the agent's account of what happened — applied / skipped / partially applied, plus issues encountered (build failures, pattern mismatches, style conflicts, etc.). Also look for **Cargo Mend Changes**, which documents automatic visibility/import fixes made by `cargo mend --fix`. Use this as your starting point: you'll verify these claims against the actual diff.
+If the exported pending markdown has no `## Fix Summary`, parse `status_json` and check `scratch_exports.fix.path`. If that path exists and contains `## Fix Summary`, read that file only for Fix Summary and Cargo Mend Changes; keep the exported pending markdown as the authority for findings and Review Log. If neither pending markdown nor the recorded fix export contains `## Fix Summary`, continue the review from the pending findings and actual diff, and state once in `## Cargo Mend Changes`: `Fix Summary unavailable; reviewing the diff directly against pending findings.`
+
+Also read the header fields. If `**Rules checked**:` is in the new coverage
+format (`N/M (stop_reason)`), include that coverage in your summary table
+context so the user can tell whether the eval exhausted the selected style
+units or stopped at the finding budget. If it is a legacy bare number with no
+denominator/stop reason, say that explicitly; do not imply a full style-guide
+sweep.
+
+If a Fix Summary is available, start by reading it. This is the agent's account of what happened — applied / skipped / partially applied, plus issues encountered (build failures, pattern mismatches, style conflicts, etc.). Also look for **Cargo Mend Changes**, which documents automatic visibility/import fixes made by `cargo mend --fix`. Use this as your starting point: you'll verify these claims against the actual diff.
 
 **Removed-by-review findings are reporting-only.** Findings whose body is wrapped in `<!-- REMOVED-BY-REVIEW: ... -->` ... `<!-- /REMOVED-BY-REVIEW -->` markers were struck by the review pass before the fix agent ran. The fix agent did not act on them and you should not evaluate the diff against them. Surface them in the Review Log section so the user can see what was cut, but do not produce a finding walkthrough for them.
 </ReadEvaluation>
@@ -252,7 +266,7 @@ Run:
 zsh ~/.claude/scripts/load-rust-style.sh
 ```
 
-Then read each unique style file referenced by the findings. Each finding in the scratch evaluation includes a **Style file** field with the full path (e.g., `~/rust/nate_style/rust/one-use-per-line.md` or a repo-local `docs/style/*.md`).
+Then read each unique style file referenced by the findings. Each finding in the pending evaluation markdown includes a **Style file** field with the full path (e.g., `~/rust/nate_style/rust/one-use-per-line.md` or a repo-local `docs/style/*.md`).
 
 The referenced files are your authoritative sources for evaluating whether the changes conform.
 
@@ -283,6 +297,8 @@ Consult `agent-must-review-allows.md`, `never-bare-allowdeadcode.md`, `cargo-tom
 <ReviewCargoMend>
 Check the Fix Summary for a **Cargo Mend Changes** section. Do **not** introduce what `cargo mend` is.
 
+**If no Fix Summary is available:** write exactly `Fix Summary unavailable; reviewing the diff directly against pending findings.` and stop this section.
+
 **If mend-credited edits exist in the diff:**
 
 Summarize as a before/after table. Group files that share the same before/after into a single row. Do **not** cross-reference numbered findings here — the reader hasn't read them yet.
@@ -310,7 +326,7 @@ Name any project-specific lint the first time it appears (one clause is enough �
 </ReviewCargoMend>
 
 <SurfaceReviewLog>
-If the scratch evaluation contains a `## Review Log` section, summarize it under a `## Review Log` heading in your output. The user has not read it. Format:
+If the pending evaluation markdown contains a `## Review Log` section, summarize it under a `## Review Log` heading in your output. The user has not read it. Format:
 
 - One line stating totals: `N findings reviewed: K kept, I improved, A amended, R removed.`
 - If anything was improved, amended, or removed, render a short table:
@@ -322,11 +338,11 @@ If the scratch evaluation contains a `## Review Log` section, summarize it under
 
 Only include rows for non-`kept` actions. If every finding was kept, write one sentence: `Review pass kept all N findings as written.` and skip the table.
 
-If the scratch evaluation has no `## Review Log` section, omit this section entirely — the eval predates the review stage or the review failed.
+If the pending evaluation markdown has no `## Review Log` section, omit this section entirely — the eval predates the review stage or the review failed.
 </SurfaceReviewLog>
 
 <ReviewFindings>
-For each numbered finding in the scratch evaluation that is **not** wrapped in `<!-- REMOVED-BY-REVIEW -->` markers, assess:
+For each numbered finding in the pending evaluation markdown that is **not** wrapped in `<!-- REMOVED-BY-REVIEW -->` markers, assess:
 
 - **What was done** — Summarize the actual changes (files touched, what was moved/renamed/rewritten)
 - **Applied?** — Was the finding addressed in the diff?
@@ -342,7 +358,7 @@ The first response branches based on whether the Allow Audit is clean.
 **Case A — Allow Audit is clean (`No new allows in the diff.`):**
 
 1. Summary table: `# | Finding | Applied | Correct | Complete | Issues` — list only findings NOT wrapped in REMOVED-BY-REVIEW markers; row number is the finding's original number
-2. `## Review Log` (per `<SurfaceReviewLog/>` — omit if the scratch evaluation has no Review Log)
+2. `## Review Log` (per `<SurfaceReviewLog/>` — omit if the pending evaluation markdown has no Review Log)
 3. `## Allow Audit` (per `<AuditAllows/>` — one sentence)
 4. `## Cargo Mend Changes` (per `<ReviewCargoMend/>`)
 5. `## Finding N` walkthrough — N is the lowest-numbered finding NOT removed-by-review (per `<FindingWalkthrough/>`)
@@ -442,7 +458,7 @@ When the user's next message arrives, produce exactly one finding walkthrough �
 <ExecutionSteps>
 **EXECUTE THESE STEPS IN ORDER. Internalize `<HardRules/>`, `<Audience/>`, `<ConcernFormat/>`, and `<Constraints/>` before producing any output — they govern every step below.**
 
-**STEP 1:** Execute `<ReadEvaluation/>` — start with the Fix Summary at the bottom of the scratch evaluation.
+**STEP 1:** Execute `<ReadEvaluation/>` — start with the Fix Summary from pending markdown, or from the recorded fix export if pending does not include it.
 **STEP 2:** Execute `<LoadStyleGuide/>` — load the global style guide and read each style file referenced by surviving findings.
 **STEP 3:** Execute `<ReadDiff/>` — `git diff` and `git diff --cached`.
 **STEP 4:** Execute `<AuditAllows/>` — inspect for new allow suppressions.

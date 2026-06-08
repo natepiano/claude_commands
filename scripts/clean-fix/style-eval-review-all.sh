@@ -168,7 +168,7 @@ for i in "${!names[@]}"; do
         continue
     fi
     rm -f "$eval_file"
-    if ! python3 "$HISTORY_HELPER" export-evaluation --project "$name" --output "$eval_file"; then
+    if ! python3 "$HISTORY_HELPER" export-evaluation --project "$name" --kind review --output "$eval_file"; then
         echo "FAILED: $name (could not export pending evaluation)"
         skipped_no_eval=$((skipped_no_eval + 1))
         continue
@@ -227,6 +227,7 @@ for pid in "${pids[@]}"; do
         python3 "$HISTORY_HELPER" save-evaluation \
             --project-root "${launch_roots[$idx]}" \
             --evaluation "$eval_file"
+        rm -f "$eval_file"
         echo "OK: $name"
         succeeded=$((succeeded + 1))
     else
