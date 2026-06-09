@@ -150,24 +150,28 @@ Then append a **Phase N Review** block under the just-completed phase summarizin
 
 Do not paste the raw subagent output into the plan — only the resolved outcomes.
 
-## Step 6: Summarize to the user
+## Step 6: Final user update
 
-Produce a short plain-language summary in this format:
+This is the command's final step and final output. Run it only after all plan edits are complete, including any inline decision or optional `/adhoc_review` decisions that were applied back into the plan.
 
+Produce a succinct markdown table:
+
+```markdown
+| Area | Update |
+| --- | --- |
+| Implemented | <one sentence naming the completed phase and concrete implementation scope> |
+| Learned and applied | <one sentence naming what the retrospective/review changed in the plan automatically; use "None" if nothing was applied automatically> |
+| User decisions | <one sentence summarizing inline or `/adhoc_review` decisions and their outcomes; use "None" if no user decisions were needed> |
+| Recommended next step | <one direct recommendation for the next phase or follow-up> |
 ```
-<one-line lead: phase X reviewed; M findings, K applied, S sent for approval>
 
-1. <finding title> → <what happened: applied / approved & applied / rejected / pending approval>
-2. ...
-```
+Style rules for the final update:
 
-Style rules for the summary:
-
-- Plain language. Name files, types, phases — not abstractions.
-- Terse. One short line per finding.
-- Do not echo the retrospective back; the user wrote it through you and already knows it.
-- Do not include passed-check filler ("phase 3 is fine"). Silence is the signal.
-- If every remaining phase came through clean, say so in one line.
+- Plain language. Name files, types, phases, and plan sections.
+- Terse. One short sentence per table row.
+- Do not echo the whole retrospective; summarize only what was learned and actually applied back to the document.
+- Do not include passed-check filler. If every remaining phase came through clean, say that in `Learned and applied`.
+- Include rejected or deferred `/adhoc_review` decisions in `User decisions` so future passes do not relitigate them.
 
 ## Rules
 
