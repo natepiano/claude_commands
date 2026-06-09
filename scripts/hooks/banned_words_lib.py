@@ -372,24 +372,33 @@ def _is_phrase(stem: str) -> bool:
 
 
 def _phrase_pattern(phrase: str) -> re.Pattern[str]:
-    # Literal case-insensitive match. Interior whitespace becomes \s+ so extra
-    # spacing or line wraps don't dodge the match. Word boundaries are added
-    # only on edges that are word characters; punctuation edges anchor themselves.
+    # Literal case-insensitive match. Interior whitespace becomes [\s-]+ so
+    # spacing and hyphenation variants don't dodge the match. Word boundaries
+    # are added only on edges that are word characters; punctuation edges
+    # anchor themselves.
     parts = re.split(r"\s+", phrase.strip())
-    body = r"\s+".join(re.escape(p) for p in parts)
+    body = r"[\s-]+".join(re.escape(p) for p in parts)
     left = r"\b" if phrase[:1].isalnum() or phrase[:1] == "_" else ""
     right = r"\b" if phrase[-1:].isalnum() or phrase[-1:] == "_" else ""
     return re.compile(rf"{left}{body}{right}", re.IGNORECASE)
 
 
 def _stem_pattern(stem: str, override: str | None = None) -> re.Pattern[str]:
-    # If the canonical guide supplied an explicit regex for this stem, use it.
+    # If the canonical guide supplied an explicit regex for this entry, use it.
     # Otherwise, strip a trailing silent 'e' so verb forms collapse to a single
     # root pattern (the stem itself works for stems that don't end in 'e').
     if override:
         return re.compile(override, re.IGNORECASE)
     root = stem[:-1] if stem.endswith("e") and len(stem) > 2 else stem
     return re.compile(rf"\b\w*{re.escape(root)}\w*\b", re.IGNORECASE)
+
+
+def _entry_pattern(stem: str, override: str | None = None) -> re.Pattern[str]:
+    if override:
+        return _stem_pattern(stem, override)
+    if _is_phrase(stem):
+        return _phrase_pattern(stem)
+    return _stem_pattern(stem)
 
 
 def bump_counters(stems: Iterable[str]) -> dict[str, CounterRecord]:
@@ -448,10 +457,7 @@ def find_violations(text: str) -> list[Violation]:
     exemptions = load_exemptions()
     per_stem_exemptions = load_per_stem_exemptions()
     overrides = load_overrides()
-    patterns = [
-        (s, _phrase_pattern(s) if _is_phrase(s) else _stem_pattern(s, overrides.get(s)))
-        for s in stems
-    ]
+    patterns = [(s, _entry_pattern(s, overrides.get(s))) for s in stems]
 
     out: list[Violation] = []
     for line_no, line in enumerate(text.splitlines(), start=1):

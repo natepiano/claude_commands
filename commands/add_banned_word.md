@@ -20,16 +20,16 @@ Then:
 
 1. Read `~/rust/nate_style/rust/forbidden-words.md` to confirm the entry isn't already present.
 
-2. **Single-word stem vs. multi-word phrase — they wire up differently.** `find_violations` in `~/.claude/scripts/hooks/banned_words_lib.py` routes on whether the `### "<heading>"` contains whitespace:
-   - **Whitespace in the heading → literal phrase matcher** (`\s+` between tokens) and the `regex:` line is *ignored*. This catches only the exact spaced spelling — not the hyphenated form, not conjugations.
-   - **No whitespace in the heading → stem matcher**, which *does* honor the `regex:` override.
+2. **Single-word stem vs. multi-word phrase — they wire up differently.** `find_violations` in `~/.claude/scripts/hooks/banned_words_lib.py` first honors a section's `regex:` override when one exists. Without an override, it routes on whether the `### "<heading>"` contains whitespace:
+   - **Whitespace in the heading → literal phrase matcher** (`[\s-]+` between tokens). This catches the exact token sequence with spaces or hyphens — not conjugations.
+   - **No whitespace in the heading → stem matcher**, using the default root algorithm.
 
-   So a multi-word phrase must use a **hyphen-joined heading** for its regex to fire.
+   So a multi-word phrase can use either heading spelling when a `regex:` is present, but the recommended heading remains hyphen-joined so the counter key is compact.
 
 3. **Single-word stem.** The default matcher strips a trailing silent `e` and matches `\b\w*<root>\w*\b` (case-insensitive) — fine for most stems. Add a custom `regex:` line only when the default root would collide with unrelated common English words (e.g. a 3-letter root that appears inside ordinary words); propose a regex matching only the listed forms with `\b` boundaries and confirm with the user.
 
 4. **Multi-word phrase — always block both the spaced and the hyphenated spelling. Do this by default; do not ask.**
-   - Heading: hyphen-join the tokens — `### "pressure-test"` (NOT `### "pressure test"`), so the regex is honored.
+   - Heading: hyphen-join the tokens — `### "pressure-test"` (NOT `### "pressure test"`), so the counter key is compact and matches the convention.
    - `regex:` line (required): join the tokens with `[\s-]+` so a space *or* a hyphen between words both match, add `\b` boundaries, and include suffix alternations for the conjugations the user wants — e.g. `\bpressure[\s-]+test(s|ed|ing)?\b`.
    - Forms line: list both spellings (e.g. `pressure test, pressure-test, pressure tested, pressure testing`).
 
