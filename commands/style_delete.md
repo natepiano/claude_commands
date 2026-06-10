@@ -8,7 +8,7 @@ Delete a shared style file deterministically with the shared admin script.
 
 If `$ARGUMENTS` is empty or does not contain exactly one argument, show usage and stop:
 ```text
-Usage: /delete_style style_name
+Usage: /style_delete style_name
 (`.md` extension is optional — it will be appended when needed)
 ```
 

@@ -1,7 +1,7 @@
 #!/bin/bash
 # Manual launcher for style-fix-worktrees.sh that accumulates log files
 # into ~/.local/logs/clean-fix/ alongside the clean-fix orchestrator runs, so
-# /clean_fix_report can pick them up.
+# /clean_fix report can pick them up.
 #
 # Usage: style-fix-manual.sh [--foreground] [project_name]
 #   --foreground  — run style-fix-worktrees.sh in the current process so the
@@ -13,7 +13,7 @@
 #                             restrict the run to a single project.
 #
 # In both modes the log path is printed up front so it can be tailed or
-# armed with /monitor_clean_fix.
+# armed with /clean_fix monitor.
 
 set -euo pipefail
 
@@ -42,5 +42,5 @@ else
     disown
     echo "PID: $PID"
     echo "Tail: tail -f \"$LOG\""
-    echo "Monitor: /monitor_clean_fix \"$LOG\""
+    echo "Monitor: /clean_fix monitor \"$LOG\""
 fi

@@ -54,19 +54,17 @@ Error Handling:
   **STOP immediately**. Report the error output to the user and ask what to do.
   Do NOT proceed to clippy.
 
-If successful: Note any remaining unfixable items from the earlier `cargo mend` run and proceed to <RunFmt/>.
+If successful: Note any remaining unfixable items from the earlier `cargo mend` run, then continue with the next step in <ExecutionSteps/>.
 </RunMendFix>
 
 <RunFmt>
 Execute: `cargo +nightly fmt --all`
 
-This step runs **unconditionally** after mend (whether mend fixed anything, found nothing, or had only unfixable items).
+This step runs **unconditionally** (whether mend fixed anything, found nothing, or had only unfixable items).
 
 Check `git diff` after running to determine if fmt applied any changes.
-- If diff is non-empty: fmt applied formatting fixes. Note this for the findings report.
-- If diff is empty: no formatting changes needed. Note this for the findings report.
-
-Proceed to <RunClippy/>.
+- If diff is non-empty: fmt applied formatting fixes. Note this for the completion summary.
+- If diff is empty: no formatting changes needed. Note this for the completion summary.
 </RunFmt>
 
 <RunClippy>
@@ -219,7 +217,7 @@ truth that maps clippy lints to the rule that governs them.
    ```
    If the file is empty, report: "No uncommitted changes to review." and skip remaining steps.
 
-2. The style guide was already loaded in STEP 1. Find the `=== STYLE_CHECKLIST ===` section from that output — it lists every rule by number and name.
+2. If the `=== STYLE_CHECKLIST ===` section is not already in context, execute <LoadStyleGuide/> now. The checklist lists every rule by number and name.
 
 3. **Systematic walk**: For each rule in the checklist, check the additions-only diff. Present results in a table:
 
@@ -261,7 +259,7 @@ truth that maps clippy lints to the rule that governs them.
 **STEP 4:** **Always** execute <StyleReview/> — evaluate diff against style guide rules (loads style guide only if diff is non-empty)
 **STEP 5:** Execute <RunClippy/>
 **STEP 5b:** Execute <RunDoc/> — run rustdoc as a lint with `RUSTDOCFLAGS="-D warnings"`
-**STEP 6:** Execute <ReportFindings/> — present mend, fmt, clippy, and doc summary
+**STEP 6:** Execute <ReportFindings/> — present mend, clippy, and doc summary (fmt runs later, at STEP 8, and is covered in the completion summary)
 **STEP 7:** If unfixable mend or clippy issues found, execute <CreateBatchTodoList/>, <BatchDecisionPoint/>, <BatchExecution/>
 **STEP 8:** Execute <RunFmt/> — run `cargo +nightly fmt --all` unconditionally
 **STEP 9:** Completion summary

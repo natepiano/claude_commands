@@ -168,7 +168,7 @@ This applies to ALL bash commands and script invocations in this process.
 [ ] STEP 8:  Create GitHub Release
 [ ] STEP 9:  Post-Release Verification
 [ ] STEP 10: Restore [Unreleased] Sections
-[ ] STEP 11: Bump to Next Dev Version
+[ ] STEP 11: Restore Dev Version on ${BASE_BRANCH}
 ═══════════════════════════════════════════════════════════════
 ```
 
@@ -191,7 +191,7 @@ This applies to ALL bash commands and script invocations in this process.
 [ ] STEP 8:  Create GitHub Release
 [ ] STEP 9:  Post-Release Verification + install verify (mcp)
 [ ] STEP 10: Restore [Unreleased] Sections
-[ ] STEP 11: Bump to Next Dev Version
+[ ] STEP 11: Restore Dev Version on ${BASE_BRANCH}
 ═══════════════════════════════════════════════════════════════
 ```
 
@@ -212,7 +212,7 @@ This applies to ALL bash commands and script invocations in this process.
 [ ] STEP 8:  Create GitHub Release
 [ ] STEP 9:  Post-Release Verification
 [—] STEP 10: Restore [Unreleased] Sections (skipped — hotfix)
-[—] STEP 11: Bump to Next Dev Version (skipped — hotfix)
+[—] STEP 11: Restore Dev Version on ${BASE_BRANCH} (skipped — hotfix)
 [ ] STEP 12: Cherry-pick to main
 ═══════════════════════════════════════════════════════════════
 ```
@@ -234,7 +234,7 @@ This applies to ALL bash commands and script invocations in this process.
 [ ] STEP 8:  Create GitHub Release
 [ ] STEP 9:  Post-Release Verification
 [ ] STEP 10: Restore [Unreleased] Sections (on ${BASE_BRANCH})
-[ ] STEP 11: Bump to Next Dev Version (on ${BASE_BRANCH})
+[ ] STEP 11: Restore Dev Version on ${BASE_BRANCH}
 ═══════════════════════════════════════════════════════════════
 ```
 Same sequence as normal mode, but every "on main" step runs on `${BASE_BRANCH}` and main is never modified. There is no STEP 12.
@@ -277,7 +277,7 @@ Same sequence as normal mode, but every "on main" step runs on `${BASE_BRANCH}` 
     **STEP 8:** Execute <CreateGitHubRelease/>
     **STEP 9:** Execute <PostReleaseVerification/>
     **STEP 10:** Execute <RestoreUnreleasedSections/>
-    **STEP 11:** Execute <BumpToNextDev/>
+    **STEP 11:** Execute <RestoreDevVersion/>
 
     **If hotfix mode (not on main):**
 
@@ -714,7 +714,7 @@ cargo install ${INSTALL_CRATE_NAME} --version "${VERSION}"
 → Report the script output to the user.
 </RestoreUnreleasedSections>
 
-<BumpToNextDev>
+<RestoreDevVersion>
 ## STEP 11: Restore Dev Version on ${BASE_BRANCH}
 
 **This step always runs** (normal and isolated modes). Step 4 set versions to the release version on `${BASE_BRANCH}` before branching. `${BASE_BRANCH}` must be restored to a dev version.
@@ -760,7 +760,7 @@ git push origin ${BASE_BRANCH}
 → Report the script output to the user.
 
 **Release complete!** All crates published from release branch. Release branch is fire-and-forget. `${BASE_BRANCH}` now at next dev version. In isolated mode, main was never touched — merge `${BASE_BRANCH}` into main yourself when ready.
-</BumpToNextDev>
+</RestoreDevVersion>
 
 <FinalizeOnHotfixBranch>
 ## STEP 4 (Hotfix): Finalize Changelogs and Bump Versions (on hotfix branch)

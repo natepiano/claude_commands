@@ -318,26 +318,8 @@ If `--fix` was passed, you are running interactively and the user is waiting on 
       ~/.claude/scripts/clean-fix/style-fix-manual.sh --foreground "$(basename "$ARGUMENTS")"
       ```
 
-   b. Arm a `Monitor` on the manual log file in the same response. Use the Python helper at `~/.claude/scripts/clean-fix/style-fix-monitor.py` — it tails both the manual log (latest `~/.local/logs/clean-fix/style-fix-manual-*.log`) and the agent's own log under `/private/tmp/claude/style_fix_<project>.log`, emits matching lines (the `[progress …]` orchestrator phases plus the agent's phase sentinels translated to `phase=agent-step name=<...>`, cargo/clippy/test markers, and compiler errors — so you see real activity, not just the 60s heartbeat), and exits 0 the moment the orchestrator writes its `phase=launcher-exit` sentinel. Use:
-
-      ```bash
-      python3 ~/.claude/scripts/clean-fix/style-fix-monitor.py <project>
-      ```
-
-      The previous `tail -F | awk` pipeline used `system("pkill -f …")` to terminate the tail at launcher-exit, but inside the Claude Code sandbox `pkill` is denied access to macOS's `sysmond` process-list service and silently fails (exit 3, "Cannot get process list"). Job-control via `&` / `$!` is also broken in the sandbox, so capturing the tail's PID isn't an option either. The Python helper avoids both: no `tail` subprocess, no `pkill`, no shell job-control — just file reads and a regex match in the same process. The Monitor's last event is `phase=launcher-exit code=N` and the helper exits within ~1s — no manual TaskStop needed.
+   b. In the same response, invoke `/clean_fix` (the `clean_fix` skill) with arguments `monitor ${LOG_PATH} $(basename "$ARGUMENTS")`. For `style-fix-manual-*.log` paths it arms the sandbox-safe Python helper (`style-fix-monitor.py`) and owns the event-to-update mapping — follow its <StyleFixManualEvents/> reporting.
 
 4. Tell the user once: "fix running, log: `<path>`. I'll surface phases as they arrive and post a final summary when codex finishes." Then **yield** — do not sleep, do not poll, do not re-read the log yourself.
 
-5. As Monitor events arrive, emit one short line per event:
-   - `[progress …] phase=worktree-ready` → `worktree ready`
-   - `phase=agent-launch …` → `agent launched (codex pid <pid>)`
-   - `phase=agent-running elapsed=Ns` → `agent running Ns` (skip if Fix Summary is already detected)
-   - `phase=agent-step name=<name>` → `agent step: <name>` (these are the phase sentinels codex prints inside the prompt — `read-evaluation`, `apply-finding`, `cargo-mend-preview`, `clippy-preview`, `tests`, `fmt`, `write-fix-summary`, etc.)
-   - `phase=agent-fix-summary-detected …` → `Fix Summary detected`
-   - `phase=agent-exit code=N` → `agent exited code=N`
-   - `phase=already-applied …` → `already-applied (retry detected finished worktree)`
-   - `phase=launcher-exit code=N` → `launcher exited code=N` (this is also the Monitor's last event; the awk filter terminates here)
-   - cargo/clippy/test/error/warning lines → echo verbatim; they're already short
-   - Skip `worktree-create` if immediately followed by `worktree-ready` to keep chatter low.
-
-6. When the harness delivers the `run_in_background` completion event for the launcher (the `exec`'d `style-fix-worktrees.sh` returned), the Monitor will already have terminated on its own via the `phase=launcher-exit` sentinel. If for any reason it has not (e.g. the trap did not fire), call `TaskStop` on the Monitor's task id. Then read `/private/tmp/claude/style_fix_<project>_evaluation.md`'s `## Fix Summary` section plus the tail of the manual log. Post a final summary covering: applied/skipped/proposed findings, `cargo mend` status, clippy status, and any `commit-style-results: skipped` notice. If the final progress phase was `failed`, surface the `reason=` value first.
+5. When the harness delivers the `run_in_background` completion event for the launcher (the `exec`'d `style-fix-worktrees.sh` returned), the Monitor will already have terminated on its own via the `phase=launcher-exit` sentinel. If for any reason it has not (e.g. the trap did not fire), call `TaskStop` on the Monitor's task id. Then read `/private/tmp/claude/style_fix_<project>_evaluation.md`'s `## Fix Summary` section plus the tail of the manual log. Post a final summary covering: applied/skipped/proposed findings, `cargo mend` status, clippy status, and any `commit-style-results: skipped` notice. If the final progress phase was `failed`, surface the `reason=` value first.

@@ -19,7 +19,6 @@ Analyzes your codebase against official Bevy migration guides using a two-pass p
 
 **EXECUTE THESE STEPS IN ORDER:**
 
-**STEP 0:** Execute <Persona/> to adopt the Principal Engineer persona
 **STEP 1:** Execute <ParseArguments/>
 **STEP 2:** Execute <CloneRepository/>
 **STEP 3:** Execute <DependencyCompatibilityCheck/>

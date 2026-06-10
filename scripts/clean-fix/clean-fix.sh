@@ -173,6 +173,6 @@ log "=== Clean-fix Rust clean + rebuild complete (${MINUTES}m ${SECS}s) ==="
 # Generate the clean-fix report via Claude CLI
 REPORT_FILE="/tmp/clean-fix-report.txt"
 log "Generating clean-fix report..."
-claude --print --dangerously-skip-permissions --settings '{"sandbox":{"enabled":false}}' -- "$(sed 's/\$ARGUMENTS/rebuild/g' "$HOME/.claude/commands/clean_fix_report.md")" > "$REPORT_FILE" 2>> "$LOG_FILE" || {
+claude --print --dangerously-skip-permissions --settings '{"sandbox":{"enabled":false}}' -- "$(sed 's/\$ARGUMENTS/rebuild/g' "$HOME/.claude/scripts/clean-fix/report-render.md")" > "$REPORT_FILE" 2>> "$LOG_FILE" || {
     log "WARNING: failed to generate clean-fix report"
 }

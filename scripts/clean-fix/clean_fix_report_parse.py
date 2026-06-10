@@ -4,7 +4,7 @@
 Modes:
   default                   Full report parse of one log (newest if no path).
   --list                    Enumerate logs in ~/.local/logs/clean-fix/ with summaries.
-  --phase-detect <log>      Emit the currently-running phase (for /monitor_clean_fix).
+  --phase-detect <log>      Emit the currently-running phase (for /clean_fix monitor).
   --filter-regex            Print the live-monitor filter regex (single source of truth).
 
 Output is line-oriented, key=value style. Consumers (slash commands, Claude)
@@ -29,7 +29,7 @@ PENDING_DIR = HISTORY_DIR / ".pending"
 
 # Single source of truth for the live-monitor filter regex.
 # Kept identical in spirit to the alternation that previously lived in
-# commands/monitor_clean_fix.md so /monitor_clean_fix can consume it via --filter-regex.
+# commands/clean_fix.md so /clean_fix monitor can consume it via --filter-regex.
 MONITOR_FILTER_REGEX = (
     r"(^|[[:space:]])(CLEAN|BUILD|MEND|DONE|ERROR|WARNING|TIMEOUT|RETRY|RETRY OK|RETRY FAILED|FAILED|WARN|OK|AUTOFINALIZE):"
     r"|(^|[[:space:]])WARMUP (OK|FAIL|SKIP):"
@@ -1036,7 +1036,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     _ = parser.add_argument("path", nargs="?", help="log path; default = newest in ~/.local/logs/clean-fix/")
     _ = parser.add_argument("--list", action="store_true", help="list available logs with summaries")
-    _ = parser.add_argument("--phase-detect", metavar="LOG", help="detect current phase of a log (for /monitor_clean_fix)")
+    _ = parser.add_argument("--phase-detect", metavar="LOG", help="detect current phase of a log (for /clean_fix monitor)")
     _ = parser.add_argument("--filter-regex", action="store_true", help="print live-monitor filter regex")
     args = parser.parse_args()
 

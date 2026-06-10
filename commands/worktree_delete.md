@@ -63,10 +63,6 @@ Update each todo status to "in_progress" when starting that step, and "completed
     - If has_unpushed is true with unpushed_count > 0, WARN user they'll be lost and ask for confirmation
 </CheckUnpushedCommits>
 
-<VerifyGitRepository>
-    - Handled by discover_worktrees.sh — if not in a git repo, the script reports an error
-</VerifyGitRepository>
-
 <GetFinalConfirmation>
     - Display summary of what will be deleted:
       - Worktree path
