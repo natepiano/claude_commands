@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.natemccoy.style-fix</string>
+    <!-- Style scope: fires every StartInterval seconds with no idle gate so
+         the style eval/review/fix queue stays full. The trigger's pgrep
+         guard skips the firing if any clean-fix.sh run (style OR the nightly
+         clean job) is still in flight. The nightly cargo clean/rebuild lives
+         in com.natemccoy.cargo-clean.plist. -->
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>/Users/natemccoy/.claude/scripts/clean-fix/clean-fix-trigger.sh</string>
+        <string>style</string>
+    </array>
+    <key>StartInterval</key>
+    <integer>600</integer>
+    <key>StandardOutPath</key>
+    <string>/tmp/style-fix-stdout.log</string>
+    <key>StandardErrorPath</key>
+    <string>/tmp/style-fix-stderr.log</string>
+</dict>
+</plist>

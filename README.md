@@ -1,36 +1,37 @@
 # Claude Commands
 
-Custom /command prompres for Claude Code.
+Custom /command prompts, hooks, and scripts for Claude Code.
 
-Try it out and let me know if you like it or have suggestions to change it.
-
-I iterate on these almost every day to get them to work right for me - feel free to make Suggestions, or create a PR!
-
+I iterate on these almost every day to get them to work right for me - feel free to make suggestions, or create a PR!
 
 ## Key Components
 
-### Review Commands
-- **code_review** - Review code changes (commits, tags, diffs)
-- **design_review** - Evaluate implementation plans
-- **alignment_review** - Verify implementation matches plans
+### Style Enforcement
+- **rust_style / local_style / succinct_style** - Load shared and repo-local style guides
+- **style_eval / focused_eval / style_fix_review** - Evaluate code against the style guide and review fixes
 
-there is some rust specific stuff in the reviews so if you try this out you may want to change some of that to suit your specific use case as I haven't yet devised how to swap out "language support". It's totally doable I just haven't gotten around to it yet.
-### Development Tools
-- **make_a_plan** - Generate implementation plans
-- **commit_prep** - Prepare git commits
-- **clippy** - Run Rust linting
+### Clean-Fix Automation
+- **clean_fix** - Pipeline that evaluates and fixes style across projects; runs on a launchd schedule (`scripts/clean-fix/`)
 
-### Automation
-- **post-tool-use-cargo-check.sh** - Auto-runs cargo check on Rust edits
-- **post-tool-use-random-ack.sh** - Random acknowledgements - ymmv
+### Review & Planning
+- **module_review** - Multi-agent module-structure evaluation
+- **adhoc_review / phase_review / team_review** - Walk findings with the user, retrospect plan phases
+- **ask_a_friend** - Get a second opinion from codex
+
+### Release & CI
+- **release** - Unified release pipeline (version bump, changelog, publish, GitHub release)
+- **validate_and_push** - Local CI validation, push, and CI monitoring
 
 ### Worktree Management
-- **make_a_worktree** - Create git worktrees
-- **delete_a_worktree** - Clean it up
-- **pr_from_worktree** - Create PRs from it
+- **make_a_worktree / worktree_delete** - Create and clean up git worktrees
+- **pr_from_branch / merge_branch** - PRs and safe merges
+
+### Hooks (`scripts/hooks/`)
+- Auto cargo check on Rust edits, basedpyright on Python edits
+- Random acknowledgements - ymmv
 
 ## Configuration
-- `settings.json` - my hook configurations and preferences
+- `settings.json` - hooks, permissions, sandbox config
 
 ## Finally
-There's more stuff you can check out. Try it out in a project branch. I use this as my "User" level with Claude - in the ~/.claude directory and probably if you like any of it you should pick and choose what you push to your user level - as Claude makes that available in every project.
+There's more stuff you can check out. I use this as my "User" level config in ~/.claude - pick and choose what you adopt, since Claude makes it available in every project. Some of it is Rust-specific; swap that out to suit your use case.

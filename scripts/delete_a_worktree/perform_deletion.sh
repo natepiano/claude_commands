@@ -45,3 +45,22 @@ if ! git branch -D "$BRANCH_NAME"; then
     exit 1
 fi
 echo "Branch deleted."
+
+# A <project>_style_fix worktree carries a clean-fix pending JSON in
+# fixed_findings state. The history row is already recorded by finalize-fix;
+# the pending file is the only leftover, and while it exists every clean-fix
+# run skips the project. Remove it here so the cycle can restart.
+WORKTREE_NAME="$(basename "$WORKTREE_PATH")"
+if [[ "$WORKTREE_NAME" == *_style_fix ]]; then
+    PROJECT="${WORKTREE_NAME%_style_fix}"
+    HISTORY_HELPER="$HOME/.claude/scripts/clean-fix/style_history.py"
+    if [[ -f "$HISTORY_HELPER" ]]; then
+        echo ""
+        echo "Style-fix worktree deleted — discarding clean-fix pending state for: $PROJECT"
+        if python3 "$HISTORY_HELPER" discard-pending --project "$PROJECT"; then
+            echo "Pending state discarded."
+        else
+            echo "Warning: discard-pending failed for $PROJECT — clean-fix will keep skipping it until ~/rust/nate_style/.history/.pending/$PROJECT.json is removed."
+        fi
+    fi
+fi

@@ -8,21 +8,25 @@ description: Unified clean-fix command — run the pipeline (one project or all)
 
 | Subcommand | Purpose |
 |---|---|
-| `run [project]` | Launch the full pipeline (all projects), or eval + fix for one project |
+| `run [clean \| style \| all \| project]` | Launch a pipeline scope (default all), or eval + fix for one project |
 | `monitor [log-path] [project]` | Attach a live Monitor to a running clean-fix log |
 | `report [list \| <path>]` | Render a per-project status table from a run log |
-| `mode [off \| claude \| codex \| on]` | Show or set the style agent mode |
+| `mode [eval \| fix] [off \| claude \| codex \| on \| inherit]` | Show or set the eval/fix style agent modes |
 | `skip clean\|style [...]` | Skip or re-enable targets for the clean or style pass |
 
 Dispatch: `run` → <Run/>, `monitor` → <Monitor/>, `report` → <Report/>, `mode` → <Mode/>, `skip` → <Skip/>. Empty or unrecognized first token → print the table above and stop.
 
 <Run>
 
-## run [project]
+## run [clean | style | all | project]
 
-### `run` or `run all` — full pipeline
+### `run`, `run all`, `run clean`, `run style` — pipeline scopes
 
-Launch `~/.claude/scripts/clean-fix/clean-fix.sh` interactively, off the launchd schedule, so the user can test the full pipeline (clean + build + warmup + eval + review + fix) end-to-end.
+Launch `~/.claude/scripts/clean-fix/clean-fix.sh <scope>` interactively, off the launchd schedule. Scopes:
+
+- `all` (or no token) — full pipeline: clean + build + warmup + eval + review + fix
+- `clean` — clean + build + mend + warmup only (the nightly 4 AM job's scope)
+- `style` — eval + review + fix worktrees only (the every-10-min job's scope)
 
 **Hard requirement: must run unsandboxed.** The script invokes `codex` and `claude`, which need write access to `~/.codex/sessions` and to many paths outside the sandbox allowlist. Per `~/.claude/CLAUDE.md` ("codex and clean-fix style scripts must run unsandboxed"), **always** invoke this with `dangerouslyDisableSandbox: true` from the start. Do not try the sandboxed run first — it will fail.
 
@@ -37,7 +41,7 @@ If anything matches, tell the user `Clean-fix already running (PID …). Use /cl
 **Step 2: Launch.** The orchestrator writes its own timestamped log under `~/.local/logs/clean-fix/clean-fix-YYYYMMDD-HHMMSS.log` and updates the `~/.local/logs/clean-fix.log` symlink to point at it. Don't pre-create or redirect — just launch:
 
 ```bash
-~/.claude/scripts/clean-fix/clean-fix.sh
+~/.claude/scripts/clean-fix/clean-fix.sh <scope>
 ```
 
 Use `Bash` with `dangerouslyDisableSandbox: true` and `run_in_background: true`. Capture the resulting bash shell id so the user can kill it later with `KillShell` if needed. After launch, resolve the active log path:
@@ -86,7 +90,8 @@ Inspect the well-known log locations and pick the one most recently modified wit
 
 ```bash
 ls -lt --time=mtime \
-  /tmp/clean-fix-stdout.log \
+  /tmp/style-fix-stdout.log \
+  /tmp/cargo-clean-stdout.log \
   ~/.local/logs/clean-fix.log \
   ~/.local/logs/clean-fix/style-fix-manual-*.log \
   /tmp/claude/style-fix-*.log \
@@ -179,7 +184,7 @@ For Monitors armed with `style-fix-monitor.py`, emit one short line per event:
 
 ### Monitor notes
 
-- The orchestrator script `clean-fix.sh` writes both to `~/.local/logs/clean-fix.log` (via `tee`) and via the launchd plist to `/tmp/clean-fix-stdout.log`. Either is valid; <DetectLog/> will prefer whichever is freshest.
+- The orchestrator script `clean-fix.sh` writes both to `~/.local/logs/clean-fix.log` (via `tee`) and via the launchd plists to `/tmp/style-fix-stdout.log` (`com.natemccoy.style-fix`, every 10 min) or `/tmp/cargo-clean-stdout.log` (`com.natemccoy.cargo-clean`, nightly 4 AM). Any is valid; <DetectLog/> will prefer whichever is freshest.
 - Standalone runs of `style-eval-all.sh` or `style-fix-worktrees.sh` invoked interactively typically log to `/tmp/claude/<name>-<suffix>.log`. The detector pattern globs match those.
 - The Monitor uses `tail -F -n 0` so we start at the current end of the file — backlog is not re-emitted. If the user wants a recap of what already ran, point them at <ArmMonitor/>'s `tail -30` output instead.
 - `grep --line-buffered` is required — without it, pipe buffering delays events by minutes and the monitor looks broken.
@@ -196,21 +201,27 @@ Read `~/.claude/scripts/clean-fix/report-render.md` and follow it, substituting 
 
 <Mode>
 
-## mode [off | claude | codex | on]
+## mode [eval | fix] [off | claude | codex | on | inherit]
 
-Set the clean-fix style agent mode.
+Show or set the clean-fix style agent modes.
 
-The config file is `~/.claude/scripts/clean-fix/clean-fix.conf`. The `[style_eval]` section has a `mode=off`, `mode=claude`, or `mode=codex` line.
+The config file is `~/.claude/scripts/clean-fix/clean-fix.conf`. Two agents are configurable:
 
-1. Read `~/.claude/scripts/clean-fix/clean-fix.conf`
-2. Determine current state from the `mode=` line under `[style_eval]`
-3. Based on the remaining token:
-   - **`claude`**: Set `mode=claude`.
-   - **`codex`**: Set `mode=codex`.
-   - **`off`**: Set `mode=off`.
-   - **`on`**: Set `mode=claude`.
-   - **empty or anything else**: Show the current mode.
-4. When changing the value, use the Edit tool to update the `mode=` line in-place. Only touch that line — the `[build]` and `[targets]` skip lists are managed by `phase_skip.py` (see <Skip/>), never by direct edits.
+- **eval** — the `mode=` line under `[style_eval]`. Drives the eval and review stages. `mode=off` is the master off switch for the whole style pipeline (including fix).
+- **fix** — the `mode=` line under `[style_fix]`. Drives the fix-worktree agents. When absent or commented out, the fix stage inherits the eval mode.
+
+Argument handling:
+
+1. Read `~/.claude/scripts/clean-fix/clean-fix.conf`.
+2. **No tokens** — show both: the eval mode, the fix mode (or "inherits eval → <mode>"), and each section's `model=` if set. Stop.
+3. **First token is `eval` or `fix`** — the scope; the next token is the value:
+   - **`claude`** / **`codex`**: set that scope's `mode=` line.
+   - **`off`**: eval scope only — set `mode=off` (master switch). For the fix scope, explain that off is controlled by the eval mode and stop.
+   - **`on`**: set `mode=claude`.
+   - **`inherit`**: fix scope only — comment out the `[style_fix]` `mode=` line so fix inherits eval.
+   - **empty**: show that scope's current mode.
+4. **First token is a bare value** (`off`/`claude`/`codex`/`on`) — one agent everywhere: apply it to the **eval** scope as in step 3 AND reset the fix scope to inherit (comment out the `[style_fix]` `mode=` line).
+5. When changing a value, use the Edit tool on that `mode=` line in-place (uncomment `#mode=` under `[style_fix]` when setting the fix scope). Only touch mode lines — the `[build]` and `[targets]` skip lists are managed by `phase_skip.py` (see <Skip/>), never by direct edits.
 
 </Mode>
 

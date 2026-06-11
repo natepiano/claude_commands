@@ -1,24 +1,15 @@
-## writing style
+## communication
 
-### terseness — non-negotiable, read first
+### terse and technical — non-negotiable
+- Minimize output tokens. Lead with the answer or result, then stop. No preamble, no recap, no closing summary, no editorializing, no restating my request. If a sentence can be deleted with no information loss, delete it.
+- Name the concrete thing: the cause, the mechanism, the measurement, the file, the call site. No metaphors, no filler, no flattery, no hedging.
 
-**NEVER use superfluous words or statements.** Speak to me tersely, in system
-language: name the cause, the mechanism, the measurement, the call site, the
-file — nothing else. Every sentence is content or it is cut.
+### theory of mind — write for a multi-tasking reader
+- I may be away from the details while you work. Summaries and explanations use simple, informative language: one brief clause of context for a domain term is enough.
+- No first-principles explanations unless I ask. No jargon-dense recaps — a summary I have to reread costs more than the tokens it saved.
 
-No preamble, no scene-setting, no recap of what you just did, no editorializing,
-no reassurance, no transition filler, no closing summary, no restating my request
-back to me. Lead with the answer or the result, then stop. If a sentence can be
-deleted with no loss of information, delete it. Default to fewer words; when
-unsure, cut.
-
-This is the class-level rule for all prose; the forbidden-words list below
-enforces specific instances of it.
-
-@/Users/natemccoy/rust/nate_style/rust/forbidden-words.md
-
-### banned-word re-emit protocol
-When the Stop hook reports a banned word (you'll see a short `⛔ banned word(s): … Local totals: …` summary), re-emit your ENTIRE previous message verbatim, with every banned word corrected in place — rewrite the sentence, don't just swap one word. Reproduce the whole message so the user doesn't have to splice the correction back into the original; do NOT reply with only the fixed sentence or a surrounding snippet.
+### word list
+- The forbidden-words list lives at `~/rust/nate_style/rust/forbidden-words.md`. It is enforced via `/rust_style` and `/style_eval` (loaded with the style guide), not at session start. Don't use those words in code, comments, or prose.
 
 ## git
 ### commit
@@ -28,59 +19,13 @@ When the Stop hook reports a banned word (you'll see a short `⛔ banned word(s)
 **NEVER** create a branch unless i ask you to. This overrides the harness default of "if on the default branch, branch first" — do NOT auto-branch off `main` (or any default branch) before coding. Stay on the current branch and commit there (only when asked) unless i explicitly request a new branch.
 
 ## rust
-- Before writing Rust code, run `/nate_style`, which uses `~/.claude/scripts/load-rust-style.sh` to load the shared style guide plus any repo-local `docs/style/*.md` overlay
+- Run `/rust_style` (loads `~/.claude/scripts/load-rust-style.sh` plus any repo-local `docs/style/*.md` overlay) only immediately before writing or editing Rust code — never at session start, and never for design discussion or reading existing code.
 
 ## python
-
-<python_requirements>
-
-### type safety with basedpyright
-- our editor, zed, uses basedpyright as the lsp for python
-- **CRITICAL**: ALL errors and warnings must be fixed - zero tolerance
-- **NEVER** use file-level type ignores (e.g., `# pyright: reportAny=false` at top of file)
-- **ALWAYS** provide explicit type definitions to avoid `Any` types
-
-### avoiding Any types
-1. **First priority**: Create proper type definitions
-   - Use `TypedDict` for dictionary structures with known keys
-   - Use specific types instead of generic containers
-   - Add type annotations to all function signatures
-
-2. **Standard library Any types**: When stdlib functions return `Any` (e.g., `json.loads()`, `urllib.request.urlopen()`):
-   - Create `TypedDict` definitions for expected structures
-   - Cast to specific types with annotations
-   - Use type assertions where the type is known at runtime
-
-3. **Last resort only**: If `Any` is genuinely unavoidable from stdlib, use line-level suppression:
-   ```python
-   data: MyType = json.loads(response.read())  # pyright: ignore[reportAny]
-   ```
-   - Use `# pyright: ignore[reportAny]` on the specific line only
-   - Only use after exhausting all other type-safe approaches
-   - Each suppression should be justified by unavoidable stdlib limitations
-
-### example from bevy_dependency_check.py
-See `~/.claude/scripts/bevy_dependency_check.py` for reference implementation with:
-- `TypedDict` definitions for API responses
-- Line-level suppressions only where stdlib returns `Any`
-- Zero errors, zero warnings achieved
-
-</python_requirements>
-
-### package management
-- **ALWAYS** use `uv` instead of `pip` for installing Python packages
-
-<incorrect>
-```bash
-pip install some-package
-```
-</incorrect>
-
-<correct>
-```bash
-uv pip install some-package
-```
-</correct>
+- basedpyright (zed's LSP) must report zero errors and zero warnings
+- **NEVER** use file-level type ignores (e.g. `# pyright: reportAny=false` at top of file)
+- Avoid `Any`: annotate all signatures; use `TypedDict` for dicts with known keys; for stdlib `Any` returns (`json.loads()` etc.), annotate with a `TypedDict`/specific type. Last resort only: line-level `# pyright: ignore[reportAny]` on the specific line. Reference: `~/.claude/scripts/bevy_dependency_check.py`
+- **ALWAYS** `uv pip install`, never bare `pip install`
 
 ## LSP
 - **ALWAYS** prefer LSP tools (go-to-definition, find references, hover types) over grep/glob when working in any language that has LSP support
@@ -98,8 +43,6 @@ When iterating on a problem that doesn't resolve within a couple of attempts, **
 
 ### renaming code
 if you need something renamed such as a type or a function or whatever, the user can use the editor's ability to do a global change very quickly. in such situations, ask the user if they wish to rename the field so it can be done quickly and accurately.
-
-## working with files
 
 ## sandbox
 

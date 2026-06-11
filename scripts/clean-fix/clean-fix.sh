@@ -1,9 +1,21 @@
 #!/bin/bash
-# Clean-fix Rust clean + rebuild script
-# Cleans target directories and rebuilds to prevent incremental bloat
-# Runs via launchd at 4:00 AM
+# Clean-fix orchestrator.
+# Usage: clean-fix.sh [clean|style|all]   (default: all)
+#   clean — settings back-populate + cargo clean/build/mend + warmup
+#           (nightly via com.natemccoy.cargo-clean, 4:00 AM calendar)
+#   style — style eval + review + fix worktrees
+#           (every 10 min via com.natemccoy.style-fix, no idle gate)
+#   all   — both, in order (manual /clean_fix run)
+# The launchd triggers share one pgrep guard on this script's path, so the
+# two scopes never run concurrently.
 
 set -euo pipefail
+
+SCOPE="${1:-all}"
+case "$SCOPE" in
+    clean|style|all) ;;
+    *) echo "Usage: clean-fix.sh [clean|style|all]"; exit 1 ;;
+esac
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 RUST_DIR="$HOME/rust"
@@ -19,6 +31,9 @@ export SCCACHE_CACHE_SIZE="30G"
 
 mkdir -p "$LOG_DIR"
 mkdir -p "$TIMESTAMP_DIR"
+# The style scope runs every 10 minutes around the clock — prune run logs
+# older than 3 days so the log dir doesn't accumulate hundreds of files.
+find "$LOG_DIR" -name 'clean-fix-*.log' -mtime +3 -delete 2>/dev/null || true
 > "$LOG_FILE"
 # Maintain legacy single-file path as a symlink to the latest run so existing
 # tooling and the launchd plist stdout sink keep working.
@@ -79,14 +94,16 @@ if [[ -f "$CONF_FILE" ]]; then
 fi
 
 START_TIME=$SECONDS
-log "=== Starting clean-fix Rust clean + rebuild ==="
+log "=== Starting clean-fix (scope: $SCOPE) ==="
 
-# Back-populate canonical settings.local.json permissions
+# Back-populate canonical settings.local.json permissions. Runs in every scope:
+# the style-fix agents depend on these permissions and the script is cheap.
 log "SETTINGS: back-populating canonical permissions..."
 python3 "$SCRIPT_DIR/backpopulate_settings.py" --apply >> "$LOG_FILE" 2>&1 || {
     log "WARNING: settings back-population failed"
 }
 
+if [[ "$SCOPE" != "style" ]]; then
 # Guard so set -u doesn't trip on an empty allowlist expansion.
 if [[ ${#BUILD_TARGETS[@]} -eq 0 ]]; then
     log "No [build] targets configured — skipping clean/build pass."
@@ -141,9 +158,10 @@ done
 "$SCRIPT_DIR/clean-fix-warmup.sh" 2>&1 | tee -a "$LOG_FILE" || {
     log "WARNING: warmup script failed"
 }
+fi  # SCOPE != style
 
 # Run style evaluations and fixes when the style mode is enabled
-if [[ "$STYLE_EVAL_MODE" != "off" ]]; then
+if [[ "$SCOPE" != "clean" && "$STYLE_EVAL_MODE" != "off" ]]; then
     log "Starting style evaluations with $STYLE_EVAL_MODE..."
     "$SCRIPT_DIR/style-eval-all.sh" 2>&1 | tee -a "$LOG_FILE" || {
         log "WARNING: style evaluation script failed"
@@ -161,6 +179,8 @@ if [[ "$STYLE_EVAL_MODE" != "off" ]]; then
     "$SCRIPT_DIR/style-fix-worktrees.sh" 2>&1 | tee -a "$LOG_FILE" || {
         log "WARNING: style-fix worktree script failed"
     }
+elif [[ "$SCOPE" == "clean" ]]; then
+    log "SKIP: style scope not selected"
 else
     log "SKIP: style evaluations disabled in clean-fix.conf"
 fi
@@ -170,9 +190,16 @@ MINUTES=$(( ELAPSED / 60 ))
 SECS=$(( ELAPSED % 60 ))
 log "=== Clean-fix Rust clean + rebuild complete (${MINUTES}m ${SECS}s) ==="
 
-# Generate the clean-fix report via Claude CLI
+# Generate the clean-fix report via Claude CLI — but only when the run did
+# something. The style scope fires every 10 minutes; an all-SKIP cycle has no
+# OK/FAILED/CLEAN/BUILD lines and a headless claude call per idle cycle is
+# pure cost.
 REPORT_FILE="/tmp/clean-fix-report.txt"
-log "Generating clean-fix report..."
-claude --print --dangerously-skip-permissions --settings '{"sandbox":{"enabled":false}}' -- "$(sed 's/\$ARGUMENTS/rebuild/g' "$HOME/.claude/scripts/clean-fix/report-render.md")" > "$REPORT_FILE" 2>> "$LOG_FILE" || {
-    log "WARNING: failed to generate clean-fix report"
-}
+if grep -qE '(^|[[:space:]])(OK|FAILED|ERROR|TIMEOUT|RECOVERED|Launched|CLEAN|BUILD|MEND):' "$LOG_FILE"; then
+    log "Generating clean-fix report..."
+    claude --print --dangerously-skip-permissions --settings '{"sandbox":{"enabled":false}}' -- "$(sed 's/\$ARGUMENTS/rebuild/g' "$HOME/.claude/scripts/clean-fix/report-render.md")" > "$REPORT_FILE" 2>> "$LOG_FILE" || {
+        log "WARNING: failed to generate clean-fix report"
+    }
+else
+    log "Report skipped (no per-project activity this run)."
+fi

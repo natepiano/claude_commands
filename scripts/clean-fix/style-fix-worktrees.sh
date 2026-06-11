@@ -37,6 +37,8 @@ HISTORY_HELPER="$SCRIPT_DIR/style_history.py"
 LOG_DIR="/private/tmp/claude"
 SINGLE_PROJECT="${1:-}"
 STYLE_AGENT_MODE="claude"
+STYLE_FIX_MODE=""
+STYLE_FIX_MODEL=""
 CODEX_BIN="${CODEX_BIN:-$HOME/.nvm/versions/node/v20.19.1/bin/codex}"
 
 mkdir -p "$LOG_DIR"
@@ -150,6 +152,10 @@ if [[ -f "$CONF_FILE" ]]; then
                     POST_SUMMARY_GRACE_SECS="${BASH_REMATCH[1]}"
                 elif [[ "$stripped" =~ ^heartbeat_interval_secs=([0-9]+)$ ]]; then
                     HEARTBEAT_INTERVAL_SECS="${BASH_REMATCH[1]}"
+                elif [[ "$stripped" =~ ^mode=(.+)$ ]]; then
+                    STYLE_FIX_MODE="${BASH_REMATCH[1]}"
+                elif [[ "$stripped" =~ ^model=(.+)$ ]]; then
+                    STYLE_FIX_MODEL="${BASH_REMATCH[1]}"
                 fi
                 ;;
         esac
@@ -167,6 +173,15 @@ fi
 : "${POST_SUMMARY_GRACE_SECS:=600}"
 : "${HEARTBEAT_INTERVAL_SECS:=60}"
 
+# Fix agent override: [style_fix] mode=/model= select the fix agent
+# independently of the eval/review agent. Unset keys inherit [style_eval].
+# The off-check below runs on the inherited value first — [style_eval]
+# mode=off is the master off switch and disables the fix stage even when
+# [style_fix] mode is set.
+if [[ "$STYLE_AGENT_MODE" != "off" && -n "$STYLE_FIX_MODE" ]]; then
+    STYLE_AGENT_MODE="$STYLE_FIX_MODE"
+fi
+
 run_style_agent() {
     local project_root="$1"
     local prompt="$2"
@@ -175,11 +190,22 @@ run_style_agent() {
 
     case "$STYLE_AGENT_MODE" in
         claude)
-            claude --print --dangerously-skip-permissions --settings '{"sandbox":{"enabled":false}}' -- "$final_prompt" > "$log_file" 2>&1
+            local claude_args=()
+            if [[ -n "$STYLE_FIX_MODEL" ]]; then
+                claude_args+=("--model" "$STYLE_FIX_MODEL")
+            fi
+            claude --print --dangerously-skip-permissions --settings '{"sandbox":{"enabled":false}}' \
+                ${claude_args[@]+"${claude_args[@]}"} \
+                -- "$final_prompt" > "$log_file" 2>&1
             ;;
         codex)
             final_prompt=$'IMPORTANT: Do NOT spawn sub-agents, delegate, or parallelize through helper agents. Complete this fix pass yourself in a single agent run.\nIMPORTANT: Do NOT create, replace, repair, or symlink the workspace path or any parent/peer repo path. If the expected workspace path is missing or invalid, fail and report it instead of trying to reconstruct it.\n\n'"$prompt"
+            local codex_args=()
+            if [[ -n "$STYLE_FIX_MODEL" ]]; then
+                codex_args+=("-m" "$STYLE_FIX_MODEL")
+            fi
             "$CODEX_BIN" exec \
+                ${codex_args[@]+"${codex_args[@]}"} \
                 -c model_reasoning_effort='"high"' \
                 --ephemeral \
                 --dangerously-bypass-approvals-and-sandbox \

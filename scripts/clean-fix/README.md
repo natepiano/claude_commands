@@ -10,10 +10,11 @@ Runs daily at **4:00 AM** via launchd.
 
 | File | Purpose |
 |------|---------|
-| `clean-fix.sh` | Main entry point. For each `[build]` target: clean, build, mend. Then runs style eval + style-fix if the style mode is not `off`. Generates the clean-fix report at the end. |
+| `clean-fix.sh` | Main entry point. Takes a scope: `clean` (settings back-populate + clean/build/mend + warmup), `style` (eval + review + fix), or `all` (default, both). Generates the clean-fix report at the end when the run did per-project work. |
 | `clean-fix.conf` | Configuration. Two opt-in allowlists: `[build]` (clean/build/mend) and `[targets]` (style eval/review/fix). Plus style eval settings (`mode`, `max_new_findings`) and warmup targets. No deny list — nothing runs unless listed. |
-| `com.natemccoy.clean-fix.plist` | launchd plist — schedules the clean-fix job at 4:00 AM. |
-| `setup.sh` | Idempotent setup script — installs the launchd agent, creates runtime directories. |
+| `com.natemccoy.style-fix.plist` | launchd plist — runs the style scope every 10 minutes (no idle gate). |
+| `com.natemccoy.cargo-clean.plist` | launchd plist — runs the clean scope nightly at 4:00 AM (idle-gated). |
+| `setup.sh` | Idempotent setup script — installs both launchd agents, creates runtime directories, retires the old pre-split agent. |
 
 ### Style Evaluation
 
@@ -100,17 +101,19 @@ To modify the diagram, edit `clean-fix-style-flow.dot` and re-run `python3 rende
 ## Pipeline flow
 
 ```
-Clean-fix Build (4:00 AM)
+cargo-clean job (nightly 4:00 AM, idle-gated) — clean-fix.sh clean
   │
-  ├─ Phase 1: Clean + Rebuild (per project, sequential)
-  │    cargo clean → cargo build → cargo clippy → warmup
+  └─ Clean + Rebuild (per project, sequential)
+       cargo clean → cargo build → cargo mend → warmup
+
+style-fix job (every 10 min, no idle gate) — clean-fix.sh style
   │
-  ├─ Phase 2: Style Evaluation (per project, parallel)
+  ├─ Phase 1: Style Evaluation (per project, parallel)
   │    Load style guide → survey code → carry forward valid findings
   │    → skip any project with pending findings or a _style_fix worktree
   │    → find new violations → store pending evaluation markdown
   │
-  ├─ Phase 3: Style-Fix Worktrees (per project, parallel)
+  ├─ Phase 2: Style-Fix Worktrees (per project, parallel)
   │    Create _style_fix worktree (other linked worktrees allowed if primary is clean)
   │    → export pending evaluation markdown to scratch storage
   │    → Configured style agent applies fixes, runs clippy/tests/style review

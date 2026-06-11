@@ -1,0 +1,31 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.natemccoy.cargo-clean</string>
+    <!-- Clean scope: nightly cargo clean/build/mend + warmup at 4:00 AM.
+         launchd coalesces a missed firing (machine asleep) onto the next
+         wake; post-sleep HID idle is hours, so the trigger's 1-hour idle
+         gate passes and the clean still runs the morning after. If the user
+         is typing at 4 AM, the gate skips that night. The style pipeline
+         lives in com.natemccoy.style-fix.plist. -->
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>/Users/natemccoy/.claude/scripts/clean-fix/clean-fix-trigger.sh</string>
+        <string>clean</string>
+    </array>
+    <key>StartCalendarInterval</key>
+    <dict>
+        <key>Hour</key>
+        <integer>4</integer>
+        <key>Minute</key>
+        <integer>0</integer>
+    </dict>
+    <key>StandardOutPath</key>
+    <string>/tmp/cargo-clean-stdout.log</string>
+    <key>StandardErrorPath</key>
+    <string>/tmp/cargo-clean-stderr.log</string>
+</dict>
+</plist>
