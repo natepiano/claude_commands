@@ -16,6 +16,5 @@ Available flags:
 - `--since 30d` — filter by time window (e.g. 30d, 2w, 6m)
 - `--project foo` — filter by project name
 - `--latest-run` — show the latest recorded run with exact reviewed guideline outcomes
-- `--generate` — write `style_report.md`
 
 If `$ARGUMENTS` is empty, run with no flags (all projects, all time).

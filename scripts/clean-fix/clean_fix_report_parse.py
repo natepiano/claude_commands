@@ -35,8 +35,6 @@ MONITOR_FILTER_REGEX = (
     r"|(^|[[:space:]])WARMUP (OK|FAIL|SKIP):"
     r"|(^|[[:space:]])Launched: "
     r"|^=== "
-    r"|(^|[[:space:]])commit-style-results: "
-    r"|^Wrote /Users/natemccoy/rust/nate_style/style_report\.md$"
 )
 
 PHASES: tuple[str, ...] = ("clean", "warmup", "eval", "review", "fix")
@@ -742,16 +740,6 @@ def parse_log(path: Path) -> ParseResult:
         if any("style-fix worktree script failed" in line for line in lines):
             result.status = "crashed"
             result.notes.append("style-fix script failed before per-project work")
-
-    # End-of-run heads-up signals worth surfacing.
-    for line in lines:
-        if "SKIP commit-style-results:" in line:
-            # The orchestrator left ~/rust/nate_style with uncommitted changes
-            # because some worktree fix failed. The user must review and commit
-            # (or discard) manually before the next run touches it.
-            after = line.split("SKIP commit-style-results:", 1)[1].strip()
-            result.notes.append(f"~/rust/nate_style left dirty: {after}")
-            break
 
     # Partial logs: only fix phase present (style-fix-manual logs).
     phases_present = [p for p in PHASES if result.stats[p].present]

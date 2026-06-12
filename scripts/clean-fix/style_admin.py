@@ -10,7 +10,6 @@ from pathlib import Path
 from typing import Any
 
 from style_history import HISTORY_DIR, NATE_STYLE_DIR
-from style_report import REPORT_FILE, build_blocked_view, build_coverage_view, build_style_summary, iter_rows, render_report
 
 RUST_STYLE_DIR = NATE_STYLE_DIR / "rust"
 
@@ -190,18 +189,6 @@ def update_markdown_wikilinks_for_delete(stem: str) -> int:
     return updated
 
 
-def regenerate_report() -> None:
-    rows = iter_rows(None, None)
-    REPORT_FILE.write_text(
-        render_report(
-            build_style_summary(rows),
-            build_coverage_view(None),
-            build_blocked_view(rows),
-            len(rows),
-        )
-    )
-
-
 def run_rename(old_name: str, new_name: str) -> None:
     old_name = resolve_source_name(old_name)
     new_name = ensure_md_suffix(new_name)
@@ -215,7 +202,6 @@ def run_rename(old_name: str, new_name: str) -> None:
     source.rename(target)
     history_files, entries_updated = update_history_for_rename(old_guideline_id, new_guideline_id)
     wikilink_files = update_markdown_wikilinks_for_rename(Path(old_name).stem, Path(new_name).stem)
-    regenerate_report()
 
     print(f"Renamed: {old_name} -> {new_name}")
     print(f".history files updated: {history_files}")
@@ -234,7 +220,6 @@ def run_delete(style_name: str) -> None:
     source.unlink()
     history_files, entries_removed, runs_removed = update_history_for_delete(guideline_id)
     wikilink_files = update_markdown_wikilinks_for_delete(stem)
-    regenerate_report()
 
     print(f"Deleted: {style_name}")
     print(f".history files updated: {history_files}")

@@ -54,22 +54,6 @@ progress() {
     printf '[progress %s] %s\n' "$proj" "$*"
 }
 
-finish_style_results() {
-    local failed_count="$1"
-
-    # style_report.md is NOT auto-generated here. Run `/style_usage --generate`
-    # ad-hoc to refresh it. Only the .history data is committed below.
-
-    # Commit the clean-fix history in ~/rust/nate_style after every pass,
-    # failures included: finalize-failure rows are history data, and the
-    # _style_fix worktrees (not nate_style) are the review surface. Skipping
-    # here used to let appends accumulate until the size guard wedged the repo.
-    if (( failed_count > 0 )); then
-        echo "WARNING: $failed_count worktree run(s) failed; failure rows committed to history, worktrees left for review"
-    fi
-    "$SCRIPT_DIR/commit-style-results.sh" 2>&1 || echo "WARNING: commit-style-results.sh failed"
-}
-
 # Validate that $dir is a real git-linked worktree of $repo, not just a leftover
 # directory. A directory with target/ but no .git linkage is
 # an orphan stub from a partially-failed cleanup — treating it as a worktree
@@ -382,7 +366,6 @@ done
 if [[ ${#eligible[@]} -eq 0 ]]; then
     echo "No projects eligible for style-fix worktrees."
     echo "=== Done: 0 created, 0 failed, $skipped skipped ==="
-    finish_style_results 0
     exit 0
 fi
 
@@ -968,5 +951,3 @@ echo "=== Done: $succeeded created, $failed failed, $skipped skipped out of $(($
 
 # Clean up per-run temp directory
 rm -rf "$RUN_DIR"
-
-finish_style_results "$failed"

@@ -12,9 +12,7 @@ from datetime import timezone
 from pathlib import Path
 from typing import Any
 
-from style_history import HISTORY_DIR, RUST_DIR, build_units, list_style_files, normalize_guideline_id, parse_frontmatter, resolve_project_root
-
-REPORT_FILE = RUST_DIR / "nate_style" / "style_report.md"
+from style_history import HISTORY_DIR, build_units, list_style_files, normalize_guideline_id, parse_frontmatter, resolve_project_root
 
 
 def parse_since(value: str) -> timedelta:
@@ -242,43 +240,6 @@ def build_run_views(rows: list[tuple[str, dict[str, Any]]]) -> list[dict[str, An
     return run_views
 
 
-def render_report(style_rows: list[dict[str, Any]], coverage_rows: list[dict[str, Any]], blocked_rows: list[dict[str, Any]], total_runs: int) -> str:
-    today = datetime.now(tz=timezone.utc).strftime("%Y-%m-%d")
-    timestamp = datetime.now(tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-    lines = [
-        "---",
-        f'date_created: "[[{today}]]"',
-        f'date_modified: "[[{today}]]"',
-        "tags:",
-        "  - report",
-        "  - style",
-        "---",
-        "# Style Report",
-        "## Style History",
-        "| Guideline | Projects | Fixed | Partial | Skipped | Fix Failed | No Findings | Last Seen |",
-        "|---|---|---|---|---|---|---|---|",
-    ]
-    for row in style_rows:
-        lines.append(
-            f"| {row['guideline_id']} | {len(row['projects'])} | {row['fixed']} | {row['partial']} | "
-            f"{row['skipped']} | {row['fix_failed']} | {row['no_findings']} | {str(row['last_seen'])[:16]} |"
-        )
-    if coverage_rows:
-        lines.extend(["", "## Review Coverage", "| Project | Guideline Units | Min Count | Max Count | Avg Count |", "|---|---|---|---|---|"])
-        for row in coverage_rows:
-            lines.append(
-                f"| {row['project']} | {row['guideline_units']} | {row['min_review_count']} | {row['max_review_count']} | {row['avg_review_count']} |"
-            )
-    if blocked_rows:
-        lines.extend(["", "## Blocked Items View", "| Project | Guideline | Review Count | Partial | Skipped | Fix Failed | Latest Reason |", "|---|---|---|---|---|---|---|"])
-        for row in blocked_rows:
-            lines.append(
-                f"| {row['project']} | {row['guideline_id']} | {row['review_count']} | {row['partial']} | {row['skipped']} | {row['fix_failed']} | {row['latest_reason']} |"
-            )
-    lines.extend(["", f"*Generated {timestamp} from {total_runs} recorded runs*", ""])
-    return "\n".join(lines)
-
-
 def print_run_views(run_views: list[dict[str, Any]]) -> None:
     for run in run_views:
         start_time = run.get("start_time") or "unknown"
@@ -314,7 +275,6 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--since")
     parser.add_argument("--project")
-    parser.add_argument("--generate", action="store_true")
     parser.add_argument("--latest-run", action="store_true")
     args = parser.parse_args()
 
@@ -324,11 +284,6 @@ def main() -> None:
     coverage_rows = build_coverage_view(args.project)
     blocked_rows = build_blocked_view(rows)
     run_views = build_run_views(rows)
-
-    if args.generate:
-        REPORT_FILE.write_text(render_report(style_rows, coverage_rows, blocked_rows, len(rows)))
-        print(f"Wrote {REPORT_FILE}")
-        return
 
     if args.latest_run:
         if args.project:

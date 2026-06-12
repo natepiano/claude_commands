@@ -10,7 +10,7 @@ Runs daily at **4:00 AM** via launchd.
 
 | File | Purpose |
 |------|---------|
-| `clean-fix.sh` | Main entry point. Takes a scope: `clean` (settings back-populate + clean/build/mend + warmup), `style` (eval + review + fix), or `all` (default, both). Generates the clean-fix report at the end when the run did per-project work. |
+| `clean-fix.sh` | Main entry point. Takes a scope: `clean` (settings back-populate + clean/build/mend + warmup), `style` (eval + review + fix), or `all` (default, both). Emits a clean-fix log that `/clean_fix report` can render on demand. |
 | `clean-fix.conf` | Configuration. Two opt-in allowlists: `[build]` (clean/build/mend) and `[targets]` (style eval/review/fix). Plus style agent settings (`enabled`, `agent`, `model`, `max_new_findings`) and warmup targets. No deny list — nothing runs unless listed. |
 | `agent-models.conf` | Allowed model names for each style agent. Any non-empty `model=` in `clean-fix.conf` must match the selected `agent=` section here. |
 | `agent_config.sh` | Shared Bash helpers for parsing booleans and validating `agent`/`model` combinations before scripts launch Claude or Codex. |
@@ -120,7 +120,7 @@ style-fix job (every 10 min, no idle gate) — clean-fix.sh style
   │    → export pending evaluation markdown to scratch storage
   │    → Configured style agent applies fixes, runs clippy/tests/style review
   │
-  └─ Generate Clean-fix Report
+  └─ Write clean-fix log for on-demand reports
 
 Post-clean-fix (manual):
   /style_fix_review → /merge_from_branch → /delete_a_worktree
@@ -132,7 +132,8 @@ The durable style-eval state is `~/rust/nate_style/.history/.pending/<project>.j
 while a project is waiting for review/fix. When style-fix writes `## Fix Summary`,
 that scratch markdown is saved back into the same pending JSON and the JSON
 stays in place until the `_style_fix` worktree is reviewed. History rows are
-still appended to `~/rust/nate_style/.history/<project>.jsonl` for reporting.
+appended to `~/rust/nate_style/.history/<project>.jsonl` for local reporting.
+The `.history/` directory is local operational state and is not committed.
 The JSON records:
 
 - `reviewable_unit_total`: how many style-guide units this run could check
