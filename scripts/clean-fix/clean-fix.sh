@@ -26,6 +26,7 @@ TIMESTAMP_DIR="$HOME/.local/state/clean-fix"
 CONF_FILE="$SCRIPT_DIR/clean-fix.conf"
 
 source "$HOME/.cargo/env"
+source "$SCRIPT_DIR/agent_config.sh"
 export PATH="/opt/homebrew/bin:$HOME/.local/bin:$PATH"
 export SCCACHE_CACHE_SIZE="30G"
 
@@ -62,13 +63,17 @@ project_env_for() {
 
 # Parse conf file. [build] is an opt-in allowlist of directories to clean/build.
 BUILD_TARGETS=()
-STYLE_EVAL_MODE=claude
+STYLE_EVAL_ENABLED=""
+STYLE_EVAL_AGENT=""
+STYLE_EVAL_MODEL=""
+STYLE_FIX_ENABLED=""
+STYLE_FIX_AGENT=""
+STYLE_FIX_MODEL=""
 if [[ -f "$CONF_FILE" ]]; then
     current_section=""
     while IFS= read -r line || [[ -n "$line" ]]; do
         stripped="${line%%#*}"
-        stripped="${stripped## }"
-        stripped="${stripped%% }"
+        stripped="$(cf_trim "$stripped")"
         [[ -z "$stripped" ]] && continue
         if [[ "$stripped" =~ ^\[(.+)\]$ ]]; then
             current_section="${BASH_REMATCH[1]}"
@@ -79,19 +84,47 @@ if [[ -f "$CONF_FILE" ]]; then
                 BUILD_TARGETS+=("$stripped")
                 ;;
             style_eval)
-                if [[ "$stripped" =~ ^mode=(.+)$ ]]; then
-                    STYLE_EVAL_MODE="${BASH_REMATCH[1]}"
+                if [[ "$stripped" =~ ^mode= ]]; then
+                    echo "ERROR: [style_eval] mode is no longer supported; use enabled=true|false and agent=claude|codex" >&2
+                    exit 1
                 elif [[ "$stripped" =~ ^enabled=(.+)$ ]]; then
-                    if [[ "${BASH_REMATCH[1]}" == "true" ]]; then
-                        STYLE_EVAL_MODE="claude"
-                    else
-                        STYLE_EVAL_MODE="off"
-                    fi
+                    cf_validate_bool "style_eval" "enabled" "${BASH_REMATCH[1]}" || exit 1
+                    STYLE_EVAL_ENABLED="${BASH_REMATCH[1]}"
+                elif [[ "$stripped" =~ ^agent=(.+)$ ]]; then
+                    STYLE_EVAL_AGENT="${BASH_REMATCH[1]}"
+                elif [[ "$stripped" =~ ^model=(.*)$ ]]; then
+                    STYLE_EVAL_MODEL="${BASH_REMATCH[1]}"
+                fi
+                ;;
+            style_fix)
+                if [[ "$stripped" =~ ^mode= ]]; then
+                    echo "ERROR: [style_fix] mode is no longer supported; use enabled=true|false and agent=claude|codex" >&2
+                    exit 1
+                elif [[ "$stripped" =~ ^enabled=(.+)$ ]]; then
+                    cf_validate_bool "style_fix" "enabled" "${BASH_REMATCH[1]}" || exit 1
+                    STYLE_FIX_ENABLED="${BASH_REMATCH[1]}"
+                elif [[ "$stripped" =~ ^agent=(.+)$ ]]; then
+                    STYLE_FIX_AGENT="${BASH_REMATCH[1]}"
+                elif [[ "$stripped" =~ ^model=(.*)$ ]]; then
+                    STYLE_FIX_MODEL="${BASH_REMATCH[1]}"
                 fi
                 ;;
         esac
     done < "$CONF_FILE"
 fi
+
+if [[ -z "$STYLE_EVAL_ENABLED" ]]; then
+    echo "ERROR: [style_eval] enabled must be set to true or false in $CONF_FILE" >&2
+    exit 1
+fi
+if [[ -z "$STYLE_FIX_ENABLED" ]]; then
+    echo "ERROR: [style_fix] enabled must be set to true or false in $CONF_FILE" >&2
+    exit 1
+fi
+cf_validate_agent "style_eval" "$STYLE_EVAL_AGENT" || exit 1
+cf_validate_model_for_agent "style_eval" "$STYLE_EVAL_AGENT" "$STYLE_EVAL_MODEL" || exit 1
+cf_validate_agent "style_fix" "$STYLE_FIX_AGENT" || exit 1
+cf_validate_model_for_agent "style_fix" "$STYLE_FIX_AGENT" "$STYLE_FIX_MODEL" || exit 1
 
 START_TIME=$SECONDS
 log "=== Starting clean-fix (scope: $SCOPE) ==="
@@ -160,29 +193,34 @@ done
 }
 fi  # SCOPE != style
 
-# Run style evaluations and fixes when the style mode is enabled
-if [[ "$SCOPE" != "clean" && "$STYLE_EVAL_MODE" != "off" ]]; then
-    log "Starting style evaluations with $STYLE_EVAL_MODE..."
-    "$SCRIPT_DIR/style-eval-all.sh" 2>&1 | tee -a "$LOG_FILE" || {
-        log "WARNING: style evaluation script failed"
-    }
+# Run style evaluations and fixes when their clean-fix.conf sections are enabled.
+if [[ "$SCOPE" != "clean" ]]; then
+    if [[ "$STYLE_EVAL_ENABLED" == "true" ]]; then
+        log "Starting style evaluations with $STYLE_EVAL_AGENT..."
+        "$SCRIPT_DIR/style-eval-all.sh" 2>&1 | tee -a "$LOG_FILE" || {
+            log "WARNING: style evaluation script failed"
+        }
 
-    # Review pass over each project's pending evaluation markdown before the fix stage spawns.
-    # Tightens, scopes, or removes findings the eval agent surfaced. Runs under
-    # the same agent as the eval stage (claude or codex per STYLE_EVAL_MODE).
-    log "Reviewing pending evaluation markdown ($STYLE_EVAL_MODE)..."
-    "$SCRIPT_DIR/style-eval-review-all.sh" 2>&1 | tee -a "$LOG_FILE" || {
-        log "WARNING: style eval review script failed"
-    }
+        # Review pass over each project's pending evaluation markdown before
+        # the fix stage spawns. Runs under the configured eval agent.
+        log "Reviewing pending evaluation markdown ($STYLE_EVAL_AGENT)..."
+        "$SCRIPT_DIR/style-eval-review-all.sh" 2>&1 | tee -a "$LOG_FILE" || {
+            log "WARNING: style eval review script failed"
+        }
+    else
+        log "SKIP: style eval/review disabled in clean-fix.conf"
+    fi
 
-    log "Creating style-fix worktrees..."
-    "$SCRIPT_DIR/style-fix-worktrees.sh" 2>&1 | tee -a "$LOG_FILE" || {
-        log "WARNING: style-fix worktree script failed"
-    }
+    if [[ "$STYLE_FIX_ENABLED" == "true" ]]; then
+        log "Creating style-fix worktrees with $STYLE_FIX_AGENT..."
+        "$SCRIPT_DIR/style-fix-worktrees.sh" 2>&1 | tee -a "$LOG_FILE" || {
+            log "WARNING: style-fix worktree script failed"
+        }
+    else
+        log "SKIP: style fix disabled in clean-fix.conf"
+    fi
 elif [[ "$SCOPE" == "clean" ]]; then
     log "SKIP: style scope not selected"
-else
-    log "SKIP: style evaluations disabled in clean-fix.conf"
 fi
 
 ELAPSED=$(( SECONDS - START_TIME ))

@@ -3,9 +3,9 @@
 # Runs after style-eval-all.sh and before style-fix-worktrees.sh in the
 # clean-fix pipeline.
 #
-# The review agent follows the [style_eval] mode in clean-fix.conf: claude
-# or codex (mode=off falls back to claude for standalone runs). The prompt lives
-# at style-eval-review-prompt.md in this directory — it is not a slash command.
+# The review agent follows the [style_eval] agent in clean-fix.conf. The prompt
+# lives at style-eval-review-prompt.md in this directory — it is not a slash
+# command.
 #
 # Usage: style-eval-review-all.sh [project_name]
 #   If project_name is given, only review that single project's pending evaluation.
@@ -22,6 +22,8 @@ set -euo pipefail
 export PATH="$HOME/.local/bin:$PATH"
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+source "$SCRIPT_DIR/agent_config.sh"
+
 RUST_DIR="$HOME/rust"
 NATE_STYLE_DIR="$HOME/rust/nate_style"
 CONF_FILE="$SCRIPT_DIR/clean-fix.conf"
@@ -29,7 +31,8 @@ CMD_FILE="$SCRIPT_DIR/style-eval-review-prompt.md"
 HISTORY_HELPER="$SCRIPT_DIR/style_history.py"
 LOG_DIR="/private/tmp/claude"
 SINGLE_PROJECT="${1:-}"
-STYLE_AGENT_MODE="claude"
+STYLE_ENABLED=""
+STYLE_AGENT=""
 STYLE_AGENT_MODEL=""
 CODEX_BIN="${CODEX_BIN:-$HOME/.nvm/versions/node/v20.19.1/bin/codex}"
 
@@ -43,8 +46,7 @@ if [[ -f "$CONF_FILE" ]]; then
     current_section=""
     while IFS= read -r line || [[ -n "$line" ]]; do
         stripped="${line%%#*}"
-        stripped="${stripped## }"
-        stripped="${stripped%% }"
+        stripped="$(cf_trim "$stripped")"
         [[ -z "$stripped" ]] && continue
         if [[ "$stripped" =~ ^\[(.+)\]$ ]]; then
             current_section="${BASH_REMATCH[1]}"
@@ -53,9 +55,15 @@ if [[ -f "$CONF_FILE" ]]; then
         case "$current_section" in
             targets) targets+=("$stripped") ;;
             style_eval)
-                if [[ "$stripped" =~ ^mode=(.+)$ ]]; then
-                    STYLE_AGENT_MODE="${BASH_REMATCH[1]}"
-                elif [[ "$stripped" =~ ^model=(.+)$ ]]; then
+                if [[ "$stripped" =~ ^mode= ]]; then
+                    echo "ERROR: [style_eval] mode is no longer supported; use enabled=true|false and agent=claude|codex" >&2
+                    exit 1
+                elif [[ "$stripped" =~ ^enabled=(.+)$ ]]; then
+                    cf_validate_bool "style_eval" "enabled" "${BASH_REMATCH[1]}" || exit 1
+                    STYLE_ENABLED="${BASH_REMATCH[1]}"
+                elif [[ "$stripped" =~ ^agent=(.+)$ ]]; then
+                    STYLE_AGENT="${BASH_REMATCH[1]}"
+                elif [[ "$stripped" =~ ^model=(.*)$ ]]; then
                     STYLE_AGENT_MODEL="${BASH_REMATCH[1]}"
                 fi
                 ;;
@@ -63,12 +71,18 @@ if [[ -f "$CONF_FILE" ]]; then
     done < "$CONF_FILE"
 fi
 
-# Review follows the configured eval agent. When eval is disabled (mode=off),
-# fall back to claude so a standalone review run still works.
-if [[ "$STYLE_AGENT_MODE" == "off" ]]; then
-    STYLE_AGENT_MODE="claude"
+# Review follows the configured eval agent.
+if [[ -z "$STYLE_ENABLED" ]]; then
+    echo "ERROR: [style_eval] enabled must be set to true or false in $CONF_FILE" >&2
+    exit 1
 fi
-if [[ "$STYLE_AGENT_MODE" == "codex" && ! -x "$CODEX_BIN" ]]; then
+cf_validate_agent "style_eval" "$STYLE_AGENT" || exit 1
+cf_validate_model_for_agent "style_eval" "$STYLE_AGENT" "$STYLE_AGENT_MODEL" || exit 1
+if [[ "$STYLE_ENABLED" == "false" ]]; then
+    echo "Style evaluation review is disabled."
+    exit 0
+fi
+if [[ "$STYLE_AGENT" == "codex" && ! -x "$CODEX_BIN" ]]; then
     echo "ERROR: configured Codex binary is not executable: $CODEX_BIN" >&2
     exit 1
 fi
@@ -79,10 +93,15 @@ fi
 run_review_agent() {
     local project_root="$1" prompt="$2" log_file="$3"
     local final_prompt="$prompt"
-    case "$STYLE_AGENT_MODE" in
+    case "$STYLE_AGENT" in
         claude)
+            local claude_args=()
+            if [[ -n "$STYLE_AGENT_MODEL" ]]; then
+                claude_args+=("--model" "$STYLE_AGENT_MODEL")
+            fi
             claude --print --dangerously-skip-permissions \
                 --settings '{"sandbox":{"enabled":false}}' \
+                ${claude_args[@]+"${claude_args[@]}"} \
                 -- "$final_prompt" > "$log_file" 2>&1
             ;;
         codex)
@@ -102,7 +121,7 @@ run_review_agent() {
                 > "$log_file" 2>&1
             ;;
         *)
-            echo "unsupported style_eval mode: $STYLE_AGENT_MODE" > "$log_file"
+            echo "unsupported style_eval agent: $STYLE_AGENT" > "$log_file"
             return 1
             ;;
     esac
@@ -208,7 +227,7 @@ if [[ ${#launch_names[@]} -eq 0 ]]; then
     exit 0
 fi
 
-echo "=== Style eval review ($STYLE_AGENT_MODE): ${#launch_names[@]} projects ==="
+echo "=== Style eval review ($STYLE_AGENT): ${#launch_names[@]} projects ==="
 
 # Launch all reviews in parallel via the configured agent (claude or codex).
 pids=()
@@ -228,7 +247,7 @@ for i in "${!launch_names[@]}"; do
     pids+=($!)
     launched_names+=("$proj")
     launched_evals+=("${launch_evals[$i]}")
-    echo "Launched: $proj via $STYLE_AGENT_MODE (PID $!)"
+    echo "Launched: $proj via $STYLE_AGENT (PID $!)"
 done
 
 echo ""

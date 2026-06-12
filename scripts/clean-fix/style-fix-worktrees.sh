@@ -31,14 +31,16 @@ export PATH="$HOME/.local/bin:$PATH"
 source "$HOME/.cargo/env"
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+source "$SCRIPT_DIR/agent_config.sh"
+
 RUST_DIR="$HOME/rust"
 CONF_FILE="$SCRIPT_DIR/clean-fix.conf"
 HISTORY_HELPER="$SCRIPT_DIR/style_history.py"
 LOG_DIR="/private/tmp/claude"
 SINGLE_PROJECT="${1:-}"
-STYLE_AGENT_MODE="claude"
-STYLE_FIX_MODE=""
-STYLE_FIX_MODEL=""
+STYLE_ENABLED=""
+STYLE_AGENT=""
+STYLE_AGENT_MODEL=""
 CODEX_BIN="${CODEX_BIN:-$HOME/.nvm/versions/node/v20.19.1/bin/codex}"
 
 mkdir -p "$LOG_DIR"
@@ -122,8 +124,7 @@ if [[ -f "$CONF_FILE" ]]; then
     current_section=""
     while IFS= read -r line || [[ -n "$line" ]]; do
         stripped="${line%%#*}"
-        stripped="${stripped## }"
-        stripped="${stripped%% }"
+        stripped="$(cf_trim "$stripped")"
         [[ -z "$stripped" ]] && continue
         if [[ "$stripped" =~ ^\[(.+)\]$ ]]; then
             current_section="${BASH_REMATCH[1]}"
@@ -132,14 +133,9 @@ if [[ -f "$CONF_FILE" ]]; then
         case "$current_section" in
             targets) targets+=("$stripped") ;;
             style_eval)
-                if [[ "$stripped" =~ ^mode=(.+)$ ]]; then
-                    STYLE_AGENT_MODE="${BASH_REMATCH[1]}"
-                elif [[ "$stripped" =~ ^enabled=(.+)$ ]]; then
-                    if [[ "${BASH_REMATCH[1]}" == "true" ]]; then
-                        STYLE_AGENT_MODE="claude"
-                    else
-                        STYLE_AGENT_MODE="off"
-                    fi
+                if [[ "$stripped" =~ ^mode= ]]; then
+                    echo "ERROR: [style_eval] mode is no longer supported; use enabled=true|false and agent=claude|codex" >&2
+                    exit 1
                 fi
                 if [[ "$stripped" =~ ^max_new_findings=([0-9]+)$ ]]; then
                     MAX_NEW_FINDINGS="${BASH_REMATCH[1]}"
@@ -152,10 +148,16 @@ if [[ -f "$CONF_FILE" ]]; then
                     POST_SUMMARY_GRACE_SECS="${BASH_REMATCH[1]}"
                 elif [[ "$stripped" =~ ^heartbeat_interval_secs=([0-9]+)$ ]]; then
                     HEARTBEAT_INTERVAL_SECS="${BASH_REMATCH[1]}"
-                elif [[ "$stripped" =~ ^mode=(.+)$ ]]; then
-                    STYLE_FIX_MODE="${BASH_REMATCH[1]}"
-                elif [[ "$stripped" =~ ^model=(.+)$ ]]; then
-                    STYLE_FIX_MODEL="${BASH_REMATCH[1]}"
+                elif [[ "$stripped" =~ ^mode= ]]; then
+                    echo "ERROR: [style_fix] mode is no longer supported; use enabled=true|false and agent=claude|codex" >&2
+                    exit 1
+                elif [[ "$stripped" =~ ^enabled=(.+)$ ]]; then
+                    cf_validate_bool "style_fix" "enabled" "${BASH_REMATCH[1]}" || exit 1
+                    STYLE_ENABLED="${BASH_REMATCH[1]}"
+                elif [[ "$stripped" =~ ^agent=(.+)$ ]]; then
+                    STYLE_AGENT="${BASH_REMATCH[1]}"
+                elif [[ "$stripped" =~ ^model=(.*)$ ]]; then
+                    STYLE_AGENT_MODEL="${BASH_REMATCH[1]}"
                 fi
                 ;;
         esac
@@ -166,6 +168,12 @@ if [[ -z "$MAX_NEW_FINDINGS" ]]; then
     echo "ERROR: [style_eval] max_new_findings is not set in $CONF_FILE" >&2
     exit 1
 fi
+if [[ -z "$STYLE_ENABLED" ]]; then
+    echo "ERROR: [style_fix] enabled must be set to true or false in $CONF_FILE" >&2
+    exit 1
+fi
+cf_validate_agent "style_fix" "$STYLE_AGENT" || exit 1
+cf_validate_model_for_agent "style_fix" "$STYLE_AGENT" "$STYLE_AGENT_MODEL" || exit 1
 
 # Default any [style_fix] tunables the user didn't set in the conf. Defaults
 # match the values these were hard-coded to before the conf section existed.
@@ -173,26 +181,17 @@ fi
 : "${POST_SUMMARY_GRACE_SECS:=600}"
 : "${HEARTBEAT_INTERVAL_SECS:=60}"
 
-# Fix agent override: [style_fix] mode=/model= select the fix agent
-# independently of the eval/review agent. Unset keys inherit [style_eval].
-# The off-check below runs on the inherited value first — [style_eval]
-# mode=off is the master off switch and disables the fix stage even when
-# [style_fix] mode is set.
-if [[ "$STYLE_AGENT_MODE" != "off" && -n "$STYLE_FIX_MODE" ]]; then
-    STYLE_AGENT_MODE="$STYLE_FIX_MODE"
-fi
-
 run_style_agent() {
     local project_root="$1"
     local prompt="$2"
     local log_file="$3"
     local final_prompt="$prompt"
 
-    case "$STYLE_AGENT_MODE" in
+    case "$STYLE_AGENT" in
         claude)
             local claude_args=()
-            if [[ -n "$STYLE_FIX_MODEL" ]]; then
-                claude_args+=("--model" "$STYLE_FIX_MODEL")
+            if [[ -n "$STYLE_AGENT_MODEL" ]]; then
+                claude_args+=("--model" "$STYLE_AGENT_MODEL")
             fi
             claude --print --dangerously-skip-permissions --settings '{"sandbox":{"enabled":false}}' \
                 ${claude_args[@]+"${claude_args[@]}"} \
@@ -201,8 +200,8 @@ run_style_agent() {
         codex)
             final_prompt=$'IMPORTANT: Do NOT spawn sub-agents, delegate, or parallelize through helper agents. Complete this fix pass yourself in a single agent run.\nIMPORTANT: Do NOT create, replace, repair, or symlink the workspace path or any parent/peer repo path. If the expected workspace path is missing or invalid, fail and report it instead of trying to reconstruct it.\n\n'"$prompt"
             local codex_args=()
-            if [[ -n "$STYLE_FIX_MODEL" ]]; then
-                codex_args+=("-m" "$STYLE_FIX_MODEL")
+            if [[ -n "$STYLE_AGENT_MODEL" ]]; then
+                codex_args+=("-m" "$STYLE_AGENT_MODEL")
             fi
             "$CODEX_BIN" exec \
                 ${codex_args[@]+"${codex_args[@]}"} \
@@ -214,18 +213,18 @@ run_style_agent() {
                 > "$log_file" 2>&1
             ;;
         *)
-            echo "unsupported style_eval mode: $STYLE_AGENT_MODE" > "$log_file"
+            echo "unsupported style_fix agent: $STYLE_AGENT" > "$log_file"
             return 1
             ;;
     esac
 }
 
-if [[ "$STYLE_AGENT_MODE" == "off" ]]; then
-    echo "Style evaluation mode is off."
+if [[ "$STYLE_ENABLED" == "false" ]]; then
+    echo "Style fix is disabled."
     exit 0
 fi
 
-if [[ "$STYLE_AGENT_MODE" == "codex" && ! -x "$CODEX_BIN" ]]; then
+if [[ "$STYLE_AGENT" == "codex" && ! -x "$CODEX_BIN" ]]; then
     echo "ERROR: configured Codex binary is not executable: $CODEX_BIN" >&2
     exit 1
 fi
@@ -696,12 +695,12 @@ PROMPT_EOF
     rm -f "$prompt_file"
 
     # Launch selected agent to apply fixes (timeout from [style_fix] agent_timeout_secs).
-    echo "[diag $proj] launching style agent ($STYLE_AGENT_MODE) in background"
+    echo "[diag $proj] launching style agent ($STYLE_AGENT) in background"
     local agent_pid
     run_style_agent "$agent_work_dir" "$prompt" "$log_file" &
     agent_pid=$!
     echo "[diag $proj] agent launched: agent_pid=$agent_pid"
-    progress "$proj" "phase=agent-launch mode=$STYLE_AGENT_MODE pid=$agent_pid log=$log_file"
+    progress "$proj" "phase=agent-launch agent=$STYLE_AGENT pid=$agent_pid log=$log_file"
 
     # Phase-marker forwarding: scan new bytes of the agent log inside the
     # main poll loop below. We previously did this with a backgrounded
@@ -773,9 +772,9 @@ PROMPT_EOF
             sleep 5
             kill -9 "$agent_pid" 2>/dev/null || true
             wait "$agent_pid" 2>/dev/null || true
-            echo "TIMEOUT: $proj ($STYLE_AGENT_MODE exceeded ${timeout_secs}s timeout)"
+            echo "TIMEOUT: $proj ($STYLE_AGENT exceeded ${timeout_secs}s timeout)"
             progress "$proj" "phase=failed reason=timeout elapsed=${elapsed}s"
-            python3 "$HISTORY_HELPER" finalize-failure --project "$proj" --reason "$STYLE_AGENT_MODE exceeded ${timeout_secs}s timeout" || true
+            python3 "$HISTORY_HELPER" finalize-failure --project "$proj" --reason "$STYLE_AGENT exceeded ${timeout_secs}s timeout" || true
             if ! safe_remove_worktree "$repo_dir" "$worktree_dir"; then
                 echo "ERROR: $proj (worktree directory persists at $worktree_dir after cleanup — manual intervention needed)"
                 progress "$proj" "phase=failed reason=cleanup-leftover dir=$worktree_dir"
@@ -812,13 +811,13 @@ PROMPT_EOF
 
     if [[ $agent_code -ne 0 ]]; then
         if [[ -f "$scratch_eval" ]] && rg -q '^## Fix Summary$' "$scratch_eval"; then
-            echo "WARN: $proj ($STYLE_AGENT_MODE exited $agent_code, but Fix Summary was produced)"
+            echo "WARN: $proj ($STYLE_AGENT exited $agent_code, but Fix Summary was produced)"
         else
             local fail_reason
             if [[ ! -s "$log_file" ]]; then
-                fail_reason="$STYLE_AGENT_MODE exited immediately with no output"
+                fail_reason="$STYLE_AGENT exited immediately with no output"
             else
-                fail_reason="$STYLE_AGENT_MODE failed after producing output (see $log_file)"
+                fail_reason="$STYLE_AGENT failed after producing output (see $log_file)"
             fi
             echo "ERROR: $proj ($fail_reason)"
             progress "$proj" "phase=failed reason=agent-exit code=$agent_code"

@@ -17,6 +17,8 @@ set -euo pipefail
 export PATH="$HOME/.local/bin:$PATH"
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+source "$SCRIPT_DIR/agent_config.sh"
+
 RUST_DIR="$HOME/rust"
 HISTORY_DIR="$HOME/rust/nate_style/.history"
 FAILURE_LOG_DIR="$HISTORY_DIR/.failures"
@@ -26,7 +28,8 @@ HISTORY_HELPER="$SCRIPT_DIR/style_history.py"
 HEARTBEAT_HELPER="$SCRIPT_DIR/style-eval-heartbeat.sh"
 LOG_DIR="/private/tmp/claude"
 SINGLE_PROJECT="${1:-}"
-STYLE_AGENT_MODE="claude"
+STYLE_ENABLED=""
+STYLE_AGENT=""
 CODEX_BIN="${CODEX_BIN:-$HOME/.nvm/versions/node/v20.19.1/bin/codex}"
 HEARTBEAT_INTERVAL_SECS=60
 
@@ -49,8 +52,7 @@ if [[ -f "$CONF_FILE" ]]; then
     current_section=""
     while IFS= read -r line || [[ -n "$line" ]]; do
         stripped="${line%%#*}"
-        stripped="${stripped## }"
-        stripped="${stripped%% }"
+        stripped="$(cf_trim "$stripped")"
         [[ -z "$stripped" ]] && continue
         if [[ "$stripped" =~ ^\[(.+)\]$ ]]; then
             current_section="${BASH_REMATCH[1]}"
@@ -59,16 +61,16 @@ if [[ -f "$CONF_FILE" ]]; then
         case "$current_section" in
             targets) targets+=("$stripped") ;;
             style_eval)
-                if [[ "$stripped" =~ ^mode=(.+)$ ]]; then
-                    STYLE_AGENT_MODE="${BASH_REMATCH[1]}"
-                elif [[ "$stripped" =~ ^model=(.+)$ ]]; then
-                    STYLE_AGENT_MODEL="${BASH_REMATCH[1]}"
+                if [[ "$stripped" =~ ^mode= ]]; then
+                    echo "ERROR: [style_eval] mode is no longer supported; use enabled=true|false and agent=claude|codex" >&2
+                    exit 1
                 elif [[ "$stripped" =~ ^enabled=(.+)$ ]]; then
-                    if [[ "${BASH_REMATCH[1]}" == "true" ]]; then
-                        STYLE_AGENT_MODE="claude"
-                    else
-                        STYLE_AGENT_MODE="off"
-                    fi
+                    cf_validate_bool "style_eval" "enabled" "${BASH_REMATCH[1]}" || exit 1
+                    STYLE_ENABLED="${BASH_REMATCH[1]}"
+                elif [[ "$stripped" =~ ^agent=(.+)$ ]]; then
+                    STYLE_AGENT="${BASH_REMATCH[1]}"
+                elif [[ "$stripped" =~ ^model=(.*)$ ]]; then
+                    STYLE_AGENT_MODEL="${BASH_REMATCH[1]}"
                 fi
                 if [[ "$stripped" =~ ^max_new_findings=([0-9]+)$ ]]; then
                     MAX_NEW_FINDINGS="${BASH_REMATCH[1]}"
@@ -87,6 +89,12 @@ if [[ -z "$MAX_NEW_FINDINGS" ]]; then
     echo "ERROR: [style_eval] max_new_findings is not set in $CONF_FILE" >&2
     exit 1
 fi
+if [[ -z "$STYLE_ENABLED" ]]; then
+    echo "ERROR: [style_eval] enabled must be set to true or false in $CONF_FILE" >&2
+    exit 1
+fi
+cf_validate_agent "style_eval" "$STYLE_AGENT" || exit 1
+cf_validate_model_for_agent "style_eval" "$STYLE_AGENT" "$STYLE_AGENT_MODEL" || exit 1
 
 # Backstop timeout for a single eval agent. Reuses the [style_fix] agent cap
 # (defaults to 2h if unset). Bounds a wedged agent so it cannot stall the serial
@@ -124,7 +132,7 @@ write_failure_report() {
         echo "# Style eval failure: $proj"
         echo
         echo "- Timestamp (UTC): $ts"
-        echo "- Agent mode: $STYLE_AGENT_MODE"
+        echo "- Agent: $STYLE_AGENT"
         echo "- Model: ${STYLE_AGENT_MODEL:-<default>}"
         echo "- Final outcome: $outcome"
         echo
@@ -375,9 +383,15 @@ run_style_agent() {
     local log_file="$3"
     local final_prompt="$prompt"
 
-    case "$STYLE_AGENT_MODE" in
+    case "$STYLE_AGENT" in
         claude)
-            claude --print --dangerously-skip-permissions --settings '{"sandbox":{"enabled":false}}' -- "$final_prompt" > "$log_file" 2>&1
+            local claude_args=()
+            if [[ -n "$STYLE_AGENT_MODEL" ]]; then
+                claude_args+=("--model" "$STYLE_AGENT_MODEL")
+            fi
+            claude --print --dangerously-skip-permissions --settings '{"sandbox":{"enabled":false}}' \
+                ${claude_args[@]+"${claude_args[@]}"} \
+                -- "$final_prompt" > "$log_file" 2>&1
             ;;
         codex)
             final_prompt=$'IMPORTANT: Do NOT spawn sub-agents, delegate, or parallelize through helper agents. Complete this evaluation yourself in a single agent run.\nIMPORTANT: Do NOT create, replace, repair, or symlink the workspace path or any parent/peer repo path. If the expected workspace path is missing or invalid, fail and report it instead of trying to reconstruct it.\n\n'"$prompt"
@@ -396,18 +410,18 @@ run_style_agent() {
                 > "$log_file" 2>&1
             ;;
         *)
-            echo "unsupported style_eval mode: $STYLE_AGENT_MODE" > "$log_file"
+            echo "unsupported style_eval agent: $STYLE_AGENT" > "$log_file"
             return 1
             ;;
     esac
 }
 
-if [[ "$STYLE_AGENT_MODE" == "off" ]]; then
-    echo "Style evaluation mode is off."
+if [[ "$STYLE_ENABLED" == "false" ]]; then
+    echo "Style evaluation is disabled."
     exit 0
 fi
 
-if [[ "$STYLE_AGENT_MODE" == "codex" && ! -x "$CODEX_BIN" ]]; then
+if [[ "$STYLE_AGENT" == "codex" && ! -x "$CODEX_BIN" ]]; then
     echo "ERROR: configured Codex binary is not executable: $CODEX_BIN" >&2
     exit 1
 fi
@@ -524,7 +538,7 @@ for i in "${!projects[@]}"; do
     evals_for_wait+=("$eval_path")
     heartbeats_for_wait+=("$WRAPPER_HEARTBEAT_PID")
     cleanups_for_wait+=("$NO_FINDINGS_CLEANUP_PID")
-    echo "Launched: $proj via $STYLE_AGENT_MODE (PID $agent_pid)"
+    echo "Launched: $proj via $STYLE_AGENT (PID $agent_pid)"
 done
 
 echo ""

@@ -11,7 +11,9 @@ Runs daily at **4:00 AM** via launchd.
 | File | Purpose |
 |------|---------|
 | `clean-fix.sh` | Main entry point. Takes a scope: `clean` (settings back-populate + clean/build/mend + warmup), `style` (eval + review + fix), or `all` (default, both). Generates the clean-fix report at the end when the run did per-project work. |
-| `clean-fix.conf` | Configuration. Two opt-in allowlists: `[build]` (clean/build/mend) and `[targets]` (style eval/review/fix). Plus style eval settings (`mode`, `max_new_findings`) and warmup targets. No deny list — nothing runs unless listed. |
+| `clean-fix.conf` | Configuration. Two opt-in allowlists: `[build]` (clean/build/mend) and `[targets]` (style eval/review/fix). Plus style agent settings (`enabled`, `agent`, `model`, `max_new_findings`) and warmup targets. No deny list — nothing runs unless listed. |
+| `agent-models.conf` | Allowed model names for each style agent. Any non-empty `model=` in `clean-fix.conf` must match the selected `agent=` section here. |
+| `agent_config.sh` | Shared Bash helpers for parsing booleans and validating `agent`/`model` combinations before scripts launch Claude or Codex. |
 | `com.natemccoy.style-fix.plist` | launchd plist — runs the style scope every 10 minutes (no idle gate). |
 | `com.natemccoy.cargo-clean.plist` | launchd plist — runs the clean scope nightly at 4:00 AM (idle-gated). |
 | `setup.sh` | Idempotent setup script — installs both launchd agents, creates runtime directories, retires the old pre-split agent. |

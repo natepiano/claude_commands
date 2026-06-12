@@ -1,5 +1,5 @@
 ---
-description: Unified clean-fix command — run the pipeline (one project or all), monitor a live log, render a report, set the style mode, or manage skip lists
+description: Unified clean-fix command — run the pipeline (one project or all), monitor a live log, render a report, configure style agents, or manage skip lists
 ---
 
 # Clean-fix
@@ -11,10 +11,13 @@ description: Unified clean-fix command — run the pipeline (one project or all)
 | `run [clean \| style \| all \| project]` | Launch a pipeline scope (default all), or eval + fix for one project |
 | `monitor [log-path] [project]` | Attach a live Monitor to a running clean-fix log |
 | `report [list \| <path>]` | Render a per-project status table from a run log |
-| `mode [eval \| fix] [off \| claude \| codex \| on \| inherit]` | Show or set the eval/fix style agent modes |
+| `eval [agent claude\|codex \| model <id>\|default \| on\|off]` | Show or set eval/review agent configuration |
+| `fix [agent claude\|codex \| model <id>\|default \| on\|off]` | Show or set fix-worktree agent configuration |
+| `agent claude\|codex` | Set both eval and fix agents |
+| `on\|off` | Enable or disable both eval and fix style stages |
 | `skip clean\|style [...]` | Skip or re-enable targets for the clean or style pass |
 
-Dispatch: `run` → <Run/>, `monitor` → <Monitor/>, `report` → <Report/>, `mode` → <Mode/>, `skip` → <Skip/>. Empty or unrecognized first token → print the table above and stop.
+Dispatch: `run` → <Run/>, `monitor` → <Monitor/>, `report` → <Report/>, `eval`/`fix`/`agent`/`on`/`off` → <StyleAgentConfig/>, `skip` → <Skip/>. Empty or unrecognized first token → print the table above and stop.
 
 <Run>
 
@@ -199,31 +202,37 @@ Read `~/.claude/scripts/clean-fix/report-render.md` and follow it, substituting 
 
 </Report>
 
-<Mode>
+<StyleAgentConfig>
 
-## mode [eval | fix] [off | claude | codex | on | inherit]
+## eval|fix [agent claude|codex | model <id>|default | on|off]
+## agent claude|codex
+## on|off
 
-Show or set the clean-fix style agent modes.
+Show or set the clean-fix style agent configuration.
 
-The config file is `~/.claude/scripts/clean-fix/clean-fix.conf`. Two agents are configurable:
+The config file is `~/.claude/scripts/clean-fix/clean-fix.conf`. The model allowlist is `~/.claude/scripts/clean-fix/agent-models.conf`. Two agent sections are configurable:
 
-- **eval** — the `mode=` line under `[style_eval]`. Drives the eval and review stages. `mode=off` is the master off switch for the whole style pipeline (including fix).
-- **fix** — the `mode=` line under `[style_fix]`. Drives the fix-worktree agents. When absent or commented out, the fix stage inherits the eval mode.
+- **eval** — `[style_eval] enabled=`, `agent=`, and optional `model=`. Drives eval and review stages.
+- **fix** — `[style_fix] enabled=`, `agent=`, and optional `model=`. Drives fix-worktree agents.
+
+`mode=` is not valid anymore. The scripts reject any `mode=` key in `[style_eval]` or `[style_fix]`.
 
 Argument handling:
 
 1. Read `~/.claude/scripts/clean-fix/clean-fix.conf`.
-2. **No tokens** — show both: the eval mode, the fix mode (or "inherits eval → <mode>"), and each section's `model=` if set. Stop.
-3. **First token is `eval` or `fix`** — the scope; the next token is the value:
-   - **`claude`** / **`codex`**: set that scope's `mode=` line.
-   - **`off`**: eval scope only — set `mode=off` (master switch). For the fix scope, explain that off is controlled by the eval mode and stop.
-   - **`on`**: set `mode=claude`.
-   - **`inherit`**: fix scope only — comment out the `[style_fix]` `mode=` line so fix inherits eval.
-   - **empty**: show that scope's current mode.
-4. **First token is a bare value** (`off`/`claude`/`codex`/`on`) — one agent everywhere: apply it to the **eval** scope as in step 3 AND reset the fix scope to inherit (comment out the `[style_fix]` `mode=` line).
-5. When changing a value, use the Edit tool on that `mode=` line in-place (uncomment `#mode=` under `[style_fix]` when setting the fix scope). Only touch mode lines — the `[build]` and `[targets]` skip lists are managed by `phase_skip.py` (see <Skip/>), never by direct edits.
+2. Read `~/.claude/scripts/clean-fix/agent-models.conf`.
+3. **No tokens** — show both sections: `enabled`, `agent`, `model` (`<default>` when empty), and the allowlist path. Stop.
+4. **First token is `eval` or `fix`** — the scope. Map `eval` to `[style_eval]` and `fix` to `[style_fix]`.
+5. **Scoped status:** `/clean_fix eval` or `/clean_fix fix` shows only that scope's current `enabled`, `agent`, and `model`.
+6. **Scoped enable/disable:** `/clean_fix eval on`, `/clean_fix eval off`, `/clean_fix fix on`, `/clean_fix fix off` set that scope's `enabled=` to `true` or `false`.
+7. **Global enable/disable:** `/clean_fix on` and `/clean_fix off` set both `[style_eval] enabled=` and `[style_fix] enabled=` to `true` or `false`.
+8. **Scoped agent:** `/clean_fix eval agent claude`, `/clean_fix eval agent codex`, `/clean_fix fix agent claude`, or `/clean_fix fix agent codex` set that scope's `agent=`. If that scope has a non-empty `model=` that is not listed under the new agent in `agent-models.conf`, also set `model=` to empty (`<default>`) and report that reset.
+9. **Global agent:** `/clean_fix agent claude` or `/clean_fix agent codex` sets both scope `agent=` values. For each scope, if its non-empty `model=` is not listed under the new agent in `agent-models.conf`, also set that scope's `model=` to empty (`<default>`) and report that reset.
+10. **Scoped model:** `/clean_fix eval model opus` or `/clean_fix fix model gpt-5.4-mini` first reads the selected scope's `agent=`. The model must exactly match a non-comment line under that agent's section in `agent-models.conf`; otherwise stop and show the allowed values.
+11. **Default model:** `/clean_fix eval model default` or `/clean_fix fix model default` sets that scope's `model=` to an empty value, which uses the selected agent's CLI default.
+12. When changing a value, edit only the relevant `enabled=`, `agent=`, or `model=` line in-place. The `[build]` and `[targets]` skip lists are managed by `phase_skip.py` (see <Skip/>), never by direct edits.
 
-</Mode>
+</StyleAgentConfig>
 
 <Skip>
 
@@ -251,7 +260,7 @@ Run the helper and relay its output verbatim:
 python3 ~/.claude/scripts/clean-fix/phase_skip.py <scope> <action> [target ...]
 ```
 
-The helper is the single source of truth for the skip lists — do not edit those entries with Edit/Write. (The `[style_eval]` mode line is the one conf setting edited directly — see <Mode/>.)
+The helper is the single source of truth for the skip lists — do not edit those entries with Edit/Write. Agent settings are edited directly — see <StyleAgentConfig/>.
 
 A commented allowlist line is invisible to the conf parser, so the entry drops out of its pass. The helper tags its edits with `#CLEAN_FIX_SKIP#` so `enable-all` only reverses temp skips and never touches plain doc comments. It exits non-zero on a name with no matching allowlist entry.
 
