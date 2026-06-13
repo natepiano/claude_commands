@@ -20,7 +20,7 @@ from typing import NamedTuple
 from typing import TypedDict
 from typing import cast
 
-from candidate_generators import CandidatesSpec, Enumeration, enumerate_candidates, read_candidates_spec
+from candidate_generators import CandidatesSpec, Enumeration, enumerate_candidates, read_candidates_spec  # pyright: ignore[reportImplicitRelativeImport]  # run standalone, not as a package — relative import would break it
 
 RUST_DIR = Path(os.environ.get("STYLE_HISTORY_RUST_DIR", str(Path.home() / "rust")))
 NATE_STYLE_DIR = Path(os.environ.get("STYLE_HISTORY_NATE_STYLE_DIR", str(RUST_DIR / "nate_style")))
@@ -744,10 +744,9 @@ def last_review_index(project: str) -> dict[str, LastReview]:
     """Per-guideline most recent review: (row end_time, row fingerprint).
 
     Pre-filter skips count as reviews — a deterministic zero-candidate check
-    is a valid verdict at that code state. Rows without a fingerprint (all
-    rows before the TTL feature, plus fix/failure rows) yield an empty
-    fingerprint, which `unit_is_due` treats as "state unknown → due once the
-    TTL expires".
+    is a valid verdict at that code state. The fingerprint is retained for
+    audit only; `unit_is_due` keys off `end_time` alone (TTL re-arms each unit
+    on time, regardless of fingerprint). `end_time` is what matters here.
     """
     index: dict[str, LastReview] = {}
     for row in load_history(project):
@@ -762,7 +761,6 @@ def last_review_index(project: str) -> dict[str, LastReview]:
 def unit_is_due(
     unit: Unit,
     review_index: dict[str, LastReview],
-    current_fingerprint: str,
     now: datetime,
     ttl: timedelta,
     project_root: Path,
@@ -772,12 +770,14 @@ def unit_is_due(
     Due triggers, per guideline:
       - never reviewed in history
       - the guideline file changed since its last review (immediate, TTL ignored)
-      - the last review is older than the TTL AND the project fingerprint has
-        changed since it was recorded
+      - the last review is older than the TTL
 
-    The fingerprint condition is the dormancy gate: re-sampling unchanged code
-    is how recall accumulates (single runs under-enumerate), but a project that
-    hasn't changed at all since its last full clean pass stops costing anything.
+    The TTL alone re-arms a unit. The eval agent is non-deterministic, so a
+    later pass over the same code can surface a finding an earlier pass missed;
+    re-sampling on every TTL lapse is how that recall accumulates. There is no
+    dormancy gate — a unit reviewed clean still comes due once its TTL passes,
+    whether or not the project changed. The recorded fingerprint is no longer
+    consulted here; it stays on history rows for audit only.
     """
     for guideline_id in unit.guideline_ids:
         last = review_index.get(guideline_id)
@@ -791,11 +791,36 @@ def unit_is_due(
             return True
         if datetime.fromtimestamp(path.stat().st_mtime, tz=timezone.utc) > reviewed_at:
             return True
-        if now - reviewed_at <= ttl:
-            continue
-        if not last.fingerprint or last.fingerprint != current_fingerprint:
+        if now - reviewed_at > ttl:
             return True
     return False
+
+
+def unit_next_due_epoch(
+    unit: Unit,
+    review_index: dict[str, LastReview],
+    ttl: timedelta,
+) -> float | None:
+    """Soonest epoch this unit re-arms on the TTL alone.
+
+    For a not-currently-due unit, that is the earliest of its guidelines'
+    `last_review + ttl`. Returns None when it can't be predicted (a guideline
+    with no parseable review timestamp — that unit is already due, not pending).
+    Guideline-file edits can pull the real date earlier but are unpredictable,
+    so they are not modeled here.
+    """
+    soonest: float | None = None
+    for guideline_id in unit.guideline_ids:
+        last = review_index.get(guideline_id)
+        if last is None:
+            return None
+        reviewed_at = parse_utc_timestamp(last.end_time)
+        if reviewed_at is None:
+            return None
+        expiry = (reviewed_at + ttl).timestamp()
+        if soonest is None or expiry < soonest:
+            soonest = expiry
+    return soonest
 
 
 def due_units_payload(project_root: Path) -> dict[str, object]:
@@ -810,15 +835,27 @@ def due_units_payload(project_root: Path) -> dict[str, object]:
     review_index = last_review_index(project)
     now = datetime.now(tz=timezone.utc)
     ttl = timedelta(days=eval_ttl_days())
-    due_ids = [
+    due_id_set = {
         unit.unit_id
         for unit in reviewable
-        if unit_is_due(unit, review_index, current_fingerprint, now, ttl, project_root)
+        if unit_is_due(unit, review_index, now, ttl, project_root)
+    }
+    due_ids = [unit.unit_id for unit in reviewable if unit.unit_id in due_id_set]
+    # Soonest a currently-not-due unit re-arms on the TTL alone. 0 means none
+    # to predict (no reviewable units, or every unit is already due).
+    pending_epochs = [
+        epoch
+        for unit in reviewable
+        if unit.unit_id not in due_id_set
+        for epoch in (unit_next_due_epoch(unit, review_index, ttl),)
+        if epoch is not None
     ]
+    next_due_epoch = int(min(pending_epochs)) if pending_epochs else 0
     return {
         "due_unit_count": len(due_ids),
         "due_unit_ids": due_ids,
         "fingerprint": current_fingerprint,
+        "next_due_epoch": next_due_epoch,
         "reviewable_unit_total": len(reviewable),
         "ttl_days": eval_ttl_days(),
     }
@@ -1057,10 +1094,10 @@ def next_unit(project_root: Path) -> dict[str, object]:
     # guidelines that never produce findings.
     hit_rates = cross_project_hit_rates()
     # TTL gate: only units that are due get re-reviewed. A unit reviewed clean
-    # within the TTL — or at the current fingerprint on a dormant project — is
-    # skipped entirely; "exhausted" now means "nothing due left", not "every
+    # within the TTL is skipped; once its TTL lapses it re-arms on time alone
+    # (the eval agent is non-deterministic, so a later pass can catch what an
+    # earlier one missed). "exhausted" means "nothing due left", not "every
     # guideline swept this run".
-    current_fingerprint = project_fingerprint(project_root)
     review_index = last_review_index(project)
     now = datetime.now(tz=timezone.utc)
     ttl = timedelta(days=eval_ttl_days())
@@ -1070,7 +1107,7 @@ def next_unit(project_root: Path) -> dict[str, object]:
             continue
         if unit.unit_id in seen_unit_ids:
             continue
-        if not unit_is_due(unit, review_index, current_fingerprint, now, ttl, project_root):
+        if not unit_is_due(unit, review_index, now, ttl, project_root):
             continue
         unit_count = min(counts.get(guideline_id, 0) for guideline_id in unit.guideline_ids) if unit.guideline_ids else 0
         # Negate hit-rate so higher rates sort earlier under ascending sort.
@@ -1378,8 +1415,9 @@ def finalize_no_findings(project: str) -> None:
         )
         print(message, file=sys.stderr)
         raise SystemExit(EXIT_INCOMPLETE_RUN)
-    # Stamp the code state the clean verdicts were earned at. This is what
-    # lets `unit_is_due` keep a dormant project's verdicts alive past the TTL.
+    # Stamp the code state the clean verdicts were earned at. Audit-only now —
+    # `unit_is_due` re-arms each unit on its TTL alone and no longer consults
+    # the fingerprint (the dormancy gate was removed); kept for traceability.
     fingerprint = ""
     raw_root = pending.get("project_root", "")
     if raw_root:
@@ -1776,7 +1814,7 @@ def parse_args() -> argparse.Namespace:
     _ = due.add_argument("--project-root", required=True)
     _ = due.add_argument(
         "--field",
-        choices=("due_unit_count", "fingerprint", "reviewable_unit_total", "ttl_days"),
+        choices=("due_unit_count", "fingerprint", "next_due_epoch", "reviewable_unit_total", "ttl_days"),
     )
     last = subparsers.add_parser(
         "last-findings",

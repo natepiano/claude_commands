@@ -61,13 +61,14 @@ digraph clean_fix_style {
         margin=12
 
         eval_foreach [label="For each project (parallel)" pos="394.2,790!"]
-        load_style [label="Load style guide\n~/.claude/scripts/load-rust-style.sh" height=0.55 pos="394.2,725!"]
-        survey [label="Survey project source" pos="394.2,665!"]
-        carry_forward [label="Read pending JSON\n(carry forward valid findings)" height=0.55 pos="394.2,600!"]
-        check_wt_eval [label="style-fix scratch\nevaluation exists?" shape=diamond fillcolor="#fef9e7" color="#f39c12" width=1.5 height=0.9 pos="394.2,520!"]
-        load_wt_eval [label="Read style-fix scratch\n(exclude these findings)" height=0.55 pos="394.2,440!"]
-        evaluate [label="Find up to 5 NEW violations\n(skip worktree findings)" height=0.55 pos="394.2,370!"]
-        write_eval [label="Write pending JSON\n(carried + new)" height=0.55 pos="394.2,300!"]
+        ttl_gate [label="due-units gate:\nany unit due?" shape=diamond fillcolor="#fef9e7" color="#f39c12" width=1.6 height=0.9 pos="394.2,722!"]
+        load_style [label="Load style guide\n~/.claude/scripts/load-rust-style.sh" height=0.55 pos="394.2,660!"]
+        survey [label="Survey project source" pos="394.2,602!"]
+        carry_forward [label="Read pending JSON\n(carry forward valid findings)" height=0.55 pos="394.2,544!"]
+        check_wt_eval [label="style-fix scratch\nevaluation exists?" shape=diamond fillcolor="#fef9e7" color="#f39c12" width=1.5 height=0.9 pos="394.2,466!"]
+        load_wt_eval [label="Read style-fix scratch\n(exclude these findings)" height=0.55 pos="394.2,388!"]
+        evaluate [label="Find up to 5 NEW violations\n(skip worktree findings)" height=0.55 pos="394.2,326!"]
+        write_eval [label="Write pending JSON\n(carried + new)" height=0.55 pos="394.2,268!"]
     }
 
     // ══════ Phase 3: Style-Fix Worktrees (x center = 700.2) ══════
@@ -113,7 +114,11 @@ digraph clean_fix_style {
     style_enabled -> report [label="no"]
 
     // Phase 2 internal
-    eval_foreach -> load_style -> survey -> carry_forward -> check_wt_eval
+    eval_foreach -> ttl_gate
+    ttl_gate -> load_style [label="1+ due"]
+    ttl_gate -> report [label="none due\n(skip, no agent)"]
+    ttl_gate -> report [label="gate crashed: ERROR\n(fail-closed, flagged)" color="#e74c3c" fontcolor="#e74c3c"]
+    load_style -> survey -> carry_forward -> check_wt_eval
     check_wt_eval -> load_wt_eval [label="yes"]
     check_wt_eval -> evaluate [label="no"]
     load_wt_eval -> evaluate

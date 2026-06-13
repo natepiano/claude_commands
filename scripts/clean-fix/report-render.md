@@ -35,7 +35,11 @@ NOTE <free-text>
 
 Only real participants appear in `ROW`.
 
-Cell values are `OK`, `FAIL`, `SKIP`, `-` (rendered as `—`). They may carry a `:slug` suffix such as `OK:no-findings` — strip that for the phase columns. Render the quoted `reason` field as the final table column; render `-` as `—`.
+Cell values are `OK`, `FAIL`, `SKIP`, `RUNNING`, `-` (rendered as `—`). They may carry a `:slug` suffix such as `OK:no-findings` — strip that for the phase columns. Render the quoted `reason` field as the final table column; render `-` as `—`.
+
+`Fix: OK` means the style fix was applied and a `_style_fix` worktree is ready for the user to `/style_fix_review` → `/merge_branch` — it is **not** auto-merged. The row reason says `fix applied — worktree ready for /style_fix_review` and the eval stop reason (quota/exhausted) is suppressed as noise in that case.
+
+`RUNNING` means the phase agent was launched and the run is still live — it has not reported an outcome yet. The parser only emits `RUNNING` while the run is in progress and that phase has no `=== Done:` footer; a finished run never shows `RUNNING` (an unresolved launch there becomes `FAIL:no-result`). The live detail (elapsed time, latest eval heartbeat message, last-beat age) rides in the row's `reason` field and in the `RUNNING` records below.
 
 ## Rendering
 
@@ -83,9 +87,21 @@ If neither `ALWAYS_EXCLUDED` nor `FILTERED_OUT` has records, omit the Excluded s
 
 ### 3. Status table
 
-Markdown table with columns `Project | Clean | Warmup | Eval | Review | Fix | Reason`. Preserve parser row order: `Eval` status first (`FAIL`, `OK`, `SKIP`, then `—`), then project name alphabetically. Each phase cell is `OK`, `FAIL`, `SKIP`, or `—`. **Strip the `:reason` suffix from phase cells.** Render the parser's quoted `reason` value in the final column, using `—` when the value is `-`. If `cargo-mend` shows `clean=OK:warning`, render the cell as `OK*` and add a footnote line under the table: `* cargo-mend built fine, but the cargo mend tool itself failed against it. The build is healthy; the linter is not.`
+Markdown table with columns `Project | Clean | Warmup | Eval | Review | Fix | Reason`. Preserve parser row order: `Eval` status first (`RUNNING`, `FAIL`, `OK`, `SKIP`, then `—`), then project name alphabetically. Each phase cell is `OK`, `FAIL`, `SKIP`, `RUNNING`, or `—`. **Strip the `:reason` suffix from phase cells.** Render the parser's quoted `reason` value in the final column, using `—` when the value is `-`. If `cargo-mend` shows `clean=OK:warning`, render the cell as `OK*` and add a footnote line under the table: `* cargo-mend built fine, but the cargo mend tool itself failed against it. The build is healthy; the linter is not.`
 
-### 4. What failed
+### 4. Still running
+
+Only render if `RUNNING` records exist (the run is in progress). Heading: `Still running`. One bullet per record, naming the project, the phase, and the record's detail verbatim:
+
+```
+Still running
+- bevy_brp_bevy_update (eval): running 22m, agent reached quota reached, finalizing; last heartbeat 12s ago
+- hana (fix): running (worktree fix in progress)
+```
+
+A `heartbeat stale … — finishing or wedged` detail means the eval agent stopped emitting heartbeats: it is either finalizing or hung. If it persists across reports the agent likely died and the run will reap it as a failure — re-run the report once the run finishes for the real outcome.
+
+### 5. What failed
 
 Only render this section if there are `WARNING` records. Use full sentences:
 
@@ -96,11 +112,11 @@ What failed
 
 Combine multiple `WARNING` records about the same project into a single sentence — don't print the same project twice.
 
-### 5. Sub-tool warnings
+### 6. Sub-tool warnings
 
 Only if `TOOL_WARNING` records exist. Heading: `Tool issues (not project failures)`. One bullet per tool warning, e.g. `cargo-mend: the cargo mend linter failed against this project. The build itself succeeded.`
 
-### 6. Skipped on purpose
+### 7. Skipped on purpose
 
 Only if `SKIP_REASON` records exist (the parser already drops bookkeeping reasons; whatever survives is a real workflow decision). Heading: `Skipped on purpose`. Render as bullets in plain English, naming the projects:
 
@@ -109,7 +125,9 @@ Skipped on purpose
 - cargo-mend, cargo-port: already at the per-project cap of 2 style findings, so no new evaluation this run.
 ```
 
-### 7. Heads up
+A reason of the form `had <X> during this run; now resolved (merged or discarded)` means eval skipped the project at run time because a fix was pending, but that pending evaluation has since been finalized, merged, or discarded — the project is no longer blocked and is eligible next run. Render it as resolved, not stuck. A reason like `an applied fix awaiting your review/merge` (no "had …") means it is still pending right now.
+
+### 8. Heads up
 
 Render any `NOTE` records as bullets under the heading `**Heads up**`. Phrase each as a one-line user-facing call to action — name the path, name what's needed.
 

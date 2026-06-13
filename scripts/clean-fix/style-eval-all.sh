@@ -539,13 +539,50 @@ for i in "${!projects[@]}"; do
     fi
 
     # TTL launch gate: skip spawning an agent when no reviewable unit is due —
-    # everything was reviewed within the TTL, or the project is dormant (same
-    # fingerprint as its last finalized run). A resumed pending bypasses the
-    # gate; its remaining work is already committed to.
+    # every reviewable unit was reviewed within the TTL. Each unit re-arms on
+    # its TTL alone (no dormancy gate), so "nothing due" is always temporary and
+    # has a definite next-eval date. A resumed pending bypasses the gate; its
+    # remaining work is already committed to.
+    #
+    # Fail-closed: if the gate itself crashes (bad guideline parse, candidate
+    # generator bug, corrupt history) it can no longer tell us whether work is
+    # due. Skip the launch and emit an ERROR line so /clean_fix report flags it,
+    # instead of falling through to a launch the gate could not justify. The
+    # eval-phase report parser turns "ERROR: <proj> (...)" into a failed cell.
     if ! $resume_pending; then
-        due_count=$(python3 "$HISTORY_HELPER" due-units --project-root "$project_root" --field due_unit_count 2>/dev/null || echo "unknown")
+        due_err="$LOG_DIR/style_eval_${proj}.due-units.err"
+        due_count=$(python3 "$HISTORY_HELPER" due-units --project-root "$project_root" --field due_unit_count 2>"$due_err") && due_rc=0 || due_rc=$?
+        if [[ $due_rc -ne 0 || ! "$due_count" =~ ^[0-9]+$ ]]; then
+            # Strip parens/newlines so the reason survives the report parser's
+            # "(...)" capture; keep it short.
+            reason=$(tail -n1 "$due_err" 2>/dev/null | tr -d '\n()' | cut -c1-140)
+            [[ -z "$reason" ]] && reason="exit $due_rc, output=${due_count:-<empty>}"
+            echo "ERROR: $proj (due-units gate failed: $reason)"
+            # Dump the crash detail into the run log for triage. The parser
+            # ignores these non-matching lines — only the ERROR line above
+            # becomes a report cell.
+            if [[ -s "$due_err" ]]; then
+                echo "  due-units stderr (last 8 lines):"
+                tail -n8 "$due_err" 2>/dev/null | sed 's/^/    /' || true
+            fi
+            rm -f "$due_err"
+            continue
+        fi
+        rm -f "$due_err"
         if [[ "$due_count" == "0" ]]; then
-            echo "SKIP: $proj (nothing due — all rules reviewed within TTL at the current code state)"
+            # Caught up: every reviewable unit was reviewed within the TTL. With
+            # no dormancy gate each unit re-arms on time alone, so the next eval
+            # has a definite date — the soonest unit TTL expiry. Show that date
+            # (local time, via BSD `date -r <epoch>`) instead of a TTL lecture.
+            next_epoch=$(python3 "$HISTORY_HELPER" due-units --project-root "$project_root" --field next_due_epoch 2>/dev/null)
+            # Separate [[ ]] blocks: bash 3.2 mis-parses `=~ regex && other` in
+            # one bracket (the regex operand swallows the &&).
+            if [[ "$next_epoch" =~ ^[0-9]+$ ]] && [[ "$next_epoch" != "0" ]]; then
+                next_when=$(date -r "$next_epoch" '+%a %b %e %H:%M' 2>/dev/null | tr -s ' ')
+                echo "SKIP: $proj (nothing due — next eval ${next_when:-pending})"
+            else
+                echo "SKIP: $proj (nothing due)"
+            fi
             continue
         fi
     fi

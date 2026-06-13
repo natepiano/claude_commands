@@ -19,7 +19,7 @@ import sys
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import cast
+from typing import TypedDict, cast
 
 LOG_DIR = Path.home() / ".local" / "logs" / "clean-fix"
 RUST_DIR = Path.home() / "rust"
@@ -40,11 +40,18 @@ MONITOR_FILTER_REGEX = (
 PHASES: tuple[str, ...] = ("clean", "warmup", "eval", "review", "fix")
 CELL_DASH = "-"
 EVAL_SORT_ORDER: dict[str, int] = {
-    "FAIL": 0,
-    "OK": 1,
-    "SKIP": 2,
-    CELL_DASH: 3,
+    "RUNNING": 0,
+    "FAIL": 1,
+    "OK": 2,
+    "SKIP": 3,
+    CELL_DASH: 4,
 }
+
+# A launched eval agent heartbeats every 60s while its pid is alive (the wrapper
+# loop in style-eval-all.sh). Treat a heartbeat newer than 2.5x that cadence as
+# a live agent; older means the agent likely died or wedged and the wait loop
+# has not reaped it yet.
+HEARTBEAT_FRESH_SECS = 150
 
 # Permanent exclusions: directory will never be a candidate while it exists in
 # its current form. Covers directories not opted into the `[build]` / `[targets]`
@@ -111,6 +118,7 @@ class PhaseStats:
     ok: int = 0
     fail: int = 0
     skip: int = 0
+    running: int = 0  # eval phase: launched agent still alive (heartbeat fresh)
     processed: int = 0  # clean phase
     warnings: int = 0
     footer_ok: int | None = None
@@ -152,6 +160,7 @@ class ParseResult:
     rows: dict[str, dict[str, Cell]] = field(default_factory=dict)
     stats: dict[str, PhaseStats] = field(default_factory=dict)
     warnings: list[Warning] = field(default_factory=list)
+    running: list[Warning] = field(default_factory=list)
     tool_warnings: list[ToolWarning] = field(default_factory=list)
     skip_reasons: list[SkipReason] = field(default_factory=list)
     always_excluded: list[tuple[str, str]] = field(default_factory=list)
@@ -248,6 +257,99 @@ def pending_evaluation_markdown(project: str) -> str:
         if isinstance(markdown, str):
             return markdown
     return ""
+
+
+class HeartbeatStatus(TypedDict):
+    elapsed_secs: int  # wall time since the agent's first heartbeat
+    last_beat_age_secs: int  # wall time since the most recent heartbeat
+    fresh: bool  # last beat within HEARTBEAT_FRESH_SECS
+    message: str  # latest heartbeat message
+    beats: int  # wrapper heartbeat count
+    stop_reason: str  # top-level pending stop_reason, if the agent earned one
+
+
+def format_duration(seconds: float) -> str:
+    s = int(seconds)
+    if s < 60:
+        return f"{s}s"
+    if s < 3600:
+        return f"{s // 60}m {s % 60}s"
+    return f"{s // 3600}h {(s % 3600) // 60}m"
+
+
+def eval_heartbeat_status(project: str, now_epoch: float) -> HeartbeatStatus | None:
+    """Liveness of a launched eval agent from the heartbeat in its pending JSON.
+
+    style-eval-all.sh writes two records into .pending/<project>.json:
+    `heartbeat` (the wrapper, every 60s while the agent pid is alive) and
+    `agent` (checkpoints the eval prompt prints). Returns None when there is no
+    pending JSON or no heartbeat to read.
+    """
+    pending_path = PENDING_DIR / f"{project}.json"
+    if not pending_path.exists():
+        return None
+    try:
+        parsed = _load_json_value(pending_path.read_text(errors="replace"))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(parsed, dict):
+        return None
+    data = cast(dict[str, object], parsed)
+    raw_hb = data.get("style_eval_heartbeat")
+    if not isinstance(raw_hb, dict):
+        return None
+    records = cast(dict[str, object], raw_hb)
+
+    first_seen: int | None = None
+    latest: int | None = None
+    latest_message = ""
+    beats = 0
+    for key in ("heartbeat", "agent"):
+        raw_entry = records.get(key)
+        if not isinstance(raw_entry, dict):
+            continue
+        entry = cast(dict[str, object], raw_entry)
+        fs = entry.get("first_seen_epoch")
+        if isinstance(fs, int) and (first_seen is None or fs < first_seen):
+            first_seen = fs
+        up = entry.get("updated_at_epoch")
+        if isinstance(up, int) and (latest is None or up >= latest):
+            latest = up
+            msg = entry.get("message")
+            latest_message = msg if isinstance(msg, str) else ""
+        if key == "heartbeat":
+            cnt = entry.get("count")
+            if isinstance(cnt, int):
+                beats = cnt
+    if first_seen is None or latest is None:
+        return None
+
+    stop = data.get("stop_reason")
+    return HeartbeatStatus(
+        elapsed_secs=max(0, int(now_epoch - first_seen)),
+        last_beat_age_secs=max(0, int(now_epoch - latest)),
+        fresh=(now_epoch - latest) <= HEARTBEAT_FRESH_SECS,
+        message=latest_message,
+        beats=beats,
+        stop_reason=stop if isinstance(stop, str) else "",
+    )
+
+
+def describe_running(hb: HeartbeatStatus | None) -> str:
+    """One-line human status for a launched-but-unresolved eval agent."""
+    if hb is None:
+        return "launched, awaiting first heartbeat"
+    parts = [f"running {format_duration(hb['elapsed_secs'])}"]
+    if hb["stop_reason"]:
+        parts.append(f"agent reached {hb['stop_reason'].replace('_', ' ')}, finalizing")
+    if hb["message"] and not hb["message"].startswith("wrapper running"):
+        parts.append(hb["message"])
+    age = hb["last_beat_age_secs"]
+    if hb["fresh"]:
+        parts.append(f"last heartbeat {age}s ago")
+    else:
+        parts.append(f"heartbeat stale {format_duration(age)} — finishing or wedged")
+    return "; ".join(parts)
 
 
 def history_has_no_findings_for_run(project: str, result: ParseResult) -> bool:
@@ -554,9 +656,21 @@ def parse_eval_phase(lines: list[str], result: ParseResult) -> None:
             stats.footer_fail = int(m.group(2))
             stats.footer_total = int(m.group(3))
 
-    # Launched but never resolved → no result; treat as fail.
+    # Launched but never resolved. While the run is still in progress this is
+    # the normal case — the wait loop hasn't reaped the agent yet — so consult
+    # the heartbeat and report RUNNING with its live value instead of a failure.
+    # Once the run has finished there are no live agents, so an unresolved
+    # launch is a genuine no-result.
+    now_epoch = time.time()
+    phase_running = result.status == "in-progress" and stats.footer_total is None
     for project in launched - resolved:
-        if evaluation_has_no_violations(project, result):
+        if phase_running:
+            get_row(result.rows, project)["eval"] = Cell("RUNNING", "running")
+            stats.running += 1
+            result.running.append(
+                Warning("eval", project, describe_running(eval_heartbeat_status(project, now_epoch)))
+            )
+        elif evaluation_has_no_violations(project, result):
             get_row(result.rows, project)["eval"] = Cell("OK", "no-findings")
             stats.ok += 1
         else:
@@ -608,10 +722,16 @@ def parse_review_phase(lines: list[str], result: ParseResult) -> None:
             stats.footer_fail = int(m.group(2))
             stats.footer_total = int(m.group(3))
 
+    phase_running = result.status == "in-progress" and stats.footer_total is None
     for project in launched - resolved:
-        get_row(result.rows, project)["review"] = Cell("FAIL", "no-result")
-        stats.fail += 1
-        result.warnings.append(Warning("review", project, "launched but no result"))
+        if phase_running:
+            get_row(result.rows, project)["review"] = Cell("RUNNING", "running")
+            stats.running += 1
+            result.running.append(Warning("review", project, "running (launched, awaiting completion)"))
+        else:
+            get_row(result.rows, project)["review"] = Cell("FAIL", "no-result")
+            stats.fail += 1
+            result.warnings.append(Warning("review", project, "launched but no result"))
 
 
 def parse_fix_phase(lines: list[str], result: ParseResult) -> None:
@@ -678,15 +798,63 @@ def parse_fix_phase(lines: list[str], result: ParseResult) -> None:
                 else stats.footer_ok + stats.footer_fail + int(m.group(3))
             )
 
+    phase_running = result.status == "in-progress" and stats.footer_total is None
     for project in eligible:
         cell = fix_results.get(project)
         if cell is None:
+            if phase_running:
+                get_row(result.rows, project)["fix"] = Cell("RUNNING", "running")
+                stats.running += 1
+                result.running.append(Warning("fix", project, "running (worktree fix in progress)"))
+                continue
             cell = Cell("FAIL", "no-result")
         get_row(result.rows, project)["fix"] = cell
         if cell.state == "OK":
             stats.ok += 1
         elif cell.state == "FAIL":
             stats.fail += 1
+
+
+# Plain-language for the internal pending statuses style-eval logs as
+# `SKIP: <proj> (pending <status>)`. (noun, what is awaited while still open).
+PENDING_PLAIN: dict[str, tuple[str, str]] = {
+    "findings": ("new style findings", "awaiting fix"),
+    "reviewed_findings": ("reviewed findings", "awaiting fix"),
+    "fixed_findings": ("an applied fix", "awaiting your review/merge"),
+    "fix_failed_findings": ("a failed style fix", "needs attention"),
+}
+
+
+def overlay_live_pending_state(result: ParseResult) -> None:
+    """Plain-language eval pending skips and re-derive them against live state.
+
+    style-eval skips a project whose pending evaluation is still open and logs
+    `SKIP: <proj> (pending <status>)` — internal jargon, frozen in the log. This
+    pass rewrites that reason in plain English. If the pending JSON still
+    exists, the project is genuinely waiting; if it is gone, the pending was
+    finalized, merged, or discarded after the run, so say it is resolved rather
+    than leaving a stale "pending" reason.
+    """
+    for project, row in result.rows.items():
+        eval_cell = row["eval"]
+        if eval_cell.state != "SKIP":
+            continue
+        skip = next(
+            (s for s in result.skip_reasons if s.phase == "eval" and s.project == project),
+            None,
+        )
+        raw_reason = skip.reason if skip is not None else humanize_cell_reason(eval_cell.reason)
+        if not raw_reason.startswith("pending "):
+            continue
+        status = raw_reason[len("pending ") :]
+        noun, awaiting = PENDING_PLAIN.get(status, (raw_reason, "pending"))
+        if (PENDING_DIR / f"{project}.json").exists():
+            plain = f"{noun} {awaiting}"
+        else:
+            plain = f"had {noun} during this run; now resolved (merged or discarded)"
+        eval_cell.reason = slugify_reason(plain)
+        if skip is not None:
+            skip.reason = plain
 
 
 def parse_log(path: Path) -> ParseResult:
@@ -755,6 +923,7 @@ def parse_log(path: Path) -> ParseResult:
         result.notes.append(f"phases not in this log: {','.join(absent)}")
 
     _prune_bookkeeping_rows(result)
+    overlay_live_pending_state(result)
     return result
 
 
@@ -821,6 +990,11 @@ def row_reason(result: ParseResult, project: str) -> str:
         for warning in result.warnings
         if warning.project == project
     }
+    running_by_phase = {
+        info.phase: info.message
+        for info in result.running
+        if info.project == project
+    }
     skips_by_phase = {
         skip.phase: skip.reason
         for skip in result.skip_reasons
@@ -841,6 +1015,8 @@ def row_reason(result: ParseResult, project: str) -> str:
                 or "failed"
             )
             add(f"{phase}: {reason}")
+        elif cell.state == "RUNNING":
+            add(f"{phase}: {running_by_phase.get(phase) or 'running'}")
         elif cell.state == "SKIP":
             reason = (
                 skips_by_phase.get(phase)
@@ -848,9 +1024,19 @@ def row_reason(result: ParseResult, project: str) -> str:
                 or "skipped"
             )
             add(f"{phase}: {reason}")
+        elif phase == "fix" and cell.state == "OK":
+            add("fix applied — worktree ready for /style_fix_review")
         elif phase == "eval" and cell.state == "OK" and cell.reason == "no-findings":
             add("eval: no violations found")
-        elif phase == "eval" and cell.state == "OK" and cell.reason in {"budget-reached", "exhausted", "quota-reached"}:
+        elif (
+            phase == "eval"
+            and cell.state == "OK"
+            and cell.reason in {"budget-reached", "exhausted", "quota-reached"}
+            and row["fix"].state != "OK"
+        ):
+            # The eval stop reason is diagnostic; when a fix actually landed it
+            # is noise next to "worktree ready". The coverage NOTE still carries
+            # stop= for anyone who wants it.
             add(f"eval: {humanize_cell_reason(cell.reason)}")
         elif cell.reason == "warning":
             add(f"{phase}: {tool_warnings_by_phase.get(phase) or 'tool warning'}")
@@ -939,6 +1125,8 @@ def emit_full_report(result: ParseResult) -> None:
         parts.append(f"ok={s.ok}")
         parts.append(f"fail={s.fail}")
         parts.append(f"skip={s.skip}")
+        if s.running:
+            parts.append(f"running={s.running}")
         if s.footer_total is not None:
             parts.append(f"footer_ok={s.footer_ok}")
             parts.append(f"footer_fail={s.footer_fail}")
@@ -974,6 +1162,10 @@ def emit_full_report(result: ParseResult) -> None:
     for w in result.warnings:
         msg = w.message.replace('"', "'")
         print(f'WARNING {w.phase} {w.project} "{msg}"')
+
+    for r in result.running:
+        msg = r.message.replace('"', "'")
+        print(f'RUNNING {r.phase} {r.project} "{msg}"')
 
     for tw in result.tool_warnings:
         msg = tw.message.replace('"', "'")
