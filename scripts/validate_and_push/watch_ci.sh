@@ -12,7 +12,7 @@ SHORT_SHA="${2:?Usage: watch_ci.sh <branch> <sha>}"
 
 # gh run list --commit requires a full SHA; short SHAs silently return nothing
 SHA=$(git rev-parse "$SHORT_SHA")
-MAX_ATTEMPTS=10
+MAX_ATTEMPTS=40
 POLL_INTERVAL=3
 
 RUN_ID=""
