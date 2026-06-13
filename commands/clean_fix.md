@@ -210,7 +210,7 @@ Read `~/.claude/scripts/clean-fix/report-render.md` and follow it, substituting 
 
 Show or set the clean-fix style agent configuration.
 
-The config file is `~/.claude/scripts/clean-fix/clean-fix.conf`. The model allowlist is `~/.claude/scripts/clean-fix/agent-models.conf`. Two agent sections are configurable:
+The config file is `~/.claude/scripts/clean-fix/clean-fix.conf`. The model allowlist is `~/.claude/scripts/clean-fix/agent-models.conf`. When a scope leaves `model=`/`effort=` empty, the values come from the shared `~/.claude/config/agents.conf` `[<agent>]` section (single source shared with `/delegate`); an explicit `model=` here overrides for that scope only. Two agent sections are configurable:
 
 - **eval** — `[style_eval] enabled=`, `agent=`, and optional `model=`. Drives eval and review stages.
 - **fix** — `[style_fix] enabled=`, `agent=`, and optional `model=`. Drives fix-worktree agents.
@@ -229,7 +229,7 @@ Argument handling:
 8. **Scoped agent:** `/clean_fix eval agent claude`, `/clean_fix eval agent codex`, `/clean_fix fix agent claude`, or `/clean_fix fix agent codex` set that scope's `agent=`. If that scope has a non-empty `model=` that is not listed under the new agent in `agent-models.conf`, also set `model=` to empty (`<default>`) and report that reset.
 9. **Global agent:** `/clean_fix agent claude` or `/clean_fix agent codex` sets both scope `agent=` values. For each scope, if its non-empty `model=` is not listed under the new agent in `agent-models.conf`, also set that scope's `model=` to empty (`<default>`) and report that reset.
 10. **Scoped model:** `/clean_fix eval model opus` or `/clean_fix fix model gpt-5.4-mini` first reads the selected scope's `agent=`. The model must exactly match a non-comment line under that agent's section in `agent-models.conf`; otherwise stop and show the allowed values.
-11. **Default model:** `/clean_fix eval model default` or `/clean_fix fix model default` sets that scope's `model=` to an empty value, which uses the selected agent's CLI default.
+11. **Default model:** `/clean_fix eval model default` or `/clean_fix fix model default` sets that scope's `model=` to an empty value, which resolves to the shared `~/.claude/config/agents.conf` `[<agent>]` model. If that agents.conf section omits `model=`, the agent's own CLI default applies.
 12. When changing a value, edit only the relevant `enabled=`, `agent=`, or `model=` line in-place. The `[build]` and `[targets]` skip lists are managed by `phase_skip.py` (see <Skip/>), never by direct edits.
 
 </StyleAgentConfig>

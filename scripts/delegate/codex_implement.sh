@@ -17,6 +17,12 @@ SESSION_DIR="${1:?Usage: codex_implement.sh <session_dir> [working_dir] [prompt_
 WORKING_DIR="${2:-$(pwd)}"
 PROMPT_FILE="${3:-${SESSION_DIR}/implementation_prompt.md}"
 
+# Shared codex model/effort (single source of truth, shared with clean-fix).
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "${SCRIPT_DIR}/../agents_config.sh"
+CODEX_MODEL="$(agents_config_model codex)"
+CODEX_EFFORT="$(agents_config_effort codex)"
+
 SUMMARY_FILE="${SESSION_DIR}/impl_summary.txt"
 STATUS_FILE="${SESSION_DIR}/impl_status"
 LOG_FILE="${SESSION_DIR}/impl_codex.log"
@@ -33,8 +39,12 @@ PROMPT=$(cat "${PROMPT_FILE}")
 
 # Invoke codex exec in full-auto mode so it can write files in the working directory.
 # -o captures the implementation summary (what was done).
+# Model/effort come from the shared agents.conf [codex]; -m omitted (codex config.toml default) if unset.
+CODEX_ARGS=()
+[[ -n "${CODEX_MODEL}" ]] && CODEX_ARGS+=(-m "${CODEX_MODEL}")
+CODEX_ARGS+=(-c "model_reasoning_effort=\"${CODEX_EFFORT:-xhigh}\"")
 if codex exec \
-  -c model_reasoning_effort='"high"' \
+  "${CODEX_ARGS[@]}" \
   --ephemeral \
   --full-auto \
   -C "${WORKING_DIR}" \

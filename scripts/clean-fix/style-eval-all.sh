@@ -97,6 +97,9 @@ if [[ -z "$STYLE_ENABLED" ]]; then
     exit 1
 fi
 cf_validate_agent "style_eval" "$STYLE_AGENT" || exit 1
+# When the conf leaves model/effort empty, take them from the shared
+# ~/.claude/config/agents.conf [<agent>] so the resolved values are validated below.
+cf_apply_agent_defaults STYLE_AGENT_MODEL STYLE_AGENT_EFFORT "$STYLE_AGENT"
 cf_validate_model_for_agent "style_eval" "$STYLE_AGENT" "$STYLE_AGENT_MODEL" || exit 1
 cf_validate_effort_for_agent "style_eval" "$STYLE_AGENT" "$STYLE_AGENT_EFFORT" || exit 1
 

@@ -4,6 +4,26 @@
 AGENT_CONFIG_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 AGENT_MODELS_FILE="${AGENT_MODELS_FILE:-$AGENT_CONFIG_DIR/agent-models.conf}"
 
+# agents_config_model / agents_config_effort — shared per-agent defaults
+# (~/.claude/config/agents.conf). clean-fix falls back to these when a scope
+# leaves model/effort empty, so the model+effort each agent runs with lives in
+# one place shared with /delegate.
+source "$AGENT_CONFIG_DIR/../agents_config.sh"
+
+# cf_apply_agent_defaults <model_var> <effort_var> <agent>
+# Fill the named model/effort vars from config/agents.conf [<agent>] when empty.
+# A non-empty value (an explicit per-scope override) is left untouched. An agent
+# section that omits a key leaves the var empty → the agent's own CLI default.
+cf_apply_agent_defaults() {
+    local model_var="$1" effort_var="$2" agent="$3"
+    if [[ -z "${!model_var}" ]]; then
+        printf -v "$model_var" '%s' "$(agents_config_model "$agent")"
+    fi
+    if [[ -z "${!effort_var}" ]]; then
+        printf -v "$effort_var" '%s' "$(agents_config_effort "$agent")"
+    fi
+}
+
 cf_trim() {
     local value="$1"
     value="${value#"${value%%[![:space:]]*}"}"
