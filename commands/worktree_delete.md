@@ -27,7 +27,7 @@ Update each todo status to "in_progress" when starting that step, and "completed
 </ExecutionSteps>
 
 <DiscoverWorktrees>
-    - Run `bash ~/.claude/scripts/delete_a_worktree/discover_worktrees.sh` to get current context and all worktrees
+    - Run `bash ~/.claude/scripts/worktree_delete/discover_worktrees.sh` to get current context and all worktrees
     - Parse the output to identify deletable worktrees (excluding current one and ${PROTECTED_BRANCHES})
     - Display current worktree and available worktrees for deletion
 
@@ -47,7 +47,7 @@ Update each todo status to "in_progress" when starting that step, and "completed
 </DiscoverWorktrees>
 
 <ValidateDeletionTarget>
-    - Run validation script: `bash ~/.claude/scripts/delete_a_worktree/delete_a_worktree_validation.sh "$SELECTED_WORKTREE"`
+    - Run validation script: `bash ~/.claude/scripts/worktree_delete/worktree_delete_validation.sh "$SELECTED_WORKTREE"`
     - Parse JSON result to check validation status
     - If status is "error", display the message and STOP
     - Store validation results for later use
@@ -76,11 +76,18 @@ Update each todo status to "in_progress" when starting that step, and "completed
     Please select one of the keywords above.
 
     [STOP and wait for user response]
+
+    **If the user selects confirm:** record the confirmation gate by running
+    `bash ~/.claude/scripts/worktree_delete/record_confirmation.sh "$SELECTED_WORKTREE" "$TARGET_BRANCH"`,
+    then proceed to <PerformDeletion/>. This nonce is what authorizes the deletion at execution time — without it `perform_deletion.sh` refuses.
+
+    **If the user selects cancel:** STOP without deleting.
 </GetFinalConfirmation>
 
 <PerformDeletion>
     - **IMPORTANT**: Use `dangerouslyDisableSandbox: true` — `git worktree remove` deletes files outside the sandbox's allowed write paths
-    - Run `bash ~/.claude/scripts/delete_a_worktree/perform_deletion.sh $SELECTED_WORKTREE $TARGET_BRANCH` to remove the worktree and delete the branch
+    - Run `bash ~/.claude/scripts/worktree_delete/perform_deletion.sh $SELECTED_WORKTREE $TARGET_BRANCH` to remove the worktree and delete the branch
+    - The script requires the confirmation nonce from <GetFinalConfirmation/>; if it reports "no confirmation nonce", the confirm step was skipped — return to <GetFinalConfirmation/> rather than retrying
     - Report success to user
 </PerformDeletion>
 

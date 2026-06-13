@@ -2,14 +2,26 @@
 # Removes a worktree and deletes its branch.
 # Usage: perform_deletion.sh <worktree_path> <branch_name>
 # Returns: Status of removal and branch deletion
+#
+# Requires a confirmation nonce written by the /worktree_delete confirm step
+# (record_confirmation.sh). Without it this script refuses to delete, so a
+# caller that skips the confirmation step cannot trigger a deletion.
 
 set -euo pipefail
 
-WORKTREE_PATH="$1"
-BRANCH_NAME="$2"
+WORKTREE_PATH="${1:-}"
+BRANCH_NAME="${2:-}"
 
 if [[ -z "$WORKTREE_PATH" || -z "$BRANCH_NAME" ]]; then
     echo "Error: Usage: perform_deletion.sh <worktree_path> <branch_name>"
+    exit 1
+fi
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=confirm_gate.sh
+source "$SCRIPT_DIR/confirm_gate.sh"
+
+if ! wt_check_and_consume "$WORKTREE_PATH" "$BRANCH_NAME"; then
     exit 1
 fi
 

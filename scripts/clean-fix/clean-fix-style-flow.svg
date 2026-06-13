@@ -336,7 +336,7 @@
 <g id="node25" class="node">
 <title>merge</title>
 <polygon fill="#e8f4f8" stroke="#2980b9" points="478.8,-96 306,-96 306,-60 478.8,-60 478.8,-96" />
-<text xml:space="preserve" text-anchor="middle" x="392.4" y="-74.13" font-family="Helvetica,sans-Serif" font-size="10.00">/merge_from_branch</text>
+<text xml:space="preserve" text-anchor="middle" x="392.4" y="-74.13" font-family="Helvetica,sans-Serif" font-size="10.00">/merge_branch</text>
 </g>
 
 <g id="edge27" class="edge">
@@ -348,7 +348,7 @@
 <g id="node26" class="node">
 <title>delete_wt</title>
 <polygon fill="#e8f4f8" stroke="#2980b9" points="478.8,-36 306,-36 306,0 478.8,0 478.8,-36" />
-<text xml:space="preserve" text-anchor="middle" x="392.4" y="-14.12" font-family="Helvetica,sans-Serif" font-size="10.00">/delete_a_worktree</text>
+<text xml:space="preserve" text-anchor="middle" x="392.4" y="-14.12" font-family="Helvetica,sans-Serif" font-size="10.00">/worktree_delete</text>
 </g>
 
 <g id="edge28" class="edge">

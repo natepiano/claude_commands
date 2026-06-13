@@ -61,6 +61,6 @@ echo "{
   \"target_branch\": \"$TARGET_BRANCH\",
   \"source_worktree\": \"$SOURCE_WORKTREE\",
   \"conflicted_files\": \"$CONFLICTED_FILES\",
-  \"message\": \"Rebase paused with conflicts. Resolve in '$SOURCE_WORKTREE', then run 'git add <files> && git rebase --continue' (or 'git rebase --abort' to bail). Re-invoke /merge_from_branch when done.\"
+  \"message\": \"Rebase paused with conflicts. Resolve in '$SOURCE_WORKTREE', then run 'git add <files> && git rebase --continue' (or 'git rebase --abort' to bail). Re-invoke /merge_branch when done.\"
 }"
 exit 1

@@ -1,6 +1,6 @@
 #!/bin/bash
 # Validates worktree deletion target and performs safety checks
-# Usage: delete_a_worktree_validation.sh <worktree_path>
+# Usage: worktree_delete_validation.sh <worktree_path>
 # Returns: JSON with validation status and details
 
 SELECTED_WORKTREE="$1"

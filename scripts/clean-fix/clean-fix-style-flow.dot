@@ -94,8 +94,8 @@ digraph clean_fix_style {
         margin=12
 
         review [label="/style_fix_review" pos="447.4,100!"]
-        merge [label="/merge_from_branch" pos="447.4,40!"]
-        delete_wt [label="/delete_a_worktree" pos="447.4,-20!"]
+        merge [label="/merge_branch" pos="447.4,40!"]
+        delete_wt [label="/worktree_delete" pos="447.4,-20!"]
     }
 
     // ── Edges ──

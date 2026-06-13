@@ -26,7 +26,7 @@ fi
 
 # No-op if already excluded
 if git config --get-all merge-from-branch.exclude 2>/dev/null | grep -Fxq "$BRANCH"; then
-    echo "'$BRANCH' is already excluded from /merge_from_branch."
+    echo "'$BRANCH' is already excluded from /merge_branch."
     exit 0
 fi
 

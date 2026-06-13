@@ -124,7 +124,7 @@ style-fix job (every 10 min, no idle gate) — clean-fix.sh style
   └─ Write clean-fix log for on-demand reports
 
 Post-clean-fix (manual):
-  /style_fix_review → /merge_from_branch → /delete_a_worktree
+  /style_fix_review → /merge_branch → /worktree_delete
 ```
 
 ## Evaluation State
