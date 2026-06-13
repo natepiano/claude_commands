@@ -40,6 +40,7 @@ mkdir -p "$FAILURE_LOG_DIR"
 targets=()    # opt-in eval targets: <dir> or <dir>/<subpath>
 MAX_NEW_FINDINGS=""
 STYLE_AGENT_MODEL=""
+STYLE_AGENT_EFFORT=""
 AGENT_TIMEOUT_SECS=""
 
 if [[ ! -f "$CONF_FILE" ]]; then
@@ -71,6 +72,8 @@ if [[ -f "$CONF_FILE" ]]; then
                     STYLE_AGENT="${BASH_REMATCH[1]}"
                 elif [[ "$stripped" =~ ^model=(.*)$ ]]; then
                     STYLE_AGENT_MODEL="${BASH_REMATCH[1]}"
+                elif [[ "$stripped" =~ ^effort=(.*)$ ]]; then
+                    STYLE_AGENT_EFFORT="${BASH_REMATCH[1]}"
                 fi
                 if [[ "$stripped" =~ ^max_new_findings=([0-9]+)$ ]]; then
                     MAX_NEW_FINDINGS="${BASH_REMATCH[1]}"
@@ -95,6 +98,7 @@ if [[ -z "$STYLE_ENABLED" ]]; then
 fi
 cf_validate_agent "style_eval" "$STYLE_AGENT" || exit 1
 cf_validate_model_for_agent "style_eval" "$STYLE_AGENT" "$STYLE_AGENT_MODEL" || exit 1
+cf_validate_effort_for_agent "style_eval" "$STYLE_AGENT" "$STYLE_AGENT_EFFORT" || exit 1
 
 # Backstop timeout for a single eval agent. Reuses the [style_fix] agent cap
 # (defaults to 2h if unset). Bounds a wedged agent so it cannot stall the serial
@@ -134,6 +138,7 @@ write_failure_report() {
         echo "- Timestamp (UTC): $ts"
         echo "- Agent: $STYLE_AGENT"
         echo "- Model: ${STYLE_AGENT_MODEL:-<default>}"
+        echo "- Effort: ${STYLE_AGENT_EFFORT:-<default>}"
         echo "- Final outcome: $outcome"
         echo
         echo "## Attempt 1"
@@ -394,6 +399,9 @@ run_style_agent() {
             if [[ -n "$STYLE_AGENT_MODEL" ]]; then
                 claude_args+=("--model" "$STYLE_AGENT_MODEL")
             fi
+            if [[ -n "$STYLE_AGENT_EFFORT" ]]; then
+                claude_args+=("--effort" "$STYLE_AGENT_EFFORT")
+            fi
             claude --print --dangerously-skip-permissions --settings '{"sandbox":{"enabled":false}}' \
                 ${claude_args[@]+"${claude_args[@]}"} \
                 -- "$final_prompt" > "$log_file" 2>&1
@@ -404,9 +412,9 @@ run_style_agent() {
             if [[ -n "$STYLE_AGENT_MODEL" ]]; then
                 codex_args+=("-m" "$STYLE_AGENT_MODEL")
             fi
+            codex_args+=("-c" "model_reasoning_effort=\"${STYLE_AGENT_EFFORT:-xhigh}\"")
             "$CODEX_BIN" exec \
                 "${codex_args[@]}" \
-                -c model_reasoning_effort='"high"' \
                 --ephemeral \
                 --full-auto \
                 -C "$project_root" \

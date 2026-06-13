@@ -66,9 +66,11 @@ BUILD_TARGETS=()
 STYLE_EVAL_ENABLED=""
 STYLE_EVAL_AGENT=""
 STYLE_EVAL_MODEL=""
+STYLE_EVAL_EFFORT=""
 STYLE_FIX_ENABLED=""
 STYLE_FIX_AGENT=""
 STYLE_FIX_MODEL=""
+STYLE_FIX_EFFORT=""
 if [[ -f "$CONF_FILE" ]]; then
     current_section=""
     while IFS= read -r line || [[ -n "$line" ]]; do
@@ -94,6 +96,8 @@ if [[ -f "$CONF_FILE" ]]; then
                     STYLE_EVAL_AGENT="${BASH_REMATCH[1]}"
                 elif [[ "$stripped" =~ ^model=(.*)$ ]]; then
                     STYLE_EVAL_MODEL="${BASH_REMATCH[1]}"
+                elif [[ "$stripped" =~ ^effort=(.*)$ ]]; then
+                    STYLE_EVAL_EFFORT="${BASH_REMATCH[1]}"
                 fi
                 ;;
             style_fix)
@@ -107,6 +111,8 @@ if [[ -f "$CONF_FILE" ]]; then
                     STYLE_FIX_AGENT="${BASH_REMATCH[1]}"
                 elif [[ "$stripped" =~ ^model=(.*)$ ]]; then
                     STYLE_FIX_MODEL="${BASH_REMATCH[1]}"
+                elif [[ "$stripped" =~ ^effort=(.*)$ ]]; then
+                    STYLE_FIX_EFFORT="${BASH_REMATCH[1]}"
                 fi
                 ;;
         esac
@@ -123,8 +129,10 @@ if [[ -z "$STYLE_FIX_ENABLED" ]]; then
 fi
 cf_validate_agent "style_eval" "$STYLE_EVAL_AGENT" || exit 1
 cf_validate_model_for_agent "style_eval" "$STYLE_EVAL_AGENT" "$STYLE_EVAL_MODEL" || exit 1
+cf_validate_effort_for_agent "style_eval" "$STYLE_EVAL_AGENT" "$STYLE_EVAL_EFFORT" || exit 1
 cf_validate_agent "style_fix" "$STYLE_FIX_AGENT" || exit 1
 cf_validate_model_for_agent "style_fix" "$STYLE_FIX_AGENT" "$STYLE_FIX_MODEL" || exit 1
+cf_validate_effort_for_agent "style_fix" "$STYLE_FIX_AGENT" "$STYLE_FIX_EFFORT" || exit 1
 
 START_TIME=$SECONDS
 log "=== Starting clean-fix (scope: $SCOPE) ==="

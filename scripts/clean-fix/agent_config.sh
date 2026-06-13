@@ -107,3 +107,36 @@ cf_validate_model_for_agent() {
     echo "       Allowed $agent models in $AGENT_MODELS_FILE: $allowed" >&2
     return 1
 }
+
+# Validate a reasoning/effort level for the selected agent. The two agents use
+# different vocabularies and different ceilings:
+#   claude  --effort <low|medium|high|xhigh|max>      ceiling = max
+#   codex   -c model_reasoning_effort="<...>"         ceiling = xhigh
+#                 (none|minimal|low|medium|high|xhigh)
+# Empty effort = leave the agent at its own default (no flag passed).
+cf_validate_effort_for_agent() {
+    local section="$1"
+    local agent="$2"
+    local effort="$3"
+
+    [[ -z "$effort" ]] && return 0
+    cf_validate_agent "$section" "$agent" || return 1
+    case "$agent" in
+        claude)
+            case "$effort" in
+                low|medium|high|xhigh|max) return 0 ;;
+            esac
+            echo "ERROR: [$section] effort '$effort' is not allowed for agent 'claude'." >&2
+            echo "       Allowed claude effort levels: low, medium, high, xhigh, max (highest)" >&2
+            return 1
+            ;;
+        codex)
+            case "$effort" in
+                none|minimal|low|medium|high|xhigh) return 0 ;;
+            esac
+            echo "ERROR: [$section] effort '$effort' is not allowed for agent 'codex'." >&2
+            echo "       Allowed codex effort levels: none, minimal, low, medium, high, xhigh (highest)" >&2
+            return 1
+            ;;
+    esac
+}

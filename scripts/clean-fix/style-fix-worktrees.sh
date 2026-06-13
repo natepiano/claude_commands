@@ -41,6 +41,7 @@ SINGLE_PROJECT="${1:-}"
 STYLE_ENABLED=""
 STYLE_AGENT=""
 STYLE_AGENT_MODEL=""
+STYLE_AGENT_EFFORT=""
 CODEX_BIN="${CODEX_BIN:-$HOME/.nvm/versions/node/v20.19.1/bin/codex}"
 
 mkdir -p "$LOG_DIR"
@@ -142,6 +143,8 @@ if [[ -f "$CONF_FILE" ]]; then
                     STYLE_AGENT="${BASH_REMATCH[1]}"
                 elif [[ "$stripped" =~ ^model=(.*)$ ]]; then
                     STYLE_AGENT_MODEL="${BASH_REMATCH[1]}"
+                elif [[ "$stripped" =~ ^effort=(.*)$ ]]; then
+                    STYLE_AGENT_EFFORT="${BASH_REMATCH[1]}"
                 fi
                 ;;
         esac
@@ -158,6 +161,7 @@ if [[ -z "$STYLE_ENABLED" ]]; then
 fi
 cf_validate_agent "style_fix" "$STYLE_AGENT" || exit 1
 cf_validate_model_for_agent "style_fix" "$STYLE_AGENT" "$STYLE_AGENT_MODEL" || exit 1
+cf_validate_effort_for_agent "style_fix" "$STYLE_AGENT" "$STYLE_AGENT_EFFORT" || exit 1
 
 # Default any [style_fix] tunables the user didn't set in the conf. Defaults
 # match the values these were hard-coded to before the conf section existed.
@@ -177,6 +181,9 @@ run_style_agent() {
             if [[ -n "$STYLE_AGENT_MODEL" ]]; then
                 claude_args+=("--model" "$STYLE_AGENT_MODEL")
             fi
+            if [[ -n "$STYLE_AGENT_EFFORT" ]]; then
+                claude_args+=("--effort" "$STYLE_AGENT_EFFORT")
+            fi
             claude --print --dangerously-skip-permissions --settings '{"sandbox":{"enabled":false}}' \
                 ${claude_args[@]+"${claude_args[@]}"} \
                 -- "$final_prompt" > "$log_file" 2>&1
@@ -187,9 +194,9 @@ run_style_agent() {
             if [[ -n "$STYLE_AGENT_MODEL" ]]; then
                 codex_args+=("-m" "$STYLE_AGENT_MODEL")
             fi
+            codex_args+=("-c" "model_reasoning_effort=\"${STYLE_AGENT_EFFORT:-xhigh}\"")
             "$CODEX_BIN" exec \
                 ${codex_args[@]+"${codex_args[@]}"} \
-                -c model_reasoning_effort='"high"' \
                 --ephemeral \
                 --dangerously-bypass-approvals-and-sandbox \
                 -C "$project_root" \
