@@ -4,7 +4,7 @@ Exclude a branch from `/merge_branch` discovery in this repo only.
 
 If `$ARGUMENTS` is empty, report an error and stop.
 
-Run `bash ~/.claude/scripts/merge_from_branch/exclude_branch.sh "$ARGUMENTS"` with `dangerouslyDisableSandbox: true` — the script writes to `.git/config`, which the sandbox blocks (same pattern as other git write ops).
+Run `bash ~/.claude/scripts/merge_branch/exclude_branch.sh "$ARGUMENTS"` with `dangerouslyDisableSandbox: true` — the script writes to `.git/config`, which the sandbox blocks (same pattern as other git write ops).
 
 The branch is appended to `merge-from-branch.exclude` in `.git/config` (local to this clone — never committed). Future `/merge_branch` runs will skip it.
 

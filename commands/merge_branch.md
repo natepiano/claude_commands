@@ -9,7 +9,7 @@ When neither direction is appropriate, the command can fall back to an explicit 
 
 **STEP 1: Discovery**
 
-Run `bash ~/.claude/scripts/merge_from_branch/discovery.sh`
+Run `bash ~/.claude/scripts/merge_branch/discovery.sh`
 
 - If `status` is `"error"`, report the message and STOP
 - If `is_clean` is `false`, STOP and ask user to commit or stash first
@@ -27,7 +27,7 @@ If user input doesn't match, display error and re-ask.
 
 **STEP 2: Validation**
 
-Run `bash ~/.claude/scripts/merge_from_branch/validate.sh ${SOURCE_BRANCH}` with `dangerouslyDisableSandbox: true`.
+Run `bash ~/.claude/scripts/merge_branch/validate.sh ${SOURCE_BRANCH}` with `dangerouslyDisableSandbox: true`.
 
 This script performs a real `git merge --no-commit --no-ff` followed by `git merge --abort` to test feasibility. The sandbox blocks git from writing `.git/*.lock` files mid-merge, which leaves the working tree in a half-merged state with untracked files that `git merge --abort` cannot clean up. Always disable the sandbox for this call.
 
@@ -77,7 +77,7 @@ Run `git rebase ${SOURCE_BRANCH}` with `dangerouslyDisableSandbox: true`.
 
 **STEP 4B: Rebase source branch (only if user chose "rebase-source")**
 
-Run `bash ~/.claude/scripts/merge_from_branch/rebase_source.sh ${SOURCE_BRANCH} ${current_branch} ${source_worktree}` with `dangerouslyDisableSandbox: true`.
+Run `bash ~/.claude/scripts/merge_branch/rebase_source.sh ${SOURCE_BRANCH} ${current_branch} ${source_worktree}` with `dangerouslyDisableSandbox: true`.
 
 - If `status` is `"success"`, continue to STEP 5.
 - If `status` is `"conflict"`, the source worktree is paused mid-rebase. Report the message and the `conflicted_files` list to the user, then STOP. The user resolves conflicts in `${source_worktree}` (their editor, normal `<<<<<<<` markers), runs `git add <files> && git rebase --continue` (or `git rebase --abort`), and re-invokes `/merge_branch`.
