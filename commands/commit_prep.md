@@ -57,10 +57,19 @@ If user selects **use**: Use the suggested title.
 </UserTitleConfirmation>
 
 <GenerateCommitBody>
-Using the analyzed changes and established commit title, generate a full conventional commit message:
-- Commit body: 10-15 lines of high-level bullet points covering what changed, why, and what it affects
-- Do not end with flowery summary statements that editorialize the change (e.g., "This improves maintainability and makes the codebase cleaner") — just state the facts
-- Avoid exhaustive details or deep subsections
+Using the analyzed changes and established commit title, generate a full conventional commit message.
+
+Use only as many bullets as the commit needs — a small or single-purpose change may need one bullet or none; a large change may need several.
+
+Every bullet must carry information a reviewer cannot get from the diff or the title. Fold the "why" into the bullet it explains rather than adding a separate rationale line.
+
+Do NOT include:
+- Bullets stating what did NOT change ("keep X unchanged", "preserve all call sites", "logic identical") — omission already implies this
+- Meta-commentary about the commit itself ("limit to a single file for focused review", "leave follow-up for future work", "make the diff a pure ordering change")
+- Restatements of the title in other words
+- Flowery or editorializing summaries (e.g., "This improves maintainability and makes the codebase cleaner") — state facts only
+
+If the change is purely mechanical (rename, reorder, move) with no behavior change, say so in one bullet and stop.
 
 Present the full commit message to the user:
 
