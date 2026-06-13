@@ -23,6 +23,7 @@ Runs daily at **4:00 AM** via launchd.
 | File | Purpose |
 |------|---------|
 | `style-eval-all.sh` | Runs `/style_eval` on every `[targets]` entry in parallel. Stores pending evaluation markdown in `.history/.pending/<project>.json`. Skips projects with pending findings or a real `_style_fix` worktree so pending JSON cannot be replaced while fixes are awaiting review. |
+| `candidate_generators.py` | Deterministic candidate enumeration for style-eval units. A guideline's `candidates:` frontmatter names a generator kind (regex / toml / Rust-source parse); `next-unit` hands the agent the enumerated sites as a closed list, `record-unit` refuses records that don't disposition every candidate, and zero-candidate units record free like pre_filter skips. Design + audit: `docs/candidate-enumeration-design.md`. Debug via `style_history.py enumerate-candidates`. |
 | `rg-shim.sh` | Timeout shim for `ripgrep`. Bounds every non-interactive `rg` so a path-less search blocked on stdin can't hang forever. See **Reliability guards** below. |
 
 ### Style-Fix Worktrees
@@ -138,7 +139,10 @@ The JSON records:
 
 - `reviewable_unit_total`: how many style-guide units this run could check
 - `checked_unit_count`: how many units were disposed by the agent or pre-filter
-- `stop_reason`: `budget_reached` or `exhausted`
+- `stop_reason`: `budget_reached`, `quota_reached`, or `exhausted` — the only
+  values that allow a run to be finalized into history. An empty stop_reason
+  means the run is in progress (or was abandoned); `start-run` resumes it and
+  `finalize-no-findings` refuses it (exit 3).
 - `finding_count`: numbered findings currently in the evaluation markdown
 - `scratch_exports`: the scratch markdown files freshly exported from pending JSON
 

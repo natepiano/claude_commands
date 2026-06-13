@@ -37,7 +37,7 @@ If no pending run exists yet (i.e. `next-unit` errors with "No pending run for .
 python3 ~/.claude/scripts/clean-fix/style_history.py start-run --project-root "$ARGUMENTS"
 ```
 
-The clean-fix (`style-eval-all.sh`) calls `start-run` itself, so this is only needed for ad-hoc agent invocations.
+The clean-fix (`style-eval-all.sh`) calls `start-run` itself, so this is only needed for ad-hoc agent invocations. If an interrupted evaluation is pending, `start-run` resumes it — already-recorded units stay recorded and `next-unit` continues where the previous run stopped.
 
 After the pending run exists, record evaluator liveness with the shared heartbeat script. This is not a substitute for `record-unit`; it only says what the agent is currently doing.
 
@@ -70,12 +70,14 @@ Rules:
 - `status=next` means review exactly that returned unit next
 - `status=complete` means stop immediately
 - `stop_reason=budget_reached` means the pending evaluation markdown has reached the configured numbered-finding cap
-- `stop_reason=exhausted` means there are no unseen eligible units left for this run
+- `stop_reason=quota_reached` means this run has hit the configured per-run unit quota (`[style_eval] eval_unit_quota`); remaining units wait for a later run
+- `stop_reason=exhausted` means there are no due units left for this run (units recently reviewed within the eval TTL are not due and are skipped by the helper — expected, not an error)
 - `coverage` is the checked/reviewable style-unit count for this run, in `<checked>/<reviewable>` form
 - `reviewable_unit_total` is the denominator for the run; use it to distinguish a full sweep from an early stop
 - `non_negotiable_guideline_ids` are binding on every unit review and are returned every time
 - each unit is exactly one guideline file — its `unit_id` equals the `guideline_id`
 - `see_also_guideline_ids` on a unit lists additional guidelines whose content you must consult as context when reviewing this unit — do NOT record results for them
+- a unit may carry a `candidates` array (plus `candidate_source` and `candidate_count`): the helper has already enumerated every site the rule could apply to. **Judge only — do not search.** For each candidate decide `violation` or `exception`; your results file must include a `dispositions` array covering every index (see below). Units whose generator finds zero candidates are recorded by the helper automatically and never reach you.
 
 After reviewing a unit, you must record its result immediately with:
 
@@ -106,11 +108,30 @@ The results JSON for a unit with no finding must look like this:
 }
 ```
 
+For a candidate-backed unit (the `next-unit` payload had a `candidates` array), the results JSON must additionally carry one disposition per candidate index:
+
+```json
+{
+  "unit_id": "rust/never-prefix-unused-fields-or-variables-with.md",
+  "results": [
+    {
+      "guideline_id": "rust/never-prefix-unused-fields-or-variables-with.md",
+      "outcome": { "status": "finding", "finding_source": "new" }
+    }
+  ],
+  "dispositions": [
+    { "index": 0, "verdict": "violation" },
+    { "index": 1, "verdict": "exception", "clause": "RAII guards" }
+  ]
+}
+```
+
 Recording rules:
 - use `outcome.status = no_findings` when that guideline produced no finding
 - use `outcome.status = finding` when that guideline produced a finding
 - pending evaluation markdown is the budget source of truth; `next-unit` counts its numbered findings
 - do not review the next unit until the current unit has been recorded
+- for candidate-backed units: every `index` from `0` to `candidate_count - 1` must appear exactly once; `verdict` is `violation` or `exception`; an `exception` must name the rule clause it relies on in `clause`. `record-unit` re-runs the generator and refuses (exit 3) any record with missing, duplicate, or unknown indices, or with violations but no recorded finding. If any candidate is a `violation`, the unit's outcome is a finding and the violating sites are its Locations.
 
 ## Step 2: Survey the project
 
@@ -176,6 +197,8 @@ For each returned unit:
 2. Read the content of any `see_also_guideline_ids` on the unit as review context — apply the selected unit's rule, informed by that context, but do not record findings against the see_also'd guidelines (they get their own review cycle)
 3. Re-read the returned `non_negotiable_guideline_ids` and treat them as binding for this unit
 3a. **If the unit's frontmatter has `mechanism: clippy` and `mode: auto`,** the rule is clippy-owned. Treat the `lint:` list in the frontmatter as the source of truth: only sites that clippy actually flags for one of those lints may be raised as findings for this unit. If the project's `Cargo.toml` already enables the lint at `warn`/`deny`, the existing `cargo clippy --all-targets` output is sufficient. Otherwise, run `cargo clippy --all-targets -- -W <lint_name>` (one `-W` per lint) and use that output. If clippy is silent project-wide for every lint in the unit's `lint:` list, record `outcome.status = no_findings` and move on. Do not visual-inspect for this category of rule — visual matches that clippy does not fire on are by definition not violations (e.g. `|x| x.method()` reached via `Deref`).
+3b. **If the unit payload has a `candidates` array,** skip the search workflow in step 4 entirely — the helper's generator already enumerated the rule's surface. Read each candidate site in context, judge it `violation` or `exception` (citing the rule clause), and build the `dispositions` array. The enumeration artifact is satisfied mechanically: `Surface searched` is the rule surface, `Search` is the payload's `candidate_source` with `candidate_count` as the match count, and a finding's Locations are exactly the violation-verdict candidates. Do not add sites that are not in the candidates list — if you believe the generator missed a real site, still record the unit from the candidate list and note the gap in the finding text so the generator can be fixed.
+
 4. Apply the unit's **rule** to the entire project. The unit of exhaustiveness is the rule, not the first example you notice.
 
    Concretely: derive the abstract pattern the rule prohibits or requires (e.g. "any field/parameter/binding whose name doesn't match the snake_case form of its type", "any raw literal at a call site that should be a named constant"), then search the codebase for every distinct match of that pattern — across all files, all binding positions, all literal kinds the rule covers.
@@ -213,7 +236,8 @@ For each returned unit:
 
 Important:
 - do not invent your own stopping rule
-- keep pulling units until the helper says `budget_reached` or `exhausted`
+- keep pulling units until the helper says `budget_reached`, `quota_reached`, or `exhausted`
+- stopping early without one of those stop reasons is a failure: the wrapper refuses to record the run in history and reports it as failed
 - `no_findings` units do not change the numbered-finding count in the pending evaluation markdown
 
 ## Step 4.5: Verify recorded findings are in the scratch evaluation markdown

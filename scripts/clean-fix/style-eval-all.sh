@@ -286,9 +286,10 @@ pid_is_live_non_zombie() {
 finalize_no_findings_if_ready() {
     local project="$1" eval_path="$2" marker="$3" project_root="${4:-}"
     pending_evaluation_has_no_findings "$project" || return 1
-    local summary
+    local summary rc=0
     summary=$(evaluation_status_summary "$project")
-    if python3 "$HISTORY_HELPER" finalize-no-findings --project "$project"; then
+    python3 "$HISTORY_HELPER" finalize-no-findings --project "$project" 2>/dev/null || rc=$?
+    if [[ $rc -eq 0 ]]; then
         if [[ -n "$project_root" ]]; then
             clean_project_scratch "$project" "$project_root"
         fi
@@ -296,6 +297,10 @@ finalize_no_findings_if_ready() {
         : > "$marker"
         echo "AUTOFINALIZE: $project (no findings — $summary; recorded in history, pending finalized)"
         return 0
+    fi
+    if [[ $rc -eq 3 ]]; then
+        # Run has no earned stop_reason yet — not ready; keep polling quietly.
+        return 1
     fi
     echo "WARN: $project (could not auto-finalize no-findings history)"
     return 1
@@ -502,15 +507,39 @@ for i in "${!projects[@]}"; do
         echo "SKIP: $proj (style_fix worktree; preserving pending handoff)"
         continue
     fi
+    resume_pending=false
     if [[ "$pending_status" == "no_findings" ]]; then
         summary=$(evaluation_status_summary "$proj")
-        if python3 "$HISTORY_HELPER" finalize-no-findings --project "$proj"; then
+        finalize_rc=0
+        python3 "$HISTORY_HELPER" finalize-no-findings --project "$proj" || finalize_rc=$?
+        if [[ $finalize_rc -eq 0 ]]; then
             clean_project_scratch "$proj" "$project_root"
             echo "OK: $proj (no findings — $summary; recorded in history, pending finalized)"
+            continue
+        elif [[ $finalize_rc -eq 3 ]]; then
+            echo "RESUME: $proj (incomplete prior run — $summary; relaunching to finish)"
+            resume_pending=true
         else
             echo "FAILED: $proj (could not finalize no-findings history)"
+            continue
         fi
-        continue
+    elif [[ "$(evaluation_status_field "$proj" has_pending)" == "True" ]]; then
+        # In-progress evaluation pending (units recorded, markdown not saved
+        # yet — e.g. a killed agent). start-run resumes it; relaunch to finish.
+        echo "RESUME: $proj ($(evaluation_status_summary "$proj"); relaunching to finish)"
+        resume_pending=true
+    fi
+
+    # TTL launch gate: skip spawning an agent when no reviewable unit is due —
+    # everything was reviewed within the TTL, or the project is dormant (same
+    # fingerprint as its last finalized run). A resumed pending bypasses the
+    # gate; its remaining work is already committed to.
+    if ! $resume_pending; then
+        due_count=$(python3 "$HISTORY_HELPER" due-units --project-root "$project_root" --field due_unit_count 2>/dev/null || echo "unknown")
+        if [[ "$due_count" == "0" ]]; then
+            echo "SKIP: $proj (nothing due — all rules reviewed within TTL at the current code state)"
+            continue
+        fi
     fi
 
     existing_findings=0
@@ -586,9 +615,10 @@ for pid in "${pids[@]}"; do
         a1_log="${log_file%.log}.attempt1.log"
         mv -f "$log_file" "$a1_log" 2>/dev/null || a1_log="$log_file"
 
-        # Clean pending state and start a fresh run before the retry. If start-run
-        # itself fails we still write a report so the cause is captured.
-        python3 "$HISTORY_HELPER" discard-pending --project "$name" || true
+        # Keep any partial pending for the retry — its recorded units went
+        # through record-unit and are valid; start-run resumes an in-progress
+        # evaluation instead of resetting it. If start-run itself fails we
+        # still write a report so the cause is captured.
         if ! python3 "$HISTORY_HELPER" start-run --project-root "$project_root"; then
             write_failure_report "$name" "$a1_log" "$code" "$a1_helper" \
                 "" "" "" "failed-no-retry (start-run rejected)"
@@ -622,11 +652,17 @@ for pid in "${pids[@]}"; do
             retry_status=$(evaluation_status_field "$name" status)
             if [[ "$retry_status" == "no_findings" ]]; then
                 summary=$(evaluation_status_summary "$name")
-                python3 "$HISTORY_HELPER" finalize-no-findings --project "$name" || true
-                clean_project_scratch "$name" "$project_root"
-                echo "RECOVERED: $name (no findings — $summary; recorded in history, pending finalized, retry succeeded)"
-                recovered=$((recovered + 1))
-                succeeded=$((succeeded + 1))
+                finalize_rc=0
+                python3 "$HISTORY_HELPER" finalize-no-findings --project "$name" || finalize_rc=$?
+                if [[ $finalize_rc -eq 0 ]]; then
+                    clean_project_scratch "$name" "$project_root"
+                    echo "RECOVERED: $name (no findings — $summary; recorded in history, pending finalized, retry succeeded)"
+                    recovered=$((recovered + 1))
+                    succeeded=$((succeeded + 1))
+                else
+                    echo "FAILED: $name (retry ended with an incomplete run — $summary; history row withheld, pending kept for resume)"
+                    failed=$((failed + 1))
+                fi
             elif [[ "$retry_status" == "findings" \
                 || "$retry_status" == "reviewed_findings" \
                 || "$retry_status" == "fixed_findings" \
@@ -637,8 +673,9 @@ for pid in "${pids[@]}"; do
                 recovered=$((recovered + 1))
                 succeeded=$((succeeded + 1))
             else
-                python3 "$HISTORY_HELPER" discard-pending --project "$name" || true
-                echo "FAILED: $name (retry also failed, exit=$retry_code helper-invoked=$a2_helper)"
+                # Keep the pending — any recorded units are valid progress;
+                # the next cycle resumes instead of starting over.
+                echo "FAILED: $name (retry also failed, exit=$retry_code helper-invoked=$a2_helper; pending kept for resume)"
                 write_failure_report "$name" "$a1_log" "$code" "$a1_helper" \
                     "$log_file" "$retry_code" "$a2_helper" "failed-after-retry"
                 failed=$((failed + 1))
@@ -653,12 +690,22 @@ for pid in "${pids[@]}"; do
     fi
     if [[ "$eval_status" == "no_findings" ]]; then
         summary=$(evaluation_status_summary "$name")
-        python3 "$HISTORY_HELPER" finalize-no-findings --project "$name" || {
+        finalize_rc=0
+        python3 "$HISTORY_HELPER" finalize-no-findings --project "$name" || finalize_rc=$?
+        if [[ $finalize_rc -eq 3 ]]; then
+            # Agent quit without an earned stop_reason. Loud failure, but the
+            # history row is withheld (no fake-clean data) and the pending is
+            # kept so the next cycle resumes its recorded units.
+            echo "FAILED: $name (eval incomplete — $summary; history row withheld, pending kept for resume)"
+            failed=$((failed + 1))
+            idx=$((idx + 1))
+            continue
+        elif [[ $finalize_rc -ne 0 ]]; then
             echo "FAILED: $name (could not finalize no-findings history)"
             failed=$((failed + 1))
             idx=$((idx + 1))
             continue
-        }
+        fi
         clean_project_scratch "$name" "$project_root"
         echo "OK: $name (no findings — $summary; recorded in history, pending finalized)"
     else

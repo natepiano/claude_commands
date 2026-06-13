@@ -209,7 +209,7 @@ def target_roots_by_project() -> dict[str, Path]:
         else:
             name = stripped
             root = RUST_DIR / stripped
-        roots.setdefault(name, root)
+        _ = roots.setdefault(name, root)
     return roots
 
 
@@ -229,18 +229,22 @@ def markdown_has_no_violations(text: str) -> bool:
     )
 
 
+def _load_json_value(text: str) -> object:
+    import json
+
+    return cast(object, json.loads(text))
+
+
 def pending_evaluation_markdown(project: str) -> str:
     pending_path = PENDING_DIR / f"{project}.json"
     if not pending_path.exists():
         return ""
     try:
-        import json
-
-        parsed = json.loads(pending_path.read_text(errors="replace"))
+        parsed = _load_json_value(pending_path.read_text(errors="replace"))
     except (OSError, ValueError):
         return ""
     if isinstance(parsed, dict):
-        markdown = parsed.get("evaluation_markdown", "")
+        markdown = cast(dict[str, object], parsed).get("evaluation_markdown", "")
         if isinstance(markdown, str):
             return markdown
     return ""
@@ -254,18 +258,17 @@ def history_has_no_findings_for_run(project: str, result: ParseResult) -> bool:
     if start_epoch is None:
         return False
     try:
-        import json
-
-        rows = [
-            json.loads(line)
+        rows: list[object] = [
+            _load_json_value(line)
             for line in history_path.read_text(errors="replace").splitlines()
             if line.strip()
         ]
     except (OSError, ValueError):
         return False
-    for row in reversed(rows):
-        if not isinstance(row, dict):
+    for raw_row in reversed(rows):
+        if not isinstance(raw_row, dict):
             continue
+        row = cast(dict[str, object], raw_row)
         start_time = row.get("start_time", "")
         if not isinstance(start_time, str) or not start_time:
             continue
@@ -278,12 +281,13 @@ def history_has_no_findings_for_run(project: str, result: ParseResult) -> bool:
         reviewed = row.get("reviewed_units", [])
         if not isinstance(reviewed, list) or not reviewed:
             continue
-        for entry in reviewed:
-            if not isinstance(entry, dict):
+        for raw_entry in cast(list[object], reviewed):
+            if not isinstance(raw_entry, dict):
                 return False
-            outcome = entry.get("outcome", {})
-            if not isinstance(outcome, dict):
+            raw_outcome = cast(dict[str, object], raw_entry).get("outcome", {})
+            if not isinstance(raw_outcome, dict):
                 return False
+            outcome = cast(dict[str, object], raw_outcome)
             if outcome.get("skipped_by") == "pre_filter":
                 continue
             if outcome.get("status") not in (None, "no_findings"):
@@ -501,6 +505,8 @@ def parse_eval_phase(lines: list[str], result: ParseResult) -> None:
             reason = ""
             if "no findings" in details:
                 reason = "no-findings"
+            elif "stop=quota_reached" in details:
+                reason = "quota-reached"
             elif "stop=budget_reached" in details:
                 reason = "budget-reached"
             elif "stop=exhausted" in details:
@@ -844,7 +850,7 @@ def row_reason(result: ParseResult, project: str) -> str:
             add(f"{phase}: {reason}")
         elif phase == "eval" and cell.state == "OK" and cell.reason == "no-findings":
             add("eval: no violations found")
-        elif phase == "eval" and cell.state == "OK" and cell.reason in {"budget-reached", "exhausted"}:
+        elif phase == "eval" and cell.state == "OK" and cell.reason in {"budget-reached", "exhausted", "quota-reached"}:
             add(f"eval: {humanize_cell_reason(cell.reason)}")
         elif cell.reason == "warning":
             add(f"{phase}: {tool_warnings_by_phase.get(phase) or 'tool warning'}")
@@ -865,7 +871,8 @@ def humanize_cell_reason(reason: str) -> str:
         return ""
     known = {
         "budget-reached": "budget reached",
-        "exhausted": "all eligible style rules checked",
+        "exhausted": "all due style rules checked",
+        "quota-reached": "per-run unit quota reached",
         "from-disk": "found Fix Summary on disk",
         "no-fix-summary": "no Fix Summary",
         "no-result": "no result",

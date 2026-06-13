@@ -4,17 +4,23 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import re
 import subprocess
+import sys
 from collections import defaultdict
 from dataclasses import dataclass
 from datetime import datetime
+from datetime import timedelta
 from datetime import timezone
 from pathlib import Path
+from typing import NamedTuple
 from typing import TypedDict
 from typing import cast
+
+from candidate_generators import CandidatesSpec, Enumeration, enumerate_candidates, read_candidates_spec
 
 RUST_DIR = Path(os.environ.get("STYLE_HISTORY_RUST_DIR", str(Path.home() / "rust")))
 NATE_STYLE_DIR = Path(os.environ.get("STYLE_HISTORY_NATE_STYLE_DIR", str(RUST_DIR / "nate_style")))
@@ -33,6 +39,21 @@ CLEAN_FIX_CONF_FILE = Path(
     )
 )
 LOG_DIR = Path(os.environ.get("STYLE_HISTORY_LOG_DIR", "/private/tmp/claude"))
+
+# Stop reasons that mean the helper itself declared the run finished. A pending
+# whose stop_reason is anything else was abandoned mid-run (agent quit early,
+# timeout kill, crash) — it must never be finalized into a history row, only
+# resumed.
+COMPLETED_STOP_REASONS = frozenset({"budget_reached", "exhausted", "quota_reached"})
+
+# Exit code for "refusing to finalize an incomplete run" so shell callers can
+# distinguish resume-and-relaunch from a real failure. argparse uses 2.
+EXIT_INCOMPLETE_RUN = 3
+
+# skipped_by values that mean the helper disposed the unit without an LLM call:
+# a pre_filter regex with zero matches, or a candidate generator that
+# enumerated zero sites. Free for quota purposes and excluded from hit rates.
+FREE_SKIP_SOURCES = frozenset({"pre_filter", "candidates"})
 
 
 class Outcome(TypedDict, total=False):
@@ -83,9 +104,16 @@ class ResultEntry(TypedDict, total=False):
     finding_source: str
 
 
+class DispositionEntry(TypedDict, total=False):
+    index: int
+    verdict: str  # "violation" | "exception"
+    clause: str  # required for "exception": which exception clause applies
+
+
 class ResultPayload(TypedDict, total=False):
     unit_id: str
     results: list[ResultEntry]
+    dispositions: list[DispositionEntry]
 
 
 class HistoryRow(TypedDict, total=False):
@@ -93,6 +121,7 @@ class HistoryRow(TypedDict, total=False):
     end_time: str
     reviewed_units: list[ReviewedUnit]
     evaluation_summary: dict[str, object]
+    fingerprint: str
 
 
 @dataclass(frozen=True)
@@ -227,8 +256,12 @@ def pre_filter_has_candidates(pattern: str, project_root: Path) -> bool:
     return result.returncode == 0
 
 
-def auto_record_pre_filter_skip(project: str, unit: "Unit") -> None:
-    """Record `no_findings` for a unit whose pre_filter found zero candidate sites."""
+def auto_record_pre_filter_skip(project: str, unit: "Unit", skipped_by: str = "pre_filter") -> None:
+    """Record `no_findings` for a unit the helper disposed without an LLM call.
+
+    `skipped_by` is `pre_filter` (skip-gate regex found zero matches) or
+    `candidates` (the unit's candidate generator enumerated zero sites).
+    """
     pending = load_pending(project)
     if not pending:
         return
@@ -240,7 +273,7 @@ def auto_record_pre_filter_skip(project: str, unit: "Unit") -> None:
         reviewed_units.append(
             {
                 "guideline_id": guideline_id,
-                "outcome": {"status": "no_findings", "skipped_by": "pre_filter"},
+                "outcome": {"status": "no_findings", "skipped_by": skipped_by},
             }
         )
     reviewed_unit_ids.append(unit.unit_id)
@@ -249,7 +282,7 @@ def auto_record_pre_filter_skip(project: str, unit: "Unit") -> None:
     pending["last_unit_id"] = unit.unit_id
     pending["last_unit_result"] = "no_findings"
     pending["updated_at"] = utc_now()
-    refresh_evaluation_summary(pending)
+    _ = refresh_evaluation_summary(pending)
     write_pending(project, pending)
 
 
@@ -275,17 +308,17 @@ def remove_pending(project: str) -> None:
     path.with_suffix(path.suffix + ".lock").unlink(missing_ok=True)
 
 
-def max_new_findings() -> int:
-    """Read `[style_eval] max_new_findings` from `clean-fix.conf`.
+def _style_eval_conf_int(conf_key: str) -> int:
+    """Read an int key from `[style_eval]` in `clean-fix.conf`.
 
-    Single source of truth for the per-run finding cap. Errors loudly if
-    missing — both the clean-fix script and the ad-hoc agent path depend on
-    this value, so silent defaulting would let arbitrary numbers leak in
-    (the bug that motivated centralizing this).
+    Single source of truth for eval tunables. Errors loudly if missing — both
+    the clean-fix script and the ad-hoc agent path depend on these values, so
+    silent defaulting would let arbitrary numbers leak in (the bug that
+    motivated centralizing max_new_findings).
     """
     if not CLEAN_FIX_CONF_FILE.exists():
         raise SystemExit(
-            f"clean-fix.conf not found at {CLEAN_FIX_CONF_FILE}; [style_eval] max_new_findings must be set there."
+            f"clean-fix.conf not found at {CLEAN_FIX_CONF_FILE}; [style_eval] {conf_key} must be set there."
         )
     current_section = ""
     for raw_line in CLEAN_FIX_CONF_FILE.read_text().splitlines():
@@ -298,16 +331,31 @@ def max_new_findings() -> int:
         if current_section != "style_eval" or "=" not in stripped:
             continue
         key, _, value = stripped.partition("=")
-        if key.strip() == "max_new_findings":
+        if key.strip() == conf_key:
             try:
                 return int(value.strip())
             except ValueError as exc:
                 raise SystemExit(
-                    f"[style_eval] max_new_findings in {CLEAN_FIX_CONF_FILE} is not an int: {value.strip()!r}"
+                    f"[style_eval] {conf_key} in {CLEAN_FIX_CONF_FILE} is not an int: {value.strip()!r}"
                 ) from exc
     raise SystemExit(
-        f"[style_eval] max_new_findings is not set in {CLEAN_FIX_CONF_FILE}"
+        f"[style_eval] {conf_key} is not set in {CLEAN_FIX_CONF_FILE}"
     )
+
+
+def max_new_findings() -> int:
+    """Per-run numbered-finding cap (`budget_reached` stop)."""
+    return _style_eval_conf_int("max_new_findings")
+
+
+def eval_unit_quota() -> int:
+    """Max LLM-reviewed units per run (`quota_reached` stop). Pre-filter skips are free."""
+    return _style_eval_conf_int("eval_unit_quota")
+
+
+def eval_ttl_days() -> int:
+    """Days a recorded unit verdict suppresses re-review (see `unit_is_due`)."""
+    return _style_eval_conf_int("eval_ttl_days")
 
 
 def count_findings_in_markdown(markdown: str) -> int:
@@ -641,7 +689,7 @@ def cross_project_hit_rates() -> dict[str, float]:
                 if not isinstance(guideline_id, str):
                     continue
                 outcome: Outcome = reviewed.get("outcome", {})
-                if outcome.get("skipped_by") == "pre_filter":
+                if outcome.get("skipped_by") in FREE_SKIP_SOURCES:
                     continue
                 reviews[guideline_id] += 1
                 if reviewed.get("finding_source") or outcome.get("status") not in (None, "no_findings"):
@@ -650,6 +698,129 @@ def cross_project_hit_rates() -> dict[str, float]:
         guideline_id: findings.get(guideline_id, 0) / count
         for guideline_id, count in reviews.items()
         if count > 0
+    }
+
+
+def project_fingerprint(project_root: Path) -> str:
+    """Hash of the code state a review verdict applies to.
+
+    Covers git HEAD, the working-tree status listing, the tracked diff, and
+    the style-guide corpus the project is judged against (so editing any
+    guideline changes the fingerprint). Untracked file *content* is not hashed
+    — only its path via `git status` — acceptable for a TTL gate that errs
+    toward re-reviewing.
+    """
+    hasher = hashlib.sha256()
+    for git_args in (("rev-parse", "HEAD"), ("status", "--porcelain"), ("diff", "HEAD")):
+        result = subprocess.run(
+            ["git", "-C", str(project_root), *git_args],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        hasher.update(result.stdout.encode())
+    for style_file in list_style_files(project_root):
+        hasher.update(str(style_file).encode())
+        try:
+            hasher.update(style_file.read_bytes())
+        except OSError:
+            continue
+    return hasher.hexdigest()
+
+
+def parse_utc_timestamp(value: str) -> datetime | None:
+    try:
+        return datetime.strptime(value, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+    except ValueError:
+        return None
+
+
+class LastReview(NamedTuple):
+    end_time: str
+    fingerprint: str
+
+
+def last_review_index(project: str) -> dict[str, LastReview]:
+    """Per-guideline most recent review: (row end_time, row fingerprint).
+
+    Pre-filter skips count as reviews — a deterministic zero-candidate check
+    is a valid verdict at that code state. Rows without a fingerprint (all
+    rows before the TTL feature, plus fix/failure rows) yield an empty
+    fingerprint, which `unit_is_due` treats as "state unknown → due once the
+    TTL expires".
+    """
+    index: dict[str, LastReview] = {}
+    for row in load_history(project):
+        entry = LastReview(row.get("end_time", ""), row.get("fingerprint", ""))
+        for reviewed in row.get("reviewed_units", []):
+            guideline_id = reviewed.get("guideline_id")
+            if isinstance(guideline_id, str):
+                index[guideline_id] = entry
+    return index
+
+
+def unit_is_due(
+    unit: Unit,
+    review_index: dict[str, LastReview],
+    current_fingerprint: str,
+    now: datetime,
+    ttl: timedelta,
+    project_root: Path,
+) -> bool:
+    """Whether a reviewable unit needs a fresh look this run.
+
+    Due triggers, per guideline:
+      - never reviewed in history
+      - the guideline file changed since its last review (immediate, TTL ignored)
+      - the last review is older than the TTL AND the project fingerprint has
+        changed since it was recorded
+
+    The fingerprint condition is the dormancy gate: re-sampling unchanged code
+    is how recall accumulates (single runs under-enumerate), but a project that
+    hasn't changed at all since its last full clean pass stops costing anything.
+    """
+    for guideline_id in unit.guideline_ids:
+        last = review_index.get(guideline_id)
+        if last is None:
+            return True
+        reviewed_at = parse_utc_timestamp(last.end_time)
+        if reviewed_at is None:
+            return True
+        path = guideline_path(guideline_id, project_root)
+        if not path.exists():
+            return True
+        if datetime.fromtimestamp(path.stat().st_mtime, tz=timezone.utc) > reviewed_at:
+            return True
+        if now - reviewed_at <= ttl:
+            continue
+        if not last.fingerprint or last.fingerprint != current_fingerprint:
+            return True
+    return False
+
+
+def due_units_payload(project_root: Path) -> dict[str, object]:
+    """Read-only report of which reviewable units are due right now.
+
+    `due_unit_count == 0` is the launch gate: the clean-fix skips spawning an
+    eval agent for the project entirely.
+    """
+    project = project_root.name.removesuffix("_style_fix")
+    reviewable = [unit for unit in build_units(project_root) if unit.budget_cost > 0]
+    current_fingerprint = project_fingerprint(project_root)
+    review_index = last_review_index(project)
+    now = datetime.now(tz=timezone.utc)
+    ttl = timedelta(days=eval_ttl_days())
+    due_ids = [
+        unit.unit_id
+        for unit in reviewable
+        if unit_is_due(unit, review_index, current_fingerprint, now, ttl, project_root)
+    ]
+    return {
+        "due_unit_count": len(due_ids),
+        "due_unit_ids": due_ids,
+        "fingerprint": current_fingerprint,
+        "reviewable_unit_total": len(reviewable),
+        "ttl_days": eval_ttl_days(),
     }
 
 
@@ -667,6 +838,21 @@ def start_run(project_root: Path) -> None:
     PENDING_DIR.mkdir(parents=True, exist_ok=True)
     project = project_root.name.removesuffix("_style_fix")
     cap = max_new_findings()
+    existing = load_pending(project)
+    if (
+        existing
+        and existing.get("phase") == "evaluation"
+        and existing.get("stop_reason", "") not in COMPLETED_STOP_REASONS
+    ):
+        # Resume an interrupted evaluation instead of resetting it. Early-quit
+        # agents and timeout kills leave a mid-run pending behind; its per-unit
+        # verdicts each went through record-unit and are as valid as any other.
+        # Refresh budget and unit totals in case the conf or guide changed.
+        existing["budget"] = cap
+        _ = refresh_evaluation_summary(existing, project_root)
+        existing["updated_at"] = utc_now()
+        write_pending(project, existing)
+        return
     totals = unit_totals(project_root)
     payload: PendingState = {
         "budget": cap,
@@ -688,7 +874,7 @@ def start_run(project_root: Path) -> None:
         "stop_reason": "",
         "updated_at": utc_now(),
     }
-    refresh_evaluation_summary(payload, project_root)
+    _ = refresh_evaluation_summary(payload, project_root)
     write_pending(project, payload)
 
 
@@ -728,7 +914,7 @@ def save_evaluation(project_root: Path, eval_path: Path) -> None:
     markdown = eval_path.read_text()
     pending["evaluation_markdown"] = markdown
     pending["evaluation_updated_at"] = utc_now()
-    refresh_evaluation_summary(pending, project_root)
+    _ = refresh_evaluation_summary(pending, project_root)
     pending["updated_at"] = utc_now()
     write_pending(project, pending)
 
@@ -749,7 +935,7 @@ def export_evaluation(project: str, output: Path, kind: str = "scratch") -> None
 
 def pending_summary_root(pending: PendingState, fallback: Path) -> Path:
     raw_root = pending.get("project_root", "")
-    if isinstance(raw_root, str) and raw_root:
+    if raw_root:
         stored_root = Path(raw_root).expanduser()
         if stored_root.exists():
             return stored_root.resolve()
@@ -823,7 +1009,7 @@ def next_unit(project_root: Path) -> dict[str, object]:
     evaluation_markdown = pending.get("evaluation_markdown", "")
     finding_count = count_findings_in_markdown(evaluation_markdown)
     pending["budget"] = budget
-    refresh_evaluation_summary(pending, project_root)
+    _ = refresh_evaluation_summary(pending, project_root)
     write_pending(project, pending)
     if finding_count >= budget:
         summary = refresh_evaluation_summary(pending, project_root, "budget_reached")
@@ -840,6 +1026,29 @@ def next_unit(project_root: Path) -> dict[str, object]:
             "stop_reason": "budget_reached",
         }
 
+    # Per-run unit quota: bound a single run to minutes instead of a full-guide
+    # sweep. Pre-filter skips are free (no LLM call) and do not count.
+    quota = eval_unit_quota()
+    llm_reviewed_count = sum(
+        1
+        for reviewed in pending.get("reviewed_units", [])
+        if reviewed.get("outcome", {}).get("skipped_by") not in FREE_SKIP_SOURCES
+    )
+    if llm_reviewed_count >= quota:
+        summary = refresh_evaluation_summary(pending, project_root, "quota_reached")
+        pending["updated_at"] = utc_now()
+        write_pending(project, pending)
+        return {
+            "budget": budget,
+            "checked_unit_count": summary.get("checked_unit_count", 0),
+            "coverage": summary.get("coverage", ""),
+            "non_negotiable_guideline_ids": non_negotiable_guideline_ids(project_root),
+            "reviewable_unit_total": summary.get("reviewable_unit_total", 0),
+            "scored_count": finding_count,
+            "status": "complete",
+            "stop_reason": "quota_reached",
+        }
+
     seen_unit_ids: set[str] = set(pending.get("reviewed_unit_ids", []))
     units = build_units(project_root)
     counts = review_counts(project_root)
@@ -847,11 +1056,21 @@ def next_unit(project_root: Path) -> dict[str, object]:
     # projects hit the budget cap and exit early instead of plowing through
     # guidelines that never produce findings.
     hit_rates = cross_project_hit_rates()
+    # TTL gate: only units that are due get re-reviewed. A unit reviewed clean
+    # within the TTL — or at the current fingerprint on a dormant project — is
+    # skipped entirely; "exhausted" now means "nothing due left", not "every
+    # guideline swept this run".
+    current_fingerprint = project_fingerprint(project_root)
+    review_index = last_review_index(project)
+    now = datetime.now(tz=timezone.utc)
+    ttl = timedelta(days=eval_ttl_days())
     sortable: list[tuple[float, int, int, str, Unit]] = []
     for unit in units:
         if unit.budget_cost == 0:
             continue
         if unit.unit_id in seen_unit_ids:
+            continue
+        if not unit_is_due(unit, review_index, current_fingerprint, now, ttl, project_root):
             continue
         unit_count = min(counts.get(guideline_id, 0) for guideline_id in unit.guideline_ids) if unit.guideline_ids else 0
         # Negate hit-rate so higher rates sort earlier under ascending sort.
@@ -863,13 +1082,24 @@ def next_unit(project_root: Path) -> dict[str, object]:
     # Walk candidates in sort order. For each, run its pre_filter (if any) against
     # the project tree. If the pattern finds zero matches, the violation cannot be
     # present — auto-record `no_findings` for the unit and continue to the next
-    # candidate without invoking the LLM.
+    # candidate without invoking the LLM. Generator-backed units additionally run
+    # their candidate generator here: zero candidates is the same free skip, and a
+    # non-empty list rides along in the unit payload as the agent's closed list.
+    enumeration: Enumeration | None = None
     while sortable:
+        enumeration = None
         _, unit_count, _, _, unit = sortable[0]
         if unit.pre_filter and not pre_filter_has_candidates(unit.pre_filter, project_root):
             auto_record_pre_filter_skip(project, unit)
             _ = sortable.pop(0)
             continue
+        spec = unit_candidates_spec(unit.unit_id, project_root)
+        if spec is not None:
+            enumeration = enumerate_candidates(spec, project_root)
+            if not enumeration.candidates:
+                auto_record_pre_filter_skip(project, unit, skipped_by="candidates")
+                _ = sortable.pop(0)
+                continue
         break
     else:
         pending = load_pending(project)
@@ -890,6 +1120,21 @@ def next_unit(project_root: Path) -> dict[str, object]:
         }
 
     summary = refresh_evaluation_summary(pending, project_root)
+    unit_payload: dict[str, object] = {
+        "budget_cost": unit.budget_cost,
+        "display_name": unit.display_name,
+        "guideline_ids": list(unit.guideline_ids),
+        "review_count_before": unit_count,
+        "see_also_guideline_ids": list(unit.see_also_guideline_ids),
+        "unit_id": unit.unit_id,
+    }
+    if enumeration is not None:
+        unit_payload["candidates"] = [
+            {"index": index, "file": candidate.file, "line": candidate.line, "text": candidate.text}
+            for index, candidate in enumerate(enumeration.candidates)
+        ]
+        unit_payload["candidate_count"] = len(enumeration.candidates)
+        unit_payload["candidate_source"] = enumeration.source
     return {
         "budget": budget,
         "checked_unit_count": summary.get("checked_unit_count", 0),
@@ -898,14 +1143,7 @@ def next_unit(project_root: Path) -> dict[str, object]:
         "reviewable_unit_total": summary.get("reviewable_unit_total", 0),
         "scored_count": finding_count,
         "status": "next",
-        "unit": {
-            "budget_cost": unit.budget_cost,
-            "display_name": unit.display_name,
-            "guideline_ids": list(unit.guideline_ids),
-            "review_count_before": unit_count,
-            "see_also_guideline_ids": list(unit.see_also_guideline_ids),
-            "unit_id": unit.unit_id,
-        },
+        "unit": unit_payload,
     }
 
 
@@ -928,6 +1166,13 @@ def record_unit(project_root: Path, results_path: Path, eval_path: Path) -> None
     reviewed_unit_ids: list[str] = list(pending.get("reviewed_unit_ids", []))
     if unit_id in reviewed_unit_ids:
         raise SystemExit(f"Unit already recorded in this run: {unit_id}")
+
+    # Generator-backed units: re-run the (deterministic, cheap) generator and
+    # refuse the record unless every candidate carries a disposition. An
+    # early-quitting agent cannot silently narrow coverage.
+    spec = unit_candidates_spec(unit_id, project_root)
+    if spec is not None:
+        verify_dispositions(unit_id, payload, enumerate_candidates(spec, project_root))
 
     evaluation_markdown = (
         eval_path.read_text()
@@ -987,7 +1232,7 @@ def record_unit(project_root: Path, results_path: Path, eval_path: Path) -> None
         pending["last_unit_result"] = "finding"
     else:
         pending["last_unit_result"] = "no_findings"
-    refresh_evaluation_summary(pending, project_root)
+    _ = refresh_evaluation_summary(pending, project_root)
     write_pending(project, pending)
 
 
@@ -1119,13 +1364,36 @@ def finalize_no_findings(project: str) -> None:
     pending = load_pending(project)
     if not pending:
         return
-    refresh_evaluation_summary(pending)
+    _ = refresh_evaluation_summary(pending)
+    stop_reason = pending.get("stop_reason", "")
+    if stop_reason not in COMPLETED_STOP_REASONS:
+        # The helper never declared this run complete — the agent stopped on
+        # its own (or was killed). Recording it would write a fake-clean row
+        # into history and poison the hit-rate stats; keep the pending so the
+        # next run resumes from its recorded units instead of starting over.
+        coverage = pending.get("evaluation_summary", {}).get("coverage", "")
+        message = (
+            f"finalize-no-findings: refusing {project} — run incomplete"
+            + f" (stop_reason={stop_reason or 'none'}, coverage={coverage}); pending kept for resume"
+        )
+        print(message, file=sys.stderr)
+        raise SystemExit(EXIT_INCOMPLETE_RUN)
+    # Stamp the code state the clean verdicts were earned at. This is what
+    # lets `unit_is_due` keep a dormant project's verdicts alive past the TTL.
+    fingerprint = ""
+    raw_root = pending.get("project_root", "")
+    if raw_root:
+        root = Path(raw_root).expanduser()
+        if root.exists():
+            fingerprint = project_fingerprint(root)
     row: HistoryRow = {
         "start_time": pending.get("start_time", ""),
         "end_time": utc_now(),
         "evaluation_summary": history_summary(pending),
         "reviewed_units": list(pending.get("reviewed_units", [])),
     }
+    if fingerprint:
+        row["fingerprint"] = fingerprint
     append_jsonl_history(history_file(project), row)
     remove_pending(project)
 
@@ -1135,7 +1403,7 @@ def last_findings(project: str) -> str:
     for row in reversed(rows):
         for reviewed in row.get("reviewed_units", []):
             outcome: Outcome = reviewed.get("outcome", {})
-            if outcome.get("skipped_by") == "pre_filter":
+            if outcome.get("skipped_by") in FREE_SKIP_SOURCES:
                 continue
             if reviewed.get("finding_source") or outcome.get("status") not in (None, "no_findings"):
                 end_time = row.get("end_time", "")
@@ -1145,7 +1413,7 @@ def last_findings(project: str) -> str:
 
 def is_finding_like(reviewed: ReviewedUnit) -> bool:
     outcome: Outcome = reviewed.get("outcome", {})
-    if outcome.get("skipped_by") == "pre_filter":
+    if outcome.get("skipped_by") in FREE_SKIP_SOURCES:
         return False
     status = outcome.get("status")
     finding_source = reviewed.get("finding_source") or outcome.get("finding_source")
@@ -1156,6 +1424,72 @@ def guideline_path(guideline_id: str, project_root: Path) -> Path:
     if guideline_id.startswith("docs/style/"):
         return project_root / guideline_id
     return NATE_STYLE_DIR / guideline_id
+
+
+def unit_candidates_spec(guideline_id: str, project_root: Path) -> CandidatesSpec | None:
+    """The unit's `candidates:` frontmatter spec, or None for agent-enumerated units."""
+    path = guideline_path(guideline_id, project_root)
+    if not path.exists():
+        return None
+    return read_candidates_spec(path)
+
+
+def verify_dispositions(unit_id: str, payload: ResultPayload, enumeration: Enumeration) -> None:
+    """Refuse a generator-backed record whose dispositions don't close the candidate list.
+
+    Same loud-failure posture as `finalize-no-findings`: exit EXIT_INCOMPLETE_RUN
+    so wrappers treat it as an incomplete run, not a crash.
+    """
+
+    def refuse(reason: str) -> None:
+        print(f"record-unit: refusing {unit_id} — {reason}", file=sys.stderr)
+        raise SystemExit(EXIT_INCOMPLETE_RUN)
+
+    expected = len(enumeration.candidates)
+    dispositions: list[DispositionEntry] = list(payload.get("dispositions", []))
+    if expected == 0:
+        return
+    if not dispositions:
+        refuse(
+            f"unit has {expected} helper-enumerated candidates but the results payload"
+            + " carries no dispositions array"
+        )
+    seen: set[int] = set()
+    violation_count = 0
+    for entry in dispositions:
+        index = entry.get("index")
+        verdict = entry.get("verdict")
+        if not isinstance(index, int) or index in seen:
+            refuse(f"disposition index {index!r} is missing, non-integer, or duplicated")
+            return
+        seen.add(index)
+        if verdict == "violation":
+            violation_count += 1
+        elif verdict == "exception":
+            if not entry.get("clause"):
+                refuse(f"candidate {index} verdict 'exception' has no clause naming the exception")
+        else:
+            refuse(f"candidate {index} has verdict {verdict!r}; expected 'violation' or 'exception'")
+    missing = set(range(expected)) - seen
+    extra = seen - set(range(expected))
+    if missing or extra:
+        refuse(
+            f"dispositions cover {sorted(seen)} but the generator enumerates {expected}"
+            + f" candidates (missing {sorted(missing)}, extra {sorted(extra)});"
+            + f" candidate_source={enumeration.source}"
+        )
+    if violation_count > 0:
+        has_finding = any(
+            result.get("outcome", {}).get("status") == "finding"
+            or result.get("finding_source") in ("new", "carried_forward")
+            or result.get("outcome", {}).get("finding_source") in ("new", "carried_forward")
+            for result in payload.get("results", [])
+        )
+        if not has_finding:
+            refuse(
+                f"{violation_count} candidate(s) dispositioned as violations but no result"
+                + " records a finding"
+            )
 
 
 def guideline_title(guideline_id: str, project_root: Path) -> str:
@@ -1214,7 +1548,7 @@ def recover_evaluation(project: str, project_root: Path, output: Path) -> None:
             markdown = "\n".join(recovery_notice(project, f"scratch file `{scratch}`"))
             markdown += "\n\n"
             markdown += scratch_markdown
-            output.write_text(markdown)
+            _ = output.write_text(markdown)
             print(f"Recovered {project} style-fix evaluation from {scratch}")
             return
 
@@ -1280,7 +1614,7 @@ def recover_evaluation(project: str, project_root: Path, output: Path) -> None:
         "- **tests:** unknown from recovered history row",
         "",
     ]
-    output.write_text("\n".join(lines))
+    _ = output.write_text("\n".join(lines))
     print(f"Recovered {project} style-fix evaluation from history row {row.get('end_time', '')}")
 
 
@@ -1298,7 +1632,7 @@ def finalize_fix(project_root: Path, eval_path: Path) -> None:
     pending["evaluation_markdown"] = markdown
     pending["evaluation_updated_at"] = now
     summary_root = pending_summary_root(pending, project_root)
-    refresh_evaluation_summary(pending, summary_root)
+    _ = refresh_evaluation_summary(pending, summary_root)
     fix_results = parse_fix_results(eval_path, project_root)
     eval_guidelines: set[str] = set(parse_eval_guidelines(eval_path, project_root).values())
     reviewed_units: list[ReviewedUnit] = []
@@ -1347,7 +1681,7 @@ def finalize_failure(project: str, reason: str) -> None:
     if not pending:
         return
     now = utc_now()
-    refresh_evaluation_summary(pending)
+    _ = refresh_evaluation_summary(pending)
     reviewed_units: list[ReviewedUnit] = []
     for reviewed in pending.get("reviewed_units", []):
         existing_outcome: Outcome = reviewed.get("outcome", {})
@@ -1435,6 +1769,15 @@ def parse_args() -> argparse.Namespace:
     )
     no_findings = subparsers.add_parser("finalize-no-findings")
     _ = no_findings.add_argument("--project", required=True)
+    due = subparsers.add_parser(
+        "due-units",
+        help="Read-only: report which reviewable units are due under the eval TTL at the current code state.",
+    )
+    _ = due.add_argument("--project-root", required=True)
+    _ = due.add_argument(
+        "--field",
+        choices=("due_unit_count", "fingerprint", "reviewable_unit_total", "ttl_days"),
+    )
     last = subparsers.add_parser(
         "last-findings",
         help="Print end_time of the most recent history row with a real finding outcome, or 'never'.",
@@ -1451,6 +1794,16 @@ def parse_args() -> argparse.Namespace:
     phase = subparsers.add_parser("set-phase")
     _ = phase.add_argument("--project", required=True)
     _ = phase.add_argument("--phase", required=True)
+    enum_cmd = subparsers.add_parser(
+        "enumerate-candidates",
+        help="Read-only: run a guideline's candidate generator and print the candidate list.",
+    )
+    _ = enum_cmd.add_argument("--project-root", required=True)
+    _ = enum_cmd.add_argument(
+        "--guideline",
+        required=True,
+        help="Guideline to enumerate. Accepts stem, filename, guideline id, or absolute path.",
+    )
     focused = subparsers.add_parser(
         "focused-eval",
         help="Read-only: emit one JSON unit per requested guideline (no pending/history state).",
@@ -1531,6 +1884,14 @@ def main() -> None:
     if command == "finalize-no-findings":
         finalize_no_findings(_arg_str(args, "project"))
         return
+    if command == "due-units":
+        payload = due_units_payload(Path(_arg_str(args, "project_root")).expanduser().resolve())
+        field = getattr(args, "field")  # pyright: ignore[reportAny]
+        if isinstance(field, str):
+            print(payload[field])
+        else:
+            print(json.dumps(payload, indent=2, sort_keys=True))
+        return
     if command == "last-findings":
         print(last_findings(_arg_str(args, "project")))
         return
@@ -1545,6 +1906,26 @@ def main() -> None:
         return
     if command == "set-phase":
         set_phase(_arg_str(args, "project"), _arg_str(args, "phase"))
+        return
+    if command == "enumerate-candidates":
+        project_root = Path(_arg_str(args, "project_root")).expanduser().resolve()
+        target = resolve_focus_targets([_arg_str(args, "guideline")], project_root)[0]
+        spec = read_candidates_spec(target)
+        if spec is None:
+            raise SystemExit(f"{target} has no candidates: block in its frontmatter.")
+        enumeration = enumerate_candidates(spec, project_root)
+        print(json.dumps(
+            {
+                "candidate_count": len(enumeration.candidates),
+                "candidate_source": enumeration.source,
+                "candidates": [
+                    {"index": index, "file": c.file, "line": c.line, "text": c.text}
+                    for index, c in enumerate(enumeration.candidates)
+                ],
+            },
+            indent=2,
+            sort_keys=True,
+        ))
         return
     if command == "focused-eval":
         project_root = Path(_arg_str(args, "project_root")).expanduser().resolve()
