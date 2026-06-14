@@ -139,7 +139,7 @@
     ]
   },
   "alwaysThinkingEnabled": true,
-  "effortLevel": "xhigh",
+  "effortLevel": "high",
   "skipDangerousModePermissionPrompt": true,
   "teammateMode": "tmux",
   "inputNeededNotifEnabled": true,
