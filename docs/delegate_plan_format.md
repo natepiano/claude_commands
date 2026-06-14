@@ -79,6 +79,19 @@ e.g. `cargo nextest run` green + a named test + an observable behavior.>
 
 ---
 
+## Forward-propagation <!-- shared rule; cited by /plan:phase_review and /plan:to_phased_plan -->
+
+**Propagate-Forward.** Whenever a phase is added, edited, or completed, the
+concrete facts it produces — new types/signatures, file paths, decisions that now
+bind — must be pushed into the **Constraints from prior phases** of every later
+phase that would otherwise re-derive them. This is the single mechanism that lets
+the next `/plan:delegate` assemble its prompt with zero codebase research. After
+propagation, each remaining Work Order must still be implementable from its named
+**Files** + **Delegation Context** alone; if a change widened scope, update
+**Files** and **Spec** to match.
+
+---
+
 ## Rules
 
 1. **Delegation Context is written once.** Per-phase Work Orders reference it

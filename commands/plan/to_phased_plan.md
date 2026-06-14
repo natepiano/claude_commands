@@ -16,12 +16,17 @@ conversation; if none, ask for the path. Do not guess.
 
 This command rewrites the doc **in place**. It does not write code.
 
+This command is **idempotent**. Run it on a fresh design (compile mode) or on an
+already-compiled, in-progress plan to bring a hand-inserted or edited phase up to
+Work Order standard (reconcile mode). `<Locate/>` picks the mode; every later step
+branches on it.
+
 ---
 
 <ExecutionSteps>
 **EXECUTE IN ORDER:**
 
-**STEP 1:** Execute <Locate/>
+**STEP 1:** Execute <Locate/> — sets ${MODE} ∈ {compile, reconcile}
 **STEP 2:** Execute <GatherContext/>
 **STEP 3:** Execute <Restructure/>
 **STEP 4:** Execute <Rewrite/>
@@ -32,15 +37,38 @@ This command rewrites the doc **in place**. It does not write code.
 
 <Locate>
 Resolve the plan doc path (argument → conversation inference → ask). Read it.
-State the path in one line: `Compiling <relative/path> into a delegate-ready plan.`
 
 Read `~/.claude/docs/delegate_plan_format.md` — it is the target format and the
 contract `/plan:delegate`, `/plan:phase_review`, and `/plan:to_as_built` all depend on.
+
+**Detect the mode.** The doc is already delegate-ready if it has both a
+`## Delegation Context` section and the `Status: IMPLEMENTATION PLAN — phased,
+delegate-ready` line.
+
+- Not delegate-ready → **${MODE} = compile** (the original full compile).
+  State: `Compiling <relative/path> into a delegate-ready plan.`
+- Already delegate-ready → **${MODE} = reconcile**. The plan is in flight; the job
+  is to bring uncompiled/edited phases up to standard without disturbing the rest.
+  State: `Reconciling <relative/path> — already delegate-ready; compiling uncompiled phases only.`
+
+In **reconcile** mode, also identify the **target phases**: every `todo` phase
+whose body is *not* a well-formed `#### Work Order` (rough narrative, a stub, a
+hand-inserted phase like `4a`), plus any phase `$ARGUMENTS` names explicitly.
+`done` phases and `todo` phases that already carry a complete Work Order are **not**
+targets — they are preserved byte-for-byte. List the target phases in one line.
 </Locate>
 
 ---
 
 <GatherContext>
+**Reconcile mode:** the `## Delegation Context` block already exists — do **not**
+regenerate it and do **not** run the full sweep below. Reuse it as-is. Only if a
+target phase names files absent from its **Key files** list, dispatch a *narrow*
+Explore for just those files (return `path — role` rows to append), leaving the
+rest of the block untouched. Then skip to `<Restructure/>`.
+
+**Compile mode** (the rest of this step):
+
 **Goal:** produce the **Delegation Context** block without spending orchestrator
 tokens on exploration.
 
@@ -103,12 +131,34 @@ not codebase searching.
    commit ref, Work Order, and any existing Retrospective as the archive zone. Do
    not rewrite shipped history. Only compile the remaining `todo` phases into
    Work Orders.
+
+**Reconcile mode** narrows steps 1–3 to the **target phases** from `<Locate/>`:
+
+- Do **not** re-decompose the plan or touch the phase spine — the insert/edit
+  already set it.
+- Compile **only** the target phases into Work Orders (steps 2–3 above, applied to
+  each target). Already-complete `todo` Work Orders and all `done` phases are left
+  byte-for-byte unchanged — no churn, no drift.
+- **Forward-propagate.** For each freshly compiled target phase, apply the
+  **Propagate-Forward** rule from the format doc (`~/.claude/docs/delegate_plan_format.md`
+  → "Forward-propagation"): push the facts it produces into the **Constraints from
+  prior phases** of every *later* phase that depends on them. Inserting `4a` between
+  done-`4` and todo-`5` means `5+` may now depend on what `4a` builds — this step is
+  what keeps them dispatch-ready. This is the only edit reconcile mode makes to a
+  non-target phase, and it touches only the **Constraints from prior phases** field.
 </Restructure>
 
 ---
 
 <Rewrite>
-Rewrite the doc **in place** to the format-doc structure:
+**Reconcile mode:** make **surgical Edits only** — never a full-doc rewrite. Edit
+each target phase's body into a `#### Work Order`, append any new **Key files** rows
+to the existing Delegation Context, and edit the **Constraints from prior phases**
+of the later phases the propagation step touched. Leave every other byte (title,
+status line, done phases, untouched todo phases, links) exactly as found. Then go to
+`<Report/>`.
+
+**Compile mode:** rewrite the doc **in place** to the format-doc structure:
 
 1. Title + a one-line `> **Status: IMPLEMENTATION PLAN — phased, delegate-ready.**`
 2. `## Delegation Context` = ${DELEGATION_CONTEXT}.
@@ -124,7 +174,7 @@ Do not change code. Do not commit.
 ---
 
 <Report>
-Produce a succinct markdown table:
+**Compile mode** — produce a succinct markdown table:
 
 ```markdown
 | Area | Result |
@@ -133,6 +183,18 @@ Produce a succinct markdown table:
 | Live phases | <count of todo phases, with titles> |
 | Archived | <count of done phases preserved, or None> |
 | Stripped | <what design narrative was removed and folded where> |
+| Next | `/plan:delegate <plan path> phase <first todo N>` |
+```
+
+**Reconcile mode** — report what changed vs what was left alone:
+
+```markdown
+| Area | Result |
+| --- | --- |
+| Mode | Reconcile (already delegate-ready) |
+| Compiled (new) | <target phases brought up to Work Order, with titles> |
+| Propagated | <later phases whose Constraints from prior phases were updated, or None> |
+| Preserved | <count of done + already-compiled todo phases left untouched> |
 | Next | `/plan:delegate <plan path> phase <first todo N>` |
 ```
 
@@ -150,3 +212,7 @@ Then stop. Do not start implementing a phase.
 - Every remaining Work Order must satisfy the format doc's self-containment rule:
   a fresh codex implements it from the named files + Delegation Context, no search.
 - Never delete completed-phase history. Strip design *narrative*, not shipped facts.
+- Reconcile mode is **additive and surgical**: it compiles uncompiled/edited phases
+  and propagates their facts forward (format doc → "Forward-propagation"). It never
+  re-runs the full Explore sweep, never re-decomposes the spine, and never rewrites
+  a `done` phase or an already-complete `todo` Work Order.

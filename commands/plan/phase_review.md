@@ -67,11 +67,10 @@ The subagent does **not** edit the plan. It returns findings only.
 **Delegate-ready plans only** (skip for plans not in the format-doc structure).
 Before processing findings, keep the remaining Work Orders dispatch-ready:
 
-1. **Propagate forward.** Add the concrete facts the just-shipped phase produced
-   that a later delegate would otherwise re-derive — new types/signatures, file
-   paths, decisions that now bind — into the **Constraints from prior phases** of
-   the phase(s) that need them. This is the single most important maintenance step:
-   it is what lets the next `/plan:delegate` assemble without research.
+1. **Propagate forward.** Apply the **Propagate-Forward** rule from the format doc
+   (`~/.claude/docs/delegate_plan_format.md` → "Forward-propagation") for the facts
+   the just-shipped phase produced. This is the single most important maintenance
+   step: it is what lets the next `/plan:delegate` assemble without research.
 2. **Apply each Q6 finding** by editing the named Work Order in place — add the
    missing constraint, fix the drifted file/line ref, adjust the **Spec** or
    **Acceptance gate**. Do not record these as prose-only notes; the Work Order
