@@ -17,6 +17,7 @@ import argparse
 import re
 import sys
 import time
+from datetime import datetime
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TypedDict, cast
@@ -312,6 +313,37 @@ def pending_evaluation_markdown(project: str) -> str:
         if isinstance(markdown, str):
             return markdown
     return ""
+
+
+def pending_eval_produced_at(project: str) -> str | None:
+    """Local-time label for when the pending evaluation was produced.
+
+    Reads the pending JSON's evaluation timestamp (UTC ISO-8601) and renders it
+    in local time, matching the "Mon Jun 15 10:25" phrasing the eval skip
+    reasons already use. mtime is unusable here: the fix pass mutates the
+    pending file as it consumes the finding, so its mtime is the consumption
+    time, not the production time.
+    """
+    pending_path = PENDING_DIR / f"{project}.json"
+    if not pending_path.exists():
+        return None
+    try:
+        parsed = _load_json_value(pending_path.read_text(errors="replace"))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(parsed, dict):
+        return None
+    fields = cast(dict[str, object], parsed)
+    for key in ("evaluation_updated_at", "start_time", "updated_at"):
+        raw = fields.get(key)
+        if not isinstance(raw, str) or not raw:
+            continue
+        try:
+            stamp = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        except ValueError:
+            continue
+        return stamp.astimezone().strftime("%a %b %-d %H:%M")
+    return None
 
 
 class HeartbeatStatus(TypedDict):
@@ -1089,11 +1121,50 @@ def _prune_bookkeeping_rows(result: ParseResult) -> None:
     ]
 
 
+def eval_fix_handoff_reason(result: ParseResult, project: str) -> str | None:
+    """One causal sentence when eval paused because fix is consuming its finding.
+
+    On a single run eval logs SKIP (pending findings/reviewed_findings) while fix
+    picks those same findings up and applies them. Rendered per-phase the row
+    reads as two unrelated cells (eval SKIP, fix RUNNING); this reframes it as the
+    producer->consumer handoff it is and dates the finding from the pending
+    evaluation. Returns None when the row is not in that handoff state.
+    """
+    row = result.rows[project]
+    if row["eval"].state != "SKIP":
+        return None
+    skip = next(
+        (s for s in result.skip_reasons if s.phase == "eval" and s.project == project),
+        None,
+    )
+    reason = skip.reason if skip is not None else humanize_cell_reason(row["eval"].reason)
+    if reason.startswith("reviewed findings"):
+        noun = "a reviewed finding"
+    elif reason.startswith("new style findings"):
+        noun = "a new style finding"
+    else:
+        return None
+    when = ""
+    produced = pending_eval_produced_at(project)
+    if produced is not None:
+        when = f" from {produced}"
+    fix_state = row["fix"].state
+    if fix_state == "RUNNING":
+        return f"applying {noun}{when}; eval paused until it clears"
+    if fix_state == "OK":
+        return (
+            f"applied {noun}{when} — worktree ready for /style_fix_review; "
+            "eval resumes next run"
+        )
+    return None
+
+
 def row_reason(result: ParseResult, project: str) -> str:
     """Return a compact reason for the row's non-OK state."""
     row = result.rows[project]
     reasons: list[str] = []
     seen: set[str] = set()
+    handoff = eval_fix_handoff_reason(result, project)
 
     def add(reason: str) -> None:
         reason = reason.strip()
@@ -1135,11 +1206,16 @@ def row_reason(result: ParseResult, project: str) -> str:
             )
             add(f"{phase}: {reason}")
         elif cell.state == "RUNNING":
+            if phase == "fix" and handoff is not None:
+                continue  # folded into the eval handoff clause below
             if live_phase:
                 add(live_phase)
             else:
                 add(f"{phase}: {running_by_phase.get(phase) or 'running'}")
         elif cell.state == "SKIP":
+            if phase == "eval" and handoff is not None:
+                add(handoff)
+                continue
             reason = (
                 skips_by_phase.get(phase)
                 or humanize_cell_reason(cell.reason)
@@ -1147,6 +1223,8 @@ def row_reason(result: ParseResult, project: str) -> str:
             )
             add(f"{phase}: {reason}")
         elif phase == "fix" and cell.state == "OK":
+            if handoff is not None:
+                continue  # folded into the eval handoff clause
             add("fix applied — worktree ready for /style_fix_review")
         elif phase == "eval" and cell.state == "OK" and cell.reason == "no-findings":
             add("eval: no violations found")
