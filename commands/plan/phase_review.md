@@ -4,6 +4,8 @@ description: After implementing a phase of a multi-phase plan, append a retrospe
 
 Use this after the agent has just finished implementing a phase of a multi-phase plan that is already in conversation context. The command updates the plan with what was learned, then asks an architect subagent to re-evaluate the remaining phases against that learning, then folds the findings back into the plan and reports a plain-language summary.
 
+**Delegate-ready plans.** If the plan follows `~/.claude/docs/delegate_plan_format.md` (a `## Delegation Context` section + per-phase `#### Work Order`), this command must keep every remaining phase **dispatch-ready**: learnings are folded *into* the remaining Work Orders (Spec, Files, Acceptance gate, and especially **Constraints from prior phases**), not merely appended as review notes. The test after this command runs: `/plan:delegate <plan> phase <next>` can assemble its prompt with zero codebase research. See `<MaintainWorkOrders/>` in Step 5.
+
 ## Step 1: Locate the plan doc
 
 The plan doc should already be in conversation context — it is the doc the just-completed phase came from.
@@ -24,7 +26,7 @@ If the conversation does not make the phase obvious, ask the user one clarifying
 
 Edit the plan doc to:
 
-1. Mark the phase complete in whatever convention the plan already uses (checkbox, status line, heading suffix). Match the existing style — do not introduce a new one.
+1. Mark the phase complete in whatever convention the plan already uses (checkbox, status line, heading suffix). Match the existing style — do not introduce a new one. For a delegate-ready plan, set the phase `status: done (<commit>)` and keep its `#### Work Order` verbatim as the archive record.
 2. Append a **Retrospective** subsection inside that phase (or directly after it if the phase has no body container). Use this template:
 
    ```markdown
@@ -54,14 +56,39 @@ The prompt to the subagent must include:
   3. Are there new risks, dependencies, or sequencing constraints that the plan does not yet name?
   4. Are any assumptions in the remaining phases now invalidated?
   5. Are there gaps — work the plan does not cover but that the implemented phase has revealed as necessary?
+  6. (Delegate-ready plans only) For each remaining phase, is its `#### Work Order` still self-contained — could a fresh codex session implement it from the named files + Delegation Context alone? Name any Work Order that now needs an added **Constraints from prior phases** fact, a corrected file/line ref, or a changed acceptance gate because of what just shipped.
 - Output format: a numbered list of findings. Each finding has a one-line title, a body of one to three sentences, and a `Severity:` tag — `minor` (safe to edit straight into the plan), or `significant` (changes scope, ordering, or architectural intent and needs user approval before editing).
 
 The subagent does **not** edit the plan. It returns findings only.
 
 ## Step 5: Fold findings back into the plan
 
+<MaintainWorkOrders>
+**Delegate-ready plans only** (skip for plans not in the format-doc structure).
+Before processing findings, keep the remaining Work Orders dispatch-ready:
+
+1. **Propagate forward.** Add the concrete facts the just-shipped phase produced
+   that a later delegate would otherwise re-derive — new types/signatures, file
+   paths, decisions that now bind — into the **Constraints from prior phases** of
+   the phase(s) that need them. This is the single most important maintenance step:
+   it is what lets the next `/plan:delegate` assemble without research.
+2. **Apply each Q6 finding** by editing the named Work Order in place — add the
+   missing constraint, fix the drifted file/line ref, adjust the **Spec** or
+   **Acceptance gate**. Do not record these as prose-only notes; the Work Order
+   text itself must change so it stays self-contained.
+3. **Self-containment check.** After edits, each remaining Work Order must still be
+   implementable from its named files + Delegation Context alone. If a finding
+   widened scope, update **Files** and **Spec** to match.
+
+Mechanical Work Order edits (added constraints, corrected refs, gate tweaks) need
+no user gate — they go straight in. A finding that changes a remaining phase's
+*intent, scope, or ordering* is a significant finding: route it through
+`<SignificantFindings/>` below, and once resolved, write the outcome into the
+affected Work Order, not just the Phase N Review block.
+</MaintainWorkOrders>
+
 <MinorFindings>
-Edit each minor finding straight into the plan — inline amendment to the affected remaining phase or a short note under that phase. No user gate.
+Edit each minor finding straight into the plan — inline amendment to the affected remaining phase or a short note under that phase. No user gate. For a delegate-ready plan, "inline amendment" means editing the affected phase's Work Order per `<MaintainWorkOrders/>`.
 </MinorFindings>
 
 <SignificantFindings>

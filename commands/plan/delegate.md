@@ -6,7 +6,7 @@ description: Delegate coding work to a Codex CLI session — Claude orchestrates
 
 **Purpose:** Claude is the design/orchestration brain; codex does all coding. This command composes an implementation work order, dispatches it to codex, runs a dual review (a fresh blind codex session + Claude's own analysis), synthesizes the results, and routes fixes back to codex.
 
-**Usage:** `/delegate [plan-doc-path] [phase N] [free-text instructions]`
+**Usage:** `/plan:delegate [plan-doc-path] [phase N] [free-text instructions]`
 
 **Arguments** — all optional, all combinable:
 - A path to a design/plan/implementation doc → the work spec
@@ -28,7 +28,7 @@ FIX_PASS = 0 (max 2)
 **STEP 3:** Execute <LaunchImplementation/>
 **STEP 4:** Execute <DualReview/>
 **STEP 5:** Execute <Synthesize/>
-**STEP 6:** Execute <OfferPhaseReview/> (only when working from a phased plan)
+**STEP 6:** Execute <RunPhaseReview/> (required when working from a phased plan)
 </ExecutionSteps>
 
 ---
@@ -47,8 +47,20 @@ FIX_PASS = 0 (max 2)
 **Goal:** Write an implementation prompt that lets codex implement without ambiguity or questions.
 
 1. Parse $ARGUMENTS into: doc path (if any), phase/section (if any), free-text instructions (if any). If all empty, infer the work from the conversation.
-2. If a doc path was given, Read it. Extract the applicable phase/section.
-3. Write ${SESSION_DIR}/implementation_prompt.md using the **Write tool** (NOT Bash heredoc):
+
+2. If a doc path was given, Read it. Decide whether it is a **delegate-ready plan** (per `~/.claude/docs/delegate_plan_format.md`): it has a `## Delegation Context` section **and** the target phase has a `#### Work Order`. Branch:
+
+**FAST PATH — delegate-ready plan. Assemble; do NOT research the codebase.**
+`/plan:to_phased_plan` already paid the research cost and baked it into the doc. Build `${SESSION_DIR}/implementation_prompt.md` by copy-and-assemble:
+- **Project Context** = the doc's `## Delegation Context` block verbatim + the target phase's **Constraints from prior phases**.
+- **Work Specification** = the target phase's **Goal**, **Spec**, and **Files** verbatim + any free-text the user added on the command line.
+- **Style Requirements** = the standard block (see fallback template), included only if Delegation Context names a **Style** line.
+- **Verification** = Delegation Context **Build / Test / Lint** + the phase **Acceptance gate**.
+
+Prepend the boilerplate header (the first paragraph of the template below) and write the file with the **Write tool**. Do not open codebase files to fill gaps — if a needed fact is absent, the *plan* is at fault: name the gap in one line, proceed with what the doc gives, and let the review catch the rest. This path should cost a few thousand tokens, not tens of thousands.
+
+**FALLBACK PATH — no Work Order (free-text, conversation-inferred, or a pre-`/plan:to_phased_plan` doc).**
+Research and compose. If a doc path was given, extract the applicable phase/section. Write `${SESSION_DIR}/implementation_prompt.md` with the **Write tool** (NOT Bash heredoc) using this template:
 
 ```
 You are implementing a code change. Write the code. Make the changes directly
@@ -85,15 +97,17 @@ Follow them in all code you write.
 command, clippy, etc. — match the project's conventions.]
 ```
 
-**Key principles:**
+**Key principles (fallback):**
 - Quote the plan section verbatim — do not paraphrase the spec
 - Be specific enough that codex never has to guess; it cannot ask questions
 - Point to files codex can read itself rather than dumping file contents
 - Include the no-commit / no-branch rules verbatim — codex must leave the tree dirty for review
 
-4. Tell the user in one line what is being dispatched and the prompt path:
+3. Tell the user in one line what is being dispatched and the prompt path:
    `Dispatching <scope summary> to codex — prompt at ${SESSION_DIR}/implementation_prompt.md`
    Do NOT ask for confirmation — invoking the command is the authorization.
+
+   If this was the fast path, add: `(assembled from <plan>'s Phase N Work Order — no research)`.
 </ComposeWorkOrder>
 
 ---
@@ -205,25 +219,23 @@ What next?
 **STOP and wait for the user.**
 
 - **1:** If ${FIX_PASS} >= 2, tell the user the fix-pass cap is reached and recommend either accepting, discussing, or explicitly authorizing Claude to fix directly. Otherwise increment ${FIX_PASS}, write ${SESSION_DIR}/fix_prompt_${FIX_PASS}.md (same structure as the work order, spec = the confirmed issues table with file/line specifics, same no-commit rules and style requirements), run `codex_implement.sh "${SESSION_DIR}" "${WORKING_DIR}" "${SESSION_DIR}/fix_prompt_${FIX_PASS}.md"` (background, unsandboxed), then re-execute <DualReview/> and <Synthesize/> scoped to the new changes.
-- **2:** Continue to <OfferPhaseReview/>.
+- **2:** Continue to <RunPhaseReview/>.
 - **3:** Discuss; afterwards re-offer the options.
 
-If there are no issues (or nits only), state that and continue to <OfferPhaseReview/>.
+If there are no issues (or nits only), state that and continue to <RunPhaseReview/>.
 
 **RULE:** Claude does not write or edit implementation code in this command unless the user explicitly says so. All fixes route to codex by default.
 </Synthesize>
 
 ---
 
-<OfferPhaseReview>
-**Only when the work came from a phased plan doc.** Ask the user:
+<RunPhaseReview>
+**Only when the work came from a phased plan doc.** A phase review is mandatory — do not ask, do not offer to skip.
 
-`Run /phase_review to update <plan doc> (retrospective + remaining-phase re-evaluation)?`
-
-If yes, invoke the `phase_review` skill. When writing the retrospective, include relevant facts from ${CODEX_REVIEW} and the fix passes (e.g. what the blind reviewer caught, what deviated from spec).
+Tell the user in one line: `Phased plan — running /plan:phase_review to update <plan doc> (retrospective + remaining-phase re-evaluation).` Then invoke the `plan:phase_review` skill immediately. When writing the retrospective, include relevant facts from ${CODEX_REVIEW} and the fix passes (e.g. what the blind reviewer caught, what deviated from spec).
 
 If the work was not from a phased plan, skip this step silently and end.
-</OfferPhaseReview>
+</RunPhaseReview>
 
 ---
 

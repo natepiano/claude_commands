@@ -14,6 +14,8 @@
 !commands/**
 !config/
 !config/**
+!docs/
+!docs/**
 !scripts/
 !scripts/**
 !shared/

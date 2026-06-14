@@ -218,7 +218,7 @@ Read `~/.claude/scripts/clean-fix/report-render.md` and follow it, substituting 
 
 Show or set the clean-fix style agent configuration.
 
-The config file is `~/.claude/scripts/clean-fix/clean-fix.conf`. The model allowlist is `~/.claude/scripts/clean-fix/agent-models.conf`. When a scope leaves `model=`/`effort=` empty, the values come from the shared `~/.claude/config/agents.conf` `[<agent>]` section (single source shared with `/delegate`); an explicit `model=` here overrides for that scope only. Two agent sections are configurable:
+The config file is `~/.claude/scripts/clean-fix/clean-fix.conf`. The model allowlist is `~/.claude/scripts/clean-fix/agent-models.conf`. When a scope leaves `model=`/`effort=` empty, the values come from the shared `~/.claude/config/agents.conf` `[<agent>]` section (single source shared with `/plan:delegate`); an explicit `model=` here overrides for that scope only. Two agent sections are configurable:
 
 - **eval** — `[style_eval] enabled=`, `agent=`, and optional `model=`. Drives eval and review stages.
 - **fix** — `[style_fix] enabled=`, `agent=`, and optional `model=`. Drives fix-worktree agents.
