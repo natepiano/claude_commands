@@ -414,6 +414,142 @@ project_env_for() {
     done < "$CONF_FILE"
 }
 
+# Launch the configured style agent and supervise it until it exits, goes
+# silent after producing its deliverable, or hits the hard timeout. Forwards
+# the agent's `>>> phase:` markers to stdout as progress lines, emits a
+# heartbeat every HEARTBEAT_INTERVAL_SECS, and once the deliverable sentinel
+# appears SIGTERMs the agent after it has been silent for the grace window (so a
+# verbose finishing agent is not cut off mid-write).
+#
+# Shared by the fix pass and the verify pass. It does NOT clean up the worktree
+# on timeout — the caller decides, because the two passes treat a timeout
+# differently (fix: discard the worktree; verify: keep the already-applied fix).
+#
+# Args: proj agent_work_dir prompt log_file sentinel_file sentinel_regex label detected_phase
+# Sets: SUPERVISE_AGENT_CODE  (agent exit code; 143 if grace-SIGTERMed, 124 on hard timeout)
+#       SUPERVISE_TIMED_OUT   (1 if hard-timeout-killed, else 0)
+#       SUPERVISE_ELAPSED     (wall seconds the agent ran, in 10s steps)
+supervise_agent() {
+    local proj="$1"
+    local agent_work_dir="$2"
+    local prompt="$3"
+    local log_file="$4"
+    local sentinel_file="$5"
+    local sentinel_regex="$6"
+    local label="$7"
+    local detected_phase="$8"
+
+    SUPERVISE_AGENT_CODE=0
+    SUPERVISE_TIMED_OUT=0
+    SUPERVISE_ELAPSED=0
+
+    # Phase-marker forwarding scans new bytes of the agent log inside the poll
+    # loop below. We previously did this with a backgrounded
+    # `( tail -F | while read ) &` subshell, but `kill $watcher_pid` only killed
+    # the wrapping subshell — `tail -F` and the `while read` bash were reparented
+    # to PID 1, kept inheriting our stdout (the pipe to tee in the parent
+    # clean-fix script), and held the pipeline open for 26+ hours, blocking
+    # launchd from firing the next night's run.
+    : > "$log_file"  # ensure file exists so the offset math starts at 0
+
+    echo "[diag $proj] launching $label agent ($STYLE_AGENT) in background"
+    local agent_pid
+    run_style_agent "$agent_work_dir" "$prompt" "$log_file" &
+    agent_pid=$!
+    echo "[diag $proj] $label agent launched: agent_pid=$agent_pid"
+    progress "$proj" "phase=${label}-launch agent=$STYLE_AGENT pid=$agent_pid log=$log_file"
+
+    local elapsed=0
+    local timeout_secs="$AGENT_TIMEOUT_SECS"
+    local summary_seen_at=""
+    local post_summary_grace="$POST_SUMMARY_GRACE_SECS"
+    local last_heartbeat=0
+    local heartbeat_interval="$HEARTBEAT_INTERVAL_SECS"
+    # Track agent log activity so we can defer SIGTERM while the agent is still
+    # writing (e.g. expanding its deliverable section). The grace period is
+    # measured from the LAST observed log activity, not the moment the sentinel
+    # first appeared, so a verbose finishing phase does not get cut off.
+    local last_log_size=0
+    local last_activity_at=0
+    [[ -f "$log_file" ]] && last_log_size=$(wc -c < "$log_file" 2>/dev/null || echo 0)
+    while kill -0 "$agent_pid" 2>/dev/null; do
+        sleep 10
+        elapsed=$((elapsed + 10))
+        if (( elapsed - last_heartbeat >= heartbeat_interval )); then
+            progress "$proj" "phase=${label}-running elapsed=${elapsed}s"
+            last_heartbeat=$elapsed
+        fi
+        local current_log_size=0
+        [[ -f "$log_file" ]] && current_log_size=$(wc -c < "$log_file" 2>/dev/null || echo 0)
+        if (( current_log_size > last_log_size )); then
+            # Synchronously scan the new bytes for `>>> phase: <name>` markers
+            # and republish each as a `progress` line on this script's stdout.
+            # awk runs to completion in a foreground pipeline — no background
+            # processes, no orphan risk.
+            local delta=$((current_log_size - last_log_size))
+            tail -c "$delta" "$log_file" 2>/dev/null \
+                | awk -v proj="$proj" '
+                    /^>>> phase: / {
+                        sub(/^>>> phase: /, "")
+                        printf "[progress %s] phase=agent-step %s\n", proj, $0
+                        fflush()
+                    }
+                ' || true
+            last_log_size=$current_log_size
+            last_activity_at=$elapsed
+        elif (( current_log_size < last_log_size )); then
+            last_log_size=$current_log_size
+        fi
+        if [[ -z "$summary_seen_at" ]] && rg -q "$sentinel_regex" "$sentinel_file" 2>/dev/null; then
+            summary_seen_at=$elapsed
+            echo "[diag $proj] $label deliverable detected at ${elapsed}s; grace window resets on each agent log write"
+            progress "$proj" "phase=$detected_phase elapsed=${elapsed}s"
+        fi
+        # Only SIGTERM after the deliverable sentinel is seen AND the agent has
+        # been silent for the full grace window. Active agents resetting the
+        # activity timer keep working past the original ceiling.
+        if [[ -n "$summary_seen_at" ]] \
+            && (( elapsed - summary_seen_at >= post_summary_grace )) \
+            && (( elapsed - last_activity_at >= post_summary_grace )); then
+            echo "[diag $proj] $label agent silent ${post_summary_grace}s after deliverable AND last log write at ${last_activity_at}s; sending SIGTERM"
+            kill "$agent_pid" 2>/dev/null || true
+            break
+        fi
+        if [[ $elapsed -ge $timeout_secs ]]; then
+            kill "$agent_pid" 2>/dev/null || true
+            sleep 5
+            kill -9 "$agent_pid" 2>/dev/null || true
+            wait "$agent_pid" 2>/dev/null || true
+            SUPERVISE_AGENT_CODE=124
+            SUPERVISE_TIMED_OUT=1
+            SUPERVISE_ELAPSED=$elapsed
+            return 0
+        fi
+    done
+
+    # Tolerant cleanup: if any of these fail under `set -e`, the caller's
+    # cleanup branches would never execute and the worktree would leak.
+    wait "$agent_pid" && SUPERVISE_AGENT_CODE=0 || SUPERVISE_AGENT_CODE=$?
+    # Final scan of any bytes the agent appended after the loop saw `kill -0`
+    # fail (e.g. the very last write before exit).
+    local final_log_size=0
+    [[ -f "$log_file" ]] && final_log_size=$(wc -c < "$log_file" 2>/dev/null || echo 0)
+    if (( final_log_size > last_log_size )); then
+        local delta=$((final_log_size - last_log_size))
+        tail -c "$delta" "$log_file" 2>/dev/null \
+            | awk -v proj="$proj" '
+                /^>>> phase: / {
+                    sub(/^>>> phase: /, "")
+                    printf "[progress %s] phase=agent-step %s\n", proj, $0
+                    fflush()
+                }
+            ' || true
+    fi
+    SUPERVISE_ELAPSED=$elapsed
+    progress "$proj" "phase=${label}-exit code=$SUPERVISE_AGENT_CODE elapsed=${elapsed}s"
+    return 0
+}
+
 # Per-project function: create worktree and launch the configured style agent
 create_and_fix() {
     local proj="$1"
@@ -687,120 +823,28 @@ PROMPT_EOF
     prompt=$(<"$prompt_file")
     rm -f "$prompt_file"
 
-    # Launch selected agent to apply fixes (timeout from [style_fix] agent_timeout_secs).
-    echo "[diag $proj] launching style agent ($STYLE_AGENT) in background"
-    local agent_pid
-    run_style_agent "$agent_work_dir" "$prompt" "$log_file" &
-    agent_pid=$!
-    echo "[diag $proj] agent launched: agent_pid=$agent_pid"
-    progress "$proj" "phase=agent-launch agent=$STYLE_AGENT pid=$agent_pid log=$log_file"
+    # Pass 1 (apply): launch the configured style agent to apply the findings.
+    # supervise_agent watches it, forwards its `>>> phase:` markers, and bounds
+    # it by the grace + hard-timeout rules. Deliverable sentinel = Fix Summary.
+    supervise_agent "$proj" "$agent_work_dir" "$prompt" "$log_file" \
+        "$scratch_eval" '^## Fix Summary$' "agent" "agent-fix-summary-detected"
+    local agent_code=$SUPERVISE_AGENT_CODE
 
-    # Phase-marker forwarding: scan new bytes of the agent log inside the
-    # main poll loop below. We previously did this with a backgrounded
-    # `( tail -F | while read ) &` subshell, but `kill $watcher_pid` only
-    # killed the wrapping subshell — `tail -F` and the `while read` bash
-    # were reparented to PID 1, kept inheriting our stdout (the pipe to
-    # tee in the parent clean-fix script), and held the pipeline open for
-    # 26+ hours, blocking launchd from firing the next night's run.
-    : > "$log_file"  # ensure file exists so the offset math starts at 0
-
-    local elapsed=0
-    local timeout_secs="$AGENT_TIMEOUT_SECS"
-    local summary_seen_at=""
-    local post_summary_grace="$POST_SUMMARY_GRACE_SECS"
-    local last_heartbeat=0
-    local heartbeat_interval="$HEARTBEAT_INTERVAL_SECS"
-    # Track agent log activity so we can defer SIGTERM while the agent is still
-    # writing (e.g. expanding the Fix Summary section). The grace period is
-    # measured from the LAST observed log activity, not the moment Fix Summary
-    # first appeared, so a verbose write-fix-summary phase doesn't get cut off.
-    local last_log_size=0
-    local last_activity_at=0
-    [[ -f "$log_file" ]] && last_log_size=$(wc -c < "$log_file" 2>/dev/null || echo 0)
-    while kill -0 "$agent_pid" 2>/dev/null; do
-        sleep 10
-        elapsed=$((elapsed + 10))
-        if (( elapsed - last_heartbeat >= heartbeat_interval )); then
-            progress "$proj" "phase=agent-running elapsed=${elapsed}s"
-            last_heartbeat=$elapsed
+    if [[ "$SUPERVISE_TIMED_OUT" == "1" ]]; then
+        echo "TIMEOUT: $proj ($STYLE_AGENT exceeded ${AGENT_TIMEOUT_SECS}s timeout)"
+        progress "$proj" "phase=failed reason=timeout elapsed=${SUPERVISE_ELAPSED}s"
+        python3 "$HISTORY_HELPER" finalize-failure --project "$proj" --reason "$STYLE_AGENT exceeded ${AGENT_TIMEOUT_SECS}s timeout" || true
+        if ! safe_remove_worktree "$repo_dir" "$worktree_dir"; then
+            echo "ERROR: $proj (worktree directory persists at $worktree_dir after cleanup — manual intervention needed)"
+            progress "$proj" "phase=failed reason=cleanup-leftover dir=$worktree_dir"
         fi
-        local current_log_size=0
-        [[ -f "$log_file" ]] && current_log_size=$(wc -c < "$log_file" 2>/dev/null || echo 0)
-        if (( current_log_size > last_log_size )); then
-            # Synchronously scan the new bytes for `>>> phase: <name>`
-            # markers and republish each as a `progress` line on this
-            # script's stdout. awk runs to completion in a foreground
-            # pipeline — no background processes, no orphan risk.
-            local delta=$((current_log_size - last_log_size))
-            tail -c "$delta" "$log_file" 2>/dev/null \
-                | awk -v proj="$proj" '
-                    /^>>> phase: / {
-                        sub(/^>>> phase: /, "")
-                        printf "[progress %s] phase=agent-step %s\n", proj, $0
-                        fflush()
-                    }
-                ' || true
-            last_log_size=$current_log_size
-            last_activity_at=$elapsed
-        elif (( current_log_size < last_log_size )); then
-            last_log_size=$current_log_size
+        if [[ "$(git -C "$repo_dir" rev-list --count "main..$branch_name" 2>/dev/null)" == "0" ]]; then
+            git -C "$repo_dir" branch -D "$branch_name" 2>/dev/null || true
+        else
+            echo "WARN: $proj (kept $branch_name branch — has unmerged commits)"
         fi
-        if [[ -z "$summary_seen_at" ]] && rg -q '^## Fix Summary$' "$scratch_eval" 2>/dev/null; then
-            summary_seen_at=$elapsed
-            echo "[diag $proj] Fix Summary detected at ${elapsed}s; grace window resets on each agent log write"
-            progress "$proj" "phase=agent-fix-summary-detected elapsed=${elapsed}s"
-        fi
-        # Only SIGTERM after Fix Summary is seen AND agent has been silent
-        # for the full grace window. Active agents resetting the activity
-        # timer keep working past the original 300s ceiling.
-        if [[ -n "$summary_seen_at" ]] \
-            && (( elapsed - summary_seen_at >= post_summary_grace )) \
-            && (( elapsed - last_activity_at >= post_summary_grace )); then
-            echo "[diag $proj] agent silent ${post_summary_grace}s after Fix Summary AND last log write at ${last_activity_at}s; sending SIGTERM"
-            kill "$agent_pid" 2>/dev/null || true
-            break
-        fi
-        if [[ $elapsed -ge $timeout_secs ]]; then
-            kill "$agent_pid" 2>/dev/null || true
-            sleep 5
-            kill -9 "$agent_pid" 2>/dev/null || true
-            wait "$agent_pid" 2>/dev/null || true
-            echo "TIMEOUT: $proj ($STYLE_AGENT exceeded ${timeout_secs}s timeout)"
-            progress "$proj" "phase=failed reason=timeout elapsed=${elapsed}s"
-            python3 "$HISTORY_HELPER" finalize-failure --project "$proj" --reason "$STYLE_AGENT exceeded ${timeout_secs}s timeout" || true
-            if ! safe_remove_worktree "$repo_dir" "$worktree_dir"; then
-                echo "ERROR: $proj (worktree directory persists at $worktree_dir after cleanup — manual intervention needed)"
-                progress "$proj" "phase=failed reason=cleanup-leftover dir=$worktree_dir"
-            fi
-            if [[ "$(git -C "$repo_dir" rev-list --count "main..$branch_name" 2>/dev/null)" == "0" ]]; then
-                git -C "$repo_dir" branch -D "$branch_name" 2>/dev/null || true
-            else
-                echo "WARN: $proj (kept $branch_name branch — has unmerged commits)"
-            fi
-            return 1
-        fi
-    done
-
-    # Tolerant cleanup: if any of these fail under `set -e`, the cleanup
-    # branches below would never execute and the worktree would leak.
-    wait "$agent_pid" && agent_code=0 || agent_code=$?
-    # Final scan of any bytes the agent appended after the loop saw
-    # `kill -0` fail (e.g. the very last write before exit).
-    local final_log_size=0
-    [[ -f "$log_file" ]] && final_log_size=$(wc -c < "$log_file" 2>/dev/null || echo 0)
-    if (( final_log_size > last_log_size )); then
-        local delta=$((final_log_size - last_log_size))
-        tail -c "$delta" "$log_file" 2>/dev/null \
-            | awk -v proj="$proj" '
-                /^>>> phase: / {
-                    sub(/^>>> phase: /, "")
-                    printf "[progress %s] phase=agent-step %s\n", proj, $0
-                    fflush()
-                }
-            ' || true
-        last_log_size=$final_log_size
+        return 1
     fi
-    progress "$proj" "phase=agent-exit code=$agent_code elapsed=${elapsed}s"
 
     if [[ $agent_code -ne 0 ]]; then
         if [[ -f "$scratch_eval" ]] && rg -q '^## Fix Summary$' "$scratch_eval"; then
@@ -826,6 +870,128 @@ PROMPT_EOF
             fi
             return 1
         fi
+    fi
+
+    # Pass 2 (verify): an independent run of the SAME configured agent
+    # (STYLE_AGENT/model/effort) checks the applied fix against the findings and
+    # the Fix Summary, corrects any incomplete or wrong fixes itself, and updates
+    # the Fix Summary. Deliverable sentinel = a `## Fix Verification` section.
+    # Only reached when a Fix Summary exists. A verify miss (timeout / no
+    # section) is non-fatal: the applied fix is already reviewable, so we keep
+    # the worktree and let the build gate below have the final say. Verify status
+    # is reported only via progress/diag lines — never `WARN:/ERROR: <proj>`,
+    # which the report parser would mis-read as a fix-phase failure.
+    progress "$proj" "phase=verify-start"
+    local verify_log="$LOG_DIR/style_fix_verify_${proj}.log"
+    local verify_prompt verify_prompt_file
+    verify_prompt_file="$LOG_DIR/style_fix_verify_prompt_${proj}_$$.txt"
+    cat > "$verify_prompt_file" <<VERIFY_EOF
+You are independently verifying automated style fixes that another agent just
+applied to a Rust project. Confirm every fix is correct and complete, correct
+any mistakes yourself, and update the Fix Summary to reflect the true state.
+
+Working directory: $agent_work_dir
+Worktree root: $worktree_dir
+
+IMPORTANT: Do NOT spawn sub-agents, delegate, or parallelize through helper agents. Complete this verification yourself in a single agent run.
+
+IMPORTANT: Run every cargo command (clippy, tests, fmt) in the FOREGROUND and read its output directly. Do NOT run cargo in the background and poll for it with \`pgrep\` — that substring matches your own process argv and the wait loop spins forever.
+
+**Progress markers (REQUIRED — emit before doing each step).** Print one line of the exact form below on stdout immediately before you begin each named phase. The orchestrator forwards these to the user's chat as live progress.
+
+    >>> phase: <name> [extra=value …]
+
+Required phase names, in order:
+
+- \`>>> phase: verify-read-style-guide\` — before Step 1.
+- \`>>> phase: verify-read-evaluation\` — before Step 2.
+- \`>>> phase: verify-inspect-diff\` — before Step 3.
+- \`>>> phase: verify-finding n=<N> id=<short-id>\` — once per finding before you re-check it (\`<short-id>\` = the guideline filename stem from the **Style file** field).
+- \`>>> phase: verify-clippy\` — before re-running clippy (only if you changed code).
+- \`>>> phase: verify-tests\` — before re-running tests (only if you changed code).
+- \`>>> phase: verify-fmt\` — before fmt (only if you changed code).
+- \`>>> phase: write-verification\` — before Step 6.
+
+Step 1: Load the style guide
+Run: zsh ~/.claude/scripts/load-rust-style.sh --project-root $agent_work_dir
+Read each unique style file referenced by the findings (the **Style file** field of each), plus every style file marked [non-negotiable] in the loaded checklist.
+
+Step 2: Read the evaluation and the Fix Summary
+Read: $scratch_eval
+It contains, in order:
+- \`## Improvements\` — the numbered findings the fix agent was told to apply. Any finding wrapped in \`<!-- REMOVED-BY-REVIEW ... -->\` markers was struck before the fix and must remain UNAPPLIED.
+- \`## Review Log\` (if present) — reporting-only. Do not act on it; do not modify it.
+- \`## Fix Summary\` — the fix agent's per-finding claims (Status, What was done, Post-fix search, Issues).
+
+Step 3: Inspect what was actually changed
+Run: git -C $worktree_dir diff
+Read the full diff — this is the complete set of edits the fix agent made.
+
+Step 4: Verify each finding against the Fix Summary, the diff, and the code
+For each numbered finding that is NOT inside REMOVED-BY-REVIEW markers, in order:
+1. Read its governing **Style file** and re-read the \`mode:\` frontmatter.
+2. Re-run the finding's post-fix search (the **Post-fix search** or **Search** command, or an equivalent project-wide search derived from **Surface searched**) against the current worktree.
+3. Decide whether the Fix Summary's claim is actually TRUE:
+   - **Applied / 0 remaining**: confirm the search really returns 0 matches AND the diff implements the recommended pattern at every listed location. If any matching site remains, the fix is INCOMPLETE — apply the missing edits now. Before renaming a symbol or changing a public signature, use LSP \`findReferences\` to enumerate call sites; ripgrep misses references through aliases, re-exports, and generic dispatch.
+   - **Partially applied / Skipped**: confirm the stated reason is legitimate (file gone, pattern absent, non-negotiable conflict). If the work was actually doable and the reason is wrong, complete it now.
+   - **Proposed** (guideline \`mode: propose\`): confirm NO code was changed for it — these are for the human to decide. If the fix agent applied code for a propose-mode finding, that is a mistake: revert those edits.
+4. Confirm no non-removed finding was silently dropped (each has a Fix Summary entry).
+5. Confirm the diff introduced no NEW violation of any [non-negotiable] rule; fix any it introduced.
+
+You ARE authorized to edit code in the worktree to correct incomplete, incorrect, or non-negotiable-violating fixes. Do NOT add fixes for unrelated rules the original findings did not cover — that is the next /style_eval's job, not this pass. Preserve all existing \`///\` doc comments and explanatory \`//\` comments.
+
+Step 5: Re-verify the build (only if you changed any code in Step 4)
+- Run: cargo clippy $cargo_scope_flag --all-targets --all-features --manifest-path $worktree_dir/Cargo.toml -- -D warnings
+  A compile error means an edit left a dangling reference — fix it before continuing.
+- Run: CARGO_MEND_SKIP_NETWORK_TESTS=1 cargo nextest run $cargo_scope_flag --manifest-path $worktree_dir/Cargo.toml
+  Fix any failures you introduced.
+- Run: cargo +clean-fix fmt $cargo_scope_flag --manifest-path $worktree_dir/Cargo.toml
+If you changed no code, skip this step.
+
+Step 6: Update the Fix Summary, then append the Fix Verification section
+First, update the existing \`## Fix Summary\` in place so each finding's **Status**, **What was done**, and **Post-fix search** lines state the TRUE post-verification result. Do not renumber. Do not touch the \`## Improvements\` findings or the \`## Review Log\`.
+
+Then append this section to the END of $scratch_eval:
+
+---
+
+## Fix Verification
+
+**Verified:** [YYYY-MM-DD]
+**Findings verified:** [N]
+
+### Per-finding verdict
+For each numbered (non-removed) finding, one bullet:
+- **Finding N** — confirmed | corrected | completed | downgraded | proposed-left-as-is — [one-line note: what you checked and what, if anything, you changed]
+
+### Corrections made
+[One bullet per code edit you made to correct the fix, by file. Write "None — all fixes confirmed correct and complete." if you changed nothing.]
+
+### Build status after verification
+- **clippy:** pass | fail | not-re-run (no code changed)
+- **tests:** pass | fail | not-re-run (no code changed)
+
+Rules:
+- $review_dir_description
+- Do NOT commit anything (no git add, no git commit). Do NOT create or switch branches.
+- Modify $scratch_eval only by (a) updating \`## Fix Summary\` status lines to reflect your corrections and (b) appending the \`## Fix Verification\` section. Do NOT edit the \`## Improvements\` findings, the REMOVED-BY-REVIEW blocks, or the \`## Review Log\`.
+- Single agent run; foreground cargo only.
+VERIFY_EOF
+    verify_prompt=$(<"$verify_prompt_file")
+    rm -f "$verify_prompt_file"
+
+    supervise_agent "$proj" "$agent_work_dir" "$verify_prompt" "$verify_log" \
+        "$scratch_eval" '^## Fix Verification$' "verify" "verify-summary-detected"
+
+    if rg -q '^## Fix Verification$' "$scratch_eval" 2>/dev/null; then
+        echo "[diag $proj] verify pass complete (Fix Verification section present)"
+        progress "$proj" "phase=verify-done elapsed=${SUPERVISE_ELAPSED}s"
+    elif [[ "$SUPERVISE_TIMED_OUT" == "1" ]]; then
+        echo "[diag $proj] verify pass timed out after ${AGENT_TIMEOUT_SECS}s; keeping applied fix for review"
+        progress "$proj" "phase=verify-incomplete reason=timeout elapsed=${SUPERVISE_ELAPSED}s"
+    else
+        echo "[diag $proj] verify pass exited ${SUPERVISE_AGENT_CODE} with no Fix Verification section; keeping applied fix for review"
+        progress "$proj" "phase=verify-incomplete reason=agent-exit code=${SUPERVISE_AGENT_CODE}"
     fi
 
     # Build gate: the agent self-reports build status in its Fix Summary, but

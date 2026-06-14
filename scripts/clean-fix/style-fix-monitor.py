@@ -60,6 +60,7 @@ def main() -> int:
         return 2
     project = sys.argv[1]
     agent_log_path = f"/private/tmp/claude/style_fix_{project}.log"
+    verify_log_path = f"/private/tmp/claude/style_fix_verify_{project}.log"
 
     manual_log_path: str | None = None
     while manual_log_path is None:
@@ -75,10 +76,11 @@ def main() -> int:
     while True:
         progressed = False
 
-        if agent_log_path not in handles:
-            agent_handle = open_for_tail(agent_log_path)
-            if agent_handle is not None:
-                handles[agent_log_path] = agent_handle
+        for lazy_path in (agent_log_path, verify_log_path):
+            if lazy_path not in handles:
+                lazy_handle = open_for_tail(lazy_path)
+                if lazy_handle is not None:
+                    handles[lazy_path] = lazy_handle
 
         for handle in list(handles.values()):
             while True:

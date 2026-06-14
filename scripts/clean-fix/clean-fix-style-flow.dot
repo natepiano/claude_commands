@@ -81,9 +81,10 @@ digraph clean_fix_style {
         prechecks [label="Prechecks:\n- target _style_fix path is free\n- primary tree is clean" height=0.65 pos="700.2,720!"]
         create_wt [label="git worktree add\n-b refactor/style\n{project}_style_fix" height=0.65 pos="700.2,645!"]
         mv_eval [label="export pending markdown\n→ scratch evaluation" height=0.55 pos="700.2,575!"]
-        claude_fix [label="Launch Claude\n(fixes, cargo mend, clippy,\ntests, style review)" fillcolor="#d5f5e3" color="#27ae60" height=0.65 pos="700.2,500!"]
-        fix_ok [label="Worktree ready\nfor review" fillcolor="#d5f5e3" color="#27ae60" height=0.55 width=1.8 pos="625.4,425!"]
-        fix_fail [label="Failure: finalize\nor keep pending" fillcolor="#fadbd8" color="#e74c3c" height=0.55 width=1.8 pos="775.0,425!"]
+        claude_fix [label="Pass 1 (apply): launch agent\n(fixes, cargo mend, clippy,\ntests, style review)" fillcolor="#d5f5e3" color="#27ae60" height=0.65 pos="700.2,512!"]
+        verify_fix [label="Pass 2 (verify): same agent\nre-checks fix vs Fix Summary,\ncorrects + updates summary" fillcolor="#d5f5e3" color="#27ae60" height=0.65 pos="700.2,432!"]
+        fix_ok [label="Worktree ready\nfor review" fillcolor="#d5f5e3" color="#27ae60" height=0.55 width=1.8 pos="625.4,352!"]
+        fix_fail [label="Failure: finalize\nor keep pending" fillcolor="#fadbd8" color="#e74c3c" height=0.55 width=1.8 pos="775.0,352!"]
     }
 
     report [label="Generate Clean-fix Report" shape=oval fillcolor="#f0e6ff" color="#8e44ad" width=2.2 pos="447.4,195!"]
@@ -129,8 +130,10 @@ digraph clean_fix_style {
 
     // Phase 3 internal
     fix_foreach -> prechecks -> create_wt -> mv_eval -> claude_fix
-    claude_fix -> fix_ok [label="success"]
-    claude_fix -> fix_fail [label="failure"]
+    claude_fix -> verify_fix [label="Fix Summary"]
+    claude_fix -> fix_fail [label="no summary /\ntimeout"]
+    verify_fix -> fix_ok [label="build ok"]
+    verify_fix -> fix_fail [label="build broken"]
 
     // Phase 3 → Report
     fix_ok -> report

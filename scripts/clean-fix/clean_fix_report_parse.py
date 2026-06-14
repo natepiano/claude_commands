@@ -37,7 +37,7 @@ MONITOR_FILTER_REGEX = (
     r"|^=== "
 )
 
-PHASES: tuple[str, ...] = ("clean", "warmup", "eval", "review", "fix")
+PHASES: tuple[str, ...] = ("clean", "warmup", "eval", "review", "fix", "verify")
 CELL_DASH = "-"
 EVAL_SORT_ORDER: dict[str, int] = {
     "RUNNING": 0,
@@ -98,6 +98,59 @@ FIX_DONE_RE = re.compile(
     r"=== Done: (\d+) created, (\d+) failed, (\d+) skipped(?: out of (\d+))? ==="
 )
 FILENAME_TS_RE = re.compile(r"(\d{8}-\d{6})")
+# Per-project live phase markers emitted by style-fix-worktrees.sh:
+#   [progress <project>] phase=<name> [k=v ...]
+PROGRESS_RE = re.compile(r"^\[progress (\S+)\] phase=(\S+)(?:\s+(.*))?$")
+
+
+def _marker_reason(rest: str) -> str:
+    """Pull the human-ish reason= value out of a progress marker's trailer."""
+    m = re.search(r"reason=(\S+)", rest)
+    return m.group(1).replace("-", " ") if m else ""
+
+
+def describe_live_phase(name: str, rest: str) -> tuple[str, str]:
+    """Map a `[progress] phase=<name> <rest>` marker to (stage, human text).
+
+    stage is "fix" or "verify" — which pass of style-fix the project is in.
+    Drives the live "current phase" shown for in-progress rows.
+    """
+
+    def pretty(token: str) -> str:
+        return token.replace("-", " ")
+
+    if name == "worktree-create":
+        return ("fix", "creating worktree")
+    if name == "worktree-ready":
+        return ("fix", "worktree ready")
+    if name in ("agent-launch", "agent-running"):
+        return ("fix", "applying fixes")
+    if name == "agent-fix-summary-detected":
+        return ("fix", "fix summary written")
+    if name == "agent-step":
+        step = rest.split()[0] if rest.split() else ""
+        if step.startswith("verify-"):
+            return ("verify", f"verifying: {pretty(step[len('verify-'):])}")
+        if step == "write-verification":
+            return ("verify", "writing verification")
+        return ("fix", f"applying: {pretty(step)}")
+    if name in ("verify-start", "verify-launch", "verify-running"):
+        return ("verify", "verifying")
+    if name == "verify-summary-detected":
+        return ("verify", "verification written")
+    if name == "verify-exit":
+        return ("verify", "verify finishing")
+    if name == "verify-done":
+        return ("verify", "verify complete")
+    if name == "verify-incomplete":
+        return ("verify", f"verify incomplete ({_marker_reason(rest) or 'incomplete'})")
+    if name == "build-gate":
+        return ("fix", "build check (after verify)")
+    if name == "done":
+        return ("fix", "done")
+    if name == "failed":
+        return ("fix", f"failed: {_marker_reason(rest) or 'failed'}")
+    return ("fix", pretty(name))
 
 
 @dataclass
@@ -166,6 +219,8 @@ class ParseResult:
     always_excluded: list[tuple[str, str]] = field(default_factory=list)
     filtered_out: list[tuple[str, str]] = field(default_factory=list)
     notes: list[str] = field(default_factory=list)
+    # project -> live current-phase text, only for rows still running.
+    phase_now: dict[str, str] = field(default_factory=dict)
 
 
 def make_blank_row() -> dict[str, Cell]:
@@ -739,6 +794,11 @@ def parse_fix_phase(lines: list[str], result: ParseResult) -> None:
     stats.present = True
     eligible: set[str] = set()
     fix_results: dict[str, Cell] = {}
+    # Per-project live markers from `[progress ...] phase=...`.
+    last_marker: dict[str, tuple[str, str]] = {}
+    verify_done: set[str] = set()
+    verify_incomplete: dict[str, str] = {}
+    verify_seen: set[str] = set()
     eligible_re = re.compile(r"^ELIGIBLE: (\S+)")
     skip_re = re.compile(r"^SKIP: (\S+) \(([^)]+)\)")
     ok_re = re.compile(r"^OK: (\S+)")
@@ -747,6 +807,23 @@ def parse_fix_phase(lines: list[str], result: ParseResult) -> None:
     retry_error_re = re.compile(r"^ERROR: (\S+) \(([^)]+)\)")
 
     for line in lines:
+        m = PROGRESS_RE.match(line)
+        if m:
+            project, pname, prest = m.group(1), m.group(2), (m.group(3) or "")
+            last_marker[project] = (pname, prest)
+            if pname == "verify-done":
+                verify_done.add(project)
+                verify_seen.add(project)
+            elif pname == "verify-incomplete":
+                verify_incomplete[project] = _marker_reason(prest) or "incomplete"
+                verify_seen.add(project)
+            elif pname.startswith("verify-"):
+                verify_seen.add(project)
+            elif pname == "agent-step":
+                step = prest.split()[0] if prest.split() else ""
+                if step.startswith("verify-") or step == "write-verification":
+                    verify_seen.add(project)
+            continue
         m = eligible_re.match(line)
         if m:
             eligible.add(m.group(1))
@@ -799,20 +876,59 @@ def parse_fix_phase(lines: list[str], result: ParseResult) -> None:
             )
 
     phase_running = result.status == "in-progress" and stats.footer_total is None
+    vstats = result.stats["verify"]
+    if verify_seen:
+        vstats.present = True
     for project in eligible:
+        row = get_row(result.rows, project)
+        # ── Fix cell (unchanged semantics) ──
         cell = fix_results.get(project)
         if cell is None:
             if phase_running:
-                get_row(result.rows, project)["fix"] = Cell("RUNNING", "running")
+                cell = Cell("RUNNING", "running")
                 stats.running += 1
                 result.running.append(Warning("fix", project, "running (worktree fix in progress)"))
-                continue
-            cell = Cell("FAIL", "no-result")
-        get_row(result.rows, project)["fix"] = cell
+            else:
+                cell = Cell("FAIL", "no-result")
+        row["fix"] = cell
         if cell.state == "OK":
             stats.ok += 1
         elif cell.state == "FAIL":
             stats.fail += 1
+
+        # ── Verify cell (decoupled from fix; never alters the fix outcome) ──
+        if project in verify_done:
+            vcell = Cell("OK")
+        elif project in verify_incomplete:
+            vcell = Cell("FAIL", slugify_reason(verify_incomplete[project]))
+            # Not a fix failure — the applied fix is intact and reviewable; only
+            # the independent verify pass did not finish. Surface as a heads-up,
+            # not under "What failed".
+            why = verify_incomplete[project]
+            note = f"{project}: the verify pass did not complete ({why}); the applied fix is in the worktree but was not independently verified — review it directly during /style_fix_review."
+            result.notes.append(note)
+        elif phase_running and project in verify_seen and cell.state == "RUNNING":
+            vcell = Cell("RUNNING", "running")
+            result.running.append(Warning("verify", project, "running (verifying applied fix)"))
+        else:
+            vcell = Cell()
+        row["verify"] = vcell
+        if vcell.state == "OK":
+            vstats.ok += 1
+        elif vcell.state == "FAIL":
+            vstats.fail += 1
+        elif vcell.state == "RUNNING":
+            vstats.running += 1
+        if vcell.state != CELL_DASH:
+            vstats.present = True
+
+        # ── Live current phase (only while the row is still running) ──
+        if phase_running and project in last_marker and (
+            cell.state == "RUNNING" or vcell.state == "RUNNING"
+        ):
+            pname, prest = last_marker[project]
+            _stage, human = describe_live_phase(pname, prest)
+            result.phase_now[project] = human
 
 
 # Plain-language for the internal pending statuses style-eval logs as
@@ -915,10 +1031,10 @@ def parse_log(path: Path) -> ParseResult:
             result.status = "crashed"
             result.notes.append("style-fix script failed before per-project work")
 
-    # Partial logs: only fix phase present (style-fix-manual logs).
+    # Partial logs: only the style-fix passes present (style-fix-manual logs).
     phases_present = [p for p in PHASES if result.stats[p].present]
     absent = [p for p in PHASES if not result.stats[p].present]
-    if phases_present == ["fix"]:
+    if phases_present and set(phases_present).issubset({"fix", "verify"}):
         result.status = "partial" if result.status != "complete" else "complete"
         result.notes.append(f"phases not in this log: {','.join(absent)}")
 
@@ -1005,6 +1121,9 @@ def row_reason(result: ParseResult, project: str) -> str:
         for warning in result.tool_warnings
         if warning.project == project
     }
+    # When a row is live, the precise sub-phase (e.g. "verifying: clippy")
+    # supersedes the generic per-phase "running" notes — show it once.
+    live_phase = result.phase_now.get(project)
 
     for phase in PHASES:
         cell = row[phase]
@@ -1016,7 +1135,10 @@ def row_reason(result: ParseResult, project: str) -> str:
             )
             add(f"{phase}: {reason}")
         elif cell.state == "RUNNING":
-            add(f"{phase}: {running_by_phase.get(phase) or 'running'}")
+            if live_phase:
+                add(live_phase)
+            else:
+                add(f"{phase}: {running_by_phase.get(phase) or 'running'}")
         elif cell.state == "SKIP":
             reason = (
                 skips_by_phase.get(phase)
@@ -1142,7 +1264,9 @@ def emit_full_report(result: ParseResult) -> None:
         row = result.rows[project]
         cells = " ".join(f"{p}={row[p].render()}" for p in PHASES)
         reason = row_reason(result, project).replace('"', "'") or "-"
-        print(f'ROW {project}  {cells} reason="{reason}"')
+        now = result.phase_now.get(project, "").replace('"', "'")
+        extra = f' phase_now="{now}"' if now else ""
+        print(f'ROW {project}  {cells} reason="{reason}"{extra}')
     print()
 
     def _emit_grouped(record: str, items: list[tuple[str, str]]) -> None:

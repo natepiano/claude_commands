@@ -30,7 +30,7 @@ Runs daily at **4:00 AM** via launchd.
 
 | File | Purpose |
 |------|---------|
-| `style-fix-worktrees.sh` | For each project with pending findings: creates a `_style_fix` worktree, exports evaluation markdown to a scratch file under `/private/tmp/claude`, launches the configured style agent to apply fixes (cargo mend, clippy, tests, style review), saves the Fix Summary back into pending JSON, and keeps `EVALUATION.md` out of the worktree. Other linked worktrees are allowed; the primary checkout still must be clean. Can target a single project by name. |
+| `style-fix-worktrees.sh` | For each project with pending findings: creates a `_style_fix` worktree, exports evaluation markdown to a scratch file under `/private/tmp/claude`, launches the configured style agent to apply fixes (cargo mend, clippy, tests, style review), then launches a second run of the **same** agent to verify the applied fix against the Fix Summary (correcting mistakes and updating the summary), saves the Fix Summary back into pending JSON, and keeps `EVALUATION.md` out of the worktree. Other linked worktrees are allowed; the primary checkout still must be clean. Can target a single project by name. |
 
 ### Warmup
 
@@ -119,7 +119,9 @@ style-fix job (every 10 min, no idle gate) — clean-fix.sh style
   ├─ Phase 2: Style-Fix Worktrees (per project, parallel)
   │    Create _style_fix worktree (other linked worktrees allowed if primary is clean)
   │    → export pending evaluation markdown to scratch storage
-  │    → Configured style agent applies fixes, runs clippy/tests/style review
+  │    → Pass 1 (apply): configured style agent applies fixes, runs clippy/tests/style review, writes Fix Summary
+  │    → Pass 2 (verify): same agent re-checks the fix vs the Fix Summary, corrects mistakes, updates the Fix Summary
+  │    → build gate (cargo check) covers both passes; finalize into pending JSON
   │
   └─ Write clean-fix log for on-demand reports
 
@@ -153,7 +155,7 @@ truth:
 |--------------|-------|--------------|
 | `style_eval_<project>_evaluation.md` | eval agent writes, pending JSON saves | deleted after the eval stage saves pending JSON |
 | `style_eval_review_<project>_evaluation.md` | review agent edits a pending export | deleted after the review stage saves pending JSON |
-| `style_fix_<project>_evaluation.md` | fix agent appends `## Fix Summary` | kept while the `_style_fix` worktree exists for `/style_fix_review` |
+| `style_fix_<project>_evaluation.md` | fix agent appends `## Fix Summary`; verify agent updates it and appends `## Fix Verification` | kept while the `_style_fix` worktree exists for `/style_fix_review` |
 
 When a new eval run starts, stale eval/review scratch files are removed. A stale
 `style_fix_<project>_evaluation.md` is removed only when no real

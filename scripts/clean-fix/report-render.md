@@ -22,7 +22,7 @@ ELAPSED: <duration | "-">
 STATUS: complete | crashed | partial | in-progress
 
 PHASE <name> present=<bool> ok=N fail=N skip=N [footer_ok=N footer_fail=N footer_total=N]
-ROW <project>  clean=<cell> warmup=<cell> eval=<cell> review=<cell> fix=<cell> reason="<short reason | ->"
+ROW <project>  clean=<cell> warmup=<cell> eval=<cell> review=<cell> fix=<cell> verify=<cell> reason="<short reason | ->" [phase_now="<live phase>"]
 ALWAYS_EXCLUDED "<reason>" count=N projects=<a,b,c>   ← directories under ~/rust not opted into the relevant allowlist ([build] / [targets]) in clean-fix.conf
 FILTERED_OUT "<reason>" count=N projects=<a,b,c>      ← would be eligible, but framework state / project layout filtered them out
 WARNING <phase> <project> "<message>"                 ← real project failures
@@ -39,7 +39,15 @@ Cell values are `OK`, `FAIL`, `SKIP`, `RUNNING`, `-` (rendered as `—`). They m
 
 `Fix: OK` means the style fix was applied and a `_style_fix` worktree is ready for the user to `/style_fix_review` → `/merge_branch` — it is **not** auto-merged. The row reason says `fix applied — worktree ready for /style_fix_review` and the eval stop reason (quota/exhausted) is suppressed as noise in that case.
 
-`RUNNING` means the phase agent was launched and the run is still live — it has not reported an outcome yet. The parser only emits `RUNNING` while the run is in progress and that phase has no `=== Done:` footer; a finished run never shows `RUNNING` (an unresolved launch there becomes `FAIL:no-result`). The live detail (elapsed time, latest eval heartbeat message, last-beat age) rides in the row's `reason` field and in the `RUNNING` records below.
+`verify=<cell>` is the second style-fix pass: after the fix agent applies the findings, the same configured agent re-checks the diff against the Fix Summary, corrects mistakes, and updates the summary. Cell meaning:
+- `OK` — the verify pass ran and wrote its `## Fix Verification` section (the fix was confirmed and/or corrected). The detailed per-finding verdict and any corrections live in that section inside the worktree; the user sees it during `/style_fix_review`.
+- `FAIL:<reason>` — the verify pass started but did not finish (e.g. `timeout`, `agent-exit`). The applied fix is still in the worktree and reviewable; only the independent verification is missing. This does **not** mean the fix failed — read it as "fix applied, not yet verified."
+- `RUNNING` — the verify pass is in progress right now.
+- `—` — verify did not run for this row (the fix produced no Fix Summary, the fix was skipped, or this is an old log from before the verify pass existed).
+
+`RUNNING` means the phase agent was launched and the run is still live — it has not reported an outcome yet. The parser only emits `RUNNING` while the run is in progress and that phase has no `=== Done:` footer; a finished run never shows `RUNNING` (an unresolved launch there becomes `FAIL:no-result`).
+
+`phase_now="<live phase>"` appears on a ROW only while that row is still running. It is the precise current sub-phase of the style-fix pipeline for that project — e.g. `applying: write fix summary`, `verifying: clippy`, `build check (after verify)`. This is the single source for "what phase is this row in right now"; it already rides in the row `reason` for running rows, and the `RUNNING` records below carry the same information.
 
 ## Rendering
 
@@ -87,19 +95,22 @@ If neither `ALWAYS_EXCLUDED` nor `FILTERED_OUT` has records, omit the Excluded s
 
 ### 3. Status table
 
-Markdown table with columns `Project | Clean | Warmup | Eval | Review | Fix | Reason`. Preserve parser row order: `Eval` status first (`RUNNING`, `FAIL`, `OK`, `SKIP`, then `—`), then project name alphabetically. Each phase cell is `OK`, `FAIL`, `SKIP`, `RUNNING`, or `—`. **Strip the `:reason` suffix from phase cells.** Render the parser's quoted `reason` value in the final column, using `—` when the value is `-`. If `cargo-mend` shows `clean=OK:warning`, render the cell as `OK*` and add a footnote line under the table: `* cargo-mend built fine, but the cargo mend tool itself failed against it. The build is healthy; the linter is not.`
+Markdown table with columns `Project | Clean | Warmup | Eval | Review | Fix | Verify | Reason`. Preserve parser row order: `Eval` status first (`RUNNING`, `FAIL`, `OK`, `SKIP`, then `—`), then project name alphabetically. Each phase cell is `OK`, `FAIL`, `SKIP`, `RUNNING`, or `—`. **Strip the `:reason` suffix from phase cells** (so a `verify=FAIL:timeout` cell renders as `FAIL`; the reason text is carried by the final column). Render the parser's quoted `reason` value in the final column, using `—` when the value is `-`. The `Verify` column comes from the `verify=<cell>` field — see the verify-cell meanings above; for a finished run with fixes applied it is normally `OK`, and `—` for any run with no applied fix or any old log. If `cargo-mend` shows `clean=OK:warning`, render the cell as `OK*` and add a footnote line under the table: `* cargo-mend built fine, but the cargo mend tool itself failed against it. The build is healthy; the linter is not.`
 
 ### 4. Still running
 
-Only render if `RUNNING` records exist (the run is in progress). Heading: `Still running`. One bullet per record, naming the project, the phase, and the record's detail verbatim:
+Only render if `RUNNING` records exist (the run is in progress). Heading: `Still running`. **One bullet per project** (not per record — a project mid-verify produces both a `RUNNING fix` and a `RUNNING verify` record; collapse them). For each running project name the project and its current phase, preferring the row's `phase_now` value (the precise sub-phase) when present; otherwise fall back to the `RUNNING` record's detail verbatim:
 
 ```
 Still running
 - bevy_brp_bevy_update (eval): running 22m, agent reached quota reached, finalizing; last heartbeat 12s ago
-- hana (fix): running (worktree fix in progress)
+- bevy_catenary: verifying: clippy   ← phase_now: fix applied, the verify pass is re-checking it
+- hana: applying: write fix summary
 ```
 
-A `heartbeat stale … — finishing or wedged` detail means the eval agent stopped emitting heartbeats: it is either finalizing or hung. If it persists across reports the agent likely died and the run will reap it as a failure — re-run the report once the run finishes for the real outcome.
+When `phase_now` reads `verifying: …` / `verification written` / `verify …`, the apply pass already finished and wrote the Fix Summary — the project is in the second (verify) pass. When it reads `applying: …` / `creating worktree` / `worktree ready`, it is still in the first (apply) pass. `build check (after verify)` means both agents are done and the external `cargo check` gate is running.
+
+A `heartbeat stale … — finishing or wedged` detail (eval phase) means the eval agent stopped emitting heartbeats: it is either finalizing or hung. If it persists across reports the agent likely died and the run will reap it as a failure — re-run the report once the run finishes for the real outcome.
 
 ### 5. What failed
 

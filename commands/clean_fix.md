@@ -180,6 +180,14 @@ For Monitors armed with `style-fix-monitor.py`, emit one short line per event:
 - `phase=agent-step name=<name>` → `agent step: <name>` (the phase sentinels the agent prints — `read-evaluation`, `apply-finding`, `cargo-mend-preview`, `clippy-preview`, `tests`, `fmt`, `write-fix-summary`, etc.)
 - `phase=agent-fix-summary-detected …` → `Fix Summary detected`
 - `phase=agent-exit code=N` → `agent exited code=N`
+- `phase=verify-start` → `verify pass starting (same agent re-checks the fix)`
+- `phase=verify-launch …` → `verify agent launched (pid <pid>)`
+- `phase=verify-running elapsed=Ns` → `verify running Ns`
+- `phase=agent-step name=verify-…` → `verify step: <name>` (verify's own sentinels — `verify-read-evaluation`, `verify-inspect-diff`, `verify-finding`, `verify-clippy`, `verify-tests`, `verify-fmt`, `write-verification`)
+- `phase=verify-summary-detected …` → `Fix Verification detected`
+- `phase=verify-exit code=N` → `verify agent exited code=N`
+- `phase=verify-done …` → `verify pass complete`
+- `phase=verify-incomplete reason=<r>` → `verify pass incomplete (<r>) — applied fix kept for review`
 - `phase=already-applied …` → `already-applied (retry detected finished worktree)`
 - `phase=launcher-exit code=N` → `launcher exited code=N` (also the Monitor's last event; the helper exits here)
 - cargo/clippy/test/error/warning lines → echo verbatim; they're already short
