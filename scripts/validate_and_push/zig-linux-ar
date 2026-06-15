@@ -1,0 +1,7 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+export ZIG_GLOBAL_CACHE_DIR="${ZIG_GLOBAL_CACHE_DIR:-$PWD/target/zig-global-cache}"
+export ZIG_LOCAL_CACHE_DIR="${ZIG_LOCAL_CACHE_DIR:-$PWD/target/zig-local-cache}"
+
+exec zig ar "$@"

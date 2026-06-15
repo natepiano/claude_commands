@@ -1,0 +1,26 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+export ZIG_GLOBAL_CACHE_DIR="${ZIG_GLOBAL_CACHE_DIR:-$PWD/target/zig-global-cache}"
+export ZIG_LOCAL_CACHE_DIR="${ZIG_LOCAL_CACHE_DIR:-$PWD/target/zig-local-cache}"
+
+args=()
+skip_next=0
+for arg in "$@"; do
+  if [ "$skip_next" -eq 1 ]; then
+    skip_next=0
+    continue
+  fi
+  case "$arg" in
+    --target=x86_64-unknown-linux-gnu)
+      ;;
+    --target)
+      skip_next=1
+      ;;
+    *)
+      args+=("$arg")
+      ;;
+  esac
+done
+
+exec zig c++ -target x86_64-linux-gnu "${args[@]}"
