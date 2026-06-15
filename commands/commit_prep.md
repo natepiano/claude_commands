@@ -123,7 +123,10 @@ Pick the path for your agent:
   ```
 
 - Do not use `~/.claude/scripts/commit_prep/stage_and_commit.sh` by default. It stages with `git add -A`, which can widen the commit scope, and invoking it through `bash` can turn the helper invocation into a one-off permission request.
-- Do not request escalation preemptively. Only if direct `git add -- <paths>` or direct `git commit -F <temp-message-file>` fails because Codex cannot write `.git/index.lock` or another git metadata path, retry the same direct git command once with `sandbox_permissions: "require_escalated"`. Use a stable prefix such as `git add` or `git commit`; never put the full commit message in the escalated command text.
+- For all repos, if direct `git add -- <paths>` or direct `git commit -F <temp-message-file>` fails because Codex cannot write `.git/index.lock` or another git metadata path, retry that exact command once using escalated execution.
+  - Use a stable `git add` prefix for staging retries.
+  - Use a stable `git commit` prefix for commit retries.
+  - Never include the full commit message in an escalated command.
 
 Then execute <CommitOutput/>
 
