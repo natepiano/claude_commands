@@ -97,34 +97,33 @@ Pick the path for your agent:
 - Commit directly with `git commit -m "$(cat <<'EOF' ... EOF)"` using a quoted heredoc for the multi-line message. `Bash(git add *)` and `Bash(git commit *)` are in the user allowlist, so this runs without a secondary permission prompt.
 - Do NOT use the helper scripts (`create_message_file.sh`, `stage_and_commit.sh`). They exist for Codex's sandbox model and only add a permission prompt when invoked from Claude, because the shell wrapper (`MSG_FILE=$(...)` or `bash <script>`) prevents the allowlist prefix match from firing.
 
-**If you are Codex (or another agent whose sandbox blocks `git add` / `git commit` from writing `.git/index.lock`):**
-- Write the prepared commit message to a system temp file via
-  `~/.claude/scripts/commit_prep/create_message_file.sh`. The helper reads the
-  message from **stdin** and prints the temp file path to stdout when
-  `--stdout-path` is passed:
+**If you are Codex:**
+- Write the prepared commit message to a system temp file first. Do this without escalation. Keep the commit message out of the permission request and out of the `git commit` command line.
 
   ```bash
-  MSG_FILE=$(~/.claude/scripts/commit_prep/create_message_file.sh --stdout-path <<'EOF'
+  cat >/tmp/commit-prep-message.txt <<'EOF'
   <title line>
 
   <body line 1>
   <body line 2>
   ...
   EOF
-  )
   ```
 
-  Notes:
-  - Never run the helper with no stdin — it exits 1 with "commit message is empty".
-  - Keep the heredoc delimiter quoted (`<<'EOF'`) so `$`, backticks, and backslashes are preserved literally.
-
-- Then run the stage+commit helper, passing the captured path:
+- Stage files with direct, explicit-path git commands. Do not use `git add -A` or `git add .`.
 
   ```bash
-  bash ~/.claude/scripts/commit_prep/stage_and_commit.sh "$MSG_FILE"
+  git add -- <path> <path> ...
   ```
 
-  Request escalation with `sandbox_permissions: "require_escalated"` (or equivalent) so the helper can write `.git/index.lock`. Do not fail the workflow on the first sandbox denial — retry once with escalation.
+- Commit directly with `git commit -F <temp-message-file>`.
+
+  ```bash
+  git commit -F /tmp/commit-prep-message.txt
+  ```
+
+- Do not use `~/.claude/scripts/commit_prep/stage_and_commit.sh` by default. It stages with `git add -A`, which can widen the commit scope, and invoking it through `bash` can turn the helper invocation into a one-off permission request.
+- Do not request escalation preemptively. Only if direct `git add -- <paths>` or direct `git commit -F <temp-message-file>` fails because Codex cannot write `.git/index.lock` or another git metadata path, retry the same direct git command once with `sandbox_permissions: "require_escalated"`. Use a stable prefix such as `git add` or `git commit`; never put the full commit message in the escalated command text.
 
 Then execute <CommitOutput/>
 
