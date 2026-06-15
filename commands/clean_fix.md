@@ -11,13 +11,14 @@ description: Unified clean-fix command — run the pipeline (one project or all)
 | `run [clean \| style \| all \| project]` | Launch a pipeline scope (default all), or eval + fix for one project |
 | `monitor [log-path] [project]` | Attach a live Monitor to a running clean-fix log |
 | `report [list \| <path>]` | Render a per-project status table from a run log |
-| `eval [agent claude\|codex \| model <id>\|default \| on\|off]` | Show or set eval/review agent configuration |
-| `fix [agent claude\|codex \| model <id>\|default \| on\|off]` | Show or set fix-worktree agent configuration |
-| `agent claude\|codex` | Set both eval and fix agents |
-| `on\|off` | Enable or disable both eval and fix style stages |
+| `eval [agent claude\|codex \| model <id>\|default \| effort <id>\|default \| on\|off]` | Show or set style-eval agent configuration |
+| `review [agent claude\|codex \| model <id>\|default \| effort <id>\|default \| on\|off]` | Show or set style-eval-review agent configuration |
+| `fix [agent claude\|codex \| model <id>\|default \| effort <id>\|default \| on\|off]` | Show or set fix-worktree agent configuration |
+| `agent claude\|codex` | Set all clean-fix style-stage agents |
+| `on\|off` | Enable or disable all clean-fix style stages |
 | `skip clean\|style [...]` | Skip or re-enable targets for the clean or style pass |
 
-Dispatch: `run` → <Run/>, `monitor` → <Monitor/>, `report` → <Report/>, `eval`/`fix`/`agent`/`on`/`off` → <StyleAgentConfig/>, `skip` → <Skip/>. Empty or unrecognized first token → print the table above and stop.
+Dispatch: `run` → <Run/>, `monitor` → <Monitor/>, `report` → <Report/>, `eval`/`review`/`fix`/`agent`/`on`/`off` → <StyleAgentConfig/>, `skip` → <Skip/>. Empty or unrecognized first token → print the table above and stop.
 
 <Run>
 
@@ -212,33 +213,37 @@ Read `~/.claude/scripts/clean-fix/report-render.md` and follow it, substituting 
 
 <StyleAgentConfig>
 
-## eval|fix [agent claude|codex | model <id>|default | on|off]
+## eval|review|fix [agent claude|codex | model <id>|default | effort <id>|default | on|off]
 ## agent claude|codex
 ## on|off
 
 Show or set the clean-fix style agent configuration.
 
-The config file is `~/.claude/scripts/clean-fix/clean-fix.conf`. The model allowlist is `~/.claude/scripts/clean-fix/agent-models.conf`. When a scope leaves `model=`/`effort=` empty, the values come from the shared `~/.claude/config/agents.conf` `[<agent>]` section (single source shared with `/plan:delegate`); an explicit `model=` here overrides for that scope only. Two agent sections are configurable:
+The clean-fix stage assignment file is `~/.claude/scripts/clean-fix/agent-assignments.conf`. The global agent registry is `~/.claude/config/agents.conf`; it contains each agent's default `model=`/`effort=` plus `[<agent>.models]` and `[<agent>.efforts]` allowlists. When a clean-fix stage leaves `model=`/`effort=` empty, the values resolve from the global `[<agent>]` section. An explicit `model=` or `effort=` in `agent-assignments.conf` overrides for that clean-fix stage only and must pass the global allowlist.
 
-- **eval** — `[style_eval] enabled=`, `agent=`, and optional `model=`. Drives eval and review stages.
-- **fix** — `[style_fix] enabled=`, `agent=`, and optional `model=`. Drives fix-worktree agents.
+Three clean-fix sections are configurable:
 
-`mode=` is not valid anymore. The scripts reject any `mode=` key in `[style_eval]` or `[style_fix]`.
+- **eval** — `[style_eval] enabled=`, `agent=`, optional `model=`, and optional `effort=`.
+- **review** — `[style_eval_review] enabled=`, `agent=`, optional `model=`, and optional `effort=`.
+- **fix** — `[style_fix] enabled=`, `agent=`, optional `model=`, and optional `effort=`.
+
+`mode=` is not valid anymore. The scripts reject any `mode=` key in the clean-fix stage assignment sections. `clean-fix.conf` owns pipeline targets and tunables only; agent settings placed there are rejected as stale.
 
 Argument handling:
 
-1. Read `~/.claude/scripts/clean-fix/clean-fix.conf`.
-2. Read `~/.claude/scripts/clean-fix/agent-models.conf`.
-3. **No tokens** — show both sections: `enabled`, `agent`, `model` (`<default>` when empty), and the allowlist path. Stop.
-4. **First token is `eval` or `fix`** — the scope. Map `eval` to `[style_eval]` and `fix` to `[style_fix]`.
-5. **Scoped status:** `/clean_fix eval` or `/clean_fix fix` shows only that scope's current `enabled`, `agent`, and `model`.
-6. **Scoped enable/disable:** `/clean_fix eval on`, `/clean_fix eval off`, `/clean_fix fix on`, `/clean_fix fix off` set that scope's `enabled=` to `true` or `false`.
-7. **Global enable/disable:** `/clean_fix on` and `/clean_fix off` set both `[style_eval] enabled=` and `[style_fix] enabled=` to `true` or `false`.
-8. **Scoped agent:** `/clean_fix eval agent claude`, `/clean_fix eval agent codex`, `/clean_fix fix agent claude`, or `/clean_fix fix agent codex` set that scope's `agent=`. If that scope has a non-empty `model=` that is not listed under the new agent in `agent-models.conf`, also set `model=` to empty (`<default>`) and report that reset.
-9. **Global agent:** `/clean_fix agent claude` or `/clean_fix agent codex` sets both scope `agent=` values. For each scope, if its non-empty `model=` is not listed under the new agent in `agent-models.conf`, also set that scope's `model=` to empty (`<default>`) and report that reset.
-10. **Scoped model:** `/clean_fix eval model opus` or `/clean_fix fix model gpt-5.4-mini` first reads the selected scope's `agent=`. The model must exactly match a non-comment line under that agent's section in `agent-models.conf`; otherwise stop and show the allowed values.
-11. **Default model:** `/clean_fix eval model default` or `/clean_fix fix model default` sets that scope's `model=` to an empty value, which resolves to the shared `~/.claude/config/agents.conf` `[<agent>]` model. If that agents.conf section omits `model=`, the agent's own CLI default applies.
-12. When changing a value, edit only the relevant `enabled=`, `agent=`, or `model=` line in-place. The `[build]` and `[targets]` skip lists are managed by `phase_skip.py` (see <Skip/>), never by direct edits.
+1. Read `~/.claude/scripts/clean-fix/agent-assignments.conf`.
+2. Read `~/.claude/config/agents.conf`.
+3. **No tokens** — show all three sections: `enabled`, `agent`, resolved `model`, resolved `effort`, assignment path, and registry path. Stop.
+4. **First token is `eval`, `review`, or `fix`** — the scope. Map `eval` to `[style_eval]`, `review` to `[style_eval_review]`, and `fix` to `[style_fix]`.
+5. **Scoped status:** `/clean_fix eval`, `/clean_fix review`, or `/clean_fix fix` shows only that scope's current `enabled`, `agent`, resolved `model`, and resolved `effort`.
+6. **Scoped enable/disable:** `/clean_fix eval on`, `/clean_fix review off`, `/clean_fix fix on`, etc. set that scope's `enabled=` to `true` or `false`.
+7. **Global enable/disable:** `/clean_fix on` and `/clean_fix off` set all three `enabled=` values to `true` or `false`.
+8. **Scoped agent:** `/clean_fix <scope> agent claude` or `/clean_fix <scope> agent codex` sets that scope's `agent=`. If that scope has a non-empty `model=` or `effort=` not allowed for the new agent in `config/agents.conf`, also set the invalid value to empty (`<default>`) and report that reset.
+9. **Global agent:** `/clean_fix agent claude` or `/clean_fix agent codex` sets all three scope `agent=` values and resets any now-invalid non-empty `model=` or `effort=` values to empty.
+10. **Scoped model:** `/clean_fix eval model opus`, `/clean_fix review model sonnet`, or `/clean_fix fix model gpt-5.4-mini` first reads the selected scope's `agent=`. The model must exactly match a non-comment line under `[<agent>.models]` in `config/agents.conf`; otherwise stop and show the allowed values.
+11. **Scoped effort:** `/clean_fix eval effort max` or `/clean_fix fix effort xhigh` first reads the selected scope's `agent=`. The effort must exactly match a non-comment line under `[<agent>.efforts]` in `config/agents.conf`; otherwise stop and show the allowed values.
+12. **Default model/effort:** `/clean_fix <scope> model default` sets that scope's `model=` to empty. `/clean_fix <scope> effort default` sets that scope's `effort=` to empty. Empty values resolve through the global `[<agent>]` defaults; if those are empty too, the agent CLI default applies.
+13. When changing a value, edit only the relevant `enabled=`, `agent=`, `model=`, or `effort=` line in `agent-assignments.conf`. The `[build]` and `[targets]` skip lists remain in `clean-fix.conf` and are managed by `phase_skip.py` (see <Skip/>), never by direct edits.
 
 </StyleAgentConfig>
 

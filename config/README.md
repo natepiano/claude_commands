@@ -4,6 +4,10 @@
 
 Example configuration for the `/blender:bake_textures` command. Copy and modify this template to specify blend files, objects, texture maps, and export settings for texture baking.
 
+## agents.conf
+
+Global agent registry for command scripts. Defines each agent's default model and reasoning effort, plus the allowed model and effort values that command-specific configs may reference.
+
 ## cargo-fmt-exclusions.json
 
 List of crate names to exclude from `cargo fmt` checks. Used when running formatting on external/third-party crates where we don't want to modify their style.

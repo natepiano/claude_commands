@@ -11,9 +11,9 @@ Runs daily at **4:00 AM** via launchd.
 | File | Purpose |
 |------|---------|
 | `clean-fix.sh` | Main entry point. Takes a scope: `clean` (settings back-populate + clean/build/mend + warmup), `style` (eval + review + fix), or `all` (default, both). Emits a clean-fix log that `/clean_fix report` can render on demand. |
-| `clean-fix.conf` | Configuration. Two opt-in allowlists: `[build]` (clean/build/mend) and `[targets]` (style eval/review/fix). Plus style agent settings (`enabled`, `agent`, `model`, `max_new_findings`) and warmup targets. No deny list — nothing runs unless listed. |
-| `agent-models.conf` | Allowed model names for each style agent. Any non-empty `model=` in `clean-fix.conf` must match the selected `agent=` section here. |
-| `agent_config.sh` | Shared Bash helpers for parsing booleans and validating `agent`/`model` combinations before scripts launch Claude or Codex. |
+| `clean-fix.conf` | Pipeline configuration. Two opt-in allowlists: `[build]` (clean/build/mend) and `[targets]` (style eval/review/fix), plus style quotas, timeouts, project env, and warmup targets. No agent settings live here. No deny list — nothing runs unless listed. |
+| `agent-assignments.conf` | Clean-fix stage-to-agent mapping. `[style_eval]`, `[style_eval_review]`, and `[style_fix]` each own `enabled=`, `agent=`, and optional per-stage `model=`/`effort=` overrides. Empty overrides resolve through `~/.claude/config/agents.conf`. |
+| `agent_assignments.sh` | Clean-fix Bash helper for loading stage assignments. It delegates model/effort defaults and allowlist validation to `scripts/agents_config.sh`. |
 | `com.natemccoy.style-fix.plist` | launchd plist — runs the style scope every 10 minutes (no idle gate). |
 | `com.natemccoy.cargo-clean.plist` | launchd plist — runs the clean scope nightly at 4:00 AM (idle-gated). |
 | `setup.sh` | Idempotent setup script — installs both launchd agents, creates runtime directories, retires the old pre-split agent. |
@@ -22,7 +22,7 @@ Runs daily at **4:00 AM** via launchd.
 
 | File | Purpose |
 |------|---------|
-| `style-eval-all.sh` | Runs `/style_eval` on every `[targets]` entry in parallel. Stores pending evaluation markdown in `.history/.pending/<project>.json`. Skips projects with pending findings or a real `_style_fix` worktree so pending JSON cannot be replaced while fixes are awaiting review. |
+| `style-eval-all.sh` | Runs `/style_eval` on every `[targets]` entry in parallel using the `[style_eval]` assignment. Stores pending evaluation markdown in `.history/.pending/<project>.json`. Skips projects with pending findings or a real `_style_fix` worktree so pending JSON cannot be replaced while fixes are awaiting review. |
 | `candidate_generators.py` | Deterministic candidate enumeration for style-eval units. A guideline's `candidates:` frontmatter names a generator kind (regex / toml / Rust-source parse); `next-unit` hands the agent the enumerated sites as a closed list, `record-unit` refuses records that don't disposition every candidate, and zero-candidate units record free like pre_filter skips. Design + audit: `docs/candidate-enumeration-design.md`. Debug via `style_history.py enumerate-candidates`. |
 | `rg-shim.sh` | Timeout shim for `ripgrep`. Bounds every non-interactive `rg` so a path-less search blocked on stdin can't hang forever. See **Reliability guards** below. |
 
@@ -30,7 +30,7 @@ Runs daily at **4:00 AM** via launchd.
 
 | File | Purpose |
 |------|---------|
-| `style-fix-worktrees.sh` | For each project with pending findings: creates a `_style_fix` worktree, exports evaluation markdown to a scratch file under `/private/tmp/claude`, launches the configured style agent to apply fixes (cargo mend, clippy, tests, style review), then launches a second run of the **same** agent to verify the applied fix against the Fix Summary (correcting mistakes and updating the summary), saves the Fix Summary back into pending JSON, and keeps `EVALUATION.md` out of the worktree. Other linked worktrees are allowed; the primary checkout still must be clean. Can target a single project by name. |
+| `style-fix-worktrees.sh` | For each project with pending findings: creates a `_style_fix` worktree, exports evaluation markdown to a scratch file under `/private/tmp/claude`, launches the `[style_fix]` agent to apply fixes (cargo mend, clippy, tests, style review), then launches a second run of the **same** agent to verify the applied fix against the Fix Summary (correcting mistakes and updating the summary), saves the Fix Summary back into pending JSON, and keeps `EVALUATION.md` out of the worktree. Other linked worktrees are allowed; the primary checkout still must be clean. Can target a single project by name. |
 
 ### Warmup
 
@@ -116,7 +116,11 @@ style-fix job (every 10 min, no idle gate) — clean-fix.sh style
   │    → skip any project with pending findings or a _style_fix worktree
   │    → find new violations → store pending evaluation markdown
   │
-  ├─ Phase 2: Style-Fix Worktrees (per project, parallel)
+  ├─ Phase 2: Style Evaluation Review (per project, parallel)
+  │    Review pending evaluation markdown with the configured review agent
+  │    → save reviewed markdown back into pending JSON
+  │
+  ├─ Phase 3: Style-Fix Worktrees (per project, parallel)
   │    Create _style_fix worktree (other linked worktrees allowed if primary is clean)
   │    → export pending evaluation markdown to scratch storage
   │    → Pass 1 (apply): configured style agent applies fixes, runs clippy/tests/style review, writes Fix Summary

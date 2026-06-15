@@ -17,7 +17,7 @@ set -euo pipefail
 export PATH="$HOME/.local/bin:$PATH"
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-source "$SCRIPT_DIR/agent_config.sh"
+source "$SCRIPT_DIR/agent_assignments.sh"
 
 RUST_DIR="$HOME/rust"
 HISTORY_DIR="$HOME/rust/nate_style/.history"
@@ -63,17 +63,11 @@ if [[ -f "$CONF_FILE" ]]; then
             targets) targets+=("$stripped") ;;
             style_eval)
                 if [[ "$stripped" =~ ^mode= ]]; then
-                    echo "ERROR: [style_eval] mode is no longer supported; use enabled=true|false and agent=claude|codex" >&2
+                    echo "ERROR: [style_eval] mode is no longer supported; agent settings moved to agent-assignments.conf" >&2
                     exit 1
-                elif [[ "$stripped" =~ ^enabled=(.+)$ ]]; then
-                    cf_validate_bool "style_eval" "enabled" "${BASH_REMATCH[1]}" || exit 1
-                    STYLE_ENABLED="${BASH_REMATCH[1]}"
-                elif [[ "$stripped" =~ ^agent=(.+)$ ]]; then
-                    STYLE_AGENT="${BASH_REMATCH[1]}"
-                elif [[ "$stripped" =~ ^model=(.*)$ ]]; then
-                    STYLE_AGENT_MODEL="${BASH_REMATCH[1]}"
-                elif [[ "$stripped" =~ ^effort=(.*)$ ]]; then
-                    STYLE_AGENT_EFFORT="${BASH_REMATCH[1]}"
+                elif [[ "$stripped" =~ ^(enabled|agent|model|effort)= ]]; then
+                    echo "ERROR: [style_eval] agent settings moved to $CLEAN_FIX_AGENT_ASSIGNMENTS_FILE" >&2
+                    exit 1
                 fi
                 if [[ "$stripped" =~ ^max_new_findings=([0-9]+)$ ]]; then
                     MAX_NEW_FINDINGS="${BASH_REMATCH[1]}"
@@ -92,16 +86,7 @@ if [[ -z "$MAX_NEW_FINDINGS" ]]; then
     echo "ERROR: [style_eval] max_new_findings is not set in $CONF_FILE" >&2
     exit 1
 fi
-if [[ -z "$STYLE_ENABLED" ]]; then
-    echo "ERROR: [style_eval] enabled must be set to true or false in $CONF_FILE" >&2
-    exit 1
-fi
-cf_validate_agent "style_eval" "$STYLE_AGENT" || exit 1
-# When the conf leaves model/effort empty, take them from the shared
-# ~/.claude/config/agents.conf [<agent>] so the resolved values are validated below.
-cf_apply_agent_defaults STYLE_AGENT_MODEL STYLE_AGENT_EFFORT "$STYLE_AGENT"
-cf_validate_model_for_agent "style_eval" "$STYLE_AGENT" "$STYLE_AGENT_MODEL" || exit 1
-cf_validate_effort_for_agent "style_eval" "$STYLE_AGENT" "$STYLE_AGENT_EFFORT" || exit 1
+cf_load_stage_assignment style_eval STYLE_ENABLED STYLE_AGENT STYLE_AGENT_MODEL STYLE_AGENT_EFFORT || exit 1
 
 # Backstop timeout for a single eval agent. Reuses the [style_fix] agent cap
 # (defaults to 2h if unset). Bounds a wedged agent so it cannot stall the serial

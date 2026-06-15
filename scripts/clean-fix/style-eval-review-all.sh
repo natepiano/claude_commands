@@ -22,7 +22,7 @@ set -euo pipefail
 export PATH="$HOME/.local/bin:$PATH"
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-source "$SCRIPT_DIR/agent_config.sh"
+source "$SCRIPT_DIR/agent_assignments.sh"
 
 RUST_DIR="$HOME/rust"
 NATE_STYLE_DIR="$HOME/rust/nate_style"
@@ -39,8 +39,8 @@ CODEX_BIN="${CODEX_BIN:-$HOME/.nvm/versions/node/v20.19.1/bin/codex}"
 
 mkdir -p "$LOG_DIR"
 
-# Parse conf for the agent mode/model and the [targets] allowlist, so the review
-# project list matches the eval stage.
+# Parse conf for the [targets] allowlist so the review project list matches the
+# eval stage. Agent assignment comes from agent-assignments.conf.
 targets=()
 
 if [[ -f "$CONF_FILE" ]]; then
@@ -57,31 +57,20 @@ if [[ -f "$CONF_FILE" ]]; then
             targets) targets+=("$stripped") ;;
             style_eval)
                 if [[ "$stripped" =~ ^mode= ]]; then
-                    echo "ERROR: [style_eval] mode is no longer supported; use enabled=true|false and agent=claude|codex" >&2
+                    echo "ERROR: [style_eval] mode is no longer supported; agent settings moved to agent-assignments.conf" >&2
                     exit 1
-                elif [[ "$stripped" =~ ^enabled=(.+)$ ]]; then
-                    cf_validate_bool "style_eval" "enabled" "${BASH_REMATCH[1]}" || exit 1
-                    STYLE_ENABLED="${BASH_REMATCH[1]}"
-                elif [[ "$stripped" =~ ^agent=(.+)$ ]]; then
-                    STYLE_AGENT="${BASH_REMATCH[1]}"
-                elif [[ "$stripped" =~ ^model=(.*)$ ]]; then
-                    STYLE_AGENT_MODEL="${BASH_REMATCH[1]}"
-                elif [[ "$stripped" =~ ^effort=(.*)$ ]]; then
-                    STYLE_AGENT_EFFORT="${BASH_REMATCH[1]}"
+                elif [[ "$stripped" =~ ^(enabled|agent|model|effort)= ]]; then
+                    echo "ERROR: [style_eval] agent settings moved to $CLEAN_FIX_AGENT_ASSIGNMENTS_FILE" >&2
+                    exit 1
                 fi
                 ;;
         esac
     done < "$CONF_FILE"
 fi
 
-# Review follows the configured eval agent.
-if [[ -z "$STYLE_ENABLED" ]]; then
-    echo "ERROR: [style_eval] enabled must be set to true or false in $CONF_FILE" >&2
-    exit 1
-fi
-cf_validate_agent "style_eval" "$STYLE_AGENT" || exit 1
-cf_validate_model_for_agent "style_eval" "$STYLE_AGENT" "$STYLE_AGENT_MODEL" || exit 1
-cf_validate_effort_for_agent "style_eval" "$STYLE_AGENT" "$STYLE_AGENT_EFFORT" || exit 1
+# Review has its own stage assignment. Empty model/effort values are filled from
+# the global agent registry before launch.
+cf_load_stage_assignment style_eval_review STYLE_ENABLED STYLE_AGENT STYLE_AGENT_MODEL STYLE_AGENT_EFFORT || exit 1
 if [[ "$STYLE_ENABLED" == "false" ]]; then
     echo "Style evaluation review is disabled."
     exit 0

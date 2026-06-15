@@ -31,7 +31,7 @@ export PATH="$HOME/.local/bin:$PATH"
 source "$HOME/.cargo/env"
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-source "$SCRIPT_DIR/agent_config.sh"
+source "$SCRIPT_DIR/agent_assignments.sh"
 
 RUST_DIR="$HOME/rust"
 CONF_FILE="$SCRIPT_DIR/clean-fix.conf"
@@ -134,17 +134,11 @@ if [[ -f "$CONF_FILE" ]]; then
                 elif [[ "$stripped" =~ ^heartbeat_interval_secs=([0-9]+)$ ]]; then
                     HEARTBEAT_INTERVAL_SECS="${BASH_REMATCH[1]}"
                 elif [[ "$stripped" =~ ^mode= ]]; then
-                    echo "ERROR: [style_fix] mode is no longer supported; use enabled=true|false and agent=claude|codex" >&2
+                    echo "ERROR: [style_fix] mode is no longer supported; agent settings moved to agent-assignments.conf" >&2
                     exit 1
-                elif [[ "$stripped" =~ ^enabled=(.+)$ ]]; then
-                    cf_validate_bool "style_fix" "enabled" "${BASH_REMATCH[1]}" || exit 1
-                    STYLE_ENABLED="${BASH_REMATCH[1]}"
-                elif [[ "$stripped" =~ ^agent=(.+)$ ]]; then
-                    STYLE_AGENT="${BASH_REMATCH[1]}"
-                elif [[ "$stripped" =~ ^model=(.*)$ ]]; then
-                    STYLE_AGENT_MODEL="${BASH_REMATCH[1]}"
-                elif [[ "$stripped" =~ ^effort=(.*)$ ]]; then
-                    STYLE_AGENT_EFFORT="${BASH_REMATCH[1]}"
+                elif [[ "$stripped" =~ ^(enabled|agent|model|effort)= ]]; then
+                    echo "ERROR: [style_fix] agent settings moved to $CLEAN_FIX_AGENT_ASSIGNMENTS_FILE" >&2
+                    exit 1
                 fi
                 ;;
         esac
@@ -155,16 +149,7 @@ if [[ -z "$MAX_NEW_FINDINGS" ]]; then
     echo "ERROR: [style_eval] max_new_findings is not set in $CONF_FILE" >&2
     exit 1
 fi
-if [[ -z "$STYLE_ENABLED" ]]; then
-    echo "ERROR: [style_fix] enabled must be set to true or false in $CONF_FILE" >&2
-    exit 1
-fi
-cf_validate_agent "style_fix" "$STYLE_AGENT" || exit 1
-# When the conf leaves model/effort empty, take them from the shared
-# ~/.claude/config/agents.conf [<agent>] so the resolved values are validated below.
-cf_apply_agent_defaults STYLE_AGENT_MODEL STYLE_AGENT_EFFORT "$STYLE_AGENT"
-cf_validate_model_for_agent "style_fix" "$STYLE_AGENT" "$STYLE_AGENT_MODEL" || exit 1
-cf_validate_effort_for_agent "style_fix" "$STYLE_AGENT" "$STYLE_AGENT_EFFORT" || exit 1
+cf_load_stage_assignment style_fix STYLE_ENABLED STYLE_AGENT STYLE_AGENT_MODEL STYLE_AGENT_EFFORT || exit 1
 
 # Default any [style_fix] tunables the user didn't set in the conf. Defaults
 # match the values these were hard-coded to before the conf section existed.

@@ -71,7 +71,25 @@ if ! gh pr checks "$PR_NUMBER" --watch; then
 fi
 
 echo "Merging PR #${PR_NUMBER}..."
-gh pr merge "$PR_NUMBER" --rebase --delete-branch
+set +e
+MERGE_OUTPUT="$(gh pr merge "$PR_NUMBER" --rebase --delete-branch 2>&1)"
+MERGE_STATUS="$?"
+set -e
+
+if [[ -n "$MERGE_OUTPUT" ]]; then
+  printf '%s\n' "$MERGE_OUTPUT"
+fi
+
+if [[ "$MERGE_STATUS" -ne 0 ]]; then
+  PR_STATE="$(gh pr view "$PR_NUMBER" --json state -q .state 2>/dev/null || true)"
+
+  if [[ "$PR_STATE" == "MERGED" && "$MERGE_OUTPUT" == *"Reference does not exist"* ]]; then
+    echo "PR #${PR_NUMBER} merged and remote branch ${BRANCH_NAME} was already deleted; continuing."
+  else
+    echo "ERROR: failed to merge PR #${PR_NUMBER}." >&2
+    exit "$MERGE_STATUS"
+  fi
+fi
 MERGE_SHA="$(gh pr view "$PR_NUMBER" --json mergeCommit -q .mergeCommit.oid 2>/dev/null || true)"
 
 git switch "$DEFAULT_BRANCH"
