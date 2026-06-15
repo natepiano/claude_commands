@@ -1,7 +1,17 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-export ZIG_GLOBAL_CACHE_DIR="${ZIG_GLOBAL_CACHE_DIR:-$PWD/target/zig-global-cache}"
-export ZIG_LOCAL_CACHE_DIR="${ZIG_LOCAL_CACHE_DIR:-$PWD/target/zig-local-cache}"
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+
+if [ -n "${VALIDATE_TARGET_DIR:-}" ]; then
+  ZIG_TARGET_DIR="${VALIDATE_TARGET_DIR}"
+elif [ -n "${CARGO_TARGET_DIR:-}" ]; then
+  ZIG_TARGET_DIR="${CARGO_TARGET_DIR}"
+else
+  ZIG_TARGET_DIR="${SCRIPT_DIR}/target"
+fi
+
+export ZIG_GLOBAL_CACHE_DIR="${ZIG_GLOBAL_CACHE_DIR:-${ZIG_TARGET_DIR}/zig-global-cache}"
+export ZIG_LOCAL_CACHE_DIR="${ZIG_LOCAL_CACHE_DIR:-${ZIG_TARGET_DIR}/zig-local-cache}"
 
 exec zig ar "$@"
