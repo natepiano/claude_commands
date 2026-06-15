@@ -22,11 +22,12 @@
 # so a path-less rg reading a dead pipe dies in seconds instead of hanging the
 # caller. Normal rg searches finish in milliseconds and never hit the cap.
 #
-# Activation
-# ----------
-# A symlink at ~/.claude/scripts/rg points here. ~/.claude/scripts sits ahead of
-# /opt/homebrew/bin on both the agent's snapshot PATH and the interactive PATH,
-# so this shim wins resolution for `rg`. Remove that symlink to deactivate.
+# Status
+# ------
+# Retired. This was previously activated by a symlink at ~/.claude/scripts/rg
+# and a shell PATH entry that put ~/.claude/scripts before the real rg. That
+# global PATH shadowing caused unrelated command-resolution risk, so the symlink
+# and .zshrc PATH export were removed. Keep this file only as incident context.
 
 set -u
 

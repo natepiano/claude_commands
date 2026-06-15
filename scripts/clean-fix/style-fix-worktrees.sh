@@ -642,7 +642,7 @@ Required phase names, in order:
 Emit each marker on its own line, with no other text on the line. Do not skip markers even when a step has nothing to do — emit the marker and proceed (the user wants to see the step ran).
 
 Step 1: Load the style guide and read referenced files
-Run: zsh ~/.claude/scripts/load-rust-style.sh --project-root $agent_work_dir
+Run: zsh ~/.claude/scripts/rust_style/load-rust-style.sh --project-root $agent_work_dir
 Then read each unique style file referenced by the findings in the scratch evaluation file. Each finding includes a **Style file** field with the full path to the style guide file (e.g., ~/rust/nate_style/rust/one-use-per-line.md or a repo-local docs/style/*.md file).
 Also read each style file marked [non-negotiable] in the loaded checklist, even if no finding cites it directly. Those rules apply to every fix.
 
@@ -898,7 +898,7 @@ Required phase names, in order:
 - \`>>> phase: write-verification\` — before Step 6.
 
 Step 1: Load the style guide
-Run: zsh ~/.claude/scripts/load-rust-style.sh --project-root $agent_work_dir
+Run: zsh ~/.claude/scripts/rust_style/load-rust-style.sh --project-root $agent_work_dir
 Read each unique style file referenced by the findings (the **Style file** field of each), plus every style file marked [non-negotiable] in the loaded checklist.
 
 Step 2: Read the evaluation and the Fix Summary

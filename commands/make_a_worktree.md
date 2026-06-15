@@ -68,6 +68,6 @@ Mark third todo as completed when finished.
 <CopySettingsLocal>
 **Copy settings.local.json to the new worktree:**
 
-- Run `bash ~/.claude/scripts/copy_settings_local.sh ../[worktree-name]`
+- Run `bash ~/.claude/scripts/make_a_worktree/copy_settings_local.sh ../[worktree-name]`
 - Inform user: "Copied settings.local.json to worktree."
 </CopySettingsLocal>

@@ -13,7 +13,7 @@ Runs daily at **4:00 AM** via launchd.
 | `clean-fix.sh` | Main entry point. Takes a scope: `clean` (settings back-populate + clean/build/mend + warmup), `style` (eval + review + fix), or `all` (default, both). Emits a clean-fix log that `/clean_fix report` can render on demand. |
 | `clean-fix.conf` | Pipeline configuration. Two opt-in allowlists: `[build]` (clean/build/mend) and `[targets]` (style eval/review/fix), plus style quotas, timeouts, project env, and warmup targets. No agent settings live here. No deny list — nothing runs unless listed. |
 | `agent-assignments.conf` | Clean-fix stage-to-agent mapping. `[style_eval]`, `[style_eval_review]`, and `[style_fix]` each own `enabled=`, `agent=`, and optional per-stage `model=`/`effort=` overrides. Empty overrides resolve through `~/.claude/config/agents.conf`. |
-| `agent_assignments.sh` | Clean-fix Bash helper for loading stage assignments. It delegates model/effort defaults and allowlist validation to `scripts/agents_config.sh`. |
+| `agent_assignments.sh` | Clean-fix Bash helper for loading stage assignments. It delegates model/effort defaults and allowlist validation to `scripts/agents/agents_config.sh`. |
 | `com.natemccoy.style-fix.plist` | launchd plist — runs the style scope every 10 minutes (no idle gate). |
 | `com.natemccoy.cargo-clean.plist` | launchd plist — runs the clean scope nightly at 4:00 AM (idle-gated). |
 | `setup.sh` | Idempotent setup script — installs both launchd agents, creates runtime directories, retires the old pre-split agent. |
@@ -24,7 +24,7 @@ Runs daily at **4:00 AM** via launchd.
 |------|---------|
 | `style-eval-all.sh` | Runs `/style_eval` on every `[targets]` entry in parallel using the `[style_eval]` assignment. Stores pending evaluation markdown in `.history/.pending/<project>.json`. Skips projects with pending findings or a real `_style_fix` worktree so pending JSON cannot be replaced while fixes are awaiting review. |
 | `candidate_generators.py` | Deterministic candidate enumeration for style-eval units. A guideline's `candidates:` frontmatter names a generator kind (regex / toml / Rust-source parse); `next-unit` hands the agent the enumerated sites as a closed list, `record-unit` refuses records that don't disposition every candidate, and zero-candidate units record free like pre_filter skips. Design + audit: `docs/candidate-enumeration-design.md`. Debug via `style_history.py enumerate-candidates`. |
-| `rg-shim.sh` | Timeout shim for `ripgrep`. Bounds every non-interactive `rg` so a path-less search blocked on stdin can't hang forever. See **Reliability guards** below. |
+| `rg-shim.sh` | Retired timeout shim for `ripgrep`. Kept for reference, but not activated on PATH. See **Reliability guards** below. |
 
 ### Style-Fix Worktrees
 
@@ -66,22 +66,11 @@ Two layers now prevent a recurrence:
    (from `[style_fix]` in `clean-fix.conf`, default 2h). Containment: one hung
    agent can no longer stall the pipeline.
 
-2. **`rg` timeout shim** (`rg-shim.sh`) — the source-level guard. Interactive
-   `rg` (stdin is a tty) is a transparent passthrough; non-interactive `rg`
-   runs under a watchdog that kills it after `RG_SHIM_TIMEOUT` seconds
-   (default 60). A path-less `rg` blocked on a dead pipe dies in seconds; normal
-   searches finish in milliseconds and never hit the cap.
-
-   **Activation** is a symlink:
-
-   ```
-   ~/.claude/scripts/rg -> clean-fix/rg-shim.sh
-   ```
-
-   `~/.claude/scripts` sits ahead of `/opt/homebrew/bin` on PATH (set in
-   `.zshrc`), for both the launchd agent's snapshot PATH and interactive shells,
-   so the shim wins `rg` resolution everywhere. To deactivate, remove the
-   symlink (`rm ~/.claude/scripts/rg`) — real `rg` resolves again immediately.
+2. **Retired `rg` timeout shim** (`rg-shim.sh`) — this used to be activated by
+   a symlink at `~/.claude/scripts/rg` plus a shell PATH entry that put
+   `~/.claude/scripts` before the real `rg`. That global PATH shadowing caused
+   unrelated command-resolution risk, so the symlink and `.zshrc` PATH export
+   were removed. The file remains as incident context only.
 
 ## Generating the flowchart
 

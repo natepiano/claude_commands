@@ -80,7 +80,7 @@ Launch **3 Explore agents in parallel** using the Agent tool. Each agent's promp
 
 ```
 Before evaluating, load the Rust style guide:
-  zsh ~/.claude/scripts/load-rust-style.sh
+  zsh ~/.claude/scripts/rust_style/load-rust-style.sh
 
 If the output mentions a saved file path, Read that file. Apply the loaded rules — especially `when-to-split-a-module.md` for the over-large-file criterion (~500 lines non-test + at least one other signal) — when forming findings. Cite the rule filename for each finding it informs.
 

@@ -85,7 +85,7 @@ edge cases and constraints discussed.]
 ## Style Requirements   ← include this section only for Rust work
 
 Before writing any code, run:
-  zsh ~/.claude/scripts/load-rust-style.sh --project-root <WORKING_DIR>
+  zsh ~/.claude/scripts/rust_style/load-rust-style.sh --project-root <WORKING_DIR>
 Read every style file marked [non-negotiable] in the loaded checklist and any
 guideline files relevant to the code you are changing (full paths are shown in
 the checklist, e.g. ~/rust/nate_style/rust/<rule>.md or repo-local docs/style/*.md).

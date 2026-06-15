@@ -24,7 +24,7 @@
       "Bash(bash ~/.claude/scripts/worktree_delete/perform_deletion.sh:*)",
       "Bash(bash ~/.claude/scripts/merge_branch/discovery.sh:*)",
       "Bash(bash ~/.claude/scripts/merge_branch/validate.sh:*)",
-      "Bash(bash ~/.claude/scripts/copy_settings_local.sh:*)",
+      "Bash(bash ~/.claude/scripts/make_a_worktree/copy_settings_local.sh:*)",
       "Bash(~/.claude/scripts/new_rust_project/rust_generate.sh:*)",
       "mcp__brp__brp_launch",
       "mcp__brp__brp_shutdown",

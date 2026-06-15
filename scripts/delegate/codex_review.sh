@@ -20,7 +20,7 @@ PROMPT_FILE="${3:-${SESSION_DIR}/review_prompt.md}"
 
 # Shared codex model/effort (single source of truth, shared with clean-fix).
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-source "${SCRIPT_DIR}/../agents_config.sh"
+source "${SCRIPT_DIR}/../agents/agents_config.sh"
 CODEX_MODEL="$(agents_config_model codex)"
 CODEX_EFFORT="$(agents_config_effort codex)"
 

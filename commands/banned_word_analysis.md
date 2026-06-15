@@ -57,8 +57,8 @@ max, white = min; log scale). Pass the SAME sort mode chosen in Step 1
 here don't render ANSI color, so the PNG is the only way to show the gradient.
 
 ```bash
-uv run ~/.claude/scripts/banned-word-gradient.py --sort recency   # recency case
-uv run ~/.claude/scripts/banned-word-gradient.py                  # count case
+uv run ~/.claude/scripts/banned_word_analysis/banned-word-gradient.py --sort recency   # recency case
+uv run ~/.claude/scripts/banned_word_analysis/banned-word-gradient.py                  # count case
 ```
 
 `uv` auto-installs Pillow from the script's inline metadata, but its cache

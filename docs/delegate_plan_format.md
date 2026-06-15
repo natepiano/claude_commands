@@ -33,7 +33,7 @@ to rediscover after a context compaction lives in the doc.
 - **Build:** <exact build command>
 - **Test:** <exact test command>
 - **Lint:** <clippy / type-check / fmt command, if any>
-- **Style:** <the style-loader line, e.g. `zsh ~/.claude/scripts/load-rust-style.sh --project-root <dir>`; omit for non-Rust>
+- **Style:** <the style-loader line, e.g. `zsh ~/.claude/scripts/rust_style/load-rust-style.sh --project-root <dir>`; omit for non-Rust>
 - **Invariants:** <project-wide rules every phase must preserve; omit if none>
 
 ## Phases

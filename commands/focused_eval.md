@@ -53,7 +53,7 @@ If any requested guideline is unresolvable, the helper exits non-zero and prints
 Run:
 
 ```bash
-zsh ~/.claude/scripts/load-rust-style.sh --list-files --project-root "<project-root>"
+zsh ~/.claude/scripts/rust_style/load-rust-style.sh --list-files --project-root "<project-root>"
 ```
 
 Match each `guideline_id` against the output to get the absolute style-file path — you'll need this to cite findings in Step 5.

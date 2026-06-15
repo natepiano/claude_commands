@@ -24,7 +24,7 @@ use the example file already in context, or ask.
 
 <LoadStyle>
 This edits Rust, so load the style guide first: run
-`zsh ~/.claude/scripts/load-rust-style.sh` and read the full persisted output.
+`zsh ~/.claude/scripts/rust_style/load-rust-style.sh` and read the full persisted output.
 Follow it for naming, comment style, and formatting.
 </LoadStyle>
 

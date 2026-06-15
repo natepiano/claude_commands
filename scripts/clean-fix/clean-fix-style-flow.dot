@@ -62,7 +62,7 @@ digraph clean_fix_style {
 
         eval_foreach [label="For each project (parallel)" pos="394.2,790!"]
         ttl_gate [label="due-units gate:\nany unit due?" shape=diamond fillcolor="#fef9e7" color="#f39c12" width=1.6 height=0.9 pos="394.2,722!"]
-        load_style [label="Load style guide\n~/.claude/scripts/load-rust-style.sh" height=0.55 pos="394.2,660!"]
+        load_style [label="Load style guide\n~/.claude/scripts/rust_style/load-rust-style.sh" height=0.55 pos="394.2,660!"]
         survey [label="Survey project source" pos="394.2,602!"]
         carry_forward [label="Read pending JSON\n(carry forward valid findings)" height=0.55 pos="394.2,544!"]
         check_wt_eval [label="style-fix scratch\nevaluation exists?" shape=diamond fillcolor="#fef9e7" color="#f39c12" width=1.5 height=0.9 pos="394.2,466!"]

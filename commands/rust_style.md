@@ -2,7 +2,7 @@ Load the Rust style guide before writing Rust code.
 
 Run this exact command with Bash:
 ```bash
-zsh ~/.claude/scripts/load-rust-style.sh
+zsh ~/.claude/scripts/rust_style/load-rust-style.sh
 ```
 
 **IMPORTANT — reading the full output:**

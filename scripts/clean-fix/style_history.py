@@ -29,7 +29,7 @@ PENDING_DIR = HISTORY_DIR / ".pending"
 LOAD_STYLE_SCRIPT = Path(
     os.environ.get(
         "STYLE_HISTORY_LOAD_STYLE_SCRIPT",
-        str(Path.home() / ".claude" / "scripts" / "load-rust-style.sh"),
+        str(Path.home() / ".claude" / "scripts" / "rust_style" / "load-rust-style.sh"),
     )
 )
 CLEAN_FIX_CONF_FILE = Path(

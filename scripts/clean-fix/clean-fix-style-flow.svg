@@ -4,7 +4,7 @@
 <title>clean_fix_style</title>
 <polygon fill="white" stroke="none" points="-4,4 -4,-950 795.67,-950 795.67,4 -4,4" />
 
-<rect x="-18.0" y="-895.4" width="208.8" height="461.2" fill="none" stroke="#95a5a6" stroke-width="1.5" stroke-dasharray="6,4" rx="4.0" /><rect x="234.8" y="-895.4" width="208.8" height="639.2" fill="none" stroke="#95a5a6" stroke-width="1.5" stroke-dasharray="6,4" rx="4.0" /><rect x="487.6" y="-895.4" width="315.2" height="555.2" fill="none" stroke="#95a5a6" stroke-width="1.5" stroke-dasharray="6,4" rx="4.0" /><rect x="288.0" y="-200.0" width="208.8" height="230.0" fill="none" stroke="#95a5a6" stroke-width="1.5" stroke-dasharray="6,4" rx="4.0" /><g id="node1" class="node">
+<rect x="-18.0" y="-895.4" width="208.8" height="461.2" fill="none" stroke="#95a5a6" stroke-width="1.5" stroke-dasharray="6,4" rx="4.0" /><rect x="214.3" y="-895.4" width="249.8" height="639.2" fill="none" stroke="#95a5a6" stroke-width="1.5" stroke-dasharray="6,4" rx="4.0" /><rect x="487.6" y="-895.4" width="315.2" height="555.2" fill="none" stroke="#95a5a6" stroke-width="1.5" stroke-dasharray="6,4" rx="4.0" /><rect x="288.0" y="-200.0" width="208.8" height="230.0" fill="none" stroke="#95a5a6" stroke-width="1.5" stroke-dasharray="6,4" rx="4.0" /><g id="node1" class="node">
 <title>start</title>
 <ellipse fill="#f0e6ff" stroke="#8e44ad" cx="86.4" cy="-928" rx="79.2" ry="18" />
 <text xml:space="preserve" text-anchor="middle" x="86.4" y="-924.12" font-family="Helvetica,sans-Serif" font-size="10.00">Clean-fix Build (4:00 AM)</text>
@@ -94,9 +94,9 @@
 
 <g id="edge7" class="edge">
 <title>style_enabled-&gt;eval_foreach</title>
-<path fill="none" stroke="black" d="M116.08,-505.79C135.46,-515.41 160.11,-530.24 176.5,-549.5 243.56,-628.31 207.56,-679.88 268.93,-763.2 279.48,-777.53 293.53,-791.23 306.29,-802.31" />
-<polygon fill="black" stroke="black" points="303.8,-804.78 313.7,-808.56 308.31,-799.43 303.8,-804.78" />
-<text xml:space="preserve" text-anchor="middle" x="218.81" y="-655.86" font-family="Helvetica,sans-Serif" font-size="8.00">yes</text>
+<path fill="none" stroke="black" d="M116.75,-505.25C136.42,-514.63 161.14,-529.4 176.5,-549.5 224.99,-612.97 188.14,-652.64 228.61,-721.5 247.77,-754.1 279.66,-783.28 304.29,-802.81" />
+<polygon fill="black" stroke="black" points="302.08,-805.53 312.13,-808.89 306.37,-800 302.08,-805.53" />
+<text xml:space="preserve" text-anchor="middle" x="201.6" y="-659.44" font-family="Helvetica,sans-Serif" font-size="8.00">yes</text>
 </g>
 
 <g id="node25" class="node">
@@ -127,9 +127,9 @@
 
 <g id="node10" class="node">
 <title>load_style</title>
-<polygon fill="#e8f4f8" stroke="#2980b9" points="425.6,-717.8 252.8,-717.8 252.8,-678.2 425.6,-678.2 425.6,-717.8" />
+<polygon fill="#e8f4f8" stroke="#2980b9" points="446.09,-717.8 232.31,-717.8 232.31,-678.2 446.09,-678.2 446.09,-717.8" />
 <text xml:space="preserve" text-anchor="middle" x="339.2" y="-699.75" font-family="Helvetica,sans-Serif" font-size="10.00">Load style guide</text>
-<text xml:space="preserve" text-anchor="middle" x="339.2" y="-688.5" font-family="Helvetica,sans-Serif" font-size="10.00">~/.claude/scripts/load-rust-style.sh</text>
+<text xml:space="preserve" text-anchor="middle" x="339.2" y="-688.5" font-family="Helvetica,sans-Serif" font-size="10.00">~/.claude/scripts/rust_style/load-rust-style.sh</text>
 </g>
 
 <g id="edge10" class="edge">
@@ -141,18 +141,20 @@
 
 <g id="edge11" class="edge">
 <title>ttl_gate-&gt;report</title>
-<path fill="none" stroke="black" d="M386.94,-750.85C403.18,-745.21 419.65,-736.12 429.3,-721.5 525.29,-576.1 429.3,-503.72 429.3,-329.5 429.3,-308.61 435.88,-302.33 429.3,-282.5 426.61,-274.39 422.01,-266.52 416.96,-259.54" />
-<polygon fill="black" stroke="black" points="419.81,-257.5 410.86,-251.82 414.31,-261.84 419.81,-257.5" />
-<text xml:space="preserve" text-anchor="middle" x="481.06" y="-497.11" font-family="Helvetica,sans-Serif" font-size="8.00">none due</text>
-<text xml:space="preserve" text-anchor="middle" x="481.06" y="-488.11" font-family="Helvetica,sans-Serif" font-size="8.00">(skip, no agent)</text>
+<path fill="none" stroke="black" d="M282.69,-765.11C276.88,-764.98 271.99,-764.42 268.93,-763.2 244.97,-753.68 238.27,-745.4 228.61,-721.5 228.61,-721.5 249.1,-402.5 249.1,-402.5 256.54,-395.26 428.48,-400.85 435.8,-393.49 444.81,-384.44 445.57,-290.53 440.77,-278.7 438.69,-273.56 431.38,-265.86 423.05,-258.24" />
+<polygon fill="black" stroke="black" points="425.5,-255.73 415.68,-251.75 420.87,-260.99 425.5,-255.73" />
+<path fill="none" stroke="black" d="M394.31,-754.29C415.2,-749.13 437.01,-739.48 449.79,-721.5 471.51,-690.94 596.5,-745.72 429.3,-282.5 426.4,-274.46 421.72,-266.62 416.66,-259.65" />
+<polygon fill="black" stroke="black" points="419.52,-257.62 410.58,-251.92 414.01,-261.94 419.52,-257.62" />
+<text xml:space="preserve" text-anchor="middle" x="314.68" y="-390.44" font-family="Helvetica,sans-Serif" font-size="8.00">none due</text>
+<text xml:space="preserve" text-anchor="middle" x="314.68" y="-381.44" font-family="Helvetica,sans-Serif" font-size="8.00">(skip, no agent)</text>
 </g>
 
 <g id="edge12" class="edge">
 <title>ttl_gate-&gt;report</title>
-<path fill="none" stroke="#e74c3c" d="M386.94,-750.85C403.18,-745.21 419.65,-736.12 429.3,-721.5 525.29,-576.1 429.3,-503.72 429.3,-329.5 429.3,-308.61 435.88,-302.33 429.3,-282.5 426.61,-274.39 422.01,-266.52 416.96,-259.54" />
-<polygon fill="#e74c3c" stroke="#e74c3c" points="419.81,-257.5 410.86,-251.82 414.31,-261.84 419.81,-257.5" />
-<text xml:space="preserve" text-anchor="middle" x="493.44" y="-479.11" font-family="Helvetica,sans-Serif" font-size="8.00" fill="#e74c3c">gate crashed: ERROR</text>
-<text xml:space="preserve" text-anchor="middle" x="493.44" y="-470.11" font-family="Helvetica,sans-Serif" font-size="8.00" fill="#e74c3c">(fail-closed, flagged)</text>
+<path fill="none" stroke="#e74c3c" d="M394.31,-754.29C415.2,-749.13 437.01,-739.48 449.79,-721.5 471.51,-690.94 596.5,-745.72 429.3,-282.5 426.4,-274.46 421.72,-266.62 416.66,-259.65" />
+<polygon fill="#e74c3c" stroke="#e74c3c" points="419.52,-257.62 410.58,-251.92 414.01,-261.94 419.52,-257.62" />
+<text xml:space="preserve" text-anchor="middle" x="465.97" y="-552.62" font-family="Helvetica,sans-Serif" font-size="8.00" fill="#e74c3c">gate crashed: ERROR</text>
+<text xml:space="preserve" text-anchor="middle" x="465.97" y="-543.62" font-family="Helvetica,sans-Serif" font-size="8.00" fill="#e74c3c">(fail-closed, flagged)</text>
 </g>
 
 <g id="node11" class="node">
@@ -409,5 +411,5 @@
 <path fill="none" stroke="black" stroke-dasharray="1,5" d="M392.4,-59.67C392.4,-55.83 392.4,-51.69 392.4,-47.56" />
 <polygon fill="black" stroke="black" points="395.9,-47.73 392.4,-37.73 388.9,-47.73 395.9,-47.73" />
 </g>
-<text x="-10.0" y="-883.4" font-family="Helvetica,sans-Serif" font-size="9" fill="#7f8c8d">Phase 1: Clean + Rebuild</text><text x="242.8" y="-883.4" font-family="Helvetica,sans-Serif" font-size="9" fill="#7f8c8d">Phase 2: Style Evaluation</text><text x="495.6" y="-883.4" font-family="Helvetica,sans-Serif" font-size="9" fill="#7f8c8d">Phase 3: Style-Fix Worktrees</text><text x="296.0" y="-188.0" font-family="Helvetica,sans-Serif" font-size="9" fill="#7f8c8d">Post-Clean-fix (Manual)</text></g>
+<text x="-10.0" y="-883.4" font-family="Helvetica,sans-Serif" font-size="9" fill="#7f8c8d">Phase 1: Clean + Rebuild</text><text x="222.3" y="-883.4" font-family="Helvetica,sans-Serif" font-size="9" fill="#7f8c8d">Phase 2: Style Evaluation</text><text x="495.6" y="-883.4" font-family="Helvetica,sans-Serif" font-size="9" fill="#7f8c8d">Phase 3: Style-Fix Worktrees</text><text x="296.0" y="-188.0" font-family="Helvetica,sans-Serif" font-size="9" fill="#7f8c8d">Post-Clean-fix (Manual)</text></g>
 </svg>

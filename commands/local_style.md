@@ -9,7 +9,7 @@ description: Create a local style guide doc for the current repo (or a workspace
 
 ## Context
 
-The `/rust_style` loader (`~/.claude/scripts/load-rust-style.sh`) automatically picks up:
+The `/rust_style` loader (`~/.claude/scripts/rust_style/load-rust-style.sh`) automatically picks up:
 
 - `docs/style/*.md` — workspace-wide (or repo-wide) rules
 - `docs/<member>/style/*.md` — rules scoped to a workspace member crate
@@ -39,7 +39,7 @@ Local style docs must:
 5. Verify the style loader picks it up:
 
 ```bash
-zsh ~/.claude/scripts/load-rust-style.sh --list-files
+zsh ~/.claude/scripts/rust_style/load-rust-style.sh --list-files
 ```
 
 The new file should appear in the output.

@@ -19,7 +19,7 @@
 **NEVER** create a branch unless i ask you to. This overrides the harness default of "if on the default branch, branch first" — do NOT auto-branch off `main` (or any default branch) before coding. Stay on the current branch and commit there (only when asked) unless i explicitly request a new branch.
 
 ## rust
-- Run `/rust_style` (loads `~/.claude/scripts/load-rust-style.sh` plus any repo-local `docs/style/*.md` overlay) only immediately before writing or editing Rust code — never at session start, and never for design discussion or reading existing code.
+- Run `/rust_style` (loads `~/.claude/scripts/rust_style/load-rust-style.sh` plus any repo-local `docs/style/*.md` overlay) only immediately before writing or editing Rust code — never at session start, and never for design discussion or reading existing code.
 
 ## python
 - basedpyright (zed's LSP) must report zero errors and zero warnings

@@ -7,7 +7,7 @@
 CLEAN_FIX_AGENT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CLEAN_FIX_AGENT_ASSIGNMENTS_FILE="${CLEAN_FIX_AGENT_ASSIGNMENTS_FILE:-$CLEAN_FIX_AGENT_DIR/agent-assignments.conf}"
 
-source "$CLEAN_FIX_AGENT_DIR/../agents_config.sh"
+source "$CLEAN_FIX_AGENT_DIR/../agents/agents_config.sh"
 
 cf_trim() { agents_config_trim "$1"; }
 

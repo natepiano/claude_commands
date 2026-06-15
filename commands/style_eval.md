@@ -16,7 +16,7 @@ Throughout the rest of this command, `$ARGUMENTS` refers to **just the project p
 Run:
 
 ```bash
-zsh ~/.claude/scripts/load-rust-style.sh --project-root "$ARGUMENTS"
+zsh ~/.claude/scripts/rust_style/load-rust-style.sh --project-root "$ARGUMENTS"
 ```
 
 This loads the shared style guide plus any repo-local `docs/style/*.md` files, filtered for the project type.
@@ -26,7 +26,7 @@ The output ends with a `=== STYLE_CHECKLIST ===` section listing every rule by n
 If you need exact style file paths for citations, run:
 
 ```bash
-zsh ~/.claude/scripts/load-rust-style.sh --list-files --project-root "$ARGUMENTS"
+zsh ~/.claude/scripts/rust_style/load-rust-style.sh --list-files --project-root "$ARGUMENTS"
 ```
 
 ## Step 1.5: Use the clean-fix selection helper

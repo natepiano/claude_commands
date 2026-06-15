@@ -284,7 +284,7 @@ If a Fix Summary is available, start by reading it. This is the agent's account 
 Run:
 
 ```bash
-zsh ~/.claude/scripts/load-rust-style.sh
+zsh ~/.claude/scripts/rust_style/load-rust-style.sh
 ```
 
 Then read each unique style file referenced by the findings. Each finding in the pending evaluation markdown includes a **Style file** field with the full path (e.g., `~/rust/nate_style/rust/one-use-per-line.md` or a repo-local `docs/style/*.md`).
