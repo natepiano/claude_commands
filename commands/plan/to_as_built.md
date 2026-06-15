@@ -86,10 +86,28 @@ Determine the repo flavor and propose the as-built directory:
 
 In practice the as-built dir is `as-built/` as a sibling of the plan doc's
 location (matching how delegate-ready plans already link `as-built/…`). Examine
-the repo to confirm which flavor applies, then **state the proposed destination
-path and the as-built filename in one line and ask the user to confirm or
-redirect.** Moving and deleting files is the user's call — do not relocate before
-they confirm.
+the repo to confirm which flavor applies.
+
+**Then ask the user to confirm — and write the question so it stands on its own.**
+The user may not remember what `/plan:to_as_built` does and has no view into your
+STEP 2 work. Phrase the confirmation like this:
+
+1. **One plain-language line of context first:** what this command is about to do
+   — "Convert the finished `<plan>` plan into a clean reference doc for whoever
+   edits this code next, then file it under `as-built/`." No domain jargon.
+2. **The two file operations, stated plainly** with the human consequence of each,
+   not a code-level description:
+   - Create: `<destination>/<filename>.md` (the new reference doc).
+   - Delete: `<old plan path>` (the original plan, now replaced by the doc above).
+3. **A clear choice:** confirm both, keep the old plan, or use a different folder.
+
+**Do NOT** put your STEP 2 fact-check details into this question — symbol names,
+type signatures, magic numbers, what you corrected against the shipped tree. That
+work is internal; surfacing it here buries the actual question and confuses the
+reader. If the distillation needed corrections worth mentioning, save them for the
+final STEP 6 report, not the confirmation prompt.
+
+Moving and deleting files is the user's call — do not relocate before they confirm.
 </ProposeDestination>
 
 ---
@@ -169,7 +187,10 @@ Then stop.
   not re-explore the repo itself.
 - The as-built is for a future implementer: keep architecture, types, invariants,
   gotchas, and rationale; drop phase/Work Order/process scaffolding.
-- Get explicit user confirmation before relocating or deleting any file.
+- Get explicit user confirmation before relocating or deleting any file. Write
+  that confirmation so it stands alone — one plain line of context + the two file
+  operations in human terms. Never dump distillation fact-check internals (symbols,
+  signatures, magic numbers) into the question.
 - Reconcile sibling as-built docs after writing the new one: apply content fixes
   in place (fix, do not flag), but confirm with the user before deleting an
   obsolete doc.
