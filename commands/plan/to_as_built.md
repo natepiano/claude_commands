@@ -130,27 +130,34 @@ Do not commit.
 ---
 
 <ReconcileAsBuilt>
-The new feature may have invalidated **other** as-built docs in the same
-directory — changed a type they describe, broken an invariant they assert, or
-made one wholly obsolete. Reconcile them so the as-built corpus stays accurate.
+The new feature may have invalidated docs in the same docs directory as the
+source plan (and/or in the as-built directory). If this feature changed a type,
+signature, invariant, behavior, or ownership model, nearby docs may now be stale.
+Reconcile them so the as-built corpus and surrounding docs stay accurate.
 
 Dispatch ONE `general-purpose` subagent (it must be able to edit). Its prompt
 must include:
 
+- The absolute path of the **source plan** doc.
 - The absolute path of the **new** as-built doc just written.
 - The plan's **change surface**: the types, signatures, invariants, and behavior
   this feature added or altered (carry these from the plan / the distilled
   overview — do not make the subagent re-derive them from scratch).
-- The as-built directory path. Directive: read each **sibling** as-built doc and
-  decide whether this feature contradicts anything it states.
+- The source plan directory path and as-built directory path. Directive:
+  - read each **sibling** as-built doc in the as-built directory and decide
+    whether this feature contradicts anything it states;
+  - read each **peer markdown** doc in the source plan directory (except the
+    source plan doc itself) and do the same check for contradicting or stale
+    statements.
 - For each affected doc, **apply the correction in place** — edit the stale
   types/signatures/invariants/behavior so the doc matches what now exists. Fix,
   do not flag.
 - If a doc is rendered **wholly obsolete** (its feature was replaced/removed),
-  do **not** delete it. Return its path plus a one-line reason in a
+  do **not** delete it. Return its path plus a one-line reason in an
   `obsolete` list for the orchestrator to confirm.
-- Output: a structured result — `edited` (paths + one-line summary of each fix)
-  and `obsolete` (paths + reason).
+- Output: a structured result — `edited` (paths + one-line summary of each fix),
+  `peer_docs_scanned` (paths checked in the source plan directory), and
+  `obsolete` (paths + reason).
 
 After the subagent returns:
 - The content edits are already applied; spot-check them against the change
@@ -169,7 +176,7 @@ Produce a succinct markdown table:
 | --- | --- |
 | As-built | <new path> |
 | Removed | <old plan path; any predecessor + confirmed-obsolete as-built deleted, or None> |
-| Reconciled | <sibling as-built docs edited, one line each, or None> |
+| Reconciled | <sibling as-built and peer source-doc edits made, one line each, or None> |
 | Flavor | <A workspace / B package> |
 | Links to fix | <paths needing a manual link update, or None> |
 ```
@@ -191,7 +198,7 @@ Then stop.
   that confirmation so it stands alone — one plain line of context + the two file
   operations in human terms. Never dump distillation fact-check internals (symbols,
   signatures, magic numbers) into the question.
-- Reconcile sibling as-built docs after writing the new one: apply content fixes
-  in place (fix, do not flag), but confirm with the user before deleting an
-  obsolete doc.
+- Reconcile sibling as-built docs and peer docs in the source-doc directory after
+  writing the new one: apply content fixes in place (fix, do not flag), but
+  confirm with the user before deleting an obsolete doc.
 - Do not change code and do not commit.
