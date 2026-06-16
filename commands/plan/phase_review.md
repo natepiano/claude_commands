@@ -40,6 +40,25 @@ Edit the plan doc to:
 
    Drop any subsection that has nothing to say. Keep bullets short and concrete — name files, types, decisions, not abstractions.
 
+## Step 3.5: Sweep process comments out of the implementation diff
+
+Before dispatching the review, inspect the implementation diff for the phase: use the working-tree diff if the phase is uncommitted, or the phase commit diff if it has already been committed.
+
+Remove or rewrite source-code comments that describe phase history, planning decisions, review process, or temporary rationale tied to the just-completed plan phase. Code comments should explain the code as it exists now, not narrate how it got there.
+
+Remove comments that mention phase numbers, "for this phase", "per the plan", "decision from review", "temporary until Phase N", or similar process/history markers.
+
+Keep comments that explain durable code facts: invariants, safety constraints, non-obvious API contracts, performance tradeoffs, data-format requirements, or behavior future maintainers need regardless of the plan history.
+
+Scope this sweep narrowly:
+
+- Only inspect files touched by the just-completed phase.
+- Only edit comments. Do not change runtime behavior.
+- Do not remove plan-doc retrospective notes, user-facing documentation, changelog text, or comments that are still the best place to document a durable code constraint.
+- If a comment contains both process history and a durable constraint, rewrite it to keep only the durable code constraint.
+
+If any comments were removed or rewritten, include that in the final update's `Learned and applied` row.
+
 ## Step 4: Dispatch a subagent review of the remaining phases
 
 Spawn a `Plan` subagent with a self-contained prompt. The subagent's job is an architectural review of the *remaining* phases in light of what was just implemented and learned.
@@ -201,7 +220,7 @@ Style rules for the final update:
 
 ## Rules
 
-- Do not modify implementation code in this command — this is plan-doc maintenance only. Code changes belong to the next phase or to a follow-up.
+- Do not modify implementation code in this command except for Step 3.5's narrow source-code comment cleanup. That cleanup may only remove or rewrite process/history comments from the just-completed phase diff; behavioral code changes belong to the next phase or to a follow-up.
 - Do not commit any changes.
 - Do not relitigate the just-completed phase's implementation. The retrospective records what was learned; the review is about what comes next.
 - Raw significant findings must be filtered before user review. Only unresolved user decisions go through the user; mechanical changes and already-implied work go straight into the plan.

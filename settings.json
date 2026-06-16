@@ -64,6 +64,7 @@
       "/tmp/claude/"
     ]
   },
+  "model": "sonnet",
   "hooks": {
     "SessionStart": [
       {
@@ -148,5 +149,6 @@
   "voiceEnabled": true,
   "feedbackSurveyState": {
     "lastShownTime": 1754090074729
-  }
+  },
+  "skipWorkflowUsageWarning": true
 }
