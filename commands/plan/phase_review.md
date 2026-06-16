@@ -207,7 +207,7 @@ Produce a succinct markdown table:
 | Implemented | <one sentence naming the completed phase and concrete implementation scope> |
 | Learned and applied | <one sentence naming what the retrospective/review changed in the plan automatically; use "None" if nothing was applied automatically> |
 | User decisions | <one sentence summarizing inline or `/adhoc_review` decisions and their outcomes; use "None" if no user decisions were needed> |
-| Recommended next step | <one direct recommendation for the next phase or follow-up> |
+| Recommended next step | <if a next phase exists: one sentence summarizing what that phase will build or accomplish, then one sentence with the direct recommendation; if no phases remain: just the direct recommendation> |
 ```
 
 Style rules for the final update:
