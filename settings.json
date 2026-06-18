@@ -64,7 +64,6 @@
       "/tmp/claude/"
     ]
   },
-  "model": "sonnet",
   "hooks": {
     "SessionStart": [
       {
@@ -142,6 +141,7 @@
   "alwaysThinkingEnabled": true,
   "effortLevel": "high",
   "skipDangerousModePermissionPrompt": true,
+  "skipWorkflowUsageWarning": true,
   "teammateMode": "tmux",
   "inputNeededNotifEnabled": true,
   "agentPushNotifEnabled": true,
@@ -149,6 +149,5 @@
   "voiceEnabled": true,
   "feedbackSurveyState": {
     "lastShownTime": 1754090074729
-  },
-  "skipWorkflowUsageWarning": true
+  }
 }

@@ -39,6 +39,8 @@ Cell values are `OK`, `FAIL`, `SKIP`, `RUNNING`, `-` (rendered as `—`). They m
 
 `Fix: OK` means the style fix was applied and a `_style_fix` worktree is ready for the user to `/style_fix_review` → `/merge_branch` — it is **not** auto-merged. The row reason says `fix applied — worktree ready for /style_fix_review` and the eval stop reason (quota/exhausted) is suppressed as noise in that case.
 
+An eval skip reason of `evaluation ran; worktree intentionally unchanged because proposed fixes need your approval` means the evaluation and fix pass produced a Fix Summary, but the worktree is deliberately clean because every proposed change is approval-gated (for example a public API or reflected-schema rename). Do not render it as an applied fix or merge-ready worktree; tell the user there is a proposal to review/approve before code should change.
+
 `verify=<cell>` is the second style-fix pass: after the fix agent applies the findings, the same configured agent re-checks the diff against the Fix Summary, corrects mistakes, and updates the summary. Cell meaning:
 - `OK` — the verify pass ran and wrote its `## Fix Verification` section (the fix was confirmed and/or corrected). The detailed per-finding verdict and any corrections live in that section inside the worktree; the user sees it during `/style_fix_review`.
 - `FAIL:<reason>` — the verify pass started but did not finish (e.g. `timeout`, `agent-exit`). The applied fix is still in the worktree and reviewable; only the independent verification is missing. This does **not** mean the fix failed — read it as "fix applied, not yet verified."
@@ -136,7 +138,7 @@ Skipped on purpose
 - cargo-mend, cargo-port: already at the per-project cap of 2 style findings, so no new evaluation this run.
 ```
 
-A reason of the form `had <X> during this run; now resolved (merged or discarded)` means eval skipped the project at run time because a fix was pending, but that pending evaluation has since been finalized, merged, or discarded — the project is no longer blocked and is eligible next run. Render it as resolved, not stuck. A reason like `an applied fix awaiting your review/merge` (no "had …") means it is still pending right now.
+A reason of the form `had <X> during this run; now resolved (merged or discarded)` means eval skipped the project at run time because a fix was pending, but that pending evaluation has since been finalized, merged, or discarded — the project is no longer blocked and is eligible next run. Render it as resolved, not stuck. A reason like `an applied fix awaiting your review/merge` (no "had …") means it is still pending right now. A reason like `evaluation ran; worktree intentionally unchanged because proposed fixes need your approval` means the pending review is approval-only; the clean worktree is expected and should not be treated as missing work.
 
 ### 8. Heads up
 

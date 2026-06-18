@@ -83,6 +83,7 @@ FRAMEWORK_FILTER_REASONS: frozenset[str] = frozenset(
 # log. The parser normalizes the reason to the prefix for grouping and emits
 # a NOTE per project so the path surfaces under "Heads up" in the report.
 ORPHAN_STUB_PREFIX: str = "style_fix orphan stub"
+EXISTING_FIX_SUMMARY_PREFIX: str = "style_fix worktree already has Fix Summary"
 
 # Combined set used during pruning — a row whose only cells are SKIPs in either
 # bucket gets pulled out of the matrix.
@@ -313,6 +314,40 @@ def pending_evaluation_markdown(project: str) -> str:
         if isinstance(markdown, str):
             return markdown
     return ""
+
+
+def pending_fix_is_approval_only(project: str) -> bool:
+    """True when the fix pass intentionally left the worktree unchanged.
+
+    These pending records still have `fixed_findings` and a `## Fix Summary`,
+    but every remaining action is a proposal or approval-gated public API
+    change. Reporting them as "an applied fix awaiting review/merge" sends the
+    user to a clean worktree looking for a diff that should not exist.
+    """
+    markdown = pending_evaluation_markdown(project)
+    if not markdown or "## Fix Summary" not in markdown:
+        return False
+    summary = markdown.split("## Fix Summary", 1)[1]
+    status_matches = re.findall(
+        r"(?im)^\s*\*\*Status:\*\*\s*([A-Za-z -]+)\s*$",
+        summary,
+    )
+    if not status_matches:
+        return False
+    statuses = {status.strip().lower() for status in status_matches}
+    applied_statuses = {"applied", "partially applied"}
+    if statuses & applied_statuses:
+        return False
+    approval_markers = (
+        "explicit approval",
+        "public api",
+        "reflected",
+        "schema change",
+        "status:** proposed",
+        "**status:** proposed",
+    )
+    lowered = summary.lower()
+    return any(marker in lowered for marker in approval_markers)
 
 
 def pending_eval_produced_at(project: str) -> str | None:
@@ -997,7 +1032,13 @@ def overlay_live_pending_state(result: ParseResult) -> None:
         status = raw_reason[len("pending ") :]
         noun, awaiting = PENDING_PLAIN.get(status, (raw_reason, "pending"))
         if (PENDING_DIR / f"{project}.json").exists():
-            plain = f"{noun} {awaiting}"
+            if status == "fixed_findings" and pending_fix_is_approval_only(project):
+                plain = (
+                    "evaluation ran; worktree intentionally unchanged because "
+                    "proposed fixes need your approval"
+                )
+            else:
+                plain = f"{noun} {awaiting}"
         else:
             plain = f"had {noun} during this run; now resolved (merged or discarded)"
         eval_cell.reason = slugify_reason(plain)
@@ -1072,6 +1113,7 @@ def parse_log(path: Path) -> ParseResult:
 
     _prune_bookkeeping_rows(result)
     overlay_live_pending_state(result)
+    suppress_redundant_fix_handoff_skips(result)
     return result
 
 
@@ -1121,6 +1163,40 @@ def _prune_bookkeeping_rows(result: ParseResult) -> None:
     ]
 
 
+def suppress_redundant_fix_handoff_skips(result: ParseResult) -> None:
+    """Rewrite fix-phase handoff bookkeeping and hide it from row reasons."""
+    projects_with_pending_eval: set[str] = set()
+    for skip in result.skip_reasons:
+        if skip.phase != "eval":
+            continue
+        if (
+            skip.reason.startswith("an applied fix awaiting")
+            or skip.reason.startswith("evaluation ran; worktree intentionally unchanged")
+        ):
+            projects_with_pending_eval.add(skip.project)
+
+    if not projects_with_pending_eval:
+        return
+
+    for skip in result.skip_reasons:
+        if (
+            skip.phase == "fix"
+            and skip.project in projects_with_pending_eval
+            and skip.reason.startswith(EXISTING_FIX_SUMMARY_PREFIX)
+        ):
+            skip.reason = "existing style-fix worktree found; Fix Summary saved to pending state"
+    for project in projects_with_pending_eval:
+        row = result.rows.get(project)
+        if row is None:
+            continue
+        fix_cell = row["fix"]
+        if (
+            fix_cell.state == "SKIP"
+            and humanize_cell_reason(fix_cell.reason).startswith(EXISTING_FIX_SUMMARY_PREFIX)
+        ):
+            fix_cell.reason = "pending-handoff"
+
+
 def eval_fix_handoff_reason(result: ParseResult, project: str) -> str | None:
     """One causal sentence when eval paused because fix is consuming its finding.
 
@@ -1159,12 +1235,30 @@ def eval_fix_handoff_reason(result: ParseResult, project: str) -> str | None:
     return None
 
 
+def approval_only_fix_reason(result: ParseResult, project: str) -> str | None:
+    """Explain clean `_style_fix` worktrees that only carry approval-gated fixes."""
+    row = result.rows[project]
+    eval_skip = next(
+        (s for s in result.skip_reasons if s.phase == "eval" and s.project == project),
+        None,
+    )
+    if eval_skip is None or not eval_skip.reason.startswith("evaluation ran;"):
+        return None
+    if row["fix"].state == "SKIP":
+        return (
+            "evaluation ran; worktree intentionally unchanged because proposed "
+            "fixes need your approval"
+        )
+    return None
+
+
 def row_reason(result: ParseResult, project: str) -> str:
     """Return a compact reason for the row's non-OK state."""
     row = result.rows[project]
     reasons: list[str] = []
     seen: set[str] = set()
     handoff = eval_fix_handoff_reason(result, project)
+    approval_only = approval_only_fix_reason(result, project)
 
     def add(reason: str) -> None:
         reason = reason.strip()
@@ -1213,6 +1307,12 @@ def row_reason(result: ParseResult, project: str) -> str:
             else:
                 add(f"{phase}: {running_by_phase.get(phase) or 'running'}")
         elif cell.state == "SKIP":
+            if approval_only is not None and phase in {"eval", "fix"}:
+                if phase == "eval":
+                    add(approval_only)
+                continue
+            if phase == "fix" and cell.reason == "pending-handoff":
+                continue
             if phase == "eval" and handoff is not None:
                 add(handoff)
                 continue
@@ -1221,13 +1321,16 @@ def row_reason(result: ParseResult, project: str) -> str:
                 or humanize_cell_reason(cell.reason)
                 or "skipped"
             )
-            add(f"{phase}: {reason}")
+            if phase == "eval":
+                add(reason)
+            else:
+                add(f"{phase}: {reason}")
         elif phase == "fix" and cell.state == "OK":
             if handoff is not None:
                 continue  # folded into the eval handoff clause
             add("fix applied — worktree ready for /style_fix_review")
         elif phase == "eval" and cell.state == "OK" and cell.reason == "no-findings":
-            add("eval: no violations found")
+            add("no violations found")
         elif (
             phase == "eval"
             and cell.state == "OK"
@@ -1237,7 +1340,7 @@ def row_reason(result: ParseResult, project: str) -> str:
             # The eval stop reason is diagnostic; when a fix actually landed it
             # is noise next to "worktree ready". The coverage NOTE still carries
             # stop= for anyone who wants it.
-            add(f"eval: {humanize_cell_reason(cell.reason)}")
+            add(humanize_cell_reason(cell.reason))
         elif cell.reason == "warning":
             add(f"{phase}: {tool_warnings_by_phase.get(phase) or 'tool warning'}")
 
