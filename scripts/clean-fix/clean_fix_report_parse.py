@@ -99,6 +99,11 @@ FIX_HEADER_RE = re.compile(r"=== Style-fix worktrees: (\d+) eligible projects ==
 FIX_DONE_RE = re.compile(
     r"=== Done: (\d+) created, (\d+) failed, (\d+) skipped(?: out of (\d+))? ==="
 )
+# Launcher-level startup failure from style-fix-worktrees.sh: the script exits
+# before any per-project work (e.g. the configured codex binary is missing), so
+# the line carries no project context. Captured as a run-level crash, never as a
+# per-project failure.
+LAUNCHER_ERROR_RE = re.compile(r"^ERROR: (configured Codex binary is not executable: .+)$")
 FILENAME_TS_RE = re.compile(r"(\d{8}-\d{6})")
 # Per-project live phase markers emitted by style-fix-worktrees.sh:
 #   [progress <project>] phase=<name> [k=v ...]
@@ -328,7 +333,7 @@ def pending_fix_is_approval_only(project: str) -> bool:
     if not markdown or "## Fix Summary" not in markdown:
         return False
     summary = markdown.split("## Fix Summary", 1)[1]
-    status_matches = re.findall(
+    status_matches: list[str] = re.findall(
         r"(?im)^\s*\*\*Status:\*\*\s*([A-Za-z -]+)\s*$",
         summary,
     )
@@ -891,6 +896,10 @@ def parse_fix_phase(lines: list[str], result: ParseResult) -> None:
                 if step.startswith("verify-") or step == "write-verification":
                     verify_seen.add(project)
             continue
+        if LAUNCHER_ERROR_RE.match(line):
+            # Run-level startup crash, not a project named "configured". Skip
+            # here; mark_crashed_fix_phase() reports it after all phases parse.
+            continue
         m = eligible_re.match(line)
         if m:
             eligible.add(m.group(1))
@@ -1098,12 +1107,6 @@ def parse_log(path: Path) -> ParseResult:
         s, e = bounds["fix"]
         parse_fix_phase(lines[s:e], result)
 
-    # Status refinement: if fix header appeared but no per-project work, mark crashed.
-    if "fix" in bounds and result.stats["fix"].ok == 0 and result.stats["fix"].fail == 0:
-        if any("style-fix worktree script failed" in line for line in lines):
-            result.status = "crashed"
-            result.notes.append("style-fix script failed before per-project work")
-
     # Partial logs: only the style-fix passes present (style-fix-manual logs).
     phases_present = [p for p in PHASES if result.stats[p].present]
     absent = [p for p in PHASES if not result.stats[p].present]
@@ -1114,7 +1117,62 @@ def parse_log(path: Path) -> ParseResult:
     _prune_bookkeeping_rows(result)
     overlay_live_pending_state(result)
     suppress_redundant_fix_handoff_skips(result)
+    # Run last: eval reasons are now in their final plain form, so the queued-fix
+    # rows the crash blocked can be identified by reason text.
+    mark_crashed_fix_phase(lines, bounds, result)
     return result
+
+
+def mark_crashed_fix_phase(
+    lines: list[str], bounds: dict[str, tuple[int, int]], result: ParseResult
+) -> None:
+    """Surface a style-fix launcher crash that happened before per-project work.
+
+    When style-fix-worktrees.sh exits at startup (e.g. the configured codex
+    binary is missing), no project ever enters the fix step, so every fix cell
+    stays blank and the failure is invisible in the table. Detect it, name the
+    real cause, and mark each queued fix as failed so the crash shows per-row.
+    """
+    if "fix" not in bounds:
+        return
+    fix = result.stats["fix"]
+    if fix.ok or fix.fail or fix.skip:
+        return  # per-project work happened; not a pre-work crash
+    if not any("style-fix worktree script failed" in line for line in lines):
+        return
+
+    result.status = "crashed"
+    cause = ""
+    for line in lines:
+        m = LAUNCHER_ERROR_RE.match(line)
+        if m:
+            cause = m.group(1)
+            break
+
+    note = "style-fix launcher crashed before any project ran"
+    if cause:
+        note += f": {cause}"
+    result.notes.append(note)
+
+    # The fix pass would have processed exactly the projects with findings
+    # queued awaiting a fix. Their pending fix did not get applied.
+    blocked: list[str] = []
+    for project, row in result.rows.items():
+        if row["eval"].state != "SKIP":
+            continue
+        eval_reason = humanize_cell_reason(row["eval"].reason)
+        if eval_reason.startswith("reviewed findings") or eval_reason.startswith(
+            "new style findings"
+        ):
+            blocked.append(project)
+
+    short = cause or "style-fix launcher never started"
+    for project in blocked:
+        result.rows[project]["fix"] = Cell("FAIL", "launcher-crashed")
+        fix.fail += 1
+        result.warnings.append(
+            Warning("fix", project, f"queued fix not applied — {short}")
+        )
 
 
 def _prune_bookkeeping_rows(result: ParseResult) -> None:

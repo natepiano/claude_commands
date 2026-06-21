@@ -30,7 +30,7 @@ LOG_DIR="/private/tmp/claude"
 SINGLE_PROJECT="${1:-}"
 STYLE_ENABLED=""
 STYLE_AGENT=""
-CODEX_BIN="${CODEX_BIN:-$HOME/.nvm/versions/node/v20.19.1/bin/codex}"
+CODEX_BIN="${CODEX_BIN:-$(command -v codex 2>/dev/null || echo "$HOME/.local/bin/codex")}"
 HEARTBEAT_INTERVAL_SECS=60
 
 mkdir -p "$LOG_DIR"

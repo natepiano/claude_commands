@@ -42,7 +42,7 @@ STYLE_ENABLED=""
 STYLE_AGENT=""
 STYLE_AGENT_MODEL=""
 STYLE_AGENT_EFFORT=""
-CODEX_BIN="${CODEX_BIN:-$HOME/.nvm/versions/node/v20.19.1/bin/codex}"
+CODEX_BIN="${CODEX_BIN:-$(command -v codex 2>/dev/null || echo "$HOME/.local/bin/codex")}"
 
 mkdir -p "$LOG_DIR"
 
@@ -618,7 +618,7 @@ Worktree root: $worktree_dir
 
 IMPORTANT: Do NOT spawn sub-agents, delegate, or parallelize through helper agents. Complete this fix pass yourself in a single agent run.
 
-IMPORTANT: Run every cargo command (mend, clippy, tests) in the FOREGROUND and read its output directly. Do NOT run cargo in the background and poll for it to finish with \`pgrep -f "cargo ..."\` — that substring matches this very fix prompt (your own claude process argv contains these cargo command names) and the polling command itself, so \`! pgrep ...\` is never true and the wait loop spins forever.
+IMPORTANT: Run every lint command through \`lint\` in the FOREGROUND and read its output directly. Do NOT run cargo/lint in the background and poll for it to finish with \`pgrep -f "cargo ..."\` or \`pgrep -f "lint ..."\` — those substrings can match this very fix prompt (your own claude process argv contains these command names) and the polling command itself, so \`! pgrep ...\` is never true and the wait loop spins forever.
 
 **Progress markers (REQUIRED — emit before doing each step).** Print one line of the exact form below on stdout immediately before you begin each named phase. The orchestrator's log watcher reads these lines and forwards them to the user's chat as live progress; without them, the user sees only a 60s heartbeat and has no idea which phase you're in.
 
@@ -629,8 +629,8 @@ Required phase names, in order:
 - \`>>> phase: read-style-guide\` — before Step 1 (load style guide).
 - \`>>> phase: read-evaluation\` — before Step 2 (read the scratch evaluation file).
 - \`>>> phase: apply-finding n=<N> id=<short-id>\` — once per finding before its first edit (\`<short-id>\` = the guideline filename stem from the **Style file** field, e.g. \`enums-over-bool-for-owned-booleans\`).
-- \`>>> phase: cargo-mend-preview\` — before \`cargo mend ... --manifest-path\` in Step 4.
-- \`>>> phase: cargo-mend-fix\` — before \`cargo mend ... --fix --manifest-path\` (skip if no fixable items).
+- \`>>> phase: cargo-mend-preview\` — before \`lint mend ... --manifest-path\` in Step 4.
+- \`>>> phase: cargo-mend-fix\` — before \`lint mend --fix ... --manifest-path\` (skip if no fixable items).
 - \`>>> phase: clippy-preview\` — before Step 5a.
 - \`>>> phase: clippy-auto-fix\` — before Step 5b (skip if 5a was clean).
 - \`>>> phase: clippy-manual\` — before Step 5c.
@@ -714,25 +714,25 @@ If you believe a comment is genuinely stale (describes code that no longer
 exists), leave it and note it in the Fix Summary as a comment-only follow-up.
 The user reviews comment changes during \`/style_fix_review\`.
 
-Step 4: Run cargo mend and fix issues
-Run: cargo mend $cargo_scope_flag --all-targets --manifest-path $worktree_dir/Cargo.toml
+Step 4: Run cargo mend through the shared lint wrapper and fix issues
+Run: lint mend --manifest-path $worktree_dir/Cargo.toml
 - If mend fails due to missing Cargo.toml or missing toolchain, report the error and skip to Step 5.
-- If mend reports fixable items, run: cargo mend $cargo_scope_flag --all-targets --fix --manifest-path $worktree_dir/Cargo.toml
+- If mend reports fixable items, run: lint mend --fix --manifest-path $worktree_dir/Cargo.toml
   - If mend --fix fails, report the error and skip to Step 5.
 - If mend reports only unfixable items, note them and continue.
 
 Step 5: Run clippy and fix any issues
-Step 5a (preview): Run: cargo clippy $cargo_scope_flag --all-targets --all-features --manifest-path $worktree_dir/Cargo.toml -- -D warnings
+Step 5a (preview): Run: lint clippy --manifest-path $worktree_dir/Cargo.toml
 - Capture the list of warnings/errors reported. This is the baseline of what clippy sees.
 - If clippy reports nothing, skip to Step 6.
 - If clippy fails because the toolchain itself is missing, report the error and skip to Step 6.
 - If clippy fails with a COMPILE error, the tree is broken — almost always because an earlier step (a module split, rename, extraction, or move) left a dangling reference or missing import. STOP. Do NOT proceed to Step 5b, 5c, 6, or beyond until the tree compiles. Fix the cause directly (restore the missing import, re-add the dropped item, repoint the reference). If the breakage came from a finding you applied and you cannot fix it in place, revert that finding's edits and mark the finding \`Skipped\` in the Fix Summary with the compile error as the reason. Compile errors are NEVER "infrastructure" — they are caused by the edits in this run.
 
-Step 5b (auto-fix): If Step 5a reported any fixable items, run: cargo clippy --fix $cargo_scope_flag --all-targets --all-features --allow-dirty --manifest-path $worktree_dir/Cargo.toml -- -D warnings
+Step 5b (auto-fix): If Step 5a reported any fixable items, run: lint clippy --fix --allow-dirty --manifest-path $worktree_dir/Cargo.toml
 - This auto-applies every fix clippy can make on its own. Do NOT manually fix anything clippy could have auto-fixed.
 - If --fix fails, report the error and fall through to Step 5c to handle remaining items manually.
 
-Step 5c (verify + manual): Re-run: cargo clippy $cargo_scope_flag --all-targets --all-features --manifest-path $worktree_dir/Cargo.toml -- -D warnings
+Step 5c (verify + manual): Re-run: lint clippy --manifest-path $worktree_dir/Cargo.toml
 - Anything still reported after 5b is either unfixable by clippy or a fix that conflicts with style. Manually fix those now.
 - Include any unfixable mend items from Step 4 in this manual pass.
 - After fixing, re-run clippy one more time to confirm clean; only spend evaluation effort on items that actually remain.
@@ -778,15 +778,15 @@ For each numbered finding, add a line:
 After all findings, add:
 
 ### Cargo Mend Changes
-If cargo mend --fix was run in Step 4 and made any changes, summarize them here:
-- List the files modified by cargo mend
+If lint mend --fix was run in Step 4 and made any changes, summarize them here:
+- List the files modified by lint mend
 - Describe the types of changes (e.g., "narrowed pub to pub(crate)", "shortened import paths")
-- If cargo mend was skipped or found nothing to fix, say so explicitly
+- If lint mend was skipped or found nothing to fix, say so explicitly
 
 ### Clippy Changes
 Summarize Step 5:
 - **Preview (5a):** count and types of warnings/errors clippy reported, or "clean"
-- **Auto-fix (5b):** files modified by \`cargo clippy --fix\` and the categories of fixes applied, or "not run" if 5a was clean
+- **Auto-fix (5b):** files modified by \`lint clippy --fix\` and the categories of fixes applied, or "not run" if 5a was clean
 - **Manual (5c):** anything that remained after --fix and had to be hand-fixed (or that was left unfixed because the suggested fix conflicts with a style rule — explain)
 
 ### Build Status
@@ -880,7 +880,7 @@ Worktree root: $worktree_dir
 
 IMPORTANT: Do NOT spawn sub-agents, delegate, or parallelize through helper agents. Complete this verification yourself in a single agent run.
 
-IMPORTANT: Run every cargo command (clippy, tests, fmt) in the FOREGROUND and read its output directly. Do NOT run cargo in the background and poll for it with \`pgrep\` — that substring matches your own process argv and the wait loop spins forever.
+IMPORTANT: Run every lint command (clippy, fmt) and every test command in the FOREGROUND and read its output directly. Do NOT run cargo/lint in the background and poll for it with \`pgrep\` — that substring can match your own process argv and the wait loop spins forever.
 
 **Progress markers (REQUIRED — emit before doing each step).** Print one line of the exact form below on stdout immediately before you begin each named phase. The orchestrator forwards these to the user's chat as live progress.
 
@@ -926,7 +926,7 @@ For each numbered finding that is NOT inside REMOVED-BY-REVIEW markers, in order
 You ARE authorized to edit code in the worktree to correct incomplete, incorrect, or non-negotiable-violating fixes. Do NOT add fixes for unrelated rules the original findings did not cover — that is the next /style_eval's job, not this pass. Preserve all existing \`///\` doc comments and explanatory \`//\` comments.
 
 Step 5: Re-verify the build (only if you changed any code in Step 4)
-- Run: cargo clippy $cargo_scope_flag --all-targets --all-features --manifest-path $worktree_dir/Cargo.toml -- -D warnings
+- Run: lint clippy --manifest-path $worktree_dir/Cargo.toml
   A compile error means an edit left a dangling reference — fix it before continuing.
 - Run: CARGO_MEND_SKIP_NETWORK_TESTS=1 cargo nextest run $cargo_scope_flag --manifest-path $worktree_dir/Cargo.toml
   Fix any failures you introduced.

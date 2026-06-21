@@ -35,7 +35,7 @@ STYLE_ENABLED=""
 STYLE_AGENT=""
 STYLE_AGENT_MODEL=""
 STYLE_AGENT_EFFORT=""
-CODEX_BIN="${CODEX_BIN:-$HOME/.nvm/versions/node/v20.19.1/bin/codex}"
+CODEX_BIN="${CODEX_BIN:-$(command -v codex 2>/dev/null || echo "$HOME/.local/bin/codex")}"
 
 mkdir -p "$LOG_DIR"
 
