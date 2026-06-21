@@ -456,7 +456,7 @@ For each finding, output a compact block with these parts. Keep it tight — a p
 
    **How to detect a clippy-driven change:**
    1. The Fix Summary's `Clippy Changes` subsection names the file and/or lint.
-   2. The fix sequence is eval-driven edits → `cargo mend` → `cargo clippy --fix` → manual clippy. Anything appearing post-eval matching a known clippy rewrite pattern (`mul_add`, `unwrap_or_else` → `unwrap_or`, `&str` → `impl AsRef<str>`, `if let Some(_) =` → `is_some()`, etc.) is presumptively clippy-driven.
+   2. The fix sequence is eval-driven edits → `lint mend` → `lint clippy --fix` → manual clippy. Anything appearing post-eval matching a known clippy rewrite pattern (`mul_add`, `unwrap_or_else` → `unwrap_or`, `&str` → `impl AsRef<str>`, `if let Some(_) =` → `is_some()`, etc.) is presumptively clippy-driven.
 6. **Concerns** — numbered list only if there are items that need the user's attention. Use `<ConcernFormat/>` exactly. If there are no real concerns and no new allows, omit the section entirely.
 
    **Before sending the response, run the `<ConcernFormat/>` pre-send scan against every Concern entry in your draft.** This is mandatory, not optional. The four checks (auto-renumber, headline wrapper, bullet anchor, no-action drop) catch the failure modes that recur across reviews. Do not send until the draft passes all four.

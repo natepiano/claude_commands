@@ -171,7 +171,7 @@ for project_name in ${BUILD_TARGETS[@]+"${BUILD_TARGETS[@]}"}; do
     }
 
     log "MEND: $project_name"
-    env $proj_env cargo mend --workspace --all-targets --manifest-path "$project_dir/Cargo.toml" 2>> "$LOG_FILE" || {
+    env $proj_env "$HOME/.claude/scripts/clippy/lint" mend --manifest-path "$project_dir/Cargo.toml" 2>> "$LOG_FILE" || {
         log "WARNING: cargo mend failed for $project_name"
     }
 

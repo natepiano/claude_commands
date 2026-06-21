@@ -128,8 +128,8 @@ Rules:
 <Verify>
 Run, in order, from the crate dir:
 - `cargo build --example <name>` (add `-p <package>` in a workspace if needed)
-- `cargo clippy --example <name>` (the workspace denies warnings — must be clean)
-- `cargo +nightly fmt`
+- `lint clippy --example <name>` (the workspace denies warnings — must be clean)
+- `lint fmt`
 
 The reorg is behavior-preserving, so the build must pass with no new warnings. If
 anything fails, fix it (clippy may flag a pattern exposed by a move, e.g. a

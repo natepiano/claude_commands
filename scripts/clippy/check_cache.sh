@@ -4,14 +4,14 @@
 #
 # Exit codes:
 #   0 = cache hit (fresh results available)
-#   1 = cache miss (agent should run mend + clippy)
+#   1 = cache miss (agent should run lint mend + lint clippy)
 #
 # Output format (on exit 0):
 #   Line 1: "cached: <timestamp>"
-#   Lines 2-4: status table (cargo mend, cargo +nightly fmt, clippy)
+#   Lines 2-5: status table (lint mend, lint fmt, lint clippy, lint doc)
 #   If passed: Line 5 is git diff status ("clean" or "has changes")
 #     If has changes: "=== git diff ===" followed by diff output
-#   If failed: "=== cargo mend ===" and/or "=== cargo clippy ===" with details
+#   If failed: "=== lint mend ===" and/or "=== lint clippy ===" with details
 #
 # Usage: check_cache.sh [project_dir]
 #   project_dir defaults to current directory
@@ -174,13 +174,24 @@ esac
 
 display_timestamp=$(echo "$fresh_timestamp" | sed 's/T/ /;s/[-+][0-9][0-9]:[0-9][0-9]$//')
 
+first_existing_log() {
+    local path
+    for path in "$@"; do
+        if [[ -f "$path" ]]; then
+            printf '%s\n' "$path"
+            return 0
+        fi
+    done
+    return 1
+}
+
 if [[ "$status" == "passed" ]]; then
     diff_output=$(git -C "$PROJECT_DIR" diff 2>/dev/null)
     echo "cached: $display_timestamp"
-    echo "cargo mend        : passed"
-    echo "cargo +nightly fmt: passed"
-    echo "clippy            : passed"
-    echo "cargo doc         : passed"
+    echo "lint mend         : passed"
+    echo "lint fmt          : passed"
+    echo "lint clippy       : passed"
+    echo "lint doc          : passed"
     if [[ -z "$diff_output" ]]; then
         echo "git diff          : clean"
     else
@@ -192,10 +203,13 @@ fi
 
 if [[ "$status" == "failed" ]]; then
     echo "cached: $display_timestamp"
+    mend_log="$(first_existing_log "$OUTPUT_DIR/mend-latest.log" "$OUTPUT_DIR/RUSTC_WRAPPER-latest.log" || true)"
+    doc_log="$(first_existing_log "$OUTPUT_DIR/doc-latest.log" "$OUTPUT_DIR/RUSTDOCFLAGS---D-latest.log" "$OUTPUT_DIR/RUSTDOCFLAGS=\"-D-latest.log" || true)"
+
     # Determine mend status
     mend_has_issues=false
-    if [[ -f "$OUTPUT_DIR/mend-latest.log" ]]; then
-        mend_output=$(cat "$OUTPUT_DIR/mend-latest.log")
+    if [[ -n "$mend_log" ]]; then
+        mend_output=$(cat "$mend_log")
         if [[ -n "$mend_output" ]] && ! echo "$mend_output" | grep -q "No findings"; then
             mend_has_issues=true
         fi
@@ -215,40 +229,40 @@ if [[ "$status" == "failed" ]]; then
     # not a failure signal. Look for rustdoc problem lines instead — with
     # RUSTDOCFLAGS="-D warnings", denied lints surface as `error:` lines.
     doc_has_issues=false
-    if [[ -f "$OUTPUT_DIR/doc-latest.log" ]]; then
-        if grep -qiE "^(warning|error)" "$OUTPUT_DIR/doc-latest.log"; then
+    if [[ -n "$doc_log" ]]; then
+        if grep -qiE "^(warning|error)" "$doc_log"; then
             doc_has_issues=true
         fi
     fi
 
     if [[ "$mend_has_issues" == true ]]; then
-        echo "cargo mend        : issues found"
+        echo "lint mend         : issues found"
     else
-        echo "cargo mend        : passed"
+        echo "lint mend         : passed"
     fi
-    echo "cargo +nightly fmt: unknown (not cached)"
+    echo "lint fmt          : unknown (not cached)"
     if [[ "$clippy_has_issues" == true ]]; then
-        echo "clippy            : issues found"
+        echo "lint clippy       : issues found"
     else
-        echo "clippy            : passed"
+        echo "lint clippy       : passed"
     fi
     if [[ "$doc_has_issues" == true ]]; then
-        echo "cargo doc         : issues found"
+        echo "lint doc          : issues found"
     else
-        echo "cargo doc         : passed"
+        echo "lint doc          : passed"
     fi
 
     # Output details
     if [[ "$mend_has_issues" == true ]]; then
-        echo "=== cargo mend ==="
-        cat "$OUTPUT_DIR/mend-latest.log"
+        echo "=== lint mend ==="
+        cat "$mend_log"
     fi
     if [[ "$clippy_has_issues" == true ]]; then
-        echo "=== cargo clippy ==="
+        echo "=== lint clippy ==="
         cat "$OUTPUT_DIR/clippy-latest.log"
     fi
     if [[ "$doc_has_issues" == true ]]; then
-        echo "=== cargo doc ==="
-        cat "$OUTPUT_DIR/doc-latest.log"
+        echo "=== lint doc ==="
+        cat "$doc_log"
     fi
 fi

@@ -2,6 +2,7 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+LINT_CMD="$HOME/.claude/scripts/clippy/lint"
 
 REPO_ROOT="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
 REPO_TARGET_DIR="${CARGO_TARGET_DIR:-${REPO_ROOT}/target}"
@@ -127,7 +128,7 @@ run_configured_target_checks() {
           PKG_CONFIG_PATH= \
           PKG_CONFIG_ALLOW_CROSS=1 \
           PKG_CONFIG_ALLOW_CROSS_x86_64_unknown_linux_gnu=1 \
-          cargo clippy --workspace --target "$target" --all-targets --all-features -- -D warnings
+          "$LINT_CMD" clippy --target "$target"
         run_step "compile tests ${target}" env \
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER="${SCRIPT_DIR}/zig-linux-cc" \
           AR_x86_64_unknown_linux_gnu="${SCRIPT_DIR}/zig-linux-ar" \
@@ -144,18 +145,18 @@ run_configured_target_checks() {
           cargo test --target "$target" --workspace --all-features --tests --no-run
         ;;
       *)
-        run_step "clippy ${target}" cargo clippy --workspace --target "$target" --all-targets --all-features -- -D warnings
+        run_step "clippy ${target}" "$LINT_CMD" clippy --target "$target"
         run_step "compile tests ${target}" cargo test --target "$target" --workspace --all-features --tests --no-run
         ;;
     esac
   done < "$targets_file"
 }
 
-run_step "rustfmt" cargo +nightly fmt --all --check
+run_step "rustfmt" "$LINT_CMD" fmt --check
 
 run_step "taplo" taplo fmt --check
 
-run_step "clippy" cargo clippy --workspace --all-targets --all-features -- -D warnings
+run_step "clippy" "$LINT_CMD" clippy
 
 run_configured_target_checks
 
@@ -170,7 +171,7 @@ fi
 if [ "$IS_SELF_MEND" -eq 1 ]; then
   run_step "cargo-mend" cargo run -- --fail-on-warn
 else
-  run_step "cargo-mend" cargo mend --workspace --all-targets --fail-on-warn
+  run_step "cargo-mend" "$LINT_CMD" mend --fail-on-warn
 fi
 
 echo ""

@@ -14,14 +14,19 @@ bash ~/.claude/scripts/clippy/check_cache.sh .
 
 - **Exit 0, all passed + "git diff: clean"**: Print the status table and exit (complete no-op).
 - **Exit 0, all passed + "git diff: has changes"**: Print the status table, then resume at STEP 4 and continue through remaining steps in order (4 → 5 → 5b → 6 → 8 → 9).
-- **Exit 0, issues found**: Print the status table and the `=== cargo mend ===` / `=== cargo clippy ===` / `=== cargo doc ===` details. Then resume at STEP 7 and execute it in full — **including stopping at `<BatchDecisionPoint/>` and waiting for user approval before any edits**. "Resuming at STEP 7" does not mean skipping the decision gate.
+- **Exit 0, issues found**: Print the status table and the `=== lint mend ===` / `=== lint clippy ===` / `=== lint doc ===` details. Then resume at STEP 7 and execute it in full — **including stopping at `<BatchDecisionPoint/>` and waiting for user approval before any edits**. "Resuming at STEP 7" does not mean skipping the decision gate.
 - **Exit 1**: Cache miss — proceed to STEP 2 (<RunMend/>).
 
 The script reads lint-runs' `latest.json`, waits if a run is still in progress, compares the cached timestamp to source files, and outputs formatted results.
 </CheckCachedResults>
 
 <RunMend>
-Execute: `cargo mend --workspace --all-targets`
+Execute: `~/.claude/scripts/clippy/lint mend`
+
+The `lint` wrapper owns the cargo-mend exception: it runs mend with
+`RUSTC_WRAPPER=` because wrapper tools can otherwise receive `cargo-mend` in
+the rustc position and fail before code is checked. Do not run `cargo mend`
+directly from this skill.
 
 Error Handling:
 - **Environmental Issues (Stop execution):** If mend fails due to missing Cargo.toml or missing toolchain, inform user: "cargo mend cannot run - environment setup required." Then exit.
@@ -33,7 +38,10 @@ Analyze output:
 </RunMend>
 
 <RunMendFix>
-Execute: `cargo mend --workspace --all-targets --fix`
+Execute: `~/.claude/scripts/clippy/lint mend --fix`
+
+The `lint` wrapper applies the same cargo-mend wrapper exception noted in
+<RunMend/>.
 
 Error Handling:
 - **Fix reverted due to compiler error (HARD STOP — capture reproduction):** If
@@ -43,10 +51,10 @@ Error Handling:
   fix manually.** The working tree is now back at its pre-fix state, which is
   exactly the state needed to reproduce the bug. Present the following so the
   user can copy it verbatim and reproduce / fix cargo mend:
-    1. The full `cargo mend --workspace --all-targets --fix` output, including
+    1. The full `~/.claude/scripts/clippy/lint mend --fix` output, including
        the lint(s) mend tried to fix and the compiler error(s) that triggered
        the revert.
-    2. The exact command that reproduces it: `cargo mend --workspace --all-targets --fix`
+    2. The exact command that reproduces it: `~/.claude/scripts/clippy/lint mend --fix`
     3. `git rev-parse HEAD` and `git status --short` output, confirming the
        working tree matches the reproduction state.
   Then end your turn and wait for the user. Do NOT proceed to clippy.
@@ -58,7 +66,7 @@ If successful: Note any remaining unfixable items from the earlier `cargo mend` 
 </RunMendFix>
 
 <RunFmt>
-Execute: `cargo +nightly fmt --all`
+Execute: `~/.claude/scripts/clippy/lint fmt`
 
 This step runs **unconditionally** (whether mend fixed anything, found nothing, or had only unfixable items).
 
@@ -68,9 +76,9 @@ Check `git diff` after running to determine if fmt applied any changes.
 </RunFmt>
 
 <RunClippy>
-CLIPPY_FLAGS = --workspace --all-targets --all-features -- -D warnings
+The `lint` wrapper supplies `--workspace --all-targets --all-features -- -D warnings`.
 
-Execute: `cargo clippy ${CLIPPY_FLAGS} ${ARGUMENTS:-}`
+Execute: `~/.claude/scripts/clippy/lint clippy ${ARGUMENTS:-}`
 
 If $ARGUMENTS provided, use as additional flags.
 If different base configuration needed, user can override CLIPPY_FLAGS.
@@ -83,7 +91,7 @@ Capture all output for analysis - both successful warnings and compilation error
 </RunClippy>
 
 <RunDoc>
-Execute: `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace --all-features`
+Execute: `~/.claude/scripts/clippy/lint doc`
 
 This mirrors the cargo-port `doc` lint command. `-D warnings` promotes every
 rustdoc lint (broken intra-doc links, invalid codeblock attributes, bare URLs,
@@ -103,7 +111,7 @@ Capture all output for analysis - rustdoc errors become todos.
 Present a summary before proceeding to todos:
 
 ## Findings
-**Mend**: [one of: "Fixed N issues via `cargo mend --workspace --all-targets --fix`" | "No issues found" | "No fixable issues found"] [if unfixable: "| N unfixable issues remaining"]
+**Mend**: [one of: "Fixed N issues via `~/.claude/scripts/clippy/lint mend --fix`" | "No issues found" | "No fixable issues found"] [if unfixable: "| N unfixable issues remaining"]
 **Style review**: [one of: "N violations fixed" | "All changes conform" | "No uncommitted changes to review"]
 **Clippy**: [one of: "N issues across M files" | "No issues found"]
 **Doc**: [one of: "N rustdoc errors across M files" | "No issues found"]
@@ -254,13 +262,13 @@ truth that maps clippy lints to the rule that governs them.
 **EXECUTE THESE STEPS IN ORDER:**
 
 **STEP 1:** Execute <CheckCachedResults/> — check for fresh lint-runs results. Follow its resume instructions (may skip ahead but always continues through remaining steps in order).
-**STEP 2:** Execute <RunMend/> — run `cargo mend --workspace --all-targets` to check for issues
-**STEP 3:** If fixable items found, execute <RunMendFix/> — run `cargo mend --workspace --all-targets --fix`. If it fails, STOP and ask user.
+**STEP 2:** Execute <RunMend/> — run `~/.claude/scripts/clippy/lint mend` to check for issues
+**STEP 3:** If fixable items found, execute <RunMendFix/> — run `~/.claude/scripts/clippy/lint mend --fix`. If it fails, STOP and ask user.
 **STEP 4:** **Always** execute <StyleReview/> — evaluate diff against style guide rules (loads style guide only if diff is non-empty)
 **STEP 5:** Execute <RunClippy/>
-**STEP 5b:** Execute <RunDoc/> — run rustdoc as a lint with `RUSTDOCFLAGS="-D warnings"`
+**STEP 5b:** Execute <RunDoc/> — run rustdoc as a lint with `~/.claude/scripts/clippy/lint doc`
 **STEP 6:** Execute <ReportFindings/> — present mend, clippy, and doc summary (fmt runs later, at STEP 8, and is covered in the completion summary)
 **STEP 7:** If unfixable mend or clippy issues found, execute <CreateBatchTodoList/>, <BatchDecisionPoint/>, <BatchExecution/>
-**STEP 8:** Execute <RunFmt/> — run `cargo +nightly fmt --all` unconditionally
+**STEP 8:** Execute <RunFmt/> — run `~/.claude/scripts/clippy/lint fmt` unconditionally
 **STEP 9:** Completion summary
 </ExecutionSteps>

@@ -32,6 +32,12 @@
 - Use LSP for finding definitions, references, and type info before resorting to text search
 
 
+## running long commands (builds, tests, pushes)
+- **ALWAYS background long-running commands** with `run_in_background: true`, then **end my turn** — do nothing, or do other unrelated work. The harness sends a `<task-notification>` when the command finishes and re-invokes me with the result. That notification IS the wait mechanism. Don't replace it.
+- **NEVER poll a backgrounded command.** No `sleep`/`grep`/`tail` loop, no `for i in $(seq …); do sleep 5; done`, no repeated reads of the output file to detect completion. If I find myself writing a wait loop, that's the bug — delete it and just wait for the notification. Foreground `sleep` is sandbox-blocked anyway.
+- **Do NOT foreground-block a long command** (a plain Bash call with a big `timeout`) as the way to "wait" for it. Background it and yield the turn instead. Foreground is for fast commands (seconds) whose output I need inline to proceed.
+- After the `<task-notification>` arrives, read the output file once to get the result. Capturing exit code: pipelines mask it — `cargo … | tail` reports `tail`'s exit (always 0), so a real failure looks like success. Use `set -o pipefail`, check `${PIPESTATUS[0]}`, or don't pipe the command whose exit code matters.
+
 ## bevy BRP MCP
 - when the user says "launch", just launch the app directly — don't try to shut down first. The user has already shut it down.
 - when the user says "relaunch", shut down the app first, then launch it.

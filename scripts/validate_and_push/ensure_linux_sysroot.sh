@@ -45,6 +45,8 @@ STAMP_FILE="${SYSROOT}/.stamp"
 ENV_FILE="${SYSROOT}/env.sh"
 SYSROOT_LOCK_DIR="${SYSROOT}/.lock"
 CACHE_LOCK_DIR="${CACHE_DIR}/.lock"
+LOCK_STALE_SECONDS="${VALIDATE_LINUX_LOCK_STALE_SECONDS:-900}"
+LOCK_HOST="$(hostname 2>/dev/null || uname -n 2>/dev/null || printf 'unknown')"
 REQUESTED_PACKAGES="libwayland-dev libasound2-dev libasound2 libffi-dev libudev-dev libudev1"
 REQUIRED_PC_FILES="
 ${SYSROOT}/usr/lib/${TARGET_TRIPLE}/pkgconfig/wayland-client.pc
@@ -309,28 +311,119 @@ populate_sysroot() {
 
 CACHE_LOCK_HELD=0
 SYSROOT_LOCK_HELD=0
+CACHE_LOCK_OWNER_FILE=""
+SYSROOT_LOCK_OWNER_FILE=""
+
+lock_mtime_epoch() {
+  local lock_dir="$1"
+  stat -f '%m' "$lock_dir" 2>/dev/null || stat -c '%Y' "$lock_dir" 2>/dev/null || printf '0\n'
+}
+
+lock_owner_value() {
+  local lock_dir="$1"
+  local key="$2"
+  local owner_file="${lock_dir}/owner"
+
+  [ -f "$owner_file" ] || return 1
+  awk -F= -v key="$key" '$1 == key { print substr($0, length(key) + 2); exit }' "$owner_file"
+}
+
+write_lock_owner() {
+  local lock_dir="$1"
+  local owner_file="${lock_dir}/owner"
+
+  {
+    printf 'pid=%s\n' "$$"
+    printf 'host=%s\n' "$LOCK_HOST"
+    printf 'started_at=%s\n' "$(date '+%Y-%m-%dT%H:%M:%S%z')"
+    printf 'cwd=%s\n' "$(pwd)"
+    printf 'script=%s\n' "$0"
+  } > "$owner_file"
+}
+
+remove_lock_if_owned() {
+  local lock_dir="$1"
+  local owner_file="$2"
+
+  [ -n "$owner_file" ] || return 0
+  [ -f "$owner_file" ] || return 0
+
+  local owner_pid
+  owner_pid="$(lock_owner_value "$lock_dir" pid 2>/dev/null || true)"
+  if [ "$owner_pid" = "$$" ]; then
+    rm -f "$owner_file"
+    rmdir "$lock_dir" 2>/dev/null || true
+  fi
+}
+
+clear_stale_lock() {
+  local lock_dir="$1"
+  local label="$2"
+  local owner_pid owner_host now mtime age
+
+  [ -d "$lock_dir" ] || return 1
+
+  owner_pid="$(lock_owner_value "$lock_dir" pid 2>/dev/null || true)"
+  owner_host="$(lock_owner_value "$lock_dir" host 2>/dev/null || true)"
+
+  if [ -n "$owner_pid" ]; then
+    if [ -z "$owner_host" ] || [ "$owner_host" = "$LOCK_HOST" ]; then
+      if ! kill -0 "$owner_pid" 2>/dev/null; then
+        log "Removing stale Linux ${label} lock from dead pid ${owner_pid}: ${lock_dir}"
+        rm -f "${lock_dir}/owner"
+        rmdir "$lock_dir" 2>/dev/null && return 0
+      fi
+    fi
+    return 1
+  fi
+
+  now="$(date +%s)"
+  mtime="$(lock_mtime_epoch "$lock_dir")"
+  age=$((now - mtime))
+  if [ "$age" -ge "$LOCK_STALE_SECONDS" ]; then
+    log "Removing stale legacy Linux ${label} lock after ${age}s: ${lock_dir}"
+    rmdir "$lock_dir" 2>/dev/null && return 0
+  fi
+
+  return 1
+}
+
+acquire_lock() {
+  local lock_dir="$1"
+  local label="$2"
+  local display_path="$3"
+
+  mkdir -p "$(dirname "$lock_dir")"
+  while ! mkdir "$lock_dir" 2>/dev/null; do
+    if clear_stale_lock "$lock_dir" "$label"; then
+      continue
+    fi
+    log "Waiting for Linux ${label} lock: ${display_path}"
+    sleep 2
+  done
+
+  write_lock_owner "$lock_dir"
+}
 
 cleanup_locks() {
   if [ "$CACHE_LOCK_HELD" -eq 1 ]; then
-    rmdir "$CACHE_LOCK_DIR" 2>/dev/null || true
+    remove_lock_if_owned "$CACHE_LOCK_DIR" "$CACHE_LOCK_OWNER_FILE"
   fi
   if [ "$SYSROOT_LOCK_HELD" -eq 1 ]; then
-    rmdir "$SYSROOT_LOCK_DIR" 2>/dev/null || true
+    remove_lock_if_owned "$SYSROOT_LOCK_DIR" "$SYSROOT_LOCK_OWNER_FILE"
   fi
 }
 
 acquire_cache_lock() {
-  mkdir -p "$CACHE_DIR"
-  while ! mkdir "$CACHE_LOCK_DIR" 2>/dev/null; do
-    log "Waiting for Linux package cache lock: ${CACHE_DIR}"
-    sleep 2
-  done
+  acquire_lock "$CACHE_LOCK_DIR" "package cache" "$CACHE_DIR"
+  CACHE_LOCK_OWNER_FILE="${CACHE_LOCK_DIR}/owner"
   CACHE_LOCK_HELD=1
 }
 
 release_cache_lock() {
   if [ "$CACHE_LOCK_HELD" -eq 1 ]; then
-    rmdir "$CACHE_LOCK_DIR" 2>/dev/null || true
+    remove_lock_if_owned "$CACHE_LOCK_DIR" "$CACHE_LOCK_OWNER_FILE"
+    CACHE_LOCK_OWNER_FILE=""
     CACHE_LOCK_HELD=0
   fi
 }
@@ -349,6 +442,9 @@ if sysroot_is_ready; then
 fi
 
 while ! mkdir "$SYSROOT_LOCK_DIR" 2>/dev/null; do
+  if clear_stale_lock "$SYSROOT_LOCK_DIR" "sysroot" "$SYSROOT"; then
+    continue
+  fi
   log "Waiting for Linux sysroot lock: ${SYSROOT}"
   sleep 2
   if sysroot_is_ready; then
@@ -361,6 +457,8 @@ while ! mkdir "$SYSROOT_LOCK_DIR" 2>/dev/null; do
     exit 0
   fi
 done
+write_lock_owner "$SYSROOT_LOCK_DIR"
+SYSROOT_LOCK_OWNER_FILE="${SYSROOT_LOCK_DIR}/owner"
 SYSROOT_LOCK_HELD=1
 
 if sysroot_is_ready; then

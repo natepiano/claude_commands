@@ -25,8 +25,8 @@ git fetch origin
 echo ""
 echo "=== Quality Checks ==="
 
-echo "  Running cargo clippy..."
-cargo clippy --all-targets --all-features -- -D warnings
+echo "  Running lint clippy..."
+"$HOME/.claude/scripts/clippy/lint" clippy
 echo "  Clippy: passed ✓"
 
 echo ""
@@ -41,7 +41,7 @@ echo "  Tests: passed ✓"
 
 echo ""
 echo "  Running cargo fmt..."
-cargo +nightly fmt --all
+"$HOME/.claude/scripts/clippy/lint" fmt
 echo "  Format: passed ✓"
 
 echo ""
