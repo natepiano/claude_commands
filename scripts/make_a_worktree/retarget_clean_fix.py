@@ -12,14 +12,20 @@ the [projects] line is never touched, so the history key is always preserved.
 `W` is also added to [build] so the worktree builds nightly (build everything).
 
 Subcommands:
-  detect --repo R --worktree W [--conf PATH]   print JSON describing the match
-  apply  --repo R --worktree W [--conf PATH]   write the redirect(s) + [build] add
-  revert --worktree W           [--conf PATH]  drop W's redirect(s) + [build] entry
+  detect --repo R --worktree W [--conf PATH]            print JSON describing the match
+  apply  --repo R --worktree W [--conf PATH] [--commit]  write the redirect(s) + [build] add
+  revert --worktree W           [--conf PATH] [--commit]  drop W's redirect(s) + [build] entry
+
+With --commit, apply/revert also commit ONLY clean-fix.conf in its own git repo
+(~/.claude) when the file changed — so the worktree redirect needs no manual
+upkeep. The commit is scoped to that one path and skipped if the conf is
+unchanged or not in a git repo.
 """
 
 from __future__ import annotations
 
 import json
+import subprocess
 import sys
 from pathlib import Path
 from typing import TypedDict
@@ -181,12 +187,40 @@ def revert(lines: list[str], worktree: str) -> tuple[list[str], list[str]]:
     return out, removed
 
 
+class CommitResult(TypedDict):
+    committed: bool
+    commit: str
+    reason: str
+
+
+def _git(top: str, *args: str) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(["git", "-C", top, *args], capture_output=True, text=True)
+
+
+def commit_conf(conf: Path, message: str) -> CommitResult:
+    """Commit ONLY `conf` in its own git repo, if it differs from HEAD. No-op
+    (never raises) when the conf is unchanged or not under git."""
+    conf = conf.resolve()
+    top_proc = _git(str(conf.parent), "rev-parse", "--show-toplevel")
+    if top_proc.returncode != 0:
+        return {"committed": False, "commit": "", "reason": "not a git repo"}
+    top = top_proc.stdout.strip()
+    if not _git(top, "status", "--porcelain", "--", str(conf)).stdout.strip():
+        return {"committed": False, "commit": "", "reason": "conf unchanged"}
+    if _git(top, "add", "--", str(conf)).returncode != 0:
+        return {"committed": False, "commit": "", "reason": "git add failed"}
+    commit_proc = _git(top, "commit", "-m", message, "--", str(conf))
+    if commit_proc.returncode != 0:
+        return {"committed": False, "commit": "", "reason": commit_proc.stderr.strip() or "git commit failed"}
+    return {"committed": True, "commit": _git(top, "rev-parse", "--short", "HEAD").stdout.strip(), "reason": ""}
+
+
 def _die(msg: str) -> None:
     print(msg, file=sys.stderr)
     raise SystemExit(2)
 
 
-def parse_args(argv: list[str]) -> tuple[str, str, str, Path]:
+def parse_args(argv: list[str]) -> tuple[str, str, str, Path, bool]:
     if len(argv) < 2:
         _die("usage: retarget_clean_fix.py {detect|apply|revert} [--repo R] --worktree W [--conf PATH]")
     cmd = argv[1]
@@ -195,10 +229,15 @@ def parse_args(argv: list[str]) -> tuple[str, str, str, Path]:
     repo = ""
     worktree = ""
     conf = DEFAULT_CONF
+    do_commit = False
     rest = argv[2:]
     i = 0
     while i < len(rest):
         flag = rest[i]
+        if flag == "--commit":
+            do_commit = True
+            i += 1
+            continue
         if i + 1 >= len(rest):
             _die(f"missing value for {flag}")
         value = rest[i + 1]
@@ -215,18 +254,21 @@ def parse_args(argv: list[str]) -> tuple[str, str, str, Path]:
         _die("--worktree is required")
     if cmd in ("detect", "apply") and not repo:
         _die("--repo is required for detect/apply")
-    return cmd, repo, worktree, conf
+    return cmd, repo, worktree, conf, do_commit
 
 
 def main() -> None:
-    cmd, repo, worktree, conf = parse_args(sys.argv)
+    cmd, repo, worktree, conf, do_commit = parse_args(sys.argv)
     lines = read_conf(conf)
 
     if cmd == "revert":
         out, removed = revert(lines, worktree)
+        payload: dict[str, object] = {"reverted": bool(removed), "removed": removed}
         if removed:
             _ = conf.write_text("\n".join(out) + "\n")
-        print(json.dumps({"reverted": bool(removed), "removed": removed}, indent=2))
+            if do_commit:
+                payload["commit"] = commit_conf(conf, f"chore(clean-fix): drop worktree redirect for {worktree}")
+        print(json.dumps(payload, indent=2))
         return
 
     result = detect(lines, repo, worktree)
@@ -239,12 +281,16 @@ def main() -> None:
         print(json.dumps({"applied": False, "reason": "no match"}, indent=2))
         return
     _ = conf.write_text("\n".join(apply(lines, result)) + "\n")
-    print(json.dumps({
+    applied: dict[str, object] = {
         "applied": True,
         "redirects": result["redirects"],
         "build_add": result["build_add"],
         "build_already": result["build_already"],
-    }, indent=2))
+    }
+    if do_commit:
+        entries = ", ".join(r["entry"] for r in result["redirects"])
+        applied["commit"] = commit_conf(conf, f"chore(clean-fix): redirect {entries} to worktree {worktree}")
+    print(json.dumps(applied, indent=2))
 
 
 if __name__ == "__main__":

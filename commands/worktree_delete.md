@@ -94,9 +94,10 @@ Update each todo status to "in_progress" when starting that step, and "completed
 
 <RevertCleanFixRedirect>
     - If a clean-fix redirect pointed style eval/fix at this worktree (set by `/make_a_worktree`), remove it so clean-fix returns to the primary checkout.
-    - Run: `python3 ~/.claude/scripts/make_a_worktree/retarget_clean_fix.py revert --worktree "$(basename "$SELECTED_WORKTREE")"`
-    - The helper drops any `[active_checkout]` redirect pointing into the worktree and removes the worktree's `[build]` entry; it is a no-op if there was none.
-    - If the JSON shows `"reverted": true`, tell the user which `removed` entries were cleaned up. Otherwise say nothing.
+    - **IMPORTANT**: Use `dangerouslyDisableSandbox: true` — the helper makes a git commit, which the sandbox blocks.
+    - Run: `python3 ~/.claude/scripts/make_a_worktree/retarget_clean_fix.py revert --worktree "$(basename "$SELECTED_WORKTREE")" --commit`
+    - The helper drops any `[active_checkout]` redirect pointing into the worktree and removes the worktree's `[build]` entry; it is a no-op if there was none. With `--commit` it commits **only** `clean-fix.conf` in the `~/.claude` repo when something changed, so the conf needs no manual upkeep.
+    - If the JSON shows `"reverted": true`, tell the user which `removed` entries were cleaned up and the `commit.commit` short hash. Otherwise say nothing.
 </RevertCleanFixRedirect>
 
 HAPPY PATH: If all validations pass and user confirms, proceed with deletion

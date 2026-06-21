@@ -98,11 +98,11 @@ while the project's identity/history stays put. This step offers that.
 - Offer keywords: **approve** / **skip**. STOP and wait.
 
 **On approve:**
-- Run:
-  `python3 ~/.claude/scripts/make_a_worktree/retarget_clean_fix.py apply --repo [repo-name] --worktree [worktree-name]`
-- This adds `[worktree-name]` to `[build]` and writes the `[active_checkout]` redirect(s); the `[projects]` lines are untouched, so history continuity is preserved. No restart needed — the clean-fix jobs read the conf live.
-- Report the edits from the JSON (`redirects`, `build_add`).
-- Note to the user: to undo later (e.g. after merging/deleting the worktree), `/worktree_delete` reverts the redirect automatically, or run the helper's `revert --worktree [worktree-name]`.
+- Run (use `dangerouslyDisableSandbox: true` — the helper makes a git commit, which the sandbox blocks):
+  `python3 ~/.claude/scripts/make_a_worktree/retarget_clean_fix.py apply --repo [repo-name] --worktree [worktree-name] --commit`
+- This adds `[worktree-name]` to `[build]` and writes the `[active_checkout]` redirect(s); the `[projects]` lines are untouched, so history continuity is preserved. No restart needed — the clean-fix jobs read the conf live. With `--commit` it also commits **only** `clean-fix.conf` in the `~/.claude` repo, so the redirect needs no manual upkeep.
+- Report the edits from the JSON (`redirects`, `build_add`) and the `commit` result (`commit.commit` short hash if `commit.committed` is true; otherwise mention `commit.reason`).
+- Note to the user: to undo later (e.g. after merging/deleting the worktree), `/worktree_delete` reverts the redirect automatically, or run the helper's `revert --worktree [worktree-name] --commit`.
 
 **On skip:** do nothing further.
 </OfferCleanFixRedirect>
