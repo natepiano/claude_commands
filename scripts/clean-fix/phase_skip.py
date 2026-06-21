@@ -4,8 +4,8 @@
 The conf is an opt-in allowlist, so "skipping" a target means commenting its
 allowlist line out, and "enabling" uncomments it. Two scopes, one section each:
 
-  - ``clean``  -> ``[build]``.   The nightly clean/build/mend allowlist.
-  - ``style``  -> ``[targets]``. The style eval/review/fix allowlist.
+  - ``clean``  -> ``[build]``.    The nightly clean/build/mend allowlist.
+  - ``style``  -> ``[projects]``. The style eval/review/fix allowlist.
 
 Skips are tagged with the ``#CLEAN_FIX_SKIP#`` marker so ``enable`` /
 ``enable-all`` only reverse temporary skips and never touch plain doc comments.
@@ -26,7 +26,7 @@ CONF_FILE = Path(__file__).resolve().parent / "clean-fix.conf"
 MARKER = "#CLEAN_FIX_SKIP#"
 
 SECTION_RE = re.compile(r"^\[(?P<name>.+)\]\s*$")
-SCOPE_SECTION = {"clean": "build", "style": "targets"}
+SCOPE_SECTION = {"clean": "build", "style": "projects"}
 
 
 def read_lines() -> list[str]:
@@ -54,7 +54,7 @@ def entry_key(line: str, section: str) -> str | None:
     """Project name a section line represents, whether active or skip-tagged.
 
     Returns None for blanks, section headers, and plain ``#`` doc comments. In
-    ``[targets]`` a member line (``<dir>/<subpath>``) is keyed by its last path
+    ``[projects]`` a member line (``<dir>/<subpath>``) is keyed by its last path
     segment; everywhere else the entry text is its own key.
     """
     body = line.strip()
@@ -63,7 +63,7 @@ def entry_key(line: str, section: str) -> str | None:
     body = body.split("#", 1)[0].strip()
     if not body or SECTION_RE.match(body):
         return None
-    if section == "targets" and "/" in body:
+    if section == "projects" and "/" in body:
         return body.rsplit("/", 1)[-1]
     return body
 

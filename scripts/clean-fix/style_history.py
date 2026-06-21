@@ -398,16 +398,42 @@ class WorkspaceMember:
     package_name: str
 
 
-def workspace_members() -> dict[str, WorkspaceMember]:
-    """Workspace-member targets from the ``[targets]`` allowlist.
+def active_checkout_overrides() -> dict[str, str]:
+    """``[active_checkout]`` map: a [projects] entry -> the checkout path (relative
+    to ~/rust) that clean-fix should read instead of the entry's own path. Lets a
+    worktree stand in for a project while history stays under the entry's name."""
+    if not CLEAN_FIX_CONF_FILE.exists():
+        return {}
+    overrides: dict[str, str] = {}
+    current_section = ""
+    for raw_line in CLEAN_FIX_CONF_FILE.read_text().splitlines():
+        stripped = raw_line.split("#", 1)[0].strip()
+        if not stripped:
+            continue
+        if stripped.startswith("[") and stripped.endswith("]"):
+            current_section = stripped[1:-1]
+            continue
+        if current_section != "active_checkout":
+            continue
+        key, _, value = stripped.partition("=")
+        if key.strip() and value.strip():
+            overrides[key.strip()] = value.strip()
+    return overrides
 
-    A member line is any ``[targets]`` entry containing a ``/`` — the part
+
+def workspace_members() -> dict[str, WorkspaceMember]:
+    """Workspace-member projects from the ``[projects]`` allowlist.
+
+    A member line is any ``[projects]`` entry containing a ``/`` — the part
     before the first slash is the workspace directory, the rest is the member
     subpath. The history key, package name, and ``_style_fix`` dir name all come
-    from the last path segment (e.g. ``bevy_diegetic``).
+    from the entry's last path segment (e.g. ``bevy_diegetic``); the workspace
+    dir and subpath come from the checkout, which an ``[active_checkout]``
+    redirect may point at a worktree.
     """
     if not CLEAN_FIX_CONF_FILE.exists():
         return {}
+    overrides = active_checkout_overrides()
     members: dict[str, WorkspaceMember] = {}
     current_section = ""
     for raw_line in CLEAN_FIX_CONF_FILE.read_text().splitlines():
@@ -417,13 +443,13 @@ def workspace_members() -> dict[str, WorkspaceMember]:
         if stripped.startswith("[") and stripped.endswith("]"):
             current_section = stripped[1:-1]
             continue
-        if current_section != "targets" or "/" not in stripped:
+        if current_section != "projects" or "/" not in stripped:
             continue
-        path_part = stripped.strip("/")
-        ws_dir, _, subpath = path_part.partition("/")
+        name = stripped.rsplit("/", 1)[-1]
+        checkout = overrides.get(stripped, stripped)
+        ws_dir, _, subpath = checkout.strip("/").partition("/")
         if not ws_dir or not subpath:
             continue
-        name = Path(subpath).name
         members[name] = WorkspaceMember(
             workspace_dir=ws_dir,
             member_subpath=subpath,
@@ -438,7 +464,8 @@ def resolve_project_root(project_name: str) -> Path | None:
         m = members[project_name]
         path = RUST_DIR / m.workspace_dir / m.member_subpath
         return path if path.exists() else None
-    default = RUST_DIR / project_name
+    checkout = active_checkout_overrides().get(project_name, project_name)
+    default = RUST_DIR / checkout
     return default if default.exists() else None
 
 

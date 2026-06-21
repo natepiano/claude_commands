@@ -243,7 +243,7 @@ Argument handling:
 10. **Scoped model:** `/clean_fix eval model opus`, `/clean_fix review model sonnet`, or `/clean_fix fix model gpt-5.4-mini` first reads the selected scope's `agent=`. The model must exactly match a non-comment line under `[<agent>.models]` in `config/agents.conf`; otherwise stop and show the allowed values.
 11. **Scoped effort:** `/clean_fix eval effort max` or `/clean_fix fix effort xhigh` first reads the selected scope's `agent=`. The effort must exactly match a non-comment line under `[<agent>.efforts]` in `config/agents.conf`; otherwise stop and show the allowed values.
 12. **Default model/effort:** `/clean_fix <scope> model default` sets that scope's `model=` to empty. `/clean_fix <scope> effort default` sets that scope's `effort=` to empty. Empty values resolve through the global `[<agent>]` defaults; if those are empty too, the agent CLI default applies.
-13. When changing a value, edit only the relevant `enabled=`, `agent=`, `model=`, or `effort=` line in `agent-assignments.conf`. The `[build]` and `[targets]` skip lists remain in `clean-fix.conf` and are managed by `phase_skip.py` (see <Skip/>), never by direct edits.
+13. When changing a value, edit only the relevant `enabled=`, `agent=`, `model=`, or `effort=` line in `agent-assignments.conf`. The `[build]` and `[projects]` skip lists remain in `clean-fix.conf` and are managed by `phase_skip.py` (see <Skip/>), never by direct edits.
 
 </StyleAgentConfig>
 
@@ -256,7 +256,7 @@ Skip or re-enable targets in `~/.claude/scripts/clean-fix/clean-fix.conf` by com
 The second token is the scope — required:
 
 - **`clean`** — the `[build]` allowlist (clean + build pass). A directory skipped from clean has no effect on style.
-- **`style`** — the `[targets]` allowlist (style eval, review, and fix passes). A target is either a whole directory or a workspace member (`<dir>/<subpath>`); a member is named by its last path segment (e.g. `bevy_diegetic`). A style skip leaves clean untouched.
+- **`style`** — the `[projects]` allowlist (style eval, review, and fix passes). A project is either a whole directory or a workspace member (`<dir>/<subpath>`); a member is named by its last path segment (e.g. `bevy_diegetic`). A style skip leaves clean untouched.
 
 If the scope is missing or anything else, explain the two scopes and stop.
 

@@ -229,7 +229,7 @@ gh api repos/bevyengine/bevy/releases/tags/v${VERSION}
 
 The script prints the resolved migration-guides directory as its final stdout line. Capture it into `GUIDES_DIR` and use that literal path for the rest of the run — it may be `${BEVY_REPO_DIR}/release-content/migration-guides` (<= 0.18) or `${BEVY_REPO_DIR}/_release-content/migration-guides` (0.19+).
 
-The clone's directory (`bevy-${VERSION}`) lives under `~/rust/` but is never touched by the nightly clean-fix automation: that conf is an opt-in allowlist, so the upstream Bevy source is skipped simply by not being listed in `[build]` or `[targets]`. No action needed here.
+The clone's directory (`bevy-${VERSION}`) lives under `~/rust/` but is never touched by the nightly clean-fix automation: that conf is an opt-in allowlist, so the upstream Bevy source is skipped simply by not being listed in `[build]` or `[projects]`. No action needed here.
 
 ```bash
 GUIDES_DIR=$(~/.claude/scripts/bevy_migration_plan/bevy_migration_ensure_repo.sh "${VERSION}" | tail -1)

@@ -2,6 +2,7 @@ Use TodoWrite tool to create initial todos:
 - "Suggest worktree and branch name to user"
 - "Get user approval for worktree creation"
 - "Create approved worktree and branch"
+- "Offer clean-fix eval/fix redirect if the worktree matches a project"
 
 <ExecutionSteps>
 **EXECUTE THESE STEPS IN ORDER:**
@@ -10,6 +11,7 @@ Use TodoWrite tool to create initial todos:
 **STEP 2:** Execute <GetUserApproval/>
 **STEP 3:** Execute <CreateWorktree/>
 **STEP 4:** Execute <CopySettingsLocal/>
+**STEP 5:** Execute <OfferCleanFixRedirect/>
 </ExecutionSteps>
 
 <SuggestWorktreeName>
@@ -71,3 +73,36 @@ Mark third todo as completed when finished.
 - Run `bash ~/.claude/scripts/make_a_worktree/copy_settings_local.sh ../[worktree-name]`
 - Inform user: "Copied settings.local.json to worktree."
 </CopySettingsLocal>
+
+<OfferCleanFixRedirect>
+**Offer to point clean-fix's style eval/fix at this worktree.**
+
+clean-fix evaluates/fixes a fixed allowlist of projects (`[projects]` in
+`~/.claude/scripts/clean-fix/clean-fix.conf`). When a worktree is a checkout of
+one of those projects, you usually want the eval/fix work to follow the worktree
+while the project's identity/history stays put. This step offers that.
+
+**Guard — only proceed if the worktree is a sibling under `~/rust`:**
+- The worktree was created at `../[worktree-name]`. Resolve its parent.
+- If the parent is not `~/rust` (i.e. `$HOME/rust`), SKIP this step silently — clean-fix paths are relative to `~/rust`, so a redirect would be invalid. Do not mention it.
+
+**Detect a match:**
+- Get the primary repo name: `basename "$(git rev-parse --show-toplevel)"`.
+- Run:
+  `python3 ~/.claude/scripts/make_a_worktree/retarget_clean_fix.py detect --repo [repo-name] --worktree [worktree-name]`
+- If the JSON has `"match": false`, SKIP silently — this worktree's name is not prefixed by the repo or one of its `[projects]` member crates, so there's nothing to redirect. Do not mention it.
+
+**On a match, ask the user (do NOT auto-apply):**
+- Present the redirect concisely, e.g.:
+  > Worktree `[worktree-name]` matches clean-fix project(s) `[redirects[].entry]`. Point style eval/fix at this worktree (and add it to the nightly build set)? The project keeps its name and history.
+- Offer keywords: **approve** / **skip**. STOP and wait.
+
+**On approve:**
+- Run:
+  `python3 ~/.claude/scripts/make_a_worktree/retarget_clean_fix.py apply --repo [repo-name] --worktree [worktree-name]`
+- This adds `[worktree-name]` to `[build]` and writes the `[active_checkout]` redirect(s); the `[projects]` lines are untouched, so history continuity is preserved. No restart needed — the clean-fix jobs read the conf live.
+- Report the edits from the JSON (`redirects`, `build_add`).
+- Note to the user: to undo later (e.g. after merging/deleting the worktree), `/worktree_delete` reverts the redirect automatically, or run the helper's `revert --worktree [worktree-name]`.
+
+**On skip:** do nothing further.
+</OfferCleanFixRedirect>

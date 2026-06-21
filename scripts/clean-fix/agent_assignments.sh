@@ -11,6 +11,24 @@ source "$CLEAN_FIX_AGENT_DIR/../agents/agents_config.sh"
 
 cf_trim() { agents_config_trim "$1"; }
 
+# cf_resolve_checkout <projects-entry>
+# Echo the checkout path clean-fix should evaluate/fix for a [projects] entry:
+# its [active_checkout] override if one is set (e.g. a worktree), else the entry
+# itself. Identity/history keys derive from the entry, not this path, so a
+# redirect keeps a project's history while pointing work at a different checkout.
+# Reads the parallel arrays cf_ac_keys / cf_ac_vals, which each caller fills from
+# the [active_checkout] section in its own conf parse loop.
+cf_resolve_checkout() {
+    local entry="$1" i
+    for ((i = 0; i < ${#cf_ac_keys[@]}; i++)); do
+        if [[ "${cf_ac_keys[$i]}" == "$entry" ]]; then
+            printf '%s' "${cf_ac_vals[$i]}"
+            return 0
+        fi
+    done
+    printf '%s' "$entry"
+}
+
 cf_validate_bool() {
     local section="$1"
     local key="$2"

@@ -1,17 +1,19 @@
 #!/bin/bash
-# Create style-fix worktrees for targets with pending evaluation findings.
-# For each eligible target: create a worktree, launch the configured style agent to apply fixes + clippy.
-# Targets come from the [targets] allowlist in clean-fix.conf.
+# Create style-fix worktrees for projects with pending evaluation findings.
+# For each eligible project: create a worktree, launch the configured style agent to apply fixes + clippy.
+# Projects come from the [projects] allowlist in clean-fix.conf.
 # Can be run standalone or called from clean-fix.sh.
 #
 # Usage: style-fix-worktrees.sh [project_name]
-#   If project_name is given, only process that single target.
-#   If omitted, process every eligible [targets] entry.
+#   If project_name is given, only process that single project.
+#   If omitted, process every eligible [projects] entry.
 #
-# Each [targets] line is either:
+# Each [projects] line is either:
 #   <dir>            a whole directory (single crate, or --workspace)
 #   <dir>/<subpath>  one workspace member crate inside <dir>
-# <dir> may be a primary repo or a worktree checkout (e.g. *_bevy_update).
+# <dir> may be a primary repo or a worktree checkout (e.g. *_bevy_update). An
+# [active_checkout] redirect can point a project's fix work at a worktree while
+# keeping its identity/history; see clean-fix.conf.
 
 set -euo pipefail
 
@@ -92,8 +94,10 @@ echo "[diag] style-fix-worktrees.sh starting: pid=$$ ppid=$PPID cwd_before=$(pwd
 cd "$RUST_DIR"
 echo "[diag] cwd_after_chdir=$(pwd)"
 
-# Parse conf file for the [targets] allowlist and settings.
-targets=()
+# Parse conf file for the [projects] allowlist and settings.
+projects=()
+cf_ac_keys=()
+cf_ac_vals=()
 MAX_NEW_FINDINGS=""
 AGENT_TIMEOUT_SECS=""
 POST_SUMMARY_GRACE_SECS=""
@@ -116,7 +120,11 @@ if [[ -f "$CONF_FILE" ]]; then
             continue
         fi
         case "$current_section" in
-            targets) targets+=("$stripped") ;;
+            projects) projects+=("$stripped") ;;
+            active_checkout)
+                cf_ac_keys+=("$(cf_trim "${stripped%%=*}")")
+                cf_ac_vals+=("$(cf_trim "${stripped#*=}")")
+                ;;
             style_eval)
                 if [[ "$stripped" =~ ^mode= ]]; then
                     echo "ERROR: [style_eval] mode is no longer supported; use enabled=true|false and agent=claude|codex" >&2
@@ -220,18 +228,22 @@ eligible=()
 records=()
 skipped=0
 
-# Resolve each [targets] entry:
-#   <dir>            -> standalone: repo_dir = work_dir = ~/rust/<dir>, --workspace
-#   <dir>/<subpath>  -> workspace_member: repo_dir = ~/rust/<dir>, work_dir = repo_dir/subpath
+# Resolve each [projects] entry:
+#   <dir>            -> standalone: repo_dir = work_dir = ~/rust/<checkout>, --workspace
+#   <dir>/<subpath>  -> workspace_member: repo_dir = ~/rust/<checkout-dir>, work_dir = repo_dir/subpath
+# Identity (kind, name, branch, _style_fix dir) comes from the entry; repo_dir,
+# work_dir, and subpath come from the checkout — an [active_checkout] redirect
+# may point those at a worktree while history stays under the entry's name.
 # <dir> may be a primary repo or a worktree checkout; `git rev-parse` accepts both.
-for entry in ${targets[@]+"${targets[@]}"}; do
+for entry in ${projects[@]+"${projects[@]}"}; do
+    checkout="$(cf_resolve_checkout "$entry")"
     if [[ "$entry" == */* ]]; then
         kind="workspace_member"
-        subpath="${entry#*/}"
+        subpath="${checkout#*/}"
         pkg="${entry##*/}"
         name="$pkg"
-        repo_dir="${RUST_DIR}/${entry%%/*}"
-        work_dir="${RUST_DIR}/${entry}"
+        repo_dir="${RUST_DIR}/${checkout%%/*}"
+        work_dir="${RUST_DIR}/${checkout}"
         worktree_dir="${RUST_DIR}/${name}_style_fix"
         unused=""
         branch_name="refactor/style/${name}"
@@ -240,7 +252,7 @@ for entry in ${targets[@]+"${targets[@]}"}; do
         subpath=""
         pkg=""
         name="$entry"
-        repo_dir="${RUST_DIR}/${entry}"
+        repo_dir="${RUST_DIR}/${checkout}"
         work_dir="$repo_dir"
         worktree_dir="${RUST_DIR}/${name}_style_fix"
         unused=""

@@ -29,7 +29,7 @@ BEVY_REPO_DIR="${HOME}/rust/bevy-${VERSION}"
 
 # No clean-fix registration needed: the conf is an opt-in allowlist, so a Bevy
 # clone under ~/rust/ is never cleaned/built/evaluated unless someone explicitly
-# adds it to [build] or [targets] in clean-fix.conf.
+# adds it to [build] or [projects] in clean-fix.conf.
 
 # Clone or update repository
 if [ -d "${BEVY_REPO_DIR}/.git" ]; then

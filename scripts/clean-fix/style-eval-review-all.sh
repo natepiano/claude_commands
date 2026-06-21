@@ -39,9 +39,11 @@ CODEX_BIN="${CODEX_BIN:-$(command -v codex 2>/dev/null || echo "$HOME/.local/bin
 
 mkdir -p "$LOG_DIR"
 
-# Parse conf for the [targets] allowlist so the review project list matches the
+# Parse conf for the [projects] allowlist so the review project list matches the
 # eval stage. Agent assignment comes from agent-assignments.conf.
-targets=()
+projects=()
+cf_ac_keys=()
+cf_ac_vals=()
 
 if [[ -f "$CONF_FILE" ]]; then
     current_section=""
@@ -54,7 +56,11 @@ if [[ -f "$CONF_FILE" ]]; then
             continue
         fi
         case "$current_section" in
-            targets) targets+=("$stripped") ;;
+            projects) projects+=("$stripped") ;;
+            active_checkout)
+                cf_ac_keys+=("$(cf_trim "${stripped%%=*}")")
+                cf_ac_vals+=("$(cf_trim "${stripped#*=}")")
+                ;;
             style_eval)
                 if [[ "$stripped" =~ ^mode= ]]; then
                     echo "ERROR: [style_eval] mode is no longer supported; agent settings moved to agent-assignments.conf" >&2
@@ -139,15 +145,18 @@ names=()
 eval_files=()
 project_roots=()
 
-# Resolve each [targets] entry into (name, eval_file). <dir> or <dir>/<subpath>;
-# a member's name is its last path segment. Matches the eval stage's resolution.
-for entry in ${targets[@]+"${targets[@]}"}; do
+# Resolve each [projects] entry into (name, eval_file). <dir> or <dir>/<subpath>;
+# a member's name is its last path segment. project_root comes from the checkout
+# (an [active_checkout] redirect may point it at a worktree). Matches the eval
+# stage's resolution.
+for entry in ${projects[@]+"${projects[@]}"}; do
     if [[ "$entry" == */* ]]; then
         name="${entry##*/}"
     else
         name="$entry"
     fi
-    project_root="${RUST_DIR}/${entry}"
+    checkout="$(cf_resolve_checkout "$entry")"
+    project_root="${RUST_DIR}/${checkout}"
     if [[ -n "$SINGLE_PROJECT" && "$name" != "$SINGLE_PROJECT" ]]; then
         continue
     fi

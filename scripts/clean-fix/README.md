@@ -11,7 +11,7 @@ Runs daily at **4:00 AM** via launchd.
 | File | Purpose |
 |------|---------|
 | `clean-fix.sh` | Main entry point. Takes a scope: `clean` (settings back-populate + clean/build/mend + warmup), `style` (eval + review + fix), or `all` (default, both). Emits a clean-fix log that `/clean_fix report` can render on demand. |
-| `clean-fix.conf` | Pipeline configuration. Two opt-in allowlists: `[build]` (clean/build/mend) and `[targets]` (style eval/review/fix), plus style quotas, timeouts, project env, and warmup targets. No agent settings live here. No deny list — nothing runs unless listed. |
+| `clean-fix.conf` | Pipeline configuration. Two opt-in allowlists: `[build]` (clean/build/mend) and `[projects]` (style eval/review/fix), plus the optional `[active_checkout]` redirect map (point a project's eval/fix at a worktree while keeping its identity/history), style quotas, timeouts, project env, and warmup targets. No agent settings live here. No deny list — nothing runs unless listed. |
 | `agent-assignments.conf` | Clean-fix stage-to-agent mapping. `[style_eval]`, `[style_eval_review]`, and `[style_fix]` each own `enabled=`, `agent=`, and optional per-stage `model=`/`effort=` overrides. Empty overrides resolve through `~/.claude/config/agents.conf`. |
 | `agent_assignments.sh` | Clean-fix Bash helper for loading stage assignments. It delegates model/effort defaults and allowlist validation to `scripts/agents/agents_config.sh`. |
 | `com.natemccoy.style-fix.plist` | launchd plist — runs the style scope every 10 minutes (no idle gate). |
@@ -22,7 +22,7 @@ Runs daily at **4:00 AM** via launchd.
 
 | File | Purpose |
 |------|---------|
-| `style-eval-all.sh` | Runs `/style_eval` on every `[targets]` entry in parallel using the `[style_eval]` assignment. Stores pending evaluation markdown in `.history/.pending/<project>.json`. Skips projects with pending findings or a real `_style_fix` worktree so pending JSON cannot be replaced while fixes are awaiting review. |
+| `style-eval-all.sh` | Runs `/style_eval` on every `[projects]` entry in parallel using the `[style_eval]` assignment. Stores pending evaluation markdown in `.history/.pending/<project>.json`. Skips projects with pending findings or a real `_style_fix` worktree so pending JSON cannot be replaced while fixes are awaiting review. |
 | `candidate_generators.py` | Deterministic candidate enumeration for style-eval units. A guideline's `candidates:` frontmatter names a generator kind (regex / toml / Rust-source parse); `next-unit` hands the agent the enumerated sites as a closed list, `record-unit` refuses records that don't disposition every candidate, and zero-candidate units record free like pre_filter skips. Design + audit: `docs/candidate-enumeration-design.md`. Debug via `style_history.py enumerate-candidates`. |
 | `rg-shim.sh` | Retired timeout shim for `ripgrep`. Kept for reference, but not activated on PATH. See **Reliability guards** below. |
 

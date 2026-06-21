@@ -55,7 +55,7 @@ EVAL_SORT_ORDER: dict[str, int] = {
 HEARTBEAT_FRESH_SECS = 150
 
 # Permanent exclusions: directory will never be a candidate while it exists in
-# its current form. Covers directories not opted into the `[build]` / `[targets]`
+# its current form. Covers directories not opted into the `[build]` / `[projects]`
 # allowlists plus structural reasons (not a Rust project, framework-managed
 # worktree, etc.).
 ALWAYS_EXCLUDED_REASONS: frozenset[str] = frozenset(
@@ -260,10 +260,17 @@ def _filename_ts_key(path: Path) -> str:
 
 
 def target_roots_by_project() -> dict[str, Path]:
-    """Return style-eval target-name to project-root mapping from clean-fix.conf."""
+    """Return style-eval project-name to project-root mapping from clean-fix.conf.
+
+    The name (identity/history key) comes from the [projects] entry; the root
+    comes from the checkout, which an [active_checkout] redirect may point at a
+    worktree.
+    """
     roots: dict[str, Path] = {}
     if not CONF_FILE.exists():
         return roots
+    entries: list[str] = []
+    overrides: dict[str, str] = {}
     current_section = ""
     for raw_line in CONF_FILE.read_text(errors="replace").splitlines():
         stripped = raw_line.split("#", 1)[0].strip()
@@ -272,15 +279,15 @@ def target_roots_by_project() -> dict[str, Path]:
         if stripped.startswith("[") and stripped.endswith("]"):
             current_section = stripped[1:-1]
             continue
-        if current_section != "targets":
-            continue
-        if "/" in stripped:
-            name = stripped.rsplit("/", 1)[1]
-            root = RUST_DIR / stripped
-        else:
-            name = stripped
-            root = RUST_DIR / stripped
-        _ = roots.setdefault(name, root)
+        if current_section == "projects":
+            entries.append(stripped)
+        elif current_section == "active_checkout":
+            key, _, value = stripped.partition("=")
+            overrides[key.strip()] = value.strip()
+    for entry in entries:
+        checkout = overrides.get(entry, entry)
+        name = entry.rsplit("/", 1)[1] if "/" in entry else entry
+        _ = roots.setdefault(name, RUST_DIR / checkout)
     return roots
 
 

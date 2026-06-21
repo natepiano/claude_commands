@@ -24,6 +24,7 @@ Update each todo status to "in_progress" when starting that step, and "completed
     **STEP 4:** Execute <CheckUnpushedCommits/>
     **STEP 5:** Execute <GetFinalConfirmation/>
     **STEP 6:** Execute <PerformDeletion/>
+    **STEP 7:** Execute <RevertCleanFixRedirect/>
 </ExecutionSteps>
 
 <DiscoverWorktrees>
@@ -90,6 +91,13 @@ Update each todo status to "in_progress" when starting that step, and "completed
     - The script requires the confirmation nonce from <GetFinalConfirmation/>; if it reports "no confirmation nonce", the confirm step was skipped — return to <GetFinalConfirmation/> rather than retrying
     - Report success to user
 </PerformDeletion>
+
+<RevertCleanFixRedirect>
+    - If a clean-fix redirect pointed style eval/fix at this worktree (set by `/make_a_worktree`), remove it so clean-fix returns to the primary checkout.
+    - Run: `python3 ~/.claude/scripts/make_a_worktree/retarget_clean_fix.py revert --worktree "$(basename "$SELECTED_WORKTREE")"`
+    - The helper drops any `[active_checkout]` redirect pointing into the worktree and removes the worktree's `[build]` entry; it is a no-op if there was none.
+    - If the JSON shows `"reverted": true`, tell the user which `removed` entries were cleaned up. Otherwise say nothing.
+</RevertCleanFixRedirect>
 
 HAPPY PATH: If all validations pass and user confirms, proceed with deletion
 UNHAPPY PATH: Stop and ask user for guidance if:

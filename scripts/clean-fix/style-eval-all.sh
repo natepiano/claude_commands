@@ -1,16 +1,18 @@
 #!/bin/bash
-# Run style evaluations on all opt-in targets in parallel.
-# Targets come from the [targets] allowlist in clean-fix.conf.
+# Run style evaluations on all opt-in projects in parallel.
+# Projects come from the [projects] allowlist in clean-fix.conf.
 # Can be run standalone or called from clean-fix.sh.
 #
 # Usage: style-eval-all.sh [project_name]
-#   If project_name is given, only evaluate that single target.
-#   If omitted, evaluate every [targets] entry.
+#   If project_name is given, only evaluate that single project.
+#   If omitted, evaluate every [projects] entry.
 #
-# Each [targets] line is either:
+# Each [projects] line is either:
 #   <dir>            a whole directory (single crate, or --workspace)
 #   <dir>/<subpath>  one workspace member crate inside <dir>
-# <dir> may be a primary repo or a worktree checkout (e.g. *_bevy_update).
+# <dir> may be a primary repo or a worktree checkout (e.g. *_bevy_update). An
+# [active_checkout] redirect can point a project's evaluation at a worktree
+# while keeping its identity/history; see clean-fix.conf.
 
 set -euo pipefail
 
@@ -36,8 +38,10 @@ HEARTBEAT_INTERVAL_SECS=60
 mkdir -p "$LOG_DIR"
 mkdir -p "$FAILURE_LOG_DIR"
 
-# Parse conf file for the [targets] allowlist and style_eval settings.
-targets=()    # opt-in eval targets: <dir> or <dir>/<subpath>
+# Parse conf file for the [projects] allowlist and style_eval settings.
+projects=()    # opt-in eval projects: <dir> or <dir>/<subpath>
+cf_ac_keys=()  # [active_checkout] LHS: a [projects] entry being redirected
+cf_ac_vals=()  # [active_checkout] RHS: the checkout path to evaluate instead
 MAX_NEW_FINDINGS=""
 STYLE_AGENT_MODEL=""
 STYLE_AGENT_EFFORT=""
@@ -60,7 +64,11 @@ if [[ -f "$CONF_FILE" ]]; then
             continue
         fi
         case "$current_section" in
-            targets) targets+=("$stripped") ;;
+            projects) projects+=("$stripped") ;;
+            active_checkout)
+                cf_ac_keys+=("$(cf_trim "${stripped%%=*}")")
+                cf_ac_vals+=("$(cf_trim "${stripped#*=}")")
+                ;;
             style_eval)
                 if [[ "$stripped" =~ ^mode= ]]; then
                     echo "ERROR: [style_eval] mode is no longer supported; agent settings moved to agent-assignments.conf" >&2
@@ -435,20 +443,23 @@ projects=()
 project_roots=()
 project_worktree_evals=()
 
-# Resolve each [targets] entry into (name, project_root, scratch eval path).
+# Resolve each [projects] entry into (name, project_root, scratch eval path).
 #   <dir>            -> whole directory; name=<dir>
 #   <dir>/<subpath>  -> workspace member; name=last path segment
-# <dir> may be a primary repo or a worktree checkout — the eval reads source
-# and never touches git, so the two are indistinguishable here.
-for entry in ${targets[@]+"${targets[@]}"}; do
+# name (identity/history key) comes from the entry; project_root comes from the
+# checkout, which an [active_checkout] redirect may point at a worktree. <dir>
+# may be a primary repo or a worktree checkout — the eval reads source and never
+# touches git, so the two are indistinguishable here.
+for entry in ${projects[@]+"${projects[@]}"}; do
+    checkout="$(cf_resolve_checkout "$entry")"
     if [[ "$entry" == */* ]]; then
         name="${entry##*/}"
-        subpath="${entry#*/}"
-        project_root="${RUST_DIR}/${entry}"
+        subpath="${checkout#*/}"
+        project_root="${RUST_DIR}/${checkout}"
         worktree_eval="${LOG_DIR}/style_fix_${name}_evaluation.md"
     else
         name="$entry"
-        project_root="${RUST_DIR}/${entry}"
+        project_root="${RUST_DIR}/${checkout}"
         worktree_eval="${LOG_DIR}/style_fix_${name}_evaluation.md"
     fi
 

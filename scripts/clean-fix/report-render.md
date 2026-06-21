@@ -23,7 +23,7 @@ STATUS: complete | crashed | partial | in-progress
 
 PHASE <name> present=<bool> ok=N fail=N skip=N [footer_ok=N footer_fail=N footer_total=N]
 ROW <project>  clean=<cell> warmup=<cell> eval=<cell> review=<cell> fix=<cell> verify=<cell> reason="<short reason | ->" [phase_now="<live phase>"]
-ALWAYS_EXCLUDED "<reason>" count=N projects=<a,b,c>   ← directories under ~/rust not opted into the relevant allowlist ([build] / [targets]) in clean-fix.conf
+ALWAYS_EXCLUDED "<reason>" count=N projects=<a,b,c>   ← directories under ~/rust not opted into the relevant allowlist ([build] / [projects]) in clean-fix.conf
 FILTERED_OUT "<reason>" count=N projects=<a,b,c>      ← would be eligible, but framework state / project layout filtered them out
 WARNING <phase> <project> "<message>"                 ← real project failures
 TOOL_WARNING <phase> <project> "<message>"            ← sub-tool failed but project itself is healthy
