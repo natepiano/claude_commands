@@ -109,6 +109,34 @@ not codebase searching.
    leaves the tree green. Prefer the smallest set of phases that are each a real
    chunk of work; do not over-split.
 
+   **Right-size each phase — split signals.** A phase must be **delegate-sized**:
+   one fresh implementer (no prior context) builds it and gets the tree green in a
+   single pass. Whether the spine is inherited or freshly decomposed, test every
+   phase against these signals **before** drafting its Work Order. If any fires,
+   split the phase into delegate-sized units — the usual seam is **types →
+   systems/wiring → tests**, or one subsystem per file group.
+
+   - **Gate breadth:** the Acceptance gate would enumerate more than ~8–10
+     distinct checks / test requirements. A long gate is the compile-time tell
+     that one phase number is wearing several units of work.
+   - **New subsystem:** the phase stands up a *new* multi-file subsystem — a new
+     module plus its own cross-cutting surface (new schema/config, a new
+     API/protocol boundary, a generated/compiled artifact such as a shader or
+     migration, a new render/IPC/service path) — rather than extending an existing
+     one. Standing it up and fully testing it are separate units.
+   - **File span:** the Spec **creates** more than ~2–3 files, or expects a single
+     new/edited file to grow by many hundreds of lines.
+   - **Mixed kinds:** the phase bundles work that could each land and be reviewed
+     on its own — defining data types, wiring systems/routing, and proving with
+     tests — under one number.
+   - **Compound goal:** the Goal joins two outcomes with "and" that need not ship
+     together.
+
+   **Counter-signal — do NOT split** when the pieces are not independently
+   buildable (one won't compile or pass without the other) or a split would leave
+   an intermediate phase red. Cohesion beats count: never break one atomic change
+   just to lower a number, and never merge unrelated work just to raise one.
+
 2. **For each phase, draft a Work Order** per the format doc:
    - **Goal** — one line, the observable outcome.
    - **Spec** — the implementation detail. Where the source doc has a resolved
@@ -135,7 +163,12 @@ not codebase searching.
 **Reconcile mode** narrows steps 1–3 to the **target phases** from `<Locate/>`:
 
 - Do **not** re-decompose the plan or touch the phase spine — the insert/edit
-  already set it.
+  already set it — **except** to apply the **Right-size** check (step 1) to the
+  remaining `todo` phases. Run that check now: any `todo` phase that trips a split
+  signal is split into delegate-sized sub-phases (e.g. `4` → `4a/4b/4c`),
+  preserving order and leaving every `done` phase untouched. This is the one
+  spine edit reconcile may make, and only on un-started `todo` phases. The newly
+  created sub-phases join the target set.
 - Compile **only** the target phases into Work Orders (steps 2–3 above, applied to
   each target). Already-complete `todo` Work Orders and all `done` phases are left
   byte-for-byte unchanged — no churn, no drift.
@@ -212,7 +245,11 @@ Then stop. Do not start implementing a phase.
 - Every remaining Work Order must satisfy the format doc's self-containment rule:
   a fresh codex implements it from the named files + Delegation Context, no search.
 - Never delete completed-phase history. Strip design *narrative*, not shipped facts.
+- Every phase must be **delegate-sized** (Restructure step 1): a fresh implementer
+  builds it green in one pass. Apply the split signals at compile time — an
+  over-size phase is a decomposition miss, not the delegate's problem to absorb.
 - Reconcile mode is **additive and surgical**: it compiles uncompiled/edited phases
   and propagates their facts forward (format doc → "Forward-propagation"). It never
-  re-runs the full Explore sweep, never re-decomposes the spine, and never rewrites
-  a `done` phase or an already-complete `todo` Work Order.
+  re-runs the full Explore sweep and never rewrites a `done` phase or an
+  already-complete `todo` Work Order. It may split an over-size **un-started `todo`**
+  phase into sub-phases (Restructure step 1 check) — the only spine edit it makes.

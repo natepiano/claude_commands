@@ -219,11 +219,16 @@ truth that maps clippy lints to the rule that governs them.
 <StyleReview>
 **This step runs unconditionally** — even if mend and clippy found zero issues.
 
-1. Get the additions-only diff (only review code that was added or modified, not deleted):
+1. Build the combined diff of uncommitted work, then the additions-only text from it. **Untracked files are always included** — a new file is entirely added code, so `git diff --no-index /dev/null <file>` renders it as all-additions. Never review only tracked changes:
    ```bash
-   git diff | grep '^+' | grep -v '^+++' > /tmp/claude/style-review-additions.txt
+   {
+     git diff
+     git ls-files --others --exclude-standard -z \
+       | xargs -0 -I{} git diff --no-index /dev/null "{}" 2>/dev/null
+   } > /tmp/claude/style-review.diff
+   grep '^+' /tmp/claude/style-review.diff | grep -v '^+++' > /tmp/claude/style-review-additions.txt
    ```
-   If the file is empty, report: "No uncommitted changes to review." and skip remaining steps.
+   The `git diff --no-index` exit status 1 (differences found) is expected, not an error. The `.diff` file (with `+++`/`@@` headers) drives the banned-words scan so findings report real source `path:line`; the `-additions.txt` (added lines only) is your reading aid for the rule walk. If `-additions.txt` is empty, report: "No uncommitted changes to review." and skip remaining steps.
 
 2. If the `=== STYLE_CHECKLIST ===` section is not already in context, execute <LoadStyleGuide/> now. The checklist lists every rule by number and name.
 
@@ -242,17 +247,20 @@ truth that maps clippy lints to the rule that governs them.
    **Banned-words rule (special handling):** When the checklist contains a "no
    banned words" / "forbidden words" rule, do **not** enumerate the stems
    yourself, do **not** write a patterns file, and do **not** build an inline
-   regex — the bare stems will trip the PostToolUse hook. Instead, call the
-   canonical scanner against the additions file:
+   regex — the bare stems will trip the PostToolUse hook. Instead, pipe the
+   combined diff through the canonical scanner's `--diff` mode:
 
    ```bash
-   python3 ~/.claude/scripts/hooks/banned_words_lib.py /tmp/claude/style-review-additions.txt
+   python3 ~/.claude/scripts/hooks/banned_words_lib.py --diff < /tmp/claude/style-review.diff
    ```
 
    Exit 0 = Pass. Exit 1 = VIOLATION; each output line is `path:lineno: stem:
-   <line>`. The script path contains `banned_words_lib`, which the hook's
-   introspection bypass recognizes, so neither the command nor its output
-   re-trips the scanner or bumps counters.
+   <line>`, where `path:lineno` is the **real source location** of the added
+   line (untracked files included). `--diff` scans added lines only, so
+   pre-existing lines in tracked files are not re-flagged. The script path
+   contains `banned_words_lib`, which the hook's introspection bypass
+   recognizes, so neither the command nor its output re-trips the scanner or
+   bumps counters.
 
 4. Fix all violations found.
 5. After fixes, report: "Style review complete — N violations fixed." or "Style review passed — all changes conform to the style guide."

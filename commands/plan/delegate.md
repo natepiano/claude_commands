@@ -188,33 +188,68 @@ Run `bash ~/.claude/scripts/delegate/codex_review.sh "${SESSION_DIR}" "${WORKING
 
 1. Merge ${CODEX_REVIEW} with your own findings. Dedupe — one entry per real issue, tagged with who caught it (codex / claude / both). Discard codex findings you can refute by reading the code; say which and why.
 
-2. Present:
+**TRANSLATE — do not pass reviewer vocabulary through.** The user has not read
+the plan, the diff, or the two reviews. Every line you present must stand on its
+own. A reference the user has never seen is invisible to them — replace it with
+what it *does*. **Banned unless defined in the same sentence:** bare finding
+numbers from the reviewers, plan-decision codes (`D2`, `I3`), test / guard /
+tripwire / file identifiers used as if the user knows them, and tooling terms
+(`headless` → "the automated tests on this machine can't drive a real screen";
+`binding` / `bind group` → say what the data connection actually is). If you
+cannot say what a finding *means in behavior terms*, you do not understand it
+well enough to present it — read the code until you can.
+
+**Never use the word "plain" or any variant** (`plain terms`, `plain language`,
+`plain English`, `in plain terms`) anywhere in the output — not in a header, a
+label, or a sentence. Just write the summary that way; do not announce that you
+are. This is absolute.
+
+2. Present in two layers — readable summary first, technical reference second:
 
 ```
 ## Delegation Result
 
-### What Codex Built
-[Concise summary — from the diff, cross-checked against ${IMPL_SUMMARY}]
+### Where things stand
+[2-4 sentences, no jargon: what codex actually built (what it does, not the type
+names), whether anything visibly changed yet, and that the important parts work
+/ pass tests. Written for someone who has not seen the code.]
 
-### Verdict
-[Looks good / Mostly good, minor issues / Needs changes]
+### What's left
+[One numbered item per confirmed issue. For EACH, with no jargon:
+- A title naming the real problem (not the reviewer's title).
+- 1-2 sentences: what the actual behavior or risk is, what breaks or could break.
+- How much it matters: does it happen in normal use, is it a rare fallback, or
+  is the code already correct and this only guards against a future edit?
+- Cost to fix: cheap vs. involved, and any hard limit (e.g. "can only be written
+  correctly, not proven here, because it needs a real screen").
+If there are no issues, say so in one sentence and skip the table below.]
 
-### Confirmed Issues (if any)
-| # | Severity | File | Problem | Caught by |
+### Reference (file/line for the fix pass)
+| # | Severity | File:line | Problem (technical) | Caught by |
 
-### Reviewer Disagreements (if any)
-[Where codex's review and yours diverge — give your honest take, don't manufacture consensus]
+### Reviewer disagreements (if any)
+[Where codex's review and yours diverge — give your take without jargon, don't
+manufacture consensus.]
 ```
 
-3. If there are blocker or minor issues, offer:
+The numbered items in **What's left** and the rows in **Reference** must use the
+same numbers so the user can cross-walk if they want detail.
+
+3. If there are blocker or minor issues, offer the choices the same way — each
+option one sentence, no jargon, with a recommendation and the reason for it:
 
 ```
-What next?
+Your choice:
 
-1. **Codex fix pass** — I'll send the confirmed issues back to a codex session
-2. **Accept as-is** — leave the remaining issues
-3. **Discuss** — talk through specific findings first
+1. One more codex fix pass — [name what gets fixed and the cost].
+   ([Recommended / not] because [reason].)
+2. Stop here — the parts that matter work; the leftover items become written-down
+   todos for later.
+3. Talk through any item first.
 ```
+
+Do not surface internal bookkeeping (`fix pass 1 of 2 used`) as the headline; if
+the cap is relevant, state it without jargon inside option 1.
 
 **STOP and wait for the user.**
 

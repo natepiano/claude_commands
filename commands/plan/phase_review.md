@@ -2,7 +2,7 @@
 description: After implementing a phase of a multi-phase plan, append a retrospective, run a subagent review of remaining phases, fold the findings back into the plan, and summarize for the user.
 ---
 
-Use this after the agent has just finished implementing a phase of a multi-phase plan that is already in conversation context. The command updates the plan with what was learned, then asks an architect subagent to re-evaluate the remaining phases against that learning, then folds the findings back into the plan and reports a plain-language summary.
+Use this after the agent has just finished implementing a phase of a multi-phase plan that is already in conversation context. The command updates the plan with what was learned, then asks an architect subagent to re-evaluate the remaining phases against that learning, then folds the findings back into the plan and reports a jargon-free summary.
 
 **Delegate-ready plans.** If the plan follows `~/.claude/docs/delegate_plan_format.md` (a `## Delegation Context` section + per-phase `#### Work Order`), this command must keep every remaining phase **dispatch-ready**: learnings are folded *into* the remaining Work Orders (Spec, Files, Acceptance gate, and especially **Constraints from prior phases**), not merely appended as review notes. The test after this command runs: `/plan:delegate <plan> phase <next>` can assemble its prompt with zero codebase research. See `<MaintainWorkOrders/>` in Step 5.
 
@@ -212,7 +212,15 @@ Produce a succinct markdown table:
 
 Style rules for the final update:
 
-- Plain language. Name files, types, phases, and plan sections.
+- Write for someone who has not read the plan or the diff. Name files, types,
+  phases, and plan sections **only when** the name itself is informative;
+  otherwise say what the thing does. Never present a reviewer's label, decision
+  code, test/guard name, or tooling term (`headless`, `bind group`) as if the
+  user already knows it — translate it to its behavior. If you cannot state a row
+  in behavior terms, you do not understand it well enough to summarize it.
+- Never use the word "plain" or any variant (`plain language`, `plain terms`,
+  `in plain English`) anywhere in the output. Write that way without announcing
+  it. Absolute.
 - Terse. One short sentence per table row.
 - Do not echo the whole retrospective; summarize only what was learned and actually applied back to the document.
 - Do not include passed-check filler. If every remaining phase came through clean, say that in `Learned and applied`.

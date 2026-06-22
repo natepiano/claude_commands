@@ -9,7 +9,8 @@
 # Output format (on exit 0):
 #   Line 1: "cached: <timestamp>"
 #   Lines 2-5: status table (lint mend, lint fmt, lint clippy, lint doc)
-#   If passed: Line 5 is git diff status ("clean" or "has changes")
+#   If passed: Line 5 is working-tree status ("clean" or "has changes"),
+#     counting both tracked diff and untracked files (new files are changes too)
 #     If has changes: "=== git diff ===" followed by diff output
 #   If failed: "=== lint mend ===" and/or "=== lint clippy ===" with details
 #
@@ -187,6 +188,12 @@ first_existing_log() {
 
 if [[ "$status" == "passed" ]]; then
     diff_output=$(git -C "$PROJECT_DIR" diff 2>/dev/null)
+    # Untracked files are uncommitted changes too. Render each as an all-additions
+    # diff so the no-op path never skips a brand-new (untracked) file.
+    while IFS= read -r untracked_file; do
+        [[ -n "$untracked_file" ]] || continue
+        diff_output+=$'\n'"$(git -C "$PROJECT_DIR" diff --no-index /dev/null "$untracked_file" 2>/dev/null)"
+    done < <(git -C "$PROJECT_DIR" ls-files --others --exclude-standard 2>/dev/null)
     echo "cached: $display_timestamp"
     echo "lint mend         : passed"
     echo "lint fmt          : passed"

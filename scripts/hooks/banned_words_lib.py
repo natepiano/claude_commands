@@ -488,15 +488,64 @@ def find_violations(text: str) -> list[Violation]:
     return out
 
 
+def _scan_diff(diff_text: str) -> int:
+    """Scan a unified diff on stdin, reporting only ADDED lines at their real
+    file path and new-file line number. Exit 1 if any violation, else 0.
+
+    A new (untracked) file rendered via `git diff --no-index /dev/null <file>`
+    appears as an all-additions hunk, so untracked files are scanned in full;
+    tracked files are scanned on their added lines only. Per-stem `except:`
+    exemptions and `allow-banned:` markers apply per line, same as a file scan.
+    """
+    found = 0
+    path: str | None = None
+    new_line = 0
+    for raw in diff_text.splitlines():
+        if raw.startswith("+++ "):
+            target = raw[4:].strip()
+            # `--- /dev/null` / `+++ /dev/null` marks the absent side; strip the
+            # a/ or b/ prefix git prepends to real paths.
+            if target == "/dev/null":
+                path = None
+            elif target[:2] in ("a/", "b/"):
+                path = target[2:]
+            else:
+                path = target
+            continue
+        if raw.startswith("--- ") or raw.startswith("diff ") or raw.startswith("index "):
+            continue
+        if raw.startswith("@@"):
+            m = re.search(r"\+(\d+)", raw)
+            new_line = int(m.group(1)) if m else 0
+            continue
+        if raw.startswith("+"):
+            for v in find_violations(raw[1:]):
+                label = path or "<unknown>"
+                print(f"{label}:{new_line}: {v.stem}: {v.line}")
+                found += 1
+            new_line += 1
+        elif raw.startswith("-"):
+            # Removed line: present only on the old side, so it does not advance
+            # the new-file counter and is never scanned.
+            continue
+        else:
+            # Context line (leading space) or inter-file blank: advances the
+            # new-file counter without being scanned.
+            new_line += 1
+    return 1 if found else 0
+
+
 def _main() -> int:
     """CLI entry point for ad-hoc scans (e.g. /clippy style review, clean-fix).
 
     Usage:
         python3 banned_words_lib.py --analysis     # print local counter state
+        python3 banned_words_lib.py --diff          # scan a unified diff on stdin
         python3 banned_words_lib.py [path ...]      # scan each file
         python3 banned_words_lib.py                 # scan stdin
 
-    Output: one line per violation as `path:lineno: stem: <line>`.
+    Output: one line per violation as `path:lineno: stem: <line>`. In `--diff`
+    mode `path:lineno` is the real source location of the added line.
     Exit 1 if any violations found, 0 if clean. Errors go to stderr (exit 2).
 
     Safe to call from inside Claude Code: the script path contains
@@ -514,6 +563,9 @@ def _main() -> int:
             return 0
         print(f"No backup found at {COUNTER_BACKUP}", file=sys.stderr)
         return 2
+
+    if paths and paths[0] == "--diff":
+        return _scan_diff(sys.stdin.read())
 
     if paths and paths[0] in ("--analysis", "--counters"):
         rest = [a.lower() for a in paths[1:]]
