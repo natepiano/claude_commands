@@ -94,7 +94,9 @@ Follow them in all code you write.
 ## Verification
 
 [How codex should verify its work before summarizing: build command, test
-command, clippy, etc. — match the project's conventions.]
+command, lint workflow, etc. — match the project's conventions. For Rust repos
+with the local `clippy` skill available, use the full `clippy` skill as the lint
+gate rather than a partial list of Cargo or `lint ...` commands.]
 ```
 
 **Key principles (fallback):**

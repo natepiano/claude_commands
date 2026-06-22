@@ -84,8 +84,13 @@ block — nothing else. The prompt must include:
   3. **Layout** — a short map of only the dirs/files the phases touch.
   4. **Key files** — `path — role` for each file a phase reads or modifies, with
      line refs where the plan already cites them.
-  5. **Build / Test / Lint** — the exact commands this project uses (read
-     `Cargo.toml`/`package.json`/`justfile`/CI config; do not invent).
+  5. **Build / Test / Lint** — the exact commands/workflows this project uses
+     (read `Cargo.toml`/`package.json`/`justfile`/CI config; do not invent).
+     For Rust repos with the local `clippy` skill/workflow available, record the
+     lint gate as the full `clippy` skill, not a hand-expanded subset of
+     `cargo clippy`, `cargo mend`, `cargo doc`, or individual `lint ...`
+     commands. The `clippy` skill owns cache checking, `lint mend`, style review,
+     `lint clippy`, `lint doc`, and `lint fmt`.
   6. **Style** — for Rust, the `load-rust-style.sh` line with the project root;
      omit for non-Rust.
   7. **Invariants** — project-wide rules every phase must preserve (from the plan

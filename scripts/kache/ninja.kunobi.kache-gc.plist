@@ -1,0 +1,29 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!-- Periodic `kache gc` to enforce local_max_size. The kache daemon's own
+         6h periodic GC only runs while the daemon stays alive, but the daemon
+         exits on its idle timeout (clean exit, not restarted by KeepAlive),
+         so in local-only use the cap is never enforced and the store grows
+         past local_max_size. This job runs gc independently of the daemon:
+         it routes through the daemon when alive, falls back to local
+         eviction when offline. gc is ~1s and only LRU-evicts above the 90%
+         target threshold. -->
+    <key>Label</key>
+    <string>ninja.kunobi.kache-gc</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Users/natemccoy/.cargo/bin/kache</string>
+        <string>gc</string>
+    </array>
+    <key>StartInterval</key>
+    <integer>3600</integer>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>StandardOutPath</key>
+    <string>/Users/natemccoy/Library/Logs/kache/gc.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/natemccoy/Library/Logs/kache/gc.log</string>
+</dict>
+</plist>

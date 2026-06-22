@@ -32,7 +32,9 @@ to rediscover after a context compaction lives in the doc.
 - **Key files:** <path — role> for each file a phase reads or modifies
 - **Build:** <exact build command>
 - **Test:** <exact test command>
-- **Lint:** <clippy / type-check / fmt command, if any>
+- **Lint:** <lint command/workflow, if any; for Rust repos with the local
+  `clippy` skill available, use the full `clippy` skill rather than a partial
+  list of Cargo or `lint ...` commands>
 - **Style:** <the style-loader line, e.g. `zsh ~/.claude/scripts/rust_style/load-rust-style.sh --project-root <dir>`; omit for non-Rust>
 - **Invariants:** <project-wide rules every phase must preserve; omit if none>
 
