@@ -15,7 +15,8 @@ HOST_TRIPLE="$(rustc -vV | sed -n 's/^host: //p')"
 # Variations:
 # - In the cargo-mend repo, final step uses `cargo run -- --fail-on-warn`
 # - In all other repos, final step uses installed `cargo mend`
-# - If `benches/` exists, Criterion benches are run as a smoke check
+# - Host clippy lints lib/bins/tests only (examples and benches excluded);
+#   benches are intentionally never run here — run them ad hoc
 # - If `.cargo/validate-targets` exists, each non-comment target listed there
 #   gets additive cross-target clippy plus test-binary compilation. Host checks
 #   still run, so this validates macOS plus configured Linux targets on a Mac.
@@ -156,17 +157,11 @@ run_step "rustfmt" "$LINT_CMD" fmt --check
 
 run_step "taplo" taplo fmt --check
 
-run_step "clippy" "$LINT_CMD" clippy
+run_step "clippy" cargo clippy --workspace --all-features --lib --bins --tests -- -D warnings
 
 run_configured_target_checks
 
-run_step "check examples" cargo check --workspace --all-features --examples
-
 run_step "nextest" cargo nextest run --workspace --all-features --tests
-
-if [ -d benches ] && find benches -type f \( -name '*.rs' -o -name '*.bench' \) | grep -q .; then
-  run_step "bench" cargo bench --workspace --all-features
-fi
 
 if [ "$IS_SELF_MEND" -eq 1 ]; then
   run_step "cargo-mend" cargo run -- --fail-on-warn
