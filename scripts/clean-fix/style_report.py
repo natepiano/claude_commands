@@ -6,13 +6,71 @@ from __future__ import annotations
 import argparse
 import json
 from collections import defaultdict
+from collections.abc import Iterator
 from datetime import datetime
 from datetime import timedelta
 from datetime import timezone
-from pathlib import Path
-from typing import Any
+from typing import TypedDict
+from typing import cast
 
-from style_history import HISTORY_DIR, build_units, list_style_files, normalize_guideline_id, parse_frontmatter, resolve_project_root
+from style_history import HISTORY_DIR, HistoryRow, Outcome, build_units, list_style_files, normalize_guideline_id, parse_frontmatter, resolve_project_root
+
+STATUS_FIELDS = ("fixed", "partial", "skipped", "fix_failed", "no_findings")
+BLOCKING_STATUSES = frozenset({"partial", "skipped", "fix_failed"})
+
+
+class StyleSummaryRow(TypedDict):
+    guideline_id: str
+    fixed: int
+    partial: int
+    skipped: int
+    fix_failed: int
+    no_findings: int
+    last_seen: str
+
+
+class CoverageRow(TypedDict):
+    project: str
+    guideline_units: int
+    min_review_count: int
+    max_review_count: int
+    avg_review_count: float
+
+
+class BlockedRow(TypedDict):
+    project: str
+    guideline_id: str
+    review_count: int
+    latest_status: str
+    last_seen: str
+    streak: int
+    latest_reason: str
+
+
+class UnitView(TypedDict):
+    guideline_id: str
+    non_negotiable: bool
+    status: str
+    finding_source: str | None
+    summary: str | None
+    reason: str | None
+
+
+class RunView(TypedDict):
+    project: str
+    start_time: str | None
+    end_time: str | None
+    selected_unit_count: int
+    reviewed_guideline_count: int
+    findings_produced: int
+    status_counts: dict[str, int]
+    units: list[UnitView]
+
+
+class ReportArgs(argparse.Namespace):
+    since: str | None = None
+    project: str | None = None
+    latest_run: bool = False
 
 
 def parse_since(value: str) -> timedelta:
@@ -25,19 +83,25 @@ def parse_since(value: str) -> timedelta:
     return timedelta(days=amount * 30)
 
 
-def load_project_history(project: str) -> list[dict[str, Any]]:
+def parse_history_row(line: str) -> HistoryRow | None:
+    try:
+        return cast("HistoryRow", json.loads(line))
+    except json.JSONDecodeError:
+        return None
+
+
+def load_project_history(project: str) -> list[HistoryRow]:
     path = HISTORY_DIR / f"{project}.jsonl"
     if not path.exists():
         return []
-    rows: list[dict[str, Any]] = []
+    rows: list[HistoryRow] = []
     for line in path.read_text().splitlines():
-        line = line.strip()
-        if not line:
+        stripped = line.strip()
+        if not stripped:
             continue
-        try:
-            rows.append(json.loads(line))
-        except json.JSONDecodeError:
-            continue
+        row = parse_history_row(stripped)
+        if row is not None:
+            rows.append(row)
     return rows
 
 
@@ -47,11 +111,24 @@ def list_projects() -> list[str]:
     return sorted(path.stem for path in HISTORY_DIR.glob("*.jsonl") if path.is_file())
 
 
-def guideline_metadata(project: str) -> dict[str, dict[str, Any]]:
+def row_time(row: HistoryRow) -> str:
+    end = row.get("end_time") or row.get("start_time")
+    return end if isinstance(end, str) else ""
+
+
+def iter_outcomes(row: HistoryRow) -> Iterator[tuple[str, Outcome]]:
+    for unit in row.get("reviewed_units") or []:
+        guideline_id = unit.get("guideline_id")
+        outcome = unit.get("outcome")
+        if isinstance(guideline_id, str) and isinstance(outcome, dict):
+            yield guideline_id, outcome
+
+
+def guideline_metadata(project: str) -> dict[str, bool]:
     project_root = resolve_project_root(project)
     if project_root is None:
         return {}
-    metadata: dict[str, dict[str, Any]] = {}
+    metadata: dict[str, bool] = {}
     try:
         style_files = list_style_files(project_root)
     except Exception:
@@ -59,23 +136,20 @@ def guideline_metadata(project: str) -> dict[str, dict[str, Any]]:
     for style_file in style_files:
         guideline_id = normalize_guideline_id(str(style_file), project_root)
         frontmatter = parse_frontmatter(style_file)
-        tags = frontmatter["tags"] if isinstance(frontmatter["tags"], list) else []
-        metadata[guideline_id] = {
-            "non_negotiable": "non-negotiable" in tags,
-        }
+        metadata[guideline_id] = "non-negotiable" in frontmatter["tags"]
     return metadata
 
 
-def iter_rows(since: timedelta | None, project_filter: str | None) -> list[tuple[str, dict[str, Any]]]:
+def iter_rows(since: timedelta | None, project_filter: str | None) -> list[tuple[str, HistoryRow]]:
     now = datetime.now(tz=timezone.utc)
-    rows: list[tuple[str, dict[str, Any]]] = []
+    rows: list[tuple[str, HistoryRow]] = []
     for project in list_projects():
         if project_filter and project != project_filter:
             continue
         for row in load_project_history(project):
             if since:
-                end_time = row.get("end_time") or row.get("start_time")
-                if not isinstance(end_time, str):
+                end_time = row_time(row)
+                if not end_time:
                     continue
                 ts = datetime.fromisoformat(end_time.replace("Z", "+00:00"))
                 if now - ts > since:
@@ -84,53 +158,46 @@ def iter_rows(since: timedelta | None, project_filter: str | None) -> list[tuple
     return rows
 
 
-def build_style_summary(rows: list[tuple[str, dict[str, Any]]]) -> list[dict[str, Any]]:
-    summary: dict[str, dict[str, Any]] = {}
-    for project, row in rows:
-        end_time = row.get("end_time") or row.get("start_time")
-        for reviewed in row.get("reviewed_units", []):
-            if not isinstance(reviewed, dict):
-                continue
-            guideline_id = reviewed.get("guideline_id")
-            outcome = reviewed.get("outcome", {})
-            if not isinstance(guideline_id, str) or not isinstance(outcome, dict):
-                continue
-            payload = summary.setdefault(
-                guideline_id,
-                {
-                    "guideline_id": guideline_id,
-                    "projects": set(),
-                    "fixed": 0,
-                    "partial": 0,
-                    "skipped": 0,
-                    "fix_failed": 0,
-                    "no_findings": 0,
-                    "last_seen": end_time,
-                },
-            )
-            payload["projects"].add(project)
-            if isinstance(end_time, str):
-                payload["last_seen"] = max(str(payload["last_seen"]), end_time)
+def build_style_summary(rows: list[tuple[str, HistoryRow]]) -> list[StyleSummaryRow]:
+    counts: dict[str, dict[str, int]] = {}
+    last_seen: dict[str, str] = {}
+    for _project, row in rows:
+        end_time = row_time(row)
+        for guideline_id, outcome in iter_outcomes(row):
+            tally = counts.setdefault(guideline_id, {field: 0 for field in STATUS_FIELDS})
+            if end_time:
+                last_seen[guideline_id] = max(last_seen.get(guideline_id, ""), end_time)
             status = outcome.get("status")
-            if isinstance(status, str) and status in payload:
-                payload[status] += 1
-    items = list(summary.values())
+            if isinstance(status, str) and status in tally:
+                tally[status] += 1
+    items: list[StyleSummaryRow] = [
+        {
+            "guideline_id": guideline_id,
+            "fixed": tally["fixed"],
+            "partial": tally["partial"],
+            "skipped": tally["skipped"],
+            "fix_failed": tally["fix_failed"],
+            "no_findings": tally["no_findings"],
+            "last_seen": last_seen.get(guideline_id, ""),
+        }
+        for guideline_id, tally in counts.items()
+    ]
     items.sort(key=lambda item: (item["fixed"] + item["partial"] + item["skipped"] + item["fix_failed"], item["guideline_id"]), reverse=True)
     return items
 
 
-def build_coverage_view(project_filter: str | None) -> list[dict[str, Any]]:
-    rows: list[dict[str, Any]] = []
+def build_coverage_view(project_filter: str | None) -> list[CoverageRow]:
+    rows: list[CoverageRow] = []
     for project in list_projects():
         if project_filter and project != project_filter:
             continue
         project_root = resolve_project_root(project)
         if project_root is None:
             continue
-        counts: dict[str, int] = defaultdict(int)
+        counts: defaultdict[str, int] = defaultdict(int)
         for row in load_project_history(project):
-            for reviewed in row.get("reviewed_units", []):
-                guideline_id = reviewed.get("guideline_id")
+            for unit in row.get("reviewed_units") or []:
+                guideline_id = unit.get("guideline_id")
                 if isinstance(guideline_id, str):
                     counts[guideline_id] += 1
         try:
@@ -154,73 +221,67 @@ def build_coverage_view(project_filter: str | None) -> list[dict[str, Any]]:
     return rows
 
 
-def build_blocked_view(rows: list[tuple[str, dict[str, Any]]]) -> list[dict[str, Any]]:
-    blocked: dict[tuple[str, str], dict[str, Any]] = {}
-    cumulative: dict[str, dict[str, int]] = defaultdict(lambda: defaultdict(int))
+def build_blocked_view(rows: list[tuple[str, HistoryRow]]) -> list[BlockedRow]:
+    # An item counts as blocked only if its MOST RECENT review still ended in a
+    # blocking status. A guideline that failed once and was later fixed (or
+    # produced no_findings) is resolved, not blocked — counting lifetime
+    # partial/skipped/fix_failed totals made stale April failures read as a
+    # current cluster. We walk each (project, guideline) timeline, take the
+    # latest outcome, and only surface it when that latest outcome blocks. The
+    # trailing run of consecutive blocking outcomes (streak) and last_seen date
+    # distinguish "failing right now" from "failed weeks ago, never retried."
+    timelines: dict[tuple[str, str], list[tuple[str, str | None, str | None]]] = defaultdict(list)
     for project, row in rows:
-        for reviewed in row.get("reviewed_units", []):
-            guideline_id = reviewed.get("guideline_id")
-            if isinstance(guideline_id, str):
-                cumulative[project][guideline_id] += 1
-            outcome = reviewed.get("outcome", {})
-            if not isinstance(guideline_id, str) or not isinstance(outcome, dict):
-                continue
-            status = outcome.get("status")
-            if status not in {"partial", "skipped", "fix_failed"}:
-                continue
-            payload = blocked.setdefault(
-                (project, guideline_id),
-                {
-                    "project": project,
-                    "guideline_id": guideline_id,
-                    "review_count": 0,
-                    "partial": 0,
-                    "skipped": 0,
-                    "fix_failed": 0,
-                    "latest_reason": "",
-                },
-            )
-            payload["review_count"] = cumulative[project][guideline_id]
-            payload[status] += 1
-            reason = outcome.get("reason")
-            if isinstance(reason, str) and reason.strip():
-                payload["latest_reason"] = reason.strip()
-    items = list(blocked.values())
-    items.sort(key=lambda item: (item["partial"] + item["skipped"] + item["fix_failed"], item["review_count"], item["guideline_id"]), reverse=True)
+        end_time = row_time(row)
+        for guideline_id, outcome in iter_outcomes(row):
+            timelines[(project, guideline_id)].append((end_time, outcome.get("status"), outcome.get("reason")))
+
+    items: list[BlockedRow] = []
+    for (project, guideline_id), events in timelines.items():
+        events.sort(key=lambda event: event[0])
+        latest_time, latest_status, latest_reason = events[-1]
+        if latest_status not in BLOCKING_STATUSES:
+            continue
+        streak = 0
+        for _time, status, _reason in reversed(events):
+            if status in BLOCKING_STATUSES:
+                streak += 1
+            else:
+                break
+        reason = latest_reason.strip() if isinstance(latest_reason, str) else ""
+        items.append({
+            "project": project,
+            "guideline_id": guideline_id,
+            "review_count": len(events),
+            "latest_status": latest_status or "",
+            "last_seen": latest_time,
+            "streak": streak,
+            "latest_reason": reason,
+        })
+    items.sort(key=lambda item: (item["last_seen"], item["streak"], item["guideline_id"]), reverse=True)
     return items
 
 
-def build_run_views(rows: list[tuple[str, dict[str, Any]]]) -> list[dict[str, Any]]:
-    grouped_rows: dict[str, list[dict[str, Any]]] = defaultdict(list)
+def build_run_views(rows: list[tuple[str, HistoryRow]]) -> list[RunView]:
+    grouped_rows: defaultdict[str, list[HistoryRow]] = defaultdict(list)
     for project, row in rows:
         grouped_rows[project].append(row)
 
-    run_views: list[dict[str, Any]] = []
+    run_views: list[RunView] = []
     for project, project_rows in grouped_rows.items():
         metadata = guideline_metadata(project)
-        for row in sorted(project_rows, key=lambda item: item.get("end_time") or item.get("start_time") or "", reverse=True):
-            reviewed_units = row.get("reviewed_units", [])
-            if not isinstance(reviewed_units, list):
-                continue
-            detailed_units: list[dict[str, Any]] = []
-            status_counts: dict[str, int] = defaultdict(int)
+        for row in sorted(project_rows, key=row_time, reverse=True):
+            detailed_units: list[UnitView] = []
+            status_counts: defaultdict[str, int] = defaultdict(int)
             findings_produced = 0
-            for reviewed in reviewed_units:
-                if not isinstance(reviewed, dict):
-                    continue
-                guideline_id = reviewed.get("guideline_id")
-                outcome = reviewed.get("outcome", {})
-                if not isinstance(guideline_id, str) or not isinstance(outcome, dict):
-                    continue
-                status = str(outcome.get("status", "unknown"))
-                meta = metadata.get(guideline_id, {})
-                non_negotiable = bool(meta.get("non_negotiable"))
+            for guideline_id, outcome in iter_outcomes(row):
+                status = outcome.get("status") or "unknown"
                 status_counts[status] += 1
                 if status != "no_findings":
                     findings_produced += 1
                 detailed_units.append({
                     "guideline_id": guideline_id,
-                    "non_negotiable": non_negotiable,
+                    "non_negotiable": metadata.get(guideline_id, False),
                     "status": status,
                     "finding_source": outcome.get("finding_source"),
                     "summary": outcome.get("summary"),
@@ -240,43 +301,37 @@ def build_run_views(rows: list[tuple[str, dict[str, Any]]]) -> list[dict[str, An
     return run_views
 
 
-def print_run_views(run_views: list[dict[str, Any]]) -> None:
+def print_run_views(run_views: list[RunView]) -> None:
     for run in run_views:
-        start_time = run.get("start_time") or "unknown"
-        end_time = run.get("end_time") or "unknown"
+        start_time = run["start_time"] or "unknown"
+        end_time = run["end_time"] or "unknown"
         print(f"{run['project']} run {start_time} -> {end_time}")
-        print(
-            "  "
-            f"selected_units={run['selected_unit_count']} "
-            f"reviewed_guidelines={run['reviewed_guideline_count']} "
-            f"findings={run['findings_produced']}"
-        )
+        print(f"  selected_units={run['selected_unit_count']} reviewed_guidelines={run['reviewed_guideline_count']} findings={run['findings_produced']}")
         counts = run["status_counts"]
-        ordered_statuses = ["fixed", "partial", "skipped", "fix_failed", "no_findings"]
-        rendered_counts = " ".join(f"{status}={counts.get(status, 0)}" for status in ordered_statuses if counts.get(status, 0))
+        rendered_counts = " ".join(f"{status}={counts.get(status, 0)}" for status in STATUS_FIELDS if counts.get(status, 0))
         if rendered_counts:
             print(f"  outcomes: {rendered_counts}")
         for unit in run["units"]:
             extras: list[str] = []
-            if unit.get("non_negotiable"):
+            if unit["non_negotiable"]:
                 extras.append("non_negotiable")
-            if unit.get("finding_source"):
+            if unit["finding_source"]:
                 extras.append(f"source={unit['finding_source']}")
             extra_text = f" ({', '.join(extras)})" if extras else ""
             print(f"  - {unit['guideline_id']}: {unit['status']}{extra_text}")
-            if unit.get("summary"):
+            if unit["summary"]:
                 print(f"    summary: {unit['summary']}")
-            if unit.get("reason"):
+            if unit["reason"]:
                 print(f"    reason: {unit['reason']}")
         print()
 
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--since")
-    parser.add_argument("--project")
-    parser.add_argument("--latest-run", action="store_true")
-    args = parser.parse_args()
+    _ = parser.add_argument("--since")
+    _ = parser.add_argument("--project")
+    _ = parser.add_argument("--latest-run", action="store_true")
+    args = parser.parse_args(namespace=ReportArgs())
 
     since = parse_since(args.since) if args.since else None
     rows = iter_rows(since, args.project)
@@ -293,16 +348,18 @@ def main() -> None:
         return
 
     print("Style History:")
-    for row in style_rows:
-        print(f"{row['guideline_id']}: fixed={row['fixed']} partial={row['partial']} skipped={row['skipped']} fix_failed={row['fix_failed']} no_findings={row['no_findings']}")
+    for style_row in style_rows:
+        print(f"{style_row['guideline_id']}: fixed={style_row['fixed']} partial={style_row['partial']} skipped={style_row['skipped']} fix_failed={style_row['fix_failed']} no_findings={style_row['no_findings']}")
     if coverage_rows:
         print("\nReview Coverage:")
-        for row in coverage_rows:
-            print(f"{row['project']}: units={row['guideline_units']} min={row['min_review_count']} max={row['max_review_count']} avg={row['avg_review_count']}")
+        for coverage_row in coverage_rows:
+            print(f"{coverage_row['project']}: units={coverage_row['guideline_units']} min={coverage_row['min_review_count']} max={coverage_row['max_review_count']} avg={coverage_row['avg_review_count']}")
     if blocked_rows:
-        print("\nBlocked Items:")
-        for row in blocked_rows:
-            print(f"{row['project']} {row['guideline_id']}: partial={row['partial']} skipped={row['skipped']} fix_failed={row['fix_failed']}")
+        print("\nBlocked Items (latest review still blocking):")
+        for blocked_row in blocked_rows:
+            last_seen = (blocked_row["last_seen"] or "unknown")[:10]
+            reason = f" reason={blocked_row['latest_reason']}" if blocked_row["latest_reason"] else ""
+            print(f"{blocked_row['project']} {blocked_row['guideline_id']}: {blocked_row['latest_status']} @ {last_seen} streak={blocked_row['streak']} reviews={blocked_row['review_count']}{reason}")
     if args.project and run_views:
         print("\nLatest Run:")
         print_run_views(run_views[:1])
