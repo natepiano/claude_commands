@@ -458,6 +458,26 @@ def workspace_members() -> dict[str, WorkspaceMember]:
     return members
 
 
+PROJECT_MARKER = ".clean-fix-project"
+
+
+def project_key(project_root: Path) -> str:
+    """Canonical history/identity key for a project root.
+
+    A `_style_fix` worktree's directory name may encode its source checkout
+    (e.g. `bevy_lagrange_flycam_style_fix`) so the user can see at a glance
+    where it branched from. The identity key is decoupled from that name via a
+    marker file written at worktree creation. Fall back to the legacy dir-suffix
+    strip when no marker is present — covers non-worktree roots (a source
+    checkout's dir name already equals its key) and any pre-marker worktree.
+    """
+    try:
+        key = (project_root / PROJECT_MARKER).read_text().strip()
+    except OSError:
+        key = ""
+    return key or project_root.name.removesuffix("_style_fix")
+
+
 def resolve_project_root(project_name: str) -> Path | None:
     members = workspace_members()
     if project_name in members:
@@ -670,7 +690,7 @@ def history_summary(pending: PendingState) -> dict[str, object]:
 
 
 def review_counts(project_root: Path) -> dict[str, int]:
-    project = project_root.name.removesuffix("_style_fix")
+    project = project_key(project_root)
     counts: dict[str, int] = defaultdict(int)
     for row in load_history(project):
         for reviewed in row.get("reviewed_units", []):
@@ -856,7 +876,7 @@ def due_units_payload(project_root: Path) -> dict[str, object]:
     `due_unit_count == 0` is the launch gate: the clean-fix skips spawning an
     eval agent for the project entirely.
     """
-    project = project_root.name.removesuffix("_style_fix")
+    project = project_key(project_root)
     reviewable = [unit for unit in build_units(project_root) if unit.budget_cost > 0]
     current_fingerprint = project_fingerprint(project_root)
     review_index = last_review_index(project)
@@ -900,7 +920,7 @@ def non_negotiable_guideline_ids(project_root: Path) -> list[str]:
 def start_run(project_root: Path) -> None:
     HISTORY_DIR.mkdir(parents=True, exist_ok=True)
     PENDING_DIR.mkdir(parents=True, exist_ok=True)
-    project = project_root.name.removesuffix("_style_fix")
+    project = project_key(project_root)
     cap = max_new_findings()
     existing = load_pending(project)
     if (
@@ -969,7 +989,7 @@ def set_phase(project: str, phase: str) -> None:
 
 
 def save_evaluation(project_root: Path, eval_path: Path) -> None:
-    project = project_root.name.removesuffix("_style_fix")
+    project = project_key(project_root)
     pending = load_pending(project)
     if not pending:
         raise SystemExit(f"No pending run for {project}. Start a run first.")
@@ -1064,7 +1084,7 @@ def evaluation_status_payload(project: str) -> dict[str, object]:
 
 
 def next_unit(project_root: Path) -> dict[str, object]:
-    project = project_root.name.removesuffix("_style_fix")
+    project = project_key(project_root)
     pending = load_pending(project)
     if not pending:
         raise SystemExit(f"No pending run for {project}. Start a run first.")
@@ -1212,7 +1232,7 @@ def next_unit(project_root: Path) -> dict[str, object]:
 
 
 def record_unit(project_root: Path, results_path: Path, eval_path: Path) -> None:
-    project = project_root.name.removesuffix("_style_fix")
+    project = project_key(project_root)
     pending = load_pending(project)
     if not pending:
         raise SystemExit(f"No pending run for {project}. Start a run first.")
@@ -1684,7 +1704,7 @@ def recover_evaluation(project: str, project_root: Path, output: Path) -> None:
 
 
 def finalize_fix(project_root: Path, eval_path: Path) -> None:
-    project = project_root.name.removesuffix("_style_fix")
+    project = project_key(project_root)
     pending = load_pending(project)
     if not pending:
         return

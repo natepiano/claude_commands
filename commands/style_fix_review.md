@@ -226,8 +226,15 @@ Run this from anywhere inside the style-fix worktree to derive the project name,
 
 ```bash
 worktree_dir="$(git rev-parse --show-toplevel)"
-project="$(basename "$worktree_dir")"
-project="${project%_style_fix}"
+# Identity/history key comes from the .clean-fix-project marker — the dir name
+# may encode the source checkout (e.g. bevy_lagrange_flycam_style_fix) and is
+# NOT the key. Fall back to the basename strip for legacy worktrees.
+if [[ -f "$worktree_dir/.clean-fix-project" ]]; then
+  project="$(tr -d '[:space:]' < "$worktree_dir/.clean-fix-project")"
+else
+  project="$(basename "$worktree_dir")"
+  project="${project%_style_fix}"
+fi
 status_json="$(python3 ~/.claude/scripts/clean-fix/style_history.py evaluation-status --project "$project")"
 eval_path="/private/tmp/claude/style_fix_review_${project}_evaluation.md"
 python3 ~/.claude/scripts/clean-fix/style_history.py export-evaluation \

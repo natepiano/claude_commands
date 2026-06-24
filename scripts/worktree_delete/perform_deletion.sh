@@ -34,6 +34,21 @@ cleanup_residual_directory() {
     fi
 }
 
+# Capture the clean-fix identity BEFORE removing the worktree. A *_style_fix
+# worktree's dir name may encode its source checkout (e.g.
+# bevy_lagrange_flycam_style_fix), so the history key comes from the
+# .clean-fix-project marker, not the basename — and the marker is gone once the
+# worktree is removed below. Fall back to the basename strip for legacy
+# worktrees created before the marker existed.
+WORKTREE_NAME="$(basename "$WORKTREE_PATH")"
+STYLE_FIX_PROJECT=""
+if [[ "$WORKTREE_NAME" == *_style_fix ]]; then
+    if [[ -f "$WORKTREE_PATH/.clean-fix-project" ]]; then
+        STYLE_FIX_PROJECT="$(tr -d '[:space:]' < "$WORKTREE_PATH/.clean-fix-project")"
+    fi
+    [[ -z "$STYLE_FIX_PROJECT" ]] && STYLE_FIX_PROJECT="${WORKTREE_NAME%_style_fix}"
+fi
+
 echo "Removing worktree: $WORKTREE_PATH"
 if ! git worktree remove "$WORKTREE_PATH" 2>/dev/null; then
     echo "Standard removal failed, forcing..."
@@ -62,9 +77,9 @@ echo "Branch deleted."
 # fixed_findings state. The history row is already recorded by finalize-fix;
 # the pending file is the only leftover, and while it exists every clean-fix
 # run skips the project. Remove it here so the cycle can restart.
-WORKTREE_NAME="$(basename "$WORKTREE_PATH")"
-if [[ "$WORKTREE_NAME" == *_style_fix ]]; then
-    PROJECT="${WORKTREE_NAME%_style_fix}"
+# PROJECT (identity/history key) was read from the marker before removal above.
+if [[ -n "$STYLE_FIX_PROJECT" ]]; then
+    PROJECT="$STYLE_FIX_PROJECT"
     HISTORY_HELPER="$HOME/.claude/scripts/clean-fix/style_history.py"
     if [[ -f "$HISTORY_HELPER" ]]; then
         echo ""

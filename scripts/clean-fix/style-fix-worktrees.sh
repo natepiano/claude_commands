@@ -244,7 +244,6 @@ for entry in ${projects[@]+"${projects[@]}"}; do
         name="$pkg"
         repo_dir="${RUST_DIR}/${checkout%%/*}"
         work_dir="${RUST_DIR}/${checkout}"
-        worktree_dir="${RUST_DIR}/${name}_style_fix"
         unused=""
         branch_name="refactor/style/${name}"
     else
@@ -254,9 +253,18 @@ for entry in ${projects[@]+"${projects[@]}"}; do
         name="$entry"
         repo_dir="${RUST_DIR}/${checkout}"
         work_dir="$repo_dir"
-        worktree_dir="${RUST_DIR}/${name}_style_fix"
         unused=""
         branch_name="refactor/style"
+    fi
+    # The worktree dir name encodes the source checkout when an [active_checkout]
+    # redirect is in play (e.g. bevy_lagrange_flycam_style_fix), so the user can
+    # see at a glance which checkout it branched from. Identity/history stays in
+    # $name (and the .clean-fix-project marker), never the dir name. Not
+    # redirected (checkout == entry) -> the identity name, unchanged.
+    if [[ "$checkout" != "$entry" ]]; then
+        worktree_dir="${RUST_DIR}/${checkout%%/*}_style_fix"
+    else
+        worktree_dir="${RUST_DIR}/${name}_style_fix"
     fi
     eval_file="$LOG_DIR/style_fix_${name}_evaluation.md"
 
@@ -585,6 +593,22 @@ create_and_fix() {
         return 1
     fi
     echo "[diag $proj] after git worktree add"
+
+    # Identity marker: decouples the history key from the (possibly
+    # checkout-encoded) dir name. style_history.py, worktree_delete, and
+    # style_fix_review read this instead of stripping _style_fix from the
+    # basename. Keep it out of `git status` via the repo's shared info/exclude.
+    printf '%s\n' "$proj" > "$worktree_dir/.clean-fix-project"
+    local git_common
+    git_common="$(git -C "$repo_dir" rev-parse --git-common-dir 2>/dev/null)"
+    if [[ -n "$git_common" ]]; then
+        [[ "$git_common" != /* ]] && git_common="$repo_dir/$git_common"
+        if ! grep -qxF ".clean-fix-project" "$git_common/info/exclude" 2>/dev/null; then
+            mkdir -p "$git_common/info"
+            printf '%s\n' ".clean-fix-project" >> "$git_common/info/exclude"
+        fi
+    fi
+    echo "[diag $proj] after identity marker write"
 
     # Apply canonical settings.local.json so manual review has permissions
     mkdir -p "$worktree_dir/.claude"
