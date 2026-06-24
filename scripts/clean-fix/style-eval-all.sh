@@ -39,7 +39,7 @@ mkdir -p "$LOG_DIR"
 mkdir -p "$FAILURE_LOG_DIR"
 
 # Parse conf file for the [projects] allowlist and style_eval settings.
-projects=()    # opt-in eval projects: <dir> or <dir>/<subpath>
+project_entries=()  # opt-in eval projects (conf input): <dir> or <dir>/<subpath>
 cf_ac_keys=()  # [active_checkout] LHS: a [projects] entry being redirected
 cf_ac_vals=()  # [active_checkout] RHS: the checkout path to evaluate instead
 MAX_NEW_FINDINGS=""
@@ -64,7 +64,7 @@ if [[ -f "$CONF_FILE" ]]; then
             continue
         fi
         case "$current_section" in
-            projects) projects+=("$stripped") ;;
+            projects) project_entries+=("$stripped") ;;
             active_checkout)
                 cf_ac_keys+=("$(cf_trim "${stripped%%=*}")")
                 cf_ac_vals+=("$(cf_trim "${stripped#*=}")")
@@ -450,7 +450,7 @@ project_worktree_evals=()
 # checkout, which an [active_checkout] redirect may point at a worktree. <dir>
 # may be a primary repo or a worktree checkout — the eval reads source and never
 # touches git, so the two are indistinguishable here.
-for entry in ${projects[@]+"${projects[@]}"}; do
+for entry in ${project_entries[@]+"${project_entries[@]}"}; do
     checkout="$(cf_resolve_checkout "$entry")"
     if [[ "$entry" == */* ]]; then
         name="${entry##*/}"
