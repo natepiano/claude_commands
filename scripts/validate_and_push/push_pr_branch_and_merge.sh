@@ -4,6 +4,10 @@ set -euo pipefail
 # Move unpushed default-branch commits onto a PR branch, wait for checks, merge,
 # and restore the local default branch.
 
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+# shellcheck source=ci_watch_lib.sh
+source "${SCRIPT_DIR}/ci_watch_lib.sh"
+
 BRANCH_NAME="${1:?Usage: push_pr_branch_and_merge.sh <branch-name>}"
 
 DEFAULT_BRANCH="$(gh repo view --json defaultBranchRef -q .defaultBranchRef.name)"
@@ -65,7 +69,7 @@ if [[ "$CHECK_OUTPUT" == *"no checks reported"* ]]; then
   exit 1
 fi
 
-if ! gh pr checks "$PR_NUMBER" --watch; then
+if ! watch_pr_checks_until_settled "$PR_NUMBER"; then
   echo "ERROR: CI failed for PR #${PR_NUMBER}. Leaving ${BRANCH_NAME} checked out for iteration." >&2
   exit 1
 fi

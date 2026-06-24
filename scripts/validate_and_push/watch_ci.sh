@@ -7,6 +7,10 @@ set -euo pipefail
 # Designed to be launched via `run_in_background` so it doesn't block
 # the conversation. The background task notification reports completion.
 
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+# shellcheck source=ci_watch_lib.sh
+source "${SCRIPT_DIR}/ci_watch_lib.sh"
+
 BRANCH="${1:?Usage: watch_ci.sh <branch> <sha>}"
 SHORT_SHA="${2:?Usage: watch_ci.sh <branch> <sha>}"
 
@@ -31,7 +35,7 @@ if [ -z "$RUN_ID" ]; then
 fi
 
 echo "Found CI run $RUN_ID for commit $SHA"
-gh run watch "$RUN_ID"
+watch_run_until_settled "$RUN_ID"
 
 # Nudge cargo-port's filesystem watcher (notify-based, no polling) to re-fetch
 # CI status: updating .git/FETCH_HEAD + refs/remotes/origin/<branch> triggers
