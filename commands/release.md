@@ -74,6 +74,16 @@ install_verify_script = ".claude/scripts/release/install_verify.sh"
 # Incompatible with [[publish_phases]]. Ignored in single-package mode.
 workspace_publish = true
 
+# Pin path-only workspace deps to a published crates.io version during publish.
+# cargo publish rejects path-only deps (no version requirement). Each entry's
+# `^<dep> = ...` line in root Cargo.toml is rewritten to `<dep> = "<version>"`
+# (path dropped) and committed on the fire-and-forget release branch just
+# before publishing; main is never touched, so it keeps the path dep. Bump
+# `version` when the dependency gets a newer published release.
+[[publish_path_pins]]
+dep = "dep_name"
+version = "0.1.0"
+
 # Ordered publish phases (workspace dependency chains only)
 [[publish_phases]]
 name = "Display name"
@@ -104,6 +114,7 @@ All scriptable steps use shell scripts. The agent orchestrates script execution 
 - `pre_release_checks.sh` — git status, clippy, build, test, fmt ⊘
 - `create_release_branch.sh` — branch creation
 - `bump_versions.sh` — update [package] version fields
+- `pin_path_deps.sh` — pin path-only workspace deps to published versions for publish (release branch only)
 - `finalize_changelogs.sh` — replace [Unreleased] with version header
 - `publish_crate.sh` — dry-run and publish a single crate ⊘
 - `update_workspace_deps.sh` — update workspace dependency versions between publish phases ⊘
@@ -333,7 +344,7 @@ curl -s "https://crates.io/api/v1/crates/${CRATE_NAME}" | jq -r '.crate.max_vers
 <ProjectDiscovery>
 ## STEP 1: Project Discovery
 
-**Read optional config** from `.claude/config/release.toml` if it exists. Store any `install_verify`, `install_verify_script`, `workspace_publish`, `publish_phases`, and `judgment_checks` settings.
+**Read optional config** from `.claude/config/release.toml` if it exists. Store any `install_verify`, `install_verify_script`, `workspace_publish`, `publish_phases`, `publish_path_pins`, and `judgment_checks` settings.
 
 **If config sets both `workspace_publish = true` and `[[publish_phases]]`**, STOP with a clear error: the two are mutually exclusive — `workspace_publish` is for workspaces whose members publish together with no between-phase scripts or dep rewrites; `[[publish_phases]]` is for ordered chains that need them.
 
@@ -530,6 +541,18 @@ This produces a clean commit label visible in GitHub's file list for both CHANGE
 ## STEP 6: Publish to crates.io
 
 **IMPORTANT**: When `[[publish_phases]]` config exists, dry-runs and publishing happen **per-phase**, not all-upfront. This is critical for workspace dependency chains where later phases depend on earlier phases being published first (e.g., Phase 2 crates may depend on Phase 1 crates via workspace dependencies that get updated between phases).
+
+### Pin path-only workspace deps (if `[[publish_path_pins]]` config exists)
+
+**Run this once, before any dry-run below**, and only when the config defines `[[publish_path_pins]]`. cargo publish rejects path-only workspace deps (no version requirement), so each pinned dep must be rewritten to a published version first. This runs on the release branch (created in STEP 5) and commits the pin there — main is never modified, so it keeps the path dependency by construction (this is the "restore to path" guarantee; no later cleanup step is needed).
+
+Build `${PIN_ARGS}` as one `<dep>=<version>` token per `[[publish_path_pins]]` entry (e.g. `bevy_kana=0.1.0`), then (with `dangerouslyDisableSandbox: true`):
+```bash
+~/.claude/scripts/release/pin_path_deps.sh ${DRY_RUN_FLAG} ${PIN_ARGS}
+```
+→ This rewrites root `Cargo.toml`, runs `cargo update --workspace`, and commits `chore: pin workspace path deps for publish`. Report the script output. Stop if it fails. In dry-run mode it reports the rewrites without committing.
+
+If no `[[publish_path_pins]]` config exists, skip this and proceed directly to the dry-run.
 
 ### If no config — single crate or simple workspace
 
@@ -936,3 +959,4 @@ If already published to crates.io, you cannot unpublish. Release a new patch ver
 6. **Workspace dependency ordering**: If publish fails due to dependency ordering, set `workspace_publish = true` in `.claude/config/release.toml` (cargo >= 1.90, members publish together, no between-phase scripts) or add `[[publish_phases]]` (ordered chains needing scripts or dep rewrites between phases, e.g. bevy_brp)
 7. **crates.io indexing delay**: If a later phase fails because a just-published crate isn't indexed yet, increase `wait_seconds` in the config
 8. **Missing post_script**: The config references a script that doesn't exist — create it or fix the path
+9. **"all dependencies must have a version requirement specified when publishing"**: A workspace dep is path-only (e.g. an unpublished sibling crate referenced by `path` with no `version`). Add a `[[publish_path_pins]]` entry naming the dep and the published version to pin it to during publish; bump that version when the dep gets a newer release

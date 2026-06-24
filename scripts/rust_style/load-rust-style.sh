@@ -426,8 +426,8 @@ if [[ ${#style_files[@]} -gt 0 ]]; then
         [[ -z "$stem" ]] && continue
         ref_file="${stem_to_file[$stem]:-}"
         if [[ -n "$ref_file" && -f "$ref_file" ]]; then
-          printf '\n### Related style guidance (via see_also → %s)\n\n' "$stem"
-          strip_frontmatter "$ref_file"
+          ref_title="$(extract_title "$ref_file")"
+          printf '\nSee also: %s (see_also → %s) — full rule loaded separately in this guide.\n' "${ref_title:-$stem}" "$stem"
         fi
       done <<< "${file_see_also[$file]}"
     fi

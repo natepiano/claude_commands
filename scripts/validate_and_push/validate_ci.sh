@@ -157,7 +157,7 @@ run_step "rustfmt" "$LINT_CMD" fmt --check
 
 run_step "taplo" taplo fmt --check
 
-run_step "clippy" cargo clippy --workspace --all-features --lib --bins --tests -- -D warnings
+run_step "clippy" cargo clippy --workspace --all-features --tests -- -D warnings
 
 run_configured_target_checks
 
