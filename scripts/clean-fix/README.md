@@ -10,8 +10,9 @@ Runs daily at **4:00 AM** via launchd.
 
 | File | Purpose |
 |------|---------|
-| `clean-fix.sh` | Main entry point. Takes a scope: `clean` (settings back-populate + clean/build/mend + warmup), `style` (eval + review + fix), or `all` (default, both). Emits a clean-fix log that `/clean_fix report` can render on demand. |
-| `clean-fix.conf` | Pipeline configuration. Two opt-in allowlists: `[build]` (clean/build/mend) and `[projects]` (style eval/review/fix), plus the optional `[active_checkout]` redirect map (point a project's eval/fix at a worktree while keeping its identity/history), style quotas, timeouts, project env, and warmup targets. No agent settings live here. No deny list — nothing runs unless listed. |
+| `clean-fix.sh` | Main entry point. Takes a scope: `clean` (settings back-populate + clean/build/mend + warmup), `style` (eval + review + fix), or default full pipeline; each form accepts an optional project filter. Emits a clean-fix log that `/clean_fix report` can render on demand. |
+| `clean-fix-usage.sh` | Emits the no-argument `/clean_fix` usage screen as preformatted Markdown with fixed-width, wrapped text blocks. `--json` exposes the same usage, agent, and project data for validation/tools. |
+| `clean-fix.conf` | Pipeline configuration. Two opt-in allowlists: `[build]` (clean/build/mend) and `[projects]` (style eval/review/fix), kept to the same project set unless a target is temporarily skipped, plus the optional `[active_checkout]` redirect map (point a project's eval/fix at a worktree while keeping its identity/history), style quotas, timeouts, project env, and warmup targets. No agent settings live here. No deny list — nothing runs unless listed. |
 | `agent-assignments.conf` | Clean-fix stage-to-agent mapping. `[style_eval]`, `[style_eval_review]`, and `[style_fix]` each own `enabled=`, `agent=`, and optional per-stage `model=`/`effort=` overrides. Empty overrides resolve through `~/.claude/config/agents.conf`. |
 | `agent_assignments.sh` | Clean-fix Bash helper for loading stage assignments. It delegates model/effort defaults and allowlist validation to `scripts/agents/agents_config.sh`. |
 | `com.natemccoy.style-fix.plist` | launchd plist — runs the style scope every 10 minutes (no idle gate). |

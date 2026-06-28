@@ -12,6 +12,7 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 RUST_DIR="$HOME/rust"
 WARMUP_CONF="$SCRIPT_DIR/clean-fix.conf"
 TIMESTAMP_DIR="$HOME/.local/state/clean-fix"
+TARGET_PROJECT="${1:-}"
 WARMUP_TIMEOUT=120
 WARMUP_PORT=15799
 WARMUP_RUN_SECONDS=1
@@ -134,20 +135,28 @@ while IFS= read -r line || [[ -n "$line" ]]; do
             ;;
         cargo_run)
             manifest="$RUST_DIR/$value"
+            project_name="${value%%/*}"
+            if [[ -n "$TARGET_PROJECT" && "$key" != "$TARGET_PROJECT" && "$project_name" != "$TARGET_PROJECT" ]]; then
+                continue
+            fi
             if [[ ! -f "$manifest" ]]; then
                 log "WARMUP SKIP: $key (no $value)"
                 continue
             fi
-            warmup_run "$key" "--manifest-path $manifest" "${value%%/*}"
+            warmup_run "$key" "--manifest-path $manifest" "$project_name"
             ;;
         examples)
             manifest="$RUST_DIR/${value%%:*}"
             example="${value#*:}"
+            project_name="${value%%/*}"
+            if [[ -n "$TARGET_PROJECT" && "$key" != "$TARGET_PROJECT" && "$project_name" != "$TARGET_PROJECT" ]]; then
+                continue
+            fi
             if [[ ! -f "$manifest" ]]; then
                 log "WARMUP SKIP: $key (no ${value%%:*})"
                 continue
             fi
-            warmup_run "$key example=$example" "--example $example --manifest-path $manifest" "${value%%/*}"
+            warmup_run "$key example=$example" "--example $example --manifest-path $manifest" "$project_name"
             ;;
     esac
 done < "$WARMUP_CONF"

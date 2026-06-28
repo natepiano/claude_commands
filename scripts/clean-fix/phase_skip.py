@@ -20,6 +20,8 @@ from __future__ import annotations
 import argparse
 import re
 
+from collections.abc import Sequence
+from typing import NamedTuple
 from pathlib import Path
 
 CONF_FILE = Path(__file__).resolve().parent / "clean-fix.conf"
@@ -27,6 +29,13 @@ MARKER = "#CLEAN_FIX_SKIP#"
 
 SECTION_RE = re.compile(r"^\[(?P<name>.+)\]\s*$")
 SCOPE_SECTION = {"clean": "build", "style": "projects"}
+
+
+class ActiveCheckout(NamedTuple):
+    entry: str
+    key: str
+    checkout: str
+    checkout_root: str
 
 
 def read_lines() -> list[str]:
@@ -50,21 +59,91 @@ def section_of_lines(lines: list[str]) -> list[str | None]:
     return sections
 
 
-def entry_key(line: str, section: str) -> str | None:
-    """Project name a section line represents, whether active or skip-tagged.
+def project_key(entry: str) -> str:
+    return entry.rsplit("/", 1)[-1] if "/" in entry else entry
 
-    Returns None for blanks, section headers, and plain ``#`` doc comments. In
-    ``[projects]`` a member line (``<dir>/<subpath>``) is keyed by its last path
-    segment; everywhere else the entry text is its own key.
-    """
+
+def checkout_root(checkout: str) -> str:
+    return checkout.split("/", 1)[0]
+
+
+def uncommented_body(line: str) -> str:
     body = line.strip()
     if body.startswith(MARKER):
         body = body[len(MARKER):]
-    body = body.split("#", 1)[0].strip()
+    return body.split("#", 1)[0].strip()
+
+
+def active_checkouts(lines: list[str]) -> list[ActiveCheckout]:
+    redirects: list[ActiveCheckout] = []
+    for line, section in zip(lines, section_of_lines(lines), strict=True):
+        if section != "active_checkout":
+            continue
+        body = uncommented_body(line)
+        if not body or "=" not in body:
+            continue
+        entry, _, checkout = body.partition("=")
+        entry = entry.strip()
+        checkout = checkout.strip()
+        if not entry or not checkout:
+            continue
+        redirects.append(
+            ActiveCheckout(
+                entry=entry,
+                key=project_key(entry),
+                checkout=checkout,
+                checkout_root=checkout_root(checkout),
+            )
+        )
+    return redirects
+
+
+def target_key(name: str, redirects: Sequence[ActiveCheckout]) -> str:
+    normalized = project_key(name)
+    for redirect in redirects:
+        if name in {
+            redirect.entry,
+            redirect.key,
+            redirect.checkout,
+            redirect.checkout_root,
+        }:
+            return redirect.key
+        if name.startswith(f"{redirect.checkout_root}/"):
+            return redirect.key
+        if normalized == redirect.key:
+            return redirect.key
+    return normalized
+
+
+def build_entry_key(entry: str, redirects: Sequence[ActiveCheckout]) -> str:
+    for redirect in redirects:
+        if entry in {
+            redirect.entry,
+            redirect.checkout,
+            redirect.checkout_root,
+        }:
+            return redirect.key
+        if entry.startswith(f"{redirect.checkout_root}/"):
+            return redirect.key
+    return project_key(entry)
+
+
+def entry_key(
+    line: str, section: str, redirects: Sequence[ActiveCheckout]
+) -> str | None:
+    """Project name a section line represents, whether active or skip-tagged.
+
+    Returns None for blanks, section headers, and plain ``#`` doc comments.
+    In ``[build]`` and ``[projects]``, a member line (``<dir>/<subpath>``) is
+    keyed by its last path segment; everywhere else the entry text is its own key.
+    """
+    body = uncommented_body(line)
     if not body or SECTION_RE.match(body):
         return None
-    if section == "projects" and "/" in body:
-        return body.rsplit("/", 1)[-1]
+    if section == "build":
+        return build_entry_key(body, redirects)
+    if section == "projects":
+        return project_key(body)
     return body
 
 
@@ -75,39 +154,61 @@ def is_tagged(line: str) -> bool:
 def skip_entry(scope: str, name: str, lines: list[str]) -> tuple[list[str], str]:
     section = SCOPE_SECTION[scope]
     out = list(lines)
+    redirects = active_checkouts(out)
+    target = target_key(name, redirects)
+    matched = 0
+    changed = 0
     for index, sec in enumerate(section_of_lines(out)):
-        if sec != section or entry_key(out[index], section) != name:
+        if sec != section or entry_key(out[index], section, redirects) != target:
             continue
+        matched += 1
         if is_tagged(out[index]):
-            return out, f"ALREADY-SKIPPED {name} ({scope})"
+            continue
         out[index] = f"{MARKER} {out[index].strip()}"
-        return out, f"SKIP {name} ({scope}): commented in [{section}]"
-    return out, f"UNKNOWN {name}: no [{section}] entry"
+        changed += 1
+    if matched == 0:
+        return out, f"UNKNOWN {name}: no [{section}] entry"
+    if changed == 0:
+        return out, f"ALREADY-SKIPPED {target} ({scope})"
+    suffix = "entry" if changed == 1 else "entries"
+    return out, f"SKIP {target} ({scope}): commented {changed} {suffix} in [{section}]"
 
 
 def enable_entry(scope: str, name: str, lines: list[str]) -> tuple[list[str], str]:
     section = SCOPE_SECTION[scope]
     out = list(lines)
+    redirects = active_checkouts(out)
+    target = target_key(name, redirects)
+    matched = 0
+    changed = 0
     for index, sec in enumerate(section_of_lines(out)):
-        if sec != section or entry_key(out[index], section) != name:
+        if sec != section or entry_key(out[index], section, redirects) != target:
             continue
+        matched += 1
         if not is_tagged(out[index]):
-            return out, f"NOT-SKIPPED {name} ({scope}): already active"
+            continue
         out[index] = out[index].strip()[len(MARKER):].lstrip()
-        return out, f"ENABLED {name} ({scope})"
-    return out, f"UNKNOWN {name}: no [{section}] entry"
+        changed += 1
+    if matched == 0:
+        return out, f"UNKNOWN {name}: no [{section}] entry"
+    if changed == 0:
+        return out, f"NOT-SKIPPED {target} ({scope}): already active"
+    return out, f"ENABLED {target} ({scope})"
 
 
 def enable_all(scope: str, lines: list[str]) -> tuple[list[str], list[str]]:
     section = SCOPE_SECTION[scope]
+    redirects = active_checkouts(lines)
     out: list[str] = []
     msgs: list[str] = []
+    seen: set[str] = set()
     for line, sec in zip(lines, section_of_lines(lines), strict=True):
         if sec == section and is_tagged(line):
-            key = entry_key(line, section)
+            key = entry_key(line, section, redirects)
             out.append(line.strip()[len(MARKER):].lstrip())
-            if key:
+            if key and key not in seen:
                 msgs.append(f"ENABLED {key} ({scope})")
+                seen.add(key)
             continue
         out.append(line)
     return out, msgs
@@ -115,12 +216,15 @@ def enable_all(scope: str, lines: list[str]) -> tuple[list[str], list[str]]:
 
 def collect_skipped(scope: str, lines: list[str]) -> list[str]:
     section = SCOPE_SECTION[scope]
+    redirects = active_checkouts(lines)
     skipped: list[str] = []
+    seen: set[str] = set()
     for line, sec in zip(lines, section_of_lines(lines), strict=True):
         if sec == section and is_tagged(line):
-            key = entry_key(line, section)
-            if key:
+            key = entry_key(line, section, redirects)
+            if key and key not in seen:
                 skipped.append(key)
+                seen.add(key)
     return skipped
 
 

@@ -6,31 +6,39 @@ description: Unified clean-fix command — run the pipeline (one project or all)
 
 `$ARGUMENTS` — the first token selects a subcommand; the remaining tokens are that subcommand's arguments.
 
-| Subcommand | Purpose |
-|---|---|
-| `run [clean \| style \| all \| project]` | Launch a pipeline scope (default all), or eval + fix for one project |
-| `monitor [log-path] [project]` | Attach a live Monitor to a running clean-fix log |
-| `report [list \| <path>]` | Render a per-project status table from a run log |
-| `eval [agent claude\|codex \| model <id>\|default \| effort <id>\|default \| on\|off]` | Show or set style-eval agent configuration |
-| `review [agent claude\|codex \| model <id>\|default \| effort <id>\|default \| on\|off]` | Show or set style-eval-review agent configuration |
-| `fix [agent claude\|codex \| model <id>\|default \| effort <id>\|default \| on\|off]` | Show or set fix-worktree agent configuration |
-| `agent claude\|codex` | Set all clean-fix style-stage agents |
-| `on\|off` | Enable or disable all clean-fix style stages |
-| `skip clean\|style [...]` | Skip or re-enable targets for the clean or style pass |
+When no subcommand is provided, run this script and relay its stdout exactly:
 
-Dispatch: `run` → <Run/>, `monitor` → <Monitor/>, `report` → <Report/>, `eval`/`review`/`fix`/`agent`/`on`/`off` → <StyleAgentConfig/>, `skip` → <Skip/>. Empty or unrecognized first token → print the table above and stop.
+```bash
+~/.claude/scripts/clean-fix/clean-fix-usage.sh
+```
+
+The script owns the user-facing data, section order, column widths, wrapping, and formatting. Do not parse, summarize, truncate, filter, sort, merge, rename, rewrite, add rows, or convert its output to Markdown pipe tables. Do not read or reinterpret clean-fix config files for this screen; the script output is the only source. If the script exits non-zero, show its stdout/stderr exactly and stop.
+
+Dispatch: `run` → <Run/>, `monitor` → <Monitor/>, `report`/`list` → <Report/>, `eval`/`review`/`fix`/`agent`/`on`/`off` → <StyleAgentConfig/>, `skip` → <Skip/>. Empty or unrecognized first token → run the usage script above, relay stdout exactly, and stop.
 
 <Run>
 
-## run [clean | style | all | project]
+## run [clean | style] [project]
+## run [project]
 
-### `run`, `run all`, `run clean`, `run style` — pipeline scopes
+### `run`, `run clean`, `run style` — pipeline scopes
 
-Launch `~/.claude/scripts/clean-fix/clean-fix.sh <scope>` interactively, off the launchd schedule. Scopes:
+Launch `~/.claude/scripts/clean-fix/clean-fix.sh` interactively, off the launchd schedule. Build the script arguments from the user command:
 
-- `all` (or no token) — full pipeline: clean + build + warmup + eval + review + fix
+- no scope — full pipeline: clean + build + warmup + eval + review + fix
 - `clean` — clean + build + mend + warmup only (the nightly 4 AM job's scope)
 - `style` — eval + review + fix worktrees only (the every-10-min job's scope)
+
+Any scope can take an optional project name:
+
+- `clean_fix run` — full pipeline for all targets
+- `clean_fix run <project>` — full pipeline for one target
+- `clean_fix run clean` — clean/build/warmup for all clean targets
+- `clean_fix run clean <project>` — clean/build/warmup for one clean target
+- `clean_fix run style` — style eval/review/fix for all style targets
+- `clean_fix run style <project>` — style eval/review/fix for one style target
+
+`<project>` may be either the active checkout name shown in the usage table's `Project` column or the preserved identity shown in `Project Key`. The scripts normalize both through `[active_checkout]`; do not create duplicate style entries for active worktrees.
 
 **Hard requirement: must run unsandboxed.** The script invokes `codex` and `claude`, which need write access to `~/.codex/sessions` and to many paths outside the sandbox allowlist. Per `~/.claude/CLAUDE.md` ("codex and clean-fix style scripts must run unsandboxed"), **always** invoke this with `dangerouslyDisableSandbox: true` from the start. Do not try the sandboxed run first — it will fail.
 
@@ -45,7 +53,7 @@ If anything matches, tell the user `Clean-fix already running (PID …). Use /cl
 **Step 2: Launch.** The orchestrator writes its own timestamped log under `~/.local/logs/clean-fix/clean-fix-YYYYMMDD-HHMMSS.log` and updates the `~/.local/logs/clean-fix.log` symlink to point at it. Don't pre-create or redirect — just launch:
 
 ```bash
-~/.claude/scripts/clean-fix/clean-fix.sh <scope>
+~/.claude/scripts/clean-fix/clean-fix.sh [clean|style] [project]
 ```
 
 Use `Bash` with `dangerouslyDisableSandbox: true` and `run_in_background: true`. Capture the resulting bash shell id so the user can kill it later with `KillShell` if needed. After launch, resolve the active log path:
@@ -56,14 +64,7 @@ ls -t ~/.local/logs/clean-fix/clean-fix-*.log 2>/dev/null | head -1
 
 Tell the user: `Clean-fix launched (shell <id>). Log: <path>.`
 
-**Step 3: Offer to arm the monitor.** In the same response, offer one short follow-up: `Want me to /clean_fix monitor to stream phase transitions?` If the user says yes, execute <Monitor/> with the resolved log path. If they decline, stop.
-
-### `run <project>` — single project
-
-The orchestrator has no per-project filter, so a single-project run covers the style pipeline only (eval + review + fix) — not clean + build.
-
-1. Resolve the project root: `~/rust/<project>` must contain a `Cargo.toml`. If it doesn't, report that and stop.
-2. Invoke the `style_eval` skill with arguments `~/rust/<project> --fix`. It owns the evaluation, the fix worktree launch, the monitoring (via <Monitor/>), and the final summary.
+**Step 3: Offer to arm the monitor.** In the same response, offer one short follow-up: `Want me to /clean_fix monitor to stream phase transitions?` If the user says yes, execute <Monitor/> with no arguments. If they decline, stop.
 
 ### Notes
 
@@ -76,21 +77,15 @@ The orchestrator has no per-project filter, so a single-project run covers the s
 
 <Monitor>
 
-## monitor [log-path] [project]
+## monitor
 
 Attach a persistent Monitor to whichever clean-fix-related script the user just kicked off (clean+rebuild, style evaluation, style-fix worktrees, or the full orchestrator) and surface meaningful state transitions in real time. Skip the high-volume noise (SKIP lines, raw cargo output) — only emit lines the user would act on.
 
-### Arguments
-
-Remaining tokens: optional `<log-path> [<project>]`. The project name is only used for style-fix manual logs (see <ArmMonitor/>).
-
-- If the first token is a path that exists, set `${LOG_PATH}` to it (and `${PROJECT}` to the second token if present) and proceed to <ArmMonitor/>.
-- If no tokens, execute <DetectLog/>.
-- If the first token is non-empty but the file does not exist, inform the user: `Log not found: <token>. Run /clean_fix monitor with no argument to autodetect, or pass a valid path.` Then stop.
+`monitor` takes no arguments. If the user passes any token after `monitor`, ignore the token and run the normal detection path.
 
 ### <DetectLog/>
 
-Inspect the well-known log locations and pick the one most recently modified within the last 2 hours. Older candidates are stale — do not pick them.
+Inspect the well-known log locations and pick the single most recently modified log within the last 2 hours. Older candidates are stale — do not pick them.
 
 ```bash
 ls -lt --time=mtime \
@@ -107,9 +102,8 @@ ls -lt --time=mtime \
 `mtime` from `stat -f '%m' <file>` gives a unix timestamp; compare against `$(date +%s)` and require the difference under 7200 seconds.
 
 Decision:
-- **Exactly one fresh candidate** — set `${LOG_PATH}` to it and tell the user `Watching ${LOG_PATH} (last write Ns ago).` Proceed to <ArmMonitor/>.
-- **Multiple fresh candidates** — list each with its mtime delta and ask the user to pick one by index. Wait for the answer; then set `${LOG_PATH}` and proceed.
-- **No fresh candidates** — inform the user: `No clean-fix logs modified in the last 2 hours. Pass an explicit path: /clean_fix monitor <path>.` Then stop.
+- **Fresh candidate found** — set `${LOG_PATH}` to the newest fresh candidate and tell the user `Watching ${LOG_PATH} (last write Ns ago).` Proceed to <ArmMonitor/>.
+- **No fresh candidates** — inform the user: `No clean-fix logs modified in the last 2 hours. Start a run first, then use /clean_fix monitor.` Then stop.
 
 ### <ArmMonitor/>
 
@@ -137,7 +131,7 @@ Otherwise tell the user: `Detected phase: <name>. Arming monitor on ${LOG_PATH}.
 - `timeout_ms`: `3600000`
 - `command`: `python3 ~/.claude/scripts/clean-fix/style-fix-monitor.py ${PROJECT}`
 
-`${PROJECT}` comes from the arguments; if absent, derive it from the log (first `Launched:`/worktree line names the project) or ask the user. The helper tails both the manual log and the agent's own log (`/private/tmp/claude/style_fix_<project>.log`), translates the agent's phase sentinels to `phase=agent-step name=<...>`, and exits 0 on the `phase=launcher-exit` sentinel — no TaskStop needed. (A tail+grep pipeline cannot terminate itself at launcher-exit inside the sandbox: `pkill` is denied access to macOS's process-list service and shell job-control is unavailable.) Then report events per <StyleFixManualEvents/> and skip the rest of this section.
+Derive `${PROJECT}` from the log before arming the helper. Use the first `Launched:` or worktree line that names the project. If the project cannot be derived, tell the user `Could not identify the project from ${LOG_PATH}; use tail -f ${LOG_PATH}.` Then stop. The helper tails both the manual log and the agent's own log (`/private/tmp/claude/style_fix_<project>.log`), translates the agent's phase sentinels to `phase=agent-step name=<...>`, and exits 0 on the `phase=launcher-exit` sentinel — no TaskStop needed. (A tail+grep pipeline cannot terminate itself at launcher-exit inside the sandbox: `pkill` is denied access to macOS's process-list service and shell job-control is unavailable.) Then report events per <StyleFixManualEvents/> and skip the rest of this section.
 
 For all other logs, fetch the live-monitor filter regex from the parser (single source of truth — keeps phase classification and live filtering in lockstep):
 
@@ -198,7 +192,7 @@ For Monitors armed with `style-fix-monitor.py`, emit one short line per event:
 
 - The orchestrator script `clean-fix.sh` writes both to `~/.local/logs/clean-fix.log` (via `tee`) and via the launchd plists to `/tmp/style-fix-stdout.log` (`com.natemccoy.style-fix`, every 10 min) or `/tmp/cargo-clean-stdout.log` (`com.natemccoy.cargo-clean`, nightly 4 AM). Any is valid; <DetectLog/> will prefer whichever is freshest.
 - Standalone runs of `style-eval-all.sh` or `style-fix-worktrees.sh` invoked interactively typically log to `/tmp/claude/<name>-<suffix>.log`. The detector pattern globs match those.
-- The Monitor uses `tail -F -n 0` so we start at the current end of the file — backlog is not re-emitted. If the user wants a recap of what already ran, point them at <ArmMonitor/>'s `tail -30` output instead.
+- The Monitor uses `tail -F -n 0` so we start at the current end of the file — backlog is not re-emitted.
 - `grep --line-buffered` is required — without it, pipe buffering delays events by minutes and the monitor looks broken.
 
 </Monitor>
@@ -206,18 +200,20 @@ For Monitors armed with `style-fix-monitor.py`, emit one short line per event:
 <Report>
 
 ## report [list | <path>]
+## list
 
-Read `~/.claude/scripts/clean-fix/report-render.md` and follow it, substituting the remaining tokens (after `report`) for its `$ARGUMENTS`. That document owns the parser invocation, the output format, and every rendering rule; it is shared with `clean-fix.sh`, which pipes it into a headless claude after each scheduled run. Do not duplicate rendering logic here — if something is missing, fix `report-render.md` (or the parser).
+Read `~/.claude/scripts/clean-fix/report-render.md` and follow it, substituting the remaining tokens (after `report`) for its `$ARGUMENTS`. If the top-level token was `list`, execute this section with `$ARGUMENTS` set to `list`. That document owns the parser invocation, the output format, and every rendering rule; it is shared with `clean-fix.sh`, which pipes it into a headless claude after each scheduled run. Do not duplicate rendering logic here — if something is missing, fix `report-render.md` (or the parser).
 
 </Report>
 
 <StyleAgentConfig>
 
-## eval|review|fix [agent claude|codex | model <id>|default | effort <id>|default | on|off]
+## eval|review|fix [model <id>|default | effort <id>|default | on|off]
 ## agent claude|codex
+## agent eval|review|fix claude|codex
 ## on|off
 
-Show or set the clean-fix style agent configuration.
+Show or set the clean-fix style agent configuration. These commands do not run the eval, review, or fix phase for a project. Project-scoped style execution is `clean_fix run <project>`.
 
 The clean-fix stage assignment file is `~/.claude/scripts/clean-fix/agent-assignments.conf`. The global agent registry is `~/.claude/config/agents.conf`; it contains each agent's default `model=`/`effort=` plus `[<agent>.models]` and `[<agent>.efforts]` allowlists. When a clean-fix stage leaves `model=`/`effort=` empty, the values resolve from the global `[<agent>]` section. An explicit `model=` or `effort=` in `agent-assignments.conf` overrides for that clean-fix stage only and must pass the global allowlist.
 
@@ -236,14 +232,15 @@ Argument handling:
 3. **No tokens** — show all three sections: `enabled`, `agent`, resolved `model`, resolved `effort`, assignment path, and registry path. Stop.
 4. **First token is `eval`, `review`, or `fix`** — the scope. Map `eval` to `[style_eval]`, `review` to `[style_eval_review]`, and `fix` to `[style_fix]`.
 5. **Scoped status:** `/clean_fix eval`, `/clean_fix review`, or `/clean_fix fix` shows only that scope's current `enabled`, `agent`, resolved `model`, and resolved `effort`.
-6. **Scoped enable/disable:** `/clean_fix eval on`, `/clean_fix review off`, `/clean_fix fix on`, etc. set that scope's `enabled=` to `true` or `false`.
-7. **Global enable/disable:** `/clean_fix on` and `/clean_fix off` set all three `enabled=` values to `true` or `false`.
-8. **Scoped agent:** `/clean_fix <scope> agent claude` or `/clean_fix <scope> agent codex` sets that scope's `agent=`. If that scope has a non-empty `model=` or `effort=` not allowed for the new agent in `config/agents.conf`, also set the invalid value to empty (`<default>`) and report that reset.
-9. **Global agent:** `/clean_fix agent claude` or `/clean_fix agent codex` sets all three scope `agent=` values and resets any now-invalid non-empty `model=` or `effort=` values to empty.
-10. **Scoped model:** `/clean_fix eval model opus`, `/clean_fix review model sonnet`, or `/clean_fix fix model gpt-5.4-mini` first reads the selected scope's `agent=`. The model must exactly match a non-comment line under `[<agent>.models]` in `config/agents.conf`; otherwise stop and show the allowed values.
-11. **Scoped effort:** `/clean_fix eval effort max` or `/clean_fix fix effort xhigh` first reads the selected scope's `agent=`. The effort must exactly match a non-comment line under `[<agent>.efforts]` in `config/agents.conf`; otherwise stop and show the allowed values.
-12. **Default model/effort:** `/clean_fix <scope> model default` sets that scope's `model=` to empty. `/clean_fix <scope> effort default` sets that scope's `effort=` to empty. Empty values resolve through the global `[<agent>]` defaults; if those are empty too, the agent CLI default applies.
-13. When changing a value, edit only the relevant `enabled=`, `agent=`, `model=`, or `effort=` line in `agent-assignments.conf`. The `[build]` and `[projects]` skip lists remain in `clean-fix.conf` and are managed by `phase_skip.py` (see <Skip/>), never by direct edits.
+6. **Project names are invalid here:** `/clean_fix eval <project>`, `/clean_fix review <project>`, and `/clean_fix fix <project>` are not supported. Tell the user to use `/clean_fix run <project>` for a single project's style eval/review/fix flow.
+7. **Scoped enable/disable:** `/clean_fix eval on`, `/clean_fix review off`, `/clean_fix fix on`, etc. set that scope's `enabled=` to `true` or `false`.
+8. **Global enable/disable:** `/clean_fix on` and `/clean_fix off` set all three `enabled=` values to `true` or `false`.
+9. **Scoped agent:** `/clean_fix agent eval claude` or `/clean_fix agent fix codex` sets only that scope's `agent=`. The old `/clean_fix <scope> agent claude|codex` form is also accepted, but do not show it in usage. If that scope has a non-empty `model=` or `effort=` not allowed for the new agent in `config/agents.conf`, also set the invalid value to empty (`<default>`) and report that reset.
+10. **Global agent:** `/clean_fix agent claude` or `/clean_fix agent codex` sets all three scope `agent=` values and resets any now-invalid non-empty `model=` or `effort=` values to empty.
+11. **Scoped model:** `/clean_fix eval model opus`, `/clean_fix review model sonnet`, or `/clean_fix fix model gpt-5.4-mini` first reads the selected scope's `agent=`. The model must exactly match a non-comment line under `[<agent>.models]` in `config/agents.conf`; otherwise stop and show the allowed values.
+12. **Scoped effort:** `/clean_fix eval effort max` or `/clean_fix fix effort xhigh` first reads the selected scope's `agent=`. The effort must exactly match a non-comment line under `[<agent>.efforts]` in `config/agents.conf`; otherwise stop and show the allowed values.
+13. **Default model/effort:** `/clean_fix <scope> model default` sets that scope's `model=` to empty. `/clean_fix <scope> effort default` sets that scope's `effort=` to empty. Empty values resolve through the global `[<agent>]` defaults; if those are empty too, the agent CLI default applies.
+14. When changing a value, edit only the relevant `enabled=`, `agent=`, `model=`, or `effort=` line in `agent-assignments.conf`. The `[build]` and `[projects]` skip lists remain in `clean-fix.conf` and are managed by `phase_skip.py` (see <Skip/>), never by direct edits.
 
 </StyleAgentConfig>
 
@@ -255,8 +252,10 @@ Skip or re-enable targets in `~/.claude/scripts/clean-fix/clean-fix.conf` by com
 
 The second token is the scope — required:
 
-- **`clean`** — the `[build]` allowlist (clean + build pass). A directory skipped from clean has no effect on style.
-- **`style`** — the `[projects]` allowlist (style eval, review, and fix passes). A project is either a whole directory or a workspace member (`<dir>/<subpath>`); a member is named by its last path segment (e.g. `bevy_diegetic`). A style skip leaves clean untouched.
+- **`clean`** — the `[build]` allowlist (clean + build pass). A clean target may be a whole directory or a workspace member (`<dir>/<subpath>`); a member is named by its last path segment (e.g. `bevy_diegetic`). A clean skip leaves style untouched.
+- **`style`** — the `[projects]` allowlist (style eval, review, and fix passes). A style target follows the same naming rule. A style skip leaves clean untouched.
+
+For redirected projects, the helper accepts either the active checkout name or the project key and applies the skip to the underlying allowlist entry.
 
 If the scope is missing or anything else, explain the two scopes and stop.
 

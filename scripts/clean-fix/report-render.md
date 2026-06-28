@@ -7,7 +7,7 @@ Render a status view of one clean-fix run from a parsed log. All log discovery, 
 `$ARGUMENTS` may be:
 
 1. **Empty** — call `clean_fix_report_parse.py` with no arguments. The parser picks the newest log in `~/.local/logs/clean-fix/`.
-2. **The literal word `list`** — call `clean_fix_report_parse.py --list`. Print the numbered list (path, age, status, phases). Ask the user to pick by index, then call `clean_fix_report_parse.py <chosen-path>` and render.
+2. **The literal word `list`** — call `clean_fix_report_parse.py --list`. Print the numbered list (path, date, time, duration, status, phases). Ask the user to pick by index, then call `clean_fix_report_parse.py <chosen-path>` and render.
 3. **A path** — call `clean_fix_report_parse.py <path>`. If the parser exits with `ERROR: log not found`, surface that and stop.
 4. **Any other token** (e.g. `rebuild`, which `clean-fix.sh` substitutes in its headless invocation) — treat as Empty: newest log.
 

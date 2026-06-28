@@ -12,8 +12,7 @@
 #   project_name (optional) — pass through to style-fix-worktrees.sh to
 #                             restrict the run to a single project.
 #
-# In both modes the log path is printed up front so it can be tailed or
-# armed with /clean_fix monitor.
+# In both modes the log path is printed up front so it can be tailed.
 
 set -euo pipefail
 
@@ -42,5 +41,5 @@ else
     disown
     echo "PID: $PID"
     echo "Tail: tail -f \"$LOG\""
-    echo "Monitor: /clean_fix monitor \"$LOG\""
+    echo "Monitor: /clean_fix monitor"
 fi

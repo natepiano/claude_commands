@@ -105,6 +105,7 @@ FIX_DONE_RE = re.compile(
 # per-project failure.
 LAUNCHER_ERROR_RE = re.compile(r"^ERROR: (configured Codex binary is not executable: .+)$")
 FILENAME_TS_RE = re.compile(r"(\d{8}-\d{6})")
+FAILURE_REPORT_RE = re.compile(r"^\s+failure report: (.+)$")
 # Per-project live phase markers emitted by style-fix-worktrees.sh:
 #   [progress <project>] phase=<name> [k=v ...]
 PROGRESS_RE = re.compile(r"^\[progress (\S+)\] phase=(\S+)(?:\s+(.*))?$")
@@ -247,6 +248,21 @@ def slugify_reason(reason: str) -> str:
     return text.strip("-")[:60]
 
 
+def eval_failure_report_summary(report_path: Path) -> str | None:
+    try:
+        text = report_path.read_text(errors="replace")
+    except OSError:
+        return None
+    limit_matches = re.findall(
+        r"You've hit your weekly limit\s*·\s*resets\s*([^\n`]+)",
+        text,
+    )
+    if limit_matches:
+        reset = limit_matches[-1].strip()
+        return f"style eval agent hit weekly limit; resets {reset}"
+    return f"see failure report: {report_path}"
+
+
 def find_newest_log() -> Path | None:
     if not LOG_DIR.exists():
         return None
@@ -257,6 +273,34 @@ def find_newest_log() -> Path | None:
 def _filename_ts_key(path: Path) -> str:
     match = FILENAME_TS_RE.search(path.name)
     return match.group(1) if match else ""
+
+
+def _filename_date_time(ts: str) -> tuple[str, str]:
+    try:
+        stamp = datetime.strptime(ts, "%Y%m%d-%H%M%S")
+    except ValueError:
+        return "unknown", "unknown"
+    return stamp.strftime("%Y-%m-%d"), stamp.strftime("%H:%M")
+
+
+def _list_duration(result: ParseResult, now: float) -> str:
+    if result.elapsed:
+        return result.elapsed
+    if not result.run_start:
+        return "-"
+    try:
+        start = time.mktime(time.strptime(result.run_start, "%Y-%m-%d %H:%M:%S"))
+    except ValueError:
+        return "-"
+    if result.status == "in-progress":
+        return f"running {format_duration(now - start)}"
+    if not result.run_end:
+        return "-"
+    try:
+        end = time.mktime(time.strptime(result.run_end, "%Y-%m-%d %H:%M:%S"))
+    except ValueError:
+        return "-"
+    return format_duration(end - start)
 
 
 def target_roots_by_project() -> dict[str, Path]:
@@ -728,6 +772,7 @@ def parse_eval_phase(lines: list[str], result: ParseResult) -> None:
     fail_re = re.compile(r"^(FAILED|ERROR|TIMEOUT): (\S+)(?:\s*\(([^)]+)\))?")
     skip_re = re.compile(r"^SKIP: (\S+) \(([^)]+)\)")
     launched_re = re.compile(r"^Launched: (\S+) ")
+    last_failed_warning: Warning | None = None
 
     for line in lines:
         if line.startswith("TIMEOUT: eval agent "):
@@ -770,7 +815,19 @@ def parse_eval_phase(lines: list[str], result: ParseResult) -> None:
             if project not in resolved:
                 stats.fail += 1
             resolved.add(project)
-            result.warnings.append(Warning("eval", project, reason))
+            warning = Warning("eval", project, reason)
+            result.warnings.append(warning)
+            last_failed_warning = warning
+            continue
+        m = FAILURE_REPORT_RE.match(line)
+        if m and last_failed_warning is not None:
+            report_path = Path(m.group(1))
+            summary = eval_failure_report_summary(report_path)
+            if summary is not None:
+                if summary.startswith("style eval agent hit weekly limit"):
+                    last_failed_warning.message = summary
+                else:
+                    last_failed_warning.message = f"{last_failed_warning.message}; {summary}"
             continue
         m = skip_re.match(line)
         if m:
@@ -1124,6 +1181,7 @@ def parse_log(path: Path) -> ParseResult:
     _prune_bookkeeping_rows(result)
     overlay_live_pending_state(result)
     suppress_redundant_fix_handoff_skips(result)
+    suppress_fix_no_findings_after_eval_failure(result)
     # Run last: eval reasons are now in their final plain form, so the queued-fix
     # rows the crash blocked can be identified by reason text.
     mark_crashed_fix_phase(lines, bounds, result)
@@ -1262,6 +1320,38 @@ def suppress_redundant_fix_handoff_skips(result: ParseResult) -> None:
             fix_cell.reason = "pending-handoff"
 
 
+def suppress_fix_no_findings_after_eval_failure(result: ParseResult) -> None:
+    """Hide fix skips that are just the consequence of a failed eval pass."""
+    eval_failed_projects = {
+        project
+        for project, row in result.rows.items()
+        if row["eval"].state == "FAIL"
+    }
+    if not eval_failed_projects:
+        return
+
+    for project in eval_failed_projects:
+        row = result.rows.get(project)
+        if row is None:
+            continue
+        fix_cell = row["fix"]
+        if (
+            fix_cell.state == "SKIP"
+            and humanize_cell_reason(fix_cell.reason) == "no open findings"
+        ):
+            fix_cell.reason = "eval-failed"
+
+    result.skip_reasons = [
+        skip
+        for skip in result.skip_reasons
+        if not (
+            skip.phase == "fix"
+            and skip.project in eval_failed_projects
+            and skip.reason == "no open findings"
+        )
+    ]
+
+
 def eval_fix_handoff_reason(result: ParseResult, project: str) -> str | None:
     """One causal sentence when eval paused because fix is consuming its finding.
 
@@ -1377,6 +1467,8 @@ def row_reason(result: ParseResult, project: str) -> str:
                     add(approval_only)
                 continue
             if phase == "fix" and cell.reason == "pending-handoff":
+                continue
+            if phase == "fix" and cell.reason == "eval-failed":
                 continue
             if phase == "eval" and handoff is not None:
                 add(handoff)
@@ -1565,16 +1657,12 @@ def emit_list() -> None:
     now = time.time()
     for path in logs:
         ts = _filename_ts_key(path)
-        try:
-            ts_struct = time.strptime(ts, "%Y%m%d-%H%M%S")
-            ts_epoch = time.mktime(ts_struct)
-            age = format_age(now - ts_epoch)
-        except ValueError:
-            age = "unknown"
+        date, clock = _filename_date_time(ts)
         result = parse_log(path)
+        duration = _list_duration(result, now)
         present = ",".join(p for p in PHASES if result.stats[p].present) or "none"
         print(
-            f"LOG path={path} ts={ts} age={age} status={result.status} phases={present}"
+            f"LOG path={path} date={date} time={clock} duration={duration} status={result.status} phases={present}"
         )
 
 

@@ -342,7 +342,7 @@ If `--fix` was passed, you are running interactively and the user is waiting on 
       ~/.claude/scripts/clean-fix/style-fix-manual.sh --foreground "$(basename "$ARGUMENTS")"
       ```
 
-   b. In the same response, invoke `/clean_fix` (the `clean_fix` skill) with arguments `monitor ${LOG_PATH} $(basename "$ARGUMENTS")`. For `style-fix-manual-*.log` paths it arms the sandbox-safe Python helper (`style-fix-monitor.py`) and owns the event-to-update mapping — follow its <StyleFixManualEvents/> reporting.
+   b. In the same response, invoke `/clean_fix` (the `clean_fix` skill) with arguments `monitor`. It autodetects the newest active clean-fix log, arms the sandbox-safe Python helper for `style-fix-manual-*.log`, and owns the event-to-update mapping — follow its <StyleFixManualEvents/> reporting.
 
 4. Tell the user once: "fix running, log: `<path>`. I'll surface phases as they arrive and post a final summary when codex finishes." Then **yield** — do not sleep, do not poll, do not re-read the log yourself.
 
