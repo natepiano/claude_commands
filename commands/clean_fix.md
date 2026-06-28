@@ -1,5 +1,5 @@
 ---
-description: Unified clean-fix command — run the pipeline (one project or all), monitor a live log, render a report, configure style agents, or manage skip lists
+description: Unified clean-fix command — run the pipeline (one project or all), add or rename projects, monitor a live log, render a report, configure style agents, or manage skip lists
 ---
 
 # Clean-fix
@@ -14,7 +14,7 @@ When no subcommand is provided, run this script and relay its stdout exactly:
 
 The script owns the user-facing data, section order, column widths, wrapping, and formatting. Do not parse, summarize, truncate, filter, sort, merge, rename, rewrite, add rows, or convert its output to Markdown pipe tables. Do not read or reinterpret clean-fix config files for this screen; the script output is the only source. If the script exits non-zero, show its stdout/stderr exactly and stop.
 
-Dispatch: `run` → <Run/>, `monitor` → <Monitor/>, `report`/`list` → <Report/>, `eval`/`review`/`fix`/`agent`/`on`/`off` → <StyleAgentConfig/>, `skip` → <Skip/>. Empty or unrecognized first token → run the usage script above, relay stdout exactly, and stop.
+Dispatch: `run` → <Run/>, `add` → <Add/>, `rename` → <Rename/>, `monitor` → <Monitor/>, `report`/`list` → <Report/>, `eval`/`review`/`fix`/`agent`/`on`/`off` → <StyleAgentConfig/>, `skip` → <Skip/>. Empty or unrecognized first token → run the usage script above, relay stdout exactly, and stop.
 
 <Run>
 
@@ -74,6 +74,63 @@ Tell the user: `Clean-fix launched (shell <id>). Log: <path>.`
 - Use `/clean_fix report` after the run for a per-project matrix, or `/clean_fix monitor` during the run for live updates.
 
 </Run>
+
+<Add>
+
+## add <path-or-project>
+
+Add a Rust project to `~/.claude/scripts/clean-fix/clean-fix.conf`.
+
+`<path-or-project>` may be a project directory name under `~/rust`, a path
+relative to `~/rust`, an absolute path under `~/rust`, or a `Cargo.toml` path.
+The target must exist and contain `Cargo.toml`.
+
+Run the helper and relay its output verbatim:
+
+```bash
+python3 ~/.claude/scripts/clean-fix/project_add.py <path-or-project>
+```
+
+The helper adds the normalized entry to both `[build]` and `[projects]`. For a
+workspace member, it writes the workspace-relative entry
+`<workspace-dir>/<member-subpath>`, so the project/history key remains the
+member directory name, matching existing clean-fix workspace entries.
+
+The helper refuses duplicate `[projects]` identity keys and refuses to reactivate
+temporarily skipped entries; use `clean_fix skip <scope> enable <target>` for
+that case.
+
+</Add>
+
+<Rename>
+
+## rename <old> <new>
+
+Rename a clean-fix project identity and migrate its existing clean-fix state.
+
+`<old>` may be the current project key or `[projects]` entry. `<new>` may be a
+project directory name under `~/rust`, a path relative to `~/rust`, an absolute
+path under `~/rust`, or a `Cargo.toml` path. The new target must exist and
+contain `Cargo.toml`.
+
+Run the helper and relay its output verbatim:
+
+```bash
+python3 ~/.claude/scripts/clean-fix/project_rename.py <old> <new>
+```
+
+The helper updates `[projects]`, `[build]`, `[active_checkout]`, and keyed
+clean-fix config entries, then migrates:
+
+- `~/rust/nate_style/.history/<old-key>.jsonl`
+- `~/rust/nate_style/.history/.pending/<old-key>.json`
+- `~/rust/nate_style/.history/.pending/<old-key>.json.lock`
+- matching `~/rust/nate_style/.history/.failures/*_<old-key>.md`
+- `.clean-fix-project` markers in existing `_style_fix` worktrees
+
+It refuses collisions with an existing new key; it does not merge histories.
+
+</Rename>
 
 <Monitor>
 
