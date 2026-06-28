@@ -2,7 +2,8 @@
 """Parse a clean-fix orchestrator log into structured records.
 
 Modes:
-  default                   Full report parse of one log (newest if no path).
+  default                   Current status for every keyed [projects] target.
+  --latest-log              Full report parse of the newest clean-fix log.
   --list                    Enumerate logs in ~/.local/logs/clean-fix/ with summaries.
   --phase-detect <log>      Emit the currently-running phase (for /clean_fix monitor).
   --filter-regex            Print the live-monitor filter regex (single source of truth).
@@ -40,6 +41,7 @@ MONITOR_FILTER_REGEX = (
 
 PHASES: tuple[str, ...] = ("clean", "warmup", "eval", "review", "fix", "verify")
 CELL_DASH = "-"
+CURRENT_STATE_LABEL = "current clean-fix state"
 EVAL_SORT_ORDER: dict[str, int] = {
     "RUNNING": 0,
     "FAIL": 1,
@@ -253,7 +255,7 @@ def eval_failure_report_summary(report_path: Path) -> str | None:
         text = report_path.read_text(errors="replace")
     except OSError:
         return None
-    limit_matches = re.findall(
+    limit_matches: list[str] = re.findall(
         r"You've hit your weekly limit\s*·\s*resets\s*([^\n`]+)",
         text,
     )
@@ -351,24 +353,37 @@ def markdown_has_no_violations(text: str) -> bool:
     )
 
 
+def markdown_finding_count(text: str) -> int:
+    return sum(
+        1
+        for line in text.splitlines()
+        if line.startswith("### ") and len(line) > 4 and line[4].isdigit()
+    )
+
+
 def _load_json_value(text: str) -> object:
     import json
 
     return cast(object, json.loads(text))
 
 
-def pending_evaluation_markdown(project: str) -> str:
+def pending_payload(project: str) -> dict[str, object]:
     pending_path = PENDING_DIR / f"{project}.json"
     if not pending_path.exists():
-        return ""
+        return {}
     try:
         parsed = _load_json_value(pending_path.read_text(errors="replace"))
     except (OSError, ValueError):
-        return ""
+        return {}
     if isinstance(parsed, dict):
-        markdown = cast(dict[str, object], parsed).get("evaluation_markdown", "")
-        if isinstance(markdown, str):
-            return markdown
+        return cast(dict[str, object], parsed)
+    return {}
+
+
+def pending_evaluation_markdown(project: str) -> str:
+    markdown = pending_payload(project).get("evaluation_markdown", "")
+    if isinstance(markdown, str):
+        return markdown
     return ""
 
 
@@ -415,16 +430,9 @@ def pending_eval_produced_at(project: str) -> str | None:
     pending file as it consumes the finding, so its mtime is the consumption
     time, not the production time.
     """
-    pending_path = PENDING_DIR / f"{project}.json"
-    if not pending_path.exists():
+    fields = pending_payload(project)
+    if not fields:
         return None
-    try:
-        parsed = _load_json_value(pending_path.read_text(errors="replace"))
-    except (OSError, ValueError):
-        return None
-    if not isinstance(parsed, dict):
-        return None
-    fields = cast(dict[str, object], parsed)
     for key in ("evaluation_updated_at", "start_time", "updated_at"):
         raw = fields.get(key)
         if not isinstance(raw, str) or not raw:
@@ -463,16 +471,9 @@ def eval_heartbeat_status(project: str, now_epoch: float) -> HeartbeatStatus | N
     `agent` (checkpoints the eval prompt prints). Returns None when there is no
     pending JSON or no heartbeat to read.
     """
-    pending_path = PENDING_DIR / f"{project}.json"
-    if not pending_path.exists():
+    data = pending_payload(project)
+    if not data:
         return None
-    try:
-        parsed = _load_json_value(pending_path.read_text(errors="replace"))
-    except (OSError, ValueError):
-        return None
-    if not isinstance(parsed, dict):
-        return None
-    data = cast(dict[str, object], parsed)
     raw_hb = data.get("style_eval_heartbeat")
     if not isinstance(raw_hb, dict):
         return None
@@ -1188,6 +1189,180 @@ def parse_log(path: Path) -> ParseResult:
     return result
 
 
+def style_fix_worktrees_by_project() -> dict[str, list[str]]:
+    """Return current *_style_fix worktrees keyed by clean-fix project identity."""
+    worktrees: dict[str, list[str]] = {}
+    if not RUST_DIR.exists():
+        return worktrees
+    for path in sorted(RUST_DIR.glob("*_style_fix")):
+        if not path.is_dir():
+            continue
+        marker = path / ".clean-fix-project"
+        try:
+            key = marker.read_text(errors="replace").strip()
+        except OSError:
+            key = ""
+        project = key or path.name.removesuffix("_style_fix")
+        worktrees.setdefault(project, []).append(path.name)
+    return worktrees
+
+
+def pending_status(pending: dict[str, object]) -> str:
+    markdown = pending.get("evaluation_markdown", "")
+    text = markdown if isinstance(markdown, str) else ""
+    if not text:
+        return "missing"
+    finding_count = markdown_finding_count(text)
+    has_review_log = "## Review Log" in text
+    has_fix_summary = "## Fix Summary" in text
+    phase = pending.get("phase", "")
+    if finding_count > 0 and has_fix_summary and phase == "fix_failed":
+        return "fix_failed_findings"
+    if finding_count > 0 and has_fix_summary:
+        return "fixed_findings"
+    if finding_count > 0 and has_review_log:
+        return "reviewed_findings"
+    if finding_count > 0:
+        return "findings"
+    return "no_findings"
+
+
+def pending_stop_reason(pending: dict[str, object]) -> str:
+    raw = pending.get("stop_reason", "")
+    if isinstance(raw, str) and raw:
+        return slugify_reason(raw)
+    return ""
+
+
+def current_state_result() -> ParseResult:
+    result = ParseResult(path=Path(CURRENT_STATE_LABEL))
+    for phase in PHASES:
+        result.stats[phase] = PhaseStats()
+    result.status = "current"
+    result.run_start = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    roots = target_roots_by_project()
+    worktrees = style_fix_worktrees_by_project()
+    now_epoch = time.time()
+
+    for project in sorted(roots):
+        row = get_row(result.rows, project)
+        root = roots[project]
+        pending = pending_payload(project)
+        hb = eval_heartbeat_status(project, now_epoch)
+        if root.exists() and not (root / "Cargo.toml").exists():
+            row["eval"] = Cell("FAIL", "missing-cargo-toml")
+            result.warnings.append(
+                Warning("eval", project, f"project root has no Cargo.toml: {root}")
+            )
+            continue
+        if not root.exists():
+            row["eval"] = Cell("FAIL", "project-root-missing")
+            result.warnings.append(
+                Warning("eval", project, f"project root missing: {root}")
+            )
+            continue
+
+        if pending:
+            status = pending_status(pending)
+            if status == "missing":
+                if hb is not None and hb["fresh"]:
+                    row["eval"] = Cell("RUNNING", "running")
+                    result.running.append(Warning("eval", project, describe_running(hb)))
+                else:
+                    row["eval"] = Cell("SKIP", "evaluation-started")
+                    result.skip_reasons.append(
+                        SkipReason("eval", "evaluation started but has no markdown yet", project)
+                    )
+            elif status == "no_findings":
+                row["eval"] = Cell("OK", "no-findings")
+            elif status == "findings":
+                row["eval"] = Cell("OK", pending_stop_reason(pending))
+                row["review"] = Cell("SKIP", "awaiting-review")
+                result.skip_reasons.append(
+                    SkipReason("review", "new style findings awaiting review", project)
+                )
+            elif status == "reviewed_findings":
+                row["eval"] = Cell("SKIP", "reviewed-findings-awaiting-fix")
+                row["review"] = Cell("OK")
+                result.skip_reasons.append(
+                    SkipReason("eval", "reviewed findings awaiting fix", project)
+                )
+            elif status == "fixed_findings":
+                if pending_fix_is_approval_only(project):
+                    reason = (
+                        "evaluation ran; worktree intentionally unchanged because "
+                        "proposed fixes need your approval"
+                    )
+                    row["eval"] = Cell("SKIP", slugify_reason(reason))
+                    row["fix"] = Cell("SKIP", "approval-needed")
+                    result.skip_reasons.append(SkipReason("eval", reason, project))
+                else:
+                    row["review"] = Cell("OK")
+                    row["fix"] = Cell("OK")
+                    markdown = pending_evaluation_markdown(project)
+                    if "## Fix Verification" in markdown:
+                        row["verify"] = Cell("OK")
+            elif status == "fix_failed_findings":
+                row["eval"] = Cell("SKIP", "failed-style-fix-needs-attention")
+                row["review"] = Cell("OK")
+                row["fix"] = Cell("FAIL", "fix-failed")
+                result.skip_reasons.append(
+                    SkipReason("eval", "a failed style fix needs attention", project)
+                )
+                result.warnings.append(
+                    Warning("fix", project, "style fix failed; inspect the pending handoff")
+                )
+        else:
+            row["eval"] = Cell("SKIP", "idle")
+            if project in worktrees:
+                row["fix"] = Cell("SKIP", "style-fix-worktree-exists")
+                result.notes.append(
+                    f"{project}: {', '.join(worktrees[project])} exists but no pending clean-fix handoff is recorded."
+                )
+
+    newest = find_newest_log()
+    if newest is not None:
+        live = parse_log(newest)
+        if live.status == "in-progress":
+            result.notes.append(f"live log overlay: {newest}")
+            for project, live_row in live.rows.items():
+                if project not in result.rows:
+                    continue
+                row = result.rows[project]
+                for phase in PHASES:
+                    if live_row[phase].state != CELL_DASH:
+                        row[phase] = live_row[phase]
+            result.warnings.extend(live.warnings)
+            result.running.extend(live.running)
+            result.tool_warnings.extend(live.tool_warnings)
+            result.skip_reasons.extend(live.skip_reasons)
+            result.phase_now.update(live.phase_now)
+
+    recompute_current_stats(result)
+    return result
+
+
+def recompute_current_stats(result: ParseResult) -> None:
+    forced_present = {"eval", "review", "fix", "verify"}
+    for phase in PHASES:
+        stats = PhaseStats(present=phase in forced_present)
+        for row in result.rows.values():
+            state = row[phase].state
+            if state == CELL_DASH:
+                continue
+            stats.present = True
+            if state == "OK":
+                stats.ok += 1
+            elif state == "FAIL":
+                stats.fail += 1
+            elif state == "SKIP":
+                stats.skip += 1
+            elif state == "RUNNING":
+                stats.running += 1
+        result.stats[phase] = stats
+
+
 def mark_crashed_fix_phase(
     lines: list[str], bounds: dict[str, tuple[int, int]], result: ParseResult
 ) -> None:
@@ -1486,6 +1661,12 @@ def row_reason(result: ParseResult, project: str) -> str:
             if handoff is not None:
                 continue  # folded into the eval handoff clause
             add("fix applied — worktree ready for /style_fix_review")
+        elif result.status == "current" and phase == "eval" and cell.state == "SKIP" and cell.reason == "idle":
+            add("idle; no open clean-fix state")
+        elif result.status == "current" and phase == "fix" and cell.state == "SKIP" and cell.reason == "style-fix-worktree-exists":
+            add("style_fix worktree exists but no pending handoff is recorded")
+        elif result.status == "current" and phase == "fix" and cell.state == "SKIP" and cell.reason == "approval-needed":
+            continue
         elif phase == "eval" and cell.state == "OK" and cell.reason == "no-findings":
             add("no violations found")
         elif (
@@ -1564,7 +1745,11 @@ def format_age(seconds: float) -> str:
 
 
 def emit_full_report(result: ParseResult) -> None:
-    mtime_age = format_age(time.time() - result.path.stat().st_mtime)
+    mtime_age = (
+        format_age(time.time() - result.path.stat().st_mtime)
+        if result.path.exists()
+        else "-"
+    )
     print(f"PATH: {result.path}")
     print(f"MTIME_AGO: {mtime_age}")
     print(f"RUN_START: {result.run_start}")
@@ -1679,7 +1864,8 @@ def emit_phase_detect(path: Path) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    _ = parser.add_argument("path", nargs="?", help="log path; default = newest in ~/.local/logs/clean-fix/")
+    _ = parser.add_argument("path", nargs="?", help="log path, or 'latest' for the newest log; omitted = current keyed-project state")
+    _ = parser.add_argument("--latest-log", action="store_true", help="parse the newest log instead of current keyed-project state")
     _ = parser.add_argument("--list", action="store_true", help="list available logs with summaries")
     _ = parser.add_argument("--phase-detect", metavar="LOG", help="detect current phase of a log (for /clean_fix monitor)")
     _ = parser.add_argument("--filter-regex", action="store_true", help="print live-monitor filter regex")
@@ -1687,6 +1873,7 @@ def main() -> None:
 
     filter_regex = cast(bool, getattr(args, "filter_regex"))
     list_mode = cast(bool, getattr(args, "list"))
+    latest_log = cast(bool, getattr(args, "latest_log"))
     phase_detect = cast("str | None", getattr(args, "phase_detect"))
     path_arg = cast("str | None", getattr(args, "path"))
 
@@ -1702,17 +1889,20 @@ def main() -> None:
         emit_phase_detect(Path(phase_detect))
         return
 
-    if path_arg is not None:
-        log_path = Path(path_arg)
-        if not log_path.exists():
-            print(f"ERROR: log not found: {log_path}")
-            sys.exit(1)
-    else:
+    if latest_log or path_arg in {"latest", "newest"}:
         found = find_newest_log()
         if not found:
             print("ERROR: no clean-fix logs available")
             sys.exit(1)
         log_path = found
+    elif path_arg is not None:
+        log_path = Path(path_arg)
+        if not log_path.exists():
+            print(f"ERROR: log not found: {log_path}")
+            sys.exit(1)
+    else:
+        emit_full_report(current_state_result())
+        return
 
     result = parse_log(log_path)
     emit_full_report(result)

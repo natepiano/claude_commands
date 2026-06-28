@@ -6,10 +6,11 @@ Render a status view of one clean-fix run from a parsed log. All log discovery, 
 
 `$ARGUMENTS` may be:
 
-1. **Empty** — call `clean_fix_report_parse.py` with no arguments. The parser picks the newest log in `~/.local/logs/clean-fix/`.
+1. **Empty** — call `clean_fix_report_parse.py` with no arguments. The parser renders the current clean-fix state for every keyed `[projects]` target, independent of whichever log was written last.
 2. **The literal word `list`** — call `clean_fix_report_parse.py --list`. Print the numbered list (path, date, time, duration, status, phases). Ask the user to pick by index, then call `clean_fix_report_parse.py <chosen-path>` and render.
-3. **A path** — call `clean_fix_report_parse.py <path>`. If the parser exits with `ERROR: log not found`, surface that and stop.
-4. **Any other token** (e.g. `rebuild`, which `clean-fix.sh` substitutes in its headless invocation) — treat as Empty: newest log.
+3. **The literal word `latest` or `newest`** — call `clean_fix_report_parse.py --latest-log`. This is the explicit old behavior: parse the newest log in `~/.local/logs/clean-fix/`.
+4. **A path** — call `clean_fix_report_parse.py <path>`. If the parser exits with `ERROR: log not found`, surface that and stop.
+5. **Any other token** (e.g. `rebuild`, which `clean-fix.sh` substitutes in its headless invocation) — treat as Empty: current keyed-project state.
 
 ## Parser output format
 
@@ -19,7 +20,7 @@ MTIME_AGO: <age>
 RUN_START: <ts>
 RUN_END: <ts>
 ELAPSED: <duration | "-">
-STATUS: complete | crashed | partial | in-progress
+STATUS: complete | crashed | partial | in-progress | current
 
 PHASE <name> present=<bool> ok=N fail=N skip=N [footer_ok=N footer_fail=N footer_total=N]
 ROW <project>  clean=<cell> warmup=<cell> eval=<cell> review=<cell> fix=<cell> verify=<cell> reason="<short reason | ->" [phase_now="<live phase>"]
@@ -61,6 +62,8 @@ Use plain language. No "matrix", "cell", "flag", "footer", or "reconcile" jargon
 Report for: <PATH>
 Run: <RUN_START> → <RUN_END> (<ELAPSED>, <STATUS>)
 ```
+
+If `STATUS` is `current`, render `Current state as of: <RUN_START>` instead of a run window.
 
 If `STATUS` is `partial` or `in-progress`, replace the parenthetical with `partial log` or `still running`.
 
