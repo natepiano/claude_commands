@@ -18,6 +18,8 @@ First, look at the file list from <AnalyzeChanges/>. If none of the uncommitted 
 
 Otherwise, check your own conversation context to determine whether `/clippy` has been run recently — i.e., whether the `clippy` skill has been invoked in this session **after the most recent Rust code changes**.
 
+When the `clippy` skill runs (from here or otherwise), its `<StyleReview/>` step must be done inline, not delegated to a subagent — the user needs to track progress through the whole workflow, not wait on an unauditable subagent turn.
+
 - **If `/clippy` has been run recently after the latest Rust edits**: Proceed silently to the next step. Do NOT ask the user. Do NOT mention clippy. Do not take an extra turn.
 - **If `/clippy` has NOT been run recently** (or no clippy run is visible in context at all): Ask the user exactly once:
 

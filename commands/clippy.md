@@ -219,6 +219,8 @@ truth that maps clippy lints to the rule that governs them.
 <StyleReview>
 **This step runs unconditionally** — even if mend and clippy found zero issues.
 
+**Do this step yourself — do not delegate it to a subagent** (Task/Agent tool, Codex sub-session, etc.). Run the diff commands and the rule-by-rule walk inline in this conversation so the user can watch progress rule-by-rule instead of waiting on an unauditable subagent turn.
+
 1. Build the combined diff of uncommitted work, then the additions-only text from it. **Untracked files are always included** — a new file is entirely added code, so `git diff --no-index /dev/null <file>` renders it as all-additions. Never review only tracked changes:
    ```bash
    {
