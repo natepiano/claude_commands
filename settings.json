@@ -64,7 +64,7 @@
       "/tmp/claude/"
     ]
   },
-  "model": "sonnet",
+  "model": "claude-fable-5[1m]",
   "hooks": {
     "SessionStart": [
       {

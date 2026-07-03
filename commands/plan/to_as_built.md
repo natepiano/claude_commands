@@ -151,7 +151,20 @@ must include:
     statements.
 - For each affected doc, **apply the correction in place** — edit the stale
   types/signatures/invariants/behavior so the doc matches what now exists. Fix,
-  do not flag.
+  do not flag. This is a **correct-everything pass**: an `Archived`/`Superseded`
+  banner does **not** exempt a doc.
+- **As-built means as-built: describe only the current design.** An as-built doc
+  is not a history. Do **not** preserve retrospectives, phase-by-phase records,
+  "today's model (what gets replaced)" sections, dated decision logs, or
+  narration of an old design that a later design superseded. When you hit that
+  material, delete it or rewrite it to the current state — do not keep it as
+  "history." The **only** reason to retain something about an old approach is if
+  it would help a developer working in this code today (e.g. a still-live
+  migration shim they must not remove, or a gotcha that still bites); that is
+  rare. When in doubt, cut it. If stripping the historical narrative leaves a
+  doc that is wholly about a replaced/removed design, treat it as `obsolete`
+  (return path + reason for the orchestrator to confirm deletion) rather than
+  keeping a hollow record.
 - If a doc is rendered **wholly obsolete** (its feature was replaced/removed),
   do **not** delete it. Return its path plus a one-line reason in an
   `obsolete` list for the orchestrator to confirm.

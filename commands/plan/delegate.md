@@ -1,10 +1,10 @@
 ---
-description: Delegate coding work to a Codex CLI session — Claude orchestrates, codex codes. Pass a plan doc, a phase, free-text instructions, or any combination. After implementation, a fresh blind codex session reviews the diff in parallel with Claude's own review; Claude synthesizes both and presents a verdict.
+description: Delegate coding work to a Codex CLI session — the main agent orchestrates, codex codes. Pass a plan doc, a phase, free-text instructions, or any combination. After implementation, a fresh blind codex session reviews the diff in parallel with the main agent's own review; the main agent synthesizes both and presents a verdict.
 ---
 
 # Delegate
 
-**Purpose:** Claude is the design/orchestration brain; codex does all coding. This command composes an implementation work order, dispatches it to codex, runs a dual review (a fresh blind codex session + Claude's own analysis), synthesizes the results, and routes fixes back to codex.
+**Purpose:** The main agent (the session running this command) is the design/orchestration brain; codex does all coding. This command composes an implementation work order, dispatches it to codex, runs a dual review (a fresh blind codex session + the main agent's own analysis), synthesizes the results, and routes fixes back to codex.
 
 **Usage:** `/plan:delegate [plan-doc-path] [phase N] [free-text instructions]`
 
@@ -128,7 +128,7 @@ gate rather than a partial list of Cargo or `lint ...` commands.]
 ---
 
 <DualReview>
-**Goal:** Two independent reviews of the diff — a fresh blind codex session and Claude's own — running concurrently.
+**Goal:** Two independent reviews of the diff — a fresh blind codex session and the main agent's own — running concurrently.
 
 **Step 1 — Capture the diff:**
 Run `git diff` and `git status --short` in ${WORKING_DIR}. For untracked new files, read them and include their contents.
@@ -170,8 +170,8 @@ If you find nothing, say so explicitly — do not invent findings.
 **Step 3 — Launch the codex review:**
 Run `bash ~/.claude/scripts/delegate/codex_review.sh "${SESSION_DIR}" "${WORKING_DIR}"` using Bash with `run_in_background: true` and `dangerouslyDisableSandbox: true`.
 
-**Step 4 — Claude's own review, while codex reviews:**
-(Claude MAY read ${IMPL_SUMMARY} — only the codex reviewer is blind.)
+**Step 4 — the main agent's own review, while codex reviews:**
+(The main agent MAY read ${IMPL_SUMMARY} — only the codex reviewer is blind.)
 1. Read every changed file (or changed sections for large files)
 2. Verify against the spec: correctness, completeness, nothing extra
 3. Check codebase consistency and — for Rust — style-guide conformance
@@ -180,7 +180,7 @@ Run `bash ~/.claude/scripts/delegate/codex_review.sh "${SESSION_DIR}" "${WORKING
 
 **Step 5 — Collect:** when the background task notification arrives, read ${SESSION_DIR}/review_status:
 - **"reviewed":** Read ${SESSION_DIR}/review_findings.txt → ${CODEX_REVIEW}
-- **"error":** Read ${SESSION_DIR}/review_codex.log, tell the user the codex review failed, and proceed on Claude's review alone (say so explicitly).
+- **"error":** Read ${SESSION_DIR}/review_codex.log, tell the user the codex review failed, and proceed on the main agent's review alone (say so explicitly).
 </DualReview>
 
 ---
@@ -237,7 +237,28 @@ manufacture consensus.]
 The numbered items in **What's left** and the rows in **Reference** must use the
 same numbers so the user can cross-walk if they want detail.
 
-3. If there are blocker or minor issues, offer the choices the same way — each
+3. **DIRECT-FIX EXCEPTION (post-review only).** Before offering choices, check
+whether every remaining confirmed issue is one of:
+- a **documentation-only update** (doc comments, markdown, plan docs — no code
+  behavior change), or
+- a **trivial change** — a fix so small and mechanical that dispatching a codex
+  session would cost more than the fix itself (a one-line correction, a typo, a
+  rename already agreed on). Not trivial: anything touching logic, error
+  handling, or more than a couple of lines.
+
+If ALL remaining issues qualify AND both reviews agree on them (the codex
+reviewer flagged it or its review is consistent with it, and the main agent's
+own review confirms it), the main agent applies the fixes directly — do NOT ask the user, do NOT
+dispatch a fix pass to codex. Then tell the user in one or two sentences exactly
+what was changed and why it qualified (doc-only / trivial). Skip the choice
+menu and continue to <RunPhaseReview/>.
+
+If even one remaining issue is substantial, or the reviews disagree, the
+exception does not apply — everything routes through the normal choice menu
+below. This exception is only available after <DualReview/> has run; it never
+applies to the initial implementation.
+
+4. Otherwise, if there are blocker or minor issues, offer the choices the same way — each
 option one sentence, no jargon, with a recommendation and the reason for it:
 
 ```
@@ -255,13 +276,13 @@ the cap is relevant, state it without jargon inside option 1.
 
 **STOP and wait for the user.**
 
-- **1:** If ${FIX_PASS} >= 2, tell the user the fix-pass cap is reached and recommend either accepting, discussing, or explicitly authorizing Claude to fix directly. Otherwise increment ${FIX_PASS}, write ${SESSION_DIR}/fix_prompt_${FIX_PASS}.md (same structure as the work order, spec = the confirmed issues table with file/line specifics, same no-commit rules and style requirements), run `codex_implement.sh "${SESSION_DIR}" "${WORKING_DIR}" "${SESSION_DIR}/fix_prompt_${FIX_PASS}.md"` (background, unsandboxed), then re-execute <DualReview/> and <Synthesize/> scoped to the new changes.
+- **1:** If ${FIX_PASS} >= 2, tell the user the fix-pass cap is reached and recommend either accepting, discussing, or explicitly authorizing the main agent to fix directly. Otherwise increment ${FIX_PASS}, write ${SESSION_DIR}/fix_prompt_${FIX_PASS}.md (same structure as the work order, spec = the confirmed issues table with file/line specifics, same no-commit rules and style requirements), run `codex_implement.sh "${SESSION_DIR}" "${WORKING_DIR}" "${SESSION_DIR}/fix_prompt_${FIX_PASS}.md"` (background, unsandboxed), then re-execute <DualReview/> and <Synthesize/> scoped to the new changes.
 - **2:** Continue to <RunPhaseReview/>.
 - **3:** Discuss; afterwards re-offer the options.
 
 If there are no issues (or nits only), state that and continue to <RunPhaseReview/>.
 
-**RULE:** Claude does not write or edit implementation code in this command unless the user explicitly says so. All fixes route to codex by default.
+**RULE:** The main agent does not write or edit implementation code in this command unless the user explicitly says so. All fixes route to codex by default. Sole exception: the direct-fix exception above (doc-only or trivial post-review fixes both reviews agree on).
 </Synthesize>
 
 ---
@@ -281,5 +302,5 @@ If the work was not from a phased plan, skip this step silently and end.
 - ${WORKING_DIR} is whatever the current project directory is — often a worktree checkout. Never create a worktree, switch branches, or commit.
 - All codex-launching scripts run with `dangerouslyDisableSandbox: true` and `run_in_background: true`.
 - The codex reviewer is always a fresh session and always blind to the implementer's summary.
-- Claude orchestrates and reviews; codex codes. Claude touches implementation code only on explicit user instruction.
+- The main agent orchestrates and reviews; codex codes. The main agent touches implementation code only on explicit user instruction — except post-review doc-only or trivial fixes that both reviews agree on (see the direct-fix exception in <Synthesize>), which the main agent applies itself and reports.
 - Max 2 codex fix passes per delegation before escalating to the user.

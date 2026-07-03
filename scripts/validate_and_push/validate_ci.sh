@@ -153,9 +153,20 @@ run_configured_target_checks() {
   done < "$targets_file"
 }
 
-run_step "rustfmt" "$LINT_CMD" fmt --check
+# Run rustfmt/taplo in write mode rather than --check. The clean-worktree guard
+# above guarantees the tree is clean here, so any reformatting they produce is
+# the only change and can be amended into the last commit before validation
+# continues. run_step still aborts on a real fmt/taplo error (non-zero exit).
+run_step "rustfmt" "$LINT_CMD" fmt
 
-run_step "taplo" taplo fmt --check
+run_step "taplo" taplo fmt
+
+if ! git diff --quiet; then
+  echo "=== STEP: amend formatting fixes ==="
+  git add -A
+  git commit --amend --no-edit --quiet
+  echo "Amended rustfmt/taplo formatting fixes into the last commit; continuing validation."
+fi
 
 run_step "clippy" cargo clippy --workspace --all-features --tests -- -D warnings
 

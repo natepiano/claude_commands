@@ -6,6 +6,8 @@ Run `~/.claude/scripts/validate_and_push/validate_and_push.sh` with `dangerously
 
 The script runs local validation, chooses the push path, pushes directly when branch rules allow it, and watches CI. It exits successfully only after the direct-push CI path completes successfully.
 
+Validation requires a clean worktree. Because the tree is clean at that point, the rustfmt and taplo steps run in write mode: if either reformats a file, the changes are amended into the last commit (`git commit --amend --no-edit`) and validation continues automatically. A genuine fmt/taplo error (non-zero exit) still aborts. All other steps (clippy, tests, cargo-mend) remain check-only and abort on failure.
+
 If the script exits with code `2`, the current branch is the default branch and GitHub branch rules require a PR. The script prints JSON with:
 
 - `status: "needs_pr_branch"`
