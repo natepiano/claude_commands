@@ -64,6 +64,7 @@
       "/tmp/claude/"
     ]
   },
+  "model": "claude-fable-5[1m]",
   "hooks": {
     "SessionStart": [
       {
@@ -146,6 +147,5 @@
   "voiceEnabled": true,
   "feedbackSurveyState": {
     "lastShownTime": 1754090074729
-  },
-  "model": "claude-fable-5[1m]"
+  }
 }
