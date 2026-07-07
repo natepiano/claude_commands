@@ -1,5 +1,5 @@
 ---
-description: Multi-agent API review — ergonomics, simplicity, duplication removal, module structure/naming, and judicious trait/generic use — across a crate or workspace member's public + internal API. Four review agents, an adversarial validation pass, then a delegate-compatible phased implementation plan written to the docs directory.
+description: Multi-agent API review — ergonomics, performance, simplicity, duplication removal, module structure/naming, and judicious trait/generic use — across a crate or workspace member's public + internal API. Five review agents, an adversarial validation pass, then a delegate-compatible phased implementation plan written to the docs directory.
 ---
 
 **IMPORTANT**: Do NOT modify any source code. This command produces a review doc with an implementation plan — implementation happens via `/plan:to_phased_plan` + `/plan:delegate` or a follow-up turn.
@@ -58,14 +58,15 @@ Capture as `${INVENTORY}` — item list plus file paths. Every agent prompt gets
 ---
 
 <ReviewPass>
-**Goal:** four agents review the API along four lenses.
+**Goal:** five agents review the API along five lenses.
 
-Launch **4 Explore agents in parallel**. Each prompt includes this preamble verbatim:
+Launch **5 Explore agents in parallel**. Each prompt includes this preamble verbatim:
 
 ```
-Before evaluating, load the Rust style guide:
-  zsh ~/.claude/scripts/rust_style/load-rust-style.sh
-If the output mentions a saved file path, Read that file. Apply the loaded rules — including forbidden-words.md — to every word of every finding you return.
+Before evaluating:
+1. Read ~/rust/nate_style/review-charter.md — its ranked values, hard rules, and finding schema govern every finding you return.
+2. Load the Rust style guide: zsh ~/.claude/scripts/rust_style/load-rust-style.sh
+   If the output mentions a saved file path, Read that file. Apply the loaded rules — including forbidden-words.md — to every word of every finding you return.
 ```
 
 Then the per-agent body, with `${INVENTORY}` and this shared context:
@@ -76,7 +77,7 @@ Then the per-agent body, with `${INVENTORY}` and this shared context:
 >
 > The review subject is exactly the in-scope items in the inventory (when a focus is set, that subset — not the whole crate; state the focus here). Items marked as callers/context inform findings (they show real usage) but do not get findings of their own.
 
-Shared output format per finding: Title / Where (paths + item names) / Observation (concrete — show the current call site) / Severity (critical / important / minor) / Recommendation (with a before/after sketch of the call site where it clarifies).
+Output format per finding: the charter's finding schema (omit Class — this command doesn't distinguish).
 
 **Agent A — Ergonomics**
 > Evaluate call-site ergonomics across `${INVENTORY}` — public and internal entry points alike. For each: how many steps/imports/type annotations does a typical use take? Judge naming (guessable? consistent verb/noun conventions?), defaults (`Default` impls, builder vs N-arg constructors), parameter types (accept `impl Into<T>`/`AsRef` where it removes caller ceremony), error types (can the caller do something with the error?), and discoverability (does the crate root re-export the things users need, or must callers know deep paths?). Ground truth is real call sites: examples/ and tests/ for public items, sibling-module callers for internal ones — flag anywhere the calling code is awkward.
@@ -88,7 +89,7 @@ Shared output format per finding: Title / Where (paths + item names) / Observati
 
 **Agent C — Trait and generic opportunities (two-sided)**
 > Evaluate where traits or generics would genuinely help — and where existing ones hurt. Rules:
-> - A trait is only justified with **more than one available implementer** (existing in the codebase, or a second one this review's plan concretely creates). One implementer = concrete type, no trait.
+> - A trait is only justified with **more than one available implementer** (existing in the codebase, or a second one this review's plan concretely creates). One implementer = concrete type, no trait. Exception: a deliberate extension point for downstream crates, with that intent stated in the trait's doc comment.
 > - A generic is justified only when it removes real duplication or widens usability without adding caller-side type ceremony (turbofish, unresolvable inference).
 > - Side 1 — opportunities: duplicated impls a trait would unify, copy-paste functions a generic would collapse, sealed-trait or extension-trait patterns that would clean the surface.
 > - Side 2 — over-abstraction: existing traits with one implementer, generics with one instantiation, `where`-clause walls. Recommend concretizing.
@@ -101,18 +102,23 @@ Shared output format per finding: Title / Where (paths + item names) / Observati
 > - **Cohesion.** Things that change together live together. Flag types/functions split across modules that every change touches in tandem, and unrelated items sharing a module.
 > - **Size.** A module over ~500 non-test lines is a split indicator (use `wc -l` plus `awk '/^#\[cfg\(test\)\]/{print NR; exit}'` to exclude inline tests). For each over-size module, propose the split along its natural seams — anchor types first — citing `when-to-split-a-module.md`.
 
+**Agent E — Performance**
+> Evaluate the runtime cost the API's shape imposes on callers. Flag: signatures that force allocation or clones at the boundary (owned `String`/`Vec` params where a borrow works, `.clone()` the caller can't avoid), dynamic dispatch (`Box<dyn Trait>`, `&dyn`) where static dispatch works, copies at module/crate boundaries, and work done per-call that could be amortized into construction/setup. If `${IS_BEVY}`: scrutinize anything on a per-frame path — allocation, lookup, or event churn each frame that setup-time registration would remove.
+>
+> Two-sided, per the charter's tie-breaks: also flag performance ceremony that isn't paying rent — lifetimes/generics that complicate every call site with no hot-path justification. When another lens's likely recommendation (e.g. `impl Into<T>` sugar) carries a cost on a hot path, say so explicitly with the cost named.
+
 Collect findings as `${FINDINGS}`.
 </ReviewPass>
 
 ---
 
 <ValidationPass>
-**Goal:** adversarially stress-test the findings before they become a plan. Merge and dedupe `${FINDINGS}` first, then launch **2 Explore agents in parallel** (same style-guide preamble), each given the merged findings and `${INVENTORY}`:
+**Goal:** adversarially stress-test the findings before they become a plan. Merge and dedupe `${FINDINGS}` first, then launch **2 Explore agents in parallel** (same charter + style-guide preamble), each given the merged findings and `${INVENTORY}`:
 
-**Agent E — Feasibility and blast radius**
-> For each recommendation: count actual call sites that break (`rg` for the item across crate + workspace), name semver/behavior hazards, and check the before/after sketch actually compiles conceptually (ownership, lifetimes, object safety for proposed traits). Verify every proposed trait's implementer count — kill any that lands at one. For module moves/renames/splits, count broken `use` paths and flag visibility shifts (`pub(super)`/`pub(crate)` items that stop resolving). Rank surviving recommendations by benefit-to-churn.
+**Agent F — Feasibility and blast radius**
+> For each recommendation: count actual call sites that break (`rg` for the item across crate + workspace), name semver/behavior hazards, and check the before/after sketch actually compiles conceptually (ownership, lifetimes, object safety for proposed traits). Verify every proposed trait's implementer count — kill any that lands at one, unless it is a documented extension point for downstream implementers. Flag any recommendation that adds runtime cost (allocation, dispatch, copies) without the charter-required cost callout. For module moves/renames/splits, count broken `use` paths and flag visibility shifts (`pub(super)`/`pub(crate)` items that stop resolving). Rank surviving recommendations by benefit-to-churn.
 
-**Agent F — Over-engineering check**
+**Agent G — Over-engineering check**
 > Attack each recommendation as a skeptic: does it make the common call site simpler, or just different? Does it add a concept callers must learn? Would the author's own examples get shorter? Kill or demote anything that trades caller simplicity for internal elegance. "Reject" is a valid verdict per finding.
 
 Apply the verdicts: drop killed findings silently, adjust demoted ones. Conflicts between agents: caller-side simplicity wins.

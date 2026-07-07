@@ -83,21 +83,29 @@ Under ${REVIEW_POSTURE} = **open**: premise-challenges are first-class; this fir
 <LaunchExpertTeam>
 **Goal:** Launch parallel expert agents to analyze the topic from different dimensions.
 
-Launch **3-5 agents in parallel** using the Agent tool, each with a distinct analytical lens. Choose dimensions appropriate to ${REVIEW_TOPIC}. Common dimensions include:
+Launch **3-5 agents in parallel** using the Agent tool, each with a distinct analytical lens. Every agent prompt begins with this preamble verbatim:
+
+```
+Before evaluating, Read ~/rust/nate_style/review-charter.md — its ranked values, hard rules, and finding schema govern every finding you return. Follow its style-guide loading rule when the subject is Rust.
+```
+
+Choose dimensions appropriate to ${REVIEW_TOPIC}. When the subject is code or a design that shapes code, the charter's four values — ergonomics, performance, type-system leverage, simplicity — must each be covered by some agent's lens (one agent may cover two). Common dimensions include:
 
 - **Correctness & Completeness** — Does the design correctly and completely achieve ${REVIEW_INTENT}? What's missing, what edge cases or gaps would stop it working as intended? (Whether the *approach itself* is correct is a premise-challenge — see `<IntentFirewall/>`.)
 - **Architecture & Design** — Given the committed approach, is the structure sound, are responsibilities well-separated, does it achieve ${REVIEW_INTENT} cleanly, and will it scale *within that approach*? A "simpler alternative" or "don't do this" is a premise-challenge — raise it only under `<IntentFirewall/>`, not as a default lens.
 - **Risk & Failure Modes** — What can go wrong? What are the assumptions? Where are the fragile points? What happens under unexpected conditions?
 - **Implementation Quality** — Is the code clean? Are there performance concerns? Dead code? Unnecessary complexity?
-- **Type System & Changeability** (Rust projects) — As an advanced Rust type system expert, evaluate: Are types encoding invariants that the compiler can enforce? Could newtypes, enums, or marker types replace runtime checks? Are state transitions modeled in the type system? Would generics or trait bounds make the code more flexible without sacrificing clarity? Are there stringly-typed patterns or primitive obsession that types could eliminate? Focus on how type-level design affects readability and how easy it is to change the code safely.
+- **Type System & Changeability** (Rust projects) — As an advanced Rust type system expert, evaluate: Are types encoding invariants that the compiler can enforce? Could newtypes, enums, or marker types replace runtime checks? Are state transitions modeled in the type system? Would generics or trait bounds make the code more flexible without sacrificing clarity? Are there stringly-typed patterns or primitive obsession that types could eliminate? Focus on how type-level design affects readability and how easy it is to change the code safely. Trait/generic recommendations are bound by the loaded style rules (single-implementer traits and their extension-point exception included) — no caller-side type ceremony.
+- **Performance** — What runtime cost does the design impose: allocation or clones at boundaries, dynamic dispatch where static works, per-call work that setup could amortize, per-frame churn (Bevy)? Per the charter, a recommendation that adds cost must name it; performance ceremony with no hot-path justification is equally a finding.
 - **User Impact & Ergonomics** — How does this affect the end user or developer experience? Is the API intuitive? Are error messages helpful?
 
 **Each agent prompt must include:**
 0. **The stated intent and the mandate.** Include ${REVIEW_INTENT} and ${REVIEW_POSTURE}. Under `strengthen`, state verbatim: _"This intent and approach are a given. Your job is to make the design correctly and robustly achieve it — not to decide whether to do it or to propose a different approach. Only if you have decisive proof the design cannot achieve the intent, raise exactly one finding labeled PREMISE-CHALLENGE (see firewall). 'A simpler alternative exists', 'marginal benefit', 'the original bug is already fixed', and 'more code/risk' are not grounds to challenge."_
 1. The ${REVIEW_TOPIC} and relevant context (file paths, code patterns, architectural decisions)
 2. Their specific analytical dimension
-3. Instruction to return findings as a structured list where each finding has:
+3. Instruction to return findings as a structured list using the charter's finding schema:
    - **Title**: Brief name for the finding
+   - **Where**: File paths + item names (or doc section) the finding is about
    - **Class**: `design-improvement` or `PREMISE-CHALLENGE` (omit for mechanical findings)
    - **Problem**: What is wrong or concerning — explain the actual issue with enough context that someone unfamiliar would understand
    - **Impact**: Why it matters (severity: critical / important / minor)
