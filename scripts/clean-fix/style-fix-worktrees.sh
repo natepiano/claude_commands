@@ -431,9 +431,31 @@ project_env_for() {
 # differently (fix: discard the worktree; verify: keep the already-applied fix).
 #
 # Args: proj agent_work_dir prompt log_file sentinel_file sentinel_regex label detected_phase
+# Detect a codex usage/weekly-limit message in an agent log. Echoes a short
+# reset descriptor (e.g. "retry after 11:27 AM") when the agent bailed because it
+# ran out of credits, or nothing otherwise. Callers write the descriptor into the
+# run log as a durable `AGENT LIMIT:` line so the report can attribute the failure
+# to the credit wall even after this tmp agent log is deleted — the report parser
+# reads that line first, falling back to scanning the agent log only if absent.
+detect_agent_limit() {
+    local log_file="$1"
+    [[ -f "$log_file" ]] || return 0
+    grep -qiE "hit your (usage|weekly) limit" "$log_file" 2>/dev/null || return 0
+    local reset
+    reset=$(grep -oiE "try again at [0-9]{1,2}:[0-9]{2} ?[AP]M" "$log_file" 2>/dev/null | head -1)
+    if [[ -n "$reset" ]]; then
+        reset="retry after ${reset##* at }"
+    else
+        reset=$(grep -oiE "resets? [^.\`]+" "$log_file" 2>/dev/null | head -1)
+    fi
+    [[ -z "$reset" ]] && reset="out of credits"
+    printf '%s' "$reset"
+}
+
 # Sets: SUPERVISE_AGENT_CODE  (agent exit code; 143 if grace-SIGTERMed, 124 on hard timeout)
 #       SUPERVISE_TIMED_OUT   (1 if hard-timeout-killed, else 0)
 #       SUPERVISE_ELAPSED     (wall seconds the agent ran, in 10s steps)
+#       SUPERVISE_AGENT_LIMIT (reset descriptor if the agent hit its usage limit, else "")
 supervise_agent() {
     local proj="$1"
     local agent_work_dir="$2"
@@ -447,6 +469,7 @@ supervise_agent() {
     SUPERVISE_AGENT_CODE=0
     SUPERVISE_TIMED_OUT=0
     SUPERVISE_ELAPSED=0
+    SUPERVISE_AGENT_LIMIT=""
 
     # Phase-marker forwarding scans new bytes of the agent log inside the poll
     # loop below. We previously did this with a backgrounded
@@ -528,6 +551,8 @@ supervise_agent() {
             SUPERVISE_AGENT_CODE=124
             SUPERVISE_TIMED_OUT=1
             SUPERVISE_ELAPSED=$elapsed
+            SUPERVISE_AGENT_LIMIT=$(detect_agent_limit "$log_file")
+            [[ -n "$SUPERVISE_AGENT_LIMIT" ]] && echo "AGENT LIMIT: $proj (codex $SUPERVISE_AGENT_LIMIT)"
             return 0
         fi
     done
@@ -552,6 +577,8 @@ supervise_agent() {
     fi
     SUPERVISE_ELAPSED=$elapsed
     progress "$proj" "phase=${label}-exit code=$SUPERVISE_AGENT_CODE elapsed=${elapsed}s"
+    SUPERVISE_AGENT_LIMIT=$(detect_agent_limit "$log_file")
+    [[ -n "$SUPERVISE_AGENT_LIMIT" ]] && echo "AGENT LIMIT: $proj (codex $SUPERVISE_AGENT_LIMIT)"
     return 0
 }
 

@@ -34,6 +34,7 @@ PENDING_DIR = HISTORY_DIR / ".pending"
 # commands/clean_fix.md so /clean_fix monitor can consume it via --filter-regex.
 MONITOR_FILTER_REGEX = (
     r"(^|[[:space:]])(CLEAN|BUILD|MEND|DONE|ERROR|WARNING|TIMEOUT|RETRY|RETRY OK|RETRY FAILED|FAILED|WARN|OK|AUTOFINALIZE):"
+    r"|(^|[[:space:]])AGENT LIMIT:"
     r"|(^|[[:space:]])WARMUP (OK|FAIL|SKIP):"
     r"|(^|[[:space:]])Launched: "
     r"|^=== "
@@ -229,6 +230,10 @@ class ParseResult:
     always_excluded: list[tuple[str, str]] = field(default_factory=list)
     filtered_out: list[tuple[str, str]] = field(default_factory=list)
     notes: list[str] = field(default_factory=list)
+    # project -> short descriptor when a fix/verify agent bailed because codex
+    # (or another agent) hit its usage/weekly limit, e.g. "retry after 11:27 AM".
+    # These are infrastructure failures, not code failures.
+    agent_limits: dict[str, str] = field(default_factory=dict)
     # project -> live current-phase text, only for rows still running.
     phase_now: dict[str, str] = field(default_factory=dict)
 
@@ -263,6 +268,52 @@ def eval_failure_report_summary(report_path: Path) -> str | None:
         reset = limit_matches[-1].strip()
         return f"style eval agent hit weekly limit; resets {reset}"
     return f"see failure report: {report_path}"
+
+
+# A style-fix (or verify) agent that runs out of credits prints a provider
+# usage/weekly-limit line and exits — the pipeline then removes its worktree via
+# the normal failure cleanup. That looks identical to a code failure in the
+# table unless we attribute it. Two sources feed this, in priority order:
+#   1. `AGENT LIMIT: <proj> (codex <descriptor>)` — a durable line
+#      style-fix-worktrees.sh writes into the run log the moment it detects the
+#      limit, so attribution survives even after the tmp agent log is deleted.
+#   2. Fallback: read the per-agent log path captured from the launch marker and
+#      scan it directly (covers logs written before the durable line existed).
+AGENT_LIMIT_LINE_RE = re.compile(r"^AGENT LIMIT: (\S+) \(codex ([^)]+)\)")
+CODEX_LIMIT_MARKER_RE = re.compile(r"hit your (?:usage|weekly) limit", re.IGNORECASE)
+CODEX_LIMIT_RETRY_RE = re.compile(r"try again at\s*([0-9]{1,2}:[0-9]{2}\s*[AP]M)", re.IGNORECASE)
+CODEX_LIMIT_RESET_RE = re.compile(r"resets?\s*([^.\n`]+)", re.IGNORECASE)
+
+
+def codex_limit_descriptor(text: str) -> str | None:
+    """Return a short reset descriptor if `text` shows a codex usage/weekly limit.
+
+    e.g. "retry after 11:27 AM", "resets 5:30pm (America/New_York)", or the
+    generic "out of credits" when the message names no reset time. None when the
+    text carries no limit message at all.
+    """
+    if not CODEX_LIMIT_MARKER_RE.search(text):
+        return None
+    m = CODEX_LIMIT_RETRY_RE.search(text)
+    if m:
+        return f"retry after {m.group(1).strip()}"
+    m = CODEX_LIMIT_RESET_RE.search(text)
+    if m:
+        return f"resets {m.group(1).strip()}"
+    return "out of credits"
+
+
+def codex_limit_from_logs(paths: list[str]) -> str | None:
+    """First codex-limit descriptor found across the given agent log paths."""
+    for raw in paths:
+        try:
+            text = Path(raw).read_text(errors="replace")
+        except OSError:
+            continue
+        desc = codex_limit_descriptor(text)
+        if desc:
+            return desc
+    return None
 
 
 def find_newest_log() -> Path | None:
@@ -936,6 +987,10 @@ def parse_fix_phase(lines: list[str], result: ParseResult) -> None:
     verify_done: set[str] = set()
     verify_incomplete: dict[str, str] = {}
     verify_seen: set[str] = set()
+    # Agent usage-limit attribution: durable `AGENT LIMIT:` lines and the
+    # per-agent log paths captured from launch markers (see codex_limit_*).
+    agent_logs: dict[str, list[str]] = {}
+    durable_limits: dict[str, str] = {}
     eligible_re = re.compile(r"^ELIGIBLE: (\S+)")
     skip_re = re.compile(r"^SKIP: (\S+) \(([^)]+)\)")
     ok_re = re.compile(r"^OK: (\S+)")
@@ -944,10 +999,18 @@ def parse_fix_phase(lines: list[str], result: ParseResult) -> None:
     retry_error_re = re.compile(r"^ERROR: (\S+) \(([^)]+)\)")
 
     for line in lines:
+        lm = AGENT_LIMIT_LINE_RE.match(line)
+        if lm:
+            durable_limits[lm.group(1)] = lm.group(2)
+            continue
         m = PROGRESS_RE.match(line)
         if m:
             project, pname, prest = m.group(1), m.group(2), (m.group(3) or "")
             last_marker[project] = (pname, prest)
+            if pname.endswith("-launch"):
+                log_m = re.search(r"log=(\S+)", prest)
+                if log_m:
+                    agent_logs.setdefault(project, []).append(log_m.group(1))
             if pname == "verify-done":
                 verify_done.add(project)
                 verify_seen.add(project)
@@ -1071,6 +1134,71 @@ def parse_fix_phase(lines: list[str], result: ParseResult) -> None:
             _stage, human = describe_live_phase(pname, prest)
             result.phase_now[project] = human
 
+    # ── Reclassify fix/verify failures that were really agent usage-limit hits ──
+    _attribute_agent_limits(result, eligible, durable_limits, agent_logs)
+
+
+def _attribute_agent_limits(
+    result: ParseResult,
+    eligible: set[str],
+    durable_limits: dict[str, str],
+    agent_logs: dict[str, list[str]],
+) -> None:
+    """Reclassify fix/verify failures whose real cause was a codex usage/weekly
+    limit, so the report names the infrastructure cause instead of showing a
+    bare timeout/agent-exit that reads as a code failure."""
+    for project in eligible:
+        row = result.rows.get(project)
+        if row is None:
+            continue
+        fix_failed = row["fix"].state == "FAIL"
+        verify_failed = row["verify"].state == "FAIL"
+        if not (fix_failed or verify_failed):
+            continue
+        desc = durable_limits.get(project) or codex_limit_from_logs(
+            agent_logs.get(project, [])
+        )
+        if not desc:
+            continue
+        result.agent_limits[project] = desc
+        if not fix_failed:
+            continue  # verify-only: fix is applied & intact; run-level note covers it
+        limit_msg = f"codex hit its usage limit — {desc}; not a code failure"
+        row["fix"].reason = "codex-usage-limit"
+        # A limited project usually logged several fix warnings (timeout + retry).
+        # Collapse them into one limit-attributed warning so the report doesn't
+        # repeat the same project.
+        result.warnings = [
+            w
+            for w in result.warnings
+            if not (w.project == project and w.phase == "fix")
+        ]
+        result.warnings.append(Warning("fix", project, limit_msg))
+
+
+def synthesize_agent_limit_note(result: ParseResult) -> None:
+    """Emit one prominent heads-up when an agent usage-limit caused fix failures.
+
+    Groups every affected project into a single sentence so the user sees the
+    shared root cause (and that these are not code problems) instead of N
+    look-alike timeout rows.
+    """
+    if not result.agent_limits:
+        return
+    projects = sorted(result.agent_limits)
+    descriptors = list(result.agent_limits.values())
+    reset = next((d for d in descriptors if d != "out of credits"), descriptors[0])
+    n = len(projects)
+    noun = "project" if n == 1 else "projects"
+    note = (
+        f"codex hit its usage limit during the fix pass: {n} {noun} "
+        + f"({', '.join(projects)}) failed for that reason alone — not a code problem. "
+        + "The pipeline removed their _style_fix worktrees via its normal failure "
+        + f"cleanup; they are recreated once codex credits reset ({reset}). "
+        + "Re-run /clean_fix after that."
+    )
+    result.notes.append(note)
+
 
 # Plain-language for the internal pending statuses style-eval logs as
 # `SKIP: <proj> (pending <status>)`. (noun, what is awaited while still open).
@@ -1186,6 +1314,7 @@ def parse_log(path: Path) -> ParseResult:
     # Run last: eval reasons are now in their final plain form, so the queued-fix
     # rows the crash blocked can be identified by reason text.
     mark_crashed_fix_phase(lines, bounds, result)
+    synthesize_agent_limit_note(result)
     return result
 
 
@@ -1704,6 +1833,7 @@ def humanize_cell_reason(reason: str) -> str:
         "no-fix-summary": "no Fix Summary",
         "no-result": "no result",
         "retry-failed": "retry failed",
+        "codex-usage-limit": "codex usage limit reached",
     }
     return known.get(reason, reason.replace("-", " "))
 

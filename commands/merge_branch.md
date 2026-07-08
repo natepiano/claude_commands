@@ -13,17 +13,8 @@ Run `bash ~/.claude/scripts/merge_branch/discovery.sh`
 
 - If `status` is `"error"`, report the message and STOP
 - If `is_clean` is `false`, STOP and ask user to commit or stash first
-- Identify clean-fix style-fix candidates from the discovery results. A candidate is a branch
-  named `refactor/style` or starting with `refactor/style/` whose `worktree` basename ends in
-  `_style_fix`.
-- If exactly one clean-fix style-fix candidate exists, automatically select it: set
-  `SOURCE_BRANCH` to that candidate's branch name, tell the user which branch/worktree was
-  selected, and continue directly to STEP 2. Do not show the selection menu.
-- If more than one clean-fix style-fix candidate exists, list those candidates with their
-  worktree paths and STOP. Do not choose among multiple style-fix worktrees automatically and do
-  not continue the merge flow.
-- If no clean-fix style-fix candidate exists, present the branches list to the user clearly,
-  numbered for easy selection, showing the last commit for each
+- Present the full branches list to the user clearly, numbered for easy selection, showing the
+  last commit for each. Do not filter or auto-select — always show every branch.
 - If a branch has a `worktree` field, show the worktree path next to it (e.g. "[worktree: /path/to/wt]")
 
 ## Available Actions
@@ -32,9 +23,8 @@ Run `bash ~/.claude/scripts/merge_branch/discovery.sh`
 
 [STOP and wait for user response]
 
-If no clean-fix style-fix candidate was auto-selected, store the user's selection as
-SOURCE_BRANCH (must match a name from the discovery results). If user input doesn't match,
-display error and re-ask.
+Store the user's selection as SOURCE_BRANCH (must match a name from the discovery results). If
+user input doesn't match, display error and re-ask.
 
 **STEP 2: Validation**
 
