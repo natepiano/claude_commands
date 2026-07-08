@@ -97,13 +97,22 @@ cli_agent_run() {
     local agent="" model="" effort=""
     cli_agent_load agent model effort || return 1
 
+    # Empty effort means "use the agent CLI's own default" — omit the flag
+    # entirely rather than passing an empty value (codex rejects an empty
+    # model_reasoning_effort; claude --effort "" is likewise invalid).
+    local -a codex_effort_arg=() claude_effort_arg=()
+    if [[ -n "$effort" ]]; then
+        codex_effort_arg=(-c model_reasoning_effort="\"$effort\"")
+        claude_effort_arg=(--effort "$effort")
+    fi
+
     if [[ $# -eq 0 ]]; then
         case "$agent" in
             codex)
-                exec codex -m "$model" -c model_reasoning_effort="\"$effort\"" -c service_tier="fast"
+                exec codex -m "$model" ${codex_effort_arg[@]+"${codex_effort_arg[@]}"} -c service_tier="fast"
                 ;;
             claude)
-                exec claude --model "$model" --effort "$effort"
+                exec claude --model "$model" ${claude_effort_arg[@]+"${claude_effort_arg[@]}"}
                 ;;
         esac
     fi
@@ -111,10 +120,10 @@ cli_agent_run() {
     local invocation="$*"
     case "$agent" in
         codex)
-            exec codex -m "$model" -c model_reasoning_effort="\"$effort\"" -c service_tier="fast" "$invocation"
+            exec codex -m "$model" ${codex_effort_arg[@]+"${codex_effort_arg[@]}"} -c service_tier="fast" "$invocation"
             ;;
         claude)
-            exec claude --model "$model" --effort "$effort" -- "/$invocation"
+            exec claude --model "$model" ${claude_effort_arg[@]+"${claude_effort_arg[@]}"} -- "/$invocation"
             ;;
     esac
 }
