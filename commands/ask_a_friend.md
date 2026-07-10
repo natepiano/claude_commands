@@ -12,6 +12,9 @@ SCRIPT_PATH = ~/.claude/scripts/ask_a_friend/ask_a_friend.sh
 HISTORY_FILE = ${SESSION_DIR}/history.md
 ROUND_NUMBER = 1
 
+The consultation and implementation scripts resolve Codex model/effort defaults
+through `~/.claude/config/agents.conf`.
+
 ---
 
 <ExecutionSteps>

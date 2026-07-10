@@ -6,6 +6,21 @@
 # validation against the global model/effort allowlists.
 
 AGENTS_CONFIG_FILE="${AGENTS_CONFIG_FILE:-$HOME/.claude/config/agents.conf}"
+AGENTS_CONFIG_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+CODEX_CONFIG_FILE="${CODEX_CONFIG_FILE:-$HOME/.codex/config.toml}"
+CODEX_MODELS_CACHE_FILE="${CODEX_MODELS_CACHE_FILE:-$HOME/.codex/models_cache.json}"
+CODEX_CATALOG_SYNC_STATE_FILE="${CODEX_CATALOG_SYNC_STATE_FILE:-$HOME/.local/state/codex-agent-catalog-sync/last_success}"
+
+# Keep the materialized registry current between periodic launchd runs.
+if [[ -f "$AGENTS_CONFIG_FILE" \
+    && -x "$AGENTS_CONFIG_DIR/sync_codex_catalog.sh" \
+    && ( ! -f "$CODEX_CATALOG_SYNC_STATE_FILE" \
+        || "$CODEX_CONFIG_FILE" -nt "$CODEX_CATALOG_SYNC_STATE_FILE" \
+        || "$CODEX_MODELS_CACHE_FILE" -nt "$CODEX_CATALOG_SYNC_STATE_FILE" ) ]]; then
+    if ! "$AGENTS_CONFIG_DIR/sync_codex_catalog.sh" >/dev/null; then
+        echo "WARNING: Codex catalog sync failed; using $AGENTS_CONFIG_FILE as-is." >&2
+    fi
+fi
 
 agents_config_trim() {
     local value="$1"

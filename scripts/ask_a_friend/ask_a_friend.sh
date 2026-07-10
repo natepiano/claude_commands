@@ -13,6 +13,9 @@
 
 set -euo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "$SCRIPT_DIR/../agents/agents_config.sh"
+
 SESSION_DIR="${1:?Usage: ask_a_friend.sh <session_dir> [working_dir]}"
 WORKING_DIR="${2:-$(pwd)}"
 
@@ -32,6 +35,13 @@ echo "asking" > "${STATUS_FILE}"
 
 QUESTION=$(cat "${QUESTION_FILE}")
 
+CODEX_MODEL="$(agents_config_model codex)"
+CODEX_EFFORT="$(agents_config_effort codex)"
+CODEX_ARGS=()
+[[ -n "$CODEX_MODEL" ]] && CODEX_ARGS+=(-m "$CODEX_MODEL")
+[[ -n "$CODEX_EFFORT" ]] \
+  && CODEX_ARGS+=(-c "model_reasoning_effort=\"$CODEX_EFFORT\"")
+
 # Invoke codex exec:
 #   --full-auto            — no approval prompts + workspace-write sandbox
 #   --ephemeral            — don't persist session (one-shot)
@@ -42,7 +52,7 @@ QUESTION=$(cat "${QUESTION_FILE}")
 # (which implies --sandbox workspace-write) and blocks macOS SystemConfiguration
 # framework access, causing a panic in the system-configuration crate.
 if codex exec \
-  -c model_reasoning_effort='"high"' \
+  "${CODEX_ARGS[@]}" \
   --ephemeral \
   --full-auto \
   -C "${WORKING_DIR}" \

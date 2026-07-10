@@ -13,6 +13,9 @@
 
 set -euo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "$SCRIPT_DIR/../agents/agents_config.sh"
+
 SESSION_DIR="${1:?Usage: codex_implement.sh <session_dir> [working_dir]}"
 WORKING_DIR="${2:-$(pwd)}"
 
@@ -32,10 +35,17 @@ echo "implementing" > "${STATUS_FILE}"
 
 PROMPT=$(cat "${PROMPT_FILE}")
 
+CODEX_MODEL="$(agents_config_model codex)"
+CODEX_EFFORT="$(agents_config_effort codex)"
+CODEX_ARGS=()
+[[ -n "$CODEX_MODEL" ]] && CODEX_ARGS+=(-m "$CODEX_MODEL")
+[[ -n "$CODEX_EFFORT" ]] \
+  && CODEX_ARGS+=(-c "model_reasoning_effort=\"$CODEX_EFFORT\"")
+
 # Invoke codex exec in full-auto mode so it can write files in the working directory.
 # -o captures the implementation summary (what was done).
 if codex exec \
-  -c model_reasoning_effort='"high"' \
+  "${CODEX_ARGS[@]}" \
   --ephemeral \
   --full-auto \
   -C "${WORKING_DIR}" \

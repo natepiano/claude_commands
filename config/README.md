@@ -8,6 +8,12 @@ Example configuration for the `/blender:bake_textures` command. Copy and modify 
 
 Global agent registry for command scripts. Defines each agent's default model and reasoning effort, plus the allowed model and effort values that command-specific configs may reference.
 
+The Codex default and visible model list are synchronized from
+`~/.codex/config.toml` and `~/.codex/models_cache.json` by
+`scripts/agents/sync_codex_catalog.sh`. The launchd job in that directory checks
+every five minutes and at login; the shared registry reader synchronizes sooner
+when Codex has updated either source file.
+
 ## cargo-fmt-exclusions.json
 
 List of crate names to exclude from `cargo fmt` checks. Used when running formatting on external/third-party crates where we don't want to modify their style.
