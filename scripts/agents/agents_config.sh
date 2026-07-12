@@ -161,3 +161,219 @@ agents_config_apply_defaults() {
         printf -v "$effort_var" '%s' "$(agents_config_effort "$agent")"
     fi
 }
+
+_agents_section_keys_inline() {
+    local section="$1" line key first=1
+    while IFS= read -r line; do
+        key="${line%%=*}"
+        if [[ "$first" -eq 1 ]]; then
+            printf '%s' "$key"
+            first=0
+        else
+            printf ', %s' "$key"
+        fi
+    done < <(_agents_config_section_values "$section")
+}
+
+_agents_registry_get() {
+    local section="$1" key="$2" line row_key value
+    while IFS= read -r line; do
+        row_key="${line%%=*}"
+        [[ "$row_key" == "$key" ]] || continue
+        value="${line#*=}"
+        agents_config_trim "$value"
+        return 0
+    done < <(_agents_config_section_values "$section")
+}
+
+_agents_registry_has_key() {
+    local section="$1" key="$2" line row_key
+    while IFS= read -r line; do
+        row_key="${line%%=*}"
+        [[ "$row_key" == "$key" ]] && return 0
+    done < <(_agents_config_section_values "$section")
+    return 1
+}
+
+_agents_function_families_inline() {
+    local function="$1" family first=1
+    for family in codex claude; do
+        _agents_config_has_section "$function.$family" || continue
+        if [[ "$first" -eq 1 ]]; then
+            printf '%s' "$family"
+            first=0
+        else
+            printf ', %s' "$family"
+        fi
+    done
+}
+
+_agents_effort_allowed() {
+    local allowed="$1" effort="$2" item
+    local old_ifs="$IFS"
+    IFS=','
+    for item in $allowed; do
+        item="$(agents_config_trim "$item")"
+        if [[ "$item" == "$effort" ]]; then
+            IFS="$old_ifs"
+            return 0
+        fi
+    done
+    IFS="$old_ifs"
+    return 1
+}
+
+_agents_validate_pair() {
+    local context="$1" family="$2" pair="$3"
+    local model effort allowed_efforts allowed_agents
+
+    model="${pair%%:*}"
+    effort=""
+    if [[ "$pair" == *:* ]]; then
+        effort="${pair#*:}"
+        if [[ -z "$effort" ]]; then
+            echo "ERROR: [$context] effort must not be empty after ':'." >&2
+            return 1
+        fi
+    fi
+
+    if ! _agents_registry_has_key "$family.agents" "$model"; then
+        allowed_agents="$(_agents_section_keys_inline "$family.agents")"
+        echo "ERROR: [$context] agent '$model' is not allowed for family '$family'." >&2
+        echo "       Allowed agents in $AGENTS_CONFIG_FILE [$family.agents]: $allowed_agents" >&2
+        return 1
+    fi
+    allowed_efforts="$(_agents_registry_get "$family.agents" "$model")"
+    if [[ -n "$effort" ]] && ! _agents_effort_allowed "$allowed_efforts" "$effort"; then
+        echo "ERROR: [$context] effort '$effort' is not allowed for agent '$model'." >&2
+        echo "       Allowed efforts in $AGENTS_CONFIG_FILE [$family.agents] $model: $allowed_efforts" >&2
+        return 1
+    fi
+
+    AGENT_MODEL="$model"
+    AGENT_EFFORT="$effort"
+}
+
+agents_resolve() {
+    local task="$1" function subtask family pair section configured allowed_families
+
+    function="${task%%.*}"
+    subtask="${task#*.}"
+    if [[ -z "$function" || -z "$subtask" || "$task" == "$function" || "$subtask" == *.* ]]; then
+        echo "ERROR: task '$task' must have exactly two segments: <function>.<subtask>." >&2
+        return 1
+    fi
+
+    family="$(_agents_registry_get assignments "$task")"
+    if [[ -z "$family" ]]; then
+        family="$(_agents_registry_get assignments "$function")"
+    fi
+    if [[ -z "$family" ]]; then
+        configured="$(_agents_section_keys_inline assignments)"
+        echo "ERROR: [$task] no [assignments] entry for '$function'." >&2
+        echo "       Configured assignments in $AGENTS_CONFIG_FILE: $configured" >&2
+        return 1
+    fi
+
+    section="$function.$family"
+    if ! _agents_config_has_section "$section"; then
+        allowed_families="$(_agents_function_families_inline "$function")"
+        echo "ERROR: [$task] missing set section [$section] in $AGENTS_CONFIG_FILE." >&2
+        echo "       Allowed families with a configured set: $allowed_families" >&2
+        return 1
+    fi
+    pair="$(_agents_registry_get "$section" "$subtask")"
+    if [[ -z "$pair" ]]; then
+        configured="$(_agents_section_keys_inline "$section")"
+        echo "ERROR: [$task] missing sub-task '$subtask' in [$section]." >&2
+        echo "       Allowed sub-tasks: $configured" >&2
+        return 1
+    fi
+
+    AGENT_FAMILY="$family"
+    _agents_validate_pair "$task" "$family" "$pair"
+}
+
+agents_resolve_print() {
+    local task="$1"
+    agents_resolve "$task" || return 1
+    printf 'task=%s family=%s agent=%s effort=%s\n' \
+        "$task" "$AGENT_FAMILY" "$AGENT_MODEL" "$AGENT_EFFORT"
+}
+
+agents_list_assignments() {
+    local assignment key family line subtask
+    while IFS= read -r assignment; do
+        key="${assignment%%=*}"
+        family="${assignment#*=}"
+        if [[ "$key" == *.* ]]; then
+            agents_resolve_print "$key" || return 1
+            continue
+        fi
+        while IFS= read -r line; do
+            subtask="${line%%=*}"
+            if [[ -n "$(_agents_registry_get assignments "$key.$subtask")" ]]; then
+                continue
+            fi
+            agents_resolve_print "$key.$subtask" || return 1
+        done < <(_agents_config_section_values "$key.$family")
+    done < <(_agents_config_section_values assignments)
+}
+
+agents_set_assignment() {
+    local function="$1" family="$2" section line subtask pair tmp_file allowed_families
+
+    if [[ -z "$function" || "$function" == *.* ]]; then
+        echo "ERROR: assignment function must be one segment; got '$function'." >&2
+        return 1
+    fi
+    section="$function.$family"
+    if ! _agents_config_has_section "$section"; then
+        allowed_families="$(_agents_function_families_inline "$function")"
+        echo "ERROR: cannot assign '$function' to '$family': missing [$section]." >&2
+        echo "       Allowed families with a configured set: $allowed_families" >&2
+        return 1
+    fi
+    while IFS= read -r line; do
+        subtask="${line%%=*}"
+        pair="${line#*=}"
+        if ! _agents_validate_pair "$function.$subtask" "$family" "$pair"; then
+            echo "ERROR: assignment rejected because [$section] row '$subtask' is invalid." >&2
+            return 1
+        fi
+    done < <(_agents_config_section_values "$section")
+
+    tmp_file="$(mktemp "${AGENTS_CONFIG_FILE}.XXXXXX")"
+    if ! awk -v fn="$function" -v fam="$family" '
+        /^\[assignments\]/ { in_section = 1; print; next }
+        /^\[/ { in_section = 0; print; next }
+        in_section && index($0, fn "=") == 1 {
+            print fn "=" fam
+            found = 1
+            next
+        }
+        { print }
+        END { if (!found) exit 2 }
+    ' "$AGENTS_CONFIG_FILE" > "$tmp_file"; then
+        rm -f "$tmp_file"
+        echo "ERROR: no [assignments] entry for '$function'; $AGENTS_CONFIG_FILE was not changed." >&2
+        return 1
+    fi
+    mv "$tmp_file" "$AGENTS_CONFIG_FILE"
+}
+
+agents_codex_args() {
+    printf '%s %s' '-m' "$AGENT_MODEL"
+    if [[ -n "$AGENT_EFFORT" ]]; then
+        printf ' %s %s' '-c' "model_reasoning_effort=\"$AGENT_EFFORT\""
+    fi
+    printf '\n'
+}
+
+agents_claude_args() {
+    printf '%s %s' '--model' "$AGENT_MODEL"
+    if [[ -n "$AGENT_EFFORT" ]]; then
+        printf ' %s %s' '--effort' "$AGENT_EFFORT"
+    fi
+    printf '\n'
+}
