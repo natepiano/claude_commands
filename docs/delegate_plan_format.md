@@ -40,14 +40,16 @@ to rediscover after a context compaction lives in the doc.
 - **Test:** <exact test command>
 - **Lint:** <lint command/workflow, if any; for Rust repos with the local
   `clippy` skill available, use the full `clippy` skill rather than a partial
-  list of Cargo or `lint ...` commands>
+  list of Cargo or `lint ...` commands. Dispatched runs invoke the skill with
+  `auto-proceed` — /plan:delegate injects that at assembly time>
 - **Style:** <the style-loader line, e.g. `zsh ~/.claude/scripts/rust_style/load-rust-style.sh --project-root <dir>`; omit for non-Rust>
 - **Invariants:** <project-wide rules every phase must preserve; omit if none>
 
 ## Phases
 
 ### Phase N — <title>  · status: todo
-<!-- status ∈ {todo, done}. /plan:phase_review flips it and appends a Retrospective. -->
+<!-- status ∈ {todo, done}. /plan:phase_review flips it and appends a Retrospective;
+     the /plan:delegate checkpoint commit writes the hash into `done (<commit>)`. -->
 
 #### Work Order
 <!-- The dispatch prompt. Self-contained against Delegation Context + named files.
@@ -97,6 +99,40 @@ the next `/plan:delegate` assemble its prompt with zero codebase research. After
 propagation, each remaining Work Order must still be implementable from its named
 **Files** + **Delegation Context** alone; if a change widened scope, update
 **Files** and **Spec** to match.
+
+---
+
+## Pending decisions <!-- written by /plan:phase_review (auto mode) and /plan:delegate; consumed by /plan:delegate -->
+
+A user decision deferred by the `/plan:delegate` loop lives inside the affected
+phase's Work Order as:
+
+```markdown
+**Pending decision: <concrete thing to decide>**
+
+Actual problem:
+<one or two sentences naming files/types/phases>
+
+What exists now:
+- <concrete current code/doc state>
+
+What should change:
+- <recommended direction>
+
+Recommendation:
+<direct recommendation>
+```
+
+Rules:
+
+- `/plan:delegate` must NOT dispatch a phase whose Work Order carries an
+  unresolved `**Pending decision:**` block — its pre-dispatch check presents the
+  block(s) to the user first.
+- Resolving a decision means editing the outcome into the Work Order's
+  **Spec** / **Files** / **Acceptance gate** and deleting the block — never
+  annotating the block in place.
+- A pending decision on phase M never blocks dispatch of an earlier, unaffected
+  phase.
 
 ---
 

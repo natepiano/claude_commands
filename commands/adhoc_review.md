@@ -40,7 +40,9 @@ For each item, in order:
 
 1. Mark the task `in_progress`.
 2. **Lead with a high-level summary of the item** — one or two lines, concrete (name the file / type / change), enough to decide on without reading the full text. This is the coarsest level; deeper detail is revealed one notch at a time via `elaborate`, never as a wholesale dump of the raw item (which is usually too noisy to be useful).
-3. **Present the choices, and always mark one as recommended.** Pick a choice set that fits the item — `keep / drop / modify`, `approve / reject / redirect`, etc. — append `(recommended)` to exactly one option with a one-line reason, and always include `elaborate` as a choice. Terse is good, cryptic is not.
+3. **Present the choices as an inline text line, and always mark one as recommended.** Pick a choice set that fits the item — `keep / drop / modify`, `approve / reject / redirect`, etc. — append `(recommended)` to exactly one option with a one-line reason, and always include `elaborate` as a choice. The answer request is a single line of plain message text, e.g.:
+   > `keep (recommended — survived review unchanged) / modify / drop / elaborate`
+   NEVER present an item through a survey/questionnaire mechanism (AskUserQuestion or any multiple-choice UI). A survey widget buries the item summary, forces the user through option chips, and obstructs free-form questions and feedback — which are the entire point of this walkthrough. Summary and choices are ordinary message text; the user answers by typing. Terse is good, cryptic is not.
 4. **Wait for the user's response.** Do not move on until they reply.
    - If the user picks `elaborate` (also: "more", "detail", "expand", "why"): take the *current* explanation and add exactly one notch more detail — do not jump to the full raw item, which is usually too verbose. Then re-present the same choices (still marking the recommendation). Do not advance. Each `elaborate` goes one level deeper, so the user can iteratively dig in as far as they want before making a terminal choice.
 5. When they make a terminal choice (any reply that isn't `elaborate`, "stop", or "go back"), record the decision to the working doc if one is in scope, mark the task `completed`, and move to the next item.
@@ -57,6 +59,7 @@ When every item is done:
 
 ## Rules
 
+- **NEVER run the review as a survey.** No AskUserQuestion, no option chips, no questionnaire UI — for the items themselves or for any step of this workflow. Every item is a succinct, clear plain-text summary followed by the inline choice line defined in Step 4. Clear beats simple: keep the technical content, drop the widget.
 - One item at a time. Never present two items in the same turn.
 - Default presentation is a high-level summary, not the full item. `elaborate` is always available and adds one notch more detail to the current explanation each time — progressive, never a wholesale dump of the raw item — then re-prompts.
 - Whenever you present discrete choices — here or in Step 2 — always mark exactly one as recommended with a one-line reason. Open prompts ("any thoughts?") are exempt.

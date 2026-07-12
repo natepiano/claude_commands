@@ -6,10 +6,13 @@ Use this after the agent has just finished implementing a phase of a multi-phase
 
 **Delegate-ready plans.** If the plan follows `~/.claude/docs/delegate_plan_format.md` (a `## Delegation Context` section + per-phase `#### Work Order`), this command must keep every remaining phase **dispatch-ready**: learnings are folded *into* the remaining Work Orders (Spec, Files, Acceptance gate, and especially **Constraints from prior phases**), not merely appended as review notes. The test after this command runs: `/plan:delegate <plan> phase <next>` can assemble its prompt with zero codebase research. See `<MaintainWorkOrders/>` in Step 5.
 
+**Auto mode.** If `$ARGUMENTS` contains the token `auto` (passed by the `/plan:delegate` loop), this command asks the user nothing: significant findings that survive filtering are deferred into the affected phase's Work Order as `**Pending decision:**` blocks (format: `~/.claude/docs/delegate_plan_format.md`) instead of being presented. Invocations without `auto` behave exactly as written below.
+
 ## Step 1: Locate the plan doc
 
 The plan doc should already be in conversation context — it is the doc the just-completed phase came from.
 
+- Strip the `auto` token from `$ARGUMENTS` first — it is a mode switch, not a path.
 - If exactly one plan doc is in scope, use it.
 - If `$ARGUMENTS` names a path, use that path (overrides inference).
 - If no plan doc is in scope, **ask the user** for the path before proceeding. Do not guess. This case should be rare.
@@ -26,7 +29,7 @@ If the conversation does not make the phase obvious, ask the user one clarifying
 
 Edit the plan doc to:
 
-1. Mark the phase complete in whatever convention the plan already uses (checkbox, status line, heading suffix). Match the existing style — do not introduce a new one. For a delegate-ready plan, set the phase `status: done (<commit>)` and keep its `#### Work Order` verbatim as the archive record.
+1. Mark the phase complete in whatever convention the plan already uses (checkbox, status line, heading suffix). Match the existing style — do not introduce a new one. For a delegate-ready plan, set the phase `status: done (<commit>)` and keep its `#### Work Order` verbatim as the archive record. In auto mode the commit does not exist yet — write `status: done`; the `/plan:delegate` checkpoint commit adds the hash afterwards.
 2. Append a **Retrospective** subsection inside that phase (or directly after it if the phase has no body container). Use this template:
 
    ```markdown
@@ -113,6 +116,8 @@ Edit each minor finding straight into the plan — inline amendment to the affec
 **Forbidden tool: `AskUserQuestion`.** Surveys collapse the decision to a one-line label and strip the concrete recommendation. If you reach for `AskUserQuestion`, stop and route through `<FilterFindingsForUserReview/>` first.
 
 Execute `<FilterFindingsForUserReview/>` before presenting anything to the user. Subagent `Severity: significant` means "needs filtering," not automatically "ask the user."
+
+**Auto mode:** do not execute `<PresentInlineSingle/>` or `<DispatchAdhocReview/>`. For each unresolved user decision after filtering, write a `**Pending decision:**` block containing the filled `<DecisionPresentationTemplate/>` into the Work Order of the earliest affected remaining phase — the `/plan:delegate` loop stops for it at that phase's pre-dispatch check. List each deferral in the final update's `User decisions` row as `deferred to phase N: <one-line title>`. Then skip the rest of this block.
 
 After filtering, count unresolved user decisions, not raw subagent findings:
 
@@ -233,4 +238,5 @@ Style rules for the final update:
 - Do not relitigate the just-completed phase's implementation. The retrospective records what was learned; the review is about what comes next.
 - Raw significant findings must be filtered before user review. Only unresolved user decisions go through the user; mechanical changes and already-implied work go straight into the plan.
 - User decisions never use `AskUserQuestion`. Single decision → inline decision template; two or more → `/adhoc_review`. See `<SignificantFindings/>`, `<FilterFindingsForUserReview/>`, and `<DecisionPresentationTemplate/>` in Step 5.
+- In auto mode this command asks the user nothing: unresolved decisions become `**Pending decision:**` blocks in the affected Work Orders, surfaced later by the `/plan:delegate` pre-dispatch check.
 - If the subagent returns nothing actionable, still append the **Phase N Review** block with a single line stating the remaining phases were reviewed and need no changes.

@@ -1,3 +1,12 @@
+<AutoProceed>
+If $ARGUMENTS contains the token `auto-proceed` (injected by /plan:delegate and
+the codex work orders it composes), this run is non-interactive: strip the token
+before any remaining arguments reach `lint clippy`, and <BatchDecisionPoint/>
+reports the batch then immediately executes it as **proceed** — no stop, no user
+wait. Auto-proceed does NOT soften the hard stops in <RunMendFix/> or the
+environmental-failure handling anywhere in this skill — those still stop.
+</AutoProceed>
+
 <LoadStyleGuide>
 Load the Rust style guide by running:
 ```bash
@@ -14,7 +23,7 @@ bash ~/.claude/scripts/clippy/check_cache.sh .
 
 - **Exit 0, all passed + "git diff: clean"**: Print the status table and exit (complete no-op).
 - **Exit 0, all passed + "git diff: has changes"**: Print the status table, then resume at STEP 4 and continue through remaining steps in order (4 → 5 → 5b → 6 → 8 → 9).
-- **Exit 0, issues found**: Print the status table and the `=== lint mend ===` / `=== lint clippy ===` / `=== lint doc ===` details. Then resume at STEP 7 and execute it in full — **including stopping at `<BatchDecisionPoint/>` and waiting for user approval before any edits**. "Resuming at STEP 7" does not mean skipping the decision gate.
+- **Exit 0, issues found**: Print the status table and the `=== lint mend ===` / `=== lint clippy ===` / `=== lint doc ===` details. Then resume at STEP 7 and execute it in full — **including stopping at `<BatchDecisionPoint/>` and waiting for user approval before any edits** (in auto-proceed mode the gate reports and proceeds instead — see <AutoProceed/>). "Resuming at STEP 7" does not mean skipping the decision gate.
 - **Exit 1**: Cache miss — proceed to STEP 2 (<RunMend/>).
 
 The script reads lint-runs' `latest.json`, waits if a run is still in progress, compares the cached timestamp to source files, and outputs formatted results.
@@ -80,7 +89,8 @@ The `lint` wrapper supplies `--workspace --all-targets --all-features -- -D warn
 
 Execute: `~/.claude/scripts/clippy/lint clippy ${ARGUMENTS:-}`
 
-If $ARGUMENTS provided, use as additional flags.
+If $ARGUMENTS provided, use as additional flags — after removing the
+`auto-proceed` token, which is a mode switch, not a clippy flag (see <AutoProceed/>).
 If different base configuration needed, user can override CLIPPY_FLAGS.
 
 Error Handling:
@@ -134,8 +144,12 @@ Create a comprehensive todo list combining all clippy, rustdoc, AND unfixable me
 </CreateBatchTodoList>
 
 <BatchDecisionPoint>
-**This is a hard gate. STOP here. Do NOT edit any files until the user has
-selected one of the Available Actions below. This applies even if there is
+**Auto-proceed mode (see <AutoProceed/>):** print the same Issues Found block
+and per-todo details below, then immediately execute <BatchExecution/> as
+**proceed**. Skip the Available Actions menu; do not end the turn.
+
+**Otherwise this is a hard gate. STOP here. Do NOT edit any files until the user
+has selected one of the Available Actions below. This applies even if there is
 only one issue — the user must approve every fix before execution.**
 
 Present the complete batch of fixes exactly as follows:
