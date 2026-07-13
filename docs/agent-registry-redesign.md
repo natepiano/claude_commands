@@ -57,6 +57,8 @@
   - The interactive codex REPL keeps `-c service_tier="fast"` (cli_agent.sh lines 112/123).
   - Never use `AskUserQuestion` in the command docs; the migrated review docs decide via in-session synthesis.
   - Accepted risk: the source-time catalog sync and the `/agent` assignment/row editors both rewrite `config/agents.conf` (tmp file + `mv`, no locking); interleaved writers can silently revert the other's change (last-writer-wins) but never corrupt the file. Acceptable on a single-user machine — do not add locking.
+  - `agent_exec` callers must pass absolute prompt/output/log paths: the claude branch redirects after `cd <working_dir>`, so relative output/log paths resolve against `working_dir` there but against the caller's cwd on the codex branch (`<prompt_file>` is read pre-`cd` in both).
+  - `AGENT_EXEC_EXTRA_ARGS` is whitespace-split with no quote interpretation — flag+value pairs like `--add-dir /path` work, but no single argument may contain a space (no prompt preambles, no `--settings` JSON); no planned phase uses it.
   - Out-of-scope guardrails (all user-confirmed 2026-07-12): do not touch `~/.zshrc`'s interactive `claude` alias, `settings.json`'s `model` or `statusLine`, `scripts/claude_to_codex/`, or `~/.codex/config.toml` beyond the existing sync trigger; no per-project override mechanism — one global `config/agents.conf` governs everything.
 
 ## Phases
@@ -232,7 +234,7 @@ Create `scripts/agents/test_agents_config.sh` (same self-contained pattern as `t
 - Phase 11: dead private helpers named for deletion; kept helpers named explicitly.
 - Delegation Context: Test line carries the bash-only and sync-suppression facts; Invariants record the accepted last-writer-wins risk between the sync and `/agent` writes.
 
-### Phase 2 — Catalog sync: `[codex.agents]` + claude alias staleness  · status: done (`fa6bc2f`)
+### Phase 2 — Catalog sync: `[codex.agents]` + claude alias staleness  · status: done (`7ef5164`)
 
 #### Work Order
 
@@ -282,7 +284,7 @@ Create `scripts/agents/test_agents_config.sh` (same self-contained pattern as `t
 - Delegation Context: recorded the accepted transitional freeze of the legacy `[codex] model=` mirror (unmigrated consumers stop tracking codex model switches until their migration phase) and refreshed the agents.conf key-file description.
 - Blind-review disagreement resolved (no plan change): the reviewer read "vanished = not in cache" literally and called the implemented keep-condition (must resolve against the refreshed visible catalog AND the cache) a blocker; overruled — cache-membership alone would still drop hidden-but-cached assigned models from `[codex.agents]` and wedge the resolver, defeating the decision's stated purpose.
 
-### Phase 3 — Shared launcher `scripts/agents/agent_exec.sh`  · status: todo
+### Phase 3 — Shared launcher `scripts/agents/agent_exec.sh`  · status: done (`56861f9`)
 
 #### Work Order
 
@@ -313,6 +315,23 @@ agent_exec <task> <mode:write|readonly> <working_dir> <prompt_file> <output_file
 
 **Acceptance gate:** `bash scripts/agents/test_agent_exec.sh` passes; `bash scripts/agents/test_agents_config.sh` still passes.
 
+#### Retrospective
+
+**What worked:** Fast-path dispatch straight from the Work Order; codex implemented to spec with no deviations; the dry-run test pins the exact assembled argv for all four family × mode combos.
+**What deviated from the plan:** One fix pass. The spec's claude command line had no working-directory mechanism (the claude CLI has no `-C` flag), so a claude-family task would have run against the caller's cwd. Fixed: the claude branch executes via subshell `( cd "$working_dir" && … )`, and dry-run prints a `cd <working_dir> && ` prefix before the claude argv.
+**Surprises:** The blind reviewer caught the working_dir gap that both the spec and the conformance review missed — spec-conformance review cannot catch spec gaps. `AGENT_EXEC_EXTRA_ARGS` is whitespace-split with no quote interpretation (args cannot contain spaces, matching the resolver emitters' convention) — now documented in a comment at `agent_exec.sh:48`.
+**Implications for remaining phases:** Dry-run output shapes for smoke gates (Phases 4, 9, 10): codex = `codex exec … "PROMPT" > <log> 2>&1` (no prefix); claude = `cd <working_dir> && claude … -- "PROMPT" > <out> 2> <log>`. Gates matching assembled commands should match on flags/substrings, not whole lines, or account for the claude `cd` prefix and both families' redirection suffixes.
+
+#### Phase 3 Review
+
+- Copied the dry-run output shapes (`%q`-quoted tokens, claude `cd` prefix, redirection suffixes, escaped effort quotes) into Phases 4/8/9's Constraints — gates must match substrings, not whole lines.
+- Phase 4 and 9 constraints now state the wrappers must not redirect `agent_exec`'s stdout (it owns all redirection; dry-run must reach the wrapper's stdout) and that `agent_exec` already handles the missing-prompt log write.
+- Phase 4/9 gates note they assume the shipped codex family assignment (registry is live-editable).
+- Phase 7's gate parenthetical corrected: `env bash` IS 3.2 on this machine and the resolver already passes under it — the gate now pins first-launchd-context execution instead.
+- Phase 8's report render gained its missing `working_dir` (`$HOME/.claude`), output-file, and failure-guard facts plus a direct-`agent_exec` smoke recipe (don't smoke through the whole driver).
+- Phase 10's acceptance grep widened (`subagent_type\|Explore agents\|using the Agent tool`) — the bare pattern was vacuous for two of the three docs; added a warm-the-freshness-gate step before its parallel launches.
+- Two new Delegation Context invariants: `agent_exec` callers pass absolute prompt/output/log paths (claude redirects post-`cd`); `AGENT_EXEC_EXTRA_ARGS` is whitespace-split, no space-containing argument, and no planned phase uses it.
+
 ### Phase 4 — Delegate migration: family-neutral launchers  · status: todo
 
 #### Work Order
@@ -337,9 +356,9 @@ agent_exec <task> <mode:write|readonly> <working_dir> <prompt_file> <output_file
 - `config/delegate.conf` — delete.
 - `commands/plan/delegate.md` — call sites, wording, log names, `<SelectProfile>`.
 
-**Constraints from prior phases:** Phase 3's `agent_exec <task> <mode> <working_dir> <prompt_file> <output_file> <log_file>` with `AGENT_EXEC_DRY_RUN=1` printing the assembled command; Phase 1's registry has `[delegate.codex]`/`[delegate.claude]` rows for `implementation`, `review`, `mechanical`, `escalation` and `[assignments] delegate=codex`.
+**Constraints from prior phases:** Phase 3's `agent_exec <task> <mode> <working_dir> <prompt_file> <output_file> <log_file>` with `AGENT_EXEC_DRY_RUN=1` printing the assembled command; Phase 1's registry has `[delegate.codex]`/`[delegate.claude]` rows for `implementation`, `review`, `mechanical`, `escalation` and `[assignments] delegate=codex`. Dry-run output shapes (Phase 3): one line per invocation, every argv token `printf '%q'`-quoted, plus a redirection suffix — codex: `codex exec -m <agent> [-c model_reasoning_effort="<effort>"] --ephemeral --full-auto|--sandbox read-only -C <dir> -o <output> <prompt> > <log> 2>&1` (no prefix); claude: `cd <dir> && claude --print … -- <prompt> > <output> 2> <log>`. The codex effort token renders with escaped quotes (`model_reasoning_effort=\"high\"`) — match gate checks on substrings (`--full-auto`, `-m <agent>`, the effort word), never on literal flag text or whole lines. `agent_exec` performs all log/output redirection itself — the wrapper must not redirect the `agent_exec` call's stdout/stderr to files (dry-run output must reach the wrapper's stdout for the gate); `agent_exec` already writes `Prompt not found: <path>` to `<log_file>` and returns 1 on a missing prompt file, so the wrapper only maps nonzero exits to the `error` status write.
 
-**Acceptance gate:** `AGENT_EXEC_DRY_RUN=1 bash scripts/delegate/implement.sh <tmp_session> . <tmp_prompt> implementation` prints a codex `--full-auto` command whose model/effort flags match the *current* `[delegate.codex] implementation` row (the registry is live-editable via `/agent` — read the row at run time, don't hard-code `gpt-5.6-sol:high`); same for `review.sh` printing `--sandbox read-only`; `grep -rn "codex_implement\|codex_review\|delegate_config\|delegate\.conf" scripts/delegate/ commands/plan/ config/` returns no live references (ask_a_friend keeps its own `codex_implement.sh` until Phase 9, so the grep is scoped to delegate paths); `bash scripts/agents/test_agents_config.sh` and `bash scripts/agents/test_agent_exec.sh` pass.
+**Acceptance gate:** `AGENT_EXEC_DRY_RUN=1 bash scripts/delegate/implement.sh <tmp_session> . <tmp_prompt> implementation` prints a codex `--full-auto` command whose model/effort flags match the *current* `[delegate.codex] implementation` row (the registry is live-editable via `/agent` — read the row at run time, don't hard-code `gpt-5.6-sol:high`); same for `review.sh` printing `--sandbox read-only` (both assume the shipped `[assignments] delegate=codex`; if the family was switched via `/agent`, expect the claude shape instead — `cd` prefix, `--dangerously-skip-permissions`/`--permission-mode plan`); `grep -rn "codex_implement\|codex_review\|delegate_config\|delegate\.conf" scripts/delegate/ commands/plan/ config/` returns no live references (ask_a_friend keeps its own `codex_implement.sh` until Phase 9, so the grep is scoped to delegate paths); `bash scripts/agents/test_agents_config.sh` and `bash scripts/agents/test_agent_exec.sh` pass.
 
 ### Phase 5 — `/agent` skill: registry administration  · status: todo
 
@@ -417,7 +436,7 @@ Post-ship note (no plan-time edits): the live `[codex.agents]` catalog now adver
 
 **Constraints from prior phases:** Phase 1 rows exist for `cleanfix.style_eval`, `cleanfix.style_eval_review`, `cleanfix.style_fix`, `cleanfix.report` in both family sets; `agents_resolve` errors loudly on bad rows — `cf_load_stage_assignment` should surface that error, not swallow it. `agent_exec` (Phase 3) is available but this phase only changes resolution; the stage scripts keep their own codex/claude launch code until a later cleanup if ever. `cf_load_stage_assignment` has callers outside this phase's file list: `clean-fix-usage.sh` calls it positionally at lines 95 and 438 (`cf_load_stage_assignment "$section" enabled agent model effort`), and `cf_print_stage_assignment`/`cf_print_agent_assignments` (`agent_assignments.sh` lines 115-129) back Phase 8's status view — keep the 5-arg out-var signature and the print helpers working; `clean-fix-usage.sh` itself isn't touched until Phase 8. Sourcing `agent_assignments.sh` (line 10) fires the freshness-gated catalog sync, which since Phase 2 can shell out to `claude --help` (~1-2s) and emit stale-row/alias `WARNING:` lines on stderr — these can appear in launchd run logs and are not stage failures.
 
-**Acceptance gate:** `bash -n` passes on all five files; sourcing `agent_assignments.sh` and calling `cf_load_stage_assignment` for each of the three stages yields `STYLE_AGENT`/`STYLE_AGENT_MODEL`/`STYLE_AGENT_EFFORT` matching the *current* `[assignments] cleanfix` family and its `[cleanfix.<family>]` rows (the registry is live-editable via `/agent` — compare against the rows at run time, don't hard-code `gpt-5.6-sol:xhigh`); this is the resolver's first execution under macOS bash 3.2 (Phase 1 tests ran under `env bash` 5.x) — `/bin/bash -c 'source scripts/clean-fix/agent_assignments.sh && cf_load_stage_assignment style_eval'` must succeed before the launchd run is trusted; the next scheduled launchd style run completes — verify the newest clean-fix log shows a successful stage pass, not a resolution error.
+**Acceptance gate:** `bash -n` passes on all five files; sourcing `agent_assignments.sh` and calling `cf_load_stage_assignment` for each of the three stages yields `STYLE_AGENT`/`STYLE_AGENT_MODEL`/`STYLE_AGENT_EFFORT` matching the *current* `[assignments] cleanfix` family and its `[cleanfix.<family>]` rows (the registry is live-editable via `/agent` — compare against the rows at run time, don't hard-code `gpt-5.6-sol:xhigh`); the resolver already passes under `/bin/bash` 3.2 (`env bash` resolves there on this machine — verified via `test_agent_exec.sh` after Phase 3), but this is its first execution in the launchd pipeline context — `/bin/bash -c 'source scripts/clean-fix/agent_assignments.sh && cf_load_stage_assignment style_eval'` must succeed before the launchd run is trusted; the next scheduled launchd style run completes — verify the newest clean-fix log shows a successful stage pass, not a resolution error.
 
 ### Phase 8 — clean-fix driver, usage, and report surfaces  · status: todo
 
@@ -427,7 +446,7 @@ Post-ship note (no plan-time edits): the live `[codex.agents]` catalog now adver
 
 **Spec:**
 
-- `scripts/clean-fix/clean-fix.sh` (driver): the `cf_load_stage_assignment` calls (lines 225-229) keep working per Phase 7; reword the agent log lines (~327+) from naming `$STYLE_EVAL_AGENT` alone to `family/agent` so the resolved model is visible. The report-render step (line 370) becomes `agent_exec cleanfix.report write …`. Today it builds the prompt inline (`"$(sed 's/\$ARGUMENTS/rebuild/g' … report-render.md)"`) and appends stderr to the main run log — there is no existing prompt file or dedicated log to map. Write the substituted prompt to a file under the run's tmp dir and give `agent_exec` a dedicated report log path (e.g. `report_render.log` beside the run log).
+- `scripts/clean-fix/clean-fix.sh` (driver): the `cf_load_stage_assignment` calls (lines 225-229) keep working per Phase 7; reword the agent log lines (~327+) from naming `$STYLE_EVAL_AGENT` alone to `family/agent` so the resolved model is visible. The report-render step (line 370) becomes `agent_exec cleanfix.report write …`. Today it builds the prompt inline (`"$(sed 's/\$ARGUMENTS/rebuild/g' … report-render.md)"`) and appends stderr to the main run log — there is no existing prompt file or dedicated log to map. Write the substituted prompt to a file under the run's tmp dir and give `agent_exec` a dedicated report log path (e.g. `report_render.log` beside the run log). Pass `$HOME/.claude` as `<working_dir>` (the current call runs in the driver's cwd; `agent_exec` needs a real directory for codex `-C` / the claude `cd`); `<output_file>` stays the existing `REPORT_FILE=/tmp/clean-fix-report.txt`; keep the `|| log "WARNING: failed to generate clean-fix report"` failure guard.
 - `scripts/clean-fix/clean-fix-usage.sh`: `print_stage_json` (lines 90/95) and `print_stage_text` (lines 433-444) render agent/model/effort columns — update to family/agent/effort; effort may legitimately be empty (CLI default), keep the `<default>` placeholder. Help text (~44-45) for `/clean_fix agent …` updates to the new semantics below.
 - `scripts/clean-fix/clean_fix_report_parse.py`: the codex usage-limit wording and reason codes ("codex hit its usage limit", `codex-usage-limit` at ~1166/1194/1836) generalize — name the resolved family in the strings or key the reason codes on it. basedpyright must stay at zero errors/warnings; no file-level ignores; no `Any`. Since Phase 2 the catalog sync can emit `WARNING:` lines (stale assigned rows, missing claude aliases) into launchd run logs — the current usage-limit regexes don't collide with them, and the generalized patterns must not start matching them either.
 - `commands/clean_fix.md` (~lines 267-300): the scoped `agent|model|effort` subcommands (`/clean_fix agent eval claude`, `/clean_fix eval model opus`, …) lose their backing (per-stage keys are gone). `/clean_fix agent` becomes a status view (family + resolved rows via the existing `cf_print_agent_assignments` path) that points at `/agent cleanfix <family>` for switching and `/agent cleanfix.<stage> <agent>[:<effort>]` for row edits. The same `<StyleAgentConfig>` block also owns the `on|off` / `eval|review|fix on|off` enable/disable subcommands — those keep their backing (`enabled=` stays per Phase 7) and must be retained; only the agent/model/effort subcommands are replaced. This rewrite closes Phase 7's accepted transitional gap (the doc instructing writes of removed conf keys) — nothing extra to do beyond the rewrite itself.
@@ -440,9 +459,9 @@ Post-ship note (no plan-time edits): the live `[codex.agents]` catalog now adver
 - `commands/clean_fix.md` — configure surface → status view pointing at `/agent`.
 - `scripts/clean-fix/README.md` — override schema rows.
 
-**Constraints from prior phases:** Phase 7 set `STYLE_AGENT`=family / `STYLE_AGENT_MODEL`=agent and stripped the stage conf to `enabled=`; Phase 3's `agent_exec` signature is `<task> <mode> <working_dir> <prompt_file> <output_file> <log_file>` with `AGENT_EXEC_DRY_RUN=1` for smoke tests; Phase 5's `/agent` is the switch/edit surface these docs point at.
+**Constraints from prior phases:** Phase 7 set `STYLE_AGENT`=family / `STYLE_AGENT_MODEL`=agent and stripped the stage conf to `enabled=`; Phase 3's `agent_exec` signature is `<task> <mode> <working_dir> <prompt_file> <output_file> <log_file>` with `AGENT_EXEC_DRY_RUN=1` for smoke tests; Phase 5's `/agent` is the switch/edit surface these docs point at. Dry-run output shapes (Phase 3): codex prints `codex exec … <prompt> > <log> 2>&1`; claude prints `cd <working_dir> && claude … -- <prompt> > <output> 2> <log>` — match smoke checks on substrings, not whole lines.
 
-**Acceptance gate:** basedpyright reports zero errors and zero warnings on `clean_fix_report_parse.py`; `bash -n` passes on both shell files; `bash scripts/clean-fix/clean-fix-usage.sh` (status path) renders family/agent/effort with `<default>` where effort is empty; `AGENT_EXEC_DRY_RUN=1` smoke of the report-render call prints a claude/codex command matching the `cleanfix.report` row; the next launchd run stays green (newest log clean).
+**Acceptance gate:** basedpyright reports zero errors and zero warnings on `clean_fix_report_parse.py`; `bash -n` passes on both shell files; `bash scripts/clean-fix/clean-fix-usage.sh` (status path) renders family/agent/effort with `<default>` where effort is empty; `AGENT_EXEC_DRY_RUN=1 bash scripts/agents/agent_exec.sh cleanfix.report write …` run directly with the same six arguments the driver passes prints a command matching the *current* `cleanfix.report` row (the render is gated behind the driver's activity grep — don't smoke through the whole driver); the next launchd run stays green (newest log clean).
 
 ### Phase 9 — ask_a_friend migration  · status: todo
 
@@ -463,9 +482,9 @@ Post-ship note (no plan-time edits): the live `[codex.agents]` catalog now adver
 - `commands/ask_a_friend.md` — call sites, blurb, log names.
 - `.claude/settings.local.json` — two renamed permission entries.
 
-**Constraints from prior phases:** Phase 1 rows exist for `ask_a_friend.consultation` and `ask_a_friend.implementation` in both family sets; Phase 3's `agent_exec` write mode emits codex `--full-auto` / claude `--dangerously-skip-permissions`, which matches this consumer's requirements; delegate (Phase 4) set the provenance/log-naming precedent (`task=/family=/agent=/effort=`, `*_agent.log`).
+**Constraints from prior phases:** Phase 1 rows exist for `ask_a_friend.consultation` and `ask_a_friend.implementation` in both family sets; Phase 3's `agent_exec` write mode emits codex `--full-auto` / claude `--dangerously-skip-permissions`, which matches this consumer's requirements; delegate (Phase 4) set the provenance/log-naming precedent (`task=/family=/agent=/effort=`, `*_agent.log`). Dry-run output shapes (Phase 3): every argv token is `printf '%q'`-quoted; codex prints `codex exec … <prompt> > <log> 2>&1` (no prefix), claude prints `cd <working_dir> && claude … -- <prompt> > <output> 2> <log>`; the codex effort token renders as `model_reasoning_effort=\"high\"` — match gate checks on substrings, never whole lines. The wrappers must not redirect the `agent_exec` call's stdout/stderr to files — `agent_exec` owns all redirection, and dry-run output must reach the wrapper's stdout.
 
-**Acceptance gate:** `AGENT_EXEC_DRY_RUN=1` smoke of both launchers prints codex `--full-auto` commands with the `[ask_a_friend.codex]` model/effort; `grep -rn "codex_implement\|impl_codex" scripts/ask_a_friend/ commands/ask_a_friend.md .claude/settings.local.json` returns nothing.
+**Acceptance gate:** `AGENT_EXEC_DRY_RUN=1` smoke of both launchers prints codex `--full-auto` commands with the `[ask_a_friend.codex]` model/effort (assumes the shipped `[assignments] ask_a_friend=codex`; if the family was switched via `/agent`, expect the claude shape instead — `cd` prefix, `--dangerously-skip-permissions`); `grep -rn "codex_implement\|impl_codex" scripts/ask_a_friend/ commands/ask_a_friend.md .claude/settings.local.json` returns nothing.
 
 ### Phase 10 — review commands migration  · status: todo
 
@@ -487,6 +506,7 @@ Shared mechanics all three docs must specify:
 - Reviewers run `readonly` mode (codex `--sandbox read-only`, claude `--permission-mode plan`) — same as delegate review.
 - The command backgrounds all `agent_exec` calls in one turn (each via Bash `run_in_background: true` with `dangerouslyDisableSandbox: true`) and yields; task-notifications signal completion. Synthesis, deduplication, and the decision walk stay in-session as today.
 - Session dirs live under the scratchpad (per-agent `prompt_N.md`/`findings_N.txt`/`agent_N.log` plus provenance files), same layout as delegate sessions.
+- Warm the freshness gate once before backgrounding (e.g. run `bash scripts/agents/agent_admin.sh status`): every backgrounded `agent_exec` sources `agents_config.sh`, and a stale gate would make 5-7 parallel launches each fire the catalog sync (concurrent conf rewrites — covered by the last-writer-wins invariant — plus a ~1-2s `claude --help` shell-out apiece).
 - Everything else in the three docs (dimension menus, finding schema, synthesis, firewall/posture logic, decision walks) is untouched.
 
 **Files:**
@@ -496,7 +516,7 @@ Shared mechanics all three docs must specify:
 
 **Constraints from prior phases:** Phase 1 rows exist for `team_review.expert`, `api_review.reviewer`, `api_review.adversary`, `module_review.reviewer`, `module_review.validation` in both family sets; Phase 3's `agent_exec` signature and readonly-mode flag mapping are the contract these docs cite — reference the script path `scripts/agents/agent_exec.sh`, don't restate its internals.
 
-**Acceptance gate:** each doc's launch step invokes `agent_exec` with the correct task name and `readonly` mode; `grep -n "subagent_type" commands/team_review.md commands/api_review.md commands/module_review.md` shows no remaining Agent-tool launch for the review-team members; each doc enumerates the self-contained-prompt requirements (charter preamble, topic/intent/posture, file paths, lens, finding schema).
+**Acceptance gate:** each doc's launch step invokes `agent_exec` with the correct task name and `readonly` mode; `grep -n "subagent_type\|Explore agents\|using the Agent tool" commands/team_review.md commands/api_review.md commands/module_review.md` shows no remaining Agent-tool launch for the review-team members (only `team_review.md` contains the literal `subagent_type` today — `api_review.md` and `module_review.md` phrase launches as "Launch N Explore agents in parallel", so the bare `subagent_type` grep is vacuous for them); each doc enumerates the self-contained-prompt requirements (charter preamble, topic/intent/posture, file paths, lens, finding schema).
 
 ### Phase 11 — legacy strip + docs  · status: todo
 
