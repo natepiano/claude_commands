@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# implement.sh — Invoke the configured delegate agent to implement code changes.
+# implement.sh — Invoke the configured friend agent to implement code changes.
 #
-# Usage: implement.sh <session_dir> [working_dir] [prompt_file] [task]
+# Usage: implement.sh <session_dir> [working_dir]
 #
 # Produces:
 #   <session_dir>/impl_status       — "implementing" while running, "implemented" on success, "error" on failure
@@ -11,13 +11,12 @@
 
 set -euo pipefail
 
-SESSION_DIR="${1:?Usage: implement.sh <session_dir> [working_dir] [prompt_file] [task]}"
+SESSION_DIR="${1:?Usage: implement.sh <session_dir> [working_dir]}"
 WORKING_DIR="${2:-$(pwd)}"
-PROMPT_FILE="${3:-${SESSION_DIR}/implementation_prompt.md}"
-SUBTASK="${4:-implementation}"
-TASK="delegate.${SUBTASK}"
+TASK="ask_a_friend.implementation"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROMPT_FILE="${SESSION_DIR}/implementation_prompt.md"
 SUMMARY_FILE="${SESSION_DIR}/impl_summary.txt"
 STATUS_FILE="${SESSION_DIR}/impl_status"
 LOG_FILE="${SESSION_DIR}/impl_agent.log"

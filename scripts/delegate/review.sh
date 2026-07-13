@@ -26,7 +26,7 @@ AGENT_FILE="${SESSION_DIR}/review_agent"
 echo "reviewing" > "${STATUS_FILE}"
 
 source "${SCRIPT_DIR}/../agents/agents_config.sh"
-if ! agents_resolve "${TASK}"; then
+if ! agents_resolve "${TASK}" 2>"${LOG_FILE}"; then
   echo "error" > "${STATUS_FILE}"
   exit 1
 fi
