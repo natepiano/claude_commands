@@ -259,45 +259,38 @@ For Monitors armed with `style-fix-monitor.py`, emit one short line per event:
 ## report [list | <path>]
 ## list
 
-Read `~/.claude/scripts/clean-fix/report-render.md` and follow it, substituting the remaining tokens (after `report`) for its `$ARGUMENTS`. If the top-level token was `list`, execute this section with `$ARGUMENTS` set to `list`. That document owns the parser invocation, the output format, and every rendering rule; it is shared with `clean-fix.sh`, which pipes it into a headless claude after each scheduled run. Do not duplicate rendering logic here — if something is missing, fix `report-render.md` (or the parser).
+Read `~/.claude/scripts/clean-fix/report-render.md` and follow it, substituting the remaining tokens (after `report`) for its `$ARGUMENTS`. If the top-level token was `list`, execute this section with `$ARGUMENTS` set to `list`. That document owns the parser invocation, the output format, and every rendering rule; it is shared with `clean-fix.sh`, which sends it to the configured report agent after each scheduled run. Do not duplicate rendering logic here — if something is missing, fix `report-render.md` (or the parser).
 
 </Report>
 
 <StyleAgentConfig>
 
-## eval|review|fix [model <id>|default | effort <id>|default | on|off]
-## agent claude|codex
-## agent eval|review|fix claude|codex
+## eval|review|fix [on|off]
+## agent
 ## on|off
 
-Show or set the clean-fix style agent configuration. These commands do not run the eval, review, or fix phase for a project. Project-scoped style execution is `clean_fix run <project>`.
+Show clean-fix agent assignments or set stage enablement. These commands do not run the eval, review, or fix phase for a project. Project-scoped style execution is `clean_fix run <project>`.
 
-The clean-fix stage assignment file is `~/.claude/scripts/clean-fix/agent-assignments.conf`. The global agent registry is `~/.claude/config/agents.conf`; it contains each agent's default `model=`/`effort=` plus `[<agent>.models]` and `[<agent>.efforts]` allowlists. When a clean-fix stage leaves `model=`/`effort=` empty, the values resolve from the global `[<agent>]` section. An explicit `model=` or `effort=` in `agent-assignments.conf` overrides for that clean-fix stage only and must pass the global allowlist.
+The clean-fix stage assignment file is `~/.claude/scripts/clean-fix/agent-assignments.conf`; it owns only stage `enabled=` values. The global agent registry is `~/.claude/config/agents.conf`; `[assignments] cleanfix=<family>` selects the family and `[cleanfix.<family>]` provides each stage's `agent[:effort]` row.
 
 Three clean-fix sections are configurable:
 
-- **eval** — `[style_eval] enabled=`, `agent=`, optional `model=`, and optional `effort=`.
-- **review** — `[style_eval_review] enabled=`, `agent=`, optional `model=`, and optional `effort=`.
-- **fix** — `[style_fix] enabled=`, `agent=`, optional `model=`, and optional `effort=`.
+- **eval** — `[style_eval] enabled=`; registry row `cleanfix.style_eval`.
+- **review** — `[style_eval_review] enabled=`; registry row `cleanfix.style_eval_review`.
+- **fix** — `[style_fix] enabled=`; registry row `cleanfix.style_fix`.
 
-`mode=` is not valid anymore. The scripts reject any `mode=` key in the clean-fix stage assignment sections. `clean-fix.conf` owns pipeline targets and tunables only; agent settings placed there are rejected as stale.
+`clean-fix.conf` owns pipeline targets and tunables only; agent settings placed there are rejected as stale.
 
 Argument handling:
 
-1. Read `~/.claude/scripts/clean-fix/agent-assignments.conf`.
-2. Read `~/.claude/config/agents.conf`.
-3. **No tokens** — show all three sections: `enabled`, `agent`, resolved `model`, resolved `effort`, assignment path, and registry path. Stop.
-4. **First token is `eval`, `review`, or `fix`** — the scope. Map `eval` to `[style_eval]`, `review` to `[style_eval_review]`, and `fix` to `[style_fix]`.
-5. **Scoped status:** `/clean_fix eval`, `/clean_fix review`, or `/clean_fix fix` shows only that scope's current `enabled`, `agent`, resolved `model`, and resolved `effort`.
-6. **Project names are invalid here:** `/clean_fix eval <project>`, `/clean_fix review <project>`, and `/clean_fix fix <project>` are not supported. Tell the user to use `/clean_fix run <project>` for a single project's style eval/review/fix flow.
-7. **Scoped enable/disable:** `/clean_fix eval on`, `/clean_fix review off`, `/clean_fix fix on`, etc. set that scope's `enabled=` to `true` or `false`.
-8. **Global enable/disable:** `/clean_fix on` and `/clean_fix off` set all three `enabled=` values to `true` or `false`.
-9. **Scoped agent:** `/clean_fix agent eval claude` or `/clean_fix agent fix codex` sets only that scope's `agent=`. The old `/clean_fix <scope> agent claude|codex` form is also accepted, but do not show it in usage. If that scope has a non-empty `model=` or `effort=` not allowed for the new agent in `config/agents.conf`, also set the invalid value to empty (`<default>`) and report that reset.
-10. **Global agent:** `/clean_fix agent claude` or `/clean_fix agent codex` sets all three scope `agent=` values and resets any now-invalid non-empty `model=` or `effort=` values to empty.
-11. **Scoped model:** `/clean_fix eval model opus`, `/clean_fix review model sonnet`, or `/clean_fix fix model gpt-5.4-mini` first reads the selected scope's `agent=`. The model must exactly match a non-comment line under `[<agent>.models]` in `config/agents.conf`; otherwise stop and show the allowed values.
-12. **Scoped effort:** `/clean_fix eval effort max` or `/clean_fix fix effort xhigh` first reads the selected scope's `agent=`. The effort must exactly match a non-comment line under `[<agent>.efforts]` in `config/agents.conf`; otherwise stop and show the allowed values.
-13. **Default model/effort:** `/clean_fix <scope> model default` sets that scope's `model=` to empty. `/clean_fix <scope> effort default` sets that scope's `effort=` to empty. Empty values resolve through the global `[<agent>]` defaults; if those are empty too, the agent CLI default applies.
-14. When changing a value, edit only the relevant `enabled=`, `agent=`, `model=`, or `effort=` line in `agent-assignments.conf`. The `[build]` and `[projects]` skip lists remain in `clean-fix.conf` and are managed by `phase_skip.py` (see <Skip/>), never by direct edits.
+1. **`/clean_fix agent`** — run `bash ~/.claude/scripts/clean-fix/agent_assignments.sh` and relay its status view: assignment path, registry path, and each stage's `enabled`, family, resolved agent, and effort. Then point to `/agent cleanfix <family>` for family switching and `/agent cleanfix.<stage> <agent>[:<effort>]` for row edits. Stop. Extra tokens after `agent` are invalid; show those two `/agent` forms and stop.
+2. **First token is `eval`, `review`, or `fix`** — map it to `[style_eval]`, `[style_eval_review]`, or `[style_fix]`.
+3. **Scoped status:** `/clean_fix eval`, `/clean_fix review`, or `/clean_fix fix` sources `agent_assignments.sh` and calls `cf_print_stage_assignment` for that section. Show its `enabled`, family, resolved agent, and effort.
+4. **Project names are invalid here:** `/clean_fix eval <project>`, `/clean_fix review <project>`, and `/clean_fix fix <project>` are not supported. Tell the user to use `/clean_fix run <project>` for a single project's style eval/review/fix flow.
+5. **Scoped enable/disable:** `/clean_fix eval on`, `/clean_fix review off`, `/clean_fix fix on`, etc. set only that section's `enabled=` to `true` or `false` in `agent-assignments.conf`.
+6. **Global enable/disable:** `/clean_fix on` and `/clean_fix off` set all three `enabled=` values to `true` or `false` in `agent-assignments.conf`.
+7. Any former `/clean_fix agent ...`, `<scope> agent ...`, `<scope> model ...`, or `<scope> effort ...` setter form is invalid. Point to `/agent cleanfix <family>` or `/agent cleanfix.<stage> <agent>[:<effort>]` and stop without editing.
+8. The `[build]` and `[projects]` skip lists remain in `clean-fix.conf` and are managed by `phase_skip.py` (see <Skip/>), never by direct edits.
 
 </StyleAgentConfig>
 

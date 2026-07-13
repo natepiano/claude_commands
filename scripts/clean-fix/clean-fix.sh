@@ -202,19 +202,19 @@ if [[ -f "$CONF_FILE" ]]; then
                 ;;
             style_eval)
                 if [[ "$stripped" =~ ^mode= ]]; then
-                    echo "ERROR: [style_eval] mode is no longer supported; agent settings moved to agent-assignments.conf" >&2
+                    echo "ERROR: [style_eval] stale clean-fix setting; stage enablement lives in $CLEAN_FIX_AGENT_ASSIGNMENTS_FILE and agent settings live in $AGENTS_CONFIG_FILE" >&2
                     exit 1
                 elif [[ "$stripped" =~ ^(enabled|agent|model|effort)= ]]; then
-                    echo "ERROR: [style_eval] agent settings moved to $CLEAN_FIX_AGENT_ASSIGNMENTS_FILE" >&2
+                    echo "ERROR: [style_eval] stale clean-fix setting; stage enablement lives in $CLEAN_FIX_AGENT_ASSIGNMENTS_FILE and agent settings live in $AGENTS_CONFIG_FILE" >&2
                     exit 1
                 fi
                 ;;
             style_fix)
                 if [[ "$stripped" =~ ^mode= ]]; then
-                    echo "ERROR: [style_fix] mode is no longer supported; agent settings moved to agent-assignments.conf" >&2
+                    echo "ERROR: [style_fix] stale clean-fix setting; stage enablement lives in $CLEAN_FIX_AGENT_ASSIGNMENTS_FILE and agent settings live in $AGENTS_CONFIG_FILE" >&2
                     exit 1
                 elif [[ "$stripped" =~ ^(enabled|agent|model|effort)= ]]; then
-                    echo "ERROR: [style_fix] agent settings moved to $CLEAN_FIX_AGENT_ASSIGNMENTS_FILE" >&2
+                    echo "ERROR: [style_fix] stale clean-fix setting; stage enablement lives in $CLEAN_FIX_AGENT_ASSIGNMENTS_FILE and agent settings live in $AGENTS_CONFIG_FILE" >&2
                     exit 1
                 fi
                 ;;
@@ -324,7 +324,7 @@ if [[ "$SCOPE" != "clean" ]]; then
         style_args+=("$(project_filter_key "$PROJECT_FILTER")")
     fi
     if [[ "$STYLE_EVAL_ENABLED" == "true" ]]; then
-        log "Starting style evaluations with $STYLE_EVAL_AGENT..."
+        log "Starting style evaluations with family=$STYLE_EVAL_AGENT agent=${STYLE_EVAL_MODEL:-<default>} effort=${STYLE_EVAL_EFFORT:-<default>}..."
         "$SCRIPT_DIR/style-eval-all.sh" ${style_args[@]+"${style_args[@]}"} 2>&1 | tee -a "$LOG_FILE" || {
             log "WARNING: style evaluation script failed"
         }
@@ -335,7 +335,7 @@ if [[ "$SCOPE" != "clean" ]]; then
     # Review pass over each project's pending evaluation markdown before the
     # fix stage spawns.
     if [[ "$STYLE_REVIEW_ENABLED" == "true" ]]; then
-        log "Reviewing pending evaluation markdown with $STYLE_REVIEW_AGENT..."
+        log "Reviewing pending evaluation markdown with family=$STYLE_REVIEW_AGENT agent=${STYLE_REVIEW_MODEL:-<default>} effort=${STYLE_REVIEW_EFFORT:-<default>}..."
         "$SCRIPT_DIR/style-eval-review-all.sh" ${style_args[@]+"${style_args[@]}"} 2>&1 | tee -a "$LOG_FILE" || {
             log "WARNING: style eval review script failed"
         }
@@ -344,7 +344,7 @@ if [[ "$SCOPE" != "clean" ]]; then
     fi
 
     if [[ "$STYLE_FIX_ENABLED" == "true" ]]; then
-        log "Creating style-fix worktrees with $STYLE_FIX_AGENT..."
+        log "Creating style-fix worktrees with family=$STYLE_FIX_AGENT agent=${STYLE_FIX_MODEL:-<default>} effort=${STYLE_FIX_EFFORT:-<default>}..."
         "$SCRIPT_DIR/style-fix-worktrees.sh" ${style_args[@]+"${style_args[@]}"} 2>&1 | tee -a "$LOG_FILE" || {
             log "WARNING: style-fix worktree script failed"
         }
@@ -360,16 +360,23 @@ MINUTES=$(( ELAPSED / 60 ))
 SECS=$(( ELAPSED % 60 ))
 log "=== Clean-fix Rust clean + rebuild complete (${MINUTES}m ${SECS}s) ==="
 
-# Generate the clean-fix report via Claude CLI — but only when the run did
+# Generate the clean-fix report via the assigned agent — but only when the run did
 # something. The style scope fires every 10 minutes; an all-SKIP cycle has no
-# OK/FAILED/CLEAN/BUILD lines and a headless claude call per idle cycle is
-# pure cost.
+# OK/FAILED/CLEAN/BUILD lines and an agent call per idle cycle is pure cost.
 REPORT_FILE="/tmp/clean-fix-report.txt"
+REPORT_PROMPT_FILE="${LOG_FILE%.log}-report-prompt.md"
+REPORT_LOG_FILE="$LOG_DIR/report_render.txt"
 if grep -qE '(^|[[:space:]])(OK|FAILED|ERROR|TIMEOUT|RECOVERED|Launched|CLEAN|BUILD|MEND):' "$LOG_FILE"; then
     log "Generating clean-fix report..."
-    claude --print --dangerously-skip-permissions --settings '{"sandbox":{"enabled":false}}' -- "$(sed 's/\$ARGUMENTS/rebuild/g' "$HOME/.claude/scripts/clean-fix/report-render.md")" > "$REPORT_FILE" 2>> "$LOG_FILE" || {
+    if sed 's/\$ARGUMENTS/rebuild/g' "$HOME/.claude/scripts/clean-fix/report-render.md" > "$REPORT_PROMPT_FILE"; then
+        "$HOME/.claude/scripts/agents/agent_exec.sh" cleanfix.report write \
+            "$HOME/.claude" "$REPORT_PROMPT_FILE" "$REPORT_FILE" "$REPORT_LOG_FILE" || {
+            log "WARNING: failed to generate clean-fix report"
+        }
+    else
         log "WARNING: failed to generate clean-fix report"
-    }
+    fi
+    rm -f "$REPORT_PROMPT_FILE"
 else
     log "Report skipped (no per-project activity this run)."
 fi

@@ -42,16 +42,16 @@ cf_validate_bool() {
     esac
 }
 
-# cf_load_stage_assignment <section> <enabled_var> <agent_var> <model_var> <effort_var>
+# cf_load_stage_assignment <section> <enabled_var> <family_var> <agent_var> <effort_var>
 cf_load_stage_assignment() {
     local want_section="$1"
     local enabled_var="$2"
-    local agent_var="$3"
-    local model_var="$4"
+    local family_var="$3"
+    local agent_var="$4"
     local effort_var="$5"
     local line stripped section
     local parsed_enabled=""
-    local resolved_family resolved_model resolved_effort
+    local resolved_family resolved_agent resolved_effort
 
     if [[ ! -f "$CLEAN_FIX_AGENT_ASSIGNMENTS_FILE" ]]; then
         echo "ERROR: clean-fix agent assignment file not found: $CLEAN_FIX_AGENT_ASSIGNMENTS_FILE" >&2
@@ -81,21 +81,21 @@ cf_load_stage_assignment() {
     cf_validate_bool "$want_section" enabled "$parsed_enabled" || return 1
     agents_resolve "cleanfix.$want_section" || return 1
     resolved_family="$AGENT_FAMILY"
-    resolved_model="$AGENT_MODEL"
+    resolved_agent="$AGENT_MODEL"
     resolved_effort="$AGENT_EFFORT"
 
     printf -v "$enabled_var" '%s' "$parsed_enabled"
-    printf -v "$agent_var" '%s' "$resolved_family"
-    printf -v "$model_var" '%s' "$resolved_model"
+    printf -v "$family_var" '%s' "$resolved_family"
+    printf -v "$agent_var" '%s' "$resolved_agent"
     printf -v "$effort_var" '%s' "$resolved_effort"
 }
 
 cf_print_stage_assignment() {
     local section="$1"
-    local enabled="" agent="" model="" effort=""
-    cf_load_stage_assignment "$section" enabled agent model effort || return 1
-    printf '%-18s enabled=%-5s agent=%-6s model=%-12s effort=%s\n' \
-        "$section" "$enabled" "$agent" "${model:-<default>}" "${effort:-<default>}"
+    local enabled="" family="" agent="" effort=""
+    cf_load_stage_assignment "$section" enabled family agent effort || return 1
+    printf '%-18s enabled=%-5s family=%-6s agent=%-12s effort=%s\n' \
+        "$section" "$enabled" "$family" "${agent:-<default>}" "${effort:-<default>}"
 }
 
 cf_print_agent_assignments() {

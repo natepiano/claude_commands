@@ -1,6 +1,6 @@
 # Clean-fix Report
 
-Render a status view of one clean-fix run from a parsed log. All log discovery, regex matching, phase slicing, and bookkeeping suppression lives in `~/.claude/scripts/clean-fix/clean_fix_report_parse.py`. This document only routes arguments and renders the parsed output. It is consumed two ways: by `/clean_fix report` (interactive) and by `clean-fix.sh`, which pipes it into a headless claude after each run.
+Render a status view of one clean-fix run from a parsed log. All log discovery, regex matching, phase slicing, and bookkeeping suppression lives in `~/.claude/scripts/clean-fix/clean_fix_report_parse.py`. This document only routes arguments and renders the parsed output. It is consumed two ways: by `/clean_fix report` (interactive) and by `clean-fix.sh`, which sends it to the configured report agent after each run.
 
 ## Arguments
 
@@ -10,7 +10,7 @@ Render a status view of one clean-fix run from a parsed log. All log discovery, 
 2. **The literal word `list`** — call `clean_fix_report_parse.py --list`. Print the numbered list (path, date, time, duration, status, phases). Ask the user to pick by index, then call `clean_fix_report_parse.py <chosen-path>` and render.
 3. **The literal word `latest` or `newest`** — call `clean_fix_report_parse.py --latest-log`. This is the explicit old behavior: parse the newest log in `~/.local/logs/clean-fix/`.
 4. **A path** — call `clean_fix_report_parse.py <path>`. If the parser exits with `ERROR: log not found`, surface that and stop.
-5. **Any other token** (e.g. `rebuild`, which `clean-fix.sh` substitutes in its headless invocation) — treat as Empty: current keyed-project state.
+5. **Any other token** (e.g. `rebuild`, which `clean-fix.sh` substitutes in its scheduled invocation) — treat as Empty: current keyed-project state.
 
 ## Parser output format
 
@@ -128,7 +128,7 @@ What failed
 
 Combine multiple `WARNING` records about the same project into a single sentence — don't print the same project twice.
 
-When fix `WARNING` records read `codex hit its usage limit — …; not a code failure`, they share one root cause: the fix agent ran out of credits, so the pipeline removed those worktrees via its normal failure cleanup. Do **not** render them as separate code failures. State the shared cause once, name the affected projects together, and defer the full framing to the `codex hit its usage limit …` NOTE under "Heads up" (see below). These projects recover on the next run once credits reset — nothing merge-ready was lost.
+When fix `WARNING` records read `<family> hit its usage limit — …; not a code failure`, they share one root cause: the fix agent ran out of credits, so the pipeline removed those worktrees via its normal failure cleanup. Do **not** render them as separate code failures. State the shared cause once, name the affected projects together, and defer the full framing to the matching `<family> hit its usage limit …` NOTE under "Heads up" (see below). These projects recover on the next run once that family's credits reset — nothing merge-ready was lost.
 
 ### 6. Sub-tool warnings
 
@@ -152,7 +152,7 @@ Render any `NOTE` records as bullets under the heading `**Heads up**`. Phrase ea
 Examples of NOTEs the parser emits:
 - `~/rust/nate_style left dirty: 1 worktree run(s) failed; leaving nate_style dirty for review` → `nate_style is in a dirty state because a worktree fix failed. Review and commit (or discard) ~/rust/nate_style before the next run.`
 - `style-fix script failed before per-project work` → `the style-fix script crashed before doing any work — investigate the orchestrator log.`
-- `codex hit its usage limit during the fix pass: N projects (…) failed for that reason alone …` → **lead the Heads up section with this, rendered close to verbatim.** It is the single most important line when it appears: it explains why several fixes are missing in one stroke — the fix agent hit the credit wall, not a code problem — and that those worktrees come back on the next run after the reset time. Do not bury it below per-project chores.
+- `<family> hit its usage limit during the fix pass: N projects (…) failed for that reason alone …` → **lead the Heads up section with this, rendered close to verbatim.** It is the single most important line when it appears: it explains why several fixes are missing in one stroke — the fix agent hit the credit wall, not a code problem — and that those worktrees come back on the next run after the reset time. Do not bury it below per-project chores.
 - `phases not in this log: clean,warmup,eval,review` → omit (this is a partial-log informational, already implied by the empty cells).
 
 Also synthesize NOTEs for:

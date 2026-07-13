@@ -38,11 +38,10 @@ load_usage_rows() {
     add_usage "clean_fix monitor" "Watches the latest clean-fix log modified in the last 2 hours." true
     add_usage "clean_fix report" "Shows the newest clean-fix report. Use clean_fix list to choose an older report."
     add_usage "clean_fix list" "Lists reportable logs. Same as clean_fix report list." true
-    add_usage "clean_fix eval" "Shows eval stage agent status. Also works for review and fix."
-    add_usage "clean_fix eval model <id-or-default>" "Sets one stage's model override. Also works for review and fix."
-    add_usage "clean_fix eval effort <id-or-default>" "Sets one stage's effort override. Also works for review and fix." true
-    add_usage "clean_fix agent codex" "Sets eval, review, and fix to codex. Use claude to set all stages to claude."
-    add_usage "clean_fix agent eval claude" "Sets only eval to claude. Also works for review/fix and claude/codex." true
+    add_usage "clean_fix eval" "Shows eval stage family/agent status. Also works for review and fix."
+    add_usage "clean_fix agent" "Shows all stage family, resolved agent, and effort assignments."
+    add_usage "/agent cleanfix <family>" "Switches the clean-fix family in the shared agent registry."
+    add_usage "/agent cleanfix.<stage> <agent>[:<effort>]" "Edits a clean-fix stage row; stages are style_eval, style_eval_review, and style_fix." true
     add_usage "clean_fix on" "Enables all style stages."
     add_usage "clean_fix off" "Disables all style stages."
     add_usage "clean_fix eval on" "Enables one stage. Also works for review and fix."
@@ -90,9 +89,9 @@ print_usage_json() {
 print_stage_json() {
     local label="$1"
     local section="$2"
-    local enabled="" agent="" model="" effort="" status=""
+    local enabled="" family="" agent="" effort="" status=""
 
-    cf_load_stage_assignment "$section" enabled agent model effort
+    cf_load_stage_assignment "$section" enabled family agent effort
     if [[ "$enabled" == "true" ]]; then
         status="ENABLED"
     else
@@ -102,10 +101,10 @@ print_stage_json() {
     json_string "$label"
     printf ', "status": '
     json_string "$status"
+    printf ', "family": '
+    json_string "$family"
     printf ', "agent": '
-    json_string "$agent"
-    printf ', "model": '
-    json_string "${model:-<default>}"
+    json_string "${agent:-<default>}"
     printf ', "effort": '
     json_string "${effort:-<default>}"
     printf '}'
@@ -433,15 +432,15 @@ print_usage_text() {
 print_stage_text() {
     local label="$1"
     local section="$2"
-    local enabled="" agent="" model="" effort="" status=""
+    local enabled="" family="" agent="" effort="" status=""
 
-    cf_load_stage_assignment "$section" enabled agent model effort
+    cf_load_stage_assignment "$section" enabled family agent effort
     if [[ "$enabled" == "true" ]]; then
         status="ENABLED"
     else
         status="DISABLED"
     fi
-    printf "%-7s %-8s %-7s %-9s %s\n" "$label" "$status" "$agent" "${model:-<default>}" "${effort:-<default>}"
+    printf "%-7s %-8s %-7s %-12s %s\n" "$label" "$status" "$family" "${agent:-<default>}" "${effort:-<default>}"
 }
 
 print_agents_rule() {
@@ -451,7 +450,7 @@ print_agents_rule() {
     printf ' '
     repeat_dash 7
     printf ' '
-    repeat_dash 9
+    repeat_dash 12
     printf ' '
     repeat_dash 6
     printf '\n'
@@ -460,7 +459,7 @@ print_agents_rule() {
 print_agents_text() {
     printf '## Agents\n\n'
     printf '```text\n'
-    printf "%-7s %-8s %-7s %-9s %s\n" "Stage" "Status" "Agent" "Model" "Effort"
+    printf "%-7s %-8s %-7s %-12s %s\n" "Stage" "Status" "Family" "Agent" "Effort"
     print_agents_rule
     print_stage_text "eval" "style_eval"
     print_stage_text "review" "style_eval_review"
