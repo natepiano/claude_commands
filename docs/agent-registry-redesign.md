@@ -36,7 +36,9 @@
   - `scripts/ask_a_friend/codex_implement.sh` — implementation launcher → `implement.sh` (Phase 9).
   - `commands/plan/delegate.md` — /plan:delegate orchestration (rewritten in Phase 4); launcher call sites at lines 213 (implement), 266 (review), 389 (fix); `<SelectTask>` at 194; `IMPLEMENTATION_TASK`/`FIX_TASK` variables; `impl_agent.log`/`review_agent.log` + `impl_agent`/`review_agent` provenance refs.
   - `commands/ask_a_friend.md` — resolution blurb at lines 15-16, call sites at 88 and 285, `codex.log`/`impl_codex.log` refs at 93 and 291.
-  - `commands/cli_agent.md` — the /cli_agent doc; replaced by `commands/agent.md` in Phase 5.
+  - `commands/cli_agent.md` — deleted in Phase 5 (done); replaced by `commands/agent.md`.
+  - `commands/agent.md` — the `/agent` skill (Phase 5): thin wrapper over `agent_admin.sh`, relays stdout/stderr exactly; Phase 6 removes its transitional `## Status`-section note.
+  - `scripts/agents/agent_admin.sh` — 26-line dispatcher (Phase 5) over `agents_list_assignments`/`agents_set_assignment`/`agents_set_row`.
   - `commands/clean_fix.md` — configure-agents surface (`agent`/`eval|review|fix` subcommands) around lines 267-300; shrinks to a status view in Phase 8.
   - `commands/team_review.md` — `<LaunchExpertTeam>` (~86-117) Agent-tool subagents; migrated in Phase 10.
   - `commands/api_review.md` — 5 reviewers (~63) + 2 adversaries (~116); migrated in Phase 10.
@@ -44,9 +46,9 @@
   - `.claude/settings.local.json` — at `/Users/natemccoy/.claude/.claude/settings.local.json`; `ask_a_friend/codex_implement.sh` permission entries at lines 20 and 73 updated in Phase 9; `Bash(codex exec:*)` (26) and `Bash(pkill -f 'claude --print')` (33) still match after migration.
   - `~/.codex/models_cache.json` — external input the sync script parses; per-model `supported_reasoning_levels[].effort`.
 - **Build:** None — no compile/build step for this repo.
-- **Test:** Standalone bash test scripts run directly (`bash scripts/agents/test_agents_config.sh`, `bash scripts/agents/test_sync_codex_catalog.sh`, `bash scripts/agents/test_agent_exec.sh` — the first and last are created by this plan); each is self-contained (uses `mktemp -d`, sources the script under test, prints a "…passed" line and exits nonzero on failure). Phase 4 deleted `scripts/delegate/test_delegate_config.sh`. The resolver code is bash-only (`BASH_REMATCH`, process substitution) — run every test and manual smoke via `bash <script>` / `bash -c`, never zsh. Sourcing `agents_config.sh` fires the codex-catalog freshness sync (can hang in a network-blocked sandbox); fixtures and probes suppress it by exporting `CODEX_CATALOG_SYNC_STATE_FILE` pointing at a freshly `touch`ed temp file before sourcing.
+- **Test:** Standalone bash test scripts run directly (`bash scripts/agents/test_agents_config.sh`, `bash scripts/agents/test_sync_codex_catalog.sh`, `bash scripts/agents/test_agent_exec.sh` — the first and last are created by this plan); each is self-contained (uses `mktemp -d`, sources the script under test, prints a "…passed" line and exits nonzero on failure). Phase 4 deleted `scripts/delegate/test_delegate_config.sh`. The resolver code is bash-only (`BASH_REMATCH`, process substitution) — run every test and manual smoke via `bash <script>` / `bash -c`, never zsh. Sourcing `agents_config.sh` fires the codex-catalog freshness sync (can hang in a network-blocked sandbox); fixtures and probes suppress it by exporting `CODEX_CATALOG_SYNC_STATE_FILE` pointing at a freshly `touch`ed temp file before sourcing. The Claude Code sandbox denies writes under `~/.claude/config` and to `~/.local/state/` — any smoke that rewrites `config/agents.conf` or needs the freshness sync to complete (`/agent` edits, conf round-trips, warm-the-gate runs) must run unsandboxed (`dangerouslyDisableSandbox: true`); sandboxed, only the mktemp fails and the sync's warn-and-continue masks it as a stale catalog.
 - **Lint:** No project-wide shellcheck harness. For Python, basedpyright must report zero errors and zero warnings (`clean_fix_report_parse.py` edits must stay clean); never add file-level type ignores.
-- **Style:** Not Rust — no Rust style loader. Repo conventions in the touched scripts: `set -euo pipefail` at the top of the `#!/usr/bin/env bash` scripts; function-name prefixes namespaced by module — `agents_*` (resolver), `cf_*` (clean-fix), `cli_agent_*` (alias dispatcher); ini sections rewritten in place via awk. Codex effort is passed as `-c model_reasoning_effort="…"` and omitted entirely when empty (empty effort = "use CLI default"). Use allowlist/denylist vocabulary, never whitelist/blacklist.
+- **Style:** Not Rust — no Rust style loader. Repo conventions in the touched scripts: `set -euo pipefail` at the top of the `#!/usr/bin/env bash` scripts; function-name prefixes namespaced by module — `agents_*` (resolver), `cf_*` (clean-fix), `cli_agent_*` (alias dispatcher); ini sections rewritten in place via awk. Codex effort is passed as `-c model_reasoning_effort="…"` and omitted entirely when empty (empty effort = "use CLI default"). awk writing a user-supplied value into a conf must pass it via `ENVIRON` (raw channel), never `awk -v`, which decodes backslash escapes — see `agents_set_row` in `agents_config.sh`. Use allowlist/denylist vocabulary, never whitelist/blacklist.
 - **Invariants:**
   - clean-fix runs unattended via launchd every 10 minutes (`com.natemccoy.style-fix.plist`, `StartInterval=600`, no idle gate) — the clean-fix scripts and `clean_fix_report_parse.py` must never be left broken at the end of any phase.
   - `/plan:delegate` is itself implemented by `scripts/delegate/*` — the very tooling dispatching this plan — so the delegate launchers must work at the end of every phase; the Phase 4 renames and the `commands/plan/delegate.md` call-site edits must land together in that one phase.
@@ -332,7 +334,7 @@ agent_exec <task> <mode:write|readonly> <working_dir> <prompt_file> <output_file
 - Phase 10's acceptance grep widened (`subagent_type\|Explore agents\|using the Agent tool`) — the bare pattern was vacuous for two of the three docs; added a warm-the-freshness-gate step before its parallel launches.
 - Two new Delegation Context invariants: `agent_exec` callers pass absolute prompt/output/log paths (claude redirects post-`cd`); `AGENT_EXEC_EXTRA_ARGS` is whitespace-split, no space-containing argument, and no planned phase uses it.
 
-### Phase 4 — Delegate migration: family-neutral launchers  · status: done (`8758032`)
+### Phase 4 — Delegate migration: family-neutral launchers  · status: done (`29ab888`)
 
 #### Work Order
 
@@ -376,7 +378,7 @@ agent_exec <task> <mode:write|readonly> <working_dir> <prompt_file> <output_file
 - Phase 11's verification grep got its dots escaped (`codex\.models` etc.) — the unescaped pattern permanently matches `~/.codex/models_cache.json` path comments and could never come back clean.
 - `settings.json` stays excluded from every checkpoint commit (pre-existing app-generated key reorder; out-of-scope guardrail) — standing practice, no plan change.
 
-### Phase 5 — `/agent` skill: registry administration  · status: todo
+### Phase 5 — `/agent` skill: registry administration  · status: done (`4eb571d`)
 
 #### Work Order
 
@@ -407,6 +409,22 @@ Post-ship note (no plan-time edits): the live `[codex.agents]` catalog now adver
 
 **Acceptance gate:** `bash scripts/agents/agent_admin.sh status` renders every function with family and resolved rows; a `cli codex→claude→codex` round-trip leaves `config/agents.conf` byte-identical (diff clean — take the "before" snapshot *after* sourcing the resolver once, so a pending freshness sync can't rewrite `[codex.agents]` mid-round-trip and fake a diff); an invalid switch (`agent_admin.sh delegate nosuch`) and an invalid row edit (`agent_admin.sh cli.interactive nosuch:high`) both fail nonzero naming the problem with the file untouched; a valid row edit and its reversal rewrite only that row and preserve its trailing inline comment; `bash scripts/agents/test_agents_config.sh` passes.
 
+#### Retrospective
+
+**What worked:** `agent_admin.sh` stayed a 26-line dispatcher (dotted first arg → `agents_set_row`, bare → `agents_set_assignment`); the row rewrite preserves trailing `# alias:` comments and spacing byte-exactly; all round-trips on the live conf verified byte-identical; grammar matches the Phase 2 sync warnings verbatim.
+**What deviated from the plan:** One fix pass. The initial `agents_set_row` passed the new pair via `awk -v`, which decodes backslash escapes (`\n`, `\t`) — a catalog-valid agent name containing a backslash would corrupt the row. Fixed by passing the value through `ENVIRON["NEW_PAIR"]` (raw channel) with a byte-exact backslash regression test.
+**Surprises:** The Claude Code sandbox denies writes under `~/.claude/config` (explicit deny path), so any smoke that rewrites `config/agents.conf` — `/agent` round-trips, the freshness sync — must run unsandboxed from a session; only the mktemp fails, and the sync's warn-and-continue masks it as a stale catalog rather than an error.
+**Implications for remaining phases:** `awk -v` escape decoding is now a known gotcha: any future awk that writes a user-supplied value into the conf must use the `ENVIRON` raw-channel pattern (`agents_config.sh` `agents_set_row`). Gate smokes in Phases 7/8/11 that trigger conf writes (resolver sourcing with a stale freshness gate, `/agent` round-trips) run unsandboxed.
+
+#### Phase 5 Review
+
+- Phase 10's warm-the-gate step now requires `dangerouslyDisableSandbox: true` — sandboxed, the sync can't write the conf or its state file and its warn-and-continue masks the failure, defeating the step's purpose.
+- The sandbox-denies-`~/.claude/config` fact and the `ENVIRON`-not-`awk -v` gotcha were promoted from this retrospective into Delegation Context (Test and Style bullets) so fresh sessions see them.
+- Phase 6 tightened: `--status` uses four `agents_resolve_print` calls (filtering `agents_list_assignments` would couple cli status to whole-registry health); the emitter word-split contract added to its Constraints; the transitional-note locator now names the exact paragraph; `commands/agent.md` gains a sandbox note for edit subcommands; the stale `~/.zshrc` line-59 comment (`/cli_agent` → `/agent`) is updated by the orchestrator at checkpoint time since the delegate can't write `$HOME` dotfiles.
+- Phase 8's Files gained `agent_assignments.sh`: `cf_print_stage_assignment`'s `agent=`/`model=` labels go stale after Phase 7's meaning shift and no phase owned the relabel.
+- Delegation Context key files refreshed: `cli_agent.md` marked deleted (done); entries added for `commands/agent.md` and `agent_admin.sh`.
+- Verified accurate, no edits needed: `cli_agent.sh` line refs (112/123, 53-56, 75-77), the delegate wrappers' `agents_resolve` retrofit target (line 29 in both), clean-fix call sites (225-229, 95/438), `<StyleAgentConfig>` at ~267-300, and the shipped `/agent` grammar matching the sync warnings verbatim.
+
 ### Phase 6 — cli aliases migration  · status: todo
 
 #### Work Order
@@ -416,16 +434,16 @@ Post-ship note (no plan-time edits): the live `[codex.agents]` catalog now adver
 **Spec:**
 
 - `scripts/cli_agent/cli_agent.sh`: drop `agent-assignment.conf` and the local load/set logic (`cli_agent_load`, `cli_agent_set`). Map invocation → task: no args → `cli.interactive`; first arg (skill name) → `cli.<skill>` (`style_fix_review`, `commit_prep`, `merge_branch` — the existing alias→skill mapping stays); unknown skill errors with the known list. Resolve via `agents_resolve`, then exec as today: codex keeps `-c service_tier="fast"` (lines 112/123) and gets model/effort flags from `agents_codex_args`; non-interactive claude keeps the `-- "/$invocation"` form with `agents_claude_args`. Empty effort omits the flag (both families).
-- `--status` prints the cli rows of `agents_list_assignments`; `--set` is removed — error message points at `/agent`.
-- `~/.zshrc` needs no changes — aliases already pass the skill name. (Out-of-scope guardrail: do not touch the interactive `claude` alias.)
-- Delete `scripts/cli_agent/agent-assignment.conf`. Remove the transitional-gap note added to `commands/agent.md` in Phase 5.
+- `--status` prints the four cli rows via `agents_resolve_print cli.style_fix_review` / `cli.commit_prep` / `cli.merge_branch` / `cli.interactive` (the shipped one-line `task=… family=… agent=… effort=…` format) — do not filter `agents_list_assignments`, which returns nonzero if any *other* function's rows fail to resolve; `--set` is removed — error message points at `/agent`.
+- `~/.zshrc`: aliases need no changes — they already pass the skill name. (Out-of-scope guardrail: do not touch the interactive `claude` alias.) Its line 59 comment ``# agent is configurable via `/cli_agent`; see ~/.claude/scripts/cli_agent/`` is a dangling pointer since Phase 5 — the delegate agent cannot write `$HOME` dotfiles (sandbox), so the orchestrator updates `/cli_agent` → `/agent` in that comment at checkpoint time.
+- Delete `scripts/cli_agent/agent-assignment.conf`. Remove the transitional note in `commands/agent.md` — the final paragraph of the `## Status` section (line 21), beginning "Until the cli aliases migrate to the registry in Phase 6". While in that file, add one line after the Run block: edit subcommands rewrite `config/agents.conf`, which the sandbox denies — run `agent_admin.sh` with `dangerouslyDisableSandbox: true` for `<function> <family>` and `<function>.<subtask>` edits (`status` is fine sandboxed).
 
 **Files:**
 - `scripts/cli_agent/cli_agent.sh` — resolve via registry; drop conf handling.
 - `scripts/cli_agent/agent-assignment.conf` — delete.
 - `commands/agent.md` — drop the Phase 5 transitional note.
 
-**Constraints from prior phases:** Phase 1 rows exist for `cli.style_fix_review`, `cli.commit_prep`, `cli.merge_branch`, `cli.interactive` in both family sets; `agents_codex_args`/`agents_claude_args` own the flag vocabulary; `/agent` (Phase 5) is the only assignment editor.
+**Constraints from prior phases:** Phase 1 rows exist for `cli.style_fix_review`, `cli.commit_prep`, `cli.merge_branch`, `cli.interactive` in both family sets; `agents_codex_args`/`agents_claude_args` own the flag vocabulary; `/agent` (Phase 5) is the only assignment editor. The emitters print one space-joined line whose codex effort token carries literal embedded quotes (`model_reasoning_effort="high"` is a single argv token) — word-split into an argv array (e.g. `read -r -a`), matching `cli_agent.sh`'s existing convention; never `eval`.
 
 **Acceptance gate:** `bash scripts/cli_agent/cli_agent.sh --status` prints all four cli sub-tasks with family/agent/effort; an unknown skill arg exits nonzero listing known skills; `--set` exits nonzero pointing at `/agent`; `grep -rn "agent-assignment.conf" scripts/ commands/` returns nothing.
 
@@ -474,6 +492,7 @@ Post-ship note (no plan-time edits): the live `[codex.agents]` catalog now adver
 - `scripts/clean-fix/clean_fix_report_parse.py` — family-keyed limit strings/codes.
 - `commands/clean_fix.md` — configure surface → status view pointing at `/agent`.
 - `scripts/clean-fix/README.md` — override schema rows.
+- `scripts/clean-fix/agent_assignments.sh` — relabel `cf_print_stage_assignment` (line 119) `agent=` → `family=`, `model=` → `agent=` (value meanings shifted in Phase 7; this helper backs the `/clean_fix agent` status view).
 
 **Constraints from prior phases:** Phase 7 set `STYLE_AGENT`=family / `STYLE_AGENT_MODEL`=agent and stripped the stage conf to `enabled=`; Phase 3's `agent_exec` signature is `<task> <mode> <working_dir> <prompt_file> <output_file> <log_file>` with `AGENT_EXEC_DRY_RUN=1` for smoke tests; Phase 5's `/agent` is the switch/edit surface these docs point at. Dry-run output shapes (Phase 3): codex prints `codex exec … <prompt> > <log> 2>&1`; claude prints `cd <working_dir> && claude … -- <prompt> > <output> 2> <log>` — match smoke checks on substrings, not whole lines.
 
@@ -524,7 +543,7 @@ Shared mechanics all three docs must specify:
 - Reviewers run `readonly` mode (codex `--sandbox read-only`, claude `--permission-mode plan`) — same as delegate review.
 - The command backgrounds all `agent_exec` calls in one turn (each via Bash `run_in_background: true` with `dangerouslyDisableSandbox: true`) and yields; task-notifications signal completion. Synthesis, deduplication, and the decision walk stay in-session as today.
 - Session dirs live under the scratchpad (per-agent `prompt_N.md`/`findings_N.txt`/`agent_N.log` plus provenance files), same layout as delegate sessions.
-- Warm the freshness gate once before backgrounding (e.g. run `bash scripts/agents/agent_admin.sh status`): every backgrounded `agent_exec` sources `agents_config.sh`, and a stale gate would make 5-7 parallel launches each fire the catalog sync (concurrent conf rewrites — covered by the last-writer-wins invariant — plus a ~1-2s `claude --help` shell-out apiece).
+- Warm the freshness gate once before backgrounding (e.g. run `bash scripts/agents/agent_admin.sh status`) — run the warm command itself with `dangerouslyDisableSandbox: true`: sandboxed, the sync can update neither `config/agents.conf` (`~/.claude/config` is a sandbox deny path) nor its state file (`~/.local/state/…` is outside the write allowlist), and its warn-and-continue masks the failure, leaving the gate stale. Every backgrounded `agent_exec` sources `agents_config.sh`, and a stale gate would make 5-7 parallel launches each fire the catalog sync (concurrent conf rewrites — covered by the last-writer-wins invariant — plus a ~1-2s `claude --help` shell-out apiece).
 - Everything else in the three docs (dimension menus, finding schema, synthesis, firewall/posture logic, decision walks) is untouched.
 
 **Files:**

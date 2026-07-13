@@ -30,6 +30,7 @@ bad_effort=codex
 empty_effort=codex
 switchable=codex
 assignable=codex
+editable=codex
 literal=codex
 literalxwork=claude
 
@@ -70,6 +71,12 @@ work=gpt-test:high
 [assignable.claude]
 work=opus:max
 
+[editable.codex]
+work=gpt-test:high    # alias: edit
+
+[editable.claude]
+work=opus:max
+
 [literal.codex]
 work=gpt-test:high
 
@@ -79,6 +86,7 @@ work=opus:max
 [codex.agents]
 gpt-test=low,medium,high
 gpt-bare=
+gpt\bs=low
 
 [claude.agents]
 opus=low,medium,high,max
@@ -163,6 +171,24 @@ cmp "$expected" "$AGENTS_CONFIG_FILE" || fail "successful assignment changed lin
 agents_resolve assignable.work
 [[ "$AGENT_FAMILY" == "claude" ]] || fail "updated assignment did not resolve to claude"
 [[ "$AGENT_MODEL" == "opus" && "$AGENT_EFFORT" == "max" ]] || fail "updated assignment resolved the wrong pair"
+
+before="$TEST_DIR/editable-before.conf"
+expected="$TEST_DIR/editable-expected.conf"
+cp "$AGENTS_CONFIG_FILE" "$before"
+assert_fails "invalid row agent" agents_set_row editable.work nosuch:high
+cmp "$before" "$AGENTS_CONFIG_FILE" || fail "rejected row agent changed the registry"
+assert_fails "invalid row effort" agents_set_row editable.work gpt-test:max
+cmp "$before" "$AGENTS_CONFIG_FILE" || fail "rejected row effort changed the registry"
+sed 's/^work=gpt-test:high    # alias: edit$/work=gpt-bare    # alias: edit/' "$before" > "$expected"
+agents_set_row editable.work gpt-bare
+cmp "$expected" "$AGENTS_CONFIG_FILE" || fail "successful row edit changed lines other than its row or comment spacing"
+agents_resolve editable.work
+[[ "$AGENT_MODEL" == "gpt-bare" && -z "$AGENT_EFFORT" ]] || fail "updated row resolved the wrong pair"
+agents_set_row editable.work gpt-test:high
+cmp "$before" "$AGENTS_CONFIG_FILE" || fail "row edit reversal was not byte-identical"
+sed 's/^work=gpt-test:high    # alias: edit$/work=gpt\\bs:low    # alias: edit/' "$before" > "$expected"
+agents_set_row editable.work 'gpt\bs:low'
+cmp "$expected" "$AGENTS_CONFIG_FILE" || fail "row edit did not preserve a literal backslash in the agent name"
 
 write_fixture "$TEST_DIR/list.conf"
 assignment_list="$(agents_list_assignments)"

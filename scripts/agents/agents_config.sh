@@ -362,6 +362,67 @@ agents_set_assignment() {
     mv "$tmp_file" "$AGENTS_CONFIG_FILE"
 }
 
+agents_set_row() {
+    local task="$1" pair="$2" function subtask family section tmp_file configured
+
+    function="${task%%.*}"
+    subtask="${task#*.}"
+    if [[ -z "$function" || -z "$subtask" || "$task" == "$function" || "$subtask" == *.* ]]; then
+        echo "ERROR: task '$task' must have exactly two segments: <function>.<subtask>." >&2
+        return 1
+    fi
+
+    family="$(_agents_registry_get assignments "$task")"
+    if [[ -z "$family" ]]; then
+        family="$(_agents_registry_get assignments "$function")"
+    fi
+    if [[ -z "$family" ]]; then
+        configured="$(_agents_section_keys_inline assignments)"
+        echo "ERROR: [$task] no [assignments] entry for '$function'." >&2
+        echo "       Configured assignments in $AGENTS_CONFIG_FILE: $configured" >&2
+        return 1
+    fi
+
+    section="$function.$family"
+    if ! _agents_registry_has_key "$section" "$subtask"; then
+        configured="$(_agents_section_keys_inline "$section")"
+        echo "ERROR: [$task] missing sub-task '$subtask' in [$section]." >&2
+        echo "       Allowed sub-tasks: $configured" >&2
+        return 1
+    fi
+    _agents_validate_pair "$task" "$family" "$pair" || return 1
+
+    tmp_file="$(mktemp "${AGENTS_CONFIG_FILE}.XXXXXX")"
+    if ! NEW_PAIR="$pair" awk -v sec="$section" -v row="$subtask" '
+        /^\[/ {
+            in_section = ($0 == "[" sec "]")
+            print
+            next
+        }
+        in_section {
+            content = $0
+            hash = index(content, "#")
+            before_comment = hash ? substr(content, 1, hash - 1) : content
+            equals = index(before_comment, "=")
+            if (equals && substr(before_comment, 1, equals - 1) == row) {
+                match(before_comment, /[[:space:]]*$/)
+                spacing = substr(before_comment, RSTART)
+                comment = hash ? substr(content, hash) : ""
+                print substr(before_comment, 1, equals) ENVIRON["NEW_PAIR"] spacing comment
+                found = 1
+                next
+            }
+        }
+        { print }
+        END { if (!found) exit 2 }
+    ' "$AGENTS_CONFIG_FILE" > "$tmp_file"; then
+        rm -f "$tmp_file"
+        echo "ERROR: no [$section] row '$subtask'; $AGENTS_CONFIG_FILE was not changed." >&2
+        return 1
+    fi
+    mv "$tmp_file" "$AGENTS_CONFIG_FILE"
+}
+
 agents_codex_args() {
     printf '%s %s' '-m' "$AGENT_MODEL"
     if [[ -n "$AGENT_EFFORT" ]]; then
