@@ -190,7 +190,9 @@ run_style_agent() {
             if [[ -n "$STYLE_AGENT_MODEL" ]]; then
                 codex_args+=("-m" "$STYLE_AGENT_MODEL")
             fi
-            codex_args+=("-c" "model_reasoning_effort=\"${STYLE_AGENT_EFFORT:-xhigh}\"")
+            if [[ -n "$STYLE_AGENT_EFFORT" ]]; then
+                codex_args+=("-c" "model_reasoning_effort=\"$STYLE_AGENT_EFFORT\"")
+            fi
             "$CODEX_BIN" exec \
                 ${codex_args[@]+"${codex_args[@]}"} \
                 --ephemeral \
@@ -552,7 +554,7 @@ supervise_agent() {
             SUPERVISE_TIMED_OUT=1
             SUPERVISE_ELAPSED=$elapsed
             SUPERVISE_AGENT_LIMIT=$(detect_agent_limit "$log_file")
-            [[ -n "$SUPERVISE_AGENT_LIMIT" ]] && echo "AGENT LIMIT: $proj (codex $SUPERVISE_AGENT_LIMIT)"
+            [[ -n "$SUPERVISE_AGENT_LIMIT" ]] && echo "AGENT LIMIT: $proj (${STYLE_AGENT} $SUPERVISE_AGENT_LIMIT)"
             return 0
         fi
     done
@@ -578,7 +580,7 @@ supervise_agent() {
     SUPERVISE_ELAPSED=$elapsed
     progress "$proj" "phase=${label}-exit code=$SUPERVISE_AGENT_CODE elapsed=${elapsed}s"
     SUPERVISE_AGENT_LIMIT=$(detect_agent_limit "$log_file")
-    [[ -n "$SUPERVISE_AGENT_LIMIT" ]] && echo "AGENT LIMIT: $proj (codex $SUPERVISE_AGENT_LIMIT)"
+    [[ -n "$SUPERVISE_AGENT_LIMIT" ]] && echo "AGENT LIMIT: $proj (${STYLE_AGENT} $SUPERVISE_AGENT_LIMIT)"
     return 0
 }
 

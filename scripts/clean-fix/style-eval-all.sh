@@ -408,7 +408,9 @@ run_style_agent() {
             if [[ -n "$STYLE_AGENT_MODEL" ]]; then
                 codex_args+=("-m" "$STYLE_AGENT_MODEL")
             fi
-            codex_args+=("-c" "model_reasoning_effort=\"${STYLE_AGENT_EFFORT:-xhigh}\"")
+            if [[ -n "$STYLE_AGENT_EFFORT" ]]; then
+                codex_args+=("-c" "model_reasoning_effort=\"$STYLE_AGENT_EFFORT\"")
+            fi
             "$CODEX_BIN" exec \
                 "${codex_args[@]}" \
                 --ephemeral \
