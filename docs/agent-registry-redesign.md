@@ -545,7 +545,7 @@ Post-ship note (no plan-time edits): the live `[codex.agents]` catalog now adver
 - Phase 11 gained the three stage scripts' stale clean-fix.conf error text (eval 74/77, review 66/69, fix 130/145/148 — line 130 still points users at the removed `agent=` conf key); no other phase owned it.
 - Delegation Context refreshed: the four Phase 8 file entries now describe what shipped, and the standing `settings.json` checkpoint exclusion is recorded as an invariant.
 
-### Phase 9 — ask_a_friend migration  · status: done (`5a91a55`)
+### Phase 9 — ask_a_friend migration  · status: done (`e874982`)
 
 #### Work Order
 
@@ -583,7 +583,7 @@ Post-ship note (no plan-time edits): the live `[codex.agents]` catalog now adver
 - Phase 11's caller inventory went past-tense (ask_a_friend's two callers removed in Phase 9; its grep is already clean of live code refs), gained the `agents_config.sh` header-comment rewrite (lines 2-6 still describe the legacy model), and its gate now runs the resolver test immediately after implementation lands to minimize the launchd broken window.
 - Recorded that Phases 10 and 11 are order-independent — the 10→11 order is convention, not a dependency.
 
-### Phase 10 — review commands migration  · status: todo
+### Phase 10 — review commands migration  · status: done (`a5bd786`)
 
 #### Work Order
 
@@ -618,6 +618,19 @@ Shared mechanics all three docs must specify:
 
 **Acceptance gate:** each doc's launch step invokes `agent_exec` with the correct task name and `readonly` mode; `grep -n "subagent_type\|Explore agents\|using the Agent tool" commands/team_review.md commands/api_review.md commands/module_review.md` shows no remaining Agent-tool launch for the review-team members (only `team_review.md` contains the literal `subagent_type` today — `api_review.md` and `module_review.md` phrase launches as "Launch N Explore agents in parallel", so the bare `subagent_type` grep is vacuous for them); each doc enumerates the self-contained-prompt requirements (charter preamble, topic/intent/posture, file paths, lens, finding schema).
 
+#### Retrospective
+
+**What worked:** All three docs landed with the full shared mechanics (wave namespacing, provenance capture, working-dir rules, unsandboxed warm-up, accepted-risk notes) in one pass; the folded-in operational specifics from the Phase 9 review were exactly what the implementation needed.
+**What deviated from the plan:** Two direct doc fixes (both reviews agreed): the new module_review prompt bullet mandated the charter's generic finding schema, contradicting the surviving per-agent format (per-agent format now governs); and no doc said what to do when a backgrounded reviewer fails — all three gained a failure rule (nonzero exit or missing/empty findings → read the agent log, surface, relaunch-or-proceed; never silently an empty review).
+**Surprises:** Two blind-review findings were refuted: the "don't restate launcher internals" objection targeted a descriptive sentence that mirrors the plan's own wording (the docs never assemble flags); and pass 2's "each proposed submodule from Agent D" dependency is a pre-existing flaw — parallel in-session subagents couldn't share results either. **Known pre-existing doc flaw (future pass, not this plan):** `module_review.md` pass 2 Agent F's charge references Agent D's proposals, which no parallel launch can deliver — it needs a second wave or a self-derived grouping.
+**Implications for remaining phases:** None structural — Phase 11 is docs/registry-internal cleanup, order-independent of this phase.
+
+#### Phase 10 Review
+
+- Phase 11's pre-flight verified everything against the live tree: the full delete list is caller-free repo-wide (wider sweep than the Work Order's grep), the keep list's callers are live, all line refs exact, the verification grep returns exactly the three predicted self-deleting categories, and every acceptance-gate command works post-strip.
+- Three one-line Work Order edits: `style-eval-review-all.sh:43`'s stale header comment added to the reword list (no phase owned it — the last such line found); the immediate post-implementation check now also runs `agent_admin.sh status` (the fixture test alone can't catch a botched live-conf edit that would wedge launchd); the cli round-trip smoke gained Phase 5's snapshot-after-one-source caveat.
+- Confirmed no-action items: Phase 10's `/tmp/claude/<command>/<uuid>/` session dirs match the delegate precedent; the grep can't see a leftover bare `[codex]` header but the spec's "file then contains only …" sentence guards that.
+
 ### Phase 11 — legacy strip + docs  · status: todo
 
 #### Work Order
@@ -631,7 +644,7 @@ Shared mechanics all three docs must specify:
 - `config/README.md`: rewrite the `## agents.conf` block for the new schema (three layers, `/agent` as the editor, sync behavior, claude catalog hand-maintained with alias-staleness warn).
 - `scripts/agents/test_sync_codex_catalog.sh`: its fixtures (heredocs ~lines 58 and 117) deliberately carry `[codex]`/`[codex.models]`/`[codex.efforts]` sections to pin "legacy sections left byte-identical when present". Rename those fixture sections to neutral names (e.g. `[legacy.unmanaged]` + plain rows) — the pass-through behavior being pinned is generic (the sync rewrites only `[codex.agents]`), so the test stays meaningful and the verification grep below can come back clean.
 - Verify `config/orphans_expected.json` needs nothing (it is empty).
-- Reword the clean-fix.conf stale-key error text in the three stage scripts to match `clean-fix.sh` 205-217 — stage enablement in `agent-assignments.conf`, agent settings in `config/agents.conf`: `style-eval-all.sh` 74/77, `style-eval-review-all.sh` 66/69, `style-fix-worktrees.sh` 130/145/148 (line 130 still says "use enabled=true|false and agent=claude|codex", directing users to a conf key Phase 7 removed).
+- Reword the clean-fix.conf stale-key error text in the three stage scripts to match `clean-fix.sh` 205-217 — stage enablement in `agent-assignments.conf`, agent settings in `config/agents.conf`: `style-eval-all.sh` 74/77, `style-eval-review-all.sh` 66/69, `style-fix-worktrees.sh` 130/145/148 (line 130 still says "use enabled=true|false and agent=claude|codex", directing users to a conf key Phase 7 removed). Also `style-eval-review-all.sh` line 43's header comment ("Agent assignment comes from agent-assignments.conf" — false since Phase 7): reword to say agent assignment resolves from `config/agents.conf` via the registry; `agent-assignments.conf` carries only `enabled=`.
 
 **Files:**
 - `config/agents.conf` — legacy sections removed.
@@ -642,4 +655,4 @@ Shared mechanics all three docs must specify:
 
 **Constraints from prior phases:** every consumer migrated in Phases 4-10; the only remaining readers of the legacy sections/functions should be the legacy functions themselves — `grep -rn "agents_config_model\|agents_config_effort\|agents_config_allowed\|agents_config_validate\|agents_config_apply_defaults\|codex\.models\|claude\.models\|codex\.efforts\|claude\.efforts" scripts/ commands/ config/` (dots escaped — the unescaped `codex.models` also matches the `~/.codex/models_cache.json` path in permanent comments at `agents_config.sh:11`, `sync_codex_catalog.sh:8`, and `config/README.md:12`, which would never grep clean) must come back clean (excluding this plan doc) before deleting — the wider pattern covers the allowed/validate/apply_defaults helpers and the `[*.efforts]` sections, whose last callers were removed in Phase 6 (`cli_agent.sh`) and Phase 7 (`agent_assignments.sh`); `agents_config_model`/`agents_config_effort`'s last two callers (the ask_a_friend launchers) were removed in Phase 9 — as of Phase 9 the verification grep already returns only the legacy functions' own definitions, `agents.conf`'s legacy sections, and the sync-test fixtures. Phases 10 and 11 are order-independent (the review docs never referenced the legacy API); the 10→11 order is kept for convention only. Phase 2 left the legacy conf sections static specifically so this phase could remove them wholesale; the Phase 2 sync neither reads nor writes any legacy section, so the wholesale strip is safe.
 
-**Acceptance gate:** run `bash scripts/agents/test_agents_config.sh` immediately after the implementation lands, before dispatching the blind review (the launchd driver sources this file every 10 minutes — minimize any broken window); then `bash scripts/agents/test_agents_config.sh`, `bash scripts/agents/test_agent_exec.sh`, and `bash scripts/agents/test_sync_codex_catalog.sh` all pass; the grep above returns nothing live; manual smoke: `/agent status` renders, one `codex`→`claude`→`codex` round-trip on `cli` leaves the conf byte-identical, and a delegate dry run (`AGENT_EXEC_DRY_RUN=1` through `implement.sh`) resolves correctly.
+**Acceptance gate:** run `bash scripts/agents/test_agents_config.sh` AND `bash scripts/agents/agent_admin.sh status` immediately after the implementation lands, before dispatching the blind review (the launchd driver sources this file every 10 minutes — minimize any broken window; the fixture test proves the resolver, the status render proves the live conf still resolves after ~40 live lines were deleted); then `bash scripts/agents/test_agents_config.sh`, `bash scripts/agents/test_agent_exec.sh`, and `bash scripts/agents/test_sync_codex_catalog.sh` all pass; the grep above returns nothing live; manual smoke: `/agent status` renders, one `codex`→`claude`→`codex` round-trip on `cli` leaves the conf byte-identical (take the "before" snapshot after sourcing the resolver once — Phase 5 precedent — and run the round-trip unsandboxed per the Test bullet), and a delegate dry run (`AGENT_EXEC_DRY_RUN=1` through `implement.sh`) resolves correctly.

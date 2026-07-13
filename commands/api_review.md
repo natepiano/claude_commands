@@ -60,7 +60,24 @@ Capture as `${INVENTORY}` — item list plus file paths. Every agent prompt gets
 <ReviewPass>
 **Goal:** five agents review the API along five lenses.
 
-Launch **5 Explore agents in parallel**. Each prompt includes this preamble verbatim:
+Launch **5 external CLI agents in parallel** through `~/.claude/scripts/agents/agent_exec.sh` using the `api_review.reviewer` registry task and `readonly` mode. Readonly mode is the delegate-review contract: codex uses `--sandbox read-only`; claude uses `--permission-mode plan`.
+
+Create an absolute `${SESSION_DIR}` under `/tmp/claude/api_review/<uuid>/`, set `${WORKING_DIR}=${CRATE_ROOT}`, and create `${WAVE_DIR}=${SESSION_DIR}/reviewer`. Before backgrounding any reviewer:
+
+1. Warm the agent-catalog freshness gate once by running `bash ~/.claude/scripts/agents/agent_admin.sh status` with Bash `dangerouslyDisableSandbox: true`. This must not run sandboxed: a sandboxed catalog sync cannot update the registry or freshness state, and its warn-and-continue behavior can leave every parallel launch attempting the same stale sync.
+2. Capture provenance once for each task this command uses:
+   - `bash -c 'source ~/.claude/scripts/agents/agents_config.sh && agents_resolve_print api_review.reviewer' >> "${SESSION_DIR}/agent_provenance.txt"`
+   - `bash -c 'source ~/.claude/scripts/agents/agents_config.sh && agents_resolve_print api_review.adversary' >> "${SESSION_DIR}/agent_provenance.txt"`
+
+Write five absolute `${WAVE_DIR}/prompt_N.md` files and reserve `${WAVE_DIR}/findings_N.txt` and `${WAVE_DIR}/agent_N.log` for each reviewer. External CLI agents inherit no session context. Every prompt file must be self-contained and include:
+
+- The charter preamble below verbatim.
+- The review topic, intent, and posture/boundaries from `<ResolveTarget/>` and the shared context below.
+- `${CRATE_ROOT}`, `${FOCUS}` when set, and every other relevant file as explicit absolute paths.
+- `${INVENTORY}` verbatim and the reviewer's specific lens.
+- The full charter finding schema: Title / Where (paths + item names) / Severity (critical / important / minor) / Problem (concrete, with the current call site or doc passage) / Impact / Recommendation (with a before/after sketch where useful). Omit Class as specified below.
+
+Each prompt includes this preamble verbatim:
 
 ```
 Before evaluating:
@@ -107,13 +124,23 @@ Output format per finding: the charter's finding schema (omit Class — this com
 >
 > Two-sided, per the charter's tie-breaks: also flag performance ceremony that isn't paying rent — lifetimes/generics that complicate every call site with no hot-path justification. When another lens's likely recommendation (e.g. `impl Into<T>` sugar) carries a cost on a hot path, say so explicitly with the cost named.
 
-Collect findings as `${FINDINGS}`.
+After all prompt files exist, issue all five Bash tool calls in the same assistant turn, each with `run_in_background: true` and `dangerouslyDisableSandbox: true`:
+
+```bash
+bash ~/.claude/scripts/agents/agent_exec.sh api_review.reviewer readonly "${WORKING_DIR}" "${WAVE_DIR}/prompt_N.md" "${WAVE_DIR}/findings_N.txt" "${WAVE_DIR}/agent_N.log"
+```
+
+All working-directory, prompt, output, and log arguments must be absolute paths. Yield after starting the complete wave; task notifications signal completion. Do not poll. After all five notifications arrive, read every `${WAVE_DIR}/findings_N.txt` and collect the findings as `${FINDINGS}`. Synthesis and deduplication remain in this command session. Failure rule for both waves in this command: if a launch exits nonzero or its findings file is missing or empty, read that agent's `agent_N.log`, surface the error to the user, and decide whether to relaunch that one agent or proceed on the remaining findings — never silently treat a failed agent as an empty review.
+
+Accepted risk: running the style loader is proven under codex readonly mode, but untested under claude `--permission-mode plan` with `--print`.
 </ReviewPass>
 
 ---
 
 <ValidationPass>
-**Goal:** adversarially stress-test the findings before they become a plan. Merge and dedupe `${FINDINGS}` first, then launch **2 Explore agents in parallel** (same charter + style-guide preamble), each given the merged findings and `${INVENTORY}`:
+**Goal:** adversarially stress-test the findings before they become a plan. Merge and dedupe `${FINDINGS}` first, then create `${WAVE_DIR}=${SESSION_DIR}/adversary` and launch **2 external CLI agents in parallel** through `~/.claude/scripts/agents/agent_exec.sh` using the `api_review.adversary` registry task and `readonly` mode.
+
+Write `${WAVE_DIR}/prompt_1.md` and `prompt_2.md`, with matching `findings_N.txt` and `agent_N.log` paths. Each self-contained prompt repeats the charter + style-guide preamble verbatim; the review topic, intent, and posture/boundaries; all relevant explicit absolute file paths; `${INVENTORY}` and the merged `${FINDINGS}` verbatim; its adversarial lens; and the complete finding schema from `<ReviewPass/>`.
 
 **Agent F — Feasibility and blast radius**
 > For each recommendation: count actual call sites that break (`rg` for the item across crate + workspace), name semver/behavior hazards, and check the before/after sketch actually compiles conceptually (ownership, lifetimes, object safety for proposed traits). Verify every proposed trait's implementer count — kill any that lands at one, unless it is a documented extension point for downstream implementers. Flag any recommendation that adds runtime cost (allocation, dispatch, copies) without the charter-required cost callout. For module moves/renames/splits, count broken `use` paths and flag visibility shifts (`pub(super)`/`pub(crate)` items that stop resolving). Rank surviving recommendations by benefit-to-churn.
@@ -121,7 +148,13 @@ Collect findings as `${FINDINGS}`.
 **Agent G — Over-engineering check**
 > Attack each recommendation as a skeptic: does it make the common call site simpler, or just different? Does it add a concept callers must learn? Would the author's own examples get shorter? Kill or demote anything that trades caller simplicity for internal elegance. "Reject" is a valid verdict per finding.
 
-Apply the verdicts: drop killed findings silently, adjust demoted ones. Conflicts between agents: caller-side simplicity wins.
+Issue both Bash tool calls in the same assistant turn, each with `run_in_background: true` and `dangerouslyDisableSandbox: true`:
+
+```bash
+bash ~/.claude/scripts/agents/agent_exec.sh api_review.adversary readonly "${WORKING_DIR}" "${WAVE_DIR}/prompt_N.md" "${WAVE_DIR}/findings_N.txt" "${WAVE_DIR}/agent_N.log"
+```
+
+Yield after starting both; task notifications signal completion. Do not poll. After both notifications arrive, read both findings files and apply the verdicts: drop killed findings silently, adjust demoted ones. Conflicts between agents: caller-side simplicity wins. Synthesis stays in this command session.
 </ValidationPass>
 
 ---

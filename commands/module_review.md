@@ -76,11 +76,29 @@ Identify the existing directory submodules under `${SCOPE}` (immediate children 
 <Pass1Discovery>
 **Goal:** Three agents evaluate the structure along three lenses, with the Rust style guide loaded.
 
-Launch **3 Explore agents in parallel** using the Agent tool. Each agent's prompt must include this preamble verbatim:
+Launch **3 external CLI agents in parallel** through `~/.claude/scripts/agents/agent_exec.sh` using the `module_review.reviewer` registry task and `readonly` mode. Readonly mode is the delegate-review contract: codex uses `--sandbox read-only`; claude uses `--permission-mode plan`.
+
+Create an absolute `${SESSION_DIR}` under `/tmp/claude/module_review/<uuid>/`. Set `${WORKING_DIR}` to the repo root containing `${SCOPE}`; never use `~/.claude` unless it is itself that repo. Create `${WAVE_DIR}=${SESSION_DIR}/pass1`. Before backgrounding any reviewer:
+
+1. Warm the agent-catalog freshness gate once by running `bash ~/.claude/scripts/agents/agent_admin.sh status` with Bash `dangerouslyDisableSandbox: true`. This must not run sandboxed: a sandboxed catalog sync cannot update the registry or freshness state, and its warn-and-continue behavior can leave every parallel launch attempting the same stale sync.
+2. Capture provenance once for each task this command uses:
+   - `bash -c 'source ~/.claude/scripts/agents/agents_config.sh && agents_resolve_print module_review.reviewer' >> "${SESSION_DIR}/agent_provenance.txt"`
+   - `bash -c 'source ~/.claude/scripts/agents/agents_config.sh && agents_resolve_print module_review.validation' >> "${SESSION_DIR}/agent_provenance.txt"`
+
+Write three absolute `${WAVE_DIR}/prompt_N.md` files and reserve `${WAVE_DIR}/findings_N.txt` and `${WAVE_DIR}/agent_N.log` for each reviewer. External CLI agents inherit no session context. Every prompt file must be self-contained and include:
+
+- The charter + style-guide preamble below verbatim.
+- The review topic, intent, and posture/boundaries from `<ResolveScope/>` and this pass.
+- `${SCOPE}`, `${CRATE_ROOT}` when set, `${DOC_PATH}`, and every other relevant file as explicit absolute paths.
+- `${INVENTORY}` verbatim and the reviewer's specific lens.
+- The finding output format for this pass: Agent A's format below (Title / Where / Observation / Severity / Recommendation), shared by Agents B and C — the per-agent format governs, not the charter's generic schema.
+
+Each agent's prompt must include this preamble verbatim:
 
 ```
-Before evaluating, load the Rust style guide:
-  zsh ~/.claude/scripts/rust_style/load-rust-style.sh
+Before evaluating:
+1. Read ~/rust/nate_style/review-charter.md — its ranked values, hard rules, and finding schema govern every finding you return.
+2. Load the Rust style guide: zsh ~/.claude/scripts/rust_style/load-rust-style.sh
 
 If the output mentions a saved file path, Read that file. Apply the loaded rules — especially `when-to-split-a-module.md` for the over-large-file criterion (~500 lines non-test + at least one other signal) — when forming findings. Cite the rule filename for each finding it informs.
 
@@ -123,7 +141,15 @@ Then the per-agent body. Pass `${INVENTORY}` verbatim into each prompt.
 **Each agent must additionally:**
 - List every over-large file it finds in `${SCOPE}`, citing `when-to-split-a-module.md` and which criteria are met. Use `wc -l` plus an `awk` test-block boundary check (`/^#\[cfg\(test\)\]/`) to separate production-line count from inline tests.
 
-Collect findings as `${PASS1_FINDINGS}` and the union of flagged over-large files as `${OVERSIZE_FILES}`.
+After all prompt files exist, issue all three Bash tool calls in the same assistant turn, each with `run_in_background: true` and `dangerouslyDisableSandbox: true`:
+
+```bash
+bash ~/.claude/scripts/agents/agent_exec.sh module_review.reviewer readonly "${WORKING_DIR}" "${WAVE_DIR}/prompt_N.md" "${WAVE_DIR}/findings_N.txt" "${WAVE_DIR}/agent_N.log"
+```
+
+All working-directory, prompt, output, and log arguments must be absolute paths. Yield after starting the complete wave; task notifications signal completion. Do not poll. After all three notifications arrive, read every `${WAVE_DIR}/findings_N.txt`; collect findings as `${PASS1_FINDINGS}` and the union of flagged over-large files as `${OVERSIZE_FILES}`. Synthesis remains in this command session. Failure rule for every wave in this command: if a launch exits nonzero or its findings file is missing or empty, read that agent's `agent_N.log`, surface the error to the user, and decide whether to relaunch that one agent or proceed on the remaining findings — never silently treat a failed agent as an empty review.
+
+Accepted risk: running the style loader is proven under codex readonly mode, but untested under claude `--permission-mode plan` with `--print`.
 </Pass1Discovery>
 
 ---
@@ -189,7 +215,9 @@ Do not cite agent reports. Do not include "options A vs B". State the recommenda
 
 **If `${OVERSIZE_FILES}` is empty:** print one line — `No over-large files in scope. Skipping pass 2.` — and proceed to pass 3.
 
-Otherwise, launch **3 Explore agents in parallel**, each loading the style guide (same preamble as pass 1). Each agent reviews **all** over-large files (not one agent per file) through a distinct lens.
+Otherwise, create `${WAVE_DIR}=${SESSION_DIR}/pass2` and launch **3 external CLI agents in parallel** through `~/.claude/scripts/agents/agent_exec.sh` using the `module_review.reviewer` registry task and `readonly` mode. Each agent reviews **all** over-large files (not one agent per file) through a distinct lens.
+
+Write three `prompt_N.md` files under the wave, with matching `findings_N.txt` and `agent_N.log` paths. Each self-contained prompt repeats the pass 1 charter + style-guide preamble verbatim; the review topic, intent, and posture/boundaries; all relevant explicit absolute paths; `${INVENTORY}` and `${OVERSIZE_FILES}` verbatim; its lens; and the complete finding schema from pass 1.
 
 **Agent D — Production seams**
 > For each file in `${OVERSIZE_FILES}`: group top-level items by responsibility. Propose a submodule layout (`<file>/mod.rs` + N submodules), citing line ranges, type names, and function clusters. Apply `name-submodules-after-anchor-types.md` and `split-by-type-ownership.md`. Output per file: target layout, what goes where (current line ranges + items), sequencing for the split (leaves first).
@@ -205,6 +233,14 @@ Otherwise, launch **3 Explore agents in parallel**, each loading the style guide
 > - External workspace (only when `${IS_WORKSPACE_MEMBER}` is true): `rg "use ${CRATE_NAME}::<path>::<file>" --type rust` across the whole repo, excluding `${CRATE_ROOT}`. Also check for re-exports at the crate root that would shield external callers from the move.
 >
 > Identify dependencies between proposed submodules (which import which) to determine extraction order. Surface any cycle or visibility hazard.
+
+Issue all three Bash tool calls in the same assistant turn, each with `run_in_background: true` and `dangerouslyDisableSandbox: true`:
+
+```bash
+bash ~/.claude/scripts/agents/agent_exec.sh module_review.reviewer readonly "${WORKING_DIR}" "${WAVE_DIR}/prompt_N.md" "${WAVE_DIR}/findings_N.txt" "${WAVE_DIR}/agent_N.log"
+```
+
+Yield after starting the complete wave; task notifications signal completion. Do not poll. After all three notifications arrive, read every findings file before synthesizing in-session.
 
 Synthesize: append a `## Phase N — Split <file>` section to `${DOC_PATH}` for each file, in order of size or risk. Each phase contains:
 - Target layout (directory tree).
@@ -223,7 +259,9 @@ Update the phase-overview table at the top of the doc to include the new phases.
 <Pass3Validation>
 **Goal:** Three agents stress-test the complete multi-phase plan.
 
-Launch **3 Explore agents in parallel**, each loading the style guide. Each agent reads `${DOC_PATH}` and validates against the current code on disk.
+Create `${WAVE_DIR}=${SESSION_DIR}/pass3` and launch **3 external CLI agents in parallel** through `~/.claude/scripts/agents/agent_exec.sh` using the `module_review.validation` registry task and `readonly` mode. Each agent reads `${DOC_PATH}` and validates against the current code on disk.
+
+Write three `prompt_N.md` files under the wave, with matching `findings_N.txt` and `agent_N.log` paths. Each self-contained prompt repeats the pass 1 charter + style-guide preamble verbatim; the review topic, intent, and posture/boundaries; all relevant explicit absolute paths; `${INVENTORY}` and `${DOC_PATH}` verbatim; its validation lens; and the complete finding schema from pass 1.
 
 **Agent G — Completeness**
 > Walk every `.rs` file in `${SCOPE}` (the inventory from step 2). Confirm each is either explicitly moved, explicitly kept where it is, or covered by a "stays where" section. Check rename consistency across the doc. Check that each new directory's `mod.rs` re-export block accounts for every type currently imported via the old path. Flag sequencing chicken-and-egg cases (e.g. directory A imports from directory B but is sequenced first).
@@ -243,7 +281,13 @@ Launch **3 Explore agents in parallel**, each loading the style guide. Each agen
 >
 > Do not manufacture dissent on side 1, but do not pull punches on side 2. "Keep as proposed" is only a valid verdict when both sides pass — overgroupings hold AND every layer is within the singleton budget.
 
-Collect findings as `${PASS3_FINDINGS}`.
+Issue all three Bash tool calls in the same assistant turn, each with `run_in_background: true` and `dangerouslyDisableSandbox: true`:
+
+```bash
+bash ~/.claude/scripts/agents/agent_exec.sh module_review.validation readonly "${WORKING_DIR}" "${WAVE_DIR}/prompt_N.md" "${WAVE_DIR}/findings_N.txt" "${WAVE_DIR}/agent_N.log"
+```
+
+Yield after starting the complete wave; task notifications signal completion. Do not poll. After all three notifications arrive, read every findings file and collect them as `${PASS3_FINDINGS}`. Refinement remains in this command session.
 </Pass3Validation>
 
 ---

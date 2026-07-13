@@ -19,6 +19,7 @@
       "Bash(bash ~/.claude/scripts/ask_a_friend/ask_a_friend.sh \"/tmp/claude/ask_a_friend\" \"/tmp/claude/test_project\")",
       "Bash(bash ~/.claude/scripts/ask_a_friend/implement.sh \"/tmp/claude/ask_a_friend\" \"/tmp/claude/test_project\")",
       "Bash(bash ~/.claude/scripts/ask_a_friend/prepare_session.sh)",
+      "Bash(bash ~/.claude/scripts/agents/agent_exec.sh:*)",
       "Bash(bash ~/.claude/scripts/clean-fix/setup.sh)",
       "Bash(bash ~/.claude/scripts/clean-fix/style-eval-all.sh)",
       "Bash(cd ~/rust/cargo-port && taplo fmt Cargo.toml 2>&1)",

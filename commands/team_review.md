@@ -83,7 +83,24 @@ Under ${REVIEW_POSTURE} = **open**: premise-challenges are first-class; this fir
 <LaunchExpertTeam>
 **Goal:** Launch parallel expert agents to analyze the topic from different dimensions.
 
-Launch **3-5 agents in parallel** using the Agent tool, each with a distinct analytical lens. Every agent prompt begins with this preamble verbatim:
+Launch **3-5 external CLI agents in parallel**, each with a distinct analytical lens, through `~/.claude/scripts/agents/agent_exec.sh` using the `team_review.expert` registry task and `readonly` mode. Readonly mode is the delegate-review contract: codex uses `--sandbox read-only`; claude uses `--permission-mode plan`.
+
+On the first cycle, create an absolute `${SESSION_DIR}` under `/tmp/claude/team_review/<uuid>/`. Set `${WORKING_DIR}` to the project root that contains the reviewed topic, normally the command session's current working directory; never use `~/.claude` unless it is itself the reviewed project. Before any agent launch:
+
+1. Warm the agent-catalog freshness gate once by running `bash ~/.claude/scripts/agents/agent_admin.sh status` with Bash `dangerouslyDisableSandbox: true`. This must not run sandboxed: a sandboxed catalog sync cannot update the registry or freshness state, and its warn-and-continue behavior can leave every parallel launch attempting the same stale sync.
+2. Capture provenance once for the task by running `bash -c 'source ~/.claude/scripts/agents/agents_config.sh && agents_resolve_print team_review.expert' >> "${SESSION_DIR}/agent_provenance.txt"`.
+
+For each cycle's 1-based `${CYCLE_NUMBER}`, create `${WAVE_DIR}=${SESSION_DIR}/cycle${CYCLE_NUMBER}`. Write one absolute `${WAVE_DIR}/prompt_N.md` per lens; reserve `${WAVE_DIR}/findings_N.txt` and `${WAVE_DIR}/agent_N.log` for its output and log. Wave namespacing is mandatory because `<LaunchExpertTeam/>` runs once per cycle.
+
+External CLI agents inherit no session context. Every prompt file must be self-contained and include:
+
+0. The following charter preamble verbatim.
+1. `${REVIEW_TOPIC}`, `${REVIEW_INTENT}`, `${REVIEW_POSTURE}`, and the posture mandate below.
+2. Every relevant file as an explicit absolute path, plus enough code/design context to evaluate it.
+3. The agent's distinct analytical dimension.
+4. The complete finding schema below.
+
+Every agent prompt begins with this preamble verbatim:
 
 ```
 Before evaluating, Read ~/rust/nate_style/review-charter.md — its ranked values, hard rules, and finding schema govern every finding you return. Follow its style-guide loading rule when the subject is Rust.
@@ -111,9 +128,17 @@ Choose dimensions appropriate to ${REVIEW_TOPIC}. When the subject is code or a 
    - **Impact**: Why it matters (severity: critical / important / minor)
    - **Recommendation**: Specific, actionable suggestion
 
-**Agent configuration:**
-- subagent_type: "Explore"
-- Each agent should read relevant files to ground their analysis in actual code/content
+Each agent should read the explicit relevant files to ground its analysis in actual code/content.
+
+After all prompt files exist, issue all 3-5 Bash tool calls in the same assistant turn, each with `run_in_background: true` and `dangerouslyDisableSandbox: true`:
+
+```bash
+bash ~/.claude/scripts/agents/agent_exec.sh team_review.expert readonly "${WORKING_DIR}" "${WAVE_DIR}/prompt_N.md" "${WAVE_DIR}/findings_N.txt" "${WAVE_DIR}/agent_N.log"
+```
+
+All working-directory, prompt, output, and log arguments must be absolute paths. Yield after starting the complete wave; task notifications signal completion. Do not poll. If a launch exits nonzero or its findings file is missing or empty, read that agent's `agent_N.log`, surface the error to the user, and decide whether to relaunch that one agent or proceed on the remaining findings — never silently treat a failed agent as an empty review. Synthesis, deduplication, firewall enforcement, and the decision walk remain in this command session.
+
+Accepted risk: Rust reviewers running the style loader through the charter are proven under codex readonly mode, but untested under claude `--permission-mode plan` with `--print`.
 </LaunchExpertTeam>
 
 ---
@@ -121,7 +146,7 @@ Choose dimensions appropriate to ${REVIEW_TOPIC}. When the subject is code or a 
 <SynthesizeFindings>
 **Goal:** Merge and deduplicate findings from all agents into a single ordered list.
 
-1. Collect all findings from returned agents
+1. After every task notification for the current wave arrives, read each `${WAVE_DIR}/findings_N.txt` and collect its findings
 2. Deduplicate — if multiple agents found the same issue, merge into one finding and note the consensus
 3. Order by severity: critical first, then important, then minor
 4. Assign each finding a sequential number (F1, F2, F3...)
