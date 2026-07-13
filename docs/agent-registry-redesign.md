@@ -583,7 +583,7 @@ Post-ship note (no plan-time edits): the live `[codex.agents]` catalog now adver
 - Phase 11's caller inventory went past-tense (ask_a_friend's two callers removed in Phase 9; its grep is already clean of live code refs), gained the `agents_config.sh` header-comment rewrite (lines 2-6 still describe the legacy model), and its gate now runs the resolver test immediately after implementation lands to minimize the launchd broken window.
 - Recorded that Phases 10 and 11 are order-independent — the 10→11 order is convention, not a dependency.
 
-### Phase 10 — review commands migration  · status: done (`a5bd786`)
+### Phase 10 — review commands migration  · status: done (`d3421f8`)
 
 #### Work Order
 
@@ -631,7 +631,7 @@ Shared mechanics all three docs must specify:
 - Three one-line Work Order edits: `style-eval-review-all.sh:43`'s stale header comment added to the reword list (no phase owned it — the last such line found); the immediate post-implementation check now also runs `agent_admin.sh status` (the fixture test alone can't catch a botched live-conf edit that would wedge launchd); the cli round-trip smoke gained Phase 5's snapshot-after-one-source caveat.
 - Confirmed no-action items: Phase 10's `/tmp/claude/<command>/<uuid>/` session dirs match the delegate precedent; the grep can't see a leftover bare `[codex]` header but the spec's "file then contains only …" sentence guards that.
 
-### Phase 11 — legacy strip + docs  · status: todo
+### Phase 11 — legacy strip + docs  · status: done (`eeae6cf`)
 
 #### Work Order
 
@@ -656,3 +656,14 @@ Shared mechanics all three docs must specify:
 **Constraints from prior phases:** every consumer migrated in Phases 4-10; the only remaining readers of the legacy sections/functions should be the legacy functions themselves — `grep -rn "agents_config_model\|agents_config_effort\|agents_config_allowed\|agents_config_validate\|agents_config_apply_defaults\|codex\.models\|claude\.models\|codex\.efforts\|claude\.efforts" scripts/ commands/ config/` (dots escaped — the unescaped `codex.models` also matches the `~/.codex/models_cache.json` path in permanent comments at `agents_config.sh:11`, `sync_codex_catalog.sh:8`, and `config/README.md:12`, which would never grep clean) must come back clean (excluding this plan doc) before deleting — the wider pattern covers the allowed/validate/apply_defaults helpers and the `[*.efforts]` sections, whose last callers were removed in Phase 6 (`cli_agent.sh`) and Phase 7 (`agent_assignments.sh`); `agents_config_model`/`agents_config_effort`'s last two callers (the ask_a_friend launchers) were removed in Phase 9 — as of Phase 9 the verification grep already returns only the legacy functions' own definitions, `agents.conf`'s legacy sections, and the sync-test fixtures. Phases 10 and 11 are order-independent (the review docs never referenced the legacy API); the 10→11 order is kept for convention only. Phase 2 left the legacy conf sections static specifically so this phase could remove them wholesale; the Phase 2 sync neither reads nor writes any legacy section, so the wholesale strip is safe.
 
 **Acceptance gate:** run `bash scripts/agents/test_agents_config.sh` AND `bash scripts/agents/agent_admin.sh status` immediately after the implementation lands, before dispatching the blind review (the launchd driver sources this file every 10 minutes — minimize any broken window; the fixture test proves the resolver, the status render proves the live conf still resolves after ~40 live lines were deleted); then `bash scripts/agents/test_agents_config.sh`, `bash scripts/agents/test_agent_exec.sh`, and `bash scripts/agents/test_sync_codex_catalog.sh` all pass; the grep above returns nothing live; manual smoke: `/agent status` renders, one `codex`→`claude`→`codex` round-trip on `cli` leaves the conf byte-identical (take the "before" snapshot after sourcing the resolver once — Phase 5 precedent — and run the round-trip unsandboxed per the Test bullet), and a delegate dry run (`AGENT_EXEC_DRY_RUN=1` through `implement.sh`) resolves correctly.
+
+#### Retrospective
+
+**What worked:** The Phase 10 review's live-tree pre-flight paid off — the strip executed exactly as written (~40 conf lines + ~110 resolver lines deleted, keepers untouched, fixtures renamed in lockstep); the immediate post-implementation checks (fixture suite + live `agent_admin.sh status`) confirmed the launchd window stayed safe; every manual smoke passed first try.
+**What deviated from the plan:** Two direct doc fixes (blind reviewer, both confirmed): `style-eval-review-all.sh` lines 6-8 still said the review agent "follows the [style_eval] agent in clean-fix.conf" — a pre-Phase-7 relic no inventory had caught (it resolves its own `cleanfix.style_eval_review` row); and this phase's own README rewrite stated the claude alias warning backwards (the sync warns when `claude --help` advertises an alias missing from `[claude.agents]`, not when a configured alias goes stale).
+**Surprises:** Even after four consecutive review passes inventoried stale wording, a fresh blind reader still found one more relic — the last two findings of the plan were both documentation-accuracy, not behavior.
+**Implications for remaining phases:** None — the plan is complete. Post-plan user follow-ups already recorded: revisit `xhigh`-era effort rows now that `max`/`ultra` exist (a `/agent` pass), and the pre-existing `module_review.md` pass-2 Agent F flaw (needs a second wave or self-derived grouping).
+
+#### Phase 11 Review
+
+- Final phase — no remaining phases to re-evaluate; the Phase 10 review performed the closing gap sweep (architect dispatch skipped as vacuous).

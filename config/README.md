@@ -6,13 +6,18 @@ Example configuration for the `/blender:bake_textures` command. Copy and modify 
 
 ## agents.conf
 
-Global agent registry for command scripts. Defines each agent's default model and reasoning effort, plus the allowed model and effort values that command-specific configs may reference.
+Global agent registry with three layers: `[assignments]` maps each function to
+an agent family; `[<function>.<family>]` maps each subtask to an
+`agent[:effort]` row; and `[<family>.agents]` catalogs each valid agent and its
+allowed efforts. Omit `:effort` to use the agent CLI's default.
 
-The Codex default and visible model list are synchronized from
-`~/.codex/config.toml` and `~/.codex/models_cache.json` by
-`scripts/agents/sync_codex_catalog.sh`. The launchd job in that directory checks
-every five minutes and at login; the shared registry reader synchronizes sooner
-when Codex has updated either source file.
+Use `/agent` to view or edit assignments and rows. The Codex catalog is
+automatically synchronized from `~/.codex/config.toml` and
+`~/.codex/models_cache.json` by `scripts/agents/sync_codex_catalog.sh`. Its
+launchd job checks every five minutes and at login; the registry reader also
+synchronizes when either source is newer than the last successful sync. The
+Claude catalog is hand-maintained; the sync warns when the Claude CLI
+advertises a model alias that `[claude.agents]` does not yet list.
 
 ## cargo-fmt-exclusions.json
 

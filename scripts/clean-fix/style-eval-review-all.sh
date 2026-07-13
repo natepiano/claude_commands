@@ -3,9 +3,9 @@
 # Runs after style-eval-all.sh and before style-fix-worktrees.sh in the
 # clean-fix pipeline.
 #
-# The review agent follows the [style_eval] agent in clean-fix.conf. The prompt
-# lives at style-eval-review-prompt.md in this directory — it is not a slash
-# command.
+# The review agent resolves from the cleanfix.style_eval_review row in
+# config/agents.conf. The prompt lives at style-eval-review-prompt.md in this
+# directory — it is not a slash command.
 #
 # Usage: style-eval-review-all.sh [project_name]
 #   If project_name is given, only review that single project's pending evaluation.
@@ -40,7 +40,8 @@ CODEX_BIN="${CODEX_BIN:-$(command -v codex 2>/dev/null || echo "$HOME/.local/bin
 mkdir -p "$LOG_DIR"
 
 # Parse conf for the [projects] allowlist so the review project list matches the
-# eval stage. Agent assignment comes from agent-assignments.conf.
+# eval stage. Agent assignment resolves from config/agents.conf through the
+# registry; agent-assignments.conf carries only enabled=.
 projects=()
 cf_ac_keys=()
 cf_ac_vals=()
@@ -63,10 +64,10 @@ if [[ -f "$CONF_FILE" ]]; then
                 ;;
             style_eval)
                 if [[ "$stripped" =~ ^mode= ]]; then
-                    echo "ERROR: [style_eval] mode is no longer supported; agent settings moved to agent-assignments.conf" >&2
+                    echo "ERROR: [style_eval] stale clean-fix setting; stage enablement lives in $CLEAN_FIX_AGENT_ASSIGNMENTS_FILE and agent settings live in $AGENTS_CONFIG_FILE" >&2
                     exit 1
                 elif [[ "$stripped" =~ ^(enabled|agent|model|effort)= ]]; then
-                    echo "ERROR: [style_eval] agent settings moved to $CLEAN_FIX_AGENT_ASSIGNMENTS_FILE" >&2
+                    echo "ERROR: [style_eval] stale clean-fix setting; stage enablement lives in $CLEAN_FIX_AGENT_ASSIGNMENTS_FILE and agent settings live in $AGENTS_CONFIG_FILE" >&2
                     exit 1
                 fi
                 ;;

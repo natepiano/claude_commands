@@ -51,15 +51,15 @@ assert_contains() {
 }
 
 cat > "$AGENTS" <<'EOF'
-[codex]
+[unmanaged.defaults]
 model=gpt-legacy
 effort=medium
 
-[codex.models]
-# Legacy catalog must remain unchanged.
+[unmanaged.models]
+# Unmanaged catalog must remain unchanged.
 gpt-legacy
 
-[codex.efforts]
+[unmanaged.efforts]
 medium
 high
 
@@ -110,15 +110,15 @@ assert_contains "$stderr_text" "Claude model alias 'opus' is missing from [claud
 
 expected="$TEST_DIR/expected.conf"
 cat > "$expected" <<'EOF'
-[codex]
+[unmanaged.defaults]
 model=gpt-legacy
 effort=medium
 
-[codex.models]
-# Legacy catalog must remain unchanged.
+[unmanaged.models]
+# Unmanaged catalog must remain unchanged.
 gpt-legacy
 
-[codex.efforts]
+[unmanaged.efforts]
 medium
 high
 

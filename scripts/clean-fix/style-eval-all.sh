@@ -71,10 +71,10 @@ if [[ -f "$CONF_FILE" ]]; then
                 ;;
             style_eval)
                 if [[ "$stripped" =~ ^mode= ]]; then
-                    echo "ERROR: [style_eval] mode is no longer supported; agent settings moved to agent-assignments.conf" >&2
+                    echo "ERROR: [style_eval] stale clean-fix setting; stage enablement lives in $CLEAN_FIX_AGENT_ASSIGNMENTS_FILE and agent settings live in $AGENTS_CONFIG_FILE" >&2
                     exit 1
                 elif [[ "$stripped" =~ ^(enabled|agent|model|effort)= ]]; then
-                    echo "ERROR: [style_eval] agent settings moved to $CLEAN_FIX_AGENT_ASSIGNMENTS_FILE" >&2
+                    echo "ERROR: [style_eval] stale clean-fix setting; stage enablement lives in $CLEAN_FIX_AGENT_ASSIGNMENTS_FILE and agent settings live in $AGENTS_CONFIG_FILE" >&2
                     exit 1
                 fi
                 if [[ "$stripped" =~ ^max_new_findings=([0-9]+)$ ]]; then
