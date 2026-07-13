@@ -1,10 +1,10 @@
 ---
-description: Delegate coding work to a Codex CLI session — the main agent orchestrates, codex codes. Pass a plan doc, a phase, free-text instructions, or any combination. Each phase runs implement → dual blind review → auto-routed fixes → phase review → checkpoint commit; phased plans loop phase-to-phase automatically, stopping only for decisions that block continued implementation. Pass `single` to run one phase with no commit.
+description: Delegate coding work to a configured CLI agent — the main agent orchestrates and the delegate agent codes. Pass a plan doc, a phase, free-text instructions, or any combination. Each phase runs implement → dual blind review → auto-routed fixes → phase review → checkpoint commit; phased plans loop phase-to-phase automatically, stopping only for decisions that block continued implementation. Pass `single` to run one phase with no commit.
 ---
 
 # Delegate
 
-**Purpose:** The main agent (the session running this command) is the design/orchestration brain; codex does all coding. This command composes an implementation work order, dispatches it to codex, runs a dual review (a fresh blind codex session + the main agent's own analysis), synthesizes the results, and routes fixes back to codex.
+**Purpose:** The main agent (the session running this command) owns design and orchestration; the configured delegate agent does all coding. This command composes an implementation work order, dispatches it, runs a dual review (a fresh blind delegate session + the main agent's own analysis), synthesizes the results, and routes fixes back to the delegate agent.
 
 **Usage:** `/plan:delegate [plan-doc-path] [phase N] [single] [free-text instructions]`
 
@@ -18,7 +18,7 @@ description: Delegate coding work to a Codex CLI session — the main agent orch
 SESSION_DIR = (captured from prepare_session.sh output — see PrepareSession)
 WORKING_DIR = current project directory (often a worktree checkout, sometimes main — use it as-is; never create a worktree or switch branches)
 FIX_PASS = 0 (max 2 per phase; resets in <NextPhase/>)
-IMPLEMENTATION_PROFILE = implementation
+IMPLEMENTATION_TASK = implementation
 MODE = loop when the work comes from a phased plan doc and `single` was not passed; otherwise single
 
 ---
@@ -90,7 +90,7 @@ reviews, fix passes, or phase review):
 
 **STEP 1:** Execute <PrepareSession/>
 **STEP 2:** Execute <ComposeWorkOrder/> (starts with the pending-decision pre-dispatch check)
-**STEP 3:** Execute <SelectProfile/>
+**STEP 3:** Execute <SelectTask/>
 **STEP 4:** Execute <LaunchImplementation/>
 **STEP 5:** Execute <DualReview/>
 **STEP 6:** Execute <Synthesize/>
@@ -112,7 +112,7 @@ reviews, fix passes, or phase review):
 ---
 
 <ComposeWorkOrder>
-**Goal:** Write an implementation prompt that lets codex implement without ambiguity or questions.
+**Goal:** Write an implementation prompt that lets the delegate agent implement without ambiguity or questions.
 
 0. **Pre-dispatch check (phased plans).** Scan the target phase's Work Order for
    `**Pending decision:**` blocks. If any exist, STOP: present each block to the
@@ -130,7 +130,7 @@ reviews, fix passes, or phase review):
 - **Project Context** = the doc's `## Delegation Context` block verbatim + the target phase's **Constraints from prior phases**.
 - **Work Specification** = the target phase's **Goal**, **Spec**, and **Files** verbatim + any free-text the user added on the command line.
 - **Style Requirements** = the standard block (see fallback template), included only if Delegation Context names a **Style** line.
-- **Verification** = Delegation Context **Build / Test / Lint** + the phase **Acceptance gate**. When the **Lint** line names the `clippy` skill, write it into the prompt as "run the `clippy` skill with `auto-proceed`" — a codex session has no user to answer the skill's batch-approval gate.
+- **Verification** = Delegation Context **Build / Test / Lint** + the phase **Acceptance gate**. When the **Lint** line names the `clippy` skill, write it into the prompt as "run the `clippy` skill with `auto-proceed`" — a delegate session has no user to answer the skill's batch-approval gate.
 
 Prepend the boilerplate header (the first paragraph of the template below) and write the file with the **Write tool**. Do not open codebase files to fill gaps — if a needed fact is absent, the *plan* is at fault: name the gap in one line, proceed with what the doc gives, and let the review catch the rest. This path should cost a few thousand tokens, not tens of thousands.
 
@@ -147,7 +147,7 @@ created/modified and why, and any deviations from the spec with reasons.
 ## Project Context
 
 [Project description, tech stack, relevant directory structure, key file paths
-codex will need to read or modify. For a phased plan: one-line summaries of
+the delegate agent will need to read or modify. For a phased plan: one-line summaries of
 already-completed phases and any retrospective facts that constrain this phase.]
 
 ## Work Specification
@@ -168,22 +168,22 @@ Follow them in all code you write.
 
 ## Verification
 
-[How codex should verify its work before summarizing: build command, test
+[How the delegate agent should verify its work before summarizing: build command, test
 command, lint workflow, etc. — match the project's conventions. For Rust repos
 with the local `clippy` skill available, use the full `clippy` skill as the lint
 gate rather than a partial list of Cargo or `lint ...` commands, and instruct
-codex to run it with `auto-proceed` — no user is present to answer its batch
+the delegate agent to run it with `auto-proceed` — no user is present to answer its batch
 gate.]
 ```
 
 **Key principles (fallback):**
 - Quote the plan section verbatim — do not paraphrase the spec
-- Be specific enough that codex never has to guess; it cannot ask questions
-- Point to files codex can read itself rather than dumping file contents
-- Include the no-commit / no-branch rules verbatim — codex must leave the tree dirty for review
+- Be specific enough that the delegate agent never has to guess; it cannot ask questions
+- Point to files the delegate agent can read itself rather than dumping file contents
+- Include the no-commit / no-branch rules verbatim — the delegate agent must leave the tree dirty for review
 
 3. Tell the user in one line what is being dispatched and the prompt path:
-   `Dispatching <scope summary> to codex — prompt at ${SESSION_DIR}/implementation_prompt.md`
+   `Dispatching <scope summary> to the delegate agent — prompt at ${SESSION_DIR}/implementation_prompt.md`
    Do NOT ask for confirmation — invoking the command is the authorization.
 
    If this was the fast path, add: `(assembled from <plan>'s Phase N Work Order — no research)`.
@@ -191,8 +191,8 @@ gate.]
 
 ---
 
-<SelectProfile>
-Choose the implementation profile deliberately; do not scan the prompt for
+<SelectTask>
+Choose the implementation task deliberately; do not scan the prompt for
 keywords:
 
 - `implementation` — the default for ordinary feature work.
@@ -200,30 +200,30 @@ keywords:
   architecture, numerical/transform mathematics, or a prior behavioral attempt
   failed review.
 
-State the selected profile in the dispatch update. Delegate profile effort is
-configured in `~/.claude/config/delegate.conf`; the model remains configured in
-`~/.claude/config/agents.conf`.
-</SelectProfile>
+State the selected task in the dispatch update. `~/.claude/config/agents.conf`
+owns both agent and effort in its `[delegate.<family>]` rows; switch the active
+delegate family with `/agent`.
+</SelectTask>
 
 ---
 
 <LaunchImplementation>
-**Goal:** Run codex and wait for completion.
+**Goal:** Run the delegate agent and wait for completion.
 
-1. Run `bash ~/.claude/scripts/delegate/codex_implement.sh "${SESSION_DIR}" "${WORKING_DIR}" "${SESSION_DIR}/implementation_prompt.md" "${IMPLEMENTATION_PROFILE}"` using Bash with `run_in_background: true` and `dangerouslyDisableSandbox: true`
-2. Inform the user: "Codex is implementing..."
+1. Run `bash ~/.claude/scripts/delegate/implement.sh "${SESSION_DIR}" "${WORKING_DIR}" "${SESSION_DIR}/implementation_prompt.md" "${IMPLEMENTATION_TASK}"` using Bash with `run_in_background: true` and `dangerouslyDisableSandbox: true`
+2. Inform the user: "The delegate agent is implementing..."
 3. Apply the **Background wait invariant**: keep this turn visibly attached to
    the returned handle and wait for the background task notification. Do NOT
    poll status files or end the turn.
 4. When it arrives, read ${SESSION_DIR}/impl_status:
    - **"implemented":** Read ${SESSION_DIR}/impl_summary.txt → ${IMPL_SUMMARY}. Continue.
-   - **"error":** Read ${SESSION_DIR}/impl_codex.log, show the user the error, stop.
+   - **"error":** Read ${SESSION_DIR}/impl_agent.log, show the user the error, stop.
 </LaunchImplementation>
 
 ---
 
 <DualReview>
-**Goal:** Two independent reviews of the diff — a fresh blind codex session and the main agent's own — running concurrently.
+**Goal:** Two independent reviews of the diff — a fresh blind delegate session and the main agent's own — running concurrently.
 
 **Step 1 — Capture the diff:**
 Run `git diff` and `git status --short` in ${WORKING_DIR}. For untracked new files, read them and include their contents.
@@ -262,14 +262,14 @@ If you find nothing, say so explicitly — do not invent findings.
 
 **BLINDNESS RULE:** the review prompt must NOT contain ${IMPL_SUMMARY} or any hint of what the implementer claims it did. Spec + diff only.
 
-**Step 3 — Launch the codex review:**
-Run `bash ~/.claude/scripts/delegate/codex_review.sh "${SESSION_DIR}" "${WORKING_DIR}" "${SESSION_DIR}/review_prompt.md" review` using Bash with `run_in_background: true` and `dangerouslyDisableSandbox: true`.
+**Step 3 — Launch the delegate review:**
+Run `bash ~/.claude/scripts/delegate/review.sh "${SESSION_DIR}" "${WORKING_DIR}" "${SESSION_DIR}/review_prompt.md" review` using Bash with `run_in_background: true` and `dangerouslyDisableSandbox: true`.
 
 Retain the returned handle. The main agent performs Step 4 while the review
 runs, then applies the **Background wait invariant** until that handle completes.
 
-**Step 4 — the main agent's own review, while codex reviews:**
-(The main agent MAY read ${IMPL_SUMMARY} — only the codex reviewer is blind.)
+**Step 4 — the main agent's own review, while the delegate agent reviews:**
+(The main agent MAY read ${IMPL_SUMMARY} — only the delegate reviewer is blind.)
 1. Read every changed file (or changed sections for large files)
 2. Verify against the spec: correctness, completeness, nothing extra
 3. Check codebase consistency and — for Rust — style-guide conformance
@@ -277,8 +277,8 @@ runs, then applies the **Background wait invariant** until that handle completes
 5. Record your own findings with the same severity scale
 
 **Step 5 — Collect:** when the background task notification arrives, read ${SESSION_DIR}/review_status:
-- **"reviewed":** Read ${SESSION_DIR}/review_findings.txt → ${CODEX_REVIEW}
-- **"error":** Read ${SESSION_DIR}/review_codex.log, tell the user the codex review failed, and proceed on the main agent's review alone (say so explicitly).
+- **"reviewed":** Read ${SESSION_DIR}/review_findings.txt → ${AGENT_REVIEW}
+- **"error":** Read ${SESSION_DIR}/review_agent.log, tell the user the delegate review failed, and proceed on the main agent's review alone (say so explicitly).
 </DualReview>
 
 ---
@@ -286,7 +286,7 @@ runs, then applies the **Background wait invariant** until that handle completes
 <Synthesize>
 **Goal:** Merge both reviews and present one verdict.
 
-1. Merge ${CODEX_REVIEW} with your own findings. Dedupe — one entry per real issue, tagged with who caught it (codex / claude / both). Discard codex findings you can refute by reading the code; say which and why.
+1. Merge ${AGENT_REVIEW} with your own findings. Dedupe — one entry per real issue, tagged with who caught it (delegate / main agent / both). Discard delegate findings you can refute by reading the code; say which and why.
 
 **TRANSLATE — do not pass reviewer vocabulary through.** The user has not read
 the plan, the diff, or the two reviews. Every line you present must stand on its
@@ -310,7 +310,7 @@ are. This is absolute.
 ## Delegation Result
 
 ### Where things stand
-[2-4 sentences, no jargon: what codex actually built (what it does, not the type
+[2-4 sentences, no jargon: what the delegate agent actually built (what it does, not the type
 names), whether anything visibly changed yet, and that the important parts work
 / pass tests. Written for someone who has not seen the code.]
 
@@ -328,7 +328,7 @@ If there are no issues, say so in one sentence and skip the table below.]
 | # | Severity | File:line | Problem (technical) | Caught by |
 
 ### Reviewer disagreements (if any)
-[Where codex's review and yours diverge — give your take without jargon, don't
+[Where the delegate review and yours diverge — give your take without jargon, don't
 manufacture consensus.]
 ```
 
@@ -339,15 +339,15 @@ same numbers so the user can cross-walk if they want detail.
 whether every remaining confirmed issue is one of:
 - a **documentation-only update** (doc comments, markdown, plan docs — no code
   behavior change), or
-- a **trivial change** — a fix so small and mechanical that dispatching a codex
+- a **trivial change** — a fix so small and mechanical that dispatching a delegate
   session would cost more than the fix itself (a one-line correction, a typo, a
   rename already agreed on). Not trivial: anything touching logic, error
   handling, or more than a couple of lines.
 
-If ALL remaining issues qualify AND both reviews agree on them (the codex
+If ALL remaining issues qualify AND both reviews agree on them (the delegate
 reviewer flagged it or its review is consistent with it, and the main agent's
 own review confirms it), the main agent applies the fixes directly — do NOT ask the user, do NOT
-dispatch a fix pass to codex. Then tell the user in one or two sentences exactly
+dispatch a fix pass to the delegate agent. Then tell the user in one or two sentences exactly
 what was changed and why it qualified (doc-only / trivial). Skip the choice
 menu and continue to <RunPhaseReview/>.
 
@@ -381,12 +381,12 @@ without asking:
    intended behavior) and ${FIX_PASS} < 2: increment ${FIX_PASS}, write
    ${SESSION_DIR}/fix_prompt_${FIX_PASS}.md (same structure as the work order,
    spec = the confirmed issues table with file/line specifics, same no-commit
-   rules and style requirements), select `${FIX_PROFILE}` — `mechanical` only
+   rules and style requirements), select `${FIX_TASK}` — `mechanical` only
    when every confirmed issue is documentation, formatting, lint guidance, a
    trivial rename, or an equivalently behavior-preserving edit; `escalation`
    when review found incorrect behavior, numerical/transform math, unresolved
    architecture, or a prior fix failed; otherwise `implementation` — then run
-   `codex_implement.sh "${SESSION_DIR}" "${WORKING_DIR}" "${SESSION_DIR}/fix_prompt_${FIX_PASS}.md" "${FIX_PROFILE}"`
+   `bash ~/.claude/scripts/delegate/implement.sh "${SESSION_DIR}" "${WORKING_DIR}" "${SESSION_DIR}/fix_prompt_${FIX_PASS}.md" "${FIX_TASK}"`
    (background, unsandboxed). Tell the user in one line what is being fixed.
    Re-execute <DualReview/> and <Synthesize/> scoped to the new changes.
 
@@ -399,7 +399,7 @@ without asking:
 ```
 Your choice:
 
-1. One more codex fix pass — [name what gets fixed and the cost].
+1. One more delegate fix pass — [name what gets fixed and the cost].
    ([Recommended / not] because [reason].)
 2. Stop here — the parts that matter work; the leftover items become written-down
    todos for later.
@@ -417,7 +417,7 @@ Your choice:
 
 If there are no issues (or nits only), state that and continue to <RunPhaseReview/>.
 
-**RULE:** The main agent does not write or edit implementation code in this command unless the user explicitly says so. All fixes route to codex by default. Sole exception: the direct-fix exception above (doc-only or trivial post-review fixes both reviews agree on).
+**RULE:** The main agent does not write or edit implementation code in this command unless the user explicitly says so. All fixes route to the delegate agent by default. Sole exception: the direct-fix exception above (doc-only or trivial post-review fixes both reviews agree on).
 </Synthesize>
 
 ---
@@ -425,7 +425,7 @@ If there are no issues (or nits only), state that and continue to <RunPhaseRevie
 <RunPhaseReview>
 **Only when the work came from a phased plan doc.** A phase review is mandatory — do not ask, do not offer to skip.
 
-Tell the user in one line: `Phased plan — running /plan:phase_review to update <plan doc> (retrospective + remaining-phase re-evaluation).` Then invoke the `plan:phase_review` skill immediately — **in loop mode pass `auto`**, so user decisions are deferred into the affected Work Orders as `**Pending decision:**` blocks instead of asked inline; the loop stops for them at that phase's pre-dispatch check. When writing the retrospective, include relevant facts from ${CODEX_REVIEW} and the fix passes (e.g. what the blind reviewer caught, what deviated from spec).
+Tell the user in one line: `Phased plan — running /plan:phase_review to update <plan doc> (retrospective + remaining-phase re-evaluation).` Then invoke the `plan:phase_review` skill immediately — **in loop mode pass `auto`**, so user decisions are deferred into the affected Work Orders as `**Pending decision:**` blocks instead of asked inline; the loop stops for them at that phase's pre-dispatch check. When writing the retrospective, include relevant facts from ${AGENT_REVIEW} and the fix passes (e.g. what the blind reviewer caught, what deviated from spec).
 
 If the work was not from a phased plan, skip this step silently and end.
 </RunPhaseReview>
@@ -460,7 +460,7 @@ Never push. Never commit anything outside this step.
 **Loop mode only.**
 
 1. Find the next `todo` phase in the plan. None left → <RunSummary/> and end.
-2. Reset ${FIX_PASS} = 0 and ${IMPLEMENTATION_PROFILE} = implementation.
+2. Reset ${FIX_PASS} = 0 and ${IMPLEMENTATION_TASK} = implementation.
 3. Announce in one line: `Continuing to phase N — <title>.`
 4. Loop back to <ComposeWorkOrder/> (STEP 2). Its pre-dispatch check stops the
    loop if the next phase carries an unresolved `**Pending decision:**` block.
@@ -478,7 +478,7 @@ Emitted whenever the loop ends — plan exhausted, blocking stop, or error.
 | --- | --- | --- | --- |
 
 **Deferred decisions still open:** [one line each, naming the phase that owns it — or "none"]
-**Why the run stopped:** [plan complete / pending decision on phase N / fix-pass cap on phase N / codex error]
+**Why the run stopped:** [plan complete / pending decision on phase N / fix-pass cap on phase N / delegate error]
 ```
 
 Same translation rules as <Synthesize/>: no reviewer vocabulary, no bare codes —
@@ -490,12 +490,12 @@ every line must stand on its own for a reader who has not seen the plan.
 ## Rules
 
 - ${WORKING_DIR} is whatever the current project directory is — often a worktree checkout. Never create a worktree or switch branches. The only commits are <CheckpointCommit/> checkpoints in loop mode — one per completed phase, never a push.
-- All codex-launching scripts run with `dangerouslyDisableSandbox: true` and `run_in_background: true`.
+- All delegate-launching scripts run with `dangerouslyDisableSandbox: true` and `run_in_background: true`.
 - The **Background wait invariant** is mandatory. No active delegate terminal may outlive the primary-agent turn that launched it.
-- The codex reviewer is always a fresh session and always blind to the implementer's summary.
-- Delegate launchers record profile, agent, model, and effort in the session directory. Never rely on an empty effort silently becoming `xhigh`.
+- The delegate reviewer is always a fresh session and always blind to the implementer's summary.
+- Delegate launchers record task, family, agent, and effort in the session directory. Never rely on an empty effort silently becoming `xhigh`.
 - Select `escalation` from the actual Work Order or review outcome, never keyword matching.
-- The main agent orchestrates and reviews; codex codes. The main agent touches implementation code only on explicit user instruction — except post-review doc-only or trivial fixes that both reviews agree on (see the direct-fix exception in <Synthesize>), which the main agent applies itself and reports.
-- Max 2 codex fix passes per phase before stopping for the user; an explicit user choice of another pass overrides the cap.
-- Loop mode stops only for: an unresolved `**Pending decision:**` on the phase being dispatched, a fix that needs a design decision the plan does not answer, reviews conflicting on intended behavior, the fix-pass cap with blockers remaining, or a codex/environment error. Everything else auto-routes or defers.
-- Work orders that name the `clippy` skill as the lint gate must instruct codex to run it with `auto-proceed`; the main agent likewise passes `auto-proceed` when it runs the `clippy` skill inside the loop.
+- The main agent orchestrates and reviews; the delegate agent codes. The main agent touches implementation code only on explicit user instruction — except post-review doc-only or trivial fixes that both reviews agree on (see the direct-fix exception in <Synthesize>), which the main agent applies itself and reports.
+- Max 2 delegate fix passes per phase before stopping for the user; an explicit user choice of another pass overrides the cap.
+- Loop mode stops only for: an unresolved `**Pending decision:**` on the phase being dispatched, a fix that needs a design decision the plan does not answer, reviews conflicting on intended behavior, the fix-pass cap with blockers remaining, or a delegate/environment error. Everything else auto-routes or defers.
+- Work orders that name the `clippy` skill as the lint gate must instruct the delegate agent to run it with `auto-proceed`; the main agent likewise passes `auto-proceed` when it runs the `clippy` skill inside the loop.
