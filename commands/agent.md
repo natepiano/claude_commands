@@ -12,13 +12,13 @@ Run:
 bash ~/.claude/scripts/agents/agent_admin.sh $ARGUMENTS
 ```
 
+Edit subcommands rewrite `config/agents.conf`, which the sandbox denies. Run `agent_admin.sh` with `dangerouslyDisableSandbox: true` for `<function> <family>` and `<function>.<subtask>` edits; `status` is fine sandboxed.
+
 Relay the script's stdout and stderr exactly. If it exits non-zero, stop; do not guess a correction.
 
 ## Status
 
 No arguments and `status` both print every function's active family and resolved rows.
-
-Until the cli aliases migrate to the registry in Phase 6, `/agent cli ...` changes this status table but does not affect the zshrc aliases; `scripts/cli_agent/cli_agent.sh` still reads its private `agent-assignment.conf`.
 
 ## Switch a function's family
 
