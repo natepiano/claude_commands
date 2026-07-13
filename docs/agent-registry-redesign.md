@@ -11,7 +11,7 @@
 - **Stack:** Bash (mixed shebangs — see below), one Python report parser (`clean_fix_report_parse.py`) plus sibling `.py` clean-fix modules, INI-style `.conf` files, JSON config, and Markdown command/skill docs. Not Rust. Bash gotcha: macOS ships bash 3.2, so no bash-4 features (no associative arrays / `${var,,}`); registry/delegate/cli_agent/ask_a_friend scripts use `#!/usr/bin/env bash` while the clean-fix pipeline scripts (`clean-fix.sh`, `style-eval-all.sh`, `style-eval-review-all.sh`, `style-fix-worktrees.sh`) use `#!/bin/bash` (`clean-fix-usage.sh` uses `env bash`). Python: basedpyright (zed's LSP) must report zero errors and zero warnings.
 - **Layout:** `config/` registry + per-consumer confs and READMEs; `scripts/agents/` the resolver + codex-catalog sync + tests; `scripts/delegate/` codex implement/review launchers + old profile config + its test + `prepare_session.sh`; `scripts/cli_agent/` zshrc-alias dispatcher + its private conf; `scripts/clean-fix/` the launchd style pipeline (drivers, stage scripts, usage/report, Python parsers, README, plists); `scripts/ask_a_friend/` two codex launchers + `prepare_session.sh`; `commands/` + `commands/plan/` the Markdown command docs that call these scripts.
 - **Key files:**
-  - `config/agents.conf` — the registry; today `[codex]`/`[claude]` defaults + `[codex.models]`/`[codex.efforts]`/`[claude.models]` sections (40 lines); gains the new schema (Phase 1), loses the legacy sections (Phase 11).
+  - `config/agents.conf` — the registry; legacy `[codex]`/`[claude]` defaults + `[codex.models]`/`[codex.efforts]`/`[claude.models]`/`[claude.efforts]` sections plus the new schema (Phase 1: `[assignments]`, `[<function>.<family>]` sets, `[<family>.agents]` catalogs), with `[codex.agents]` live-synced from the cache since Phase 2; loses the legacy sections (Phase 11).
   - `config/delegate.conf` — per-profile agent/effort for delegate launchers; deleted in Phase 4.
   - `config/README.md` — describes `agents.conf` (the `## agents.conf` block); rewritten in Phase 11.
   - `config/orphans_expected.json` — `{"scripts":[],"config":[]}`, empty; nothing to do.
@@ -52,6 +52,7 @@
   - clean-fix runs unattended via launchd every 10 minutes (`com.natemccoy.style-fix.plist`, `StartInterval=600`, no idle gate) — the clean-fix scripts and `clean_fix_report_parse.py` must never be left broken at the end of any phase.
   - `/plan:delegate` is itself implemented by `scripts/delegate/*` — the very tooling dispatching this plan — so the delegate launchers must work at the end of every phase; the Phase 4 renames and the `commands/plan/delegate.md` call-site edits must land together in that one phase.
   - The migration is a strangler: Phase 1 **adds** the new schema sections and resolver API alongside the legacy ones; every pre-Phase-11 phase leaves the legacy sections/functions in `config/agents.conf` / `agents_config.sh` untouched so unmigrated consumers keep working; Phase 11 strips them once nothing references them.
+  - Accepted transitional behavior (Phase 2+): the sync stopped updating the legacy `[codex] model=` mirror, so unmigrated consumers (delegate until Phase 4, cli until 6, clean-fix until 7, ask_a_friend until 9) no longer track codex's selected-model changes — harmless while the values coincide, but pressure against long pauses between Phase 2 and Phases 4-9.
   - codex is launched with `dangerouslyDisableSandbox: true` (and `run_in_background: true`) from Claude Code sessions; `codex --sandbox read-only` panics codex's system-configuration crate on macOS, which is why ask_a_friend runs `--full-auto` (write) even though the consult is conceptually read-only. The delegate reviewer's `--sandbox read-only` usage is proven and stays.
   - The interactive codex REPL keeps `-c service_tier="fast"` (cli_agent.sh lines 112/123).
   - Never use `AskUserQuestion` in the command docs; the migrated review docs decide via in-session synthesis.
@@ -60,7 +61,7 @@
 
 ## Phases
 
-### Phase 1 — Registry core: new schema + resolver + tests  · status: done (`8267fcf`)
+### Phase 1 — Registry core: new schema + resolver + tests  · status: done (`ae2c744`)
 
 #### Work Order
 
@@ -221,7 +222,7 @@ Create `scripts/agents/test_agents_config.sh` (same self-contained pattern as `t
 
 #### Phase 1 Review
 
-- Phase 2: pending decision added — a sync that drops a model still referenced by an assignment would break the unattended clean-fix pipeline; recommendation is a warn-and-keep post-sync validation.
+- Phase 2: pending decision (sync drops a model an assignment still uses) resolved 2026-07-13 — warn-and-keep adopted; the warning must name the stale row and the `/agent` commands to reconfigure.
 - Phase 2: sync must succeed on a conf without the legacy sections; `:` dropped from the slug charset (collides with pair syntax); alias-staleness check no-ops when no `claude` binary is on PATH.
 - Phase 3: recorded the arg-emitters' one-line output contract (word-split into argv) and the provenance rule (wrappers re-resolve; `agent_exec` exports nothing); named the test-fixture pattern file.
 - Phase 4: provenance values come from `agents_resolve` in the wrappers; acceptance grep narrowed to delegate paths so ask_a_friend (migrated in Phase 9) doesn't trip it.
@@ -231,7 +232,7 @@ Create `scripts/agents/test_agents_config.sh` (same self-contained pattern as `t
 - Phase 11: dead private helpers named for deletion; kept helpers named explicitly.
 - Delegation Context: Test line carries the bash-only and sync-suppression facts; Invariants record the accepted last-writer-wins risk between the sync and `/agent` writes.
 
-### Phase 2 — Catalog sync: `[codex.agents]` + claude alias staleness  · status: todo
+### Phase 2 — Catalog sync: `[codex.agents]` + claude alias staleness  · status: done (`fa6bc2f`)
 
 #### Work Order
 
@@ -246,19 +247,9 @@ Create `scripts/agents/test_agents_config.sh` (same self-contained pattern as `t
 - The retargeted sync must not *require* the legacy sections: today it hard-fails when `[codex] model=` / `[codex.models]` are absent (~lines 126-127). It must succeed on a conf containing only the new sections (the post-Phase-11 shape) while still leaving legacy sections byte-identical when they are present.
 - Drop `:` from the allowed slug charset (~lines 42/70): `_agents_validate_pair` splits `agent:effort` pairs at the first colon, so a colon-bearing slug could never be assigned — skip such models with a stderr warning.
 - Claude alias staleness check: the same sync run parses the quoted aliases from `claude --help`'s `--model` flag text (today: 'fable', 'opus', 'sonnet') and warns to stderr when one is missing from `[claude.agents]`. Warn-only, never auto-add — the effort list for a new alias is a human call, and exclusions like haiku are deliberate. A help-text wording change degrades to a no-op (no aliases parsed → no warning), never a false edit; likewise a missing `claude` binary on PATH (launchd context) degrades to a no-op.
-- Update `scripts/agents/test_sync_codex_catalog.sh` for the new output shape: `[codex.agents]` rows with efforts, legacy sections left byte-identical when present, sync succeeds on a new-sections-only conf, empty-levels model → empty list, colon-bearing slug skipped with a warning, alias-staleness warn fires on a fixture missing an alias and stays silent when help text parses to nothing.
-
-**Pending decision: what the sync does when the cache drops a model an assignment still uses**
-
-Actual problem: after this phase the sync rewrites `[codex.agents]` from `~/.codex/models_cache.json` at source time — including from the launchd clean-fix run every 10 minutes. If the cache drops a model still referenced by a `[<function>.codex]` row (say `gpt-5.6-sol` is retired), `agents_resolve` hard-fails for that function, `agents_list_assignments` aborts, and the unattended pipeline breaks with nobody watching — violating the "clean-fix must never be left broken" invariant.
-
-What exists now: Phase 1's resolver validates every row against `[codex.agents]`; this phase's sync rewrites that section wholesale with no cross-check against the assignment sets.
-
-What should change: after rewriting the catalog, the sync resolves every codex-assigned row; for any row whose agent vanished from the cache it warns loudly to stderr AND keeps that agent's previous catalog row, so resolution keeps working until a human re-points the row via `/agent`.
-
-Recommendation: adopt warn-and-keep (small addition to this phase, preserves the launchd invariant). Alternatives: warn-only (pipeline breaks until manually fixed) or explicitly accepting the risk with no check.
-
-Approve this direction, or modify it?
+- Vanished-model protection (user decision 2026-07-13: **warn-and-keep**): after rewriting `[codex.agents]`, the sync resolves every codex-assigned row; for any row whose agent is no longer in the cache it keeps that agent's previous catalog row (efforts unchanged) and warns to stderr. Rationale: without the kept row, `agents_resolve` hard-fails at the config layer and wedges the whole registry (`agents_list_assignments`, `/agent status`, every `cf_load_stage_assignment`) — including the unattended 10-minute launchd run; with it, resolution stays green and a truly-retired model fails only in that one stage's own execution logs. Never auto-edit assignments (auto-repoint rejected — assignment edits are a human call).
+- The warning must tell the user to reconfigure agents, naming the stale row and the `/agent` commands to fix it, e.g.: `WARNING: cleanfix.style_eval is assigned to 'gpt-5.6-sol', which is gone from the codex catalog — re-point it: /agent cleanfix.style_eval <agent>[:<effort>], or switch the family: /agent cleanfix <family>`. One warning per stale row, every sync run, until fixed.
+- Update `scripts/agents/test_sync_codex_catalog.sh` for the new output shape: `[codex.agents]` rows with efforts, legacy sections left byte-identical when present, sync succeeds on a new-sections-only conf, empty-levels model → empty list, colon-bearing slug skipped with a warning, alias-staleness warn fires on a fixture missing an alias and stays silent when help text parses to nothing, and a cache that drops a still-assigned model → previous catalog row preserved, stderr warning names the stale row and `/agent`.
 
 **Files:**
 - `scripts/agents/sync_codex_catalog.sh` — retarget + staleness check.
@@ -267,6 +258,29 @@ Approve this direction, or modify it?
 **Constraints from prior phases:** Phase 1 defined `[codex.agents]` / `[claude.agents]` as `agent=comma-separated-efforts` rows and seeded placeholder codex rows; this phase's sync overwrites the `[codex.agents]` body with real cache data. The resolver validates efforts against these rows, so a sync that wrote wrong shapes would break `agents_resolve` — run `bash scripts/agents/test_agents_config.sh` after changes.
 
 **Acceptance gate:** `bash scripts/agents/test_sync_codex_catalog.sh` and `bash scripts/agents/test_agents_config.sh` pass; a real run against `~/.codex/models_cache.json` rewrites `[codex.agents]` to match the cache and leaves the legacy `[codex] model=` / `[codex.models]` lines byte-identical.
+
+#### Retrospective
+
+**What worked:** Single codex pass, zero fix passes; both test suites green and the real-run diff touched only `[codex.agents]` effort lists — legacy sections byte-identical, proving the stops-managing transition.
+
+**What deviated from the plan:** Vanished-model detection keys on "would the row still resolve against the refreshed `[codex.agents]`" — membership in the *visible* catalog AND the cache — not cache membership alone. Required: a hidden-but-cached assigned model is dropped from the sync output (row must be kept or the resolver wedges), and a selected-but-uncached model is prepended with an *empty* effort list (previous row must be kept or `agent:effort` assignments fail validation). The blind reviewer read the spec's "no longer in the cache" literally and filed a blocker; overruled — the spec's own wedge-prevention rationale demands the implemented condition.
+
+**Surprises:**
+- The live cache now reports `max`/`ultra` efforts for the gpt-5.6 models, so `[codex.agents]` rows exceed the legacy `[codex.efforts]` list — harmless; the new resolver validates per-agent, not against the legacy list.
+- An assigned agent with no previous `[codex.agents]` row hard-fails the sync ("cannot preserve") — acceptable: that state means the registry was already broken before the sync ran, and `/agent` cannot create it.
+- The sync now shells out to `claude --help` on every triggered run (~1-2s when the freshness gate fires); alias warnings will surface in launchd stderr logs.
+
+**Implications for remaining phases:** Phase 11 can strip the legacy sections knowing the sync no longer reads or writes them; `[codex.agents]` effort lists are now live cache data, so later phases must not hard-code effort vocabularies in tests against the real conf (use fixture confs, as Phases 1-2 do).
+
+#### Phase 2 Review
+
+- Phase 11: the sync test's fixtures pin legacy-section pass-through using literal `[codex.models]`/`[codex.efforts]` names, which would trip Phase 11's clean-grep gate — Phase 11 now renames those fixture sections to neutral names and lists the test file; its verification grep widened to cover the allowed/validate/apply_defaults legacy helpers and the `[*.efforts]` sections.
+- Phase 7: gained the accepted transitional-gap note (until Phase 8, `/clean_fix agent …` doc text still writes conf keys the phase removes — ignored, harmless), the out-of-file-list callers of `cf_load_stage_assignment` (clean-fix-usage.sh lines 95/438, print helpers), and the fact that sync `WARNING:` lines can appear in launchd logs; its gate no longer hard-codes `gpt-5.6-sol:xhigh`.
+- Phase 8: closes the Phase 7 transitional gap via the clean_fix.md rewrite; parser constraint added — generalized usage-limit patterns must not match the sync's new `WARNING:` lines.
+- Phase 5: constraint added that `agent_admin.sh`'s argument grammar must match the `/agent` command forms the Phase 2 warnings already print (sequencing pressure to ship promptly); round-trip gate snapshots the conf after one resolver source so a freshness sync can't fake a diff; post-ship note that revisiting `xhigh`-era effort choices (`max`/`ultra` now exist) is a user `/agent` pass, not plan work.
+- Phase 4: gate reads the current `[delegate.codex]` row at run time instead of hard-coding `gpt-5.6-sol:high`.
+- Delegation Context: recorded the accepted transitional freeze of the legacy `[codex] model=` mirror (unmigrated consumers stop tracking codex model switches until their migration phase) and refreshed the agents.conf key-file description.
+- Blind-review disagreement resolved (no plan change): the reviewer read "vanished = not in cache" literally and called the implemented keep-condition (must resolve against the refreshed visible catalog AND the cache) a blocker; overruled — cache-membership alone would still drop hidden-but-cached assigned models from `[codex.agents]` and wedge the resolver, defeating the decision's stated purpose.
 
 ### Phase 3 — Shared launcher `scripts/agents/agent_exec.sh`  · status: todo
 
@@ -325,7 +339,7 @@ agent_exec <task> <mode:write|readonly> <working_dir> <prompt_file> <output_file
 
 **Constraints from prior phases:** Phase 3's `agent_exec <task> <mode> <working_dir> <prompt_file> <output_file> <log_file>` with `AGENT_EXEC_DRY_RUN=1` printing the assembled command; Phase 1's registry has `[delegate.codex]`/`[delegate.claude]` rows for `implementation`, `review`, `mechanical`, `escalation` and `[assignments] delegate=codex`.
 
-**Acceptance gate:** `AGENT_EXEC_DRY_RUN=1 bash scripts/delegate/implement.sh <tmp_session> . <tmp_prompt> implementation` prints a codex `--full-auto` command with `-m gpt-5.6-sol -c model_reasoning_effort="high"`; same for `review.sh` printing `--sandbox read-only`; `grep -rn "codex_implement\|codex_review\|delegate_config\|delegate\.conf" scripts/delegate/ commands/plan/ config/` returns no live references (ask_a_friend keeps its own `codex_implement.sh` until Phase 9, so the grep is scoped to delegate paths); `bash scripts/agents/test_agents_config.sh` and `bash scripts/agents/test_agent_exec.sh` pass.
+**Acceptance gate:** `AGENT_EXEC_DRY_RUN=1 bash scripts/delegate/implement.sh <tmp_session> . <tmp_prompt> implementation` prints a codex `--full-auto` command whose model/effort flags match the *current* `[delegate.codex] implementation` row (the registry is live-editable via `/agent` — read the row at run time, don't hard-code `gpt-5.6-sol:high`); same for `review.sh` printing `--sandbox read-only`; `grep -rn "codex_implement\|codex_review\|delegate_config\|delegate\.conf" scripts/delegate/ commands/plan/ config/` returns no live references (ask_a_friend keeps its own `codex_implement.sh` until Phase 9, so the grep is scoped to delegate paths); `bash scripts/agents/test_agents_config.sh` and `bash scripts/agents/test_agent_exec.sh` pass.
 
 ### Phase 5 — `/agent` skill: registry administration  · status: todo
 
@@ -345,6 +359,8 @@ Create `commands/agent.md` — the `/agent` skill, a thin wrapper that runs `age
 
 Delete `commands/cli_agent.md`. Known transitional gap (accepted): until Phase 6, `cli_agent.sh` still reads its private `agent-assignment.conf`, so `/agent cli …` edits don't affect the zshrc aliases yet — note this in the `/agent` doc's status output section and remove the note in Phase 6.
 
+Post-ship note (no plan-time edits): the live `[codex.agents]` catalog now advertises `max`/`ultra` efforts for the gpt-5.6 models; the seeded `[<function>.codex]` rows were written when `xhigh` was the ceiling. Revisiting those effort choices is a user `/agent` pass after this phase ships, not part of any phase.
+
 **Files:**
 - `scripts/agents/agent_admin.sh` — new.
 - `scripts/agents/agents_config.sh` — add the row-edit function beside the Phase 1 API.
@@ -352,9 +368,9 @@ Delete `commands/cli_agent.md`. Known transitional gap (accepted): until Phase 6
 - `commands/agent.md` — new.
 - `commands/cli_agent.md` — delete.
 
-**Constraints from prior phases:** Phase 1 provides `agents_list_assignments`, `agents_set_assignment` (validate-then-awk-rewrite, reject invalid leaving file untouched), `agents_resolve_print`; the registry file is `config/agents.conf` with `[assignments]` + `[<function>.<family>]` + `[<family>.agents]` sections. New-code lookup/validation primitives are `_agents_registry_get` (prints value; returns 0 even on not-found — errexit-safe in `$(...)`), `_agents_registry_has_key` (0/1 presence for `if` conditions), and `_agents_validate_pair` — use these; never `_agents_config_get`, whose unescaped `^key=` regex mis-matches dotted keys. awk gotcha: `function` is a reserved awk word — Phase 1's rewrite passes `-v fn=`/`-v fam=`.
+**Constraints from prior phases:** Phase 1 provides `agents_list_assignments`, `agents_set_assignment` (validate-then-awk-rewrite, reject invalid leaving file untouched), `agents_resolve_print`; the registry file is `config/agents.conf` with `[assignments]` + `[<function>.<family>]` + `[<family>.agents]` sections. New-code lookup/validation primitives are `_agents_registry_get` (prints value; returns 0 even on not-found — errexit-safe in `$(...)`), `_agents_registry_has_key` (0/1 presence for `if` conditions), and `_agents_validate_pair` — use these; never `_agents_config_get`, whose unescaped `^key=` regex mis-matches dotted keys. awk gotcha: `function` is a reserved awk word — Phase 1's rewrite passes `-v fn=`/`-v fam=`. Phase 2's sync already emits warnings that name `/agent` command forms — `re-point it: /agent <function>.<subtask> <agent>[:<effort>], or switch the family: /agent <function> <family>` (`sync_codex_catalog.sh` ~line 283) — so `agent_admin.sh`'s argument grammar must match those forms exactly; until this phase ships those warnings are dangling pointers, which is sequencing pressure to land it promptly.
 
-**Acceptance gate:** `bash scripts/agents/agent_admin.sh status` renders every function with family and resolved rows; a `cli codex→claude→codex` round-trip leaves `config/agents.conf` byte-identical (diff clean); an invalid switch (`agent_admin.sh delegate nosuch`) and an invalid row edit (`agent_admin.sh cli.interactive nosuch:high`) both fail nonzero naming the problem with the file untouched; a valid row edit and its reversal rewrite only that row and preserve its trailing inline comment; `bash scripts/agents/test_agents_config.sh` passes.
+**Acceptance gate:** `bash scripts/agents/agent_admin.sh status` renders every function with family and resolved rows; a `cli codex→claude→codex` round-trip leaves `config/agents.conf` byte-identical (diff clean — take the "before" snapshot *after* sourcing the resolver once, so a pending freshness sync can't rewrite `[codex.agents]` mid-round-trip and fake a diff); an invalid switch (`agent_admin.sh delegate nosuch`) and an invalid row edit (`agent_admin.sh cli.interactive nosuch:high`) both fail nonzero naming the problem with the file untouched; a valid row edit and its reversal rewrite only that row and preserve its trailing inline comment; `bash scripts/agents/test_agents_config.sh` passes.
 
 ### Phase 6 — cli aliases migration  · status: todo
 
@@ -390,6 +406,7 @@ Delete `commands/cli_agent.md`. Known transitional gap (accepted): until Phase 6
 - `scripts/clean-fix/agent_assignments.sh`: `cf_load_stage_assignment` reads `enabled=` locally and fills the rest from `agents_resolve cleanfix.<stage>`. Variable meaning shifts: `STYLE_AGENT` = family (`codex`|`claude`), `STYLE_AGENT_MODEL` = agent — so the existing `case "$STYLE_AGENT" in claude|codex)` dispatch in the three style scripts keeps working unmodified in shape. Drop validators for the removed conf keys.
 - `style-eval-all.sh`, `style-eval-review-all.sh`, `style-fix-worktrees.sh`: drop the `${STYLE_AGENT_EFFORT:-xhigh}` fallbacks — empty effort now means "omit the flag" (mirror cli_agent.sh's empty-effort handling in the codex branches). Codex-specific plumbing stays but must be reached only on the codex family path: the exec-marker transcript filtering (`style-eval-all.sh` ~line 110) and the codex usage/weekly-limit detection (`style-fix-worktrees.sh` ~line 434) already live in codex branches — verify, don't assume.
 - These scripts are `#!/bin/bash` (bash 3.2) — no bash-4 features.
+- Known transitional gap (accepted, same pattern as Phase 5's `/agent cli` note): until Phase 8 rewrites `commands/clean_fix.md`, its `<StyleAgentConfig>` subcommands (`/clean_fix agent eval claude` etc., ~lines 267-300) still instruct writing `agent=`/`model=`/`effort=` keys into `agent-assignments.conf` — keys this phase removes and `cf_load_stage_assignment` now ignores. Harmless (ignored keys, no breakage) and short-lived; Phase 8 replaces that doc surface.
 
 **Files:**
 - `scripts/clean-fix/agent-assignments.conf` — `enabled=` only.
@@ -398,9 +415,9 @@ Delete `commands/cli_agent.md`. Known transitional gap (accepted): until Phase 6
 - `scripts/clean-fix/style-eval-review-all.sh` — same.
 - `scripts/clean-fix/style-fix-worktrees.sh` — same + usage-limit branch check.
 
-**Constraints from prior phases:** Phase 1 rows exist for `cleanfix.style_eval`, `cleanfix.style_eval_review`, `cleanfix.style_fix`, `cleanfix.report` in both family sets; `agents_resolve` errors loudly on bad rows — `cf_load_stage_assignment` should surface that error, not swallow it. `agent_exec` (Phase 3) is available but this phase only changes resolution; the stage scripts keep their own codex/claude launch code until a later cleanup if ever.
+**Constraints from prior phases:** Phase 1 rows exist for `cleanfix.style_eval`, `cleanfix.style_eval_review`, `cleanfix.style_fix`, `cleanfix.report` in both family sets; `agents_resolve` errors loudly on bad rows — `cf_load_stage_assignment` should surface that error, not swallow it. `agent_exec` (Phase 3) is available but this phase only changes resolution; the stage scripts keep their own codex/claude launch code until a later cleanup if ever. `cf_load_stage_assignment` has callers outside this phase's file list: `clean-fix-usage.sh` calls it positionally at lines 95 and 438 (`cf_load_stage_assignment "$section" enabled agent model effort`), and `cf_print_stage_assignment`/`cf_print_agent_assignments` (`agent_assignments.sh` lines 115-129) back Phase 8's status view — keep the 5-arg out-var signature and the print helpers working; `clean-fix-usage.sh` itself isn't touched until Phase 8. Sourcing `agent_assignments.sh` (line 10) fires the freshness-gated catalog sync, which since Phase 2 can shell out to `claude --help` (~1-2s) and emit stale-row/alias `WARNING:` lines on stderr — these can appear in launchd run logs and are not stage failures.
 
-**Acceptance gate:** `bash -n` passes on all five files; sourcing `agent_assignments.sh` and calling `cf_load_stage_assignment` for each of the three stages yields `STYLE_AGENT=codex`, `STYLE_AGENT_MODEL=gpt-5.6-sol`, `STYLE_AGENT_EFFORT=xhigh` (current registry values); this is the resolver's first execution under macOS bash 3.2 (Phase 1 tests ran under `env bash` 5.x) — `/bin/bash -c 'source scripts/clean-fix/agent_assignments.sh && cf_load_stage_assignment style_eval'` must succeed before the launchd run is trusted; the next scheduled launchd style run completes — verify the newest clean-fix log shows a successful stage pass, not a resolution error.
+**Acceptance gate:** `bash -n` passes on all five files; sourcing `agent_assignments.sh` and calling `cf_load_stage_assignment` for each of the three stages yields `STYLE_AGENT`/`STYLE_AGENT_MODEL`/`STYLE_AGENT_EFFORT` matching the *current* `[assignments] cleanfix` family and its `[cleanfix.<family>]` rows (the registry is live-editable via `/agent` — compare against the rows at run time, don't hard-code `gpt-5.6-sol:xhigh`); this is the resolver's first execution under macOS bash 3.2 (Phase 1 tests ran under `env bash` 5.x) — `/bin/bash -c 'source scripts/clean-fix/agent_assignments.sh && cf_load_stage_assignment style_eval'` must succeed before the launchd run is trusted; the next scheduled launchd style run completes — verify the newest clean-fix log shows a successful stage pass, not a resolution error.
 
 ### Phase 8 — clean-fix driver, usage, and report surfaces  · status: todo
 
@@ -412,8 +429,8 @@ Delete `commands/cli_agent.md`. Known transitional gap (accepted): until Phase 6
 
 - `scripts/clean-fix/clean-fix.sh` (driver): the `cf_load_stage_assignment` calls (lines 225-229) keep working per Phase 7; reword the agent log lines (~327+) from naming `$STYLE_EVAL_AGENT` alone to `family/agent` so the resolved model is visible. The report-render step (line 370) becomes `agent_exec cleanfix.report write …`. Today it builds the prompt inline (`"$(sed 's/\$ARGUMENTS/rebuild/g' … report-render.md)"`) and appends stderr to the main run log — there is no existing prompt file or dedicated log to map. Write the substituted prompt to a file under the run's tmp dir and give `agent_exec` a dedicated report log path (e.g. `report_render.log` beside the run log).
 - `scripts/clean-fix/clean-fix-usage.sh`: `print_stage_json` (lines 90/95) and `print_stage_text` (lines 433-444) render agent/model/effort columns — update to family/agent/effort; effort may legitimately be empty (CLI default), keep the `<default>` placeholder. Help text (~44-45) for `/clean_fix agent …` updates to the new semantics below.
-- `scripts/clean-fix/clean_fix_report_parse.py`: the codex usage-limit wording and reason codes ("codex hit its usage limit", `codex-usage-limit` at ~1166/1194/1836) generalize — name the resolved family in the strings or key the reason codes on it. basedpyright must stay at zero errors/warnings; no file-level ignores; no `Any`.
-- `commands/clean_fix.md` (~lines 267-300): the scoped `agent|model|effort` subcommands (`/clean_fix agent eval claude`, `/clean_fix eval model opus`, …) lose their backing (per-stage keys are gone). `/clean_fix agent` becomes a status view (family + resolved rows via the existing `cf_print_agent_assignments` path) that points at `/agent cleanfix <family>` for switching and `/agent cleanfix.<stage> <agent>[:<effort>]` for row edits. The same `<StyleAgentConfig>` block also owns the `on|off` / `eval|review|fix on|off` enable/disable subcommands — those keep their backing (`enabled=` stays per Phase 7) and must be retained; only the agent/model/effort subcommands are replaced.
+- `scripts/clean-fix/clean_fix_report_parse.py`: the codex usage-limit wording and reason codes ("codex hit its usage limit", `codex-usage-limit` at ~1166/1194/1836) generalize — name the resolved family in the strings or key the reason codes on it. basedpyright must stay at zero errors/warnings; no file-level ignores; no `Any`. Since Phase 2 the catalog sync can emit `WARNING:` lines (stale assigned rows, missing claude aliases) into launchd run logs — the current usage-limit regexes don't collide with them, and the generalized patterns must not start matching them either.
+- `commands/clean_fix.md` (~lines 267-300): the scoped `agent|model|effort` subcommands (`/clean_fix agent eval claude`, `/clean_fix eval model opus`, …) lose their backing (per-stage keys are gone). `/clean_fix agent` becomes a status view (family + resolved rows via the existing `cf_print_agent_assignments` path) that points at `/agent cleanfix <family>` for switching and `/agent cleanfix.<stage> <agent>[:<effort>]` for row edits. The same `<StyleAgentConfig>` block also owns the `on|off` / `eval|review|fix on|off` enable/disable subcommands — those keep their backing (`enabled=` stays per Phase 7) and must be retained; only the agent/model/effort subcommands are replaced. This rewrite closes Phase 7's accepted transitional gap (the doc instructing writes of removed conf keys) — nothing extra to do beyond the rewrite itself.
 - `scripts/clean-fix/README.md` (~line 18): rewrite the per-stage override schema rows — `agent-assignments.conf` now holds only `enabled=`; agent/model/effort live in `config/agents.conf` under `[cleanfix.<family>]`.
 
 **Files:**
@@ -492,13 +509,15 @@ Shared mechanics all three docs must specify:
 - `config/agents.conf`: delete the legacy sections — `[codex]` (`model=`), `[claude]` (`model=`), `[codex.models]`, `[claude.models]`, and any `[codex.efforts]`/`[claude.efforts]` remnants. The file then contains only `[assignments]`, the `[<function>.<family>]` sets, and the two `[<family>.agents]` catalogs. Update the header comment (resolver path, sync note, consumers list).
 - `scripts/agents/agents_config.sh`: remove the legacy `agents_config_*` API that no longer has callers (`agents_config_model`, `agents_config_effort`, `agents_config_allowed_*`, `agents_config_validate_*`, `agents_config_apply_defaults`) and the private helpers that go dead with them (`_agents_config_get` — the dotted-key-regex footgun — `_agents_config_value_allowed`, `_agents_config_values_inline`) — verify each with grep before deleting. Keep `agents_config_trim`, `_agents_config_has_section`, and `_agents_config_section_values` (the new API uses both), the freshness-triggered sync, and the Phase 1+ API.
 - `config/README.md`: rewrite the `## agents.conf` block for the new schema (three layers, `/agent` as the editor, sync behavior, claude catalog hand-maintained with alias-staleness warn).
+- `scripts/agents/test_sync_codex_catalog.sh`: its fixtures (heredocs ~lines 58 and 117) deliberately carry `[codex]`/`[codex.models]`/`[codex.efforts]` sections to pin "legacy sections left byte-identical when present". Rename those fixture sections to neutral names (e.g. `[legacy.unmanaged]` + plain rows) — the pass-through behavior being pinned is generic (the sync rewrites only `[codex.agents]`), so the test stays meaningful and the verification grep below can come back clean.
 - Verify `config/orphans_expected.json` needs nothing (it is empty).
 
 **Files:**
 - `config/agents.conf` — legacy sections removed.
 - `scripts/agents/agents_config.sh` — legacy functions removed.
 - `config/README.md` — agents.conf description rewritten.
+- `scripts/agents/test_sync_codex_catalog.sh` — fixture legacy-section names neutralized.
 
-**Constraints from prior phases:** every consumer migrated in Phases 4-10; the only remaining readers of the legacy sections/functions should be the legacy functions themselves — `grep -rn "agents_config_model\|agents_config_effort\|codex.models\|claude.models" scripts/ commands/ config/` must come back clean (excluding this plan doc) before deleting. Phase 2 left the legacy conf sections static specifically so this phase could remove them wholesale.
+**Constraints from prior phases:** every consumer migrated in Phases 4-10; the only remaining readers of the legacy sections/functions should be the legacy functions themselves — `grep -rn "agents_config_model\|agents_config_effort\|agents_config_allowed\|agents_config_validate\|agents_config_apply_defaults\|codex.models\|claude.models\|codex.efforts\|claude.efforts" scripts/ commands/ config/` must come back clean (excluding this plan doc) before deleting — the wider pattern covers the allowed/validate/apply_defaults helpers and the `[*.efforts]` sections, whose last callers (`cli_agent.sh` ~lines 53-56/75-77, `agent_assignments.sh` ~lines 45-57) are removed in Phases 6/7. Phase 2 left the legacy conf sections static specifically so this phase could remove them wholesale; the Phase 2 sync neither reads nor writes any legacy section, so the wholesale strip is safe.
 
 **Acceptance gate:** `bash scripts/agents/test_agents_config.sh`, `bash scripts/agents/test_agent_exec.sh`, and `bash scripts/agents/test_sync_codex_catalog.sh` all pass; the grep above returns nothing live; manual smoke: `/agent status` renders, one `codex`→`claude`→`codex` round-trip on `cli` leaves the conf byte-identical, and a delegate dry run (`AGENT_EXEC_DRY_RUN=1` through `implement.sh`) resolves correctly.
