@@ -32,7 +32,7 @@ I iterate on these almost every day to get them to work right for me - feel free
 
 ## Configuration
 - `settings.json` - hooks, permissions, sandbox config; its volatile `model` and `effortLevel` fields are excluded from Git
-- `scripts/settings/setup_git_filter.sh` - configure the `settings.json` filter once per clone; a `ConfigChange` hook refreshes Git after Claude rewrites the file
+- `scripts/settings/setup_git_filter.sh` - configure the filter and install the launchd settings watcher once per clone
 
 ## Finally
 There's more stuff you can check out. I use this as my "User" level config in ~/.claude - pick and choose what you adopt, since Claude makes it available in every project. Some of it is Rust-specific; swap that out to suit your use case.

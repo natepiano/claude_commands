@@ -75,17 +75,6 @@
         ]
       }
     ],
-    "ConfigChange": [
-      {
-        "matcher": "user_settings",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "/Users/natemccoy/.claude/scripts/settings/refresh_settings_index.sh"
-          }
-        ]
-      }
-    ],
     "PostToolUse": [
       {
         "hooks": [
