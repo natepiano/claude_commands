@@ -2,10 +2,13 @@
 # Clean-fix orchestrator.
 # Usage: clean-fix.sh [clean|style] [project]
 #        clean-fix.sh [project]
+#        clean-fix.sh run_once
 #   clean — settings back-populate + cargo clean/build/mend + warmup
 #           (nightly via com.natemccoy.cargo-clean, 4:00 AM calendar)
 #   style — style eval + review + fix worktrees
 #           (every 10 min via com.natemccoy.style-fix, no idle gate)
+#   run_once — one style eval + review + fix pass across all configured
+#              projects, ignoring persistent stage enablement
 #   no scope — both, in order (manual /clean_fix run)
 # The launchd triggers share one pgrep guard on this script's path, so the
 # two scopes never run concurrently.
@@ -23,6 +26,14 @@ if [[ $# -gt 0 ]]; then
                 echo "Usage: clean-fix.sh [clean|style] [project]" >&2
                 exit 1
             fi
+            ;;
+        run_once)
+            SCOPE="$1"
+            if [[ $# -gt 1 ]]; then
+                echo "Usage: clean-fix.sh run_once" >&2
+                exit 1
+            fi
+            export CLEAN_FIX_FORCE_STYLE_STAGES=1
             ;;
         *)
             SCOPE="all"
@@ -64,6 +75,21 @@ ln -sfn "$LOG_FILE" "$LEGACY_LOG"
 
 log() {
     echo "$(date '+%Y-%m-%d %H:%M:%S') $1" | tee -a "$LOG_FILE"
+}
+
+log_run_once_summary() {
+    local eval_agent="${STYLE_EVAL_MODEL:-<default>}:${STYLE_EVAL_EFFORT:-<default>}"
+    local review_agent="${STYLE_REVIEW_MODEL:-<default>}:${STYLE_REVIEW_EFFORT:-<default>}"
+    local fix_agent="${STYLE_FIX_MODEL:-<default>}:${STYLE_FIX_EFFORT:-<default>}"
+
+    log "Run-once execution summary: one eval -> eval_review -> fix pass across all configured style projects; persistent stage enablement ignored."
+    {
+        printf '%-12s %s\n' "Stage" "Agent:effort"
+        printf '%-12s %s\n' "------------" "------------"
+        printf '%-12s %s\n' "eval" "$eval_agent"
+        printf '%-12s %s\n' "eval_review" "$review_agent"
+        printf '%-12s %s\n' "fix" "$fix_agent"
+    } | tee -a "$LOG_FILE"
 }
 
 # Per-project build environment from [project_env] in clean-fix.conf. Echoes the
@@ -235,6 +261,9 @@ if [[ -n "$PROJECT_FILTER" ]]; then
 else
     log "=== Starting clean-fix (scope: $SCOPE) ==="
 fi
+if [[ "$SCOPE" == "run_once" ]]; then
+    log_run_once_summary
+fi
 
 # Back-populate canonical settings.local.json permissions. Runs in every scope:
 # the style-fix agents depend on these permissions and the script is cheap.
@@ -243,7 +272,7 @@ python3 "$SCRIPT_DIR/backpopulate_settings.py" --apply >> "$LOG_FILE" 2>&1 || {
     log "WARNING: settings back-population failed"
 }
 
-if [[ "$SCOPE" != "style" ]]; then
+if [[ "$SCOPE" != "style" && "$SCOPE" != "run_once" ]]; then
 # Guard so set -u doesn't trip on an empty allowlist expansion.
 if [[ ${#BUILD_TARGETS[@]} -eq 0 ]]; then
     log "No [build] targets configured — skipping clean/build pass."
@@ -323,7 +352,7 @@ if [[ "$SCOPE" != "clean" ]]; then
     if [[ -n "$PROJECT_FILTER" ]]; then
         style_args+=("$(project_filter_key "$PROJECT_FILTER")")
     fi
-    if [[ "$STYLE_EVAL_ENABLED" == "true" ]]; then
+    if [[ "$STYLE_EVAL_ENABLED" == "true" || "$SCOPE" == "run_once" ]]; then
         log "Starting style evaluations with family=$STYLE_EVAL_AGENT agent=${STYLE_EVAL_MODEL:-<default>} effort=${STYLE_EVAL_EFFORT:-<default>}..."
         "$SCRIPT_DIR/style-eval-all.sh" ${style_args[@]+"${style_args[@]}"} 2>&1 | tee -a "$LOG_FILE" || {
             log "WARNING: style evaluation script failed"
@@ -334,7 +363,7 @@ if [[ "$SCOPE" != "clean" ]]; then
 
     # Review pass over each project's pending evaluation markdown before the
     # fix stage spawns.
-    if [[ "$STYLE_REVIEW_ENABLED" == "true" ]]; then
+    if [[ "$STYLE_REVIEW_ENABLED" == "true" || "$SCOPE" == "run_once" ]]; then
         log "Reviewing pending evaluation markdown with family=$STYLE_REVIEW_AGENT agent=${STYLE_REVIEW_MODEL:-<default>} effort=${STYLE_REVIEW_EFFORT:-<default>}..."
         "$SCRIPT_DIR/style-eval-review-all.sh" ${style_args[@]+"${style_args[@]}"} 2>&1 | tee -a "$LOG_FILE" || {
             log "WARNING: style eval review script failed"
@@ -343,7 +372,7 @@ if [[ "$SCOPE" != "clean" ]]; then
         log "SKIP: style eval review disabled in agent-assignments.conf"
     fi
 
-    if [[ "$STYLE_FIX_ENABLED" == "true" ]]; then
+    if [[ "$STYLE_FIX_ENABLED" == "true" || "$SCOPE" == "run_once" ]]; then
         log "Creating style-fix worktrees with family=$STYLE_FIX_AGENT agent=${STYLE_FIX_MODEL:-<default>} effort=${STYLE_FIX_EFFORT:-<default>}..."
         "$SCRIPT_DIR/style-fix-worktrees.sh" ${style_args[@]+"${style_args[@]}"} 2>&1 | tee -a "$LOG_FILE" || {
             log "WARNING: style-fix worktree script failed"

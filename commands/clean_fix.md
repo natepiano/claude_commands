@@ -14,22 +14,24 @@ When no subcommand is provided, run this script and relay its stdout exactly:
 
 The script owns the user-facing data, section order, column widths, wrapping, and formatting. Do not parse, summarize, truncate, filter, sort, merge, rename, rewrite, add rows, or convert its output to Markdown pipe tables. Do not read or reinterpret clean-fix config files for this screen; the script output is the only source. If the script exits non-zero, show its stdout/stderr exactly and stop.
 
-Dispatch: `run` → <Run/>, `add` → <Add/>, `rename` → <Rename/>, `monitor` → <Monitor/>, `report`/`list` → <Report/>, `eval`/`review`/`fix`/`agent`/`on`/`off` → <StyleAgentConfig/>, `skip` → <Skip/>. Empty or unrecognized first token → run the usage script above, relay stdout exactly, and stop.
+Dispatch: `run`/`run_once` → <Run/>, `add` → <Add/>, `rename` → <Rename/>, `monitor` → <Monitor/>, `report`/`list` → <Report/>, `eval`/`review`/`fix`/`agent`/`on`/`off` → <StyleAgentConfig/>, `skip` → <Skip/>. Empty or unrecognized first token → run the usage script above, relay stdout exactly, and stop.
 
 <Run>
 
 ## run [clean | style] [project]
 ## run [project]
+## run_once
 
-### `run`, `run clean`, `run style` — pipeline scopes
+### `run`, `run clean`, `run style`, `run_once` — pipeline scopes
 
 Launch `~/.claude/scripts/clean-fix/clean-fix.sh` interactively, off the launchd schedule. Build the script arguments from the user command:
 
 - no scope — full pipeline: clean + build + warmup + eval + review + fix
 - `clean` — clean + build + mend + warmup only (the nightly 4 AM job's scope)
 - `style` — eval + review + fix worktrees only (the every-10-min job's scope)
+- `run_once` — one eval + review + fix pass across every configured style project, regardless of the three persistent stage enablement settings
 
-Any scope can take an optional project name:
+The `run` forms can take an optional project name:
 
 - `clean_fix run` — full pipeline for all targets
 - `clean_fix run <project>` — full pipeline for one target
@@ -37,6 +39,9 @@ Any scope can take an optional project name:
 - `clean_fix run clean <project>` — clean/build/warmup for one clean target
 - `clean_fix run style` — style eval/review/fix for all style targets
 - `clean_fix run style <project>` — style eval/review/fix for one style target
+- `clean_fix run_once` — one forced style eval/review/fix pass for all style targets
+
+`run_once` takes no arguments. If any token follows it, run the usage script, relay stdout exactly, and stop. It does not change `agent-assignments.conf`; later scheduled runs continue using the persistent stage enablement settings. Normal per-project safety and eligibility skips still apply; only stage enablement is overridden.
 
 `<project>` may be either the active checkout name shown in the usage table's `Project` column or the preserved identity shown in `Project Key`. The scripts normalize both through `[active_checkout]`; do not create duplicate style entries for active worktrees.
 
@@ -50,10 +55,25 @@ pgrep -fl clean-fix.sh || true
 
 If anything matches, tell the user `Clean-fix already running (PID …). Use /clean_fix monitor to attach to the live log, or wait for it to finish.` Stop. Do not launch a second copy.
 
-**Step 2: Launch.** The orchestrator writes its own timestamped log under `~/.local/logs/clean-fix/clean-fix-YYYYMMDD-HHMMSS.log` and updates the `~/.local/logs/clean-fix.log` symlink to point at it. Don't pre-create or redirect — just launch:
+**Step 2: Show the `run_once` execution summary.** Skip this step for `run`. For `run_once`, source `~/.claude/scripts/clean-fix/agent_assignments.sh`, resolve `style_eval`, `style_eval_review`, and `style_fix` with `cf_load_stage_assignment`, and show:
+
+`One eval → eval_review → fix pass across all configured style projects. Persistent stage enablement is ignored for this run.`
+
+Then render the current assignments as a Markdown table with exactly these columns and rows:
+
+| Stage | Agent:effort |
+|---|---|
+| eval | `<resolved agent>:<resolved effort>` |
+| eval_review | `<resolved agent>:<resolved effort>` |
+| fix | `<resolved agent>:<resolved effort>` |
+
+Use `<default>` when agent or effort is empty. This summary is informational; do not edit either assignment file.
+
+**Step 3: Launch.** The orchestrator writes its own timestamped log under `~/.local/logs/clean-fix/clean-fix-YYYYMMDD-HHMMSS.log` and updates the `~/.local/logs/clean-fix.log` symlink to point at it. Don't pre-create or redirect — just launch:
 
 ```bash
 ~/.claude/scripts/clean-fix/clean-fix.sh [clean|style] [project]
+~/.claude/scripts/clean-fix/clean-fix.sh run_once
 ```
 
 Use `Bash` with `dangerouslyDisableSandbox: true` and `run_in_background: true`. Capture the resulting bash shell id so the user can kill it later with `KillShell` if needed. After launch, resolve the active log path:
@@ -64,12 +84,13 @@ ls -t ~/.local/logs/clean-fix/clean-fix-*.log 2>/dev/null | head -1
 
 Tell the user: `Clean-fix launched (shell <id>). Log: <path>.`
 
-**Step 3: Offer to arm the monitor.** In the same response, offer one short follow-up: `Want me to /clean_fix monitor to stream phase transitions?` If the user says yes, execute <Monitor/> with no arguments. If they decline, stop.
+**Step 4: Offer to arm the monitor.** In the same response, offer one short follow-up: `Want me to /clean_fix monitor to stream phase transitions?` If the user says yes, execute <Monitor/> with no arguments. If they decline, stop.
 
 ### Notes
 
 - The full run can take an hour or more. The user does not need to keep this conversation open — the script runs detached and writes to disk.
 - `run` is the on-demand counterpart to the launchd job; the schedule is unaffected. If a launchd-triggered run is already in flight, Step 1 will catch it.
+- `run_once` is a one-time style-stage override; it does not run clean/build/warmup and does not persistently enable any stage.
 - For testing only the review stage in isolation, prefer `~/.claude/scripts/clean-fix/style-eval-review-all.sh [project]` — much faster than a full clean-fix.
 - Use `/clean_fix report` after the run for a per-project matrix, or `/clean_fix monitor` during the run for live updates.
 

@@ -33,6 +33,7 @@ load_usage_rows() {
     add_usage "clean_fix run [project]" "Clean/build/warmup and style eval/review/fix. Optional project filters to one target."
     add_usage "clean_fix run clean [project]" "Clean + build + mend + warmup. Optional project filters to one clean target."
     add_usage "clean_fix run style [project]" "Style eval + review + fix worktrees. Optional project filters to one style target." true
+    add_usage "clean_fix run_once" "Runs one eval + review + fix pass across all configured style projects, regardless of stage enablement." true
     add_usage "clean_fix add <path-or-project>" "Adds a Rust project to clean and style allowlists. Workspace members use workspace-relative entries." true
     add_usage "clean_fix rename <old> <new>" "Renames a clean-fix project key and migrates history, pending state, and markers." true
     add_usage "clean_fix monitor" "Watches the latest clean-fix log modified in the last 2 hours." true

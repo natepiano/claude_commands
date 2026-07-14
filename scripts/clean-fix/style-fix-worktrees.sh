@@ -208,7 +208,7 @@ run_style_agent() {
     esac
 }
 
-if [[ "$STYLE_ENABLED" == "false" ]]; then
+if [[ "$STYLE_ENABLED" == "false" && "${CLEAN_FIX_FORCE_STYLE_STAGES:-0}" != "1" ]]; then
     echo "Style fix is disabled."
     exit 0
 fi

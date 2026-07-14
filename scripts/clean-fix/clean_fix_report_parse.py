@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import argparse
 import re
+import subprocess
 import sys
 import time
 from datetime import datetime
@@ -1390,6 +1391,42 @@ def pending_stop_reason(pending: dict[str, object]) -> str:
     return ""
 
 
+def source_working_tree_is_dirty(root: Path) -> bool:
+    """Match the style-fix launcher's member-scoped dirty-tree check."""
+    try:
+        repo_result = subprocess.run(
+            ["git", "-C", str(root), "rev-parse", "--show-toplevel"],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+    except OSError:
+        return False
+    repo_text = repo_result.stdout.strip()
+    if repo_result.returncode != 0 or not repo_text:
+        return False
+
+    repo_root = Path(repo_text)
+    try:
+        target = root.resolve().relative_to(repo_root.resolve())
+    except (OSError, ValueError):
+        return False
+
+    command = ["git", "-C", str(repo_root), "status", "--porcelain"]
+    if target != Path("."):
+        command.extend(["--", str(target)])
+    try:
+        status_result = subprocess.run(
+            command,
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+    except OSError:
+        return False
+    return status_result.returncode == 0 and bool(status_result.stdout.strip())
+
+
 def current_state_result() -> ParseResult:
     result = ParseResult(path=Path(CURRENT_STATE_LABEL))
     for phase in PHASES:
@@ -1444,6 +1481,11 @@ def current_state_result() -> ParseResult:
                 result.skip_reasons.append(
                     SkipReason("eval", "reviewed findings awaiting fix", project)
                 )
+                if source_working_tree_is_dirty(root):
+                    row["fix"] = Cell("SKIP", "source-working-tree-dirty")
+                    result.skip_reasons.append(
+                        SkipReason("fix", "source working tree dirty", project)
+                    )
             elif status == "fixed_findings":
                 if pending_fix_is_approval_only(project):
                     reason = (
@@ -1470,7 +1512,7 @@ def current_state_result() -> ParseResult:
                     Warning("fix", project, "style fix failed; inspect the pending handoff")
                 )
         else:
-            row["eval"] = Cell("SKIP", "idle")
+            row["eval"] = Cell("SKIP", "no-pending-work")
             if project in worktrees:
                 row["fix"] = Cell("SKIP", "style-fix-worktree-exists")
                 result.notes.append(
