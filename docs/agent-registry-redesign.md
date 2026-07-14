@@ -631,7 +631,7 @@ Shared mechanics all three docs must specify:
 - Three one-line Work Order edits: `style-eval-review-all.sh:43`'s stale header comment added to the reword list (no phase owned it — the last such line found); the immediate post-implementation check now also runs `agent_admin.sh status` (the fixture test alone can't catch a botched live-conf edit that would wedge launchd); the cli round-trip smoke gained Phase 5's snapshot-after-one-source caveat.
 - Confirmed no-action items: Phase 10's `/tmp/claude/<command>/<uuid>/` session dirs match the delegate precedent; the grep can't see a leftover bare `[codex]` header but the spec's "file then contains only …" sentence guards that.
 
-### Phase 11 — legacy strip + docs  · status: done (`eeae6cf`)
+### Phase 11 — legacy strip + docs  · status: done (`d864d9c`)
 
 #### Work Order
 

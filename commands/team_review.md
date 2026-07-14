@@ -87,7 +87,7 @@ Launch **3-5 external CLI agents in parallel**, each with a distinct analytical 
 
 On the first cycle, create an absolute `${SESSION_DIR}` under `/tmp/claude/team_review/<uuid>/`. Set `${WORKING_DIR}` to the project root that contains the reviewed topic, normally the command session's current working directory; never use `~/.claude` unless it is itself the reviewed project. Before any agent launch:
 
-1. Warm the agent-catalog freshness gate once by running `bash ~/.claude/scripts/agents/agent_admin.sh status` with Bash `dangerouslyDisableSandbox: true`. This must not run sandboxed: a sandboxed catalog sync cannot update the registry or freshness state, and its warn-and-continue behavior can leave every parallel launch attempting the same stale sync.
+1. Warm the agent-catalog freshness gate once by running `bash ~/.claude/scripts/agents/agent_admin.sh team_review` with Bash `dangerouslyDisableSandbox: true`. This must not run sandboxed: a sandboxed catalog sync cannot update the registry or freshness state, and its warn-and-continue behavior can leave every parallel launch attempting the same stale sync.
 2. Capture provenance once for the task by running `bash -c 'source ~/.claude/scripts/agents/agents_config.sh && agents_resolve_print team_review.expert' >> "${SESSION_DIR}/agent_provenance.txt"`.
 
 For each cycle's 1-based `${CYCLE_NUMBER}`, create `${WAVE_DIR}=${SESSION_DIR}/cycle${CYCLE_NUMBER}`. Write one absolute `${WAVE_DIR}/prompt_N.md` per lens; reserve `${WAVE_DIR}/findings_N.txt` and `${WAVE_DIR}/agent_N.log` for its output and log. Wave namespacing is mandatory because `<LaunchExpertTeam/>` runs once per cycle.

@@ -64,7 +64,7 @@ Launch **5 external CLI agents in parallel** through `~/.claude/scripts/agents/a
 
 Create an absolute `${SESSION_DIR}` under `/tmp/claude/api_review/<uuid>/`, set `${WORKING_DIR}=${CRATE_ROOT}`, and create `${WAVE_DIR}=${SESSION_DIR}/reviewer`. Before backgrounding any reviewer:
 
-1. Warm the agent-catalog freshness gate once by running `bash ~/.claude/scripts/agents/agent_admin.sh status` with Bash `dangerouslyDisableSandbox: true`. This must not run sandboxed: a sandboxed catalog sync cannot update the registry or freshness state, and its warn-and-continue behavior can leave every parallel launch attempting the same stale sync.
+1. Warm the agent-catalog freshness gate once by running `bash ~/.claude/scripts/agents/agent_admin.sh api_review` with Bash `dangerouslyDisableSandbox: true`. This must not run sandboxed: a sandboxed catalog sync cannot update the registry or freshness state, and its warn-and-continue behavior can leave every parallel launch attempting the same stale sync.
 2. Capture provenance once for each task this command uses:
    - `bash -c 'source ~/.claude/scripts/agents/agents_config.sh && agents_resolve_print api_review.reviewer' >> "${SESSION_DIR}/agent_provenance.txt"`
    - `bash -c 'source ~/.claude/scripts/agents/agents_config.sh && agents_resolve_print api_review.adversary' >> "${SESSION_DIR}/agent_provenance.txt"`

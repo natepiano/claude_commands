@@ -201,10 +201,14 @@ agents_resolve_print() {
 }
 
 agents_list_assignments() {
-    local assignment key family line subtask
+    local filter="${1:-}" assignment key family line subtask matched=0
     while IFS= read -r assignment; do
         key="${assignment%%=*}"
         family="${assignment#*=}"
+        if [[ -n "$filter" && "$key" != "$filter" && "$key" != "$filter".* ]]; then
+            continue
+        fi
+        matched=1
         if [[ "$key" == *.* ]]; then
             agents_resolve_print "$key" || return 1
             continue
@@ -217,6 +221,46 @@ agents_list_assignments() {
             agents_resolve_print "$key.$subtask" || return 1
         done < <(_agents_config_section_values "$key.$family")
     done < <(_agents_config_section_values assignments)
+    if [[ -n "$filter" && "$matched" -eq 0 ]]; then
+        echo "ERROR: no [assignments] entry for '$filter'." >&2
+        echo "       Configured assignments in $AGENTS_CONFIG_FILE: $(_agents_section_keys_inline assignments)" >&2
+        return 1
+    fi
+}
+
+# Print every family's rows for one function, then a comment naming the
+# active family (plus any per-subtask assignment overrides).
+agents_list_function() {
+    local function="$1" active family line key subtask pair model effort overrides=""
+
+    active="$(_agents_registry_get assignments "$function")"
+    if [[ -z "$active" ]]; then
+        echo "ERROR: no [assignments] entry for '$function'." >&2
+        echo "       Configured assignments in $AGENTS_CONFIG_FILE: $(_agents_section_keys_inline assignments)" >&2
+        return 1
+    fi
+    for family in codex claude; do
+        _agents_config_has_section "$function.$family" || continue
+        while IFS= read -r line; do
+            subtask="${line%%=*}"
+            pair="$(agents_config_trim "${line#*=}")"
+            model="${pair%%:*}"
+            effort=""
+            [[ "$pair" == *:* ]] && effort="${pair#*:}"
+            printf 'task=%s family=%s agent=%s effort=%s\n' \
+                "$function.$subtask" "$family" "$model" "$effort"
+        done < <(_agents_config_section_values "$function.$family")
+    done
+    while IFS= read -r line; do
+        key="${line%%=*}"
+        [[ "$key" == "$function".* ]] || continue
+        overrides="$overrides, ${key#"$function".}=$(agents_config_trim "${line#*=}")"
+    done < <(_agents_config_section_values assignments)
+    if [[ -n "$overrides" ]]; then
+        echo "# current family: $active (overrides:${overrides#,})"
+    else
+        echo "# current family: $active"
+    fi
 }
 
 agents_set_assignment() {

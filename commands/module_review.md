@@ -80,7 +80,7 @@ Launch **3 external CLI agents in parallel** through `~/.claude/scripts/agents/a
 
 Create an absolute `${SESSION_DIR}` under `/tmp/claude/module_review/<uuid>/`. Set `${WORKING_DIR}` to the repo root containing `${SCOPE}`; never use `~/.claude` unless it is itself that repo. Create `${WAVE_DIR}=${SESSION_DIR}/pass1`. Before backgrounding any reviewer:
 
-1. Warm the agent-catalog freshness gate once by running `bash ~/.claude/scripts/agents/agent_admin.sh status` with Bash `dangerouslyDisableSandbox: true`. This must not run sandboxed: a sandboxed catalog sync cannot update the registry or freshness state, and its warn-and-continue behavior can leave every parallel launch attempting the same stale sync.
+1. Warm the agent-catalog freshness gate once by running `bash ~/.claude/scripts/agents/agent_admin.sh module_review` with Bash `dangerouslyDisableSandbox: true`. This must not run sandboxed: a sandboxed catalog sync cannot update the registry or freshness state, and its warn-and-continue behavior can leave every parallel launch attempting the same stale sync.
 2. Capture provenance once for each task this command uses:
    - `bash -c 'source ~/.claude/scripts/agents/agents_config.sh && agents_resolve_print module_review.reviewer' >> "${SESSION_DIR}/agent_provenance.txt"`
    - `bash -c 'source ~/.claude/scripts/agents/agents_config.sh && agents_resolve_print module_review.validation' >> "${SESSION_DIR}/agent_provenance.txt"`
@@ -215,9 +215,9 @@ Do not cite agent reports. Do not include "options A vs B". State the recommenda
 
 **If `${OVERSIZE_FILES}` is empty:** print one line — `No over-large files in scope. Skipping pass 2.` — and proceed to pass 3.
 
-Otherwise, create `${WAVE_DIR}=${SESSION_DIR}/pass2` and launch **3 external CLI agents in parallel** through `~/.claude/scripts/agents/agent_exec.sh` using the `module_review.reviewer` registry task and `readonly` mode. Each agent reviews **all** over-large files (not one agent per file) through a distinct lens.
+Otherwise, create `${WAVE_DIR}=${SESSION_DIR}/pass2` and run **3 external CLI agents in two waves** through `~/.claude/scripts/agents/agent_exec.sh` using the `module_review.reviewer` registry task and `readonly` mode: Agents D and E launch in parallel; Agent F launches only after D completes, because F's prompt embeds D's proposed layouts. Each agent reviews **all** over-large files (not one agent per file) through a distinct lens.
 
-Write three `prompt_N.md` files under the wave, with matching `findings_N.txt` and `agent_N.log` paths. Each self-contained prompt repeats the pass 1 charter + style-guide preamble verbatim; the review topic, intent, and posture/boundaries; all relevant explicit absolute paths; `${INVENTORY}` and `${OVERSIZE_FILES}` verbatim; its lens; and the complete finding schema from pass 1.
+Write `prompt_D.md` and `prompt_E.md` under the wave up front, with matching `findings_D.txt`/`findings_E.txt` and `agent_D.log`/`agent_E.log` paths; `prompt_F.md` is written after D's findings arrive. Each self-contained prompt repeats the pass 1 charter + style-guide preamble verbatim; the review topic, intent, and posture/boundaries; all relevant explicit absolute paths; `${INVENTORY}` and `${OVERSIZE_FILES}` verbatim; its lens; and the complete finding schema from pass 1. `prompt_F.md` additionally embeds the full contents of `findings_D.txt` verbatim under a `## Agent D's proposed layouts` heading.
 
 **Agent D — Production seams**
 > For each file in `${OVERSIZE_FILES}`: group top-level items by responsibility. Propose a submodule layout (`<file>/mod.rs` + N submodules), citing line ranges, type names, and function clusters. Apply `name-submodules-after-anchor-types.md` and `split-by-type-ownership.md`. Output per file: target layout, what goes where (current line ranges + items), sequencing for the split (leaves first).
@@ -225,8 +225,8 @@ Write three `prompt_N.md` files under the wave, with matching `findings_N.txt` a
 **Agent E — Production-vs-test ratio**
 > For each file in `${OVERSIZE_FILES}`: compute production-line vs inline-test-line counts (use `awk '/^#\[cfg\(test\)\]/{print NR; exit}'` to find the test block boundary). If a file is >50% tests, the right action is test extraction (move tests to a `tests/` directory), not a module split. Flag any such file and propose the test-extraction target path. For genuine production-heavy files, confirm the split is warranted by `when-to-split-a-module.md`.
 
-**Agent F — Call-site impact**
-> For each file in `${OVERSIZE_FILES}` and each proposed submodule from Agent D: count caller `use` statements that reference the file and predict which submodule each caller now needs.
+**Agent F — Call-site impact** (launched after D; its prompt embeds D's findings)
+> For each file in `${OVERSIZE_FILES}` and each proposed submodule in the embedded `## Agent D's proposed layouts` section: count caller `use` statements that reference the file and predict which submodule each caller now needs.
 >
 > Search both intra-crate and (when applicable) external workspace callers:
 > - Intra-crate: `rg "use crate::<path>::<file>" --type rust` inside `${CRATE_ROOT}` (or repo root for single-crate projects).
@@ -234,13 +234,15 @@ Write three `prompt_N.md` files under the wave, with matching `findings_N.txt` a
 >
 > Identify dependencies between proposed submodules (which import which) to determine extraction order. Surface any cycle or visibility hazard.
 
-Issue all three Bash tool calls in the same assistant turn, each with `run_in_background: true` and `dangerouslyDisableSandbox: true`:
+**Wave 1 — D and E.** Issue both Bash tool calls in the same assistant turn, each with `run_in_background: true` and `dangerouslyDisableSandbox: true`:
 
 ```bash
 bash ~/.claude/scripts/agents/agent_exec.sh module_review.reviewer readonly "${WORKING_DIR}" "${WAVE_DIR}/prompt_N.md" "${WAVE_DIR}/findings_N.txt" "${WAVE_DIR}/agent_N.log"
 ```
 
-Yield after starting the complete wave; task notifications signal completion. Do not poll. After all three notifications arrive, read every findings file before synthesizing in-session.
+Yield after starting the wave; task notifications signal completion. Do not poll.
+
+**Wave 2 — F.** When D's notification arrives, read `${WAVE_DIR}/findings_D.txt` (apply the pass 1 failure rule if it is missing or empty), write `prompt_F.md` embedding it as described above, and launch F with the same command shape (`prompt_F.md` / `findings_F.txt` / `agent_F.log`), again `run_in_background: true` and `dangerouslyDisableSandbox: true`. E's completion order relative to F does not matter. After all three findings files are in, read them before synthesizing in-session.
 
 Synthesize: append a `## Phase N — Split <file>` section to `${DOC_PATH}` for each file, in order of size or risk. Each phase contains:
 - Target layout (directory tree).
