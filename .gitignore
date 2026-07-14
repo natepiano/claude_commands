@@ -3,6 +3,7 @@
 
 # Allow what we track
 !.gitignore
+!.gitattributes
 !CLAUDE.md
 !README.md
 !settings.json
