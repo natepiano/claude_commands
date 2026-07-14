@@ -31,7 +31,7 @@ I iterate on these almost every day to get them to work right for me - feel free
 - Random acknowledgements - ymmv
 
 ## Configuration
-- `settings.json` - hooks, permissions, sandbox config; its volatile `model` field is excluded from Git
+- `settings.json` - hooks, permissions, sandbox config; its volatile `model` and `effortLevel` fields are excluded from Git
 - `scripts/settings/setup_git_filter.sh` - configure the `settings.json` filter once per clone
 
 ## Finally
