@@ -6,7 +6,9 @@ Run `~/.claude/scripts/validate_and_push/validate_and_push.sh` with `dangerously
 
 The script runs local validation, chooses the push path, pushes directly when branch rules allow it, and watches CI. It exits successfully only after the direct-push CI path completes successfully.
 
-Validation requires a clean worktree. Because the tree is clean at that point, the rustfmt and taplo steps run in write mode: if either reformats a file, the changes are amended into the last commit (`git commit --amend --no-edit`) and validation continues automatically. A genuine fmt/taplo error (non-zero exit) still aborts. All other steps (clippy, tests, cargo-mend) remain check-only and abort on failure.
+Validation requires a clean worktree. Before strict validation, the script automatically applies every fix that cargo-mend and clippy mark as machine-applicable; these fixes do not require user approval. Rustfmt and taplo also run in write mode. After each successful fix step, any resulting changes are amended into the last commit (`git commit --amend --no-edit`) and validation continues automatically.
+
+The cargo-mend fix step follows the `/clippy` workflow's error handling: if an advertised fix fails or is reverted because it does not compile, stop immediately and preserve the reproduction state rather than attempting a manual substitute. The clippy fix pass caps lint severity at warnings so findings without machine-applicable suggestions do not prevent available fixes from being applied. After all automatic fixes and formatting, strict clippy, configured target checks, tests, and cargo-mend run normally. A fix command failure or any finding that remains under strict validation aborts the workflow.
 
 If the script exits with code `2`, the current branch is the default branch and GitHub branch rules require a PR. The script prints JSON with:
 
