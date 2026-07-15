@@ -1,17 +1,23 @@
 ---
-description: Delegate coding work to a configured CLI agent — the main agent orchestrates and the delegate agent codes. Pass a plan doc, a phase, free-text instructions, or any combination. Each phase runs implement → dual blind review → auto-routed fixes → phase review → checkpoint commit; phased plans loop phase-to-phase automatically, stopping only for decisions that block continued implementation. Pass `single` to run one phase with no commit.
+description: Delegate coding work to a configured CLI agent — the main agent orchestrates and the delegate agent codes. Each phase runs implement → dual blind review → auto-routed fixes → phase review → checkpoint commit. Phased plans run automatically by default; pass `verbose` for a pre-phase explanation and approval gate before every phase, or `single` for one phase with no commit.
 ---
 
 # Delegate
 
 **Purpose:** The main agent (the session running this command) owns design and orchestration; the configured delegate agent does all coding. This command composes an implementation work order, dispatches it, runs a dual review (a fresh blind delegate session + the main agent's own analysis), synthesizes the results, and routes fixes back to the delegate agent.
 
-**Usage:** `/plan:delegate [plan-doc-path] [phase N] [single] [free-text instructions]`
+**Usage:** `/plan:delegate [plan-doc-path] [phase N] [single|verbose] [auto next N phases|auto through phase X] [free-text instructions]`
 
-**Arguments** — all optional, all combinable:
+**Arguments** — all optional; `single` and `verbose` are mutually exclusive:
 - A path to a design/plan/implementation doc → the work spec
 - A phase/section identifier (e.g. `phase 3`, `## Migration` section name) → the starting phase
 - `single` → run exactly one phase, then stop (no checkpoint commit, no auto-continue)
+- `verbose` → before every phase, explain why it exists, the work it will do,
+  and the important types/APIs it will introduce or change; wait for explicit
+  approval, then run and checkpoint that phase, output only its reviewed result,
+  and wait for `continue` before showing the next phase's briefing
+- `auto next N phases` / `auto through phase X` → with `verbose`, temporarily
+  auto-run a bounded phase range and then restore the verbose approval gate
 - Free text → direct instructions, or amendments/narrowing on top of the doc
 - Empty → infer the work from the current conversation (the design just discussed is the work)
 
@@ -19,7 +25,11 @@ SESSION_DIR = (captured from prepare_session.sh output — see PrepareSession)
 WORKING_DIR = current project directory (often a worktree checkout, sometimes main — use it as-is; never create a worktree or switch branches)
 FIX_PASS = 0 (max 2 per phase; resets in <NextPhase/>)
 IMPLEMENTATION_TASK = implementation
-MODE = loop when the work comes from a phased plan doc and `single` was not passed; otherwise single
+APPLICATION_SMOKE_RESULT = not_run (resets in <NextPhase/>)
+MODE = single when `single` was passed or the work is not phased; verbose when
+`verbose` was passed for a phased plan; otherwise loop
+AUTO_WINDOW = none (verbose mode only; may become `next N` or `through <phase>`
+at a <VerbosePrePhaseGate/>, then returns to none automatically)
 
 ---
 
@@ -44,19 +54,63 @@ and control flow after compaction.
 
 ---
 
-## Loop mode
+## Multi-phase modes
 
-When the work comes from a phased plan doc, loop mode is the default: run the
+When the work comes from a phased plan doc, auto/loop mode is the default: run the
 named phase (or the first `todo` phase if none was named), then continue
 phase-after-phase until the plan is exhausted or a blocking decision stops the
-run. `single` opts out.
+run. `verbose` opts into a checkpointed human gate before every phase, including
+the selected starting phase; `single` opts out of multi-phase execution and
+checkpoint commits entirely.
+
+### Verbose mode
+
+`verbose` does not authorize the selected phase immediately. After assembling
+the selected phase's work order, run <VerbosePrePhaseGate/> before any delegate
+dispatch and wait. Approval authorizes exactly that phase's implementation,
+dual review, fixes, phase review, and checkpoint commit. After completion, run
+<VerbosePostPhaseReport/> and, outside a bounded-auto window, wait at
+<VerbosePostPhaseGate/>. The post-phase report contains only the completed
+phase's reviewed summary. `continue` advances only far enough to assemble and
+show the next phase's <VerbosePrePhaseGate/>; it never authorizes that phase.
+Even a completely correct phase never authorizes the next phase.
+
+At the gate, accept these controls:
+
+- `proceed` or `approved` — run only the phase currently described,
+  then return to another verbose gate before the next phase.
+- `auto next N phases` — run the currently described phase and enough
+  subsequent phases to total the positive integer N automatically, then return
+  to verbose mode after the Nth checkpoint.
+- `auto through phase X` — run the currently described phase through X inclusive, then
+  return to verbose mode after X's checkpoint.
+- `stop` — emit <RunSummary/> and end without starting the described phase.
+
+The user may include amendments with `proceed`; append the remaining text to the
+current phase's assembled implementation prompt before dispatch. Post-phase
+`continue` never amends or dispatches a phase. Validate an auto-window target
+before dispatch: it must identify the current or a later todo phase in the current plan. Plan
+exhaustion, a blocking decision, or an error still ends/stops the window early.
+An auto window changes only phase-to-phase advancement; every implementation,
+review, fix, phase-review, and checkpoint rule remains active.
+
+The same bounded-auto controls may accompany the initial `verbose` invocation.
+There, the selected starting phase counts as the first `auto next N` phase, and
+`auto through phase X` includes both the selected phase and X. Examples:
+
+```
+/plan:delegate docs/hana/tool-graph.md phase 0a verbose
+/plan:delegate docs/hana/tool-graph.md phase 0a verbose auto through phase 0j
+```
 
 **Commit authorization.** Invoking this command in loop mode IS the user's
-explicit request for checkpoint commits — exactly one per completed phase via
-<CheckpointCommit/>, never a push, no other commits. This is the sole exception
-to the global never-commit rule.
+explicit request for checkpoint commits. In verbose mode, approval at
+<VerbosePrePhaseGate/> authorizes exactly one implementation and checkpoint, or
+the phases named by an explicit bounded-auto control. Each completed phase gets
+exactly one commit via <CheckpointCommit/>, never a push, no other commits. This
+is the sole exception to the global never-commit rule.
 
-**Dirty-tree guard.** Before the first dispatch in loop mode, run
+**Dirty-tree guard.** Before the first dispatch in loop or verbose mode, run
 `git status --short` in ${WORKING_DIR}. If the tree already has uncommitted
 changes, STOP and ask the user how to proceed — a checkpoint must contain one
 phase's work and nothing else. Exception: if the selected phased plan document
@@ -80,8 +134,8 @@ reviews, fix passes, or phase review):
   without it → write a `**Pending decision:**` block (format:
   `~/.claude/docs/delegate_plan_format.md`) into the affected phase's Work
   Order, tell the user in one line that it was deferred, and continue. The
-  pre-dispatch check in <ComposeWorkOrder/> stops the loop when that phase
-  actually comes up.
+  pre-dispatch check in <ComposeWorkOrder/> stops either multi-phase mode when
+  that phase actually comes up.
 
 ---
 
@@ -90,13 +144,19 @@ reviews, fix passes, or phase review):
 
 **STEP 1:** Execute <PrepareSession/>
 **STEP 2:** Execute <ComposeWorkOrder/> (starts with the pending-decision pre-dispatch check)
-**STEP 3:** Execute <SelectTask/>
-**STEP 4:** Execute <LaunchImplementation/>
-**STEP 5:** Execute <DualReview/>
-**STEP 6:** Execute <Synthesize/>
-**STEP 7:** Execute <RunPhaseReview/> (required when working from a phased plan; pass `auto` in loop mode)
-**STEP 8:** Execute <CheckpointCommit/> (loop mode only)
-**STEP 9:** Execute <NextPhase/> (loop mode only) — loops back to STEP 2 or ends with <RunSummary/>
+**STEP 3:** In verbose mode with no active auto window, execute
+<VerbosePrePhaseGate/> and wait
+**STEP 4:** Execute <SelectTask/>
+**STEP 5:** Execute <LaunchImplementation/>
+**STEP 6:** Execute <DualReview/>
+**STEP 7:** Execute <Synthesize/>
+**STEP 8:** Execute <RunApplicationSmokeTest/>
+**STEP 9:** Execute <RunPhaseReview/> (required for phased plans; pass `auto` in either multi-phase mode)
+**STEP 10:** Execute <CheckpointCommit/> (loop and verbose modes only)
+**STEP 11:** In verbose mode execute <VerbosePostPhaseReport/>
+**STEP 12:** In verbose mode execute <VerbosePostPhaseGate/> when applicable
+**STEP 13:** Execute <NextPhase/> (loop and verbose modes only) — auto-continues,
+returns to STEP 2 for the next pre-phase gate, or ends with <RunSummary/>
 </ExecutionSteps>
 
 ---
@@ -121,16 +181,39 @@ reviews, fix passes, or phase review):
    Work Order (Spec / Files / Acceptance gate, then delete the block), and only
    then proceed. Never dispatch a phase carrying an unresolved pending decision.
 
-1. Parse $ARGUMENTS into: doc path (if any), phase/section (if any), `single` token (if present — sets MODE = single), free-text instructions (if any). If all empty, infer the work from the conversation.
+1. Parse $ARGUMENTS into: doc path (if any), phase/section (if any), `single`
+   token, `verbose` token, optional bounded-auto control (`auto next N phases`
+   or `auto through phase X`), and free-text instructions. Remove recognized
+   controls from the free text. Parse the complete bounded-auto phrase before
+   interpreting standalone `phase X`, because `auto through phase X` contains a
+   phase token that is not the starting phase. If both `single` and `verbose`
+   appear, or if a bounded-auto control appears without `verbose`, STOP and ask which execution
+   contract the user wants. Require a positive N. If all arguments are empty,
+   infer the work from the conversation.
 
 2. If a doc path was given, Read it. Decide whether it is a **delegate-ready plan** (per `~/.claude/docs/delegate_plan_format.md`): it has a `## Delegation Context` section **and** the target phase has a `#### Work Order`. Branch:
+
+   `verbose` requires a phased delegate-ready plan. If the target has no phased
+   Work Orders, STOP and explain that there is no next-phase boundary to gate;
+   offer `single` for that work instead.
+
+   Validate an initial bounded-auto range against the plan before dispatch. For
+   `auto next N phases`, set `AUTO_WINDOW = next N` and count the selected phase
+   as the first. For `auto through phase X`, require X to be the selected or a
+   later todo phase and set `AUTO_WINDOW = through X`.
 
 **FAST PATH — delegate-ready plan. Assemble; do NOT research the codebase.**
 `/plan:to_phased_plan` already paid the research cost and baked it into the doc. Build `${SESSION_DIR}/implementation_prompt.md` by copy-and-assemble:
 - **Project Context** = the doc's `## Delegation Context` block verbatim + the target phase's **Constraints from prior phases**.
 - **Work Specification** = the target phase's **Goal**, **Spec**, and **Files** verbatim + any free-text the user added on the command line.
 - **Style Requirements** = the standard block (see fallback template), included only if Delegation Context names a **Style** line.
-- **Verification** = Delegation Context **Build / Test / Lint** + the phase **Acceptance gate**. When the **Lint** line names the `clippy` skill, write it into the prompt as "run the `clippy` skill with `auto-proceed`" — a delegate session has no user to answer the skill's batch-approval gate.
+- **Verification** = Delegation Context **Build / Test / Lint / Run / Smoke**
+  entries that exist + the phase **Acceptance gate**. When the **Lint** line
+  names the `clippy` skill, write it into the prompt as "run the `clippy` skill
+  with `auto-proceed`" — a delegate session has no user to answer the skill's
+  batch-approval gate. The main agent still owns the mandatory live application
+  smoke test in <RunApplicationSmokeTest/>; delegate verification never
+  substitutes for it.
 
 Prepend the boilerplate header (the first paragraph of the template below) and write the file with the **Write tool**. Do not open codebase files to fill gaps — if a needed fact is absent, the *plan* is at fault: name the gap in one line, proceed with what the doc gives, and let the review catch the rest. This path should cost a few thousand tokens, not tens of thousands.
 
@@ -182,12 +265,74 @@ gate.]
 - Point to files the delegate agent can read itself rather than dumping file contents
 - Include the no-commit / no-branch rules verbatim — the delegate agent must leave the tree dirty for review
 
-3. Tell the user in one line what is being dispatched and the prompt path:
+3. In single/loop mode or a verbose bounded-auto window, tell the user in one
+   line what is being dispatched and the prompt path:
    `Dispatching <scope summary> to the delegate agent — prompt at ${SESSION_DIR}/implementation_prompt.md`
-   Do NOT ask for confirmation — invoking the command is the authorization.
+   In verbose mode with no active auto window, do not announce dispatch yet;
+   <VerbosePrePhaseGate/> explains the assembled phase and waits for approval.
 
    If this was the fast path, add: `(assembled from <plan>'s Phase N Work Order — no research)`.
 </ComposeWorkOrder>
+
+---
+
+<VerbosePrePhaseGate>
+**Verbose mode only, before every phase when no bounded-auto window is active.**
+
+**Goal:** Explain the phase before any delegate work starts, including the
+load-bearing types and APIs the plan expects, then wait for explicit approval.
+
+Build the briefing only from the target phase's Work Order and Delegation
+Context. Do not research the codebase on the delegate-ready fast path, invent
+types the plan does not name, or describe planned behavior as already working.
+Use the assembled implementation prompt to ensure any command-line amendments
+are reflected.
+
+```
+## Phase N ready — <phase title>
+
+### Why this phase exists
+[The point of the phase in 2-4 sentences: what capability or foundation it adds,
+what later work depends on it, and what remains deliberately outside it.]
+
+### Work to be done
+[A behavior-focused summary of the planned implementation, including the main
+state transitions, ownership boundaries, and user-visible effect.]
+
+### Important types and APIs this phase will introduce or change
+| Type / trait / API | Planned role | How it will work with the rest of the system |
+| --- | --- | --- |
+[Only load-bearing types, traits, resources, enums, events, and public methods
+explicitly named by the Work Order. Explain expected ownership, inputs/outputs,
+lifecycle, and persistence/runtime boundaries where specified. If the Work
+Order names none, say "No new load-bearing types or APIs are specified for this
+phase" instead of manufacturing entries.]
+
+### Files and verification
+[Name the files or modules that will change, the acceptance gate, and meaningful
+build/test/lint checks.]
+```
+
+Then ask exactly one authorization question and wait:
+
+`Start Phase N? Reply \`proceed\` to run only this phase, \`auto next N phases\`,
+\`auto through phase X\`, or \`stop\`.`
+
+- `proceed` or `approved`: keep `AUTO_WINDOW = none`; append any
+  trailing text to `${SESSION_DIR}/implementation_prompt.md` as current-phase
+  free-text instructions; announce the dispatch and continue to <SelectTask/>.
+- `auto next N phases`: require positive N, set `AUTO_WINDOW = next N`, announce
+  the inclusive phase range when it can be determined, and dispatch the current
+  phase. The current phase counts as one.
+- `auto through phase X`: require X to be the current or a later todo phase, set
+  `AUTO_WINDOW = through X`, announce the inclusive range, and dispatch the
+  current phase.
+- `stop`: emit <RunSummary/> with `user stopped before phase N` and end.
+- `continue`: this control is reserved for <VerbosePostPhaseGate/> and does not
+  authorize implementation; preserve this gate and ask for `proceed`.
+- A question or discussion without an explicit authorization control does not
+  authorize the phase. Answer it, preserve the gate, and ask again.
+</VerbosePrePhaseGate>
 
 ---
 
@@ -349,7 +494,7 @@ reviewer flagged it or its review is consistent with it, and the main agent's
 own review confirms it), the main agent applies the fixes directly — do NOT ask the user, do NOT
 dispatch a fix pass to the delegate agent. Then tell the user in one or two sentences exactly
 what was changed and why it qualified (doc-only / trivial). Skip the choice
-menu and continue to <RunPhaseReview/>.
+menu and continue to <RunApplicationSmokeTest/>.
 
 If even one remaining issue is substantial, or the reviews disagree, the
 exception does not apply — everything routes through the normal choice menu
@@ -361,7 +506,7 @@ without asking:
 
    **Defer first** — if an issue is really a decision that affects only later
    phases and the current phase's acceptance gate passes without it, apply the
-   blocking-vs-deferrable rule (see Loop mode): record it as a
+   blocking-vs-deferrable rule (see Multi-phase modes): record it as a
    `**Pending decision:**` block on the affected phase, tell the user in one
    line, and drop it from this phase's issue list.
 
@@ -412,20 +557,66 @@ Your choice:
 
    - **1:** An explicit user choice overrides the cap — increment ${FIX_PASS}
      and dispatch as in the auto fix pass above.
-   - **2:** Continue to <RunPhaseReview/>.
+   - **2:** Continue to <RunApplicationSmokeTest/>.
    - **3:** Discuss; afterwards re-offer the options.
 
-If there are no issues (or nits only), state that and continue to <RunPhaseReview/>.
+If there are no issues (or nits only), state that and continue to
+<RunApplicationSmokeTest/>.
 
 **RULE:** The main agent does not write or edit implementation code in this command unless the user explicitly says so. All fixes route to the delegate agent by default. Sole exception: the direct-fix exception above (doc-only or trivial post-review fixes both reviews agree on).
 </Synthesize>
 
 ---
 
+<RunApplicationSmokeTest>
+**Required after every phase, after review fixes and before phase review or a
+checkpoint.**
+
+**Goal:** Demonstrate that the repository's runnable product still starts and
+that the runtime behavior added or changed by the phase works without a panic,
+fatal error, or immediate shutdown.
+
+1. Determine the runnable target and command from, in order: the Delegation
+   Context's **Run** or **Smoke** entry, the phase Acceptance gate, repository
+   instructions, and the relevant package manifest. This narrow inspection is
+   required even on the delegate-ready fast path. Do not treat a successful
+   build, test binary, static example build, or delegate claim as an application
+   smoke test.
+2. Launch the real application or executable directly from ${WORKING_DIR} with
+   backtraces and useful runtime logging enabled. Keep the process attached and
+   capture its output. For a repository with a primary application, run that
+   application after every phase, including library-only phases. If the
+   repository genuinely has no runnable product, run the closest executable or
+   example that integrates the changed code and record why it is the applicable
+   target.
+3. Exercise the runtime path added or changed by the phase. Merely reaching the
+   first frame is sufficient only when the phase has no changed runtime behavior
+   to invoke. For GUI, input, hardware, networking, persistence, or other
+   interactive work, perform the relevant action and continue the application
+   long enough to observe its result. Automate the action when safe. If the
+   environment cannot perform a required real interaction, keep the bounded
+   smoke run attached, ask the user to perform that exact action, and wait. Do
+   not report a pass with an unexercised runtime path.
+4. Close the application cleanly after the exercised behavior remains stable.
+   Set ${APPLICATION_SMOKE_RESULT} to a concise record of the command, exercised
+   behavior, and observed result.
+5. A panic, fatal log, unexpected exit, or incorrect exercised behavior is a
+   blocker for the current phase. Capture the backtrace and relevant logs, route
+   the confirmed issue through the same automatic delegate fix logic in
+   <Synthesize/>, then rerun <DualReview/>, <Synthesize/>, and this smoke test.
+   Never run <RunPhaseReview/>, <CheckpointCommit/>, or a verbose completion
+   report until the smoke test passes.
+6. If no applicable executable can be found or a required interaction cannot be
+   performed by either the main agent or the user, STOP with the phase
+   incomplete. Environment limits are not a successful application smoke test.
+</RunApplicationSmokeTest>
+
+---
+
 <RunPhaseReview>
 **Only when the work came from a phased plan doc.** A phase review is mandatory — do not ask, do not offer to skip.
 
-Tell the user in one line: `Phased plan — running /plan:phase_review to update <plan doc> (retrospective + remaining-phase re-evaluation).` Then invoke the `plan:phase_review` skill immediately — **in loop mode pass `auto`**, so user decisions are deferred into the affected Work Orders as `**Pending decision:**` blocks instead of asked inline; the loop stops for them at that phase's pre-dispatch check. When writing the retrospective, include relevant facts from ${AGENT_REVIEW} and the fix passes (e.g. what the blind reviewer caught, what deviated from spec).
+Tell the user in one line: `Phased plan — running /plan:phase_review to update <plan doc> (retrospective + remaining-phase re-evaluation).` Then invoke the `plan:phase_review` skill immediately — **in loop or verbose mode pass `auto`**, so user decisions are deferred into the affected Work Orders as `**Pending decision:**` blocks instead of asked inline; either multi-phase mode stops for them at that phase's pre-dispatch check. When writing the retrospective, include relevant facts from ${AGENT_REVIEW} and the fix passes (e.g. what the blind reviewer caught, what deviated from spec).
 
 If the work was not from a phased plan, skip this step silently and end.
 </RunPhaseReview>
@@ -433,11 +624,15 @@ If the work was not from a phased plan, skip this step silently and end.
 ---
 
 <CheckpointCommit>
-**Loop mode only** — `single` runs end after <RunPhaseReview/> without committing.
+**Loop and verbose modes only** — `single` runs end after <RunPhaseReview/>
+without committing.
 
-1. Run `git status --short` in ${WORKING_DIR} and confirm the changes are this
+1. Confirm ${APPLICATION_SMOKE_RESULT} records a passing live application run
+   that exercised the current phase's changed runtime path. If it is `not_run`,
+   incomplete, or failed, STOP; do not commit.
+2. Run `git status --short` in ${WORKING_DIR} and confirm the changes are this
    phase's implementation plus the plan doc. Anything unexpected → STOP and ask.
-2. Stage everything and commit with this message shape:
+3. Stage everything and commit with this message shape:
 
    ```
    checkpoint(<plan-slug>): phase N — <phase title>
@@ -447,29 +642,116 @@ If the work was not from a phased plan, skip this step silently and end.
    Claude-Session: <session url>
    ```
 
-3. Edit the phase's status line in the plan doc to ``status: done (`<short hash>`)``,
+4. Edit the phase's status line in the plan doc to ``status: done (`<short hash>`)``,
    then `git add <plan doc> && git commit --amend --no-edit`.
-4. Report one line: `Checkpoint <short hash> — phase N: <title>.`
+5. Report one line: `Checkpoint <short hash> — phase N: <title>.`
 
 Never push. Never commit anything outside this step.
 </CheckpointCommit>
 
 ---
 
-<NextPhase>
-**Loop mode only.**
+<VerbosePostPhaseReport>
+**Verbose mode only, after every completed phase, including phases inside a
+bounded-auto window.**
 
-1. Find the next `todo` phase in the plan. None left → <RunSummary/> and end.
-2. Reset ${FIX_PASS} = 0 and ${IMPLEMENTATION_TASK} = implementation.
-3. Announce in one line: `Continuing to phase N — <title>.`
-4. Loop back to <ComposeWorkOrder/> (STEP 2). Its pre-dispatch check stops the
-   loop if the next phase carries an unresolved `**Pending decision:**` block.
+**Goal:** Output only what the reviewed phase actually delivered. Do not include
+the next phase's purpose, planned work, types, files, verification, or any other
+pre-phase briefing content.
+
+Build this summary from the phase Work Order, the reviewed diff captured in
+<DualReview/>, ${IMPL_SUMMARY}, accepted fixes, the phase retrospective, and the
+checkpoint. The diff and review are authoritative when an implementation detail
+differs from the original plan. Do not merely repeat the Work Order or the
+delegate's claims.
+
+```
+## Phase N complete — <phase title>
+
+### Why this phase exists
+[The point of the phase in 2-4 sentences: what capability or foundation it adds,
+what later work depends on it, and what remains deliberately outside it.]
+
+### What now works
+[A concise behavior-focused summary of the reviewed implementation.]
+
+### Important types and APIs
+| Type / trait / API | Role | How it works with the rest of the system |
+| --- | --- | --- |
+[Only load-bearing new or materially changed types, traits, resources, enums,
+and public methods. Explain ownership, inputs/outputs, important lifecycle, and
+persistence/runtime boundaries where relevant. If none were introduced, say
+"No new load-bearing types in this phase" instead of manufacturing entries.]
+
+### Verification and review
+[Acceptance gate result, meaningful tests/lint, review outcome, fixes, and the
+mandatory live application smoke command, exercised behavior, and result from
+${APPLICATION_SMOKE_RESULT}.]
+
+**Checkpoint:** `<short hash>`
+
+```
+
+Do not include the next phase's briefing or ask whether to start it in this
+report. <VerbosePostPhaseGate/> separately waits for `continue` before the next
+briefing when no bounded-auto window is active.
+</VerbosePostPhaseReport>
+
+---
+
+<VerbosePostPhaseGate>
+**Verbose mode only, after <VerbosePostPhaseReport/>.**
+
+If no `todo` phase remains, skip this gate and let <NextPhase/> finish with
+<RunSummary/>. If a bounded-auto window is active, skip this gate and let
+<NextPhase/> continue or end the window according to its existing rules.
+
+Otherwise, show exactly this control line after the completed-phase summary and
+wait:
+
+`Reply \`continue\` when you are ready to review the next phase's pre-phase briefing, or \`stop\` to end the run.`
+
+- `continue` — advance to <NextPhase/>. This authorizes only composing and
+  displaying the next phase's <VerbosePrePhaseGate/>; it does not authorize a
+  delegate dispatch, implementation, review, fix, phase review, or checkpoint.
+- `stop` — emit <RunSummary/> with `user stopped after phase N` and end without
+  composing the next phase's briefing.
+- `proceed`, `approved`, a question, or discussion without `continue` does not
+  advance. Answer any discussion using only the completed phase's report and
+  preserve this gate.
+</VerbosePostPhaseGate>
+
+---
+
+<NextPhase>
+**Loop and verbose modes only.**
+
+1. Find the next `todo` phase in the plan. If none remains, run <RunSummary/>
+   and end. The final verbose phase already received <VerbosePostPhaseReport/>.
+2. Reset ${FIX_PASS} = 0, ${IMPLEMENTATION_TASK} = implementation, and
+   ${APPLICATION_SMOKE_RESULT} = not_run.
+3. If MODE = loop, announce `Continuing to phase N — <title>.` and loop to
+   <ComposeWorkOrder/> (STEP 2).
+4. If MODE = verbose and `AUTO_WINDOW = none`, announce
+   `Preparing the Phase N briefing — <title>.` and loop to STEP 2.
+   <VerbosePrePhaseGate/> waits before dispatch.
+5. If MODE = verbose and `AUTO_WINDOW = next N`, decrement N for the phase just
+   completed. If N is now zero, clear the window, announce the next phase's
+   briefing, and loop to STEP 2. Otherwise announce the next phase and loop to
+   STEP 2; STEP 3 skips the gate while the window remains active.
+6. If MODE = verbose and `AUTO_WINDOW = through X`, compare the phase just
+   completed with X. If it is X, clear the window, announce the next phase's
+   briefing, and loop to STEP 2. Otherwise announce the next phase and loop to
+   STEP 2; STEP 3 skips the gate while the window remains active.
+
+Every path back to STEP 2 still runs the pending-decision pre-dispatch check.
 </NextPhase>
 
 ---
 
 <RunSummary>
-Emitted whenever the loop ends — plan exhausted, blocking stop, or error.
+Emitted whenever a multi-phase run ends — plan exhausted, verbose user stop,
+blocking stop, or error.
 
 ```
 ## Run Summary
@@ -478,7 +760,8 @@ Emitted whenever the loop ends — plan exhausted, blocking stop, or error.
 | --- | --- | --- | --- |
 
 **Deferred decisions still open:** [one line each, naming the phase that owns it — or "none"]
-**Why the run stopped:** [plan complete / pending decision on phase N / fix-pass cap on phase N / delegate error]
+**Why the run stopped:** [plan complete / user stopped before phase N / pending
+decision on phase N / fix-pass cap on phase N / delegate error]
 ```
 
 Same translation rules as <Synthesize/>: no reviewer vocabulary, no bare codes —
@@ -489,7 +772,7 @@ every line must stand on its own for a reader who has not seen the plan.
 
 ## Rules
 
-- ${WORKING_DIR} is whatever the current project directory is — often a worktree checkout. Never create a worktree or switch branches. The only commits are <CheckpointCommit/> checkpoints in loop mode — one per completed phase, never a push.
+- ${WORKING_DIR} is whatever the current project directory is — often a worktree checkout. Never create a worktree or switch branches. The only commits are <CheckpointCommit/> checkpoints in loop or verbose mode — one per completed phase, never a push.
 - All delegate-launching scripts run with `dangerouslyDisableSandbox: true` and `run_in_background: true`.
 - The **Background wait invariant** is mandatory. No active delegate terminal may outlive the primary-agent turn that launched it.
 - The delegate reviewer is always a fresh session and always blind to the implementer's summary.
@@ -497,5 +780,15 @@ every line must stand on its own for a reader who has not seen the plan.
 - Select `escalation` from the actual Work Order or review outcome, never keyword matching.
 - The main agent orchestrates and reviews; the delegate agent codes. The main agent touches implementation code only on explicit user instruction — except post-review doc-only or trivial fixes that both reviews agree on (see the direct-fix exception in <Synthesize>), which the main agent applies itself and reports.
 - Max 2 delegate fix passes per phase before stopping for the user; an explicit user choice of another pass overrides the cap.
-- Loop mode stops only for: an unresolved `**Pending decision:**` on the phase being dispatched, a fix that needs a design decision the plan does not answer, reviews conflicting on intended behavior, the fix-pass cap with blockers remaining, or a delegate/environment error. Everything else auto-routes or defers.
-- Work orders that name the `clippy` skill as the lint gate must instruct the delegate agent to run it with `auto-proceed`; the main agent likewise passes `auto-proceed` when it runs the `clippy` skill inside the loop.
+- Auto/loop mode stops only for: an unresolved `**Pending decision:**` on the phase being dispatched, a fix that needs a design decision the plan does not answer, reviews conflicting on intended behavior, the fix-pass cap with blockers remaining, or a delegate/environment error. Everything else auto-routes or defers.
+- Verbose mode has all of those stops plus a mandatory <VerbosePrePhaseGate/>
+  before every phase outside an active bounded-auto window, a
+  <VerbosePostPhaseReport/> after every completed phase, and a separate
+  <VerbosePostPhaseGate/> that waits for `continue` before showing the next
+  briefing. A successful phase and the post-phase `continue` never imply
+  authorization for the next implementation.
+- Work orders that name the `clippy` skill as the lint gate must instruct the delegate agent to run it with `auto-proceed`; the main agent likewise passes `auto-proceed` when it runs the `clippy` skill inside either multi-phase mode.
+- Every phase must pass <RunApplicationSmokeTest/> before phase review,
+  checkpoint, or completion reporting. The main agent must run the actual
+  product and exercise the phase's changed runtime path; builds, automated
+  tests, and an untested startup screen do not satisfy this gate.

@@ -176,26 +176,6 @@ compile_target_tests() {
   esac
 }
 
-run_configured_target_autofixes() {
-  local targets_file=".cargo/validate-targets"
-  if [ ! -f "$targets_file" ]; then
-    return 0
-  fi
-
-  local target
-  while IFS= read -r target || [ -n "$target" ]; do
-    target="$(trim_target_line "$target")"
-    if [ -z "$target" ]; then
-      continue
-    fi
-    if skip_unsupported_cross_target "$target"; then
-      continue
-    fi
-    run_autofix_step "clippy autofix ${target}" run_target_clippy "$target" \
-      --fix --allow-dirty --allow-staged --jobs 1 -- --cap-lints warn
-  done < "$targets_file"
-}
-
 run_configured_target_checks() {
   local targets_file=".cargo/validate-targets"
   if [ ! -f "$targets_file" ]; then
@@ -221,13 +201,6 @@ if [ "$IS_SELF_MEND" -eq 1 ]; then
 else
   run_autofix_step "cargo-mend autofix" "$LINT_CMD" mend --fix
 fi
-
-# Cap lint severity during fix passes so clippy can apply every available
-# machine-applicable suggestion. Strict checks below reject anything remaining.
-run_autofix_step "clippy autofix" cargo clippy --fix --allow-dirty --allow-staged \
-  --jobs 1 --workspace --all-features --tests -- --cap-lints warn
-
-run_configured_target_autofixes
 
 run_autofix_step "rustfmt" "$LINT_CMD" fmt
 

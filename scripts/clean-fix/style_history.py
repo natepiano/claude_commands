@@ -427,7 +427,7 @@ def workspace_members() -> dict[str, WorkspaceMember]:
     A member line is any ``[projects]`` entry containing a ``/`` — the part
     before the first slash is the workspace directory, the rest is the member
     subpath. The history key, package name, and ``_style_fix`` dir name all come
-    from the entry's last path segment (e.g. ``bevy_diegetic``); the workspace
+    from the entry's last path segment (e.g. ``hana_diegetic``); the workspace
     dir and subpath come from the checkout, which an ``[active_checkout]``
     redirect may point at a worktree.
     """

@@ -761,23 +761,18 @@ codex has equivalent coverage via the \`mcp-language-server\` MCP server. If nei
 is reachable, fall back to ripgrep but expand the scope (search the whole crate, not
 just the cited file) and document the limitation in the Fix Summary.
 
-**Do NOT delete or rewrite existing documentation as a side effect of any fix.**
-Each recommended pattern in a finding is a structural code change (split a module,
-bundle parameters, rename a binding, switch to a \`From\` impl). None of those
-patterns require touching comments or doc strings. Specifically:
+**Documentation edits**
 
-- **Preserve** all \`///\` doc comments on items, fields, and uniform/\`ShaderType\`
-  struct fields — these document the GPU contract or public API and live nowhere else.
-- **Preserve** inline \`//\` comments that explain coordinate-space conversions,
-  shader semantics, or other non-obvious WHYs.
-- **Update** only the comments your edit makes literally inaccurate (e.g. a
-  parameter name you just renamed). Update; do not delete.
-- The "default to no comments" guidance in the global instructions applies to
-  *writing new code*. It does NOT authorize pruning existing documentation.
-
-If you believe a comment is genuinely stale (describes code that no longer
-exists), leave it and note it in the Fix Summary as a comment-only follow-up.
-The user reviews comment changes during \`/style_fix_review\`.
+- If a finding's governing style rule or Recommended pattern directly requires
+  deleting or rewriting comments or doc strings, apply those edits. They are the
+  finding itself, not a side effect. Edit every cited and same-rule location while
+  retaining factual API, GPU-contract, and implementation information. Delete a
+  comment only when the Recommended pattern says it merely restates the code.
+- For every other finding, do NOT delete or rewrite existing documentation as a
+  side effect. Preserve \`///\` API and GPU-contract documentation and explanatory
+  \`//\` comments. Update only comments made literally inaccurate by the code edit.
+- Do not mark a comment-focused finding Partially applied or Skipped merely because
+  its required fix edits existing documentation.
 
 Step 4: Run cargo mend through the shared lint wrapper and fix issues
 Run: lint mend --manifest-path $worktree_dir/Cargo.toml
@@ -983,12 +978,12 @@ For each numbered finding that is NOT inside REMOVED-BY-REVIEW markers, in order
 2. Re-run the finding's post-fix search (the **Post-fix search** or **Search** command, or an equivalent project-wide search derived from **Surface searched**) against the current worktree.
 3. Decide whether the Fix Summary's claim is actually TRUE:
    - **Applied / 0 remaining**: confirm the search really returns 0 matches AND the diff implements the recommended pattern at every listed location. If any matching site remains, the fix is INCOMPLETE — apply the missing edits now. Before renaming a symbol or changing a public signature, use LSP \`findReferences\` to enumerate call sites; ripgrep misses references through aliases, re-exports, and generic dispatch.
-   - **Partially applied / Skipped**: confirm the stated reason is legitimate (file gone, pattern absent, non-negotiable conflict). If the work was actually doable and the reason is wrong, complete it now.
+   - **Partially applied / Skipped**: confirm the stated reason is legitimate (file gone, pattern absent, non-negotiable conflict). Comment preservation is not a legitimate skip reason when the governing rule or Recommended pattern directly requires comment edits. If the work was actually doable and the reason is wrong, complete it now.
    - **Proposed** (guideline \`mode: propose\`): confirm NO code was changed for it — these are for the human to decide. If the fix agent applied code for a propose-mode finding, that is a mistake: revert those edits.
 4. Confirm no non-removed finding was silently dropped (each has a Fix Summary entry).
 5. Confirm the diff introduced no NEW violation of any [non-negotiable] rule; fix any it introduced.
 
-You ARE authorized to edit code in the worktree to correct incomplete, incorrect, or non-negotiable-violating fixes. Do NOT add fixes for unrelated rules the original findings did not cover — that is the next /style_eval's job, not this pass. Preserve all existing \`///\` doc comments and explanatory \`//\` comments.
+You ARE authorized to edit code in the worktree to correct incomplete, incorrect, or non-negotiable-violating fixes. Do NOT add fixes for unrelated rules the original findings did not cover — that is the next /style_eval's job, not this pass. For a comment-focused finding, apply the required comment edits while retaining factual API, GPU-contract, and implementation information. For every other finding, preserve existing \`///\` documentation and explanatory \`//\` comments unless the code edit makes them inaccurate.
 
 Step 5: Re-verify the build (only if you changed any code in Step 4)
 - Run: lint clippy --manifest-path $worktree_dir/Cargo.toml
