@@ -30,8 +30,6 @@ VALUES = {
     "alignment": "⭐⭐⭐⭐",
     "impact": "⭐⭐⭐",
     "urgency": "⭐⭐",
-    "leverage": "⭐⭐⭐",
-    "confidence": "⭐⭐",
     "effort": "⭐⭐⭐",
 }
 
@@ -186,8 +184,8 @@ class ApplyRatingsTests(unittest.TestCase):
             "impact: ⭐⭐⭐",
             'impact:\n  - "⭐⭐⭐"',
         ).replace(
-            "leverage: ⭐⭐⭐",
-            'leverage:\n- "⭐⭐⭐"',
+            "urgency: ⭐⭐",
+            'urgency:\n- "⭐⭐"',
         ).replace(
             "---\n# Example",
             'effort: "⭐"\n---\n# Example',
@@ -199,13 +197,13 @@ class ApplyRatingsTests(unittest.TestCase):
 
         updated = path.read_text(encoding="utf-8")
         self.assertEqual(updated.count("impact:"), 1)
-        self.assertEqual(updated.count("leverage:"), 1)
+        self.assertEqual(updated.count("urgency:"), 1)
         self.assertEqual(updated.count("effort:"), 1)
         self.assertIn("impact: ⭐⭐⭐", updated)
-        self.assertIn("leverage: ⭐⭐⭐", updated)
+        self.assertIn("urgency: ⭐⭐", updated)
         self.assertIn("effort: ⭐⭐⭐", updated)
         self.assertNotIn('  - "⭐⭐⭐"', updated)
-        self.assertNotIn('- "⭐⭐⭐"', updated)
+        self.assertNotIn('- "⭐⭐"', updated)
         self.assertTrue(updated.endswith("# Example\n\nEvidence.\n"))
 
     def test_source_evidence_change_rejects_batch(self) -> None:

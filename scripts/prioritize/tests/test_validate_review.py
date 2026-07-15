@@ -34,8 +34,6 @@ RUBRIC: dict[str, str] = {
     "alignment": "⭐⭐⭐⭐",
     "impact": "⭐⭐⭐",
     "urgency": "⭐⭐",
-    "leverage": "⭐⭐⭐",
-    "confidence": "⭐⭐",
     "effort": "⭐⭐⭐",
 }
 
@@ -301,7 +299,7 @@ class ValidateReviewTests(unittest.TestCase):
 
         with self.assertRaisesRegex(
             validate_review.ValidationError,
-            "must propose all seven values",
+            "must propose all five values",
         ):
             _ = validate_review.validate(
                 "reviewer", manifest_path, unchanged_path, self.fixture.scope

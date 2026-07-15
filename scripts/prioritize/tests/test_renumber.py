@@ -37,8 +37,6 @@ DEFAULT_VALUES = {
     "alignment": "⭐⭐",
     "impact": "⭐⭐⭐⭐",
     "urgency": "⭐",
-    "leverage": "⭐⭐⭐",
-    "confidence": "⭐⭐",
     "effort": "⭐⭐⭐",
 }
 
@@ -104,15 +102,13 @@ class RenumberTests(unittest.TestCase):
             "alignment": 2,
             "impact": 4,
             "urgency": 1,
-            "leverage": 3,
-            "confidence": 2,
             "effort": 3,
         }
 
-        self.assertEqual(renumber.calculate_score(goal, values), 18)
+        self.assertEqual(renumber.calculate_score(goal, values), 15)
 
         values["alignment"] = 1
-        self.assertEqual(renumber.calculate_score(goal, values), 14)
+        self.assertEqual(renumber.calculate_score(goal, values), 11)
 
     def test_goal_bonus_tracks_the_ordered_goal_count(self) -> None:
         self.fixture.goals.write_text(
@@ -175,7 +171,7 @@ class RenumberTests(unittest.TestCase):
         renumber.apply_plan(plan)
 
         content = path.read_text(encoding="utf-8")
-        self.assertIn("backlog_score: 18\n", content)
+        self.assertIn("backlog_score: 15\n", content)
         self.assertIn("backlog_rank: 1\n", content)
         self.assertNotIn("  - 999", content)
         self.assertNotIn("- 77", content)
@@ -183,7 +179,7 @@ class RenumberTests(unittest.TestCase):
 
     def test_invalid_open_removes_generated_block_values_completely(self) -> None:
         values = dict(DEFAULT_VALUES)
-        del values["confidence"]
+        del values["effort"]
         path = self.fixture.add(
             "invalid-block-generated.md",
             issue_text(
@@ -234,7 +230,7 @@ class RenumberTests(unittest.TestCase):
         plan = renumber.build_plan(self.fixture.scope)
         renumber.apply_plan(plan)
 
-        expected = original.replace("backlog_score: 999", "backlog_score: 18").replace(
+        expected = original.replace("backlog_score: 999", "backlog_score: 15").replace(
             "backlog_rank: 999", "backlog_rank: 1"
         )
         self.assertEqual(path.read_bytes(), expected.encode("utf-8"))
@@ -292,7 +288,7 @@ class RenumberTests(unittest.TestCase):
 
     def test_missing_issue_does_not_block_valid_ranking(self) -> None:
         missing_values = dict(DEFAULT_VALUES)
-        del missing_values["confidence"]
+        del missing_values["effort"]
         missing = self.fixture.add(
             "missing.md", issue_text(values=missing_values, generated=(70, 9))
         )
@@ -304,7 +300,7 @@ class RenumberTests(unittest.TestCase):
         self.assertEqual(plan.valid_open[0].source.path, valid)
         self.assertEqual(plan.valid_open[0].assigned_rank, 1)
         self.assertEqual(len(plan.needs_prioritization), 1)
-        self.assertIn("missing confidence", plan.needs_prioritization[0].problems)
+        self.assertIn("missing effort", plan.needs_prioritization[0].problems)
 
         renumber.apply_plan(plan)
         self.assertIn("backlog_rank: 1", valid.read_text(encoding="utf-8"))
@@ -326,8 +322,8 @@ class RenumberTests(unittest.TestCase):
 
     def test_ranks_are_dense_and_ties_preserve_unique_existing_order(self) -> None:
         # Same score, with existing order intentionally opposite path order.
-        zulu = self.fixture.add("zulu.md", issue_text(generated=(18, 2)))
-        alpha = self.fixture.add("alpha.md", issue_text(generated=(18, 7)))
+        zulu = self.fixture.add("zulu.md", issue_text(generated=(15, 2)))
+        alpha = self.fixture.add("alpha.md", issue_text(generated=(15, 7)))
 
         lower_values = dict(DEFAULT_VALUES)
         lower_values["impact"] = "⭐"
@@ -391,7 +387,7 @@ class RenumberTests(unittest.TestCase):
         self.assertEqual(second.read_bytes(), originals[second])
 
     def test_apply_detects_concurrent_change_to_unwritten_issue(self) -> None:
-        stable = self.fixture.add("alpha.md", issue_text(generated=(18, 1)))
+        stable = self.fixture.add("alpha.md", issue_text(generated=(15, 1)))
         changed = self.fixture.add("zulu.md", issue_text())
         changed_original = changed.read_bytes()
         stable_original = stable.read_bytes()

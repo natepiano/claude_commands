@@ -60,15 +60,15 @@ Launch the complete wave before waiting. Join through the host's supported compl
 
 - Run `/usr/bin/python3 /Users/natemccoy/.claude/scripts/prioritize/review_manifest.py --session-dir <session> --shards 4` to enumerate every `status: open` issue, capture a review hash that excludes derived score/rank fields plus a hash of the governing goals note, and create up to four deterministically balanced, nonempty JSONL shards. Verify that the union of shard paths equals the open-issue inventory exactly once.
 - Launch one `prioritize.reviewer` agent per emitted shard in one parallel read-only wave. Every prompt must include the absolute path to this command, the approved ordered goals, the complete rubric and scoring definitions, its shard manifest, and the response schema below.
-- Each manifest row's `linked_evidence` map is the authoritative resolved-link allowlist and binds every canonical note path to its discovery-time evidence hash. Reviewer evidence may cite only the reviewed issue itself, the canonical goals note, and those explicitly linked in-vault Markdown notes; every finding must cite the reviewed issue itself. `review_manifest.py` resolves Obsidian wikilinks/embeds and Markdown `.md` links, while unresolved, ambiguous, symlinked, non-Markdown, and outside-vault targets are excluded. Add allowed linked notes only when they materially support the judgment. Do not inspect sibling repositories, GitHub, or the internet. Sparse evidence lowers `confidence`; it never licenses invented facts.
+- Each manifest row's `linked_evidence` map is the authoritative resolved-link allowlist and binds every canonical note path to its discovery-time evidence hash. Reviewer evidence may cite only the reviewed issue itself, the canonical goals note, and those explicitly linked in-vault Markdown notes; every finding must cite the reviewed issue itself. `review_manifest.py` resolves Obsidian wikilinks/embeds and Markdown `.md` links, while unresolved, ambiguous, symlinked, non-Markdown, and outside-vault targets are excluded. Add allowed linked notes only when they materially support the judgment. Do not inspect sibling repositories, GitHub, or the internet. Sparse evidence requires conservative ratings; it never licenses invented facts.
 - Require one JSON object per assigned issue, in the same path order, with no Markdown wrapper:
 
 ```json
 {"path":"/absolute/issues/example.md","review_hash":"...","goals_hash":"...","verdict":"unchanged|proposed","current":{},"proposed":{},"evidence":[{"path":"/absolute/vault/note.md","detail":"short paraphrase"}],"reason":"short explanation"}
 ```
 
-- `proposed` must contain all seven judgment properties when the verdict is `proposed`. A missing or invalid current property requires `proposed`; otherwise use it only for a supported change. `unchanged` must still echo all current values so audit completeness can be checked.
-- Require explicit evidence for four- or five-star urgency and named downstream work for four- or five-star leverage. Use low confidence where support is weak. Never estimate elapsed time.
+- `proposed` must contain all five judgment properties when the verdict is `proposed`. A missing or invalid current property requires `proposed`; otherwise use it only for a supported change. `unchanged` must still echo all current values so audit completeness can be checked.
+- Require explicit evidence for four- or five-star urgency. Rate conservatively where support is weak. Never estimate elapsed time.
 - Run `/usr/bin/python3 /Users/natemccoy/.claude/scripts/prioritize/validate_review.py reviewer --manifest <shard> --findings <agent-output> --output <normalized-output>` for each shard. It must reject malformed JSONL, Markdown wrappers, missing/duplicate/reordered paths, changed source hashes, current-value drift, invalid domain values, missing evidence, and evidence outside the row allowlist; it also records stable hashes for every cited allowed note. Reject or rerun any shard that does not validate.
 - Regenerate the complete inventory in a fresh session subdirectory immediately after all reviewer outputs validate. Require its open path set, goals hash, and every discovery review hash to match the reviewed inventory before calibration; if membership or content changed, regenerate shards and re-review the changed audit rather than silently omitting it.
 
@@ -76,7 +76,7 @@ Launch the complete wave before waiting. Join through the host's supported compl
 
 After every emitted reviewer output validates, launch two `prioritize.calibrator` agents in one parallel read-only wave:
 
-1. Domain consistency — find scale drift and inconsistent values among comparable project/category issues, especially unsupported urgency, leverage, confidence, and effort outliers.
+1. Domain consistency — find scale drift and inconsistent values among comparable project/category issues, especially unsupported alignment, impact, urgency, and effort outliers.
 2. Global strategic consistency — compare goals and projects, check mutually exclusive goal choices, detect duplicated issue scope, and challenge ratings whose evidence does not support their relative strength.
 
 Give each calibrator this command, the approved goals, every emitted shard manifest and validated finding file, and the same JSONL amendment schema. Calibrator evidence may cite only the canonical goals note and issue paths present in the complete inventory; arbitrary linked supporting notes are not calibration evidence. Calibrators return only evidence-backed amendments; they do not rewrite the full inventory and do not write vault files. When a calibrator finds no amendments, it must return the single completion object `{"status":"complete","amendments":0}` instead of prose or a zero-byte file. Validate each output with `/usr/bin/python3 /Users/natemccoy/.claude/scripts/prioritize/validate_review.py calibrator --manifest <inventory> --findings <agent-output> --output <normalized-output>`; the validator requires that manifest to equal the complete live inventory and converts the explicit completion object to an empty normalized amendment set. Apply the same failure rule as the reviewer wave. Reconcile reviewer and calibrator output yourself against the source notes. Do not average values or use majority voting.
@@ -84,11 +84,11 @@ Give each calibrator this command, the approved goals, every emitted shard manif
 ### 5. Apply recommendations and show a spot check
 
 - Exclude every fully audited `unchanged` issue from the apply manifest. Reconcile every evidence-backed reviewer and calibrator amendment into one complete proposed judgment map per changed issue; do not average values or let an agent write the vault.
-- Write all reconciled proposals to one immutable JSONL apply manifest. Each line contains exactly the issue path, its discovery-time review and goals hashes, the normalized hashes of every cited evidence note including the reviewed issue itself, and the complete proposed judgment map: `{"path":"/absolute/issues/example.md","review_hash":"...","goals_hash":"...","evidence_hashes":{"/absolute/issues/example.md":"..."},"proposed":{"strategic_goal":"...","alignment":"...","impact":"...","urgency":"...","leverage":"...","confidence":"...","effort":"..."}}`.
-- Run `/usr/bin/python3 /Users/natemccoy/.claude/scripts/prioritize/apply_ratings.py <manifest>` first as a dry-run, then run the same command with `--apply` automatically. Invoking `/prioritize` authorizes these calibrated issue-rating updates; do not pause for per-issue or per-group approval. `apply_ratings.py` must revalidate every review, goals, and evidence hash, write only the seven judgment fields, use `renumber.py`'s calculation code before releasing the shared writer lock, and restore the previous files if either the judgment writes or automatic ranking fails.
+- Write all reconciled proposals to one immutable JSONL apply manifest. Each line contains exactly the issue path, its discovery-time review and goals hashes, the normalized hashes of every cited evidence note including the reviewed issue itself, and the complete proposed judgment map: `{"path":"/absolute/issues/example.md","review_hash":"...","goals_hash":"...","evidence_hashes":{"/absolute/issues/example.md":"..."},"proposed":{"strategic_goal":"...","alignment":"...","impact":"...","urgency":"...","effort":"..."}}`.
+- Run `/usr/bin/python3 /Users/natemccoy/.claude/scripts/prioritize/apply_ratings.py <manifest>` first as a dry-run, then run the same command with `--apply` automatically. Invoking `/prioritize` authorizes these calibrated issue-rating updates; do not pause for per-issue or per-group approval. `apply_ratings.py` must revalidate every review, goals, and evidence hash, write only the five judgment fields, use `renumber.py`'s calculation code before releasing the shared writer lock, and restore the previous files if either the judgment writes or automatic ranking fails.
 - Mark a proposed row `applied` only after the complete manifest succeeds. Record each row's post-apply review hash in the ledger. If any row fails validation or application, do not silently skip it: leave the session incomplete, identify the exact path and cause, and resume from fresh evidence rather than claiming a partial pass is complete.
 - After the write, regenerate the inventory and run `renumber.py` in dry-run mode. Derive `audited`, `ratings changed`, `valid ranked`, and `needs prioritization` counts from the current ledger and that fresh check; never maintain hand-edited counters.
-- Show one optional spot-check table after application. If ratings changed, show up to `spot_check_size` changed issues ordered by their resulting `backlog_rank`; if nothing changed, show the highest-ranked `spot_check_size` open issues. Include `Backlog rank`, `Issue`, `Goal`, `Alignment`, `Impact`, `Urgency`, `Leverage`, `Confidence`, and `Effort`, plus a compact reason for changed rows. Never use letter-only abbreviations for table headers. Beneath the table, show the complete legend once: every current goal name and definition from `prioritization goals.md`, followed by every value and definition for the six rating factors in this command. Render rating cells as their stored one-to-five-star strings.
+- Show one optional spot-check table after application. If ratings changed, show up to `spot_check_size` changed issues ordered by their resulting `backlog_rank`; if nothing changed, show the highest-ranked `spot_check_size` open issues. Include `Backlog rank`, `Issue`, `Goal`, `Alignment`, `Impact`, `Urgency`, and `Effort`, plus a compact reason for changed rows. Never use letter-only abbreviations for table headers. Beneath the table, show the complete legend once: every current goal name and definition from `prioritization goals.md`, followed by every value and definition for the four rating factors in this command. Render rating cells as their stored one-to-five-star strings.
 - Treat the spot check as inspection, not an approval gate. The full audit and application are complete even if the user does not respond. If the user identifies a disagreement, use the underlying rubric fields rather than manually editing `backlog_score` or `backlog_rank`: accept exact corrections or propose the smallest evidence-backed field correction, record it with current hashes, and apply it through `apply_ratings.py`. A direct correction in the user's next message is an authorized continuation even after the audit session has closed.
 - In user-facing progress reports, name the responsible local automation instead of saying "the system": `apply_ratings.py` saves the reviewed ratings and immediately uses `renumber.py`'s calculation code; `renumber.py` recalculates scores and positions; the background watcher reacts to every relevant edit regardless of whether it came from `/prioritize`, Obsidian, or another process. After `/prioritize` writes ratings, the watcher checks the same edits and makes no further changes when the positions are already current; after an edit elsewhere that did not update positions, it applies the needed calculation. Explain that apply failures restore the previous files. Say that automatic ranking was applied or verified. Never use wording such as "I reranked" that implies the primary agent manually chose or assigned ranks, and avoid implementation jargon such as "guarded writer" or "deterministic ranker" unless the user asks for technical detail.
 - If there are no proposals, report that the full backlog was audited and no judgment metadata changed; still show the configured spot check and verify automatic ranking.
@@ -118,7 +118,7 @@ Give each calibrator this command, the approved goals, every emitted shard manif
 - Strategic-goal additions, removals, renames, and reordering still require user approval before the goals note changes. Issue-rating recommendations do not; explicit user spot-check corrections override them and are applied through the same validated path.
 - `/prioritize` does not ask the user to review mechanically derived score ties. It may show `backlog_rank` as spot-check context, but no workflow writes a rank directly.
 - The automatic watcher owns mechanics after any relevant edit: parse current inputs, recompute `backlog_score`, and densely renumber `backlog_rank`.
-- Never let the watcher invent or revise `strategic_goal`, `alignment`, `impact`, `urgency`, `leverage`, `confidence`, or `effort`.
+- Never let the watcher invent or revise `strategic_goal`, `alignment`, `impact`, `urgency`, or `effort`.
 
 ### Deterministic renumbering
 
@@ -139,7 +139,7 @@ Give each calibrator this command, the approved goals, every emitted shard manif
 - Keep a lightweight watcher daemon alive through launchd and monitor every issue file plus `/Users/natemccoy/rust/hanadocs/prioritization goals.md` so new, modified, renamed, and deleted issues and goal-order changes trigger ranking. Do not depend on launchd `WatchPaths`, which can miss filesystem events.
 - Poll stable path/inode/size/mtime/ctime signatures at a sub-second interval and run the semantic snapshot/scorer only after a watched signature changes. Use a separate OS-released runner lock plus pending marker so overlapping save bursts coalesce safely; use `/tmp/hanadocs-prioritize/writer.lock` with another OS-released exclusive lock for actual vault writes. A crash must release either lock without stale-PID cleanup.
 - Do not use `git diff` as the change detector. Repository state is not the source of truth for live filesystem events.
-- Build a canonical semantic snapshot containing each issue path, eligibility fields, and ranking input fields: `status`, `strategic_goal`, `alignment`, `impact`, `urgency`, `leverage`, `confidence`, and `effort`.
+- Build a canonical semantic snapshot containing each issue path, eligibility fields, and ranking input fields: `status`, `strategic_goal`, `alignment`, `impact`, `urgency`, and `effort`.
 - Exclude generated `backlog_score` and `backlog_rank` from the input snapshot so the watcher's own renumbering writes cannot create a loop.
 - Compare the snapshot with the last successful snapshot in `/Users/natemccoy/Library/Caches/hanadocs-prioritize/`. When inputs are unchanged, still run a mechanical check: exit without writing only when generated score/rank state is canonical, and repair it when it has drifted.
 - When valid inputs or eligible membership changed, invoke `renumber.py --apply`, validate the result, then atomically replace the cached snapshot.
@@ -168,7 +168,7 @@ Give each calibrator this command, the approved goals, every emitted shard manif
 - Assign exactly one `strategic_goal` to every eligible issue; do not store multiple goals or a goal list.
 - Use `alignment` to record how strongly the issue advances its selected goal.
 - Record each rubric component as its own frontmatter property so Obsidian Bases can filter and sort it independently.
-- Store `alignment`, `impact`, `urgency`, `leverage`, `confidence`, and `effort` as separate YAML text scalars containing exactly one through five `⭐` characters. Accept semantically equivalent plain, single-quoted, and double-quoted YAML serialization because Obsidian may rewrite text properties with quotes.
+- Store `alignment`, `impact`, `urgency`, and `effort` as separate YAML text scalars containing exactly one through five `⭐` characters. Accept semantically equivalent plain, single-quoted, and double-quoted YAML serialization because Obsidian may rewrite text properties with quotes.
 - Parse and validate the star count for scoring. Treat a missing rubric property as unassessed; there is no zero-star assessed value.
 - Store the computed `backlog_score` and `backlog_rank` as unquoted numbers.
 - Use the existing `category` property for issue-type questions such as the highest-ranked bug, feature, business, or research issues; do not duplicate issue type in the rubric fields.
@@ -186,11 +186,11 @@ Give each calibrator this command, the approved goals, every emitted shard manif
 ### Score model
 
 - Compute the candidate backlog order with a weighted additive score.
-- Combine weighted goal alignment, a soft goal-order bonus, impact, urgency, leverage, a confidence adjustment, and a modest subtractive effort penalty.
+- Combine weighted goal alignment, a soft goal-order bonus, impact, urgency, and a modest subtractive effort penalty.
 - Never divide by `effort`; coarse effort estimates must not make tiny tasks dominate or make an `XL` strategic initiative disappear.
-- Parse `A`, `I`, `U`, `L`, `C`, and `E` as the star counts in `alignment`, `impact`, `urgency`, `leverage`, `confidence`, and `effort`.
+- Parse `A`, `I`, `U`, and `E` as the star counts in `alignment`, `impact`, `urgency`, and `effort`.
 - Parse each goal's 1-based numeric prefix as `goal_position`, require the goals note to use contiguous positions, and compute `goal_bonus = 2 * (goal_count - goal_position)`. The current four goals therefore produce bonuses `6`, `4`, `2`, and `0`.
-- Compute `backlog_score = (4 * (A - 1)) + (3 * (I - 1)) + (2 * (U - 1)) + (2 * (L - 1)) + (C - 3) - (E - 1) + goal_bonus`.
+- Compute `backlog_score = (4 * (A - 1)) + (3 * (I - 1)) + (2 * (U - 1)) - (E - 1) + goal_bonus`.
 - Keep these exact weights explicit and centralized in this command.
 - Parse the star strings, then write the resulting numeric `backlog_score` and `backlog_rank` together.
 - Do not require calculated Base fields for the canonical score or rank. Base formulas may be added later for exploratory views, but they are not a source of truth.
@@ -215,7 +215,7 @@ Assign every eligible issue its closest `strategic_goal`, even when alignment is
 - `⭐⭐⭐⭐` — major benefit across a core workflow or multiple audiences
 - `⭐⭐⭐⭐⭐` — transformative outcome for the product, organization, or ecosystem
 
-Measure the magnitude of the benefit if completed. Do not include urgency, leverage, confidence, or effort in `impact`.
+Measure the magnitude of the benefit if completed. Do not include urgency or effort in `impact`.
 
 #### `urgency`
 
@@ -226,26 +226,6 @@ Measure the magnitude of the benefit if completed. Do not include urgency, lever
 - `⭐⭐⭐⭐⭐` — immediate; serious current harm, blockage, or a hard cutoff demands action
 
 Measure cost of delay without estimating a duration. Require cited evidence for four- and five-star urgency; never invent a deadline, commitment, or closing opportunity window.
-
-#### `leverage`
-
-- `⭐` — standalone result with little downstream enablement
-- `⭐⭐` — reusable by a few related tasks or consumers
-- `⭐⭐⭐` — multiplies several meaningful efforts or repeated uses
-- `⭐⭐⭐⭐` — broadly unlocks major work across a project or several projects
-- `⭐⭐⭐⭐⭐` — removes a foundational bottleneck blocking many valuable outcomes
-
-Measure downstream enablement, not the issue's direct benefit. Require identifiable downstream work for four- and five-star leverage; never assume that something described as foundational will be reused. The prioritization workflow owns and maintains this value rather than requiring the user to populate it manually.
-
-#### `confidence`
-
-- `⭐` — a guess based on sparse evidence and major assumptions
-- `⭐⭐` — some evidence exists, but important uncertainty remains
-- `⭐⭐⭐` — credible evidence supports the judgment with manageable uncertainty
-- `⭐⭐⭐⭐` — strong direct evidence supports most material judgments
-- `⭐⭐⭐⭐⭐` — current direct evidence verifies the scope and expected outcome
-
-Measure evidentiary support for the proposed rubric values, not confidence that the issue will succeed. Use low values to expose uncertainty rather than hiding agent guesses.
 
 #### `effort`
 
@@ -261,9 +241,9 @@ Measure relative breadth and coordination, never elapsed time. More effort stars
 
 - Automatically apply the complete reconciled set of issue-rating recommendations after agent review and calibration; do not wait for per-issue approval.
 - After application and validation, show up to the invocation's `spot_check_size` as one compact table. Show changed issues first by resulting rank; when no values changed, show the highest-ranked current issues.
-- Show each issue as a row with `Backlog rank`, `Issue`, `Goal`, `Alignment`, `Impact`, `Urgency`, `Leverage`, `Confidence`, and `Effort` columns. Spell out every factor name; never use `A`, `I`, `U`, `L`, `C`, or `E` as a standalone presentation header.
+- Show each issue as a row with `Backlog rank`, `Issue`, `Goal`, `Alignment`, `Impact`, `Urgency`, and `Effort` columns. Spell out every factor name; never use `A`, `I`, `U`, or `E` as a standalone presentation header.
 - Render rating cells as their stored star strings; do not repeat full definitions in every cell.
-- Show the complete legend once with every spot-check group: the current goal names and definitions from `prioritization goals.md`, followed by all six factor scales and definitions from this command. Do not shorten the legend to the numeric prefixes or mnemonic labels alone.
+- Show the complete legend once with every spot-check group: the current goal names and definitions from `prioritization goals.md`, followed by all four factor scales and definitions from this command. Do not shorten the legend to the numeric prefixes or mnemonic labels alone.
 - Treat `backlog_rank` as read-only context. If the user disagrees with an ordering, inspect or correct the underlying goal and rubric values, then let `renumber.py` calculate score and position automatically.
 - Apply an explicit user correction immediately through `apply_ratings.py` when current hashes still match. If the user describes a disagreement without exact values, propose the smallest underlying correction and ask only for the choice needed to resolve it.
 - Never display real-time duration estimates or translate effort labels into durations.

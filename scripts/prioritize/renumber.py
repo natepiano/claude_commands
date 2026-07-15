@@ -40,8 +40,6 @@ RUBRIC_DOMAINS: dict[str, tuple[str, ...]] = {
         "alignment",
         "impact",
         "urgency",
-        "leverage",
-        "confidence",
         "effort",
     )
 }
@@ -373,8 +371,6 @@ def calculate_score(goal: Goal, values: dict[str, int]) -> int:
         (4 * (alignment - 1))
         + (3 * (values["impact"] - 1))
         + (2 * (values["urgency"] - 1))
-        + (2 * (values["leverage"] - 1))
-        + (values["confidence"] - 3)
         - (values["effort"] - 1)
         + goal.bonus
     )

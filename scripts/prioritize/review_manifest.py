@@ -30,8 +30,6 @@ RUBRIC_FIELDS = (
     "alignment",
     "impact",
     "urgency",
-    "leverage",
-    "confidence",
     "effort",
 )
 TOP_LEVEL_FIELD_RE = re.compile(
@@ -83,8 +81,6 @@ class CurrentRubric(TypedDict):
     alignment: str | None
     impact: str | None
     urgency: str | None
-    leverage: str | None
-    confidence: str | None
     effort: str | None
 
 
@@ -510,8 +506,6 @@ def _record(
         alignment=_optional_domain(note, "alignment", path),
         impact=_optional_domain(note, "impact", path),
         urgency=_optional_domain(note, "urgency", path),
-        leverage=_optional_domain(note, "leverage", path),
-        confidence=_optional_domain(note, "confidence", path),
         effort=_optional_domain(note, "effort", path),
     )
     body_bytes = len(note.body.encode("utf-8"))

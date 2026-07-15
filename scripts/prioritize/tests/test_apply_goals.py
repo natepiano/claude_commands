@@ -43,8 +43,6 @@ RUBRIC = {
     "alignment": "⭐⭐",
     "impact": "⭐⭐⭐⭐",
     "urgency": "⭐",
-    "leverage": "⭐⭐⭐",
-    "confidence": "⭐⭐",
     "effort": "⭐⭐⭐",
 }
 
@@ -167,7 +165,7 @@ class ApplyGoalsTests(unittest.TestCase):
         self.assertEqual(self.fixture.goals.read_text(encoding="utf-8"), UPDATED_GOALS)
         self.assertEqual(stat.S_IMODE(self.fixture.goals.stat().st_mode), 0o640)
         valid_content = valid.read_text(encoding="utf-8")
-        self.assertIn("backlog_score: 16", valid_content)
+        self.assertIn("backlog_score: 13", valid_content)
         self.assertIn("backlog_rank: 1", valid_content)
         invalidated_content = invalidated.read_text(encoding="utf-8")
         self.assertIn('strategic_goal: "3 - Seek Investors"', invalidated_content)
@@ -270,7 +268,7 @@ class ApplyGoalsTests(unittest.TestCase):
                 apply_goals.apply_manifest(manifest, self.fixture.runtime)
 
         self.assertEqual(self.fixture.goals.read_text(encoding="utf-8"), external)
-        self.assertIn("backlog_score: 18", issue.read_text(encoding="utf-8"))
+        self.assertIn("backlog_score: 15", issue.read_text(encoding="utf-8"))
 
 
 if __name__ == "__main__":

@@ -24,8 +24,6 @@ INPUT_FIELDS = (
     "alignment",
     "impact",
     "urgency",
-    "leverage",
-    "confidence",
     "effort",
 )
 

@@ -66,8 +66,6 @@ class ProposedRubric(TypedDict):
     alignment: str
     impact: str
     urgency: str
-    leverage: str
-    confidence: str
     effort: str
 
 
@@ -237,8 +235,6 @@ def _current_rubric(value: object, *, context: str) -> review_manifest.CurrentRu
         ),
         impact=_optional_string(mapping, "impact", context=context),
         urgency=_optional_string(mapping, "urgency", context=context),
-        leverage=_optional_string(mapping, "leverage", context=context),
-        confidence=_optional_string(mapping, "confidence", context=context),
         effort=_optional_string(mapping, "effort", context=context),
     )
 
@@ -284,8 +280,6 @@ def _proposed_rubric(
         alignment=cast(str, mapping["alignment"]),
         impact=cast(str, mapping["impact"]),
         urgency=cast(str, mapping["urgency"]),
-        leverage=cast(str, mapping["leverage"]),
-        confidence=cast(str, mapping["confidence"]),
         effort=cast(str, mapping["effort"]),
     )
 
@@ -457,7 +451,7 @@ def _finding(
             raise ValidationError(f"{context}.proposed must be empty for unchanged")
         if not _valid_current(current, manifest.goals):
             raise ValidationError(
-                f"{context} must propose all seven values because current is missing or invalid"
+                f"{context} must propose all five values because current is missing or invalid"
             )
         proposed: ProposedRubric | dict[str, object] = {}
     else:

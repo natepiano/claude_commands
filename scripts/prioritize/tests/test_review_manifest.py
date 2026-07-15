@@ -33,8 +33,6 @@ RUBRIC = {
     "alignment": "⭐⭐⭐⭐",
     "impact": "⭐⭐⭐",
     "urgency": "⭐⭐",
-    "leverage": "⭐⭐⭐",
-    "confidence": "⭐⭐",
     "effort": "⭐⭐⭐",
 }
 
