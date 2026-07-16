@@ -30,12 +30,12 @@ class SnapshotTests(unittest.TestCase):
                     "path": "issues/example.md",
                     "frontmatter": "valid",
                     "status": "open",
-                    "strategic_goal": "1 - Ship Hana",
-                    "impact": "9 - Canonical",
+                    "backlog_goal": "1 - Ship Hana",
+                    "backlog_impact": "9 - Canonical",
                 }
             ],
         }
-        canonical = {"impact": ("9 - Canonical",)}
+        canonical = {"backlog_impact": ("9 - Canonical",)}
 
         with mock.patch.object(snapshot.renumber, "RUBRIC_DOMAINS", canonical):
             errors = list(snapshot.completeness_errors(candidate))
@@ -48,7 +48,7 @@ class SnapshotTests(unittest.TestCase):
             issue = root / "issue.md"
             _ = issue.write_text(
                 "---\nstatus: open\n"
-                + 'strategic_goal: "1 - Ship [[hana|Hana]]"\n'
+                + 'backlog_goal: "1 - Ship [[hana|Hana]]"\n'
                 + "---\n",
                 encoding="utf-8",
             )
@@ -66,7 +66,7 @@ class SnapshotTests(unittest.TestCase):
         state = cast(object, raw_state)
         current_goals = cast(list[str], raw_goals)
         self.assertEqual(state, "valid")
-        self.assertEqual(values["strategic_goal"], "1 - Ship Hana")
+        self.assertEqual(values["backlog_goal"], "1 - Ship Hana")
         self.assertEqual(current_goals, ["1 - Ship Hana"])
 
 

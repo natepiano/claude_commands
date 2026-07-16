@@ -29,11 +29,11 @@ GOALS = """# prioritization goals
 """
 
 RUBRIC = {
-    "strategic_goal": "1 - Ship Hana",
-    "alignment": "⭐⭐⭐⭐",
-    "impact": "⭐⭐⭐",
-    "urgency": "⭐⭐",
-    "effort": "⭐⭐⭐",
+    "backlog_goal": "1 - Ship Hana",
+    "backlog_alignment": "⭐⭐⭐⭐",
+    "backlog_impact": "⭐⭐⭐",
+    "backlog_urgency": "⭐⭐",
+    "backlog_effort": "⭐⭐⭐",
 }
 
 
@@ -162,7 +162,7 @@ class ReviewManifestTests(unittest.TestCase):
         record = review_manifest.build_inventory(self.fixture.scope)[0]
 
         self.assertEqual(record["goals"][0], "1 - Ship Hana")
-        self.assertEqual(record["current"]["strategic_goal"], "1 - Ship Hana")
+        self.assertEqual(record["current"]["backlog_goal"], "1 - Ship Hana")
 
     def test_inventory_resolves_only_safe_explicit_markdown_links(self) -> None:
         notes = self.fixture.vault / "notes"
@@ -225,10 +225,10 @@ class ReviewManifestTests(unittest.TestCase):
 
     def test_yaml_string_domain_styles_are_recorded(self) -> None:
         plain = issue_text().replace(
-            'impact: "⭐⭐⭐"', "impact: ⭐⭐⭐"
+            'backlog_impact: "⭐⭐⭐"', "backlog_impact: ⭐⭐⭐"
         )
         single_quoted = issue_text().replace(
-            'impact: "⭐⭐⭐"', "impact: '⭐⭐⭐'"
+            'backlog_impact: "⭐⭐⭐"', "backlog_impact: '⭐⭐⭐'"
         )
         _ = self.fixture.add("plain.md", plain)
         _ = self.fixture.add("single-quoted.md", single_quoted)
@@ -238,24 +238,24 @@ class ReviewManifestTests(unittest.TestCase):
             for record in review_manifest.build_inventory(self.fixture.scope)
         }
 
-        self.assertEqual(records["plain.md"]["current"]["impact"], "⭐⭐⭐")
+        self.assertEqual(records["plain.md"]["current"]["backlog_impact"], "⭐⭐⭐")
         self.assertEqual(
-            records["single-quoted.md"]["current"]["impact"], "⭐⭐⭐"
+            records["single-quoted.md"]["current"]["backlog_impact"], "⭐⭐⭐"
         )
 
     def test_malformed_duplicate_and_list_domains_are_unassessed(self) -> None:
         cases = {
             "malformed.md": issue_text().replace(
-                'impact: "⭐⭐⭐"', 'impact: "⭐⭐⭐'
+                'backlog_impact: "⭐⭐⭐"', 'backlog_impact: "⭐⭐⭐'
             ),
-            "duplicate.md": issue_text(extra='impact: "⭐⭐⭐⭐"'),
+            "duplicate.md": issue_text(extra='backlog_impact: "⭐⭐⭐⭐"'),
             "list.md": issue_text().replace(
-                'impact: "⭐⭐⭐"',
-                'impact:\n  - "⭐⭐⭐"',
+                'backlog_impact: "⭐⭐⭐"',
+                'backlog_impact:\n  - "⭐⭐⭐"',
             ),
             "indentless.md": issue_text().replace(
-                'impact: "⭐⭐⭐"',
-                'impact:\n- "⭐⭐⭐"',
+                'backlog_impact: "⭐⭐⭐"',
+                'backlog_impact:\n- "⭐⭐⭐"',
             ),
         }
         for name, content in cases.items():
@@ -268,7 +268,7 @@ class ReviewManifestTests(unittest.TestCase):
 
         for name in cases:
             with self.subTest(name=name):
-                self.assertIsNone(records[name]["current"]["impact"])
+                self.assertIsNone(records[name]["current"]["backlog_impact"])
 
     def test_shards_are_deterministic_balanced_and_exact(self) -> None:
         for index, size in enumerate((10, 20, 40, 80, 160, 320, 640), start=1):

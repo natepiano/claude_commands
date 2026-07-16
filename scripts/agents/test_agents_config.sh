@@ -87,9 +87,11 @@ work=opus:max
 gpt-test=low,medium,high
 gpt-bare=
 gpt\bs=low
+collide=low
 
 [claude.agents]
 opus=low,medium,high,max
+collide=low
 EOF
 
 cat > "$TEST_DIR/list.conf" <<'EOF'
@@ -189,6 +191,63 @@ cmp "$before" "$AGENTS_CONFIG_FILE" || fail "row edit reversal was not byte-iden
 sed 's/^work=gpt-test:high    # alias: edit$/work=gpt\\bs:low    # alias: edit/' "$before" > "$expected"
 agents_set_row editable.work 'gpt\bs:low'
 cmp "$expected" "$AGENTS_CONFIG_FILE" || fail "row edit did not preserve a literal backslash in the agent name"
+
+write_fixture "$TEST_DIR/base.conf"
+before="$TEST_DIR/infer-before.conf"
+expected="$TEST_DIR/infer-expected.conf"
+cp "$AGENTS_CONFIG_FILE" "$before"
+
+# The agent names its own family: a claude agent edits the claude row even
+# though the function is assigned to codex, and reports the row as dormant.
+awk '/^\[/ { in_sec = ($0 == "[editable.claude]") }
+     in_sec && $0 == "work=opus:max" { print "work=opus:high"; next }
+     { print }' "$before" > "$expected"
+agents_set_row editable.work opus:high
+cmp "$expected" "$AGENTS_CONFIG_FILE" || fail "cross-family row edit did not edit exactly the claude row"
+[[ "$AGENT_ROW_FAMILY" == "claude" ]] || fail "cross-family row edit reported the wrong family"
+[[ "$AGENT_ROW_ACTIVE" == "no" ]] || fail "dormant row edit was not reported dormant"
+[[ "$AGENT_ROW_ACTIVE_FAMILY" == "codex" ]] || fail "dormant row edit reported the wrong active family"
+agents_resolve editable.work
+[[ "$AGENT_MODEL" == "gpt-test" && "$AGENT_EFFORT" == "high" ]] || fail "dormant row edit changed what the task resolves to"
+
+# Editing the active family's row reports it live.
+write_fixture "$TEST_DIR/base.conf"
+agents_set_row editable.work gpt-test:medium
+[[ "$AGENT_ROW_FAMILY" == "codex" ]] || fail "same-family row edit reported the wrong family"
+[[ "$AGENT_ROW_ACTIVE" == "yes" ]] || fail "active row edit was not reported live"
+agents_resolve editable.work
+[[ "$AGENT_EFFORT" == "medium" ]] || fail "active row edit did not change resolution"
+
+# An exact-task override decides liveness, not the function's assignment.
+write_fixture "$TEST_DIR/base.conf"
+agents_set_row alpha.claude_task opus:high
+[[ "$AGENT_ROW_FAMILY" == "claude" ]] || fail "override row edit wrote the wrong family"
+[[ "$AGENT_ROW_ACTIVE" == "yes" ]] || fail "exact-task override row was not reported live"
+
+write_fixture "$TEST_DIR/base.conf"
+before="$TEST_DIR/reject-before.conf"
+cp "$AGENTS_CONFIG_FILE" "$before"
+
+assert_fails "agent in two catalogs" agents_set_row editable.work collide:low
+cmp "$before" "$AGENTS_CONFIG_FILE" || fail "ambiguous agent changed the registry"
+stderr_out="$(agents_set_row editable.work collide:low 2>&1 >/dev/null || true)"
+[[ "$stderr_out" == *"more than one family"* ]] || fail "ambiguous agent did not fail as an ambiguity error"
+
+stderr_out="$(agents_set_row editable.work nosuch:high 2>&1 >/dev/null || true)"
+[[ "$stderr_out" == *"[codex.agents]"* && "$stderr_out" == *"[claude.agents]"* ]] \
+    || fail "unknown agent error did not list both catalogs"
+
+# A claude agent for a function that has no claude set names the real problem.
+assert_fails "inferred family has no set" agents_set_row bare.work opus:high
+cmp "$before" "$AGENTS_CONFIG_FILE" || fail "missing inferred-family set changed the registry"
+stderr_out="$(agents_set_row bare.work opus:high 2>&1 >/dev/null || true)"
+[[ "$stderr_out" == *"no [bare.claude]"* ]] || fail "missing inferred-family set did not name the section"
+
+function_list="$(agents_list_function editable)"
+printf '%s\n' "$function_list" | grep -q '^task=editable.work family=codex agent=gpt-test effort=high active=yes$' \
+    || fail "active codex row was not marked active"
+printf '%s\n' "$function_list" | grep -q '^task=editable.work family=claude agent=opus effort=max active=no$' \
+    || fail "dormant claude row was not marked inactive"
 
 write_fixture "$TEST_DIR/list.conf"
 assignment_list="$(agents_list_assignments)"

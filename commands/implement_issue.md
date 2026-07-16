@@ -121,7 +121,7 @@ If the issue needs no design at all — the behavior, surface, and acceptance ar
 already unambiguous — say so plainly rather than manufacturing decisions. Skip to
 Stage 7 and recommend delegation directly.
 
-If `effort` is `⭐⭐⭐⭐⭐`, treat decomposition as `D1`: the first decision is
+If `backlog_effort` is `⭐⭐⭐⭐⭐`, treat decomposition as `D1`: the first decision is
 whether this is one issue or several.
 
 Propose the design doc path before the conversation starts, following the repo
@@ -140,7 +140,7 @@ Then present the gate:
 
 **<issue title>** — rank <backlog_rank> — <absolute clickable issue path>
 Project: <project> | Repository: <absolute repo path>
-Goal: <strategic_goal> | Effort: <effort stars> | Stage: <stage>
+Goal: <backlog_goal> | Effort: <backlog_effort stars> | Stage: <stage>
 
 <one-sentence scope>
 

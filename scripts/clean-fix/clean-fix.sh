@@ -59,7 +59,6 @@ MANUAL_LOG_RETENTION_DAYS=7
 source "$HOME/.cargo/env"
 source "$SCRIPT_DIR/agent_assignments.sh"
 export PATH="/opt/homebrew/bin:$HOME/.local/bin:$PATH"
-export SCCACHE_CACHE_SIZE="30G"
 
 mkdir -p "$LOG_DIR"
 mkdir -p "$TIMESTAMP_DIR"

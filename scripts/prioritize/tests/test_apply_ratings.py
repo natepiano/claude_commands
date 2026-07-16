@@ -26,11 +26,11 @@ GOALS = """# Prioritization goals
 """
 
 VALUES = {
-    "strategic_goal": "1 - Ship Hana",
-    "alignment": "⭐⭐⭐⭐",
-    "impact": "⭐⭐⭐",
-    "urgency": "⭐⭐",
-    "effort": "⭐⭐⭐",
+    "backlog_goal": "1 - Ship Hana",
+    "backlog_alignment": "⭐⭐⭐⭐",
+    "backlog_impact": "⭐⭐⭐",
+    "backlog_urgency": "⭐⭐",
+    "backlog_effort": "⭐⭐⭐",
 }
 
 
@@ -51,7 +51,7 @@ def issue_text(
     ]
     if values is not None:
         lines.extend(
-            f'{key}: "{value}"' if key == "strategic_goal" else f"{key}: {value}"
+            f'{key}: "{value}"' if key == "backlog_goal" else f"{key}: {value}"
             for key, value in values.items()
         )
     if generated is not None:
@@ -158,7 +158,7 @@ class ApplyRatingsTests(unittest.TestCase):
         for field, value in VALUES.items():
             expected = (
                 f'{field}: "{value}"'
-                if field == "strategic_goal"
+                if field == "backlog_goal"
                 else f"{field}: {value}"
             )
             self.assertIn(expected, content)
@@ -181,14 +181,14 @@ class ApplyRatingsTests(unittest.TestCase):
 
     def test_apply_canonicalizes_duplicate_and_list_judgment_fields(self) -> None:
         content = issue_text(values=VALUES).replace(
-            "impact: ⭐⭐⭐",
-            'impact:\n  - "⭐⭐⭐"',
+            "backlog_impact: ⭐⭐⭐",
+            'backlog_impact:\n  - "⭐⭐⭐"',
         ).replace(
-            "urgency: ⭐⭐",
-            'urgency:\n- "⭐⭐"',
+            "backlog_urgency: ⭐⭐",
+            'backlog_urgency:\n- "⭐⭐"',
         ).replace(
             "---\n# Example",
-            'effort: "⭐"\n---\n# Example',
+            'backlog_effort: "⭐"\n---\n# Example',
         )
         path = self.fixture.add("issue.md", content)
         manifest = self.fixture.manifest(path)
@@ -196,12 +196,12 @@ class ApplyRatingsTests(unittest.TestCase):
         apply_ratings.apply_manifest(manifest, self.fixture.runtime)
 
         updated = path.read_text(encoding="utf-8")
-        self.assertEqual(updated.count("impact:"), 1)
-        self.assertEqual(updated.count("urgency:"), 1)
-        self.assertEqual(updated.count("effort:"), 1)
-        self.assertIn("impact: ⭐⭐⭐", updated)
-        self.assertIn("urgency: ⭐⭐", updated)
-        self.assertIn("effort: ⭐⭐⭐", updated)
+        self.assertEqual(updated.count("backlog_impact:"), 1)
+        self.assertEqual(updated.count("backlog_urgency:"), 1)
+        self.assertEqual(updated.count("backlog_effort:"), 1)
+        self.assertIn("backlog_impact: ⭐⭐⭐", updated)
+        self.assertIn("backlog_urgency: ⭐⭐", updated)
+        self.assertIn("backlog_effort: ⭐⭐⭐", updated)
         self.assertNotIn('  - "⭐⭐⭐"', updated)
         self.assertNotIn('- "⭐⭐"', updated)
         self.assertTrue(updated.endswith("# Example\n\nEvidence.\n"))
@@ -220,9 +220,9 @@ class ApplyRatingsTests(unittest.TestCase):
     def test_invalid_domain_and_out_of_scope_path_are_rejected(self) -> None:
         path = self.fixture.add("issue.md", issue_text(values=None))
         invalid = dict(VALUES)
-        invalid["impact"] = "⭐⭐⭐⭐⭐⭐"
+        invalid["backlog_impact"] = "⭐⭐⭐⭐⭐⭐"
         manifest = self.fixture.manifest(path, invalid)
-        with self.assertRaisesRegex(apply_ratings.ApprovalError, "invalid impact"):
+        with self.assertRaisesRegex(apply_ratings.ApprovalError, "invalid backlog_impact"):
             apply_ratings.prepare_plan(manifest, self.fixture.scope)
 
         record = {
@@ -270,7 +270,7 @@ class ApplyRatingsTests(unittest.TestCase):
         )
         manifest = self.fixture.manifest(path, evidence_paths=(evidence,))
         updated = evidence.read_text(encoding="utf-8").replace(
-            "impact: ⭐⭐⭐", "impact: ⭐⭐⭐⭐"
+            "backlog_impact: ⭐⭐⭐", "backlog_impact: ⭐⭐⭐⭐"
         ).replace("backlog_score: 10", "backlog_score: 99")
         evidence.write_text(updated, encoding="utf-8")
 

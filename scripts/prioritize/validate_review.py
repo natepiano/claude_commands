@@ -25,7 +25,7 @@ GOALS_PATH = VAULT_PATH / "prioritization goals.md"
 PRODUCTION_SCOPE = review_manifest.Scope(VAULT_PATH, ISSUES_PATH, GOALS_PATH)
 
 Mode = Literal["reviewer", "calibrator"]
-JUDGMENT_FIELDS = ("strategic_goal", *renumber.RUBRIC_FIELDS)
+JUDGMENT_FIELDS = ("backlog_goal", *renumber.RUBRIC_FIELDS)
 FINDING_FIELDS = frozenset(
     {
         "path",
@@ -62,11 +62,11 @@ class ValidationError(RuntimeError):
 
 
 class ProposedRubric(TypedDict):
-    strategic_goal: str
-    alignment: str
-    impact: str
-    urgency: str
-    effort: str
+    backlog_goal: str
+    backlog_alignment: str
+    backlog_impact: str
+    backlog_urgency: str
+    backlog_effort: str
 
 
 class Evidence(TypedDict):
@@ -224,18 +224,24 @@ def _current_rubric(value: object, *, context: str) -> review_manifest.CurrentRu
         raise ValidationError(
             f"{context} must contain exactly: {', '.join(JUDGMENT_FIELDS)}"
         )
-    raw_goal = _optional_string(mapping, "strategic_goal", context=context)
-    strategic_goal = (
+    raw_goal = _optional_string(mapping, "backlog_goal", context=context)
+    backlog_goal = (
         None if raw_goal is None else renumber.normalize_obsidian_links(raw_goal)
     )
     return review_manifest.CurrentRubric(
-        strategic_goal=strategic_goal,
-        alignment=_optional_string(
-            mapping, "alignment", context=context
+        backlog_goal=backlog_goal,
+        backlog_alignment=_optional_string(
+            mapping, "backlog_alignment", context=context
         ),
-        impact=_optional_string(mapping, "impact", context=context),
-        urgency=_optional_string(mapping, "urgency", context=context),
-        effort=_optional_string(mapping, "effort", context=context),
+        backlog_impact=_optional_string(
+            mapping, "backlog_impact", context=context
+        ),
+        backlog_urgency=_optional_string(
+            mapping, "backlog_urgency", context=context
+        ),
+        backlog_effort=_optional_string(
+            mapping, "backlog_effort", context=context
+        ),
     )
 
 
@@ -243,7 +249,7 @@ def _valid_current(
     current: review_manifest.CurrentRubric,
     goals: Sequence[str],
 ) -> bool:
-    if current["strategic_goal"] not in goals:
+    if current["backlog_goal"] not in goals:
         return False
     return all(current[field] in renumber.RUBRIC_DOMAINS[field] for field in renumber.RUBRIC_FIELDS)
 
@@ -262,12 +268,12 @@ def _proposed_rubric(
     for field in JUDGMENT_FIELDS:
         if not isinstance(mapping[field], str):
             raise ValidationError(f"{context}.{field} must be a string")
-    strategic_goal = renumber.normalize_obsidian_links(
-        cast(str, mapping["strategic_goal"])
+    backlog_goal = renumber.normalize_obsidian_links(
+        cast(str, mapping["backlog_goal"])
     )
-    if strategic_goal not in goals:
+    if backlog_goal not in goals:
         raise ValidationError(
-            f"{context}.strategic_goal is not an exact current goal: {strategic_goal!r}"
+            f"{context}.backlog_goal is not an exact current goal: {backlog_goal!r}"
         )
     for field in renumber.RUBRIC_FIELDS:
         field_value = cast(str, mapping[field])
@@ -276,11 +282,11 @@ def _proposed_rubric(
                 f"{context}.{field} is not an exact rubric value: {field_value!r}"
             )
     return ProposedRubric(
-        strategic_goal=strategic_goal,
-        alignment=cast(str, mapping["alignment"]),
-        impact=cast(str, mapping["impact"]),
-        urgency=cast(str, mapping["urgency"]),
-        effort=cast(str, mapping["effort"]),
+        backlog_goal=backlog_goal,
+        backlog_alignment=cast(str, mapping["backlog_alignment"]),
+        backlog_impact=cast(str, mapping["backlog_impact"]),
+        backlog_urgency=cast(str, mapping["backlog_urgency"]),
+        backlog_effort=cast(str, mapping["backlog_effort"]),
     )
 
 

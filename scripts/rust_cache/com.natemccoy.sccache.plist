@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.natemccoy.sccache</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Users/natemccoy/.cargo/bin/sccache</string>
+        <string>--start-server</string>
+    </array>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>SCCACHE_IDLE_TIMEOUT</key>
+        <string>0</string>
+    </dict>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>StandardOutPath</key>
+    <string>/tmp/sccache-launchd.log</string>
+    <key>StandardErrorPath</key>
+    <string>/tmp/sccache-launchd.log</string>
+</dict>
+</plist>

@@ -30,11 +30,11 @@ GOALS = """# prioritization goals
 """
 
 RUBRIC: dict[str, str] = {
-    "strategic_goal": "1 - Ship Hana",
-    "alignment": "⭐⭐⭐⭐",
-    "impact": "⭐⭐⭐",
-    "urgency": "⭐⭐",
-    "effort": "⭐⭐⭐",
+    "backlog_goal": "1 - Ship Hana",
+    "backlog_alignment": "⭐⭐⭐⭐",
+    "backlog_impact": "⭐⭐⭐",
+    "backlog_urgency": "⭐⭐",
+    "backlog_effort": "⭐⭐⭐",
 }
 
 
@@ -185,7 +185,7 @@ class ValidateReviewTests(unittest.TestCase):
             finding(
                 inventory[1],
                 verdict="proposed",
-                proposed={**RUBRIC, "impact": "⭐⭐⭐⭐"},
+                proposed={**RUBRIC, "backlog_impact": "⭐⭐⭐⭐"},
             ),
         ]
         findings_path = self.fixture.findings(rows)
@@ -292,7 +292,7 @@ class ValidateReviewTests(unittest.TestCase):
 
     def test_missing_or_invalid_current_values_require_a_complete_proposal(self) -> None:
         incomplete = dict(RUBRIC)
-        _ = incomplete.pop("effort")
+        _ = incomplete.pop("backlog_effort")
         _ = self.fixture.add_issue("issue.md", issue_text(rubric=incomplete))
         manifest_path, inventory = self.fixture.manifest()
         unchanged_path = self.fixture.findings([finding(inventory[0])])
@@ -329,19 +329,19 @@ class ValidateReviewTests(unittest.TestCase):
                 "current",
                 {
                     **base,
-                    "current": {**cast(dict[str, object], base["current"]), "effort": "⭐"},
+                    "current": {**cast(dict[str, object], base["current"]), "backlog_effort": "⭐"},
                 },
             ),
             (
                 "goal",
                 {
                     **base,
-                    "proposed": {**RUBRIC, "strategic_goal": "1 - Invented"},
+                    "proposed": {**RUBRIC, "backlog_goal": "1 - Invented"},
                 },
             ),
             (
                 "domain",
-                {**base, "proposed": {**RUBRIC, "effort": "⭐⭐⭐⭐⭐⭐"}},
+                {**base, "proposed": {**RUBRIC, "backlog_effort": "⭐⭐⭐⭐⭐⭐"}},
             ),
         )
         for name, row in mutations:

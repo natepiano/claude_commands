@@ -84,7 +84,7 @@ Give each calibrator this command, the approved goals, every emitted shard manif
 ### 5. Apply recommendations and show a spot check
 
 - Exclude every fully audited `unchanged` issue from the apply manifest. Reconcile every evidence-backed reviewer and calibrator amendment into one complete proposed judgment map per changed issue; do not average values or let an agent write the vault.
-- Write all reconciled proposals to one immutable JSONL apply manifest. Each line contains exactly the issue path, its discovery-time review and goals hashes, the normalized hashes of every cited evidence note including the reviewed issue itself, and the complete proposed judgment map: `{"path":"/absolute/issues/example.md","review_hash":"...","goals_hash":"...","evidence_hashes":{"/absolute/issues/example.md":"..."},"proposed":{"strategic_goal":"...","alignment":"...","impact":"...","urgency":"...","effort":"..."}}`.
+- Write all reconciled proposals to one immutable JSONL apply manifest. Each line contains exactly the issue path, its discovery-time review and goals hashes, the normalized hashes of every cited evidence note including the reviewed issue itself, and the complete proposed judgment map: `{"path":"/absolute/issues/example.md","review_hash":"...","goals_hash":"...","evidence_hashes":{"/absolute/issues/example.md":"..."},"proposed":{"backlog_goal":"...","backlog_alignment":"...","backlog_impact":"...","backlog_urgency":"...","backlog_effort":"..."}}`.
 - Run `/usr/bin/python3 /Users/natemccoy/.claude/scripts/prioritize/apply_ratings.py <manifest>` first as a dry-run, then run the same command with `--apply` automatically. Invoking `/prioritize` authorizes these calibrated issue-rating updates; do not pause for per-issue or per-group approval. `apply_ratings.py` must revalidate every review, goals, and evidence hash, write only the five judgment fields, use `renumber.py`'s calculation code before releasing the shared writer lock, and restore the previous files if either the judgment writes or automatic ranking fails.
 - Mark a proposed row `applied` only after the complete manifest succeeds. Record each row's post-apply review hash in the ledger. If any row fails validation or application, do not silently skip it: leave the session incomplete, identify the exact path and cause, and resume from fresh evidence rather than claiming a partial pass is complete.
 - After the write, regenerate the inventory and run `renumber.py` in dry-run mode. Derive `audited`, `ratings changed`, `valid ranked`, and `needs prioritization` counts from the current ledger and that fresh check; never maintain hand-edited counters.
@@ -118,7 +118,7 @@ Give each calibrator this command, the approved goals, every emitted shard manif
 - Strategic-goal additions, removals, renames, and reordering still require user approval before the goals note changes. Issue-rating recommendations do not; explicit user spot-check corrections override them and are applied through the same validated path.
 - `/prioritize` does not ask the user to review mechanically derived score ties. It may show `backlog_rank` as spot-check context, but no workflow writes a rank directly.
 - The automatic watcher owns mechanics after any relevant edit: parse current inputs, recompute `backlog_score`, and densely renumber `backlog_rank`.
-- Never let the watcher invent or revise `strategic_goal`, `alignment`, `impact`, `urgency`, or `effort`.
+- Never let the watcher invent or revise `backlog_goal`, `backlog_alignment`, `backlog_impact`, `backlog_urgency`, or `backlog_effort`.
 
 ### Deterministic renumbering
 
@@ -139,7 +139,7 @@ Give each calibrator this command, the approved goals, every emitted shard manif
 - Keep a lightweight watcher daemon alive through launchd and monitor every issue file plus `/Users/natemccoy/rust/hanadocs/prioritization goals.md` so new, modified, renamed, and deleted issues and goal-order changes trigger ranking. Do not depend on launchd `WatchPaths`, which can miss filesystem events.
 - Poll stable path/inode/size/mtime/ctime signatures at a sub-second interval and run the semantic snapshot/scorer only after a watched signature changes. Use a separate OS-released runner lock plus pending marker so overlapping save bursts coalesce safely; use `/tmp/hanadocs-prioritize/writer.lock` with another OS-released exclusive lock for actual vault writes. A crash must release either lock without stale-PID cleanup.
 - Do not use `git diff` as the change detector. Repository state is not the source of truth for live filesystem events.
-- Build a canonical semantic snapshot containing each issue path, eligibility fields, and ranking input fields: `status`, `strategic_goal`, `alignment`, `impact`, `urgency`, and `effort`.
+- Build a canonical semantic snapshot containing each issue path, eligibility fields, and ranking input fields: `status`, `backlog_goal`, `backlog_alignment`, `backlog_impact`, `backlog_urgency`, and `backlog_effort`.
 - Exclude generated `backlog_score` and `backlog_rank` from the input snapshot so the watcher's own renumbering writes cannot create a loop.
 - Compare the snapshot with the last successful snapshot in `/Users/natemccoy/Library/Caches/hanadocs-prioritize/`. When inputs are unchanged, still run a mechanical check: exit without writing only when generated score/rank state is canonical, and repair it when it has drifted.
 - When valid inputs or eligible membership changed, invoke `renumber.py --apply`, validate the result, then atomically replace the cached snapshot.
@@ -163,12 +163,12 @@ Give each calibrator this command, the approved goals, every emitted shard manif
 - Read the canonical ordered goals from `/Users/natemccoy/rust/hanadocs/prioritization goals.md`; do not infer or replace them from the issue corpus.
 - Give earlier goals more influence through soft weighting, not absolute precedence. A strongly justified issue for a later goal may outrank a weakly justified issue for an earlier goal.
 - Never group the final backlog into rigid goal lanes where every issue for one goal outranks every issue for the next.
-- Store the single goal an issue influences most in the scalar `strategic_goal` frontmatter property. Its value must match one readable, numerically prefixed domain value defined in the goals note, for example `"1 - Ship Hana"`.
+- Store the single goal an issue influences most in the scalar `backlog_goal` frontmatter property. Its value must match one readable, numerically prefixed domain value defined in the goals note, for example `"1 - Ship Hana"`.
 - Normalize Obsidian wikilinks to their displayed text when comparing goals. For example, treat `1 - Ship [[hana|Hana]]` and `1 - Ship Hana` as the same goal while retaining the goals note's readable links.
-- Assign exactly one `strategic_goal` to every eligible issue; do not store multiple goals or a goal list.
-- Use `alignment` to record how strongly the issue advances its selected goal.
+- Assign exactly one `backlog_goal` to every eligible issue; do not store multiple goals or a goal list.
+- Use `backlog_alignment` to record how strongly the issue advances its selected goal.
 - Record each rubric component as its own frontmatter property so Obsidian Bases can filter and sort it independently.
-- Store `alignment`, `impact`, `urgency`, and `effort` as separate YAML text scalars containing exactly one through five `⭐` characters. Accept semantically equivalent plain, single-quoted, and double-quoted YAML serialization because Obsidian may rewrite text properties with quotes.
+- Store `backlog_alignment`, `backlog_impact`, `backlog_urgency`, and `backlog_effort` as separate YAML text scalars containing exactly one through five `⭐` characters. Accept semantically equivalent plain, single-quoted, and double-quoted YAML serialization because Obsidian may rewrite text properties with quotes.
 - Parse and validate the star count for scoring. Treat a missing rubric property as unassessed; there is no zero-star assessed value.
 - Store the computed `backlog_score` and `backlog_rank` as unquoted numbers.
 - Use the existing `category` property for issue-type questions such as the highest-ranked bug, feature, business, or research issues; do not duplicate issue type in the rubric fields.
@@ -177,9 +177,9 @@ Give each calibrator this command, the approved goals, every emitted shard manif
 
 ### Effort sizing
 
-- Store relative effort as a one-to-five-star YAML text value in `effort`.
+- Store relative effort as a one-to-five-star YAML text value in `backlog_effort`.
 - Interpret one through five stars as `XS`, `S`, `M`, `L`, and `XL` respectively.
-- Use `effort` only as a relative effort and complexity estimate.
+- Use `backlog_effort` only as a relative effort and complexity estimate.
 - Never estimate or display real durations such as hours, days, or weeks.
 - Never translate an effort value or t-shirt label into a real duration.
 
@@ -187,8 +187,8 @@ Give each calibrator this command, the approved goals, every emitted shard manif
 
 - Compute the candidate backlog order with a weighted additive score.
 - Combine weighted goal alignment, a soft goal-order bonus, impact, urgency, and a modest subtractive effort penalty.
-- Never divide by `effort`; coarse effort estimates must not make tiny tasks dominate or make an `XL` strategic initiative disappear.
-- Parse `A`, `I`, `U`, and `E` as the star counts in `alignment`, `impact`, `urgency`, and `effort`.
+- Never divide by `backlog_effort`; coarse effort estimates must not make tiny tasks dominate or make an `XL` strategic initiative disappear.
+- Parse `A`, `I`, `U`, and `E` as the star counts in `backlog_alignment`, `backlog_impact`, `backlog_urgency`, and `backlog_effort`.
 - Parse each goal's 1-based numeric prefix as `goal_position`, require the goals note to use contiguous positions, and compute `goal_bonus = 2 * (goal_count - goal_position)`. The current four goals therefore produce bonuses `6`, `4`, `2`, and `0`.
 - Compute `backlog_score = (4 * (A - 1)) + (3 * (I - 1)) + (2 * (U - 1)) - (E - 1) + goal_bonus`.
 - Keep these exact weights explicit and centralized in this command.
@@ -197,7 +197,7 @@ Give each calibrator this command, the approved goals, every emitted shard manif
 
 ### Rubric definitions
 
-#### `alignment`
+#### `backlog_alignment`
 
 - `⭐` — weak or minimal relationship to the selected goal
 - `⭐⭐` — indirectly supports the goal or removes a limited obstacle
@@ -205,9 +205,9 @@ Give each calibrator this command, the approved goals, every emitted shard manif
 - `⭐⭐⭐⭐` — central work on which substantial goal progress depends
 - `⭐⭐⭐⭐⭐` — completing the issue itself delivers a major goal outcome
 
-Assign every eligible issue its closest `strategic_goal`, even when alignment is weak.
+Assign every eligible issue its closest `backlog_goal`, even when alignment is weak.
 
-#### `impact`
+#### `backlog_impact`
 
 - `⭐` — small or highly localized benefit
 - `⭐⭐` — clear but limited benefit to a narrow workflow or audience
@@ -215,9 +215,9 @@ Assign every eligible issue its closest `strategic_goal`, even when alignment is
 - `⭐⭐⭐⭐` — major benefit across a core workflow or multiple audiences
 - `⭐⭐⭐⭐⭐` — transformative outcome for the product, organization, or ecosystem
 
-Measure the magnitude of the benefit if completed. Do not include urgency or effort in `impact`.
+Measure the magnitude of the benefit if completed. Do not include urgency or effort in `backlog_impact`.
 
-#### `urgency`
+#### `backlog_urgency`
 
 - `⭐` — can wait; delay has little material cost
 - `⭐⭐` — pressure is building; delay slowly raises cost or loses opportunity
@@ -227,7 +227,7 @@ Measure the magnitude of the benefit if completed. Do not include urgency or eff
 
 Measure cost of delay without estimating a duration. Require cited evidence for four- and five-star urgency; never invent a deadline, commitment, or closing opportunity window.
 
-#### `effort`
+#### `backlog_effort`
 
 - `⭐` — `XS`: one atomic, tightly scoped action
 - `⭐⭐` — `S`: contained work with few touchpoints and a known approach

@@ -37,10 +37,10 @@ STAR_VALUES = tuple(STAR * count for count in range(1, 6))
 RUBRIC_DOMAINS: dict[str, tuple[str, ...]] = {
     field: STAR_VALUES
     for field in (
-        "alignment",
-        "impact",
-        "urgency",
-        "effort",
+        "backlog_alignment",
+        "backlog_impact",
+        "backlog_urgency",
+        "backlog_effort",
     )
 }
 RUBRIC_FIELDS = tuple(RUBRIC_DOMAINS)
@@ -366,12 +366,12 @@ def parse_goals(source: SourceFile) -> tuple[Goal, ...]:
 
 
 def calculate_score(goal: Goal, values: dict[str, int]) -> int:
-    alignment = values["alignment"]
+    alignment = values["backlog_alignment"]
     return (
         (4 * (alignment - 1))
-        + (3 * (values["impact"] - 1))
-        + (2 * (values["urgency"] - 1))
-        - (values["effort"] - 1)
+        + (3 * (values["backlog_impact"] - 1))
+        + (2 * (values["backlog_urgency"] - 1))
+        - (values["backlog_effort"] - 1)
         + goal.bonus
     )
 
@@ -399,10 +399,10 @@ def _parse_issue(source: SourceFile, goals: tuple[Goal, ...]) -> Issue:
 
     goal_by_value = {goal.value: goal for goal in goals}
     try:
-        raw_goal_value = _parse_required_value(frontmatter, "strategic_goal")
+        raw_goal_value = _parse_required_value(frontmatter, "backlog_goal")
         goal_value = normalize_obsidian_links(raw_goal_value)
         if goal_value not in goal_by_value:
-            raise ValueError(f"invalid strategic_goal: {raw_goal_value!r}")
+            raise ValueError(f"invalid backlog_goal: {raw_goal_value!r}")
     except ValueError as error:
         issue.problems.append(str(error))
         goal = None
@@ -479,7 +479,7 @@ def _rewrite_generated(
     else:
         rubric_indices = [
             occurrence.index
-            for key in ("strategic_goal", *RUBRIC_FIELDS)
+            for key in ("backlog_goal", *RUBRIC_FIELDS)
             for occurrence in frontmatter.fields.get(key, [])
         ]
         if rubric_indices:

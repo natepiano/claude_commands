@@ -36,9 +36,8 @@
       "Bash(rg *)",
       "Bash(rm *)",
       "Bash(run_test.sh *)",
-      "Bash(sccache *)",
+      "Bash(rust-cache *)",
       "Bash(~/.claude/scripts/release/*)",
-      "Bash(//Users/natemccoy/Library/Caches/Mozilla.sccache/**)",
       "Bash(//Users/natemccoy/rust/**/.git/**)",
       "Edit(//Users/natemccoy/.claude/**)",
       "Edit(//Users/natemccoy/Library/Application Support/**)",
@@ -120,6 +119,7 @@
       "allowWrite": [
         "/Users/natemccoy/.cargo",
         "/Users/natemccoy/Library/Application Support",
+        "/Users/natemccoy/Library/Caches/kache",
         "/Users/natemccoy/Library/Caches/Mozilla.sccache",
         "/Users/natemccoy/rust",
         "/private/tmp",

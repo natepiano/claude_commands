@@ -107,6 +107,33 @@ _agents_function_families_inline() {
     done
 }
 
+# Every family whose catalog lists <agent>, inline for error text. Agent names
+# are disjoint across families, so exactly one match names a row's family and
+# two means the catalogs collided and the caller must refuse to guess.
+_agents_agent_families_inline() {
+    local agent="$1" family first=1
+    for family in codex claude; do
+        _agents_registry_has_key "$family.agents" "$agent" || continue
+        if [[ "$first" -eq 1 ]]; then
+            printf '%s' "$family"
+            first=0
+        else
+            printf ', %s' "$family"
+        fi
+    done
+}
+
+# The family a task resolves through today: an exact-task assignment override
+# if one exists, otherwise the function's assignment.
+_agents_active_family() {
+    local function="$1" subtask="$2" family
+    family="$(_agents_registry_get assignments "$function.$subtask")"
+    if [[ -z "$family" ]]; then
+        family="$(_agents_registry_get assignments "$function")"
+    fi
+    printf '%s' "$family"
+}
+
 _agents_effort_allowed() {
     local allowed="$1" effort="$2" item
     local old_ifs="$IFS"
@@ -232,6 +259,7 @@ agents_list_assignments() {
 # active family (plus any per-subtask assignment overrides).
 agents_list_function() {
     local function="$1" active family line key subtask pair model effort overrides=""
+    local row_active
 
     active="$(_agents_registry_get assignments "$function")"
     if [[ -z "$active" ]]; then
@@ -247,8 +275,13 @@ agents_list_function() {
             model="${pair%%:*}"
             effort=""
             [[ "$pair" == *:* ]] && effort="${pair#*:}"
-            printf 'task=%s family=%s agent=%s effort=%s\n' \
-                "$function.$subtask" "$family" "$model" "$effort"
+            if [[ "$(_agents_active_family "$function" "$subtask")" == "$family" ]]; then
+                row_active="yes"
+            else
+                row_active="no"
+            fi
+            printf 'task=%s family=%s agent=%s effort=%s active=%s\n' \
+                "$function.$subtask" "$family" "$model" "$effort" "$row_active"
         done < <(_agents_config_section_values "$function.$family")
     done
     while IFS= read -r line; do
@@ -305,8 +338,13 @@ agents_set_assignment() {
     mv "$tmp_file" "$AGENTS_CONFIG_FILE"
 }
 
+# Edit one row. The agent names its own family, so the row written is the one
+# the agent could only ever have meant — never the merely-active one. Sets
+# AGENT_ROW_FAMILY (where it landed), AGENT_ROW_ACTIVE_FAMILY (what the task
+# resolves through today), and AGENT_ROW_ACTIVE (yes when those agree).
 agents_set_row() {
-    local task="$1" pair="$2" function subtask family section tmp_file configured
+    local task="$1" pair="$2" function subtask family families active
+    local section tmp_file configured
 
     function="${task%%.*}"
     subtask="${task#*.}"
@@ -315,18 +353,34 @@ agents_set_row() {
         return 1
     fi
 
-    family="$(_agents_registry_get assignments "$task")"
-    if [[ -z "$family" ]]; then
-        family="$(_agents_registry_get assignments "$function")"
-    fi
-    if [[ -z "$family" ]]; then
+    active="$(_agents_active_family "$function" "$subtask")"
+    if [[ -z "$active" ]]; then
         configured="$(_agents_section_keys_inline assignments)"
         echo "ERROR: [$task] no [assignments] entry for '$function'." >&2
         echo "       Configured assignments in $AGENTS_CONFIG_FILE: $configured" >&2
         return 1
     fi
 
+    families="$(_agents_agent_families_inline "${pair%%:*}")"
+    if [[ -z "$families" ]]; then
+        echo "ERROR: [$task] unknown agent '${pair%%:*}'." >&2
+        echo "       Allowed agents in $AGENTS_CONFIG_FILE [codex.agents]: $(_agents_section_keys_inline codex.agents)" >&2
+        echo "       Allowed agents in $AGENTS_CONFIG_FILE [claude.agents]: $(_agents_section_keys_inline claude.agents)" >&2
+        return 1
+    fi
+    if [[ "$families" == *,* ]]; then
+        echo "ERROR: [$task] agent '${pair%%:*}' is listed by more than one family ($families)." >&2
+        echo "       Remove the duplicate in $AGENTS_CONFIG_FILE so an agent names exactly one family." >&2
+        return 1
+    fi
+    family="$families"
+
     section="$function.$family"
+    if ! _agents_config_has_section "$section"; then
+        echo "ERROR: [$task] '${pair%%:*}' is a $family agent, but there is no [$section]." >&2
+        echo "       Families with a configured set for '$function': $(_agents_function_families_inline "$function")" >&2
+        return 1
+    fi
     if ! _agents_registry_has_key "$section" "$subtask"; then
         configured="$(_agents_section_keys_inline "$section")"
         echo "ERROR: [$task] missing sub-task '$subtask' in [$section]." >&2
@@ -364,6 +418,14 @@ agents_set_row() {
         return 1
     fi
     mv "$tmp_file" "$AGENTS_CONFIG_FILE"
+
+    AGENT_ROW_FAMILY="$family"
+    AGENT_ROW_ACTIVE_FAMILY="$active"
+    if [[ "$family" == "$active" ]]; then
+        AGENT_ROW_ACTIVE="yes"
+    else
+        AGENT_ROW_ACTIVE="no"
+    fi
 }
 
 agents_codex_args() {

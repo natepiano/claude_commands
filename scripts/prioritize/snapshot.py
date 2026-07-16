@@ -20,11 +20,11 @@ GOALS_FILE = Path("/Users/natemccoy/rust/hanadocs/prioritization goals.md")
 
 INPUT_FIELDS = (
     "status",
-    "strategic_goal",
-    "alignment",
-    "impact",
-    "urgency",
-    "effort",
+    "backlog_goal",
+    "backlog_alignment",
+    "backlog_impact",
+    "backlog_urgency",
+    "backlog_effort",
 )
 
 TOP_LEVEL_PROPERTY = re.compile(r"^([A-Za-z_][A-Za-z0-9_-]*):(?:[ \t]*(.*))?$")
@@ -131,7 +131,7 @@ def frontmatter_values(path: Path) -> tuple[Dict[str, Any], Any]:
                 parsed = parse_status_scalar(raw)
             else:
                 parsed = parse_domain_scalar(raw)
-            if key == "strategic_goal" and isinstance(parsed, str):
+            if key == "backlog_goal" and isinstance(parsed, str):
                 parsed = renumber.normalize_obsidian_links(parsed)
             occurrences[key].append(parsed)
 
@@ -240,9 +240,9 @@ def completeness_errors(snapshot: Mapping[str, Any]) -> Iterable[str]:
         if issue["frontmatter"] != "valid":
             yield f"{path}: malformed frontmatter {issue['frontmatter']!r}"
             continue
-        strategic_goal = issue["strategic_goal"]
-        if not isinstance(strategic_goal, str) or strategic_goal not in goal_values:
-            yield f"{path}: invalid or missing strategic_goal {strategic_goal!r}"
+        backlog_goal = issue["backlog_goal"]
+        if not isinstance(backlog_goal, str) or backlog_goal not in goal_values:
+            yield f"{path}: invalid or missing backlog_goal {backlog_goal!r}"
 
         for field, domain in renumber.RUBRIC_DOMAINS.items():
             value = issue[field]

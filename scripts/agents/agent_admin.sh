@@ -44,9 +44,12 @@ Usage: agent_admin.sh [skills | <function>] | <function> <codex|claude> | <funct
   skills                   print the list of configured skills for use with agents
   <function>               print just that function's rows
   <function> <family>      switch a whole function to the codex or claude family
+                           — the only thing that changes which rows are live
   <function>.<subtask> <agent>[:<effort>]
-                           edit one row in the active family; omit :<effort>
-                           to use the agent CLI default
+                           edit one row; the agent names its own family, so
+                           naming a dormant family's agent edits that row and
+                           says so rather than erroring. Omit :<effort> to use
+                           the agent CLI default
 
 Examples:
   agent_admin.sh $ex_fn
@@ -79,6 +82,13 @@ elif [[ "$#" -eq 2 ]]; then
     if [[ "$1" == *.* ]]; then
         agents_set_row "$1" "$2"
         fn="${1%%.*}"
+        if [[ "$AGENT_ROW_ACTIVE" == "yes" ]]; then
+            echo "# updated [$fn.$AGENT_ROW_FAMILY] $1 — live"
+        else
+            echo "# updated [$fn.$AGENT_ROW_FAMILY] $1 — dormant:" \
+                "$1 runs on $AGENT_ROW_ACTIVE_FAMILY. Make it live with:" \
+                "agent_admin.sh $fn $AGENT_ROW_FAMILY"
+        fi
     else
         agents_set_assignment "$1" "$2"
         fn="$1"

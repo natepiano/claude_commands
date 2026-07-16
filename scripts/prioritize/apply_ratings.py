@@ -18,7 +18,7 @@ import review_hash  # pyright: ignore[reportImplicitRelativeImport]
 import writer_lock  # pyright: ignore[reportImplicitRelativeImport]
 
 
-JUDGMENT_FIELDS = ("strategic_goal", *renumber.RUBRIC_FIELDS)
+JUDGMENT_FIELDS = ("backlog_goal", *renumber.RUBRIC_FIELDS)
 HASH_RE = re.compile(r"^[0-9a-f]{64}$")
 MANIFEST_FIELDS = {
     "path",
@@ -177,8 +177,8 @@ def _read_manifest(path: Path, scope: renumber.Scope) -> tuple[Approval, ...]:
             )
 
         parsed_proposed = dict(cast(dict[str, str], proposed))
-        parsed_proposed["strategic_goal"] = renumber.normalize_obsidian_links(
-            parsed_proposed["strategic_goal"]
+        parsed_proposed["backlog_goal"] = renumber.normalize_obsidian_links(
+            parsed_proposed["backlog_goal"]
         )
         approvals.append(
             Approval(
@@ -200,10 +200,10 @@ def _validate_proposed(
     goals: tuple[renumber.Goal, ...],
 ) -> None:
     goal_values = {goal.value for goal in goals}
-    goal = approval.proposed["strategic_goal"]
+    goal = approval.proposed["backlog_goal"]
     if goal not in goal_values:
         raise ApprovalError(
-            f"{approval.path}: strategic_goal is not a current goal: {goal!r}"
+            f"{approval.path}: backlog_goal is not a current goal: {goal!r}"
         )
     for field in renumber.RUBRIC_FIELDS:
         value = approval.proposed[field]

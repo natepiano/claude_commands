@@ -1,0 +1,277 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+STATE_DIR="${RUST_CACHE_STATE_DIR:-$HOME/.config/rust-cache}"
+STATE_FILE="$STATE_DIR/backend"
+SCCACHE_BIN="${RUST_CACHE_SCCACHE_BIN:-$HOME/.cargo/bin/sccache}"
+KACHE_BIN="${RUST_CACHE_KACHE_BIN:-$HOME/.cargo/bin/kache}"
+SCCACHE_LABEL="com.natemccoy.sccache"
+KACHE_DAEMON_LABEL="ninja.kunobi.kache"
+KACHE_GC_LABEL="ninja.kunobi.kache-gc"
+SCCACHE_PLIST="$HOME/Library/LaunchAgents/$SCCACHE_LABEL.plist"
+KACHE_DAEMON_PLIST="$HOME/Library/LaunchAgents/$KACHE_DAEMON_LABEL.plist"
+KACHE_GC_PLIST="$HOME/Library/LaunchAgents/$KACHE_GC_LABEL.plist"
+LAUNCH_DOMAIN="gui/$(id -u)"
+
+usage() {
+    cat <<'EOF'
+Usage:
+  rust-cache use sccache|kache|off
+  rust-cache status
+  rust-cache stats
+  rust-cache doctor
+
+Cargo invokes rust-cache as its rustc wrapper. The saved backend applies to
+every Cargo process.
+EOF
+}
+
+validate_backend() {
+    case "$1" in
+        sccache|kache|off) ;;
+        *)
+            echo "error: invalid Rust cache backend: $1" >&2
+            return 2
+            ;;
+    esac
+}
+
+selected_backend() {
+    local backend
+    if [[ -r "$STATE_FILE" ]]; then
+        IFS= read -r backend < "$STATE_FILE"
+    else
+        backend="off"
+    fi
+    validate_backend "$backend"
+    printf '%s\n' "$backend"
+}
+
+require_backend_binary() {
+    case "$1" in
+        sccache)
+            [[ -x "$SCCACHE_BIN" ]] || {
+                echo "error: sccache is not installed at $SCCACHE_BIN" >&2
+                return 1
+            }
+            ;;
+        kache)
+            [[ -x "$KACHE_BIN" ]] || {
+                echo "error: kache is not installed at $KACHE_BIN" >&2
+                return 1
+            }
+            ;;
+    esac
+}
+
+job_loaded() {
+    launchctl print "$LAUNCH_DOMAIN/$1" >/dev/null 2>&1
+}
+
+disable_job() {
+    local label="$1"
+    launchctl disable "$LAUNCH_DOMAIN/$label" >/dev/null 2>&1 || true
+    if job_loaded "$label"; then
+        launchctl bootout "$LAUNCH_DOMAIN/$label" >/dev/null 2>&1 || true
+    fi
+}
+
+enable_job() {
+    local label="$1" plist="$2"
+    [[ -f "$plist" ]] || {
+        echo "error: missing LaunchAgent: $plist" >&2
+        return 1
+    }
+    launchctl enable "$LAUNCH_DOMAIN/$label"
+    if ! job_loaded "$label"; then
+        launchctl bootstrap "$LAUNCH_DOMAIN" "$plist"
+    fi
+}
+
+stop_sccache() {
+    disable_job "$SCCACHE_LABEL"
+    if [[ -x "$SCCACHE_BIN" ]]; then
+        "$SCCACHE_BIN" --stop-server >/dev/null 2>&1 || true
+    fi
+}
+
+stop_kache() {
+    if [[ -x "$KACHE_BIN" ]]; then
+        "$KACHE_BIN" daemon stop >/dev/null 2>&1 || true
+    fi
+    disable_job "$KACHE_DAEMON_LABEL"
+    disable_job "$KACHE_GC_LABEL"
+}
+
+build_is_running() {
+    pgrep -x cargo >/dev/null 2>&1 ||
+        pgrep -x rustc >/dev/null 2>&1 ||
+        pgrep -x rustdoc >/dev/null 2>&1 ||
+        pgrep -x clippy-driver >/dev/null 2>&1
+}
+
+write_backend() {
+    local backend="$1" temporary
+    mkdir -p "$STATE_DIR"
+    temporary="$STATE_FILE.$$"
+    printf '%s\n' "$backend" > "$temporary"
+    mv "$temporary" "$STATE_FILE"
+}
+
+warn_stale_shell_wrapper() {
+    case "${RUSTC_WRAPPER:-}" in
+        ""|rust-cache|"$HOME/.cargo/bin/rust-cache"|"$HOME/.claude/scripts/rust_cache/rust-cache") ;;
+        *)
+            echo "warning: this shell still exports RUSTC_WRAPPER=$RUSTC_WRAPPER" >&2
+            echo "run: export RUSTC_WRAPPER=rust-cache" >&2
+            ;;
+    esac
+}
+
+use_backend() {
+    local backend="$1"
+    validate_backend "$backend"
+    require_backend_binary "$backend"
+    if build_is_running; then
+        echo "error: Cargo or rustc is running; switch after it exits" >&2
+        return 1
+    fi
+
+    case "$backend" in
+        sccache)
+            stop_kache
+            enable_job "$SCCACHE_LABEL" "$SCCACHE_PLIST"
+            ;;
+        kache)
+            stop_sccache
+            enable_job "$KACHE_GC_LABEL" "$KACHE_GC_PLIST"
+            enable_job "$KACHE_DAEMON_LABEL" "$KACHE_DAEMON_PLIST"
+            "$KACHE_BIN" daemon start >/dev/null 2>&1 || true
+            echo "kache GC enabled; it may trim the store to local_max_size"
+            ;;
+        off)
+            stop_sccache
+            stop_kache
+            ;;
+    esac
+
+    write_backend "$backend"
+    echo "Rust cache backend: $backend"
+    warn_stale_shell_wrapper
+}
+
+human_size() {
+    local path="$1"
+    if [[ -d "$path" ]]; then
+        du -sh "$path" 2>/dev/null | awk '{print $1}'
+    else
+        printf '0B\n'
+    fi
+}
+
+job_state() {
+    if job_loaded "$1"; then
+        printf 'loaded\n'
+    else
+        printf 'disabled\n'
+    fi
+}
+
+show_status() {
+    local backend shell_wrapper
+    backend="$(selected_backend)"
+    shell_wrapper="${RUSTC_WRAPPER:-<Cargo config>}"
+    printf 'backend: %s\n' "$backend"
+    printf 'RUSTC_WRAPPER: %s\n' "$shell_wrapper"
+    printf 'sccache: %s; cache %s; service %s\n' \
+        "$([[ -x "$SCCACHE_BIN" ]] && "$SCCACHE_BIN" --version || echo 'not installed')" \
+        "$(human_size "$HOME/Library/Caches/Mozilla.sccache")" \
+        "$(job_state "$SCCACHE_LABEL")"
+    printf 'kache: %s; cache %s; daemon %s; GC %s\n' \
+        "$([[ -x "$KACHE_BIN" ]] && "$KACHE_BIN" --version || echo 'not installed')" \
+        "$(human_size "$HOME/Library/Caches/kache")" \
+        "$(job_state "$KACHE_DAEMON_LABEL")" \
+        "$(job_state "$KACHE_GC_LABEL")"
+    warn_stale_shell_wrapper
+}
+
+show_stats() {
+    local backend
+    backend="$(selected_backend)"
+    require_backend_binary "$backend"
+    case "$backend" in
+        sccache) exec "$SCCACHE_BIN" --show-stats ;;
+        kache) exec "$KACHE_BIN" stats ;;
+        off)
+            echo "Rust cache backend is off."
+            ;;
+    esac
+}
+
+run_doctor() {
+    local backend
+    backend="$(selected_backend)"
+    require_backend_binary "$backend"
+    case "$backend" in
+        sccache)
+            "$SCCACHE_BIN" --version
+            "$SCCACHE_BIN" --show-stats
+            ;;
+        kache) exec "$KACHE_BIN" doctor ;;
+        off) echo "Rust cache backend is off." ;;
+    esac
+}
+
+dispatch_rustc() {
+    local backend
+    backend="$(selected_backend)"
+    require_backend_binary "$backend"
+    case "$backend" in
+        sccache)
+            export SCCACHE_IDLE_TIMEOUT="${SCCACHE_IDLE_TIMEOUT:-0}"
+            exec "$SCCACHE_BIN" "$@"
+            ;;
+        kache) exec "$KACHE_BIN" "$@" ;;
+        off) exec "$@" ;;
+    esac
+}
+
+if [[ $# -eq 0 ]]; then
+    show_status
+    exit
+fi
+
+case "$1" in
+    use)
+        [[ $# -eq 2 ]] || {
+            usage >&2
+            exit 2
+        }
+        use_backend "$2"
+        ;;
+    status)
+        [[ $# -eq 1 ]] || {
+            usage >&2
+            exit 2
+        }
+        show_status
+        ;;
+    stats)
+        [[ $# -eq 1 ]] || {
+            usage >&2
+            exit 2
+        }
+        show_stats
+        ;;
+    doctor)
+        [[ $# -eq 1 ]] || {
+            usage >&2
+            exit 2
+        }
+        run_doctor
+        ;;
+    help|-h|--help)
+        usage
+        ;;
+    *) dispatch_rustc "$@" ;;
+esac

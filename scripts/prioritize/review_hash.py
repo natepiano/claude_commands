@@ -58,7 +58,7 @@ def canonical_evidence_bytes(source: renumber.SourceFile) -> bytes:
 
     return _bytes_without_fields(
         source,
-        ("strategic_goal", *renumber.RUBRIC_FIELDS, *renumber.GENERATED_FIELDS),
+        ("backlog_goal", *renumber.RUBRIC_FIELDS, *renumber.GENERATED_FIELDS),
     )
 
 

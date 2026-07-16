@@ -40,15 +40,15 @@ This complete note deliberately has no YAML frontmatter.
 """
 
 RUBRIC = {
-    "alignment": "⭐⭐",
-    "impact": "⭐⭐⭐⭐",
-    "urgency": "⭐",
-    "effort": "⭐⭐⭐",
+    "backlog_alignment": "⭐⭐",
+    "backlog_impact": "⭐⭐⭐⭐",
+    "backlog_urgency": "⭐",
+    "backlog_effort": "⭐⭐⭐",
 }
 
 
 def issue_text(goal: str) -> str:
-    lines = ["---", "status: open", f'strategic_goal: "{goal}"']
+    lines = ["---", "status: open", f'backlog_goal: "{goal}"']
     lines.extend(f'{key}: "{value}"' for key, value in RUBRIC.items())
     lines.extend(["---", "# Issue", "", "Evidence."])
     return "\n".join(lines) + "\n"
@@ -168,7 +168,7 @@ class ApplyGoalsTests(unittest.TestCase):
         self.assertIn("backlog_score: 13", valid_content)
         self.assertIn("backlog_rank: 1", valid_content)
         invalidated_content = invalidated.read_text(encoding="utf-8")
-        self.assertIn('strategic_goal: "3 - Seek Investors"', invalidated_content)
+        self.assertIn('backlog_goal: "3 - Seek Investors"', invalidated_content)
         self.assertNotIn("backlog_score:", invalidated_content)
         self.assertNotIn("backlog_rank:", invalidated_content)
         self.assertEqual(renumber.build_plan(self.fixture.scope).changes, ())

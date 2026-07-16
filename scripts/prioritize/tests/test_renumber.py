@@ -33,11 +33,11 @@ GOALS = """# prioritization goals
 """
 
 DEFAULT_VALUES = {
-    "strategic_goal": "1 - Ship Hana",
-    "alignment": "⭐⭐",
-    "impact": "⭐⭐⭐⭐",
-    "urgency": "⭐",
-    "effort": "⭐⭐⭐",
+    "backlog_goal": "1 - Ship Hana",
+    "backlog_alignment": "⭐⭐",
+    "backlog_impact": "⭐⭐⭐⭐",
+    "backlog_urgency": "⭐",
+    "backlog_effort": "⭐⭐⭐",
 }
 
 
@@ -99,15 +99,15 @@ class RenumberTests(unittest.TestCase):
         goal_source = renumber._read_source(self.fixture.goals)
         goal = renumber.parse_goals(goal_source)[0]
         values = {
-            "alignment": 2,
-            "impact": 4,
-            "urgency": 1,
-            "effort": 3,
+            "backlog_alignment": 2,
+            "backlog_impact": 4,
+            "backlog_urgency": 1,
+            "backlog_effort": 3,
         }
 
         self.assertEqual(renumber.calculate_score(goal, values), 15)
 
-        values["alignment"] = 1
+        values["backlog_alignment"] = 1
         self.assertEqual(renumber.calculate_score(goal, values), 11)
 
     def test_goal_bonus_tracks_the_ordered_goal_count(self) -> None:
@@ -121,7 +121,7 @@ class RenumberTests(unittest.TestCase):
 
     def test_malformed_domain_is_unranked_and_reported(self) -> None:
         values = dict(DEFAULT_VALUES)
-        values["impact"] = "⭐⭐⭐⭐⭐⭐"
+        values["backlog_impact"] = "⭐⭐⭐⭐⭐⭐"
         path = self.fixture.add(
             "invalid.md", issue_text(values=values, generated=(99, 1))
         )
@@ -130,7 +130,7 @@ class RenumberTests(unittest.TestCase):
 
         self.assertEqual(len(plan.valid_open), 0)
         self.assertEqual(len(plan.needs_prioritization), 1)
-        self.assertIn("invalid impact", plan.needs_prioritization[0].problems[0])
+        self.assertIn("invalid backlog_impact", plan.needs_prioritization[0].problems[0])
         self.assertEqual(len(plan.changes), 1)
 
         renumber.apply_plan(plan)
@@ -179,7 +179,7 @@ class RenumberTests(unittest.TestCase):
 
     def test_invalid_open_removes_generated_block_values_completely(self) -> None:
         values = dict(DEFAULT_VALUES)
-        del values["effort"]
+        del values["backlog_effort"]
         path = self.fixture.add(
             "invalid-block-generated.md",
             issue_text(
@@ -288,7 +288,7 @@ class RenumberTests(unittest.TestCase):
 
     def test_missing_issue_does_not_block_valid_ranking(self) -> None:
         missing_values = dict(DEFAULT_VALUES)
-        del missing_values["effort"]
+        del missing_values["backlog_effort"]
         missing = self.fixture.add(
             "missing.md", issue_text(values=missing_values, generated=(70, 9))
         )
@@ -300,7 +300,7 @@ class RenumberTests(unittest.TestCase):
         self.assertEqual(plan.valid_open[0].source.path, valid)
         self.assertEqual(plan.valid_open[0].assigned_rank, 1)
         self.assertEqual(len(plan.needs_prioritization), 1)
-        self.assertIn("missing effort", plan.needs_prioritization[0].problems)
+        self.assertIn("missing backlog_effort", plan.needs_prioritization[0].problems)
 
         renumber.apply_plan(plan)
         self.assertIn("backlog_rank: 1", valid.read_text(encoding="utf-8"))
@@ -315,8 +315,8 @@ class RenumberTests(unittest.TestCase):
         renumber.apply_plan(plan)
         content = path.read_text(encoding="utf-8")
 
-        self.assertIn('strategic_goal: "1 - Ship Hana"', content)
-        self.assertIn('impact: "⭐⭐⭐⭐"', content)
+        self.assertIn('backlog_goal: "1 - Ship Hana"', content)
+        self.assertIn('backlog_impact: "⭐⭐⭐⭐"', content)
         self.assertNotIn("backlog_score:", content)
         self.assertNotIn("backlog_rank:", content)
 
@@ -326,7 +326,7 @@ class RenumberTests(unittest.TestCase):
         alpha = self.fixture.add("alpha.md", issue_text(generated=(15, 7)))
 
         lower_values = dict(DEFAULT_VALUES)
-        lower_values["impact"] = "⭐"
+        lower_values["backlog_impact"] = "⭐"
         lower = self.fixture.add("lower.md", issue_text(values=lower_values))
 
         plan = renumber.build_plan(self.fixture.scope)
@@ -422,7 +422,7 @@ class RenumberTests(unittest.TestCase):
 
     def test_require_complete_fails_only_for_unassessed_open_issues(self) -> None:
         missing_values = dict(DEFAULT_VALUES)
-        del missing_values["effort"]
+        del missing_values["backlog_effort"]
         self.fixture.add("missing.md", issue_text(values=missing_values))
 
         with mock.patch.object(renumber, "PRODUCTION_SCOPE", self.fixture.scope):

@@ -26,11 +26,11 @@ ISSUES_PATH = VAULT_PATH / "issues"
 GOALS_PATH = VAULT_PATH / "prioritization goals.md"
 
 RUBRIC_FIELDS = (
-    "strategic_goal",
-    "alignment",
-    "impact",
-    "urgency",
-    "effort",
+    "backlog_goal",
+    "backlog_alignment",
+    "backlog_impact",
+    "backlog_urgency",
+    "backlog_effort",
 )
 TOP_LEVEL_FIELD_RE = re.compile(
     r"^(?P<key>[A-Za-z_][A-Za-z0-9_-]*):(?P<raw>.*?)(?:\r?\n)?$"
@@ -77,11 +77,11 @@ class ParsedNote:
 
 
 class CurrentRubric(TypedDict):
-    strategic_goal: str | None
-    alignment: str | None
-    impact: str | None
-    urgency: str | None
-    effort: str | None
+    backlog_goal: str | None
+    backlog_alignment: str | None
+    backlog_impact: str | None
+    backlog_urgency: str | None
+    backlog_effort: str | None
 
 
 class ManifestRecord(TypedDict):
@@ -472,7 +472,7 @@ def _optional_domain(note: ParsedNote, key: str, path: Path) -> str | None:
 
 
 def _optional_goal(note: ParsedNote, path: Path) -> str | None:
-    value = _optional_domain(note, "strategic_goal", path)
+    value = _optional_domain(note, "backlog_goal", path)
     return None if value is None else renumber.normalize_obsidian_links(value)
 
 
@@ -502,11 +502,11 @@ def _record(
         return None
 
     current = CurrentRubric(
-        strategic_goal=_optional_goal(note, path),
-        alignment=_optional_domain(note, "alignment", path),
-        impact=_optional_domain(note, "impact", path),
-        urgency=_optional_domain(note, "urgency", path),
-        effort=_optional_domain(note, "effort", path),
+        backlog_goal=_optional_goal(note, path),
+        backlog_alignment=_optional_domain(note, "backlog_alignment", path),
+        backlog_impact=_optional_domain(note, "backlog_impact", path),
+        backlog_urgency=_optional_domain(note, "backlog_urgency", path),
+        backlog_effort=_optional_domain(note, "backlog_effort", path),
     )
     body_bytes = len(note.body.encode("utf-8"))
     note_bytes = len(review_hash.canonical_review_bytes(source))
