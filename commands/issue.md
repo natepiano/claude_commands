@@ -112,7 +112,7 @@ If the shorthand doesn't match any of these, tell the user and stop.
 
 9. Show the user the created file path and a summary of what was created.
 
-10. Report the ranking. The vault's background watcher computes `backlog_score` and `backlog_rank` from the survey inputs about 500ms after the file is written. Wait about a minute for it to settle, then re-read the created file's frontmatter and report `backlog_rank` (and `backlog_score`) to the user, so they see where the new issue landed in the global ordering.
+10. Report the ranking. The vault's background watcher computes `backlog_score` and `backlog_rank` from the survey inputs within ~1s of the file write. Wait ~1-2s, then re-read the created file's frontmatter and report `backlog_rank` (and `backlog_score`) to the user, so they see where the new issue landed in the global ordering.
 
 ## Important
 - Do NOT commit the changes
