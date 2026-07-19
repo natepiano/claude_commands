@@ -22,7 +22,8 @@ from collections import Counter
 from dataclasses import dataclass, field
 from datetime import date, datetime
 from pathlib import Path
-from typing import Sequence
+from collections.abc import Sequence
+from typing import TypedDict
 from zoneinfo import ZoneInfo
 
 import writer_lock  # pyright: ignore[reportImplicitRelativeImport]
@@ -31,6 +32,7 @@ import writer_lock  # pyright: ignore[reportImplicitRelativeImport]
 VAULT_PATH = Path("/Users/natemccoy/rust/hanadocs")
 ISSUES_PATH = VAULT_PATH / "issues"
 GOALS_PATH = VAULT_PATH / "prioritization goals.md"
+RANKINGS_FILENAME = "backlog-rankings.jsonl"
 
 STAR = "⭐"
 STAR_VALUES = tuple(STAR * count for count in range(1, 6))
@@ -707,6 +709,68 @@ def _rollback(written: Sequence[PlannedChange]) -> list[str]:
     return failures
 
 
+class RankingEntry(TypedDict):
+    name: str
+    rank: int
+    score: int
+
+
+def _rankings_content(plan: RankingPlan) -> bytes:
+    """Serialize the canonical ordering as name-sorted JSON Lines."""
+    entries: list[RankingEntry] = []
+    for issue in plan.valid_open:
+        rank = issue.assigned_rank
+        score = issue.score
+        if rank is None or score is None:
+            raise PlanningError(
+                f"ranked issue is missing derived values: {issue.source.path}"
+            )
+        entries.append(
+            RankingEntry(name=issue.source.path.stem, rank=rank, score=score)
+        )
+    entries.sort(key=lambda entry: entry["name"])
+    return "".join(
+        f"{json.dumps(entry, ensure_ascii=False)}\n" for entry in entries
+    ).encode("utf-8")
+
+
+def _write_rankings(plan: RankingPlan) -> None:
+    """Overwrite the derived rankings export beside the vault's Base views.
+
+    The export mirrors the canonical ``backlog_rank`` frontmatter and is written
+    under the same writer lock as the ranks it reflects. A failure here never
+    unwinds the applied frontmatter: the frontmatter is the source of truth and
+    the next apply rewrites this file.
+    """
+    content = _rankings_content(plan)
+    path = plan.scope.vault / RANKINGS_FILENAME
+    try:
+        if path.exists() and path.read_bytes() == content:
+            return
+        file_descriptor, temporary_name = tempfile.mkstemp(
+            prefix=f".{path.name}.prioritize-", dir=path.parent
+        )
+        temporary_path: str | None = temporary_name
+        try:
+            with os.fdopen(file_descriptor, "wb") as temporary:
+                _ = temporary.write(content)
+                temporary.flush()
+                os.fsync(temporary.fileno())
+            os.replace(temporary_path, path)
+            temporary_path = None
+        finally:
+            if temporary_path is not None:
+                try:
+                    os.unlink(temporary_path)
+                except FileNotFoundError:
+                    pass
+    except OSError as error:
+        print(
+            f"warning: could not write rankings export {path}: {error}",
+            file=sys.stderr,
+        )
+
+
 def apply_plan(plan: RankingPlan) -> None:
     _assert_issue_membership_unchanged(plan)
     _assert_source_unchanged(plan.goals_source)
@@ -749,6 +813,8 @@ def apply_plan(plan: RankingPlan) -> None:
         if rollback_failures:
             suffix = "; rollback warnings: " + "; ".join(rollback_failures)
         raise ApplyError(f"apply failed: {error}{suffix}") from error
+
+    _write_rankings(plan)
 
 
 def _relative_path(plan: RankingPlan, path: Path) -> str:
