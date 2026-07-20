@@ -263,7 +263,9 @@ class RenumberTests(unittest.TestCase):
 
         after = path.stat()
         self.assertNotEqual(path.read_bytes(), original)
-        self.assertNotEqual(after.st_ino, before.st_ino)
+        # In-place edit keeps the same inode; that is what preserves the
+        # creation date without a SetFile call.
+        self.assertEqual(after.st_ino, before.st_ino)
         self.assertEqual(int(after.st_birthtime), int(before.st_birthtime))
         observed_delta = after.st_mtime_ns - before.st_mtime_ns
         self.assertNotEqual(observed_delta, 0)

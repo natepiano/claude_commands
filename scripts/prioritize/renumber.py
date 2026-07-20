@@ -13,9 +13,7 @@ import hashlib
 import json
 import os
 import re
-import shutil
 import stat
-import subprocess
 import sys
 import tempfile
 from collections import Counter
@@ -613,84 +611,37 @@ def _assert_issue_membership_unchanged(plan: RankingPlan) -> None:
 
 
 def _atomic_write(path: Path, content: bytes, mode: int) -> None:
-    temporary_path: str | None = None
-    file_descriptor: int | None = None
-    try:
-        source_metadata = path.lstat()
-        file_descriptor, temporary_path = tempfile.mkstemp(
-            prefix=f".{path.name}.prioritize-", dir=path.parent
-        )
-        os.fchmod(file_descriptor, mode)
-        with os.fdopen(file_descriptor, "wb") as temporary:
-            file_descriptor = None
-            temporary.write(content)
-            temporary.flush()
-            os.fsync(temporary.fileno())
+    """Overwrite ``path`` in place, preserving its inode and creation date.
 
-        # Preserve creation time exactly. Request a one-millisecond mtime move
-        # within the same New York date so Obsidian invalidates its metadata
-        # cache while obsidian_knife still sees the same date_modified value.
-        # Filesystems may quantize the observed subsecond delta slightly.
-        shutil.copystat(path, temporary_path, follow_symlinks=False)
-        if sys.platform == "darwin":
-            if not hasattr(source_metadata, "st_birthtime"):
-                raise OSError(f"cannot preserve creation time for {path}")
-            created = datetime.fromtimestamp(source_metadata.st_birthtime).astimezone()
-            setfile = subprocess.run(
-                [
-                    "/usr/bin/SetFile",
-                    "-d",
-                    created.strftime("%m/%d/%Y %H:%M:%S"),
-                    temporary_path,
-                ],
-                check=False,
-                capture_output=True,
-                text=True,
-            )
-            if setfile.returncode != 0:
-                detail = setfile.stderr.strip() or setfile.stdout.strip()
-                raise OSError(f"cannot preserve creation time for {path}: {detail}")
-        os.utime(
-            temporary_path,
-            ns=(
-                source_metadata.st_atime_ns,
-                _refreshed_mtime_ns(source_metadata.st_mtime_ns),
-            ),
-            follow_symlinks=False,
-        )
-        refreshed_metadata = os.lstat(temporary_path)
-        if refreshed_metadata.st_mtime_ns == source_metadata.st_mtime_ns:
-            raise OSError(f"cannot refresh Obsidian metadata cache for {path}")
-        if _operational_date(refreshed_metadata.st_mtime_ns) != _operational_date(
-            source_metadata.st_mtime_ns
-        ):
-            raise OSError(f"cannot preserve modified calendar date for {path}")
+    Editing the existing file—rather than replacing it with a renamed temp
+    file—keeps the same inode, so the macOS creation date and every other
+    identity-bound attribute survive without a SetFile call. Only mtime is
+    nudged one millisecond within its New York date so Obsidian invalidates its
+    metadata cache while obsidian_knife still sees the same date_modified value.
 
-        metadata_fd = os.open(temporary_path, os.O_RDONLY)
-        try:
-            os.fsync(metadata_fd)
-        finally:
-            os.close(metadata_fd)
-        os.replace(temporary_path, path)
-        temporary_path = None
-        try:
-            directory_fd = os.open(path.parent, os.O_RDONLY)
-            try:
-                os.fsync(directory_fd)
-            finally:
-                os.close(directory_fd)
-        except OSError:
-            # The replacement is still atomic on filesystems that do not permit
-            # directory fsync (notably some macOS filesystem configurations).
-            pass
-    finally:
-        if file_descriptor is not None:
-            os.close(file_descriptor)
-        if temporary_path is not None:
-            try:
-                os.unlink(temporary_path)
-            except FileNotFoundError:
-                pass
+    The write is deliberately not crash-atomic: a reader that catches the brief
+    mid-write window may observe a partial file. The next deterministic apply
+    rewrites the canonical content, so the exposure self-heals.
+    """
+    before = path.lstat()
+
+    file_descriptor = os.open(path, os.O_WRONLY | os.O_NOFOLLOW)
+    with os.fdopen(file_descriptor, "wb") as handle:
+        os.fchmod(handle.fileno(), mode)
+        _ = handle.write(content)
+        handle.flush()
+        _ = handle.truncate()
+
+    os.utime(
+        path,
+        ns=(before.st_atime_ns, _refreshed_mtime_ns(before.st_mtime_ns)),
+        follow_symlinks=False,
+    )
+    refreshed = os.lstat(path)
+    if refreshed.st_mtime_ns == before.st_mtime_ns:
+        raise OSError(f"cannot refresh Obsidian metadata cache for {path}")
+    if _operational_date(refreshed.st_mtime_ns) != _operational_date(before.st_mtime_ns):
+        raise OSError(f"cannot preserve modified calendar date for {path}")
 
 
 def _rollback(written: Sequence[PlannedChange]) -> list[str]:
