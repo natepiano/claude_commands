@@ -208,8 +208,8 @@ recommend exactly one next command, but do not invoke it:
   then `/make_a_worktree`, then `/plan:delegate`.
 - **Design settled, small and coherent** — `/make_a_worktree`, then
   `/plan:delegate single` with the design doc as context.
-- **Decomposed into several issues** — `/issue` for each, then `/prioritize` to
-  rank them.
+- **Decomposed into several issues** — `/issue` for each; its survey rates them
+  and the background watcher ranks them automatically.
 - **Already implemented or obsolete** — `/close_issue` with the supported
   reason.
 

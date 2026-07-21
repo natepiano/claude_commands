@@ -23,7 +23,7 @@ description: Delegate coding work to a configured CLI agent — the main agent o
 
 SESSION_DIR = (captured from prepare_session.sh output — see PrepareSession)
 WORKING_DIR = current project directory (often a worktree checkout, sometimes main — use it as-is; never create a worktree or switch branches)
-FIX_PASS = 0 (max 2 per phase; resets in <NextPhase/>)
+FIX_PASS = 0 (max 4 per phase; resets in <NextPhase/>)
 IMPLEMENTATION_TASK = implementation
 APPLICATION_SMOKE_RESULT = not_run (resets in <NextPhase/>)
 MODE = single when `single` was passed or the work is not phased; verbose when
@@ -523,7 +523,7 @@ without asking:
 
    **Auto fix pass** — when every remaining confirmed issue has an unambiguous
    correct fix (the spec answers it and the two reviews do not conflict on
-   intended behavior) and ${FIX_PASS} < 2: increment ${FIX_PASS}, write
+   intended behavior) and ${FIX_PASS} < 4: increment ${FIX_PASS}, write
    ${SESSION_DIR}/fix_prompt_${FIX_PASS}.md (same structure as the work order,
    spec = the confirmed issues table with file/line specifics, same no-commit
    rules and style requirements), select `${FIX_TASK}` — `mechanical` only
@@ -537,7 +537,7 @@ without asking:
 
    **STOP** — when any remaining issue needs a design decision the plan does
    not answer, when the two reviews conflict on *intended behavior* (not just
-   severity), or when ${FIX_PASS} >= 2 with blockers remaining. Present the
+   severity), or when ${FIX_PASS} >= 4 with blockers remaining. Present the
    two-layer result above plus the choices — each option one sentence, no
    jargon, with a recommendation and the reason for it:
 
@@ -551,7 +551,7 @@ Your choice:
 3. Talk through any item first.
 ```
 
-   Do not surface internal bookkeeping (`fix pass 1 of 2 used`) as the headline;
+   Do not surface internal bookkeeping (`fix pass 1 of 4 used`) as the headline;
    if the cap is relevant, state it without jargon inside option 1. **Wait for
    the user.**
 
@@ -779,7 +779,7 @@ every line must stand on its own for a reader who has not seen the plan.
 - Delegate launchers record task, family, agent, and effort in the session directory. Never rely on an empty effort silently becoming `xhigh`.
 - Select `escalation` from the actual Work Order or review outcome, never keyword matching.
 - The main agent orchestrates and reviews; the delegate agent codes. The main agent touches implementation code only on explicit user instruction — except post-review doc-only or trivial fixes that both reviews agree on (see the direct-fix exception in <Synthesize>), which the main agent applies itself and reports.
-- Max 2 delegate fix passes per phase before stopping for the user; an explicit user choice of another pass overrides the cap.
+- Max 4 delegate fix passes per phase before stopping for the user; an explicit user choice of another pass overrides the cap.
 - Auto/loop mode stops only for: an unresolved `**Pending decision:**` on the phase being dispatched, a fix that needs a design decision the plan does not answer, reviews conflicting on intended behavior, the fix-pass cap with blockers remaining, or a delegate/environment error. Everything else auto-routes or defers.
 - Verbose mode has all of those stops plus a mandatory <VerbosePrePhaseGate/>
   before every phase outside an active bounded-auto window, a
