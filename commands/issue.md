@@ -27,6 +27,7 @@ Look up the project shorthand from the base files in the vault root (`/Users/nat
 | diegetic | bevy_diegetic | issues - diegetic.base |
 | fairy_dust | fairy_dust | issues - fairy_dust.base |
 | hana | hana | issues - hana.base |
+| lading | hana_lading | issues - lading.base |
 | lagrange | bevy_lagrange | issues - lagrange.base |
 | liminal | bevy_liminal | issues - liminal.base |
 | nateroids | nateroids | issues - nateroids.base |
