@@ -56,19 +56,33 @@ and control flow after compaction.
 
 ## Delegate heartbeat
 
-Every write-mode dispatch (implementation and fix passes) maintains
-`${SESSION_DIR}/heartbeat.log`. Line format: `<ISO time> <epoch>
-[wrapper|agent] <message>`.
+Every dispatch in a session — implementation, blind review, fix passes,
+escalations — shares one `${SESSION_DIR}/heartbeat.log`, so a single read shows
+the whole session's timeline. Beat lines: `<ISO time> [wrapper|agent]
+<message>`.
 
-- `[wrapper]` lines come from `implement.sh`: one `dispatched` seed line, then
-  one beat every 60s while the delegate process is alive. They prove liveness
-  only.
+- **Header block** — each launcher (`implement.sh`, `review.sh`) opens its run
+  with `---- <ISO time> [<role> (<family>/<model>:<effort>)] ----`
+  (an empty resolved effort shows as `unset`, never silently) followed by
+  the responsibility text the main agent passed as the launcher's 5th
+  argument: 1-2 lines saying what this specific run is responsible for (e.g.
+  `Phase 3 — implement the parser Work Order` or `Fix pass 2 — clippy
+  findings from the dual review`). Always pass it; the scripts' fallback text
+  is generic.
+- `[wrapper]` lines come from the launcher: one beat every 60s while the
+  delegate process is alive, tagged with the role. They prove liveness only.
 - `[agent]` lines are the delegate's own narration, written via
   `~/.claude/scripts/agents/heartbeat.sh` immediately before each new activity
   ("implementing the parser changes", "running clippy for verification"). The
   delegate cannot write during a blocking command, so an agent line's age
   measures how long the last-named activity has been running — it is not
   staleness.
+- **Handoff rule:** a delegate only narrates if its prompt names the concrete
+  heartbeat file path — delegates have no `${SESSION_DIR}` variable. Every
+  write-mode prompt (work order and fix prompts) must carry the heartbeat
+  paragraph with the path substituted. Review prompts must NOT: the reviewer's
+  read-only sandbox cannot write, so reviews contribute header + `[wrapper]`
+  beats only, via `review.sh`.
 
 Reading rules — the **Background wait invariant** stands unchanged:
 
@@ -84,8 +98,7 @@ Reading rules — the **Background wait invariant** stands unchanged:
   the user only if that duration is implausible for the activity. `[wrapper]`
   lines older than ~150s (2.5x the 60s cadence) mean the delegate process is
   dead — expect the task notification imminently; do not act before it arrives.
-- Review dispatches have no heartbeat: the blind reviewer runs in a read-only
-  sandbox and cannot write files. `review_agent.log` is the only signal there.
+  Read entries below the most recent header block as belonging to that run.
 
 ---
 
@@ -399,7 +412,7 @@ delegate family with `/agent`.
 <LaunchImplementation>
 **Goal:** Run the delegate agent and wait for completion.
 
-1. Run `bash ~/.claude/scripts/delegate/implement.sh "${SESSION_DIR}" "${WORKING_DIR}" "${SESSION_DIR}/implementation_prompt.md" "${IMPLEMENTATION_TASK}"` using Bash with `run_in_background: true` and `dangerouslyDisableSandbox: true`
+1. Run `bash ~/.claude/scripts/delegate/implement.sh "${SESSION_DIR}" "${WORKING_DIR}" "${SESSION_DIR}/implementation_prompt.md" "${IMPLEMENTATION_TASK}" "<responsibility>"` using Bash with `run_in_background: true` and `dangerouslyDisableSandbox: true` — `<responsibility>` is 1-2 lines naming what this run implements (for a phased plan: phase number, title, and the Work Order's goal in a few words)
 2. Inform the user: "The delegate agent is implementing... (heartbeat: ${SESSION_DIR}/heartbeat.log)"
 3. Apply the **Background wait invariant**: keep this turn visibly attached to
    the returned handle and wait for the background task notification. Do NOT
@@ -452,7 +465,7 @@ If you find nothing, say so explicitly — do not invent findings.
 **BLINDNESS RULE:** the review prompt must NOT contain ${IMPL_SUMMARY} or any hint of what the implementer claims it did. Spec + diff only.
 
 **Step 3 — Launch the delegate review:**
-Run `bash ~/.claude/scripts/delegate/review.sh "${SESSION_DIR}" "${WORKING_DIR}" "${SESSION_DIR}/review_prompt.md" review` using Bash with `run_in_background: true` and `dangerouslyDisableSandbox: true`.
+Run `bash ~/.claude/scripts/delegate/review.sh "${SESSION_DIR}" "${WORKING_DIR}" "${SESSION_DIR}/review_prompt.md" review "<responsibility>"` using Bash with `run_in_background: true` and `dangerouslyDisableSandbox: true` — `<responsibility>` is 1-2 lines naming what is under review (e.g. `Blind review of the phase 3 diff against its Work Order; no implementer summary provided`).
 
 Retain the returned handle. The main agent performs Step 4 while the review
 runs, then applies the **Background wait invariant** until that handle completes.
@@ -575,8 +588,11 @@ without asking:
    trivial rename, or an equivalently behavior-preserving edit; `escalation`
    when review found incorrect behavior, numerical/transform math, unresolved
    architecture, or a prior fix failed; otherwise `implementation` — then run
-   `bash ~/.claude/scripts/delegate/implement.sh "${SESSION_DIR}" "${WORKING_DIR}" "${SESSION_DIR}/fix_prompt_${FIX_PASS}.md" "${FIX_TASK}"`
-   (background, unsandboxed). Tell the user in one line what is being fixed.
+   `bash ~/.claude/scripts/delegate/implement.sh "${SESSION_DIR}" "${WORKING_DIR}" "${SESSION_DIR}/fix_prompt_${FIX_PASS}.md" "${FIX_TASK}" "<responsibility>"`
+   (background, unsandboxed) — `<responsibility>` is 1-2 lines naming the fix
+   pass and the confirmed issues it addresses (e.g. `Fix pass 2 — restore the
+   error path dropped from the parser; both reviews flagged it`). Tell the
+   user in one line what is being fixed.
    Re-execute <DualReview/> and <Synthesize/> scoped to the new changes.
 
    **STOP** — when any remaining issue needs a design decision the plan does
