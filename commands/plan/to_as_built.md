@@ -203,6 +203,16 @@ must include:
   - read each **peer markdown** doc in the source plan directory (except the
     source plan doc itself) and do the same check for contradicting or stale
     statements.
+- For each peer doc that survives reconciliation, classify it:
+  - `contract` — it describes the current shipped design (status says
+    implemented, no pending work orders); it is an as-built in fact, just not
+    in location.
+  - `working` — a plan, draft, or notes doc still in progress; leave it where
+    it is.
+  Return each `contract` doc in a `relocate` list: current path, suggested
+  `as-built/<name>.md` destination, one-line reason. If a sibling as-built
+  already covers the same subject, suggest a merge target instead of a move.
+  Do not move any file yourself.
 - For each affected doc, **apply the correction in place** — edit the stale
   types/signatures/invariants/behavior so the doc matches what now exists. Fix,
   do not flag. This is a **correct-everything pass**: an `Archived`/`Superseded`
@@ -223,14 +233,18 @@ must include:
   do **not** delete it. Return its path plus a one-line reason in an
   `obsolete` list for the orchestrator to confirm.
 - Output: a structured result — `edited` (paths + one-line summary of each fix),
-  `peer_docs_scanned` (paths checked in the source plan directory), and
-  `obsolete` (paths + reason).
+  `peer_docs_scanned` (paths checked in the source plan directory),
+  `obsolete` (paths + reason), and `relocate` (path + destination + reason).
 
 After the subagent returns:
 - The content edits are already applied; spot-check them against the change
   surface for accuracy.
 - For each `obsolete` doc, **state the path and reason and ask the user to
   confirm deletion** before removing it. Deleting a file is the user's call.
+- For each `relocate` doc, state the path, destination, and reason and ask the
+  user to confirm the move. On confirm, move the file into the as-built
+  directory and fix in-repo links to its old path (including links in the new
+  as-built doc).
 </ReconcileAsBuilt>
 
 ---
@@ -245,6 +259,7 @@ Produce a succinct markdown table:
 | As-built | <create: new path / amend: target docs updated, one line each> |
 | Removed | <old plan path; any predecessor + confirmed-obsolete as-built deleted, or None> |
 | Reconciled | <sibling as-built and peer source-doc edits made, one line each, or None> |
+| Relocated | <peer docs moved into as-built/, or None> |
 | Flavor | <A workspace / B package; create mode only> |
 | Links to fix | <paths needing a manual link update, or None> |
 ```
@@ -269,6 +284,8 @@ Then stop.
 - Reconcile sibling as-built docs and peer docs in the source-doc directory after
   writing the new one: apply content fixes in place (fix, do not flag), but
   confirm with the user before deleting an obsolete doc.
+- Peer docs classified as current-state contracts are offered for relocation
+  into `as-built/` — moved only on user confirmation.
 - `amend` disposition: no new doc and no distillation — fold the plan's change
   surface into the existing as-built docs, then delete the plan (user-confirmed).
   `needs_new_doc` items require explicit user confirmation before any file is
