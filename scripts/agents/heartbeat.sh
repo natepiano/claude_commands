@@ -11,9 +11,9 @@
 #   <role>         short role tag, e.g. "implementation (codex/gpt-5.6-sol:xhigh)"
 #   <description>  1-2 lines describing this run's responsibility (may contain \n)
 #
-# Beat line format:   <ISO-8601 UTC> [<source>] <message>
+# Beat line format:   <ISO-8601 local time+offset> [<source>] <message>
 # Header block format:
-#   ---- <ISO-8601 UTC> [<role>] ----
+#   ---- <ISO-8601 local time+offset> [<role>] ----
 #   <description>
 #
 # Single-line appends under PIPE_BUF are atomic, so concurrent wrapper and
@@ -39,7 +39,7 @@ if [[ "$SOURCE" == "header" ]]; then
         exit 2
     fi
     printf -- '---- %s [%s] ----\n%s\n' \
-        "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$1" "$2" >> "$FILE"
+        "$(date +%Y-%m-%dT%H:%M:%S%z)" "$1" "$2" >> "$FILE"
     exit 0
 fi
 
@@ -54,4 +54,4 @@ case "$SOURCE" in
 esac
 
 printf '%s [%s] %s\n' \
-    "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$SOURCE" "$MESSAGE" >> "$FILE"
+    "$(date +%Y-%m-%dT%H:%M:%S%z)" "$SOURCE" "$MESSAGE" >> "$FILE"

@@ -13,8 +13,9 @@
 #   <session_dir>/heartbeat.log     — shared liveness log for every dispatch in
 #                                     this session: a role header block at start,
 #                                     [wrapper] beats every 60s while the agent
-#                                     pid is alive, and [agent] narration lines
-#                                     (prompt-instructed)
+#                                     pid is alive (each carrying an activity
+#                                     digest from the agent log), and [agent]
+#                                     narration lines (prompt-instructed)
 
 set -euo pipefail
 
@@ -51,18 +52,11 @@ bash "${SCRIPT_DIR}/../agents/agent_exec.sh" \
   "${TASK}" write "${WORKING_DIR}" "${PROMPT_FILE}" "${SUMMARY_FILE}" "${LOG_FILE}" &
 AGENT_PID=$!
 
-# Wrapper beat: proves the delegate process is alive while it is blocked in a
-# long tool call and cannot narrate. [agent] lines come from the delegate
-# itself, per its prompt.
-(
-  waited=0
-  while kill -0 "${AGENT_PID}" 2>/dev/null; do
-    sleep "${HEARTBEAT_INTERVAL_SECS}"
-    kill -0 "${AGENT_PID}" 2>/dev/null || exit 0
-    waited=$((waited + HEARTBEAT_INTERVAL_SECS))
-    bash "${HEARTBEAT_HELPER}" "${HEARTBEAT_FILE}" wrapper "${SUBTASK} agent running ${waited}s" || true
-  done
-) &
+# Wrapper beats with an activity digest from the agent log: proves the process
+# is alive and names what it is doing even while blocked in a long tool call.
+# [agent] lines still come from the delegate itself, per its prompt.
+bash "${SCRIPT_DIR}/../agents/heartbeat_watch.sh" \
+  "${HEARTBEAT_FILE}" "${SUBTASK}" "${AGENT_PID}" "${LOG_FILE}" "${HEARTBEAT_INTERVAL_SECS}" &
 HEARTBEAT_LOOP_PID=$!
 
 AGENT_CODE=0

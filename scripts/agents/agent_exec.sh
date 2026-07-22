@@ -11,6 +11,36 @@ agents_exec_print_argv() {
     done
 }
 
+# claude --print with --output-format stream-json writes one JSON event per
+# line to the log as it happens (so heartbeat_watch.sh can narrate long turns);
+# this extracts the final result event's text into the output file to keep the
+# caller contract: output_file = final answer, log_file = full log.
+agents_claude_extract_result() {
+    python3 - "$1" "$2" <<'PY'
+import json
+import sys
+
+log_path, out_path = sys.argv[1], sys.argv[2]
+result = None
+try:
+    with open(log_path, encoding="utf-8", errors="replace") as log:
+        for line in log:
+            line = line.strip()
+            if not line.startswith("{"):
+                continue
+            try:
+                event = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if event.get("type") == "result" and isinstance(event.get("result"), str):
+                result = event["result"]
+except OSError:
+    pass
+with open(out_path, "w", encoding="utf-8") as out:
+    out.write(result if result is not None else "")
+PY
+}
+
 agents_exec_main() {
     if [[ "$#" -ne 6 ]]; then
         echo "Usage: agent_exec.sh <task> <write|readonly> <working_dir> <prompt_file> <output_file> <log_file>" >&2
@@ -23,7 +53,7 @@ agents_exec_main() {
     local prompt_file="$4"
     local output_file="$5"
     local log_file="$6"
-    local script_dir prompt family_args_line
+    local script_dir prompt family_args_line claude_code
     local -a family_args extra_args command
 
     if [[ ! -f "$prompt_file" ]]; then
@@ -84,6 +114,7 @@ agents_exec_main() {
                 command+=(--permission-mode plan)
             fi
             command+=(--settings '{"sandbox":{"enabled":false}}')
+            command+=(--verbose --output-format stream-json)
             command+=("${family_args[@]}")
             if [[ -n "${AGENT_EXEC_EXTRA_ARGS:-}" ]]; then
                 command+=("${extra_args[@]}")
@@ -96,13 +127,14 @@ agents_exec_main() {
                 printf ' && '
                 agents_exec_print_argv "${command[@]}"
                 printf ' > '
-                printf '%q' "$output_file"
-                printf ' 2> '
                 printf '%q' "$log_file"
-                printf '\n'
+                printf ' 2>&1\n'
                 return 0
             fi
-            ( cd "$working_dir" && "${command[@]}" > "$output_file" 2> "$log_file" )
+            claude_code=0
+            ( cd "$working_dir" && "${command[@]}" > "$log_file" 2>&1 ) || claude_code=$?
+            agents_claude_extract_result "$log_file" "$output_file" || true
+            return "$claude_code"
             ;;
         *)
             echo "ERROR: unsupported agent family '$AGENT_FAMILY'." >&2

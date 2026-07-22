@@ -11,9 +11,12 @@
 #   <session_dir>/review_agent.log     — full agent log
 #   <session_dir>/review_agent         — resolved task, family, agent, and effort
 #   <session_dir>/heartbeat.log        — shared with implement.sh: role header at
-#                                        start + [wrapper] beats every 60s. No
-#                                        [agent] lines — the reviewer's read-only
-#                                        sandbox cannot write files.
+#                                        start + [wrapper] beats every 60s, each
+#                                        carrying an activity digest decoded from
+#                                        the reviewer's streamed log. No [agent]
+#                                        lines — the reviewer's read-only sandbox
+#                                        cannot write files; its prompt-instructed
+#                                        narration arrives via the digest instead.
 
 set -euo pipefail
 
@@ -50,17 +53,12 @@ bash "${SCRIPT_DIR}/../agents/agent_exec.sh" \
   "${TASK}" readonly "${WORKING_DIR}" "${PROMPT_FILE}" "${FINDINGS_FILE}" "${LOG_FILE}" &
 AGENT_PID=$!
 
-# Wrapper beat only: the reviewer's read-only sandbox cannot write [agent]
-# narration lines, so pid liveness is the sole in-flight signal here.
-(
-  waited=0
-  while kill -0 "${AGENT_PID}" 2>/dev/null; do
-    sleep "${HEARTBEAT_INTERVAL_SECS}"
-    kill -0 "${AGENT_PID}" 2>/dev/null || exit 0
-    waited=$((waited + HEARTBEAT_INTERVAL_SECS))
-    bash "${HEARTBEAT_HELPER}" "${HEARTBEAT_FILE}" wrapper "${SUBTASK} agent running ${waited}s" || true
-  done
-) &
+# The reviewer's read-only sandbox cannot write [agent] lines, but it is not
+# blind: the wrapper beat carries an activity digest decoded from the
+# reviewer's own streamed log (the tool it is running, the file it is reading,
+# its prompt-instructed narration lines).
+bash "${SCRIPT_DIR}/../agents/heartbeat_watch.sh" \
+  "${HEARTBEAT_FILE}" "${SUBTASK}" "${AGENT_PID}" "${LOG_FILE}" "${HEARTBEAT_INTERVAL_SECS}" &
 HEARTBEAT_LOOP_PID=$!
 
 AGENT_CODE=0

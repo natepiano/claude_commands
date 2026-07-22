@@ -76,12 +76,12 @@ assert_equal "codex readonly command is wrong" \
 
 claude_write="$(run_dry claude_case.task write)"
 assert_equal "claude write command is wrong" \
-    "cd $WORKING_DIR && claude --print --dangerously-skip-permissions --settings \\{\\\"sandbox\\\":\\{\\\"enabled\\\":false\\}\\} --model opus --effort max -- test\\ prompt > $OUTPUT_FILE 2> $LOG_FILE" \
+    "cd $WORKING_DIR && claude --print --dangerously-skip-permissions --settings \\{\\\"sandbox\\\":\\{\\\"enabled\\\":false\\}\\} --verbose --output-format stream-json --model opus --effort max -- test\\ prompt > $LOG_FILE 2>&1" \
     "$claude_write"
 
 claude_readonly="$(run_dry claude_case.task readonly)"
 assert_equal "claude readonly command is wrong" \
-    "cd $WORKING_DIR && claude --print --permission-mode plan --settings \\{\\\"sandbox\\\":\\{\\\"enabled\\\":false\\}\\} --model opus --effort max -- test\\ prompt > $OUTPUT_FILE 2> $LOG_FILE" \
+    "cd $WORKING_DIR && claude --print --permission-mode plan --settings \\{\\\"sandbox\\\":\\{\\\"enabled\\\":false\\}\\} --verbose --output-format stream-json --model opus --effort max -- test\\ prompt > $LOG_FILE 2>&1" \
     "$claude_readonly"
 
 bare_command="$(run_dry bare_case.task write)"

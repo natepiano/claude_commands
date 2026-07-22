@@ -65,28 +65,42 @@ the whole session's timeline. Beat lines: `<ISO time> [wrapper|agent]
   with `---- <ISO time> [<role> (<family>/<model>:<effort>)] ----`
   (an empty resolved effort shows as `unset`, never silently) followed by
   the responsibility text the main agent passed as the launcher's 5th
-  argument: 1-2 lines saying what this specific run is responsible for (e.g.
-  `Phase 3 — implement the parser Work Order` or `Fix pass 2 — clippy
-  findings from the dual review`). Always pass it; the scripts' fallback text
-  is generic.
-- `[wrapper]` lines come from the launcher: one beat every 60s while the
-  delegate process is alive, tagged with the role. They prove liveness only.
+  argument. Its first line always names the plan and phase:
+  `<plan-doc filename> — phase: <phase identifier>` (work without a plan doc
+  uses `adhoc — <short scope name>` instead). Then 1-2 lines saying what this
+  specific run is responsible for (e.g. `implement the parser Work Order` or
+  `fix pass 2 — clippy findings from the dual review`). Always pass it; the
+  scripts' fallback text is generic.
+- `[wrapper]` lines come from the launcher (`heartbeat_watch.sh`): one beat
+  every 60s while the delegate process is alive, tagged with the role and
+  carrying an activity digest decoded from the delegate's own streamed log —
+  the latest tool call (`Bash: cargo nextest run`), narration line, or output
+  line. They prove liveness AND name what the process is doing, even
+  mid-blocking-command and even for dispatches that cannot write `[agent]`
+  lines.
 - `[agent]` lines are the delegate's own narration, written via
   `~/.claude/scripts/agents/heartbeat.sh` immediately before each new activity
   ("implementing the parser changes", "running clippy for verification"). The
   delegate cannot write during a blocking command, so an agent line's age
   measures how long the last-named activity has been running — it is not
   staleness.
-- **Handoff rule:** a delegate only narrates if its prompt names the concrete
-  heartbeat file path — delegates have no `${SESSION_DIR}` variable. Every
-  write-mode prompt (work order and fix prompts) must carry the heartbeat
-  paragraph with the path substituted. Review prompts must NOT: the reviewer's
-  read-only sandbox cannot write, so reviews contribute header + `[wrapper]`
-  beats only, via `review.sh`.
+- **Handoff rule:** a delegate only writes `[agent]` lines if its prompt names
+  the concrete heartbeat file path — delegates have no `${SESSION_DIR}`
+  variable. Every write-mode prompt (work order and fix prompts) must carry the
+  heartbeat paragraph with the path substituted. Review prompts must NOT carry
+  the file path — reviewers cannot write it (codex read-only runs under an OS
+  sandbox that fails every write; claude plan mode refuses mutating commands
+  even when explicitly allowlisted — verified empirically). Review prompts
+  instead carry the **narration instruction**: the reviewer emits one short
+  line of output text before each activity, which streams into its log and
+  reaches heartbeat.log through the `[wrapper]` digest within one beat. No
+  dispatch is ever dark.
 
 Reading rules — the **Background wait invariant** stands unchanged:
 
-- Read the file on demand, as a single read. Never in a wait loop, and never as
+- Read the file on demand, as a single read — and read only the tail (last
+  ~40 lines, e.g. `tail -n 40`), not the whole file: a long multi-phase
+  session accumulates hundreds of lines. Never in a wait loop, and never as
   a completion signal; the background task notification remains the only wait
   mechanism.
 - Read it when: the user interjects during a wait and asks what is happening
@@ -94,10 +108,11 @@ Reading rules — the **Background wait invariant** stands unchanged:
   compaction (one read to re-establish where the delegate is); or when a
   delegate has run far longer than its scope suggests (one staleness check).
 - Interpretation: fresh `[wrapper]` lines + an old `[agent]` line mean the
-  delegate is alive and has been in the named activity that long — flag it to
-  the user only if that duration is implausible for the activity. `[wrapper]`
-  lines older than ~150s (2.5x the 60s cadence) mean the delegate process is
-  dead — expect the task notification imminently; do not act before it arrives.
+  delegate is alive and has been in the named activity that long — the wrapper
+  digest shows what it is actually doing meanwhile; flag it to the user only
+  if that duration is implausible for the activity. `[wrapper]` lines older
+  than ~150s (2.5x the 60s cadence) mean the delegate process is dead —
+  expect the task notification imminently; do not act before it arrives.
   Read entries below the most recent header block as belonging to that run.
 
 ---
@@ -280,7 +295,8 @@ running build/lint/tests), run
   bash ~/.claude/scripts/agents/heartbeat.sh <SESSION_DIR>/heartbeat.log agent "<what you are about to do>"
 with a short present-tense phrase of real words naming the activity (e.g.
 "implementing the parser changes", "running clippy for verification"). One
-line per activity change. Never read the heartbeat file — it is for the
+line per activity change — err on the side of too many, not too few; a long
+gap reads as a hang. Never read the heartbeat file — it is for the
 orchestrator only.
 
 ## Project Context
@@ -412,7 +428,7 @@ delegate family with `/agent`.
 <LaunchImplementation>
 **Goal:** Run the delegate agent and wait for completion.
 
-1. Run `bash ~/.claude/scripts/delegate/implement.sh "${SESSION_DIR}" "${WORKING_DIR}" "${SESSION_DIR}/implementation_prompt.md" "${IMPLEMENTATION_TASK}" "<responsibility>"` using Bash with `run_in_background: true` and `dangerouslyDisableSandbox: true` — `<responsibility>` is 1-2 lines naming what this run implements (for a phased plan: phase number, title, and the Work Order's goal in a few words)
+1. Run `bash ~/.claude/scripts/delegate/implement.sh "${SESSION_DIR}" "${WORKING_DIR}" "${SESSION_DIR}/implementation_prompt.md" "${IMPLEMENTATION_TASK}" "<responsibility>"` using Bash with `run_in_background: true` and `dangerouslyDisableSandbox: true` — `<responsibility>` starts with the plan/phase line (`<plan-doc filename> — phase: <identifier>`, or `adhoc — <scope>` without a plan doc), then 1-2 lines naming what this run implements (the Work Order's goal in a few words)
 2. Inform the user: "The delegate agent is implementing... (heartbeat: ${SESSION_DIR}/heartbeat.log)"
 3. Apply the **Background wait invariant**: keep this turn visibly attached to
    the returned handle and wait for the background task notification. Do NOT
@@ -436,6 +452,13 @@ Run `git diff` and `git status --short` in ${WORKING_DIR}. For untracked new fil
 You are reviewing a code change you did not write. You have the specification
 it was implemented from and the full diff. Review independently and critically.
 You have read-only access to the codebase — read surrounding code as needed.
+
+Narrate as you go: before each new activity (reading the diff, opening a
+surrounding file, checking a spec section, composing findings), output one
+short present-tense line of plain text naming it, e.g. "checking error
+handling in parser.rs against spec section 3". These lines stream to a
+liveness monitor; a long silent stretch reads as a hang. Narrate every
+activity change — err on the side of too many lines, not too few.
 
 Report findings as a numbered list. Each finding: one-line title, 1-3 sentence
 body naming file and line, and a severity tag:
@@ -465,7 +488,7 @@ If you find nothing, say so explicitly — do not invent findings.
 **BLINDNESS RULE:** the review prompt must NOT contain ${IMPL_SUMMARY} or any hint of what the implementer claims it did. Spec + diff only.
 
 **Step 3 — Launch the delegate review:**
-Run `bash ~/.claude/scripts/delegate/review.sh "${SESSION_DIR}" "${WORKING_DIR}" "${SESSION_DIR}/review_prompt.md" review "<responsibility>"` using Bash with `run_in_background: true` and `dangerouslyDisableSandbox: true` — `<responsibility>` is 1-2 lines naming what is under review (e.g. `Blind review of the phase 3 diff against its Work Order; no implementer summary provided`).
+Run `bash ~/.claude/scripts/delegate/review.sh "${SESSION_DIR}" "${WORKING_DIR}" "${SESSION_DIR}/review_prompt.md" review "<responsibility>"` using Bash with `run_in_background: true` and `dangerouslyDisableSandbox: true` — `<responsibility>` starts with the same plan/phase line as the implementation dispatch, then 1-2 lines naming what is under review (e.g. `tool-graph.md — phase: 3` newline `Blind review of the diff against its Work Order; no implementer summary provided`).
 
 Retain the returned handle. The main agent performs Step 4 while the review
 runs, then applies the **Background wait invariant** until that handle completes.
@@ -589,10 +612,11 @@ without asking:
    when review found incorrect behavior, numerical/transform math, unresolved
    architecture, or a prior fix failed; otherwise `implementation` — then run
    `bash ~/.claude/scripts/delegate/implement.sh "${SESSION_DIR}" "${WORKING_DIR}" "${SESSION_DIR}/fix_prompt_${FIX_PASS}.md" "${FIX_TASK}" "<responsibility>"`
-   (background, unsandboxed) — `<responsibility>` is 1-2 lines naming the fix
-   pass and the confirmed issues it addresses (e.g. `Fix pass 2 — restore the
-   error path dropped from the parser; both reviews flagged it`). Tell the
-   user in one line what is being fixed.
+   (background, unsandboxed) — `<responsibility>` starts with the plan/phase
+   line, then 1-2 lines naming the fix pass and the confirmed issues it
+   addresses (e.g. `tool-graph.md — phase: 3` newline `Fix pass 2 — restore
+   the error path dropped from the parser; both reviews flagged it`). Tell
+   the user in one line what is being fixed.
    Re-execute <DualReview/> and <Synthesize/> scoped to the new changes.
 
    **STOP** — when any remaining issue needs a design decision the plan does
