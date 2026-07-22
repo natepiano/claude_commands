@@ -203,6 +203,8 @@ For each returned unit:
 
    Concretely: derive the abstract pattern the rule prohibits or requires (e.g. "any field/parameter/binding whose name doesn't match the snake_case form of its type", "any raw literal at a call site that should be a named constant"), then search the codebase for every distinct match of that pattern — across all files, all binding positions, all literal kinds the rule covers.
 
+   Before running the project-wide search command(s), record another agent heartbeat (same invocation as step 0) with `--message "agent enumerating <unit_id>: <the abstract pattern, in a few words>"`. A long enumeration otherwise leaves the heartbeat silent between "reviewing" and "recorded".
+
    **Mandatory enumeration artifact.** Before deciding the unit's `outcome.status`, you must produce two written lines for the unit, regardless of whether the outcome is `finding` or `no_findings`:
 
    - **Surface searched** — one sentence naming the abstract pattern, derived from the rule (not from the first example). If the guideline file has a `### Surface` section, use it as the source of truth and quote it back; do not narrow it.

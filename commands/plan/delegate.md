@@ -54,6 +54,41 @@ and control flow after compaction.
 
 ---
 
+## Delegate heartbeat
+
+Every write-mode dispatch (implementation and fix passes) maintains
+`${SESSION_DIR}/heartbeat.log`. Line format: `<ISO time> <epoch>
+[wrapper|agent] <message>`.
+
+- `[wrapper]` lines come from `implement.sh`: one `dispatched` seed line, then
+  one beat every 60s while the delegate process is alive. They prove liveness
+  only.
+- `[agent]` lines are the delegate's own narration, written via
+  `~/.claude/scripts/agents/heartbeat.sh` immediately before each new activity
+  ("implementing the parser changes", "running clippy for verification"). The
+  delegate cannot write during a blocking command, so an agent line's age
+  measures how long the last-named activity has been running — it is not
+  staleness.
+
+Reading rules — the **Background wait invariant** stands unchanged:
+
+- Read the file on demand, as a single read. Never in a wait loop, and never as
+  a completion signal; the background task notification remains the only wait
+  mechanism.
+- Read it when: the user interjects during a wait and asks what is happening
+  (report the last few lines in real words); when resuming after context
+  compaction (one read to re-establish where the delegate is); or when a
+  delegate has run far longer than its scope suggests (one staleness check).
+- Interpretation: fresh `[wrapper]` lines + an old `[agent]` line mean the
+  delegate is alive and has been in the named activity that long — flag it to
+  the user only if that duration is implausible for the activity. `[wrapper]`
+  lines older than ~150s (2.5x the 60s cadence) mean the delegate process is
+  dead — expect the task notification imminently; do not act before it arrives.
+- Review dispatches have no heartbeat: the blind reviewer runs in a read-only
+  sandbox and cannot write files. `review_agent.log` is the only signal there.
+
+---
+
 ## Multi-phase modes
 
 When the work comes from a phased plan doc, auto/loop mode is the default: run the
@@ -215,7 +250,7 @@ returns to STEP 2 for the next pre-phase gate, or ends with <RunSummary/>
   smoke test in <RunApplicationSmokeTest/>; delegate verification never
   substitutes for it.
 
-Prepend the boilerplate header (the first paragraph of the template below) and write the file with the **Write tool**. Do not open codebase files to fill gaps — if a needed fact is absent, the *plan* is at fault: name the gap in one line, proceed with what the doc gives, and let the review catch the rest. This path should cost a few thousand tokens, not tens of thousands.
+Prepend the boilerplate header (the first two paragraphs of the template below, with the concrete ${SESSION_DIR} path substituted into the heartbeat command) and write the file with the **Write tool**. Do not open codebase files to fill gaps — if a needed fact is absent, the *plan* is at fault: name the gap in one line, proceed with what the doc gives, and let the review catch the rest. This path should cost a few thousand tokens, not tens of thousands.
 
 **FALLBACK PATH — no Work Order (free-text, conversation-inferred, or a pre-`/plan:to_phased_plan` doc).**
 Research and compose. If a doc path was given, extract the applicable phase/section. Write `${SESSION_DIR}/implementation_prompt.md` with the **Write tool** (NOT Bash heredoc) using this template:
@@ -226,6 +261,14 @@ in the codebase. Do not ask questions — implement the spec below.
 Do NOT commit. Do NOT create branches. Do NOT touch files outside this task's scope.
 After making all changes, summarize what you did: which files you
 created/modified and why, and any deviations from the spec with reasons.
+
+Heartbeat: immediately before each new activity (reading code, editing a file,
+running build/lint/tests), run
+  bash ~/.claude/scripts/agents/heartbeat.sh <SESSION_DIR>/heartbeat.log agent "<what you are about to do>"
+with a short present-tense phrase of real words naming the activity (e.g.
+"implementing the parser changes", "running clippy for verification"). One
+line per activity change. Never read the heartbeat file — it is for the
+orchestrator only.
 
 ## Project Context
 
@@ -264,6 +307,7 @@ gate.]
 - Be specific enough that the delegate agent never has to guess; it cannot ask questions
 - Point to files the delegate agent can read itself rather than dumping file contents
 - Include the no-commit / no-branch rules verbatim — the delegate agent must leave the tree dirty for review
+- Include the heartbeat paragraph with the concrete ${SESSION_DIR} path substituted — the delegate has no ${SESSION_DIR} variable
 
 3. In single/loop mode or a verbose bounded-auto window, tell the user in one
    line what is being dispatched and the prompt path:
@@ -356,7 +400,7 @@ delegate family with `/agent`.
 **Goal:** Run the delegate agent and wait for completion.
 
 1. Run `bash ~/.claude/scripts/delegate/implement.sh "${SESSION_DIR}" "${WORKING_DIR}" "${SESSION_DIR}/implementation_prompt.md" "${IMPLEMENTATION_TASK}"` using Bash with `run_in_background: true` and `dangerouslyDisableSandbox: true`
-2. Inform the user: "The delegate agent is implementing..."
+2. Inform the user: "The delegate agent is implementing... (heartbeat: ${SESSION_DIR}/heartbeat.log)"
 3. Apply the **Background wait invariant**: keep this turn visibly attached to
    the returned handle and wait for the background task notification. Do NOT
    poll status files or end the turn.
@@ -526,7 +570,7 @@ without asking:
    intended behavior) and ${FIX_PASS} < 4: increment ${FIX_PASS}, write
    ${SESSION_DIR}/fix_prompt_${FIX_PASS}.md (same structure as the work order,
    spec = the confirmed issues table with file/line specifics, same no-commit
-   rules and style requirements), select `${FIX_TASK}` — `mechanical` only
+   rules, heartbeat instruction, and style requirements), select `${FIX_TASK}` — `mechanical` only
    when every confirmed issue is documentation, formatting, lint guidance, a
    trivial rename, or an equivalently behavior-preserving edit; `escalation`
    when review found incorrect behavior, numerical/transform math, unresolved
@@ -775,6 +819,7 @@ every line must stand on its own for a reader who has not seen the plan.
 - ${WORKING_DIR} is whatever the current project directory is — often a worktree checkout. Never create a worktree or switch branches. The only commits are <CheckpointCommit/> checkpoints in loop or verbose mode — one per completed phase, never a push.
 - All delegate-launching scripts run with `dangerouslyDisableSandbox: true` and `run_in_background: true`.
 - The **Background wait invariant** is mandatory. No active delegate terminal may outlive the primary-agent turn that launched it.
+- `${SESSION_DIR}/heartbeat.log` is for on-demand status only (see **Delegate heartbeat**): a single read when the user asks what is happening, once after compaction, or one staleness check on an overdue delegate — never a wait loop, never a completion signal.
 - The delegate reviewer is always a fresh session and always blind to the implementer's summary.
 - Delegate launchers record task, family, agent, and effort in the session directory. Never rely on an empty effort silently becoming `xhigh`.
 - Select `escalation` from the actual Work Order or review outcome, never keyword matching.

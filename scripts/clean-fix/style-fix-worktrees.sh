@@ -706,6 +706,12 @@ Required phase names, in order:
 
 Emit each marker on its own line, with no other text on the line. Do not skip markers even when a step has nothing to do — emit the marker and proceed (the user wants to see the step ran).
 
+During long phases (\`clippy-manual\`, \`tests\`, or a multi-file \`apply-finding\`), additionally emit free-form progress lines of the form:
+
+    >>> phase: note <short present-tense phrase>
+
+e.g. \`>>> phase: note fixing 3 clippy warnings in src/parse.rs\`. The watcher forwards any \`>>> phase:\` line to the user's chat. Use real words naming the activity, one line per activity change; these supplement the required markers, they never replace them.
+
 Step 1: Load the style guide and read referenced files
 Run: zsh ~/.claude/scripts/rust_style/load-rust-style.sh --project-root $agent_work_dir
 Then read each unique style file referenced by the findings in the scratch evaluation file. Each finding includes a **Style file** field with the full path to the style guide file (e.g., ~/rust/nate_style/rust/one-use-per-line.md or a repo-local docs/style/*.md file).
