@@ -84,13 +84,17 @@ block — nothing else. The prompt must include:
   3. **Layout** — a short map of only the dirs/files the phases touch.
   4. **Key files** — `path — role` for each file a phase reads or modifies, with
      line refs where the plan already cites them.
-  5. **Build / Test / Lint** — the exact commands/workflows this project uses
-     (read `Cargo.toml`/`package.json`/`justfile`/CI config; do not invent).
-     For Rust repos with the local `clippy` skill/workflow available, record the
-     lint gate as the full `clippy` skill, not a hand-expanded subset of
-     `cargo clippy`, `cargo mend`, `cargo doc`, or individual `lint ...`
-     commands. The `clippy` skill owns cache checking, `lint mend`, style review,
-     `lint clippy`, `lint doc`, and `lint fmt`.
+  5. **Build / Test / Lint** — for Rust, always these `verify.sh` lines with
+     the package name filled in (never raw cargo commands — Cargo's default
+     target selection compiles a package's examples even under `-p <pkg>`,
+     and the delegate must have no flag choices to make):
+     Build = `bash ~/.claude/scripts/delegate/verify.sh check <pkg>`;
+     Test = `bash ~/.claude/scripts/delegate/verify.sh test <pkg>`;
+     Lint = `bash ~/.claude/scripts/delegate/verify.sh lint <pkg>`.
+     Workspace-wide breadth — `--all-targets`, all examples, the full `clippy`
+     skill — belongs to /plan:delegate's <FinalGate/> after the last phase,
+     never to any phase. For non-Rust projects, record the exact commands the
+     project uses (read `package.json`/`justfile`/CI config; do not invent).
   6. **Style** — for Rust, the `load-rust-style.sh` line with the project root;
      omit for non-Rust.
   7. **Invariants** — project-wide rules every phase must preserve (from the plan
@@ -152,6 +156,10 @@ not codebase searching.
    - **Constraints from prior phases** — facts later phases need from earlier ones
      (what got built, decisions that bind). Empty for Phase 1.
    - **Acceptance gate** — the build/test/behavior proving the phase done.
+     Gate commands are the Delegation Context `verify.sh` lines (plus
+     `verify.sh example <pkg> <name>` only in phases whose Files touch that
+     example, and `verify.sh test <pkg> <int_test>` only in phases owning that
+     integration test) — never workspace-wide or example-building commands.
 
 3. **Fold design history into the phases, then drop the narrative.** Justification
    essays ("why this exists", "what's wrong with the old model"), alternatives,

@@ -117,6 +117,38 @@ Reading rules — the **Background wait invariant** stands unchanged:
 
 ---
 
+## Delegate verification (Rust)
+
+Delegates never compose cargo commands. Every build/test/lint a delegate runs
+is an exact line from its prompt invoking
+`~/.claude/scripts/delegate/verify.sh` — the script owns all flags, target
+selection, and the nextest fallback, so there is no scope choice to get wrong
+(Cargo compiles a package's examples even under `-p <pkg>`; the script pins
+explicit `--lib`/`--bins` targets from cargo metadata).
+
+| Intent | Line |
+| --- | --- |
+| compile feedback while coding | `bash ~/.claude/scripts/delegate/verify.sh check <package>` |
+| unit tests (phase gate) | `bash ~/.claude/scripts/delegate/verify.sh test <package>` |
+| one integration test target | `bash ~/.claude/scripts/delegate/verify.sh test <package> <int_test>` |
+| scoped lint (phase gate) | `bash ~/.claude/scripts/delegate/verify.sh lint <package>` |
+| one changed example | `bash ~/.claude/scripts/delegate/verify.sh example <package> <name>` |
+| full workspace gate | `verify.sh final` — <FinalGate/> only, never a phase delegate |
+
+- Work orders and fix prompts list the applicable lines verbatim with
+  `<package>` filled in; the delegate runs exactly those, nothing more. An
+  unrequested `cargo check --all-targets` or example build is a Work Order
+  violation, not diligence.
+- `example` lines appear only in phases whose **Files** touch that example;
+  integration-test lines only in phases that own that test.
+- Everything workspace-wide — `--all-targets`, all examples, the full `clippy`
+  skill — happens once in <FinalGate/> when the plan is exhausted, not per
+  phase.
+- Non-Rust projects: the Work Order lists the project's exact commands instead;
+  the run-only-what-is-listed rule is identical.
+
+---
+
 ## Multi-phase modes
 
 When the work comes from a phased plan doc, auto/loop mode is the default: run the
@@ -271,12 +303,15 @@ returns to STEP 2 for the next pre-phase gate, or ends with <RunSummary/>
 - **Work Specification** = the target phase's **Goal**, **Spec**, and **Files** verbatim + any free-text the user added on the command line.
 - **Style Requirements** = the standard block (see fallback template), included only if Delegation Context names a **Style** line.
 - **Verification** = Delegation Context **Build / Test / Lint / Run / Smoke**
-  entries that exist + the phase **Acceptance gate**. When the **Lint** line
-  names the `clippy` skill, write it into the prompt as "run the `clippy` skill
-  with `auto-proceed`" — a delegate session has no user to answer the skill's
-  batch-approval gate. The main agent still owns the mandatory live application
-  smoke test in <RunApplicationSmokeTest/>; delegate verification never
-  substitutes for it.
+  entries that exist + the phase **Acceptance gate**, translated into
+  `verify.sh` lines per **Delegate verification (Rust)**. Older plans carry raw
+  cargo commands — never pass those through: a bare `cargo nextest run` or any
+  `--all-targets`/example-building command becomes its scoped `verify.sh`
+  equivalent, and a **Lint** line naming the `clippy` skill becomes
+  `verify.sh lint <package>` (the full `clippy` skill runs once in
+  <FinalGate/>, not per phase). Note the translation in one line. The main
+  agent still owns the mandatory live application smoke test in
+  <RunApplicationSmokeTest/>; delegate verification never substitutes for it.
 
 Prepend the boilerplate header (the first two paragraphs of the template below, with the concrete ${SESSION_DIR} path substituted into the heartbeat command) and write the file with the **Write tool**. Do not open codebase files to fill gaps — if a needed fact is absent, the *plan* is at fault: name the gap in one line, proceed with what the doc gives, and let the review catch the rest. This path should cost a few thousand tokens, not tens of thousands.
 
@@ -323,12 +358,22 @@ Follow them in all code you write.
 
 ## Verification
 
-[How the delegate agent should verify its work before summarizing: build command, test
-command, lint workflow, etc. — match the project's conventions. For Rust repos
-with the local `clippy` skill available, use the full `clippy` skill as the lint
-gate rather than a partial list of Cargo or `lint ...` commands, and instruct
-the delegate agent to run it with `auto-proceed` — no user is present to answer its batch
-gate.]
+Run ONLY the commands listed below. Verification scope is not your choice:
+do not add flags, do not widen targets, do not invoke cargo directly. If a
+listed command fails in a way the spec does not explain, report it in your
+summary rather than inventing a broader check.
+
+While coding (as often as useful):
+  bash ~/.claude/scripts/delegate/verify.sh check <package>
+Before summarizing (the phase gate):
+  bash ~/.claude/scripts/delegate/verify.sh test <package>
+  bash ~/.claude/scripts/delegate/verify.sh lint <package>
+[ONLY if this phase's Files touch an example, add:
+  bash ~/.claude/scripts/delegate/verify.sh example <package> <name>]
+[ONLY if this phase owns a named integration test, add:
+  bash ~/.claude/scripts/delegate/verify.sh test <package> <integration_test>]
+[Non-Rust projects: replace the lines above with the project's exact
+commands — the run-only-what-is-listed rule still applies.]
 ```
 
 **Key principles (fallback):**
@@ -337,6 +382,7 @@ gate.]
 - Point to files the delegate agent can read itself rather than dumping file contents
 - Include the no-commit / no-branch rules verbatim — the delegate agent must leave the tree dirty for review
 - Include the heartbeat paragraph with the concrete ${SESSION_DIR} path substituted — the delegate has no ${SESSION_DIR} variable
+- Verification lines are `verify.sh` invocations with `<package>` filled in — never raw cargo commands (see **Delegate verification (Rust)**)
 
 3. In single/loop mode or a verbose bounded-auto window, tell the user in one
    line what is being dispatched and the prompt path:
@@ -606,7 +652,10 @@ without asking:
    intended behavior) and ${FIX_PASS} < 4: increment ${FIX_PASS}, write
    ${SESSION_DIR}/fix_prompt_${FIX_PASS}.md (same structure as the work order,
    spec = the confirmed issues table with file/line specifics, same no-commit
-   rules, heartbeat instruction, and style requirements), select `${FIX_TASK}` — `mechanical` only
+   rules, heartbeat instruction, and style requirements; verification = only
+   the `verify.sh` lines the confirmed issues implicate — typically `check` +
+   `test`, adding `lint` only when lint findings are being fixed, never the
+   whole phase gate), select `${FIX_TASK}` — `mechanical` only
    when every confirmed issue is documentation, formatting, lint guidance, a
    trivial rename, or an equivalently behavior-preserving edit; `escalation`
    when review found incorrect behavior, numerical/transform math, unresolved
@@ -810,8 +859,9 @@ wait:
 <NextPhase>
 **Loop and verbose modes only.**
 
-1. Find the next `todo` phase in the plan. If none remains, run <RunSummary/>
-   and end. The final verbose phase already received <VerbosePostPhaseReport/>.
+1. Find the next `todo` phase in the plan. If none remains, run <FinalGate/>,
+   then <RunSummary/>, and end. The final verbose phase already received
+   <VerbosePostPhaseReport/>.
 2. Reset ${FIX_PASS} = 0, ${IMPLEMENTATION_TASK} = implementation, and
    ${APPLICATION_SMOKE_RESULT} = not_run.
 3. If MODE = loop, announce `Continuing to phase N — <title>.` and loop to
@@ -833,6 +883,27 @@ Every path back to STEP 2 still runs the pending-decision pre-dispatch check.
 
 ---
 
+<FinalGate>
+**Loop and verbose modes, once, when the plan is exhausted — before
+<RunSummary/>.** Per-phase gates were deliberately scoped (see **Delegate
+verification (Rust)**); this is the single full-breadth pass.
+
+1. Run `bash ~/.claude/scripts/delegate/verify.sh final` with
+   `run_in_background: true` — workspace `--all-targets` check (the only time
+   every example builds) plus the full test suite — and apply the
+   **Background wait invariant**.
+2. Rust plans: run the `clippy` skill with `auto-proceed` (main agent, inline).
+3. Failures route like review findings: compose a fix prompt scoped to the
+   failures, dispatch per the <Synthesize/> auto fix pass against the last
+   phase, then rerun this gate. The fix-pass cap applies.
+4. Record the outcome for <RunSummary/>'s **Final gate** line.
+
+Single mode and non-plan-complete endings (user stop, blocking stop, error)
+skip this gate — say so in the summary; the tree may not be workspace-clean.
+</FinalGate>
+
+---
+
 <RunSummary>
 Emitted whenever a multi-phase run ends — plan exhausted, verbose user stop,
 blocking stop, or error.
@@ -843,6 +914,7 @@ blocking stop, or error.
 | Phase | Commit | Fix passes | Notes |
 | --- | --- | --- | --- |
 
+**Final gate:** [green / green after N fix passes / skipped — <reason>]
 **Deferred decisions still open:** [one line each, naming the phase that owns it — or "none"]
 **Why the run stopped:** [plan complete / user stopped before phase N / pending
 decision on phase N / fix-pass cap on phase N / delegate error]
@@ -872,7 +944,7 @@ every line must stand on its own for a reader who has not seen the plan.
   <VerbosePostPhaseGate/> that waits for `continue` before showing the next
   briefing. A successful phase and the post-phase `continue` never imply
   authorization for the next implementation.
-- Work orders that name the `clippy` skill as the lint gate must instruct the delegate agent to run it with `auto-proceed`; the main agent likewise passes `auto-proceed` when it runs the `clippy` skill inside either multi-phase mode.
+- Delegate verification is `verify.sh` lines only (see **Delegate verification (Rust)**): work orders and fix prompts never contain raw cargo commands, and a delegate running one — or any unrequested check — is a Work Order violation. The full `clippy` skill runs only in <FinalGate/>, with `auto-proceed`.
 - Every phase must pass <RunApplicationSmokeTest/> before phase review,
   checkpoint, or completion reporting. The main agent must run the actual
   product and exercise the phase's changed runtime path; builds, automated

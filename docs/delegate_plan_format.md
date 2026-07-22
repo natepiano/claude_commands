@@ -36,12 +36,14 @@ to rediscover after a context compaction lives in the doc.
 - **Stack:** <language + key frameworks/versions the work touches>
 - **Layout:** <only the dirs/files phases touch, as a short map>
 - **Key files:** <path — role> for each file a phase reads or modifies
-- **Build:** <exact build command>
-- **Test:** <exact test command>
-- **Lint:** <lint command/workflow, if any; for Rust repos with the local
-  `clippy` skill available, use the full `clippy` skill rather than a partial
-  list of Cargo or `lint ...` commands. Dispatched runs invoke the skill with
-  `auto-proceed` — /plan:delegate injects that at assembly time>
+- **Build:** <for Rust always `bash ~/.claude/scripts/delegate/verify.sh check <pkg>`;
+  otherwise the project's exact build command>
+- **Test:** <for Rust always `bash ~/.claude/scripts/delegate/verify.sh test <pkg>`;
+  otherwise the project's exact test command>
+- **Lint:** <for Rust always `bash ~/.claude/scripts/delegate/verify.sh lint <pkg>`.
+  Never raw cargo commands and never the full `clippy` skill here — phase
+  verification is deliberately scoped; workspace breadth and the `clippy`
+  skill run once in /plan:delegate's <FinalGate/> after the last phase>
 - **Style:** <the style-loader line, e.g. `zsh ~/.claude/scripts/rust_style/load-rust-style.sh --project-root <dir>`; omit for non-Rust>
 - **Invariants:** <project-wide rules every phase must preserve; omit if none>
 
@@ -71,7 +73,10 @@ re-derive — what earlier phases built, decisions that bind this phase. Empty f
 Phase 1. Maintained by /plan:phase_review.>
 
 **Acceptance gate:** <the build/test/behavior that proves this phase done —
-e.g. `cargo nextest run` green + a named test + an observable behavior.>
+e.g. `bash ~/.claude/scripts/delegate/verify.sh test <pkg>` green + a named
+test + an observable behavior. Gate commands are `verify.sh` lines only —
+`example`/integration-test lines appear solely in phases whose Files own
+them; nothing workspace-wide.>
 
 ### Phase N (completed) — collapses to the archive form once done:
 
