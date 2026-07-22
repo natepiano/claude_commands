@@ -12,7 +12,8 @@
 #   verify.sh check <package>              fast compile feedback (lib + bins)
 #   verify.sh test <package>               unit tests (lib + bins)
 #   verify.sh test <package> <int_test>    one named integration test target
-#   verify.sh lint <package>               scoped clippy, warnings denied
+#   verify.sh lint <package>               format, then scoped clippy (warnings denied)
+#   verify.sh fmt <package>                format only (checkpoint-commit backstop)
 #   verify.sh example <package> <name>     compile one example (only when the
 #                                          phase changed that example)
 #   verify.sh final                        full workspace gate (orchestrator only)
@@ -30,6 +31,15 @@ run() {
 
 have_nextest() {
     cargo nextest --version >/dev/null 2>&1
+}
+
+# Nightly rustfmt when available (unstable rustfmt.toml options), stable otherwise.
+fmt_cargo() {
+    if cargo +nightly fmt --version >/dev/null 2>&1; then
+        run cargo +nightly fmt "$@"
+    else
+        run cargo fmt "$@"
+    fi
 }
 
 TARGET_FLAGS_PY='
@@ -105,8 +115,13 @@ case "$CMD" in
     lint)
         PKG="${1:?verify.sh lint <package>}"
         FLAGS="$(target_flags "$PKG")"
+        fmt_cargo -p "$PKG"
         # shellcheck disable=SC2086
         run cargo clippy -p "$PKG" $FLAGS --tests -- -D warnings
+        ;;
+    fmt)
+        PKG="${1:?verify.sh fmt <package>}"
+        fmt_cargo -p "$PKG"
         ;;
     example)
         PKG="${1:?verify.sh example <package> <name>}"
@@ -114,6 +129,7 @@ case "$CMD" in
         run cargo check -p "$PKG" --example "$NAME"
         ;;
     final)
+        fmt_cargo --check
         run cargo check --workspace --all-targets
         if have_nextest; then
             run cargo nextest run --workspace

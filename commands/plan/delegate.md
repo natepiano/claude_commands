@@ -131,7 +131,8 @@ explicit `--lib`/`--bins` targets from cargo metadata).
 | compile feedback while coding | `bash ~/.claude/scripts/delegate/verify.sh check <package>` |
 | unit tests (phase gate) | `bash ~/.claude/scripts/delegate/verify.sh test <package>` |
 | one integration test target | `bash ~/.claude/scripts/delegate/verify.sh test <package> <int_test>` |
-| scoped lint (phase gate) | `bash ~/.claude/scripts/delegate/verify.sh lint <package>` |
+| format + scoped lint (phase gate) | `bash ~/.claude/scripts/delegate/verify.sh lint <package>` |
+| format only (checkpoint backstop) | `bash ~/.claude/scripts/delegate/verify.sh fmt <package>` — <CheckpointCommit/>, not phase delegates |
 | one changed example | `bash ~/.claude/scripts/delegate/verify.sh example <package> <name>` |
 | full workspace gate | `verify.sh final` — <FinalGate/> only, never a phase delegate |
 
@@ -765,7 +766,11 @@ without committing.
    incomplete, or failed, STOP; do not commit.
 2. Run `git status --short` in ${WORKING_DIR} and confirm the changes are this
    phase's implementation plus the plan doc. Anything unexpected → STOP and ask.
-3. Stage everything and commit with this message shape:
+3. Run `bash ~/.claude/scripts/delegate/verify.sh fmt <package>` for each
+   package the phase touched — fix passes skip `lint` (the only formatting
+   phase-gate step), so formatting must be re-proven here. Formatting-only
+   changes join the checkpoint commit.
+4. Stage everything and commit with this message shape:
 
    ```
    checkpoint(<plan-slug>): phase N — <phase title>
@@ -775,9 +780,9 @@ without committing.
    Claude-Session: <session url>
    ```
 
-4. Edit the phase's status line in the plan doc to ``status: done (`<short hash>`)``,
+5. Edit the phase's status line in the plan doc to ``status: done (`<short hash>`)``,
    then `git add <plan doc> && git commit --amend --no-edit`.
-5. Report one line: `Checkpoint <short hash> — phase N: <title>.`
+6. Report one line: `Checkpoint <short hash> — phase N: <title>.`
 
 Never push. Never commit anything outside this step.
 </CheckpointCommit>
@@ -889,9 +894,9 @@ Every path back to STEP 2 still runs the pending-decision pre-dispatch check.
 verification (Rust)**); this is the single full-breadth pass.
 
 1. Run `bash ~/.claude/scripts/delegate/verify.sh final` with
-   `run_in_background: true` — workspace `--all-targets` check (the only time
-   every example builds) plus the full test suite — and apply the
-   **Background wait invariant**.
+   `run_in_background: true` — workspace `fmt --check`, `--all-targets` check
+   (the only time every example builds), and the full test suite — and apply
+   the **Background wait invariant**.
 2. Rust plans: run the `clippy` skill with `auto-proceed` (main agent, inline).
 3. Failures route like review findings: compose a fix prompt scoped to the
    failures, dispatch per the <Synthesize/> auto fix pass against the last
