@@ -47,8 +47,7 @@
       "Read(//Users/natemccoy/rust/**)",
       "Read(//tmp/**)",
       "Read(//var/folders/rf/twhh0jfd243fpltn5k0w1t980000gn/T/**)",
-      "Read(/private/tmp*)",
-      "Write(//tmp/claude/**)"
+      "Read(/private/tmp*)"
     ],
     "deny": [
       "Bash(git stash)",
