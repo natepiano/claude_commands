@@ -16,6 +16,9 @@
 #   verify.sh fmt <package>                format only (checkpoint-commit backstop)
 #   verify.sh example <package> <name>     compile one example (only when the
 #                                          phase changed that example)
+#   verify.sh example-test <package> <name>
+#                                          test one example (only when the
+#                                          example contains unit tests)
 #   verify.sh final                        full workspace gate (orchestrator only)
 
 set -euo pipefail
@@ -64,6 +67,29 @@ print("verify.sh: package " + package_name + " not found in workspace", file=sys
 sys.exit(2)
 '
 
+EXAMPLE_FEATURES_PY='
+import json
+import sys
+
+package_name = sys.argv[1]
+example_name = sys.argv[2]
+meta = json.load(sys.stdin)
+for package in meta["packages"]:
+    if package["name"] != package_name:
+        continue
+    for target in package["targets"]:
+        if target["name"] == example_name and "example" in target["kind"]:
+            print(",".join(target.get("required-features", [])))
+            sys.exit(0)
+    print(
+        "verify.sh: example " + example_name + " not found in package " + package_name,
+        file=sys.stderr,
+    )
+    sys.exit(2)
+print("verify.sh: package " + package_name + " not found in workspace", file=sys.stderr)
+sys.exit(2)
+'
+
 # Emits the explicit target flags (--lib and/or --bins) for a package, so
 # lib-only and bin-only crates both work without compiling examples.
 target_flags() {
@@ -76,6 +102,11 @@ target_flags() {
         exit 2
     fi
     printf '%s' "$flags"
+}
+
+example_features() {
+    cargo metadata --no-deps --format-version 1 \
+        | python3 -c "$EXAMPLE_FEATURES_PY" "$1" "$2"
 }
 
 CMD="${1:-}"
@@ -126,7 +157,28 @@ case "$CMD" in
     example)
         PKG="${1:?verify.sh example <package> <name>}"
         NAME="${2:?verify.sh example <package> <name>}"
-        run cargo check -p "$PKG" --example "$NAME"
+        FEATURES="$(example_features "$PKG" "$NAME")"
+        if [[ -n "$FEATURES" ]]; then
+            run cargo check -p "$PKG" --example "$NAME" --features "$FEATURES"
+        else
+            run cargo check -p "$PKG" --example "$NAME"
+        fi
+        ;;
+    example-test)
+        PKG="${1:?verify.sh example-test <package> <name>}"
+        NAME="${2:?verify.sh example-test <package> <name>}"
+        FEATURES="$(example_features "$PKG" "$NAME")"
+        if have_nextest; then
+            if [[ -n "$FEATURES" ]]; then
+                run cargo nextest run -p "$PKG" --example "$NAME" --features "$FEATURES"
+            else
+                run cargo nextest run -p "$PKG" --example "$NAME"
+            fi
+        elif [[ -n "$FEATURES" ]]; then
+            run cargo test -p "$PKG" --example "$NAME" --features "$FEATURES"
+        else
+            run cargo test -p "$PKG" --example "$NAME"
+        fi
         ;;
     final)
         fmt_cargo --check

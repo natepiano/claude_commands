@@ -57,7 +57,7 @@ Examples:
    - unique case-insensitive substring of that normalized filename stem.
 4. Resolve the real path and require it to be a regular, non-symlink Markdown file whose real parent is `/Users/natemccoy/rust/hanadocs/issues`. Reject traversal and outside-vault paths.
 5. Inspect the file's complete YAML frontmatter before changing it. Require exactly one top-level `status` property.
-6. Read the current APFS creation and modification timestamps before changing the file. Require their calendar dates in `America/New_York` to match the existing `date_created` and `date_modified` frontmatter dates. If either differs, stop without writing and report the mismatch; never choose the filesystem or YAML side implicitly.
+6. Read the current APFS creation and modification timestamps before changing the file, and capture the frontmatter `date_created` value — it is the authoritative creation date you will restore the filesystem to after editing. Require the pre-edit filesystem creation and modification calendar dates in `America/New_York` to match the existing `date_created` and `date_modified` frontmatter dates. If either differs, the file was already inconsistent before this command touched it: stop without writing and report the mismatch; never choose the filesystem or YAML side implicitly.
 7. If the resolved issue is already closed, make no changes. Report its existing `date_closed` and `reason`; this command closes issues rather than revising prior closure records.
 8. If matching remains ambiguous, show at most five matching open issue paths and ask the user to identify one. Never choose arbitrarily.
 
@@ -74,7 +74,7 @@ Use `apply_patch` to make the smallest possible edit to the selected issue's top
 5. With `--no-reason`, remove any existing top-level `reason` so the new closure is recorded without one. This matters for reopened issues that still carry metadata from an earlier closure.
 6. Preserve `stage`, all seven prioritization judgment properties, the note body, and every unrelated property and formatting choice.
 
-`apply_patch` preserves the existing inode and APFS creation timestamp but advances the modification timestamp. Immediately after the patch, require the inode and creation timestamp to equal the captured pre-edit values, then set the filesystem modification timestamp to noon on the resolved closure date in `America/New_York` with `/usr/bin/SetFile -m`. Verify that the filesystem calendar dates now match `date_created` and `date_modified`. If any timestamp operation or verification fails, do not run automatic ranking and report the exact mismatch.
+`apply_patch` normally preserves the inode and APFS creation timestamp and only advances the modification timestamp. Do not depend on that here: automatic ranking below and the background rank-watcher each rewrite the file atomically — a temp file plus rename — once the status flips to `closed`, which changes the inode and resets the APFS creation timestamp to the current time. So do not assert the inode or creation timestamp are unchanged, and do not set any filesystem timestamps yet. Reconcile them from the authoritative frontmatter dates only after ranking has settled — see "Reconcile filesystem timestamps" below.
 
 Do not directly edit `backlog_score` or `backlog_rank`. After the closure edit succeeds, run:
 
@@ -84,9 +84,21 @@ Do not directly edit `backlog_score` or `backlog_rank`. After the closure edit s
 
 This removes live score/rank fields from the closed issue and immediately recalculates the positions of every valid open issue. The background watcher may observe the same edit afterward; when the positions are already current, its check makes no further changes.
 
+## Reconcile filesystem timestamps
+
+Run this only after `renumber.py --apply` succeeds. By now the file has almost certainly been rewritten atomically by ranking and/or the background watcher, so its inode and APFS creation timestamp have changed and its birthtime reads as today. This is expected — do not treat it as an error and do not assert the inode or creation timestamp are unchanged. Instead, restore both filesystem timestamps from the issue's authoritative frontmatter dates. `SetFile` uses `MM/DD/YYYY` order; use noon to avoid midnight/DST calendar-date drift.
+
+1. Restore the creation timestamp to noon on `date_created` in `America/New_York`:
+   `/usr/bin/SetFile -d "MM/DD/YYYY 12:00:00" "<file>"`
+2. Restore the modification timestamp to noon on `date_modified` (equal to `date_closed`) in `America/New_York`:
+   `/usr/bin/SetFile -m "MM/DD/YYYY 12:00:00" "<file>"`
+3. Re-read the filesystem creation and modification calendar dates and require them to equal `date_created` and `date_modified`. If the creation date is still wrong, the watcher rewrote the file again between steps 1 and 3 — repeat steps 1–3 once. If it still fails after that retry, report the exact mismatch and stop; do not claim a clean closure.
+
+Restoring the creation timestamp requires `SetFile -d` against the frontmatter `date_created`. The earlier design set only `-m` and merely asserted `-d` was untouched, which is why a watcher rewrite silently reset `date_created` to today.
+
 ## Verify and report
 
-1. Re-read the selected issue and verify exactly one `status: closed`, the expected `date_closed`, matching `date_modified`, the resolved reason choice, unchanged `stage`, and no `backlog_score` or `backlog_rank`. Verify again that the filesystem creation and modification calendar dates match `date_created` and `date_modified` after automatic ranking.
+1. Re-read the selected issue and verify exactly one `status: closed`, the expected `date_closed`, matching `date_modified`, the resolved reason choice, unchanged `stage`, and no `backlog_score` or `backlog_rank`. Confirm the filesystem creation and modification calendar dates match `date_created` and `date_modified` after ranking and timestamp reconciliation — this is the same check as reconcile step 3 and must still hold at report time.
 2. Run the rank updater again without `--apply` and require it to report no pending mechanical changes. Missing or invalid ratings on other open issues may remain visible for `/prioritize`; they do not invalidate the closure or prevent valid open issues from being ranked.
 3. If the issue edit fails, do not run the rank updater. If automatic ranking fails after the issue was closed, leave the valid closure metadata in place, report the exact failure plainly, and do not claim the backlog positions are current.
 4. Report the clickable issue path, closure date, recorded reason or `no reason`, and whether automatic ranking was applied and verified.
