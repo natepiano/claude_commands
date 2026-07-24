@@ -33,7 +33,8 @@ def _argument_parser() -> argparse.ArgumentParser:
 def main(argv: Sequence[str] | None = None) -> int:
     arguments = _argument_parser().parse_args(argv)
     lock_path = cast(Path, arguments.lock_path)
-    if arguments.operation == "status":
+    operation = cast(str, arguments.operation)
+    if operation == "status":
         held = writer_lock.lock_is_held(lock_path)
         print("held" if held else "free")
         return 1 if held else 0
@@ -52,8 +53,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             return BUSY_EXIT
         os.fchmod(descriptor, 0o600)
         owner = f"pid={os.getpid()}\n".encode("ascii")
-        os.ftruncate(descriptor, 0)
-        os.lseek(descriptor, 0, os.SEEK_SET)
+        _ = os.ftruncate(descriptor, 0)
+        _ = os.lseek(descriptor, 0, os.SEEK_SET)
         _ = os.write(descriptor, owner)
         os.set_inheritable(descriptor, True)
         os.execvp(command[0], command)
@@ -61,7 +62,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(f"runner lock error: {error}", file=sys.stderr)
         return 2
     finally:
-        os.close(descriptor)
+        _ = os.close(descriptor)
 
 
 if __name__ == "__main__":

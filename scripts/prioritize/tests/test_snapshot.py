@@ -62,13 +62,31 @@ class SnapshotTests(unittest.TestCase):
             with mock.patch.object(snapshot, "GOALS_FILE", goals):
                 raw_goals = snapshot.current_goals()
 
-        values = cast(dict[str, object], raw_values)
-        state = cast(object, raw_state)
+        values = raw_values
+        state = raw_state
         current_goals = cast(list[str], raw_goals)
         self.assertEqual(state, "valid")
         self.assertEqual(values["backlog_goal"], "1 - Ship Hana")
         self.assertEqual(current_goals, ["1 - Ship Hana"])
 
+    def test_dependency_lists_are_part_of_the_semantic_snapshot(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            issue = Path(temporary) / "issue.md"
+            _ = issue.write_text(
+                "---\nstatus: open\ndepends_on:\n  - \"[[first]]\"\n---\n",
+                encoding="utf-8",
+            )
+
+            raw_values, raw_state = snapshot.frontmatter_values(issue)
+
+        values = raw_values
+        state = raw_state
+        self.assertEqual(state, "valid")
+        self.assertEqual(
+            values["depends_on"],
+            ["depends_on:", '  - "[[first]]"'],
+        )
+
 
 if __name__ == "__main__":
-    unittest.main()
+    _ = unittest.main()

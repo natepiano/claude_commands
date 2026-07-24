@@ -52,6 +52,8 @@ If the shorthand doesn't match any of these, tell the user and stop.
 
    **Prioritization survey (required — every new issue is fully rated at creation).** Ask via `AskUserQuestion`. The four-question-per-call cap means two calls: first `backlog_goal` + `backlog_alignment` + `backlog_impact` + `backlog_urgency`, then `backlog_effort`. For each factor present all five levels as options — the option label is the star string, the description is the definition below. Store `backlog_goal` as a scalar (e.g. `1 - Ship Hana`) and each rating as a double-quoted YAML text scalar of one-to-five `⭐` characters. Do NOT collect or write `backlog_score` / `backlog_rank`; the vault's background watcher computes those from these inputs.
 
+   **Dependencies (optional).** Ask which existing open issues, if any, must rank ahead of this issue. Record each answer as a wikilink in `depends_on`; use `[]` when there are none. Before creating the issue, resolve every supplied wikilink to an issue file. Closed targets are satisfied and are ignored by ranking. An unresolved link, duplicate target, self-reference, or open dependency missing prioritization metadata is invalid; a dependency cycle prevents ranking.
+
    - **`backlog_goal`** — the one goal this issue most directly advances (pick exactly one):
      - `1 - Ship Hana` — make Hana a coherent, usable, releasable product
      - `2 - Find Collaborators` — make the work inviting and practical for contributors and partners
@@ -97,6 +99,7 @@ If the shorthand doesn't match any of these, tell the user and stop.
    - `{{BACKLOG_IMPACT}}` — the chosen impact stars
    - `{{BACKLOG_URGENCY}}` — the chosen urgency stars
    - `{{BACKLOG_EFFORT}}` — the chosen effort stars
+   - `{{DEPENDS_ON}}` — a YAML inline list of existing issue wikilinks, e.g. `["[[render backend]]"]`, or `[]`
 
 6. If the category is "unfiled", set the category frontmatter to:
    ```yaml

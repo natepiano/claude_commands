@@ -11,6 +11,7 @@ import time
 from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
 from pathlib import Path
+from typing import cast
 
 
 LOCK_PATH = Path("/tmp/hanadocs-prioritize/writer.lock")
@@ -45,16 +46,16 @@ def acquire_writer_lock(
                 time.sleep(0.1)
 
         owner = f"pid={os.getpid()} acquired={time.time_ns()}\n".encode("ascii")
-        os.ftruncate(descriptor, 0)
-        os.lseek(descriptor, 0, os.SEEK_SET)
-        os.write(descriptor, owner)
-        os.fsync(descriptor)
+        _ = os.ftruncate(descriptor, 0)
+        _ = os.lseek(descriptor, 0, os.SEEK_SET)
+        _ = os.write(descriptor, owner)
+        _ = os.fsync(descriptor)
         yield
     finally:
         try:
             fcntl.flock(descriptor, fcntl.LOCK_UN)
         finally:
-            os.close(descriptor)
+            _ = os.close(descriptor)
 
 
 def lock_is_held(path: Path = LOCK_PATH) -> bool:
@@ -67,15 +68,15 @@ def lock_is_held(path: Path = LOCK_PATH) -> bool:
             fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
             return True
-        fcntl.flock(descriptor, fcntl.LOCK_UN)
+        _ = fcntl.flock(descriptor, fcntl.LOCK_UN)
         return False
     finally:
-        os.close(descriptor)
+        _ = os.close(descriptor)
 
 
 def _argument_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument(
+    _ = parser.add_argument(
         "--status",
         action="store_true",
         help="print whether the shared writer lock is held",
@@ -85,7 +86,8 @@ def _argument_parser() -> argparse.ArgumentParser:
 
 def main(argv: Sequence[str] | None = None) -> int:
     arguments = _argument_parser().parse_args(argv)
-    if not arguments.status:
+    status = cast(bool, arguments.status)
+    if not status:
         _argument_parser().error("only --status is supported")
     held = lock_is_held()
     print("held" if held else "free")

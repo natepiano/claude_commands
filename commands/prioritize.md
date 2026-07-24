@@ -71,7 +71,7 @@ Bands are rated internally against each other; different bands are only comparab
 
 - Source, setup/status helper, and runner live under `/Users/natemccoy/.claude/scripts/prioritize/`; the installed plist is `/Users/natemccoy/Library/LaunchAgents/com.natemccoy.hanadocs-prioritize.plist`.
 - The daemon polls stable path/inode/size/mtime/ctime signatures of every issue file plus the goals note at a sub-second interval; it runs the semantic snapshot/scorer only after a signature changes. New, modified, renamed, and deleted issues all trigger ranking.
-- The semantic snapshot covers `status`, `backlog_goal`, and the four rubric fields — never the generated fields, so the watcher's own writes cannot loop. Snapshots live in `/Users/natemccoy/Library/Caches/hanadocs-prioritize/`; event logs and last-status in `/tmp/hanadocs-prioritize/`.
+- The semantic snapshot covers `status`, `depends_on`, `backlog_goal`, and the four rubric fields — never the generated fields, so the watcher's own writes cannot loop. Snapshots live in `/Users/natemccoy/Library/Caches/hanadocs-prioritize/`; event logs and last-status in `/tmp/hanadocs-prioritize/`.
 - Every write entry point (watcher, direct `renumber.py --apply`) holds the shared OS-released writer lock at `/tmp/hanadocs-prioritize/writer.lock`; a separate runner lock coalesces overlapping save bursts. No stale-PID cleanup.
 - Body-only edits with unchanged ranking inputs are a no-op. Judgment reassessment is always an explicit `/prioritize` or `/issue` action.
 

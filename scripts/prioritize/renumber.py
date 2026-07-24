@@ -21,7 +21,7 @@ from dataclasses import dataclass, field
 from datetime import date, datetime
 from pathlib import Path
 from collections.abc import Sequence
-from typing import TypedDict
+from typing import TypedDict, cast
 from zoneinfo import ZoneInfo
 
 import writer_lock  # pyright: ignore[reportImplicitRelativeImport]
@@ -54,7 +54,9 @@ FIELD_LINE_RE = re.compile(
 GOAL_LINE_RE = re.compile(r"^(?P<ordinal>[1-9]\d*)\.\s+`(?P<value>[^`]+)`\s*$")
 GOAL_VALUE_RE = re.compile(r"^(?P<prefix>[1-9]\d*) - (?P<name>\S(?:.*\S)?)$")
 WIKILINK_RE = re.compile(r"!?\[\[(?P<body>[^\]\n]+)\]\]")
+WIKILINK_VALUE_RE = re.compile(r"^\[\[(?P<body>[^\]\n]+)\]\]$")
 POSITIVE_INTEGER_RE = re.compile(r"^[1-9]\d*$")
+LIST_ITEM_RE = re.compile(r"^\s+-\s+(?P<value>.+?)\s*$")
 
 
 class PlanningError(RuntimeError):
@@ -116,6 +118,8 @@ class Issue:
     score: int | None = None
     existing_rank: int | None = None
     assigned_rank: int | None = None
+    dependency_names: tuple[str, ...] = ()
+    open_dependencies: tuple[Issue, ...] = ()
     problems: list[str] = field(default_factory=list)
 
     @property
@@ -250,7 +254,7 @@ def _parse_scalar(raw_value: str) -> str:
         raise ValueError("empty scalar")
     if raw_value.startswith('"'):
         try:
-            decoded = json.loads(raw_value)
+            decoded = cast(object, json.loads(raw_value))
         except json.JSONDecodeError as error:
             raise ValueError("malformed quoted scalar") from error
         if not isinstance(decoded, str):
@@ -308,6 +312,63 @@ def _parse_existing_rank(frontmatter: Frontmatter) -> int | None:
     if occurrence is None or POSITIVE_INTEGER_RE.fullmatch(occurrence.raw_value) is None:
         return None
     return int(occurrence.raw_value)
+
+
+def _parse_dependency_name(raw_value: str) -> str:
+    match = WIKILINK_VALUE_RE.fullmatch(raw_value)
+    if match is None:
+        raise ValueError(f"depends_on entry must be a wikilink: {raw_value!r}")
+    target, _separator, _alias = match.group("body").partition("|")
+    target = re.split(r"[#^]", target, maxsplit=1)[0].strip()
+    if target.endswith(".md"):
+        target = target.removesuffix(".md")
+    target = target.rsplit("/", maxsplit=1)[-1].strip()
+    if not target:
+        raise ValueError(f"depends_on entry has no issue target: {raw_value!r}")
+    return target.casefold()
+
+
+def _parse_depends_on(frontmatter: Frontmatter) -> tuple[str, ...]:
+    occurrence = _one_field(frontmatter, "depends_on")
+    if occurrence is None:
+        return ()
+
+    raw_value = occurrence.raw_value
+    values: list[str]
+    if raw_value == "[]":
+        values = []
+    elif raw_value.startswith("["):
+        try:
+            parsed = cast(object, json.loads(raw_value))
+        except json.JSONDecodeError as error:
+            raise ValueError("depends_on must be a YAML list of wikilinks") from error
+        if not isinstance(parsed, list):
+            raise ValueError("depends_on must be a YAML list of wikilinks")
+        values = []
+        for value in cast(list[object], parsed):
+            if not isinstance(value, str):
+                raise ValueError("depends_on must be a YAML list of wikilinks")
+            values.append(value)
+    elif raw_value:
+        raise ValueError("depends_on must be a YAML list of wikilinks")
+    else:
+        values = []
+        for line in frontmatter.lines[occurrence.index + 1 : frontmatter.closing_index]:
+            if not line[:1].isspace():
+                break
+            if not line.strip():
+                continue
+            item = LIST_ITEM_RE.fullmatch(line.rstrip("\r\n"))
+            if item is None:
+                raise ValueError("depends_on must be a YAML list of wikilinks")
+            values.append(_parse_scalar(item.group("value")))
+        if not values:
+            raise ValueError("depends_on must be a YAML list of wikilinks")
+
+    names = tuple(_parse_dependency_name(value) for value in values)
+    if len(set(names)) != len(names):
+        raise ValueError("depends_on contains duplicate issue links")
+    return names
 
 
 def parse_goals(source: SourceFile) -> tuple[Goal, ...]:
@@ -418,6 +479,11 @@ def _parse_issue(source: SourceFile, goals: tuple[Goal, ...]) -> Issue:
         else:
             values[key] = star_count
 
+    try:
+        issue.dependency_names = _parse_depends_on(frontmatter)
+    except ValueError as error:
+        issue.problems.append(str(error))
+
     if not issue.problems and goal is not None:
         issue.score = calculate_score(goal, values)
     return issue
@@ -446,11 +512,7 @@ def _generated_description(frontmatter: Frontmatter, desired: dict[str, int]) ->
     return "; ".join(parts)
 
 
-def _rewrite_generated(
-    source: SourceFile,
-    frontmatter: Frontmatter,
-    desired: dict[str, int],
-) -> bytes:
+def _rewrite_generated(frontmatter: Frontmatter, desired: dict[str, int]) -> bytes:
     top_level_indices = sorted(
         occurrence.index
         for occurrences in frontmatter.fields.values()
@@ -532,6 +594,36 @@ def build_plan(scope: Scope = PRODUCTION_SCOPE) -> RankingPlan:
     issue_sources = tuple(_read_source(path) for path in _discover_issue_paths(scope))
     issues = tuple(_parse_issue(source, goals) for source in issue_sources)
 
+    issues_by_name: dict[str, Issue] = {}
+    for issue in issues:
+        name = issue.source.path.stem.casefold()
+        if name in issues_by_name:
+            raise PlanningError(f"duplicate issue filename for wikilinks: {name}")
+        issues_by_name[name] = issue
+
+    for issue in issues:
+        if not issue.is_valid_open:
+            continue
+        open_dependencies: list[Issue] = []
+        for dependency_name in issue.dependency_names:
+            dependency = issues_by_name.get(dependency_name)
+            if dependency is None:
+                issue.problems.append(
+                    f"depends_on issue not found: [[{dependency_name}]]"
+                )
+                continue
+            if dependency is issue:
+                issue.problems.append("depends_on cannot refer to itself")
+                continue
+            if dependency.is_open and not dependency.is_valid_open:
+                issue.problems.append(
+                    f"depends_on open issue needs prioritization: [[{dependency.source.path.stem}]]"
+                )
+                continue
+            if dependency.is_valid_open:
+                open_dependencies.append(dependency)
+        issue.open_dependencies = tuple(open_dependencies)
+
     rank_counts = Counter(
         issue.existing_rank
         for issue in issues
@@ -547,7 +639,46 @@ def build_plan(scope: Scope = PRODUCTION_SCOPE) -> RankingPlan:
             return (-score, 0, stable_rank, str(issue.source.path))
         return (-score, 1, 0, str(issue.source.path))
 
-    ranked = sorted((issue for issue in issues if issue.is_valid_open), key=sort_key)
+    score_ranked = sorted(
+        (issue for issue in issues if issue.is_valid_open), key=sort_key
+    )
+    baseline_positions = {
+        issue.source.path: position for position, issue in enumerate(score_ranked)
+    }
+    pending_dependencies = {
+        issue.source.path: len(issue.open_dependencies) for issue in score_ranked
+    }
+    dependents: dict[Path, list[Issue]] = {
+        issue.source.path: [] for issue in score_ranked
+    }
+    for issue in score_ranked:
+        for dependency in issue.open_dependencies:
+            dependents[dependency.source.path].append(issue)
+
+    ranked: list[Issue] = []
+    available = [
+        issue for issue in score_ranked if pending_dependencies[issue.source.path] == 0
+    ]
+    while available:
+        available.sort(key=lambda issue: baseline_positions[issue.source.path])
+        issue = available.pop(0)
+        ranked.append(issue)
+        for dependent in dependents[issue.source.path]:
+            dependent_path = dependent.source.path
+            pending_dependencies[dependent_path] -= 1
+            if pending_dependencies[dependent_path] == 0:
+                available.append(dependent)
+
+    if len(ranked) != len(score_ranked):
+        cyclic = [
+            issue.source.path.stem
+            for issue in score_ranked
+            if pending_dependencies[issue.source.path] > 0
+        ]
+        raise PlanningError(
+            "open depends_on cycle prevents ranking: " + ", ".join(cyclic)
+        )
+
     for rank, issue in enumerate(ranked, start=1):
         issue.assigned_rank = rank
 
@@ -566,7 +697,7 @@ def build_plan(scope: Scope = PRODUCTION_SCOPE) -> RankingPlan:
                 "backlog_score": issue.score,
                 "backlog_rank": issue.assigned_rank,
             }
-        updated = _rewrite_generated(issue.source, issue.frontmatter, desired)
+        updated = _rewrite_generated(issue.frontmatter, desired)
         if updated == issue.source.content:
             continue
         description = _generated_description(issue.frontmatter, desired)
@@ -779,13 +910,7 @@ def print_plan(plan: RankingPlan, *, mode: str) -> None:
     valid_count = len(plan.valid_open)
     needs_count = len(plan.needs_prioritization)
     print(f"Mode: {mode}")
-    print(
-        "Issues: "
-        f"{len(plan.issues)} discovered; "
-        f"{valid_count} valid open; "
-        f"{needs_count} need prioritization; "
-        f"{len(plan.closed)} closed"
-    )
+    print(f"Issues: {len(plan.issues)} discovered; {valid_count} valid open; {needs_count} need prioritization; {len(plan.closed)} closed")
     if valid_count:
         print(f"Canonical ranks: 1..{valid_count}")
     else:
@@ -800,10 +925,7 @@ def print_plan(plan: RankingPlan, *, mode: str) -> None:
     if plan.changes:
         print(f"Mechanical changes: {len(plan.changes)} file(s)")
         for change in plan.changes:
-            print(
-                f"  {_relative_path(plan, change.source.path)}: "
-                f"{change.description}"
-            )
+            print(f"  {_relative_path(plan, change.source.path)}: {change.description}")
     else:
         print("No mechanical changes required.")
 
@@ -813,17 +935,17 @@ def _argument_parser() -> argparse.ArgumentParser:
         description="Score and densely rank open Hanadocs issues."
     )
     mode = parser.add_mutually_exclusive_group()
-    mode.add_argument(
+    _ = mode.add_argument(
         "--apply",
         action="store_true",
         help="atomically apply the proposed score and rank changes",
     )
-    mode.add_argument(
+    _ = mode.add_argument(
         "--check",
         action="store_true",
         help="return 1 when the mechanical state is not canonical",
     )
-    parser.add_argument(
+    _ = parser.add_argument(
         "--require-complete",
         action="store_true",
         help="return 1 when any open issue needs prioritization",
@@ -834,10 +956,13 @@ def _argument_parser() -> argparse.ArgumentParser:
 def main(argv: Sequence[str] | None = None) -> int:
     parser = _argument_parser()
     arguments = parser.parse_args(argv)
-    if arguments.apply and arguments.require_complete:
+    apply = cast(bool, arguments.apply)
+    check = cast(bool, arguments.check)
+    require_complete = cast(bool, arguments.require_complete)
+    if apply and require_complete:
         parser.error("--require-complete cannot be combined with --apply")
     try:
-        if arguments.apply:
+        if apply:
             with writer_lock.acquire_writer_lock():
                 plan = build_plan(PRODUCTION_SCOPE)
                 apply_plan(plan)
@@ -846,21 +971,21 @@ def main(argv: Sequence[str] | None = None) -> int:
                 print(f"Applied {len(plan.changes)} file change(s).")
             return 0
         plan = build_plan(PRODUCTION_SCOPE)
-        if arguments.check:
-            mode = "check + require-complete" if arguments.require_complete else "check"
+        if check:
+            mode = "check + require-complete" if require_complete else "check"
             print_plan(plan, mode=mode)
             return 1 if plan.changes or (
-                arguments.require_complete and plan.needs_prioritization
+                require_complete and plan.needs_prioritization
             ) else 0
         mode = (
             "dry-run + require-complete (no files written)"
-            if arguments.require_complete
+            if require_complete
             else "dry-run (no files written)"
         )
         print_plan(plan, mode=mode)
         if plan.changes:
             print("Run with --apply to write these changes.")
-        return 1 if arguments.require_complete and plan.needs_prioritization else 0
+        return 1 if require_complete and plan.needs_prioritization else 0
     except ConcurrentChangeError as error:
         print(f"concurrent change: {error}", file=sys.stderr)
         return 3

@@ -1,5 +1,14 @@
 {
+  "pythonVersion": "3.9",
   "venvPath": ".",
   "venv": ".venv",
-  "extraPaths": ["hooks", "clean-fix"]
+  "extraPaths": ["hooks", "clean-fix"],
+  "reportImplicitOverride": "none",
+  "reportImplicitStringConcatenation": "none",
+  "reportPrivateLocalImportUsage": "none",
+  "reportPrivateUsage": "none",
+  "reportUnannotatedClassAttribute": "none",
+  "reportUnknownArgumentType": "none",
+  "reportUnknownMemberType": "none",
+  "reportUnusedCallResult": "none"
 }

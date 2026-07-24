@@ -9,8 +9,9 @@ import os
 import re
 import stat
 import sys
+from collections.abc import Iterable, Mapping
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Mapping, Optional
+from typing import cast
 
 import renumber  # pyright: ignore[reportImplicitRelativeImport]
 
@@ -26,6 +27,7 @@ INPUT_FIELDS = (
     "backlog_urgency",
     "backlog_effort",
 )
+DEPENDENCY_FIELD = "depends_on"
 
 TOP_LEVEL_PROPERTY = re.compile(r"^([A-Za-z_][A-Za-z0-9_-]*):(?:[ \t]*(.*))?$")
 GOAL_LINE = re.compile(r"^(?P<ordinal>[1-9][0-9]*)\.\s+`(?P<value>[^`]+)`\s*$")
@@ -33,7 +35,7 @@ NUMBERED_GOAL_START = re.compile(r"^[1-9][0-9]*\.\s+")
 GOAL_VALUE = re.compile(r"^(?P<prefix>[1-9][0-9]*) - (?P<name>\S(?:.*\S)?)$")
 
 
-def invalid_scalar(raw: str, reason: str) -> Dict[str, str]:
+def invalid_scalar(raw: str, reason: str) -> dict[str, str]:
     return {"invalid": reason, "raw": raw}
 
 
@@ -75,7 +77,7 @@ def read_stable_text(path: Path) -> str:
         raise ValueError(f"{path} is not valid UTF-8: {error}") from error
 
 
-def parse_status_scalar(raw: Optional[str]) -> Any:
+def parse_status_scalar(raw: str | None) -> str | dict[str, str] | None:
     if raw is None:
         return None
 
@@ -85,7 +87,7 @@ def parse_status_scalar(raw: Optional[str]) -> Any:
 
     if value.startswith('"'):
         try:
-            parsed = json.loads(value)
+            parsed = cast(object, json.loads(value))
         except json.JSONDecodeError:
             return invalid_scalar(raw, "malformed double-quoted scalar")
         if not isinstance(parsed, str):
@@ -102,19 +104,52 @@ def parse_status_scalar(raw: Optional[str]) -> Any:
     return value
 
 
-def parse_domain_scalar(raw: Optional[str]) -> Any:
+def parse_domain_scalar(raw: str | None) -> str | dict[str, str] | None:
     return parse_status_scalar(raw)
 
 
-def frontmatter_values(path: Path) -> tuple[Dict[str, Any], Any]:
+def dependency_block(lines: list[str]) -> list[str] | dict[str, object] | None:
+    blocks: list[list[str]] = []
+    current: list[str] | None = None
+    for line in lines[1:]:
+        if line == "---":
+            break
+        if not line[:1].isspace():
+            match = TOP_LEVEL_PROPERTY.match(line)
+            if match is None:
+                if current is not None:
+                    break
+                continue
+            key, _raw = match.groups()
+            if key == DEPENDENCY_FIELD:
+                current = [line]
+                blocks.append(current)
+                continue
+            if current is not None:
+                break
+        if current is not None:
+            current.append(line)
+
+    if not blocks:
+        return None
+    if len(blocks) == 1:
+        return blocks[0]
+    return {"invalid": "duplicate property", "values": blocks}
+
+
+def frontmatter_values(
+    path: Path,
+) -> tuple[dict[str, object], str | dict[str, str]]:
     text = read_stable_text(path)
     lines = text.splitlines()
-    values: Dict[str, Any] = {field: None for field in INPUT_FIELDS}
+    values: dict[str, object] = {
+        field: None for field in (*INPUT_FIELDS, DEPENDENCY_FIELD)
+    }
 
     if not lines or lines[0] != "---":
         return values, invalid_scalar(lines[0] if lines else "", "missing opening delimiter")
 
-    occurrences: Dict[str, List[Any]] = {field: [] for field in INPUT_FIELDS}
+    occurrences: dict[str, list[object]] = {field: [] for field in INPUT_FIELDS}
     found_closing_delimiter = False
     for line in lines[1:]:
         if line == "---":
@@ -147,15 +182,17 @@ def frontmatter_values(path: Path) -> tuple[Dict[str, Any], Any]:
                 "values": found,
             }
 
+    values[DEPENDENCY_FIELD] = dependency_block(lines)
+
     return values, "valid"
 
 
-def current_goals() -> Any:
+def current_goals() -> list[str] | dict[str, object]:
     lines = read_stable_text(GOALS_FILE).splitlines()
     in_current_goals = False
     saw_heading = False
-    goals: List[str] = []
-    errors: List[str] = []
+    goals: list[str] = []
+    errors: list[str] = []
 
     for line in lines:
         if line.strip() == "## Current goals":
@@ -200,7 +237,7 @@ def current_goals() -> Any:
     return goals
 
 
-def build_snapshot() -> Dict[str, Any]:
+def build_snapshot() -> dict[str, object]:
     if ISSUES_DIR.is_symlink():
         raise ValueError(f"refusing symlinked issues directory: {ISSUES_DIR}")
     if not ISSUES_DIR.is_dir():
@@ -208,10 +245,10 @@ def build_snapshot() -> Dict[str, Any]:
     if not GOALS_FILE.is_file():
         raise ValueError(f"goals file does not exist: {GOALS_FILE}")
 
-    issues: List[Dict[str, Any]] = []
+    issues: list[dict[str, object]] = []
     for path in sorted(ISSUES_DIR.glob("*.md"), key=lambda item: item.name):
         values, frontmatter_state = frontmatter_values(path)
-        record: Dict[str, Any] = {
+        record: dict[str, object] = {
             "path": f"issues/{path.name}",
             "frontmatter": frontmatter_state,
         }
@@ -225,40 +262,57 @@ def build_snapshot() -> Dict[str, Any]:
     }
 
 
-def completeness_errors(snapshot: Mapping[str, Any]) -> Iterable[str]:
-    goals = snapshot["goals"]
+def completeness_errors(snapshot: Mapping[str, object]) -> Iterable[str]:
+    goals = snapshot.get("goals")
     if not isinstance(goals, list):
         yield f"{GOALS_FILE}: malformed goals section {goals!r}"
-        goal_values = set()
+        goal_values: set[str] = set()
     else:
-        goal_values = set(goals)
-    for issue in snapshot["issues"]:
-        if issue["status"] != "open":
+        goal_items = cast(list[object], goals)
+        if not all(isinstance(goal, str) for goal in goal_items):
+            yield f"{GOALS_FILE}: malformed goals section {goals!r}"
+            goal_values = set()
+        else:
+            goal_values = set(cast(list[str], goal_items))
+    raw_issues = snapshot.get("issues")
+    if not isinstance(raw_issues, list):
+        yield "snapshot has malformed issues"
+        return
+    for raw_issue in cast(list[object], raw_issues):
+        if not isinstance(raw_issue, dict):
+            yield f"snapshot has malformed issue {raw_issue!r}"
+            continue
+        issue = cast(Mapping[str, object], raw_issue)
+        if issue.get("status") != "open":
             continue
 
-        path = issue["path"]
-        if issue["frontmatter"] != "valid":
-            yield f"{path}: malformed frontmatter {issue['frontmatter']!r}"
+        path = issue.get("path")
+        if not isinstance(path, str):
+            yield f"snapshot issue has invalid path {path!r}"
             continue
-        backlog_goal = issue["backlog_goal"]
+        frontmatter = issue.get("frontmatter")
+        if frontmatter != "valid":
+            yield f"{path}: malformed frontmatter {frontmatter!r}"
+            continue
+        backlog_goal = issue.get("backlog_goal")
         if not isinstance(backlog_goal, str) or backlog_goal not in goal_values:
             yield f"{path}: invalid or missing backlog_goal {backlog_goal!r}"
 
         for field, domain in renumber.RUBRIC_DOMAINS.items():
-            value = issue[field]
+            value = issue.get(field)
             if value not in domain:
                 yield f"{path}: invalid or missing {field} {value!r}"
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument(
+    _ = parser.add_argument(
         "--output",
         required=True,
         type=Path,
         help="write canonical JSON to this path",
     )
-    parser.add_argument(
+    _ = parser.add_argument(
         "--require-complete",
         action="store_true",
         help="fail unless every open issue has valid rubric inputs",
@@ -268,13 +322,15 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> int:
     args = parse_args()
+    output = cast(Path, args.output)
+    require_complete = cast(bool, args.require_complete)
     try:
         snapshot = build_snapshot()
     except (OSError, UnicodeError, ValueError) as error:
         print(f"snapshot error: {error}", file=sys.stderr)
         return 2
 
-    if args.require_complete:
+    if require_complete:
         errors = list(completeness_errors(snapshot))
         if errors:
             print(
@@ -286,7 +342,7 @@ def main() -> int:
             return 1
 
     try:
-        args.output.write_text(
+        _ = output.write_text(
             json.dumps(snapshot, indent=2, sort_keys=True) + "\n",
             encoding="utf-8",
         )

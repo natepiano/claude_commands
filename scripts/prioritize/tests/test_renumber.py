@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import contextlib
-import importlib.util
 import io
 import os
 import subprocess
@@ -14,13 +13,11 @@ from unittest import mock
 from zoneinfo import ZoneInfo
 
 
-MODULE_PATH = Path(__file__).parents[1] / "renumber.py"
-sys.path.insert(0, str(MODULE_PATH.parent))
-SPEC = importlib.util.spec_from_file_location("hanadocs_renumber", MODULE_PATH)
-assert SPEC is not None and SPEC.loader is not None
-renumber = importlib.util.module_from_spec(SPEC)
-sys.modules[SPEC.name] = renumber
-SPEC.loader.exec_module(renumber)
+SCRIPTS_DIR = Path(__file__).parents[2]
+PRIORITIZE_DIR = Path(__file__).parents[1]
+sys.path.insert(0, str(SCRIPTS_DIR))
+sys.path.insert(0, str(PRIORITIZE_DIR))
+from prioritize import renumber
 
 
 GOALS = """# prioritization goals
@@ -355,6 +352,84 @@ class RenumberTests(unittest.TestCase):
         ordered = sorted(plan.valid_open, key=lambda issue: issue.assigned_rank or 0)
 
         self.assertEqual([issue.source.path for issue in ordered], [alpha, bravo])
+
+    def test_open_dependency_ranks_immediately_before_dependent(self) -> None:
+        prerequisite_values = dict(DEFAULT_VALUES)
+        prerequisite_values["backlog_impact"] = "⭐"
+        prerequisite = self.fixture.add(
+            "prerequisite.md", issue_text(values=prerequisite_values)
+        )
+        dependent = self.fixture.add(
+            "dependent.md",
+            issue_text(extra_frontmatter='depends_on: ["[[prerequisite]]"]'),
+        )
+
+        plan = renumber.build_plan(self.fixture.scope)
+        ordered = sorted(plan.valid_open, key=lambda issue: issue.assigned_rank or 0)
+
+        self.assertEqual([issue.source.path for issue in ordered], [prerequisite, dependent])
+
+    def test_multiple_dependencies_place_dependent_after_the_last_one(self) -> None:
+        low_values = dict(DEFAULT_VALUES)
+        low_values["backlog_impact"] = "⭐"
+        first = self.fixture.add("first.md", issue_text(values=low_values))
+        second = self.fixture.add("second.md", issue_text(values=low_values))
+        dependent = self.fixture.add(
+            "dependent.md",
+            issue_text(
+                extra_frontmatter=(
+                    "depends_on:\n"
+                    '  - "[[first]]"\n'
+                    '  - "[[second]]"'
+                )
+            ),
+        )
+
+        plan = renumber.build_plan(self.fixture.scope)
+        ordered = sorted(plan.valid_open, key=lambda issue: issue.assigned_rank or 0)
+
+        self.assertEqual([issue.source.path for issue in ordered], [first, second, dependent])
+
+    def test_closed_dependencies_are_ignored(self) -> None:
+        self.fixture.add("closed.md", issue_text(status="closed"))
+        dependent = self.fixture.add(
+            "dependent.md",
+            issue_text(extra_frontmatter='depends_on: ["[[closed]]"]'),
+        )
+
+        plan = renumber.build_plan(self.fixture.scope)
+
+        self.assertEqual(len(plan.valid_open), 1)
+        self.assertEqual(plan.valid_open[0].source.path, dependent)
+        self.assertEqual(plan.valid_open[0].assigned_rank, 1)
+
+    def test_unknown_dependency_is_unranked_and_reported(self) -> None:
+        dependent = self.fixture.add(
+            "dependent.md",
+            issue_text(extra_frontmatter='depends_on: ["[[missing]]"]'),
+        )
+
+        plan = renumber.build_plan(self.fixture.scope)
+
+        self.assertEqual(plan.valid_open, ())
+        self.assertEqual(plan.needs_prioritization[0].source.path, dependent)
+        self.assertIn(
+            "depends_on issue not found: [[missing]]",
+            plan.needs_prioritization[0].problems,
+        )
+
+    def test_open_dependency_cycle_prevents_ranking(self) -> None:
+        self.fixture.add(
+            "first.md", issue_text(extra_frontmatter='depends_on: ["[[second]]"]')
+        )
+        self.fixture.add(
+            "second.md", issue_text(extra_frontmatter='depends_on: ["[[first]]"]')
+        )
+
+        with self.assertRaisesRegex(
+            renumber.PlanningError, "open depends_on cycle prevents ranking"
+        ):
+            _ = renumber.build_plan(self.fixture.scope)
 
     def test_apply_refuses_a_file_changed_after_discovery(self) -> None:
         path = self.fixture.add("issue.md", issue_text())
