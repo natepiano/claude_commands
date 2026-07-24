@@ -24,7 +24,7 @@ Look up the project shorthand from the base files in the vault root (`/Users/nat
 | cargo-mend | cargo-mend | issues - cargo-mend.base |
 | cargo-port | cargo-port | issues - cargo-port.base |
 | catenary | bevy_catenary | issues - catenary.base |
-| diegetic | bevy_diegetic | issues - diegetic.base |
+| diegetic | hana_diegetic | issues - diegetic.base |
 | fairy_dust | fairy_dust | issues - fairy_dust.base |
 | hana | hana | issues - hana.base |
 | lading | hana_lading | issues - lading.base |
@@ -74,7 +74,7 @@ If the shorthand doesn't match any of these, tell the user and stop.
      - `⭐⭐⭐⭐` — major benefit across a core workflow or multiple audiences
      - `⭐⭐⭐⭐⭐` — transformative outcome for the product, organization, or ecosystem
 
-   - **`backlog_urgency`** — cost of delay (no duration estimate; four- and five-star require concrete time-pressure evidence):
+   - **`backlog_urgency`** — cost of delay, rated against the calendar rather than against other issues (no duration estimate). Four and five stars require concrete time-pressure evidence — a committed date, an external cutoff, an expiring opportunity, or active harm — and carry heavy scoring weight; five stars sends the issue straight to the top of the backlog. Wanting to work on something next is alignment or impact, not urgency. One star is the default and is correct for most issues:
      - `⭐` — can wait; delay has little material cost
      - `⭐⭐` — pressure is building; delay slowly raises cost or loses opportunity
      - `⭐⭐⭐` — pressing; delay materially worsens the outcome or problem

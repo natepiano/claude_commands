@@ -84,9 +84,26 @@ Bands are rated internally against each other; different bands are only comparab
 
 - `A`, `I`, `U`, `E` are the star counts of `backlog_alignment`, `backlog_impact`, `backlog_urgency`, `backlog_effort`.
 - Each goal's 1-based numeric prefix is `goal_position`; `goal_bonus = 2 * (goal_count - goal_position)`. Four goals produce bonuses `6`, `4`, `2`, `0`.
-- `backlog_score = (4 * (A - 1)) + (3 * (I - 1)) + (2 * (U - 1)) - (E - 1) + goal_bonus`
+- Urgency scores as tiers, not a linear term: `urgency_bonus` is `0`, `2`, `4`, `20`, `70` for `U` of one through five stars.
+- `backlog_score = (4 * (A - 1)) + (3 * (I - 1)) + urgency_bonus + goal_bonus - (E - 1)`
 - Never divide by effort; coarse effort estimates must not let tiny tasks dominate or erase an XL strategic initiative.
 - These exact weights stay explicit and centralized here.
+
+#### Why urgency is tiered
+
+Alignment, impact, and effort measure how valuable an issue is. Urgency measures when that value expires, which is a scheduling fact rather than a value judgment, so blending it in linearly would produce a number that is neither a good value estimate nor a good schedule.
+
+The tiers encode where the distinction actually bites. One through three stars separate "can wait" from "feels pressing" — a judgment call that must not outrank a strategic issue, so those tiers only nudge. Four stars is heavy enough to outweigh a full alignment or impact gap on its own, but a top-scoring strategic issue can still beat a weak four-star one. Five stars is a strict override: every other term together spans 38 points, so the 50-point gap between the four- and five-star bonuses guarantees any five-star issue outranks every issue below it, whatever its other ratings.
+
+`depends_on` still wins over urgency. Ranking sorts by score and then applies the dependency topological order, so a five-star issue with an unfinished open dependency waits behind it.
+
+#### Keeping the override meaningful
+
+An overruling signal invites grade inflation: it becomes the escape hatch for whatever the user wants to work on next, and once most issues sit at three or four stars the override is noise. Urgency is safe to weight this heavily only because it stays absolute and evidence-gated.
+
+- Never re-rate urgency comparatively within a band, the way alignment and impact are re-rated. Comparative urgency is a contradiction — it hands the override to whichever issue is merely the least patient among its neighbors.
+- Four and five stars require concrete, checkable time pressure named in the note: a committed date, an external dependency's cutoff, an expiring opportunity, active harm. "This feels important" or "I want to do this next" is alignment or impact, not urgency.
+- Expect most issues to sit at one star permanently. A backlog where urgency is broadly distributed has a broken rubric, not an urgent backlog.
 
 ### Rubric metadata
 
@@ -116,11 +133,13 @@ Assign every eligible issue its closest `backlog_goal`, even when alignment is w
 
 #### `backlog_urgency` — evidenced cost of delay (absolute; no duration estimates)
 
-- `⭐` — can wait; delay has little material cost
+Rated against the calendar, never against the band. Four and five stars must cite concrete time pressure in the note and carry heavy scoring weight; five stars sends the issue to the top of the backlog outright.
+
+- `⭐` — can wait; delay has little material cost. The default, and correct for most issues
 - `⭐⭐` — pressure is building; delay slowly raises cost or loses opportunity
 - `⭐⭐⭐` — pressing; delay materially worsens the outcome or problem
-- `⭐⭐⭐⭐` — time-sensitive; an active commitment, dependency, or opportunity is at risk
-- `⭐⭐⭐⭐⭐` — immediate; serious current harm, blockage, or a hard cutoff demands action
+- `⭐⭐⭐⭐` — time-sensitive; an active commitment, dependency, or opportunity is at risk. Requires a named date, cutoff, or external dependency
+- `⭐⭐⭐⭐⭐` — immediate; serious current harm, blockage, or a hard cutoff demands action. Overrides every other factor, so reserve it for work that must happen next
 
 Require cited evidence for four and five stars; never invent a deadline, commitment, or closing opportunity window.
 

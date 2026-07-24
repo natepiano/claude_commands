@@ -45,6 +45,19 @@ RUBRIC_DOMAINS: dict[str, tuple[str, ...]] = {
 }
 RUBRIC_FIELDS = tuple(RUBRIC_DOMAINS)
 GENERATED_FIELDS = ("backlog_score", "backlog_rank")
+
+# Urgency is a scheduling signal, not a value signal, so it is scored as tiers
+# rather than a linear term. One through three stars nudge; four is heavy enough
+# to outweigh a full alignment or impact gap; five is an override that always
+# sorts above every lower-urgency issue.
+#
+# The override holds because the other terms span a bounded range: alignment
+# contributes 0..16, impact 0..12, effort -4..0, and the goal bonus 0..2*(g-1)
+# for g goals. With the four current goals that span is 38 points, so the worst
+# five-star issue (70 - 4 = 66) still outranks the best four-star issue
+# (20 + 34 = 54). The headroom in the five-star bonus keeps that true up to
+# nineteen goals.
+URGENCY_BONUSES = (0, 2, 4, 20, 70)
 OPERATIONAL_TIMEZONE = ZoneInfo("America/New_York")
 OBSIDIAN_CACHE_REFRESH_NS = 1_000_000
 
@@ -427,11 +440,10 @@ def parse_goals(source: SourceFile) -> tuple[Goal, ...]:
 
 
 def calculate_score(goal: Goal, values: dict[str, int]) -> int:
-    alignment = values["backlog_alignment"]
     return (
-        (4 * (alignment - 1))
+        (4 * (values["backlog_alignment"] - 1))
         + (3 * (values["backlog_impact"] - 1))
-        + (2 * (values["backlog_urgency"] - 1))
+        + URGENCY_BONUSES[values["backlog_urgency"] - 1]
         - (values["backlog_effort"] - 1)
         + goal.bonus
     )

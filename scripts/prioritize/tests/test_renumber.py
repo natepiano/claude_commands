@@ -107,6 +107,52 @@ class RenumberTests(unittest.TestCase):
         values["backlog_alignment"] = 1
         self.assertEqual(renumber.calculate_score(goal, values), 11)
 
+    def test_urgency_scores_as_tiers(self) -> None:
+        goal_source = renumber._read_source(self.fixture.goals)
+        goal = renumber.parse_goals(goal_source)[0]
+        values = {
+            "backlog_alignment": 1,
+            "backlog_impact": 1,
+            "backlog_urgency": 1,
+            "backlog_effort": 1,
+        }
+
+        scores: list[int] = []
+        for stars in range(1, 6):
+            values["backlog_urgency"] = stars
+            scores.append(renumber.calculate_score(goal, values))
+
+        self.assertEqual(scores, [4, 6, 8, 24, 74])
+
+    def test_five_star_urgency_outranks_every_lower_rating(self) -> None:
+        """The weakest five-star issue must still beat the strongest four-star one."""
+        goal_source = renumber._read_source(self.fixture.goals)
+        goals = renumber.parse_goals(goal_source)
+
+        weakest_override = renumber.calculate_score(
+            goals[-1],
+            {
+                "backlog_alignment": 1,
+                "backlog_impact": 1,
+                "backlog_urgency": 5,
+                "backlog_effort": 5,
+            },
+        )
+        strongest_below = max(
+            renumber.calculate_score(
+                goals[0],
+                {
+                    "backlog_alignment": 5,
+                    "backlog_impact": 5,
+                    "backlog_urgency": stars,
+                    "backlog_effort": 1,
+                },
+            )
+            for stars in range(1, 5)
+        )
+
+        self.assertGreater(weakest_override, strongest_below)
+
     def test_goal_bonus_tracks_the_ordered_goal_count(self) -> None:
         self.fixture.goals.write_text(
             GOALS + "4. `4 - Build Community`\n", encoding="utf-8"
