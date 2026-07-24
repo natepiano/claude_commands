@@ -95,8 +95,9 @@ block — nothing else. The prompt must include:
      skill — belongs to /plan:delegate's <FinalGate/> after the last phase,
      never to any phase. For non-Rust projects, record the exact commands the
      project uses (read `package.json`/`justfile`/CI config; do not invent).
-  6. **Style** — for Rust, the `load-rust-style.sh` line with the project root;
-     omit for non-Rust.
+  6. **Style** — for Rust, the `load-rust-style.sh` line with `--scope edit` and
+     the project root (phases write code, so they do not need the structural
+     rules); omit for non-Rust.
   7. **Invariants** — project-wide rules every phase must preserve (from the plan
      and from obvious code constraints).
 - Output format: exactly the `## Delegation Context` bullet block from the format

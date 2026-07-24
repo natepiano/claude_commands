@@ -4,6 +4,7 @@ set -euo pipefail
 list_files=false
 project_root=""
 shuffle=false
+scope="all"
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -15,6 +16,22 @@ while [[ $# -gt 0 ]]; do
       shuffle=true
       shift
       ;;
+    --scope)
+      if [[ $# -lt 2 ]]; then
+        echo "error: --scope requires a value (edit|all)" >&2
+        exit 2
+      fi
+      case "$2" in
+        edit|all)
+          scope="$2"
+          ;;
+        *)
+          echo "error: --scope must be 'edit' or 'all' (got '$2')" >&2
+          exit 2
+          ;;
+      esac
+      shift 2
+      ;;
     --project-root)
       if [[ $# -lt 2 ]]; then
         echo "error: --project-root requires a path" >&2
@@ -24,7 +41,7 @@ while [[ $# -gt 0 ]]; do
       shift 2
       ;;
     *)
-      echo "usage: load-rust-style.sh [--list-files] [--shuffle] [--project-root PATH]" >&2
+      echo "usage: load-rust-style.sh [--list-files] [--shuffle] [--scope edit|all] [--project-root PATH]" >&2
       exit 2
       ;;
   esac
@@ -133,6 +150,15 @@ is_auto_fix() {
   return 1
 }
 
+# Returns 0 if the file is tagged `scope: review` — a rule about where code
+# lives (module boundaries, file placement, Cargo.toml deps) rather than what
+# to type. Skipped under `--scope edit` so a coding agent does not carry
+# structural-audit rules it cannot act on mid-edit. Review callers pass no
+# --scope and still get everything.
+is_review_only() {
+  [[ "$(frontmatter_value "$1" scope)" == "review" ]]
+}
+
 # Emit one wikilink stem per line from a file's `see_also:` frontmatter entry.
 # Supports single-line `see_also: "[[stem]]"` and multi-line list forms:
 #   see_also:
@@ -191,6 +217,7 @@ declare -a member_style_files=()
 declare -a non_negotiable_files=()
 skipped_bevy=0
 skipped_auto_fix=0
+skipped_review=0
 
 if [[ -d "$global_style_dir" ]]; then
   while IFS= read -r file; do
@@ -200,6 +227,10 @@ if [[ -d "$global_style_dir" ]]; then
     fi
     if is_auto_fix "$file"; then
       skipped_auto_fix=$((skipped_auto_fix + 1))
+      continue
+    fi
+    if [[ "$scope" == edit ]] && is_review_only "$file"; then
+      skipped_review=$((skipped_review + 1))
       continue
     fi
     global_style_files+=("$file")
@@ -216,6 +247,10 @@ if [[ -n "$repo_style_dir" && -d "$repo_style_dir" ]]; then
       skipped_auto_fix=$((skipped_auto_fix + 1))
       continue
     fi
+    if [[ "$scope" == edit ]] && is_review_only "$file"; then
+      skipped_review=$((skipped_review + 1))
+      continue
+    fi
     if has_tag "$file" non-negotiable; then
       non_negotiable_files+=("$file")
     fi
@@ -228,6 +263,10 @@ for dir in "${member_style_dirs[@]}"; do
   while IFS= read -r file; do
     if is_auto_fix "$file"; then
       skipped_auto_fix=$((skipped_auto_fix + 1))
+      continue
+    fi
+    if [[ "$scope" == edit ]] && is_review_only "$file"; then
+      skipped_review=$((skipped_review + 1))
       continue
     fi
     if has_tag "$file" non-negotiable; then
@@ -282,8 +321,17 @@ if [[ "$list_files" == true ]]; then
 fi
 
 # ── Helpers ─────────────────────────────────────────────────────
+# Strip frontmatter, and under `--scope edit` also drop body-level `regex:`
+# lines. Those are matcher patterns for banned_words_lib.py (which parses
+# forbidden-words.md straight from disk, not this output) — a model only needs
+# the `### "stem"` term itself to avoid the word. `except:` lines stay: they
+# carry the domain carve-outs.
 strip_frontmatter() {
-  awk 'NR==1 && /^---$/ { skip=1; next } skip && /^---$/ { skip=0; next } !skip' "$1"
+  if [[ "$scope" == edit ]]; then
+    awk 'NR==1 && /^---$/ { skip=1; next } skip && /^---$/ { skip=0; next } skip { next } /^regex:[[:space:]]/ { next } { print }' "$1"
+  else
+    awk 'NR==1 && /^---$/ { skip=1; next } skip && /^---$/ { skip=0; next } !skip' "$1"
+  fi
 }
 
 extract_title() {
@@ -346,8 +394,12 @@ auto_fix_note=""
 if [[ "$skipped_auto_fix" -gt 0 ]]; then
   auto_fix_note=" (skipped $skipped_auto_fix tool-enforced rules)"
 fi
+scope_note=""
+if [[ "$scope" == edit ]]; then
+  scope_note=" (edit scope: skipped $skipped_review structural rules — run without --scope for the full guide)"
+fi
 
-printf 'Rust style guide loaded — %d %s, %d lines (shared: %d %s, %d lines; project: %d %s, %d lines; members: %d %s, %d lines; non-negotiable: %d)%s%s.\n\n' \
+printf 'Rust style guide loaded — %d %s, %d lines (shared: %d %s, %d lines; project: %d %s, %d lines; members: %d %s, %d lines; non-negotiable: %d)%s%s%s.\n\n' \
   "$total_files" \
   "$(pluralize_file "$total_files")" \
   "$total_lines" \
@@ -362,7 +414,8 @@ printf 'Rust style guide loaded — %d %s, %d lines (shared: %d %s, %d lines; pr
   "$member_lines" \
   "$non_negotiable_count" \
   "$bevy_note" \
-  "$auto_fix_note"
+  "$auto_fix_note" \
+  "$scope_note"
 
 counter_state="${HOME}/.claude/state/forbidden-word-counts.json"
 if [[ -s "$counter_state" ]]; then
