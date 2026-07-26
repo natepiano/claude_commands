@@ -48,6 +48,12 @@ launcher in this workflow:
 - When phases or reviews launch in parallel, retain every handle and wait on all
   of them in the same turn. Process each completion while remaining waits stay
   attached. Continue the workflow immediately after the final completion.
+- **Dual-review preemption:** <DualReview/> may cancel a still-running blind
+  review only when the main agent has already confirmed a substantial,
+  unambiguous correction from the Work Order. First read any streamed reviewer
+  log once, then cancel its handle through the environment's cancellation
+  mechanism and remain attached until cancellation settles. Dispatch the fix
+  only after that; never edit the diff while the old-diff reviewer is active.
 
 Context compaction does not relax this invariant: resume the same active waits
 and control flow after compaction.
@@ -548,6 +554,33 @@ runs, then applies the **Background wait invariant** until that handle completes
 4. Note where ${IMPL_SUMMARY}'s claims diverge from what the diff actually shows
 5. Record your own findings with the same severity scale
 
+**Step 4a — preempt an obsolete blind review.** Do this as soon as Step 4
+confirms a substantial defect whose correct repair is already unambiguous from
+the Work Order; do not wait merely to collect a second opinion. A defect is
+substantial when it is wrong behavior, a specification violation, missing
+required work, or a non-trivial change to logic or error handling. It is not a
+style issue, a documentation-only change, a one-line mechanical correction, or
+anything whose intended behavior remains unclear.
+
+1. If the blind reviewer has already completed, use its findings normally and
+   continue to Step 5.
+2. If it is still active, read `${SESSION_DIR}/review_agent.log` once. Preserve
+   any completed observations that bear on the confirmed defect as
+   `${PARTIAL_AGENT_REVIEW}`; an absent, partial, or silent log is not an
+   approval and does not delay the repair.
+3. Cancel the blind-review handle with the environment's background-task
+   cancellation mechanism. Stay attached until cancellation completion is
+   reported; cancellation replaces the ordinary completion wait for this one
+   review, never the same-turn wait requirement.
+4. Increment `${FIX_PASS}`, compose a normal delegate fix prompt for the
+   confirmed defect (including any useful `${PARTIAL_AGENT_REVIEW}` evidence),
+   and dispatch it immediately using the auto-fix-pass rules in <Synthesize/>.
+   Tell the user in one line that the blind review was canceled because the
+   confirmed defect already requires this fix.
+5. After the fix returns, run a fresh <DualReview/> of the new diff. Do not
+   synthesize the canceled review as a verdict and do not use it to qualify for
+   the direct-fix exception.
+
 **Step 5 — Collect:** when the background task notification arrives, read ${SESSION_DIR}/review_status:
 - **"reviewed":** Read ${SESSION_DIR}/review_findings.txt → ${AGENT_REVIEW}
 - **"error":** Read ${SESSION_DIR}/review_agent.log, tell the user the delegate review failed, and proceed on the main agent's review alone (say so explicitly).
@@ -936,6 +969,10 @@ every line must stand on its own for a reader who has not seen the plan.
 - ${WORKING_DIR} is whatever the current project directory is — often a worktree checkout. Never create a worktree or switch branches. The only commits are <CheckpointCommit/> checkpoints in loop or verbose mode — one per completed phase, never a push.
 - All delegate-launching scripts run with `dangerouslyDisableSandbox: true` and `run_in_background: true`.
 - The **Background wait invariant** is mandatory. No active delegate terminal may outlive the primary-agent turn that launched it.
+- A confirmed substantial, spec-defined defect found during the main side of
+  <DualReview/> preempts a still-running blind review: read its partial log if
+  available, cancel and wait for cancellation, delegate the repair immediately,
+  then run a fresh dual review of the repaired diff.
 - `${SESSION_DIR}/heartbeat.log` is for on-demand status only (see **Delegate heartbeat**): a single read when the user asks what is happening, once after compaction, or one staleness check on an overdue delegate — never a wait loop, never a completion signal.
 - The delegate reviewer is always a fresh session and always blind to the implementer's summary.
 - Delegate launchers record task, family, agent, and effort in the session directory. Never rely on an empty effort silently becoming `xhigh`.
