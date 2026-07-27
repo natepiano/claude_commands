@@ -148,6 +148,17 @@ explicit `--lib`/`--bins` targets from cargo metadata).
   violation, not diligence.
 - `example` lines appear only in phases whose **Files** touch that example;
   integration-test lines only in phases that own that test.
+- `check` is compile feedback, never a gate entry. Every package in the gate
+  gets `test` + `lint`. A package listed as `check` only is a hole: it proves
+  the code builds while its tests go unrun.
+- The gate covers every package the phase **modifies**, which is not the same as
+  the packages its **Files** list names. A changed trait signature, public API,
+  registration path, or plugin wiring reaches callers the plan never listed —
+  most often the top-level application crate, which the Work Order rarely names
+  because the change there is one or two lines. Trace the blast radius when
+  composing the gate and add those packages. This is a recurring escape route
+  for regressions: the delegate edits a caller to keep the build green, and
+  nothing ever runs that caller's tests.
 - Everything workspace-wide — `--all-targets`, all examples, the full `clippy`
   skill — happens once in <FinalGate/> when the plan is exhausted, not per
   phase.
@@ -370,6 +381,14 @@ do not add flags, do not widen targets, do not invoke cargo directly. If a
 listed command fails in a way the spec does not explain, report it in your
 summary rather than inventing a broader check.
 
+One exception, and only this one: if you modify a file in a package that has no
+`test` line below, run `bash ~/.claude/scripts/delegate/verify.sh test <that
+package>` as well and name it in your summary. Editing a caller to keep the
+build compiling — a trait signature change, a new registration, a plugin
+list — is exactly the case where that package's tests are most likely to break
+and least likely to be listed. Widening a package already covered below is
+still a violation; this covers packages the gate missed entirely.
+
 While coding (as often as useful):
   bash ~/.claude/scripts/delegate/verify.sh check <package>
 Before summarizing (the phase gate):
@@ -514,6 +533,17 @@ Run `git diff` and `git status --short` in ${WORKING_DIR}. For untracked new fil
 You are reviewing a code change you did not write. You have the specification
 it was implemented from and the full diff. Review independently and critically.
 You have read-only access to the codebase — read surrounding code as needed.
+
+Do NOT re-run the verification the implementer already ran — its exact
+build/test/lint gate is listed in the specification below and it passed.
+Repeating it proves nothing and burns most of the review on compilation.
+Reading code and reasoning about it is the only thing this review contributes,
+so spend your time there.
+
+The exception is real: if you suspect this change breaks something the listed
+gate does NOT cover — another crate's tests, a target outside its scope — run
+that one specific check. Gaps in the gate are exactly what a reviewer is
+positioned to catch. Name the command you ran in the finding.
 
 Narrate as you go: before each new activity (reading the diff, opening a
 surrounding file, checking a spec section, composing findings), output one

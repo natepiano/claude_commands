@@ -118,16 +118,21 @@ Capture all output for analysis - rustdoc errors become todos.
 </RunDoc>
 
 <ReportFindings>
-Present a summary before proceeding to todos:
+Present a summary before proceeding to todos, as a table — one row per lint
+stage, no prose around it:
 
 ## Findings
-**Mend**: [one of: "Fixed N issues via `~/.claude/scripts/clippy/lint mend --fix`" | "No issues found" | "No fixable issues found"] [if unfixable: "| N unfixable issues remaining"]
-**Style review**: [one of: "N violations fixed" | "All changes conform" | "No uncommitted changes to review"]
-**Clippy**: [one of: "N issues across M files" | "No issues found"]
-**Doc**: [one of: "N rustdoc errors across M files" | "No issues found"]
+| Stage | Result | Action |
+|---|---|---|
+| Mend | [one of: "Fixed N issues" \| "No issues found" \| "No fixable issues found"] [if unfixable: ", N unfixable"] | [Applied \| N todos below \| —] |
+| Style review | [one of: "N violations fixed" \| "All changes conform" \| "No uncommitted changes"] | [Applied \| —] |
+| Clippy | [one of: "N issues across M files" \| "No issues found"] | [N todos below \| —] |
+| Doc | [one of: "N rustdoc errors across M files" \| "No issues found"] | [N todos below \| —] |
 
-Mend and style fixes are already applied, not action items.
-Only unfixable mend issues, clippy issues, and rustdoc errors become todos below.
+The **Action** column carries what used to be explanatory prose: mend and style
+fixes are already applied (`Applied`), unfixable mend issues / clippy issues /
+rustdoc errors become todos (`N todos below`), and a clean stage is `—`. Do not
+restate any of that in sentences under the table.
 </ReportFindings>
 
 <CreateBatchTodoList>
@@ -152,18 +157,34 @@ and per-todo details below, then immediately execute <BatchExecution/> as
 has selected one of the Available Actions below. This applies even if there is
 only one issue — the user must approve every fix before execution.**
 
-Present the complete batch of fixes exactly as follows:
+Present the complete batch of fixes exactly as follows — **one table, one row
+per todo**. No paragraph-per-issue write-ups; the columns carry the metadata.
 
 ## Issues Found
-**Clippy**: [clippy_count] issues across [clippy_file_count] files
-**Doc**: [doc_count] rustdoc errors across [doc_file_count] files
-**Mend (unfixable)**: [mend_count] issues across [mend_file_count] files
+[total] issues — mend (unfixable) [mend_count] in [mend_file_count] files, clippy [clippy_count] in [clippy_file_count] files, doc [doc_count] in [doc_file_count] files
 
-For each todo, show:
-- file:line and lint name
-- the fix approach in one sentence
-- `rule:` with the matched style-guide filename from the `lint:`
-  frontmatter lookup, when a match exists (omit the field otherwise)
+| # | Src | File:line | Lint | Rule | Fix |
+|---|---|---|---|---|---|
+| 1 | mend | src/project/cargo/parse.rs:78 | forbidden_pub_crate | use-narrowest-visibility | Re-export `ManifestTargets` through `cargo/mod.rs` and `project/mod.rs`, matching `GitRepoPresence`. |
+
+Column rules:
+- **#** — todo number, also the key for any Notes entry below.
+- **Src** — `mend` / `clippy` / `doc`, lowercase.
+- **File:line** — repo-relative path and line, nothing else.
+- **Lint** — the lint or rule name that fired. For a style-review violation with
+  no lint name, use the rule's short name.
+- **Rule** — matched style-guide filename from the `lint:` frontmatter lookup,
+  `.md` dropped for width. `—` when no rule file matches (do not write "none",
+  do not leave the cell blank).
+- **Fix** — the fix approach in **one sentence**, imperative, naming the concrete
+  edit. This is the last column so its wrapping does not shift the others.
+
+Anything that does not fit one sentence — a rationale, a constraint that rules
+out the obvious fix, a pre-existing off-rule pattern deliberately not copied —
+goes in a `### Notes` section under the table, one short paragraph per entry,
+prefixed with the row number it belongs to (`**2.** …`). Do not inflate the Fix
+cell to carry it, and do not add notes for rows that do not need one; omit the
+section entirely when every row is self-explanatory.
 
 ## Available Actions
 - **proceed** - Fix all issues using standard clippy guidance
