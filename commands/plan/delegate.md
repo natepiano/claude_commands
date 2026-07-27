@@ -426,13 +426,22 @@ what later work depends on it, and what remains deliberately outside it.]
 state transitions, ownership boundaries, and user-visible effect.]
 
 ### Important types and APIs this phase will introduce or change
-| Type / trait / API | Planned role | How it will work with the rest of the system |
-| --- | --- | --- |
+| Type / trait / API | Status | Planned role | How it will work with the rest of the system |
+| --- | --- | --- | --- |
 [Only load-bearing types, traits, resources, enums, events, and public methods
 explicitly named by the Work Order. Explain expected ownership, inputs/outputs,
 lifecycle, and persistence/runtime boundaries where specified. If the Work
 Order names none, say "No new load-bearing types or APIs are specified for this
-phase" instead of manufacturing entries.]
+phase" instead of manufacturing entries.
+
+**Status** is exactly one of `New`, `Existing - Changes`, or
+`Existing - No Changes`, derived from the Work Order alone — its Spec wording
+and Files list say what the phase creates versus modifies; a type the phase
+only calls, stores, or reads is `Existing - No Changes`. Never open codebase
+files to settle this on the delegate-ready fast path. If the Work Order is
+genuinely ambiguous about a row, write `Existing - Changes (unconfirmed)` or
+`New (unconfirmed)` rather than guessing silently, and name the ambiguity in
+one line under the table.]
 
 ### Files and verification
 [Name the files or modules that will change, the acceptance gate, and meaningful
@@ -847,12 +856,20 @@ what later work depends on it, and what remains deliberately outside it.]
 [A concise behavior-focused summary of the reviewed implementation.]
 
 ### Important types and APIs
-| Type / trait / API | Role | How it works with the rest of the system |
-| --- | --- | --- |
+| Type / trait / API | Status | Role | How it works with the rest of the system |
+| --- | --- | --- | --- |
 [Only load-bearing new or materially changed types, traits, resources, enums,
 and public methods. Explain ownership, inputs/outputs, important lifecycle, and
 persistence/runtime boundaries where relevant. If none were introduced, say
-"No new load-bearing types in this phase" instead of manufacturing entries.]
+"No new load-bearing types in this phase" instead of manufacturing entries.
+
+**Status** is exactly one of `New`, `Existing - Changes`, or
+`Existing - No Changes`, read off the reviewed diff — the diff is authoritative
+over the Work Order's expectation, so a type the pre-phase briefing called
+`New` that landed as a change to an existing type is reported as
+`Existing - Changes`, and the difference is worth one line. Include an
+`Existing - No Changes` row only when that untouched type is needed to
+understand the phase's change.]
 
 ### Verification and review
 [Acceptance gate result, meaningful tests/lint, review outcome, fixes, and the
