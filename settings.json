@@ -90,6 +90,14 @@
             "command": "/opt/homebrew/bin/python3 /Users/natemccoy/.claude/scripts/hooks/post-tool-use-basedpyright.py"
           }
         ]
+      },
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/opt/homebrew/bin/python3 /Users/natemccoy/.claude/scripts/hooks/post-tool-use-context-usage.py"
+          }
+        ]
       }
     ]
   },
@@ -134,9 +142,13 @@
     ]
   },
   "alwaysThinkingEnabled": true,
+  "askUserQuestionTimeout": "never",
   "tui": "fullscreen",
   "skipDangerousModePermissionPrompt": true,
   "skipWorkflowUsageWarning": true,
+  "editorMode": "normal",
+  "autoCompactEnabled": true,
+  "autoCompactWindow": 233000,
   "teammateMode": "tmux",
   "inputNeededNotifEnabled": true,
   "agentPushNotifEnabled": true,
