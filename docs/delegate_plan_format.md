@@ -49,13 +49,25 @@ to rediscover after a context compaction lives in the doc.
 
 ## Phases
 
+<!-- PHASE NUMBERING — binds every command that edits this doc.
+     N is a bare integer, numbered from 1, contiguous, in execution order.
+     Never a letter suffix (`4a`, `2b1a`) — those stop sorting and make ranges
+     unreadable. Any spine edit (insert, split, merge, reorder, delete)
+     resequences from the edit point to the end AND updates every cross-reference:
+     substitute highest-first so `Phase 8` does not corrupt `Phase 12`, and
+     re-check that each `Phases X–Y` range still spans the same set.
+     Insert after the last `done` phase where possible — a done phase's number
+     is baked into its checkpoint commit message and cannot be rewritten; if one
+     must be renumbered, add an old→new mapping note to the doc.
+     Full procedure: /plan:to_phased_plan → <PhaseNumbering/>. -->
+
 ### Phase N — <title>  · status: todo
 <!-- status ∈ {todo, done}. /plan:phase_review flips it and appends a Retrospective;
      the /plan:delegate checkpoint commit writes the hash into `done (<commit>)`. -->
 
 #### Work Order
 <!-- The dispatch prompt. Self-contained against Delegation Context + named files.
-     A fresh codex session reads ONLY the files named here — no exploration. -->
+     A fresh delegate session reads ONLY the files named here — no exploration. -->
 
 **Goal:** <one line — the observable outcome of this phase>
 
@@ -146,8 +158,8 @@ Rules:
 1. **Delegation Context is written once.** Per-phase Work Orders reference it
    ("build/test/paths: see Delegation Context") rather than repeating it. The
    dispatch step concatenates the two.
-2. **A Work Order is self-contained against named files.** A fresh codex with no
-   conversation history must be able to implement it by reading only the files
+2. **A Work Order is self-contained against named files.** A fresh delegate agent
+   with no conversation history must be able to implement it by reading only the files
    the Work Order names plus the Delegation Context. If it would have to *search*
    for something, that something belongs in the Work Order or Delegation Context.
 3. **Spec stays verbatim.** When the plan derives from a resolved design, copy the
