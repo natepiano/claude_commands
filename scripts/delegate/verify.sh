@@ -126,20 +126,23 @@ case "$CMD" in
     test)
         PKG="${1:?verify.sh test <package> [integration_test]}"
         TARGET="${2:-}"
+        # --no-fail-fast: nextest cancels every remaining test after the first
+        # failure, so one broken test silently hides the rest of the suite. A
+        # phase gate has to report the whole result, not the first stop.
         if [[ -n "$TARGET" ]]; then
             if have_nextest; then
-                run cargo nextest run -p "$PKG" --test "$TARGET"
+                run cargo nextest run --no-fail-fast -p "$PKG" --test "$TARGET"
             else
-                run cargo test -p "$PKG" --test "$TARGET"
+                run cargo test --no-fail-fast -p "$PKG" --test "$TARGET"
             fi
         else
             FLAGS="$(target_flags "$PKG")"
             if have_nextest; then
                 # shellcheck disable=SC2086
-                run cargo nextest run -p "$PKG" $FLAGS
+                run cargo nextest run --no-fail-fast -p "$PKG" $FLAGS
             else
                 # shellcheck disable=SC2086
-                run cargo test -p "$PKG" $FLAGS
+                run cargo test --no-fail-fast -p "$PKG" $FLAGS
             fi
         fi
         ;;

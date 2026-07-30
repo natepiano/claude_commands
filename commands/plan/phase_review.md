@@ -47,6 +47,8 @@ Edit the plan doc to:
 
 Before dispatching the review, inspect the implementation diff for the phase: use the working-tree diff if the phase is uncommitted, or the phase commit diff if it has already been committed.
 
+If the phase is uncommitted, first run `git status --short` and `git add -N` every untracked file the phase created (excluding orchestrator-owned files such as handoff docs). `git diff` does not show untracked files at all, so a new source file is invisible to this sweep and to the architect review that follows — and new files are exactly where fresh process comments accumulate. Verify by name that every file the phase claims to have created appears in the diff before continuing.
+
 Remove or rewrite source-code comments that describe phase history, planning decisions, review process, or temporary rationale tied to the just-completed plan phase. Code comments should explain the code as it exists now, not narrate how it got there.
 
 Remove comments that mention phase numbers, "for this phase", "per the plan", "decision from review", "temporary until Phase N", or similar process/history markers.
@@ -182,8 +184,25 @@ When a decision needs source detail, include it inside `<DecisionPresentationTem
 </RequiredSubSections>
 
 <PresentInlineSingle>
-Write the decision using `<DecisionPresentationTemplate/>`. Ask once for approve / reject / redirect. Apply on approve. Drop or apply the user's redirect on rejection.
+Write the decision using `<DecisionPresentationTemplate/>`. Ask once for approve / reject / redirect. Apply on approve. Drop or apply the user's redirect on rejection. If the user answers with confusion instead of a decision, execute `<ExplainOnDemand/>` and re-ask — a decision the user cannot restate is not resolved.
 </PresentInlineSingle>
+
+<ExplainOnDemand>
+**Trigger:** the user says they do not understand, asks what something means,
+asks for a reframe, or answers a decision with confusion instead of an answer.
+This fires wherever it happens — an inline decision, an `/adhoc_review` item,
+the Step 6 final update — and preserves whatever was pending. Explaining never
+counts as approval.
+
+**Read `~/.claude/docs/explain_on_demand.md` and follow it.** It owns the
+method: rebuild from the bottom, stay technical, name real signatures read from
+real source, and put a short code example under every mechanism — problem code
+before fix code. `/plan:delegate` shares the same file, so the two commands
+cannot drift.
+
+This is the one place terseness is wrong. Do not compress and do not re-emit the
+same wording softened. Afterwards, restate the pending question and wait.
+</ExplainOnDemand>
 
 <DispatchAdhocReview>
 Invoke `/adhoc_review` with the filtered user decisions. Each item must already use `<DecisionPresentationTemplate/>` so the user can decide one at a time without translating abstract review language. Apply each user decision into the plan as the walkthrough completes that item.
@@ -240,3 +259,4 @@ Style rules for the final update:
 - User decisions never use `AskUserQuestion`. Single decision → inline decision template; two or more → `/adhoc_review`. See `<SignificantFindings/>`, `<FilterFindingsForUserReview/>`, and `<DecisionPresentationTemplate/>` in Step 5.
 - In auto mode this command asks the user nothing: unresolved decisions become `**Pending decision:**` blocks in the affected Work Orders, surfaced later by the `/plan:delegate` pre-dispatch check.
 - If the subagent returns nothing actionable, still append the **Phase N Review** block with a single line stating the remaining phases were reviewed and need no changes.
+- Any signal that the user does not understand triggers `<ExplainOnDemand/>`: rebuild from the bottom, stay technical, put a short code example under every mechanism, and preserve whatever was pending. Terseness is the default everywhere else; here it is the defect.

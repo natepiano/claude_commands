@@ -119,6 +119,7 @@ If the shorthand doesn't match any of these, tell the user and stop.
 10. Report the ranking. The vault's background watcher computes `backlog_score` and `backlog_rank` from the survey inputs faster than a tool-call round trip. Do NOT sleep or wait — immediately re-read the created file's frontmatter (e.g. `rg -n "backlog_score|backlog_rank" <file>`). If the fields aren't there yet, just re-query until they are; never insert a sleep between attempts. Report `backlog_rank` (and `backlog_score`) to the user, so they see where the new issue landed in the global ordering.
 
 ## Important
+- Every issue's `return` carries **two** entries: the project base `[[issues - <short>.base]]` first, then `[[issues.base]]`. The template already does this — do not drop either one.
 - Do NOT commit the changes
 - The file must go in `/Users/natemccoy/rust/hanadocs/issues/` (absolute path)
 - Today's date comes from the MEMORY.md `# currentDate` section, or use the system date

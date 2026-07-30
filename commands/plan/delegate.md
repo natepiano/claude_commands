@@ -60,6 +60,43 @@ and control flow after compaction.
 
 ---
 
+## Context and compaction — never stall for it
+
+Compaction is a normal, expected event in a long delegate run. It is designed
+into this workflow, not an emergency.
+
+**Do not write or refresh a handoff doc before the environment's context-usage
+hook asks for one.** Speculative handoff maintenance burns tokens on every
+meaningful change and buys nothing; the hook fires at its threshold and that is
+the trigger. When it does fire, write the doc into the repo (not the session
+scratchpad, which does not survive) and follow the hook's own content list. Add
+exactly one thing it has no reason to ask for: **the authorization state** — the
+mode this run is in, whether a bounded auto window is open and how many phases
+remain in it, and what the last gate actually approved. Everything else the hook
+already covers; do not pad the doc. Getting authorization wrong after compaction
+means dispatching a phase the user never approved, which is why it is worth the
+line. Exclude the doc from `add -N` and from <CheckpointCommit/>; delete it once
+the phase is committed and its content is consumed.
+
+**Never stall for compaction.** An approaching context limit is not a reason to
+stop, pause, wrap up early, ask the user whether to continue, or hold a dispatch
+until after compaction — and it is not something to announce. Write the doc when
+the hook asks, then proceed directly to the next action and let auto-compaction
+fire on its own schedule. That is the intended path; interrupting it is strictly
+slower. Even a missing or hastily written handoff is not grounds to stop —
+auto-compaction plus the conversation summary generally carries the run forward
+correctly on its own.
+
+After compaction, before taking any further workflow action: **re-read this
+command file in full** (`~/.claude/commands/plan/delegate.md`) so the workflow is
+fresh and complete rather than reconstructed from a summary — a summarized
+workflow silently drops rules, and the ones it drops are the ones that were not
+firing at the moment of compaction. Then read the handoff back, resume the same
+active waits and control flow, and delete the handoff when the phase it describes
+is committed.
+
+---
+
 ## Delegate heartbeat
 
 Every dispatch in a session — implementation, blind review, fix passes,
@@ -108,7 +145,9 @@ Reading rules — the **Background wait invariant** stands unchanged:
   ~40 lines, e.g. `tail -n 40`), not the whole file: a long multi-phase
   session accumulates hundreds of lines. Never in a wait loop, and never as
   a completion signal; the background task notification remains the only wait
-  mechanism.
+  mechanism. The two-minute progress narration below is the one sanctioned
+  periodic read, and it is driven by monitor events, not by a loop the main
+  agent writes into its own turn.
 - Read it when: the user interjects during a wait and asks what is happening
   (report the last few lines in real words); when resuming after context
   compaction (one read to re-establish where the delegate is); or when a
@@ -120,6 +159,105 @@ Reading rules — the **Background wait invariant** stands unchanged:
   than ~150s (2.5x the 60s cadence) mean the delegate process is dead —
   expect the task notification imminently; do not act before it arrives.
   Read entries below the most recent header block as belonging to that run.
+
+---
+
+## Progress narration while waiting
+
+A delegate dispatch runs for many minutes. The user must not have to ask what is
+happening. Every dispatch — implementation, blind review, fix pass, escalation —
+narrates its progress to the user about every two minutes for as long as it runs.
+
+**Arm the monitor in the same turn as the dispatch**, immediately after the
+launcher returns its handle and before settling into the **Background wait
+invariant**. Both launchers write a status file whose value ends in `ing` while
+the delegate is alive (`impl_status` → `implementing`, `review_status` →
+`reviewing`), so one command serves either:
+
+```
+Monitor({
+  command: 'S="${SESSION_DIR}/<impl|review>_status"; while :; do sleep 120; ' +
+           'case "$(cat "$S" 2>/dev/null)" in *ing) ;; *) break ;; esac; ' +
+           'echo "--- $(date +%H:%M:%S)"; tail -n 6 "${SESSION_DIR}/heartbeat.log"; done',
+  description: '<phase> delegate progress',
+  persistent: true,
+})
+```
+
+Substitute the real `${SESSION_DIR}` and the right status file. The loop exits on
+its own when the status flips to `implemented` / `reviewed` / `error`, so no
+monitor outlives its dispatch; still call `TaskStop` on the monitor handle if the
+dispatch ends some other way (cancelled, preempted by <DualReview/>).
+
+**When a monitor event lands, write one or two sentences of ordinary English plus
+a rough completion estimate** — what the delegate is doing right now, roughly how
+long it has been at it, and how far through its work it appears to be. This is
+the same translation standard as <Synthesize/>: the reader has not seen the code,
+the plan, or the log. Turn `[agent] rerunning the mimesis test gate` into "still
+running the image-tool tests, about four minutes in — roughly 70% done". Never
+paste raw heartbeat lines, never quote a file path, never emit a bare timestamp.
+(The heartbeat log path is given once at dispatch — see <ComposeWorkOrder/> step
+3 — and is not repeated in these updates.)
+If nothing has changed since the last narration, say that in one short sentence
+rather than repeating the previous wording verbatim.
+
+**Estimating percent complete.** The main agent wrote the prompt, so it knows the
+whole work list: the number of issues or files to change, and the exact
+verification lines the delegate must run. Score against that list, not against
+elapsed time.
+
+- Reading the style guide, reading source, and locating the change sites is the
+  first stretch — under 20%.
+- Editing is the middle. With a known issue count, weight by issues finished:
+  two of four done is about half of the editing stretch.
+- Verification is the last stretch and its steps are countable. Each
+  `verify.sh` line that has passed is a fixed share of it; the last line
+  finishing means the delegate is writing its report — 90%+.
+- A blind review has no edit stretch: reading and cross-checking is nearly all
+  of it, so hold the estimate low and moving (30%, 55%, 70%) until findings are
+  being written.
+
+Give one number, round it hard (10%, 25%, half, 80%), and never present it as
+precise. If the delegate is doing something the work list did not anticipate,
+say the estimate is uncertain and why, in the same sentence — an unexplained
+percentage that stalls or moves backwards is worse than no percentage.
+
+Interpretation carries over from the heartbeat reading rules: fresh `[wrapper]`
+lines with an old `[agent]` line mean the delegate is alive and has been in that
+one activity the whole time — say so, and flag it only when that duration is
+implausible for the named activity.
+
+Two things this narration never does: it never ends the turn, and it never
+substitutes for the completion notification. The **Background wait invariant**
+stands unchanged — the monitor is a side channel for the user's benefit, not a
+wait mechanism.
+
+**Yield to the user.** If the user gives the main agent something else to do
+during a wait, that work takes precedence: do it, and let the narration lapse
+while it is in progress rather than interleaving status lines into the middle of
+it. Resume narrating once that work is done and the delegate is still running. If
+the user says to stop the updates, `TaskStop` the monitor and do not re-arm it
+for the rest of the run.
+
+---
+
+<ExplainOnDemand>
+**Trigger:** the user says they do not understand, asks what something means,
+asks for a reframe, or answers a gate with confusion instead of a control. This
+fires at any gate — pending decision, <VerbosePrePhaseGate/>, <Synthesize/>,
+<VerbosePostPhaseReport/> — and preserves that gate. Explaining never authorizes
+anything.
+
+**Read `~/.claude/docs/explain_on_demand.md` and follow it.** It owns the
+method: rebuild from the bottom, stay technical, name real signatures read from
+real source, and put a short code example under every mechanism — problem code
+before fix code. `/plan:phase_review` shares the same file, so the two commands
+cannot drift.
+
+This is the one place the terse default is wrong. Do not compress and do not
+re-emit the same summary with softer words. Afterwards, restate the pending
+question and wait.
+</ExplainOnDemand>
 
 ---
 
@@ -151,6 +289,23 @@ explicit `--lib`/`--bins` targets from cargo metadata).
 - `check` is compile feedback, never a gate entry. Every package in the gate
   gets `test` + `lint`. A package listed as `check` only is a hole: it proves
   the code builds while its tests go unrun.
+- **Never write a "known pre-existing failure" caveat into a delegate prompt
+  without having proven it on a clean tree first.** Telling the delegate which
+  failure to disregard makes its confirmation circular: it reports back the
+  conclusion the prompt handed it, and a real regression introduced by the
+  phase wears the exemption. If a test is believed to fail before the phase
+  starts, verify it by running that test on the pre-phase tree — `git stash` is
+  prohibited, so check out the base commit in a scratch worktree, or run the
+  single test by name before dispatching. If it passes there, it is not
+  pre-existing and the prompt must say nothing about it.
+- A failure that is environmental rather than code — no GPU, no display, a
+  missing service, a blocked socket — is a finding to surface to the user, not
+  a caveat to feed the delegate. The main agent's own shell may be sandboxed
+  when the delegate's is not (or the reverse), so "it fails for me" is not
+  evidence about the delegate's environment. Re-run the failing test with
+  `dangerouslyDisableSandbox: true` before concluding anything: a sandboxed
+  macOS shell has no GPU adapter, so every test that builds a real render
+  device panics with a driver error that looks nothing like a sandbox problem.
 - The gate covers every package the phase **modifies**, which is not the same as
   the packages its **Files** list names. A changed trait signature, public API,
   registration path, or plugin wiring reaches callers the plan never listed —
@@ -212,8 +367,8 @@ There, the selected starting phase counts as the first `auto next N` phase, and
 `auto through phase X` includes both the selected phase and X. Examples:
 
 ```
-/plan:delegate docs/hana/tool-graph.md phase 0a verbose
-/plan:delegate docs/hana/tool-graph.md phase 0a verbose auto through phase 0j
+/plan:delegate docs/hana/tool-graph.md phase 1 verbose
+/plan:delegate docs/hana/tool-graph.md phase 1 verbose auto through phase 13
 ```
 
 **Commit authorization.** Invoking this command in loop mode IS the user's
@@ -293,6 +448,10 @@ returns to STEP 2 for the next pre-phase gate, or ends with <RunSummary/>
    recommendation), wait for the resolution, edit the resolved outcome into the
    Work Order (Spec / Files / Acceptance gate, then delete the block), and only
    then proceed. Never dispatch a phase carrying an unresolved pending decision.
+   A block written months ago may name code that has since shipped — read what
+   it cites before presenting it, and say so when the gap turns out narrower
+   than the block assumes. If the user does not follow the decision, execute
+   <ExplainOnDemand/>; a decision the user cannot restate is not resolved.
 
 1. Parse $ARGUMENTS into: doc path (if any), phase/section (if any), `single`
    token, `verbose` token, optional bounded-auto control (`auto next N phases`
@@ -410,11 +569,18 @@ commands — the run-only-what-is-listed rule still applies.]
 - Include the heartbeat paragraph with the concrete ${SESSION_DIR} path substituted — the delegate has no ${SESSION_DIR} variable
 - Verification lines are `verify.sh` invocations with `<package>` filled in — never raw cargo commands (see **Delegate verification (Rust)**)
 
-3. In single/loop mode or a verbose bounded-auto window, tell the user in one
-   line what is being dispatched and the prompt path:
+3. In single/loop mode or a verbose bounded-auto window, tell the user what is
+   being dispatched, the prompt path, and the heartbeat log path:
    `Dispatching <scope summary> to the delegate agent — prompt at ${SESSION_DIR}/implementation_prompt.md`
+   `Heartbeat: ${SESSION_DIR}/heartbeat.log`
+   The heartbeat path is always given so the user can watch the delegate
+   directly (`tail -f`) instead of relying on the two-minute narration. Emit it
+   once per dispatch, at dispatch — including fix passes, escalations, and the
+   blind review, which share the same file.
    In verbose mode with no active auto window, do not announce dispatch yet;
-   <VerbosePrePhaseGate/> explains the assembled phase and waits for approval.
+   <VerbosePrePhaseGate/> explains the assembled phase and waits for approval —
+   the same two lines are emitted after approval, when the dispatch actually
+   goes out.
 
    If this was the fast path, add: `(assembled from <plan>'s Phase N Work Order — no research)`.
 </ComposeWorkOrder>
@@ -485,7 +651,8 @@ Then ask exactly one authorization question and wait:
 - `continue`: this control is reserved for <VerbosePostPhaseGate/> and does not
   authorize implementation; preserve this gate and ask for `proceed`.
 - A question or discussion without an explicit authorization control does not
-  authorize the phase. Answer it, preserve the gate, and ask again.
+  authorize the phase. Answer it, preserve the gate, and ask again. If the
+  question is that the briefing did not land, execute <ExplainOnDemand/>.
 </VerbosePrePhaseGate>
 
 ---
@@ -511,10 +678,12 @@ delegate family with `/agent`.
 
 1. Run `bash ~/.claude/scripts/delegate/implement.sh "${SESSION_DIR}" "${WORKING_DIR}" "${SESSION_DIR}/implementation_prompt.md" "${IMPLEMENTATION_TASK}" "<responsibility>"` using Bash with `run_in_background: true` and `dangerouslyDisableSandbox: true` — `<responsibility>` starts with the plan/phase line (`<plan-doc filename> — phase: <identifier>`, or `adhoc — <scope>` without a plan doc), then 1-2 lines naming what this run implements (the Work Order's goal in a few words)
 2. Inform the user: "The delegate agent is implementing... (heartbeat: ${SESSION_DIR}/heartbeat.log)"
-3. Apply the **Background wait invariant**: keep this turn visibly attached to
+3. Arm the two-minute progress monitor over `impl_status` per **Progress
+   narration while waiting**, in this same turn.
+4. Apply the **Background wait invariant**: keep this turn visibly attached to
    the returned handle and wait for the background task notification. Do NOT
    poll status files or end the turn.
-4. When it arrives, read ${SESSION_DIR}/impl_status:
+5. When it arrives, read ${SESSION_DIR}/impl_status:
    - **"implemented":** Read ${SESSION_DIR}/impl_summary.txt → ${IMPL_SUMMARY}. Continue.
    - **"error":** Read ${SESSION_DIR}/impl_agent.log, show the user the error, stop.
 </LaunchImplementation>
@@ -525,7 +694,16 @@ delegate family with `/agent`.
 **Goal:** Two independent reviews of the diff — a fresh blind delegate session and the main agent's own — running concurrently.
 
 **Step 1 — Capture the diff:**
-Run `git diff` and `git status --short` in ${WORKING_DIR}. For untracked new files, read them and include their contents.
+
+**Before capturing anything, run `git status --short` in ${WORKING_DIR} and `git add -N` every untracked file the phase created.** A delegate that creates a new source file leaves it untracked, and `git diff` does not show untracked files at all — so the phase's largest new file is routinely the one missing from the review. Intent-to-add makes it appear in every subsequent `git diff` without staging its contents.
+
+Exclude from `add -N`: files the phase did not create (pre-existing untracked scratch), and orchestrator-owned files such as handoff docs. Everything else the phase produced gets tracked now — it also has to be in <CheckpointCommit/> later, so this is not extra work.
+
+Then run `git diff` and `git status --short`. Verify the diff now contains every new file by name; if a file the delegate's summary claims to have created is absent from the diff, stop and resolve that before dispatching any review.
+
+This rule applies to **every** review dispatch, not just the first: the fix-pass re-review in Step 5 below, any re-review after <Synthesize/>, and any scoped re-review. Fix passes create new files too.
+
+**Never hand a reviewer a `git diff <ref>` command as the definition of the change** unless every new file is already tracked. If a review prompt names a diff command, the untracked sweep above must have run first — otherwise the reviewer silently reviews a subset and reports clean.
 
 **Step 2 — Compose the review prompt.** Write ${SESSION_DIR}/review_prompt.md using the **Write tool**:
 
@@ -582,8 +760,12 @@ If you find nothing, say so explicitly — do not invent findings.
 **Step 3 — Launch the delegate review:**
 Run `bash ~/.claude/scripts/delegate/review.sh "${SESSION_DIR}" "${WORKING_DIR}" "${SESSION_DIR}/review_prompt.md" review "<responsibility>"` using Bash with `run_in_background: true` and `dangerouslyDisableSandbox: true` — `<responsibility>` starts with the same plan/phase line as the implementation dispatch, then 1-2 lines naming what is under review (e.g. `tool-graph.md — phase: 3` newline `Blind review of the diff against its Work Order; no implementer summary provided`).
 
-Retain the returned handle. The main agent performs Step 4 while the review
-runs, then applies the **Background wait invariant** until that handle completes.
+Retain the returned handle and arm the two-minute progress monitor over
+`review_status` per **Progress narration while waiting**. The main agent performs
+Step 4 while the review runs, then applies the **Background wait invariant** until
+that handle completes. Narration during Step 4 is unnecessary — the main agent is
+visibly working — so let it lapse there and resume once Step 4 is done and the
+only remaining activity is the wait.
 
 **Step 4 — the main agent's own review, while the delegate agent reviews:**
 (The main agent MAY read ${IMPL_SUMMARY} — only the delegate reviewer is blind.)
@@ -641,7 +823,8 @@ tripwire / file identifiers used as if the user knows them, and tooling terms
 (`headless` → "the automated tests on this machine can't drive a real screen";
 `binding` / `bind group` → say what the data connection actually is). If you
 cannot say what a finding *means in behavior terms*, you do not understand it
-well enough to present it — read the code until you can.
+well enough to present it — read the code until you can. If the user says a
+finding did not land, execute <ExplainOnDemand/> before re-offering the choices.
 
 **Never use the word "plain" or any variant** (`plain terms`, `plain language`,
 `plain English`, `in plain terms`) anywhere in the output — not in a header, a
@@ -738,7 +921,8 @@ without asking:
    line, then 1-2 lines naming the fix pass and the confirmed issues it
    addresses (e.g. `tool-graph.md — phase: 3` newline `Fix pass 2 — restore
    the error path dropped from the parser; both reviews flagged it`). Tell
-   the user in one line what is being fixed.
+   the user in one line what is being fixed, and arm the two-minute progress
+   monitor over `impl_status` per **Progress narration while waiting**.
    Re-execute <DualReview/> and <Synthesize/> scoped to the new changes.
 
    **STOP** — when any remaining issue needs a design decision the plan does
@@ -936,7 +1120,7 @@ wait:
   composing the next phase's briefing.
 - `proceed`, `approved`, a question, or discussion without `continue` does not
   advance. Answer any discussion using only the completed phase's report and
-  preserve this gate.
+  preserve this gate. If the report did not land, execute <ExplainOnDemand/>.
 </VerbosePostPhaseGate>
 
 ---
@@ -1025,6 +1209,15 @@ every line must stand on its own for a reader who has not seen the plan.
 - Delegate launchers record task, family, agent, and effort in the session directory. Never rely on an empty effort silently becoming `xhigh`.
 - Select `escalation` from the actual Work Order or review outcome, never keyword matching.
 - The main agent orchestrates and reviews; the delegate agent codes. The main agent touches implementation code only on explicit user instruction — except post-review doc-only or trivial fixes that both reviews agree on (see the direct-fix exception in <Synthesize>), which the main agent applies itself and reports.
+- Every delegate dispatch arms a two-minute progress monitor and narrates what
+  the delegate is doing in ordinary English, with a rough percent-complete
+  estimate scored against the prompt's own work list, until it finishes
+  (**Progress narration while waiting**). Other user work takes precedence over
+  the narration; the narration never replaces the completion notification.
+- Any signal that the user does not understand — at any gate — triggers
+  <ExplainOnDemand/>: rebuild from the bottom, stay technical, put a short code
+  example under every mechanism, and preserve the gate. Terseness is the default
+  everywhere else; here it is the defect.
 - Max 4 delegate fix passes per phase before stopping for the user; an explicit user choice of another pass overrides the cap.
 - Auto/loop mode stops only for: an unresolved `**Pending decision:**` on the phase being dispatched, a fix that needs a design decision the plan does not answer, reviews conflicting on intended behavior, the fix-pass cap with blockers remaining, or a delegate/environment error. Everything else auto-routes or defers.
 - Verbose mode has all of those stops plus a mandatory <VerbosePrePhaseGate/>

@@ -46,6 +46,13 @@ HANDOFF_MARGIN_TOKENS = 25_000
 # warning late costs the handoff entirely.
 PENDING_BYTES_PER_TOKEN = 3.0
 
+# Same idea for the just-landed tool result, but a smaller divisor: the payload
+# holds the raw result, while what reaches the context is the formatted version
+# (line-number prefixes, JSON escaping, truncation notices, system reminders).
+# Measured on a 1,388-line source read: 48,622 payload bytes became 109,632
+# transcript bytes, a 2.2x expansion. Reusing 3.0 credited 16k of a 36.5k read.
+RESPONSE_BYTES_PER_TOKEN = 1.5
+
 # Bytes of transcript tail to scan for the most recent usage record.
 TAIL_BYTES = 512 * 1024
 TAIL_BYTES_RETRY = 4 * 1024 * 1024
@@ -75,6 +82,10 @@ class HookInput(TypedDict, total=False):
     transcript_path: str
     hook_event_name: str
     tool_name: str
+    # The result the tool just produced. Typed `object` rather than a concrete
+    # shape because every tool returns something different; it is only ever
+    # measured, never inspected.
+    tool_response: object
     # Present only when the hook fires inside a subagent.
     agent_id: str
     agent_type: str
@@ -202,6 +213,19 @@ def latest_reading(path: Path) -> Reading | None:
     return None
 
 
+def response_bytes(payload: HookInput) -> int:
+    """Size of the tool result that just landed.
+
+    PostToolUse runs before the result reaches the transcript, so it appears
+    neither in the usage record nor in `pending_bytes`. Measuring it here is
+    what keeps one large read from going unnoticed until the next tool call.
+    """
+    response = payload.get("tool_response")
+    if response is None:
+        return 0
+    return len(json.dumps(response, default=str))
+
+
 def build_context(tokens: int, window: int | None, is_subagent: bool) -> str | None:
     """The line handed to the agent, or None when there is nothing to say."""
     warn_only = os.environ.get("CLAUDE_CONTEXT_HOOK_MODE", "always") == "warn"
@@ -241,6 +265,7 @@ def log_debug(
     transcript: Path | None,
     reading: Reading | None,
     window: int | None,
+    response: int,
 ) -> None:
     if os.environ.get("CLAUDE_CONTEXT_HOOK_DEBUG") == "0":
         return
@@ -255,6 +280,7 @@ def log_debug(
         "pending_bytes": None if reading is None else reading["pending_bytes"],
         "is_sidechain": None if reading is None else reading["is_sidechain"],
         "window": window,
+        "response_bytes": response,
     }
     try:
         DEBUG_LOG.parent.mkdir(parents=True, exist_ok=True)
@@ -269,10 +295,15 @@ def main() -> None:
     transcript = resolve_transcript(payload)
     window = auto_compact_window()
     reading = None if transcript is None else latest_reading(transcript)
-    log_debug(payload, transcript, reading, window)
+    response = response_bytes(payload)
+    log_debug(payload, transcript, reading, window, response)
     if reading is None:
         return
-    tokens = reading["tokens"] + int(reading["pending_bytes"] / PENDING_BYTES_PER_TOKEN)
+    tokens = (
+        reading["tokens"]
+        + int(reading["pending_bytes"] / PENDING_BYTES_PER_TOKEN)
+        + int(response / RESPONSE_BYTES_PER_TOKEN)
+    )
     context = build_context(tokens, window, bool(payload.get("agent_id")))
     if context is None:
         return

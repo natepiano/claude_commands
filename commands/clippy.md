@@ -181,10 +181,82 @@ Column rules:
 
 Anything that does not fit one sentence — a rationale, a constraint that rules
 out the obvious fix, a pre-existing off-rule pattern deliberately not copied —
-goes in a `### Notes` section under the table, one short paragraph per entry,
-prefixed with the row number it belongs to (`**2.** …`). Do not inflate the Fix
-cell to carry it, and do not add notes for rows that do not need one; omit the
-section entirely when every row is self-explanatory.
+goes in a `### Notes` section under the table, prefixed with the row number it
+belongs to (`**2.** …`). Do not inflate the Fix cell to carry it, and do not add
+notes for rows that do not need one; omit the section entirely when every row is
+self-explanatory.
+
+**Notes must be readable at a glance.** Give each note a short bolded lead-in
+naming what that paragraph answers, and put one idea in each paragraph. The
+questions a note usually needs to answer, in this order:
+
+1. **What is being flagged** — the specific thing in the code, with the
+   surrounding pattern that makes it stand out.
+2. **Why the fix is safe** (or what makes it risky) — what keeps working, and
+   which call sites move.
+3. **How it was verified** — which tool answered, and what the fallback covers
+   if the preferred one did not.
+4. **Where the rule comes from** — only when the `lint:` lookup found nothing
+   and the rule had to be traced somewhere else.
+
+Skip any of these that do not apply. A note that only needs one sentence stays
+one sentence.
+
+#### Do not write notes like this
+
+The following is a real note that was rejected as unreadable. Every fact in it
+is correct; the problem is that four unrelated findings are fused into one
+unbroken block, so nothing can be located without reading all of it:
+
+> **1.** No style-guide file carries `review-pub-mod` in its `lint:`
+> frontmatter, so the mechanical lookup found nothing. `use-narrowest-visibility.md`
+> still governs it in prose: "`pub mod` is forbidden by never-use-pub-mod" (that
+> referenced rule file isn't present in `~/rust/nate_style/rust/`). The fix is
+> zero-call-site: all five public items are already re-exported from the crate
+> root at `lib.rs:80-84` (`ImageDelay`, `Outputs`, `Settings`, `State`,
+> `register`), and the sole external consumer — `crates/hana/src/video_plane/mod.rs:169`
+> — calls `hana_mimesis_tools::register_image_delay`, the re-export, not the
+> module path. `image_delay` is also the only `pub mod` in that file; the other
+> 17 are private `mod` with `pub use` re-exports. LSP `findReferences` on the
+> module declaration returned nothing (rust-analyzer doesn't resolve module decls
+> as symbols), so coverage here rests on ripgrep across every `.rs` in the
+> workspace, which is exhaustive for a module path since it can't be reached
+> through a type alias or generic dispatch.
+
+What is wrong with it: it opens on rule provenance (the least useful fact)
+instead of on what the code does; the verification caveat is buried in the last
+clause; parenthetical asides carry load-bearing information; and the reader has
+to hold four threads at once because none of them are separated or labeled.
+
+#### Write it like this instead
+
+> **1. What mend is flagging.** `hana_mimesis_tools/src/lib.rs` declares 18
+> modules. Seventeen are private (`mod foo;`). One — `image_delay` — is
+> `pub mod`. The style guide bans `pub mod`.
+>
+> **Why making it private is safe.** Nothing gets hidden, because the crate root
+> already re-exports the five things callers need (lines 80–84): `ImageDelay`,
+> `Outputs`, `Settings`, `State`, `register`. Those re-exports keep working when
+> the module itself goes private. The only code outside the crate that touches
+> `image_delay` is `crates/hana/src/video_plane/mod.rs:169`, and it calls
+> `hana_mimesis_tools::register_image_delay` — the re-export, not the module
+> path. So no caller changes.
+>
+> **How I checked.** LSP was the right tool but returned nothing: rust-analyzer
+> doesn't treat a `mod` declaration as a findable symbol. I fell back to ripgrep
+> for `image_delay` across every `.rs` file in the workspace. For a module name
+> that's a complete check — unlike a type, a module path can't be reached through
+> an alias or generic dispatch, so if grep doesn't see it, it isn't there.
+>
+> **Where the rule lives.** The skill looks up a lint name in style-guide `lint:`
+> frontmatter. Nothing matches `review-pub-mod`. The ban is stated in passing
+> inside `use-narrowest-visibility.md`, which cites a `never-use-pub-mod` file
+> that doesn't exist in the guide directory. The rule is real; its home file is
+> missing.
+
+Same facts, same length. The difference is that a reader who only wants to know
+whether the fix is safe can find that answer without reading the other three
+paragraphs.
 
 ## Available Actions
 - **proceed** - Fix all issues using standard clippy guidance
