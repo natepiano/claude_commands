@@ -117,7 +117,7 @@ All scriptable steps use shell scripts. The agent orchestrates script execution 
 - `pin_path_deps.sh` — pin path-only workspace deps to published versions for publish (release branch only)
 - `finalize_changelogs.sh` — replace [Unreleased] with version header
 - `publish_crate.sh` — dry-run and publish a single crate ⊘
-- `update_workspace_deps.sh` — update workspace dependency versions between publish phases ⊘
+- `update_workspace_deps.sh` — update internal cross-crate versions in root `Cargo.toml` `[workspace.dependencies]`; between publish phases with explicit names ⊘, or with `--edit-only --auto` (self-discovering, no crates.io wait, no commit) when bumping versions in STEP 4 and STEP 11
 - `push_release.sh` — tag, push branch, push tag ⊘
 - `verify_published.sh` — check crates.io versions ⊘
 - `create_github_release.sh` — create GitHub release ⊘
@@ -502,6 +502,34 @@ git commit -m "docs: update compatibility tables for v${VERSION}"
 
 → Report the script output to the user.
 
+### Update Workspace Dependencies
+
+**This runs unconditionally** — it discovers its own targets and no-ops when there are none, so single crates and workspaces without internal cross-crate dependencies need no special handling.
+
+`bump_versions.sh` rewrote only `[package] version` fields. An entry in root `Cargo.toml` `[workspace.dependencies]` that declares both a `path` into the workspace and a `version` still carries the *old* requirement, which no longer matches the just-bumped local crate. `cargo update --workspace` in the next subsection would then fail with:
+
+```
+error: failed to select a version for the requirement `<dep> = "^<old-version>"`
+candidate versions found which didn't match: ${VERSION}
+```
+
+**Run the update:**
+```bash
+~/.claude/scripts/release/update_workspace_deps.sh ${VERSION} ${DRY_RUN_FLAG} --edit-only --auto
+```
+
+`--auto` finds the affected entries by reading root `Cargo.toml` rather than taking a list: an inline `[workspace.dependencies]` entry qualifies when it has both `path` and `version` **and** the crate at that path is already at `${VERSION}` — proof that `bump_versions.sh` just bumped it. Path-only entries state no requirement and cannot break the lockfile; external paths and unbumped or excluded members fail the version match. This is why the subsection must run *after* the version bump.
+
+`--edit-only` rewrites just the version value, preserving `path` and every other key, then exits without the crates.io wait, the `cargo check`, or a commit — the version is not on crates.io yet, and the change belongs in this step's single version commit.
+
+Deriving the list beats configuring it: a hand-maintained list silently goes stale the moment someone adds a `version` to an existing path dependency, which is exactly when it starts mattering.
+
+If the script warns about `[workspace.dependencies.<name>]` sub-table entries, it could not inspect those — check them by hand and pass their names explicitly.
+
+These entries are rewritten again after their crate publishes (STEP 6, same script with explicit names and no `--auto`). Setting them here makes that later pass a no-op, which is expected.
+
+→ Report which entries were updated.
+
 ### Update Cargo.lock
 
 **Regenerate the lockfile** to reflect the bumped versions (skip in dry-run mode):
@@ -510,6 +538,8 @@ cargo update --workspace
 ```
 
 This syncs `Cargo.lock` with the new `[package] version` fields. Without this step, `Cargo.lock` remains stale and the next cargo command (publish dry-run, etc.) would create uncommitted changes that break the process.
+
+**If this command fails, STOP — do not commit.** A failed `cargo update` leaves `Cargo.lock` stale, and committing anyway produces a version commit that cannot be published without an amend. Never chain the commit after it with `;`; use `&&` so a failure cannot fall through. The usual cause is a workspace dependency missed in the previous subsection.
 
 → Report that the lockfile was updated.
 
@@ -520,6 +550,8 @@ This syncs `Cargo.lock` with the new `[package] version` fields. Without this st
 git add ${ALL_CHANGELOG_FILES} ${ALL_VERSION_FILES} Cargo.lock
 git commit -m "${VERSION}"
 ```
+
+If the "Update Workspace Dependencies" subsection changed root `Cargo.toml`, add it to the `git add` as well — it is not part of `${ALL_VERSION_FILES}`.
 
 This produces a clean commit label visible in GitHub's file list for both CHANGELOG.md and Cargo.toml.
 </FinalizeOnBase>
@@ -754,21 +786,20 @@ cargo install ${INSTALL_CRATE_NAME} --version "${VERSION}"
 ~/.claude/scripts/release/bump_versions.sh ${NEXT_DEV_VERSION} ${DRY_RUN_FLAG} ${ALL_VERSION_FILES}
 ```
 
+**Update workspace dependencies** (runs unconditionally — no-ops when the project has none):
+Internal cross-crate dependencies declared in root `Cargo.toml` `[workspace.dependencies]` must move to the dev version too, otherwise the workspace won't build.
+
+**This must run before `cargo update --workspace` below.** `bump_versions.sh` just moved the local crates to `${NEXT_DEV_VERSION}` while these declarations still require the released version, so a lockfile regeneration attempted first fails with "failed to select a version for the requirement".
+
+```bash
+~/.claude/scripts/release/update_workspace_deps.sh ${NEXT_DEV_VERSION} ${DRY_RUN_FLAG} --edit-only --auto
+```
+
+`--auto` reads the affected entries out of root `Cargo.toml` instead of taking a list — those declaring both a `path` into the workspace and a `version`, whose target crate is already at `${NEXT_DEV_VERSION}`. `--edit-only` preserves `path` and every other key and skips the crates.io wait and the commit; no waiting applies here, since a `-dev` version is never published and the local path dep resolves without the registry.
+
 **Regenerate the lockfile** to reflect the dev versions (skip in dry-run mode):
 ```bash
 cargo update --workspace
-```
-
-**Update workspace dependencies** (if config has `workspace_dep_updates`):
-Any `workspace_dep_updates` entries from `[[publish_phases]]` in the config represent internal cross-crate dependencies declared in root `Cargo.toml`. These must also be updated to the dev version, otherwise the workspace won't build.
-
-For each unique dependency name across all publish phases' `workspace_dep_updates`:
-- Update root `Cargo.toml` `[workspace.dependencies]` entry to `version = "${NEXT_DEV_VERSION}"`
-- This is a simple text replacement — no crates.io waiting needed (unlike during publish)
-
-```bash
-# For each workspace dep, update the version in root Cargo.toml
-sed -i'' "s/bevy_brp_mcp_macros = \".*\"/bevy_brp_mcp_macros = \"${NEXT_DEV_VERSION}\"/" Cargo.toml
 ```
 
 → Verify `cargo check` passes after updating (skip in dry-run mode).
@@ -830,6 +861,34 @@ git push origin ${BASE_BRANCH}
 
 → Report the script output to the user.
 
+### Update Workspace Dependencies
+
+**This runs unconditionally** — it discovers its own targets and no-ops when there are none, so single crates and workspaces without internal cross-crate dependencies need no special handling.
+
+`bump_versions.sh` rewrote only `[package] version` fields. An entry in root `Cargo.toml` `[workspace.dependencies]` that declares both a `path` into the workspace and a `version` still carries the *old* requirement, which no longer matches the just-bumped local crate. `cargo update --workspace` in the next subsection would then fail with:
+
+```
+error: failed to select a version for the requirement `<dep> = "^<old-version>"`
+candidate versions found which didn't match: ${VERSION}
+```
+
+**Run the update:**
+```bash
+~/.claude/scripts/release/update_workspace_deps.sh ${VERSION} ${DRY_RUN_FLAG} --edit-only --auto
+```
+
+`--auto` finds the affected entries by reading root `Cargo.toml` rather than taking a list: an inline `[workspace.dependencies]` entry qualifies when it has both `path` and `version` **and** the crate at that path is already at `${VERSION}` — proof that `bump_versions.sh` just bumped it. Path-only entries state no requirement and cannot break the lockfile; external paths and unbumped or excluded members fail the version match. This is why the subsection must run *after* the version bump.
+
+`--edit-only` rewrites just the version value, preserving `path` and every other key, then exits without the crates.io wait, the `cargo check`, or a commit — the version is not on crates.io yet, and the change belongs in this step's single version commit.
+
+Deriving the list beats configuring it: a hand-maintained list silently goes stale the moment someone adds a `version` to an existing path dependency, which is exactly when it starts mattering.
+
+If the script warns about `[workspace.dependencies.<name>]` sub-table entries, it could not inspect those — check them by hand and pass their names explicitly.
+
+These entries are rewritten again after their crate publishes (STEP 6, same script with explicit names and no `--auto`). Setting them here makes that later pass a no-op, which is expected.
+
+→ Report which entries were updated.
+
 ### Update Cargo.lock
 
 **Regenerate the lockfile** to reflect the bumped versions (skip in dry-run mode):
@@ -838,6 +897,8 @@ cargo update --workspace
 ```
 
 This syncs `Cargo.lock` with the new `[package] version` fields. Without this step, `Cargo.lock` remains stale and the next cargo command (publish dry-run, etc.) would create uncommitted changes that break the process.
+
+**If this command fails, STOP — do not commit.** A failed `cargo update` leaves `Cargo.lock` stale, and committing anyway produces a version commit that cannot be published without an amend. Never chain the commit after it with `;`; use `&&` so a failure cannot fall through. The usual cause is a workspace dependency missed in the previous subsection.
 
 → Report that the lockfile was updated.
 
@@ -848,6 +909,8 @@ This syncs `Cargo.lock` with the new `[package] version` fields. Without this st
 git add ${ALL_CHANGELOG_FILES} ${ALL_VERSION_FILES} Cargo.lock
 git commit -m "${VERSION}"
 ```
+
+If the "Update Workspace Dependencies" subsection changed root `Cargo.toml`, add it to the `git add` as well — it is not part of `${ALL_VERSION_FILES}`.
 
 ### Rename Branch
 
