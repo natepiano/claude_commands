@@ -8,6 +8,7 @@
 !README.md
 !settings.json
 !settings.local.json
+!pyrightconfig.json
 !keybindings.json
 !.claude/
 !.claude/settings.local.json

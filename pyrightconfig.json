@@ -1,0 +1,6 @@
+{
+  "executionEnvironments": [
+    { "root": "scripts/hooks", "extraPaths": ["scripts/hooks"] },
+    { "root": "." }
+  ]
+}
