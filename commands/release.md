@@ -578,7 +578,9 @@ This produces a clean commit label visible in GitHub's file list for both CHANGE
 
 **Run this once, before any dry-run below**, and only when the config defines `[[publish_path_pins]]`. cargo publish rejects path-only workspace deps (no version requirement), so each pinned dep must be rewritten to a published version first. This runs on the release branch (created in STEP 5) and commits the pin there — main is never modified, so it keeps the path dependency by construction (this is the "restore to path" guarantee; no later cleanup step is needed).
 
-Build `${PIN_ARGS}` as one `<dep>=<version>` token per `[[publish_path_pins]]` entry (e.g. `bevy_kana=0.1.0`), then (with `dangerouslyDisableSandbox: true`):
+**Skip any entry whose `dep` names a crate being released in this run**, and proceed directly to the dry-run if that leaves nothing to pin. In single-package mode the pinned crate is often the release target itself. A crate never depends on itself, so it has nothing to pin — and the entry still names the *previous* published version, so applying it would resolve the rest of the workspace against the older crates.io release instead of the local one. Bumping the entry first is circular: the version being released is not on crates.io yet. Path-only *dev*-dependencies need no pin either, since cargo strips them from the packaged manifest.
+
+Build `${PIN_ARGS}` as one `<dep>=<version>` token per remaining `[[publish_path_pins]]` entry (e.g. `bevy_kana=0.1.0`), then (with `dangerouslyDisableSandbox: true`):
 ```bash
 ~/.claude/scripts/release/pin_path_deps.sh ${DRY_RUN_FLAG} ${PIN_ARGS}
 ```
@@ -804,7 +806,11 @@ cargo update --workspace
 
 → Verify `cargo check` passes after updating (skip in dry-run mode).
 
-**Commit and push** (skip in dry-run mode; push with `dangerouslyDisableSandbox: true`):
+**Bump `[[publish_path_pins]]` to the version just released** (skip in dry-run mode). For each `[[publish_path_pins]]` entry in `.claude/config/release.toml` whose `dep` names a crate published in this run, set its `version` to `${VERSION}`. That version is on crates.io now, so the next dependent crate's release pins against it instead of the previous one — left stale, it silently publishes that crate against an older API.
+
+**Do this without asking the user.** It records what the release just made true; it is not a judgment call.
+
+**Commit and push** (skip in dry-run mode; push with `dangerouslyDisableSandbox: true`). Include `.claude/config/release.toml` in the `git add` when the pin bump above changed it:
 ```bash
 git add ${ALL_VERSION_FILES} Cargo.toml Cargo.lock
 git commit -m "chore: bump to ${NEXT_DEV_VERSION}"
