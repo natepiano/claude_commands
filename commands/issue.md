@@ -29,7 +29,7 @@ Look up the project shorthand from the base files in the vault root (`/Users/nat
 | hana | hana | issues - hana.base |
 | lading | hana_lading | issues - lading.base |
 | lagrange | bevy_lagrange | issues - lagrange.base |
-| liminal | bevy_liminal | issues - liminal.base |
+| liminal | hana_liminal | issues - liminal.base |
 | nateroids | nateroids | issues - nateroids.base |
 | panorbit | bevy_panorbit_camera | issues - panorbit.base |
 | rust-template | rust-template | issues - rust-template.base |

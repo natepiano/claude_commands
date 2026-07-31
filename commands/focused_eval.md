@@ -22,7 +22,7 @@ If `$ARGUMENTS` is empty or has fewer than three tokens, print usage and stop:
 Usage: /focused_eval <project-root> <scope-glob> <guideline-1> [<guideline-2> ...]
 
 Example:
-  /focused_eval ~/rust/bevy_liminal src/types/ \
+  /focused_eval ~/rust/bevy_hana/crates/hana_liminal src/types/ \
       when-to-split-a-module \
       types-live-with-their-behavior \
       name-submodules-after-anchor-types split-by-type-ownership
