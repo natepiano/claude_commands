@@ -36,12 +36,20 @@ have_nextest() {
     cargo nextest --version >/dev/null 2>&1
 }
 
-# Nightly rustfmt when available (unstable rustfmt.toml options), stable otherwise.
+# The workspace's rustfmt configuration uses nightly-only options. Formatting with
+# stable could accept output that nightly rejects, so it is a verifier error.
 fmt_cargo() {
-    if cargo +nightly fmt --version >/dev/null 2>&1; then
-        run cargo +nightly fmt "$@"
-    else
-        run cargo fmt "$@"
+    if ! cargo +nightly fmt --version >/dev/null 2>&1; then
+        echo "verify.sh: cargo +nightly fmt is required" >&2
+        exit 2
+    fi
+    run cargo +nightly fmt "$@"
+}
+
+require_nextest() {
+    if ! have_nextest; then
+        echo "verify.sh: cargo nextest is required" >&2
+        exit 2
     fi
 }
 
@@ -129,21 +137,13 @@ case "$CMD" in
         # --no-fail-fast: nextest cancels every remaining test after the first
         # failure, so one broken test silently hides the rest of the suite. A
         # phase gate has to report the whole result, not the first stop.
+        require_nextest
         if [[ -n "$TARGET" ]]; then
-            if have_nextest; then
-                run cargo nextest run --no-fail-fast -p "$PKG" --test "$TARGET"
-            else
-                run cargo test --no-fail-fast -p "$PKG" --test "$TARGET"
-            fi
+            run cargo nextest run --no-fail-fast -p "$PKG" --test "$TARGET"
         else
             FLAGS="$(target_flags "$PKG")"
-            if have_nextest; then
-                # shellcheck disable=SC2086
-                run cargo nextest run --no-fail-fast -p "$PKG" $FLAGS
-            else
-                # shellcheck disable=SC2086
-                run cargo test --no-fail-fast -p "$PKG" $FLAGS
-            fi
+            # shellcheck disable=SC2086
+            run cargo nextest run --no-fail-fast -p "$PKG" $FLAGS
         fi
         ;;
     lint)
@@ -171,26 +171,18 @@ case "$CMD" in
         PKG="${1:?verify.sh example-test <package> <name>}"
         NAME="${2:?verify.sh example-test <package> <name>}"
         FEATURES="$(example_features "$PKG" "$NAME")"
-        if have_nextest; then
-            if [[ -n "$FEATURES" ]]; then
-                run cargo nextest run -p "$PKG" --example "$NAME" --features "$FEATURES"
-            else
-                run cargo nextest run -p "$PKG" --example "$NAME"
-            fi
-        elif [[ -n "$FEATURES" ]]; then
-            run cargo test -p "$PKG" --example "$NAME" --features "$FEATURES"
+        require_nextest
+        if [[ -n "$FEATURES" ]]; then
+            run cargo nextest run -p "$PKG" --example "$NAME" --features "$FEATURES"
         else
-            run cargo test -p "$PKG" --example "$NAME"
+            run cargo nextest run -p "$PKG" --example "$NAME"
         fi
         ;;
     final)
         fmt_cargo --check
         run cargo check --workspace --all-targets
-        if have_nextest; then
-            run cargo nextest run --workspace
-        else
-            run cargo test --workspace
-        fi
+        require_nextest
+        run cargo nextest run --workspace
         ;;
     *)
         usage
