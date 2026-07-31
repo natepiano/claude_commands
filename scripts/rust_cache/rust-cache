@@ -4,19 +4,14 @@ set -euo pipefail
 STATE_DIR="${RUST_CACHE_STATE_DIR:-$HOME/.config/rust-cache}"
 STATE_FILE="$STATE_DIR/backend"
 SCCACHE_BIN="${RUST_CACHE_SCCACHE_BIN:-$HOME/.cargo/bin/sccache}"
-KACHE_BIN="${RUST_CACHE_KACHE_BIN:-$HOME/.cargo/bin/kache}"
 SCCACHE_LABEL="com.natemccoy.sccache"
-KACHE_DAEMON_LABEL="ninja.kunobi.kache"
-KACHE_GC_LABEL="ninja.kunobi.kache-gc"
 SCCACHE_PLIST="$HOME/Library/LaunchAgents/$SCCACHE_LABEL.plist"
-KACHE_DAEMON_PLIST="$HOME/Library/LaunchAgents/$KACHE_DAEMON_LABEL.plist"
-KACHE_GC_PLIST="$HOME/Library/LaunchAgents/$KACHE_GC_LABEL.plist"
 LAUNCH_DOMAIN="gui/$(id -u)"
 
 usage() {
     cat <<'EOF'
 Usage:
-  rust-cache use sccache|kache|off
+  rust-cache use sccache|off
   rust-cache status
   rust-cache stats
   rust-cache doctor
@@ -28,7 +23,7 @@ EOF
 
 validate_backend() {
     case "$1" in
-        sccache|kache|off) ;;
+        sccache|off) ;;
         *)
             echo "error: invalid Rust cache backend: $1" >&2
             return 2
@@ -52,12 +47,6 @@ require_backend_binary() {
         sccache)
             [[ -x "$SCCACHE_BIN" ]] || {
                 echo "error: sccache is not installed at $SCCACHE_BIN" >&2
-                return 1
-            }
-            ;;
-        kache)
-            [[ -x "$KACHE_BIN" ]] || {
-                echo "error: kache is not installed at $KACHE_BIN" >&2
                 return 1
             }
             ;;
@@ -93,14 +82,6 @@ stop_sccache() {
     if [[ -x "$SCCACHE_BIN" ]]; then
         "$SCCACHE_BIN" --stop-server >/dev/null 2>&1 || true
     fi
-}
-
-stop_kache() {
-    if [[ -x "$KACHE_BIN" ]]; then
-        "$KACHE_BIN" daemon stop >/dev/null 2>&1 || true
-    fi
-    disable_job "$KACHE_DAEMON_LABEL"
-    disable_job "$KACHE_GC_LABEL"
 }
 
 build_is_running() {
@@ -139,19 +120,10 @@ use_backend() {
 
     case "$backend" in
         sccache)
-            stop_kache
             enable_job "$SCCACHE_LABEL" "$SCCACHE_PLIST"
-            ;;
-        kache)
-            stop_sccache
-            enable_job "$KACHE_GC_LABEL" "$KACHE_GC_PLIST"
-            enable_job "$KACHE_DAEMON_LABEL" "$KACHE_DAEMON_PLIST"
-            "$KACHE_BIN" daemon start >/dev/null 2>&1 || true
-            echo "kache GC enabled; it may trim the store to local_max_size"
             ;;
         off)
             stop_sccache
-            stop_kache
             ;;
     esac
 
@@ -187,11 +159,6 @@ show_status() {
         "$([[ -x "$SCCACHE_BIN" ]] && "$SCCACHE_BIN" --version || echo 'not installed')" \
         "$(human_size "$HOME/Library/Caches/Mozilla.sccache")" \
         "$(job_state "$SCCACHE_LABEL")"
-    printf 'kache: %s; cache %s; daemon %s; GC %s\n' \
-        "$([[ -x "$KACHE_BIN" ]] && "$KACHE_BIN" --version || echo 'not installed')" \
-        "$(human_size "$HOME/Library/Caches/kache")" \
-        "$(job_state "$KACHE_DAEMON_LABEL")" \
-        "$(job_state "$KACHE_GC_LABEL")"
     warn_stale_shell_wrapper
 }
 
@@ -201,7 +168,6 @@ show_stats() {
     require_backend_binary "$backend"
     case "$backend" in
         sccache) exec "$SCCACHE_BIN" --show-stats ;;
-        kache) exec "$KACHE_BIN" stats ;;
         off)
             echo "Rust cache backend is off."
             ;;
@@ -217,7 +183,6 @@ run_doctor() {
             "$SCCACHE_BIN" --version
             "$SCCACHE_BIN" --show-stats
             ;;
-        kache) exec "$KACHE_BIN" doctor ;;
         off) echo "Rust cache backend is off." ;;
     esac
 }
@@ -231,7 +196,6 @@ dispatch_rustc() {
             export SCCACHE_IDLE_TIMEOUT="${SCCACHE_IDLE_TIMEOUT:-0}"
             exec "$SCCACHE_BIN" "$@"
             ;;
-        kache) exec "$KACHE_BIN" "$@" ;;
         off) exec "$@" ;;
     esac
 }

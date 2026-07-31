@@ -145,7 +145,6 @@
       "allowWrite": [
         "/Users/natemccoy/.cargo",
         "/Users/natemccoy/Library/Application Support",
-        "/Users/natemccoy/Library/Caches/kache",
         "/Users/natemccoy/Library/Caches/Mozilla.sccache",
         "/Users/natemccoy/rust",
         "/private/tmp",
@@ -161,13 +160,13 @@
     ]
   },
   "alwaysThinkingEnabled": true,
+  "autoCompactWindow": 233000,
   "askUserQuestionTimeout": "never",
   "tui": "fullscreen",
   "skipDangerousModePermissionPrompt": true,
   "skipWorkflowUsageWarning": true,
   "editorMode": "normal",
   "autoCompactEnabled": true,
-  "autoCompactWindow": 233000,
   "teammateMode": "tmux",
   "inputNeededNotifEnabled": true,
   "agentPushNotifEnabled": true,
