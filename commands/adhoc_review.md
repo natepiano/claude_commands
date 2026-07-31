@@ -38,6 +38,48 @@ Rules:
 
 If a todo tool is available (e.g. `TaskCreate`), add one task per item, in order, each with a short label and status `pending`. If not, keep an inline numbered checklist and refer to items by number.
 
+## Step 3.5: Establish the shared model
+
+Run this once, before the first item, whenever the items all live inside one
+model the user has not already been walked through in this conversation — a set
+of types, actors, or states that only mean anything in relation to each other.
+Skip it only when the items are genuinely independent of one another, or when the
+user built the model with you earlier in the session.
+
+**This is not a glossary.** A sequence of definitions is exactly what fails: each
+one is individually correct and the reader still cannot say how the pieces fit,
+so they reconstruct the model themselves out of N item-scoped explanations.
+State the relationships instead.
+
+Cover this, in this order:
+
+1. **The participants** — one line each, giving the *question it answers* rather
+   than what it is. "`DeviceKey` — which physical unit is this?" beats
+   "`DeviceKey` is a durable device identifier."
+2. **What is durable and what is transient.** Which participants outlive which,
+   and what event makes a transient one go away. This is usually the load-bearing
+   fact of the whole model and it is almost never stated outright.
+3. **How they connect** — which participant points at which, with cardinality in
+   both directions: "one device, many roles; one role, one device at a time."
+4. **One worked instance** with real values, not placeholders. A table of
+   concrete rows carries relationships better than prose — this is the one place
+   in this command where a table is the right tool.
+5. **One change over time.** Show that same instance before and after the event
+   the model exists to survive — a device unplugged, a session lost, a job
+   cancelled. What holds still and what moves *is* the model.
+
+Then hand it back for correction:
+
+> `That's the model the N items sit inside. Restate it your way or correct it, and I'll start the walk.`
+
+Wait for the response. A correction here is worth more than a correction ten
+items deep, because every later item inherits this framing. If the user restates
+it differently but equivalently, adopt **their** wording for the rest of the walk
+— theirs, not the source document's.
+
+**Ask no decision question in this step.** Orientation and decisions are separate
+turns.
+
 ## Step 4: Walk the list
 
 For each item, in order:
@@ -62,7 +104,7 @@ For each item, in order:
    NEVER present an item through a survey/questionnaire mechanism (AskUserQuestion or any multiple-choice UI). Summary and choices are ordinary message text; the user answers by typing. Terse is good, cryptic is not.
 7. **Wait for the user's response.** Do not move on until they reply.
    - If the user picks `elaborate` (also: "more", "detail", "expand", "why"): add one new rationale, constraint, or example relevant to the current item. Do not broaden scope or dump the raw item. Then re-present the same choices and wait again.
-   - If the user says they are lost, confused, or asks what the introduced concepts mean, treat that as a failed initial explanation. Stop asking for a decision, discard the current framing, and rebuild it from the triggering situation and observable behavior. Do not merely define the same labels with more labels.
+   - If the user says they are lost, confused, or asks what the introduced concepts mean, treat that as a failed initial explanation and stop asking for a decision. **Repair downward once, then upward.** On the first signal, rebuild the item from the triggering situation and observable behavior — concrete, no new labels, do not define the same labels with more labels. **On a second signal about the same item, stop adding detail and go up to the model** — run Step 3.5 now, whether or not it ran earlier. More concrete examples of the same item is not a repair: if one rebuild did not land, the missing context is above the item, not below it, and further zooming in produces a chain of individually-correct explanations that never converge. Re-running Step 3.5 mid-walk costs one turn; iterating item detail at ever finer grain costs many and does not terminate.
    - If the user asks a clarifying question, answer it without recording a decision or advancing. Re-present the choices only when useful.
    - If the user proposes a modification, restate only the revised decision, update the recommendation or example as needed, and wait for explicit acknowledgment before recording it.
 8. When they clearly acknowledge a terminal choice (including terse approvals such as `agreed`, `approved`, `okay`, or `continue` when unambiguous), record the decision to the working doc if one is in scope, mark the task `completed`, and move to the next item.
@@ -145,6 +187,8 @@ When every item is done:
 - One item at a time. Never present two items in the same turn.
 - Default presentation must be decision-ready on its first pass. `elaborate` adds depth; it is not an escape hatch for omitted foundational context.
 - Do not mechanically fill headings and mistake that for context. A response can contain `Situation`, `Question`, and `Recommendation` sections and still fail if the causal relationship between them remains implicit.
+- **Model-level questions get model-level answers.** "What are examples of X?", "how is it used?", "what's the difference between X and Y?", "is it per-X or per-Y?", "show me the relationships" are requests for the *model*, not for more detail about the current item. Answer at Step 3.5's altitude — participants, what is durable versus transient, how they connect, one worked instance — and then return to the item. Answering a model-level question with item detail is the single most common way this command fails, and it fails silently: each answer is accurate, so nothing looks wrong until the user has asked four times.
+- **If the user ends up building the model themselves, the orientation failed.** A message that restates the model in the user's own words and asks you to confirm it is a failure signal, not a success — the synthesis work landed on the user instead of on you. Confirm it, adopt their wording verbatim for the rest of the walk, and re-frame every remaining item inside it.
 - Never infer that the user knows a concept because they own the project, requested a technical review, or previously approved a related feature. Use only concepts already explained in user-facing conversation; introduce everything else behavior-first.
 - Never introduce an unexplained name or substitute a code label for an explanation. Explain what it does first. If a name is undecided, label it `(name TBD)` instead of making it sound settled.
 - Never present enum variants, policy names, state names, or API alternatives without saying what each one makes the system do.

@@ -23,7 +23,7 @@ description: Delegate coding work to a configured CLI agent — the main agent o
 
 SESSION_DIR = (captured from prepare_session.sh output — see PrepareSession)
 WORKING_DIR = current project directory (often a worktree checkout, sometimes main — use it as-is; never create a worktree or switch branches)
-FIX_PASS = 0 (max 4 per phase; resets in <NextPhase/>)
+FIX_PASS = 0 (max 10 per phase; resets in <NextPhase/>)
 IMPLEMENTATION_TASK = implementation
 APPLICATION_SMOKE_RESULT = not_run (resets in <NextPhase/>)
 MODE = single when `single` was passed or the work is not phased; verbose when
@@ -1007,7 +1007,7 @@ without asking:
 
    **Auto fix pass** — when every remaining confirmed issue has an unambiguous
    correct fix (the spec answers it and the two reviews do not conflict on
-   intended behavior) and ${FIX_PASS} < 4: increment ${FIX_PASS}, write
+   intended behavior) and ${FIX_PASS} < 10: increment ${FIX_PASS}, write
    ${SESSION_DIR}/fix_prompt_${FIX_PASS}.md (same structure as the work order,
    spec = the confirmed issues table with file/line specifics, same no-commit
    rules, heartbeat instruction, and style requirements; verification = only
@@ -1030,7 +1030,7 @@ without asking:
    **STOP** — when any remaining issue needs a design decision the plan does
    not answer *and that has at least two buildable answers*, when the two
    reviews conflict on *intended behavior* (not just severity), or when
-   ${FIX_PASS} >= 4 with blockers remaining. Present the
+   ${FIX_PASS} >= 10 with blockers remaining. Present the
    two-layer result above plus the choices — each option one sentence, no
    jargon, with a recommendation and the reason for it:
 
@@ -1044,7 +1044,7 @@ Your choice:
 3. Talk through any item first.
 ```
 
-   Do not surface internal bookkeeping (`fix pass 1 of 4 used`) as the headline;
+   Do not surface internal bookkeeping (`fix pass 1 of 10 used`) as the headline;
    if the cap is relevant, state it without jargon inside option 1. **Wait for
    the user.**
 
@@ -1328,7 +1328,7 @@ unrelated turns to continue a run that is over.
   <ExplainOnDemand/>: rebuild from the bottom, stay technical, put a short code
   example under every mechanism, and preserve the gate. Terseness is the default
   everywhere else; here it is the defect.
-- Max 4 delegate fix passes per phase before stopping for the user; an explicit user choice of another pass overrides the cap.
+- Max 10 delegate fix passes per phase before stopping for the user; an explicit user choice of another pass overrides the cap.
 - Auto/loop mode stops only for: an unresolved `**Pending decision:**` on the phase being dispatched, a fix that needs a design decision the plan does not answer, reviews conflicting on intended behavior, the fix-pass cap with blockers remaining, or a delegate/environment error. Everything else auto-routes or defers.
 - Verbose mode has all of those stops plus a mandatory <VerbosePrePhaseGate/>
   before every phase outside an active bounded-auto window, a

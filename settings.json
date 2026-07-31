@@ -167,7 +167,7 @@
   "skipWorkflowUsageWarning": true,
   "editorMode": "normal",
   "autoCompactEnabled": true,
-  "teammateMode": "tmux",
+  "teammateMode": "in-process",
   "inputNeededNotifEnabled": true,
   "agentPushNotifEnabled": true,
   "skipAutoPermissionPrompt": true,
