@@ -71,6 +71,15 @@
             "command": "mkdir -p /tmp/claude"
           }
         ]
+      },
+      {
+        "matcher": "compact",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/opt/homebrew/bin/python3 /Users/natemccoy/.claude/scripts/hooks/session-start-delegate-resume.py"
+          }
+        ]
       }
     ],
     "PostToolUse": [
@@ -96,6 +105,16 @@
           {
             "type": "command",
             "command": "/opt/homebrew/bin/python3 /Users/natemccoy/.claude/scripts/hooks/post-tool-use-context-usage.py"
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/opt/homebrew/bin/python3 /Users/natemccoy/.claude/scripts/hooks/stop-delegate-continue.py"
           }
         ]
       }

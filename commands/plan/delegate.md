@@ -87,6 +87,15 @@ slower. Even a missing or hastily written handoff is not grounds to stop —
 auto-compaction plus the conversation summary generally carries the run forward
 correctly on its own.
 
+The mechanism behind that rule: **auto-compaction fires on the next request,
+never mid-turn.** Ending the turn near the limit is therefore the one action that
+guarantees compaction never runs — the run stalls waiting for a user who has no
+reason to expect it. A Stop hook enforces this while a run is active: end the
+turn past the handoff threshold and it refuses the stop and sends you straight
+back in. It blocks only once, so a genuine wait on a user decision (a verbose
+gate, a pending decision, conflicting reviews, the fix-pass cap) survives —
+restate the decision in one line and end the turn again.
+
 After compaction, before taking any further workflow action: **re-read this
 command file in full** (`~/.claude/commands/plan/delegate.md`) so the workflow is
 fresh and complete rather than reconstructed from a summary — a summarized
@@ -94,6 +103,10 @@ workflow silently drops rules, and the ones it drops are the ones that were not
 firing at the moment of compaction. Then read the handoff back, resume the same
 active waits and control flow, and delete the handoff when the phase it describes
 is committed.
+
+A SessionStart hook restates that paragraph into the freshly compacted context
+while a run is active, since this file is one of the things summarization can
+drop. Treat the two as the same instruction, not as a second one.
 
 ---
 
@@ -435,6 +448,10 @@ returns to STEP 2 for the next pre-phase gate, or ends with <RunSummary/>
 1. Run: `bash ~/.claude/scripts/delegate/prepare_session.sh` using Bash with `dangerouslyDisableSandbox: true`
 2. **Capture ${SESSION_DIR}** from the last line of output (format: `Session ready at <path>`)
 3. Store the current project directory as ${WORKING_DIR}
+
+The same script writes a run-active marker for this Claude session. While it
+exists, the Stop hook refuses to let the turn end near the auto-compaction
+threshold (see **Context and compaction**). <RunSummary/> clears it.
 </PrepareSession>
 
 ---
@@ -1191,6 +1208,11 @@ decision on phase N / fix-pass cap on phase N / delegate error]
 
 Same translation rules as <Synthesize/>: no reviewer vocabulary, no bare codes —
 every line must stand on its own for a reader who has not seen the plan.
+
+After emitting the summary, run `bash ~/.claude/scripts/delegate/end_session.sh`
+to clear the run-active marker. This is mandatory on every ending, including the
+ones that stop early — leaving it set keeps the Stop hook pushing later,
+unrelated turns to continue a run that is over.
 </RunSummary>
 
 ---
