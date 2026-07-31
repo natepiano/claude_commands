@@ -375,6 +375,25 @@ exhaustion, a blocking decision, or an error still ends/stops the window early.
 An auto window changes only phase-to-phase advancement; every implementation,
 review, fix, phase-review, and checkpoint rule remains active.
 
+**An auto window removes the stops, not the explanations.** The verbose briefing
+is the reason the user chose verbose; it survives the window. The window changes
+only *when* the briefings are delivered — instead of one before each phase, all
+of them **up front**, before the first dispatch. On accepting `auto next N
+phases` or `auto through phase X`:
+
+1. Resolve the exact phase list the window covers.
+2. Brief **every** phase in that list, in order, to the standard
+   <VerbosePrePhaseGate/> requires for a single phase — why it exists, the work
+   it will do, the important types/APIs it introduces or changes. A phase whose
+   Work Order has not been read yet is not briefable; read it now, not later.
+3. Take **one** approval on the whole batch, then run the window uninterrupted.
+
+Never treat a reply to a compressed summary row — a `Recommended next step`
+table cell, a one-line phase title — as informed approval for a window or a
+phase. If an auto control arrives before its batch briefing exists (attached to
+the initial invocation, or given at a gate that described only the current
+phase), deliver the batch briefing and re-gate before the first dispatch.
+
 The same bounded-auto controls may accompany the initial `verbose` invocation.
 There, the selected starting phase counts as the first `auto next N` phase, and
 `auto through phase X` includes both the selected phase and X. Examples:
@@ -383,6 +402,10 @@ There, the selected starting phase counts as the first `auto next N` phase, and
 /plan:delegate docs/hana/tool-graph.md phase 1 verbose
 /plan:delegate docs/hana/tool-graph.md phase 1 verbose auto through phase 13
 ```
+
+The second form still owes the user <AutoWindowBatchBriefing/> for phases 1–13
+before phase 1 is dispatched. An auto control on the invocation line is a
+statement about stopping, not a waiver of the briefing.
 
 **Commit authorization.** Invoking this command in loop mode IS the user's
 explicit request for checkpoint commits. In verbose mode, approval at
@@ -659,11 +682,11 @@ Then ask exactly one authorization question and wait:
   trailing text to `${SESSION_DIR}/implementation_prompt.md` as current-phase
   free-text instructions; announce the dispatch and continue to <SelectTask/>.
 - `auto next N phases`: require positive N, set `AUTO_WINDOW = next N`, announce
-  the inclusive phase range when it can be determined, and dispatch the current
-  phase. The current phase counts as one.
+  the inclusive phase range, then execute <AutoWindowBatchBriefing/> before any
+  dispatch. The current phase counts as one.
 - `auto through phase X`: require X to be the current or a later todo phase, set
-  `AUTO_WINDOW = through X`, announce the inclusive range, and dispatch the
-  current phase.
+  `AUTO_WINDOW = through X`, announce the inclusive range, then execute
+  <AutoWindowBatchBriefing/> before any dispatch.
 - `stop`: emit <RunSummary/> with `user stopped before phase N` and end.
 - `continue`: this control is reserved for <VerbosePostPhaseGate/> and does not
   authorize implementation; preserve this gate and ask for `proceed`.
@@ -671,6 +694,57 @@ Then ask exactly one authorization question and wait:
   authorize the phase. Answer it, preserve the gate, and ask again. If the
   question is that the briefing did not land, execute <ExplainOnDemand/>.
 </VerbosePrePhaseGate>
+
+---
+
+<AutoWindowBatchBriefing>
+**Verbose mode only, when a bounded-auto window opens — before the window's
+first dispatch.**
+
+**Goal:** The user is authorizing several phases at once and will not be asked
+again until the window closes. Give them, up front, everything they would have
+been told phase by phase.
+
+An auto window suppresses the *stops*, never the *explanations*. Skipping the
+briefing because "auto means go" is the failure this block exists to prevent,
+and so is deferring the briefing until after dispatch.
+
+1. **Resolve the window's phase list** from `AUTO_WINDOW` and the plan's `todo`
+   phases: the current phase plus each subsequent one the window covers.
+2. **Read each of those phases' Work Orders now.** A phase that has not been
+   read cannot be briefed, and reading it later is too late — the user has
+   already approved by then. This is also the moment any `**Pending decision:**`
+   block inside a windowed phase surfaces: name it in the briefing rather than
+   letting the window run into it blind.
+3. **Emit one briefing per phase, in order, in a single turn**, each using the
+   <VerbosePrePhaseGate/> template above (`## Phase N ready` → Why → Work →
+   types/APIs table → Files and verification). Do not compress a phase to a
+   table row or a sentence; the window is exactly when the user has the least
+   opportunity to ask.
+4. **Ask once, for the whole batch, and wait:**
+
+   `Run phases <list> without stopping? Reply \`proceed\` to authorize all of
+   them, \`proceed phase N\` to authorize only phase N and re-gate after it, or
+   \`stop\`.`
+
+- `proceed` / `approved`: dispatch the first phase and run the window to its end
+  without further gates.
+- `proceed phase N` or any narrowing: set `AUTO_WINDOW = none` (or the narrowed
+  range), and continue with only what was authorized.
+- `stop`: emit <RunSummary/> and end.
+- A question, or an answer that shows a phase did not land, preserves the batch
+  gate: answer it (via <ExplainOnDemand/> when the briefing itself missed),
+  then ask again. Discussion is never authorization.
+
+**Applies to a window opened at the initial invocation too** — `/plan:delegate
+<doc> phase 1 verbose auto through phase 13` runs this block before phase 1's
+dispatch, not a single-phase gate.
+
+**If a window was already opened without this briefing**, deliver it at the next
+point the run reaches — before the next dispatch inside the window — and say
+plainly that the earlier approval was taken on less information than it should
+have been.
+</AutoWindowBatchBriefing>
 
 ---
 
@@ -903,6 +977,17 @@ applies to the initial implementation.
 4. **AUTO-ROUTE.** Otherwise (confirmed blocker or minor issues remain), route
 without asking:
 
+   **Only real choices reach the user** — before routing anything to STOP, test
+   every option you would present: can it actually be built as described? An
+   option that contradicts the phase's own structure — an acceptance line
+   asserting a guarantee the phase has no code path to deliver, a test for a
+   boundary that does not exist yet — is not an option, and a list with one
+   viable option is not a decision. Correct the plan document yourself, move the
+   guarantee to the phase that can enforce it, tell the user in one line what you
+   corrected and why, and continue. Same standard as the resequencing rule: this
+   is a correction, not a decision, so long as it preserves product behavior,
+   public API, scope, invariants, and required verification.
+
    **Defer first** — if an issue is really a decision that affects only later
    phases and the current phase's acceptance gate passes without it, apply the
    blocking-vs-deferrable rule (see Multi-phase modes): record it as a
@@ -943,8 +1028,9 @@ without asking:
    Re-execute <DualReview/> and <Synthesize/> scoped to the new changes.
 
    **STOP** — when any remaining issue needs a design decision the plan does
-   not answer, when the two reviews conflict on *intended behavior* (not just
-   severity), or when ${FIX_PASS} >= 4 with blockers remaining. Present the
+   not answer *and that has at least two buildable answers*, when the two
+   reviews conflict on *intended behavior* (not just severity), or when
+   ${FIX_PASS} >= 4 with blockers remaining. Present the
    two-layer result above plus the choices — each option one sentence, no
    jargon, with a recommendation and the reason for it:
 
@@ -1043,7 +1129,11 @@ without committing.
    package the phase touched — fix passes skip `lint` (the only formatting
    phase-gate step), so formatting must be re-proven here. Formatting-only
    changes join the checkpoint commit.
-4. Stage everything and commit with this message shape:
+4. Edit the phase's status line in the plan doc to `status: done`. Never record
+   the commit hash in the plan doc — the commit does not exist yet at this
+   point, and amending afterwards to add one only writes a hash the amend
+   itself invalidates.
+5. Stage everything and commit with this message shape:
 
    ```
    checkpoint(<plan-slug>): phase N — <phase title>
@@ -1053,8 +1143,6 @@ without committing.
    Claude-Session: <session url>
    ```
 
-5. Edit the phase's status line in the plan doc to ``status: done (`<short hash>`)``,
-   then `git add <plan doc> && git commit --amend --no-edit`.
 6. Report one line: `Checkpoint <short hash> — phase N: <title>.`
 
 Never push. Never commit anything outside this step.
