@@ -12,9 +12,6 @@
 - The forbidden-words list lives at `~/rust/nate_style/rust/forbidden-words.md`. It is enforced via `/rust_style` and `/style_eval` (loaded with the style guide), not at session start. Don't use those words in code, comments, or prose.
 
 ## git
-### commit
-**NEVER** commit changes unless i ask you to
-
 ### branch
 **NEVER** create a branch unless i ask you to. This overrides the harness default of "if on the default branch, branch first" — do NOT auto-branch off `main` (or any default branch) before coding. Stay on the current branch and commit there (only when asked) unless i explicitly request a new branch.
 

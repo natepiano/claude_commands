@@ -3,6 +3,10 @@
 Shared by `/plan:delegate` and `/plan:phase_review`. Both reference this file
 rather than carrying their own copy, so the method cannot drift between them.
 
+`~/.claude/docs/user_facing_explanation.md` is the companion: it governs the
+first presentation, this file governs the rebuild after that presentation fails
+to land.
+
 **Trigger:** the user says they do not understand, asks what something means,
 asks for a reframe, or answers a gate or decision with confusion instead of an
 answer. This fires at any gate — a pending decision, a pre-phase briefing, a

@@ -131,7 +131,9 @@ There is no fixed maximum number of user decisions. If filtering leaves a large 
 </SignificantFindings>
 
 <FilterFindingsForUserReview>
-Convert raw significant findings into real user decisions:
+Convert raw significant findings into real user decisions. `<UserFacingText/>`'s
+three tests — is it real, does it have at least two buildable answers, is it the
+user's — decide what survives; these steps are how they apply here:
 
 1. Apply mechanical plan-doc findings directly.
 2. Merge duplicate findings that point to the same actual decision.
@@ -187,6 +189,18 @@ When a decision needs source detail, include it inside `<DecisionPresentationTem
 Write the decision using `<DecisionPresentationTemplate/>`. Ask once for approve / reject / redirect. Apply on approve. Drop or apply the user's redirect on rejection. If the user answers with confusion instead of a decision, execute `<ExplainOnDemand/>` and re-ask — a decision the user cannot restate is not resolved.
 </PresentInlineSingle>
 
+<UserFacingText>
+**Applies to every turn this command shows the user** — inline decisions,
+`/adhoc_review` items, the Step 6 final update.
+
+**Read `~/.claude/docs/user_facing_explanation.md` and follow it.** It owns the
+principle the presentation rules here derive from — you do the reconstruction,
+not the user — plus the build order, naming, banned vocabulary, the
+comprehension gate, which decisions are worth the user's attention, and the
+choice-line format. `/plan:delegate` and `/adhoc_review` share the same file, so
+the three cannot drift.
+</UserFacingText>
+
 <ExplainOnDemand>
 **Trigger:** the user says they do not understand, asks what something means,
 asks for a reframe, or answers a decision with confusion instead of an answer.
@@ -236,15 +250,9 @@ Produce a succinct markdown table:
 
 Style rules for the final update:
 
-- Write for someone who has not read the plan or the diff. Name files, types,
-  phases, and plan sections **only when** the name itself is informative;
-  otherwise say what the thing does. Never present a reviewer's label, decision
-  code, test/guard name, or tooling term (`headless`, `bind group`) as if the
-  user already knows it — translate it to its behavior. If you cannot state a row
-  in behavior terms, you do not understand it well enough to summarize it.
-- Never use the word "plain" or any variant (`plain language`, `plain terms`,
-  `in plain English`) anywhere in the output. Write that way without announcing
-  it. Absolute.
+- `<UserFacingText/>` applies to every row. Name files, types, phases, and plan
+  sections **only when** the name itself is informative; otherwise say what the
+  thing does.
 - Terse. One short sentence per table row.
 - Do not echo the whole retrospective; summarize only what was learned and actually applied back to the document.
 - Do not include passed-check filler. If every remaining phase came through clean, say that in `Learned and applied`.
@@ -259,4 +267,4 @@ Style rules for the final update:
 - User decisions never use `AskUserQuestion`. Single decision → inline decision template; two or more → `/adhoc_review`. See `<SignificantFindings/>`, `<FilterFindingsForUserReview/>`, and `<DecisionPresentationTemplate/>` in Step 5.
 - In auto mode this command asks the user nothing: unresolved decisions become `**Pending decision:**` blocks in the affected Work Orders, surfaced later by the `/plan:delegate` pre-dispatch check.
 - If the subagent returns nothing actionable, still append the **Phase N Review** block with a single line stating the remaining phases were reviewed and need no changes.
-- Any signal that the user does not understand triggers `<ExplainOnDemand/>`: rebuild from the bottom, stay technical, put a short code example under every mechanism, and preserve whatever was pending. Terseness is the default everywhere else; here it is the defect.
+- Any signal that the user does not understand triggers `<ExplainOnDemand/>` and preserves whatever was pending. Terseness is the default everywhere else; here it is the defect.

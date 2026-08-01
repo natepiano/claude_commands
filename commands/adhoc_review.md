@@ -4,6 +4,12 @@ description: Walk through decisions one at a time using behavior-first, decision
 
 Use this when the user has just received a long list — recommendations, findings, options, todos — and wants to review them deliberately one by one instead of responding to the whole wall of text.
 
+**Read `~/.claude/docs/user_facing_explanation.md` first and follow it.** It owns
+the principle every rule here derives from — you do the reconstruction, not the
+user — plus the build order, the naming rules, the banned vocabulary, the
+comprehension gate, the choice-line format, and what to do when an explanation
+fails to land. This file adds only what is specific to walking a list.
+
 ## Step 1: Identify the items
 
 Find the list to review. Look in this order:
@@ -86,25 +92,18 @@ For each item, in order:
 
 1. Mark the task `in_progress`.
 2. Check that the item contains **one decision**. If it contains independent questions, split them into ordered subitems, preserve the original ID as their prefix, update the task list, and present only the first.
-3. **Build a decision-ready explanation before formatting the item.** Reviewer knowledge, source-document terminology, and names introduced by another agent do not count as user knowledge.
-   - Start with the situation the user is trying to handle: what happens, who or what responds, and why a choice is needed.
-   - Explain every new concept by its behavior before giving its code/API name. If the name is unnecessary for the decision, omit it.
-   - For every option or enum variant, state what the application or user would observe and the important tradeoff. A list of names is not an explanation.
+3. **Build a decision-ready explanation before formatting the item**, following
+   the build order and naming rules in the shared file. Two additions specific to
+   list items:
    - Use one concrete scenario when timing, lifecycle, ownership, or state transitions create the decision.
    - Distinguish existing behavior from proposed behavior, but do not make the user reconstruct the causal story from implementation facts.
-4. Apply the **comprehension gate** before presenting the item. The explanation is not ready unless a reader who has not read the source can answer all three:
-   - Why does this decision exist?
-   - What would each choice make the system do?
-   - What user goal or failure mode makes the recommendation preferable?
-
-   If any answer depends on an unexplained type, variant, acronym, file, or prior review finding, rewrite the explanation from the user's situation. Do not rely on `elaborate` to supply context required for the initial decision.
-5. Present the item with the decision frame below. Brevity is applied only after the comprehension gate passes; there is no sentence or bullet budget when more context is required to make the decision intelligible.
-6. **Present the choices as an inline text line, and always mark one as recommended.** Write choices in behavioral language first, with code names parenthetically only when useful. Pick a choice set that fits the item — `keep / drop / modify`, `approve / reject / redirect`, etc. — append `(recommended)` to exactly one option with a one-line reason, and always include `elaborate` as a choice. The answer request is a single line of plain message text, e.g.:
+4. Apply the **comprehension gate** from the shared file before presenting. `elaborate` never supplies context the initial decision required.
+5. Present the item with the decision frame below.
+6. **Present the choices as an inline text line** per the shared file's Choices section — one line of message text, exactly one option marked recommended with its reason, never a survey or multiple-choice UI. Pick a choice set that fits the item (`keep / drop / modify`, `approve / reject / redirect`, …) and always include `elaborate`:
    > `keep (recommended — survived review unchanged) / modify / drop / elaborate`
-   NEVER present an item through a survey/questionnaire mechanism (AskUserQuestion or any multiple-choice UI). Summary and choices are ordinary message text; the user answers by typing. Terse is good, cryptic is not.
 7. **Wait for the user's response.** Do not move on until they reply.
    - If the user picks `elaborate` (also: "more", "detail", "expand", "why"): add one new rationale, constraint, or example relevant to the current item. Do not broaden scope or dump the raw item. Then re-present the same choices and wait again.
-   - If the user says they are lost, confused, or asks what the introduced concepts mean, treat that as a failed initial explanation and stop asking for a decision. **Repair downward once, then upward.** On the first signal, rebuild the item from the triggering situation and observable behavior — concrete, no new labels, do not define the same labels with more labels. **On a second signal about the same item, stop adding detail and go up to the model** — run Step 3.5 now, whether or not it ran earlier. More concrete examples of the same item is not a repair: if one rebuild did not land, the missing context is above the item, not below it, and further zooming in produces a chain of individually-correct explanations that never converge. Re-running Step 3.5 mid-walk costs one turn; iterating item detail at ever finer grain costs many and does not terminate.
+   - If the user says they are lost, confused, or asks what the introduced concepts mean, treat that as a failed initial explanation and stop asking for a decision. Apply repair-downward-then-upward from the shared file: **the upward repair here is Step 3.5** — run it now, whether or not it ran earlier. Re-running it mid-walk costs one turn; iterating item detail at ever finer grain costs many and does not terminate.
    - If the user asks a clarifying question, answer it without recording a decision or advancing. Re-present the choices only when useful.
    - If the user proposes a modification, restate only the revised decision, update the recommendation or example as needed, and wait for explicit acknowledgment before recording it.
 8. When they clearly acknowledge a terminal choice (including terse approvals such as `agreed`, `approved`, `okay`, or `continue` when unambiguous), record the decision to the working doc if one is in scope, mark the task `completed`, and move to the next item.
@@ -150,29 +149,6 @@ approve (recommended — reason) / alternative / elaborate
 
 This is a scaffold, not a demand for headings when a very small item reads more clearly in a few sentences.
 
-### Behavior-first example
-
-This does **not** introduce a decision:
-
-```text
-The recovery variants are `Disabled`, `ApplicationControlled`, and
-`FallbackAndReturn`. Which should the primary use?
-```
-
-It assumes the names explain themselves. Introduce the same decision from what
-the application does:
-
-```text
-If the editor's monitor disappears, the application can do one of three things:
-- leave the editor absent;
-- notify application code and wait for it to create a replacement; or
-- create a temporary editor on another monitor and return it automatically when
-  the original physical display reconnects.
-
-For the main editor, should the application keep it usable automatically, wait
-for application code, or leave it absent?
-```
-
 ## Step 5: Wrap up
 
 When every item is done:
@@ -183,22 +159,18 @@ When every item is done:
 
 ## Rules
 
-- **NEVER run the review as a survey.** No AskUserQuestion, no option chips, no questionnaire UI — for the items themselves or for any step of this workflow. Every item is a succinct, clear plain-text summary followed by the inline choice line defined in Step 4. Clear beats simple: keep the technical content, drop the widget.
+`~/.claude/docs/user_facing_explanation.md` carries the explanation rules — build
+order, naming, banned vocabulary, comprehension gate, choice format, repair when
+an item does not land. These are the ones specific to walking a list.
+
+- **NEVER run the review as a survey.** No AskUserQuestion, no option chips, no questionnaire UI — for the items themselves or for any step of this workflow. Every item is a succinct summary followed by the inline choice line from Step 4. Keep the technical content, drop the widget.
 - One item at a time. Never present two items in the same turn.
-- Default presentation must be decision-ready on its first pass. `elaborate` adds depth; it is not an escape hatch for omitted foundational context.
-- Do not mechanically fill headings and mistake that for context. A response can contain `Situation`, `Question`, and `Recommendation` sections and still fail if the causal relationship between them remains implicit.
-- **Model-level questions get model-level answers.** "What are examples of X?", "how is it used?", "what's the difference between X and Y?", "is it per-X or per-Y?", "show me the relationships" are requests for the *model*, not for more detail about the current item. Answer at Step 3.5's altitude — participants, what is durable versus transient, how they connect, one worked instance — and then return to the item. Answering a model-level question with item detail is the single most common way this command fails, and it fails silently: each answer is accurate, so nothing looks wrong until the user has asked four times.
-- **If the user ends up building the model themselves, the orientation failed.** A message that restates the model in the user's own words and asks you to confirm it is a failure signal, not a success — the synthesis work landed on the user instead of on you. Confirm it, adopt their wording verbatim for the rest of the walk, and re-frame every remaining item inside it.
-- Never infer that the user knows a concept because they own the project, requested a technical review, or previously approved a related feature. Use only concepts already explained in user-facing conversation; introduce everything else behavior-first.
-- Never introduce an unexplained name or substitute a code label for an explanation. Explain what it does first. If a name is undecided, label it `(name TBD)` instead of making it sound settled.
-- Never present enum variants, policy names, state names, or API alternatives without saying what each one makes the system do.
+- **Model-level questions get model-level answers, at Step 3.5's altitude** — participants, what is durable versus transient, how they connect, one worked instance — and then return to the item. Adopt the user's wording verbatim if they restate the model themselves.
 - Keep the recommendation scoped to the active question. Put adjacent unresolved consequences in **Still pending** rather than deciding them implicitly.
-- For technical changes, include enough current behavior to explain why the decision exists. Avoid unsolicited before/after code comparisons; this restriction never permits omitting the triggering situation.
-- Whenever you present discrete choices — here or in Step 2 — always mark exactly one as recommended with a one-line reason. Open prompts ("any thoughts?") are exempt.
-- Don't echo the user's feedback back to them unless asked — just record it.
+- Step 2's working-doc question is a choice like any other: mark exactly one option recommended.
+- Avoid unsolicited before/after code comparisons. This never permits omitting the triggering situation.
 - If the user says skip, use a supported skipped/cancelled terminal status; if none exists, mark it completed with the skip noted. Then move on without arguing.
 - If they want to revisit an earlier item, jump back. Don't insist on linear order.
-- Keep prompts concise only after they pass the comprehension gate. Missing causal context costs more than additional words.
-- If the user asks for plain-English explanation of an item, give it without abandoning the one-at-a-time rhythm.
+- An explanation request never suspends the one-at-a-time rhythm.
 - If the review maintains a decision ledger, update it only after acknowledgment and leave undecided decision cells blank. Show it after each acknowledgment only when the user requested a running ledger; otherwise show it at wrap-up.
 - When the user adds a later review item, record it without forcing an immediate decision; place it after any prerequisites they named.

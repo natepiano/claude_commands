@@ -254,6 +254,20 @@ for the rest of the run.
 
 ---
 
+<UserFacingText>
+**Applies to every turn this command shows the user** — briefings, review
+results, decisions, choice lines, progress narration.
+
+**Read `~/.claude/docs/user_facing_explanation.md` and follow it.** It owns the
+principle the rest of this command's presentation rules derive from — you do the
+reconstruction, not the user — plus the build order, naming, banned vocabulary,
+the comprehension gate, which decisions are worth the user's attention, and the
+choice-line format. `/adhoc_review` shares the same file, so the two cannot
+drift.
+</UserFacingText>
+
+---
+
 <ExplainOnDemand>
 **Trigger:** the user says they do not understand, asks what something means,
 asks for a reframe, or answers a gate with confusion instead of a control. This
@@ -905,22 +919,12 @@ anything whose intended behavior remains unclear.
 
 1. Merge ${AGENT_REVIEW} with your own findings. Dedupe — one entry per real issue, tagged with who caught it (delegate / main agent / both). Discard delegate findings you can refute by reading the code; say which and why.
 
-**TRANSLATE — do not pass reviewer vocabulary through.** The user has not read
-the plan, the diff, or the two reviews. Every line you present must stand on its
-own. A reference the user has never seen is invisible to them — replace it with
-what it *does*. **Banned unless defined in the same sentence:** bare finding
-numbers from the reviewers, plan-decision codes (`D2`, `I3`), test / guard /
-tripwire / file identifiers used as if the user knows them, and tooling terms
-(`headless` → "the automated tests on this machine can't drive a real screen";
-`binding` / `bind group` → say what the data connection actually is). If you
-cannot say what a finding *means in behavior terms*, you do not understand it
-well enough to present it — read the code until you can. If the user says a
-finding did not land, execute <ExplainOnDemand/> before re-offering the choices.
-
-**Never use the word "plain" or any variant** (`plain terms`, `plain language`,
-`plain English`, `in plain terms`) anywhere in the output — not in a header, a
-label, or a sentence. Just write the summary that way; do not announce that you
-are. This is absolute.
+**TRANSLATE — do not pass reviewer vocabulary through.** <UserFacingText/>
+applies in full here. The user has not read the plan, the diff, or the two
+reviews, so its banned-vocabulary rule also covers the reviewers' own finding
+numbers and titles: name the real problem, not what a reviewer called it. If the
+user says a finding did not land, execute <ExplainOnDemand/> before re-offering
+the choices.
 
 2. Present in two layers — readable summary first, technical reference second:
 
@@ -977,14 +981,13 @@ applies to the initial implementation.
 4. **AUTO-ROUTE.** Otherwise (confirmed blocker or minor issues remain), route
 without asking:
 
-   **Only real choices reach the user** — before routing anything to STOP, test
-   every option you would present: can it actually be built as described? An
-   option that contradicts the phase's own structure — an acceptance line
-   asserting a guarantee the phase has no code path to deliver, a test for a
-   boundary that does not exist yet — is not an option, and a list with one
-   viable option is not a decision. Correct the plan document yourself, move the
-   guarantee to the phase that can enforce it, tell the user in one line what you
-   corrected and why, and continue. Same standard as the resequencing rule: this
+   **Only real choices reach the user** — before routing anything to STOP, apply
+   <UserFacingText/>'s three tests to every option you would present. An option
+   that contradicts the phase's own structure — an acceptance line asserting a
+   guarantee the phase has no code path to deliver, a test for a boundary that
+   does not exist yet — is not buildable. Correct the plan document yourself,
+   move the guarantee to the phase that can enforce it, tell the user in one line
+   what you corrected, and continue. Same standard as the resequencing rule: this
    is a correction, not a decision, so long as it preserves product behavior,
    public API, scope, invariants, and required verification.
 
@@ -1307,7 +1310,9 @@ unrelated turns to continue a run that is over.
 
 ## Rules
 
-- ${WORKING_DIR} is whatever the current project directory is — often a worktree checkout. Never create a worktree or switch branches. The only commits are <CheckpointCommit/> checkpoints in loop or verbose mode — one per completed phase, never a push.
+- ${WORKING_DIR} is whatever the current project directory is — often a worktree checkout. Never create a worktree or switch branches. The only commits are <CheckpointCommit/> checkpoints in loop or verbose mode — one per completed phase.
+- **Verify a blocker before naming one** — <UserFacingText/>'s three tests decide what may appear in a gate briefing. A stale status doc, an unpushed branch, or a decision the plan already recommends fails them: read the doc's claim against the actual tree, push the branch, follow the plan's recommendation.
+- **An unpushed branch is NEVER a blocker.** When a phase's work needs a commit reachable from the remote — a `git = "…", rev = "…"` pin, a cross-repo consumer, a CI run — pushing the working branch is a mechanical step of that phase. Push it, compute the rev, continue. Do not list it in a <VerbosePrePhaseGate/> briefing, do not raise it as a prerequisite, do not ask.
 - All delegate-launching scripts run with `dangerouslyDisableSandbox: true` and `run_in_background: true`.
 - The **Background wait invariant** is mandatory. No active delegate terminal may outlive the primary-agent turn that launched it.
 - A confirmed substantial, spec-defined defect found during the main side of
