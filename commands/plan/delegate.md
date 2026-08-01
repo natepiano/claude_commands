@@ -165,6 +165,10 @@ Reading rules — the **Background wait invariant** stands unchanged:
   (report the last few lines in real words); when resuming after context
   compaction (one read to re-establish where the delegate is); or when a
   delegate has run far longer than its scope suggests (one staleness check).
+- A user-requested progress check reads both evidence channels: the heartbeat
+  tail for what the delegate says it is doing, and the worktree snapshot defined
+  under **Progress narration while waiting** for what implementation has actually
+  appeared. Never answer from the heartbeat alone when a live diff is available.
 - Interpretation: fresh `[wrapper]` lines + an old `[agent]` line mean the
   delegate is alive and has been in the named activity that long — the wrapper
   digest shows what it is actually doing meanwhile; flag it to the user only
@@ -180,6 +184,14 @@ Reading rules — the **Background wait invariant** stands unchanged:
 A delegate dispatch runs for many minutes. The user must not have to ask what is
 happening. Every dispatch — implementation, blind review, fix pass, escalation —
 narrates its progress to the user about every two minutes for as long as it runs.
+
+**Capture the pre-dispatch worktree baseline once per phase.** Immediately before
+the phase's first implementation launcher, write `git status --short` from
+`${WORKING_DIR}` to `${SESSION_DIR}/progress_baseline_status`. This records the
+plan doc, handoff, or user-owned paths that were already dirty and prevents later
+progress reports from claiming them as delegate work. Keep that original phase
+baseline through reviews and fix passes; do not overwrite it after implementation
+starts.
 
 **Arm the monitor in the same turn as the dispatch**, immediately after the
 launcher returns its handle and before settling into the **Background wait
@@ -219,9 +231,44 @@ its own when the status flips to `implemented` / `reviewed` / `error`, so no
 monitor outlives its dispatch; still call `TaskStop` on the monitor handle if the
 dispatch ends some other way (cancelled, preempted by <DualReview/>).
 
+**Worktree evidence is mandatory for every progress narration.** Immediately
+before writing a scheduled progress update or answering a user-requested status
+check, run these read-only commands in `${WORKING_DIR}`:
+
+```
+git status --short
+git diff --stat
+```
+
+Compare the current paths with `${SESSION_DIR}/progress_baseline_status` and
+identify which source, test, example, or documentation areas appeared after the
+dispatch. An untracked path is real progress even though ordinary `git diff
+--stat` omits it; take its name from `git status --short`. Never use `git add -N`
+for progress reporting, and never modify the index or worktree to improve the
+snapshot. The snapshot is evidence that editing exists, not evidence that the
+edit is correct, complete, or owned by a finished task.
+
+Every progress narration combines both channels:
+
+- **Current activity** from the newest heartbeat entries.
+- **Delivered work so far** from post-baseline changed paths and diff scope,
+  grouped into behavior-relevant areas rather than pasted filenames.
+- **What remains** from the Work Order and verification list.
+- **Rough completion estimate** scored from all three.
+
+If the heartbeat still describes reading while source files have appeared, say
+that implementation is present and name its areas; do not report that the run is
+"still reading" or in its "initial pass." If the configured monitor interval is
+longer than another environment rule permits between user updates, capture the
+same fresh worktree evidence before each interim narration instead of
+extrapolating from the last monitor event. Never infer unchanged work from a
+silent launcher terminal: launchers normally emit no stdout while the delegate
+runs.
+
 **When a monitor event lands, write one or two sentences of ordinary English plus
-a rough completion estimate** — what the delegate is doing right now, roughly how
-long it has been at it, and how far through its work it appears to be. This is
+a rough completion estimate** — what the delegate is doing right now, what has
+materially appeared in the worktree, roughly how long it has been at it, and how
+far through its work it appears to be. This is
 the same translation standard as <Synthesize/>: the reader has not seen the code,
 the plan, or the log. Turn `[agent] rerunning the mimesis test gate` into "still
 running the image-tool tests, about four minutes in — roughly 70% done". Never
@@ -237,9 +284,12 @@ verification lines the delegate must run. Score against that list, not against
 elapsed time.
 
 - Reading the style guide, reading source, and locating the change sites is the
-  first stretch — under 20%.
+  first stretch — under 20% only while the worktree snapshot confirms that no
+  implementation has appeared.
 - Editing is the middle. With a known issue count, weight by issues finished:
-  two of four done is about half of the editing stretch.
+  two of four done is about half of the editing stretch. Use changed areas as
+  evidence that an issue has started, then use heartbeat/check output to decide
+  whether it is merely drafted or working.
 - Verification is the last stretch and its steps are countable. Each
   `verify.sh` line that has passed is a fixed share of it; the last line
   finishing means the delegate is writing its report — 90%+.
@@ -798,14 +848,18 @@ delegate family with `/agent`.
 <LaunchImplementation>
 **Goal:** Run the delegate agent and wait for completion.
 
-1. Run `bash ~/.claude/scripts/delegate/implement.sh "${SESSION_DIR}" "${WORKING_DIR}" "${SESSION_DIR}/implementation_prompt.md" "${IMPLEMENTATION_TASK}" "<responsibility>"` using Bash with `run_in_background: true` and `dangerouslyDisableSandbox: true` — `<responsibility>` starts with the plan/phase line (`<plan-doc filename> — phase: <identifier>`, or `adhoc — <scope>` without a plan doc), then 1-2 lines naming what this run implements (the Work Order's goal in a few words)
-2. Inform the user: "The delegate agent is implementing... (heartbeat: ${SESSION_DIR}/heartbeat.log)"
-3. Arm the two-minute progress monitor over `impl_status` per **Progress
+1. Before the phase's first implementation launcher, run `git status --short`
+   in `${WORKING_DIR}` and write its output to
+   `${SESSION_DIR}/progress_baseline_status`. Do this exactly once for the phase;
+   fix passes keep the original baseline.
+2. Run `bash ~/.claude/scripts/delegate/implement.sh "${SESSION_DIR}" "${WORKING_DIR}" "${SESSION_DIR}/implementation_prompt.md" "${IMPLEMENTATION_TASK}" "<responsibility>"` using Bash with `run_in_background: true` and `dangerouslyDisableSandbox: true` — `<responsibility>` starts with the plan/phase line (`<plan-doc filename> — phase: <identifier>`, or `adhoc — <scope>` without a plan doc), then 1-2 lines naming what this run implements (the Work Order's goal in a few words)
+3. Inform the user: "The delegate agent is implementing... (heartbeat: ${SESSION_DIR}/heartbeat.log)"
+4. Arm the two-minute progress monitor over `impl_status` per **Progress
    narration while waiting**, in this same turn.
-4. Apply the **Background wait invariant**: keep this turn visibly attached to
+5. Apply the **Background wait invariant**: keep this turn visibly attached to
    the returned handle and wait for the background task notification. Do NOT
    poll status files or end the turn.
-5. When it arrives, read ${SESSION_DIR}/impl_status:
+6. When it arrives, read ${SESSION_DIR}/impl_status:
    - **"implemented":** Read ${SESSION_DIR}/impl_summary.txt → ${IMPL_SUMMARY}. Continue.
    - **"error":** Read ${SESSION_DIR}/impl_agent.log, show the user the error, stop.
 </LaunchImplementation>
