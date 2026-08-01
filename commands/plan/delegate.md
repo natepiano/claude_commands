@@ -189,13 +189,30 @@ the delegate is alive (`impl_status` → `implementing`, `review_status` →
 
 ```
 Monitor({
-  command: 'S="${SESSION_DIR}/<impl|review>_status"; while :; do sleep 120; ' +
+  command: 'S="${SESSION_DIR}/<impl|review>_status"; C="$HOME/.claude/config/timings.conf"; while :; do ' +
+           'PLAN_DELEGATE_PROGRESS_INTERVAL_SECONDS=120; ' +
+           'test ! -r "$C" || . "$C"; I="$PLAN_DELEGATE_PROGRESS_INTERVAL_SECONDS"; ' +
+           'case "$I" in ""|*[!0-9]*|0) I=120 ;; esac; sleep "$I"; ' +
            'case "$(cat "$S" 2>/dev/null)" in *ing) ;; *) break ;; esac; ' +
            'echo "--- $(date +%H:%M:%S)"; tail -n 6 "${SESSION_DIR}/heartbeat.log"; done',
   description: '<phase> delegate progress',
   persistent: true,
 })
 ```
+
+The interval comes from
+`~/.claude/config/timings.conf`'s
+`PLAN_DELEGATE_PROGRESS_INTERVAL_SECONDS` value. The monitor re-reads it before
+every sleep; a missing, zero, or non-numeric value falls back to 120 seconds.
+
+`Monitor` above names the capability, not a required tool spelling. If the
+environment has no first-class persistent monitor primitive, launch that exact
+loop immediately in its own background terminal and retain its handle separately
+from the delegate terminal. The monitor terminal owns the configured interval;
+do not approximate it by polling the delegate terminal for one minute at a time,
+and do not wait for the primary agent to enter a generic "waiting for background
+terminal" state before launching it. The primary agent remains attached to the
+delegate terminal independently under the Background wait invariant.
 
 Substitute the real `${SESSION_DIR}` and the right status file. The loop exits on
 its own when the status flips to `implemented` / `reviewed` / `error`, so no

@@ -30,3 +30,11 @@ MCP server definitions for reference when setting up Claude Code on a new machin
 ## orphans_expected.json
 
 Files that the `/orphans` command should ignore when checking for unreferenced scripts and configs. Lists scripts and config files that are intentionally not referenced by any command.
+
+## timings.conf
+
+Shared workflow timing values expressed in seconds. `/plan:delegate` reads
+`PLAN_DELEGATE_PROGRESS_INTERVAL_SECONDS` before every progress-monitor sleep,
+so changing it affects the next monitor cycle without regenerating the command.
+The value must be a positive integer; invalid or missing values fall back to
+120 seconds.
