@@ -191,7 +191,11 @@ the phase's first implementation launcher, write `git status --short` from
 plan doc, handoff, or user-owned paths that were already dirty and prevents later
 progress reports from claiming them as delegate work. Keep that original phase
 baseline through reviews and fix passes; do not overwrite it after implementation
-starts.
+starts. At the same time, clear any prior
+`${SESSION_DIR}/progress_last_percent` and
+`${SESSION_DIR}/progress_percent_started_at` state so unchanged-percentage timing
+starts fresh for the new phase. Do not reset the project timer created by
+<PrepareSession/>.
 
 **Arm the monitor in the same turn as the dispatch**, immediately after the
 launcher returns its handle and before settling into the **Background wait
@@ -265,18 +269,46 @@ extrapolating from the last monitor event. Never infer unchanged work from a
 silent launcher terminal: launchers normally emit no stdout while the delegate
 runs.
 
-**When a monitor event lands, write one or two sentences of ordinary English plus
-a rough completion estimate** — what the delegate is doing right now, what has
-materially appeared in the worktree, roughly how long it has been at it, and how
-far through its work it appears to be. This is
+**When a monitor event lands, write one bold progress title, then one or two
+sentences of ordinary English** — what the delegate is doing right now, what has
+materially appeared in the worktree, and what remains. This is
 the same translation standard as <Synthesize/>: the reader has not seen the code,
 the plan, or the log. Turn `[agent] rerunning the mimesis test gate` into "still
-running the image-tool tests, about four minutes in — roughly 70% done". Never
-paste raw heartbeat lines, never quote a file path, never emit a bare timestamp.
+running the image-tool tests; the implementation is present and verification is
+underway." Never paste raw heartbeat lines, never quote a file path, never emit a
+bare timestamp.
 (The heartbeat log path is given once at dispatch — see <ComposeWorkOrder/> step
 3 — and is not repeated in these updates.)
 If nothing has changed since the last narration, say that in one short sentence
 rather than repeating the previous wording verbatim.
+
+The bold line is mandatory for every scheduled update and every user-requested
+progress check. Use zero-padded `HH:MM:SS` durations, where `HH` is total elapsed
+hours and may exceed 23, and this exact format:
+
+```
+**<percent>% complete for phase <phase identifier> - duration <HH:MM:SS>**
+```
+
+`duration` is the whole project's elapsed wall time: current time minus
+`${SESSION_DIR}/progress_project_started_at`. For phased plans that timestamp
+comes from the plan's memorialized `Project started` field and does not reset
+between phases, reviews, fix passes, or later delegation sessions. Persist the
+last reported percentage in `${SESSION_DIR}/progress_last_percent` and the epoch
+time it was first reported in
+`${SESSION_DIR}/progress_percent_started_at`. When the same percentage appears in
+more than one consecutive report, append the unchanged percentage and its elapsed
+duration:
+
+```
+**<percent>% complete for phase <phase identifier> - duration <HH:MM:SS> - reported <percent>% complete for duration <HH:MM:SS>**
+```
+
+On a percentage change, replace the stored percentage and reset its timer to the
+current report time; omit the appended clause from that report. The next report
+with the same percentage includes it. The bold line is the update's title and
+must come first. Current-status prose follows it in normal text and never
+duplicates its percentage or durations.
 
 **Estimating percent complete.** The main agent wrote the prompt, so it knows the
 whole work list: the number of issues or files to change, and the exact
@@ -297,10 +329,12 @@ elapsed time.
   of it, so hold the estimate low and moving (30%, 55%, 70%) until findings are
   being written.
 
-Give one number, round it hard (10%, 25%, half, 80%), and never present it as
+Give one number, round it hard (10%, 25%, 50%, 80%), and never present it as
 precise. If the delegate is doing something the work list did not anticipate,
-say the estimate is uncertain and why, in the same sentence — an unexplained
-percentage that stalls or moves backwards is worse than no percentage.
+say the estimate is uncertain and why in the prose after the required bold
+line. Never omit the line because the estimate is uncertain. An unexplained
+percentage that stalls or moves backwards is worse than an explicitly qualified
+estimate.
 
 Interpretation carries over from the heartbeat reading rules: fresh `[wrapper]`
 lines with an old `[agent]` line mean the delegate is alive and has been in that
@@ -566,6 +600,10 @@ returns to STEP 2 for the next pre-phase gate, or ends with <RunSummary/>
 1. Run: `bash ~/.claude/scripts/delegate/prepare_session.sh` using Bash with `dangerouslyDisableSandbox: true`
 2. **Capture ${SESSION_DIR}** from the last line of output (format: `Session ready at <path>`)
 3. Store the current project directory as ${WORKING_DIR}
+4. Record the current epoch time in
+   `${SESSION_DIR}/progress_project_started_at`. This is the fallback start for
+   ad hoc work and plans with no Git history. <ComposeWorkOrder/> replaces it
+   with the plan's memorialized project start when one exists or can be derived.
 
 The same script writes a run-active marker for this Claude session. While it
 exists, the Stop hook refuses to let the turn end near the auto-compaction
@@ -597,6 +635,24 @@ threshold (see **Context and compaction**). <RunSummary/> clears it.
    appear, or if a bounded-auto control appears without `verbose`, STOP and ask which execution
    contract the user wants. Require a positive N. If all arguments are empty,
    infer the work from the conversation.
+
+1a. **Resolve project start once.** If a plan doc was given, read its
+    `## Delegation Context` and look for `- **Project started:** <ISO-8601>`.
+    Validate and convert an existing value to epoch seconds, then write it to
+    `${SESSION_DIR}/progress_project_started_at`; never query Git when the field
+    exists. If the field is absent, run one Git-history lookup for the oldest
+    visible commit that touched the plan doc:
+
+    `git log --follow --format='%H %cI' -- "<plan-doc>"`
+
+    Take the last non-empty entry, add its ISO-8601 commit timestamp as the
+    `Project started` bullet immediately after the `Project` bullet, and write
+    the corresponding epoch time to the session file. The plan field is the
+    authority from then on; later phases and later `/plan:delegate` sessions
+    read it without checking Git again. If the plan has no Git history, use the
+    session-start timestamp from <PrepareSession/> and still write its ISO-8601
+    value into the plan so the failed lookup is never repeated. A malformed
+    existing field is an error; do not silently replace it.
 
 2. If a doc path was given, Read it. Decide whether it is a **delegate-ready plan** (per `~/.claude/docs/delegate_plan_format.md`): it has a `## Delegation Context` section **and** the target phase has a `#### Work Order`. Branch:
 
@@ -1424,8 +1480,9 @@ unrelated turns to continue a run that is over.
 - Select `escalation` from the actual Work Order or review outcome, never keyword matching.
 - The main agent orchestrates and reviews; the delegate agent codes. The main agent touches implementation code only on explicit user instruction — except post-review doc-only or trivial fixes that both reviews agree on (see the direct-fix exception in <Synthesize>), which the main agent applies itself and reports.
 - Every delegate dispatch arms a two-minute progress monitor and narrates what
-  the delegate is doing in ordinary English, with a rough percent-complete
-  estimate scored against the prompt's own work list, until it finishes
+  the delegate is doing with the mandatory bold phase-percentage/project-duration
+  title first, followed by the ordinary-English current status defined under
+  **Progress narration while waiting**, until it finishes
   (**Progress narration while waiting**). Other user work takes precedence over
   the narration; the narration never replaces the completion notification.
 - Any signal that the user does not understand — at any gate — triggers

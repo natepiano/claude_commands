@@ -138,6 +138,8 @@ block — nothing else. The prompt must include:
 
 - The absolute plan-doc path (the subagent reads it to learn which files/areas
   the phases touch).
+- Do not return `Project started`; `/plan:delegate` owns deriving that runtime
+  provenance from Git and memorializing it on the first delegation run.
 - A directive to determine and return, terse:
   1. **Project** — the crate / workspace-member name and one-line purpose.
   2. **Stack** — language + key frameworks/versions the work touches.
@@ -160,8 +162,9 @@ block — nothing else. The prompt must include:
      rules); omit for non-Rust.
   7. **Invariants** — project-wide rules every phase must preserve (from the plan
      and from obvious code constraints).
-- Output format: exactly the `## Delegation Context` bullet block from the format
-  doc. No prose, no findings list.
+- Output format: the `## Delegation Context` bullet block from the format doc,
+  omitting `Project started` until `/plan:delegate` resolves it. No prose, no
+  findings list.
 
 The subagent does not edit anything. Capture its block as ${DELEGATION_CONTEXT}.
 </GatherContext>
