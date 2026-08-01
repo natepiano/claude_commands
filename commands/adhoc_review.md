@@ -10,6 +10,12 @@ user — plus the build order, the naming rules, the banned vocabulary, the
 comprehension gate, the choice-line format, and what to do when an explanation
 fails to land. This file adds only what is specific to walking a list.
 
+**Read `~/.claude/docs/type_design.md` too and follow it.** When an item concerns
+types, APIs, stored state, or optional values, use that contract to evaluate the
+proposal and recommendation. A vague name or domain-owned `Option<T>` is a
+design issue; consider the restructuring needed to make a precise semantic type
+truthful, not only a rename.
+
 ## Step 1: Identify the items
 
 Find the list to review. Look in this order:

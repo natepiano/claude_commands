@@ -4,6 +4,11 @@ description: After implementing a phase of a multi-phase plan, append a retrospe
 
 Use this after the agent has just finished implementing a phase of a multi-phase plan that is already in conversation context. The command updates the plan with what was learned, then asks an architect subagent to re-evaluate the remaining phases against that learning, then folds the findings back into the plan and reports a jargon-free summary.
 
+**Read `~/.claude/docs/type_design.md` first and follow it.** Apply its type-name
+and `Option<T>` rules to the retrospective, the remaining-phase review, and all
+Work Order revisions. Include its complete contents verbatim in the architect
+subagent prompt so the reviewer receives the same contract as `/plan:delegate`.
+
 **Delegate-ready plans.** If the plan follows `~/.claude/docs/delegate_plan_format.md` (a `## Delegation Context` section + per-phase `#### Work Order`), this command must keep every remaining phase **dispatch-ready**: learnings are folded *into* the remaining Work Orders (Spec, Files, Acceptance gate, and especially **Constraints from prior phases**), not merely appended as review notes. The test after this command runs: `/plan:delegate <plan> phase <next>` can assemble its prompt with zero codebase research. See `<MaintainWorkOrders/>` in Step 5.
 
 **Auto mode.** If `$ARGUMENTS` contains the token `auto` (passed by the `/plan:delegate` loop), this command asks the user nothing: significant findings that survive filtering are deferred into the affected phase's Work Order as `**Pending decision:**` blocks (format: `~/.claude/docs/delegate_plan_format.md`) instead of being presented. Invocations without `auto` behave exactly as written below.
@@ -74,6 +79,8 @@ The prompt to the subagent must include:
 - The phase that just completed (number and title).
 - A directive to read the implemented code referenced by that phase (so its review is grounded in what actually exists, not what was planned).
 - A directive to read the **Retrospective** that was just appended.
+- The complete contents of `~/.claude/docs/type_design.md`, under a `Type Design
+  Contract` heading.
 - The review questions:
   1. Are any remaining phases now redundant, partially redundant, or already satisfied by what was just built?
   2. Do any remaining phases need re-scoping (smaller, larger, split, merged, reordered) given the implications surfaced in the retrospective?
@@ -81,6 +88,11 @@ The prompt to the subagent must include:
   4. Are any assumptions in the remaining phases now invalidated?
   5. Are there gaps — work the plan does not cover but that the implemented phase has revealed as necessary?
   6. (Delegate-ready plans only) For each remaining phase, is its `#### Work Order` still self-contained — could a fresh codex session implement it from the named files + Delegation Context alone? Name any Work Order that now needs an added **Constraints from prior phases** fact, a corrected file/line ref, or a changed acceptance gate because of what just shipped.
+  7. Do type names state their semantic role, state, lifetime, or guarantee
+     without requiring the reader to inspect callers? Does any remaining phase
+     introduce or retain a bare `Option<T>` in a domain-owned type or API where
+     a semantic type should replace it, including conversion around an external
+     API boundary?
 - Output format: a numbered list of findings. Each finding has a one-line title, a body of one to three sentences, and a `Severity:` tag — `minor` (safe to edit straight into the plan), or `significant` (changes scope, ordering, or architectural intent and needs user approval before editing).
 
 The subagent does **not** edit the plan. It returns findings only.

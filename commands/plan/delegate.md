@@ -335,6 +335,20 @@ drift.
 
 ---
 
+<TypeDesignContract>
+**Applies to every implementation, blind-review, fix-pass, and escalation
+delegate call, and to the main agent's own review.**
+
+Read `~/.claude/docs/type_design.md` and follow it. Copy its complete contents
+verbatim into every delegate prompt under `## Type Design Contract`; a role
+does not inherit this contract from an earlier call. Implementers and fixers
+must apply it to the code they write. Reviewers must actively check the diff
+for violations and report them as design findings. Escalation does not relax
+it.
+</TypeDesignContract>
+
+---
+
 <ExplainOnDemand>
 **Trigger:** the user says they do not understand, asks what something means,
 asks for a reframe, or answers a gate with confusion instead of a control. This
@@ -599,6 +613,7 @@ threshold (see **Context and compaction**). <RunSummary/> clears it.
 `/plan:to_phased_plan` already paid the research cost and baked it into the doc. Build `${SESSION_DIR}/implementation_prompt.md` by copy-and-assemble:
 - **Project Context** = the doc's `## Delegation Context` block verbatim + the target phase's **Constraints from prior phases**.
 - **Work Specification** = the target phase's **Goal**, **Spec**, and **Files** verbatim + any free-text the user added on the command line.
+- **Type Design Contract** = `~/.claude/docs/type_design.md` verbatim.
 - **Style Requirements** = the standard block (see fallback template), included only if Delegation Context names a **Style** line.
 - **Verification** = Delegation Context **Build / Test / Lint / Run / Smoke**
   entries that exist + the phase **Acceptance gate**, translated into
@@ -644,6 +659,10 @@ already-completed phases and any retrospective facts that constrain this phase.]
 instructions. If inferred from conversation: a concrete, complete spec —
 files to create/modify, the approach, types/APIs/patterns to follow,
 edge cases and constraints discussed.]
+
+## Type Design Contract
+
+[Complete contents of ~/.claude/docs/type_design.md, copied verbatim.]
 
 ## Style Requirements   ← include this section only for Rust work
 
@@ -919,6 +938,10 @@ If you find nothing, say so explicitly — do not invent findings.
 
 [The same work spec sent to the implementer — verbatim]
 
+## Type Design Contract
+
+[Complete contents of ~/.claude/docs/type_design.md, copied verbatim.]
+
 ## Diff
 
 [git diff output + contents of new untracked files]
@@ -929,6 +952,9 @@ If you find nothing, say so explicitly — do not invent findings.
 2. Any bugs, missed edge cases, or broken error handling?
 3. Anything implemented that the spec did not ask for?
 4. Does it fit the existing codebase's patterns?
+5. Can every domain type be understood from its name, and has each bare
+   `Option<T>` in an owned API been replaced or justified by an external API
+   boundary and converted there?
 ```
 
 **BLINDNESS RULE:** the review prompt must NOT contain ${IMPL_SUMMARY} or any hint of what the implementer claims it did. Spec + diff only.
@@ -1084,7 +1110,9 @@ without asking:
    intended behavior) and ${FIX_PASS} < 10: increment ${FIX_PASS}, write
    ${SESSION_DIR}/fix_prompt_${FIX_PASS}.md (same structure as the work order,
    spec = the confirmed issues table with file/line specifics, same no-commit
-   rules, heartbeat instruction, and style requirements; verification = only
+   rules, heartbeat instruction, the complete `## Type Design Contract` copied
+   verbatim from `~/.claude/docs/type_design.md`, and style requirements;
+   verification = only
    the `verify.sh` lines the confirmed issues implicate — typically `check` +
    `test`, adding `lint` only when lint findings are being fixed, never the
    whole phase gate), select `${FIX_TASK}` — `mechanical` only
