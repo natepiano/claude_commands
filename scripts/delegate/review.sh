@@ -3,14 +3,20 @@
 #
 # Usage: review.sh <session_dir> [working_dir] [prompt_file] [task]
 #                  [role_description] [pass_activity]
+#                  [role_description] [pass_activity] [pass_index]
 #   role_description — 1-2 lines describing this review's responsibility,
 #   written as a header block into the shared heartbeat log
 #   pass_activity — short user-facing description for the progress header
+#   pass_index — 1 for a phase's broad review, incrementing for each closure
+#   review after it. Artifacts are written per index and never overwritten:
+#   a run that failed to converge can be read back round by round.
 #
 # Produces:
-#   <session_dir>/review_status        — "reviewing" while running, "reviewed" on success, "error" on failure
-#   <session_dir>/review_findings.txt  — review findings
-#   <session_dir>/review_agent.log     — full agent log
+#   <session_dir>/review_status            — "reviewing" while running, "reviewed" on success, "error" on failure
+#   <session_dir>/review_findings_<N>.txt  — review findings for pass N
+#   <session_dir>/review_agent_<N>.log     — full agent log for pass N
+#   <session_dir>/review_findings.txt      — symlink to the current pass's findings
+#   <session_dir>/review_agent.log         — symlink to the current pass's log
 #   <session_dir>/review_agent         — resolved task, family, agent, and effort
 #   <session_dir>/heartbeat.log        — shared with implement.sh: role header at
 #                                        start + [wrapper] beats every 60s, each
@@ -28,12 +34,22 @@ PROMPT_FILE="${3:-${SESSION_DIR}/review_prompt.md}"
 SUBTASK="${4:-review}"
 ROLE_DESC="${5:-blind review of the current diff against its spec}"
 PASS_ACTIVITY="${6:-reviewing the current diff against its work order}"
+PASS_INDEX="${7:-1}"
 TASK="delegate.${SUBTASK}"
 
+case "${PASS_INDEX}" in
+  ''|*[!0-9]*|0) PASS_INDEX=1 ;;
+esac
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-FINDINGS_FILE="${SESSION_DIR}/review_findings.txt"
+FINDINGS_FILE="${SESSION_DIR}/review_findings_${PASS_INDEX}.txt"
 STATUS_FILE="${SESSION_DIR}/review_status"
-LOG_FILE="${SESSION_DIR}/review_agent.log"
+LOG_FILE="${SESSION_DIR}/review_agent_${PASS_INDEX}.log"
+
+# Every reader of the unnumbered paths — the orchestrator's mid-run preemption
+# read, the heartbeat digest — keeps working while the per-pass history is kept.
+ln -sfn "review_findings_${PASS_INDEX}.txt" "${SESSION_DIR}/review_findings.txt"
+ln -sfn "review_agent_${PASS_INDEX}.log" "${SESSION_DIR}/review_agent.log"
 AGENT_FILE="${SESSION_DIR}/review_agent"
 HEARTBEAT_HELPER="${SCRIPT_DIR}/../agents/heartbeat.sh"
 HEARTBEAT_FILE="${SESSION_DIR}/heartbeat.log"

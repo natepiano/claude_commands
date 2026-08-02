@@ -224,6 +224,8 @@ class ProgressHistoryTests(unittest.TestCase):
             "65",
             "--phase-percent",
             "25",
+            "--cap-stage",
+            "open_findings",
             "--activity",
             "correcting retry recovery",
             at=started_at + 100,
@@ -260,6 +262,8 @@ class ProgressHistoryTests(unittest.TestCase):
             "65",
             "--phase-percent",
             "25",
+            "--cap-stage",
+            "open_findings",
             "--activity",
             "correcting retry recovery",
             at=started_at + 160,
@@ -293,6 +297,8 @@ class ProgressHistoryTests(unittest.TestCase):
             "65",
             "--phase-percent",
             "25",
+            "--cap-stage",
+            "open_findings",
             "--activity",
             "correcting retry recovery",
             at=started_at + 180,
@@ -375,6 +381,93 @@ class ProgressHistoryTests(unittest.TestCase):
                 "**Total elapsed 01:40**",
             ],
         )
+
+    def test_cap_stage_clamps_optimistic_estimates(self) -> None:
+        started_at = 40_000
+        session_dir = self.start_run("capped", started_at)
+        self.start_phase_and_pass(session_dir, started_at)
+        header = self.run_command(
+            "progress",
+            "--session-dir",
+            str(session_dir),
+            "--project-raw-percent",
+            "100",
+            "--project-percent",
+            "100",
+            "--phase-raw-percent",
+            "99",
+            "--phase-percent",
+            "99",
+            "--activity",
+            "waiting on the closure review",
+            "--cap-stage",
+            "open_findings",
+            at=started_at + 100,
+        )
+        self.assertIn("**90% complete", header)
+        self.assertIn("**99% complete", header)
+        self.assertNotIn("**100% complete", header)
+
+        history_text = (self.history_dir / "runs" / "capped.jsonl").read_text(encoding="utf-8")
+        self.assertIn('"cap_stage":"open_findings"', history_text)
+        self.assertIn('"phase_uncapped_percent":99', history_text)
+        self.assertIn('"phase_percent_capped_by":"open_findings"', history_text)
+        self.assertIn('"project_uncapped_percent":100', history_text)
+
+    def test_dual_layout_progress_requires_a_cap_stage(self) -> None:
+        started_at = 50_000
+        session_dir = self.start_run("uncapped", started_at)
+        self.start_phase_and_pass(session_dir, started_at)
+        result = self.run_failing_command(
+            "progress",
+            "--session-dir",
+            str(session_dir),
+            "--project-raw-percent",
+            "40",
+            "--project-percent",
+            "40",
+            "--phase-raw-percent",
+            "40",
+            "--phase-percent",
+            "40",
+            "--activity",
+            "implementing",
+            at=started_at + 60,
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("--cap-stage is required", result.stderr)
+
+    def test_start_phase_records_work_order_size(self) -> None:
+        started_at = 60_000
+        session_dir = self.start_run("sized", started_at)
+        work_order = self.root / "work_order.md"
+        work_order_lines = [
+            "**Goal:** wire the retry path",
+            "",
+            "- touch `src/retry.rs`",
+            "- touch `src/lib.rs`",
+            "- keep `RetryBudget` intact",
+        ]
+        _ = work_order.write_text(
+            "\n".join(work_order_lines) + "\n",
+            encoding="utf-8",
+        )
+        _ = self.run_command(
+            "start-phase",
+            "--session-dir",
+            str(session_dir),
+            "--phase-id",
+            "3",
+            "--phase-title",
+            "Retry handling",
+            "--work-order-file",
+            str(work_order),
+            at=started_at,
+        )
+        history_text = (self.history_dir / "runs" / "sized.jsonl").read_text(encoding="utf-8")
+        self.assertIn('"work_order_lines":4', history_text)
+        self.assertIn('"work_order_top_level_bullets":3', history_text)
+        self.assertIn('"work_order_file_targets":2', history_text)
 
     def test_aggregate_reports_raw_and_calibrated_error_fields(self) -> None:
         self.complete_historical_run(0)

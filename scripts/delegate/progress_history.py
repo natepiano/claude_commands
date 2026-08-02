@@ -7,6 +7,7 @@ import argparse
 import fcntl
 import json
 import os
+import re
 import statistics
 import subprocess
 import tempfile
@@ -22,6 +23,19 @@ from typing import TypedDict, cast
 SCHEMA_VERSION = 1
 MIN_CALIBRATION_SAMPLES = 5
 STATE_FILENAME = "progress_history_state.json"
+
+# A percentage is an estimate; a stage is a fact. These ceilings keep an
+# optimistic estimate from claiming a gate that has not run — the failure mode
+# was a phase sitting at 99% while its review loop was still unconverged.
+PROGRESS_CAPS: dict[str, int] = {
+    "implementation": 75,
+    "initial_review": 85,
+    "open_findings": 90,
+    "closure": 95,
+    "checkpoint": 98,
+    "complete": 100,
+}
+PROJECT_CAP_BEFORE_COMPLETE = 99
 
 
 class AgentIdentity(TypedDict):
@@ -395,6 +409,35 @@ def _start_run(args: argparse.Namespace) -> None:
     print(history_file)
 
 
+def _work_order_metrics(work_order_file: str) -> dict[str, object]:
+    """Measure a phase's Work Order so phase size can be correlated with outcome.
+
+    Recorded only. Thresholds belong upstream in `/plan:to_phased_plan`, and
+    setting them from one bad phase is guesswork — this is how the data arrives.
+    """
+    if not work_order_file:
+        return {}
+    try:
+        text = Path(work_order_file).expanduser().read_text(encoding="utf-8")
+    except OSError:
+        return {}
+    lines = text.splitlines()
+    targets: set[str] = set()
+    quoted_spans = cast(list[str], re.findall(r"`([^`\n]+)`", text))
+    for quoted in quoted_spans:
+        candidate = quoted.strip()
+        if "/" in candidate or re.search(r"\.[A-Za-z0-9]{1,5}$", candidate):
+            targets.add(candidate)
+    return {
+        "work_order_lines": sum(1 for line in lines if line.strip()),
+        "work_order_words": len(text.split()),
+        "work_order_file_targets": len(targets),
+        "work_order_top_level_bullets": sum(
+            1 for line in lines if re.match(r"^[-*] ", line)
+        ),
+    }
+
+
 def _start_phase(args: argparse.Namespace) -> None:
     session_dir = _session_dir(args)
     state = _read_state(session_dir)
@@ -421,7 +464,9 @@ def _start_phase(args: argparse.Namespace) -> None:
     state["percent_started_at"] = None
     state["pending_calibration"] = None
     _write_state(session_dir, state)
-    _append_event(state, _event(state, "phase_started", now))
+    event = _event(state, "phase_started", now)
+    event.update(_work_order_metrics(_arg_string(args, "work_order_file")))
+    _append_event(state, event)
 
 
 def _start_pass(args: argparse.Namespace) -> None:
@@ -959,6 +1004,20 @@ def _progress(args: argparse.Namespace) -> None:
             _arg_string(args, "project_override_reason"),
             "project",
         )
+    cap_stage = _arg_string(args, "cap_stage")
+    if uses_dual_layout and not cap_stage:
+        raise SystemExit(
+            "--cap-stage is required: name the gate this phase has actually reached ("
+            + ", ".join(sorted(PROGRESS_CAPS))
+            + ")"
+        )
+    phase_uncapped_percent = phase_percent
+    project_uncapped_percent = project_percent
+    if cap_stage:
+        phase_percent = min(phase_percent, PROGRESS_CAPS.get(cap_stage, 100))
+        if cap_stage != "complete":
+            project_percent = min(project_percent, PROJECT_CAP_BEFORE_COMPLETE)
+
     activity = _arg_string(args, "activity")
     if activity:
         current_pass["activity"] = activity
@@ -998,6 +1057,11 @@ def _progress(args: argparse.Namespace) -> None:
             "phase_elapsed_seconds": phase_elapsed,
             "pass_elapsed_seconds": pass_elapsed,
             "total_elapsed_seconds": total_elapsed,
+            "cap_stage": cap_stage,
+            "phase_uncapped_percent": phase_uncapped_percent,
+            "phase_percent_capped_by": (
+                cap_stage if phase_percent < phase_uncapped_percent else ""
+            ),
             "calibration": phase_calibration,
             "phase_calibration": phase_calibration,
             **phase_decision,
@@ -1009,6 +1073,7 @@ def _progress(args: argparse.Namespace) -> None:
             {
                 "project_raw_percent": project_raw_percent,
                 "project_percent": project_percent,
+                "project_uncapped_percent": project_uncapped_percent,
                 "project_same_percent_started_at": project_percent_started_at,
                 "project_same_percent_elapsed_seconds": project_unchanged_seconds,
                 "project_calibration": None,
@@ -1156,6 +1221,7 @@ def _build_parser() -> argparse.ArgumentParser:
     _ = start_phase.add_argument("--session-dir", required=True)
     _ = start_phase.add_argument("--phase-id", required=True)
     _ = start_phase.add_argument("--phase-title", required=True)
+    _ = start_phase.add_argument("--work-order-file", default="")
     start_phase.set_defaults(handler=_start_phase)
 
     start_pass = subparsers.add_parser("start-pass")
@@ -1192,6 +1258,7 @@ def _build_parser() -> argparse.ArgumentParser:
     _ = progress.add_argument("--phase-raw-percent", type=int, default=-1)
     _ = progress.add_argument("--phase-percent", type=int, default=-1)
     _ = progress.add_argument("--activity", required=True)
+    _ = progress.add_argument("--cap-stage", choices=tuple(PROGRESS_CAPS), default="")
     _ = progress.add_argument("--override-reason", default="")
     _ = progress.add_argument("--project-override-reason", default="")
     _ = progress.add_argument("--phase-override-reason", default="")

@@ -20,6 +20,8 @@ Schema version 1 records these event types:
 - `phase_started` / `phase_finished`
 - `pass_started` / `pass_finished`
 - `progress_reported`
+- `finding_opened` / `finding_batch_dispatched` / `finding_verdict` /
+  `finding_gate`, appended by `scripts/delegate/findings.py` to the same stream
 
 Every event repeats its query dimensions: run and phase identity, worktree,
 branch, working directory, plan doc, project/phase/pass timestamps, current pass
@@ -30,6 +32,20 @@ percentages, decision source, override reason, each elapsed clock, and the
 calibration evidence used for that report. The phase decision also repeats the
 historical bias, suggested adjustment, and chosen adjustment so downstream
 analysis does not need to unpack the calibration snapshot.
+
+`phase_started` also carries the Work Order's size when `start-phase` is given
+`--work-order-file`: `work_order_lines` (nonblank), `work_order_words`,
+`work_order_file_targets` (distinct backticked strings holding a `/` or a file
+extension), and `work_order_top_level_bullets`. Nothing enforces a threshold on
+these. They accumulate so a later release can answer, from real runs, what size
+of phase actually converges — and only then set a limit in
+`/plan:to_phased_plan`.
+
+The `finding_*` events are written by `findings.py`, which reads
+`progress_history_state.json` for the run's `history_file` and the active
+phase's identity. A findings ledger without progress state still works; it just
+keeps no durable history. Each `finding_*` event repeats `phase_instance_id` and
+`phase_id`, so the fix loop's rounds join to the phase they belong to.
 
 The main agent's exact family, session id, model, and effort come from the
 active Claude or Codex transcript. `implement.sh` and `review.sh` provide the
@@ -70,6 +86,34 @@ reports whether the suggested and final reported adjustments improved on the
 raw estimate. This allows later changes to the bias formula to be evaluated
 against both accepted suggestions and rejected ones.
 
+## Stage caps
+
+A percentage is an estimate; a stage is a fact. `progress` therefore requires
+`--cap-stage` on dual-layout calls — the script refuses an uncapped one — and
+clamps the reported phase percentage to that stage's ceiling:
+
+| `--cap-stage` | Phase cap |
+|---|---|
+| `implementation` | 75 |
+| `initial_review` | 85 |
+| `open_findings` | 90 |
+| `closure` | 95 |
+| `checkpoint` | 98 |
+| `complete` | 100 |
+
+Project percent is clamped to 99 at every stage except `complete`.
+
+The clamp is applied **after** calibration, and the decision fields
+(`raw` / `calibrated` / `override`, the bias, the suggested adjustment) are all
+computed on the uncapped values. Calibration therefore keeps learning from what
+the agent actually estimated rather than from what the ceiling allowed. Each
+event records both: `phase_percent` / `project_percent` are the reported capped
+values, and `phase_uncapped_percent`, `project_uncapped_percent`, `cap_stage`,
+and `phase_percent_capped_by` preserve what was clamped and by which ceiling.
+
+Percentages moving backwards is correct behavior here: a phase reporting 92 at
+`closure` that reopens findings drops to 90 at `open_findings`.
+
 Before a progress report, `calibrate` first tries history matching the main and
 called model/effort plus pass kind. It falls back through called-agent/pass,
 pass-only, and global samples. A suggestion requires at least five completed
@@ -78,15 +122,61 @@ when exact history is sparse). The raw estimate is always retained even when
 the reported estimate uses the suggestion, so later aggregation can measure
 whether the calibration helped and continue tuning that original estimate.
 
+## Findings ledger
+
+`scripts/delegate/findings.py` bounds `/plan:delegate`'s fix loop. It replaced a
+`FIX_PASS < 10` counter, which could not converge: the re-review after each fix
+was a fresh blind review of a now-larger diff, with no memory of what had already
+been accepted, so it always returned something.
+
+State lives in `findings_state.json` beside the progress state and resets itself
+when the progress state's active `phase.instance_id` changes. Findings get stable
+ids (`F001…`) that survive across rounds, so "the same finding came back" is a
+fact the script can check rather than a judgment the orchestrator has to make.
+Each finding is `open`, `fixed_pending_review`, or `accepted`.
+
+`gate` returns one of three verdicts and the orchestrator follows it — it never
+decides on its own whether to run another round:
+
+- `converged` — nothing gating is open; go to the smoke test.
+- `dispatch` — repair the whole returned `batch` in one round.
+- `stop` — hand the run to the user with `stop_reason`.
+
+Three rules are enforced by refusal, not by prose:
+
+- **Severity narrows.** Round 1 gates blockers and minors; every later round
+  gates blockers only. Nits never gate, and are returned as `non_gating_open` so
+  they can still be reported.
+- **One batch per round.** `dispatch --covers` refuses a partial batch, so a
+  round cannot repair one finding, re-review, and rediscover the rest.
+- **No gate with verdicts outstanding.** `gate` refuses while any finding is
+  `fixed_pending_review`; reopening an `accepted` finding requires `--evidence`
+  naming the hunk that invalidated it.
+
+Stop conditions, checked in this order: a finding reopened twice after being
+accepted; a finding that failed to close after two repair attempts; two
+consecutive rounds with no decrease in the gating-open count; a 10-round runaway
+backstop. The first three are convergence tests — a run grinding through eight
+rounds of genuinely new defects is never interrupted, because progress is
+measured, not counted.
+
 ## Commands
 
 ```text
+findings.py open --session-dir <dir> --severity blocker|minor|nit --title <text> --caught-by delegate|main|both [--file <path>] [--line <N>] [--detail <text>]
+findings.py verdict --session-dir <dir> --id <F00N> --state accepted|still_open|reopened [--evidence <hunk>]
+findings.py gate --session-dir <dir>
+findings.py dispatch --session-dir <dir> --covers F001,F002,...
+findings.py status --session-dir <dir>
+```
+
+```text
 progress_history.py start-run ...
-progress_history.py start-phase ...
+progress_history.py start-phase --session-dir <dir> --phase-id <id> --phase-title <title> [--work-order-file <path>]
 progress_history.py start-pass ...
 progress_history.py finish-pass ...
 progress_history.py calibrate --session-dir <dir> --candidate-percent <N>
-progress_history.py progress --session-dir <dir> --project-raw-percent <N> --project-percent <N> --phase-raw-percent <N> --phase-percent <N> --activity <text> [--phase-override-reason <evidence>]
+progress_history.py progress --session-dir <dir> --project-raw-percent <N> --project-percent <N> --phase-raw-percent <N> --phase-percent <N> --cap-stage <stage> --activity <text> [--phase-override-reason <evidence>]
 progress_history.py finish-phase ...
 progress_history.py finish-run ...
 progress_history.py aggregate [--percent <N>]

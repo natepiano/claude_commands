@@ -23,7 +23,9 @@ description: Delegate coding work to a configured CLI agent — the main agent o
 
 SESSION_DIR = (captured from prepare_session.sh output — see PrepareSession)
 WORKING_DIR = current project directory (often a worktree checkout, sometimes main — use it as-is; never create a worktree or switch branches)
-FIX_PASS = 0 (max 10 per phase; resets in <NextPhase/>)
+REVIEW_PASS = 0 (review dispatches this phase; resets in <NextPhase/>)
+FINDINGS = the per-phase ledger owned by `findings.py` — see <FindingsLedger/>.
+It, not a counter, decides whether another fix round runs.
 IMPLEMENTATION_TASK = implementation
 APPLICATION_SMOKE_RESULT = not_run (resets in <NextPhase/>)
 MODE = single when `single` was passed or the work is not phased; verbose when
@@ -93,7 +95,7 @@ guarantees compaction never runs — the run stalls waiting for a user who has n
 reason to expect it. A Stop hook enforces this while a run is active: end the
 turn past the handoff threshold and it refuses the stop and sends you straight
 back in. It blocks only once, so a genuine wait on a user decision (a verbose
-gate, a pending decision, conflicting reviews, the fix-pass cap) survives —
+gate, a pending decision, conflicting reviews, a `stop` gate verdict) survives —
 restate the decision in one line and end the turn again.
 
 After compaction, before taking any further workflow action: **re-read this
@@ -107,6 +109,43 @@ is committed.
 A SessionStart hook restates that paragraph into the freshly compacted context
 while a run is active, since this file is one of the things summarization can
 drop. Treat the two as the same instruction, not as a second one.
+
+---
+
+<FindingsLedger>
+The fix loop is bounded by convergence, not by a counter. A counter punished a
+phase with eight real defects exactly as hard as one whose reviews kept
+re-litigating settled ground. `~/.claude/scripts/delegate/findings.py` owns the
+per-phase ledger and makes the decision:
+
+| Command | Use |
+| --- | --- |
+| `open --severity <blocker\|minor\|nit> --title <t> --file <p> [--line N] --caught-by <delegate\|main\|both> [--detail <d>]` | Record one confirmed issue after <Synthesize/> merges the reviews. Prints its permanent id (`F001`). |
+| `status` | The whole ledger as JSON — the closure review prompt is built from it. |
+| `gate` | Returns `converged`, `dispatch`, or `stop`, plus the `batch` a fix round must cover and a `stop_reason`. |
+| `dispatch --covers F001,F002,…` | Record the fix round. Refuses a partial batch and refuses when `gate` did not say `dispatch`. |
+| `verdict --id F001 --state <accepted\|still_open\|reopened> [--evidence <e>]` | Record the closure review's outcome per finding. |
+
+Every command takes `--session-dir "${SESSION_DIR}"`. The ledger resets itself
+when `start-phase` moves to a new phase.
+
+Three rules the script enforces, so the main agent never rules on them:
+
+- **One batch per round.** A fix round repairs every gating open finding
+  together, by root cause. `dispatch` rejects a subset.
+- **Severity narrows.** Blockers and minors gate the first fix round; blockers
+  alone gate every later one. Nits never gate — they belong in the phase
+  retrospective, not in the loop. A phase ships when it is correct, not when it
+  is spotless.
+- **Convergence, not a count.** A run grinding through eight rounds of real
+  defects is never interrupted. `gate` returns `stop` only when a finding fails
+  to close twice, a finding reopens twice after being accepted, the gating open
+  count fails to decrease across two consecutive rounds, or a ten-round runaway
+  backstop trips.
+
+Record findings only after <Synthesize/> has confirmed them — a finding refuted
+by reading the code never enters the ledger.
+</FindingsLedger>
 
 ---
 
@@ -349,11 +388,28 @@ progress report:
    the phase decision source: `raw` when no suggestion applies, `calibrated`
    when the suggestion is used, and `override` for any other reported value.
 4. Run:
-   `python3 ~/.claude/scripts/delegate/progress_history.py progress --session-dir "${SESSION_DIR}" --project-raw-percent "${PROJECT_RAW_PERCENT}" --project-percent "${PROJECT_REPORTED_PERCENT}" --phase-raw-percent "${PHASE_RAW_PERCENT}" --phase-percent "${PHASE_REPORTED_PERCENT}" --activity "<current activity>" [--phase-override-reason "<specific current evidence>"]`
+   `python3 ~/.claude/scripts/delegate/progress_history.py progress --session-dir "${SESSION_DIR}" --project-raw-percent "${PROJECT_RAW_PERCENT}" --project-percent "${PROJECT_REPORTED_PERCENT}" --phase-raw-percent "${PHASE_RAW_PERCENT}" --phase-percent "${PHASE_REPORTED_PERCENT}" --cap-stage "<stage>" --activity "<current activity>" [--phase-override-reason "<specific current evidence>"]`
    Include `--phase-override-reason` exactly when rejecting the calibrated phase
    value. State the countable worktree, heartbeat, or verification evidence that
    justified the choice; generic disagreement is not a reason. The script
    rejects a missing reason and also rejects a reason when no override occurred.
+
+   `--cap-stage` is required, and it names the last gate this phase has actually
+   passed — not how far along it feels. A percentage is an estimate; a stage is a
+   fact, so the script clamps the estimate to the stage's ceiling:
+
+   | `--cap-stage` | The phase has reached | Phase cap |
+   |---|---|---|
+   | `implementation` | implement.sh dispatched or running; no review yet | 75 |
+   | `initial_review` | the broad <DualReview/> is running or just merged | 85 |
+   | `open_findings` | the ledger holds gating open findings — fix rounds and closure reviews | 90 |
+   | `closure` | `findings.py gate` returned `converged`; smoke test / phase review | 95 |
+   | `checkpoint` | phase review done, committing the checkpoint | 98 |
+   | `complete` | the checkpoint commit landed | 100 |
+
+   Project percent is clamped to 99 at every stage except `complete`. Going
+   backwards is normal and correct: a phase reporting 92 at `closure` that
+   reopens findings drops to 90 at `open_findings`.
 5. Copy the script's two-section Markdown header exactly, then add the status prose.
 
 `calibrate` uses completed phases only. It compares the report timestamp with
@@ -999,9 +1055,13 @@ delegate family with `/agent`.
    in `${WORKING_DIR}` and write its output to
    `${SESSION_DIR}/progress_baseline_status`. Do this exactly once for the phase;
    fix passes keep the original baseline. Then run
-   `python3 ~/.claude/scripts/delegate/progress_history.py start-phase --session-dir "${SESSION_DIR}" --phase-id "<identifier>" --phase-title "<title>"`.
+   `python3 ~/.claude/scripts/delegate/progress_history.py start-phase --session-dir "${SESSION_DIR}" --phase-id "<identifier>" --phase-title "<title>" --work-order-file "${SESSION_DIR}/implementation_prompt.md"`.
    Use `ad hoc` plus a short scope title when there is no phased plan. This call
-   is idempotent for the already-active phase.
+   is idempotent for the already-active phase. `--work-order-file` records the
+   Work Order's size (lines, words, distinct file targets, top-level bullets)
+   into the `phase_started` event. Nothing enforces a threshold on it; the
+   numbers accumulate so a later release can tell what size of phase actually
+   converges. Pass the phase's original prompt, never a fix-round prompt.
 2. Set `${PASS_KIND}` to `arch` when
    `${IMPLEMENTATION_TASK} = escalation`, otherwise `impl`.
 3. Run `bash ~/.claude/scripts/delegate/implement.sh "${SESSION_DIR}" "${WORKING_DIR}" "${SESSION_DIR}/implementation_prompt.md" "${IMPLEMENTATION_TASK}" "<responsibility>" "${PASS_KIND}" "<current pass activity>"` using Bash with `run_in_background: true` and `dangerouslyDisableSandbox: true` — `<responsibility>` starts with the plan/phase line (`<plan-doc filename> — phase: <identifier>`, or `adhoc — <scope>` without a plan doc), then 1-2 lines naming what this run implements (the Work Order's goal in a few words). `<current pass activity>` is a short present-participle description suitable for the header, e.g. `implementing retry recovery`. The launcher records the pass start, called agent identity, and completion/error automatically.
@@ -1021,6 +1081,20 @@ delegate family with `/agent`.
 <DualReview>
 **Goal:** Two independent reviews of the diff — a fresh blind delegate session and the main agent's own — running concurrently.
 
+**Step 0 — pick the review kind.** Increment `${REVIEW_PASS}`.
+
+- `${REVIEW_PASS} = 1` — the phase's **broad review**. Whole diff, whole spec,
+  the five general questions. Steps 1-5 below as written.
+- `${REVIEW_PASS} > 1` — a **closure review** of one repair. Use
+  <ClosureReview/> instead of Step 2's template. Everything else in this block
+  (the untracked sweep, the launch, the main agent's own pass, collection)
+  is unchanged.
+
+A closure review is not a second audit of the phase. Re-running the broad review
+after every repair is what kept runs from converging: a fresh blind reviewer,
+handed a larger diff each time with no record of what was already accepted,
+always returns something.
+
 **Step 1 — Capture the diff:**
 
 **Before capturing anything, run `git status --short` in ${WORKING_DIR} and `git add -N` every untracked file the phase created.** A delegate that creates a new source file leaves it untracked, and `git diff` does not show untracked files at all — so the phase's largest new file is routinely the one missing from the review. Intent-to-add makes it appear in every subsequent `git diff` without staging its contents.
@@ -1029,11 +1103,11 @@ Exclude from `add -N`: files the phase did not create (pre-existing untracked sc
 
 Then run `git diff` and `git status --short`. Verify the diff now contains every new file by name; if a file the delegate's summary claims to have created is absent from the diff, stop and resolve that before dispatching any review.
 
-This rule applies to **every** review dispatch, not just the first: the fix-pass re-review in Step 5 below, any re-review after <Synthesize/>, and any scoped re-review. Fix passes create new files too.
+This rule applies to **every** review dispatch, not just the first: every <ClosureReview/> after a fix round too. Fix rounds create new files, and a closure review that never sees them reports the repair clean.
 
 **Never hand a reviewer a `git diff <ref>` command as the definition of the change** unless every new file is already tracked. If a review prompt names a diff command, the untracked sweep above must have run first — otherwise the reviewer silently reviews a subset and reports clean.
 
-**Step 2 — Compose the review prompt.** Write ${SESSION_DIR}/review_prompt.md using the **Write tool**:
+**Step 2 — Compose the review prompt.** Write ${SESSION_DIR}/review_prompt_${REVIEW_PASS}.md using the **Write tool**:
 
 ```
 You are reviewing a code change you did not write. You have the specification
@@ -1093,7 +1167,7 @@ If you find nothing, say so explicitly — do not invent findings.
 **BLINDNESS RULE:** the review prompt must NOT contain ${IMPL_SUMMARY} or any hint of what the implementer claims it did. Spec + diff only.
 
 **Step 3 — Launch the delegate review:**
-Run `bash ~/.claude/scripts/delegate/review.sh "${SESSION_DIR}" "${WORKING_DIR}" "${SESSION_DIR}/review_prompt.md" review "<responsibility>" "<current review activity>"` using Bash with `run_in_background: true` and `dangerouslyDisableSandbox: true` — `<responsibility>` starts with the same plan/phase line as the implementation dispatch, then 1-2 lines naming what is under review (e.g. `tool-graph.md — phase: 3` newline `Blind review of the diff against its Work Order; no implementer summary provided`). `<current review activity>` starts as a concise phrase such as `reviewing the retry recovery diff`; later progress reports replace it with the newest heartbeat activity. The launcher records the review pass and called agent identity automatically.
+Run `bash ~/.claude/scripts/delegate/review.sh "${SESSION_DIR}" "${WORKING_DIR}" "${SESSION_DIR}/review_prompt_${REVIEW_PASS}.md" review "<responsibility>" "<current review activity>" "${REVIEW_PASS}"` using Bash with `run_in_background: true` and `dangerouslyDisableSandbox: true` — `<responsibility>` starts with the same plan/phase line as the implementation dispatch, then 1-2 lines naming what is under review (e.g. `tool-graph.md — phase: 3` newline `Blind review of the diff against its Work Order; no implementer summary provided`). `<current review activity>` starts as a concise phrase such as `reviewing the retry recovery diff`; later progress reports replace it with the newest heartbeat activity. The launcher records the review pass and called agent identity automatically.
 
 Retain the returned handle and arm the two-minute progress monitor over
 `review_status` per **Progress narration while waiting**. The main agent performs
@@ -1129,9 +1203,12 @@ anything whose intended behavior remains unclear.
    reported; cancellation replaces the ordinary completion wait for this one
    review, never the same-turn wait requirement. Then run
    `python3 ~/.claude/scripts/delegate/progress_history.py finish-pass --session-dir "${SESSION_DIR}" --status canceled`; a forcibly canceled launcher cannot record its own ending.
-4. Increment `${FIX_PASS}`, compose a normal delegate fix prompt for the
-   confirmed defect (including any useful `${PARTIAL_AGENT_REVIEW}` evidence),
-   and dispatch it immediately using the auto-fix-pass rules in <Synthesize/>.
+4. Record the confirmed defect with `findings.py open`, run `findings.py
+   gate` and then `findings.py dispatch --covers <its id>`, compose a normal
+   delegate fix prompt for it (including any useful `${PARTIAL_AGENT_REVIEW}`
+   evidence), and dispatch it immediately using the auto fix round rules in
+   <Synthesize/>. Preempt at most once per phase: a second obsolete-review
+   cancellation means the broad review is never completing, so let it finish.
    Tell the user in one line that the blind review was canceled because the
    confirmed defect already requires this fix.
 5. After the fix returns, run a fresh <DualReview/> of the new diff. Do not
@@ -1141,7 +1218,79 @@ anything whose intended behavior remains unclear.
 **Step 5 — Collect:** when the background task notification arrives, read ${SESSION_DIR}/review_status:
 - **"reviewed":** Read ${SESSION_DIR}/review_findings.txt → ${AGENT_REVIEW}
 - **"error":** Read ${SESSION_DIR}/review_agent.log, tell the user the delegate review failed, and proceed on the main agent's review alone (say so explicitly).
+
+Both paths are the current pass's artifacts — `review.sh` writes
+`review_findings_${REVIEW_PASS}.txt` and `review_agent_${REVIEW_PASS}.log` and
+points the unnumbered names at them, so every earlier round stays readable.
 </DualReview>
+
+---
+
+<ClosureReview>
+**Replaces <DualReview/> Step 2's template whenever `${REVIEW_PASS} > 1`.**
+
+Run `python3 ~/.claude/scripts/delegate/findings.py status --session-dir
+"${SESSION_DIR}"` and build the prompt from it. Write
+${SESSION_DIR}/review_prompt_${REVIEW_PASS}.md:
+
+```
+You are checking one repair. A previous review of this change produced the
+findings listed below and a delegate has just repaired them. Your job is to
+decide whether each one is actually fixed and whether the repair broke
+anything adjacent. This is not a fresh audit of the whole change.
+
+You have read-only access to the codebase. Do not re-run the verification the
+implementer already ran.
+
+Narrate as you go: before each new activity, output one short present-tense
+line of plain text naming it. These lines stream to a liveness monitor.
+
+## Findings under repair
+
+[One block per open finding from `findings.py status`: its id, severity,
+file:line, and title. Verbatim — keep the ids.]
+
+## What the repair touched
+
+[The files the fix prompt named, plus any path that appeared in
+`git status --short` after the fix that was not in the pre-fix snapshot.]
+
+## Diff of the repair
+
+[git diff limited to the touched paths + contents of any new untracked file.]
+
+## Answer exactly two questions
+
+1. For EACH finding id above, is it actually fixed? Answer per id with one of:
+   FIXED, NOT FIXED, or UNCLEAR — and one sentence of evidence naming the
+   file and line you read.
+2. Does the repair break a caller, consumer, state transition, or invariant of
+   the symbols it changed? Name each one you checked and whether it holds.
+
+Then stop. Do NOT audit parts of the change outside the touched paths and do
+NOT report style, polish, or design observations about already-reviewed code.
+If you believe something outside the touched paths is now broken, you may
+report it only by quoting the specific hunk of THIS repair that breaks it and
+naming what it invalidates. A general concern without that hunk is not a
+finding here.
+```
+
+**The prompt carries no `## Review Questions` section and no Type Design
+Contract.** Those belong to the broad review; repeating them is what turns a
+closure check back into a full audit.
+
+**Record the verdicts.** For each id the closure review answered, and only after
+the main agent's own pass agrees:
+
+- FIXED, confirmed → `findings.py verdict --id <id> --state accepted`
+- NOT FIXED or UNCLEAR → `findings.py verdict --id <id> --state still_open`
+- An accepted finding the reviewer invalidated with a quoted hunk →
+  `findings.py verdict --id <id> --state reopened --evidence "<the hunk and
+  the dependency it invalidates>"`
+
+New problems the repair introduced are new findings: `findings.py open`. Then
+continue to <Synthesize/>, which gates the next round.
+</ClosureReview>
 
 ---
 
@@ -1239,10 +1388,27 @@ without asking:
    verification. If any of those must change, it remains a real decision and
    follows the normal blocking/deferral rules.
 
-   **Auto fix pass** — when every remaining confirmed issue has an unambiguous
-   correct fix (the spec answers it and the two reviews do not conflict on
-   intended behavior) and ${FIX_PASS} < 10: increment ${FIX_PASS}, write
-   ${SESSION_DIR}/fix_prompt_${FIX_PASS}.md (same structure as the work order,
+   **Record, then let the ledger decide.** `findings.py open` every remaining
+   confirmed issue (see <FindingsLedger/>) — one call per issue, with the
+   severity the merged reviews settled on. Then run
+   `python3 ~/.claude/scripts/delegate/findings.py gate --session-dir
+   "${SESSION_DIR}"` and follow its verdict. Do not decide this yourself, and
+   do not count rounds:
+
+   - `converged` — no gating finding is open. Report the non-gating leftovers
+     in one line for the retrospective and continue to
+     <RunApplicationSmokeTest/>.
+   - `dispatch` — run the **auto fix round** below over the whole `batch`.
+   - `stop` — go to **STOP** below and give the user `stop_reason` in plain
+     words.
+
+   **Auto fix round** — when `gate` said `dispatch` and every issue in the
+   batch has an unambiguous correct fix (the spec answers it and the two
+   reviews do not conflict on intended behavior): set ${FIX_ROUND} to the
+   gate's `round`, write
+   ${SESSION_DIR}/fix_prompt_${FIX_ROUND}.md covering **every** id in the
+   batch — a fix prompt that repairs a subset is rejected at `dispatch`, and
+   the batch is meant to be repaired together by root cause (same structure as the work order,
    spec = the confirmed issues table with file/line specifics, same no-commit
    rules, heartbeat instruction, the complete `## Type Design Contract` copied
    verbatim from `~/.claude/docs/type_design.md`, and style requirements;
@@ -1254,22 +1420,27 @@ without asking:
    trivial rename, or an equivalently behavior-preserving edit; `escalation`
    when review found incorrect behavior, numerical/transform math, unresolved
    architecture, or a prior fix failed; otherwise `implementation` — then run
-   `bash ~/.claude/scripts/delegate/implement.sh "${SESSION_DIR}" "${WORKING_DIR}" "${SESSION_DIR}/fix_prompt_${FIX_PASS}.md" "${FIX_TASK}" "<responsibility>" fix "<current fix activity>" "${FIX_PASS}"`
+   `python3 ~/.claude/scripts/delegate/findings.py dispatch --session-dir "${SESSION_DIR}" --covers "<every batch id, comma-separated>"` — this
+   records the round and refuses an incomplete batch, so run it before the
+   launcher, not after — then run
+   `bash ~/.claude/scripts/delegate/implement.sh "${SESSION_DIR}" "${WORKING_DIR}" "${SESSION_DIR}/fix_prompt_${FIX_ROUND}.md" "${FIX_TASK}" "<responsibility>" fix "<current fix activity>" "${FIX_ROUND}"`
    (background, unsandboxed) — `<responsibility>` starts with the plan/phase
-   line, then 1-2 lines naming the fix pass and the confirmed issues it
-   addresses (e.g. `tool-graph.md — phase: 3` newline `Fix pass 2 — restore
+   line, then 1-2 lines naming the fix round and the confirmed issues it
+   addresses (e.g. `tool-graph.md — phase: 3` newline `Fix round 2 — restore
    the error path dropped from the parser; both reviews flagged it`).
    `<current fix activity>` is a short phrase such as `restoring parser error
-   handling`; the launcher records `fix ${FIX_PASS}`, called agent identity,
+   handling`; the launcher records `fix ${FIX_ROUND}`, called agent identity,
    and the pass outcome automatically. Tell
    the user in one line what is being fixed, and arm the two-minute progress
    monitor over `impl_status` per **Progress narration while waiting**.
-   Re-execute <DualReview/> and <Synthesize/> scoped to the new changes.
+   Then re-execute <DualReview/> — which, at `${REVIEW_PASS} > 1`, is
+   <ClosureReview/> over this repair, not another audit of the phase — and
+   return here.
 
    **STOP** — when any remaining issue needs a design decision the plan does
    not answer *and that has at least two buildable answers*, when the two
-   reviews conflict on *intended behavior* (not just severity), or when
-   ${FIX_PASS} >= 10 with blockers remaining. Present the
+   reviews conflict on *intended behavior* (not just severity), or when `gate`
+   returned `stop`. Present the
    two-layer result above plus the choices — each option one sentence, no
    jargon, with a recommendation and the reason for it:
 
@@ -1283,12 +1454,14 @@ Your choice:
 3. Talk through any item first.
 ```
 
-   Do not surface internal bookkeeping (`fix pass 1 of 10 used`) as the headline;
-   if the cap is relevant, state it without jargon inside option 1. **Wait for
-   the user.**
+   Do not surface internal bookkeeping (finding ids, round numbers) as the
+   headline. When `gate` returned `stop`, option 1 must say in plain words what
+   stopped converging — that the same problem survived two repairs, that a fix
+   undid an earlier one, or that the list stopped shrinking. That is the whole
+   reason the user is being asked. **Wait for the user.**
 
-   - **1:** An explicit user choice overrides the cap — increment ${FIX_PASS}
-     and dispatch as in the auto fix pass above.
+   - **1:** An explicit user choice overrides the gate — dispatch as in the
+     auto fix round above, running `findings.py dispatch` first.
    - **2:** Continue to <RunApplicationSmokeTest/>.
    - **3:** Discuss; afterwards re-offer the options.
 
@@ -1492,7 +1665,7 @@ wait:
 1. Find the next `todo` phase in the plan. If none remains, run <FinalGate/>,
    then <RunSummary/>, and end. The final verbose phase already received
    <VerbosePostPhaseReport/>.
-2. Reset ${FIX_PASS} = 0, ${IMPLEMENTATION_TASK} = implementation, and
+2. Reset ${REVIEW_PASS} = 0, ${IMPLEMENTATION_TASK} = implementation, and
    ${APPLICATION_SMOKE_RESULT} = not_run.
 3. If MODE = loop, announce `Continuing to phase N — <title>.` and loop to
    <ComposeWorkOrder/> (STEP 2).
@@ -1526,9 +1699,10 @@ verification (Rust)**); this is the single full-breadth pass.
 3. Failures route like review findings: compose a fix prompt scoped to the
    failures. Before the first such dispatch, capture a new
    `${SESSION_DIR}/progress_baseline_status`, run `start-phase` with phase ID
-   `final` and title `Final verification`, and reset `${FIX_PASS}` to zero. Then
-   dispatch per the <Synthesize/> auto fix-pass rules and rerun this gate. The
-   fix-pass cap applies to this final-verification phase independently.
+   `final` and title `Final verification`, and reset `${REVIEW_PASS}` to zero.
+   `start-phase` resets the findings ledger with it. Then dispatch per the
+   <Synthesize/> auto fix round rules and rerun this gate. The convergence test
+   applies to this final-verification phase independently.
 4. Once the entire gate is green, if the synthetic `final` phase was started,
    record it with `finish-phase --status completed`. Its completion timestamp
    scores the progress estimates made during final-gate fixes.
@@ -1550,10 +1724,10 @@ blocking stop, or error.
 | Phase | Commit | Fix passes | Notes |
 | --- | --- | --- | --- |
 
-**Final gate:** [green / green after N fix passes / skipped — <reason>]
+**Final gate:** [green / green after N fix rounds / skipped — <reason>]
 **Deferred decisions still open:** [one line each, naming the phase that owns it — or "none"]
 **Why the run stopped:** [plan complete / user stopped before phase N / pending
-decision on phase N / fix-pass cap on phase N / delegate error]
+decision on phase N / phase N stopped converging: <reason> / delegate error]
 ```
 
 Same translation rules as <Synthesize/>: no reviewer vocabulary, no bare codes —
@@ -1562,7 +1736,7 @@ every line must stand on its own for a reader who has not seen the plan.
 After emitting the summary, record the durable run outcome:
 
 - plan complete → `python3 ~/.claude/scripts/delegate/progress_history.py finish-run --session-dir "${SESSION_DIR}" --status completed`
-- user stop, pending decision, or fix-pass cap → the same command with `--status stopped`
+- user stop, pending decision, or a `stop` gate verdict → the same command with `--status stopped`
 - delegate or environment error → the same command with `--status error`
 
 `finish-run` automatically closes an active pass/phase as incomplete, so
@@ -1603,8 +1777,12 @@ unrelated turns to continue a run that is over.
   <ExplainOnDemand/>: rebuild from the bottom, stay technical, put a short code
   example under every mechanism, and preserve the gate. Terseness is the default
   everywhere else; here it is the defect.
-- Max 10 delegate fix passes per phase before stopping for the user; an explicit user choice of another pass overrides the cap.
-- Auto/loop mode stops only for: an unresolved `**Pending decision:**` on the phase being dispatched, a fix that needs a design decision the plan does not answer, reviews conflicting on intended behavior, the fix-pass cap with blockers remaining, or a delegate/environment error. Everything else auto-routes or defers.
+- The fix loop is bounded by convergence, not a counter (<FindingsLedger/>).
+  `findings.py gate` decides `converged` / `dispatch` / `stop`; the main agent
+  never rules on it. One batch per round, blockers-only gating after round 1,
+  and a stop when a finding fails to close twice, reopens twice, or the gating
+  open count stops falling. An explicit user choice overrides a `stop`.
+- Auto/loop mode stops only for: an unresolved `**Pending decision:**` on the phase being dispatched, a fix that needs a design decision the plan does not answer, reviews conflicting on intended behavior, a `stop` verdict from `findings.py gate`, or a delegate/environment error. Everything else auto-routes or defers.
 - Verbose mode has all of those stops plus a mandatory <VerbosePrePhaseGate/>
   before every phase outside an active bounded-auto window, a
   <VerbosePostPhaseReport/> after every completed phase, and a separate
