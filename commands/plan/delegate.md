@@ -185,17 +185,36 @@ A delegate dispatch runs for many minutes. The user must not have to ask what is
 happening. Every dispatch — implementation, blind review, fix pass, escalation —
 narrates its progress to the user about every two minutes for as long as it runs.
 
+**Durable progress history.** Every main-agent implementation of this command —
+Claude or Codex — writes the same schema through
+`~/.claude/scripts/delegate/progress_history.py`. The durable store is
+`~/.local/state/plan-delegate/runs/<run-id>.jsonl`: one append-only event stream
+per delegation run, all under one aggregation root. `${SESSION_DIR}` retains
+only the live state cache. The recorder locks each session state transition and
+uses a file lock plus fsync for every event, so simultaneous agents cannot race
+the cache, interleave events, or lose rows.
+
+The event stream contains run, phase, pass, progress, and completion events.
+Every row carries the worktree name, branch, working directory, plan doc,
+phase identifier/title, project/phase/pass timestamps, pass kind and fix count,
+current activity, raw and reported percentages, unchanged-percentage duration,
+the suggested percentage, the decision source (`raw`, `calibrated`, or
+`override`), any override reason, the historical bias and resulting adjustment,
+and both agent identities. The recorder detects the main agent's family,
+session, model, and effort from the active Claude or Codex transcript. The
+launchers supply the called agent's resolved task, family, model, and effort from
+`config/agents.conf`; never infer either identity from defaults.
+
 **Capture the pre-dispatch worktree baseline once per phase.** Immediately before
 the phase's first implementation launcher, write `git status --short` from
 `${WORKING_DIR}` to `${SESSION_DIR}/progress_baseline_status`. This records the
 plan doc, handoff, or user-owned paths that were already dirty and prevents later
 progress reports from claiming them as delegate work. Keep that original phase
 baseline through reviews and fix passes; do not overwrite it after implementation
-starts. At the same time, clear any prior
-`${SESSION_DIR}/progress_last_percent` and
-`${SESSION_DIR}/progress_percent_started_at` state so unchanged-percentage timing
-starts fresh for the new phase. Do not reset the project timer created by
-<PrepareSession/>.
+starts. `progress_history.py start-phase` resets the phase clock and unchanged
+percentage state. The modified launchers start and finish the `impl`, `review`,
+`arch`, and `fix N` pass clocks; a canceled or completed pass never lends its
+elapsed time to the next pass.
 
 **Arm the monitor in the same turn as the dispatch**, immediately after the
 launcher returns its handle and before settling into the **Background wait
@@ -269,9 +288,9 @@ extrapolating from the last monitor event. Never infer unchanged work from a
 silent launcher terminal: launchers normally emit no stdout while the delegate
 runs.
 
-**When a monitor event lands, write one bold progress title, then one or two
-sentences of ordinary English** — what the delegate is doing right now, what has
-materially appeared in the worktree, and what remains. This is
+**When a monitor event lands, write the five-line progress header below, then one
+or two sentences of ordinary English** — what the delegate is doing right now,
+what has materially appeared in the worktree, and what remains. This is
 the same translation standard as <Synthesize/>: the reader has not seen the code,
 the plan, or the log. Turn `[agent] rerunning the mimesis test gate` into "still
 running the image-tool tests; the implementation is present and verification is
@@ -282,33 +301,66 @@ bare timestamp.
 If nothing has changed since the last narration, say that in one short sentence
 rather than repeating the previous wording verbatim.
 
-The bold line is mandatory for every scheduled update and every user-requested
-progress check. Use zero-padded `HH:MM:SS` durations, where `HH` is total elapsed
-hours and may exceed 23, and this exact format:
+The five bold lines are mandatory for every scheduled update and every
+user-requested progress check. Each line owns one kind of information, in this
+order:
 
 ```
-**<percent>% complete for phase <phase identifier> - duration <HH:MM:SS>**
+**<worktree-name> - <branch>**
+**Phase <phase identifier>: <phase title> - elapsed <phase-duration>**
+**<Impl|Review|Arch|Fix N> - <current activity> - elapsed <pass-duration>**
+**<percent>% complete**
+**Total elapsed <project-duration>**
 ```
 
-`duration` is the whole project's elapsed wall time: current time minus
-`${SESSION_DIR}/progress_project_started_at`. For phased plans that timestamp
-comes from the plan's memorialized `Project started` field and does not reset
-between phases, reviews, fix passes, or later delegation sessions. Persist the
-last reported percentage in `${SESSION_DIR}/progress_last_percent` and the epoch
-time it was first reported in
-`${SESSION_DIR}/progress_percent_started_at`. When the same percentage appears in
-more than one consecutive report, append the unchanged percentage and its elapsed
-duration:
+When the same percentage is reported consecutively, the fourth line becomes:
 
 ```
-**<percent>% complete for phase <phase identifier> - duration <HH:MM:SS> - reported <percent>% complete for duration <HH:MM:SS>**
+**<percent>% complete - unchanged for <duration>**
 ```
 
-On a percentage change, replace the stored percentage and reset its timer to the
-current report time; omit the appended clause from that report. The next report
-with the same percentage includes it. The bold line is the update's title and
-must come first. Current-status prose follows it in normal text and never
-duplicates its percentage or durations.
+For work without a phased plan, use `ad hoc` as the phase identifier and a short
+scope name as its title. Phase elapsed resets at the phase's first implementation
+dispatch. Pass elapsed resets at every called-agent dispatch. Total elapsed is
+current time minus the plan's memorialized `Project started` value and does not
+reset between phases, reviews, fixes, or later delegation sessions. Every
+duration is zero-padded `MM:SS` under one hour and `HH:MM:SS` at one hour or
+longer; total hours may exceed 23.
+
+Do not hand-format or independently time these lines. Immediately before each
+progress report:
+
+1. Derive `${RAW_PERCENT}` from the live work evidence and work list using the
+   estimation rules below.
+2. Run:
+   `python3 ~/.claude/scripts/delegate/progress_history.py calibrate --session-dir "${SESSION_DIR}" --candidate-percent "${RAW_PERCENT}"`
+3. Read its JSON. When `apply_suggestion` is true, use `suggested_percent` as
+   `${REPORTED_PERCENT}` unless countable current evidence proves that value
+   wrong. With fewer than `minimum_samples`, keep
+   `${REPORTED_PERCENT} = ${RAW_PERCENT}`. The recorder derives the decision
+   source: `raw` when no suggestion applies, `calibrated` when the suggestion is
+   used, and `override` for any other reported value.
+4. Run:
+   `python3 ~/.claude/scripts/delegate/progress_history.py progress --session-dir "${SESSION_DIR}" --raw-percent "${RAW_PERCENT}" --percent "${REPORTED_PERCENT}" --activity "<current activity>" [--override-reason "<specific current evidence>"]`
+   Include `--override-reason` exactly when rejecting the applicable raw or
+   calibrated value. State the countable worktree, heartbeat, or verification
+   evidence that justified the choice; generic disagreement is not a reason.
+   The script rejects a missing reason and also rejects a reason when no
+   override occurred.
+5. Copy the script's five Markdown lines exactly, then add the status prose.
+
+`calibrate` uses completed phases only. It compares the report timestamp with
+the phase's actual finish time, measures how long that percentage remained
+unchanged, and computes raw-vs-reported temporal bias. It prefers matching main
+and called model/effort plus pass kind when at least five comparable percentage
+streaks for the raw estimate exist, then falls back through called-agent/pass,
+pass-only, and global evidence. `aggregate [--percent N]` groups on the raw
+estimate and emits the underlying statistics, including median and tail
+unchanged durations, remaining time, percentage bias, and raw-versus-calibrated
+absolute error. It separately reports suggested-versus-reported accuracy and
+decision-source counts, so overrides can be evaluated instead of silently
+folded into the calibration result. This is advisory calibration, not a
+replacement for current worktree and verification evidence.
 
 **Estimating percent complete.** The main agent wrote the prompt, so it knows the
 whole work list: the number of issues or files to change, and the exact
@@ -331,8 +383,8 @@ elapsed time.
 
 Give one number, round it hard (10%, 25%, 50%, 80%), and never present it as
 precise. If the delegate is doing something the work list did not anticipate,
-say the estimate is uncertain and why in the prose after the required bold
-line. Never omit the line because the estimate is uncertain. An unexplained
+say the estimate is uncertain and why in the prose after the required header.
+Never omit the header because the estimate is uncertain. An unexplained
 percentage that stalls or moves backwards is worse than an explicitly qualified
 estimate.
 
@@ -586,9 +638,10 @@ reviews, fix passes, or phase review):
 **STEP 8:** Execute <RunApplicationSmokeTest/>
 **STEP 9:** Execute <RunPhaseReview/> (required for phased plans; pass `auto` in either multi-phase mode)
 **STEP 10:** Execute <CheckpointCommit/> (loop and verbose modes only)
-**STEP 11:** In verbose mode execute <VerbosePostPhaseReport/>
-**STEP 12:** In verbose mode execute <VerbosePostPhaseGate/> when applicable
-**STEP 13:** Execute <NextPhase/> (loop and verbose modes only) — auto-continues,
+**STEP 11:** Execute <RecordPhaseCompletion/>
+**STEP 12:** In verbose mode execute <VerbosePostPhaseReport/>
+**STEP 13:** In verbose mode execute <VerbosePostPhaseGate/> when applicable
+**STEP 14:** Execute <NextPhase/> (loop and verbose modes only) — auto-continues,
 returns to STEP 2 for the next pre-phase gate, or ends with <RunSummary/>
 </ExecutionSteps>
 
@@ -653,6 +706,18 @@ threshold (see **Context and compaction**). <RunSummary/> clears it.
     session-start timestamp from <PrepareSession/> and still write its ISO-8601
     value into the plan so the failed lookup is never repeated. A malformed
     existing field is an error; do not silently replace it.
+
+1b. **Initialize durable progress history once.** After 1a has resolved the
+    project timestamp, run:
+
+    `python3 ~/.claude/scripts/delegate/progress_history.py start-run --session-dir "${SESSION_DIR}" --working-dir "${WORKING_DIR}" --project-started-at "$(cat "${SESSION_DIR}/progress_project_started_at")" [--plan-doc "<plan-doc>"]`
+
+    Include `--plan-doc` only when one exists. The recorder captures the
+    working-directory basename, branch, run id, and the active main agent's
+    family/session/model/effort. It is idempotent when later phases return to
+    <ComposeWorkOrder/> with the same `${SESSION_DIR}`. The recorder fails when
+    identity detection cannot find an exact model/effort; STOP instead of
+    supplying guessed values.
 
 2. If a doc path was given, Read it. Decide whether it is a **delegate-ready plan** (per `~/.claude/docs/delegate_plan_format.md`): it has a `## Delegation Context` section **and** the target phase has a `#### Work Order`. Branch:
 
@@ -926,15 +991,20 @@ delegate family with `/agent`.
 1. Before the phase's first implementation launcher, run `git status --short`
    in `${WORKING_DIR}` and write its output to
    `${SESSION_DIR}/progress_baseline_status`. Do this exactly once for the phase;
-   fix passes keep the original baseline.
-2. Run `bash ~/.claude/scripts/delegate/implement.sh "${SESSION_DIR}" "${WORKING_DIR}" "${SESSION_DIR}/implementation_prompt.md" "${IMPLEMENTATION_TASK}" "<responsibility>"` using Bash with `run_in_background: true` and `dangerouslyDisableSandbox: true` — `<responsibility>` starts with the plan/phase line (`<plan-doc filename> — phase: <identifier>`, or `adhoc — <scope>` without a plan doc), then 1-2 lines naming what this run implements (the Work Order's goal in a few words)
-3. Inform the user: "The delegate agent is implementing... (heartbeat: ${SESSION_DIR}/heartbeat.log)"
-4. Arm the two-minute progress monitor over `impl_status` per **Progress
+   fix passes keep the original baseline. Then run
+   `python3 ~/.claude/scripts/delegate/progress_history.py start-phase --session-dir "${SESSION_DIR}" --phase-id "<identifier>" --phase-title "<title>"`.
+   Use `ad hoc` plus a short scope title when there is no phased plan. This call
+   is idempotent for the already-active phase.
+2. Set `${PASS_KIND}` to `arch` when
+   `${IMPLEMENTATION_TASK} = escalation`, otherwise `impl`.
+3. Run `bash ~/.claude/scripts/delegate/implement.sh "${SESSION_DIR}" "${WORKING_DIR}" "${SESSION_DIR}/implementation_prompt.md" "${IMPLEMENTATION_TASK}" "<responsibility>" "${PASS_KIND}" "<current pass activity>"` using Bash with `run_in_background: true` and `dangerouslyDisableSandbox: true` — `<responsibility>` starts with the plan/phase line (`<plan-doc filename> — phase: <identifier>`, or `adhoc — <scope>` without a plan doc), then 1-2 lines naming what this run implements (the Work Order's goal in a few words). `<current pass activity>` is a short present-participle description suitable for the header, e.g. `implementing retry recovery`. The launcher records the pass start, called agent identity, and completion/error automatically.
+4. Inform the user: "The delegate agent is implementing... (heartbeat: ${SESSION_DIR}/heartbeat.log)"
+5. Arm the two-minute progress monitor over `impl_status` per **Progress
    narration while waiting**, in this same turn.
-5. Apply the **Background wait invariant**: keep this turn visibly attached to
+6. Apply the **Background wait invariant**: keep this turn visibly attached to
    the returned handle and wait for the background task notification. Do NOT
    poll status files or end the turn.
-6. When it arrives, read ${SESSION_DIR}/impl_status:
+7. When it arrives, read ${SESSION_DIR}/impl_status:
    - **"implemented":** Read ${SESSION_DIR}/impl_summary.txt → ${IMPL_SUMMARY}. Continue.
    - **"error":** Read ${SESSION_DIR}/impl_agent.log, show the user the error, stop.
 </LaunchImplementation>
@@ -1016,7 +1086,7 @@ If you find nothing, say so explicitly — do not invent findings.
 **BLINDNESS RULE:** the review prompt must NOT contain ${IMPL_SUMMARY} or any hint of what the implementer claims it did. Spec + diff only.
 
 **Step 3 — Launch the delegate review:**
-Run `bash ~/.claude/scripts/delegate/review.sh "${SESSION_DIR}" "${WORKING_DIR}" "${SESSION_DIR}/review_prompt.md" review "<responsibility>"` using Bash with `run_in_background: true` and `dangerouslyDisableSandbox: true` — `<responsibility>` starts with the same plan/phase line as the implementation dispatch, then 1-2 lines naming what is under review (e.g. `tool-graph.md — phase: 3` newline `Blind review of the diff against its Work Order; no implementer summary provided`).
+Run `bash ~/.claude/scripts/delegate/review.sh "${SESSION_DIR}" "${WORKING_DIR}" "${SESSION_DIR}/review_prompt.md" review "<responsibility>" "<current review activity>"` using Bash with `run_in_background: true` and `dangerouslyDisableSandbox: true` — `<responsibility>` starts with the same plan/phase line as the implementation dispatch, then 1-2 lines naming what is under review (e.g. `tool-graph.md — phase: 3` newline `Blind review of the diff against its Work Order; no implementer summary provided`). `<current review activity>` starts as a concise phrase such as `reviewing the retry recovery diff`; later progress reports replace it with the newest heartbeat activity. The launcher records the review pass and called agent identity automatically.
 
 Retain the returned handle and arm the two-minute progress monitor over
 `review_status` per **Progress narration while waiting**. The main agent performs
@@ -1050,7 +1120,8 @@ anything whose intended behavior remains unclear.
 3. Cancel the blind-review handle with the environment's background-task
    cancellation mechanism. Stay attached until cancellation completion is
    reported; cancellation replaces the ordinary completion wait for this one
-   review, never the same-turn wait requirement.
+   review, never the same-turn wait requirement. Then run
+   `python3 ~/.claude/scripts/delegate/progress_history.py finish-pass --session-dir "${SESSION_DIR}" --status canceled`; a forcibly canceled launcher cannot record its own ending.
 4. Increment `${FIX_PASS}`, compose a normal delegate fix prompt for the
    confirmed defect (including any useful `${PARTIAL_AGENT_REVIEW}` evidence),
    and dispatch it immediately using the auto-fix-pass rules in <Synthesize/>.
@@ -1176,11 +1247,14 @@ without asking:
    trivial rename, or an equivalently behavior-preserving edit; `escalation`
    when review found incorrect behavior, numerical/transform math, unresolved
    architecture, or a prior fix failed; otherwise `implementation` — then run
-   `bash ~/.claude/scripts/delegate/implement.sh "${SESSION_DIR}" "${WORKING_DIR}" "${SESSION_DIR}/fix_prompt_${FIX_PASS}.md" "${FIX_TASK}" "<responsibility>"`
+   `bash ~/.claude/scripts/delegate/implement.sh "${SESSION_DIR}" "${WORKING_DIR}" "${SESSION_DIR}/fix_prompt_${FIX_PASS}.md" "${FIX_TASK}" "<responsibility>" fix "<current fix activity>" "${FIX_PASS}"`
    (background, unsandboxed) — `<responsibility>` starts with the plan/phase
    line, then 1-2 lines naming the fix pass and the confirmed issues it
    addresses (e.g. `tool-graph.md — phase: 3` newline `Fix pass 2 — restore
-   the error path dropped from the parser; both reviews flagged it`). Tell
+   the error path dropped from the parser; both reviews flagged it`).
+   `<current fix activity>` is a short phrase such as `restoring parser error
+   handling`; the launcher records `fix ${FIX_PASS}`, called agent identity,
+   and the pass outcome automatically. Tell
    the user in one line what is being fixed, and arm the two-minute progress
    monitor over `impl_status` per **Progress narration while waiting**.
    Re-execute <DualReview/> and <Synthesize/> scoped to the new changes.
@@ -1269,14 +1343,14 @@ fatal error, or immediate shutdown.
 
 Tell the user in one line: `Phased plan — running /plan:phase_review to update <plan doc> (retrospective + remaining-phase re-evaluation).` Then invoke the `plan:phase_review` skill immediately — **in loop or verbose mode pass `auto`**, so user decisions are deferred into the affected Work Orders as `**Pending decision:**` blocks instead of asked inline; either multi-phase mode stops for them at that phase's pre-dispatch check. When writing the retrospective, include relevant facts from ${AGENT_REVIEW} and the fix passes (e.g. what the blind reviewer caught, what deviated from spec).
 
-If the work was not from a phased plan, skip this step silently and end.
+If the work was not from a phased plan, skip this step silently and continue to
+<RecordPhaseCompletion/>.
 </RunPhaseReview>
 
 ---
 
 <CheckpointCommit>
-**Loop and verbose modes only** — `single` runs end after <RunPhaseReview/>
-without committing.
+**Loop and verbose modes only** — `single` skips this step without committing.
 
 1. Confirm ${APPLICATION_SMOKE_RESULT} records a passing live application run
    that exercised the current phase's changed runtime path. If it is `not_run`,
@@ -1305,6 +1379,23 @@ without committing.
 
 Never push. Never commit anything outside this step.
 </CheckpointCommit>
+
+---
+
+<RecordPhaseCompletion>
+After the smoke test, phase review when applicable, and checkpoint when
+applicable have all succeeded, run:
+
+`python3 ~/.claude/scripts/delegate/progress_history.py finish-phase --session-dir "${SESSION_DIR}" --status completed`
+
+This finish timestamp is the outcome used to score every earlier percentage in
+the phase. Never record `completed` before all required phase gates pass.
+
+In `single` mode, then run
+`python3 ~/.claude/scripts/delegate/progress_history.py finish-run --session-dir "${SESSION_DIR}" --status completed`, run
+`bash ~/.claude/scripts/delegate/end_session.sh`, and end. Loop and verbose modes
+continue to their normal report/gate/next-phase path.
+</RecordPhaseCompletion>
 
 ---
 
@@ -1426,9 +1517,15 @@ verification (Rust)**); this is the single full-breadth pass.
    the **Background wait invariant**.
 2. Rust plans: run the `clippy` skill with `auto-proceed` (main agent, inline).
 3. Failures route like review findings: compose a fix prompt scoped to the
-   failures, dispatch per the <Synthesize/> auto fix pass against the last
-   phase, then rerun this gate. The fix-pass cap applies.
-4. Record the outcome for <RunSummary/>'s **Final gate** line.
+   failures. Before the first such dispatch, capture a new
+   `${SESSION_DIR}/progress_baseline_status`, run `start-phase` with phase ID
+   `final` and title `Final verification`, and reset `${FIX_PASS}` to zero. Then
+   dispatch per the <Synthesize/> auto fix-pass rules and rerun this gate. The
+   fix-pass cap applies to this final-verification phase independently.
+4. Once the entire gate is green, if the synthetic `final` phase was started,
+   record it with `finish-phase --status completed`. Its completion timestamp
+   scores the progress estimates made during final-gate fixes.
+5. Record the outcome for <RunSummary/>'s **Final gate** line.
 
 Single mode and non-plan-complete endings (user stop, blocking stop, error)
 skip this gate — say so in the summary; the tree may not be workspace-clean.
@@ -1455,7 +1552,15 @@ decision on phase N / fix-pass cap on phase N / delegate error]
 Same translation rules as <Synthesize/>: no reviewer vocabulary, no bare codes —
 every line must stand on its own for a reader who has not seen the plan.
 
-After emitting the summary, run `bash ~/.claude/scripts/delegate/end_session.sh`
+After emitting the summary, record the durable run outcome:
+
+- plan complete → `python3 ~/.claude/scripts/delegate/progress_history.py finish-run --session-dir "${SESSION_DIR}" --status completed`
+- user stop, pending decision, or fix-pass cap → the same command with `--status stopped`
+- delegate or environment error → the same command with `--status error`
+
+`finish-run` automatically closes an active pass/phase as incomplete, so
+partial runs remain measurable without being included in completed-phase
+calibration. Then run `bash ~/.claude/scripts/delegate/end_session.sh`
 to clear the run-active marker. This is mandatory on every ending, including the
 ones that stop early — leaving it set keeps the Stop hook pushing later,
 unrelated turns to continue a run that is over.
@@ -1476,12 +1581,14 @@ unrelated turns to continue a run that is over.
   then run a fresh dual review of the repaired diff.
 - `${SESSION_DIR}/heartbeat.log` is for on-demand status only (see **Delegate heartbeat**): a single read when the user asks what is happening, once after compaction, or one staleness check on an overdue delegate — never a wait loop, never a completion signal.
 - The delegate reviewer is always a fresh session and always blind to the implementer's summary.
-- Delegate launchers record task, family, agent, and effort in the session directory. Never rely on an empty effort silently becoming `xhigh`.
+- Delegate launchers record task, family, model, effort, pass timing, and pass
+  outcome in both the session directory and durable progress history. Never
+  rely on an empty effort silently becoming `xhigh`.
 - Select `escalation` from the actual Work Order or review outcome, never keyword matching.
 - The main agent orchestrates and reviews; the delegate agent codes. The main agent touches implementation code only on explicit user instruction — except post-review doc-only or trivial fixes that both reviews agree on (see the direct-fix exception in <Synthesize>), which the main agent applies itself and reports.
 - Every delegate dispatch arms a two-minute progress monitor and narrates what
-  the delegate is doing with the mandatory bold phase-percentage/project-duration
-  title first, followed by the ordinary-English current status defined under
+  the delegate is doing with the mandatory five-line worktree/phase/pass/
+  percentage/total header first, followed by the ordinary-English current status defined under
   **Progress narration while waiting**, until it finishes
   (**Progress narration while waiting**). Other user work takes precedence over
   the narration; the narration never replaces the completion notification.
@@ -1502,3 +1609,6 @@ unrelated turns to continue a run that is over.
   checkpoint, or completion reporting. The main agent must run the actual
   product and exercise the phase's changed runtime path; builds, automated
   tests, and an untested startup screen do not satisfy this gate.
+- Every workflow exit records `finish-run` before `end_session.sh`; completed
+  phases feed calibration, while stopped/error phases remain audit evidence but
+  never train percentage suggestions.

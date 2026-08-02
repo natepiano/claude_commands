@@ -1,9 +1,13 @@
 #!/usr/bin/env bash
 # implement.sh — Invoke the configured delegate agent to implement code changes.
 #
-# Usage: implement.sh <session_dir> [working_dir] [prompt_file] [task] [role_description]
+# Usage: implement.sh <session_dir> [working_dir] [prompt_file] [task]
+#                     [role_description] [pass_kind] [pass_activity] [fix_pass]
 #   role_description — 1-2 lines describing this dispatch's responsibility,
 #   written as a header block into the shared heartbeat log
+#   pass_kind — impl, arch, or fix; enables durable progress recording
+#   pass_activity — short user-facing description for the progress header
+#   fix_pass — required pass count when pass_kind is fix
 #
 # Produces:
 #   <session_dir>/impl_status       — "implementing" while running, "implemented" on success, "error" on failure
@@ -24,6 +28,9 @@ WORKING_DIR="${2:-$(pwd)}"
 PROMPT_FILE="${3:-${SESSION_DIR}/implementation_prompt.md}"
 SUBTASK="${4:-implementation}"
 ROLE_DESC="${5:-work order at ${PROMPT_FILE}}"
+PASS_KIND="${6:-}"
+PASS_ACTIVITY="${7:-${ROLE_DESC%%$'\n'*}}"
+FIX_PASS="${8:-0}"
 TASK="delegate.${SUBTASK}"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -33,6 +40,8 @@ LOG_FILE="${SESSION_DIR}/impl_agent.log"
 AGENT_FILE="${SESSION_DIR}/impl_agent"
 HEARTBEAT_HELPER="${SCRIPT_DIR}/../agents/heartbeat.sh"
 HEARTBEAT_FILE="${SESSION_DIR}/heartbeat.log"
+PROGRESS_HELPER="${SCRIPT_DIR}/progress_history.py"
+PROGRESS_STATE="${SESSION_DIR}/progress_history_state.json"
 HEARTBEAT_INTERVAL_SECS=60
 
 echo "implementing" > "${STATUS_FILE}"
@@ -45,6 +54,22 @@ fi
 
 printf 'task=%s\nfamily=%s\nagent=%s\neffort=%s\n' \
   "${TASK}" "${AGENT_FAMILY}" "${AGENT_MODEL}" "${AGENT_EFFORT}" > "${AGENT_FILE}"
+
+if [[ -n "${PASS_KIND}" && -f "${PROGRESS_STATE}" ]]; then
+  if ! python3 "${PROGRESS_HELPER}" start-pass \
+    --session-dir "${SESSION_DIR}" \
+    --pass-kind "${PASS_KIND}" \
+    --fix-pass "${FIX_PASS}" \
+    --activity "${PASS_ACTIVITY}" \
+    --called-task "${TASK}" \
+    --called-family "${AGENT_FAMILY}" \
+    --called-model "${AGENT_MODEL}" \
+    --called-effort "${AGENT_EFFORT:-unset}"; then
+    echo "ERROR: unable to record the ${PASS_KIND} pass start." >&2
+    echo "error" > "${STATUS_FILE}"
+    exit 1
+  fi
+fi
 
 bash "${HEARTBEAT_HELPER}" "${HEARTBEAT_FILE}" header "${SUBTASK} (${AGENT_FAMILY}/${AGENT_MODEL}:${AGENT_EFFORT:-unset})" "${ROLE_DESC}" || true
 
@@ -66,10 +91,23 @@ kill "${HEARTBEAT_LOOP_PID}" 2>/dev/null || true
 wait "${HEARTBEAT_LOOP_PID}" 2>/dev/null || true
 
 if [[ "${AGENT_CODE}" -eq 0 ]]; then
-  bash "${HEARTBEAT_HELPER}" "${HEARTBEAT_FILE}" wrapper "${SUBTASK} agent finished" || true
   echo "implemented" > "${STATUS_FILE}"
+  if [[ -n "${PASS_KIND}" && -f "${PROGRESS_STATE}" ]]; then
+    if ! python3 "${PROGRESS_HELPER}" finish-pass \
+      --session-dir "${SESSION_DIR}" --status completed; then
+      echo "ERROR: unable to record the ${PASS_KIND} pass completion." >&2
+      echo "error" > "${STATUS_FILE}"
+      exit 1
+    fi
+  fi
+  bash "${HEARTBEAT_HELPER}" "${HEARTBEAT_FILE}" wrapper "${SUBTASK} agent finished" || true
 else
-  bash "${HEARTBEAT_HELPER}" "${HEARTBEAT_FILE}" wrapper "${SUBTASK} agent exited with code ${AGENT_CODE}" || true
   echo "error" > "${STATUS_FILE}"
+  if [[ -n "${PASS_KIND}" && -f "${PROGRESS_STATE}" ]]; then
+    python3 "${PROGRESS_HELPER}" finish-pass \
+      --session-dir "${SESSION_DIR}" --status error \
+      || echo "ERROR: unable to record the ${PASS_KIND} pass error." >&2
+  fi
+  bash "${HEARTBEAT_HELPER}" "${HEARTBEAT_FILE}" wrapper "${SUBTASK} agent exited with code ${AGENT_CODE}" || true
   exit "${AGENT_CODE}"
 fi
