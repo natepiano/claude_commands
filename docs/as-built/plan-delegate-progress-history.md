@@ -24,12 +24,12 @@ Schema version 1 records these event types:
 Every event repeats its query dimensions: run and phase identity, worktree,
 branch, working directory, plan doc, project/phase/pass timestamps, current pass
 kind and fix count, main-agent identity, and called-agent identity. Progress
-events add the current activity, raw percentage, calibrated/reported percentage,
-suggested percentage, decision source, override reason, unchanged-percentage
-duration, each elapsed clock, and the calibration evidence used for that report.
-The decision row also repeats the historical bias, suggested adjustment, and
-chosen adjustment so downstream analysis does not need to unpack the calibration
-snapshot.
+events add the current activity, separate project and phase percentages, each
+assessment's unchanged duration, the phase's raw, suggested, and reported
+percentages, decision source, override reason, each elapsed clock, and the
+calibration evidence used for that report. The phase decision also repeats the
+historical bias, suggested adjustment, and chosen adjustment so downstream
+analysis does not need to unpack the calibration snapshot.
 
 The main agent's exact family, session id, model, and effort come from the
 active Claude or Codex transcript. `implement.sh` and `review.sh` provide the
@@ -86,13 +86,14 @@ progress_history.py start-phase ...
 progress_history.py start-pass ...
 progress_history.py finish-pass ...
 progress_history.py calibrate --session-dir <dir> --candidate-percent <N>
-progress_history.py progress --session-dir <dir> --raw-percent <N> --percent <N> --activity <text> [--override-reason <evidence>]
+progress_history.py progress --session-dir <dir> --project-raw-percent <N> --project-percent <N> --phase-raw-percent <N> --phase-percent <N> --activity <text> [--phase-override-reason <evidence>]
 progress_history.py finish-phase ...
 progress_history.py finish-run ...
 progress_history.py aggregate [--percent <N>]
 ```
 
-`progress` writes the event and prints the exact five-line Markdown header used
-by `/plan:delegate`. `aggregate` groups by raw percentage and pass kind, reads
-every durable run, and emits raw/suggested/reported error plus decision-source
-counts as JSON suitable for further analysis.
+`progress` writes the event and prints the project section, one blank line, then
+the phase/pass section used by `/plan:delegate`. Project and phase percentages
+have independent unchanged timers. `aggregate` calibrates phase estimates by
+raw percentage and pass kind and emits raw/suggested/reported error plus
+decision-source counts as JSON suitable for further analysis.

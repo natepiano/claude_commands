@@ -381,6 +381,10 @@ def _start_run(args: argparse.Namespace) -> None:
         "main_agent": main_agent,
         "phase": None,
         "pass": None,
+        "project_last_percent": None,
+        "project_percent_started_at": None,
+        "phase_last_percent": None,
+        "phase_percent_started_at": None,
         "last_percent": None,
         "percent_started_at": None,
         "pending_calibration": None,
@@ -411,6 +415,8 @@ def _start_phase(args: argparse.Namespace) -> None:
     }
     state["phase"] = phase
     state["pass"] = None
+    state["phase_last_percent"] = None
+    state["phase_percent_started_at"] = None
     state["last_percent"] = None
     state["percent_started_at"] = None
     state["pending_calibration"] = None
@@ -733,9 +739,16 @@ def _matching_scope(
 
 
 def _current_hold_seconds(state: dict[str, object], candidate_percent: int, now: float) -> int:
-    if _integer(state.get("last_percent"), -1) != candidate_percent:
+    last_percent = _integer(
+        state.get("phase_last_percent"),
+        _integer(state.get("last_percent"), -1),
+    )
+    if last_percent != candidate_percent:
         return 0
-    started_at = _number(state.get("percent_started_at"), now)
+    started_at = _number(
+        state.get("phase_percent_started_at"),
+        _number(state.get("percent_started_at"), now),
+    )
     return max(0, int(now - started_at))
 
 
@@ -795,12 +808,15 @@ def _pass_display(current_pass: dict[str, object]) -> str:
 
 
 def _progress_decision(
-    state: dict[str, object],
+    calibration: dict[str, object] | None,
     raw_percent: int,
     reported_percent: int,
     override_reason: str,
+    scope: str,
 ) -> dict[str, object]:
-    calibration = _object_dict(state.get("pending_calibration"))
+    reason_option = (
+        "--override-reason" if scope == "legacy" else f"--{scope}-override-reason"
+    )
     if calibration is None:
         suggested_percent = raw_percent
         apply_suggestion = False
@@ -809,7 +825,7 @@ def _progress_decision(
         candidate_percent = _integer(calibration.get("candidate_percent"), raw_percent)
         if candidate_percent != raw_percent:
             raise SystemExit(
-                "The pending calibration candidate does not match --raw-percent; "
+                f"The pending {scope} calibration candidate does not match its raw percent; "
                 + "run calibrate again"
             )
         suggested_percent = _integer(calibration.get("suggested_percent"), raw_percent)
@@ -829,11 +845,11 @@ def _progress_decision(
     cleaned_reason = override_reason.strip()
     if decision_source == "override" and not cleaned_reason:
         raise SystemExit(
-            "--override-reason is required when the reported percentage differs "
+            f"{reason_option} is required when the reported percentage differs "
             + "from the applicable raw or calibrated value"
         )
     if decision_source != "override" and cleaned_reason:
-        raise SystemExit("--override-reason is valid only for an override decision")
+        raise SystemExit(f"{reason_option} is valid only for an override decision")
 
     return {
         "decision_source": decision_source,
@@ -843,6 +859,33 @@ def _progress_decision(
         "suggested_adjustment_percentage_points": suggested_percent - raw_percent,
         "reported_adjustment_percentage_points": reported_percent - raw_percent,
     }
+
+
+def _assessment_timing(
+    state: dict[str, object],
+    scope: str,
+    percent: int,
+    now: float,
+) -> tuple[float, int]:
+    last_key = f"{scope}_last_percent"
+    started_key = f"{scope}_percent_started_at"
+    if _integer(state.get(last_key), -1) == percent:
+        started_at = _number(state.get(started_key), now)
+        return started_at, max(0, int(now - started_at))
+    state[last_key] = percent
+    state[started_key] = now
+    return now, 0
+
+
+def _prefixed_decision(scope: str, decision: dict[str, object]) -> dict[str, object]:
+    return {f"{scope}_{key}": value for key, value in decision.items()}
+
+
+def _assessment_line(percent: int, elapsed: int, unchanged: int) -> str:
+    line = f"**{percent}% complete - elapsed {_format_duration(elapsed)}"
+    if unchanged > 0:
+        line += f" - unchanged {_format_duration(unchanged)}"
+    return line + "**"
 
 
 def _progress(args: argparse.Namespace) -> None:
@@ -858,28 +901,85 @@ def _progress(args: argparse.Namespace) -> None:
         or _string(current_pass.get("status")) != "active"
     ):
         raise SystemExit("An active phase and pass are required before reporting progress")
-    raw_percent = _arg_integer(args, "raw_percent")
-    percent = _arg_integer(args, "percent")
-    if not 0 <= raw_percent <= 100 or not 0 <= percent <= 100:
-        raise SystemExit("Percent values must be between 0 and 100")
-    decision = _progress_decision(
-        state,
-        raw_percent,
-        percent,
-        _arg_string(args, "override_reason"),
+    legacy_raw_percent = _arg_integer(args, "raw_percent", -1)
+    legacy_percent = _arg_integer(args, "percent", -1)
+    project_raw_percent = _arg_integer(args, "project_raw_percent", -1)
+    project_percent = _arg_integer(args, "project_percent", -1)
+    phase_raw_percent = _arg_integer(args, "phase_raw_percent", -1)
+    phase_percent = _arg_integer(args, "phase_percent", -1)
+    uses_dual_layout = any(
+        value >= 0
+        for value in (
+            project_raw_percent,
+            project_percent,
+            phase_raw_percent,
+            phase_percent,
+        )
     )
+    if uses_dual_layout:
+        if legacy_raw_percent >= 0 or legacy_percent >= 0:
+            raise SystemExit("Do not combine legacy and project/phase percent options")
+        if not all(
+            0 <= value <= 100
+            for value in (
+                project_raw_percent,
+                project_percent,
+                phase_raw_percent,
+                phase_percent,
+            )
+        ):
+            raise SystemExit("All project and phase percent values are required")
+    else:
+        if not 0 <= legacy_raw_percent <= 100 or not 0 <= legacy_percent <= 100:
+            raise SystemExit("--raw-percent and --percent are required for legacy calls")
+        phase_raw_percent = legacy_raw_percent
+        phase_percent = legacy_percent
+
+    if not 0 <= phase_raw_percent <= 100 or not 0 <= phase_percent <= 100:
+        raise SystemExit("Percent values must be between 0 and 100")
+    phase_calibration = _object_dict(state.get("pending_calibration"))
+    phase_override_reason = (
+        _arg_string(args, "phase_override_reason")
+        if uses_dual_layout
+        else _arg_string(args, "override_reason")
+    )
+    phase_decision = _progress_decision(
+        phase_calibration,
+        phase_raw_percent,
+        phase_percent,
+        phase_override_reason,
+        "phase" if uses_dual_layout else "legacy",
+    )
+    project_decision: dict[str, object] | None = None
+    if uses_dual_layout:
+        project_decision = _progress_decision(
+            None,
+            project_raw_percent,
+            project_percent,
+            _arg_string(args, "project_override_reason"),
+            "project",
+        )
     activity = _arg_string(args, "activity")
     if activity:
         current_pass["activity"] = activity
 
-    if _integer(state.get("last_percent"), -1) == percent:
-        percent_started_at = _number(state.get("percent_started_at"), now)
-        unchanged_seconds = max(0, int(now - percent_started_at))
-    else:
-        percent_started_at = now
-        unchanged_seconds = 0
-        state["last_percent"] = percent
-        state["percent_started_at"] = now
+    phase_percent_started_at, phase_unchanged_seconds = _assessment_timing(
+        state,
+        "phase",
+        phase_percent,
+        now,
+    )
+    state["last_percent"] = phase_percent
+    state["percent_started_at"] = phase_percent_started_at
+    project_percent_started_at = now
+    project_unchanged_seconds = 0
+    if uses_dual_layout:
+        project_percent_started_at, project_unchanged_seconds = _assessment_timing(
+            state,
+            "project",
+            project_percent,
+            now,
+        )
 
     phase_elapsed = max(0, int(now - _number(phase.get("started_at"), now)))
     pass_elapsed = max(0, int(now - _number(current_pass.get("started_at"), now)))
@@ -887,17 +987,34 @@ def _progress(args: argparse.Namespace) -> None:
     event = _event(state, "progress_reported", now)
     event.update(
         {
-            "raw_percent": raw_percent,
-            "percent": percent,
-            "same_percent_started_at": percent_started_at,
-            "same_percent_elapsed_seconds": unchanged_seconds,
+            "raw_percent": phase_raw_percent,
+            "percent": phase_percent,
+            "same_percent_started_at": phase_percent_started_at,
+            "same_percent_elapsed_seconds": phase_unchanged_seconds,
+            "phase_raw_percent": phase_raw_percent,
+            "phase_percent": phase_percent,
+            "phase_same_percent_started_at": phase_percent_started_at,
+            "phase_same_percent_elapsed_seconds": phase_unchanged_seconds,
             "phase_elapsed_seconds": phase_elapsed,
             "pass_elapsed_seconds": pass_elapsed,
             "total_elapsed_seconds": total_elapsed,
-            "calibration": state.get("pending_calibration"),
-            **decision,
+            "calibration": phase_calibration,
+            "phase_calibration": phase_calibration,
+            **phase_decision,
+            **_prefixed_decision("phase", phase_decision),
         }
     )
+    if uses_dual_layout and project_decision is not None:
+        event.update(
+            {
+                "project_raw_percent": project_raw_percent,
+                "project_percent": project_percent,
+                "project_same_percent_started_at": project_percent_started_at,
+                "project_same_percent_elapsed_seconds": project_unchanged_seconds,
+                "project_calibration": None,
+                **_prefixed_decision("project", project_decision),
+            }
+        )
     _append_event(state, event)
     state["pending_calibration"] = None
     state["pass"] = current_pass
@@ -905,20 +1022,33 @@ def _progress(args: argparse.Namespace) -> None:
 
     phase_id = _string(phase.get("id"), "ad hoc")
     phase_title = _string(phase.get("title"), "Ad hoc work")
-    progress_line = f"**{percent}% complete"
-    if unchanged_seconds > 0:
-        progress_line += f" - unchanged for {_format_duration(unchanged_seconds)}"
-    progress_line += "**"
-    lines = [
-        f"**{_string(state.get('worktree'))} - {_string(state.get('branch'))}**",
-        f"**Phase {phase_id}: {phase_title} - elapsed {_format_duration(phase_elapsed)}**",
-        (
-            f"**{_pass_display(current_pass)} - {_string(current_pass.get('activity'))} "
-            f"- elapsed {_format_duration(pass_elapsed)}**"
-        ),
-        progress_line,
-        f"**Total elapsed {_format_duration(total_elapsed)}**",
-    ]
+    pass_line = (
+        f"**{_pass_display(current_pass)} - {_string(current_pass.get('activity'))} "
+        f"- elapsed {_format_duration(pass_elapsed)}**"
+    )
+    if uses_dual_layout:
+        lines = [
+            f"**{_string(state.get('worktree'))} - {_string(state.get('branch'))}**",
+            _assessment_line(project_percent, total_elapsed, project_unchanged_seconds),
+            "",
+            f"**Phase {phase_id}: {phase_title}**",
+            _assessment_line(phase_percent, phase_elapsed, phase_unchanged_seconds),
+            pass_line,
+        ]
+    else:
+        legacy_progress_line = f"**{phase_percent}% complete"
+        if phase_unchanged_seconds > 0:
+            legacy_progress_line += (
+                f" - unchanged for {_format_duration(phase_unchanged_seconds)}"
+            )
+        legacy_progress_line += "**"
+        lines = [
+            f"**{_string(state.get('worktree'))} - {_string(state.get('branch'))}**",
+            f"**Phase {phase_id}: {phase_title} - elapsed {_format_duration(phase_elapsed)}**",
+            pass_line,
+            legacy_progress_line,
+            f"**Total elapsed {_format_duration(total_elapsed)}**",
+        ]
     print("\n".join(lines))
 
 
@@ -1055,10 +1185,16 @@ def _build_parser() -> argparse.ArgumentParser:
 
     progress = subparsers.add_parser("progress")
     _ = progress.add_argument("--session-dir", required=True)
-    _ = progress.add_argument("--raw-percent", type=int, required=True)
-    _ = progress.add_argument("--percent", type=int, required=True)
+    _ = progress.add_argument("--raw-percent", type=int, default=-1)
+    _ = progress.add_argument("--percent", type=int, default=-1)
+    _ = progress.add_argument("--project-raw-percent", type=int, default=-1)
+    _ = progress.add_argument("--project-percent", type=int, default=-1)
+    _ = progress.add_argument("--phase-raw-percent", type=int, default=-1)
+    _ = progress.add_argument("--phase-percent", type=int, default=-1)
     _ = progress.add_argument("--activity", required=True)
     _ = progress.add_argument("--override-reason", default="")
+    _ = progress.add_argument("--project-override-reason", default="")
+    _ = progress.add_argument("--phase-override-reason", default="")
     progress.set_defaults(handler=_progress)
 
     finish_phase = subparsers.add_parser("finish-phase")

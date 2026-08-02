@@ -216,9 +216,13 @@ class ProgressHistoryTests(unittest.TestCase):
             "progress",
             "--session-dir",
             str(session_dir),
-            "--raw-percent",
+            "--project-raw-percent",
+            "80",
+            "--project-percent",
+            "80",
+            "--phase-raw-percent",
             "65",
-            "--percent",
+            "--phase-percent",
             "25",
             "--activity",
             "correcting retry recovery",
@@ -228,10 +232,11 @@ class ProgressHistoryTests(unittest.TestCase):
             header.splitlines(),
             [
                 "**bevy_hana_rubric - feature/rubric**",
-                "**Phase 3: Retry handling - elapsed 01:40**",
+                "**80% complete - elapsed 01:40**",
+                "",
+                "**Phase 3: Retry handling**",
+                "**25% complete - elapsed 01:40**",
                 "**Fix 2 - correcting retry recovery - elapsed 01:30**",
-                "**25% complete**",
-                "**Total elapsed 01:40**",
             ],
         )
 
@@ -247,15 +252,56 @@ class ProgressHistoryTests(unittest.TestCase):
             "progress",
             "--session-dir",
             str(session_dir),
-            "--raw-percent",
+            "--project-raw-percent",
+            "80",
+            "--project-percent",
+            "80",
+            "--phase-raw-percent",
             "65",
-            "--percent",
+            "--phase-percent",
             "25",
             "--activity",
             "correcting retry recovery",
             at=started_at + 160,
         )
-        self.assertIn("**25% complete - unchanged for 01:00**", unchanged_header)
+        self.assertIn(
+            "**80% complete - elapsed 02:40 - unchanged 01:00**",
+            unchanged_header,
+        )
+        self.assertIn(
+            "**25% complete - elapsed 02:40 - unchanged 01:00**",
+            unchanged_header,
+        )
+
+        _ = self.run_command(
+            "calibrate",
+            "--session-dir",
+            str(session_dir),
+            "--candidate-percent",
+            "65",
+            at=started_at + 180,
+        )
+        independently_changed = self.run_command(
+            "progress",
+            "--session-dir",
+            str(session_dir),
+            "--project-raw-percent",
+            "85",
+            "--project-percent",
+            "85",
+            "--phase-raw-percent",
+            "65",
+            "--phase-percent",
+            "25",
+            "--activity",
+            "correcting retry recovery",
+            at=started_at + 180,
+        )
+        self.assertIn("**85% complete - elapsed 03:00**", independently_changed)
+        self.assertIn(
+            "**25% complete - elapsed 03:00 - unchanged 01:20**",
+            independently_changed,
+        )
 
         history_file = self.history_dir / "runs" / "current.jsonl"
         history_text = history_file.read_text(encoding="utf-8")
@@ -263,6 +309,8 @@ class ProgressHistoryTests(unittest.TestCase):
         self.assertIn('"model":"gpt-called"', history_text)
         self.assertIn('"raw_percent":65', history_text)
         self.assertIn('"percent":25', history_text)
+        self.assertIn('"project_percent":80', history_text)
+        self.assertIn('"phase_percent":25', history_text)
         self.assertIn('"decision_source":"calibrated"', history_text)
         self.assertIn('"suggested_percent":25', history_text)
         self.assertIn('"historical_bias_percentage_points":40.0', history_text)
@@ -300,6 +348,33 @@ class ProgressHistoryTests(unittest.TestCase):
         decision_counts = cast(dict[str, object], group["decision_source_counts"])
         self.assertEqual(decision_counts["raw"], 5)
         self.assertEqual(decision_counts["calibrated"], 1)
+
+    def test_legacy_progress_call_keeps_existing_header(self) -> None:
+        started_at = 20_000
+        session_dir = self.start_run("legacy", started_at)
+        self.start_phase_and_pass(session_dir, started_at)
+        header = self.run_command(
+            "progress",
+            "--session-dir",
+            str(session_dir),
+            "--raw-percent",
+            "20",
+            "--percent",
+            "20",
+            "--activity",
+            "correcting retry recovery",
+            at=started_at + 100,
+        )
+        self.assertEqual(
+            header.splitlines(),
+            [
+                "**bevy_hana_rubric - feature/rubric**",
+                "**Phase 3: Retry handling - elapsed 01:40**",
+                "**Fix 2 - correcting retry recovery - elapsed 01:30**",
+                "**20% complete**",
+                "**Total elapsed 01:40**",
+            ],
+        )
 
     def test_aggregate_reports_raw_and_calibrated_error_fields(self) -> None:
         self.complete_historical_run(0)

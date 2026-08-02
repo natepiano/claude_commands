@@ -197,10 +197,10 @@ the cache, interleave events, or lose rows.
 The event stream contains run, phase, pass, progress, and completion events.
 Every row carries the worktree name, branch, working directory, plan doc,
 phase identifier/title, project/phase/pass timestamps, pass kind and fix count,
-current activity, raw and reported percentages, unchanged-percentage duration,
-the suggested percentage, the decision source (`raw`, `calibrated`, or
-`override`), any override reason, the historical bias and resulting adjustment,
-and both agent identities. The recorder detects the main agent's family,
+current activity, independent project and phase percentages, each percentage's
+unchanged duration, the phase's raw and suggested percentages, the decision
+source (`raw`, `calibrated`, or `override`), any override reason, the historical
+bias and resulting adjustment, and both agent identities. The recorder detects the main agent's family,
 session, model, and effort from the active Claude or Codex transcript. The
 launchers supply the called agent's resolved task, family, model, and effort from
 `config/agents.conf`; never infer either identity from defaults.
@@ -211,10 +211,10 @@ the phase's first implementation launcher, write `git status --short` from
 plan doc, handoff, or user-owned paths that were already dirty and prevents later
 progress reports from claiming them as delegate work. Keep that original phase
 baseline through reviews and fix passes; do not overwrite it after implementation
-starts. `progress_history.py start-phase` resets the phase clock and unchanged
-percentage state. The modified launchers start and finish the `impl`, `review`,
-`arch`, and `fix N` pass clocks; a canceled or completed pass never lends its
-elapsed time to the next pass.
+starts. `progress_history.py start-phase` resets the phase clock and phase
+percentage state without resetting the project percentage state. The modified
+launchers start and finish the `impl`, `review`, `arch`, and `fix N` pass clocks;
+a canceled or completed pass never lends its elapsed time to the next pass.
 
 **Arm the monitor in the same turn as the dispatch**, immediately after the
 launcher returns its handle and before settling into the **Background wait
@@ -288,7 +288,7 @@ extrapolating from the last monitor event. Never infer unchanged work from a
 silent launcher terminal: launchers normally emit no stdout while the delegate
 runs.
 
-**When a monitor event lands, write the five-line progress header below, then one
+**When a monitor event lands, write the two-section progress header below, then one
 or two sentences of ordinary English** — what the delegate is doing right now,
 what has materially appeared in the worktree, and what remains. This is
 the same translation standard as <Synthesize/>: the reader has not seen the code,
@@ -301,53 +301,60 @@ bare timestamp.
 If nothing has changed since the last narration, say that in one short sentence
 rather than repeating the previous wording verbatim.
 
-The five bold lines are mandatory for every scheduled update and every
-user-requested progress check. Each line owns one kind of information, in this
-order:
+The two sections are mandatory for every scheduled update and every
+user-requested progress check. Project information comes first; phase and pass
+information comes after one blank line:
 
 ```
 **<worktree-name> - <branch>**
-**Phase <phase identifier>: <phase title> - elapsed <phase-duration>**
+**<project-percent>% complete - elapsed <project-duration>**
+
+**Phase <phase identifier>: <phase title>**
+**<phase-percent>% complete - elapsed <phase-duration>**
 **<Impl|Review|Arch|Fix N> - <current activity> - elapsed <pass-duration>**
-**<percent>% complete**
-**Total elapsed <project-duration>**
 ```
 
-When the same percentage is reported consecutively, the fourth line becomes:
+When either percentage is reported consecutively, append its own unchanged
+duration to that percentage's row:
 
 ```
-**<percent>% complete - unchanged for <duration>**
+**<percent>% complete - elapsed <duration> - unchanged <duration>**
 ```
 
 For work without a phased plan, use `ad hoc` as the phase identifier and a short
-scope name as its title. Phase elapsed resets at the phase's first implementation
-dispatch. Pass elapsed resets at every called-agent dispatch. Total elapsed is
-current time minus the plan's memorialized `Project started` value and does not
-reset between phases, reviews, fixes, or later delegation sessions. Every
+scope name as its title and use the same assessment for project and phase.
+Project elapsed is current time minus the plan's memorialized `Project started`
+value and does not reset between phases, reviews, fixes, or later delegation
+sessions. Phase elapsed resets at the phase's first implementation dispatch.
+Pass elapsed resets at every called-agent dispatch. Project and phase unchanged
+timers are independent: changing one assessment resets only its row. Every
 duration is zero-padded `MM:SS` under one hour and `HH:MM:SS` at one hour or
 longer; total hours may exceed 23.
 
 Do not hand-format or independently time these lines. Immediately before each
 progress report:
 
-1. Derive `${RAW_PERCENT}` from the live work evidence and work list using the
-   estimation rules below.
+1. Derive `${PROJECT_RAW_PERCENT}` from the whole plan's completed and remaining
+   work, including the current phase's contribution. Derive
+   `${PHASE_RAW_PERCENT}` from the current phase's live evidence and work list
+   using the estimation rules below. These are separate assessments; never copy
+   one into the other merely because only one changed since the last report.
 2. Run:
-   `python3 ~/.claude/scripts/delegate/progress_history.py calibrate --session-dir "${SESSION_DIR}" --candidate-percent "${RAW_PERCENT}"`
+   `python3 ~/.claude/scripts/delegate/progress_history.py calibrate --session-dir "${SESSION_DIR}" --candidate-percent "${PHASE_RAW_PERCENT}"`
 3. Read its JSON. When `apply_suggestion` is true, use `suggested_percent` as
-   `${REPORTED_PERCENT}` unless countable current evidence proves that value
+   `${PHASE_REPORTED_PERCENT}` unless countable current evidence proves that value
    wrong. With fewer than `minimum_samples`, keep
-   `${REPORTED_PERCENT} = ${RAW_PERCENT}`. The recorder derives the decision
-   source: `raw` when no suggestion applies, `calibrated` when the suggestion is
-   used, and `override` for any other reported value.
+   `${PHASE_REPORTED_PERCENT} = ${PHASE_RAW_PERCENT}`. Keep
+   `${PROJECT_REPORTED_PERCENT} = ${PROJECT_RAW_PERCENT}`. The recorder derives
+   the phase decision source: `raw` when no suggestion applies, `calibrated`
+   when the suggestion is used, and `override` for any other reported value.
 4. Run:
-   `python3 ~/.claude/scripts/delegate/progress_history.py progress --session-dir "${SESSION_DIR}" --raw-percent "${RAW_PERCENT}" --percent "${REPORTED_PERCENT}" --activity "<current activity>" [--override-reason "<specific current evidence>"]`
-   Include `--override-reason` exactly when rejecting the applicable raw or
-   calibrated value. State the countable worktree, heartbeat, or verification
-   evidence that justified the choice; generic disagreement is not a reason.
-   The script rejects a missing reason and also rejects a reason when no
-   override occurred.
-5. Copy the script's five Markdown lines exactly, then add the status prose.
+   `python3 ~/.claude/scripts/delegate/progress_history.py progress --session-dir "${SESSION_DIR}" --project-raw-percent "${PROJECT_RAW_PERCENT}" --project-percent "${PROJECT_REPORTED_PERCENT}" --phase-raw-percent "${PHASE_RAW_PERCENT}" --phase-percent "${PHASE_REPORTED_PERCENT}" --activity "<current activity>" [--phase-override-reason "<specific current evidence>"]`
+   Include `--phase-override-reason` exactly when rejecting the calibrated phase
+   value. State the countable worktree, heartbeat, or verification evidence that
+   justified the choice; generic disagreement is not a reason. The script
+   rejects a missing reason and also rejects a reason when no override occurred.
+5. Copy the script's two-section Markdown header exactly, then add the status prose.
 
 `calibrate` uses completed phases only. It compares the report timestamp with
 the phase's actual finish time, measures how long that percentage remained
@@ -1587,8 +1594,8 @@ unrelated turns to continue a run that is over.
 - Select `escalation` from the actual Work Order or review outcome, never keyword matching.
 - The main agent orchestrates and reviews; the delegate agent codes. The main agent touches implementation code only on explicit user instruction — except post-review doc-only or trivial fixes that both reviews agree on (see the direct-fix exception in <Synthesize>), which the main agent applies itself and reports.
 - Every delegate dispatch arms a two-minute progress monitor and narrates what
-  the delegate is doing with the mandatory five-line worktree/phase/pass/
-  percentage/total header first, followed by the ordinary-English current status defined under
+  the delegate is doing with the mandatory project section followed by the
+  phase/pass section, then the ordinary-English current status defined under
   **Progress narration while waiting**, until it finishes
   (**Progress narration while waiting**). Other user work takes precedence over
   the narration; the narration never replaces the completion notification.
