@@ -76,6 +76,9 @@ Dispatch ONE `Explore` (or `general-purpose`) subagent. Its prompt must include:
     plan's invariants + anything the retrospectives surfaced).
   - **Calibration / gotchas** — magic numbers, budgets, edge cases, and the
     surprises recorded in the phase retrospectives that a future implementer needs.
+    On a plan that `/plan:compact` has run over, a completed phase carries a
+    `#### As-built` block instead of a Work Order + Retrospective; its
+    **Gotchas** and **Ruled out** lines are the same input, already distilled.
   - **Why** — the rationale behind load-bearing decisions, reconstructed as
     "why it is this way" (the useful residue of the resolved-decision record),
     not a debate transcript.

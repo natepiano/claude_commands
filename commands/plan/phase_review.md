@@ -69,11 +69,48 @@ Scope this sweep narrowly:
 
 If any comments were removed or rewritten, include that in the final update's `Learned and applied` row.
 
-## Step 4: Dispatch a subagent review of the remaining phases
+## Step 4: Dispatch an architect review of the remaining phases
 
-Spawn a `Plan` subagent with a self-contained prompt. The subagent's job is an architectural review of the *remaining* phases in light of what was just implemented and learned.
+The architect's job is an architectural review of the *remaining* phases in light
+of what was just implemented and learned.
 
-The prompt to the subagent must include:
+**Dispatch it through the delegate launcher, not the Agent tool.** A launcher
+dispatch writes a status file and streams `[wrapper]` beats with an activity
+digest into the shared heartbeat log, so the orchestrating agent can watch this
+review and narrate it exactly like an implementation or code review. An Agent-tool
+subagent produces no readable liveness signal — its only output is a full
+transcript too large to read — which leaves the user with an unexplained
+multi-minute silence at the same point in every phase.
+
+Write the prompt to `${SESSION_DIR}/architect_prompt_<phase>.md`, then:
+
+```
+bash ~/.claude/scripts/delegate/review.sh \
+  "${SESSION_DIR}" "${WORKING_DIR}" \
+  "${SESSION_DIR}/architect_prompt_<phase>.md" \
+  architect \
+  "<plan-doc filename> — phase: <phase>
+architect review of the remaining phases against what phase <phase> actually shipped" \
+  "reviewing the remaining phases against what just shipped" \
+  <pass_index>
+```
+
+- `architect` is the subtask name; it resolves through
+  `[delegate.<family>]` in `~/.claude/config/agents.conf` like every other
+  delegate subtask.
+- `<pass_index>` continues the phase's review numbering — one past the last code
+  review pass — so `review_findings_<N>.txt` never overwrites a code review's
+  findings. Findings come back in that file.
+- **`SESSION_DIR`**: under `/plan:delegate` this command inherits the run's
+  session directory — use it, do not create another. Invoked standalone, create
+  one with `bash ~/.claude/scripts/delegate/prepare_session.sh` and capture the
+  path it prints.
+- Arm the progress monitor on `${SESSION_DIR}/review_status` in the same turn as
+  the dispatch, and narrate every monitor event, per **Progress narration while
+  waiting** in `~/.claude/commands/plan/delegate.md`. The **Background wait
+  invariant** in that file applies to this dispatch unchanged.
+
+The prompt must include:
 
 - The absolute path to the plan doc.
 - The phase that just completed (number and title).
@@ -93,9 +130,15 @@ The prompt to the subagent must include:
      introduce or retain a bare `Option<T>` in a domain-owned type or API where
      a semantic type should replace it, including conversion around an external
      API boundary?
+- **The narration instruction**, verbatim: *"Narrate as you go: before each new
+  activity, output one short present-tense line of plain text naming it. These
+  lines stream to a liveness monitor."* This is what makes the dispatch legible
+  to the progress monitor. Do **not** give the architect the heartbeat file path —
+  it runs read-only and cannot write; its narration reaches the heartbeat log
+  through the `[wrapper]` digest instead. Same rule as a code review prompt.
 - Output format: a numbered list of findings. Each finding has a one-line title, a body of one to three sentences, and a `Severity:` tag — `minor` (safe to edit straight into the plan), or `significant` (changes scope, ordering, or architectural intent and needs user approval before editing).
 
-The subagent does **not** edit the plan. It returns findings only.
+The architect does **not** edit the plan. It returns findings only.
 
 ## Step 5: Fold findings back into the plan
 

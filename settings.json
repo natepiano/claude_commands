@@ -144,6 +144,7 @@
     "filesystem": {
       "allowWrite": [
         "/Users/natemccoy/.cargo",
+        "/Users/natemccoy/.local/state/plan-delegate",
         "/Users/natemccoy/Library/Application Support",
         "/Users/natemccoy/Library/Caches/Mozilla.sccache",
         "/Users/natemccoy/rust",

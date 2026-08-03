@@ -1,6 +1,6 @@
 # Delegate-ready plan format
 
-The shared contract for a **delegate-ready phased implementation plan**. Four
+The shared contract for a **delegate-ready phased implementation plan**. Five
 commands read or write this format and must not drift from it:
 
 - `/plan:to_phased_plan` — compiles a design/plan doc into this format.
@@ -8,6 +8,8 @@ commands read or write this format and must not drift from it:
   not by researching the codebase.
 - `/plan:phase_review` — folds per-phase learnings back in, keeping every remaining
   Work Order dispatch-ready.
+- `/plan:compact` — rewrites completed phases into their compacted archive form,
+  leaving the live zone and Delegation Context untouched.
 - `/plan:to_as_built` — distills the completed plan into an as-built overview.
 
 The single design goal: **a compacted orchestrator can dispatch any remaining
@@ -104,6 +106,19 @@ them; nothing workspace-wide.>
 **What deviated:** ...
 **Surprises:** ...
 **Implications for remaining phases:** ...   ← /plan:phase_review acts on these
+
+### Phase N (compacted) — the archive form /plan:compact rewrites it to:
+
+### Phase N — <title>  · status: done (`<commit>`)   ← heading byte-for-byte
+
+#### As-built
+<what the phase shipped, present tense: types, signatures, modules, behavior —
+the Work Order's Spec corrected by the Retrospective's deviations>
+
+**Files:** `<path>` — <what it holds now>
+**Binds later work:** <facts remaining phases still depend on; omit if none>
+**Gotchas:** <durable traps; omit if none>
+**Ruled out:** <rejected proposals, one clause each; omit if none>
 ```
 
 ---
@@ -173,7 +188,11 @@ Rules:
    orchestrator reads to dispatch. Completed (`done`) phases + their
    retrospectives are the archive zone — kept in the doc for the record, skipped
    at dispatch time. Keep the archive below the live phases or clearly marked so
-   the live zone stays small.
+   the live zone stays small. On a long-running plan the archive is compacted to
+   the form above by `/plan:compact`; a compacted phase carries no Work Order,
+   Retrospective, or `Phase N Review` block, and any command that would preserve
+   those "verbatim" preserves the `#### As-built` block instead. Compaction never
+   touches the live zone, the Delegation Context, or a phase identifier.
 5. **No design narrative in the plan.** Justification essays, alternatives
    considered, and resolved-decision debates do not belong in a delegate-ready
    plan. `/plan:to_phased_plan` strips them; anything load-bearing becomes a Work Order

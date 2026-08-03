@@ -197,9 +197,9 @@ Reading rules — the **Background wait invariant** stands unchanged:
   ~40 lines, e.g. `tail -n 40`), not the whole file: a long multi-phase
   session accumulates hundreds of lines. Never in a wait loop, and never as
   a completion signal; the background task notification remains the only wait
-  mechanism. The two-minute progress narration below is the one sanctioned
-  periodic read, and it is driven by monitor events, not by a loop the main
-  agent writes into its own turn.
+  mechanism. The progress narration below is the one sanctioned periodic read,
+  it runs at the interval <ProgressMonitor/> owns, and it is driven by monitor
+  events, not by a loop the main agent writes into its own turn.
 - Read it when: the user interjects during a wait and asks what is happening
   (report the last few lines in real words); when resuming after context
   compaction (one read to re-establish where the delegate is); or when a
@@ -221,8 +221,19 @@ Reading rules — the **Background wait invariant** stands unchanged:
 ## Progress narration while waiting
 
 A delegate dispatch runs for many minutes. The user must not have to ask what is
-happening. Every dispatch — implementation, blind review, fix pass, escalation —
-narrates its progress to the user about every two minutes for as long as it runs.
+happening. Every dispatch — implementation, blind review, fix pass, escalation,
+and <RunPhaseReview/>'s architect review of the remaining phases — narrates its
+progress to the user for as long as it runs, at the interval <ProgressMonitor/>
+owns.
+
+The list is exhaustive by construction, not by enumeration: **every dispatch this
+command makes goes through a launcher in `~/.claude/scripts/delegate/`, and every
+launcher writes a status file and streams heartbeat beats.** If a step of this
+workflow ever hands work to another agent by some other mechanism, that is the
+defect — route it through a launcher instead of accepting an unnarratable gap.
+The Agent tool in particular gives no readable liveness signal: its only output
+is a full transcript too large to read, so a subagent dispatch goes dark until it
+finishes and the user is left guessing at the same point in every phase.
 
 **Durable progress history.** Every main-agent implementation of this command —
 Claude or Codex — writes the same schema through
@@ -255,17 +266,32 @@ percentage state without resetting the project percentage state. The modified
 launchers start and finish the `impl`, `review`, `arch`, and `fix N` pass clocks;
 a canceled or completed pass never lends its elapsed time to the next pass.
 
+<ProgressMonitor>
+**This block is the sole owner of the progress-update interval.** Nowhere else
+in this command names a cadence — not in prose, not in a gate briefing, not in a
+dispatch announcement. Every other mention refers here.
+
+**The interval is `PLAN_DELEGATE_PROGRESS_INTERVAL_SECONDS` in
+`~/.claude/config/timings.conf`, and it is the only source.** Read that file
+before telling the user anything about how often updates arrive, and quote the
+value it holds — converted to whatever unit reads naturally, but derived from
+the file every time, never recalled. If the file is missing or its value is not
+a positive integer, say that updates arrive periodically and name no number:
+the loop's own numeric guard below exists to keep `sleep` from failing, not to
+be reported as a cadence.
+
 **Arm the monitor in the same turn as the dispatch**, immediately after the
 launcher returns its handle and before settling into the **Background wait
 invariant**. Both launchers write a status file whose value ends in `ing` while
 the delegate is alive (`impl_status` → `implementing`, `review_status` →
-`reviewing`), so one command serves either:
+`reviewing`), so one command serves either. The architect review dispatches
+through `review.sh` as well, so it watches `review_status` like any other review:
 
 ```
 Monitor({
   command: 'S="${SESSION_DIR}/<impl|review>_status"; C="$HOME/.claude/config/timings.conf"; while :; do ' +
-           'PLAN_DELEGATE_PROGRESS_INTERVAL_SECONDS=120; ' +
-           'test ! -r "$C" || . "$C"; I="$PLAN_DELEGATE_PROGRESS_INTERVAL_SECONDS"; ' +
+           'unset PLAN_DELEGATE_PROGRESS_INTERVAL_SECONDS; test ! -r "$C" || . "$C"; ' +
+           'I="$PLAN_DELEGATE_PROGRESS_INTERVAL_SECONDS"; ' +
            'case "$I" in ""|*[!0-9]*|0) I=120 ;; esac; sleep "$I"; ' +
            'case "$(cat "$S" 2>/dev/null)" in *ing) ;; *) break ;; esac; ' +
            'echo "--- $(date +%H:%M:%S)"; tail -n 6 "${SESSION_DIR}/heartbeat.log"; done',
@@ -274,24 +300,27 @@ Monitor({
 })
 ```
 
-The interval comes from
-`~/.claude/config/timings.conf`'s
-`PLAN_DELEGATE_PROGRESS_INTERVAL_SECONDS` value. The monitor re-reads it before
-every sleep; a missing, zero, or non-numeric value falls back to 120 seconds.
+The loop unsets the variable and re-sources the config before every sleep, so an
+edit to `timings.conf` takes effect on the next tick and a config that stops
+being readable cannot leave a stale value in place. The `case` guard is a shell
+safety net for a missing or malformed setting; it is not a documented default
+and is never quoted to the user.
 
 `Monitor` above names the capability, not a required tool spelling. If the
 environment has no first-class persistent monitor primitive, launch that exact
 loop immediately in its own background terminal and retain its handle separately
 from the delegate terminal. The monitor terminal owns the configured interval;
-do not approximate it by polling the delegate terminal for one minute at a time,
-and do not wait for the primary agent to enter a generic "waiting for background
-terminal" state before launching it. The primary agent remains attached to the
-delegate terminal independently under the Background wait invariant.
+do not approximate it by polling the delegate terminal on some shorter rhythm of
+your own, and do not wait for the primary agent to enter a generic "waiting for
+background terminal" state before launching it. The primary agent remains
+attached to the delegate terminal independently under the Background wait
+invariant.
 
 Substitute the real `${SESSION_DIR}` and the right status file. The loop exits on
 its own when the status flips to `implemented` / `reviewed` / `error`, so no
 monitor outlives its dispatch; still call `TaskStop` on the monitor handle if the
 dispatch ends some other way (cancelled, preempted by <DualReview/>).
+</ProgressMonitor>
 
 **Worktree evidence is mandatory for every progress narration.** Immediately
 before writing a scheduled progress update or answering a user-requested status
@@ -443,6 +472,12 @@ elapsed time.
 - A blind review has no edit stretch: reading and cross-checking is nearly all
   of it, so hold the estimate low and moving (30%, 55%, 70%) until findings are
   being written.
+- The architect review of the remaining phases has no edit stretch either, and
+  its work list is known exactly: the number of remaining phases, each of which
+  it reads and then verifies against real code. Score by phases covered. Its
+  tail is the variable part — heavy drift means writing replacement Work Order
+  text for each finding, so say the estimate is uncertain when findings start
+  appearing early.
 
 Give one number, round it hard (10%, 25%, 50%, 80%), and never present it as
 precise. If the delegate is doing something the work list did not anticipate,
@@ -541,6 +576,13 @@ explicit `--lib`/`--bins` targets from cargo metadata).
   `<package>` filled in; the delegate runs exactly those, nothing more. An
   unrequested `cargo check --all-targets` or example build is a Work Order
   violation, not diligence.
+- **Every write-mode prompt must state that the delegate may not report back
+  until each verification command has exited and it has read the output.**
+  Without that sentence a delegate will background its own verification and
+  return a summary claiming success — observed returning the single line "Test
+  verification running in background" for a change that failed lint. The main
+  agent's own gate run is what catches this; never accept the summary's word for
+  a passing gate.
 - `example` lines appear only in phases whose **Files** touch that example;
   integration-test lines only in phases that own that test.
 - `check` is compile feedback, never a gate entry. Every package in the gate
@@ -898,7 +940,7 @@ commands — the run-only-what-is-listed rule still applies.]
    `Dispatching <scope summary> to the delegate agent — prompt at ${SESSION_DIR}/implementation_prompt.md`
    `Heartbeat: ${SESSION_DIR}/heartbeat.log`
    The heartbeat path is always given so the user can watch the delegate
-   directly (`tail -f`) instead of relying on the two-minute narration. Emit it
+   directly (`tail -f`) instead of relying on the periodic narration. Emit it
    once per dispatch, at dispatch — including fix passes, escalations, and the
    blind review, which share the same file.
    In verbose mode with no active auto window, do not announce dispatch yet;
@@ -1066,8 +1108,8 @@ delegate family with `/agent`.
    `${IMPLEMENTATION_TASK} = escalation`, otherwise `impl`.
 3. Run `bash ~/.claude/scripts/delegate/implement.sh "${SESSION_DIR}" "${WORKING_DIR}" "${SESSION_DIR}/implementation_prompt.md" "${IMPLEMENTATION_TASK}" "<responsibility>" "${PASS_KIND}" "<current pass activity>"` using Bash with `run_in_background: true` and `dangerouslyDisableSandbox: true` — `<responsibility>` starts with the plan/phase line (`<plan-doc filename> — phase: <identifier>`, or `adhoc — <scope>` without a plan doc), then 1-2 lines naming what this run implements (the Work Order's goal in a few words). `<current pass activity>` is a short present-participle description suitable for the header, e.g. `implementing retry recovery`. The launcher records the pass start, called agent identity, and completion/error automatically.
 4. Inform the user: "The delegate agent is implementing... (heartbeat: ${SESSION_DIR}/heartbeat.log)"
-5. Arm the two-minute progress monitor over `impl_status` per **Progress
-   narration while waiting**, in this same turn.
+5. Arm the progress monitor over `impl_status` per <ProgressMonitor/>, in this
+   same turn.
 6. Apply the **Background wait invariant**: keep this turn visibly attached to
    the returned handle and wait for the background task notification. Do NOT
    poll status files or end the turn.
@@ -1169,8 +1211,8 @@ If you find nothing, say so explicitly — do not invent findings.
 **Step 3 — Launch the delegate review:**
 Run `bash ~/.claude/scripts/delegate/review.sh "${SESSION_DIR}" "${WORKING_DIR}" "${SESSION_DIR}/review_prompt_${REVIEW_PASS}.md" review "<responsibility>" "<current review activity>" "${REVIEW_PASS}"` using Bash with `run_in_background: true` and `dangerouslyDisableSandbox: true` — `<responsibility>` starts with the same plan/phase line as the implementation dispatch, then 1-2 lines naming what is under review (e.g. `tool-graph.md — phase: 3` newline `Blind review of the diff against its Work Order; no implementer summary provided`). `<current review activity>` starts as a concise phrase such as `reviewing the retry recovery diff`; later progress reports replace it with the newest heartbeat activity. The launcher records the review pass and called agent identity automatically.
 
-Retain the returned handle and arm the two-minute progress monitor over
-`review_status` per **Progress narration while waiting**. The main agent performs
+Retain the returned handle and arm the progress monitor over `review_status`
+per <ProgressMonitor/>. The main agent performs
 Step 4 while the review runs, then applies the **Background wait invariant** until
 that handle completes. Narration during Step 4 is unnecessary — the main agent is
 visibly working — so let it lapse there and resume once Step 4 is done and the
@@ -1431,8 +1473,8 @@ without asking:
    `<current fix activity>` is a short phrase such as `restoring parser error
    handling`; the launcher records `fix ${FIX_ROUND}`, called agent identity,
    and the pass outcome automatically. Tell
-   the user in one line what is being fixed, and arm the two-minute progress
-   monitor over `impl_status` per **Progress narration while waiting**.
+   the user in one line what is being fixed, and arm the progress monitor over
+   `impl_status` per <ProgressMonitor/>.
    Then re-execute <DualReview/> — which, at `${REVIEW_PASS} > 1`, is
    <ClosureReview/> over this repair, not another audit of the phase — and
    return here.
@@ -1522,6 +1564,12 @@ fatal error, or immediate shutdown.
 **Only when the work came from a phased plan doc.** A phase review is mandatory — do not ask, do not offer to skip.
 
 Tell the user in one line: `Phased plan — running /plan:phase_review to update <plan doc> (retrospective + remaining-phase re-evaluation).` Then invoke the `plan:phase_review` skill immediately — **in loop or verbose mode pass `auto`**, so user decisions are deferred into the affected Work Orders as `**Pending decision:**` blocks instead of asked inline; either multi-phase mode stops for them at that phase's pre-dispatch check. When writing the retrospective, include relevant facts from ${AGENT_REVIEW} and the fix passes (e.g. what the blind reviewer caught, what deviated from spec).
+
+**Pass this run's `${SESSION_DIR}` and `${WORKING_DIR}` down.** That command's
+architect review dispatches through `review.sh` into the same session directory,
+at a pass index one past this phase's last code review, so its findings file
+never overwrites a review's and its progress narrates from the same heartbeat
+log. It must not create a session of its own.
 
 If the work was not from a phased plan, skip this step silently and continue to
 <RecordPhaseCompletion/>.
@@ -1755,6 +1803,8 @@ unrelated turns to continue a run that is over.
 - **Verify a blocker before naming one** — <UserFacingText/>'s three tests decide what may appear in a gate briefing. A stale status doc, an unpushed branch, or a decision the plan already recommends fails them: read the doc's claim against the actual tree, push the branch, follow the plan's recommendation.
 - **An unpushed branch is NEVER a blocker.** When a phase's work needs a commit reachable from the remote — a `git = "…", rev = "…"` pin, a cross-repo consumer, a CI run — pushing the working branch is a mechanical step of that phase. Push it, compute the rev, continue. Do not list it in a <VerbosePrePhaseGate/> briefing, do not raise it as a prerequisite, do not ask.
 - All delegate-launching scripts run with `dangerouslyDisableSandbox: true` and `run_in_background: true`.
+- **Every script in `~/.claude/scripts/delegate/` runs with `dangerouslyDisableSandbox: true`**, launcher or not — `prepare_session.sh`, `implement.sh`, `review.sh`, `verify.sh`, `findings.py`, `progress_history.py`. They write to `~/.local/state/plan-delegate/`, which the sandbox denies. Do not try sandboxed first: `findings.py` mutates the session ledger *before* it appends to the durable store, so a sandboxed call half-applies — the round is recorded, the history event is lost, and the retry then refuses the round as already dispatched. Foreground bookkeeping calls (`findings.py`, `progress_history.py`) take `dangerouslyDisableSandbox: true` alone, without `run_in_background`.
+- **Tooling mechanics never reach the user.** Sandbox flags, script names, ledger internals, status files, and the recovery for a half-applied call are the main agent's business. They do not appear in progress narration, gate briefings, <Synthesize/> summaries, or post-phase reports — not as an aside, not as a "process note". The user asked for a phase of work; report the work. If a tooling failure genuinely changes what the user gets, say what changed in terms of the work, not the tool.
 - The **Background wait invariant** is mandatory. No active delegate terminal may outlive the primary-agent turn that launched it.
 - A confirmed substantial, spec-defined defect found during the main side of
   <DualReview/> preempts a still-running blind review: read its partial log if
@@ -1767,7 +1817,7 @@ unrelated turns to continue a run that is over.
   rely on an empty effort silently becoming `xhigh`.
 - Select `escalation` from the actual Work Order or review outcome, never keyword matching.
 - The main agent orchestrates and reviews; the delegate agent codes. The main agent touches implementation code only on explicit user instruction — except post-review doc-only or trivial fixes that both reviews agree on (see the direct-fix exception in <Synthesize>), which the main agent applies itself and reports.
-- Every delegate dispatch arms a two-minute progress monitor and narrates what
+- Every delegate dispatch arms the <ProgressMonitor/> and narrates what
   the delegate is doing with the mandatory project section followed by the
   phase/pass section, then the ordinary-English current status defined under
   **Progress narration while waiting**, until it finishes
