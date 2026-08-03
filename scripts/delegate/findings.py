@@ -33,6 +33,7 @@ from __future__ import annotations
 import argparse
 import fcntl
 import json
+import math
 import os
 import tempfile
 import time
@@ -58,7 +59,23 @@ STATE_ACCEPTED = "accepted"
 MAX_FIX_ATTEMPTS = 2
 MAX_REOPENS = 2
 STALLED_ROUNDS = 2
-RUNAWAY_ROUNDS = 10
+RUNAWAY_ROUNDS = 5
+
+# Repairs are dispatched one batch per round, so N confirmed findings should
+# close in about N/2 rounds. A phase that needs materially more than that is
+# bleeding slowly rather than converging -- the stalled-count test never trips
+# on 8 -> 7 -> 6 -> 5, and that shape is what used to run to the backstop.
+REPAIR_ROUNDS_PER_FINDING = 0.5
+MIN_REPAIR_BUDGET = 2
+
+# Re-dispatching the same pass kind over and over inside one phase is itself a
+# convergence failure: observed as six consecutive implementation passes and as
+# back-to-back failed fix passes, neither of which the ledger could see.
+MAX_CONSECUTIVE_SAME_KIND_PASSES = 3
+
+# <DualReview/> may preempt one obsolete blind review per phase. A second
+# cancellation means the broad review is never completing.
+MAX_REVIEW_CANCELLATIONS = 1
 
 
 def _now_epoch() -> float:
@@ -264,6 +281,74 @@ def _rounds(state: dict[str, object]) -> list[dict[str, object]]:
     return _object_list(state.get("rounds"))
 
 
+def _history_root() -> Path:
+    configured = os.environ.get("PLAN_DELEGATE_HISTORY_DIR")
+    if configured:
+        return Path(configured).expanduser()
+    return Path.home() / ".local" / "state" / "plan-delegate"
+
+
+def _phase_passes(session_dir: Path, instance_id: str) -> list[tuple[str, str]]:
+    """Every pass this phase instance has run, as (kind, status) in order.
+
+    Read from the durable event stream rather than the session cache: the cache
+    holds only the pass currently running, and what the gate needs is the shape
+    of the whole phase. `finished` carries the outcome; a pass still running
+    contributes its `started` row with an empty status.
+    """
+    if not instance_id:
+        return []
+    path = _history_root() / "runs" / f"{session_dir.name}.jsonl"
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return []
+    passes: dict[str, tuple[int, str, str]] = {}
+    for order, line in enumerate(lines):
+        line = line.strip()
+        if not line:
+            continue
+        event = _json_object(line)
+        if event is None:
+            continue
+        if _string(event.get("phase_instance_id")) != instance_id:
+            continue
+        event_type = _string(event.get("event_type"))
+        if event_type not in ("pass_started", "pass_finished"):
+            continue
+        pass_id = _string(event.get("pass_instance_id"))
+        if not pass_id:
+            continue
+        kind = _string(event.get("pass_kind"))
+        status = _string(event.get("status")) if event_type == "pass_finished" else ""
+        existing = passes.get(pass_id)
+        seen_at = existing[0] if existing else order
+        passes[pass_id] = (seen_at, kind or (existing[1] if existing else ""), status)
+    return [(kind, status) for _, kind, status in sorted(passes.values())]
+
+
+def _consecutive_same_kind(passes: list[tuple[str, str]]) -> tuple[str, int]:
+    """The longest run of one pass kind ending at the most recent pass."""
+    if not passes:
+        return "", 0
+    kind = passes[-1][0]
+    run = 0
+    for entry_kind, _ in reversed(passes):
+        if entry_kind != kind:
+            break
+        run += 1
+    return kind, run
+
+
+def _repair_budget(state: dict[str, object]) -> int:
+    """How many fix rounds this phase's original finding count justifies."""
+    rounds = _rounds(state)
+    if not rounds:
+        return 0
+    initial = _integer(rounds[0].get("gating_open_before"), 0)
+    return max(MIN_REPAIR_BUDGET, math.ceil(initial * REPAIR_ROUNDS_PER_FINDING))
+
+
 def _gating_severities(state: dict[str, object]) -> tuple[str, ...]:
     return FIRST_ROUND_GATING if not _rounds(state) else LATER_ROUND_GATING
 
@@ -318,7 +403,11 @@ def _open_counts(state: dict[str, object]) -> dict[str, int]:
     return counts
 
 
-def _stop_reason(state: dict[str, object], gating_open: int) -> str:
+def _stop_reason(
+    state: dict[str, object],
+    gating_open: int,
+    passes: list[tuple[str, str]],
+) -> str:
     # Reopens are checked first: a finding that was accepted and then invalidated
     # again says more about the repair than its raw dispatch count does, and the
     # two thresholds are reached on the same round in the ordinary flow.
@@ -335,6 +424,14 @@ def _stop_reason(state: dict[str, object], gating_open: int) -> str:
         if _integer(entry.get("fix_attempts")) >= MAX_FIX_ATTEMPTS:
             attempts = _integer(entry.get("fix_attempts"))
             return f"{finding_id} failed to close after {attempts} repair attempts"
+    kind, run = _consecutive_same_kind(passes)
+    if run >= MAX_CONSECUTIVE_SAME_KIND_PASSES:
+        return f"{run} consecutive {kind} passes ran without the phase advancing"
+    cancellations = sum(
+        1 for pass_kind, status in passes if pass_kind == "review" and status == "canceled"
+    )
+    if cancellations > MAX_REVIEW_CANCELLATIONS:
+        return f"the blind review was canceled {cancellations} times, so it is never completing"
     rounds = _rounds(state)
     if len(rounds) >= STALLED_ROUNDS:
         previous = _integer(rounds[-1].get("gating_open_before"), -1)
@@ -342,6 +439,13 @@ def _stop_reason(state: dict[str, object], gating_open: int) -> str:
         if previous >= 0 and earlier >= 0 and gating_open >= previous >= earlier:
             trend = f"({earlier} -> {previous} -> {gating_open})"
             return f"the gating open count has not decreased for {STALLED_ROUNDS} rounds {trend}"
+    budget = _repair_budget(state)
+    if budget and len(rounds) >= budget:
+        initial = _integer(rounds[0].get("gating_open_before"), 0)
+        return (
+            f"{len(rounds)} fix rounds have run for {initial} original findings, "
+            f"past the {budget}-round repair budget, with {gating_open} still open"
+        )
     if len(rounds) >= RUNAWAY_ROUNDS:
         return f"the runaway backstop of {RUNAWAY_ROUNDS} fix rounds was reached"
     return ""
@@ -438,11 +542,13 @@ def _verdict(args: argparse.Namespace) -> None:
     print(f"{finding_id} {_string(entry.get('state'))}")
 
 
-def _gate_payload(state: dict[str, object]) -> dict[str, object]:
+def _gate_payload(state: dict[str, object], session_dir: Path) -> dict[str, object]:
     gating = _gating_severities(state)
     batch = _open_entries(state, gating)
     counts = _open_counts(state)
     gating_open = sum(counts[severity] for severity in gating)
+    passes = _phase_passes(session_dir, _string(state.get("phase_instance_id")))
+    kind, run = _consecutive_same_kind(passes)
     payload: dict[str, object] = {
         "round": len(_rounds(state)) + 1,
         "gating_severities": list(gating),
@@ -452,12 +558,18 @@ def _gate_payload(state: dict[str, object]) -> dict[str, object]:
             _summarize(entry)
             for entry in _open_entries(state, tuple(s for s in SEVERITIES if s not in gating))
         ],
+        "repair_budget": _repair_budget(state),
+        "passes_run": len(passes),
+        "consecutive_same_kind": {"kind": kind, "count": run} if run else None,
+        "review_cancellations": sum(
+            1 for pass_kind, status in passes if pass_kind == "review" and status == "canceled"
+        ),
     }
     if not batch:
         payload["verdict"] = "converged"
         payload["stop_reason"] = None
         return payload
-    reason = _stop_reason(state, gating_open)
+    reason = _stop_reason(state, gating_open, passes)
     payload["verdict"] = "stop" if reason else "dispatch"
     payload["stop_reason"] = reason or None
     return payload
@@ -474,7 +586,7 @@ def _gate(args: argparse.Namespace) -> None:
             + ", ".join(pending)
             + " before gating the next round"
         )
-    payload = _gate_payload(state)
+    payload = _gate_payload(state, session_dir)
     _write_state(session_dir, state)
     _append_event(
         session_dir,
@@ -496,7 +608,7 @@ def _dispatch(args: argparse.Namespace) -> None:
     session_dir = _session_dir(args)
     now = _now_epoch()
     state = _read_state(session_dir, now)
-    payload = _gate_payload(state)
+    payload = _gate_payload(state, session_dir)
     verdict = _string(payload.get("verdict"))
     if verdict != "dispatch":
         raise SystemExit(

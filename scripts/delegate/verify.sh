@@ -20,8 +20,19 @@
 #                                          test one example (only when the
 #                                          example contains unit tests)
 #   verify.sh final                        full workspace gate (orchestrator only)
+#
+# Exit codes: 2 = usage error or missing tooling; 3 = sandbox failure, re-run
+# the same command unsandboxed; anything else is the underlying cargo status.
 
 set -euo pipefail
+
+# macOS sandboxes cannot nest. A dependency whose build script shells out to
+# Swift Package Manager — apple-cf, apple-metal, screencapturekit, anything
+# wrapping a macOS framework — makes SwiftPM call sandbox-exec, which fails
+# inside the Claude Code sandbox. The panic names Swift and never names the
+# sandbox, so it reads like a broken dependency and costs a round trip to
+# diagnose. Name it here instead of leaving it to be rediscovered.
+SANDBOX_SIGNATURE='sandbox_apply: Operation not permitted'
 
 usage() {
     sed -n '/^# Usage:/,/^$/p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//' >&2
@@ -29,7 +40,35 @@ usage() {
 
 run() {
     printf '+ %s\n' "$*"
-    "$@"
+    local log="${TMPDIR:-/tmp}/verify_sh.$$.log"
+    local status=0
+    # tee keeps output streaming: heartbeat_watch.sh digests the agent log to
+    # prove the delegate is alive, so buffering a long build looks like a hang.
+    set +e
+    "$@" 2>&1 | tee "$log"
+    status=${PIPESTATUS[0]}
+    set -e
+    if [[ $status -ne 0 ]] && grep -q "$SANDBOX_SIGNATURE" "$log"; then
+        rm -f "$log"
+        cat >&2 <<'EOF'
+
+verify.sh: THIS IS A SANDBOX FAILURE, NOT A TEST FAILURE.
+
+A dependency build script shells out to Swift Package Manager, which sandboxes
+itself with sandbox-exec. macOS sandboxes cannot nest, so the call fails and the
+build script panics naming Swift.
+
+Re-run this exact command with the sandbox disabled — in Claude Code, pass
+dangerouslyDisableSandbox: true on the Bash call.
+
+Do not report this as a finding. Do not pin, patch, or change the dependency it
+names. Nothing in settings.json fixes it: excludedCommands decides whether an
+unsandboxed run needs approval, not whether it runs unsandboxed.
+EOF
+        exit 3
+    fi
+    rm -f "$log"
+    return $status
 }
 
 have_nextest() {

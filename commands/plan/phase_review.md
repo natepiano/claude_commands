@@ -17,7 +17,7 @@ subagent prompt so the reviewer receives the same contract as `/plan:delegate`.
 
 The plan doc should already be in conversation context — it is the doc the just-completed phase came from.
 
-- Strip the `auto` token from `$ARGUMENTS` first — it is a mode switch, not a path.
+- Strip the `auto` and `skip-architect` tokens from `$ARGUMENTS` first — they are mode switches, not paths.
 - If exactly one plan doc is in scope, use it.
 - If `$ARGUMENTS` names a path, use that path (overrides inference).
 - If no plan doc is in scope, **ask the user** for the path before proceeding. Do not guess. This case should be rare.
@@ -71,8 +71,22 @@ If any comments were removed or rewritten, include that in the final update's `L
 
 ## Step 4: Dispatch an architect review of the remaining phases
 
+**Skip this whole step when `$ARGUMENTS` contains `skip-architect`.** The caller
+has already applied the trigger test in `/plan:delegate`'s `<RunPhaseReview/>`
+and determined this phase produced nothing for an architect to find. Write
+`not run — phase matched its plan` into the final update's architect row and go
+straight to Step 5; the retrospective's implications still get folded into the
+remaining Work Orders exactly as written there. Do not second-guess the token or
+re-derive the trigger test — the caller has the review results and the ledger,
+this command does not.
+
 The architect's job is an architectural review of the *remaining* phases in light
 of what was just implemented and learned.
+
+**When the caller names a scope** — a list of phases whose Work Orders reference
+what actually changed — those are the architect's subject. It still reads the
+others for consistency, but it verifies the named ones against real code. An
+unscoped invocation covers every remaining phase as before.
 
 **Dispatch it through the delegate launcher, not the Agent tool.** A launcher
 dispatch writes a status file and streams `[wrapper]` beats with an activity

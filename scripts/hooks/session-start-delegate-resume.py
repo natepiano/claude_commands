@@ -2,7 +2,7 @@
 """SessionStart(compact) hook: re-seat a /plan:delegate run after compaction.
 
 `delegate.md` already says to re-read the command file after compaction and
-resume the same active waits. The problem is where that instruction lives: in
+resume the same control flow. The problem is where that instruction lives: in
 the conversation being summarized. Summarization drops the rules that were not
 firing at the moment it ran, which is exactly the set that matters on the far
 side.
@@ -45,8 +45,9 @@ Before any further workflow action:
 1. Re-read ~/.claude/commands/plan/delegate.md in full. Do not reconstruct the \
 workflow from the summary; a summarized workflow silently drops rules, and the \
 ones it drops are the ones that were not firing when compaction hit.
-2. Read back the handoff doc named in the summary and resume the same active \
-waits and control flow it describes. The authorization state is the one thing the \
+2. Read back the handoff doc named in the summary and resume the control flow it \
+describes -- re-establish which dispatches are live without blocking on any of \
+them. The authorization state is the one thing the \
 summary has no reason to preserve -- take it from the handoff doc, not from \
 inference, and do not assume a phase is approved.
 3. Delete the handoff doc once the phase it describes is committed.

@@ -65,6 +65,13 @@ if you need something renamed such as a type or a function or whatever, the user
 - taplo panics in the sandbox due to macOS Mach IPC restrictions (`SCDynamicStoreCreate`)
 - `excludedCommands` does NOT help — it only bypasses filesystem restrictions, not Mach IPC
 
+### builds whose build scripts call sandbox-exec must run unsandboxed
+- Some crates' build scripts shell out to Swift Package Manager — `apple-cf`, `apple-metal`, `screencapturekit`, and generally anything wrapping a macOS framework. SwiftPM sandboxes its own manifest compile with `sandbox-exec`, and **macOS sandboxes cannot nest**, so inside the sandbox that call fails at `sandbox_apply` and the build script panics
+- The signature is `sandbox-exec: sandbox_apply: Operation not permitted`, usually buried under a panic that names Swift and never names the sandbox — it reads like a broken dependency
+- **Treat this as a sandbox failure, never a code defect.** Re-run with `dangerouslyDisableSandbox: true` before concluding anything. Do not report it as a finding, do not pin or patch the dependency, and do not write it into a delegate prompt as a known pre-existing failure
+- `sandbox.excludedCommands` does NOT help — it decides whether an unsandboxed run needs *approval*, not whether the command runs unsandboxed. Listing `cargo` there changes nothing, and no other setting fixes nesting
+- It is intermittent because build-script output caches: once built unsandboxed it stays green until a dependency bump, a toolchain change, or the nightly `cargo clean` makes the scripts re-run
+
 ### codex and clean-fix style scripts must run unsandboxed
 - **ALWAYS** use `dangerouslyDisableSandbox: true` when invoking `codex` directly or any script that launches codex: `style-eval-all.sh`, `style-fix-worktrees.sh`, `clean-fix.sh`
 - codex requires write access to `~/.codex/sessions` which the sandbox blocks (`Operation not permitted (os error 1)`)

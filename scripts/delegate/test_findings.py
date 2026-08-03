@@ -190,20 +190,43 @@ class FindingsLedgerTests(unittest.TestCase):
         self.assertEqual(payload["verdict"], "stop")
         self.assertIn("has not decreased for 2 rounds", str(payload["stop_reason"]))
 
-    def test_runaway_backstop_stops_a_loop_that_never_stalls(self) -> None:
-        """Alternating 2 and 1 open blockers never trips the stall test, so 10 rounds does."""
-        for index in range(10):
+    def test_repair_budget_stops_a_loop_that_never_stalls(self) -> None:
+        """Alternating 2 and 1 open blockers never trips the stall test.
+
+        The budget does: two original findings buy two rounds, so the third
+        gate stops. A slow bleed used to run all the way to the backstop.
+        """
+        for index in range(2):
             batch: list[str] = []
             for _ in range(2 if index % 2 == 0 else 1):
                 batch.append(self.open_finding("blocker", f"round {index + 1}"))
             payload = self.gate()
             self.assertEqual(payload["verdict"], "dispatch", f"round {index + 1}")
+            self.assertEqual(payload["repair_budget"], 0 if index == 0 else 2)
             self.close_round(batch)
         _ = self.open_finding("blocker", "one more")
-        _ = self.open_finding("blocker", "and another")
         payload = self.gate()
         self.assertEqual(payload["verdict"], "stop")
-        self.assertIn("runaway backstop of 10 fix rounds", str(payload["stop_reason"]))
+        self.assertIn("repair budget", str(payload["stop_reason"]))
+        self.assertIn("2 fix rounds have run for 2 original findings", str(payload["stop_reason"]))
+
+    def test_repair_budget_scales_with_the_original_finding_count(self) -> None:
+        """Eight findings buy four rounds; two buy the floor of two."""
+        for _ in range(8):
+            _ = self.open_finding("blocker", "one of eight")
+        payload = self.gate()
+        self.assertEqual(payload["verdict"], "dispatch")
+        self.close_round([f"F{index:03d}" for index in range(1, 9)])
+        payload = self.gate()
+        self.assertEqual(payload["repair_budget"], 4)
+
+    def test_the_gate_reports_pass_shape_without_history(self) -> None:
+        """No durable event stream in the fixture, so the pass counters are empty."""
+        _ = self.open_finding("blocker", "null deref")
+        payload = self.gate()
+        self.assertEqual(payload["passes_run"], 0)
+        self.assertIsNone(payload["consecutive_same_kind"])
+        self.assertEqual(payload["review_cancellations"], 0)
 
     def test_reopening_an_accepted_finding_requires_evidence(self) -> None:
         _ = self.open_finding("blocker", "null deref")

@@ -35,30 +35,47 @@ at a <VerbosePrePhaseGate/>, then returns to none automatically)
 
 ---
 
-## Background wait invariant
+## Dispatch-and-yield invariant
 
-This is a hard control-flow rule for every implementation, review, and fix-pass
-launcher in this workflow:
+This is a hard control-flow rule for every implementation, review, fix-pass, and
+verification launcher in this workflow. Every one of them runs with
+`run_in_background: true`. The moment a launcher returns its handle:
 
-- When a background launch returns a task or terminal handle, immediately attach
-  the environment's background-wait mechanism to that handle and keep the
-  current primary-agent turn open until completion notification arrives.
-- Never send a final response, yield the turn back to the user, or substitute
-  status-file/process polling while any delegated terminal is still active.
-- `run_in_background: true` permits the main agent to do the concurrent work
-  named by this workflow; it does not permit the main agent to end its turn.
-- When phases or reviews launch in parallel, retain every handle and wait on all
-  of them in the same turn. Process each completion while remaining waits stay
-  attached. Continue the workflow immediately after the final completion.
+1. Arm the progress monitor per <ProgressMonitor/>.
+2. Tell the user in one line what was dispatched.
+3. **End the turn.**
+
+The background task notification re-invokes the main agent with the result.
+**That notification is the wait mechanism.** It requires nothing to be held open,
+and it fires whether or not the turn is still running.
+
+- **Never block the main loop on a delegate.** Do not call a blocking waiter on
+  the handle, do not open a task-output view as a way of waiting, do not spawn a
+  subagent and wait on it, do not sleep, loop, or poll a status file. Any of
+  these wedges the primary agent for the entire multi-minute dispatch: the user
+  cannot run `/rename`, `/color`, `/compact`, or any other slash command, cannot
+  redirect the run, and cannot do anything but watch a spinner. The block buys
+  nothing — the notification arrives either way — and it costs the user control
+  of their own session for as long as the delegate runs.
+- **A held-open turn is the defect, not the diligence.** If a step of this
+  workflow appears to require staying attached, that step is wrong; dispatch,
+  yield, and resume from the notification instead.
+- **Parallel dispatches:** arm a monitor for each, then end the turn once.
+  Notifications arrive independently. When one arrives and others are still
+  running, process it, take any workflow action it unblocks, and end the turn
+  again — do not hold open for the stragglers.
+- **The turn ends; the run does not.** Ending the turn here is not abandoning
+  the workflow and is never reported to the user as waiting, pausing, or
+  stopping. State what is running and what happens when it finishes.
 - **Dual-review preemption:** <DualReview/> may cancel a still-running blind
   review only when the main agent has already confirmed a substantial,
-  unambiguous correction from the Work Order. First read any streamed reviewer
-  log once, then cancel its handle through the environment's cancellation
-  mechanism and remain attached until cancellation settles. Dispatch the fix
-  only after that; never edit the diff while the old-diff reviewer is active.
+  unambiguous correction from the Work Order. Read any streamed reviewer log
+  once, cancel its handle (`TaskStop`), then dispatch the fix. Never edit the
+  diff while the old-diff reviewer is active.
 
-Context compaction does not relax this invariant: resume the same active waits
-and control flow after compaction.
+Context compaction does not relax this invariant: after compaction, re-establish
+which dispatches are live and resume the same control flow — still without
+blocking on any of them.
 
 ---
 
@@ -90,9 +107,13 @@ auto-compaction plus the conversation summary generally carries the run forward
 correctly on its own.
 
 The mechanism behind that rule: **auto-compaction fires on the next request,
-never mid-turn.** Ending the turn near the limit is therefore the one action that
-guarantees compaction never runs — the run stalls waiting for a user who has no
-reason to expect it. A Stop hook enforces this while a run is active: end the
+never mid-turn.** Ending the turn near the limit with nothing scheduled to come
+back is therefore the one action that guarantees compaction never runs — the run
+stalls waiting for a user who has no reason to expect it. Ending the turn on a
+live dispatch is *not* that case and never conflicts with the
+**Dispatch-and-yield invariant**: the completion notification is itself the next
+request, so compaction fires there. The Stop hook already knows the difference —
+it checks for a moving heartbeat and stays out of the way. A Stop hook enforces this while a run is active: end the
 turn past the handoff threshold and it refuses the stop and sends you straight
 back in. It blocks only once, so a genuine wait on a user decision (a verbose
 gate, a pending decision, conflicting reviews, a `stop` gate verdict) survives —
@@ -137,11 +158,25 @@ Three rules the script enforces, so the main agent never rules on them:
   alone gate every later one. Nits never gate — they belong in the phase
   retrospective, not in the loop. A phase ships when it is correct, not when it
   is spotless.
-- **Convergence, not a count.** A run grinding through eight rounds of real
-  defects is never interrupted. `gate` returns `stop` only when a finding fails
+- **Convergence, not a count.** A phase working through real defects is never
+  interrupted for the number of them. `gate` returns `stop` when a finding fails
   to close twice, a finding reopens twice after being accepted, the gating open
-  count fails to decrease across two consecutive rounds, or a ten-round runaway
+  count fails to decrease across two consecutive rounds, the round count passes
+  the **repair budget**, three consecutive passes of one kind run without the
+  phase advancing, the blind review is canceled more than once, or a five-round
   backstop trips.
+- **The repair budget.** Rounds repair a whole batch, so N original findings
+  should close in about N/2 rounds; the budget is that, with a floor of two.
+  It exists because the stalled-count test only catches a flat line — a phase
+  bleeding 8 → 7 → 6 → 5 satisfies it every round and used to run to the
+  backstop. `gate` reports `repair_budget` alongside its verdict.
+- **Pass shape is evidence.** `gate` reads the phase's pass history from the
+  durable event stream and reports `passes_run`, `consecutive_same_kind`, and
+  `review_cancellations`. Repeated same-kind dispatches and a repeatedly
+  canceled blind review are convergence failures the finding counts cannot see:
+  six consecutive implementation passes and two preempted reviews in one phase
+  are both observed, and both used to be invisible here. The ledger enforces
+  <DualReview/>'s one-preempt-per-phase rule; do not rule on it yourself.
 
 Record findings only after <Synthesize/> has confirmed them — a finding refuted
 by reading the code never enters the ledger.
@@ -191,7 +226,7 @@ the whole session's timeline. Beat lines: `<ISO time> [wrapper|agent]
   reaches heartbeat.log through the `[wrapper]` digest within one beat. No
   dispatch is ever dark.
 
-Reading rules — the **Background wait invariant** stands unchanged:
+Reading rules — the **Dispatch-and-yield invariant** stands unchanged:
 
 - Read the file on demand, as a single read — and read only the tail (last
   ~40 lines, e.g. `tail -n 40`), not the whole file: a long multi-phase
@@ -200,7 +235,7 @@ Reading rules — the **Background wait invariant** stands unchanged:
   mechanism. The progress narration below is the one sanctioned periodic read,
   it runs at the interval <ProgressMonitor/> owns, and it is driven by monitor
   events, not by a loop the main agent writes into its own turn.
-- Read it when: the user interjects during a wait and asks what is happening
+- Read it when: the user interjects while a delegate is running and asks what is happening
   (report the last few lines in real words); when resuming after context
   compaction (one read to re-establish where the delegate is); or when a
   delegate has run far longer than its scope suggests (one staleness check).
@@ -271,50 +306,71 @@ a canceled or completed pass never lends its elapsed time to the next pass.
 in this command names a cadence — not in prose, not in a gate briefing, not in a
 dispatch announcement. Every other mention refers here.
 
-**The interval is `PLAN_DELEGATE_PROGRESS_INTERVAL_SECONDS` in
-`~/.claude/config/timings.conf`, and it is the only source.** Read that file
-before telling the user anything about how often updates arrive, and quote the
-value it holds — converted to whatever unit reads naturally, but derived from
-the file every time, never recalled. If the file is missing or its value is not
-a positive integer, say that updates arrive periodically and name no number:
-the loop's own numeric guard below exists to keep `sleep` from failing, not to
-be reported as a cadence.
+**The cadence lives in `~/.claude/config/timings.conf`, and it is the only
+source.** Three values own it:
+`PLAN_DELEGATE_PROGRESS_INTERVAL_SECONDS` (the interval after any tick that
+showed new activity), `PLAN_DELEGATE_PROGRESS_BACKOFF_FACTOR`, and
+`PLAN_DELEGATE_PROGRESS_INTERVAL_MAX_SECONDS`. Read that file before telling the
+user anything about how often updates arrive, and quote the values it holds —
+converted to whatever unit reads naturally, but derived from the file every
+time, never recalled. If the file is missing or a value is not a positive
+integer, say that updates arrive periodically and name no number: the loop's own
+numeric guards below exist to keep `sleep` from failing, not to be reported as a
+cadence.
+
+**The interval backs off while the delegate is quiet.** A tick whose heartbeat
+tail is byte-identical to the previous tick multiplies the interval by the
+backoff factor, up to the maximum; the next tick that shows new activity resets
+it to the base. A delegate sitting in one long activity is exactly where
+per-tick narration costs the most and says the least — the run stays visible,
+but a fifteen-minute compile stops buying four near-identical updates. Every
+tick still emits; backoff changes only how far apart they are.
 
 **Arm the monitor in the same turn as the dispatch**, immediately after the
-launcher returns its handle and before settling into the **Background wait
-invariant**. Both launchers write a status file whose value ends in `ing` while
+launcher returns its handle and before ending the turn per the
+**Dispatch-and-yield invariant**. Both launchers write a status file whose value ends in `ing` while
 the delegate is alive (`impl_status` → `implementing`, `review_status` →
 `reviewing`), so one command serves either. The architect review dispatches
 through `review.sh` as well, so it watches `review_status` like any other review:
 
 ```
 Monitor({
-  command: 'S="${SESSION_DIR}/<impl|review>_status"; C="$HOME/.claude/config/timings.conf"; while :; do ' +
-           'unset PLAN_DELEGATE_PROGRESS_INTERVAL_SECONDS; test ! -r "$C" || . "$C"; ' +
-           'I="$PLAN_DELEGATE_PROGRESS_INTERVAL_SECONDS"; ' +
-           'case "$I" in ""|*[!0-9]*|0) I=120 ;; esac; sleep "$I"; ' +
+  command: 'S="${SESSION_DIR}/<impl|review>_status"; H="${SESSION_DIR}/heartbeat.log"; ' +
+           'C="$HOME/.claude/config/timings.conf"; P=""; I=0; while :; do ' +
+           'unset PLAN_DELEGATE_PROGRESS_INTERVAL_SECONDS PLAN_DELEGATE_PROGRESS_BACKOFF_FACTOR ' +
+           'PLAN_DELEGATE_PROGRESS_INTERVAL_MAX_SECONDS; test ! -r "$C" || . "$C"; ' +
+           'B="$PLAN_DELEGATE_PROGRESS_INTERVAL_SECONDS"; case "$B" in ""|*[!0-9]*|0) B=120 ;; esac; ' +
+           'F="$PLAN_DELEGATE_PROGRESS_BACKOFF_FACTOR"; case "$F" in ""|*[!0-9]*|0) F=2 ;; esac; ' +
+           'M="$PLAN_DELEGATE_PROGRESS_INTERVAL_MAX_SECONDS"; case "$M" in ""|*[!0-9]*|0) M=1800 ;; esac; ' +
+           'test "$I" -ge "$B" 2>/dev/null || I="$B"; test "$I" -le "$M" || I="$M"; sleep "$I"; ' +
            'case "$(cat "$S" 2>/dev/null)" in *ing) ;; *) break ;; esac; ' +
-           'echo "--- $(date +%H:%M:%S)"; tail -n 6 "${SESSION_DIR}/heartbeat.log"; done',
+           'T="$(tail -n 6 "$H" 2>/dev/null)"; ' +
+           'if [ "$T" = "$P" ]; then I=$((I * F)); else I="$B"; P="$T"; fi; ' +
+           'echo "--- $(date +%H:%M:%S)"; printf "%s\\n" "$T"; done',
   description: '<phase> delegate progress',
   persistent: true,
 })
 ```
 
-The loop unsets the variable and re-sources the config before every sleep, so an
-edit to `timings.conf` takes effect on the next tick and a config that stops
-being readable cannot leave a stale value in place. The `case` guard is a shell
-safety net for a missing or malformed setting; it is not a documented default
-and is never quoted to the user.
+The loop unsets the three variables and re-sources the config before every
+sleep, so an edit to `timings.conf` takes effect on the next tick and a config
+that stops being readable cannot leave a stale value in place. The `case` guards
+are shell safety nets for a missing or malformed setting; they are not
+documented defaults and are never quoted to the user. `P` holds the previous
+heartbeat tail: identical tail multiplies the interval, new activity resets it
+to the base. `I` is clamped up to the base and down to the maximum on every
+pass, so lowering either config value takes effect on the next tick instead of
+after the current backoff unwinds.
 
 `Monitor` above names the capability, not a required tool spelling. If the
 environment has no first-class persistent monitor primitive, launch that exact
 loop immediately in its own background terminal and retain its handle separately
 from the delegate terminal. The monitor terminal owns the configured interval;
 do not approximate it by polling the delegate terminal on some shorter rhythm of
-your own, and do not wait for the primary agent to enter a generic "waiting for
-background terminal" state before launching it. The primary agent remains
-attached to the delegate terminal independently under the Background wait
-invariant.
+your own. The monitor is armed in the dispatch turn and outlives it; the primary
+agent then ends its turn under the **Dispatch-and-yield invariant** and is
+re-invoked by monitor events and by the delegate's completion notification. The
+monitor is not a wait, and arming it is never a reason to keep the turn open.
 
 Substitute the real `${SESSION_DIR}` and the right status file. The loop exits on
 its own when the status flips to `implemented` / `reviewed` / `error`, so no
@@ -491,13 +547,14 @@ lines with an old `[agent]` line mean the delegate is alive and has been in that
 one activity the whole time — say so, and flag it only when that duration is
 implausible for the named activity.
 
-Two things this narration never does: it never ends the turn, and it never
-substitutes for the completion notification. The **Background wait invariant**
-stands unchanged — the monitor is a side channel for the user's benefit, not a
-wait mechanism.
+Each narration update is its own short turn: the monitor event re-invokes the
+main agent, it writes the update, and it ends the turn again. Narration never
+substitutes for the completion notification and is never a reason to hold a turn
+open — the monitor is a side channel for the user's benefit, not a wait
+mechanism. The **Dispatch-and-yield invariant** governs both.
 
 **Yield to the user.** If the user gives the main agent something else to do
-during a wait, that work takes precedence: do it, and let the narration lapse
+while a delegate runs, that work takes precedence: do it, and let the narration lapse
 while it is in progress rather than interleaving status lines into the middle of
 it. Resume narrating once that work is done and the delegate is still running. If
 the user says to stop the updates, `TaskStop` the monitor and do not re-arm it
@@ -602,9 +659,21 @@ explicit `--lib`/`--bins` targets from cargo metadata).
   a caveat to feed the delegate. The main agent's own shell may be sandboxed
   when the delegate's is not (or the reverse), so "it fails for me" is not
   evidence about the delegate's environment. Re-run the failing test with
-  `dangerouslyDisableSandbox: true` before concluding anything: a sandboxed
-  macOS shell has no GPU adapter, so every test that builds a real render
-  device panics with a driver error that looks nothing like a sandbox problem.
+  `dangerouslyDisableSandbox: true` before concluding anything. Two signatures
+  recur, and neither names the sandbox:
+  - `sandbox-exec: sandbox_apply: Operation not permitted`, under a build-script
+    panic naming Swift — a dependency whose `build.rs` shells out to Swift
+    Package Manager, which sandboxes itself, and macOS sandboxes cannot nest.
+    It reads like a broken dependency. It is not. No settings change fixes it:
+    `excludedCommands` decides whether an unsandboxed run needs approval, not
+    whether the command runs unsandboxed.
+  - a driver or adapter panic — a sandboxed macOS shell has no GPU adapter, so
+    every test that builds a real render device dies in a way that looks
+    nothing like a sandbox problem.
+
+  Both cache their way to green: once a build script has run unsandboxed the
+  next sandboxed run succeeds, so "it worked yesterday" is not evidence. A
+  dependency bump or the nightly `cargo clean` brings it straight back.
 - The gate covers every package the phase **modifies**, which is not the same as
   the packages its **Files** list names. A changed trait signature, public API,
   registration path, or plugin wiring reaches callers the plan never listed —
@@ -914,6 +983,15 @@ list — is exactly the case where that package's tests are most likely to break
 and least likely to be listed. Widening a package already covered below is
 still a violation; this covers packages the gate missed entirely.
 
+Run every command below with the sandbox disabled — in Claude Code that means
+`dangerouslyDisableSandbox: true` on the Bash call. Do not try sandboxed first.
+Some crates' build scripts shell out to Swift Package Manager, which sandboxes
+its own manifest compile with `sandbox-exec`, and macOS sandboxes cannot nest: a
+sandboxed run dies at `sandbox-exec: sandbox_apply: Operation not permitted`
+under a panic that names Swift and never names the sandbox. That is an
+environment failure, not a defect in the code you wrote. Never report it as one,
+and never pin or patch the dependency it names.
+
 While coding (as often as useful):
   bash ~/.claude/scripts/delegate/verify.sh check <package>
 Before summarizing (the phase gate):
@@ -1091,7 +1169,7 @@ delegate family with `/agent`.
 ---
 
 <LaunchImplementation>
-**Goal:** Run the delegate agent and wait for completion.
+**Goal:** Dispatch the delegate agent and resume on its completion notification.
 
 1. Before the phase's first implementation launcher, run `git status --short`
    in `${WORKING_DIR}` and write its output to
@@ -1110,9 +1188,9 @@ delegate family with `/agent`.
 4. Inform the user: "The delegate agent is implementing... (heartbeat: ${SESSION_DIR}/heartbeat.log)"
 5. Arm the progress monitor over `impl_status` per <ProgressMonitor/>, in this
    same turn.
-6. Apply the **Background wait invariant**: keep this turn visibly attached to
-   the returned handle and wait for the background task notification. Do NOT
-   poll status files or end the turn.
+6. Apply the **Dispatch-and-yield invariant**: end the turn. Do NOT block on the
+   handle and do NOT poll status files — the background task notification
+   re-invokes the main agent when the delegate finishes.
 7. When it arrives, read ${SESSION_DIR}/impl_status:
    - **"implemented":** Read ${SESSION_DIR}/impl_summary.txt → ${IMPL_SUMMARY}. Continue.
    - **"error":** Read ${SESSION_DIR}/impl_agent.log, show the user the error, stop.
@@ -1213,10 +1291,11 @@ Run `bash ~/.claude/scripts/delegate/review.sh "${SESSION_DIR}" "${WORKING_DIR}"
 
 Retain the returned handle and arm the progress monitor over `review_status`
 per <ProgressMonitor/>. The main agent performs
-Step 4 while the review runs, then applies the **Background wait invariant** until
-that handle completes. Narration during Step 4 is unnecessary — the main agent is
-visibly working — so let it lapse there and resume once Step 4 is done and the
-only remaining activity is the wait.
+Step 4 while the review runs, then applies the **Dispatch-and-yield invariant**
+and ends the turn; the review's completion notification brings it back for
+Step 5. Narration during Step 4 is unnecessary — the main agent is visibly
+working — so let it lapse there and resume once Step 4 is done and the delegate
+review is the only thing still running.
 
 **Step 4 — the main agent's own review, while the delegate agent reviews:**
 (The main agent MAY read ${IMPL_SUMMARY} — only the delegate reviewer is blind.)
@@ -1225,6 +1304,23 @@ only remaining activity is the wait.
 3. Check codebase consistency and — for Rust — style-guide conformance
 4. Note where ${IMPL_SUMMARY}'s claims diverge from what the diff actually shows
 5. Record your own findings with the same severity scale
+
+**Scope this pass to the review kind.** At `${REVIEW_PASS} > 1` the main agent
+reviews what the delegate reviewer reviews: the repair's touched paths and the
+callers/consumers/invariants of the symbols it changed. Re-reading the whole
+phase diff on every closure pass is the same re-audit that <ClosureReview/>
+exists to prevent, and it is where the main agent's own cost compounds — a
+five-round phase pays for the full diff five times. Findings outside the touched
+paths still count, but only when a specific hunk of *this* repair reaches them.
+
+**On a broad review of a large diff, review in risk order and say what you
+covered.** Read the files the Work Order's **Spec** names, then anything
+changing a public API, trait signature, registration path, or plugin wiring,
+then the remainder by hunk. If the diff is too large to finish that way, stop at
+the risk boundary you reached, record findings for what you read, and name in
+one line what you did not cover — the blind reviewer read it independently, and
+an honest partial pass beats a rushed complete one. Never report a full review
+you did not perform.
 
 **Step 4a — preempt an obsolete blind review.** Do this as soon as Step 4
 confirms a substantial defect whose correct repair is already unambiguous from
@@ -1251,6 +1347,9 @@ anything whose intended behavior remains unclear.
    evidence), and dispatch it immediately using the auto fix round rules in
    <Synthesize/>. Preempt at most once per phase: a second obsolete-review
    cancellation means the broad review is never completing, so let it finish.
+   `findings.py gate` counts cancellations and stops the phase on the second,
+   so a preempt taken anyway surfaces as a convergence stop rather than
+   silently costing another round.
    Tell the user in one line that the blind review was canceled because the
    confirmed defect already requires this fix.
 5. After the fix returns, run a fresh <DualReview/> of the new diff. Do not
@@ -1473,11 +1572,32 @@ without asking:
    `<current fix activity>` is a short phrase such as `restoring parser error
    handling`; the launcher records `fix ${FIX_ROUND}`, called agent identity,
    and the pass outcome automatically. Tell
-   the user in one line what is being fixed, and arm the progress monitor over
-   `impl_status` per <ProgressMonitor/>.
+   the user in one line what is being fixed, arm the progress monitor over
+   `impl_status` per <ProgressMonitor/>, and end the turn per the
+   **Dispatch-and-yield invariant** — a fix round is dispatched exactly like an
+   implementation and is never waited on inside the dispatching turn.
    Then re-execute <DualReview/> — which, at `${REVIEW_PASS} > 1`, is
    <ClosureReview/> over this repair, not another audit of the phase — and
    return here.
+
+   **Mechanical rounds close without a delegate review.** When `${FIX_TASK}` was
+   `mechanical` — every issue in the batch documentation, formatting, lint
+   guidance, a trivial rename, or an equivalently behavior-preserving edit — skip
+   the <ClosureReview/> dispatch. Instead: run the untracked sweep from
+   <DualReview/> Step 1, read the repair diff yourself, and record a
+   `findings.py verdict` for every id from your own reading, citing the file and
+   line that settles it. Then return here for the next `gate`.
+
+   The blind reviewer earns its dispatch by reasoning about behavior. On a batch
+   that changed no behavior there is nothing for it to reason about, and its
+   verdict reduces to reading the same diff the main agent is already holding —
+   which is why a `mechanical` round drags a full review dispatch today for no
+   decision it could have changed.
+
+   Two conditions void this and force the normal dispatch: the repair touched a
+   file outside the ids' named paths, or reading it leaves any id `UNCLEAR`. A
+   mechanical label is the plan for the round, not a finding about the diff — if
+   the diff disagrees with the label, believe the diff.
 
    **STOP** — when any remaining issue needs a design decision the plan does
    not answer *and that has at least two buildable answers*, when the two
@@ -1516,12 +1636,26 @@ If there are no issues (or nits only), state that and continue to
 ---
 
 <RunApplicationSmokeTest>
-**Required after every phase, after review fixes and before phase review or a
-checkpoint.**
+**Required after every phase that changed a runtime path, after review fixes and
+before phase review or a checkpoint.**
 
 **Goal:** Demonstrate that the repository's runnable product still starts and
 that the runtime behavior added or changed by the phase works without a panic,
 fatal error, or immediate shutdown.
+
+0. **Applicability.** Read the phase's diff — not its Work Order's intent — and
+   decide whether it changed any code the running application executes. A phase
+   whose whole diff is tests, benchmarks, documentation, build configuration, or
+   library code that no binary in this repository reaches has no runtime path to
+   exercise. Set `${APPLICATION_SMOKE_RESULT}` to `not applicable — <what the
+   phase changed and why nothing runnable reaches it>` and continue to
+   <RunPhaseReview/>. Say it in one line to the user.
+
+   This is a narrow exemption and the diff has to earn it. A new public function
+   nothing calls yet is exempt; a changed function an existing binary already
+   calls is not, however library-shaped the phase looked. When the trace is
+   genuinely unclear, run the test — the cost of one extra smoke run is far
+   below the cost of a phase that shipped a panic.
 
 1. Determine the runnable target and command from, in order: the Delegation
    Context's **Run** or **Smoke** entry, the phase Acceptance gate, repository
@@ -1531,19 +1665,14 @@ fatal error, or immediate shutdown.
    smoke test.
 2. Launch the real application or executable directly from ${WORKING_DIR} with
    backtraces and useful runtime logging enabled. Keep the process attached and
-   capture its output. For a repository with a primary application, run that
-   application after every phase, including library-only phases. If the
-   repository genuinely has no runnable product, run the closest executable or
-   example that integrates the changed code and record why it is the applicable
-   target.
+   capture its output. If the repository genuinely has no runnable product, run
+   the closest executable or example that integrates the changed code and record
+   why it is the applicable target.
 3. Exercise the runtime path added or changed by the phase. Merely reaching the
    first frame is sufficient only when the phase has no changed runtime behavior
    to invoke. For GUI, input, hardware, networking, persistence, or other
    interactive work, perform the relevant action and continue the application
-   long enough to observe its result. Automate the action when safe. If the
-   environment cannot perform a required real interaction, keep the bounded
-   smoke run attached, ask the user to perform that exact action, and wait. Do
-   not report a pass with an unexercised runtime path.
+   long enough to observe its result. Automate the action when safe.
 4. Close the application cleanly after the exercised behavior remains stable.
    Set ${APPLICATION_SMOKE_RESULT} to a concise record of the command, exercised
    behavior, and observed result.
@@ -1553,17 +1682,69 @@ fatal error, or immediate shutdown.
    <Synthesize/>, then rerun <DualReview/>, <Synthesize/>, and this smoke test.
    Never run <RunPhaseReview/>, <CheckpointCommit/>, or a verbose completion
    report until the smoke test passes.
-6. If no applicable executable can be found or a required interaction cannot be
-   performed by either the main agent or the user, STOP with the phase
-   incomplete. Environment limits are not a successful application smoke test.
+
+**Never park the run on a human.** If the environment cannot perform a required
+real interaction, or no applicable executable can be found, do **not** stop and
+do **not** wait for the user. Close the process, set
+`${APPLICATION_SMOKE_RESULT}` to `deferred — <the exact action a human must
+perform, and why this environment cannot>`, tell the user in one line, and
+continue to <RunPhaseReview/>. A run started in the evening must not spend the
+night holding a phase open for a keystroke.
+
+A deferred smoke does not block the checkpoint — the phase's code review and
+verification gate already passed, and an uncommitted phase is harder to recover
+than a committed one carrying a known open check. It blocks the *run*: carry
+every deferred action forward and present them as one batch at <FinalGate/>,
+after the workspace gate is green, so the user performs them in a single sitting
+instead of once per phase. <RunSummary/> names any that are still outstanding.
+
+The exemption in step 0 and the deferral above are the only ways past this gate.
+Environment limits are still not a successful application smoke test — a
+deferred smoke is recorded as unperformed, never as a pass.
 </RunApplicationSmokeTest>
 
 ---
 
 <RunPhaseReview>
-**Only when the work came from a phased plan doc.** A phase review is mandatory — do not ask, do not offer to skip.
+**Only when the work came from a phased plan doc.** The retrospective is
+mandatory — do not ask, do not offer to skip. The architect review of the
+remaining phases is **conditional**; see the trigger test below.
 
 Tell the user in one line: `Phased plan — running /plan:phase_review to update <plan doc> (retrospective + remaining-phase re-evaluation).` Then invoke the `plan:phase_review` skill immediately — **in loop or verbose mode pass `auto`**, so user decisions are deferred into the affected Work Orders as `**Pending decision:**` blocks instead of asked inline; either multi-phase mode stops for them at that phase's pre-dispatch check. When writing the retrospective, include relevant facts from ${AGENT_REVIEW} and the fix passes (e.g. what the blind reviewer caught, what deviated from spec).
+
+**The architect dispatch is the expensive half and it does not scale.** It reads
+*every* remaining phase, so running it after every phase makes a plan's review
+cost grow with the square of its length — a thirteen-phase plan pays for
+seventy-eight phase-reads to catch drift that most phases never produce. Run it
+only when this phase gave it something to find.
+
+**Dispatch the architect when any of these is true:**
+
+- The phase shipped something its Work Order did not specify, or omitted
+  something it did — any confirmed deviation from spec, from either review.
+- The run resequenced, merged, split, or renumbered phases, or edited a
+  remaining phase's Work Order for any reason.
+- A new `**Pending decision:**` block was written onto a later phase.
+- A confirmed finding changed a type, trait, public API, registration path, or
+  file that a later phase's **Spec**, **Files**, or **Constraints from prior
+  phases** names. Check the remaining Work Orders for the changed symbols and
+  paths — this is a text search over the plan, not a codebase investigation.
+- `findings.py gate` returned `stop` for this phase, whatever the user then
+  chose.
+- Three phases have completed since the last architect dispatch. Drift
+  accumulates below the threshold of any single phase, and this backstop is what
+  catches it.
+
+**Otherwise pass `skip-architect`.** Write the retrospective, fold its
+implications into the remaining Work Orders as usual, and say in one line that
+the remaining phases were not re-reviewed because this phase matched its plan.
+Skipping is the expected outcome for a phase that implemented exactly what it
+said it would, which is most of them.
+
+**When it does dispatch, scope it.** Name the phases whose Work Orders reference
+what actually changed and tell the architect those are its subject; the rest get
+a consistency pass, not a re-derivation. A three-phase blast radius does not
+need all ten remaining phases re-verified against real code.
 
 **Pass this run's `${SESSION_DIR}` and `${WORKING_DIR}` down.** That command's
 architect review dispatches through `review.sh` into the same session directory,
@@ -1580,9 +1761,10 @@ If the work was not from a phased plan, skip this step silently and continue to
 <CheckpointCommit>
 **Loop and verbose modes only** — `single` skips this step without committing.
 
-1. Confirm ${APPLICATION_SMOKE_RESULT} records a passing live application run
-   that exercised the current phase's changed runtime path. If it is `not_run`,
-   incomplete, or failed, STOP; do not commit.
+1. Confirm ${APPLICATION_SMOKE_RESULT} is a pass, `not applicable`, or
+   `deferred` per <RunApplicationSmokeTest/>. If it is `not_run`, incomplete, or
+   failed, STOP; do not commit. A deferred smoke commits with the rest of the
+   phase and carries its outstanding action to <FinalGate/>.
 2. Run `git status --short` in ${WORKING_DIR} and confirm the changes are this
    phase's implementation plus the plan doc. Anything unexpected → STOP and ask.
 3. Run `bash ~/.claude/scripts/delegate/verify.sh fmt <package>` for each
@@ -1742,8 +1924,16 @@ verification (Rust)**); this is the single full-breadth pass.
 1. Run `bash ~/.claude/scripts/delegate/verify.sh final` with
    `run_in_background: true` — workspace `fmt --check`, `--all-targets` check
    (the only time every example builds), and the full test suite — and apply
-   the **Background wait invariant**.
+   the **Dispatch-and-yield invariant**.
 2. Rust plans: run the `clippy` skill with `auto-proceed` (main agent, inline).
+2a. **Deferred smoke batch.** Once the gate is green, collect every phase whose
+   `${APPLICATION_SMOKE_RESULT}` was `deferred` and present them as one list —
+   the phase, the exact action, and what it would prove. Ask the user to perform
+   them in one sitting and wait. This is the run's one human-interaction stop,
+   deliberately placed where it costs one wait instead of one per phase. Anything
+   a deferred action then reveals routes through step 3 like any other failure.
+   If the user declines or defers again, carry the list into <RunSummary/> as
+   outstanding rather than blocking the run.
 3. Failures route like review findings: compose a fix prompt scoped to the
    failures. Before the first such dispatch, capture a new
    `${SESSION_DIR}/progress_baseline_status`, run `start-phase` with phase ID
@@ -1773,6 +1963,8 @@ blocking stop, or error.
 | --- | --- | --- | --- |
 
 **Final gate:** [green / green after N fix rounds / skipped — <reason>]
+**Smoke checks still unperformed:** [one line each — the phase and the exact
+action a human still needs to perform — or "none"]
 **Deferred decisions still open:** [one line each, naming the phase that owns it — or "none"]
 **Why the run stopped:** [plan complete / user stopped before phase N / pending
 decision on phase N / phase N stopped converging: <reason> / delegate error]
@@ -1805,11 +1997,11 @@ unrelated turns to continue a run that is over.
 - All delegate-launching scripts run with `dangerouslyDisableSandbox: true` and `run_in_background: true`.
 - **Every script in `~/.claude/scripts/delegate/` runs with `dangerouslyDisableSandbox: true`**, launcher or not — `prepare_session.sh`, `implement.sh`, `review.sh`, `verify.sh`, `findings.py`, `progress_history.py`. They write to `~/.local/state/plan-delegate/`, which the sandbox denies. Do not try sandboxed first: `findings.py` mutates the session ledger *before* it appends to the durable store, so a sandboxed call half-applies — the round is recorded, the history event is lost, and the retry then refuses the round as already dispatched. Foreground bookkeeping calls (`findings.py`, `progress_history.py`) take `dangerouslyDisableSandbox: true` alone, without `run_in_background`.
 - **Tooling mechanics never reach the user.** Sandbox flags, script names, ledger internals, status files, and the recovery for a half-applied call are the main agent's business. They do not appear in progress narration, gate briefings, <Synthesize/> summaries, or post-phase reports — not as an aside, not as a "process note". The user asked for a phase of work; report the work. If a tooling failure genuinely changes what the user gets, say what changed in terms of the work, not the tool.
-- The **Background wait invariant** is mandatory. No active delegate terminal may outlive the primary-agent turn that launched it.
+- The **Dispatch-and-yield invariant** is mandatory. Every delegate terminal outlives the turn that launched it, and the main agent never blocks the session waiting on one.
 - A confirmed substantial, spec-defined defect found during the main side of
   <DualReview/> preempts a still-running blind review: read its partial log if
-  available, cancel and wait for cancellation, delegate the repair immediately,
-  then run a fresh dual review of the repaired diff.
+  available, `TaskStop` its handle, delegate the repair immediately, then run a
+  fresh dual review of the repaired diff.
 - `${SESSION_DIR}/heartbeat.log` is for on-demand status only (see **Delegate heartbeat**): a single read when the user asks what is happening, once after compaction, or one staleness check on an overdue delegate — never a wait loop, never a completion signal.
 - The delegate reviewer is always a fresh session and always blind to the implementer's summary.
 - Delegate launchers record task, family, model, effort, pass timing, and pass
@@ -1830,8 +2022,17 @@ unrelated turns to continue a run that is over.
 - The fix loop is bounded by convergence, not a counter (<FindingsLedger/>).
   `findings.py gate` decides `converged` / `dispatch` / `stop`; the main agent
   never rules on it. One batch per round, blockers-only gating after round 1,
-  and a stop when a finding fails to close twice, reopens twice, or the gating
-  open count stops falling. An explicit user choice overrides a `stop`.
+  and a stop when a finding fails to close twice, reopens twice, the gating open
+  count stops falling, the repair budget is spent, one pass kind repeats three
+  times without the phase advancing, or the blind review is canceled twice. An
+  explicit user choice overrides a `stop`.
+- A `mechanical` fix round closes on the main agent's own reading of the repair
+  diff — no <ClosureReview/> dispatch — unless the repair reached outside the
+  ids' paths or any id reads `UNCLEAR`.
+- <RunPhaseReview/>'s retrospective is mandatory; its architect review of the
+  remaining phases is conditional on that block's trigger test, with a
+  three-phase backstop. Running it after every phase makes review cost grow with
+  the square of the plan's length.
 - Auto/loop mode stops only for: an unresolved `**Pending decision:**` on the phase being dispatched, a fix that needs a design decision the plan does not answer, reviews conflicting on intended behavior, a `stop` verdict from `findings.py gate`, or a delegate/environment error. Everything else auto-routes or defers.
 - Verbose mode has all of those stops plus a mandatory <VerbosePrePhaseGate/>
   before every phase outside an active bounded-auto window, a
@@ -1840,10 +2041,13 @@ unrelated turns to continue a run that is over.
   briefing. A successful phase and the post-phase `continue` never imply
   authorization for the next implementation.
 - Delegate verification is `verify.sh` lines only (see **Delegate verification (Rust)**): work orders and fix prompts never contain raw cargo commands, and a delegate running one — or any unrequested check — is a Work Order violation. The full `clippy` skill runs only in <FinalGate/>, with `auto-proceed`.
-- Every phase must pass <RunApplicationSmokeTest/> before phase review,
-  checkpoint, or completion reporting. The main agent must run the actual
-  product and exercise the phase's changed runtime path; builds, automated
-  tests, and an untested startup screen do not satisfy this gate.
+- Every phase that changed a runtime path must pass <RunApplicationSmokeTest/>
+  before phase review, checkpoint, or completion reporting. The main agent must
+  run the actual product and exercise the phase's changed runtime path; builds,
+  automated tests, and an untested startup screen do not satisfy this gate. A
+  phase whose diff no binary reaches is exempt; an interaction this environment
+  cannot perform is deferred to a single batch at <FinalGate/>. Neither ever
+  waits on the user mid-run.
 - Every workflow exit records `finish-run` before `end_session.sh`; completed
   phases feed calibration, while stopped/error phases remain audit evidence but
   never train percentage suggestions.
