@@ -40,13 +40,14 @@ load_usage_rows() {
     add_usage "clean_fix report" "Shows the newest clean-fix report. Use clean_fix list to choose an older report."
     add_usage "clean_fix list" "Lists reportable logs. Same as clean_fix report list." true
     add_usage "clean_fix eval" "Shows eval stage family/agent status. Also works for review and fix."
+    add_usage "clean_fix clean" "Shows whether the nightly clean/build/mend pass is enabled. That stage runs no agent."
     add_usage "clean_fix agent" "Shows all stage family, resolved agent, and effort assignments."
     add_usage "/agent cleanfix <family>" "Switches the clean-fix family in the shared agent registry."
     add_usage "/agent cleanfix.<stage> <agent>[:<effort>]" "Edits a clean-fix stage row; stages are style_eval, style_eval_review, and style_fix." true
-    add_usage "clean_fix on" "Enables all style stages."
-    add_usage "clean_fix off" "Disables all style stages."
-    add_usage "clean_fix eval on" "Enables one stage. Also works for review and fix."
-    add_usage "clean_fix eval off" "Disables one stage. Also works for review and fix." true
+    add_usage "clean_fix on" "Enables the clean stage and all style stages."
+    add_usage "clean_fix off" "Disables the clean stage and all style stages."
+    add_usage "clean_fix eval on" "Enables one stage. Also works for clean, review, and fix."
+    add_usage "clean_fix eval off" "Disables one stage. Also works for clean, review, and fix." true
     add_usage "clean_fix skip clean" "Shows targets currently skipped from the clean pass."
     add_usage "clean_fix skip style" "Shows targets currently skipped from the style pass."
     add_usage "clean_fix skip clean <target>..." "Temporarily skips clean targets."
@@ -457,11 +458,24 @@ print_agents_rule() {
     printf '\n'
 }
 
+# The clean/build pass runs no agent, so its row carries only a status.
+print_clean_text() {
+    local enabled="" status
+    cf_load_stage_enabled clean enabled || return 1
+    if [[ "$enabled" == "true" ]]; then
+        status="ENABLED"
+    else
+        status="DISABLED"
+    fi
+    printf "%-7s %-8s %-7s %-12s %s\n" "clean" "$status" "-" "-" "-"
+}
+
 print_agents_text() {
     printf '## Agents\n\n'
     printf '```text\n'
     printf "%-7s %-8s %-7s %-12s %s\n" "Stage" "Status" "Family" "Agent" "Effort"
     print_agents_rule
+    print_clean_text
     print_stage_text "eval" "style_eval"
     print_stage_text "review" "style_eval_review"
     print_stage_text "fix" "style_fix"

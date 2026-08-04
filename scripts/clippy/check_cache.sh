@@ -4,20 +4,44 @@
 #
 # Exit codes:
 #   0 = cache hit (fresh results available)
-#   1 = cache miss (agent should run lint mend + lint clippy)
+#   1 = cache miss (agent should run the lint suite itself)
 #
 # Output format (on exit 0):
-#   Line 1: "cached: <timestamp>"
-#   Lines 2-5: status table (lint mend, lint fmt, lint clippy, lint doc)
-#   If passed: Line 5 is working-tree status ("clean" or "has changes"),
-#     counting both tracked diff and untracked files (new files are changes too)
-#     If has changes: "=== git diff ===" followed by diff output
-#   If failed: "=== lint mend ===" and/or "=== lint clippy ===" with details
+#   cached: <timestamp>
+#   lint mend         : passed | N auto-fixable, M manual
+#   lint fmt          : unknown (not cached)
+#   lint clippy       : passed | issues found
+#   lint doc          : passed | issues found
+#   git diff          : clean | has changes
+#   resume: <directive telling /clippy which STEP to re-enter at>
+#   === lint mend (manual) ===   per-rule aggregate, then the finding blocks
+#                                that `mend --fix` cannot apply
+#   === lint clippy ===
+#   === lint doc ===
+#   logs: <state dir>
+#
+# Per-command pass/fail comes from latest.json's `commands[]` array — its
+# `status` and `log_file` fields are authoritative, so there is no guessing from
+# log text and no reliance on legacy log filenames.
+#
+# The one thing latest.json does NOT record is which mend findings `mend --fix`
+# can apply on its own. That split decides where /clippy resumes: auto-fixable
+# findings must go through STEP 3 (`lint mend --fix`), and only the manual ones
+# belong in the batch approval gate. So the mend log is parsed for exactly that,
+# and only the manual findings are printed.
+#
+# The working tree diff is reported as clean/has-changes but never dumped —
+# /clippy's style-review step builds its own diff from git.
 #
 # Usage: check_cache.sh [project_dir]
 #   project_dir defaults to current directory
+#
+# Env:
+#   MEND_MAX_LINES   cap on printed manual-finding lines (default 1200)
 
 set -euo pipefail
+
+MEND_MAX_LINES="${MEND_MAX_LINES:-1200}"
 
 cache_root() {
     if [[ -n "${XDG_CACHE_HOME:-}" ]]; then
@@ -46,40 +70,69 @@ project_key() {
 
 STATE_DIR="$TEMP_ROOT/$(project_key "$PROJECT_DIR")"
 LATEST_FILE="$STATE_DIR/latest.json"
-OUTPUT_DIR="$STATE_DIR"
 
 if [[ ! -f "$LATEST_FILE" ]]; then
     echo "No latest.json found." >&2
     exit 1
 fi
 
-read_json_field() {
-    local key="$1"
-    python3 - "$LATEST_FILE" "$key" <<'PY2'
+# Read the whole run record in one pass and emit shell-quoted assignments.
+# Anything absent comes back as an empty string rather than an unset variable.
+run_meta() {
+    python3 - "$LATEST_FILE" <<'PY'
 import json
+import shlex
 import sys
 from pathlib import Path
 
-path = Path(sys.argv[1])
-key = sys.argv[2]
 try:
-    data = json.loads(path.read_text())
+    data = json.loads(Path(sys.argv[1]).read_text())
 except Exception:
-    print("")
-    raise SystemExit(0)
-value = data.get(key)
-if value is None:
-    print("")
-elif isinstance(value, str):
-    print(value)
-else:
-    print(value)
-PY2
+    raise SystemExit(1)
+
+if not isinstance(data, dict):
+    raise SystemExit(1)
+
+
+def emit(key, value):
+    print(f"{key}={shlex.quote('' if value is None else str(value))}")
+
+
+emit("RUN_STATUS", data.get("status"))
+emit("RUN_STARTED", data.get("started_at"))
+emit("RUN_FINISHED", data.get("finished_at"))
+
+known = {"mend", "clippy", "doc", "fmt"}
+seen = set()
+for cmd in data.get("commands") or []:
+    if not isinstance(cmd, dict):
+        continue
+    name = str(cmd.get("name") or "").lower()
+    if name not in known:
+        continue
+    seen.add(name)
+    emit(f"CMD_{name.upper()}_STATUS", cmd.get("status"))
+    emit(f"CMD_{name.upper()}_LOG", cmd.get("log_file"))
+
+for name in known - seen:
+    emit(f"CMD_{name.upper()}_STATUS", "")
+    emit(f"CMD_{name.upper()}_LOG", "")
+PY
 }
 
+if ! meta="$(run_meta)"; then
+    echo "latest.json is unreadable or malformed." >&2
+    exit 1
+fi
+eval "$meta"
+
+if [[ -z "$RUN_STATUS" || -z "$RUN_STARTED" ]]; then
+    echo "latest.json is missing required fields." >&2
+    exit 1
+fi
+
 parse_timestamp_epoch() {
-    local timestamp="$1"
-    python3 - "$timestamp" <<'PY2'
+    python3 - "$1" <<'PY'
 from datetime import datetime
 import sys
 
@@ -95,20 +148,11 @@ except ValueError:
     raise SystemExit(0)
 
 print(int(dt.timestamp()))
-PY2
+PY
 }
 
-raw_timestamp="$(read_json_field started_at)"
-status="$(read_json_field status)"
-finished_at="$(read_json_field finished_at)"
-
-if [[ -z "$raw_timestamp" || -z "$status" ]]; then
-    echo "latest.json is missing required fields." >&2
-    exit 1
-fi
-
-if [[ "$status" == "running" ]]; then
-    start_epoch=$(parse_timestamp_epoch "$raw_timestamp")
+if [[ "$RUN_STATUS" == "running" ]]; then
+    start_epoch=$(parse_timestamp_epoch "$RUN_STARTED")
     now_epoch=$(date "+%s")
     age=$(( now_epoch - start_epoch ))
     if (( start_epoch == 0 || age > STALE_SECONDS )); then
@@ -122,37 +166,59 @@ if [[ "$status" == "running" ]]; then
     while (( elapsed < timeout )); do
         sleep 2
         elapsed=$(( elapsed + 2 ))
-        raw_timestamp="$(read_json_field started_at)"
-        status="$(read_json_field status)"
-        finished_at="$(read_json_field finished_at)"
-        if [[ "$status" != "running" ]]; then
+        meta="$(run_meta)" || break
+        eval "$meta"
+        if [[ "$RUN_STATUS" != "running" ]]; then
             break
         fi
     done
 
-    if [[ "$status" == "running" ]]; then
+    if [[ "$RUN_STATUS" == "running" ]]; then
         echo "Timed out waiting for lint-runs (${timeout}s)." >&2
         exit 1
     fi
 fi
 
-fresh_timestamp="$finished_at"
+case "$RUN_STATUS" in
+    passed|failed) ;;
+    *)
+        echo "Unsupported lint-runs status: $RUN_STATUS" >&2
+        exit 1
+        ;;
+esac
+
+fresh_timestamp="$RUN_FINISHED"
 if [[ -z "$fresh_timestamp" ]]; then
-    fresh_timestamp="$raw_timestamp"
+    fresh_timestamp="$RUN_STARTED"
 fi
 
 log_epoch=$(parse_timestamp_epoch "$fresh_timestamp")
-
 if (( log_epoch == 0 )); then
     echo "Could not parse timestamp: $fresh_timestamp" >&2
     exit 1
 fi
 
+# rg honours .gitignore, so target/ stays out. getmtime keeps this off BSD-only
+# `stat -f`, whose GNU coreutils spelling is different.
 newest_source_mtime=$(
     rg --files -g '*.rs' -g '*.toml' "$PROJECT_DIR" 2>/dev/null |
-    xargs stat -f '%m' 2>/dev/null |
-    sort -rn |
-    head -1
+    python3 -c '
+import os
+import sys
+
+newest = 0.0
+found = False
+for line in sys.stdin:
+    path = line.rstrip("\n")
+    if not path:
+        continue
+    try:
+        newest = max(newest, os.path.getmtime(path))
+        found = True
+    except OSError:
+        pass
+print(int(newest) if found else "")
+'
 )
 
 if [[ -z "$newest_source_mtime" ]]; then
@@ -165,111 +231,188 @@ if (( newest_source_mtime > log_epoch )); then
     exit 1
 fi
 
-case "$status" in
-    passed|failed) ;;
-    *)
-        echo "Unsupported lint-runs status: $status" >&2
-        exit 1
-        ;;
-esac
-
-display_timestamp=$(echo "$fresh_timestamp" | sed 's/T/ /;s/[-+][0-9][0-9]:[0-9][0-9]$//')
-
-first_existing_log() {
-    local path
-    for path in "$@"; do
-        if [[ -f "$path" ]]; then
-            printf '%s\n' "$path"
-            return 0
-        fi
-    done
+# latest.json records log_file relative to the state dir. Fall back to the
+# stable <name>-latest.log mirror when the per-run copy has been reaped.
+resolve_log() {
+    local rel="$1" name="$2"
+    if [[ -n "$rel" && -f "$STATE_DIR/$rel" ]]; then
+        printf '%s\n' "$STATE_DIR/$rel"
+        return 0
+    fi
+    if [[ -f "$STATE_DIR/${name}-latest.log" ]]; then
+        printf '%s\n' "$STATE_DIR/${name}-latest.log"
+        return 0
+    fi
     return 1
 }
 
-if [[ "$status" == "passed" ]]; then
-    diff_output=$(git -C "$PROJECT_DIR" diff 2>/dev/null)
-    # Untracked files are uncommitted changes too. Render each as an all-additions
-    # diff so the no-op path never skips a brand-new (untracked) file.
-    while IFS= read -r untracked_file; do
-        [[ -n "$untracked_file" ]] || continue
-        diff_output+=$'\n'"$(git -C "$PROJECT_DIR" diff --no-index /dev/null "$untracked_file" 2>/dev/null)"
-    done < <(git -C "$PROJECT_DIR" ls-files --others --exclude-standard 2>/dev/null)
-    echo "cached: $display_timestamp"
+# Split mend findings into what `mend --fix` applies and what a human must do.
+# Writes the manual detail (per-rule aggregate first, then the finding blocks)
+# to $2; prints the fixable count and the manual count, one per line.
+analyze_mend() {
+    python3 - "$1" "$2" "$MEND_MAX_LINES" <<'PY'
+import re
+import sys
+from collections import Counter, defaultdict
+from pathlib import Path
+
+log_path, out_path, max_lines = sys.argv[1], sys.argv[2], int(sys.argv[3])
+
+try:
+    text = Path(log_path).read_text(errors="replace")
+except OSError:
+    print(0)
+    print(0)
+    raise SystemExit(0)
+
+AUTOFIX = "auto-fixable with `cargo mend --fix`"
+RULE = re.compile(r"cargo-mend#([a-z-]+)")
+LOCATION = re.compile(r"-->\s*([^\s:]+):")
+
+fixable = 0
+manual = []
+trailer = []
+
+for block in text.split("\n\n"):
+    if not block.strip():
+        continue
+    if RULE.search(block):
+        if AUTOFIX in block:
+            fixable += 1
+        else:
+            manual.append(block.rstrip("\n"))
+    elif re.match(r"\s*(errors|summary):", block):
+        trailer.extend(line.strip() for line in block.splitlines() if line.strip())
+
+rules = Counter()
+files = defaultdict(set)
+for block in manual:
+    rule = RULE.search(block)
+    if not rule:
+        continue
+    rules[rule.group(1)] += 1
+    location = LOCATION.search(block)
+    if location:
+        files[rule.group(1)].add(location.group(1))
+
+header = []
+if rules:
+    header.append("manual findings by rule:")
+    for rule, count in rules.most_common():
+        header.append(f"  {count:5}  {rule}  ({len(files[rule])} files)")
+if trailer:
+    header.extend(trailer)
+if header:
+    header.append("")
+
+body = []
+for block in manual:
+    body.extend(block.splitlines())
+    body.append("")
+
+if len(body) > max_lines:
+    body = body[:max_lines]
+    body.append(f"... truncated at {max_lines} lines — read {log_path} for the rest")
+
+Path(out_path).write_text("\n".join(header + body).rstrip("\n") + "\n")
+
+print(fixable)
+print(len(manual))
+PY
+}
+
+mend_log="$(resolve_log "$CMD_MEND_LOG" mend || true)"
+clippy_log="$(resolve_log "$CMD_CLIPPY_LOG" clippy || true)"
+doc_log="$(resolve_log "$CMD_DOC_LOG" doc || true)"
+
+# Always analyse the mend log when one exists. cargo-port only fails the mend
+# command when it was invoked with --fail-on-warn, so a `passed` status can still
+# sit on top of auto-fixable warnings; the counts decide, not the status.
+mend_fixable=0
+mend_manual=0
+# Written beside the run's own logs rather than to TMPDIR: the state dir is
+# always writable when the cache exists, and the file survives the run so a
+# truncated listing can be read back in full.
+mend_detail="$STATE_DIR/mend-manual-latest.log"
+if [[ -n "$mend_log" ]]; then
+    counts="$(analyze_mend "$mend_log" "$mend_detail")"
+    mend_fixable="$(printf '%s\n' "$counts" | head -1)"
+    mend_manual="$(printf '%s\n' "$counts" | tail -1)"
+elif [[ "$CMD_MEND_STATUS" == "failed" ]]; then
+    echo "mend failed but its log is missing." >&2
+    exit 1
+fi
+
+clippy_has_issues=false
+if [[ "$CMD_CLIPPY_STATUS" == "failed" ]]; then
+    clippy_has_issues=true
+fi
+
+doc_has_issues=false
+if [[ "$CMD_DOC_STATUS" == "failed" ]]; then
+    doc_has_issues=true
+fi
+
+diff_output="$(git -C "$PROJECT_DIR" diff 2>/dev/null || true)"
+untracked="$(git -C "$PROJECT_DIR" ls-files --others --exclude-standard 2>/dev/null || true)"
+tree_state=clean
+if [[ -n "$diff_output" || -n "$untracked" ]]; then
+    tree_state="has changes"
+fi
+
+display_timestamp="${fresh_timestamp/T/ }"
+display_timestamp="${display_timestamp%%[-+][0-9][0-9]:[0-9][0-9]}"
+
+echo "cached: $display_timestamp"
+if (( mend_fixable > 0 || mend_manual > 0 )); then
+    echo "lint mend         : ${mend_fixable} auto-fixable, ${mend_manual} manual"
+else
     echo "lint mend         : passed"
-    echo "lint fmt          : passed"
+fi
+echo "lint fmt          : unknown (not cached)"
+if [[ "$clippy_has_issues" == true ]]; then
+    echo "lint clippy       : issues found"
+else
     echo "lint clippy       : passed"
+fi
+if [[ "$doc_has_issues" == true ]]; then
+    echo "lint doc          : issues found"
+else
     echo "lint doc          : passed"
-    if [[ -z "$diff_output" ]]; then
-        echo "git diff          : clean"
-    else
-        echo "git diff          : has changes"
-        echo "=== git diff ==="
-        echo "$diff_output"
-    fi
+fi
+echo "git diff          : $tree_state"
+
+# Where /clippy re-enters its pipeline. Auto-fixable mend findings must be
+# applied by STEP 3 before anything is offered to the batch gate; applying them
+# rewrites source, which invalidates the cached clippy and doc results, so that
+# path re-runs them. With nothing to auto-fix the cached results still describe
+# the tree, so STEP 5/5b can read them instead of re-running.
+if (( mend_fixable > 0 )); then
+    echo "resume: STEP 3 — ${mend_fixable} auto-fixable mend findings; run 3 -> 4 -> 5 -> 5b -> 6 -> 7 -> 8 -> 9"
+elif (( mend_manual > 0 )) || [[ "$clippy_has_issues" == true || "$doc_has_issues" == true ]]; then
+    echo "resume: STEP 4 — nothing to auto-fix; run 4 -> 6 -> 7 -> 8 -> 9, reusing the cached clippy/doc output below for STEP 5/5b unless STEP 4 edits files"
+elif [[ "$tree_state" == "has changes" ]]; then
+    echo "resume: STEP 4 — all lints passed; run 4 -> 6 -> 8 -> 9, reusing the cached clippy/doc results for STEP 5/5b unless STEP 4 edits files"
+else
+    echo "resume: NONE — all lints passed and the working tree is clean"
 fi
 
-if [[ "$status" == "failed" ]]; then
-    echo "cached: $display_timestamp"
-    mend_log="$(first_existing_log "$OUTPUT_DIR/mend-latest.log" "$OUTPUT_DIR/RUSTC_WRAPPER-latest.log" || true)"
-    doc_log="$(first_existing_log "$OUTPUT_DIR/doc-latest.log" "$OUTPUT_DIR/RUSTDOCFLAGS---D-latest.log" "$OUTPUT_DIR/RUSTDOCFLAGS=\"-D-latest.log" || true)"
-
-    # Determine mend status
-    mend_has_issues=false
-    if [[ -n "$mend_log" ]]; then
-        mend_output=$(cat "$mend_log")
-        if [[ -n "$mend_output" ]] && ! echo "$mend_output" | grep -q "No findings"; then
-            mend_has_issues=true
-        fi
-    fi
-
-    # Determine clippy status
-    clippy_has_issues=false
-    if [[ -f "$OUTPUT_DIR/clippy-latest.log" ]]; then
-        clippy_output=$(cat "$OUTPUT_DIR/clippy-latest.log")
-        if [[ -n "$clippy_output" ]]; then
-            clippy_has_issues=true
-        fi
-    fi
-
-    # Determine doc status. Unlike mend/clippy, a clean `cargo doc` run still
-    # writes "Documenting.../Finished" chatter to its log, so a non-empty log is
-    # not a failure signal. Look for rustdoc problem lines instead — with
-    # RUSTDOCFLAGS="-D warnings", denied lints surface as `error:` lines.
-    doc_has_issues=false
-    if [[ -n "$doc_log" ]]; then
-        if grep -qiE "^(warning|error)" "$doc_log"; then
-            doc_has_issues=true
-        fi
-    fi
-
-    if [[ "$mend_has_issues" == true ]]; then
-        echo "lint mend         : issues found"
-    else
-        echo "lint mend         : passed"
-    fi
-    echo "lint fmt          : unknown (not cached)"
-    if [[ "$clippy_has_issues" == true ]]; then
-        echo "lint clippy       : issues found"
-    else
-        echo "lint clippy       : passed"
-    fi
-    if [[ "$doc_has_issues" == true ]]; then
-        echo "lint doc          : issues found"
-    else
-        echo "lint doc          : passed"
-    fi
-
-    # Output details
-    if [[ "$mend_has_issues" == true ]]; then
-        echo "=== lint mend ==="
-        cat "$mend_log"
-    fi
-    if [[ "$clippy_has_issues" == true ]]; then
-        echo "=== lint clippy ==="
-        cat "$OUTPUT_DIR/clippy-latest.log"
-    fi
-    if [[ "$doc_has_issues" == true ]]; then
-        echo "=== lint doc ==="
-        cat "$doc_log"
-    fi
+if (( mend_manual > 0 )); then
+    echo "=== lint mend (manual) ==="
+    cat "$mend_detail"
+    echo "(full manual listing: $mend_detail)"
 fi
+if (( mend_fixable > 0 )); then
+    echo "=== lint mend (auto-fixable) ==="
+    echo "${mend_fixable} findings apply cleanly via \`lint mend --fix\` — not listed; run STEP 3."
+fi
+if [[ "$clippy_has_issues" == true && -n "$clippy_log" ]]; then
+    echo "=== lint clippy ==="
+    cat "$clippy_log"
+fi
+if [[ "$doc_has_issues" == true && -n "$doc_log" ]]; then
+    echo "=== lint doc ==="
+    cat "$doc_log"
+fi
+
+echo "logs: $STATE_DIR"

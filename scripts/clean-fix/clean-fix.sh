@@ -189,6 +189,7 @@ build_target_matches_filter() {
 BUILD_TARGETS=()
 cf_ac_keys=()
 cf_ac_vals=()
+CLEAN_ENABLED=""
 STYLE_EVAL_ENABLED=""
 STYLE_EVAL_AGENT=""
 STYLE_EVAL_MODEL=""
@@ -253,6 +254,7 @@ cf_load_stage_assignment style_eval_review \
     STYLE_REVIEW_ENABLED STYLE_REVIEW_AGENT STYLE_REVIEW_MODEL STYLE_REVIEW_EFFORT || exit 1
 cf_load_stage_assignment style_fix \
     STYLE_FIX_ENABLED STYLE_FIX_AGENT STYLE_FIX_MODEL STYLE_FIX_EFFORT || exit 1
+cf_load_stage_enabled clean CLEAN_ENABLED || exit 1
 
 START_TIME=$SECONDS
 if [[ -n "$PROJECT_FILTER" ]]; then
@@ -271,7 +273,10 @@ python3 "$SCRIPT_DIR/backpopulate_settings.py" --apply >> "$LOG_FILE" 2>&1 || {
     log "WARNING: settings back-population failed"
 }
 
-if [[ "$SCOPE" != "style" && "$SCOPE" != "run_once" ]]; then
+if [[ "$SCOPE" != "style" && "$SCOPE" != "run_once" && "$CLEAN_ENABLED" != "true" ]]; then
+    log "SKIP: clean/build disabled in $CLEAN_FIX_AGENT_ASSIGNMENTS_FILE"
+fi
+if [[ "$SCOPE" != "style" && "$SCOPE" != "run_once" && "$CLEAN_ENABLED" == "true" ]]; then
 # Guard so set -u doesn't trip on an empty allowlist expansion.
 if [[ ${#BUILD_TARGETS[@]} -eq 0 ]]; then
     log "No [build] targets configured — skipping clean/build pass."

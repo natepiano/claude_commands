@@ -42,16 +42,15 @@ cf_validate_bool() {
     esac
 }
 
-# cf_load_stage_assignment <section> <enabled_var> <family_var> <agent_var> <effort_var>
-cf_load_stage_assignment() {
+# cf_load_stage_enabled <section> <enabled_var>
+# Reads only the `enabled` switch. The clean/build pass runs no agent and so has
+# no registry row; going through cf_load_stage_assignment would fail resolution
+# for it.
+cf_load_stage_enabled() {
     local want_section="$1"
     local enabled_var="$2"
-    local family_var="$3"
-    local agent_var="$4"
-    local effort_var="$5"
     local line stripped section
     local parsed_enabled=""
-    local resolved_family resolved_agent resolved_effort
 
     if [[ ! -f "$CLEAN_FIX_AGENT_ASSIGNMENTS_FILE" ]]; then
         echo "ERROR: clean-fix agent assignment file not found: $CLEAN_FIX_AGENT_ASSIGNMENTS_FILE" >&2
@@ -79,15 +78,25 @@ cf_load_stage_assignment() {
         return 1
     fi
     cf_validate_bool "$want_section" enabled "$parsed_enabled" || return 1
-    agents_resolve "cleanfix.$want_section" || return 1
-    resolved_family="$AGENT_FAMILY"
-    resolved_agent="$AGENT_MODEL"
-    resolved_effort="$AGENT_EFFORT"
-
     printf -v "$enabled_var" '%s' "$parsed_enabled"
-    printf -v "$family_var" '%s' "$resolved_family"
-    printf -v "$agent_var" '%s' "$resolved_agent"
-    printf -v "$effort_var" '%s' "$resolved_effort"
+}
+
+# cf_load_stage_assignment <section> <enabled_var> <family_var> <agent_var> <effort_var>
+cf_load_stage_assignment() {
+    local want_section="$1"
+    local enabled_var="$2"
+    local family_var="$3"
+    local agent_var="$4"
+    local effort_var="$5"
+    local cf_stage_enabled_value=""
+
+    cf_load_stage_enabled "$want_section" cf_stage_enabled_value || return 1
+    agents_resolve "cleanfix.$want_section" || return 1
+
+    printf -v "$enabled_var" '%s' "$cf_stage_enabled_value"
+    printf -v "$family_var" '%s' "$AGENT_FAMILY"
+    printf -v "$agent_var" '%s' "$AGENT_MODEL"
+    printf -v "$effort_var" '%s' "$AGENT_EFFORT"
 }
 
 cf_print_stage_assignment() {
@@ -98,9 +107,17 @@ cf_print_stage_assignment() {
         "$section" "$enabled" "$family" "${agent:-<default>}" "${effort:-<default>}"
 }
 
+cf_print_stage_enabled() {
+    local section="$1"
+    local enabled=""
+    cf_load_stage_enabled "$section" enabled || return 1
+    printf '%-18s enabled=%-5s (no agent)\n' "$section" "$enabled"
+}
+
 cf_print_agent_assignments() {
     echo "clean-fix assignments: $CLEAN_FIX_AGENT_ASSIGNMENTS_FILE"
     echo "global agent registry: $AGENTS_CONFIG_FILE"
+    cf_print_stage_enabled clean
     cf_print_stage_assignment style_eval
     cf_print_stage_assignment style_eval_review
     cf_print_stage_assignment style_fix

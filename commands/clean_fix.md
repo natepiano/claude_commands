@@ -14,7 +14,7 @@ When no subcommand is provided, run this script and relay its stdout exactly:
 
 The script owns the user-facing data, section order, column widths, wrapping, and formatting. Do not parse, summarize, truncate, filter, sort, merge, rename, rewrite, add rows, or convert its output to Markdown pipe tables. Do not read or reinterpret clean-fix config files for this screen; the script output is the only source. If the script exits non-zero, show its stdout/stderr exactly and stop.
 
-Dispatch: `run`/`run_once` → <Run/>, `add` → <Add/>, `rename` → <Rename/>, `monitor` → <Monitor/>, `report`/`list` → <Report/>, `eval`/`review`/`fix`/`agent`/`on`/`off` → <StyleAgentConfig/>, `skip` → <Skip/>. Empty or unrecognized first token → run the usage script above, relay stdout exactly, and stop.
+Dispatch: `run`/`run_once` → <Run/>, `add` → <Add/>, `rename` → <Rename/>, `monitor` → <Monitor/>, `report`/`list` → <Report/>, `clean`/`eval`/`review`/`fix`/`agent`/`on`/`off` → <StyleAgentConfig/>, `skip` → <Skip/>. Empty or unrecognized first token → run the usage script above, relay stdout exactly, and stop.
 
 <Run>
 
@@ -286,16 +286,17 @@ Read `~/.claude/scripts/clean-fix/report-render.md` and follow it, substituting 
 
 <StyleAgentConfig>
 
-## eval|review|fix [on|off]
+## clean|eval|review|fix [on|off]
 ## agent
 ## on|off
 
-Show clean-fix agent assignments or set stage enablement. These commands do not run the eval, review, or fix phase for a project. Project-scoped style execution is `clean_fix run <project>`.
+Show clean-fix agent assignments or set stage enablement. These commands do not run the clean, eval, review, or fix phase for a project. Project-scoped execution is `clean_fix run <project>`.
 
 The clean-fix stage assignment file is `~/.claude/scripts/clean-fix/agent-assignments.conf`; it owns only stage `enabled=` values. The global agent registry is `~/.claude/config/agents.conf`; `[assignments] cleanfix=<family>` selects the family and `[cleanfix.<family>]` provides each stage's `agent[:effort]` row.
 
-Three clean-fix sections are configurable:
+Four clean-fix sections are configurable:
 
+- **clean** — `[clean] enabled=`; the nightly cargo clean + build + mend + warmup pass. It runs no agent, so it has no registry row and no family/agent/effort — only the switch. With it off, `clean-fix.sh` logs `SKIP: clean/build disabled in <assignments file>` and runs no clean, build, or mend, whatever `[build]` in `clean-fix.conf` lists.
 - **eval** — `[style_eval] enabled=`; registry row `cleanfix.style_eval`.
 - **review** — `[style_eval_review] enabled=`; registry row `cleanfix.style_eval_review`.
 - **fix** — `[style_fix] enabled=`; registry row `cleanfix.style_fix`.
@@ -305,11 +306,11 @@ Three clean-fix sections are configurable:
 Argument handling:
 
 1. **`/clean_fix agent`** — run `bash ~/.claude/scripts/clean-fix/agent_assignments.sh` and relay its status view: assignment path, registry path, and each stage's `enabled`, family, resolved agent, and effort. Then point to `/agent cleanfix <family>` for family switching and `/agent cleanfix.<stage> <agent>[:<effort>]` for row edits. Stop. Extra tokens after `agent` are invalid; show those two `/agent` forms and stop.
-2. **First token is `eval`, `review`, or `fix`** — map it to `[style_eval]`, `[style_eval_review]`, or `[style_fix]`.
-3. **Scoped status:** `/clean_fix eval`, `/clean_fix review`, or `/clean_fix fix` sources `agent_assignments.sh` and calls `cf_print_stage_assignment` for that section. Show its `enabled`, family, resolved agent, and effort.
-4. **Project names are invalid here:** `/clean_fix eval <project>`, `/clean_fix review <project>`, and `/clean_fix fix <project>` are not supported. Tell the user to use `/clean_fix run <project>` for a single project's style eval/review/fix flow.
-5. **Scoped enable/disable:** `/clean_fix eval on`, `/clean_fix review off`, `/clean_fix fix on`, etc. set only that section's `enabled=` to `true` or `false` in `agent-assignments.conf`.
-6. **Global enable/disable:** `/clean_fix on` and `/clean_fix off` set all three `enabled=` values to `true` or `false` in `agent-assignments.conf`.
+2. **First token is `clean`, `eval`, `review`, or `fix`** — map it to `[clean]`, `[style_eval]`, `[style_eval_review]`, or `[style_fix]`.
+3. **Scoped status:** `/clean_fix eval`, `/clean_fix review`, or `/clean_fix fix` sources `agent_assignments.sh` and calls `cf_print_stage_assignment` for that section. Show its `enabled`, family, resolved agent, and effort. `/clean_fix clean` calls `cf_print_stage_enabled clean` instead — that stage has no agent to resolve, and `cf_load_stage_assignment` would fail looking for a registry row.
+4. **Project names are invalid here:** `/clean_fix clean <project>`, `/clean_fix eval <project>`, `/clean_fix review <project>`, and `/clean_fix fix <project>` are not supported. Tell the user to use `/clean_fix run <project>` for a single project.
+5. **Scoped enable/disable:** `/clean_fix clean off`, `/clean_fix eval on`, `/clean_fix review off`, `/clean_fix fix on`, etc. set only that section's `enabled=` to `true` or `false` in `agent-assignments.conf`.
+6. **Global enable/disable:** `/clean_fix on` and `/clean_fix off` set all four `enabled=` values — `[clean]` included — to `true` or `false` in `agent-assignments.conf`. `/clean_fix off` therefore stops the nightly 4 AM clean/build/mend pass as well as the three style stages; before the `[clean]` switch existed it stopped only the style stages and the nightly pass kept running.
 7. Any former `/clean_fix agent ...`, `<scope> agent ...`, `<scope> model ...`, or `<scope> effort ...` setter form is invalid. Point to `/agent cleanfix <family>` or `/agent cleanfix.<stage> <agent>[:<effort>]` and stop without editing.
 8. The `[build]` and `[projects]` skip lists remain in `clean-fix.conf` and are managed by `phase_skip.py` (see <Skip/>), never by direct edits.
 

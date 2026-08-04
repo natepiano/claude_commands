@@ -21,12 +21,32 @@ Run the cache check script:
 bash ~/.claude/scripts/clippy/check_cache.sh .
 ```
 
-- **Exit 0, all passed + "git diff: clean"**: Print the status table and exit (complete no-op).
-- **Exit 0, all passed + "git diff: has changes"**: Print the status table, then resume at STEP 4 and continue through remaining steps in order (4 → 5 → 5b → 6 → 8 → 9).
-- **Exit 0, issues found**: Print the status table and the `=== lint mend ===` / `=== lint clippy ===` / `=== lint doc ===` details. Then resume at STEP 7 and execute it in full — **including stopping at `<BatchDecisionPoint/>` and waiting for user approval before any edits** (in auto-proceed mode the gate reports and proceeds instead — see <AutoProceed/>). "Resuming at STEP 7" does not mean skipping the decision gate.
-- **Exit 1**: Cache miss — proceed to STEP 2 (<RunMend/>).
+**Exit 1** — cache miss. Proceed to STEP 2 (<RunMend/>).
 
-The script reads lint-runs' `latest.json`, waits if a run is still in progress, compares the cached timestamp to source files, and outputs formatted results.
+**Exit 0** — cache hit. Print the status table, then obey the `resume:` line the
+script emits. It is computed from the cached run; do not re-derive it.
+
+| `resume:` | What to do |
+|---|---|
+| `NONE` | Print the status table and exit — complete no-op. |
+| `STEP 3` | The cached run has auto-fixable mend findings that were never applied — cargo-port runs mend in check mode, so a cache hit is always a pre-fix snapshot. Enter at STEP 3, continue 3 → 4 → 5 → 5b → 6 → 7 → 8 → 9. Applying fixes rewrites source, so clippy and doc must genuinely re-run. |
+| `STEP 4` | Nothing to auto-fix. Enter at STEP 4, then go to STEP 6 — at STEP 5/5b reuse the `=== lint clippy ===` / `=== lint doc ===` output already printed rather than re-running. If STEP 4 edited files, run 5/5b for real instead. Continue 6 → 7 → 8 → 9. |
+
+Reaching STEP 7 by any route still means stopping at `<BatchDecisionPoint/>` and
+waiting for user approval before any edits (in auto-proceed mode the gate
+reports and proceeds instead — see <AutoProceed/>). A resume directive never
+skips the decision gate.
+
+Only the **manual** mend findings are printed, under `=== lint mend (manual) ===`
+— the ones `mend --fix` cannot apply. Those are the ones that belong in the
+batch todo list. Auto-fixable findings are counted, never listed, because STEP 3
+handles them; do not turn them into todos. If the manual listing is truncated,
+the script prints the path to the full listing — read that file rather than
+working from the excerpt.
+
+The script reads lint-runs' `latest.json`, waits if a run is still in progress,
+takes per-command pass/fail from its `commands[]` array, and rejects the cache
+when any `*.rs`/`*.toml` is newer than the run.
 </CheckCachedResults>
 
 <RunMend>
@@ -378,14 +398,14 @@ truth that maps clippy lints to the rule that governs them.
 <ExecutionSteps>
 **EXECUTE THESE STEPS IN ORDER:**
 
-**STEP 1:** Execute <CheckCachedResults/> — check for fresh lint-runs results. Follow its resume instructions (may skip ahead but always continues through remaining steps in order).
+**STEP 1:** Execute <CheckCachedResults/> — check for fresh lint-runs results. On a cache hit, re-enter the pipeline at the step named by the script's `resume:` line and continue through the remaining steps in order. A cache hit never skips STEP 3 when there are auto-fixable mend findings, and never skips the STEP 7 decision gate.
 **STEP 2:** Execute <RunMend/> — run `~/.claude/scripts/clippy/lint mend` to check for issues
 **STEP 3:** If fixable items found, execute <RunMendFix/> — run `~/.claude/scripts/clippy/lint mend --fix`. If it fails, STOP and ask user.
 **STEP 4:** **Always** execute <StyleReview/> — evaluate diff against style guide rules (loads style guide only if diff is non-empty)
 **STEP 5:** Execute <RunClippy/>
 **STEP 5b:** Execute <RunDoc/> — run rustdoc as a lint with `~/.claude/scripts/clippy/lint doc`
 **STEP 6:** Execute <ReportFindings/> — present mend, clippy, and doc summary (fmt runs later, at STEP 8, and is covered in the completion summary)
-**STEP 7:** If unfixable mend or clippy issues found, execute <CreateBatchTodoList/>, <BatchDecisionPoint/>, <BatchExecution/>
+**STEP 7:** If manual mend, clippy, or doc issues found, execute <CreateBatchTodoList/>, <BatchDecisionPoint/>, <BatchExecution/>
 **STEP 8:** Execute <RunFmt/> — run `~/.claude/scripts/clippy/lint fmt` unconditionally
 **STEP 9:** Completion summary
 </ExecutionSteps>
