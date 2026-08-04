@@ -5,6 +5,10 @@
 #        clean-fix.sh run_once
 #   clean — settings back-populate + cargo clean/build/mend + warmup
 #           (nightly via com.natemccoy.cargo-clean, 4:00 AM calendar)
+#           The mend step is the one stage here gated by config/lint.conf
+#           (mend=off, set with /lint_config) rather than by the clean-fix
+#           agent-assignments file; it is skipped on its own, and clean,
+#           build, and warmup still run.
 #   style — style eval + review + fix worktrees
 #           (every 10 min via com.natemccoy.style-fix, no idle gate)
 #   run_once — one style eval + review + fix pass across all configured

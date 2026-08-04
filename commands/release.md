@@ -111,7 +111,7 @@ All scriptable steps use shell scripts. The agent orchestrates script execution 
 
 **Universal scripts** in `~/.claude/scripts/release/`:
 - `validate_version.sh` — format, collision, and gap checking ⊘
-- `pre_release_checks.sh` — git status, clippy, build, test, fmt ⊘
+- `pre_release_checks.sh` — git status, clippy, build, test, fmt ⊘ (deliberately ignores `config/lint.conf`; a check turned off with `/lint_config` still runs here, because a release gate that silently no-ops is worse than a noisy one)
 - `create_release_branch.sh` — branch creation
 - `bump_versions.sh` — update [package] version fields
 - `pin_path_deps.sh` — pin path-only workspace deps to published versions for publish (release branch only)

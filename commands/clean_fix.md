@@ -296,7 +296,7 @@ The clean-fix stage assignment file is `~/.claude/scripts/clean-fix/agent-assign
 
 Four clean-fix sections are configurable:
 
-- **clean** — `[clean] enabled=`; the nightly cargo clean + build + mend + warmup pass. It runs no agent, so it has no registry row and no family/agent/effort — only the switch. With it off, `clean-fix.sh` logs `SKIP: clean/build disabled in <assignments file>` and runs no clean, build, or mend, whatever `[build]` in `clean-fix.conf` lists.
+- **clean** — `[clean] enabled=`; the nightly cargo clean + build + mend + warmup pass. It runs no agent, so it has no registry row and no family/agent/effort — only the switch. With it off, `clean-fix.sh` logs `SKIP: clean/build disabled in <assignments file>` and runs no clean, build, or mend, whatever `[build]` in `clean-fix.conf` lists. The mend step has a second gate above this one: `mend=off` in `config/lint.conf` (set with `/lint_config`) skips mend alone and logs `SKIP: mend for <project> — mend=off in config/lint.conf`, while clean, build, and warmup still run. Nothing else in clean-fix reads that file.
 - **eval** — `[style_eval] enabled=`; registry row `cleanfix.style_eval`.
 - **review** — `[style_eval_review] enabled=`; registry row `cleanfix.style_eval_review`.
 - **fix** — `[style_fix] enabled=`; registry row `cleanfix.style_fix`.
