@@ -1,8 +1,8 @@
 ---
-description: Compact the completed phases of an in-flight plan doc — rewrite each `done` phase's Work Order, Retrospective, and Review blocks into a short as-built record of what actually shipped, dropping decision debate and process narration. The live (`todo`) zone and Delegation Context are never touched.
+description: Shrink the completed phases of an in-flight plan doc — rewrite each `done` phase's Work Order, Retrospective, and Review blocks into a short as-built record of what actually shipped, dropping decision debate and process narration. The live (`todo`) zone and Delegation Context are never touched.
 ---
 
-# Plan Compact
+# Plan Shrink
 
 **Purpose:** A phased plan implemented over many days grows an archive zone that
 outweighs the work left to do. Every `done` phase carries the Work Order it was
@@ -16,15 +16,15 @@ phase shipped, stated in the present tense, corrected to what actually landed.
 Deliberation goes ("this was decided this way, that was decided that way"),
 process narration goes, prospective phrasing goes. Facts survive.
 
-**Usage:** `/plan:compact [plan-doc-path] [--phases <ids>]`
+**Usage:** `/plan:shrink [plan-doc-path] [--phases <ids>]`
 
 **Argument:** the in-flight plan doc. **Omitting it is the normal case** — with no
-argument this command compacts the plan the current `/plan:delegate` run is
+argument this command shrinks the plan the current `/plan:delegate` run is
 executing, resolved from the run record rather than from memory. See
 `<ResolvePlan/>`.
 
 **`--phases <ids>`** (optional) comma-separated phase identifiers (`1,4b,7`) to
-limit the run to those phases. Without it, every `done` phase is compacted.
+limit the run to those phases. Without it, every `done` phase is shrunk.
 
 **When to run it:** whenever the archive zone dominates the doc — a rough trigger
 is the doc past ~1,500 lines or `done` phases past half its length. Natural
@@ -42,7 +42,7 @@ This command does not change code and does not commit.
 **STEP 0:** Execute <ResolvePlan/>
 **STEP 1:** Execute <Locate/>
 **STEP 2:** Execute <IndexLiveDependencies/>
-**STEP 3:** Execute <Compact/>
+**STEP 3:** Execute <Shrink/>
 **STEP 4:** Execute <Splice/>
 **STEP 5:** Execute <Verify/>
 **STEP 6:** Execute <Report/>
@@ -53,7 +53,7 @@ This command does not change code and does not commit.
 ---
 
 <ArchiveOnly>
-**Compaction touches `done` phases and nothing else.** Not the title, not the
+**Shrinking touches `done` phases and nothing else.** Not the title, not the
 status line, not the `As-built disposition` line, not `## Delegation Context`
 (including `Project started`, which `/plan:delegate` treats as authoritative),
 not `## Gates` or any other doc-level section, and above all not a single byte of
@@ -137,18 +137,18 @@ start; read that record.
 
 4. **A single plan doc in conversation**, if the durable lookup found nothing.
 
-5. **Ask.** Never guess, and never compact a doc the user did not name or that
+5. **Ask.** Never guess, and never shrink a doc the user did not name or that
    the run record did not produce.
 
 **Sanity-check whatever came back** before continuing: the path exists and its
 head carries a `## Delegation Context` section. A plan doc that fails this is not
 delegate-ready and this command does not apply to it — say so and stop.
 
-**Running mid-run is fine** — compaction only touches `done` phases, and the
+**Running mid-run is fine** — shrinking only touches `done` phases, and the
 phase `/plan:delegate` is working is `todo`. Two consequences to state in one line
 when a run is active: any copy of the doc already in the orchestrator's context is
-now stale (a later `Edit` against pre-compaction text will fail loudly, not
-silently), and the next checkpoint commit will carry the compaction along with its
+now stale (a later `Edit` against pre-shrink text will fail loudly, not
+silently), and the next checkpoint commit will carry the shrink along with its
 phase.
 </ResolvePlan>
 
@@ -185,31 +185,31 @@ whichever comes first, else EOF.
 
 Then:
 
-- **Skip already-compacted phases.** A `done` phase whose body has an `As-built`
+- **Skip already-shrunk phases.** A `done` phase whose body has an `As-built`
   heading and no `Work Order` / `Retrospective` / `Phase N Review` heading is
-  already compacted. Excluded unless `--phases` names it explicitly.
-- **Nothing to do** — no compactable `done` phase → say so in one line and stop.
+  already shrunk. Excluded unless `--phases` names it explicitly.
+- **Nothing to do** — no shrinkable `done` phase → say so in one line and stop.
 - **No `todo` phases remain** — say so in one line, note that `/plan:to_as_built`
-  is the finishing move, and continue; compaction makes that command's job
+  is the finishing move, and continue; shrinking makes that command's job
   cheaper. Do not stop to ask.
 
 Set **${SCRATCH}** to the session scratchpad directory (or `${TMPDIR}` if the
 session has none). Every intermediate file this command writes lives there and
 none of them belong in the user's repo.
 
-**Back up.** `cp <plan> "${SCRATCH}/$(basename <plan>).pre-compact.md"` and
+**Back up.** `cp <plan> "${SCRATCH}/$(basename <plan>).pre-shrink.md"` and
 keep the path for `<Report/>`. Also run `git status --porcelain -- <plan>` in its
 repo; if the doc is tracked and clean, `git checkout -- <plan>` is the cleaner
 undo and `<Report/>` names it.
 
-State one line: `Compacting <relative/path> — N done phases, <lines> of archive.`
+State one line: `Shrinking <relative/path> — N done phases, <lines> of archive.`
 </Locate>
 
 ---
 
 <IndexLiveDependencies>
 **Goal:** the retention floor — what the remaining phases still need from the
-completed ones. Compaction may drop anything, *except* something the live zone
+completed ones. Shrinking may drop anything, *except* something the live zone
 would then have to re-derive from the code. This step establishes that floor
 before a single line is rewritten.
 
@@ -220,7 +220,7 @@ Dispatch ONE `Explore` (or `general-purpose`) subagent. Its prompt must include:
 - The absolute plan-doc path and the line ranges of the **`todo` phases** and
   `## Delegation Context` (from `<Locate/>`'s heading map). Directive: read those
   ranges only — not the `done` phases.
-- The identifiers and titles of the `done` phases being compacted.
+- The identifiers and titles of the `done` phases being shrunk.
 - The job: for each `done` phase, list every concrete fact the live zone depends
   on it for — a type or signature a later **Spec** names, a rule a later
   **Constraints from prior phases** cites, a file/line ref, an invariant, a
@@ -240,7 +240,7 @@ Capture it as ${FLOOR}. It is small; it goes into every later prompt.
 
 ---
 
-<Compact>
+<Shrink>
 **Goal:** one replacement block per `done` phase, produced without the archive
 text ever entering the orchestrator's context.
 
@@ -259,7 +259,7 @@ Each prompt must include:
   every listed fact must survive, verbatim where it is a signature or a name.
 - `<KeepDrop/>` below, in full.
 - Output: for each phase, `Write` the replacement block to
-  `${SCRATCH}/compact_<id>.md`. Its **first line is the phase heading copied
+  `${SCRATCH}/shrink_<id>.md`. Its **first line is the phase heading copied
   byte-for-byte** from the original. No file may contain a `#### Work Order`,
   `### Retrospective`, or `Phase <id> Review` heading.
 - Return, per phase: `phase <id>: <orig lines> → <new lines>` plus a one-clause
@@ -307,7 +307,7 @@ would otherwise be re-proposed. Omit if none.>
   simply absent from the block.
 - Rejected proposals, one clause each, under **Ruled out** — the plan format
   records them so later passes do not relitigate them, and that reason survives
-  compaction.
+  the shrink.
 
 **Drop:**
 
@@ -322,7 +322,7 @@ would otherwise be re-proposed. Omit if none.>
   whole subsection is dead.
 - **Work Order scaffolding:** **Goal**, **Acceptance gate**, and **Constraints
   from prior phases**. The gate has been passed; the tests it names live in the
-  repo; the constraints came from earlier phases that are themselves compacted.
+  repo; the constraints came from earlier phases that are themselves shrunk.
 - **Prospective and instructional phrasing.** "Create `foo/mod.rs`", "add
   `mod bar;`", "write our own test cases", "check whether the prelude needs
   updating" → rewrite as what now exists, or drop when purely instructional.
@@ -339,12 +339,12 @@ would otherwise be re-proposed. Omit if none.>
 - Delegate/review vocabulary, pass numbers, session references, commit hashes in
   prose (the heading carries the one that matters).
 
-**Calibration:** a compacted phase typically lands at 10–25% of its original
+**Calibration:** a shrunk phase typically lands at 10–25% of its original
 length, often under 25 lines. Coming back over ~40% means narration survived —
-compact again. But brevity is not the goal: removing narration is. Never drop a
+shrink again. But brevity is not the goal: removing narration is. Never drop a
 signature, an invariant, or a gotcha to hit a number.
 </KeepDrop>
-</Compact>
+</Shrink>
 
 ---
 
@@ -353,11 +353,11 @@ Assemble the doc deterministically. The orchestrator does not read or rewrite th
 plan by hand — a script replaces each span bottom-up, so earlier line numbers stay
 valid as later spans shrink.
 
-`Write` a manifest to `${SCRATCH}/compact_manifest.json`:
+`Write` a manifest to `${SCRATCH}/shrink_manifest.json`:
 
 ```json
 {"plan": "<abs plan path>",
- "spans": [{"id": "4b", "start": 637, "end": 738, "file": "<SCRATCH>/compact_4b.md"}]}
+ "spans": [{"id": "4b", "start": 637, "end": 738, "file": "<SCRATCH>/shrink_4b.md"}]}
 ```
 
 `Write` `${SCRATCH}/splice.py`:
@@ -385,7 +385,7 @@ plan.write_text("".join(lines))
 print(f"spliced {len(m['spans'])} phases")
 ```
 
-Run `python3 ${SCRATCH}/splice.py ${SCRATCH}/compact_manifest.json`.
+Run `python3 ${SCRATCH}/splice.py ${SCRATCH}/shrink_manifest.json`.
 
 The three assertions are the structural guarantee: a span that does not begin at
 a `done` phase heading, does not end at a heading boundary, or whose replacement
@@ -400,7 +400,7 @@ heading map) and re-run. Do not edit the plan by hand to work around it.
 ---
 
 <Verify>
-Compaction is lossy on purpose, so it gets one check that it was lossy only where
+Shrinking is lossy on purpose, so it gets one check that it was lossy only where
 intended.
 
 **Structural, orchestrator-run, no tokens:**
@@ -415,13 +415,13 @@ and order must be identical, and no `todo` phase's span may have moved in
 content — only in line number.
 
 **Content, subagent:** dispatch ONE `general-purpose` subagent with ${FLOOR}, the
-plan path, and the new spans of the compacted phases. Its job: confirm every
+plan path, and the new spans of the shrunk phases. Its job: confirm every
 floor item survives in the phase that owns it, verbatim for signatures and type
 names. Return `missing` — floor item, owning phase, one line — and nothing else.
 
 For each `missing` item, patch it into that phase's **Binds later work** from the
 backup. If more than a couple of items are missing, restore the backup and re-run
-`<Compact/>` with the floor stated more forcefully; a compaction that loses the
+`<Shrink/>` with the floor stated more forcefully; a shrink that loses the
 floor is not worth hand-repairing.
 </Verify>
 
@@ -433,7 +433,7 @@ Produce a succinct markdown table:
 ```markdown
 | Area | Result |
 | --- | --- |
-| Compacted | <N done phases; <before> → <after> lines (<pct>% smaller)> |
+| Shrunk | <N done phases; <before> → <after> lines (<pct>% smaller)> |
 | Live zone | <count of todo phases, untouched> |
 | Dropped | <what classes of content went: review blocks, retrospective process notes, work-order scaffolding> |
 | Preserved | <floor items carried forward; gotchas and ruled-out decisions retained> |
@@ -463,10 +463,10 @@ Then stop.
   A fact the remaining phases still depend on is not narration, however it is
   phrased.
 - Rejected decisions survive as one-clause **Ruled out** lines. The plan format
-  records them so later passes do not relitigate them; compaction that drops them
+  records them so later passes do not relitigate them; a shrink that drops them
   reopens settled ground.
 - Back up before splicing, and name the undo in the report.
 - Do not change code and do not commit.
 - After the last phase ships, `/plan:to_as_built` is still the finishing move.
-  Compaction shrinks the archive; it does not convert the plan into a reference
+  This command shrinks the archive; it does not convert the plan into a reference
   doc, and it does not reconcile sibling docs.
