@@ -687,6 +687,15 @@ explicit `--lib`/`--bins` targets from cargo metadata).
   phase.
 - Non-Rust projects: the Work Order lists the project's exact commands instead;
   the run-only-what-is-listed rule is identical.
+- **A lint check the user turned off.** `verify.sh lint` and `verify.sh fmt`
+  read `config/lint.conf` (edited with `/lint_config`), so `clippy=off` or
+  `fmt=off` silences that half everywhere — here, in the `/clippy` skill, and in
+  clean-fix. The command prints
+  `SKIPPED: <command> — <key>=off in <config path>` and exits 0. Treat that line
+  as **skipped, never passed**: say so in the phase summary, and do not run the
+  check by hand to fill the gap — the user disabled it deliberately. `check`,
+  `test`, and the workspace check and test inside `final` are never gated, so
+  the correctness floor is unchanged.
 
 ---
 

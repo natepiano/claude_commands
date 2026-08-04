@@ -2,7 +2,7 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-LINT_CMD="$HOME/.claude/scripts/clippy/lint"
+LINT_CMD="$HOME/.claude/scripts/lint/lint"
 
 REPO_ROOT="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
 REPO_TARGET_DIR="${CARGO_TARGET_DIR:-${REPO_ROOT}/target}"

@@ -63,7 +63,7 @@
       "Read(//private/tmp/claude/**)",
       "Bash(pgrep -lf cargo-watch.*hana)",
       "Bash(find /Users/natemccoy/rust -name \"port-report.log\" -path \"*/target/*\" -delete)",
-      "Bash(bash ~/.claude/scripts/clippy/check_cache.sh .)",
+      "Bash(bash ~/.claude/scripts/lint/check_cache.sh .)",
       "Bash(echo \"exit: $?\")",
       "Bash(grep -E '^\\\\s+\\\\w|^={10,}|^Total|^Canonical')",
       "Bash(log show:*)",

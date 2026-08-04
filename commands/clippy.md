@@ -7,6 +7,44 @@ wait. Auto-proceed does NOT soften the hard stops in <RunMendFix/> or the
 environmental-failure handling anywhere in this skill — those still stop.
 </AutoProceed>
 
+<LoadOperationSwitches>
+Run:
+```bash
+bash ~/.claude/scripts/lint/lint_config.sh export
+```
+
+It prints one `LINT_OP_<NAME>=on|off` line per check, read from
+`~/.claude/config/lint.conf` (edited with `/lint_config`). A check whose value
+is `off` is **skipped entirely** — do not run its command, do not substitute an
+equivalent by hand, and do not create todos from it.
+
+| Variable | Gates in this skill |
+|---|---|
+| `LINT_OP_CACHE` | STEP 1 <CheckCachedResults/> |
+| `LINT_OP_MEND` | STEP 2 <RunMend/> and STEP 3 <RunMendFix/> |
+| `LINT_OP_STYLE_REVIEW` | STEP 4 <StyleReview/> |
+| `LINT_OP_CLIPPY` | STEP 5 <RunClippy/> |
+| `LINT_OP_DOC` | STEP 5b <RunDoc/> |
+| `LINT_OP_FMT` | STEP 8 <RunFmt/> |
+
+These are the same switches `scripts/delegate/verify.sh` and clean-fix read —
+one key per check, no per-consumer override — so `clippy=off` here means clippy
+is off in every delegate phase too.
+
+Two interactions the switches change:
+
+- **`LINT_OP_MEND=off` with `LINT_OP_CACHE=on`.** The cache script has no
+  knowledge of the switches, so it still prints mend counts and can still emit
+  `resume: STEP 3`. Treat that directive as `STEP 4`, ignore the cached
+  `=== lint mend (manual) ===` block, and put none of it in the batch.
+- **A disabled stage in <ReportFindings/>.** Keep its row and write `Off` in
+  both Result and Action. Never report a skipped stage as clean — an unrun
+  check found nothing because it did not run.
+
+If every check is off, print the Findings table with all rows `Off` and stop.
+If the script fails, report the error and stop; do not assume defaults.
+</LoadOperationSwitches>
+
 <LoadStyleGuide>
 Load the Rust style guide by running:
 ```bash
@@ -18,7 +56,7 @@ Confirm using the script summary line. Then proceed.
 <CheckCachedResults>
 Run the cache check script:
 ```bash
-bash ~/.claude/scripts/clippy/check_cache.sh .
+bash ~/.claude/scripts/lint/check_cache.sh .
 ```
 
 **Exit 1** — cache miss. Proceed to STEP 2 (<RunMend/>).
@@ -50,7 +88,7 @@ when any `*.rs`/`*.toml` is newer than the run.
 </CheckCachedResults>
 
 <RunMend>
-Execute: `~/.claude/scripts/clippy/lint mend`
+Execute: `~/.claude/scripts/lint/lint mend`
 
 The `lint` wrapper owns the cargo-mend exception: it runs mend with
 `RUSTC_WRAPPER=` because wrapper tools can otherwise receive `cargo-mend` in
@@ -67,7 +105,7 @@ Analyze output:
 </RunMend>
 
 <RunMendFix>
-Execute: `~/.claude/scripts/clippy/lint mend --fix`
+Execute: `~/.claude/scripts/lint/lint mend --fix`
 
 The `lint` wrapper applies the same cargo-mend wrapper exception noted in
 <RunMend/>.
@@ -80,10 +118,10 @@ Error Handling:
   fix manually.** The working tree is now back at its pre-fix state, which is
   exactly the state needed to reproduce the bug. Present the following so the
   user can copy it verbatim and reproduce / fix cargo mend:
-    1. The full `~/.claude/scripts/clippy/lint mend --fix` output, including
+    1. The full `~/.claude/scripts/lint/lint mend --fix` output, including
        the lint(s) mend tried to fix and the compiler error(s) that triggered
        the revert.
-    2. The exact command that reproduces it: `~/.claude/scripts/clippy/lint mend --fix`
+    2. The exact command that reproduces it: `~/.claude/scripts/lint/lint mend --fix`
     3. `git rev-parse HEAD` and `git status --short` output, confirming the
        working tree matches the reproduction state.
   Then end your turn and wait for the user. Do NOT proceed to clippy.
@@ -95,9 +133,9 @@ If successful: Note any remaining unfixable items from the earlier `cargo mend` 
 </RunMendFix>
 
 <RunFmt>
-Execute: `~/.claude/scripts/clippy/lint fmt`
+Execute: `~/.claude/scripts/lint/lint fmt`
 
-This step runs **unconditionally** (whether mend fixed anything, found nothing, or had only unfixable items).
+This step runs whether mend fixed anything, found nothing, or had only unfixable items. `LINT_OP_FMT=off` is the only thing that skips it.
 
 Check `git diff` after running to determine if fmt applied any changes.
 - If diff is non-empty: fmt applied formatting fixes. Note this for the completion summary.
@@ -107,7 +145,7 @@ Check `git diff` after running to determine if fmt applied any changes.
 <RunClippy>
 The `lint` wrapper supplies `--workspace --all-targets --all-features -- -D warnings`.
 
-Execute: `~/.claude/scripts/clippy/lint clippy ${ARGUMENTS:-}`
+Execute: `~/.claude/scripts/lint/lint clippy ${ARGUMENTS:-}`
 
 If $ARGUMENTS provided, use as additional flags — after removing the
 `auto-proceed` token, which is a mode switch, not a clippy flag (see <AutoProceed/>).
@@ -121,7 +159,7 @@ Capture all output for analysis - both successful warnings and compilation error
 </RunClippy>
 
 <RunDoc>
-Execute: `~/.claude/scripts/clippy/lint doc`
+Execute: `~/.claude/scripts/lint/lint doc`
 
 This mirrors the cargo-port `doc` lint command. `-D warnings` promotes every
 rustdoc lint (broken intra-doc links, invalid codeblock attributes, bare URLs,
@@ -144,15 +182,19 @@ stage, no prose around it:
 ## Findings
 | Stage | Result | Action |
 |---|---|---|
-| Mend | [one of: "Fixed N issues" \| "No issues found" \| "No fixable issues found"] [if unfixable: ", N unfixable"] | [Applied \| N todos below \| —] |
-| Style review | [one of: "N violations fixed" \| "All changes conform" \| "No uncommitted changes"] | [Applied \| —] |
-| Clippy | [one of: "N issues across M files" \| "No issues found"] | [N todos below \| —] |
-| Doc | [one of: "N rustdoc errors across M files" \| "No issues found"] | [N todos below \| —] |
+| Mend | [one of: "Fixed N issues" \| "No issues found" \| "No fixable issues found" \| "Off"] [if unfixable: ", N unfixable"] | [Applied \| N todos below \| Off \| —] |
+| Style review | [one of: "N violations fixed" \| "All changes conform" \| "No uncommitted changes" \| "Off"] | [Applied \| Off \| —] |
+| Clippy | [one of: "N issues across M files" \| "No issues found" \| "Off"] | [N todos below \| Off \| —] |
+| Doc | [one of: "N rustdoc errors across M files" \| "No issues found" \| "Off"] | [N todos below \| Off \| —] |
 
 The **Action** column carries what used to be explanatory prose: mend and style
 fixes are already applied (`Applied`), unfixable mend issues / clippy issues /
 rustdoc errors become todos (`N todos below`), and a clean stage is `—`. Do not
 restate any of that in sentences under the table.
+
+A stage disabled by <LoadOperationSwitches/> reads `Off` in **both** columns.
+Keep the row — dropping it, or writing "No issues found" for a stage that never
+ran, hides the fact that the check was skipped.
 </ReportFindings>
 
 <CreateBatchTodoList>
@@ -344,7 +386,7 @@ truth that maps clippy lints to the rule that governs them.
 </FixingGuidelines>
 
 <StyleReview>
-**This step runs unconditionally** — even if mend and clippy found zero issues.
+**This step runs even if mend and clippy found zero issues.** `LINT_OP_STYLE_REVIEW=off` is the only thing that skips it.
 
 **Do this step yourself — do not delegate it to a subagent** (Task/Agent tool, Codex sub-session, etc.). Run the diff commands and the rule-by-rule walk inline in this conversation so the user can watch progress rule-by-rule instead of waiting on an unauditable subagent turn.
 
@@ -396,16 +438,19 @@ truth that maps clippy lints to the rule that governs them.
 </StyleReview>
 
 <ExecutionSteps>
-**EXECUTE THESE STEPS IN ORDER:**
+**EXECUTE THESE STEPS IN ORDER.** Every numbered step below is gated by
+<LoadOperationSwitches/> — a step whose switch is `off` is skipped outright, and
+the pipeline continues at the next enabled step.
 
+**STEP 0:** Execute <LoadOperationSwitches/> — read which stages are enabled. This step is never skipped.
 **STEP 1:** Execute <CheckCachedResults/> — check for fresh lint-runs results. On a cache hit, re-enter the pipeline at the step named by the script's `resume:` line and continue through the remaining steps in order. A cache hit never skips STEP 3 when there are auto-fixable mend findings, and never skips the STEP 7 decision gate.
-**STEP 2:** Execute <RunMend/> — run `~/.claude/scripts/clippy/lint mend` to check for issues
-**STEP 3:** If fixable items found, execute <RunMendFix/> — run `~/.claude/scripts/clippy/lint mend --fix`. If it fails, STOP and ask user.
-**STEP 4:** **Always** execute <StyleReview/> — evaluate diff against style guide rules (loads style guide only if diff is non-empty)
+**STEP 2:** Execute <RunMend/> — run `~/.claude/scripts/lint/lint mend` to check for issues
+**STEP 3:** If fixable items found, execute <RunMendFix/> — run `~/.claude/scripts/lint/lint mend --fix`. If it fails, STOP and ask user.
+**STEP 4:** Execute <StyleReview/> — evaluate diff against style guide rules (loads style guide only if diff is non-empty). Runs regardless of what earlier steps found; only `LINT_OP_STYLE_REVIEW=off` skips it.
 **STEP 5:** Execute <RunClippy/>
-**STEP 5b:** Execute <RunDoc/> — run rustdoc as a lint with `~/.claude/scripts/clippy/lint doc`
+**STEP 5b:** Execute <RunDoc/> — run rustdoc as a lint with `~/.claude/scripts/lint/lint doc`
 **STEP 6:** Execute <ReportFindings/> — present mend, clippy, and doc summary (fmt runs later, at STEP 8, and is covered in the completion summary)
 **STEP 7:** If manual mend, clippy, or doc issues found, execute <CreateBatchTodoList/>, <BatchDecisionPoint/>, <BatchExecution/>
-**STEP 8:** Execute <RunFmt/> — run `~/.claude/scripts/clippy/lint fmt` unconditionally
+**STEP 8:** Execute <RunFmt/> — run `~/.claude/scripts/lint/lint fmt`. Runs regardless of what earlier steps found; only `LINT_OP_FMT=off` skips it.
 **STEP 9:** Completion summary
 </ExecutionSteps>

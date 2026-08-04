@@ -26,7 +26,7 @@ echo ""
 echo "=== Quality Checks ==="
 
 echo "  Running lint clippy..."
-"$HOME/.claude/scripts/clippy/lint" clippy
+"$HOME/.claude/scripts/lint/lint" clippy
 echo "  Clippy: passed ✓"
 
 echo ""
@@ -41,7 +41,7 @@ echo "  Tests: passed ✓"
 
 echo ""
 echo "  Running cargo fmt..."
-"$HOME/.claude/scripts/clippy/lint" fmt
+"$HOME/.claude/scripts/lint/lint" fmt
 echo "  Format: passed ✓"
 
 echo ""

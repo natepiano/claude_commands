@@ -1,0 +1,85 @@
+---
+description: Show or edit which lint checks run — across /clippy, delegate phases, and clean-fix
+---
+
+# lint_config
+
+`$ARGUMENTS` — optional: `<op>`, `<op> on|off`, or `all on|off`.
+
+Run:
+
+```bash
+bash ~/.claude/scripts/lint/lint_config.sh $ARGUMENTS
+```
+
+**Always run `lint_config.sh` with `dangerouslyDisableSandbox: true`** — edits
+rewrite `config/lint.conf` through a sibling temp file, and the sandbox denies
+writes under `~/.claude/config`. A sandboxed read-only run works but there is no
+reason to split the two.
+
+Relay the script's stdout and stderr exactly, except the status lines — see
+below. If it exits non-zero, stop; do not guess a correction.
+
+## Status
+
+No arguments prints one `op=… state=… runs=… applies=…` line per check,
+followed by a blank line and the usage block. `/lint_config <op>` prints just
+that check's line plus usage.
+
+**Always render the `op=` lines as a markdown table** — never relay them raw.
+Columns: `Check | State | Runs | Applies to`. Render any `# note:` or
+`# updated …` line as plain text immediately before the table, and relay the
+usage block after it in a code block.
+
+## Edit a check
+
+```text
+/lint_config <op> on|off
+/lint_config all on|off
+```
+
+On success the script prints `# updated <op> — <state>`, then the full status
+and usage. Render per the Status rules above.
+
+There is **one key per check and no per-consumer override** — `clippy=off`
+means cargo clippy does not run anywhere that honors this file. Changes take
+effect on the next run of each consumer; nothing needs restarting.
+
+## Checks
+
+| Check | Runs | Where it applies |
+|---|---|---|
+| `cache` | reuse a fresh cargo-port lint-run | `/clippy` STEP 1 |
+| `mend` | `cargo mend` check pass and `--fix` | `/clippy` STEP 2/3 · clean-fix mend stage |
+| `style_review` | style-guide walk over the uncommitted diff | `/clippy` STEP 4 |
+| `clippy` | `cargo clippy` | `/clippy` STEP 5 · `verify.sh lint <pkg>` |
+| `doc` | `cargo doc -D warnings` | `/clippy` STEP 5b |
+| `fmt` | `cargo +nightly fmt` | `/clippy` STEP 8 · `verify.sh lint`, `verify.sh fmt`, `verify.sh final` |
+
+The three consumers: the `/clippy` skill (reads the file at STEP 0 of every run,
+including runs started by `/commit_prep` or a `/plan:delegate` work order),
+`scripts/delegate/verify.sh`, and `scripts/clean-fix/clean-fix.sh`.
+
+## What this file deliberately does not gate
+
+- **`verify.sh check` / `test` / `example` / `example-test`, and the workspace
+  check and test inside `verify.sh final`.** Those are correctness gates, not
+  lints. A delegate phase that compiles nothing has verified nothing.
+- **`pre_release_checks.sh` and `validate_ci.sh`.** A release or CI check that
+  silently no-ops is worse than a noisy one.
+- **Scope.** `verify.sh` pins targets per package on purpose (see its header
+  comment); config decides *whether* a check runs, never with what flags.
+
+A check gated off inside `verify.sh` prints
+`SKIPPED: <command> — <key>=off in <config path>` and exits 0. When you see that
+line in a delegate log, report the check as **skipped**, never as passed.
+
+## Examples
+
+```text
+/lint_config                  show every check and its state
+/lint_config mend             show just the mend check
+/lint_config mend off         stop running cargo mend everywhere
+/lint_config mend on          start running it again
+/lint_config all on           turn every check back on
+```

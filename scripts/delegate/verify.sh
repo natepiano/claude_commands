@@ -8,12 +8,21 @@
 # Nothing below `final` compiles examples or uses --all-targets; `final` is the
 # plan-final full gate, run by the orchestrator, never by a phase delegate.
 #
+# The lint halves — clippy and fmt — are gated by config/lint.conf (edit it with
+# /lint_config), so one switch silences a check across /clippy, clean-fix, and
+# every delegate phase. A gated-off check prints a SKIPPED line and the command
+# still exits 0. Scope is never configurable: the target pinning above is a
+# correctness constraint, not a preference. cargo check and cargo nextest are
+# never gated — a phase that compiles nothing has verified nothing.
+#
 # Usage:
 #   verify.sh check <package>              fast compile feedback (lib + bins)
 #   verify.sh test <package>               unit tests (lib + bins)
 #   verify.sh test <package> <int_test>    one named integration test target
 #   verify.sh lint <package>               format, then scoped clippy (warnings denied)
+#                                          — both halves gated by config/lint.conf
 #   verify.sh fmt <package>                format only (checkpoint-commit backstop)
+#                                          — gated by config/lint.conf
 #   verify.sh example <package> <name>     compile one example (only when the
 #                                          phase changed that example)
 #   verify.sh example-test <package> <name>
@@ -33,6 +42,18 @@ set -euo pipefail
 # sandbox, so it reads like a broken dependency and costs a round trip to
 # diagnose. Name it here instead of leaving it to be rediscovered.
 SANDBOX_SIGNATURE='sandbox_apply: Operation not permitted'
+
+# Lint policy. Missing reader means every check runs — a delegate must never be
+# silently under-verified because a config script moved.
+LINT_CONFIG_READER="$HOME/.claude/scripts/lint/lint_config.sh"
+if [[ -f "$LINT_CONFIG_READER" ]]; then
+    # shellcheck source=/dev/null
+    source "$LINT_CONFIG_READER"
+else
+    echo "verify.sh: $LINT_CONFIG_READER not found — running every check" >&2
+    lint_config_enabled() { return 0; }
+    lint_config_skip_notice() { :; }
+fi
 
 usage() {
     sed -n '/^# Usage:/,/^$/p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//' >&2
@@ -78,6 +99,10 @@ have_nextest() {
 # The workspace's rustfmt configuration uses nightly-only options. Formatting with
 # stable could accept output that nightly rejects, so it is a verifier error.
 fmt_cargo() {
+    if ! lint_config_enabled fmt; then
+        lint_config_skip_notice fmt "cargo +nightly fmt $*"
+        return 0
+    fi
     if ! cargo +nightly fmt --version >/dev/null 2>&1; then
         echo "verify.sh: cargo +nightly fmt is required" >&2
         exit 2
@@ -187,10 +212,16 @@ case "$CMD" in
         ;;
     lint)
         PKG="${1:?verify.sh lint <package>}"
-        FLAGS="$(target_flags "$PKG")"
         fmt_cargo -p "$PKG"
-        # shellcheck disable=SC2086
-        run cargo clippy -p "$PKG" $FLAGS --tests -- -D warnings
+        # target_flags shells out to cargo metadata, so resolve it only when
+        # clippy is actually going to run.
+        if lint_config_enabled clippy; then
+            FLAGS="$(target_flags "$PKG")"
+            # shellcheck disable=SC2086
+            run cargo clippy -p "$PKG" $FLAGS --tests -- -D warnings
+        else
+            lint_config_skip_notice clippy "cargo clippy -p $PKG"
+        fi
         ;;
     fmt)
         PKG="${1:?verify.sh fmt <package>}"

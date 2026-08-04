@@ -19,6 +19,35 @@ synchronizes when either source is newer than the last successful sync. The
 Claude catalog is hand-maintained; the sync warns when the Claude CLI
 advertises a model alias that `[claude.agents]` does not yet list.
 
+## lint.conf
+
+Which lint checks run, everywhere they run: `cache`, `mend`, `style_review`,
+`clippy`, `doc`, `fmt`, under an `[operations]` section. Values are `on` or
+`off`; a missing key or missing file means `on`. One key per check with no
+per-consumer override — `clippy=off` means cargo clippy does not run in the
+`/clippy` skill *or* in a delegate phase.
+
+Use `/lint_config` to view or change them. The three consumers read it on their
+next run, so a change is immediate:
+
+- the `/clippy` skill, at STEP 0 — including runs started by `/commit_prep` or
+  a `/plan:delegate` work order
+- `scripts/delegate/verify.sh` — the `lint`, `fmt`, and `final` arms
+- `scripts/clean-fix/clean-fix.sh` — the mend stage
+
+Deliberately not gated: `verify.sh check`/`test`/`example`, the workspace check
+and test inside `verify.sh final`, `pre_release_checks.sh`, and
+`validate_ci.sh`. Those are correctness gates rather than lints, and a release
+check that silently no-ops is worse than a noisy one. Scope is never
+configurable either — `verify.sh` pins targets per package for correctness, so
+config decides whether a check runs, never with what flags.
+
+`scripts/lint/lint_config.sh` is both the reader and the editor: source it and
+call `lint_config_enabled <op>` (plus `lint_config_skip_notice <op> <what>` for
+the SKIPPED line), or run it as the `/lint_config` CLI. Edits need
+`dangerouslyDisableSandbox: true` — the sandbox denies writes under
+`~/.claude/config`.
+
 ## cargo-fmt-exclusions.json
 
 List of crate names to exclude from `cargo fmt` checks. Used when running formatting on external/third-party crates where we don't want to modify their style.

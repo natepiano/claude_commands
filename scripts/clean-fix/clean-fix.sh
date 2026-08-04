@@ -331,10 +331,16 @@ for project_name in ${BUILD_TARGETS[@]+"${BUILD_TARGETS[@]}"}; do
         continue
     }
 
-    log "MEND: $project_display"
-    env $proj_env "$HOME/.claude/scripts/clippy/lint" mend --manifest-path "$project_dir/Cargo.toml" 2>> "$LOG_FILE" || {
-        log "WARNING: cargo mend failed for $project_display"
-    }
+    # One switch, every consumer: turning mend off with /lint_config also stops
+    # it running unattended here.
+    if bash "$HOME/.claude/scripts/lint/lint_config.sh" enabled mend; then
+        log "MEND: $project_display"
+        env $proj_env "$HOME/.claude/scripts/lint/lint" mend --manifest-path "$project_dir/Cargo.toml" 2>> "$LOG_FILE" || {
+            log "WARNING: cargo mend failed for $project_display"
+        }
+    else
+        log "SKIP: mend for $project_display — mend=off in config/lint.conf"
+    fi
 
     touch "$timestamp_file"
     log "DONE: $project_display"
