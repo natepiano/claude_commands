@@ -91,9 +91,10 @@ Applies to implementation, review, fix, and architect launchers.
 Codex only; no timer process:
 
 1. Empty-poll `${DISPATCH_HANDLE}` with `write_stdin`. Set `yield_time_ms` to the
-   chosen progress interval, capped by `background_terminal_max_timeout`; when
-   progress is disabled, use the maximum. Do not use shell `wait`, `sleep`, a
-   status-file loop, or a second terminal.
+   configured interval from <ProgressContract/>, capped by
+   `background_terminal_max_timeout`; when progress is disabled, use the
+   maximum. Do not use shell `wait`, `sleep`, a status-file loop, or a second
+   terminal.
 2. A result with the same `session_id` and no `exit_code` means the interval
    elapsed and the launcher remains active. If progress is enabled, apply
    <ProgressContract/>, then poll the same session again.
@@ -237,14 +238,15 @@ calls `findings.py dispatch`. `start-phase` resets the ledger.
 
 <ProgressContract>
 The main agent produces progress reports from the plan, launcher state,
-heartbeat, and live diff. Do not launch a reporter agent or `reporter.sh`; its
-standalone CLI remains available independently.
+heartbeat, and live diff. Before every progress-enabled wait, set
+`${PROGRESS_INTERVAL_SECONDS}` from `PLAN_DELEGATE_PROGRESS_INTERVAL_SECONDS`
+in `~/.claude/config/timings.conf`; use 240 when it is missing or not a positive
+integer. This is the Claude timer delay and Codex poll timeout.
 
 Claude: while a dispatch is active and progress is enabled, keep exactly one
-one-shot timer in a managed background terminal. Choose a reasonable interval
-and launch:
+one-shot timer in a managed background terminal. Launch:
 
-`sleep <seconds>; printf 'PLAN_DELEGATE_PROGRESS_TICK\n'`
+`sleep "${PROGRESS_INTERVAL_SECONDS}"; printf 'PLAN_DELEGATE_PROGRESS_TICK\n'`
 
 Save its handle and end the turn normally. The timer contains no loop and runs
 no agent. Codex never launches this timer; a <CodexDispatchWait/> timeout is its
@@ -280,9 +282,10 @@ On a Claude timer notification or Codex poll timeout:
    value. Copy the resulting Markdown header exactly.
 5. Add one or two ordinary-English sentences covering current activity,
    material work now present, and what remains. Do not paste logs or filenames.
-6. If the dispatch remains active, choose the next interval. Claude launches a
+6. If the dispatch remains active, Claude reads the interval again, launches a
    fresh one-shot timer, replaces the handle, and ends the turn. Codex returns
-   immediately to <CodexDispatchWait/> on the same session.
+   immediately to <CodexDispatchWait/> on the same session and reads the
+   interval again before polling.
 
 A user-requested status check performs steps 1-5 immediately. If the user stops
 updates, stop and clear any Claude timer and set

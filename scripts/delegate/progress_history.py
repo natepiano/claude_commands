@@ -797,24 +797,9 @@ def _current_hold_seconds(state: dict[str, object], candidate_percent: int, now:
     return max(0, int(now - started_at))
 
 
-def _require_expected_instances(
-    args: argparse.Namespace,
-    state: dict[str, object],
-) -> None:
-    expected_phase = _arg_string(args, "expected_phase_instance")
-    expected_pass = _arg_string(args, "expected_pass_instance")
-    phase = _object_dict(state.get("phase")) or {}
-    current_pass = _object_dict(state.get("pass")) or {}
-    if expected_phase and _string(phase.get("instance_id")) != expected_phase:
-        raise SystemExit("The active phase changed while progress was assessed")
-    if expected_pass and _string(current_pass.get("instance_id")) != expected_pass:
-        raise SystemExit("The active pass changed while progress was assessed")
-
-
 def _calibrate(args: argparse.Namespace) -> None:
     session_dir = _session_dir(args)
     state = _read_state(session_dir)
-    _require_expected_instances(args, state)
     now = _now_epoch()
     candidate = _arg_integer(args, "candidate_percent")
     if not 0 <= candidate <= 100:
@@ -955,7 +940,6 @@ def _assessment_line(percent: int, elapsed: int, unchanged: int) -> str:
 def _progress(args: argparse.Namespace) -> None:
     session_dir = _session_dir(args)
     state = _read_state(session_dir)
-    _require_expected_instances(args, state)
     now = _now_epoch()
     phase = _object_dict(state.get("phase"))
     current_pass = _object_dict(state.get("pass"))
@@ -1267,8 +1251,6 @@ def _build_parser() -> argparse.ArgumentParser:
     calibrate = subparsers.add_parser("calibrate")
     _ = calibrate.add_argument("--session-dir", required=True)
     _ = calibrate.add_argument("--candidate-percent", type=int, required=True)
-    _ = calibrate.add_argument("--expected-phase-instance", default="")
-    _ = calibrate.add_argument("--expected-pass-instance", default="")
     calibrate.set_defaults(handler=_calibrate)
 
     progress = subparsers.add_parser("progress")
@@ -1284,8 +1266,6 @@ def _build_parser() -> argparse.ArgumentParser:
     _ = progress.add_argument("--override-reason", default="")
     _ = progress.add_argument("--project-override-reason", default="")
     _ = progress.add_argument("--phase-override-reason", default="")
-    _ = progress.add_argument("--expected-phase-instance", default="")
-    _ = progress.add_argument("--expected-pass-instance", default="")
     progress.set_defaults(handler=_progress)
 
     finish_phase = subparsers.add_parser("finish-phase")

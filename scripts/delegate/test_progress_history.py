@@ -471,41 +471,6 @@ class ProgressHistoryTests(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("--cap-stage is required", result.stderr)
 
-    def test_expected_instances_reject_stale_reporter_assessments(self) -> None:
-        started_at = 55_000
-        session_dir = self.start_run("stale-reporter", started_at)
-        self.start_phase_and_pass(session_dir, started_at)
-
-        stale_phase = self.run_failing_command(
-            "calibrate",
-            "--session-dir",
-            str(session_dir),
-            "--candidate-percent",
-            "40",
-            "--expected-phase-instance",
-            "old-phase",
-            at=started_at + 60,
-        )
-        self.assertNotEqual(stale_phase.returncode, 0)
-        self.assertIn("active phase changed", stale_phase.stderr)
-
-        stale_pass = self.run_failing_command(
-            "progress",
-            "--session-dir",
-            str(session_dir),
-            "--raw-percent",
-            "40",
-            "--percent",
-            "40",
-            "--activity",
-            "implementing",
-            "--expected-pass-instance",
-            "old-pass",
-            at=started_at + 60,
-        )
-        self.assertNotEqual(stale_pass.returncode, 0)
-        self.assertIn("active pass changed", stale_pass.stderr)
-
     def test_start_phase_records_work_order_size(self) -> None:
         started_at = 60_000
         session_dir = self.start_run("sized", started_at)

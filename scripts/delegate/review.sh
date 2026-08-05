@@ -18,8 +18,6 @@
 #   <session_dir>/review_findings.txt      — symlink to the current pass's findings
 #   <session_dir>/review_agent.log         — symlink to the current pass's log
 #   <session_dir>/review_agent         — resolved task, family, agent, and effort
-#   <session_dir>/review_wrapper_pid   — launcher pid for external reporters
-#   <session_dir>/review_agent_pid     — agent_exec pid for external reporters
 #   <session_dir>/heartbeat.log        — shared with implement.sh: role header at
 #                                        start + [wrapper] beats every 60s, each
 #                                        carrying an activity digest decoded from
@@ -59,7 +57,6 @@ PROGRESS_HELPER="${SCRIPT_DIR}/progress_history.py"
 PROGRESS_STATE="${SESSION_DIR}/progress_history_state.json"
 HEARTBEAT_INTERVAL_SECS=60
 
-printf '%s\n' "$$" > "${SESSION_DIR}/review_wrapper_pid"
 echo "reviewing" > "${STATUS_FILE}"
 
 source "${SCRIPT_DIR}/../agents/agents_config.sh"
@@ -91,7 +88,6 @@ bash "${HEARTBEAT_HELPER}" "${HEARTBEAT_FILE}" header "${SUBTASK} (${AGENT_FAMIL
 bash "${SCRIPT_DIR}/../agents/agent_exec.sh" \
   "${TASK}" readonly "${WORKING_DIR}" "${PROMPT_FILE}" "${FINDINGS_FILE}" "${LOG_FILE}" &
 AGENT_PID=$!
-printf '%s\n' "${AGENT_PID}" > "${SESSION_DIR}/review_agent_pid"
 
 # The reviewer's read-only sandbox cannot write [agent] lines, but it is not
 # blind: the wrapper beat carries an activity digest decoded from the
