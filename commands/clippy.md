@@ -1,3 +1,22 @@
+---
+description: Run the Rust lint pipeline, or run its style review alone without repeating the rest of the pipeline
+---
+
+<InvocationModes>
+Parse these case-insensitive whole-word control tokens before any remaining
+arguments can reach `lint clippy`, then strip them from `$ARGUMENTS`:
+
+- `style-only` sets `STYLE_ONLY = true`. This invocation runs
+  <LoadOperationSwitches/> and then exactly one <StyleReview/>. It does not run
+  the cache, mend, Clippy, rustdoc, batch-fix, or formatting stages.
+- `no-style` sets `NO_STYLE = true`. This invocation runs the normal pipeline
+  with `LINT_OP_STYLE_REVIEW=off` for this invocation only; it does not edit
+  `config/lint.conf`.
+
+If both tokens are present, STOP and report that `style-only` and `no-style`
+are mutually exclusive. Both variables default to false.
+</InvocationModes>
+
 <AutoProceed>
 If $ARGUMENTS contains the token `auto-proceed` (injected by /plan:delegate and
 the codex work orders it composes), this run is non-interactive: strip the token
@@ -17,6 +36,13 @@ It prints one `LINT_OP_<NAME>=on|off` line per check, read from
 `~/.claude/config/lint.conf` (edited with `/lint_config`). A check whose value
 is `off` is **skipped entirely** — do not run its command, do not substitute an
 equivalent by hand, and do not create todos from it.
+
+After reading the file, if `NO_STYLE = true`, set
+`LINT_OP_STYLE_REVIEW=off` for this invocation. If `STYLE_ONLY = true`, ignore
+the other operation switches: execute <StyleReview/> when
+`LINT_OP_STYLE_REVIEW=on`, otherwise report `Style review: Off` and stop. The
+global switch remains authoritative for whether a requested style-only pass is
+allowed to run.
 
 | Variable | Gates in this skill |
 |---|---|
@@ -41,7 +67,8 @@ Two interactions the switches change:
   both Result and Action. Never report a skipped stage as clean — an unrun
   check found nothing because it did not run.
 
-If every check is off, print the Findings table with all rows `Off` and stop.
+In the normal pipeline, if every check is off, print the Findings table with
+all rows `Off` and stop.
 If the script fails, report the error and stop; do not assume defaults.
 </LoadOperationSwitches>
 
@@ -148,7 +175,8 @@ The `lint` wrapper supplies `--workspace --all-targets --all-features -- -D warn
 Execute: `~/.claude/scripts/lint/lint clippy ${ARGUMENTS:-}`
 
 If $ARGUMENTS provided, use as additional flags — after removing the
-`auto-proceed` token, which is a mode switch, not a clippy flag (see <AutoProceed/>).
+`auto-proceed`, `style-only`, and `no-style` tokens, which are mode switches,
+not clippy flags (see <InvocationModes/> and <AutoProceed/>).
 If different base configuration needed, user can override CLIPPY_FLAGS.
 
 Error Handling:
@@ -442,7 +470,9 @@ truth that maps clippy lints to the rule that governs them.
 <LoadOperationSwitches/> — a step whose switch is `off` is skipped outright, and
 the pipeline continues at the next enabled step.
 
+**STEP -1:** Execute <InvocationModes/> and <AutoProceed/> — parse and strip all control tokens before any command receives `$ARGUMENTS`.
 **STEP 0:** Execute <LoadOperationSwitches/> — read which stages are enabled. This step is never skipped.
+**STYLE-ONLY EXIT:** If `STYLE_ONLY = true`, execute <StyleReview/> when enabled, report its result, and stop. Run none of STEP 1 through STEP 9.
 **STEP 1:** Execute <CheckCachedResults/> — check for fresh lint-runs results. On a cache hit, re-enter the pipeline at the step named by the script's `resume:` line and continue through the remaining steps in order. A cache hit never skips STEP 3 when there are auto-fixable mend findings, and never skips the STEP 7 decision gate.
 **STEP 2:** Execute <RunMend/> — run `~/.claude/scripts/lint/lint mend` to check for issues
 **STEP 3:** If fixable items found, execute <RunMendFix/> — run `~/.claude/scripts/lint/lint mend --fix`. If it fails, STOP and ask user.

@@ -51,7 +51,7 @@ effect on the next run of each consumer; nothing needs restarting.
 |---|---|---|
 | `cache` | reuse a fresh cargo-port lint-run | `/clippy` STEP 1 |
 | `mend` | `cargo mend` check pass and `--fix` | `/clippy` STEP 2/3 · clean-fix mend stage |
-| `style_review` | style-guide walk over the uncommitted diff | `/clippy` STEP 4 |
+| `style_review` | style-guide walk over the uncommitted diff | `/clippy` STEP 4 · `/plan:delegate` phase-end gate |
 | `clippy` | `cargo clippy` | `/clippy` STEP 5 · `verify.sh lint <pkg>` |
 | `doc` | `cargo doc -D warnings` | `/clippy` STEP 5b |
 | `fmt` | `cargo +nightly fmt` | `/clippy` STEP 8 · `verify.sh lint`, `verify.sh fmt`, `verify.sh final` |
@@ -59,6 +59,9 @@ effect on the next run of each consumer; nothing needs restarting.
 The three consumers: the `/clippy` skill (reads the file at STEP 0 of every run,
 including runs started by `/commit_prep` or a `/plan:delegate` work order),
 `scripts/delegate/verify.sh`, and `scripts/clean-fix/clean-fix.sh`.
+`/plan:delegate` uses `/clippy style-only` for its required phase-end style
+gate, so `style_review=off` blocks that checkpoint instead of silently passing
+it.
 
 ## What this file deliberately does not gate
 

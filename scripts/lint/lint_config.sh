@@ -25,7 +25,7 @@ LINT_CONFIG_FILE="${LINT_CONFIG_FILE:-$HOME/.claude/config/lint.conf}"
 LINT_CONFIG_OPS=(
     "cache|reuse a fresh cargo-port lint-run instead of re-running the suite|/clippy STEP 1"
     "mend|cargo mend check pass and its --fix pass|/clippy STEP 2/3 · clean-fix mend stage"
-    "style_review|style-guide walk over the uncommitted diff|/clippy STEP 4"
+    "style_review|style-guide walk over the uncommitted diff|/clippy STEP 4 · /plan:delegate phase-end gate"
     "clippy|cargo clippy|/clippy STEP 5 · verify.sh lint"
     "doc|cargo doc with -D warnings|/clippy STEP 5b"
     "fmt|cargo +nightly fmt|/clippy STEP 8 · verify.sh lint, fmt, final"

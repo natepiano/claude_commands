@@ -382,6 +382,40 @@ class ProgressHistoryTests(unittest.TestCase):
             ],
         )
 
+    def test_long_elapsed_times_split_days_from_clock_hours(self) -> None:
+        started_at = 30_000
+        session_dir = self.start_run("long-duration", started_at)
+        self.start_phase_and_pass(session_dir, started_at)
+
+        first = self.run_command(
+            "progress",
+            "--session-dir",
+            str(session_dir),
+            "--raw-percent",
+            "20",
+            "--percent",
+            "20",
+            "--activity",
+            "implementing",
+            at=started_at + 90_061,
+        )
+        self.assertIn("elapsed 1 day 01:01:01", first)
+
+        second = self.run_command(
+            "progress",
+            "--session-dir",
+            str(session_dir),
+            "--raw-percent",
+            "20",
+            "--percent",
+            "20",
+            "--activity",
+            "implementing",
+            at=started_at + 176_461,
+        )
+        self.assertIn("elapsed 2 days 01:01:01", second)
+        self.assertIn("unchanged for 1 day 00:00:00", second)
+
     def test_cap_stage_clamps_optimistic_estimates(self) -> None:
         started_at = 40_000
         session_dir = self.start_run("capped", started_at)
@@ -436,6 +470,41 @@ class ProgressHistoryTests(unittest.TestCase):
         )
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("--cap-stage is required", result.stderr)
+
+    def test_expected_instances_reject_stale_reporter_assessments(self) -> None:
+        started_at = 55_000
+        session_dir = self.start_run("stale-reporter", started_at)
+        self.start_phase_and_pass(session_dir, started_at)
+
+        stale_phase = self.run_failing_command(
+            "calibrate",
+            "--session-dir",
+            str(session_dir),
+            "--candidate-percent",
+            "40",
+            "--expected-phase-instance",
+            "old-phase",
+            at=started_at + 60,
+        )
+        self.assertNotEqual(stale_phase.returncode, 0)
+        self.assertIn("active phase changed", stale_phase.stderr)
+
+        stale_pass = self.run_failing_command(
+            "progress",
+            "--session-dir",
+            str(session_dir),
+            "--raw-percent",
+            "40",
+            "--percent",
+            "40",
+            "--activity",
+            "implementing",
+            "--expected-pass-instance",
+            "old-pass",
+            at=started_at + 60,
+        )
+        self.assertNotEqual(stale_pass.returncode, 0)
+        self.assertIn("active pass changed", stale_pass.stderr)
 
     def test_start_phase_records_work_order_size(self) -> None:
         started_at = 60_000

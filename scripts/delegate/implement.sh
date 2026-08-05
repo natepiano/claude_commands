@@ -14,6 +14,8 @@
 #   <session_dir>/impl_summary.txt  — the implementation summary
 #   <session_dir>/impl_agent.log    — full agent log
 #   <session_dir>/impl_agent        — resolved task, family, agent, and effort
+#   <session_dir>/impl_wrapper_pid  — launcher pid for external reporters
+#   <session_dir>/impl_agent_pid    — agent_exec pid for external reporters
 #   <session_dir>/heartbeat.log     — shared liveness log for every dispatch in
 #                                     this session: a role header block at start,
 #                                     [wrapper] beats every 60s while the agent
@@ -44,6 +46,7 @@ PROGRESS_HELPER="${SCRIPT_DIR}/progress_history.py"
 PROGRESS_STATE="${SESSION_DIR}/progress_history_state.json"
 HEARTBEAT_INTERVAL_SECS=60
 
+printf '%s\n' "$$" > "${SESSION_DIR}/impl_wrapper_pid"
 echo "implementing" > "${STATUS_FILE}"
 
 source "${SCRIPT_DIR}/../agents/agents_config.sh"
@@ -76,6 +79,7 @@ bash "${HEARTBEAT_HELPER}" "${HEARTBEAT_FILE}" header "${SUBTASK} (${AGENT_FAMIL
 bash "${SCRIPT_DIR}/../agents/agent_exec.sh" \
   "${TASK}" write "${WORKING_DIR}" "${PROMPT_FILE}" "${SUMMARY_FILE}" "${LOG_FILE}" &
 AGENT_PID=$!
+printf '%s\n' "${AGENT_PID}" > "${SESSION_DIR}/impl_agent_pid"
 
 # Wrapper beats with an activity digest from the agent log: proves the process
 # is alive and names what it is doing even while blocked in a long tool call.

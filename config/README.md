@@ -63,7 +63,6 @@ Files that the `/orphans` command should ignore when checking for unreferenced s
 ## timings.conf
 
 Shared workflow timing values expressed in seconds. `/plan:delegate` reads
-`PLAN_DELEGATE_PROGRESS_INTERVAL_SECONDS` before every progress-monitor sleep,
-so changing it affects the next monitor cycle without regenerating the command.
-The value must be a positive integer; invalid or missing values fall back to
-120 seconds.
+`PLAN_DELEGATE_REPORTER_INTERVAL_SECONDS` when its independent reporter starts.
+`reporter.sh watch --interval <seconds>` overrides it for one run. The value
+must be a positive integer; invalid or missing values fall back to 240 seconds.
