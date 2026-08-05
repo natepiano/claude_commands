@@ -62,6 +62,22 @@ config/agents.conf; valid agents and efforts from [<family>.agents].
 EOF
 }
 
+# Accept the user-facing command name while preserving the canonical registry
+# key used by team_review's consumers.
+if [[ "$#" -ge 1 && "$1" != "skills" ]]; then
+    command_name="$1"
+    case "$command_name" in
+        teamreview)
+            shift
+            set -- team_review "$@"
+            ;;
+        teamreview.*)
+            shift
+            set -- "team_review.${command_name#*.}" "$@"
+            ;;
+    esac
+fi
+
 if [[ "$#" -eq 0 ]]; then
     agents_list_assignments
     echo ""
