@@ -1,11 +1,14 @@
 ---
-description: After implementing a phase of a multi-phase plan, append a retrospective, run a subagent review of remaining phases, fold the findings back into the plan, and summarize for the user.
+description: After implementing a phase, keep review prose temporary, update remaining Work Orders, and prepare the completed phase for as-built shrink.
 ---
 
-Use this after the agent has just finished implementing a phase of a multi-phase plan that is already in conversation context. The command updates the plan with what was learned, then asks an architect subagent to re-evaluate the remaining phases against that learning, then folds the findings back into the plan and reports a jargon-free summary.
+Use this after implementing a phase of a multi-phase plan. Review prose is
+ephemeral: write it only under `${SESSION_DIR}`, use it to update remaining Work
+Orders and prepare as-built input, then let `/plan:delegate` delete it after the
+phase checkpoint. Never append retrospective or review prose to the plan.
 
 **Read `~/.claude/docs/type_design.md` first and follow it.** Apply its type-name
-and `Option<T>` rules to the retrospective, the remaining-phase review, and all
+and `Option<T>` rules to the temporary retrospective, remaining-phase review, and all
 Work Order revisions. Include its complete contents verbatim in the architect
 subagent prompt so the reviewer receives the same contract as `/plan:delegate`.
 
@@ -21,6 +24,9 @@ The plan doc should already be in conversation context — it is the doc the jus
 - If exactly one plan doc is in scope, use it.
 - If `$ARGUMENTS` names a path, use that path (overrides inference).
 - If no plan doc is in scope, **ask the user** for the path before proceeding. Do not guess. This case should be rare.
+- Under `/plan:delegate`, inherit its `${SESSION_DIR}` and `${WORKING_DIR}`.
+  Invoked standalone, create a session with `prepare_session.sh` now so every
+  temporary review artifact has an explicit owner.
 
 State the path you picked in one line: `Reviewing <relative/path/to/plan.md>.`
 
@@ -30,15 +36,16 @@ Infer from conversation: the most recently implemented phase is the one being re
 
 If the conversation does not make the phase obvious, ask the user one clarifying question and wait.
 
-## Step 3: Append a retrospective and mark the phase complete
+## Step 3: Record a temporary retrospective and mark the phase complete
 
-Edit the plan doc to:
+1. Mark the phase complete in the plan's existing convention. For a
+   delegate-ready plan, set `status: done` and keep its `#### Work Order` only
+   until `/plan:shrink` replaces this phase before checkpoint. Do not edit any
+   earlier `done` phase.
+2. Write `${SESSION_DIR}/phase_review_retrospective_<phase>.md` using:
 
-1. Mark the phase complete in whatever convention the plan already uses (checkbox, status line, heading suffix). Match the existing style — do not introduce a new one. For a delegate-ready plan, set the phase `status: done (<commit>)` and keep its `#### Work Order` verbatim as the archive record. In auto mode the commit does not exist yet — write `status: done`; the `/plan:delegate` checkpoint commit adds the hash afterwards.
-2. Append a **Retrospective** subsection inside that phase (or directly after it if the phase has no body container). Use this template:
-
-   ```markdown
-   ### Retrospective
+   ```text
+   Phase <id>: <title>
 
    **What worked:** <one or two terse bullets>
    **What deviated from the plan:** <bullets — scope changes, approach changes, anything the plan did not predict>
@@ -46,7 +53,8 @@ Edit the plan doc to:
    **Implications for remaining phases:** <bullets — concrete effects on later phases; this is the bridge into Step 4>
    ```
 
-   Drop any subsection that has nothing to say. Keep bullets short and concrete — name files, types, decisions, not abstractions.
+   Drop empty fields. Keep bullets short and concrete. This file is input to the
+   remaining-phase review and closeout shrink; it never enters the repository.
 
 ## Step 3.5: Sweep process comments out of the implementation diff
 
@@ -64,7 +72,7 @@ Scope this sweep narrowly:
 
 - Only inspect files touched by the just-completed phase.
 - Only edit comments. Do not change runtime behavior.
-- Do not remove plan-doc retrospective notes, user-facing documentation, changelog text, or comments that are still the best place to document a durable code constraint.
+- Do not remove user-facing documentation, changelog text, or comments that are still the best place to document a durable code constraint.
 - If a comment contains both process history and a durable constraint, rewrite it to keep only the durable code constraint.
 
 If any comments were removed or rewritten, include that in the final update's `Learned and applied` row.
@@ -75,7 +83,7 @@ If any comments were removed or rewritten, include that in the final update's `L
 has already applied the trigger test in `/plan:delegate`'s `<RunPhaseReview/>`
 and determined this phase produced nothing for an architect to find. Write
 `not run — phase matched its plan` into the final update's architect row and go
-straight to Step 5; the retrospective's implications still get folded into the
+straight to Step 5; the temporary retrospective's implications still get folded into the
 remaining Work Orders exactly as written there. Do not second-guess the token or
 re-derive the trigger test — the caller has the review results and the ledger,
 this command does not.
@@ -115,21 +123,18 @@ architect review of the remaining phases against what phase <phase> actually shi
 - `<pass_index>` continues the phase's review numbering — one past the last code
   review pass — so `review_findings_<N>.txt` never overwrites a code review's
   findings. Findings come back in that file.
-- **`SESSION_DIR`**: under `/plan:delegate` this command inherits the run's
-  session directory — use it, do not create another. Invoked standalone, create
-  one with `bash ~/.claude/scripts/delegate/prepare_session.sh` and capture the
-  path it prints.
-- Arm the progress monitor on `${SESSION_DIR}/review_status` in the same turn as
-  the dispatch, and narrate every monitor event, per **Progress narration while
-  waiting** in `~/.claude/commands/plan/delegate.md`. The **Background wait
-  invariant** in that file applies to this dispatch unchanged.
+- **`SESSION_DIR`**: use the session established in Step 1.
+- Apply `/plan:delegate`'s `<DispatchContract/>`; do not invent another wait or
+  progress mechanism.
 
 The prompt must include:
 
 - The absolute path to the plan doc.
 - The phase that just completed (number and title).
 - A directive to read the implemented code referenced by that phase (so its review is grounded in what actually exists, not what was planned).
-- A directive to read the **Retrospective** that was just appended.
+- A directive to read
+  `${SESSION_DIR}/phase_review_retrospective_<phase>.md` and not search the plan
+  for retrospective or review prose.
 - The complete contents of `~/.claude/docs/type_design.md`, under a `Type Design
   Contract` heading.
 - The review questions:
@@ -147,7 +152,7 @@ The prompt must include:
 - **The narration instruction**, verbatim: *"Narrate as you go: before each new
   activity, output one short present-tense line of plain text naming it. These
   lines stream to a liveness monitor."* This is what makes the dispatch legible
-  to the progress monitor. Do **not** give the architect the heartbeat file path —
+  in the wrapper heartbeat digest. Do **not** give the architect the heartbeat file path —
   it runs read-only and cannot write; its narration reaches the heartbeat log
   through the `[wrapper]` digest instead. Same rule as a code review prompt.
 - Output format: a numbered list of findings. Each finding has a one-line title, a body of one to three sentences, and a `Severity:` tag — `minor` (safe to edit straight into the plan), or `significant` (changes scope, ordering, or architectural intent and needs user approval before editing).
@@ -159,6 +164,10 @@ The architect does **not** edit the plan. It returns findings only.
 <MaintainWorkOrders>
 **Delegate-ready plans only** (skip for plans not in the format-doc structure).
 Before processing findings, keep the remaining Work Orders dispatch-ready:
+
+**Write boundary:** only remaining `todo` Work Orders may change. The current
+phase is replaced later by shrink; every earlier `done` phase must remain
+byte-identical.
 
 1. **Propagate forward.** Apply the **Propagate-Forward** rule from the format doc
    (`~/.claude/docs/delegate_plan_format.md` → "Forward-propagation") for the facts
@@ -176,7 +185,7 @@ Mechanical Work Order edits (added constraints, corrected refs, gate tweaks) nee
 no user gate — they go straight in. A finding that changes a remaining phase's
 *intent, scope, or ordering* is a significant finding: route it through
 `<SignificantFindings/>` below, and once resolved, write the outcome into the
-affected Work Order, not just the Phase N Review block.
+affected Work Order, not a prose review note.
 </MaintainWorkOrders>
 
 <MinorFindings>
@@ -291,16 +300,27 @@ same wording softened. Afterwards, restate the pending question and wait.
 Invoke `/adhoc_review` with the filtered user decisions. Each item must already use `<DecisionPresentationTemplate/>` so the user can decide one at a time without translating abstract review language. Apply each user decision into the plan as the walkthrough completes that item.
 </DispatchAdhocReview>
 
-Then append a **Phase N Review** block under the just-completed phase summarizing what the review changed:
+Write `${SESSION_DIR}/phase_review_outcomes_<phase>.md` instead of appending any
+review block to the plan:
 
-```markdown
-### Phase N Review
+```text
+Phase <id>: <title>
 
-- <one bullet per finding that resulted in a plan edit, naming the affected remaining phase and the change>
-- <bullets for findings the user rejected, marked as such, so future passes do not relitigate>
+Shipped:
+- <concrete behavior, types, and modules now present>
+Files:
+- <path — current role>
+Gotchas:
+- <durable implementation constraint, if any>
+Ruled out:
+- <rejected proposal in one clause, if any>
+Forward propagated:
+- <affected todo phase and exact Work Order change, if any>
 ```
 
-Do not paste the raw subagent output into the plan — only the resolved outcomes.
+This is the closeout input for `/plan:shrink`; do not paste raw findings into it.
+The plan retains only the resulting `As-built` block and edits already applied
+to remaining Work Orders.
 
 ## Step 6: Final user update
 
@@ -331,9 +351,13 @@ Style rules for the final update:
 
 - Do not modify implementation code in this command except for Step 3.5's narrow source-code comment cleanup. That cleanup may only remove or rewrite process/history comments from the just-completed phase diff; behavioral code changes belong to the next phase or to a follow-up.
 - Do not commit any changes.
-- Do not relitigate the just-completed phase's implementation. The retrospective records what was learned; the review is about what comes next.
+- Do not relitigate the just-completed phase's implementation. The temporary retrospective records what was learned; the review is about what comes next.
 - Raw significant findings must be filtered before user review. Only unresolved user decisions go through the user; mechanical changes and already-implied work go straight into the plan.
 - User decisions never use `AskUserQuestion`. Single decision → inline decision template; two or more → `/adhoc_review`. See `<SignificantFindings/>`, `<FilterFindingsForUserReview/>`, and `<DecisionPresentationTemplate/>` in Step 5.
 - In auto mode this command asks the user nothing: unresolved decisions become `**Pending decision:**` blocks in the affected Work Orders, surfaced later by the `/plan:delegate` pre-dispatch check.
-- If the subagent returns nothing actionable, still append the **Phase N Review** block with a single line stating the remaining phases were reviewed and need no changes.
+- Never write retrospective, finding, reviewer, pass, or approval prose into the
+  plan. Review text exists only under `${SESSION_DIR}` until the phase checkpoint.
+- Never edit an earlier `done` phase. A finding about past work becomes an
+  `As-built` fact for the current phase, a forward Work Order change, or a new
+  pending decision.
 - Any signal that the user does not understand triggers `<ExplainOnDemand/>` and preserves whatever was pending. Terseness is the default everywhere else; here it is the defect.

@@ -6,8 +6,8 @@ commands read or write this format and must not drift from it:
 - `/plan:to_phased_plan` — compiles a design/plan doc into this format.
 - `/plan:delegate` — dispatches a phase by *assembling* its Work Order (fast path),
   not by researching the codebase.
-- `/plan:phase_review` — folds per-phase learnings back in, keeping every remaining
-  Work Order dispatch-ready.
+- `/plan:phase_review` — keeps review prose temporary and folds durable learnings
+  into remaining Work Orders.
 - `/plan:shrink` — rewrites completed phases into their shrunk archive form,
   leaving the live zone and Delegation Context untouched.
 - `/plan:to_as_built` — distills the completed plan into an as-built overview.
@@ -68,8 +68,9 @@ to rediscover after a context compaction lives in the doc.
      Full procedure: /plan:to_phased_plan → <PhaseNumbering/>. -->
 
 ### Phase N — <title>  · status: todo
-<!-- status ∈ {todo, done}. /plan:phase_review flips it and appends a Retrospective;
-     the /plan:delegate checkpoint commit writes the hash into `done (<commit>)`. -->
+<!-- status ∈ {todo, done}. /plan:phase_review flips it, then /plan:delegate
+     shrinks the phase to As-built before checkpoint. Review prose never enters
+     this document. -->
 
 #### Work Order
 <!-- The dispatch prompt. Self-contained against Delegation Context + named files.
@@ -96,26 +97,22 @@ test + an observable behavior. Gate commands are `verify.sh` lines only —
 `example`/integration-test lines appear solely in phases whose Files own
 them; nothing workspace-wide.>
 
-### Phase N (completed) — collapses to the archive form once done:
+### Phase N (transient closeout form) — exists only between review and shrink:
 
-### Phase N — <title>  · status: done (`<commit>`)
+### Phase N — <title>  · status: done
 
 #### Work Order
-<kept verbatim — the record of what was dispatched>
+<the dispatched work order; /plan:shrink replaces this span before checkpoint>
 
-#### Retrospective
-**What worked:** ...
-**What deviated:** ...
-**Surprises:** ...
-**Implications for remaining phases:** ...   ← /plan:phase_review acts on these
+Retrospective and review outcomes live only under the delegate session directory.
+`/plan:phase_review` first propagates durable decisions into remaining Work
+Orders; `/plan:shrink --closeout` then writes the archive form:
 
-### Phase N (shrunk) — the archive form /plan:shrink rewrites it to:
-
-### Phase N — <title>  · status: done (`<commit>`)   ← heading byte-for-byte
+### Phase N — <title>  · status: done   ← heading byte-for-byte, including any existing commit annotation
 
 #### As-built
 <what the phase shipped, present tense: types, signatures, modules, behavior —
-the Work Order's Spec corrected by the Retrospective's deviations>
+the Work Order's Spec corrected by temporary closeout facts>
 
 **Files:** `<path>` — <what it holds now>
 **Binds later work:** <facts remaining phases still depend on; omit if none>
@@ -186,15 +183,12 @@ Rules:
 3. **Spec stays verbatim.** When the plan derives from a resolved design, copy the
    design's concrete types/signatures/constraints into the Work Order. Do not
    compress a settled decision into a one-liner — the delegate needs the detail.
-4. **Live zone vs archive zone.** Remaining (`todo`) phases are the live zone the
-   orchestrator reads to dispatch. Completed (`done`) phases + their
-   retrospectives are the archive zone — kept in the doc for the record, skipped
-   at dispatch time. Keep the archive below the live phases or clearly marked so
-   the live zone stays small. On a long-running plan the archive is shrunk to
-   the form above by `/plan:shrink`; a shrunk phase carries no Work Order,
-   Retrospective, or `Phase N Review` block, and any command that would preserve
-   those "verbatim" preserves the `#### As-built` block instead. Shrinking never
-   touches the live zone, the Delegation Context, or a phase identifier.
+4. **Live zone vs archive zone.** Remaining (`todo`) phases are dispatch-ready
+   Work Orders. Every completed (`done`) phase is immediately reduced to the
+   `As-built` archive form before checkpoint. Retrospective, finding, reviewer,
+   and approval prose never persists in the plan. `/plan:shrink --closeout`
+   changes only the current phase; earlier `As-built` blocks and remaining Work
+   Orders are byte-stable during shrink.
 5. **No design narrative in the plan.** Justification essays, alternatives
    considered, and resolved-decision debates do not belong in a delegate-ready
    plan. `/plan:to_phased_plan` strips them; anything load-bearing becomes a Work Order

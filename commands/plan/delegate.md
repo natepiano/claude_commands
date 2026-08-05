@@ -356,10 +356,12 @@ Apply <CoreContract/>, <CompactionContract/>, and <UserFacingText/> throughout.
 8. <RunApplicationSmokeTest/>
 9. <RunPhaseStyleReview/>
 10. <RunPhaseReview/>
-11. <CheckpointCommit/>
-12. <RecordPhaseCompletion/>
-13. <VerbosePostPhaseReport/> and applicable <VerbosePostPhaseGate/>
-14. <NextPhase/> or <RunSummary/>
+11. <RunPhaseShrink/>
+12. <CheckpointCommit/>
+13. <DiscardPhaseReviewText/>
+14. <RecordPhaseCompletion/>
+15. <VerbosePostPhaseReport/> and applicable <VerbosePostPhaseGate/>
+16. <NextPhase/> or <RunSummary/>
 </ExecutionSteps>
 
 <PrepareSession>
@@ -738,8 +740,10 @@ review. The actual diff, not `${STYLE_GATE_CONFIG}`, decides applicability.
 
 <RunPhaseReview>
 For phased plans, invoke `plan:phase_review` with this run's `SESSION_DIR` and
-`WORKING_DIR`; pass `auto` in loop/verbose. The retrospective is mandatory and
-includes review/fix facts. Later user choices become Pending decision blocks.
+`WORKING_DIR`; pass `auto` in loop/verbose. Its retrospective and review outcomes
+are temporary session files, never plan sections. It may edit only remaining
+`todo` Work Orders; earlier `done` phases remain byte-identical. Later user
+choices become Pending decision blocks.
 
 Dispatch its architect review only when any trigger holds:
 
@@ -754,6 +758,18 @@ Otherwise pass `skip-architect`. When dispatched, focus real-code checking on
 affected phases and give the rest a consistency pass. It uses `review.sh`, this
 session, and the next review index. Ad hoc work skips this section.
 </RunPhaseReview>
+
+<RunPhaseShrink>
+For a phased plan, invoke `plan:shrink "${PLAN_DOC}" --phases <current-id>
+--closeout "${SESSION_DIR}"` after phase review and before checkpoint. This is
+the final plan mutation for the phase. It replaces only the current phase's
+`Work Order` with `As-built`; prior `done` phases must remain byte-identical and
+remaining `todo` phases must retain the forward edits from phase review.
+
+Require a successful structural check and a current phase containing no Work
+Order, Retrospective, or Phase Review heading. Failure blocks checkpoint. Ad hoc
+work skips this section.
+</RunPhaseShrink>
 
 <CheckpointCommit>
 Loop/verbose only:
@@ -777,10 +793,20 @@ Loop/verbose only:
 6. Report `Checkpoint <short hash> — phase N: <title>.` Never push here.
 </CheckpointCommit>
 
+<DiscardPhaseReviewText>
+After <RunPhaseShrink/> and a successful checkpoint when one applies, run:
+
+`bash ~/.claude/scripts/delegate/clear_phase_review.sh "${SESSION_DIR}" <phase-id>`
+
+This removes raw review prompts, findings, logs, and the temporary retrospective
+and outcome files. Do not clear them before shrink succeeds or while a checkpoint
+can still fail. Structured progress history remains; no review prose remains in
+the plan or phase scratch files.
+</DiscardPhaseReviewText>
+
 <RecordPhaseCompletion>
-After smoke, style, phase review when applicable, and checkpoint when applicable,
-run `progress_history.py finish-phase --session-dir "${SESSION_DIR}" --status
-completed`.
+After smoke, style, phase review, shrink, cleanup, and checkpoint when applicable,
+run `progress_history.py finish-phase --session-dir "${SESSION_DIR}" --status completed`.
 
 In `single`, also run `finish-run --status completed`, then
 `bash ~/.claude/scripts/delegate/end_session.sh`, and end. Other modes continue.
@@ -788,7 +814,7 @@ In `single`, also run `finish-run --status completed`, then
 
 <VerbosePostPhaseReport>
 After every completed verbose phase, including an auto window, report only that
-phase from its reviewed diff, accepted fixes, retrospective, and checkpoint:
+phase from its reviewed diff, accepted fixes, `As-built` block, and checkpoint:
 
 ```
 ## Phase N complete — <title>

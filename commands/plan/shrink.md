@@ -1,22 +1,20 @@
 ---
-description: Shrink the completed phases of an in-flight plan doc — rewrite each `done` phase's Work Order, Retrospective, and Review blocks into a short as-built record of what actually shipped, dropping decision debate and process narration. The live (`todo`) zone and Delegation Context are never touched.
+description: Rewrite completed plan phases into short as-built records; closeout mode shrinks one phase from ephemeral review artifacts before checkpoint.
 ---
 
 # Plan Shrink
 
-**Purpose:** A phased plan implemented over many days grows an archive zone that
-outweighs the work left to do. Every `done` phase carries the Work Order it was
-dispatched with (written *before* the code existed), a Retrospective, and a
-`Phase N Review` block recording an architect pass. That material is read again
-on every `/plan:delegate` and `/plan:phase_review` run, and carried through every
-context compaction, long after it stops informing anything.
+**Purpose:** Rewrite legacy completed phases that still carry Work Orders and
+review narration, or close one newly completed phase directly into `As-built`.
+Review prose is temporary; only shipped facts and forward Work Order decisions
+belong in the plan.
 
 This command rewrites each `done` phase into an **as-built record**: what the
 phase shipped, stated in the present tense, corrected to what actually landed.
 Deliberation goes ("this was decided this way, that was decided that way"),
 process narration goes, prospective phrasing goes. Facts survive.
 
-**Usage:** `/plan:shrink [plan-doc-path] [--phases <ids>]`
+**Usage:** `/plan:shrink [plan-doc-path] [--phases <ids>] [--closeout <session-dir>]`
 
 **Argument:** the in-flight plan doc. **Omitting it is the normal case** — with no
 argument this command shrinks the plan the current `/plan:delegate` run is
@@ -26,11 +24,19 @@ executing, resolved from the run record rather than from memory. See
 **`--phases <ids>`** (optional) comma-separated phase identifiers (`1,4b,7`) to
 limit the run to those phases. Without it, every `done` phase is shrunk.
 
-**When to run it:** whenever the archive zone dominates the doc — a rough trigger
-is the doc past ~1,500 lines or `done` phases past half its length. Natural
-cadence is every few completed phases. It is safe to run mid-project; it is also
-worth running immediately before `/plan:to_as_built`, which gets its input
-pre-digested.
+**`--closeout <session-dir>`** is the `/plan:delegate` phase-end path. It
+requires exactly one `--phases` id plus that phase's
+`phase_review_retrospective_<id>.md` and `phase_review_outcomes_<id>.md`. It
+shrinks only that phase, uses no dependency-index or verification subagent, and
+must leave every earlier `done` phase and remaining `todo` phase byte-identical.
+
+Parse `--phases` and `--closeout` before <ResolvePlan/> and remove them from the
+path arguments. Set `${CLOSEOUT_DIR}` only when closeout was supplied; reject a
+missing directory, multiple phase ids, or closeout without `--phases`.
+
+`/plan:delegate` runs closeout mode after every phase review and before its
+checkpoint. Standalone mode remains for legacy accumulated plans and immediately
+before `/plan:to_as_built`.
 
 This command does not change code and does not commit.
 
@@ -41,7 +47,7 @@ This command does not change code and does not commit.
 
 **STEP 0:** Execute <ResolvePlan/>
 **STEP 1:** Execute <Locate/>
-**STEP 2:** Execute <IndexLiveDependencies/>
+**STEP 2:** Execute <IndexLiveDependencies/> unless closeout mode
 **STEP 3:** Execute <Shrink/>
 **STEP 4:** Execute <Splice/>
 **STEP 5:** Execute <Verify/>
@@ -60,6 +66,10 @@ not `## Gates` or any other doc-level section, and above all not a single byte o
 any `todo` phase. The live zone is the dispatch contract `/plan:delegate` reads;
 this command has no opinion about it.
 
+Closeout mode is stricter: exactly one current phase may change. Every earlier
+`done` phase and every remaining `todo` phase must be byte-identical to the
+pre-shrink input; forward propagation happened before this command.
+
 **Never renumber, merge, split, delete, or reorder a phase.** Identifiers are
 load-bearing: a `done` phase's number is baked into its checkpoint commit message
 and referenced by later phases' **Constraints from prior phases**. Phases keep
@@ -67,9 +77,7 @@ their position in the doc. Identifiers appearing with letter suffixes (`4b`,
 `11a`) in older plans are copied as found — this command is not the place to fix
 numbering.
 
-**The phase heading line is copied verbatim** — identifier, title, and
-`· status: done (<commit>)` — because the title is the doc's anchor and the
-commit is its only link to `git log`.
+**The phase heading line is copied verbatim**, including any commit annotation.
 </ArchiveOnly>
 
 ---
@@ -192,6 +200,10 @@ Then:
 - **No `todo` phases remain** — say so in one line, note that `/plan:to_as_built`
   is the finishing move, and continue; shrinking makes that command's job
   cheaper. Do not stop to ask.
+- **Closeout validation** — require exactly one target phase and readable
+  `${CLOSEOUT_DIR}/phase_review_retrospective_<id>.md` and
+  `${CLOSEOUT_DIR}/phase_review_outcomes_<id>.md`. Reject an already-shrunk
+  target rather than rewriting its past `As-built` record.
 
 Set **${SCRATCH}** to the session scratchpad directory (or `${TMPDIR}` if the
 session has none). Every intermediate file this command writes lives there and
@@ -213,7 +225,12 @@ completed ones. Shrinking may drop anything, *except* something the live zone
 would then have to re-derive from the code. This step establishes that floor
 before a single line is rewritten.
 
-Skip this step entirely when no `todo` phase remains; the floor is empty.
+In closeout mode, skip this step. `/plan:phase_review` already propagated every
+required fact into remaining Work Orders, and deterministic splicing preserves
+those bytes. The temporary outcomes file supplies gotchas and ruled-out choices
+for the current `As-built` block.
+
+Otherwise skip this step when no `todo` phase remains; the floor is empty.
 
 Dispatch ONE `Explore` (or `general-purpose`) subagent. Its prompt must include:
 
@@ -244,7 +261,14 @@ Capture it as ${FLOOR}. It is small; it goes into every later prompt.
 **Goal:** one replacement block per `done` phase, produced without the archive
 text ever entering the orchestrator's context.
 
-Group the `done` phases into **chunks** of at most 6 phases or ~1,000 original
+In closeout mode, dispatch one `general-purpose` subagent for the single target.
+It reads only that phase span plus
+`phase_review_retrospective_<id>.md` and `phase_review_outcomes_<id>.md`; it must
+not read another phase. The artifacts provide shipped behavior, deviations,
+files, gotchas, rejected choices, and already-applied forward edits. Produce one
+replacement under `<KeepDrop/>` with no review, finding, pass, or approval prose.
+
+In standalone mode, group the `done` phases into **chunks** of at most 6 phases or ~1,000 original
 lines, whichever comes first. Dispatch one `general-purpose` subagent per chunk,
 **in parallel** — each writes only its own scratch files and never touches the
 plan doc, so there is no write race.
@@ -271,7 +295,7 @@ declarative, no first person, no reference to the plan, the delegate, the
 reviewer, or the sequence of attempts.
 
 ```markdown
-### Phase <id> — <title>  · status: done (`<commit>`)
+### Phase <id> — <title>  · status: done
 
 #### As-built
 
@@ -414,7 +438,12 @@ Diff the phase-heading list against `<Locate/>`'s: identifiers, titles, statuses
 and order must be identical, and no `todo` phase's span may have moved in
 content — only in line number.
 
-**Content, subagent:** dispatch ONE `general-purpose` subagent with ${FLOOR}, the
+In closeout mode, also require exactly one changed phase span, an `As-built`
+heading, and no Work Order, Retrospective, or Phase Review heading in that span.
+Compare the backup outside that span byte-for-byte. This completes verification;
+do not dispatch another subagent.
+
+**Standalone content check:** dispatch ONE `general-purpose` subagent with ${FLOOR}, the
 plan path, and the new spans of the shrunk phases. Its job: confirm every
 floor item survives in the phase that owns it, verbatim for signatures and type
 names. Return `missing` — floor item, owning phase, one line — and nothing else.
@@ -455,17 +484,20 @@ Then stop.
 - `done` phases only. The live zone, `## Delegation Context`, and every other
   doc-level section are untouched — see `<ArchiveOnly/>`.
 - Never renumber, merge, split, delete, or reorder a phase; heading lines are
-  copied byte-for-byte, commit hash included.
+  copied byte-for-byte.
 - The orchestrator never reads the plan doc's archive text. Structure comes from
   a heading map, rewriting is offloaded to chunk subagents, and assembly is a
   script — that is the whole point of the command.
-- Establish the retention floor (`<IndexLiveDependencies/>`) **before** rewriting.
+- In standalone mode, establish the retention floor (`<IndexLiveDependencies/>`) **before** rewriting.
   A fact the remaining phases still depend on is not narration, however it is
   phrased.
 - Rejected decisions survive as one-clause **Ruled out** lines. The plan format
   records them so later passes do not relitigate them; a shrink that drops them
   reopens settled ground.
 - Back up before splicing, and name the undo in the report.
+- Closeout mode never revisits an earlier `As-built` block. A later finding is
+  expressed in a remaining Work Order or a future phase, not by rewriting past
+  review history.
 - Do not change code and do not commit.
 - After the last phase ships, `/plan:to_as_built` is still the finishing move.
   This command shrinks the archive; it does not convert the plan into a reference
