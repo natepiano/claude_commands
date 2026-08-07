@@ -1,11 +1,12 @@
 ---
-description: After implementing a phase, keep review prose temporary, update remaining Work Orders, and prepare the completed phase for as-built shrink.
+description: After implementing a phase, keep review prose temporary, update remaining Work Orders, review approved next items, and prepare the phase for as-built shrink.
 ---
 
 Use this after implementing a phase of a multi-phase plan. Review prose is
 ephemeral: write it only under `${SESSION_DIR}`, use it to update remaining Work
 Orders and prepare as-built input, then let `/plan:delegate` delete it after the
-phase checkpoint. Never append retrospective or review prose to the plan.
+phase checkpoint. The forward review also checks the plan's sibling
+`{plan-name}-next.md` when present. Never append review prose to either file.
 
 **Read `~/.claude/docs/type_design.md` first and follow it.** Apply its type-name
 and `Option<T>` rules to the temporary retrospective, remaining-phase review, and all
@@ -27,6 +28,9 @@ The plan doc should already be in conversation context — it is the doc the jus
 - Under `/plan:delegate`, inherit its `${SESSION_DIR}` and `${WORKING_DIR}`.
   Invoked standalone, create a session with `prepare_session.sh` now so every
   temporary review artifact has an explicit owner.
+- Set `${NEXT_ITEMS_PATH}` from the caller when available. Otherwise derive the
+  sibling kebab-case `{plan-name}-next.md` path using `/plan:delegate`'s naming
+  rule. The file is optional.
 
 State the path you picked in one line: `Reviewing <relative/path/to/plan.md>.`
 
@@ -88,8 +92,9 @@ remaining Work Orders exactly as written there. Do not second-guess the token or
 re-derive the trigger test — the caller has the review results and the ledger,
 this command does not.
 
-The architect's job is an architectural review of the *remaining* phases in light
-of what was just implemented and learned.
+The architect's job is an architectural review of the *remaining* phases and,
+when present, `${NEXT_ITEMS_PATH}` in light of what was just implemented and
+learned.
 
 **When the caller names a scope** — a list of phases whose Work Orders reference
 what actually changed — those are the architect's subject. It still reads the
@@ -130,6 +135,8 @@ architect review of the remaining phases against what phase <phase> actually shi
 The prompt must include:
 
 - The absolute path to the plan doc.
+- The absolute `${NEXT_ITEMS_PATH}` and a directive to read it when it exists;
+  absence means there are no approved next items to review.
 - The phase that just completed (number and title).
 - A directive to read the implemented code referenced by that phase (so its review is grounded in what actually exists, not what was planned).
 - A directive to read
@@ -149,17 +156,43 @@ The prompt must include:
      introduce or retain a bare `Option<T>` in a domain-owned type or API where
      a semantic type should replace it, including conversion around an external
      API boundary?
+  8. If `${NEXT_ITEMS_PATH}` exists, did this phase or the revised remaining plan
+     make any item inaccurate, redundant, already satisfied, or aimed at the
+     wrong target? Quote the current item and propose its exact replacement or
+     removal with concrete evidence. Do not propose optional polish.
 - **The narration instruction**, verbatim: *"Narrate as you go: before each new
   activity, output one short present-tense line of plain text naming it. These
   lines stream to a liveness monitor."* This is what makes the dispatch legible
   in the wrapper heartbeat digest. Do **not** give the architect the heartbeat file path —
   it runs read-only and cannot write; its narration reaches the heartbeat log
   through the `[wrapper]` digest instead. Same rule as a code review prompt.
-- Output format: a numbered list of findings. Each finding has a one-line title, a body of one to three sentences, and a `Severity:` tag — `minor` (safe to edit straight into the plan), or `significant` (changes scope, ordering, or architectural intent and needs user approval before editing).
+- Output format: a numbered list of findings. Each finding has a one-line title,
+  a body of one to three sentences, and a `Severity:` tag — `minor` (safe to edit
+  straight into the plan), or `significant` (changes scope, ordering, or
+  architectural intent and needs user approval before editing). A Q8 finding
+  also has `Destination: next-items`, `Action: amend|remove`, `Current:` quoted
+  verbatim, `Target:`, and `Proposed:` with exact replacement text or `remove`.
 
 The architect does **not** edit the plan. It returns findings only.
 
 ## Step 5: Fold findings back into the plan
+
+<NextItemAmendments>
+Before normal finding routing, remove every `Destination: next-items` finding
+from the plan-finding set. Never edit `${NEXT_ITEMS_PATH}` automatically.
+Deduplicate by current item and observable outcome, reject unsupported or
+optional changes, then write validated proposals to
+`${SESSION_DIR}/next_item_amendments_<phase>.md` with `Action`, `Current`,
+`Target`, `Proposed`, `Why`, and source phase.
+
+Under `/plan:delegate`, stop there; <ConsiderNextItems/> owns user approval and
+auto-window batching. Invoked standalone, present the same
+approve/revise/reject gate before Step 6, apply only approved amendments, and
+delete the artifact after every proposal is resolved.
+</NextItemAmendments>
+
+Execute <NextItemAmendments/> before `<MinorFindings/>` or
+`<SignificantFindings/>`.
 
 <MaintainWorkOrders>
 **Delegate-ready plans only** (skip for plans not in the format-doc structure).
@@ -355,6 +388,8 @@ Style rules for the final update:
 - Raw significant findings must be filtered before user review. Only unresolved user decisions go through the user; mechanical changes and already-implied work go straight into the plan.
 - User decisions never use `AskUserQuestion`. Single decision → inline decision template; two or more → `/adhoc_review`. See `<SignificantFindings/>`, `<FilterFindingsForUserReview/>`, and `<DecisionPresentationTemplate/>` in Step 5.
 - In auto mode this command asks the user nothing: unresolved decisions become `**Pending decision:**` blocks in the affected Work Orders, surfaced later by the `/plan:delegate` pre-dispatch check.
+- Next-item amendments never use plan finding routing and never edit the next
+  file without approval; `/plan:delegate` batches them at its normal boundary.
 - Never write retrospective, finding, reviewer, pass, or approval prose into the
   plan. Review text exists only under `${SESSION_DIR}` until the phase checkpoint.
 - Never edit an earlier `done` phase. A finding about past work becomes an

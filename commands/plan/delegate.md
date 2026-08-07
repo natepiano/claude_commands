@@ -1,5 +1,5 @@
 ---
-description: Delegate coding work to a configured CLI agent — the main agent orchestrates and the delegate agent codes. Each phase runs implement → dual blind review → auto-routed fixes → smoke → one style cleanup → phase review → checkpoint commit. Phased plans run automatically by default; pass `verbose` for a pre-phase explanation and approval gate before every phase, or `single` for one phase with no commit.
+description: Delegate phased work with review, repair, smoke/style gates, as-built shrink, approved follow-up capture, and one checkpoint per phase. Supports automatic loop, verbose gating, bounded auto windows, and single no-commit mode.
 ---
 
 # Delegate
@@ -23,6 +23,10 @@ State:
 - `WORKING_DIR`: invocation directory; use it as-is.
 - `MODE`: `single`, `verbose`, or `loop`.
 - `AUTO_WINDOW`: `none`, `next N`, or `through X`.
+- `NEXT_ITEMS_PATH`: phased-plan sibling path named from the plan stem as
+  lowercase kebab-case plus `-next.md`.
+- `NEXT_ITEMS_PENDING`: `${SESSION_DIR}/next_items_pending.md`; absent or empty
+  means no unreviewed additions or amendments.
 - `PROGRESS_UPDATES_ENABLED`: starts true; user cancellation sets it false for
   the rest of the run.
 - `DISPATCH_HANDLE`: active launcher task handle (Claude) or managed terminal
@@ -118,8 +122,9 @@ and has no heartbeat monitor.
 - When requested, write it in the repository and include the hook's fields plus
   `MODE`, `AUTO_WINDOW`, the last authorization, `PROGRESS_UPDATES_ENABLED`, any
   live `DISPATCH_HANDLE`, any Claude `PROGRESS_TIMER_HANDLE`,
-  `STYLE_REVIEW_DONE`, `MECHANICAL_GATE_CLEANUP_USED`, and their results. Exclude
-  it from review intent-to-add and commits.
+  `STYLE_REVIEW_DONE`, `MECHANICAL_GATE_CLEANUP_USED`, `NEXT_ITEMS_PATH`, and any
+  unresolved next-item approval. Exclude it from review intent-to-add and
+  commits.
 - Never stop or delay work for compaction. Claude resumes from a live-dispatch
   notification; Codex remains in <CodexDispatchWait/>.
 - After compaction, re-read this command in full, then the handoff. Restore live
@@ -321,9 +326,10 @@ plan doc is the only dirty path; then include it in the first checkpoint.
 Loop stops only for that dirty-tree guard, an unresolved current Pending
 decision, a real design choice, reviews conflicting on intended behavior, a
 ledger `stop`, a required gate that cannot run, or delegate/environment error.
-Apply <MechanicalGateCleanup/> before treating an eligible repair-budget verdict
-as a stop. Everything else auto-routes, resequences, or defers. Verbose adds only
-its authorization gates.
+It may also stop at a phase or auto-window boundary for
+<ConsiderNextItems/> approval. Apply <MechanicalGateCleanup/> before treating an
+eligible repair-budget verdict as a stop. Everything else auto-routes,
+resequences, or defers. Verbose adds only its authorization gates.
 </AuthorizationContract>
 
 <DecisionRouting>
@@ -357,11 +363,12 @@ Apply <CoreContract/>, <CompactionContract/>, and <UserFacingText/> throughout.
 9. <RunPhaseStyleReview/>
 10. <RunPhaseReview/>
 11. <RunPhaseShrink/>
-12. <CheckpointCommit/>
-13. <DiscardPhaseReviewText/>
-14. <RecordPhaseCompletion/>
-15. <VerbosePostPhaseReport/> and applicable <VerbosePostPhaseGate/>
-16. <NextPhase/> or <RunSummary/>
+12. <ConsiderNextItems/>
+13. <CheckpointCommit/>
+14. <DiscardPhaseReviewText/>
+15. <RecordPhaseCompletion/>
+16. <VerbosePostPhaseReport/> and applicable <VerbosePostPhaseGate/>
+17. <NextPhase/> or <RunSummary/>
 </ExecutionSteps>
 
 <PrepareSession>
@@ -394,6 +401,10 @@ eventually run `end_session.sh` through <RunSummary/> or single-mode completion.
 5. A delegate-ready plan has `## Delegation Context` and a target
    `#### Work Order` per `~/.claude/docs/delegate_plan_format.md`. `verbose`
    requires one.
+6. For a phased plan, derive `${NEXT_ITEMS_PATH}` beside `${PLAN_DOC}`. Lowercase
+   its filename stem, replace each run of non-alphanumeric characters with one
+   hyphen, trim leading/trailing hyphens, and append `-next.md`. Stop if the
+   normalized stem is empty. The file need not exist.
 
 **Delegate-ready fast path:** do not research the codebase. Assemble
 `${SESSION_DIR}/implementation_prompt.md` under <WritePromptContract/>:
@@ -740,23 +751,26 @@ review. The actual diff, not `${STYLE_GATE_CONFIG}`, decides applicability.
 
 <RunPhaseReview>
 For phased plans, invoke `plan:phase_review` with this run's `SESSION_DIR` and
-`WORKING_DIR`; pass `auto` in loop/verbose. Its retrospective and review outcomes
-are temporary session files, never plan sections. It may edit only remaining
-`todo` Work Orders; earlier `done` phases remain byte-identical. Later user
-choices become Pending decision blocks.
+`WORKING_DIR`; pass `auto` in loop/verbose and make `${NEXT_ITEMS_PATH}` available.
+Its retrospective, review outcomes, and proposed next-item amendments are
+temporary session files, never plan sections. It may edit only remaining `todo`
+Work Orders; earlier `done` phases remain byte-identical. Later user choices
+become Pending decision blocks.
 
 Dispatch its architect review only when any trigger holds:
 
 - implementation deviated from the Work Order;
 - phases or remaining Work Orders were changed;
 - a later Pending decision was added;
-- a changed type/API/registration/path is named by a remaining Work Order;
+- a changed type/API/registration/path is named by a remaining Work Order or
+  `${NEXT_ITEMS_PATH}`;
 - the ledger stopped convergence; or
 - three phases completed since the prior architect review.
 
 Otherwise pass `skip-architect`. When dispatched, focus real-code checking on
-affected phases and give the rest a consistency pass. It uses `review.sh`, this
-session, and the next review index. Ad hoc work skips this section.
+affected phases and next items, then give the rest a consistency pass. It uses
+`review.sh`, this session, and the next review index. Ad hoc work skips this
+section.
 </RunPhaseReview>
 
 <RunPhaseShrink>
@@ -771,16 +785,83 @@ Order, Retrospective, or Phase Review heading. Failure blocks checkpoint. Ad hoc
 work skips this section.
 </RunPhaseShrink>
 
+<ConsiderNextItems>
+Phased plans only. The main agent performs this assessment; do not launch another
+agent. After shrink, read the current `As-built` block, phase diff,
+`${SESSION_DIR}/phase_review_outcomes_<phase>.md`, remaining `todo` Work Orders,
+`${SESSION_DIR}/next_item_amendments_<phase>.md` when present, and
+`${NEXT_ITEMS_PATH}` when it exists. Inspect targeted Hana or crate code only when
+those sources cannot confirm a candidate.
+
+A candidate must be needed for the plan's broader outcome and target one of:
+Hana, the crate's API/implementation, or a crate example. Exclude a current-phase
+defect, work already owned by a remaining Work Order, and optional polish or an
+idea that is not required. Current-phase defects return to <Synthesize/>.
+
+Each new candidate is an `add` proposal with title, target, need, completion
+condition, and source phase. Import each architect proposal as `amend` or
+`remove` with its exact current item, replacement, reason, and source phase, then
+delete its amendment artifact. Deduplicate all proposals by action, target, and
+observable outcome against `${NEXT_ITEMS_PATH}` and `${NEXT_ITEMS_PENDING}`.
+Never write an unapproved proposal to the repository.
+
+If a bounded auto window continues after this phase, return immediately without
+reporting or asking. `next N` continues when N is greater than 1; `through X`
+continues until the current phase is X. At an ordinary phase boundary or the
+last phase of an auto window, continue silently when `${NEXT_ITEMS_PENDING}` is
+absent or empty; otherwise present all pending candidates once:
+
+```
+## Items to consider
+
+1. **<Add | Amend | Remove>: <title>**
+   **Target:** Hana | <crate> | <crate example>
+   **Current:** <exact existing item; amend/remove only>
+   **Proposed:** <new item, replacement, or removal>
+   **Why:** <missing capability or changed evidence>
+   **Completion condition:** <observable result; add/amend only>
+
+Reply `approve <numbers>`, `revise <number>: ...`, or `reject <numbers>`.
+```
+
+Every proposal requires a disposition. Feedback revises it and requires
+re-presentation; questions preserve the gate. Apply approved actions only:
+append `add`, replace the exact quoted item for `amend`, and delete the exact
+quoted item for `remove`. If an amend/remove target no longer matches, refresh
+and re-present it. Preserve existing content and create this structure only for
+an approved `add` when the file does not exist:
+
+```
+# <plan title> — Next
+
+## Items to consider
+
+- [ ] **<title>**
+  - Target: <Hana | crate | crate example>
+  - Why needed: <missing capability>
+  - Completion condition: <observable result>
+  - Revealed by: Phase <id>
+```
+
+Remove resolved entries from `${NEXT_ITEMS_PENDING}` and delete it when empty.
+A rejected add does not enter the repository; a rejected amendment leaves the
+existing item unchanged. In loop/verbose, an approved file change joins the
+current phase checkpoint; in `single`, it remains uncommitted. The boundary gate
+occurs before the last auto phase's checkpoint, never between auto phases.
+</ConsiderNextItems>
+
 <CheckpointCommit>
 Loop/verbose only:
 
 1. Require smoke pass, `not applicable`, or `deferred`; require
    `STYLE_REVIEW_DONE=true`.
-2. Confirm status contains only this phase plus its plan doc.
+2. Confirm status contains only this phase, its plan doc, and an approved change
+   to `${NEXT_ITEMS_PATH}` when present.
 3. Run `verify.sh fmt <package>` for every touched package; include resulting
    formatting changes.
 4. Mark the phase `status: done`. Never put its commit hash in the plan.
-5. Stage the phase and commit exactly once:
+5. Stage the phase, its plan doc, and `${NEXT_ITEMS_PATH}` when approved and
+   changed; commit exactly once:
 
    ```
    checkpoint(<plan-slug>): phase N — <title>
@@ -805,8 +886,9 @@ the plan or phase scratch files.
 </DiscardPhaseReviewText>
 
 <RecordPhaseCompletion>
-After smoke, style, phase review, shrink, cleanup, and checkpoint when applicable,
-run `progress_history.py finish-phase --session-dir "${SESSION_DIR}" --status completed`.
+After smoke, style, phase review, shrink, next-item consideration, cleanup, and
+checkpoint when applicable, run `progress_history.py finish-phase --session-dir
+"${SESSION_DIR}" --status completed`.
 
 In `single`, also run `finish-run --status completed`, then
 `bash ~/.claude/scripts/delegate/end_session.sh`, and end. Other modes continue.
