@@ -8,6 +8,7 @@ import os
 import subprocess
 import tempfile
 import unittest
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import cast, override
 
@@ -68,6 +69,18 @@ class ProgressHistoryTests(unittest.TestCase):
     def start_run(self, name: str, started_at: int) -> Path:
         session_dir = self.root / name
         session_dir.mkdir()
+        plan_path = self.working_dir / "docs" / f"{name}.md"
+        plan_path.parent.mkdir(exist_ok=True)
+        plan_text = "\n".join(
+            (
+                "## Delegation Context",
+                "",
+                "- **Project:** Test project",
+                f"- **Project started:** {datetime.fromtimestamp(started_at, UTC).isoformat()}",
+                "",
+            )
+        )
+        _ = plan_path.write_text(plan_text, encoding="utf-8")
         _ = self.run_command(
             "start-run",
             "--session-dir",
@@ -75,9 +88,7 @@ class ProgressHistoryTests(unittest.TestCase):
             "--working-dir",
             str(self.working_dir),
             "--plan-doc",
-            "docs/rubric.md",
-            "--project-started-at",
-            str(started_at),
+            str(plan_path.relative_to(self.working_dir)),
             "--main-family",
             "codex",
             "--main-model",
@@ -234,11 +245,11 @@ class ProgressHistoryTests(unittest.TestCase):
             header.splitlines(),
             [
                 "**bevy_hana_rubric - feature/rubric**",
-                "**80% complete - elapsed 01:40**",
+                "**80% complete - elapsed 00:01:40**",
                 "",
                 "**Phase 3: Retry handling**",
-                "**25% complete - elapsed 01:40**",
-                "**Fix 2 - correcting retry recovery - elapsed 01:30**",
+                "**25% complete - elapsed 00:01:40**",
+                "**Fix 2 - correcting retry recovery - elapsed 00:01:30**",
             ],
         )
 
@@ -269,11 +280,11 @@ class ProgressHistoryTests(unittest.TestCase):
             at=started_at + 160,
         )
         self.assertIn(
-            "**80% complete - elapsed 02:40 - unchanged 01:00**",
+            "**80% complete - elapsed 00:02:40 - unchanged 00:01:00**",
             unchanged_header,
         )
         self.assertIn(
-            "**25% complete - elapsed 02:40 - unchanged 01:00**",
+            "**25% complete - elapsed 00:02:40 - unchanged 00:01:00**",
             unchanged_header,
         )
 
@@ -303,9 +314,9 @@ class ProgressHistoryTests(unittest.TestCase):
             "correcting retry recovery",
             at=started_at + 180,
         )
-        self.assertIn("**85% complete - elapsed 03:00**", independently_changed)
+        self.assertIn("**85% complete - elapsed 00:03:00**", independently_changed)
         self.assertIn(
-            "**25% complete - elapsed 03:00 - unchanged 01:20**",
+            "**25% complete - elapsed 00:03:00 - unchanged 00:01:20**",
             independently_changed,
         )
 
@@ -375,11 +386,164 @@ class ProgressHistoryTests(unittest.TestCase):
             header.splitlines(),
             [
                 "**bevy_hana_rubric - feature/rubric**",
-                "**Phase 3: Retry handling - elapsed 01:40**",
-                "**Fix 2 - correcting retry recovery - elapsed 01:30**",
+                "**Phase 3: Retry handling - elapsed 00:01:40**",
+                "**Fix 2 - correcting retry recovery - elapsed 00:01:30**",
                 "**20% complete**",
-                "**Total elapsed 01:40**",
+                "**Total elapsed 00:01:40**",
             ],
+        )
+
+    def test_ad_hoc_run_reuses_plan_project_time_for_the_same_worktree_branch(
+        self,
+    ) -> None:
+        planned_start = 1_000
+        planned_session = self.start_run("planned", planned_start)
+        _ = self.run_command(
+            "finish-run",
+            "--session-dir",
+            str(planned_session),
+            "--status",
+            "stopped",
+            at=1_100,
+        )
+
+        ad_hoc_start = 100_000
+        ad_hoc_session = self.root / "ad-hoc"
+        ad_hoc_session.mkdir()
+        _ = self.run_command(
+            "start-run",
+            "--session-dir",
+            str(ad_hoc_session),
+            "--working-dir",
+            str(self.working_dir),
+            "--main-family",
+            "codex",
+            "--main-model",
+            "gpt-main",
+            "--main-effort",
+            "xhigh",
+            "--main-session-id",
+            "main-ad-hoc",
+            at=ad_hoc_start,
+        )
+        state_text = (ad_hoc_session / "progress_history_state.json").read_text(
+            encoding="utf-8"
+        )
+        state_object: object = json.loads(state_text)  # pyright: ignore[reportAny]
+        state = cast(dict[str, object], state_object)
+        self.assertEqual(state["project_started_at"], float(planned_start))
+        self.assertEqual(state["project_start_source"], "history_plan_field")
+        self.assertEqual(state["plan_doc"], "")
+        self.assertEqual(
+            state["project_plan_doc"],
+            str((self.working_dir / "docs" / "planned.md").resolve()),
+        )
+
+        del state["project_start_source"]
+        del state["project_plan_doc"]
+        state["project_started_at"] = float(ad_hoc_start)
+        _ = (ad_hoc_session / "progress_history_state.json").write_text(
+            json.dumps(state),
+            encoding="utf-8",
+        )
+
+        self.start_phase_and_pass(ad_hoc_session, ad_hoc_start)
+        header = self.run_command(
+            "progress",
+            "--session-dir",
+            str(ad_hoc_session),
+            "--project-raw-percent",
+            "40",
+            "--project-percent",
+            "40",
+            "--phase-raw-percent",
+            "10",
+            "--phase-percent",
+            "10",
+            "--cap-stage",
+            "implementation",
+            "--activity",
+            "implementing",
+            at=ad_hoc_start + 10,
+        )
+        self.assertIn("**40% complete - elapsed 1 day 03:30:10**", header)
+        self.assertIn("**10% complete - elapsed 00:00:10**", header)
+
+    def test_start_run_persists_the_plan_git_time_without_an_agent_timestamp(
+        self,
+    ) -> None:
+        plan_path = self.working_dir / "docs" / "derived.md"
+        plan_path.parent.mkdir(exist_ok=True)
+        _ = plan_path.write_text(
+            "## Delegation Context\n\n- **Project:** Derived project\n",
+            encoding="utf-8",
+        )
+        commit_time = 1_700_000_000
+        commit_time_text = datetime.fromtimestamp(commit_time, UTC).isoformat()
+        environment = os.environ.copy()
+        environment["GIT_AUTHOR_DATE"] = commit_time_text
+        environment["GIT_COMMITTER_DATE"] = commit_time_text
+        _ = subprocess.run(
+            ["git", "add", str(plan_path.relative_to(self.working_dir))],
+            cwd=self.working_dir,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        _ = subprocess.run(
+            [
+                "git",
+                "-c",
+                "user.name=Plan Delegate Test",
+                "-c",
+                "user.email=plan-delegate@example.invalid",
+                "commit",
+                "-m",
+                "add plan",
+            ],
+            cwd=self.working_dir,
+            check=True,
+            capture_output=True,
+            text=True,
+            env=environment,
+        )
+
+        session_dir = self.root / "derived"
+        session_dir.mkdir()
+        _ = self.run_command(
+            "start-run",
+            "--session-dir",
+            str(session_dir),
+            "--working-dir",
+            str(self.working_dir),
+            "--plan-doc",
+            str(plan_path.relative_to(self.working_dir)),
+            "--main-family",
+            "codex",
+            "--main-model",
+            "gpt-main",
+            "--main-effort",
+            "xhigh",
+            "--main-session-id",
+            "main-derived",
+            at=commit_time + 1_000,
+        )
+
+        state_text = (session_dir / "progress_history_state.json").read_text(
+            encoding="utf-8"
+        )
+        state_object: object = json.loads(state_text)  # pyright: ignore[reportAny]
+        state = cast(dict[str, object], state_object)
+        self.assertEqual(state["project_started_at"], float(commit_time))
+        self.assertEqual(state["project_start_source"], "plan_git")
+        persisted_text = plan_path.read_text(encoding="utf-8")
+        persisted_value = persisted_text.split(
+            "- **Project started:** ",
+            maxsplit=1,
+        )[1].strip()
+        self.assertEqual(
+            datetime.fromisoformat(persisted_value).timestamp(),
+            commit_time,
         )
 
     def test_long_elapsed_times_split_days_from_clock_hours(self) -> None:

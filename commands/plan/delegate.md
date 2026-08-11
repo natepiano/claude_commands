@@ -284,7 +284,10 @@ On a Claude timer notification or Codex poll timeout:
    `python3 ~/.claude/scripts/delegate/progress_history.py progress --session-dir "${SESSION_DIR}" --project-raw-percent "${PROJECT_RAW_PERCENT}" --project-percent "${PROJECT_RAW_PERCENT}" --phase-raw-percent "${PHASE_RAW_PERCENT}" --phase-percent "${PHASE_REPORTED_PERCENT}" --cap-stage "<stage>" --activity "<current activity>" [--phase-override-reason "<specific evidence>"]`
 
    Include the override reason only when rejecting an applicable calibrated
-   value. Copy the resulting Markdown header exactly.
+   value. The recorder refreshes any legacy run whose project clock was not
+   script-resolved. Copy the resulting Markdown header exactly. Durations below
+   one day are always `HH:MM:SS`; longer durations are
+   `<days> day(s) HH:MM:SS`.
 5. Add one or two ordinary-English sentences covering current activity,
    material work now present, and what remains. Do not paste logs or filenames.
 6. If the dispatch remains active, Claude reads the interval again, launches a
@@ -373,10 +376,9 @@ Apply <CoreContract/>, <CompactionContract/>, and <UserFacingText/> throughout.
 
 <PrepareSession>
 Run `bash ~/.claude/scripts/delegate/prepare_session.sh` under
-<ToolingContract/>. Capture `SESSION_DIR`, set `WORKING_DIR`, and write the
-current epoch to `${SESSION_DIR}/progress_project_started_at` as the fallback
-project start. The script also creates the run-active marker; every exit must
-eventually run `end_session.sh` through <RunSummary/> or single-mode completion.
+<ToolingContract/>. Capture `SESSION_DIR` and set `WORKING_DIR`. The script also
+creates the run-active marker; every exit must eventually run `end_session.sh`
+through <RunSummary/> or single-mode completion.
 </PrepareSession>
 
 <ComposeWorkOrder>
@@ -389,19 +391,18 @@ eventually run `end_session.sh` through <RunSummary/> or single-mode completion.
    invalid range. Set `MODE=single` for `single` or non-phased work,
    `MODE=verbose` for a phased verbose invocation, otherwise `MODE=loop`.
    Infer absent work from the conversation.
-3. Resolve project start. Prefer a valid `Project started` ISO-8601 field in
-   `## Delegation Context`. Otherwise run
-   `git log --follow --format='%H %cI' -- "<plan-doc>"`, use the oldest entry or
-   session fallback, add the field after `Project`, and write its epoch to the
-   session file. A malformed existing field is an error.
-4. Run `progress_history.py start-run --session-dir "${SESSION_DIR}"
-   --working-dir "${WORKING_DIR}" --project-started-at "$(cat
-   "${SESSION_DIR}/progress_project_started_at")" [--plan-doc <path>]`. It is
-   idempotent; stop if exact main-agent identity cannot be detected.
-5. A delegate-ready plan has `## Delegation Context` and a target
+3. Run `progress_history.py start-run --session-dir "${SESSION_DIR}"
+   --working-dir "${WORKING_DIR}" [--plan-doc <path>]`. It is idempotent; stop
+   if exact main-agent identity cannot be detected. The recorder alone owns the
+   project clock: for a supplied plan it validates and uses `Project started`,
+   or derives and persists it from the plan's oldest Git commit or run start;
+   for ad hoc work it reuses the latest plan-backed clock for the exact working
+   directory and branch, or starts at this run when none exists. Never
+   calculate, pass, edit, or correct a project timestamp in the agent.
+4. A delegate-ready plan has `## Delegation Context` and a target
    `#### Work Order` per `~/.claude/docs/delegate_plan_format.md`. `verbose`
    requires one.
-6. For a phased plan, derive `${NEXT_ITEMS_PATH}` beside `${PLAN_DOC}`. Lowercase
+5. For a phased plan, derive `${NEXT_ITEMS_PATH}` beside `${PLAN_DOC}`. Lowercase
    its filename stem, replace each run of non-alphanumeric characters with one
    hyphen, trim leading/trailing hyphens, and append `-next.md`. Stop if the
    normalized stem is empty. The file need not exist.

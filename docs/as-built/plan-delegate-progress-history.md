@@ -33,6 +33,23 @@ calibration evidence used for that report. The phase decision also repeats the
 historical bias, suggested adjustment, and chosen adjustment so downstream
 analysis does not need to unpack the calibration snapshot.
 
+## Project clock
+
+`start-run` resolves the project clock without an agent-supplied timestamp. For
+a supplied plan, the recorder uses its timezone-qualified `Project started`
+field. If absent, it persists the oldest Git commit time for that plan, or the
+run start when the plan has no history. For ad hoc work without a plan, it
+reuses the most recent plan-backed clock for the exact working directory and
+branch. With no such history, the project clock starts with the run.
+
+The live state and every event record `project_start_source` and
+`project_plan_doc`. `progress` resolves these fields for legacy active runs that
+do not have them, so an ad hoc fallback is corrected on its next report. The
+agent invokes the recorder; it does not calculate, pass, or edit the timestamp.
+
+Every duration below one day renders as `HH:MM:SS`, including the leading hour
+field. Longer durations render as `<days> day(s) HH:MM:SS`.
+
 `phase_started` also carries the Work Order's size when `start-phase` is given
 `--work-order-file`: `work_order_lines` (nonblank), `work_order_words`,
 `work_order_file_targets` (distinct backticked strings holding a `/` or a file
@@ -171,7 +188,7 @@ findings.py status --session-dir <dir>
 ```
 
 ```text
-progress_history.py start-run ...
+progress_history.py start-run --session-dir <dir> --working-dir <dir> [--plan-doc <path>]
 progress_history.py start-phase --session-dir <dir> --phase-id <id> --phase-title <title> [--work-order-file <path>]
 progress_history.py start-pass ...
 progress_history.py finish-pass ...

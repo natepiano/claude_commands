@@ -35,8 +35,9 @@ to rediscover after a context compaction lives in the doc.
 <!-- Shared across all phases. /plan:delegate prepends this to every dispatch. -->
 
 - **Project:** <crate / workspace member name — one-line purpose>
-- **Project started:** <ISO-8601 timestamp — written once by `/plan:delegate`;
-  if absent, derive it from the oldest Git commit touching this plan and persist it>
+- **Project started:** <ISO-8601 timestamp — written once by the
+  `progress_history.py start-run` recorder; if absent, the recorder derives it
+  from the oldest Git commit touching this plan and persists it>
 - **Stack:** <language + key frameworks/versions the work touches>
 - **Layout:** <only the dirs/files phases touch, as a short map>
 - **Key files:** <path — role> for each file a phase reads or modifies
@@ -172,8 +173,9 @@ Rules:
 ## Rules
 
 1. **Delegation Context is written once.** `Project started` is the one field
-   `/plan:delegate` may add later: once present it is authoritative and must not
-   be recomputed from Git. Per-phase Work Orders reference the context
+   the progress recorder may add later: once present it is authoritative and
+   must not be recomputed from Git or selected by the agent. Per-phase Work
+   Orders reference the context
    ("build/test/paths: see Delegation Context") rather than repeating it. The
    dispatch step concatenates the two.
 2. **A Work Order is self-contained against named files.** A fresh delegate agent

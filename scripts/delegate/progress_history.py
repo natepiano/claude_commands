@@ -23,6 +23,14 @@ from typing import TypedDict, cast
 SCHEMA_VERSION = 1
 MIN_CALIBRATION_SAMPLES = 5
 STATE_FILENAME = "progress_history_state.json"
+PROJECT_STARTED_PATTERN = re.compile(
+    r"^[ \t]*-[ \t]+\*\*Project started:\*\*[ \t]*(?P<value>.+?)[ \t]*$",
+    re.MULTILINE,
+)
+PROJECT_PATTERN = re.compile(
+    r"^[ \t]*-[ \t]+\*\*Project:\*\*[^\n]*$",
+    re.MULTILINE,
+)
 
 # A percentage is an estimate; a stage is a fact. These ceilings keep an
 # optimistic estimate from claiming a gate that has not run — the failure mode
@@ -64,6 +72,12 @@ class CalibrationSample(TypedDict):
     suggested_bias_percentage_points: float
     reported_bias_percentage_points: float
     implied_total_error_seconds: float
+
+
+class ProjectTiming(TypedDict):
+    started_at: float
+    source: str
+    plan_doc: str
 
 
 def _history_root() -> Path:
@@ -295,6 +309,202 @@ def _git_value(working_dir: Path, *arguments: str) -> str:
     return result.stdout.strip() if result.returncode == 0 else ""
 
 
+def _iso_epoch(value: str, context: str) -> float:
+    normalized = value.strip()
+    if normalized.endswith("Z"):
+        normalized = normalized[:-1] + "+00:00"
+    try:
+        parsed = datetime.fromisoformat(normalized)
+    except ValueError as error:
+        raise SystemExit(
+            f"Malformed Project started timestamp in {context}: {value}"
+        ) from error
+    if parsed.tzinfo is None:
+        raise SystemExit(
+            f"Project started timestamp must include a timezone in {context}: {value}"
+        )
+    return parsed.timestamp()
+
+
+def _plan_path(working_dir: Path, value: str) -> Path:
+    path = Path(value).expanduser()
+    return path.resolve() if path.is_absolute() else (working_dir / path).resolve()
+
+
+def _read_plan_project_start(plan_path: Path) -> float | None:
+    try:
+        text = plan_path.read_text(encoding="utf-8")
+    except OSError as error:
+        raise SystemExit(f"Unable to read plan document {plan_path}: {error}") from error
+    matches = list(PROJECT_STARTED_PATTERN.finditer(text))
+    if len(matches) > 1:
+        raise SystemExit(f"Plan document has multiple Project started fields: {plan_path}")
+    if not matches:
+        return None
+    return _iso_epoch(matches[0].group("value"), str(plan_path))
+
+
+def _persist_plan_project_start(plan_path: Path, value: str) -> None:
+    try:
+        text = plan_path.read_text(encoding="utf-8")
+    except OSError as error:
+        raise SystemExit(f"Unable to read plan document {plan_path}: {error}") from error
+    project_match = PROJECT_PATTERN.search(text)
+    if project_match is None:
+        raise SystemExit(f"Plan document has no Delegation Context Project field: {plan_path}")
+    updated = (
+        text[: project_match.end()]
+        + f"\n- **Project started:** {value}"
+        + text[project_match.end() :]
+    )
+    try:
+        _ = plan_path.write_text(updated, encoding="utf-8")
+    except OSError as error:
+        raise SystemExit(f"Unable to write Project started to {plan_path}: {error}") from error
+
+
+def _explicit_plan_timing(
+    working_dir: Path,
+    plan_doc: str,
+    now: float,
+) -> ProjectTiming:
+    plan_path = _plan_path(working_dir, plan_doc)
+    existing = _read_plan_project_start(plan_path)
+    if existing is not None:
+        return ProjectTiming(
+            started_at=existing,
+            source="plan_field",
+            plan_doc=str(plan_path),
+        )
+
+    try:
+        git_path = plan_path.relative_to(working_dir)
+    except ValueError:
+        commit_times = ""
+    else:
+        commit_times = _git_value(
+            working_dir,
+            "log",
+            "--follow",
+            "--format=%cI",
+            "--",
+            str(git_path),
+        )
+    committed = [line.strip() for line in commit_times.splitlines() if line.strip()]
+    if committed:
+        value = committed[-1]
+        started_at = _iso_epoch(value, f"Git history for {plan_path}")
+        source = "plan_git"
+    else:
+        value = _iso_time(now)
+        started_at = now
+        source = "plan_run"
+    _persist_plan_project_start(plan_path, value)
+    return ProjectTiming(
+        started_at=started_at,
+        source=source,
+        plan_doc=str(plan_path),
+    )
+
+
+def _run_started_event(path: Path) -> dict[str, object] | None:
+    try:
+        with path.open(encoding="utf-8") as handle:
+            first_line = handle.readline()
+    except OSError:
+        return None
+    event = _json_object(first_line)
+    if event is None or _string(event.get("event_type")) != "run_started":
+        return None
+    return event
+
+
+def _historical_project_timing(
+    working_dir: Path,
+    branch: str,
+) -> ProjectTiming | None:
+    runs_dir = _history_root() / "runs"
+    latest_event: dict[str, object] | None = None
+    latest_started_at = -1.0
+    try:
+        history_paths = runs_dir.glob("*.jsonl")
+    except OSError:
+        return None
+    for history_path in history_paths:
+        event = _run_started_event(history_path)
+        if event is None:
+            continue
+        if (
+            _string(event.get("working_dir")) != str(working_dir)
+            or _string(event.get("branch")) != branch
+        ):
+            continue
+        project_plan_doc = _string(event.get("project_plan_doc")) or _string(
+            event.get("plan_doc")
+        )
+        if not project_plan_doc:
+            continue
+        run_started_at = _number(event.get("run_started_at"), -1.0)
+        if run_started_at > latest_started_at:
+            latest_event = event
+            latest_started_at = run_started_at
+    if latest_event is None:
+        return None
+
+    project_plan_doc = _string(latest_event.get("project_plan_doc")) or _string(
+        latest_event.get("plan_doc")
+    )
+    plan_path = _plan_path(working_dir, project_plan_doc)
+    if plan_path.is_file():
+        existing = _read_plan_project_start(plan_path)
+        if existing is not None:
+            return ProjectTiming(
+                started_at=existing,
+                source="history_plan_field",
+                plan_doc=str(plan_path),
+            )
+    return ProjectTiming(
+        started_at=_number(latest_event.get("project_started_at")),
+        source="history_recorded",
+        plan_doc=str(plan_path),
+    )
+
+
+def _resolve_project_timing(
+    working_dir: Path,
+    branch: str,
+    plan_doc: str,
+    now: float,
+) -> ProjectTiming:
+    if plan_doc:
+        return _explicit_plan_timing(working_dir, plan_doc, now)
+    historical = _historical_project_timing(working_dir, branch)
+    if historical is not None:
+        return historical
+    return ProjectTiming(started_at=now, source="run_started", plan_doc="")
+
+
+def _ensure_project_timing(
+    session_dir: Path,
+    state: dict[str, object],
+    now: float,
+) -> dict[str, object]:
+    if _string(state.get("project_start_source")):
+        return state
+    working_dir = Path(_string(state.get("working_dir"))).resolve()
+    timing = _resolve_project_timing(
+        working_dir,
+        _string(state.get("branch")),
+        _string(state.get("plan_doc")),
+        now,
+    )
+    state["project_started_at"] = timing["started_at"]
+    state["project_start_source"] = timing["source"]
+    state["project_plan_doc"] = timing["plan_doc"]
+    _write_state(session_dir, state)
+    return state
+
+
 def _event(state: dict[str, object], event_type: str, now: float) -> dict[str, object]:
     event: dict[str, object] = {
         "schema_version": SCHEMA_VERSION,
@@ -309,6 +519,8 @@ def _event(state: dict[str, object], event_type: str, now: float) -> dict[str, o
         "plan_doc": _string(state.get("plan_doc")),
         "run_started_at": _number(state.get("run_started_at")),
         "project_started_at": _number(state.get("project_started_at")),
+        "project_start_source": _string(state.get("project_start_source")),
+        "project_plan_doc": _string(state.get("project_plan_doc")),
         "main_agent": state.get("main_agent", {}),
     }
     phase = _object_dict(state.get("phase"))
@@ -362,7 +574,12 @@ def _start_run(args: argparse.Namespace) -> None:
     session_dir = _session_dir(args)
     existing = _state_path(session_dir)
     if existing.exists():
-        print(existing)
+        state = _ensure_project_timing(
+            session_dir,
+            _read_state(session_dir),
+            _now_epoch(),
+        )
+        print(_string(state.get("history_file"), str(existing)))
         return
 
     working_dir_value = _arg_string(args, "working_dir")
@@ -375,7 +592,8 @@ def _start_run(args: argparse.Namespace) -> None:
     if not branch:
         short_hash = _git_value(working_dir, "rev-parse", "--short", "HEAD")
         branch = f"detached@{short_hash or 'unknown'}"
-    project_started_at = float(_arg_integer(args, "project_started_at", int(now)))
+    plan_doc = _arg_string(args, "plan_doc")
+    project_timing = _resolve_project_timing(working_dir, branch, plan_doc, now)
     history_file = _history_root() / "runs" / f"{run_id}.jsonl"
     main_agent = _detect_main_identity(args)
     if main_agent["model"] == "unknown":
@@ -389,9 +607,11 @@ def _start_run(args: argparse.Namespace) -> None:
         "working_dir": str(working_dir),
         "worktree": working_dir.name,
         "branch": branch,
-        "plan_doc": _arg_string(args, "plan_doc"),
+        "plan_doc": plan_doc,
         "run_started_at": now,
-        "project_started_at": project_started_at,
+        "project_started_at": project_timing["started_at"],
+        "project_start_source": project_timing["source"],
+        "project_plan_doc": project_timing["plan_doc"],
         "main_agent": main_agent,
         "phase": None,
         "pass": None,
@@ -840,9 +1060,7 @@ def _format_duration(seconds: int) -> str:
     if days:
         unit = "day" if days == 1 else "days"
         return f"{days} {unit} {hours:02d}:{minutes:02d}:{remaining_seconds:02d}"
-    if hours:
-        return f"{hours:02d}:{minutes:02d}:{remaining_seconds:02d}"
-    return f"{minutes:02d}:{remaining_seconds:02d}"
+    return f"{hours:02d}:{minutes:02d}:{remaining_seconds:02d}"
 
 
 def _pass_display(current_pass: dict[str, object]) -> str:
@@ -939,8 +1157,8 @@ def _assessment_line(percent: int, elapsed: int, unchanged: int) -> str:
 
 def _progress(args: argparse.Namespace) -> None:
     session_dir = _session_dir(args)
-    state = _read_state(session_dir)
     now = _now_epoch()
+    state = _ensure_project_timing(session_dir, _read_state(session_dir), now)
     phase = _object_dict(state.get("phase"))
     current_pass = _object_dict(state.get("pass"))
     if (
@@ -1217,7 +1435,6 @@ def _build_parser() -> argparse.ArgumentParser:
     _ = start_run.add_argument("--session-dir", required=True)
     _ = start_run.add_argument("--working-dir", required=True)
     _ = start_run.add_argument("--plan-doc", default="")
-    _ = start_run.add_argument("--project-started-at", type=int, required=True)
     _add_identity_options(start_run)
     start_run.set_defaults(handler=_start_run)
 

@@ -61,7 +61,8 @@ This command does not change code and does not commit.
 <ArchiveOnly>
 **Shrinking touches `done` phases and nothing else.** Not the title, not the
 status line, not the `As-built disposition` line, not `## Delegation Context`
-(including `Project started`, which `/plan:delegate` treats as authoritative),
+(including `Project started`, which `/plan:delegate`'s recorder treats as
+authoritative),
 not `## Gates` or any other doc-level section, and above all not a single byte of
 any `todo` phase. The live zone is the dispatch contract `/plan:delegate` reads;
 this command has no opinion about it.
