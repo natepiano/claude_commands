@@ -66,7 +66,7 @@ run_dry() {
 
 codex_write="$(run_dry codex_case.task write)"
 assert_equal "codex write command is wrong" \
-    "codex exec -m gpt-test -c model_reasoning_effort=\\\"high\\\" --ephemeral --full-auto -C $WORKING_DIR -o $OUTPUT_FILE test\\ prompt > $LOG_FILE 2>&1" \
+    "codex exec -m gpt-test -c model_reasoning_effort=\\\"high\\\" --ephemeral --sandbox danger-full-access -C $WORKING_DIR -o $OUTPUT_FILE test\\ prompt > $LOG_FILE 2>&1" \
     "$codex_write"
 
 codex_readonly="$(run_dry codex_case.task readonly)"
@@ -86,12 +86,12 @@ assert_equal "claude readonly command is wrong" \
 
 bare_command="$(run_dry bare_case.task write)"
 assert_equal "bare pair did not omit the effort flag" \
-    "codex exec -m gpt-bare --ephemeral --full-auto -C $WORKING_DIR -o $OUTPUT_FILE test\\ prompt > $LOG_FILE 2>&1" \
+    "codex exec -m gpt-bare --ephemeral --sandbox danger-full-access -C $WORKING_DIR -o $OUTPUT_FILE test\\ prompt > $LOG_FILE 2>&1" \
     "$bare_command"
 
 extra_command="$(AGENT_EXEC_EXTRA_ARGS='--add-dir /tmp/extra' run_dry codex_case.task write)"
 assert_equal "extra arguments were not appended" \
-    "codex exec -m gpt-test -c model_reasoning_effort=\\\"high\\\" --add-dir /tmp/extra --ephemeral --full-auto -C $WORKING_DIR -o $OUTPUT_FILE test\\ prompt > $LOG_FILE 2>&1" \
+    "codex exec -m gpt-test -c model_reasoning_effort=\\\"high\\\" --add-dir /tmp/extra --ephemeral --sandbox danger-full-access -C $WORKING_DIR -o $OUTPUT_FILE test\\ prompt > $LOG_FILE 2>&1" \
     "$extra_command"
 
 MISSING_PROMPT="$TEST_DIR/missing.txt"

@@ -319,9 +319,10 @@ only after the required briefing:
 - `stop`: end without the described phase.
 - Post-phase `continue`: show the next briefing only; it never authorizes work.
 
-An auto window removes intermediate stops, not explanations. Before its first
-dispatch, <AutoWindowBatchBriefing/> briefs every covered phase and takes one
-approval. An auto control on initial invocation still requires that batch gate.
+An auto window removes intermediate stops, not explanations. Apply
+<BriefingFreshness/> before its first dispatch. An auto control on initial
+invocation still requires <AutoWindowBatchBriefing/> because no phase has been
+briefed.
 
 Before the first loop/verbose dispatch, stop on a dirty tree unless the selected
 plan doc is the only dirty path; then include it in the first checkpoint.
@@ -334,6 +335,22 @@ It may also stop at a phase or auto-window boundary for
 eligible repair-budget verdict as a stop. Everything else auto-routes,
 resequences, or defers. Verbose adds only its authorization gates.
 </AuthorizationContract>
+
+<BriefingFreshness>
+A phase is freshly briefed when the user received its complete
+<PhaseBriefing/> in the current uninterrupted pre-phase review sequence, every
+pending decision and user amendment was surfaced and resolved, and no later
+edit changed its behavior, scope, files, or verification. Sequential individual
+briefings count; they need not appear in one batch message. A follow-up question
+or explanation does not stale a briefing. Recording an accepted decision that
+the briefing and discussion already described does not stale it.
+
+When an auto control arrives and every covered phase is freshly briefed, that
+control is the batch approval: set the approved `AUTO_WINDOW` and proceed to
+<SelectTask/> without repeating briefings or asking for `proceed`. If any
+covered phase is unbriefed, stale, or has an unresolved decision, route to
+<AutoWindowBatchBriefing/>. Compressed rows and phase titles are not briefings.
+</BriefingFreshness>
 
 <DecisionRouting>
 For every decision raised by review, repair, or phase review:
@@ -467,13 +484,17 @@ When `MODE=verbose` and no approved auto window is active, emit
 `Start Phase N? Reply \`proceed\` to run only this phase, \`auto next N phases\`, \`auto through phase X\`, or \`stop\`.`
 
 Apply <AuthorizationContract/>. Questions preserve the gate; confusion invokes
-<ExplainOnDemand/>. Opening an auto window routes to
+<ExplainOnDemand/>. Opening an auto window applies <BriefingFreshness/>: a fully
+fresh range is authorized by the auto control itself; otherwise route to
 <AutoWindowBatchBriefing/> before dispatch.
 </VerbosePrePhaseGate>
 
 <AutoWindowBatchBriefing>
-Resolve the covered todo phases. Read every Work Order now and emit one complete
-<PhaseBriefing/> per phase in order; surface any pending decision. Ask:
+Resolve the covered todo phases and apply <BriefingFreshness/> first. If every
+covered phase is fresh, set the approved `AUTO_WINDOW` and continue directly to
+<SelectTask/> without another briefing or gate. Otherwise read every Work Order
+now and emit one complete <PhaseBriefing/> per phase in order; surface any
+pending decision. Ask:
 
 `Run phases <list> without stopping? Reply \`proceed\` to authorize all of them, \`proceed phase N\` to authorize only phase N and re-gate after it, or \`stop\`.`
 
@@ -763,6 +784,9 @@ Dispatch its architect review only when any trigger holds:
 - implementation deviated from the Work Order;
 - phases or remaining Work Orders were changed;
 - a later Pending decision was added;
+- the phase introduced or changed a semantic state, transition, failure,
+  availability, recovery condition, diagnostic, or externally observable
+  lifecycle;
 - a changed type/API/registration/path is named by a remaining Work Order or
   `${NEXT_ITEMS_PATH}`;
 - the ledger stopped convergence; or
@@ -791,13 +815,14 @@ Phased plans only. The main agent performs this assessment; do not launch anothe
 agent. After shrink, read the current `As-built` block, phase diff,
 `${SESSION_DIR}/phase_review_outcomes_<phase>.md`, remaining `todo` Work Orders,
 `${SESSION_DIR}/next_item_amendments_<phase>.md` when present, and
-`${NEXT_ITEMS_PATH}` when it exists. Inspect targeted Hana or crate code only when
-those sources cannot confirm a candidate.
+`${NEXT_ITEMS_PATH}` when it exists. Inspect targeted in-scope consumer or crate
+code only when those sources cannot confirm a candidate.
 
-A candidate must be needed for the plan's broader outcome and target one of:
-Hana, the crate's API/implementation, or a crate example. Exclude a current-phase
-defect, work already owned by a remaining Work Order, and optional polish or an
-idea that is not required. Current-phase defects return to <Synthesize/>.
+A candidate must be needed for the plan's broader outcome and target an
+in-scope consumer named by Delegation Context, the crate's API/implementation,
+or a crate example. Exclude a current-phase defect, work already owned by a
+remaining Work Order, and optional polish or an idea that is not required.
+Current-phase defects return to <Synthesize/>.
 
 Each new candidate is an `add` proposal with title, target, need, completion
 condition, and source phase. Import each architect proposal as `amend` or
@@ -816,7 +841,7 @@ absent or empty; otherwise present all pending candidates once:
 ## Items to consider
 
 1. **<Add | Amend | Remove>: <title>**
-   **Target:** Hana | <crate> | <crate example>
+   **Target:** <in-scope consumer | crate | crate example>
    **Current:** <exact existing item; amend/remove only>
    **Proposed:** <new item, replacement, or removal>
    **Why:** <missing capability or changed evidence>
@@ -838,7 +863,7 @@ an approved `add` when the file does not exist:
 ## Items to consider
 
 - [ ] **<title>**
-  - Target: <Hana | crate | crate example>
+  - Target: <in-scope consumer | crate | crate example>
   - Why needed: <missing capability>
   - Completion condition: <observable result>
   - Revealed by: Phase <id>

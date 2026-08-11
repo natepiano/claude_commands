@@ -55,10 +55,35 @@ If the conversation does not make the phase obvious, ask the user one clarifying
    **What deviated from the plan:** <bullets — scope changes, approach changes, anything the plan did not predict>
    **Surprises:** <bullets — things learned during implementation that the plan author did not know>
    **Implications for remaining phases:** <bullets — concrete effects on later phases; this is the bridge into Step 4>
+   **State and consequence audit:** <one disposition per new or changed state/outcome, or `None`>
    ```
 
    Drop empty fields. Keep bullets short and concrete. This file is input to the
    remaining-phase review and closeout shrink; it never enters the repository.
+
+<StateAndConsequenceAudit>
+Always perform this audit, including when the caller passes `skip-architect`.
+For every new or changed semantic state, transition, failure, availability,
+recovery condition, diagnostic, or externally observable lifecycle, record:
+
+1. Who produces it and how long it persists.
+2. Which code or application consumers can observe it.
+3. Whether it is implementation-only, application-observable, or
+   user-actionable.
+4. For a user-actionable outcome, what the user sees or can do, including
+   recovery, diagnostics, reflection/BRP, documentation, and examples where
+   applicable.
+5. Which existing remaining Work Order owns the required surface and its
+   acceptance test.
+6. When no external surface is appropriate, `implementation-only because
+   <reason>` instead of silently omitting it.
+
+Put each disposition under `State and consequence audit` in the retrospective.
+Treat an unowned required consequence as an implication for remaining phases or
+a necessary next-item candidate. Treat a missing surface required by the
+completed Work Order as a current-phase defect; under `/plan:delegate`, return
+it to `<Synthesize/>` before shrink.
+</StateAndConsequenceAudit>
 
 ## Step 3.5: Sweep process comments out of the implementation diff
 
@@ -149,7 +174,12 @@ The prompt must include:
   2. Do any remaining phases need re-scoping (smaller, larger, split, merged, reordered) given the implications surfaced in the retrospective?
   3. Are there new risks, dependencies, or sequencing constraints that the plan does not yet name?
   4. Are any assumptions in the remaining phases now invalidated?
-  5. Are there gaps — work the plan does not cover but that the implemented phase has revealed as necessary?
+  5. Are there gaps — work the plan does not cover but that the implemented
+     phase has revealed as necessary? For every state or outcome in the
+     retrospective's `State and consequence audit`, confirm who can observe it,
+     what a user should see or be able to do, and which remaining Work Order
+     owns that surface and its acceptance test. If no external surface is
+     appropriate, confirm the implementation-only reason.
   6. (Delegate-ready plans only) For each remaining phase, is its `#### Work Order` still self-contained — could a fresh codex session implement it from the named files + Delegation Context alone? Name any Work Order that now needs an added **Constraints from prior phases** fact, a corrected file/line ref, or a changed acceptance gate because of what just shipped.
   7. Do type names state their semantic role, state, lifetime, or guarantee
      without requiring the reader to inspect callers? Does any remaining phase
@@ -213,6 +243,10 @@ byte-identical.
 3. **Self-containment check.** After edits, each remaining Work Order must still be
    implementable from its named files + Delegation Context alone. If a finding
    widened scope, update **Files** and **Spec** to match.
+4. **Own every consequence.** For each application-observable or
+   user-actionable audit disposition, name the remaining Work Order that owns
+   its surface and acceptance test. If none does, route the required work as a
+   plan gap or next-item candidate; never leave it only in retrospective prose.
 
 Mechanical Work Order edits (added constraints, corrected refs, gate tweaks) need
 no user gate — they go straight in. A finding that changes a remaining phase's
@@ -345,6 +379,8 @@ Files:
 - <path — current role>
 Gotchas:
 - <durable implementation constraint, if any>
+Consequences:
+- <state/outcome — classification, audience, surface or implementation-only reason, and owning phase/test>
 Ruled out:
 - <rejected proposal in one clause, if any>
 Forward propagated:

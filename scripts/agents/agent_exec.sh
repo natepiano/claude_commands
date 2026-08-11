@@ -89,7 +89,7 @@ agents_exec_main() {
             fi
             command+=(--ephemeral)
             if [[ "$mode" == "write" ]]; then
-                command+=(--full-auto)
+                command+=(--sandbox danger-full-access)
             else
                 command+=(--sandbox read-only)
             fi
