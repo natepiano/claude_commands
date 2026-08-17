@@ -69,7 +69,7 @@ printf 'task=%s\nfamily=%s\nagent=%s\neffort=%s\n' \
   "${TASK}" "${AGENT_FAMILY}" "${AGENT_MODEL}" "${AGENT_EFFORT}" > "${AGENT_FILE}"
 
 if [[ -f "${PROGRESS_STATE}" ]]; then
-  if ! python3 "${PROGRESS_HELPER}" start-pass \
+  if ! PLAN_DELEGATE_PASS_OWNER=launcher python3 "${PROGRESS_HELPER}" start-pass \
     --session-dir "${SESSION_DIR}" \
     --pass-kind review \
     --activity "${PASS_ACTIVITY}" \
@@ -106,7 +106,7 @@ wait "${HEARTBEAT_LOOP_PID}" 2>/dev/null || true
 if [[ "${AGENT_CODE}" -eq 0 ]]; then
   echo "reviewed" > "${STATUS_FILE}"
   if [[ -f "${PROGRESS_STATE}" ]]; then
-    if ! python3 "${PROGRESS_HELPER}" finish-pass \
+    if ! PLAN_DELEGATE_PASS_OWNER=launcher python3 "${PROGRESS_HELPER}" finish-pass \
       --session-dir "${SESSION_DIR}" --status completed; then
       echo "ERROR: unable to record the review pass completion." >&2
       echo "error" > "${STATUS_FILE}"
@@ -117,7 +117,7 @@ if [[ "${AGENT_CODE}" -eq 0 ]]; then
 else
   echo "error" > "${STATUS_FILE}"
   if [[ -f "${PROGRESS_STATE}" ]]; then
-    python3 "${PROGRESS_HELPER}" finish-pass \
+    PLAN_DELEGATE_PASS_OWNER=launcher python3 "${PROGRESS_HELPER}" finish-pass \
       --session-dir "${SESSION_DIR}" --status error \
       || echo "ERROR: unable to record the review pass error." >&2
   fi

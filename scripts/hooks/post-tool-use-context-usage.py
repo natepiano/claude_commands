@@ -98,6 +98,7 @@ def log_debug(
         "tokens": None if reading is None else reading["tokens"],
         "pending_bytes": None if reading is None else reading["pending_bytes"],
         "is_sidechain": None if reading is None else reading["is_sidechain"],
+        "model": None if reading is None else reading["model"],
         "window": window,
         "response_bytes": response,
     }
@@ -112,8 +113,10 @@ def log_debug(
 def main() -> None:
     payload = cast(HookInput, json.loads(sys.stdin.read()))
     transcript = resolve_transcript(payload)
-    window = auto_compact_window()
     reading = None if transcript is None else latest_reading(transcript)
+    # The window depends on the model, and only the transcript names it, so this
+    # has to come after the reading.
+    window = auto_compact_window(None if reading is None else reading["model"])
     response = response_bytes(payload)
     log_debug(payload, transcript, reading, window, response)
     if reading is None:

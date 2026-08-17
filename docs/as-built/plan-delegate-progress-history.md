@@ -185,19 +185,36 @@ findings.py verdict --session-dir <dir> --id <F00N> --state accepted|still_open|
 findings.py gate --session-dir <dir>
 findings.py dispatch --session-dir <dir> --covers F001,F002,...
 findings.py status --session-dir <dir>
+findings.py override --session-dir <dir> --reason <the user's own words>
 ```
+
+`override` is the correction path for a `stop` whose inputs were wrong — an
+aborted launcher, a pass recorded outside a launcher, a count carried across a
+mislabeled phase boundary. It never edits the run history that produced the
+stop; it appends beside it, names the one stop reason it clears, and is spent by
+the fix round it authorizes. It refuses a reason under 20 characters and refuses
+outright when the gate is not stopping.
 
 ```text
 progress_history.py start-run --session-dir <dir> --working-dir <dir> [--plan-doc <path>]
 progress_history.py start-phase --session-dir <dir> --phase-id <id> --phase-title <title> [--work-order-file <path>]
-progress_history.py start-pass ...
-progress_history.py finish-pass ...
+progress_history.py start-pass ...        # launcher only
+progress_history.py finish-pass ...       # launcher only, or --orphaned-launcher --status canceled
 progress_history.py calibrate --session-dir <dir> --candidate-percent <N>
 progress_history.py progress --session-dir <dir> --project-raw-percent <N> --project-percent <N> --phase-raw-percent <N> --phase-percent <N> --cap-stage <stage> --activity <text> [--phase-override-reason <evidence>]
 progress_history.py finish-phase ...
 progress_history.py finish-run ...
 progress_history.py aggregate [--percent <N>]
 ```
+
+`implement.sh` and `review.sh` own pass lifecycle: they set
+`PLAN_DELEGATE_PASS_OWNER=launcher` on their own `start-pass` / `finish-pass`
+calls, per invocation so the agent subprocess never inherits it. The recorder
+rejects an unowned call, because a hand-written pass forges one that never ran
+and `findings.py gate` counts passes to decide whether a phase is converging.
+The single exception is a launcher the orchestrator killed, whose pass stays
+open: `finish-pass --status canceled --orphaned-launcher` closes it, and only
+that status, and only while a pass is open.
 
 `progress` writes the event and prints the project section, one blank line, then
 the phase/pass section used by `/plan:delegate`. Project and phase percentages

@@ -542,6 +542,26 @@ def _verdict(args: argparse.Namespace) -> None:
     print(f"{finding_id} {_string(entry.get('state'))}")
 
 
+def _live_override(state: dict[str, object], reason: str) -> dict[str, object] | None:
+    """The user's standing override of one specific stop reason, or None.
+
+    A stop can be wrong about the world — a review the orchestrator recorded by
+    hand, a count skewed by an aborted launcher — and the durable event history
+    that produced it must never be edited to make it go away. The override is the
+    correction path instead: it names the exact reason it clears, carries the
+    user's own words, and is spent by the fix round it authorizes, so it can
+    silence one wrong stop and nothing else.
+    """
+    override = _object_dict(state.get("stop_override"))
+    if override is None:
+        return None
+    if override.get("consumed_round") is not None:
+        return None
+    if _string(override.get("stop_reason")) != reason:
+        return None
+    return override
+
+
 def _gate_payload(state: dict[str, object], session_dir: Path) -> dict[str, object]:
     gating = _gating_severities(state)
     batch = _open_entries(state, gating)
@@ -570,6 +590,16 @@ def _gate_payload(state: dict[str, object], session_dir: Path) -> dict[str, obje
         payload["stop_reason"] = None
         return payload
     reason = _stop_reason(state, gating_open, passes)
+    override = _live_override(state, reason) if reason else None
+    if override is not None:
+        payload["verdict"] = "dispatch"
+        payload["stop_reason"] = None
+        payload["overridden_stop"] = {
+            "stop_reason": reason,
+            "reason": _string(override.get("reason")),
+            "granted_at": _string(override.get("granted_at")),
+        }
+        return payload
     payload["verdict"] = "stop" if reason else "dispatch"
     payload["stop_reason"] = reason or None
     return payload
@@ -647,6 +677,11 @@ def _dispatch(args: argparse.Namespace) -> None:
         }
     )
     state["rounds"] = rounds
+    spent = _object_dict(payload.get("overridden_stop"))
+    if spent is not None:
+        override = _object_dict(state.get("stop_override"))
+        if override is not None:
+            override["consumed_round"] = round_number
     _write_state(session_dir, state)
     _append_event(
         session_dir,
@@ -659,9 +694,51 @@ def _dispatch(args: argparse.Namespace) -> None:
             "covered": sorted(covered),
             "gating_open_before": gating_open,
             "gating_severities": list(gating),
+            "overridden_stop": spent,
         },
     )
     print(f"round {round_number} covering {', '.join(sorted(covered))}")
+
+
+def _override(args: argparse.Namespace) -> None:
+    session_dir = _session_dir(args)
+    now = _now_epoch()
+    state = _read_state(session_dir, now)
+    gating = _gating_severities(state)
+    batch = _open_entries(state, gating)
+    counts = _open_counts(state)
+    gating_open = sum(counts[severity] for severity in gating)
+    passes = _phase_passes(session_dir, _string(state.get("phase_instance_id")))
+    reason = _stop_reason(state, gating_open, passes) if batch else ""
+    if not reason:
+        raise SystemExit("The gate is not stopping, so there is nothing to override")
+    justification = _arg_string(args, "reason")
+    if len(justification) < 20:
+        raise SystemExit(
+            "Record why the stop is wrong in the user's own words, not a token; "
+            "this text is the whole audit trail for the round it authorizes"
+        )
+    override: dict[str, object] = {
+        "stop_reason": reason,
+        "reason": justification,
+        "granted_at": _iso_time(now),
+        "granted_at_epoch": now,
+        "consumed_round": None,
+    }
+    state["stop_override"] = override
+    _write_state(session_dir, state)
+    _append_event(
+        session_dir,
+        state,
+        {
+            "event_type": "finding_stop_overridden",
+            "timestamp": _iso_time(now),
+            "timestamp_epoch": now,
+            "stop_reason": reason,
+            "reason": justification,
+        },
+    )
+    print(f"override recorded for: {reason}")
 
 
 def _status(args: argparse.Namespace) -> None:
@@ -716,6 +793,13 @@ def _build_parser() -> argparse.ArgumentParser:
     _ = dispatch.add_argument("--session-dir", required=True)
     _ = dispatch.add_argument("--covers", required=True)
     dispatch.set_defaults(handler=_dispatch)
+
+    override = subparsers.add_parser(
+        "override", help="record the user's override of one wrong stop verdict"
+    )
+    _ = override.add_argument("--session-dir", required=True)
+    _ = override.add_argument("--reason", required=True)
+    override.set_defaults(handler=_override)
 
     status = subparsers.add_parser("status", help="print the whole ledger")
     _ = status.add_argument("--session-dir", required=True)

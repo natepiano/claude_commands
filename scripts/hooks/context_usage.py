@@ -12,19 +12,49 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from pathlib import Path
 from typing import TypedDict, cast
 
 # Auto-compaction does NOT wait for the window. Reconstructed from the 2.1.220
-# binary (`Hds`/`Sfo`/`CSe`), the trigger is
-#     window - min(max_output_tokens, 20_000) - 13_000
+# binary (`Hds`/`Sfo`/`CSe`, still `W9`/`Bye`/`SQo` in 2.1.233), the trigger is
+#     min(configured_window, model_context_window)
+#         - min(max_output_tokens, 20_000) - 13_000
 # so a 200_000 window really compacts at ~167_000. Quoting the window as the
 # deadline is what let the first live test sail past the warning entirely.
+#
+# The 20_000 is exact for every model from Sonnet 4.0 on (max output 32k-64k).
+# Only claude-3-5-haiku and claude-3-5-sonnet cap out at 8_192, where this
+# over-reserves by ~11_800 and warns that much early -- the safe direction.
 OUTPUT_RESERVE_TOKENS = 20_000
 PRECOMPUTE_RESERVE_TOKENS = 13_000
 
-# How far ahead of that trigger to start asking for a handoff doc.
-# 167_000 trigger - 25_000 margin = warn at 142_000.
+# The configured window is clamped to the model's OWN context window before any
+# of the above applies. Skipping the clamp is how a hook ends up quoting a
+# trigger the CLI will never use: a 258_000 setting on a 200k-context model
+# looks like a 225_000 trigger while compaction actually fires at 167_000.
+#
+# Transcribed from the CLI's model-capabilities table (2.1.233). The binary
+# resolves this in `KT`/`Z2`: an explicit `[1m]` suffix wins outright, otherwise
+# a `native_1m` model gets 1M on a first-party account.
+DEFAULT_CONTEXT_TOKENS = 200_000
+LONG_CONTEXT_TOKENS = 1_000_000
+NATIVE_1M_MODELS = frozenset(
+    {
+        "claude-sonnet-5",
+        "claude-opus-4-7",
+        "claude-opus-4-8",
+        "claude-opus-5",
+        "claude-fable-5",
+        "claude-mythos-5",
+    }
+)
+
+# How far ahead of that trigger to start asking for a handoff doc. Deliberately
+# a fixed count, not a fraction of the window: it covers two absolute costs --
+# residual estimate lag and the tokens to write the doc -- neither of which
+# scales with window size, so a proportional margin would shrink headroom exactly
+# on the small windows where it is tightest.
 #
 # The margin covers the residual lag plus the cost of writing the doc. With the
 # pending-bytes correction below, ordinary turns land within ~1k; the rare
@@ -59,6 +89,7 @@ class Usage(TypedDict, total=False):
 
 class Message(TypedDict, total=False):
     usage: Usage
+    model: str
 
 
 class TranscriptEntry(TypedDict, total=False):
@@ -93,6 +124,15 @@ class Reading(TypedDict):
     tokens: int
     pending_bytes: int
     is_sidechain: bool
+    # Whatever produced the turn we measured -- a subagent's transcript names its
+    # own model, which is how a haiku subagent gets a 200k clamp while the main
+    # thread keeps 1M.
+    model: str | None
+
+
+class Measurement(TypedDict):
+    tokens: int
+    model: str | None
 
 
 def parse_window(text: str) -> int | None:
@@ -115,8 +155,53 @@ def parse_window(text: str) -> int | None:
     return number if number > 0 else None
 
 
-def auto_compact_window() -> int | None:
-    """Effective auto-compact window: env override wins over settings.json."""
+def normalize_model(model: str) -> str:
+    """Strip the decorations a transcript model id can carry.
+
+    Covers the `[1m]` suffix, provider prefixes (`us.anthropic.claude-opus-5`),
+    Bedrock version tails (`-v1:0`) and dated ids (`claude-haiku-4-5-20251001`).
+    """
+    name = re.sub(r"\[1m\]", "", model.strip().lower())
+    name = name.rsplit(".", 1)[-1]
+    name = re.sub(r"-v\d+(:\d+)?$", "", name)
+    return re.sub(r"-\d{8}$", "", name)
+
+
+def model_context_window(model: str | None) -> int:
+    """The model's own context window, as the CLI resolves it.
+
+    An unrecognised model falls back to 200k rather than 1M: the smaller guess
+    warns early, and warning early costs a sentence while warning late costs the
+    handoff entirely. Assumes a first-party account -- on Bedrock/Vertex the CLI
+    consults `native_1m_3p` per provider, which a hook cannot see. It also cannot
+    see the account-level 1M credit gate (`longContext1mCreditsBlocked`), so a
+    blocked account is reported as 1M and warns late.
+    """
+    if os.environ.get("CLAUDE_CODE_DISABLE_1M_CONTEXT"):
+        return DEFAULT_CONTEXT_TOKENS
+    if model is None:
+        return DEFAULT_CONTEXT_TOKENS
+    if "[1m]" in model.lower():
+        return LONG_CONTEXT_TOKENS
+    if normalize_model(model) in NATIVE_1M_MODELS:
+        return LONG_CONTEXT_TOKENS
+    return DEFAULT_CONTEXT_TOKENS
+
+
+def auto_compact_window(model: str | None = None) -> int | None:
+    """Effective auto-compact window for `model`.
+
+    Env override wins over settings.json, then the result is clamped to the
+    model's own context window exactly as the CLI clamps it.
+    """
+    configured = configured_window()
+    if configured is None:
+        return None
+    return min(configured, model_context_window(model))
+
+
+def configured_window() -> int | None:
+    """The raw configured window, before the model clamp."""
     from_env = os.environ.get("CLAUDE_CODE_AUTO_COMPACT_WINDOW")
     if from_env:
         parsed = parse_window(from_env)
@@ -212,6 +297,7 @@ def latest_reading(path: Path) -> Reading | None:
                 "tokens": tokens,
                 "pending_bytes": sum(len(text) + 1 for text in after),
                 "is_sidechain": entry.get("isSidechain", False),
+                "model": message.get("model"),
             }
     return None
 
@@ -240,12 +326,19 @@ def estimate_tokens(reading: Reading, response: int) -> int:
     )
 
 
-def measure(payload: HookInput) -> int | None:
-    """Current context usage for the agent this hook fired in, or None."""
+def measure(payload: HookInput) -> Measurement | None:
+    """Current context usage for the agent this hook fired in, or None.
+
+    Carries the model along: the window this count should be judged against
+    depends on it, and only the transcript knows which model was in play.
+    """
     transcript = resolve_transcript(payload)
     if transcript is None:
         return None
     reading = latest_reading(transcript)
     if reading is None:
         return None
-    return estimate_tokens(reading, response_bytes(payload))
+    return {
+        "tokens": estimate_tokens(reading, response_bytes(payload)),
+        "model": reading["model"],
+    }

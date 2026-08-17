@@ -34,7 +34,6 @@
       "Bash(git worktree *)",
       "Bash(mkdir *)",
       "Bash(rg *)",
-      "Bash(rm *)",
       "Bash(run_test.sh *)",
       "Bash(rust-cache *)",
       "Bash(~/.claude/scripts/release/*)",
@@ -161,7 +160,7 @@
     ]
   },
   "alwaysThinkingEnabled": true,
-  "autoCompactWindow": 233000,
+  "autoCompactWindow": 258000,
   "askUserQuestionTimeout": "never",
   "tui": "fullscreen",
   "skipDangerousModePermissionPrompt": true,
@@ -172,6 +171,35 @@
   "inputNeededNotifEnabled": true,
   "agentPushNotifEnabled": true,
   "skipAutoPermissionPrompt": true,
+  "autoMode": {
+    "environment": [
+      "### Org-wide",
+      "**Organization**: None configured",
+      "**Primary use of Claude Code**: software development",
+      "**Cloud provider(s)**: None configured",
+      "**Repository visibility**: PUBLIC — natepiano/bevy_brp (github.com)",
+      "**Internal sharing / snippet hosting**: None configured — treat public paste/gist services as outside the trust boundary",
+      "**Secrets management**: None configured",
+      "**Default / protected branches**: main (default, protected via ruleset `main_protection`)",
+      "**CI/CD deploy targets**: None configured",
+      "**Network posture**: None configured",
+      "**Source control**: The trusted repo and its remote(s) only — https://github.com/natepiano/bevy_brp (no additional orgs configured)",
+      "**Trusted internal domains**: None configured",
+      "**Trusted cloud buckets**: None configured",
+      "**Key internal services**: None configured",
+      "**Internal package registry**: None configured — crates.io is used as the public package registry (crates.io, index.crates.io, static.crates.io observed)",
+      "**Sensitive data locations & audiences**: any file or store holding personal data, confidential business data, credentials, regulated data, or similarly sensitive material; preserve exact handles when known and share only with audiences cleared at the [named+specifics] bar",
+      "**Data retention / declassification**: None configured",
+      "**Sensitive remote targets**: any namespace, host, or container whose name carries `prod` or `production` as a whole word or name segment (hyphen/underscore/dot-delimited — e.g. matches `prod-db`, not `producer`)",
+      "**Protected deployment namespaces / environments**: None configured — fall back to the Sensitive remote targets heuristic",
+      "**Protected IaC scopes**: IAM, RBAC, networking, quota, and node-pool resources; anything whose name or tag carries `prod` or `production` as a whole word or name segment",
+      "### User-specific",
+      "**Primary use of Claude Code**: software development (Rust workspace — bevy_brp_mcp, bevy_brp_extras, bevy_brp_mcp_macros)",
+      "**Trusted repo**: /Users/natemccoy/rust/bevy_brp and its remote https://github.com/natepiano/bevy_brp (PUBLIC — only this repo's own work should be pushed there; confidential material and secrets are never cleared into it by visibility)",
+      "**Org-specific CLIs**: None configured",
+      "**routine under natepiano/ prefix qualifiers**: publishing to crates.io as bevy_brp_mcp, bevy_brp_extras, bevy_brp_mcp_macros is this repo's own routine publish workflow"
+    ]
+  },
   "voiceEnabled": true,
   "feedbackSurveyState": {
     "lastShownTime": 1754090074729

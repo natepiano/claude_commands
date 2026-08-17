@@ -45,6 +45,7 @@ class ProgressHistoryTests(unittest.TestCase):
         environment = os.environ.copy()
         environment["PLAN_DELEGATE_HISTORY_DIR"] = str(self.history_dir)
         environment["PLAN_DELEGATE_NOW_EPOCH"] = str(at)
+        environment["PLAN_DELEGATE_PASS_OWNER"] = "launcher"
         result = subprocess.run(
             ["python3", str(SCRIPT), *arguments],
             check=True,
@@ -58,6 +59,7 @@ class ProgressHistoryTests(unittest.TestCase):
         environment = os.environ.copy()
         environment["PLAN_DELEGATE_HISTORY_DIR"] = str(self.history_dir)
         environment["PLAN_DELEGATE_NOW_EPOCH"] = str(at)
+        environment["PLAN_DELEGATE_PASS_OWNER"] = "launcher"
         return subprocess.run(
             ["python3", str(SCRIPT), *arguments],
             check=False,
@@ -667,6 +669,98 @@ class ProgressHistoryTests(unittest.TestCase):
         self.assertIn('"work_order_top_level_bullets":3', history_text)
         self.assertIn('"work_order_file_targets":2', history_text)
 
+    def run_unowned_command(
+        self, *arguments: str, at: int
+    ) -> subprocess.CompletedProcess[str]:
+        """Invoke the recorder the way a caller outside a launcher would."""
+        environment = os.environ.copy()
+        environment["PLAN_DELEGATE_HISTORY_DIR"] = str(self.history_dir)
+        environment["PLAN_DELEGATE_NOW_EPOCH"] = str(at)
+        environment.pop("PLAN_DELEGATE_PASS_OWNER", None)
+        return subprocess.run(
+            ["python3", str(SCRIPT), *arguments],
+            check=False,
+            capture_output=True,
+            text=True,
+            env=environment,
+        )
+
+    def test_start_pass_outside_a_launcher_is_refused(self) -> None:
+        session_dir = self.start_run("owned", 20_000)
+        _ = self.run_command(
+            "start-phase",
+            "--session-dir",
+            str(session_dir),
+            "--phase-id",
+            "3",
+            "--phase-title",
+            "Retry handling",
+            at=20_010,
+        )
+        failure = self.run_unowned_command(
+            "start-pass",
+            "--session-dir",
+            str(session_dir),
+            "--pass-kind",
+            "review",
+            "--activity",
+            "reviewing by hand",
+            "--called-task",
+            "delegate.review",
+            "--called-family",
+            "codex",
+            "--called-model",
+            "gpt-called",
+            at=20_020,
+        )
+        self.assertNotEqual(failure.returncode, 0)
+        self.assertIn("launcher", failure.stderr)
+        history = self.history_dir / "runs" / "owned.jsonl"
+        self.assertNotIn("pass_started", history.read_text(encoding="utf-8"))
+
+    def test_finish_pass_outside_a_launcher_only_cancels_an_orphan(self) -> None:
+        session_dir = self.start_run("orphan", 20_000)
+        self.start_phase_and_pass(session_dir, 20_010)
+        unowned = self.run_unowned_command(
+            "finish-pass", "--session-dir", str(session_dir), "--status", "completed", at=20_030
+        )
+        self.assertNotEqual(unowned.returncode, 0)
+        self.assertIn("launcher", unowned.stderr)
+        wrong_status = self.run_unowned_command(
+            "finish-pass",
+            "--session-dir",
+            str(session_dir),
+            "--status",
+            "completed",
+            "--orphaned-launcher",
+            at=20_040,
+        )
+        self.assertNotEqual(wrong_status.returncode, 0)
+        self.assertIn("--status canceled", wrong_status.stderr)
+        canceled = self.run_unowned_command(
+            "finish-pass",
+            "--session-dir",
+            str(session_dir),
+            "--status",
+            "canceled",
+            "--orphaned-launcher",
+            at=20_050,
+        )
+        self.assertEqual(canceled.returncode, 0, canceled.stderr)
+        history = (self.history_dir / "runs" / "orphan.jsonl").read_text(encoding="utf-8")
+        self.assertIn('"status":"canceled"', history.replace(" ", ""))
+        repeated = self.run_unowned_command(
+            "finish-pass",
+            "--session-dir",
+            str(session_dir),
+            "--status",
+            "canceled",
+            "--orphaned-launcher",
+            at=20_060,
+        )
+        self.assertNotEqual(repeated.returncode, 0)
+        self.assertIn("No pass is open", repeated.stderr)
+
     def test_aggregate_reports_raw_and_calibrated_error_fields(self) -> None:
         self.complete_historical_run(0)
         output = self.run_command("aggregate", "--percent", "65", at=30_000)
@@ -740,6 +834,100 @@ class ProgressHistoryTests(unittest.TestCase):
         self.assertEqual(progress_event["suggested_percent"], 25)
         self.assertEqual(progress_event["suggested_adjustment_percentage_points"], -40)
         self.assertEqual(progress_event["reported_adjustment_percentage_points"], -30)
+
+
+class PhaseCountTests(unittest.TestCase):
+    """A plan's phase headings take three forms; all three must be counted.
+
+    Counting only the `· status:` forms silently drops every shrunk phase,
+    which under-reported a 68%-complete plan as 36%.
+    """
+
+    temporary: tempfile.TemporaryDirectory[str]  # pyright: ignore[reportUninitializedInstanceVariable]
+
+    @override
+    def setUp(self) -> None:
+        self.temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary.cleanup)
+
+    def _count(self, body: str, phase_percent: int = 0) -> dict[str, object]:
+        plan = Path(self.temporary.name) / "plan.md"
+        _ = plan.write_text(body, encoding="utf-8")
+        completed = subprocess.run(
+            [
+                "python3",
+                str(SCRIPT),
+                "phase-count",
+                "--plan-doc",
+                str(plan),
+                "--phase-percent",
+                str(phase_percent),
+            ],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        return cast("dict[str, object]", json.loads(completed.stdout))
+
+    def test_counts_all_three_heading_forms(self) -> None:
+        counts = self._count(
+            "### Phase 1 — Shrunk archive form (`bbac234`)\n"
+            "\n"
+            "### Phase 2 — Another shrunk one (`8c5053a`)\n"
+            "\n"
+            "### Phase 3 — Completed, not yet shrunk  · status: done\n"
+            "\n"
+            "### Phase 4 — Live work  · status: todo\n"
+        )
+        self.assertEqual(counts["done"], 3)
+        self.assertEqual(counts["todo"], 1)
+        self.assertEqual(counts["total"], 4)
+
+    def test_review_section_heading_is_not_a_phase(self) -> None:
+        counts = self._count(
+            "### Phase 1 — Real phase  · status: done\n"
+            "\n"
+            "### Phase 1 Review\n"
+            "\n"
+            "### Phase 2 — Real phase  · status: todo\n"
+        )
+        self.assertEqual(counts["total"], 2)
+        self.assertEqual(counts["done"], 1)
+        self.assertEqual(counts["todo"], 1)
+
+    def test_repeated_identifier_counts_once(self) -> None:
+        counts = self._count(
+            "### Phase 7 — First mention  · status: done\n"
+            "\n"
+            "#### Phase 7 — Same id again  · status: done\n"
+        )
+        self.assertEqual(counts["total"], 1)
+        self.assertEqual(counts["duplicate_ids"], ["7"])
+
+    def test_letter_suffixed_identifier_is_counted(self) -> None:
+        counts = self._count(
+            "### Phase 4 — Plain  · status: done\n"
+            "\n"
+            "### Phase 4b — Suffixed legacy id  · status: todo\n"
+        )
+        self.assertEqual(counts["total"], 2)
+        self.assertEqual(counts["todo"], 1)
+
+    def test_project_percent_credits_the_phase_in_flight(self) -> None:
+        body = (
+            "".join(
+                f"### Phase {index} — Done  · status: done\n\n" for index in range(1, 4)
+            )
+            + "### Phase 4 — Live  · status: todo\n"
+        )
+        self.assertEqual(self._count(body, 0)["project_percent"], 75)
+        self.assertEqual(self._count(body, 100)["project_percent"], 100)
+        self.assertEqual(self._count(body, 50)["project_percent"], 88)
+
+    def test_plan_without_phase_headings_is_unavailable(self) -> None:
+        counts = self._count("# A document with no phases\n")
+        self.assertIs(counts["available"], False)
+        self.assertIsNone(counts["project_percent"])
 
 
 if __name__ == "__main__":

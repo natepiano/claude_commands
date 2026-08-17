@@ -231,15 +231,45 @@ Use `python3 ~/.claude/scripts/delegate/findings.py <command> --session-dir
 | `gate` | get `converged`, `dispatch`, or `stop`, plus batch and reason |
 | `dispatch --covers F001,F002,...` | record one complete repair batch |
 | `verdict --id F001 --state <accepted\|still_open\|reopened> [--evidence <e>]` | record closure evidence |
+| `override --reason <the user's own words>` | clear one wrong `stop` |
 
 The script, not the main agent, owns convergence: first round gates blockers and
 minors; later rounds gate blockers; nits never gate. It rejects partial batches
 and stops on repeated failed closure, reopening, stalled counts, repair budget,
-repeated pass shape, a second blind-review cancellation, or the backstop. An
-explicit user choice may override `stop`. The one
+repeated pass shape, a second blind-review cancellation, or the backstop. The one
 <MechanicalGateCleanup/> exception bypasses only a repair-budget stop; it never
 calls `findings.py dispatch`. `start-phase` resets the ledger.
+
+A `stop` can be wrong about the world when its inputs were: an aborted launcher,
+a pass recorded outside <PassOwnership/>, a count carried across a mislabeled
+phase boundary. Never edit the run history to clear one — that history is the
+audit trail, and rewriting it destroys the evidence that the stop was wrong.
+Report the stop and its evidence, get the user's explicit decision, then record
+`override --reason "<their words>"`. The override names the one stop reason it
+clears, is spent by the round it authorizes, and is appended beside the stop it
+corrects. A stop the evidence supports is never overridden; find the real defect.
 </FindingsLedger>
+
+<PassOwnership>
+Every pass is recorded by the launcher that runs it. `implement.sh` and
+`review.sh` call `progress_history.py start-pass` and `finish-pass` themselves,
+around the worker they wait on, for completion and for error alike. The main
+agent never calls either by hand: the launcher's own records already exist, so a
+hand-written call forges a pass that never ran, and `findings.py gate` counts
+passes when it decides whether a phase is converging. The recorder enforces this
+and rejects an unowned call.
+
+The one exception is a launcher the main agent killed — the <DualReview/>
+preemption. Its pass stays open because the process died before recording, so
+close it with `finish-pass --status canceled --orphaned-launcher`, which the
+recorder accepts only for `canceled` and only while a pass is actually open.
+
+Phase records are the main agent's, and both belong at the real boundary:
+`finish-phase` for the outgoing phase and `start-phase` for the incoming one run
+before that phase's first dispatch. Recording them late attributes the new
+phase's work to the finished one — its title, its elapsed clock, and its pass
+counts all describe the wrong phase.
+</PassOwnership>
 
 <ProgressContract>
 The main agent produces progress reports from the plan, launcher state,
@@ -267,13 +297,25 @@ On a Claude timer notification or Codex poll timeout:
    heartbeat lines, `git status --short`, and `git diff --stat` in
    `${WORKING_DIR}`. Compare status with the phase baseline; include untracked
    paths without changing the index.
-3. Derive separate whole-plan and current-phase percentages from completed and
-   remaining work, changed areas, current activity, and passed verification—not
-   elapsed time. Round hard: stay below 20 only until implementation appears;
-   editing is the middle; completed verification lines form the final stretch;
-   reviews advance by inspected scope. Use the last factually passed cap stage:
+3. Derive the **current-phase** percentage from completed and remaining work,
+   changed areas, current activity, and passed verification—not elapsed time.
+   Round hard: stay below 20 only until implementation appears; editing is the
+   middle; completed verification lines form the final stretch; reviews advance
+   by inspected scope. Use the last factually passed cap stage:
    `implementation` 75, `initial_review` 85, `open_findings` 90, `closure` 95,
    `checkpoint` 98, or `complete` 100.
+
+   **Do not derive the whole-plan percentage.** `progress_history.py` computes it
+   from the plan's phase headings and overwrites whatever `--project-raw-percent`
+   and `--project-percent` carry, so pass the phase percentage there and treat
+   the project value as advisory. Never count phases by hand or by grep: a
+   heading takes three forms over its life—`· status: todo`, `· status: done`,
+   and the shrunk as-built form that drops the status marker and carries a commit
+   annotation instead—and any pattern keyed on `status:` silently ignores every
+   archived phase. That mistake reported a 68%-complete plan as 36%. To read the
+   count directly, without an active phase and pass:
+
+   `python3 ~/.claude/scripts/delegate/progress_history.py phase-count --plan-doc "<plan>" [--phase-percent N]`
 4. Run:
 
    `python3 ~/.claude/scripts/delegate/progress_history.py calibrate --session-dir "${SESSION_DIR}" --candidate-percent "${PHASE_RAW_PERCENT}"`
@@ -331,7 +373,9 @@ Loop stops only for that dirty-tree guard, an unresolved current Pending
 decision, a real design choice, reviews conflicting on intended behavior, a
 ledger `stop`, a required gate that cannot run, or delegate/environment error.
 It may also stop at a phase or auto-window boundary for
-<ConsiderNextItems/> approval. Apply <MechanicalGateCleanup/> before treating an
+<ConsiderNextItems/> approval, and only for that step's `gate` proposals — its
+`apply` ones are written and reported, never asked. Apply
+<MechanicalGateCleanup/> before treating an
 eligible repair-budget verdict as a stop. Everything else auto-routes,
 resequences, or defers. Verbose adds only its authorization gates.
 </AuthorizationContract>
@@ -402,7 +446,13 @@ through <RunSummary/> or single-mode completion.
 1. For a phased plan, scan the target Work Order for `**Pending decision:**`.
    Verify cited code still matches the block. If unresolved, present it, apply
    <ExplainOnDemand/> when needed, edit the resolution into Spec/Files/gate, and
-   remove the block before continuing.
+   remove the block before continuing. A resolution introduces behavior nothing
+   else audits — `/plan:phase_review`'s `<StateAndConsequenceAudit/>` inspects
+   only what a phase already shipped — so run that audit against the resolution
+   here and state its destination and owner alongside it. An in-repository
+   destination is the Spec/Files/gate edit already being made. A destination in
+   another repository goes to the next-items file derived in step 5, and only
+   with the user's approval; never append to it automatically.
 2. Parse the complete bounded-auto phrase before a standalone phase selector.
    Reject `single` plus `verbose`, auto without `verbose`, non-positive N, or an
    invalid range. Set `MODE=single` for `single` or non-phased work,
@@ -517,10 +567,14 @@ in the dispatch update.
 <LaunchImplementation>
 1. Once per phase, save `git status --short` to
    `${SESSION_DIR}/progress_baseline_status`; fixes retain it.
-2. Run `progress_history.py start-phase --session-dir "${SESSION_DIR}"
+2. Close the outgoing phase before opening this one, per <PassOwnership/>: when a
+   phase record is still active, run `progress_history.py finish-phase
+   --session-dir "${SESSION_DIR}" --status completed` first. Then run
+   `progress_history.py start-phase --session-dir "${SESSION_DIR}"
    --phase-id <id> --phase-title <title> --work-order-file
    "${SESSION_DIR}/implementation_prompt.md"`. Use `ad hoc` plus scope without a
-   phased plan; pass the original prompt only.
+   phased plan; pass the original prompt only. Both run before the dispatch in
+   step 4, never after it.
 3. Set `${PASS_KIND}=arch` for escalation, otherwise `${PASS_KIND}=impl`.
 4. Launch
    `bash ~/.claude/scripts/delegate/implement.sh "${SESSION_DIR}"
@@ -532,6 +586,13 @@ in the dispatch update.
    into `${IMPL_SUMMARY}`. On `error`, report `impl_agent.log`, record
    `finish-run --status error`, run `end_session.sh`, and stop; multi-phase runs
    also emit <RunSummary/>.
+7. `implemented` is the delegate's claim, not a passed gate. Read
+   `${IMPL_SUMMARY}` for a verification line it left running, unread, or
+   unmentioned — "still running", "I'll report once it completes", a listed
+   command with no stated result. When one is there, run that command yourself
+   under <VerificationContract/> before <DualReview/> and review against its real
+   output. A failing gate the delegate never read is a finding like any other,
+   not a reason to reject the phase.
 </LaunchImplementation>
 
 <ReviewDiffContract>
@@ -590,7 +651,8 @@ End with APPROVE, APPROVE WITH FIXES, or REQUEST CHANGES. Do not invent findings
    callers, consumers, transitions, or invariants.
 5. If this main pass confirms a substantial, unambiguous spec-defined defect
    while the blind review remains active, read its log once, cancel it, record
-   `finish-pass --status canceled`, open and gate the finding, and apply
+   `finish-pass --status canceled --orphaned-launcher` per <PassOwnership/>,
+   open and gate the finding, and apply
    <FixDispatch/> with useful partial-review evidence. Preempt at most once per
    phase; never edit while an old-diff review remains active. A canceled review
    supplies no verdict or direct-fix agreement.
@@ -829,33 +891,70 @@ condition, and source phase. Import each architect proposal as `amend` or
 `remove` with its exact current item, replacement, reason, and source phase, then
 delete its amendment artifact. Deduplicate all proposals by action, target, and
 observable outcome against `${NEXT_ITEMS_PATH}` and `${NEXT_ITEMS_PENDING}`.
-Never write an unapproved proposal to the repository.
 
-If a bounded auto window continues after this phase, return immediately without
-reporting or asking. `next N` continues when N is greater than 1; `through X`
-continues until the current phase is X. At an ordinary phase boundary or the
-last phase of an auto window, continue silently when `${NEXT_ITEMS_PENDING}` is
-absent or empty; otherwise present all pending candidates once:
+**Then split the proposals into `apply` and `gate`.** The gate costs the user a
+turn, so it is spent only where there is something to decide. This file is a
+backlog: writing an item into it commits nobody to building it, and the decision
+that matters happens later, when an item is scheduled into a phase. What earns a
+gate here is destroying or rewriting a record the user may have already read —
+not creating one.
+
+A proposal is **`apply`** — do it now, do not ask — when it is purely additive or
+purely factual:
+
+- Any `add`. A new backlog item records that something may be worth doing. It
+  changes no phase, no schedule, and no commitment.
+- An `amend` that only makes an existing item agree with code that has already
+  shipped, leaving it asking for exactly the work it asked for before: a drifted
+  file or line reference, a stated dependency the completed phase satisfied, a
+  named consequence the completed phase created, a claim the completed phase
+  falsified. Cite the evidence in the one-line report and move on.
+
+A proposal is **`gate`** — ask the user — when it removes or rewrites what is
+already recorded: any `remove`, and any `amend` that changes what the item asks
+for, what would satisfy it, or what it targets. Deleting a candidate and
+redefining one are the user's calls; nothing here may make them.
+
+When the split is genuinely unclear, gate it. Never write a `gate` proposal to
+the repository without approval.
+
+**A defect in what this phase just shipped is never an `add`.** Filing it as
+future work converts a fix into a backlog entry the user must later approve, read,
+and schedule — three costs where there was one. Route it to <Synthesize/> and fix
+it in this phase, even when no remaining Work Order names the files it touches:
+Work Order **Files** lists scope the plan predicted, not permission to edit.
+
+Apply every `apply` proposal to `${NEXT_ITEMS_PATH}` now, in one edit, and report
+them as a single line naming the count and the file — not as a list, and never as
+a question. They never enter `${NEXT_ITEMS_PENDING}`, never appear in the block
+below, and never hold an auto window open.
+
+Only `gate` proposals reach the gate. If a bounded auto window continues after
+this phase, return immediately without reporting or asking. `next N` continues
+when N is greater than 1; `through X` continues until the current phase is X. At
+an ordinary phase boundary or the last phase of an auto window, continue
+silently when `${NEXT_ITEMS_PENDING}` is absent or empty; otherwise present all
+pending candidates once:
 
 ```
 ## Items to consider
 
-1. **<Add | Amend | Remove>: <title>**
+1. **<Amend | Remove>: <title>**
    **Target:** <in-scope consumer | crate | crate example>
-   **Current:** <exact existing item; amend/remove only>
-   **Proposed:** <new item, replacement, or removal>
+   **Current:** <exact existing item>
+   **Proposed:** <replacement, or removal>
    **Why:** <missing capability or changed evidence>
-   **Completion condition:** <observable result; add/amend only>
+   **Completion condition:** <observable result; amend only>
 
 Reply `approve <numbers>`, `revise <number>: ...`, or `reject <numbers>`.
 ```
 
-Every proposal requires a disposition. Feedback revises it and requires
+Every `gate` proposal requires a disposition. Feedback revises it and requires
 re-presentation; questions preserve the gate. Apply approved actions only:
-append `add`, replace the exact quoted item for `amend`, and delete the exact
-quoted item for `remove`. If an amend/remove target no longer matches, refresh
-and re-present it. Preserve existing content and create this structure only for
-an approved `add` when the file does not exist:
+replace the exact quoted item for `amend`, and delete the exact quoted item for
+`remove`. If a target no longer matches, refresh and re-present it. Preserve
+existing content and create this structure only when an `add` lands in a file
+that does not exist:
 
 ```
 # <plan title> — Next

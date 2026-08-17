@@ -75,11 +75,16 @@ def main() -> None:
     if delegate_working(session_dir):
         return
 
-    window = auto_compact_window()
+    # Measure first: the window is clamped to the model's own context window, and
+    # only the transcript names the model.
+    measurement = measure(payload)
+    if measurement is None:
+        return
+    window = auto_compact_window(measurement["model"])
     if window is None:
         return
-    tokens = measure(payload)
-    if tokens is None or tokens < handoff_threshold(window):
+    tokens = measurement["tokens"]
+    if tokens < handoff_threshold(window):
         return
 
     print(json.dumps({"decision": "block", "reason": build_reason(tokens, trigger_tokens(window))}))

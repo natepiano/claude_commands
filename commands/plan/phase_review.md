@@ -73,8 +73,14 @@ recovery condition, diagnostic, or externally observable lifecycle, record:
 4. For a user-actionable outcome, what the user sees or can do, including
    recovery, diagnostics, reflection/BRP, documentation, and examples where
    applicable.
-5. Which existing remaining Work Order owns the required surface and its
-   acceptance test.
+5. Its destination, named from this set: a test, an example in this repository,
+   a feature in a consuming application, a reified tool in a tool-graph or
+   node-runtime repository, or none. Then its owner — an existing remaining Work
+   Order for an in-repository destination, or `${NEXT_ITEMS_PATH}` for one this
+   plan cannot implement. Name the acceptance test for every in-repository
+   destination. A destination is never dropped for being blocked by a gate or
+   living in another repository; that is what makes it a next item rather than a
+   phase.
 6. When no external surface is appropriate, `implementation-only because
    <reason>` instead of silently omitting it.
 
@@ -200,8 +206,9 @@ The prompt must include:
   a body of one to three sentences, and a `Severity:` tag — `minor` (safe to edit
   straight into the plan), or `significant` (changes scope, ordering, or
   architectural intent and needs user approval before editing). A Q8 finding
-  also has `Destination: next-items`, `Action: amend|remove`, `Current:` quoted
-  verbatim, `Target:`, and `Proposed:` with exact replacement text or `remove`.
+  also has `Destination: next-items`, `Action: add|amend|remove`, `Current:`
+  quoted verbatim for `amend`/`remove`, `Target:`, and `Proposed:` with the exact
+  new item, replacement text, or `remove`.
 
 The architect does **not** edit the plan. It returns findings only.
 
@@ -209,16 +216,43 @@ The architect does **not** edit the plan. It returns findings only.
 
 <NextItemAmendments>
 Before normal finding routing, remove every `Destination: next-items` finding
-from the plan-finding set. Never edit `${NEXT_ITEMS_PATH}` automatically.
-Deduplicate by current item and observable outcome, reject unsupported or
-optional changes, then write validated proposals to
+from the plan-finding set. Deduplicate by current item and observable outcome,
+reject unsupported or optional changes, then write validated proposals to
 `${SESSION_DIR}/next_item_amendments_<phase>.md` with `Action`, `Current`,
-`Target`, `Proposed`, `Why`, and source phase.
+`Target`, `Proposed`, `Why`, source phase, and **`Class`**.
 
-Under `/plan:delegate`, stop there; <ConsiderNextItems/> owns user approval and
-auto-window batching. Invoked standalone, present the same
-approve/revise/reject gate before Step 6, apply only approved amendments, and
-delete the artifact after every proposal is resolved.
+`Class` is `apply` or `gate`, and it decides whether the user is asked. This file
+is a backlog: writing an item into it commits nobody to building it, and the
+decision that matters happens later, when an item is scheduled into a phase. What
+earns a gate is destroying or rewriting a record the user may have already read —
+not creating one.
+
+A proposal is **`apply`** when it is purely additive or purely factual: any `add`,
+and any `amend` that only makes an existing item agree with code that has already
+shipped while leaving it asking for exactly the work it asked for before — a
+drifted file or line reference, a stated dependency this phase satisfied, a named
+consequence this phase created, a claim this phase falsified.
+
+A proposal is **`gate`** when it removes or rewrites what is already recorded: any
+`remove`, and any `amend` that changes what the item asks for, what would satisfy
+it, or what it targets. When the split is genuinely unclear, `gate`.
+
+**A defect in what this phase just shipped is never an `add`.** It is a
+current-phase defect: under `/plan:delegate` return it to <Synthesize/>, and
+standalone fix it before Step 6. A Work Order's **Files** list is the scope the
+plan predicted, not a limit on what this phase may repair.
+
+Under `/plan:delegate`, stop there; <ConsiderNextItems/> writes the `apply` ones
+and owns the gate for the rest, plus auto-window batching. Invoked standalone,
+write every `apply` proposal to `${NEXT_ITEMS_PATH}` now and report it as one line
+naming the count and the file; present only the `gate` proposals through the
+approve/revise/reject gate before Step 6; apply approved ones; then delete the
+artifact once every proposal is resolved.
+
+Do not route an `apply` proposal to the user under any framing — not as a
+question, not as a list awaiting acknowledgement, not as a "confirm before I
+apply". A correction with verified evidence and no alternative answer is not a
+decision, and presenting it as one spends the user's turn to buy nothing.
 </NextItemAmendments>
 
 Execute <NextItemAmendments/> before `<MinorFindings/>` or

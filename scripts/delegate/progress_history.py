@@ -32,6 +32,22 @@ PROJECT_PATTERN = re.compile(
     re.MULTILINE,
 )
 
+# Every phase heading in a delegate plan, in all three forms it takes over a
+# plan's life. `· status: todo` and `· status: done` are the live-zone forms;
+# a shrunk or as-built phase drops the status marker and usually carries a
+# commit annotation instead. Counting on the status marker alone silently
+# ignores every already-archived phase, which is how a 67%-complete plan once
+# reported 36%. Match the `Phase <id>` heading itself and classify after.
+PHASE_HEADING_PATTERN = re.compile(
+    r"^(?P<hashes>#{2,4})[ \t]+Phase[ \t]+(?P<id>\d+[a-z]?)\b(?P<rest>[^\n]*)$",
+    re.MULTILINE,
+)
+PHASE_STATUS_PATTERN = re.compile(r"·[ \t]*status:[ \t]*(?P<status>todo|done)\b")
+# `### Phase 12 Review` sits at the same heading level as a phase but is a
+# section inside one. A real phase heading always names a title after an
+# em-dash separator.
+PHASE_TITLE_PATTERN = re.compile(r"^[ \t]*[—–-][ \t]*\S")
+
 # A percentage is an estimate; a stage is a fact. These ceilings keep an
 # optimistic estimate from claiming a gate that has not run — the failure mode
 # was a phase sitting at 99% while its review loop was still unconverged.
@@ -92,6 +108,24 @@ def _now_epoch() -> float:
     if configured:
         return float(configured)
     return time.time()
+
+
+PASS_OWNER_ENV = "PLAN_DELEGATE_PASS_OWNER"
+PASS_OWNER_TOKEN = "launcher"
+
+PASS_OWNERSHIP_RULE = (
+    "Pass lifecycle belongs to the launcher. implement.sh and review.sh already "
+    "record pass_started and pass_finished around the worker they wait on, so a "
+    "hand-written call forges a pass that never ran. findings.py gate counts "
+    "passes to decide whether a phase is converging, and forged passes stop a run "
+    "for a condition that never happened. Launch the work through implement.sh or "
+    "review.sh. The single exception is a launcher the orchestrator killed: close "
+    "its still-open pass with 'finish-pass --status canceled --orphaned-launcher'."
+)
+
+
+def _launcher_owned() -> bool:
+    return os.environ.get(PASS_OWNER_ENV) == PASS_OWNER_TOKEN
 
 
 def _iso_time(epoch: float) -> str:
@@ -329,6 +363,69 @@ def _iso_epoch(value: str, context: str) -> float:
 def _plan_path(working_dir: Path, value: str) -> Path:
     path = Path(value).expanduser()
     return path.resolve() if path.is_absolute() else (working_dir / path).resolve()
+
+
+def _count_plan_phases(plan_path: Path) -> dict[str, object]:
+    """Count a plan's phases by heading, classifying every form.
+
+    Returns done/todo/total plus any heading this could not classify. An
+    unclassifiable heading is reported rather than guessed at: a miscount here
+    silently corrupts every project percentage the run reports.
+    """
+    try:
+        text = plan_path.read_text(encoding="utf-8")
+    except OSError:
+        return {"available": False, "reason": f"unable to read {plan_path}"}
+    done = 0
+    todo = 0
+    seen: set[str] = set()
+    duplicates: list[str] = []
+    for match in PHASE_HEADING_PATTERN.finditer(text):
+        rest = match.group("rest")
+        status_match = PHASE_STATUS_PATTERN.search(rest)
+        if status_match is None and not PHASE_TITLE_PATTERN.match(rest):
+            # `### Phase 12 Review` and friends — a section, not a phase.
+            continue
+        identifier = match.group("id")
+        if identifier in seen:
+            duplicates.append(identifier)
+            continue
+        seen.add(identifier)
+        # No status marker means the phase was shrunk into an as-built record,
+        # which only ever happens after it completed.
+        if status_match is not None and status_match.group("status") == "todo":
+            todo += 1
+        else:
+            done += 1
+    total = done + todo
+    if total == 0:
+        return {"available": False, "reason": f"no phase headings in {plan_path}"}
+    return {
+        "available": True,
+        "done": done,
+        "todo": todo,
+        "total": total,
+        "duplicate_ids": sorted(set(duplicates)),
+    }
+
+
+def _plan_derived_project_percent(
+    counts: dict[str, object], phase_percent: int
+) -> int | None:
+    """Project completion from phase counts, crediting the phase in flight.
+
+    The active phase contributes its own percentage as a fraction of one phase,
+    so a project clock advances during a long phase instead of stepping only at
+    checkpoints.
+    """
+    if not counts.get("available"):
+        return None
+    done = counts.get("done")
+    total = counts.get("total")
+    if not isinstance(done, int) or not isinstance(total, int) or total <= 0:
+        return None
+    completed = done + max(0, min(100, phase_percent)) / 100
+    return max(0, min(100, round(100 * completed / total)))
 
 
 def _read_plan_project_start(plan_path: Path) -> float | None:
@@ -690,6 +787,8 @@ def _start_phase(args: argparse.Namespace) -> None:
 
 
 def _start_pass(args: argparse.Namespace) -> None:
+    if not _launcher_owned():
+        raise SystemExit(f"start-pass is the launcher's to record. {PASS_OWNERSHIP_RULE}")
     session_dir = _session_dir(args)
     state = _read_state(session_dir)
     phase = _object_dict(state.get("phase"))
@@ -724,8 +823,24 @@ def _start_pass(args: argparse.Namespace) -> None:
 
 def _finish_pass(args: argparse.Namespace) -> None:
     session_dir = _session_dir(args)
+    status = _arg_string(args, "status")
+    orphaned = bool(getattr(args, "orphaned_launcher", False))
+    if not _launcher_owned():
+        if not orphaned:
+            raise SystemExit(f"finish-pass is the launcher's to record. {PASS_OWNERSHIP_RULE}")
+        if status != "canceled":
+            raise SystemExit(
+                "--orphaned-launcher closes the pass of a launcher the orchestrator "
+                f"killed, so it takes --status canceled, not {status}"
+            )
     state = _read_state(session_dir)
-    _close_active_pass(session_dir, state, _arg_string(args, "status"), _now_epoch())
+    if orphaned:
+        current = _object_dict(state.get("pass"))
+        if current is None or _string(current.get("status")) != "active":
+            raise SystemExit(
+                "No pass is open, so no launcher was orphaned and nothing was recorded"
+            )
+    _close_active_pass(session_dir, state, status, _now_epoch())
 
 
 def _load_events() -> tuple[list[dict[str, object]], int]:
@@ -1155,6 +1270,20 @@ def _assessment_line(percent: int, elapsed: int, unchanged: int) -> str:
     return line + "**"
 
 
+def _phase_count(args: argparse.Namespace) -> None:
+    """Report a plan's phase counts and the project percent they imply.
+
+    Standalone query for the same numbers `progress` derives, so a plan's
+    completion can be checked without an active phase and pass.
+    """
+    plan_doc = _arg_string(args, "plan_doc")
+    counts = _count_plan_phases(Path(plan_doc).expanduser().resolve())
+    phase_percent = _arg_integer(args, "phase_percent", 0)
+    payload = dict(counts)
+    payload["project_percent"] = _plan_derived_project_percent(counts, phase_percent)
+    print(json.dumps(payload, indent=2, sort_keys=True))
+
+
 def _progress(args: argparse.Namespace) -> None:
     session_dir = _session_dir(args)
     now = _now_epoch()
@@ -1217,6 +1346,26 @@ def _progress(args: argparse.Namespace) -> None:
         phase_override_reason,
         "phase" if uses_dual_layout else "legacy",
     )
+    # The project clock is derived, never estimated. An agent eyeballing phase
+    # headings misses the archived ones; counting them here removes the judgment
+    # call entirely, and a supplied --project-percent becomes advisory.
+    plan_phase_counts: dict[str, object] = {"available": False, "reason": "no plan doc"}
+    project_percent_source = "supplied"
+    state_plan_doc = _string(state.get("project_plan_doc")) or _string(
+        state.get("plan_doc")
+    )
+    if state_plan_doc:
+        candidate = Path(state_plan_doc).expanduser()
+        if candidate.is_absolute():
+            plan_phase_counts = _count_plan_phases(candidate)
+    derived_project_percent = _plan_derived_project_percent(
+        plan_phase_counts, phase_percent
+    )
+    if uses_dual_layout and derived_project_percent is not None:
+        project_percent_source = "plan_phase_count"
+        project_raw_percent = derived_project_percent
+        project_percent = derived_project_percent
+
     project_decision: dict[str, object] | None = None
     if uses_dual_layout:
         project_decision = _progress_decision(
@@ -1295,6 +1444,8 @@ def _progress(args: argparse.Namespace) -> None:
             {
                 "project_raw_percent": project_raw_percent,
                 "project_percent": project_percent,
+                "project_percent_source": project_percent_source,
+                "project_plan_phase_counts": plan_phase_counts,
                 "project_uncapped_percent": project_uncapped_percent,
                 "project_same_percent_started_at": project_percent_started_at,
                 "project_same_percent_elapsed_seconds": project_unchanged_seconds,
@@ -1463,6 +1614,11 @@ def _build_parser() -> argparse.ArgumentParser:
         choices=("completed", "error", "canceled", "interrupted"),
         required=True,
     )
+    _ = finish_pass.add_argument(
+        "--orphaned-launcher",
+        action="store_true",
+        help="close the open pass of a launcher the orchestrator killed (--status canceled only)",
+    )
     finish_pass.set_defaults(handler=_finish_pass)
 
     calibrate = subparsers.add_parser("calibrate")
@@ -1484,6 +1640,11 @@ def _build_parser() -> argparse.ArgumentParser:
     _ = progress.add_argument("--project-override-reason", default="")
     _ = progress.add_argument("--phase-override-reason", default="")
     progress.set_defaults(handler=_progress)
+
+    phase_count = subparsers.add_parser("phase-count")
+    _ = phase_count.add_argument("--plan-doc", required=True)
+    _ = phase_count.add_argument("--phase-percent", type=int, default=0)
+    phase_count.set_defaults(handler=_phase_count)
 
     finish_phase = subparsers.add_parser("finish-phase")
     _ = finish_phase.add_argument("--session-dir", required=True)

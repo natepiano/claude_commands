@@ -24,7 +24,7 @@ LINT_CONFIG_FILE="${LINT_CONFIG_FILE:-$HOME/.claude/config/lint.conf}"
 # the config that is not listed here is rejected as unknown.
 LINT_CONFIG_OPS=(
     "cache|reuse a fresh cargo-port lint-run instead of re-running the suite|/clippy STEP 1"
-    "mend|cargo mend check pass and its --fix pass|/clippy STEP 2/3 · clean-fix mend stage"
+    "mend|cargo mend check pass and its --fix pass|/clippy STEP 2/3 · clean-fix mend stage · validate_ci.sh mend steps"
     "style_review|style-guide walk over the uncommitted diff|/clippy STEP 4 · /plan:delegate phase-end gate"
     "clippy|cargo clippy|/clippy STEP 5 · verify.sh lint"
     "doc|cargo doc with -D warnings|/clippy STEP 5b"
@@ -206,7 +206,8 @@ Usage: lint_config.sh [<op>] | <op> on|off | all on|off | export | enabled <op>
 Checks: $(_lint_config_op_names | tr '\n' ' ')
 
 Not gated by this file: verify.sh check/test/example, the workspace check and
-test inside verify.sh final, pre_release_checks.sh, and validate_ci.sh.
+test inside verify.sh final, pre_release_checks.sh, and every validate_ci.sh
+step except its two cargo-mend steps, which the mend switch does gate.
 
 Examples:
   lint_config.sh

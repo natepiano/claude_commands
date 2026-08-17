@@ -4,6 +4,18 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 LINT_CMD="$HOME/.claude/scripts/lint/lint"
 
+# Lint policy, read for `mend` only — see the mend note in the header comment
+# below. A missing reader means every step runs.
+LINT_CONFIG_READER="$HOME/.claude/scripts/lint/lint_config.sh"
+if [ -f "$LINT_CONFIG_READER" ]; then
+  # shellcheck source=/dev/null
+  source "$LINT_CONFIG_READER"
+else
+  echo "validate_ci.sh: $LINT_CONFIG_READER not found — running every step" >&2
+  lint_config_enabled() { return 0; }
+  lint_config_skip_notice() { :; }
+fi
+
 REPO_ROOT="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
 REPO_TARGET_DIR="${CARGO_TARGET_DIR:-${REPO_ROOT}/target}"
 export CARGO_TARGET_DIR="$REPO_TARGET_DIR"
@@ -17,6 +29,11 @@ HOST_TRIPLE="$(rustc -vV | sed -n 's/^host: //p')"
 #   `cargo run`; all other repos use the installed cargo-mend through LINT_CMD
 # - Host clippy lints lib/bins/tests only (examples and benches excluded);
 #   benches are intentionally never run here — run them ad hoc
+# - `mend=off` in config/lint.conf skips both cargo-mend steps here, and only
+#   those two. Every other step ignores that file: a pre-push gate that silently
+#   no-ops is worse than a noisy one. mend is the exception because it rewrites
+#   source, so a mend release that emits a fix which does not compile blocks
+#   every push from an affected repo with nothing the repo can do about it
 # - If `.cargo/validate-targets` exists, each non-comment target listed there
 #   gets additive cross-target clippy plus test-binary compilation. Host checks
 #   still run, so this validates macOS plus configured Linux targets on a Mac.
@@ -196,7 +213,9 @@ run_configured_target_checks() {
   done < "$targets_file"
 }
 
-if [ "$IS_SELF_MEND" -eq 1 ]; then
+if ! lint_config_enabled mend; then
+  lint_config_skip_notice mend "cargo-mend autofix"
+elif [ "$IS_SELF_MEND" -eq 1 ]; then
   run_autofix_step "cargo-mend autofix" cargo run -- --fix
 else
   run_autofix_step "cargo-mend autofix" "$LINT_CMD" mend --fix
@@ -212,7 +231,9 @@ run_configured_target_checks
 
 run_step "nextest" cargo nextest run --workspace --all-features --tests
 
-if [ "$IS_SELF_MEND" -eq 1 ]; then
+if ! lint_config_enabled mend; then
+  lint_config_skip_notice mend "cargo-mend --fail-on-warn"
+elif [ "$IS_SELF_MEND" -eq 1 ]; then
   run_step "cargo-mend" cargo run -- --fail-on-warn
 else
   run_step "cargo-mend" "$LINT_CMD" mend --fail-on-warn
