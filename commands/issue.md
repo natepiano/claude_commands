@@ -23,7 +23,7 @@ Look up the project shorthand from the base files in the vault root (`/Users/nat
 | bwm | bevy_window_manager | issues - bwm.base |
 | cargo-mend | cargo-mend | issues - cargo-mend.base |
 | cargo-port | cargo-port | issues - cargo-port.base |
-| catenary | bevy_catenary | issues - catenary.base |
+| conduit | hana_conduit | issues - conduit.base |
 | diegetic | hana_diegetic | issues - diegetic.base |
 | fairy_dust | fairy_dust | issues - fairy_dust.base |
 | hana | hana | issues - hana.base |
@@ -116,7 +116,22 @@ If the shorthand doesn't match any of these, tell the user and stop.
 
 9. Show the user the created file path and a summary of what was created.
 
-10. Report the ranking. The vault's background watcher computes `backlog_score` and `backlog_rank` from the survey inputs faster than a tool-call round trip. Do NOT sleep or wait — immediately re-read the created file's frontmatter (e.g. `rg -n "backlog_score|backlog_rank" <file>`). If the fields aren't there yet, just re-query until they are; never insert a sleep between attempts. Report `backlog_rank` (and `backlog_score`) to the user, so they see where the new issue landed in the global ordering.
+10. Report the ranking. The vault's background watcher computes `backlog_score` and `backlog_rank` from the survey inputs — it does NOT finish within a tool-call round trip. Even a full re-rank measures about 3-4 seconds end to end (0.5s poll detection, debounce, snapshot, apply, validate, settle). Repeatedly re-reading the file in a tight loop just returns nothing several times and invites a false "the watcher isn't running" report.
+
+    Wait for the fields with a single **backgrounded** blocking command, then yield the turn and read the result from the task notification:
+
+    ```bash
+    f="/Users/natemccoy/rust/hanadocs/issues/<derived-filename>.md"
+    until grep -q "backlog_rank" "$f"; do sleep 2; done
+    grep -E "backlog_score|backlog_rank" "$f"
+    cat /tmp/hanadocs-prioritize/last-status
+    ```
+
+    Run it with `run_in_background: true` and a `timeout` of 60000. Report `backlog_rank` (and `backlog_score`) to the user, so they see where the new issue landed in the global ordering.
+
+    **Concurrent edits abort the apply.** If the user (or Obsidian) saves any issue file while the apply is in flight, `renumber.py` raises `file changed after discovery`, rolls the whole batch back, and `last-status` goes to `pending ... result=rerun detail=concurrent-change-during-apply`. That is self-healing — the daemon coalesces and retries within a few seconds, and the wait loop above rides through it. Only report a problem if `last-status` is still not `ok ... result=updated` after the timeout; then check `/tmp/hanadocs-prioritize/events.log` for the failure and whether `run_watcher.sh --daemon` is alive.
+
+    If a re-rank ever takes tens of seconds again, check `ProcessType` in `~/.claude/scripts/prioritize/com.natemccoy.hanadocs-prioritize.plist`. `Background` puts the daemon in the DARWIN_BG band, which adds a per-write I/O throttle delay — that alone turned a 0.5s 338-file apply into 38-47s. It must stay `Standard`.
 
 ## Important
 - Every issue's `return` carries **two** entries: the project base `[[issues - <short>.base]]` first, then `[[issues.base]]`. The template already does this — do not drop either one.

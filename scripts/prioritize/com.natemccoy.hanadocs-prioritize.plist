@@ -16,8 +16,15 @@
     <true/>
     <key>ThrottleInterval</key>
     <integer>1</integer>
+    <!-- ProcessType MUST NOT be Background. Background puts the job in the
+         DARWIN_BG band, which forces an I/O throttle delay on every write.
+         A top-of-backlog insert renumbers ~330 issue files; measured on this
+         machine that is 0.5s at Standard and 38-47s under Background. The
+         delay is per-write, so it scales with how many ranks shift and cannot
+         be cleared from inside the job (taskpolicy -B -p $$ does not work).
+         LowPriorityIO is the throttle worth keeping: measured cost 0.00s. -->
     <key>ProcessType</key>
-    <string>Background</string>
+    <string>Standard</string>
     <key>LowPriorityIO</key>
     <true/>
     <key>Umask</key>
