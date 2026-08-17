@@ -23,7 +23,9 @@ DEST=/tmp/mend-repro-$(basename "$SRC")
 rm -rf "$DEST" && mkdir -p "$DEST"
 rsync -a --exclude 'target/' --exclude '.git/' "$SRC"/ "$DEST"/pristine/
 rsync -a "$DEST"/pristine/ "$DEST"/work/
+(cd "$DEST"/work && git init -q . && git add -A && git -c user.email=t@t -c user.name=t commit -qm base)
 ```
+- The `git init` is required: `--fix-all` runs `--fix-compiler`, which shells out to `cargo fix`, which refuses to touch a directory with no VCS (`no VCS found for this package`). Without it the run fails for a reason that has nothing to do with the bug.
 - `$DEST/pristine` is never run against. `$DEST/work` is the run target.
 - To reset `work` after a `--fix` run mutated it, keeping its build cache:
   `rsync -a --delete --exclude 'target/' "$DEST"/pristine/ "$DEST"/work/`
@@ -42,7 +44,8 @@ cargo mend --fix-all "$DEST/work" > "$DEST"/repro.log 2>&1; echo "EXIT=$?" >> "$
 
 **STEP 4 — Diagnose in cargo-mend**
 - Work in `/Users/natemccoy/rust/cargo-mend`. Prefer LSP (definitions, references, hover) over grep.
-- Trace from the observed symptom to the code that produced it before changing anything. Name the mechanism, not a guess.
+- Trace from the observed symptom to the code that produced it before changing anything. Name the function and the value it computed.
+- Isolate the pattern in a dependency-free fixture crate under `$DEST` and confirm it reproduces there. A 6-file crate that fails in one second beats re-checking a bevy workspace, and it becomes the regression test.
 - If two attempts fail to resolve it, start an attempts log in the cargo-mend memory directory and log every approach, reasoning, and result before the next attempt — telling the user each time an entry is added.
 
 **STEP 5 — Fix**
@@ -57,7 +60,7 @@ cargo +stable build            # RUSTC_BOOTSTRAP=1 comes from .cargo/config.toml
 rsync -a --delete --exclude 'target/' "$DEST"/pristine/ "$DEST"/work/   # fresh sources, keep build cache
 ./target/debug/cargo-mend --fix-all "$DEST/work"
 ```
-  `+stable` is load-bearing — a nightly-built binary fails against stable projects with `E0514`, which reads like a fresh bug.
+  `+stable` matters — a nightly-built binary fails against stable projects with `E0514`, which reads like a fresh bug.
 - The fix is confirmed only when mend exits 0 **and** the rewritten copy compiles: `cargo check --workspace --all-targets` in `$DEST/work` after the fix run.
 - Run `cargo test` (background it).
 - Report the before/after to the user: the original compiler errors, and what the run does now.
