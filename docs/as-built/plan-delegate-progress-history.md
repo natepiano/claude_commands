@@ -170,12 +170,20 @@ Three rules are enforced by refusal, not by prose:
   `fixed_pending_review`; reopening an `accepted` finding requires `--evidence`
   naming the hunk that invalidated it.
 
-Stop conditions, checked in this order: a finding reopened twice after being
-accepted; a finding that failed to close after two repair attempts; two
-consecutive rounds with no decrease in the gating-open count; a 10-round runaway
-backstop. The first three are convergence tests — a run grinding through eight
-rounds of genuinely new defects is never interrupted, because progress is
-measured, not counted.
+Stop conditions, checked in this order: a finding reopened `MAX_REOPENS` times
+after being accepted; a finding that failed to close after `MAX_FIX_ATTEMPTS`
+repair attempts; `STALLED_ROUNDS` consecutive rounds with no decrease in the
+gating-open count; `MAX_CONSECUTIVE_SAME_KIND_PASSES` passes of one kind in a
+row; more than `MAX_REVIEW_CANCELLATIONS` blind-review cancellations; a spent
+repair budget; the `RUNAWAY_ROUNDS` backstop. The convergence tests come first
+so a run grinding through eight rounds of genuinely new defects is never
+interrupted, because progress is measured, not counted.
+
+The repair budget is the first round's gating count times
+`REPAIR_ROUNDS_PER_FINDING`, never below `MIN_REPAIR_BUDGET`. All of these
+limits are set in `~/.claude/config/delegate.conf`, read at startup by
+`findings.py`; the shipped values give a phase 3 automatic fix rounds at
+minimum and 5 at most.
 
 ## Commands
 

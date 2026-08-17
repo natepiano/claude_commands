@@ -238,7 +238,9 @@ minors; later rounds gate blockers; nits never gate. It rejects partial batches
 and stops on repeated failed closure, reopening, stalled counts, repair budget,
 repeated pass shape, a second blind-review cancellation, or the backstop. The one
 <MechanicalGateCleanup/> exception bypasses only a repair-budget stop; it never
-calls `findings.py dispatch`. `start-phase` resets the ledger.
+calls `findings.py dispatch`. `start-phase` resets the ledger. Every limit those
+stops use lives in `~/.claude/config/delegate.conf`; never argue a stop down by
+editing that file mid-run.
 
 A `stop` can be wrong about the world when its inputs were: an aborted launcher,
 a pass recorded outside <PassOwnership/>, a count carried across a mislabeled

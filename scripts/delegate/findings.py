@@ -19,10 +19,16 @@ This ledger replaces the counter with state:
 
 Convergence stop conditions, all computed from recorded state:
 
-  * a finding failed to close twice
-  * a finding reopened twice after being accepted
-  * the gating open count failed to decrease across two consecutive rounds
-  * a runaway backstop at ten rounds
+  * a finding failed to close `MAX_FIX_ATTEMPTS` times
+  * a finding reopened `MAX_REOPENS` times after being accepted
+  * the gating open count failed to decrease across `STALLED_ROUNDS` rounds
+  * the phase spent its repair budget, which is the first round's gating count
+    times `REPAIR_ROUNDS_PER_FINDING`, never below `MIN_REPAIR_BUDGET`
+  * `MAX_CONSECUTIVE_SAME_KIND_PASSES` passes of one kind ran in a row
+  * the blind review was canceled more than `MAX_REVIEW_CANCELLATIONS` times
+  * a runaway backstop at `RUNAWAY_ROUNDS` rounds
+
+Every one of those limits is set in `~/.claude/config/delegate.conf`.
 
 Findings live in `<session_dir>/findings_state.json` and are also appended to
 the run's durable event stream when `progress_history.py` has started a run.
@@ -35,6 +41,7 @@ import fcntl
 import json
 import math
 import os
+import sys
 import tempfile
 import time
 import uuid
@@ -56,26 +63,89 @@ STATE_OPEN = "open"
 STATE_PENDING = "fixed_pending_review"
 STATE_ACCEPTED = "accepted"
 
-MAX_FIX_ATTEMPTS = 2
-MAX_REOPENS = 2
-STALLED_ROUNDS = 2
-RUNAWAY_ROUNDS = 5
+# Every convergence limit is tunable in `~/.claude/config/delegate.conf`; the
+# values here are the fallbacks when a key is missing or unusable, and the file
+# documents what each one bounds. `PLAN_DELEGATE_CONFIG` overrides the path so
+# the tests read a fixture rather than the machine's live settings.
+DEFAULT_CONFIG_PATH = Path("~/.claude/config/delegate.conf").expanduser()
+
+
+def _config_values() -> dict[str, str]:
+    configured = os.environ.get("PLAN_DELEGATE_CONFIG")
+    path = Path(configured) if configured else DEFAULT_CONFIG_PATH
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError:
+        return {}
+    values: dict[str, str] = {}
+    for line in text.splitlines():
+        statement = line.split("#", 1)[0].strip()
+        key, separator, value = statement.partition("=")
+        if separator:
+            values[key.strip()] = value.strip()
+    return values
+
+
+def _config_warn(key: str, raw: str, default: object) -> None:
+    print(
+        f"delegate.conf: {key}={raw} is not usable; falling back to {default}",
+        file=sys.stderr,
+    )
+
+
+def _configured_int(values: dict[str, str], key: str, default: int, minimum: int = 1) -> int:
+    raw = values.get(key)
+    if raw is None:
+        return default
+    try:
+        parsed = int(raw)
+    except ValueError:
+        _config_warn(key, raw, default)
+        return default
+    if parsed < minimum:
+        _config_warn(key, raw, default)
+        return default
+    return parsed
+
+
+def _configured_float(values: dict[str, str], key: str, default: float) -> float:
+    raw = values.get(key)
+    if raw is None:
+        return default
+    try:
+        parsed = float(raw)
+    except ValueError:
+        _config_warn(key, raw, default)
+        return default
+    if parsed <= 0:
+        _config_warn(key, raw, default)
+        return default
+    return parsed
+
+
+_CONFIG = _config_values()
+
+MAX_FIX_ATTEMPTS = _configured_int(_CONFIG, "MAX_FIX_ATTEMPTS", 2)
+MAX_REOPENS = _configured_int(_CONFIG, "MAX_REOPENS", 2)
+STALLED_ROUNDS = _configured_int(_CONFIG, "STALLED_ROUNDS", 2)
+RUNAWAY_ROUNDS = _configured_int(_CONFIG, "RUNAWAY_ROUNDS", 5)
 
 # Repairs are dispatched one batch per round, so N confirmed findings should
 # close in about N/2 rounds. A phase that needs materially more than that is
 # bleeding slowly rather than converging -- the stalled-count test never trips
-# on 8 -> 7 -> 6 -> 5, and that shape is what used to run to the backstop.
-REPAIR_ROUNDS_PER_FINDING = 0.5
-MIN_REPAIR_BUDGET = 2
+# on 8 -> 7 -> 6 -> 5, and that pattern is what used to run to the backstop.
+# The floor is what a phase gets regardless of its first-round count.
+REPAIR_ROUNDS_PER_FINDING = _configured_float(_CONFIG, "REPAIR_ROUNDS_PER_FINDING", 0.5)
+MIN_REPAIR_BUDGET = _configured_int(_CONFIG, "MIN_REPAIR_BUDGET", 3)
 
 # Re-dispatching the same pass kind over and over inside one phase is itself a
 # convergence failure: observed as six consecutive implementation passes and as
 # back-to-back failed fix passes, neither of which the ledger could see.
-MAX_CONSECUTIVE_SAME_KIND_PASSES = 3
+MAX_CONSECUTIVE_SAME_KIND_PASSES = _configured_int(_CONFIG, "MAX_CONSECUTIVE_SAME_KIND_PASSES", 3)
 
 # <DualReview/> may preempt one obsolete blind review per phase. A second
 # cancellation means the broad review is never completing.
-MAX_REVIEW_CANCELLATIONS = 1
+MAX_REVIEW_CANCELLATIONS = _configured_int(_CONFIG, "MAX_REVIEW_CANCELLATIONS", 1, minimum=0)
 
 
 def _now_epoch() -> float:

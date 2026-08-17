@@ -20,6 +20,7 @@ class FindingsLedgerTests(unittest.TestCase):
     root: Path  # pyright: ignore[reportUninitializedInstanceVariable]
     session_dir: Path  # pyright: ignore[reportUninitializedInstanceVariable]
     history_file: Path  # pyright: ignore[reportUninitializedInstanceVariable]
+    config_file: Path  # pyright: ignore[reportUninitializedInstanceVariable]
 
     @override
     def setUp(self) -> None:
@@ -28,32 +29,39 @@ class FindingsLedgerTests(unittest.TestCase):
         self.session_dir = self.root / "session"
         self.session_dir.mkdir()
         self.history_file = self.root / "history" / "run.jsonl"
+        self.config_file = self.root / "delegate.conf"
 
     @override
     def tearDown(self) -> None:
         self.temporary.cleanup()
 
-    def run_command(self, *arguments: str, at: int = 1_000) -> str:
+    def environment(self, at: int) -> dict[str, str]:
+        """Pin the clock and the config so a machine's own delegate.conf cannot move a limit."""
         environment = os.environ.copy()
         environment["PLAN_DELEGATE_NOW_EPOCH"] = str(at)
+        environment["PLAN_DELEGATE_CONFIG"] = str(self.config_file)
+        return environment
+
+    def write_config(self, text: str) -> None:
+        _ = self.config_file.write_text(text, encoding="utf-8")
+
+    def run_command(self, *arguments: str, at: int = 1_000) -> str:
         result = subprocess.run(
             ["python3", str(SCRIPT), *arguments, "--session-dir", str(self.session_dir)],
             check=True,
             capture_output=True,
             text=True,
-            env=environment,
+            env=self.environment(at),
         )
         return result.stdout.strip()
 
     def run_failing_command(self, *arguments: str, at: int = 1_000) -> subprocess.CompletedProcess[str]:
-        environment = os.environ.copy()
-        environment["PLAN_DELEGATE_NOW_EPOCH"] = str(at)
         return subprocess.run(
             ["python3", str(SCRIPT), *arguments, "--session-dir", str(self.session_dir)],
             check=False,
             capture_output=True,
             text=True,
-            env=environment,
+            env=self.environment(at),
         )
 
     def write_progress_state(self, instance_id: str, phase_id: str = "phase-1") -> None:
@@ -237,25 +245,53 @@ class FindingsLedgerTests(unittest.TestCase):
     def test_repair_budget_stops_a_loop_that_never_stalls(self) -> None:
         """Alternating 2 and 1 open blockers never trips the stall test.
 
-        The budget does: two original findings buy two rounds, so the third
-        gate stops. A slow bleed used to run all the way to the backstop.
+        The budget does: two original findings buy the three-round floor, so
+        the fourth gate stops. A slow bleed used to run all the way to the
+        backstop.
         """
-        for index in range(2):
+        for index in range(3):
             batch: list[str] = []
             for _ in range(2 if index % 2 == 0 else 1):
                 batch.append(self.open_finding("blocker", f"round {index + 1}"))
             payload = self.gate()
             self.assertEqual(payload["verdict"], "dispatch", f"round {index + 1}")
-            self.assertEqual(payload["repair_budget"], 0 if index == 0 else 2)
+            self.assertEqual(payload["repair_budget"], 0 if index == 0 else 3)
             self.close_round(batch)
         _ = self.open_finding("blocker", "one more")
         payload = self.gate()
         self.assertEqual(payload["verdict"], "stop")
         self.assertIn("repair budget", str(payload["stop_reason"]))
-        self.assertIn("2 fix rounds have run for 2 original findings", str(payload["stop_reason"]))
+        self.assertIn("3 fix rounds have run for 2 original findings", str(payload["stop_reason"]))
+
+    def test_the_repair_budget_floor_is_configurable(self) -> None:
+        """delegate.conf raises the floor, and the extra round is authorized."""
+        self.write_config("MIN_REPAIR_BUDGET=4\n")
+        for index in range(3):
+            batch: list[str] = []
+            for _ in range(2 if index % 2 == 0 else 1):
+                batch.append(self.open_finding("blocker", f"round {index + 1}"))
+            payload = self.gate()
+            self.assertEqual(payload["verdict"], "dispatch", f"round {index + 1}")
+            self.assertEqual(payload["repair_budget"], 0 if index == 0 else 4)
+            self.close_round(batch)
+        _ = self.open_finding("blocker", "fourth round")
+        payload = self.gate()
+        self.assertEqual(payload["verdict"], "dispatch")
+
+    def test_an_unusable_config_value_falls_back_to_the_default(self) -> None:
+        """A bad value warns on stderr and leaves the compiled floor in place."""
+        self.write_config("MIN_REPAIR_BUDGET=zero\n")
+        _ = self.open_finding("blocker", "first")
+        self.close_round(["F001"])
+        _ = self.open_finding("blocker", "second")
+        result = self.run_failing_command("gate")
+        self.assertEqual(result.returncode, 0)
+        self.assertIn("MIN_REPAIR_BUDGET=zero is not usable", result.stderr)
+        payload = cast(dict[str, object], json.loads(result.stdout))
+        self.assertEqual(payload["repair_budget"], 3)
 
     def test_repair_budget_scales_with_the_original_finding_count(self) -> None:
-        """Eight findings buy four rounds; two buy the floor of two."""
+        """Eight findings buy four rounds; two buy the floor of three."""
         for _ in range(8):
             _ = self.open_finding("blocker", "one of eight")
         payload = self.gate()

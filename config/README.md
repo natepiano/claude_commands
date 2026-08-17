@@ -48,6 +48,29 @@ the SKIPPED line), or run it as the `/lint_config` CLI. Edits need
 `dangerouslyDisableSandbox: true` — the sandbox denies writes under
 `~/.claude/config`.
 
+## delegate.conf
+
+The `/plan:delegate` convergence limits — how many automatic fix rounds one
+phase gets before the run stops and asks the user. `MIN_REPAIR_BUDGET` is the
+floor every phase gets regardless of finding count (3);
+`REPAIR_ROUNDS_PER_FINDING` scales the budget above that floor from the first
+round's gating count (0.5, so 8 findings buy 4 rounds); `RUNAWAY_ROUNDS` is the
+hard ceiling (5). The rest bound the other stop conditions:
+`MAX_FIX_ATTEMPTS`, `MAX_REOPENS`, `STALLED_ROUNDS`,
+`MAX_CONSECUTIVE_SAME_KIND_PASSES`, `MAX_REVIEW_CANCELLATIONS`.
+
+`scripts/delegate/findings.py` reads the file at startup, so an edit applies to
+the next `findings.py gate` with nothing to restart. A missing key, a
+non-numeric value, or a value below its minimum falls back to the default
+compiled into that script and warns on stderr. `PLAN_DELEGATE_CONFIG` overrides
+the path, which is how `test_findings.py` stays independent of this machine's
+values. Edits need `dangerouslyDisableSandbox: true` — the sandbox denies
+writes under `~/.claude/config`.
+
+One automatic mechanical-cleanup round can still run past a spent repair
+budget, once per phase, under `<MechanicalGateCleanup/>` in
+`commands/plan/delegate.md`; it is not configurable here.
+
 ## cargo-fmt-exclusions.json
 
 List of crate names to exclude from `cargo fmt` checks. Used when running formatting on external/third-party crates where we don't want to modify their style.
