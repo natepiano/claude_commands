@@ -62,6 +62,14 @@ NATIVE_1M_MODELS = frozenset(
 # can still overshoot -- accepted, since covering it means warning near 60%.
 HANDOFF_MARGIN_TOKENS = 25_000
 
+# How far ahead of the handoff threshold the hook breaks silence. Below this it
+# says nothing at all. A running count with no instruction attached is not free:
+# three sessions read a bare "67%" off the always-on line and invented their own
+# ~150k handoff rule from it, 50k before anything asked them to. The lead is one
+# more handoff margin, so the notice band is exactly as wide as the margin it
+# precedes and scales with the window the same way.
+NOTICE_LEAD_TOKENS = HANDOFF_MARGIN_TOKENS
+
 # Divisor turning bytes of not-yet-billed transcript into a token estimate.
 # Measured across ~20k real turns: median 4.23 bytes/token, p25 2.63. Deliberately
 # below the median so the estimate errs high -- warning early costs a sentence,
@@ -224,6 +232,11 @@ def trigger_tokens(window: int) -> int:
 def handoff_threshold(window: int) -> int:
     """Token count at which the agent should be writing a handoff doc."""
     return max(0, trigger_tokens(window) - HANDOFF_MARGIN_TOKENS)
+
+
+def notice_threshold(window: int) -> int:
+    """Token count at which the hook starts reporting usage at all."""
+    return max(0, handoff_threshold(window) - NOTICE_LEAD_TOKENS)
 
 
 def resolve_transcript(payload: HookInput) -> Path | None:

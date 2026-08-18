@@ -6,14 +6,19 @@ line into the agent's context via `hookSpecificOutput.additionalContext`.
 The user never sees it (suppressOutput), so this is cheap situational
 awareness for whichever agent just ran a tool -- main thread or subagent.
 
-Above the handoff threshold it escalates to an instruction telling the agent
-to write a handoff doc before auto-compaction fires. The measurement itself
-lives in `context_usage.py`, shared with `stop-delegate-continue.py` so the
-two hooks cannot drift onto different thresholds.
+It stays quiet until the count is worth acting on. Below the notice threshold
+it says nothing, between notice and handoff it reports the count together with
+the point a handoff is actually requested, and at or above the handoff
+threshold it escalates to the instruction to write one. All three points are
+derived from the configured window in `context_usage.py`, shared with
+`stop-delegate-continue.py` so the two hooks cannot drift apart.
 
 Env knobs:
-  CLAUDE_CONTEXT_HOOK_MODE   always (default) | warn -- `warn` stays silent
-                             until the handoff threshold is crossed.
+  CLAUDE_CONTEXT_HOOK_MODE   dynamic (default) | always | warn.
+                             `dynamic` reports from the notice threshold on,
+                             `always` reports after every tool call from token
+                             one, `warn` stays silent until the handoff
+                             threshold is crossed.
   CLAUDE_CONTEXT_HOOK_DEBUG  0 to disable the debug log (default on).
 """
 
@@ -34,6 +39,7 @@ from context_usage import (
     estimate_tokens,
     handoff_threshold,
     latest_reading,
+    notice_threshold,
     resolve_transcript,
     response_bytes,
     trigger_tokens,
@@ -44,17 +50,28 @@ DEBUG_LOG = Path("/tmp/claude/context-hook-debug.jsonl")
 
 def build_context(tokens: int, window: int | None, is_subagent: bool) -> str | None:
     """The line handed to the agent, or None when there is nothing to say."""
-    warn_only = os.environ.get("CLAUDE_CONTEXT_HOOK_MODE", "always") == "warn"
+    mode = os.environ.get("CLAUDE_CONTEXT_HOOK_MODE", "dynamic")
     label = "Your context usage" if is_subagent else "Context usage"
     if window is None:
-        return None if warn_only else f"{label}: {tokens:,} tokens."
+        return f"{label}: {tokens:,} tokens." if mode == "always" else None
     trigger = trigger_tokens(window)
     threshold = handoff_threshold(window)
     percent = round(100 * tokens / trigger) if trigger else 100
     if tokens < threshold:
-        if warn_only:
+        if mode == "warn":
             return None
-        return f"{label}: {tokens:,} / {trigger:,} tokens ({percent}%)."
+        if mode != "always" and tokens < notice_threshold(window):
+            return None
+        # Naming the request point is the reason this band exists at all. A bare
+        # percentage states a problem and no policy, so the agent supplies the
+        # missing policy itself: three sessions settled on ~150k off a "67%",
+        # 50k before anything had asked them for a handoff.
+        action = "wrap up and return results" if is_subagent else "write a handoff doc"
+        return (
+            f"{label}: {tokens:,} / {trigger:,} tokens ({percent}%). "
+            f"No action needed yet — you are asked to {action} at "
+            f"{threshold:,} tokens, not before. Keep working."
+        )
     if is_subagent:
         return (
             f"{label}: {tokens:,} / {trigger:,} tokens ({percent}%) — you are "
