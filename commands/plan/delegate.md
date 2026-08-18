@@ -180,6 +180,11 @@ every command has exited and its output has been read. If an edited package has
 no listed `test` line, add that package's scoped
 `verify.sh test` and report it. Omit plan **Style** metadata and never load the
 style guide; <RunPhaseStyleReview/> owns the one style audit.
+
+It must also instruct the delegate: tests are the only testing — a passing
+`test` run proves the build, so never add a `check` or build pass around a
+listed `test`; and a listed example or app launch compiles its own target — do
+not build or test first just to prove it builds.
 </WritePromptContract>
 
 <ReviewPromptContract>
@@ -213,6 +218,12 @@ Rules:
   and `lint`; trace changed public APIs, traits, registration, and plugin wiring
   to modified callers. Add example or integration lines only when the phase owns
   them.
+- Tests are the only testing: a passing `test` run proves the package builds.
+  Never run `check` or any build alongside a `test` that is going to run anyway;
+  `check` exists solely for mid-edit compile feedback.
+- A launch is not a time to build or test: `verify.sh example` and any app or
+  binary launch compile their own target. Never precede or follow a launch with
+  a build, `check`, or `test` pass just to prove it builds.
 - Phase prompts never use `final`, raw Cargo, `--all-targets`, or the full
   `clippy` skill. Workspace breadth belongs to <FinalGate/>.
 - Non-Rust prompts list the project's exact scoped commands under the same
@@ -227,6 +238,15 @@ Rules:
 - `style_review=off` does not waive <RunPhaseStyleReview/>; it blocks the
   checkpoint.
 </VerificationContract>
+
+<VerificationNarration>
+Whenever choosing how a change gets verified — running tests, launching a
+binary or example, or dispatching a delegate that will — state the choice and
+its reason to the user in one line: `Running tests only because …`,
+`Launching <binary|example> because …`, or `Delegate will run tests only
+because …`. The line makes the verification economy visible; it never replaces
+recording the result.
+</VerificationNarration>
 
 <FindingsLedger>
 Use `python3 ~/.claude/scripts/delegate/findings.py <command> --session-dir
@@ -376,7 +396,7 @@ Mode behavior:
 | --- | --- | --- | --- |
 | `single` | no gate | end | none |
 | `loop` | automatic | next phase | one checkpoint |
-| `verbose` | <VerbosePrePhaseGate/> unless an approved auto window is active | report, then `continue` gate unless windowed | one checkpoint |
+| `verbose` | <VerbosePrePhaseGate/> unless an approved auto window is active | report, then `continue` gate; a window defers both into one combined report at its close | one checkpoint |
 
 Loop invocation authorizes its phase checkpoints. Verbose authorization occurs
 only after the required briefing:
@@ -424,6 +444,18 @@ covered phase is unbriefed, stale, or has an unresolved decision, route to
 <AutoWindowBatchBriefing/>. Compressed rows and phase titles are not briefings.
 </BriefingFreshness>
 
+<DecisionEconomy>
+If a decision has an obviously better answer, take it, record the choice where
+the decision lived, and do not ask the user. When the options differ in user
+experience, the premium, flawless experience is always the answer — nothing
+less than the best user experience is acceptable, and everything is built with
+that in mind — so that decision is already made and never reaches the user.
+Bring the user only decisions with true, substantive tradeoffs. Downstream gates — style review, fix reviews,
+example implementation, and real use in hana — will hammer out the actual
+problems; optimize for speed, and surface the risk a self-made call carries in
+one line instead of a question.
+</DecisionEconomy>
+
 <DecisionRouting>
 For every decision raised by review, repair, or phase review:
 
@@ -431,7 +463,7 @@ For every decision raised by review, repair, or phase review:
   split, merge, or renumber phases; preserve scope, API, invariants, tests, and
   ownership. Update affected Work Orders and continue automatically.
 - If current-phase correctness has at least two buildable unresolved answers,
-  stop and ask.
+  apply <DecisionEconomy/>; stop and ask only when the tradeoff survives it.
 - If only a later phase is affected, write a `**Pending decision:**` block using
   `~/.claude/docs/delegate_plan_format.md`, report the deferral, and continue.
   That phase's pre-dispatch check will stop on it.
@@ -442,7 +474,8 @@ For every decision raised by review, repair, or phase review:
 <ExecutionSteps>
 Execute in order:
 
-Apply <CoreContract/>, <CompactionContract/>, and <UserFacingText/> throughout.
+Apply <CoreContract/>, <CompactionContract/>, <UserFacingText/>, and
+<VerificationNarration/> throughout.
 
 1. <PrepareSession/>
 2. <ComposeWorkOrder/>
@@ -824,7 +857,8 @@ a smoke test.
 
 Launch the real product from `${WORKING_DIR}` with useful logging/backtraces,
 exercise the changed runtime behavior, observe stability, close cleanly, and
-record command/action/result. Startup alone suffices only when no changed
+record command/action/result. The launch compiles its own target — never run a
+build, `check`, or `test` pass first to prove it builds. Startup alone suffices only when no changed
 behavior can be invoked.
 
 A panic, fatal log, unexpected exit, or wrong behavior is a blocker: route it
@@ -1048,8 +1082,12 @@ In `single`, also run `finish-run --status completed`, then
 </RecordPhaseCompletion>
 
 <VerbosePostPhaseReport>
-After every completed verbose phase, including an auto window, report only that
-phase from its reviewed diff, accepted fixes, `As-built` block, and checkpoint:
+After a completed verbose phase outside an auto window, report only that phase
+from its reviewed diff, accepted fixes, `As-built` block, and checkpoint. Inside
+an active window, emit no per-phase report; when the window's last phase
+completes, emit one <CombinedWindowReport/> instead of per-phase reports.
+
+Single-phase report:
 
 ```
 ## Phase N complete — <title>
@@ -1076,6 +1114,38 @@ phase from its reviewed diff, accepted fixes, `As-built` block, and checkpoint:
 Use the diff over planned claims. Include only load-bearing new/materially
 changed types; use the same statuses as <PhaseBriefing/> and say when none exist.
 Everything above `### What remains` describes only the completed phase.
+
+<CombinedWindowReport>
+One report covering every phase the window ran, built from the same sources as
+the single-phase report. Keep it succinct and plain-spoken — ordinary sentences
+a reader away from the details can follow — while still naming types, modules,
+and crates exactly. Describe what the window built as one piece of work, not a
+per-phase replay:
+
+```
+## Phases N–M complete — <window summary title>
+
+### What now works
+[combined reviewed behavior across the window]
+
+### Important types and APIs
+| Phase | Type / trait / API | Status | Role | System relationship |
+| --- | --- | --- | --- | --- |
+
+### Verification and review
+[one combined summary; call out only per-phase results that differed]
+
+**Checkpoints:** phase N `<short hash>`, …, phase M `<short hash>`
+
+### What remains
+[same content as the single-phase report]
+```
+
+Unify the types into that single table with its `Phase` column — never one
+table per phase. Include only load-bearing new/materially changed types across
+the whole window, using the <PhaseBriefing/> statuses; say when none exist.
+<RemainingWorkOutlook/> applies to `### What remains` unchanged.
+</CombinedWindowReport>
 
 <RemainingWorkOutlook>
 `### What remains` is the one place the report looks forward. It states what is
@@ -1110,10 +1180,22 @@ single phase; never round the window up to a phase you would then have to
 interrupt. Cap the recommendation at three phases even when more would qualify,
 so a batch briefing stays readable.
 
+When the only criterion stopping a longer window is an unresolved
+`**Pending decision:**` block on a covered phase, and the phases otherwise
+cohere enough that running them together is clearly desirable, say so and offer
+to surface those decision questions now: answering them here resolves the
+blocks and lets the next auto control cover the full run. Before bringing a
+decision forward, apply <DecisionEconomy/>: decide any with an obviously better
+answer yourself and bring only true, substantive tradeoffs. Ask only the
+blocking questions; the batch briefing still owns briefing the phases.
+
 Write it as two or three sentences of ordinary English under <UserFacingText/> —
-what the next phases do, why they group or do not, and the control that opens the
-recommended window. Do not emit a table, a per-phase criteria checklist, or the
-criteria vocabulary above.
+what the next phases do, why they group or do not — and always end with the
+concrete control to type: `auto through phase X` with the actual phase number,
+or `proceed` when only the single next phase qualifies. Never leave the number
+for the user to work out. This closing control line is required in every
+single-phase and combined-window report while todo phases remain. Do not emit a
+table, a per-phase criteria checklist, or the criteria vocabulary above.
 </RemainingWorkOutlook>
 </VerbosePostPhaseReport>
 
