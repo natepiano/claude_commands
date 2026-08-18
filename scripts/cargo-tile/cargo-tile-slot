@@ -1,0 +1,44 @@
+#!/bin/zsh
+# rev 12 — bump this comment in every cargo-tile source file on each change
+# One grid pane. Watches its slot file and displays the assigned run's
+# log via tail; shows an idle placeholder when the slot is empty. The
+# pane itself is never destroyed between runs — content just swaps.
+set -u
+
+TILE_HOME="${CARGO_TILE_HOME:-$HOME/.cargo-tile}"
+STATE="$TILE_HOME/state"
+N="$1"
+SLOTF="$STATE/slots/$N"
+
+tailpid=""
+cur="__init__"
+
+show_idle() {
+    printf '\033]2;· %s ·\007' "$N"
+    printf '\033[H\033[2J\033[3J'
+    printf '\n  \033[2m· slot %s idle ·\033[0m\n' "$N"
+}
+
+cleanup() {
+    [[ -n "$tailpid" ]] && kill "$tailpid" 2>/dev/null
+    exit 0
+}
+trap cleanup INT TERM HUP
+
+while true; do
+    new=""
+    [[ -s "$SLOTF" ]] && new=$(<"$SLOTF")
+    if [[ "$new" != "$cur" ]]; then
+        [[ -n "$tailpid" ]] && { kill "$tailpid" 2>/dev/null; wait "$tailpid" 2>/dev/null }
+        tailpid=""
+        cur="$new"
+        if [[ -n "$cur" && -f "$cur" ]]; then
+            printf '\033[H\033[2J\033[3J'
+            /usr/bin/tail -n +1 -F "$cur" 2>/dev/null &
+            tailpid=$!
+        else
+            show_idle
+        fi
+    fi
+    sleep 0.3
+done

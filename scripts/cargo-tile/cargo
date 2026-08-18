@@ -1,0 +1,105 @@
+#!/bin/zsh
+# rev 12 — bump this comment in every cargo-tile source file on each change
+# cargo-tile-shim -- master copies live in ~/.claude/scripts/cargo-tile/;
+# ~/.cargo-tile/bin holds symlinks and `cargo-tile on` reinstalls the
+# toolchain hooks from there.
+# When tiling is active, mirror this run's output into the cargo-tile
+# iTerm2 grid window, then run the real cargo. Works from two homes:
+#   - ~/.cargo-tile/bin (PATH shim): real cargo found via PATH
+#   - ~/.rustup/toolchains/*/bin (hook): real binary is sibling
+#     cargo-tile-real, so hardcoded-path invocations are captured too
+set -u
+setopt no_bgnice
+
+TILE_HOME="${CARGO_TILE_HOME:-$HOME/.cargo-tile}"
+STATE="$TILE_HOME/state"
+
+SELF_DIR="${0:h}"
+if [[ -x "$SELF_DIR/cargo-tile-real" ]]; then
+    REAL="$SELF_DIR/cargo-tile-real"
+else
+    # locate the real cargo by removing this shim's directory from PATH
+    # (both as invoked and symlink-resolved)
+    typeset -a path_parts
+    path_parts=(${(s.:.)PATH})
+    path_parts=(${path_parts:#${0:h}})
+    path_parts=(${path_parts:#${0:A:h}})
+    REAL="$(PATH="${(j.:.)path_parts}" command -v cargo)" || {
+        print -u2 "cargo-tile shim: real cargo not found in PATH"
+        exit 127
+    }
+fi
+
+tile=1
+[[ -f "$STATE/active" ]] || tile=0
+# nested cargo (build scripts, cargo-invoking-cargo, shim-in-shim) never
+# re-tiles
+[[ -n "${CARGO_TILE_NESTED:-}" ]] && tile=0
+# skip tooling/query invocations (rust-analyzer, IDE metadata probes, etc.)
+case "${1:-}" in
+    metadata|pkgid|locate-project|read-manifest|config|-V|--version|-vV|--list|"") tile=0 ;;
+esac
+prev=""
+for arg in "$@"; do
+    [[ "$arg" == --message-format=json* ]] && tile=0
+    [[ "$prev" == --message-format && "$arg" == json* ]] && tile=0
+    prev="$arg"
+done
+# don't launch iTerm2 if it definitively isn't running; if the process
+# list is unreadable (sandboxed callers), assume it is and let the pane
+# attempt fail harmlessly
+if (( tile )); then
+    ps_out=$(ps -axo comm 2>/dev/null)
+    if (( $? == 0 )) && ! print -r -- "$ps_out" | grep -q '/iTerm\.app/Contents/MacOS/iTerm2$'; then
+        tile=0
+    fi
+fi
+
+(( tile )) || exec "$REAL" "$@"
+
+export CARGO_TILE_NESTED=1
+LOG_DIR=/tmp/cargo-tile
+mkdir -p "$LOG_DIR" "$STATE/pids"
+LOG="$LOG_DIR/run-$(date +%Y%m%d-%H%M%S)-$$.log"
+
+# register this run for the summary pane; cleaned up on exit
+print -r -- "cargo $*" > "$STATE/pids/$$"
+trap 'rm -f "$STATE/pids/$$"' EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+dir="${PWD/#$HOME/~}"
+{
+    # OSC 2 sets the pane title when tail replays the log
+    printf '\033]2;cargo %s  [%s]\007' "$*" "$dir"
+    printf '\033[1m$ cargo %s\033[0m\n' "$*"
+    printf '\033[2m%s — %s\033[0m\n\n' "$PWD" "$(date '+%H:%M:%S')"
+} > "$LOG"
+
+# claim a pane in the background so cargo starts immediately
+"$TILE_HOME/bin/cargo-tile-pane" "$LOG" >/dev/null 2>>"$TILE_HOME/pane-errors.log" &!
+
+if [[ -t 0 && -t 1 && -t 2 ]]; then
+    # pty capture: full terminal fidelity (colors, progress bars)
+    /usr/bin/script -q -a "$LOG" "$REAL" "$@"
+    st=$?
+else
+    # non-tty caller (scripts, pipes): keep streams separate, force color
+    # into the log copy via cargo's own color env
+    export CARGO_TERM_COLOR="${CARGO_TERM_COLOR:-always}"
+    "$REAL" "$@" > >(tee -a "$LOG") 2> >(tee -a "$LOG" >&2)
+    st=$?
+    sleep 0.2  # let the tee processes flush before the footer
+fi
+
+if (( st == 0 )); then
+    printf '\n\033[1;32m── exit 0 ──\033[0m\n' >> "$LOG"
+else
+    printf '\n\033[1;31m── exit %d ──\033[0m\n' "$st" >> "$LOG"
+fi
+
+# the pane clears shortly after the run exits
+LINGER="${CARGO_TILE_LINGER:-4}"
+( sleep "$LINGER"; "$TILE_HOME/bin/cargo-tile-pane" --remove "$LOG" ) \
+    >/dev/null 2>>"$TILE_HOME/pane-errors.log" &!
+exit $st

@@ -1,0 +1,274 @@
+#!/bin/zsh
+# rev 12 — bump this comment in every cargo-tile source file on each change
+# Assign runs to the cargo-tile slot grid.
+#   cargo-tile-pane <log>           add a run
+#   cargo-tile-pane --remove <log>  drop a finished run (slot goes idle)
+#   cargo-tile-pane --check         re-evaluate grid size (deferred retreat)
+#
+# The iTerm2 window holds a fixed k x k grid of persistent panes: pane 1
+# is the summary, panes 2..k^2 are slots (numbered column-major: col 1
+# top-to-bottom, then col 2, ...). Runs claim slots in order, wrapping.
+# Adding/removing a run only rewrites a slot file — the pane's watcher
+# picks it up; no AppleScript, no focus changes, no visual churn.
+#
+# The grid starts 2x2 and expands to 3x3, 4x4, ... (cap 6x6) when total
+# tiles (runs + summary) exceed k^2; it retreats one size only when
+# total tiles fall to (k-1)^2 or fewer. Only those resizes (and window
+# creation/recovery) rebuild the layout via AppleScript.
+set -u
+
+TILE_HOME="${CARGO_TILE_HOME:-$HOME/.cargo-tile}"
+STATE="$TILE_HOME/state"
+
+mode=add
+case "${1:-}" in
+    --remove) mode=remove; shift ;;
+    --check) mode=check; shift ;;
+esac
+LOG="${1:-}"
+mkdir -p "$STATE/slots"
+
+# serialize concurrent invocations
+LOCK="$STATE/lock"
+locked=0
+for i in {1..100}; do
+    if mkdir "$LOCK" 2>/dev/null; then
+        locked=1
+        break
+    fi
+    sleep 0.1
+done
+(( locked )) && trap 'rmdir "$LOCK" 2>/dev/null' EXIT
+
+k=1
+[[ -f "$STATE/grid" ]] && k=$(<"$STATE/grid")
+
+# collect active slots (slot -> log), dropping stale entries
+typeset -A slotlog
+for f in "$STATE"/slots/*(N); do
+    [[ -s "$f" ]] || continue
+    l=$(<"$f")
+    if [[ -f "$l" ]]; then
+        slotlog[${f:t}]="$l"
+    else
+        : > "$f"
+    fi
+done
+
+if [[ "$mode" == remove ]]; then
+    for s in "${(k)slotlog[@]}"; do
+        if [[ "${slotlog[$s]}" == "$LOG" ]]; then
+            : > "$STATE/slots/$s"
+            unset "slotlog[$s]"
+        fi
+    done
+    ( sleep 0.7; rm -f "$LOG" ) &!
+fi
+
+runs_after=${#slotlog}
+[[ "$mode" == add ]] && (( runs_after += 1 ))
+total=$(( runs_after + 1 ))  # + summary tile
+
+# growth is immediate; retreat only after the current size has been held
+# for CARGO_TILE_RETREAT_HOLD seconds (a deferred --check finishes the
+# retreat once the hold expires)
+HOLD="${CARGO_TILE_RETREAT_HOLD:-60}"
+now=$(date +%s)
+since=0
+[[ -f "$STATE/grid-since" ]] && since=$(<"$STATE/grid-since")
+
+target_k=$k
+while (( target_k < 6 && total > target_k * target_k )); do (( target_k += 1 )); done
+if (( target_k == k )); then
+    want_k=$k
+    while (( want_k > 1 && total <= (want_k - 1) * (want_k - 1) )); do (( want_k -= 1 )); done
+    if (( want_k < k )); then
+        if (( now - since >= HOLD )); then
+            target_k=$want_k
+        elif [[ ! -f "$STATE/retreat-pending" ]]; then
+            touch "$STATE/retreat-pending"
+            ( sleep $(( HOLD - (now - since) + 1 ))
+              rm -f "$STATE/retreat-pending"
+              "$TILE_HOME/bin/cargo-tile-pane" --check ) \
+                >/dev/null 2>>"$TILE_HOME/pane-errors.log" &!
+        fi
+    fi
+fi
+
+# does the window still exist?
+win=""
+[[ -f "$STATE/window" ]] && win=$(<"$STATE/window")
+rebuild=0
+if [[ -z "$win" ]]; then
+    rebuild=1
+elif ! osascript -e "tell application \"iTerm2\" to count of tabs of window id $win" >/dev/null 2>&1; then
+    rebuild=1
+fi
+(( target_k != k )) && rebuild=1
+
+if (( ! rebuild )); then
+    if [[ "$mode" == add ]]; then
+        cap=$(( k * k ))
+        slot=2
+        [[ -f "$STATE/next-slot" ]] && slot=$(<"$STATE/next-slot")
+        (( slot < 2 || slot > cap )) && slot=2
+        # prefer the next idle slot in order; if all are busy, replace in order
+        probe=$slot
+        for (( i = 1; i < cap; i++ )); do
+            if [[ -z "${slotlog[$probe]:-}" ]]; then
+                slot=$probe
+                break
+            fi
+            (( probe = probe + 1 > cap ? 2 : probe + 1 ))
+        done
+        old="${slotlog[$slot]:-}"
+        print -r -- "$LOG" > "$STATE/slots/$slot"
+        [[ -n "$old" ]] && ( sleep 0.7; rm -f "$old" ) &!
+        next=$(( slot + 1 > cap ? 2 : slot + 1 ))
+        print -r -- "$next" > "$STATE/next-slot"
+    fi
+    exit 0
+fi
+
+# --- rebuild: compact runs (oldest assignment first) into slots 2.. ---
+typeset -a ordered
+ordered=()
+for s in "${(k)slotlog[@]}"; do
+    ordered+=("$(stat -f %m "$STATE/slots/$s" 2>/dev/null || echo 0)	${slotlog[$s]}")
+done
+ordered=("${(@on)ordered}")
+typeset -a logs
+for e in "${ordered[@]}"; do logs+=("${e#*	}"); done
+[[ "$mode" == add ]] && logs+=("$LOG")
+
+rm -f "$STATE"/slots/*(N)
+i=2
+for l in "${logs[@]}"; do
+    print -r -- "$l" > "$STATE/slots/$i"
+    (( i += 1 ))
+done
+print -r -- "$(( i > target_k * target_k ? 2 : i ))" > "$STATE/next-slot"
+print -r -- "$target_k" > "$STATE/grid"
+(( target_k != k )) && print -r -- "$now" > "$STATE/grid-since"
+
+# pane commands, column-major: pane 1 = summary, panes 2..k^2 = slots
+typeset -a cmds
+cmds=("$TILE_HOME/bin/cargo-tile-summary")
+for (( p = 2; p <= target_k * target_k; p++ )); do
+    cmds+=("$TILE_HOME/bin/cargo-tile-slot $p")
+done
+
+# every grid window ever created; all but the active one get closed
+typeset -a known stale
+[[ -f "$STATE/windows-created" ]] && known=("${(@f)$(<"$STATE/windows-created")}")
+for kn in "${known[@]}"; do
+    [[ -n "$kn" && "$kn" != "$win" ]] && stale+=("$kn")
+done
+
+out=$(osascript - "$win" "${#stale}" "${stale[@]}" "$target_k" "${cmds[@]}" <<'EOF'
+on run argv
+	set winId to item 1 of argv
+	set nStale to (item 2 of argv) as integer
+	set staleIds to {}
+	repeat with i from 3 to (2 + nStale)
+		copy (item i of argv) to end of staleIds
+	end repeat
+	set base to 2 + nStale
+	set k to (item (base + 1) of argv) as integer
+	set cmds to {}
+	repeat with i from (base + 2) to (base + 1 + k * k)
+		copy (item i of argv) to end of cmds
+	end repeat
+
+	set firstCmd to item 1 of cmds
+	tell application "iTerm2"
+		set w to missing value
+		set created to false
+		if winId is not "" then
+			try
+				set w to window id (winId as integer)
+				tell w to create tab with default profile command firstCmd
+			on error
+				set w to missing value
+			end try
+		end if
+		if w is missing value then
+			set w to (create window with default profile command firstCmd)
+			set created to true
+		end if
+
+		-- size a fresh window to 75% of the screen, centered
+		if created then
+			set sw to 1440
+			set sh to 900
+			try
+				with timeout of 2 seconds
+					tell application "Finder" to set sb to bounds of window of desktop
+				end timeout
+				set sw to item 3 of sb
+				set sh to item 4 of sb
+			end try
+			set winW to sw * 3 div 4
+			set winH to sh * 3 div 4
+			set x0 to (sw - winW) div 2
+			set y0 to (sh - winH) div 2
+			try
+				set bounds of w to {x0, y0, x0 + winW, y0 + winH}
+			end try
+		end if
+
+		-- close superseded grid windows
+		repeat with sid in staleIds
+			try
+				with timeout of 5 seconds
+					close window id (sid as integer)
+				end timeout
+			end try
+		end repeat
+
+		-- k columns via vertical splits, left to right
+		set t to current tab of w
+		set colHeads to {current session of t}
+		repeat with c from 2 to k
+			set prev to item (c - 1) of colHeads
+			tell prev to set ns to (split vertically with default profile command (item ((c - 1) * k + 1) of cmds))
+			copy ns to end of colHeads
+		end repeat
+
+		-- fill each column's k rows top to bottom
+		repeat with c from 1 to k
+			set cur to item c of colHeads
+			repeat with r from 2 to k
+				tell cur to set cur to (split horizontally with default profile command (item ((c - 1) * k + r) of cmds))
+			end repeat
+		end repeat
+
+		-- drop the previous layout (best-effort; never hang on a prompt)
+		try
+			with timeout of 5 seconds
+				tell w
+					repeat while (count of tabs) > 1
+						close first tab
+					end repeat
+				end tell
+			end timeout
+		end try
+		set winResult to id of w
+	end tell
+
+	-- equalize pane sizes (needs Automation+Accessibility; best-effort)
+	try
+		with timeout of 3 seconds
+			tell application "System Events" to tell process "iTerm2"
+				click menu item "Arrange Split Panes Evenly" of menu "View" of menu bar 1
+			end tell
+		end timeout
+	end try
+
+	return winResult
+end run
+EOF
+) || exit 1
+
+print -r -- "$out" > "$STATE/window"
+print -r -- "$out" > "$STATE/windows-created"

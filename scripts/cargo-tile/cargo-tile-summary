@@ -1,0 +1,68 @@
+#!/bin/zsh
+# rev 12 — bump this comment in every cargo-tile source file on each change
+# Live summary for the cargo-tile grid: revision, grid size, counts of
+# tiled runs, plus cargo processes that predate `cargo-tile on`
+# (uncapturable) — those lines disappear as the processes exit.
+set -u
+
+REVISION=12
+
+TILE_HOME="${CARGO_TILE_HOME:-$HOME/.cargo-tile}"
+STATE="$TILE_HOME/state"
+
+printf '\033]2;cargo-tile summary\007'
+
+while true; do
+    cols=$(tput cols 2>/dev/null) || cols=80
+
+    # tiled runs still executing (pid files cleaned up by the shim)
+    running=0
+    for f in "$STATE"/pids/*(N); do
+        if kill -0 "${f:t}" 2>/dev/null; then
+            (( running += 1 ))
+        else
+            rm -f "$f"
+        fi
+    done
+
+    k=1
+    [[ -f "$STATE/grid" ]] && k=$(<"$STATE/grid")
+    shown=0
+    for sf in "$STATE"/slots/*(N); do
+        [[ -s "$sf" ]] && (( shown += 1 ))
+    done
+
+    # pre-existing cargo processes: snapshot taken at `cargo-tile on`,
+    # pruned as they exit
+    typeset -a pre
+    pre=()
+    if [[ -f "$STATE/preexisting" ]]; then
+        while IFS=$'\t' read -r pid cmd; do
+            [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null && pre+=("$pid	$cmd")
+        done < "$STATE/preexisting"
+        print -rl -- "${pre[@]}" > "$STATE/preexisting" 2>/dev/null
+    fi
+
+    buf=""
+    buf+=$'\033[1;36mcargo-tile\033[0m  \033[35mrev '"$REVISION"$'\033[0m  \033[2m'"$(date '+%H:%M:%S')"$'\033[0m\n\n'
+    buf+=$'\033[1mgrid:\033[0m             '"${k}x${k}"$'\n'
+    buf+=$'\033[1mrunning (tiled):\033[0m  '"$running"$'\n'
+    buf+=$'\033[1mslots in use:\033[0m     '"$shown / $(( k * k - 1 ))"$'\n'
+    if (( ${#pre} > 0 )); then
+        buf+=$'\n\033[1;33mpre-existing (not captured):\033[0m  '"${#pre}"$'\n'
+        for entry in "${pre[@]}"; do
+            pid="${entry%%	*}"
+            cmd="${entry#*	}"
+            # strip the leading binary path down to "cargo"
+            cmd="cargo ${cmd#* }"
+            line="  $pid  $cmd"
+            buf+="${line[1,$cols]}"$'\n'
+        done
+    else
+        buf+=$'\n\033[2mno pre-existing cargo processes\033[0m\n'
+    fi
+
+    printf '\033[H\033[2J\033[3J'
+    print -rn -- "$buf"
+    sleep 2
+done

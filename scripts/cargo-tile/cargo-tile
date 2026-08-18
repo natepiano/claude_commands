@@ -1,0 +1,101 @@
+#!/bin/zsh
+# rev 12 — bump this comment in every cargo-tile source file on each change
+# Control command for cargo run tiling in iTerm2.
+set -u
+
+TILE_HOME="${CARGO_TILE_HOME:-$HOME/.cargo-tile}"
+STATE="$TILE_HOME/state"
+mkdir -p "$STATE"
+
+# clear the run list only — the window id and created-window history are
+# kept so the next run reuses (or closes) existing grid windows instead
+# of orphaning them
+reset_layout() {
+    rm -f "$STATE/session" "$STATE/count" "$STATE/runs" "$STATE/grid" "$STATE/next-slot" "$STATE/grid-since" "$STATE/retreat-pending"
+    rm -f "$STATE"/pids/*(N) "$STATE"/slots/*(N)
+    rmdir "$STATE/lock" 2>/dev/null
+}
+
+# install the shim over each rustup toolchain's cargo so hardcoded-path
+# invocations (rust-analyzer, nextest, scripts) are captured too; the
+# real binary moves to cargo-tile-real. Safe to rerun — a rustup update
+# that replaces the wrapper is re-hooked on the next `cargo-tile on`.
+hook_toolchains() {
+    local shim="$TILE_HOME/bin/cargo" tc
+    for tc in "$HOME"/.rustup/toolchains/*/bin(N); do
+        [[ -e "$tc/cargo" ]] || continue
+        if ! grep -q 'cargo-tile-shim' "$tc/cargo" 2>/dev/null; then
+            mv -f "$tc/cargo" "$tc/cargo-tile-real" || continue
+        fi
+        cp -f "$shim" "$tc/cargo" && chmod +x "$tc/cargo"
+        echo "  hooked ${tc:h:t}"
+    done
+}
+
+unhook_toolchains() {
+    local tc
+    for tc in "$HOME"/.rustup/toolchains/*/bin(N); do
+        if [[ -x "$tc/cargo-tile-real" ]]; then
+            mv -f "$tc/cargo-tile-real" "$tc/cargo"
+            echo "  unhooked ${tc:h:t}"
+        fi
+    done
+}
+
+# snapshot cargo processes already running — they can't be captured, but
+# the summary pane shows them until they exit
+snapshot_preexisting() {
+    : > "$STATE/preexisting"
+    ps -axo pid=,command= 2>/dev/null | while read -r pid cmd; do
+        tok="${cmd%% *}"
+        [[ "$tok" == *cargo-tile* ]] && continue
+        [[ "$tok" == cargo || "$tok" == */cargo ]] || continue
+        print -r -- "$pid	$cmd" >> "$STATE/preexisting"
+    done
+    local n
+    n=$(grep -c . "$STATE/preexisting" 2>/dev/null)
+    echo "  pre-existing cargo processes: ${n:-0}"
+}
+
+case "${1:-status}" in
+    on)
+        reset_layout
+        hook_toolchains
+        snapshot_preexisting
+        touch "$STATE/active"
+        echo "cargo-tile: on — new cargo runs open panes in the grid window"
+        ;;
+    off)
+        rm -f "$STATE/active"
+        echo "cargo-tile: off"
+        ;;
+    reset)
+        reset_layout
+        echo "cargo-tile: layout reset"
+        ;;
+    hook)
+        hook_toolchains
+        ;;
+    unhook)
+        unhook_toolchains
+        ;;
+    status)
+        if [[ -f "$STATE/active" ]]; then
+            k=1
+            [[ -f "$STATE/grid" ]] && k=$(<"$STATE/grid")
+            runs=0
+            for sf in "$STATE"/slots/*(N); do
+                [[ -s "$sf" ]] && (( runs += 1 ))
+            done
+            pre=0
+            [[ -f "$STATE/preexisting" ]] && pre=$(grep -c . "$STATE/preexisting")
+            echo "cargo-tile: on (grid ${k}x${k}, $runs slots in use, $pre pre-existing)"
+        else
+            echo "cargo-tile: off"
+        fi
+        ;;
+    *)
+        echo "usage: cargo-tile [on|off|reset|status|hook|unhook]" >&2
+        exit 2
+        ;;
+esac
