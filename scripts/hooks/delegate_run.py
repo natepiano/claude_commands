@@ -6,8 +6,10 @@
 delegate session directory. `end_session.sh` removes it. Anything that needs to
 know "is this session mid-delegate-run" reads the marker.
 
-Markers are in /tmp and a killed run never removes its own, so a marker older
-than MAX_AGE_SECONDS is treated as debris rather than an active run.
+Markers are in /tmp and a killed run never removes its own, so a run with no
+write inside MAX_AGE_SECONDS is treated as debris rather than an active run.
+Staleness is judged from the session directory's own contents, never from the
+marker's mtime -- see `_recently_active`.
 """
 
 from __future__ import annotations
@@ -17,8 +19,10 @@ from pathlib import Path
 
 ACTIVE_DIR = Path("/tmp/claude/delegate/active")
 
-# Long enough for a real multi-phase run with slow delegate builds, short enough
-# that yesterday's abandoned marker cannot block today's turns.
+# Long enough to span a slow delegate build plus the user's time at a gate, short
+# enough that yesterday's abandoned run cannot block today's turns. It bounds
+# silence, not total run length: a multi-day run stays active as long as it keeps
+# writing.
 MAX_AGE_SECONDS = 12 * 60 * 60
 
 # heartbeat_watch.sh beats every 60s by default (its INTERVAL_SECS). Three beats
@@ -30,20 +34,38 @@ def marker_path(session_id: str) -> Path:
     return ACTIVE_DIR / session_id
 
 
+def _recently_active(session_dir: Path) -> bool:
+    """True when the run itself wrote something inside MAX_AGE_SECONDS.
+
+    Liveness is read from the session directory, never from the marker's own
+    mtime. `prepare_session.sh` stamps the marker once at run start and nothing
+    refreshes it, so marker age measures how long ago the run *began* -- which
+    made every run silently unrecognizable to its own hooks twelve hours in,
+    while it was still writing state every few seconds. What actually stops
+    moving when a run dies is the run's own files.
+    """
+    try:
+        newest = max(
+            (entry.stat().st_mtime for entry in session_dir.iterdir() if entry.is_file()),
+            default=None,
+        )
+    except OSError:
+        return False
+    if newest is None:
+        return False
+    return time.time() - newest <= MAX_AGE_SECONDS
+
+
 def active_run(session_id: str) -> Path | None:
     """The delegate session directory for an active run, or None."""
-    marker = marker_path(session_id)
     try:
-        age = time.time() - marker.stat().st_mtime
+        recorded = marker_path(session_id).read_text(encoding="utf-8").strip()
     except OSError:
         return None
-    if age > MAX_AGE_SECONDS:
+    if not recorded:
         return None
-    try:
-        recorded = marker.read_text(encoding="utf-8").strip()
-    except OSError:
-        return None
-    return Path(recorded) if recorded else None
+    session_dir = Path(recorded)
+    return session_dir if _recently_active(session_dir) else None
 
 
 def delegate_working(session_dir: Path) -> bool:

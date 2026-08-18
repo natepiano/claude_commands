@@ -188,6 +188,32 @@ if [[ -z "$CMD" ]]; then
 fi
 shift
 
+# Open a progress window for the duration of this run when a delegate session is
+# in scope. This is what the orchestrator's progress header reports against while
+# the main agent runs verification itself: an activity, not a pass, so
+# findings.py never counts it toward convergence. The launcher-owns-its-own-pass
+# rule applies here too — the thing that runs the work opens the window.
+PROGRESS_HISTORY="${HOME}/.claude/scripts/delegate/progress_history.py"
+ACTIVITY_SESSION_DIR="${PLAN_DELEGATE_SESSION_DIR:-}"
+if [[ -n "${ACTIVITY_SESSION_DIR}" \
+      && -f "${ACTIVITY_SESSION_DIR}/progress_history_state.json" ]]; then
+    if python3 "${PROGRESS_HISTORY}" start-activity \
+        --session-dir "${ACTIVITY_SESSION_DIR}" \
+        --label "Verification" \
+        --activity "${CMD} ${*:-workspace}" >/dev/null 2>&1; then
+        finish_activity() {
+            local status=$1
+            python3 "${PROGRESS_HISTORY}" finish-activity \
+                --session-dir "${ACTIVITY_SESSION_DIR}" \
+                --status "${status}" >/dev/null 2>&1 || true
+        }
+        # EXIT alone would report success for a failed cargo run, so branch on the
+        # status the trap receives.
+        trap '[[ $? -eq 0 ]] && finish_activity completed || finish_activity error' EXIT
+        trap 'finish_activity interrupted' INT TERM
+    fi
+fi
+
 case "$CMD" in
     check)
         PKG="${1:?verify.sh check <package>}"

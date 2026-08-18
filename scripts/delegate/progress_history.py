@@ -667,6 +667,55 @@ def _close_active_pass(
     _write_state(session_dir, state)
 
 
+def _close_active_activity(
+    session_dir: Path,
+    state: dict[str, object],
+    status: str,
+    now: float,
+) -> None:
+    activity = _object_dict(state.get("activity"))
+    if activity is None or _string(activity.get("status")) != "active":
+        return
+    event = _event(state, "activity_finished", now)
+    event["status"] = status
+    event["activity_elapsed_seconds"] = max(
+        0,
+        int(now - _number(activity.get("started_at"), now)),
+    )
+    _append_event(state, event)
+    activity["status"] = status
+    activity["finished_at"] = now
+    _write_state(session_dir, state)
+
+
+def _start_activity(args: argparse.Namespace) -> None:
+    session_dir = _session_dir(args)
+    state = _read_state(session_dir)
+    phase = _object_dict(state.get("phase"))
+    if phase is None or _string(phase.get("status")) != "active":
+        raise SystemExit("Start a phase before starting an activity")
+    now = _now_epoch()
+    _close_active_activity(session_dir, state, "interrupted", now)
+    state = _read_state(session_dir)
+    activity: dict[str, object] = {
+        "instance_id": str(uuid.uuid4()),
+        "label": _arg_string(args, "label", "Work") or "Work",
+        "activity": _arg_string(args, "activity"),
+        "started_at": now,
+        "status": "active",
+    }
+    state["activity"] = activity
+    _write_state(session_dir, state)
+    _append_event(state, _event(state, "activity_started", now))
+
+
+def _finish_activity(args: argparse.Namespace) -> None:
+    session_dir = _session_dir(args)
+    state = _read_state(session_dir)
+    status = _arg_string(args, "status", "completed") or "completed"
+    _close_active_activity(session_dir, state, status, _now_epoch())
+
+
 def _start_run(args: argparse.Namespace) -> None:
     session_dir = _session_dir(args)
     existing = _state_path(session_dir)
@@ -1179,6 +1228,11 @@ def _format_duration(seconds: int) -> str:
 
 
 def _pass_display(current_pass: dict[str, object]) -> str:
+    # An activity is main-agent work with no convergence meaning, so it carries a
+    # plain label instead of a pass kind. findings.py counts passes, never these.
+    label = _string(current_pass.get("label"))
+    if label:
+        return label
     pass_kind = _string(current_pass.get("kind"))
     if pass_kind == "fix":
         return f"Fix {_integer(current_pass.get('fix_pass'))}"
@@ -1289,14 +1343,23 @@ def _progress(args: argparse.Namespace) -> None:
     now = _now_epoch()
     state = _ensure_project_timing(session_dir, _read_state(session_dir), now)
     phase = _object_dict(state.get("phase"))
+    # The reported window is the launcher's pass when one is open, and otherwise
+    # the main agent's activity. Both render the same third header line; only a
+    # pass carries convergence meaning.
+    window_key = "pass"
     current_pass = _object_dict(state.get("pass"))
-    if (
-        phase is None
-        or _string(phase.get("status")) != "active"
-        or current_pass is None
-        or _string(current_pass.get("status")) != "active"
-    ):
-        raise SystemExit("An active phase and pass are required before reporting progress")
+    if current_pass is None or _string(current_pass.get("status")) != "active":
+        activity = _object_dict(state.get("activity"))
+        if activity is not None and _string(activity.get("status")) == "active":
+            window_key = "activity"
+            current_pass = activity
+        else:
+            current_pass = None
+    if phase is None or _string(phase.get("status")) != "active" or current_pass is None:
+        raise SystemExit(
+            "An active phase and either an active pass or an active activity are "
+            "required before reporting progress"
+        )
     legacy_raw_percent = _arg_integer(args, "raw_percent", -1)
     legacy_percent = _arg_integer(args, "percent", -1)
     project_raw_percent = _arg_integer(args, "project_raw_percent", -1)
@@ -1455,7 +1518,7 @@ def _progress(args: argparse.Namespace) -> None:
         )
     _append_event(state, event)
     state["pending_calibration"] = None
-    state["pass"] = current_pass
+    state[window_key] = current_pass
     _write_state(session_dir, state)
 
     phase_id = _string(phase.get("id"), "ad hoc")
@@ -1495,6 +1558,8 @@ def _finish_phase(args: argparse.Namespace) -> None:
     state = _read_state(session_dir)
     now = _now_epoch()
     _close_active_pass(session_dir, state, "interrupted", now)
+    state = _read_state(session_dir)
+    _close_active_activity(session_dir, state, "interrupted", now)
     state = _read_state(session_dir)
     phase = _object_dict(state.get("phase"))
     if phase is None or _string(phase.get("status")) != "active":
@@ -1595,6 +1660,21 @@ def _build_parser() -> argparse.ArgumentParser:
     _ = start_phase.add_argument("--phase-title", required=True)
     _ = start_phase.add_argument("--work-order-file", default="")
     start_phase.set_defaults(handler=_start_phase)
+
+    start_activity = subparsers.add_parser("start-activity")
+    _ = start_activity.add_argument("--session-dir", required=True)
+    _ = start_activity.add_argument("--label", required=True)
+    _ = start_activity.add_argument("--activity", required=True)
+    start_activity.set_defaults(handler=_start_activity)
+
+    finish_activity = subparsers.add_parser("finish-activity")
+    _ = finish_activity.add_argument("--session-dir", required=True)
+    _ = finish_activity.add_argument(
+        "--status",
+        choices=("completed", "error", "canceled", "interrupted"),
+        default="completed",
+    )
+    finish_activity.set_defaults(handler=_finish_activity)
 
     start_pass = subparsers.add_parser("start-pass")
     _ = start_pass.add_argument("--session-dir", required=True)

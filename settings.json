@@ -114,6 +114,10 @@
           {
             "type": "command",
             "command": "/opt/homebrew/bin/python3 /Users/natemccoy/.claude/scripts/hooks/stop-delegate-continue.py"
+          },
+          {
+            "type": "command",
+            "command": "/opt/homebrew/bin/python3 /Users/natemccoy/.claude/scripts/hooks/stop-delegate-progress-timer.py"
           }
         ]
       }

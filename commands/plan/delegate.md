@@ -86,7 +86,10 @@ Applies to implementation, review, fix, and architect launchers.
    <DualReview/>. Do not inspect launcher output as a substitute for that review.
 4. Claude: if progress is enabled, arm <ProgressContract/>; then end the turn.
    Task and timer notifications resume the workflow independently. Process the
-   first notification without waiting for the other.
+   first notification without waiting for the other. Re-arm before every
+   subsequent turn that leaves work running -- a completed dispatch that hands
+   straight off to verification, a smoke run, or a style pass is still running
+   work, and its timer is the one most often dropped.
 5. Codex: apply <CodexDispatchWait/>. Never end the turn while the launcher is
    active; its terminal result drives the next workflow step.
 </DispatchContract>
@@ -113,8 +116,13 @@ Codex only; no timer process:
 <BackgroundVerificationContract>
 For `verify.sh final`, launch under <ToolingContract/> and tell the user what is
 running. Claude ends the turn and resumes from the task notification. Codex
-applies <CodexDispatchWait/> with progress disabled. It is not an agent dispatch
-and has no heartbeat monitor.
+applies <CodexDispatchWait/> with progress disabled.
+
+It is not an agent dispatch and has no heartbeat monitor, so nothing else
+reports on it. That makes a timer more necessary here, not less: export
+`PLAN_DELEGATE_SESSION_DIR="${SESSION_DIR}"` so `verify.sh` opens its own
+progress window, and arm a timer under <ProgressContract/> exactly as a dispatch
+does.
 </BackgroundVerificationContract>
 
 <CompactionContract>
@@ -280,14 +288,30 @@ heartbeat, and live diff. Before every progress-enabled wait, set
 in `~/.claude/config/timings.conf`; use 240 when it is missing or not a positive
 integer. This is the Claude timer delay and Codex poll timeout.
 
-Claude: while a dispatch is active and progress is enabled, keep exactly one
+Claude: while any work is running and progress is enabled, keep exactly one
 one-shot timer in a managed background terminal. Launch:
 
-`sleep "${PROGRESS_INTERVAL_SECONDS}"; printf 'PLAN_DELEGATE_PROGRESS_TICK\n'`
+`bash ~/.claude/scripts/delegate/progress_timer.sh "${SESSION_DIR}" "${PROGRESS_INTERVAL_SECONDS}"`
 
 Save its handle and end the turn normally. The timer contains no loop and runs
-no agent. Codex never launches this timer; a <CodexDispatchWait/> timeout is its
-progress tick.
+no agent. Use the script rather than a bare `sleep`: it records the armed
+deadline in `${SESSION_DIR}/progress_timer` and clears it on exit, which is what
+lets the Stop hook tell an armed timer from none at all. Codex never launches
+this timer; a <CodexDispatchWait/> timeout is its progress tick.
+
+**Never end a turn that leaves work running without an armed timer.** Running
+work is a live launcher, a background `verify.sh final`, or any main-agent run
+that opened a progress window. A registered Stop hook enforces this and blocks
+once; treat that block as a dropped timer, not as a prompt to argue.
+
+The reported window is a pass when a launcher owns the work and an **activity**
+when the main agent runs it itself -- verification, smoke, style. `verify.sh`
+opens and closes its own activity whenever `PLAN_DELEGATE_SESSION_DIR` is set;
+open one by hand for other main-agent work with
+`progress_history.py start-activity --session-dir "${SESSION_DIR}" --label <label> --activity <what>`
+and close it with `finish-activity`. Activities render an identical header and
+are invisible to `findings.py`, so they never touch convergence counting -- which
+is exactly why <PassOwnership/> forbids faking a pass for the same purpose.
 
 On a Claude timer notification or Codex poll timeout:
 
@@ -362,6 +386,8 @@ only after the required briefing:
 - `auto through phase X`: current through a current-or-later todo phase X.
 - `stop`: end without the described phase.
 - Post-phase `continue`: show the next briefing only; it never authorizes work.
+  An auto control at that gate is a normal window control and routes through
+  <BriefingFreshness/> like any other.
 
 An auto window removes intermediate stops, not explanations. Apply
 <BriefingFreshness/> before its first dispatch. An auto control on initial
@@ -1042,19 +1068,65 @@ phase from its reviewed diff, accepted fixes, `As-built` block, and checkpoint:
 [gate, meaningful tests/lint, review/fixes, one style result, smoke]
 
 **Checkpoint:** `<short hash>`
+
+### What remains
+[phases remaining out of the plan total, then the auto-together recommendation]
 ```
 
 Use the diff over planned claims. Include only load-bearing new/materially
 changed types; use the same statuses as <PhaseBriefing/> and say when none exist.
-Never include or ask about the next phase here.
+Everything above `### What remains` describes only the completed phase.
+
+<RemainingWorkOutlook>
+`### What remains` is the one place the report looks forward. It states what is
+left and whether the next phases are safe to run without stopping between them.
+It never briefs a phase and never asks for authorization; <VerbosePostPhaseGate/>
+owns the ask.
+
+**Count.** Read it from
+
+`python3 ~/.claude/scripts/delegate/progress_history.py phase-count --plan-doc "<plan>"`
+
+and report its `todo` and `total`. Never count phases by hand or by grep: a
+heading takes three forms over its life and any pattern keyed on `status:`
+silently ignores every shrunk phase, which is the mistake <ProgressContract/>
+records. When `todo` is zero, say the plan is out of phases and that final
+workspace verification runs next; skip the recommendation.
+
+**Recommendation.** Read the Work Orders of the next todo phases in order, up to
+three. A consecutive run is auto-together only while every phase in it:
+
+- carries no unresolved `**Pending decision:**` block — that phase stops the run
+  at its own pre-dispatch check whatever the window says;
+- extends a subsystem shipped by a `done` phase rather than opening a new one;
+- has an acceptance gate that runs unattended, with no smoke action needing the
+  user;
+- and does not depend on an outcome only knowable once an earlier phase in the
+  run has actually landed.
+
+The run ends at the first phase failing any of these. Name that phase and the
+one reason it stops there. When the very next phase fails a test, recommend that
+single phase; never round the window up to a phase you would then have to
+interrupt. Cap the recommendation at three phases even when more would qualify,
+so a batch briefing stays readable.
+
+Write it as two or three sentences of ordinary English under <UserFacingText/> —
+what the next phases do, why they group or do not, and the control that opens the
+recommended window. Do not emit a table, a per-phase criteria checklist, or the
+criteria vocabulary above.
+</RemainingWorkOutlook>
 </VerbosePostPhaseReport>
 
 <VerbosePostPhaseGate>
 Skip when no todo phase remains or an auto window continues. Otherwise ask:
 
-`Reply \`continue\` when you are ready to review the next phase's pre-phase briefing, or \`stop\` to end the run.`
+`Reply \`continue\` when you are ready to review the next phase's pre-phase briefing, \`auto next N phases\` or \`auto through phase X\` to open a window, or \`stop\` to end the run.`
 
-`continue` authorizes only composing that briefing. `stop` ends through
+`continue` authorizes only composing that briefing. An auto control accepts the
+outlook in <RemainingWorkOutlook/> and applies <BriefingFreshness/>: the covered
+phases are unbriefed here, so it routes to <AutoWindowBatchBriefing/>, which
+briefs each one and gates once before any dispatch. A window the user sizes
+differently from the recommendation is authoritative. `stop` ends through
 <RunSummary/>. `proceed`, `approved`, questions, or discussion do not advance;
 answer from the completed report and preserve the gate.
 </VerbosePostPhaseGate>
