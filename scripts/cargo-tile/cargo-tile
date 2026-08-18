@@ -1,5 +1,5 @@
 #!/bin/zsh
-# rev 12 — bump this comment in every cargo-tile source file on each change
+# rev 16 — bump this comment in every cargo-tile source file on each change
 # Control command for cargo run tiling in iTerm2.
 set -u
 
@@ -11,7 +11,7 @@ mkdir -p "$STATE"
 # kept so the next run reuses (or closes) existing grid windows instead
 # of orphaning them
 reset_layout() {
-    rm -f "$STATE/session" "$STATE/count" "$STATE/runs" "$STATE/grid" "$STATE/next-slot" "$STATE/grid-since" "$STATE/retreat-pending"
+    rm -f "$STATE/session" "$STATE/count" "$STATE/runs" "$STATE/grid" "$STATE/next-slot" "$STATE/grid-since" "$STATE/retreat-pending" "$STATE/pre-last"
     rm -f "$STATE"/pids/*(N) "$STATE"/slots/*(N)
     rmdir "$STATE/lock" 2>/dev/null
 }
@@ -49,7 +49,11 @@ snapshot_preexisting() {
     ps -axo pid=,command= 2>/dev/null | while read -r pid cmd; do
         tok="${cmd%% *}"
         [[ "$tok" == *cargo-tile* ]] && continue
+        [[ "$tok" == *cargo-port* ]] && continue
         [[ "$tok" == cargo || "$tok" == */cargo ]] || continue
+        # cargo port is untracked (see the shim's skip list)
+        rest="${cmd#* }"
+        [[ "$rest" == port || "$rest" == "port "* ]] && continue
         print -r -- "$pid	$cmd" >> "$STATE/preexisting"
     done
     local n
@@ -63,6 +67,9 @@ case "${1:-status}" in
         hook_toolchains
         snapshot_preexisting
         touch "$STATE/active"
+        # bring up the 1x1 summary window right away
+        "$TILE_HOME/bin/cargo-tile-pane" --check \
+            >/dev/null 2>>"$TILE_HOME/pane-errors.log" &!
         echo "cargo-tile: on — new cargo runs open panes in the grid window"
         ;;
     off)

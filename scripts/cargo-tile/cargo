@@ -1,5 +1,5 @@
 #!/bin/zsh
-# rev 12 — bump this comment in every cargo-tile source file on each change
+# rev 16 — bump this comment in every cargo-tile source file on each change
 # cargo-tile-shim -- master copies live in ~/.claude/scripts/cargo-tile/;
 # ~/.cargo-tile/bin holds symlinks and `cargo-tile on` reinstalls the
 # toolchain hooks from there.
@@ -37,7 +37,7 @@ tile=1
 [[ -n "${CARGO_TILE_NESTED:-}" ]] && tile=0
 # skip tooling/query invocations (rust-analyzer, IDE metadata probes, etc.)
 case "${1:-}" in
-    metadata|pkgid|locate-project|read-manifest|config|-V|--version|-vV|--list|"") tile=0 ;;
+    metadata|pkgid|locate-project|read-manifest|config|port|-V|--version|-vV|--list|"") tile=0 ;;
 esac
 prev=""
 for arg in "$@"; do
@@ -62,8 +62,15 @@ LOG_DIR=/tmp/cargo-tile
 mkdir -p "$LOG_DIR" "$STATE/pids"
 LOG="$LOG_DIR/run-$(date +%Y%m%d-%H%M%S)-$$.log"
 
-# register this run for the summary pane; cleaned up on exit
-print -r -- "cargo $*" > "$STATE/pids/$$"
+# register this run for the summary pane (path TAB command); cleaned up
+# on exit. Command = cargo + first non-flag arg (skips +toolchain).
+subcmd=""
+for arg in "$@"; do
+    [[ "$arg" == -* || "$arg" == +* ]] && continue
+    subcmd="$arg"
+    break
+done
+print -r -- "${PWD/#$HOME/~}	cargo${subcmd:+ $subcmd}" > "$STATE/pids/$$"
 trap 'rm -f "$STATE/pids/$$"' EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM

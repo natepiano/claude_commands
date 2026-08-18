@@ -1,11 +1,11 @@
 #!/bin/zsh
-# rev 12 — bump this comment in every cargo-tile source file on each change
+# rev 16 — bump this comment in every cargo-tile source file on each change
 # Live summary for the cargo-tile grid: revision, grid size, counts of
 # tiled runs, plus cargo processes that predate `cargo-tile on`
 # (uncapturable) — those lines disappear as the processes exit.
 set -u
 
-REVISION=12
+REVISION=16
 
 TILE_HOME="${CARGO_TILE_HOME:-$HOME/.cargo-tile}"
 STATE="$TILE_HOME/state"
@@ -15,15 +15,20 @@ printf '\033]2;cargo-tile summary\007'
 while true; do
     cols=$(tput cols 2>/dev/null) || cols=80
 
-    # tiled runs still executing (pid files cleaned up by the shim)
+    # tiled runs still executing (pid files cleaned up by the shim);
+    # collect "path TAB command" lines for the alphabetical list
     running=0
+    typeset -a active
+    active=()
     for f in "$STATE"/pids/*(N); do
         if kill -0 "${f:t}" 2>/dev/null; then
             (( running += 1 ))
+            [[ -s "$f" ]] && active+=("$(<"$f")")
         else
             rm -f "$f"
         fi
     done
+    (( ${#active} > 0 )) && active=(${(o)active})
 
     k=1
     [[ -f "$STATE/grid" ]] && k=$(<"$STATE/grid")
@@ -48,7 +53,23 @@ while true; do
     buf+=$'\033[1mgrid:\033[0m             '"${k}x${k}"$'\n'
     buf+=$'\033[1mrunning (tiled):\033[0m  '"$running"$'\n'
     buf+=$'\033[1mslots in use:\033[0m     '"$shown / $(( k * k - 1 ))"$'\n'
+    if (( ${#active} > 0 )); then
+        buf+=$'\n\033[1mactive:\033[0m\n'
+        for entry in "${active[@]}"; do
+            rpath="${entry%%	*}"
+            rcmd="${entry#*	}"
+            if (( ${#rpath} + ${#rcmd} + 4 <= cols )); then
+                buf+="  ${rpath}  "$'\033[36m'"${rcmd}"$'\033[0m\n'
+            else
+                # too wide: drop the color so truncation can't strand
+                # an unclosed escape
+                line="  ${rpath}  ${rcmd}"
+                buf+="${line[1,$cols]}"$'\n'
+            fi
+        done
+    fi
     if (( ${#pre} > 0 )); then
+        touch "$STATE/pre-last"
         buf+=$'\n\033[1;33mpre-existing (not captured):\033[0m  '"${#pre}"$'\n'
         for entry in "${pre[@]}"; do
             pid="${entry%%	*}"
@@ -59,10 +80,28 @@ while true; do
             buf+="${line[1,$cols]}"$'\n'
         done
     else
-        buf+=$'\n\033[2mno pre-existing cargo processes\033[0m\n'
+        # placeholder shows for a minute after `on` (or after the last
+        # pre-existing process exits), then the section vanishes
+        ref="$STATE/pre-last"
+        [[ -f "$ref" ]] || ref="$STATE/active"
+        if [[ -f "$ref" ]] && (( $(date +%s) - $(stat -f %m "$ref") < 60 )); then
+            buf+=$'\n\033[2mno pre-existing cargo processes\033[0m\n'
+        fi
     fi
+
+    buf+=$'\n\033[2m[q] exit to shell\033[0m\n'
 
     printf '\033[H\033[2J\033[3J'
     print -rn -- "$buf"
-    sleep 2
+    # q drops this pane to an interactive shell
+    if [[ -t 0 ]]; then
+        key=""
+        read -s -t 2 -k 1 key 2>/dev/null
+        if [[ "$key" == q ]]; then
+            printf '\033[H\033[2J\033[3J'
+            exec /bin/zsh -il
+        fi
+    else
+        sleep 2
+    fi
 done

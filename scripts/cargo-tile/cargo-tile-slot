@@ -1,5 +1,5 @@
 #!/bin/zsh
-# rev 12 — bump this comment in every cargo-tile source file on each change
+# rev 16 — bump this comment in every cargo-tile source file on each change
 # One grid pane. Watches its slot file and displays the assigned run's
 # log via tail; shows an idle placeholder when the slot is empty. The
 # pane itself is never destroyed between runs — content just swaps.
@@ -40,5 +40,17 @@ while true; do
             show_idle
         fi
     fi
-    sleep 0.3
+    # q drops this pane to an interactive shell (watcher is gone until
+    # the next grid rebuild)
+    if [[ -t 0 ]]; then
+        key=""
+        read -s -t 0.3 -k 1 key 2>/dev/null
+        if [[ "$key" == q ]]; then
+            [[ -n "$tailpid" ]] && kill "$tailpid" 2>/dev/null
+            printf '\033[H\033[2J\033[3J'
+            exec /bin/zsh -il
+        fi
+    else
+        sleep 0.3
+    fi
 done
