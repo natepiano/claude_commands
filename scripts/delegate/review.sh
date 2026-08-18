@@ -2,14 +2,20 @@
 # review.sh — Invoke the configured delegate agent for a read-only review.
 #
 # Usage: review.sh <session_dir> [working_dir] [prompt_file] [task]
-#                  [role_description] [pass_activity]
 #                  [role_description] [pass_activity] [pass_index]
+#                  [early_ready_file]
 #   role_description — 1-2 lines describing this review's responsibility,
 #   written as a header block into the shared heartbeat log
 #   pass_activity — short user-facing description for the progress header
 #   pass_index — 1 for a phase's broad review, incrementing for each closure
 #   review after it. Artifacts are written per index and never overwritten:
 #   a run that failed to converge can be read back round by round.
+#   early_ready_file — early-launch mode: the reviewer starts while the
+#   implementer is still running, so its start-pass is deferred until this
+#   sentinel appears (the recorder closes any active pass as interrupted when
+#   a new one starts, and the implementation pass is still open at launch).
+#   The orchestrator creates the sentinel after the implementation pass has
+#   finished and the final diff is written.
 #
 # Produces:
 #   <session_dir>/review_status            — "reviewing" while running, "reviewed" on success, "error" on failure
@@ -35,6 +41,7 @@ SUBTASK="${4:-review}"
 ROLE_DESC="${5:-blind review of the current diff against its spec}"
 PASS_ACTIVITY="${6:-reviewing the current diff against its work order}"
 PASS_INDEX="${7:-1}"
+EARLY_READY_FILE="${8:-}"
 TASK="delegate.${SUBTASK}"
 
 case "${PASS_INDEX}" in
@@ -68,7 +75,9 @@ fi
 printf 'task=%s\nfamily=%s\nagent=%s\neffort=%s\n' \
   "${TASK}" "${AGENT_FAMILY}" "${AGENT_MODEL}" "${AGENT_EFFORT}" > "${AGENT_FILE}"
 
-if [[ -f "${PROGRESS_STATE}" ]]; then
+PASS_STARTED=0
+record_pass_start() {
+  [[ -f "${PROGRESS_STATE}" ]] || return 0
   if ! PLAN_DELEGATE_PASS_OWNER=launcher python3 "${PROGRESS_HELPER}" start-pass \
     --session-dir "${SESSION_DIR}" \
     --pass-kind review \
@@ -77,6 +86,13 @@ if [[ -f "${PROGRESS_STATE}" ]]; then
     --called-family "${AGENT_FAMILY}" \
     --called-model "${AGENT_MODEL}" \
     --called-effort "${AGENT_EFFORT:-unset}"; then
+    return 1
+  fi
+  PASS_STARTED=1
+}
+
+if [[ -z "${EARLY_READY_FILE}" ]]; then
+  if ! record_pass_start; then
     echo "ERROR: unable to record the review pass start." >&2
     echo "error" > "${STATUS_FILE}"
     exit 1
@@ -97,6 +113,25 @@ bash "${SCRIPT_DIR}/../agents/heartbeat_watch.sh" \
   "${HEARTBEAT_FILE}" "${SUBTASK}" "${AGENT_PID}" "${LOG_FILE}" "${HEARTBEAT_INTERVAL_SECS}" &
 HEARTBEAT_LOOP_PID=$!
 
+if [[ -n "${EARLY_READY_FILE}" ]]; then
+  # The implementation pass is open until the sentinel appears; starting the
+  # review pass before then would close it as interrupted.
+  while kill -0 "${AGENT_PID}" 2>/dev/null && [[ ! -e "${EARLY_READY_FILE}" ]]; do
+    sleep 5
+  done
+  if [[ -e "${EARLY_READY_FILE}" ]] && kill -0 "${AGENT_PID}" 2>/dev/null; then
+    if ! record_pass_start; then
+      echo "ERROR: unable to record the early review pass start." >&2
+      kill "${AGENT_PID}" 2>/dev/null || true
+      wait "${AGENT_PID}" 2>/dev/null || true
+      kill "${HEARTBEAT_LOOP_PID}" 2>/dev/null || true
+      wait "${HEARTBEAT_LOOP_PID}" 2>/dev/null || true
+      echo "error" > "${STATUS_FILE}"
+      exit 1
+    fi
+  fi
+fi
+
 AGENT_CODE=0
 wait "${AGENT_PID}" || AGENT_CODE=$?
 
@@ -105,7 +140,12 @@ wait "${HEARTBEAT_LOOP_PID}" 2>/dev/null || true
 
 if [[ "${AGENT_CODE}" -eq 0 ]]; then
   echo "reviewed" > "${STATUS_FILE}"
-  if [[ -f "${PROGRESS_STATE}" ]]; then
+  # A completed review is a real pass even if the worker won the race with the
+  # sentinel; record its start now so pass counting stays truthful.
+  if [[ "${PASS_STARTED}" -eq 0 ]]; then
+    record_pass_start || echo "ERROR: unable to record the review pass start." >&2
+  fi
+  if [[ -f "${PROGRESS_STATE}" && "${PASS_STARTED}" -eq 1 ]]; then
     if ! PLAN_DELEGATE_PASS_OWNER=launcher python3 "${PROGRESS_HELPER}" finish-pass \
       --session-dir "${SESSION_DIR}" --status completed; then
       echo "ERROR: unable to record the review pass completion." >&2
@@ -116,7 +156,9 @@ if [[ "${AGENT_CODE}" -eq 0 ]]; then
   bash "${HEARTBEAT_HELPER}" "${HEARTBEAT_FILE}" wrapper "${SUBTASK} agent finished" || true
 else
   echo "error" > "${STATUS_FILE}"
-  if [[ -f "${PROGRESS_STATE}" ]]; then
+  # An early reviewer that failed before its pass started recorded nothing;
+  # there is no pass to close.
+  if [[ -f "${PROGRESS_STATE}" && "${PASS_STARTED}" -eq 1 ]]; then
     PLAN_DELEGATE_PASS_OWNER=launcher python3 "${PROGRESS_HELPER}" finish-pass \
       --session-dir "${SESSION_DIR}" --status error \
       || echo "ERROR: unable to record the review pass error." >&2

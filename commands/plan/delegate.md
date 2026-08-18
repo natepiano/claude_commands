@@ -34,6 +34,10 @@ State:
 - `PROGRESS_TIMER_HANDLE`: Claude only; starts empty and identifies its current
   one-shot managed background timer.
 - `REVIEW_PASS`: review dispatch count for the current phase; starts at 0.
+- `REVIEW_DISPATCH_HANDLE`: handle of an early-launched blind reviewer running
+  alongside `DISPATCH_HANDLE`; empty when review runs synchronously.
+- `EARLY_REVIEW`: `none` or `launched`; resets with every implementation or fix
+  dispatch. Owned by <EarlyReviewArm/>.
 - `IMPLEMENTATION_TASK`: starts as `implementation`.
 - `APPLICATION_SMOKE_RESULT`: starts as `not_run`.
 - `STYLE_GATE_CONFIG`: plan hint captured during prompt composition.
@@ -111,6 +115,11 @@ Codex only; no timer process:
    this turn. Do not end the turn between completion and routing.
 4. A user message may interrupt the poll. Answer it, retain the session handle,
    and resume this contract unless the user cancels or redirects the run.
+5. An early-launched reviewer occupies its own managed terminal under
+   `REVIEW_DISPATCH_HANDLE`. Keep polling the primary dispatch session; each
+   timeout is also the <EarlyReviewArm/> evaluation point. After the primary
+   completes and the ready sentinel is written, poll the reviewer session under
+   this same contract.
 </CodexDispatchWait>
 
 <BackgroundVerificationContract>
@@ -129,7 +138,8 @@ does.
 - Do not maintain a handoff before the context hook requests one.
 - When requested, write it in the repository and include the hook's fields plus
   `MODE`, `AUTO_WINDOW`, the last authorization, `PROGRESS_UPDATES_ENABLED`, any
-  live `DISPATCH_HANDLE`, any Claude `PROGRESS_TIMER_HANDLE`,
+  live `DISPATCH_HANDLE`, any live `REVIEW_DISPATCH_HANDLE` with `EARLY_REVIEW`
+  and `REVIEW_PASS`, any Claude `PROGRESS_TIMER_HANDLE`,
   `STYLE_REVIEW_DONE`, `MECHANICAL_GATE_CLEANUP_USED`, `NEXT_ITEMS_PATH`, and any
   unresolved next-item approval. Exclude it from review intent-to-add and
   commits.
@@ -378,7 +388,9 @@ On a Claude timer notification or Codex poll timeout:
    `<days> day(s) HH:MM:SS`.
 5. Add one or two ordinary-English sentences covering current activity,
    material work now present, and what remains. Do not paste logs or filenames.
-6. If the dispatch remains active, Claude reads the interval again, launches a
+6. Apply <EarlyReviewArm/>: the evidence steps 2-3 just gathered is its input,
+   and this tick is its only trigger point.
+7. If the dispatch remains active, Claude reads the interval again, launches a
    fresh one-shot timer, replaces the handle, and ends the turn. Codex returns
    immediately to <CodexDispatchWait/> on the same session and reads the
    interval again before polling.
@@ -429,8 +441,9 @@ resequences, or defers. Verbose adds only its authorization gates.
 </AuthorizationContract>
 
 <BriefingFreshness>
-A phase is freshly briefed when the user received its complete
-<PhaseBriefing/> in the current uninterrupted pre-phase review sequence, every
+A phase is freshly briefed when the user received either its complete
+<PhaseBriefing/> or the complete <CombinedWindowBriefing/> for an auto range
+containing it in the current uninterrupted pre-phase review sequence, every
 pending decision and user amendment was surfaced and resolved, and no later
 edit changed its behavior, scope, files, or verification. Sequential individual
 briefings count; they need not appear in one batch message. A follow-up question
@@ -592,6 +605,52 @@ Work Order without code research. Mark genuine uncertainty instead of guessing;
 say explicitly when no load-bearing type is specified.
 </PhaseBriefing>
 
+<CombinedWindowBriefing>
+For an auto window, build one high-level preview from Delegation Context, every
+covered Work Order, and command-line amendments:
+
+```
+## Phases N–M ready — <one outcome-oriented title>
+
+### Overview
+[succinct human-readable explanation of what the window accomplishes as one
+piece of work, why these phases belong together, and the deliberate boundary]
+
+### Phase summaries
+- **Phase N — <title>:** [succinct purpose, dependency, behavior, and deliberate
+  exclusion]
+- **Phase N+1 — <title>:** [...]
+
+### Important types and APIs
+| Phase | Type / trait / API | Status | Planned role | System relationship |
+| --- | --- | --- | --- | --- |
+
+### Files and verification
+[one combined module/package and acceptance summary; name per-phase differences
+only where they matter]
+
+### Wrap-up
+[succinct statement of the resulting capability, what remains outside this
+window, and why the window can run without an intermediate stop]
+```
+
+Keep the overview and phase summaries behavioral and high-level; do not replay
+each Work Order. The complete preview must still preserve the load-bearing
+state transitions, ownership, visible effects, dependencies, and exclusions
+the user needs to authorize the range.
+
+Table rows include only load-bearing types explicitly named by the applicable
+Work Order. Use status `New`, `Existing - Changes`, or
+`Existing - No Changes`, inferred from that Work Order without code research.
+Order rows by editing sequence: covered phase order first, then the order each
+type is first introduced or changed within that phase. Never alphabetize the
+table or regroup it by crate. Mark genuine uncertainty instead of guessing;
+say explicitly when the window specifies no load-bearing type.
+
+Keep `### Wrap-up` short. It synthesizes the authorization boundary; it does not
+repeat the overview, phase summaries, table, or verification section.
+</CombinedWindowBriefing>
+
 <VerbosePrePhaseGate>
 When `MODE=verbose` and no approved auto window is active, emit
 <PhaseBriefing/> and ask exactly:
@@ -608,14 +667,14 @@ fresh range is authorized by the auto control itself; otherwise route to
 Resolve the covered todo phases and apply <BriefingFreshness/> first. If every
 covered phase is fresh, set the approved `AUTO_WINDOW` and continue directly to
 <SelectTask/> without another briefing or gate. Otherwise read every Work Order
-now and emit one complete <PhaseBriefing/> per phase in order; surface any
-pending decision. Ask:
+now and emit one complete <CombinedWindowBriefing/> for the covered range;
+surface any pending decision. Ask:
 
 `Run phases <list> without stopping? Reply \`proceed\` to authorize all of them, \`proceed phase N\` to authorize only phase N and re-gate after it, or \`stop\`.`
 
 Approval runs the resolved range without intermediate gates. Narrowing updates
-`AUTO_WINDOW`; questions preserve the batch gate. Never accept a compressed row
-or phase title as batch authorization.
+`AUTO_WINDOW`; questions preserve the batch gate. The full combined preview,
+not a phase-title list or type table alone, owns batch authorization.
 </AutoWindowBatchBriefing>
 
 <SelectTask>
@@ -646,9 +705,11 @@ in the dispatch update.
    "${WORKING_DIR}" "${SESSION_DIR}/implementation_prompt.md"
    "${IMPLEMENTATION_TASK}" "<responsibility>" "${PASS_KIND}" "<activity>"`.
    Responsibility follows <ProgressContract/>.
-5. Announce prompt and heartbeat paths, then apply <DispatchContract/>.
+5. Announce prompt and heartbeat paths, set `EARLY_REVIEW=none`, then apply
+   <DispatchContract/>.
 6. On completion, read `impl_status`: `implemented` loads `impl_summary.txt`
-   into `${IMPL_SUMMARY}`. On `error`, report `impl_agent.log`, record
+   into `${IMPL_SUMMARY}`. On `error`, cancel any early-launched reviewer per
+   <EarlyReviewArm/>, report `impl_agent.log`, record
    `finish-run --status error`, run `end_session.sh`, and stop; multi-phase runs
    also emit <RunSummary/>.
 7. `implemented` is the delegate's claim, not a passed gate. Read
@@ -666,6 +727,62 @@ Before every broad or closure review, run `git status --short` and apply
 pre-existing untracked and orchestrator-owned handoffs. Verify every created
 file named by the delegate is visible; stop if not. Capture the diff and status.
 </ReviewDiffContract>
+
+<EarlyReviewArm>
+Launch the blind reviewer while the writer is still running, so both finish
+together instead of back to back. Evaluated only on a <ProgressContract/> tick,
+and only when all of these hold: an implementation, escalation, or
+non-mechanical fix dispatch is active; `EARLY_REVIEW=none`; and the completed
+dispatch would receive a delegate review — <DualReview/> pass 1 or a closure
+review. <MechanicalGateCleanup/> and mechanical repairs never arm.
+
+Estimate the **pass-internal** completion of the running dispatch — not the
+capped phase percentage — from the tick's evidence. It is ≥75% when the
+heartbeat shows the delegate running its listed verification commands, or the
+diff already covers essentially all Work Order (or fix batch) files. Below
+75%, or when genuinely unsure, do nothing; the synchronous path still exists.
+
+At ≥75%, in the same tick:
+
+1. Increment `${REVIEW_PASS}` now; <DualReview/> will not increment it again.
+2. Apply <ReviewDiffContract/> to the current partial tree. The delegate has
+   named no created files yet, so that check is vacuous; the snapshot is
+   expected to be incomplete.
+3. Write the applicable early-form prompt — <BroadReviewPrompt/> for pass 1,
+   <ClosureReview/> for a fix — including the completion estimate, the partial
+   diff, and the exact final-diff and ready-sentinel paths below.
+4. Launch `review.sh` exactly as <DualReview/> step 3 does, appending one extra
+   final argument: `${SESSION_DIR}/final_diff_${REVIEW_PASS}.ready`. Save the
+   handle as `${REVIEW_DISPATCH_HANDLE}`, set `EARLY_REVIEW=launched`, and tell
+   the user in one line. Do not disturb `${DISPATCH_HANDLE}` or the tick's
+   timer re-arm.
+
+The extra argument makes `review.sh` defer its `start-pass` until the sentinel
+appears, so the implementation pass and review pass never overlap in the
+recorder. At most one early launch per dispatch. When the primary dispatch
+completes first — before any tick reaches 75% — review runs synchronously as
+before; early launch is opportunistic, never required.
+
+**Delivery.** When the primary dispatch completes, after
+<LaunchImplementation/> step 7, write the final diff to
+`${SESSION_DIR}/final_diff_${REVIEW_PASS}.diff` (for a closure review, limited
+to its paths per <ClosureReview/>), then create
+`${SESSION_DIR}/final_diff_${REVIEW_PASS}.ready`. Never create the sentinel
+before the diff is fully written.
+
+**Cancellation.** If the primary dispatch errors or the run stops before
+delivery, kill the early reviewer. If the ready sentinel exists, close its
+pass with `finish-pass --status canceled --orphaned-launcher` per
+<PassOwnership/>; before the sentinel no pass was recorded, so record nothing —
+a pre-sentinel kill counts toward no ledger stop, including the second
+blind-review cancellation.
+
+**Reviewer error before delivery.** If the early reviewer itself errors while
+the primary dispatch is still running, report it in one line, clear
+`${REVIEW_DISPATCH_HANDLE}`, and set `EARLY_REVIEW=none`; the primary dispatch
+continues and its review runs synchronously at completion under the next
+`${REVIEW_PASS}` index. The errored pass's numbered artifacts remain.
+</EarlyReviewArm>
 
 <BroadReviewPrompt>
 Write `${SESSION_DIR}/review_prompt_${REVIEW_PASS}.md` under
@@ -697,10 +814,40 @@ End with APPROVE, APPROVE WITH FIXES, or REQUEST CHANGES. Do not invent findings
 5. Are domain types clear, and are owned bare Option<T> values replaced or
    justified at an external boundary?
 ```
+
+**Early form** (an <EarlyReviewArm/> launch only): the `## Diff` section holds
+the partial diff at launch, and an `## Implementation status` section is
+inserted before it:
+
+```
+## Implementation status
+
+Implementation is estimated ~N% complete and still running; the diff below is
+a partial snapshot. Work in two stages.
+
+Stage 1 — arm, now: read the specification, the partial diff, and the
+surrounding code, callers, and consumers it touches. Draft provisional
+findings. Emit no verdict.
+
+Stage 2 — fire: poll for <ready sentinel path> (e.g. `test -e`, sleeping ~15s
+between checks), narrating each wait as one short output line. When it
+appears, read <final diff path> — it supersedes the partial snapshot — and
+review it in full, concentrating on hunks that changed since the snapshot.
+Reconcile your provisional findings against the final diff; drop any the final
+code resolves. Then answer the Review Questions and emit the normal numbered
+findings and verdict from the final diff only. If the sentinel has not
+appeared after 30 minutes, report that timeout and exit with an error instead
+of reviewing the partial diff.
+```
 </BroadReviewPrompt>
 
 <DualReview>
-1. Increment `${REVIEW_PASS}`. Pass 1 uses <BroadReviewPrompt/> over the whole
+1. If `EARLY_REVIEW=launched`, the reviewer is already armed and
+   `${REVIEW_PASS}` already incremented: apply <ReviewDiffContract/> to the
+   completed tree, deliver the final diff and ready sentinel per
+   <EarlyReviewArm/>, reset `EARLY_REVIEW=none`, and skip to step 4 with
+   `${REVIEW_DISPATCH_HANDLE}` as the blind-review handle. Otherwise increment
+   `${REVIEW_PASS}`. Pass 1 uses <BroadReviewPrompt/> over the whole
    phase; later passes use <ClosureReview/> over one repair.
 2. Apply <ReviewDiffContract/> and create the applicable prompt.
 3. Launch
@@ -742,6 +889,13 @@ contains only:
 Forbid whole-phase, style, polish, and already-reviewed design findings. An
 outside-path problem is valid only when a quoted repair hunk causes it. Omit the
 broad questions and Type Design Contract.
+
+**Early form** (an <EarlyReviewArm/> launch only): the diff section holds the
+partial repair diff at launch, and the prompt opens with the same
+`## Implementation status` staging block as <BroadReviewPrompt/>'s early form —
+arm on the open ids, their surrounding code, and the partial diff; fire on the
+final path-limited diff when the ready sentinel appears; answer the two
+questions from the final diff only.
 
 After the main pass agrees, record `accepted` for fixed, `still_open` for not
 fixed/unclear, or `reopened` with the invalidating hunk. Open any new defect
@@ -790,7 +944,9 @@ Run `findings.py dispatch --covers <all batch ids>` before launching:
 "${WORKING_DIR}" "${SESSION_DIR}/fix_prompt_${FIX_ROUND}.md" "${FIX_TASK}"
 "<responsibility>" fix "<activity>" "${FIX_ROUND}"`
 
-Apply <DispatchContract/>. After a non-mechanical repair, run <DualReview/>.
+Apply <DispatchContract/>; set `EARLY_REVIEW=none` at dispatch. While a
+non-mechanical fix runs, <EarlyReviewArm/> may arm its closure reviewer early.
+After a non-mechanical repair, run <DualReview/>.
 For a mechanical repair, apply <ReviewDiffContract/>, read it yourself, and
 record each verdict without a delegate review. Force normal closure review if
 the repair touched another path or any id remains unclear.
