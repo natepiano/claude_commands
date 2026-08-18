@@ -49,6 +49,18 @@ if [[ "$WORKTREE_NAME" == *_style_fix ]]; then
     [[ -z "$STYLE_FIX_PROJECT" ]] && STYLE_FIX_PROJECT="${WORKTREE_NAME%_style_fix}"
 fi
 
+# Every git call below runs against the ambient cwd. When the caller's cwd is
+# inside the worktree being removed, that directory stops existing partway
+# through and git aborts with "Unable to read current working directory". Move
+# to the main worktree first — it is the first entry of `git worktree list`, and
+# it is never the deletion target.
+MAIN_WORKTREE="$(git worktree list --porcelain | sed -n '1s/^worktree //p')"
+if [[ -n "$MAIN_WORKTREE" && -d "$MAIN_WORKTREE" ]]; then
+    cd "$MAIN_WORKTREE"
+else
+    echo "Warning: could not resolve the main worktree; staying in $PWD"
+fi
+
 echo "Removing worktree: $WORKTREE_PATH"
 if ! git worktree remove "$WORKTREE_PATH" 2>/dev/null; then
     echo "Standard removal failed, forcing..."
