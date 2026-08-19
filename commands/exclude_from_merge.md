@@ -1,3 +1,7 @@
+---
+description: Exclude a branch from /merge_branch discovery in this repo only.
+---
+
 Exclude a branch from `/merge_branch` discovery in this repo only.
 
 **Arguments**: $ARGUMENTS (branch name to exclude, e.g. `archive/networking-poc`)

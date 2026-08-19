@@ -1,3 +1,7 @@
+---
+description: Delete a shared style file and clean up every see_also reference and wikilink pointing at it.
+---
+
 # Delete Style
 
 Delete a shared style file deterministically with the shared admin script.

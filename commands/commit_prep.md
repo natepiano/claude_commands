@@ -1,3 +1,7 @@
+---
+description: Analyze staged and unstaged changes, run a clippy precheck, and draft a commit title and body for review before committing.
+---
+
 **IMPORTANT** don't commit the changes that you will examine. Just do the following:
 
 <ExecutionSteps>

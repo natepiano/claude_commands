@@ -1,3 +1,7 @@
+---
+description: Create a new issue in the hanadocs vault from a project shorthand, title, and optional body.
+---
+
 Create a new issue in the hanadocs vault.
 
 The hanadocs vault lives at an absolute path on disk so this command works from any project. Do NOT use paths relative to the current working directory.

@@ -1,3 +1,7 @@
+---
+description: Create a pull request from the current branch, then manage the merge, switch back to main, and clean up.
+---
+
 **Arguments**: None (uses current branch)
 
 I'll create a PR from your current branch and manage the merge workflow.

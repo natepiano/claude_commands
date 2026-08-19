@@ -1,3 +1,7 @@
+---
+description: Scaffold a new Rust crate from the local rust-template, either standalone under ~/rust or as a member of the current workspace.
+---
+
 # New Rust Project
 
 Scaffold a new Rust crate from the local `rust-template` checkout (`~/rust/rust-template`, via `cargo generate --path`) — either as a standalone repo under `~/rust/`, or as a member of the Cargo workspace you're currently in. The command infers which from the invocation directory and confirms before proceeding.

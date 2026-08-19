@@ -1,3 +1,7 @@
+---
+description: Acknowledge context passed in arguments and stop without taking any action.
+---
+
 # ACK Command
 
 ## MANDATORY BEHAVIOR

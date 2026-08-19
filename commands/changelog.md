@@ -1,3 +1,7 @@
+---
+description: Generate a changelog entry from the current git changes, optionally tied to an issue or PR number.
+---
+
 **IMPORTANT** don't commit any changes. Just do the following:
 
 **Arguments**: $ARGUMENTS (optional: issue/PR number, e.g. `#123` or `123`)

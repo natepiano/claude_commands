@@ -1,3 +1,7 @@
+---
+description: Show style guide history and reporting derived from clean-fix style runs.
+---
+
 # Style Report Summary
 
 Show style guide history and reporting derived from clean-fix style runs.

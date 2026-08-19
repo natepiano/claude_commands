@@ -1,3 +1,7 @@
+---
+description: Open a file in the Zed editor.
+---
+
 # Open File in Zed
 
 Open the file specified in `$ARGUMENTS` using the Zed CLI.

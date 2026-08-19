@@ -1,3 +1,7 @@
+---
+description: Load the Rust style guide before writing Rust code.
+---
+
 Load the Rust style guide before writing Rust code.
 
 Run this exact command with Bash:

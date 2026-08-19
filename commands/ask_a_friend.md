@@ -1,3 +1,7 @@
+---
+description: Consult an external CLI agent over multiple rounds on a design decision, bug, or architectural question, then synthesize both perspectives.
+---
+
 # Ask A Friend
 
 **Purpose:** Have a back-and-forth consultation with an external CLI agent on design decisions, bugs, or architectural questions. Each round sends a question to your friend, presents both perspectives, and lets you continue the dialog or wrap up with a final synthesis.

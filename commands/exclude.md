@@ -1,3 +1,7 @@
+---
+description: Add a file to this repo's .git/info/exclude so it stays untracked locally.
+---
+
 **Arguments**: $ARGUMENTS (filename to exclude, e.g. `plan.md` — if empty, infer from the most recently written plan file in this conversation)
 
 <ExecutionSteps>

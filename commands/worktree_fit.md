@@ -1,3 +1,7 @@
+---
+description: Given a design plan, work out which repo, branch, and base point it should live on to minimize later integration pain.
+---
+
 # Worktree Fit
 
 **Purpose:** Given a design plan, work out *where it should live* — which repo, which branch, branched from what — so the work integrates with everything else in flight with the least pain later. Surveys every worktree across the project's repos, compares what each in-flight branch is touching against what the plan will touch, and returns a placement recommendation with a merge and sequencing plan.

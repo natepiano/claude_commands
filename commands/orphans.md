@@ -1,3 +1,7 @@
+---
+description: Find scripts and config files in ~/.claude that nothing references any more.
+---
+
 Find orphaned scripts and config files in the .claude directory that aren't referenced anywhere.
 
 Execute: `~/.claude/scripts/orphans/orphans.py`

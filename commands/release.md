@@ -1,3 +1,7 @@
+---
+description: Release a Rust crate or workspace — version bump, publish, and tagging, with dry-run and RC support.
+---
+
 # Unified Release Command
 
 Perform a release for any Rust crate or workspace project.

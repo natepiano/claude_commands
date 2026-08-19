@@ -1,3 +1,7 @@
+---
+description: Rename a shared style file and rewrite see_also wikilinks across all style files so references still resolve.
+---
+
 # Rename Style
 
 Rename a shared style file deterministically with the shared admin script.

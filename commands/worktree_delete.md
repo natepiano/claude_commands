@@ -1,3 +1,7 @@
+---
+description: Discover worktrees and safely delete one and its branch, checking for uncommitted and unpushed work first.
+---
+
 PROTECTED_BRANCHES = main
 DEFAULT_REMOTE = origin
 

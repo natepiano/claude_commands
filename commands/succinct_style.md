@@ -1,3 +1,7 @@
+---
+description: Load this before editing any file under ~/rust/nate_style/ or a repo-local docs/style/.
+---
+
 Load this before editing any file under `~/rust/nate_style/` or a repo-local `docs/style/`.
 
 ## Context cost is real

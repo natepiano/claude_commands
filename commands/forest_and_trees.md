@@ -1,3 +1,7 @@
+---
+description: Abandon the original task and switch entirely to the larger underlying problem that surfaced during the conversation.
+---
+
 Stop. The original problem we started working on is not the real problem.
 
 During our conversation, a bigger underlying issue has emerged. That is now the only thing that matters.

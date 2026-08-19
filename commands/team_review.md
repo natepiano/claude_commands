@@ -1,3 +1,7 @@
+---
+description: Launch a team of expert agents to review a topic across multiple dimensions and cycles, recording findings and surfacing unresolved decisions.
+---
+
 # Team Review
 
 **Purpose:** Launch a team of expert agents to analyze a topic from multiple dimensions across one or more refinement cycles. Mechanical findings are auto-recorded to a working doc; judgment-call findings accumulate as proposed user decisions that later cycles can add to, sharpen, or drop. After the final cycle, the surviving proposed decisions are surfaced through `/adhoc_review`.

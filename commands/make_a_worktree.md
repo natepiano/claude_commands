@@ -1,3 +1,7 @@
+---
+description: Suggest and create a git worktree and branch, copy local settings into it, and offer a clean-fix redirect.
+---
+
 Use TodoWrite tool to create initial todos:
 - "Suggest worktree and branch name to user"
 - "Get user approval for worktree creation"

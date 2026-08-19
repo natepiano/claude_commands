@@ -1,3 +1,7 @@
+---
+description: Bake PBR textures in Blender from a configuration file.
+---
+
 execute the following instructions:
 
 Run the bake_textures.py script through Blender to bake PBR textures using the provided configuration file.
