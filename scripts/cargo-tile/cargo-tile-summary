@@ -1,11 +1,11 @@
 #!/bin/zsh
-# rev 43 — bump this comment in every cargo-tile source file on each change
+# rev 44 — bump this comment in every cargo-tile source file on each change
 # Live summary for the cargo-tile grid: revision, grid size, counts of
 # tiled runs, plus cargo processes that predate `cargo-tile on`
 # (uncapturable) — those lines disappear as the processes exit.
 set -u
 
-REVISION=43
+REVISION=44
 
 TILE_HOME="${CARGO_TILE_HOME:-$HOME/.cargo-tile}"
 STATE=/tmp/cargo-tile/state

@@ -1,5 +1,5 @@
 #!/bin/zsh
-# rev 43 — bump this comment in every cargo-tile source file on each change
+# rev 44 — bump this comment in every cargo-tile source file on each change
 # Assign runs to the cargo-tile pane layout.
 #   cargo-tile-pane <log>           add a run
 #   cargo-tile-pane --remove <log>  drop a finished run
@@ -205,6 +205,9 @@ if [[ "$mode" == check ]]; then
         pid="${${lg:t:r}##*-}"
         [[ "$pid" == <-> ]] || continue
         kill -0 "$pid" 2>/dev/null || continue
+        # a finished run keeps its exit banner; a reused pid must not
+        # resurrect it (same guard as adopt_live_runs)
+        tail -2 "$lg" 2>/dev/null | grep -q -- '── exit ' && continue
         slot=$(( ${#slotlog} + 2 ))
         (( slot <= 36 )) || break
         print -r -- "$lg" > "$STATE/slots/$slot"

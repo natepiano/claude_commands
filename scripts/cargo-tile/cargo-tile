@@ -1,5 +1,5 @@
 #!/bin/zsh
-# rev 39 — bump this comment in every cargo-tile source file on each change
+# rev 44 — bump this comment in every cargo-tile source file on each change
 # Control command for cargo run tiling in iTerm2.
 set -u
 
@@ -67,11 +67,23 @@ adopt_live_runs() {
         [[ "$pid" == <-> ]] || continue
         kill -0 "$pid" 2>/dev/null || continue
         [[ -f "$STATE/pids/$pid" ]] && continue
+        # a finished run leaves the shim's exit banner — never adopt it:
+        # overnight the pid gets reused, so kill -0 alone proves nothing
+        if tail -2 "$lg" 2>/dev/null | grep -q -- '── exit '; then
+            rm -f "$lg"
+            continue
+        fi
+        # pid-reuse guard for runs that died without a banner: the live
+        # process must actually be cargo
+        ps -p "$pid" -o command= 2>/dev/null | grep -q cargo || continue
         # log line 1: OSC title "cargo <args>  [~/dir]" then the command echo
         l1=$(head -1 "$lg" 2>/dev/null)
         title="${l1#*\]2;}"
         title="${title%%$'\a'*}"
         dir="${${title##*\[}%\]}"
+        # a title without "[~/dir]" (pre-rev-38 log) parses to the command
+        # itself — no usable cwd, so skip rather than corrupt the summary
+        [[ "$dir" == "~"* || "$dir" == /* ]] || continue
         sub=""
         for w in ${(z)${title%%  \[*}}; do
             [[ "$w" == cargo || "$w" == -* || "$w" == +* ]] && continue
