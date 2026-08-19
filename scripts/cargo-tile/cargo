@@ -1,5 +1,5 @@
 #!/bin/zsh
-# rev 32 — bump this comment in every cargo-tile source file on each change
+# rev 36 — bump this comment in every cargo-tile source file on each change
 # cargo-tile-shim -- master copies live in ~/.claude/scripts/cargo-tile/;
 # ~/.cargo-tile/bin holds symlinks and `cargo-tile on` reinstalls the
 # toolchain hooks from there.
@@ -12,7 +12,12 @@ set -u
 setopt no_bgnice
 
 TILE_HOME="${CARGO_TILE_HOME:-$HOME/.cargo-tile}"
-STATE="$TILE_HOME/state"
+# hot state lives under /tmp: sandboxed callers (cargo from a Claude
+# Code shell) can't write $HOME dotdirs, so pid/slot registration
+# would silently fail there. The on/off toggle stays in TILE_HOME so
+# it survives reboots.
+STATE=/tmp/cargo-tile/state
+ERRLOG=/tmp/cargo-tile/pane-errors.log
 
 SELF_DIR="${0:h}"
 if [[ -x "$SELF_DIR/cargo-tile-real" ]]; then
@@ -31,10 +36,14 @@ else
 fi
 
 tile=1
-[[ -f "$STATE/active" ]] || tile=0
+[[ -f "$TILE_HOME/active" ]] || tile=0
 # nested cargo (build scripts, cargo-invoking-cargo, shim-in-shim) never
-# re-tiles
-[[ -n "${CARGO_TILE_NESTED:-}" ]] && tile=0
+# re-tiles. The flag carries the enclosing shim's pid and only counts
+# while that pid is alive — shell environments captured inside a tiled
+# run (Claude Code shell snapshots) carry the flag forever otherwise
+if [[ "${CARGO_TILE_NESTED:-}" == <-> ]] && kill -0 "$CARGO_TILE_NESTED" 2>/dev/null; then
+    tile=0
+fi
 # skip tooling/query invocations (rust-analyzer, IDE metadata probes,
 # etc.); the subcommand is the first arg past any +toolchain selector
 first=""
@@ -64,7 +73,7 @@ fi
 
 (( tile )) || exec "$REAL" "$@"
 
-export CARGO_TILE_NESTED=1
+export CARGO_TILE_NESTED=$$
 LOG_DIR=/tmp/cargo-tile
 mkdir -p "$LOG_DIR" "$STATE/pids"
 LOG="$LOG_DIR/run-$(date +%Y%m%d-%H%M%S)-$$.log"
@@ -85,7 +94,7 @@ dir="${PWD/#$HOME/~}"
 } > "$LOG"
 
 # claim a pane in the background so cargo starts immediately
-"$TILE_HOME/bin/cargo-tile-pane" "$LOG" >/dev/null 2>>"$TILE_HOME/pane-errors.log" &!
+"$TILE_HOME/bin/cargo-tile-pane" "$LOG" >/dev/null 2>>"$ERRLOG" &!
 
 if [[ -t 0 && -t 1 && -t 2 ]]; then
     # pty capture: full terminal fidelity (colors, progress bars)
@@ -109,5 +118,5 @@ fi
 # the pane clears shortly after the run exits
 LINGER="${CARGO_TILE_LINGER:-4}"
 ( sleep "$LINGER"; "$TILE_HOME/bin/cargo-tile-pane" --remove "$LOG" ) \
-    >/dev/null 2>>"$TILE_HOME/pane-errors.log" &!
+    >/dev/null 2>>"$ERRLOG" &!
 exit $st

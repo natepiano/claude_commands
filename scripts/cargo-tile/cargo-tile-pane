@@ -1,47 +1,62 @@
 #!/bin/zsh
-# rev 32 — bump this comment in every cargo-tile source file on each change
-# Assign runs to the cargo-tile slot grid.
+# rev 37 — bump this comment in every cargo-tile source file on each change
+# Assign runs to the cargo-tile pane layout.
 #   cargo-tile-pane <log>           add a run
-#   cargo-tile-pane --remove <log>  drop a finished run (slot goes idle)
-#   cargo-tile-pane --check         re-evaluate grid size (deferred retreat)
+#   cargo-tile-pane --remove <log>  drop a finished run
+#   cargo-tile-pane --check         converge layout (deferred work, recovery)
+#   cargo-tile-pane --decay         close one trailing idle pane
 #
-# The iTerm2 window holds a fixed k x k grid of persistent panes: pane 1
-# is the summary, panes 2..k^2 are slots (numbered column-major: col 1
-# top-to-bottom, then col 2, ...). Runs claim slots in order, wrapping.
-# Adding/removing a run only rewrites a slot file — the pane's watcher
-# picks it up; no AppleScript, no focus changes, no visual churn.
+# Tile 1 is the summary; runs fill tiles 2..N in snake order (down
+# column 1, then column 2, ...). For N tiles, k = ceil(sqrt(N)):
+# columns hold k tiles each and the last column's panes split the full
+# column height evenly. Panes are added one split at a time as tiles
+# arrive; a new COLUMN can't be made from a session split, so only
+# column growth (N = 3, 7, 13, 21, 31) rebuilds the window. When runs
+# leave, content shifts up (slots stay packed), trailing panes go idle
+# in place, and --decay closes one per minute so they can be refilled
+# without churn.
 #
-# The grid starts 2x2 and expands to 3x3, 4x4, ... (cap 6x6) when total
-# tiles (runs + summary) exceed k^2; it retreats one size only when
-# total tiles fall to (k-1)^2 or fewer. Only those resizes (and window
-# creation/recovery) rebuild the layout via AppleScript.
+# state/slots/<pos>  packed run logs, positions 2.. in snake order
+# state/layout       one line per column: "ord:sessionid ..." top-down
+# state/panemap/<o>  the log pane <o> shows (empty = idle); watched by
+#                    cargo-tile-slot <o>
 set -u
 
 TILE_HOME="${CARGO_TILE_HOME:-$HOME/.cargo-tile}"
-STATE="$TILE_HOME/state"
+STATE=/tmp/cargo-tile/state
+ERRLOG=/tmp/cargo-tile/pane-errors.log
 
 mode=add
 case "${1:-}" in
     --remove) mode=remove; shift ;;
     --check) mode=check; shift ;;
+    --decay) mode=decay; shift ;;
 esac
 LOG="${1:-}"
-mkdir -p "$STATE/slots"
+mkdir -p "$STATE/slots" "$STATE/panemap"
 
-# serialize concurrent invocations
+# serialize concurrent invocations — running two of these at once
+# interleaves osascript calls and corrupts the layout, so on timeout we
+# DROP the event (a later --check self-heals) rather than run unlocked
 LOCK="$STATE/lock"
 locked=0
-for i in {1..100}; do
+for i in {1..150}; do
     if mkdir "$LOCK" 2>/dev/null; then
         locked=1
         break
     fi
+    # a holder that crashed without its EXIT trap leaves the lock behind
+    if (( i % 20 == 0 )); then
+        lage=$(( $(date +%s) - $(stat -f %m "$LOCK" 2>/dev/null || date +%s) ))
+        (( lage > 30 )) && rmdir "$LOCK" 2>/dev/null
+    fi
     sleep 0.1
 done
-(( locked )) && trap 'rmdir "$LOCK" 2>/dev/null' EXIT
-
-k=1
-[[ -f "$STATE/grid" ]] && k=$(<"$STATE/grid")
+if (( ! locked )); then
+    touch "$STATE/rebuild-needed"
+    exit 0
+fi
+trap 'rmdir "$LOCK" 2>/dev/null' EXIT
 
 # collect active slots (slot -> log), dropping stale entries
 typeset -A slotlog
@@ -65,107 +80,203 @@ if [[ "$mode" == remove ]]; then
     ( sleep 0.7; rm -f "$LOG" ) &!
 fi
 
-runs_after=${#slotlog}
-[[ "$mode" == add ]] && (( runs_after += 1 ))
-total=$(( runs_after + 1 ))  # + summary tile
+# keep runs packed toward the front: close any holes left by removes
+# (or stale entries) by shifting later runs up, preserving order
+typeset -a packed
+packed=()
+for s in ${(kon)slotlog}; do packed+=("${slotlog[$s]}"); done
+slotlog=()
+i=2
+for l in "${packed[@]}"; do
+    cur=""
+    [[ -s "$STATE/slots/$i" ]] && cur=$(<"$STATE/slots/$i")
+    [[ "$cur" == "$l" ]] || print -r -- "$l" > "$STATE/slots/$i"
+    slotlog[$i]="$l"
+    (( i += 1 ))
+done
+for f in "$STATE"/slots/*(N); do
+    (( ${f:t} >= i )) && [[ -s "$f" ]] && : > "$f"
+done
 
-# growth is immediate; retreat only after the current size has been held
-# for CARGO_TILE_RETREAT_HOLD seconds (a deferred --check finishes the
-# retreat once the hold expires)
-HOLD="${CARGO_TILE_RETREAT_HOLD:-60}"
-now=$(date +%s)
-since=0
-[[ -f "$STATE/grid-since" ]] && since=$(<"$STATE/grid-since")
-
-target_k=$k
-while (( target_k < 6 && total > target_k * target_k )); do (( target_k += 1 )); done
-if (( target_k == k )); then
-    want_k=$k
-    while (( want_k > 1 && total <= (want_k - 1) * (want_k - 1) )); do (( want_k -= 1 )); done
-    if (( want_k < k )); then
-        if (( now - since >= HOLD )); then
-            target_k=$want_k
-        elif [[ ! -f "$STATE/retreat-pending" ]]; then
-            touch "$STATE/retreat-pending"
-            ( sleep $(( HOLD - (now - since) + 1 ))
-              rm -f "$STATE/retreat-pending"
-              "$TILE_HOME/bin/cargo-tile-pane" --check ) \
-                >/dev/null 2>>"$TILE_HOME/pane-errors.log" &!
-        fi
+if [[ "$mode" == add && -n "$LOG" ]]; then
+    slot=$(( ${#slotlog} + 2 ))
+    if (( slot <= 36 )); then
+        print -r -- "$LOG" > "$STATE/slots/$slot"
+        slotlog[$slot]="$LOG"
     fi
 fi
 
-# does the window still exist?
-win=""
-[[ -f "$STATE/window" ]] && win=$(<"$STATE/window")
-rebuild=0
-if [[ -z "$win" ]]; then
-    rebuild=1
-elif ! osascript -e "tell application \"iTerm2\" to count of tabs of window id $win" >/dev/null 2>&1; then
-    rebuild=1
-fi
-(( target_k != k )) && rebuild=1
+N=$(( ${#slotlog} + 1 ))  # + summary tile
+(( N > 36 )) && N=36
 
-if (( ! rebuild )); then
-    if [[ "$mode" == add ]]; then
-        cap=$(( k * k ))
-        slot=2
-        [[ -f "$STATE/next-slot" ]] && slot=$(<"$STATE/next-slot")
-        (( slot < 2 || slot > cap )) && slot=2
-        # prefer the next idle slot in order; if all are busy, replace in order
-        probe=$slot
-        for (( i = 1; i < cap; i++ )); do
-            if [[ -z "${slotlog[$probe]:-}" ]]; then
-                slot=$probe
-                break
-            fi
-            (( probe = probe + 1 > cap ? 2 : probe + 1 ))
-        done
-        old="${slotlog[$slot]:-}"
-        print -r -- "$LOG" > "$STATE/slots/$slot"
-        [[ -n "$old" ]] && ( sleep 0.7; rm -f "$old" ) &!
-        next=$(( slot + 1 > cap ? 2 : slot + 1 ))
-        print -r -- "$next" > "$STATE/next-slot"
+# current pane layout
+typeset -a cols
+[[ -s "$STATE/layout" ]] && cols=("${(@f)$(<"$STATE/layout")}")
+P=0
+for c in "${cols[@]}"; do (( P += ${#${=c}} )); done
+
+# column heights for $1 tiles -> SHAPE
+shape_for() {
+    local n=$1 k=1 rem
+    while (( k * k < n )); do (( k += 1 )); done
+    typeset -ga SHAPE
+    SHAPE=()
+    rem=$n
+    while (( rem > 0 )); do
+        if (( rem >= k )); then
+            SHAPE+=($k)
+            (( rem -= k ))
+        else
+            SHAPE+=($rem)
+            rem=0
+        fi
+    done
+}
+
+# pane ordinals in snake order from $cols -> ORDS
+flatten_ords() {
+    typeset -ga ORDS
+    ORDS=()
+    local c e
+    for c in "${cols[@]}"; do
+        for e in ${=c}; do ORDS+=("${e%%:*}"); done
+    done
+}
+
+# point every pane's map at the run for its position (pure file writes,
+# safe from any caller); panes past the run list go idle
+sync_maps() {
+    flatten_ords
+    local i tgt curm mf
+    for (( i = 2; i <= ${#ORDS}; i++ )); do
+        tgt="${slotlog[$i]:-}"
+        mf="$STATE/panemap/${ORDS[$i]}"
+        curm=""
+        [[ -s "$mf" ]] && curm=$(<"$mf")
+        [[ "$curm" == "$tgt" ]] || print -r -- "$tgt" > "$mf"
+    done
+}
+
+# sandboxed caller (cargo from a Claude Code shell — detectable because
+# the sandbox blocks exec of /bin/ps): slot and map files are plain
+# /tmp writes, but osascript can't reach iTerm2, so pane creation and
+# recovery are deferred to the summary pane via the rebuild-needed
+# marker
+if ! /bin/ps -p $$ >/dev/null 2>&1; then
+    sync_maps
+    if [[ ! -f "$STATE/window" ]] || (( N > P )); then
+        touch "$STATE/rebuild-needed"
     fi
     exit 0
 fi
 
-# --- rebuild: compact runs (oldest assignment first) into slots 2.. ---
-typeset -a ordered
-ordered=()
-for s in "${(k)slotlog[@]}"; do
-    ordered+=("$(stat -f %m "$STATE/slots/$s" 2>/dev/null || echo 0)	${slotlog[$s]}")
-done
-ordered=("${(@on)ordered}")
-typeset -a logs
-for e in "${ordered[@]}"; do logs+=("${e#*	}"); done
-[[ "$mode" == add ]] && logs+=("$LOG")
+# a --check is the self-heal entry point: re-register any live run
+# whose add was dropped (lock contention) or whose slot was lost
+if [[ "$mode" == check ]]; then
+    typeset -A haslog
+    for s in "${(k)slotlog[@]}"; do haslog[${slotlog[$s]}]=1; done
+    for lg in /tmp/cargo-tile/run-*-*.log(N); do
+        [[ -n "${haslog[$lg]:-}" ]] && continue
+        pid="${${lg:t:r}##*-}"
+        [[ "$pid" == <-> ]] || continue
+        kill -0 "$pid" 2>/dev/null || continue
+        slot=$(( ${#slotlog} + 2 ))
+        (( slot <= 36 )) || break
+        print -r -- "$lg" > "$STATE/slots/$slot"
+        slotlog[$slot]="$lg"
+        haslog[$lg]=1
+    done
+    N=$(( ${#slotlog} + 1 ))
+    (( N > 36 )) && N=36
+fi
 
-rm -f "$STATE"/slots/*(N)
-i=2
-for l in "${logs[@]}"; do
-    print -r -- "$l" > "$STATE/slots/$i"
-    (( i += 1 ))
-done
-print -r -- "$(( i > target_k * target_k ? 2 : i ))" > "$STATE/next-slot"
-print -r -- "$target_k" > "$STATE/grid"
-(( target_k != k )) && print -r -- "$now" > "$STATE/grid-since"
+next_ord() {
+    local o=1
+    [[ -s "$STATE/pane-seq" ]] && o=$(<"$STATE/pane-seq")
+    (( o += 1 ))
+    print -r -- "$o" > "$STATE/pane-seq"
+    print -r -- "$o"
+}
 
-# pane commands, column-major: pane 1 = summary, panes 2..k^2 = slots
-typeset -a cmds
-cmds=("$TILE_HOME/bin/cargo-tile-summary")
-for (( p = 2; p <= target_k * target_k; p++ )); do
-    cmds+=("$TILE_HOME/bin/cargo-tile-slot $p")
-done
+even_arrange() {
+    osascript <<'EOF' 2>/dev/null
+try
+	with timeout of 3 seconds
+		tell application "System Events" to tell process "iTerm2"
+			click menu item "Arrange Split Panes Evenly" of menu "View" of menu bar 1
+		end tell
+	end timeout
+end try
+EOF
+}
 
-# every grid window ever created; all but the active one get closed
-typeset -a known stale
-[[ -f "$STATE/windows-created" ]] && known=("${(@f)$(<"$STATE/windows-created")}")
-for kn in "${known[@]}"; do
-    [[ -n "$kn" && "$kn" != "$win" ]] && stale+=("$kn")
-done
+split_pane() {  # $1 = session id to split below, $2 = new pane ordinal
+    osascript - "$win" "$1" "$TILE_HOME/bin/cargo-tile-slot $2" <<'EOF'
+on run argv
+	set winId to (item 1 of argv) as integer
+	set sid to item 2 of argv
+	set cmd to item 3 of argv
+	tell application "iTerm2"
+		repeat with t in tabs of window id winId
+			repeat with s in sessions of t
+				if (id of s) is equal to sid then
+					tell s to set ns to (split horizontally with default profile command cmd)
+					return id of ns
+				end if
+			end repeat
+		end repeat
+	end tell
+	error "session not found"
+end run
+EOF
+}
 
-out=$(osascript - "$win" "${#stale}" "${stale[@]}" "$target_k" "${cmds[@]}" <<'EOF'
+close_pane() {  # $1 = session id
+    osascript - "$win" "$1" <<'EOF'
+on run argv
+	set winId to (item 1 of argv) as integer
+	set sid to item 2 of argv
+	tell application "iTerm2"
+		repeat with t in tabs of window id winId
+			repeat with s in sessions of t
+				if (id of s) is equal to sid then
+					close s
+					return
+				end if
+			end repeat
+		end repeat
+	end tell
+end run
+EOF
+}
+
+# tear down and rebuild the whole layout for N tiles (window creation,
+# recovery, and column growth — the only cases a session split can't
+# reach)
+full_rebuild() {
+    shape_for $N
+    local m=${#SHAPE}
+    typeset -a cmds nords
+    cmds=("$TILE_HOME/bin/cargo-tile-summary")
+    nords=(1)
+    local j o
+    for (( j = 2; j <= N; j++ )); do
+        o=$(next_ord)
+        nords+=($o)
+        cmds+=("$TILE_HOME/bin/cargo-tile-slot $o")
+    done
+    local w=""
+    [[ -f "$STATE/window" ]] && w=$(<"$STATE/window")
+    typeset -a known stale
+    known=()
+    stale=()
+    [[ -f "$STATE/windows-created" ]] && known=("${(@f)$(<"$STATE/windows-created")}")
+    local kn
+    for kn in "${known[@]}"; do
+        [[ -n "$kn" && "$kn" != "$w" ]] && stale+=("$kn")
+    done
+    local out
+    out=$(osascript - "$w" "${#stale}" "${stale[@]}" "$m" "${SHAPE[@]}" "${cmds[@]}" <<'EOF'
 on run argv
 	set winId to item 1 of argv
 	set nStale to (item 2 of argv) as integer
@@ -174,9 +285,14 @@ on run argv
 		copy (item i of argv) to end of staleIds
 	end repeat
 	set base to 2 + nStale
-	set k to (item (base + 1) of argv) as integer
+	set m to (item (base + 1) of argv) as integer
+	set hs to {}
+	repeat with i from (base + 2) to (base + 1 + m)
+		copy ((item i of argv) as integer) to end of hs
+	end repeat
+	set cbase to base + 1 + m
 	set cmds to {}
-	repeat with i from (base + 2) to (base + 1 + k * k)
+	repeat with i from (cbase + 1) to (count of argv)
 		copy (item i of argv) to end of cmds
 	end repeat
 
@@ -226,21 +342,37 @@ on run argv
 			end try
 		end repeat
 
-		-- k columns via vertical splits, left to right
+		-- columns via vertical splits; column c starts at cmds index
+		-- 1 + sum of hs[1..c-1]
 		set t to current tab of w
 		set colHeads to {current session of t}
-		repeat with c from 2 to k
+		set starts to {1}
+		set acc to 1
+		repeat with c from 2 to m
+			set acc to acc + (item (c - 1) of hs)
+			copy acc to end of starts
 			set prev to item (c - 1) of colHeads
-			tell prev to set ns to (split vertically with default profile command (item ((c - 1) * k + 1) of cmds))
+			tell prev to set ns to (split vertically with default profile command (item acc of cmds))
 			copy ns to end of colHeads
 		end repeat
 
-		-- fill each column's k rows top to bottom
-		repeat with c from 1 to k
+		-- fill each column's rows top to bottom, collecting session
+		-- ids in snake order
+		set allSess to {}
+		repeat with c from 1 to m
 			set cur to item c of colHeads
-			repeat with r from 2 to k
-				tell cur to set cur to (split horizontally with default profile command (item ((c - 1) * k + r) of cmds))
+			copy cur to end of allSess
+			repeat with r from 2 to (item c of hs)
+				tell cur to set cur to (split horizontally with default profile command (item ((item c of starts) + r - 1) of cmds))
+				copy cur to end of allSess
 			end repeat
+		end repeat
+
+		-- session refs are positional (tab N), so resolve ids BEFORE
+		-- closing the old tab shifts every index
+		set out to (id of w) as text
+		repeat with s in allSess
+			set out to out & " " & (id of s)
 		end repeat
 
 		-- drop the previous layout (best-effort; never hang on a prompt)
@@ -253,7 +385,6 @@ on run argv
 				end tell
 			end timeout
 		end try
-		set winResult to id of w
 	end tell
 
 	-- equalize pane sizes (needs Automation+Accessibility; best-effort)
@@ -265,10 +396,137 @@ on run argv
 		end timeout
 	end try
 
-	return winResult
+	return out
 end run
 EOF
-) || exit 1
+    ) || return 1
+    typeset -a parts
+    parts=(${=out})
+    print -r -- "${parts[1]}" > "$STATE/window"
+    print -r -- "${parts[1]}" > "$STATE/windows-created"
+    cols=()
+    local ci pos=1 line
+    for (( ci = 1; ci <= m; ci++ )); do
+        line=""
+        for (( j = 1; j <= SHAPE[ci]; j++ )); do
+            line+="${line:+ }${nords[$pos]}:${parts[pos+1]}"
+            (( pos += 1 ))
+        done
+        cols+=("$line")
+    done
+    print -rl -- "${cols[@]}" > "$STATE/layout"
+    rm -f "$STATE"/panemap/*(N)
+    rm -f "$STATE/rebuild-needed"
+}
 
-print -r -- "$out" > "$STATE/window"
-print -r -- "$out" > "$STATE/windows-created"
+# grow (and reshape) the existing window one split/close at a time
+converge() {
+    shape_for $N
+    local m=${#SHAPE}
+    if (( ${#cols} == 0 )) || (( m > ${#cols} )); then
+        full_rebuild
+        return
+    fi
+    local ci changed=0 ord nsid base want
+    typeset -a entries
+    for (( ci = 1; ci <= ${#cols}; ci++ )); do
+        entries=(${=cols[$ci]})
+        want=${SHAPE[$ci]:-0}
+        while (( ${#entries} < want )); do
+            ord=$(next_ord)
+            base="${entries[-1]#*:}"
+            if ! nsid=$(split_pane "$base" "$ord"); then
+                # a split that misses means the layout no longer matches
+                # the window — start over rather than leave them apart
+                full_rebuild
+                return
+            fi
+            entries+=("$ord:$nsid")
+            changed=1
+        done
+        while (( ${#entries} > want )); do
+            close_pane "${entries[-1]#*:}"
+            rm -f "$STATE/panemap/${entries[-1]%%:*}"
+            entries=("${(@)entries[1,-2]}")
+            changed=1
+        done
+        cols[$ci]="${entries[*]}"
+    done
+    cols=("${(@)cols:#}")
+    if (( changed )); then
+        print -rl -- "${cols[@]}" > "$STATE/layout"
+        even_arrange
+    fi
+}
+
+# close one trailing pane — only ever called when it is idle (runs are
+# packed toward the front, so with P > N the last pane shows nothing)
+do_decay() {
+    (( P > N )) || return 0
+    local li=${#cols}
+    typeset -a entries
+    entries=(${=cols[$li]})
+    # runs pack toward the front, so the last pane should be idle — but
+    # never close one that is showing something (an idle map file still
+    # holds print's newline, so test the content, not the size)
+    local lmf="$STATE/panemap/${entries[-1]%%:*}" lmap=""
+    [[ -f "$lmf" ]] && lmap=$(<"$lmf")
+    [[ -n "$lmap" ]] && return 0
+    close_pane "${entries[-1]#*:}"
+    rm -f "$STATE/panemap/${entries[-1]%%:*}"
+    entries=("${(@)entries[1,-2]}")
+    if (( ${#entries} == 0 )); then
+        cols=("${(@)cols[1,-2]}")
+    else
+        cols[$li]="${entries[*]}"
+    fi
+    print -rl -- "${cols[@]}" > "$STATE/layout"
+    touch "$STATE/decay-last"
+    even_arrange
+}
+
+# the real session ids of the window, one per line; fails if it is gone
+win_sids() {
+    osascript - "$win" <<'EOF'
+on run argv
+	set winId to (item 1 of argv) as integer
+	set out to ""
+	tell application "iTerm2"
+		repeat with t in tabs of window id winId
+			repeat with s in sessions of t
+				set out to out & (id of s) & linefeed
+			end repeat
+		end repeat
+	end tell
+	return out
+end run
+EOF
+}
+
+# does the window still exist, and does the layout file describe it?
+# splitting against a stale layout puts panes in the wrong place (and
+# the summary can't map runs to panes), so any mismatch rebuilds
+win=""
+[[ -f "$STATE/window" ]] && win=$(<"$STATE/window")
+alive=0
+layout_ok=0
+typeset -a realsids
+if [[ -n "$win" ]] && sids=$(win_sids 2>/dev/null); then
+    alive=1
+    realsids=(${(f)sids})
+    typeset -a lsids
+    lsids=()
+    for c in "${cols[@]}"; do
+        for e in ${=c}; do lsids+=("${e#*:}"); done
+    done
+    [[ "${(j: :)${(o)lsids}}" == "${(j: :)${(o)realsids}}" ]] && layout_ok=1
+fi
+
+if (( ! alive || ! layout_ok )); then
+    full_rebuild
+elif [[ "$mode" == decay ]]; then
+    do_decay
+elif (( N > P )); then
+    converge
+fi
+sync_maps

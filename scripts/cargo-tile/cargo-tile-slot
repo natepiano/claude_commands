@@ -1,16 +1,17 @@
 #!/bin/zsh
-# rev 32 — bump this comment in every cargo-tile source file on each change
-# One grid pane. Watches its slot file and displays the assigned run's
-# log via tail; shows an idle placeholder when the slot is empty. The
-# pane itself is never destroyed between runs — content just swaps.
+# rev 36 — bump this comment in every cargo-tile source file on each change
+# One layout pane, identified by a permanent ordinal. Watches its map
+# file (the log it should show) and displays it via tail; shows an idle
+# placeholder when the map is empty. Content reflows across panes as
+# the layout changes — the pane itself only ever swaps what it tails.
 set -u
 
-REVISION=32
+REVISION=36
 
 TILE_HOME="${CARGO_TILE_HOME:-$HOME/.cargo-tile}"
-STATE="$TILE_HOME/state"
+STATE=/tmp/cargo-tile/state
 N="$1"
-SLOTF="$STATE/slots/$N"
+SLOTF="$STATE/panemap/$N"
 
 # self-refresh: re-exec when the source file's rev comment changes.
 # $0 inside a zsh function is the function name, so capture it here.

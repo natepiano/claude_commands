@@ -1,14 +1,15 @@
 #!/bin/zsh
-# rev 32 — bump this comment in every cargo-tile source file on each change
+# rev 37 — bump this comment in every cargo-tile source file on each change
 # Live summary for the cargo-tile grid: revision, grid size, counts of
 # tiled runs, plus cargo processes that predate `cargo-tile on`
 # (uncapturable) — those lines disappear as the processes exit.
 set -u
 
-REVISION=32
+REVISION=37
 
 TILE_HOME="${CARGO_TILE_HOME:-$HOME/.cargo-tile}"
-STATE="$TILE_HOME/state"
+STATE=/tmp/cargo-tile/state
+ERRLOG=/tmp/cargo-tile/pane-errors.log
 
 # self-refresh: re-exec when the source file's rev comment changes.
 # $0 inside a zsh function is the function name, so capture it here.
@@ -42,6 +43,14 @@ printf '\033]0;cargo-tile summary\007'
 while true; do
     rev="$(src_rev)"
     [[ -n "$rev" && "$rev" != "$REVISION" ]] && exec "$SELF"
+
+    # a sandboxed caller can't drive iTerm — do its deferred grid
+    # rebuild (growth, retreat, window recovery) on its behalf
+    if [[ -f "$STATE/rebuild-needed" ]]; then
+        rm -f "$STATE/rebuild-needed"
+        "$TILE_HOME/bin/cargo-tile-pane" --check \
+            >/dev/null 2>>"$ERRLOG" &!
+    fi
 
     cols=$(tput cols 2>/dev/null) || cols=80
 
@@ -112,8 +121,16 @@ while true; do
         done
     fi
 
-    k=1
-    [[ -f "$STATE/grid" ]] && k=$(<"$STATE/grid")
+    # pane layout: total pane count and the column shape (e.g. 3+3+1)
+    P=0
+    shapestr=""
+    if [[ -s "$STATE/layout" ]]; then
+        while IFS= read -r lline; do
+            wn=${#${=lline}}
+            (( P += wn ))
+            shapestr+="${shapestr:+ + }$wn"
+        done < "$STATE/layout"
+    fi
     shown=0
     for sf in "$STATE"/slots/*(N); do
         [[ -s "$sf" ]] || continue
@@ -126,10 +143,28 @@ while true; do
         if [[ "$lpid" == <-> ]] && ! kill -0 "$lpid" 2>/dev/null; then
             if (( $(date +%s) - $(stat -f %m "$l" 2>/dev/null || echo 0) > 10 )); then
                 "$TILE_HOME/bin/cargo-tile-pane" --remove "$l" \
-                    >/dev/null 2>>"$TILE_HOME/pane-errors.log" &!
+                    >/dev/null 2>>"$ERRLOG" &!
             fi
         fi
     done
+
+    # self-heal: more runs than panes with no pending marker means an
+    # add was dropped or a split failed — request a converge
+    want=$(( shown + 1 ))
+    (( want > 36 )) && want=36
+    if (( want > P )) && [[ ! -f "$STATE/rebuild-needed" ]]; then
+        touch "$STATE/rebuild-needed"
+    fi
+
+    # decay: with more panes than tiles, close one trailing idle pane
+    # per minute (the pane script guards against closing a busy one)
+    if (( P <= shown + 1 )) || [[ ! -f "$STATE/decay-last" ]]; then
+        touch "$STATE/decay-last"
+    elif (( $(date +%s) - $(stat -f %m "$STATE/decay-last") >= 60 )); then
+        touch "$STATE/decay-last"
+        "$TILE_HOME/bin/cargo-tile-pane" --decay \
+            >/dev/null 2>>"$ERRLOG" &!
+    fi
 
     # pre-existing cargo processes: snapshot taken at `cargo-tile on`,
     # pruned as they exit
@@ -144,9 +179,9 @@ while true; do
 
     buf=""
     buf+=$'\033[1;36mcargo-tile\033[0m  \033[35mrev '"$REVISION"$'\033[0m  \033[2m'"$(date '+%H:%M:%S')"$'\033[0m\n\n'
-    buf+=$'\033[1mgrid:\033[0m             '"${k}x${k}"$'\n'
+    buf+=$'\033[1mpanes:\033[0m            '"${shapestr:-none} ($P)"$'\n'
     buf+=$'\033[1mrunning (tiled):\033[0m  '"$running"$'\n'
-    buf+=$'\033[1mslots in use:\033[0m     '"$shown / $(( k * k - 1 ))"$'\n'
+    buf+=$'\033[1mtiles in use:\033[0m     '"$(( shown + 1 )) / $P"$'\n'
     if (( ${#active} > 0 )); then
         pw=4   # "path"
         dw=3   # "pid"
@@ -219,7 +254,7 @@ while true; do
         # placeholder shows for a minute after `on` (or after the last
         # pre-existing process exits), then the section vanishes
         ref="$STATE/pre-last"
-        [[ -f "$ref" ]] || ref="$STATE/active"
+        [[ -f "$ref" ]] || ref="$TILE_HOME/active"
         if [[ -f "$ref" ]] && (( $(date +%s) - $(stat -f %m "$ref") < 60 )); then
             buf+=$'\n\033[2mno pre-existing cargo processes\033[0m\n'
         fi
