@@ -28,7 +28,9 @@ Convergence stop conditions, all computed from recorded state:
   * the blind review was canceled more than `MAX_REVIEW_CANCELLATIONS` times
   * a runaway backstop at `RUNAWAY_ROUNDS` rounds
 
-Every one of those limits is set in `~/.claude/config/delegate.conf`.
+Every one of those limits is set in `~/.claude/config/delegate.conf`, which is
+authoritative: no limit has a compiled default, and a missing or unusable value
+stops the run before any command executes.
 
 Findings live in `<session_dir>/findings_state.json` and are also appended to
 the run's durable event stream when `progress_history.py` has started a run.
@@ -63,19 +65,31 @@ STATE_OPEN = "open"
 STATE_PENDING = "fixed_pending_review"
 STATE_ACCEPTED = "accepted"
 
-# Every convergence limit is tunable in `~/.claude/config/delegate.conf`; the
-# values here are the fallbacks when a key is missing or unusable, and the file
-# documents what each one bounds. `PLAN_DELEGATE_CONFIG` overrides the path so
-# the tests read a fixture rather than the machine's live settings.
+# Every convergence limit is set in `~/.claude/config/delegate.conf` and nowhere
+# else -- there are no compiled defaults, so a missing key or an unusable value
+# stops the run instead of quietly substituting a limit nobody chose. Problems
+# accumulate and are reported together, so one run fixes the whole file rather
+# than one key per attempt. `PLAN_DELEGATE_CONFIG` overrides the path so the
+# tests read a fixture rather than the machine's live settings.
 DEFAULT_CONFIG_PATH = Path("~/.claude/config/delegate.conf").expanduser()
+
+_CONFIG_PROBLEMS: list[str] = []
+
+
+def _config_path() -> Path:
+    configured = os.environ.get("PLAN_DELEGATE_CONFIG")
+    return Path(configured) if configured else DEFAULT_CONFIG_PATH
 
 
 def _config_values() -> dict[str, str]:
-    configured = os.environ.get("PLAN_DELEGATE_CONFIG")
-    path = Path(configured) if configured else DEFAULT_CONFIG_PATH
+    path = _config_path()
     try:
         text = path.read_text(encoding="utf-8")
-    except OSError:
+    except OSError as error:
+        # Stop here: a file nobody can read would otherwise report every key as
+        # unset, burying the one problem that matters.
+        _CONFIG_PROBLEMS.append(f"the file cannot be read ({error.strerror})")
+        _require_usable_config()
         return {}
     values: dict[str, str] = {}
     for line in text.splitlines():
@@ -86,66 +100,76 @@ def _config_values() -> dict[str, str]:
     return values
 
 
-def _config_warn(key: str, raw: str, default: object) -> None:
-    print(
-        f"delegate.conf: {key}={raw} is not usable; falling back to {default}",
-        file=sys.stderr,
-    )
-
-
-def _configured_int(values: dict[str, str], key: str, default: int, minimum: int = 1) -> int:
+def _configured_int(values: dict[str, str], key: str, minimum: int = 1) -> int:
+    """Read one integer limit. Records a problem and returns a placeholder when unusable."""
     raw = values.get(key)
     if raw is None:
-        return default
+        _CONFIG_PROBLEMS.append(f"{key} is not set")
+        return minimum
     try:
         parsed = int(raw)
     except ValueError:
-        _config_warn(key, raw, default)
-        return default
+        _CONFIG_PROBLEMS.append(f"{key}={raw} is not a whole number")
+        return minimum
     if parsed < minimum:
-        _config_warn(key, raw, default)
-        return default
+        _CONFIG_PROBLEMS.append(f"{key}={raw} is below the minimum of {minimum}")
+        return minimum
     return parsed
 
 
-def _configured_float(values: dict[str, str], key: str, default: float) -> float:
+def _configured_float(values: dict[str, str], key: str) -> float:
+    """Read one rate. Records a problem and returns a placeholder when unusable."""
     raw = values.get(key)
     if raw is None:
-        return default
+        _CONFIG_PROBLEMS.append(f"{key} is not set")
+        return 1.0
     try:
         parsed = float(raw)
     except ValueError:
-        _config_warn(key, raw, default)
-        return default
+        _CONFIG_PROBLEMS.append(f"{key}={raw} is not a number")
+        return 1.0
     if parsed <= 0:
-        _config_warn(key, raw, default)
-        return default
+        _CONFIG_PROBLEMS.append(f"{key}={raw} is not greater than 0")
+        return 1.0
     return parsed
+
+
+def _require_usable_config() -> None:
+    """Exit before any command runs when the configuration cannot be trusted."""
+    if not _CONFIG_PROBLEMS:
+        return
+    print(f"delegate.conf ({_config_path()}) is not usable:", file=sys.stderr)
+    for problem in _CONFIG_PROBLEMS:
+        print(f"  - {problem}", file=sys.stderr)
+    print("Every convergence limit must be set; there are no defaults.", file=sys.stderr)
+    raise SystemExit(2)
 
 
 _CONFIG = _config_values()
 
-MAX_FIX_ATTEMPTS = _configured_int(_CONFIG, "MAX_FIX_ATTEMPTS", 2)
-MAX_REOPENS = _configured_int(_CONFIG, "MAX_REOPENS", 2)
-STALLED_ROUNDS = _configured_int(_CONFIG, "STALLED_ROUNDS", 2)
-RUNAWAY_ROUNDS = _configured_int(_CONFIG, "RUNAWAY_ROUNDS", 5)
+MAX_FIX_ATTEMPTS = _configured_int(_CONFIG, "MAX_FIX_ATTEMPTS")
+MAX_REOPENS = _configured_int(_CONFIG, "MAX_REOPENS")
+STALLED_ROUNDS = _configured_int(_CONFIG, "STALLED_ROUNDS")
+RUNAWAY_ROUNDS = _configured_int(_CONFIG, "RUNAWAY_ROUNDS")
 
 # Repairs are dispatched one batch per round, so N confirmed findings should
 # close in about N/2 rounds. A phase that needs materially more than that is
 # bleeding slowly rather than converging -- the stalled-count test never trips
 # on 8 -> 7 -> 6 -> 5, and that pattern is what used to run to the backstop.
 # The floor is what a phase gets regardless of its first-round count.
-REPAIR_ROUNDS_PER_FINDING = _configured_float(_CONFIG, "REPAIR_ROUNDS_PER_FINDING", 0.5)
-MIN_REPAIR_BUDGET = _configured_int(_CONFIG, "MIN_REPAIR_BUDGET", 3)
+REPAIR_ROUNDS_PER_FINDING = _configured_float(_CONFIG, "REPAIR_ROUNDS_PER_FINDING")
+MIN_REPAIR_BUDGET = _configured_int(_CONFIG, "MIN_REPAIR_BUDGET")
 
 # Re-dispatching the same pass kind over and over inside one phase is itself a
 # convergence failure: observed as six consecutive implementation passes and as
 # back-to-back failed fix passes, neither of which the ledger could see.
-MAX_CONSECUTIVE_SAME_KIND_PASSES = _configured_int(_CONFIG, "MAX_CONSECUTIVE_SAME_KIND_PASSES", 3)
+MAX_CONSECUTIVE_SAME_KIND_PASSES = _configured_int(_CONFIG, "MAX_CONSECUTIVE_SAME_KIND_PASSES")
 
 # <DualReview/> may preempt one obsolete blind review per phase. A second
 # cancellation means the broad review is never completing.
-MAX_REVIEW_CANCELLATIONS = _configured_int(_CONFIG, "MAX_REVIEW_CANCELLATIONS", 1, minimum=0)
+MAX_REVIEW_CANCELLATIONS = _configured_int(_CONFIG, "MAX_REVIEW_CANCELLATIONS", minimum=0)
+
+_require_usable_config()
 
 
 def _now_epoch() -> float:

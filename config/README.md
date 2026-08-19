@@ -50,21 +50,31 @@ the SKIPPED line), or run it as the `/lint_config` CLI. Edits need
 
 ## delegate.conf
 
-The `/plan:delegate` convergence limits — how many automatic fix rounds one
-phase gets before the run stops and asks the user. `MIN_REPAIR_BUDGET` is the
-floor every phase gets regardless of finding count (3);
+The `/plan:delegate` tuning file: the convergence limits — how many automatic
+fix rounds one phase gets before the run stops and asks the user — plus the
+progress-report interval. `MIN_REPAIR_BUDGET` is the floor every phase gets
+regardless of finding count (3);
 `REPAIR_ROUNDS_PER_FINDING` scales the budget above that floor from the first
 round's gating count (0.5, so 8 findings buy 4 rounds); `RUNAWAY_ROUNDS` is the
 hard ceiling (5). The rest bound the other stop conditions:
 `MAX_FIX_ATTEMPTS`, `MAX_REOPENS`, `STALLED_ROUNDS`,
 `MAX_CONSECUTIVE_SAME_KIND_PASSES`, `MAX_REVIEW_CANCELLATIONS`.
 
+`PLAN_DELEGATE_PROGRESS_INTERVAL_SECONDS` is the odd one out: seconds between
+user-facing progress reports while a phase is active, read by
+`scripts/delegate/progress_timer.sh` and by the main agent per
+`<ProgressContract/>` in `commands/plan/delegate.md` rather than by
+`findings.py`. It has no default either — a missing or non-positive-integer
+value makes `progress_timer.sh` exit non-zero instead of timing at a length
+nobody chose.
+
 `scripts/delegate/findings.py` reads the file at startup, so an edit applies to
-the next `findings.py gate` with nothing to restart. A missing key, a
-non-numeric value, or a value below its minimum falls back to the default
-compiled into that script and warns on stderr. `PLAN_DELEGATE_CONFIG` overrides
-the path, which is how `test_findings.py` stays independent of this machine's
-values. Edits need `dangerouslyDisableSandbox: true` — the sandbox denies
+the next `findings.py gate` with nothing to restart. The file is authoritative:
+no limit has a compiled default, so a missing key, a non-numeric value, or a
+value below its minimum makes `findings.py` list every problem it found and
+exit 2 before running the command. `PLAN_DELEGATE_CONFIG` overrides the path,
+which is how `test_findings.py` supplies its own limits rather than this
+machine's. Edits need `dangerouslyDisableSandbox: true` — the sandbox denies
 writes under `~/.claude/config`.
 
 One automatic mechanical-cleanup round can still run past a spent repair
@@ -82,10 +92,3 @@ MCP server definitions for reference when setting up Claude Code on a new machin
 ## orphans_expected.json
 
 Files that the `/orphans` command should ignore when checking for unreferenced scripts and configs. Lists scripts and config files that are intentionally not referenced by any command.
-
-## timings.conf
-
-Shared workflow timing values expressed in seconds. `/plan:delegate` reads
-`PLAN_DELEGATE_PROGRESS_INTERVAL_SECONDS` before each progress-enabled Codex
-poll or Claude timer. The value must be a positive integer; invalid or missing
-values fall back to 240 seconds.

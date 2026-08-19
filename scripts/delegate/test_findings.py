@@ -14,6 +14,20 @@ from typing import cast, override
 
 SCRIPT = Path(__file__).with_name("findings.py")
 
+# findings.py has no compiled limits, so every run needs a complete config.
+# These are the machine's shipped values; a test that cares about one limit
+# overrides just that key on top of them.
+STANDARD_CONFIG = """\
+MIN_REPAIR_BUDGET=3
+REPAIR_ROUNDS_PER_FINDING=0.5
+RUNAWAY_ROUNDS=5
+MAX_FIX_ATTEMPTS=2
+MAX_REOPENS=2
+STALLED_ROUNDS=2
+MAX_CONSECUTIVE_SAME_KIND_PASSES=3
+MAX_REVIEW_CANCELLATIONS=1
+"""
+
 
 class FindingsLedgerTests(unittest.TestCase):
     temporary: tempfile.TemporaryDirectory[str]  # pyright: ignore[reportUninitializedInstanceVariable]
@@ -30,6 +44,7 @@ class FindingsLedgerTests(unittest.TestCase):
         self.session_dir.mkdir()
         self.history_file = self.root / "history" / "run.jsonl"
         self.config_file = self.root / "delegate.conf"
+        self.write_config("")
 
     @override
     def tearDown(self) -> None:
@@ -43,6 +58,11 @@ class FindingsLedgerTests(unittest.TestCase):
         return environment
 
     def write_config(self, text: str) -> None:
+        """Write the standard limits with `text` appended; a repeated key there wins."""
+        _ = self.config_file.write_text(STANDARD_CONFIG + text, encoding="utf-8")
+
+    def write_partial_config(self, text: str) -> None:
+        """Write `text` as the whole file, standard limits omitted."""
         _ = self.config_file.write_text(text, encoding="utf-8")
 
     def run_command(self, *arguments: str, at: int = 1_000) -> str:
@@ -278,17 +298,29 @@ class FindingsLedgerTests(unittest.TestCase):
         payload = self.gate()
         self.assertEqual(payload["verdict"], "dispatch")
 
-    def test_an_unusable_config_value_falls_back_to_the_default(self) -> None:
-        """A bad value warns on stderr and leaves the compiled floor in place."""
+    def test_an_unusable_config_value_stops_the_run(self) -> None:
+        """A bad value is an error, not a fall back to some compiled limit."""
         self.write_config("MIN_REPAIR_BUDGET=zero\n")
-        _ = self.open_finding("blocker", "first")
-        self.close_round(["F001"])
-        _ = self.open_finding("blocker", "second")
         result = self.run_failing_command("gate")
-        self.assertEqual(result.returncode, 0)
-        self.assertIn("MIN_REPAIR_BUDGET=zero is not usable", result.stderr)
-        payload = cast(dict[str, object], json.loads(result.stdout))
-        self.assertEqual(payload["repair_budget"], 3)
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("MIN_REPAIR_BUDGET=zero is not a whole number", result.stderr)
+        self.assertEqual(result.stdout, "")
+
+    def test_a_missing_config_key_stops_the_run(self) -> None:
+        """Every limit must be set, and one run names all of the missing ones."""
+        self.write_partial_config("MIN_REPAIR_BUDGET=3\n")
+        result = self.run_failing_command("gate")
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("RUNAWAY_ROUNDS is not set", result.stderr)
+        self.assertIn("MAX_REVIEW_CANCELLATIONS is not set", result.stderr)
+        self.assertNotIn("MIN_REPAIR_BUDGET", result.stderr)
+
+    def test_a_missing_config_file_stops_the_run(self) -> None:
+        """No config at all is the same error, not a run on defaults."""
+        self.config_file.unlink()
+        result = self.run_failing_command("gate")
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("cannot be read", result.stderr)
 
     def test_repair_budget_scales_with_the_original_finding_count(self) -> None:
         """Eight findings buy four rounds; two buy the floor of three."""

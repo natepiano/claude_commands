@@ -315,8 +315,9 @@ counts all describe the wrong phase.
 The main agent produces progress reports from the plan, launcher state,
 heartbeat, and live diff. Before every progress-enabled wait, set
 `${PROGRESS_INTERVAL_SECONDS}` from `PLAN_DELEGATE_PROGRESS_INTERVAL_SECONDS`
-in `~/.claude/config/timings.conf`; use 240 when it is missing or not a positive
-integer. This is the Claude timer delay and Codex poll timeout.
+in `~/.claude/config/delegate.conf`. This is the Claude timer delay and Codex
+poll timeout. There is no default: if the key is missing or is not a positive
+integer, stop and tell the user to set it rather than picking a value.
 
 Claude: while any work is running and progress is enabled, keep exactly one
 one-shot timer in a managed background terminal. Launch:

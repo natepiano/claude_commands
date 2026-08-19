@@ -182,7 +182,8 @@ interrupted, because progress is measured, not counted.
 The repair budget is the first round's gating count times
 `REPAIR_ROUNDS_PER_FINDING`, never below `MIN_REPAIR_BUDGET`. All of these
 limits are set in `~/.claude/config/delegate.conf`, read at startup by
-`findings.py`; the shipped values give a phase 3 automatic fix rounds at
+`findings.py` and required there — an absent or unusable value exits 2 rather
+than falling back. The shipped values give a phase 3 automatic fix rounds at
 minimum and 5 at most.
 
 ## Commands

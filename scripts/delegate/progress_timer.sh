@@ -17,15 +17,21 @@ set -euo pipefail
 SESSION_DIR="${1:?Usage: progress_timer.sh <session_dir> [seconds]}"
 SECONDS_TO_WAIT="${2:-}"
 
-TIMINGS_CONF="${HOME}/.claude/config/timings.conf"
+DELEGATE_CONF="${HOME}/.claude/config/delegate.conf"
+INTERVAL_ORIGIN="argument"
 if [[ -z "${SECONDS_TO_WAIT}" ]]; then
+  INTERVAL_ORIGIN="PLAN_DELEGATE_PROGRESS_INTERVAL_SECONDS in ${DELEGATE_CONF}"
   SECONDS_TO_WAIT="$(
     sed -n 's/^PLAN_DELEGATE_PROGRESS_INTERVAL_SECONDS=\([0-9][0-9]*\).*/\1/p' \
-      "${TIMINGS_CONF}" 2>/dev/null | head -1
+      "${DELEGATE_CONF}" 2>/dev/null | head -1
   )"
 fi
+# No default interval: an unconfigured timer would run at a length nobody chose,
+# so fail loudly and let the caller fix the config.
 if [[ ! "${SECONDS_TO_WAIT}" =~ ^[0-9]+$ ]] || (( SECONDS_TO_WAIT <= 0 )); then
-  SECONDS_TO_WAIT=240
+  printf 'progress_timer.sh: interval from %s is not a positive integer: %s\n' \
+    "${INTERVAL_ORIGIN}" "${SECONDS_TO_WAIT:-<empty>}" >&2
+  exit 1
 fi
 
 MARKER="${SESSION_DIR}/progress_timer"
