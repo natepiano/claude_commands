@@ -1,15 +1,20 @@
 #!/bin/zsh
-# rev 49 — bump this comment in every cargo-tile source file on each change
+# rev 51 — bump this comment in every cargo-tile source file on each change
 # One layout pane, identified by a permanent ordinal. Watches its map
 # file (the log it should show) and displays it via tail; shows an idle
 # placeholder when the map is empty. Content reflows across panes as
 # the layout changes — the pane itself only ever swaps what it tails.
 set -u
 
-REVISION=49
+REVISION=51
 
 TILE_HOME="${CARGO_TILE_HOME:-$HOME/.cargo-tile}"
 STATE=/tmp/cargo-tile/state
+
+# idle panes close this many seconds after their content leaves them;
+# cargo-tile-pane, cargo-tile-slot and cargo-tile-summary must agree
+DECAY_SECS=15
+
 N="$1"
 SLOTF="$STATE/panemap/$N"
 
@@ -27,32 +32,40 @@ cur="__init__"
 last_rev_check=0
 last_idle_tick=0
 
-# countdown to this pane's decay, empty if it will survive. Decay
-# closes the flatten-order tail once per 15s, so the pane at reverse
-# position r goes at decay-last + r*15s; panes inside the runs+1
-# target are keepers awaiting refill and show nothing.
+# countdown for the trailing pane — the only one decay can close, so
+# the only one with a deadline to show. Its DECAY_SECS runs from
+# whichever came later: the moment its own content left (the map file
+# is rewritten only when what the pane shows changes, so its mtime is
+# that moment) or the moment it became the trailing pane, which is the
+# close in front of it stamping decay-last. Idle panes further up wait
+# silently and start their own DECAY_SECS when that close lands, so one
+# pane drops off every DECAY_SECS. Panes inside the runs+1 target are
+# keepers awaiting refill and show nothing.
 idle_line() {
     [[ -s "$STATE/layout" ]] || return 0
-    local -a lw
-    local lline e P=0 mine=0
+    local -a lw ords
+    local lline e i mine=0 P
+    ords=()
     while IFS= read -r lline; do
         lw=(${=lline})
-        for e in "${lw[@]}"; do
-            (( P += 1 ))
-            [[ "${e%%:*}" == "$N" ]] && mine=$P
-        done
+        for e in "${lw[@]}"; do ords+=("${e%%:*}"); done
     done < "$STATE/layout"
-    (( mine )) || return 0
+    P=${#ords}
+    for (( i = 1; i <= P; i++ )); do
+        [[ "${ords[$i]}" == "$N" ]] && mine=$i
+    done
+    (( mine == P && P > 1 )) || return 0
     local shown=0 mf
     for mf in "$STATE"/panemap/*(N); do
         [[ -n "$(<"$mf")" ]] && (( shown += 1 ))
     done
-    local doomed=$(( P - shown - 1 ))
-    local r=$(( P - mine + 1 ))
-    (( doomed > 0 && r <= doomed )) || return 0
-    local dl=0
-    [[ -f "$STATE/decay-last" ]] && dl=$(stat -f %m "$STATE/decay-last" 2>/dev/null)
-    local rem=$(( dl + 15 * r - $(date +%s) ))
+    (( P - shown - 1 > 0 )) || return 0
+    local now mt dl
+    now=$(date +%s)
+    mt=$(stat -f %m "$STATE/panemap/$N" 2>/dev/null) || mt=$now
+    dl=$(stat -f %m "$STATE/decay-last" 2>/dev/null) || dl=0
+    (( mt > dl )) && dl=$mt
+    local rem=$(( dl + DECAY_SECS - now ))
     # decay pauses while the summary is mid-rebuild or the closer is
     # waiting on the layout lock — say so instead of freezing at 0:00
     if (( rem <= 0 )); then

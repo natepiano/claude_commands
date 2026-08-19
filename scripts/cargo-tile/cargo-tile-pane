@@ -1,10 +1,10 @@
 #!/bin/zsh
-# rev 49 — bump this comment in every cargo-tile source file on each change
+# rev 51 — bump this comment in every cargo-tile source file on each change
 # Assign runs to the cargo-tile pane layout.
 #   cargo-tile-pane <log>           add a run
 #   cargo-tile-pane --remove <log>  drop a finished run
 #   cargo-tile-pane --check         converge layout (deferred work, recovery)
-#   cargo-tile-pane --decay         close one trailing idle pane
+#   cargo-tile-pane --decay         close the trailing idle pane
 #
 # Tile 1 is the summary; runs fill tiles 2..N in snake order (down
 # column 1, then column 2, ...). For N tiles, k = ceil(sqrt(N)):
@@ -13,8 +13,9 @@
 # arrive; a new COLUMN can't be made from a session split, so only
 # column growth (N = 3, 7, 13, 21, 31) rebuilds the window. When runs
 # leave, content shifts up (slots stay packed), trailing panes go idle
-# in place, and --decay closes one per minute so they can be refilled
-# without churn.
+# in place, and --decay closes the trailing one DECAY_SECS after it
+# cleared or after the close in front of it, whichever came later — so
+# a refilled pane starts over and idle panes drop off one at a time.
 #
 # state/slots/<pos>  packed run logs, positions 2.. in snake order
 # state/layout       one line per column: "ord:sessionid ..." top-down
@@ -25,6 +26,10 @@ set -u
 TILE_HOME="${CARGO_TILE_HOME:-$HOME/.cargo-tile}"
 STATE=/tmp/cargo-tile/state
 ERRLOG=/tmp/cargo-tile/pane-errors.log
+
+# idle panes close this many seconds after their content leaves them;
+# cargo-tile-pane, cargo-tile-slot and cargo-tile-summary must agree
+DECAY_SECS=15
 
 mode=add
 case "${1:-}" in
@@ -619,8 +624,13 @@ converge() {
     fi
 }
 
-# close one trailing pane — only ever called when it is idle (runs are
-# packed toward the front, so with P > N the last pane shows nothing)
+# close the one trailing pane, once its DECAY_SECS is up. That window
+# runs from whichever came later: the moment its own content left (its
+# map file is rewritten only when what the pane shows changes, so its
+# mtime is that moment) or the moment it became the trailing pane —
+# decay-last, stamped by the close in front of it. So a refilled pane
+# starts over, and a row of idle panes drops off one per DECAY_SECS
+# rather than all at once.
 do_decay() {
     (( P > N )) || return 0
     local li=${#cols}
@@ -629,11 +639,20 @@ do_decay() {
     # runs pack toward the front, so the last pane should be idle — but
     # never close one that is showing something (an idle map file still
     # holds print's newline, so test the content, not the size)
-    local lmf="$STATE/panemap/${entries[-1]%%:*}" lmap=""
-    [[ -f "$lmf" ]] && lmap=$(<"$lmf")
+    local ord="${entries[-1]%%:*}"
+    local mf="$STATE/panemap/$ord" lmap=""
+    [[ -f "$mf" ]] && lmap=$(<"$mf")
     [[ -n "$lmap" ]] && return 0
+    local now mt dl
+    now=$(date +%s)
+    # no map file yet (a pane converge just made): sync_maps writes one
+    # on the way out and it decays a full window later
+    mt=$(stat -f %m "$mf" 2>/dev/null) || mt=$now
+    dl=$(stat -f %m "$STATE/decay-last" 2>/dev/null) || dl=0
+    (( mt > dl )) && dl=$mt
+    (( now - dl >= DECAY_SECS )) || return 0
     close_pane "${entries[-1]#*:}"
-    rm -f "$STATE/panemap/${entries[-1]%%:*}"
+    rm -f "$mf"
     entries=("${(@)entries[1,-2]}")
     if (( ${#entries} == 0 )); then
         cols=("${(@)cols[1,-2]}")
@@ -641,6 +660,8 @@ do_decay() {
         cols[$li]="${entries[*]}"
     fi
     print -rl -- "${cols[@]}" > "$STATE/layout"
+    # this is also when the pane behind it became the trailing one, and
+    # so when its own DECAY_SECS starts
     touch "$STATE/decay-last"
     even_arrange
 }

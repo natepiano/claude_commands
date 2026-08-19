@@ -1,5 +1,5 @@
 #!/bin/zsh
-# rev 49 — bump this comment in every cargo-tile source file on each change
+# rev 51 — bump this comment in every cargo-tile source file on each change
 # Control command for cargo run tiling in iTerm2.
 set -u
 
