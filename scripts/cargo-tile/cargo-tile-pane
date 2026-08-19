@@ -1,5 +1,5 @@
 #!/bin/zsh
-# rev 16 — bump this comment in every cargo-tile source file on each change
+# rev 32 — bump this comment in every cargo-tile source file on each change
 # Assign runs to the cargo-tile slot grid.
 #   cargo-tile-pane <log>           add a run
 #   cargo-tile-pane --remove <log>  drop a finished run (slot goes idle)

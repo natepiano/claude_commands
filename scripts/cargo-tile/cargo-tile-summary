@@ -1,40 +1,134 @@
 #!/bin/zsh
-# rev 16 — bump this comment in every cargo-tile source file on each change
+# rev 32 — bump this comment in every cargo-tile source file on each change
 # Live summary for the cargo-tile grid: revision, grid size, counts of
 # tiled runs, plus cargo processes that predate `cargo-tile on`
 # (uncapturable) — those lines disappear as the processes exit.
 set -u
 
-REVISION=16
+REVISION=32
 
 TILE_HOME="${CARGO_TILE_HOME:-$HOME/.cargo-tile}"
 STATE="$TILE_HOME/state"
 
-printf '\033]2;cargo-tile summary\007'
+# self-refresh: re-exec when the source file's rev comment changes.
+# $0 inside a zsh function is the function name, so capture it here.
+SELF="$0"
+src_rev() { sed -n '2s/^# rev \([0-9]*\).*/\1/p' "$SELF" 2>/dev/null; }
+
+# nearest descendant of a registered (shim) pid whose executable is
+# cargo — the shim pid itself is a zsh wrapper over script(1), so the
+# lock heuristic must look at the real cargo root underneath
+cargo_root() {
+    typeset -a queue
+    queue=($1)
+    local q i=0
+    while (( ${#queue} > 0 && i < 100 )); do
+        q=${queue[1]}
+        queue=(${queue[2,-1]})
+        (( i += 1 ))
+        if [[ "$q" != "$1" && "${comm_of[$q]:-}" == *cargo* ]]; then
+            print -r -- "$q"
+            return 0
+        fi
+        queue+=(${=${child_of[$q]:-}})
+    done
+    return 1
+}
+
+# OSC 0 sets the session name (what iTerm displays), not just the
+# window title
+printf '\033]0;cargo-tile summary\007'
 
 while true; do
+    rev="$(src_rev)"
+    [[ -n "$rev" && "$rev" != "$REVISION" ]] && exec "$SELF"
+
     cols=$(tput cols 2>/dev/null) || cols=80
 
     # tiled runs still executing (pid files cleaned up by the shim);
-    # collect "path TAB command" lines for the alphabetical list
+    # collect "epoch TAB path TAB pid TAB command" lines, oldest first —
+    # the pid file's mtime is the run's start time
     running=0
+    now=$(date +%s)
     typeset -a active
     active=()
     for f in "$STATE"/pids/*(N); do
         if kill -0 "${f:t}" 2>/dev/null; then
             (( running += 1 ))
-            [[ -s "$f" ]] && active+=("$(<"$f")")
+            if [[ -s "$f" ]]; then
+                entry="$(<"$f")"
+                ep=$(stat -f %m "$f" 2>/dev/null) || ep=$now
+                active+=("$ep	${entry%%	*}	${f:t}	${entry#*	}")
+            fi
         else
             rm -f "$f"
         fi
     done
-    (( ${#active} > 0 )) && active=(${(o)active})
+    (( ${#active} > 0 )) && active=(${(on)active})
+
+    # lock contention (cargo-port's heuristic, approximated): runs sharing
+    # a path serialize behind cargo's build-directory lock. The one with
+    # child processes or measurable CPU is the holder; a parked root sits
+    # in flock with neither. Claim nothing unless exactly one candidate.
+    typeset -A path_pids blocked_by
+    path_pids=()
+    blocked_by=()
+    for entry in "${active[@]}"; do
+        rest="${entry#*	}"
+        rpath="${rest%%	*}"
+        rest="${rest#*	}"
+        path_pids[$rpath]+="${rest%%	*} "
+    done
+    contended=0
+    for p in "${(k)path_pids[@]}"; do
+        [[ "${path_pids[$p]}" == *' '*' '* ]] && contended=1
+    done
+    if (( contended )); then
+        typeset -A cpu_of child_of comm_of
+        cpu_of=()
+        child_of=()
+        comm_of=()
+        while read -r p pp pc cm; do
+            cpu_of[$p]="$pc"
+            comm_of[$p]="$cm"
+            child_of[$pp]+="$p "
+        done < <(ps -axo pid=,ppid=,pcpu=,comm= 2>/dev/null)
+        for p in "${(k)path_pids[@]}"; do
+            typeset -a group holders
+            group=(${=path_pids[$p]})
+            (( ${#group} < 2 )) && continue
+            holders=()
+            for pid in "${group[@]}"; do
+                croot=$(cargo_root "$pid") || continue
+                if [[ -n "${child_of[$croot]:-}" ]] || (( ${cpu_of[$croot]:-0} > 1.0 )); then
+                    holders+=("$pid")
+                fi
+            done
+            if (( ${#holders} == 1 )); then
+                for pid in "${group[@]}"; do
+                    [[ "$pid" != "${holders[1]}" ]] && blocked_by[$pid]="${holders[1]}"
+                done
+            fi
+        done
+    fi
 
     k=1
     [[ -f "$STATE/grid" ]] && k=$(<"$STATE/grid")
     shown=0
     for sf in "$STATE"/slots/*(N); do
-        [[ -s "$sf" ]] && (( shown += 1 ))
+        [[ -s "$sf" ]] || continue
+        (( shown += 1 ))
+        # reap slots whose run is gone — adopted runs have no shim to
+        # call --remove. The log name embeds the root pid; 10s of quiet
+        # keeps this from racing the shim's own exit-banner linger.
+        l=$(<"$sf")
+        lpid="${${l:t:r}##*-}"
+        if [[ "$lpid" == <-> ]] && ! kill -0 "$lpid" 2>/dev/null; then
+            if (( $(date +%s) - $(stat -f %m "$l" 2>/dev/null || echo 0) > 10 )); then
+                "$TILE_HOME/bin/cargo-tile-pane" --remove "$l" \
+                    >/dev/null 2>>"$TILE_HOME/pane-errors.log" &!
+            fi
+        fi
     done
 
     # pre-existing cargo processes: snapshot taken at `cargo-tile on`,
@@ -54,17 +148,59 @@ while true; do
     buf+=$'\033[1mrunning (tiled):\033[0m  '"$running"$'\n'
     buf+=$'\033[1mslots in use:\033[0m     '"$shown / $(( k * k - 1 ))"$'\n'
     if (( ${#active} > 0 )); then
-        buf+=$'\n\033[1mactive:\033[0m\n'
+        pw=4   # "path"
+        dw=3   # "pid"
+        bw=7   # "blocker"
+        sw=5   # "start" / "hh:mm"
+        cw=7   # "command"
+        show_hours=0
         for entry in "${active[@]}"; do
-            rpath="${entry%%	*}"
-            rcmd="${entry#*	}"
-            if (( ${#rpath} + ${#rcmd} + 4 <= cols )); then
-                buf+="  ${rpath}  "$'\033[36m'"${rcmd}"$'\033[0m\n'
+            ep="${entry%%	*}"
+            rest="${entry#*	}"
+            rpath="${rest%%	*}"
+            rest="${rest#*	}"
+            rpid="${rest%%	*}"
+            rcmd="${rest#*	}"
+            (( ${#rpath} > pw )) && pw=${#rpath}
+            (( ${#rpid} > dw )) && dw=${#rpid}
+            (( ${#rcmd} > cw )) && cw=${#rcmd}
+            (( now - ep > 3599 )) && show_hours=1
+        done
+        uw=5   # "mm:ss"; hh:mm:ss when any run passes the hour
+        (( show_hours )) && uw=8
+        # the path is never cut — a too-wide row clamps the command
+        # (its color codes wrap the whole field, so cutting is safe)
+        cmd_avail=$(( cols - (pw + dw + bw + sw + uw + 12) ))
+        (( cmd_avail < 0 )) && cmd_avail=0
+        buf+=$'\n\033[1mactive:\033[0m\n'
+        buf+=$'\033[2m'"$(printf '  %-*s  %-*s  %-*s  %-*s  %-*s  %s' "$pw" path "$dw" pid "$bw" blocker "$sw" start "$uw" dur command)"$'\033[0m\n'
+        for entry in "${active[@]}"; do
+            ep="${entry%%	*}"
+            rest="${entry#*	}"
+            rpath="${rest%%	*}"
+            rest="${rest#*	}"
+            rpid="${rest%%	*}"
+            rcmd="${rest#*	}"
+            blk="${blocked_by[$rpid]:-}"
+            secs=$(( now - ep ))
+            (( secs < 0 )) && secs=0
+            if (( show_hours )); then
+                dur="$(printf '%02d:%02d:%02d' $(( secs / 3600 )) $(( secs % 3600 / 60 )) $(( secs % 60 )))"
             else
-                # too wide: drop the color so truncation can't strand
-                # an unclosed escape
-                line="  ${rpath}  ${rcmd}"
-                buf+="${line[1,$cols]}"$'\n'
+                dur="$(printf '%02d:%02d' $(( secs / 60 )) $(( secs % 60 )))"
+            fi
+            birth="$(date -r "$ep" '+%H:%M' 2>/dev/null)"
+            fpath="$(printf '%-*s' "$pw" "$rpath")"
+            fpid="$(printf '%-*s' "$dw" "$rpid")"
+            fblk="$(printf '%-*s' "$bw" "$blk")"
+            fbirth="$(printf '%-*s' "$sw" "$birth")"
+            fdur="$(printf '%-*s' "$uw" "$dur")"
+            (( ${#rcmd} > cmd_avail )) && rcmd="${rcmd[1,$cmd_avail]}"
+            if [[ -n "$blk" ]]; then
+                # blocked run: its own pid in red
+                buf+="  ${fpath}  "$'\033[31m'"${fpid}"$'\033[0m'"  ${fblk}  ${fbirth}  ${fdur}  "$'\033[36m'"${rcmd}"$'\033[0m\n'
+            else
+                buf+="  ${fpath}  ${fpid}  ${fblk}  ${fbirth}  ${fdur}  "$'\033[36m'"${rcmd}"$'\033[0m\n'
             fi
         done
     fi

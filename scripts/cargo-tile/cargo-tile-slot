@@ -1,20 +1,30 @@
 #!/bin/zsh
-# rev 16 — bump this comment in every cargo-tile source file on each change
+# rev 32 — bump this comment in every cargo-tile source file on each change
 # One grid pane. Watches its slot file and displays the assigned run's
 # log via tail; shows an idle placeholder when the slot is empty. The
 # pane itself is never destroyed between runs — content just swaps.
 set -u
+
+REVISION=32
 
 TILE_HOME="${CARGO_TILE_HOME:-$HOME/.cargo-tile}"
 STATE="$TILE_HOME/state"
 N="$1"
 SLOTF="$STATE/slots/$N"
 
+# self-refresh: re-exec when the source file's rev comment changes.
+# $0 inside a zsh function is the function name, so capture it here.
+SELF="$0"
+src_rev() { sed -n '2s/^# rev \([0-9]*\).*/\1/p' "$SELF" 2>/dev/null; }
+
 tailpid=""
 cur="__init__"
+last_rev_check=0
 
 show_idle() {
-    printf '\033]2;· %s ·\007' "$N"
+    # OSC 0 sets the session name (what iTerm displays), not just the
+    # window title
+    printf '\033]0;· %s ·\007' "$N"
     printf '\033[H\033[2J\033[3J'
     printf '\n  \033[2m· slot %s idle ·\033[0m\n' "$N"
 }
@@ -26,6 +36,15 @@ cleanup() {
 trap cleanup INT TERM HUP
 
 while true; do
+    # throttled so the 0.3s loop doesn't fork sed every pass
+    if (( SECONDS - last_rev_check >= 5 )); then
+        last_rev_check=$SECONDS
+        rev="$(src_rev)"
+        if [[ -n "$rev" && "$rev" != "$REVISION" ]]; then
+            [[ -n "$tailpid" ]] && kill "$tailpid" 2>/dev/null
+            exec "$SELF" "$N"
+        fi
+    fi
     new=""
     [[ -s "$SLOTF" ]] && new=$(<"$SLOTF")
     if [[ "$new" != "$cur" ]]; then
@@ -33,6 +52,13 @@ while true; do
         tailpid=""
         cur="$new"
         if [[ -n "$cur" && -f "$cur" ]]; then
+            # name the pane after the run's full command (log line 1
+            # carries it in an OSC 2 escape)
+            l1=$(head -1 "$cur" 2>/dev/null)
+            t="${l1#*\]2;}"
+            t="${t%%$'\a'*}"
+            [[ -n "$t" && "$t" != "$l1" ]] || t="slot $N"
+            printf '\033]0;%s\007' "$t"
             printf '\033[H\033[2J\033[3J'
             /usr/bin/tail -n +1 -F "$cur" 2>/dev/null &
             tailpid=$!

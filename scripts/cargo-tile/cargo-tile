@@ -1,5 +1,5 @@
 #!/bin/zsh
-# rev 16 — bump this comment in every cargo-tile source file on each change
+# rev 32 — bump this comment in every cargo-tile source file on each change
 # Control command for cargo run tiling in iTerm2.
 set -u
 
@@ -42,6 +42,47 @@ unhook_toolchains() {
     done
 }
 
+# re-register shim runs that are still alive (their pid is in the log
+# filename, their command and cwd in the log header) — so `on` mid-flight
+# no longer orphans them
+adopt_live_runs() {
+    mkdir -p "$STATE/pids"
+    local lg pid l1 title dir sub w n=0
+    for lg in /tmp/cargo-tile/run-*-*.log(N); do
+        pid="${${lg:t:r}##*-}"
+        [[ "$pid" == <-> ]] || continue
+        kill -0 "$pid" 2>/dev/null || continue
+        [[ -f "$STATE/pids/$pid" ]] && continue
+        # log line 1: OSC title "cargo <args>  [~/dir]" then the command echo
+        l1=$(head -1 "$lg" 2>/dev/null)
+        title="${l1#*\]2;}"
+        title="${title%%$'\a'*}"
+        dir="${${title##*\[}%\]}"
+        sub=""
+        for w in ${(z)${title%%  \[*}}; do
+            [[ "$w" == cargo || "$w" == -* || "$w" == +* ]] && continue
+            sub="$w"
+            break
+        done
+        # same exclusions as the shim
+        [[ "$sub" == port ]] && continue
+        print -r -- "$dir	${title%%  \[*}" > "$STATE/pids/$pid"
+        # the summary reads start time from the pid file's mtime; for an
+        # adopted run that is the log's birth (in its filename:
+        # run-YYYYmmdd-HHMMSS-pid), not adoption time
+        local -a lparts
+        lparts=(${(s.-.)${lg:t:r}})
+        if (( ${#lparts} >= 3 )) && [[ "${lparts[2]}" == <-> && "${lparts[3]}" == <-> ]]; then
+            touch -t "${lparts[2]}${lparts[3][1,4]}.${lparts[3][5,6]}" \
+                "$STATE/pids/$pid" 2>/dev/null
+        fi
+        "$TILE_HOME/bin/cargo-tile-pane" "$lg" \
+            >/dev/null 2>>"$TILE_HOME/pane-errors.log"
+        (( n += 1 ))
+    done
+    echo "  adopted live cargo runs: $n"
+}
+
 # snapshot cargo processes already running — they can't be captured, but
 # the summary pane shows them until they exit
 snapshot_preexisting() {
@@ -67,9 +108,7 @@ case "${1:-status}" in
         hook_toolchains
         snapshot_preexisting
         touch "$STATE/active"
-        # bring up the 1x1 summary window right away
-        "$TILE_HOME/bin/cargo-tile-pane" --check \
-            >/dev/null 2>>"$TILE_HOME/pane-errors.log" &!
+        adopt_live_runs
         echo "cargo-tile: on — new cargo runs open panes in the grid window"
         ;;
     off)
