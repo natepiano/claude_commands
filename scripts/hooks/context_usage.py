@@ -83,6 +83,25 @@ PENDING_BYTES_PER_TOKEN = 3.0
 # transcript bytes, a 2.2x expansion. Reusing 3.0 credited 16k of a 36.5k read.
 RESPONSE_BYTES_PER_TOKEN = 1.5
 
+# Mutating tools break the payload-size-tracks-context assumption entirely: an
+# Edit's tool_response embeds the whole original file, while the context only
+# receives a patch-sized confirmation snippet. A 560KB Edit payload on an 83k
+# context once estimated 458k and fired the compaction escalation at 32% full.
+# For these tools only the structuredPatch approximates what actually lands.
+MUTATING_TOOLS = frozenset({"Edit", "MultiEdit", "Write", "NotebookEdit"})
+
+# The CLI truncates any single tool result before it enters the context, so no
+# response can contribute more than roughly this many tokens no matter how
+# large the payload was. Backstop for payload shapes not special-cased above.
+RESPONSE_TOKENS_CAP = 25_000
+
+# Pasted images sit in the transcript as base64 blobs, but they do not bill
+# like text: a full-screen image costs ~1,600 tokens while its megabyte of
+# base64 divided by 3 bytes/token would claim ~350k. Runs this long can only
+# be embedded media, so each one is counted as a flat image-sized cost.
+BASE64_RUN = re.compile(r"[A-Za-z0-9+/=]{4096,}")
+IMAGE_TOKENS = 1_600
+
 # Bytes of transcript tail to scan for the most recent usage record.
 TAIL_BYTES = 512 * 1024
 TAIL_BYTES_RETRY = 4 * 1024 * 1024
@@ -272,6 +291,14 @@ def read_tail(path: Path, size: int) -> list[str]:
     return lines if start == 0 else lines[1:]
 
 
+def pending_line_bytes(text: str) -> int:
+    """A pending line's contribution, with base64 media priced as images."""
+    if len(text) < 4096:
+        return len(text) + 1
+    stripped, images = BASE64_RUN.subn("", text)
+    return len(stripped) + 1 + images * IMAGE_TOKENS * int(PENDING_BYTES_PER_TOKEN)
+
+
 def latest_reading(path: Path) -> Reading | None:
     """Tokens in the context window as of the most recent assistant turn.
 
@@ -308,7 +335,7 @@ def latest_reading(path: Path) -> Reading | None:
             after = lines[len(lines) - offset :]
             return {
                 "tokens": tokens,
-                "pending_bytes": sum(len(text) + 1 for text in after),
+                "pending_bytes": sum(pending_line_bytes(text) for text in after),
                 "is_sidechain": entry.get("isSidechain", False),
                 "model": message.get("model"),
             }
@@ -327,15 +354,21 @@ def response_bytes(payload: HookInput) -> int:
     response = payload.get("tool_response")
     if response is None:
         return 0
+    if payload.get("tool_name") in MUTATING_TOOLS:
+        if not isinstance(response, dict):
+            return 0
+        patch = cast(dict[str, object], response).get("structuredPatch")
+        return 0 if patch is None else len(json.dumps(patch, default=str))
     return len(json.dumps(response, default=str))
 
 
 def estimate_tokens(reading: Reading, response: int) -> int:
     """Billed tokens plus the two corrections for what has not been billed yet."""
+    response_tokens = min(int(response / RESPONSE_BYTES_PER_TOKEN), RESPONSE_TOKENS_CAP)
     return (
         reading["tokens"]
         + int(reading["pending_bytes"] / PENDING_BYTES_PER_TOKEN)
-        + int(response / RESPONSE_BYTES_PER_TOKEN)
+        + response_tokens
     )
 
 

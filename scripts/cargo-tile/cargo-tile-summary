@@ -1,11 +1,11 @@
 #!/bin/zsh
-# rev 37 — bump this comment in every cargo-tile source file on each change
+# rev 43 — bump this comment in every cargo-tile source file on each change
 # Live summary for the cargo-tile grid: revision, grid size, counts of
 # tiled runs, plus cargo processes that predate `cargo-tile on`
 # (uncapturable) — those lines disappear as the processes exit.
 set -u
 
-REVISION=37
+REVISION=43
 
 TILE_HOME="${CARGO_TILE_HOME:-$HOME/.cargo-tile}"
 STATE=/tmp/cargo-tile/state
@@ -15,26 +15,6 @@ ERRLOG=/tmp/cargo-tile/pane-errors.log
 # $0 inside a zsh function is the function name, so capture it here.
 SELF="$0"
 src_rev() { sed -n '2s/^# rev \([0-9]*\).*/\1/p' "$SELF" 2>/dev/null; }
-
-# nearest descendant of a registered (shim) pid whose executable is
-# cargo — the shim pid itself is a zsh wrapper over script(1), so the
-# lock heuristic must look at the real cargo root underneath
-cargo_root() {
-    typeset -a queue
-    queue=($1)
-    local q i=0
-    while (( ${#queue} > 0 && i < 100 )); do
-        q=${queue[1]}
-        queue=(${queue[2,-1]})
-        (( i += 1 ))
-        if [[ "$q" != "$1" && "${comm_of[$q]:-}" == *cargo* ]]; then
-            print -r -- "$q"
-            return 0
-        fi
-        queue+=(${=${child_of[$q]:-}})
-    done
-    return 1
-}
 
 # OSC 0 sets the session name (what iTerm displays), not just the
 # window title
@@ -75,10 +55,11 @@ while true; do
     done
     (( ${#active} > 0 )) && active=(${(on)active})
 
-    # lock contention (cargo-port's heuristic, approximated): runs sharing
-    # a path serialize behind cargo's build-directory lock. The one with
-    # child processes or measurable CPU is the holder; a parked root sits
-    # in flock with neither. Claim nothing unless exactly one candidate.
+    # build-dir lock contention: runs sharing a path serialize behind
+    # cargo's file lock, and a waiter announces it in its own output —
+    # trust the log tail over any process-tree heuristic (a blocked
+    # cargo still has helper children, so tree shape can't tell holder
+    # from waiter). Match only the escape-code-free part of the line.
     typeset -A path_pids blocked_by
     path_pids=()
     blocked_by=()
@@ -88,47 +69,45 @@ while true; do
         rest="${rest#*	}"
         path_pids[$rpath]+="${rest%%	*} "
     done
-    contended=0
     for p in "${(k)path_pids[@]}"; do
-        [[ "${path_pids[$p]}" == *' '*' '* ]] && contended=1
-    done
-    if (( contended )); then
-        typeset -A cpu_of child_of comm_of
-        cpu_of=()
-        child_of=()
-        comm_of=()
-        while read -r p pp pc cm; do
-            cpu_of[$p]="$pc"
-            comm_of[$p]="$cm"
-            child_of[$pp]+="$p "
-        done < <(ps -axo pid=,ppid=,pcpu=,comm= 2>/dev/null)
-        for p in "${(k)path_pids[@]}"; do
-            typeset -a group holders
-            group=(${=path_pids[$p]})
-            (( ${#group} < 2 )) && continue
-            holders=()
-            for pid in "${group[@]}"; do
-                croot=$(cargo_root "$pid") || continue
-                if [[ -n "${child_of[$croot]:-}" ]] || (( ${cpu_of[$croot]:-0} > 1.0 )); then
-                    holders+=("$pid")
-                fi
-            done
-            if (( ${#holders} == 1 )); then
-                for pid in "${group[@]}"; do
-                    [[ "$pid" != "${holders[1]}" ]] && blocked_by[$pid]="${holders[1]}"
-                done
+        typeset -a group waiting free lgs
+        group=(${=path_pids[$p]})
+        (( ${#group} < 2 )) && continue
+        waiting=()
+        free=()
+        for pid in "${group[@]}"; do
+            lgs=(/tmp/cargo-tile/run-*-$pid.log(N))
+            if (( ${#lgs} > 0 )) && \
+                tail -4 "${lgs[1]}" 2>/dev/null | grep -q 'waiting for file lock'; then
+                waiting+=("$pid")
+            else
+                free+=("$pid")
             fi
         done
-    fi
+        # a waiter is blocked no matter how many holders are plausible —
+        # only the attribution needs a unique candidate. With several
+        # non-waiting runs (e.g. one building, one testing) the holder
+        # is unknowable from here, so mark the waiter and show "?"
+        if (( ${#waiting} > 0 )); then
+            holder="?"
+            (( ${#free} == 1 )) && holder="${free[1]}"
+            for pid in "${waiting[@]}"; do
+                blocked_by[$pid]="$holder"
+            done
+        fi
+    done
 
     # pane layout: total pane count and the column shape (e.g. 3+3+1)
     P=0
     shapestr=""
     if [[ -s "$STATE/layout" ]]; then
+        typeset -a lw
         while IFS= read -r lline; do
-            wn=${#${=lline}}
-            (( P += wn ))
-            shapestr+="${shapestr:+ + }$wn"
+            # split first: ${#${=x}} on a one-word line is its string
+            # length, not 1
+            lw=(${=lline})
+            (( P += ${#lw} ))
+            shapestr+="${shapestr:+ + }${#lw}"
         done < "$STATE/layout"
     fi
     shown=0
@@ -157,10 +136,10 @@ while true; do
     fi
 
     # decay: with more panes than tiles, close one trailing idle pane
-    # per minute (the pane script guards against closing a busy one)
+    # every 15s (the pane script guards against closing a busy one)
     if (( P <= shown + 1 )) || [[ ! -f "$STATE/decay-last" ]]; then
         touch "$STATE/decay-last"
-    elif (( $(date +%s) - $(stat -f %m "$STATE/decay-last") >= 60 )); then
+    elif (( $(date +%s) - $(stat -f %m "$STATE/decay-last") >= 15 )); then
         touch "$STATE/decay-last"
         "$TILE_HOME/bin/cargo-tile-pane" --decay \
             >/dev/null 2>>"$ERRLOG" &!
@@ -185,7 +164,6 @@ while true; do
     if (( ${#active} > 0 )); then
         pw=4   # "path"
         dw=3   # "pid"
-        bw=7   # "blocker"
         sw=5   # "start" / "hh:mm"
         cw=7   # "command"
         show_hours=0
@@ -203,12 +181,31 @@ while true; do
         done
         uw=5   # "mm:ss"; hh:mm:ss when any run passes the hour
         (( show_hours )) && uw=8
-        # the path is never cut — a too-wide row clamps the command
-        # (its color codes wrap the whole field, so cutting is safe)
-        cmd_avail=$(( cols - (pw + dw + bw + sw + uw + 12) ))
-        (( cmd_avail < 0 )) && cmd_avail=0
+        # width-aware: the full table only when every column fits the
+        # pane; otherwise a compact form — path on its own dim line
+        # (repeated only when it changes), command truncated — so
+        # nothing ever wraps in a small window
+        bw=0
+        if (( ${#blocked_by} > 0 )); then
+            bw=7   # "blocker"
+            for blk in "${(v)blocked_by[@]}"; do
+                (( ${#blk} > bw )) && bw=${#blk}
+            done
+        fi
+        need=$(( 2 + pw + 2 + dw + 2 + sw + 2 + uw + 2 + cw ))
+        (( bw )) && (( need += 2 + bw ))
+        wide=1
+        (( need > cols )) && wide=0
         buf+=$'\n\033[1mactive:\033[0m\n'
-        buf+=$'\033[2m'"$(printf '  %-*s  %-*s  %-*s  %-*s  %-*s  %s' "$pw" path "$dw" pid "$bw" blocker "$sw" start "$uw" dur command)"$'\033[0m\n'
+        if (( ! wide )); then
+            hdr="$(printf '  %-*s  %-*s  %-*s  command' "$dw" pid "$sw" start "$uw" dur)"
+            buf+=$'\033[2m'"${hdr[1,$cols]}"$'\033[0m\n'
+        elif (( ${#blocked_by} > 0 )); then
+            buf+=$'\033[2m'"$(printf '  %-*s  %-*s  %-*s  %-*s  %-*s  blocker' "$pw" path "$dw" pid "$sw" start "$uw" dur "$cw" command)"$'\033[0m\n'
+        else
+            buf+=$'\033[2m'"$(printf '  %-*s  %-*s  %-*s  %-*s  %s' "$pw" path "$dw" pid "$sw" start "$uw" dur command)"$'\033[0m\n'
+        fi
+        prevpath=""
         for entry in "${active[@]}"; do
             ep="${entry%%	*}"
             rest="${entry#*	}"
@@ -227,15 +224,34 @@ while true; do
             birth="$(date -r "$ep" '+%H:%M' 2>/dev/null)"
             fpath="$(printf '%-*s' "$pw" "$rpath")"
             fpid="$(printf '%-*s' "$dw" "$rpid")"
-            fblk="$(printf '%-*s' "$bw" "$blk")"
             fbirth="$(printf '%-*s' "$sw" "$birth")"
             fdur="$(printf '%-*s' "$uw" "$dur")"
-            (( ${#rcmd} > cmd_avail )) && rcmd="${rcmd[1,$cmd_avail]}"
-            if [[ -n "$blk" ]]; then
-                # blocked run: its own pid in red
-                buf+="  ${fpath}  "$'\033[31m'"${fpid}"$'\033[0m'"  ${fblk}  ${fbirth}  ${fdur}  "$'\033[36m'"${rcmd}"$'\033[0m\n'
+            if (( ! wide )); then
+                if [[ "$rpath" != "$prevpath" ]]; then
+                    pline="  $rpath"
+                    buf+=$'\033[2m'"${pline[1,$cols]}"$'\033[0m\n'
+                    prevpath="$rpath"
+                fi
+                blkmark=""
+                [[ -n "$blk" ]] && blkmark="⇠${blk}  "
+                avail=$(( cols - 2 - dw - 2 - sw - 2 - uw - 2 - ${#blkmark} ))
+                (( avail < 0 )) && avail=0
+                (( ${#rcmd} > avail )) && rcmd="${rcmd[1,$avail]}"
+                if [[ -n "$blk" ]]; then
+                    buf+="  "$'\033[31m'"${fpid}"$'\033[0m'"  ${fbirth}  ${fdur}  "$'\033[33m'"${blkmark}"$'\033[0m'$'\033[36m'"${rcmd}"$'\033[0m\n'
+                else
+                    buf+="  ${fpid}  ${fbirth}  ${fdur}  "$'\033[36m'"${rcmd}"$'\033[0m\n'
+                fi
+            elif (( ${#blocked_by} > 0 )); then
+                fcmd="$(printf '%-*s' "$cw" "$rcmd")"
+                if [[ -n "$blk" ]]; then
+                    # blocked run: its own pid in red
+                    buf+="  ${fpath}  "$'\033[31m'"${fpid}"$'\033[0m'"  ${fbirth}  ${fdur}  "$'\033[36m'"${fcmd}"$'\033[0m'"  ${blk}"$'\n'
+                else
+                    buf+="  ${fpath}  ${fpid}  ${fbirth}  ${fdur}  "$'\033[36m'"${fcmd}"$'\033[0m\n'
+                fi
             else
-                buf+="  ${fpath}  ${fpid}  ${fblk}  ${fbirth}  ${fdur}  "$'\033[36m'"${rcmd}"$'\033[0m\n'
+                buf+="  ${fpath}  ${fpid}  ${fbirth}  ${fdur}  "$'\033[36m'"${rcmd}"$'\033[0m\n'
             fi
         done
     fi

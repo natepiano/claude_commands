@@ -1,5 +1,5 @@
 #!/bin/zsh
-# rev 37 — bump this comment in every cargo-tile source file on each change
+# rev 43 — bump this comment in every cargo-tile source file on each change
 # Assign runs to the cargo-tile pane layout.
 #   cargo-tile-pane <log>           add a run
 #   cargo-tile-pane --remove <log>  drop a finished run
@@ -43,12 +43,24 @@ locked=0
 for i in {1..150}; do
     if mkdir "$LOCK" 2>/dev/null; then
         locked=1
+        print -r -- $$ > "$LOCK/pid"
         break
     fi
-    # a holder that crashed without its EXIT trap leaves the lock behind
-    if (( i % 20 == 0 )); then
-        lage=$(( $(date +%s) - $(stat -f %m "$LOCK" 2>/dev/null || date +%s) ))
-        (( lage > 30 )) && rmdir "$LOCK" 2>/dev/null
+    # a holder that crashed without its EXIT trap leaves the lock
+    # behind — steal only when the recorded holder is dead (a slow
+    # full_rebuild legitimately holds it well past any age threshold).
+    # Sandboxed callers never steal: the sandbox blocks probing
+    # unrelated pids, so kill -0 reports a live holder as dead.
+    if (( i % 20 == 0 )) && /bin/ps -p $$ >/dev/null 2>&1; then
+        hpid=""
+        [[ -f "$LOCK/pid" ]] && hpid=$(<"$LOCK/pid")
+        if [[ "$hpid" == <-> ]]; then
+            kill -0 "$hpid" 2>/dev/null || rm -rf "$LOCK" 2>/dev/null
+        else
+            # no pid recorded (holder died mid-acquire): fall back to age
+            lage=$(( $(date +%s) - $(stat -f %m "$LOCK" 2>/dev/null || date +%s) ))
+            (( lage > 60 )) && rm -rf "$LOCK" 2>/dev/null
+        fi
     fi
     sleep 0.1
 done
@@ -56,7 +68,10 @@ if (( ! locked )); then
     touch "$STATE/rebuild-needed"
     exit 0
 fi
-trap 'rmdir "$LOCK" 2>/dev/null' EXIT
+# rm -rf, not rmdir: the pid file inside makes rmdir fail silently, which
+# leaks the lock on every release — sandboxed callers can't steal, so their
+# adds then time out forever
+trap 'rm -rf "$LOCK" 2>/dev/null' EXIT
 
 # collect active slots (slot -> log), dropping stale entries
 typeset -A slotlog
@@ -99,8 +114,14 @@ for f in "$STATE"/slots/*(N); do
 done
 
 if [[ "$mode" == add && -n "$LOG" ]]; then
+    # a shim add can race --check adoption of the same run — never
+    # register a log twice (two panes would tail the same output)
+    dup=0
+    for s in "${(k)slotlog[@]}"; do
+        [[ "${slotlog[$s]}" == "$LOG" ]] && { dup=1; break }
+    done
     slot=$(( ${#slotlog} + 2 ))
-    if (( slot <= 36 )); then
+    if (( ! dup && slot <= 36 )); then
         print -r -- "$LOG" > "$STATE/slots/$slot"
         slotlog[$slot]="$LOG"
     fi
@@ -110,10 +131,14 @@ N=$(( ${#slotlog} + 1 ))  # + summary tile
 (( N > 36 )) && N=36
 
 # current pane layout
-typeset -a cols
+typeset -a cols colw
 [[ -s "$STATE/layout" ]] && cols=("${(@f)$(<"$STATE/layout")}")
 P=0
-for c in "${cols[@]}"; do (( P += ${#${=c}} )); done
+for c in "${cols[@]}"; do
+    # split first: ${#${=c}} on a one-word line is its string length, not 1
+    colw=(${=c})
+    (( P += ${#colw} ))
+done
 
 # column heights for $1 tiles -> SHAPE
 shape_for() {

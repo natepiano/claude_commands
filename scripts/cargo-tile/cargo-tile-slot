@@ -1,12 +1,12 @@
 #!/bin/zsh
-# rev 36 — bump this comment in every cargo-tile source file on each change
+# rev 43 — bump this comment in every cargo-tile source file on each change
 # One layout pane, identified by a permanent ordinal. Watches its map
 # file (the log it should show) and displays it via tail; shows an idle
 # placeholder when the map is empty. Content reflows across panes as
 # the layout changes — the pane itself only ever swaps what it tails.
 set -u
 
-REVISION=36
+REVISION=43
 
 TILE_HOME="${CARGO_TILE_HOME:-$HOME/.cargo-tile}"
 STATE=/tmp/cargo-tile/state
@@ -21,6 +21,42 @@ src_rev() { sed -n '2s/^# rev \([0-9]*\).*/\1/p' "$SELF" 2>/dev/null; }
 tailpid=""
 cur="__init__"
 last_rev_check=0
+last_idle_tick=0
+
+# countdown to this pane's decay, empty if it will survive. Decay
+# closes the flatten-order tail once per 15s, so the pane at reverse
+# position r goes at decay-last + r*15s; panes inside the runs+1
+# target are keepers awaiting refill and show nothing.
+idle_line() {
+    [[ -s "$STATE/layout" ]] || return 0
+    local -a lw
+    local lline e P=0 mine=0
+    while IFS= read -r lline; do
+        lw=(${=lline})
+        for e in "${lw[@]}"; do
+            (( P += 1 ))
+            [[ "${e%%:*}" == "$N" ]] && mine=$P
+        done
+    done < "$STATE/layout"
+    (( mine )) || return 0
+    local shown=0 mf
+    for mf in "$STATE"/panemap/*(N); do
+        [[ -n "$(<"$mf")" ]] && (( shown += 1 ))
+    done
+    local doomed=$(( P - shown - 1 ))
+    local r=$(( P - mine + 1 ))
+    (( doomed > 0 && r <= doomed )) || return 0
+    local dl=0
+    [[ -f "$STATE/decay-last" ]] && dl=$(stat -f %m "$STATE/decay-last" 2>/dev/null)
+    local rem=$(( dl + 15 * r - $(date +%s) ))
+    # decay pauses while the summary is mid-rebuild or the closer is
+    # waiting on the layout lock — say so instead of freezing at 0:00
+    if (( rem <= 0 )); then
+        printf 'closing…'
+    else
+        printf 'closes in %d:%02d' $(( rem / 60 )) $(( rem % 60 ))
+    fi
+}
 
 show_idle() {
     # OSC 0 sets the session name (what iTerm displays), not just the
@@ -28,6 +64,16 @@ show_idle() {
     printf '\033]0;· %s ·\007' "$N"
     printf '\033[H\033[2J\033[3J'
     printf '\n  \033[2m· slot %s idle ·\033[0m\n' "$N"
+    idle_tick
+}
+
+# rewrite only the countdown line (row 3) so the ticking doesn't flicker
+# the whole pane
+idle_tick() {
+    local c
+    c="$(idle_line)"
+    printf '\033[3;1H\033[K'
+    [[ -n "$c" ]] && printf '  \033[2m%s\033[0m' "$c"
 }
 
 cleanup() {
@@ -65,7 +111,13 @@ while true; do
             tailpid=$!
         else
             show_idle
+            last_idle_tick=$SECONDS
         fi
+    fi
+    # keep the decay countdown ticking while idle
+    if [[ -z "$cur" ]] && (( SECONDS - last_idle_tick >= 1 )); then
+        last_idle_tick=$SECONDS
+        idle_tick
     fi
     # q drops this pane to an interactive shell (watcher is gone until
     # the next grid rebuild)

@@ -117,6 +117,26 @@ require_nextest() {
     fi
 }
 
+# Test builds use the workspace's fast-test profile when it defines one: deps
+# compile at a lower opt-level than dev's (only `cargo run` needs opt-3 deps),
+# and the separate target dir keeps test builds off the dev profile's build
+# lock. Workspaces without the profile build exactly as before.
+nextest_profile_flags() {
+    local root
+    root="$(cargo locate-project --workspace --message-format plain 2>/dev/null)" || return 0
+    if [[ -n "$root" ]] && grep -q '^\[profile\.fast-test\]' "$root"; then
+        printf -- '--cargo-profile fast-test'
+    fi
+}
+
+run_nextest() {
+    require_nextest
+    local profile_flags
+    profile_flags="$(nextest_profile_flags)"
+    # shellcheck disable=SC2086
+    run cargo nextest run $profile_flags "$@"
+}
+
 TARGET_FLAGS_PY='
 import json
 import sys
@@ -227,13 +247,12 @@ case "$CMD" in
         # --no-fail-fast: nextest cancels every remaining test after the first
         # failure, so one broken test silently hides the rest of the suite. A
         # phase gate has to report the whole result, not the first stop.
-        require_nextest
         if [[ -n "$TARGET" ]]; then
-            run cargo nextest run --no-fail-fast -p "$PKG" --test "$TARGET"
+            run_nextest --no-fail-fast -p "$PKG" --test "$TARGET"
         else
             FLAGS="$(target_flags "$PKG")"
             # shellcheck disable=SC2086
-            run cargo nextest run --no-fail-fast -p "$PKG" $FLAGS
+            run_nextest --no-fail-fast -p "$PKG" $FLAGS
         fi
         ;;
     lint)
@@ -267,18 +286,16 @@ case "$CMD" in
         PKG="${1:?verify.sh example-test <package> <name>}"
         NAME="${2:?verify.sh example-test <package> <name>}"
         FEATURES="$(example_features "$PKG" "$NAME")"
-        require_nextest
         if [[ -n "$FEATURES" ]]; then
-            run cargo nextest run -p "$PKG" --example "$NAME" --features "$FEATURES"
+            run_nextest -p "$PKG" --example "$NAME" --features "$FEATURES"
         else
-            run cargo nextest run -p "$PKG" --example "$NAME"
+            run_nextest -p "$PKG" --example "$NAME"
         fi
         ;;
     final)
         fmt_cargo --check
         run cargo check --workspace --all-targets
-        require_nextest
-        run cargo nextest run --workspace
+        run_nextest --workspace
         ;;
     *)
         usage
