@@ -1,5 +1,5 @@
 #!/bin/zsh
-# rev 48 — bump this comment in every cargo-tile source file on each change
+# rev 49 — bump this comment in every cargo-tile source file on each change
 # Assign runs to the cargo-tile pane layout.
 #   cargo-tile-pane <log>           add a run
 #   cargo-tile-pane --remove <log>  drop a finished run
@@ -260,74 +260,45 @@ EOF
 }
 
 close_pane() {  # $1 = session id
+    # timeout, because a close confirmation prompt would otherwise hold
+    # the layout lock forever and stall every later add and decay
     osascript - "$win" "$1" <<'EOF'
 on run argv
 	set winId to (item 1 of argv) as integer
 	set sid to item 2 of argv
-	tell application "iTerm2"
-		repeat with t in tabs of window id winId
-			repeat with s in sessions of t
-				if (id of s) is equal to sid then
-					close s
-					return
-				end if
-			end repeat
-		end repeat
-	end tell
+	try
+		with timeout of 10 seconds
+			tell application "iTerm2"
+				repeat with t in tabs of window id winId
+					repeat with s in sessions of t
+						if (id of s) is equal to sid then
+							close s
+							return
+						end if
+					end repeat
+				end repeat
+			end tell
+		end timeout
+	end try
 end run
 EOF
 }
 
-# tear down and rebuild the whole layout for N tiles (window creation,
-# recovery, and column growth — the only cases a session split can't
-# reach)
-full_rebuild() {
-    shape_for $N
-    local m=${#SHAPE}
-    typeset -a cmds nords
-    cmds=("$TILE_HOME/bin/cargo-tile-summary")
-    nords=(1)
-    local j o
-    for (( j = 2; j <= N; j++ )); do
-        o=$(next_ord)
-        nords+=($o)
-        cmds+=("$TILE_HOME/bin/cargo-tile-slot $o")
-    done
-    local w=""
+# create or reuse the grid window and hand back "winid headsid". The id
+# comes back BEFORE any split runs so the caller can record it at once:
+# a window created inside a script that later errors — or whose Apple
+# event reply times out, which is what produced the duplicate grid
+# windows — is otherwise alive but untracked, and the next add makes
+# another one.
+ensure_window() {  # $1 = command for the head pane
+    local w="" out
     [[ -f "$STATE/window" ]] && w=$(<"$STATE/window")
-    typeset -a known stale
-    known=()
-    stale=()
-    [[ -f "$STATE/windows-created" ]] && known=("${(@f)$(<"$STATE/windows-created")}")
-    local kn
-    for kn in "${known[@]}"; do
-        [[ -n "$kn" && "$kn" != "$w" ]] && stale+=("$kn")
-    done
-    local out
-    out=$(osascript - "$w" "${#stale}" "${stale[@]}" "$m" "${SHAPE[@]}" "${cmds[@]}" <<'EOF'
+    out=$(osascript - "$w" "$1" <<'EOF'
 on run argv
 	set winId to item 1 of argv
-	set nStale to (item 2 of argv) as integer
-	set staleIds to {}
-	repeat with i from 3 to (2 + nStale)
-		copy (item i of argv) to end of staleIds
-	end repeat
-	set base to 2 + nStale
-	set m to (item (base + 1) of argv) as integer
-	set hs to {}
-	repeat with i from (base + 2) to (base + 1 + m)
-		copy ((item i of argv) as integer) to end of hs
-	end repeat
-	set cbase to base + 1 + m
-	set cmds to {}
-	repeat with i from (cbase + 1) to (count of argv)
-		copy (item i of argv) to end of cmds
-	end repeat
-
-	set firstCmd to item 1 of cmds
+	set firstCmd to item 2 of argv
 	tell application "iTerm2"
 		set w to missing value
-		set created to false
 		if winId is not "" then
 			try
 				set w to window id (winId as integer)
@@ -337,12 +308,10 @@ on run argv
 			end try
 		end if
 		if w is missing value then
-			set w to (create window with default profile command firstCmd)
-			set created to true
-		end if
-
-		-- size a fresh window to 75% of the screen, centered
-		if created then
+			with timeout of 60 seconds
+				set w to (create window with default profile command firstCmd)
+			end timeout
+			-- size a fresh window to 75% of the screen, centered
 			set sw to 1440
 			set sh to 900
 			try
@@ -360,20 +329,144 @@ on run argv
 				set bounds of w to {x0, y0, x0 + winW, y0 + winH}
 			end try
 		end if
+		return ((id of w) as text) & " " & (id of (current session of (current tab of w)))
+	end tell
+end run
+EOF
+    ) && [[ -n "$out" ]] && { print -r -- "$out"; return 0 }
+    adopt_stray "$w"
+}
 
-		-- close superseded grid windows
-		repeat with sid in staleIds
+# a `create window` whose Apple event reply timed out still made the
+# window — find it by the marker its panes set rather than creating a
+# second one. The marker needs a moment to arrive, hence the retries.
+adopt_stray() {  # $1 = window id to leave alone
+    local out i
+    for i in {1..5}; do
+        out=$(osascript - "$1" <<'EOF'
+on run argv
+	set keepId to item 1 of argv
+	tell application "iTerm2"
+		repeat with w in windows
+			if ((id of w) as text) is not keepId then
+				if (count of tabs of w) is 1 then
+					set t to item 1 of tabs of w
+					if (count of sessions of t) is 1 then
+						set s to item 1 of sessions of t
+						set v to missing value
+						try
+							tell s to set v to (variable named "user.cargotile")
+						end try
+						if v is "grid" then
+							return ((id of w) as text) & " " & (id of s)
+						end if
+					end if
+				end if
+			end if
+		end repeat
+	end tell
+	return ""
+end run
+EOF
+        ) || out=""
+        [[ -n "$out" ]] && { print -r -- "$out"; return 0 }
+        sleep 1
+    done
+    return 1
+}
+
+# close superseded grid windows: any window whose every session is a
+# cargo-tile pane (they tag themselves with the user.cargotile variable;
+# pressing q clears the tag, so a window the user took over survives)
+sweep_orphans() {  # $1 = window id to keep
+    [[ -n "${1:-}" ]] || return 0
+    osascript - "$1" <<'EOF'
+on run argv
+	set keepId to item 1 of argv
+	set doomed to {}
+	tell application "iTerm2"
+		repeat with w in windows
+			if ((id of w) as text) is not keepId then
+				set marked to 0
+				set total to 0
+				repeat with t in tabs of w
+					repeat with s in sessions of t
+						set total to total + 1
+						set v to missing value
+						try
+							tell s to set v to (variable named "user.cargotile")
+						end try
+						if v is "grid" then set marked to marked + 1
+					end repeat
+				end repeat
+				if total > 0 and marked is total then
+					copy (id of w) to end of doomed
+				end if
+			end if
+		end repeat
+		-- close the sessions one at a time and let the window go when
+		-- its last one does: `close window` (and `close tab`) trips
+		-- iTerm2's "confirm closing multiple sessions" sheet, which
+		-- blocks the Apple event until someone clicks it
+		repeat with d in doomed
 			try
-				with timeout of 5 seconds
-					close window id (sid as integer)
+				with timeout of 20 seconds
+					repeat 60 times
+						set w2 to missing value
+						try
+							set w2 to window id (d as integer)
+						end try
+						if w2 is missing value then exit repeat
+						set victim to missing value
+						repeat with t in tabs of w2
+							repeat with s in sessions of t
+								set victim to s
+								exit repeat
+							end repeat
+							if victim is not missing value then exit repeat
+						end repeat
+						if victim is missing value then exit repeat
+						close victim
+					end repeat
 				end timeout
 			end try
 		end repeat
+	end tell
+end run
+EOF
+}
+
+# split the head pane into the k-column grid; echoes the session ids in
+# snake order. It runs against a window whose id is already recorded, so
+# a failure here costs a retry, never a leaked window.
+build_layout() {  # $1 win, $2 head session, $3 m, then SHAPE, then cmds
+    osascript - "$@" <<'EOF'
+on run argv
+	set winId to (item 1 of argv) as integer
+	set headId to item 2 of argv
+	set m to (item 3 of argv) as integer
+	set hs to {}
+	repeat with i from 4 to (3 + m)
+		copy ((item i of argv) as integer) to end of hs
+	end repeat
+	set cmds to {}
+	repeat with i from (4 + m) to (count of argv)
+		copy (item i of argv) to end of cmds
+	end repeat
+
+	tell application "iTerm2"
+		set w to window id winId
+		set head to missing value
+		repeat with t in tabs of w
+			repeat with s in sessions of t
+				if (id of s) is equal to headId then set head to s
+			end repeat
+		end repeat
+		if head is missing value then error "head session gone"
 
 		-- columns via vertical splits; column c starts at cmds index
 		-- 1 + sum of hs[1..c-1]
-		set t to current tab of w
-		set colHeads to {current session of t}
+		set colHeads to {head}
 		set starts to {1}
 		set acc to 1
 		repeat with c from 2 to m
@@ -396,21 +489,36 @@ on run argv
 			end repeat
 		end repeat
 
-		-- session refs are positional (tab N), so resolve ids BEFORE
-		-- closing the old tab shifts every index
-		set out to (id of w) as text
+		-- session refs are positional, so resolve ids BEFORE closing
+		-- the old panes shifts every index
+		set out to ""
+		set newIds to {}
 		repeat with s in allSess
-			set out to out & " " & (id of s)
+			set out to out & (id of s) & " "
+			copy (id of s) to end of newIds
 		end repeat
 
-		-- drop the previous layout (best-effort; never hang on a prompt)
+		-- drop the previous layout: close every session that is not part
+		-- of the new grid, one at a time. Closing the whole tab would
+		-- trip iTerm2's "confirm closing multiple sessions" sheet and
+		-- hang the Apple event; re-scanning each pass avoids the index
+		-- invalidation that produced "Can't get tab 2 of window id".
 		try
-			with timeout of 5 seconds
-				tell w
-					repeat while (count of tabs) > 1
-						close first tab
+			with timeout of 20 seconds
+				repeat 60 times
+					set victim to missing value
+					repeat with t in tabs of w
+						repeat with s in sessions of t
+							if (id of s) is not in newIds then
+								set victim to s
+								exit repeat
+							end if
+						end repeat
+						if victim is not missing value then exit repeat
 					end repeat
-				end tell
+					if victim is missing value then exit repeat
+					close victim
+				end repeat
 			end timeout
 		end try
 	end tell
@@ -427,17 +535,41 @@ on run argv
 	return out
 end run
 EOF
-    ) || return 1
+}
+
+# tear down and rebuild the whole layout for N tiles (window creation,
+# recovery, and column growth — the only cases a session split can't
+# reach)
+full_rebuild() {
+    shape_for $N
+    local m=${#SHAPE}
+    typeset -a cmds nords
+    cmds=("$TILE_HOME/bin/cargo-tile-summary")
+    nords=(1)
+    local j o
+    for (( j = 2; j <= N; j++ )); do
+        o=$(next_ord)
+        nords+=($o)
+        cmds+=("$TILE_HOME/bin/cargo-tile-slot $o")
+    done
+    local head
+    head=$(ensure_window "${cmds[1]}") || return 1
+    win="${head%% *}"
+    local hsid="${head##* }"
+    # record it now: everything past this point is retryable, and an
+    # unrecorded window can never be found or closed again
+    print -r -- "$win" > "$STATE/window"
+    sweep_orphans "$win" >/dev/null 2>&1
+    local out
+    out=$(build_layout "$win" "$hsid" "$m" "${SHAPE[@]}" "${cmds[@]}") || return 1
     typeset -a parts
     parts=(${=out})
-    print -r -- "${parts[1]}" > "$STATE/window"
-    print -r -- "${parts[1]}" > "$STATE/windows-created"
     cols=()
     local ci pos=1 line
     for (( ci = 1; ci <= m; ci++ )); do
         line=""
         for (( j = 1; j <= SHAPE[ci]; j++ )); do
-            line+="${line:+ }${nords[$pos]}:${parts[pos+1]}"
+            line+="${line:+ }${nords[$pos]}:${parts[pos]}"
             (( pos += 1 ))
         done
         cols+=("$line")
@@ -556,5 +688,10 @@ elif [[ "$mode" == decay ]]; then
     do_decay
 elif (( N > P )); then
     converge
+fi
+# --check is the recovery path: reap grid windows left behind by an
+# earlier rebuild even when this run had no layout work to do
+if [[ "$mode" == check && -f "$STATE/window" ]]; then
+    sweep_orphans "$(<"$STATE/window")" >/dev/null 2>&1
 fi
 sync_maps

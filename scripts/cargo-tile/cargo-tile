@@ -1,5 +1,5 @@
 #!/bin/zsh
-# rev 48 — bump this comment in every cargo-tile source file on each change
+# rev 49 — bump this comment in every cargo-tile source file on each change
 # Control command for cargo run tiling in iTerm2.
 set -u
 
@@ -13,19 +13,18 @@ mkdir -p "$STATE"
 # state moved out of ~/.cargo-tile at rev 33 — carry the window
 # bookkeeping over once and drop the rest
 if [[ -d "$TILE_HOME/state" ]]; then
-    for f in window windows-created; do
-        [[ -f "$TILE_HOME/state/$f" && ! -f "$STATE/$f" ]] && \
-            cp "$TILE_HOME/state/$f" "$STATE/$f"
-    done
+    [[ -f "$TILE_HOME/state/window" && ! -f "$STATE/window" ]] && \
+        cp "$TILE_HOME/state/window" "$STATE/window"
     [[ -f "$TILE_HOME/state/active" ]] && touch "$TILE_HOME/active"
     rm -rf "$TILE_HOME/state"
 fi
 
-# clear the run list only — the window id and created-window history are
-# kept so the next run reuses (or closes) existing grid windows instead
-# of orphaning them
+# clear the run list only — the window id is kept so the next run reuses
+# the existing grid window instead of orphaning it. Superseded windows
+# are found by their panes' marker, not by a stored list (rev 49), so
+# windows-created is dropped here.
 reset_layout() {
-    rm -f "$STATE/session" "$STATE/count" "$STATE/runs" "$STATE/grid" "$STATE/next-slot" "$STATE/grid-since" "$STATE/retreat-pending" "$STATE/rebuild-needed" "$STATE/pre-last" "$STATE/layout" "$STATE/pane-seq" "$STATE/decay-last"
+    rm -f "$STATE/session" "$STATE/count" "$STATE/runs" "$STATE/grid" "$STATE/next-slot" "$STATE/grid-since" "$STATE/retreat-pending" "$STATE/rebuild-needed" "$STATE/pre-last" "$STATE/layout" "$STATE/pane-seq" "$STATE/decay-last" "$STATE/windows-created"
     rm -f "$STATE"/pids/*(N) "$STATE"/slots/*(N) "$STATE"/panemap/*(N)
     rmdir "$STATE/lock" 2>/dev/null
 }

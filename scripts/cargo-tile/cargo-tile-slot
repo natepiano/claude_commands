@@ -1,12 +1,12 @@
 #!/bin/zsh
-# rev 48 — bump this comment in every cargo-tile source file on each change
+# rev 49 — bump this comment in every cargo-tile source file on each change
 # One layout pane, identified by a permanent ordinal. Watches its map
 # file (the log it should show) and displays it via tail; shows an idle
 # placeholder when the map is empty. Content reflows across panes as
 # the layout changes — the pane itself only ever swaps what it tails.
 set -u
 
-REVISION=48
+REVISION=49
 
 TILE_HOME="${CARGO_TILE_HOME:-$HOME/.cargo-tile}"
 STATE=/tmp/cargo-tile/state
@@ -17,6 +17,10 @@ SLOTF="$STATE/panemap/$N"
 # $0 inside a zsh function is the function name, so capture it here.
 SELF="$0"
 src_rev() { sed -n '2s/^# rev \([0-9]*\).*/\1/p' "$SELF" 2>/dev/null; }
+
+# tag the session so the orphan sweep can tell a cargo-tile grid window
+# from one the user owns; pressing q below clears the tag (base64 "grid")
+printf '\033]1337;SetUserVar=cargotile=%s\007' Z3JpZA==
 
 tailpid=""
 cur="__init__"
@@ -126,6 +130,7 @@ while true; do
         read -s -t 0.3 -k 1 key 2>/dev/null
         if [[ "$key" == q ]]; then
             [[ -n "$tailpid" ]] && kill "$tailpid" 2>/dev/null
+            printf '\033]1337;SetUserVar=cargotile=\007'
             printf '\033[H\033[2J\033[3J'
             exec /bin/zsh -il
         fi
