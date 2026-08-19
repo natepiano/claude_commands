@@ -50,15 +50,17 @@ effect on the next run of each consumer; nothing needs restarting.
 | Check | Runs | Where it applies |
 |---|---|---|
 | `cache` | reuse a fresh cargo-port lint-run | `/clippy` STEP 1 |
-| `mend` | `cargo mend` check pass and `--fix` | `/clippy` STEP 2/3 · clean-fix mend stage |
+| `mend` | `cargo mend` check pass and `--fix` | `/clippy` STEP 2/3 · `invoke.sh mend` (lint CLI, clean-fix, validate_ci mend steps) |
 | `style_review` | style-guide walk over the uncommitted diff | `/clippy` STEP 4 · `/plan:delegate` phase-end gate |
-| `clippy` | `cargo clippy` | `/clippy` STEP 5 · `verify.sh lint <pkg>` |
-| `doc` | `cargo doc -D warnings` | `/clippy` STEP 5b |
-| `fmt` | `cargo +nightly fmt` | `/clippy` STEP 8 · `verify.sh lint`, `verify.sh fmt`, `verify.sh final` |
+| `clippy` | `cargo clippy` | `/clippy` STEP 5 · `invoke.sh clippy` (lint CLI, clean-fix, `verify.sh lint <pkg>`) |
+| `doc` | `cargo doc -D warnings` | `/clippy` STEP 5b · `invoke.sh doc` (`lint doc`) |
+| `fmt` | `cargo +nightly fmt` | `/clippy` STEP 8 · `invoke.sh fmt` (`lint fmt`, `verify.sh lint`/`fmt`/`final`) |
 
-The three consumers: the `/clippy` skill (reads the file at STEP 0 of every run,
-including runs started by `/commit_prep` or a `/plan:delegate` work order),
-`scripts/delegate/verify.sh`, and `scripts/clean-fix/clean-fix.sh`.
+The two consumers: the `/clippy` skill (reads the file at STEP 0 of every run,
+including runs started by `/commit_prep` or a `/plan:delegate` work order) and
+`scripts/lint/invoke.sh` — the sourced bottom layer that the `lint` CLI,
+`scripts/delegate/verify.sh`, and `scripts/clean-fix/clean-fix.sh` all flow
+through.
 `/plan:delegate` uses `/clippy style-only` for its required phase-end style
 gate, so `style_review=off` blocks that checkpoint instead of silently passing
 it.
@@ -69,7 +71,9 @@ it.
   check and test inside `verify.sh final`.** Those are correctness gates, not
   lints. A delegate phase that compiles nothing has verified nothing.
 - **`pre_release_checks.sh` and `validate_ci.sh`.** A release or CI check that
-  silently no-ops is worse than a noisy one.
+  silently no-ops is worse than a noisy one. Both route through the `lint` CLI
+  like everything else, but set `LINT_CONFIG_FORCE=1` on the steps they never
+  allow to skip (every step except validate_ci's two mend steps).
 - **Scope.** `verify.sh` pins targets per package on purpose (see its header
   comment); config decides *whether* a check runs, never with what flags.
 

@@ -25,8 +25,12 @@ git fetch origin
 echo ""
 echo "=== Quality Checks ==="
 
-echo "  Running lint clippy..."
-"$HOME/.claude/scripts/lint/lint" clippy
+# the lint CLI is the single bottom layer for cargo invocations; as a release
+# gate, LINT_CONFIG_FORCE=1 keeps config/lint.conf toggles from skipping steps
+LINT_CMD="$HOME/.claude/scripts/lint/lint"
+
+echo "  Running clippy..."
+env LINT_CONFIG_FORCE=1 "$LINT_CMD" clippy
 echo "  Clippy: passed ✓"
 
 echo ""
@@ -36,12 +40,12 @@ echo "  Build: passed ✓"
 
 echo ""
 echo "  Running cargo nextest..."
-cargo nextest run --all
+"$LINT_CMD" nextest --all
 echo "  Tests: passed ✓"
 
 echo ""
 echo "  Running cargo fmt..."
-"$HOME/.claude/scripts/lint/lint" fmt
+env LINT_CONFIG_FORCE=1 "$LINT_CMD" fmt
 echo "  Format: passed ✓"
 
 echo ""

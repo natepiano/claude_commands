@@ -30,111 +30,24 @@
 #                                          example contains unit tests)
 #   verify.sh final                        full workspace gate (orchestrator only)
 #
+# Invocation policy — canonical flags, lint.conf gating, sandbox-failure
+# detection — lives in scripts/lint/invoke.sh, the
+# single bottom layer, sourced below. This file adds only delegate scope rules
+# on top. Workspace-scope entry points (aliases, validate_ci, clean-fix,
+# release checks) use the lint CLI in that directory instead of this script.
+#
 # Exit codes: 2 = usage error or missing tooling; 3 = sandbox failure, re-run
 # the same command unsandboxed; anything else is the underlying cargo status.
 
 set -euo pipefail
 
-# macOS sandboxes cannot nest. A dependency whose build script shells out to
-# Swift Package Manager — apple-cf, apple-metal, screencapturekit, anything
-# wrapping a macOS framework — makes SwiftPM call sandbox-exec, which fails
-# inside the Claude Code sandbox. The panic names Swift and never names the
-# sandbox, so it reads like a broken dependency and costs a round trip to
-# diagnose. Name it here instead of leaving it to be rediscovered.
-SANDBOX_SIGNATURE='sandbox_apply: Operation not permitted'
-
-# Lint policy. Missing reader means every check runs — a delegate must never be
-# silently under-verified because a config script moved.
-LINT_CONFIG_READER="$HOME/.claude/scripts/lint/lint_config.sh"
-if [[ -f "$LINT_CONFIG_READER" ]]; then
-    # shellcheck source=/dev/null
-    source "$LINT_CONFIG_READER"
-else
-    echo "verify.sh: $LINT_CONFIG_READER not found — running every check" >&2
-    lint_config_enabled() { return 0; }
-    lint_config_skip_notice() { :; }
-fi
+# The single bottom layer: run(), lint.conf gating, fmt_cargo, run_nextest,
+# invoke_clippy, and the sandbox-failure detection all come from here.
+# shellcheck source=/dev/null
+source "$HOME/.claude/scripts/lint/invoke.sh"
 
 usage() {
     sed -n '/^# Usage:/,/^$/p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//' >&2
-}
-
-run() {
-    printf '+ %s\n' "$*"
-    local log="${TMPDIR:-/tmp}/verify_sh.$$.log"
-    local status=0
-    # tee keeps output streaming: heartbeat_watch.sh digests the agent log to
-    # prove the delegate is alive, so buffering a long build looks like a hang.
-    set +e
-    "$@" 2>&1 | tee "$log"
-    status=${PIPESTATUS[0]}
-    set -e
-    if [[ $status -ne 0 ]] && grep -q "$SANDBOX_SIGNATURE" "$log"; then
-        rm -f "$log"
-        cat >&2 <<'EOF'
-
-verify.sh: THIS IS A SANDBOX FAILURE, NOT A TEST FAILURE.
-
-A dependency build script shells out to Swift Package Manager, which sandboxes
-itself with sandbox-exec. macOS sandboxes cannot nest, so the call fails and the
-build script panics naming Swift.
-
-Re-run this exact command with the sandbox disabled — in Claude Code, pass
-dangerouslyDisableSandbox: true on the Bash call.
-
-Do not report this as a finding. Do not pin, patch, or change the dependency it
-names. Nothing in settings.json fixes it: excludedCommands decides whether an
-unsandboxed run needs approval, not whether it runs unsandboxed.
-EOF
-        exit 3
-    fi
-    rm -f "$log"
-    return $status
-}
-
-have_nextest() {
-    cargo nextest --version >/dev/null 2>&1
-}
-
-# The workspace's rustfmt configuration uses nightly-only options. Formatting with
-# stable could accept output that nightly rejects, so it is a verifier error.
-fmt_cargo() {
-    if ! lint_config_enabled fmt; then
-        lint_config_skip_notice fmt "cargo +nightly fmt $*"
-        return 0
-    fi
-    if ! cargo +nightly fmt --version >/dev/null 2>&1; then
-        echo "verify.sh: cargo +nightly fmt is required" >&2
-        exit 2
-    fi
-    run cargo +nightly fmt "$@"
-}
-
-require_nextest() {
-    if ! have_nextest; then
-        echo "verify.sh: cargo nextest is required" >&2
-        exit 2
-    fi
-}
-
-# Test builds use the workspace's fast-test profile when it defines one: deps
-# compile at a lower opt-level than dev's (only `cargo run` needs opt-3 deps),
-# and the separate target dir keeps test builds off the dev profile's build
-# lock. Workspaces without the profile build exactly as before.
-nextest_profile_flags() {
-    local root
-    root="$(cargo locate-project --workspace --message-format plain 2>/dev/null)" || return 0
-    if [[ -n "$root" ]] && grep -q '^\[profile\.fast-test\]' "$root"; then
-        printf -- '--cargo-profile fast-test'
-    fi
-}
-
-run_nextest() {
-    require_nextest
-    local profile_flags
-    profile_flags="$(nextest_profile_flags)"
-    # shellcheck disable=SC2086
-    run cargo nextest run $profile_flags "$@"
 }
 
 TARGET_FLAGS_PY='
@@ -263,7 +176,7 @@ case "$CMD" in
         if lint_config_enabled clippy; then
             FLAGS="$(target_flags "$PKG")"
             # shellcheck disable=SC2086
-            run cargo clippy -p "$PKG" $FLAGS --tests -- -D warnings
+            invoke_clippy -p "$PKG" $FLAGS --tests
         else
             lint_config_skip_notice clippy "cargo clippy -p $PKG"
         fi

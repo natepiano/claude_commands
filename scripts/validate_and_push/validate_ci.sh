@@ -2,6 +2,11 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+# Single bottom layer for cargo invocations: scripts/lint owns every command's
+# flags (lint CLI over invoke.sh); this script only picks subcommands.
+# LINT_CONFIG_FORCE=1 is set on each step that must never be skipped by
+# config/lint.conf — as a pre-push gate, only the two mend steps honor that
+# file (see the mend note below).
 LINT_CMD="$HOME/.claude/scripts/lint/lint"
 
 # Lint policy, read for `mend` only — see the mend note in the header comment
@@ -158,10 +163,11 @@ run_target_clippy() {
         PKG_CONFIG_PATH= \
         PKG_CONFIG_ALLOW_CROSS=1 \
         PKG_CONFIG_ALLOW_CROSS_x86_64_unknown_linux_gnu=1 \
+        LINT_CONFIG_FORCE=1 \
         "$LINT_CMD" clippy --target "$target" "$@"
       ;;
     *)
-      "$LINT_CMD" clippy --target "$target" "$@"
+      env LINT_CONFIG_FORCE=1 "$LINT_CMD" clippy --target "$target" "$@"
       ;;
   esac
 }
@@ -221,15 +227,15 @@ else
   run_autofix_step "cargo-mend autofix" "$LINT_CMD" mend --fix
 fi
 
-run_autofix_step "rustfmt" "$LINT_CMD" fmt
+run_autofix_step "rustfmt" env LINT_CONFIG_FORCE=1 "$LINT_CMD" fmt
 
 run_autofix_step "taplo" taplo fmt
 
-run_step "clippy" cargo clippy --workspace --all-features --tests -- -D warnings
+run_step "clippy" env LINT_CONFIG_FORCE=1 "$LINT_CMD" clippy-tests
 
 run_configured_target_checks
 
-run_step "nextest" cargo nextest run --workspace --all-features --tests
+run_step "nextest" "$LINT_CMD" nextest --workspace --all-features --tests
 
 if ! lint_config_enabled mend; then
   lint_config_skip_notice mend "cargo-mend --fail-on-warn"

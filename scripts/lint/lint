@@ -1,158 +1,46 @@
 #!/usr/bin/env bash
+# lint — public entry point over invoke.sh, the single bottom layer for cargo
+# invocation policy. Shell aliases (clippy, cf, ct, cwb, mend), validate_ci.sh,
+# pre_release_checks.sh, clean-fix agent prompts, and /clippy all come through
+# here; delegate/verify.sh sources invoke.sh directly to add its per-package
+# scope rules. This file picks workspace scope only, never policy flags.
 set -euo pipefail
 
-SCRIPT_NAME="$(basename "$0")"
+# shellcheck source=/dev/null
+source "$HOME/.claude/scripts/lint/invoke.sh"
 
 usage() {
   cat <<EOF
 Usage:
-  ${SCRIPT_NAME} mend [--manifest-path PATH] [--fix] [--fail-on-warn] [extra cargo-mend args...]
-  ${SCRIPT_NAME} clippy [--manifest-path PATH] [extra cargo args...] [-- extra clippy args...]
-  ${SCRIPT_NAME} doc [--manifest-path PATH] [extra cargo-doc args...]
-  ${SCRIPT_NAME} fmt [--manifest-path PATH] [extra cargo-fmt args...]
-  ${SCRIPT_NAME} all [--manifest-path PATH]
+  lint mend [args...]             cargo mend --workspace --all-targets
+  lint clippy [args] [-- lints]   workspace clippy --all-targets, -D warnings
+  lint clippy-tests [args] [-- lints]
+                                  workspace clippy over lib/bins/tests only —
+                                  validate_ci's host shape (no examples or
+                                  benches)
+  lint doc [args...]              cargo doc, warnings denied
+  lint fmt [args...]              cargo +nightly fmt --all
+  lint nextest [args...]          cargo nextest run
 
-If --manifest-path is omitted, the command runs in the current workspace.
+mend/clippy/doc/fmt honor config/lint.conf (edit with /lint_config);
+LINT_CONFIG_FORCE=1 overrides the gate — push and release gates set it on
+steps they never allow to skip. Extra args (--manifest-path, --fix, --target,
+"-- <clippy lints>") pass through unchanged.
 EOF
 }
 
-if [[ $# -lt 1 ]]; then
-  usage >&2
-  exit 2
-fi
+CMD="${1:-}"
+[[ $# -gt 0 ]] && shift
 
-COMMAND="$1"
-shift
-
-manifest_path=""
-args=()
-while [[ $# -gt 0 ]]; do
-  case "$1" in
-    --manifest-path)
-      if [[ $# -lt 2 ]]; then
-        echo "error: --manifest-path requires a value" >&2
-        exit 2
-      fi
-      manifest_path="$2"
-      shift 2
-      ;;
-    --help|-h)
-      usage
-      exit 0
-      ;;
-    *)
-      args+=("$1")
-      shift
-      ;;
-  esac
-done
-
-run_mend() {
-  local command=(cargo mend --workspace --all-targets)
-  if [[ -n "$manifest_path" ]]; then
-    command+=(--manifest-path "$manifest_path")
-  fi
-  command+=("$@")
-  env RUSTC_WRAPPER= "${command[@]}"
-}
-
-run_clippy() {
-  local cargo_args=()
-  local clippy_args=(-D warnings)
-  local after_separator=0
-
-  for arg in "$@"; do
-    if [[ "$arg" == "--" && "$after_separator" -eq 0 ]]; then
-      after_separator=1
-      continue
-    fi
-
-    if [[ "$after_separator" -eq 0 ]]; then
-      cargo_args+=("$arg")
-    else
-      clippy_args+=("$arg")
-    fi
-  done
-
-  local command=(cargo clippy
-    --workspace \
-    --all-targets \
-    --all-features)
-  if [[ -n "$manifest_path" ]]; then
-    command+=(--manifest-path "$manifest_path")
-  fi
-  if [[ "${#cargo_args[@]}" -gt 0 ]]; then
-    command+=("${cargo_args[@]}")
-  fi
-  command+=(-- "${clippy_args[@]}")
-  "${command[@]}"
-}
-
-run_doc() {
-  local command=(cargo doc
-    --no-deps \
-    --workspace \
-    --all-features)
-  if [[ -n "$manifest_path" ]]; then
-    command+=(--manifest-path "$manifest_path")
-  fi
-  command+=("$@")
-  env RUSTDOCFLAGS="-D warnings" "${command[@]}"
-}
-
-run_fmt() {
-  local command=(cargo +nightly fmt --all)
-  if [[ -n "$manifest_path" ]]; then
-    command+=(--manifest-path "$manifest_path")
-  fi
-  command+=("$@")
-  "${command[@]}"
-}
-
-case "$COMMAND" in
-  mend)
-    if [[ "${#args[@]}" -gt 0 ]]; then
-      run_mend "${args[@]}"
-    else
-      run_mend
-    fi
-    ;;
-  clippy)
-    if [[ "${#args[@]}" -gt 0 ]]; then
-      run_clippy "${args[@]}"
-    else
-      run_clippy
-    fi
-    ;;
-  doc)
-    if [[ "${#args[@]}" -gt 0 ]]; then
-      run_doc "${args[@]}"
-    else
-      run_doc
-    fi
-    ;;
-  fmt)
-    if [[ "${#args[@]}" -gt 0 ]]; then
-      run_fmt "${args[@]}"
-    else
-      run_fmt
-    fi
-    ;;
-  all)
-    if [[ "${#args[@]}" -ne 0 ]]; then
-      echo "error: lint all only accepts --manifest-path" >&2
-      exit 2
-    fi
-    run_mend --fail-on-warn
-    run_clippy
-    run_doc
-    run_fmt --check
-    ;;
-  --help|-h)
-    usage
-    ;;
+case "$CMD" in
+  mend)         invoke_mend "$@" ;;
+  clippy)       invoke_clippy --workspace --all-targets --all-features "$@" ;;
+  clippy-tests) invoke_clippy --workspace --all-features --tests "$@" ;;
+  doc)          invoke_doc "$@" ;;
+  fmt)          fmt_cargo --all "$@" ;;
+  nextest)      run_nextest "$@" ;;
+  --help|-h)    usage ;;
   *)
-    echo "error: unknown lint command: $COMMAND" >&2
     usage >&2
     exit 2
     ;;

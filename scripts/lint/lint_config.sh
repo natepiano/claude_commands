@@ -24,11 +24,11 @@ LINT_CONFIG_FILE="${LINT_CONFIG_FILE:-$HOME/.claude/config/lint.conf}"
 # the config that is not listed here is rejected as unknown.
 LINT_CONFIG_OPS=(
     "cache|reuse a fresh cargo-port lint-run instead of re-running the suite|/clippy STEP 1"
-    "mend|cargo mend check pass and its --fix pass|/clippy STEP 2/3 · clean-fix mend stage · validate_ci.sh mend steps"
+    "mend|cargo mend check pass and its --fix pass|/clippy STEP 2/3 · invoke.sh mend (lint CLI, clean-fix, validate_ci mend steps)"
     "style_review|style-guide walk over the uncommitted diff|/clippy STEP 4 · /plan:delegate phase-end gate"
-    "clippy|cargo clippy|/clippy STEP 5 · verify.sh lint"
-    "doc|cargo doc with -D warnings|/clippy STEP 5b"
-    "fmt|cargo +nightly fmt|/clippy STEP 8 · verify.sh lint, fmt, final"
+    "clippy|cargo clippy|/clippy STEP 5 · invoke.sh clippy (lint CLI, clean-fix, verify.sh lint)"
+    "doc|cargo doc with -D warnings|/clippy STEP 5b · invoke.sh doc (lint doc)"
+    "fmt|cargo +nightly fmt|/clippy STEP 8 · invoke.sh fmt (lint fmt, verify.sh lint/fmt/final)"
 )
 
 _lint_config_op_names() {
@@ -114,7 +114,17 @@ lint_config_state() {
 }
 
 # Exit 0 when the check is on, 1 when off, 2 when the name is unknown.
+# LINT_CONFIG_FORCE=1 makes every known check report on: a pre-push gate
+# (validate_ci.sh) must not silently no-op because a dev-loop switch is off,
+# so it sets this per step on every check it does not itself gate.
 lint_config_enabled() {
+    if [[ "${LINT_CONFIG_FORCE:-0}" == "1" ]]; then
+        if ! _lint_config_is_op "$1"; then
+            _lint_config_unknown "$1"
+            return 2
+        fi
+        return 0
+    fi
     local state
     state="$(lint_config_state "$1")" || return 2
     [[ "$state" == "on" ]]
@@ -205,9 +215,11 @@ Usage: lint_config.sh [<op>] | <op> on|off | all on|off | export | enabled <op>
 
 Checks: $(_lint_config_op_names | tr '\n' ' ')
 
-Not gated by this file: verify.sh check/test/example, the workspace check and
-test inside verify.sh final, pre_release_checks.sh, and every validate_ci.sh
-step except its two cargo-mend steps, which the mend switch does gate.
+Not gated by this file: nextest, verify.sh check/test/example, the workspace
+check and test inside verify.sh final, pre_release_checks.sh, and every
+validate_ci.sh step except its two cargo-mend steps, which the mend switch
+does gate. The gates (validate_ci, pre_release_checks) route through the lint
+CLI too but set LINT_CONFIG_FORCE=1 on the steps they never allow to skip.
 
 Examples:
   lint_config.sh
