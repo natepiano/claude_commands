@@ -1,8 +1,9 @@
 #!/bin/zsh
-# rev 60 — bump this comment in every cargo-tile source file on each change
+# rev 65 — bump this comment in every cargo-tile source file on each change
 # Shared reader for cargo-tile.conf, plus the idle tint every pane paints
 # itself with. Sourced, never executed.
 #
+#   $TILE_ROOT / $TILE_STATE        this instance's root and state dir
 #   tile_conf <key> <default>       prints a whole-second value
 #   tile_conf_str <key> <default>   prints a value verbatim (colors)
 #   tile_decay_secs                 decay_secs, or the test-mode override
@@ -16,6 +17,22 @@
 # %x is the file this line lives in, so the conf is found through the
 # ~/.cargo-tile/bin symlinks and from the shim copied into a toolchain
 TILE_CONF="${${(%):-%x}:A:h}/cargo-tile.conf"
+
+# One cargo-tile instance per root. CARGO_TILE_ROOT points every process
+# in an instance at its own state, logs and grid window, so a throwaway
+# test grid can run beside the real one without either reaching into the
+# other's bookkeeping. TILE_TAG is what a pane advertises in its
+# user.cargotile variable and what the orphan sweep matches on — one tag
+# shared across roots would let either instance close the other's window.
+typeset -g TILE_ROOT="${CARGO_TILE_ROOT:-/tmp/cargo-tile}"
+typeset -g TILE_STATE="$TILE_ROOT/state"
+typeset -g TILE_ERRLOG="$TILE_ROOT/pane-errors.log"
+typeset -g TILE_TAG=grid
+[[ "$TILE_ROOT" == /tmp/cargo-tile ]] || TILE_TAG="grid-${TILE_ROOT:t}"
+
+# iTerm2 wants the marker base64-encoded; only the panes need it, so it
+# is a function rather than a subshell every caller pays for
+tile_tag_b64() { print -rn -- "$TILE_TAG" | base64 }
 
 tile_conf_str() {
     local key="$1" def="$2" val
@@ -38,8 +55,8 @@ tile_conf() {
 # panes are long-lived separate processes — a file is the only thing all
 # of them see flip at once. Decay drops to a second in test mode so a
 # whole row of panes can be watched falling off instead of timed.
-TILE_TEST_FLAG=/tmp/cargo-tile/state/test-mode
-TILE_TEST_DECAY=1
+typeset -g TILE_TEST_FLAG="$TILE_STATE/test-mode"
+typeset -g TILE_TEST_DECAY=1
 
 tile_test_mode() { [[ -f "$TILE_TEST_FLAG" ]] }
 

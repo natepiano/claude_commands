@@ -1,10 +1,11 @@
 #!/bin/zsh
-# rev 60 — bump this comment in every cargo-tile source file on each change
+# rev 65 — bump this comment in every cargo-tile source file on each change
 # Assign runs to the cargo-tile pane layout.
 #   cargo-tile-pane <log>           add a run
 #   cargo-tile-pane --remove <log>  drop a finished run
 #   cargo-tile-pane --check         converge layout (deferred work, recovery)
 #   cargo-tile-pane --decay         close the trailing idle pane
+#   cargo-tile-pane --close         close this instance's grid window
 #
 # Tile 1 is the summary; runs fill tiles 2..N in reading order (down
 # column 1, then column 2, ...) so the grid is always in timestamp
@@ -24,16 +25,27 @@
 # state/target/<o>    the log pane <o> should end up showing
 # state/target-order  pane ordinals in reading order; the summary walks
 #                     it one pane per frame to animate the reflow
+# state/test-mode     present while the grid is in test mode: + and - in
+#                     the summary pane add and drop synthetic tiles, and
+#                     decay runs at a second so a retreat can be watched
+# state/test/         those tiles' logs, one per tile, plus their counter
 set -u
 
 TILE_HOME="${CARGO_TILE_HOME:-$HOME/.cargo-tile}"
-STATE=/tmp/cargo-tile/state
-ERRLOG=/tmp/cargo-tile/pane-errors.log
 
 # idle panes close this many seconds after their content leaves them —
 # cargo-tile.conf is the one place it is set, so pane, slot and summary
-# cannot drift apart
+# cannot drift apart; test mode overrides it to a second
 source "${0:A:h}/conf.zsh"
+STATE="$TILE_STATE"
+ERRLOG="$TILE_ERRLOG"
+
+# a pane iTerm2 launches starts from a fresh environment, so a non-default
+# root has to travel in the command itself or the new pane would come up
+# attached to the default instance
+TILE_ENV=""
+[[ "$TILE_ROOT" == /tmp/cargo-tile ]] || \
+    TILE_ENV="/usr/bin/env CARGO_TILE_ROOT=$TILE_ROOT "
 DECAY_SECS=$(tile_decay_secs)
 
 mode=add
@@ -41,6 +53,7 @@ case "${1:-}" in
     --remove) mode=remove; shift ;;
     --check) mode=check; shift ;;
     --decay) mode=decay; shift ;;
+    --close) mode=close; shift ;;
 esac
 LOG="${1:-}"
 mkdir -p "$STATE/slots" "$STATE/panemap"
@@ -242,7 +255,7 @@ fi
 if [[ "$mode" == check ]]; then
     typeset -A haslog
     for s in "${(k)slotlog[@]}"; do haslog[${slotlog[$s]}]=1; done
-    for lg in /tmp/cargo-tile/run-*-*.log(N); do
+    for lg in "$TILE_ROOT"/run-*-*.log(N); do
         [[ -n "${haslog[$lg]:-}" ]] && continue
         pid="${${lg:t:r}##*-}"
         [[ "$pid" == <-> ]] || continue
@@ -281,7 +294,7 @@ EOF
 }
 
 split_pane() {  # $1 = session id to split below, $2 = new pane ordinal
-    osascript - "$win" "$1" "$TILE_HOME/bin/cargo-tile-slot $2" <<'EOF'
+    osascript - "$win" "$1" "${TILE_ENV}$TILE_HOME/bin/cargo-tile-slot $2" <<'EOF'
 on run argv
 	set winId to (item 1 of argv) as integer
 	set sid to item 2 of argv
@@ -385,9 +398,10 @@ EOF
 adopt_stray() {  # $1 = window id to leave alone
     local out i
     for i in {1..5}; do
-        out=$(osascript - "$1" <<'EOF'
+        out=$(osascript - "$1" "$TILE_TAG" <<'EOF'
 on run argv
 	set keepId to item 1 of argv
+	set myTag to item 2 of argv
 	tell application "iTerm2"
 		repeat with w in windows
 			if ((id of w) as text) is not keepId then
@@ -399,7 +413,7 @@ on run argv
 						try
 							tell s to set v to (variable named "user.cargotile")
 						end try
-						if v is "grid" then
+						if v is myTag then
 							return ((id of w) as text) & " " & (id of s)
 						end if
 					end if
@@ -417,14 +431,17 @@ EOF
     return 1
 }
 
-# close superseded grid windows: any window whose every session is a
-# cargo-tile pane (they tag themselves with the user.cargotile variable;
-# pressing q clears the tag, so a window the user took over survives)
+# close superseded grid windows: any window whose every session is a pane
+# of THIS instance (they tag themselves with the user.cargotile variable;
+# pressing q clears the tag, so a window the user took over survives).
+# The tag carries the root, so a test grid running beside the real one is
+# not mistaken for a window this instance superseded and closed.
 sweep_orphans() {  # $1 = window id to keep
     [[ -n "${1:-}" ]] || return 0
-    osascript - "$1" <<'EOF'
+    osascript - "$1" "$TILE_TAG" <<'EOF'
 on run argv
 	set keepId to item 1 of argv
+	set myTag to item 2 of argv
 	set doomed to {}
 	tell application "iTerm2"
 		repeat with w in windows
@@ -438,7 +455,7 @@ on run argv
 						try
 							tell s to set v to (variable named "user.cargotile")
 						end try
-						if v is "grid" then set marked to marked + 1
+						if v is myTag then set marked to marked + 1
 					end repeat
 				end repeat
 				if total > 0 and marked is total then
@@ -586,13 +603,13 @@ full_rebuild() {
     shape_for $N
     local m=${#SHAPE}
     typeset -a cmds nords
-    cmds=("$TILE_HOME/bin/cargo-tile-summary")
+    cmds=("${TILE_ENV}$TILE_HOME/bin/cargo-tile-summary")
     nords=(1)
     local j o
     for (( j = 2; j <= N; j++ )); do
         o=$(next_ord)
         nords+=($o)
-        cmds+=("$TILE_HOME/bin/cargo-tile-slot $o")
+        cmds+=("${TILE_ENV}$TILE_HOME/bin/cargo-tile-slot $o")
     done
     local head
     head=$(ensure_window "${cmds[1]}") || return 1
@@ -720,6 +737,21 @@ on run argv
 end run
 EOF
 }
+
+# --close tears the whole instance down: every window whose panes all
+# carry this instance's tag goes, which is the same test the orphan sweep
+# uses, so a window the user took over with q is left alone. Handled
+# before the liveness check below, which would otherwise rebuild the very
+# grid we are trying to close.
+if [[ "$mode" == close ]]; then
+    # forget the window first: a summary that wakes while the sweep is
+    # still running would otherwise see an empty layout, ask for a
+    # rebuild, and stand a fresh grid up behind us
+    rm -f "$STATE/window" "$STATE/layout" "$STATE/rebuild-needed"
+    rm -f "$STATE"/slots/*(N) "$STATE"/panemap/*(N) "$STATE"/target/*(N)
+    sweep_orphans 0 >/dev/null 2>&1
+    exit 0
+fi
 
 # does the window still exist, and does the layout file describe it?
 # splitting against a stale layout puts panes in the wrong place (and

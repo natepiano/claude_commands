@@ -1,20 +1,21 @@
 #!/bin/zsh
-# rev 60 — bump this comment in every cargo-tile source file on each change
+# rev 65 — bump this comment in every cargo-tile source file on each change
 # One layout pane, identified by a permanent ordinal. Watches its map
 # file (the log it should show) and displays it via tail; shows an idle
 # placeholder when the map is empty. Content reflows across panes as
 # the layout changes — the pane itself only ever swaps what it tails.
 set -u
 
-REVISION=60
+REVISION=65
 
 TILE_HOME="${CARGO_TILE_HOME:-$HOME/.cargo-tile}"
-STATE=/tmp/cargo-tile/state
 
 # idle panes close this many seconds after their content leaves them —
 # cargo-tile.conf is the one place it is set, so pane, slot and summary
-# cannot drift apart
+# cannot drift apart; test mode overrides it to a second
 source "${0:A:h}/conf.zsh"
+STATE="$TILE_STATE"
+ERRLOG="$TILE_ERRLOG"
 DECAY_SECS=$(tile_decay_secs)
 IDLE_BG=$(tile_conf_str idle_bg "$TILE_IDLE_BG_DEFAULT")
 
@@ -26,9 +27,10 @@ SLOTF="$STATE/panemap/$N"
 SELF="$0"
 src_rev() { sed -n '2s/^# rev \([0-9]*\).*/\1/p' "$SELF" 2>/dev/null; }
 
-# tag the session so the orphan sweep can tell a cargo-tile grid window
-# from one the user owns; pressing q below clears the tag (base64 "grid")
-printf '\033]1337;SetUserVar=cargotile=%s\007' Z3JpZA==
+# tag the session so the orphan sweep can tell this instance's grid
+# window from one the user owns — or from another instance's grid;
+# pressing q below clears the tag
+printf '\033]1337;SetUserVar=cargotile=%s\007' "$(tile_tag_b64)"
 
 tailpid=""
 cur="__init__"

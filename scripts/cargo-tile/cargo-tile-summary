@@ -1,20 +1,20 @@
 #!/bin/zsh
-# rev 60 — bump this comment in every cargo-tile source file on each change
+# rev 65 — bump this comment in every cargo-tile source file on each change
 # Live summary for the cargo-tile grid: revision, grid size, tiled runs,
 # compiler activity (including rustc owned by the sccache server), plus Cargo
 # processes that predate `cargo-tile on` — those lines disappear as they exit.
 set -u
 
-REVISION=60
+REVISION=65
 
 TILE_HOME="${CARGO_TILE_HOME:-$HOME/.cargo-tile}"
-STATE=/tmp/cargo-tile/state
-ERRLOG=/tmp/cargo-tile/pane-errors.log
 
 # idle panes close this many seconds after their content leaves them —
 # cargo-tile.conf is the one place it is set, so pane, slot and summary
-# cannot drift apart
+# cannot drift apart; test mode overrides it to a second
 source "${0:A:h}/conf.zsh"
+STATE="$TILE_STATE"
+ERRLOG="$TILE_ERRLOG"
 DECAY_SECS=$(tile_decay_secs)
 
 # self-refresh: re-exec when the source file's rev comment changes.
@@ -26,12 +26,101 @@ src_rev() { sed -n '2s/^# rev \([0-9]*\).*/\1/p' "$SELF" 2>/dev/null; }
 # window title
 printf '\033]0;cargo-tile summary\007'
 
-# tag the session so the orphan sweep can tell a cargo-tile grid window
-# from one the user owns; pressing q below clears the tag (base64 "grid")
-printf '\033]1337;SetUserVar=cargotile=%s\007' Z3JpZA==
+# tag the session so the orphan sweep can tell this instance's grid
+# window from one the user owns — or from another instance's grid;
+# pressing q below clears the tag
+printf '\033]1337;SetUserVar=cargotile=%s\007' "$(tile_tag_b64)"
 
 last_decay_spawn=0
 painted=""
+
+# Test mode stands a synthetic run up in a slot so growth and decay can
+# be driven by hand. The tile has to hold a real (if near-empty) log:
+# cargo-tile-pane drops any slot whose file is gone, so a slot pointing
+# at nothing would be swept before the grid ever grew. Line 1 carries the
+# OSC 2 title the same way a run's log does, which is where the pane gets
+# its name.
+TESTDIR="$STATE/test"
+
+test_add() {
+    local n=0
+    mkdir -p "$TESTDIR"
+    [[ -s "$TESTDIR/seq" ]] && n=$(<"$TESTDIR/seq")
+    (( n += 1 ))
+    print -r -- "$n" > "$TESTDIR/seq"
+    # no dash before the digits: the summary reaps a slot whose log name
+    # ends in a dead pid, and "testtile7" never parses as one
+    local l="$TESTDIR/testtile$n.log"
+    {
+        printf '\033]2;test tile %s\007\n' "$n"
+        printf '\033[2m  synthetic tile %s — cargo-tile test mode\033[0m\n' "$n"
+    } > "$l"
+    "$TILE_HOME/bin/cargo-tile-pane" "$l" >/dev/null 2>>"$ERRLOG" &!
+}
+
+# Drop the last synthetic tile, which is also the last tile in the grid
+# whenever any exists — test tiles are only ever appended. Real runs are
+# left alone on purpose: --remove deletes the log it unregisters, and
+# doing that to a live build would cut its output off mid-run.
+test_drop() {
+    local f l last=""
+    for f in "$STATE"/slots/*(Nn); do
+        [[ -s "$f" ]] || continue
+        l=$(<"$f")
+        [[ "$l" == "$TESTDIR/"* ]] && last="$l"
+    done
+    [[ -n "$last" ]] || return 1
+    "$TILE_HOME/bin/cargo-tile-pane" --remove "$last" >/dev/null 2>>"$ERRLOG" &!
+}
+
+# Unregistering has to be serial — each call takes the layout lock — so it
+# runs detached rather than freezing the summary for a second per tile.
+# Disowned, it also outlives the exec on the way out through q.
+test_clear() {
+    local f l
+    for f in "$STATE"/slots/*(Nn); do
+        [[ -s "$f" ]] || continue
+        l=$(<"$f")
+        [[ "$l" == "$TESTDIR/"* ]] || continue
+        "$TILE_HOME/bin/cargo-tile-pane" --remove "$l" >/dev/null 2>>"$ERRLOG"
+    done
+}
+
+# Leaving test mode takes the synthetic tiles with it — the flag drops
+# first so they decay at the real interval rather than vanishing in a
+# second, which is the same retreat any finished run gets.
+test_off() {
+    rm -f "$TILE_TEST_FLAG"
+    test_clear &!
+}
+
+# With more panes than tiles, wake the closer once the trailing pane's
+# DECAY_SECS is up — dated from its own map file mtime (when its content
+# left) or decay-last (when the close in front of it made it the trailing
+# pane), whichever came later. That is the same rule the pane script
+# counts down, so the number a pane shows is the one it gets. Called every
+# frame rather than once per stats pass, so a one-second test-mode decay
+# is not rounded up to the stats interval; cargo-tile-pane rechecks all of
+# this under the lock, so an eager spawn is at worst a wasted process. The
+# throttle is in memory and tracks DECAY_SECS, because a fixed five
+# seconds would gate a one-second decay to a fifth of its rate:
+# decay-last means "a pane closed", and stamping it here would hand the
+# next pane back a free window.
+maybe_decay() {
+    local gap=5 now tmt dl
+    (( DECAY_SECS < gap )) && gap=$DECAY_SECS
+    (( gap < 1 )) && gap=1
+    (( P > shown + 1 )) || return
+    [[ -n "$tailord" ]] || return
+    (( SECONDS - last_decay_spawn >= gap )) || return
+    now=$(date +%s)
+    tmt=$(stat -f %m "$STATE/panemap/$tailord" 2>/dev/null) || tmt=$now
+    dl=$(stat -f %m "$STATE/decay-last" 2>/dev/null) || dl=0
+    (( tmt > dl )) && dl=$tmt
+    (( now - dl >= DECAY_SECS )) || return
+    last_decay_spawn=$SECONDS
+    "$TILE_HOME/bin/cargo-tile-pane" --decay >/dev/null 2>>"$ERRLOG" &!
+}
 
 # Move the grid one pane closer to the layout cargo-tile-pane published,
 # and stop. Walking target-order — the reading order — is what turns a
@@ -119,7 +208,7 @@ while true; do
         waiting=()
         free=()
         for pid in "${group[@]}"; do
-            lgs=(/tmp/cargo-tile/run-*-$pid.log(N))
+            lgs=("$TILE_ROOT"/run-*-$pid.log(N))
             if (( ${#lgs} > 0 )) && \
                 tail -4 "${lgs[1]}" 2>/dev/null | grep -q 'waiting for file lock'; then
                 waiting+=("$pid")
@@ -182,25 +271,7 @@ while true; do
         touch "$STATE/rebuild-needed"
     fi
 
-    # decay: with more panes than tiles, wake the closer once the
-    # trailing pane's DECAY_SECS is up — dated from its own map file
-    # mtime (when its content left) or decay-last (when the close in
-    # front of it made it the trailing pane), whichever came later.
-    # That is the same rule the pane script counts down, so the number
-    # a pane shows is the one it gets. The spawn throttle is in memory:
-    # decay-last means "a pane closed", and stamping it here would hand
-    # the next pane back a free window.
-    if (( P > shown + 1 )) && [[ -n "$tailord" ]] \
-        && (( SECONDS - last_decay_spawn >= 5 )); then
-        tmt=$(stat -f %m "$STATE/panemap/$tailord" 2>/dev/null) || tmt=$now
-        dl=$(stat -f %m "$STATE/decay-last" 2>/dev/null) || dl=0
-        (( tmt > dl )) && dl=$tmt
-        if (( now - dl >= DECAY_SECS )); then
-            last_decay_spawn=$SECONDS
-            "$TILE_HOME/bin/cargo-tile-pane" --decay \
-                >/dev/null 2>>"$ERRLOG" &!
-        fi
-    fi
+    maybe_decay
 
     # pre-existing cargo processes: snapshot taken at `cargo-tile on`,
     # pruned as they exit
@@ -459,7 +530,13 @@ while true; do
         fi
     fi
 
-    buf+=$'\n\033[2m[q] exit to shell\033[0m\n'
+    if tile_test_mode; then
+        buf+=$'\n\033[1;35mTEST MODE\033[0m\033[2m  [+] add tile   [-] drop the last one'
+        buf+=" (decays in ${DECAY_SECS}s)"$'   [t] leave\033[0m\n'
+    else
+        buf+=$'\n\033[2m[t] test mode\033[0m\n'
+    fi
+    buf+=$'\033[2m[q] exit to shell\033[0m\n'
 
     printf '\033[H\033[2J\033[3J'
     print -rn -- "$buf"
@@ -476,16 +553,31 @@ while true; do
     waited=0
     while (( waited < 2000 )); do
         step_reflow
+        maybe_decay
         # q drops this pane to an interactive shell
         if [[ -t 0 ]]; then
             key=""
             read -s -t "$tick" -k 1 key 2>/dev/null
-            if [[ "$key" == q ]]; then
-                tile_paint normal
-                printf '\033]1337;SetUserVar=cargotile=\007'
-                printf '\033[H\033[2J\033[3J'
-                exec /bin/zsh -il
-            fi
+            case "$key" in
+                q)
+                    tile_test_mode && test_off
+                    tile_paint normal
+                    printf '\033]1337;SetUserVar=cargotile=\007'
+                    printf '\033[H\033[2J\033[3J'
+                    exec /bin/zsh -il
+                    ;;
+                t)
+                    if tile_test_mode; then test_off; else touch "$TILE_TEST_FLAG"; fi
+                    break
+                    ;;
+                # = is + without the shift; both read as "one more"
+                +|=)
+                    tile_test_mode && { test_add; break }
+                    ;;
+                -|_)
+                    tile_test_mode && { test_drop; break }
+                    ;;
+            esac
         else
             sleep "$tick"
         fi

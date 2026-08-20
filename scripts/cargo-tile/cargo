@@ -1,5 +1,5 @@
 #!/bin/zsh
-# rev 60 — bump this comment in every cargo-tile source file on each change
+# rev 65 — bump this comment in every cargo-tile source file on each change
 # cargo-tile-shim -- master copies live in ~/.claude/scripts/cargo-tile/;
 # ~/.cargo-tile/bin holds symlinks and `cargo-tile on` reinstalls the
 # toolchain hooks from there.
@@ -16,8 +16,9 @@ TILE_HOME="${CARGO_TILE_HOME:-$HOME/.cargo-tile}"
 # Code shell) can't write $HOME dotdirs, so pid/slot registration
 # would silently fail there. The on/off toggle stays in TILE_HOME so
 # it survives reboots.
-STATE=/tmp/cargo-tile/state
-ERRLOG=/tmp/cargo-tile/pane-errors.log
+ROOT="${CARGO_TILE_ROOT:-/tmp/cargo-tile}"
+STATE="$ROOT/state"
+ERRLOG="$ROOT/pane-errors.log"
 
 SELF_DIR="${0:h}"
 if [[ -x "$SELF_DIR/cargo-tile-real" ]]; then
@@ -74,7 +75,7 @@ fi
 (( tile )) || exec "$REAL" "$@"
 
 export CARGO_TILE_NESTED=$$
-LOG_DIR=/tmp/cargo-tile
+LOG_DIR="$ROOT"
 mkdir -p "$LOG_DIR" "$STATE/pids"
 LOG="$LOG_DIR/run-$(date +%Y%m%d-%H%M%S)-$$.log"
 
