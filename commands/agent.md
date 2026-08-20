@@ -4,7 +4,7 @@ description: Show or edit agent family, agent, and effort assignments in the sha
 
 # agent
 
-`$ARGUMENTS` — optional: `skills`, `<function>`, `<function> <family>`, or `<function>.<subtask> <agent>[:<effort>]`.
+`$ARGUMENTS` — optional: `skills`, `<function>`, `<family>`, `<function> <family>`, or `<function>.<subtask> <agent>[:<effort>]`.
 
 Run:
 
@@ -30,13 +30,23 @@ No arguments prints every function's active family and resolved rows (one `task=
 
 The switch is rejected if any row in the target family set is invalid.
 
+## Switch every function at once
+
+```text
+/agent <codex|claude>
+```
+
+A bare family name — no function — moves every `[assignments]` entry to that family, exact-task overrides included. It is validated wholesale first: one function missing a set for that family, or one invalid row in any of them, rejects the whole switch and leaves the registry untouched.
+
+On success it prints `# switched every function to <family>` followed by the no-argument status output (rows in `task | family | agent | effort` form) and the usage block. Render the `# switched …` line as plain text first, then the rows per the Status rules above.
+
 ## Edit a row
 
 ```text
 /agent <function>.<subtask> <agent>[:<effort>]
 ```
 
-The agent names its own family — `[codex.agents]` and `[claude.agents]` share no names — so this edits whichever family's row the agent belongs to, active or not. Naming a dormant family's agent is not an error: the row is written and reported dormant. Editing a row never changes which family is live; only `/agent <function> <family>` does that. The effort must exist in that agent's catalog entry.
+The agent names its own family — `[codex.agents]` and `[claude.agents]` share no names — so this edits whichever family's row the agent belongs to, active or not. Naming a dormant family's agent is not an error: the row is written and reported dormant. Editing a row never changes which family is live; only `/agent <function> <family>` or `/agent <family>` does that. The effort must exist in that agent's catalog entry.
 
 On success the edit prints a `# updated [<function>.<family>] <task> — live|dormant` line, then the affected function's rows and usage (same output as `/agent <function>`). Render the `# updated …` line as plain text first, then the rows per the Status rules above.
 
@@ -45,6 +55,7 @@ On success the edit prints a `# updated [<function>.<family>] <task> — live|do
 ```text
 /agent                                    show all assignments and rows
 /agent module_review                      show just module_review's rows
+/agent claude                             every function switches to the claude family
 /agent delegate claude                    /plan:delegate switches to the claude family
 /agent delegate.escalation gpt-5.6-sol:max   set agent and effort for one subtask
 /agent cli.commit_prep sonnet             set agent, keep the CLI default effort

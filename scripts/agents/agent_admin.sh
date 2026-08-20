@@ -22,8 +22,12 @@ list_skills() {
 # usage [function] — with a function, the examples use that function's real
 # subtasks and current agent so they are copy-pasteable.
 usage() {
-    local fn="${1:-}" ex_fn="delegate" ex_other="claude" ex_row="delegate.escalation"
+    local fn="${1:-}" switched="${2:-}"
+    local ex_fn="delegate" ex_other="claude" ex_row="delegate.escalation"
     local ex_pair="gpt-5.6-sol:max" family row_line
+    if [[ -n "$switched" ]]; then
+        [[ "$switched" == "codex" ]] && ex_other="claude" || ex_other="codex"
+    fi
     if [[ -n "$fn" ]]; then
         family="$(_agents_registry_get assignments "$fn")"
         if [[ -n "$family" ]]; then
@@ -38,11 +42,12 @@ usage() {
         fi
     fi
     cat <<EOF
-Usage: agent_admin.sh [skills | <function>] | <function> <codex|claude> | <function>.<subtask> <agent>[:<effort>]
+Usage: agent_admin.sh [skills | <function> | <family>] | <function> <codex|claude> | <function>.<subtask> <agent>[:<effort>]
 
   (no args)                print every function, its family, and its resolved rows
   skills                   print the list of configured skills for use with agents
   <function>               print just that function's rows
+  <family>                 switch every function to the codex or claude family
   <function> <family>      switch a whole function to the codex or claude family
                            — the only thing that changes which rows are live
   <function>.<subtask> <agent>[:<effort>]
@@ -53,6 +58,7 @@ Usage: agent_admin.sh [skills | <function>] | <function> <codex|claude> | <funct
 
 Examples:
   agent_admin.sh $ex_fn
+  agent_admin.sh $ex_other   # switch every function at once
   agent_admin.sh $ex_fn $ex_other
   agent_admin.sh $ex_row $ex_pair
   agent_admin.sh $ex_row ${ex_pair%%:*}   # keep the agent CLI default effort
@@ -89,6 +95,15 @@ elif [[ "$#" -eq 1 ]]; then
     fi
     if [[ "$1" == "skills" ]]; then
         list_skills
+        exit 0
+    fi
+    # A bare family name switches everything; no function is ever named for one.
+    if _agents_config_has_section "$1.agents"; then
+        agents_set_all_assignments "$1"
+        echo "# switched every function to $1"
+        agents_list_assignments
+        echo ""
+        usage "" "$1"
         exit 0
     fi
     agents_list_function "$1"

@@ -62,6 +62,7 @@ Public:
 - `agents_list_assignments [filter]` — walks `[assignments]`; for a bare function key it resolve-prints every row of the active set, skipping sub-tasks shadowed by an exact-task override (which are printed once from their own key). Returns nonzero if *any* row fails to resolve; with a filter that matches no assignment it errors.
 - `agents_list_function <function>` — prints every row of *both* families for one function as `task=… family=… agent=… effort=… active=yes|no`, then a `# current family: X` line (with `(overrides: …)` when exact-task assignments exist).
 - `agents_set_assignment <function> <family>` — validates that every row of `[<function>.<family>]` resolves, then awk-rewrites the `[assignments]` line. Any invalid row → reject, name the row, file untouched.
+- `agents_set_all_assignments <family>` — switches **every** `[assignments]` entry, exact-task overrides included, to one family. Validates the whole target set first — a function with no `[<function>.<family>]` section, an override key with no matching row, or any invalid row rejects the switch with the file untouched — then awk-rewrites every assignment line in one pass, preserving trailing inline comments and spacing byte-exactly.
 - `agents_set_row <task> <agent>[:<effort>]` — edits one row. The **agent** names the family (the two catalogs share no names), so the row written is the one the agent could only have meant, live or dormant; an agent listed by both catalogs is refused as ambiguous, and an agent whose family has no `[<function>.<family>]` section names the missing section. Validates the pair, then awk-rewrites the row preserving its trailing inline comment and spacing byte-exactly. Sets `AGENT_ROW_FAMILY`, `AGENT_ROW_ACTIVE_FAMILY`, `AGENT_ROW_ACTIVE`. Editing a row never changes which family is live.
 - `agents_codex_args` — one line: `-m <agent>`, plus `-c model_reasoning_effort="<effort>"` when effort is non-empty.
 - `agents_claude_args` — one line: `--model <agent>`, plus `--effort <effort>` when effort is non-empty.
@@ -76,6 +77,7 @@ Private helpers:
 - `_agents_section_keys_inline <section>` — comma-joined key list for error text.
 - `_agents_function_families_inline <function>` — families that have a set section for a function.
 - `_agents_agent_families_inline <agent>` — families whose catalog lists an agent (one match names its family; two means the catalogs collided).
+- `_agents_families_inline` — comma-joined list of families that have an agent catalog, for the unknown-family error.
 - `_agents_active_family <function> <subtask>` — the family a task resolves through today, honoring exact-task overrides; shared by `agents_list_function` and `agents_set_row`.
 - `_agents_effort_allowed <csv> <effort>` and `_agents_validate_pair <context> <family> <pair>` — pair splitting and catalog validation; `_agents_validate_pair` is what sets `AGENT_MODEL` / `AGENT_EFFORT`.
 
@@ -111,6 +113,7 @@ A thin dispatcher over the resolver:
 - no args → `agents_list_assignments` + usage block;
 - `skills` → the unique sorted function names from `[assignments]`;
 - `<function>` → `agents_list_function` + usage with examples tuned to that function's real subtask and current pair;
+- `<family>` alone → `agents_set_all_assignments`, then a `# switched every function to <family>` line and the no-arg listing;
 - `<function> <family>` → `agents_set_assignment`;
 - `<function>.<subtask> <agent>[:<effort>]` → `agents_set_row`, then a `# updated [<function>.<family>] <task> — live|dormant` line (dormant hints the `agent_admin.sh <fn> <family>` that would make it live), then the function's rows;
 - a lone dotted argument or three-plus args → usage on stderr, exit 1.
@@ -148,10 +151,10 @@ All four wrappers capture resolver stderr into their log (`agents_resolve "$TASK
 ## Invariants
 
 - The registry is the only home for family/agent/effort. Consumers resolve through `agents_resolve` or `agent_exec` and never re-derive flag vocabulary — `agents_codex_args` / `agents_claude_args` own it.
-- Every function keeps **both** family sets fully specified, so switching families is a one-row edit; `agents_set_assignment` refuses a switch if any row of the target set fails validation, and leaves the file untouched.
+- Every function keeps **both** family sets fully specified, so switching families is a one-row edit; `agents_set_assignment` (and `agents_set_all_assignments`, across every function at once) refuses a switch if any row of the target set fails validation, and leaves the file untouched.
 - Agent names stay disjoint between `[codex.agents]` and `[claude.agents]` — `agents_set_row` infers the family from the agent and refuses a name listed by both rather than guessing.
 - Task names are exactly two segments. Empty effort means "omit the flag"; `agent:` with nothing after the colon is invalid; a catalog row with an empty effort list is valid and admits only bare pairs.
-- Only `agents_set_assignment` changes which family is live. `agents_set_row` writes a row (live or dormant) and never flips liveness.
+- Only `agents_set_assignment` and `agents_set_all_assignments` change which family is live. `agents_set_row` writes a row (live or dormant) and never flips liveness.
 - The sync rewrites only `[codex.agents]` and never touches assignments. `[claude.agents]` stays hand-maintained; alias warnings never auto-add, vanished-agent warnings never auto-repoint.
 - New lookups use `_agents_registry_get` / `_agents_registry_has_key` (literal key comparison). Never match keys with an unescaped `^key=` regex — dotted keys like `delegate.review` mis-match.
 - Any awk that writes a user-supplied value into the conf passes it through `ENVIRON`, not `awk -v`. Row rewrites preserve trailing inline comments and spacing byte-exactly; conf writes go through a tmp file + `mv` (mode preserved), never in place.

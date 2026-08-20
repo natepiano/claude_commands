@@ -112,6 +112,31 @@ gpt-test=low,medium,high
 opus=low,medium,high,max
 EOF
 
+cat > "$TEST_DIR/switchall.conf" <<'EOF'
+[assignments]
+one=codex
+one.work=codex
+two=codex    # trailing comment
+
+[one.codex]
+work=gpt-test:high
+
+[one.claude]
+work=opus:max
+
+[two.codex]
+work=gpt-test:high
+
+[two.claude]
+work=opus:max
+
+[codex.agents]
+gpt-test=low,medium,high
+
+[claude.agents]
+opus=low,medium,high,max
+EOF
+
 write_fixture "$TEST_DIR/base.conf"
 source "$SCRIPT_DIR/agents_config.sh"
 
@@ -255,6 +280,38 @@ override_count="$(printf '%s\n' "$assignment_list" | awk '$1 == "task=override.w
 [[ "$override_count" -eq 1 ]] || fail "exact-task override was listed $override_count times"
 printf '%s\n' "$assignment_list" | grep -q '^task=override.work family=claude ' \
     || fail "exact-task override did not use the override family"
+
+# A bare family switches every [assignments] entry, exact-task overrides too.
+write_fixture "$TEST_DIR/switchall.conf"
+before="$TEST_DIR/switchall-before.conf"
+expected="$TEST_DIR/switchall-expected.conf"
+cp "$AGENTS_CONFIG_FILE" "$before"
+sed -e 's/^one=codex$/one=claude/' \
+    -e 's/^one\.work=codex$/one.work=claude/' \
+    -e 's/^two=codex    # trailing comment$/two=claude    # trailing comment/' \
+    "$before" > "$expected"
+agents_set_all_assignments claude
+cmp "$expected" "$AGENTS_CONFIG_FILE" || fail "switch-all changed lines other than the assignments or comment spacing"
+agents_resolve one.work
+[[ "$AGENT_FAMILY" == "claude" && "$AGENT_MODEL" == "opus" ]] || fail "switch-all did not move the exact-task override"
+agents_resolve two.work
+[[ "$AGENT_FAMILY" == "claude" ]] || fail "switch-all did not move a commented assignment"
+agents_set_all_assignments codex
+cmp "$before" "$AGENTS_CONFIG_FILE" || fail "switch-all reversal was not byte-identical"
+
+before="$TEST_DIR/switchall-reject.conf"
+cp "$AGENTS_CONFIG_FILE" "$before"
+assert_fails "unknown family" agents_set_all_assignments nosuch
+cmp "$before" "$AGENTS_CONFIG_FILE" || fail "unknown family changed the registry"
+stderr_out="$(agents_set_all_assignments nosuch 2>&1 >/dev/null || true)"
+[[ "$stderr_out" == *"Configured families"* ]] || fail "unknown family error did not list the families"
+
+# One missing set or invalid row anywhere rejects the whole switch.
+write_fixture "$TEST_DIR/base.conf"
+before="$TEST_DIR/switchall-base.conf"
+cp "$AGENTS_CONFIG_FILE" "$before"
+assert_fails "switch-all with a missing set" agents_set_all_assignments claude
+cmp "$before" "$AGENTS_CONFIG_FILE" || fail "rejected switch-all changed the registry"
 
 AGENT_MODEL="gpt-test"
 AGENT_EFFORT="high"

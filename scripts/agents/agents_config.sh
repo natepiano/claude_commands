@@ -123,6 +123,20 @@ _agents_agent_families_inline() {
     done
 }
 
+# Every family with an agent catalog, inline for error text.
+_agents_families_inline() {
+    local family first=1
+    for family in codex claude; do
+        _agents_config_has_section "$family.agents" || continue
+        if [[ "$first" -eq 1 ]]; then
+            printf '%s' "$family"
+            first=0
+        else
+            printf ', %s' "$family"
+        fi
+    done
+}
+
 # The family a task resolves through today: an exact-task assignment override
 # if one exists, otherwise the function's assignment.
 _agents_active_family() {
@@ -333,6 +347,77 @@ agents_set_assignment() {
     ' "$AGENTS_CONFIG_FILE" > "$tmp_file"; then
         rm -f "$tmp_file"
         echo "ERROR: no [assignments] entry for '$function'; $AGENTS_CONFIG_FILE was not changed." >&2
+        return 1
+    fi
+    mv "$tmp_file" "$AGENTS_CONFIG_FILE"
+}
+
+# Switch every [assignments] entry — functions and any exact-task overrides —
+# to one family. Validated wholesale first, so a switch that would leave any
+# task unresolvable is rejected before a single line is written.
+agents_set_all_assignments() {
+    local family="$1" line key fn subtask section row seen="" tmp_file
+
+    if [[ -z "$family" ]] || ! _agents_config_has_section "$family.agents"; then
+        echo "ERROR: unknown family '$family'." >&2
+        echo "       Configured families in $AGENTS_CONFIG_FILE: $(_agents_families_inline)" >&2
+        return 1
+    fi
+    while IFS= read -r line; do
+        key="${line%%=*}"
+        fn="${key%%.*}"
+        section="$fn.$family"
+        if ! _agents_config_has_section "$section"; then
+            echo "ERROR: cannot assign '$fn' to '$family': missing [$section]." >&2
+            echo "       Allowed families with a configured set: $(_agents_function_families_inline "$fn")" >&2
+            return 1
+        fi
+        if [[ "$key" == *.* ]]; then
+            subtask="${key#*.}"
+            if ! _agents_registry_has_key "$section" "$subtask"; then
+                echo "ERROR: cannot assign '$key' to '$family': [$section] has no row '$subtask'." >&2
+                echo "       Allowed sub-tasks: $(_agents_section_keys_inline "$section")" >&2
+                return 1
+            fi
+        fi
+        case " $seen " in
+            *" $section "*) continue ;;
+        esac
+        seen="$seen $section"
+        while IFS= read -r row; do
+            if ! _agents_validate_pair "$fn.${row%%=*}" "$family" "${row#*=}"; then
+                echo "ERROR: switch rejected because [$section] row '${row%%=*}' is invalid." >&2
+                return 1
+            fi
+        done < <(_agents_config_section_values "$section")
+    done < <(_agents_config_section_values assignments)
+
+    tmp_file="$(mktemp "${AGENTS_CONFIG_FILE}.XXXXXX")"
+    if ! awk -v fam="$family" '
+        /^\[/ {
+            in_section = ($0 == "[assignments]")
+            print
+            next
+        }
+        in_section {
+            content = $0
+            hash = index(content, "#")
+            before_comment = hash ? substr(content, 1, hash - 1) : content
+            equals = index(before_comment, "=")
+            if (equals) {
+                match(before_comment, /[[:space:]]*$/)
+                spacing = substr(before_comment, RSTART)
+                comment = hash ? substr(content, hash) : ""
+                print substr(before_comment, 1, equals) fam spacing comment
+                found = 1
+                next
+            }
+        }
+        { print }
+        END { if (!found) exit 2 }
+    ' "$AGENTS_CONFIG_FILE" > "$tmp_file"; then
+        rm -f "$tmp_file"
+        echo "ERROR: [assignments] has no entries; $AGENTS_CONFIG_FILE was not changed." >&2
         return 1
     fi
     mv "$tmp_file" "$AGENTS_CONFIG_FILE"
