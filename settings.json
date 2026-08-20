@@ -169,6 +169,7 @@
   "tui": "fullscreen",
   "skipDangerousModePermissionPrompt": true,
   "skipWorkflowUsageWarning": true,
+  "theme": "dark",
   "editorMode": "normal",
   "autoCompactEnabled": true,
   "teammateMode": "in-process",

@@ -1,19 +1,21 @@
 #!/bin/zsh
-# rev 51 — bump this comment in every cargo-tile source file on each change
+# rev 53 — bump this comment in every cargo-tile source file on each change
 # One layout pane, identified by a permanent ordinal. Watches its map
 # file (the log it should show) and displays it via tail; shows an idle
 # placeholder when the map is empty. Content reflows across panes as
 # the layout changes — the pane itself only ever swaps what it tails.
 set -u
 
-REVISION=51
+REVISION=53
 
 TILE_HOME="${CARGO_TILE_HOME:-$HOME/.cargo-tile}"
 STATE=/tmp/cargo-tile/state
 
-# idle panes close this many seconds after their content leaves them;
-# cargo-tile-pane, cargo-tile-slot and cargo-tile-summary must agree
-DECAY_SECS=15
+# idle panes close this many seconds after their content leaves them —
+# cargo-tile.conf is the one place it is set, so pane, slot and summary
+# cannot drift apart
+source "${0:A:h}/conf.zsh"
+DECAY_SECS=$(tile_conf decay_secs 15)
 
 N="$1"
 SLOTF="$STATE/panemap/$N"
@@ -80,7 +82,7 @@ show_idle() {
     # window title
     printf '\033]0;· %s ·\007' "$N"
     printf '\033[H\033[2J\033[3J'
-    printf '\n  \033[2m· slot %s idle ·\033[0m\n' "$N"
+    printf '\n  \033[37m· slot %s idle ·\033[0m\n' "$N"
     idle_tick
 }
 
@@ -90,7 +92,7 @@ idle_tick() {
     local c
     c="$(idle_line)"
     printf '\033[3;1H\033[K'
-    [[ -n "$c" ]] && printf '  \033[2m%s\033[0m' "$c"
+    [[ -n "$c" ]] && printf '  \033[33m%s\033[0m' "$c"
 }
 
 cleanup() {
@@ -103,6 +105,8 @@ while true; do
     # throttled so the 0.3s loop doesn't fork sed every pass
     if (( SECONDS - last_rev_check >= 5 )); then
         last_rev_check=$SECONDS
+        # re-read so a conf edit lands on a running pane without a restart
+        DECAY_SECS=$(tile_conf decay_secs 15)
         rev="$(src_rev)"
         if [[ -n "$rev" && "$rev" != "$REVISION" ]]; then
             [[ -n "$tailpid" ]] && kill "$tailpid" 2>/dev/null

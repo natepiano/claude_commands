@@ -603,8 +603,46 @@ Build only from Delegation Context, the Work Order, and command-line amendments:
 Rows include only load-bearing types explicitly named by the Work Order. Status
 is `New`, `Existing - Changes`, or `Existing - No Changes`, inferred from that
 Work Order without code research. Mark genuine uncertainty instead of guessing;
-say explicitly when no load-bearing type is specified.
+say explicitly when no load-bearing type is specified. Write every cell under
+<TypeTableCells/>.
 </PhaseBriefing>
+
+<TypeTableCells>
+Governs the `Planned role` and `System relationship` cells in every types table
+— phase briefing, window briefing, and completion report alike.
+
+The `Type / trait / API` cell is the only place a code identifier belongs. The
+other two are written for someone who has never opened the file and never will:
+name the thing in ordinary words — a tag, a list, a rule, the box around the
+members, the step that copies it — and say what it does, or what breaks without
+it.
+
+Two tests every cell must pass:
+
+- **Say it out loud.** Could you read the cell to someone watching the running
+  application and have them follow it? "Durable back-reference from an instance
+  shell to the registered Look definition it was built from" fails. "A tag on
+  each Look saying which of the seven it came from" passes.
+- **Name the consequence.** A cell that states a mechanism and stops makes the
+  reader work out why it matters. "Copied onto duplicates by the new integration
+  point" fails — copied by what, and what happens if it is not? "Duplicating has
+  to copy it deliberately, because the duplicator copies wiring but no tags"
+  passes.
+
+Three specific failures, each fluent English that informs nobody:
+
+- A code identifier used as a noun where an ordinary word exists — *the shell*,
+  *the definition*, *the publication*.
+- A noun phrase compounded from three or more plan terms, such as naming a
+  transaction by the three steps it performs.
+- Plan-internal vocabulary the user has never been shown: gate ids, phase
+  numbers as adjectives, *promotion*, *staging*, *additive*, *erased*.
+
+One sentence per cell is the target and two the ceiling, but length is not the
+constraint — a cell needing a clause of context gets it. Terseness bought by
+compressing plan terms into a noun phrase is the failure this contract exists to
+stop.
+</TypeTableCells>
 
 <CombinedWindowBriefing>
 For an auto window, build one high-level preview from Delegation Context, every
@@ -646,7 +684,8 @@ Work Order. Use status `New`, `Existing - Changes`, or
 Order rows by editing sequence: covered phase order first, then the order each
 type is first introduced or changed within that phase. Never alphabetize the
 table or regroup it by crate. Mark genuine uncertainty instead of guessing;
-say explicitly when the window specifies no load-bearing type.
+say explicitly when the window specifies no load-bearing type. Write every cell
+under <TypeTableCells/>.
 
 Keep `### Wrap-up` short. It synthesizes the authorization boundary; it does not
 repeat the overview, phase summaries, table, or verification section.
@@ -1273,7 +1312,8 @@ Single-phase report:
 ```
 
 Use the diff over planned claims. Include only load-bearing new/materially
-changed types; use the same statuses as <PhaseBriefing/> and say when none exist.
+changed types; use the same statuses as <PhaseBriefing/>, write every cell under
+<TypeTableCells/>, and say when none exist.
 Everything above `### What remains` describes only the completed phase.
 
 <CombinedWindowReport>
@@ -1304,7 +1344,8 @@ per-phase replay:
 
 Unify the types into that single table with its `Phase` column — never one
 table per phase. Include only load-bearing new/materially changed types across
-the whole window, using the <PhaseBriefing/> statuses; say when none exist.
+the whole window, using the <PhaseBriefing/> statuses and <TypeTableCells/>;
+say when none exist.
 <RemainingWorkOutlook/> applies to `### What remains` unchanged.
 </CombinedWindowReport>
 

@@ -1,5 +1,5 @@
 #!/bin/zsh
-# rev 51 — bump this comment in every cargo-tile source file on each change
+# rev 53 — bump this comment in every cargo-tile source file on each change
 # Assign runs to the cargo-tile pane layout.
 #   cargo-tile-pane <log>           add a run
 #   cargo-tile-pane --remove <log>  drop a finished run
@@ -27,9 +27,11 @@ TILE_HOME="${CARGO_TILE_HOME:-$HOME/.cargo-tile}"
 STATE=/tmp/cargo-tile/state
 ERRLOG=/tmp/cargo-tile/pane-errors.log
 
-# idle panes close this many seconds after their content leaves them;
-# cargo-tile-pane, cargo-tile-slot and cargo-tile-summary must agree
-DECAY_SECS=15
+# idle panes close this many seconds after their content leaves them —
+# cargo-tile.conf is the one place it is set, so pane, slot and summary
+# cannot drift apart
+source "${0:A:h}/conf.zsh"
+DECAY_SECS=$(tile_conf decay_secs 15)
 
 mode=add
 case "${1:-}" in

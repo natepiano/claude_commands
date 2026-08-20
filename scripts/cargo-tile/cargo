@@ -1,5 +1,5 @@
 #!/bin/zsh
-# rev 51 — bump this comment in every cargo-tile source file on each change
+# rev 53 — bump this comment in every cargo-tile source file on each change
 # cargo-tile-shim -- master copies live in ~/.claude/scripts/cargo-tile/;
 # ~/.cargo-tile/bin holds symlinks and `cargo-tile on` reinstalls the
 # toolchain hooks from there.
@@ -115,8 +115,19 @@ else
     printf '\n\033[1;31m── exit %d ──\033[0m\n' "$st" >> "$LOG"
 fi
 
-# the pane clears shortly after the run exits
-LINGER="${CARGO_TILE_LINGER:-4}"
+# the pane clears shortly after the run exits. This copy of the shim may
+# be sitting in a toolchain's bin, where conf.zsh is not a sibling — then
+# reach the master copy through the TILE_HOME symlink.
+conf_dir="${0:A:h}"
+if [[ ! -r "$conf_dir/conf.zsh" ]]; then
+    tile_pane="$TILE_HOME/bin/cargo-tile-pane"
+    conf_dir="${tile_pane:A:h}"
+fi
+LINGER=4
+if [[ -r "$conf_dir/conf.zsh" ]]; then
+    source "$conf_dir/conf.zsh"
+    LINGER=$(tile_conf linger_secs 4)
+fi
 ( sleep "$LINGER"; "$TILE_HOME/bin/cargo-tile-pane" --remove "$LOG" ) \
     >/dev/null 2>>"$ERRLOG" &!
 exit $st

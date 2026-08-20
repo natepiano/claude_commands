@@ -1,19 +1,21 @@
 #!/bin/zsh
-# rev 51 — bump this comment in every cargo-tile source file on each change
-# Live summary for the cargo-tile grid: revision, grid size, counts of
-# tiled runs, plus cargo processes that predate `cargo-tile on`
-# (uncapturable) — those lines disappear as the processes exit.
+# rev 53 — bump this comment in every cargo-tile source file on each change
+# Live summary for the cargo-tile grid: revision, grid size, tiled runs,
+# compiler activity (including rustc owned by the sccache server), plus Cargo
+# processes that predate `cargo-tile on` — those lines disappear as they exit.
 set -u
 
-REVISION=51
+REVISION=53
 
 TILE_HOME="${CARGO_TILE_HOME:-$HOME/.cargo-tile}"
 STATE=/tmp/cargo-tile/state
 ERRLOG=/tmp/cargo-tile/pane-errors.log
 
-# idle panes close this many seconds after their content leaves them;
-# cargo-tile-pane, cargo-tile-slot and cargo-tile-summary must agree
-DECAY_SECS=15
+# idle panes close this many seconds after their content leaves them —
+# cargo-tile.conf is the one place it is set, so pane, slot and summary
+# cannot drift apart
+source "${0:A:h}/conf.zsh"
+DECAY_SECS=$(tile_conf decay_secs 15)
 
 # self-refresh: re-exec when the source file's rev comment changes.
 # $0 inside a zsh function is the function name, so capture it here.
@@ -31,6 +33,8 @@ printf '\033]1337;SetUserVar=cargotile=%s\007' Z3JpZA==
 last_decay_spawn=0
 
 while true; do
+    # re-read so a conf edit lands on the running grid without a restart
+    DECAY_SECS=$(tile_conf decay_secs 15)
     rev="$(src_rev)"
     [[ -n "$rev" && "$rev" != "$REVISION" ]] && exec "$SELF"
 
@@ -50,10 +54,13 @@ while true; do
     running=0
     now=$(date +%s)
     typeset -a active
+    typeset -A tile_roots
     active=()
+    tile_roots=()
     for f in "$STATE"/pids/*(N); do
         if kill -0 "${f:t}" 2>/dev/null; then
             (( running += 1 ))
+            tile_roots[${f:t}]=1
             if [[ -s "$f" ]]; then
                 entry="$(<"$f")"
                 ep=$(stat -f %m "$f" 2>/dev/null) || ep=$now
@@ -180,15 +187,105 @@ while true; do
         print -rl -- "${pre[@]}" > "$STATE/preexisting" 2>/dev/null
     fi
 
+    # Compiler ownership is not the same as build ownership when sccache is
+    # active. Cargo's short-lived sccache client remains in the tiled run's
+    # process tree, but the CPU-heavy rustc is spawned by the persistent
+    # server (usually parented by launchd). Join through the client so the
+    # work is shown on the right Cargo session, and report anything with no
+    # tiled ancestor instead of letting server-owned work disappear.
+    typeset -A proc_parent proc_command direct_by_root sccache_by_root
+    proc_parent=()
+    proc_command=()
+    direct_by_root=()
+    sccache_by_root=()
+    compiler_workers=0
+    sccache_workers=0
+    linked_sccache_requests=0
+    untiled_sccache_requests=0
+    untiled_direct_workers=0
+    while read -r scan_pid scan_ppid scan_cmd; do
+        [[ "$scan_pid" == <-> && "$scan_ppid" == <-> ]] || continue
+        proc_parent[$scan_pid]="$scan_ppid"
+        proc_command[$scan_pid]="$scan_cmd"
+    done < <(ps -axo pid=,ppid=,command= 2>/dev/null)
+
+    tile_root_for() {
+        local current="$1" parent depth=0
+        while [[ "$current" == <-> ]] && (( current > 1 && depth < 64 )); do
+            if [[ -n "${tile_roots[$current]:-}" ]]; then
+                print -r -- "$current"
+                return 0
+            fi
+            parent="${proc_parent[$current]:-}"
+            [[ -n "$parent" && "$parent" != "$current" ]] || break
+            current="$parent"
+            (( depth += 1 ))
+        done
+        return 1
+    }
+
+    for scan_pid in "${(k)proc_command[@]}"; do
+        scan_cmd="${proc_command[$scan_pid]}"
+        scan_exe="${scan_cmd%% *}"
+        scan_base="${scan_exe:t}"
+        case "$scan_base" in
+            rustc|rustdoc|clippy-driver)
+                (( compiler_workers += 1 ))
+                scan_ppid="${proc_parent[$scan_pid]:-}"
+                parent_cmd="${proc_command[$scan_ppid]:-}"
+                parent_exe="${parent_cmd%% *}"
+                if [[ "${parent_exe:t}" == sccache ]]; then
+                    (( sccache_workers += 1 ))
+                elif root=$(tile_root_for "$scan_pid"); then
+                    direct_by_root[$root]=$(( ${direct_by_root[$root]:-0} + 1 ))
+                else
+                    (( untiled_direct_workers += 1 ))
+                fi
+                ;;
+            sccache)
+                # The server has no compiler argument. A request client starts
+                # with the rustc/rustdoc/clippy-driver path it is wrapping.
+                scan_rest="${scan_cmd#* }"
+                [[ "$scan_rest" != "$scan_cmd" ]] || continue
+                compiler_exe="${scan_rest%% *}"
+                case "${compiler_exe:t}" in
+                    rustc|rustdoc|clippy-driver) ;;
+                    *) continue ;;
+                esac
+                if root=$(tile_root_for "$scan_pid"); then
+                    sccache_by_root[$root]=$(( ${sccache_by_root[$root]:-0} + 1 ))
+                    (( linked_sccache_requests += 1 ))
+                else
+                    (( untiled_sccache_requests += 1 ))
+                fi
+                ;;
+        esac
+    done
+
     buf=""
     buf+=$'\033[1;36mcargo-tile\033[0m  \033[35mrev '"$REVISION"$'\033[0m  \033[2m'"$(date '+%H:%M:%S')"$'\033[0m\n\n'
     buf+=$'\033[1mpanes:\033[0m            '"${shapestr:-none} ($P)"$'\n'
     buf+=$'\033[1mrunning (tiled):\033[0m  '"$running"$'\n'
     buf+=$'\033[1mtiles in use:\033[0m     '"$(( shown + 1 )) / $P"$'\n'
+    if (( compiler_workers > 0 || linked_sccache_requests > 0 || untiled_sccache_requests > 0 )); then
+        buf+=$'\033[1mcompiler workers:\033[0m '"$compiler_workers"
+        (( sccache_workers > 0 )) && buf+=" ($sccache_workers sccache-owned)"
+        buf+=$'\n'
+        if (( linked_sccache_requests > 0 )); then
+            buf+=$'\033[1msccache requests:\033[0m '"$linked_sccache_requests linked to tiles"$'\n'
+        fi
+        if (( untiled_sccache_requests > 0 || untiled_direct_workers > 0 )); then
+            untiled_total=$(( untiled_sccache_requests + untiled_direct_workers ))
+            buf+=$'\033[1;31muntiled compiler activity:\033[0m '"$untiled_total"
+            (( untiled_sccache_requests > 0 )) && buf+=" ($untiled_sccache_requests via sccache)"
+            buf+=$'\n'
+        fi
+    fi
     if (( ${#active} > 0 )); then
         pw=4   # "path"
         dw=3   # "pid"
         sw=5   # "start" / "hh:mm"
+        aw=8   # "compiler"
         cw=7   # "command"
         show_hours=0
         for entry in "${active[@]}"; do
@@ -198,8 +295,15 @@ while true; do
             rest="${rest#*	}"
             rpid="${rest%%	*}"
             rcmd="${rest#*	}"
+            direct="${direct_by_root[$rpid]:-0}"
+            cached="${sccache_by_root[$rpid]:-0}"
+            rwork=""
+            (( direct > 0 )) && rwork="rustc×$direct"
+            (( cached > 0 )) && rwork+="${rwork:+ + }sccache×$cached"
+            [[ -n "$rwork" ]] || rwork="—"
             (( ${#rpath} > pw )) && pw=${#rpath}
             (( ${#rpid} > dw )) && dw=${#rpid}
+            (( ${#rwork} > aw )) && aw=${#rwork}
             (( ${#rcmd} > cw )) && cw=${#rcmd}
             (( now - ep > 3599 )) && show_hours=1
         done
@@ -216,18 +320,18 @@ while true; do
                 (( ${#blk} > bw )) && bw=${#blk}
             done
         fi
-        need=$(( 2 + pw + 2 + dw + 2 + sw + 2 + uw + 2 + cw ))
+        need=$(( 2 + pw + 2 + dw + 2 + sw + 2 + uw + 2 + aw + 2 + cw ))
         (( bw )) && (( need += 2 + bw ))
         wide=1
         (( need > cols )) && wide=0
         buf+=$'\n\033[1mactive:\033[0m\n'
         if (( ! wide )); then
-            hdr="$(printf '  %-*s  %-*s  %-*s  command' "$dw" pid "$sw" start "$uw" dur)"
+            hdr="$(printf '  %-*s  %-*s  %-*s  compiler  command' "$dw" pid "$sw" start "$uw" dur)"
             buf+=$'\033[37m'"${hdr[1,$cols]}"$'\033[0m\n'
         elif (( ${#blocked_by} > 0 )); then
-            buf+=$'\033[37m'"$(printf '  %-*s  %-*s  %-*s  %-*s  %-*s  blocker' "$pw" path "$dw" pid "$sw" start "$uw" dur "$cw" command)"$'\033[0m\n'
+            buf+=$'\033[37m'"$(printf '  %-*s  %-*s  %-*s  %-*s  %-*s  %-*s  blocker' "$pw" path "$dw" pid "$sw" start "$uw" dur "$aw" compiler "$cw" command)"$'\033[0m\n'
         else
-            buf+=$'\033[37m'"$(printf '  %-*s  %-*s  %-*s  %-*s  %s' "$pw" path "$dw" pid "$sw" start "$uw" dur command)"$'\033[0m\n'
+            buf+=$'\033[37m'"$(printf '  %-*s  %-*s  %-*s  %-*s  %-*s  %s' "$pw" path "$dw" pid "$sw" start "$uw" dur "$aw" compiler command)"$'\033[0m\n'
         fi
         prevpath=""
         for entry in "${active[@]}"; do
@@ -238,6 +342,12 @@ while true; do
             rpid="${rest%%	*}"
             rcmd="${rest#*	}"
             blk="${blocked_by[$rpid]:-}"
+            direct="${direct_by_root[$rpid]:-0}"
+            cached="${sccache_by_root[$rpid]:-0}"
+            rwork=""
+            (( direct > 0 )) && rwork="rustc×$direct"
+            (( cached > 0 )) && rwork+="${rwork:+ + }sccache×$cached"
+            [[ -n "$rwork" ]] || rwork="—"
             secs=$(( now - ep ))
             (( secs < 0 )) && secs=0
             if (( show_hours )); then
@@ -250,6 +360,7 @@ while true; do
             fpid="$(printf '%-*s' "$dw" "$rpid")"
             fbirth="$(printf '%-*s' "$sw" "$birth")"
             fdur="$(printf '%-*s' "$uw" "$dur")"
+            fwork="$(printf '%-*s' "$aw" "$rwork")"
             if (( ! wide )); then
                 if [[ "$rpath" != "$prevpath" ]]; then
                     pline="  $rpath"
@@ -258,24 +369,24 @@ while true; do
                 fi
                 blkmark=""
                 [[ -n "$blk" ]] && blkmark="⇠${blk}  "
-                avail=$(( cols - 2 - dw - 2 - sw - 2 - uw - 2 - ${#blkmark} ))
+                avail=$(( cols - 2 - dw - 2 - sw - 2 - uw - 2 - ${#rwork} - 2 - ${#blkmark} ))
                 (( avail < 0 )) && avail=0
                 (( ${#rcmd} > avail )) && rcmd="${rcmd[1,$avail]}"
                 if [[ -n "$blk" ]]; then
-                    buf+="  "$'\033[31m'"${fpid}"$'\033[0m'"  ${fbirth}  ${fdur}  "$'\033[33m'"${blkmark}"$'\033[0m'$'\033[36m'"${rcmd}"$'\033[0m\n'
+                    buf+="  "$'\033[31m'"${fpid}"$'\033[0m'"  ${fbirth}  ${fdur}  "$'\033[35m'"${rwork}"$'\033[0m'"  "$'\033[33m'"${blkmark}"$'\033[0m'$'\033[36m'"${rcmd}"$'\033[0m\n'
                 else
-                    buf+="  ${fpid}  ${fbirth}  ${fdur}  "$'\033[36m'"${rcmd}"$'\033[0m\n'
+                    buf+="  ${fpid}  ${fbirth}  ${fdur}  "$'\033[35m'"${rwork}"$'\033[0m'"  "$'\033[36m'"${rcmd}"$'\033[0m\n'
                 fi
             elif (( ${#blocked_by} > 0 )); then
                 fcmd="$(printf '%-*s' "$cw" "$rcmd")"
                 if [[ -n "$blk" ]]; then
                     # blocked run: its own pid in red
-                    buf+="  ${fpath}  "$'\033[31m'"${fpid}"$'\033[0m'"  ${fbirth}  ${fdur}  "$'\033[36m'"${fcmd}"$'\033[0m'"  ${blk}"$'\n'
+                    buf+="  ${fpath}  "$'\033[31m'"${fpid}"$'\033[0m'"  ${fbirth}  ${fdur}  "$'\033[35m'"${fwork}"$'\033[0m'"  "$'\033[36m'"${fcmd}"$'\033[0m'"  ${blk}"$'\n'
                 else
-                    buf+="  ${fpath}  ${fpid}  ${fbirth}  ${fdur}  "$'\033[36m'"${fcmd}"$'\033[0m\n'
+                    buf+="  ${fpath}  ${fpid}  ${fbirth}  ${fdur}  "$'\033[35m'"${fwork}"$'\033[0m'"  "$'\033[36m'"${fcmd}"$'\033[0m\n'
                 fi
             else
-                buf+="  ${fpath}  ${fpid}  ${fbirth}  ${fdur}  "$'\033[36m'"${rcmd}"$'\033[0m\n'
+                buf+="  ${fpath}  ${fpid}  ${fbirth}  ${fdur}  "$'\033[35m'"${fwork}"$'\033[0m'"  "$'\033[36m'"${rcmd}"$'\033[0m\n'
             fi
         done
     fi
