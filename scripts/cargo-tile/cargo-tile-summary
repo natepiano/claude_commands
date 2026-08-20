@@ -1,11 +1,11 @@
 #!/bin/zsh
-# rev 65 — bump this comment in every cargo-tile source file on each change
+# rev 66 — bump this comment in every cargo-tile source file on each change
 # Live summary for the cargo-tile grid: revision, grid size, tiled runs,
 # compiler activity (including rustc owned by the sccache server), plus Cargo
 # processes that predate `cargo-tile on` — those lines disappear as they exit.
 set -u
 
-REVISION=65
+REVISION=66
 
 TILE_HOME="${CARGO_TILE_HOME:-$HOME/.cargo-tile}"
 
@@ -138,7 +138,14 @@ step_reflow() {
         [[ -s "$STATE/target/$o" ]] && want=$(<"$STATE/target/$o")
         cur=""
         [[ -s "$STATE/panemap/$o" ]] && cur=$(<"$STATE/panemap/$o")
-        if [[ "$want" != "$cur" ]]; then
+        # a missing map file counts as a mismatch even when the content
+        # already agrees (both empty). The file's mtime is what decay
+        # dates the trailing pane from, and a pane that never had one
+        # reads as "idle since now" on every pass — so it never ages out,
+        # and nothing behind it can become the trailing pane either.
+        # Before the reflow moved map writing here, sync_maps wrote one
+        # for every pane, so this was never reachable.
+        if [[ "$want" != "$cur" || ! -f "$STATE/panemap/$o" ]]; then
             print -r -- "$want" > "$STATE/panemap/$o"
             return 0
         fi
