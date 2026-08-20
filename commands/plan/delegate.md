@@ -458,21 +458,9 @@ covered phase is unbriefed, stale, or has an unresolved decision, route to
 <AutoWindowBatchBriefing/>. Compressed rows and phase titles are not briefings.
 </BriefingFreshness>
 
-<DecisionEconomy>
-If a decision has an obviously better answer, take it, record the choice where
-the decision lived, and do not ask the user. When the options differ in user
-experience, the premium, flawless experience is always the answer — nothing
-less than the best user experience is acceptable, and everything is built with
-that in mind — so that decision is already made and never reaches the user.
-When the question is whether to expose API surface that has no current consumer
-— only a possible future technical use case — the answer is always private now:
-keep it internal and open it later when a real consumer establishes what it
-needs. Both decisions are already made and never reach the user. Bring the user
-only decisions with true, substantive tradeoffs. Downstream gates — style review, fix reviews,
-example implementation, and real use in hana — will hammer out the actual
-problems; optimize for speed, and surface the risk a self-made call carries in
-one line instead of a question.
-</DecisionEconomy>
+`<DecisionEconomy/>` is defined by this import, shared with every session:
+
+@~/.claude/docs/decision_criteria.md
 
 <DecisionRouting>
 For every decision raised by review, repair, or phase review:

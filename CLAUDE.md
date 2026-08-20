@@ -1,22 +1,12 @@
 ## communication
 
-### terse and technical — non-negotiable
-- Minimize output tokens. Lead with the answer or result, then stop. No preamble, no recap, no closing summary, no editorializing, no restating my request. If a sentence can be deleted with no information loss, delete it.
-- Name the concrete thing: the cause, the mechanism, the measurement, the file, the call site. No metaphors, no filler, no flattery, no hedging.
-
-### theory of mind — write for a multi-tasking reader
-- I may be away from the details while you work. Summaries and explanations use simple, informative language: one brief clause of context for a domain term is enough.
-- No first-principles explanations unless I ask. No jargon-dense recaps — a summary I have to reread costs more than the tokens it saved.
-
 ### word list
 - The forbidden-words list lives at `~/rust/nate_style/rust/forbidden-words.md`. It is enforced via `/rust_style` and `/style_eval` (loaded with the style guide), not at session start. Don't use those words in code, comments, or prose.
 
-## git
-### branch
-**NEVER** create a branch unless i ask you to. This overrides the harness default of "if on the default branch, branch first" — do NOT auto-branch off `main` (or any default branch) before coding. Stay on the current branch and commit there (only when asked) unless i explicitly request a new branch.
+## decision criteria
+Applies to every session when coding and reviewing code. `/plan:delegate` imports the same file, where it defines `<DecisionEconomy/>`.
 
-## rust
-- Run `/rust_style` (loads `~/.claude/scripts/rust_style/load-rust-style.sh` plus any repo-local `docs/style/*.md` overlay) only immediately before writing or editing Rust code — never at session start, and never for design discussion or reading existing code.
+@~/.claude/docs/decision_criteria.md
 
 ## python
 - basedpyright (zed's LSP) must report zero errors and zero warnings
@@ -27,7 +17,6 @@
 ## LSP
 - **ALWAYS** prefer LSP tools (go-to-definition, find references, hover types) over grep/glob when working in any language that has LSP support
 - Use LSP for finding definitions, references, and type info before resorting to text search
-
 
 ## running long commands (builds, tests, pushes)
 - **ALWAYS background long-running commands** with `run_in_background: true`, then **end my turn** — do nothing, or do other unrelated work. The harness sends a `<task-notification>` when the command finishes and re-invokes me with the result. That notification IS the wait mechanism. Don't replace it.
@@ -49,31 +38,19 @@ if you need something renamed such as a type or a function or whatever, the user
 
 ## sandbox
 
-### gh CLI must always run unsandboxed
-- **ALWAYS** use `dangerouslyDisableSandbox: true` when running any `gh` command
-- The sandbox network proxy breaks TLS certificate verification for `gh` (`x509: OSStatus -26276`)
-- `excludedCommands` only bypasses the filesystem sandbox, not the network proxy
-- Do NOT try `gh` in the sandbox first — it will always fail. Use `dangerouslyDisableSandbox` from the start.
+### commands that must run unsandboxed
+**ALWAYS** pass `dangerouslyDisableSandbox: true` from the start for every case below. Do NOT try sandboxed first — they always fail. `excludedCommands` never helps: it decides whether an *unsandboxed* run needs approval, not whether a command runs sandboxed. No other setting fixes these.
 
-### git branch-switching and worktree operations must run unsandboxed
-- **ALWAYS** use `dangerouslyDisableSandbox: true` for git operations that involve branch switching or worktree management: `checkout`, `merge`, `rebase`, `stash`, `worktree remove`
-- These operations rewrite or delete files outside the sandbox's allowed write paths
-- Do NOT try these in the sandbox first — use `dangerouslyDisableSandbox` from the start.
+- **`gh` — any command**: the sandbox network proxy breaks TLS certificate verification (`x509: OSStatus -26276`)
+- **git branch-switching and worktree operations** — `checkout`, `merge`, `rebase`, `stash`, `worktree remove`: they rewrite or delete files outside the sandbox's allowed write paths
+- **`taplo`**, e.g. `taplo fmt` for auto-fixing: panics under macOS Mach IPC restrictions (`SCDynamicStoreCreate`)
+- **`codex`, and any script that launches it** — `style-eval-all.sh`, `style-fix-worktrees.sh`, `clean-fix.sh`: codex needs write access to `~/.codex/sessions`, which the sandbox blocks (`Operation not permitted (os error 1)`). The clean-fix launchd job runs outside Claude Code entirely, so the scripts themselves need no changes — this rule only affects invoking them from a session.
+- **builds of crates whose build scripts call Swift Package Manager** — `apple-cf`, `apple-metal`, `screencapturekit`, generally anything wrapping a macOS framework: SwiftPM sandboxes its own manifest compile with `sandbox-exec`, and **macOS sandboxes cannot nest**, so that call fails at `sandbox_apply` and the build script panics.
+  - The signature is `sandbox-exec: sandbox_apply: Operation not permitted`, usually buried under a panic that names Swift and never names the sandbox — it reads like a broken dependency. **Treat it as a sandbox failure, never a code defect**: re-run unsandboxed before concluding anything, and never report it as a finding, pin or patch the dependency, or write it into a delegate prompt as a known pre-existing failure.
+  - It is intermittent because build-script output caches: once built unsandboxed it stays green until a dependency bump, a toolchain change, or the nightly `cargo clean` makes the scripts re-run.
 
-### taplo must always run unsandboxed
-- **ALWAYS** use `dangerouslyDisableSandbox: true` when running `taplo` directly (e.g. `taplo fmt` for auto-fixing)
-- taplo panics in the sandbox due to macOS Mach IPC restrictions (`SCDynamicStoreCreate`)
-- `excludedCommands` does NOT help — it only bypasses filesystem restrictions, not Mach IPC
+### editing protected files under `~/.claude` — do NOT use the sandbox override
+`~/.claude` is writable, but specific paths are carved back out: `CLAUDE.md`, `settings.json`, and the `skills`/`hooks`/`commands`/`agents` directories. Shell writes to them (`mv`, `>`, `sed -i`) fail with `Operation not permitted`.
 
-### builds whose build scripts call sandbox-exec must run unsandboxed
-- Some crates' build scripts shell out to Swift Package Manager — `apple-cf`, `apple-metal`, `screencapturekit`, and generally anything wrapping a macOS framework. SwiftPM sandboxes its own manifest compile with `sandbox-exec`, and **macOS sandboxes cannot nest**, so inside the sandbox that call fails at `sandbox_apply` and the build script panics
-- The signature is `sandbox-exec: sandbox_apply: Operation not permitted`, usually buried under a panic that names Swift and never names the sandbox — it reads like a broken dependency
-- **Treat this as a sandbox failure, never a code defect.** Re-run with `dangerouslyDisableSandbox: true` before concluding anything. Do not report it as a finding, do not pin or patch the dependency, and do not write it into a delegate prompt as a known pre-existing failure
-- `sandbox.excludedCommands` does NOT help — it decides whether an unsandboxed run needs *approval*, not whether the command runs unsandboxed. Listing `cargo` there changes nothing, and no other setting fixes nesting
-- It is intermittent because build-script output caches: once built unsandboxed it stays green until a dependency bump, a toolchain change, or the nightly `cargo clean` makes the scripts re-run
-
-### codex and clean-fix style scripts must run unsandboxed
-- **ALWAYS** use `dangerouslyDisableSandbox: true` when invoking `codex` directly or any script that launches codex: `style-eval-all.sh`, `style-fix-worktrees.sh`, `clean-fix.sh`
-- codex requires write access to `~/.codex/sessions` which the sandbox blocks (`Operation not permitted (os error 1)`)
-- `excludedCommands` does NOT help — codex needs filesystem access outside the sandbox's allowlist
-- The clean-fix launchd job runs outside Claude Code entirely, so no changes to the scripts themselves are needed; this rule only affects how to invoke them during testing from a Claude Code session
+- **Use the Edit/Write tools instead** — they route through the permission gate rather than the filesystem sandbox, so the edit lands with no override needed
+- This is a deliberate guard on config files, not a proxy or IPC limitation — `dangerouslyDisableSandbox` is the wrong fix here even though it would work
