@@ -1,26 +1,29 @@
 #!/bin/zsh
-# rev 53 — bump this comment in every cargo-tile source file on each change
+# rev 60 — bump this comment in every cargo-tile source file on each change
 # Assign runs to the cargo-tile pane layout.
 #   cargo-tile-pane <log>           add a run
 #   cargo-tile-pane --remove <log>  drop a finished run
 #   cargo-tile-pane --check         converge layout (deferred work, recovery)
 #   cargo-tile-pane --decay         close the trailing idle pane
 #
-# Tile 1 is the summary; runs fill tiles 2..N in snake order (down
-# column 1, then column 2, ...). For N tiles, k = ceil(sqrt(N)):
-# columns hold k tiles each and the last column's panes split the full
-# column height evenly. Panes are added one split at a time as tiles
+# Tile 1 is the summary; runs fill tiles 2..N in reading order (down
+# column 1, then column 2, ...) so the grid is always in timestamp
+# order top to bottom, left to right. Column heights come from
+# shape_for below. Panes are added one split at a time as tiles
 # arrive; a new COLUMN can't be made from a session split, so only
-# column growth (N = 3, 7, 13, 21, 31) rebuilds the window. When runs
+# column growth (N = 5, 9, 13, 21, 31) rebuilds the window. When runs
 # leave, content shifts up (slots stay packed), trailing panes go idle
 # in place, and --decay closes the trailing one DECAY_SECS after it
 # cleared or after the close in front of it, whichever came later — so
 # a refilled pane starts over and idle panes drop off one at a time.
 #
-# state/slots/<pos>  packed run logs, positions 2.. in snake order
-# state/layout       one line per column: "ord:sessionid ..." top-down
-# state/panemap/<o>  the log pane <o> shows (empty = idle); watched by
-#                    cargo-tile-slot <o>
+# state/slots/<pos>   packed run logs, positions 2.. in reading order
+# state/layout        one line per column: "ord:sessionid ..." top-down
+# state/panemap/<o>   the log pane <o> shows (empty = idle); watched by
+#                     cargo-tile-slot <o>
+# state/target/<o>    the log pane <o> should end up showing
+# state/target-order  pane ordinals in reading order; the summary walks
+#                     it one pane per frame to animate the reflow
 set -u
 
 TILE_HOME="${CARGO_TILE_HOME:-$HOME/.cargo-tile}"
@@ -31,7 +34,7 @@ ERRLOG=/tmp/cargo-tile/pane-errors.log
 # cargo-tile.conf is the one place it is set, so pane, slot and summary
 # cannot drift apart
 source "${0:A:h}/conf.zsh"
-DECAY_SECS=$(tile_conf decay_secs 15)
+DECAY_SECS=$(tile_decay_secs)
 
 mode=add
 case "${1:-}" in
@@ -147,21 +150,43 @@ for c in "${cols[@]}"; do
     (( P += ${#colw} ))
 done
 
-# column heights for $1 tiles -> SHAPE
+# Column heights for $1 tiles -> SHAPE. Growth alternates between
+# deepening every column by one row (rightmost first) and appending a
+# column on the right that fills top-down, so the caps run
+# 4x4=16, 4x5=20, 5x5=25, 5x6=30, 6x6=36 — landing exactly on the tile
+# ceiling. Right-to-left is not cosmetic: growing the leftmost column
+# first would shift every column's contents, while growing the rightmost
+# shifts only what is to its right, and the very first step of a row add
+# shifts nothing at all.
 shape_for() {
-    local n=$1 k=1 rem
-    while (( k * k < n )); do (( k += 1 )); done
+    local n=$1 R=4 C=4 base extra i
     typeset -ga SHAPE
     SHAPE=()
-    rem=$n
-    while (( rem > 0 )); do
-        if (( rem >= k )); then
-            SHAPE+=($k)
-            (( rem -= k ))
-        else
-            SHAPE+=($rem)
-            rem=0
+    if (( n <= 16 )); then
+        # phase 1: columns of four, left to right, last one short
+        while (( n > 0 )); do
+            if (( n >= 4 )); then SHAPE+=(4); (( n -= 4 ))
+            else SHAPE+=($n); n=0
+            fi
+        done
+        return
+    fi
+    while true; do
+        base=$(( R * C ))
+        if (( n <= base + C )); then          # row add, rightmost first
+            extra=$(( n - base ))
+            for (( i = 1; i <= C - extra; i++ )); do SHAPE+=($R); done
+            for (( i = 1; i <= extra; i++ )); do SHAPE+=($(( R + 1 ))); done
+            return
         fi
+        (( R += 1 ))
+        base=$(( R * C ))
+        if (( n <= base + R )); then          # column add on the right
+            for (( i = 1; i <= C; i++ )); do SHAPE+=($R); done
+            SHAPE+=($(( n - base )))
+            return
+        fi
+        (( C += 1 ))
     done
 }
 
@@ -177,15 +202,25 @@ flatten_ords() {
 
 # point every pane's map at the run for its position (pure file writes,
 # safe from any caller); panes past the run list go idle
+# Publish where every run BELONGS, not where it is shown. The summary
+# walks target-order and moves one pane per frame, so a layout change
+# slides through the grid instead of every pane swapping at once. The
+# order is the reading order, which makes the shift travel forward: the
+# cell a split just opened fills first, and each pane behind it hands its
+# content back one position until the new run drops into the last pane.
 sync_maps() {
     flatten_ords
-    local i tgt curm mf
+    local i
+    mkdir -p "$STATE/target"
     for (( i = 2; i <= ${#ORDS}; i++ )); do
-        tgt="${slotlog[$i]:-}"
-        mf="$STATE/panemap/${ORDS[$i]}"
-        curm=""
-        [[ -s "$mf" ]] && curm=$(<"$mf")
-        [[ "$curm" == "$tgt" ]] || print -r -- "$tgt" > "$mf"
+        print -r -- "${slotlog[$i]:-}" > "$STATE/target/${ORDS[$i]}"
+    done
+    # (@) keeps the slice as separate words — quoted without it, zsh
+    # joins them and the stepper reads the whole grid as one ordinal
+    (( ${#ORDS} >= 2 )) && print -rl -- "${(@)ORDS[2,-1]}" > "$STATE/target-order"
+    # a pane that left the layout keeps no claim on a run
+    for i in "$STATE"/target/*(N); do
+        [[ " ${ORDS[*]} " == *" ${i:t} "* ]] || rm -f "$i"
     done
 }
 

@@ -1,12 +1,12 @@
 #!/bin/zsh
-# rev 53 — bump this comment in every cargo-tile source file on each change
+# rev 60 — bump this comment in every cargo-tile source file on each change
 # One layout pane, identified by a permanent ordinal. Watches its map
 # file (the log it should show) and displays it via tail; shows an idle
 # placeholder when the map is empty. Content reflows across panes as
 # the layout changes — the pane itself only ever swaps what it tails.
 set -u
 
-REVISION=53
+REVISION=60
 
 TILE_HOME="${CARGO_TILE_HOME:-$HOME/.cargo-tile}"
 STATE=/tmp/cargo-tile/state
@@ -15,7 +15,8 @@ STATE=/tmp/cargo-tile/state
 # cargo-tile.conf is the one place it is set, so pane, slot and summary
 # cannot drift apart
 source "${0:A:h}/conf.zsh"
-DECAY_SECS=$(tile_conf decay_secs 15)
+DECAY_SECS=$(tile_decay_secs)
+IDLE_BG=$(tile_conf_str idle_bg "$TILE_IDLE_BG_DEFAULT")
 
 N="$1"
 SLOTF="$STATE/panemap/$N"
@@ -33,6 +34,8 @@ tailpid=""
 cur="__init__"
 last_rev_check=0
 last_idle_tick=0
+painted=""
+disp=idle
 
 # countdown for the trailing pane — the only one decay can close, so
 # the only one with a deadline to show. Its DECAY_SECS runs from
@@ -95,6 +98,20 @@ idle_tick() {
     [[ -n "$c" ]] && printf '  \033[33m%s\033[0m' "$c"
 }
 
+# A pane showing nothing is tinted whatever the rest of the grid is
+# doing, so the empty half of a busy grid reads as empty at a glance. An
+# idle pane is keyed on its tint as well as its state, so a live idle_bg
+# edit lands on it; a pane showing a log is keyed on the state alone,
+# since painting it normal means a terminal reset, and a reset would
+# clear the log it is showing.
+repaint() {  # $1 = idle | normal
+    local want="$1"
+    [[ "$1" == idle ]] && want="idle:$IDLE_BG"
+    [[ "$want" == "$painted" ]] && return
+    painted="$want"
+    tile_paint "$1" "$IDLE_BG"
+}
+
 cleanup() {
     [[ -n "$tailpid" ]] && kill "$tailpid" 2>/dev/null
     exit 0
@@ -106,7 +123,8 @@ while true; do
     if (( SECONDS - last_rev_check >= 5 )); then
         last_rev_check=$SECONDS
         # re-read so a conf edit lands on a running pane without a restart
-        DECAY_SECS=$(tile_conf decay_secs 15)
+        DECAY_SECS=$(tile_decay_secs)
+        IDLE_BG=$(tile_conf_str idle_bg "$TILE_IDLE_BG_DEFAULT")
         rev="$(src_rev)"
         if [[ -n "$rev" && "$rev" != "$REVISION" ]]; then
             [[ -n "$tailpid" ]] && kill "$tailpid" 2>/dev/null
@@ -116,6 +134,14 @@ while true; do
     new=""
     [[ -s "$SLOTF" ]] && new=$(<"$SLOTF")
     if [[ "$new" != "$cur" ]]; then
+        # what the pane is about to show is what decides the tint, and it
+        # is decided here rather than from a fresh look at the map: tail
+        # -F keeps a run on screen after its log is deleted, and
+        # re-deriving would call that pane idle while it is still showing
+        # output. Painting before the swap also keeps the reset's screen
+        # clear in front of the content instead of wiping it.
+        if [[ -n "$new" && -f "$new" ]]; then disp=normal; else disp=idle; fi
+        repaint "$disp"
         [[ -n "$tailpid" ]] && { kill "$tailpid" 2>/dev/null; wait "$tailpid" 2>/dev/null }
         tailpid=""
         cur="$new"
@@ -135,6 +161,10 @@ while true; do
             last_idle_tick=$SECONDS
         fi
     fi
+    # picks up a live idle_bg edit on a pane already sitting idle instead
+    # of making it wait for the next swap; a no-op for a pane showing a
+    # log, whose paint is keyed on the state alone
+    repaint "$disp"
     # keep the decay countdown ticking while idle
     if [[ -z "$cur" ]] && (( SECONDS - last_idle_tick >= 1 )); then
         last_idle_tick=$SECONDS
@@ -147,6 +177,7 @@ while true; do
         read -s -t 0.3 -k 1 key 2>/dev/null
         if [[ "$key" == q ]]; then
             [[ -n "$tailpid" ]] && kill "$tailpid" 2>/dev/null
+            tile_paint normal
             printf '\033]1337;SetUserVar=cargotile=\007'
             printf '\033[H\033[2J\033[3J'
             exec /bin/zsh -il

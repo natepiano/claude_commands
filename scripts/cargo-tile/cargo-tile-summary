@@ -1,11 +1,11 @@
 #!/bin/zsh
-# rev 53 — bump this comment in every cargo-tile source file on each change
+# rev 60 — bump this comment in every cargo-tile source file on each change
 # Live summary for the cargo-tile grid: revision, grid size, tiled runs,
 # compiler activity (including rustc owned by the sccache server), plus Cargo
 # processes that predate `cargo-tile on` — those lines disappear as they exit.
 set -u
 
-REVISION=53
+REVISION=60
 
 TILE_HOME="${CARGO_TILE_HOME:-$HOME/.cargo-tile}"
 STATE=/tmp/cargo-tile/state
@@ -15,7 +15,7 @@ ERRLOG=/tmp/cargo-tile/pane-errors.log
 # cargo-tile.conf is the one place it is set, so pane, slot and summary
 # cannot drift apart
 source "${0:A:h}/conf.zsh"
-DECAY_SECS=$(tile_conf decay_secs 15)
+DECAY_SECS=$(tile_decay_secs)
 
 # self-refresh: re-exec when the source file's rev comment changes.
 # $0 inside a zsh function is the function name, so capture it here.
@@ -31,10 +31,36 @@ printf '\033]0;cargo-tile summary\007'
 printf '\033]1337;SetUserVar=cargotile=%s\007' Z3JpZA==
 
 last_decay_spawn=0
+painted=""
+
+# Move the grid one pane closer to the layout cargo-tile-pane published,
+# and stop. Walking target-order — the reading order — is what turns a
+# reflow into motion: the cell a split just opened is the first mismatch,
+# so it fills first, then each pane behind it hands its content back one
+# position, and the wave ends with the new run in the last pane. One pane
+# per frame means nothing ever jumps, and a run leaving animates the same
+# way as one arriving. Returns 1 when the grid already matches.
+step_reflow() {
+    [[ -s "$STATE/target-order" ]] || return 1
+    local o want cur
+    while IFS= read -r o; do
+        [[ -n "$o" ]] || continue
+        want=""
+        [[ -s "$STATE/target/$o" ]] && want=$(<"$STATE/target/$o")
+        cur=""
+        [[ -s "$STATE/panemap/$o" ]] && cur=$(<"$STATE/panemap/$o")
+        if [[ "$want" != "$cur" ]]; then
+            print -r -- "$want" > "$STATE/panemap/$o"
+            return 0
+        fi
+    done < "$STATE/target-order"
+    return 1
+}
 
 while true; do
     # re-read so a conf edit lands on the running grid without a restart
-    DECAY_SECS=$(tile_conf decay_secs 15)
+    DECAY_SECS=$(tile_decay_secs)
+    IDLE_BG=$(tile_conf_str idle_bg "$TILE_IDLE_BG_DEFAULT")
     rev="$(src_rev)"
     [[ -n "$rev" && "$rev" != "$REVISION" ]] && exec "$SELF"
 
@@ -185,6 +211,28 @@ while true; do
             [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null && pre+=("$pid	$cmd")
         done < "$STATE/preexisting"
         print -rl -- "${pre[@]}" > "$STATE/preexisting" 2>/dev/null
+    fi
+
+    # this pane is idle when cargo-tile is watching nothing: no tiled run
+    # alive and no pre-existing cargo process left over from `on`. Same
+    # tint the slot panes use for an empty pane, so one color means the
+    # same thing everywhere in the window — nothing is happening here —
+    # and a fully quiet grid goes green all over.
+    if (( running == 0 && ${#pre} == 0 )); then
+        state=idle
+    else
+        state=normal
+    fi
+    # an idle pane is keyed on its tint as well as its state, so retuning
+    # idle_bg lands on it instead of waiting for the next run to come and
+    # go; a busy pane is keyed on the state alone, since painting it
+    # normal means a terminal reset and there is nothing to reset twice.
+    # The frame below redraws whatever that reset clears.
+    want="$state"
+    [[ "$state" == idle ]] && want="idle:$IDLE_BG"
+    if [[ "$want" != "$painted" ]]; then
+        painted="$want"
+        tile_paint "$state" "$IDLE_BG"
     fi
 
     # Compiler ownership is not the same as build ownership when sccache is
@@ -415,16 +463,32 @@ while true; do
 
     printf '\033[H\033[2J\033[3J'
     print -rn -- "$buf"
-    # q drops this pane to an interactive shell
-    if [[ -t 0 ]]; then
-        key=""
-        read -s -t 2 -k 1 key 2>/dev/null
-        if [[ "$key" == q ]]; then
-            printf '\033]1337;SetUserVar=cargotile=\007'
-            printf '\033[H\033[2J\033[3J'
-            exec /bin/zsh -il
+
+    # Hold for the stats interval, but in frame-sized ticks: each one
+    # advances the reflow by a single pane. The stats are cheap to read
+    # at 2s and would look frantic faster; the reflow needs to be far
+    # quicker than that or a layout change reads as a jump. A worst-case
+    # step (29 -> 30 panes) is 25 frames, so the frame interval also sets
+    # how long the longest slide takes.
+    frame_ms=$(tile_conf reflow_ms 120)
+    (( frame_ms < 20 )) && frame_ms=20
+    tick=$(printf '%.3f' $(( frame_ms / 1000.0 )))
+    waited=0
+    while (( waited < 2000 )); do
+        step_reflow
+        # q drops this pane to an interactive shell
+        if [[ -t 0 ]]; then
+            key=""
+            read -s -t "$tick" -k 1 key 2>/dev/null
+            if [[ "$key" == q ]]; then
+                tile_paint normal
+                printf '\033]1337;SetUserVar=cargotile=\007'
+                printf '\033[H\033[2J\033[3J'
+                exec /bin/zsh -il
+            fi
+        else
+            sleep "$tick"
         fi
-    else
-        sleep 2
-    fi
+        (( waited += frame_ms ))
+    done
 done

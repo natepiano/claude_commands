@@ -1,5 +1,5 @@
 #!/bin/zsh
-# rev 53 — bump this comment in every cargo-tile source file on each change
+# rev 60 — bump this comment in every cargo-tile source file on each change
 # Control command for cargo run tiling in iTerm2.
 set -u
 
@@ -25,7 +25,8 @@ fi
 # windows-created is dropped here.
 reset_layout() {
     rm -f "$STATE/session" "$STATE/count" "$STATE/runs" "$STATE/grid" "$STATE/next-slot" "$STATE/grid-since" "$STATE/retreat-pending" "$STATE/rebuild-needed" "$STATE/pre-last" "$STATE/layout" "$STATE/pane-seq" "$STATE/decay-last" "$STATE/windows-created"
-    rm -f "$STATE"/pids/*(N) "$STATE"/slots/*(N) "$STATE"/panemap/*(N)
+    rm -f "$STATE/target-order"
+    rm -f "$STATE"/pids/*(N) "$STATE"/slots/*(N) "$STATE"/panemap/*(N) "$STATE"/target/*(N)
     rmdir "$STATE/lock" 2>/dev/null
 }
 
