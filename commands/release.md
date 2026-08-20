@@ -67,9 +67,13 @@ The command works with **zero config** by convention. It auto-detects:
 **Optional config** at `.claude/config/release.toml` for projects that need overrides:
 
 ```toml
-# Post-release install verification (binary crates only)
+# Post-release install verification (binary crates only).
+# In single-package mode the crate released is the crate verified, and this
+# value is only an on-switch — a multi-binary workspace has no one fixed crate.
 install_verify = "crate_dir"
-# Optional: custom install script (overrides default `cargo install`)
+# Optional: custom install script (overrides default `cargo install`).
+# Invoked as `<script> <version> <crate>`; reading $2 lets one script serve a
+# workspace whose crates install differently.
 install_verify_script = ".claude/scripts/release/install_verify.sh"
 
 # Publish all workspace members in one `cargo publish --workspace` call
@@ -748,9 +752,11 @@ NOTES_EOF
 
 **If `install_verify` is set in config** (skip in dry-run mode, with `dangerouslyDisableSandbox: true`):
 
-If `install_verify_script` is also set, run the custom script instead of the default `cargo install`:
+Resolve `${INSTALL_CRATE_NAME}` first. In single-package mode it is `${PACKAGE}`, and the config value acts only as an on-switch — a workspace holding several binaries cannot name one fixed crate to install, so the crate being released is the one to verify. Otherwise it is the `[package].name` of the crate at the `install_verify` directory.
+
+If `install_verify_script` is also set, run the custom script instead of the default `cargo install`. The crate name is passed as `$2` so one script can serve a workspace whose crates install differently; a script that reads only `$1` ignores it:
 ```bash
-${INSTALL_VERIFY_SCRIPT} ${VERSION}
+${INSTALL_VERIFY_SCRIPT} ${VERSION} ${INSTALL_CRATE_NAME}
 ```
 
 Otherwise, use the default:
