@@ -194,6 +194,20 @@ dispatch_rustc() {
     case "$backend" in
         sccache)
             export SCCACHE_IDLE_TIMEOUT="${SCCACHE_IDLE_TIMEOUT:-0}"
+            # sccache hashes every CARGO_*-prefixed environment variable into
+            # its cache key. Neither of the two below changes rustc's output,
+            # but both vary between otherwise identical builds, so leaving them
+            # alone splits or destroys the cache:
+            #   CARGO_TILE_NESTED  cargo-tile's pre-rev-67 nesting flag; it
+            #     carried the shim's pid, so every build got a unique key.
+            #     Renamed to CARGOTILE_NESTED, but long-lived shells and
+            #     captured shell snapshots still export the old name.
+            #   CARGO_TERM_COLOR   cargo-tile sets this only on the non-tty
+            #     path, so scripted builds (clean-fix, CI, agent shells) and
+            #     interactive builds landed in separate key spaces. Pin one
+            #     value here so they share entries.
+            unset CARGO_TILE_NESTED
+            export CARGO_TERM_COLOR=always
             exec "$SCCACHE_BIN" "$@"
             ;;
         off) exec "$@" ;;

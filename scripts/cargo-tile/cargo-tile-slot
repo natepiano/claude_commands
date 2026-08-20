@@ -1,5 +1,5 @@
 #!/bin/zsh
-# rev 66 — bump this comment in every cargo-tile source file on each change
+# rev 69 — bump this comment in every cargo-tile source file on each change
 # One layout pane, identified by a permanent ordinal. Watches its map
 # file (the log it should show) and displays it via tail; shows an idle
 # placeholder when the map is empty. Content reflows across panes as

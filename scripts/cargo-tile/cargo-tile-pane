@@ -1,5 +1,5 @@
 #!/bin/zsh
-# rev 66 — bump this comment in every cargo-tile source file on each change
+# rev 69 — bump this comment in every cargo-tile source file on each change
 # Assign runs to the cargo-tile pane layout.
 #   cargo-tile-pane <log>           add a run
 #   cargo-tile-pane --remove <log>  drop a finished run
@@ -58,6 +58,26 @@ esac
 LOG="${1:-}"
 mkdir -p "$STATE/slots" "$STATE/panemap"
 
+# Sandboxed callers (a cargo run from a Claude Code shell) never take the
+# layout lock. Taking it works, but the sandbox can kill the holder before
+# its EXIT trap releases it, and the steal path below is closed to them --
+# it needs /bin/ps, which the sandbox blocks -- so one sandboxed corpse
+# used to wedge the grid for every later caller until someone cleared the
+# lock by hand. Hand the work to the summary pane instead: it polls
+# rebuild-needed and spawns an unsandboxed --check, which re-registers
+# live runs and reaps slots whose log is gone.
+#
+# Two carve-outs:
+#   --close is an explicit teardown with nothing to defer to, so it locks
+#     as before.
+#   The handoff needs a summary pane to receive it, so it only applies once
+#     a grid window exists. Before that -- a sandboxed `cargo-tile on` --
+#     fall through and bootstrap the window directly, or nothing ever would.
+if [[ "$mode" != close && -s "$STATE/window" ]] && ! /bin/ps -p $$ >/dev/null 2>&1; then
+    touch "$STATE/rebuild-needed"
+    exit 0
+fi
+
 # serialize concurrent invocations — running two of these at once
 # interleaves osascript calls and corrupts the layout, so on timeout we
 # DROP the event (a later --check self-heals) rather than run unlocked
@@ -78,7 +98,19 @@ for i in {1..150}; do
         hpid=""
         [[ -f "$LOCK/pid" ]] && hpid=$(<"$LOCK/pid")
         if [[ "$hpid" == <-> ]]; then
-            kill -0 "$hpid" 2>/dev/null || rm -rf "$LOCK" 2>/dev/null
+            # `kill -0` succeeds for a zombie, so a holder killed before
+            # its EXIT trap ran keeps the lock forever and every later add
+            # times out — the grid then never rebuilds and no window
+            # appears. Process state is not a reliable tell either (an
+            # exiting zsh reports `?NE`, not `Z`). Match the command line
+            # instead: a live holder still shows its cargo-tile-pane
+            # argv, while a corpse shows a bare parenthesized `(zsh)` and
+            # a recycled pid shows something unrelated. All three of those
+            # mean the lock is free.
+            hcmd=$(/bin/ps -p "$hpid" -o command= 2>/dev/null)
+            if [[ "$hcmd" != *cargo-tile-pane* ]]; then
+                rm -rf "$LOCK" 2>/dev/null
+            fi
         else
             # no pid recorded (holder died mid-acquire): fall back to age
             lage=$(( $(date +%s) - $(stat -f %m "$LOCK" 2>/dev/null || date +%s) ))

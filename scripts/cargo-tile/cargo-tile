@@ -1,5 +1,5 @@
 #!/bin/zsh
-# rev 66 — bump this comment in every cargo-tile source file on each change
+# rev 69 — bump this comment in every cargo-tile source file on each change
 # Control command for cargo run tiling in iTerm2.
 set -u
 
@@ -43,8 +43,11 @@ hook_toolchains() {
         if ! grep -q 'cargo-tile-shim' "$tc/cargo" 2>/dev/null; then
             mv -f "$tc/cargo" "$tc/cargo-tile-real" || continue
         fi
-        cp -f "$shim" "$tc/cargo" && chmod +x "$tc/cargo"
-        echo "  hooked ${tc:h:t}"
+        if cp -f "$shim" "$tc/cargo" && chmod +x "$tc/cargo"; then
+            echo "  hooked ${tc:h:t}"
+        else
+            echo "  FAILED to hook ${tc:h:t} — the copy in that toolchain is stale" >&2
+        fi
     done
 }
 

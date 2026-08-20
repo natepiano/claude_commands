@@ -1,5 +1,5 @@
 #!/bin/zsh
-# rev 66 — bump this comment in every cargo-tile source file on each change
+# rev 69 — bump this comment in every cargo-tile source file on each change
 # cargo-tile-shim -- master copies live in ~/.claude/scripts/cargo-tile/;
 # ~/.cargo-tile/bin holds symlinks and `cargo-tile on` reinstalls the
 # toolchain hooks from there.
@@ -41,8 +41,11 @@ tile=1
 # nested cargo (build scripts, cargo-invoking-cargo, shim-in-shim) never
 # re-tiles. The flag carries the enclosing shim's pid and only counts
 # while that pid is alive — shell environments captured inside a tiled
-# run (Claude Code shell snapshots) carry the flag forever otherwise
-if [[ "${CARGO_TILE_NESTED:-}" == <-> ]] && kill -0 "$CARGO_TILE_NESTED" 2>/dev/null; then
+# run (Claude Code shell snapshots) carry the flag forever otherwise.
+# The name must NOT start with `CARGO_`: sccache hashes every CARGO_*
+# env var into its cache key, so a per-run pid under that prefix makes
+# every compilation unique and drives the hit rate to zero.
+if [[ "${CARGOTILE_NESTED:-}" == <-> ]] && kill -0 "$CARGOTILE_NESTED" 2>/dev/null; then
     tile=0
 fi
 # skip tooling/query invocations (rust-analyzer, IDE metadata probes,
@@ -74,7 +77,7 @@ fi
 
 (( tile )) || exec "$REAL" "$@"
 
-export CARGO_TILE_NESTED=$$
+export CARGOTILE_NESTED=$$
 LOG_DIR="$ROOT"
 mkdir -p "$LOG_DIR" "$STATE/pids"
 LOG="$LOG_DIR/run-$(date +%Y%m%d-%H%M%S)-$$.log"

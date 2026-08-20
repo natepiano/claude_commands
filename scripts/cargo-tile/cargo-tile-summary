@@ -1,11 +1,14 @@
 #!/bin/zsh
-# rev 66 — bump this comment in every cargo-tile source file on each change
+# rev 69 — bump this comment in every cargo-tile source file on each change
+# (in THIS file, bump REVISION below to the same number: the self-refresh at
+#  the top of the paint loop re-execs while the two disagree, so a bumped
+#  comment with a stale REVISION spins forever and the pane never paints)
 # Live summary for the cargo-tile grid: revision, grid size, tiled runs,
 # compiler activity (including rustc owned by the sccache server), plus Cargo
 # processes that predate `cargo-tile on` — those lines disappear as they exit.
 set -u
 
-REVISION=66
+REVISION=69
 
 TILE_HOME="${CARGO_TILE_HOME:-$HOME/.cargo-tile}"
 
