@@ -1,5 +1,5 @@
 ---
-description: Analyze staged and unstaged changes, run a clippy precheck, and draft a commit title and body for review before committing.
+description: Analyze staged and unstaged changes and present a complete commit message for a single approve-or-abandon decision; runs clippy only when the `clippy` token is passed.
 ---
 
 **IMPORTANT** don't commit the changes that you will examine. Just do the following:
@@ -8,30 +8,24 @@ description: Analyze staged and unstaged changes, run a clippy precheck, and dra
     **EXECUTE THESE STEPS IN ORDER:**
     **STEP 1:** Execute <AnalyzeChanges/>
     **STEP 2:** Execute <ClippyPrecheck/>
-    **STEP 3:** Execute <CommitTitleHandling/>
-    **STEP 4:** Execute <GenerateCommitBody/>
-    **STEP 5:** Execute <FinalCommitDecision/>
+    **STEP 3:** Execute <DraftCommitMessage/>
+    **STEP 4:** Execute <CommitDecision/>
 </ExecutionSteps>
 
+There is exactly ONE approval gate, in <CommitDecision/>. Never stop to confirm
+the title on its own — the title and body are presented together, once.
+
 <ClippyPrecheck>
-If `$ARGUMENTS` contains the token `noclippy` (case-insensitive, matched as a whole word), skip this step silently. Strip the `noclippy` token from `$ARGUMENTS` before any later step uses it (so it is not treated as part of the commit title).
+**Clippy is opt-in, and the default is not to run it.** Skip this step
+silently unless explicitly asked: no clippy run, no question about running
+one, no mention of it in your output. Never ask "Run `/clippy` first?" — the
+answer is already no unless the token below is present.
 
-If `$ARGUMENTS` contains the token `clippy` (case-insensitive, matched as a whole word — and not `noclippy`), invoke the `clippy` skill immediately without asking, then continue to the next step. Strip the `clippy` token from `$ARGUMENTS` before any later step uses it (so it is not treated as part of the commit title).
+If `$ARGUMENTS` contains the token `clippy` (case-insensitive, matched as a whole word — and not `noclippy`), invoke the `clippy` skill immediately without asking, then continue to the next step.
 
-First, look at the file list from <AnalyzeChanges/>. If none of the uncommitted files are Rust source (`.rs`) or Cargo manifests (`Cargo.toml`, `Cargo.lock`), skip this step silently — clippy is irrelevant.
-
-Otherwise, check your own conversation context to determine whether `/clippy` has been run recently — i.e., whether the `clippy` skill has been invoked in this session **after the most recent Rust code changes**.
+Strip both the `clippy` and `noclippy` tokens from `$ARGUMENTS` before any later step uses it, so neither is treated as part of the commit title. `noclippy` is accepted and ignored — it names what already happens by default.
 
 When the `clippy` skill runs (from here or otherwise), its `<StyleReview/>` step must be done inline, not delegated to a subagent — the user needs to track progress through the whole workflow, not wait on an unauditable subagent turn.
-
-- **If `/clippy` has been run recently after the latest Rust edits**: Proceed silently to the next step. Do NOT ask the user. Do NOT mention clippy. Do not take an extra turn.
-- **If `/clippy` has NOT been run recently** (or no clippy run is visible in context at all): Ask the user exactly once:
-
-  > Run `/clippy` first? (yes/no)
-
-  Wait for the user's response.
-  - If **yes**: Invoke the `clippy` skill, then continue to the next step.
-  - If **no**: Continue to the next step without running clippy.
 </ClippyPrecheck>
 
 <AnalyzeChanges>
@@ -40,30 +34,15 @@ Run `bash ~/.claude/scripts/commit_prep/analyze_changes.sh` to gather git status
 If the script reports no uncommitted changes, inform the user and stop.
 </AnalyzeChanges>
 
-<CommitTitleHandling>
-If $ARGUMENTS is provided:
-- Use $ARGUMENTS as the commit title
+<DraftCommitMessage>
+Write the complete conventional commit message — title and body together —
+without pausing for approval of either part.
 
-If no $ARGUMENTS provided:
-- Suggest a concise conventional commit title (one line, under 72 characters)
-- Execute <UserTitleConfirmation/>
-</CommitTitleHandling>
+**Title**: if $ARGUMENTS is non-empty after the token stripping in
+<ClippyPrecheck/>, use it verbatim as the title. Otherwise compose one: a
+concise conventional commit title, one line, under 72 characters.
 
-<UserTitleConfirmation>
-Present to user:
-
-## Available Actions
-- **use** - Use the suggested commit title
-- **change** - Provide a different commit title
-
-Wait for user response.
-
-If user selects **change**: Ask for new title and use their provided title.
-If user selects **use**: Use the suggested title.
-</UserTitleConfirmation>
-
-<GenerateCommitBody>
-Using the analyzed changes and established commit title, generate a full conventional commit message.
+**Body**: generate it from the analyzed changes and the established title.
 
 Use only as many bullets as the commit needs — a small or single-purpose change may need one bullet or none; a large change may need several.
 
@@ -77,22 +56,29 @@ Do NOT include:
 
 If the change is purely mechanical (rename, reorder, move) with no behavior change, say so in one bullet and stop.
 
-Present the full commit message to the user:
+Present the full commit message to the user, title line included:
 
 ```
 **Proposed commit message:**
 [full commit message]
 ```
-</GenerateCommitBody>
 
-<FinalCommitDecision>
-Present to user:
+Then go straight to <CommitDecision/> in the same turn.
+</DraftCommitMessage>
+
+<CommitDecision>
+Present to user, immediately below the proposed message:
 
 ## Available Actions
 - **commit** - Execute the git commit with the prepared message
+- **change** - Say what to change (title, body, or file selection); revise and re-present
 - **abandon** - Stop without committing
 
 Wait for user response.
+
+If user selects **change**: apply what they asked for, present the revised
+message in full, and return to this same gate. Do not split the revision into
+separate title and body approvals.
 
 If user selects **commit**:
 
@@ -137,7 +123,7 @@ Pick the path for your agent:
 Then execute <CommitOutput/>
 
 If user selects **abandon**: Run `git reset` to unstage any changes (if staged) and stop
-</FinalCommitDecision>
+</CommitDecision>
 
 <CommitOutput>
 Format output as:
