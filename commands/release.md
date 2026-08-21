@@ -86,11 +86,16 @@ workspace_publish = true
 # cargo publish rejects path-only deps (no version requirement). Each entry's
 # `^<dep> = ...` line in root Cargo.toml is rewritten to `<dep> = "<version>"`
 # (path dropped) and committed on the fire-and-forget release branch just
-# before publishing; main is never touched, so it keeps the path dep. Bump
-# `version` when the dependency gets a newer published release.
+# before publishing; main is never touched, so it keeps the path dep.
+#
+# Omit `version` to resolve it at release time from the crates.io sparse index.
+# That also diffs the local crate against what the resolved version actually
+# published and halts the release when the dep has unpublished changes, which a
+# hardcoded version cannot do — it goes stale silently and ships the dependent
+# crate against an older API than the repo builds. Set `version` only to force a
+# specific pin against that check.
 [[publish_path_pins]]
 dep = "dep_name"
-version = "0.1.0"
 
 # Ordered publish phases (workspace dependency chains only)
 [[publish_phases]]
@@ -122,7 +127,8 @@ All scriptable steps use shell scripts. The agent orchestrates script execution 
 - `pre_release_checks.sh` — git status, clippy, build, test, fmt ⊘ (deliberately ignores `config/lint.conf`; a check turned off with `/lint_config` still runs here, because a release gate that silently no-ops is worse than a noisy one)
 - `create_release_branch.sh` — branch creation
 - `bump_versions.sh` — update [package] version fields
-- `pin_path_deps.sh` — pin path-only workspace deps to published versions for publish (release branch only)
+- `resolve_path_pins.sh` — resolve each path-only workspace dep to its latest published version and detect unpublished local changes ⊘
+- `pin_path_deps.sh` — pin path-only workspace deps to published versions for publish; `--restore` undoes an uncommitted dry-run pin
 - `finalize_changelogs.sh` — replace [Unreleased] with version header
 - `publish_crate.sh` — dry-run and publish a single crate ⊘
 - `update_workspace_deps.sh` — update internal cross-crate versions in root `Cargo.toml` `[workspace.dependencies]`; between publish phases with explicit names ⊘, or with `--edit-only --auto` (self-discovering, no crates.io wait, no commit) when bumping versions in STEP 4 and STEP 11
@@ -584,17 +590,31 @@ This produces a clean commit label visible in GitHub's file list for both CHANGE
 
 ### Pin path-only workspace deps (if `[[publish_path_pins]]` config exists)
 
-**Run this once, before any dry-run below**, and only when the config defines `[[publish_path_pins]]`. cargo publish rejects path-only workspace deps (no version requirement), so each pinned dep must be rewritten to a published version first. This runs on the release branch (created in STEP 5) and commits the pin there — main is never modified, so it keeps the path dependency by construction (this is the "restore to path" guarantee; no later cleanup step is needed).
+**Run this once, before any dry-run below**, and only when the config defines `[[publish_path_pins]]`. cargo publish rejects path-only workspace deps (no version requirement), so each pinned dep must be rewritten to a published version first. On a real release this runs on the release branch (created in STEP 5) and commits the pin there — main is never modified, so it keeps the path dependency by construction (this is the "restore to path" guarantee; no later cleanup step is needed).
 
-**Skip any entry whose `dep` names a crate being released in this run**, and proceed directly to the dry-run if that leaves nothing to pin. In single-package mode the pinned crate is often the release target itself. A crate never depends on itself, so it has nothing to pin — and the entry still names the *previous* published version, so applying it would resolve the rest of the workspace against the older crates.io release instead of the local one. Bumping the entry first is circular: the version being released is not on crates.io yet. Path-only *dev*-dependencies need no pin either, since cargo strips them from the packaged manifest.
+**Skip any entry whose `dep` names a crate being released in this run**, and proceed directly to the dry-run if that leaves nothing to pin. In single-package mode the pinned crate is often the release target itself. A crate never depends on itself, so it has nothing to pin — and resolving the entry would point the rest of the workspace at the *previous* crates.io release instead of the local one. Path-only *dev*-dependencies need no pin either, since cargo strips them from the packaged manifest.
 
-Build `${PIN_ARGS}` as one `<dep>=<version>` token per remaining `[[publish_path_pins]]` entry (e.g. `bevy_kana=0.1.0`), then (with `dangerouslyDisableSandbox: true`):
+**Resolve the pins.** Collect `${DEP_NAMES}` as one bare `dep` name per remaining entry that omits `version`. **If that list is empty, skip this command** — every entry already names its version, and the script rejects an empty argument list. Otherwise (with `dangerouslyDisableSandbox: true`):
+```bash
+~/.claude/scripts/release/resolve_path_pins.sh ${DEP_NAMES}
+```
+→ stdout is one `<dep>=<version>` token per dep, resolved from the crates.io sparse index. That is `${PIN_ARGS}`. Entries that set an explicit `version` skip resolution — append them to `${PIN_ARGS}` as `<dep>=<version>` directly.
+
+**Exit 2 means a dep has changes that are not published.** The script lists the added, removed, and modified files against the published tarball. **Stop and report them.** Pinning anyway publishes the dependent crate against an older API than this repo builds and CI tested — usually a wall of "not found in crate" errors during the publish verify build, and if the drift happens to compile, a silent mismatch instead. The fix is to release the dependency first with `/release <dep> X.Y.Z`, then re-run this release. Choosing a version for the dependency is a semver judgment, so it belongs to the user. Continue past exit 2 only if the user, shown the drift, says to.
+
+**Apply the pins** (with `dangerouslyDisableSandbox: true`):
 ```bash
 ~/.claude/scripts/release/pin_path_deps.sh ${DRY_RUN_FLAG} ${PIN_ARGS}
 ```
-→ This rewrites root `Cargo.toml`, runs `cargo update --workspace`, and commits `chore: pin workspace path deps for publish`. Report the script output. Stop if it fails. In dry-run mode it reports the rewrites without committing.
+→ This rewrites root `Cargo.toml`, runs `cargo update --workspace`, and commits `chore: pin workspace path deps for publish`. Report the script output. Stop if it fails.
 
-If no `[[publish_path_pins]]` config exists, skip this and proceed directly to the dry-run.
+**In dry-run mode the pin is applied but not committed**, because a dry-run cuts no release branch — the edit lands on the working tree. Set `${PIN_DIRTY_FLAG}` to `--allow-dirty` for the dry-run publish commands below (cargo refuses a dirty tree otherwise), and once every dry-run publish has finished — **pass or fail** — restore the working tree before reporting results:
+```bash
+~/.claude/scripts/release/pin_path_deps.sh --restore
+```
+Leave `${PIN_DIRTY_FLAG}` empty when no dry-run pin was applied, and on real releases, where the pin is committed on the release branch.
+
+If no `[[publish_path_pins]]` config exists, skip this entirely, leave `${PIN_DIRTY_FLAG}` empty, and proceed directly to the dry-run.
 
 ### If no config — single crate or simple workspace
 
@@ -602,16 +622,16 @@ If no `[[publish_path_pins]]` config exists, skip this and proceed directly to t
 
 Single crate:
 ```bash
-~/.claude/scripts/release/publish_crate.sh ${PACKAGE_NAME} --dry-run
+~/.claude/scripts/release/publish_crate.sh ${PACKAGE_NAME} --dry-run ${PIN_DIRTY_FLAG}
 ```
 
 Workspace (no config):
 For each non-excluded workspace member:
 ```bash
-~/.claude/scripts/release/publish_crate.sh ${PACKAGE_NAME} --dry-run
+~/.claude/scripts/release/publish_crate.sh ${PACKAGE_NAME} --dry-run ${PIN_DIRTY_FLAG}
 ```
 
-→ Report all dry-run results to the user. Stop if any dry-run fails.
+→ Report all dry-run results to the user. When `${PIN_DIRTY_FLAG}` is set, run `pin_path_deps.sh --restore` now, before reporting or stopping — the pin is uncommitted and must not outlive the dry-run. Stop if any dry-run fails.
 
 **If this is a dry-run release (`${DRY_RUN_FLAG}` is `--dry-run`), skip the rest of STEP 6 — do not publish.**
 
@@ -639,10 +659,10 @@ Build `${EXCLUDE_FLAGS}` as one `--exclude <name>` per member that STEP 1 discov
 
 **Dry-run** (with `dangerouslyDisableSandbox: true`):
 ```bash
-cargo publish --workspace --dry-run ${EXCLUDE_FLAGS}
+cargo publish --workspace --dry-run ${EXCLUDE_FLAGS} ${PIN_DIRTY_FLAG}
 ```
 
-→ Report dry-run results to the user. Stop if the dry-run fails.
+→ Report dry-run results to the user. When `${PIN_DIRTY_FLAG}` is set, run `pin_path_deps.sh --restore` now, before reporting or stopping — the pin is uncommitted and must not outlive the dry-run. Stop if the dry-run fails.
 
 **If this is a dry-run release (`${DRY_RUN_FLAG}` is `--dry-run`), skip the rest of STEP 6 — do not publish.**
 
@@ -665,9 +685,9 @@ Execute each phase in order. **Each phase does its own dry-run before publishing
 
 2. **Dry-run** this phase's crates (with `dangerouslyDisableSandbox: true`):
 ```bash
-~/.claude/scripts/release/publish_crate.sh ${PACKAGE_NAME} --dry-run
+~/.claude/scripts/release/publish_crate.sh ${PACKAGE_NAME} --dry-run ${PIN_DIRTY_FLAG}
 ```
-→ Report dry-run results. Stop if any dry-run fails.
+→ Report dry-run results. When `${PIN_DIRTY_FLAG}` is set, run `pin_path_deps.sh --restore` now, before reporting or stopping — the pin is uncommitted and must not outlive the dry-run. Stop if any dry-run fails.
 
 3. **If this is a dry-run release (`${DRY_RUN_FLAG}` is `--dry-run`)**: report what would be published for remaining phases, then skip the rest of STEP 6 — do not publish.
 
@@ -816,9 +836,11 @@ cargo update --workspace
 
 → Verify `cargo check` passes after updating (skip in dry-run mode).
 
-**Bump `[[publish_path_pins]]` to the version just released** (skip in dry-run mode). For each `[[publish_path_pins]]` entry in `.claude/config/release.toml` whose `dep` names a crate published in this run, set its `version` to `${VERSION}`. That version is on crates.io now, so the next dependent crate's release pins against it instead of the previous one — left stale, it silently publishes that crate against an older API.
+**Bump any pinned `[[publish_path_pins]]` to the version just released** (skip in dry-run mode). For each `[[publish_path_pins]]` entry in `.claude/config/release.toml` that sets an explicit `version` and whose `dep` names a crate published in this run, set its `version` to `${VERSION}`. That version is on crates.io now, so the next dependent crate's release pins against it instead of the previous one — left stale, it silently publishes that crate against an older API.
 
 **Do this without asking the user.** It records what the release just made true; it is not a judgment call.
+
+Entries that omit `version` need no bump — `resolve_path_pins.sh` reads the current version from crates.io on every release, which is why omitting it is the better default.
 
 **Commit and push** (skip in dry-run mode; push with `dangerouslyDisableSandbox: true`). Include `.claude/config/release.toml` in the `git add` when the pin bump above changed it:
 ```bash
@@ -1038,4 +1060,5 @@ If already published to crates.io, you cannot unpublish. Release a new patch ver
 6. **Workspace dependency ordering**: If publish fails due to dependency ordering, set `workspace_publish = true` in `.claude/config/release.toml` (cargo >= 1.90, members publish together, no between-phase scripts) or add `[[publish_phases]]` (ordered chains needing scripts or dep rewrites between phases, e.g. bevy_brp)
 7. **crates.io indexing delay**: If a later phase fails because a just-published crate isn't indexed yet, increase `wait_seconds` in the config
 8. **Missing post_script**: The config references a script that doesn't exist — create it or fix the path
-9. **"all dependencies must have a version requirement specified when publishing"**: A workspace dep is path-only (e.g. an unpublished sibling crate referenced by `path` with no `version`). Add a `[[publish_path_pins]]` entry naming the dep and the published version to pin it to during publish; bump that version when the dep gets a newer release
+9. **"all dependencies must have a version requirement specified when publishing"**: A workspace dep is path-only (e.g. a sibling crate referenced by `path` with no `version`). Add a `[[publish_path_pins]]` entry naming the dep, with no `version`, so STEP 6 pins it to its current crates.io release during publish
+10. **Publish verify build fails with "not found in crate `<dep>`" for a pinned path dep**: the dependent crate uses API that exists locally but was never published. `resolve_path_pins.sh` reports this as unpublished drift before the dry-run; the fix is to release `<dep>` first, then re-run. If it slipped through, the `[[publish_path_pins]]` entry is carrying a stale explicit `version` — drop the `version` key so it resolves at release time
