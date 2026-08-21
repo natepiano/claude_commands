@@ -106,6 +106,12 @@ IMAGE_TOKENS = 1_600
 TAIL_BYTES = 512 * 1024
 TAIL_BYTES_RETRY = 4 * 1024 * 1024
 
+# A compaction writes two adjacent entries: a `system` record carrying
+# `compactMetadata` and the `user` record holding the summary itself. Either one
+# marks the point where the previous context stopped existing, and the backward
+# scan below must not cross it -- see `latest_reading`.
+COMPACT_MARKERS = ('"compactMetadata"', '"isCompactSummary"')
+
 
 class Usage(TypedDict, total=False):
     input_tokens: int
@@ -307,10 +313,26 @@ def latest_reading(path: Path) -> Reading | None:
     are not counted anywhere until the next request. `pending_bytes` measures
     that gap -- everything written to the transcript after the newest assistant
     turn -- so the caller can add it back in.
+
+    Returns None on the first tool call after a compaction. That one-turn lag is
+    normally harmless, but across a compaction boundary the previous turn belongs
+    to a context that no longer exists, and the scan would keep walking back into
+    it: a live session read 194,099 tokens off a turn the compaction had already
+    discarded, then added the summary itself as `pending_bytes` on top, and
+    reported 219,231 against a 225,000 trigger while the real count was 60,335.
+    The agent stopped work to write a handoff doc it did not need.
+
+    `compactMetadata.postTokens` is not the fix -- it counts only the surviving
+    conversation (13,444 in that session) and misses the system prompt, tools,
+    and project files that reload with it, which is the direction this file
+    refuses to err in everywhere else. Staying silent costs exactly one tool
+    call, because the next assistant turn writes a real post-compaction record.
     """
     for size in (TAIL_BYTES, TAIL_BYTES_RETRY):
         lines = read_tail(path, size)
         for offset, line in enumerate(reversed(lines)):
+            if any(marker in line for marker in COMPACT_MARKERS):
+                return None
             if '"usage"' not in line or '"assistant"' not in line:
                 continue
             try:
