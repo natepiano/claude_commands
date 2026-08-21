@@ -13,9 +13,12 @@ These categories are already decided and never reach the user:
 
 - **Low-stakes and reversible.** Make the call, state it in one line with the
   reason, and note that it is a one-line revert if they disagree.
-- **User experience.** When the options differ in user experience, the premium,
-  flawless experience is always the answer — nothing less than the best user
-  experience is acceptable, and everything is built with that in mind.
+- **Experience, user and developer.** When options differ in experience, the
+  premium, flawless one is always the answer — nothing less is acceptable, for
+  the user or for the next agent reading the code. Complexity you struggle to
+  hold is complexity that will defeat a future agent debugging it.
+- **Ranking.** Correctness, then simplicity and ergonomics, then speed. Cost of
+  the work never breaks the tie — a phase splits easily, complexity never does.
 - **API surface.** When the question is whether to expose API surface that has
   no current consumer — only a possible future technical use case — the answer
   is always private now: keep it internal, and open it later when a real
