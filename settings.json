@@ -35,7 +35,6 @@
       "Bash(mkdir *)",
       "Bash(rg *)",
       "Bash(run_test.sh *)",
-      "Bash(rust-cache *)",
       "Bash(~/.claude/scripts/release/*)",
       "Bash(//Users/natemccoy/rust/**/.git/**)",
       "Edit(//Users/natemccoy/.claude/**)",
