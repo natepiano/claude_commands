@@ -1,5 +1,5 @@
 #!/bin/zsh
-# rev 69 — bump this comment in every cargo-tile source file on each change
+# rev 70 — bump this comment in every cargo-tile source file on each change
 # Shared reader for cargo-tile.conf, plus the idle tint every pane paints
 # itself with. Sourced, never executed.
 #

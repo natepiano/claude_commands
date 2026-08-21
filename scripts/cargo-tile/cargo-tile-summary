@@ -1,5 +1,5 @@
 #!/bin/zsh
-# rev 69 — bump this comment in every cargo-tile source file on each change
+# rev 70 — bump this comment in every cargo-tile source file on each change
 # (in THIS file, bump REVISION below to the same number: the self-refresh at
 #  the top of the paint loop re-execs while the two disagree, so a bumped
 #  comment with a stale REVISION spins forever and the pane never paints)
@@ -8,7 +8,7 @@
 # processes that predate `cargo-tile on` — those lines disappear as they exit.
 set -u
 
-REVISION=69
+REVISION=70
 
 TILE_HOME="${CARGO_TILE_HOME:-$HOME/.cargo-tile}"
 

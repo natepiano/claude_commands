@@ -1,5 +1,5 @@
 #!/bin/zsh
-# rev 69 — bump this comment in every cargo-tile source file on each change
+# rev 70 — bump this comment in every cargo-tile source file on each change
 # Assign runs to the cargo-tile pane layout.
 #   cargo-tile-pane <log>           add a run
 #   cargo-tile-pane --remove <log>  drop a finished run
@@ -57,6 +57,24 @@ case "${1:-}" in
 esac
 LOG="${1:-}"
 mkdir -p "$STATE/slots" "$STATE/panemap"
+
+# Tiling off: nothing here may stand a grid back up. `cargo-tile off`
+# clears the marker, but the lingering --remove a finishing run schedules
+# — and any --check still queued behind it — arrives seconds later, finds
+# the window gone, and rebuilds it, which is why a grid closed by hand or
+# by `off` used to come straight back. --close is the teardown itself and
+# the test grid runs without the marker by design, so both are exempt.
+if [[ "$mode" != close && ! -f "$TILE_HOME/active" && ! -f "$STATE/test-mode" ]]; then
+    # a remove still tidies up after itself, so switching off mid-run
+    # leaves neither a stale slot nor an orphaned log behind
+    if [[ "$mode" == remove && -n "$LOG" ]]; then
+        for f in "$STATE"/slots/*(N); do
+            [[ -s "$f" && "$(<"$f")" == "$LOG" ]] && : > "$f"
+        done
+        rm -f "$LOG"
+    fi
+    exit 0
+fi
 
 # Sandboxed callers (a cargo run from a Claude Code shell) never take the
 # layout lock. Taking it works, but the sandbox can kill the holder before

@@ -1,5 +1,5 @@
 #!/bin/zsh
-# rev 69 — bump this comment in every cargo-tile source file on each change
+# rev 70 — bump this comment in every cargo-tile source file on each change
 # Control command for cargo run tiling in iTerm2.
 set -u
 
@@ -147,8 +147,14 @@ case "${1:-status}" in
         echo "cargo-tile: on — new cargo runs open panes in the grid window"
         ;;
     off)
+        # clear the marker first so nothing tiles behind the teardown,
+        # then close the grid window and drop the layout state — leaving
+        # $STATE/window recorded is what made a later --check rebuild the
+        # window we just closed
         rm -f "$TILE_HOME/active"
-        echo "cargo-tile: off"
+        "$TILE_HOME/bin/cargo-tile-pane" --close >/dev/null 2>>"$ERRLOG"
+        reset_layout
+        echo "cargo-tile: off — grid closed"
         ;;
     reset)
         reset_layout
