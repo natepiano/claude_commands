@@ -35,6 +35,19 @@ fi
 
 run() {
     printf '+ %s\n' "$*"
+    # A terminal on the other end means a human is watching, so run straight
+    # through and keep the colors. The tee below is what costs them: cargo and
+    # mend see a pipe, not a tty, and drop their ANSI. It buys only the sandbox
+    # detection underneath, which can fire only inside Claude Code, where
+    # stdout is never a tty.
+    if [[ -t 1 ]]; then
+        local tty_status=0
+        set +e
+        "$@"
+        tty_status=$?
+        set -e
+        return $tty_status
+    fi
     local log="${TMPDIR:-/tmp}/lint_invoke.$$.log"
     local status=0
     # tee keeps output streaming: heartbeat_watch.sh digests the agent log to
