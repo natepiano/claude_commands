@@ -6,7 +6,7 @@ description: Reproduce a cargo-mend failure on an external project in a throwawa
 
 **Arguments**: `$ARGUMENTS` — path to the project `cargo mend` is failing on. If empty, ask the user for it before doing anything else.
 
-cargo-mend source lives at `/Users/natemccoy/rust/cargo-mend`. All fixes go there, never in the target project.
+cargo-mend source lives at `/Users/natemccoy/rust/cargo-liner/crates/cargo-mend`, a member of the cargo-liner workspace. All fixes go there, never in the target project.
 
 **The failure is always the same one**: `cargo mend --fix-all` applies rewrites that no longer compile. mend re-checks after applying, the compiler errors, and it prints `compiler failed after applying mend fixes; changes were rolled back` and exits 2. Plain `cargo mend` exits 0 — a clean read-only run is not evidence of anything. Never ask the user which failure they mean; this command is only invoked when `--fix` is broken.
 
@@ -43,7 +43,7 @@ cargo mend --fix-all "$DEST/work" > "$DEST"/repro.log 2>&1; echo "EXIT=$?" >> "$
 - If it does **not** reproduce, try `--fix`, `--fix-pub-use`, and `--fix-compiler` individually before reporting back — the breakage may be confined to one fix pass.
 
 **STEP 4 — Diagnose in cargo-mend**
-- Work in `/Users/natemccoy/rust/cargo-mend`. Prefer LSP (definitions, references, hover) over grep.
+- Work in `/Users/natemccoy/rust/cargo-liner/crates/cargo-mend`. Prefer LSP (definitions, references, hover) over grep.
 - Trace from the observed symptom to the code that produced it before changing anything. Name the function and the value it computed.
 - Isolate the pattern in a dependency-free fixture crate under `$DEST` and confirm it reproduces there. A 6-file crate that fails in one second beats re-checking a bevy workspace, and it becomes the regression test.
 - If two attempts fail to resolve it, start an attempts log in the cargo-mend memory directory and log every approach, reasoning, and result before the next attempt — telling the user each time an entry is added.
@@ -68,7 +68,7 @@ rsync -a --delete --exclude 'target/' "$DEST"/pristine/ "$DEST"/work/   # fresh 
 **STEP 7 — Install**
 Only after the fix is confirmed and tests pass. Run this exactly, without asking:
 ```bash
-RUSTC_BOOTSTRAP=1 cargo +stable install --path .
+RUSTC_BOOTSTRAP=1 cargo +stable install --path /Users/natemccoy/rust/cargo-liner/crates/cargo-mend
 ```
 
 **STEP 8 — Hand off for user verification, then stop**

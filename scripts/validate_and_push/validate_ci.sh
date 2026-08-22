@@ -30,8 +30,9 @@ HOST_TRIPLE="$(rustc -vV | sed -n 's/^host: //p')"
 
 # Canonical local CI mirror for Nate's Rust repos.
 # Variations:
-# - In the cargo-mend repo, fix and strict steps invoke the local binary through
-#   `cargo run`; all other repos use the installed cargo-mend through LINT_CMD
+# - When the repo builds cargo-mend, fix and strict steps invoke that build
+#   instead of the installed binary, so a mend change gates its own push; all
+#   other repos use the installed cargo-mend through LINT_CMD
 # - Host clippy lints lib/bins/tests only (examples and benches excluded);
 #   benches are intentionally never run here — run them ad hoc
 # - `mend=off` in config/lint.conf skips both cargo-mend steps here, and only
@@ -42,6 +43,9 @@ HOST_TRIPLE="$(rustc -vV | sed -n 's/^host: //p')"
 # - If `.cargo/validate-targets` exists, each non-comment target listed there
 #   gets additive cross-target clippy plus test-binary compilation. Host checks
 #   still run, so this validates macOS plus configured Linux targets on a Mac.
+#   Packages using rustc_private are excluded from those cross-target steps one
+#   by one — rustc-dev is host-only — and a target is skipped outright only when
+#   no package is left to check
 
 worktree_has_changes() {
   ! git diff --quiet || ! git diff --cached --quiet || [ -n "$(git ls-files --others --exclude-standard)" ]
@@ -53,11 +57,29 @@ if worktree_has_changes; then
   exit 1
 fi
 
-REPO_NAME="$(basename "$PWD")"
-IS_SELF_MEND=0
-if [ "$REPO_NAME" = "cargo-mend" ]; then
-  IS_SELF_MEND=1
-fi
+TAB="$(printf '\t')"
+RUSTC_PRIVATE_MARKERS='(^|[^[:alnum:]_])rustc_(driver|hir|interface|middle|span)(::|[[:space:]]|$)'
+
+# Workspace members as "name<TAB>manifest-path", resolved once. `cargo metadata
+# --no-deps` reports members only, which is the scope both the cross-target and
+# the cargo-mend decisions below need. An empty result means metadata or jq is
+# unavailable; each caller then falls back to a repo-wide test rather than
+# guessing at package boundaries.
+WORKSPACE_MEMBERS=""
+WORKSPACE_MEMBERS_RESOLVED=0
+
+workspace_members() {
+  if [ "$WORKSPACE_MEMBERS_RESOLVED" -eq 0 ]; then
+    WORKSPACE_MEMBERS_RESOLVED=1
+    if command -v jq >/dev/null 2>&1; then
+      WORKSPACE_MEMBERS="$(
+        cargo metadata --no-deps --format-version 1 2>/dev/null |
+          jq -r '.packages[] | "\(.name)\t\(.manifest_path)"' 2>/dev/null || printf ''
+      )"
+    fi
+  fi
+  printf '%s' "$WORKSPACE_MEMBERS"
+}
 
 run_step() {
   local label="$1"
@@ -90,20 +112,100 @@ run_autofix_step() {
   amend_fixes "$label"
 }
 
-repo_uses_rustc_private() {
-  if [ "${VALIDATE_FORCE_CROSS_TARGETS:-0}" = "1" ]; then
+# Whether one package's sources use rustc_private. Asked per package, not per
+# repo: in a workspace, one rustc_private crate must not disqualify its stable
+# siblings from cross-target checks.
+package_uses_rustc_private() {
+  local pkg_dir="$1"
+  local pathspec
+
+  if git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    # `:/` anchors the pathspec at the repo root: git pathspecs are otherwise
+    # relative to the caller's directory, where a package path would match
+    # nothing and read as "no rustc_private".
+    if [ "$pkg_dir" = "$REPO_ROOT" ]; then
+      pathspec=':/*.rs'
+    else
+      pathspec=":/${pkg_dir#"${REPO_ROOT}/"}/*.rs"
+    fi
+    if git grep -q -E "$RUSTC_PRIVATE_MARKERS" -- "$pathspec" 2>/dev/null; then
+      return 0
+    fi
     return 1
   fi
 
   local search_roots=()
-  [ -d src ] && search_roots+=(src)
-  [ -d tests ] && search_roots+=(tests)
-  [ -d benches ] && search_roots+=(benches)
-  [ -d examples ] && search_roots+=(examples)
+  [ -d "$pkg_dir/src" ] && search_roots+=("$pkg_dir/src")
+  [ -d "$pkg_dir/tests" ] && search_roots+=("$pkg_dir/tests")
+  [ -d "$pkg_dir/benches" ] && search_roots+=("$pkg_dir/benches")
+  [ -d "$pkg_dir/examples" ] && search_roots+=("$pkg_dir/examples")
+  [ -f "$pkg_dir/build.rs" ] && search_roots+=("$pkg_dir/build.rs")
   [ "${#search_roots[@]}" -gt 0 ] || return 1
 
-  grep -R -E '(^|[^[:alnum:]_])rustc_(driver|hir|interface|middle|span)(::|[[:space:]]|$)' \
-    "${search_roots[@]}" >/dev/null 2>&1
+  if grep -R -E "$RUSTC_PRIVATE_MARKERS" "${search_roots[@]}" >/dev/null 2>&1; then
+    return 0
+  fi
+  return 1
+}
+
+# Fallback for repos whose package list could not be read: the original
+# repo-wide question, over tracked sources.
+repo_uses_rustc_private() {
+  package_uses_rustc_private "$REPO_ROOT"
+}
+
+# Which workspace packages can be cross-compiled, resolved once. rustc_private
+# binds a package to the host rustc toolchain (rustc-dev ships host-only), so
+# those packages are excluded by name and the target is skipped only when
+# nothing else is left to check.
+CROSS_SCOPE_RESOLVED=0
+CROSS_SCOPE=""
+CROSS_EXCLUDE_ARGS=()
+CROSS_EXCLUDED_NAMES=""
+
+resolve_cross_target_scope() {
+  if [ "$CROSS_SCOPE_RESOLVED" -eq 1 ]; then
+    return 0
+  fi
+  CROSS_SCOPE_RESOLVED=1
+
+  if [ "${VALIDATE_FORCE_CROSS_TARGETS:-0}" = "1" ]; then
+    CROSS_SCOPE="all"
+    return 0
+  fi
+
+  local members
+  members="$(workspace_members)"
+  if [ -z "$members" ]; then
+    if repo_uses_rustc_private; then
+      CROSS_SCOPE="none"
+    else
+      CROSS_SCOPE="all"
+    fi
+    return 0
+  fi
+
+  local total=0 excluded=0 name manifest pkg_dir
+  while IFS="$TAB" read -r name manifest; do
+    [ -n "$name" ] || continue
+    total=$((total + 1))
+    pkg_dir="$(dirname "$manifest")"
+    if package_uses_rustc_private "$pkg_dir"; then
+      excluded=$((excluded + 1))
+      CROSS_EXCLUDE_ARGS+=(--exclude "$name")
+      CROSS_EXCLUDED_NAMES="${CROSS_EXCLUDED_NAMES:+${CROSS_EXCLUDED_NAMES}, }${name}"
+    fi
+  done <<EOF
+$members
+EOF
+
+  if [ "$excluded" -eq 0 ]; then
+    CROSS_SCOPE="all"
+  elif [ "$excluded" -ge "$total" ]; then
+    CROSS_SCOPE="none"
+  else
+    CROSS_SCOPE="partial"
+  fi
 }
 
 skip_unsupported_cross_target() {
@@ -112,13 +214,20 @@ skip_unsupported_cross_target() {
     return 1
   fi
 
-  if repo_uses_rustc_private; then
-    echo "=== STEP: skip ${target} ==="
-    echo "Skipping configured cross-target ${target}: this repo uses rustc_private crates, which are tied to the rustc host toolchain."
-    echo "Host validation still runs here; run validation on a Linux host or rely on Linux CI for native Linux coverage."
-    echo "Set VALIDATE_FORCE_CROSS_TARGETS=1 to force the cross-target check."
-    return 0
-  fi
+  resolve_cross_target_scope
+
+  case "$CROSS_SCOPE" in
+    none)
+      echo "=== STEP: skip ${target} ==="
+      echo "Skipping configured cross-target ${target}: every workspace package uses rustc_private crates, which are tied to the rustc host toolchain."
+      echo "Host validation still runs here; run validation on a Linux host or rely on Linux CI for native Linux coverage."
+      echo "Set VALIDATE_FORCE_CROSS_TARGETS=1 to force the cross-target check."
+      return 0
+      ;;
+    partial)
+      echo "Cross-target ${target} excludes rustc_private packages (${CROSS_EXCLUDED_NAMES}): they are bound to the host rustc toolchain and are covered by Linux CI. Every other workspace package is checked."
+      ;;
+  esac
 
   return 1
 }
@@ -164,10 +273,12 @@ run_target_clippy() {
         PKG_CONFIG_ALLOW_CROSS=1 \
         PKG_CONFIG_ALLOW_CROSS_x86_64_unknown_linux_gnu=1 \
         LINT_CONFIG_FORCE=1 \
-        "$LINT_CMD" clippy --target "$target" "$@"
+        "$LINT_CMD" clippy --target "$target" \
+        ${CROSS_EXCLUDE_ARGS[@]+"${CROSS_EXCLUDE_ARGS[@]}"} "$@"
       ;;
     *)
-      env LINT_CONFIG_FORCE=1 "$LINT_CMD" clippy --target "$target" "$@"
+      env LINT_CONFIG_FORCE=1 "$LINT_CMD" clippy --target "$target" \
+        ${CROSS_EXCLUDE_ARGS[@]+"${CROSS_EXCLUDE_ARGS[@]}"} "$@"
       ;;
   esac
 }
@@ -191,12 +302,65 @@ compile_target_tests() {
         PKG_CONFIG_PATH= \
         PKG_CONFIG_ALLOW_CROSS=1 \
         PKG_CONFIG_ALLOW_CROSS_x86_64_unknown_linux_gnu=1 \
-        cargo test --target "$target" --workspace --all-features --tests --no-run
+        cargo test --target "$target" --workspace --all-features --tests --no-run \
+        ${CROSS_EXCLUDE_ARGS[@]+"${CROSS_EXCLUDE_ARGS[@]}"}
       ;;
     *)
-      cargo test --target "$target" --workspace --all-features --tests --no-run
+      cargo test --target "$target" --workspace --all-features --tests --no-run \
+        ${CROSS_EXCLUDE_ARGS[@]+"${CROSS_EXCLUDE_ARGS[@]}"}
       ;;
   esac
+}
+
+# The repo builds cargo-mend when a workspace member is named cargo-mend —
+# true both for the standalone repo and for a workspace that holds it. Keyed on
+# the package rather than the directory name so validation lints with the build
+# under test instead of whatever binary was last installed.
+MEND_SELF_RESOLVED=0
+MEND_SELF_PACKAGE=""
+
+resolve_mend_self_package() {
+  if [ "$MEND_SELF_RESOLVED" -eq 1 ]; then
+    return 0
+  fi
+  MEND_SELF_RESOLVED=1
+
+  local members name manifest
+  members="$(workspace_members)"
+  if [ -n "$members" ]; then
+    while IFS="$TAB" read -r name manifest; do
+      if [ "$name" = "cargo-mend" ]; then
+        MEND_SELF_PACKAGE="$name"
+        break
+      fi
+    done <<EOF
+$members
+EOF
+    return 0
+  fi
+
+  if [ "$(basename "$PWD")" = "cargo-mend" ]; then
+    MEND_SELF_PACKAGE="cargo-mend"
+  fi
+}
+
+# Build cargo-mend with the ambient env so its fingerprint matches every other
+# build here, then run it with RUSTC_WRAPPER cleared: a compiler cache replays
+# cached output instead of running rustc, which suppresses the diagnostics mend
+# analyzes.
+run_self_mend() {
+  local mend_bin="${REPO_TARGET_DIR}/debug/cargo-mend"
+
+  echo "+ cargo build -p ${MEND_SELF_PACKAGE} --bin cargo-mend"
+  cargo build -p "$MEND_SELF_PACKAGE" --bin cargo-mend
+
+  if [ ! -x "$mend_bin" ]; then
+    echo "validate_ci.sh: no cargo-mend binary at ${mend_bin} after building ${MEND_SELF_PACKAGE}" >&2
+    return 1
+  fi
+
+  echo "+ env RUSTC_WRAPPER= ${mend_bin} --workspace --all-targets $*"
+  env RUSTC_WRAPPER= "$mend_bin" --workspace --all-targets "$@"
 }
 
 run_configured_target_checks() {
@@ -219,10 +383,12 @@ run_configured_target_checks() {
   done < "$targets_file"
 }
 
+resolve_mend_self_package
+
 if ! lint_config_enabled mend; then
   lint_config_skip_notice mend "cargo-mend autofix"
-elif [ "$IS_SELF_MEND" -eq 1 ]; then
-  run_autofix_step "cargo-mend autofix" cargo run -- --fix
+elif [ -n "$MEND_SELF_PACKAGE" ]; then
+  run_autofix_step "cargo-mend autofix (in-repo build)" run_self_mend --fix
 else
   run_autofix_step "cargo-mend autofix" "$LINT_CMD" mend --fix
 fi
@@ -239,8 +405,8 @@ run_step "nextest" "$LINT_CMD" nextest --workspace --all-features --tests
 
 if ! lint_config_enabled mend; then
   lint_config_skip_notice mend "cargo-mend --fail-on-warn"
-elif [ "$IS_SELF_MEND" -eq 1 ]; then
-  run_step "cargo-mend" cargo run -- --fail-on-warn
+elif [ -n "$MEND_SELF_PACKAGE" ]; then
+  run_step "cargo-mend (in-repo build)" run_self_mend --fail-on-warn
 else
   run_step "cargo-mend" "$LINT_CMD" mend --fail-on-warn
 fi

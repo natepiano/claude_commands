@@ -2,7 +2,8 @@
 set -euo pipefail
 
 # Top-level validate-and-push workflow. Exits with code 2 when a PR branch name
-# needs user confirmation; in that case it prints prepare_pr_push.sh JSON.
+# needs user confirmation; in that case it prints prepare_pr_push.sh JSON. On the
+# direct path it pushes and hands CI watching to the agent; it does not block on CI.
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 
@@ -19,5 +20,5 @@ if [[ "$PUSH_PATH_JSON" == *'"push_path":"pr"'* ]]; then
   exit 2
 fi
 
-echo "=== STEP: direct push and CI ==="
-bash "${SCRIPT_DIR}/push_direct_and_watch.sh"
+echo "=== STEP: direct push ==="
+bash "${SCRIPT_DIR}/push_direct.sh"
