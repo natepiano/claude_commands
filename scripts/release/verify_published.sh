@@ -15,7 +15,7 @@ ALL_OK=true
 # call returns an errors object with no `.crate`, so `.crate.max_version`
 # yields null and every crate reads as a version mismatch. See
 # https://crates.io/data-access.
-CRATES_IO_UA="cargo-mend-release (https://github.com/natepiano/cargo-mend)"
+CRATES_IO_UA="natepiano-release-script (https://github.com/natepiano)"
 
 echo "=== Verifying Published Versions ==="
 

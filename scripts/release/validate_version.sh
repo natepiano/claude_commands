@@ -13,7 +13,7 @@ CRATES=("$@")
 # without an identifying User-Agent (curl's default UA fails). Without this the
 # call returns an errors object, which the `.errors` check below misreads as
 # "crate not yet published". See https://crates.io/data-access.
-CRATES_IO_UA="cargo-mend-release (https://github.com/natepiano/cargo-mend)"
+CRATES_IO_UA="natepiano-release-script (https://github.com/natepiano)"
 
 # --- Format check ---
 if [[ ! "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-rc\.[0-9]+)?$ ]]; then

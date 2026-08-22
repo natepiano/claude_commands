@@ -27,7 +27,7 @@ set -euo pipefail
 #          a stale dependency ships something CI never built.
 # Exit 1 = failure
 
-UA="User-Agent: natepiano-release-script"
+UA="User-Agent: natepiano-release-script (https://github.com/natepiano)"
 DEPS=("$@")
 
 if [[ ${#DEPS[@]} -eq 0 ]]; then
