@@ -12,8 +12,6 @@
       "Bash(~/.claude/scripts/validate_and_push/validate_ci.sh:*)",
       "Bash(bash ~/.claude/scripts/validate_and_push/run_validation.sh:*)",
       "Bash(~/.claude/scripts/validate_and_push/run_validation.sh:*)",
-      "Bash(bash ~/.claude/scripts/validate_and_push/watch_ci.sh:*)",
-      "Bash(~/.claude/scripts/validate_and_push/watch_ci.sh:*)",
       "Bash(bash ~/.claude/scripts/ask_a_friend/ask_a_friend.sh:*)",
       "Bash(bash ~/.claude/scripts/ask_a_friend/prepare_session.sh:*)",
       "Bash(bash ~/.claude/scripts/ask_a_friend/codex_implement.sh:*)",
