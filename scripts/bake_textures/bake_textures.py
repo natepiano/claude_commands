@@ -490,13 +490,13 @@ def select_all(objects: list[bpy.types.Object]) -> None:
 def bake_object_to_image(obj: bpy.types.Object, img: bpy.types.Image, map_type: str) -> None:
     """Bake a standard map type for one object to an image
 
-    This handles albedo, normal, roughness, and metallic.
+    This handles albedo, normal, roughness, metallic, and emission.
     AO requires special handling (see bake_ao_separate/combined).
 
     Args:
         obj: Blender Object to bake
         img: Blender Image to bake to
-        map_type: Type of map (albedo, normal, roughness, metallic)
+        map_type: Type of map (albedo, normal, roughness, metallic, emission)
     """
     select_only(obj)
 
@@ -504,6 +504,10 @@ def bake_object_to_image(obj: bpy.types.Object, img: bpy.types.Image, map_type: 
         bake_with_emission_workaround(obj, img, "Base Color")
     elif map_type == "normal":
         bake_simple(obj, img, "NORMAL")
+    elif map_type == "emission":
+        # Cycles bakes the emission shader directly, so the material is left as
+        # authored rather than rewired the way the other properties need.
+        bake_simple(obj, img, "EMIT")
     elif map_type in ("roughness", "metallic"):
         bake_with_emission_workaround(obj, img, map_type.title())
     else:
@@ -529,6 +533,8 @@ def bake_simple(obj: bpy.types.Object, img: bpy.types.Image, bake_type: str) -> 
             _ = bpy.ops.object.bake(type="DIFFUSE")
         elif bake_type == "METALLIC":
             _ = bpy.ops.object.bake(type="METALLIC")  # pyright: ignore[reportArgumentType]
+        elif bake_type == "EMIT":
+            _ = bpy.ops.object.bake(type="EMIT")
         else:
             _ = bpy.ops.object.bake(type=bake_type)  # pyright: ignore[reportArgumentType]
 
@@ -665,7 +671,9 @@ def bake_ao(objects: list[bpy.types.Object], img: bpy.types.Image, select_all_ob
 
 # === LAYER 3: MAP TYPE WORKFLOWS ===
 
-STANDARD_MAPS = ["albedo", "normal", "roughness", "metallic"]
+# Emission bakes like the others — one image per target, no special selection
+# semantics — so it belongs here rather than alongside the AO special case.
+STANDARD_MAPS = ["albedo", "normal", "roughness", "metallic", "emission"]
 
 
 def bake_standard_maps(objects: list[bpy.types.Object], obj_name: str | None) -> None:
@@ -946,8 +954,6 @@ def create_images_for_maps(obj_name: str | None) -> None:
             _ = create_bake_image(map_type, obj_name)
     if texture_maps.get("ambient_occlusion"):
         _ = create_bake_image("ao", obj_name)
-    if texture_maps.get("emission"):
-        _ = create_bake_image("emission", obj_name)
 
 
 def configure_compositor_for_packing() -> CompositorState:
