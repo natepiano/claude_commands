@@ -67,6 +67,10 @@
           {
             "type": "command",
             "command": "mkdir -p /tmp/claude"
+          },
+          {
+            "type": "command",
+            "command": "\"$HOME/.claude/scripts/settings/ensure_git_filters.sh\""
           }
         ]
       },
