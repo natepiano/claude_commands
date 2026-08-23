@@ -1,1 +1,2 @@
 settings.json filter=claude-settings
+config/agents.conf filter=claude-agents-conf

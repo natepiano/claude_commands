@@ -18,6 +18,13 @@ git -C "$REPO_ROOT" config --local \
 git -C "$REPO_ROOT" config --local filter.claude-settings.smudge cat
 git -C "$REPO_ROOT" config --local filter.claude-settings.required true
 
+# config/agents.conf pins instead of stripping — see clean_agents_conf.sh for
+# why the settings.json approach does not transfer.
+git -C "$REPO_ROOT" config --local \
+  filter.claude-agents-conf.clean scripts/agents/clean_agents_conf.sh
+git -C "$REPO_ROOT" config --local filter.claude-agents-conf.smudge cat
+git -C "$REPO_ROOT" config --local filter.claude-agents-conf.required true
+
 mkdir -p "$HOME/Library/LaunchAgents"
 if [[ -e "$PLIST_DST" && ! -L "$PLIST_DST" ]]; then
   echo "ERROR: $PLIST_DST exists and is not a symlink." >&2
