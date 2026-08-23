@@ -511,7 +511,14 @@ through <RunSummary/> or single-mode completion.
 
 <ComposeWorkOrder>
 1. For a phased plan, scan the target Work Order for `**Pending decision:**`.
-   Verify cited code still matches the block. If unresolved, present it, apply
+   Verify cited code still matches the block. **Re-test the block against
+   <DecisionRouting/> before presenting it** — a block is a claim that a decision
+   is the user's, not proof of it, and the pass that wrote it may have been wrong
+   or may have been overtaken by later phases. If the two options differ only in
+   how committed work is packaged — phase count, boundaries, ordering, numbering,
+   ownership of a task — resolve it yourself under <DecisionEconomy/>, edit the
+   resolution in, delete the block, state the call in one line, and do not stop.
+   If it is genuinely the user's, present it, apply
    <ExplainOnDemand/> when needed, edit the resolution into Spec/Files/gate, and
    remove the block before continuing. A resolution introduces behavior nothing
    else audits — `/plan:phase_review`'s `<StateAndConsequenceAudit/>` inspects

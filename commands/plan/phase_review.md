@@ -294,6 +294,11 @@ Edit each minor finding straight into the plan — inline amendment to the affec
 </MinorFindings>
 
 <SignificantFindings>
+**`<DecisionEconomy/>` binds this command**, by the same import `/plan:delegate`
+uses. Read it before deciding anything reaches the user:
+
+@~/.claude/docs/decision_criteria.md
+
 **Forbidden tool: `AskUserQuestion`.** Surveys collapse the decision to a one-line label and strip the concrete recommendation. If you reach for `AskUserQuestion`, stop and route through `<FilterFindingsForUserReview/>` first.
 
 Execute `<FilterFindingsForUserReview/>` before presenting anything to the user. Subagent `Severity: significant` means "needs filtering," not automatically "ask the user."
@@ -311,8 +316,9 @@ There is no fixed maximum number of user decisions. If filtering leaves a large 
 
 <FilterFindingsForUserReview>
 Convert raw significant findings into real user decisions. `<UserFacingText/>`'s
-three tests — is it real, does it have at least two buildable answers, is it the
-user's — decide what survives; these steps are how they apply here:
+four tests — is it real, does it have at least two buildable answers, is it the
+user's, would the finished thing differ — decide what survives; these steps are
+how they apply here:
 
 1. Apply mechanical plan-doc findings directly.
 2. Merge duplicate findings that point to the same actual decision.
@@ -326,9 +332,22 @@ user's — decide what survives; these steps are how they apply here:
    - the next phase is supposed to create it,
    - or the plan is missing a task or phase that should create it.
    Present that answer directly.
-6. Make a recommendation. Do not ask the user to reason from labels.
+6. **Resequence rather than ask.** When the plan already defines the behavior and
+   only the shape of the work is wrong, split, merge, reorder, or renumber the
+   phases yourself, preserve scope, API, invariants, tests, and ownership, update
+   the affected Work Orders, and continue. State the change in one line. This is
+   `<DecisionRouting/>`'s first rule and it is not discretionary: a phase that grew
+   too large, a seam in the wrong place, or two phases that should be one are
+   decisions about how work is packaged, not about what gets built, and they cost
+   a one-line revert. Never spend a user turn on one.
+7. Make a recommendation. Do not ask the user to reason from labels.
 
-Only decisions that change product behavior, architecture direction, phase ordering, or implementation scope survive this filter.
+Only decisions that change **what gets built** survive this filter: product
+behavior, architecture direction, an externally observable contract, or whether a
+piece of scope exists at all. **How committed work is packaged never survives it**
+— phase count, phase boundaries, ordering, numbering, and which phase owns a task
+are the orchestrator's to decide. If the answer to "what will the finished
+deliverable do?" is the same under both options, it is not the user's decision.
 </FilterFindingsForUserReview>
 
 <DecisionPresentationTemplate>

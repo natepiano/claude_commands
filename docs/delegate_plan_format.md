@@ -196,3 +196,13 @@ Rules:
    plan. `/plan:to_phased_plan` strips them; anything load-bearing becomes a Work Order
    **Spec** line or a Delegation Context **Invariant**. The full rationale lives
    in the eventual as-built doc, not the implementation plan.
+6. **Every constraint names its source.** A boundary in **Layout**, **Files**,
+   **Invariants**, or a **Spec** — "read-only", "do not touch", "out of scope for
+   this plan" — is a claim about what the user or the repository requires, so the
+   plan states which. A scope note the author chose ("this phase does not change
+   X; phase N does") says so in those words. Never write a crate, module, or
+   dependency off as unchangeable because the plan happens to be aimed elsewhere:
+   a defect gets fixed where it lives, and an authored boundary that hides that is
+   how a workaround gets built on purpose. See `~/.claude/docs/decision_criteria.md`
+   → "Where a fix goes".
+

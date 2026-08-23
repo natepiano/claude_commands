@@ -105,7 +105,7 @@ the causal relationship between them stays implicit.
 
 ## Which decisions reach the user
 
-Before presenting anything as a decision, test all three:
+Before presenting anything as a decision, test all four:
 
 1. **Is it real?** Checked against the actual tree or code, not against a
    document's claim about them. A stale status file is not evidence.
@@ -115,6 +115,12 @@ Before presenting anything as a decision, test all three:
 3. **Is it theirs?** If the source material already answers it, if it is
    mechanical, or if it affects only later work, then do it or defer it and say
    so in one line.
+4. **Would the finished thing differ?** Compare the two options at the level of
+   what ships: behavior, contract, whether a piece of scope exists. If the
+   deliverable is identical either way and only the route there changes — how
+   the work is split, ordered, numbered, or which unit owns a task — it is not
+   a decision. Decide it, state the call in one line, keep going. Two buildable
+   answers make it a choice; only a difference in the result makes it *theirs*.
 
 Manufactured blockers stall authorized work and bury the real findings among
 fake ones.
