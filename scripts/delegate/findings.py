@@ -810,7 +810,7 @@ def _override(args: argparse.Namespace) -> None:
     if len(justification) < 20:
         raise SystemExit(
             "Record why the stop is wrong in the user's own words, not a token; "
-            "this text is the whole audit trail for the round it authorizes"
+            + "this text is the whole audit trail for the round it authorizes"
         )
     override: dict[str, object] = {
         "stop_reason": reason,

@@ -676,7 +676,7 @@ class ProgressHistoryTests(unittest.TestCase):
         environment = os.environ.copy()
         environment["PLAN_DELEGATE_HISTORY_DIR"] = str(self.history_dir)
         environment["PLAN_DELEGATE_NOW_EPOCH"] = str(at)
-        environment.pop("PLAN_DELEGATE_PASS_OWNER", None)
+        _ = environment.pop("PLAN_DELEGATE_PASS_OWNER", None)
         return subprocess.run(
             ["python3", str(SCRIPT), *arguments],
             check=False,
@@ -872,12 +872,12 @@ class PhaseCountTests(unittest.TestCase):
     def test_counts_all_three_heading_forms(self) -> None:
         counts = self._count(
             "### Phase 1 — Shrunk archive form (`bbac234`)\n"
-            "\n"
-            "### Phase 2 — Another shrunk one (`8c5053a`)\n"
-            "\n"
-            "### Phase 3 — Completed, not yet shrunk  · status: done\n"
-            "\n"
-            "### Phase 4 — Live work  · status: todo\n"
+            + "\n"
+            + "### Phase 2 — Another shrunk one (`8c5053a`)\n"
+            + "\n"
+            + "### Phase 3 — Completed, not yet shrunk  · status: done\n"
+            + "\n"
+            + "### Phase 4 — Live work  · status: todo\n"
         )
         self.assertEqual(counts["done"], 3)
         self.assertEqual(counts["todo"], 1)
@@ -886,10 +886,10 @@ class PhaseCountTests(unittest.TestCase):
     def test_review_section_heading_is_not_a_phase(self) -> None:
         counts = self._count(
             "### Phase 1 — Real phase  · status: done\n"
-            "\n"
-            "### Phase 1 Review\n"
-            "\n"
-            "### Phase 2 — Real phase  · status: todo\n"
+            + "\n"
+            + "### Phase 1 Review\n"
+            + "\n"
+            + "### Phase 2 — Real phase  · status: todo\n"
         )
         self.assertEqual(counts["total"], 2)
         self.assertEqual(counts["done"], 1)
@@ -898,8 +898,8 @@ class PhaseCountTests(unittest.TestCase):
     def test_repeated_identifier_counts_once(self) -> None:
         counts = self._count(
             "### Phase 7 — First mention  · status: done\n"
-            "\n"
-            "#### Phase 7 — Same id again  · status: done\n"
+            + "\n"
+            + "#### Phase 7 — Same id again  · status: done\n"
         )
         self.assertEqual(counts["total"], 1)
         self.assertEqual(counts["duplicate_ids"], ["7"])
@@ -907,8 +907,8 @@ class PhaseCountTests(unittest.TestCase):
     def test_letter_suffixed_identifier_is_counted(self) -> None:
         counts = self._count(
             "### Phase 4 — Plain  · status: done\n"
-            "\n"
-            "### Phase 4b — Suffixed legacy id  · status: todo\n"
+            + "\n"
+            + "### Phase 4b — Suffixed legacy id  · status: todo\n"
         )
         self.assertEqual(counts["total"], 2)
         self.assertEqual(counts["todo"], 1)

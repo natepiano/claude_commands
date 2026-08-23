@@ -31,22 +31,22 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Generate Codex skills from Claude command markdown files."
     )
-    parser.add_argument(
+    _ = parser.add_argument(
         "--source",
         default="~/".replace("//", "/") + ".claude/commands",
         help="Claude commands directory (default: ~/.claude/commands)",
     )
-    parser.add_argument(
+    _ = parser.add_argument(
         "--dest",
         default="~/".replace("//", "/") + ".codex/skills/generated-from-claude",
         help="Destination root for generated Codex skills",
     )
-    parser.add_argument(
+    _ = parser.add_argument(
         "--force",
         action="store_true",
         help="Overwrite existing generated skill directories",
     )
-    parser.add_argument(
+    _ = parser.add_argument(
         "--dry-run",
         action="store_true",
         help="Print planned output without writing files",
@@ -179,7 +179,7 @@ def atomic_write_text(path: pathlib.Path, content: str) -> None:
     tmp_path = pathlib.Path(tmp_name)
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as handle:
-            handle.write(content)
+            _ = handle.write(content)
         os.replace(tmp_path, path)
     except Exception:
         tmp_path.unlink(missing_ok=True)
@@ -209,8 +209,10 @@ def remove_stale_skill_dirs(dest_root: pathlib.Path, current_skill_names: set[st
 
 def main() -> int:
     args = parse_args()
-    source_root = expand_path(args.source)
-    dest_root = expand_path(args.dest)
+    source: str = str(args.source)  # pyright: ignore[reportAny]
+    dest: str = str(args.dest)  # pyright: ignore[reportAny]
+    source_root = expand_path(source)
+    dest_root = expand_path(dest)
 
     if not source_root.is_dir():
         print(f"error: source directory does not exist: {source_root}", file=sys.stderr)
@@ -223,10 +225,12 @@ def main() -> int:
         if path.is_file()
     ]
 
-    if args.dry_run:
+    dry_run: bool = bool(args.dry_run)  # pyright: ignore[reportAny]
+    if dry_run:
         print(render_plan(commands, dest_root))
         return 0
 
+    force: bool = bool(args.force)  # pyright: ignore[reportAny]
     dest_root.mkdir(parents=True, exist_ok=True)
     current_skill_names = {command.skill_name for command in commands}
     removed = remove_stale_skill_dirs(dest_root, current_skill_names)
@@ -238,7 +242,7 @@ def main() -> int:
         skill_file = skill_dir / "SKILL.md"
 
         if skill_dir.exists():
-            if not args.force:
+            if not force:
                 print(f"skip: {skill_dir} already exists", file=sys.stderr)
                 continue
 

@@ -3,13 +3,17 @@
 
 import unittest
 from pathlib import Path
+from typing import ClassVar, override
 
 
 SCRIPT = Path(__file__).resolve().parents[1] / "style-fix-worktrees.sh"
 
 
 class StyleFixPromptCommentPolicyTest(unittest.TestCase):
+    source: ClassVar[str]
+
     @classmethod
+    @override
     def setUpClass(cls) -> None:
         cls.source = SCRIPT.read_text()
 
@@ -45,4 +49,4 @@ class StyleFixPromptCommentPolicyTest(unittest.TestCase):
 
 
 if __name__ == "__main__":
-    unittest.main()
+    _ = unittest.main()

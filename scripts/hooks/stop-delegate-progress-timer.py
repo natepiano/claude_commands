@@ -122,7 +122,7 @@ def main() -> None:
         marker.unlink(missing_ok=True)
         return
 
-    marker.write_text(work, encoding="utf-8")
+    _ = marker.write_text(work, encoding="utf-8")
     print(
         json.dumps(
             {

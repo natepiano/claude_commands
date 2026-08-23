@@ -8,6 +8,7 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
+from typing import final, override
 
 
 PRIORITIZE_DIR = Path(__file__).parents[1]
@@ -16,6 +17,7 @@ RUNNER_LOCK = PRIORITIZE_DIR / "runner_lock.py"
 BUSY_EXIT = 75
 
 
+@final
 class WatcherFixture:
     def __init__(self) -> None:
         self.temporary = tempfile.TemporaryDirectory()
@@ -23,7 +25,7 @@ class WatcherFixture:
         self.issues = self.root / "issues"
         self.issues.mkdir()
         self.goals = self.root / "prioritization goals.md"
-        self.goals.write_text("# Goals\n", encoding="utf-8")
+        _ = self.goals.write_text("# Goals\n", encoding="utf-8")
         self.cache = self.root / "cache"
         self.state = self.root / "state"
         self.snapshot = self.root / "snapshot.py"
@@ -33,7 +35,7 @@ class WatcherFixture:
         self.owner_release = self.root / "release-owner"
         self.failing_owner = self.root / "failing_owner.py"
 
-        self.snapshot.write_text(
+        _ = self.snapshot.write_text(
             """#!/usr/bin/env python3
 import argparse
 
@@ -46,20 +48,20 @@ with open(args.output, \"w\", encoding=\"utf-8\") as output:
 """,
             encoding="utf-8",
         )
-        self.renumber.write_text(
+        _ = self.renumber.write_text(
             """#!/usr/bin/env python3
 raise SystemExit(0)
 """,
             encoding="utf-8",
         )
-        self.signature.write_text(
+        _ = self.signature.write_text(
             """#!/usr/bin/env python3
 print(\"stable-signature\")
 """,
             encoding="utf-8",
         )
 
-        self.failing_owner.write_text(
+        _ = self.failing_owner.write_text(
             """#!/usr/bin/env python3
 import sys
 import time
@@ -105,7 +107,7 @@ raise SystemExit(2)
             if original not in content:
                 raise AssertionError(f"watcher fixture could not replace: {original}")
             content = content.replace(original, replacement)
-        self.watcher.write_text(content, encoding="utf-8")
+        _ = self.watcher.write_text(content, encoding="utf-8")
         self.watcher.chmod(0o700)
 
     @property
@@ -146,9 +148,11 @@ raise SystemExit(2)
 class RunWatcherTests(unittest.TestCase):
     fixture: WatcherFixture  # pyright: ignore[reportUninitializedInstanceVariable]
 
+    @override
     def setUp(self) -> None:
         self.fixture = WatcherFixture()
 
+    @override
     def tearDown(self) -> None:
         self.fixture.close()
 
@@ -180,7 +184,7 @@ class RunWatcherTests(unittest.TestCase):
             self.assertTrue((self.fixture.state / "pending").exists())
         finally:
             owner.terminate()
-            owner.wait(timeout=2)
+            _ = owner.wait(timeout=2)
 
     def test_daemon_retries_after_busy_owner_fails(self) -> None:
         owner = self._start_lock_owner(
@@ -208,10 +212,10 @@ class RunWatcherTests(unittest.TestCase):
             else:
                 self.fail(
                     "daemon did not observe the confirmed busy runner lock; "
-                    f"log={log!r}"
+                    + f"log={log!r}"
                 )
 
-            self.fixture.owner_release.write_text("release\n", encoding="utf-8")
+            _ = self.fixture.owner_release.write_text("release\n", encoding="utf-8")
             self.assertEqual(owner.wait(timeout=2), 2)
 
             deadline = time.monotonic() + 5.0
@@ -226,7 +230,7 @@ class RunWatcherTests(unittest.TestCase):
             else:
                 self.fail(
                     "daemon did not retry after the failing owner released the lock; "
-                    f"status={status!r} log={log!r}"
+                    + f"status={status!r} log={log!r}"
                 )
 
             self.assertIn("renumber completed, validated", log)
@@ -237,10 +241,10 @@ class RunWatcherTests(unittest.TestCase):
         finally:
             if owner.poll() is None:
                 owner.terminate()
-                owner.wait(timeout=2)
+                _ = owner.wait(timeout=2)
             if daemon.poll() is None:
                 os.killpg(daemon.pid, signal.SIGTERM)
-                daemon.wait(timeout=2)
+                _ = daemon.wait(timeout=2)
 
     def test_daemon_absorbs_its_own_canonical_rank_writes(self) -> None:
         issue = self.fixture.issues / "issue.md"
@@ -348,4 +352,4 @@ raise SystemExit(0)
 
 
 if __name__ == "__main__":
-    unittest.main()
+    _ = unittest.main()

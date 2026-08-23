@@ -20,7 +20,8 @@ from typing import NamedTuple
 from typing import TypedDict
 from typing import cast
 
-from candidate_generators import CandidatesSpec, Enumeration, enumerate_candidates, read_candidates_spec  # pyright: ignore[reportImplicitRelativeImport]  # run standalone, not as a package — relative import would break it
+# run standalone, not as a package — a relative import would break it
+from candidate_generators import CandidatesSpec, Enumeration, enumerate_candidates, read_candidates_spec
 
 RUST_DIR = Path(os.environ.get("STYLE_HISTORY_RUST_DIR", str(Path.home() / "rust")))
 NATE_STYLE_DIR = Path(os.environ.get("STYLE_HISTORY_NATE_STYLE_DIR", str(RUST_DIR / "nate_style")))

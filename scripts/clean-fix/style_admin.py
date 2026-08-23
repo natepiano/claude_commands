@@ -7,9 +7,9 @@ import argparse
 import json
 import re
 from pathlib import Path
-from typing import Any
+from typing import cast
 
-from style_history import HISTORY_DIR, NATE_STYLE_DIR
+from style_history import HISTORY_DIR, NATE_STYLE_DIR, HistoryRow
 
 RUST_STYLE_DIR = NATE_STYLE_DIR / "rust"
 
@@ -96,29 +96,30 @@ def remove_see_also_references(stem: str) -> tuple[int, int]:
         original = path.read_text()
         rewritten, removed = strip_frontmatter_see_also(original, stem)
         if removed:
-            path.write_text(rewritten)
+            _ = path.write_text(rewritten)
             files_updated += 1
             references_removed += removed
     return files_updated, references_removed
 
 
-def load_jsonl(path: Path) -> list[dict[str, Any]]:
-    rows: list[dict[str, Any]] = []
+def load_jsonl(path: Path) -> list[HistoryRow]:
+    rows: list[HistoryRow] = []
     for line in path.read_text().splitlines():
         line = line.strip()
         if not line:
             continue
-        rows.append(json.loads(line))
+        parsed: object = json.loads(line)  # pyright: ignore[reportAny]
+        rows.append(cast("HistoryRow", parsed))
     return rows
 
 
-def write_jsonl(path: Path, rows: list[dict[str, Any]]) -> None:
+def write_jsonl(path: Path, rows: list[HistoryRow]) -> None:
     if not rows:
         path.unlink(missing_ok=True)
         return
     with path.open("w") as handle:
         for row in rows:
-            handle.write(json.dumps(row, sort_keys=True) + "\n")
+            _ = handle.write(json.dumps(row, sort_keys=True) + "\n")
 
 
 def update_history_for_rename(old_guideline_id: str, new_guideline_id: str) -> tuple[int, int]:
@@ -145,7 +146,7 @@ def update_history_for_delete(guideline_id: str) -> tuple[int, int, int]:
     runs_removed = 0
     for path in sorted(HISTORY_DIR.glob("*.jsonl")):
         rows = load_jsonl(path)
-        new_rows: list[dict[str, Any]] = []
+        new_rows: list[HistoryRow] = []
         changed = False
         for row in rows:
             reviewed_units = row.get("reviewed_units", [])
@@ -173,7 +174,7 @@ def update_markdown_wikilinks_for_rename(old_stem: str, new_stem: str) -> int:
         original = path.read_text()
         rewritten = replace_wikilinks_for_rename(original, old_stem, new_stem)
         if rewritten != original:
-            path.write_text(rewritten)
+            _ = path.write_text(rewritten)
             updated += 1
     return updated
 
@@ -184,7 +185,7 @@ def update_markdown_wikilinks_for_delete(stem: str) -> int:
         original = path.read_text()
         rewritten = replace_wikilinks_for_delete(original, stem)
         if rewritten != original:
-            path.write_text(rewritten)
+            _ = path.write_text(rewritten)
             updated += 1
     return updated
 
@@ -199,7 +200,7 @@ def run_rename(old_name: str, new_name: str) -> None:
 
     old_guideline_id = f"rust/{old_name}"
     new_guideline_id = f"rust/{new_name}"
-    source.rename(target)
+    _ = source.rename(target)
     history_files, entries_updated = update_history_for_rename(old_guideline_id, new_guideline_id)
     wikilink_files = update_markdown_wikilinks_for_rename(Path(old_name).stem, Path(new_name).stem)
 
@@ -234,21 +235,25 @@ def parse_args() -> argparse.Namespace:
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     rename = subparsers.add_parser("rename")
-    rename.add_argument("old_name")
-    rename.add_argument("new_name")
+    _ = rename.add_argument("old_name")
+    _ = rename.add_argument("new_name")
 
     delete = subparsers.add_parser("delete")
-    delete.add_argument("style_name")
+    _ = delete.add_argument("style_name")
 
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
-    if args.command == "rename":
-        run_rename(args.old_name, args.new_name)
+    command: str = str(args.command)  # pyright: ignore[reportAny]
+    if command == "rename":
+        old_name: str = str(args.old_name)  # pyright: ignore[reportAny]
+        new_name: str = str(args.new_name)  # pyright: ignore[reportAny]
+        run_rename(old_name, new_name)
         return
-    run_delete(args.style_name)
+    style_name: str = str(args.style_name)  # pyright: ignore[reportAny]
+    run_delete(style_name)
 
 
 if __name__ == "__main__":

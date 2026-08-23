@@ -9,6 +9,7 @@ import tempfile
 import unittest
 from datetime import datetime
 from pathlib import Path
+from typing import final, override
 from unittest import mock
 from zoneinfo import ZoneInfo
 
@@ -64,6 +65,7 @@ def issue_text(
     return newline.join(lines) + newline
 
 
+@final
 class VaultFixture:
     def __init__(self) -> None:
         self.temporary = tempfile.TemporaryDirectory()
@@ -71,12 +73,12 @@ class VaultFixture:
         self.issues = self.vault / "issues"
         self.issues.mkdir()
         self.goals = self.vault / "prioritization goals.md"
-        self.goals.write_text(GOALS, encoding="utf-8")
+        _ = self.goals.write_text(GOALS, encoding="utf-8")
         self.scope = renumber.Scope(self.vault, self.issues, self.goals)
 
     def add(self, name: str, content: str) -> Path:
         path = self.issues / name
-        path.write_bytes(content.encode("utf-8"))
+        _ = path.write_bytes(content.encode("utf-8"))
         return path
 
     def close(self) -> None:
@@ -86,14 +88,17 @@ class VaultFixture:
 class RenumberTests(unittest.TestCase):
     fixture: VaultFixture  # pyright: ignore[reportUninitializedInstanceVariable]
 
+    @override
     def setUp(self) -> None:
         self.fixture = VaultFixture()
 
+    @override
     def tearDown(self) -> None:
         self.fixture.close()
 
     def test_score_uses_settled_formula(self) -> None:
-        goal_source = renumber._read_source(self.fixture.goals)
+        goal_source = renumber._read_source(  # pyright: ignore[reportPrivateUsage]
+            self.fixture.goals)
         goal = renumber.parse_goals(goal_source)[0]
         values = {
             "backlog_alignment": 2,
@@ -108,7 +113,8 @@ class RenumberTests(unittest.TestCase):
         self.assertEqual(renumber.calculate_score(goal, values), 11)
 
     def test_urgency_scores_as_tiers(self) -> None:
-        goal_source = renumber._read_source(self.fixture.goals)
+        goal_source = renumber._read_source(  # pyright: ignore[reportPrivateUsage]
+            self.fixture.goals)
         goal = renumber.parse_goals(goal_source)[0]
         values = {
             "backlog_alignment": 1,
@@ -126,7 +132,8 @@ class RenumberTests(unittest.TestCase):
 
     def test_five_star_urgency_outranks_every_lower_rating(self) -> None:
         """The weakest five-star issue must still beat the strongest four-star one."""
-        goal_source = renumber._read_source(self.fixture.goals)
+        goal_source = renumber._read_source(  # pyright: ignore[reportPrivateUsage]
+            self.fixture.goals)
         goals = renumber.parse_goals(goal_source)
 
         weakest_override = renumber.calculate_score(
@@ -154,11 +161,12 @@ class RenumberTests(unittest.TestCase):
         self.assertGreater(weakest_override, strongest_below)
 
     def test_goal_bonus_tracks_the_ordered_goal_count(self) -> None:
-        self.fixture.goals.write_text(
+        _ = self.fixture.goals.write_text(
             GOALS + "4. `4 - Build Community`\n", encoding="utf-8"
         )
 
-        goals = renumber.parse_goals(renumber._read_source(self.fixture.goals))
+        goals = renumber.parse_goals(renumber._read_source(  # pyright: ignore[reportPrivateUsage]
+            self.fixture.goals))
 
         self.assertEqual([goal.bonus for goal in goals], [6, 4, 2, 0])
 
@@ -189,8 +197,8 @@ class RenumberTests(unittest.TestCase):
             single_quoted = single_quoted.replace(
                 f'{key}: "{value}"', f"{key}: '{value}'"
             )
-        self.fixture.add("plain.md", plain)
-        self.fixture.add("single-quoted.md", single_quoted)
+        _ = self.fixture.add("plain.md", plain)
+        _ = self.fixture.add("single-quoted.md", single_quoted)
 
         plan = renumber.build_plan(self.fixture.scope)
 
@@ -281,7 +289,7 @@ class RenumberTests(unittest.TestCase):
     @unittest.skipUnless(sys.platform == "darwin", "requires macOS creation dates")
     def test_apply_preserves_creation_time_and_modified_calendar_date(self) -> None:
         path = self.fixture.add("dates.md", issue_text())
-        subprocess.run(
+        _ = subprocess.run(
             ["/usr/bin/SetFile", "-d", "05/19/2024 12:34:56", str(path)],
             check=True,
             capture_output=True,
@@ -322,7 +330,7 @@ class RenumberTests(unittest.TestCase):
         )
 
     def test_second_run_is_idempotent(self) -> None:
-        self.fixture.add("issue.md", issue_text())
+        _ = self.fixture.add("issue.md", issue_text())
 
         first = renumber.build_plan(self.fixture.scope)
         self.assertEqual(len(first.changes), 1)
@@ -381,7 +389,7 @@ class RenumberTests(unittest.TestCase):
         self.assertEqual([issue.assigned_rank for issue in ordered], [1, 2, 3])
 
         renumber.apply_plan(plan)
-        ranks = []
+        ranks: list[int] = []
         for path in (zulu, alpha, lower):
             text = path.read_text(encoding="utf-8")
             rank_line = next(
@@ -437,7 +445,7 @@ class RenumberTests(unittest.TestCase):
         self.assertEqual([issue.source.path for issue in ordered], [first, second, dependent])
 
     def test_closed_dependencies_are_ignored(self) -> None:
-        self.fixture.add("closed.md", issue_text(status="closed"))
+        _ = self.fixture.add("closed.md", issue_text(status="closed"))
         dependent = self.fixture.add(
             "dependent.md",
             issue_text(extra_frontmatter='depends_on: ["[[closed]]"]'),
@@ -465,10 +473,10 @@ class RenumberTests(unittest.TestCase):
         )
 
     def test_open_dependency_cycle_prevents_ranking(self) -> None:
-        self.fixture.add(
+        _ = self.fixture.add(
             "first.md", issue_text(extra_frontmatter='depends_on: ["[[second]]"]')
         )
-        self.fixture.add(
+        _ = self.fixture.add(
             "second.md", issue_text(extra_frontmatter='depends_on: ["[[first]]"]')
         )
 
@@ -480,7 +488,7 @@ class RenumberTests(unittest.TestCase):
     def test_apply_refuses_a_file_changed_after_discovery(self) -> None:
         path = self.fixture.add("issue.md", issue_text())
         plan = renumber.build_plan(self.fixture.scope)
-        path.write_text(path.read_text(encoding="utf-8") + "external edit\n")
+        _ = path.write_text(path.read_text(encoding="utf-8") + "external edit\n")
 
         with self.assertRaises(renumber.ConcurrentChangeError):
             renumber.apply_plan(plan)
@@ -492,7 +500,7 @@ class RenumberTests(unittest.TestCase):
         second = self.fixture.add("second.md", issue_text())
         originals = {first: first.read_bytes(), second: second.read_bytes()}
         plan = renumber.build_plan(self.fixture.scope)
-        atomic_write = renumber._atomic_write
+        atomic_write = renumber._atomic_write  # pyright: ignore[reportPrivateUsage]
         call_count = 0
 
         def fail_second_write(path: Path, content: bytes, mode: int) -> None:
@@ -516,11 +524,11 @@ class RenumberTests(unittest.TestCase):
         stable_original = stable.read_bytes()
         plan = renumber.build_plan(self.fixture.scope)
         self.assertEqual([change.source.path for change in plan.changes], [changed])
-        atomic_write = renumber._atomic_write
+        atomic_write = renumber._atomic_write  # pyright: ignore[reportPrivateUsage]
 
         def write_then_edit_unwritten(path: Path, content: bytes, mode: int) -> None:
             atomic_write(path, content, mode)
-            stable.write_bytes(stable_original + b"concurrent edit\n")
+            _ = stable.write_bytes(stable_original + b"concurrent edit\n")
 
         with mock.patch.object(
             renumber, "_atomic_write", write_then_edit_unwritten
@@ -532,7 +540,7 @@ class RenumberTests(unittest.TestCase):
         self.assertEqual(stable.read_bytes(), stable_original + b"concurrent edit\n")
 
     def test_check_reports_whether_changes_are_needed(self) -> None:
-        self.fixture.add("issue.md", issue_text())
+        _ = self.fixture.add("issue.md", issue_text())
         output = io.StringIO()
 
         with mock.patch.object(renumber, "PRODUCTION_SCOPE", self.fixture.scope):
@@ -546,7 +554,7 @@ class RenumberTests(unittest.TestCase):
     def test_require_complete_fails_only_for_unassessed_open_issues(self) -> None:
         missing_values = dict(DEFAULT_VALUES)
         del missing_values["backlog_effort"]
-        self.fixture.add("missing.md", issue_text(values=missing_values))
+        _ = self.fixture.add("missing.md", issue_text(values=missing_values))
 
         with mock.patch.object(renumber, "PRODUCTION_SCOPE", self.fixture.scope):
             with contextlib.redirect_stdout(io.StringIO()):
@@ -558,7 +566,7 @@ class RenumberTests(unittest.TestCase):
                     renumber.main(["--check", "--require-complete"]), 1
                 )
 
-        self.fixture.add("closed.md", issue_text(status="closed", values={}))
+        _ = self.fixture.add("closed.md", issue_text(status="closed", values={}))
         (self.fixture.issues / "missing.md").unlink()
         with mock.patch.object(renumber, "PRODUCTION_SCOPE", self.fixture.scope):
             with contextlib.redirect_stdout(io.StringIO()):
@@ -566,4 +574,4 @@ class RenumberTests(unittest.TestCase):
 
 
 if __name__ == "__main__":
-    unittest.main()
+    _ = unittest.main()

@@ -37,7 +37,7 @@ class SnapshotTests(unittest.TestCase):
         }
         canonical = {"backlog_impact": ("9 - Canonical",)}
 
-        with mock.patch.object(snapshot.renumber, "RUBRIC_DOMAINS", canonical):
+        with mock.patch("renumber.RUBRIC_DOMAINS", canonical):
             errors = list(snapshot.completeness_errors(candidate))
 
         self.assertEqual(errors, [])

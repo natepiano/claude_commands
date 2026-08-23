@@ -21,20 +21,20 @@ class WatchSignatureTests(unittest.TestCase):
             issues = root / "issues"
             issues.mkdir()
             goals = root / "prioritization goals.md"
-            goals.write_text("goals\n", encoding="utf-8")
+            _ = goals.write_text("goals\n", encoding="utf-8")
             issue = issues / "issue.md"
-            issue.write_text("first\n", encoding="utf-8")
+            _ = issue.write_text("first\n", encoding="utf-8")
             first = watch_signature.build_signature(issues, goals)
 
-            issue.write_text("second and longer\n", encoding="utf-8")
+            _ = issue.write_text("second and longer\n", encoding="utf-8")
             second = watch_signature.build_signature(issues, goals)
             self.assertNotEqual(first, second)
 
-            (issues / "new.md").write_text("new\n", encoding="utf-8")
+            _ = (issues / "new.md").write_text("new\n", encoding="utf-8")
             third = watch_signature.build_signature(issues, goals)
             self.assertNotEqual(second, third)
 
-            goals.write_text("changed goals\n", encoding="utf-8")
+            _ = goals.write_text("changed goals\n", encoding="utf-8")
             fourth = watch_signature.build_signature(issues, goals)
             self.assertNotEqual(third, fourth)
 
@@ -44,9 +44,9 @@ class WatchSignatureTests(unittest.TestCase):
             issues = root / "issues"
             issues.mkdir()
             goals = root / "prioritization goals.md"
-            goals.write_text("goals\n", encoding="utf-8")
+            _ = goals.write_text("goals\n", encoding="utf-8")
             target = root / "target.md"
-            target.write_text("target\n", encoding="utf-8")
+            _ = target.write_text("target\n", encoding="utf-8")
             (issues / "linked.md").symlink_to(target)
 
             with self.assertRaises(watch_signature.SignatureError):

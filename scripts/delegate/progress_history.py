@@ -880,7 +880,7 @@ def _finish_pass(args: argparse.Namespace) -> None:
         if status != "canceled":
             raise SystemExit(
                 "--orphaned-launcher closes the pass of a launcher the orchestrator "
-                f"killed, so it takes --status canceled, not {status}"
+                + f"killed, so it takes --status canceled, not {status}"
             )
     state = _read_state(session_dir)
     if orphaned:
@@ -1358,7 +1358,7 @@ def _progress(args: argparse.Namespace) -> None:
     if phase is None or _string(phase.get("status")) != "active" or current_pass is None:
         raise SystemExit(
             "An active phase and either an active pass or an active activity are "
-            "required before reporting progress"
+            + "required before reporting progress"
         )
     legacy_raw_percent = _arg_integer(args, "raw_percent", -1)
     legacy_percent = _arg_integer(args, "percent", -1)

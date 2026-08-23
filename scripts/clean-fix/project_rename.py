@@ -11,7 +11,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal, cast
 
-from project_add import (  # pyright: ignore[reportImplicitRelativeImport]
+from project_add import (
     DEFAULT_CONF,
     DEFAULT_RUST_DIR,
     MARKER,
