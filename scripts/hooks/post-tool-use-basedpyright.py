@@ -1,11 +1,20 @@
 #!/usr/bin/env python3
 
 import json
+import os
 import sys
 import subprocess
 import shutil
 from pathlib import Path
 from typing import TypedDict, NotRequired, cast
+
+# A config file in an ancestor directory means the file belongs to a real Python
+# project. Without one, basedpyright falls back to its default strictness and
+# buries a throwaway script in reportAny/reportUnknown noise.
+PROJECT_CONFIG_FILES: tuple[str, ...] = ('pyproject.toml', 'pyrightconfig.json', 'setup.cfg', 'setup.py')
+
+# Session scratchpads and temp dirs hold disposable scripts, not maintained code.
+TEMP_ROOTS: tuple[str, ...] = ('/tmp', '/private/tmp', '/var/folders', '/private/var/folders')
 
 class Range(TypedDict):
     start: dict[str, int]  # {line: int, character: int}
@@ -76,6 +85,26 @@ def find_basedpyright() -> str | None:
 
     return None
 
+def is_scratchpad(file_path: Path) -> bool:
+    """True for disposable scripts — session scratchpads and temp directories."""
+    if 'scratchpad' in file_path.parts:
+        return True
+
+    roots = list(TEMP_ROOTS)
+    tmpdir = os.environ.get('TMPDIR')
+    if tmpdir:
+        roots.append(tmpdir.rstrip('/'))
+
+    text = str(file_path)
+    return any(text.startswith(root + '/') for root in roots)
+
+def find_project_root(file_path: Path) -> Path | None:
+    """Nearest ancestor holding a Python project config, or None if unconfigured."""
+    for parent in file_path.parents:
+        if any((parent / name).exists() for name in PROJECT_CONFIG_FILES):
+            return parent
+    return None
+
 def parse_basedpyright_output(output_json: str) -> tuple[int, int, list[str], list[str]]:
     """Parse basedpyright JSON output and extract diagnostics."""
     try:
@@ -115,29 +144,53 @@ def main() -> None:
             print(json.dumps({"continue": True}))
             return
 
+        target = Path(file_path)
+
+        # Disposable scripts get no type-check gate at all
+        if is_scratchpad(target):
+            print(json.dumps({"continue": True}))
+            return
+
         # Check if basedpyright is available
         basedpyright_path = find_basedpyright()
         if not basedpyright_path:
             print(json.dumps({"systemMessage": "🐍 Python file edited (no basedpyright)"}))
             return
 
-        # Run basedpyright from the file's directory for proper import resolution
-        file_dir = Path(file_path).parent
+        # Run from the project root so its config is picked up; fall back to the
+        # file's own directory, where only the interpreter version is assumed.
+        project_root = find_project_root(target)
+        command = [basedpyright_path]
+        if project_root:
+            cwd = project_root
+            command.append(str(target))
+        else:
+            cwd = target.parent
+            command.extend(['--pythonversion', f'{sys.version_info.major}.{sys.version_info.minor}', target.name])
+        command.append('--outputjson')
 
         result = subprocess.run(
-            [basedpyright_path, Path(file_path).name, '--outputjson'],
+            command,
             capture_output=True,
             text=True,
             timeout=10,
-            cwd=str(file_dir)
+            cwd=str(cwd)
         )
 
         # Parse output with proper types
         error_count, warning_count, error_lines, warning_lines = parse_basedpyright_output(result.stdout)
 
+        # Unconfigured directories run at default strictness, so their warnings
+        # are noise about a project that was never set up. Errors still report.
+        hidden_warnings = 0
+        if not project_root:
+            hidden_warnings = warning_count
+            warning_count, warning_lines = 0, []
+
         # Build response
         if error_count == 0 and warning_count == 0:
-            response = {"systemMessage": "✅ basedpyright passed"}
+            suffix = f" ({hidden_warnings} unconfigured warning(s) hidden)" if hidden_warnings else ""
+            response = {"systemMessage": f"✅ basedpyright passed{suffix}"}
         elif error_count == 0:
             context = "\n"
             if warning_lines:
