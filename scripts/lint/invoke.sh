@@ -144,13 +144,23 @@ invoke_mend() {
     fi
     # RUSTC_WRAPPER cleared: a compiler cache replays cached output instead of
     # running rustc, which suppresses the diagnostics mend analyzes
-    run env RUSTC_WRAPPER= cargo mend --workspace --all-targets "$@"
+    # Scope comes from the caller (the lint CLI resolves it, or a caller like
+    # clean-fix passes --manifest-path). Forcing --workspace here silently
+    # overrode both: a per-project run linted the whole workspace instead.
+    run env RUSTC_WRAPPER= cargo mend --all-targets "$@"
 }
 
+# Scope comes from the caller, like mend and clippy. --workspace used to be
+# hardcoded here, which made every dev-time doc lint a full-workspace rustdoc
+# run no matter how little changed. Narrowing is safe: rustdoc resolves
+# intra-doc links per crate against that crate's own dependency metadata, so
+# which other members share the invocation never changes a given crate's
+# warnings. The workspace-wide sweep it used to provide incidentally now runs
+# once at the push gate (validate_ci.sh), where it belongs.
 invoke_doc() {
     if ! lint_config_enabled doc; then
-        lint_config_skip_notice doc "cargo doc --workspace"
+        lint_config_skip_notice doc "cargo doc $*"
         return 0
     fi
-    run env RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace --all-features "$@"
+    run env RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --all-features "$@"
 }

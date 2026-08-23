@@ -178,7 +178,8 @@ The subagent does not edit anything. Capture its block as ${DELEGATION_CONTEXT}.
 orchestrator work (you hold the design intent) — but it is reading + structuring,
 not codebase searching.
 
-0. **Check for a `## Worktree Placement` section** (written by `/worktree_fit`).
+0. **Check for a `## Worktree Placement` section** (hand-written, or carried
+   over from an older design doc).
    Optional — if absent, proceed normally and skip this item entirely. If
    present, read its `**Base:**`, `**Gates:**`, `**Scope now:**`, and
    `**Scope deferred:**` fields, and let them shape the phase set:

@@ -2,8 +2,8 @@
 
 How to decide what reaches the user when coding and reviewing code. This file is
 the single source for that guidance: imported by `~/.claude/CLAUDE.md` for every
-session, and by `/plan:delegate`, where it also defines the `<DecisionEconomy/>`
-contract. Related memories hold only provenance and point here.
+session, and by `/plan:delegate` and `/team_review`, where it also defines the
+`<DecisionEconomy/>` contract. Related memories hold only provenance and point here.
 
 <DecisionEconomy>
 If a decision has an obviously better answer, take it, record the choice where

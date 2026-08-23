@@ -103,20 +103,40 @@ emit("RUN_STARTED", data.get("started_at"))
 emit("RUN_FINISHED", data.get("finished_at"))
 
 known = {"mend", "clippy", "doc", "fmt"}
+
+
+def identify(cmd):
+    """Which lint a commands[] entry describes.
+
+    `name` is not reliable: cargo-port labels every entry with the driver it
+    invoked, so a run of all three arrives as three entries named "lint". The
+    invocation string is the field that actually distinguishes them, so it is
+    tried first and `name` is the fallback for drivers that do label per-lint.
+    """
+    for token in str(cmd.get("command") or "").split():
+        candidate = token.lower()
+        if candidate in known:
+            return candidate
+    name = str(cmd.get("name") or "").lower()
+    return name if name in known else None
+
+
 seen = set()
 for cmd in data.get("commands") or []:
     if not isinstance(cmd, dict):
         continue
-    name = str(cmd.get("name") or "").lower()
-    if name not in known:
+    key = identify(cmd)
+    if key is None or key in seen:
         continue
-    seen.add(name)
-    emit(f"CMD_{name.upper()}_STATUS", cmd.get("status"))
-    emit(f"CMD_{name.upper()}_LOG", cmd.get("log_file"))
+    seen.add(key)
+    emit(f"CMD_{key.upper()}_STATUS", cmd.get("status"))
+    emit(f"CMD_{key.upper()}_LOG", cmd.get("log_file"))
+    emit(f"CMD_{key.upper()}_EXIT", cmd.get("exit_code"))
 
-for name in known - seen:
-    emit(f"CMD_{name.upper()}_STATUS", "")
-    emit(f"CMD_{name.upper()}_LOG", "")
+for key in known - seen:
+    emit(f"CMD_{key.upper()}_STATUS", "")
+    emit(f"CMD_{key.upper()}_LOG", "")
+    emit(f"CMD_{key.upper()}_EXIT", "")
 PY
 }
 
@@ -186,6 +206,52 @@ case "$RUN_STATUS" in
         exit 1
         ;;
 esac
+
+# A cached result is only reusable when the lint it came from actually ran. The
+# three checks below reject caches that cannot support that claim; every one of
+# them used to fall through to an empty status, which reads as "passed" further
+# down and reports a lint as clean when it never executed.
+#
+# 126/127 are the shell's "found it but could not run it" / "not found" codes.
+# They mean the harness itself failed to start -- a missing interpreter, a
+# builtin the system shell lacks -- so the lint examined no code at all. That is
+# the opposite of clean and must never be cached as a pass.
+# `tr` rather than ${var^^}: this runs under macOS's bash 3.2, which has no
+# case-modifying expansion.
+upper() { printf '%s' "$1" | tr '[:lower:]' '[:upper:]'; }
+
+for name in mend clippy doc fmt; do
+    eval "cmd_exit=\${CMD_$(upper "$name")_EXIT:-}"
+    if [[ "$cmd_exit" == "127" || "$cmd_exit" == "126" ]]; then
+        echo "lint $name did not execute (exit $cmd_exit) — cache unusable." >&2
+        exit 1
+    fi
+done
+
+# An overall failure that no individual command accounts for means the run
+# record does not explain itself. Trusting the per-command fields here is what
+# turned a failed run into a clean report, so refuse the cache instead.
+if [[ "$RUN_STATUS" == "failed" ]]; then
+    attributed=false
+    for name in mend clippy doc fmt; do
+        eval "cmd_status=\${CMD_$(upper "$name")_STATUS:-}"
+        [[ "$cmd_status" == "failed" ]] && attributed=true
+    done
+    if [[ "$attributed" == false ]]; then
+        echo "lint-runs recorded a failed run with no failing command — cache unusable." >&2
+        exit 1
+    fi
+fi
+
+# /clippy reuses mend, clippy, and doc; fmt is always re-run. A missing entry is
+# an unknown result, not a pass.
+for name in mend clippy doc; do
+    eval "cmd_status=\${CMD_$(upper "$name")_STATUS:-}"
+    if [[ -z "$cmd_status" ]]; then
+        echo "lint $name is absent from the run record — cache incomplete." >&2
+        exit 1
+    fi
+done
 
 fresh_timestamp="$RUN_FINISHED"
 if [[ -z "$fresh_timestamp" ]]; then

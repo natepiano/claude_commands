@@ -40,7 +40,7 @@ For agent judgment steps (README updates, changelog review, GitHub release notes
 
 When a package selector is present in `$ARGUMENTS` (validated in STEP 1), set `${PACKAGE}` to that crate name and `${PACKAGE_FLAG}` to `--package ${PACKAGE}`. Otherwise both are empty and every step behaves exactly as a whole-workspace release.
 
-In single-package mode the entire pipeline is scoped to the one crate: `${ALL_CRATE_NAMES}`, `${ALL_VERSION_FILES}`, `${ALL_CHANGELOG_FILES}`, the published README, and `${PROJECT_NAME}` all narrow to that crate. The release branch becomes `release-${PACKAGE}-${VERSION}` and the tag `${PACKAGE}-v${VERSION}`. All three modes (normal, isolated, hotfix) run unchanged apart from this scoping. `pre_release_checks.sh` (STEP 2) still runs workspace-wide — the whole workspace must build, lint, and test before any single crate ships.
+In single-package mode the entire pipeline is scoped to the one crate: `${ALL_CRATE_NAMES}`, `${ALL_VERSION_FILES}`, `${ALL_CHANGELOG_FILES}`, the published README, and `${PROJECT_NAME}` all narrow to that crate. The release branch becomes `release-${PACKAGE}-${VERSION}` and the tag `${PACKAGE}-v${VERSION}`. All three modes (normal, isolated, hotfix) run unchanged apart from this scoping. `pre_release_checks.sh` (STEP 2) is scoped too, via `--package ${PACKAGE}`: `cargo publish` already verifies the packaged tarball by compiling it in isolation against registry dependencies, so building unrelated workspace members proves nothing about what ships. The scoped run keeps `--all-targets`, which builds the crate's examples and tests — where its path-only dev-dependencies live — and formatting stays workspace-wide. Run `/release ${VERSION}` without a package selector when you also want reverse-dependency coverage across the workspace.
 
 **Single-package mode is incompatible with `[[publish_phases]]` config.** A workspace that defines publish phases releases its crates together with ordered cross-dependency updates; STEP 1 stops if a package is named there.
 
@@ -124,7 +124,7 @@ All scriptable steps use shell scripts. The agent orchestrates script execution 
 
 **Universal scripts** in `~/.claude/scripts/release/`:
 - `validate_version.sh` — format, collision, and gap checking ⊘
-- `pre_release_checks.sh` — git status, clippy, build, test, fmt ⊘ (deliberately ignores `config/lint.conf`; a check turned off with `/lint_config` still runs here, because a release gate that silently no-ops is worse than a noisy one)
+- `pre_release_checks.sh` — git status, clippy, build, test, fmt ⊘ (deliberately ignores `config/lint.conf`; a check turned off with `/lint_config` still runs here, because a release gate that silently no-ops is worse than a noisy one). Takes an optional `--package <name>` to scope the compile-and-test gate to one crate
 - `create_release_branch.sh` — branch creation
 - `bump_versions.sh` — update [package] version fields
 - `resolve_path_pins.sh` — resolve each path-only workspace dep to its latest published version and detect unpublished local changes ⊘
@@ -430,14 +430,16 @@ Mode: normal | hotfix (from branch: ${HOTFIX_BRANCH}) | isolated (base branch: $
 <PreReleaseChecks>
 ## STEP 2: Pre-Release Validation
 
-**Run pre-release checks** (with `dangerouslyDisableSandbox: true`):
+**Run pre-release checks** (with `dangerouslyDisableSandbox: true`). `${PACKAGE_FLAG}` is `--package ${PACKAGE}` in single-package mode and empty otherwise, which scopes the compile-and-test gate to the crate being released:
 ```bash
-~/.claude/scripts/release/pre_release_checks.sh
+~/.claude/scripts/release/pre_release_checks.sh ${PACKAGE_FLAG}
 ```
+
+**This is long-running — background it** (`run_in_background: true`) and wait for the task notification rather than blocking. Redirect to a log file if you like, but **do not append `echo "EXIT=$?"` or any trailing command**: the task's reported exit code is the *last* command's, so a trailing echo masks a failed gate as success. Either let the script's own exit code stand as the command's, or capture it into the log with `&& echo PASS || echo FAIL`.
 
 → Report the full script output to the user. Stop if any check fails.
 
-**Note**: This script is read-only — runs the same in dry-run mode.
+**Note**: This script is read-only apart from `cargo fmt`, which may rewrite formatting — runs the same in dry-run mode.
 </PreReleaseChecks>
 
 <UpdateReadmesOnBase>

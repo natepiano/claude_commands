@@ -7,6 +7,11 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 # LINT_CONFIG_FORCE=1 is set on each step that must never be skipped by
 # config/lint.conf — as a pre-push gate, only the two mend steps honor that
 # file (see the mend note below).
+# Every lint call here passes --workspace explicitly. The lint CLI otherwise
+# narrows scope to the members the working tree changed, which is right for a
+# dev loop and wrong for a pre-push gate: a change that compiles in its own
+# crate can still break a dependent one, and this is the last check before the
+# push. Full coverage is the point.
 LINT_CMD="$HOME/.claude/scripts/lint/lint"
 
 # Lint policy, read for `mend` only — see the mend note in the header comment
@@ -273,11 +278,11 @@ run_target_clippy() {
         PKG_CONFIG_ALLOW_CROSS=1 \
         PKG_CONFIG_ALLOW_CROSS_x86_64_unknown_linux_gnu=1 \
         LINT_CONFIG_FORCE=1 \
-        "$LINT_CMD" clippy --target "$target" \
+        "$LINT_CMD" clippy --workspace --target "$target" \
         ${CROSS_EXCLUDE_ARGS[@]+"${CROSS_EXCLUDE_ARGS[@]}"} "$@"
       ;;
     *)
-      env LINT_CONFIG_FORCE=1 "$LINT_CMD" clippy --target "$target" \
+      env LINT_CONFIG_FORCE=1 "$LINT_CMD" clippy --workspace --target "$target" \
         ${CROSS_EXCLUDE_ARGS[@]+"${CROSS_EXCLUDE_ARGS[@]}"} "$@"
       ;;
   esac
@@ -390,14 +395,20 @@ if ! lint_config_enabled mend; then
 elif [ -n "$MEND_SELF_PACKAGE" ]; then
   run_autofix_step "cargo-mend autofix (in-repo build)" run_self_mend --fix
 else
-  run_autofix_step "cargo-mend autofix" "$LINT_CMD" mend --fix
+  run_autofix_step "cargo-mend autofix" "$LINT_CMD" mend --workspace --fix
 fi
 
 run_autofix_step "rustfmt" env LINT_CONFIG_FORCE=1 "$LINT_CMD" fmt
 
 run_autofix_step "taplo" taplo fmt
 
-run_step "clippy" env LINT_CONFIG_FORCE=1 "$LINT_CMD" clippy-tests
+run_step "clippy" env LINT_CONFIG_FORCE=1 "$LINT_CMD" clippy-tests --workspace
+
+# rustdoc across every member. `lint doc` scopes to changed members like the
+# other checks, so the dev-time run cannot see a doc link that rotted in an
+# untouched crate when a public item was renamed elsewhere. This is the sweep
+# that catches it, and the only place cargo doc runs workspace-wide.
+run_step "rustdoc" env LINT_CONFIG_FORCE=1 "$LINT_CMD" doc --workspace
 
 run_configured_target_checks
 
@@ -408,7 +419,7 @@ if ! lint_config_enabled mend; then
 elif [ -n "$MEND_SELF_PACKAGE" ]; then
   run_step "cargo-mend (in-repo build)" run_self_mend --fail-on-warn
 else
-  run_step "cargo-mend" "$LINT_CMD" mend --fail-on-warn
+  run_step "cargo-mend" "$LINT_CMD" mend --workspace --fail-on-warn
 fi
 
 echo ""

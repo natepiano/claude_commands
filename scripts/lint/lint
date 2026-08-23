@@ -12,15 +12,25 @@ source "$HOME/.claude/scripts/lint/invoke.sh"
 usage() {
   cat <<EOF
 Usage:
-  lint mend [args...]             cargo mend --workspace --all-targets
-  lint clippy [args] [-- lints]   workspace clippy --all-targets, -D warnings
+  lint mend [args...]             cargo mend --all-targets
+  lint clippy [args] [-- lints]   clippy --all-targets, -D warnings
   lint clippy-tests [args] [-- lints]
-                                  workspace clippy over lib/bins/tests only —
+                                  clippy over lib/bins/tests only —
                                   validate_ci's host shape (no examples or
                                   benches)
   lint doc [args...]              cargo doc, warnings denied
   lint fmt [args...]              cargo +nightly fmt --all
   lint nextest [args...]          cargo nextest run
+
+Scope is resolved per run: mend, clippy, clippy-tests, doc, and nextest cover
+only the workspace members the working tree changed, widening to --workspace
+when a root manifest, lockfile, or shared tool config changed, when nothing
+changed, or when over half did. Pass --workspace or -p <pkg> to choose the
+scope yourself and skip resolution — gates that must cover everything
+(validate_ci.sh) pass --workspace explicitly. --manifest-path does NOT skip
+resolution: it names a manifest, not a package set, so resolution runs against
+that manifest's tree instead of the working directory. fmt is always --all: it
+compiles nothing, so the wider scope is free.
 
 mend/clippy/doc/fmt honor config/lint.conf (edit with /lint_config);
 LINT_CONFIG_FORCE=1 overrides the gate — push and release gates set it on
@@ -29,16 +39,60 @@ steps they never allow to skip. Extra args (--manifest-path, --fix, --target,
 EOF
 }
 
+
+# Package scope. A workspace-wide lint recompiles every member on every run,
+# so this narrows to the members the working tree actually changed. It stays
+# out of the way when the caller already picked a PACKAGE scope -- --workspace
+# from a gate that must cover everything, or -p from a targeted run.
+#
+# --manifest-path is deliberately not in that list, though it used to be. It
+# names a manifest, not a package set: aimed at a virtual workspace root it
+# leaves cargo selecting every member, so short-circuiting on it made each
+# per-project driver that passes it -- cargo-port's lint commands, clean-fix's
+# agent prompts -- silently lint the whole workspace, with no --workspace in
+# the argv to reveal it. The full argv goes to scope.py instead, which reads
+# the manifest path out of it and resolves against that tree. See scope.py for
+# the widen rules.
+lint_scope() {
+    local arg
+    for arg in "$@"; do
+        case "$arg" in
+            --workspace | --all | -p | --package | -p=* | --package=*)
+                return 0
+                ;;
+        esac
+    done
+    python3 "$HOME/.claude/scripts/lint/scope.py" "$@"
+}
+
+# Populate the SCOPE array from lint_scope. macOS ships bash 3.2, which has no
+# `mapfile`, so a read loop stands in for it -- and must, because the shebang
+# resolves to that system bash whenever no newer one is on PATH. cargo-port runs
+# with a bare PATH, so a `mapfile` here fails with exit 127 and the lint never
+# runs at all.
+resolve_scope() {
+    SCOPE=()
+    local line
+    while IFS= read -r line; do
+        [[ -n "$line" ]] && SCOPE+=("$line")
+    done < <(lint_scope "$@")
+}
+
 CMD="${1:-}"
 [[ $# -gt 0 ]] && shift
 
 case "$CMD" in
-  mend)         invoke_mend "$@" ;;
-  clippy)       invoke_clippy --workspace --all-targets --all-features "$@" ;;
-  clippy-tests) invoke_clippy --workspace --all-features --tests "$@" ;;
-  doc)          invoke_doc "$@" ;;
+  mend)         resolve_scope "$@"
+                invoke_mend ${SCOPE[@]+"${SCOPE[@]}"} "$@" ;;
+  clippy)       resolve_scope "$@"
+                invoke_clippy ${SCOPE[@]+"${SCOPE[@]}"} --all-targets --all-features "$@" ;;
+  clippy-tests) resolve_scope "$@"
+                invoke_clippy ${SCOPE[@]+"${SCOPE[@]}"} --all-features --tests "$@" ;;
+  doc)          resolve_scope "$@"
+                invoke_doc ${SCOPE[@]+"${SCOPE[@]}"} "$@" ;;
   fmt)          fmt_cargo --all "$@" ;;
-  nextest)      run_nextest "$@" ;;
+  nextest)      resolve_scope "$@"
+                run_nextest ${SCOPE[@]+"${SCOPE[@]}"} "$@" ;;
   --help|-h)    usage ;;
   *)
     usage >&2

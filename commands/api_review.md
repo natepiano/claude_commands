@@ -33,7 +33,7 @@ description: Multi-agent API review — ergonomics, performance, simplicity, dup
 - Resolve `target` to `${CRATE_ROOT}` (directory containing the `Cargo.toml`) and, if narrower than the whole crate, the module/feature subset `${FOCUS}` (e.g. `src/viewport/`, "the conduit connection API"). When `${FOCUS}` is set, the review is scoped to it — the rest of the crate is context, not review subject.
 - Detect workspace membership by walking up from `${CRATE_ROOT}` for a `[workspace]` `Cargo.toml`. Capture `${CRATE_NAME}` from `[package] name`.
 - **Doc path convention** (this is how the user organizes docs across all projects):
-  - Workspace member → `<workspace_root>/docs/${CRATE_NAME}/api_review_<topic>.md` (e.g. `~/rust/bevy_hana/crates/hana_conduit` → `~/rust/bevy_hana/docs/hana_conduit/api_review_<topic>.md`)
+  - Workspace member → `<workspace_root>/docs/${CRATE_NAME}/api_review_<topic>.md` (e.g. `~/rust/hana/crates/hana_conduit` → `~/rust/hana/docs/hana_conduit/api_review_<topic>.md`)
   - Standalone crate / binary → `${CRATE_ROOT}/docs/api_review_<topic>.md` (e.g. `~/rust/nateroids/docs/api_review_<topic>.md`)
   - `<topic>` — short kebab slug: the crate name when reviewing the whole crate, otherwise the module/feature name (e.g. `api_review_viewport.md`).
 - Create the docs directory if missing. If `${DOC_PATH}` already exists, ask: `Doc already exists at <path>. Overwrite / append / cancel?` On cancel, stop.

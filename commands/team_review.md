@@ -8,8 +8,14 @@ description: Launch a team of expert agents to review a topic across multiple di
 
 **Critical execution guards:**
 - The working doc established by `<EstablishWorkingDoc/>` is final for this workflow and for the `/adhoc_review` handoff. Do not ask where to record decisions again.
-- Hard-filter proposed decisions before surfacing. If a finding has converged into a concrete in-intent plan refinement with no meaningful user choice left, record it in `${WORKING_DOC}` and do not send it to `/adhoc_review`.
+- Hard-filter proposed decisions before surfacing, through `<DecisionEconomy/>`. If a finding has converged into a concrete in-intent plan refinement with no meaningful user choice left, record it in `${WORKING_DOC}` and do not send it to `/adhoc_review`.
 - Surface only unresolved product/design choices where the user must choose among plausible alternatives or explicitly approve a scope/behavior change.
+
+`<DecisionEconomy/>` is defined by this import, shared with every session and with `/plan:delegate`:
+
+@~/.claude/docs/decision_criteria.md
+
+It is the authority on what reaches the user, and it applies to the review's own output the same way it applies to a phase's. This command adds only what is specific to a multi-cycle expert review: the `<IntentFirewall/>` classes, and the rule that an expert finding is *evidence for* a decision, never a decision already taken — several agents agreeing does not convert a judgment call into a settled one, and one agent objecting does not create a user decision out of something `<DecisionEconomy/>` already decides.
 
 When the topic is a design/plan/spec, the review is **bound to that design's stated intent**: by default it strengthens the design to achieve that intent and does *not* relitigate whether to pursue it. Challenges to the premise are quarantined, not run as the default mode — see `<IntentFirewall/>`. This exists because an unbound multi-cycle review will, given enough cycles, talk itself into "should this exist?" and bury the work that was actually asked for.
 
@@ -180,7 +186,9 @@ If the user picks `none` (case 3 only), ${WORKING_DOC} is unset and the accumula
 <RecordMechanicalFindings>
 **Goal:** Record strictly mechanical findings into ${WORKING_DOC} with no prompt.
 
-A finding is **auto-recorded** (no prompt) when its recommendation has a single correct outcome *and* does not change the plan's structure or its intended behavior. This covers both (a) mechanical fixes — typo, dead import, naming-consistency rename, formatting, a refactor with one valid result — and (b) **correctness/bug fixes** where the right fix is determined even if finding it took judgment (a compile break, a missing guard, a wrong read path, a stale doc reference). A finding becomes a **decision** (Step 6) surfaced to the user *only* when it changes the plan's structure or the intended behavior — more than one valid answer, a new API/feature, or a scope/ordering change. When unsure whether it changes intended behavior, treat it as a decision.
+A finding is **auto-recorded** (no prompt) when its recommendation has a single correct outcome *and* does not change the plan's structure or its intended behavior. This covers both (a) mechanical fixes — typo, dead import, naming-consistency rename, formatting, a refactor with one valid result — and (b) **correctness/bug fixes** where the right fix is determined even if finding it took judgment (a compile break, a missing guard, a wrong read path, a stale doc reference). A finding becomes a **decision** carried into `<ReconcileProposedDecisions/>` *only* when it changes the plan's structure or the intended behavior — more than one valid answer, a new API/feature, or a scope/ordering change.
+
+When it is unclear which side a finding falls on, `<DecisionEconomy/>` breaks the tie, not caution: apply its test — if being wrong costs a one-line revert, record the call and state it in one line; if it costs lost work, a published artifact, or the wrong thing built, it is a decision. Its already-decided categories are auto-recorded here too, however many agents raised them: low-stakes and reversible, the premium experience option, its correctness-then-simplicity-then-speed ranking, and keeping API surface private until a real consumer exists. Cost of the work never promotes a finding to a decision.
 
 Incorporate each mechanical finding into ${WORKING_DOC} where it belongs — fold it into the appropriate existing section, or collect it under a dedicated `## Mechanical (auto-recorded)` section when there is no natural home. Record finding id, title, recommendation, marked accepted. Skip any finding an earlier cycle already recorded. Do not edit source code — this records the decision in the doc; applying it to code is a separate step. If ${WORKING_DOC} is unset, list them inline in the conversation instead.
 </RecordMechanicalFindings>
@@ -215,10 +223,12 @@ For this cycle's judgment findings, reconcile against the existing entries:
 - **Duplicate or refinement** of an existing entry → merge into it, keeping the sharper wording.
 - **Contradicts or obsoletes** an existing entry → mark that entry `dropped` (or `superseded`) with a one-line reason. A later cycle marking an earlier proposed decision unnecessary is expected and allowed.
 
-Before the final surface step, apply a hard decision gate:
-- **Record, do not surface:** converged refinements, correctness fixes, implementation constraints, acceptance-test additions, or API clarifications that have one sensible in-intent outcome after review.
-- **Surface:** unresolved choices where the user must pick among plausible alternatives, approve a scope/behavior change, or decide whether to accept a tradeoff the team could not settle.
+Before the final surface step, apply `<DecisionEconomy/>` as the hard decision gate. Every entry still marked `proposed` must survive it:
+- **Record, do not surface:** anything `<DecisionEconomy/>` already decides — low-stakes and reversible, the premium user-or-developer experience option, a tie its correctness → simplicity/ergonomics → speed ranking settles, API surface with no current consumer — plus converged refinements, correctness fixes, implementation constraints, acceptance-test additions, and API clarifications that have one sensible in-intent outcome after review. Record the call and the risk it carries in one line in `${WORKING_DOC}`; a call the user never sees was taken from them, not made for them.
+- **Surface:** only what cannot be cheaply undone — unresolved choices where the user must pick among plausible alternatives, approve a scope or behavior change, or accept a tradeoff the team could not settle, and where being wrong costs lost work, a published artifact, or the wrong thing built.
 - **Drop/supersede:** items made redundant by sharper later-cycle wording.
+
+Two failure modes this gate exists to stop, both specific to a multi-agent review. **Consensus is not promotion:** four lenses independently raising the same in-intent refinement makes it better evidenced, not more the user's call — it is still auto-recorded. **Volume is not significance:** a long `proposed` list at the end of a multi-cycle run means the gate was not applied, not that the design has many open questions.
 
 Only entries still `proposed` after this gate get surfaced; keep `dropped`/`superseded` ones in the doc with their reason so a future run does not relitigate them. If ${WORKING_DOC} is unset, hold this set in conversation instead.
 </ReconcileProposedDecisions>
