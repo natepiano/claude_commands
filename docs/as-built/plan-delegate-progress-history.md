@@ -234,10 +234,16 @@ The single exception is a launcher the orchestrator killed, whose pass stays
 open: `finish-pass --status canceled --orphaned-launcher` closes it, and only
 that status, and only while a pass is open.
 
-`progress` writes the event and prints two tables. The first holds the clocks:
-a project row and a phase row carrying the reported percentage, elapsed, ETA,
-unchanged, and — when the plan's headings can be counted — how many phases are
-done. The second is the stage table, one row per window the phase has opened,
+`progress` writes the event and prints two tables under a line naming the
+worktree, the branch, and — when the plan's headings can be counted — the
+position of the phase in flight, `phase N of M`. That position is the finished
+count plus one, off the same headings the project percentage derives from, so
+the line and the table can never disagree; a plan that cannot be counted keeps
+the short worktree-and-branch form. The first table holds the clocks: a project
+row and a phase row carrying the reported percentage, elapsed, ETA, unchanged,
+— when the plan's headings can be counted — how many phases are done, and last
+the best and worst arrival the percentage still allows. The second is the stage
+table, one row per window the phase has opened,
 oldest first: the stage, the main agent that orchestrated it, the delegate that
 ran it, its start time, its elapsed, and its result. Under the table
 sits the running stage's activity sentence, which no fixed-width column can
@@ -274,6 +280,21 @@ extend or nothing left to extend it over. Because the projection reads the same
 capped number the row displays, it never contradicts the percentage beside it,
 and it inherits that number's accuracy: derived phase counts for the project,
 the reporter's estimate for the phase.
+
+`ETA low` and `ETA high` close the row with the two arrivals that same
+percentage still allows, each followed by its own distance from the ETA as
+`(-HH:MM)` and `(+HH:MM)` so the swing reads without subtracting clock times by
+hand. Both come from re-running the ETA's own projection over a percentage moved
+a plausible distance each way, which makes the band asymmetric on purpose: at
+20% a few points of optimism cost far more hours than the same few points of
+pessimism save, and a symmetric band would hide exactly that. The distance is
+the phase estimate's own measured error when a calibration cleared its sample
+floor, and ten percentage points otherwise; the project row always takes the
+default, where it reads as the phases left being worth more or less time than
+their share of the count. Neither end may stray past double or half the reported
+rate whatever the measured error says — a spread wider than the percentage
+itself would otherwise push the pessimistic end to 1% and quote an arrival
+ninety-nine times the elapsed clock. Both cells are blank wherever the ETA is.
 
 `timeline` renders the stage table alone, for one phase or for every phase of
 the run, and needs no open window. It answers the questions asked after the

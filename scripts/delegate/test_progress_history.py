@@ -280,10 +280,10 @@ class ProgressHistoryTests(unittest.TestCase):
             [
                 "**bevy_hana_rubric - feature/rubric**",
                 "",
-                "| Scope   |   % | Elapsed  | ETA         | Unchanged |",
-                "| ------- | --: | -------- | ----------- | --------- |",
-                "| Project |  80 | 00:01:40 | today 05:35 |           |",
-                "| Phase 3 |  25 | 00:01:40 | today 05:40 |           |",
+                "| Scope   |   % | Elapsed  | ETA         | Unchanged | ETA low              | ETA high             |",
+                "| ------- | --: | -------- | ----------- | --------- | -------------------- | -------------------- |",
+                "| Project |  80 | 00:01:40 | today 05:35 |           | today 05:35 (-00:00) | today 05:35 (+00:00) |",
+                "| Phase 3 |  25 | 00:01:40 | today 05:40 |           | today 05:36 (-00:03) | today 05:46 (+00:06) |",
                 "",
                 "**Phase 3: Retry handling**",
                 "",
@@ -1425,6 +1425,91 @@ class ProgressHistoryTests(unittest.TestCase):
         )
         self.assertIn("| Project |  10 | 22:13:20 | 1970-01-10 06:13 |", header)
         self.assertIn("| Phase 3 |  50 | 02:46:40 | tomorrow 01:00 ", header)
+
+
+    def test_the_eta_band_brackets_the_arrival_and_names_its_own_swing(self) -> None:
+        """One arrival hides how firm it is; two bracket it and show the spread.
+
+        Ten points of doubt either way, run back through the same projection the
+        ETA uses. The band is asymmetric because the projection is: at 10% those
+        ten points buy four days of optimism and cost nine of pessimism, and the
+        parenthesised distances say so without any clock arithmetic.
+        """
+        session_dir = self.start_run("band", 0)
+        self.start_phase_and_pass(session_dir, 70_000)
+        header = self.run_command(
+            "progress",
+            "--session-dir",
+            str(session_dir),
+            "--project-raw-percent",
+            "10",
+            "--project-percent",
+            "10",
+            "--phase-raw-percent",
+            "50",
+            "--phase-percent",
+            "50",
+            "--cap-stage",
+            "implementation",
+            "--activity",
+            "writing the retry path",
+            at=80_000,
+        )
+        self.assertIn(
+            "| 1970-01-05 15:06 (-111:06) | 1970-01-19 12:26 (+222:13) |",
+            header,
+        )
+        self.assertIn(
+            "| tomorrow 00:04 (-00:55)    | tomorrow 02:23 (+01:23)    |",
+            header,
+        )
+
+
+    def test_the_header_names_the_phase_position_in_the_plan(self) -> None:
+        """Worktree and branch say where the run is, not how much plan is left.
+
+        The position counts the finished phases and adds the one in flight, off
+        the same headings the project percentage derives from, so the line and
+        the table can never disagree about how far along the plan is.
+        """
+        session_dir = self.start_run("position", 0)
+        plan_path = self.working_dir / "docs" / "position.md"
+        _ = plan_path.write_text(
+            plan_path.read_text(encoding="utf-8")
+            + "### Phase 1 — Shrunk archive form (`bbac234`)\n\n"
+            + "### Phase 2 — Completed  · status: done\n\n"
+            + "### Phase 3 — Live work  · status: todo\n\n"
+            + "### Phase 4 — Waiting  · status: todo\n\n"
+            + "### Phase 5 — Waiting  · status: todo\n\n",
+            encoding="utf-8",
+        )
+        self.start_phase_and_pass(session_dir, 70_000)
+        header = self.run_command(
+            "progress",
+            "--session-dir",
+            str(session_dir),
+            "--project-raw-percent",
+            "90",
+            "--project-percent",
+            "90",
+            "--phase-raw-percent",
+            "50",
+            "--phase-percent",
+            "50",
+            "--cap-stage",
+            "implementation",
+            "--activity",
+            "writing the retry path",
+            at=80_000,
+        )
+        self.assertEqual(
+            header.splitlines()[0],
+            "**bevy_hana_rubric - feature/rubric - phase 3 of 5**",
+        )
+        # The supplied 90 is advisory; two finished phases and a half-done third
+        # of five is 50, and the position above counts the same headings.
+        self.assertIn("| Project |  50 | ", header)
+        self.assertIn("| 2 of 5 done |", header)
 
 
 class PhaseCountTests(unittest.TestCase):

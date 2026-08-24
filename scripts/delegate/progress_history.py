@@ -22,6 +22,14 @@ from typing import TypedDict, cast
 
 SCHEMA_VERSION = 1
 MIN_CALIBRATION_SAMPLES = 5
+# How far the percentage beside an ETA is assumed to be off when no calibration
+# history has an opinion. Ten points is the width the recorded phase estimates
+# have shown; a run with enough matching samples replaces it with its own
+# measured error, so this only ever governs the first runs of a fresh history.
+DEFAULT_PERCENT_SPREAD = 10.0
+# The widest the best and worst case may stray from the reported rate: at worst
+# the work is half as far along as it says, at best twice.
+RATE_FACTOR_LIMIT = 2.0
 STATE_FILENAME = "progress_history_state.json"
 PROJECT_STARTED_PATTERN = re.compile(
     r"^[ \t]*-[ \t]+\*\*Project started:\*\*[ \t]*(?P<value>.+?)[ \t]*$",
@@ -1795,17 +1803,9 @@ def _render_table(
     return [rendered(headers), rule, *(rendered(row) for row in rows)]
 
 
-def _eta_cell(percent: int, elapsed: int, now: float) -> str:
-    """When the work is expected to land, as a clock time rather than a duration.
-
-    A remaining duration has to be added to the current time by hand every time
-    it is read, and the answer changes with every report. An arrival stamp is
-    that addition already done, and it says the same thing tomorrow morning.
-    """
-    eta = _eta_seconds(percent, elapsed)
-    if eta is None:
-        return ""
-    arrival = datetime.fromtimestamp(now + eta)
+def _arrival_label(seconds_out: int, now: float) -> str:
+    """A point in the future named the way a person would say it aloud."""
+    arrival = datetime.fromtimestamp(now + seconds_out)
     days = (arrival.date() - datetime.fromtimestamp(now).date()).days
     if days == 0:
         return f"today {arrival:%H:%M}"
@@ -1814,8 +1814,102 @@ def _eta_cell(percent: int, elapsed: int, now: float) -> str:
     return f"{arrival:%Y-%m-%d %H:%M}"
 
 
+def _eta_cell(percent: int, elapsed: int, now: float) -> str:
+    """When the work is expected to land, as a clock time rather than a duration.
+
+    A remaining duration has to be added to the current time by hand every time
+    it is read, and the answer changes with every report. An arrival stamp is
+    that addition already done, and it says the same thing tomorrow morning.
+    """
+    eta = _eta_seconds(percent, elapsed)
+    return "" if eta is None else _arrival_label(eta, now)
+
+
+def _format_offset(seconds: int) -> str:
+    """A swing, as hours and minutes, however many hours that turns out to be.
+
+    `_format_duration` breaks past a day into a `<days> HH:MM:SS` phrase, which
+    reads well for an elapsed clock and badly for the two numbers whose whole
+    job is to be compared at a glance. One unbroken hours field renders a swing
+    of forty minutes and a swing of forty hours the same way.
+    """
+    hours, remainder = divmod(max(0, seconds), 3600)
+    return f"{hours:02d}:{remainder // 60:02d}"
+
+
+def _eta_band_cells(
+    percent: int,
+    elapsed: int,
+    now: float,
+    spread: float,
+) -> tuple[str, str]:
+    """The best and worst arrival the percentage beside it still allows.
+
+    The ETA extends the current rate from a percentage that is an estimate, so
+    every hour it predicts inherits that estimate's error. Moving the percentage
+    a plausible distance each way and re-running the same projection turns that
+    error into the two times it actually implies. The band is asymmetric on
+    purpose: at 20% a few points of optimism cost far more hours than the same
+    few points of pessimism save, and a symmetric band would hide exactly that.
+
+    Each cell carries its own distance from the ETA, so the swing reads off the
+    row without subtracting two clock times by hand.
+
+    Neither end is allowed past double or half the reported progress, whatever
+    the spread says. A measured error wider than the percentage itself would
+    otherwise push the pessimistic end down to 1% and quote an arrival ninety-nine
+    times the elapsed clock — a number no reader can use and none should trust.
+    """
+    eta = _eta_seconds(percent, elapsed)
+    if eta is None:
+        return "", ""
+    optimistic = min(99.0, percent * RATE_FACTOR_LIMIT, percent + max(0.0, spread))
+    pessimistic = max(1.0, percent / RATE_FACTOR_LIMIT, percent - max(0.0, spread))
+    low = int(elapsed * (100.0 - optimistic) / optimistic)
+    high = int(elapsed * (100.0 - pessimistic) / pessimistic)
+    return (
+        f"{_arrival_label(low, now)} (-{_format_offset(eta - low)})",
+        f"{_arrival_label(high, now)} (+{_format_offset(high - eta)})",
+    )
+
+
+def _percent_spread(calibration: dict[str, object] | None) -> float:
+    """How far off the percentage has actually run, when history can say.
+
+    A calibration that cleared its sample floor has measured this reporter's
+    error at this percentage against phases that finished, which beats any
+    constant. Below the floor the measurement is noise wearing a number, so the
+    default stands.
+    """
+    if calibration is None:
+        return DEFAULT_PERCENT_SPREAD
+    if _integer(calibration.get("sample_count")) < MIN_CALIBRATION_SAMPLES:
+        return DEFAULT_PERCENT_SPREAD
+    measured = calibration.get("median_raw_absolute_error_percentage_points")
+    if not isinstance(measured, int | float):
+        return DEFAULT_PERCENT_SPREAD
+    return max(1.0, float(measured))
+
+
 def _unchanged_cell(seconds: int) -> str:
     return _format_duration(seconds) if seconds > 0 else ""
+
+
+def _scope_line(state: dict[str, object], counts: dict[str, object]) -> str:
+    """Where the run is working, and how far into the plan that leaves it.
+
+    Worktree and branch say where; neither says how much plan is left. The
+    position is the count of finished phases plus the one in flight, taken from
+    the same headings the project percentage is derived from, so the two can
+    never disagree. A plan whose phases could not be counted keeps the short
+    form rather than showing a position nothing verified.
+    """
+    line = f"{_string(state.get('worktree'))} - {_string(state.get('branch'))}"
+    if counts.get("available") is not True:
+        return f"**{line}**"
+    total = _integer(counts.get("total"))
+    position = min(total, _integer(counts.get("done")) + 1)
+    return f"**{line} - phase {position} of {total}**"
 
 
 def _timeline(args: argparse.Namespace) -> None:
@@ -2116,6 +2210,26 @@ def _progress(args: argparse.Namespace) -> None:
             total = _integer(plan_phase_counts.get("total"))
             project_row.append(f"{done} of {total} done")
             phase_row.append("")
+        # The project percentage is a phase count, so it is exact in phases and
+        # only an estimate in work; the same spread reads there as "the phases
+        # left may be worth more or less time than their share of the count".
+        summary_headers.extend(("ETA low", "ETA high"))
+        project_row.extend(
+            _eta_band_cells(
+                project_percent,
+                total_elapsed,
+                now,
+                DEFAULT_PERCENT_SPREAD,
+            )
+        )
+        phase_row.extend(
+            _eta_band_cells(
+                phase_percent,
+                phase_elapsed,
+                now,
+                _percent_spread(phase_calibration),
+            )
+        )
         stage_rows = _stage_rows(
             _run_events(state),
             state,
@@ -2127,7 +2241,7 @@ def _progress(args: argparse.Namespace) -> None:
         # carry.
         live_label = stage_rows[-1][0] if stage_rows else _pass_display(current_pass)
         lines = [
-            f"**{_string(state.get('worktree'))} - {_string(state.get('branch'))}**",
+            _scope_line(state, plan_phase_counts),
             "",
             *_render_table(summary_headers, [project_row, phase_row], {1}),
             "",

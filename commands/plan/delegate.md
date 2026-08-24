@@ -421,10 +421,13 @@ On a Claude timer notification or Codex poll timeout:
    stage the phase has opened — implementation, each review, each fix, each
    main-agent activity — in the order they ran. Durations below one day are
    always `HH:MM:SS`; longer durations are `<days> day(s) HH:MM:SS`, and the
-   `ETA` column is an arrival time rather than a duration. Its last line is the
-   wall clock — `now` and the next report time, both computed by the recorder
-   from the same interval the timer uses. Never write, adjust, or drop that
-   line, reorder a table, or edit a cell by hand.
+   `ETA`, `ETA low`, and `ETA high` columns are arrival times rather than
+   durations — the two band columns each carry their own distance from the ETA
+   in parentheses as `(-HH:MM)` and `(+HH:MM)`. The line above the first table
+   names the worktree, the branch, and the phase's position in the plan. Its
+   last line is the wall clock — `now` and the next report time, both computed
+   by the recorder from the same interval the timer uses. Never write, adjust,
+   or drop that line, reorder a table, or edit a cell by hand.
 5. Add two or three ordinary-English sentences covering current activity,
    material work now present, and what remains.
 
@@ -1069,6 +1072,16 @@ Use <UserFacingText/> and emit:
 
 Summary and reference numbers must match. A reader should not need the plan,
 diff, reviews, or finding ids.
+
+When the same turn launches a repair, close the message with the current
+progress header — both tables and the wall-clock line — after the launch and
+after the timer is armed, produced by <ProgressContract/> steps 3 and 4 with the
+launched pass as the activity. A result that ends in a dispatch is where the
+clocks are worth the most: the numbered items say what is being repaired, and
+the tables say how far into the phase and the plan that repair sits. Print it
+below the sections above, exactly as the recorder emits it. Should the recorder
+answer that no window is open, the launcher has not recorded its pass yet: try
+once more, then continue without the tables rather than stalling the turn.
 </DelegationResultFormat>
 
 <FixDispatch>
@@ -1090,7 +1103,8 @@ Run `findings.py dispatch --covers <all batch ids>` before launching:
 "${WORKING_DIR}" "${SESSION_DIR}/fix_prompt_${FIX_ROUND}.md" "${FIX_TASK}"
 "<responsibility>" fix "<activity>" "${FIX_ROUND}"`
 
-Apply <DispatchContract/>; set `EARLY_REVIEW=none` at dispatch. While a
+Apply <DispatchContract/>; set `EARLY_REVIEW=none` at dispatch, and close the
+turn with the progress header per <DelegationResultFormat/>. While a
 non-mechanical fix runs, <EarlyReviewArm/> may arm its closure reviewer early.
 After a non-mechanical repair, run <DualReview/>.
 For a mechanical repair, apply <ReviewDiffContract/>, read it yourself, and
@@ -1119,7 +1133,8 @@ Set the state true and write the marker before dispatch. Compose one mechanical
 fix prompt containing the complete gate batch, exact diagnostics, and affected
 test and lint lines. Do not call `findings.py dispatch`; the earlier behavioral
 rounds remain authoritative. Launch with <DispatchContract/> using the gate's
-next round number.
+next round number, and close the turn with the progress header per
+<DelegationResultFormat/>.
 
 On completion, apply <ReviewDiffContract/>, read every cleanup hunk, and rerun
 the exact failing verification plus affected tests. Record each existing id
