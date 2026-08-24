@@ -1511,6 +1511,10 @@ STAGE_HEADERS: tuple[str, ...] = (
     "Result",
 )
 SUMMARY_HEADERS: tuple[str, ...] = ("Scope", "%", "Elapsed", "ETA", "Unchanged")
+# Every summary column holding a magnitude or a time, named rather than indexed
+# so the alignment follows a column that moves. The two scope labels and the
+# phase tally read as words and stay left.
+RIGHT_ALIGNED_SUMMARY_COLUMNS = frozenset({"%", "Elapsed", "ETA", "ETA low", "ETA high"})
 
 
 def _run_events(state: dict[str, object]) -> list[dict[str, object]]:
@@ -2243,7 +2247,15 @@ def _progress(args: argparse.Namespace) -> None:
         lines = [
             _scope_line(state, plan_phase_counts),
             "",
-            *_render_table(summary_headers, [project_row, phase_row], {1}),
+            *_render_table(
+                summary_headers,
+                [project_row, phase_row],
+                {
+                    index
+                    for index, header in enumerate(summary_headers)
+                    if header in RIGHT_ALIGNED_SUMMARY_COLUMNS
+                },
+            ),
             "",
             f"**Phase {phase_id}: {phase_title}**",
             "",

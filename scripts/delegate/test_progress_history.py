@@ -280,8 +280,8 @@ class ProgressHistoryTests(unittest.TestCase):
             [
                 "**bevy_hana_rubric - feature/rubric**",
                 "",
-                "| Scope   |   % | Elapsed  | ETA         | Unchanged | ETA low              | ETA high             |",
-                "| ------- | --: | -------- | ----------- | --------- | -------------------- | -------------------- |",
+                "| Scope   |   % |  Elapsed |         ETA | Unchanged |              ETA low |             ETA high |",
+                "| ------- | --: | -------: | ----------: | --------- | -------------------: | -------------------: |",
                 "| Project |  80 | 00:01:40 | today 05:35 |           | today 05:35 (-00:00) | today 05:35 (+00:00) |",
                 "| Phase 3 |  25 | 00:01:40 | today 05:40 |           | today 05:36 (-00:03) | today 05:46 (+00:06) |",
                 "",
@@ -514,7 +514,7 @@ class ProgressHistoryTests(unittest.TestCase):
             at=ad_hoc_start + 10,
         )
         self.assertIn("| Project |  40 | 1 day 03:30:10 ", header)
-        self.assertIn("| Phase 3 |  10 | 00:00:10 ", header)
+        self.assertIn("| Phase 3 |  10 |       00:00:10 |", header)
 
     def test_the_clock_line_names_the_armed_timer_then_falls_back_to_the_interval(
         self,
@@ -1424,7 +1424,7 @@ class ProgressHistoryTests(unittest.TestCase):
             at=80_000,
         )
         self.assertIn("| Project |  10 | 22:13:20 | 1970-01-10 06:13 |", header)
-        self.assertIn("| Phase 3 |  50 | 02:46:40 | tomorrow 01:00 ", header)
+        self.assertIn("| Phase 3 |  50 | 02:46:40 |   tomorrow 01:00 |", header)
 
 
     def test_the_eta_band_brackets_the_arrival_and_names_its_own_swing(self) -> None:
@@ -1460,7 +1460,7 @@ class ProgressHistoryTests(unittest.TestCase):
             header,
         )
         self.assertIn(
-            "| tomorrow 00:04 (-00:55)    | tomorrow 02:23 (+01:23)    |",
+            "|    tomorrow 00:04 (-00:55) |    tomorrow 02:23 (+01:23) |",
             header,
         )
 
