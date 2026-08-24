@@ -49,14 +49,13 @@ effect on the next run of each consumer; nothing needs restarting.
 
 | Check | Runs | Where it applies |
 |---|---|---|
-| `cache` | reuse a fresh cargo-port lint-run | `/clippy` STEP 1 |
-| `mend` | `cargo mend` check pass and `--fix` | `/clippy` STEP 2/3 · `invoke.sh mend` (lint CLI, clean-fix, validate_ci mend steps) |
-| `style_review` | style-guide walk over the uncommitted diff | `/clippy` STEP 4 · `/plan:delegate` phase-end gate |
-| `clippy` | `cargo clippy` | `/clippy` STEP 5 · `invoke.sh clippy` (lint CLI, clean-fix, `verify.sh lint <pkg>`) |
-| `doc` | `cargo doc -D warnings` | `/clippy` STEP 5b · `invoke.sh doc` (`lint doc`) |
-| `fmt` | `cargo +nightly fmt` | `/clippy` STEP 8 · `invoke.sh fmt` (`lint fmt`, `verify.sh lint`/`fmt`/`final`) |
+| `mend` | `cargo mend` check pass and `--fix` | `/clippy` mend check/fix · `invoke.sh mend` (lint CLI, clean-fix, validate_ci mend steps) |
+| `style_review` | style-guide walk over the uncommitted diff | `/clippy` style review · `/plan:delegate` phase-end gate |
+| `clippy` | `cargo clippy` | `/clippy` clippy stage · `invoke.sh clippy` (lint CLI, clean-fix, `verify.sh lint <pkg>`) |
+| `doc` | `cargo doc -D warnings` | `/clippy` doc stage · `invoke.sh doc` (`lint doc`) |
+| `fmt` | `cargo +nightly fmt` | `/clippy` format stage · `invoke.sh fmt` (`lint fmt`, `verify.sh lint`/`fmt`/`final`) |
 
-The two consumers: the `/clippy` skill (reads the file at STEP 0 of every run,
+The two consumers: the `/clippy` skill (reads the file at the start of every run,
 including runs started by `/commit_prep` or a `/plan:delegate` work order) and
 `scripts/lint/invoke.sh` — the sourced bottom layer that the `lint` CLI,
 `scripts/delegate/verify.sh`, and `scripts/clean-fix/clean-fix.sh` all flow

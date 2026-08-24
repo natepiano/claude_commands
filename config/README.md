@@ -30,8 +30,8 @@ per-consumer override — `clippy=off` means cargo clippy does not run in the
 Use `/lint_config` to view or change them. The three consumers read it on their
 next run, so a change is immediate:
 
-- the `/clippy` skill, at STEP 0 — including runs started by `/commit_prep` or
-  a `/plan:delegate` work order
+- the `/clippy` skill, at the start of every run — including runs started by
+  `/commit_prep` or a `/plan:delegate` work order
 - `scripts/delegate/verify.sh` — the `lint`, `fmt`, and `final` arms
 - `scripts/clean-fix/clean-fix.sh` — the mend stage
 
