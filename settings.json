@@ -167,7 +167,7 @@
     ]
   },
   "alwaysThinkingEnabled": true,
-  "autoCompactWindow": 258000,
+  "autoCompactWindow": 283800,
   "askUserQuestionTimeout": "never",
   "tui": "fullscreen",
   "skipDangerousModePermissionPrompt": true,
