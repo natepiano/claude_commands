@@ -223,19 +223,24 @@ reject unsupported or optional changes, then write validated proposals to
 
 `Class` is `apply` or `gate`, and it decides whether the user is asked. This file
 is a backlog: writing an item into it commits nobody to building it, and the
-decision that matters happens later, when an item is scheduled into a phase. What
-earns a gate is destroying or rewriting a record the user may have already read —
-not creating one.
+decision that matters happens later, when an item is scheduled into a phase.
+Rewriting a backlog record so it describes the code that now exists is the same
+operation `/plan:shrink` and `/plan:to_as_built` perform on completed phases — an
+as-built correction, never a decision. What earns a gate is a judgment about what
+is worth doing, not the maintenance of a record.
 
-A proposal is **`apply`** when it is purely additive or purely factual: any `add`,
-and any `amend` that only makes an existing item agree with code that has already
-shipped while leaving it asking for exactly the work it asked for before — a
-drifted file or line reference, a stated dependency this phase satisfied, a named
-consequence this phase created, a claim this phase falsified.
+A proposal is **`apply`** when the shipped code decides it: any `add`; any
+`amend`, however large — a drifted file or line reference, a re-key onto a type
+this phase introduced, a re-target at the crate that now owns the work, a
+capability moved out because a phase absorbed it, a restatement of what would
+satisfy the item now that the surrounding code has changed; and any `remove` the
+shipped code has already satisfied. An `amend` is never gated for changing what
+the item asks for.
 
-A proposal is **`gate`** when it removes or rewrites what is already recorded: any
-`remove`, and any `amend` that changes what the item asks for, what would satisfy
-it, or what it targets. When the split is genuinely unclear, `gate`.
+A proposal is **`gate`** only when it rests on judgment rather than evidence: a
+`remove` proposed because the work looks not worth doing, out of scope, or
+superseded by a direction nobody has taken yet. When the split is genuinely
+unclear, `apply` — a wrong backlog edit is one line to revert.
 
 **A defect in what this phase just shipped is never an `add`.** It is a
 current-phase defect: under `/plan:delegate` return it to <Synthesize/>, and

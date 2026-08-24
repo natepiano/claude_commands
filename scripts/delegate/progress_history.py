@@ -110,6 +110,43 @@ def _now_epoch() -> float:
     return time.time()
 
 
+# The report interval lives in delegate.conf, the same file progress_timer.sh
+# reads, so the next tick this header names and the timer that actually fires
+# can never disagree. `PLAN_DELEGATE_CONFIG` overrides the path so the tests
+# read a fixture rather than the machine's live settings.
+DEFAULT_CONFIG_PATH = Path("~/.claude/config/delegate.conf").expanduser()
+PROGRESS_INTERVAL_KEY = "PLAN_DELEGATE_PROGRESS_INTERVAL_SECONDS"
+TIMER_MARKER_FILENAME = "progress_timer"
+
+
+def _config_path() -> Path:
+    configured = os.environ.get("PLAN_DELEGATE_CONFIG")
+    return Path(configured) if configured else DEFAULT_CONFIG_PATH
+
+
+def _progress_interval_seconds() -> int | None:
+    """Configured seconds between reports, or None when the key is unusable.
+
+    A report is not a timer, so an unusable interval drops the next-tick clause
+    instead of stopping the header. progress_timer.sh reads the same key and is
+    the caller that fails loudly on it.
+    """
+    try:
+        config_text = _config_path().read_text(encoding="utf-8")
+    except OSError:
+        return None
+    for line in config_text.splitlines():
+        key, separator, value = line.split("#", 1)[0].strip().partition("=")
+        if not separator or key.strip() != PROGRESS_INTERVAL_KEY:
+            continue
+        try:
+            parsed = int(value.strip())
+        except ValueError:
+            return None
+        return parsed if parsed > 0 else None
+    return None
+
+
 PASS_OWNER_ENV = "PLAN_DELEGATE_PASS_OWNER"
 PASS_OWNER_TOKEN = "launcher"
 
@@ -1317,10 +1354,76 @@ def _prefixed_decision(scope: str, decision: dict[str, object]) -> dict[str, obj
     return {f"{scope}_{key}": value for key, value in decision.items()}
 
 
+def _eta_seconds(percent: int, elapsed: int) -> int | None:
+    """Project the time left by extending the rate the clock has run so far.
+
+    Percent over elapsed is the only rate both scopes share. For the project the
+    percent comes from the plan's phase counts, so this is exactly "mean time per
+    phase so far, times the phases left"; for the phase it inherits whatever
+    accuracy the reporter's estimate has and claims nothing more. Both are read
+    off the number the same line displays, capped value included, so the estimate
+    never contradicts the percentage sitting beside it.
+    """
+    if percent <= 0 or percent >= 100 or elapsed <= 0:
+        return None
+    return int(elapsed * (100 - percent) / percent)
+
+
 def _assessment_line(percent: int, elapsed: int, unchanged: int) -> str:
     line = f"**{percent}% complete - elapsed {_format_duration(elapsed)}"
+    eta = _eta_seconds(percent, elapsed)
+    if eta is not None:
+        line += f" - eta {_format_duration(eta)}"
     if unchanged > 0:
         line += f" - unchanged {_format_duration(unchanged)}"
+    return line + "**"
+
+
+def _next_report_at(session_dir: Path, now: float) -> float | None:
+    """When the next progress report is due, in epoch seconds.
+
+    progress_timer.sh clears its marker as it ticks, so at the usual reporting
+    moment -- after the tick, before the next timer is armed -- no marker exists
+    and the configured interval supplies the answer. A marker still present and
+    still ahead of the clock is a timer genuinely armed right now, and that
+    deadline beats an interval added to the current time.
+    """
+    try:
+        marker_text = (session_dir / TIMER_MARKER_FILENAME).read_text(encoding="utf-8")
+    except OSError:
+        marker_text = ""
+    for line in marker_text.splitlines():
+        key, separator, value = line.partition("=")
+        if not separator or key.strip() != "deadline_epoch":
+            continue
+        try:
+            deadline = float(value.strip())
+        except ValueError:
+            break
+        if deadline > now:
+            return deadline
+        break
+    interval = _progress_interval_seconds()
+    return now + interval if interval is not None else None
+
+
+def _clock_line(now: float, next_report_at: float | None) -> str:
+    """Anchor the durations above to wall-clock time and name the next report.
+
+    Every other number in the header is a duration, which says how long but
+    never when. This line is the one place a reader can tell whether the report
+    they are looking at is current and how long until the next one lands.
+    """
+    now_local = datetime.fromtimestamp(now)
+    line = f"**now {now_local:%Y-%m-%d %H:%M:%S}"
+    if next_report_at is not None:
+        next_local = datetime.fromtimestamp(next_report_at)
+        stamp = (
+            f"{next_local:%H:%M:%S}"
+            if next_local.date() == now_local.date()
+            else f"{next_local:%Y-%m-%d %H:%M:%S}"
+        )
+        line += f" - next report {stamp}"
     return line + "**"
 
 
@@ -1477,9 +1580,11 @@ def _progress(args: argparse.Namespace) -> None:
     phase_elapsed = max(0, int(now - _number(phase.get("started_at"), now)))
     pass_elapsed = max(0, int(now - _number(current_pass.get("started_at"), now)))
     total_elapsed = max(0, int(now - _number(state.get("project_started_at"), now)))
+    next_report_at = _next_report_at(session_dir, now)
     event = _event(state, "progress_reported", now)
     event.update(
         {
+            "next_report_at": next_report_at,
             "raw_percent": phase_raw_percent,
             "percent": phase_percent,
             "same_percent_started_at": phase_percent_started_at,
@@ -1535,6 +1640,7 @@ def _progress(args: argparse.Namespace) -> None:
             f"**Phase {phase_id}: {phase_title}**",
             _assessment_line(phase_percent, phase_elapsed, phase_unchanged_seconds),
             pass_line,
+            _clock_line(now, next_report_at),
         ]
     else:
         legacy_progress_line = f"**{phase_percent}% complete"
@@ -1549,6 +1655,7 @@ def _progress(args: argparse.Namespace) -> None:
             pass_line,
             legacy_progress_line,
             f"**Total elapsed {_format_duration(total_elapsed)}**",
+            _clock_line(now, next_report_at),
         ]
     print("\n".join(lines))
 

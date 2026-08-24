@@ -412,12 +412,50 @@ On a Claude timer notification or Codex poll timeout:
    value. The recorder refreshes any legacy run whose project clock was not
    script-resolved. Copy the resulting Markdown header exactly. Durations below
    one day are always `HH:MM:SS`; longer durations are
-   `<days> day(s) HH:MM:SS`.
-5. Add one or two ordinary-English sentences covering current activity,
-   material work now present, and what remains. Do not paste logs or filenames.
-   Never quantify the work in lines of code, insertions, or file counts: the
-   user can already see the diff, so a line total displaces the one thing only
-   the reporter knows — what the code now does.
+   `<days> day(s) HH:MM:SS`. Its last line is the wall clock — `now` and the
+   next report time, both computed by the recorder from the same interval the
+   timer uses. Never write, adjust, or drop that line by hand.
+5. Add two or three ordinary-English sentences covering current activity,
+   material work now present, and what remains.
+
+   **Open by saying what this phase gives the person using the tool, then report
+   the movement on it.** Under <UserFacingText/> this report is read cold: the
+   user is doing something else, reads one update out of a long scroll, and
+   reads it the morning after. It re-orients every time, and it never spends the
+   design's own vocabulary — `edge`, `ancestry`, `stale marker`, a type name, the
+   plan's name for a subsystem — on a reader who has not opened the plan doc.
+   Those words look like English from inside the work, which is why they slip
+   through; that file's banned list covers them.
+
+   One topic per sentence, no sentence carrying more than two clauses. When a
+   topic holds more than two items, give the count and what they have in common
+   rather than chaining them; the same ceiling applies to lists of tests, files,
+   or checks. An accurate sentence the user has to read twice has failed at its
+   one job.
+
+   Not this:
+
+   ```text
+   The repair pass has landed its production changes: an edge whose successor
+   has already ended now reports as ended rather than still waiting on its
+   predecessor, ancestry questions are narrowed to the reservations that
+   actually have something ordered after them, and an unrelated missing commit
+   no longer poisons a whole batch of ancestry answers.
+   ```
+
+   This:
+
+   ```text
+   This phase lets one worktree's work be ordered behind another's — start here
+   only once that branch is done. The repair pass fixed four cases where the
+   tool gave the wrong answer about whether the waiting side was still blocked.
+   Tests for that ordering come next, then verification.
+   ```
+
+   Do not paste logs or filenames. Never quantify the work in lines of code,
+   insertions, or file counts: the user can already see the diff, so a line
+   total displaces the one thing only the reporter knows — what the code now
+   does.
 6. Apply <EarlyReviewArm/>: the evidence steps 2-3 just gathered is its input,
    and this tick is its only trigger point.
 7. If the dispatch remains active, Claude reads the interval again, launches a
@@ -1211,28 +1249,35 @@ observable outcome against `${NEXT_ITEMS_PATH}` and `${NEXT_ITEMS_PENDING}`.
 **Then split the proposals into `apply` and `gate`.** The gate costs the user a
 turn, so it is spent only where there is something to decide. This file is a
 backlog: writing an item into it commits nobody to building it, and the decision
-that matters happens later, when an item is scheduled into a phase. What earns a
-gate here is destroying or rewriting a record the user may have already read —
-not creating one.
+that matters happens later, when an item is scheduled into a phase. Rewriting a
+backlog record so it describes the code that now exists is the same operation
+`/plan:shrink` and `/plan:to_as_built` perform on completed phases — an as-built
+correction, never a decision. What earns a gate here is a judgment about what is
+worth doing, not the maintenance of a record.
 
-A proposal is **`apply`** — do it now, do not ask — when it is purely additive or
-purely factual:
+A proposal is **`apply`** — do it now, do not ask — when the shipped code decides
+it:
 
 - Any `add`. A new backlog item records that something may be worth doing. It
   changes no phase, no schedule, and no commitment.
-- An `amend` that only makes an existing item agree with code that has already
-  shipped, leaving it asking for exactly the work it asked for before: a drifted
-  file or line reference, a stated dependency the completed phase satisfied, a
-  named consequence the completed phase created, a claim the completed phase
-  falsified. Cite the evidence in the one-line report and move on.
+- Any `amend`. A drifted file or line reference, a re-key onto a type a phase
+  introduced, a re-target at the crate that now owns the work, a capability
+  moved out because a phase absorbed it, a restatement of what would satisfy the
+  item now that the surrounding code has changed — all of it is as-built
+  maintenance of a record nobody has committed to building. Cite the evidence in
+  the one-line report and move on. An `amend` is never gated for being large,
+  for changing what the item asks for, or for changing what would satisfy it.
+- A `remove` the shipped code has already satisfied. The item asked for
+  something that now exists; deleting it records that fact.
 
-A proposal is **`gate`** — ask the user — when it removes or rewrites what is
-already recorded: any `remove`, and any `amend` that changes what the item asks
-for, what would satisfy it, or what it targets. Deleting a candidate and
-redefining one are the user's calls; nothing here may make them.
+A proposal is **`gate`** — ask the user — only when it rests on judgment rather
+than evidence: a `remove` proposed because the work looks not worth doing, out
+of scope, or superseded by a direction nobody has taken yet. That is a product
+call and nothing here may make it.
 
-When the split is genuinely unclear, gate it. Never write a `gate` proposal to
-the repository without approval.
+When the split is genuinely unclear, apply it — a wrong backlog edit is one line
+to revert, and every item is re-read before it is ever scheduled. Never write a
+`gate` proposal to the repository without approval.
 
 **A defect in what this phase just shipped is never an `add`.** Filing it as
 future work converts a fix into a backlog entry the user must later approve, read,

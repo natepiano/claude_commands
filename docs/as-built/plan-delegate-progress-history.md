@@ -227,6 +227,27 @@ that status, and only while a pass is open.
 
 `progress` writes the event and prints the project section, one blank line, then
 the phase/pass section used by `/plan:delegate`. Project and phase percentages
-have independent unchanged timers. `aggregate` calibrates phase estimates by
+have independent unchanged timers. Each also carries an `eta`, the elapsed clock
+extended across what the displayed percentage says remains; it is omitted at 0
+and 100, where there is no rate to extend or nothing left to extend it over. The
+pass line has none — a fix is a sub-phase with no percentage of its own. Because
+the projection reads the same capped number the line displays, it never
+contradicts the percentage beside it, and it inherits that number's accuracy:
+derived phase counts for the project, the reporter's estimate for the phase.
+
+The last line is the wall clock: `now <local timestamp>` and, when it can be
+resolved, `next report <time>` — the date is repeated there only when the next
+tick lands on a later day. Every other number in the header is a duration, which
+says how long but never when; this line is what tells a reader whether the report
+in front of them is current and how long until the next one. The next tick comes
+from `${SESSION_DIR}/progress_timer` when a timer is armed and its deadline is
+still ahead, and otherwise from `PLAN_DELEGATE_PROGRESS_INTERVAL_SECONDS` in
+`delegate.conf` — the same key `progress_timer.sh` reads, so the reported time and
+the timer that fires cannot disagree. At the usual reporting moment the marker is
+already gone, because the timer clears it as it ticks and the next one is armed
+only at the end of the turn, so the interval is the ordinary source. An unusable
+interval drops the clause instead of stopping the header: a report is not a timer,
+and `progress_timer.sh` is the caller that fails loudly on that key.
+`aggregate` calibrates phase estimates by
 raw percentage and pass kind and emits raw/suggested/reported error plus
 decision-source counts as JSON suitable for further analysis.

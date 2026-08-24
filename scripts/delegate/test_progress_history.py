@@ -21,6 +21,7 @@ class ProgressHistoryTests(unittest.TestCase):
     root: Path  # pyright: ignore[reportUninitializedInstanceVariable]
     history_dir: Path  # pyright: ignore[reportUninitializedInstanceVariable]
     working_dir: Path  # pyright: ignore[reportUninitializedInstanceVariable]
+    config_file: Path  # pyright: ignore[reportUninitializedInstanceVariable]
 
     @override
     def setUp(self) -> None:
@@ -29,6 +30,11 @@ class ProgressHistoryTests(unittest.TestCase):
         self.history_dir = self.root / "history"
         self.working_dir = self.root / "bevy_hana_rubric"
         self.working_dir.mkdir()
+        # Pin the report interval and the timezone: without both, the clock line
+        # renders from the machine's own delegate.conf and local offset, and the
+        # expected header would differ per machine.
+        self.config_file = self.root / "delegate.conf"
+        self.write_interval(180)
         _ = subprocess.run(
             ["git", "init", "-b", "feature/rubric"],
             cwd=self.working_dir,
@@ -41,9 +47,17 @@ class ProgressHistoryTests(unittest.TestCase):
     def tearDown(self) -> None:
         self.temporary.cleanup()
 
+    def write_interval(self, seconds: object) -> None:
+        _ = self.config_file.write_text(
+            f"PLAN_DELEGATE_PROGRESS_INTERVAL_SECONDS={seconds}\n",
+            encoding="utf-8",
+        )
+
     def run_command(self, *arguments: str, at: int) -> str:
         environment = os.environ.copy()
         environment["PLAN_DELEGATE_HISTORY_DIR"] = str(self.history_dir)
+        environment["PLAN_DELEGATE_CONFIG"] = str(self.config_file)
+        environment["TZ"] = "UTC"
         environment["PLAN_DELEGATE_NOW_EPOCH"] = str(at)
         environment["PLAN_DELEGATE_PASS_OWNER"] = "launcher"
         result = subprocess.run(
@@ -58,6 +72,8 @@ class ProgressHistoryTests(unittest.TestCase):
     def run_failing_command(self, *arguments: str, at: int) -> subprocess.CompletedProcess[str]:
         environment = os.environ.copy()
         environment["PLAN_DELEGATE_HISTORY_DIR"] = str(self.history_dir)
+        environment["PLAN_DELEGATE_CONFIG"] = str(self.config_file)
+        environment["TZ"] = "UTC"
         environment["PLAN_DELEGATE_NOW_EPOCH"] = str(at)
         environment["PLAN_DELEGATE_PASS_OWNER"] = "launcher"
         return subprocess.run(
@@ -247,11 +263,12 @@ class ProgressHistoryTests(unittest.TestCase):
             header.splitlines(),
             [
                 "**bevy_hana_rubric - feature/rubric**",
-                "**80% complete - elapsed 00:01:40**",
+                "**80% complete - elapsed 00:01:40 - eta 00:00:25**",
                 "",
                 "**Phase 3: Retry handling**",
-                "**25% complete - elapsed 00:01:40**",
+                "**25% complete - elapsed 00:01:40 - eta 00:05:00**",
                 "**Fix 2 - correcting retry recovery - elapsed 00:01:30**",
+                "**now 1970-01-01 05:35:00 - next report 05:38:00**",
             ],
         )
 
@@ -282,11 +299,11 @@ class ProgressHistoryTests(unittest.TestCase):
             at=started_at + 160,
         )
         self.assertIn(
-            "**80% complete - elapsed 00:02:40 - unchanged 00:01:00**",
+            "**80% complete - elapsed 00:02:40 - eta 00:00:40 - unchanged 00:01:00**",
             unchanged_header,
         )
         self.assertIn(
-            "**25% complete - elapsed 00:02:40 - unchanged 00:01:00**",
+            "**25% complete - elapsed 00:02:40 - eta 00:08:00 - unchanged 00:01:00**",
             unchanged_header,
         )
 
@@ -316,9 +333,9 @@ class ProgressHistoryTests(unittest.TestCase):
             "correcting retry recovery",
             at=started_at + 180,
         )
-        self.assertIn("**85% complete - elapsed 00:03:00**", independently_changed)
+        self.assertIn("**85% complete - elapsed 00:03:00 - eta 00:00:31**", independently_changed)
         self.assertIn(
-            "**25% complete - elapsed 00:03:00 - unchanged 00:01:20**",
+            "**25% complete - elapsed 00:03:00 - eta 00:09:00 - unchanged 00:01:20**",
             independently_changed,
         )
 
@@ -392,6 +409,7 @@ class ProgressHistoryTests(unittest.TestCase):
                 "**Fix 2 - correcting retry recovery - elapsed 00:01:30**",
                 "**20% complete**",
                 "**Total elapsed 00:01:40**",
+                "**now 1970-01-01 05:35:00 - next report 05:38:00**",
             ],
         )
 
@@ -468,8 +486,70 @@ class ProgressHistoryTests(unittest.TestCase):
             "implementing",
             at=ad_hoc_start + 10,
         )
-        self.assertIn("**40% complete - elapsed 1 day 03:30:10**", header)
-        self.assertIn("**10% complete - elapsed 00:00:10**", header)
+        self.assertIn("**40% complete - elapsed 1 day 03:30:10 - eta 1 day 17:15:15**", header)
+        self.assertIn("**10% complete - elapsed 00:00:10 - eta 00:01:30**", header)
+
+    def test_the_clock_line_names_the_armed_timer_then_falls_back_to_the_interval(
+        self,
+    ) -> None:
+        started_at = 20_000
+        session_dir = self.start_run("clock", started_at)
+        self.start_phase_and_pass(session_dir, started_at)
+
+        # A timer armed and still ahead of the clock is the real next tick, so
+        # its deadline wins over the interval added to the current time.
+        _ = (session_dir / "progress_timer").write_text(
+            f"deadline_epoch={started_at + 400}\npid=1234\ninterval_seconds=600\n",
+            encoding="utf-8",
+        )
+        armed = self.run_progress(session_dir, at=started_at + 100)
+        self.assertIn("**now 1970-01-01 05:35:00 - next report 05:40:00**", armed)
+
+        # progress_timer.sh clears the marker as it ticks, and an expired one
+        # left behind names a tick that has already happened. Both fall through
+        # to the configured interval.
+        _ = (session_dir / "progress_timer").write_text(
+            f"deadline_epoch={started_at + 50}\npid=1234\ninterval_seconds=600\n",
+            encoding="utf-8",
+        )
+        expired = self.run_progress(session_dir, at=started_at + 100)
+        self.assertIn("**now 1970-01-01 05:35:00 - next report 05:38:00**", expired)
+
+        (session_dir / "progress_timer").unlink()
+        self.write_interval(90_000)
+        crosses_midnight = self.run_progress(session_dir, at=started_at + 100)
+        self.assertIn(
+            "**now 1970-01-01 05:35:00 - next report 1970-01-02 06:35:00**",
+            crosses_midnight,
+        )
+
+        # An unusable interval degrades the clause rather than stopping the
+        # header: the report is not the timer, and progress_timer.sh is the
+        # caller that fails loudly on the same key.
+        self.write_interval("not-a-number")
+        unusable = self.run_progress(session_dir, at=started_at + 100)
+        self.assertIn("**now 1970-01-01 05:35:00**", unusable)
+        self.assertNotIn("next report", unusable)
+
+    def run_progress(self, session_dir: Path, at: int) -> str:
+        return self.run_command(
+            "progress",
+            "--session-dir",
+            str(session_dir),
+            "--project-raw-percent",
+            "40",
+            "--project-percent",
+            "40",
+            "--phase-raw-percent",
+            "30",
+            "--phase-percent",
+            "30",
+            "--cap-stage",
+            "implementation",
+            "--activity",
+            "implementing",
+            at=at,
+        )
 
     def test_start_run_persists_the_plan_git_time_without_an_agent_timestamp(
         self,
@@ -675,6 +755,8 @@ class ProgressHistoryTests(unittest.TestCase):
         """Invoke the recorder the way a caller outside a launcher would."""
         environment = os.environ.copy()
         environment["PLAN_DELEGATE_HISTORY_DIR"] = str(self.history_dir)
+        environment["PLAN_DELEGATE_CONFIG"] = str(self.config_file)
+        environment["TZ"] = "UTC"
         environment["PLAN_DELEGATE_NOW_EPOCH"] = str(at)
         _ = environment.pop("PLAN_DELEGATE_PASS_OWNER", None)
         return subprocess.run(
@@ -834,6 +916,54 @@ class ProgressHistoryTests(unittest.TestCase):
         self.assertEqual(progress_event["suggested_percent"], 25)
         self.assertEqual(progress_event["suggested_adjustment_percentage_points"], -40)
         self.assertEqual(progress_event["reported_adjustment_percentage_points"], -30)
+
+
+    def test_eta_is_omitted_at_both_endpoints(self) -> None:
+        """0% offers no rate to extend, and 100% leaves nothing to extend it over."""
+        started_at = 40_000
+        session_dir = self.start_run("endpoints", started_at)
+        self.start_phase_and_pass(session_dir, started_at)
+        unstarted = self.run_command(
+            "progress",
+            "--session-dir",
+            str(session_dir),
+            "--project-raw-percent",
+            "0",
+            "--project-percent",
+            "0",
+            "--phase-raw-percent",
+            "0",
+            "--phase-percent",
+            "0",
+            "--cap-stage",
+            "implementation",
+            "--activity",
+            "reading the work order",
+            at=started_at + 100,
+        )
+        self.assertIn("**0% complete - elapsed 00:01:40**", unstarted)
+        self.assertNotIn("eta", unstarted)
+
+        finished = self.run_command(
+            "progress",
+            "--session-dir",
+            str(session_dir),
+            "--project-raw-percent",
+            "100",
+            "--project-percent",
+            "100",
+            "--phase-raw-percent",
+            "100",
+            "--phase-percent",
+            "100",
+            "--cap-stage",
+            "complete",
+            "--activity",
+            "closing the phase",
+            at=started_at + 200,
+        )
+        self.assertIn("**100% complete - elapsed 00:03:20**", finished)
+        self.assertNotIn("eta", finished)
 
 
 class PhaseCountTests(unittest.TestCase):

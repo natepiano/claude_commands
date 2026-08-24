@@ -34,6 +34,13 @@ own earlier reasoning. Owning the project, requesting the review, or having
 approved a related feature is not knowledge of a concept. A reference the user
 has never seen is invisible to them.
 
+**A report that repeats on a timer is read cold.** Progress updates arrive while
+the user is doing something else, are read one at a time out of a long scroll,
+and are read the morning after. Nothing an earlier update or briefing
+established carries into this one: vocabulary does not accumulate across
+updates, and a term defined three updates ago is undefined again here. Each one
+re-orients before it reports, or it does not land.
+
 ## Build order — one rule at three scales
 
 Build from what the reader already holds toward what they do not.
@@ -83,6 +90,13 @@ for application code, or leave it absent?
   drive a real screen"; `bind group` becomes what the data connection does.
 - Internal bookkeeping (`fix pass 1 of 10`) as a headline. State the constraint
   in ordinary words where it matters.
+- The design's own nouns — what a structure is built from (`edge`, `node`,
+  `marker`, `ancestry`), the project's name for a subsystem, a type or trait
+  name. From inside the design these read as ordinary words; from outside they
+  read as nothing at all, and the user did not read the source document. Say the
+  situation the thing exists for, or define the noun where it appears. Being the
+  vocabulary of the work in progress is what makes these easy to miss: they do
+  not look like the terms on this list, they look like English.
 
 Test: if you cannot say what it means in behavior terms, you do not understand
 it well enough to present it. Read the code until you can.
