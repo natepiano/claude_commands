@@ -146,14 +146,18 @@ does.
 - Never stop or delay work for compaction. Claude resumes from a live-dispatch
   notification; Codex remains in <CodexDispatchWait/>.
 - After compaction, re-read this command in full, then the handoff. Restore live
-  dispatches and state; delete the handoff after its phase is committed.
+  dispatches and state; delete the handoff after its phase is committed. A
+  dispatch the handoff records as live but that is gone did not survive: resolve
+  it per <FixDispatch/> before trusting any state it was supposed to have written.
 - A real user decision may still end the turn after the Stop hook's one retry.
 </CompactionContract>
 
 <UserFacingText>
 For every briefing, decision, progress update, review result, and report, read
 and follow `~/.claude/docs/user_facing_explanation.md`. Reconstruct context for
-the user; do not pass through internal review or tooling vocabulary.
+the user; do not pass through internal review or tooling vocabulary. Never
+measure work in lines of code, insertions, or file counts anywhere in that text
+— describe what the code does, not how much of it there is.
 </UserFacingText>
 
 <ExplainOnDemand>
@@ -268,6 +272,7 @@ Use `python3 ~/.claude/scripts/delegate/findings.py <command> --session-dir
 | `status` | read the ledger for closure review |
 | `gate` | get `converged`, `dispatch`, or `stop`, plus batch and reason |
 | `dispatch --covers F001,F002,...` | record one complete repair batch |
+| `abandon --reason <r> [--edits-landed]` | a dispatched repair died; reopen its batch |
 | `verdict --id F001 --state <accepted\|still_open\|reopened> [--evidence <e>]` | record closure evidence |
 | `override --reason <the user's own words>` | clear one wrong `stop` |
 
@@ -288,6 +293,22 @@ Report the stop and its evidence, get the user's explicit decision, then record
 `override --reason "<their words>"`. The override names the one stop reason it
 clears, is spent by the round it authorizes, and is appended beside the stop it
 corrects. A stop the evidence supports is never overridden; find the real defect.
+
+**Dispatching a repair fixes nothing.** `dispatch` leaves its batch
+`repair_in_flight`, and exactly two things resolve that state: `implement.sh`
+records `landed` when its worker exits cleanly, and `abandon --reason "<how it
+ended>"` reopens the batch when the repair died instead. Both `gate` and `verdict`
+refuse a finding still in flight, so a repair that never finished cannot reach a
+reviewer pre-labelled as fixed and be confirmed on that label alone.
+
+The main agent owns `abandon` and nothing else here — `landed` belongs to the
+launcher, the only party that watches the worker exit. Whenever a fix dispatch
+ends without `impl_status` reaching `implemented` — the user stopped it, the
+process was killed, the session was interrupted — run `abandon` before any other
+workflow step, and say in one line what died and that the findings are open again.
+Pass `--edits-landed` only when repair edits are actually in the tree; without it
+the attempt is refunded, because a repair that never ran must not spend the budget
+that decides when this phase stops.
 </FindingsLedger>
 
 <PassOwnership>
@@ -303,6 +324,11 @@ The one exception is a launcher the main agent killed — the <DualReview/>
 preemption. Its pass stays open because the process died before recording, so
 close it with `finish-pass --status canceled --orphaned-launcher`, which the
 recorder accepts only for `canceled` and only while a pass is actually open.
+
+A dead launcher usually leaves two records open, not one. If it was a fix
+dispatch, its findings are still `repair_in_flight` for the same reason its pass
+is still open — the process died before anything observed how it ended — so
+`findings.py abandon` per <FindingsLedger/> belongs beside this call.
 
 Phase records are the main agent's, and both belong at the real boundary:
 `finish-phase` for the outgoing phase and `start-phase` for the incoming one run
@@ -389,6 +415,9 @@ On a Claude timer notification or Codex poll timeout:
    `<days> day(s) HH:MM:SS`.
 5. Add one or two ordinary-English sentences covering current activity,
    material work now present, and what remains. Do not paste logs or filenames.
+   Never quantify the work in lines of code, insertions, or file counts: the
+   user can already see the diff, so a line total displaces the one thing only
+   the reporter knows — what the code now does.
 6. Apply <EarlyReviewArm/>: the evidence steps 2-3 just gathered is its input,
    and this tick is its only trigger point.
 7. If the dispatch remains active, Claude reads the interval again, launches a
@@ -780,13 +809,29 @@ diff already covers essentially all Work Order (or fix batch) files. Below
 At ≥75%, in the same tick:
 
 1. Increment `${REVIEW_PASS}` now; <DualReview/> will not increment it again.
-2. Apply <ReviewDiffContract/> to the current partial tree. The delegate has
+2. **Delete every stale delivery artifact and prove they are gone.**
+   `${SESSION_DIR}` spans the whole run but `${REVIEW_PASS}` resets with every
+   phase, so earlier phases' `final_diff_*.diff` and `final_diff_*.ready` are
+   already on disk under the exact names this phase's launches will poll.
+   `rm -f "${SESSION_DIR}"/final_diff_*.diff "${SESSION_DIR}"/final_diff_*.ready`
+   — the whole glob, not just the current index, because later passes in this
+   phase collide the same way — then confirm no sentinel remains before
+   continuing. Skipping this does not fail loudly, and it does two separate
+   kinds of damage. The reviewer's poll succeeds instantly, so it reads a
+   previous phase's diff as if it were this phase's finished code and returns a
+   confident, entirely false blocker saying the phase implemented nothing. And
+   because the sentinel is what releases `review.sh` to call `start-pass`, the
+   review pass opens while the implementation is still running: the recorder
+   closes the live implementation pass as `interrupted`, and every later
+   `progress` call in that phase is refused for having no active window. The
+   delivery step below then overwrites the diff a reviewer has already read.
+3. Apply <ReviewDiffContract/> to the current partial tree. The delegate has
    named no created files yet, so that check is vacuous; the snapshot is
    expected to be incomplete.
-3. Write the applicable early-form prompt — <BroadReviewPrompt/> for pass 1,
+4. Write the applicable early-form prompt — <BroadReviewPrompt/> for pass 1,
    <ClosureReview/> for a fix — including the completion estimate, the partial
    diff, and the exact final-diff and ready-sentinel paths below.
-4. Launch `review.sh` exactly as <DualReview/> step 3 does, appending one extra
+5. Launch `review.sh` exactly as <DualReview/> step 3 does, appending one extra
    final argument: `${SESSION_DIR}/final_diff_${REVIEW_PASS}.ready`. Save the
    handle as `${REVIEW_DISPATCH_HANDLE}`, set `EARLY_REVIEW=launched`, and tell
    the user in one line. Do not disturb `${DISPATCH_HANDLE}` or the tick's
@@ -817,6 +862,16 @@ the primary dispatch is still running, report it in one line, clear
 `${REVIEW_DISPATCH_HANDLE}`, and set `EARLY_REVIEW=none`; the primary dispatch
 continues and its review runs synchronously at completion under the next
 `${REVIEW_PASS}` index. The errored pass's numbered artifacts remain.
+
+**Verdict before delivery is void.** An early reviewer that returns findings
+while the primary dispatch is still running reviewed something other than this
+phase's finished code — it cannot have read a diff that does not exist yet.
+Discard its findings entirely rather than reading them as evidence: open nothing
+in the ledger, preempt nothing, and never route its blockers into a fix
+dispatch. Treat it exactly as a reviewer error before delivery, and say in one
+line that the review is being discarded and why. A void verdict is often
+fluent and specific — a stale diff supports confident claims about missing work
+— so the check is the timing, never how convincing the text reads.
 </EarlyReviewArm>
 
 <BroadReviewPrompt>
@@ -987,7 +1042,11 @@ record each verdict without a delegate review. Force normal closure review if
 the repair touched another path or any id remains unclear.
 
 On completion, `implemented` continues as above; `error` reports the fix log,
-records an error outcome, clears the session marker, and stops.
+records an error outcome, clears the session marker, and stops. Both outcomes
+resolve the round in the ledger through the launcher. Any third outcome — the
+dispatch stopped, killed, or gone without `impl_status` reaching either — is the
+main agent's to resolve with `findings.py abandon` per <FindingsLedger/>, before
+reviewing, re-dispatching, or reporting anything about the round.
 </FixDispatch>
 
 <MechanicalGateCleanup>

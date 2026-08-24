@@ -42,6 +42,8 @@ HEARTBEAT_HELPER="${SCRIPT_DIR}/../agents/heartbeat.sh"
 HEARTBEAT_FILE="${SESSION_DIR}/heartbeat.log"
 PROGRESS_HELPER="${SCRIPT_DIR}/progress_history.py"
 PROGRESS_STATE="${SESSION_DIR}/progress_history_state.json"
+FINDINGS_HELPER="${SCRIPT_DIR}/findings.py"
+FINDINGS_STATE="${SESSION_DIR}/findings_state.json"
 HEARTBEAT_INTERVAL_SECS=60
 
 echo "implementing" > "${STATUS_FILE}"
@@ -100,6 +102,14 @@ if [[ "${AGENT_CODE}" -eq 0 ]]; then
       exit 1
     fi
   fi
+  # Only the launcher watches the worker exit, so only the launcher can say a
+  # repair landed. Asking the orchestrator to record it later leaves a gap it can
+  # be killed or compacted inside, and that gap used to resolve as "fixed" --
+  # handing the next review a defect pre-labelled as repaired.
+  if [[ "${PASS_KIND}" == "fix" && -f "${FINDINGS_STATE}" ]]; then
+    python3 "${FINDINGS_HELPER}" landed --session-dir "${SESSION_DIR}" \
+      || echo "ERROR: unable to record the repair round as landed." >&2
+  fi
   bash "${HEARTBEAT_HELPER}" "${HEARTBEAT_FILE}" wrapper "${SUBTASK} agent finished" || true
 else
   echo "error" > "${STATUS_FILE}"
@@ -107,6 +117,13 @@ else
     PLAN_DELEGATE_PASS_OWNER=launcher python3 "${PROGRESS_HELPER}" finish-pass \
       --session-dir "${SESSION_DIR}" --status error \
       || echo "ERROR: unable to record the ${PASS_KIND} pass error." >&2
+  fi
+  # The attempt stands rather than being refunded: a worker that ran and then
+  # failed may have left partial edits behind, and the launcher cannot tell.
+  if [[ "${PASS_KIND}" == "fix" && -f "${FINDINGS_STATE}" ]]; then
+    python3 "${FINDINGS_HELPER}" abandon --session-dir "${SESSION_DIR}" --edits-landed \
+      --reason "the ${SUBTASK} worker exited with code ${AGENT_CODE}" \
+      || echo "ERROR: unable to record the repair round as abandoned." >&2
   fi
   bash "${HEARTBEAT_HELPER}" "${HEARTBEAT_FILE}" wrapper "${SUBTASK} agent exited with code ${AGENT_CODE}" || true
   exit "${AGENT_CODE}"

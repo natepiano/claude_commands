@@ -14,6 +14,10 @@ This ledger replaces the counter with state:
     `converged`, `dispatch`, or `stop` — the orchestrator never decides.
   * `dispatch` refuses a fix that covers only part of the gating open set, so a
     round always closes everything currently on the ledger.
+  * A dispatched round is `repair_in_flight` until something observes how it
+    ended: `landed` on a clean worker exit, `abandon` on a kill or an error.
+    Nothing may review a finding still in flight, so a repair that dies cannot
+    hand the next reviewer a problem pre-labelled as fixed.
   * Severity narrows after the first round: blockers and minors gate the first
     fix round, blockers alone gate every later one. Nits never gate.
 
@@ -62,6 +66,13 @@ FIRST_ROUND_GATING = ("blocker", "minor")
 LATER_ROUND_GATING = ("blocker",)
 
 STATE_OPEN = "open"
+# Dispatching a repair proves an attempt was launched, never that it landed, so
+# these are two states rather than one. A repair that dies -- killed, crashed,
+# or abandoned mid-edit -- leaves its findings `repair_in_flight`, and both the
+# gate and the closure verdict refuse that state. Collapsing them would let a
+# dead repair present its findings to the next review already labelled fixed,
+# which is a request to confirm work nobody did.
+STATE_IN_FLIGHT = "repair_in_flight"
 STATE_PENDING = "fixed_pending_review"
 STATE_ACCEPTED = "accepted"
 
@@ -372,7 +383,22 @@ def _finding(state: dict[str, object], finding_id: str) -> dict[str, object]:
 
 
 def _rounds(state: dict[str, object]) -> list[dict[str, object]]:
+    """Every round ever dispatched, abandoned ones included.
+
+    This is the audit trail and the source of round numbers, which stay
+    monotonic so no two entries in the event stream share one.
+    """
     return _object_list(state.get("rounds"))
+
+
+def _live_rounds(state: dict[str, object]) -> list[dict[str, object]]:
+    """The rounds that actually ran, which are the ones convergence counts.
+
+    An abandoned round consumed no repair: its worker died before finishing, so
+    charging it against the repair budget or reading it as a stalled round would
+    stop a phase for work that never happened.
+    """
+    return [entry for entry in _rounds(state) if not entry.get("abandoned")]
 
 
 def _history_root() -> Path:
@@ -444,7 +470,9 @@ def _repair_budget(state: dict[str, object]) -> int:
 
 
 def _gating_severities(state: dict[str, object]) -> tuple[str, ...]:
-    return FIRST_ROUND_GATING if not _rounds(state) else LATER_ROUND_GATING
+    # Live rounds only: a round that was abandoned before it ran must not spend
+    # the first round's wider gate, which is the only one that gates minors.
+    return FIRST_ROUND_GATING if not _live_rounds(state) else LATER_ROUND_GATING
 
 
 def _summarize(entry: dict[str, object]) -> dict[str, object]:
@@ -479,10 +507,18 @@ def _open_entries(state: dict[str, object], severities: tuple[str, ...]) -> list
 
 
 def _pending_ids(state: dict[str, object]) -> list[str]:
+    return _ids_in_state(state, STATE_PENDING)
+
+
+def _in_flight_ids(state: dict[str, object]) -> list[str]:
+    return _ids_in_state(state, STATE_IN_FLIGHT)
+
+
+def _ids_in_state(state: dict[str, object], wanted: str) -> list[str]:
     return [
         finding_id
         for finding_id in sorted(_findings(state))
-        if _string(_finding(state, finding_id).get("state")) == STATE_PENDING
+        if _string(_finding(state, finding_id).get("state")) == wanted
     ]
 
 
@@ -526,7 +562,9 @@ def _stop_reason(
     )
     if cancellations > MAX_REVIEW_CANCELLATIONS:
         return f"the blind review was canceled {cancellations} times, so it is never completing"
-    rounds = _rounds(state)
+    # Stall and budget read live rounds: an abandoned round repaired nothing, so
+    # counting it would stop the phase for a repair that never ran.
+    rounds = _live_rounds(state)
     if len(rounds) >= STALLED_ROUNDS:
         previous = _integer(rounds[-1].get("gating_open_before"), -1)
         earlier = _integer(rounds[-2].get("gating_open_before"), -1)
@@ -540,7 +578,9 @@ def _stop_reason(
             f"{len(rounds)} fix rounds have run for {initial} original findings, "
             f"past the {budget}-round repair budget, with {gating_open} still open"
         )
-    if len(rounds) >= RUNAWAY_ROUNDS:
+    # The backstop counts every dispatch, abandoned ones included: a loop that
+    # keeps launching repairs that keep dying is exactly the runaway it guards.
+    if len(_rounds(state)) >= RUNAWAY_ROUNDS:
         return f"the runaway backstop of {RUNAWAY_ROUNDS} fix rounds was reached"
     return ""
 
@@ -596,6 +636,13 @@ def _verdict(args: argparse.Namespace) -> None:
     entry = _finding(state, finding_id)
     outcome = _arg_string(args, "state")
     current = _string(entry.get("state"))
+    # A verdict judges a repair that exists. While one is in flight nothing has
+    # confirmed any edit landed, so there is nothing a reviewer could have read.
+    if current == STATE_IN_FLIGHT:
+        raise SystemExit(
+            f"{finding_id} has a repair in flight; record `landed` once its worker"
+            + " exits cleanly, or `abandon --reason ...` if it died, before any verdict"
+        )
     if outcome == "accepted":
         entry["state"] = STATE_ACCEPTED
         entry["accepted_at"] = now
@@ -703,6 +750,14 @@ def _gate(args: argparse.Namespace) -> None:
     session_dir = _session_dir(args)
     now = _now_epoch()
     state = _read_state(session_dir, now)
+    in_flight = _in_flight_ids(state)
+    if in_flight:
+        raise SystemExit(
+            "A repair round is still in flight for "
+            + ", ".join(in_flight)
+            + ". Record how it ended -- `landed` if its worker exited cleanly,"
+            + " `abandon --reason ...` if it was killed or errored -- before gating"
+        )
     pending = _pending_ids(state)
     if pending:
         raise SystemExit(
@@ -757,7 +812,9 @@ def _dispatch(args: argparse.Namespace) -> None:
     round_number = len(_rounds(state)) + 1
     for finding_id in sorted(covered):
         entry = _finding(state, finding_id)
-        entry["state"] = STATE_PENDING
+        # In flight, not fixed: launching a repair is all that has happened.
+        # `landed` promotes these to review once a worker exits cleanly.
+        entry["state"] = STATE_IN_FLIGHT
         entry["fix_attempts"] = _integer(entry.get("fix_attempts")) + 1
         entry["last_dispatch_round"] = round_number
     rounds = _rounds(state)
@@ -768,6 +825,7 @@ def _dispatch(args: argparse.Namespace) -> None:
             "covered": sorted(covered),
             "gating_open_before": gating_open,
             "gating_severities": list(gating),
+            "outcome": "in_flight",
         }
     )
     state["rounds"] = rounds
@@ -792,6 +850,111 @@ def _dispatch(args: argparse.Namespace) -> None:
         },
     )
     print(f"round {round_number} covering {', '.join(sorted(covered))}")
+
+
+def _in_flight_round(state: dict[str, object]) -> dict[str, object] | None:
+    """The dispatched round nobody has resolved yet, or None."""
+    for entry in reversed(_rounds(state)):
+        if _string(entry.get("outcome")) == "in_flight":
+            return entry
+    return None
+
+
+def _landed(args: argparse.Namespace) -> None:
+    """Promote an in-flight round to review after its worker exited cleanly.
+
+    `implement.sh` calls this, not the orchestrator, for the same reason the
+    launcher owns its own pass records: the launcher is the only party that
+    watches the worker exit. An orchestrator can be killed, compacted, or simply
+    distracted between the repair finishing and the ledger hearing about it, and
+    every one of those gaps used to resolve as "fixed".
+
+    A session with no round in flight is the ordinary case for an implementation
+    dispatch, so it succeeds quietly rather than failing the launcher.
+    """
+    session_dir = _session_dir(args)
+    now = _now_epoch()
+    state = _read_state(session_dir, now)
+    round_entry = _in_flight_round(state)
+    in_flight = _in_flight_ids(state)
+    if round_entry is None or not in_flight:
+        print("no repair round in flight")
+        return
+    for finding_id in in_flight:
+        entry = _finding(state, finding_id)
+        entry["state"] = STATE_PENDING
+        entry["landed_at"] = now
+    round_entry["outcome"] = "landed"
+    round_entry["landed_at"] = now
+    _write_state(session_dir, state)
+    _append_event(
+        session_dir,
+        state,
+        {
+            "event_type": "finding_batch_landed",
+            "timestamp": _iso_time(now),
+            "timestamp_epoch": now,
+            "round": _integer(round_entry.get("round")),
+            "landed": in_flight,
+        },
+    )
+    print(f"round {_integer(round_entry.get('round'))} landed: {', '.join(in_flight)}")
+
+
+def _abandon(args: argparse.Namespace) -> None:
+    """Return an in-flight round's findings to open because its repair died.
+
+    This is the honest reading of a killed, crashed, or errored repair: the
+    findings are open again, unreviewed, and the reason is appended to the event
+    stream. It never edits history, and it never accepts anything.
+
+    Without `--edits-landed` the round is refunded -- the attempt is uncounted
+    and the round stops counting toward the repair budget -- because a worker
+    that died before writing anything consumed no repair. Pass `--edits-landed`
+    when partial edits are in the tree: that work was real, the next reviewer has
+    to read it, and the attempt stands.
+    """
+    session_dir = _session_dir(args)
+    now = _now_epoch()
+    state = _read_state(session_dir, now)
+    round_entry = _in_flight_round(state)
+    in_flight = _in_flight_ids(state)
+    if round_entry is None or not in_flight:
+        raise SystemExit("No repair round is in flight, so there is nothing to abandon")
+    reason = _arg_string(args, "reason").strip()
+    if not reason:
+        raise SystemExit("--reason is required: name how the repair ended")
+    edits_landed = bool(getattr(args, "edits_landed", False))
+    for finding_id in in_flight:
+        entry = _finding(state, finding_id)
+        entry["state"] = STATE_OPEN
+        if not edits_landed:
+            entry["fix_attempts"] = max(0, _integer(entry.get("fix_attempts")) - 1)
+    round_entry["outcome"] = "abandoned"
+    round_entry["abandoned_at"] = now
+    round_entry["abandoned_reason"] = reason
+    round_entry["edits_landed"] = edits_landed
+    if not edits_landed:
+        round_entry["abandoned"] = True
+    _write_state(session_dir, state)
+    _append_event(
+        session_dir,
+        state,
+        {
+            "event_type": "finding_batch_abandoned",
+            "timestamp": _iso_time(now),
+            "timestamp_epoch": now,
+            "round": _integer(round_entry.get("round")),
+            "reopened": in_flight,
+            "reason": reason,
+            "edits_landed": edits_landed,
+        },
+    )
+    refund = "attempt stands" if edits_landed else "attempt refunded"
+    print(
+        f"round {_integer(round_entry.get('round'))} abandoned ({refund}): "
+        + ", ".join(in_flight)
+    )
 
 
 def _override(args: argparse.Namespace) -> None:
@@ -842,7 +1005,9 @@ def _status(args: argparse.Namespace) -> None:
     findings = [_summarize(_finding(state, key)) for key in sorted(_findings(state))]
     payload: dict[str, object] = {
         "phase_id": _string(state.get("phase_id")),
-        "rounds_completed": len(_rounds(state)),
+        "rounds_completed": len(_live_rounds(state)),
+        "rounds_dispatched": len(_rounds(state)),
+        "in_flight": _in_flight_ids(state),
         "gating_severities": list(_gating_severities(state)),
         "open_counts": _open_counts(state),
         "findings": findings,
@@ -887,6 +1052,24 @@ def _build_parser() -> argparse.ArgumentParser:
     _ = dispatch.add_argument("--session-dir", required=True)
     _ = dispatch.add_argument("--covers", required=True)
     dispatch.set_defaults(handler=_dispatch)
+
+    landed = subparsers.add_parser(
+        "landed", help="promote an in-flight round to review after a clean worker exit"
+    )
+    _ = landed.add_argument("--session-dir", required=True)
+    landed.set_defaults(handler=_landed)
+
+    abandon = subparsers.add_parser(
+        "abandon", help="return an in-flight round to open because its repair died"
+    )
+    _ = abandon.add_argument("--session-dir", required=True)
+    _ = abandon.add_argument("--reason", required=True)
+    _ = abandon.add_argument(
+        "--edits-landed",
+        action="store_true",
+        help="partial edits are in the tree, so the attempt stands rather than being refunded",
+    )
+    abandon.set_defaults(handler=_abandon)
 
     override = subparsers.add_parser(
         "override", help="record the user's override of one wrong stop verdict"

@@ -115,8 +115,13 @@ class FindingsLedgerTests(unittest.TestCase):
         ]
 
     def close_round(self, covers: list[str], *, verdict: str = "accepted") -> None:
-        """Dispatch a batch and record every closure verdict for it."""
+        """Dispatch a batch, land it, and record every closure verdict for it.
+
+        `landed` stands in for the launcher, which is what calls it in a real run
+        once the repair worker exits cleanly.
+        """
         _ = self.run_command("dispatch", "--covers", ",".join(covers))
+        _ = self.run_command("landed")
         for finding_id in covers:
             _ = self.run_command("verdict", "--id", finding_id, "--state", verdict)
 
@@ -181,9 +186,97 @@ class FindingsLedgerTests(unittest.TestCase):
     def test_gate_refuses_while_a_closure_verdict_is_missing(self) -> None:
         _ = self.open_finding("blocker", "null deref")
         _ = self.run_command("dispatch", "--covers", "F001")
+        _ = self.run_command("landed")
         result = self.run_failing_command("gate")
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("Record a closure verdict for F001", result.stderr)
+
+    def test_a_dispatched_repair_is_in_flight_not_fixed(self) -> None:
+        """Launching a repair proves an attempt was made, never that it landed.
+
+        This is the whole point of the in-flight state: a killed repair used to
+        leave its findings labelled `fixed_pending_review`, so the next reviewer
+        was handed a live defect and asked only to confirm the fix.
+        """
+        _ = self.open_finding("blocker", "null deref")
+        _ = self.run_command("dispatch", "--covers", "F001")
+        findings = cast(list[dict[str, object]], self.status()["findings"])
+        self.assertEqual(findings[0]["state"], "repair_in_flight")
+        self.assertEqual(self.status()["in_flight"], ["F001"])
+
+    def test_gate_refuses_while_a_repair_is_in_flight(self) -> None:
+        _ = self.open_finding("blocker", "null deref")
+        _ = self.run_command("dispatch", "--covers", "F001")
+        result = self.run_failing_command("gate")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("still in flight for F001", result.stderr)
+
+    def test_no_verdict_may_be_recorded_while_a_repair_is_in_flight(self) -> None:
+        _ = self.open_finding("blocker", "null deref")
+        _ = self.run_command("dispatch", "--covers", "F001")
+        result = self.run_failing_command("verdict", "--id", "F001", "--state", "accepted")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("has a repair in flight", result.stderr)
+
+    def test_abandon_reopens_the_batch_and_refunds_the_attempt(self) -> None:
+        """A repair killed before it edited anything consumed no repair.
+
+        Charging it would spend the budget on work that never happened, which is
+        how a killed dispatch turns into a spurious convergence stop.
+        """
+        _ = self.open_finding("blocker", "null deref")
+        _ = self.run_command("dispatch", "--covers", "F001")
+        _ = self.run_command("abandon", "--reason", "the user stopped the launcher")
+        findings = cast(list[dict[str, object]], self.status()["findings"])
+        self.assertEqual(findings[0]["state"], "open")
+        self.assertEqual(findings[0]["fix_attempts"], 0)
+        self.assertEqual(self.status()["rounds_completed"], 0)
+        self.assertEqual(self.status()["rounds_dispatched"], 1)
+
+    def test_abandon_keeps_the_attempt_when_edits_landed(self) -> None:
+        _ = self.open_finding("blocker", "null deref")
+        _ = self.run_command("dispatch", "--covers", "F001")
+        _ = self.run_command(
+            "abandon", "--reason", "worker exited with code 1", "--edits-landed"
+        )
+        findings = cast(list[dict[str, object]], self.status()["findings"])
+        self.assertEqual(findings[0]["state"], "open")
+        self.assertEqual(findings[0]["fix_attempts"], 1)
+        self.assertEqual(self.status()["rounds_completed"], 1)
+
+    def test_an_abandoned_round_does_not_narrow_the_gate_to_blockers(self) -> None:
+        """The first round is the only one that gates minors; a dead round keeps it."""
+        _ = self.open_finding("blocker", "null deref")
+        _ = self.open_finding("minor", "unused import")
+        _ = self.run_command("dispatch", "--covers", "F001,F002")
+        _ = self.run_command("abandon", "--reason", "the user stopped the launcher")
+        payload = self.gate()
+        self.assertEqual(payload["gating_severities"], ["blocker", "minor"])
+
+    def test_abandon_appends_its_reason_and_leaves_the_dispatch_recorded(self) -> None:
+        self.write_progress_state("phase-instance-1")
+        _ = self.open_finding("blocker", "null deref")
+        _ = self.run_command("dispatch", "--covers", "F001")
+        _ = self.run_command("abandon", "--reason", "the user stopped the launcher")
+        events = self.events()
+        types = [event["event_type"] for event in events]
+        self.assertIn("finding_batch_dispatched", types)
+        self.assertIn("finding_batch_abandoned", types)
+        abandoned = [
+            event for event in events if event["event_type"] == "finding_batch_abandoned"
+        ]
+        self.assertEqual(abandoned[0]["reason"], "the user stopped the launcher")
+
+    def test_abandon_refuses_when_no_repair_is_in_flight(self) -> None:
+        _ = self.open_finding("blocker", "null deref")
+        result = self.run_failing_command("abandon", "--reason", "nothing to abandon")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("No repair round is in flight", result.stderr)
+
+    def test_landed_is_quiet_when_no_repair_is_in_flight(self) -> None:
+        """Implementation dispatches call it too, and must not fail because of it."""
+        _ = self.open_finding("blocker", "null deref")
+        self.assertEqual(self.run_command("landed"), "no repair round in flight")
 
     def test_stop_when_a_finding_fails_to_close_twice(self) -> None:
         _ = self.open_finding("blocker", "null deref")
@@ -219,6 +312,7 @@ class FindingsLedgerTests(unittest.TestCase):
         self.assertIsNone(overridden["stop_reason"])
         self.assertIn("failed to close", str(overridden["overridden_stop"]))
         _ = self.run_command("dispatch", "--covers", "F001")
+        _ = self.run_command("landed")
         _ = self.run_command("verdict", "--id", "F001", "--state", "still_open")
         spent = self.gate()
         self.assertEqual(spent["verdict"], "stop")
@@ -384,6 +478,7 @@ class FindingsLedgerTests(unittest.TestCase):
             [
                 "finding_opened",
                 "finding_batch_dispatched",
+                "finding_batch_landed",
                 "finding_verdict",
                 "finding_gate",
             ],
