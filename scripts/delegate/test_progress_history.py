@@ -14,6 +14,7 @@ from typing import cast, override
 
 
 SCRIPT = Path(__file__).with_name("progress_history.py")
+FINDINGS = Path(__file__).with_name("findings.py")
 
 
 class ProgressHistoryTests(unittest.TestCase):
@@ -53,13 +54,27 @@ class ProgressHistoryTests(unittest.TestCase):
             encoding="utf-8",
         )
 
-    def run_command(self, *arguments: str, at: int) -> str:
+    def isolate_identity(self, environment: dict[str, str]) -> None:
+        """Point main-agent detection at the temporary home, not this machine's.
+
+        Every window opening re-detects the orchestrator, and left alone that
+        reads the real session transcript, so the recorded identity would be
+        whichever model happens to be running the tests.
+        """
+        environment["HOME"] = str(self.root)
+        _ = environment.pop("CODEX_THREAD_ID", None)
+        _ = environment.pop("CLAUDE_CODE_SESSION_ID", None)
+
+    def run_command(self, *arguments: str, at: int, claude_session: str = "") -> str:
         environment = os.environ.copy()
         environment["PLAN_DELEGATE_HISTORY_DIR"] = str(self.history_dir)
         environment["PLAN_DELEGATE_CONFIG"] = str(self.config_file)
         environment["TZ"] = "UTC"
         environment["PLAN_DELEGATE_NOW_EPOCH"] = str(at)
         environment["PLAN_DELEGATE_PASS_OWNER"] = "launcher"
+        self.isolate_identity(environment)
+        if claude_session:
+            environment["CLAUDE_CODE_SESSION_ID"] = claude_session
         result = subprocess.run(
             ["python3", str(SCRIPT), *arguments],
             check=True,
@@ -76,6 +91,7 @@ class ProgressHistoryTests(unittest.TestCase):
         environment["TZ"] = "UTC"
         environment["PLAN_DELEGATE_NOW_EPOCH"] = str(at)
         environment["PLAN_DELEGATE_PASS_OWNER"] = "launcher"
+        self.isolate_identity(environment)
         return subprocess.run(
             ["python3", str(SCRIPT), *arguments],
             check=False,
@@ -263,11 +279,19 @@ class ProgressHistoryTests(unittest.TestCase):
             header.splitlines(),
             [
                 "**bevy_hana_rubric - feature/rubric**",
-                "**80% complete - elapsed 00:01:40 - eta 00:00:25**",
+                "",
+                "| Scope   |   % | Elapsed  | ETA         | Unchanged |",
+                "| ------- | --: | -------- | ----------- | --------- |",
+                "| Project |  80 | 00:01:40 | today 05:35 |           |",
+                "| Phase 3 |  25 | 00:01:40 | today 05:40 |           |",
                 "",
                 "**Phase 3: Retry handling**",
-                "**25% complete - elapsed 00:01:40 - eta 00:05:00**",
-                "**Fix 2 - correcting retry recovery - elapsed 00:01:30**",
+                "",
+                "| Stage | Main           | Delegate        | Start    | Elapsed  | Result  |",
+                "| ----- | -------------- | --------------- | -------- | -------- | ------- |",
+                "| Fix 2 | gpt-main xhigh | gpt-called high | 05:33:30 | 00:01:30 | running |",
+                "",
+                "▸ **Fix 2 - correcting retry recovery**",
                 "**now 1970-01-01 05:35:00 - next report 05:38:00**",
             ],
         )
@@ -299,11 +323,11 @@ class ProgressHistoryTests(unittest.TestCase):
             at=started_at + 160,
         )
         self.assertIn(
-            "**80% complete - elapsed 00:02:40 - eta 00:00:40 - unchanged 00:01:00**",
+            "| Project |  80 | 00:02:40 | today 05:36 | 00:01:00  |",
             unchanged_header,
         )
         self.assertIn(
-            "**25% complete - elapsed 00:02:40 - eta 00:08:00 - unchanged 00:01:00**",
+            "| Phase 3 |  25 | 00:02:40 | today 05:44 | 00:01:00  |",
             unchanged_header,
         )
 
@@ -333,9 +357,12 @@ class ProgressHistoryTests(unittest.TestCase):
             "correcting retry recovery",
             at=started_at + 180,
         )
-        self.assertIn("**85% complete - elapsed 00:03:00 - eta 00:00:31**", independently_changed)
         self.assertIn(
-            "**25% complete - elapsed 00:03:00 - eta 00:09:00 - unchanged 00:01:20**",
+            "| Project |  85 | 00:03:00 | today 05:36 |           |",
+            independently_changed,
+        )
+        self.assertIn(
+            "| Phase 3 |  25 | 00:03:00 | today 05:45 | 00:01:20  |",
             independently_changed,
         )
 
@@ -486,8 +513,8 @@ class ProgressHistoryTests(unittest.TestCase):
             "implementing",
             at=ad_hoc_start + 10,
         )
-        self.assertIn("**40% complete - elapsed 1 day 03:30:10 - eta 1 day 17:15:15**", header)
-        self.assertIn("**10% complete - elapsed 00:00:10 - eta 00:01:30**", header)
+        self.assertIn("| Project |  40 | 1 day 03:30:10 ", header)
+        self.assertIn("| Phase 3 |  10 | 00:00:10 ", header)
 
     def test_the_clock_line_names_the_armed_timer_then_falls_back_to_the_interval(
         self,
@@ -684,9 +711,10 @@ class ProgressHistoryTests(unittest.TestCase):
             "open_findings",
             at=started_at + 100,
         )
-        self.assertIn("**90% complete", header)
-        self.assertIn("**99% complete", header)
-        self.assertNotIn("**100% complete", header)
+        self.assertIn("| Phase 3 |  90 |", header)
+        self.assertIn("| Project |  99 |", header)
+        self.assertNotIn("| Phase 3 | 100 |", header)
+        self.assertNotIn("| Project | 100 |", header)
 
         history_text = (self.history_dir / "runs" / "capped.jsonl").read_text(encoding="utf-8")
         self.assertIn('"cap_stage":"open_findings"', history_text)
@@ -941,8 +969,9 @@ class ProgressHistoryTests(unittest.TestCase):
             "reading the work order",
             at=started_at + 100,
         )
-        self.assertIn("**0% complete - elapsed 00:01:40**", unstarted)
-        self.assertNotIn("eta", unstarted)
+        self.assertIn("| Project |   0 | 00:01:40 ", unstarted)
+        self.assertIn("| Phase 3 |   0 | 00:01:40 ", unstarted)
+        self.assertNotIn("today", unstarted)
 
         finished = self.run_command(
             "progress",
@@ -962,8 +991,440 @@ class ProgressHistoryTests(unittest.TestCase):
             "closing the phase",
             at=started_at + 200,
         )
-        self.assertIn("**100% complete - elapsed 00:03:20**", finished)
-        self.assertNotIn("eta", finished)
+        self.assertIn("| Project | 100 | 00:03:20 ", finished)
+        self.assertIn("| Phase 3 | 100 | 00:03:20 ", finished)
+        self.assertNotIn("today", finished)
+
+
+    def write_full_config(self) -> None:
+        """findings.py refuses every convergence limit it cannot read."""
+        _ = self.config_file.write_text(
+            "\n".join(
+                (
+                    "PLAN_DELEGATE_PROGRESS_INTERVAL_SECONDS=180",
+                    "MIN_REPAIR_BUDGET=3",
+                    "REPAIR_ROUNDS_PER_FINDING=0.5",
+                    "RUNAWAY_ROUNDS=5",
+                    "MAX_FIX_ATTEMPTS=2",
+                    "MAX_REOPENS=2",
+                    "STALLED_ROUNDS=2",
+                    "MAX_CONSECUTIVE_SAME_KIND_PASSES=3",
+                    "MAX_REVIEW_CANCELLATIONS=1",
+                    "",
+                )
+            ),
+            encoding="utf-8",
+        )
+
+    def run_findings(self, session_dir: Path, *arguments: str, at: int) -> str:
+        environment = os.environ.copy()
+        environment["PLAN_DELEGATE_HISTORY_DIR"] = str(self.history_dir)
+        environment["PLAN_DELEGATE_CONFIG"] = str(self.config_file)
+        environment["TZ"] = "UTC"
+        environment["PLAN_DELEGATE_NOW_EPOCH"] = str(at)
+        result = subprocess.run(
+            ["python3", str(FINDINGS), *arguments, "--session-dir", str(session_dir)],
+            check=True,
+            capture_output=True,
+            text=True,
+            env=environment,
+        )
+        return result.stdout.strip()
+
+    def run_pass(
+        self,
+        session_dir: Path,
+        kind: str,
+        fix_pass: int,
+        activity: str,
+        started_at: int,
+        finished_at: int,
+    ) -> None:
+        _ = self.run_command(
+            "start-pass",
+            "--session-dir",
+            str(session_dir),
+            "--pass-kind",
+            kind,
+            "--fix-pass",
+            str(fix_pass),
+            "--activity",
+            activity,
+            "--called-task",
+            "delegate.implementation",
+            "--called-family",
+            "codex",
+            "--called-model",
+            "gpt-called",
+            "--called-effort",
+            "high",
+            at=started_at,
+        )
+        _ = self.run_command(
+            "finish-pass",
+            "--session-dir",
+            str(session_dir),
+            "--status",
+            "completed",
+            at=finished_at,
+        )
+
+    def read_events(self, name: str) -> list[dict[str, object]]:
+        path = self.history_dir / "runs" / f"{name}.jsonl"
+        events: list[dict[str, object]] = []
+        for line in path.read_text(encoding="utf-8").splitlines():
+            parsed: object = json.loads(line)  # pyright: ignore[reportAny]
+            events.append(cast(dict[str, object], parsed))
+        return events
+
+    def table_rows(self, rendered: str, header: list[str]) -> list[list[str]]:
+        rows = [
+            [cell.strip() for cell in line.removeprefix("| ").removesuffix(" |").split(" | ")]
+            for line in rendered.splitlines()
+            if line.startswith("| ") and set(line) - set("|-: ")
+        ]
+        return rows[rows.index(header) + 1 :]
+
+    def test_the_stage_table_names_every_window_the_phase_opened(self) -> None:
+        """Each pass and activity in start order, with what the ledger recorded."""
+        self.write_full_config()
+        started_at = 60_000
+        session_dir = self.start_run("stages", started_at)
+        _ = self.run_command(
+            "start-phase",
+            "--session-dir",
+            str(session_dir),
+            "--phase-id",
+            "7",
+            "--phase-title",
+            "Drift records",
+            at=started_at,
+        )
+        self.run_pass(
+            session_dir,
+            "impl",
+            0,
+            "writing the drift records",
+            started_at + 10,
+            started_at + 200,
+        )
+        self.run_pass(
+            session_dir,
+            "review",
+            0,
+            "independent review of the finished code",
+            started_at + 220,
+            started_at + 300,
+        )
+        for index in (1, 2):
+            _ = self.run_findings(
+                session_dir,
+                "open",
+                "--severity",
+                "blocker",
+                "--title",
+                f"finding {index}",
+                "--file",
+                "src/lib.rs",
+                "--line",
+                str(index),
+                "--caught-by",
+                "both",
+                at=started_at + 320,
+            )
+        _ = self.run_findings(session_dir, "gate", at=started_at + 325)
+        _ = self.run_findings(session_dir, "dispatch", "--covers", "F001,F002", at=started_at + 330)
+        self.run_pass(
+            session_dir,
+            "fix",
+            1,
+            "repairing both findings",
+            started_at + 340,
+            started_at + 500,
+        )
+        _ = self.run_findings(session_dir, "landed", at=started_at + 500)
+        self.run_pass(
+            session_dir,
+            "review",
+            0,
+            "closure review of the repair",
+            started_at + 520,
+            started_at + 560,
+        )
+        for finding in ("F001", "F002"):
+            _ = self.run_findings(
+                session_dir,
+                "verdict",
+                "--id",
+                finding,
+                "--state",
+                "accepted",
+                "--evidence",
+                "repaired",
+                at=started_at + 580,
+            )
+        _ = self.run_command(
+            "start-activity",
+            "--session-dir",
+            str(session_dir),
+            "--label",
+            "Verification",
+            "--activity",
+            "test hana_clerestory",
+            at=started_at + 600,
+        )
+        _ = self.run_command(
+            "finish-activity",
+            "--session-dir",
+            str(session_dir),
+            "--status",
+            "completed",
+            "--result",
+            "pass",
+            at=started_at + 640,
+        )
+        _ = self.run_command(
+            "start-pass",
+            "--session-dir",
+            str(session_dir),
+            "--pass-kind",
+            "review",
+            "--activity",
+            "checking the remaining plan against what shipped",
+            "--called-task",
+            "delegate.review",
+            "--called-family",
+            "codex",
+            "--called-model",
+            "gpt-called",
+            "--called-effort",
+            "max",
+            at=started_at + 660,
+        )
+        header = self.run_command(
+            "progress",
+            "--session-dir",
+            str(session_dir),
+            "--project-raw-percent",
+            "50",
+            "--project-percent",
+            "50",
+            "--phase-raw-percent",
+            "95",
+            "--phase-percent",
+            "95",
+            "--cap-stage",
+            "closure",
+            "--activity",
+            "checking the remaining plan against what shipped",
+            at=started_at + 700,
+        )
+        stage_rows = self.table_rows(
+            header,
+            ["Stage", "Main", "Delegate", "Start", "Elapsed", "Result"],
+        )
+        self.assertEqual(
+            [(row[0], row[4], row[5]) for row in stage_rows],
+            [
+                ("Impl", "00:03:10", "done"),
+                ("Review 1", "00:01:20", "2 found"),
+                ("Fix 1", "00:02:40", "2 landed"),
+                ("Review 2", "00:00:40", "2 fixed"),
+                ("Verification", "00:00:40", "pass"),
+                ("Review 3", "00:00:40", "running"),
+            ],
+        )
+        self.assertIn("▸ **Review 3 - checking the remaining plan against what shipped**", header)
+        # The main agent ran verification itself, so that row has no delegate.
+        self.assertEqual((stage_rows[4][1], stage_rows[4][2]), ("gpt-main xhigh", ""))
+        self.assertEqual(stage_rows[0][1], "gpt-main xhigh")
+
+    def test_an_activity_records_its_own_identity_not_the_finished_pass(self) -> None:
+        """A finished pass stays in state; it used to stamp every later event."""
+        started_at = 70_000
+        session_dir = self.start_run("identity", started_at)
+        self.start_phase_and_pass(session_dir, started_at)
+        _ = self.run_command(
+            "finish-pass",
+            "--session-dir",
+            str(session_dir),
+            "--status",
+            "completed",
+            at=started_at + 60,
+        )
+        _ = self.run_command(
+            "start-activity",
+            "--session-dir",
+            str(session_dir),
+            "--label",
+            "Style",
+            "--activity",
+            "style-only review of the phase diff",
+            at=started_at + 70,
+        )
+        started = [
+            event
+            for event in self.read_events("identity")
+            if event.get("event_type") == "activity_started"
+        ]
+        self.assertEqual(len(started), 1)
+        self.assertEqual(started[0]["activity_label"], "Style")
+        self.assertEqual(started[0]["activity_text"], "style-only review of the phase diff")
+        self.assertNotIn("pass_kind", started[0])
+        self.assertNotIn("called_agent", started[0])
+
+    def test_the_timeline_reports_a_phase_the_run_has_already_finished(self) -> None:
+        started_at = 80_000
+        session_dir = self.start_run("recorded", started_at)
+        self.start_phase_and_pass(session_dir, started_at)
+        _ = self.run_command(
+            "finish-pass",
+            "--session-dir",
+            str(session_dir),
+            "--status",
+            "completed",
+            at=started_at + 100,
+        )
+        _ = self.run_command(
+            "finish-phase",
+            "--session-dir",
+            str(session_dir),
+            "--status",
+            "completed",
+            at=started_at + 120,
+        )
+        rendered = self.run_command(
+            "timeline",
+            "--session-dir",
+            str(session_dir),
+            at=started_at + 900,
+        )
+        self.assertIn("**Phase 3: Retry handling - elapsed 00:02:00 - completed**", rendered)
+        self.assertIn(
+            "| Fix 2 | gpt-main xhigh | gpt-called high | 22:13:30 | 00:01:30 | done",
+            rendered,
+        )
+
+        missing = self.run_failing_command(
+            "timeline",
+            "--session-dir",
+            str(session_dir),
+            "--phase",
+            "9",
+            at=started_at + 900,
+        )
+        self.assertEqual(missing.returncode, 1)
+        self.assertIn("recorded no phase 9", missing.stderr)
+
+    def test_a_window_picks_up_the_main_agent_changing_mid_run(self) -> None:
+        """`start-run` detects the orchestrator once, and it can change after."""
+        started_at = 90_000
+        session_dir = self.start_run("switched", started_at)
+        transcript = self.root / ".claude" / "projects" / "demo" / "session-9.jsonl"
+        transcript.parent.mkdir(parents=True)
+        _ = transcript.write_text(
+            "\n".join(
+                (
+                    json.dumps(
+                        {"type": "assistant", "message": {"model": "opus-5"}, "effort": "high"}
+                    ),
+                    json.dumps(
+                        {"type": "assistant", "message": {"model": "sonnet-5"}, "effort": "low"}
+                    ),
+                    "",
+                )
+            ),
+            encoding="utf-8",
+        )
+        _ = self.run_command(
+            "start-phase",
+            "--session-dir",
+            str(session_dir),
+            "--phase-id",
+            "3",
+            "--phase-title",
+            "Retry handling",
+            at=started_at,
+        )
+        _ = self.run_command(
+            "start-pass",
+            "--session-dir",
+            str(session_dir),
+            "--pass-kind",
+            "impl",
+            "--activity",
+            "writing the retry path",
+            "--called-task",
+            "delegate.implementation",
+            "--called-family",
+            "codex",
+            "--called-model",
+            "gpt-called",
+            "--called-effort",
+            "high",
+            at=started_at + 10,
+            claude_session="session-9",
+        )
+        rendered = self.run_command(
+            "timeline",
+            "--session-dir",
+            str(session_dir),
+            at=started_at + 100,
+        )
+        self.assertIn("| sonnet-5 low |", rendered)
+        self.assertNotIn("gpt-main xhigh", rendered)
+
+    def test_the_eta_names_the_day_the_work_is_expected_to_land(self) -> None:
+        """A duration has to be added to the clock by hand; an arrival does not."""
+        session_dir = self.start_run("arrival", 0)
+        _ = self.run_command(
+            "start-phase",
+            "--session-dir",
+            str(session_dir),
+            "--phase-id",
+            "3",
+            "--phase-title",
+            "Retry handling",
+            at=70_000,
+        )
+        _ = self.run_command(
+            "start-pass",
+            "--session-dir",
+            str(session_dir),
+            "--pass-kind",
+            "impl",
+            "--activity",
+            "writing the retry path",
+            "--called-task",
+            "delegate.implementation",
+            "--called-family",
+            "codex",
+            "--called-model",
+            "gpt-called",
+            "--called-effort",
+            "high",
+            at=70_010,
+        )
+        header = self.run_command(
+            "progress",
+            "--session-dir",
+            str(session_dir),
+            "--project-raw-percent",
+            "10",
+            "--project-percent",
+            "10",
+            "--phase-raw-percent",
+            "50",
+            "--phase-percent",
+            "50",
+            "--cap-stage",
+            "implementation",
+            "--activity",
+            "writing the retry path",
+            at=80_000,
+        )
+        self.assertIn("| Project |  10 | 22:13:20 | 1970-01-10 06:13 |", header)
+        self.assertIn("| Phase 3 |  50 | 02:46:40 | tomorrow 01:00 ", header)
 
 
 class PhaseCountTests(unittest.TestCase):

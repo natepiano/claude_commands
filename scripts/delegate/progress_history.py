@@ -96,6 +96,29 @@ class ProjectTiming(TypedDict):
     plan_doc: str
 
 
+class StageWindow(TypedDict):
+    """One row of the stage table: a launcher's pass or a main-agent activity."""
+
+    instance_id: str
+    kind: str
+    fix_round: int
+    label: str
+    started_at: float
+    elapsed: int
+    status: str
+    result: str
+    delegate: str
+    main: str
+
+
+class FindingTally(TypedDict):
+    opened: int
+    landed: int
+    accepted: int
+    still_open: int
+    reopened: int
+
+
 def _history_root() -> Path:
     configured = os.environ.get("PLAN_DELEGATE_HISTORY_DIR")
     if configured:
@@ -367,6 +390,27 @@ def _detect_main_identity(args: argparse.Namespace) -> AgentIdentity:
         effort=explicit_effort or "unset",
         session_id=explicit_session or codex_session or claude_session,
     )
+
+
+def _refresh_main_identity(state: dict[str, object]) -> None:
+    """Re-read the orchestrator's identity whenever a window opens.
+
+    `start-run` detects it once, and the main agent's model or effort can change
+    part way through a run. Detection that comes back unknown leaves the stored
+    identity alone: a window that cannot answer must not erase the answer
+    already recorded.
+    """
+    detected = _detect_main_identity(
+        argparse.Namespace(
+            main_model="",
+            main_family="",
+            main_effort="",
+            main_session_id="",
+        )
+    )
+    if detected["model"] == "unknown":
+        return
+    state["main_agent"] = detected
 
 
 def _git_value(working_dir: Path, *arguments: str) -> str:
@@ -667,8 +711,12 @@ def _event(state: dict[str, object], event_type: str, now: float) -> dict[str, o
                 "phase_started_at": _number(phase.get("started_at")),
             }
         )
+    # Only the window that is open right now identifies an event. A finished
+    # pass stays in state, so stamping it unconditionally attributed every
+    # activity -- and every progress report made during one -- to whichever
+    # delegate happened to run before it.
     current_pass = _object_dict(state.get("pass"))
-    if current_pass is not None:
+    if current_pass is not None and _string(current_pass.get("status")) == "active":
         event.update(
             {
                 "pass_instance_id": _string(current_pass.get("instance_id")),
@@ -678,6 +726,16 @@ def _event(state: dict[str, object], event_type: str, now: float) -> dict[str, o
                 "pass_started_at": _number(current_pass.get("started_at")),
                 "called_agent": current_pass.get("called_agent", {}),
                 "called_task": _string(current_pass.get("called_task")),
+            }
+        )
+    activity = _object_dict(state.get("activity"))
+    if activity is not None and _string(activity.get("status")) == "active":
+        event.update(
+            {
+                "activity_instance_id": _string(activity.get("instance_id")),
+                "activity_label": _string(activity.get("label")),
+                "activity_text": _string(activity.get("activity")),
+                "activity_started_at": _number(activity.get("started_at")),
             }
         )
     return event
@@ -708,6 +766,7 @@ def _close_active_activity(
     session_dir: Path,
     state: dict[str, object],
     status: str,
+    result: str,
     now: float,
 ) -> None:
     activity = _object_dict(state.get("activity"))
@@ -715,12 +774,14 @@ def _close_active_activity(
         return
     event = _event(state, "activity_finished", now)
     event["status"] = status
+    event["activity_result"] = result
     event["activity_elapsed_seconds"] = max(
         0,
         int(now - _number(activity.get("started_at"), now)),
     )
     _append_event(state, event)
     activity["status"] = status
+    activity["result"] = result
     activity["finished_at"] = now
     _write_state(session_dir, state)
 
@@ -732,8 +793,9 @@ def _start_activity(args: argparse.Namespace) -> None:
     if phase is None or _string(phase.get("status")) != "active":
         raise SystemExit("Start a phase before starting an activity")
     now = _now_epoch()
-    _close_active_activity(session_dir, state, "interrupted", now)
+    _close_active_activity(session_dir, state, "interrupted", "", now)
     state = _read_state(session_dir)
+    _refresh_main_identity(state)
     activity: dict[str, object] = {
         "instance_id": str(uuid.uuid4()),
         "label": _arg_string(args, "label", "Work") or "Work",
@@ -750,7 +812,13 @@ def _finish_activity(args: argparse.Namespace) -> None:
     session_dir = _session_dir(args)
     state = _read_state(session_dir)
     status = _arg_string(args, "status", "completed") or "completed"
-    _close_active_activity(session_dir, state, status, _now_epoch())
+    _close_active_activity(
+        session_dir,
+        state,
+        status,
+        _arg_string(args, "result"),
+        _now_epoch(),
+    )
 
 
 def _start_run(args: argparse.Namespace) -> None:
@@ -891,6 +959,7 @@ def _start_pass(args: argparse.Namespace) -> None:
         effort=_arg_string(args, "called_effort", "unset") or "unset",
         session_id="",
     )
+    _refresh_main_identity(state)
     current_pass: dict[str, object] = {
         "instance_id": str(uuid.uuid4()),
         "kind": pass_kind,
@@ -1160,7 +1229,15 @@ def _matching_scope(
             candidates = nearby
             percent_scope = "within_5_percentage_points"
 
-    current_pass = _object_dict(state.get("pass")) or {}
+    # Match on the open window, the same rule `_event` records by. A finished
+    # pass left in state would otherwise match this activity's report against
+    # samples from a delegate that is no longer running.
+    active_pass = _object_dict(state.get("pass"))
+    current_pass = (
+        active_pass
+        if active_pass is not None and _string(active_pass.get("status")) == "active"
+        else {}
+    )
     main_agent = _object_dict(state.get("main_agent")) or {}
     called_agent = _object_dict(current_pass.get("called_agent")) or {}
     pass_kind = _string(current_pass.get("kind"))
@@ -1369,16 +1446,6 @@ def _eta_seconds(percent: int, elapsed: int) -> int | None:
     return int(elapsed * (100 - percent) / percent)
 
 
-def _assessment_line(percent: int, elapsed: int, unchanged: int) -> str:
-    line = f"**{percent}% complete - elapsed {_format_duration(elapsed)}"
-    eta = _eta_seconds(percent, elapsed)
-    if eta is not None:
-        line += f" - eta {_format_duration(eta)}"
-    if unchanged > 0:
-        line += f" - unchanged {_format_duration(unchanged)}"
-    return line + "**"
-
-
 def _next_report_at(session_dir: Path, now: float) -> float | None:
     """When the next progress report is due, in epoch seconds.
 
@@ -1425,6 +1492,401 @@ def _clock_line(now: float, next_report_at: float | None) -> str:
         )
         line += f" - next report {stamp}"
     return line + "**"
+
+
+STAGE_HEADERS: tuple[str, ...] = (
+    "Stage",
+    "Main",
+    "Delegate",
+    "Start",
+    "Elapsed",
+    "Result",
+)
+SUMMARY_HEADERS: tuple[str, ...] = ("Scope", "%", "Elapsed", "ETA", "Unchanged")
+
+
+def _run_events(state: dict[str, object]) -> list[dict[str, object]]:
+    """Every event this run recorded, oldest first.
+
+    Scoped to the one run rather than `_load_events`' whole history: the stage
+    table describes the phase in front of the reader, and reading every past run
+    to build it would grow with the machine's history instead of the phase.
+    """
+    history_file = _string(state.get("history_file"))
+    if not history_file:
+        return []
+    try:
+        with Path(history_file).open(encoding="utf-8") as handle:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_SH)
+            lines = handle.read().splitlines()
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+    except OSError:
+        return []
+    events: list[dict[str, object]] = []
+    for line in lines:
+        event = _json_object(line)
+        if event is not None and _integer(event.get("schema_version")) == SCHEMA_VERSION:
+            events.append(event)
+    return events
+
+
+def _agent_display(model: str, effort: str) -> str:
+    if not model:
+        return ""
+    return model if not effort or effort == "unset" else f"{model} {effort}"
+
+
+def _clock_stamp(epoch: float) -> str:
+    return f"{datetime.fromtimestamp(epoch):%H:%M:%S}"
+
+
+def _started_window(event: dict[str, object], event_type: str) -> StageWindow:
+    if event_type == "pass_started":
+        model, effort = _agent_fields(event, "called_agent")
+        instance_id = _string(event.get("pass_instance_id"))
+        kind = _string(event.get("pass_kind"))
+        label = ""
+        started_at = _number(event.get("pass_started_at"))
+    else:
+        # An activity is the main agent working directly, so it has no delegate
+        # and the Delegate cell stays empty rather than repeating the orchestrator.
+        model, effort = "", ""
+        instance_id = _string(event.get("activity_instance_id"))
+        kind = "activity"
+        label = _string(event.get("activity_label"), "Work")
+        started_at = _number(event.get("activity_started_at"))
+    main_model, main_effort = _agent_fields(event, "main_agent")
+    return StageWindow(
+        instance_id=instance_id,
+        kind=kind,
+        fix_round=_integer(event.get("fix_pass")),
+        label=label,
+        started_at=started_at or _number(event.get("timestamp_epoch")),
+        elapsed=0,
+        status="open",
+        result="",
+        delegate=_agent_display(model, effort),
+        main=_agent_display(main_model, main_effort),
+    )
+
+
+def _live_window(state: dict[str, object], now: float) -> StageWindow | None:
+    """The window running right now, read from state rather than the events.
+
+    Its finishing event does not exist yet, and a session upgraded mid-phase has
+    an activity whose start event predates activity identity, so state is the
+    only source that always knows what is running.
+    """
+    current = _object_dict(state.get("pass"))
+    if current is not None and _string(current.get("status")) == "active":
+        model, effort = _agent_fields(current, "called_agent")
+        kind = _string(current.get("kind"))
+        label = ""
+    else:
+        current = _object_dict(state.get("activity"))
+        if current is None or _string(current.get("status")) != "active":
+            return None
+        model, effort = "", ""
+        kind = "activity"
+        label = _string(current.get("label"), "Work")
+    main_model, main_effort = _agent_fields(state, "main_agent")
+    started_at = _number(current.get("started_at"), now)
+    return StageWindow(
+        instance_id=_string(current.get("instance_id")) or "live",
+        kind=kind,
+        fix_round=_integer(current.get("fix_pass")),
+        label=label,
+        started_at=started_at,
+        elapsed=max(0, int(now - started_at)),
+        status="running",
+        result="running",
+        delegate=_agent_display(model, effort),
+        main=_agent_display(main_model, main_effort),
+    )
+
+
+def _phase_windows(
+    events: list[dict[str, object]],
+    state: dict[str, object],
+    phase_instance_id: str,
+    now: float,
+    include_live: bool,
+) -> list[StageWindow]:
+    windows: dict[str, StageWindow] = {}
+    for event in events:
+        if _string(event.get("phase_instance_id")) != phase_instance_id:
+            continue
+        event_type = _string(event.get("event_type"))
+        if event_type in ("pass_started", "activity_started"):
+            window = _started_window(event, event_type)
+            if window["instance_id"]:
+                windows[window["instance_id"]] = window
+            continue
+        if event_type not in ("pass_finished", "activity_finished"):
+            continue
+        finished_pass = event_type == "pass_finished"
+        key = _string(
+            event.get("pass_instance_id" if finished_pass else "activity_instance_id")
+        )
+        window = windows.get(key)
+        if window is None:
+            continue
+        window["status"] = _string(event.get("status"), "completed")
+        window["result"] = _string(event.get("activity_result"))
+        window["elapsed"] = _integer(
+            event.get(
+                "pass_elapsed_seconds" if finished_pass else "activity_elapsed_seconds"
+            )
+        )
+    if include_live:
+        live = _live_window(state, now)
+        if live is not None:
+            windows[live["instance_id"]] = live
+    return sorted(windows.values(), key=lambda window: window["started_at"])
+
+
+def _stage_labels(windows: list[StageWindow]) -> list[str]:
+    """Name each window by kind and its position among that kind in the phase.
+
+    Reviews and fixes are numbered because a phase runs several and the reader's
+    question is which one; a fix carries the round the ledger dispatched, so its
+    number matches the one convergence counts.
+    """
+    counts: dict[str, int] = {}
+    labels: list[str] = []
+    for window in windows:
+        kind = window["kind"]
+        counts[kind] = counts.get(kind, 0) + 1
+        index = counts[kind]
+        if kind == "activity":
+            labels.append(window["label"] or "Work")
+        elif kind == "fix":
+            labels.append(f"Fix {window['fix_round'] or index}")
+        elif kind == "review":
+            labels.append(f"Review {index}")
+        else:
+            name = {"impl": "Impl", "arch": "Arch"}.get(kind) or kind.title() or "Pass"
+            labels.append(name if index == 1 else f"{name} {index}")
+    return labels
+
+
+def _finding_tally(
+    findings: list[dict[str, object]],
+    lower: float,
+    upper: float,
+) -> FindingTally:
+    """What the ledger recorded between one window opening and the next.
+
+    Findings are opened, dispatched, and settled by the main agent in the gap
+    after a window closes, so the interval that starts at a window and ends at
+    its successor is what attributes them to the pass that produced them.
+    """
+    tally = FindingTally(opened=0, landed=0, accepted=0, still_open=0, reopened=0)
+    for event in findings:
+        at = _number(event.get("timestamp_epoch"))
+        if not lower <= at < upper:
+            continue
+        event_type = _string(event.get("event_type"))
+        if event_type == "finding_opened":
+            tally["opened"] += 1
+        elif event_type == "finding_batch_landed":
+            landed = event.get("landed")
+            if isinstance(landed, list):
+                tally["landed"] += len(cast(list[object], landed))
+        elif event_type == "finding_verdict":
+            verdict = _string(event.get("verdict"))
+            if verdict == "accepted":
+                tally["accepted"] += 1
+            elif verdict == "still_open":
+                tally["still_open"] += 1
+            elif verdict == "reopened":
+                tally["reopened"] += 1
+    return tally
+
+
+def _window_result(window: StageWindow, tally: FindingTally) -> str:
+    status = window["status"]
+    if status == "running":
+        return "running"
+    if status not in ("completed", "open"):
+        return status
+    if window["kind"] == "activity":
+        return window["result"] or ("open" if status == "open" else "done")
+    if status == "open":
+        return "open"
+    if window["kind"] == "fix":
+        return f"{tally['landed']} landed" if tally["landed"] else "done"
+    if window["kind"] == "review":
+        unresolved = tally["still_open"] + tally["reopened"]
+        if tally["accepted"] or unresolved:
+            parts = [f"{tally['accepted']} fixed"]
+            if unresolved:
+                parts.append(f"{unresolved} open")
+            if tally["opened"]:
+                parts.append(f"{tally['opened']} new")
+            return ", ".join(parts)
+        return f"{tally['opened']} found" if tally["opened"] else "clean"
+    return "done"
+
+
+def _stage_rows(
+    events: list[dict[str, object]],
+    state: dict[str, object],
+    phase_instance_id: str,
+    now: float,
+    include_live: bool = True,
+) -> list[list[str]]:
+    windows = _phase_windows(events, state, phase_instance_id, now, include_live)
+    findings = [
+        event
+        for event in events
+        if _string(event.get("phase_instance_id")) == phase_instance_id
+        and _string(event.get("event_type")).startswith("finding_")
+    ]
+    labels = _stage_labels(windows)
+    rows: list[list[str]] = []
+    for index, window in enumerate(windows):
+        upper = (
+            windows[index + 1]["started_at"]
+            if index + 1 < len(windows)
+            else max(now, window["started_at"]) + 1.0
+        )
+        rows.append(
+            [
+                labels[index],
+                window["main"],
+                window["delegate"],
+                _clock_stamp(window["started_at"]),
+                _format_duration(window["elapsed"]),
+                _window_result(window, _finding_tally(findings, window["started_at"], upper)),
+            ]
+        )
+    return rows
+
+
+def _render_table(
+    headers: list[str],
+    rows: list[list[str]],
+    numeric: set[int],
+) -> list[str]:
+    """Pad a Markdown table so its columns line up as plain text as well."""
+    # Three is the narrowest column a Markdown rule can still describe: `--:`
+    # keeps the `%` column's alignment marker legal where `:` alone is not.
+    widths = [max(len(header), 3) for header in headers]
+    for row in rows:
+        for index, cell in enumerate(row):
+            widths[index] = max(widths[index], len(cell))
+
+    def rendered(cells: list[str]) -> str:
+        padded = [
+            cell.rjust(widths[index]) if index in numeric else cell.ljust(widths[index])
+            for index, cell in enumerate(cells)
+        ]
+        return "| " + " | ".join(padded) + " |"
+
+    rule = (
+        "| "
+        + " | ".join(
+            "-" * (width - 1) + ":" if index in numeric else "-" * width
+            for index, width in enumerate(widths)
+        )
+        + " |"
+    )
+    return [rendered(headers), rule, *(rendered(row) for row in rows)]
+
+
+def _eta_cell(percent: int, elapsed: int, now: float) -> str:
+    """When the work is expected to land, as a clock time rather than a duration.
+
+    A remaining duration has to be added to the current time by hand every time
+    it is read, and the answer changes with every report. An arrival stamp is
+    that addition already done, and it says the same thing tomorrow morning.
+    """
+    eta = _eta_seconds(percent, elapsed)
+    if eta is None:
+        return ""
+    arrival = datetime.fromtimestamp(now + eta)
+    days = (arrival.date() - datetime.fromtimestamp(now).date()).days
+    if days == 0:
+        return f"today {arrival:%H:%M}"
+    if days == 1:
+        return f"tomorrow {arrival:%H:%M}"
+    return f"{arrival:%Y-%m-%d %H:%M}"
+
+
+def _unchanged_cell(seconds: int) -> str:
+    return _format_duration(seconds) if seconds > 0 else ""
+
+
+def _timeline(args: argparse.Namespace) -> None:
+    """Render the stage table for one phase, or for every phase of the run.
+
+    The progress header only ever shows the phase in flight. This answers the
+    questions asked after the fact -- how many fix passes, how long each review
+    took -- without reading the raw event stream by hand.
+    """
+    session_dir = _session_dir(args)
+    state = _read_state(session_dir)
+    now = _now_epoch()
+    events = _run_events(state)
+    wanted = _arg_string(args, "phase")
+    started: list[tuple[str, str, str, float]] = []
+    finished: dict[str, tuple[str, int]] = {}
+    for event in events:
+        event_type = _string(event.get("event_type"))
+        if event_type == "phase_started":
+            started.append(
+                (
+                    _string(event.get("phase_instance_id")),
+                    _string(event.get("phase_id"), "ad hoc"),
+                    _string(event.get("phase_title"), "Ad hoc work"),
+                    _number(
+                        event.get("phase_started_at"),
+                        _number(event.get("timestamp_epoch")),
+                    ),
+                )
+            )
+        elif event_type == "phase_finished":
+            finished[_string(event.get("phase_instance_id"))] = (
+                _string(event.get("status"), "completed"),
+                _integer(event.get("phase_elapsed_seconds")),
+            )
+    lines = [
+        f"**{_string(state.get('worktree'))} - {_string(state.get('branch'))}**",
+    ]
+    matched = 0
+    for instance_id, phase_id, title, started_at in started:
+        if wanted and phase_id != wanted:
+            continue
+        matched += 1
+        live = instance_id not in finished
+        status, elapsed = finished.get(
+            instance_id,
+            ("running", max(0, int(now - started_at))),
+        )
+        heading = (
+            f"Phase {phase_id}: {title} - elapsed {_format_duration(elapsed)}"
+            + f" - {status}"
+        )
+        lines.extend(
+            [
+                "",
+                f"**{heading}**",
+                "",
+                *_render_table(
+                    list(STAGE_HEADERS),
+                    _stage_rows(events, state, instance_id, now, include_live=live),
+                    set(),
+                ),
+            ]
+        )
+    if matched == 0:
+        raise SystemExit(
+            f"This run recorded no phase {wanted}"
+            if wanted
+            else "This run has recorded no phase yet"
+        )
+    print("\n".join(lines))
 
 
 def _phase_count(args: argparse.Namespace) -> None:
@@ -1633,13 +2095,47 @@ def _progress(args: argparse.Namespace) -> None:
         f"- elapsed {_format_duration(pass_elapsed)}**"
     )
     if uses_dual_layout:
+        summary_headers = list(SUMMARY_HEADERS)
+        project_row = [
+            "Project",
+            str(project_percent),
+            _format_duration(total_elapsed),
+            _eta_cell(project_percent, total_elapsed, now),
+            _unchanged_cell(project_unchanged_seconds),
+        ]
+        phase_row = [
+            f"Phase {phase_id}",
+            str(phase_percent),
+            _format_duration(phase_elapsed),
+            _eta_cell(phase_percent, phase_elapsed, now),
+            _unchanged_cell(phase_unchanged_seconds),
+        ]
+        if plan_phase_counts.get("available") is True:
+            summary_headers.append("Phases")
+            done = _integer(plan_phase_counts.get("done"))
+            total = _integer(plan_phase_counts.get("total"))
+            project_row.append(f"{done} of {total} done")
+            phase_row.append("")
+        stage_rows = _stage_rows(
+            _run_events(state),
+            state,
+            _string(phase.get("instance_id")),
+            now,
+        )
+        # The running window is the newest one, so its row is the last row; the
+        # sentence beneath the table is what a fixed-width Result column cannot
+        # carry.
+        live_label = stage_rows[-1][0] if stage_rows else _pass_display(current_pass)
         lines = [
             f"**{_string(state.get('worktree'))} - {_string(state.get('branch'))}**",
-            _assessment_line(project_percent, total_elapsed, project_unchanged_seconds),
+            "",
+            *_render_table(summary_headers, [project_row, phase_row], {1}),
             "",
             f"**Phase {phase_id}: {phase_title}**",
-            _assessment_line(phase_percent, phase_elapsed, phase_unchanged_seconds),
-            pass_line,
+            "",
+            *_render_table(list(STAGE_HEADERS), stage_rows, set()),
+            "",
+            f"▸ **{live_label} - {_string(current_pass.get('activity'))}**",
             _clock_line(now, next_report_at),
         ]
     else:
@@ -1666,7 +2162,7 @@ def _finish_phase(args: argparse.Namespace) -> None:
     now = _now_epoch()
     _close_active_pass(session_dir, state, "interrupted", now)
     state = _read_state(session_dir)
-    _close_active_activity(session_dir, state, "interrupted", now)
+    _close_active_activity(session_dir, state, "interrupted", "", now)
     state = _read_state(session_dir)
     phase = _object_dict(state.get("phase"))
     if phase is None or _string(phase.get("status")) != "active":
@@ -1781,6 +2277,11 @@ def _build_parser() -> argparse.ArgumentParser:
         choices=("completed", "error", "canceled", "interrupted"),
         default="completed",
     )
+    _ = finish_activity.add_argument(
+        "--result",
+        default="",
+        help="short outcome for the stage table, such as pass, clean, or no change",
+    )
     finish_activity.set_defaults(handler=_finish_activity)
 
     start_pass = subparsers.add_parser("start-pass")
@@ -1827,6 +2328,15 @@ def _build_parser() -> argparse.ArgumentParser:
     _ = progress.add_argument("--project-override-reason", default="")
     _ = progress.add_argument("--phase-override-reason", default="")
     progress.set_defaults(handler=_progress)
+
+    timeline = subparsers.add_parser("timeline")
+    _ = timeline.add_argument("--session-dir", required=True)
+    _ = timeline.add_argument(
+        "--phase",
+        default="",
+        help="restrict the table to this phase identifier; omit for every phase",
+    )
+    timeline.set_defaults(handler=_timeline)
 
     phase_count = subparsers.add_parser("phase-count")
     _ = phase_count.add_argument("--plan-doc", required=True)

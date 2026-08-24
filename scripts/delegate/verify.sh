@@ -136,9 +136,17 @@ if [[ -n "${ACTIVITY_SESSION_DIR}" \
         --activity "${CMD} ${*:-workspace}" >/dev/null 2>&1; then
         finish_activity() {
             local status=$1
+            # The stage table shows an outcome per row, and "completed" only
+            # says the window closed. Name what the gate actually did.
+            local result=""
+            case "${status}" in
+                completed) result="pass" ;;
+                error) result="fail" ;;
+            esac
             python3 "${PROGRESS_HISTORY}" finish-activity \
                 --session-dir "${ACTIVITY_SESSION_DIR}" \
-                --status "${status}" >/dev/null 2>&1 || true
+                --status "${status}" \
+                --result "${result}" >/dev/null 2>&1 || true
         }
         # EXIT alone would report success for a failed cargo run, so branch on the
         # status the trap receives.

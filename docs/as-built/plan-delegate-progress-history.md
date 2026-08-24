@@ -19,13 +19,18 @@ Schema version 1 records these event types:
 - `run_started` / `run_finished`
 - `phase_started` / `phase_finished`
 - `pass_started` / `pass_finished`
+- `activity_started` / `activity_finished`
 - `progress_reported`
 - `finding_opened` / `finding_batch_dispatched` / `finding_verdict` /
   `finding_gate`, appended by `scripts/delegate/findings.py` to the same stream
 
 Every event repeats its query dimensions: run and phase identity, worktree,
 branch, working directory, plan doc, project/phase/pass timestamps, current pass
-kind and fix count, main-agent identity, and called-agent identity. Progress
+kind and fix count, main-agent identity, and called-agent identity. Only the
+window that is *open* stamps an event with its identity. A finished pass stays
+in the session state so the next launcher can be told what it replaced, and
+stamping it unconditionally attributed every activity — and every progress
+report made during one — to whichever delegate happened to run before it. Progress
 events add the current activity, separate project and phase percentages, each
 assessment's unchanged duration, the phase's raw, suggested, and reported
 percentages, decision source, override reason, each elapsed clock, and the
@@ -209,10 +214,14 @@ progress_history.py start-run --session-dir <dir> --working-dir <dir> [--plan-do
 progress_history.py start-phase --session-dir <dir> --phase-id <id> --phase-title <title> [--work-order-file <path>]
 progress_history.py start-pass ...        # launcher only
 progress_history.py finish-pass ...       # launcher only, or --orphaned-launcher --status canceled
+progress_history.py start-activity --session-dir <dir> --label <label> --activity <text>
+progress_history.py finish-activity --session-dir <dir> [--status completed|error|canceled|interrupted] [--result <outcome>]
 progress_history.py calibrate --session-dir <dir> --candidate-percent <N>
 progress_history.py progress --session-dir <dir> --project-raw-percent <N> --project-percent <N> --phase-raw-percent <N> --phase-percent <N> --cap-stage <stage> --activity <text> [--phase-override-reason <evidence>]
 progress_history.py finish-phase ...
 progress_history.py finish-run ...
+progress_history.py timeline --session-dir <dir> [--phase <id>]
+progress_history.py phase-count --plan-doc <path> [--phase-percent <N>]
 progress_history.py aggregate [--percent <N>]
 ```
 
@@ -225,21 +234,58 @@ The single exception is a launcher the orchestrator killed, whose pass stays
 open: `finish-pass --status canceled --orphaned-launcher` closes it, and only
 that status, and only while a pass is open.
 
-`progress` writes the event and prints the project section, one blank line, then
-the phase/pass section used by `/plan:delegate`. Project and phase percentages
-have independent unchanged timers. Each also carries an `eta`, the elapsed clock
-extended across what the displayed percentage says remains; it is omitted at 0
-and 100, where there is no rate to extend or nothing left to extend it over. The
-pass line has none — a fix is a sub-phase with no percentage of its own. Because
-the projection reads the same capped number the line displays, it never
-contradicts the percentage beside it, and it inherits that number's accuracy:
-derived phase counts for the project, the reporter's estimate for the phase.
+`progress` writes the event and prints two tables. The first holds the clocks:
+a project row and a phase row carrying the reported percentage, elapsed, ETA,
+unchanged, and — when the plan's headings can be counted — how many phases are
+done. The second is the stage table, one row per window the phase has opened,
+oldest first: the stage, the main agent that orchestrated it, the delegate that
+ran it, its start time, its elapsed, and its result. Under the table
+sits the running stage's activity sentence, which no fixed-width column can
+carry, and then the wall clock.
+
+Stage names come from the pass kind and its position among that kind in the
+phase — `Impl`, `Review 1`, `Review 2`, `Fix 1` — and a fix carries the round
+the ledger dispatched, so its number is the one convergence counts. An
+activity's name is its `--label`, and its `Delegate` cell is empty: the main
+agent ran that window itself. Both identity columns are read per window rather
+than per run, and `start-pass` and `start-activity` re-detect the orchestrator
+as they open, so a main agent that changes model or effort part way through
+shows the change on the rows after it. Detection that comes back unknown leaves
+the stored identity alone, because a window that cannot answer must not erase
+the answer already recorded.
+
+Results come from the same event stream, over the interval that starts at one
+window and ends at the next: findings opened after a review make it `N found`,
+a landed repair batch makes a fix `N landed`, verdicts recorded after a closure
+review make it `N fixed` plus `M open` or `M new` where those apply, an activity
+shows the `--result` its own launcher recorded, and any non-completed status
+shows itself. The interval is what does the attributing — the main agent opens,
+dispatches, and settles findings in the gap after a window closes, not while it
+runs.
+
+Project and phase percentages have independent unchanged timers. Each also
+carries an ETA: the elapsed clock extended across what the displayed percentage
+says remains, added to the current time, and printed as an arrival —
+`today HH:MM`, `tomorrow HH:MM`, or `YYYY-MM-DD HH:MM` further out, always on a
+24-hour clock. A remaining duration has to be added to the clock by hand every
+time it is read, and the answer changes with every report; an arrival is that
+addition already done. It is omitted at 0 and 100, where there is no rate to
+extend or nothing left to extend it over. Because the projection reads the same
+capped number the row displays, it never contradicts the percentage beside it,
+and it inherits that number's accuracy: derived phase counts for the project,
+the reporter's estimate for the phase.
+
+`timeline` renders the stage table alone, for one phase or for every phase of
+the run, and needs no open window. It answers the questions asked after the
+fact — how many fix passes a phase took, how long each review ran — without
+reading the event stream by hand.
 
 The last line is the wall clock: `now <local timestamp>` and, when it can be
 resolved, `next report <time>` — the date is repeated there only when the next
-tick lands on a later day. Every other number in the header is a duration, which
-says how long but never when; this line is what tells a reader whether the report
-in front of them is current and how long until the next one. The next tick comes
+tick lands on a later day. The elapsed and unchanged columns are durations, which
+say how long but never when, and an ETA says when the work lands rather than when
+this report was made; this line is what tells a reader whether the report in
+front of them is current and how long until the next one. The next tick comes
 from `${SESSION_DIR}/progress_timer` when a timer is armed and its deadline is
 still ahead, and otherwise from `PLAN_DELEGATE_PROGRESS_INTERVAL_SECONDS` in
 `delegate.conf` — the same key `progress_timer.sh` reads, so the reported time and

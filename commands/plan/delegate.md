@@ -366,9 +366,15 @@ when the main agent runs it itself -- verification, smoke, style. `verify.sh`
 opens and closes its own activity whenever `PLAN_DELEGATE_SESSION_DIR` is set;
 open one by hand for other main-agent work with
 `progress_history.py start-activity --session-dir "${SESSION_DIR}" --label <label> --activity <what>`
-and close it with `finish-activity`. Activities render an identical header and
-are invisible to `findings.py`, so they never touch convergence counting -- which
-is exactly why <PassOwnership/> forbids faking a pass for the same purpose.
+and close it with
+`finish-activity --session-dir "${SESSION_DIR}" --status <status> --result <outcome>`.
+Keep `--label` to one or two words -- it is the row's name in the stage table --
+and make `--result` the short outcome that row should show: `pass`, `clean`,
+`no change`. Without one the row can only say `done`, which reports that the
+window closed rather than what it found. Activities sit in that table beside
+passes and are invisible to `findings.py`, so they never touch convergence
+counting -- which is exactly why <PassOwnership/> forbids faking a pass for the
+same purpose.
 
 On a Claude timer notification or Codex poll timeout:
 
@@ -410,11 +416,15 @@ On a Claude timer notification or Codex poll timeout:
 
    Include the override reason only when rejecting an applicable calibrated
    value. The recorder refreshes any legacy run whose project clock was not
-   script-resolved. Copy the resulting Markdown header exactly. Durations below
-   one day are always `HH:MM:SS`; longer durations are
-   `<days> day(s) HH:MM:SS`. Its last line is the wall clock — `now` and the
-   next report time, both computed by the recorder from the same interval the
-   timer uses. Never write, adjust, or drop that line by hand.
+   script-resolved. Copy the resulting Markdown header exactly, both tables
+   included: the first carries the project and phase clocks, the second every
+   stage the phase has opened — implementation, each review, each fix, each
+   main-agent activity — in the order they ran. Durations below one day are
+   always `HH:MM:SS`; longer durations are `<days> day(s) HH:MM:SS`, and the
+   `ETA` column is an arrival time rather than a duration. Its last line is the
+   wall clock — `now` and the next report time, both computed by the recorder
+   from the same interval the timer uses. Never write, adjust, or drop that
+   line, reorder a table, or edit a cell by hand.
 5. Add two or three ordinary-English sentences covering current activity,
    material work now present, and what remains.
 
@@ -463,7 +473,15 @@ On a Claude timer notification or Codex poll timeout:
    immediately to <CodexDispatchWait/> on the same session and reads the
    interval again before polling.
 
-A user-requested status check performs steps 1-5 immediately. If the user stops
+A user-requested status check performs steps 1-5 immediately. A question about
+work already finished — how many fix passes there have been, how long a review
+took, what an earlier phase ran — is answered by
+
+`python3 ~/.claude/scripts/delegate/progress_history.py timeline --session-dir "${SESSION_DIR}" [--phase <id>]`
+
+which renders the same stage table for one phase or for every phase of the run.
+Read the answer from it rather than counting passes from memory or grepping the
+event stream by hand. If the user stops
 updates, stop and clear any Claude timer and set
 `PROGRESS_UPDATES_ENABLED=false` for the rest of the run; Codex keeps polling
 without reports.
