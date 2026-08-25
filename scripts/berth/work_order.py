@@ -327,12 +327,18 @@ def _select_work_orders(
     if isinstance(selection, EveryWorkOrderSelection):
         return sources
     phase_selection = selection.phase
-    selected = tuple(
-        source
-        for source in sources
-        if source.phase == phase_selection
-        or phase_selection.casefold() in source.phase_heading.casefold()
-    )
+    # An exact phase identifier wins outright. The heading substring match is a
+    # convenience for selecting by title, and on its own it makes every
+    # single-digit selector ambiguous once a plan reaches ten phases ("1" is a
+    # substring of "Phase 10"). Falling back to it only when nothing matched
+    # exactly keeps both spellings usable.
+    selected = tuple(source for source in sources if source.phase == phase_selection)
+    if not selected:
+        selected = tuple(
+            source
+            for source in sources
+            if phase_selection.casefold() in source.phase_heading.casefold()
+        )
     if not selected:
         raise WorkOrderValidationError(
             [f"no Work Order matches phase selector {phase_selection!r}"]
