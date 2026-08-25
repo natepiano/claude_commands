@@ -1239,6 +1239,211 @@ class ProgressHistoryTests(unittest.TestCase):
         self.assertEqual((stage_rows[4][1], stage_rows[4][2]), ("gpt-main xhigh", ""))
         self.assertEqual(stage_rows[0][1], "gpt-main xhigh")
 
+    def write_agents_registry(self) -> None:
+        """A registry under the temporary home, so arm-review resolves the same
+        agent review.sh would without reading this machine's real assignments."""
+        config = self.root / ".claude" / "config"
+        config.mkdir(parents=True, exist_ok=True)
+        _ = (config / "agents.conf").write_text(
+            "\n".join(
+                (
+                    "[assignments]",
+                    "delegate=codex",
+                    "",
+                    "[delegate.codex]",
+                    "implementation=gpt-called:xhigh",
+                    "review=gpt-blind:max",
+                    "",
+                    "[codex.agents]",
+                    "gpt-called=low,medium,high,xhigh,max",
+                    "gpt-blind=low,medium,high,xhigh,max",
+                    "",
+                )
+            ),
+            encoding="utf-8",
+        )
+
+    def arm_early_review(self, session_dir: Path, at: int) -> str:
+        return self.run_command(
+            "arm-review",
+            "--session-dir",
+            str(session_dir),
+            "--activity",
+            "reviewing the diff the writer is still producing",
+            "--called-task",
+            "delegate.review",
+            at=at,
+        )
+
+    def test_an_early_review_runs_as_its_own_row_beside_the_open_pass(self) -> None:
+        """The one moment two agents work at once, shown as two running rows."""
+        self.write_agents_registry()
+        started_at = 90_000
+        session_dir = self.start_run("early", started_at)
+        self.start_phase_and_pass(session_dir, started_at)
+        _ = self.arm_early_review(session_dir, started_at + 100)
+        header = self.run_command(
+            "progress",
+            "--session-dir",
+            str(session_dir),
+            "--project-raw-percent",
+            "40",
+            "--project-percent",
+            "40",
+            "--phase-raw-percent",
+            "75",
+            "--phase-percent",
+            "75",
+            "--cap-stage",
+            "implementation",
+            "--activity",
+            "correcting retry recovery",
+            at=started_at + 160,
+        )
+        stage_rows = self.table_rows(
+            header,
+            ["Stage", "Main", "Delegate", "Start", "Elapsed", "Result"],
+        )
+        self.assertEqual(
+            [(row[0], row[2], row[4], row[5]) for row in stage_rows],
+            [
+                ("Fix 2", "gpt-called high", "00:02:30", "running"),
+                ("Review 1", "gpt-blind max", "00:01:00", "running (early)"),
+            ],
+        )
+        # The report is about the writer, so the sentence beneath the table names
+        # it -- not the reviewer, whose row is now the last one.
+        self.assertIn("▸ **Fix 2 - correcting retry recovery**", header)
+
+    def test_the_early_reviewers_real_pass_supersedes_its_armed_row(self) -> None:
+        self.write_agents_registry()
+        started_at = 91_000
+        session_dir = self.start_run("adopted", started_at)
+        self.start_phase_and_pass(session_dir, started_at)
+        _ = self.arm_early_review(session_dir, started_at + 100)
+        _ = self.run_command(
+            "finish-pass",
+            "--session-dir",
+            str(session_dir),
+            "--status",
+            "completed",
+            at=started_at + 200,
+        )
+        _ = self.run_command(
+            "start-pass",
+            "--session-dir",
+            str(session_dir),
+            "--pass-kind",
+            "review",
+            "--activity",
+            "reviewing the finished diff",
+            "--called-task",
+            "delegate.review",
+            "--called-family",
+            "codex",
+            "--called-model",
+            "gpt-blind",
+            "--called-effort",
+            "max",
+            at=started_at + 210,
+        )
+        rendered = self.run_command(
+            "timeline",
+            "--session-dir",
+            str(session_dir),
+            at=started_at + 240,
+        )
+        stage_rows = self.table_rows(
+            rendered,
+            ["Stage", "Main", "Delegate", "Start", "Elapsed", "Result"],
+        )
+        self.assertEqual(
+            [(row[0], row[5]) for row in stage_rows],
+            [("Fix 2", "done"), ("Review 1", "running")],
+        )
+        disarmed = [
+            event
+            for event in self.read_events("adopted")
+            if event.get("event_type") == "early_review_disarmed"
+        ]
+        self.assertEqual([event["reason"] for event in disarmed], ["adopted"])
+
+    def test_a_killed_early_reviewer_leaves_no_row_behind(self) -> None:
+        """A marker outliving its launcher would show a phantom agent working."""
+        self.write_agents_registry()
+        started_at = 92_000
+        session_dir = self.start_run("orphan", started_at)
+        self.start_phase_and_pass(session_dir, started_at)
+        _ = self.arm_early_review(session_dir, started_at + 100)
+        dead = subprocess.Popen(["true"])
+        _ = dead.wait()
+        pid_file = session_dir / "review_pid"
+        _ = pid_file.write_text(f"{dead.pid}\n", encoding="utf-8")
+        os.utime(pid_file, (started_at + 110, started_at + 110))
+        rendered = self.run_command(
+            "timeline",
+            "--session-dir",
+            str(session_dir),
+            at=started_at + 160,
+        )
+        stage_rows = self.table_rows(
+            rendered,
+            ["Stage", "Main", "Delegate", "Start", "Elapsed", "Result"],
+        )
+        self.assertEqual([row[0] for row in stage_rows], ["Fix 2"])
+
+    def test_a_reviewer_that_failed_before_delivery_leaves_no_row_behind(self) -> None:
+        """review.sh's own status retires the row a killed launcher cannot."""
+        self.write_agents_registry()
+        started_at = 94_000
+        session_dir = self.start_run("failed-early", started_at)
+        self.start_phase_and_pass(session_dir, started_at)
+        status = session_dir / "review_status"
+        # The status a previous pass left behind must not retire the new row.
+        _ = status.write_text("reviewed\n", encoding="utf-8")
+        os.utime(status, (started_at + 50, started_at + 50))
+        _ = self.arm_early_review(session_dir, started_at + 100)
+        armed = self.run_command(
+            "timeline",
+            "--session-dir",
+            str(session_dir),
+            at=started_at + 120,
+        )
+        self.assertIn("running (early)", armed)
+
+        _ = status.write_text("error\n", encoding="utf-8")
+        os.utime(status, (started_at + 130, started_at + 130))
+        retired = self.run_command(
+            "timeline",
+            "--session-dir",
+            str(session_dir),
+            at=started_at + 140,
+        )
+        self.assertNotIn("running (early)", retired)
+
+    def test_arming_an_early_review_without_an_open_pass_is_refused(self) -> None:
+        started_at = 93_000
+        session_dir = self.start_run("unpaired", started_at)
+        self.start_phase_and_pass(session_dir, started_at)
+        _ = self.run_command(
+            "finish-pass",
+            "--session-dir",
+            str(session_dir),
+            "--status",
+            "completed",
+            at=started_at + 60,
+        )
+        failure = self.run_failing_command(
+            "arm-review",
+            "--session-dir",
+            str(session_dir),
+            "--activity",
+            "reviewing nothing in particular",
+            at=started_at + 70,
+        )
+        self.assertNotEqual(failure.returncode, 0)
+        self.assertIn("a pass must be open", failure.stderr)
+
     def test_an_activity_records_its_own_identity_not_the_finished_pass(self) -> None:
         """A finished pass stays in state; it used to stamp every later event."""
         started_at = 70_000

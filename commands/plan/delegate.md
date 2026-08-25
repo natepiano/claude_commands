@@ -405,7 +405,11 @@ On a Claude timer notification or Codex poll timeout:
    count directly, without an active phase and pass:
 
    `python3 ~/.claude/scripts/delegate/progress_history.py phase-count --plan-doc "<plan>" [--phase-percent N]`
-4. Run:
+4. Apply <EarlyReviewArm/>: the evidence steps 2-3 just gathered is its input,
+   and this tick is its only trigger point. It runs **before** the recorder,
+   never after, so that when it does launch a reviewer the stage table this
+   tick is about to print already carries both rows.
+5. Run:
 
    `python3 ~/.claude/scripts/delegate/progress_history.py calibrate --session-dir "${SESSION_DIR}" --candidate-percent "${PHASE_RAW_PERCENT}"`
 
@@ -428,7 +432,14 @@ On a Claude timer notification or Codex poll timeout:
    last line is the wall clock — `now` and the next report time, both computed
    by the recorder from the same interval the timer uses. Never write, adjust,
    or drop that line, reorder a table, or edit a cell by hand.
-5. Add two or three ordinary-English sentences covering current activity,
+
+   Two stage rows read `running` at once only after step 4 armed an early
+   reviewer, and that is the table's whole point there: the writer and the
+   reviewer are working at the same time, and the reviewer's row says
+   `running (early)` because it started on a diff that was not finished yet.
+   Say so in the prose below rather than leaving the reader to infer it from
+   two rows that both look live.
+6. Add two or three ordinary-English sentences covering current activity,
    material work now present, and what remains.
 
    **Open by saying what this phase gives the person using the tool, then report
@@ -469,25 +480,23 @@ On a Claude timer notification or Codex poll timeout:
    insertions, or file counts: the user can already see the diff, so a line
    total displaces the one thing only the reporter knows — what the code now
    does.
-6. Apply <EarlyReviewArm/>: the evidence steps 2-3 just gathered is its input,
-   and this tick is its only trigger point.
 7. If the dispatch remains active, Claude reads the interval again, launches a
    fresh one-shot timer, replaces the handle, and ends the turn. Codex returns
    immediately to <CodexDispatchWait/> on the same session and reads the
    interval again before polling.
 
 **An armed timer is never a substitute for the report.** Every turn that arms or
-re-arms a timer emits steps 1-5 first — both tables and the wall-clock line —
+re-arms a timer emits steps 1-6 first — both tables and the wall-clock line —
 and a bare "timer re-armed" line is a dropped report, not a short one. This
 matters most where it is easiest to skip: a Stop-hook block reads as a
 mechanical complaint about a missing file, so the reflex is to relaunch the
 script and end the turn. But the hook fires on the turn the user was owed an
 update and did not get one, and the timer file is only how it noticed. Re-arming
 without reporting answers the hook and leaves the user exactly where they were.
-Steps 1-5 are cheap: the recorder emits both tables, and the prose is three
+Steps 1-6 are cheap: the recorder emits both tables, and the prose is three
 sentences.
 
-A user-requested status check performs steps 1-5 immediately. A question about
+A user-requested status check performs steps 1-6 immediately. A question about
 work already finished — how many fix passes there have been, how long a review
 took, what an earlier phase ran — is answered by
 
@@ -922,9 +931,25 @@ At ≥75%, in the same tick:
    diff, and the exact final-diff and ready-sentinel paths below.
 5. Launch `review.sh` exactly as <DualReview/> step 3 does, appending one extra
    final argument: `${SESSION_DIR}/final_diff_${REVIEW_PASS}.ready`. Save the
-   handle as `${REVIEW_DISPATCH_HANDLE}`, set `EARLY_REVIEW=launched`, and tell
-   the user in one line. Do not disturb `${DISPATCH_HANDLE}` or the tick's
-   timer re-arm.
+   handle as `${REVIEW_DISPATCH_HANDLE}` and set `EARLY_REVIEW=launched`. Do not
+   disturb `${DISPATCH_HANDLE}` or the tick's timer re-arm.
+6. Give the reviewer its row in the stage table, so the tick's report shows two
+   agents working rather than one:
+
+   `python3 ~/.claude/scripts/delegate/progress_history.py arm-review --session-dir "${SESSION_DIR}" --activity "<what this reviewer is checking>" --called-task <delegate.review or delegate.architect>`
+
+   Run it before the recorder call in <ProgressContract/> step 5, which is what
+   prints the table. The command opens no pass and writes no pass event, so it
+   cannot forge anything convergence counts — it is a presentation marker and
+   nothing else. It resolves the reviewer's agent from the same registry
+   `review.sh` uses, and retires its own row when `review.sh` reports an error
+   or its process is gone, so the table never shows a reviewer that stopped
+   working. The real review pass, recorded by `review.sh` when the ready
+   sentinel releases it, supersedes the marker automatically.
+
+   A one-line announcement is no longer the delivery here. The two running rows
+   are, and they carry what a sentence cannot: which agent each one is, when it
+   started, and how long it has been going.
 
 The extra argument makes `review.sh` defer its `start-pass` until the sentinel
 appears, so the implementation pass and review pass never overlap in the
@@ -961,6 +986,16 @@ dispatch. Treat it exactly as a reviewer error before delivery, and say in one
 line that the review is being discarded and why. A void verdict is often
 fluent and specific — a stale diff supports confident claims about missing work
 — so the check is the timing, never how convincing the text reads.
+
+**Every path above that ends an early launch before its real pass starts also
+drops the row it was given** — cancellation, a reviewer error before delivery,
+and a void verdict alike:
+
+`python3 ~/.claude/scripts/delegate/progress_history.py disarm-review --session-dir "${SESSION_DIR}" --reason "<canceled|reviewer error|void verdict>"`
+
+Run it alongside clearing `${REVIEW_DISPATCH_HANDLE}` and `EARLY_REVIEW`. The
+row would retire itself at the next report anyway; this is how the reason
+reaches the record, and it is what keeps that report from having to guess.
 </EarlyReviewArm>
 
 <BroadReviewPrompt>
@@ -1104,7 +1139,7 @@ Summary and reference numbers must match. A reader should not need the plan,
 diff, reviews, or finding ids.
 
 **Close every delegation result with the current progress header** — both tables
-and the wall-clock line, produced by <ProgressContract/> steps 3 and 4 with the
+and the wall-clock line, produced by <ProgressContract/> steps 3 and 5 with the
 current pass or activity. This is not conditional on what the result led to. A
 review that came back clean, a fix that landed, a verification that passed, and
 a pass that ends the phase all close the same way as one that launches a repair;

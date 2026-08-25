@@ -31,6 +31,13 @@ DEFAULT_PERCENT_SPREAD = 10.0
 # the work is half as far along as it says, at best twice.
 RATE_FACTOR_LIMIT = 2.0
 STATE_FILENAME = "progress_history_state.json"
+# Where the early reviewer lives between its launch and the ready sentinel that
+# releases its real pass. The recorder holds one pass at a time by design, so an
+# early launch has nowhere to be recorded and the stage table showed only the
+# implementer -- exactly during the window where the reader most needs to see
+# that two agents are running. This marker is presentation-only: it opens no
+# pass, and `findings.py` counts pass events, so convergence never sees it.
+ARMED_REVIEW_KEY = "early_review"
 PROJECT_STARTED_PATTERN = re.compile(
     r"^[ \t]*-[ \t]+\*\*Project started:\*\*[ \t]*(?P<value>.+?)[ \t]*$",
     re.MULTILINE,
@@ -940,6 +947,7 @@ def _start_phase(args: argparse.Namespace) -> None:
     }
     state["phase"] = phase
     state["pass"] = None
+    state[ARMED_REVIEW_KEY] = None
     state["phase_last_percent"] = None
     state["phase_percent_started_at"] = None
     state["last_percent"] = None
@@ -985,6 +993,11 @@ def _start_pass(args: argparse.Namespace) -> None:
     _write_state(session_dir, state)
     event = _event(state, "pass_started", now)
     _append_event(state, event)
+    # The reviewer this pass belongs to has been rendering as an armed row since
+    # its early launch; its real window supersedes that one rather than joining
+    # it, so the marker retires here instead of leaving two review rows.
+    if pass_kind == "review":
+        _ = _clear_armed_review(session_dir, _read_state(session_dir), "adopted", now)
 
 
 def _finish_pass(args: argparse.Namespace) -> None:
@@ -1007,6 +1020,125 @@ def _finish_pass(args: argparse.Namespace) -> None:
                 "No pass is open, so no launcher was orphaned and nothing was recorded"
             )
     _close_active_pass(session_dir, state, status, _now_epoch())
+
+
+def _resolve_delegate_agent(task: str) -> AgentIdentity:
+    """Ask the shared agent registry which agent a task resolves to.
+
+    The early reviewer is armed by the orchestrator in the same turn it launches
+    `review.sh`, so the launcher has not written its resolved identity yet and
+    waiting for it would be a poll. Resolving through the same bash entry point
+    the launcher uses gives the Delegate cell the same answer with no race.
+    """
+    resolver = Path(__file__).resolve().parent.parent / "agents" / "agents_config.sh"
+    unknown = AgentIdentity(family="", model="", effort="", session_id="")
+    if not resolver.is_file():
+        return unknown
+    try:
+        result = subprocess.run(
+            ["bash", "-c", 'source "$1" && agents_resolve_print "$2"', "_", str(resolver), task],
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return unknown
+    if result.returncode != 0:
+        return unknown
+    fields = dict(
+        part.split("=", 1)
+        for part in result.stdout.strip().split(" ")
+        if "=" in part
+    )
+    return AgentIdentity(
+        family=fields.get("family", ""),
+        model=fields.get("agent", ""),
+        effort=fields.get("effort", "") or "unset",
+        session_id="",
+    )
+
+
+def _arm_review(args: argparse.Namespace) -> None:
+    """Record that a blind reviewer is running alongside the open pass.
+
+    Deliberately not launcher-owned: no pass is opened and no pass event is
+    written, so nothing convergence counts can be forged from here. The marker
+    only earns the reviewer a row in the stage table while the writer it
+    overlaps is still going.
+    """
+    session_dir = _session_dir(args)
+    state = _read_state(session_dir)
+    phase = _object_dict(state.get("phase"))
+    if phase is None or _string(phase.get("status")) != "active":
+        raise SystemExit("Start a phase before arming an early review")
+    current_pass = _object_dict(state.get("pass"))
+    if current_pass is None or _string(current_pass.get("status")) != "active":
+        raise SystemExit(
+            "An early review is the reviewer that overlaps a running dispatch, so "
+            + "a pass must be open. With none open the review is not early -- "
+            + "launch it through review.sh and let it record its own pass."
+        )
+    now = _now_epoch()
+    called_task = _arg_string(args, "called_task", "delegate.review") or "delegate.review"
+    armed: dict[str, object] = {
+        "instance_id": str(uuid.uuid4()),
+        "kind": "review",
+        "phase_instance_id": _string(phase.get("instance_id")),
+        "activity": _arg_string(args, "activity"),
+        "started_at": now,
+        "called_task": called_task,
+        "called_agent": _resolve_delegate_agent(called_task),
+        "status_file": str(session_dir / "review_status"),
+        "pid_file": str(session_dir / "review_pid"),
+        "status": "armed",
+    }
+    state[ARMED_REVIEW_KEY] = armed
+    _write_state(session_dir, state)
+    event = _event(state, "early_review_armed", now)
+    event.update(
+        {
+            "early_review_instance_id": _string(armed.get("instance_id")),
+            "early_review_activity": _string(armed.get("activity")),
+        }
+    )
+    _append_event(state, event)
+
+
+def _clear_armed_review(
+    session_dir: Path,
+    state: dict[str, object],
+    reason: str,
+    now: float,
+) -> bool:
+    armed = _object_dict(state.get(ARMED_REVIEW_KEY))
+    if armed is None:
+        return False
+    state[ARMED_REVIEW_KEY] = None
+    _write_state(session_dir, state)
+    event = _event(state, "early_review_disarmed", now)
+    event.update(
+        {
+            "early_review_instance_id": _string(armed.get("instance_id")),
+            "reason": reason,
+            "early_review_elapsed_seconds": max(
+                0,
+                int(now - _number(armed.get("started_at"), now)),
+            ),
+        }
+    )
+    _append_event(state, event)
+    return True
+
+
+def _disarm_review(args: argparse.Namespace) -> None:
+    session_dir = _session_dir(args)
+    state = _read_state(session_dir)
+    _ = _clear_armed_review(
+        session_dir,
+        state,
+        _arg_string(args, "reason", "cleared") or "cleared",
+        _now_epoch(),
+    )
 
 
 def _load_events() -> tuple[list[dict[str, object]], int]:
@@ -1620,6 +1752,82 @@ def _live_window(state: dict[str, object], now: float) -> StageWindow | None:
     )
 
 
+def _launcher_file_written_since(path_value: str, epoch: float) -> str | None:
+    """A launcher-written file's contents, or None when it predates `epoch`."""
+    if not path_value:
+        return None
+    path = Path(path_value)
+    try:
+        if path.stat().st_mtime <= epoch:
+            return None
+        return path.read_text(encoding="utf-8").strip()
+    except OSError:
+        return None
+
+
+def _early_reviewer_working(armed: dict[str, object]) -> bool:
+    """Whether the launcher behind an armed row is still doing the review.
+
+    Two files `review.sh` writes, because neither covers the other. Its status
+    catches a reviewer that failed before delivery and left the marker standing;
+    its pid catches a kill, which writes no status at all.
+
+    Both are believed only once written after the arm. At launch each still
+    holds the previous pass's value, and reading that would retire the row
+    before this reviewer had drawn breath -- the same stale-artifact trap the
+    early launch itself has to clear before it starts.
+    """
+    started_at = _number(armed.get("started_at"))
+    status = _launcher_file_written_since(_string(armed.get("status_file")), started_at)
+    if status is not None and status != "reviewing":
+        return False
+    pid = _launcher_file_written_since(_string(armed.get("pid_file")), started_at)
+    if pid is None or not pid.isdigit():
+        return True
+    try:
+        os.kill(int(pid), 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def _armed_window(
+    state: dict[str, object],
+    phase_instance_id: str,
+    now: float,
+) -> StageWindow | None:
+    """The early reviewer's row, running beside the pass it overlaps.
+
+    Rendered from the marker rather than an event, and dropped the moment the
+    launcher that owns it is gone: a marker outliving a killed reviewer would
+    show a phantom agent working, which is worse than showing nothing.
+    """
+    armed = _object_dict(state.get(ARMED_REVIEW_KEY))
+    if armed is None or _string(armed.get("status")) != "armed":
+        return None
+    if _string(armed.get("phase_instance_id")) != phase_instance_id:
+        return None
+    if not _early_reviewer_working(armed):
+        return None
+    model, effort = _agent_fields(armed, "called_agent")
+    main_model, main_effort = _agent_fields(state, "main_agent")
+    started_at = _number(armed.get("started_at"), now)
+    return StageWindow(
+        instance_id=_string(armed.get("instance_id")) or "armed",
+        kind="review",
+        fix_round=0,
+        label="",
+        started_at=started_at,
+        elapsed=max(0, int(now - started_at)),
+        status="armed",
+        result="running (early)",
+        delegate=_agent_display(model, effort),
+        main=_agent_display(main_model, main_effort),
+    )
+
+
 def _phase_windows(
     events: list[dict[str, object]],
     state: dict[str, object],
@@ -1657,6 +1865,11 @@ def _phase_windows(
         live = _live_window(state, now)
         if live is not None:
             windows[live["instance_id"]] = live
+        # Two rows can be running at once, and only here: an early-launched
+        # reviewer reading the diff the writer beside it is still producing.
+        armed = _armed_window(state, phase_instance_id, now)
+        if armed is not None:
+            windows[armed["instance_id"]] = armed
     return sorted(windows.values(), key=lambda window: window["started_at"])
 
 
@@ -1721,8 +1934,8 @@ def _finding_tally(
 
 def _window_result(window: StageWindow, tally: FindingTally) -> str:
     status = window["status"]
-    if status == "running":
-        return "running"
+    if status in ("running", "armed"):
+        return window["result"] or "running"
     if status not in ("completed", "open"):
         return status
     if window["kind"] == "activity":
@@ -1744,13 +1957,19 @@ def _window_result(window: StageWindow, tally: FindingTally) -> str:
     return "done"
 
 
-def _stage_rows(
+def _stage_table(
     events: list[dict[str, object]],
     state: dict[str, object],
     phase_instance_id: str,
     now: float,
     include_live: bool = True,
-) -> list[list[str]]:
+) -> tuple[list[StageWindow], list[str], list[list[str]]]:
+    """The phase's windows, their labels, and the rows rendered from both.
+
+    Callers that only print take the rows; the progress header also needs the
+    label of one particular window, which it can no longer find by position now
+    that a second row can be running.
+    """
     windows = _phase_windows(events, state, phase_instance_id, now, include_live)
     findings = [
         event
@@ -1776,7 +1995,17 @@ def _stage_rows(
                 _window_result(window, _finding_tally(findings, window["started_at"], upper)),
             ]
         )
-    return rows
+    return windows, labels, rows
+
+
+def _stage_rows(
+    events: list[dict[str, object]],
+    state: dict[str, object],
+    phase_instance_id: str,
+    now: float,
+    include_live: bool = True,
+) -> list[list[str]]:
+    return _stage_table(events, state, phase_instance_id, now, include_live)[2]
 
 
 def _render_table(
@@ -2247,16 +2476,26 @@ def _progress(args: argparse.Namespace) -> None:
                 _percent_spread(phase_calibration),
             )
         )
-        stage_rows = _stage_rows(
+        stage_windows, stage_labels, stage_rows = _stage_table(
             _run_events(state),
             state,
             _string(phase.get("instance_id")),
             now,
         )
-        # The running window is the newest one, so its row is the last row; the
-        # sentence beneath the table is what a fixed-width Result column cannot
-        # carry.
-        live_label = stage_rows[-1][0] if stage_rows else _pass_display(current_pass)
+        # The sentence beneath the table is what a fixed-width Result column
+        # cannot carry, and it belongs to the window this report is about. That
+        # is not simply the last row: an early-launched reviewer runs beside the
+        # writer and starts later, so position would name the reviewer and
+        # describe it with the writer's activity.
+        reported_id = _string(current_pass.get("instance_id"))
+        live_label = next(
+            (
+                stage_labels[index]
+                for index, window in enumerate(stage_windows)
+                if window["instance_id"] == reported_id
+            ),
+            stage_labels[-1] if stage_labels else _pass_display(current_pass),
+        )
         lines = [
             _scope_line(state, plan_phase_counts),
             "",
@@ -2303,6 +2542,8 @@ def _finish_phase(args: argparse.Namespace) -> None:
     state = _read_state(session_dir)
     _close_active_activity(session_dir, state, "interrupted", "", now)
     state = _read_state(session_dir)
+    if _clear_armed_review(session_dir, state, "phase ended", now):
+        state = _read_state(session_dir)
     phase = _object_dict(state.get("phase"))
     if phase is None or _string(phase.get("status")) != "active":
         return
@@ -2447,6 +2688,23 @@ def _build_parser() -> argparse.ArgumentParser:
         help="close the open pass of a launcher the orchestrator killed (--status canceled only)",
     )
     finish_pass.set_defaults(handler=_finish_pass)
+
+    arm_review = subparsers.add_parser(
+        "arm-review",
+        help="show an early-launched reviewer as a second running row beside the open pass",
+    )
+    _ = arm_review.add_argument("--session-dir", required=True)
+    _ = arm_review.add_argument("--activity", required=True)
+    _ = arm_review.add_argument("--called-task", default="delegate.review")
+    arm_review.set_defaults(handler=_arm_review)
+
+    disarm_review = subparsers.add_parser(
+        "disarm-review",
+        help="drop the early reviewer's row when its launch is canceled or discarded",
+    )
+    _ = disarm_review.add_argument("--session-dir", required=True)
+    _ = disarm_review.add_argument("--reason", default="cleared")
+    disarm_review.set_defaults(handler=_disarm_review)
 
     calibrate = subparsers.add_parser("calibrate")
     _ = calibrate.add_argument("--session-dir", required=True)

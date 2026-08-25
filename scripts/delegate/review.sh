@@ -19,6 +19,10 @@
 #
 # Produces:
 #   <session_dir>/review_status            — "reviewing" while running, "reviewed" on success, "error" on failure
+#   <session_dir>/review_pid               — this wrapper's pid, so a progress
+#                                            report can tell an early-launched
+#                                            reviewer that is still working from
+#                                            one that was killed
 #   <session_dir>/review_findings_<N>.txt  — review findings for pass N
 #   <session_dir>/review_agent_<N>.log     — full agent log for pass N
 #   <session_dir>/review_findings.txt      — symlink to the current pass's findings
@@ -65,6 +69,10 @@ PROGRESS_STATE="${SESSION_DIR}/progress_history_state.json"
 HEARTBEAT_INTERVAL_SECS=60
 
 echo "reviewing" > "${STATUS_FILE}"
+# Only meaningful while an early launch has a row in the stage table, and read
+# there only if it was written after that row was armed — so it is written on
+# every run, before anything can fail, rather than in the early branch alone.
+echo "$$" > "${SESSION_DIR}/review_pid"
 
 source "${SCRIPT_DIR}/../agents/agents_config.sh"
 if ! agents_resolve "${TASK}" 2>"${LOG_FILE}"; then
