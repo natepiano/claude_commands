@@ -94,7 +94,19 @@ EXISTING_FIX_SUMMARY_PREFIX: str = "style_fix worktree already has Fix Summary"
 BOOKKEEPING_REASONS: frozenset[str] = ALWAYS_EXCLUDED_REASONS | FRAMEWORK_FILTER_REASONS
 
 TS_RE = re.compile(r"^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}) ")
-COMPLETE_RE = re.compile(r"=== Clean-fix Rust clean \+ rebuild complete \(([^)]+)\) ===")
+COMPLETE_RE = re.compile(r"=== Clean-fix complete \(([^)]+)\) ===")
+# Logs outlive the code that wrote them: the run-log directory keeps about a
+# day of logs, and without this historical banner a finished run reads as running.
+HISTORICAL_COMPLETE_RE = re.compile(
+    r"=== Clean-fix Rust clean \+ rebuild complete \(([^)]+)\) ==="
+)
+
+
+def match_completion_banner(line: str) -> re.Match[str] | None:
+    """Match a current or retained historical completion banner."""
+    return COMPLETE_RE.search(line) or HISTORICAL_COMPLETE_RE.search(line)
+
+
 EVAL_HEADER_RE = re.compile(r"=== Style evaluation: (\d+) projects ===")
 EVAL_DONE_RE = re.compile(r"=== Done: (\d+) succeeded, (\d+) failed out of (\d+) ===")
 REVIEW_HEADER_RE = re.compile(r"=== Style eval review(?: \([^)]+\))?: (\d+) projects ===")
@@ -1294,7 +1306,7 @@ def parse_log(path: Path) -> ParseResult:
             result.run_start = m.group(1)
             break
     for line in lines:
-        m = COMPLETE_RE.search(line)
+        m = match_completion_banner(line)
         if m:
             result.elapsed = m.group(1)
             ts = TS_RE.match(line)
@@ -1916,7 +1928,7 @@ def detect_current_phase(path: Path) -> tuple[str, str]:
     if not lines:
         return ("unknown", "")
 
-    if any("=== Clean-fix Rust clean + rebuild complete" in line for line in lines):
+    if any(match_completion_banner(line) is not None for line in lines):
         return ("done", lines[-1] if lines else "")
 
     # Walk from end backwards looking for the latest phase signal.

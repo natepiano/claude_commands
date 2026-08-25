@@ -1,38 +1,19 @@
 #!/bin/bash
-# Clean-fix orchestrator.
-# Usage: clean-fix.sh [clean|style] [project]
-#        clean-fix.sh [project]
+# Clean-fix style orchestrator.
+# Usage: clean-fix.sh [project]
 #        clean-fix.sh run_once
-#   clean — settings back-populate + cargo clean/build/mend + warmup
-#           (nightly via com.natemccoy.cargo-clean, 4:00 AM calendar)
-#           The mend step is the one stage here gated by config/lint.conf
-#           (mend=off, set with /lint_config) rather than by the clean-fix
-#           agent-assignments file; it is skipped on its own, and clean,
-#           build, and warmup still run.
-#   style — style eval + review + fix worktrees
-#           (every 10 min via com.natemccoy.style-fix, no idle gate)
-#   run_once — one style eval + review + fix pass across all configured
-#              projects, ignoring persistent stage enablement
-#   no scope — both, in order (manual /clean_fix run)
-# The launchd triggers share one pgrep guard on this script's path, so the
-# two scopes never run concurrently.
+#   [project] — optionally filter the style eval, review, and fix pass
+#   run_once — run one pass across all configured projects, ignoring persistent
+#              stage enablement
 
 set -euo pipefail
 
-SCOPE="all"
+RUN_ONCE_REQUESTED="false"
 PROJECT_FILTER=""
 if [[ $# -gt 0 ]]; then
     case "$1" in
-        clean|style|all)
-            SCOPE="$1"
-            PROJECT_FILTER="${2:-}"
-            if [[ $# -gt 2 ]]; then
-                echo "Usage: clean-fix.sh [clean|style] [project]" >&2
-                exit 1
-            fi
-            ;;
         run_once)
-            SCOPE="$1"
+            RUN_ONCE_REQUESTED="true"
             if [[ $# -gt 1 ]]; then
                 echo "Usage: clean-fix.sh run_once" >&2
                 exit 1
@@ -40,10 +21,9 @@ if [[ $# -gt 0 ]]; then
             export CLEAN_FIX_FORCE_STYLE_STAGES=1
             ;;
         *)
-            SCOPE="all"
             PROJECT_FILTER="$1"
             if [[ $# -gt 1 ]]; then
-                echo "Usage: clean-fix.sh [clean|style] [project]" >&2
+                echo "Usage: clean-fix.sh [project]" >&2
                 exit 1
             fi
             ;;
@@ -51,11 +31,9 @@ if [[ $# -gt 0 ]]; then
 fi
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-RUST_DIR="$HOME/rust"
 LOG_DIR="$HOME/.local/logs/clean-fix"
 LOG_FILE="$LOG_DIR/clean-fix-$(date '+%Y%m%d-%H%M%S').log"
 LEGACY_LOG="$HOME/.local/logs/clean-fix.log"
-TIMESTAMP_DIR="$HOME/.local/state/clean-fix"
 CONF_FILE="$SCRIPT_DIR/clean-fix.conf"
 RUN_LOG_RETENTION_MINUTES=1440
 MANUAL_LOG_RETENTION_DAYS=7
@@ -65,8 +43,7 @@ source "$SCRIPT_DIR/agent_assignments.sh"
 export PATH="/opt/homebrew/bin:$HOME/.local/bin:$PATH"
 
 mkdir -p "$LOG_DIR"
-mkdir -p "$TIMESTAMP_DIR"
-# The style scope runs every 10 minutes around the clock. Keep roughly one
+# The pipeline runs every 10 minutes around the clock. Keep roughly one
 # day of scheduled logs plus a short manual-log window so report lists stay
 # focused on runs that are still useful to inspect.
 find "$LOG_DIR" -name 'clean-fix-*.log' -mmin +"$RUN_LOG_RETENTION_MINUTES" -delete 2>/dev/null || true
@@ -95,23 +72,6 @@ log_run_once_summary() {
     } | tee -a "$LOG_FILE"
 }
 
-# Per-project build environment from [project_env] in clean-fix.conf. Echoes the
-# space-separated KEY=VALUE assignments for the given project, or nothing.
-# cargo-mend needs RUSTC_BOOTSTRAP=1 to compile its rustc_private features on
-# stable (the `imend` trick) — the global toolchain is stable.
-project_env_for() {
-    local proj="$1" line section=""
-    [[ -f "$CONF_FILE" ]] || return 0
-    while IFS= read -r line || [[ -n "$line" ]]; do
-        line="${line%%#*}"; line="${line## }"; line="${line%% }"
-        [[ -z "$line" ]] && continue
-        if [[ "$line" =~ ^\[(.+)\]$ ]]; then section="${BASH_REMATCH[1]}"; continue; fi
-        if [[ "$section" == "project_env" && "$line" == "$proj="* ]]; then
-            echo "${line#*=}"; return 0
-        fi
-    done < "$CONF_FILE"
-}
-
 project_key() {
     local entry="$1"
     if [[ "$entry" == */* ]]; then
@@ -124,42 +84,6 @@ project_key() {
 checkout_root() {
     local checkout="$1"
     printf '%s' "${checkout%%/*}"
-}
-
-active_redirect_index_for_build_target() {
-    local target="$1"
-    local i checkout root
-    for ((i = 0; i < ${#cf_ac_keys[@]}; i++)); do
-        checkout="${cf_ac_vals[$i]}"
-        root="$(checkout_root "$checkout")"
-        if [[ "$target" == "${cf_ac_keys[$i]}" || "$target" == "$checkout" || "$target" == "$root" || "$target" == "$root/"* ]]; then
-            printf '%s' "$i"
-            return
-        fi
-    done
-    printf '%s' "-1"
-}
-
-project_identity_for_build_target() {
-    local target="$1"
-    local index
-    index="$(active_redirect_index_for_build_target "$target")"
-    if [[ "$index" == "-1" ]]; then
-        project_key "$target"
-    else
-        project_key "${cf_ac_keys[$index]}"
-    fi
-}
-
-project_display_for_build_target() {
-    local target="$1"
-    local index
-    index="$(active_redirect_index_for_build_target "$target")"
-    if [[ "$index" == "-1" ]]; then
-        project_key "$target"
-    else
-        checkout_root "${cf_ac_vals[$index]}"
-    fi
 }
 
 project_filter_key() {
@@ -178,22 +102,9 @@ project_filter_key() {
     printf '%s' "$normalized"
 }
 
-build_target_matches_filter() {
-    local target="$1"
-    local filter="$2"
-    local target_display target_identity filter_identity
-    [[ -z "$filter" ]] && return 0
-    target_display="$(project_display_for_build_target "$target")"
-    target_identity="$(project_identity_for_build_target "$target")"
-    filter_identity="$(project_filter_key "$filter")"
-    [[ "$target" == "$filter" || "$target_display" == "$filter" || "$target_identity" == "$filter_identity" ]]
-}
-
-# Parse conf file. [build] is an opt-in allowlist of directories to clean/build.
-BUILD_TARGETS=()
+# Parse the active-checkout redirects and reject stale style settings.
 cf_ac_keys=()
 cf_ac_vals=()
-CLEAN_ENABLED=""
 STYLE_EVAL_ENABLED=""
 STYLE_EVAL_AGENT=""
 STYLE_EVAL_MODEL=""
@@ -217,9 +128,6 @@ if [[ -f "$CONF_FILE" ]]; then
             continue
         fi
         case "$current_section" in
-            build)
-                BUILD_TARGETS+=("$stripped")
-                ;;
             active_checkout)
                 if [[ "$stripped" == *=* ]]; then
                     key="$(cf_trim "${stripped%%=*}")"
@@ -258,158 +166,72 @@ cf_load_stage_assignment style_eval_review \
     STYLE_REVIEW_ENABLED STYLE_REVIEW_AGENT STYLE_REVIEW_MODEL STYLE_REVIEW_EFFORT || exit 1
 cf_load_stage_assignment style_fix \
     STYLE_FIX_ENABLED STYLE_FIX_AGENT STYLE_FIX_MODEL STYLE_FIX_EFFORT || exit 1
-cf_load_stage_enabled clean CLEAN_ENABLED || exit 1
 
 START_TIME=$SECONDS
 if [[ -n "$PROJECT_FILTER" ]]; then
-    log "=== Starting clean-fix (scope: $SCOPE, project: $PROJECT_FILTER) ==="
+    log "=== Starting clean-fix (project: $PROJECT_FILTER) ==="
+elif [[ "$RUN_ONCE_REQUESTED" == "true" ]]; then
+    log "=== Starting clean-fix (run_once) ==="
 else
-    log "=== Starting clean-fix (scope: $SCOPE) ==="
+    log "=== Starting clean-fix ==="
 fi
-if [[ "$SCOPE" == "run_once" ]]; then
+if [[ "$RUN_ONCE_REQUESTED" == "true" ]]; then
     log_run_once_summary
 fi
 
-# Back-populate canonical settings.local.json permissions. Runs in every scope:
+# Back-populate canonical settings.local.json permissions before every pass:
 # the style-fix agents depend on these permissions and the script is cheap.
 log "SETTINGS: back-populating canonical permissions..."
 python3 "$SCRIPT_DIR/backpopulate_settings.py" --apply >> "$LOG_FILE" 2>&1 || {
     log "WARNING: settings back-population failed"
 }
 
-if [[ "$SCOPE" != "style" && "$SCOPE" != "run_once" && "$CLEAN_ENABLED" != "true" ]]; then
-    log "SKIP: clean/build disabled in $CLEAN_FIX_AGENT_ASSIGNMENTS_FILE"
-fi
-if [[ "$SCOPE" != "style" && "$SCOPE" != "run_once" && "$CLEAN_ENABLED" == "true" ]]; then
-# Guard so set -u doesn't trip on an empty allowlist expansion.
-if [[ ${#BUILD_TARGETS[@]} -eq 0 ]]; then
-    log "No [build] targets configured — skipping clean/build pass."
-fi
-matched_clean_target=false
-for project_name in ${BUILD_TARGETS[@]+"${BUILD_TARGETS[@]}"}; do
-    project_display="$(project_display_for_build_target "$project_name")"
-    project_identity="$(project_identity_for_build_target "$project_name")"
-    if ! build_target_matches_filter "$project_name" "$PROJECT_FILTER"; then
-        continue
-    fi
-    matched_clean_target=true
-    project_dir="$RUST_DIR/$project_name"
-
-    # A listed target must be a Rust crate/workspace. A missing Cargo.toml means
-    # the opt-in name is wrong, so surface it rather than skip silently. Worktree
-    # checkouts (.git is a file) are valid build targets — each has its own target/.
-    if [[ ! -f "$project_dir/Cargo.toml" ]]; then
-        log "SKIP: $project_display (no Cargo.toml at $project_dir)"
-        continue
-    fi
-
-    # Skip projects not modified since last run
-    timestamp_file="$TIMESTAMP_DIR/$project_display"
-    if [[ -f "$timestamp_file" ]]; then
-        changed=$(find "$project_dir" \( -path "$project_dir/target" -o -path "$project_dir/.claude" \) -prune -o -newer "$timestamp_file" -type f -print -quit)
-        if [[ -z "$changed" ]]; then
-            log "SKIP: $project_display (not modified since last run)"
-            continue
-        fi
-    fi
-
-    # Per-project build env (e.g. cargo-mend needs RUSTC_BOOTSTRAP=1 on stable).
-    proj_env=$(project_env_for "$project_name")
-    if [[ -z "$proj_env" && "$project_display" != "$project_name" ]]; then
-        proj_env=$(project_env_for "$project_display")
-    fi
-    if [[ -z "$proj_env" && "$project_identity" != "$project_display" ]]; then
-        proj_env=$(project_env_for "$project_identity")
-    fi
-    [[ -n "$proj_env" ]] && log "ENV: $project_display ($proj_env)"
-
-    log "CLEAN: $project_display"
-    env $proj_env cargo clean --manifest-path "$project_dir/Cargo.toml" 2>> "$LOG_FILE" || {
-        log "ERROR: cargo clean failed for $project_display"
-        continue
-    }
-
-    log "BUILD: $project_display"
-    env $proj_env cargo build --workspace --examples --manifest-path "$project_dir/Cargo.toml" 2>> "$LOG_FILE" || {
-        log "ERROR: cargo build failed for $project_display"
-        continue
-    }
-
-    # One switch, every consumer: turning mend off with /lint_config also stops
-    # it running unattended here.
-    if bash "$HOME/.claude/scripts/lint/lint_config.sh" enabled mend; then
-        log "MEND: $project_display"
-        env $proj_env "$HOME/.claude/scripts/lint/lint" mend --manifest-path "$project_dir/Cargo.toml" 2>> "$LOG_FILE" || {
-            log "WARNING: cargo mend failed for $project_display"
-        }
-    else
-        log "SKIP: mend for $project_display — mend=off in config/lint.conf"
-    fi
-
-    touch "$timestamp_file"
-    log "DONE: $project_display"
-done
-
-if [[ -n "$PROJECT_FILTER" && "$matched_clean_target" == "false" && "$SCOPE" == "clean" ]]; then
-    log "SKIP: $PROJECT_FILTER (not listed in [build])"
-fi
-
-# Warm up specific projects by launching briefly then killing
-"$SCRIPT_DIR/clean-fix-warmup.sh" ${PROJECT_FILTER:+"$PROJECT_FILTER"} 2>&1 | tee -a "$LOG_FILE" || {
-    log "WARNING: warmup script failed"
-}
-fi  # SCOPE != style
-
 # Run style evaluations and fixes when their stage assignments are enabled.
-if [[ "$SCOPE" != "clean" ]]; then
-    style_args=()
-    if [[ -n "$PROJECT_FILTER" ]]; then
-        style_args+=("$(project_filter_key "$PROJECT_FILTER")")
-    fi
-    if [[ "$STYLE_EVAL_ENABLED" == "true" || "$SCOPE" == "run_once" ]]; then
-        log "Starting style evaluations with family=$STYLE_EVAL_AGENT agent=${STYLE_EVAL_MODEL:-<default>} effort=${STYLE_EVAL_EFFORT:-<default>}..."
-        "$SCRIPT_DIR/style-eval-all.sh" ${style_args[@]+"${style_args[@]}"} 2>&1 | tee -a "$LOG_FILE" || {
-            log "WARNING: style evaluation script failed"
-        }
-    else
-        log "SKIP: style eval disabled in agent-assignments.conf"
-    fi
+style_args=()
+if [[ -n "$PROJECT_FILTER" ]]; then
+    style_args+=("$(project_filter_key "$PROJECT_FILTER")")
+fi
+if [[ "$STYLE_EVAL_ENABLED" == "true" || "$RUN_ONCE_REQUESTED" == "true" ]]; then
+    log "Starting style evaluations with family=$STYLE_EVAL_AGENT agent=${STYLE_EVAL_MODEL:-<default>} effort=${STYLE_EVAL_EFFORT:-<default>}..."
+    "$SCRIPT_DIR/style-eval-all.sh" ${style_args[@]+"${style_args[@]}"} 2>&1 | tee -a "$LOG_FILE" || {
+        log "WARNING: style evaluation script failed"
+    }
+else
+    log "SKIP: style eval disabled in agent-assignments.conf"
+fi
 
-    # Review pass over each project's pending evaluation markdown before the
-    # fix stage spawns.
-    if [[ "$STYLE_REVIEW_ENABLED" == "true" || "$SCOPE" == "run_once" ]]; then
-        log "Reviewing pending evaluation markdown with family=$STYLE_REVIEW_AGENT agent=${STYLE_REVIEW_MODEL:-<default>} effort=${STYLE_REVIEW_EFFORT:-<default>}..."
-        "$SCRIPT_DIR/style-eval-review-all.sh" ${style_args[@]+"${style_args[@]}"} 2>&1 | tee -a "$LOG_FILE" || {
-            log "WARNING: style eval review script failed"
-        }
-    else
-        log "SKIP: style eval review disabled in agent-assignments.conf"
-    fi
+# Review pass over each project's pending evaluation markdown before the
+# fix stage spawns.
+if [[ "$STYLE_REVIEW_ENABLED" == "true" || "$RUN_ONCE_REQUESTED" == "true" ]]; then
+    log "Reviewing pending evaluation markdown with family=$STYLE_REVIEW_AGENT agent=${STYLE_REVIEW_MODEL:-<default>} effort=${STYLE_REVIEW_EFFORT:-<default>}..."
+    "$SCRIPT_DIR/style-eval-review-all.sh" ${style_args[@]+"${style_args[@]}"} 2>&1 | tee -a "$LOG_FILE" || {
+        log "WARNING: style eval review script failed"
+    }
+else
+    log "SKIP: style eval review disabled in agent-assignments.conf"
+fi
 
-    if [[ "$STYLE_FIX_ENABLED" == "true" || "$SCOPE" == "run_once" ]]; then
-        log "Creating style-fix worktrees with family=$STYLE_FIX_AGENT agent=${STYLE_FIX_MODEL:-<default>} effort=${STYLE_FIX_EFFORT:-<default>}..."
-        "$SCRIPT_DIR/style-fix-worktrees.sh" ${style_args[@]+"${style_args[@]}"} 2>&1 | tee -a "$LOG_FILE" || {
-            log "WARNING: style-fix worktree script failed"
-        }
-    else
-        log "SKIP: style fix disabled in agent-assignments.conf"
-    fi
-elif [[ "$SCOPE" == "clean" ]]; then
-    log "SKIP: style scope not selected"
+if [[ "$STYLE_FIX_ENABLED" == "true" || "$RUN_ONCE_REQUESTED" == "true" ]]; then
+    log "Creating style-fix worktrees with family=$STYLE_FIX_AGENT agent=${STYLE_FIX_MODEL:-<default>} effort=${STYLE_FIX_EFFORT:-<default>}..."
+    "$SCRIPT_DIR/style-fix-worktrees.sh" ${style_args[@]+"${style_args[@]}"} 2>&1 | tee -a "$LOG_FILE" || {
+        log "WARNING: style-fix worktree script failed"
+    }
+else
+    log "SKIP: style fix disabled in agent-assignments.conf"
 fi
 
 ELAPSED=$(( SECONDS - START_TIME ))
 MINUTES=$(( ELAPSED / 60 ))
 SECS=$(( ELAPSED % 60 ))
-log "=== Clean-fix Rust clean + rebuild complete (${MINUTES}m ${SECS}s) ==="
+log "=== Clean-fix complete (${MINUTES}m ${SECS}s) ==="
 
 # Generate the clean-fix report via the assigned agent — but only when the run did
-# something. The style scope fires every 10 minutes; an all-SKIP cycle has no
-# OK/FAILED/CLEAN/BUILD lines and an agent call per idle cycle is pure cost.
+# something. The pipeline fires every 10 minutes; an all-SKIP cycle has no
+# OK/FAILED lines and an agent call per idle cycle is pure cost.
 REPORT_FILE="/tmp/clean-fix-report.txt"
 REPORT_PROMPT_FILE="${LOG_FILE%.log}-report-prompt.md"
 REPORT_LOG_FILE="$LOG_DIR/report_render.txt"
-if grep -qE '(^|[[:space:]])(OK|FAILED|ERROR|TIMEOUT|RECOVERED|Launched|CLEAN|BUILD|MEND):' "$LOG_FILE"; then
+if grep -qE '(^|[[:space:]])(OK|FAILED|ERROR|TIMEOUT|RECOVERED|Launched):' "$LOG_FILE"; then
     log "Generating clean-fix report..."
     if sed 's/\$ARGUMENTS/rebuild/g' "$HOME/.claude/scripts/clean-fix/report-render.md" > "$REPORT_PROMPT_FILE"; then
         "$HOME/.claude/scripts/agents/agent_exec.sh" cleanfix.report write \
