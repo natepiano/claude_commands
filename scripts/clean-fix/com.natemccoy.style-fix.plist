@@ -6,9 +6,7 @@
     <string>com.natemccoy.style-fix</string>
     <!-- Style scope: fires every StartInterval seconds with no idle gate so
          the style eval/review/fix queue stays full. The trigger's pgrep
-         guard skips the firing if any clean-fix.sh run (style OR the nightly
-         clean job) is still in flight. The nightly cargo clean/rebuild lives
-         in com.natemccoy.cargo-clean.plist. -->
+         guard skips the firing if any clean-fix.sh run is still in flight. -->
     <key>ProgramArguments</key>
     <array>
         <string>/bin/bash</string>

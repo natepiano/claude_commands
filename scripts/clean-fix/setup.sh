@@ -1,7 +1,6 @@
 #!/bin/bash
-# Setup script for the clean-fix launchd agents:
+# Setup script for the clean-fix launchd agent:
 #   com.natemccoy.style-fix  — style eval/review/fix every 10 min
-#   com.natemccoy.cargo-clean — nightly cargo clean/build/mend + warmup, 4 AM
 # Idempotent — safe to run multiple times. Only acts on what's missing.
 
 set -euo pipefail
@@ -9,13 +8,12 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PLIST_NAMES=(
     "com.natemccoy.style-fix.plist"
-    "com.natemccoy.cargo-clean.plist"
 )
 
 changes=0
 
 # 1. Create runtime directories
-for dir in "$HOME/.local/logs" "$HOME/.local/state/clean-fix"; do
+for dir in "$HOME/.local/logs"; do
     if [[ ! -d "$dir" ]]; then
         mkdir -p "$dir"
         echo "Created $dir"
