@@ -14,7 +14,6 @@ USAGE_DESCRIPTIONS=()
 USAGE_BREAK_AFTER=()
 PROJECT_NAMES=()
 PROJECT_KEYS=()
-CLEAN_STATUSES=()
 STYLE_STATUSES=()
 ACTIVE_CHECKOUT_KEYS=()
 ACTIVE_CHECKOUT_VALUES=()
@@ -30,30 +29,24 @@ load_usage_rows() {
     USAGE_DESCRIPTIONS=()
     USAGE_BREAK_AFTER=()
 
-    add_usage "clean_fix run [project]" "Clean/build/warmup and style eval/review/fix. Optional project filters to one target."
-    add_usage "clean_fix run clean [project]" "Clean + build + mend + warmup. Optional project filters to one clean target."
-    add_usage "clean_fix run style [project]" "Style eval + review + fix worktrees. Optional project filters to one style target." true
+    add_usage "clean_fix run [project]" "Style eval/review/fix. Optional project filters to one target." true
     add_usage "clean_fix run_once" "Runs one eval + review + fix pass across all configured style projects, regardless of stage enablement." true
-    add_usage "clean_fix add <path-or-project>" "Adds a Rust project to clean and style allowlists. Workspace members use workspace-relative entries." true
+    add_usage "clean_fix add <path-or-project>" "Adds a Rust project to the style allowlist. Workspace members use workspace-relative entries." true
     add_usage "clean_fix rename <old> <new>" "Renames a clean-fix project key and migrates history, pending state, and markers." true
     add_usage "clean_fix monitor" "Watches the latest clean-fix log modified in the last 2 hours." true
-    add_usage "clean_fix report" "Shows the newest clean-fix report. Use clean_fix list to choose an older report."
+    add_usage "clean_fix report" "Shows current clean-fix state for every project. Use clean_fix report latest for the newest log, or clean_fix list to pick an older one."
     add_usage "clean_fix list" "Lists reportable logs. Same as clean_fix report list." true
     add_usage "clean_fix eval" "Shows eval stage family/agent status. Also works for review and fix."
-    add_usage "clean_fix clean" "Shows whether the nightly clean/build/mend pass is enabled. That stage runs no agent."
     add_usage "clean_fix agent" "Shows all stage family, resolved agent, and effort assignments."
     add_usage "/agent cleanfix <family>" "Switches the clean-fix family in the shared agent registry."
     add_usage "/agent cleanfix.<stage> <agent>[:<effort>]" "Edits a clean-fix stage row; stages are style_eval, style_eval_review, and style_fix." true
-    add_usage "clean_fix on" "Enables the clean stage and all style stages."
-    add_usage "clean_fix off" "Disables the clean stage and all style stages."
-    add_usage "clean_fix eval on" "Enables one stage. Also works for clean, review, and fix."
-    add_usage "clean_fix eval off" "Disables one stage. Also works for clean, review, and fix." true
-    add_usage "clean_fix skip clean" "Shows targets currently skipped from the clean pass."
-    add_usage "clean_fix skip style" "Shows targets currently skipped from the style pass."
-    add_usage "clean_fix skip clean <target>..." "Temporarily skips clean targets."
-    add_usage "clean_fix skip style <target>..." "Temporarily skips style projects."
-    add_usage "clean_fix skip clean enable <target>..." "Re-enables clean targets. Use enable-all to restore every temporary clean skip."
-    add_usage "clean_fix skip style enable <target>..." "Re-enables style projects. Use enable-all to restore every temporary style skip."
+    add_usage "clean_fix on" "Enables all style stages."
+    add_usage "clean_fix off" "Disables all style stages."
+    add_usage "clean_fix eval on" "Enables one stage. Also works for review and fix."
+    add_usage "clean_fix eval off" "Disables one stage. Also works for review and fix." true
+    add_usage "clean_fix skip" "Shows targets currently skipped."
+    add_usage "clean_fix skip <target>..." "Temporarily skips projects."
+    add_usage "clean_fix skip enable <target>..." "Re-enables projects. Use enable-all to restore every temporary skip."
 }
 
 json_escape() {
@@ -159,42 +152,6 @@ project_display_for_entry() {
     fi
 }
 
-active_redirect_index_for_build_entry() {
-    local entry="$1"
-    local i checkout root
-    for ((i = 0; i < ${#ACTIVE_CHECKOUT_KEYS[@]}; i++)); do
-        checkout="${ACTIVE_CHECKOUT_VALUES[$i]}"
-        root="$(checkout_root "$checkout")"
-        if [[ "$entry" == "${ACTIVE_CHECKOUT_KEYS[$i]}" || "$entry" == "$checkout" || "$entry" == "$root" || "$entry" == "$root/"* ]]; then
-            printf '%s\n' "$i"
-            return
-        fi
-    done
-    printf '%s\n' "-1"
-}
-
-project_key_for_build_entry() {
-    local entry="$1"
-    local index
-    index="$(active_redirect_index_for_build_entry "$entry")"
-    if [[ "$index" == "-1" ]]; then
-        entry_key "$entry"
-    else
-        entry_key "${ACTIVE_CHECKOUT_KEYS[$index]}"
-    fi
-}
-
-project_display_for_build_entry() {
-    local entry="$1"
-    local index
-    index="$(active_redirect_index_for_build_entry "$entry")"
-    if [[ "$index" == "-1" ]]; then
-        entry_key "$entry"
-    else
-        checkout_root "${ACTIVE_CHECKOUT_VALUES[$index]}"
-    fi
-}
-
 find_project_index() {
     local wanted="$1"
     local i
@@ -222,44 +179,35 @@ merge_status() {
 set_project_status() {
     local name="$1"
     local key="$2"
-    local column="$3"
-    local value="$4"
+    local value="$3"
     local found
     found="$(find_project_index "$key")"
     if [[ "$found" == "-1" ]]; then
         PROJECT_NAMES+=("$name")
         PROJECT_KEYS+=("$key")
-        CLEAN_STATUSES+=("-")
         STYLE_STATUSES+=("-")
         found=$((${#PROJECT_NAMES[@]} - 1))
     elif [[ "$name" != "$key" && "${PROJECT_NAMES[$found]}" == "$key" ]]; then
         PROJECT_NAMES[$found]="$name"
     fi
-    if [[ "$column" == "clean" ]]; then
-        CLEAN_STATUSES[$found]="$(merge_status "${CLEAN_STATUSES[$found]}" "$value")"
-    else
-        STYLE_STATUSES[$found]="$(merge_status "${STYLE_STATUSES[$found]}" "$value")"
-    fi
+    STYLE_STATUSES[$found]="$(merge_status "${STYLE_STATUSES[$found]}" "$value")"
 }
 
 sort_projects() {
     local i j
-    local tmp_name tmp_key tmp_clean tmp_style
+    local tmp_name tmp_key tmp_style
 
     for ((i = 0; i < ${#PROJECT_NAMES[@]}; i++)); do
         for ((j = i + 1; j < ${#PROJECT_NAMES[@]}; j++)); do
             if [[ "${PROJECT_NAMES[$j]}" < "${PROJECT_NAMES[$i]}" || ( "${PROJECT_NAMES[$j]}" == "${PROJECT_NAMES[$i]}" && "${PROJECT_KEYS[$j]}" < "${PROJECT_KEYS[$i]}" ) ]]; then
                 tmp_name="${PROJECT_NAMES[$i]}"
                 tmp_key="${PROJECT_KEYS[$i]}"
-                tmp_clean="${CLEAN_STATUSES[$i]}"
                 tmp_style="${STYLE_STATUSES[$i]}"
                 PROJECT_NAMES[$i]="${PROJECT_NAMES[$j]}"
                 PROJECT_KEYS[$i]="${PROJECT_KEYS[$j]}"
-                CLEAN_STATUSES[$i]="${CLEAN_STATUSES[$j]}"
                 STYLE_STATUSES[$i]="${STYLE_STATUSES[$j]}"
                 PROJECT_NAMES[$j]="$tmp_name"
                 PROJECT_KEYS[$j]="$tmp_key"
-                CLEAN_STATUSES[$j]="$tmp_clean"
                 STYLE_STATUSES[$j]="$tmp_style"
             fi
         done
@@ -295,7 +243,6 @@ load_projects() {
 
     PROJECT_NAMES=()
     PROJECT_KEYS=()
-    CLEAN_STATUSES=()
     STYLE_STATUSES=()
     load_active_checkouts
 
@@ -305,7 +252,7 @@ load_projects() {
             section="${BASH_REMATCH[1]}"
             continue
         fi
-        [[ "$section" == "build" || "$section" == "projects" ]] || continue
+        [[ "$section" == "projects" ]] || continue
 
         status="ACTIVE"
         if [[ "$body" == "$MARKER"* ]]; then
@@ -317,15 +264,9 @@ load_projects() {
         body="$(cf_trim "$body")"
         [[ -n "$body" ]] || continue
 
-        if [[ "$section" == "build" ]]; then
-            key="$(project_key_for_build_entry "$body")"
-            name="$(project_display_for_build_entry "$body")"
-            set_project_status "$name" "$key" "clean" "$status"
-        else
-            key="$(entry_key "$body")"
-            name="$(project_display_for_entry "$body")"
-            set_project_status "$name" "$key" "style" "$status"
-        fi
+        key="$(entry_key "$body")"
+        name="$(project_display_for_entry "$body")"
+        set_project_status "$name" "$key" "$status"
     done < "$CONF_FILE"
 
     sort_projects
@@ -344,8 +285,6 @@ print_projects_json() {
         json_string "${PROJECT_NAMES[$i]}"
         printf ', "project_key": '
         json_string "$key_cell"
-        printf ', "clean": '
-        json_string "${CLEAN_STATUSES[$i]}"
         printf ', "style": '
         json_string "${STYLE_STATUSES[$i]}"
         printf '}'
@@ -458,24 +397,11 @@ print_agents_rule() {
     printf '\n'
 }
 
-# The clean/build pass runs no agent, so its row carries only a status.
-print_clean_text() {
-    local enabled="" status
-    cf_load_stage_enabled clean enabled || return 1
-    if [[ "$enabled" == "true" ]]; then
-        status="ENABLED"
-    else
-        status="DISABLED"
-    fi
-    printf "%-7s %-8s %-7s %-12s %s\n" "clean" "$status" "-" "-" "-"
-}
-
 print_agents_text() {
     printf '## Agents\n\n'
     printf '```text\n'
     printf "%-7s %-8s %-7s %-12s %s\n" "Stage" "Status" "Family" "Agent" "Effort"
     print_agents_rule
-    print_clean_text
     print_stage_text "eval" "style_eval"
     print_stage_text "review" "style_eval_review"
     print_stage_text "fix" "style_fix"
@@ -515,8 +441,6 @@ print_projects_rule() {
     printf '  '
     repeat_dash "$key_width"
     printf '  '
-    repeat_dash 6
-    printf '  '
     repeat_dash 5
     printf '\n'
 }
@@ -537,11 +461,11 @@ print_projects_text() {
 
     printf '## Projects\n\n'
     printf '```text\n'
-    printf "%-*s  %-*s  %-6s  %s\n" "$project_width" "Project" "$project_key_width" "Project Key" "Clean" "Style"
+    printf "%-*s  %-*s  %s\n" "$project_width" "Project" "$project_key_width" "Project Key" "Style"
     print_projects_rule "$project_width" "$project_key_width"
     for ((i = 0; i < ${#PROJECT_NAMES[@]}; i++)); do
         key_cell="$(project_key_cell "$i")"
-        printf "%-*s  %-*s  %-6s  %s\n" "$project_width" "${PROJECT_NAMES[$i]}" "$project_key_width" "$key_cell" "${CLEAN_STATUSES[$i]}" "${STYLE_STATUSES[$i]}"
+        printf "%-*s  %-*s  %s\n" "$project_width" "${PROJECT_NAMES[$i]}" "$project_key_width" "$key_cell" "${STYLE_STATUSES[$i]}"
     done
     printf '```\n'
 }

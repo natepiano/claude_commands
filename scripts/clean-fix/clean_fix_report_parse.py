@@ -37,7 +37,7 @@ MONITOR_FILTER_REGEX = (
     r"(^|[[:space:]])(ERROR|WARNING|TIMEOUT|RETRY|RETRY OK|RETRY FAILED|FAILED|WARN|OK|AUTOFINALIZE):"
     r"|(^|[[:space:]])AGENT LIMIT:"
     r"|(^|[[:space:]])Launched: "
-    r"|^=== "
+    r"|(^|[[:space:]])=== "
 )
 
 PHASES: tuple[str, ...] = ("eval", "review", "fix", "verify")

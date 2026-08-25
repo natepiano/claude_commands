@@ -27,7 +27,7 @@
   - `scripts/clean-fix/agent_assignments.sh` — stage loading, 119 lines. `CLEAN_FIX_AGENT_DIR` `:7`; `CLEAN_FIX_AGENT_ASSIGNMENTS_FILE` `:8`; `cf_load_stage_enabled` `:48`; `cf_load_stage_assignment` `:84` with `agents_resolve "cleanfix.$want_section"` `:93`; `cf_print_stage_assignment` `:104`; `cf_print_agent_assignments` `:109`
   - `scripts/clean-fix/agent-assignments.conf` — stage enablement, three sections: `[style_eval]`, `[style_eval_review]`, `[style_fix]`, each carrying `enabled=` alone
   - `scripts/clean-fix/clean-fix.conf` — `[style_eval]` `:10`, `[style_fix]` `:24`, `[project_env]` `:39`, `[projects]` `:50`, `[active_checkout]` `:92`. One allowlist; nothing runs unless `[projects]` lists it
-  - `scripts/clean-fix/clean_fix_report_parse.py` — 1986 lines. `LOG_DIR` `:27`; `MONITOR_FILTER_REGEX` `:36`; `PHASES` `:43` (now `eval`, `review`, `fix`, `verify`); `COMPLETE_RE` `:96`; `HISTORICAL_COMPLETE_RE` `:99-102`; `match_completion_banner()` `:104-106`; `PhaseStats` `:193-202` (`ok`, `fail`, `skip`, `running`, `footer_ok`, `footer_fail`, `footer_total`, `present`); conf project map `:395`; `detect_phase_boundaries()` `:658`; `parse_log()` `:1165` with the banner check at `:1183` and the project-marker read at `:1237`; `detect_current_phase()` `:1792` with its backward walk at `:1803`. The clean and warmup parsers are gone.
+  - `scripts/clean-fix/clean_fix_report_parse.py` — 1986 lines. `LOG_DIR` `:27`; `MONITOR_FILTER_REGEX` `:36-41`; `PHASES` `:43` (now `eval`, `review`, `fix`, `verify`); `COMPLETE_RE` `:96`; `HISTORICAL_COMPLETE_RE` `:99-102`; `match_completion_banner()` `:104-106`; `PhaseStats` `:193-202` (`ok`, `fail`, `skip`, `running`, `footer_ok`, `footer_fail`, `footer_total`, `present`); conf project map `:395`; `detect_phase_boundaries()` `:658`; `parse_log()` `:1165` with the banner check at `:1183` and the project-marker read at `:1237`; `detect_current_phase()` `:1792` with its backward walk at `:1803`. The clean and warmup parsers are gone.
   - `scripts/clean-fix/clean-fix-usage.sh` — 590 lines. `MARKER` `:8`; `CLEAN_STATUSES` `:17,232,238-262,298,323,347-348`; usage lines `:33-55`; clean row `:461`
   - `scripts/clean-fix/report-render.md` — report prompt. `ROW` format `:26`; `[build]` gloss `:27`; phases note `:156`; log path `:11`
   - `scripts/clean-fix/phase_skip.py` — `MARKER` `:28`; `PASS_LABEL = "style"` `:32`; the skip-marker docstring `:8-9`. Every entry point takes projects only; the scope token is optional at the CLI and absent from every signature
@@ -38,7 +38,7 @@
   - `scripts/clean-fix/README.md` — pipeline overview, file table `:9-25`, warmup section `:33-37`, flow diagram `:97-104`. Names `[cleanfix.<family>]` at `:18` and `agents_resolve cleanfix.<stage>` at `:19`
   - `scripts/clean-fix/clean-fix-style-flow.dot` — `cluster_build` `:43-53`; edge chain `:109`
   - `scripts/clean-fix/render-flow.py` — renders the dot to SVG via `neato -n2`
-  - `commands/clean_fix.md` — 351 lines. Dispatch `:17`; scopes `:21-42`; notes `:89-95`; add/rename `:115,143`; log detect `:171`; phase sentinels `:197`; monitor note `:230`; monitor stop condition `:244`; stage config `:289-314`; skip `:321-349`
+  - `commands/clean_fix.md` — **335 lines after Phase 5 rewrote it.** `<Monitor/>`'s stop condition is at `:236`; the log-directory references are at `:65,75,164-165,263`. Phase 5 deleted the clean scope forms, the `**clean**` stage bullet, and three of the six skip lines, so every other offset the plan once recorded for this file has moved — **re-grep, do not trust a number written before Phase 5**.
   - `scripts/make_a_worktree/retarget_clean_fix.py` — redirect-only. `DetectResult` `:37`; `detect()` `:94`; `apply()` `:142` upserting `[active_checkout]`; `revert()` `:161`. No `[build]` add or revert
   - `scripts/worktree_delete/perform_deletion.sh` — marker read `:40,46-47`
   - `scripts/new_rust_project/rust_generate.sh` — conf enrollment heredoc `:148-183`, `ensure('build', rootdir)` `:180`. **Still writes a `[build]` section the conf no longer has** — Phase 7 deletes that call
@@ -160,72 +160,26 @@ The four conf helpers know only about sections that exist. `phase_skip.py` resol
 
 **Ruled out:** reshaping `PhaseStats.footer_ok/footer_fail/footer_total`'s `int | None` shape in this commit — the `None` is a real state, not an absence, but reworking it here costs the reviewability this commit most needs; deferring the fixture and regression test to later work — without them this phase's own deletions would ship with no oracle.
 
-### Phase 5 — Update the user-facing surface: usage screen and command doc · status: todo
+### Phase 5 — Update the user-facing surface: usage screen and command doc · status: done
 
-#### Work Order
+#### As-built
 
-**Goal:** `/clean_fix` offers no clean scope, no clean stage switch, and no clean skip list; the usage screen and the command doc describe the three surviving stages.
-
-**Spec:**
-
-**`scripts/clean-fix/clean-fix-usage.sh`**
-- `:33-35` — the `clean_fix run [project]` description says "Clean/build/warmup and style eval/review/fix"; rewrite as style eval/review/fix. Delete the `clean_fix run clean [project]` line (`:34`) **and** the `clean_fix run style [project]` line (`:35`). Both scope words have to go, not just the clean one: Phase 2 deleted the `clean|style|all` case arm, so any non-`run_once` first argument is now a project filter. `clean_fix run style` today means "style pass filtered to a project literally named style", which matches nothing and reports nothing — a usage screen that still advertises it is documenting a silent misfire.
-- `:43` — delete the `clean_fix clean` status line.
-- `:47-50` — `clean_fix on` / `off` say "the clean stage and all style stages"; rewrite as all style stages. The `eval on` / `eval off` lines say "Also works for clean, review, and fix"; drop `clean`.
-- `:37` — the `clean_fix add` description says it adds to "clean and style allowlists"; rewrite for the single allowlist.
-- `:51-56` — six skip lines, alternating clean and style. Delete the three `clean_fix skip clean …` lines (`:51`, `:53`, `:55`) and **rewrite the three surviving style lines in the short form**: `clean_fix skip` (show what is skipped), `clean_fix skip <target>...`, and `clean_fix skip enable <target>...`, keeping their existing descriptions minus the word "style" where it only distinguished them from the clean pass. Phase 3 made the scope token optional, so a usage screen still printing `clean_fix skip style` advertises a word the user never needs to type — and once the clean pass is gone, "style" no longer distinguishes anything.
-- `:17,232,238-262,298,323,347-348,461` — delete the `CLEAN_STATUSES` array and every use: its initialization, the `if [[ "$column" == "clean" ]]` branch in `set_project_status`, the `tmp_clean` swap in the sort, the `[[ "$section" == "build" ]]` branch in the conf scan (`:308,320`), the `set_project_status … "clean" …` call, the `"clean"` key in the `--json` emitter, and the comment at `:461` about the clean/build pass carrying only a status. The project table loses its clean column; keep the style column and the header alignment consistent.
-
-**`commands/clean_fix.md`** (edit with the Edit/Write tools — `commands/` is a protected path):
-- `:17` dispatch line — remove `clean` from the `<StyleAgentConfig/>` token list.
-- `:21-42` — delete the `## run [clean | style] [project]` heading variant and every scope-word form. The remaining scopes are a bare project filter and `run_once`. Rewrite `:29-30` (the scope bullet list) and delete all four lines `:38-41` — `run clean`, `run clean <project>`, `run style`, and `run style <project>`. Deleting only the `clean` pair leaves the `style` pair documenting a filter that will not match.
-- `:73-76` — the shell block still shows `~/.claude/scripts/clean-fix/clean-fix.sh [clean|style] [project]`. Rewrite that line as `… clean-fix.sh [project]`; leave the `run_once` line alone.
-- `:89-95` — the notes. `:93` says `run_once` "does not run clean/build/warmup"; that contrast is now meaningless — rewrite it to say `run_once` is a one-time style-stage override that does not persistently enable any stage.
-- `:115` and `:143` — `<Add/>` and `<Rename/>` say the helpers touch `[build]`; correct both to `[projects]` (and `[active_checkout]` plus keyed sections for rename).
-- `:171` — remove `/tmp/cargo-clean-stdout.log` from the `<DetectLog/>` candidate list.
-- `:197` — the `PHASE <name>` sentinel list drops `clean+rebuild` and `warmup`.
-- `:230` — the example "clean → eval → fix all in one orchestrator run" becomes an eval → review → fix example.
-- `:244` — `<Monitor/>`'s stop condition waits for `=== Clean-fix Rust clean + rebuild complete`, a banner the orchestrator stopped writing in Phase 2. An armed monitor therefore never sees the run end and never calls TaskStop. Point it at the line the orchestrator emits today, `=== Clean-fix complete` (`clean-fix.sh:226`), and leave the `=== Done:` alternative beside it alone.
-- `:271` — the log-sink sentence names both plists and both `/tmp` sinks; reduce to `com.natemccoy.style-fix` and `/tmp/style-fix-stdout.log`.
-- `:289` — heading `## clean|eval|review|fix [on|off]` becomes `## eval|review|fix [on|off]`.
-- `:299` — delete the `**clean**` bullet in full, including its description of the mend gate and the `SKIP: clean/build disabled` log line.
-- `:309` — step 2 maps a first token to a section; drop `clean` -> `[clean]`.
-- `:310` — step 3 describes `/clean_fix clean` calling `cf_print_stage_enabled`; delete that sentence. `cf_print_stage_enabled` no longer exists.
-- `:311` — step 4 lists invalid project-name forms; drop the `/clean_fix clean <project>` form.
-- `:312` — step 5's example list drops `clean off`.
-- `:313` — step 6 says `/clean_fix on` and `off` set "all four `enabled=` values — `[clean]` included" and explains the pre-`[clean]`-switch history. Rewrite for three stages and delete the history sentence.
-- `:321-349` — `<Skip/>`. Delete the `clean` scope: the `## skip clean|style` heading becomes `## skip style` (or the bare form if Phase 3 made the scope optional), and the `**clean**` bullet at `:327` goes. The `**style**` bullet at `:328` ends "A style skip leaves clean untouched" — drop that clause. `:349`'s description of the `#CLEAN_FIX_SKIP#` marker stays; the marker is renamed in Phase 8.
+The `/clean_fix` usage screen offers one `run [project]` form plus `run_once`, three skip forms in the short spelling (`clean_fix skip`, `clean_fix skip <target>...`, `clean_fix skip enable <target>...`), and a project table with a single `Style` column. The `clean_fix clean` status line, the `clean` and `style` scope words, and the `CLEAN_STATUSES` array with every consumer — initializer, `set_project_status` column branch, the sort's parallel swap, the conf reader's `[build]` branch, the table's `%-6s` column, and the `--json` `clean` key — are gone; `set_project_status` takes `(name, key, value)`, and the three `*_build_entry` helpers that only `[build]` reached are deleted. `commands/clean_fix.md` documents a bare project filter and `run_once` as the only scopes, three configurable stages, one `[projects]` allowlist, and the scope-less skip form; `<Monitor/>`'s stop condition waits on `=== Clean-fix complete`, and its `PHASE <name>` list is `style-eval`, `style-eval-review`, `style-fix`, `done`, `unknown`. Every scope word leaves the surface, not only the clean ones, because a non-`run_once` first argument is read as a project filter that silently matches nothing. `MONITOR_FILTER_REGEX`'s `=== ` alternative is `(^|[[:space:]])=== ` rather than `^=== `, so the pipeline that stops an armed monitor actually sees the banner it waits on.
 
 **Files:**
-- `scripts/clean-fix/clean-fix-usage.sh` — drop the clean usage lines and the `CLEAN_STATUSES` column
-- `commands/clean_fix.md` — drop the clean scope, stage switch, and skip list
+- `scripts/clean-fix/clean-fix-usage.sh` — 514 lines; usage rows, project table, and `--json` emitter, all single-column
+- `commands/clean_fix.md` — 335 lines; monitor stop condition at `:236`, log-directory references at `:65,75,164-165,263`, no `/tmp/clean-fix-report.txt`
+- `scripts/clean-fix/clean_fix_report_parse.py` — `MONITOR_FILTER_REGEX` at `:36-41`
 
-**Reservations:**
-- file: `scripts/clean-fix/clean-fix-usage.sh`
-- file: `commands/clean_fix.md`
+**Binds later work:** The `=== ` anchor must stay `(^|[[:space:]])`; a renamed `=== `-prefixed banner written through `log()` is already covered, and re-narrowing to `^` breaks the monitor again. `MONITOR_FILTER_REGEX` has no test; a durable regression belongs with whatever change renames the banner, in `tests/test_report_parse_phases.py`. `commands/clean_fix.md` is finished for clean removal and its offsets have all moved. `commands/style_eval.md:347` is the only external caller of a `/clean_fix` invocation path.
 
-**Constraints from prior phases:**
-- Phase 4 reduced the parser's `PHASES` to `("eval", "review", "fix", "verify")` **and** rewrote `report-render.md`'s `ROW` contract to match. That file is finished for this plan's clean removal; do not re-edit it here.
-- Phase 3 deleted the `[clean]` section from `agent-assignments.conf` and Phase 2 deleted `cf_load_stage_enabled clean`, so `/clean_fix clean` has nothing to read; Phase 3 also deleted `cf_print_stage_enabled`, so the command doc's reference to it at `:310` is a dangling call.
-- Phase 3 made `phase_skip.py`'s scope argument optional while still accepting `style`. Either form works in the rewritten `<Skip/>` section; prefer the short form and say so.
-- Phase 2 replaced `clean-fix.sh`'s `SCOPE` variable with a `run_once` flag and deleted the `clean|style|all` case arm, so `clean`, `style`, and `all` are no longer scope words that fail loudly — each is now read as a project filter that silently matches nothing. That is why every one of them has to leave the usage screen and the command doc in this phase, not just the clean ones.
-- Phase 2 set the orchestrator's completion banner to `=== Clean-fix complete (…) ===` (`clean-fix.sh:226`), which is what this phase's monitor fix targets. Phase 8 changes that banner again, to `=== Fix complete (…) ===`, and owns updating this doc's stop condition the second time.
-- `#CLEAN_FIX_SKIP#` and `/tmp/clean-fix-report.txt` keep their current names through this phase; Phase 8 renames them.
-- `commands/` is a protected path — use Edit/Write, never shell redirection or `sed -i`.
+**Gotchas:**
+- `clean-fix.sh`'s `log()` prefixes `%Y-%m-%d %H:%M:%S`, so any `^`-anchored filter or matcher misses the completion banner — the reason `^=== ` defeated the live monitor across two banner generations.
+- `detect_current_phase()` returns only `done`, `style-fix`, `style-eval`, `style-eval-review`, `unknown` — never `verify`. It is a different vocabulary from `PHASES`, which names report-table columns; the two lists are correct because they differ, and "syncing" them makes the doc wrong.
+- `checkout_root` and the `ACTIVE_CHECKOUT_*` arrays survive the clean-column removal — `project_display_for_entry` calls `checkout_root` at `:149`. Deleting them as clean-only breaks redirected-project display.
+- `report-render.md` treats an empty `/clean_fix report` argument as current keyed-project state; newest-log mode requires `latest` or `newest`.
 
-**Acceptance gate:**
-- `bash -n scripts/clean-fix/clean-fix-usage.sh` exits 0.
-- `bash scripts/clean-fix/clean-fix-usage.sh` exits 0 and its output contains no `run clean`, no `skip clean`, and no clean column in the project table.
-- `bash scripts/clean-fix/clean-fix-usage.sh --json | python3 -m json.tool` exits 0, and the parsed JSON has no `clean` key on any project object.
-- `grep -nE "CLEAN_STATUSES|run clean|run style|run all|skip clean|skip style|== \"clean\"|== \"build\"" scripts/clean-fix/clean-fix-usage.sh` returns nothing. `skip style` is in this list on purpose: the short skip form is the deliverable, not a preference, so a surviving scope word is a failed edit rather than a stylistic leftover.
-- `bash scripts/clean-fix/clean-fix-usage.sh` prints a `clean_fix skip <target>...` line, proving the short form actually reached the screen rather than the scope-word lines simply being deleted.
-- `python3 scripts/clean-fix/phase_skip.py status` and `python3 scripts/clean-fix/phase_skip.py style status` still produce identical output — the short form is the advertised one, but Phase 3 kept the scope token accepted, and a user's muscle memory must not start erroring.
-- `python3 scripts/clean-fix/project_add.py <some-existing-project>` prints **exactly one** `[projects]` result line. `<Add/>` at `:115` relays this helper's output verbatim to the user, and Phase 3 reduced it from a per-section list to a single result; a second line here means a caller is still formatting for the retired two-allowlist shape.
-- `grep -nE "run clean|run style|run all|\[clean\|style\]|skip clean|cargo-clean|cf_print_stage_enabled|clean\+rebuild|\[build\]|\[clean\]" commands/clean_fix.md` returns nothing. Every retired leading token is now read as a project filter, so each one has to be gone from the doc — not only the `clean` spellings.
-- `grep -n "Clean-fix Rust clean + rebuild complete" commands/clean_fix.md` returns nothing, and `grep -n "Clean-fix complete" commands/clean_fix.md` matches at the monitor stop condition — the check that the monitor now waits on a banner something actually writes.
-- `/clean_fix` with no arguments renders the usage screen without error (invoke the usage script directly; do not require a live agent run).
-
----
+**Ruled out:** deleting only the `clean` scope words and keeping the `style` pair, which would document a silent no-match; narrowing the parser's era-agnostic `*.log` enumeration globs to a branded pattern; routing the missing monitor-filter regression to a backlog rather than to the change that would break it.
 
 ### Phase 6 — Rebuild the flow diagram without the clean cluster · status: todo
 
@@ -349,6 +303,7 @@ Each edit below removes a claim that is now false. Where a sentence merely menti
 - Phase 3 left one allowlist (`[projects]`) plus `[active_checkout]`, `[project_env]`, `[style_eval]`, and `[style_fix]` — every doc naming conf sections must name only those.
 - Phase 3 made `retarget_clean_fix.py` redirect-only and `project_add.py` `[projects]`-only, which is what `make_a_worktree.md`, `worktree_delete.md`, and `rust_generate.sh` must now describe.
 - `CLAUDE.md`, `commands/`, and the memory directory are protected or gitignored: use Edit/Write for all of them. `projects/` is gitignored, so those two files will not appear in `git status` — confirm the edits by reading the files back.
+- **Phase 5 finished `commands/clean_fix.md`'s clean removal; do not re-open it here, and do not "sync" its `PHASE <name>` list against the parser's `PHASES`.** That doc's `<Monitor/>` section lists what `--phase-detect` can emit — `style-eval`, `style-eval-review`, `style-fix`, `done`, `unknown` — which is what `detect_current_phase()` actually returns. `PHASES` is a different tuple for a different purpose (`("eval", "review", "fix", "verify")`, the report table's columns), and `verify` is never a `--phase-detect` answer. The two lists are correct precisely because they differ; making them match breaks the monitor's phase display.
 - Everything here keeps its current `clean-fix` / `clean_fix` naming; Phases 8 through 10 rename.
 
 **Acceptance gate:**
@@ -389,13 +344,13 @@ Find every occurrence first (`grep -rn "CLEAN_FIX_" --include='*.sh' --include='
 - Every `agents_resolve cleanfix.<stage>` call site — `scripts/clean-fix/agent_assignments.sh:93` and the `agent_exec.sh cleanfix.report` call in `clean-fix.sh:237`.
 - `docs/as-built/agent-registry.md` — `:33` the family/sub-task table row, and `:140-147` the consumer rows, plus every `/agent cleanfix …` example.
 - `commands/clean_fix.md` — every `/agent cleanfix <family>` and `/agent cleanfix.<stage>` reference.
-- `scripts/clean-fix/clean-fix-usage.sh:45-46` — the two `/agent cleanfix …` usage lines.
+- `scripts/clean-fix/clean-fix-usage.sh:41-42` — the two `/agent cleanfix …` usage lines. (Phase 5 deleted four usage rows above them; the file is 514 lines.)
 - `scripts/clean-fix/README.md:18-19` — the file table describes assignments living under `[cleanfix.<family>]` and resolving through `agents_resolve cleanfix.<stage>`. Both spellings change with the family key; the surrounding prose is Phase 7's and Phase 10's.
 - `scripts/agents/test_sync_codex_catalog.sh` — **this is a live test, not documentation.** Its `agents.conf` fixture heredocs (`:67,69,126,128,160,162,187,189`) and its four assertion strings (`:210,212,214,216`) spell the family key `cleanfix`. Rename it in all twelve places and re-run the test in this phase: the assertions match on the registry's own diagnostic text, so a renamed family with an un-renamed test fails on the mismatch — which is the test doing its job, not a flake to work around.
 
 **Runtime brand strings — one atomic edit, five participants.** Completion recognition is not a matched pair any more. Phase 2 made it four things: the emitter (`clean-fix.sh:226`, writing `=== Clean-fix complete (…) ===`), `COMPLETE_RE` (`clean_fix_report_parse.py:96`) for that current wording, `HISTORICAL_COMPLETE_RE` (`:99-102`) for the retired `=== Clean-fix Rust clean + rebuild complete (…) ===`, and `match_completion_banner()` (`:104-106`), the one helper both call sites go through — `parse_log` (`:1183`) and `detect_current_phase` (`:1799`).
 
-Phase 5 adds the fifth: `<Monitor/>`'s stop condition in `commands/clean_fix.md:244`, which Phase 5 repoints at `=== Clean-fix complete` because the banner it waited on before that had already been retired. It is not a parser and not a regex, which is exactly why it gets missed — but it is the line that decides when an armed monitor calls TaskStop, so leaving it on the superseded wording strands the monitor watching a run that has already ended. It moves with the emitter, in this commit.
+Phase 5 adds the fifth: `<Monitor/>`'s stop condition in `commands/clean_fix.md:236`, which Phase 5 repoints at `=== Clean-fix complete` because the banner it waited on before that had already been retired. It is not a parser and not a regex, which is exactly why it gets missed — but it is the line that decides when an armed monitor calls TaskStop, so leaving it on the superseded wording strands the monitor watching a run that has already ended. It moves with the emitter, in this commit.
 
 In this commit: change the emitter to `=== Fix complete (…) ===`, change `COMPLETE_RE` to match it, repoint the command doc's monitor stop condition at `=== Fix complete`, and **add the wording being replaced to the historical set** rather than dropping it. After this phase there are three generations — `Fix complete` current, `Clean-fix complete` and `Clean-fix Rust clean + rebuild complete` historical — because the log directory carries roughly a day of logs across the change and every one of them must still read as a finished run. Keep all three behind `match_completion_banner()`: a second copy of this literal went stale once already, which is why that helper exists.
 
@@ -404,10 +359,10 @@ Splitting the emitter and the current regex across commits makes every report in
 **Runtime paths**
 - Log directory `~/.local/logs/clean-fix/` -> `~/.local/logs/fix/`, and the legacy single-file symlink `~/.local/logs/clean-fix.log` -> `~/.local/logs/fix.log`. **Migrate the existing directory**: `mv ~/.local/logs/clean-fix ~/.local/logs/fix` and remove the stale `~/.local/logs/clean-fix.log` symlink, so `/clean_fix report` and `list` keep seeing history.
 - **Quiesce the job before the directory moves.** `com.natemccoy.style-fix` is loaded and fires every 600 seconds, so a run can begin at any point during this phase. One that is mid-append when the directory moves out from under it either loses its output or recreates `~/.local/logs/clean-fix/` behind the migration, and the phase then passes its greps while the old path is quietly back. The order is: `launchctl bootout gui/$(id -u)/com.natemccoy.style-fix` (unsandboxed), confirm no orchestrator is running with the same `pgrep -f` guard the trigger uses, migrate and edit, then `bash scripts/clean-fix/setup.sh` to bootstrap it back and confirm it reports a reload. Leaving the job booted out silently stops the whole pipeline, so verify the reload before this phase reports done.
-- **Own every reader of that directory in the same commit.** Verified at plan time, these are all of them: `clean-fix.sh:34` (`LOG_DIR`) and `:36` (`LEGACY_LOG`); `clean_fix_report_parse.py:27` (`LOG_DIR`) and its `:7` usage docstring; `style-fix-monitor.py:38` (`LOG_DIR` — the monitor waits on this directory, so a missed rename leaves it watching a path nothing writes to); `style-fix-manual.sh:3,25` (`LOG_DIR` — a manual run would otherwise recreate the old directory the moment someone uses it); `report-render.md:11`; and `commands/style_eval.md:334`. `commands/clean_fix.md` names the path at `:72,82,172,173` and is already in this phase's Files.
+- **Own every reader of that directory in the same commit.** Verified at plan time, these are all of them: `clean-fix.sh:34` (`LOG_DIR`) and `:36` (`LEGACY_LOG`); `clean_fix_report_parse.py:27` (`LOG_DIR`) and its `:7` usage docstring; `style-fix-monitor.py:38` (`LOG_DIR` — the monitor waits on this directory, so a missed rename leaves it watching a path nothing writes to); `style-fix-manual.sh:3,25` (`LOG_DIR` — a manual run would otherwise recreate the old directory the moment someone uses it); `report-render.md:11`; and `commands/style_eval.md:334`. `commands/clean_fix.md` names the path at `:65,75,164-165,263` and is already in this phase's Files.
 - **Log filenames follow the directory.** The orchestrator writes `clean-fix-YYYYMMDD-HHMMSS.log` (`clean-fix.sh:35`) and `style-fix-manual.sh` writes `style-fix-manual-*.log`. Rename the orchestrator's prefix to `fix-YYYYMMDD-HHMMSS.log` and leave the manual prefix alone (it is named for the surviving style job).
 - **Retention is the glob that must change; enumeration already covers both eras.** Verified against the live parser: `clean_fix_report_parse.py` enumerates with `LOG_DIR.glob("*.log")` at `:338` and `:1912`, which matches any filename and therefore reads migrated `clean-fix-*` and new `fix-*` logs alike with no edit. **Do not "fix" those two lines** — narrowing an era-agnostic glob to a branded one is how the migrated history gets stranded. What genuinely needs the two-era treatment is `clean-fix.sh:49`, `find "$LOG_DIR" -name 'clean-fix-*.log' -mmin +"$RUN_LOG_RETENTION_MINUTES" -delete`, which prunes by name: after the prefix rename it must cover the new `fix-*` names *and* the migrated `clean-fix-*` files, which keep their old names after the `mv`. A glob matching only one either strands the history or never prunes it — say in the code comment which of the two patterns each branch is for. `commands/clean_fix.md:82,173` name the filename pattern in prose and follow the prefix. Leave `clean-fix.sh:50`'s `style-fix-manual-*.log` line alone.
-- Report file `/tmp/clean-fix-report.txt` -> `/tmp/fix-report.txt` — `clean-fix.sh`'s `REPORT_FILE`, `docs/as-built/agent-registry.md:142`, and `commands/clean_fix.md`.
+- Report file `/tmp/clean-fix-report.txt` -> `/tmp/fix-report.txt` — `clean-fix.sh`'s `REPORT_FILE` and `docs/as-built/agent-registry.md:142`. **Not `commands/clean_fix.md`:** Phase 5 removed that path from the doc, so a rename sweep expecting to find it there will report a miss that is not one.
 - Leave `/tmp/style-fix-stdout.log` and `/tmp/style-fix-stderr.log` alone; they are named for the surviving launchd job and are already correct.
 
 **Skip marker** `#CLEAN_FIX_SKIP#` -> `#FIX_SKIP#`:
@@ -420,6 +375,7 @@ Splitting the emitter and the current regex across commits makes every report in
 
 **Files:**
 - `scripts/clean-fix/clean-fix.sh` — env vars, `LOG_DIR`, `LEGACY_LOG`, `LOG_FILE` prefix, the `:49` retention glob, `REPORT_FILE`, `agent_exec` family
+- `scripts/clean-fix/clean-fix-trigger.sh` — `CLEAN_FIX_SCRIPT` -> `FIX_ORCHESTRATOR_PATH` at `:13` and the `pgrep -f` guard at `:15` that matches on its value
 - `scripts/clean-fix/agent_assignments.sh` — env vars and `agents_resolve fix.<stage>`
 - `scripts/clean-fix/clean-fix-usage.sh` — `MARKER`, env vars, `/agent fix …` usage lines
 - `scripts/clean-fix/phase_skip.py` — `MARKER`
@@ -446,6 +402,7 @@ Splitting the emitter and the current regex across commits makes every report in
 
 **Reservations:**
 - file: `scripts/clean-fix/clean-fix.sh`
+- file: `scripts/clean-fix/clean-fix-trigger.sh`
 - file: `scripts/clean-fix/agent_assignments.sh`
 - file: `scripts/clean-fix/clean-fix-usage.sh`
 - file: `scripts/clean-fix/phase_skip.py`
@@ -480,6 +437,8 @@ Splitting the emitter and the current regex across commits makes every report in
 - Phase 2 rewrote `clean-fix-trigger.sh` down to a guard plus an `exec`: `CLEAN_FIX_SCRIPT` is now at `:13`, the `pgrep -f` guard at `:15`, and the `exec` at `:19`. Its idle gate and scope argument are gone.
 - Phase 2 moved `clean-fix.sh`'s `LOG_DIR` to `:34`, `LEGACY_LOG` to `:36`, the completion banner to `:226`, and `REPORT_FILE` to `:231`; the file is 247 lines. `clean_fix_report_parse.py` is 1986 lines after Phase 4, and every offset into it in this Work Order was re-derived against that file — re-grep anyway rather than trusting a recorded number.
 - Phase 4 cut the parser's phase model to four: `PHASES` is now `("eval", "review", "fix", "verify")` (`:43`) and `PhaseStats` (`:193-202`) no longer carries `processed` or `warnings`. `parse_clean_phase()` and `parse_warmup_phase()` are gone, and `MONITOR_FILTER_REGEX` (`:36`) no longer lists `CLEAN`, `BUILD`, `MEND`, `DONE`, or the `WARMUP` verbs. Rename identifiers only — do not reopen the phase model.
+- **Phase 5 broadened `MONITOR_FILTER_REGEX`'s `=== ` alternative and it must not be re-narrowed.** It was `^=== `, anchored at line start, while `clean-fix.sh` writes the completion banner through `log()`, which prefixes `%Y-%m-%d %H:%M:%S` — so the live monitor's `grep -E` dropped the exact line `<Monitor/>`'s stop condition waits for, and an armed monitor never stopped. It is now `(^|[[:space:]])=== `, matching how every other alternative in the same regex was already anchored, and the constant spans `:36-41` rather than the single line `:36` the Delegation Context records. `=== Fix complete (…) ===` is still `=== `-prefixed and still written through `log()`, so this phase's banner rename is already covered — verified directly against a real orchestrator log. A rename sweep that "tidies" the anchor back to `^=== ` silently restores the defect, and no test would catch it.
+- **The parser's own domain types are deferred to next-items 1-4 and must keep their current shape through this phase.** `Cell`, `ParseResult`, and `Warning` are named for representation rather than role; `ParseResult.running` reuses `Warning` for a non-warning; phase state and project status are free-form `str`; and a "no reason" is encoded as an empty string. All of it is real, all of it is recorded, and none of it lands here — a rename sweep that also re-tags a domain type is reviewable as neither. Rename identifiers and paths only.
 - Phase 4 added `scripts/clean-fix/tests/fixtures/six-phase-run.log`, which deliberately contains `CLEAN:`, `BUILD:`, `MEND:`, `DONE:`, every `WARMUP` verb, and the retired completion banner. It is a captured historical log — **data, not code** — and renaming any string inside it destroys the regression oracle. This phase's residual-brand greps already exclude it; keep it that way and do not edit the file.
 - Phase 4 added `scripts/clean-fix/tests/test_report_parse_phases.py`, which asserts `PHASES` and an exact four-phase cell baseline. A rename that reaches `PHASES` or a `Cell` field makes it fail, which is the intended alarm — update the test in the same commit rather than working around it.
 
@@ -501,6 +460,7 @@ Splitting the emitter and the current regex across commits makes every report in
 - `python3 scripts/clean-fix/clean_fix_report_parse.py --list` enumerates both the migrated `clean-fix-*` logs and any new `fix-*` log, proving the retention and enumeration globs cover both naming eras, and reports every migrated log as complete rather than in-progress, proving all three banner generations still resolve.
 - `basedpyright scripts/clean-fix/ scripts/make_a_worktree/` prints `0 errors, 0 warnings, 0 notes`.
 - `bash scripts/clean-fix/clean-fix.sh` exits 0 with the style stages disabled, writes its log under `~/.local/logs/fix/` with a `fix-` prefix, and `python3 scripts/clean-fix/clean_fix_report_parse.py --latest-log` finds and parses it.
+- **Add a durable monitor-filter regression to `scripts/clean-fix/tests/test_report_parse_phases.py`, beside the three-generation banner test.** It asserts that `re.search`-equivalent matching of `MONITOR_FILTER_REGEX` accepts a **timestamped** `2026-01-01 00:00:00 === Fix complete (1m 2s) ===` and an untimestamped `=== Done: 1 created, 0 failed ===`, and rejects an ordinary ` Compiling serde v1.0` line. Nothing has ever covered this constant: a line-start anchor survived two banner changes unnoticed and was found only by a blind reviewer in Phase 5. The banner is read by three consumers — the live monitor's `grep -E`, `parse_log()` at `:1183`, and `detect_current_phase()` at `:1799` — and this phase renames it while owning all three, which is precisely when a silent anchor regression would ship. An inline `python3 -c` is not acceptable here; it vanishes with the terminal.
 - `grep -n "Clean-fix complete" commands/clean_fix.md` returns nothing and `grep -n "Fix complete" commands/clean_fix.md` matches at `<Monitor/>`'s stop condition — the check that the fifth participant moved with the emitter instead of being left on Phase 5's now-superseded wording.
 - **Run every test in the directory, not the one file that used to be there:** `for t in scripts/clean-fix/tests/test_*.py; do python3 "$t" || exit 1; done` prints `OK` for each. Phase 4 added a second test file, and naming only the older one is how a parser regression ships green.
 
@@ -543,6 +503,7 @@ Use `git mv` for every rename so history follows. `commands/` is a protected pat
 **Files:**
 - `commands/clean_fix.md` — removed by the rename; its content moves to commands/fix.md
 - `commands/fix.md` — the command doc under its new name
+- **Every `/clean_fix` invocation moves in this commit, not in Phase 10.** `commands/style_eval.md:347` invokes `/clean_fix` with `monitor` and is the only external caller; renaming `commands/clean_fix.md` without it leaves this phase's own checkpoint with a slash command that resolves to nothing. A command's name and its call sites are one atomic change, so they land together. Phase 10 keeps the `/clean_fix` **wording** sweep in `commands/new_rust_project.md` and `commands/bevy_migration_plan.md`, which is prose about the pipeline rather than a live invocation.
 - `scripts/clean-fix` — the whole directory is renamed away, tests/ and docs/ included
 - `scripts/fix` — the pipeline directory under its new name, with seven files renamed inside it
 - `scripts/make_a_worktree/retarget_clean_fix.py` — removed by the rename
@@ -552,7 +513,10 @@ Use `git mv` for every rename so history follows. `commands/` is a protected pat
 - `scripts/fix/render-flow.py` — dot/svg basenames if hardcoded
 - `scripts/fix/tests/test_report_parse_phases.py` — the `from clean_fix_report_parse import …` line, the repository's only import of the renamed module
 - `scripts/fix/fix-style-flow.svg` — re-rendered after the rename, never hand-edited
-- `scripts/lint/invoke.sh`, `scripts/lint/lint`, `scripts/lint/lint_config.sh`, `scripts/lint/scope.py`, `scripts/delegate/verify.sh`, `scripts/hooks/banned_words_lib.py`, `scripts/agents/clean_agents_conf.sh`, `scripts/worktree_delete/perform_deletion.sh`, `scripts/new_rust_project/rust_generate.sh`, `scripts/bevy_migration_plan/bevy_migration_ensure_repo.sh` — `scripts/clean-fix/` path strings
+- `scripts/worktree_delete/perform_deletion.sh`, `scripts/new_rust_project/rust_generate.sh`, `scripts/bevy_migration_plan/bevy_migration_ensure_repo.sh` — `scripts/clean-fix/` path strings. **`scripts/lint/{invoke.sh,lint,lint_config.sh,scope.py}`, `scripts/delegate/verify.sh`, `scripts/hooks/banned_words_lib.py`, and `scripts/agents/clean_agents_conf.sh` are deliberately absent**: verified against the tree, each carries brand wording only and not one `scripts/clean-fix/` path, so they are Phase 10's and listing them here would reserve seven files this phase never edits.
+- `CLAUDE.md`, `README.md`, `config/README.md`, `docs/as-built/agent-registry.md` — `scripts/clean-fix/` path strings in prose and file tables
+- `commands/focused_eval.md`, `commands/lint_config.md`, `commands/make_a_worktree.md`, `commands/style_delete.md`, `commands/style_fix_review.md`, `commands/style_rename.md`, `commands/style_usage.md`, `commands/worktree_delete.md` — `scripts/clean-fix/` path strings
+- `commands/style_eval.md` — both the `scripts/clean-fix/` paths **and** the `/clean_fix` invocation at `:347`, the repository's only external caller of the command this phase renames
 
 **Reservations:**
 - file: `commands/clean_fix.md`
@@ -563,27 +527,36 @@ Use `git mv` for every rename so history follows. `commands/` is a protected pat
 - file: `scripts/make_a_worktree/retarget_fix.py`
 - file: `pyrightconfig.json`
 - file: `.claude/settings.local.json`
-- file: `scripts/lint/invoke.sh`
-- file: `scripts/lint/lint`
-- file: `scripts/lint/lint_config.sh`
-- file: `scripts/lint/scope.py`
-- file: `scripts/delegate/verify.sh`
-- file: `scripts/hooks/banned_words_lib.py`
-- file: `scripts/agents/clean_agents_conf.sh`
 - file: `scripts/worktree_delete/perform_deletion.sh`
+- file: `CLAUDE.md`
+- file: `README.md`
+- file: `config/README.md`
+- file: `docs/as-built/agent-registry.md`
+- file: `commands/focused_eval.md`
+- file: `commands/lint_config.md`
+- file: `commands/make_a_worktree.md`
+- file: `commands/style_delete.md`
+- file: `commands/style_fix_review.md`
+- file: `commands/style_rename.md`
+- file: `commands/style_usage.md`
+- file: `commands/worktree_delete.md`
+- file: `commands/style_eval.md`
 - file: `scripts/new_rust_project/rust_generate.sh`
 - file: `scripts/bevy_migration_plan/bevy_migration_ensure_repo.sh`
 
 **Constraints from prior phases:**
 - Phase 8 renamed `CLEAN_FIX_SCRIPT` (`clean-fix-trigger.sh:13`) to **`FIX_ORCHESTRATOR_PATH`** but left its **value** pointing at the old path — this phase fixes the value. The name is `FIX_ORCHESTRATOR_PATH`, not `FIX_SCRIPT`: Phase 8 rejected the bare de-branding because `FIX_SCRIPT` names one of a dozen scripts in the pipeline without saying which. Do not reintroduce it. The same is true of `LOG_DIR`, which Phase 8 already repointed at `~/.local/logs/fix/`; that path is a runtime directory, not a script path, and needs no further change here.
 - Phase 8 renamed the agent-registry family to `fix`, so nothing in `config/agents.conf` depends on the directory name.
+- **The parser's own domain types are deferred to next-items 1-4 and must keep their current shape through this phase either.** `Cell`, `ParseResult`, and `Warning` are named for representation rather than role; `ParseResult.running` reuses `Warning` for a non-warning; phase state and project status are free-form `str`; and a "no reason" is encoded as an empty string. All of it is real, all of it is recorded, and none of it lands here — a rename sweep that also re-tags a domain type is reviewable as neither. Rename identifiers and paths only.
 - Phase 1 reduced `setup.sh` to one plist, so the reload touches a single agent.
 - The launchd label `com.natemccoy.style-fix` and the plist filename `com.natemccoy.style-fix.plist` deliberately keep their names — they describe the surviving style job accurately, and renaming a loaded label risks a bootstrap mistake for no gain. Same for `style-fix-worktrees.sh`, `style-eval-all.sh`, `style-eval-review-all.sh`, `style_history.py`, and `style-fix-monitor.py`.
+- **Re-derive this phase's file set before starting; do not trust the Files list alone.** Phase 7 sweeps repository documentation and will delete some `scripts/clean-fix/` references outright, so the list above is the set that held old paths when Phase 5 closed. Run this phase's own path grep first and reconcile: a file the grep no longer matches needs no edit, and a file it matches that is not listed still has to be renamed, because the gate is repository-wide and does not care what the Files list predicted.
 - `launchctl` must run unsandboxed.
 
 **Acceptance gate:**
 - `ls scripts/fix/fix.sh scripts/fix/fix.conf scripts/fix/fix-trigger.sh scripts/fix/fix-usage.sh scripts/fix/fix_report_parse.py` all exist; `ls scripts/clean-fix` reports no such directory.
 - `ls commands/fix.md` exists; `ls commands/clean_fix.md` reports no such file.
+- `grep -rn "/clean_fix" commands/ --exclude-dir=plans` returns nothing except the pipeline **wording** in `commands/new_rust_project.md` and `commands/bevy_migration_plan.md` that Phase 10 owns — no live invocation of the removed command survives. `grep -n "/fix" commands/style_eval.md` matches at its monitor hand-off.
 - `git status --porcelain` shows the renames as `R` entries, not as delete-plus-add.
 - `grep -rn "scripts/clean-fix\|clean-fix.sh\|clean_fix_report_parse\|clean-fix.conf\|clean-fix-trigger\|clean-fix-usage\|clean-fix-style-flow\|retarget_clean_fix" . | grep -v '^./projects/' | grep -v '^./docs/plans/'` returns nothing. The `docs/plans/` exclusion is required: this plan quotes every old path by design and would otherwise keep the grep permanently non-empty.
 - `cd scripts/fix && python3 render-flow.py` exits 0 and writes `fix-style-flow.svg`; `git diff --stat scripts/fix/fix-style-flow.svg` shows it changed, and the diagram's node and edge set is identical to the one Phase 6 produced.
@@ -696,6 +669,7 @@ Replace all three with `cargo +nightly fmt`, keeping each line's surrounding arg
 - `commands/`, `CLAUDE.md`, and the memory directory are protected or gitignored — use Edit/Write throughout.
 - The surviving `style-*` names are deliberate and stay: `style-fix-worktrees.sh`, `style-eval-all.sh`, `style-eval-review-all.sh`, `style_history.py`, `style-fix-monitor.py`, `style-fix-manual.sh`, the `com.natemccoy.style-fix` launchd label, `/tmp/style-fix-stdout.log`, and the `_style_fix` worktree suffix. Do not rename any of them.
 - `~/rust/nate_style/.history/` is durable style state and is out of scope.
+- **The parser's own domain types are deferred to next-items 1-4 and must keep their current shape through this phase.** `Cell`, `ParseResult`, and `Warning` are named for representation rather than role; `ParseResult.running` reuses `Warning` for a non-warning; phase state and project status are free-form `str`; and a "no reason" is encoded as an empty string. All of it is real, all of it is recorded, and none of it lands here — a rename sweep that also re-tags a domain type is reviewable as neither. Rename identifiers and paths only.
 - `HISTORICAL_COMPLETE_RE` and `match_completion_banner()` in `fix_report_parse.py` carry the retired banner wording on purpose, so that logs written before the rename still read as finished runs. Phase 4's `tests/fixtures/six-phase-run.log` and `tests/test_report_parse_phases.py` carry it for the same kind of reason: the fixture *is* a pre-change log, and the test asserts on its exact strings. Together with `setup.sh`'s historical launchd label, these are the sanctioned survivals of the old brand; the acceptance gate below names all four as permitted exceptions rather than things to sweep. A grep-driven edit to any of them is a regression dressed as cleanup.
 
 **Acceptance gate:**
