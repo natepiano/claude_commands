@@ -34,14 +34,13 @@ PENDING_DIR = HISTORY_DIR / ".pending"
 # Kept identical in spirit to the alternation that previously lived in
 # commands/clean_fix.md so /clean_fix monitor can consume it via --filter-regex.
 MONITOR_FILTER_REGEX = (
-    r"(^|[[:space:]])(CLEAN|BUILD|MEND|DONE|ERROR|WARNING|TIMEOUT|RETRY|RETRY OK|RETRY FAILED|FAILED|WARN|OK|AUTOFINALIZE):"
+    r"(^|[[:space:]])(ERROR|WARNING|TIMEOUT|RETRY|RETRY OK|RETRY FAILED|FAILED|WARN|OK|AUTOFINALIZE):"
     r"|(^|[[:space:]])AGENT LIMIT:"
-    r"|(^|[[:space:]])WARMUP (OK|FAIL|SKIP):"
     r"|(^|[[:space:]])Launched: "
     r"|^=== "
 )
 
-PHASES: tuple[str, ...] = ("clean", "warmup", "eval", "review", "fix", "verify")
+PHASES: tuple[str, ...] = ("eval", "review", "fix", "verify")
 CELL_DASH = "-"
 CURRENT_STATE_LABEL = "current clean-fix state"
 EVAL_SORT_ORDER: dict[str, int] = {
@@ -59,8 +58,8 @@ EVAL_SORT_ORDER: dict[str, int] = {
 HEARTBEAT_FRESH_SECS = 150
 
 # Permanent exclusions: directory will never be a candidate while it exists in
-# its current form. Covers directories not opted into the `[build]` / `[projects]`
-# allowlists plus structural reasons (not a Rust project, framework-managed
+# its current form. Covers directories not opted into the `[projects]` allowlist
+# plus structural reasons (not a Rust project, framework-managed
 # worktree, etc.).
 ALWAYS_EXCLUDED_REASONS: frozenset[str] = frozenset(
     {
@@ -196,8 +195,6 @@ class PhaseStats:
     fail: int = 0
     skip: int = 0
     running: int = 0  # eval phase: launched agent still alive (heartbeat fresh)
-    processed: int = 0  # clean phase
-    warnings: int = 0
     footer_ok: int | None = None
     footer_fail: int | None = None
     footer_total: int | None = None
@@ -665,25 +662,22 @@ def detect_phase_boundaries(lines: list[str]) -> dict[str, tuple[int, int]]:
     """
     bounds: dict[str, tuple[int, int]] = {}
     n = len(lines)
-    clean_start = 0 if n > 0 else -1
-    warmup_start = -1
-    eval_start = -1
+    eval_start = 0 if n > 0 else -1
     eval_end = -1
     review_start = -1
     review_end = -1
     fix_start = -1
     fix_end = n  # default — fix runs to end
 
+    eval_present = False
     eval_done_seen = False
     review_done_seen = False
 
     for i, line in enumerate(lines):
-        if warmup_start == -1 and "WARMUP:" in line and "WARMUP KILLING" not in line:
-            warmup_start = i
-        if eval_start == -1 and EVAL_HEADER_RE.search(line):
-            eval_start = i
+        if not eval_present and EVAL_HEADER_RE.search(line):
+            eval_present = True
             continue
-        if eval_start != -1 and not eval_done_seen and EVAL_DONE_RE.search(line):
+        if eval_present and not eval_done_seen and EVAL_DONE_RE.search(line):
             eval_end = i + 1
             eval_done_seen = True
             continue
@@ -703,35 +697,7 @@ def detect_phase_boundaries(lines: list[str]) -> dict[str, tuple[int, int]]:
         if FIX_DONE_RE.search(line) and fix_start != -1:
             fix_end = i + 1
 
-    # clean phase ends at first warmup OR first eval header OR first
-    # "Starting style evaluations" line.
-    clean_end = n
-    for i, line in enumerate(lines):
-        if "WARMUP:" in line and "WARMUP KILLING" not in line:
-            clean_end = i
-            break
-        if EVAL_HEADER_RE.search(line) or "Starting style evaluations" in line:
-            clean_end = i
-            break
-
-    # warmup ends at clean_end's successor: first eval header / "Starting style".
-    warmup_end = clean_end  # default if no warmup
-    if warmup_start != -1:
-        warmup_end = n
-        for i in range(warmup_start, n):
-            if EVAL_HEADER_RE.search(lines[i]) or "Starting style evaluations" in lines[i]:
-                warmup_end = i
-                break
-
-    if clean_start != -1 and clean_end > clean_start:
-        # Only register clean if there's a timestamped `CLEAN: <project>` line.
-        # Untimestamped SKIP/ELIGIBLE lines belong to style-fix-worktrees.sh, not the clean phase.
-        slice_text = "\n".join(lines[clean_start:clean_end])
-        if re.search(r"^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2} CLEAN: ", slice_text, re.MULTILINE):
-            bounds["clean"] = (clean_start, clean_end)
-    if warmup_start != -1:
-        bounds["warmup"] = (warmup_start, warmup_end)
-    if eval_start != -1:
+    if eval_present and eval_start != -1:
         bounds["eval"] = (eval_start, eval_end if eval_end != -1 else n)
     if review_start != -1:
         bounds["review"] = (review_start, review_end if review_end != -1 else n)
@@ -739,98 +705,6 @@ def detect_phase_boundaries(lines: list[str]) -> dict[str, tuple[int, int]]:
         bounds["fix"] = (fix_start, fix_end)
 
     return bounds
-
-
-def parse_clean_phase(
-    lines: list[str], result: ParseResult
-) -> None:
-    stats = result.stats["clean"]
-    stats.present = True
-    project_warnings: dict[str, str] = {}
-    done_projects: set[str] = set()
-    cleaned_projects: set[str] = set()
-
-    skip_re = re.compile(r"SKIP: (.+?) \(([^)]+)\)")
-    clean_re = re.compile(r"CLEAN: (\S+)")
-    done_re = re.compile(r"DONE: (\S+)")
-    warn_re = re.compile(r"WARNING: (.+?) for (\S+)")
-    error_re = re.compile(r"ERROR: (.+?) for (\S+)")
-
-    for line in lines:
-        m = clean_re.search(line)
-        if m:
-            cleaned_projects.add(m.group(1))
-            continue
-        m = done_re.search(line)
-        if m:
-            done_projects.add(m.group(1))
-            continue
-        m = skip_re.search(line)
-        if m and "WARMUP" not in line and "PHASE" not in line:
-            project, reason = m.group(1), m.group(2)
-            row = get_row(result.rows, project)
-            row["clean"] = Cell("SKIP", slugify_reason(reason))
-            stats.skip += 1
-            result.skip_reasons.append(SkipReason("clean", reason, project))
-            continue
-        m = warn_re.search(line)
-        if m:
-            msg, project = m.group(1), m.group(2)
-            project_warnings[project] = msg
-            stats.warnings += 1
-            result.tool_warnings.append(ToolWarning("clean", project, msg))
-            continue
-        m = error_re.search(line)
-        if m:
-            msg, project = m.group(1), m.group(2)
-            project_warnings[project] = f"ERROR {msg}"
-            result.warnings.append(Warning("clean", project, f"ERROR {msg}"))
-
-    for project in cleaned_projects:
-        row = get_row(result.rows, project)
-        if project in done_projects:
-            if project in project_warnings:
-                row["clean"] = Cell("OK", "warning")
-            else:
-                row["clean"] = Cell("OK")
-        else:
-            if project in project_warnings:
-                row["clean"] = Cell("FAIL", slugify_reason(project_warnings[project]))
-                stats.fail += 1
-            else:
-                row["clean"] = Cell("OK")
-        if row["clean"].state.startswith("OK"):
-            stats.ok += 1
-        stats.processed += 1
-
-
-def parse_warmup_phase(lines: list[str], result: ParseResult) -> None:
-    stats = result.stats["warmup"]
-    stats.present = True
-    ok_re = re.compile(r"WARMUP OK: (\S+)")
-    fail_re = re.compile(r"WARMUP FAIL: (\S+) \(([^)]+)\)")
-    skip_re = re.compile(r"WARMUP SKIP: (\S+) \(([^)]+)\)")
-
-    for line in lines:
-        m = ok_re.search(line)
-        if m:
-            project = m.group(1)
-            get_row(result.rows, project)["warmup"] = Cell("OK")
-            stats.ok += 1
-            continue
-        m = fail_re.search(line)
-        if m:
-            project, reason = m.group(1), m.group(2)
-            get_row(result.rows, project)["warmup"] = Cell("FAIL", slugify_reason(reason))
-            stats.fail += 1
-            result.warnings.append(Warning("warmup", project, reason))
-            continue
-        m = skip_re.search(line)
-        if m:
-            project, reason = m.group(1), m.group(2)
-            get_row(result.rows, project)["warmup"] = Cell("SKIP", slugify_reason(reason))
-            stats.skip += 1
-            result.skip_reasons.append(SkipReason("warmup", reason, project))
 
 
 def parse_eval_phase(lines: list[str], result: ParseResult) -> None:
@@ -1324,12 +1198,6 @@ def parse_log(path: Path) -> ParseResult:
         result.status = "in-progress" if result.run_start else "partial"
 
     bounds = detect_phase_boundaries(lines)
-    if "clean" in bounds:
-        s, e = bounds["clean"]
-        parse_clean_phase(lines[s:e], result)
-    if "warmup" in bounds:
-        s, e = bounds["warmup"]
-        parse_warmup_phase(lines[s:e], result)
     if "eval" in bounds:
         s, e = bounds["eval"]
         parse_eval_phase(lines[s:e], result)
@@ -1939,10 +1807,6 @@ def detect_current_phase(path: Path) -> tuple[str, str]:
             return ("style-eval", line)
         if REVIEW_HEADER_RE.search(line):
             return ("style-eval-review", line)
-        if "WARMUP" in line:
-            return ("warmup", line)
-        if re.search(r"^\d{4}-\d{2}-\d{2}.*(CLEAN:|BUILD:|MEND:|DONE:)", line):
-            return ("clean+rebuild", line)
     return ("unknown", lines[-1])
 
 
@@ -1977,9 +1841,6 @@ def emit_full_report(result: ParseResult) -> None:
             print(f"PHASE {phase} present=false")
             continue
         parts = [f"PHASE {phase}", "present=true"]
-        if phase == "clean":
-            parts.append(f"processed={s.processed}")
-            parts.append(f"warnings={s.warnings}")
         parts.append(f"ok={s.ok}")
         parts.append(f"fail={s.fail}")
         parts.append(f"skip={s.skip}")

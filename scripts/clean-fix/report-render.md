@@ -23,8 +23,8 @@ ELAPSED: <duration | "-">
 STATUS: complete | crashed | partial | in-progress | current
 
 PHASE <name> present=<bool> ok=N fail=N skip=N [footer_ok=N footer_fail=N footer_total=N]
-ROW <project>  clean=<cell> warmup=<cell> eval=<cell> review=<cell> fix=<cell> verify=<cell> reason="<short reason | ->" [phase_now="<live phase>"]
-ALWAYS_EXCLUDED "<reason>" count=N projects=<a,b,c>   ← directories under ~/rust not opted into the relevant allowlist ([build] / [projects]) in clean-fix.conf
+ROW <project>  eval=<cell> review=<cell> fix=<cell> verify=<cell> reason="<short reason | ->" [phase_now="<live phase>"]
+ALWAYS_EXCLUDED "<reason>" count=N projects=<a,b,c>   ← directories under ~/rust not opted into the [projects] allowlist in clean-fix.conf
 FILTERED_OUT "<reason>" count=N projects=<a,b,c>      ← would be eligible, but framework state / project layout filtered them out
 WARNING <phase> <project> "<message>"                 ← real project failures
 TOOL_WARNING <phase> <project> "<message>"            ← sub-tool failed but project itself is healthy
@@ -71,7 +71,7 @@ If `STATUS` is `partial` or `in-progress`, replace the parenthetical with `parti
 
 Render these as **two separate sections**, never one combined list. They have different audiences.
 
-**Excluded** — render only if `ALWAYS_EXCLUDED` or `FILTERED_OUT` records exist. The orchestrator picks up every directory under `~/rust/` automatically (no allowlist) so anything not under "Excluded" is implicitly in. Render as a header line followed by one bullet per reason, with the **category name in bold**. Use these category names (map from the parser's raw reason text):
+**Excluded** — render only if `ALWAYS_EXCLUDED` or `FILTERED_OUT` records exist. The orchestrator works from the `[projects]` allowlist in `clean-fix.conf`, so a directory under `~/rust/` is a target only when it is keyed there; everything else is reported under "Excluded". Render as a header line followed by one bullet per reason, with the **category name in bold**. Use these category names (map from the parser's raw reason text):
 
 | Parser reason text                            | Bullet category                            |
 |-----------------------------------------------|--------------------------------------------|
@@ -100,7 +100,7 @@ If neither `ALWAYS_EXCLUDED` nor `FILTERED_OUT` has records, omit the Excluded s
 
 ### 3. Status table
 
-Markdown table with columns `Project | Clean | Warmup | Eval | Review | Fix | Verify | Reason`. Preserve parser row order: `Eval` status first (`RUNNING`, `FAIL`, `OK`, `SKIP`, then `—`), then project name alphabetically. Each phase cell is `OK`, `FAIL`, `SKIP`, `RUNNING`, or `—`. **Strip the `:reason` suffix from phase cells** (so a `verify=FAIL:timeout` cell renders as `FAIL`; the reason text is carried by the final column). Render the parser's quoted `reason` value in the final column, using `—` when the value is `-`. The `Verify` column comes from the `verify=<cell>` field — see the verify-cell meanings above; for a finished run with fixes applied it is normally `OK`, and `—` for any run with no applied fix or any old log. If `cargo-mend` shows `clean=OK:warning`, render the cell as `OK*` and add a footnote line under the table: `* cargo-mend built fine, but the cargo mend tool itself failed against it. The build is healthy; the linter is not.`
+Markdown table with columns `Project | Eval | Review | Fix | Verify | Reason`. Preserve parser row order: `Eval` status first (`RUNNING`, `FAIL`, `OK`, `SKIP`, then `—`), then project name alphabetically. Each phase cell is `OK`, `FAIL`, `SKIP`, `RUNNING`, or `—`. **Strip the `:reason` suffix from phase cells** (so a `verify=FAIL:timeout` cell renders as `FAIL`; the reason text is carried by the final column). Render the parser's quoted `reason` value in the final column, using `—` when the value is `-`. The `Verify` column comes from the `verify=<cell>` field — see the verify-cell meanings above; for a finished run with fixes applied it is normally `OK`, and `—` for any run with no applied fix or any old log.
 
 ### 4. Still running
 
@@ -153,7 +153,7 @@ Examples of NOTEs the parser emits:
 - `~/rust/nate_style left dirty: 1 worktree run(s) failed; leaving nate_style dirty for review` → `nate_style is in a dirty state because a worktree fix failed. Review and commit (or discard) ~/rust/nate_style before the next run.`
 - `style-fix script failed before per-project work` → `the style-fix script crashed before doing any work — investigate the orchestrator log.`
 - `<family> hit its usage limit during the fix pass: N projects (…) failed for that reason alone …` → **lead the Heads up section with this, rendered close to verbatim.** It is the single most important line when it appears: it explains why several fixes are missing in one stroke — the fix agent hit the credit wall, not a code problem — and that those worktrees come back on the next run after the reset time. Do not bury it below per-project chores.
-- `phases not in this log: clean,warmup,eval,review` → omit (this is a partial-log informational, already implied by the empty cells).
+- `phases not in this log: eval,review` → omit (this is a partial-log informational, already implied by the empty cells).
 
 Also synthesize NOTEs for:
 - **Footer mismatches**: a `PHASE` line where `ok + fail` doesn't equal the count of per-project results in the matrix for that phase. Phrase as `Eval phase: footer says 12 in scope, 10 produced results, 2 unaccounted for.`

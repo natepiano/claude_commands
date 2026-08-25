@@ -1,0 +1,73 @@
+#!/usr/bin/env python3
+"""Lock the four-phase parser model to a representative historical run.
+
+The fixture is a full six-phase run: it carries the clean and warmup log
+vocabulary the pipeline no longer emits, plus the retired completion banner.
+Both are load-bearing. The retired vocabulary must parse into the same eval,
+review, fix, and verify cells recorded in EXPECTED_PROJECT_CELLS, and the
+retired banner must still close the run, so archived logs keep reading as
+finished rather than in-progress.
+"""
+
+import sys
+import unittest
+from pathlib import Path
+from typing import ClassVar, override
+
+
+SCRIPT_DIR = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(SCRIPT_DIR))
+
+from clean_fix_report_parse import PHASES, ParseResult, parse_log  # noqa: E402
+
+
+FIXTURE = Path(__file__).parent / "fixtures" / "six-phase-run.log"
+EXPECTED_PHASES: tuple[str, ...] = ("eval", "review", "fix", "verify")
+EXPECTED_PROJECT_CELLS: dict[str, tuple[str, ...]] = {
+    "fixture_alpha": ("OK:exhausted", "OK", "OK", "OK"),
+    "fixture_beta": ("OK:no-findings", "OK", "SKIP:no-open-findings", "-"),
+    "fixture_gamma": (
+        "SKIP:already-at-cap-of-2-findings",
+        "-",
+        "SKIP:no-open-findings",
+        "-",
+    ),
+}
+
+
+class ReportPhaseRegressionTest(unittest.TestCase):
+    result: ClassVar[ParseResult]
+
+    @classmethod
+    @override
+    def setUpClass(cls) -> None:
+        cls.result = parse_log(FIXTURE)
+
+    def test_historical_completion_banner_finishes_run(self) -> None:
+        self.assertEqual(self.result.status, "complete")
+        self.assertEqual(self.result.elapsed, "0m 55s")
+
+    def test_parser_exposes_only_surviving_phases(self) -> None:
+        self.assertEqual(PHASES, EXPECTED_PHASES)
+        self.assertEqual(tuple(self.result.stats), EXPECTED_PHASES)
+        self.assertEqual(
+            tuple(phase for phase in EXPECTED_PHASES if self.result.stats[phase].present),
+            EXPECTED_PHASES,
+        )
+        self.assertNotIn("clean", self.result.stats)
+        self.assertNotIn("warmup", self.result.stats)
+        for row in self.result.rows.values():
+            self.assertEqual(tuple(row), EXPECTED_PHASES)
+            self.assertNotIn("clean", row)
+            self.assertNotIn("warmup", row)
+
+    def test_surviving_project_cells_match_pre_edit_baseline(self) -> None:
+        actual = {
+            project: tuple(row[phase].render() for phase in EXPECTED_PHASES)
+            for project, row in self.result.rows.items()
+        }
+        self.assertEqual(actual, EXPECTED_PROJECT_CELLS)
+
+
+if __name__ == "__main__":
+    _ = unittest.main()
