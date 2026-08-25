@@ -71,12 +71,18 @@ Closeout mode is stricter: exactly one current phase may change. Every earlier
 `done` phase and every remaining `todo` phase must be byte-identical to the
 pre-shrink input; forward propagation happened before this command.
 
-**Never renumber, merge, split, delete, or reorder a phase.** Identifiers are
-load-bearing: a `done` phase's number is baked into its checkpoint commit message
-and referenced by later phases' **Constraints from prior phases**. Phases keep
-their position in the doc. Identifiers appearing with letter suffixes (`4b`,
-`11a`) in older plans are copied as found — this command is not the place to fix
-numbering.
+**Never renumber, merge, split, delete, or reorder a phase.** This is a statement
+about *this command's* scope, not about whether phase numbers may ever move. They
+may: `~/.claude/docs/delegate_plan_format.md` requires bare contiguous integers
+and resequences from the edit point on any spine edit. That procedure lives in
+`/plan:to_phased_plan` → `<PhaseNumbering/>`. Shrink rewrites archive prose and
+splices by exact heading match, so a number changing underneath it would break
+the splice — which is why shrink leaves numbering alone and defers to that
+command, not because identifiers are immovable.
+
+Identifiers carrying letter suffixes (`4b`, `11a`) in older plans are copied as
+found. They are a violation of the format doc, not a supported form: do not
+normalize them here, and do not treat their presence as license to create more.
 
 **The phase heading line is copied verbatim**, including any commit annotation.
 </ArchiveOnly>
@@ -308,7 +314,11 @@ Retrospective's deviations: where the two disagree, what shipped wins.>
 - `<path>` — <what it holds now>
 
 **Binds later work:** <facts the remaining phases depend on — the ${FLOOR} entries.
-Omit the line if none.>
+Name the fact and, where a consumer must be named, its **title**. Never a forward
+phase number: a `todo` phase's number moves whenever the spine is edited, and a
+`done` phase is frozen, so a number written here goes stale with no one permitted
+to fix it. "The `PostToolUse` shim invokes `drift` with a named comparison
+selector", not "Phase 13's shim invokes…". Omit the line if none.>
 
 **Gotchas:** <durable traps: calibration constants, invariants enforced by
 construction, environment or tooling constraints that still bite. Omit if none.>
@@ -485,7 +495,8 @@ Then stop.
 - `done` phases only. The live zone, `## Delegation Context`, and every other
   doc-level section are untouched — see `<ArchiveOnly/>`.
 - Never renumber, merge, split, delete, or reorder a phase; heading lines are
-  copied byte-for-byte.
+  copied byte-for-byte. Resequencing is `/plan:to_phased_plan` → `<PhaseNumbering/>`,
+  not this command — see `<ArchiveOnly/>`.
 - The orchestrator never reads the plan doc's archive text. Structure comes from
   a heading map, rewriting is offloaded to chunk subagents, and assembly is a
   script — that is the whole point of the command.

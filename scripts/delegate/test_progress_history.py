@@ -1468,9 +1468,9 @@ class ProgressHistoryTests(unittest.TestCase):
     def test_the_header_names_the_phase_position_in_the_plan(self) -> None:
         """Worktree and branch say where the run is, not how much plan is left.
 
-        The position counts the finished phases and adds the one in flight, off
-        the same headings the project percentage derives from, so the line and
-        the table can never disagree about how far along the plan is.
+        The position is the ordinal of the heading the phase in flight actually
+        occupies, looked up by the id `start-phase` named, off the same headings
+        the project percentage derives from.
         """
         session_dir = self.start_run("position", 0)
         plan_path = self.working_dir / "docs" / "position.md"
@@ -1510,6 +1510,50 @@ class ProgressHistoryTests(unittest.TestCase):
         # of five is 50, and the position above counts the same headings.
         self.assertIn("| Project |  50 | ", header)
         self.assertIn("| 2 of 5 done |", header)
+
+    def test_the_position_holds_while_the_phase_review_window_marks_it_done(
+        self,
+    ) -> None:
+        """`/plan:phase_review` flips the phase to done before its checkpoint.
+
+        For that whole window the phase in flight is also a finished phase, so
+        counting finished phases and adding one names the phase after it. The
+        position must keep naming the phase `start-phase` opened.
+        """
+        session_dir = self.start_run("position", 0)
+        plan_path = self.working_dir / "docs" / "position.md"
+        _ = plan_path.write_text(
+            plan_path.read_text(encoding="utf-8")
+            + "### Phase 1 — Shrunk archive form (`bbac234`)\n\n"
+            + "### Phase 2 — Completed  · status: done\n\n"
+            + "### Phase 3 — Live work  · status: done\n\n"
+            + "### Phase 4 — Waiting  · status: todo\n\n"
+            + "### Phase 5 — Waiting  · status: todo\n\n",
+            encoding="utf-8",
+        )
+        self.start_phase_and_pass(session_dir, 70_000)
+        header = self.run_command(
+            "progress",
+            "--session-dir",
+            str(session_dir),
+            "--project-raw-percent",
+            "90",
+            "--project-percent",
+            "90",
+            "--phase-raw-percent",
+            "50",
+            "--phase-percent",
+            "50",
+            "--cap-stage",
+            "closure",
+            "--activity",
+            "reviewing the remaining phases",
+            at=80_000,
+        )
+        self.assertEqual(
+            header.splitlines()[0],
+            "**bevy_hana_rubric - feature/rubric - phase 3 of 5**",
+        )
 
 
 class PhaseCountTests(unittest.TestCase):

@@ -278,60 +278,17 @@ class FindingsLedgerTests(unittest.TestCase):
         _ = self.open_finding("blocker", "null deref")
         self.assertEqual(self.run_command("landed"), "no repair round in flight")
 
-    def test_stop_when_a_finding_fails_to_close_twice(self) -> None:
+    def test_a_finding_that_fails_to_close_twice_is_advised_not_blocked(self) -> None:
+        """The pattern is worth saying; it is not this script's call to make."""
         _ = self.open_finding("blocker", "null deref")
         self.close_round(["F001"], verdict="still_open")
         self.close_round(["F001"], verdict="still_open")
         payload = self.gate()
-        self.assertEqual(payload["verdict"], "stop")
-        self.assertIn("F001 failed to close after 2 repair attempts", str(payload["stop_reason"]))
+        self.assertEqual(payload["verdict"], "dispatch")
+        self.assertIn("F001 failed to close after 2 repair attempts", str(payload["advisory"]))
+        self.assertEqual(self.run_command("dispatch", "--covers", "F001"), "round 3 covering F001")
 
-    def test_override_clears_one_stop_and_is_spent_by_its_round(self) -> None:
-        """The correction path for a stop that is wrong about the world.
-
-        The run history that produced the stop is never edited; the override is
-        appended alongside it, names the exact reason it clears, and dies with
-        the fix round it authorizes.
-        """
-        self.write_progress_state("override-instance")
-        _ = self.open_finding("blocker", "null deref")
-        self.close_round(["F001"], verdict="still_open")
-        self.close_round(["F001"], verdict="still_open")
-        stopped = self.gate()
-        self.assertEqual(stopped["verdict"], "stop")
-        refused = self.run_failing_command("override", "--reason", "wrong")
-        self.assertNotEqual(refused.returncode, 0)
-        self.assertIn("user's own words", refused.stderr)
-        _ = self.run_command(
-            "override",
-            "--reason",
-            "the second attempt never ran; the launcher died before it edited anything",
-        )
-        overridden = self.gate()
-        self.assertEqual(overridden["verdict"], "dispatch")
-        self.assertIsNone(overridden["stop_reason"])
-        self.assertIn("failed to close", str(overridden["overridden_stop"]))
-        _ = self.run_command("dispatch", "--covers", "F001")
-        _ = self.run_command("landed")
-        _ = self.run_command("verdict", "--id", "F001", "--state", "still_open")
-        spent = self.gate()
-        self.assertEqual(spent["verdict"], "stop")
-        self.assertIn("failed to close", str(spent["stop_reason"]))
-        self.assertIn(
-            "finding_stop_overridden",
-            {str(event.get("event_type")) for event in self.events()},
-        )
-
-    def test_override_is_refused_when_the_gate_is_not_stopping(self) -> None:
-        _ = self.open_finding("blocker", "null deref")
-        self.assertEqual(self.gate()["verdict"], "dispatch")
-        refused = self.run_failing_command(
-            "override", "--reason", "there is no stop here to correct at all"
-        )
-        self.assertNotEqual(refused.returncode, 0)
-        self.assertIn("nothing to override", refused.stderr)
-
-    def test_stop_when_an_accepted_finding_reopens_twice(self) -> None:
+    def test_a_finding_that_reopens_twice_is_advised_not_blocked(self) -> None:
         _ = self.open_finding("blocker", "null deref")
         self.close_round(["F001"])
         _ = self.run_command(
@@ -342,26 +299,31 @@ class FindingsLedgerTests(unittest.TestCase):
             "verdict", "--id", "F001", "--state", "reopened", "--evidence", "same hunk, again"
         )
         payload = self.gate()
-        self.assertEqual(payload["verdict"], "stop")
-        self.assertIn("reopened 2 times", str(payload["stop_reason"]))
+        self.assertEqual(payload["verdict"], "dispatch")
+        self.assertIn("reopened 2 times", str(payload["advisory"]))
 
-    def test_stop_when_the_gating_count_stops_decreasing(self) -> None:
-        """Each round closes its finding and the closure review opens a fresh one."""
+    def test_a_gating_count_that_stops_decreasing_is_advised_not_blocked(self) -> None:
+        """Each round closes its finding and the closure review opens a fresh one.
+
+        Which is also what an honest phase looks like when every round repairs
+        what it was given and the next gate finds something new, so this is
+        exactly the pattern a watcher must be told about rather than stopped by.
+        """
         _ = self.open_finding("blocker", "round 1")
         self.close_round(["F001"])
         _ = self.open_finding("blocker", "round 2")
         self.close_round(["F002"])
         _ = self.open_finding("blocker", "round 3")
         payload = self.gate()
-        self.assertEqual(payload["verdict"], "stop")
-        self.assertIn("has not decreased for 2 rounds", str(payload["stop_reason"]))
+        self.assertEqual(payload["verdict"], "dispatch")
+        self.assertIn("has not decreased for 2 rounds", str(payload["advisory"]))
 
-    def test_repair_budget_stops_a_loop_that_never_stalls(self) -> None:
+    def test_a_spent_repair_budget_is_advised_not_blocked(self) -> None:
         """Alternating 2 and 1 open blockers never trips the stall test.
 
         The budget does: two original findings buy the three-round floor, so
-        the fourth gate stops. A slow bleed used to run all the way to the
-        backstop.
+        the fourth gate reports it. A slow bleed is the shape this advisory
+        exists to name.
         """
         for index in range(3):
             batch: list[str] = []
@@ -373,9 +335,9 @@ class FindingsLedgerTests(unittest.TestCase):
             self.close_round(batch)
         _ = self.open_finding("blocker", "one more")
         payload = self.gate()
-        self.assertEqual(payload["verdict"], "stop")
-        self.assertIn("repair budget", str(payload["stop_reason"]))
-        self.assertIn("3 fix rounds have run for 2 original findings", str(payload["stop_reason"]))
+        self.assertEqual(payload["verdict"], "dispatch")
+        self.assertIn("repair budget", str(payload["advisory"]))
+        self.assertIn("3 fix rounds have run for 2 original findings", str(payload["advisory"]))
 
     def test_the_repair_budget_floor_is_configurable(self) -> None:
         """delegate.conf raises the floor, and the extra round is authorized."""
@@ -391,6 +353,7 @@ class FindingsLedgerTests(unittest.TestCase):
         _ = self.open_finding("blocker", "fourth round")
         payload = self.gate()
         self.assertEqual(payload["verdict"], "dispatch")
+        self.assertIsNone(payload["advisory"])
 
     def test_an_unusable_config_value_stops_the_run(self) -> None:
         """A bad value is an error, not a fall back to some compiled limit."""

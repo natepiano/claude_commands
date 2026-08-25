@@ -116,7 +116,9 @@ Orders; `/plan:shrink --closeout` then writes the archive form:
 the Work Order's Spec corrected by temporary closeout facts>
 
 **Files:** `<path>` — <what it holds now>
-**Binds later work:** <facts remaining phases still depend on; omit if none>
+**Binds later work:** <facts remaining phases still depend on, named by fact and
+by consumer *title* — never by forward phase number, which resequencing moves and
+a frozen `done` phase cannot follow; omit if none>
 **Gotchas:** <durable traps; omit if none>
 **Ruled out:** <rejected proposals, one clause each; omit if none>
 ```

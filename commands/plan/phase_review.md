@@ -286,6 +286,24 @@ byte-identical.
    user-actionable audit disposition, name the remaining Work Order that owns
    its surface and acceptance test. If none does, route the required work as a
    plan gap or next-item candidate; never leave it only in retrospective prose.
+5. **Revalidate the complete Work Orders.** Set
+   `${RESERVATION_COVERAGE_MODE}` to `required` when the plan's repository has
+   `.claude/config/berth.toml`, otherwise `advisory`, then run the command below
+   separately for every remaining `todo` phase. Do not validate archived `done`
+   Work Orders, which this command must leave byte-identical:
+
+   ```sh
+   PYTHONPATH="$HOME/.claude/scripts" python3 -m berth.work_order \
+     --repository-root "${WORKING_DIR}" validate --document "${PLAN_DOC}" \
+     --phase <todo-phase> --coverage "${RESERVATION_COVERAGE_MODE}"
+   ```
+
+   This shared tagged contract validates Goal, Spec, Files, Reservations, and
+   Files/Reservations agreement together. Never parse a Reservations block in
+   this command. After any Files edit or newly named implementation path, edit
+   Reservations through the same grammar and rerun this command; failure blocks
+   Step 6. Under `advisory`, a tagged `missing` declaration is distinct from a
+   declared empty scope set and is the only accepted absence.
 
 Mechanical Work Order edits (added constraints, corrected refs, gate tweaks) need
 no user gate — they go straight in. A finding that changes a remaining phase's

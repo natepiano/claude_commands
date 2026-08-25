@@ -11,7 +11,11 @@ This ledger replaces the counter with state:
   * Every finding gets a stable id (`F001`) that survives every round, so
     "issue 2" means the same thing on round four as on round one.
   * `gate` decides whether another automatic fix round may run. It answers
-    `converged`, `dispatch`, or `stop` — the orchestrator never decides.
+    `converged` or `dispatch` and never stops the run. The patterns that once
+    stopped it are still computed and still reported, as an `advisory` string
+    beside the verdict, because they are worth seeing — a repair that keeps
+    failing, a count that will not come down. They are for the person watching
+    to act on, not for this script to enforce.
   * `dispatch` refuses a fix that covers only part of the gating open set, so a
     round always closes everything currently on the ledger.
   * A dispatched round is `repair_in_flight` until something observes how it
@@ -21,7 +25,8 @@ This ledger replaces the counter with state:
   * Severity narrows after the first round: blockers and minors gate the first
     fix round, blockers alone gate every later one. Nits never gate.
 
-Convergence stop conditions, all computed from recorded state:
+Convergence advisories, all computed from recorded state and all reported
+rather than enforced:
 
   * a finding failed to close `MAX_FIX_ATTEMPTS` times
   * a finding reopened `MAX_REOPENS` times after being accepted
@@ -34,7 +39,8 @@ Convergence stop conditions, all computed from recorded state:
 
 Every one of those limits is set in `~/.claude/config/delegate.conf`, which is
 authoritative: no limit has a compiled default, and a missing or unusable value
-stops the run before any command executes.
+stops the run before any command executes. The limits decide when an advisory
+is worth printing; none of them decides whether a round runs.
 
 Findings live in `<session_dir>/findings_state.json` and are also appended to
 the run's durable event stream when `progress_history.py` has started a run.
@@ -533,11 +539,19 @@ def _open_counts(state: dict[str, object]) -> dict[str, int]:
     return counts
 
 
-def _stop_reason(
+def _advisory_reason(
     state: dict[str, object],
     gating_open: int,
     passes: list[tuple[str, str]],
 ) -> str:
+    """The convergence pattern worth reporting this round, or "" for none.
+
+    Every branch below used to stop the phase. None of them does now: the run
+    belongs to whoever is watching it, and these patterns are advice offered to
+    that person rather than a verdict imposed on them. What each branch is still
+    good at is naming the shape of a phase that is not converging, which is
+    exactly what a watcher wants said out loud and early.
+    """
     # Reopens are checked first: a finding that was accepted and then invalidated
     # again says more about the repair than its raw dispatch count does, and the
     # two thresholds are reached on the same round in the ordinary flow.
@@ -683,26 +697,6 @@ def _verdict(args: argparse.Namespace) -> None:
     print(f"{finding_id} {_string(entry.get('state'))}")
 
 
-def _live_override(state: dict[str, object], reason: str) -> dict[str, object] | None:
-    """The user's standing override of one specific stop reason, or None.
-
-    A stop can be wrong about the world — a review the orchestrator recorded by
-    hand, a count skewed by an aborted launcher — and the durable event history
-    that produced it must never be edited to make it go away. The override is the
-    correction path instead: it names the exact reason it clears, carries the
-    user's own words, and is spent by the fix round it authorizes, so it can
-    silence one wrong stop and nothing else.
-    """
-    override = _object_dict(state.get("stop_override"))
-    if override is None:
-        return None
-    if override.get("consumed_round") is not None:
-        return None
-    if _string(override.get("stop_reason")) != reason:
-        return None
-    return override
-
-
 def _gate_payload(state: dict[str, object], session_dir: Path) -> dict[str, object]:
     gating = _gating_severities(state)
     batch = _open_entries(state, gating)
@@ -728,21 +722,13 @@ def _gate_payload(state: dict[str, object], session_dir: Path) -> dict[str, obje
     }
     if not batch:
         payload["verdict"] = "converged"
-        payload["stop_reason"] = None
+        payload["advisory"] = None
         return payload
-    reason = _stop_reason(state, gating_open, passes)
-    override = _live_override(state, reason) if reason else None
-    if override is not None:
-        payload["verdict"] = "dispatch"
-        payload["stop_reason"] = None
-        payload["overridden_stop"] = {
-            "stop_reason": reason,
-            "reason": _string(override.get("reason")),
-            "granted_at": _string(override.get("granted_at")),
-        }
-        return payload
-    payload["verdict"] = "stop" if reason else "dispatch"
-    payload["stop_reason"] = reason or None
+    # An advisory never changes the verdict. A phase that has run four rounds on
+    # one finding still gets its fifth; the difference is that the gate says so
+    # out loud instead of refusing.
+    payload["verdict"] = "dispatch"
+    payload["advisory"] = _advisory_reason(state, gating_open, passes) or None
     return payload
 
 
@@ -775,7 +761,7 @@ def _gate(args: argparse.Namespace) -> None:
             "timestamp": _iso_time(now),
             "timestamp_epoch": now,
             "verdict": payload.get("verdict"),
-            "stop_reason": payload.get("stop_reason"),
+            "advisory": payload.get("advisory"),
             "round": payload.get("round"),
             "open_counts": payload.get("open_counts"),
         },
@@ -790,11 +776,7 @@ def _dispatch(args: argparse.Namespace) -> None:
     payload = _gate_payload(state, session_dir)
     verdict = _string(payload.get("verdict"))
     if verdict != "dispatch":
-        raise SystemExit(
-            f"gate says {verdict}"
-            + (f" ({_string(payload.get('stop_reason'))})" if payload.get("stop_reason") else "")
-            + "; a fix round is not authorized"
-        )
+        raise SystemExit(f"gate says {verdict}; there is nothing to dispatch")
     gating = _gating_severities(state)
     expected = {_string(entry.get("id")) for entry in _open_entries(state, gating)}
     covered = {value.strip() for value in _arg_string(args, "covers").split(",") if value.strip()}
@@ -829,11 +811,6 @@ def _dispatch(args: argparse.Namespace) -> None:
         }
     )
     state["rounds"] = rounds
-    spent = _object_dict(payload.get("overridden_stop"))
-    if spent is not None:
-        override = _object_dict(state.get("stop_override"))
-        if override is not None:
-            override["consumed_round"] = round_number
     _write_state(session_dir, state)
     _append_event(
         session_dir,
@@ -846,7 +823,7 @@ def _dispatch(args: argparse.Namespace) -> None:
             "covered": sorted(covered),
             "gating_open_before": gating_open,
             "gating_severities": list(gating),
-            "overridden_stop": spent,
+            "advisory": payload.get("advisory"),
         },
     )
     print(f"round {round_number} covering {', '.join(sorted(covered))}")
@@ -957,47 +934,6 @@ def _abandon(args: argparse.Namespace) -> None:
     )
 
 
-def _override(args: argparse.Namespace) -> None:
-    session_dir = _session_dir(args)
-    now = _now_epoch()
-    state = _read_state(session_dir, now)
-    gating = _gating_severities(state)
-    batch = _open_entries(state, gating)
-    counts = _open_counts(state)
-    gating_open = sum(counts[severity] for severity in gating)
-    passes = _phase_passes(session_dir, _string(state.get("phase_instance_id")))
-    reason = _stop_reason(state, gating_open, passes) if batch else ""
-    if not reason:
-        raise SystemExit("The gate is not stopping, so there is nothing to override")
-    justification = _arg_string(args, "reason")
-    if len(justification) < 20:
-        raise SystemExit(
-            "Record why the stop is wrong in the user's own words, not a token; "
-            + "this text is the whole audit trail for the round it authorizes"
-        )
-    override: dict[str, object] = {
-        "stop_reason": reason,
-        "reason": justification,
-        "granted_at": _iso_time(now),
-        "granted_at_epoch": now,
-        "consumed_round": None,
-    }
-    state["stop_override"] = override
-    _write_state(session_dir, state)
-    _append_event(
-        session_dir,
-        state,
-        {
-            "event_type": "finding_stop_overridden",
-            "timestamp": _iso_time(now),
-            "timestamp_epoch": now,
-            "stop_reason": reason,
-            "reason": justification,
-        },
-    )
-    print(f"override recorded for: {reason}")
-
-
 def _status(args: argparse.Namespace) -> None:
     session_dir = _session_dir(args)
     now = _now_epoch()
@@ -1070,13 +1006,6 @@ def _build_parser() -> argparse.ArgumentParser:
         help="partial edits are in the tree, so the attempt stands rather than being refunded",
     )
     abandon.set_defaults(handler=_abandon)
-
-    override = subparsers.add_parser(
-        "override", help="record the user's override of one wrong stop verdict"
-    )
-    _ = override.add_argument("--session-dir", required=True)
-    _ = override.add_argument("--reason", required=True)
-    override.set_defaults(handler=_override)
 
     status = subparsers.add_parser("status", help="print the whole ledger")
     _ = status.add_argument("--session-dir", required=True)

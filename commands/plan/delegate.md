@@ -43,8 +43,6 @@ State:
 - `STYLE_GATE_CONFIG`: plan hint captured during prompt composition.
 - `STYLE_REVIEW_DONE`: starts false. The durable true state is
   `${SESSION_DIR}/style_review_done`; later fixes never clear it.
-- `MECHANICAL_GATE_CLEANUP_USED`: starts false. Its durable marker is
-  `${SESSION_DIR}/mechanical_gate_cleanup_used` and resets with the phase.
 - `FINDINGS`: the current phase's `findings.py` ledger.
 
 <TagReferenceContract>
@@ -140,7 +138,7 @@ does.
   `MODE`, `AUTO_WINDOW`, the last authorization, `PROGRESS_UPDATES_ENABLED`, any
   live `DISPATCH_HANDLE`, any live `REVIEW_DISPATCH_HANDLE` with `EARLY_REVIEW`
   and `REVIEW_PASS`, any Claude `PROGRESS_TIMER_HANDLE`,
-  `STYLE_REVIEW_DONE`, `MECHANICAL_GATE_CLEANUP_USED`, `NEXT_ITEMS_PATH`, and any
+  `STYLE_REVIEW_DONE`, `NEXT_ITEMS_PATH`, and any
   unresolved next-item approval. Exclude it from review intent-to-add and
   commits.
 - Never stop or delay work for compaction. Claude resumes from a live-dispatch
@@ -270,29 +268,31 @@ Use `python3 ~/.claude/scripts/delegate/findings.py <command> --session-dir
 | --- | --- |
 | `open --severity <blocker\|minor\|nit> --title <t> --file <p> [--line N] --caught-by <delegate\|main\|both> [--detail <d>]` | create an id |
 | `status` | read the ledger for closure review |
-| `gate` | get `converged`, `dispatch`, or `stop`, plus batch and reason |
+| `gate` | get `converged` or `dispatch`, plus batch and any advisory |
 | `dispatch --covers F001,F002,...` | record one complete repair batch |
 | `abandon --reason <r> [--edits-landed]` | a dispatched repair died; reopen its batch |
 | `verdict --id F001 --state <accepted\|still_open\|reopened> [--evidence <e>]` | record closure evidence |
-| `override --reason <the user's own words>` | clear one wrong `stop` |
 
-The script, not the main agent, owns convergence: first round gates blockers and
-minors; later rounds gate blockers; nits never gate. It rejects partial batches
-and stops on repeated failed closure, reopening, stalled counts, repair budget,
-repeated pass shape, a second blind-review cancellation, or the backstop. The one
-<MechanicalGateCleanup/> exception bypasses only a repair-budget stop; it never
-calls `findings.py dispatch`. `start-phase` resets the ledger. Every limit those
-stops use lives in `~/.claude/config/delegate.conf`; never argue a stop down by
-editing that file mid-run.
+The script owns batching, not permission: first round gates blockers and minors;
+later rounds gate blockers; nits never gate. It rejects partial batches, so a
+round always closes everything currently on the ledger. `start-phase` resets it.
 
-A `stop` can be wrong about the world when its inputs were: an aborted launcher,
-a pass recorded outside <PassOwnership/>, a count carried across a mislabeled
-phase boundary. Never edit the run history to clear one — that history is the
-audit trail, and rewriting it destroys the evidence that the stop was wrong.
-Report the stop and its evidence, get the user's explicit decision, then record
-`override --reason "<their words>"`. The override names the one stop reason it
-clears, is spent by the round it authorizes, and is appended beside the stop it
-corrects. A stop the evidence supports is never overridden; find the real defect.
+**The gate never stops the run.** It answers `converged` or `dispatch` and
+nothing else. Where it once stopped — a finding that failed to close repeatedly,
+a gating count that will not come down, a spent repair budget, a repeated pass
+shape, repeated blind-review cancellations, the runaway backstop — it now returns
+that sentence in `advisory` beside a `dispatch` verdict, and the round runs.
+There is no override to record, because there is nothing to override.
+
+An advisory is not a gate and never becomes one: do not treat it as a reason to
+stop, to ask permission, or to re-open a decision the user has already made about
+this run. It is a fact worth passing along, so **report it in one line whenever
+one is present** — say the pattern in ordinary words alongside the repair being
+dispatched, and continue. The user watches the shape of the phase and stops it
+themselves if it needs stopping; that judgment is theirs, and the whole point of
+reporting is to let them make it early. Every limit that decides when an advisory
+is worth printing lives in `~/.claude/config/delegate.conf`; never edit that file
+mid-run to change what gets said.
 
 **Dispatching a repair fixes nothing.** `dispatch` leaves its batch
 `repair_in_flight`, and exactly two things resolve that state: `implement.sh`
@@ -476,6 +476,17 @@ On a Claude timer notification or Codex poll timeout:
    immediately to <CodexDispatchWait/> on the same session and reads the
    interval again before polling.
 
+**An armed timer is never a substitute for the report.** Every turn that arms or
+re-arms a timer emits steps 1-5 first — both tables and the wall-clock line —
+and a bare "timer re-armed" line is a dropped report, not a short one. This
+matters most where it is easiest to skip: a Stop-hook block reads as a
+mechanical complaint about a missing file, so the reflex is to relaunch the
+script and end the turn. But the hook fires on the turn the user was owed an
+update and did not get one, and the timer file is only how it noticed. Re-arming
+without reporting answers the hook and leaves the user exactly where they were.
+Steps 1-5 are cheap: the recorder emits both tables, and the prose is three
+sentences.
+
 A user-requested status check performs steps 1-5 immediately. A question about
 work already finished — how many fix passes there have been, how long a review
 took, what an earlier phase ran — is answered by
@@ -520,13 +531,12 @@ plan doc is the only dirty path; then include it in the first checkpoint.
 
 Loop stops only for that dirty-tree guard, an unresolved current Pending
 decision, a real design choice, reviews conflicting on intended behavior, a
-ledger `stop`, a required gate that cannot run, or delegate/environment error.
-It may also stop at a phase or auto-window boundary for
-<ConsiderNextItems/> approval, and only for that step's `gate` proposals — its
-`apply` ones are written and reported, never asked. Apply
-<MechanicalGateCleanup/> before treating an
-eligible repair-budget verdict as a stop. Everything else auto-routes,
-resequences, or defers. Verbose adds only its authorization gates.
+required gate that cannot run, or delegate/environment error. It may also stop
+at a phase or auto-window boundary for <ConsiderNextItems/> approval, and only
+for that step's `gate` proposals — its `apply` ones are written and reported,
+never asked. The findings ledger is not on this list and never joins it: a
+convergence advisory is reported and the round runs. Everything else
+auto-routes, resequences, or defers. Verbose adds only its authorization gates.
 </AuthorizationContract>
 
 <BriefingFreshness>
@@ -598,7 +608,23 @@ through <RunSummary/> or single-mode completion.
 </PrepareSession>
 
 <ComposeWorkOrder>
-1. For a phased plan, scan the target Work Order for `**Pending decision:**`.
+1. For a phased plan, validate the target Work Order before reading any of its
+   fields. Set `${RESERVATION_COVERAGE_MODE}` to `required` when the plan's
+   repository has `.claude/config/berth.toml`, otherwise `advisory`, and run:
+
+   ```sh
+   PYTHONPATH="$HOME/.claude/scripts" python3 -m berth.work_order \
+     --repository-root "${WORKING_DIR}" validate --document "${PLAN_DOC}" \
+     --phase <target-phase> --coverage "${RESERVATION_COVERAGE_MODE}"
+   ```
+
+   The tagged output is authoritative for complete Goal/Spec/Files structure,
+   `reservation_declaration = declared|missing`, lexical paths, minimal scopes,
+   and Files/Reservations agreement. Do not grow a second parser here. A
+   missing declaration is accepted only when the explicitly tagged caller mode
+   is `advisory`; an empty declaration is always malformed.
+
+   Then scan the target Work Order for `**Pending decision:**`.
    Verify cited code still matches the block. **Re-test the block against
    <DecisionRouting/> before presenting it** — a block is a claim that a decision
    is the user's, not proof of it, and the pass that wrote it may have been wrong
@@ -615,6 +641,10 @@ through <RunSummary/> or single-mode completion.
    destination is the Spec/Files/gate edit already being made. A destination in
    another repository goes to the next-items file derived in step 5, and only
    with the user's approval; never append to it automatically.
+   After editing a resolution into Spec, Files, or the acceptance gate, rerun
+   the shared validation above before continuing. A Files edit or newly named
+   implementation path must be mirrored into Reservations; a validation failure
+   blocks dispatch.
 2. Parse the complete bounded-auto phrase before a standalone phase selector.
    Reject `single` plus `verbose`, auto without `verbose`, non-positive N, or an
    invalid range. Set `MODE=single` for `single` or non-phased work,
@@ -857,7 +887,7 @@ together instead of back to back. Evaluated only on a <ProgressContract/> tick,
 and only when all of these hold: an implementation, escalation, or
 non-mechanical fix dispatch is active; `EARLY_REVIEW=none`; and the completed
 dispatch would receive a delegate review — <DualReview/> pass 1 or a closure
-review. <MechanicalGateCleanup/> and mechanical repairs never arm.
+review. Mechanical repairs never arm.
 
 Estimate the **pass-internal** completion of the running dispatch — not the
 capped phase percentage — from the tick's evidence. It is ≥75% when the
@@ -913,8 +943,8 @@ before the diff is fully written.
 delivery, kill the early reviewer. If the ready sentinel exists, close its
 pass with `finish-pass --status canceled --orphaned-launcher` per
 <PassOwnership/>; before the sentinel no pass was recorded, so record nothing —
-a pre-sentinel kill counts toward no ledger stop, including the second
-blind-review cancellation.
+a pre-sentinel kill counts toward no advisory, including the blind-review
+cancellation one.
 
 **Reviewer error before delivery.** If the early reviewer itself errors while
 the primary dispatch is still running, report it in one line, clear
@@ -1073,15 +1103,19 @@ Use <UserFacingText/> and emit:
 Summary and reference numbers must match. A reader should not need the plan,
 diff, reviews, or finding ids.
 
-When the same turn launches a repair, close the message with the current
-progress header — both tables and the wall-clock line — after the launch and
-after the timer is armed, produced by <ProgressContract/> steps 3 and 4 with the
-launched pass as the activity. A result that ends in a dispatch is where the
-clocks are worth the most: the numbered items say what is being repaired, and
-the tables say how far into the phase and the plan that repair sits. Print it
-below the sections above, exactly as the recorder emits it. Should the recorder
-answer that no window is open, the launcher has not recorded its pass yet: try
-once more, then continue without the tables rather than stalling the turn.
+**Close every delegation result with the current progress header** — both tables
+and the wall-clock line, produced by <ProgressContract/> steps 3 and 4 with the
+current pass or activity. This is not conditional on what the result led to. A
+review that came back clean, a fix that landed, a verification that passed, and
+a pass that ends the phase all close the same way as one that launches a repair;
+so does a turn that only re-arms the timer. The numbered items say what
+happened, and the tables say how far into the phase and the plan it happened —
+and the tables are the half the user cannot reconstruct for themselves. A result
+that ends in a dispatch is where they are worth the most, so emit the header
+after the launch and after the timer is armed. Print it below the sections
+above, exactly as the recorder emits it. Should the recorder answer that no
+window is open, the launcher has not recorded its pass yet: try once more, then
+continue without the tables rather than stalling the turn.
 </DelegationResultFormat>
 
 <FixDispatch>
@@ -1119,31 +1153,6 @@ main agent's to resolve with `findings.py abandon` per <FindingsLedger/>, before
 reviewing, re-dispatching, or reporting anything about the round.
 </FixDispatch>
 
-<MechanicalGateCleanup>
-One automatic cleanup is allowed after behavioral convergence when all of these
-hold:
-
-- `findings.py gate` stopped solely on `repair_budget`;
-- every gating finding came from required lint, format, or style verification,
-  has `fix_attempts=0`, and has one behavior-preserving mechanical repair;
-- smoke and behavioral review passed; and
-- `${MECHANICAL_GATE_CLEANUP_USED}=false` and its marker is absent.
-
-Set the state true and write the marker before dispatch. Compose one mechanical
-fix prompt containing the complete gate batch, exact diagnostics, and affected
-test and lint lines. Do not call `findings.py dispatch`; the earlier behavioral
-rounds remain authoritative. Launch with <DispatchContract/> using the gate's
-next round number, and close the turn with the progress header per
-<DelegationResultFormat/>.
-
-On completion, apply <ReviewDiffContract/>, read every cleanup hunk, and rerun
-the exact failing verification plus affected tests. Record each existing id
-directly as `accepted` or `still_open`. If all pass, continue from the blocked
-gate without another style review or blind review. If any remains, the cleanup
-changed behavior, or it touched an unrelated path, return to <Synthesize/> and
-honor its normal gate; never use this exception twice in one phase.
-</MechanicalGateCleanup>
-
 <Synthesize>
 1. Merge delegate and main findings, dedupe real issues, tag who caught each,
    and discard refuted findings with a concrete explanation.
@@ -1156,9 +1165,9 @@ honor its normal gate; never use this exception twice in one phase.
 5. Open every confirmed remaining issue, then obey `findings.py gate`:
    - `converged`: retain nits for retrospective; continue to smoke.
    - `dispatch`: apply <FixDispatch/> to the complete batch, then return here.
-   - `stop`: apply <MechanicalGateCleanup/> when eligible; otherwise present the
-     result plus the choices below and wait.
-6. Also stop when the plan leaves a real design choice or reviews conflict on
+     When the payload carries an `advisory`, say it in one line and dispatch
+     anyway per <FindingsLedger/>.
+6. Stop only when the plan leaves a real design choice or reviews conflict on
    intended behavior:
 
 ```
@@ -1168,9 +1177,8 @@ Your choice:
 3. Talk through an item first.
 ```
 
-Explain a convergence stop in ordinary language. Choice 1 overrides the ledger
-and applies <FixDispatch/>; choice 2 continues to smoke; choice 3 preserves the
-gate. With no gating issues, continue to <RunApplicationSmokeTest/>.
+Choice 1 applies <FixDispatch/>; choice 2 continues to smoke; choice 3 preserves
+the gate. With no gating issues, continue to <RunApplicationSmokeTest/>.
 </Synthesize>
 
 <RunApplicationSmokeTest>
@@ -1213,8 +1221,7 @@ review. The actual diff, not `${STYLE_GATE_CONFIG}`, decides applicability.
    `${SESSION_DIR}/style_review_after.status`, compare them with the before
    snapshots, and read every style-induced hunk. If Rust/Cargo changed, rerun
    exact phase `test` and `lint` lines for affected packages. Failures use normal
-   finding/fix routing; an eligible repair-budget stop uses
-   <MechanicalGateCleanup/> without another style pass.
+   finding/fix routing.
 6. If cleanup reached runnable code, reset smoke to `not_run` and rerun
    <RunApplicationSmokeTest/>. The guard skips this section on return.
 7. Continue to <RunPhaseReview/>, or back to <FinalGate/> for synthetic final.
@@ -1238,7 +1245,7 @@ Dispatch its architect review only when any trigger holds:
   lifecycle;
 - a changed type/API/registration/path is named by a remaining Work Order or
   `${NEXT_ITEMS_PATH}`;
-- the ledger stopped convergence; or
+- the ledger returned a convergence advisory; or
 - three phases completed since the prior architect review.
 
 Otherwise pass `skip-architect`. When dispatched, focus real-code checking on
@@ -1550,7 +1557,7 @@ answer from the completed report and preserve the gate.
 <NextPhase>
 If no todo phase remains, run <FinalGate/> then <RunSummary/>. Otherwise reset
 `REVIEW_PASS=0`, `IMPLEMENTATION_TASK=implementation`, smoke to `not_run`, style
-to false, mechanical cleanup to false, and delete both markers.
+to false, and delete its marker.
 
 - Loop: announce next phase and return to <ComposeWorkOrder/>.
 - Verbose/no window: announce its briefing and return to <ComposeWorkOrder/>.
@@ -1570,9 +1577,8 @@ Loop/verbose only after plan exhaustion:
    already complete.
 3. On failure, create a synthetic phase `final` / `Final verification` once:
    capture a new baseline, run `start-phase`, reset review/smoke/style state and
-   marker, reset mechanical cleanup state and marker, open the concrete failures
-   in the ledger, then use its gate plus <FixDispatch/>. Later repairs do not
-   repeat those resets. After closure
+   marker, open the concrete failures in the ledger, then use its gate plus
+   <FixDispatch/>. Later repairs do not repeat those resets. After closure
    convergence, run applicable smoke and return here; do not run phase review or
    checkpoint for the synthetic phase. Rerun this gate after each repair.
 4. Once full verification is green, run <RunPhaseStyleReview/> exactly once on

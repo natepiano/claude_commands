@@ -468,6 +468,7 @@ def _count_plan_phases(plan_path: Path) -> dict[str, object]:
     done = 0
     todo = 0
     seen: set[str] = set()
+    order: list[str] = []
     duplicates: list[str] = []
     for match in PHASE_HEADING_PATTERN.finditer(text):
         rest = match.group("rest")
@@ -480,6 +481,7 @@ def _count_plan_phases(plan_path: Path) -> dict[str, object]:
             duplicates.append(identifier)
             continue
         seen.add(identifier)
+        order.append(identifier)
         # No status marker means the phase was shrunk into an as-built record,
         # which only ever happens after it completed.
         if status_match is not None and status_match.group("status") == "todo":
@@ -494,6 +496,7 @@ def _count_plan_phases(plan_path: Path) -> dict[str, object]:
         "done": done,
         "todo": todo,
         "total": total,
+        "order": order,
         "duplicate_ids": sorted(set(duplicates)),
     }
 
@@ -1903,17 +1906,27 @@ def _scope_line(state: dict[str, object], counts: dict[str, object]) -> str:
     """Where the run is working, and how far into the plan that leaves it.
 
     Worktree and branch say where; neither says how much plan is left. The
-    position is the count of finished phases plus the one in flight, taken from
-    the same headings the project percentage is derived from, so the two can
-    never disagree. A plan whose phases could not be counted keeps the short
+    position is the ordinal of the heading the active phase actually occupies,
+    looked up by the id `start-phase` named. Counting finished phases and adding
+    one is wrong: `/plan:phase_review` flips a phase to `done` before its
+    checkpoint, so for the whole review window the phase in flight is counted
+    twice and the position runs one ahead. A plan whose phases could not be
+    counted, or whose headings do not name the active phase, keeps the short
     form rather than showing a position nothing verified.
     """
     line = f"{_string(state.get('worktree'))} - {_string(state.get('branch'))}"
     if counts.get("available") is not True:
         return f"**{line}**"
+    order = counts.get("order")
+    phase = _object_dict(state.get("phase"))
+    if phase is None or not isinstance(order, list):
+        return f"**{line}**"
+    identifiers = [identifier for identifier in cast(list[object], order) if isinstance(identifier, str)]
+    active = _string(phase.get("id"))
+    if active not in identifiers:
+        return f"**{line}**"
     total = _integer(counts.get("total"))
-    position = min(total, _integer(counts.get("done")) + 1)
-    return f"**{line} - phase {position} of {total}**"
+    return f"**{line} - phase {identifiers.index(active) + 1} of {total}**"
 
 
 def _timeline(args: argparse.Namespace) -> None:

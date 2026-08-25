@@ -157,12 +157,14 @@ ids (`F001…`) that survive across rounds, so "the same finding came back" is a
 fact the script can check rather than a judgment the orchestrator has to make.
 Each finding is `open`, `fixed_pending_review`, or `accepted`.
 
-`gate` returns one of three verdicts and the orchestrator follows it — it never
+`gate` returns one of two verdicts and the orchestrator follows it — it never
 decides on its own whether to run another round:
 
 - `converged` — nothing gating is open; go to the smoke test.
 - `dispatch` — repair the whole returned `batch` in one round.
-- `stop` — hand the run to the user with `stop_reason`.
+
+There is no third verdict. The gate does not stop the run, and it holds no
+override, because there is nothing to override.
 
 Three rules are enforced by refusal, not by prose:
 
@@ -175,21 +177,30 @@ Three rules are enforced by refusal, not by prose:
   `fixed_pending_review`; reopening an `accepted` finding requires `--evidence`
   naming the hunk that invalidated it.
 
-Stop conditions, checked in this order: a finding reopened `MAX_REOPENS` times
-after being accepted; a finding that failed to close after `MAX_FIX_ATTEMPTS`
-repair attempts; `STALLED_ROUNDS` consecutive rounds with no decrease in the
-gating-open count; `MAX_CONSECUTIVE_SAME_KIND_PASSES` passes of one kind in a
-row; more than `MAX_REVIEW_CANCELLATIONS` blind-review cancellations; a spent
-repair budget; the `RUNAWAY_ROUNDS` backstop. The convergence tests come first
-so a run grinding through eight rounds of genuinely new defects is never
-interrupted, because progress is measured, not counted.
+Advisories, checked in this order and reported in `advisory` beside a `dispatch`
+verdict: a finding reopened `MAX_REOPENS` times after being accepted; a finding
+that failed to close after `MAX_FIX_ATTEMPTS` repair attempts; `STALLED_ROUNDS`
+consecutive rounds with no decrease in the gating-open count;
+`MAX_CONSECUTIVE_SAME_KIND_PASSES` passes of one kind in a row; more than
+`MAX_REVIEW_CANCELLATIONS` blind-review cancellations; a spent repair budget; the
+`RUNAWAY_ROUNDS` backstop.
+
+Each of these used to stop the phase and hand it to the user. They stopped too
+much: the stall test in particular fires on the honest pattern where every round
+repairs exactly what it was handed and the next gate finds something genuinely
+new, which reads as one open blocker round after round. The count cannot tell
+that apart from a repair that will not take. So the tests were kept for what they
+are good at — naming the shape of a phase that is not converging — and the
+enforcement was dropped. The orchestrator reports the sentence and dispatches the
+round; the user watches the run and stops it themselves when it warrants.
 
 The repair budget is the first round's gating count times
 `REPAIR_ROUNDS_PER_FINDING`, never below `MIN_REPAIR_BUDGET`. All of these
 limits are set in `~/.claude/config/delegate.conf`, read at startup by
 `findings.py` and required there — an absent or unusable value exits 2 rather
-than falling back. The shipped values give a phase 3 automatic fix rounds at
-minimum and 5 at most.
+than falling back. They now decide when an advisory is worth printing rather than
+when a phase stops, so the shipped values set where a phase starts being reported
+as slow, not where it is cut off.
 
 ## Commands
 
@@ -199,15 +210,7 @@ findings.py verdict --session-dir <dir> --id <F00N> --state accepted|still_open|
 findings.py gate --session-dir <dir>
 findings.py dispatch --session-dir <dir> --covers F001,F002,...
 findings.py status --session-dir <dir>
-findings.py override --session-dir <dir> --reason <the user's own words>
 ```
-
-`override` is the correction path for a `stop` whose inputs were wrong — an
-aborted launcher, a pass recorded outside a launcher, a count carried across a
-mislabeled phase boundary. It never edits the run history that produced the
-stop; it appends beside it, names the one stop reason it clears, and is spent by
-the fix round it authorizes. It refuses a reason under 20 characters and refuses
-outright when the gate is not stopping.
 
 ```text
 progress_history.py start-run --session-dir <dir> --working-dir <dir> [--plan-doc <path>]
