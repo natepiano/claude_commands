@@ -1874,27 +1874,44 @@ def _phase_windows(
 
 
 def _stage_labels(windows: list[StageWindow]) -> list[str]:
-    """Name each window by kind and its position among that kind in the phase.
+    """Name each window by kind, and a review by the pass whose diff it reads.
 
-    Reviews and fixes are numbered because a phase runs several and the reader's
-    question is which one; a fix carries the round the ledger dispatched, so its
-    number matches the one convergence counts.
+    A review row answers "which one" far better as `Impl Review` or `Review Fix
+    2` than as an ordinal the reader has to count rows to place, because a
+    review always follows the pass it judges. Activities are transparent here:
+    verification sits between a fix and its review without breaking the pair. A
+    review with no unclaimed pass behind it -- the closure review after
+    verification -- keeps the ordinal, which is all that is true of it. A fix
+    carries the round the ledger dispatched, so its number is the one
+    convergence counts, and the review naming it repeats that number.
     """
     counts: dict[str, int] = {}
     labels: list[str] = []
+    reviewed: tuple[str, str] | None = None
     for window in windows:
         kind = window["kind"]
         counts[kind] = counts.get(kind, 0) + 1
         index = counts[kind]
         if kind == "activity":
             labels.append(window["label"] or "Work")
-        elif kind == "fix":
-            labels.append(f"Fix {window['fix_round'] or index}")
         elif kind == "review":
-            labels.append(f"Review {index}")
+            if reviewed is None:
+                labels.append(f"Review {index}")
+            elif reviewed[0] == "fix":
+                labels.append(f"Review {reviewed[1]}")
+            else:
+                labels.append(f"{reviewed[1]} Review")
+            reviewed = None
         else:
-            name = {"impl": "Impl", "arch": "Arch"}.get(kind) or kind.title() or "Pass"
-            labels.append(name if index == 1 else f"{name} {index}")
+            if kind == "fix":
+                name = f"Fix {window['fix_round'] or index}"
+            else:
+                base = (
+                    {"impl": "Impl", "arch": "Arch"}.get(kind) or kind.title() or "Pass"
+                )
+                name = base if index == 1 else f"{base} {index}"
+            reviewed = (kind, name)
+            labels.append(name)
     return labels
 
 

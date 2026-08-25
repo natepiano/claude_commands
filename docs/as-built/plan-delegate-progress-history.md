@@ -253,8 +253,13 @@ sits the running stage's activity sentence, which no fixed-width column can
 carry, and then the wall clock.
 
 Stage names come from the pass kind and its position among that kind in the
-phase — `Impl`, `Review 1`, `Review 2`, `Fix 1` — and a fix carries the round
-the ledger dispatched, so its number is the one convergence counts. An
+phase — `Impl`, `Fix 1`, `Fix 2` — and a fix carries the round the ledger
+dispatched, so its number is the one convergence counts. A review is named for
+the pass whose diff it reads rather than for its own ordinal — `Impl Review`,
+`Review Fix 1` — since a review always follows the pass it judges, and an
+activity between them is transparent, so verification does not break the pair. A
+review with no unclaimed pass behind it, the closure review after verification,
+keeps the ordinal `Review 3`. An
 activity's name is its `--label`, and its `Delegate` cell is empty: the main
 agent ran that window itself. Both identity columns are read per window rather
 than per run, and `start-pass` and `start-activity` re-detect the orchestrator

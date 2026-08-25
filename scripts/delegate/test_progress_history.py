@@ -1227,9 +1227,9 @@ class ProgressHistoryTests(unittest.TestCase):
             [(row[0], row[4], row[5]) for row in stage_rows],
             [
                 ("Impl", "00:03:10", "done"),
-                ("Review 1", "00:01:20", "2 found"),
+                ("Impl Review", "00:01:20", "2 found"),
                 ("Fix 1", "00:02:40", "2 landed"),
-                ("Review 2", "00:00:40", "2 fixed"),
+                ("Review Fix 1", "00:00:40", "2 fixed"),
                 ("Verification", "00:00:40", "pass"),
                 ("Review 3", "00:00:40", "running"),
             ],
@@ -1308,7 +1308,7 @@ class ProgressHistoryTests(unittest.TestCase):
             [(row[0], row[2], row[4], row[5]) for row in stage_rows],
             [
                 ("Fix 2", "gpt-called high", "00:02:30", "running"),
-                ("Review 1", "gpt-blind max", "00:01:00", "running (early)"),
+                ("Review Fix 2", "gpt-blind max", "00:01:00", "running (early)"),
             ],
         )
         # The report is about the writer, so the sentence beneath the table names
@@ -1359,7 +1359,7 @@ class ProgressHistoryTests(unittest.TestCase):
         )
         self.assertEqual(
             [(row[0], row[5]) for row in stage_rows],
-            [("Fix 2", "done"), ("Review 1", "running")],
+            [("Fix 2", "done"), ("Review Fix 2", "running")],
         )
         disarmed = [
             event
