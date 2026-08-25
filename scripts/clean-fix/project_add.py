@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Add a Rust project to the clean-fix allowlists."""
+"""Add a Rust project to the clean-fix allowlist."""
 
 from __future__ import annotations
 
@@ -263,8 +263,6 @@ def add_to_section(
     lines: list[str],
     section: str,
     project: Project,
-    *,
-    unique_key: bool,
 ) -> tuple[list[str], SectionResult]:
     out = list(lines)
     start, end = section_bounds(out, section)
@@ -284,7 +282,7 @@ def add_to_section(
                 status="active",
                 detail=f"{project.entry} is already active",
             )
-        if unique_key and project_key(body) == project.key:
+        if project_key(body) == project.key:
             return out, SectionResult(
                 section=section,
                 status="conflict",
@@ -299,21 +297,18 @@ def add_to_section(
     )
 
 
-def add_project(lines: list[str], project: Project) -> tuple[list[str], list[SectionResult]]:
-    out, build = add_to_section(lines, "build", project, unique_key=False)
-    out, style = add_to_section(out, "projects", project, unique_key=True)
-    return out, [build, style]
+def add_project(lines: list[str], project: Project) -> tuple[list[str], SectionResult]:
+    return add_to_section(lines, "projects", project)
 
 
-def print_result(project: Project, results: list[SectionResult], changed: bool) -> None:
+def print_result(project: Project, result: SectionResult, changed: bool) -> None:
     if project.kind == "workspace_member" and project.workspace_root is not None:
         workspace = project.workspace_root.name
         print(f"Project: {project.key} ({project.kind}, workspace {workspace})")
     else:
         print(f"Project: {project.key} ({project.kind})")
     print(f"Entry: {project.entry}")
-    for result in results:
-        print(f"[{result.section}] {result.status}: {result.detail}")
+    print(f"[{result.section}] {result.status}: {result.detail}")
     if not changed:
         print("No changes.")
 
@@ -332,7 +327,7 @@ def main(argv: list[str]) -> int:
     try:
         project = resolve_project(args.project, args.rust_dir)
         lines = args.conf.read_text().splitlines()
-        out, results = add_project(lines, project)
+        out, result = add_project(lines, project)
     except OSError as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 1
@@ -340,14 +335,14 @@ def main(argv: list[str]) -> int:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 1
 
-    if any(result.status in {"skipped", "conflict"} for result in results):
-        print_result(project, results, changed=False)
+    if result.status in {"skipped", "conflict"}:
+        print_result(project, result, changed=False)
         return 1
 
     changed = out != lines
     if changed and not args.dry_run:
         _ = args.conf.write_text("\n".join(out) + "\n")
-    print_result(project, results, changed=changed)
+    print_result(project, result, changed=changed)
     if args.dry_run and changed:
         print("Dry run; no file written.")
     return 0

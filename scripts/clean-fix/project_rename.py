@@ -80,24 +80,6 @@ def section_for_lines(lines: list[str]) -> list[str | None]:
     return sections
 
 
-def section_bounds(lines: list[str], section: str) -> tuple[int, int]:
-    start = -1
-    for index, raw in enumerate(lines):
-        if raw.strip() == f"[{section}]":
-            start = index
-            break
-    if start < 0:
-        raise ValueError(f"section [{section}] not found")
-
-    end = len(lines)
-    for index in range(start + 1, len(lines)):
-        stripped = lines[index].strip()
-        if stripped.startswith("[") and stripped.endswith("]"):
-            end = index
-            break
-    return start, end
-
-
 def uncommented_body(line: str) -> str:
     body = line.strip()
     if body.startswith(MARKER):
@@ -198,15 +180,6 @@ def find_old_project(lines: list[str], raw_old: str, rust_dir: Path) -> ConfigEn
     return next(iter(unique.values()))
 
 
-def last_content_index(lines: list[str], section: str) -> int:
-    start, end = section_bounds(lines, section)
-    last = start
-    for index in range(start + 1, end):
-        if lines[index].strip():
-            last = index
-    return last
-
-
 def ensure_no_project_collision(
     entries: list[ConfigEntry],
     old_entry: ConfigEntry,
@@ -234,45 +207,6 @@ def replace_project_entry(
         out[old_project.index] = replace_entry_line(out[old_project.index], new_project.entry)
         status = "skipped " if old_project.skipped else ""
         changes.append(f"[projects] {status}{old_project.entry} -> {new_project.entry}")
-    return out, changes
-
-
-def replace_build_entries(
-    lines: list[str],
-    old_entry: str,
-    old_key: str,
-    new_entry: str,
-) -> tuple[list[str], list[str]]:
-    out = list(lines)
-    changes: list[str] = []
-    sections = section_for_lines(out)
-    build_indices = [index for index, section in enumerate(sections) if section == "build"]
-    old_indices: list[int] = []
-    new_present = False
-
-    for index in build_indices:
-        body = uncommented_body(out[index])
-        if not body:
-            continue
-        if body == new_entry:
-            new_present = True
-        if body == old_entry or project_key(body) == old_key:
-            old_indices.append(index)
-
-    if old_indices:
-        first = old_indices[0]
-        if not new_present:
-            out[first] = replace_entry_line(out[first], new_entry)
-            changes.append(f"[build] {old_entry} -> {new_entry}")
-        for index in reversed(old_indices[1:] if not new_present else old_indices):
-            removed = uncommented_body(out[index])
-            del out[index]
-            changes.append(f"[build] removed duplicate old entry {removed}")
-        return out, changes
-
-    if not new_present:
-        out.insert(last_content_index(out, "build") + 1, new_entry)
-        changes.append(f"[build] added {new_entry}")
     return out, changes
 
 
@@ -318,7 +252,7 @@ def update_keyed_sections(
 ) -> tuple[list[str], list[str]]:
     out = list(lines)
     changes: list[str] = []
-    for section in ("project_env", "cargo_run", "examples"):
+    for section in ("project_env",):
         for _, key, _ in kv_lines(out, section):
             if key == new_key and old_key != new_key:
                 raise ValueError(f"[{section}] already contains {new_key}")
@@ -417,10 +351,6 @@ def build_plan(args: CliArgs) -> Plan:
     ensure_no_project_collision(project_entries(lines), old_project, new_project)
 
     out, changes = replace_project_entry(lines, old_project, new_project)
-    out, build_changes = replace_build_entries(
-        out, old_project.entry, old_project.key, new_project.entry
-    )
-    changes.extend(build_changes)
     out, active_changes = update_active_checkout(out, old_project.entry, new_project.entry)
     changes.extend(active_changes)
     out, keyed_changes = update_keyed_sections(

@@ -43,9 +43,8 @@ cf_validate_bool() {
 }
 
 # cf_load_stage_enabled <section> <enabled_var>
-# Reads only the `enabled` switch. The clean/build pass runs no agent and so has
-# no registry row; going through cf_load_stage_assignment would fail resolution
-# for it.
+# Reads the `enabled` switch for a stage. Used internally by
+# cf_load_stage_assignment before it resolves the stage's agent registry row.
 cf_load_stage_enabled() {
     local want_section="$1"
     local enabled_var="$2"
@@ -107,17 +106,9 @@ cf_print_stage_assignment() {
         "$section" "$enabled" "$family" "${agent:-<default>}" "${effort:-<default>}"
 }
 
-cf_print_stage_enabled() {
-    local section="$1"
-    local enabled=""
-    cf_load_stage_enabled "$section" enabled || return 1
-    printf '%-18s enabled=%-5s (no agent)\n' "$section" "$enabled"
-}
-
 cf_print_agent_assignments() {
     echo "clean-fix assignments: $CLEAN_FIX_AGENT_ASSIGNMENTS_FILE"
     echo "global agent registry: $AGENTS_CONFIG_FILE"
-    cf_print_stage_enabled clean
     cf_print_stage_assignment style_eval
     cf_print_stage_assignment style_eval_review
     cf_print_stage_assignment style_fix

@@ -9,12 +9,11 @@ worktree instead of the primary, while keeping their identity/history.
 
 That redirect lives in [active_checkout] (`<projects-entry> = <checkout-path>`);
 the [projects] line is never touched, so the history key is always preserved.
-`W` is also added to [build] so the worktree builds nightly (build everything).
 
 Subcommands:
   detect --repo R --worktree W [--conf PATH]            print JSON describing the match
-  apply  --repo R --worktree W [--conf PATH] [--commit]  write the redirect(s) + [build] add
-  revert --worktree W           [--conf PATH] [--commit]  drop W's redirect(s) + [build] entry
+  apply  --repo R --worktree W [--conf PATH] [--commit]  write the redirect(s)
+  revert --worktree W           [--conf PATH] [--commit]  drop W's redirect(s)
 
 With --commit, apply/revert also commit ONLY clean-fix.conf in its own git repo
 (~/.claude) when the file changed — so the worktree redirect needs no manual
@@ -46,8 +45,6 @@ class DetectResult(TypedDict):
     selector: str
     kind: str  # "repo" | "member" | "none"
     redirects: list[Redirect]
-    build_add: str
-    build_already: bool
 
 
 def read_conf(path: Path) -> list[str]:
@@ -97,7 +94,7 @@ def _is_prefixed(name: str, sel: str) -> bool:
 def detect(lines: list[str], repo: str, worktree: str) -> DetectResult:
     none: DetectResult = {
         "match": False, "repo": repo, "worktree": worktree, "selector": "",
-        "kind": "none", "redirects": [], "build_add": worktree, "build_already": False,
+        "kind": "none", "redirects": [],
     }
 
     projects = [lines[i].strip() for i in _entry_indices(lines, "projects")]
@@ -125,11 +122,9 @@ def detect(lines: list[str], repo: str, worktree: str) -> DetectResult:
     redirects: list[Redirect] = [
         {"entry": e, "checkout": worktree + e[len(repo):]} for e in move
     ]
-    build_entries = [lines[i].strip() for i in _entry_indices(lines, "build")]
     return {
         "match": True, "repo": repo, "worktree": worktree, "selector": selector,
-        "kind": kind, "redirects": redirects, "build_add": worktree,
-        "build_already": worktree in build_entries,
+        "kind": kind, "redirects": redirects,
     }
 
 
@@ -160,16 +155,14 @@ def apply(lines: list[str], result: DetectResult) -> list[str]:
         if not replaced:
             out.insert(_last_content_index(out, "active_checkout") + 1, line)
 
-    # Add the worktree to [build] (keep the primary — build everything).
-    if not result["build_already"]:
-        out.insert(_last_content_index(out, "build") + 1, result["build_add"])
-
     return out
 
 
 def revert(lines: list[str], worktree: str) -> tuple[list[str], list[str]]:
-    """Drop [active_checkout] redirects pointing into `worktree` and the worktree's
-    [build] entry. Returns (new_lines, removed-descriptions)."""
+    """Drop [active_checkout] redirects pointing into `worktree`.
+
+    Returns (new_lines, removed-descriptions).
+    """
     removed: list[str] = []
     drop: set[int] = set()
 
@@ -178,11 +171,6 @@ def revert(lines: list[str], worktree: str) -> tuple[list[str], list[str]]:
         if value.split("/", 1)[0] == worktree:
             drop.add(i)
             removed.append(f"redirect: {lines[i].strip()}")
-    for i in _entry_indices(lines, "build"):
-        if lines[i].strip() == worktree:
-            drop.add(i)
-            removed.append(f"build: {worktree}")
-
     out = [line for i, line in enumerate(lines) if i not in drop]
     return out, removed
 
@@ -284,8 +272,6 @@ def main() -> None:
     applied: dict[str, object] = {
         "applied": True,
         "redirects": result["redirects"],
-        "build_add": result["build_add"],
-        "build_already": result["build_already"],
     }
     if do_commit:
         entries = ", ".join(r["entry"] for r in result["redirects"])
