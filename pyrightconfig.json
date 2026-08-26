@@ -5,7 +5,8 @@
     "**/node_modules",
     "**/__pycache__",
     "**/.*",
-    "plugins"
+    "plugins",
+    "jobs"
   ],
   "executionEnvironments": [
     { "root": "scripts/hooks", "extraPaths": ["scripts/hooks"] },

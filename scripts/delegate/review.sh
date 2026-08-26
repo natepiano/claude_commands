@@ -148,9 +148,13 @@ wait "${HEARTBEAT_LOOP_PID}" 2>/dev/null || true
 
 if [[ "${AGENT_CODE}" -eq 0 ]]; then
   echo "reviewed" > "${STATUS_FILE}"
-  # A completed review is a real pass even if the worker won the race with the
-  # sentinel; record its start now so pass counting stays truthful.
-  if [[ "${PASS_STARTED}" -eq 0 ]]; then
+  # A completed early review is a real pass only once the sentinel exists: the
+  # worker can beat the 5s poll to the finish, leaving the start unrecorded
+  # above. Before the sentinel there is nothing to record. The implementation
+  # pass is still open, so start-pass would close it as interrupted and every
+  # later progress call would be refused for having no active window; and the
+  # verdict is void regardless, because the final diff does not exist yet.
+  if [[ "${PASS_STARTED}" -eq 0 && -e "${EARLY_READY_FILE}" ]]; then
     record_pass_start || echo "ERROR: unable to record the review pass start." >&2
   fi
   if [[ -f "${PROGRESS_STATE}" && "${PASS_STARTED}" -eq 1 ]]; then
@@ -161,7 +165,12 @@ if [[ "${AGENT_CODE}" -eq 0 ]]; then
       exit 1
     fi
   fi
-  bash "${HEARTBEAT_HELPER}" "${HEARTBEAT_FILE}" wrapper "${SUBTASK} agent finished" || true
+  if [[ -n "${EARLY_READY_FILE}" && ! -e "${EARLY_READY_FILE}" ]]; then
+    bash "${HEARTBEAT_HELPER}" "${HEARTBEAT_FILE}" wrapper \
+      "${SUBTASK} agent finished before delivery — no pass recorded, verdict void" || true
+  else
+    bash "${HEARTBEAT_HELPER}" "${HEARTBEAT_FILE}" wrapper "${SUBTASK} agent finished" || true
+  fi
 else
   echo "error" > "${STATUS_FILE}"
   # An early reviewer that failed before its pass started recorded nothing;
