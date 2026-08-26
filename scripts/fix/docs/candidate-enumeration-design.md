@@ -190,7 +190,7 @@ Pool mechanics, confirmed against `style_history.py` and
 | test-module-allow-boilerplate | parse | allows on `#[cfg(test)]` modules; verify lint vs `.unwrap(`/`.expect(`/`panic!(` matches in scope | **near-fully mechanizable** — the rule's own "verify before flagging" section is an algorithm |
 | types-live-with-their-behavior | semantic | — | relocation check needs whole-codebase behavioral reasoning |
 | use-a-context-struct-when-arguments-exceed-7 | lint | clippy `too_many_arguments` (threshold 7) | **migration candidate: flip to `mechanism: clippy, mode: flag`** |
-| use-bevy_kana-in-all-bevy-crates | parse | Cargo.toml dep presence + `bevy_kana` types in pub positions | dep check trivial; API-leak check parse |
+| use-bevy_kana-in-all-bevy-crates | parse | Cargo.toml dep presence + `hana_kana` types in pub positions | dep check trivial; API-leak check parse |
 | when-to-split-a-module | semantic | — | composite criteria; mechanical pre-signal (>500L non-test) can seed but not decide |
 | workspace-dependencies | parse | member `[dependencies]` entries with `version=` instead of `workspace = true` | **near-fully mechanizable** via toml parse |
 

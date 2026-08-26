@@ -607,16 +607,16 @@ def gen_bevy_kana_usage(spec: CandidatesSpec, project_root: Path) -> Enumeration
     for manifest in manifests:
         data = _load_toml(manifest)
         deps = _toml_table(data, "dependencies")
-        if "bevy" in deps and "bevy_kana" not in deps:
+        if "bevy" in deps and "hana_kana" not in deps:
             rel = manifest.relative_to(project_root).as_posix()
             candidates.append(
                 Candidate(
                     file=rel,
                     line=_dep_line(manifest, "bevy"),
-                    text="bevy crate without a bevy_kana dependency",
+                    text="bevy crate without a hana_kana dependency",
                 )
             )
-        if "bevy_kana" in deps:
+        if "hana_kana" in deps:
             kana_crates.append(manifest.parent)
     leak_re = re.compile(
         r"^\s*pub\s.*\b(Position|Displacement|Velocity|ToF32|ToI32|ToU32|ToUsize)\b"
@@ -628,7 +628,7 @@ def gen_bevy_kana_usage(spec: CandidatesSpec, project_root: Path) -> Enumeration
             rel = path.relative_to(project_root).as_posix()
             masked = read_masked(path)
             for idx, line in enumerate(masked.lines):
-                if leak_re.match(line) or re.match(r"^\s*pub\s+use\s+.*bevy_kana", line):
+                if leak_re.match(line) or re.match(r"^\s*pub\s+use\s+.*hana_kana", line):
                     candidates.append(
                         Candidate(file=rel, line=idx + 1, text=display_line(path, idx + 1))
                     )
