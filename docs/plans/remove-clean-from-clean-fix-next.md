@@ -7,8 +7,9 @@ building it — that decision happens when one is scheduled into a phase.
 
 ## 1. `PhaseStats`'s footer counters encode a state as an absent value
 
-`clean_fix_report_parse.py` `PhaseStats.footer_ok`, `footer_fail`, and
-`footer_total` are each `int | None`, and each surviving phase parser reads
+The report parser (`clean_fix_report_parse.py`, later `fix_report_parse.py`)
+defines `PhaseStats.footer_ok`, `footer_fail`, and `footer_total` as
+`int | None`, and each surviving phase parser reads
 `footer_total is None` to mean "this phase emitted no footer, so it is still
 running". A phase
 that finished reporting zero failures and a phase that never reported at all are
@@ -26,20 +27,27 @@ the three assignment sites with it.
 and phase-boundary detection there is positional. Adding a type rework to that
 commit would have cost the reviewability the phase most needed.
 
-## 2. Three conf-helper types encode state through flags and empty strings
+## 2. Four conf-helper types encode state through flags, optionals, and empty strings
 
 - `project_add.py` `Project.workspace_root: Path | None` is valid only when
   `kind == "workspace_member"`, checked that way at `:305` — a discriminant and a
   payload in two fields that must agree and are not made to.
 - `project_rename.py` `Plan.pending_path: Path | None` means "this rename has
   pending state to migrate" and is read as a presence test at `:435` and `:471`.
-- `retarget_clean_fix.py` `DetectResult` is a `TypedDict` carrying a `match`
-  boolean, a free-form `kind` string, and fields that are empty strings when
-  `match` is false — match state spelled three ways at once.
+- `DetectResult` in `retarget_clean_fix.py` (later `retarget_fix.py`) is a
+  `TypedDict` carrying a `match` boolean, a free-form `kind` string, and fields
+  that are empty strings when `match` is false — match state spelled three ways
+  at once.
+- `CommitResult` in that same helper couples `committed: bool` with mutually
+  exclusive `commit` and `reason` strings. Success needs a commit and an empty
+  reason; every no-op and every failure needs an empty commit and free-form
+  reason text.
 
 **What would satisfy it:** one tagged project-role member replacing
 `kind`/`workspace_root`; a pending-migration variant replacing `pending_path`; a
-tagged match type replacing `DetectResult`'s boolean-plus-`kind`-plus-empties.
+tagged worktree-redirect match replacing `DetectResult`; and a
+`ConfigurationCommitOutcome` whose variants state `Committed`, `Unchanged`,
+`RepositoryUnavailable`, `StageFailed`, and `CommitFailed`.
 
 **Why not in the plan:** the rename phase already rewrites identifiers across a
 broad file set. A type refactor riding along turns a mechanical sweep into a
@@ -48,10 +56,11 @@ design change nobody can review as either one.
 ## 3. Six helper types are named for representation, not role
 
 `SectionResult` (`project_add.py`), `Plan`, `PlannedMove`, `PlannedMarker`
-(`project_rename.py`), `DetectResult`, `CommitResult`
-(`retarget_clean_fix.py`) say what a value *is* rather than what it is *for* —
-a project-allowlist change, a project-rename migration plan, a history-state
-move, a worktree-redirect match, a configuration-commit outcome.
+(`project_rename.py`), `DetectResult`, and `CommitResult`
+(`retarget_clean_fix.py`, later `retarget_fix.py`) say what a value *is* rather
+than what it is *for* — a project-allowlist change, a project-rename migration
+plan, a history-state move, a worktree-redirect match, or a configuration-commit
+outcome.
 
 **Do this one in the editor, not through an agent.** A global rename is exact and
 instant there and slow and error-prone anywhere else; the right hand-off is this
@@ -77,3 +86,27 @@ boundary and convert before data enters the report model.
 verification sweep. Phase 4's six-phase fixture and four-phase regression test
 now provide the oracle for a dedicated report-model refactor without coupling it
 to those renames.
+
+## 5. The flow renderer hides geometry state behind `Bbox | None`
+
+`scripts/clean-fix/render-flow.py` (later `scripts/fix/render-flow.py`) names its
+coordinate tuple `Bbox`, which states a representation rather than what the four
+numbers bound, and returns `Bbox | None` from `bbox_from_points`, `union_bboxes`,
+`get_element_bbox`, `get_node_bbox`, and `get_content_bbox`. Depending on the
+caller, the absent value means no points, non-drawable or unsupported SVG
+content, a node with no supported shape, or no graph bounds at all.
+`inject_clusters()` then drops a declared cluster whose members produce no
+bounds, silently, in the same run that reports having parsed that cluster.
+
+**What would satisfy it:** a semantic `SvgBounds` type replacing `Bbox`;
+ElementTree attribute optionals converted at the XML boundary; tagged geometry
+outcomes that tell non-drawable content apart from an unsupported shape; and a
+declared node or cluster with no measurable bounds failing with a diagnostic
+naming it rather than disappearing. Cover polygon and ellipse bounds, an
+unsupported element, and a cluster whose members cannot be measured.
+
+**Why not in the plan:** the rename phases re-render the diagram and both gate on
+the output being byte-identical. Restructuring the geometry model changes what
+the renderer can produce, which is the opposite of what those phases must prove.
+
+**Revealed by:** Phase 6.

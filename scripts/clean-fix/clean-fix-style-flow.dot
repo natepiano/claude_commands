@@ -32,114 +32,148 @@ digraph clean_fix_style {
 
     node [fillcolor="#e8f4f8" color="#2980b9"]
 
-    start [label="Clean-fix Build (4:00 AM)" shape=oval fillcolor="#f0e6ff" color="#8e44ad" width=2.2 pos="141.4,890!"]
+    start [label="Clean-fix launchd trigger\n(every 10 minutes)" shape=oval fillcolor="#f0e6ff" color="#8e44ad" width=2.2 height=0.55 pos="470,1050!"]
 
     // Cluster-first layout in points:
-    // Phase 1 range = [30.0, 252.8], center = 141.4
-    // Phase 2 range = [282.8, 505.6], center = 394.2
-    // Phase 3 range = [535.6, 864.8], center = 700.2
-    // Inter-cluster gap = 30.0
+    // Phase 1 range = [-15.6, 315.6], center = 150.0
+    // Phase 2 range = [341.3, 598.7], center = 470.0
+    // Phase 3 range = [632.2, 947.8], center = 790.0
+    // Inter-cluster gaps = 25.7 and 33.5
+    // Post-stage gate center = 470.0; outcome centers = 470.0 and 790.0
 
-    // ══════ Phase 1: Clean + Rebuild (x center = 141.4) ══════
-    subgraph cluster_build {
-        label="Phase 1: Clean + Rebuild"
-        style=dashed color="#95a5a6" fontcolor="#7f8c8d" fontsize=9
-        margin=12
+    foreach_project [label="Projects from [projects] allowlist\n(resolve [active_checkout];\nskip missing path/Cargo.toml)" height=0.65 pos="470,970!"]
 
-        foreach_project [label="For each ~/rust/*\n(skip excluded, worktrees,\n_style_fix, unmodified)" height=0.65 pos="141.4,790!"]
-        clean [label="cargo clean" pos="141.4,720!"]
-        build [label="cargo build --workspace" pos="141.4,660!"]
-        clippy_build [label="cargo clippy -D warnings" pos="141.4,600!"]
-        warmup [label="Warmup\n(launch + kill selected apps)" height=0.55 pos="141.4,535!"]
-        style_enabled [label="style_eval\nenabled?" shape=diamond fillcolor="#fef9e7" color="#f39c12" width=1.4 height=0.8 pos="141.4,455!"]
-    }
-
-    // ══════ Phase 2: Style Evaluation (x center = 394.2) ══════
+    // ══════ Phase 1: Style Evaluation (x center = 150.0) ══════
     subgraph cluster_eval {
-        label="Phase 2: Style Evaluation"
+        label="Phase 1: Style Evaluation"
         style=dashed color="#95a5a6" fontcolor="#7f8c8d" fontsize=9
         margin=12
 
-        eval_foreach [label="For each project (parallel)" pos="394.2,790!"]
-        ttl_gate [label="due-units gate:\nany unit due?" shape=diamond fillcolor="#fef9e7" color="#f39c12" width=1.6 height=0.9 pos="394.2,722!"]
-        load_style [label="Load style guide\n~/.claude/scripts/rust_style/load-rust-style.sh" height=0.55 pos="394.2,660!"]
-        survey [label="Survey project source" pos="394.2,602!"]
-        carry_forward [label="Read pending JSON\n(carry forward valid findings)" height=0.55 pos="394.2,544!"]
-        check_wt_eval [label="style-fix scratch\nevaluation exists?" shape=diamond fillcolor="#fef9e7" color="#f39c12" width=1.5 height=0.9 pos="394.2,466!"]
-        load_wt_eval [label="Read style-fix scratch\n(exclude these findings)" height=0.55 pos="394.2,388!"]
-        evaluate [label="Find up to 5 NEW violations\n(skip worktree findings)" height=0.55 pos="394.2,326!"]
-        write_eval [label="Write pending JSON\n(carried + new)" height=0.55 pos="394.2,268!"]
+        eval_enabled [label="style_eval enabled?\n(run_once forces yes)" shape=diamond fillcolor="#fef9e7" color="#f39c12" width=1.6 height=0.9 pos="150,855!"]
+        eval_foreach [label="For each project (parallel)\n(skip pending handoff or\nstyle-fix worktree)" height=0.65 pos="150,775!"]
+        ttl_gate [label="due-units gate:\nany unit due?" shape=diamond fillcolor="#fef9e7" color="#f39c12" width=1.6 height=0.9 pos="150,695!"]
+        load_style [label="Load style guide\n~/.claude/scripts/rust_style/load-rust-style.sh" height=0.55 pos="150,620!"]
+        survey [label="Survey project source" pos="150,560!"]
+        carry_forward [label="Read pending JSON\n(carry forward valid findings)" height=0.55 pos="150,500!"]
+        check_wt_eval [label="style-fix scratch\nevaluation exists?" shape=diamond fillcolor="#fef9e7" color="#f39c12" width=1.5 height=0.9 pos="150,425!"]
+        load_wt_eval [label="Read style-fix scratch\n(exclude these findings)" height=0.55 pos="150,350!"]
+        evaluate [label="Find NEW violations up to\n[style_eval] max_new_findings\n(skip worktree findings)" height=0.65 pos="150,285!"]
+        write_eval [label="Write pending JSON\n(carried + new)" height=0.55 pos="150,220!"]
+        eval_idle [label="Skip project\n(no agent needed)" height=0.55 width=1.6 pos="60,155!"]
+        eval_gate_error [label="Flag project ERROR\n(fail closed)" fillcolor="#fadbd8" color="#e74c3c" height=0.55 width=1.6 pos="240,155!"]
+        eval_done [label="All project evals done" fillcolor="#d5f5e3" color="#27ae60" width=1.8 pos="150,90!"]
     }
 
-    // ══════ Phase 3: Style-Fix Worktrees (x center = 700.2) ══════
+    // ══════ Phase 2: Evaluation Review (x center = 470.0) ══════
+    subgraph cluster_review {
+        label="Phase 2: Evaluation Review"
+        style=dashed color="#95a5a6" fontcolor="#7f8c8d" fontsize=9
+        margin=12
+
+        review_enabled [label="style_eval_review enabled?\n(run_once forces yes)" shape=diamond fillcolor="#fef9e7" color="#f39c12" width=1.8 height=0.9 pos="470,855!"]
+        review_foreach [label="For each pending evaluation\n(skip reviewed/fixed or\nstyle-fix worktree)" height=0.65 pos="470,775!"]
+        review_eligible [label="findings and no\nReview Log?" shape=diamond fillcolor="#fef9e7" color="#f39c12" width=1.6 height=0.9 pos="470,695!"]
+        export_review [label="Export pending evaluation\n→ review scratch" height=0.55 pos="470,615!"]
+        review_agent [label="Review each finding\n(keep, improve, amend, remove)" fillcolor="#d5f5e3" color="#27ae60" height=0.55 pos="470,545!"]
+        save_review [label="Append Review Log\nand save pending JSON" height=0.55 pos="470,475!"]
+        review_done [label="Review stage done" fillcolor="#d5f5e3" color="#27ae60" width=1.8 pos="470,400!"]
+    }
+
+    // ══════ Phase 3: Style-Fix Worktrees (x center = 790.0) ══════
     subgraph cluster_fix {
         label="Phase 3: Style-Fix Worktrees"
         style=dashed color="#95a5a6" fontcolor="#7f8c8d" fontsize=9
         margin=12
 
-        fix_foreach [label="For each project with\npending eval findings" height=0.55 pos="700.2,790!"]
-        prechecks [label="Prechecks:\n- target _style_fix path is free\n- primary tree is clean" height=0.65 pos="700.2,720!"]
-        create_wt [label="git worktree add\n-b refactor/style\n{project}_style_fix" height=0.65 pos="700.2,645!"]
-        mv_eval [label="export pending markdown\n→ scratch evaluation" height=0.55 pos="700.2,575!"]
-        claude_fix [label="Pass 1 (apply): launch agent\n(fixes, cargo mend, clippy,\ntests, style review)" fillcolor="#d5f5e3" color="#27ae60" height=0.65 pos="700.2,512!"]
-        verify_fix [label="Pass 2 (verify): same agent\nre-checks fix vs Fix Summary,\ncorrects + updates summary" fillcolor="#d5f5e3" color="#27ae60" height=0.65 pos="700.2,432!"]
-        fix_ok [label="Worktree ready\nfor review" fillcolor="#d5f5e3" color="#27ae60" height=0.55 width=1.8 pos="625.4,352!"]
-        fix_fail [label="Failure: finalize\nor keep pending" fillcolor="#fadbd8" color="#e74c3c" height=0.55 width=1.8 pos="775.0,352!"]
+        fix_enabled [label="style_fix enabled?\n(run_once forces yes)" shape=diamond fillcolor="#fef9e7" color="#f39c12" width=1.6 height=0.9 pos="790,855!"]
+        fix_foreach [label="For each project with\npending eval findings" height=0.55 pos="790,775!"]
+        prechecks [label="Prechecks:\n- target _style_fix path is free\n- source tree is clean" height=0.65 pos="790,700!"]
+        create_wt [label="git worktree add\n-b refactor/style\n{project}_style_fix" height=0.65 pos="790,620!"]
+        mv_eval [label="export pending markdown\n→ scratch evaluation" height=0.55 pos="790,545!"]
+        claude_fix [label="Pass 1 (apply): launch agent\n(fixes, cargo mend, clippy,\ntests, style review)" fillcolor="#d5f5e3" color="#27ae60" height=0.65 pos="790,475!"]
+        verify_fix [label="Pass 2 (verify): same agent\nre-checks fix vs Fix Summary,\ncorrects + updates summary" fillcolor="#d5f5e3" color="#27ae60" height=0.65 pos="790,390!"]
+        fix_ok [label="Worktree ready\nfor review" fillcolor="#d5f5e3" color="#27ae60" height=0.55 width=1.8 pos="715,305!"]
+        fix_fail [label="Failure: finalize\nor keep pending" fillcolor="#fadbd8" color="#e74c3c" height=0.55 width=1.8 pos="865,305!"]
+        fix_done [label="Style-fix stage done" fillcolor="#d5f5e3" color="#27ae60" width=1.8 pos="790,225!"]
     }
 
-    report [label="Generate Clean-fix Report" shape=oval fillcolor="#f0e6ff" color="#8e44ad" width=2.2 pos="447.4,195!"]
+    activity_gate [label="run log has\nproject result lines?" shape=diamond fillcolor="#fef9e7" color="#f39c12" width=1.7 height=0.9 pos="470,130!"]
+    report [label="Generate Clean-fix Report" shape=oval fillcolor="#f0e6ff" color="#8e44ad" width=2.2 pos="470,30!"]
+    report_idle [label="Skip report\n(no activity this run)" height=0.55 width=1.8 pos="790,30!"]
 
-    // ══════ Phase 4: Post-Clean-fix Manual ══════
+    // ══════ Post-Clean-fix Manual (x center = 470.0) ══════
     subgraph cluster_manual {
         label="Post-Clean-fix (Manual)"
         style=dashed color="#95a5a6" fontcolor="#7f8c8d" fontsize=9
         margin=12
 
-        review [label="/style_fix_review" pos="447.4,100!"]
-        merge [label="/merge_branch" pos="447.4,40!"]
-        delete_wt [label="/worktree_delete" pos="447.4,-20!"]
+        review [label="/style_fix_review" pos="470,-90!"]
+        merge [label="/merge_branch" pos="470,-150!"]
+        delete_wt [label="/worktree_delete" pos="470,-210!"]
     }
 
     // ── Edges ──
 
-    // Start → Phase 1
+    // Start → configured project selection
     start -> foreach_project
 
-    // Phase 1 internal
-    foreach_project -> clean -> build -> clippy_build -> warmup -> style_enabled
+    // Configured projects → Phase 1 gate
+    foreach_project -> eval_enabled [tailport=w headport=n]
 
-    // Phase 1 → Phase 2
-    style_enabled -> eval_foreach [label="yes"]
+    // Phase 1 gate
+    eval_enabled -> eval_foreach [label="yes"]
+    eval_enabled -> review_enabled [label="no: continue"]
 
-    // Phase 1 → Report (skip)
-    style_enabled -> report [label="no"]
-
-    // Phase 2 internal
-    eval_foreach -> ttl_gate
+    // Phase 1 internal (the due-units gate is per project)
+    eval_foreach -> ttl_gate [label="per project"]
     ttl_gate -> load_style [label="1+ due"]
-    ttl_gate -> report [label="none due\n(skip, no agent)"]
-    ttl_gate -> report [label="gate crashed: ERROR\n(fail-closed, flagged)" color="#e74c3c" fontcolor="#e74c3c"]
+    ttl_gate -> eval_idle [label="none due"]
+    ttl_gate -> eval_gate_error [label="gate crashed" color="#e74c3c" fontcolor="#e74c3c"]
     load_style -> survey -> carry_forward -> check_wt_eval
     check_wt_eval -> load_wt_eval [label="yes"]
     check_wt_eval -> evaluate [label="no"]
     load_wt_eval -> evaluate
     evaluate -> write_eval
+    write_eval -> eval_done
+    eval_idle -> eval_done
+    eval_gate_error -> eval_done [color="#e74c3c"]
+
+    // Phase 1 → Phase 2
+    eval_done -> review_enabled [label="all done"]
+
+    // Phase 2 gate
+    review_enabled -> review_foreach [label="yes"]
+    review_enabled -> fix_enabled [label="no: continue"]
+
+    // Phase 2 internal
+    review_foreach -> review_eligible
+    review_eligible -> export_review [label="yes"]
+    review_eligible -> review_done [label="none eligible"]
+    export_review -> review_agent -> save_review -> review_done
 
     // Phase 2 → Phase 3
-    write_eval -> fix_foreach [label="all done"]
+    review_done -> fix_enabled [label="all done"]
+
+    // Phase 3 gate
+    fix_enabled -> fix_foreach [label="yes"]
+    fix_enabled -> fix_done [label="no: continue"]
 
     // Phase 3 internal
+    fix_foreach -> fix_done [label="none eligible"]
     fix_foreach -> prechecks -> create_wt -> mv_eval -> claude_fix
     claude_fix -> verify_fix [label="Fix Summary"]
     claude_fix -> fix_fail [label="no summary /\ntimeout"]
     verify_fix -> fix_ok [label="build ok"]
     verify_fix -> fix_fail [label="build broken"]
+    fix_ok -> fix_done
+    fix_fail -> fix_done
 
-    // Phase 3 → Report
-    fix_ok -> report
-    fix_fail -> report
+    // Completed automation reports only when the run log records project activity
+    fix_done -> activity_gate
+    activity_gate -> report [label="yes"]
+    activity_gate -> report_idle [label="no"]
 
-    // Report → Manual
+    // Report → unnumbered manual follow-up
     report -> review [style=dotted xlabel="user reviews\nnext day"]
     review -> merge [style=dotted]
     merge -> delete_wt [style=dotted]

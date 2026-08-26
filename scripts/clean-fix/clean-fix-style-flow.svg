@@ -1,415 +1,581 @@
 <?xml version='1.0' encoding='UTF-8'?>
-<svg xmlns="http://www.w3.org/2000/svg" width="850.8pt" height="1006.0pt" viewBox="-29.00 -11.00 850.80 1006.00">
-<g id="graph0" class="graph" transform="scale(1 1) rotate(0) translate(4 950)">
+<svg xmlns="http://www.w3.org/2000/svg" width="1055.1pt" height="1360.0pt" viewBox="-25.52 -11.00 1055.12 1360.02">
+<g id="graph0" class="graph" transform="scale(1 1) rotate(0) translate(46.81 1304.02)">
 <title>clean_fix_style</title>
-<polygon fill="white" stroke="none" points="-4,4 -4,-950 795.67,-950 795.67,4 -4,4" />
+<polygon fill="white" stroke="none" points="-46.81,4 -46.81,-1304.02 958.98,-1304.02 958.98,4 -46.81,4" />
 
-<rect x="-18.0" y="-895.4" width="208.8" height="461.2" fill="none" stroke="#95a5a6" stroke-width="1.5" stroke-dasharray="6,4" rx="4.0" /><rect x="214.3" y="-895.4" width="249.8" height="639.2" fill="none" stroke="#95a5a6" stroke-width="1.5" stroke-dasharray="6,4" rx="4.0" /><rect x="487.6" y="-895.4" width="315.2" height="555.2" fill="none" stroke="#95a5a6" stroke-width="1.5" stroke-dasharray="6,4" rx="4.0" /><rect x="288.0" y="-200.0" width="208.8" height="230.0" fill="none" stroke="#95a5a6" stroke-width="1.5" stroke-dasharray="6,4" rx="4.0" /><g id="node1" class="node">
+<rect x="-18.0" y="-1159.4" width="331.2" height="889.4" fill="none" stroke="#95a5a6" stroke-width="1.5" stroke-dasharray="6,4" rx="4.0" /><rect x="338.9" y="-1159.4" width="257.4" height="579.4" fill="none" stroke="#95a5a6" stroke-width="1.5" stroke-dasharray="6,4" rx="4.0" /><rect x="629.8" y="-1159.4" width="315.6" height="754.4" fill="none" stroke="#95a5a6" stroke-width="1.5" stroke-dasharray="6,4" rx="4.0" /><rect x="363.2" y="-200.0" width="208.8" height="230.0" fill="none" stroke="#95a5a6" stroke-width="1.5" stroke-dasharray="6,4" rx="4.0" /><g id="node1" class="node">
 <title>start</title>
-<ellipse fill="#f0e6ff" stroke="#8e44ad" cx="86.4" cy="-928" rx="79.2" ry="18" />
-<text xml:space="preserve" text-anchor="middle" x="86.4" y="-924.12" font-family="Helvetica,sans-Serif" font-size="10.00">Clean-fix Build (4:00 AM)</text>
+<ellipse fill="#f0e6ff" stroke="#8e44ad" cx="467.6" cy="-1278" rx="87" ry="22.02" />
+<text xml:space="preserve" text-anchor="middle" x="467.6" y="-1279.75" font-family="Helvetica,sans-Serif" font-size="10.00">Clean-fix launchd trigger</text>
+<text xml:space="preserve" text-anchor="middle" x="467.6" y="-1268.5" font-family="Helvetica,sans-Serif" font-size="10.00">(every 10 minutes)</text>
 </g>
 
 <g id="node2" class="node">
 <title>foreach_project</title>
-<polygon fill="#e8f4f8" stroke="#2980b9" points="172.8,-851.4 0,-851.4 0,-804.6 172.8,-804.6 172.8,-851.4" />
-<text xml:space="preserve" text-anchor="middle" x="86.4" y="-835.38" font-family="Helvetica,sans-Serif" font-size="10.00">For each ~/rust/*</text>
-<text xml:space="preserve" text-anchor="middle" x="86.4" y="-824.12" font-family="Helvetica,sans-Serif" font-size="10.00">(skip excluded, worktrees,</text>
-<text xml:space="preserve" text-anchor="middle" x="86.4" y="-812.88" font-family="Helvetica,sans-Serif" font-size="10.00">_style_fix, unmodified)</text>
+<polygon fill="#e8f4f8" stroke="#2980b9" points="554,-1221.4 381.2,-1221.4 381.2,-1174.6 554,-1174.6 554,-1221.4" />
+<text xml:space="preserve" text-anchor="middle" x="467.6" y="-1205.38" font-family="Helvetica,sans-Serif" font-size="10.00">Projects from [projects] allowlist</text>
+<text xml:space="preserve" text-anchor="middle" x="467.6" y="-1194.12" font-family="Helvetica,sans-Serif" font-size="10.00">(resolve [active_checkout];</text>
+<text xml:space="preserve" text-anchor="middle" x="467.6" y="-1182.88" font-family="Helvetica,sans-Serif" font-size="10.00">skip missing path/Cargo.toml)</text>
 </g>
 
 <g id="edge1" class="edge">
 <title>start-&gt;foreach_project</title>
-<path fill="none" stroke="black" d="M86.4,-909.66C86.4,-896.72 86.4,-878.97 86.4,-863.33" />
-<polygon fill="black" stroke="black" points="89.9,-863.4 86.4,-853.4 82.9,-863.4 89.9,-863.4" />
+<path fill="none" stroke="black" d="M467.6,-1255.72C467.6,-1248.72 467.6,-1240.81 467.6,-1233.14" />
+<polygon fill="black" stroke="black" points="471.1,-1233.36 467.6,-1223.36 464.1,-1233.36 471.1,-1233.36" />
 </g>
 
 <g id="node3" class="node">
-<title>clean</title>
-<polygon fill="#e8f4f8" stroke="#2980b9" points="172.8,-776 0,-776 0,-740 172.8,-740 172.8,-776" />
-<text xml:space="preserve" text-anchor="middle" x="86.4" y="-754.12" font-family="Helvetica,sans-Serif" font-size="10.00">cargo clean</text>
+<title>eval_enabled</title>
+<polygon fill="#fef9e7" stroke="#f39c12" points="147.6,-1115.4 57.47,-1083 147.6,-1050.6 237.73,-1083 147.6,-1115.4" />
+<text xml:space="preserve" text-anchor="middle" x="147.6" y="-1084.75" font-family="Helvetica,sans-Serif" font-size="10.00">style_eval enabled?</text>
+<text xml:space="preserve" text-anchor="middle" x="147.6" y="-1073.5" font-family="Helvetica,sans-Serif" font-size="10.00">(run_once forces yes)</text>
 </g>
 
 <g id="edge2" class="edge">
-<title>foreach_project-&gt;clean</title>
-<path fill="none" stroke="black" d="M86.4,-804.3C86.4,-798.84 86.4,-792.96 86.4,-787.29" />
-<polygon fill="black" stroke="black" points="89.9,-787.65 86.4,-777.65 82.9,-787.65 89.9,-787.65" />
+<title>foreach_project:w-&gt;eval_enabled:n</title>
+<path fill="none" stroke="black" d="M381.2,-1198C381.2,-1198 203.94,-1135.5 158.24,-1119.38" />
+<polygon fill="black" stroke="black" points="159.62,-1116.16 149.03,-1116.13 157.29,-1122.76 159.62,-1116.16" />
 </g>
 
 <g id="node4" class="node">
-<title>build</title>
-<polygon fill="#e8f4f8" stroke="#2980b9" points="172.8,-716 0,-716 0,-680 172.8,-680 172.8,-716" />
-<text xml:space="preserve" text-anchor="middle" x="86.4" y="-694.12" font-family="Helvetica,sans-Serif" font-size="10.00">cargo build --workspace</text>
+<title>eval_foreach</title>
+<polygon fill="#e8f4f8" stroke="#2980b9" points="234,-1026.4 61.2,-1026.4 61.2,-979.6 234,-979.6 234,-1026.4" />
+<text xml:space="preserve" text-anchor="middle" x="147.6" y="-1010.38" font-family="Helvetica,sans-Serif" font-size="10.00">For each project (parallel)</text>
+<text xml:space="preserve" text-anchor="middle" x="147.6" y="-999.12" font-family="Helvetica,sans-Serif" font-size="10.00">(skip pending handoff or</text>
+<text xml:space="preserve" text-anchor="middle" x="147.6" y="-987.88" font-family="Helvetica,sans-Serif" font-size="10.00">style-fix worktree)</text>
 </g>
 
 <g id="edge3" class="edge">
-<title>clean-&gt;build</title>
-<path fill="none" stroke="black" d="M86.4,-739.67C86.4,-735.83 86.4,-731.69 86.4,-727.56" />
-<polygon fill="black" stroke="black" points="89.9,-727.73 86.4,-717.73 82.9,-727.73 89.9,-727.73" />
-</g>
-
-<g id="node5" class="node">
-<title>clippy_build</title>
-<polygon fill="#e8f4f8" stroke="#2980b9" points="172.8,-656 0,-656 0,-620 172.8,-620 172.8,-656" />
-<text xml:space="preserve" text-anchor="middle" x="86.4" y="-634.13" font-family="Helvetica,sans-Serif" font-size="10.00">cargo clippy -D warnings</text>
-</g>
-
-<g id="edge4" class="edge">
-<title>build-&gt;clippy_build</title>
-<path fill="none" stroke="black" d="M86.4,-679.67C86.4,-675.83 86.4,-671.69 86.4,-667.56" />
-<polygon fill="black" stroke="black" points="89.9,-667.73 86.4,-657.73 82.9,-667.73 89.9,-667.73" />
-</g>
-
-<g id="node6" class="node">
-<title>warmup</title>
-<polygon fill="#e8f4f8" stroke="#2980b9" points="172.8,-592.8 0,-592.8 0,-553.2 172.8,-553.2 172.8,-592.8" />
-<text xml:space="preserve" text-anchor="middle" x="86.4" y="-574.75" font-family="Helvetica,sans-Serif" font-size="10.00">Warmup</text>
-<text xml:space="preserve" text-anchor="middle" x="86.4" y="-563.5" font-family="Helvetica,sans-Serif" font-size="10.00">(launch + kill selected apps)</text>
-</g>
-
-<g id="edge5" class="edge">
-<title>clippy_build-&gt;warmup</title>
-<path fill="none" stroke="black" d="M86.4,-619.55C86.4,-614.77 86.4,-609.5 86.4,-604.27" />
-<polygon fill="black" stroke="black" points="89.9,-604.61 86.4,-594.61 82.9,-604.61 89.9,-604.61" />
-</g>
-
-<g id="node7" class="node">
-<title>style_enabled</title>
-<polygon fill="#fef9e7" stroke="#f39c12" points="86.4,-521.8 34.68,-493 86.4,-464.2 138.12,-493 86.4,-521.8" />
-<text xml:space="preserve" text-anchor="middle" x="86.4" y="-494.75" font-family="Helvetica,sans-Serif" font-size="10.00">style_eval</text>
-<text xml:space="preserve" text-anchor="middle" x="86.4" y="-483.5" font-family="Helvetica,sans-Serif" font-size="10.00">enabled?</text>
-</g>
-
-<g id="edge6" class="edge">
-<title>warmup-&gt;style_enabled</title>
-<path fill="none" stroke="black" d="M86.4,-552.81C86.4,-546.88 86.4,-540.17 86.4,-533.45" />
-<polygon fill="black" stroke="black" points="89.9,-533.76 86.4,-523.76 82.9,-533.76 89.9,-533.76" />
-</g>
-
-<g id="node8" class="node">
-<title>eval_foreach</title>
-<polygon fill="#e8f4f8" stroke="#2980b9" points="425.6,-846 252.8,-846 252.8,-810 425.6,-810 425.6,-846" />
-<text xml:space="preserve" text-anchor="middle" x="339.2" y="-824.12" font-family="Helvetica,sans-Serif" font-size="10.00">For each project (parallel)</text>
-</g>
-
-<g id="edge7" class="edge">
-<title>style_enabled-&gt;eval_foreach</title>
-<path fill="none" stroke="black" d="M116.75,-505.25C136.42,-514.63 161.14,-529.4 176.5,-549.5 224.99,-612.97 188.14,-652.64 228.61,-721.5 247.77,-754.1 279.66,-783.28 304.29,-802.81" />
-<polygon fill="black" stroke="black" points="302.08,-805.53 312.13,-808.89 306.37,-800 302.08,-805.53" />
-<text xml:space="preserve" text-anchor="middle" x="201.6" y="-659.44" font-family="Helvetica,sans-Serif" font-size="8.00">yes</text>
-</g>
-
-<g id="node25" class="node">
-<title>report</title>
-<ellipse fill="#f0e6ff" stroke="#8e44ad" cx="392.4" cy="-233" rx="79.2" ry="18" />
-<text xml:space="preserve" text-anchor="middle" x="392.4" y="-229.12" font-family="Helvetica,sans-Serif" font-size="10.00">Generate Clean-fix Report</text>
-</g>
-
-<g id="edge8" class="edge">
-<title>style_enabled-&gt;report</title>
-<path fill="none" stroke="black" d="M97.95,-470.48C120.98,-427.73 176.69,-334.49 249.1,-282.5 270.7,-266.99 297.58,-256.01 322.2,-248.4" />
-<polygon fill="black" stroke="black" points="322.9,-251.85 331.5,-245.67 320.92,-245.13 322.9,-251.85" />
-<text xml:space="preserve" text-anchor="middle" x="186.38" y="-337.11" font-family="Helvetica,sans-Serif" font-size="8.00">no</text>
-</g>
-
-<g id="node9" class="node">
-<title>ttl_gate</title>
-<polygon fill="#fef9e7" stroke="#f39c12" points="339.2,-792.4 273.26,-760 339.2,-727.6 405.14,-760 339.2,-792.4" />
-<text xml:space="preserve" text-anchor="middle" x="339.2" y="-761.75" font-family="Helvetica,sans-Serif" font-size="10.00">due-units gate:</text>
-<text xml:space="preserve" text-anchor="middle" x="339.2" y="-750.5" font-family="Helvetica,sans-Serif" font-size="10.00">any unit due?</text>
-</g>
-
-<g id="edge9" class="edge">
-<title>eval_foreach-&gt;ttl_gate</title>
-<path fill="none" stroke="black" d="M339.2,-809.78C339.2,-807.97 339.2,-806.08 339.2,-804.14" />
-<polygon fill="black" stroke="black" points="342.7,-804.23 339.2,-794.23 335.7,-804.23 342.7,-804.23" />
-</g>
-
-<g id="node10" class="node">
-<title>load_style</title>
-<polygon fill="#e8f4f8" stroke="#2980b9" points="446.09,-717.8 232.31,-717.8 232.31,-678.2 446.09,-678.2 446.09,-717.8" />
-<text xml:space="preserve" text-anchor="middle" x="339.2" y="-699.75" font-family="Helvetica,sans-Serif" font-size="10.00">Load style guide</text>
-<text xml:space="preserve" text-anchor="middle" x="339.2" y="-688.5" font-family="Helvetica,sans-Serif" font-size="10.00">~/.claude/scripts/rust_style/load-rust-style.sh</text>
-</g>
-
-<g id="edge10" class="edge">
-<title>ttl_gate-&gt;load_style</title>
-<path fill="none" stroke="black" d="M339.2,-727.18C339.2,-727.09 339.2,-726.99 339.2,-726.89" />
-<polygon fill="black" stroke="black" points="342.7,-729.49 339.2,-719.49 335.7,-729.49 342.7,-729.49" />
-<text xml:space="preserve" text-anchor="middle" x="326.82" y="-719.33" font-family="Helvetica,sans-Serif" font-size="8.00">1+ due</text>
-</g>
-
-<g id="edge11" class="edge">
-<title>ttl_gate-&gt;report</title>
-<path fill="none" stroke="black" d="M282.69,-765.11C276.88,-764.98 271.99,-764.42 268.93,-763.2 244.97,-753.68 238.27,-745.4 228.61,-721.5 228.61,-721.5 249.1,-402.5 249.1,-402.5 256.54,-395.26 428.48,-400.85 435.8,-393.49 444.81,-384.44 445.57,-290.53 440.77,-278.7 438.69,-273.56 431.38,-265.86 423.05,-258.24" />
-<polygon fill="black" stroke="black" points="425.5,-255.73 415.68,-251.75 420.87,-260.99 425.5,-255.73" />
-<path fill="none" stroke="black" d="M394.31,-754.29C415.2,-749.13 437.01,-739.48 449.79,-721.5 471.51,-690.94 596.5,-745.72 429.3,-282.5 426.4,-274.46 421.72,-266.62 416.66,-259.65" />
-<polygon fill="black" stroke="black" points="419.52,-257.62 410.58,-251.92 414.01,-261.94 419.52,-257.62" />
-<text xml:space="preserve" text-anchor="middle" x="314.68" y="-390.44" font-family="Helvetica,sans-Serif" font-size="8.00">none due</text>
-<text xml:space="preserve" text-anchor="middle" x="314.68" y="-381.44" font-family="Helvetica,sans-Serif" font-size="8.00">(skip, no agent)</text>
-</g>
-
-<g id="edge12" class="edge">
-<title>ttl_gate-&gt;report</title>
-<path fill="none" stroke="#e74c3c" d="M394.31,-754.29C415.2,-749.13 437.01,-739.48 449.79,-721.5 471.51,-690.94 596.5,-745.72 429.3,-282.5 426.4,-274.46 421.72,-266.62 416.66,-259.65" />
-<polygon fill="#e74c3c" stroke="#e74c3c" points="419.52,-257.62 410.58,-251.92 414.01,-261.94 419.52,-257.62" />
-<text xml:space="preserve" text-anchor="middle" x="465.97" y="-552.62" font-family="Helvetica,sans-Serif" font-size="8.00" fill="#e74c3c">gate crashed: ERROR</text>
-<text xml:space="preserve" text-anchor="middle" x="465.97" y="-543.62" font-family="Helvetica,sans-Serif" font-size="8.00" fill="#e74c3c">(fail-closed, flagged)</text>
-</g>
-
-<g id="node11" class="node">
-<title>survey</title>
-<polygon fill="#e8f4f8" stroke="#2980b9" points="425.6,-658 252.8,-658 252.8,-622 425.6,-622 425.6,-658" />
-<text xml:space="preserve" text-anchor="middle" x="339.2" y="-636.12" font-family="Helvetica,sans-Serif" font-size="10.00">Survey project source</text>
-</g>
-
-<g id="edge13" class="edge">
-<title>load_style-&gt;survey</title>
-<path fill="none" stroke="black" d="M339.2,-677.71C339.2,-675.17 339.2,-672.52 339.2,-669.86" />
-<polygon fill="black" stroke="black" points="342.7,-669.94 339.2,-659.94 335.7,-669.94 342.7,-669.94" />
-</g>
-
-<g id="node12" class="node">
-<title>carry_forward</title>
-<polygon fill="#e8f4f8" stroke="#2980b9" points="425.6,-601.8 252.8,-601.8 252.8,-562.2 425.6,-562.2 425.6,-601.8" />
-<text xml:space="preserve" text-anchor="middle" x="339.2" y="-583.75" font-family="Helvetica,sans-Serif" font-size="10.00">Read pending JSON</text>
-<text xml:space="preserve" text-anchor="middle" x="339.2" y="-572.5" font-family="Helvetica,sans-Serif" font-size="10.00">(carry forward valid findings)</text>
-</g>
-
-<g id="edge14" class="edge">
-<title>survey-&gt;carry_forward</title>
-<path fill="none" stroke="black" d="M339.2,-621.65C339.2,-619.02 339.2,-616.25 339.2,-613.45" />
-<polygon fill="black" stroke="black" points="342.7,-613.56 339.2,-603.56 335.7,-613.56 342.7,-613.56" />
-</g>
-
-<g id="node13" class="node">
-<title>check_wt_eval</title>
-<polygon fill="#fef9e7" stroke="#f39c12" points="339.2,-536.4 261.77,-504 339.2,-471.6 416.63,-504 339.2,-536.4" />
-<text xml:space="preserve" text-anchor="middle" x="339.2" y="-505.75" font-family="Helvetica,sans-Serif" font-size="10.00">style-fix scratch</text>
-<text xml:space="preserve" text-anchor="middle" x="339.2" y="-494.5" font-family="Helvetica,sans-Serif" font-size="10.00">evaluation exists?</text>
-</g>
-
-<g id="edge15" class="edge">
-<title>carry_forward-&gt;check_wt_eval</title>
-<path fill="none" stroke="black" d="M339.2,-561.91C339.2,-557.6 339.2,-552.87 339.2,-548.04" />
-<polygon fill="black" stroke="black" points="342.7,-548.24 339.2,-538.24 335.7,-548.24 342.7,-548.24" />
-</g>
-
-<g id="node14" class="node">
-<title>load_wt_eval</title>
-<polygon fill="#e8f4f8" stroke="#2980b9" points="425.6,-445.8 252.8,-445.8 252.8,-406.2 425.6,-406.2 425.6,-445.8" />
-<text xml:space="preserve" text-anchor="middle" x="339.2" y="-427.75" font-family="Helvetica,sans-Serif" font-size="10.00">Read style-fix scratch</text>
-<text xml:space="preserve" text-anchor="middle" x="339.2" y="-416.5" font-family="Helvetica,sans-Serif" font-size="10.00">(exclude these findings)</text>
-</g>
-
-<g id="edge16" class="edge">
-<title>check_wt_eval-&gt;load_wt_eval</title>
-<path fill="none" stroke="black" d="M339.2,-471.37C339.2,-466.85 339.2,-462.21 339.2,-457.7" />
-<polygon fill="black" stroke="black" points="342.7,-457.77 339.2,-447.77 335.7,-457.77 342.7,-457.77" />
-<text xml:space="preserve" text-anchor="middle" x="333.2" y="-459.95" font-family="Helvetica,sans-Serif" font-size="8.00">yes</text>
-</g>
-
-<g id="node15" class="node">
-<title>evaluate</title>
-<polygon fill="#e8f4f8" stroke="#2980b9" points="425.6,-383.8 252.8,-383.8 252.8,-344.2 425.6,-344.2 425.6,-383.8" />
-<text xml:space="preserve" text-anchor="middle" x="339.2" y="-365.75" font-family="Helvetica,sans-Serif" font-size="10.00">Find up to 5 NEW violations</text>
-<text xml:space="preserve" text-anchor="middle" x="339.2" y="-354.5" font-family="Helvetica,sans-Serif" font-size="10.00">(skip worktree findings)</text>
-</g>
-
-<g id="edge17" class="edge">
-<title>check_wt_eval-&gt;evaluate</title>
-<path fill="none" stroke="black" d="M296.24,-489.05C278.32,-480.45 259.34,-467.65 249.1,-449.5 238.84,-431.3 237.59,-419.93 249.1,-402.5 251.97,-398.15 255.45,-394.29 259.34,-390.86" />
-<polygon fill="black" stroke="black" points="261.34,-393.74 267.24,-384.95 257.14,-388.14 261.34,-393.74" />
-<text xml:space="preserve" text-anchor="middle" x="244.58" y="-450.87" font-family="Helvetica,sans-Serif" font-size="8.00">no</text>
-</g>
-
-<g id="edge18" class="edge">
-<title>load_wt_eval-&gt;evaluate</title>
-<path fill="none" stroke="black" d="M339.2,-406.04C339.2,-402.61 339.2,-398.98 339.2,-395.33" />
-<polygon fill="black" stroke="black" points="342.7,-395.43 339.2,-385.43 335.7,-395.43 342.7,-395.43" />
+<title>eval_enabled-&gt;eval_foreach</title>
+<path fill="none" stroke="black" d="M147.6,-1050.46C147.6,-1046.36 147.6,-1042.14 147.6,-1038" />
+<polygon fill="black" stroke="black" points="151.1,-1038.19 147.6,-1028.19 144.1,-1038.19 151.1,-1038.19" />
+<text xml:space="preserve" text-anchor="middle" x="141.6" y="-1040.18" font-family="Helvetica,sans-Serif" font-size="8.00">yes</text>
 </g>
 
 <g id="node16" class="node">
+<title>review_enabled</title>
+<polygon fill="#fef9e7" stroke="#f39c12" points="467.6,-1115.4 356.91,-1083 467.6,-1050.6 578.29,-1083 467.6,-1115.4" />
+<text xml:space="preserve" text-anchor="middle" x="467.6" y="-1084.75" font-family="Helvetica,sans-Serif" font-size="10.00">style_eval_review enabled?</text>
+<text xml:space="preserve" text-anchor="middle" x="467.6" y="-1073.5" font-family="Helvetica,sans-Serif" font-size="10.00">(run_once forces yes)</text>
+</g>
+
+<g id="edge4" class="edge">
+<title>eval_enabled-&gt;review_enabled</title>
+<path fill="none" stroke="black" d="M238.87,-1083C271.54,-1083 308.94,-1083 343.89,-1083" />
+<polygon fill="black" stroke="black" points="343.63,-1086.5 353.63,-1083 343.63,-1079.5 343.63,-1086.5" />
+<text xml:space="preserve" text-anchor="middle" x="275.04" y="-1084.4" font-family="Helvetica,sans-Serif" font-size="8.00">no: continue</text>
+</g>
+
+<g id="node5" class="node">
+<title>ttl_gate</title>
+<polygon fill="#fef9e7" stroke="#f39c12" points="147.6,-955.4 81.66,-923 147.6,-890.6 213.54,-923 147.6,-955.4" />
+<text xml:space="preserve" text-anchor="middle" x="147.6" y="-924.75" font-family="Helvetica,sans-Serif" font-size="10.00">due-units gate:</text>
+<text xml:space="preserve" text-anchor="middle" x="147.6" y="-913.5" font-family="Helvetica,sans-Serif" font-size="10.00">any unit due?</text>
+</g>
+
+<g id="edge5" class="edge">
+<title>eval_foreach-&gt;ttl_gate</title>
+<path fill="none" stroke="black" d="M147.6,-979.43C147.6,-975.51 147.6,-971.34 147.6,-967.11" />
+<polygon fill="black" stroke="black" points="151.1,-967.4 147.6,-957.4 144.1,-967.4 151.1,-967.4" />
+<text xml:space="preserve" text-anchor="middle" x="128.48" y="-969.3" font-family="Helvetica,sans-Serif" font-size="8.00">per project</text>
+</g>
+
+<g id="node6" class="node">
+<title>load_style</title>
+<polygon fill="#e8f4f8" stroke="#2980b9" points="254.49,-867.8 40.71,-867.8 40.71,-828.2 254.49,-828.2 254.49,-867.8" />
+<text xml:space="preserve" text-anchor="middle" x="147.6" y="-849.75" font-family="Helvetica,sans-Serif" font-size="10.00">Load style guide</text>
+<text xml:space="preserve" text-anchor="middle" x="147.6" y="-838.5" font-family="Helvetica,sans-Serif" font-size="10.00">~/.claude/scripts/rust_style/load-rust-style.sh</text>
+</g>
+
+<g id="edge6" class="edge">
+<title>ttl_gate-&gt;load_style</title>
+<path fill="none" stroke="black" d="M147.6,-890.32C147.6,-886.65 147.6,-882.92 147.6,-879.26" />
+<polygon fill="black" stroke="black" points="151.1,-879.56 147.6,-869.56 144.1,-879.56 151.1,-879.56" />
+<text xml:space="preserve" text-anchor="middle" x="135.23" y="-881.01" font-family="Helvetica,sans-Serif" font-size="8.00">1+ due</text>
+</g>
+
+<g id="node13" class="node">
+<title>eval_idle</title>
+<polygon fill="#e8f4f8" stroke="#2980b9" points="115.2,-402.8 0,-402.8 0,-363.2 115.2,-363.2 115.2,-402.8" />
+<text xml:space="preserve" text-anchor="middle" x="57.6" y="-384.75" font-family="Helvetica,sans-Serif" font-size="10.00">Skip project</text>
+<text xml:space="preserve" text-anchor="middle" x="57.6" y="-373.5" font-family="Helvetica,sans-Serif" font-size="10.00">(no agent needed)</text>
+</g>
+
+<g id="edge7" class="edge">
+<title>ttl_gate-&gt;eval_idle</title>
+<path fill="none" stroke="black" d="M100.12,-913.44C76.88,-906.11 50.96,-893.38 37.01,-871.5 -57.33,-723.49 14.16,-495.88 45.14,-413.82" />
+<polygon fill="black" stroke="black" points="48.35,-415.23 48.68,-404.65 41.82,-412.72 48.35,-415.23" />
+<text xml:space="preserve" text-anchor="middle" x="-25.93" y="-654.86" font-family="Helvetica,sans-Serif" font-size="8.00">none due</text>
+</g>
+
+<g id="node14" class="node">
+<title>eval_gate_error</title>
+<polygon fill="#fadbd8" stroke="#e74c3c" points="295.2,-402.8 180,-402.8 180,-363.2 295.2,-363.2 295.2,-402.8" />
+<text xml:space="preserve" text-anchor="middle" x="237.6" y="-384.75" font-family="Helvetica,sans-Serif" font-size="10.00">Flag project ERROR</text>
+<text xml:space="preserve" text-anchor="middle" x="237.6" y="-373.5" font-family="Helvetica,sans-Serif" font-size="10.00">(fail closed)</text>
+</g>
+
+<g id="edge8" class="edge">
+<title>ttl_gate-&gt;eval_gate_error</title>
+<path fill="none" stroke="#e74c3c" d="M195.08,-913.44C218.32,-906.11 244.24,-893.38 258.19,-871.5 352.53,-723.49 281.04,-495.88 250.06,-413.82" />
+<polygon fill="#e74c3c" stroke="#e74c3c" points="253.38,-412.72 246.52,-404.65 246.85,-415.23 253.38,-412.72" />
+<text xml:space="preserve" text-anchor="middle" x="281.01" y="-654.86" font-family="Helvetica,sans-Serif" font-size="8.00" fill="#e74c3c">gate crashed</text>
+</g>
+
+<g id="node7" class="node">
+<title>survey</title>
+<polygon fill="#e8f4f8" stroke="#2980b9" points="234,-806 61.2,-806 61.2,-770 234,-770 234,-806" />
+<text xml:space="preserve" text-anchor="middle" x="147.6" y="-784.12" font-family="Helvetica,sans-Serif" font-size="10.00">Survey project source</text>
+</g>
+
+<g id="edge9" class="edge">
+<title>load_style-&gt;survey</title>
+<path fill="none" stroke="black" d="M147.6,-828.02C147.6,-824.76 147.6,-821.32 147.6,-817.89" />
+<polygon fill="black" stroke="black" points="151.1,-817.99 147.6,-807.99 144.1,-817.99 151.1,-817.99" />
+</g>
+
+<g id="node8" class="node">
+<title>carry_forward</title>
+<polygon fill="#e8f4f8" stroke="#2980b9" points="234,-747.8 61.2,-747.8 61.2,-708.2 234,-708.2 234,-747.8" />
+<text xml:space="preserve" text-anchor="middle" x="147.6" y="-729.75" font-family="Helvetica,sans-Serif" font-size="10.00">Read pending JSON</text>
+<text xml:space="preserve" text-anchor="middle" x="147.6" y="-718.5" font-family="Helvetica,sans-Serif" font-size="10.00">(carry forward valid findings)</text>
+</g>
+
+<g id="edge10" class="edge">
+<title>survey-&gt;carry_forward</title>
+<path fill="none" stroke="black" d="M147.6,-769.67C147.6,-766.33 147.6,-762.77 147.6,-759.18" />
+<polygon fill="black" stroke="black" points="151.1,-759.4 147.6,-749.4 144.1,-759.4 151.1,-759.4" />
+</g>
+
+<g id="node9" class="node">
+<title>check_wt_eval</title>
+<polygon fill="#fef9e7" stroke="#f39c12" points="147.6,-685.4 70.17,-653 147.6,-620.6 225.03,-653 147.6,-685.4" />
+<text xml:space="preserve" text-anchor="middle" x="147.6" y="-654.75" font-family="Helvetica,sans-Serif" font-size="10.00">style-fix scratch</text>
+<text xml:space="preserve" text-anchor="middle" x="147.6" y="-643.5" font-family="Helvetica,sans-Serif" font-size="10.00">evaluation exists?</text>
+</g>
+
+<g id="edge11" class="edge">
+<title>carry_forward-&gt;check_wt_eval</title>
+<path fill="none" stroke="black" d="M147.6,-707.9C147.6,-704.52 147.6,-700.89 147.6,-697.17" />
+<polygon fill="black" stroke="black" points="151.1,-697.41 147.6,-687.41 144.1,-697.41 151.1,-697.41" />
+</g>
+
+<g id="node10" class="node">
+<title>load_wt_eval</title>
+<polygon fill="#e8f4f8" stroke="#2980b9" points="234,-597.8 61.2,-597.8 61.2,-558.2 234,-558.2 234,-597.8" />
+<text xml:space="preserve" text-anchor="middle" x="147.6" y="-579.75" font-family="Helvetica,sans-Serif" font-size="10.00">Read style-fix scratch</text>
+<text xml:space="preserve" text-anchor="middle" x="147.6" y="-568.5" font-family="Helvetica,sans-Serif" font-size="10.00">(exclude these findings)</text>
+</g>
+
+<g id="edge12" class="edge">
+<title>check_wt_eval-&gt;load_wt_eval</title>
+<path fill="none" stroke="black" d="M147.6,-620.32C147.6,-616.65 147.6,-612.92 147.6,-609.26" />
+<polygon fill="black" stroke="black" points="151.1,-609.56 147.6,-599.56 144.1,-609.56 151.1,-609.56" />
+<text xml:space="preserve" text-anchor="middle" x="141.6" y="-611.01" font-family="Helvetica,sans-Serif" font-size="8.00">yes</text>
+</g>
+
+<g id="node11" class="node">
+<title>evaluate</title>
+<polygon fill="#e8f4f8" stroke="#2980b9" points="234,-536.4 61.2,-536.4 61.2,-489.6 234,-489.6 234,-536.4" />
+<text xml:space="preserve" text-anchor="middle" x="147.6" y="-520.38" font-family="Helvetica,sans-Serif" font-size="10.00">Find NEW violations up to</text>
+<text xml:space="preserve" text-anchor="middle" x="147.6" y="-509.12" font-family="Helvetica,sans-Serif" font-size="10.00">[style_eval] max_new_findings</text>
+<text xml:space="preserve" text-anchor="middle" x="147.6" y="-497.88" font-family="Helvetica,sans-Serif" font-size="10.00">(skip worktree findings)</text>
+</g>
+
+<g id="edge13" class="edge">
+<title>check_wt_eval-&gt;evaluate</title>
+<path fill="none" stroke="black" d="M191.91,-638.8C209.39,-630.78 227.66,-618.8 237.7,-601.5 248.18,-583.43 248.96,-572.09 237.7,-554.5 235.26,-550.69 232.38,-547.23 229.16,-544.08" />
+<polygon fill="black" stroke="black" points="231.63,-541.59 221.72,-537.85 227.14,-546.96 231.63,-541.59" />
+<text xml:space="preserve" text-anchor="middle" x="233.23" y="-602.85" font-family="Helvetica,sans-Serif" font-size="8.00">no</text>
+</g>
+
+<g id="edge14" class="edge">
+<title>load_wt_eval-&gt;evaluate</title>
+<path fill="none" stroke="black" d="M147.6,-557.79C147.6,-554.65 147.6,-551.32 147.6,-547.96" />
+<polygon fill="black" stroke="black" points="151.1,-548.13 147.6,-538.13 144.1,-548.13 151.1,-548.13" />
+</g>
+
+<g id="node12" class="node">
 <title>write_eval</title>
-<polygon fill="#e8f4f8" stroke="#2980b9" points="425.6,-325.8 252.8,-325.8 252.8,-286.2 425.6,-286.2 425.6,-325.8" />
-<text xml:space="preserve" text-anchor="middle" x="339.2" y="-307.75" font-family="Helvetica,sans-Serif" font-size="10.00">Write pending JSON</text>
-<text xml:space="preserve" text-anchor="middle" x="339.2" y="-296.5" font-family="Helvetica,sans-Serif" font-size="10.00">(carried + new)</text>
+<polygon fill="#e8f4f8" stroke="#2980b9" points="234,-467.8 61.2,-467.8 61.2,-428.2 234,-428.2 234,-467.8" />
+<text xml:space="preserve" text-anchor="middle" x="147.6" y="-449.75" font-family="Helvetica,sans-Serif" font-size="10.00">Write pending JSON</text>
+<text xml:space="preserve" text-anchor="middle" x="147.6" y="-438.5" font-family="Helvetica,sans-Serif" font-size="10.00">(carried + new)</text>
+</g>
+
+<g id="edge15" class="edge">
+<title>evaluate-&gt;write_eval</title>
+<path fill="none" stroke="black" d="M147.6,-489.17C147.6,-486.01 147.6,-482.74 147.6,-479.49" />
+<polygon fill="black" stroke="black" points="151.1,-479.5 147.6,-469.5 144.1,-479.5 151.1,-479.5" />
+</g>
+
+<g id="node15" class="node">
+<title>eval_done</title>
+<polygon fill="#d5f5e3" stroke="#27ae60" points="212.4,-336 82.8,-336 82.8,-300 212.4,-300 212.4,-336" />
+<text xml:space="preserve" text-anchor="middle" x="147.6" y="-314.12" font-family="Helvetica,sans-Serif" font-size="10.00">All project evals done</text>
+</g>
+
+<g id="edge16" class="edge">
+<title>write_eval-&gt;eval_done</title>
+<path fill="none" stroke="black" d="M147.6,-427.97C147.6,-406.43 147.6,-371.95 147.6,-347.35" />
+<polygon fill="black" stroke="black" points="151.1,-347.67 147.6,-337.67 144.1,-347.68 151.1,-347.67" />
+</g>
+
+<g id="edge17" class="edge">
+<title>eval_idle-&gt;eval_done</title>
+<path fill="none" stroke="black" d="M85.58,-362.79C94.24,-356.54 103.88,-349.58 112.93,-343.04" />
+<polygon fill="black" stroke="black" points="114.8,-346.01 120.86,-337.32 110.7,-340.33 114.8,-346.01" />
+</g>
+
+<g id="edge18" class="edge">
+<title>eval_gate_error-&gt;eval_done</title>
+<path fill="none" stroke="#e74c3c" d="M209.62,-362.79C200.96,-356.54 191.32,-349.58 182.27,-343.04" />
+<polygon fill="#e74c3c" stroke="#e74c3c" points="184.5,-340.33 174.34,-337.32 180.4,-346.01 184.5,-340.33" />
 </g>
 
 <g id="edge19" class="edge">
-<title>evaluate-&gt;write_eval</title>
-<path fill="none" stroke="black" d="M339.2,-343.71C339.2,-341.65 339.2,-339.52 339.2,-337.37" />
-<polygon fill="black" stroke="black" points="342.7,-337.49 339.2,-327.49 335.7,-337.49 342.7,-337.49" />
+<title>eval_done-&gt;review_enabled</title>
+<path fill="none" stroke="black" d="M148.62,-336.19C150.71,-356.15 157.07,-387.81 176.3,-406.5 196.69,-426.32 218.19,-403.81 237.7,-424.5 427.25,-625.44 214,-807.45 377.5,-1030.1 385.97,-1041.64 397.78,-1051.09 410.06,-1058.64" />
+<polygon fill="black" stroke="black" points="408.23,-1061.62 418.65,-1063.55 411.7,-1055.55 408.23,-1061.62" />
+<text xml:space="preserve" text-anchor="middle" x="304.91" y="-705" font-family="Helvetica,sans-Serif" font-size="8.00">all done</text>
 </g>
 
 <g id="node17" class="node">
-<title>fix_foreach</title>
-<polygon fill="#e8f4f8" stroke="#2980b9" points="731.6,-847.8 558.8,-847.8 558.8,-808.2 731.6,-808.2 731.6,-847.8" />
-<text xml:space="preserve" text-anchor="middle" x="645.2" y="-829.75" font-family="Helvetica,sans-Serif" font-size="10.00">For each project with</text>
-<text xml:space="preserve" text-anchor="middle" x="645.2" y="-818.5" font-family="Helvetica,sans-Serif" font-size="10.00">pending eval findings</text>
+<title>review_foreach</title>
+<polygon fill="#e8f4f8" stroke="#2980b9" points="554,-1026.4 381.2,-1026.4 381.2,-979.6 554,-979.6 554,-1026.4" />
+<text xml:space="preserve" text-anchor="middle" x="467.6" y="-1010.38" font-family="Helvetica,sans-Serif" font-size="10.00">For each pending evaluation</text>
+<text xml:space="preserve" text-anchor="middle" x="467.6" y="-999.12" font-family="Helvetica,sans-Serif" font-size="10.00">(skip reviewed/fixed or</text>
+<text xml:space="preserve" text-anchor="middle" x="467.6" y="-987.88" font-family="Helvetica,sans-Serif" font-size="10.00">style-fix worktree)</text>
 </g>
 
 <g id="edge20" class="edge">
-<title>write_eval-&gt;fix_foreach</title>
-<path fill="none" stroke="black" d="M411.13,-326.08C417.86,-330.05 424.1,-334.81 429.3,-340.5 567.83,-492.09 422.64,-628.18 555.1,-785.1 560.68,-791.71 567.51,-797.37 574.89,-802.21" />
-<polygon fill="black" stroke="black" points="572.79,-805.03 583.18,-807.12 576.36,-799.01 572.79,-805.03" />
-<text xml:space="preserve" text-anchor="middle" x="480.4" y="-568.16" font-family="Helvetica,sans-Serif" font-size="8.00">all done</text>
-</g>
-
-<g id="node18" class="node">
-<title>prechecks</title>
-<polygon fill="#e8f4f8" stroke="#2980b9" points="731.6,-781.4 558.8,-781.4 558.8,-734.6 731.6,-734.6 731.6,-781.4" />
-<text xml:space="preserve" text-anchor="middle" x="645.2" y="-765.38" font-family="Helvetica,sans-Serif" font-size="10.00">Prechecks:</text>
-<text xml:space="preserve" text-anchor="middle" x="645.2" y="-754.12" font-family="Helvetica,sans-Serif" font-size="10.00">- target _style_fix path is free</text>
-<text xml:space="preserve" text-anchor="middle" x="645.2" y="-742.88" font-family="Helvetica,sans-Serif" font-size="10.00">- primary tree is clean</text>
-</g>
-
-<g id="edge21" class="edge">
-<title>fix_foreach-&gt;prechecks</title>
-<path fill="none" stroke="black" d="M645.2,-807.75C645.2,-803.17 645.2,-798.16 645.2,-793.16" />
-<polygon fill="black" stroke="black" points="648.7,-793.17 645.2,-783.17 641.7,-793.17 648.7,-793.17" />
-</g>
-
-<g id="node19" class="node">
-<title>create_wt</title>
-<polygon fill="#e8f4f8" stroke="#2980b9" points="731.6,-706.4 558.8,-706.4 558.8,-659.6 731.6,-659.6 731.6,-706.4" />
-<text xml:space="preserve" text-anchor="middle" x="645.2" y="-690.38" font-family="Helvetica,sans-Serif" font-size="10.00">git worktree add</text>
-<text xml:space="preserve" text-anchor="middle" x="645.2" y="-679.13" font-family="Helvetica,sans-Serif" font-size="10.00">-b refactor/style</text>
-<text xml:space="preserve" text-anchor="middle" x="645.2" y="-667.88" font-family="Helvetica,sans-Serif" font-size="10.00">{project}_style_fix</text>
-</g>
-
-<g id="edge22" class="edge">
-<title>prechecks-&gt;create_wt</title>
-<path fill="none" stroke="black" d="M645.2,-734.27C645.2,-729.07 645.2,-723.46 645.2,-717.93" />
-<polygon fill="black" stroke="black" points="648.7,-718.35 645.2,-708.35 641.7,-718.35 648.7,-718.35" />
-</g>
-
-<g id="node20" class="node">
-<title>mv_eval</title>
-<polygon fill="#e8f4f8" stroke="#2980b9" points="731.6,-632.8 558.8,-632.8 558.8,-593.2 731.6,-593.2 731.6,-632.8" />
-<text xml:space="preserve" text-anchor="middle" x="645.2" y="-615.5" font-family="Helvetica,sans-Serif" font-size="10.00">export pending markdown</text>
-<text xml:space="preserve" text-anchor="middle" x="645.2" y="-604.25" font-family="Helvetica,sans-Serif" font-size="10.00">→ scratch evaluation</text>
-</g>
-
-<g id="edge23" class="edge">
-<title>create_wt-&gt;mv_eval</title>
-<path fill="none" stroke="black" d="M645.2,-659.3C645.2,-654.48 645.2,-649.34 645.2,-644.31" />
-<polygon fill="black" stroke="black" points="648.7,-644.46 645.2,-634.46 641.7,-644.46 648.7,-644.46" />
-</g>
-
-<g id="node21" class="node">
-<title>claude_fix</title>
-<polygon fill="#d5f5e3" stroke="#27ae60" points="731.6,-573.4 558.8,-573.4 558.8,-526.6 731.6,-526.6 731.6,-573.4" />
-<text xml:space="preserve" text-anchor="middle" x="645.2" y="-557.38" font-family="Helvetica,sans-Serif" font-size="10.00">Pass 1 (apply): launch agent</text>
-<text xml:space="preserve" text-anchor="middle" x="645.2" y="-546.12" font-family="Helvetica,sans-Serif" font-size="10.00">(fixes, cargo mend, clippy,</text>
-<text xml:space="preserve" text-anchor="middle" x="645.2" y="-534.88" font-family="Helvetica,sans-Serif" font-size="10.00">tests, style review)</text>
-</g>
-
-<g id="edge24" class="edge">
-<title>mv_eval-&gt;claude_fix</title>
-<path fill="none" stroke="black" d="M645.2,-592.72C645.2,-590.26 645.2,-587.71 645.2,-585.11" />
-<polygon fill="black" stroke="black" points="648.7,-585.27 645.2,-575.27 641.7,-585.27 648.7,-585.27" />
-</g>
-
-<g id="node22" class="node">
-<title>verify_fix</title>
-<polygon fill="#d5f5e3" stroke="#27ae60" points="731.6,-493.4 558.8,-493.4 558.8,-446.6 731.6,-446.6 731.6,-493.4" />
-<text xml:space="preserve" text-anchor="middle" x="645.2" y="-477.38" font-family="Helvetica,sans-Serif" font-size="10.00">Pass 2 (verify): same agent</text>
-<text xml:space="preserve" text-anchor="middle" x="645.2" y="-466.12" font-family="Helvetica,sans-Serif" font-size="10.00">re-checks fix vs Fix Summary,</text>
-<text xml:space="preserve" text-anchor="middle" x="645.2" y="-454.88" font-family="Helvetica,sans-Serif" font-size="10.00">corrects + updates summary</text>
-</g>
-
-<g id="edge25" class="edge">
-<title>claude_fix-&gt;verify_fix</title>
-<path fill="none" stroke="black" d="M645.2,-526.43C645.2,-519.74 645.2,-512.3 645.2,-505.08" />
-<polygon fill="black" stroke="black" points="648.7,-505.19 645.2,-495.19 641.7,-505.19 648.7,-505.19" />
-<text xml:space="preserve" text-anchor="middle" x="621.58" y="-511.24" font-family="Helvetica,sans-Serif" font-size="8.00">Fix Summary</text>
-</g>
-
-<g id="node24" class="node">
-<title>fix_fail</title>
-<polygon fill="#fadbd8" stroke="#e74c3c" points="784.8,-409.8 655.2,-409.8 655.2,-370.2 784.8,-370.2 784.8,-409.8" />
-<text xml:space="preserve" text-anchor="middle" x="720" y="-391.75" font-family="Helvetica,sans-Serif" font-size="10.00">Failure: finalize</text>
-<text xml:space="preserve" text-anchor="middle" x="720" y="-380.5" font-family="Helvetica,sans-Serif" font-size="10.00">or keep pending</text>
-</g>
-
-<g id="edge26" class="edge">
-<title>claude_fix-&gt;fix_fail</title>
-<path fill="none" stroke="black" d="M705.57,-526.36C717.44,-518.84 728.36,-509.22 735.3,-497.1 748.63,-473.81 742.32,-443.16 734.14,-420.62" />
-<polygon fill="black" stroke="black" points="737.41,-419.38 730.47,-411.37 730.9,-421.96 737.41,-419.38" />
-<text xml:space="preserve" text-anchor="middle" x="767.29" y="-479.64" font-family="Helvetica,sans-Serif" font-size="8.00">no summary /</text>
-<text xml:space="preserve" text-anchor="middle" x="767.29" y="-470.64" font-family="Helvetica,sans-Serif" font-size="8.00">timeout</text>
+<title>review_enabled-&gt;review_foreach</title>
+<path fill="none" stroke="black" d="M467.6,-1050.46C467.6,-1046.36 467.6,-1042.14 467.6,-1038" />
+<polygon fill="black" stroke="black" points="471.1,-1038.19 467.6,-1028.19 464.1,-1038.19 471.1,-1038.19" />
+<text xml:space="preserve" text-anchor="middle" x="461.6" y="-1040.18" font-family="Helvetica,sans-Serif" font-size="8.00">yes</text>
 </g>
 
 <g id="node23" class="node">
-<title>fix_ok</title>
-<polygon fill="#d5f5e3" stroke="#27ae60" points="635.2,-409.8 505.6,-409.8 505.6,-370.2 635.2,-370.2 635.2,-409.8" />
-<text xml:space="preserve" text-anchor="middle" x="570.4" y="-391.75" font-family="Helvetica,sans-Serif" font-size="10.00">Worktree ready</text>
-<text xml:space="preserve" text-anchor="middle" x="570.4" y="-380.5" font-family="Helvetica,sans-Serif" font-size="10.00">for review</text>
+<title>fix_enabled</title>
+<polygon fill="#fef9e7" stroke="#f39c12" points="787.6,-1115.4 697.47,-1083 787.6,-1050.6 877.73,-1083 787.6,-1115.4" />
+<text xml:space="preserve" text-anchor="middle" x="787.6" y="-1084.75" font-family="Helvetica,sans-Serif" font-size="10.00">style_fix enabled?</text>
+<text xml:space="preserve" text-anchor="middle" x="787.6" y="-1073.5" font-family="Helvetica,sans-Serif" font-size="10.00">(run_once forces yes)</text>
+</g>
+
+<g id="edge21" class="edge">
+<title>review_enabled-&gt;fix_enabled</title>
+<path fill="none" stroke="black" d="M579.97,-1083C614.11,-1083 651.43,-1083 684.9,-1083" />
+<polygon fill="black" stroke="black" points="684.58,-1086.5 694.58,-1083 684.58,-1079.5 684.58,-1086.5" />
+<text xml:space="preserve" text-anchor="middle" x="616.35" y="-1084.4" font-family="Helvetica,sans-Serif" font-size="8.00">no: continue</text>
+</g>
+
+<g id="node18" class="node">
+<title>review_eligible</title>
+<polygon fill="#fef9e7" stroke="#f39c12" points="467.6,-955.4 400.45,-923 467.6,-890.6 534.75,-923 467.6,-955.4" />
+<text xml:space="preserve" text-anchor="middle" x="467.6" y="-924.75" font-family="Helvetica,sans-Serif" font-size="10.00">findings and no</text>
+<text xml:space="preserve" text-anchor="middle" x="467.6" y="-913.5" font-family="Helvetica,sans-Serif" font-size="10.00">Review Log?</text>
+</g>
+
+<g id="edge22" class="edge">
+<title>review_foreach-&gt;review_eligible</title>
+<path fill="none" stroke="black" d="M467.6,-979.43C467.6,-975.51 467.6,-971.34 467.6,-967.11" />
+<polygon fill="black" stroke="black" points="471.1,-967.4 467.6,-957.4 464.1,-967.4 471.1,-967.4" />
+</g>
+
+<g id="node19" class="node">
+<title>export_review</title>
+<polygon fill="#e8f4f8" stroke="#2980b9" points="554,-862.8 381.2,-862.8 381.2,-823.2 554,-823.2 554,-862.8" />
+<text xml:space="preserve" text-anchor="middle" x="467.6" y="-845.5" font-family="Helvetica,sans-Serif" font-size="10.00">Export pending evaluation</text>
+<text xml:space="preserve" text-anchor="middle" x="467.6" y="-834.25" font-family="Helvetica,sans-Serif" font-size="10.00">→ review scratch</text>
+</g>
+
+<g id="edge23" class="edge">
+<title>review_eligible-&gt;export_review</title>
+<path fill="none" stroke="black" d="M467.6,-890.46C467.6,-885.06 467.6,-879.47 467.6,-874.1" />
+<polygon fill="black" stroke="black" points="471.1,-874.39 467.6,-864.39 464.1,-874.39 471.1,-874.39" />
+<text xml:space="preserve" text-anchor="middle" x="461.6" y="-878.03" font-family="Helvetica,sans-Serif" font-size="8.00">yes</text>
+</g>
+
+<g id="node22" class="node">
+<title>review_done</title>
+<polygon fill="#d5f5e3" stroke="#27ae60" points="532.4,-646 402.8,-646 402.8,-610 532.4,-610 532.4,-646" />
+<text xml:space="preserve" text-anchor="middle" x="467.6" y="-624.12" font-family="Helvetica,sans-Serif" font-size="10.00">Review stage done</text>
+</g>
+
+<g id="edge24" class="edge">
+<title>review_eligible-&gt;review_done</title>
+<path fill="none" stroke="black" d="M506.39,-909.19C525.48,-900.19 546.71,-886.37 557.7,-866.5 567.81,-848.22 557.7,-840.39 557.7,-819.5 557.7,-757.28 588.93,-733.32 557.7,-679.5 551.2,-668.29 541.23,-659.31 530.27,-652.2" />
+<polygon fill="black" stroke="black" points="532.14,-649.24 521.74,-647.19 528.59,-655.27 532.14,-649.24" />
+<text xml:space="preserve" text-anchor="middle" x="582.8" y="-787.73" font-family="Helvetica,sans-Serif" font-size="8.00">none eligible</text>
+</g>
+
+<g id="node20" class="node">
+<title>review_agent</title>
+<polygon fill="#d5f5e3" stroke="#27ae60" points="554,-792.8 381.2,-792.8 381.2,-753.2 554,-753.2 554,-792.8" />
+<text xml:space="preserve" text-anchor="middle" x="467.6" y="-774.75" font-family="Helvetica,sans-Serif" font-size="10.00">Review each finding</text>
+<text xml:space="preserve" text-anchor="middle" x="467.6" y="-763.5" font-family="Helvetica,sans-Serif" font-size="10.00">(keep, improve, amend, remove)</text>
+</g>
+
+<g id="edge25" class="edge">
+<title>export_review-&gt;review_agent</title>
+<path fill="none" stroke="black" d="M467.6,-822.75C467.6,-816.9 467.6,-810.37 467.6,-804.02" />
+<polygon fill="black" stroke="black" points="471.1,-804.47 467.6,-794.47 464.1,-804.47 471.1,-804.47" />
+</g>
+
+<g id="node21" class="node">
+<title>save_review</title>
+<polygon fill="#e8f4f8" stroke="#2980b9" points="554,-722.8 381.2,-722.8 381.2,-683.2 554,-683.2 554,-722.8" />
+<text xml:space="preserve" text-anchor="middle" x="467.6" y="-704.75" font-family="Helvetica,sans-Serif" font-size="10.00">Append Review Log</text>
+<text xml:space="preserve" text-anchor="middle" x="467.6" y="-693.5" font-family="Helvetica,sans-Serif" font-size="10.00">and save pending JSON</text>
+</g>
+
+<g id="edge26" class="edge">
+<title>review_agent-&gt;save_review</title>
+<path fill="none" stroke="black" d="M467.6,-752.75C467.6,-746.9 467.6,-740.37 467.6,-734.02" />
+<polygon fill="black" stroke="black" points="471.1,-734.47 467.6,-724.47 464.1,-734.47 471.1,-734.47" />
 </g>
 
 <g id="edge27" class="edge">
-<title>verify_fix-&gt;fix_ok</title>
-<path fill="none" stroke="black" d="M623.16,-446.43C614.91,-437.61 605.46,-427.5 596.85,-418.29" />
-<polygon fill="black" stroke="black" points="599.67,-416.17 590.28,-411.26 594.55,-420.96 599.67,-416.17" />
-<text xml:space="preserve" text-anchor="middle" x="592.86" y="-429.86" font-family="Helvetica,sans-Serif" font-size="8.00">build ok</text>
+<title>save_review-&gt;review_done</title>
+<path fill="none" stroke="black" d="M467.6,-682.9C467.6,-675.17 467.6,-666.18 467.6,-657.74" />
+<polygon fill="black" stroke="black" points="471.1,-657.87 467.6,-647.87 464.1,-657.87 471.1,-657.87" />
 </g>
 
 <g id="edge28" class="edge">
-<title>verify_fix-&gt;fix_fail</title>
-<path fill="none" stroke="black" d="M667.24,-446.43C675.49,-437.61 684.94,-427.5 693.55,-418.29" />
-<polygon fill="black" stroke="black" points="695.85,-420.96 700.12,-411.26 690.73,-416.17 695.85,-420.96" />
-<text xml:space="preserve" text-anchor="middle" x="662.29" y="-429.86" font-family="Helvetica,sans-Serif" font-size="8.00">build broken</text>
+<title>review_done-&gt;fix_enabled</title>
+<path fill="none" stroke="black" d="M513.07,-646.45C528.86,-654.66 545.62,-665.65 557.7,-679.5 666.99,-804.8 590.79,-898.99 697.5,-1026.5 708.38,-1039.5 723.04,-1050.44 737.38,-1059.13" />
+<polygon fill="black" stroke="black" points="735.48,-1062.07 745.89,-1064.03 738.97,-1056.01 735.48,-1062.07" />
+<text xml:space="preserve" text-anchor="middle" x="615.16" y="-856.8" font-family="Helvetica,sans-Serif" font-size="8.00">all done</text>
+</g>
+
+<g id="node24" class="node">
+<title>fix_foreach</title>
+<polygon fill="#e8f4f8" stroke="#2980b9" points="874,-1022.8 701.2,-1022.8 701.2,-983.2 874,-983.2 874,-1022.8" />
+<text xml:space="preserve" text-anchor="middle" x="787.6" y="-1004.75" font-family="Helvetica,sans-Serif" font-size="10.00">For each project with</text>
+<text xml:space="preserve" text-anchor="middle" x="787.6" y="-993.5" font-family="Helvetica,sans-Serif" font-size="10.00">pending eval findings</text>
 </g>
 
 <g id="edge29" class="edge">
-<title>fix_ok-&gt;report</title>
-<path fill="none" stroke="black" d="M547.49,-369.8C515.12,-341.24 456.02,-289.11 420.86,-258.11" />
-<polygon fill="black" stroke="black" points="423.42,-255.7 413.61,-251.71 418.79,-260.95 423.42,-255.7" />
+<title>fix_enabled-&gt;fix_foreach</title>
+<path fill="none" stroke="black" d="M787.6,-1050.46C787.6,-1045.06 787.6,-1039.47 787.6,-1034.1" />
+<polygon fill="black" stroke="black" points="791.1,-1034.39 787.6,-1024.39 784.1,-1034.39 791.1,-1034.39" />
+<text xml:space="preserve" text-anchor="middle" x="781.6" y="-1038.03" font-family="Helvetica,sans-Serif" font-size="8.00">yes</text>
+</g>
+
+<g id="node32" class="node">
+<title>fix_done</title>
+<polygon fill="#d5f5e3" stroke="#27ae60" points="852.4,-471 722.8,-471 722.8,-435 852.4,-435 852.4,-471" />
+<text xml:space="preserve" text-anchor="middle" x="787.6" y="-449.12" font-family="Helvetica,sans-Serif" font-size="10.00">Style-fix stage done</text>
 </g>
 
 <g id="edge30" class="edge">
-<title>fix_fail-&gt;report</title>
-<path fill="none" stroke="black" d="M677.84,-369.8C615.8,-340.06 500.42,-284.77 437.01,-254.38" />
-<polygon fill="black" stroke="black" points="438.81,-251.36 428.28,-250.2 435.79,-257.67 438.81,-251.36" />
+<title>fix_enabled-&gt;fix_done</title>
+<path fill="none" stroke="black" d="M832.02,-1066.41C849.52,-1057.44 867.78,-1044.43 877.7,-1026.5 893.06,-998.73 877.7,-986.83 877.7,-955.1 877.7,-793.23 967.79,-725.38 877.7,-590.9 855.34,-557.52 817.5,-589.16 794.1,-556.5 785.92,-545.08 785.3,-509.1 786.06,-482.77" />
+<polygon fill="black" stroke="black" points="789.55,-483.1 786.43,-472.98 782.55,-482.84 789.55,-483.1" />
+<text xml:space="preserve" text-anchor="middle" x="933.23" y="-764.13" font-family="Helvetica,sans-Serif" font-size="8.00">no: continue</text>
 </g>
 
-<g id="node26" class="node">
-<title>review</title>
-<polygon fill="#e8f4f8" stroke="#2980b9" points="478.8,-156 306,-156 306,-120 478.8,-120 478.8,-156" />
-<text xml:space="preserve" text-anchor="middle" x="392.4" y="-134.12" font-family="Helvetica,sans-Serif" font-size="10.00">/style_fix_review</text>
-</g>
-
-<g id="edge31" class="edge">
-<title>report-&gt;review</title>
-<path fill="none" stroke="black" stroke-dasharray="1,5" d="M392.4,-214.68C392.4,-201.28 392.4,-182.81 392.4,-167.36" />
-<polygon fill="black" stroke="black" points="395.9,-167.77 392.4,-157.77 388.9,-167.77 395.9,-167.77" />
-<text xml:space="preserve" text-anchor="middle" x="369.9" y="-195.6" font-family="Helvetica,sans-Serif" font-size="8.00">user reviews</text>
-<text xml:space="preserve" text-anchor="middle" x="369.9" y="-186.6" font-family="Helvetica,sans-Serif" font-size="8.00">next day</text>
-</g>
-
-<g id="node27" class="node">
-<title>merge</title>
-<polygon fill="#e8f4f8" stroke="#2980b9" points="478.8,-96 306,-96 306,-60 478.8,-60 478.8,-96" />
-<text xml:space="preserve" text-anchor="middle" x="392.4" y="-74.13" font-family="Helvetica,sans-Serif" font-size="10.00">/merge_branch</text>
+<g id="node25" class="node">
+<title>prechecks</title>
+<polygon fill="#e8f4f8" stroke="#2980b9" points="874,-951.4 701.2,-951.4 701.2,-904.6 874,-904.6 874,-951.4" />
+<text xml:space="preserve" text-anchor="middle" x="787.6" y="-935.37" font-family="Helvetica,sans-Serif" font-size="10.00">Prechecks:</text>
+<text xml:space="preserve" text-anchor="middle" x="787.6" y="-924.12" font-family="Helvetica,sans-Serif" font-size="10.00">- target _style_fix path is free</text>
+<text xml:space="preserve" text-anchor="middle" x="787.6" y="-912.87" font-family="Helvetica,sans-Serif" font-size="10.00">- source tree is clean</text>
 </g>
 
 <g id="edge32" class="edge">
-<title>review-&gt;merge</title>
-<path fill="none" stroke="black" stroke-dasharray="1,5" d="M392.4,-119.67C392.4,-115.83 392.4,-111.69 392.4,-107.56" />
-<polygon fill="black" stroke="black" points="395.9,-107.73 392.4,-97.73 388.9,-107.73 395.9,-107.73" />
+<title>fix_foreach-&gt;prechecks</title>
+<path fill="none" stroke="black" d="M787.6,-982.9C787.6,-976.79 787.6,-969.88 787.6,-963.08" />
+<polygon fill="black" stroke="black" points="791.1,-963.4 787.6,-953.4 784.1,-963.4 791.1,-963.4" />
 </g>
 
-<g id="node28" class="node">
-<title>delete_wt</title>
-<polygon fill="#e8f4f8" stroke="#2980b9" points="478.8,-36 306,-36 306,0 478.8,0 478.8,-36" />
-<text xml:space="preserve" text-anchor="middle" x="392.4" y="-14.12" font-family="Helvetica,sans-Serif" font-size="10.00">/worktree_delete</text>
+<g id="edge31" class="edge">
+<title>fix_foreach-&gt;fix_done</title>
+<path fill="none" stroke="black" d="M847.38,-982.91C859.44,-976.02 870.58,-966.94 877.7,-955.1 896.01,-924.62 877.7,-910.66 877.7,-875.1 877.7,-748.79 948,-695.84 877.7,-590.9 855.34,-557.52 817.5,-589.16 794.1,-556.5 785.92,-545.08 785.3,-509.1 786.06,-482.77" />
+<polygon fill="black" stroke="black" points="789.55,-483.1 786.43,-472.98 782.55,-482.84 789.55,-483.1" />
+<text xml:space="preserve" text-anchor="middle" x="926.19" y="-726.38" font-family="Helvetica,sans-Serif" font-size="8.00">none eligible</text>
+</g>
+
+<g id="node26" class="node">
+<title>create_wt</title>
+<polygon fill="#e8f4f8" stroke="#2980b9" points="874,-871.4 701.2,-871.4 701.2,-824.6 874,-824.6 874,-871.4" />
+<text xml:space="preserve" text-anchor="middle" x="787.6" y="-855.37" font-family="Helvetica,sans-Serif" font-size="10.00">git worktree add</text>
+<text xml:space="preserve" text-anchor="middle" x="787.6" y="-844.12" font-family="Helvetica,sans-Serif" font-size="10.00">-b refactor/style</text>
+<text xml:space="preserve" text-anchor="middle" x="787.6" y="-832.87" font-family="Helvetica,sans-Serif" font-size="10.00">{project}_style_fix</text>
 </g>
 
 <g id="edge33" class="edge">
-<title>merge-&gt;delete_wt</title>
-<path fill="none" stroke="black" stroke-dasharray="1,5" d="M392.4,-59.67C392.4,-55.83 392.4,-51.69 392.4,-47.56" />
-<polygon fill="black" stroke="black" points="395.9,-47.73 392.4,-37.73 388.9,-47.73 395.9,-47.73" />
+<title>prechecks-&gt;create_wt</title>
+<path fill="none" stroke="black" d="M787.6,-904.43C787.6,-897.74 787.6,-890.3 787.6,-883.08" />
+<polygon fill="black" stroke="black" points="791.1,-883.19 787.6,-873.19 784.1,-883.19 791.1,-883.19" />
 </g>
-<text x="-10.0" y="-883.4" font-family="Helvetica,sans-Serif" font-size="9" fill="#7f8c8d">Phase 1: Clean + Rebuild</text><text x="222.3" y="-883.4" font-family="Helvetica,sans-Serif" font-size="9" fill="#7f8c8d">Phase 2: Style Evaluation</text><text x="495.6" y="-883.4" font-family="Helvetica,sans-Serif" font-size="9" fill="#7f8c8d">Phase 3: Style-Fix Worktrees</text><text x="296.0" y="-188.0" font-family="Helvetica,sans-Serif" font-size="9" fill="#7f8c8d">Post-Clean-fix (Manual)</text></g>
+
+<g id="node27" class="node">
+<title>mv_eval</title>
+<polygon fill="#e8f4f8" stroke="#2980b9" points="874,-792.8 701.2,-792.8 701.2,-753.2 874,-753.2 874,-792.8" />
+<text xml:space="preserve" text-anchor="middle" x="787.6" y="-775.5" font-family="Helvetica,sans-Serif" font-size="10.00">export pending markdown</text>
+<text xml:space="preserve" text-anchor="middle" x="787.6" y="-764.25" font-family="Helvetica,sans-Serif" font-size="10.00">→ scratch evaluation</text>
+</g>
+
+<g id="edge34" class="edge">
+<title>create_wt-&gt;mv_eval</title>
+<path fill="none" stroke="black" d="M787.6,-824.27C787.6,-818.05 787.6,-811.24 787.6,-804.67" />
+<polygon fill="black" stroke="black" points="791.1,-804.81 787.6,-794.81 784.1,-804.81 791.1,-804.81" />
+</g>
+
+<g id="node28" class="node">
+<title>claude_fix</title>
+<polygon fill="#d5f5e3" stroke="#27ae60" points="874,-726.4 701.2,-726.4 701.2,-679.6 874,-679.6 874,-726.4" />
+<text xml:space="preserve" text-anchor="middle" x="787.6" y="-710.38" font-family="Helvetica,sans-Serif" font-size="10.00">Pass 1 (apply): launch agent</text>
+<text xml:space="preserve" text-anchor="middle" x="787.6" y="-699.12" font-family="Helvetica,sans-Serif" font-size="10.00">(fixes, cargo mend, clippy,</text>
+<text xml:space="preserve" text-anchor="middle" x="787.6" y="-687.88" font-family="Helvetica,sans-Serif" font-size="10.00">tests, style review)</text>
+</g>
+
+<g id="edge35" class="edge">
+<title>mv_eval-&gt;claude_fix</title>
+<path fill="none" stroke="black" d="M787.6,-752.75C787.6,-748.17 787.6,-743.16 787.6,-738.16" />
+<polygon fill="black" stroke="black" points="791.1,-738.17 787.6,-728.17 784.1,-738.17 791.1,-738.17" />
+</g>
+
+<g id="node29" class="node">
+<title>verify_fix</title>
+<polygon fill="#d5f5e3" stroke="#27ae60" points="874,-641.4 701.2,-641.4 701.2,-594.6 874,-594.6 874,-641.4" />
+<text xml:space="preserve" text-anchor="middle" x="787.6" y="-625.38" font-family="Helvetica,sans-Serif" font-size="10.00">Pass 2 (verify): same agent</text>
+<text xml:space="preserve" text-anchor="middle" x="787.6" y="-614.12" font-family="Helvetica,sans-Serif" font-size="10.00">re-checks fix vs Fix Summary,</text>
+<text xml:space="preserve" text-anchor="middle" x="787.6" y="-602.88" font-family="Helvetica,sans-Serif" font-size="10.00">corrects + updates summary</text>
+</g>
+
+<g id="edge36" class="edge">
+<title>claude_fix-&gt;verify_fix</title>
+<path fill="none" stroke="black" d="M787.6,-679.32C787.6,-671.19 787.6,-661.91 787.6,-653.08" />
+<polygon fill="black" stroke="black" points="791.1,-653.36 787.6,-643.36 784.1,-653.36 791.1,-653.36" />
+<text xml:space="preserve" text-anchor="middle" x="763.97" y="-662" font-family="Helvetica,sans-Serif" font-size="8.00">Fix Summary</text>
+</g>
+
+<g id="node31" class="node">
+<title>fix_fail</title>
+<polygon fill="#fadbd8" stroke="#e74c3c" points="927.4,-552.8 797.8,-552.8 797.8,-513.2 927.4,-513.2 927.4,-552.8" />
+<text xml:space="preserve" text-anchor="middle" x="862.6" y="-534.75" font-family="Helvetica,sans-Serif" font-size="10.00">Failure: finalize</text>
+<text xml:space="preserve" text-anchor="middle" x="862.6" y="-523.5" font-family="Helvetica,sans-Serif" font-size="10.00">or keep pending</text>
+</g>
+
+<g id="edge37" class="edge">
+<title>claude_fix-&gt;fix_fail</title>
+<path fill="none" stroke="black" d="M843.42,-679.18C857.06,-670.53 869.95,-659.3 877.7,-645.1 891.43,-619.95 884.61,-587.06 876.2,-563.42" />
+<polygon fill="black" stroke="black" points="879.57,-562.43 872.7,-554.36 873.04,-564.95 879.57,-562.43" />
+<text xml:space="preserve" text-anchor="middle" x="909.62" y="-628.85" font-family="Helvetica,sans-Serif" font-size="8.00">no summary /</text>
+<text xml:space="preserve" text-anchor="middle" x="909.62" y="-619.85" font-family="Helvetica,sans-Serif" font-size="8.00">timeout</text>
+</g>
+
+<g id="node30" class="node">
+<title>fix_ok</title>
+<polygon fill="#d5f5e3" stroke="#27ae60" points="777.4,-552.8 647.8,-552.8 647.8,-513.2 777.4,-513.2 777.4,-552.8" />
+<text xml:space="preserve" text-anchor="middle" x="712.6" y="-534.75" font-family="Helvetica,sans-Serif" font-size="10.00">Worktree ready</text>
+<text xml:space="preserve" text-anchor="middle" x="712.6" y="-523.5" font-family="Helvetica,sans-Serif" font-size="10.00">for review</text>
+</g>
+
+<g id="edge38" class="edge">
+<title>verify_fix-&gt;fix_ok</title>
+<path fill="none" stroke="black" d="M766.71,-594.32C757.77,-584.19 747.25,-572.27 737.88,-561.65" />
+<polygon fill="black" stroke="black" points="740.57,-559.41 731.33,-554.23 735.33,-564.05 740.57,-559.41" />
+<text xml:space="preserve" text-anchor="middle" x="734.8" y="-574.86" font-family="Helvetica,sans-Serif" font-size="8.00">build ok</text>
+</g>
+
+<g id="edge39" class="edge">
+<title>verify_fix-&gt;fix_fail</title>
+<path fill="none" stroke="black" d="M808.49,-594.32C817.43,-584.19 827.95,-572.27 837.32,-561.65" />
+<polygon fill="black" stroke="black" points="839.87,-564.05 843.87,-554.23 834.63,-559.41 839.87,-564.05" />
+<text xml:space="preserve" text-anchor="middle" x="805.15" y="-574.86" font-family="Helvetica,sans-Serif" font-size="8.00">build broken</text>
+</g>
+
+<g id="edge40" class="edge">
+<title>fix_ok-&gt;fix_done</title>
+<path fill="none" stroke="black" d="M731.53,-512.81C740.98,-502.73 752.53,-490.41 762.69,-479.57" />
+<polygon fill="black" stroke="black" points="765.15,-482.06 769.44,-472.37 760.05,-477.27 765.15,-482.06" />
+</g>
+
+<g id="edge41" class="edge">
+<title>fix_fail-&gt;fix_done</title>
+<path fill="none" stroke="black" d="M843.67,-512.81C834.22,-502.73 822.67,-490.41 812.51,-479.57" />
+<polygon fill="black" stroke="black" points="815.15,-477.27 805.76,-472.37 810.05,-482.06 815.15,-477.27" />
+</g>
+
+<g id="node33" class="node">
+<title>activity_gate</title>
+<polygon fill="#fef9e7" stroke="#f39c12" points="467.6,-390.4 385.33,-358 467.6,-325.6 549.87,-358 467.6,-390.4" />
+<text xml:space="preserve" text-anchor="middle" x="467.6" y="-359.75" font-family="Helvetica,sans-Serif" font-size="10.00">run log has</text>
+<text xml:space="preserve" text-anchor="middle" x="467.6" y="-348.5" font-family="Helvetica,sans-Serif" font-size="10.00">project result lines?</text>
+</g>
+
+<g id="edge42" class="edge">
+<title>fix_done-&gt;activity_gate</title>
+<path fill="none" stroke="black" d="M725.52,-434.57C667.76,-417.42 582.33,-392.06 525.83,-375.29" />
+<polygon fill="black" stroke="black" points="526.97,-371.97 516.39,-372.48 524.98,-378.69 526.97,-371.97" />
+</g>
+
+<g id="node34" class="node">
+<title>report</title>
+<ellipse fill="#f0e6ff" stroke="#8e44ad" cx="467.6" cy="-258" rx="79.2" ry="18" />
+<text xml:space="preserve" text-anchor="middle" x="467.6" y="-254.12" font-family="Helvetica,sans-Serif" font-size="10.00">Generate Clean-fix Report</text>
+</g>
+
+<g id="edge43" class="edge">
+<title>activity_gate-&gt;report</title>
+<path fill="none" stroke="black" d="M467.6,-325.26C467.6,-313.17 467.6,-299.54 467.6,-287.73" />
+<polygon fill="black" stroke="black" points="471.1,-287.74 467.6,-277.74 464.1,-287.74 471.1,-287.74" />
+<text xml:space="preserve" text-anchor="middle" x="461.6" y="-302.41" font-family="Helvetica,sans-Serif" font-size="8.00">yes</text>
+</g>
+
+<g id="node35" class="node">
+<title>report_idle</title>
+<polygon fill="#e8f4f8" stroke="#2980b9" points="852.4,-277.8 722.8,-277.8 722.8,-238.2 852.4,-238.2 852.4,-277.8" />
+<text xml:space="preserve" text-anchor="middle" x="787.6" y="-259.75" font-family="Helvetica,sans-Serif" font-size="10.00">Skip report</text>
+<text xml:space="preserve" text-anchor="middle" x="787.6" y="-248.5" font-family="Helvetica,sans-Serif" font-size="10.00">(no activity this run)</text>
+</g>
+
+<g id="edge44" class="edge">
+<title>activity_gate-&gt;report_idle</title>
+<path fill="none" stroke="black" d="M514.13,-343.46C565.97,-327.26 650.54,-300.83 711.93,-281.65" />
+<polygon fill="black" stroke="black" points="712.78,-285.05 721.28,-278.73 710.69,-278.37 712.78,-285.05" />
+<text xml:space="preserve" text-anchor="middle" x="614.07" y="-312.22" font-family="Helvetica,sans-Serif" font-size="8.00">no</text>
+</g>
+
+<g id="node36" class="node">
+<title>review</title>
+<polygon fill="#e8f4f8" stroke="#2980b9" points="554,-156 381.2,-156 381.2,-120 554,-120 554,-156" />
+<text xml:space="preserve" text-anchor="middle" x="467.6" y="-134.12" font-family="Helvetica,sans-Serif" font-size="10.00">/style_fix_review</text>
+</g>
+
+<g id="edge45" class="edge">
+<title>report-&gt;review</title>
+<path fill="none" stroke="black" stroke-dasharray="1,5" d="M467.6,-239.51C467.6,-220.34 467.6,-190.08 467.6,-167.58" />
+<polygon fill="black" stroke="black" points="471.1,-167.82 467.6,-157.82 464.1,-167.82 471.1,-167.82" />
+<text xml:space="preserve" text-anchor="middle" x="445.1" y="-208.58" font-family="Helvetica,sans-Serif" font-size="8.00">user reviews</text>
+<text xml:space="preserve" text-anchor="middle" x="445.1" y="-199.58" font-family="Helvetica,sans-Serif" font-size="8.00">next day</text>
+</g>
+
+<g id="node37" class="node">
+<title>merge</title>
+<polygon fill="#e8f4f8" stroke="#2980b9" points="554,-96 381.2,-96 381.2,-60 554,-60 554,-96" />
+<text xml:space="preserve" text-anchor="middle" x="467.6" y="-74.12" font-family="Helvetica,sans-Serif" font-size="10.00">/merge_branch</text>
+</g>
+
+<g id="edge46" class="edge">
+<title>review-&gt;merge</title>
+<path fill="none" stroke="black" stroke-dasharray="1,5" d="M467.6,-119.67C467.6,-115.83 467.6,-111.69 467.6,-107.56" />
+<polygon fill="black" stroke="black" points="471.1,-107.73 467.6,-97.73 464.1,-107.73 471.1,-107.73" />
+</g>
+
+<g id="node38" class="node">
+<title>delete_wt</title>
+<polygon fill="#e8f4f8" stroke="#2980b9" points="554,-36 381.2,-36 381.2,0 554,0 554,-36" />
+<text xml:space="preserve" text-anchor="middle" x="467.6" y="-14.12" font-family="Helvetica,sans-Serif" font-size="10.00">/worktree_delete</text>
+</g>
+
+<g id="edge47" class="edge">
+<title>merge-&gt;delete_wt</title>
+<path fill="none" stroke="black" stroke-dasharray="1,5" d="M467.6,-59.67C467.6,-55.83 467.6,-51.69 467.6,-47.56" />
+<polygon fill="black" stroke="black" points="471.1,-47.73 467.6,-37.73 464.1,-47.73 471.1,-47.73" />
+</g>
+<text x="-10.0" y="-1147.4" font-family="Helvetica,sans-Serif" font-size="9" fill="#7f8c8d">Phase 1: Style Evaluation</text><text x="346.9" y="-1147.4" font-family="Helvetica,sans-Serif" font-size="9" fill="#7f8c8d">Phase 2: Evaluation Review</text><text x="637.8" y="-1147.4" font-family="Helvetica,sans-Serif" font-size="9" fill="#7f8c8d">Phase 3: Style-Fix Worktrees</text><text x="371.2" y="-188.0" font-family="Helvetica,sans-Serif" font-size="9" fill="#7f8c8d">Post-Clean-fix (Manual)</text></g>
 </svg>
