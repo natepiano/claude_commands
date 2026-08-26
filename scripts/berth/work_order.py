@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Parse, validate, resolve, and compare cargo-berth Work Orders.
+"""Parse and validate cargo-berth Work Order structure.
 
 The module is intentionally independent of the cargo-berth ledger.  Work Order
 authors and readers share this one lexical contract instead of teaching plan
@@ -12,94 +12,50 @@ import argparse
 import json
 import os
 import re
-import subprocess
 import sys
+from collections.abc import Iterable
 from dataclasses import dataclass
-from enum import Enum
 from pathlib import Path
-from typing import Iterable
 
 
 CONTRACT = "cargo-berth-work-order/v1"
 FIELD_HEADING = re.compile(
     r"^\*\*(?P<label>[^*\n]+):\*\*(?P<inline>.*)$", re.MULTILINE
 )
+PENDING_DECISION_HEADING = re.compile(
+    r"^\*\*Pending decision:\s*(?P<subject>[^*\n]+)\*\*\s*$", re.MULTILINE
+)
 WORK_ORDER_HEADING = re.compile(r"^#### Work Order\s*$", re.MULTILINE)
 PHASE_HEADING = re.compile(r"^### Phase\s+(?P<identifier>\d+)\b(?P<title>.*)$", re.MULTILINE)
-RESERVATION_LINE = re.compile(r"^- (file|tree): `([^`]+)`$")
+SECTION_HEADING = re.compile(r"^## ", re.MULTILINE)
 CODE_SPAN = re.compile(r"`([^`]+)`")
 LINE_REFERENCE = re.compile(r"(?::\d+(?:-\d+)?|#L\d+(?:-L\d+)?)$")
 WINDOWS_DRIVE = re.compile(r"^[A-Za-z]:/")
-
-
-class ReservationCoverageMode(Enum):
-    """Whether a caller permits or rejects a missing declaration."""
-
-    ADVISORY = "advisory"
-    REQUIRED = "required"
-
-    def tagged(self) -> dict[str, str]:
-        return {"kind": self.value}
-
-
-class ScopeKind(Enum):
-    """The path relationship promised by one reservation scope."""
-
-    FILE = "file"
-    TREE = "tree"
-
-
-@dataclass(frozen=True)
-class ReservationScope:
-    """One validated lexical reservation scope."""
-
-    kind: ScopeKind
-    path: str
-
-    def tagged(self) -> dict[str, str]:
-        return {"kind": self.kind.value, "path": self.path}
-
-    def argument(self) -> str:
-        return f"{self.kind.value}:{self.path}"
-
-
-@dataclass(frozen=True)
-class DeclaredReservationDeclaration:
-    """A present, non-empty, validated Reservations block."""
-
-    scopes: tuple[ReservationScope, ...]
-
-    def tagged(self) -> dict[str, object]:
-        return {
-            "kind": "declared",
-            "scopes": [scope.tagged() for scope in self.scopes],
-        }
-
-
-@dataclass(frozen=True)
-class MissingReservationDeclaration:
-    """A Work Order with no Reservations heading."""
-
-    def tagged(self) -> dict[str, str]:
-        return {"kind": "missing"}
-
-
-ReservationDeclaration = DeclaredReservationDeclaration | MissingReservationDeclaration
+SHELL_VARIABLE = re.compile(r"\$(?:[A-Za-z_][A-Za-z0-9_]*|\{[A-Za-z_][A-Za-z0-9_]*\})")
+WORK_ORDER_FIELD_LABELS = frozenset(
+    {
+        "Goal",
+        "Spec",
+        "Files",
+        "Acceptance gate",
+        "Constraints from prior phases",
+        "Pending decision",
+        "Style",
+        "Binds later work",
+        "Gotchas",
+        "Ruled out",
+    }
+)
 
 
 @dataclass(frozen=True)
 class WorkOrderFile:
-    """One expanded path named by Files and its reservation obligation."""
+    """One validated expanded path named by Files."""
 
     path: str
-    coverage: str
-
-    @property
-    def requires_reservation(self) -> bool:
-        return self.coverage == "implementation"
 
     def tagged(self) -> dict[str, str]:
-        return {"path": self.path, "coverage": self.coverage}
+        return {"path": self.path}
 
 
 @dataclass(frozen=True)
@@ -111,7 +67,6 @@ class ValidatedWorkOrder:
     goal: str
     specification: str
     files: tuple[WorkOrderFile, ...]
-    declaration: ReservationDeclaration
 
     def tagged(self) -> dict[str, object]:
         return {
@@ -120,7 +75,6 @@ class ValidatedWorkOrder:
             "goal": self.goal,
             "specification": self.specification,
             "files": [entry.tagged() for entry in self.files],
-            "reservation_declaration": self.declaration.tagged(),
         }
 
 
@@ -131,6 +85,16 @@ class WorkOrderSource:
     phase: str
     phase_heading: str
     markdown: str
+
+
+@dataclass(frozen=True)
+class WorkOrderFieldBoundary:
+    """One Markdown field boundary within a Work Order."""
+
+    start: int
+    end: int
+    label: str
+    inline: str
 
 
 @dataclass(frozen=True)
@@ -152,7 +116,7 @@ class WorkOrderValidationError(Exception):
     """One or more deterministic Work Order contract violations."""
 
     def __init__(self, errors: Iterable[str]):
-        self.errors = tuple(errors)
+        self.errors: tuple[str, ...] = tuple(errors)
         super().__init__("; ".join(self.errors))
 
 
@@ -173,10 +137,18 @@ def _invalid(operation: str, errors: Iterable[str]) -> int:
 
 def _lexical_components(path: str, context: str) -> tuple[str, ...]:
     errors: list[str] = []
-    if not isinstance(path, str) or not path:
+    if not path:
         errors.append(f"{context}: path must be a non-empty string")
     elif "\\" in path:
         errors.append(f"{context}: path must use '/' separators: {path!r}")
+    elif path.split("/", maxsplit=1)[0].startswith("~"):
+        errors.append(
+            f"{context}: home-relative path rule rejects a first component beginning with '~': {path!r}"
+        )
+    elif SHELL_VARIABLE.search(path):
+        errors.append(
+            f"{context}: shell-variable path rule rejects $NAME and ${{NAME}} references: {path!r}"
+        )
     elif path.startswith("/") or WINDOWS_DRIVE.match(path):
         errors.append(f"{context}: path must be repository-relative: {path!r}")
     elif "{" in path or "}" in path:
@@ -200,73 +172,8 @@ def _lexical_components(path: str, context: str) -> tuple[str, ...]:
 def validate_lexical_path(path: str, context: str) -> str:
     """Return an unchanged valid repository-relative path."""
 
-    _lexical_components(path, context)
+    _ = _lexical_components(path, context)
     return path
-
-
-def _folded_components(path: str, ignore_case: bool) -> tuple[str, ...]:
-    components = _lexical_components(path, "scope comparison")
-    if ignore_case:
-        # Match Rust `str::to_lowercase`, which is the engine's component rule.
-        return tuple(component.lower() for component in components)
-    return components
-
-
-def _is_component_ancestor(parent: tuple[str, ...], child: tuple[str, ...]) -> bool:
-    return len(parent) <= len(child) and child[: len(parent)] == parent
-
-
-def scope_contains(
-    container: ReservationScope, contained: ReservationScope, ignore_case: bool
-) -> bool:
-    """Whether every path in ``contained`` is covered by ``container``."""
-
-    container_path = _folded_components(container.path, ignore_case)
-    contained_path = _folded_components(contained.path, ignore_case)
-    if container.kind is ScopeKind.FILE:
-        return container_path == contained_path and contained.kind is ScopeKind.FILE
-    return _is_component_ancestor(container_path, contained_path)
-
-
-def scopes_overlap(
-    left: ReservationScope, right: ReservationScope, ignore_case: bool
-) -> bool:
-    """Whether the two file/tree scope sets share at least one lexical path."""
-
-    left_path = _folded_components(left.path, ignore_case)
-    right_path = _folded_components(right.path, ignore_case)
-    if left_path == right_path:
-        return True
-    if left.kind is ScopeKind.TREE and _is_component_ancestor(left_path, right_path):
-        return True
-    return right.kind is ScopeKind.TREE and _is_component_ancestor(right_path, left_path)
-
-
-def _path_covered_by_scope(path: str, scope: ReservationScope, ignore_case: bool) -> bool:
-    path_components = _folded_components(path, ignore_case)
-    scope_components = _folded_components(scope.path, ignore_case)
-    if scope.kind is ScopeKind.FILE:
-        return path_components == scope_components
-    return _is_component_ancestor(scope_components, path_components)
-
-
-def _validate_minimal_antichain(
-    scopes: tuple[ReservationScope, ...], ignore_case: bool, context: str
-) -> list[str]:
-    errors: list[str] = []
-    for index, left in enumerate(scopes):
-        for right in scopes[index + 1 :]:
-            if scope_contains(left, right, ignore_case):
-                errors.append(
-                    f"{context}: {right.kind.value}:{right.path} is duplicate or contained by "
-                    f"{left.kind.value}:{left.path}"
-                )
-            elif scope_contains(right, left, ignore_case):
-                errors.append(
-                    f"{context}: {left.kind.value}:{left.path} is duplicate or contained by "
-                    f"{right.kind.value}:{right.path}"
-                )
-    return errors
 
 
 def _expand_braces(expression: str) -> tuple[str, ...]:
@@ -307,7 +214,9 @@ def _bounded_work_orders(document: str) -> tuple[WorkOrderSource, ...]:
         next_work_order = headings[index + 1].start() if index + 1 < len(headings) else len(document)
         next_phase_match = PHASE_HEADING.search(document, heading.end())
         next_phase = next_phase_match.start() if next_phase_match else len(document)
-        end = min(next_work_order, next_phase)
+        next_section_match = SECTION_HEADING.search(document, heading.end())
+        next_section = next_section_match.start() if next_section_match else len(document)
+        end = min(next_work_order, next_phase, next_section)
         phase, phase_heading = _phase_for_offset(document, heading.start())
         sources.append(
             WorkOrderSource(
@@ -350,14 +259,50 @@ def _select_work_orders(
     return selected
 
 
+def _field_boundaries(markdown: str) -> tuple[WorkOrderFieldBoundary, ...]:
+    headings = [
+        WorkOrderFieldBoundary(
+            start=match.start(),
+            end=match.end(),
+            label=match.group("label").strip(),
+            inline=match.group("inline"),
+        )
+        for match in FIELD_HEADING.finditer(markdown)
+        if not _inside_fenced_code(markdown, match.start())
+    ]
+    headings.extend(
+        WorkOrderFieldBoundary(
+            start=match.start(),
+            end=match.end(),
+            label="Pending decision",
+            inline=match.group("subject"),
+        )
+        for match in PENDING_DECISION_HEADING.finditer(markdown)
+        if not _inside_fenced_code(markdown, match.start())
+    )
+    headings.sort(key=lambda heading: heading.start)
+    return tuple(headings)
+
+
+def _inside_fenced_code(markdown: str, offset: int) -> bool:
+    fence_count = sum(
+        1
+        for line in markdown[:offset].splitlines()
+        if line.lstrip().startswith("```")
+    )
+    return fence_count % 2 == 1
+
+
 def _field_sections(markdown: str) -> dict[str, str]:
-    matches = list(FIELD_HEADING.finditer(markdown))
+    matches = _field_boundaries(markdown)
     sections: dict[str, str] = {}
     duplicates: list[str] = []
     for index, match in enumerate(matches):
-        label = match.group("label").strip()
-        end = matches[index + 1].start() if index + 1 < len(matches) else len(markdown)
-        content = (match.group("inline") + markdown[match.end() : end]).strip()
+        label = match.label
+        end = matches[index + 1].start if index + 1 < len(matches) else len(markdown)
+        content = (match.inline + markdown[match.end : end]).strip()
+        if label not in WORK_ORDER_FIELD_LABELS:
+            continue
         if label in sections:
             duplicates.append(label)
         else:
@@ -369,20 +314,92 @@ def _field_sections(markdown: str) -> dict[str, str]:
     return sections
 
 
-def _file_entries(files_content: str) -> tuple[WorkOrderFile, ...]:
-    bullet_lines = [line for line in files_content.splitlines() if line.startswith("- ")]
-    candidates = bullet_lines if bullet_lines else [files_content]
-    entries: list[WorkOrderFile] = []
+def _logical_file_entries(files_content: str) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    candidates: list[str] = []
     errors: list[str] = []
+    current: list[str] = []
+    for line_number, line in enumerate(files_content.splitlines(), start=1):
+        if line.startswith("- `"):
+            if current:
+                candidates.append(" ".join(current))
+            current = [line]
+        elif line.startswith("- **") and current:
+            current.append(line)
+        elif line.startswith("- "):
+            if current:
+                candidates.append(" ".join(current))
+            current = [line]
+        elif not line.strip():
+            continue
+        elif current:
+            current.append(line.strip())
+        else:
+            errors.append(
+                f"Files: line {line_number} is neither a '- ' bullet nor an indented continuation: {line!r}"
+            )
+    if current:
+        candidates.append(" ".join(current))
+    if not candidates and not errors:
+        errors.append("Files: section must contain at least one '- ' bullet")
+    return tuple(candidates), tuple(errors)
+
+
+def _absolute_path_components(path: str, context: str) -> tuple[str, ...]:
+    errors: list[str] = []
+    if "\\" in path:
+        errors.append(f"{context}: absolute path must use '/' separators: {path!r}")
+    if SHELL_VARIABLE.search(path):
+        errors.append(
+            f"{context}: shell-variable path rule rejects $NAME and ${{NAME}} references: {path!r}"
+        )
+    if "{" in path or "}" in path:
+        errors.append(f"{context}: brace expressions must be expanded: {path!r}")
+    if "\x00" in path or "\n" in path or "\r" in path:
+        errors.append(f"{context}: path contains a forbidden control character")
+    without_one_trailing_slash = path[:-1] if path.endswith("/") else path
+    components = tuple(without_one_trailing_slash.split("/")[1:])
+    if not components or any(component == "" for component in components):
+        errors.append(f"{context}: absolute path has an empty component: {path!r}")
+    if any(component in {".", ".."} for component in components):
+        errors.append(f"{context}: absolute path has a '.' or '..' component: {path!r}")
+    if any(component.casefold() == ".git" for component in components):
+        errors.append(f"{context}: path may not enter .git: {path!r}")
+    if errors:
+        raise WorkOrderValidationError(errors)
+    return components
+
+
+def _work_order_file(
+    expression: str,
+    repository_root: Path,
+) -> WorkOrderFile:
+    explicit_directory = expression.endswith("/")
+    path_without_trailing_slash = expression[:-1] if explicit_directory else expression
+    if path_without_trailing_slash.startswith("~/"):
+        path_without_trailing_slash = (
+            Path.home() / path_without_trailing_slash.removeprefix("~/")
+        ).as_posix()
+    if path_without_trailing_slash.startswith("/"):
+        absolute_expression = path_without_trailing_slash + ("/" if explicit_directory else "")
+        _ = _absolute_path_components(absolute_expression, "Files")
+        absolute = Path(path_without_trailing_slash)
+        try:
+            relative = absolute.relative_to(repository_root).as_posix()
+        except ValueError:
+            return WorkOrderFile(path=absolute.as_posix())
+        path = validate_lexical_path(relative, "Files")
+    else:
+        path = validate_lexical_path(path_without_trailing_slash, "Files")
+    return WorkOrderFile(path=path)
+
+
+def _file_entries(files_content: str, repository_root: Path) -> tuple[WorkOrderFile, ...]:
+    candidates, logical_errors = _logical_file_entries(files_content)
+    entries: list[WorkOrderFile] = []
+    errors = list(logical_errors)
     for candidate in candidates:
         path_side = re.split(r"\s+[—–]\s+", candidate, maxsplit=1)[0]
-        description = candidate[len(path_side) :].casefold()
-        coverage = (
-            "verify_only"
-            if "verify-only" in description or "verify only" in description
-            else "implementation"
-        )
-        spans = CODE_SPAN.findall(path_side)
+        spans = [match.group(1) for match in CODE_SPAN.finditer(path_side)]
         if not spans:
             errors.append(f"Files: entry has no backticked path: {candidate.strip()!r}")
             continue
@@ -392,19 +409,18 @@ def _file_entries(files_content: str) -> tuple[WorkOrderFile, ...]:
         if residual:
             errors.append(
                 "Files: every path expression must be fully backticked; "
-                f"unexpected text {residual!r} in {candidate.strip()!r}"
+                + f"unexpected text {residual!r} in {candidate.strip()!r}"
             )
             continue
         for span in spans:
             expression = LINE_REFERENCE.sub("", span.strip())
             try:
                 for expanded in _expand_braces(expression):
-                    path = validate_lexical_path(expanded, "Files")
-                    entries.append(WorkOrderFile(path=path, coverage=coverage))
+                    entries.append(_work_order_file(expanded, repository_root))
             except WorkOrderValidationError as error:
                 errors.extend(error.errors)
     if not entries and not errors:
-        errors.append("Files: section must name at least one backticked repository-relative path")
+        errors.append("Files: section must name at least one backticked path")
     seen: set[str] = set()
     for entry in entries:
         if entry.path in seen:
@@ -415,80 +431,11 @@ def _file_entries(files_content: str) -> tuple[WorkOrderFile, ...]:
     return tuple(entries)
 
 
-def _reservation_declaration(
-    sections: dict[str, str], coverage: ReservationCoverageMode, ignore_case: bool
-) -> ReservationDeclaration:
-    if "Reservations" not in sections:
-        if coverage is ReservationCoverageMode.REQUIRED:
-            raise WorkOrderValidationError(
-                ["Reservations: declaration is missing while coverage is required"]
-            )
-        return MissingReservationDeclaration()
-    content = sections["Reservations"]
-    if not content:
-        raise WorkOrderValidationError(
-            ["Reservations: a present declaration must contain at least one scope"]
-        )
-    scopes: list[ReservationScope] = []
-    errors: list[str] = []
-    for line in content.splitlines():
-        if not line.strip():
-            continue
-        match = RESERVATION_LINE.fullmatch(line)
-        if not match:
-            errors.append(f"Reservations: malformed line {line!r}")
-            continue
-        kind = ScopeKind(match.group(1))
-        path = match.group(2)
-        try:
-            scopes.append(
-                ReservationScope(kind=kind, path=validate_lexical_path(path, "Reservations"))
-            )
-        except WorkOrderValidationError as error:
-            errors.extend(error.errors)
-    if not scopes and not errors:
-        errors.append("Reservations: declaration must contain at least one scope")
-    scope_tuple = tuple(scopes)
-    errors.extend(_validate_minimal_antichain(scope_tuple, ignore_case, "Reservations"))
-    if errors:
-        raise WorkOrderValidationError(errors)
-    return DeclaredReservationDeclaration(scope_tuple)
-
-
-def _validate_file_coverage(
-    files: tuple[WorkOrderFile, ...],
-    declaration: ReservationDeclaration,
-    ignore_case: bool,
-) -> list[str]:
-    if isinstance(declaration, MissingReservationDeclaration):
-        return []
-    errors: list[str] = []
-    implementation_paths = tuple(entry.path for entry in files if entry.requires_reservation)
-    for path in implementation_paths:
-        if not any(
-            _path_covered_by_scope(path, scope, ignore_case)
-            for scope in declaration.scopes
-        ):
-            errors.append(
-                f"Files: implementation path {path!r} is not covered by Reservations"
-            )
-    for scope in declaration.scopes:
-        if not any(
-            _path_covered_by_scope(path, scope, ignore_case)
-            for path in implementation_paths
-        ):
-            errors.append(
-                f"Reservations: {scope.kind.value}:{scope.path} covers no implementation path in Files"
-            )
-    return errors
-
-
 def validate_work_order(
     source: WorkOrderSource,
-    coverage: ReservationCoverageMode,
-    ignore_case: bool,
+    repository_root: Path,
 ) -> ValidatedWorkOrder:
-    """Validate one complete Work Order, including Files/Reservations agreement."""
+    """Validate one complete Work Order's Goal, Spec, and Files structure."""
 
     try:
         sections = _field_sections(source.markdown)
@@ -504,40 +451,18 @@ def validate_work_order(
         raise WorkOrderValidationError(errors)
 
     try:
-        files = _file_entries(sections["Files"])
-        declaration = _reservation_declaration(sections, coverage, ignore_case)
+        files = _file_entries(sections["Files"], repository_root)
     except WorkOrderValidationError as error:
         raise WorkOrderValidationError(
             [f"Phase {source.phase}: {message}" for message in error.errors]
         ) from error
-    coverage_errors = _validate_file_coverage(files, declaration, ignore_case)
-    if coverage_errors:
-        raise WorkOrderValidationError(
-            [f"Phase {source.phase}: {message}" for message in coverage_errors]
-        )
     return ValidatedWorkOrder(
         phase=source.phase,
         phase_heading=source.phase_heading,
         goal=sections["Goal"].strip(),
         specification=sections["Spec"].strip(),
         files=files,
-        declaration=declaration,
     )
-
-
-def _repository_ignore_case(repository_root: Path, case_mode: str) -> bool:
-    if case_mode == "insensitive":
-        return True
-    if case_mode == "sensitive":
-        return False
-    result = subprocess.run(
-        ["git", "config", "--bool", "core.ignoreCase"],
-        cwd=repository_root,
-        check=False,
-        capture_output=True,
-        text=True,
-    )
-    return result.returncode == 0 and result.stdout.strip().casefold() == "true"
 
 
 def _read_document(document: str, repository_root: Path) -> tuple[Path, str, str]:
@@ -551,7 +476,7 @@ def _read_document(document: str, repository_root: Path) -> tuple[Path, str, str
         raise WorkOrderValidationError(
             [f"plan document is outside the repository: {absolute}"]
         ) from error
-    validate_lexical_path(relative, "plan document")
+    _ = validate_lexical_path(relative, "plan document")
     try:
         contents = absolute.read_text(encoding="utf-8")
     except OSError as error:
@@ -565,107 +490,32 @@ def _validated_orders(
     document: str,
     repository_root: Path,
     selection: WorkOrderSelection,
-    coverage: ReservationCoverageMode,
-    ignore_case: bool,
 ) -> tuple[str, tuple[ValidatedWorkOrder, ...]]:
     _, relative, contents = _read_document(document, repository_root)
     sources = _select_work_orders(_bounded_work_orders(contents), selection)
-    orders = tuple(validate_work_order(source, coverage, ignore_case) for source in sources)
+    orders = tuple(
+        validate_work_order(source, repository_root) for source in sources
+    )
     return relative, orders
 
 
-def _generated_declaration(
-    order: ValidatedWorkOrder, ignore_case: bool
-) -> DeclaredReservationDeclaration:
-    scopes = tuple(
-        ReservationScope(ScopeKind.FILE, entry.path)
-        for entry in order.files
-        if entry.requires_reservation
-    )
-    if not scopes:
-        raise WorkOrderValidationError(
-            [f"Phase {order.phase}: Files contains no implementation path to reserve"]
-        )
-    errors = _validate_minimal_antichain(scopes, ignore_case, "generated Reservations")
-    if errors:
-        raise WorkOrderValidationError(errors)
-    return DeclaredReservationDeclaration(scopes)
+class WorkOrderArguments(argparse.Namespace):
+    """Fully typed command-line values for every Work Order operation."""
 
-
-def _reservations_markdown(declaration: DeclaredReservationDeclaration) -> str:
-    lines = ["**Reservations:**", ""]
-    lines.extend(f"- {scope.kind.value}: `{scope.path}`" for scope in declaration.scopes)
-    return "\n".join(lines)
-
-
-def _derived_next_items_path(plan_path: str) -> str:
-    plan = Path(plan_path)
-    normalized_stem = re.sub(r"[^a-z0-9]+", "-", plan.stem.casefold()).strip("-")
-    if not normalized_stem:
-        raise WorkOrderValidationError(
-            [f"plan document stem cannot derive a next-items path: {plan_path!r}"]
-        )
-    return plan.with_name(f"{normalized_stem}-next{plan.suffix}").as_posix()
-
-
-def _resolved_scopes(
-    order: ValidatedWorkOrder, plan_path: str, ignore_case: bool
-) -> tuple[ReservationScope, ...]:
-    if isinstance(order.declaration, MissingReservationDeclaration):
-        raise WorkOrderValidationError(
-            [f"Phase {order.phase}: cannot resolve a missing Reservations declaration"]
-        )
-    scopes = order.declaration.scopes + (
-        ReservationScope(ScopeKind.FILE, plan_path),
-        ReservationScope(ScopeKind.FILE, _derived_next_items_path(plan_path)),
-    )
-    errors = _validate_minimal_antichain(scopes, ignore_case, "resolved claim footprint")
-    if errors:
-        raise WorkOrderValidationError(errors)
-    return scopes
-
-
-def _compare_declarations(
-    left: ValidatedWorkOrder,
-    right: ValidatedWorkOrder,
-    ignore_case: bool,
-) -> list[dict[str, object]]:
-    if isinstance(left.declaration, MissingReservationDeclaration):
-        raise WorkOrderValidationError(
-            [f"Phase {left.phase}: comparison requires a declared Reservations block"]
-        )
-    if isinstance(right.declaration, MissingReservationDeclaration):
-        raise WorkOrderValidationError(
-            [f"Phase {right.phase}: comparison requires a declared Reservations block"]
-        )
-    collisions: list[dict[str, object]] = []
-    for left_scope in left.declaration.scopes:
-        for right_scope in right.declaration.scopes:
-            if scopes_overlap(left_scope, right_scope, ignore_case):
-                collisions.append(
-                    {"left": left_scope.tagged(), "right": right_scope.tagged()}
-                )
-    return collisions
+    repository_root: str = ""
+    operation: str = ""
+    document: str = ""
+    phase: str = ""
 
 
 def _common_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument(
+    _ = parser.add_argument(
         "--repository-root",
         default=os.getcwd(),
-        help="repository root used to resolve plan paths and core.ignoreCase",
-    )
-    parser.add_argument(
-        "--case-mode",
-        choices=("repository", "sensitive", "insensitive"),
-        default="repository",
-        help="path comparison policy; repository reads git core.ignoreCase",
+        help="repository root used to resolve plan paths",
     )
     return parser
-
-
-def _coverage(value: str) -> ReservationCoverageMode:
-    return ReservationCoverageMode(value)
 
 
 def _selection(value: str) -> WorkOrderSelection:
@@ -679,152 +529,55 @@ def _build_parser() -> argparse.ArgumentParser:
     subparsers = parser.add_subparsers(dest="operation", required=True)
 
     validate = subparsers.add_parser("validate", help="validate complete Work Orders")
-    validate.add_argument("--document", required=True)
-    validate.add_argument("--phase", default="")
-    validate.add_argument(
-        "--coverage", choices=("advisory", "required"), required=True
-    )
-
-    emit = subparsers.add_parser(
-        "emit-reservations", help="derive conservative exact-file Reservations Markdown"
-    )
-    emit.add_argument("--document", required=True)
-    emit.add_argument("--phase", required=True)
+    _ = validate.add_argument("--document", required=True)
+    _ = validate.add_argument("--phase", default="")
 
     resolve = subparsers.add_parser(
-        "resolve", help="resolve one declared Work Order to claim arguments"
+        "resolve", help="validate and select one complete Work Order"
     )
-    resolve.add_argument("--document", required=True)
-    resolve.add_argument("--phase", required=True)
-    resolve.add_argument(
-        "--coverage", choices=("advisory", "required"), required=True
-    )
-
-    compare = subparsers.add_parser(
-        "compare", help="compare two declared Work Orders without the ledger"
-    )
-    compare.add_argument("--left-document", required=True)
-    compare.add_argument("--left-phase", required=True)
-    compare.add_argument("--right-document", required=True)
-    compare.add_argument("--right-phase", required=True)
+    _ = resolve.add_argument("--document", required=True)
+    _ = resolve.add_argument("--phase", required=True)
 
     return parser
 
 
 def main(argv: list[str]) -> int:
-    arguments = _build_parser().parse_args(argv)
+    arguments = _build_parser().parse_args(argv, namespace=WorkOrderArguments())
     operation = arguments.operation
     repository_root = Path(arguments.repository_root).resolve()
-    ignore_case = _repository_ignore_case(repository_root, arguments.case_mode)
     try:
         if operation == "validate":
             plan_path, orders = _validated_orders(
                 arguments.document,
                 repository_root,
                 _selection(arguments.phase),
-                _coverage(arguments.coverage),
-                ignore_case,
             )
             _emit(
                 {
                     "contract": CONTRACT,
                     "operation": "validate",
-                    "coverage_mode": _coverage(arguments.coverage).tagged(),
-                    "case_comparison": {
-                        "kind": "insensitive" if ignore_case else "sensitive"
-                    },
                     "document": plan_path,
                     "outcome": {"kind": "valid", "work_orders": [order.tagged() for order in orders]},
                 }
             )
             return 0
 
-        if operation == "emit-reservations":
-            plan_path, orders = _validated_orders(
-                arguments.document,
-                repository_root,
-                ExactPhaseSelection(arguments.phase),
-                ReservationCoverageMode.ADVISORY,
-                ignore_case,
-            )
-            declaration = _generated_declaration(orders[0], ignore_case)
-            _emit(
-                {
-                    "contract": CONTRACT,
-                    "operation": "emit_reservations",
-                    "coverage_mode": ReservationCoverageMode.ADVISORY.tagged(),
-                    "document": plan_path,
-                    "phase": orders[0].phase,
-                    "reservation_declaration": declaration.tagged(),
-                    "markdown": _reservations_markdown(declaration),
-                    "outcome": {"kind": "generated"},
-                }
-            )
-            return 0
-
-        if operation == "resolve":
-            coverage = _coverage(arguments.coverage)
-            plan_path, orders = _validated_orders(
-                arguments.document,
-                repository_root,
-                ExactPhaseSelection(arguments.phase),
-                coverage,
-                ignore_case,
-            )
-            order = orders[0]
-            scopes = _resolved_scopes(order, plan_path, ignore_case)
-            _emit(
-                {
-                    "contract": CONTRACT,
-                    "operation": "resolve",
-                    "coverage_mode": coverage.tagged(),
-                    "case_comparison": {
-                        "kind": "insensitive" if ignore_case else "sensitive"
-                    },
-                    "document": plan_path,
-                    "phase": order.phase,
-                    "reservation_declaration": order.declaration.tagged(),
-                    "resolved_claim": {
-                        "kind": "declared_with_plan_scopes",
-                        "scopes": [scope.tagged() for scope in scopes],
-                        "arguments": [scope.argument() for scope in scopes],
-                    },
-                    "outcome": {"kind": "resolved"},
-                }
-            )
-            return 0
-
-        left_path, left_orders = _validated_orders(
-            arguments.left_document,
+        plan_path, orders = _validated_orders(
+            arguments.document,
             repository_root,
-            ExactPhaseSelection(arguments.left_phase),
-            ReservationCoverageMode.REQUIRED,
-            ignore_case,
+            ExactPhaseSelection(arguments.phase),
         )
-        right_path, right_orders = _validated_orders(
-            arguments.right_document,
-            repository_root,
-            ExactPhaseSelection(arguments.right_phase),
-            ReservationCoverageMode.REQUIRED,
-            ignore_case,
-        )
-        collisions = _compare_declarations(left_orders[0], right_orders[0], ignore_case)
         _emit(
             {
                 "contract": CONTRACT,
-                "operation": "compare",
-                "case_comparison": {
-                    "kind": "insensitive" if ignore_case else "sensitive"
-                },
-                "left": {"document": left_path, "phase": left_orders[0].phase},
-                "right": {"document": right_path, "phase": right_orders[0].phase},
-                "outcome": {
-                    "kind": "collision" if collisions else "disjoint",
-                    "collisions": collisions,
-                },
+                "operation": "resolve",
+                "document": plan_path,
+                "phase": orders[0].phase,
+                "work_order": orders[0].tagged(),
+                "outcome": {"kind": "resolved"},
             }
         )
-        return 1 if collisions else 0
+        return 0
     except WorkOrderValidationError as error:
         return _invalid(operation, error.errors)
 
