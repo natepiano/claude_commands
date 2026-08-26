@@ -14,7 +14,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal, cast
 
-DEFAULT_CONF = Path.home() / ".claude" / "scripts" / "clean-fix" / "clean-fix.conf"
+DEFAULT_CONF = Path.home() / ".claude" / "scripts" / "fix" / "fix.conf"
 DEFAULT_RUST_DIR = Path.home() / "rust"
 MARKER = "#FIX_SKIP#"
 SECTION_RE = re.compile(r"^\[(?P<name>.+)\]\s*$")

@@ -13,7 +13,7 @@ Show style guide history and reporting derived from clean-fix style runs.
 Run the summary script and display its output:
 
 ```bash
-python3 ~/.claude/scripts/clean-fix/style_report.py $ARGUMENTS
+python3 ~/.claude/scripts/fix/style_report.py $ARGUMENTS
 ```
 
 Available flags:

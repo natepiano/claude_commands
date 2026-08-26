@@ -146,7 +146,7 @@ PY
   fi
 
   # Enroll in the clean-fix flow (config lives outside the workspace).
-  CONF="$HOME/.claude/scripts/clean-fix/clean-fix.conf"
+  CONF="$HOME/.claude/scripts/fix/fix.conf"
   ROOTDIR=$(basename "$ROOT")
   if [[ -f "$CONF" ]]; then
     echo "=== Enrolling in clean-fix ==="

@@ -82,7 +82,7 @@ Mark third todo as completed when finished.
 **Offer to point clean-fix's style eval/fix at this worktree.**
 
 clean-fix evaluates/fixes a fixed allowlist of projects (`[projects]` in
-`~/.claude/scripts/clean-fix/clean-fix.conf`). When a worktree is a checkout of
+`~/.claude/scripts/fix/fix.conf`). When a worktree is a checkout of
 one of those projects, you usually want the eval/fix work to follow the worktree
 while the project's identity/history stays put. This step offers that.
 
@@ -93,7 +93,7 @@ while the project's identity/history stays put. This step offers that.
 **Detect a match:**
 - Get the primary repo name: `basename "$(git rev-parse --show-toplevel)"`.
 - Run:
-  `python3 ~/.claude/scripts/make_a_worktree/retarget_clean_fix.py detect --repo [repo-name] --worktree [worktree-name]`
+  `python3 ~/.claude/scripts/make_a_worktree/retarget_fix.py detect --repo [repo-name] --worktree [worktree-name]`
 - If the JSON has `"match": false`, SKIP silently — this worktree's name is not prefixed by the repo or one of its `[projects]` member crates, so there's nothing to redirect. Do not mention it.
 
 **On a match, ask the user (do NOT auto-apply):**
@@ -103,8 +103,8 @@ while the project's identity/history stays put. This step offers that.
 
 **On approve:**
 - Run (use `dangerouslyDisableSandbox: true` — the helper makes a git commit, which the sandbox blocks):
-  `python3 ~/.claude/scripts/make_a_worktree/retarget_clean_fix.py apply --repo [repo-name] --worktree [worktree-name] --commit`
-- This writes the `[active_checkout]` redirect(s); the `[projects]` lines are untouched, so history continuity is preserved. No restart needed — the clean-fix job reads the conf live. With `--commit` it also commits **only** `clean-fix.conf` in the `~/.claude` repo, so the redirect needs no manual upkeep.
+  `python3 ~/.claude/scripts/make_a_worktree/retarget_fix.py apply --repo [repo-name] --worktree [worktree-name] --commit`
+- This writes the `[active_checkout]` redirect(s); the `[projects]` lines are untouched, so history continuity is preserved. No restart needed — the clean-fix job reads the conf live. With `--commit` it also commits **only** `fix.conf` in the `~/.claude` repo, so the redirect needs no manual upkeep.
 - Report the `redirects` from the JSON and the `commit` result (`commit.commit` short hash if `commit.committed` is true; otherwise mention `commit.reason`).
 - Note to the user: to undo later (e.g. after merging/deleting the worktree), `/worktree_delete` reverts the redirect automatically, or run the helper's `revert --worktree [worktree-name] --commit`.
 

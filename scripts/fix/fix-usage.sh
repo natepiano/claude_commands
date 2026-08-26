@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
-# Emit the no-argument /clean_fix usage screen.
+# Emit the no-argument /fix usage screen.
 
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-CONF_FILE="$SCRIPT_DIR/clean-fix.conf"
+CONF_FILE="$SCRIPT_DIR/fix.conf"
 MARKER="#FIX_SKIP#"
 
 source "$SCRIPT_DIR/agent_assignments.sh"
@@ -505,7 +505,7 @@ main() {
             print_json
             ;;
         *)
-            echo "Usage: clean-fix-usage.sh [--json]" >&2
+            echo "Usage: fix-usage.sh [--json]" >&2
             return 2
             ;;
     esac

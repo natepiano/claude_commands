@@ -1,16 +1,16 @@
 #!/bin/bash
-# Launchd wrapper for clean-fix.sh, invoked every StartInterval seconds by
+# Launchd wrapper for fix.sh, invoked every StartInterval seconds by
 # com.natemccoy.style-fix. There is no idle gate, so every firing runs the
 # style pipeline and keeps the eval/review/fix queue full.
 #
 # Concurrency guard: pgrep against the orchestrator's path.
-# clean-fix.sh runs synchronously start-to-finish (style-fix-worktrees waits
+# fix.sh runs synchronously start-to-finish (style-fix-worktrees waits
 # on its backgrounded agents before returning), so its presence in the
 # process table accurately reflects "a run is still in progress."
 
 set -euo pipefail
 
-FIX_ORCHESTRATOR_PATH="$HOME/.claude/scripts/clean-fix/clean-fix.sh"
+FIX_ORCHESTRATOR_PATH="$HOME/.claude/scripts/fix/fix.sh"
 
 if pgrep -f "$FIX_ORCHESTRATOR_PATH" >/dev/null 2>&1; then
     exit 0

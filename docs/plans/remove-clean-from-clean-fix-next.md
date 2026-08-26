@@ -7,7 +7,7 @@ building it — that decision happens when one is scheduled into a phase.
 
 ## 1. `PhaseStats`'s footer counters encode a state as an absent value
 
-The report parser (`clean_fix_report_parse.py`, later `fix_report_parse.py`)
+The report parser (`scripts/fix/fix_report_parse.py`)
 defines `PhaseStats.footer_ok`, `footer_fail`, and `footer_total` as
 `int | None`, and each surviving phase parser reads
 `footer_total is None` to mean "this phase emitted no footer, so it is still
@@ -38,7 +38,7 @@ commit would have cost the reviewability the phase most needed.
   optional at `:435`, while `update_pending_project_root()` independently reads
   `None` as "no pending JSON" before the unconditional call at `:471` — so a
   state where the two disagree is representable.
-- `DetectResult` in `retarget_clean_fix.py` (later `retarget_fix.py`) is a
+- `DetectResult` in `scripts/make_a_worktree/retarget_fix.py` is a
   `TypedDict` carrying a `match` boolean, a free-form `kind` string, and fields
   that are empty strings when `match` is false — match state spelled three ways
   at once.
@@ -62,9 +62,10 @@ design change nobody can review as either one.
 
 ## 3. Six helper types are named for representation, not role
 
-`SectionResult` (`project_add.py`), `Plan`, `PlannedMove`, `PlannedMarker`
-(`project_rename.py`), `DetectResult`, and `CommitResult`
-(`retarget_clean_fix.py`, later `retarget_fix.py`) say what a value *is* rather
+`SectionResult` (`scripts/fix/project_add.py`), `Plan`, `PlannedMove`,
+`PlannedMarker` (`scripts/fix/project_rename.py`), `DetectResult`, and
+`CommitResult` (`scripts/make_a_worktree/retarget_fix.py`) say what a value *is*
+rather
 than what it is *for* — a project-allowlist change, a project-rename migration
 plan, a history-state move, a worktree-redirect match, or a configuration-commit
 outcome.
@@ -75,7 +76,7 @@ list, not a phase. Item 2 should land first, since it changes which types exist.
 
 ## 4. The report model hides domain outcomes behind generic types and strings
 
-The report parser (`clean_fix_report_parse.py`, later `fix_report_parse.py`)
+The report parser (`scripts/fix/fix_report_parse.py`)
 exposes `Cell`, which does not say that it is one project's outcome for one
 report phase, and `ParseResult`, which says only how the value was obtained.
 `Warning` is also stored in `ParseResult.running`, so its name is false for live
@@ -96,7 +97,7 @@ to those renames.
 
 ## 5. The flow renderer hides geometry state behind `Bbox | None`
 
-`scripts/clean-fix/render-flow.py` (later `scripts/fix/render-flow.py`) names its
+`scripts/fix/render-flow.py` names its
 coordinate tuple `Bbox`, which states a representation rather than what the four
 numbers bound, and returns `Bbox | None` from `bbox_from_points`, `union_bboxes`,
 `get_element_bbox`, `get_node_bbox`, and `get_content_bbox`. Depending on the

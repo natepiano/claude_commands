@@ -9,7 +9,7 @@
   ],
   "executionEnvironments": [
     { "root": "scripts/hooks", "extraPaths": ["scripts/hooks"] },
-    { "root": "scripts/clean-fix", "extraPaths": ["scripts/clean-fix"] },
+    { "root": "scripts/fix", "extraPaths": ["scripts/fix"] },
     {
       "root": "scripts/banned_word_analysis",
       "extraPaths": ["scripts/banned_word_analysis", "scripts/hooks"]

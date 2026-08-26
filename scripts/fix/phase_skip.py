@@ -24,7 +24,7 @@ from typing import NamedTuple
 from typing import Literal, cast
 from pathlib import Path
 
-CONF_FILE = Path(__file__).resolve().parent / "clean-fix.conf"
+CONF_FILE = Path(__file__).resolve().parent / "fix.conf"
 MARKER = "#FIX_SKIP#"
 
 SECTION_RE = re.compile(r"^\[(?P<name>.+)\]\s*$")

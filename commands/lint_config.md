@@ -58,7 +58,7 @@ effect on the next run of each consumer; nothing needs restarting.
 The two consumers: the `/clippy` skill (reads the file at the start of every run,
 including runs started by `/commit_prep` or a `/plan:delegate` work order) and
 `scripts/lint/invoke.sh` — the sourced bottom layer that the `lint` CLI,
-`scripts/delegate/verify.sh`, and `scripts/clean-fix/clean-fix.sh` all flow
+`scripts/delegate/verify.sh`, and `scripts/fix/fix.sh` all flow
 through.
 `/plan:delegate` uses `/clippy style-only` for its required phase-end style
 gate, so `style_review=off` blocks that checkpoint instead of silently passing

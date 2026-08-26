@@ -26,7 +26,7 @@ source "$SCRIPT_DIR/agent_assignments.sh"
 
 RUST_DIR="$HOME/rust"
 NATE_STYLE_DIR="$HOME/rust/nate_style"
-CONF_FILE="$SCRIPT_DIR/clean-fix.conf"
+CONF_FILE="$SCRIPT_DIR/fix.conf"
 CMD_FILE="$SCRIPT_DIR/style-eval-review-prompt.md"
 HISTORY_HELPER="$SCRIPT_DIR/style_history.py"
 LOG_DIR="/private/tmp/claude"

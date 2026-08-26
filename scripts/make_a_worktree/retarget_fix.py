@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Redirect clean-fix's style eval/fix to a worktree, via clean-fix.conf.
+"""Redirect clean-fix's style eval/fix to a worktree, via fix.conf.
 
 A git worktree `W` is a full checkout of one repo `R` (its parent must be ~/rust
 so its name is a valid clean-fix path relative to ~/rust). If `W`'s name is
@@ -15,7 +15,7 @@ Subcommands:
   apply  --repo R --worktree W [--conf PATH] [--commit]  write the redirect(s)
   revert --worktree W           [--conf PATH] [--commit]  drop W's redirect(s)
 
-With --commit, apply/revert also commit ONLY clean-fix.conf in its own git repo
+With --commit, apply/revert also commit ONLY fix.conf in its own git repo
 (~/.claude) when the file changed — so the worktree redirect needs no manual
 upkeep. The commit is scoped to that one path and skipped if the conf is
 unchanged or not in a git repo.
@@ -29,7 +29,7 @@ import sys
 from pathlib import Path
 from typing import TypedDict
 
-DEFAULT_CONF = Path.home() / ".claude" / "scripts" / "clean-fix" / "clean-fix.conf"
+DEFAULT_CONF = Path.home() / ".claude" / "scripts" / "fix" / "fix.conf"
 BOUNDARY = "_-"
 
 
@@ -210,7 +210,7 @@ def _die(msg: str) -> None:
 
 def parse_args(argv: list[str]) -> tuple[str, str, str, Path, bool]:
     if len(argv) < 2:
-        _die("usage: retarget_clean_fix.py {detect|apply|revert} [--repo R] --worktree W [--conf PATH]")
+        _die("usage: retarget_fix.py {detect|apply|revert} [--repo R] --worktree W [--conf PATH]")
     cmd = argv[1]
     if cmd not in ("detect", "apply", "revert"):
         _die(f"unknown subcommand: {cmd}")

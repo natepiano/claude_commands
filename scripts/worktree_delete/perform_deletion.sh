@@ -92,7 +92,7 @@ echo "Branch deleted."
 # PROJECT (identity/history key) was read from the marker before removal above.
 if [[ -n "$STYLE_FIX_PROJECT" ]]; then
     PROJECT="$STYLE_FIX_PROJECT"
-    HISTORY_HELPER="$HOME/.claude/scripts/clean-fix/style_history.py"
+    HISTORY_HELPER="$HOME/.claude/scripts/fix/style_history.py"
     if [[ -f "$HISTORY_HELPER" ]]; then
         echo ""
         echo "Style-fix worktree deleted — discarding clean-fix pending state for: $PROJECT"

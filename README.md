@@ -11,7 +11,7 @@ I iterate on these almost every day to get them to work right for me - feel free
 - **style_eval / focused_eval / style_fix_review** - Evaluate code against the style guide and review fixes
 
 ### Clean-Fix Automation
-- **clean_fix** - Pipeline that evaluates and fixes style across projects; runs on a launchd schedule (`scripts/clean-fix/`)
+- **fix** - Pipeline that evaluates and fixes style across projects; runs on a launchd schedule (`scripts/fix/`)
 
 ### Review & Planning
 - **module_review** - Multi-agent module-structure evaluation

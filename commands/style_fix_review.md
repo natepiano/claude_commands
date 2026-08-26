@@ -235,9 +235,9 @@ else
   project="$(basename "$worktree_dir")"
   project="${project%_style_fix}"
 fi
-status_json="$(python3 ~/.claude/scripts/clean-fix/style_history.py evaluation-status --project "$project")"
+status_json="$(python3 ~/.claude/scripts/fix/style_history.py evaluation-status --project "$project")"
 eval_path="/private/tmp/claude/style_fix_review_${project}_evaluation.md"
-python3 ~/.claude/scripts/clean-fix/style_history.py export-evaluation \
+python3 ~/.claude/scripts/fix/style_history.py export-evaluation \
   --project "$project" \
   --kind review \
   --output "$eval_path"
@@ -252,7 +252,7 @@ Instead, enter **Recovered Handoff Mode**:
 
 ```bash
 recovery_path="/private/tmp/claude/style_fix_review_${project}_recovered_evaluation.md"
-python3 ~/.claude/scripts/clean-fix/style_history.py recover-evaluation \
+python3 ~/.claude/scripts/fix/style_history.py recover-evaluation \
   --project "$project" \
   --project-root "$worktree_dir" \
   --output "$recovery_path"

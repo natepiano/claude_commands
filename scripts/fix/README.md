@@ -10,9 +10,9 @@ Runs every 10 minutes via launchd.
 
 | File | Purpose |
 |------|---------|
-| `clean-fix.sh` | Main entry point. Accepts an optional project filter or the literal `run_once`, which forces one evaluation + review + fix pass across all projects. `run_once` overrides only the three stage switches, so normal per-project safety and eligibility skips still apply. Emits a clean-fix log that `/clean_fix report` can render on demand. |
-| `clean-fix-usage.sh` | Emits the no-argument `/clean_fix` usage screen as preformatted Markdown with fixed-width, wrapped text blocks. `--json` exposes the same usage, agent, and project data for validation/tools. |
-| `clean-fix.conf` | Pipeline configuration. One opt-in allowlist, `[projects]`, plus the optional `[active_checkout]` redirect map (point a project's eval/fix at a worktree while keeping its identity/history), style quotas, timeouts, and project environment. No agent settings live here. No deny list — nothing runs unless listed. |
+| `fix.sh` | Main entry point. Accepts an optional project filter or the literal `run_once`, which forces one evaluation + review + fix pass across all projects. `run_once` overrides only the three stage switches, so normal per-project safety and eligibility skips still apply. Emits a clean-fix log that `/fix report` can render on demand. |
+| `fix-usage.sh` | Emits the no-argument `/fix` usage screen as preformatted Markdown with fixed-width, wrapped text blocks. `--json` exposes the same usage, agent, and project data for validation/tools. |
+| `fix.conf` | Pipeline configuration. One opt-in allowlist, `[projects]`, plus the optional `[active_checkout]` redirect map (point a project's eval/fix at a worktree while keeping its identity/history), style quotas, timeouts, and project environment. No agent settings live here. No deny list — nothing runs unless listed. |
 | `project_add.py` | Adds a project to `[projects]` only. Accepts checkout names, paths under `~/rust`, absolute paths, and `Cargo.toml` paths; workspace members are written as workspace-relative entries so their identity/history key stays the member directory name. |
 | `project_rename.py` | Renames a clean-fix project key after a checkout/member path changes. Updates `[projects]`, `[active_checkout]`, and `[project_env]` entries and migrates history JSONL, pending JSON/lock, failure logs, and `.fix-project` markers. Refuses collisions instead of merging histories. |
 | `agent-assignments.conf` | Clean-fix stage enablement. `[style_eval]`, `[style_eval_review]`, and `[style_fix]` each own only `enabled=`; family, agent, and effort assignments live under `[fix.<family>]` in `~/.claude/config/agents.conf`. |
@@ -38,9 +38,9 @@ Runs every 10 minutes via launchd.
 
 | File | Purpose |
 |------|---------|
-| `clean-fix-style-flow.dot` | Graphviz source for the pipeline flowchart. Defines nodes, edges, positions, and cluster membership. |
+| `fix-style-flow.dot` | Graphviz source for the pipeline flowchart. Defines nodes, edges, positions, and cluster membership. |
 | `render-flow.py` | Renders the dot file to SVG. Parses cluster definitions from the dot file, runs `neato -n2`, then injects dashed cluster borders and rewrites the SVG viewBox. |
-| `clean-fix-style-flow.svg` | Generated output — do not edit by hand. |
+| `fix-style-flow.svg` | Generated output — do not edit by hand. |
 
 ## Reliability guards (the rg-hang)
 
@@ -50,7 +50,7 @@ worktrees. Two style-eval agents had issued pipelines like
 but **no path argument**. With no path, `rg` searches stdin whenever stdin is
 not a terminal; claude's Bash tool hands each command an open stdin pipe that
 never delivers data and never closes, so that first `rg` blocked on `read()`
-forever. The eval stage's serial `wait` then stalled, the parent `clean-fix.sh`
+forever. The eval stage's serial `wait` then stalled, the parent `fix.sh`
 stayed alive, and the launchd trigger's `pgrep` concurrency guard suppressed
 every subsequent run all night.
 
@@ -59,7 +59,7 @@ Two layers now prevent a recurrence:
 1. **Eval-stage watchdog** (`style-eval-all.sh`). The per-agent wait is
    `wait_or_timeout`, which kills the agent's whole process tree (subshell +
    `claude`/`codex` + any `rg`/`zsh` grandchildren) after `agent_timeout_secs`
-   (from `[style_fix]` in `clean-fix.conf`, default 2h). Containment: one hung
+   (from `[style_fix]` in `fix.conf`, default 2h). Containment: one hung
    agent can no longer stall the pipeline.
 
 2. **Retired `rg` timeout shim** (`rg-shim.sh`) — this used to be activated by
@@ -73,7 +73,7 @@ Two layers now prevent a recurrence:
 Prerequisites: `graphviz` (`brew install graphviz`), Python 3.
 
 ```bash
-cd ~/.claude/scripts/clean-fix
+cd ~/.claude/scripts/fix
 python3 render-flow.py
 ```
 
@@ -84,12 +84,12 @@ The render script:
 4. Aligns the tops of Phase 1/2/3 clusters
 5. Rewrites the SVG `viewBox` to fit all content with uniform padding
 
-To modify the diagram, edit `clean-fix-style-flow.dot` and re-run `python3 render-flow.py`. See the layout guide comment at the top of the dot file for details on adding/removing nodes and phases.
+To modify the diagram, edit `fix-style-flow.dot` and re-run `python3 render-flow.py`. See the layout guide comment at the top of the dot file for details on adding/removing nodes and phases.
 
 ## Pipeline flow
 
 ```
-style-fix job (every 10 min, no idle gate) — clean-fix.sh [PROJECT | run_once]
+style-fix job (every 10 min, no idle gate) — fix.sh [PROJECT | run_once]
   │
   ├─ STYLE_EVAL_ENABLED? (run_once forces yes)
   │    ├─ no → log SKIP and continue to STYLE_REVIEW_ENABLED

@@ -1,16 +1,16 @@
 # Clean-fix Report
 
-Render a status view of one clean-fix run from a parsed log. All log discovery, regex matching, phase slicing, and bookkeeping suppression lives in `~/.claude/scripts/clean-fix/clean_fix_report_parse.py`. This document only routes arguments and renders the parsed output. It is consumed two ways: by `/clean_fix report` (interactive) and by `clean-fix.sh`, which sends it to the configured report agent after each run.
+Render a status view of one clean-fix run from a parsed log. All log discovery, regex matching, phase slicing, and bookkeeping suppression lives in `~/.claude/scripts/fix/fix_report_parse.py`. This document only routes arguments and renders the parsed output. It is consumed two ways: by `/fix report` (interactive) and by `fix.sh`, which sends it to the configured report agent after each run.
 
 ## Arguments
 
 `$ARGUMENTS` may be:
 
-1. **Empty** — call `clean_fix_report_parse.py` with no arguments. The parser renders the current clean-fix state for every keyed `[projects]` target, independent of whichever log was written last.
-2. **The literal word `list`** — call `clean_fix_report_parse.py --list`. Print the numbered list (path, date, time, duration, status, phases). Ask the user to pick by index, then call `clean_fix_report_parse.py <chosen-path>` and render.
-3. **The literal word `latest` or `newest`** — call `clean_fix_report_parse.py --latest-log`. This is the explicit old behavior: parse the newest log in `~/.local/logs/fix/`.
-4. **A path** — call `clean_fix_report_parse.py <path>`. If the parser exits with `ERROR: log not found`, surface that and stop.
-5. **Any other token** (e.g. `rebuild`, which `clean-fix.sh` substitutes in its scheduled invocation) — treat as Empty: current keyed-project state.
+1. **Empty** — call `fix_report_parse.py` with no arguments. The parser renders the current clean-fix state for every keyed `[projects]` target, independent of whichever log was written last.
+2. **The literal word `list`** — call `fix_report_parse.py --list`. Print the numbered list (path, date, time, duration, status, phases). Ask the user to pick by index, then call `fix_report_parse.py <chosen-path>` and render.
+3. **The literal word `latest` or `newest`** — call `fix_report_parse.py --latest-log`. This is the explicit old behavior: parse the newest log in `~/.local/logs/fix/`.
+4. **A path** — call `fix_report_parse.py <path>`. If the parser exits with `ERROR: log not found`, surface that and stop.
+5. **Any other token** (e.g. `rebuild`, which `fix.sh` substitutes in its scheduled invocation) — treat as Empty: current keyed-project state.
 
 ## Parser output format
 
@@ -24,7 +24,7 @@ STATUS: complete | crashed | partial | in-progress | current
 
 PHASE <name> present=<bool> ok=N fail=N skip=N [footer_ok=N footer_fail=N footer_total=N]
 ROW <project>  eval=<cell> review=<cell> fix=<cell> verify=<cell> reason="<short reason | ->" [phase_now="<live phase>"]
-ALWAYS_EXCLUDED "<reason>" count=N projects=<a,b,c>   ← directories under ~/rust not opted into the [projects] allowlist in clean-fix.conf
+ALWAYS_EXCLUDED "<reason>" count=N projects=<a,b,c>   ← directories under ~/rust not opted into the [projects] allowlist in fix.conf
 FILTERED_OUT "<reason>" count=N projects=<a,b,c>      ← would be eligible, but framework state / project layout filtered them out
 WARNING <phase> <project> "<message>"                 ← real project failures
 TOOL_WARNING <phase> <project> "<message>"            ← sub-tool failed but project itself is healthy
@@ -71,7 +71,7 @@ If `STATUS` is `partial` or `in-progress`, replace the parenthetical with `parti
 
 Render these as **two separate sections**, never one combined list. They have different audiences.
 
-**Excluded** — render only if `ALWAYS_EXCLUDED` or `FILTERED_OUT` records exist. The orchestrator works from the `[projects]` allowlist in `clean-fix.conf`, so a directory under `~/rust/` is a target only when it is keyed there; everything else is reported under "Excluded". Render as a header line followed by one bullet per reason, with the **category name in bold**. Use these category names (map from the parser's raw reason text):
+**Excluded** — render only if `ALWAYS_EXCLUDED` or `FILTERED_OUT` records exist. The orchestrator works from the `[projects]` allowlist in `fix.conf`, so a directory under `~/rust/` is a target only when it is keyed there; everything else is reported under "Excluded". Render as a header line followed by one bullet per reason, with the **category name in bold**. Use these category names (map from the parser's raw reason text):
 
 | Parser reason text                            | Bullet category                            |
 |-----------------------------------------------|--------------------------------------------|

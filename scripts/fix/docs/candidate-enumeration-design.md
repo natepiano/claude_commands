@@ -274,7 +274,7 @@ from the style guide outright (decision 1), so there is no lint wiring step
 and no mechanism flips.
 
 **Generator placement:** parse-class generators live in a new sibling module
-`~/.claude/scripts/clean-fix/candidate_generators.py`, imported by
+`~/.claude/scripts/fix/candidate_generators.py`, imported by
 `style_history.py`. Single entry point
 `enumerate_candidates(unit, project_dir) -> list[Candidate]`, dispatched on
 the unit's `candidates.kind` frontmatter — so `next-unit` and `record-unit`

@@ -5,7 +5,7 @@ Modes:
   default                   Current status for every keyed [projects] target.
   --latest-log              Full report parse of the newest clean-fix log.
   --list                    Enumerate logs in ~/.local/logs/fix/ with summaries.
-  --phase-detect <log>      Emit the currently-running phase (for /clean_fix monitor).
+  --phase-detect <log>      Emit the currently-running phase (for /fix monitor).
   --filter-regex            Print the live-monitor filter regex (single source of truth).
 
 Output is line-oriented, key=value style. Consumers (slash commands, Claude)
@@ -26,13 +26,13 @@ from typing import TypedDict, cast
 
 LOG_DIR = Path.home() / ".local" / "logs" / "fix"
 RUST_DIR = Path.home() / "rust"
-CONF_FILE = Path.home() / ".claude" / "scripts" / "clean-fix" / "clean-fix.conf"
+CONF_FILE = Path.home() / ".claude" / "scripts" / "fix" / "fix.conf"
 HISTORY_DIR = RUST_DIR / "nate_style" / ".history"
 PENDING_DIR = HISTORY_DIR / ".pending"
 
 # Single source of truth for the live-monitor filter regex.
 # Kept identical in spirit to the alternation that previously lived in
-# commands/clean_fix.md so /clean_fix monitor can consume it via --filter-regex.
+# commands/fix.md so /fix monitor can consume it via --filter-regex.
 MONITOR_FILTER_REGEX = (
     r"(^|[[:space:]])(ERROR|WARNING|TIMEOUT|RETRY|RETRY OK|RETRY FAILED|FAILED|WARN|OK|AUTOFINALIZE):"
     r"|(^|[[:space:]])AGENT LIMIT:"
@@ -373,7 +373,7 @@ def _list_duration(result: ParseResult, now: float) -> str:
 
 
 def target_roots_by_project() -> dict[str, Path]:
-    """Return style-eval project-name to project-root mapping from clean-fix.conf.
+    """Return style-eval project-name to project-root mapping from fix.conf.
 
     The name (identity/history key) comes from the [projects] entry; the root
     comes from the checkout, which an [active_checkout] redirect may point at a
@@ -1109,7 +1109,7 @@ def synthesize_agent_limit_note(result: ParseResult) -> None:
             + f"({', '.join(projects)}) failed for that reason alone — not a code problem. "
             + "The pipeline removed their _style_fix worktrees via its normal failure "
             + f"cleanup; they are recreated once {family} credits reset ({reset}). "
-            + "Re-run /clean_fix after that."
+            + "Re-run /fix after that."
         )
         result.notes.append(note)
 
@@ -1941,7 +1941,7 @@ def main() -> None:
     _ = parser.add_argument("path", nargs="?", help="log path, or 'latest' for the newest log; omitted = current keyed-project state")
     _ = parser.add_argument("--latest-log", action="store_true", help="parse the newest log instead of current keyed-project state")
     _ = parser.add_argument("--list", action="store_true", help="list available logs with summaries")
-    _ = parser.add_argument("--phase-detect", metavar="LOG", help="detect current phase of a log (for /clean_fix monitor)")
+    _ = parser.add_argument("--phase-detect", metavar="LOG", help="detect current phase of a log (for /fix monitor)")
     _ = parser.add_argument("--filter-regex", action="store_true", help="print live-monitor filter regex")
     args = parser.parse_args()
 

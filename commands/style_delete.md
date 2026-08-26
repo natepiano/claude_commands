@@ -24,5 +24,5 @@ The admin script:
 
 Run:
 ```bash
-python3 ~/.claude/scripts/clean-fix/style_admin.py delete $ARGUMENTS
+python3 ~/.claude/scripts/fix/style_admin.py delete $ARGUMENTS
 ```

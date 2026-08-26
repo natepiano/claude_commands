@@ -31,10 +31,10 @@ zsh ~/.claude/scripts/rust_style/load-rust-style.sh --list-files --project-root 
 
 ## Step 1.5: Use the clean-fix selection helper
 
-If no pending run exists yet (i.e. `next-unit` errors with "No pending run for ..."), initialize one first. The budget is the configured `[style_eval] max_new_findings` in `~/.claude/scripts/clean-fix/clean-fix.conf`; `next-unit` stops once the pending evaluation markdown contains that many numbered findings.
+If no pending run exists yet (i.e. `next-unit` errors with "No pending run for ..."), initialize one first. The budget is the configured `[style_eval] max_new_findings` in `~/.claude/scripts/fix/fix.conf`; `next-unit` stops once the pending evaluation markdown contains that many numbered findings.
 
 ```bash
-python3 ~/.claude/scripts/clean-fix/style_history.py start-run --project-root "$ARGUMENTS"
+python3 ~/.claude/scripts/fix/style_history.py start-run --project-root "$ARGUMENTS"
 ```
 
 The clean-fix (`style-eval-all.sh`) calls `start-run` itself, so this is only needed for ad-hoc agent invocations. If an interrupted evaluation is pending, `start-run` resumes it — already-recorded units stay recorded and `next-unit` continues where the previous run stopped.
@@ -49,7 +49,7 @@ EVAL_PATH="$EVALUATION_PATH"
 if [[ -z "$EVAL_PATH" ]]; then
     EVAL_PATH="/tmp/style-eval-${PROJECT_NAME}-evaluation.md"
 fi
-~/.claude/scripts/clean-fix/style-eval-heartbeat.sh \
+~/.claude/scripts/fix/style-eval-heartbeat.sh \
     --project "$PROJECT_NAME" \
     --record agent \
     --project-root "$ARGUMENTS" \
@@ -61,7 +61,7 @@ fi
 You must pull evaluation units one at a time from:
 
 ```bash
-python3 ~/.claude/scripts/clean-fix/style_history.py next-unit --project-root "$ARGUMENTS"
+python3 ~/.claude/scripts/fix/style_history.py next-unit --project-root "$ARGUMENTS"
 ```
 
 The helper returns JSON.
@@ -82,7 +82,7 @@ Rules:
 After reviewing a unit, you must record its result immediately with:
 
 ```bash
-python3 ~/.claude/scripts/clean-fix/style_history.py record-unit \
+python3 ~/.claude/scripts/fix/style_history.py record-unit \
     --project-root "$ARGUMENTS" \
     --results "$RESULTS_FILE" \
     --eval-path "$EVAL_PATH"
@@ -149,7 +149,7 @@ Read enough to form a thorough understanding of the codebase's patterns. Aim for
 Export any already-pending evaluation markdown to the scratch path, if it exists:
 
 ```bash
-python3 ~/.claude/scripts/clean-fix/style_history.py export-evaluation \
+python3 ~/.claude/scripts/fix/style_history.py export-evaluation \
     --project "$PROJECT_NAME" \
     --output "$EVAL_PATH" 2>/dev/null || true
 ```
@@ -185,7 +185,7 @@ For each returned unit:
    if [[ -z "$EVAL_PATH" ]]; then
        EVAL_PATH="/tmp/style-eval-${PROJECT_NAME}-evaluation.md"
    fi
-   ~/.claude/scripts/clean-fix/style-eval-heartbeat.sh \
+   ~/.claude/scripts/fix/style-eval-heartbeat.sh \
        --project "$PROJECT_NAME" \
        --record agent \
        --project-root "$ARGUMENTS" \
@@ -304,7 +304,7 @@ Do NOT include an "Overall Assessment" section — just list the findings.
 After writing the final markdown, save it into pending JSON. The helper also stores the authoritative `checked_unit_count`, `reviewable_unit_total`, `coverage`, and `stop_reason` in pending JSON; do not rely on scratch-file mtimes to infer what ran:
 
 ```bash
-python3 ~/.claude/scripts/clean-fix/style_history.py save-evaluation \
+python3 ~/.claude/scripts/fix/style_history.py save-evaluation \
     --project-root "$ARGUMENTS" \
     --evaluation "$EVAL_PATH"
 ```
@@ -326,7 +326,7 @@ Skip this step entirely if `--fix` is not in the original arguments — `/style_
 
 If `--fix` was passed, you are running interactively and the user is waiting on the fix to finish. The fix takes 10–20 minutes; do all of the following without narration in between so the user hits a single "running, you'll be notified" message instead of two.
 
-1. Run `python3 ~/.claude/scripts/clean-fix/style_history.py evaluation-status --project "$(basename "$ARGUMENTS")" --field status`. If it prints `no_findings`, print `nothing to fix` and stop. Do not launch the fix script.
+1. Run `python3 ~/.claude/scripts/fix/style_history.py evaluation-status --project "$(basename "$ARGUMENTS")" --field status`. If it prints `no_findings`, print `nothing to fix` and stop. Do not launch the fix script.
 
 2. Compute the log path deterministically — do not wait to read it from stdout:
 
@@ -341,10 +341,10 @@ If `--fix` was passed, you are running interactively and the user is waiting on 
    a. Run the foreground launcher via Bash with `run_in_background: true` + `dangerouslyDisableSandbox: true` (codex needs unsandboxed):
 
       ```bash
-      ~/.claude/scripts/clean-fix/style-fix-manual.sh --foreground "$(basename "$ARGUMENTS")"
+      ~/.claude/scripts/fix/style-fix-manual.sh --foreground "$(basename "$ARGUMENTS")"
       ```
 
-   b. In the same response, invoke `/clean_fix` (the `clean_fix` skill) with arguments `monitor`. It autodetects the newest active clean-fix log, arms the sandbox-safe Python helper for `style-fix-manual-*.log`, and owns the event-to-update mapping — follow its <StyleFixManualEvents/> reporting.
+   b. In the same response, invoke `/fix` (the `fix` skill) with arguments `monitor`. It autodetects the newest active clean-fix log, arms the sandbox-safe Python helper for `style-fix-manual-*.log`, and owns the event-to-update mapping — follow its <StyleFixManualEvents/> reporting.
 
 4. Tell the user once: "fix running, log: `<path>`. I'll surface phases as they arrive and post a final summary when codex finishes." Then **yield** — do not sleep, do not poll, do not re-read the log yourself.
 

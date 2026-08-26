@@ -1,7 +1,7 @@
 #!/bin/bash
 # Clean-fix style orchestrator.
-# Usage: clean-fix.sh [project]
-#        clean-fix.sh run_once
+# Usage: fix.sh [project]
+#        fix.sh run_once
 #   [project] — optionally filter the style eval, review, and fix pass
 #   run_once — run one pass across all configured projects, ignoring persistent
 #              stage enablement
@@ -15,7 +15,7 @@ if [[ $# -gt 0 ]]; then
         run_once)
             RUN_ONCE_REQUESTED="true"
             if [[ $# -gt 1 ]]; then
-                echo "Usage: clean-fix.sh run_once" >&2
+                echo "Usage: fix.sh run_once" >&2
                 exit 1
             fi
             export FIX_FORCE_STYLE_STAGES=1
@@ -23,7 +23,7 @@ if [[ $# -gt 0 ]]; then
         *)
             PROJECT_FILTER="$1"
             if [[ $# -gt 1 ]]; then
-                echo "Usage: clean-fix.sh [project]" >&2
+                echo "Usage: fix.sh [project]" >&2
                 exit 1
             fi
             ;;
@@ -34,7 +34,7 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 LOG_DIR="$HOME/.local/logs/fix"
 LOG_FILE="$LOG_DIR/fix-$(date '+%Y%m%d-%H%M%S').log"
 LEGACY_LOG="$HOME/.local/logs/fix.log"
-CONF_FILE="$SCRIPT_DIR/clean-fix.conf"
+CONF_FILE="$SCRIPT_DIR/fix.conf"
 RUN_LOG_RETENTION_MINUTES=1440
 MANUAL_LOG_RETENTION_DAYS=7
 
@@ -236,7 +236,7 @@ REPORT_PROMPT_FILE="${LOG_FILE%.log}-report-prompt.md"
 REPORT_LOG_FILE="$LOG_DIR/report_render.txt"
 if grep -qE '(^|[[:space:]])(OK|FAILED|ERROR|TIMEOUT|RECOVERED|Launched):' "$LOG_FILE"; then
     log "Generating clean-fix report..."
-    if sed 's/\$ARGUMENTS/rebuild/g' "$HOME/.claude/scripts/clean-fix/report-render.md" > "$REPORT_PROMPT_FILE"; then
+    if sed 's/\$ARGUMENTS/rebuild/g' "$HOME/.claude/scripts/fix/report-render.md" > "$REPORT_PROMPT_FILE"; then
         "$HOME/.claude/scripts/agents/agent_exec.sh" fix.report write \
             "$HOME/.claude" "$REPORT_PROMPT_FILE" "$REPORT_FILE" "$REPORT_LOG_FILE" || {
             log "WARNING: failed to generate clean-fix report"

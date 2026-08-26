@@ -36,7 +36,7 @@ LOAD_STYLE_SCRIPT = Path(
 FIX_CONF_FILE = Path(
     os.environ.get(
         "STYLE_HISTORY_CONF_FILE",
-        str(Path.home() / ".claude" / "scripts" / "clean-fix" / "clean-fix.conf"),
+        str(Path.home() / ".claude" / "scripts" / "fix" / "fix.conf"),
     )
 )
 LOG_DIR = Path(os.environ.get("STYLE_HISTORY_LOG_DIR", "/private/tmp/claude"))
@@ -310,7 +310,7 @@ def remove_pending(project: str) -> None:
 
 
 def _style_eval_conf_int(conf_key: str) -> int:
-    """Read an int key from `[style_eval]` in `clean-fix.conf`.
+    """Read an int key from `[style_eval]` in `fix.conf`.
 
     Single source of truth for eval tunables. Errors loudly if missing — both
     the clean-fix script and the ad-hoc agent path depend on these values, so
@@ -319,7 +319,7 @@ def _style_eval_conf_int(conf_key: str) -> int:
     """
     if not FIX_CONF_FILE.exists():
         raise SystemExit(
-            f"clean-fix.conf not found at {FIX_CONF_FILE}; [style_eval] {conf_key} must be set there."
+            f"fix.conf not found at {FIX_CONF_FILE}; [style_eval] {conf_key} must be set there."
         )
     current_section = ""
     for raw_line in FIX_CONF_FILE.read_text().splitlines():

@@ -9,7 +9,7 @@ description: Unified clean-fix command — run the pipeline (one project or all)
 When no subcommand is provided, run this script and relay its stdout exactly:
 
 ```bash
-~/.claude/scripts/clean-fix/clean-fix-usage.sh
+~/.claude/scripts/fix/fix-usage.sh
 ```
 
 The script owns the user-facing data, section order, column widths, wrapping, and formatting. Do not parse, summarize, truncate, filter, sort, merge, rename, rewrite, add rows, or convert its output to Markdown pipe tables. Do not read or reinterpret clean-fix config files for this screen; the script output is the only source. If the script exits non-zero, show its stdout/stderr exactly and stop.
@@ -23,16 +23,16 @@ Dispatch: `run`/`run_once` → <Run/>, `add` → <Add/>, `rename` → <Rename/>,
 
 ### `run`, `run_once` — style pipeline execution
 
-Launch `~/.claude/scripts/clean-fix/clean-fix.sh` interactively, off the launchd schedule. Build the script arguments from the user command:
+Launch `~/.claude/scripts/fix/fix.sh` interactively, off the launchd schedule. Build the script arguments from the user command:
 
 - `run` — eval + review + fix worktrees across configured style projects; an optional project argument filters to one target
 - `run_once` — one eval + review + fix pass across every configured style project, regardless of the three persistent stage enablement settings
 
 The `run` forms can take an optional project name:
 
-- `clean_fix run` — style eval/review/fix for all targets
-- `clean_fix run <project>` — style eval/review/fix for one target
-- `clean_fix run_once` — one forced style eval/review/fix pass for all style targets
+- `/fix run` — style eval/review/fix for all targets
+- `/fix run <project>` — style eval/review/fix for one target
+- `/fix run_once` — one forced style eval/review/fix pass for all style targets
 
 `run_once` takes no arguments. If any token follows it, run the usage script, relay stdout exactly, and stop. It does not change `agent-assignments.conf`; later scheduled runs continue using the persistent stage enablement settings. Normal per-project safety and eligibility skips still apply; only stage enablement is overridden.
 
@@ -43,12 +43,12 @@ The `run` forms can take an optional project name:
 **Step 1: Refuse to launch if a clean-fix is already running.** A second concurrent run will collide with the first one's worktrees and history files. Before launching, check:
 
 ```bash
-pgrep -fl clean-fix.sh || true
+pgrep -fl fix.sh || true
 ```
 
-If anything matches, tell the user `Clean-fix already running (PID …). Use /clean_fix monitor to attach to the live log, or wait for it to finish.` Stop. Do not launch a second copy.
+If anything matches, tell the user `Clean-fix already running (PID …). Use /fix monitor to attach to the live log, or wait for it to finish.` Stop. Do not launch a second copy.
 
-**Step 2: Show the `run_once` execution summary.** Skip this step for `run`. For `run_once`, source `~/.claude/scripts/clean-fix/agent_assignments.sh`, resolve `style_eval`, `style_eval_review`, and `style_fix` with `cf_load_stage_assignment`, and show:
+**Step 2: Show the `run_once` execution summary.** Skip this step for `run`. For `run_once`, source `~/.claude/scripts/fix/agent_assignments.sh`, resolve `style_eval`, `style_eval_review`, and `style_fix` with `cf_load_stage_assignment`, and show:
 
 `One eval → eval_review → fix pass across all configured style projects. Persistent stage enablement is ignored for this run.`
 
@@ -65,8 +65,8 @@ Use `<default>` when agent or effort is empty. This summary is informational; do
 **Step 3: Launch.** The orchestrator writes its own timestamped log under `~/.local/logs/fix/fix-YYYYMMDD-HHMMSS.log` and updates the `~/.local/logs/fix.log` symlink to point at it. Don't pre-create or redirect — just launch:
 
 ```bash
-~/.claude/scripts/clean-fix/clean-fix.sh [project]
-~/.claude/scripts/clean-fix/clean-fix.sh run_once
+~/.claude/scripts/fix/fix.sh [project]
+~/.claude/scripts/fix/fix.sh run_once
 ```
 
 Use `Bash` with `dangerouslyDisableSandbox: true` and `run_in_background: true`. Capture the resulting bash shell id so the user can kill it later with `KillShell` if needed. After launch, resolve the active log path:
@@ -77,15 +77,15 @@ ls -t ~/.local/logs/fix/fix-*.log 2>/dev/null | head -1
 
 Tell the user: `Clean-fix launched (shell <id>). Log: <path>.`
 
-**Step 4: Offer to arm the monitor.** In the same response, offer one short follow-up: `Want me to /clean_fix monitor to stream phase transitions?` If the user says yes, execute <Monitor/> with no arguments. If they decline, stop.
+**Step 4: Offer to arm the monitor.** In the same response, offer one short follow-up: `Want me to /fix monitor to stream phase transitions?` If the user says yes, execute <Monitor/> with no arguments. If they decline, stop.
 
 ### Notes
 
 - The full run can take an hour or more. The user does not need to keep this conversation open — the script runs detached and writes to disk.
 - `run` is the on-demand counterpart to the launchd job; the schedule is unaffected. If a launchd-triggered run is already in flight, Step 1 will catch it.
 - `run_once` is a one-time style-stage override that does not persistently enable any stage.
-- For testing only the review stage in isolation, prefer `~/.claude/scripts/clean-fix/style-eval-review-all.sh [project]` — much faster than a full clean-fix.
-- Use `/clean_fix report` after the run for a per-project matrix, or `/clean_fix monitor` during the run for live updates.
+- For testing only the review stage in isolation, prefer `~/.claude/scripts/fix/style-eval-review-all.sh [project]` — much faster than a full clean-fix.
+- Use `/fix report` after the run for a per-project matrix, or `/fix monitor` during the run for live updates.
 
 </Run>
 
@@ -93,7 +93,7 @@ Tell the user: `Clean-fix launched (shell <id>). Log: <path>.`
 
 ## add <path-or-project>
 
-Add a Rust project to `~/.claude/scripts/clean-fix/clean-fix.conf`.
+Add a Rust project to `~/.claude/scripts/fix/fix.conf`.
 
 `<path-or-project>` may be a project directory name under `~/rust`, a path
 relative to `~/rust`, an absolute path under `~/rust`, or a `Cargo.toml` path.
@@ -102,7 +102,7 @@ The target must exist and contain `Cargo.toml`.
 Run the helper and relay its output verbatim:
 
 ```bash
-python3 ~/.claude/scripts/clean-fix/project_add.py <path-or-project>
+python3 ~/.claude/scripts/fix/project_add.py <path-or-project>
 ```
 
 The helper adds the normalized entry to `[projects]`. For a
@@ -111,7 +111,7 @@ workspace member, it writes the workspace-relative entry
 member directory name, matching existing clean-fix workspace entries.
 
 The helper refuses duplicate `[projects]` identity keys and refuses to reactivate
-temporarily skipped entries; use `clean_fix skip enable <target>` for
+temporarily skipped entries; use `/fix skip enable <target>` for
 that case.
 
 </Add>
@@ -130,7 +130,7 @@ contain `Cargo.toml`.
 Run the helper and relay its output verbatim:
 
 ```bash
-python3 ~/.claude/scripts/clean-fix/project_rename.py <old> <new>
+python3 ~/.claude/scripts/fix/project_rename.py <old> <new>
 ```
 
 The helper updates `[projects]`, `[active_checkout]`, and keyed
@@ -166,6 +166,7 @@ ls -lt --time=mtime \
   /tmp/claude/style-fix-*.log \
   /tmp/claude/style-eval-*.log \
   /tmp/claude/clean-fix-*.log \
+  /tmp/claude/fix-*.log \
   2>/dev/null | head -5
 ```
 
@@ -173,14 +174,14 @@ ls -lt --time=mtime \
 
 Decision:
 - **Fresh candidate found** — set `${LOG_PATH}` to the newest fresh candidate and tell the user `Watching ${LOG_PATH} (last write Ns ago).` Proceed to <ArmMonitor/>.
-- **No fresh candidates** — inform the user: `No clean-fix logs modified in the last 2 hours. Start a run first, then use /clean_fix monitor.` Then stop.
+- **No fresh candidates** — inform the user: `No clean-fix logs modified in the last 2 hours. Start a run first, then use /fix monitor.` Then stop.
 
 ### <ArmMonitor/>
 
 Identify the current phase by calling the parser:
 
 ```bash
-python3 ~/.claude/scripts/clean-fix/clean_fix_report_parse.py --phase-detect ${LOG_PATH}
+python3 ~/.claude/scripts/fix/fix_report_parse.py --phase-detect ${LOG_PATH}
 ```
 
 Output is two lines:
@@ -199,14 +200,14 @@ Otherwise tell the user: `Detected phase: <name>. Arming monitor on ${LOG_PATH}.
 - `description`: `clean-fix: style-fix (manual)`
 - `persistent`: `true`
 - `timeout_ms`: `3600000`
-- `command`: `python3 ~/.claude/scripts/clean-fix/style-fix-monitor.py ${PROJECT}`
+- `command`: `python3 ~/.claude/scripts/fix/style-fix-monitor.py ${PROJECT}`
 
 Derive `${PROJECT}` from the log before arming the helper. Use the first `Launched:` or worktree line that names the project. If the project cannot be derived, tell the user `Could not identify the project from ${LOG_PATH}; use tail -f ${LOG_PATH}.` Then stop. The helper tails both the manual log and the agent's own log (`/private/tmp/claude/style_fix_<project>.log`), translates the agent's phase sentinels to `phase=agent-step name=<...>`, and exits 0 on the `phase=launcher-exit` sentinel — no TaskStop needed. (A tail+grep pipeline cannot terminate itself at launcher-exit inside the sandbox: `pkill` is denied access to macOS's process-list service and shell job-control is unavailable.) Then report events per <StyleFixManualEvents/> and skip the rest of this section.
 
 For all other logs, fetch the live-monitor filter regex from the parser (single source of truth — keeps phase classification and live filtering in lockstep):
 
 ```bash
-FILTER_REGEX=$(python3 ~/.claude/scripts/clean-fix/clean_fix_report_parse.py --filter-regex)
+FILTER_REGEX=$(python3 ~/.claude/scripts/fix/fix_report_parse.py --filter-regex)
 ```
 
 Call the Monitor tool with these exact parameters:
@@ -260,7 +261,7 @@ For Monitors armed with `style-fix-monitor.py`, emit one short line per event:
 
 ### Monitor notes
 
-- The orchestrator script `clean-fix.sh` writes both to `~/.local/logs/fix.log` (via `tee`) and via the `com.natemccoy.style-fix` launchd job to `/tmp/style-fix-stdout.log` every 10 minutes. Either is valid; <DetectLog/> will prefer whichever is freshest.
+- The orchestrator script `fix.sh` writes both to `~/.local/logs/fix.log` (via `tee`) and via the `com.natemccoy.style-fix` launchd job to `/tmp/style-fix-stdout.log` every 10 minutes. Either is valid; <DetectLog/> will prefer whichever is freshest.
 - Standalone runs of `style-eval-all.sh` or `style-fix-worktrees.sh` invoked interactively typically log to `/tmp/claude/<name>-<suffix>.log`. The detector pattern globs match those.
 - The Monitor uses `tail -F -n 0` so we start at the current end of the file — backlog is not re-emitted.
 - `grep --line-buffered` is required — without it, pipe buffering delays events by minutes and the monitor looks broken.
@@ -272,7 +273,7 @@ For Monitors armed with `style-fix-monitor.py`, emit one short line per event:
 ## report [list | <path>]
 ## list
 
-Read `~/.claude/scripts/clean-fix/report-render.md` and follow it, substituting the remaining tokens (after `report`) for its `$ARGUMENTS`. If the top-level token was `list`, execute this section with `$ARGUMENTS` set to `list`. That document owns the parser invocation, the output format, and every rendering rule; it is shared with `clean-fix.sh`, which sends it to the configured report agent after each scheduled run. Do not duplicate rendering logic here — if something is missing, fix `report-render.md` (or the parser).
+Read `~/.claude/scripts/fix/report-render.md` and follow it, substituting the remaining tokens (after `report`) for its `$ARGUMENTS`. If the top-level token was `list`, execute this section with `$ARGUMENTS` set to `list`. That document owns the parser invocation, the output format, and every rendering rule; it is shared with `fix.sh`, which sends it to the configured report agent after each scheduled run. Do not duplicate rendering logic here — if something is missing, fix `report-render.md` (or the parser).
 
 </Report>
 
@@ -282,9 +283,9 @@ Read `~/.claude/scripts/clean-fix/report-render.md` and follow it, substituting 
 ## agent
 ## on|off
 
-Show clean-fix agent assignments or set stage enablement. These commands do not run the eval, review, or fix phase for a project. Project-scoped execution is `clean_fix run <project>`.
+Show clean-fix agent assignments or set stage enablement. These commands do not run the eval, review, or fix phase for a project. Project-scoped execution is `/fix run <project>`.
 
-The clean-fix stage assignment file is `~/.claude/scripts/clean-fix/agent-assignments.conf`; it owns only stage `enabled=` values. The global agent registry is `~/.claude/config/agents.conf`; `[assignments] fix=<family>` selects the family and `[fix.<family>]` provides each stage's `agent[:effort]` row.
+The clean-fix stage assignment file is `~/.claude/scripts/fix/agent-assignments.conf`; it owns only stage `enabled=` values. The global agent registry is `~/.claude/config/agents.conf`; `[assignments] fix=<family>` selects the family and `[fix.<family>]` provides each stage's `agent[:effort]` row.
 
 Three clean-fix sections are configurable:
 
@@ -292,18 +293,18 @@ Three clean-fix sections are configurable:
 - **review** — `[style_eval_review] enabled=`; registry row `fix.style_eval_review`.
 - **fix** — `[style_fix] enabled=`; registry row `fix.style_fix`.
 
-`clean-fix.conf` owns pipeline targets and tunables only; agent settings placed there are rejected as stale.
+`fix.conf` owns pipeline targets and tunables only; agent settings placed there are rejected as stale.
 
 Argument handling:
 
-1. **`/clean_fix agent`** — run `bash ~/.claude/scripts/clean-fix/agent_assignments.sh` and relay its status view: assignment path, registry path, and each stage's `enabled`, family, resolved agent, and effort. Then point to `/agent fix <family>` for family switching and `/agent fix.<stage> <agent>[:<effort>]` for row edits. Stop. Extra tokens after `agent` are invalid; show those two `/agent` forms and stop.
+1. **`/fix agent`** — run `bash ~/.claude/scripts/fix/agent_assignments.sh` and relay its status view: assignment path, registry path, and each stage's `enabled`, family, resolved agent, and effort. Then point to `/agent fix <family>` for family switching and `/agent fix.<stage> <agent>[:<effort>]` for row edits. Stop. Extra tokens after `agent` are invalid; show those two `/agent` forms and stop.
 2. **First token is `eval`, `review`, or `fix`** — map it to `[style_eval]`, `[style_eval_review]`, or `[style_fix]`.
-3. **Scoped status:** `/clean_fix eval`, `/clean_fix review`, or `/clean_fix fix` sources `agent_assignments.sh` and calls `cf_print_stage_assignment` for that section. Show its `enabled`, family, resolved agent, and effort.
-4. **Project names are invalid here:** `/clean_fix eval <project>`, `/clean_fix review <project>`, and `/clean_fix fix <project>` are not supported. Tell the user to use `/clean_fix run <project>` for a single project.
-5. **Scoped enable/disable:** `/clean_fix eval on`, `/clean_fix review off`, `/clean_fix fix on`, etc. set only that section's `enabled=` to `true` or `false` in `agent-assignments.conf`.
-6. **Global enable/disable:** `/clean_fix on` and `/clean_fix off` set all three `enabled=` values to `true` or `false` in `agent-assignments.conf`.
-7. Any former `/clean_fix agent ...`, `<scope> agent ...`, `<scope> model ...`, or `<scope> effort ...` setter form is invalid. Point to `/agent fix <family>` or `/agent fix.<stage> <agent>[:<effort>]` and stop without editing.
-8. The `[projects]` skip list remains in `clean-fix.conf` and is managed by `phase_skip.py` (see <Skip/>), never by direct edits.
+3. **Scoped status:** `/fix eval`, `/fix review`, or `/fix fix` sources `agent_assignments.sh` and calls `cf_print_stage_assignment` for that section. Show its `enabled`, family, resolved agent, and effort.
+4. **Project names are invalid here:** `/fix eval <project>`, `/fix review <project>`, and `/fix fix <project>` are not supported. Tell the user to use `/fix run <project>` for a single project.
+5. **Scoped enable/disable:** `/fix eval on`, `/fix review off`, `/fix fix on`, etc. set only that section's `enabled=` to `true` or `false` in `agent-assignments.conf`.
+6. **Global enable/disable:** `/fix on` and `/fix off` set all three `enabled=` values to `true` or `false` in `agent-assignments.conf`.
+7. Any former `/fix agent ...`, `<scope> agent ...`, `<scope> model ...`, or `<scope> effort ...` setter form is invalid. Point to `/agent fix <family>` or `/agent fix.<stage> <agent>[:<effort>]` and stop without editing.
+8. The `[projects]` skip list remains in `fix.conf` and is managed by `phase_skip.py` (see <Skip/>), never by direct edits.
 
 </StyleAgentConfig>
 
@@ -311,7 +312,7 @@ Argument handling:
 
 ## skip [...]
 
-Skip or re-enable projects in the `[projects]` allowlist in `~/.claude/scripts/clean-fix/clean-fix.conf` by commenting/uncommenting allowlist lines. A target may be a whole directory or a workspace member (`<dir>/<subpath>`); a member is named by its last path segment (e.g. `bevy_diegetic`).
+Skip or re-enable projects in the `[projects]` allowlist in `~/.claude/scripts/fix/fix.conf` by commenting/uncommenting allowlist lines. A target may be a whole directory or a workspace member (`<dir>/<subpath>`); a member is named by its last path segment (e.g. `bevy_diegetic`).
 
 For redirected projects, the helper accepts either the active checkout name or the project key and applies the skip to the underlying allowlist entry.
 
@@ -325,7 +326,7 @@ Map the tokens to an action:
 Run the helper and relay its output verbatim:
 
 ```bash
-python3 ~/.claude/scripts/clean-fix/phase_skip.py <action> [target ...]
+python3 ~/.claude/scripts/fix/phase_skip.py <action> [target ...]
 ```
 
 The helper is the single source of truth for the skip list — do not edit those entries with Edit/Write. Agent settings are edited directly — see <StyleAgentConfig/>.

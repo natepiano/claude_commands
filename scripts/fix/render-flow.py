@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Render clean-fix-style-flow.dot with neato -n2, then inject cluster borders.
+"""Render fix-style-flow.dot with neato -n2, then inject cluster borders.
 
 neato doesn't support cluster outlines, so we:
 1. Parse the .dot file to extract cluster membership, labels, and colors
@@ -18,8 +18,8 @@ from pathlib import Path
 from typing import TypedDict
 
 SCRIPT_DIR = Path(__file__).parent
-DOT_FILE = SCRIPT_DIR / "clean-fix-style-flow.dot"
-SVG_FILE = SCRIPT_DIR / "clean-fix-style-flow.svg"
+DOT_FILE = SCRIPT_DIR / "fix-style-flow.dot"
+SVG_FILE = SCRIPT_DIR / "fix-style-flow.svg"
 
 # Layout constants
 CLUSTER_PAD_X = 18.0
@@ -35,7 +35,7 @@ CLUSTER_CORNER_RADIUS = 4.0
 SVG_OUTER_PAD = 15.0
 
 # Phase clusters get aligned tops; add cluster IDs here to include them
-PHASE_CLUSTER_IDS = ("cluster_build", "cluster_eval", "cluster_fix")
+PHASE_CLUSTER_IDS = ("cluster_eval", "cluster_review", "cluster_fix")
 
 SVG_NS = "http://www.w3.org/2000/svg"
 Bbox = tuple[float, float, float, float]

@@ -1,8 +1,8 @@
 #!/bin/bash
 # Create style-fix worktrees for projects with pending evaluation findings.
 # For each eligible project: create a worktree, launch the configured style agent to apply fixes + clippy.
-# Projects come from the [projects] allowlist in clean-fix.conf.
-# Can be run standalone or called from clean-fix.sh.
+# Projects come from the [projects] allowlist in fix.conf.
+# Can be run standalone or called from fix.sh.
 #
 # Usage: style-fix-worktrees.sh [project_name]
 #   If project_name is given, only process that single project.
@@ -13,7 +13,7 @@
 #   <dir>/<subpath>  one workspace member crate inside <dir>
 # <dir> may be a primary repo or a worktree checkout (e.g. *_bevy_update). An
 # [active_checkout] redirect can point a project's fix work at a worktree while
-# keeping its identity/history; see clean-fix.conf.
+# keeping its identity/history; see fix.conf.
 
 set -euo pipefail
 
@@ -36,7 +36,7 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 source "$SCRIPT_DIR/agent_assignments.sh"
 
 RUST_DIR="$HOME/rust"
-CONF_FILE="$SCRIPT_DIR/clean-fix.conf"
+CONF_FILE="$SCRIPT_DIR/fix.conf"
 HISTORY_HELPER="$SCRIPT_DIR/style_history.py"
 LOG_DIR="/private/tmp/claude"
 SINGLE_PROJECT="${1:-}"
@@ -406,7 +406,7 @@ load_record() {
     return 1
 }
 
-# Per-project environment from [project_env] in clean-fix.conf. Echoes the
+# Per-project environment from [project_env] in fix.conf. Echoes the
 # space-separated KEY=VALUE assignments for the given project, or nothing.
 project_env_for() {
     local proj="$1" line section=""

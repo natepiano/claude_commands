@@ -1,7 +1,7 @@
 #!/bin/bash
 # Manual launcher for style-fix-worktrees.sh that accumulates log files
 # into ~/.local/logs/fix/ alongside the clean-fix orchestrator runs, so
-# /clean_fix report can pick them up.
+# /fix report can pick them up.
 #
 # Usage: style-fix-manual.sh [--foreground] [project_name]
 #   --foreground  — run style-fix-worktrees.sh in the current process so the
@@ -26,7 +26,7 @@ LOG_DIR="$HOME/.local/logs/fix"
 mkdir -p "$LOG_DIR"
 LOG="$LOG_DIR/style-fix-manual-$(date '+%Y%m%d-%H%M%S').log"
 
-SCRIPT="$HOME/.claude/scripts/clean-fix/style-fix-worktrees.sh"
+SCRIPT="$HOME/.claude/scripts/fix/style-fix-worktrees.sh"
 
 echo "Log: $LOG"
 
@@ -41,5 +41,5 @@ else
     disown
     echo "PID: $PID"
     echo "Tail: tail -f \"$LOG\""
-    echo "Monitor: /clean_fix monitor"
+    echo "Monitor: /fix monitor"
 fi

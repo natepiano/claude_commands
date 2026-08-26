@@ -1,7 +1,7 @@
 #!/bin/bash
 # Run style evaluations on all opt-in projects in parallel.
-# Projects come from the [projects] allowlist in clean-fix.conf.
-# Can be run standalone or called from clean-fix.sh.
+# Projects come from the [projects] allowlist in fix.conf.
+# Can be run standalone or called from fix.sh.
 #
 # Usage: style-eval-all.sh [project_name]
 #   If project_name is given, only evaluate that single project.
@@ -12,7 +12,7 @@
 #   <dir>/<subpath>  one workspace member crate inside <dir>
 # <dir> may be a primary repo or a worktree checkout (e.g. *_bevy_update). An
 # [active_checkout] redirect can point a project's evaluation at a worktree
-# while keeping its identity/history; see clean-fix.conf.
+# while keeping its identity/history; see fix.conf.
 
 set -euo pipefail
 
@@ -24,7 +24,7 @@ source "$SCRIPT_DIR/agent_assignments.sh"
 RUST_DIR="$HOME/rust"
 HISTORY_DIR="$HOME/rust/nate_style/.history"
 FAILURE_LOG_DIR="$HISTORY_DIR/.failures"
-CONF_FILE="$SCRIPT_DIR/clean-fix.conf"
+CONF_FILE="$SCRIPT_DIR/fix.conf"
 CMD_FILE="$HOME/.claude/commands/style_eval.md"
 HISTORY_HELPER="$SCRIPT_DIR/style_history.py"
 HEARTBEAT_HELPER="$SCRIPT_DIR/style-eval-heartbeat.sh"
@@ -547,7 +547,7 @@ for i in "${!projects[@]}"; do
     #
     # Fail-closed: if the gate itself crashes (bad guideline parse, candidate
     # generator bug, corrupt history) it can no longer tell us whether work is
-    # due. Skip the launch and emit an ERROR line so /clean_fix report flags it,
+    # due. Skip the launch and emit an ERROR line so /fix report flags it,
     # instead of falling through to a launch the gate could not justify. The
     # eval-phase report parser turns "ERROR: <proj> (...)" into a failed cell.
     if ! $resume_pending; then

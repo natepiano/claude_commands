@@ -33,7 +33,7 @@ Example:
 Run the read-only `focused-eval` helper — it does **not** touch the clean-fix scheduler's pending or history state:
 
 ```bash
-python3 ~/.claude/scripts/clean-fix/style_history.py focused-eval \
+python3 ~/.claude/scripts/fix/style_history.py focused-eval \
     --project-root "<project-root>" \
     --guideline <guideline-1> \
     [--guideline <guideline-2> ...]
