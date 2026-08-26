@@ -1,6 +1,6 @@
 #!/bin/bash
 # Manual launcher for style-fix-worktrees.sh that accumulates log files
-# into ~/.local/logs/clean-fix/ alongside the clean-fix orchestrator runs, so
+# into ~/.local/logs/fix/ alongside the clean-fix orchestrator runs, so
 # /clean_fix report can pick them up.
 #
 # Usage: style-fix-manual.sh [--foreground] [project_name]
@@ -22,7 +22,7 @@ if [[ "${1:-}" == "--foreground" ]]; then
     shift
 fi
 
-LOG_DIR="$HOME/.local/logs/clean-fix"
+LOG_DIR="$HOME/.local/logs/fix"
 mkdir -p "$LOG_DIR"
 LOG="$LOG_DIR/style-fix-manual-$(date '+%Y%m%d-%H%M%S').log"
 

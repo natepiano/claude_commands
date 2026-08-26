@@ -5,7 +5,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 CONF_FILE="$SCRIPT_DIR/clean-fix.conf"
-MARKER="#CLEAN_FIX_SKIP#"
+MARKER="#FIX_SKIP#"
 
 source "$SCRIPT_DIR/agent_assignments.sh"
 
@@ -38,8 +38,8 @@ load_usage_rows() {
     add_usage "clean_fix list" "Lists reportable logs. Same as clean_fix report list." true
     add_usage "clean_fix eval" "Shows eval stage family/agent status. Also works for review and fix."
     add_usage "clean_fix agent" "Shows all stage family, resolved agent, and effort assignments."
-    add_usage "/agent cleanfix <family>" "Switches the clean-fix family in the shared agent registry."
-    add_usage "/agent cleanfix.<stage> <agent>[:<effort>]" "Edits a clean-fix stage row; stages are style_eval, style_eval_review, and style_fix." true
+    add_usage "/agent fix <family>" "Switches the clean-fix family in the shared agent registry."
+    add_usage "/agent fix.<stage> <agent>[:<effort>]" "Edits a clean-fix stage row; stages are style_eval, style_eval_review, and style_fix." true
     add_usage "clean_fix on" "Enables all style stages."
     add_usage "clean_fix off" "Disables all style stages."
     add_usage "clean_fix eval on" "Enables one stage. Also works for review and fix."

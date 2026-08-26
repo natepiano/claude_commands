@@ -4,10 +4,10 @@
 # Clean-fix owns stage enablement. The global agent registry
 # (~/.claude/config/agents.conf) owns family, agent, and effort assignments.
 
-CLEAN_FIX_AGENT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-CLEAN_FIX_AGENT_ASSIGNMENTS_FILE="${CLEAN_FIX_AGENT_ASSIGNMENTS_FILE:-$CLEAN_FIX_AGENT_DIR/agent-assignments.conf}"
+FIX_PIPELINE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+FIX_AGENT_ASSIGNMENTS_FILE="${FIX_AGENT_ASSIGNMENTS_FILE:-$FIX_PIPELINE_DIR/agent-assignments.conf}"
 
-source "$CLEAN_FIX_AGENT_DIR/../agents/agents_config.sh"
+source "$FIX_PIPELINE_DIR/../agents/agents_config.sh"
 
 cf_trim() { agents_config_trim "$1"; }
 
@@ -51,8 +51,8 @@ cf_load_stage_enabled() {
     local line stripped section
     local parsed_enabled=""
 
-    if [[ ! -f "$CLEAN_FIX_AGENT_ASSIGNMENTS_FILE" ]]; then
-        echo "ERROR: clean-fix agent assignment file not found: $CLEAN_FIX_AGENT_ASSIGNMENTS_FILE" >&2
+    if [[ ! -f "$FIX_AGENT_ASSIGNMENTS_FILE" ]]; then
+        echo "ERROR: clean-fix agent assignment file not found: $FIX_AGENT_ASSIGNMENTS_FILE" >&2
         return 1
     fi
 
@@ -70,10 +70,10 @@ cf_load_stage_enabled() {
         if [[ "$stripped" =~ ^enabled=(.+)$ ]]; then
             parsed_enabled="${BASH_REMATCH[1]}"
         fi
-    done < "$CLEAN_FIX_AGENT_ASSIGNMENTS_FILE"
+    done < "$FIX_AGENT_ASSIGNMENTS_FILE"
 
     if [[ -z "$parsed_enabled" ]]; then
-        echo "ERROR: [$want_section] enabled must be set to true or false in $CLEAN_FIX_AGENT_ASSIGNMENTS_FILE" >&2
+        echo "ERROR: [$want_section] enabled must be set to true or false in $FIX_AGENT_ASSIGNMENTS_FILE" >&2
         return 1
     fi
     cf_validate_bool "$want_section" enabled "$parsed_enabled" || return 1
@@ -90,7 +90,7 @@ cf_load_stage_assignment() {
     local cf_stage_enabled_value=""
 
     cf_load_stage_enabled "$want_section" cf_stage_enabled_value || return 1
-    agents_resolve "cleanfix.$want_section" || return 1
+    agents_resolve "fix.$want_section" || return 1
 
     printf -v "$enabled_var" '%s' "$cf_stage_enabled_value"
     printf -v "$family_var" '%s' "$AGENT_FAMILY"
@@ -107,7 +107,7 @@ cf_print_stage_assignment() {
 }
 
 cf_print_agent_assignments() {
-    echo "clean-fix assignments: $CLEAN_FIX_AGENT_ASSIGNMENTS_FILE"
+    echo "clean-fix assignments: $FIX_AGENT_ASSIGNMENTS_FILE"
     echo "global agent registry: $AGENTS_CONFIG_FILE"
     cf_print_stage_assignment style_eval
     cf_print_stage_assignment style_eval_review

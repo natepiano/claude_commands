@@ -62,7 +62,7 @@ Then render the current assignments as a Markdown table with exactly these colum
 
 Use `<default>` when agent or effort is empty. This summary is informational; do not edit either assignment file.
 
-**Step 3: Launch.** The orchestrator writes its own timestamped log under `~/.local/logs/clean-fix/clean-fix-YYYYMMDD-HHMMSS.log` and updates the `~/.local/logs/clean-fix.log` symlink to point at it. Don't pre-create or redirect — just launch:
+**Step 3: Launch.** The orchestrator writes its own timestamped log under `~/.local/logs/fix/fix-YYYYMMDD-HHMMSS.log` and updates the `~/.local/logs/fix.log` symlink to point at it. Don't pre-create or redirect — just launch:
 
 ```bash
 ~/.claude/scripts/clean-fix/clean-fix.sh [project]
@@ -72,7 +72,7 @@ Use `<default>` when agent or effort is empty. This summary is informational; do
 Use `Bash` with `dangerouslyDisableSandbox: true` and `run_in_background: true`. Capture the resulting bash shell id so the user can kill it later with `KillShell` if needed. After launch, resolve the active log path:
 
 ```bash
-ls -t ~/.local/logs/clean-fix/clean-fix-*.log 2>/dev/null | head -1
+ls -t ~/.local/logs/fix/fix-*.log 2>/dev/null | head -1
 ```
 
 Tell the user: `Clean-fix launched (shell <id>). Log: <path>.`
@@ -140,7 +140,7 @@ clean-fix config entries, then migrates:
 - `~/rust/nate_style/.history/.pending/<old-key>.json`
 - `~/rust/nate_style/.history/.pending/<old-key>.json.lock`
 - matching `~/rust/nate_style/.history/.failures/*_<old-key>.md`
-- `.clean-fix-project` markers in existing `_style_fix` worktrees
+- `.fix-project` markers in existing `_style_fix` worktrees
 
 It refuses collisions with an existing new key; it does not merge histories.
 
@@ -161,8 +161,8 @@ Inspect the well-known log locations and pick the single most recently modified 
 ```bash
 ls -lt --time=mtime \
   /tmp/style-fix-stdout.log \
-  ~/.local/logs/clean-fix.log \
-  ~/.local/logs/clean-fix/style-fix-manual-*.log \
+  ~/.local/logs/fix.log \
+  ~/.local/logs/fix/style-fix-manual-*.log \
   /tmp/claude/style-fix-*.log \
   /tmp/claude/style-eval-*.log \
   /tmp/claude/clean-fix-*.log \
@@ -233,7 +233,7 @@ Every Monitor event arriving in chat is a single line from the log. For each:
   - `=== Done: 5 created, 2 failed, 0 skipped out of 7 ===` → `Style-fix run complete: 5 ok, 2 failed.`
 - Maintain a running tally of OK/FAILED counts across notifications when the user benefits from it (e.g. style-fix has a known 7-project denominator).
 - Treat `ERROR:`, `FAILED:`, `TIMEOUT:`, and `=== Done:` with non-zero failures as user-actionable — call PushNotification for those. Routine `OK:` and `Launched:` lines do not need a push.
-- When `=== Clean-fix complete` lands, or `=== Done:` for the standalone phase the user kicked off, tell the user the run is finished and stop the monitor with TaskStop using the task id you stored.
+- When `=== Fix complete` lands, or `=== Done:` for the standalone phase the user kicked off, tell the user the run is finished and stop the monitor with TaskStop using the task id you stored.
 
 ### <StyleFixManualEvents/>
 
@@ -260,7 +260,7 @@ For Monitors armed with `style-fix-monitor.py`, emit one short line per event:
 
 ### Monitor notes
 
-- The orchestrator script `clean-fix.sh` writes both to `~/.local/logs/clean-fix.log` (via `tee`) and via the `com.natemccoy.style-fix` launchd job to `/tmp/style-fix-stdout.log` every 10 minutes. Either is valid; <DetectLog/> will prefer whichever is freshest.
+- The orchestrator script `clean-fix.sh` writes both to `~/.local/logs/fix.log` (via `tee`) and via the `com.natemccoy.style-fix` launchd job to `/tmp/style-fix-stdout.log` every 10 minutes. Either is valid; <DetectLog/> will prefer whichever is freshest.
 - Standalone runs of `style-eval-all.sh` or `style-fix-worktrees.sh` invoked interactively typically log to `/tmp/claude/<name>-<suffix>.log`. The detector pattern globs match those.
 - The Monitor uses `tail -F -n 0` so we start at the current end of the file — backlog is not re-emitted.
 - `grep --line-buffered` is required — without it, pipe buffering delays events by minutes and the monitor looks broken.
@@ -284,25 +284,25 @@ Read `~/.claude/scripts/clean-fix/report-render.md` and follow it, substituting 
 
 Show clean-fix agent assignments or set stage enablement. These commands do not run the eval, review, or fix phase for a project. Project-scoped execution is `clean_fix run <project>`.
 
-The clean-fix stage assignment file is `~/.claude/scripts/clean-fix/agent-assignments.conf`; it owns only stage `enabled=` values. The global agent registry is `~/.claude/config/agents.conf`; `[assignments] cleanfix=<family>` selects the family and `[cleanfix.<family>]` provides each stage's `agent[:effort]` row.
+The clean-fix stage assignment file is `~/.claude/scripts/clean-fix/agent-assignments.conf`; it owns only stage `enabled=` values. The global agent registry is `~/.claude/config/agents.conf`; `[assignments] fix=<family>` selects the family and `[fix.<family>]` provides each stage's `agent[:effort]` row.
 
 Three clean-fix sections are configurable:
 
-- **eval** — `[style_eval] enabled=`; registry row `cleanfix.style_eval`.
-- **review** — `[style_eval_review] enabled=`; registry row `cleanfix.style_eval_review`.
-- **fix** — `[style_fix] enabled=`; registry row `cleanfix.style_fix`.
+- **eval** — `[style_eval] enabled=`; registry row `fix.style_eval`.
+- **review** — `[style_eval_review] enabled=`; registry row `fix.style_eval_review`.
+- **fix** — `[style_fix] enabled=`; registry row `fix.style_fix`.
 
 `clean-fix.conf` owns pipeline targets and tunables only; agent settings placed there are rejected as stale.
 
 Argument handling:
 
-1. **`/clean_fix agent`** — run `bash ~/.claude/scripts/clean-fix/agent_assignments.sh` and relay its status view: assignment path, registry path, and each stage's `enabled`, family, resolved agent, and effort. Then point to `/agent cleanfix <family>` for family switching and `/agent cleanfix.<stage> <agent>[:<effort>]` for row edits. Stop. Extra tokens after `agent` are invalid; show those two `/agent` forms and stop.
+1. **`/clean_fix agent`** — run `bash ~/.claude/scripts/clean-fix/agent_assignments.sh` and relay its status view: assignment path, registry path, and each stage's `enabled`, family, resolved agent, and effort. Then point to `/agent fix <family>` for family switching and `/agent fix.<stage> <agent>[:<effort>]` for row edits. Stop. Extra tokens after `agent` are invalid; show those two `/agent` forms and stop.
 2. **First token is `eval`, `review`, or `fix`** — map it to `[style_eval]`, `[style_eval_review]`, or `[style_fix]`.
 3. **Scoped status:** `/clean_fix eval`, `/clean_fix review`, or `/clean_fix fix` sources `agent_assignments.sh` and calls `cf_print_stage_assignment` for that section. Show its `enabled`, family, resolved agent, and effort.
 4. **Project names are invalid here:** `/clean_fix eval <project>`, `/clean_fix review <project>`, and `/clean_fix fix <project>` are not supported. Tell the user to use `/clean_fix run <project>` for a single project.
 5. **Scoped enable/disable:** `/clean_fix eval on`, `/clean_fix review off`, `/clean_fix fix on`, etc. set only that section's `enabled=` to `true` or `false` in `agent-assignments.conf`.
 6. **Global enable/disable:** `/clean_fix on` and `/clean_fix off` set all three `enabled=` values to `true` or `false` in `agent-assignments.conf`.
-7. Any former `/clean_fix agent ...`, `<scope> agent ...`, `<scope> model ...`, or `<scope> effort ...` setter form is invalid. Point to `/agent cleanfix <family>` or `/agent cleanfix.<stage> <agent>[:<effort>]` and stop without editing.
+7. Any former `/clean_fix agent ...`, `<scope> agent ...`, `<scope> model ...`, or `<scope> effort ...` setter form is invalid. Point to `/agent fix <family>` or `/agent fix.<stage> <agent>[:<effort>]` and stop without editing.
 8. The `[projects]` skip list remains in `clean-fix.conf` and is managed by `phase_skip.py` (see <Skip/>), never by direct edits.
 
 </StyleAgentConfig>
@@ -330,6 +330,6 @@ python3 ~/.claude/scripts/clean-fix/phase_skip.py <action> [target ...]
 
 The helper is the single source of truth for the skip list — do not edit those entries with Edit/Write. Agent settings are edited directly — see <StyleAgentConfig/>.
 
-A commented allowlist line is invisible to the conf parser, so the entry drops out of its pass. The helper tags its edits with `#CLEAN_FIX_SKIP#` so `enable-all` only reverses temp skips and never touches plain doc comments. It exits non-zero on a name with no matching allowlist entry.
+A commented allowlist line is invisible to the conf parser, so the entry drops out of its pass. The helper tags its edits with `#FIX_SKIP#` so `enable-all` only reverses temp skips and never touches plain doc comments. It exits non-zero on a name with no matching allowlist entry.
 
 </Skip>

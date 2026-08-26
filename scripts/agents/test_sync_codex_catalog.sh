@@ -64,9 +64,9 @@ medium
 high
 
 [assignments]
-cleanfix=codex
+fix=codex
 
-[cleanfix.codex]
+[fix.codex]
 style_eval=gpt-new:high
 
 [codex.agents]
@@ -123,9 +123,9 @@ medium
 high
 
 [assignments]
-cleanfix=codex
+fix=codex
 
-[cleanfix.codex]
+[fix.codex]
 style_eval=gpt-new:high
 
 [codex.agents]
@@ -157,9 +157,9 @@ stderr_text="$(<"$STDERR_FILE")"
 
 cat > "$AGENTS" <<'EOF'
 [assignments]
-cleanfix=codex
+fix=codex
 
-[cleanfix.codex]
+[fix.codex]
 style_eval=gpt-new:high
 
 [codex.agents]
@@ -184,9 +184,9 @@ fi
 
 cat > "$AGENTS" <<'EOF'
 [assignments]
-cleanfix=codex
+fix=codex
 
-[cleanfix.codex]
+[fix.codex]
 style_eval=gpt-retired:high
 report=gpt-retired:medium
 
@@ -207,13 +207,13 @@ cat > "$MODELS_CACHE" <<'EOF'
 EOF
 run_sync >/dev/null 2>"$STDERR_FILE"
 stderr_text="$(<"$STDERR_FILE")"
-assert_contains "$stderr_text" "cleanfix.style_eval is assigned to 'gpt-retired'" \
+assert_contains "$stderr_text" "fix.style_eval is assigned to 'gpt-retired'" \
     "stale style_eval row warning did not name the row"
-assert_contains "$stderr_text" "/agent cleanfix.style_eval <agent>[:<effort>]" \
+assert_contains "$stderr_text" "/agent fix.style_eval <agent>[:<effort>]" \
     "stale row warning did not name the task reconfiguration command"
-assert_contains "$stderr_text" "/agent cleanfix <family>" \
+assert_contains "$stderr_text" "/agent fix <family>" \
     "stale row warning did not name the family reconfiguration command"
-assert_contains "$stderr_text" "cleanfix.report is assigned to 'gpt-retired'" \
+assert_contains "$stderr_text" "fix.report is assigned to 'gpt-retired'" \
     "sync did not warn once for each stale assigned row"
 [[ "$(grep -c "is assigned to 'gpt-retired'" "$STDERR_FILE")" -eq 2 ]] \
     || fail "sync emitted the wrong number of stale-row warnings"

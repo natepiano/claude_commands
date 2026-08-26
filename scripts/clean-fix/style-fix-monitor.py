@@ -35,7 +35,7 @@ EMIT_RE = re.compile("^(" + "|".join(EMIT_PREFIXES) + ")")
 EXIT_RE = re.compile(r"^\[progress [^\]]+\] phase=launcher-exit ")
 
 POLL_SECS = 0.5
-LOG_DIR = os.path.expanduser("~/.local/logs/clean-fix")
+LOG_DIR = os.path.expanduser("~/.local/logs/fix")
 
 
 def latest_manual_log() -> str | None:

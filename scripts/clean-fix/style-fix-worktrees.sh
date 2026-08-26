@@ -127,7 +127,7 @@ if [[ -f "$CONF_FILE" ]]; then
                 ;;
             style_eval)
                 if [[ "$stripped" =~ ^mode= ]]; then
-                    echo "ERROR: [style_eval] stale clean-fix setting; stage enablement lives in $CLEAN_FIX_AGENT_ASSIGNMENTS_FILE and agent settings live in $AGENTS_CONFIG_FILE" >&2
+                    echo "ERROR: [style_eval] stale clean-fix setting; stage enablement lives in $FIX_AGENT_ASSIGNMENTS_FILE and agent settings live in $AGENTS_CONFIG_FILE" >&2
                     exit 1
                 fi
                 if [[ "$stripped" =~ ^max_new_findings=([0-9]+)$ ]]; then
@@ -142,10 +142,10 @@ if [[ -f "$CONF_FILE" ]]; then
                 elif [[ "$stripped" =~ ^heartbeat_interval_secs=([0-9]+)$ ]]; then
                     HEARTBEAT_INTERVAL_SECS="${BASH_REMATCH[1]}"
                 elif [[ "$stripped" =~ ^mode= ]]; then
-                    echo "ERROR: [style_fix] stale clean-fix setting; stage enablement lives in $CLEAN_FIX_AGENT_ASSIGNMENTS_FILE and agent settings live in $AGENTS_CONFIG_FILE" >&2
+                    echo "ERROR: [style_fix] stale clean-fix setting; stage enablement lives in $FIX_AGENT_ASSIGNMENTS_FILE and agent settings live in $AGENTS_CONFIG_FILE" >&2
                     exit 1
                 elif [[ "$stripped" =~ ^(enabled|agent|model|effort)= ]]; then
-                    echo "ERROR: [style_fix] stale clean-fix setting; stage enablement lives in $CLEAN_FIX_AGENT_ASSIGNMENTS_FILE and agent settings live in $AGENTS_CONFIG_FILE" >&2
+                    echo "ERROR: [style_fix] stale clean-fix setting; stage enablement lives in $FIX_AGENT_ASSIGNMENTS_FILE and agent settings live in $AGENTS_CONFIG_FILE" >&2
                     exit 1
                 fi
                 ;;
@@ -208,7 +208,7 @@ run_style_agent() {
     esac
 }
 
-if [[ "$STYLE_ENABLED" == "false" && "${CLEAN_FIX_FORCE_STYLE_STAGES:-0}" != "1" ]]; then
+if [[ "$STYLE_ENABLED" == "false" && "${FIX_FORCE_STYLE_STAGES:-0}" != "1" ]]; then
     echo "Style fix is disabled."
     exit 0
 fi
@@ -261,7 +261,7 @@ for entry in ${projects[@]+"${projects[@]}"}; do
     # The worktree dir name encodes the source checkout when an [active_checkout]
     # redirect is in play (e.g. bevy_lagrange_flycam_style_fix), so the user can
     # see at a glance which checkout it branched from. Identity/history stays in
-    # $name (and the .clean-fix-project marker), never the dir name. Not
+    # $name (and the .fix-project marker), never the dir name. Not
     # redirected (checkout == entry) -> the identity name, unchanged.
     if [[ "$checkout" != "$entry" ]]; then
         worktree_dir="${RUST_DIR}/${checkout%%/*}_style_fix"
@@ -627,14 +627,14 @@ create_and_fix() {
     # checkout-encoded) dir name. style_history.py, worktree_delete, and
     # style_fix_review read this instead of stripping _style_fix from the
     # basename. Keep it out of `git status` via the repo's shared info/exclude.
-    printf '%s\n' "$proj" > "$worktree_dir/.clean-fix-project"
+    printf '%s\n' "$proj" > "$worktree_dir/.fix-project"
     local git_common
     git_common="$(git -C "$repo_dir" rev-parse --git-common-dir 2>/dev/null)"
     if [[ -n "$git_common" ]]; then
         [[ "$git_common" != /* ]] && git_common="$repo_dir/$git_common"
-        if ! grep -qxF ".clean-fix-project" "$git_common/info/exclude" 2>/dev/null; then
+        if ! grep -qxF ".fix-project" "$git_common/info/exclude" 2>/dev/null; then
             mkdir -p "$git_common/info"
-            printf '%s\n' ".clean-fix-project" >> "$git_common/info/exclude"
+            printf '%s\n' ".fix-project" >> "$git_common/info/exclude"
         fi
     fi
     echo "[diag $proj] after identity marker write"

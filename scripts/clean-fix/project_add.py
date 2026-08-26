@@ -16,7 +16,7 @@ from typing import Literal, cast
 
 DEFAULT_CONF = Path.home() / ".claude" / "scripts" / "clean-fix" / "clean-fix.conf"
 DEFAULT_RUST_DIR = Path.home() / "rust"
-MARKER = "#CLEAN_FIX_SKIP#"
+MARKER = "#FIX_SKIP#"
 SECTION_RE = re.compile(r"^\[(?P<name>.+)\]\s*$")
 
 ProjectKind = Literal["standalone", "workspace", "workspace_member"]

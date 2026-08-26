@@ -300,7 +300,7 @@ def ensure_no_move_collisions(moves: list[PlannedMove]) -> None:
 
 def marker_updates(rust_dir: Path, old_key: str) -> list[PlannedMarker]:
     markers: list[PlannedMarker] = []
-    for marker in sorted(rust_dir.glob("*_style_fix/.clean-fix-project")):
+    for marker in sorted(rust_dir.glob("*_style_fix/.fix-project")):
         try:
             key = marker.read_text().strip()
         except OSError:

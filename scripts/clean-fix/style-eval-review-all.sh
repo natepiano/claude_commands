@@ -3,7 +3,7 @@
 # Runs after style-eval-all.sh and before style-fix-worktrees.sh in the
 # clean-fix pipeline.
 #
-# The review agent resolves from the cleanfix.style_eval_review row in
+# The review agent resolves from the fix.style_eval_review row in
 # config/agents.conf. The prompt lives at style-eval-review-prompt.md in this
 # directory — it is not a slash command.
 #
@@ -64,10 +64,10 @@ if [[ -f "$CONF_FILE" ]]; then
                 ;;
             style_eval)
                 if [[ "$stripped" =~ ^mode= ]]; then
-                    echo "ERROR: [style_eval] stale clean-fix setting; stage enablement lives in $CLEAN_FIX_AGENT_ASSIGNMENTS_FILE and agent settings live in $AGENTS_CONFIG_FILE" >&2
+                    echo "ERROR: [style_eval] stale clean-fix setting; stage enablement lives in $FIX_AGENT_ASSIGNMENTS_FILE and agent settings live in $AGENTS_CONFIG_FILE" >&2
                     exit 1
                 elif [[ "$stripped" =~ ^(enabled|agent|model|effort)= ]]; then
-                    echo "ERROR: [style_eval] stale clean-fix setting; stage enablement lives in $CLEAN_FIX_AGENT_ASSIGNMENTS_FILE and agent settings live in $AGENTS_CONFIG_FILE" >&2
+                    echo "ERROR: [style_eval] stale clean-fix setting; stage enablement lives in $FIX_AGENT_ASSIGNMENTS_FILE and agent settings live in $AGENTS_CONFIG_FILE" >&2
                     exit 1
                 fi
                 ;;
@@ -78,7 +78,7 @@ fi
 # Review has its own stage assignment. Empty model/effort values are filled from
 # the global agent registry before launch.
 cf_load_stage_assignment style_eval_review STYLE_ENABLED STYLE_AGENT STYLE_AGENT_MODEL STYLE_AGENT_EFFORT || exit 1
-if [[ "$STYLE_ENABLED" == "false" && "${CLEAN_FIX_FORCE_STYLE_STAGES:-0}" != "1" ]]; then
+if [[ "$STYLE_ENABLED" == "false" && "${FIX_FORCE_STYLE_STAGES:-0}" != "1" ]]; then
     echo "Style evaluation review is disabled."
     exit 0
 fi

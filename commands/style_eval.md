@@ -331,7 +331,7 @@ If `--fix` was passed, you are running interactively and the user is waiting on 
 2. Compute the log path deterministically — do not wait to read it from stdout:
 
    ```
-   LOG_PATH=$HOME/.local/logs/clean-fix/style-fix-manual-$(date '+%Y%m%d-%H%M%S').log
+   LOG_PATH=$HOME/.local/logs/fix/style-fix-manual-$(date '+%Y%m%d-%H%M%S').log
    ```
 
    The manual launcher names its log using `date '+%Y%m%d-%H%M%S'` taken at invocation time, so as long as you compute the same expression in the same shell second the path matches. (You can verify after the fact by reading the launcher's first stdout line.)

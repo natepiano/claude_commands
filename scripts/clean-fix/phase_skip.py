@@ -5,7 +5,7 @@ The conf is an opt-in allowlist, so "skipping" a target means commenting its
 allowlist line out, and "enabling" uncomments it. Style targets live in
 ``[projects]``.
 
-Skips are tagged with the ``#CLEAN_FIX_SKIP#`` marker so ``enable`` /
+Skips are tagged with the ``#FIX_SKIP#`` marker so ``enable`` /
 ``enable-all`` only reverse temporary skips and never touch plain doc comments.
 
 Usage:
@@ -25,7 +25,7 @@ from typing import Literal, cast
 from pathlib import Path
 
 CONF_FILE = Path(__file__).resolve().parent / "clean-fix.conf"
-MARKER = "#CLEAN_FIX_SKIP#"
+MARKER = "#FIX_SKIP#"
 
 SECTION_RE = re.compile(r"^\[(?P<name>.+)\]\s*$")
 PROJECTS_SECTION = "projects"

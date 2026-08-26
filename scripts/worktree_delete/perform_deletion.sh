@@ -37,14 +37,14 @@ cleanup_residual_directory() {
 # Capture the clean-fix identity BEFORE removing the worktree. A *_style_fix
 # worktree's dir name may encode its source checkout (e.g.
 # bevy_lagrange_flycam_style_fix), so the history key comes from the
-# .clean-fix-project marker, not the basename — and the marker is gone once the
+# .fix-project marker, not the basename — and the marker is gone once the
 # worktree is removed below. Fall back to the basename strip for legacy
 # worktrees created before the marker existed.
 WORKTREE_NAME="$(basename "$WORKTREE_PATH")"
 STYLE_FIX_PROJECT=""
 if [[ "$WORKTREE_NAME" == *_style_fix ]]; then
-    if [[ -f "$WORKTREE_PATH/.clean-fix-project" ]]; then
-        STYLE_FIX_PROJECT="$(tr -d '[:space:]' < "$WORKTREE_PATH/.clean-fix-project")"
+    if [[ -f "$WORKTREE_PATH/.fix-project" ]]; then
+        STYLE_FIX_PROJECT="$(tr -d '[:space:]' < "$WORKTREE_PATH/.fix-project")"
     fi
     [[ -z "$STYLE_FIX_PROJECT" ]] && STYLE_FIX_PROJECT="${WORKTREE_NAME%_style_fix}"
 fi

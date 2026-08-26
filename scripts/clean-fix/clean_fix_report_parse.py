@@ -4,7 +4,7 @@
 Modes:
   default                   Current status for every keyed [projects] target.
   --latest-log              Full report parse of the newest clean-fix log.
-  --list                    Enumerate logs in ~/.local/logs/clean-fix/ with summaries.
+  --list                    Enumerate logs in ~/.local/logs/fix/ with summaries.
   --phase-detect <log>      Emit the currently-running phase (for /clean_fix monitor).
   --filter-regex            Print the live-monitor filter regex (single source of truth).
 
@@ -24,7 +24,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TypedDict, cast
 
-LOG_DIR = Path.home() / ".local" / "logs" / "clean-fix"
+LOG_DIR = Path.home() / ".local" / "logs" / "fix"
 RUST_DIR = Path.home() / "rust"
 CONF_FILE = Path.home() / ".claude" / "scripts" / "clean-fix" / "clean-fix.conf"
 HISTORY_DIR = RUST_DIR / "nate_style" / ".history"
@@ -93,11 +93,11 @@ EXISTING_FIX_SUMMARY_PREFIX: str = "style_fix worktree already has Fix Summary"
 BOOKKEEPING_REASONS: frozenset[str] = ALWAYS_EXCLUDED_REASONS | FRAMEWORK_FILTER_REASONS
 
 TS_RE = re.compile(r"^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}) ")
-COMPLETE_RE = re.compile(r"=== Clean-fix complete \(([^)]+)\) ===")
+COMPLETE_RE = re.compile(r"=== Fix complete \(([^)]+)\) ===")
 # Logs outlive the code that wrote them: the run-log directory keeps about a
 # day of logs, and without this historical banner a finished run reads as running.
 HISTORICAL_COMPLETE_RE = re.compile(
-    r"=== Clean-fix Rust clean \+ rebuild complete \(([^)]+)\) ==="
+    r"=== Clean-fix (?:complete|Rust clean \+ rebuild complete) \(([^)]+)\) ==="
 )
 
 
@@ -1234,7 +1234,7 @@ def style_fix_worktrees_by_project() -> dict[str, list[str]]:
     for path in sorted(RUST_DIR.glob("*_style_fix")):
         if not path.is_dir():
             continue
-        marker = path / ".clean-fix-project"
+        marker = path / ".fix-project"
         try:
             key = marker.read_text(errors="replace").strip()
         except OSError:

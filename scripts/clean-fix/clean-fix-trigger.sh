@@ -10,10 +10,10 @@
 
 set -euo pipefail
 
-CLEAN_FIX_SCRIPT="$HOME/.claude/scripts/clean-fix/clean-fix.sh"
+FIX_ORCHESTRATOR_PATH="$HOME/.claude/scripts/clean-fix/clean-fix.sh"
 
-if pgrep -f "$CLEAN_FIX_SCRIPT" >/dev/null 2>&1; then
+if pgrep -f "$FIX_ORCHESTRATOR_PATH" >/dev/null 2>&1; then
     exit 0
 fi
 
-exec "$CLEAN_FIX_SCRIPT"
+exec "$FIX_ORCHESTRATOR_PATH"

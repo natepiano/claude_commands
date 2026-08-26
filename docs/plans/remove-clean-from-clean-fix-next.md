@@ -32,8 +32,12 @@ commit would have cost the reviewability the phase most needed.
 - `project_add.py` `Project.workspace_root: Path | None` is valid only when
   `kind == "workspace_member"`, checked that way at `:305` — a discriminant and a
   payload in two fields that must agree and are not made to.
-- `project_rename.py` `Plan.pending_path: Path | None` means "this rename has
-  pending state to migrate" and is read as a presence test at `:435` and `:471`.
+- `project_rename.py` `Plan` couples `pending_path: Path | None` to
+  `pending_project_root_changed: bool`. `build_plan()` derives them separately at
+  `:368-380`; `print_plan()` tests the boolean at `:434` and interpolates the
+  optional at `:435`, while `update_pending_project_root()` independently reads
+  `None` as "no pending JSON" before the unconditional call at `:471` — so a
+  state where the two disagree is representable.
 - `DetectResult` in `retarget_clean_fix.py` (later `retarget_fix.py`) is a
   `TypedDict` carrying a `match` boolean, a free-form `kind` string, and fields
   that are empty strings when `match` is false — match state spelled three ways
@@ -44,7 +48,10 @@ commit would have cost the reviewability the phase most needed.
   reason text.
 
 **What would satisfy it:** one tagged project-role member replacing
-`kind`/`workspace_root`; a pending-migration variant replacing `pending_path`; a
+`kind`/`workspace_root`; a tagged pending-migration state replacing both
+`pending_path` and `pending_project_root_changed`, whose variants distinguish no
+pending JSON, pending JSON already current, and pending JSON needing a root
+update; a
 tagged worktree-redirect match replacing `DetectResult`; and a
 `ConfigurationCommitOutcome` whose variants state `Committed`, `Unchanged`,
 `RepositoryUnavailable`, `StageFailed`, and `CommitFailed`.

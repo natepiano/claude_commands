@@ -33,7 +33,7 @@ LOAD_STYLE_SCRIPT = Path(
         str(Path.home() / ".claude" / "scripts" / "rust_style" / "load-rust-style.sh"),
     )
 )
-CLEAN_FIX_CONF_FILE = Path(
+FIX_CONF_FILE = Path(
     os.environ.get(
         "STYLE_HISTORY_CONF_FILE",
         str(Path.home() / ".claude" / "scripts" / "clean-fix" / "clean-fix.conf"),
@@ -317,12 +317,12 @@ def _style_eval_conf_int(conf_key: str) -> int:
     silent defaulting would let arbitrary numbers leak in (the bug that
     motivated centralizing max_new_findings).
     """
-    if not CLEAN_FIX_CONF_FILE.exists():
+    if not FIX_CONF_FILE.exists():
         raise SystemExit(
-            f"clean-fix.conf not found at {CLEAN_FIX_CONF_FILE}; [style_eval] {conf_key} must be set there."
+            f"clean-fix.conf not found at {FIX_CONF_FILE}; [style_eval] {conf_key} must be set there."
         )
     current_section = ""
-    for raw_line in CLEAN_FIX_CONF_FILE.read_text().splitlines():
+    for raw_line in FIX_CONF_FILE.read_text().splitlines():
         stripped = raw_line.split("#", 1)[0].strip()
         if not stripped:
             continue
@@ -337,10 +337,10 @@ def _style_eval_conf_int(conf_key: str) -> int:
                 return int(value.strip())
             except ValueError as exc:
                 raise SystemExit(
-                    f"[style_eval] {conf_key} in {CLEAN_FIX_CONF_FILE} is not an int: {value.strip()!r}"
+                    f"[style_eval] {conf_key} in {FIX_CONF_FILE} is not an int: {value.strip()!r}"
                 ) from exc
     raise SystemExit(
-        f"[style_eval] {conf_key} is not set in {CLEAN_FIX_CONF_FILE}"
+        f"[style_eval] {conf_key} is not set in {FIX_CONF_FILE}"
     )
 
 
@@ -376,11 +376,11 @@ def has_fix_summary_marker(markdown: str) -> bool:
 
 
 def excluded_projects() -> set[str]:
-    if not CLEAN_FIX_CONF_FILE.exists():
+    if not FIX_CONF_FILE.exists():
         return set()
     excluded: set[str] = set()
     current_section = ""
-    for raw_line in CLEAN_FIX_CONF_FILE.read_text().splitlines():
+    for raw_line in FIX_CONF_FILE.read_text().splitlines():
         stripped = raw_line.split("#", 1)[0].strip()
         if not stripped:
             continue
@@ -403,11 +403,11 @@ def active_checkout_overrides() -> dict[str, str]:
     """``[active_checkout]`` map: a [projects] entry -> the checkout path (relative
     to ~/rust) that clean-fix should read instead of the entry's own path. Lets a
     worktree stand in for a project while history stays under the entry's name."""
-    if not CLEAN_FIX_CONF_FILE.exists():
+    if not FIX_CONF_FILE.exists():
         return {}
     overrides: dict[str, str] = {}
     current_section = ""
-    for raw_line in CLEAN_FIX_CONF_FILE.read_text().splitlines():
+    for raw_line in FIX_CONF_FILE.read_text().splitlines():
         stripped = raw_line.split("#", 1)[0].strip()
         if not stripped:
             continue
@@ -432,12 +432,12 @@ def workspace_members() -> dict[str, WorkspaceMember]:
     dir and subpath come from the checkout, which an ``[active_checkout]``
     redirect may point at a worktree.
     """
-    if not CLEAN_FIX_CONF_FILE.exists():
+    if not FIX_CONF_FILE.exists():
         return {}
     overrides = active_checkout_overrides()
     members: dict[str, WorkspaceMember] = {}
     current_section = ""
-    for raw_line in CLEAN_FIX_CONF_FILE.read_text().splitlines():
+    for raw_line in FIX_CONF_FILE.read_text().splitlines():
         stripped = raw_line.split("#", 1)[0].strip()
         if not stripped:
             continue
@@ -459,7 +459,7 @@ def workspace_members() -> dict[str, WorkspaceMember]:
     return members
 
 
-PROJECT_MARKER = ".clean-fix-project"
+PROJECT_MARKER = ".fix-project"
 
 
 def project_key(project_root: Path) -> str:

@@ -18,7 +18,7 @@ if [[ $# -gt 0 ]]; then
                 echo "Usage: clean-fix.sh run_once" >&2
                 exit 1
             fi
-            export CLEAN_FIX_FORCE_STYLE_STAGES=1
+            export FIX_FORCE_STYLE_STAGES=1
             ;;
         *)
             PROJECT_FILTER="$1"
@@ -31,9 +31,9 @@ if [[ $# -gt 0 ]]; then
 fi
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-LOG_DIR="$HOME/.local/logs/clean-fix"
-LOG_FILE="$LOG_DIR/clean-fix-$(date '+%Y%m%d-%H%M%S').log"
-LEGACY_LOG="$HOME/.local/logs/clean-fix.log"
+LOG_DIR="$HOME/.local/logs/fix"
+LOG_FILE="$LOG_DIR/fix-$(date '+%Y%m%d-%H%M%S').log"
+LEGACY_LOG="$HOME/.local/logs/fix.log"
 CONF_FILE="$SCRIPT_DIR/clean-fix.conf"
 RUN_LOG_RETENTION_MINUTES=1440
 MANUAL_LOG_RETENTION_DAYS=7
@@ -46,6 +46,9 @@ mkdir -p "$LOG_DIR"
 # The pipeline runs every 10 minutes around the clock. Keep roughly one
 # day of scheduled logs plus a short manual-log window so report lists stay
 # focused on runs that are still useful to inspect.
+# New runs use the fix-*.log pattern.
+find "$LOG_DIR" -name 'fix-*.log' -mmin +"$RUN_LOG_RETENTION_MINUTES" -delete 2>/dev/null || true
+# Migrated historical runs retain the clean-fix-*.log pattern.
 find "$LOG_DIR" -name 'clean-fix-*.log' -mmin +"$RUN_LOG_RETENTION_MINUTES" -delete 2>/dev/null || true
 find "$LOG_DIR" -name 'style-fix-manual-*.log' -mtime +"$MANUAL_LOG_RETENTION_DAYS" -delete 2>/dev/null || true
 > "$LOG_FILE"
@@ -140,19 +143,19 @@ if [[ -f "$CONF_FILE" ]]; then
                 ;;
             style_eval)
                 if [[ "$stripped" =~ ^mode= ]]; then
-                    echo "ERROR: [style_eval] stale clean-fix setting; stage enablement lives in $CLEAN_FIX_AGENT_ASSIGNMENTS_FILE and agent settings live in $AGENTS_CONFIG_FILE" >&2
+                    echo "ERROR: [style_eval] stale clean-fix setting; stage enablement lives in $FIX_AGENT_ASSIGNMENTS_FILE and agent settings live in $AGENTS_CONFIG_FILE" >&2
                     exit 1
                 elif [[ "$stripped" =~ ^(enabled|agent|model|effort)= ]]; then
-                    echo "ERROR: [style_eval] stale clean-fix setting; stage enablement lives in $CLEAN_FIX_AGENT_ASSIGNMENTS_FILE and agent settings live in $AGENTS_CONFIG_FILE" >&2
+                    echo "ERROR: [style_eval] stale clean-fix setting; stage enablement lives in $FIX_AGENT_ASSIGNMENTS_FILE and agent settings live in $AGENTS_CONFIG_FILE" >&2
                     exit 1
                 fi
                 ;;
             style_fix)
                 if [[ "$stripped" =~ ^mode= ]]; then
-                    echo "ERROR: [style_fix] stale clean-fix setting; stage enablement lives in $CLEAN_FIX_AGENT_ASSIGNMENTS_FILE and agent settings live in $AGENTS_CONFIG_FILE" >&2
+                    echo "ERROR: [style_fix] stale clean-fix setting; stage enablement lives in $FIX_AGENT_ASSIGNMENTS_FILE and agent settings live in $AGENTS_CONFIG_FILE" >&2
                     exit 1
                 elif [[ "$stripped" =~ ^(enabled|agent|model|effort)= ]]; then
-                    echo "ERROR: [style_fix] stale clean-fix setting; stage enablement lives in $CLEAN_FIX_AGENT_ASSIGNMENTS_FILE and agent settings live in $AGENTS_CONFIG_FILE" >&2
+                    echo "ERROR: [style_fix] stale clean-fix setting; stage enablement lives in $FIX_AGENT_ASSIGNMENTS_FILE and agent settings live in $AGENTS_CONFIG_FILE" >&2
                     exit 1
                 fi
                 ;;
@@ -223,18 +226,18 @@ fi
 ELAPSED=$(( SECONDS - START_TIME ))
 MINUTES=$(( ELAPSED / 60 ))
 SECS=$(( ELAPSED % 60 ))
-log "=== Clean-fix complete (${MINUTES}m ${SECS}s) ==="
+log "=== Fix complete (${MINUTES}m ${SECS}s) ==="
 
 # Generate the clean-fix report via the assigned agent — but only when the run did
 # something. The pipeline fires every 10 minutes; an all-SKIP cycle has no
 # OK/FAILED lines and an agent call per idle cycle is pure cost.
-REPORT_FILE="/tmp/clean-fix-report.txt"
+REPORT_FILE="/tmp/fix-report.txt"
 REPORT_PROMPT_FILE="${LOG_FILE%.log}-report-prompt.md"
 REPORT_LOG_FILE="$LOG_DIR/report_render.txt"
 if grep -qE '(^|[[:space:]])(OK|FAILED|ERROR|TIMEOUT|RECOVERED|Launched):' "$LOG_FILE"; then
     log "Generating clean-fix report..."
     if sed 's/\$ARGUMENTS/rebuild/g' "$HOME/.claude/scripts/clean-fix/report-render.md" > "$REPORT_PROMPT_FILE"; then
-        "$HOME/.claude/scripts/agents/agent_exec.sh" cleanfix.report write \
+        "$HOME/.claude/scripts/agents/agent_exec.sh" fix.report write \
             "$HOME/.claude" "$REPORT_PROMPT_FILE" "$REPORT_FILE" "$REPORT_LOG_FILE" || {
             log "WARNING: failed to generate clean-fix report"
         }

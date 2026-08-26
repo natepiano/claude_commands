@@ -226,11 +226,11 @@ Run this from anywhere inside the style-fix worktree to derive the project name,
 
 ```bash
 worktree_dir="$(git rev-parse --show-toplevel)"
-# Identity/history key comes from the .clean-fix-project marker — the dir name
+# Identity/history key comes from the .fix-project marker — the dir name
 # may encode the source checkout (e.g. bevy_lagrange_flycam_style_fix) and is
 # NOT the key. Fall back to the basename strip for legacy worktrees.
-if [[ -f "$worktree_dir/.clean-fix-project" ]]; then
-  project="$(tr -d '[:space:]' < "$worktree_dir/.clean-fix-project")"
+if [[ -f "$worktree_dir/.fix-project" ]]; then
+  project="$(tr -d '[:space:]' < "$worktree_dir/.fix-project")"
 else
   project="$(basename "$worktree_dir")"
   project="${project%_style_fix}"
