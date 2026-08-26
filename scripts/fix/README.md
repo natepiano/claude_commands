@@ -44,7 +44,7 @@ Runs every 10 minutes via launchd.
 
 ## Reliability guards (the rg-hang)
 
-On **2026-06-02** a nightly run wedged for 12+ hours and produced no style-fix
+On **2026-06-02** a scheduled run wedged for 12+ hours and produced no style-fix
 worktrees. Two style-eval agents had issued pipelines like
 `rg PATTERN -g '*.rs' | rg -v X | head` where the first `rg` has glob filters
 but **no path argument**. With no path, `rg` searches stdin whenever stdin is
