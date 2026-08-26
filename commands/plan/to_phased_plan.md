@@ -100,14 +100,8 @@ the compiled plan is good; never do it as part of this run.
 Read `~/.claude/docs/delegate_plan_format.md` — it is the target format and the
 contract `/plan:delegate`, `/plan:phase_review`, and `/plan:to_as_built` all depend on.
 
-Set `${RESERVATION_COVERAGE_MODE}` explicitly. Use `required` when `${DEST}` is
-inside a repository enrolled by `.claude/config/berth.toml`; otherwise use
-`advisory`. These are tagged caller semantics consumed by the shared Work Order
-validator, not a boolean and not an inference from an empty list.
 Resolve `${PLAN_REPOSITORY_ROOT}` from `${DEST}`'s containing Git repository.
-When `${DEST}` is not in Git, use its parent directory and force coverage to
-`advisory`; a required plan must live in the repository whose relative paths it
-reserves.
+When `${DEST}` is not in Git, use its parent directory.
 
 **Detect the mode.** The doc is already delegate-ready if it has both a
 `## Delegation Context` section and the `Status: IMPLEMENTATION PLAN — phased,
@@ -257,10 +251,6 @@ not codebase searching.
      the Spec. Do NOT compress a settled decision to a summary — the delegate
      needs the detail to implement without searching.
    - **Files** — the files to create/modify, with line refs the doc already cites.
-   - **Reservations** — generated from Files only through
-     `~/.claude/scripts/berth/work_order.py`; never hand-parse Files or invent a
-     second Reservations grammar. The generator emits conservative exact
-     `file:` scopes and excludes entries explicitly described as verify-only.
    - **Constraints from prior phases** — facts later phases need from earlier ones
      (what got built, decisions that bind). Empty for Phase 1.
    - **Acceptance gate** — the build/test/behavior proving the phase done.
@@ -332,32 +322,20 @@ Do not change code. Do not commit.
 
 <ValidateWorkOrders>
 The shared module is the only Work Order structure/parser contract. After
-`<Rewrite/>`, first run its complete structural validation separately for every
-remaining `todo` phase, in advisory mode, so missing declarations remain a
-tagged result that can be generated. Do not validate archived `done` Work
-Orders; their byte-preserved historical format is outside the live reservation
-coverage transition:
+`<Rewrite/>`, run its complete structural validation separately for every
+remaining `todo` phase. Do not validate archived `done` Work Orders; their
+byte-preserved historical format is outside the live Work Order contract:
 
 ```sh
 PYTHONPATH="$HOME/.claude/scripts" python3 -m berth.work_order \
   --repository-root "${PLAN_REPOSITORY_ROOT}" validate --document "${DEST}" \
-  --phase <todo-phase> --coverage advisory
+  --phase <todo-phase>
 ```
 
-For each newly compiled target phase whose tagged
-`reservation_declaration.kind` is `missing`, first run the same module's
-`emit-reservations` operation with `--document "${DEST}" --phase <N>`, insert
-the returned `markdown` after that phase's **Files** block. Then run `validate`
-again for every remaining `todo` phase with
-`--coverage "${RESERVATION_COVERAGE_MODE}"` as the final gate. Do not copy its
-parsing logic into this command.
-
 The final validation covers the complete Work Order: non-empty Goal, Spec, and
-Files; lexical repo-relative paths; a minimal Reservations antichain; and
-Files/Reservations agreement. Any edit in this command that changes Files or
-adds an implementation path must update Reservations and revalidate the whole
-Work Order before this command returns. A missing declaration is a tagged valid
-answer only under `advisory`; under `required` it blocks `<Report/>`.
+Files and lexical repository-relative paths. Any edit in this command that
+changes Files or adds an implementation path must revalidate the whole Work
+Order before this command returns. Do not copy the parser into this command.
 </ValidateWorkOrders>
 
 ---

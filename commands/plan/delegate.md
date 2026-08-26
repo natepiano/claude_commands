@@ -44,6 +44,9 @@ State:
 - `STYLE_REVIEW_DONE`: starts false. The durable true state is
   `${SESSION_DIR}/style_review_done`; later fixes never clear it.
 - `FINDINGS`: the current phase's `findings.py` ledger.
+- `DELEGATED_PHASE_RESERVATION_STATE`: the tagged state persisted at
+  `${SESSION_DIR}/delegated_phase_reservation_state.json`; see
+  <DelegatedPhaseReservationContract/>.
 
 <TagReferenceContract>
 `<section-name/>` means apply the complete matching tagged contract. The
@@ -61,6 +64,9 @@ or exceptions; it does not restate the contract.
 - A checkpoint never pushes. If a phase explicitly needs a remote commit for a
   dependency pin, consumer, or CI run, pushing that working branch is mechanical
   phase work, not a user decision or prerequisite.
+- A phase reservation is released only by the successful-checkpoint path in
+  <CheckpointCommit/>. Cancellation, error, failed commit, `single`, user stop,
+  and failed release never release it or delete its durable record.
 - Verify a claimed blocker against the live tree. Follow a decision already
   settled by the plan. Do not expose sandbox flags, scripts, status files,
   ledger ids, or other tooling mechanics in user-facing reports.
@@ -138,13 +144,21 @@ does.
   `MODE`, `AUTO_WINDOW`, the last authorization, `PROGRESS_UPDATES_ENABLED`, any
   live `DISPATCH_HANDLE`, any live `REVIEW_DISPATCH_HANDLE` with `EARLY_REVIEW`
   and `REVIEW_PASS`, any Claude `PROGRESS_TIMER_HANDLE`,
-  `STYLE_REVIEW_DONE`, `NEXT_ITEMS_PATH`, and any
-  unresolved next-item approval. Exclude it from review intent-to-add and
-  commits.
+  `STYLE_REVIEW_DONE`, `NEXT_ITEMS_PATH`, whichever tagged
+  `DelegatedPhaseReservationState` is live, and any
+  unresolved next-item approval. When a claim is still in its authorization
+  round trip, also include its UUID-v7 coordination run, captured phase-start
+  HEAD, answer, blocker, reason, and transient proposal token. Exclude the
+  handoff from review intent-to-add and commits.
 - Never stop or delay work for compaction. Claude resumes from a live-dispatch
   notification; Codex remains in <CodexDispatchWait/>.
 - After compaction, re-read this command in full, then the handoff. Restore live
-  dispatches and state; delete the handoff after its phase is committed. A
+  dispatches and state. Independently read and validate
+  `${SESSION_DIR}/delegated_phase_reservation_state.json` once coordination has
+  reached a persisted state, including its durable `checkpoint_commit` when
+  release confirmation is pending; the handoff, conversation, and the session
+  mapping are never reservation-lifecycle memory. Delete the handoff only after
+  checkpoint and any active release both succeed. A
   dispatch the handoff records as live but that is gone did not survive: resolve
   it per <FixDispatch/> before trusting any state it was supposed to have written.
 - A real user decision may still end the turn after the Stop hook's one retry.
@@ -594,19 +608,20 @@ Apply <CoreContract/>, <CompactionContract/>, <UserFacingText/>, and
 2. <ComposeWorkOrder/>
 3. <VerbosePrePhaseGate/> when required
 4. <SelectTask/>
-5. <LaunchImplementation/>
-6. <DualReview/>
-7. <Synthesize/>
-8. <RunApplicationSmokeTest/>
-9. <RunPhaseStyleReview/>
-10. <RunPhaseReview/>
-11. <RunPhaseShrink/>
-12. <ConsiderNextItems/>
-13. <CheckpointCommit/>
-14. <DiscardPhaseReviewText/>
-15. <RecordPhaseCompletion/>
-16. <VerbosePostPhaseReport/> and applicable <VerbosePostPhaseGate/>
-17. <NextPhase/> or <RunSummary/>
+5. <CoordinateDelegatedPhaseReservation/>
+6. <LaunchImplementation/>
+7. <DualReview/>
+8. <Synthesize/>
+9. <RunApplicationSmokeTest/>
+10. <RunPhaseStyleReview/>
+11. <RunPhaseReview/>
+12. <RunPhaseShrink/>
+13. <ConsiderNextItems/>
+14. <CheckpointCommit/>
+15. <DiscardPhaseReviewText/>
+16. <RecordPhaseCompletion/>
+17. <VerbosePostPhaseReport/> and applicable <VerbosePostPhaseGate/>
+18. <NextPhase/> or <RunSummary/>
 </ExecutionSteps>
 
 <PrepareSession>
@@ -618,20 +633,17 @@ through <RunSummary/> or single-mode completion.
 
 <ComposeWorkOrder>
 1. For a phased plan, validate the target Work Order before reading any of its
-   fields. Set `${RESERVATION_COVERAGE_MODE}` to `required` when the plan's
-   repository has `.claude/config/berth.toml`, otherwise `advisory`, and run:
+   fields:
 
    ```sh
    PYTHONPATH="$HOME/.claude/scripts" python3 -m berth.work_order \
      --repository-root "${WORKING_DIR}" validate --document "${PLAN_DOC}" \
-     --phase <target-phase> --coverage "${RESERVATION_COVERAGE_MODE}"
+     --phase <target-phase>
    ```
 
-   The tagged output is authoritative for complete Goal/Spec/Files structure,
-   `reservation_declaration = declared|missing`, lexical paths, minimal scopes,
-   and Files/Reservations agreement. Do not grow a second parser here. A
-   missing declaration is accepted only when the explicitly tagged caller mode
-   is `advisory`; an empty declaration is always malformed.
+   The tagged output is authoritative for complete Goal/Spec/Files structure
+   and lexical paths. Work Orders do not declare reservations; the edit hook
+   claims exact paths on first touch.
 
    Then scan the target Work Order for `**Pending decision:**`.
    Verify cited code still matches the block. **Re-test the block against
@@ -651,9 +663,8 @@ through <RunSummary/> or single-mode completion.
    another repository goes to the next-items file derived in step 5, and only
    with the user's approval; never append to it automatically.
    After editing a resolution into Spec, Files, or the acceptance gate, rerun
-   the shared validation above before continuing. A Files edit or newly named
-   implementation path must be mirrored into Reservations; a validation failure
-   blocks dispatch.
+   the shared validation above before continuing. A validation failure blocks
+   dispatch.
 2. Parse the complete bounded-auto phrase before a standalone phase selector.
    Reject `single` plus `verbose`, auto without `verbose`, non-positive N, or an
    invalid range. Set `MODE=single` for `single` or non-phased work,
@@ -701,6 +712,111 @@ If an initial verbose invocation contains a bounded-auto control, resolve
 `AUTO_WINDOW` and run <AutoWindowBatchBriefing/> before <SelectTask/>. Otherwise
 follow <AuthorizationContract/>.
 </ComposeWorkOrder>
+
+<DelegatedPhaseReservationContract>
+Coordination applies to phased Work Orders in every mode. Ad hoc work skips it.
+
+Persist exactly one tagged `DelegatedPhaseReservationState` for the current
+phase at `${SESSION_DIR}/delegated_phase_reservation_state.json`. Write every
+state transition atomically and read it back before the next lifecycle action;
+the initial state must be durable before dispatch. The domain states and
+on-disk shapes are:
+
+```json
+{"kind":"repository_not_enrolled","phase":"<phase>"}
+{"kind":"enrolled_awaiting_first_touch","phase":"<phase>"}
+{"kind":"active","active_phase_reservation":{"reservation_id":"<id>","coordination_run_id":"<uuid-v7>","phase":"<phase>","phase_start_head":"<full object id>"}}
+{"kind":"checkpoint_committed_awaiting_release_confirmation","checkpoint_release_confirmation_pending":{"reservation_id":"<id>","coordination_run_id":"<uuid-v7>","phase":"<phase>","phase_start_head":"<full object id>","checkpoint_commit":"<full object id>"}}
+```
+
+These are
+`DelegatedPhaseReservationState::{RepositoryNotEnrolled,
+EnrolledAwaitingFirstTouch, Active(ActivePhaseReservation),
+CheckpointCommittedAwaitingReleaseConfirmation(
+CheckpointReleaseConfirmationPending)}`. Do not represent any of them as an
+absent record or a bare optional value. Only `Active` and
+`CheckpointCommittedAwaitingReleaseConfirmation` supply a release argument.
+The engine's harness-session mapping is a disposable edit-authorization
+projection: another claim in the same harness session replaces it, and no
+command reads a reservation id back from it.
+
+`ActivePhaseReservation` is orchestration memory. The registered edit hook
+creates it only from a validated clear-check result whose acquisition is
+`appended` or `already_held`, copying the returned reservation and
+coordination-run ids, phase, and protected phase-start HEAD. Never reconstruct
+it from a marker, rendered prose, or conversation.
+
+`CheckpointReleaseConfirmationPending` is durable proof that the checkpoint
+commit succeeded and only release confirmation remains. Create it only in
+<CheckpointCommit/> step 6 by atomically replacing `Active` after that step's
+commit succeeds, copying the active reservation fields and the full object id
+captured immediately from that successful commit. Never create or reconstruct
+it from conversation or from `git rev-parse HEAD` read at a later time. Delete
+this pending record only after <CheckpointCommit/> validates a successful
+release.
+
+An unsuccessful ending applies <RetainDelegatedPhaseReservation/>. This includes
+a cancelled no-diff phase, dispatch or run error, failed checkpoint commit,
+every `single` run including a dirty one, user stop, drift refusal, busy ledger,
+and failed release. Never invoke release from an error handler, cancellation
+path, single-mode completion, run summary, or session cleanup.
+</DelegatedPhaseReservationContract>
+
+<RetainDelegatedPhaseReservation>
+If the durable state is `Active` or
+`CheckpointCommittedAwaitingReleaseConfirmation`, leave both the engine
+reservation and `${SESSION_DIR}/delegated_phase_reservation_state.json` intact.
+Report that the phase stopped before its checkpoint release could be confirmed
+and name the recovery action that stopped; retain the reservation id in
+durable/internal recovery output even when ordinary user-facing prose omits
+tooling ids. This retention is still required when `release` may have died after
+appending its checkpoint: that post-append death leaves
+`CheckpointCommittedAwaitingReleaseConfirmation`, and only
+<CheckpointCommit/> step 7 may later confirm that journalled success from
+matching outstanding evidence and delete the record. A state file that is
+absent after a validated claim, malformed, names another unfinished phase, or
+disagrees with a validated claim is lifecycle loss, not non-enrollment: stop and
+report it. Absence before the coordination boundary has produced a state is
+ordinary and must not be misreported as loss. `RepositoryNotEnrolled` and
+`EnrolledAwaitingFirstTouch` require no engine release.
+</RetainDelegatedPhaseReservation>
+
+<CoordinateDelegatedPhaseReservation>
+Run after phase authorization and task selection, immediately before
+<LaunchImplementation/>. It is the only pre-dispatch coordination boundary.
+Do not dispatch until this contract reaches one of its four persisted states.
+
+0. On resume, read the state file first. A valid state for the current phase is
+   authoritative: `Active` resumes without another claim, and either inactive
+   state resumes without an engine mutation. `EnrolledAwaitingFirstTouch`
+   resumes with the registered edit hook still responsible for acquisition.
+   `CheckpointCommittedAwaitingReleaseConfirmation` for the current phase means
+   the checkpoint already committed and only its release confirmation remains:
+   resume at <CheckpointCommit/> step 7 without re-committing, re-claiming, or
+   dispatching. `Active` or
+   `CheckpointCommittedAwaitingReleaseConfirmation` for another unfinished
+   phase is a stranded reservation and stops the new dispatch. A completed phase
+   removes its inactive state under <RecordPhaseCompletion/>, so no old inactive
+   tag is silently reused for a new phase.
+1. When no state exists yet, invoke the shared `/sync board` entry point once:
+
+   ```sh
+   PYTHONPATH="$HOME/.claude/scripts" python3 -m berth.claim_state board \
+     --cwd "${WORKING_DIR}"
+   ```
+
+   `unconfigured` persists `RepositoryNotEnrolled` and proceeds silently.
+   `ledger_unreadable` stops the run; it is never
+   opt-out. `busy` stops with “the ledger is busy, try again” and the exact board
+   command to rerun; do not retry. `board_ready` persists
+   `EnrolledAwaitingFirstTouch` and proceeds without claiming predicted paths.
+2. The registered PreToolUse edit hook owns the next transition. A clear check
+   atomically acquires exact `file:` scopes before the edit, then replaces
+   `EnrolledAwaitingFirstTouch` with `Active` from the returned facts. A blocked
+   check refuses the edit and leaves the pending state intact. An unreadable
+   ledger stops without facts. Do not call `cargo-berth claim` on behalf of a
+   Work Order.
+</CoordinateDelegatedPhaseReservation>
 
 <PhaseBriefing>
 Build only from Delegation Context, the Work Order, and command-line amendments:
@@ -871,7 +987,8 @@ in the dispatch update.
    <DispatchContract/>.
 6. On completion, read `impl_status`: `implemented` loads `impl_summary.txt`
    into `${IMPL_SUMMARY}`. On `error`, cancel any early-launched reviewer per
-   <EarlyReviewArm/>, report `impl_agent.log`, record
+   <EarlyReviewArm/>, apply <RetainDelegatedPhaseReservation/>, report
+   `impl_agent.log`, record
    `finish-run --status error`, run `end_session.sh`, and stop; multi-phase runs
    also emit <RunSummary/>.
 7. `implemented` is the delegate's claim, not a passed gate. Read
@@ -1180,12 +1297,14 @@ For a mechanical repair, apply <ReviewDiffContract/>, read it yourself, and
 record each verdict without a delegate review. Force normal closure review if
 the repair touched another path or any id remains unclear.
 
-On completion, `implemented` continues as above; `error` reports the fix log,
-records an error outcome, clears the session marker, and stops. Both outcomes
-resolve the round in the ledger through the launcher. Any third outcome — the
-dispatch stopped, killed, or gone without `impl_status` reaching either — is the
-main agent's to resolve with `findings.py abandon` per <FindingsLedger/>, before
-reviewing, re-dispatching, or reporting anything about the round.
+On completion, `implemented` continues as above; `error` applies
+<RetainDelegatedPhaseReservation/>, reports the fix log, records an error
+outcome, clears the session marker, and stops. Both outcomes resolve the round
+in the ledger through the launcher. Any third outcome — the dispatch stopped,
+killed, or gone without `impl_status` reaching either — is the main agent's to
+resolve with `findings.py abandon` per <FindingsLedger/>, then apply
+<RetainDelegatedPhaseReservation/> before reviewing, re-dispatching, or
+reporting anything about the round.
 </FixDispatch>
 
 <Synthesize>
@@ -1421,7 +1540,40 @@ Loop/verbose only:
 3. Run `verify.sh fmt <package>` for every touched package; include resulting
    formatting changes.
 4. Mark the phase `status: done`. Never put its commit hash in the plan.
-5. Stage the phase, its plan doc, and `${NEXT_ITEMS_PATH}` when approved and
+5. Read and validate
+   `${SESSION_DIR}/delegated_phase_reservation_state.json`; do not use a value
+   remembered from conversation or the harness-session mapping. For `Active`,
+   require its phase to be current and run `/sync check` as drift's full
+   phase-start comparison exactly once:
+
+   ```sh
+   PYTHONPATH="$HOME/.claude/scripts" python3 -m berth.claim_state invoke \
+     --cwd "${WORKING_DIR}" --expected-verb drift -- drift --full --json
+   ```
+
+   Require a validated exit-`0` drift result with `payload.kind = drift`,
+   `payload.data.comparison = full_phase_start`, and exactly one
+   `payload.data.results` entry. That entry's `reservation_id` must equal the
+   `reservation_id` in the durable `ActivePhaseReservation`; bind the result to
+   that record's `phase_start_head`, because `full_phase_start` means the engine
+   compared the selected reservation against its protected phase-start
+   baseline. The response does not echo that object id, so do not invent an OID
+   field or re-derive acting identity. An exit-`5` `invalid_input` response whose
+   diagnostic says drift requires a live session mapping, active coordination-run
+   marker, or `CARGO_BERTH_RUN` is the `Unidentified` identity case. That case,
+   no result, more than one result, a different reservation id, any comparison
+   other than `full_phase_start`, an incursion, collision, attribution
+   requirement, absent/corrupt ledger, or malformed response is identity
+   ambiguity or unsafe drift and blocks the checkpoint. Apply
+   <RetainDelegatedPhaseReservation/> and report the exact full-drift command
+   above so a person can run it to see the conflict. The cheap drift delta is
+   forbidden here. Exit `6` has already spent the engine's single ten-second
+   deadline: invoke no retry, retain the reservation, and name that same exact
+   full-drift command. The two inactive states skip drift because they own no
+   reservation. `CheckpointCommittedAwaitingReleaseConfirmation` is valid here
+   only as a resumed state that routes directly to step 7; it does not re-enter
+   drift or checkpoint creation.
+6. Stage the phase, its plan doc, and `${NEXT_ITEMS_PATH}` when approved and
    changed; commit exactly once:
 
    ```
@@ -1432,7 +1584,132 @@ Loop/verbose only:
    Claude-Session: <session url>
    ```
 
-6. Report `Checkpoint <short hash> — phase N: <title>.` Never push here.
+   A failed commit is an unsuccessful ending: do not invoke release, leave
+   `Active` untouched, and apply <RetainDelegatedPhaseReservation/>. After a
+   successful commit, for `Active`, immediately capture the full output of
+   `git rev-parse HEAD`, atomically replace the `Active` record with
+   `CheckpointCommittedAwaitingReleaseConfirmation` carrying that value as
+   `checkpoint_commit`, and read the new record back. This durable transition
+   must succeed before invoking release. The new state comes only from the
+   commit that just succeeded, never from conversation or from a later reading
+   of `HEAD`. If capture, atomic replacement, or read-back fails, do not invoke
+   release and apply <RetainDelegatedPhaseReservation/> to whichever valid
+   durable state remains.
+7. Read and validate the durable record. For
+   `CheckpointCommittedAwaitingReleaseConfirmation`, read its reservation id
+   and `checkpoint_commit` from the read-back
+   `CheckpointReleaseConfirmationPending` and invoke `/sync release` exactly
+   once. An `Active` record at this step means step 6's durable transition did
+   not complete: do not invoke release and apply
+   <RetainDelegatedPhaseReservation/>.
+
+   ```sh
+   PYTHONPATH="$HOME/.claude/scripts" python3 -m berth.claim_state invoke \
+     --cwd "${WORKING_DIR}" --expected-verb release -- \
+     release <recorded-reservation-id> --json
+   ```
+
+   Do not pass a commit: `release` snapshots the invoking worktree's current
+   HEAD. Require exit `0`, envelope status `outstanding`, release payload status
+   `checkpointed`, the requested reservation id, and
+   `payload.data.protected_tip` equal to the durable record's read-back
+   `checkpoint_commit`. Also require its
+   `payload.data.session_mapping_publication`; report its `unavailable`
+   diagnostic without treating the journalled checkpoint as absent. Those are
+   the first-attempt assertions and are not weakened by recovery.
+
+   A resumed session obtains `checkpoint_commit` by reading the durable record,
+   never by re-deriving it from current `HEAD`. `HEAD` is not proof: a later
+   commit in the same worktree would silently supply the wrong answer and make
+   the comparison accept the wrong checkpoint.
+
+   A process kill, crash, or power loss can retain the durable record after the
+   `Checkpoint` operation was appended but before this workflow observed the
+   reply. On a later recovery from that retained record, invoke the same release
+   once. If it returns exit `0`, names the requested reservation, and has release
+   payload status `resnapshotted` or `evidence_revalidated` instead of
+   `checkpointed`, invoke `/sync board` once. `resnapshotted` has envelope status
+   `outstanding`; `evidence_revalidated` can legitimately have `outstanding`,
+   `integrated`, `trunk_rewritten`, or `object_unknown` because its envelope
+   status reports current integration evidence, not reservation lifecycle.
+   Evidence replay preserves the `outstanding` lifecycle and its original
+   protected tip. Do not gate recovery on envelope status: the board must
+   establish both the outstanding lifecycle and protected-tip equality with the
+   journalled checkpoint below. A `released` payload remains excluded because it
+   records a terminal disposition, not a recovered checkpoint.
+
+   ```sh
+   PYTHONPATH="$HOME/.claude/scripts" python3 -m berth.claim_state board \
+     --cwd "${WORKING_DIR}"
+   ```
+
+   Inspect the validated board's `envelope.payload.data`, not its rendered
+   Markdown. Lifecycle-bearing reservation representations are
+   `ready_now.entries[].reservation`, `unconstrained_reservations.entries[]`,
+   and `resolved.entries[]`; each carries `reservation_id` and `lifecycle`.
+   Constraint-only representations are `waiting.entries[]`, whose
+   `predecessor` and `successor` are reservation ids, and
+   `unresolved_overlaps.entries[]`, whose `deferred` and `blocker` are
+   reservation ids. A waiting successor and either unresolved-overlap endpoint
+   are deliberately omitted from the lifecycle-bearing sections. An
+   `alerts.entries[]` item with `kind = orphaned_outstanding` independently
+   carries `reservation_id` and `protected_tip`, including when its reservation
+   occupies one of those constraint-only positions.
+
+   Classify the requested reservation as exactly one of
+   `ProtectedTipObserved`, `ReservationPresentWithoutProtectedTip`,
+   `ReservationAbsent`, or `BoardInconsistent`. Repeated constraint references
+   are one logical presence, not duplicate reservation rows.
+   `ProtectedTipObserved` requires the board to represent the requested
+   reservation, at most one lifecycle-bearing representation, every such
+   lifecycle to have `stage = outstanding`, at least one protected tip from
+   that lifecycle or a matching `orphaned_outstanding` alert, and all observed
+   tips to agree. `ReservationPresentWithoutProtectedTip` means there is no
+   lifecycle-bearing representation or matching alert tip, but the requested
+   id occurs as a waiting `successor` or as an unresolved-overlap `deferred` or
+   `blocker`. No representation is `ReservationAbsent`. Duplicate lifecycle
+   representations, a non-outstanding lifecycle, disagreeing tips, an alert
+   without a reservation representation, or a constraint-only shape other than
+   the two permitted omissions is `BoardInconsistent`.
+
+   `ProtectedTipObserved` with the observed tip equal to the durable record's
+   read-back `checkpoint_commit` confirms that the same checkpoint release is
+   already journalled. `ReservationPresentWithoutProtectedTip` confirms only a
+   constraint endpoint: the validated board exposes neither that reservation's
+   lifecycle nor its protected tip in this position. No validated, read-only
+   `cargo-berth` output can select that named reservation and expose its
+   lifecycle independently. Retain the durable record without consulting the
+   retention ref; even a matching retention ref proves only the protected tip,
+   not `lifecycle.stage = outstanding`. Report the distinct reason that the
+   requested reservation appeared only as a waiting successor or
+   unresolved-overlap endpoint, so the board exposed neither a lifecycle nor a
+   matching `orphaned_outstanding` alert and could not establish the outstanding
+   stage. Name this exact command so a person can inspect the current board
+   position:
+
+   ```sh
+   PYTHONPATH="$HOME/.claude/scripts" python3 -m berth.claim_state board \
+     --cwd "${WORKING_DIR}"
+   ```
+
+   Report a checkpoint confirmed through `ProtectedTipObserved` as recovered
+   rather than re-made. A different observed tip is another release and must
+   retain the record. `ReservationAbsent`, `BoardInconsistent`, or a busy,
+   unreadable, or malformed board also retains it with that distinct reason.
+   Only after the first-attempt structured assertions or these recovery
+   assertions pass, delete
+   `${SESSION_DIR}/delegated_phase_reservation_state.json`.
+
+   An ordinary failed release did not append anything because transaction
+   validation precedes the journal write; it is not recovery and the original
+   first-attempt assertions still apply when it is run again. At the moment of
+   any busy or failed release, invoke no retry and apply
+   <RetainDelegatedPhaseReservation/>. The checkpoint commit exists, but the
+   phase does not complete until a later invocation confirms either the normal
+   first-attempt reply or the matching already-journalled checkpoint above. The
+   two inactive states invoke no release.
+8. Report `Checkpoint <short hash> — phase N: <title>.` Never push here. This
+   report follows successful release when the phase was active.
 </CheckpointCommit>
 
 <DiscardPhaseReviewText>
@@ -1451,8 +1728,17 @@ After smoke, style, phase review, shrink, next-item consideration, cleanup, and
 checkpoint when applicable, run `progress_history.py finish-phase --session-dir
 "${SESSION_DIR}" --status completed`.
 
+After a loop/verbose phase with `RepositoryNotEnrolled` or
+`EnrolledAwaitingFirstTouch`, delete its completed-phase state
+file. `Active` must already have been replaced by
+`CheckpointCommittedAwaitingReleaseConfirmation`, and that pending state must
+already have been deleted by the validated successful release. If either state
+survives, the phase is not complete and this section must not run.
+
 In `single`, also run `finish-run --status completed`, then
-`bash ~/.claude/scripts/delegate/end_session.sh`, and end. Other modes continue.
+apply <RetainDelegatedPhaseReservation/>, report that no checkpoint release was
+attempted, run `bash ~/.claude/scripts/delegate/end_session.sh`, and end. Other
+modes continue.
 </RecordPhaseCompletion>
 
 <VerbosePostPhaseReport>
@@ -1638,10 +1924,13 @@ Emit on every multi-phase ending:
 **Final gate:** [result or skipped reason]
 **Smoke checks still unperformed:** [phase + exact action, or none]
 **Deferred decisions still open:** [phase + decision, or none]
+**Reservation disposition:** [checkpointed and outstanding, retained with the
+reason this run stopped, or coordination not active]
 **Why the run stopped:** [complete, user stop, pending decision, convergence reason, or error]
 ```
 
-Apply <UserFacingText/>. Then run `progress_history.py finish-run` with
+Apply <UserFacingText/> and <RetainDelegatedPhaseReservation/> for every ending
+that did not complete <CheckpointCommit/>. Then run `progress_history.py finish-run` with
 `completed`, `stopped`, or `error`; it closes active pass/phase as incomplete
 when needed. Finally run `bash ~/.claude/scripts/delegate/end_session.sh` on
 every exit so the Stop hook cannot revive a finished run.
