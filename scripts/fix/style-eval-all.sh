@@ -412,9 +412,9 @@ run_style_agent() {
                 codex_args+=("-c" "model_reasoning_effort=\"$STYLE_AGENT_EFFORT\"")
             fi
             "$CODEX_BIN" exec \
-                "${codex_args[@]}" \
+                ${codex_args[@]+"${codex_args[@]}"} \
                 --ephemeral \
-                --full-auto \
+                -s workspace-write \
                 -C "$project_root" \
                 --add-dir "$HISTORY_DIR" \
                 -- "$final_prompt" \
