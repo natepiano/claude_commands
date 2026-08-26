@@ -145,7 +145,7 @@ else:
 PY
   fi
 
-  # Enroll in the nightly clean-fix flow (config lives outside the workspace).
+  # Enroll in the clean-fix flow (config lives outside the workspace).
   CONF="$HOME/.claude/scripts/clean-fix/clean-fix.conf"
   ROOTDIR=$(basename "$ROOT")
   if [[ -f "$CONF" ]]; then
@@ -177,7 +177,6 @@ def ensure(sec, entry):
     lines.insert(ins, entry)
     print(f"  added {entry} to [{sec}]")
 
-ensure('build', rootdir)
 ensure('projects', f'{rootdir}/crates/{name}')
 open(conf, 'w').write('\n'.join(lines) + '\n')
 PY

@@ -84,5 +84,5 @@ If the script fails, show the error output and stop.
 
 On success:
 - **Standalone** — report the local path. Remind the user they can use `/add_github_repo` to create a GitHub repo for it.
-- **Member** — report the member path. It is already built, formatted, enrolled in nightly clean-fix, and committed to the workspace repo. Tell the user to review and push when ready. Do **not** suggest `/add_github_repo` — a member has no repo of its own.
+- **Member** — report the member path. It is already built, formatted, enrolled in clean-fix, and committed to the workspace repo. Tell the user to review and push when ready. Do **not** suggest `/add_github_repo` — a member has no repo of its own.
 </RunScript>

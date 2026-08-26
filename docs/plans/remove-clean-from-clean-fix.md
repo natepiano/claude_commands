@@ -207,110 +207,65 @@ The `/clean_fix` usage screen offers one `run [project]` form plus `run_once`, t
 - Depicting every skip reason — `style-eval-all.sh:593` carries a further one ("already at cap of $MAX_NEW_FINDINGS findings"); the diagram is a summary of the pipeline's shape, not a branch table.
 - Treating the report/idle split as implementation-only — it decides whether the pipeline's main visible product appears.
 
-### Phase 7 — Sweep the repository documentation · status: todo
+### Phase 7 — Sweep the repository documentation · status: done
 
-#### Work Order
+#### As-built
 
-**Goal:** No document in the repository claims clean-fix has a nightly clean/build/mend/warmup pass, while the mend, clippy, test, and format work that genuinely still runs inside the style-fix stage remains documented exactly as it is.
-
-**Spec:**
-
-Each edit below removes a claim that is now false. Where a sentence merely mentions clean-fix in passing and stays true, leave it.
-
-**`scripts/clean-fix/README.md`**
-- `:3` — "Automated clean-fix clean-build, style evaluation, and style-fix pipeline" and `:5` "Runs daily at **4:00 AM** via launchd" are both wrong. Rewrite the opening for a style-only pipeline running every 10 minutes.
-- `:9-25` file table — delete the rows for `com.natemccoy.cargo-clean.plist` and `clean-fix-warmup.sh`. Rewrite the `clean-fix.sh` row (no scopes; a project filter and `run_once`), the `clean-fix.conf` row (one allowlist), the `project_add.py` row (adds to `[projects]` only), the `project_rename.py` row (no `[build]`), the `agent-assignments.conf` and `agent_assignments.sh` rows (three stages), and the `setup.sh` row (one agent).
-- `:33-37` — delete the **Warmup** section and its table entry for `clean-fix-warmup.sh`.
-- `:97-104` — the **Pipeline flow** ASCII diagram opens with the `cargo-clean job (nightly 4:00 AM, idle-gated)` block and its `cargo clean → cargo build → cargo mend → warmup` line. Delete that block; the diagram starts at the style-fix job.
-- `:104` — that job's own header line reads `style-fix job (every 10 min, no idle gate) — clean-fix.sh style`. There is no `style` subcommand: `clean-fix.sh` takes an optional project name or the literal `run_once` (`:3`, `:18`, `:26`). Drop the `style` argument from the header.
-- **The ASCII flow is a stage behind the code and this phase brings it level.** It shows one job with three phases running unconditionally. `clean-fix.sh` actually reads three independent switches — `STYLE_EVAL_ENABLED` (`:194`), `STYLE_REVIEW_ENABLED` (`:205`), and `STYLE_FIX_ENABLED` (`:214`) — each of which logs its own `SKIP:` line (`:200`, `:211`, `:220`) and falls through to the next stage rather than ending the run, and each of which `run_once` forces on. After the stages it checks the run log for project result lines and either renders the report or logs `Report skipped (no per-project activity this run)` (`:234`, `:246`). Draw the three gates and that final split. The checked-in Graphviz diagram already shows exactly this shape — read `clean-fix-style-flow.dot` as the reference and do not edit it.
-- `:36` and `:116` both say the primary checkout must be clean before a style-fix worktree is created. Neither is what the code checks: `style-fix-worktrees.sh:362-370` runs the dirty check against `$repo_dir`, which an `[active_checkout]` redirect can point at a worktree rather than the primary, and scopes it to `$subpath` for a workspace member. Restate both as the source tree the project actually resolves to, narrowed to the member subpath for a workspace member.
-- Leave the **Reliability guards (the rg-hang)** and **Evaluation State** sections alone — both are still accurate.
-
-**`docs/as-built/agent-registry.md`**
-- `:142` — the `clean-fix.sh` row describes the driver. Keep the report-render description; remove any clean/build framing if present.
-- `:164` — the unattended-run constraint says clean-fix runs every 10 minutes via `com.natemccoy.style-fix.plist`; that is still true, so leave the substance. Verify it does not also reference the clean job.
-- Sweep the file for `cargo-clean` and `[build]`; correct what you find.
-
-**`config/README.md:36`** and **`config/lint.conf:14,32`** — both list `scripts/clean-fix/clean-fix.sh` as the mend stage's consumer. That call site is gone (Phase 2). Remove clean-fix from the mend consumer lists. The `mend` switch itself stays — `/clippy` and `scripts/delegate/verify.sh` still read it.
-
-**`README.md:14`** — "Pipeline that evaluates and fixes style across projects; runs on a launchd schedule" is already accurate. Verify and leave, unless it mentions cleaning.
-
-**`CLAUDE.md:47`** (protected path — Edit/Write only) — the SwiftPM sandbox note ends: "once built unsandboxed it stays green until a dependency bump, a toolchain change, or the nightly `cargo clean` makes the scripts re-run." The nightly `cargo clean` no longer exists. Rewrite the clause to name the surviving triggers — a dependency bump, a toolchain change, or a manual `cargo clean` — and delete "nightly".
-
-**`commands/make_a_worktree.md`** (protected path) — `:101` the offer text asks "Point style eval/fix at this worktree (and add it to the nightly build set)?"; drop the parenthetical. `:107` says the helper "adds `[worktree-name]` to `[build]` and writes the `[active_checkout]` redirect(s)"; rewrite for the redirect alone. `:108` instructs the agent to "Report the edits from the JSON (`redirects`, `build_add`)" — `retarget_clean_fix.py` stopped emitting `build_add` in Phase 3, so this line tells the agent to read a key that is never there; reduce it to `redirects` plus the `commit` result. Check `:82-96` for any other build-set claim.
-
-**`commands/worktree_delete.md:103`** (protected path) — "The helper drops any `[active_checkout]` redirect pointing into the worktree and removes the worktree's `[build]` entry"; drop the `[build]` clause.
-
-**`commands/bevy_migration_plan.md:232`** (protected path) and **`scripts/bevy_migration_plan/bevy_migration_ensure_repo.sh:30-32`** — both explain that a Bevy clone under `~/rust/` is never touched because the conf is an opt-in allowlist, naming `[build]` or `[projects]`. Keep the reassurance; reduce the section names to `[projects]` and drop "cleaned/built".
-
-**`scripts/new_rust_project/rust_generate.sh`**
-- `:148` — the comment "Enroll in the nightly clean-fix flow" and `:152`'s `echo "=== Enrolling in clean-fix ==="`: drop "nightly".
-- `:181` — delete `ensure('build', rootdir)` from the heredoc. Keep `ensure('projects', f'{rootdir}/crates/{name}')`.
-- `:203` — the closing message "Built, formatted, clean-fix enrolled, and committed to $ROOTDIR" is still accurate; leave it.
-
-**`commands/new_rust_project.md:87`** (protected path) — "It is already built, formatted, enrolled in nightly clean-fix, and committed"; drop "nightly".
-
-**Memory** (gitignored, but part of the deliverable) — `projects/-Users-natemccoy--claude/memory/project_clean_fix_10min_schedule.md` is currently the "Two launchd jobs" note describing style-fix every ~10 min plus cargo-clean nightly at 4 AM. Rewrite it for the single surviving job, keeping the point that frequent style runs in the log list are normal rather than a runaway. Update its one-line pointer in `projects/-Users-natemccoy--claude/memory/MEMORY.md` under "Clean-fix" so the hook matches.
+No document in the repository claims a nightly clean/build/mend/warmup pass; every remaining
+clean-fix reference describes the single style-only pipeline that runs every 10 minutes through
+three independent stages. The pipeline README's **Pipeline flow** block opens at the style-fix job
+and names all three stage switches independently, each falling through with its own `SKIP:` line,
+ending in a check that either renders the report or logs `Report skipped (no per-project activity
+this run)` — both outcomes are drawn. The README's **Style-Fix Worktrees** row still describes the
+mend, clippy, test, and format work that stage genuinely performs, and that documentation is
+current. `scripts/new_rust_project/rust_generate.sh`'s enrollment heredoc no longer calls
+`ensure('build', rootdir)` — the removal is what stops `/new_rust_project` printing a
+`[build] section not found — skipping <entry>` warning on stderr — and still calls
+`ensure('projects', f'{rootdir}/crates/{name}')`. Two conf-section corrections landed beyond the
+original file list: `config/README.md`'s lint.conf consumer count, and the `project_rename.py` row,
+which also migrates `[project_env]`, not only `[projects]` and `[active_checkout]`.
+`commands/validate_and_push.md:13`, missing from the original file list, was corrected in the same
+pass to say the clippy switch quiets a *scheduled* style-fix pass, not a nightly one.
 
 **Files:**
-- `scripts/clean-fix/README.md` — pipeline description, file table, warmup section, flow diagram
-- `docs/as-built/agent-registry.md` — driver row and unattended-run constraint
-- `config/README.md` — mend consumer list
-- `config/lint.conf` — mend consumer list
-- `README.md` — verify the clean_fix line
-- `CLAUDE.md` — SwiftPM note's cache-invalidation trigger
-- `commands/make_a_worktree.md` — redirect offer text
-- `commands/worktree_delete.md` — revert description
-- `commands/bevy_migration_plan.md` — allowlist reassurance
-- `scripts/bevy_migration_plan/bevy_migration_ensure_repo.sh` — allowlist comment
-- `scripts/new_rust_project/rust_generate.sh` — enrollment comment and `ensure('build', …)`
-- `commands/new_rust_project.md` — member completion message
-- `projects/-Users-natemccoy--claude/memory/project_clean_fix_10min_schedule.md` — one launchd job
-- `projects/-Users-natemccoy--claude/memory/MEMORY.md` — pointer line
+- `scripts/clean-fix/README.md` — opening describes the style-only, every-10-minute pipeline; file
+  table drops the cargo-clean plist and warmup rows and names `[project_env]` in the
+  `project_rename.py` row; **Pipeline flow** diagram redrawn per above; **Reliability guards** and
+  **Style-Fix Worktrees** sections left as accurate.
+- `docs/as-built/agent-registry.md` — driver row and unattended-run constraint describe the
+  report-render step only, with no clean/build framing.
+- `config/README.md`, `config/lint.conf` — mend-stage consumer lists name only `/clippy` and
+  `scripts/delegate/verify.sh`.
+- `CLAUDE.md:47` — SwiftPM cache-invalidation clause names a dependency bump, a toolchain change, or
+  a manual `cargo clean` as the surviving triggers.
+- `commands/make_a_worktree.md`, `commands/worktree_delete.md` — worktree offer/revert text drops
+  the `[build]` enrollment and removal clauses; the redirect-only description stands.
+- `commands/bevy_migration_plan.md:232`, `scripts/bevy_migration_plan/bevy_migration_ensure_repo.sh`
+  — allowlist reassurance narrowed to "never evaluated, reviewed, or fixed," with a caveat that
+  permissions back-population still visits every directory under `~/rust/`.
+- `commands/new_rust_project.md` — member completion message drops "nightly."
+- `commands/validate_and_push.md:13` — names the clippy switch as quieting a scheduled style-fix
+  pass.
+- `projects/-Users-natemccoy--claude/memory/project_clean_fix_10min_schedule.md`,
+  `.../memory/MEMORY.md` — rewritten for the single surviving launchd job; the point that frequent
+  style runs in the log list are normal, not a runaway, is kept.
 
-**Reservations:**
-- file: `scripts/clean-fix/README.md`
-- file: `docs/as-built/agent-registry.md`
-- file: `config/README.md`
-- file: `config/lint.conf`
-- file: `README.md`
-- file: `CLAUDE.md`
-- file: `commands/make_a_worktree.md`
-- file: `commands/worktree_delete.md`
-- file: `commands/bevy_migration_plan.md`
-- file: `scripts/bevy_migration_plan/bevy_migration_ensure_repo.sh`
-- file: `scripts/new_rust_project/rust_generate.sh`
-- file: `commands/new_rust_project.md`
-- file: `projects/-Users-natemccoy--claude/memory/project_clean_fix_10min_schedule.md`
-- file: `projects/-Users-natemccoy--claude/memory/MEMORY.md`
+**Binds later work:** The pipeline README's file table now names `[project_env]` in the
+`project_rename.py` row, and its **Pipeline flow** block opens at the style-fix job with three
+independent stage gates plus both report outcomes — later edits to that table land below a shifted
+line count. `config/README.md`'s lint.conf consumer list is two bullets with a "two consumers"
+sentence above it; the count must move with the list on any later edit. The reworded sentences in
+`commands/validate_and_push.md:13` and `commands/bevy_migration_plan.md:232` are the current text —
+later documentation sweeps correct residual wording around them, not the sentences themselves.
 
-**Constraints from prior phases:**
-- Phase 1 removed the `com.natemccoy.cargo-clean` plist and reduced `setup.sh` to one agent — the README file table and setup row must match.
-- Phase 2 deleted `clean-fix-warmup.sh` and the `cargo mend` call, which is why clean-fix leaves the mend consumer lists in `config/`.
-- Phase 3 left one allowlist (`[projects]`) plus `[active_checkout]`, `[project_env]`, `[style_eval]`, and `[style_fix]` — every doc naming conf sections must name only those.
-- Phase 3 made `retarget_clean_fix.py` redirect-only and `project_add.py` `[projects]`-only, which is what `make_a_worktree.md`, `worktree_delete.md`, and `rust_generate.sh` must now describe.
-- `CLAUDE.md`, `commands/`, and the memory directory are protected or gitignored: use Edit/Write for all of them. `projects/` is gitignored, so those two files will not appear in `git status` — confirm the edits by reading the files back.
-- **Phase 5 finished `commands/clean_fix.md`'s clean removal; do not re-open it here, and do not "sync" its `PHASE <name>` list against the parser's `PHASES`.** That doc's `<Monitor/>` section lists what `--phase-detect` can emit — `style-eval`, `style-eval-review`, `style-fix`, `done`, `unknown` — which is what `detect_current_phase()` actually returns. `PHASES` is a different tuple for a different purpose (`("eval", "review", "fix", "verify")`, the report table's columns), and `verify` is never a `--phase-detect` answer. The two lists are correct precisely because they differ; making them match breaks the monitor's phase display.
-- **Phase 6 already brought `clean-fix-style-flow.dot` current against the scripts** — it now shows the evaluation-review stage, the three independent stage gates, and the activity gate in front of the report. The **Pipeline flow** ASCII block in `scripts/clean-fix/README.md` is a separate hand-drawn diagram and is the only one this phase edits; do not touch the `.dot` or `.svg`.
-- **Only the retired nightly pass is false; the style-fix stage genuinely mends, lints, tests, and formats.** `style-fix-worktrees.sh` runs `lint mend` and `lint mend --fix` (`:783-788`), a full clippy preview/auto-fix/manual cycle (`:793` onward), tests, and a post-fix `cargo check`. `README.md:36` describes that accurately today. Do not delete a mend, clippy, test, or build claim that belongs to the style-fix agent — the Goal above is about the nightly clean/build/mend/warmup pass this plan retired, and nothing else.
-- **Two of this phase's edits land in executable files, not prose.** `rust_generate.sh:181` deletes the `ensure('build', rootdir)` call from a live heredoc — the last writer of a `[build]` section that no longer exists — and `bevy_migration_ensure_repo.sh:30-32` edits comment text inside a running script. Both need `bash -n`; treat neither as documentation.
-- Everything here keeps its current `clean-fix` / `clean_fix` naming; Phases 8 through 10 rename.
-
-**Acceptance gate:**
-- **Target current-behavior claims, never the historical record.** Two gates below would otherwise reject text this phase deliberately preserves, and a gate that cannot go quiet is a gate nobody can pass.
-- `grep -rniE "cargo.clean|warmup|4:00 AM|\[build\]" scripts/clean-fix/README.md` returns nothing. `nightly` is checked separately, because the **Reliability guards (the rg-hang)** section records that on 2026-06-02 a nightly run wedged for 12+ hours — a dated incident that happened, which the Spec above says to leave alone. So: `grep -niE "nightly" scripts/clean-fix/README.md` matches only inside that section, and every match reads as history rather than a claim about how the pipeline runs now. Confirm each one; do not rewrite them to satisfy the grep.
-- `grep -rn "clean-fix" config/README.md config/lint.conf` returns nothing.
-- `grep -rn "\[build\]\|build_add\|build_already" commands/ scripts/ docs/as-built/ README.md CLAUDE.md config/` returns nothing. **`docs/as-built/`, not `docs/`** — `docs/plans/` holds this plan, whose Spec and gate quote `[build]` and `build_add` as their subject matter, so a `docs/`-wide sweep matches this very Work Order and can never be satisfied. The two JSON key names are in this grep because a doc can promise a key without ever spelling the section: `make_a_worktree.md:108` tells the agent to report `build_add`, which `retarget_clean_fix.py` stopped emitting in Phase 3, and a `[build]`-only sweep walks straight past it.
-- `grep -rn "nightly clean-fix\|nightly build set\|nightly cargo clean" commands/ scripts/ CLAUDE.md README.md` returns nothing.
-- `grep -n "ensure('build'" scripts/new_rust_project/rust_generate.sh` returns nothing; `grep -n "ensure('projects'" scripts/new_rust_project/rust_generate.sh` still matches.
-- `bash -n scripts/new_rust_project/rust_generate.sh` and `bash -n scripts/bevy_migration_plan/bevy_migration_ensure_repo.sh` exit 0.
-- `grep -c "cargo-clean" projects/-Users-natemccoy--claude/memory/project_clean_fix_10min_schedule.md` returns 0, and `MEMORY.md`'s Clean-fix pointer line no longer says "Two launchd jobs".
-- `bash scripts/clean-fix/clean-fix.sh` still exits 0 with the style stages disabled. Two executable files **are** edited here — `rust_generate.sh` loses `ensure('build', …)` from a live heredoc and `bevy_migration_ensure_repo.sh` loses comment text — so this run is proving the orchestrator was not collateral damage, not that no script changed at all.
-- `grep -nE "mend|clippy|cargo check" scripts/clean-fix/README.md` still matches inside the **Style-Fix Worktrees** row. That row describes what the style-fix agent runs and is true; an empty result here means the sweep deleted a surviving capability instead of a retired one.
-- `grep -n "clean-fix.sh style" scripts/clean-fix/README.md` returns nothing, and the **Pipeline flow** block names all three stage switches and both report outcomes.
-
----
+**Gotchas:** `backpopulate_settings.py --apply` runs unconditionally inside `clean-fix.sh` and walks
+every non-dot directory under `~/rust/`, not the `[projects]` allowlist — a claim that clean-fix
+"never touches" an unlisted directory is false; the accurate claim is that it is never evaluated,
+reviewed, or fixed. The disabled-stage smoke run prints exactly three `SKIP:` lines, the completion
+banner, and `Report skipped (no per-project activity this run).`, matching the README's Pipeline
+flow prose word for word. Two dated 2026-06-02 accounts of a wedged run are preserved deliberately
+as history, not rewritten: one in the README's **Reliability guards** section, one in
+`scripts/clean-fix/rg-shim.sh:13`.
 
 ### Phase 8 — Rename identifiers, markers, and runtime paths · status: todo
 
@@ -484,13 +439,13 @@ Use `git mv` for every rename so history follows. `commands/` is a protected pat
 - `scripts/fix/setup.sh` — `SCRIPT_DIR` is derived; verify no absolute clean-fix path remains.
 - `pyrightconfig.json:12` — `{ "root": "scripts/clean-fix", "extraPaths": ["scripts/clean-fix"] }` becomes `scripts/fix`.
 - `.claude/settings.local.json` — 12 entries at `:7,11,12,23,53,55-59,61,75` hardcode `scripts/clean-fix/…`. Update each to `scripts/fix/…`, including the renamed script basenames. **`"Bash(pkill -f 'clean-fix.sh')"` must become `"Bash(pkill -f 'fix.sh')"`** or the kill permission stops matching the process.
-- Every remaining `scripts/clean-fix/` path string in `commands/`, `scripts/`, `docs/`, and `README.md`. **This phase owns every path-dependent caller, not just the ones inside the renamed tree** — the residual sweep in Phase 10 is a prose pass, and a stale path is a broken call, not a wording problem. Verified at plan time, the callers outside `scripts/fix/` are: `scripts/lint/invoke.sh`, `scripts/lint/lint`, `scripts/lint/lint_config.sh`, `scripts/lint/scope.py`, `scripts/delegate/verify.sh`, `scripts/hooks/banned_words_lib.py`, `scripts/agents/clean_agents_conf.sh`, `scripts/worktree_delete/perform_deletion.sh`, `scripts/new_rust_project/rust_generate.sh`, and `scripts/bevy_migration_plan/bevy_migration_ensure_repo.sh`. Sweep for more rather than trusting the list. `scripts/agents/test_sync_codex_catalog.sh` is deliberately **not** on it: it holds no `scripts/clean-fix` path at all — only the `cleanfix` family key, which Phase 8 already renamed. It stays a verification command here, not an edit target.
+- Every remaining `scripts/clean-fix/` path string in `commands/`, `scripts/`, `docs/`, and `README.md`. **This phase owns every path-dependent caller, not just the ones inside the renamed tree** — the residual sweep in Phase 10 is a prose pass, and a stale path is a broken call, not a wording problem. **Re-verified after Phase 7**, the callers outside `scripts/fix/` that this phase must edit are three: `scripts/worktree_delete/perform_deletion.sh:95` and `scripts/new_rust_project/rust_generate.sh:149` each hold one literal `scripts/clean-fix/` path, and `scripts/bevy_migration_plan/bevy_migration_ensure_repo.sh:32` names `clean-fix.conf` in a comment — a filename this phase renames, so the gate below rejects it even though it is not a directory path. The seven lint, delegate, hook, and agents-conf scripts carry brand **wording** and not one renamed path or filename between them; they are Phase 10's and are deliberately absent from Files below. Sweep for more rather than trusting the list. `scripts/agents/test_sync_codex_catalog.sh` is deliberately **not** on it: it holds no `scripts/clean-fix` path at all — only the `cleanfix` family key, which Phase 8 already renamed. It stays a verification command here, not an edit target.
 
 **Re-render the diagram in this commit.** Phase 6 rebuilt the dot source's content; renaming `clean-fix-style-flow.dot` and `.svg` here leaves `render-flow.py` pointing at basenames that no longer exist. Run `cd scripts/fix && python3 render-flow.py`, and if the script hardcodes either basename, fix it here — a rename that leaves the renderer broken is this phase's defect, not the next phase's cleanup. Change no diagram content.
 
 **Correct `PHASE_CLUSTER_IDS` in the same edit.** `render-flow.py:38` still reads `("cluster_build", "cluster_eval", "cluster_fix")`. `cluster_build` was deleted from the dot source in Phase 6 and `cluster_review` was added, so the constant names a cluster that no longer exists and omits one that does — the aligned-tops pass silently skips the evaluation-review cluster. Replace it with `("cluster_eval", "cluster_review", "cluster_fix")`, matching the dot source's declaration order. This is a stale-reference repair inside a file this phase already owns, not a diagram change: verified by rendering both tuples against the current source, the corrected constant produces a **byte-identical** SVG, because all three stage gates already sit at the same `y` coordinate. Both the correction and the byte-identity check below therefore hold at once.
 
-**Prove the generated command skill followed the rename.** `commands/clean_fix.md` is the source for the live Codex skill at `~/.codex/skills/generated-from-claude/clean_fix/SKILL.md`, and the synchronizer removes a stale skill directory when its source command disappears. **The synchronizer is `scripts/claude_to_codex/run_sync.sh`**, which drives `scripts/claude_to_codex/sync.py` over `~/.claude/commands` and writes `~/.codex/skills/generated-from-claude/<command>/SKILL.md` (`sync.py:41`). It is not anything under `scripts/agents/`: `scripts/agents/sync_codex_catalog.sh` materializes Codex's *model catalog* into `agents.conf`, and `scripts/agents/test_sync_codex_catalog.sh` tests that — a different subsystem that shares a word. After `commands/clean_fix.md` becomes `commands/fix.md`, run `bash scripts/claude_to_codex/run_sync.sh` and confirm `generated-from-claude/fix/SKILL.md` exists and `generated-from-claude/clean_fix/` does not. Nothing else in the plan looks at this surface.
+**Prove the generated command skill followed the rename.** `commands/clean_fix.md` is the source for the live Codex skill at `~/.codex/skills/generated-from-claude/clean_fix/SKILL.md`, and the synchronizer removes a stale skill directory when its source command disappears. **The synchronizer is `scripts/claude_to_codex/run_sync.sh`**, which drives `scripts/claude_to_codex/sync.py` over `~/.claude/commands` and writes `~/.codex/skills/generated-from-claude/<command>/SKILL.md` (`sync.py:41`). It is not anything under `scripts/agents/`: `scripts/agents/sync_codex_catalog.sh` materializes Codex's *model catalog* into `agents.conf`, and `scripts/agents/test_sync_codex_catalog.sh` tests that — a different subsystem that shares a word. After `commands/clean_fix.md` becomes `commands/fix.md`, run `bash scripts/claude_to_codex/run_sync.sh` and confirm `generated-from-claude/fix/SKILL.md` exists and `generated-from-claude/clean_fix/` does not. This is not the last word on that surface: Phase 10 rewrites `commands/fix.md` and twelve sibling commands, so it reruns the same synchronizer after its own edits. What this phase proves is that the *directory* followed the rename — the stale `clean_fix/` skill is gone and a `fix/` one exists.
 
 **Reload launchd** after the plist changes: `bash scripts/fix/setup.sh` detects the changed plist and re-bootstraps the agent. Run it and confirm it reports a reload rather than "Already set up".
 
@@ -503,14 +458,14 @@ Use `git mv` for every rename so history follows. `commands/` is a protected pat
 - `scripts/clean-fix` — the whole directory is renamed away, tests/ and docs/ included
 - `scripts/fix` — the pipeline directory under its new name, with seven files renamed inside it
 - `scripts/make_a_worktree/retarget_clean_fix.py` — removed by the rename
-- `scripts/make_a_worktree/retarget_fix.py` — the redirect helper under its new name
+- `scripts/make_a_worktree/retarget_fix.py` — the redirect helper under its new name. Its `DEFAULT_CONF` at `:32` hardcodes `~/.claude/scripts/clean-fix/clean-fix.conf` and its usage string at `:213` names the old module, so both move here. Its remaining brand prose — the docstring line calling a worktree name a valid clean-fix path, and the two `chore(clean-fix):` commit messages it writes — is wording and belongs to Phase 10
 - `pyrightconfig.json` — execution-environment root
 - `.claude/settings.local.json` — 12 permission entries
 - `scripts/fix/render-flow.py` — dot/svg basenames if hardcoded, plus the `PHASE_CLUSTER_IDS` tuple at `:38`
 - `scripts/fix/tests/test_report_parse_phases.py` — the `from clean_fix_report_parse import …` line, the repository's only import of the renamed module
 - `scripts/fix/fix-style-flow.svg` — re-rendered after the rename, never hand-edited
 - `scripts/worktree_delete/perform_deletion.sh`, `scripts/new_rust_project/rust_generate.sh`, `scripts/bevy_migration_plan/bevy_migration_ensure_repo.sh` — `scripts/clean-fix/` path strings. **`scripts/lint/{invoke.sh,lint,lint_config.sh,scope.py}`, `scripts/delegate/verify.sh`, `scripts/hooks/banned_words_lib.py`, and `scripts/agents/clean_agents_conf.sh` are deliberately absent**: verified against the tree, each carries brand wording only and not one `scripts/clean-fix/` path, so they are Phase 10's and listing them here would reserve seven files this phase never edits.
-- `CLAUDE.md`, `README.md`, `config/README.md`, `docs/as-built/agent-registry.md` — `scripts/clean-fix/` path strings in prose and file tables
+- `CLAUDE.md`, `README.md`, `docs/as-built/agent-registry.md` — `scripts/clean-fix/` paths and renamed script filenames in prose and file tables. **`config/README.md` is deliberately absent**: Phase 7 removed its last clean-fix reference, so it holds neither a path nor a brand word for this phase or the next one
 - `commands/focused_eval.md`, `commands/lint_config.md`, `commands/make_a_worktree.md`, `commands/style_delete.md`, `commands/style_fix_review.md`, `commands/style_rename.md`, `commands/style_usage.md`, `commands/worktree_delete.md` — `scripts/clean-fix/` path strings
 - `commands/style_eval.md` — both the `scripts/clean-fix/` paths **and** the `/clean_fix` invocation at `:347`, the repository's only external caller of the command this phase renames
 
@@ -526,7 +481,6 @@ Use `git mv` for every rename so history follows. `commands/` is a protected pat
 - file: `scripts/worktree_delete/perform_deletion.sh`
 - file: `CLAUDE.md`
 - file: `README.md`
-- file: `config/README.md`
 - file: `docs/as-built/agent-registry.md`
 - file: `commands/focused_eval.md`
 - file: `commands/lint_config.md`
@@ -558,12 +512,13 @@ Use `git mv` for every rename so history follows. `commands/` is a protected pat
 - `git status --porcelain` shows the renames as `R` entries, not as delete-plus-add.
 - `grep -rn "scripts/clean-fix\|clean-fix.sh\|clean_fix_report_parse\|clean-fix.conf\|clean-fix-trigger\|clean-fix-usage\|clean-fix-style-flow\|retarget_clean_fix" . | grep -v '^./projects/' | grep -v '^./docs/plans/'` returns nothing. The `docs/plans/` exclusion is required: this plan quotes every old path by design and would otherwise keep the grep permanently non-empty.
 - `cd scripts/fix && python3 render-flow.py` exits 0, prints `Parsed 4 clusters: cluster_eval, cluster_review, cluster_fix, cluster_manual`, emits no `Could not create control points` warning, and writes `fix-style-flow.svg`; `git diff --stat scripts/fix/fix-style-flow.svg` shows it changed, and the diagram's node and edge set is identical to the one Phase 6 produced.
-- `grep -n "PHASE_CLUSTER_IDS" scripts/fix/render-flow.py` shows exactly `("cluster_eval", "cluster_review", "cluster_fix")` — no `cluster_build`, and `cluster_review` present. Re-rendering the unchanged source across that constant change must still `cmp` byte-identical against the pre-edit SVG; a difference means the diagram content moved and this phase changed something it was told not to.
+- `grep -n "PHASE_CLUSTER_IDS" scripts/fix/render-flow.py` shows exactly `("cluster_eval", "cluster_review", "cluster_fix")` — no `cluster_build`, and `cluster_review` present. Re-rendering the unchanged source across that constant change must still be byte-identical to the pre-edit SVG. **Name that baseline rather than assuming it survives** — `git mv` moves those bytes to the new path and the re-render then overwrites them, so nothing on disk holds the original by the time the check runs. Capture it from history first: `git show HEAD:scripts/clean-fix/clean-fix-style-flow.svg > /tmp/fix-flow-baseline.svg`, then `cmp /tmp/fix-flow-baseline.svg scripts/fix/fix-style-flow.svg` exits 0. A difference means the diagram content moved and this phase changed something it was told not to.
 - `bash scripts/claude_to_codex/run_sync.sh` exits 0; afterwards `ls ~/.codex/skills/generated-from-claude/fix/SKILL.md` exists and `ls -d ~/.codex/skills/generated-from-claude/clean_fix` reports no such directory. Run **that** script — `scripts/agents/test_sync_codex_catalog.sh` regenerates a model catalog, not a skill, and passing it proves nothing about this surface.
 - `bash scripts/lint/lint --help` (or the nearest cheap invocation of each renamed caller) exits 0, proving no script is left pointing at `scripts/clean-fix/`.
 - `python3 -c "import json,sys; json.load(open('.claude/settings.local.json'))"` exits 0, and `grep -c "scripts/clean-fix" .claude/settings.local.json` returns 0.
 - `grep -n "pkill -f 'fix.sh'" .claude/settings.local.json` matches.
 - `basedpyright scripts/fix/ scripts/make_a_worktree/` prints `0 errors, 0 warnings, 0 notes` (proving `pyrightconfig.json` still resolves the execution environment).
+- **`rust_generate.sh` keeps Phase 7's enrollment behavior across the path edit**: `grep -n "ensure('build'" scripts/new_rust_project/rust_generate.sh` returns nothing, `grep -n "ensure('projects'" scripts/new_rust_project/rust_generate.sh` still matches, and `bash -n scripts/new_rust_project/rust_generate.sh` exits 0. Phase 7 dropped the `[build]` enrollment call from a live heredoc, and that is what stopped `/new_rust_project` printing `[build] section not found — skipping …` on stderr for every new project. This phase edits the same heredoc's conf path, so it is the next chance to restore the call by accident.
 - `bash -n scripts/fix/fix.sh scripts/fix/fix-trigger.sh scripts/fix/fix-usage.sh scripts/fix/setup.sh` exits 0.
 - `bash scripts/fix/setup.sh` exits 0 and reports the agent reloaded; `launchctl list | grep style-fix` (unsandboxed) still shows `com.natemccoy.style-fix`.
 - `bash scripts/fix/fix-trigger.sh` exits 0 and executes the pipeline (or exits 0 on the pgrep guard if a run is already in flight).
@@ -576,9 +531,9 @@ Use `git mv` for every rename so history follows. `commands/` is a protected pat
 
 #### Work Order
 
-**Goal:** Every surviving `clean_fix`, `clean-fix`, or `cleanfix` reference outside session transcripts belongs to one of the four sanctioned compatibility survivals named in Constraints, and one full pipeline run plus a rendered report proves the renamed system works.
+**Goal:** Every surviving `clean_fix`, `clean-fix`, or `cleanfix` reference outside session transcripts belongs to one of the five sanctioned compatibility survivals named in Constraints, and one full pipeline run plus a rendered report proves the renamed system works.
 
-The Goal is deliberately *not* "no match remains". Four classes of match must survive this phase — the retired launchd label, the two historical completion banners, the captured pre-change fixture, and the test assertions quoting it — and a goal stated as absolute absence contradicts the Constraints below and invites the sweep to delete exactly the compatibility this plan built. The sweep's job is to leave no **unsanctioned** match.
+The Goal is deliberately *not* "no match remains". Five classes of match must survive this phase — the retired launchd label, the two historical completion banners, the captured pre-change fixture, the test assertions quoting it, and the log-retention glob that still prunes migrated `clean-fix-*` filenames — and a goal stated as absolute absence contradicts the Constraints below and invites the sweep to delete exactly the compatibility this plan built. The sweep's job is to leave no **unsanctioned** match.
 
 **Spec:**
 
@@ -589,7 +544,7 @@ Also update `commands/fix.md` itself — its own self-references (`/clean_fix ru
 
 **This phase is the prose and verification sweep.** Phase 9 already repointed every executable path reference, inside the renamed tree and outside it, and re-rendered the diagram. What is left here is wording — sentences that still say `/clean_fix` or "clean-fix" where nothing breaks but the text is now wrong — plus the end-to-end run that proves the whole plan. If this phase finds a *path* that still resolves to the old location, that is a Phase 9 defect being caught late: fix it here and say so, rather than filing it forward.
 
-**Remaining docs and scripts** — `README.md:14`, `scripts/fix/README.md` (title, every path and command in the file table, the pipeline-flow diagram, the Evaluation State section, and the flowchart-generation instructions), `docs/as-built/agent-registry.md`, `config/README.md`, `config/lint.conf`, `scripts/fix/docs/candidate-enumeration-design.md`, `scripts/fix/style-fix-manual.sh`, `scripts/fix/style-eval-review-prompt.md`, `scripts/fix/rg-shim.sh`, `scripts/fix/setup.sh` (its header comment names the clean-fix agent), `scripts/fix/README.md`, and `CLAUDE.md`.
+**Remaining docs and scripts** — `README.md:14`, `scripts/fix/README.md` (title, every path and command in the file table, the pipeline-flow diagram, the Evaluation State section, and the flowchart-generation instructions), `docs/as-built/agent-registry.md`, `scripts/fix/docs/candidate-enumeration-design.md`, `scripts/fix/style-fix-manual.sh`, `scripts/fix/style-eval-review-prompt.md`, `scripts/fix/rg-shim.sh`, `scripts/fix/setup.sh` (its header comment names the clean-fix agent), and `CLAUDE.md`. **`config/README.md` and `config/lint.conf` are deliberately absent**: Phase 7 removed their last clean-fix references, so both are already clean and listing them would reserve files this phase never edits.
 
 **The renamed core files still carry the brand in their prose and comments** — `fix.sh`, `fix-trigger.sh`, `fix-usage.sh`, `fix.conf`, `fix_report_parse.py`, `agent-assignments.conf`, `agent_assignments.sh`, `phase_skip.py`, `project_add.py`, `project_rename.py`, `style_history.py`, `style-fix-worktrees.sh`, `style-eval-all.sh`, `style-eval-review-all.sh`, `style-fix-monitor.py`, `report-render.md`, and `fix-style-flow.dot`. Their identifiers and paths were settled in Phases 8 and 9; what remains is comment and message text. Sweep the whole `scripts/fix/` tree rather than working from this list.
 
@@ -602,6 +557,8 @@ Replace all three with `cargo +nightly fmt`, keeping each line's surrounding arg
 **Memory** — rename `projects/-Users-natemccoy--claude/memory/project_clean_fix_10min_schedule.md` to `project_fix_10min_schedule.md`, update its body to say `/fix`, and update the pointer line and the `## Clean-fix` heading in `projects/-Users-natemccoy--claude/memory/MEMORY.md`.
 
 **Re-render only if this phase changed the dot source.** Phase 9 already re-rendered after the rename. If a comment edit here touches `fix-style-flow.dot`, run `cd scripts/fix && python3 render-flow.py` again; otherwise leave the SVG alone.
+
+**Regenerate the Codex skill after the command edits.** `commands/fix.md` is the source for the live Codex skill at `~/.codex/skills/generated-from-claude/fix/SKILL.md`, generated by `scripts/claude_to_codex/run_sync.sh` over `~/.claude/commands` (`sync.py:41`). Phase 9 ran that synchronizer to prove the *directory* followed the rename; this phase rewrites the command's own body — its `/clean_fix run`, `report`, and `monitor` self-references, its `<DetectLog/>` paths, and its frontmatter `description` — plus twelve sibling commands, so the generated skill goes stale the moment those edits land. Run `bash scripts/claude_to_codex/run_sync.sh` **after** the command sweep and confirm the regenerated `fix/SKILL.md` carries the new wording. Running it before the edits just regenerates the stale text.
 
 **End-to-end verification** (the real acceptance for the whole plan):
 1. Record `scripts/fix/agent-assignments.conf`'s checksum.
@@ -616,11 +573,12 @@ Replace all three with `cargo +nightly fmt`, keeping each line's surrounding arg
 - `scripts/fix/docs/candidate-enumeration-design.md`, `scripts/fix/style-fix-manual.sh`, `scripts/fix/style-eval-review-prompt.md`, `scripts/fix/rg-shim.sh` — path references
 - `scripts/fix/render-flow.py` — docstring and brand wording only; Phase 9 already owns its basenames and its `PHASE_CLUSTER_IDS` tuple
 - `scripts/fix/fix-style-flow.svg` — regenerated
-- `docs/as-built/agent-registry.md`, `config/README.md`, `config/lint.conf`, `README.md`, `CLAUDE.md` — remaining wording
+- `docs/as-built/agent-registry.md`, `README.md`, `CLAUDE.md` — remaining wording. **`config/README.md` and `config/lint.conf` are deliberately absent**: Phase 7 left neither a path nor a brand word in either file
 - `commands/new_rust_project.md`, `commands/bevy_migration_plan.md` — `/clean_fix` wording Phase 7 left in place while it removed only the "nightly" claims
 - `scripts/fix/style-fix-worktrees.sh` — wording, plus the three broken `cargo +clean-fix fmt` toolchain selectors at `:820,821,999`, which become `cargo +nightly fmt`
 - `scripts/fix/` — a whole-tree comment and message sweep across the renamed core files, `setup.sh` header included
 - `scripts/lint/invoke.sh`, `scripts/lint/lint`, `scripts/lint/lint_config.sh`, `scripts/lint/scope.py`, `scripts/delegate/verify.sh`, `scripts/hooks/banned_words_lib.py`, `scripts/agents/clean_agents_conf.sh`, `scripts/new_rust_project/rust_generate.sh`, `scripts/bevy_migration_plan/bevy_migration_ensure_repo.sh`, `scripts/worktree_delete/perform_deletion.sh` — wording only; Phase 9 already fixed their paths. `scripts/agents/test_sync_codex_catalog.sh` is not here: Phase 8 renamed its `cleanfix` family key and it carries no other clean-fix spelling, so this phase only runs it
+- `scripts/make_a_worktree/retarget_fix.py` — **wording only.** Phase 9 already fixed its `DEFAULT_CONF` path and its usage string; what survives here is the docstring line calling a worktree name a valid clean-fix path and the two `chore(clean-fix):` commit messages it writes. Its type-design weaknesses are next-items 2-3 and stay deferred; the existing `basedpyright scripts/make_a_worktree/` gate already covers this file
 - `projects/-Users-natemccoy--claude/memory/project_clean_fix_10min_schedule.md` — removed by the rename
 - `projects/-Users-natemccoy--claude/memory/project_fix_10min_schedule.md` — the memory under its new name, rewritten to say /fix
 - `projects/-Users-natemccoy--claude/memory/MEMORY.md` — heading and pointer line
@@ -643,8 +601,6 @@ Replace all three with `cargo +nightly fmt`, keeping each line's surrounding arg
 - file: `commands/new_rust_project.md`
 - file: `commands/bevy_migration_plan.md`
 - file: `docs/as-built/agent-registry.md`
-- file: `config/README.md`
-- file: `config/lint.conf`
 - file: `README.md`
 - file: `CLAUDE.md`
 - file: `scripts/lint/invoke.sh`
@@ -657,6 +613,7 @@ Replace all three with `cargo +nightly fmt`, keeping each line's surrounding arg
 - file: `scripts/new_rust_project/rust_generate.sh`
 - file: `scripts/bevy_migration_plan/bevy_migration_ensure_repo.sh`
 - file: `scripts/worktree_delete/perform_deletion.sh`
+- file: `scripts/make_a_worktree/retarget_fix.py`
 - file: `projects/-Users-natemccoy--claude/memory/project_clean_fix_10min_schedule.md`
 - file: `projects/-Users-natemccoy--claude/memory/project_fix_10min_schedule.md`
 - file: `projects/-Users-natemccoy--claude/memory/MEMORY.md`
@@ -670,9 +627,12 @@ Replace all three with `cargo +nightly fmt`, keeping each line's surrounding arg
 - `~/rust/nate_style/.history/` is durable style state and is out of scope.
 - **The parser's own domain types are deferred to next-items 1-4 and must keep their current shape through this phase.** `Cell`, `ParseResult`, and `Warning` are named for representation rather than role; `ParseResult.running` reuses `Warning` for a non-warning; phase state and project status are free-form `str`; and a "no reason" is encoded as an empty string. All of it is real, all of it is recorded, and none of it lands here — a rename sweep that also re-tags a domain type is reviewable as neither. Rename identifiers and paths only.
 - `HISTORICAL_COMPLETE_RE` and `match_completion_banner()` in `fix_report_parse.py` carry the retired banner wording on purpose, so that logs written before the rename still read as finished runs. Phase 4's `tests/fixtures/six-phase-run.log` and `tests/test_report_parse_phases.py` carry it for the same kind of reason: the fixture *is* a pre-change log, and the test asserts on its exact strings. Together with `setup.sh`'s historical launchd label, these are the sanctioned survivals of the old brand; the acceptance gate below names all four as permitted exceptions rather than things to sweep. A grep-driven edit to any of them is a regression dressed as cleanup.
+- **The log-retention glob is the fifth sanctioned survival.** Phase 8 requires `fix.sh`'s retention `find` to prune both the new `fix-*.log` names and the migrated `clean-fix-*.log` files, which keep their old names after the directory move. That branded pattern is load-bearing compatibility, exactly like the historical banners: deleting it to satisfy this phase's grep either strands the migrated history forever or stops pruning it. Classify it with the other four and leave it alone.
+- **Narrow the allowlist claim; do not merely rebrand it.** `fix.conf`'s header says "Allowlist model: nothing runs unless it is listed. There is no deny list." and `scripts/fix/README.md`'s conf row repeats it as "No deny list — nothing runs unless listed." Both are wrong as written: `fix.sh` runs `backpopulate_settings.py --apply` unconditionally on every pass, and that helper visits every non-dot directory under `~/rust/` without consulting `[projects]` at all. Rewrite both so the allowlist governs evaluation, review, and fixing, while permissions back-population is stated as repository-wide. This phase owns both files.
+- **Preserve what Phase 7 established; these references are current, not stale.** `scripts/fix/README.md:18-19`, top-level `README.md:14`, `commands/validate_and_push.md:13`, and `commands/bevy_migration_plan.md:232` all say true things now, and this phase rebrands their wording without changing their claims. Specifically: the README's pipeline-flow block keeps naming three independent stage switches and both report outcomes; its style-fix row keeps naming the mend, clippy, test, and format work that stage really does; `validate_and_push.md` keeps saying the clippy switch quiets a *scheduled* style-fix pass rather than a nightly one; and `bevy_migration_plan.md` keeps "never evaluated, reviewed, or fixed" together with its caveat that back-population still visits every directory under `~/rust/`. A brand sweep that flattens any of these to a shorter phrasing reintroduces a false claim Phase 7 removed.
 
 **Acceptance gate:**
-- `grep -rn "clean_fix\|clean-fix\|cleanfix\|CLEAN_FIX\|Clean-fix" . --exclude-dir=projects --exclude-dir=.git --exclude-dir=.venv --exclude-dir=__pycache__ --exclude-dir=plans` returns **only matches belonging to the four sanctioned classes below, and nothing else**. Read the output and classify every line; an empty result is not the pass condition and would in fact mean the compatibility survivals were destroyed. The four classes are: `setup.sh`'s retired-agent cleanup block referencing the historical label `com.natemccoy.clean-fix`; the retired completion banners inside `fix_report_parse.py`'s `HISTORICAL_COMPLETE_RE` — `Clean-fix complete` and `Clean-fix Rust clean + rebuild complete` — which exist so migrated logs still parse as finished runs; `scripts/fix/tests/fixtures/six-phase-run.log`, which is a captured pre-change log and is **data, not code** — its `=== Starting clean-fix (scope: all) ===` banner, its `CLEAN:`/`BUILD:`/`MEND:`/`DONE:`/`WARMUP:` lines, and its retired completion banner are the whole reason the fixture proves anything; and the assertions in `scripts/fix/tests/test_report_parse_phases.py` that quote those same strings, including all three banner generations. Rewriting either of the last two to satisfy a grep destroys the regression oracle the plan built and leaves the highest-risk file uncovered. Confirm every surviving match falls into one of the four and nothing else; deleting any of them breaks reading the log history this plan deliberately preserved. The `plans` exclusion is deliberate and permanent — this plan and its siblings quote the old names as their subject matter, so the sweep's claim is about maintained implementation, command, configuration, and product documentation, never about the planning record.
+- `grep -rn "clean_fix\|clean-fix\|cleanfix\|CLEAN_FIX\|Clean-fix" . --exclude-dir=projects --exclude-dir=.git --exclude-dir=.venv --exclude-dir=__pycache__ --exclude-dir=plans` returns **only matches belonging to the five sanctioned classes below, and nothing else**. Read the output and classify every line; an empty result is not the pass condition and would in fact mean the compatibility survivals were destroyed. The five classes are: `setup.sh`'s retired-agent cleanup block referencing the historical label `com.natemccoy.clean-fix`; the retired completion banners inside `fix_report_parse.py`'s `HISTORICAL_COMPLETE_RE` — `Clean-fix complete` and `Clean-fix Rust clean + rebuild complete` — which exist so migrated logs still parse as finished runs; `scripts/fix/tests/fixtures/six-phase-run.log`, which is a captured pre-change log and is **data, not code** — its `=== Starting clean-fix (scope: all) ===` banner, its `CLEAN:`/`BUILD:`/`MEND:`/`DONE:`/`WARMUP:` lines, and its retired completion banner are the whole reason the fixture proves anything; and the assertions in `scripts/fix/tests/test_report_parse_phases.py` that quote those same strings, including all three banner generations; and the log-retention `find` in `scripts/fix/fix.sh`, whose `-name 'clean-fix-*.log'` branch prunes the migrated logs that kept their old filenames through the directory move, which Phase 8 put there deliberately. Rewriting the fixture or the test assertions to satisfy a grep destroys the regression oracle the plan built and leaves the highest-risk file uncovered; rewriting the retention branch strands the log history the migration preserved. Confirm every surviving match falls into one of the five and nothing else; deleting any of them breaks reading the log history this plan deliberately preserved. The `plans` exclusion is deliberate and permanent — this plan and its siblings quote the old names as their subject matter, so the sweep's claim is about maintained implementation, command, configuration, and product documentation, never about the planning record.
 - `grep -rn "clean_fix\|clean-fix" projects/-Users-natemccoy--claude/memory/` returns nothing.
 - `bash -n` exits 0 on every touched shell script.
 - `basedpyright scripts/fix/ scripts/make_a_worktree/ scripts/lint/ scripts/hooks/` prints `0 errors, 0 warnings, 0 notes`.
@@ -680,6 +640,7 @@ Replace all three with `cargo +nightly fmt`, keeping each line's surrounding arg
 - `bash scripts/agents/test_agents_config.sh`, `bash scripts/agents/test_agent_exec.sh`, and `bash scripts/agents/test_sync_codex_catalog.sh` all pass.
 - `cd scripts/fix && python3 render-flow.py` exits 0 and writes `fix-style-flow.svg`.
 - `bash scripts/fix/fix-usage.sh` exits 0 and every command it prints reads `/fix …`.
+- `bash scripts/claude_to_codex/run_sync.sh` exits 0 when run **after** the command sweep, and afterwards `grep -c "clean_fix" ~/.codex/skills/generated-from-claude/fix/SKILL.md` returns 0. Phase 9 proved the skill directory followed the rename; this is the check that the skill's *body* followed the command's rewritten text instead of freezing Phase 9's.
 - `grep -n "cargo +" scripts/fix/style-fix-worktrees.sh` shows `cargo +nightly fmt` and no `cargo +clean-fix` or `cargo +fix`; `rustup toolchain list` confirms `nightly` is installed while no `fix`-named toolchain exists.
 - **End to end:** `bash scripts/fix/fix.sh run_once` completes without any change to the stage switches; a new `fix-*` log exists under `~/.local/logs/fix/`; `python3 scripts/fix/fix_report_parse.py --latest-log` reports the run **complete** and renders the four-column `Eval | Review | Fix | Verify` schema. `scripts/fix/agent-assignments.conf` is byte-identical before and after.
 - **The report is a branch, so accept either arm and never accept a stale file.** `fix.sh` renders `/tmp/fix-report.txt` only when the run log carries project result lines, and otherwise logs `Report skipped (no per-project activity this run)`. Record `/tmp/fix-report.txt`'s modification time before the run, or its absence. Then require exactly one of two outcomes: the log has result lines **and** the report's timestamp advanced with rendered content in it; or the log has the skip line **and** the report is unchanged or still absent while `--latest-log` reports the run complete. Asserting a report exists satisfies the gate from a file an earlier run left behind, which proves nothing about this one.

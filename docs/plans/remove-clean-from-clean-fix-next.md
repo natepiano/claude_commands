@@ -105,8 +105,11 @@ declared node or cluster with no measurable bounds failing with a diagnostic
 naming it rather than disappearing. Cover polygon and ellipse bounds, an
 unsupported element, and a cluster whose members cannot be measured.
 
-**Why not in the plan:** the rename phases re-render the diagram and both gate on
-the output being byte-identical. Restructuring the geometry model changes what
-the renderer can produce, which is the opposite of what those phases must prove.
+**Why not in the plan:** Phase 9 re-renders the unchanged diagram after the
+file/basename rename and the `PHASE_CLUSTER_IDS` repair, and must prove that SVG
+is byte-identical to the pre-edit output. Phase 10 re-renders after deliberate
+label and comment rebranding, so byte identity is not expected there.
+Restructuring the geometry model would confound both the rename check and the
+prose-only one, so it belongs after this plan.
 
 **Revealed by:** Phase 6.

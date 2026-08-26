@@ -10,7 +10,7 @@ Validation requires a clean worktree. Before strict validation, the script autom
 
 The cargo-mend fix step follows the `/clippy` workflow's error handling: if an advertised fix fails or is reverted because it does not compile, stop immediately and preserve the reproduction state rather than attempting a manual substitute. After automatic cargo-mend fixes and formatting, strict clippy, configured target checks, tests, and cargo-mend run normally. A fix command failure or any finding under strict validation aborts the workflow.
 
-`validate_ci.sh` ignores `config/lint.conf` for every step except its two cargo-mend steps, so a pre-push gate never silently no-ops. Turning `clippy` off quiets `/clippy`, delegate phases, and the nightly clean-fix pass; it does not quiet this command. Turning `mend` off does quiet this command's mend steps, which print a loud `SKIPPED` line instead — mend rewrites source, so a mend release that emits a fix which does not compile would otherwise block every push from an affected repo with nothing that repo can do about it.
+`validate_ci.sh` ignores `config/lint.conf` for every step except its two cargo-mend steps, so a pre-push gate never silently no-ops. Turning `clippy` off quiets `/clippy`, delegate phases, and the clean-fix style-fix pass; it does not quiet this command. Turning `mend` off does quiet this command's mend steps, which print a loud `SKIPPED` line instead — mend rewrites source, so a mend release that emits a fix which does not compile would otherwise block every push from an affected repo with nothing that repo can do about it.
 
 If the script exits with code `2`, the current branch is the default branch and GitHub branch rules require a PR. The script prints JSON with:
 

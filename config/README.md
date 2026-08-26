@@ -27,13 +27,12 @@ Which lint checks run, everywhere they run: `cache`, `mend`, `style_review`,
 per-consumer override — `clippy=off` means cargo clippy does not run in the
 `/clippy` skill *or* in a delegate phase.
 
-Use `/lint_config` to view or change them. The three consumers read it on their
+Use `/lint_config` to view or change them. The two consumers read it on their
 next run, so a change is immediate:
 
 - the `/clippy` skill, at the start of every run — including runs started by
   `/commit_prep` or a `/plan:delegate` work order
 - `scripts/delegate/verify.sh` — the `lint`, `fmt`, and `final` arms
-- `scripts/clean-fix/clean-fix.sh` — the mend stage
 
 Deliberately not gated: `verify.sh check`/`test`/`example`, the workspace check
 and test inside `verify.sh final`, `pre_release_checks.sh`, and

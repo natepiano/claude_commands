@@ -1,8 +1,8 @@
 # Clean-fix Rust Pipeline
 
-Automated clean-fix clean-build, style evaluation, and style-fix pipeline for all Rust projects under `~/rust/`.
+Automated style evaluation, evaluation review, and style-fix pipeline for opt-in Rust projects under `~/rust/`.
 
-Runs daily at **4:00 AM** via launchd.
+Runs every 10 minutes via launchd.
 
 ## Files
 
@@ -10,16 +10,15 @@ Runs daily at **4:00 AM** via launchd.
 
 | File | Purpose |
 |------|---------|
-| `clean-fix.sh` | Main entry point. Takes a scope: `clean` (settings back-populate + clean/build/mend + warmup), `style` (eval + review + fix), `run_once` (one forced eval + review + fix pass across all style projects), or default full pipeline; `clean`, `style`, and the default form accept an optional project filter. `run_once` overrides only stage enablement, so normal per-project safety and eligibility skips still apply. Emits a clean-fix log that `/clean_fix report` can render on demand. |
+| `clean-fix.sh` | Main entry point. Accepts an optional project filter or the literal `run_once`, which forces one evaluation + review + fix pass across all projects. `run_once` overrides only the three stage switches, so normal per-project safety and eligibility skips still apply. Emits a clean-fix log that `/clean_fix report` can render on demand. |
 | `clean-fix-usage.sh` | Emits the no-argument `/clean_fix` usage screen as preformatted Markdown with fixed-width, wrapped text blocks. `--json` exposes the same usage, agent, and project data for validation/tools. |
-| `clean-fix.conf` | Pipeline configuration. Two opt-in allowlists: `[build]` (clean/build/mend) and `[projects]` (style eval/review/fix), kept to the same project set unless a target is temporarily skipped, plus the optional `[active_checkout]` redirect map (point a project's eval/fix at a worktree while keeping its identity/history), style quotas, timeouts, project env, and warmup targets. No agent settings live here. No deny list — nothing runs unless listed. |
-| `project_add.py` | Adds a project to `[build]` and `[projects]`. Accepts checkout names, paths under `~/rust`, absolute paths, and `Cargo.toml` paths; workspace members are written as workspace-relative entries so their identity/history key stays the member directory name. |
-| `project_rename.py` | Renames a clean-fix project key after a checkout/member path changes. Updates config entries and migrates history JSONL, pending JSON/lock, failure logs, and `.clean-fix-project` markers. Refuses collisions instead of merging histories. |
+| `clean-fix.conf` | Pipeline configuration. One opt-in allowlist, `[projects]`, plus the optional `[active_checkout]` redirect map (point a project's eval/fix at a worktree while keeping its identity/history), style quotas, timeouts, and project environment. No agent settings live here. No deny list — nothing runs unless listed. |
+| `project_add.py` | Adds a project to `[projects]` only. Accepts checkout names, paths under `~/rust`, absolute paths, and `Cargo.toml` paths; workspace members are written as workspace-relative entries so their identity/history key stays the member directory name. |
+| `project_rename.py` | Renames a clean-fix project key after a checkout/member path changes. Updates `[projects]`, `[active_checkout]`, and `[project_env]` entries and migrates history JSONL, pending JSON/lock, failure logs, and `.clean-fix-project` markers. Refuses collisions instead of merging histories. |
 | `agent-assignments.conf` | Clean-fix stage enablement. `[style_eval]`, `[style_eval_review]`, and `[style_fix]` each own only `enabled=`; family, agent, and effort assignments live under `[cleanfix.<family>]` in `~/.claude/config/agents.conf`. |
-| `agent_assignments.sh` | Clean-fix Bash helper for loading stage enablement and resolving family, agent, and effort through `agents_resolve cleanfix.<stage>`. |
-| `com.natemccoy.style-fix.plist` | launchd plist — runs the style scope every 10 minutes (no idle gate). |
-| `com.natemccoy.cargo-clean.plist` | launchd plist — runs the clean scope nightly at 4:00 AM (idle-gated). |
-| `setup.sh` | Idempotent setup script — installs both launchd agents, creates runtime directories, retires the old pre-split agent. |
+| `agent_assignments.sh` | Clean-fix Bash helper for loading the three stage switches and resolving family, agent, and effort for `style_eval`, `style_eval_review`, and `style_fix` through `agents_resolve cleanfix.<stage>`. |
+| `com.natemccoy.style-fix.plist` | launchd plist — triggers the pipeline every 10 minutes (no idle gate). |
+| `setup.sh` | Idempotent setup script — installs the one launchd agent, creates runtime directories, and retires the old pre-split agent. |
 
 ### Style Evaluation
 
@@ -33,13 +32,7 @@ Runs daily at **4:00 AM** via launchd.
 
 | File | Purpose |
 |------|---------|
-| `style-fix-worktrees.sh` | For each project with pending findings: creates a `_style_fix` worktree, exports evaluation markdown to a scratch file under `/private/tmp/claude`, launches the `[style_fix]` agent to apply fixes (cargo mend, clippy, tests, style review), then launches a second run of the **same** agent to verify the applied fix against the Fix Summary (correcting mistakes and updating the summary), saves the Fix Summary back into pending JSON, and keeps `EVALUATION.md` out of the worktree. Other linked worktrees are allowed; the primary checkout still must be clean. Can target a single project by name. |
-
-### Warmup
-
-| File | Purpose |
-|------|---------|
-| `clean-fix-warmup.sh` | Warms up Bevy apps by launching them briefly, polling the BRP endpoint until ready, then shutting them down. Configured via the `[warmup]` section in `clean-fix.conf`. |
+| `style-fix-worktrees.sh` | For each project with pending findings: creates a `_style_fix` worktree, exports evaluation markdown to a scratch file under `/private/tmp/claude`, launches the `[style_fix]` agent to apply fixes (cargo mend, clippy, tests, style review), then launches a second run of the **same** agent to verify the applied fix against the Fix Summary (correcting mistakes and updating the summary), saves the Fix Summary back into pending JSON, and keeps `EVALUATION.md` out of the worktree. Other linked worktrees are allowed; the source tree the project resolves to must be clean, with the check narrowed to the member subpath for a workspace member. Can target a single project by name. |
 
 ### Flowchart Diagram
 
@@ -96,30 +89,34 @@ To modify the diagram, edit `clean-fix-style-flow.dot` and re-run `python3 rende
 ## Pipeline flow
 
 ```
-cargo-clean job (nightly 4:00 AM, idle-gated) — clean-fix.sh clean
+style-fix job (every 10 min, no idle gate) — clean-fix.sh [PROJECT | run_once]
   │
-  └─ Clean + Rebuild (per project, sequential)
-       cargo clean → cargo build → cargo mend → warmup
-
-style-fix job (every 10 min, no idle gate) — clean-fix.sh style
+  ├─ STYLE_EVAL_ENABLED? (run_once forces yes)
+  │    ├─ no → log SKIP and continue to STYLE_REVIEW_ENABLED
+  │    └─ yes → Phase 1: Style Evaluation (per project, parallel)
+  │         Load style guide → survey code → carry forward valid findings
+  │         → skip any project with pending findings or a _style_fix worktree
+  │         → find new violations → store pending evaluation markdown
   │
-  ├─ Phase 1: Style Evaluation (per project, parallel)
-  │    Load style guide → survey code → carry forward valid findings
-  │    → skip any project with pending findings or a _style_fix worktree
-  │    → find new violations → store pending evaluation markdown
+  ├─ STYLE_REVIEW_ENABLED? (run_once forces yes)
+  │    ├─ no → log SKIP and continue to STYLE_FIX_ENABLED
+  │    └─ yes → Phase 2: Style Evaluation Review (per project, parallel)
+  │         Review pending evaluation markdown with the configured review agent
+  │         → save reviewed markdown back into pending JSON
   │
-  ├─ Phase 2: Style Evaluation Review (per project, parallel)
-  │    Review pending evaluation markdown with the configured review agent
-  │    → save reviewed markdown back into pending JSON
+  ├─ STYLE_FIX_ENABLED? (run_once forces yes)
+  │    ├─ no → log SKIP and continue to the report activity gate
+  │    └─ yes → Phase 3: Style-Fix Worktrees (per project, parallel)
+  │         Create _style_fix worktree (other linked worktrees allowed if the resolved
+  │         source tree is clean; workspace-member checks use the member subpath)
+  │         → export pending evaluation markdown to scratch storage
+  │         → Pass 1 (apply): configured style agent applies fixes, runs clippy/tests/style review, writes Fix Summary
+  │         → Pass 2 (verify): same agent re-checks the fix vs the Fix Summary, corrects mistakes, updates the Fix Summary
+  │         → build gate (cargo check) covers both passes; finalize into pending JSON
   │
-  ├─ Phase 3: Style-Fix Worktrees (per project, parallel)
-  │    Create _style_fix worktree (other linked worktrees allowed if primary is clean)
-  │    → export pending evaluation markdown to scratch storage
-  │    → Pass 1 (apply): configured style agent applies fixes, runs clippy/tests/style review, writes Fix Summary
-  │    → Pass 2 (verify): same agent re-checks the fix vs the Fix Summary, corrects mistakes, updates the Fix Summary
-  │    → build gate (cargo check) covers both passes; finalize into pending JSON
-  │
-  └─ Write clean-fix log for on-demand reports
+  └─ Run log has project result lines?
+       ├─ yes → render the clean-fix report
+       └─ no → log "Report skipped (no per-project activity this run)"
 
 Post-clean-fix (manual):
   /style_fix_review → /merge_branch → /worktree_delete
