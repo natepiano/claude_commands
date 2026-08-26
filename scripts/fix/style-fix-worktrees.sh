@@ -832,7 +832,7 @@ For each numbered finding, add a line:
 ### Finding N: [title from finding]
 **Status:** Applied | Partially applied | Skipped | Proposed
 **What was done:** [1-2 sentences describing the actual changes made]
-**Post-fix search:** [exact command or equivalent search used] — [0 remaining | N remaining: `path:line`, ...]
+**Post-fix search:** [exact command or equivalent search used] — [0 remaining | N remaining: \`path:line\`, ...]
 **What I would change** (Proposed only): [paragraph describing recommended edits per Location]
 **Why** (Proposed only): [paragraph naming the tradeoff for the user to weigh in on]
 **Issues:** [If partially applied or skipped, explain WHY — e.g., "file no longer exists",
