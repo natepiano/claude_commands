@@ -1,8 +1,8 @@
 ---
-description: Review changes in a style-fix worktree against its clean-fix evaluation findings
+description: Review changes in a style-fix worktree against its fix pipeline evaluation findings
 ---
 
-**Context:** You are in a `_style_fix` worktree created by the clean-fix automation. The clean-fix pipeline:
+**Context:** You are in a `_style_fix` worktree created by the fix automation. The fix pipeline:
 1. Ran `/style_eval` on the main branch, storing numbered findings in pending JSON
 2. Created this worktree on branch `refactor/style`
 3. Launched Claude to apply every finding, run clippy, and run tests
@@ -220,7 +220,7 @@ If the draft fails any of these, do not send — fix and re-scan.
 </ConcernFormat>
 
 <ReadEvaluation>
-**Load the style-fix evaluation from pending JSON.** Clean-fix no longer writes `EVALUATION.md` into style-fix worktrees. The durable evaluation markdown lives in `~/rust/nate_style/.history/.pending/<project>.json` under `evaluation_markdown`. Scratch files under `/private/tmp/claude` are exports only; their absence is not a reason to stop.
+**Load the style-fix evaluation from pending JSON.** The fix pipeline does not write `EVALUATION.md` into style-fix worktrees. The durable evaluation markdown lives in `~/rust/nate_style/.history/.pending/<project>.json` under `evaluation_markdown`. Scratch files under `/private/tmp/claude` are exports only; their absence is not a reason to stop.
 
 Run this from anywhere inside the style-fix worktree to derive the project name, inspect the pending state, and export the pending markdown to a temporary review file:
 
@@ -272,7 +272,7 @@ When Recovered Handoff Mode is used, the first user-facing response must start w
 Read the exported pending markdown. It contains up to three parts:
 
 1. **Findings** — numbered style violations identified by `/style_eval`
-2. **Review Log** — appended by the clean-fix style-eval-review stage, documenting which findings the review pass kept, improved, amended, or removed, and why
+2. **Review Log** — appended by the fix pipeline's style-eval-review stage, documenting which findings the review pass kept, improved, amended, or removed, and why
 3. **Fix Summary** — appended by the fix agent, documenting what it did, what it skipped, and why
 
 Also read the header fields. If `**Rules checked**:` is in the new coverage

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Add a Rust project to the clean-fix allowlist."""
+"""Add a Rust project to the fix pipeline allowlist."""
 
 from __future__ import annotations
 
@@ -314,7 +314,7 @@ def print_result(project: Project, result: SectionResult, changed: bool) -> None
 
 
 def parse_args(argv: list[str]) -> CliArgs:
-    parser = argparse.ArgumentParser(description="Add a project to clean-fix.")
+    parser = argparse.ArgumentParser(description="Add a project to the fix pipeline.")
     _ = parser.add_argument("project", help="project name/path under ~/rust, or absolute path")
     _ = parser.add_argument("--conf", type=Path, default=DEFAULT_CONF)
     _ = parser.add_argument("--rust-dir", type=Path, default=DEFAULT_RUST_DIR)

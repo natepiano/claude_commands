@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""Parse a clean-fix orchestrator log into structured records.
+"""Parse a fix orchestrator log into structured records.
 
 Modes:
   default                   Current status for every keyed [projects] target.
-  --latest-log              Full report parse of the newest clean-fix log.
+  --latest-log              Full report parse of the newest fix log.
   --list                    Enumerate logs in ~/.local/logs/fix/ with summaries.
   --phase-detect <log>      Emit the currently-running phase (for /fix monitor).
   --filter-regex            Print the live-monitor filter regex (single source of truth).
@@ -42,7 +42,7 @@ MONITOR_FILTER_REGEX = (
 
 PHASES: tuple[str, ...] = ("eval", "review", "fix", "verify")
 CELL_DASH = "-"
-CURRENT_STATE_LABEL = "current clean-fix state"
+CURRENT_STATE_LABEL = "current fix state"
 EVAL_SORT_ORDER: dict[str, int] = {
     "RUNNING": 0,
     "FAIL": 1,
@@ -1227,7 +1227,7 @@ def parse_log(path: Path) -> ParseResult:
 
 
 def style_fix_worktrees_by_project() -> dict[str, list[str]]:
-    """Return current *_style_fix worktrees keyed by clean-fix project identity."""
+    """Return current *_style_fix worktrees keyed by fix project identity."""
     worktrees: dict[str, list[str]] = {}
     if not RUST_DIR.exists():
         return worktrees
@@ -1396,7 +1396,7 @@ def current_state_result() -> ParseResult:
             if project in worktrees:
                 row["fix"] = Cell("SKIP", "style-fix-worktree-exists")
                 result.notes.append(
-                    f"{project}: {', '.join(worktrees[project])} exists but no pending clean-fix handoff is recorded."
+                    f"{project}: {', '.join(worktrees[project])} exists but no pending fix handoff is recorded."
                 )
 
     newest = find_newest_log()
@@ -1740,7 +1740,7 @@ def row_reason(result: ParseResult, project: str) -> str:
                 continue  # folded into the eval handoff clause
             add("fix applied — worktree ready for /style_fix_review")
         elif result.status == "current" and phase == "eval" and cell.state == "SKIP" and cell.reason == "idle":
-            add("idle; no open clean-fix state")
+            add("idle; no open fix state")
         elif result.status == "current" and phase == "fix" and cell.state == "SKIP" and cell.reason == "style-fix-worktree-exists":
             add("style_fix worktree exists but no pending handoff is recorded")
         elif result.status == "current" and phase == "fix" and cell.state == "SKIP" and cell.reason == "approval-needed":
@@ -1966,7 +1966,7 @@ def main() -> None:
     if latest_log or path_arg in {"latest", "newest"}:
         found = find_newest_log()
         if not found:
-            print("ERROR: no clean-fix logs available")
+            print("ERROR: no fix logs available")
             sys.exit(1)
         log_path = found
     elif path_arg is not None:

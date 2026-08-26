@@ -1,4 +1,4 @@
-# Clean-fix Rust Pipeline
+# Fix Rust Pipeline
 
 Automated style evaluation, evaluation review, and style-fix pipeline for opt-in Rust projects under `~/rust/`.
 
@@ -10,13 +10,13 @@ Runs every 10 minutes via launchd.
 
 | File | Purpose |
 |------|---------|
-| `fix.sh` | Main entry point. Accepts an optional project filter or the literal `run_once`, which forces one evaluation + review + fix pass across all projects. `run_once` overrides only the three stage switches, so normal per-project safety and eligibility skips still apply. Emits a clean-fix log that `/fix report` can render on demand. |
+| `fix.sh` | Main entry point. Accepts an optional project filter or the literal `run_once`, which forces one evaluation + review + fix pass across all projects. `run_once` overrides only the three stage switches, so normal per-project safety and eligibility skips still apply. Emits a fix log that `/fix report` can render on demand. |
 | `fix-usage.sh` | Emits the no-argument `/fix` usage screen as preformatted Markdown with fixed-width, wrapped text blocks. `--json` exposes the same usage, agent, and project data for validation/tools. |
-| `fix.conf` | Pipeline configuration. One opt-in allowlist, `[projects]`, plus the optional `[active_checkout]` redirect map (point a project's eval/fix at a worktree while keeping its identity/history), style quotas, timeouts, and project environment. No agent settings live here. No deny list — nothing runs unless listed. |
+| `fix.conf` | Pipeline configuration. `[projects]` is the opt-in allowlist for evaluation, review, and fixing; there is no deny list. Permissions back-population is repository-wide and visits every non-dot directory under `~/rust/` independently of the allowlist. Also contains the optional `[active_checkout]` redirect map (point a project's eval/fix at a worktree while keeping its identity/history), style quotas, timeouts, and project environment. No agent settings live here. |
 | `project_add.py` | Adds a project to `[projects]` only. Accepts checkout names, paths under `~/rust`, absolute paths, and `Cargo.toml` paths; workspace members are written as workspace-relative entries so their identity/history key stays the member directory name. |
-| `project_rename.py` | Renames a clean-fix project key after a checkout/member path changes. Updates `[projects]`, `[active_checkout]`, and `[project_env]` entries and migrates history JSONL, pending JSON/lock, failure logs, and `.fix-project` markers. Refuses collisions instead of merging histories. |
-| `agent-assignments.conf` | Clean-fix stage enablement. `[style_eval]`, `[style_eval_review]`, and `[style_fix]` each own only `enabled=`; family, agent, and effort assignments live under `[fix.<family>]` in `~/.claude/config/agents.conf`. |
-| `agent_assignments.sh` | Clean-fix Bash helper for loading the three stage switches and resolving family, agent, and effort for `style_eval`, `style_eval_review`, and `style_fix` through `agents_resolve fix.<stage>`. |
+| `project_rename.py` | Renames a fix project key after a checkout/member path changes. Updates `[projects]`, `[active_checkout]`, and `[project_env]` entries and migrates history JSONL, pending JSON/lock, failure logs, and `.fix-project` markers. Refuses collisions instead of merging histories. |
+| `agent-assignments.conf` | Fix stage enablement. `[style_eval]`, `[style_eval_review]`, and `[style_fix]` each own only `enabled=`; family, agent, and effort assignments live under `[fix.<family>]` in `~/.claude/config/agents.conf`. |
+| `agent_assignments.sh` | Fix Bash helper for loading the three stage switches and resolving family, agent, and effort for `style_eval`, `style_eval_review`, and `style_fix` through `agents_resolve fix.<stage>`. |
 | `com.natemccoy.style-fix.plist` | launchd plist — triggers the pipeline every 10 minutes (no idle gate). |
 | `setup.sh` | Idempotent setup script — installs the one launchd agent, creates runtime directories, and retires the old pre-split agent. |
 
@@ -115,10 +115,10 @@ style-fix job (every 10 min, no idle gate) — fix.sh [PROJECT | run_once]
   │         → build gate (cargo check) covers both passes; finalize into pending JSON
   │
   └─ Run log has project result lines?
-       ├─ yes → render the clean-fix report
+       ├─ yes → render the fix report
        └─ no → log "Report skipped (no per-project activity this run)"
 
-Post-clean-fix (manual):
+Post-fix (manual):
   /style_fix_review → /merge_branch → /worktree_delete
 ```
 

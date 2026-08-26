@@ -1,8 +1,8 @@
 ---
-description: Unified clean-fix command — run the pipeline (one project or all), add or rename projects, monitor a live log, render a report, configure style agents, or manage the skip list
+description: Unified /fix command — run the pipeline (one project or all), add or rename projects, monitor a live log, render a report, configure style agents, or manage the skip list
 ---
 
-# Clean-fix
+# Fix
 
 `$ARGUMENTS` — the first token selects a subcommand; the remaining tokens are that subcommand's arguments.
 
@@ -12,7 +12,7 @@ When no subcommand is provided, run this script and relay its stdout exactly:
 ~/.claude/scripts/fix/fix-usage.sh
 ```
 
-The script owns the user-facing data, section order, column widths, wrapping, and formatting. Do not parse, summarize, truncate, filter, sort, merge, rename, rewrite, add rows, or convert its output to Markdown pipe tables. Do not read or reinterpret clean-fix config files for this screen; the script output is the only source. If the script exits non-zero, show its stdout/stderr exactly and stop.
+The script owns the user-facing data, section order, column widths, wrapping, and formatting. Do not parse, summarize, truncate, filter, sort, merge, rename, rewrite, add rows, or convert its output to Markdown pipe tables. Do not read or reinterpret fix config files for this screen; the script output is the only source. If the script exits non-zero, show its stdout/stderr exactly and stop.
 
 Dispatch: `run`/`run_once` → <Run/>, `add` → <Add/>, `rename` → <Rename/>, `monitor` → <Monitor/>, `report`/`list` → <Report/>, `eval`/`review`/`fix`/`agent`/`on`/`off` → <StyleAgentConfig/>, `skip` → <Skip/>. Empty or unrecognized first token → run the usage script above, relay stdout exactly, and stop.
 
@@ -38,15 +38,15 @@ The `run` forms can take an optional project name:
 
 `<project>` may be either the active checkout name shown in the usage table's `Project` column or the preserved identity shown in `Project Key`. The scripts normalize both through `[active_checkout]`; do not create duplicate style entries for active worktrees.
 
-**Hard requirement: must run unsandboxed.** The script invokes `codex` and `claude`, which need write access to `~/.codex/sessions` and to many paths outside the sandbox allowlist. Per `~/.claude/CLAUDE.md` ("codex and clean-fix style scripts must run unsandboxed"), **always** invoke this with `dangerouslyDisableSandbox: true` from the start. Do not try the sandboxed run first — it will fail.
+**Hard requirement: must run unsandboxed.** The script invokes `codex` and `claude`, which need write access to `~/.codex/sessions` and to many paths outside the sandbox allowlist. Per `~/.claude/CLAUDE.md` ("codex and fix pipeline scripts must run unsandboxed"), **always** invoke this with `dangerouslyDisableSandbox: true` from the start. Do not try the sandboxed run first — it will fail.
 
-**Step 1: Refuse to launch if a clean-fix is already running.** A second concurrent run will collide with the first one's worktrees and history files. Before launching, check:
+**Step 1: Refuse to launch if the fix pipeline is already running.** A second concurrent run will collide with the first one's worktrees and history files. Before launching, check:
 
 ```bash
 pgrep -fl fix.sh || true
 ```
 
-If anything matches, tell the user `Clean-fix already running (PID …). Use /fix monitor to attach to the live log, or wait for it to finish.` Stop. Do not launch a second copy.
+If anything matches, tell the user `Fix pipeline already running (PID …). Use /fix monitor to attach to the live log, or wait for it to finish.` Stop. Do not launch a second copy.
 
 **Step 2: Show the `run_once` execution summary.** Skip this step for `run`. For `run_once`, source `~/.claude/scripts/fix/agent_assignments.sh`, resolve `style_eval`, `style_eval_review`, and `style_fix` with `cf_load_stage_assignment`, and show:
 
@@ -75,7 +75,7 @@ Use `Bash` with `dangerouslyDisableSandbox: true` and `run_in_background: true`.
 ls -t ~/.local/logs/fix/fix-*.log 2>/dev/null | head -1
 ```
 
-Tell the user: `Clean-fix launched (shell <id>). Log: <path>.`
+Tell the user: `Fix pipeline launched (shell <id>). Log: <path>.`
 
 **Step 4: Offer to arm the monitor.** In the same response, offer one short follow-up: `Want me to /fix monitor to stream phase transitions?` If the user says yes, execute <Monitor/> with no arguments. If they decline, stop.
 
@@ -84,7 +84,7 @@ Tell the user: `Clean-fix launched (shell <id>). Log: <path>.`
 - The full run can take an hour or more. The user does not need to keep this conversation open — the script runs detached and writes to disk.
 - `run` is the on-demand counterpart to the launchd job; the schedule is unaffected. If a launchd-triggered run is already in flight, Step 1 will catch it.
 - `run_once` is a one-time style-stage override that does not persistently enable any stage.
-- For testing only the review stage in isolation, prefer `~/.claude/scripts/fix/style-eval-review-all.sh [project]` — much faster than a full clean-fix.
+- For testing only the review stage in isolation, prefer `~/.claude/scripts/fix/style-eval-review-all.sh [project]` — much faster than a full fix run.
 - Use `/fix report` after the run for a per-project matrix, or `/fix monitor` during the run for live updates.
 
 </Run>
@@ -108,7 +108,7 @@ python3 ~/.claude/scripts/fix/project_add.py <path-or-project>
 The helper adds the normalized entry to `[projects]`. For a
 workspace member, it writes the workspace-relative entry
 `<workspace-dir>/<member-subpath>`, so the project/history key remains the
-member directory name, matching existing clean-fix workspace entries.
+member directory name, matching existing fix workspace entries.
 
 The helper refuses duplicate `[projects]` identity keys and refuses to reactivate
 temporarily skipped entries; use `/fix skip enable <target>` for
@@ -120,7 +120,7 @@ that case.
 
 ## rename <old> <new>
 
-Rename a clean-fix project identity and migrate its existing clean-fix state.
+Rename a fix project identity and migrate its existing fix state.
 
 `<old>` may be the current project key or `[projects]` entry. `<new>` may be a
 project directory name under `~/rust`, a path relative to `~/rust`, an absolute
@@ -134,7 +134,7 @@ python3 ~/.claude/scripts/fix/project_rename.py <old> <new>
 ```
 
 The helper updates `[projects]`, `[active_checkout]`, and keyed
-clean-fix config entries, then migrates:
+fix config entries, then migrates:
 
 - `~/rust/nate_style/.history/<old-key>.jsonl`
 - `~/rust/nate_style/.history/.pending/<old-key>.json`
@@ -150,7 +150,7 @@ It refuses collisions with an existing new key; it does not merge histories.
 
 ## monitor
 
-Attach a persistent Monitor to whichever clean-fix-related script the user just kicked off (style evaluation, style-fix worktrees, or the full orchestrator) and surface meaningful state transitions in real time. Skip the high-volume noise (SKIP lines, raw cargo output) — only emit lines the user would act on.
+Attach a persistent Monitor to whichever fix-related script the user just kicked off (style evaluation, style-fix worktrees, or the full orchestrator) and surface meaningful state transitions in real time. Skip the high-volume noise (SKIP lines, raw cargo output) — only emit lines the user would act on.
 
 `monitor` takes no arguments. If the user passes any token after `monitor`, ignore the token and run the normal detection path.
 
@@ -174,7 +174,7 @@ ls -lt --time=mtime \
 
 Decision:
 - **Fresh candidate found** — set `${LOG_PATH}` to the newest fresh candidate and tell the user `Watching ${LOG_PATH} (last write Ns ago).` Proceed to <ArmMonitor/>.
-- **No fresh candidates** — inform the user: `No clean-fix logs modified in the last 2 hours. Start a run first, then use /fix monitor.` Then stop.
+- **No fresh candidates** — inform the user: `No fix logs modified in the last 2 hours. Start a run first, then use /fix monitor.` Then stop.
 
 ### <ArmMonitor/>
 
@@ -197,7 +197,7 @@ Otherwise tell the user: `Detected phase: <name>. Arming monitor on ${LOG_PATH}.
 
 **Style-fix manual logs** — if `${LOG_PATH}` matches `style-fix-manual-*.log`, do NOT use the tail+grep pipeline below. Arm the Monitor with the sandbox-safe Python helper instead:
 
-- `description`: `clean-fix: style-fix (manual)`
+- `description`: `fix: style-fix (manual)`
 - `persistent`: `true`
 - `timeout_ms`: `3600000`
 - `command`: `python3 ~/.claude/scripts/fix/style-fix-monitor.py ${PROJECT}`
@@ -212,7 +212,7 @@ FILTER_REGEX=$(python3 ~/.claude/scripts/fix/fix_report_parse.py --filter-regex)
 
 Call the Monitor tool with these exact parameters:
 
-- `description`: `clean-fix: <phase>` (e.g. `clean-fix: style-fix`)
+- `description`: `fix: <phase>` (e.g. `fix: style-fix`)
 - `persistent`: `true`
 - `timeout_ms`: `3600000`
 - `command`:
@@ -283,11 +283,11 @@ Read `~/.claude/scripts/fix/report-render.md` and follow it, substituting the re
 ## agent
 ## on|off
 
-Show clean-fix agent assignments or set stage enablement. These commands do not run the eval, review, or fix phase for a project. Project-scoped execution is `/fix run <project>`.
+Show fix pipeline agent assignments or set stage enablement. These commands do not run the eval, review, or fix phase for a project. Project-scoped execution is `/fix run <project>`.
 
-The clean-fix stage assignment file is `~/.claude/scripts/fix/agent-assignments.conf`; it owns only stage `enabled=` values. The global agent registry is `~/.claude/config/agents.conf`; `[assignments] fix=<family>` selects the family and `[fix.<family>]` provides each stage's `agent[:effort]` row.
+The fix stage assignment file is `~/.claude/scripts/fix/agent-assignments.conf`; it owns only stage `enabled=` values. The global agent registry is `~/.claude/config/agents.conf`; `[assignments] fix=<family>` selects the family and `[fix.<family>]` provides each stage's `agent[:effort]` row.
 
-Three clean-fix sections are configurable:
+Three fix sections are configurable:
 
 - **eval** — `[style_eval] enabled=`; registry row `fix.style_eval`.
 - **review** — `[style_eval_review] enabled=`; registry row `fix.style_eval_review`.

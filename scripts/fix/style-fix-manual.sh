@@ -1,6 +1,6 @@
 #!/bin/bash
 # Manual launcher for style-fix-worktrees.sh that accumulates log files
-# into ~/.local/logs/fix/ alongside the clean-fix orchestrator runs, so
+# into ~/.local/logs/fix/ alongside the fix orchestrator runs, so
 # /fix report can pick them up.
 #
 # Usage: style-fix-manual.sh [--foreground] [project_name]
@@ -8,7 +8,7 @@
 #                   caller (e.g. an agent invoking via Bash with
 #                   run_in_background:true) gets a real completion event when
 #                   the fix actually finishes. Without this flag the launcher
-#                   detaches via nohup + disown (the original clean-fix pattern).
+#                   detaches via nohup + disown (the original fix pipeline pattern).
 #   project_name (optional) — pass through to style-fix-worktrees.sh to
 #                             restrict the run to a single project.
 #

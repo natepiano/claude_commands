@@ -52,7 +52,7 @@ allowed to run.
 | `LINT_OP_DOC` | <RunDoc/> |
 | `LINT_OP_FMT` | <RunFmt/> |
 
-These are the same switches `scripts/delegate/verify.sh` and clean-fix read —
+These are the same switches `scripts/delegate/verify.sh` and the fix pipeline read —
 one key per check, no per-consumer override — so `clippy=off` here means clippy
 is off in every delegate phase too.
 

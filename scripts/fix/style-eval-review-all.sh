@@ -1,7 +1,7 @@
 #!/bin/bash
 # Run the style-eval-review prompt on every project with fresh pending evaluation markdown.
 # Runs after style-eval-all.sh and before style-fix-worktrees.sh in the
-# clean-fix pipeline.
+# fix pipeline.
 #
 # The review agent resolves from the fix.style_eval_review row in
 # config/agents.conf. The prompt lives at style-eval-review-prompt.md in this
@@ -64,10 +64,10 @@ if [[ -f "$CONF_FILE" ]]; then
                 ;;
             style_eval)
                 if [[ "$stripped" =~ ^mode= ]]; then
-                    echo "ERROR: [style_eval] stale clean-fix setting; stage enablement lives in $FIX_AGENT_ASSIGNMENTS_FILE and agent settings live in $AGENTS_CONFIG_FILE" >&2
+                    echo "ERROR: [style_eval] stale fix setting; stage enablement lives in $FIX_AGENT_ASSIGNMENTS_FILE and agent settings live in $AGENTS_CONFIG_FILE" >&2
                     exit 1
                 elif [[ "$stripped" =~ ^(enabled|agent|model|effort)= ]]; then
-                    echo "ERROR: [style_eval] stale clean-fix setting; stage enablement lives in $FIX_AGENT_ASSIGNMENTS_FILE and agent settings live in $AGENTS_CONFIG_FILE" >&2
+                    echo "ERROR: [style_eval] stale fix setting; stage enablement lives in $FIX_AGENT_ASSIGNMENTS_FILE and agent settings live in $AGENTS_CONFIG_FILE" >&2
                     exit 1
                 fi
                 ;;

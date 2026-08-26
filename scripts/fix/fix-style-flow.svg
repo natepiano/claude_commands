@@ -1,13 +1,13 @@
 <?xml version='1.0' encoding='UTF-8'?>
 <svg xmlns="http://www.w3.org/2000/svg" width="1055.1pt" height="1360.0pt" viewBox="-25.52 -11.00 1055.12 1360.02">
 <g id="graph0" class="graph" transform="scale(1 1) rotate(0) translate(46.81 1304.02)">
-<title>clean_fix_style</title>
+<title>fix_style</title>
 <polygon fill="white" stroke="none" points="-46.81,4 -46.81,-1304.02 958.98,-1304.02 958.98,4 -46.81,4" />
 
 <rect x="-18.0" y="-1159.4" width="331.2" height="889.4" fill="none" stroke="#95a5a6" stroke-width="1.5" stroke-dasharray="6,4" rx="4.0" /><rect x="338.9" y="-1159.4" width="257.4" height="579.4" fill="none" stroke="#95a5a6" stroke-width="1.5" stroke-dasharray="6,4" rx="4.0" /><rect x="629.8" y="-1159.4" width="315.6" height="754.4" fill="none" stroke="#95a5a6" stroke-width="1.5" stroke-dasharray="6,4" rx="4.0" /><rect x="363.2" y="-200.0" width="208.8" height="230.0" fill="none" stroke="#95a5a6" stroke-width="1.5" stroke-dasharray="6,4" rx="4.0" /><g id="node1" class="node">
 <title>start</title>
-<ellipse fill="#f0e6ff" stroke="#8e44ad" cx="467.6" cy="-1278" rx="87" ry="22.02" />
-<text xml:space="preserve" text-anchor="middle" x="467.6" y="-1279.75" font-family="Helvetica,sans-Serif" font-size="10.00">Clean-fix launchd trigger</text>
+<ellipse fill="#f0e6ff" stroke="#8e44ad" cx="467.6" cy="-1278" rx="94.42" ry="22.02" />
+<text xml:space="preserve" text-anchor="middle" x="467.6" y="-1279.75" font-family="Helvetica,sans-Serif" font-size="10.00">Fix pipeline launchd trigger</text>
 <text xml:space="preserve" text-anchor="middle" x="467.6" y="-1268.5" font-family="Helvetica,sans-Serif" font-size="10.00">(every 10 minutes)</text>
 </g>
 
@@ -516,7 +516,7 @@
 <g id="node34" class="node">
 <title>report</title>
 <ellipse fill="#f0e6ff" stroke="#8e44ad" cx="467.6" cy="-258" rx="79.2" ry="18" />
-<text xml:space="preserve" text-anchor="middle" x="467.6" y="-254.12" font-family="Helvetica,sans-Serif" font-size="10.00">Generate Clean-fix Report</text>
+<text xml:space="preserve" text-anchor="middle" x="467.6" y="-254.12" font-family="Helvetica,sans-Serif" font-size="10.00">Generate Fix Report</text>
 </g>
 
 <g id="edge43" class="edge">
@@ -577,5 +577,5 @@
 <path fill="none" stroke="black" stroke-dasharray="1,5" d="M467.6,-59.67C467.6,-55.83 467.6,-51.69 467.6,-47.56" />
 <polygon fill="black" stroke="black" points="471.1,-47.73 467.6,-37.73 464.1,-47.73 471.1,-47.73" />
 </g>
-<text x="-10.0" y="-1147.4" font-family="Helvetica,sans-Serif" font-size="9" fill="#7f8c8d">Phase 1: Style Evaluation</text><text x="346.9" y="-1147.4" font-family="Helvetica,sans-Serif" font-size="9" fill="#7f8c8d">Phase 2: Evaluation Review</text><text x="637.8" y="-1147.4" font-family="Helvetica,sans-Serif" font-size="9" fill="#7f8c8d">Phase 3: Style-Fix Worktrees</text><text x="371.2" y="-188.0" font-family="Helvetica,sans-Serif" font-size="9" fill="#7f8c8d">Post-Clean-fix (Manual)</text></g>
+<text x="-10.0" y="-1147.4" font-family="Helvetica,sans-Serif" font-size="9" fill="#7f8c8d">Phase 1: Style Evaluation</text><text x="346.9" y="-1147.4" font-family="Helvetica,sans-Serif" font-size="9" fill="#7f8c8d">Phase 2: Evaluation Review</text><text x="637.8" y="-1147.4" font-family="Helvetica,sans-Serif" font-size="9" fill="#7f8c8d">Phase 3: Style-Fix Worktrees</text><text x="371.2" y="-188.0" font-family="Helvetica,sans-Serif" font-size="9" fill="#7f8c8d">Post-Fix (Manual)</text></g>
 </svg>

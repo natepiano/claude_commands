@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # lint — public entry point over invoke.sh, the single bottom layer for cargo
 # invocation policy. Shell aliases (clippy, cf, ct, cwb, mend), validate_ci.sh,
-# pre_release_checks.sh, clean-fix agent prompts, and /clippy all come through
+# pre_release_checks.sh, fix pipeline agent prompts, and /clippy all come through
 # here; delegate/verify.sh sources invoke.sh directly to add its per-package
 # scope rules. This file picks workspace scope only, never policy flags.
 set -euo pipefail
@@ -48,7 +48,7 @@ EOF
 # --manifest-path is deliberately not in that list, though it used to be. It
 # names a manifest, not a package set: aimed at a virtual workspace root it
 # leaves cargo selecting every member, so short-circuiting on it made each
-# per-project driver that passes it -- cargo-port's lint commands, clean-fix's
+# per-project driver that passes it -- cargo-port's lint commands, the fix pipeline's
 # agent prompts -- silently lint the whole workspace, with no --workspace in
 # the argv to reveal it. The full argv goes to scope.py instead, which reads
 # the manifest path out of it and resolves against that tree. See scope.py for

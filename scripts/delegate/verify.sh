@@ -9,7 +9,7 @@
 # plan-final full gate, run by the orchestrator, never by a phase delegate.
 #
 # The lint halves — clippy and fmt — are gated by config/lint.conf (edit it with
-# /lint_config), so one switch silences a check across /clippy, clean-fix, and
+# /lint_config), so one switch silences a check across /clippy, the fix pipeline, and
 # every delegate phase. A gated-off check prints a SKIPPED line and the command
 # still exits 0. Scope is never configurable: the target pinning above is a
 # correctness constraint, not a preference. cargo check and cargo nextest are
@@ -33,7 +33,7 @@
 # Invocation policy — canonical flags, lint.conf gating, sandbox-failure
 # detection — lives in scripts/lint/invoke.sh, the
 # single bottom layer, sourced below. This file adds only delegate scope rules
-# on top. Workspace-scope entry points (aliases, validate_ci, clean-fix,
+# on top. Workspace-scope entry points (aliases, validate_ci, the fix pipeline,
 # release checks) use the lint CLI in that directory instead of this script.
 #
 # Exit codes: 2 = usage error or missing tooling; 3 = sandbox failure, re-run

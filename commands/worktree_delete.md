@@ -28,7 +28,7 @@ Update each todo status to "in_progress" when starting that step, and "completed
     **STEP 4:** Execute <CheckUnpushedCommits/>
     **STEP 5:** Execute <GetFinalConfirmation/>
     **STEP 6:** Execute <PerformDeletion/>
-    **STEP 7:** Execute <RevertCleanFixRedirect/>
+    **STEP 7:** Execute <RevertFixPipelineRedirect/>
 </ExecutionSteps>
 
 <DiscoverWorktrees>
@@ -96,13 +96,13 @@ Update each todo status to "in_progress" when starting that step, and "completed
     - Report success to user
 </PerformDeletion>
 
-<RevertCleanFixRedirect>
-    - If a clean-fix redirect pointed style eval/fix at this worktree (set by `/make_a_worktree`), remove it so clean-fix returns to the primary checkout.
+<RevertFixPipelineRedirect>
+    - If a fix pipeline redirect pointed style eval/fix at this worktree (set by `/make_a_worktree`), remove it so the fix pipeline returns to the primary checkout.
     - **IMPORTANT**: Use `dangerouslyDisableSandbox: true` — the helper makes a git commit, which the sandbox blocks.
     - Run: `python3 ~/.claude/scripts/make_a_worktree/retarget_fix.py revert --worktree "$(basename "$SELECTED_WORKTREE")" --commit`
     - The helper drops any `[active_checkout]` redirect pointing into the worktree; it is a no-op if there was none. With `--commit` it commits **only** `fix.conf` in the `~/.claude` repo when something changed, so the conf needs no manual upkeep.
     - If the JSON shows `"reverted": true`, tell the user which `removed` entries were cleaned up and the `commit.commit` short hash. Otherwise say nothing.
-</RevertCleanFixRedirect>
+</RevertFixPipelineRedirect>
 
 HAPPY PATH: If all validations pass and user confirms, proceed with deletion
 UNHAPPY PATH: Stop and ask user for guidance if:

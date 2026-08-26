@@ -29,7 +29,7 @@ If you need exact style file paths for citations, run:
 zsh ~/.claude/scripts/rust_style/load-rust-style.sh --list-files --project-root "$ARGUMENTS"
 ```
 
-## Step 1.5: Use the clean-fix selection helper
+## Step 1.5: Use the fix pipeline selection helper
 
 If no pending run exists yet (i.e. `next-unit` errors with "No pending run for ..."), initialize one first. The budget is the configured `[style_eval] max_new_findings` in `~/.claude/scripts/fix/fix.conf`; `next-unit` stops once the pending evaluation markdown contains that many numbered findings.
 
@@ -37,7 +37,7 @@ If no pending run exists yet (i.e. `next-unit` errors with "No pending run for .
 python3 ~/.claude/scripts/fix/style_history.py start-run --project-root "$ARGUMENTS"
 ```
 
-The clean-fix (`style-eval-all.sh`) calls `start-run` itself, so this is only needed for ad-hoc agent invocations. If an interrupted evaluation is pending, `start-run` resumes it — already-recorded units stay recorded and `next-unit` continues where the previous run stopped.
+The fix pipeline (`style-eval-all.sh`) calls `start-run` itself, so this is only needed for ad-hoc agent invocations. If an interrupted evaluation is pending, `start-run` resumes it — already-recorded units stay recorded and `next-unit` continues where the previous run stopped.
 
 After the pending run exists, record evaluator liveness with the shared heartbeat script. This is not a substitute for `record-unit`; it only says what the agent is currently doing.
 
@@ -90,7 +90,7 @@ python3 ~/.claude/scripts/fix/style_history.py record-unit \
 
 **Ordering rule for findings:** if the unit produced a finding, append it under `## Improvements` in the scratch evaluation markdown at `$EVAL_PATH` **before** calling `record-unit`. `record-unit` saves that markdown into `.history/.pending/<project>.json` and refuses to record a finding whose guideline is not present there.
 
-The results path **must** be project-scoped (`/tmp/style-eval-results-<project>.json`). The clean-fix launches up to 4 codex evals in parallel, all writing to `/tmp`; a shared results file would clobber other agents' in-flight results. Always use `$(basename "$ARGUMENTS")` to derive the path so each agent has its own.
+The results path **must** be project-scoped (`/tmp/style-eval-results-<project>.json`). The fix pipeline launches up to 4 codex evals in parallel, all writing to `/tmp`; a shared results file would clobber other agents' in-flight results. Always use `$(basename "$ARGUMENTS")` to derive the path so each agent has its own.
 
 The results JSON for a unit with no finding must look like this:
 
@@ -167,7 +167,7 @@ The active style-fix scratch evaluation path for this project is: `$WORKTREE_EVA
 
 If the line above shows a real filesystem path, check whether that file exists.
 
-If the line above shows the literal string `$WORKTREE_EVAL_PATH` (i.e. no substitution was made, because this command was invoked directly rather than via the clean-fix), derive the scratch path instead: take the project directory name and check `/private/tmp/claude/style_fix_<project>_evaluation.md`. For example, if `$ARGUMENTS` is `~/rust/my_project`, check `/private/tmp/claude/style_fix_my_project_evaluation.md`.
+If the line above shows the literal string `$WORKTREE_EVAL_PATH` (i.e. no substitution was made, because this command was invoked directly rather than via the fix pipeline), derive the scratch path instead: take the project directory name and check `/private/tmp/claude/style_fix_<project>_evaluation.md`. For example, if `$ARGUMENTS` is `~/rust/my_project`, check `/private/tmp/claude/style_fix_my_project_evaluation.md`.
 
 If that file exists, read it. These findings are already being addressed in a style-fix branch. When evaluating in Step 4, **do not re-discover** any finding that matches a style-fix scratch finding by title or by the same style rule applied to the same files. This prevents duplicate work between the primary evaluation and the in-progress worktree fixes.
 
@@ -313,7 +313,7 @@ Then record one last agent heartbeat with `--message "agent saved pending evalua
 
 Requirements for each finding:
 - Rank by impact: most violations / most deviation from the guide comes first
-- **Locations must enumerate every site that violates the rule project-wide.** Before writing the finding, name the abstract pattern the rule covers (not the first example you found), run a project-wide search for that pattern, and list every match. A finding scoped to one cluster of sites — when other sites elsewhere violate the same rule — is a defective finding, not a partial one. The next clean-fix will re-flag the same guideline instead of clearing it.
+- **Locations must enumerate every site that violates the rule project-wide.** Before writing the finding, name the abstract pattern the rule covers (not the first example you found), run a project-wide search for that pattern, and list every match. A finding scoped to one cluster of sites — when other sites elsewhere violate the same rule — is a defective finding, not a partial one. The next fix run will re-flag the same guideline instead of clearing it.
 - **`Surface searched` and `Search` are required fields** alongside `Locations`. The Search line must contain the literal command(s) you ran (not "I searched") and the resulting match count. `len(Locations)` must equal that match count. A finding without these fields, or with a Locations count that disagrees with the Search count, is malformed.
 - If the guideline file contains a `### Surface` section, copy or paraphrase it into the `Surface searched` field — the rule's own surface is the source of truth, not your interpretation of the rule's lead example.
 - Be actionable: someone should be able to act on each item without re-reading the style guide
@@ -322,7 +322,7 @@ Requirements for each finding:
 
 ## Step 6: If `--fix` was passed, launch the style-fix worktree
 
-Skip this step entirely if `--fix` is not in the original arguments — `/style_eval` ends at Step 5. The clean-fix never passes `--fix`, so its behavior is unchanged.
+Skip this step entirely if `--fix` is not in the original arguments — `/style_eval` ends at Step 5. The fix pipeline never passes `--fix`, so its behavior is unchanged.
 
 If `--fix` was passed, you are running interactively and the user is waiting on the fix to finish. The fix takes 10–20 minutes; do all of the following without narration in between so the user hits a single "running, you'll be notified" message instead of two.
 
@@ -344,7 +344,7 @@ If `--fix` was passed, you are running interactively and the user is waiting on 
       ~/.claude/scripts/fix/style-fix-manual.sh --foreground "$(basename "$ARGUMENTS")"
       ```
 
-   b. In the same response, invoke `/fix` (the `fix` skill) with arguments `monitor`. It autodetects the newest active clean-fix log, arms the sandbox-safe Python helper for `style-fix-manual-*.log`, and owns the event-to-update mapping — follow its <StyleFixManualEvents/> reporting.
+   b. In the same response, invoke `/fix` (the `fix` skill) with arguments `monitor`. It autodetects the newest active fix log, arms the sandbox-safe Python helper for `style-fix-manual-*.log`, and owns the event-to-update mapping — follow its <StyleFixManualEvents/> reporting.
 
 4. Tell the user once: "fix running, log: `<path>`. I'll surface phases as they arrive and post a final summary when codex finishes." Then **yield** — do not sleep, do not poll, do not re-read the log yourself.
 

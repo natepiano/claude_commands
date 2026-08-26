@@ -74,7 +74,7 @@ is_real_worktree() {
 # first, falls back to `rm -rf`, then asserts the directory no longer exists.
 # Returns 0 on success, 1 if the directory persists (a child process holding
 # files open, permissions, etc.) — in which case the caller must fail loud so
-# the next clean-fix doesn't silently skip on the leftover stub.
+# the next fix run doesn't silently skip on the leftover stub.
 safe_remove_worktree() {
     local repo="$1"
     local dir="$2"
@@ -88,7 +88,7 @@ safe_remove_worktree() {
 
 # Diagnostic: change cwd to $RUST_DIR so any unanchored `cargo` call from this
 # process or its children no longer references /Users/natemccoy/.claude. If the
-# clean-fix log still shows that path tomorrow, the cargo invocation is coming
+# fix log still shows that path tomorrow, the cargo invocation is coming
 # from a process *outside* this script's tree (e.g. an IDE/LSP/watcher).
 echo "[diag] style-fix-worktrees.sh starting: pid=$$ ppid=$PPID cwd_before=$(pwd)"
 cd "$RUST_DIR"
@@ -127,7 +127,7 @@ if [[ -f "$CONF_FILE" ]]; then
                 ;;
             style_eval)
                 if [[ "$stripped" =~ ^mode= ]]; then
-                    echo "ERROR: [style_eval] stale clean-fix setting; stage enablement lives in $FIX_AGENT_ASSIGNMENTS_FILE and agent settings live in $AGENTS_CONFIG_FILE" >&2
+                    echo "ERROR: [style_eval] stale fix setting; stage enablement lives in $FIX_AGENT_ASSIGNMENTS_FILE and agent settings live in $AGENTS_CONFIG_FILE" >&2
                     exit 1
                 fi
                 if [[ "$stripped" =~ ^max_new_findings=([0-9]+)$ ]]; then
@@ -142,10 +142,10 @@ if [[ -f "$CONF_FILE" ]]; then
                 elif [[ "$stripped" =~ ^heartbeat_interval_secs=([0-9]+)$ ]]; then
                     HEARTBEAT_INTERVAL_SECS="${BASH_REMATCH[1]}"
                 elif [[ "$stripped" =~ ^mode= ]]; then
-                    echo "ERROR: [style_fix] stale clean-fix setting; stage enablement lives in $FIX_AGENT_ASSIGNMENTS_FILE and agent settings live in $AGENTS_CONFIG_FILE" >&2
+                    echo "ERROR: [style_fix] stale fix setting; stage enablement lives in $FIX_AGENT_ASSIGNMENTS_FILE and agent settings live in $AGENTS_CONFIG_FILE" >&2
                     exit 1
                 elif [[ "$stripped" =~ ^(enabled|agent|model|effort)= ]]; then
-                    echo "ERROR: [style_fix] stale clean-fix setting; stage enablement lives in $FIX_AGENT_ASSIGNMENTS_FILE and agent settings live in $AGENTS_CONFIG_FILE" >&2
+                    echo "ERROR: [style_fix] stale fix setting; stage enablement lives in $FIX_AGENT_ASSIGNMENTS_FILE and agent settings live in $AGENTS_CONFIG_FILE" >&2
                     exit 1
                 fi
                 ;;
@@ -308,7 +308,7 @@ for entry in ${projects[@]+"${projects[@]}"}; do
         # Distinguish a legitimate in-flight worktree (skip silently, expected)
         # from an orphan stub left by a partially-failed cleanup (surface loud).
         # An orphan looks like a worktree on disk but has no .git linkage and
-        # isn't registered with the parent repo — every future clean-fix will
+        # isn't registered with the parent repo — every future fix run will
         # otherwise keep skipping the project until someone removes it by hand.
         if is_real_worktree "$worktree_dir" "$repo_dir"; then
             if [[ -f "$eval_file" ]] && rg -q '^## Fix Summary$' "$eval_file" 2>/dev/null; then
@@ -478,7 +478,7 @@ supervise_agent() {
     # `( tail -F | while read ) &` subshell, but `kill $watcher_pid` only killed
     # the wrapping subshell — `tail -F` and the `while read` bash were reparented
     # to PID 1, kept inheriting our stdout (the pipe to tee in the parent
-    # clean-fix script), and held the pipeline open for 26+ hours, blocking
+    # fix script), and held the pipeline open for 26+ hours, blocking
     # launchd from firing the next night's run.
     : > "$log_file"  # ensure file exists so the offset math starts at 0
 
@@ -727,7 +727,7 @@ IMPORTANT — review-stage exclusions:
 
 Step 3: Apply numbered findings from the evaluation.
 Each evaluation run adds up to $MAX_NEW_FINDINGS new findings, but findings accumulate
-across clean-fix runs via carry-forward. Process every finding present, but how you process
+across fix runs via carry-forward. Process every finding present, but how you process
 it depends on the governing guideline frontmatter \`mode:\` field.
 
 **For each finding, before touching code:** open the guideline file from the
@@ -817,8 +817,8 @@ For each rule in the checklist, check the additions-only diff for violations.
 Fix any violations found. If no violations, move on.
 For rules marked [non-negotiable], review the full diff intent, not just added lines. Reversions, deletions, or signature changes that violate a non-negotiable rule must be fixed or the conflicting finding must be marked partial/skipped with an explanation.
 
-Step 8: Run cargo +clean-fix fmt
-Run: cargo +clean-fix fmt $cargo_scope_flag --manifest-path $worktree_dir/Cargo.toml
+Step 8: Run cargo +nightly fmt
+Run: cargo +nightly fmt $cargo_scope_flag --manifest-path $worktree_dir/Cargo.toml
 
 Step 9: Write fix summary to the scratch evaluation file
 Append a section to the END of $scratch_eval with the following format:
@@ -996,7 +996,7 @@ Step 5: Re-verify the build (only if you changed any code in Step 4)
   A compile error means an edit left a dangling reference — fix it before continuing.
 - Run: CARGO_MEND_SKIP_NETWORK_TESTS=1 cargo nextest run $cargo_scope_flag --manifest-path $worktree_dir/Cargo.toml
   Fix any failures you introduced.
-- Run: cargo +clean-fix fmt $cargo_scope_flag --manifest-path $worktree_dir/Cargo.toml
+- Run: cargo +nightly fmt $cargo_scope_flag --manifest-path $worktree_dir/Cargo.toml
 If you changed no code, skip this step.
 
 Step 6: Update the Fix Summary, then append the Fix Verification section

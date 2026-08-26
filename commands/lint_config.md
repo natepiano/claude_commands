@@ -1,5 +1,5 @@
 ---
-description: Show or edit which lint checks run — across /clippy, delegate phases, and clean-fix
+description: Show or edit which lint checks run — across /clippy, delegate phases, and the fix pipeline
 ---
 
 # lint_config
@@ -49,9 +49,9 @@ effect on the next run of each consumer; nothing needs restarting.
 
 | Check | Runs | Where it applies |
 |---|---|---|
-| `mend` | `cargo mend` check pass and `--fix` | `/clippy` mend check/fix · `invoke.sh mend` (lint CLI, clean-fix, validate_ci mend steps) |
+| `mend` | `cargo mend` check pass and `--fix` | `/clippy` mend check/fix · `invoke.sh mend` (lint CLI, fix pipeline, validate_ci mend steps) |
 | `style_review` | style-guide walk over the uncommitted diff | `/clippy` style review · `/plan:delegate` phase-end gate |
-| `clippy` | `cargo clippy` | `/clippy` clippy stage · `invoke.sh clippy` (lint CLI, clean-fix, `verify.sh lint <pkg>`) |
+| `clippy` | `cargo clippy` | `/clippy` clippy stage · `invoke.sh clippy` (lint CLI, fix pipeline, `verify.sh lint <pkg>`) |
 | `doc` | `cargo doc -D warnings` | `/clippy` doc stage · `invoke.sh doc` (`lint doc`) |
 | `fmt` | `cargo +nightly fmt` | `/clippy` format stage · `invoke.sh fmt` (`lint fmt`, `verify.sh lint`/`fmt`/`final`) |
 

@@ -34,7 +34,7 @@ cleanup_residual_directory() {
     fi
 }
 
-# Capture the clean-fix identity BEFORE removing the worktree. A *_style_fix
+# Capture the fix pipeline identity BEFORE removing the worktree. A *_style_fix
 # worktree's dir name may encode its source checkout (e.g.
 # bevy_lagrange_flycam_style_fix), so the history key comes from the
 # .fix-project marker, not the basename — and the marker is gone once the
@@ -85,9 +85,9 @@ if ! git branch -D "$BRANCH_NAME"; then
 fi
 echo "Branch deleted."
 
-# A <project>_style_fix worktree carries a clean-fix pending JSON in
+# A <project>_style_fix worktree carries a fix pipeline pending JSON in
 # fixed_findings state. The history row is already recorded by finalize-fix;
-# the pending file is the only leftover, and while it exists every clean-fix
+# the pending file is the only leftover, and while it exists every fix run
 # run skips the project. Remove it here so the cycle can restart.
 # PROJECT (identity/history key) was read from the marker before removal above.
 if [[ -n "$STYLE_FIX_PROJECT" ]]; then
@@ -95,11 +95,11 @@ if [[ -n "$STYLE_FIX_PROJECT" ]]; then
     HISTORY_HELPER="$HOME/.claude/scripts/fix/style_history.py"
     if [[ -f "$HISTORY_HELPER" ]]; then
         echo ""
-        echo "Style-fix worktree deleted — discarding clean-fix pending state for: $PROJECT"
+        echo "Style-fix worktree deleted — discarding fix pipeline pending state for: $PROJECT"
         if python3 "$HISTORY_HELPER" discard-pending --project "$PROJECT"; then
             echo "Pending state discarded."
         else
-            echo "Warning: discard-pending failed for $PROJECT — clean-fix will keep skipping it until ~/rust/nate_style/.history/.pending/$PROJECT.json is removed."
+            echo "Warning: discard-pending failed for $PROJECT — the fix pipeline will keep skipping it until ~/rust/nate_style/.history/.pending/$PROJECT.json is removed."
         fi
     fi
 fi

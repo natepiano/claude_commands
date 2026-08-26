@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# Clean-fix stage assignment reader.
+# Fix pipeline stage assignment reader.
 #
-# Clean-fix owns stage enablement. The global agent registry
+# The fix pipeline owns stage enablement. The global agent registry
 # (~/.claude/config/agents.conf) owns family, agent, and effort assignments.
 
 FIX_PIPELINE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -12,7 +12,7 @@ source "$FIX_PIPELINE_DIR/../agents/agents_config.sh"
 cf_trim() { agents_config_trim "$1"; }
 
 # cf_resolve_checkout <projects-entry>
-# Echo the checkout path clean-fix should evaluate/fix for a [projects] entry:
+# Echo the checkout path the fix pipeline should evaluate/fix for a [projects] entry:
 # its [active_checkout] override if one is set (e.g. a worktree), else the entry
 # itself. Identity/history keys derive from the entry, not this path, so a
 # redirect keeps a project's history while pointing work at a different checkout.
@@ -52,7 +52,7 @@ cf_load_stage_enabled() {
     local parsed_enabled=""
 
     if [[ ! -f "$FIX_AGENT_ASSIGNMENTS_FILE" ]]; then
-        echo "ERROR: clean-fix agent assignment file not found: $FIX_AGENT_ASSIGNMENTS_FILE" >&2
+        echo "ERROR: fix agent assignment file not found: $FIX_AGENT_ASSIGNMENTS_FILE" >&2
         return 1
     fi
 
@@ -107,7 +107,7 @@ cf_print_stage_assignment() {
 }
 
 cf_print_agent_assignments() {
-    echo "clean-fix assignments: $FIX_AGENT_ASSIGNMENTS_FILE"
+    echo "fix assignments: $FIX_AGENT_ASSIGNMENTS_FILE"
     echo "global agent registry: $AGENTS_CONFIG_FILE"
     cf_print_stage_assignment style_eval
     cf_print_stage_assignment style_eval_review

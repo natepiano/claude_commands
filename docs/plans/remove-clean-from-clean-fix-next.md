@@ -121,3 +121,71 @@ Restructuring the geometry model would confound both the rename check and the
 prose-only one, so it belongs after this plan.
 
 **Revealed by:** Phase 6.
+
+## 6. `codex exec` rejects `--full-auto`, so every evaluation worker fails
+
+`scripts/fix/style-eval-all.sh:417` passes `--full-auto` to `codex exec`. The
+installed `codex` no longer accepts it: `error: unexpected argument '--full-auto'
+found`, with the tip `to pass '--full-auto' as a value, use '-- --full-auto'`.
+Every worker exits 2 before invoking its history helper, so the eval stage
+reports 27 failures out of 30 and the fix stage skips every one of them with
+`eval-failed`. Retry does not help, because the flag is wrong on both attempts.
+The pending work is kept for resume and a per-failure report is written under
+`nate_style/.history/.failures/`, so nothing is lost — but nothing is evaluated
+either.
+
+**What would satisfy it:** the eval launcher passes flags the installed `codex
+exec` accepts, and a forced `run_once` reports a non-zero eval `ok` count.
+`scripts/fix/style-eval-review-all.sh` and `scripts/fix/style-fix-worktrees.sh`
+build their own `codex` argument lists and should be checked against the same
+binary at the same time.
+
+**Why not in the plan:** the flag is byte-identical at the pre-plan commit and
+has nothing to do with removing the clean stage. It surfaced only because this
+plan's final phase forced a full `run_once`, which is the first run in this
+window to reach the eval stage at all.
+
+**Revealed by:** Phase 10.
+
+## 7. A configured project points at a path that no longer exists
+
+`scripts/fix/fix.conf` lists `hana/crates/bevy_kana`, and every run skips it with
+`SKIP: bevy_kana (target path not found: /Users/natemccoy/rust/hana/crates/bevy_kana)`.
+The skip is emitted once per stage that enumerates projects, so a single missing
+directory produces a recurring line in every report for a project that cannot be
+worked on.
+
+**What would satisfy it:** the entry names a path that exists, or it is removed
+from the allowlist, and a forced `run_once` emits no `target path not found`
+line.
+
+**Why not in the plan:** whether the crate moved or was deleted is a fact about
+the `hana` workspace, not about this repository, and the entry is unchanged at
+the pre-plan commit.
+
+**Revealed by:** Phase 10.
+
+## 8. An unquoted heredoc evaluates a backtick in the fix agent's prompt
+
+`scripts/fix/style-fix-worktrees.sh:679` opens the agent prompt with
+`cat > "$prompt_file" <<PROMPT_EOF` — an unquoted delimiter, so the shell expands
+the body. Line 835 writes ``N remaining: `path:line`, ...`` with live backticks,
+so the shell runs `path:line` as a command and prints
+`style-fix-worktrees.sh: line 679: path:line: command not found` once per
+invocation. The message names the heredoc's opening line, not the offending one,
+which sends anyone reading the log to the wrong place. The prompt still reaches
+the agent with an empty span where the example should be, so the instruction the
+line was written to give is silently missing.
+
+The file documents this exact hazard at `:673-676` and warns against command
+substitution around the heredoc; the guard is right and one line slipped past it.
+
+**What would satisfy it:** the prompt body no longer runs anything at render
+time — either the delimiter is quoted (`<<'PROMPT_EOF'`, with every intended
+expansion re-introduced deliberately) or the backticks at `:835` are escaped —
+and a forced `run_once` reaches the fix stage with no `command not found` line.
+
+**Why not in the plan:** the line is byte-identical at the pre-plan commit, and
+the surrounding heredoc is untouched by the rename.
+
+**Revealed by:** Phase 10.

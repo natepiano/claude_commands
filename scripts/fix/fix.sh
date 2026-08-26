@@ -1,5 +1,5 @@
 #!/bin/bash
-# Clean-fix style orchestrator.
+# Fix style orchestrator.
 # Usage: fix.sh [project]
 #        fix.sh run_once
 #   [project] — optionally filter the style eval, review, and fix pass
@@ -143,19 +143,19 @@ if [[ -f "$CONF_FILE" ]]; then
                 ;;
             style_eval)
                 if [[ "$stripped" =~ ^mode= ]]; then
-                    echo "ERROR: [style_eval] stale clean-fix setting; stage enablement lives in $FIX_AGENT_ASSIGNMENTS_FILE and agent settings live in $AGENTS_CONFIG_FILE" >&2
+                    echo "ERROR: [style_eval] stale fix setting; stage enablement lives in $FIX_AGENT_ASSIGNMENTS_FILE and agent settings live in $AGENTS_CONFIG_FILE" >&2
                     exit 1
                 elif [[ "$stripped" =~ ^(enabled|agent|model|effort)= ]]; then
-                    echo "ERROR: [style_eval] stale clean-fix setting; stage enablement lives in $FIX_AGENT_ASSIGNMENTS_FILE and agent settings live in $AGENTS_CONFIG_FILE" >&2
+                    echo "ERROR: [style_eval] stale fix setting; stage enablement lives in $FIX_AGENT_ASSIGNMENTS_FILE and agent settings live in $AGENTS_CONFIG_FILE" >&2
                     exit 1
                 fi
                 ;;
             style_fix)
                 if [[ "$stripped" =~ ^mode= ]]; then
-                    echo "ERROR: [style_fix] stale clean-fix setting; stage enablement lives in $FIX_AGENT_ASSIGNMENTS_FILE and agent settings live in $AGENTS_CONFIG_FILE" >&2
+                    echo "ERROR: [style_fix] stale fix setting; stage enablement lives in $FIX_AGENT_ASSIGNMENTS_FILE and agent settings live in $AGENTS_CONFIG_FILE" >&2
                     exit 1
                 elif [[ "$stripped" =~ ^(enabled|agent|model|effort)= ]]; then
-                    echo "ERROR: [style_fix] stale clean-fix setting; stage enablement lives in $FIX_AGENT_ASSIGNMENTS_FILE and agent settings live in $AGENTS_CONFIG_FILE" >&2
+                    echo "ERROR: [style_fix] stale fix setting; stage enablement lives in $FIX_AGENT_ASSIGNMENTS_FILE and agent settings live in $AGENTS_CONFIG_FILE" >&2
                     exit 1
                 fi
                 ;;
@@ -172,11 +172,11 @@ cf_load_stage_assignment style_fix \
 
 START_TIME=$SECONDS
 if [[ -n "$PROJECT_FILTER" ]]; then
-    log "=== Starting clean-fix (project: $PROJECT_FILTER) ==="
+    log "=== Starting fix (project: $PROJECT_FILTER) ==="
 elif [[ "$RUN_ONCE_REQUESTED" == "true" ]]; then
-    log "=== Starting clean-fix (run_once) ==="
+    log "=== Starting fix (run_once) ==="
 else
-    log "=== Starting clean-fix ==="
+    log "=== Starting fix ==="
 fi
 if [[ "$RUN_ONCE_REQUESTED" == "true" ]]; then
     log_run_once_summary
@@ -228,21 +228,21 @@ MINUTES=$(( ELAPSED / 60 ))
 SECS=$(( ELAPSED % 60 ))
 log "=== Fix complete (${MINUTES}m ${SECS}s) ==="
 
-# Generate the clean-fix report via the assigned agent — but only when the run did
+# Generate the fix report via the assigned agent — but only when the run did
 # something. The pipeline fires every 10 minutes; an all-SKIP cycle has no
 # OK/FAILED lines and an agent call per idle cycle is pure cost.
 REPORT_FILE="/tmp/fix-report.txt"
 REPORT_PROMPT_FILE="${LOG_FILE%.log}-report-prompt.md"
 REPORT_LOG_FILE="$LOG_DIR/report_render.txt"
 if grep -qE '(^|[[:space:]])(OK|FAILED|ERROR|TIMEOUT|RECOVERED|Launched):' "$LOG_FILE"; then
-    log "Generating clean-fix report..."
+    log "Generating fix report..."
     if sed 's/\$ARGUMENTS/rebuild/g' "$HOME/.claude/scripts/fix/report-render.md" > "$REPORT_PROMPT_FILE"; then
         "$HOME/.claude/scripts/agents/agent_exec.sh" fix.report write \
             "$HOME/.claude" "$REPORT_PROMPT_FILE" "$REPORT_FILE" "$REPORT_LOG_FILE" || {
-            log "WARNING: failed to generate clean-fix report"
+            log "WARNING: failed to generate fix report"
         }
     else
-        log "WARNING: failed to generate clean-fix report"
+        log "WARNING: failed to generate fix report"
     fi
     rm -f "$REPORT_PROMPT_FILE"
 else

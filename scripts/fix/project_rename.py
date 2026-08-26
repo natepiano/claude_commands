@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Rename a clean-fix project key and migrate its history state."""
+"""Rename a fix pipeline project key and migrate its history state."""
 
 from __future__ import annotations
 
@@ -438,8 +438,8 @@ def print_plan(plan: Plan, *, dry_run: bool, applied: bool) -> None:
 
 
 def parse_args(argv: list[str]) -> CliArgs:
-    parser = argparse.ArgumentParser(description="Rename a clean-fix project key.")
-    _ = parser.add_argument("old", help="current clean-fix project key or [projects] entry")
+    parser = argparse.ArgumentParser(description="Rename a fix pipeline project key.")
+    _ = parser.add_argument("old", help="current fix project key or [projects] entry")
     _ = parser.add_argument("new", help="new project name/path under ~/rust, or absolute path")
     _ = parser.add_argument("--conf", type=Path, default=DEFAULT_CONF)
     _ = parser.add_argument("--rust-dir", type=Path, default=DEFAULT_RUST_DIR)

@@ -23,9 +23,9 @@ LINT_CONFIG_FILE="${LINT_CONFIG_FILE:-$HOME/.claude/config/lint.conf}"
 # Canonical order. Each entry is `name|what it runs|where it applies`. A key in
 # the config that is not listed here is rejected as unknown.
 LINT_CONFIG_OPS=(
-    "mend|cargo mend check pass and its --fix pass|/clippy mend check/fix · invoke.sh mend (lint CLI, clean-fix, validate_ci mend steps)"
+    "mend|cargo mend check pass and its --fix pass|/clippy mend check/fix · invoke.sh mend (lint CLI, fix pipeline, validate_ci mend steps)"
     "style_review|style-guide walk over the uncommitted diff|/clippy style review · /plan:delegate phase-end gate"
-    "clippy|cargo clippy|/clippy clippy stage · invoke.sh clippy (lint CLI, clean-fix, verify.sh lint)"
+    "clippy|cargo clippy|/clippy clippy stage · invoke.sh clippy (lint CLI, fix pipeline, verify.sh lint)"
     "doc|cargo doc with -D warnings|/clippy doc stage · invoke.sh doc (lint doc)"
     "fmt|cargo +nightly fmt|/clippy format stage · invoke.sh fmt (lint fmt, verify.sh lint/fmt/final)"
 )

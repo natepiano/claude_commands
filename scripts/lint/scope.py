@@ -31,7 +31,7 @@ chose a *package* scope -- --workspace or -p.
 this resolver takes arguments. It chooses a manifest, not a package set:
 aimed at a virtual workspace root it leaves cargo's default selection at
 "every member", so a per-project driver that passes it (cargo-port,
-clean-fix) gets a workspace-wide compile with no --workspace anywhere in the
+fix pipeline) gets a workspace-wide compile with no --workspace anywhere in the
 argv to show for it. Treating it as a caller-chosen scope therefore disabled
 narrowing for every such driver. It is forwarded here instead, and metadata
 and git status resolve against that manifest rather than the working

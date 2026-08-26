@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Redirect clean-fix's style eval/fix to a worktree, via fix.conf.
+"""Redirect the fix pipeline's style eval/fix to a worktree, via fix.conf.
 
 A git worktree `W` is a full checkout of one repo `R` (its parent must be ~/rust
-so its name is a valid clean-fix path relative to ~/rust). If `W`'s name is
+so its name is a valid fix pipeline path relative to ~/rust). If `W`'s name is
 prefixed — at a `_`/`-` boundary — by `R` itself or by one of `R`'s workspace
 members named in [projects], the matched project(s) should evaluate/fix that
 worktree instead of the primary, while keeping their identity/history.
@@ -255,7 +255,7 @@ def main() -> None:
         if removed:
             _ = conf.write_text("\n".join(out) + "\n")
             if do_commit:
-                payload["commit"] = commit_conf(conf, f"chore(clean-fix): drop worktree redirect for {worktree}")
+                payload["commit"] = commit_conf(conf, f"chore(fix): drop worktree redirect for {worktree}")
         print(json.dumps(payload, indent=2))
         return
 
@@ -275,7 +275,7 @@ def main() -> None:
     }
     if do_commit:
         entries = ", ".join(r["entry"] for r in result["redirects"])
-        applied["commit"] = commit_conf(conf, f"chore(clean-fix): redirect {entries} to worktree {worktree}")
+        applied["commit"] = commit_conf(conf, f"chore(fix): redirect {entries} to worktree {worktree}")
     print(json.dumps(applied, indent=2))
 
 

@@ -10,7 +10,7 @@ I iterate on these almost every day to get them to work right for me - feel free
 - **rust_style / local_style / succinct_style** - Load shared and repo-local style guides
 - **style_eval / focused_eval / style_fix_review** - Evaluate code against the style guide and review fixes
 
-### Clean-Fix Automation
+### Fix Automation
 - **fix** - Pipeline that evaluates and fixes style across projects; runs on a launchd schedule (`scripts/fix/`)
 
 ### Review & Planning

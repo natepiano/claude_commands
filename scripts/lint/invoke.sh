@@ -2,7 +2,7 @@
 # invoke.sh — sourced library holding every cargo invocation policy: canonical
 # flags, config/lint.conf gating, and macOS sandbox-failure detection. This is the single bottom layer. The lint CLI in
 # this directory is the public entry point (shell aliases, validate_ci.sh,
-# clean-fix, pre_release_checks.sh, /clippy); delegate/verify.sh sources this
+# the fix pipeline, pre_release_checks.sh, /clippy); delegate/verify.sh sources this
 # file directly and adds only its per-package scope rules on top. Nothing
 # outside this directory composes policy flags like -D warnings or the nextest
 # profile.
@@ -145,7 +145,7 @@ invoke_mend() {
     # RUSTC_WRAPPER cleared: a compiler cache replays cached output instead of
     # running rustc, which suppresses the diagnostics mend analyzes
     # Scope comes from the caller (the lint CLI resolves it, or a caller like
-    # clean-fix passes --manifest-path). Forcing --workspace here silently
+    # the fix pipeline passes --manifest-path). Forcing --workspace here silently
     # overrode both: a per-project run linted the whole workspace instead.
     run env RUSTC_WRAPPER= cargo mend --all-targets "$@"
 }

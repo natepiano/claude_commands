@@ -1,10 +1,10 @@
 ---
-description: Show style guide history and reporting derived from clean-fix style runs.
+description: Show style guide history and reporting derived from fix pipeline style runs.
 ---
 
 # Style Report Summary
 
-Show style guide history and reporting derived from clean-fix style runs.
+Show style guide history and reporting derived from fix pipeline style runs.
 
 **Arguments**: `$ARGUMENTS` — optional flags passed to `style_report.py`
 

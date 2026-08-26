@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Skip or re-enable individual clean-fix style targets.
+"""Skip or re-enable individual fix pipeline style targets.
 
 The conf is an opt-in allowlist, so "skipping" a target means commenting its
 allowlist line out, and "enabling" uncomments it. Style targets live in

@@ -90,7 +90,7 @@ Every numbered finding gets exactly one bullet, even if you took no action (`kep
 
 ## Hard rules
 
-- Do **not** add new findings for unrelated rules. If the same style file and same rule has missing locations, add those locations to the existing finding as an amendment. If you notice an unrelated violation, ignore it — `/style_eval` will catch it on the next clean-fix.
+- Do **not** add new findings for unrelated rules. If the same style file and same rule has missing locations, add those locations to the existing finding as an amendment. If you notice an unrelated violation, ignore it — `/style_eval` will catch it on the next fix run.
 - Do **not** edit source code. Do **not** edit any style guide file.
 - Do **not** delete a removed finding's text — wrap it in `REMOVED-BY-REVIEW` markers.
 - Do **not** renumber findings.

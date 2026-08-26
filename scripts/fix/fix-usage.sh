@@ -29,24 +29,24 @@ load_usage_rows() {
     USAGE_DESCRIPTIONS=()
     USAGE_BREAK_AFTER=()
 
-    add_usage "clean_fix run [project]" "Style eval/review/fix. Optional project filters to one target." true
-    add_usage "clean_fix run_once" "Runs one eval + review + fix pass across all configured style projects, regardless of stage enablement." true
-    add_usage "clean_fix add <path-or-project>" "Adds a Rust project to the style allowlist. Workspace members use workspace-relative entries." true
-    add_usage "clean_fix rename <old> <new>" "Renames a clean-fix project key and migrates history, pending state, and markers." true
-    add_usage "clean_fix monitor" "Watches the latest clean-fix log modified in the last 2 hours." true
-    add_usage "clean_fix report" "Shows current clean-fix state for every project. Use clean_fix report latest for the newest log, or clean_fix list to pick an older one."
-    add_usage "clean_fix list" "Lists reportable logs. Same as clean_fix report list." true
-    add_usage "clean_fix eval" "Shows eval stage family/agent status. Also works for review and fix."
-    add_usage "clean_fix agent" "Shows all stage family, resolved agent, and effort assignments."
-    add_usage "/agent fix <family>" "Switches the clean-fix family in the shared agent registry."
-    add_usage "/agent fix.<stage> <agent>[:<effort>]" "Edits a clean-fix stage row; stages are style_eval, style_eval_review, and style_fix." true
-    add_usage "clean_fix on" "Enables all style stages."
-    add_usage "clean_fix off" "Disables all style stages."
-    add_usage "clean_fix eval on" "Enables one stage. Also works for review and fix."
-    add_usage "clean_fix eval off" "Disables one stage. Also works for review and fix." true
-    add_usage "clean_fix skip" "Shows targets currently skipped."
-    add_usage "clean_fix skip <target>..." "Temporarily skips projects."
-    add_usage "clean_fix skip enable <target>..." "Re-enables projects. Use enable-all to restore every temporary skip."
+    add_usage "/fix run [project]" "Style eval/review/fix. Optional project filters to one target." true
+    add_usage "/fix run_once" "Runs one eval + review + fix pass across all configured style projects, regardless of stage enablement." true
+    add_usage "/fix add <path-or-project>" "Adds a Rust project to the style allowlist. Workspace members use workspace-relative entries." true
+    add_usage "/fix rename <old> <new>" "Renames a fix project key and migrates history, pending state, and markers." true
+    add_usage "/fix monitor" "Watches the latest fix log modified in the last 2 hours." true
+    add_usage "/fix report" "Shows current fix state for every project. Use /fix report latest for the newest log, or /fix list to pick an older one."
+    add_usage "/fix list" "Lists reportable logs. Same as /fix report list." true
+    add_usage "/fix eval" "Shows eval stage family/agent status. Also works for review and fix."
+    add_usage "/fix agent" "Shows all stage family, resolved agent, and effort assignments."
+    add_usage "/agent fix <family>" "Switches the fix family in the shared agent registry."
+    add_usage "/agent fix.<stage> <agent>[:<effort>]" "Edits a fix stage row; stages are style_eval, style_eval_review, and style_fix." true
+    add_usage "/fix on" "Enables all style stages."
+    add_usage "/fix off" "Disables all style stages."
+    add_usage "/fix eval on" "Enables one stage. Also works for review and fix."
+    add_usage "/fix eval off" "Disables one stage. Also works for review and fix." true
+    add_usage "/fix skip" "Shows targets currently skipped."
+    add_usage "/fix skip <target>..." "Temporarily skips projects."
+    add_usage "/fix skip enable <target>..." "Re-enables projects. Use enable-all to restore every temporary skip."
 }
 
 json_escape() {

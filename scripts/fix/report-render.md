@@ -1,12 +1,12 @@
-# Clean-fix Report
+# Fix Report
 
-Render a status view of one clean-fix run from a parsed log. All log discovery, regex matching, phase slicing, and bookkeeping suppression lives in `~/.claude/scripts/fix/fix_report_parse.py`. This document only routes arguments and renders the parsed output. It is consumed two ways: by `/fix report` (interactive) and by `fix.sh`, which sends it to the configured report agent after each run.
+Render a status view of one fix run from a parsed log. All log discovery, regex matching, phase slicing, and bookkeeping suppression lives in `~/.claude/scripts/fix/fix_report_parse.py`. This document only routes arguments and renders the parsed output. It is consumed two ways: by `/fix report` (interactive) and by `fix.sh`, which sends it to the configured report agent after each run.
 
 ## Arguments
 
 `$ARGUMENTS` may be:
 
-1. **Empty** — call `fix_report_parse.py` with no arguments. The parser renders the current clean-fix state for every keyed `[projects]` target, independent of whichever log was written last.
+1. **Empty** — call `fix_report_parse.py` with no arguments. The parser renders the current fix state for every keyed `[projects]` target, independent of whichever log was written last.
 2. **The literal word `list`** — call `fix_report_parse.py --list`. Print the numbered list (path, date, time, duration, status, phases). Ask the user to pick by index, then call `fix_report_parse.py <chosen-path>` and render.
 3. **The literal word `latest` or `newest`** — call `fix_report_parse.py --latest-log`. This is the explicit old behavior: parse the newest log in `~/.local/logs/fix/`.
 4. **A path** — call `fix_report_parse.py <path>`. If the parser exits with `ERROR: log not found`, surface that and stop.

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Per-project clean-fix style history helpers."""
+"""Per-project fix pipeline style history helpers."""
 
 from __future__ import annotations
 
@@ -313,7 +313,7 @@ def _style_eval_conf_int(conf_key: str) -> int:
     """Read an int key from `[style_eval]` in `fix.conf`.
 
     Single source of truth for eval tunables. Errors loudly if missing — both
-    the clean-fix script and the ad-hoc agent path depend on these values, so
+    the fix script and the ad-hoc agent path depend on these values, so
     silent defaulting would let arbitrary numbers leak in (the bug that
     motivated centralizing max_new_findings).
     """
@@ -401,7 +401,7 @@ class WorkspaceMember:
 
 def active_checkout_overrides() -> dict[str, str]:
     """``[active_checkout]`` map: a [projects] entry -> the checkout path (relative
-    to ~/rust) that clean-fix should read instead of the entry's own path. Lets a
+    to ~/rust) that the fix pipeline should read instead of the entry's own path. Lets a
     worktree stand in for a project while history stays under the entry's name."""
     if not FIX_CONF_FILE.exists():
         return {}
@@ -874,7 +874,7 @@ def unit_next_due_epoch(
 def due_units_payload(project_root: Path) -> dict[str, object]:
     """Read-only report of which reviewable units are due right now.
 
-    `due_unit_count == 0` is the launch gate: the clean-fix skips spawning an
+    `due_unit_count == 0` is the launch gate: the fix pipeline skips spawning an
     eval agent for the project entirely.
     """
     project = project_key(project_root)

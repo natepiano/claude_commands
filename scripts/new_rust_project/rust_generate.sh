@@ -145,11 +145,11 @@ else:
 PY
   fi
 
-  # Enroll in the clean-fix flow (config lives outside the workspace).
+  # Enroll in the fix flow (config lives outside the workspace).
   CONF="$HOME/.claude/scripts/fix/fix.conf"
   ROOTDIR=$(basename "$ROOT")
   if [[ -f "$CONF" ]]; then
-    echo "=== Enrolling in clean-fix ==="
+    echo "=== Enrolling in fix pipeline ==="
     python3 - "$CONF" "$ROOTDIR" "$NAME" <<'PY'
 import sys
 conf, rootdir, name = sys.argv[1], sys.argv[2], sys.argv[3]
@@ -200,7 +200,7 @@ PY
 
   echo "=== Done! ==="
   echo "Member: $DEST"
-  echo "Built, formatted, clean-fix enrolled, and committed to $ROOTDIR. Push when ready."
+  echo "Built, formatted, fix pipeline enrolled, and committed to $ROOTDIR. Push when ready."
   exit 0
 fi
 

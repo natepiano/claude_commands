@@ -1,4 +1,4 @@
-digraph clean_fix_style {
+digraph fix_style {
     // ┌─────────────────────────────────────────────────────────────────┐
     // │ LAYOUT GUIDE                                                    │
     // │                                                                 │
@@ -32,7 +32,7 @@ digraph clean_fix_style {
 
     node [fillcolor="#e8f4f8" color="#2980b9"]
 
-    start [label="Clean-fix launchd trigger\n(every 10 minutes)" shape=oval fillcolor="#f0e6ff" color="#8e44ad" width=2.2 height=0.55 pos="470,1050!"]
+    start [label="Fix pipeline launchd trigger\n(every 10 minutes)" shape=oval fillcolor="#f0e6ff" color="#8e44ad" width=2.2 height=0.55 pos="470,1050!"]
 
     // Cluster-first layout in points:
     // Phase 1 range = [-15.6, 315.6], center = 150.0
@@ -98,12 +98,12 @@ digraph clean_fix_style {
     }
 
     activity_gate [label="run log has\nproject result lines?" shape=diamond fillcolor="#fef9e7" color="#f39c12" width=1.7 height=0.9 pos="470,130!"]
-    report [label="Generate Clean-fix Report" shape=oval fillcolor="#f0e6ff" color="#8e44ad" width=2.2 pos="470,30!"]
+    report [label="Generate Fix Report" shape=oval fillcolor="#f0e6ff" color="#8e44ad" width=2.2 pos="470,30!"]
     report_idle [label="Skip report\n(no activity this run)" height=0.55 width=1.8 pos="790,30!"]
 
-    // ══════ Post-Clean-fix Manual (x center = 470.0) ══════
+    // ══════ Post-Fix Manual (x center = 470.0) ══════
     subgraph cluster_manual {
-        label="Post-Clean-fix (Manual)"
+        label="Post-Fix (Manual)"
         style=dashed color="#95a5a6" fontcolor="#7f8c8d" fontsize=9
         margin=12
 
