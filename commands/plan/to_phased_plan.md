@@ -162,10 +162,10 @@ block — nothing else. The prompt must include:
      skill — belongs to /plan:delegate's <FinalGate/> after the last phase,
      never to any phase. For non-Rust projects, record the exact commands the
      project uses (read `package.json`/`justfile`/CI config; do not invent).
-  6. **Style** — for Rust, record `phase-end /clippy style-only auto-proceed`.
-     /plan:delegate keeps this line out of coding and fix prompts, then runs the
-     style review once after behavioral review and smoke converge; omit for
-     non-Rust.
+  6. **Style** — for Rust, record `run-end /clippy style-only auto-proceed`.
+     /plan:delegate keeps this line out of coding and fix prompts, then runs one
+     style review for the whole project at <FinalGate/>, diffing the branch so
+     it reaches work every phase already checkpointed; omit for non-Rust.
   7. **Invariants** — project-wide rules every phase must preserve (from the plan
      and from obvious code constraints).
 - Output format: the `## Delegation Context` bullet block from the format doc,

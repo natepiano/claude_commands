@@ -49,9 +49,9 @@ to rediscover after a context compaction lives in the doc.
   Never raw cargo commands and never the full `clippy` skill here — phase
   verification is deliberately scoped; workspace breadth and the `clippy`
   skill run once in /plan:delegate's <FinalGate/> after the last phase>
-- **Style:** <for Rust use `phase-end /clippy style-only auto-proceed`;
-  /plan:delegate omits it from coding prompts and executes it once before the
-  phase checkpoint; omit for non-Rust>
+- **Style:** <for Rust use `run-end /clippy style-only auto-proceed`;
+  /plan:delegate omits it from coding prompts and runs it once at <FinalGate/>,
+  over the whole branch diff rather than one phase; omit for non-Rust>
 - **Invariants:** <project-wide rules every phase must preserve; omit if none>
 
 ## Phases

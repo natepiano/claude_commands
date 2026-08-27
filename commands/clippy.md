@@ -12,9 +12,15 @@ arguments can reach `lint clippy`, then strip them from `$ARGUMENTS`:
 - `no-style` sets `NO_STYLE = true`. This invocation runs the normal pipeline
   with `LINT_OP_STYLE_REVIEW=off` for this invocation only; it does not edit
   `config/lint.conf`.
+- `since <ref>` sets `STYLE_SINCE = <ref>` and consumes the argument after it.
+  <StyleReview/> then reviews everything that changed from that commit forward —
+  committed work included — instead of the working tree alone. Use it when the
+  work under review is already committed, as /plan:delegate's branch-wide review
+  is. STOP and report if `git rev-parse --verify <ref>` does not resolve.
 
-If both tokens are present, STOP and report that `style-only` and `no-style`
-are mutually exclusive. Both variables default to false.
+If both `style-only` and `no-style` are present, STOP and report that they are
+mutually exclusive. `STYLE_ONLY` and `NO_STYLE` default to false; `STYLE_SINCE`
+defaults to empty.
 </InvocationModes>
 
 <AutoProceed>
@@ -140,8 +146,8 @@ Pass `--workspace` or `-p <pkg>` in `$ARGUMENTS` to choose the scope yourself.
 Execute: `~/.claude/scripts/lint/lint clippy ${ARGUMENTS:-}`
 
 If $ARGUMENTS provided, use as additional flags — after removing the
-`auto-proceed`, `style-only`, and `no-style` tokens, which are mode switches,
-not clippy flags (see <InvocationModes/> and <AutoProceed/>).
+`auto-proceed`, `style-only`, `no-style`, and `since <ref>` tokens, which are
+mode switches, not clippy flags (see <InvocationModes/> and <AutoProceed/>).
 If different base configuration needed, user can override CLIPPY_FLAGS.
 
 Error Handling:
@@ -390,16 +396,16 @@ truth that maps clippy lints to the rule that governs them.
 
 **Do this step yourself — do not delegate it to a subagent** (Task/Agent tool, Codex sub-session, etc.). Run the diff commands and the rule-by-rule walk inline in this conversation so the user can watch progress rule-by-rule instead of waiting on an unauditable subagent turn.
 
-1. Build the combined diff of uncommitted work, then the additions-only text from it. **Untracked files are always included** — a new file is entirely added code, so `git diff --no-index /dev/null <file>` renders it as all-additions. Never review only tracked changes:
+1. Build the combined diff under review, then the additions-only text from it. **Untracked files are always included** — a new file is entirely added code, so `git diff --no-index /dev/null <file>` renders it as all-additions. Never review only tracked changes:
    ```bash
    {
-     git diff
+     if [ -n "${STYLE_SINCE:-}" ]; then git diff "${STYLE_SINCE}"; else git diff; fi
      git ls-files --others --exclude-standard -z \
        | xargs -0 -I{} git diff --no-index /dev/null "{}" 2>/dev/null
    } > /tmp/claude/style-review.diff
    grep '^+' /tmp/claude/style-review.diff | grep -v '^+++' > /tmp/claude/style-review-additions.txt
    ```
-   The `git diff --no-index` exit status 1 (differences found) is expected, not an error. The `.diff` file (with `+++`/`@@` headers) drives the banned-words scan so findings report real source `path:line`; the `-additions.txt` (added lines only) is your reading aid for the rule walk. If `-additions.txt` is empty, report: "No uncommitted changes to review." and skip remaining steps.
+   Export `STYLE_SINCE` from <InvocationModes/> first, empty when no `since` token was given. `git diff <ref>` compares that commit to the working tree, so one command covers committed, staged, and unstaged work in the range. The `git diff --no-index` exit status 1 (differences found) is expected, not an error. The `.diff` file (with `+++`/`@@` headers) drives the banned-words scan so findings report real source `path:line`; the `-additions.txt` (added lines only) is your reading aid for the rule walk. If `-additions.txt` is empty, report "No changes to review." — naming the range when `STYLE_SINCE` is set — and skip remaining steps.
 
 2. If the `=== STYLE_CHECKLIST ===` section is not already in context, execute <LoadStyleGuide/> now. The checklist lists every rule by number and name.
 

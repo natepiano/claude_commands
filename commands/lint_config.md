@@ -60,9 +60,9 @@ including runs started by `/commit_prep` or a `/plan:delegate` work order) and
 `scripts/lint/invoke.sh` — the sourced bottom layer that the `lint` CLI,
 `scripts/delegate/verify.sh`, and `scripts/fix/fix.sh` all flow
 through.
-`/plan:delegate` uses `/clippy style-only` for its required phase-end style
-gate, so `style_review=off` blocks that checkpoint instead of silently passing
-it.
+`/plan:delegate` uses `/clippy style-only` for the one style review it runs over
+the whole branch at the end of a project, so `style_review=off` blocks that run
+from completing instead of silently passing it.
 
 ## What this file deliberately does not gate
 

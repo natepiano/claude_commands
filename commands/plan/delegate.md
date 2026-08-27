@@ -1,5 +1,5 @@
 ---
-description: Delegate phased work with review, repair, smoke/style gates, as-built shrink, approved follow-up capture, and one checkpoint per phase. Supports automatic loop, verbose gating, bounded auto windows, and single no-commit mode.
+description: Delegate phased work with review, repair, smoke gates, one branch-wide style review at the end of the project, as-built shrink, approved follow-up capture, and one checkpoint per phase. Supports automatic loop, verbose gating, bounded auto windows, and single no-commit mode.
 ---
 
 # Delegate
@@ -43,6 +43,9 @@ State:
 - `STYLE_GATE_CONFIG`: plan hint captured during prompt composition.
 - `STYLE_REVIEW_DONE`: starts false. The durable true state is
   `${SESSION_DIR}/style_review_done`; later fixes never clear it.
+- `STYLE_DIFF_BASE`: the commit the project-end style review diffs from,
+  resolved once by <ResolveStyleDiffBase/> and persisted at
+  `${SESSION_DIR}/style_diff_base`. Empty means no branch diff is available.
 - `FINDINGS`: the current phase's `findings.py` ledger.
 - `DELEGATED_PHASE_RESERVATION_STATE`: the tagged state persisted at
   `${SESSION_DIR}/delegated_phase_reservation_state.json`; see
@@ -55,12 +58,15 @@ or exceptions; it does not restate the contract.
 </TagReferenceContract>
 
 <CoreContract>
-- Never create a worktree, switch branches, or modify unrelated files.
+- Never create a worktree or modify unrelated files. The only branch the run may
+  create is the one the user approves in <ResolveStyleDiffBase/>; never switch to
+  an existing branch.
 - The main agent does not write implementation code unless the user explicitly
   asks. Exceptions: agreed doc-only/trivial post-review fixes and the single
-  inline cleanup in <RunPhaseStyleReview/>.
+  inline cleanup in <RunProjectStyleReview/>.
 - `single` never commits. Loop and verbose modes create exactly one
-  <CheckpointCommit/> per completed phase. No other commit is allowed.
+  <CheckpointCommit/> per completed phase, plus the one <FinalGateCommit/> that
+  closes the run. No other commit is allowed.
 - A checkpoint never pushes. If a phase explicitly needs a remote commit for a
   dependency pin, consumer, or CI run, pushing that working branch is mechanical
   phase work, not a user decision or prerequisite.
@@ -144,7 +150,7 @@ does.
   `MODE`, `AUTO_WINDOW`, the last authorization, `PROGRESS_UPDATES_ENABLED`, any
   live `DISPATCH_HANDLE`, any live `REVIEW_DISPATCH_HANDLE` with `EARLY_REVIEW`
   and `REVIEW_PASS`, any Claude `PROGRESS_TIMER_HANDLE`,
-  `STYLE_REVIEW_DONE`, `NEXT_ITEMS_PATH`, whichever tagged
+  `STYLE_REVIEW_DONE`, `STYLE_DIFF_BASE`, `NEXT_ITEMS_PATH`, whichever tagged
   `DelegatedPhaseReservationState` is live, and any
   unresolved next-item approval. When a claim is still in its authorization
   round trip, also include its UUID-v7 coordination run, captured phase-start
@@ -205,7 +211,7 @@ Cargo; run each listed command with the sandbox disabled; do not report until
 every command has exited and its output has been read. If an edited package has
 no listed `test` line, add that package's scoped
 `verify.sh test` and report it. Omit plan **Style** metadata and never load the
-style guide; <RunPhaseStyleReview/> owns the one style audit.
+style guide; <RunProjectStyleReview/> owns the run's one style audit.
 
 It must also instruct the delegate: tests are the only testing — a passing
 `test` run proves the build, so never add a `check` or build pass around a
@@ -261,8 +267,8 @@ Rules:
   failures, not dependency or code defects.
 - `verify.sh lint` and `fmt` honor `~/.claude/config/lint.conf`. A printed `SKIPPED` is
   skipped, not passed; do not bypass a disabled check manually.
-- `style_review=off` does not waive <RunPhaseStyleReview/>; it blocks the
-  checkpoint.
+- `style_review=off` does not waive <RunProjectStyleReview/>; it blocks the run
+  from completing <FinalGate/>.
 </VerificationContract>
 
 <VerificationNarration>
@@ -606,22 +612,24 @@ Apply <CoreContract/>, <CompactionContract/>, <UserFacingText/>, and
 
 1. <PrepareSession/>
 2. <ComposeWorkOrder/>
-3. <VerbosePrePhaseGate/> when required
-4. <SelectTask/>
-5. <CoordinateDelegatedPhaseReservation/>
-6. <LaunchImplementation/>
-7. <DualReview/>
-8. <Synthesize/>
-9. <RunApplicationSmokeTest/>
-10. <RunPhaseStyleReview/>
-11. <RunPhaseReview/>
-12. <RunPhaseShrink/>
-13. <ConsiderNextItems/>
-14. <CheckpointCommit/>
-15. <DiscardPhaseReviewText/>
-16. <RecordPhaseCompletion/>
-17. <VerbosePostPhaseReport/> and applicable <VerbosePostPhaseGate/>
-18. <NextPhase/> or <RunSummary/>
+3. <ResolveStyleDiffBase/>
+4. <VerbosePrePhaseGate/> when required
+5. <SelectTask/>
+6. <CoordinateDelegatedPhaseReservation/>
+7. <LaunchImplementation/>
+8. <DualReview/>
+9. <Synthesize/>
+10. <RunApplicationSmokeTest/>
+11. <RunProjectStyleReview/> — `single` only; loop and verbose run the run's one
+    style review from <FinalGate/> after the whole plan is green
+12. <RunPhaseReview/>
+13. <RunPhaseShrink/>
+14. <ConsiderNextItems/>
+15. <CheckpointCommit/>
+16. <DiscardPhaseReviewText/>
+17. <RecordPhaseCompletion/>
+18. <VerbosePostPhaseReport/> and applicable <VerbosePostPhaseGate/>
+19. <NextPhase/> or <RunSummary/>
 </ExecutionSteps>
 
 <PrepareSession>
@@ -693,7 +701,7 @@ through <RunSummary/> or single-mode completion.
   prior phases.
 - Work Specification: Goal, Spec, Files verbatim, plus command-line amendments.
 - Capture **Style** only as `${STYLE_GATE_CONFIG}` for
-  <RunPhaseStyleReview/>.
+  <RunProjectStyleReview/>.
 - Verification: translate Build/Test/Lint/Run/Smoke and Acceptance gate into
   <VerificationContract/> lines. Convert old raw Cargo/full-clippy entries to
   scoped `verify.sh`; the main agent retains live smoke ownership.
@@ -712,6 +720,50 @@ If an initial verbose invocation contains a bounded-auto control, resolve
 `AUTO_WINDOW` and run <AutoWindowBatchBriefing/> before <SelectTask/>. Otherwise
 follow <AuthorizationContract/>.
 </ComposeWorkOrder>
+
+<ResolveStyleDiffBase>
+Loop and verbose only, once per run, before the first dispatch. `single` skips
+it and never sets a base: it commits nothing, so <RunProjectStyleReview/> reads
+the working tree directly.
+
+1. If `${SESSION_DIR}/style_diff_base` exists, restore `STYLE_DIFF_BASE` from it
+   and return. Later phases never re-resolve the base.
+2. Take `<plan-slug>` as the normalized stem derived in <ComposeWorkOrder/>
+   step 5 without its `-next.md` suffix — the same slug <CheckpointCommit/>
+   writes into every checkpoint subject. Run:
+
+   ```sh
+   bash ~/.claude/scripts/delegate/style_branch.sh resolve "${WORKING_DIR}" <plan-slug>
+   ```
+
+   Its `project_base` is the parent of this plan's first checkpoint commit, or
+   current HEAD when the plan has not checkpointed yet. That base spans a
+   project resumed across several runs and still excludes commits the branch
+   already carried. Any status other than `ok` records no base: report the
+   reason in one line, leave `STYLE_DIFF_BASE` empty, and continue.
+3. `purpose_built=true` needs no user decision. Persist `project_base` to
+   `${SESSION_DIR}/style_diff_base`, name the branch and how many commits the
+   end-of-run style review will therefore cover in one line, and continue.
+4. `purpose_built=false` means HEAD is detached or sits on the default branch,
+   so the run would checkpoint onto a branch it does not own. Ask exactly once
+   and dispatch nothing until it is answered:
+
+   ```
+   Each phase checkpoints, and the project-end style review diffs the branch to reach that committed work. Currently <reason>, so this project has no branch of its own to diff. Reply \`branch\` to create \`<suggested_branch>\` here and run on it, \`branch <name>\` to choose the name, or \`stay\` to keep this position and accept that anything else committed here lands in the same style diff.
+   ```
+
+   A `branch` answer runs
+
+   ```sh
+   bash ~/.claude/scripts/delegate/style_branch.sh create "${WORKING_DIR}" <name>
+   ```
+
+   and persists the `project_base` it returns. A non-`ok` status reports its
+   reason and re-asks; never create a differently named branch on its own
+   initiative, and never move onto an existing one. `stay` persists the
+   `project_base` already resolved and says in one line where the style diff
+   will start and that unrelated commits landing here join it.
+</ResolveStyleDiffBase>
 
 <DelegatedPhaseReservationContract>
 Coordination applies to phased Work Orders in every mode. Ad hoc work skips it.
@@ -1356,30 +1408,43 @@ and limitation>`, and continue without waiting. Deferred smoke allows the
 checkpoint but is batched at <FinalGate/> and reported by <RunSummary/>.
 </RunApplicationSmokeTest>
 
-<RunPhaseStyleReview>
-Required exactly once when the current phase diff contains `.rs`, `Cargo.toml`,
-or `Cargo.lock`, after behavioral convergence and first smoke, before phase
-review. The actual diff, not `${STYLE_GATE_CONFIG}`, decides applicability.
+<RunProjectStyleReview>
+The run's single style audit, over everything the project built rather than one
+phase. Required exactly once when the reviewed diff contains `.rs`,
+`Cargo.toml`, or `Cargo.lock`. The actual diff, not `${STYLE_GATE_CONFIG}`,
+decides applicability. Phases never run it: they carry no style gate, and a
+phase checkpoint never waits on one.
+
+- `single`: after behavioral convergence and first smoke, before phase review.
+  The reviewed range is the working tree, tracked and untracked.
+- Loop and verbose: from <FinalGate/>, once the whole plan is verified green.
+  The reviewed range is `${STYLE_DIFF_BASE}..` — every commit the project
+  landed on this branch plus the current working tree.
 
 1. If `STYLE_REVIEW_DONE=true` or the marker exists, restore true and continue.
-2. Compare current status/diff, including untracked paths, with the phase
-   baseline. With no Rust/Cargo changes, set true and write `not applicable` to
-   the marker. Stop if the style pass would edit pre-existing Rust/Cargo work.
-3. Save combined diff/status to `${SESSION_DIR}/style_review_before.diff` and
-   `${SESSION_DIR}/style_review_before.status`, announce the single cleanup,
-   and invoke the `clippy` skill inline as `style-only auto-proceed`. `Off`,
-   error, or unresolved choice blocks completion.
-4. On successful review, set true and write the result to the marker before any
+2. Loop and verbose with an empty `STYLE_DIFF_BASE` have no branch to diff:
+   set true, write `not applicable — no diff base` to the marker, and report
+   that the run ends without a style review.
+3. Build the reviewed diff, including untracked paths. With no Rust/Cargo
+   changes in it, set true and write `not applicable` to the marker. Stop if
+   the style pass would reach Rust/Cargo work the project did not write.
+4. Save combined diff/status to `${SESSION_DIR}/style_review_before.diff` and
+   `${SESSION_DIR}/style_review_before.status`, announce the single cleanup and
+   the range it covers, and invoke the `clippy` skill inline as
+   `style-only auto-proceed` — for loop and verbose, as
+   `style-only auto-proceed since ${STYLE_DIFF_BASE}`. `Off`, error, or
+   unresolved choice blocks completion.
+5. On successful review, set true and write the result to the marker before any
    cleanup verification. Never clear it during later fixes.
-5. Save `${SESSION_DIR}/style_review_after.diff` and
+6. Save `${SESSION_DIR}/style_review_after.diff` and
    `${SESSION_DIR}/style_review_after.status`, compare them with the before
    snapshots, and read every style-induced hunk. If Rust/Cargo changed, rerun
-   exact phase `test` and `lint` lines for affected packages. Failures use normal
+   `verify.sh test` and `lint` for every affected package. Failures use normal
    finding/fix routing.
-6. If cleanup reached runnable code, reset smoke to `not_run` and rerun
+7. If cleanup reached runnable code, reset smoke to `not_run` and rerun
    <RunApplicationSmokeTest/>. The guard skips this section on return.
-7. Continue to <RunPhaseReview/>, or back to <FinalGate/> for synthetic final.
-</RunPhaseStyleReview>
+8. Continue to <RunPhaseReview/> for `single`, or back to <FinalGate/>.
+</RunProjectStyleReview>
 
 <RunPhaseReview>
 For phased plans, invoke `plan:phase_review` with this run's `SESSION_DIR` and
@@ -1533,8 +1598,9 @@ occurs before the last auto phase's checkpoint, never between auto phases.
 <CheckpointCommit>
 Loop/verbose only:
 
-1. Require smoke pass, `not applicable`, or `deferred`; require
-   `STYLE_REVIEW_DONE=true`.
+1. Require smoke pass, `not applicable`, or `deferred`. Style is not a phase
+   gate: <RunProjectStyleReview/> runs once at <FinalGate/>, over every
+   checkpoint this one joins.
 2. Confirm status contains only this phase, its plan doc, and an approved change
    to `${NEXT_ITEMS_PATH}` when present.
 3. Run `verify.sh fmt <package>` for every touched package; include resulting
@@ -1724,7 +1790,7 @@ the plan or phase scratch files.
 </DiscardPhaseReviewText>
 
 <RecordPhaseCompletion>
-After smoke, style, phase review, shrink, next-item consideration, cleanup, and
+After smoke, phase review, shrink, next-item consideration, cleanup, and
 checkpoint when applicable, run `progress_history.py finish-phase --session-dir
 "${SESSION_DIR}" --status completed`.
 
@@ -1763,7 +1829,7 @@ Single-phase report:
 | --- | --- | --- | --- |
 
 ### Verification and review
-[gate, meaningful tests/lint, review/fixes, one style result, smoke]
+[gate, meaningful tests/lint, review/fixes, smoke]
 
 **Checkpoint:** `<short hash>`
 
@@ -1877,8 +1943,9 @@ answer from the completed report and preserve the gate.
 
 <NextPhase>
 If no todo phase remains, run <FinalGate/> then <RunSummary/>. Otherwise reset
-`REVIEW_PASS=0`, `IMPLEMENTATION_TASK=implementation`, smoke to `not_run`, style
-to false, and delete its marker.
+`REVIEW_PASS=0`, `IMPLEMENTATION_TASK=implementation`, and smoke to `not_run`.
+Style state is per-run, not per-phase: never reset it or delete its marker
+here, and never re-resolve `STYLE_DIFF_BASE`.
 
 - Loop: announce next phase and return to <ComposeWorkOrder/>.
 - Verbose/no window: announce its briefing and return to <ComposeWorkOrder/>.
@@ -1894,23 +1961,58 @@ Loop/verbose only after plan exhaustion:
 
 1. Launch `verify.sh final` under <BackgroundVerificationContract/>. It owns workspace
    fmt-check, all-targets check, and full tests.
-2. For Rust, invoke `clippy auto-proceed no-style` inline. Per-phase style is
-   already complete.
+2. For Rust, invoke `clippy auto-proceed no-style` inline. Style stays out of
+   this step; step 4 owns it.
 3. On failure, create a synthetic phase `final` / `Final verification` once:
-   capture a new baseline, run `start-phase`, reset review/smoke/style state and
-   marker, open the concrete failures in the ledger, then use its gate plus
-   <FixDispatch/>. Later repairs do not repeat those resets. After closure
-   convergence, run applicable smoke and return here; do not run phase review or
+   capture a new baseline, run `start-phase`, reset review and smoke state, open
+   the concrete failures in the ledger, then use its gate plus <FixDispatch/>.
+   Later repairs do not repeat those resets. After closure convergence, run
+   applicable smoke and return here; do not run phase review or a phase
    checkpoint for the synthetic phase. Rerun this gate after each repair.
-4. Once full verification is green, run <RunPhaseStyleReview/> exactly once on
-   synthetic final fixes, then rerun steps 1-2 so cleanup receives full breadth.
+4. Once full verification is green, run <RunProjectStyleReview/> exactly once —
+   this is the run's only style pass, and it covers every phase the project
+   checkpointed, not just synthetic final fixes. Then rerun steps 1-2 so its
+   cleanup receives full breadth.
 5. Batch all deferred smoke actions after the gate is green. Ask the user once;
    route discovered defects through the synthetic fix path. If declined, carry
    them as outstanding rather than blocking run completion.
-6. Finish the synthetic phase when applicable and record the final result.
+6. Finish the synthetic phase when applicable, run <FinalGateCommit/>, and
+   record the final result.
 
 Single mode and early endings skip this gate and state why in <RunSummary/>.
+An ending that never reaches this gate never runs the style review;
+<RunSummary/> reports that, and the next run over the same plan resolves the
+same `STYLE_DIFF_BASE` and picks the whole project up again.
 </FinalGate>
+
+<FinalGateCommit>
+Loop and verbose only, at most once per run, after <FinalGate/> is green. It
+commits what the gate itself produced — the style cleanup from step 4 and any
+synthetic-final repairs — so the run leaves no uncommitted work behind.
+
+1. With no changes in `git status --short`, skip it silently.
+2. Confirm the changed paths are only the ones the gate touched: the
+   before/after snapshots in <RunProjectStyleReview/> plus the synthetic phase's
+   own baseline name them. Anything else stays uncommitted and is reported
+   instead; never sweep an unrelated path into this commit.
+3. Run `verify.sh fmt <package>` for every touched package and include the
+   result.
+4. Stage those paths and commit exactly once:
+
+   ```
+   checkpoint(<plan-slug>): final gate
+
+   <what the style pass and any final repairs changed>
+
+   Claude-Session: <session url>
+   ```
+
+   Keep the `checkpoint(<plan-slug>)` subject: <ResolveStyleDiffBase/> reads it
+   to place a later run's diff base.
+5. Never push. This commit holds no phase reservation, so it invokes no drift
+   check and no release. Report `Final gate <short hash> — style review and
+   closing repairs.`
+</FinalGateCommit>
 
 <RunSummary>
 Emit on every multi-phase ending:
@@ -1922,6 +2024,7 @@ Emit on every multi-phase ending:
 | --- | --- | --- | --- |
 
 **Final gate:** [result or skipped reason]
+**Style review:** [range reviewed and result, or the reason the run never ran it]
 **Smoke checks still unperformed:** [phase + exact action, or none]
 **Deferred decisions still open:** [phase + decision, or none]
 **Reservation disposition:** [checkpointed and outstanding, retained with the
