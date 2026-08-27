@@ -61,6 +61,17 @@
     ]
   },
   "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Edit|Write|NotebookEdit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/Users/natemccoy/.claude/scripts/berth/install/hooks/berth_pre_edit.sh"
+          }
+        ]
+      }
+    ],
     "SessionStart": [
       {
         "hooks": [
@@ -71,6 +82,10 @@
           {
             "type": "command",
             "command": "\"$HOME/.claude/scripts/settings/ensure_git_filters.sh\""
+          },
+          {
+            "type": "command",
+            "command": "/Users/natemccoy/.claude/scripts/berth/install/hooks/berth_session_start.sh"
           }
         ]
       },
@@ -85,6 +100,15 @@
       }
     ],
     "PostToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/Users/natemccoy/.claude/scripts/berth/install/hooks/berth_post_bash.sh"
+          }
+        ]
+      },
       {
         "hooks": [
           {

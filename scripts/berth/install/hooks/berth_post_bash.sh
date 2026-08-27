@@ -126,12 +126,17 @@ valid_drift_envelope() {
                 (.protection | valid_protection)) or
              (.status == "ambiguous" and (.candidates | string_array and length > 0) and (.paths | string_array and length > 0)) or
              (.status == "coordination_run_required" and (.paths | string_array and length > 0)));
+        def valid_incursion_commit:
+            (type == "object") and (.commit | nonempty_string) and (.subject | type == "string") and
+            (.origin == "phase_authored" or .origin == "already_on_trunk" or .origin == "unknown") and
+            (.paths | string_array and length > 0);
         def valid_effect:
             (type == "object") and
             ((.kind == "widened" and (.added_scopes | type == "array" and length > 0) and
                 all(.added_scopes[]; (type == "object") and (.path | nonempty_string) and (.kind == "file" or .kind == "tree"))) or
              (.kind == "incursion" and (.incident_id | nonempty_string) and
-                (.foreign_reservation_ids | string_array and length > 0) and (.paths | string_array and length > 0)) or
+                (.foreign_reservation_ids | string_array and length > 0) and (.paths | string_array and length > 0) and
+                (.commits | type == "array") and all(.commits[]; valid_incursion_commit)) or
              (.kind == "collision" and (.foreign_reservation_ids | string_array and length > 0) and
                 (.paths | string_array and length > 0)));
         def valid_result:
@@ -173,7 +178,16 @@ typed_drift_feedback() {
                 if .kind == "widened" then
                     "AUTO-WIDEN: reservation \($result.reservation_id) now covers \([.added_scopes[] | .kind + ":" + .path] | join(", "))"
                 elif .kind == "incursion" then
-                    "INCURSION: reservation \($result.reservation_id) entered \(.paths | join(", ")), held by \(.foreign_reservation_ids | join(", ")); incident \(.incident_id). STOP. Resolve with `cargo-berth resolve \($result.reservation_id) --incursion \(.incident_id)` before making more changes."
+                    "INCURSION: reservation \($result.reservation_id) entered \(.paths | join(", ")), held by \(.foreign_reservation_ids | join(", ")); incident \(.incident_id)." +
+                    (if (.commits | length) > 0 then
+                        " Committed by " + ([.commits[] |
+                            "\(.commit[0:8]) \"\(.subject)\" (" +
+                            (if .origin == "already_on_trunk" then "already on trunk, so this phase received it"
+                             elif .origin == "phase_authored" then "this phase authored it"
+                             else "origin undetermined" end) +
+                            ") covering \(.paths | join(", "))"] | join("; ")) + "."
+                     else "" end) +
+                    " STOP. Resolve with `cargo-berth resolve \($result.reservation_id) --incursion \(.incident_id)` before making more changes."
                 else
                     "COLLISION: reservation \($result.reservation_id) could not widen to \(.paths | join(", ")) because \(.foreign_reservation_ids | join(", ")) now holds the path. STOP and resolve the overlap before making more changes."
                 end),

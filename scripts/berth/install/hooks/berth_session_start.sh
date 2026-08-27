@@ -77,7 +77,9 @@ valid_board_envelope() {
             (.resolution | type == "object") and
             (.resolution.reservation_id | nonempty_string) and
             (.resolution.incident_id | nonempty_string) and
-            (.resolution.flag | nonempty_string);
+            (.resolution.flag | nonempty_string) and
+            (.resolution.every_flag | nonempty_string) and
+            (.outstanding_count | type == "number" and . >= 1);
         (.status == "board_ready") and
         (.blocked_by | length == 0) and
         (.payload.kind == "board") and
@@ -111,7 +113,13 @@ session_notices() {
                 select(.kind == "unrecorded_bypasses") |
                 "UNRECORDED BYPASS: \(.count) pending bypass marker(s) still could not be journalled. \(.instruction). This condition will be reported at every SessionStart until it becomes durable."),
             (.payload.data.outstanding_incursions.entries[]? |
-                "OUTSTANDING INCURSION: reservation \(.straying_reservation_id) entered \(.entered_paths | join(", ")), held by \(.foreign_reservation_ids | join(", ")); incident \(.incident_id). STOP and answer it with `cargo-berth \(.resolution.flag)`. It will stop appearing after a disposition is recorded.")
+                "OUTSTANDING INCURSION: reservation \(.straying_reservation_id) entered \(.entered_paths | join(", ")), held by \(.foreign_reservation_ids | join(", ")); incident \(.incident_id). " +
+                (if .outstanding_count > 1 then
+                    "This reservation has \(.outstanding_count) outstanding incidents, so answering this one leaves \(.outstanding_count - 1). STOP and answer them all with `cargo-berth \(.resolution.every_flag)`, or this one alone with `cargo-berth \(.resolution.flag)`."
+                 else
+                    "STOP and answer it with `cargo-berth \(.resolution.flag)`."
+                 end) +
+                " It will stop appearing after a disposition is recorded.")
         ] | join("\n")
     ' "$command_stdout_file"
 }

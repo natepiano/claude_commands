@@ -441,6 +441,15 @@ class HolderSharedScopeFactsValue(TypedDict):
 RefusalScopeFactsValue = ExactRequestedScopeFactsValue | HolderSharedScopeFactsValue
 
 
+class FirstTouchDispositionValue(TypedDict):
+    """One first-touch holder and the verbs that clear it, which no answer reaches."""
+
+    reservation_id: str
+    release: str
+    integrated_as: str
+    abandon: str
+
+
 class RefusalPresentationValue(TypedDict):
     """The complete refusal presentation shared by /sync and the edit shim."""
 
@@ -448,6 +457,7 @@ class RefusalPresentationValue(TypedDict):
     current_holders: list[ReservationConflictValue]
     scope_facts: RefusalScopeFactsValue
     answers: list[RefusalAnswerValue]
+    first_touch_dispositions: list[FirstTouchDispositionValue]
     rendered_markdown: str
 
 
@@ -1036,6 +1046,7 @@ def _render_refusal_markdown(
     conflicts: list[ReservationConflictValue],
     scope_facts: RefusalScopeFactsValue,
     answers: list[RefusalAnswerValue],
+    first_touch_dispositions: list[FirstTouchDispositionValue],
 ) -> str:
     lines = [
         _render_holder_facts_markdown(conflicts, scope_facts),
@@ -1084,6 +1095,41 @@ def _render_refusal_markdown(
             "The trunk-gate bypass is not an edit answer and cannot permit this edit.",
         ]
     )
+    if first_touch_dispositions:
+        lines.extend(
+            [
+                "",
+                (
+                    "A first-touch holder was acquired by whichever edit reached the paths "
+                    + "first, so it may protect no work at all. None of the answers above "
+                    + "clears one; these verbs do, and they belong to the holder:"
+                ),
+                "",
+            ]
+        )
+        lines.extend(
+            "".join(
+                (
+                    f"- Reservation `{disposition['reservation_id']}`: ",
+                    f"`{disposition['release']}` once the work is on trunk, ",
+                    f"`{disposition['integrated_as']}` after that release when git ",
+                    "cannot prove the integration, or ",
+                    f"`{disposition['abandon']}` when the work was discarded.",
+                )
+            )
+            for disposition in first_touch_dispositions
+        )
+        lines.extend(
+            [
+                "",
+                (
+                    "`release` records the protected checkpoint and must run from the "
+                    + "holder's own worktree. Both `resolve` dispositions run from "
+                    + "anywhere but assert facts about the holder's work, so ask the "
+                    + "holder before recording one."
+                ),
+            ]
+        )
     if len(conflicts) > 1:
         lines.extend(
             [
@@ -1097,18 +1143,41 @@ def _render_refusal_markdown(
     return "\n".join(lines)
 
 
+def _first_touch_dispositions(
+    conflicts: list[ReservationConflictValue],
+) -> list[FirstTouchDispositionValue]:
+    return [
+        {
+            "reservation_id": conflict["reservation_id"],
+            "release": f"cargo-berth release {conflict['reservation_id']}",
+            "integrated_as": (
+                f"cargo-berth resolve {conflict['reservation_id']} "
+                "--integrated-as <TRUNK_OID>"
+            ),
+            "abandon": (
+                f"cargo-berth resolve {conflict['reservation_id']} "
+                "--abandon --why <WHY>"
+            ),
+        }
+        for conflict in conflicts
+        if conflict["source"]["kind"] == "first_touch"
+    ]
+
+
 def _refusal_presentation(
     conflicts: list[ReservationConflictValue],
     scope_facts: RefusalScopeFactsValue,
 ) -> RefusalPresentationValue:
     answers = _refusal_answers()
+    first_touch_dispositions = _first_touch_dispositions(conflicts)
     return {
         "kind": "blocked",
         "current_holders": conflicts,
         "scope_facts": scope_facts,
         "answers": answers,
+        "first_touch_dispositions": first_touch_dispositions,
         "rendered_markdown": _render_refusal_markdown(
-            conflicts, scope_facts, answers
+            conflicts, scope_facts, answers, first_touch_dispositions
         ),
     }
 
