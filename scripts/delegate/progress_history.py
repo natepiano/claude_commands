@@ -540,6 +540,26 @@ def _read_plan_project_start(plan_path: Path) -> float | None:
     return _iso_epoch(matches[0].group("value"), str(plan_path))
 
 
+def _bullet_end(text: str, first_line_end: int) -> int:
+    """Offset just past a Markdown bullet, continuation lines included.
+
+    A Delegation Context bullet routinely wraps across several lines, and its
+    sub-bullets are indented under it. Inserting after only the first line would
+    split the bullet in half and orphan its remainder.
+    """
+    end = first_line_end
+    while end < len(text) and text[end] == "\n":
+        line_start = end + 1
+        line_end = text.find("\n", line_start)
+        if line_end == -1:
+            line_end = len(text)
+        line = text[line_start:line_end]
+        if not line.strip() or not line[:1].isspace():
+            break
+        end = line_end
+    return end
+
+
 def _persist_plan_project_start(plan_path: Path, value: str) -> None:
     try:
         text = plan_path.read_text(encoding="utf-8")
@@ -548,10 +568,11 @@ def _persist_plan_project_start(plan_path: Path, value: str) -> None:
     project_match = PROJECT_PATTERN.search(text)
     if project_match is None:
         raise SystemExit(f"Plan document has no Delegation Context Project field: {plan_path}")
+    insert_at = _bullet_end(text, project_match.end())
     updated = (
-        text[: project_match.end()]
+        text[:insert_at]
         + f"\n- **Project started:** {value}"
-        + text[project_match.end() :]
+        + text[insert_at:]
     )
     try:
         _ = plan_path.write_text(updated, encoding="utf-8")
