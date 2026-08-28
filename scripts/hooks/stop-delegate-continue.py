@@ -16,6 +16,9 @@ It stays out of the way unless all of these hold:
   * context is at or past the same handoff threshold the PostToolUse hook uses
   * this turn is not already the product of a block (`stop_hook_active`)
   * the agent is the main thread, not a subagent
+  * nothing is in flight that will wake the session by itself -- a live delegate
+    dispatch, or anything in the payload's `background_tasks`. That wake-up is
+    the next request, so compaction gets its chance without a block
 
 Blocking is deliberately once-only. The agent legitimately stops above the
 threshold to ask the user things -- verbose pre/post-phase gates, unresolved
@@ -36,7 +39,14 @@ import json
 import sys
 from typing import cast
 
-from context_usage import HookInput, auto_compact_window, handoff_threshold, measure, trigger_tokens
+from context_usage import (
+    HookInput,
+    auto_compact_window,
+    handoff_threshold,
+    measure,
+    pending_background_tasks,
+    trigger_tokens,
+)
 from delegate_run import active_run, delegate_working
 
 REASON = """\
@@ -73,6 +83,15 @@ def main() -> None:
     # Parked on a completion waiter: the delegate's own notification will supply
     # the next request, and compaction fires there. Nothing to force.
     if delegate_working(session_dir):
+        return
+    # The same situation, read from the CLI instead of from a delegate
+    # heartbeat: anything in `background_tasks` wakes this session on its own,
+    # and that wake-up is the request compaction needs. The heartbeat covers
+    # delegate dispatches only, so a run waiting on ordinary Agent-tool
+    # subagents looked idle to `delegate_working` and got ordered back to work
+    # with nothing to do -- a blocked stop, a restated "still waiting", and no
+    # compaction, since the count was nowhere near the trigger.
+    if pending_background_tasks(payload):
         return
 
     # Measure first: the window is clamped to the model's own context window, and

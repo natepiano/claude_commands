@@ -70,6 +70,14 @@ HANDOFF_MARGIN_TOKENS = 25_000
 # precedes and scales with the window the same way.
 NOTICE_LEAD_TOKENS = HANDOFF_MARGIN_TOKENS
 
+# Task statuses that mean the work will still wake this session. The Stop
+# payload documents its array as in-flight only, so this is a belt-and-braces
+# filter against a future status that means "finished, retained for display" --
+# counting one of those as live would block a stop that is genuinely final.
+DEAD_TASK_STATUSES = frozenset(
+    {"completed", "complete", "done", "failed", "error", "cancelled", "canceled", "killed"}
+)
+
 # Divisor turning bytes of not-yet-billed transcript into a token estimate.
 # Measured across ~20k real turns: median 4.23 bytes/token, p25 2.63. Deliberately
 # below the median so the estimate errs high -- warning early costs a sentence,
@@ -131,6 +139,20 @@ class TranscriptEntry(TypedDict, total=False):
     message: Message
 
 
+class BackgroundTask(TypedDict, total=False):
+    """One entry of the Stop payload's `background_tasks` array.
+
+    Only `status` is read here; the rest are carried so a caller can say what
+    the session is actually waiting on.
+    """
+
+    id: str
+    type: str
+    status: str
+    description: str
+    agent_type: str
+
+
 class HookInput(TypedDict, total=False):
     session_id: str
     transcript_path: str
@@ -146,6 +168,12 @@ class HookInput(TypedDict, total=False):
     # Stop only: true when this turn exists because a previous Stop hook
     # blocked. Blocking again would wedge the agent in a loop.
     stop_hook_active: bool
+    # Stop only: background work registered in this session that is still
+    # running, pending, or backgrounded. This is what separates "the session is
+    # finished" from "the session is parked until something wakes it", and the
+    # CLI documents it as empty rather than absent when nothing is in flight.
+    # Optional in the schema, so absence means unknown, never idle.
+    background_tasks: list[BackgroundTask]
 
 
 class Settings(TypedDict, total=False):
@@ -233,6 +261,15 @@ def auto_compact_window(model: str | None = None) -> int | None:
     return min(configured, model_context_window(model))
 
 
+def read_settings() -> Settings:
+    """`~/.claude/settings.json`, or an empty mapping when it cannot be read."""
+    settings_path = Path.home() / ".claude" / "settings.json"
+    try:
+        return cast(Settings, json.loads(settings_path.read_text(encoding="utf-8")))
+    except (OSError, ValueError):
+        return {}
+
+
 def configured_window() -> int | None:
     """The raw configured window, before the model clamp."""
     from_env = os.environ.get("CLAUDE_CODE_AUTO_COMPACT_WINDOW")
@@ -240,12 +277,7 @@ def configured_window() -> int | None:
         parsed = parse_window(from_env)
         if parsed is not None:
             return parsed
-    settings_path = Path.home() / ".claude" / "settings.json"
-    try:
-        settings = cast(Settings, json.loads(settings_path.read_text(encoding="utf-8")))
-    except (OSError, ValueError):
-        return None
-    window = settings.get("autoCompactWindow")
+    window = read_settings().get("autoCompactWindow")
     return window if isinstance(window, int) and window > 0 else None
 
 
@@ -262,6 +294,19 @@ def handoff_threshold(window: int) -> int:
 def notice_threshold(window: int) -> int:
     """Token count at which the hook starts reporting usage at all."""
     return max(0, handoff_threshold(window) - NOTICE_LEAD_TOKENS)
+
+
+def pending_background_tasks(payload: HookInput) -> list[BackgroundTask]:
+    """In-flight background work from a Stop payload.
+
+    An empty list means the CLI reported nothing in flight *or* did not report
+    at all; the caller cannot distinguish idle-waiting from finished in either
+    case, and both answer the same way -- do not claim the session is waiting.
+    """
+    tasks = payload.get("background_tasks")
+    if not isinstance(tasks, list):
+        return []
+    return [task for task in tasks if task.get("status", "").lower() not in DEAD_TASK_STATUSES]
 
 
 def resolve_transcript(payload: HookInput) -> Path | None:

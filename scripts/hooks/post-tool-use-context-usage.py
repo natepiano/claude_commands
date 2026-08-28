@@ -13,6 +13,11 @@ threshold it escalates to the instruction to write one. All three points are
 derived from the configured window in `context_usage.py`, shared with
 `stop-delegate-continue.py` so the two hooks cannot drift apart.
 
+The escalation also names the one case where stopping is the right move: an
+agent with nothing left to do but wait on background work. Its next request is
+the wake-up, which compacts on its own, so this hook's "do not end your turn"
+must not talk the agent out of a stop it should take.
+
 Env knobs:
   CLAUDE_CONTEXT_HOOK_MODE   dynamic (default) | always | warn.
                              `dynamic` reports from the notice threshold on,
@@ -92,7 +97,11 @@ def build_context(tokens: int, window: int | None, is_subagent: bool) -> str | N
         "involved, and the exact next step. Save it to a durable file in the "
         "repo — NOT the session scratchpad, which does not survive — and state "
         "its path. Then proceed directly to your next action. After compaction, "
-        "read it back to pick up where you left off, and delete it once you have."
+        "read it back to pick up where you left off, and delete it once you have. "
+        "One exception to the rule against stopping: if you have nothing left to "
+        "do but wait on subagents or other background work, end the turn. The "
+        "wake-up is a request like any other, so compaction fires there without "
+        "you holding the turn open for it."
     )
 
 

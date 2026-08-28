@@ -158,6 +158,9 @@ does.
   handoff from review intent-to-add and commits.
 - Never stop or delay work for compaction. Claude resumes from a live-dispatch
   notification; Codex remains in <CodexDispatchWait/>.
+- A wait you cannot fill is the exception. With nothing left to do but wait on
+  background work, end the turn; the Stop hook stands down there, and the
+  wake-up request compacts on its own.
 - After compaction, re-read this command in full, then the handoff. Restore live
   dispatches and state. Independently read and validate
   `${SESSION_DIR}/delegated_phase_reservation_state.json` once coordination has
