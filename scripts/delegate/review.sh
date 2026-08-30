@@ -35,6 +35,12 @@
 #                                        lines — the reviewer's read-only sandbox
 #                                        cannot write files; its prompt-instructed
 #                                        narration arrives via the digest instead.
+#   <session_dir>/review_awake         — seconds the beat loop has counted for
+#                                        this dispatch, which excludes time the
+#                                        machine was suspended; stamped on the
+#                                        pass. An early launch starts the loop
+#                                        before its pass opens, so the total can
+#                                        exceed the pass it is recorded on.
 
 set -euo pipefail
 
@@ -64,10 +70,24 @@ ln -sfn "review_agent_${PASS_INDEX}.log" "${SESSION_DIR}/review_agent.log"
 AGENT_FILE="${SESSION_DIR}/review_agent"
 HEARTBEAT_HELPER="${SCRIPT_DIR}/../agents/heartbeat.sh"
 HEARTBEAT_FILE="${SESSION_DIR}/heartbeat.log"
+AWAKE_FILE="${SESSION_DIR}/review_awake"
 PROGRESS_HELPER="${SCRIPT_DIR}/progress_history.py"
 PROGRESS_STATE="${SESSION_DIR}/progress_history_state.json"
 HEARTBEAT_INTERVAL_SECS=60
 
+# -1 says the beat loop counted nothing, which a review shorter than one
+# interval always does. The previous review's file is removed before this one
+# launches, so a leftover total can never be read as this pass's.
+awake_seconds() {
+  local counted
+  counted="$(cat "${AWAKE_FILE}" 2>/dev/null || true)"
+  case "${counted}" in
+    ''|*[!0-9]*) echo "-1" ;;
+    *) echo "${counted}" ;;
+  esac
+}
+
+rm -f "${AWAKE_FILE}"
 echo "reviewing" > "${STATUS_FILE}"
 # Only meaningful while an early launch has a row in the stage table, and read
 # there only if it was written after that row was armed — so it is written on
@@ -118,7 +138,8 @@ AGENT_PID=$!
 # reviewer's own streamed log (the tool it is running, the file it is reading,
 # its prompt-instructed narration lines).
 bash "${SCRIPT_DIR}/../agents/heartbeat_watch.sh" \
-  "${HEARTBEAT_FILE}" "${SUBTASK}" "${AGENT_PID}" "${LOG_FILE}" "${HEARTBEAT_INTERVAL_SECS}" &
+  "${HEARTBEAT_FILE}" "${SUBTASK}" "${AGENT_PID}" "${LOG_FILE}" "${HEARTBEAT_INTERVAL_SECS}" \
+  "${AWAKE_FILE}" &
 HEARTBEAT_LOOP_PID=$!
 
 if [[ -n "${EARLY_READY_FILE}" ]]; then
@@ -159,7 +180,8 @@ if [[ "${AGENT_CODE}" -eq 0 ]]; then
   fi
   if [[ -f "${PROGRESS_STATE}" && "${PASS_STARTED}" -eq 1 ]]; then
     if ! PLAN_DELEGATE_PASS_OWNER=launcher python3 "${PROGRESS_HELPER}" finish-pass \
-      --session-dir "${SESSION_DIR}" --status completed; then
+      --session-dir "${SESSION_DIR}" --status completed \
+      --agent-awake-seconds "$(awake_seconds)"; then
       echo "ERROR: unable to record the review pass completion." >&2
       echo "error" > "${STATUS_FILE}"
       exit 1
@@ -178,6 +200,7 @@ else
   if [[ -f "${PROGRESS_STATE}" && "${PASS_STARTED}" -eq 1 ]]; then
     PLAN_DELEGATE_PASS_OWNER=launcher python3 "${PROGRESS_HELPER}" finish-pass \
       --session-dir "${SESSION_DIR}" --status error \
+      --agent-awake-seconds "$(awake_seconds)" \
       || echo "ERROR: unable to record the review pass error." >&2
   fi
   bash "${HEARTBEAT_HELPER}" "${HEARTBEAT_FILE}" wrapper "${SUBTASK} agent exited with code ${AGENT_CODE}" || true

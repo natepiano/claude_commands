@@ -37,7 +37,15 @@ fi
 MARKER="${SESSION_DIR}/progress_timer"
 mkdir -p "${SESSION_DIR}"
 
-cleanup() { rm -f "${MARKER}"; }
+# Remove the marker only while it still names this timer. Arming a new timer
+# before an older one has exited is normal -- the older one then exits into a
+# marker its successor wrote, and an unconditional removal would delete a live
+# timer's record, leaving the Stop hook to read "no timer armed" and block.
+cleanup() {
+  if grep -qx "pid=$$" "${MARKER}" 2>/dev/null; then
+    rm -f "${MARKER}"
+  fi
+}
 trap cleanup EXIT INT TERM
 
 DEADLINE=$(( $(date +%s) + SECONDS_TO_WAIT ))

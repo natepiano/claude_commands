@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import fcntl
+import hashlib
 import json
 import os
 import re
@@ -16,11 +17,18 @@ import uuid
 from collections import defaultdict
 from collections.abc import Callable
 from datetime import UTC, datetime
+from functools import cache
 from pathlib import Path
 from typing import TypedDict, cast
 
 
 SCHEMA_VERSION = 1
+# The shared history spine, read by scripts/history/history.py. Kept separate
+# from SCHEMA_VERSION, which versions this recorder's own fields: a reader has
+# to tell "delegate changed its events" apart from "the shared format changed",
+# and one number cannot say both once other skills write to the same spine.
+SPINE_VERSION = 1
+SKILL_NAME = "plan-delegate"
 MIN_CALIBRATION_SAMPLES = 5
 # How far the percentage beside an ETA is assumed to be off when no calibration
 # history has an opinion. Ten points is the width the recorded phase estimates
@@ -156,10 +164,45 @@ DEFAULT_CONFIG_PATH = Path("~/.claude/config/delegate.conf").expanduser()
 PROGRESS_INTERVAL_KEY = "PLAN_DELEGATE_PROGRESS_INTERVAL_SECONDS"
 TIMER_MARKER_FILENAME = "progress_timer"
 
+# A pass already records the agent identity it resolved to, so the digest covers
+# what that identity cannot: the assignment tables that produced it and the
+# delegate settings the run obeyed. Stamped on every pass_started, it lets a
+# later query group passes by the configuration in force, which is what makes a
+# comparison survive interleaved runs and a conf edited between them.
+CONFIG_DIGEST_LENGTH = 12
+# agents_config.sh reads the same env override, so a launcher resolving against
+# one table can never be stamped with the digest of another.
+AGENTS_CONFIG_ENV = "AGENTS_CONFIG_FILE"
+DEFAULT_AGENTS_CONFIG_PATH = Path("~/.claude/config/agents.conf").expanduser()
+
 
 def _config_path() -> Path:
     configured = os.environ.get("PLAN_DELEGATE_CONFIG")
     return Path(configured) if configured else DEFAULT_CONFIG_PATH
+
+
+def _agents_config_path() -> Path:
+    configured = os.environ.get(AGENTS_CONFIG_ENV)
+    return Path(configured) if configured else DEFAULT_AGENTS_CONFIG_PATH
+
+
+@cache
+def _config_digest() -> str:
+    """Both configuration files hashed together, empty when either cannot be read.
+
+    Cached for the life of the process: one launcher records one pass, and both
+    files answer the same way every call. This is telemetry and must never stop
+    a delegate run, so an unreadable file returns empty rather than raising --
+    and empty rather than the hash of the half that could be read, which would
+    name a configuration this process never saw and group unlike passes under it.
+    """
+    contents: list[bytes] = []
+    for path in (_agents_config_path(), _config_path()):
+        try:
+            contents.append(path.read_bytes())
+        except OSError:
+            return ""
+    return hashlib.sha256(b"".join(contents)).hexdigest()[:CONFIG_DIGEST_LENGTH]
 
 
 def _progress_interval_seconds() -> int | None:
@@ -725,6 +768,8 @@ def _ensure_project_timing(
 def _event(state: dict[str, object], event_type: str, now: float) -> dict[str, object]:
     event: dict[str, object] = {
         "schema_version": SCHEMA_VERSION,
+        "spine_version": SPINE_VERSION,
+        "skill": SKILL_NAME,
         "event_id": str(uuid.uuid4()),
         "event_type": event_type,
         "timestamp": _iso_time(now),
@@ -785,6 +830,7 @@ def _close_active_pass(
     state: dict[str, object],
     status: str,
     now: float,
+    agent_awake_seconds: int = -1,
 ) -> None:
     current_pass = _object_dict(state.get("pass"))
     if current_pass is None or _string(current_pass.get("status")) != "active":
@@ -795,6 +841,17 @@ def _close_active_pass(
         0,
         int(now - _number(current_pass.get("started_at"), now)),
     )
+    # Elapsed time cannot separate an agent that worked for fourteen hours from
+    # a laptop suspended for six of them. heartbeat_watch.sh counts only the
+    # intervals it slept all the way through, so its total is time the machine
+    # was awake with the delegate alive, to one beat interval. Absent when the
+    # loop never beat: a pass shorter than one interval has nothing to report,
+    # and a zero would read as a measurement instead of the lack of one. It
+    # describes the delegate process, not this window -- review.sh starts the
+    # loop before an early review's pass opens, so that pass can report more
+    # awake seconds than it was open.
+    if agent_awake_seconds >= 0:
+        event["agent_awake_seconds"] = agent_awake_seconds
     _append_event(state, event)
     current_pass["status"] = status
     current_pass["finished_at"] = now
@@ -1013,6 +1070,7 @@ def _start_pass(args: argparse.Namespace) -> None:
     state["pass"] = current_pass
     _write_state(session_dir, state)
     event = _event(state, "pass_started", now)
+    event["config_digest"] = _config_digest()
     _append_event(state, event)
     # The reviewer this pass belongs to has been rendering as an armed row since
     # its early launch; its real window supersedes that one rather than joining
@@ -1040,7 +1098,13 @@ def _finish_pass(args: argparse.Namespace) -> None:
             raise SystemExit(
                 "No pass is open, so no launcher was orphaned and nothing was recorded"
             )
-    _close_active_pass(session_dir, state, status, _now_epoch())
+    _close_active_pass(
+        session_dir,
+        state,
+        status,
+        _now_epoch(),
+        _arg_integer(args, "agent_awake_seconds", -1),
+    )
 
 
 def _resolve_delegate_agent(task: str) -> AgentIdentity:
@@ -1666,6 +1730,19 @@ STAGE_HEADERS: tuple[str, ...] = (
     "Elapsed",
     "Result",
 )
+# The three slots a phase always runs, in the order they are reported. A slot is
+# a fixed identity; the role it is doing is what the cell shows, so a `review`
+# slot recruited into writing reads "impl" under the Review column.
+TEAM_SLOTS: tuple[str, ...] = ("impl", "test", "review")
+TEAM_HEADERS: tuple[str, ...] = (
+    "Phase",
+    "Impl",
+    "Test",
+    "Review",
+    "Start",
+    "Elapsed",
+    "Result",
+)
 SUMMARY_HEADERS: tuple[str, ...] = ("Scope", "%", "Elapsed", "ETA", "Unchanged")
 # Every summary column holding a magnitude or a time, named rather than indexed
 # so the alignment follows a column that moves. The two scope labels and the
@@ -1993,6 +2070,70 @@ def _window_result(window: StageWindow, tally: FindingTally) -> str:
             return ", ".join(parts)
         return f"{tally['opened']} found" if tally["opened"] else "clean"
     return "done"
+
+
+def _board_roles(session_dir: Path) -> dict[str, str]:
+    """What each slot is doing now, read from the phase's coordination board.
+
+    Roles move during a phase -- a reviewer gets recruited into implementation,
+    every slot converges on review at the end -- so the board, not the launch
+    arguments, is what knows the current answer. `board.sh role` stamps a
+    `role=<name>` field precisely so this can be read back exactly rather than
+    inferred from prose.
+    """
+    roles: dict[str, str] = {}
+    board = session_dir / "board.log"
+    try:
+        text = board.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return roles
+    for line in text.splitlines():
+        match = re.search(r"\[([^\]]+)\] (register|handoff): (.*)$", line)
+        if match is None:
+            continue
+        slot, kind, rest = match.group(1), match.group(2), match.group(3)
+        if kind == "register":
+            _ = roles.setdefault(slot, "")
+            continue
+        role_match = re.match(r"role=(\w+)", rest)
+        if role_match is not None:
+            roles[slot] = role_match.group(1)
+    return roles
+
+
+def _team_row(
+    session_dir: Path,
+    phase_label: str,
+    phase_started_at: float,
+    phase_elapsed: int,
+    findings: list[dict[str, object]],
+    now: float,
+) -> list[str]:
+    """One row for the whole phase, with a column per agent.
+
+    A phase is one self-contained unit of impl/fix, test, and review, so it
+    reports as one row; the per-pass breakdown lives in `timeline`, which is
+    where a reader goes for provenance rather than for what is happening now.
+    """
+    roles = _board_roles(session_dir)
+    tally = _finding_tally(findings, phase_started_at, max(now, phase_started_at) + 1.0)
+    unresolved = tally["still_open"] + tally["reopened"]
+    if tally["accepted"] or unresolved:
+        parts = [f"{tally['accepted']} fixed"]
+        if unresolved:
+            parts.append(f"{unresolved} open")
+        result = ", ".join(parts)
+    elif tally["opened"]:
+        result = f"{tally['opened']} found"
+    else:
+        result = "running"
+    return [
+        phase_label,
+        *(roles.get(slot) or "-" for slot in TEAM_SLOTS),
+        _clock_stamp(phase_started_at),
+        _format_duration(phase_elapsed),
+        result,
+    ]
 
 
 def _stage_table(
@@ -2534,6 +2675,27 @@ def _progress(args: argparse.Namespace) -> None:
             ),
             stage_labels[-1] if stage_labels else _pass_display(current_pass),
         )
+        # One row for the phase, a column per agent: a phase is one self-contained
+        # unit of impl/fix, test, and review, and this is the row that answers
+        # what each agent is doing right now. The stage table below it keeps the
+        # per-pass timing, which is a different question -- what has happened --
+        # and is the only place a review pass running beside the writer shows as
+        # its own row.
+        phase_instance_id = _string(phase.get("instance_id"))
+        phase_findings = [
+            event
+            for event in _run_events(state)
+            if _string(event.get("phase_instance_id")) == phase_instance_id
+            and _string(event.get("event_type")).startswith("finding_")
+        ]
+        team_row = _team_row(
+            session_dir,
+            str(phase_id),
+            _number(phase.get("started_at"), now),
+            phase_elapsed,
+            phase_findings,
+            now,
+        )
         lines = [
             _scope_line(state, plan_phase_counts),
             "",
@@ -2548,6 +2710,8 @@ def _progress(args: argparse.Namespace) -> None:
             ),
             "",
             f"**Phase {phase_id}: {phase_title}**",
+            "",
+            *_render_table(list(TEAM_HEADERS), [team_row], set()),
             "",
             *_render_table(list(STAGE_HEADERS), stage_rows, set()),
             "",
@@ -2724,6 +2888,13 @@ def _build_parser() -> argparse.ArgumentParser:
         "--orphaned-launcher",
         action="store_true",
         help="close the open pass of a launcher the orchestrator killed (--status canceled only)",
+    )
+    _ = finish_pass.add_argument(
+        "--agent-awake-seconds",
+        type=int,
+        default=-1,
+        help="seconds the heartbeat loop counted while the delegate ran, which "
+        + "excludes time the machine was suspended; omit when it counted none",
     )
     finish_pass.set_defaults(handler=_finish_pass)
 

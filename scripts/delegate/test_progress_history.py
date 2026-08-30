@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import subprocess
@@ -15,6 +16,7 @@ from typing import cast, override
 
 SCRIPT = Path(__file__).with_name("progress_history.py")
 FINDINGS = Path(__file__).with_name("findings.py")
+BOARD = Path(__file__).with_name("board.sh")
 
 
 class ProgressHistoryTests(unittest.TestCase):
@@ -23,6 +25,7 @@ class ProgressHistoryTests(unittest.TestCase):
     history_dir: Path  # pyright: ignore[reportUninitializedInstanceVariable]
     working_dir: Path  # pyright: ignore[reportUninitializedInstanceVariable]
     config_file: Path  # pyright: ignore[reportUninitializedInstanceVariable]
+    agents_config_file: Path  # pyright: ignore[reportUninitializedInstanceVariable]
 
     @override
     def setUp(self) -> None:
@@ -36,6 +39,13 @@ class ProgressHistoryTests(unittest.TestCase):
         # expected header would differ per machine.
         self.config_file = self.root / "delegate.conf"
         self.write_interval(180)
+        # The temporary home's registry path. Named so the digest hashes a file
+        # the test controls rather than the machine's own agents.conf, which
+        # would differ per machine and per registry edit. write_agents_registry
+        # writes to this same path: one file, so arm-review resolves the agent
+        # the test wrote instead of reading an empty one beside it.
+        self.agents_config_file = self.root / ".claude" / "config" / "agents.conf"
+        self.agents_config_file.parent.mkdir(parents=True, exist_ok=True)
         _ = subprocess.run(
             ["git", "init", "-b", "feature/rubric"],
             cwd=self.working_dir,
@@ -69,6 +79,7 @@ class ProgressHistoryTests(unittest.TestCase):
         environment = os.environ.copy()
         environment["PLAN_DELEGATE_HISTORY_DIR"] = str(self.history_dir)
         environment["PLAN_DELEGATE_CONFIG"] = str(self.config_file)
+        environment["AGENTS_CONFIG_FILE"] = str(self.agents_config_file)
         environment["TZ"] = "UTC"
         environment["PLAN_DELEGATE_NOW_EPOCH"] = str(at)
         environment["PLAN_DELEGATE_PASS_OWNER"] = "launcher"
@@ -88,6 +99,7 @@ class ProgressHistoryTests(unittest.TestCase):
         environment = os.environ.copy()
         environment["PLAN_DELEGATE_HISTORY_DIR"] = str(self.history_dir)
         environment["PLAN_DELEGATE_CONFIG"] = str(self.config_file)
+        environment["AGENTS_CONFIG_FILE"] = str(self.agents_config_file)
         environment["TZ"] = "UTC"
         environment["PLAN_DELEGATE_NOW_EPOCH"] = str(at)
         environment["PLAN_DELEGATE_PASS_OWNER"] = "launcher"
@@ -286,6 +298,10 @@ class ProgressHistoryTests(unittest.TestCase):
                 "| Phase 3 |  25 | 00:01:40 | today 05:40 |           | today 05:36 (-00:03) | today 05:46 (+00:06) |",
                 "",
                 "**Phase 3: Retry handling**",
+                "",
+                "| Phase | Impl | Test | Review | Start    | Elapsed  | Result  |",
+                "| ----- | ---- | ---- | ------ | -------- | -------- | ------- |",
+                "| 3     | -    | -    | -      | 05:33:20 | 00:01:40 | running |",
                 "",
                 "| Stage | Main           | Delegate        | Start    | Elapsed  | Result  |",
                 "| ----- | -------------- | --------------- | -------- | -------- | ------- |",
@@ -784,6 +800,7 @@ class ProgressHistoryTests(unittest.TestCase):
         environment = os.environ.copy()
         environment["PLAN_DELEGATE_HISTORY_DIR"] = str(self.history_dir)
         environment["PLAN_DELEGATE_CONFIG"] = str(self.config_file)
+        environment["AGENTS_CONFIG_FILE"] = str(self.agents_config_file)
         environment["TZ"] = "UTC"
         environment["PLAN_DELEGATE_NOW_EPOCH"] = str(at)
         _ = environment.pop("PLAN_DELEGATE_PASS_OWNER", None)
@@ -870,6 +887,99 @@ class ProgressHistoryTests(unittest.TestCase):
         )
         self.assertNotEqual(repeated.returncode, 0)
         self.assertIn("No pass is open", repeated.stderr)
+
+    def pass_events(self, name: str, event_type: str) -> list[dict[str, object]]:
+        return [
+            event
+            for event in self.read_events(name)
+            if event.get("event_type") == event_type
+        ]
+
+    def test_a_pass_records_a_digest_of_the_configuration_it_ran_under(self) -> None:
+        _ = self.agents_config_file.write_text(
+            "[delegate.implementation.codex]\nagent = gpt-called\n", encoding="utf-8"
+        )
+        session_dir = self.start_run("digest", 20_000)
+        self.start_phase_and_pass(session_dir, 20_010)
+        expected = hashlib.sha256(
+            self.agents_config_file.read_bytes() + self.config_file.read_bytes()
+        ).hexdigest()[:12]
+        started = self.pass_events("digest", "pass_started")
+        self.assertEqual(len(started), 1)
+        self.assertEqual(started[0].get("config_digest"), expected)
+
+        # A conf edited between two passes has to move the digest, or grouping by
+        # it would compare passes that ran under configurations that differ.
+        self.write_interval(240)
+        _ = self.run_command(
+            "start-pass",
+            "--session-dir",
+            str(session_dir),
+            "--pass-kind",
+            "review",
+            "--activity",
+            "reviewing the retry path",
+            "--called-task",
+            "delegate.review",
+            "--called-family",
+            "codex",
+            "--called-model",
+            "gpt-called",
+            "--called-effort",
+            "high",
+            at=20_100,
+        )
+        started = self.pass_events("digest", "pass_started")
+        self.assertEqual(len(started), 2)
+        second = cast(str, started[1]["config_digest"])
+        self.assertEqual(len(second), 12)
+        self.assertNotEqual(second, expected)
+
+    def test_an_unreadable_conf_leaves_the_digest_empty_and_records_the_pass(self) -> None:
+        session_dir = self.start_run("no-registry", 21_000)
+        self.start_phase_and_pass(session_dir, 21_010)
+        started = self.pass_events("no-registry", "pass_started")
+        self.assertEqual(len(started), 1)
+        self.assertEqual(started[0].get("config_digest"), "")
+
+    def test_finish_pass_records_the_seconds_the_delegate_was_awake(self) -> None:
+        session_dir = self.start_run("awake", 22_000)
+        self.start_phase_and_pass(session_dir, 22_010)
+        _ = self.run_command(
+            "finish-pass",
+            "--session-dir",
+            str(session_dir),
+            "--status",
+            "completed",
+            "--agent-awake-seconds",
+            "1800",
+            at=72_020,
+        )
+        finished = self.pass_events("awake", "pass_finished")
+        self.assertEqual(len(finished), 1)
+        # The point of the field: elapsed covers the stretch the machine spent
+        # suspended, and the beat count does not.
+        self.assertEqual(finished[0].get("pass_elapsed_seconds"), 50_000)
+        self.assertEqual(finished[0].get("agent_awake_seconds"), 1800)
+
+    def test_a_pass_with_nothing_counted_records_no_awake_seconds(self) -> None:
+        for name, reported in (("unreported", ()), ("none-counted", ("-1",))):
+            with self.subTest(name):
+                session_dir = self.start_run(name, 23_000)
+                self.start_phase_and_pass(session_dir, 23_010)
+                awake = ("--agent-awake-seconds", *reported) if reported else ()
+                _ = self.run_command(
+                    "finish-pass",
+                    "--session-dir",
+                    str(session_dir),
+                    "--status",
+                    "completed",
+                    *awake,
+                    at=23_050,
+                )
+                finished = self.pass_events(name, "pass_finished")
+                self.assertEqual(len(finished), 1)
+                self.assertNotIn("agent_awake_seconds", finished[0])
 
     def test_aggregate_reports_raw_and_calibrated_error_fields(self) -> None:
         self.complete_historical_run(0)
@@ -1085,6 +1195,145 @@ class ProgressHistoryTests(unittest.TestCase):
         ]
         return rows[rows.index(header) + 1 :]
 
+    def test_the_team_row_reports_the_role_each_slot_holds_now(self) -> None:
+        """One row per phase, one column per agent, showing current role."""
+        self.write_full_config()
+        started_at = 60_000
+        session_dir = self.start_run("team", started_at)
+        _ = self.run_command(
+            "start-phase",
+            "--session-dir",
+            str(session_dir),
+            "--phase-id",
+            "4",
+            "--phase-title",
+            "Adapter wiring",
+            at=started_at,
+        )
+        # Drive the board through board.sh rather than writing board.log by
+        # hand: what is under test is that the writer and the reader agree on a
+        # format, which a hand-written fixture would assert nothing about.
+        for slot in ("impl", "test", "review"):
+            _ = subprocess.run(
+                ["bash", str(BOARD), "post", str(session_dir), slot, "register", "up"],
+                check=True,
+                capture_output=True,
+            )
+            _ = subprocess.run(
+                ["bash", str(BOARD), "role", str(session_dir), slot, slot, "opening"],
+                check=True,
+                capture_output=True,
+            )
+        # The reviewer gets recruited into implementation: the slot keeps its
+        # identity and its column, and only the role in the cell changes.
+        _ = subprocess.run(
+            ["bash", str(BOARD), "role", str(session_dir), "review", "impl", "recruited"],
+            check=True,
+            capture_output=True,
+        )
+        _ = self.run_command(
+            "start-pass",
+            "--session-dir",
+            str(session_dir),
+            "--pass-kind",
+            "impl",
+            "--fix-pass",
+            "0",
+            "--activity",
+            "wiring the adapter",
+            "--called-task",
+            "delegate.implementation",
+            "--called-family",
+            "codex",
+            "--called-model",
+            "gpt-called",
+            "--called-effort",
+            "high",
+            at=started_at + 10,
+        )
+        header = self.run_command(
+            "progress",
+            "--session-dir",
+            str(session_dir),
+            "--project-raw-percent",
+            "40",
+            "--project-percent",
+            "40",
+            "--phase-raw-percent",
+            "40",
+            "--phase-percent",
+            "40",
+            "--cap-stage",
+            "implementation",
+            "--activity",
+            "wiring the adapter",
+            at=started_at + 300,
+        )
+        team_rows = self.table_rows(
+            header,
+            ["Phase", "Impl", "Test", "Review", "Start", "Elapsed", "Result"],
+        )
+        self.assertEqual(team_rows[0][:4], ["4", "impl", "test", "impl"])
+
+    def test_the_team_row_falls_back_when_no_board_exists(self) -> None:
+        """A phase whose team has not registered still renders a row."""
+        self.write_full_config()
+        started_at = 60_000
+        session_dir = self.start_run("noboard", started_at)
+        _ = self.run_command(
+            "start-phase",
+            "--session-dir",
+            str(session_dir),
+            "--phase-id",
+            "2",
+            "--phase-title",
+            "Nothing posted",
+            at=started_at,
+        )
+        _ = self.run_command(
+            "start-pass",
+            "--session-dir",
+            str(session_dir),
+            "--pass-kind",
+            "impl",
+            "--fix-pass",
+            "0",
+            "--activity",
+            "working",
+            "--called-task",
+            "delegate.implementation",
+            "--called-family",
+            "codex",
+            "--called-model",
+            "gpt-called",
+            "--called-effort",
+            "high",
+            at=started_at + 10,
+        )
+        header = self.run_command(
+            "progress",
+            "--session-dir",
+            str(session_dir),
+            "--project-raw-percent",
+            "10",
+            "--project-percent",
+            "10",
+            "--phase-raw-percent",
+            "10",
+            "--phase-percent",
+            "10",
+            "--cap-stage",
+            "implementation",
+            "--activity",
+            "working",
+            at=started_at + 200,
+        )
+        team_rows = self.table_rows(
+            header,
+            ["Phase", "Impl", "Test", "Review", "Start", "Elapsed", "Result"],
+        )
+        self.assertEqual(team_rows[0][:4], ["2", "-", "-", "-"])
+
     def test_the_stage_table_names_every_window_the_phase_opened(self) -> None:
         """Each pass and activity in start order, with what the ledger recorded."""
         self.write_full_config()
@@ -1242,9 +1491,7 @@ class ProgressHistoryTests(unittest.TestCase):
     def write_agents_registry(self) -> None:
         """A registry under the temporary home, so arm-review resolves the same
         agent review.sh would without reading this machine's real assignments."""
-        config = self.root / ".claude" / "config"
-        config.mkdir(parents=True, exist_ok=True)
-        _ = (config / "agents.conf").write_text(
+        _ = self.agents_config_file.write_text(
             "\n".join(
                 (
                     "[assignments]",

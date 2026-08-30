@@ -237,7 +237,7 @@ The single exception is a launcher the orchestrator killed, whose pass stays
 open: `finish-pass --status canceled --orphaned-launcher` closes it, and only
 that status, and only while a pass is open.
 
-`progress` writes the event and prints two tables under a line naming the
+`progress` writes the event and prints three tables under a line naming the
 worktree, the branch, and — when the plan's headings can be counted — the
 position of the phase in flight, `phase N of M`. That position is the finished
 count plus one, off the same headings the project percentage derives from, so
@@ -245,10 +245,27 @@ the line and the table can never disagree; a plan that cannot be counted keeps
 the short worktree-and-branch form. The first table holds the clocks: a project
 row and a phase row carrying the reported percentage, elapsed, ETA, unchanged,
 — when the plan's headings can be counted — how many phases are done, and last
-the best and worst arrival the percentage still allows. The second is the stage
+the best and worst arrival the percentage still allows.
+
+The second is the team table, under the phase heading: one row for the whole
+phase, with a column for each of the three slots — `Impl`, `Test`, `Review` —
+holding the role that slot is working in right now, plus the phase's start,
+elapsed, and finding result. A phase is one self-contained unit of
+implementation-or-fix, test, and review, so it reports as one row; the columns
+answer "who is doing what at this moment", which is the question a slot table
+can answer and a per-pass list cannot. The roles come from `board.log`, not from
+the launch arguments, because roles move during a phase: a reviewer gets
+recruited into implementation, and every slot converges on review at the end.
+`board.sh role` stamps a `role=<name>` field on each `handoff` line precisely so
+this is read back exactly rather than inferred from prose, and a slot that has
+registered but never handed off, or a phase with no board at all, shows `-`.
+
+The third is the stage
 table, one row per window the phase has opened,
 oldest first: the stage, the main agent that orchestrated it, the delegate that
-ran it, its start time, its elapsed, and its result. Under the table
+ran it, its start time, its elapsed, and its result. It stays beside the team
+table rather than being replaced by it: the team row says what is happening, the
+stage table says what happened, and provenance needs both. Under the table
 sits the running stage's activity sentence, which no fixed-width column can
 carry, and then the wall clock.
 

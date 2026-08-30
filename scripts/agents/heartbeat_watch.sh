@@ -2,7 +2,7 @@
 # heartbeat_watch.sh — Emit [wrapper] beats with a live activity digest while an
 # agent process runs.
 #
-# Usage: heartbeat_watch.sh <heartbeat_file> <subtask> <agent_pid> <agent_log> [interval_secs]
+# Usage: heartbeat_watch.sh <heartbeat_file> <subtask> <agent_pid> <agent_log> [interval_secs] [awake_file]
 #        heartbeat_watch.sh --digest <agent_log>     (print one digest and exit; for tests)
 #
 # Each beat tails <agent_log> and appends a short digest of the latest activity:
@@ -10,6 +10,12 @@
 # plain-text logs contribute their last non-empty line. This narrates every
 # dispatch — including read-only reviewers that cannot write [agent] lines —
 # from the agent family CLI output itself. Exits when the agent pid dies.
+#
+# <awake_file>, when given, holds the running total of interval seconds this
+# loop has slept through, rewritten at each beat. A suspended machine stops the
+# loop with it, so the total counts time the delegate was alive and the machine
+# awake — which wall-clock elapsed cannot tell apart from a closed lid. The
+# launcher hands it to progress_history.py finish-pass.
 
 set -euo pipefail
 
@@ -95,12 +101,16 @@ SUBTASK="${2:?missing subtask}"
 AGENT_PID="${3:?missing agent pid}"
 AGENT_LOG="${4:?missing agent log path}"
 INTERVAL_SECS="${5:-60}"
+AWAKE_FILE="${6:-}"
 
 waited=0
 while kill -0 "${AGENT_PID}" 2>/dev/null; do
     sleep "${INTERVAL_SECS}"
     kill -0 "${AGENT_PID}" 2>/dev/null || exit 0
     waited=$((waited + INTERVAL_SECS))
+    if [[ -n "${AWAKE_FILE}" ]]; then
+        printf '%s\n' "${waited}" > "${AWAKE_FILE}" 2>/dev/null || true
+    fi
     activity="$(digest 2>/dev/null || true)"
     if [[ -n "${activity}" ]]; then
         bash "${SCRIPT_DIR}/heartbeat.sh" "${HEARTBEAT_FILE}" wrapper "${SUBTASK} agent running ${waited}s — ${activity}" || true
