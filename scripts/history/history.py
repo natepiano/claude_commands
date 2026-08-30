@@ -98,6 +98,11 @@ FIX_PASS_THRESHOLD = 4
 # from any change being compared.
 READABLE_SAMPLES = 80
 
+# Two medians closer than this factor are one median seen twice. Used by
+# `compare` to refuse a verdict rather than report a difference that a rerun of
+# the same configuration would produce on its own.
+NOISE_RATIO = 1.5
+
 
 class StageRow(TypedDict):
     skill: str
@@ -795,14 +800,13 @@ def _cmd_versions(args: argparse.Namespace) -> None:
     _require_rows(table, "events")
 
 
-def _cmd_phases(args: argparse.Namespace) -> None:
-    """Rounds per phase, not seconds per stage.
+def _phase_rows(rows: list[StageRow]) -> list[PhaseRow]:
+    """One record per (run, phase): rounds run, and the seconds each held.
 
-    No findings column: all 1,637 `finding_opened` events carry no `phase_id`,
-    so every one of them would join nothing.
+    Rows with no run or no phase join nothing and are dropped rather than
+    collapsed into a shared empty key, which would merge unrelated work into
+    one enormous phase.
     """
-    events, tally = _events(_skills(args))
-    rows = _rows(args, events, tally)
     buckets: dict[tuple[str, str], PhaseRow] = {}
     for row in rows:
         if not row["run"] or not row["phase"]:
@@ -827,7 +831,18 @@ def _cmd_phases(args: argparse.Namespace) -> None:
             cell["fix_seconds"] += row["seconds"]
         elif row["stage"] == "implementation":
             cell["impl_seconds"] += row["seconds"]
-    phases = list(buckets.values())
+    return list(buckets.values())
+
+
+def _cmd_phases(args: argparse.Namespace) -> None:
+    """Rounds per phase, not seconds per stage.
+
+    No findings column: all 1,637 `finding_opened` events carry no `phase_id`,
+    so every one of them would join nothing.
+    """
+    events, tally = _events(_skills(args))
+    rows = _rows(args, events, tally)
+    phases = _phase_rows(rows)
     if _arg(args, "sort", "total") == "fix_passes":
         phases.sort(key=lambda cell: (-cell["fixes"], -cell["fix_seconds"], cell["run"]))
     else:
@@ -875,6 +890,135 @@ def _cmd_phases(args: argparse.Namespace) -> None:
         print(f"{weight} with >={FIX_PASS_THRESHOLD} fix passes {held}")
     _warn(tally)
     _require_rows(table, "phases")
+
+
+def _verdict(before: Cell, after: Cell) -> str:
+    """What the two windows support saying, which is often less than a ratio.
+
+    The failure this exists to prevent: two agents each holding hundreds of
+    samples across the corpus, never having run in the same week, reported as
+    though one beat the other. A cell absent from one window is an era, not a
+    result, and says so before any number is printed.
+    """
+    if not before["n"] or not after["n"]:
+        return "one window only"
+    if not before["median"] or not after["median"]:
+        return "no median"
+    ratio = before["median"] / after["median"]
+    if 1.0 / NOISE_RATIO < ratio < NOISE_RATIO:
+        return "unchanged"
+    change = f"{ratio:.1f}x faster" if ratio > 1.0 else f"{1.0 / ratio:.1f}x slower"
+    if before["n"] < READABLE_SAMPLES or after["n"] < READABLE_SAMPLES:
+        return f"{change} (thin)"
+    return change
+
+
+def _cmd_compare(args: argparse.Namespace) -> None:
+    """One config change: the window before it against the window after.
+
+    `--since` is ignored here because the two windows are the only time filter,
+    and a third would silently empty one of them.
+    """
+    events, tally = _events(_skills(args))
+    args.since = ""
+    rows = _rows(args, events, tally)
+    on = _arg(args, "on")
+    if not on:
+        raise SystemExit("compare needs --on <date>: the day the change landed")
+    pivot = _since_epoch(on)
+    span = datetime.now(UTC).timestamp() - _since_epoch(_arg(args, "window", "14d"))
+    keys = _group_keys(_arg(args, "group", "agent"))
+    before: dict[tuple[str, ...], list[int]] = defaultdict(list)
+    after: dict[tuple[str, ...], list[int]] = defaultdict(list)
+    for row in rows:
+        started = row["started_at"]
+        if pivot - span <= started < pivot:
+            before[_group_of(row, keys)].append(row["seconds"])
+        elif pivot <= started < pivot + span:
+            after[_group_of(row, keys)].append(row["seconds"])
+    groups = sorted(
+        set(before) | set(after),
+        key=lambda group: (-(sum(before.get(group, [])) + sum(after.get(group, []))), group),
+    )
+    table: list[list[str]] = []
+    for group in groups:
+        old, new = _cell(before.get(group, [])), _cell(after.get(group, []))
+        table.append(
+            [
+                *_render_group(group, keys),
+                str(old["n"]),
+                _duration(old["median"]) if old["n"] else "-",
+                str(new["n"]),
+                _duration(new["median"]) if new["n"] else "-",
+                _verdict(old, new),
+            ]
+        )
+    meta = _meta(tally)
+    meta["pivot"] = _stamp(pivot)
+    meta["window_seconds"] = int(round(span))
+    form = _arg(args, "format", "table")
+    _emit(table, [*keys, "n before", "before", "n after", "after", "verdict"], form, meta)
+    if form == "table" and table:
+        window = _duration(span)
+        print(f"\n{window} either side of {_stamp(pivot)}")
+        thin = f"'thin' means under {READABLE_SAMPLES} samples"
+        flat = f"'unchanged' means under {NOISE_RATIO}x apart"
+        print(f"{thin}; {flat}, which a rerun alone can produce.")
+    _warn(tally)
+    _require_rows(table, "compare")
+
+
+def _cmd_summary(args: argparse.Namespace) -> None:
+    """Where the time goes and what holds the tail, without choosing a view.
+
+    Every number here can be assembled from `stages` and `phases`. This runs
+    both and prints the few lines that point at a change worth making.
+    """
+    events, tally = _events(_skills(args))
+    rows = _rows(args, events, tally)
+    by_stage: dict[str, list[int]] = defaultdict(list)
+    for row in rows:
+        by_stage[row["stage"]].append(row["seconds"])
+    grand = sum(sum(seconds) for seconds in by_stage.values())
+    table: list[list[str]] = []
+    for stage in sorted(by_stage, key=lambda name: -sum(by_stage[name])):
+        cell = _cell(by_stage[stage])
+        share = (cell["total"] / grand * 100.0) if grand else 0.0
+        table.append(
+            [
+                stage,
+                str(cell["n"]),
+                _duration(cell["median"]),
+                _duration(cell["total"]),
+                f"{share:.0f}%",
+            ]
+        )
+    phases = _phase_rows(rows)
+    fix_total = sum(cell["fix_seconds"] for cell in phases)
+    heavy = [cell for cell in phases if cell["fixes"] >= FIX_PASS_THRESHOLD]
+    heavy_fix = sum(cell["fix_seconds"] for cell in heavy)
+    heavy_share = (len(heavy) / len(phases) * 100.0) if phases else 0.0
+    fix_share = (heavy_fix / fix_total * 100.0) if fix_total else 0.0
+    meta = _meta(tally)
+    meta["stages"] = len(rows)
+    meta["phases"] = len(phases)
+    meta["heavy_phases"] = len(heavy)
+    meta["heavy_fix_seconds"] = heavy_fix
+    form = _arg(args, "format", "table")
+    _emit(table, ["stage", "n", "median", "total", "share"], form, meta)
+    if form == "table" and table:
+        counted = _count(len(phases), "phase", "phases")
+        print(f"\n{counted}, {_duration(grand)} of agent time")
+        if heavy:
+            held = f"hold {_duration(heavy_fix)} — {fix_share:.0f}% of all fix time"
+            weight = f"{_count(len(heavy), 'phase', 'phases')} ({heavy_share:.0f}%)"
+            print(f"{weight} with >={FIX_PASS_THRESHOLD} fix passes {held}")
+        print("\nNext:")
+        print("  history.py phases --sort fix_passes        the phases holding the tail")
+        print("  history.py stages --stage review --group agent   cost per agent")
+        print("  history.py compare --on <date>             did a change help")
+    _warn(tally)
+    _require_rows(table, "summary")
 
 
 def main() -> None:
@@ -929,6 +1073,23 @@ def main() -> None:
     status(phases)
     _ = phases.add_argument("--sort", default="total", choices=["fix_passes", "total"])
     phases.set_defaults(handler=_cmd_phases)
+
+    compare = subparsers.add_parser("compare", help="before and after one change")
+    _ = compare.add_argument("--on", default="", help="the date the change landed")
+    _ = compare.add_argument("--window", default="14d", help="span either side")
+    _ = compare.add_argument("--group", default="agent", help=",".join(GROUP_KEYS))
+    _ = compare.add_argument("--skill", default="", help="comma-separated skill names")
+    _ = compare.add_argument("--format", default="table", choices=["table", "json", "csv"])
+    _ = compare.add_argument("--stage", default="", help=",".join(STAGE_ORDER))
+    _ = compare.add_argument("--label", default="", help="substring match")
+    _ = compare.add_argument("--agent", default="", help="substring match")
+    status(compare)
+    compare.set_defaults(handler=_cmd_compare)
+
+    summary = subparsers.add_parser("summary", help="where the time goes, and what to do")
+    shared(summary, filters=False)
+    status(summary)
+    summary.set_defaults(handler=_cmd_summary)
 
     args = parser.parse_args()
     handler_value: object = getattr(args, "handler")  # pyright: ignore[reportAny]

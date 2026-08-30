@@ -4,8 +4,8 @@ description: Query stage, phase, and run timings across skill run history
 
 # history
 
-`$ARGUMENTS` — a subcommand (`stages`, `phases`, `runs`, `tests`, `versions`) and
-its flags.
+`$ARGUMENTS` — a subcommand (`summary`, `compare`, `stages`, `phases`, `runs`,
+`tests`, `versions`) and its flags.
 
 Run:
 
@@ -13,8 +13,8 @@ Run:
 python3 ~/.claude/scripts/history/history.py $ARGUMENTS
 ```
 
-Empty `$ARGUMENTS` → run `stages --since 14d`. A first word that is not one of the
-five subcommands → show `history.py --help` and stop.
+Empty `$ARGUMENTS` → run `summary`. A first word that is not one of the seven
+subcommands → show `history.py --help` and stop.
 
 **Runs sandboxed — never pass `dangerouslyDisableSandbox`.** The script reads
 `~/.local/state/*/runs/*.jsonl` and writes nothing. Sibling commands disable the
@@ -47,6 +47,10 @@ unconverted.
 
 ## Subcommands
 
+- `summary` — start here. Time per stage, plus the phases holding the fix tail,
+  and the three commands worth running next
+- `compare` — one change, the window before it against the window after, with a
+  verdict per row. Needs `--on <date>`
 - `stages` — stage timings, grouped by `--group` (default `stage,agent`); duplicate
   keys are rejected
 - `phases` — review and fix rounds per phase, grouped by `(run, phase)`; columns
@@ -66,7 +70,22 @@ table|json|csv`. Beyond those:
 - `--stage`, `--label`, `--agent` substring filters on `stages` and `runs`
 - `tests` — `--label`, `--agent`, `--raw` (it pins `stage=test` itself)
 - `phases` — `--sort fix_passes|total`, default `total`
+- `compare` — `--on <date>` (required), `--window` (default `14d`, the span taken
+  either side), `--group` (default `agent`), and the same stage/label/agent
+  filters. It ignores `--since`: the two windows are the only time filter, and a
+  third would silently empty one of them
 - `versions` — nothing else, `--status` included
+
+### Reading a `compare` verdict
+
+- **`one window only`** — the row ran on one side of the date and not the other.
+  Consecutive eras, not competitors; whatever else changed between them is folded
+  into any difference. This is the most common wrong conclusion the tool prevents.
+- **`unchanged`** — the medians are under 1.5x apart, which rerunning the same
+  configuration can produce on its own.
+- **`N.Nx faster|slower (thin)`** — a real gap, but under 80 samples on one side.
+  Directional, not settled.
+- **`N.Nx faster|slower`** — enough samples, and past the noise factor.
 
 **`--skill plan-delegate`** — the value is the store directory name under
 `~/.local/state/`, not the user-facing skill name. Every visible name says
