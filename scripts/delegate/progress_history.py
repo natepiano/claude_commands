@@ -3190,9 +3190,21 @@ def _progress(args: argparse.Namespace) -> None:
         else:
             current_pass = None
     if phase is None or _string(phase.get("status")) != "active" or current_pass is None:
+        # Name what the caller should do, not just what is missing. Every seat's
+        # pass having ended is the normal end of a dispatch, not a fault in the
+        # recorder -- and a tick that reads this as "tables unavailable" reports
+        # prose over a phase that has already finished, instead of reading the
+        # statuses and processing completion.
+        open_slots = ", ".join(sorted(_open_passes(state))) or "none"
+        phase_status = _string((phase or {}).get("status")) or "missing"
+        activity_status = (
+            _string((_object_dict(state.get("activity")) or {}).get("status")) or "none"
+        )
         raise SystemExit(
-            "An active phase and either an active pass or an active activity are "
-            + "required before reporting progress"
+            f"No open window to report: phase {phase_status}, "
+            + f"open passes {open_slots}, activity {activity_status}. "
+            + "Every seat's pass ending is a finished dispatch: read each "
+            + "impl_status_<slot> and process completion rather than reporting."
         )
     legacy_raw_percent = _arg_integer(args, "raw_percent", -1)
     legacy_percent = _arg_integer(args, "percent", -1)
