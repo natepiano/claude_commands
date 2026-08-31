@@ -54,6 +54,23 @@ State:
 `<section-name/>` means apply the complete matching tagged contract. The
 definition is authoritative. A call site states only its local inputs, outputs,
 or exceptions; it does not restate the contract.
+
+Some contracts are defined in their own file and stubbed here. A stub names the
+file and the moment it applies; **read that file at the moment and act from what
+it says, never from memory of an earlier read or from the stub alone.** Each one
+is also a command the user can invoke directly when this workflow fails to run
+it:
+
+| Contract | File | Command |
+| --- | --- | --- |
+| <ProgressReport/> | `commands/plan/delegate_report.md` | `/plan:delegate_report` |
+| <VerbosePostPhaseReport/>, <CombinedWindowReport/>, <RemainingWorkOutlook/> | `commands/plan/delegate_phase_report.md` | `/plan:delegate_phase_report` |
+| <CheckpointCommit/> | `commands/plan/delegate_checkpoint.md` | `/plan:delegate_checkpoint` |
+| <ConsiderNextItems/> | `commands/plan/delegate_next.md` | `/plan:delegate_next` |
+| <ResolveStyleDiffBase/>, <RunProjectStyleReview/> | `commands/plan/delegate_style.md` | `/plan:delegate_style` |
+| <ComposeWorkOrder/> | `docs/delegate/compose_work_order.md` | — |
+
+Paths are under `~/.claude/`.
 </TagReferenceContract>
 
 <CoreContract>
@@ -132,15 +149,12 @@ Codex only; no timer process:
 </CodexDispatchWait>
 
 <BackgroundVerificationContract>
-For `verify.sh final`, launch under <ToolingContract/> and tell the user what is
-running. Claude ends the turn and resumes from the task notification. Codex
-applies <CodexDispatchWait/> with progress disabled.
-
-It is not an agent dispatch and has no heartbeat monitor, so nothing else
-reports on it. That makes a timer more necessary here, not less: export
+For `verify.sh final`, launch under <ToolingContract/>, export
 `PLAN_DELEGATE_SESSION_DIR="${SESSION_DIR}"` so `verify.sh` opens its own
-progress window, and arm a timer under <ProgressContract/> exactly as a dispatch
-does.
+progress window, and tell the user what is running. Nothing else reports on it,
+so the timer matters more here, not less: Claude arms one under
+<ProgressContract/> exactly as a dispatch does and ends the turn, resuming from
+the task notification; Codex applies <CodexDispatchWait/> with progress disabled.
 </BackgroundVerificationContract>
 
 <CompactionContract>
@@ -209,35 +223,34 @@ Every implementation or fix prompt contains these sections once:
 3. Narration: before each activity, run
    `bash ~/.claude/scripts/delegate/board.sh post <concrete SESSION_DIR> <slot> status "<activity>"`.
    Use short present-tense text and never read the heartbeat file.
-4. `## Team` — the three slots, who holds which files, and the board commands
-   from <CoordinationBoard/>. Say that peers are working concurrently, that the
-   board carries the record every member can read, and that a `verify.sh` run
-   may pause while a peer finishes its own. Never mention the cargo token or
-   ask for it: <BuildTokenContract/> takes it inside `verify.sh`, and an agent
-   holding it by hand deadlocks against its own verification.
-   Whenever this slot has a mesh address, also give it its own mesh name, both
-   peers' names, the call that reaches each of them, and — on the claude path —
-   the orchestrator's name from `ListAgents`, per <PhaseMesh/>. An address a
-   member has to go looking for is one it will not use, and a codex peer needs
-   the literal `codex_mesh.py` command line with the concrete `--session-dir`
-   already filled in, not a description of it.
+4. `## Team` — name the three concurrent slots and who holds which files. Copy
+   the board commands from <CoordinationBoard/>, and say a `verify.sh` run may
+   pause while a peer finishes its own. Copy <BuildTokenContract/>'s
+   delegate-facing prohibition: never mention, request, or acquire the cargo
+   token. State the one rule plainly: **a question to a peer is a message, a
+   decision is a board post**, and the board has no `ask` kind to fall back on.
+   Give this slot its own mesh name, both peers' names, the call that reaches
+   each of them, and — on the claude path — the orchestrator's name from
+   `ListAgents`, per <PhaseMesh/>. An address a member has to go looking for is
+   one it will not use, and a codex peer needs the literal `codex_mesh.py`
+   command line with the concrete `--session-dir` already filled in, not a
+   description of it. A slot whose register line says `mesh=none` has no peer
+   channel at all: say so, and tell it to read the board rather than wait on a
+   reply.
 5. `## Project Context`.
 6. `## Work Specification`.
 7. `## Type Design Contract` per <TypeDesignContract/>.
 8. `## Verification` per <VerificationContract/>, exactly as listed and with
    nothing added around it.
 
-The Verification section must say: run only its listed commands, never raw
-Cargo; run each listed command with the sandbox disabled; do not report until
-every command has exited and its output has been read. If an edited package has
-no listed `test` line, add that package's scoped
-`verify.sh test` and report it. Omit plan **Style** metadata and never load the
-style guide; <RunProjectStyleReview/> owns the run's one style audit.
-
-It must also instruct the delegate: tests are the only testing — a passing
-`test` run proves the build, so never add a `check` or build pass around a
-listed `test`; and a listed example or app launch compiles its own target — do
-not build or test first just to prove it builds.
+The Verification section carries the applicable command lines and every
+delegate-facing rule from <VerificationContract/>, with nothing added around
+them. It must also say: run only its listed commands, never raw Cargo; run each
+with the sandbox disabled; do not report until every command has exited and its
+output has been read. If an edited package has no listed `test` line, add that
+package's scoped `verify.sh test` and report it. Omit plan **Style** metadata
+and never load the style guide; <RunProjectStyleReview/> owns the run's one
+style audit.
 </WritePromptContract>
 
 <PhaseTeam>
@@ -261,22 +274,20 @@ implementation work is still slot `review`.
 Order defines the behavior, so tests can be written before any of it exists;
 a tester that waits for `impl` has converted a parallel team back into a queue.
 
-**Only `impl` is given a `${PASS_KIND}`.** The recorder closes any open pass
-when a new one starts, so three recorded passes would leave the ledger
-describing whichever finished last and would corrupt the pass counts
-`findings.py gate` uses to judge convergence. One dispatch, one recorded pass,
-three agents inside it. This is the same reason <EarlyReviewArm/> defers its
-reviewer's `start-pass`, applied to a wider team.
+**Every seat carries its own `${PASS_KIND}`**, so a team phase records three
+passes. The recorder keys them by slot and closes only that slot's stale pass;
+<LaunchImplementation/> step 5 owns the argument positions.
 
 Launch all three in **one message** so they run concurrently, each with its own
-prompt file and its slot as the ninth argument to `implement.sh`. Announce the
-board path with the prompt and heartbeat paths, then apply <DispatchContract/>
-once for the team: the progress timer covers the phase, not each member.
+prompt file and its slot as the ninth argument to `implement.sh`, then apply
+<DispatchContract/> once for the team: the progress timer covers the phase, not
+each member. <LaunchImplementation/> owns the rest of the procedure, and repairs
+run the same team under <FixDispatch/>.
 
-A member that finishes writes `impl_status_<slot>`; the phase is complete when
-every slot has a terminal status, not when the first one lands. Reading one
-slot's `implemented` as the phase's result is the same defect as reading a
-completion notification as a finished assignment.
+The phase is complete only when every slot has a terminal `impl_status_<slot>`,
+not when the first one lands. Reading one slot's `implemented` as the phase's
+result is the same defect as reading a completion notification as a finished
+assignment.
 </PhaseTeam>
 
 <CoordinationBoard>
@@ -284,47 +295,40 @@ The team coordinates through `${SESSION_DIR}/board.log`, written only with
 `bash ~/.claude/scripts/delegate/board.sh`.
 
 **Why a file even when messages work.** Every member is reachable by name on
-both the claude and codex paths — see <PhaseMesh/> — but the board still carries
-the record, for three reasons. A post is a single broadcast that reaches both
-peers and the wrapper at once, where addressed sends are N-1 separate deliveries
-that can each fail and leave the team holding different pictures of one
-decision. The board outlives a turn, so a member that starts late, or is resumed
-hours later, reads the whole history rather than the messages that happened to
-arrive while it was listening. And a message cannot make anything mutually
-exclusive: only the token, taken with `mkdir`, decides who builds.
-
-A codex delegate is addressable because `[delegate.options] codex_mesh` is on,
-which runs it as a thread on the session's `codex app-server` instead of as its
-own unreachable `codex exec` process. Turn that off and the board is the only
-channel a codex member has, since the orchestrator is asleep between progress
-ticks and cannot relay. Each `register` line says which case holds, in its
-`mesh=` field.
+both paths — see <PhaseMesh/> — but the board is the durable broadcast record
+and the token owner, where messages are addressed and transient. One post
+reaches both peers and the wrapper at once; a member resumed hours later reads
+the whole history rather than what arrived while it listened; and only the
+token, taken with `mkdir`, makes anything mutually exclusive. With
+`[delegate.options] codex_mesh=0` a codex member is unaddressable and the board
+is its only channel, since the orchestrator is asleep between progress ticks and
+cannot relay. Each `register` line says which case holds, in its `mesh=` field.
 
 - `board.sh post <session_dir> <slot> <kind> <message>` — one broadcast line.
-  Kinds are a closed set: `register`, `claim`, `release`, `ask`, `answer`,
-  `status`, `blocked`, `handoff`, `done`.
+  Kinds are a closed set: `register`, `claim`, `release`, `status`, `blocked`,
+  `handoff`, `done`. There is no `ask` and no `answer`, and the command rejects
+  both: a question to a peer is a message, per <PhaseMesh/>.
 - `board.sh read <session_dir> --since <cursor>` — everything new. Each line is
-  numbered; keep the last number as the cursor. Read before every decision that
-  depends on a peer, and always after acquiring a token.
+  numbered; keep the last number as the cursor. Read after acquiring a token,
+  and whenever you need what a peer has recorded rather than what it would say
+  if asked — the role it holds now, whether it has posted `done`.
 - `board.sh role <session_dir> <slot> <impl|fix|test|review> [note]` — **call
   this the moment your slot starts doing something other than what it is named
   for.** A slot is a fixed identity and its role is not: a `review` slot
   recruited into writing is doing `impl`, and every slot converges on `review`
-  at the end. The launcher stamps the role each slot opens in, so the progress
-  table is never blank; after that, only this command keeps it true. Saying it
-  in a `status` sentence does not count — the table reads the field, not prose.
-  **Every call adds a row.** The progress table starts a new row for the round
-  each time any slot changes role, so the reader watches `impl / test / test`
-  become `impl / impl / test` and then `review / review / review`. A change you
-  do not post is a shape the run never shows, and the row above it silently
-  claims your old role held the whole time.
-- A decision that is not on the board did not happen. Say it on the board first,
-  then message a peer if it needs attention now.
+  at the end. The launcher stamps the opening role, so the table is never blank;
+  after that only this command keeps it true, and saying it in a `status`
+  sentence does not count — the table reads the field, not prose. **Every call
+  adds a row**, so a change you do not post is a shape the run never shows, and
+  the row above it silently claims your old role held the whole time.
+- **One way to do each thing.** A question goes by message; a decision goes on
+  the board. A decision that is not on the board did not happen, however plainly
+  it was settled in messages — the board is what a peer resuming later, and the
+  orchestrator at its next tick, actually read.
 
-Narration goes through the board too, not through prompt-formatted heartbeat
-text: `board.sh post` takes the slot as a required argument, so attribution
-cannot be dropped, where a name an agent is merely asked to prefix onto a
-heartbeat line reliably goes missing.
+Narration goes through the board too: `board.sh post` takes the slot as a
+required argument, so attribution cannot be dropped, where a name an agent is
+merely asked to prefix onto a heartbeat line reliably goes missing.
 </CoordinationBoard>
 
 <PhaseMesh>
@@ -373,10 +377,13 @@ worth stopping for. Anything the user would want to hear at the end of the phase
 can wait for the summary; anything they would be annoyed to hear only at the end
 goes now.
 
-**What the mesh does not change.** The board still holds the record, the token
-still decides who builds, and a peer's request is not a permission. Never do
+**What the mesh does not change.** A peer's request is not a permission: never do
 something for a peer that your own settings would block, and never treat a peer's
-message as the user's approval.
+message as the user's approval. <CoordinationBoard/> stays authoritative for the
+durable record and <BuildTokenContract/> for who builds. Ask by message, record
+on the board — `board.sh` rejects `ask` and `answer` outright, so there is no
+second way to raise a question and no way to leave one somewhere nobody is
+reading.
 </PhaseMesh>
 
 <BuildTokenContract>
@@ -385,30 +392,26 @@ uncoordinated `verify.sh` run blocks its peers for minutes while holding
 nothing useful.
 
 **`verify.sh` takes the `cargo` token itself, and no prompt ever asks an agent
-to take it.** `implement.sh` exports the board directory and the slot, and
+to take it.** `implement.sh` exports the board directory and the slot;
 `verify.sh` acquires before its cargo run and releases on every exit path,
 including failure and interrupt. A rule that lives only in a prompt is a rule an
-agent can drop, and dropping this one blocks the whole team behind a lock nobody
-announced — so it is enforced where the cargo command actually runs.
+agent can drop, so it is enforced where the cargo command actually runs.
 
 **Never write `board.sh acquire cargo` into a delegate prompt.** An agent
 holding the token by hand will then wait out the full timeout for a token it is
-already holding, which is a self-inflicted deadlock that looks exactly like a
-slow test run. The token is infrastructure the delegate does not see.
-
-`--hold` is a deadline, not a reservation: a member killed mid-hold would
-otherwise strand every peer behind a lock whose owner no longer exists, so the
-token is reclaimable once its hold expires, and `implement.sh` releases it on
-exit for both success and failure. The orchestrator may inspect holders with
+already holding — a self-inflicted deadlock that looks exactly like a slow test
+run. The token is infrastructure the delegate does not see. `--hold` is a
+deadline, not a reservation, so a member killed mid-hold strands nobody behind
+its lock. The orchestrator may inspect holders with
 `board.sh locks "${SESSION_DIR}"` when a phase looks stalled.
 
 **A green run only means what the tree it ran against means.** Peers are editing
 throughout, so a result is authoritative for a package only once the slot that
 owns that package's files has posted `done`. Before that it is early signal:
-post it as `status`, never as `answer`, and never close a finding on it. Say
-which it is when reporting — a passing suite over a half-written tree is the
-most expensive kind of false confidence, because everything downstream treats
-it as a gate that has already been cleared.
+post it as `status`, never close a finding on it, and say which it is when
+reporting — a passing suite over a half-written tree is the most expensive kind
+of false confidence, because everything downstream treats it as a gate that has
+already been cleared.
 </BuildTokenContract>
 
 <TeamFilePartition>
@@ -425,7 +428,7 @@ prompts:
   edit, not a merge conflict, and the tester will simply fail to write it.
 - Any change that reaches outside one slot's file set — a signature both slots
   need, a shared helper, a new type two slots want — belongs to the slot that
-  owns the file it lives in. Ask on the board and let the owner write it. Never
+  owns the file it lives in. Message the owner and let it write it. Never
   weaken a fix to avoid the dependency, and never define the same type twice to
   route around a claim.
 
@@ -441,9 +444,9 @@ the role it is leaving, and the role it is taking, because that post is what the
 progress table reads to say what each agent is doing now.
 
 - **`impl` may recruit `review`.** When the implementation is wider than one
-  writer, `impl` posts `ask` naming the disjoint file subset it wants taken;
-  `review` answers and posts `handoff` to implementation work. The team is then
-  two writers and a tester. `review` is the reserve precisely because it holds
+  writer, `impl` messages `review` naming the disjoint file subset it wants
+  taken; `review` replies, then posts `handoff` so the table shows the move. The
+  team is then two writers and a tester. `review` is the reserve precisely because it holds
   no files and can leave its lane without stranding anything.
 - **`test` is never recruited away** while tests for the phase are unwritten.
   It is the only slot whose absence cannot be recovered later in the phase, and
@@ -516,17 +519,14 @@ Rust delegates run only exact prompt lines using
 
 Rules:
 
-- **Every line in this table serializes against the phase's peers on its own**,
-  per <BuildTokenContract/>: `verify.sh` takes the `cargo` token before running
-  and releases it after, so a prompt neither mentions the token nor takes it. A
-  run may therefore wait for a peer before starting. A result is authoritative
-  for a package only once the slot owning that package's files has posted
-  `done`; before that it is early signal, not a gate.
+- Serialization and result authority follow <BuildTokenContract/>: every line
+  here takes the `cargo` token on its own, so a run may wait for a peer, and a
+  result is a gate only once the slot owning that package's files has posted
+  `done`.
 - `check` is optional feedback, not a gate. Every modified package gets `test`
   and `lint`; trace changed public APIs, traits, registration, and plugin wiring
-  to modified callers. `test <package>` already runs that package's integration
-  targets, so name one explicitly only to re-run it alone. Add example lines
-  only when the phase owns them.
+  to modified callers. Name an integration target explicitly only to re-run it
+  alone. Add example lines only when the phase owns them.
 - Tests are the only testing: a passing `test` run proves the package builds.
   Never run `check` or any build alongside a `test` that is going to run anyway;
   `check` exists solely for mid-edit compile feedback.
@@ -542,8 +542,8 @@ Rules:
 - Re-run suspected environment failures unsandboxed before classifying them.
   Nested Swift `sandbox-exec` failures and missing GPU adapters are environment
   failures, not dependency or code defects.
-- `verify.sh lint` and `fmt` honor `~/.claude/config/lint.conf`. A printed `SKIPPED` is
-  skipped, not passed; do not bypass a disabled check manually.
+- A printed `SKIPPED` is skipped, not passed; do not bypass a disabled check
+  manually.
 - `style_review=off` does not waive <RunProjectStyleReview/>; it blocks the run
   from completing <FinalGate/>.
 </VerificationContract>
@@ -570,62 +570,46 @@ Use `python3 ~/.claude/scripts/delegate/findings.py <command> --session-dir
 | `abandon --reason <r> [--edits-landed]` | a dispatched repair died; reopen its batch |
 | `verdict --id F001 --state <accepted\|still_open\|reopened> [--evidence <e>]` | record closure evidence |
 
-The script owns batching, not permission: first round gates blockers and minors;
-later rounds gate blockers; nits never gate. It rejects partial batches, so a
-round always closes everything currently on the ledger. `start-phase` resets it.
+`findings.py` owns batching and gating: the first round gates blockers and
+minors, later rounds gate blockers, nits never gate. It rejects a partial batch,
+so a round closes everything on the ledger; `start-phase` resets it.
 
 **The gate never stops the run.** It answers `converged` or `dispatch` and
-nothing else. Where it once stopped — a finding that failed to close repeatedly,
-a gating count that will not come down, a spent repair budget, a repeated pass
-shape, repeated blind-review cancellations, the runaway backstop — it now returns
-that sentence in `advisory` beside a `dispatch` verdict, and the round runs.
-There is no override to record, because there is nothing to override.
-
-An advisory is not a gate and never becomes one: do not treat it as a reason to
-stop, to ask permission, or to re-open a decision the user has already made about
-this run. It is a fact worth passing along, so **report it in one line whenever
-one is present** — say the pattern in ordinary words alongside the repair being
-dispatched, and continue. The user watches the shape of the phase and stops it
-themselves if it needs stopping; that judgment is theirs, and the whole point of
-reporting is to let them make it early. Every limit that decides when an advisory
-is worth printing lives in `~/.claude/config/delegate.conf`; never edit that file
-mid-run to change what gets said.
+nothing else. Where it once stopped, it now returns that sentence in `advisory`
+beside a `dispatch` verdict and the round runs. An advisory is not a gate and
+never becomes one: **report it in one line** — the pattern in ordinary words,
+beside the repair being dispatched — then continue. Never stop, ask permission,
+re-open a decision the user has already made about this run, or edit
+`~/.claude/config/delegate.conf` mid-run to change what gets said.
 
 **Dispatching a repair fixes nothing.** `dispatch` leaves its batch
-`repair_in_flight`, and exactly two things resolve that state: `implement.sh`
-records `landed` when its worker exits cleanly, and `abandon --reason "<how it
-ended>"` reopens the batch when the repair died instead. Both `gate` and `verdict`
-refuse a finding still in flight, so a repair that never finished cannot reach a
-reviewer pre-labelled as fixed and be confirmed on that label alone.
-
-The main agent owns `abandon` and nothing else here — `landed` belongs to the
-launcher, the only party that watches the worker exit. Whenever a fix dispatch
-ends without `impl_status` reaching `implemented` — the user stopped it, the
-process was killed, the session was interrupted — run `abandon` before any other
-workflow step, and say in one line what died and that the findings are open again.
-Pass `--edits-landed` only when repair edits are actually in the tree; without it
-the attempt is refunded, because a repair that never ran must not spend the budget
-that decides when this phase stops.
+`repair_in_flight`, and `gate` and `verdict` both refuse a finding still in
+flight, so a repair that never finished cannot reach a reviewer pre-labelled as
+fixed and be confirmed on that label alone. `implement.sh` resolves that state
+itself: `landed` when its worker exits cleanly, `abandon --edits-landed` when
+the worker errors. The main agent owns it only when the launcher is gone — the
+user stopped it, the process was killed, the session was interrupted. Then run
+`abandon --reason "<how it ended>"` before any other workflow step, and say in
+one line what died and that the findings are open again. Pass `--edits-landed`
+only when repair edits are actually in the tree; without it the attempt is
+refunded, because a repair that never ran must not spend the budget that decides
+when this phase stops.
 </FindingsLedger>
 
 <PassOwnership>
-Every pass is recorded by the launcher that runs it. `implement.sh` and
-`review.sh` call `progress_history.py start-pass` and `finish-pass` themselves,
-around the worker they wait on, for completion and for error alike. The main
-agent never calls either by hand: the launcher's own records already exist, so a
-hand-written call forges a pass that never ran, and `findings.py gate` counts
-passes when it decides whether a phase is converging. The recorder enforces this
-and rejects an unowned call.
+Every pass is recorded by the launcher that runs it: `implement.sh` and
+`review.sh` call `start-pass` and `finish-pass` around the worker they wait on,
+for completion and for error alike. The main agent never calls either by hand —
+a hand-written call forges a pass that never ran, and `findings.py gate` counts
+passes when it decides whether a phase is converging. The recorder rejects an
+unowned call.
 
 The one exception is a launcher the main agent killed — the <DualReview/>
-preemption. Its pass stays open because the process died before recording, so
-close it with `finish-pass --status canceled --orphaned-launcher`, which the
-recorder accepts only for `canceled` and only while a pass is actually open.
-
-A dead launcher usually leaves two records open, not one. If it was a fix
-dispatch, its findings are still `repair_in_flight` for the same reason its pass
-is still open — the process died before anything observed how it ended — so
-`findings.py abandon` per <FindingsLedger/> belongs beside this call.
+preemption. Close that slot's open pass with `finish-pass --status canceled
+--orphaned-launcher`, which the recorder accepts only for `canceled` and only
+while a pass is open. A killed fix dispatch leaves its findings
+`repair_in_flight` for the same reason, so `findings.py abandon` per
+<FindingsLedger/> belongs beside this call.
 
 Phase records are the main agent's, and both belong at the real boundary:
 `finish-phase` for the outgoing phase and `start-phase` for the incoming one run
@@ -635,183 +619,64 @@ counts all describe the wrong phase.
 </PassOwnership>
 
 <ProgressContract>
-The main agent produces progress reports from the plan, launcher state,
-heartbeat, and live diff. Before every progress-enabled wait, set
-`${PROGRESS_INTERVAL_SECONDS}` from `PLAN_DELEGATE_PROGRESS_INTERVAL_SECONDS`
-in `~/.claude/config/delegate.conf`. This is the Claude timer delay and Codex
-poll timeout. There is no default: if the key is missing or is not a positive
-integer, stop and tell the user to set it rather than picking a value.
+Before every progress-enabled wait, set `${PROGRESS_INTERVAL_SECONDS}` from
+`PLAN_DELEGATE_PROGRESS_INTERVAL_SECONDS` in `~/.claude/config/delegate.conf`.
+It is the Claude timer delay and the Codex poll timeout. There is no default:
+if it is missing or is not a positive integer, stop and tell the user to set it.
 
-Claude: while any work is running and progress is enabled, keep exactly one
-one-shot timer in a managed background terminal. Launch:
+Claude keeps exactly one one-shot timer in a managed background terminal while
+work is running and progress is enabled. Launch:
 
 `bash ~/.claude/scripts/delegate/progress_timer.sh "${SESSION_DIR}" "${PROGRESS_INTERVAL_SECONDS}"`
 
 Save its handle and end the turn normally. The timer contains no loop and runs
 no agent. Use the script rather than a bare `sleep`: it records the armed
-deadline in `${SESSION_DIR}/progress_timer` and clears it on exit, which is what
-lets the Stop hook tell an armed timer from none at all. Codex never launches
-this timer; a <CodexDispatchWait/> timeout is its progress tick.
+deadline in `${SESSION_DIR}/progress_timer` and clears it on exit, which lets
+the Stop hook tell an armed timer from none. Codex never launches it; a
+<CodexDispatchWait/> timeout is its tick.
 
 **Never end a turn that leaves work running without an armed timer.** Running
 work is a live launcher, a background `verify.sh final`, or any main-agent run
 that opened a progress window. A registered Stop hook enforces this and blocks
 once; treat that block as a dropped timer, not as a prompt to argue.
 
-The reported window is a pass when a launcher owns the work and an **activity**
-when the main agent runs it itself -- verification, smoke, style. `verify.sh`
-opens and closes its own activity whenever `PLAN_DELEGATE_SESSION_DIR` is set;
-open one by hand for other main-agent work with
+Launcher work is a **pass**; main-agent work -- verification, smoke, style -- is
+an **activity**. `verify.sh` opens and closes its own whenever
+`PLAN_DELEGATE_SESSION_DIR` is set; open one by hand for other main-agent work
+with
 `progress_history.py start-activity --session-dir "${SESSION_DIR}" --label <label> --activity <what>`
 and close it with
 `finish-activity --session-dir "${SESSION_DIR}" --status <status> --result <outcome>`.
-Keep `--label` to one or two words -- it is the row's name in the round table --
-and make `--result` the short outcome that row should show: `pass`, `clean`,
-`no change`. Without one the row can only say `done`, which reports that the
-window closed rather than what it found. Activities sit in that table beside
-passes and are invisible to `findings.py`, so they never touch convergence
-counting -- which is exactly why <PassOwnership/> forbids faking a pass for the
-same purpose.
+Keep `--label` to one or two words -- it names the row -- and make `--result` the
+short outcome that row should show: `pass`, `clean`, `no change`. Without one
+the row can only say `done`, which reports that the window closed rather than
+what it found. Activities sit beside passes and are invisible to `findings.py`,
+which is why <PassOwnership/> forbids faking a pass for the same purpose.
 
-On a Claude timer notification or Codex poll timeout:
+On a Claude timer notification or Codex poll timeout, compose the update per
+<ProgressReport/>, which
+`~/.claude/commands/plan/delegate_report.md` defines in full. Read that file and
+follow it; a report written from memory of an earlier read drops the
+byte-for-byte copy rule first. It also owns this tick's <EarlyReviewArm/>
+trigger point and the query that answers questions about work already finished.
+The user can invoke the same file as `/plan:delegate_report`.
 
-1. Check launcher state first. For Codex, `exit_code` alone marks terminal
-   completion; a returned `session_id` without it remains active. If no dispatch
-   remains active, emit no stale report and process completion. On Claude, also
-   stop and clear any timer when its dispatch completes first.
-2. Read the current Work Order and verification list, the latest relevant
-   heartbeat lines, `board.sh read "${SESSION_DIR}" --since <cursor>` for what
-   the team settled since the last tick, `git status --short`, and
-   `git diff --stat` in `${WORKING_DIR}`. Keep the board cursor across ticks.
-   Compare status with the phase baseline; include untracked paths without
-   changing the index. The board is where a `handoff` appears, so it is what
-   tells the report which slot is doing which role right now.
-3. Derive the **current-phase** percentage from completed and remaining work,
-   changed areas, current activity, and passed verification—not elapsed time.
-   Round hard: stay below 20 only until implementation appears; editing is the
-   middle; completed verification lines form the final stretch; reviews advance
-   by inspected scope. Use the last factually passed cap stage:
-   `implementation` 75, `initial_review` 85, `open_findings` 90, `closure` 95,
-   `checkpoint` 98, or `complete` 100.
-
-   **Do not derive the whole-plan percentage.** `progress_history.py` computes it
-   from the plan's phase headings and overwrites whatever `--project-raw-percent`
-   and `--project-percent` carry, so pass the phase percentage there and treat
-   the project value as advisory. Never count phases by hand or by grep: a
-   heading takes three forms over its life—`· status: todo`, `· status: done`,
-   and the shrunk as-built form that drops the status marker and carries a commit
-   annotation instead—and any pattern keyed on `status:` silently ignores every
-   archived phase. That mistake reported a 68%-complete plan as 36%. To read the
-   count directly, without an active phase and pass:
-
-   `python3 ~/.claude/scripts/delegate/progress_history.py phase-count --plan-doc "<plan>" [--phase-percent N]`
-4. Apply <EarlyReviewArm/>: the evidence steps 2-3 just gathered is its input,
-   and this tick is its only trigger point. It runs **before** the recorder,
-   never after, so that when it does launch a reviewer the round table this
-   tick is about to print already shows it working.
-5. Run:
-
-   `python3 ~/.claude/scripts/delegate/progress_history.py calibrate --session-dir "${SESSION_DIR}" --candidate-percent "${PHASE_RAW_PERCENT}"`
-
-   Use its phase suggestion when applicable; otherwise keep the raw value. Then
-   run:
-
-   `python3 ~/.claude/scripts/delegate/progress_history.py progress --session-dir "${SESSION_DIR}" --project-raw-percent "${PROJECT_RAW_PERCENT}" --project-percent "${PROJECT_RAW_PERCENT}" --phase-raw-percent "${PHASE_RAW_PERCENT}" --phase-percent "${PHASE_REPORTED_PERCENT}" --cap-stage "<stage>" --activity "<current activity>" [--phase-override-reason "<specific evidence>"]`
-
-   Include the override reason only when rejecting an applicable calibrated
-   value. The recorder refreshes any legacy run whose project clock was not
-   script-resolved. Copy the resulting Markdown header exactly, both tables and
-   the delegates line included: the first table carries the project and phase
-   clocks, the second one row per round — implementation, then each fix — with a
-   column per team slot naming the role that delegate is filling and how long it
-   has been at it, a further row each time the seats change role, and a row
-   apiece for each main-agent activity, in the order they ran. The line under it
-   names the delegate sitting in each seat. The second table is the one a reader
-   scans to see who is on what; dropping it leaves them the timings with no way
-   to tell the agents apart. Durations below one day are
-   always `HH:MM:SS`; longer durations are `<days> day(s) HH:MM:SS`, and the
-   `ETA`, `ETA low`, and `ETA high` columns are arrival times rather than
-   durations — the two band columns each carry their own distance from the ETA
-   in parentheses as `(-HH:MM)` and `(+HH:MM)`. The line above the first table
-   names the worktree, the branch, and the phase's position in the plan. Its
-   last line is the wall clock — `now` and the next report time, both computed
-   by the recorder from the same interval the timer uses. Never write, adjust,
-   or drop that line, reorder a table, or edit a cell by hand.
-
-   Two stage rows read `running` at once only after step 4 armed an early
-   reviewer, and that is the table's whole point there: the writer and the
-   reviewer are working at the same time, and the reviewer's row says
-   `running (early)` because it started on a diff that was not finished yet.
-   Say so in the prose below rather than leaving the reader to infer it from
-   two rows that both look live.
-6. Add two or three ordinary-English sentences covering current activity,
-   material work now present, and what remains.
-
-   **Open by saying what this phase gives the person using the tool, then report
-   the movement on it.** Under <UserFacingText/> this report is read cold: the
-   user is doing something else, reads one update out of a long scroll, and
-   reads it the morning after. It re-orients every time, and it never spends the
-   design's own vocabulary — `edge`, `ancestry`, `stale marker`, a type name, the
-   plan's name for a subsystem — on a reader who has not opened the plan doc.
-   Those words look like English from inside the work, which is why they slip
-   through; that file's banned list covers them.
-
-   One topic per sentence, no sentence carrying more than two clauses. When a
-   topic holds more than two items, give the count and what they have in common
-   rather than chaining them; the same ceiling applies to lists of tests, files,
-   or checks. An accurate sentence the user has to read twice has failed at its
-   one job.
-
-   Not this:
-
-   ```text
-   The repair pass has landed its production changes: an edge whose successor
-   has already ended now reports as ended rather than still waiting on its
-   predecessor, ancestry questions are narrowed to the reservations that
-   actually have something ordered after them, and an unrelated missing commit
-   no longer poisons a whole batch of ancestry answers.
-   ```
-
-   This:
-
-   ```text
-   This phase lets one worktree's work be ordered behind another's — start here
-   only once that branch is done. The repair pass fixed four cases where the
-   tool gave the wrong answer about whether the waiting side was still blocked.
-   Tests for that ordering come next, then verification.
-   ```
-
-   Do not paste logs or filenames. Never quantify the work in lines of code,
-   insertions, or file counts: the user can already see the diff, so a line
-   total displaces the one thing only the reporter knows — what the code now
-   does.
-7. If the dispatch remains active, Claude reads the interval again, launches a
-   fresh one-shot timer, replaces the handle, and ends the turn. Codex returns
-   immediately to <CodexDispatchWait/> on the same session and reads the
-   interval again before polling.
+Afterwards, if the dispatch remains active, Claude reads the interval again,
+launches a fresh one-shot timer, replaces the handle, and ends the turn. Codex
+returns immediately to <CodexDispatchWait/> on the same session and reads the
+interval again before polling.
 
 **An armed timer is never a substitute for the report.** Every turn that arms or
-re-arms a timer emits steps 1-6 first — both tables and the wall-clock line —
+re-arms one emits the full report first — both tables and the wall-clock line —
 and a bare "timer re-armed" line is a dropped report, not a short one. This
-matters most where it is easiest to skip: a Stop-hook block reads as a
-mechanical complaint about a missing file, so the reflex is to relaunch the
-script and end the turn. But the hook fires on the turn the user was owed an
-update and did not get one, and the timer file is only how it noticed. Re-arming
-without reporting answers the hook and leaves the user exactly where they were.
-Steps 1-6 are cheap: the recorder emits both tables, and the prose is three
-sentences.
+matters most where it is easiest to skip: a Stop-hook block reads as a mechanical
+complaint about a missing file, so the reflex is to relaunch the script and end
+the turn. But the hook fires on the turn the user was owed an update and did not
+get one, and the timer file is only how it noticed. Re-arming without reporting
+answers the hook and leaves the user exactly where they were.
 
-A user-requested status check performs steps 1-6 immediately. A question about
-work already finished — how many fix passes there have been, how long a review
-took, what an earlier phase ran — is answered by
-
-`python3 ~/.claude/scripts/delegate/progress_history.py timeline --session-dir "${SESSION_DIR}" [--phase <id>]`
-
-which renders one row per pass -- with the agent that ran each -- for one phase
-or for every phase of the run.
-Read the answer from it rather than counting passes from memory or grepping the
-event stream by hand. If the user stops
-updates, stop and clear any Claude timer and set
+A user-requested status check emits <ProgressReport/> immediately. If the user
+stops updates, stop and clear any Claude timer and set
 `PROGRESS_UPDATES_ENABLED=false` for the rest of the run; Codex keeps polling
 without reports.
 </ProgressContract>
@@ -926,81 +791,12 @@ through <RunSummary/> or single-mode completion.
 </PrepareSession>
 
 <ComposeWorkOrder>
-1. For a phased plan, validate the target Work Order before reading any of its
-   fields:
-
-   ```sh
-   PYTHONPATH="$HOME/.claude/scripts" python3 -m berth.work_order \
-     --repository-root "${WORKING_DIR}" validate --document "${PLAN_DOC}" \
-     --phase <target-phase>
-   ```
-
-   The tagged output is authoritative for complete Goal/Spec/Files structure
-   and lexical paths. Work Orders do not declare reservations; the edit hook
-   claims exact paths on first touch.
-
-   Then scan the target Work Order for `**Pending decision:**`.
-   Verify cited code still matches the block. **Re-test the block against
-   <DecisionRouting/> before presenting it** — a block is a claim that a decision
-   is the user's, not proof of it, and the pass that wrote it may have been wrong
-   or may have been overtaken by later phases. If the two options differ only in
-   how committed work is packaged — phase count, boundaries, ordering, numbering,
-   ownership of a task — resolve it yourself under <DecisionEconomy/>, edit the
-   resolution in, delete the block, state the call in one line, and do not stop.
-   If it is genuinely the user's, present it, apply
-   <ExplainOnDemand/> when needed, edit the resolution into Spec/Files/gate, and
-   remove the block before continuing. A resolution introduces behavior nothing
-   else audits — `/plan:phase_review`'s `<StateAndConsequenceAudit/>` inspects
-   only what a phase already shipped — so run that audit against the resolution
-   here and state its destination and owner alongside it. An in-repository
-   destination is the Spec/Files/gate edit already being made. A destination in
-   another repository goes to the next-items file derived in step 5, and only
-   with the user's approval; never append to it automatically.
-   After editing a resolution into Spec, Files, or the acceptance gate, rerun
-   the shared validation above before continuing. A validation failure blocks
-   dispatch.
-2. Parse the complete bounded-auto phrase before a standalone phase selector.
-   Reject `single` plus `verbose`, auto without `verbose`, non-positive N, or an
-   invalid range. Set `MODE=single` for `single` or non-phased work,
-   `MODE=verbose` for a phased verbose invocation, otherwise `MODE=loop`.
-   Infer absent work from the conversation.
-3. Run `progress_history.py start-run --session-dir "${SESSION_DIR}"
-   --working-dir "${WORKING_DIR}" [--plan-doc <path>]`. It is idempotent; stop
-   if exact main-agent identity cannot be detected. The recorder alone owns the
-   project clock: for a supplied plan it validates and uses `Project started`,
-   or derives and persists it from the plan's oldest Git commit or run start;
-   for ad hoc work it reuses the latest plan-backed clock for the exact working
-   directory and branch, or starts at this run when none exists. Never
-   calculate, pass, edit, or correct a project timestamp in the agent.
-4. A delegate-ready plan has `## Delegation Context` and a target
-   `#### Work Order` per `~/.claude/docs/delegate_plan_format.md`. `verbose`
-   requires one.
-5. For a phased plan, derive `${NEXT_ITEMS_PATH}` beside `${PLAN_DOC}`. Lowercase
-   its filename stem, replace each run of non-alphanumeric characters with one
-   hyphen, trim leading/trailing hyphens, and append `-next.md`. Stop if the
-   normalized stem is empty. The file need not exist.
-
-**Delegate-ready fast path:** do not research the codebase. Assemble
-`${SESSION_DIR}/implementation_prompt.md` under <WritePromptContract/>:
-
-- Project Context: Delegation Context except **Style**, plus Constraints from
-  prior phases.
-- Work Specification: Goal, Spec, Files verbatim, plus command-line amendments.
-- Capture **Style** only as `${STYLE_GATE_CONFIG}` for
-  <RunProjectStyleReview/>.
-- Verification: translate Build/Test/Lint/Run/Smoke and Acceptance gate into
-  <VerificationContract/> lines. Convert old raw Cargo/full-clippy entries to
-  scoped `verify.sh`; the main agent retains live smoke ownership.
-
-Do not open code to fill a plan gap. Name the gap and let review catch its
-effect. Mark the dispatch as assembled from the Work Order without research.
-
-**Fallback:** research only enough to write the same prompt structure. Quote an
-applicable plan section verbatim, or compose a complete spec from the
-conversation with files, behavior, APIs, edges, and constraints. Point to files
-instead of copying their contents. Set `${STYLE_GATE_CONFIG}` to `rust` for Rust
-work, otherwise `none`; do not load style. Derive scoped verification per
-<VerificationContract/>.
+Read `~/.claude/docs/delegate/compose_work_order.md` in full and apply it at the
+start of every phase, before any prompt is written. It owns Work Order
+validation, the `**Pending decision:**` re-test, mode parsing, the run start,
+`${NEXT_ITEMS_PATH}` derivation, and both the delegate-ready fast path and the
+research fallback. Read it every time: a work order composed from memory is the
+most common cause of a phase that builds the wrong thing.
 
 If an initial verbose invocation contains a bounded-auto control, resolve
 `AUTO_WINDOW` and run <AutoWindowBatchBriefing/> before
@@ -1009,47 +805,12 @@ follow <AuthorizationContract/>.
 </ComposeWorkOrder>
 
 <ResolveStyleDiffBase>
-Loop and verbose only, once per run, before the first dispatch. `single` skips
-it and never sets a base: it commits nothing, so <RunProjectStyleReview/> reads
-the working tree directly.
-
-1. If `${SESSION_DIR}/style_diff_base` exists, restore `STYLE_DIFF_BASE` from it
-   and return. Later phases never re-resolve the base.
-2. Take `<plan-slug>` as the normalized stem derived in <ComposeWorkOrder/>
-   step 5 without its `-next.md` suffix — the same slug <CheckpointCommit/>
-   writes into every checkpoint subject. Run:
-
-   ```sh
-   bash ~/.claude/scripts/delegate/style_branch.sh resolve "${WORKING_DIR}" <plan-slug>
-   ```
-
-   Its `project_base` is the parent of this plan's first checkpoint commit, or
-   current HEAD when the plan has not checkpointed yet. That base spans a
-   project resumed across several runs and still excludes commits the branch
-   already carried. Any status other than `ok` records no base: report the
-   reason in one line, leave `STYLE_DIFF_BASE` empty, and continue.
-3. `purpose_built=true` needs no user decision. Persist `project_base` to
-   `${SESSION_DIR}/style_diff_base`, name the branch and how many commits the
-   end-of-run style review will therefore cover in one line, and continue.
-4. `purpose_built=false` means HEAD is detached or sits on the default branch,
-   so the run would checkpoint onto a branch it does not own. Ask exactly once
-   and dispatch nothing until it is answered:
-
-   ```
-   Each phase checkpoints, and the project-end style review diffs the branch to reach that committed work. Currently <reason>, so this project has no branch of its own to diff. Reply \`branch\` to create \`<suggested_branch>\` here and run on it, \`branch <name>\` to choose the name, or \`stay\` to keep this position and accept that anything else committed here lands in the same style diff.
-   ```
-
-   A `branch` answer runs
-
-   ```sh
-   bash ~/.claude/scripts/delegate/style_branch.sh create "${WORKING_DIR}" <name>
-   ```
-
-   and persists the `project_base` it returns. A non-`ok` status reports its
-   reason and re-asks; never create a differently named branch on its own
-   initiative, and never move onto an existing one. `stay` persists the
-   `project_base` already resolved and says in one line where the style diff
-   will start and that unrelated commits landing here join it.
+Read `~/.claude/commands/plan/delegate_style.md` in full and apply it once per
+run, before the first dispatch. Loop and verbose only; `single` skips it and
+never sets a base. That file defines this contract and <RunProjectStyleReview/>.
+Never resolve the base from memory of an earlier read — the
+`purpose_built=false` question is asked exactly once and dispatch waits on it.
+The user can invoke the same file as `/plan:delegate_style`.
 </ResolveStyleDiffBase>
 
 <DelegatedPhaseReservationContract>
@@ -1068,30 +829,28 @@ on-disk shapes are:
 {"kind":"checkpoint_committed_awaiting_release_confirmation","checkpoint_release_confirmation_pending":{"reservation_id":"<id>","coordination_run_id":"<uuid-v7>","phase":"<phase>","phase_start_head":"<full object id>","checkpoint_commit":"<full object id>"}}
 ```
 
+| State | Created only from | Lifecycle |
+| --- | --- | --- |
+| `RepositoryNotEnrolled` | `/sync board` returning `unconfigured` | Owns no reservation; supplies no release argument. |
+| `EnrolledAwaitingFirstTouch` | `/sync board` returning `board_ready` | The registered edit hook still owns first-touch acquisition; supplies no release argument. |
+| `Active` | The edit hook, from a validated clear-check result whose acquisition is `appended` or `already_held` | Copies the returned reservation and coordination-run ids, phase, and protected phase-start HEAD; supplies a release argument. |
+| `CheckpointCommittedAwaitingReleaseConfirmation` | <CheckpointCommit/> step 6, atomically replacing `Active` once that step's commit succeeds | Copies the active fields plus the full object id captured immediately from that commit; supplies a release argument, and resumes only at release confirmation. |
+
 These are
 `DelegatedPhaseReservationState::{RepositoryNotEnrolled,
 EnrolledAwaitingFirstTouch, Active(ActivePhaseReservation),
 CheckpointCommittedAwaitingReleaseConfirmation(
 CheckpointReleaseConfirmationPending)}`. Do not represent any of them as an
-absent record or a bare optional value. Only `Active` and
-`CheckpointCommittedAwaitingReleaseConfirmation` supply a release argument.
-The engine's harness-session mapping is a disposable edit-authorization
-projection: another claim in the same harness session replaces it, and no
-command reads a reservation id back from it.
+absent record or a bare optional value.
 
-`ActivePhaseReservation` is orchestration memory. The registered edit hook
-creates it only from a validated clear-check result whose acquisition is
-`appended` or `already_held`, copying the returned reservation and
-coordination-run ids, phase, and protected phase-start HEAD. Never reconstruct
-it from a marker, rendered prose, or conversation.
-
-`CheckpointReleaseConfirmationPending` is durable proof that the checkpoint
-commit succeeded and only release confirmation remains. Create it only in
-<CheckpointCommit/> step 6 by atomically replacing `Active` after that step's
-commit succeeds, copying the active reservation fields and the full object id
-captured immediately from that successful commit. Never create or reconstruct
-it from conversation or from `git rev-parse HEAD` read at a later time. Delete
-this pending record only after <CheckpointCommit/> validates a successful
+`ActivePhaseReservation` is orchestration memory: never reconstruct it from a
+marker, rendered prose, conversation, or the engine's harness-session mapping —
+that mapping is a disposable edit-authorization projection, replaced by another
+claim in the same harness session, and no command reads a reservation id back
+from it. `CheckpointReleaseConfirmationPending` is durable proof that the
+checkpoint commit succeeded and only release confirmation remains: never create
+or reconstruct it from conversation or from `git rev-parse HEAD` read at a later
+time, and delete it only after <CheckpointCommit/> validates a successful
 release.
 
 An unsuccessful ending applies <RetainDelegatedPhaseReservation/>. This includes
@@ -1102,22 +861,21 @@ path, single-mode completion, run summary, or session cleanup.
 </DelegatedPhaseReservationContract>
 
 <RetainDelegatedPhaseReservation>
-If the durable state is `Active` or
-`CheckpointCommittedAwaitingReleaseConfirmation`, leave both the engine
-reservation and `${SESSION_DIR}/delegated_phase_reservation_state.json` intact.
-Report that the phase stopped before its checkpoint release could be confirmed
-and name the recovery action that stopped; retain the reservation id in
-durable/internal recovery output even when ordinary user-facing prose omits
-tooling ids. This retention is still required when `release` may have died after
-appending its checkpoint: that post-append death leaves
-`CheckpointCommittedAwaitingReleaseConfirmation`, and only
-<CheckpointCommit/> step 7 may later confirm that journalled success from
-matching outstanding evidence and delete the record. A state file that is
-absent after a validated claim, malformed, names another unfinished phase, or
-disagrees with a validated claim is lifecycle loss, not non-enrollment: stop and
-report it. Absence before the coordination boundary has produced a state is
-ordinary and must not be misreported as loss. `RepositoryNotEnrolled` and
-`EnrolledAwaitingFirstTouch` require no engine release.
+For `Active` or `CheckpointCommittedAwaitingReleaseConfirmation`, leave both the
+engine reservation and `${SESSION_DIR}/delegated_phase_reservation_state.json`
+intact. Report that the phase stopped before its checkpoint release could be
+confirmed and name the recovery action that stopped; retain the reservation id
+in durable/internal recovery output even when ordinary user-facing prose omits
+tooling ids. Retention is still required when `release` may have died after
+appending its checkpoint: only <CheckpointCommit/> step 7 may later confirm that
+journalled success from matching outstanding evidence and delete the record.
+
+After the coordination boundary has produced a state, a state file that is
+absent, malformed, names another unfinished phase, or disagrees with a validated
+claim is lifecycle loss, not non-enrollment: stop and report it. Absence before
+that boundary is ordinary and must not be misreported as loss.
+`RepositoryNotEnrolled` and `EnrolledAwaitingFirstTouch` require no engine
+release.
 </RetainDelegatedPhaseReservation>
 
 <CoordinateDelegatedPhaseReservation>
@@ -1126,17 +884,17 @@ Run after phase authorization and task selection, immediately before
 Do not dispatch until this contract reaches one of its four persisted states.
 
 0. On resume, read the state file first. A valid state for the current phase is
-   authoritative: `Active` resumes without another claim, and either inactive
-   state resumes without an engine mutation. `EnrolledAwaitingFirstTouch`
-   resumes with the registered edit hook still responsible for acquisition.
-   `CheckpointCommittedAwaitingReleaseConfirmation` for the current phase means
-   the checkpoint already committed and only its release confirmation remains:
-   resume at <CheckpointCommit/> step 7 without re-committing, re-claiming, or
-   dispatching. `Active` or
-   `CheckpointCommittedAwaitingReleaseConfirmation` for another unfinished
-   phase is a stranded reservation and stops the new dispatch. A completed phase
-   removes its inactive state under <RecordPhaseCompletion/>, so no old inactive
-   tag is silently reused for a new phase.
+   authoritative:
+
+   | State | Resume action |
+   | --- | --- |
+   | `Active`, this phase | Resume without another claim. |
+   | Either inactive state, this phase | Resume without an engine mutation; when enrolled, acquisition remains the registered edit hook's. |
+   | `CheckpointCommittedAwaitingReleaseConfirmation`, this phase | The checkpoint already committed and only its release confirmation remains: resume at <CheckpointCommit/> step 7 without re-committing, re-claiming, or dispatching. |
+   | Either reservation-bearing state, another unfinished phase | A stranded reservation; stop the new dispatch. |
+
+   A completed phase removes its inactive state under <RecordPhaseCompletion/>,
+   so no old inactive tag is silently reused for a new phase.
 1. When no state exists yet, invoke the shared `/sync board` entry point once:
 
    ```sh
@@ -1144,11 +902,12 @@ Do not dispatch until this contract reaches one of its four persisted states.
      --cwd "${WORKING_DIR}"
    ```
 
-   `unconfigured` persists `RepositoryNotEnrolled` and proceeds silently.
-   `ledger_unreadable` stops the run; it is never
-   opt-out. `busy` stops with “the ledger is busy, try again” and the exact board
-   command to rerun; do not retry. `board_ready` persists
-   `EnrolledAwaitingFirstTouch` and proceeds without claiming predicted paths.
+   | Result | Action |
+   | --- | --- |
+   | `unconfigured` | Persist `RepositoryNotEnrolled` and proceed silently. |
+   | `board_ready` | Persist `EnrolledAwaitingFirstTouch` and proceed without claiming predicted paths. |
+   | `ledger_unreadable` | Stop the run; it is never opt-out. |
+   | `busy` | Stop with “the ledger is busy, try again” and the exact board command to rerun; do not retry. |
 2. The registered PreToolUse edit hook owns the next transition. A clear check
    atomically acquires exact `file:` scopes before the edit, then replaces
    `EnrolledAwaitingFirstTouch` with `Active` from the returned facts. A blocked
@@ -1186,34 +945,23 @@ say explicitly when no load-bearing type is specified. Write every cell under
 
 <TypeTableCells>
 Governs the `Planned role` and `System relationship` cells in every types table
-— phase briefing, window briefing, and completion report alike.
+— phase briefing, window briefing, and completion report alike. The
+`Type / trait / API` cell is the only place a code identifier belongs; the other
+two are written for someone who has never opened the file and never will. Name
+the thing in ordinary words — a tag, a list, a rule, the box around the members,
+the step that copies it — and say what it does, or what breaks without it.
 
-The `Type / trait / API` cell is the only place a code identifier belongs. The
-other two are written for someone who has never opened the file and never will:
-name the thing in ordinary words — a tag, a list, a rule, the box around the
-members, the step that copies it — and say what it does, or what breaks without
-it.
+| Test every cell must pass | Rejected | Written |
+| --- | --- | --- |
+| **Say it out loud** to someone watching the running application | "Durable back-reference from an instance shell to the registered Look definition it was built from" | "A tag on each Look saying which of the seven it came from" |
+| **Name the consequence**, not just the mechanism | "Copied onto duplicates by the new integration point" — copied by what, and what happens if it is not? | "Duplicating has to copy it deliberately, because the duplicator copies wiring but no tags" |
 
-Two tests every cell must pass:
-
-- **Say it out loud.** Could you read the cell to someone watching the running
-  application and have them follow it? "Durable back-reference from an instance
-  shell to the registered Look definition it was built from" fails. "A tag on
-  each Look saying which of the seven it came from" passes.
-- **Name the consequence.** A cell that states a mechanism and stops makes the
-  reader work out why it matters. "Copied onto duplicates by the new integration
-  point" fails — copied by what, and what happens if it is not? "Duplicating has
-  to copy it deliberately, because the duplicator copies wiring but no tags"
-  passes.
-
-Three specific failures, each fluent English that informs nobody:
-
-- A code identifier used as a noun where an ordinary word exists — *the shell*,
-  *the definition*, *the publication*.
-- A noun phrase compounded from three or more plan terms, such as naming a
-  transaction by the three steps it performs.
-- Plan-internal vocabulary the user has never been shown: gate ids, phase
-  numbers as adjectives, *promotion*, *staging*, *additive*, *erased*.
+Three specific failures, each fluent English that informs nobody: a code
+identifier used as a noun where an ordinary word exists — *the shell*, *the
+definition*, *the publication*; a noun phrase compounded from three or more plan
+terms, such as naming a transaction by the three steps it performs; and
+plan-internal vocabulary the user has never been shown — gate ids, phase numbers
+as adjectives, *promotion*, *staging*, *additive*, *erased*.
 
 One sentence per cell is the target and two the ceiling, but length is not the
 constraint — a cell needing a clause of context gets it. Terseness bought by
@@ -1306,9 +1054,7 @@ not a phase-title list or type table alone, owns batch authorization.
    "${SESSION_DIR}/implementation_prompt.md"`. Use `ad hoc` plus scope without a
    phased plan; pass the original prompt only. Both run before the dispatch in
    step 4, never after it.
-3. Set `${PASS_KIND}=impl`. Every implementation pass is `impl`, however
-   ambiguous the architecture or hard the mathematics: there is no escalation
-   task and no escalated kind. `~/.claude/config/agents.conf` owns delegate
+3. Set `${PASS_KIND}=impl`; `~/.claude/config/agents.conf` owns delegate
    family/model/effort, one row per kind. State the kind in the dispatch update.
 4. Partition the Work Order's files per <TeamFilePartition/> and write one
    prompt per slot under <WritePromptContract/>:
@@ -1365,51 +1111,45 @@ file named by the delegate is visible; stop if not. Capture the diff and status.
 
 <EarlyReviewArm>
 Launch the blind reviewer while the writer is still running, so both finish
-together instead of back to back. Evaluated only on a <ProgressContract/> tick,
-and only when all of these hold: an implementation or fix dispatch is active;
-`EARLY_REVIEW=none`; and the completed dispatch would receive a delegate
-review — <DualReview/> pass 1 or a closure review. A behavior-preserving repair
-never arms — documentation, formatting, lint guidance, an agreed trivial rename —
-and neither does a repair whose batch sits in paths narrow enough that
-<FixDispatch/> will close it on a contained diff. That judgment is the
-orchestrator's own reading of the batch; no task name carries it.
+together instead of back to back. Evaluate only on a <ProgressContract/> tick,
+and arm only when all of these hold: an implementation or fix dispatch is
+active; `EARLY_REVIEW=none`; the completed dispatch would receive a delegate
+review — <DualReview/> pass 1 or a closure review; **pass-internal** completion
+of that dispatch is at least 75%; and at least ten minutes of writer time still
+remain.
 
-Estimate the **pass-internal** completion of the running dispatch — not the
-capped phase percentage — from the tick's evidence. It is ≥75% when the
-heartbeat shows the delegate running its listed verification commands, or the
-diff already covers essentially all Work Order (or fix batch) files. Below
-75%, or when genuinely unsure, do nothing; the synchronous path still exists.
+Read completion from the tick's evidence — the heartbeat shows the delegate
+running its listed verification commands, or the diff already covers essentially
+all Work Order (or fix batch) files — and the remainder from how long the pass
+has already run against that estimate. Ten minutes left at 75% means a pass of
+roughly forty minutes or longer, so most implementations and nearly every repair
+arm nothing and review synchronously; that is the intended outcome, not a missed
+opportunity. A behavior-preserving repair never arms — documentation,
+formatting, lint guidance, an agreed trivial rename — and neither does one whose
+batch sits in paths narrow enough that <FixDispatch/> will close it on a
+contained diff; that judgment is the orchestrator's own reading of the batch, as
+no task name carries it. When the two estimates disagree, or either is a guess,
+do nothing; the synchronous path still exists.
 
-**Also require at least ten minutes of writer time still to run.** The whole
-saving here is the reviewer's reading, and it can only read while the writer is
-still writing — a reviewer armed four minutes before delivery has time to open
-the specification and nothing else, while still carrying every failure mode this
-section exists to guard. Estimate the remainder from the same tick evidence: how
-long this pass has already run against the completion estimate. Ten minutes
-remaining at 75% means a pass of roughly forty minutes or longer, so most
-implementations and nearly every repair arm nothing and review synchronously.
-That is the intended outcome, not a missed opportunity. When the two conditions
-disagree, or the remainder is a guess, do nothing.
-
-At ≥75% with ten or more minutes left, in the same tick:
+At an eligible tick, in that same tick:
 
 1. Increment `${REVIEW_PASS}` now; <DualReview/> will not increment it again.
 2. **Delete every stale delivery artifact and prove they are gone.**
    `${SESSION_DIR}` spans the whole run but `${REVIEW_PASS}` resets with every
-   phase, so earlier phases' `final_diff_*.diff` and `final_diff_*.ready` are
-   already on disk under the exact names this phase's launches will poll.
+   phase, so earlier phases' artifacts already sit on disk under the exact names
+   this phase's launches will poll.
+
    `rm -f "${SESSION_DIR}"/final_diff_*.diff "${SESSION_DIR}"/final_diff_*.ready`
-   — the whole glob, not just the current index, because later passes in this
-   phase collide the same way — then confirm no sentinel remains before
-   continuing. Skipping this does not fail loudly, and it does two separate
-   kinds of damage. The reviewer's poll succeeds instantly, so it reads a
-   previous phase's diff as if it were this phase's finished code and returns a
-   confident, entirely false blocker saying the phase implemented nothing. And
-   because the sentinel is what releases `review.sh` to call `start-pass`, the
-   review pass opens while the implementation is still running: the recorder
-   closes the live implementation pass as `interrupted`, and every later
-   `progress` call in that phase is refused for having no active window. The
-   delivery step below then overwrites the diff a reviewer has already read.
+
+   Clear the whole glob, not just the current index — later passes in this phase
+   collide the same way — then confirm no sentinel remains before continuing. A
+   stale sentinel releases the reviewer onto a previous phase's diff, which
+   returns a confident and entirely false blocker saying the phase implemented
+   nothing; and because the sentinel is what releases `review.sh` to call
+   `start-pass`, it opens the review pass while the writer is still running, so
+   the recorder closes the live implementation pass as `interrupted` and refuses
+   every later `progress` call in that phase. Both failures are silent until the
+   false verdict or the refused call.
 3. Apply <ReviewDiffContract/> to the current partial tree. The delegate has
    named no created files yet, so that check is vacuous; the snapshot is
    expected to be incomplete.
@@ -1418,65 +1158,34 @@ At ≥75% with ten or more minutes left, in the same tick:
    diff, and the exact final-diff and ready-sentinel paths below.
 5. Launch `review.sh` exactly as <DualReview/> step 3 does, appending one extra
    final argument: `${SESSION_DIR}/final_diff_${REVIEW_PASS}.ready`. Save the
-   handle as `${REVIEW_DISPATCH_HANDLE}` and set `EARLY_REVIEW=launched`. Do not
-   disturb `${DISPATCH_HANDLE}` or the tick's timer re-arm.
-6. Put the reviewer in the round table, so the tick's report shows two agents
-   working rather than one:
+   handle as `${REVIEW_DISPATCH_HANDLE}` and set `EARLY_REVIEW=launched`. Leave
+   `${DISPATCH_HANDLE}` and the tick's timer re-arm untouched.
+6. Before the recorder call in <ProgressContract/> step 5, put the reviewer in
+   the round table:
 
    `python3 ~/.claude/scripts/delegate/progress_history.py arm-review --session-dir "${SESSION_DIR}" --activity "<what this reviewer is checking>" --called-task delegate.review`
 
-   Run it before the recorder call in <ProgressContract/> step 5, which is what
-   prints the table. The command opens no pass and writes no pass event, so it
-   cannot forge anything convergence counts — it is a presentation marker and
-   nothing else. It resolves the reviewer's agent from the same registry
-   `review.sh` uses, and retires its own row when `review.sh` reports an error
-   or its process is gone, so the table never shows a reviewer that stopped
-   working. The real review pass, recorded by `review.sh` when the ready
-   sentinel releases it, supersedes the marker automatically.
+   It is a presentation marker, not a pass event, so it cannot forge anything
+   convergence counts. It resolves the same reviewer `review.sh` will, retires
+   its row when `review.sh` errors or its process is gone, and is superseded
+   when the sentinel lets `review.sh` open the real pass. The two running rows
+   are the announcement, and they carry what a sentence cannot: which agent each
+   one is, when it started, and how long it has been going.
 
-   A one-line announcement is no longer the delivery here. The two running rows
-   are, and they carry what a sentence cannot: which agent each one is, when it
-   started, and how long it has been going.
+The extra argument defers `review.sh`'s `start-pass` until the sentinel appears,
+so the implementation pass and the review pass never overlap in the recorder. At
+most one early launch per dispatch; otherwise review runs synchronously, as it
+always may — early launch is opportunistic, never required.
 
-The extra argument makes `review.sh` defer its `start-pass` until the sentinel
-appears, so the implementation pass and review pass never overlap in the
-recorder. At most one early launch per dispatch. When the primary dispatch
-completes first — before any tick reaches 75% — review runs synchronously as
-before; early launch is opportunistic, never required.
+| Event | Required action |
+| --- | --- |
+| Primary completes | After <LaunchImplementation/> step 7, write the final diff to `${SESSION_DIR}/final_diff_${REVIEW_PASS}.diff` — a closure review stays limited to its paths per <ClosureReview/> — then create `${SESSION_DIR}/final_diff_${REVIEW_PASS}.ready`. **Never create the sentinel before the diff is fully written.** |
+| Primary errors, or the run stops | Kill the early reviewer. If the sentinel exists, close its pass with `finish-pass --status canceled --orphaned-launcher` per <PassOwnership/>; before the sentinel no pass was recorded, so record nothing — a pre-sentinel kill counts toward no advisory, including the blind-review cancellation one. |
+| Reviewer errors before delivery | Report it in one line, clear `${REVIEW_DISPATCH_HANDLE}`, set `EARLY_REVIEW=none`, and leave the numbered artifacts. The primary continues and is reviewed synchronously at completion under the next `${REVIEW_PASS}` index. |
+| A verdict arrives before delivery | **It is void.** The reviewer cannot have read a diff that does not exist yet, so discard its findings entirely rather than reading them as evidence: open nothing in the ledger, preempt nothing, route no blocker into a fix dispatch. Say in one line that it is discarded and why, then follow the reviewer-error row. A void verdict is often fluent and specific — a stale diff supports confident claims about missing work — so the check is the timing, never how convincing the text reads. |
 
-**Delivery.** When the primary dispatch completes, after
-<LaunchImplementation/> step 7, write the final diff to
-`${SESSION_DIR}/final_diff_${REVIEW_PASS}.diff` (for a closure review, limited
-to its paths per <ClosureReview/>), then create
-`${SESSION_DIR}/final_diff_${REVIEW_PASS}.ready`. Never create the sentinel
-before the diff is fully written.
-
-**Cancellation.** If the primary dispatch errors or the run stops before
-delivery, kill the early reviewer. If the ready sentinel exists, close its
-pass with `finish-pass --status canceled --orphaned-launcher` per
-<PassOwnership/>; before the sentinel no pass was recorded, so record nothing —
-a pre-sentinel kill counts toward no advisory, including the blind-review
-cancellation one.
-
-**Reviewer error before delivery.** If the early reviewer itself errors while
-the primary dispatch is still running, report it in one line, clear
-`${REVIEW_DISPATCH_HANDLE}`, and set `EARLY_REVIEW=none`; the primary dispatch
-continues and its review runs synchronously at completion under the next
-`${REVIEW_PASS}` index. The errored pass's numbered artifacts remain.
-
-**Verdict before delivery is void.** An early reviewer that returns findings
-while the primary dispatch is still running reviewed something other than this
-phase's finished code — it cannot have read a diff that does not exist yet.
-Discard its findings entirely rather than reading them as evidence: open nothing
-in the ledger, preempt nothing, and never route its blockers into a fix
-dispatch. Treat it exactly as a reviewer error before delivery, and say in one
-line that the review is being discarded and why. A void verdict is often
-fluent and specific — a stale diff supports confident claims about missing work
-— so the check is the timing, never how convincing the text reads.
-
-**Every path above that ends an early launch before its real pass starts also
-drops the row it was given** — cancellation, a reviewer error before delivery,
-and a void verdict alike:
+Every path that ends an early launch before its real pass starts also drops the
+row it was given:
 
 `python3 ~/.claude/scripts/delegate/progress_history.py disarm-review --session-dir "${SESSION_DIR}" --reason "<canceled|reviewer error|void verdict>"`
 
@@ -1625,19 +1334,15 @@ Use <UserFacingText/> and emit:
 Summary and reference numbers must match. A reader should not need the plan,
 diff, reviews, or finding ids.
 
-**Close every delegation result with the current progress header** — all three
-tables and the wall-clock line, produced by <ProgressContract/> steps 3 and 5 with the
-current pass or activity. This is not conditional on what the result led to. A
-review that came back clean, a fix that landed, a verification that passed, and
-a pass that ends the phase all close the same way as one that launches a repair;
-so does a turn that only re-arms the timer. The numbered items say what
-happened, and the tables say how far into the phase and the plan it happened —
-and the tables are the half the user cannot reconstruct for themselves. A result
-that ends in a dispatch is where they are worth the most, so emit the header
-after the launch and after the timer is armed. Print it below the sections
-above, exactly as the recorder emits it. Should the recorder answer that no
-window is open, the launcher has not recorded its pass yet: try once more, then
-continue without the tables rather than stalling the turn.
+**Close every delegation result with the current progress header** — both tables
+and the wall-clock line, produced by <ProgressContract/> steps 3 and 5 with the
+current pass or activity. This is unconditional: the numbered items say what
+happened, and the tables say how far into the phase and the plan it happened,
+which is the half the user cannot reconstruct. Emit it after any launch and
+after the timer is armed, printed below the sections above exactly as the
+recorder emits it. Should the recorder answer that no window is open, the
+launcher has not recorded its pass yet: try once more, then continue without the
+tables rather than stalling the turn.
 </DelegationResultFormat>
 
 <FixDispatch>
@@ -1673,13 +1378,11 @@ implement.sh "${SESSION_DIR}" "${WORKING_DIR}" \
 Each seat records the work it was assigned: the repairing seat `fix`, the test
 seat `test`, the review seat `review`.
 
-**`PLAN_DELEGATE_RESOLVES_ROUND=1` goes on exactly one seat**, and it is what
-marks the repair round landed. Only the launcher watches the worker exit, so only
-a launcher can say a repair landed; asking the orchestrator to record it later
-leaves a gap it can be killed or compacted inside, and that gap used to resolve
-as "fixed". Two seats carrying the signal would resolve one round twice over.
-The signal is separate from the kind precisely so a second repairing seat can
-record `fix` honestly without performing the resolution.
+**`PLAN_DELEGATE_RESOLVES_ROUND=1` goes on exactly one seat.** Only the launcher
+watches the worker exit, so only a launcher can say a repair landed; two seats
+carrying the signal would resolve one round twice over. The signal is separate
+from the pass kind precisely so a second repairing seat can record `fix`
+honestly without performing the resolution.
 
 Apply <DispatchContract/>; set `EARLY_REVIEW=none` at dispatch, and close the
 turn with the progress header per <DelegationResultFormat/>. While a fix runs
@@ -1689,19 +1392,14 @@ reviewer early.
 **A contained repair closes without a delegate review.** Apply
 <ReviewDiffContract/> and read the repair diff yourself. When every hunk sits in
 a path the batch's own findings named — or in a new file one of those paths
-creates — record each verdict directly and continue to <Synthesize/>. A second
-reader buys nothing there: the closure question is only whether the named line
-changed as the finding intended, and every line of the diff is in a file the
-main pass just read for that finding. Containment is the whole test, which is
-why no separate classification of the repair decides it: a behavior-preserving
-repair simply always satisfies the same containment test anyway.
+creates — record each verdict directly and continue to <Synthesize/>.
 
 Dispatch the normal <DualReview/> closure review whenever the repair leaves that
 boundary or the diff cannot answer the question: an edited path no finding
 named, a caller or consumer pulled in, a changed signature, registration, or
 invariant reaching past the batch, an id whose verdict reads unclear, or a new
-defect the repair introduced. Uncertainty routes to the reviewer. The test is
-what the diff touched, never how confident the reading felt.
+defect the repair introduced. Uncertainty routes to the reviewer. Judge the
+paths the diff touched, never how confident the reading felt.
 
 On completion, `implemented` continues as above; `error` applies
 <RetainDelegatedPhaseReservation/>, reports the fix log, records an error
@@ -1763,41 +1461,13 @@ checkpoint but is batched at <FinalGate/> and reported by <RunSummary/>.
 </RunApplicationSmokeTest>
 
 <RunProjectStyleReview>
-The run's single style audit, over everything the project built rather than one
-phase. Required exactly once when the reviewed diff contains `.rs`,
-`Cargo.toml`, or `Cargo.lock`. The actual diff, not `${STYLE_GATE_CONFIG}`,
-decides applicability. Phases never run it: they carry no style gate, and a
-phase checkpoint never waits on one.
-
-- `single`: after behavioral convergence and first smoke, before phase review.
-  The reviewed range is the working tree, tracked and untracked.
-- Loop and verbose: from <FinalGate/>, once the whole plan is verified green.
-  The reviewed range is `${STYLE_DIFF_BASE}..` — every commit the project
-  landed on this branch plus the current working tree.
-
-1. If `STYLE_REVIEW_DONE=true` or the marker exists, restore true and continue.
-2. Loop and verbose with an empty `STYLE_DIFF_BASE` have no branch to diff:
-   set true, write `not applicable — no diff base` to the marker, and report
-   that the run ends without a style review.
-3. Build the reviewed diff, including untracked paths. With no Rust/Cargo
-   changes in it, set true and write `not applicable` to the marker. Stop if
-   the style pass would reach Rust/Cargo work the project did not write.
-4. Save combined diff/status to `${SESSION_DIR}/style_review_before.diff` and
-   `${SESSION_DIR}/style_review_before.status`, announce the single cleanup and
-   the range it covers, and invoke the `clippy` skill inline as
-   `style-only auto-proceed` — for loop and verbose, as
-   `style-only auto-proceed since ${STYLE_DIFF_BASE}`. `Off`, error, or
-   unresolved choice blocks completion.
-5. On successful review, set true and write the result to the marker before any
-   cleanup verification. Never clear it during later fixes.
-6. Save `${SESSION_DIR}/style_review_after.diff` and
-   `${SESSION_DIR}/style_review_after.status`, compare them with the before
-   snapshots, and read every style-induced hunk. If Rust/Cargo changed, rerun
-   `verify.sh test` and `lint` for every affected package. Failures use normal
-   finding/fix routing.
-7. If cleanup reached runnable code, reset smoke to `not_run` and rerun
-   <RunApplicationSmokeTest/>. The guard skips this section on return.
-8. Continue to <RunPhaseReview/> for `single`, or back to <FinalGate/>.
+Read `~/.claude/commands/plan/delegate_style.md` in full and apply it. This is
+the run's single style audit, over everything the project built rather than one
+phase: `single` runs it after first smoke, loop and verbose from <FinalGate/>.
+Phases never run it — they carry no style gate, and a phase checkpoint never
+waits on one. Never run it from memory of an earlier read; the after-cleanup
+reverification and the smoke reset are what get dropped. The user can invoke the
+same file as `/plan:delegate_style`.
 </RunProjectStyleReview>
 
 <RunPhaseReview>
@@ -1854,263 +1524,26 @@ work skips this section.
 </RunPhaseShrink>
 
 <ConsiderNextItems>
-Phased plans only. The main agent performs this assessment; do not launch another
-agent. After shrink, read the current `As-built` block, phase diff,
-`${SESSION_DIR}/phase_review_outcomes_<phase>.md`, remaining `todo` Work Orders,
-`${SESSION_DIR}/next_item_amendments_<phase>.md` when present, and
-`${NEXT_ITEMS_PATH}` when it exists. Inspect targeted in-scope consumer or crate
-code only when those sources cannot confirm a candidate.
-
-A candidate must be needed for the plan's broader outcome and target an
-in-scope consumer named by Delegation Context, the crate's API/implementation,
-or a crate example. Exclude a current-phase defect, work already owned by a
-remaining Work Order, and optional polish or an idea that is not required.
-Current-phase defects return to <Synthesize/>.
-
-Each new candidate is an `add` proposal with title, target, need, completion
-condition, and source phase. Import each architect proposal as `amend` or
-`remove` with its exact current item, replacement, reason, and source phase, then
-delete its amendment artifact. Deduplicate all proposals by action, target, and
-observable outcome against `${NEXT_ITEMS_PATH}` and `${NEXT_ITEMS_PENDING}`.
-
-**Then split the proposals into `apply` and `gate`.** The gate costs the user a
-turn, so it is spent only where there is something to decide. This file is a
-backlog: writing an item into it commits nobody to building it, and the decision
-that matters happens later, when an item is scheduled into a phase. Rewriting a
-backlog record so it describes the code that now exists is the same operation
-`/plan:shrink` and `/plan:to_as_built` perform on completed phases — an as-built
-correction, never a decision. What earns a gate here is a judgment about what is
-worth doing, not the maintenance of a record.
-
-A proposal is **`apply`** — do it now, do not ask — when the shipped code decides
-it:
-
-- Any `add`. A new backlog item records that something may be worth doing. It
-  changes no phase, no schedule, and no commitment.
-- Any `amend`. A drifted file or line reference, a re-key onto a type a phase
-  introduced, a re-target at the crate that now owns the work, a capability
-  moved out because a phase absorbed it, a restatement of what would satisfy the
-  item now that the surrounding code has changed — all of it is as-built
-  maintenance of a record nobody has committed to building. Cite the evidence in
-  the one-line report and move on. An `amend` is never gated for being large,
-  for changing what the item asks for, or for changing what would satisfy it.
-- A `remove` the shipped code has already satisfied. The item asked for
-  something that now exists; deleting it records that fact.
-
-A proposal is **`gate`** — ask the user — only when it rests on judgment rather
-than evidence: a `remove` proposed because the work looks not worth doing, out
-of scope, or superseded by a direction nobody has taken yet. That is a product
-call and nothing here may make it.
-
-When the split is genuinely unclear, apply it — a wrong backlog edit is one line
-to revert, and every item is re-read before it is ever scheduled. Never write a
-`gate` proposal to the repository without approval.
-
-**A defect in what this phase just shipped is never an `add`.** Filing it as
-future work converts a fix into a backlog entry the user must later approve, read,
-and schedule — three costs where there was one. Route it to <Synthesize/> and fix
-it in this phase, even when no remaining Work Order names the files it touches:
-Work Order **Files** lists scope the plan predicted, not permission to edit.
-
-Apply every `apply` proposal to `${NEXT_ITEMS_PATH}` now, in one edit, and report
-them as a single line naming the count and the file — not as a list, and never as
-a question. They never enter `${NEXT_ITEMS_PENDING}`, never appear in the block
-below, and never hold an auto window open.
-
-Only `gate` proposals reach the gate. If a bounded auto window continues after
-this phase, return immediately without reporting or asking. `next N` continues
-when N is greater than 1; `through X` continues until the current phase is X. At
-an ordinary phase boundary or the last phase of an auto window, continue
-silently when `${NEXT_ITEMS_PENDING}` is absent or empty; otherwise present all
-pending candidates once:
-
-```
-## Items to consider
-
-1. **<Amend | Remove>: <title>**
-   **Target:** <in-scope consumer | crate | crate example>
-   **Current:** <exact existing item>
-   **Proposed:** <replacement, or removal>
-   **Why:** <missing capability or changed evidence>
-   **Completion condition:** <observable result; amend only>
-
-Reply `approve <numbers>`, `revise <number>: ...`, or `reject <numbers>`.
-```
-
-Every `gate` proposal requires a disposition. Feedback revises it and requires
-re-presentation; questions preserve the gate. Apply approved actions only:
-replace the exact quoted item for `amend`, and delete the exact quoted item for
-`remove`. If a target no longer matches, refresh and re-present it. Preserve
-existing content and create this structure only when an `add` lands in a file
-that does not exist:
-
-```
-# <plan title> — Next
-
-## Items to consider
-
-- [ ] **<title>**
-  - Target: <in-scope consumer | crate | crate example>
-  - Why needed: <missing capability>
-  - Completion condition: <observable result>
-  - Revealed by: Phase <id>
-```
-
-Remove resolved entries from `${NEXT_ITEMS_PENDING}` and delete it when empty.
-A rejected add does not enter the repository; a rejected amendment leaves the
-existing item unchanged. In loop/verbose, an approved file change joins the
-current phase checkpoint; in `single`, it remains uncommitted. The boundary gate
-occurs before the last auto phase's checkpoint, never between auto phases.
+Read `~/.claude/commands/plan/delegate_next.md` in full and apply it after
+shrink, at each phase boundary. Phased plans only; the main agent performs the
+assessment and never launches another agent for it. Never work from memory of an
+earlier read — `Class` obedience and the single-line reporting rule are what
+drift. The user can invoke the same file as `/plan:delegate_next`.
 </ConsiderNextItems>
 
 <CheckpointCommit>
-Loop/verbose only:
+Read `~/.claude/commands/plan/delegate_checkpoint.md` in full and apply it once
+per completed phase. Loop and verbose only; `single` never commits.
 
-1. Require smoke pass, `not applicable`, or `deferred`. Style is not a phase
-   gate: <RunProjectStyleReview/> runs once at <FinalGate/>, over every
-   checkpoint this one joins.
-2. Confirm status contains only this phase, its plan doc, and an approved change
-   to `${NEXT_ITEMS_PATH}` when present.
-3. Run `verify.sh fmt <package>` for every touched package; include resulting
-   formatting changes.
-4. Mark the phase `status: done`. Never put its commit hash in the plan.
-5. Read and validate
-   `${SESSION_DIR}/delegated_phase_reservation_state.json`; do not use a value
-   remembered from conversation or the harness-session mapping. For `Active`,
-   require its phase to be current and run `/sync check` as drift's full
-   phase-start comparison exactly once:
+This is durable state with no cheap undo, so read the whole contract before
+acting on any part of it, and read the reservation record from disk. A value
+remembered from conversation, taken from the harness session mapping, or
+re-derived from current `HEAD` is not proof and will silently accept the wrong
+checkpoint. The user can invoke the same file as `/plan:delegate_checkpoint`.
 
-   ```sh
-   PYTHONPATH="$HOME/.claude/scripts" python3 -m berth.claim_state invoke \
-     --cwd "${WORKING_DIR}" --expected-verb drift -- drift --full --json
-   ```
-
-   Require a validated exit-`0` drift result with `payload.kind = drift`,
-   `payload.data.comparison = full_phase_start`, and exactly one
-   `payload.data.results` entry. That entry's `reservation_id` must equal the
-   `reservation_id` in the durable `ActivePhaseReservation`; bind the result to
-   that record's `phase_start_head`, because `full_phase_start` means the engine
-   compared the selected reservation against its protected phase-start
-   baseline. The response does not echo that object id, so do not invent an OID
-   field or re-derive acting identity. An exit-`5` `invalid_input` response whose
-   diagnostic says drift requires a live session mapping, active coordination-run
-   marker, or `CARGO_BERTH_RUN` is the `Unidentified` identity case. That case,
-   no result, more than one result, a different reservation id, any comparison
-   other than `full_phase_start`, an incursion, collision, attribution
-   requirement, absent/corrupt ledger, or malformed response is identity
-   ambiguity or unsafe drift and blocks the checkpoint. Apply
-   <RetainDelegatedPhaseReservation/> and report the exact full-drift command
-   above so a person can run it to see the conflict. The cheap drift delta is
-   forbidden here. Exit `6` has already spent the engine's single ten-second
-   deadline: invoke no retry, retain the reservation, and name that same exact
-   full-drift command. The two inactive states skip drift because they own no
-   reservation. `CheckpointCommittedAwaitingReleaseConfirmation` is valid here
-   only as a resumed state that routes directly to step 7; it does not re-enter
-   drift or checkpoint creation.
-6. Stage the phase, its plan doc, and `${NEXT_ITEMS_PATH}` when approved and
-   changed; commit exactly once:
-
-   ```
-   checkpoint(<plan-slug>): phase N — <title>
-
-   <what the phase built>
-
-   Claude-Session: <session url>
-   ```
-
-   A failed commit is an unsuccessful ending: do not invoke release, leave
-   `Active` untouched, and apply <RetainDelegatedPhaseReservation/>. After a
-   successful commit, for `Active`, immediately capture the full output of
-   `git rev-parse HEAD`, atomically replace the `Active` record with
-   `CheckpointCommittedAwaitingReleaseConfirmation` carrying that value as
-   `checkpoint_commit`, and read the new record back. This durable transition
-   must succeed before invoking release. The new state comes only from the
-   commit that just succeeded, never from conversation or from a later reading
-   of `HEAD`. If capture, atomic replacement, or read-back fails, do not invoke
-   release and apply <RetainDelegatedPhaseReservation/> to whichever valid
-   durable state remains.
-7. Read and validate the durable record. For
-   `CheckpointCommittedAwaitingReleaseConfirmation`, read its reservation id
-   and `checkpoint_commit` from the read-back
-   `CheckpointReleaseConfirmationPending` and invoke `/sync release` exactly
-   once. An `Active` record at this step means step 6's durable transition did
-   not complete: do not invoke release and apply
-   <RetainDelegatedPhaseReservation/>.
-
-   ```sh
-   PYTHONPATH="$HOME/.claude/scripts" python3 -m berth.claim_state invoke \
-     --cwd "${WORKING_DIR}" --expected-verb release -- \
-     release <recorded-reservation-id> --json
-   ```
-
-   Do not pass a commit: `release` snapshots the invoking worktree's current
-   HEAD. Require exit `0`, envelope status `outstanding`, release payload status
-   `checkpointed`, the requested reservation id, and
-   `payload.data.protected_tip` equal to the durable record's read-back
-   `checkpoint_commit`. Also require its
-   `payload.data.session_mapping_publication`; report its `unavailable`
-   diagnostic without treating the journalled checkpoint as absent. Those are
-   the first-attempt assertions and are not weakened by recovery.
-
-   A resumed session obtains `checkpoint_commit` by reading the durable record,
-   never by re-deriving it from current `HEAD`. `HEAD` is not proof: a later
-   commit in the same worktree would silently supply the wrong answer and make
-   the comparison accept the wrong checkpoint.
-
-   A process kill, crash, or power loss can retain the durable record after the
-   `Checkpoint` operation was appended but before this workflow observed the
-   reply. On a later recovery from that retained record, invoke the same release
-   once. If it returns exit `0`, names the requested reservation, and has release
-   payload status `resnapshotted`, `evidence_revalidated`, or `released` instead
-   of `checkpointed`, invoke the named reservation lifecycle query below.
-   `resnapshotted` has envelope status `outstanding`; `evidence_revalidated` can
-   legitimately have `outstanding`, `integrated`, `trunk_rewritten`, or
-   `object_unknown` because its envelope status reports current integration
-   evidence, not reservation lifecycle. Evidence replay preserves the
-   `outstanding` lifecycle and its original protected tip. Do not gate recovery
-   on envelope status: the named reservation lifecycle query must establish the
-   current lifecycle and protected-tip equality with the journalled checkpoint.
-
-   ```sh
-   PYTHONPATH="$HOME/.claude/scripts" python3 -m berth.claim_state reservation \
-     --cwd "${WORKING_DIR}" --reservation <recorded-reservation-id>
-   ```
-
-   Inspect the validated coordinator `state`, which is derived from
-   `envelope.payload.data` without reading `message`. Exit `0` requires
-   `kind = reservation_lifecycle`, the requested `reservation_id`, and exactly
-   one lifecycle alternative: `active`; `outstanding` with `protected_tip`;
-   `released_after_checkpoint` with `protected_tip` and `disposition`; or
-   `released_without_checkpoint` with `disposition`. Exit `5` is valid only for
-   `kind = unknown_reservation` carrying the requested `reservation_id`.
-
-   `outstanding` with `protected_tip` equal to the durable record's read-back
-   `checkpoint_commit` confirms that the same checkpoint release is already
-   journalled. `released_after_checkpoint` with the same protected tip also
-   confirms that release, followed by the reported terminal disposition; report
-   it as recovered and subsequently released. A different protected tip is
-   another release and must retain the record. `active`,
-   `released_without_checkpoint`, `unknown_reservation`, a mismatched echoed id,
-   or a busy, unreadable, malformed, or otherwise invalid response retains the
-   record with that distinct reason. Do not consult the retention ref: it proves
-   commit reachability but not whether the selected reservation is outstanding
-   or released.
-
-   Report a matching checkpoint as recovered rather than re-made.
-   Only after the first-attempt structured assertions or these recovery
-   assertions pass, delete
-   `${SESSION_DIR}/delegated_phase_reservation_state.json`.
-
-   An ordinary failed release did not append anything because transaction
-   validation precedes the journal write; it is not recovery and the original
-   first-attempt assertions still apply when it is run again. At the moment of
-   any busy or failed release, invoke no retry and apply
-   <RetainDelegatedPhaseReservation/>. The checkpoint commit exists, but the
-   phase does not complete until a later invocation confirms either the normal
-   first-attempt reply or the matching already-journalled checkpoint above. The
-   two inactive states invoke no release.
-8. Report `Checkpoint <short hash> — phase N: <title>.` Never push here. This
-   report follows successful release when the phase was active.
+Never push here. The phase does not complete until the reservation release is
+confirmed, so a failed or busy release applies
+<RetainDelegatedPhaseReservation/> rather than a retry.
 </CheckpointCommit>
 
 <DiscardPhaseReviewText>
@@ -2118,10 +1551,9 @@ After <RunPhaseShrink/> and a successful checkpoint when one applies, run:
 
 `bash ~/.claude/scripts/delegate/clear_phase_review.sh "${SESSION_DIR}" <phase-id>`
 
-This removes raw review prompts, findings, logs, and the temporary retrospective
-and outcome files. Do not clear them before shrink succeeds or while a checkpoint
-can still fail. Structured progress history remains; no review prose remains in
-the plan or phase scratch files.
+The script removes only this phase's review prose; structured progress history
+remains. Do not clear before shrink succeeds or while a checkpoint can still
+fail.
 </DiscardPhaseReviewText>
 
 <RecordPhaseCompletion>
@@ -2143,123 +1575,14 @@ modes continue.
 </RecordPhaseCompletion>
 
 <VerbosePostPhaseReport>
-After a completed verbose phase outside an auto window, report only that phase
-from its reviewed diff, accepted fixes, `As-built` block, and checkpoint. Inside
-an active window, emit no per-phase report; when the window's last phase
-completes, emit one <CombinedWindowReport/> instead of per-phase reports.
-
-Single-phase report:
-
-```
-## Phase N complete — <title>
-
-### Why this phase exists
-[purpose and deliberate boundary]
-
-### What now works
-[reviewed behavior]
-
-### Important types and APIs
-| Type / trait / API | Status | Role | System relationship |
-| --- | --- | --- | --- |
-
-### Verification and review
-[gate, meaningful tests/lint, review/fixes, smoke]
-
-**Checkpoint:** `<short hash>`
-
-### What remains
-[phases remaining out of the plan total, then the auto-together recommendation]
-```
-
-Use the diff over planned claims. Include only load-bearing new/materially
-changed types; use the same statuses as <PhaseBriefing/>, write every cell under
-<TypeTableCells/>, and say when none exist.
-Everything above `### What remains` describes only the completed phase.
-
-<CombinedWindowReport>
-One report covering every phase the window ran, built from the same sources as
-the single-phase report. Keep it succinct and plain-spoken — ordinary sentences
-a reader away from the details can follow — while still naming types, modules,
-and crates exactly. Describe what the window built as one piece of work, not a
-per-phase replay:
-
-```
-## Phases N–M complete — <window summary title>
-
-### What now works
-[combined reviewed behavior across the window]
-
-### Important types and APIs
-| Phase | Type / trait / API | Status | Role | System relationship |
-| --- | --- | --- | --- | --- |
-
-### Verification and review
-[one combined summary; call out only per-phase results that differed]
-
-**Checkpoints:** phase N `<short hash>`, …, phase M `<short hash>`
-
-### What remains
-[same content as the single-phase report]
-```
-
-Unify the types into that single table with its `Phase` column — never one
-table per phase. Include only load-bearing new/materially changed types across
-the whole window, using the <PhaseBriefing/> statuses and <TypeTableCells/>;
-say when none exist.
-<RemainingWorkOutlook/> applies to `### What remains` unchanged.
-</CombinedWindowReport>
-
-<RemainingWorkOutlook>
-`### What remains` is the one place the report looks forward. It states what is
-left and whether the next phases are safe to run without stopping between them.
-It never briefs a phase and never asks for authorization; <VerbosePostPhaseGate/>
-owns the ask.
-
-**Count.** Read it from
-
-`python3 ~/.claude/scripts/delegate/progress_history.py phase-count --plan-doc "<plan>"`
-
-and report its `todo` and `total`. Never count phases by hand or by grep: a
-heading takes three forms over its life and any pattern keyed on `status:`
-silently ignores every shrunk phase, which is the mistake <ProgressContract/>
-records. When `todo` is zero, say the plan is out of phases and that final
-workspace verification runs next; skip the recommendation.
-
-**Recommendation.** Read the Work Orders of the next todo phases in order, up to
-three. A consecutive run is auto-together only while every phase in it:
-
-- carries no unresolved `**Pending decision:**` block — that phase stops the run
-  at its own pre-dispatch check whatever the window says;
-- extends a subsystem shipped by a `done` phase rather than opening a new one;
-- has an acceptance gate that runs unattended, with no smoke action needing the
-  user;
-- and does not depend on an outcome only knowable once an earlier phase in the
-  run has actually landed.
-
-The run ends at the first phase failing any of these. Name that phase and the
-one reason it stops there. When the very next phase fails a test, recommend that
-single phase; never round the window up to a phase you would then have to
-interrupt. Cap the recommendation at three phases even when more would qualify,
-so a batch briefing stays readable.
-
-When the only criterion stopping a longer window is an unresolved
-`**Pending decision:**` block on a covered phase, and the phases otherwise
-cohere enough that running them together is clearly desirable, say so and offer
-to surface those decision questions now: answering them here resolves the
-blocks and lets the next auto control cover the full run. Before bringing a
-decision forward, apply <DecisionEconomy/>: decide any with an obviously better
-answer yourself and bring only true, substantive tradeoffs. Ask only the
-blocking questions; the batch briefing still owns briefing the phases.
-
-Write it as two or three sentences of ordinary English under <UserFacingText/> —
-what the next phases do, why they group or do not — and always end with the
-concrete control to type: `auto through phase X` with the actual phase number,
-or `proceed` when only the single next phase qualifies. Never leave the number
-for the user to work out. This closing control line is required in every
-single-phase and combined-window report while todo phases remain. Do not emit a
-table, a per-phase criteria checklist, or the criteria vocabulary above.
-</RemainingWorkOutlook>
+Read `~/.claude/commands/plan/delegate_phase_report.md` in full and apply it
+after a completed verbose phase outside an auto window. Inside an active window,
+emit no per-phase report; when the window's last phase completes, emit one
+combined report instead. That file defines this contract,
+<CombinedWindowReport/>, and <RemainingWorkOutlook/>. Never compose the report
+from memory of an earlier read — the phase count and the closing control line
+are what go missing. The user can invoke the same file as
+`/plan:delegate_phase_report`.
 </VerbosePostPhaseReport>
 
 <VerbosePostPhaseGate>
@@ -2364,7 +1687,7 @@ Emit on every multi-phase ending:
 **Deferred decisions still open:** [phase + decision, or none]
 **Reservation disposition:** [checkpointed and outstanding, retained with the
 reason this run stopped, or coordination not active]
-**Why the run stopped:** [complete, user stop, pending decision, convergence reason, or error]
+**Why the run stopped:** [complete, user stop, pending decision, or error]
 ```
 
 Apply <UserFacingText/> and <RetainDelegatedPhaseReservation/> for every ending
