@@ -60,6 +60,10 @@ PASS_STAGE: dict[str, str] = {
     "arch": "implementation",
 }
 ACTIVITY_STAGE: dict[str, str] = {
+    # An activity may name its own stage outright; these are not aliases.
+    "implementation": "implementation",
+    "fix": "fix",
+    "review": "review",
     "verification": "test",
     "verify": "test",
     "test": "test",
@@ -75,6 +79,49 @@ ACTIVITY_STAGE: dict[str, str] = {
     "triage": "final",
 }
 STAGE_ORDER: list[str] = ["implementation", "review", "fix", "test", "final", "other"]
+ACTIVITY_ALIASES: dict[str, str] = {
+    # One activity, five spellings, all of it plan fold-in.
+    "fold": "plan update",
+    "fold in": "plan update",
+    "plan fold": "plan update",
+    "plan fold-in": "plan update",
+    "plan fold-back": "plan update",
+    "plan reconcile": "plan update",
+    "plan revision": "plan update",
+    "plan edits": "plan update",
+    "plan": "plan update",
+    # Named for the stage they are, not a stage of their own.
+    "implement": "implementation",
+    "team review": "review",
+    "as-built": "shrink",
+    "closure": "closeout",
+    "phase closeout": "closeout",
+}
+ROUND_SUFFIX = re.compile(r"\s+\d+$")
+
+
+def _clean_label(label: str) -> str:
+    """An activity label with its round number and spelling drift removed.
+
+    Labels are free text an orchestrator writes, so the same activity arrives as
+    `fix`, `fix 1` and `fix 4`, and plan fold-in has five spellings. Grouping on
+    the raw string scatters one activity across a dozen one-row buckets that all
+    fall to `other`. Normalising at read time keeps the stored events untouched.
+    """
+    cleaned = ROUND_SUFFIX.sub("", label.strip())
+    return ACTIVITY_ALIASES.get(cleaned, cleaned)
+
+
+def _clean_task(task: str) -> str:
+    """A task name without its skill prefix, so it matches agents.conf keys.
+
+    The ledger holds both `delegate.escalation` (1089) and bare `escalation`
+    (21) for one tier. Stripping the prefix collapses them and leaves exactly
+    the names agents.conf uses -- implementation, review, architect, mechanical,
+    escalation -- so config and history speak the same words.
+    """
+    prefix, _, rest = task.partition(".")
+    return rest if rest and prefix == "delegate" else task
 GROUP_KEYS: list[str] = [
     "skill",
     "stage",
@@ -325,7 +372,7 @@ def _normalize(
         seconds = _integer(event.get("pass_elapsed_seconds"))
         started = _number(event.get("pass_started_at"))
         agent = _agent_label(event, "called_agent")
-        task = _string(event.get("called_task"))
+        task = _clean_task(_string(event.get("called_task")))
         result = ""
         # The adopted early review is folded into the pass it became rather
         # than emitted as its own row: it is one round, and a second row would
@@ -336,6 +383,7 @@ def _normalize(
             started = started - lead if started > 0 else started
     elif event_type == "activity_finished":
         label = _string(event.get("activity_label")).strip().lower()
+        label = _clean_label(label)
         stage = ACTIVITY_STAGE.get(label, "other")
         seconds = _integer(event.get("activity_elapsed_seconds"))
         started = _number(event.get("activity_started_at"))
@@ -343,7 +391,7 @@ def _normalize(
         # task; `main_agent` on them is the orchestrator that dispatched the
         # work, not whoever did it.
         agent = _agent_label(event, "called_agent") or _agent_label(event, "main_agent")
-        task = _string(event.get("called_task"))
+        task = _clean_task(_string(event.get("called_task")))
         result = _string(event.get("activity_result"))
     elif event_type == "stage_finished":
         # The spine's own event, for skills instrumented after delegate. It
