@@ -315,9 +315,9 @@ class ProgressHistoryTests(unittest.TestCase):
                 "",
                 "**Phase 3: Retry handling**",
                 "",
-                "| Round | Impl   | Test | Review | Start    | Elapsed | Result  |",
-                "| ----- | ------ | ---- | ------ | -------- | ------- | ------- |",
-                "| Fix 2 | fix 1m | -    | -      | 05:33:30 | 1m      | running |",
+                "| Round | Agent 1 | Agent 2 | Agent 3 | Start    | Elapsed | Result  |",
+                "| ----- | ------- | ------- | ------- | -------- | ------- | ------- |",
+                "| Fix 2 | fix 1m  | -       | -       | 05:33:30 | 1m      | running |",
                 "",
                 "▸ **Fix 2 - correcting retry recovery**",
                 "**now 1970-01-01 05:35:00 - next report 05:38:00**",
@@ -1276,7 +1276,7 @@ class ProgressHistoryTests(unittest.TestCase):
         header = self.run_progress(session_dir, 47_100)
         rows = self.table_rows(
             header,
-            ["Round", "Impl", "Test", "Review", "Start", "Elapsed", "Result"],
+            ["Round", "Agent 1", "Agent 2", "Agent 3", "Start", "Elapsed", "Result"],
         )
         # One row, because the three seats are working one round. Each carries
         # its own elapsed: they launch together but do not finish together, and
@@ -1304,7 +1304,7 @@ class ProgressHistoryTests(unittest.TestCase):
         self.team_slot = ""
         rows = self.table_rows(
             self.run_progress(session_dir, 50_540),
-            ["Round", "Impl", "Test", "Review", "Start", "Elapsed", "Result"],
+            ["Round", "Agent 1", "Agent 2", "Agent 3", "Start", "Elapsed", "Result"],
         )
         # One row. Before the register/handoff split this rendered four: a
         # near-empty row per launch -- 0s, 2s, 2s -- and then the real one.
@@ -1333,7 +1333,7 @@ class ProgressHistoryTests(unittest.TestCase):
         header = self.run_progress(session_dir, 49_800)
         rows = self.table_rows(
             header,
-            ["Round", "Impl", "Test", "Review", "Start", "Elapsed", "Result"],
+            ["Round", "Agent 1", "Agent 2", "Agent 3", "Start", "Elapsed", "Result"],
         )
         # One round, three shapes. The label names the round once: a repeat on
         # the continuation rows would read as three rounds rather than as one
@@ -1354,9 +1354,9 @@ class ProgressHistoryTests(unittest.TestCase):
         # seat carries its last board line and that line's age, because a role
         # alone -- and an open pass window, which grows either way -- cannot say
         # whether a seat is working or has been silent since it took the role.
-        for slot in ("impl", "test", "review"):
+        for label, slot in (("Agent 1", "impl"), ("Agent 2", "test"), ("Agent 3", "review")):
             self.assertIn(
-                f"- **{slot}** gpt-called high · 3m ago · handoff: converging",
+                f"- **{label}** ({slot}) gpt-called high · 3m ago · handoff: converging",
                 header,
             )
 
@@ -1373,7 +1373,7 @@ class ProgressHistoryTests(unittest.TestCase):
         header = self.run_progress(session_dir, 48_400)
         rows = self.table_rows(
             header,
-            ["Round", "Impl", "Test", "Review", "Start", "Elapsed", "Result"],
+            ["Round", "Agent 1", "Agent 2", "Agent 3", "Start", "Elapsed", "Result"],
         )
         self.assertEqual(
             [(row[0], row[1], row[6]) for row in rows],
@@ -1679,9 +1679,9 @@ class ProgressHistoryTests(unittest.TestCase):
         )
         rows = self.table_rows(
             header,
-            ["Round", "Impl", "Test", "Review", "Start", "Elapsed", "Result"],
+            ["Round", "Agent 1", "Agent 2", "Agent 3", "Start", "Elapsed", "Result"],
         )
-        # The recruited reviewer reads `impl` under the Review column: the seat
+        # The recruited reviewer reads `impl` under Agent 3: the seat
         # keeps its identity and its column, and only the role in the cell moves.
         # Test and review have registered without opening a pass yet, so they
         # report the role the board knows and no duration, which is the part that
@@ -1706,7 +1706,7 @@ class ProgressHistoryTests(unittest.TestCase):
         self.team_slot = ""
         rows = self.table_rows(
             self.run_progress(session_dir, started_at + 400),
-            ["Round", "Impl", "Test", "Review", "Start", "Elapsed", "Result"],
+            ["Round", "Agent 1", "Agent 2", "Agent 3", "Start", "Elapsed", "Result"],
         )
         # The board knows these two roles after the round closes exactly as it
         # did while the round ran. Blanking them once it ends would render every
@@ -1735,9 +1735,9 @@ class ProgressHistoryTests(unittest.TestCase):
         # The age is the whole point: a seat four minutes into one activity and a
         # seat that has said nothing read differently, where two identical role
         # words in the table do not.
-        self.assertIn("- **impl** gpt-called high · 3m ago · rerunning the scoped test", header)
-        self.assertIn("- **test** · 4m ago · writing the token race test", header)
-        self.assertIn("- **review** gpt-called high · no board line yet", header)
+        self.assertIn("- **Agent 1** (impl) gpt-called high · 3m ago · rerunning the scoped test", header)
+        self.assertIn("- **Agent 2** (test) · 4m ago · writing the token race test", header)
+        self.assertIn("- **Agent 3** (review) gpt-called high · no board line yet", header)
 
     def test_a_finished_seat_keeps_its_own_last_words_under_the_launcher_done(self) -> None:
         """The launcher's exit post names the kind; the seat's narration names the work."""
@@ -1773,10 +1773,10 @@ class ProgressHistoryTests(unittest.TestCase):
         self.team_slot = ""
         header = self.run_progress(session_dir, started_at + 300)
         self.assertIn(
-            "- **test** gpt-called high · 40s ago · done: hana_catalyst tests 240 passed", header
+            "- **Agent 2** (test) gpt-called high · 40s ago · done: hana_catalyst tests 240 passed", header
         )
         self.assertIn(
-            "- **impl** gpt-called high · 30s ago · done: fix finished; summary at impl_summary_impl.txt",
+            "- **Agent 1** (impl) gpt-called high · 30s ago · done: fix finished; summary at impl_summary_impl.txt",
             header,
         )
 
@@ -1855,7 +1855,7 @@ class ProgressHistoryTests(unittest.TestCase):
         )
         rows = self.table_rows(
             header,
-            ["Round", "Impl", "Test", "Review", "Start", "Elapsed", "Result"],
+            ["Round", "Agent 1", "Agent 2", "Agent 3", "Start", "Elapsed", "Result"],
         )
         # No board and no seat on the pass: the window sits in no round, so it
         # renders on its own the way every solo run always has, drawn in the
@@ -1998,7 +1998,7 @@ class ProgressHistoryTests(unittest.TestCase):
         )
         rows = self.table_rows(
             header,
-            ["Round", "Impl", "Test", "Review", "Start", "Elapsed", "Result"],
+            ["Round", "Agent 1", "Agent 2", "Agent 3", "Start", "Elapsed", "Result"],
         )
         # A solo run records no seat, so every window keeps a row and the
         # per-window finding attribution it always had.
@@ -2014,7 +2014,7 @@ class ProgressHistoryTests(unittest.TestCase):
             ],
         )
         # A slotless pass is drawn in the seat its kind names -- the closure
-        # review under Review, where a reader looks for it -- and a main-agent
+        # review under Agent 3, where a reader looks for it -- and a main-agent
         # activity names no seat and keeps three dashes.
         self.assertEqual(
             [tuple(row[1:4]) for row in rows],
@@ -2103,7 +2103,7 @@ class ProgressHistoryTests(unittest.TestCase):
         )
         rows = self.table_rows(
             header,
-            ["Round", "Impl", "Test", "Review", "Start", "Elapsed", "Result"],
+            ["Round", "Agent 1", "Agent 2", "Agent 3", "Start", "Elapsed", "Result"],
         )
         # Neither window holds a seat -- the writer predates seats and the armed
         # reviewer has no pass yet -- so there is no round for the reviewer to

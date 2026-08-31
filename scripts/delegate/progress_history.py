@@ -1878,13 +1878,17 @@ STAGE_HEADERS: tuple[str, ...] = (
 )
 # The three slots a phase always runs, in the order they are reported. A slot is
 # a fixed identity; the role it is doing is what the cell shows, so a `review`
-# slot recruited into writing reads "impl" under the Review column.
+# slot recruited into writing reads "impl" under Agent 3.
 ROUND_SLOTS: tuple[str, ...] = ("impl", "test", "review")
+# The header each slot is reported under, in ROUND_SLOTS order. A slot name
+# doubles as a role word, and `impl` under a column headed `Test` read as a
+# contradiction; a numbered seat carries no role, so the cell alone says what
+# the seat is doing. The bullets under the table keep the slot in parentheses
+# so the reader can still find `impl_status_<slot>` and the `[slot]` board lines.
+SEAT_LABELS: dict[str, str] = {"impl": "Agent 1", "test": "Agent 2", "review": "Agent 3"}
 ROUND_HEADERS: tuple[str, ...] = (
     "Round",
-    "Impl",
-    "Test",
-    "Review",
+    *(SEAT_LABELS[slot] for slot in ROUND_SLOTS),
     "Start",
     "Elapsed",
     "Result",
@@ -1907,7 +1911,7 @@ BOARD_NOTE_CHARS = 72
 LAUNCHER_PREFIX = "launcher:"
 # Where a window that sits in no round is drawn when its kind names a seat. A
 # lone reviewer between rounds -- the closure review, the broad review of a
-# solo run -- is doing review work, and a reader scanning the Review column for
+# solo run -- is doing review work, and a reader scanning the review seat's column for
 # it found three dashes. A main-agent activity names no seat and keeps them.
 LONE_SEATS: dict[str, str] = {"impl": "impl", "fix": "impl", "test": "test", "review": "review"}
 
@@ -2687,7 +2691,7 @@ def _round_rows(
     # it, by the interval running to whatever opened next. That slice is wrong
     # for concurrent seats, which is why a round does not use it -- but it is
     # exactly right for the sequential windows that still reach this branch.
-    # Its seat cells come from its kind: a lone review sits under Review.
+    # Its seat cells come from its kind: a lone review sits under the review seat.
     uppers = {
         window["instance_id"]: (
             windows[index + 1]["started_at"]
@@ -2772,7 +2776,9 @@ def _delegate_note(
         else:
             age = _compact_duration(max(int(now - said["at"]), 0))
             detail = f"{age} ago \u00b7 {_board_phrase(said)}"
-        lines.append(f"- **{slot}**{f' {agent}' if agent else ''} \u00b7 {detail}")
+        lines.append(
+            f"- **{SEAT_LABELS[slot]}** ({slot}){f' {agent}' if agent else ''} \u00b7 {detail}"
+        )
     return lines
 
 def _stage_table(

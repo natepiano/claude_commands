@@ -248,9 +248,10 @@ row and a phase row carrying the reported percentage, elapsed, ETA, unchanged,
 the best and worst arrival the percentage still allows.
 
 The second is the round table, under the phase heading: one row per round,
-oldest first, with a column for each of the three slots — `Impl`, `Test`,
-`Review` — plus the round's start, elapsed, and finding result. A round is the
-unit that advances: it is dispatched, it lands, and the ledger stamps its number
+oldest first, with a column for each of the three slots — `Agent 1`, `Agent 2`,
+`Agent 3`, the `impl`, `test`, `review` slots in that order, numbered so the
+header carries no role word the cell beneath could contradict — plus the
+round's start, elapsed, and finding result. A round is the unit that advances: it is dispatched, it lands, and the ledger stamps its number
 on every finding it produces, so it is the only row key whose start, elapsed and
 result all describe the same thing. The three seats working it read across as
 columns, each cell naming what that seat is doing and how long it has been doing
@@ -300,7 +301,7 @@ events, `board.sh` and the recorder read the same clock: both honour
 outside a ledger stamped from an override and drop every role change out of
 every round.
 
-Under the table sits one line per seat — `- **impl** <model> <effort> · 3m ago ·
+Under the table sits one line per seat — `- **Agent 1** (impl) <model> <effort> · 3m ago ·
 rerunning the scoped test` — naming the delegate in it for the round in flight
 and the last thing that seat said on the board, with its age. It is one answer
 per phase rather than per row, so a column repeating the same values down every
@@ -317,9 +318,9 @@ Windows that sit in no round keep a row apiece, named as they always were: a
 main-agent activity, which holds no seat, and every pass that records none — a
 solo run's, and the closure or broad reviewer `review.sh` launches between
 rounds. Such a pass is drawn in the seat its kind names — `review 9m` under
-Review, `impl 3m` under Impl — so a reader scanning the Review column for the
-closure review finds it rather than three dashes; an activity names no seat and
-keeps them. These rows keep the per-window finding attribution — the interval
+Agent 3, `impl 3m` under Agent 1 — so a reader scanning the review seat's
+column for the closure review finds it rather than three dashes; an activity
+names no seat and keeps them. These rows keep the per-window finding attribution — the interval
 running to whatever opened next — which is wrong for concurrent seats and
 exactly right for the sequential windows that still reach it. An early-armed reviewer joins the round it reads when there is
 one, and otherwise keeps its own row beside the writer.
