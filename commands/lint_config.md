@@ -18,7 +18,7 @@ writes under `~/.claude/config`. A sandboxed read-only run works but there is no
 reason to split the two.
 
 Relay the script's stdout and stderr exactly, except the status lines — see
-below. If it exits non-zero, stop; do not guess a correction.
+below. If it exits non-zero, stop; do not invent a correction.
 
 ## Status
 
@@ -75,6 +75,12 @@ from completing instead of silently passing it.
   allow to skip (every step except validate_ci's two mend steps).
 - **Scope.** `verify.sh` pins targets per package on purpose (see its header
   comment); config decides *whether* a check runs, never with what flags.
+- **Who runs a check.** Whether `/clippy` puts its mend/clippy/doc stages in a
+  subagent, and whether it splits an approved fix batch across parallel fixers,
+  lives in `config/clippy.conf` — read with
+  `bash ~/.claude/scripts/lint/clippy_config.sh`, hand-edited like
+  `delegate.conf`. A check turned off here does not run whoever would have run
+  it; that file only moves the work.
 
 A check gated off inside `verify.sh` prints
 `SKIPPED: <command> — <key>=off in <config path>` and exits 0. When you see that

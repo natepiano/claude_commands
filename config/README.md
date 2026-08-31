@@ -47,6 +47,32 @@ the SKIPPED line), or run it as the `/lint_config` CLI. Edits need
 `dangerouslyDisableSandbox: true` — the sandbox denies writes under
 `~/.claude/config`.
 
+## clippy.conf
+
+The `/clippy` delegation tuning file — *who* runs the checks, where `lint.conf`
+says *which* checks run. `SCAN_AGENT` puts the mend/clippy/doc stages in one
+subagent so a workspace-sized cargo log never enters the main conversation;
+`FANOUT` lets an approved fix batch split across parallel fixer agents.
+`MIN_FINDINGS` (12), `MIN_FILES` (4), `MAX_AGENTS` (4), and
+`FINDINGS_PER_AGENT` (8) decide whether a batch is large and splittable enough
+to be worth a wave and how wide it opens; `PROGRESS_INTERVAL_SECONDS` (120) is
+the gap between supervision reports while one runs.
+
+Fixers own whole files, never individual findings, so no two ever edit the same
+file — which is why `MIN_FILES` exists and why a batch concentrated in two files
+stays inline however many findings it holds. Everything past that partition is
+settled between the agents themselves over `SendMessage`, under
+`<PeerCoordinationContract/>` in `commands/clippy.md`.
+
+Hand-edited, like `delegate.conf`; `scripts/lint/clippy_config.sh` reads and
+validates it (`export`, `get <key>`, or no argument for a status listing) and
+carries no defaults. A missing file, an unset key, a non-numeric value, or a
+value below its minimum makes it print every problem it found and exit 2 —
+whereupon `/clippy` runs the whole pipeline inline and says why. The lint never
+depends on this file: inline is what the skill did before it existed.
+`/clippy no-agents` forces that path for one run, and `auto-proceed` takes it
+always, since a codex sub-session has no agent tool to launch anything with.
+
 ## delegate.conf
 
 The `/plan:delegate` tuning file: the convergence limits — how many automatic
