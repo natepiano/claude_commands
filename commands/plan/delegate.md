@@ -198,16 +198,35 @@ calls. Closure reviews omit it to remain scoped to the repair.
 <WritePromptContract>
 Every implementation or fix prompt contains these sections once:
 
-1. Role: write the requested code directly; do not ask questions.
+1. Role: write the requested code directly; do not ask questions. Name the
+   slot this prompt is for and the role it opens in, per <PhaseTeam/>.
 2. Boundaries: do not commit, branch, or touch unrelated files; summarize files,
-   reasons, and deviations when done.
-3. Heartbeat: before each activity, run
-   `bash ~/.claude/scripts/agents/heartbeat.sh <concrete SESSION_DIR>/heartbeat.log agent "<activity>"`.
+   reasons, and deviations when done, and **write that summary to this slot's
+   `impl_summary_<role>.txt` as the last act before finishing** — a background
+   session has no output redirect, so a summary left only in the reply is a
+   summary the orchestrator never sees. State this slot's file set and the
+   peers' file sets per <TeamFilePartition/>, and that a peer's file is blocked
+   rather than merged.
+3. Narration: before each activity, run
+   `bash ~/.claude/scripts/delegate/board.sh post <concrete SESSION_DIR> <slot> status "<activity>"`.
    Use short present-tense text and never read the heartbeat file.
-4. `## Project Context`.
-5. `## Work Specification`.
-6. `## Type Design Contract` per <TypeDesignContract/>.
-7. `## Verification` per <VerificationContract/>.
+4. `## Team` — the three slots, who holds which files, and the board commands
+   from <CoordinationBoard/>. Say that peers are working concurrently, that the
+   board carries the record every member can read, and that a `verify.sh` run
+   may pause while a peer finishes its own. Never mention the cargo token or
+   ask for it: <BuildTokenContract/> takes it inside `verify.sh`, and an agent
+   holding it by hand deadlocks against its own verification.
+   Whenever this slot has a mesh address, also give it its own mesh name, both
+   peers' names, the call that reaches each of them, and — on the claude path —
+   the orchestrator's name from `ListAgents`, per <PhaseMesh/>. An address a
+   member has to go looking for is one it will not use, and a codex peer needs
+   the literal `codex_mesh.py` command line with the concrete `--session-dir`
+   already filled in, not a description of it.
+5. `## Project Context`.
+6. `## Work Specification`.
+7. `## Type Design Contract` per <TypeDesignContract/>.
+8. `## Verification` per <VerificationContract/>, exactly as listed and with
+   nothing added around it.
 
 The Verification section must say: run only its listed commands, never raw
 Cargo; run each listed command with the sandbox disabled; do not report until
@@ -221,6 +240,241 @@ It must also instruct the delegate: tests are the only testing — a passing
 listed `test`; and a listed example or app launch compiles its own target — do
 not build or test first just to prove it builds.
 </WritePromptContract>
+
+<PhaseTeam>
+Every implementation, escalation, and fix dispatch runs **three delegates at
+once**, never one. They share `${SESSION_DIR}` and `${WORKING_DIR}`, and each
+occupies a fixed **slot** that names its artifacts and its board identity:
+
+| Slot | Opens as | Owns |
+| --- | --- | --- |
+| `impl` | the phase's implementation or repair | the Work Order's production files |
+| `test` | tests for the same specification | test targets under `tests/` and new test files |
+| `review` | reading the spec and the tree cold | nothing; it is the team's reserve |
+
+A slot is an identity and never changes. What a slot is *doing* is its **role**,
+and roles move during a phase per <RoleReassignment/>. Everything downstream —
+the board, the progress table, the review split — reads the slot for identity
+and the role for activity, so keep the two distinct: `review` doing
+implementation work is still slot `review`.
+
+`test` opens against the **specification, not the implementation**. The Work
+Order defines the behavior, so tests can be written before any of it exists;
+a tester that waits for `impl` has converted a parallel team back into a queue.
+
+**Only `impl` is given a `${PASS_KIND}`.** The recorder closes any open pass
+when a new one starts, so three recorded passes would leave the ledger
+describing whichever finished last and would corrupt the pass counts
+`findings.py gate` uses to judge convergence. One dispatch, one recorded pass,
+three agents inside it. This is the same reason <EarlyReviewArm/> defers its
+reviewer's `start-pass`, applied to a wider team.
+
+Launch all three in **one message** so they run concurrently, each with its own
+prompt file and its slot as the ninth argument to `implement.sh`. Announce the
+board path with the prompt and heartbeat paths, then apply <DispatchContract/>
+once for the team: the progress timer covers the phase, not each member.
+
+A member that finishes writes `impl_status_<slot>`; the phase is complete when
+every slot has a terminal status, not when the first one lands. Reading one
+slot's `implemented` as the phase's result is the same defect as reading a
+completion notification as a finished assignment.
+</PhaseTeam>
+
+<CoordinationBoard>
+The team coordinates through `${SESSION_DIR}/board.log`, written only with
+`bash ~/.claude/scripts/delegate/board.sh`.
+
+**Why a file even when messages work.** On the claude path every member is also
+reachable by name — see <PhaseMesh/> — but the board still carries the record,
+for three reasons. A post is a single broadcast that reaches both peers and the
+wrapper at once, where addressed sends are N-1 separate deliveries that can each
+fail and leave the team holding different pictures of one decision. The board
+outlives a turn, so a member that starts late, or is resumed hours later, reads
+the whole history rather than the messages that happened to arrive while it was
+listening. And a message cannot make anything mutually exclusive: only the
+token, taken with `mkdir`, decides who builds.
+
+When `agents.conf` resolves the delegate family to codex there is no mesh at all
+— a codex process has no reachable address, and the orchestrator is asleep
+between progress ticks and cannot relay — so the board is then the only channel
+that exists. Each `register` line says which case holds, in its `mesh=` field.
+
+- `board.sh post <session_dir> <slot> <kind> <message>` — one broadcast line.
+  Kinds are a closed set: `register`, `claim`, `release`, `ask`, `answer`,
+  `status`, `blocked`, `handoff`, `done`.
+- `board.sh read <session_dir> --since <cursor>` — everything new. Each line is
+  numbered; keep the last number as the cursor. Read before every decision that
+  depends on a peer, and always after acquiring a token.
+- A decision that is not on the board did not happen. Say it on the board first,
+  then message a peer if it needs attention now.
+
+Narration goes through the board too, not through prompt-formatted heartbeat
+text: `board.sh post` takes the slot as a required argument, so attribution
+cannot be dropped, where a name an agent is merely asked to prefix onto a
+heartbeat line reliably goes missing.
+</CoordinationBoard>
+
+<PhaseMesh>
+A member launched into the mesh is **addressable**: peers reach each other, the
+orchestrator reaches any of them, and a claude member reaches the orchestrator —
+mid-run, without waiting for a phase to end.
+
+- **Addresses** are `<mesh_prefix>-<role>`, where the prefix is the session
+  directory's basename: `phase3-a91c-impl`, `-test`, `-review`. A member is told
+  its peers' names in its prompt, and every `register` line on the board repeats
+  them in its `mesh=` field, so a member that missed the launch can still look
+  one up.
+- **How you reach a name depends on its family**, and the register line says
+  which in its `reach=` field. Guessing wrong is silent: the message goes
+  nowhere and the sender waits on a reply that was never queued.
+  - `reach=SendMessage` — a claude member, running as a named background
+    session. Address the bare name; `ListAgents` confirms who is live.
+  - `reach=codex_mesh.py` — a codex member, running as a thread on the phase's
+    `codex app-server`. Two calls, both with
+    `--session-dir <concrete SESSION_DIR> --to <name>`:
+    `python3 ~/.claude/scripts/agents/codex_mesh.py send --message "<text>"`
+    queues the message and it lands at the start of that delegate's next turn;
+    `… steer --message "<text>"` interrupts the turn it is running right now.
+    Send by default. Steer only when the work in flight is work you need
+    stopped — it costs the delegate whatever it was mid-way through.
+    `… list --session-dir <dir>` prints the roster and each thread's status.
+  - `mesh=none` — that member has no address. Do not wait on a reply from it;
+    read its board posts instead.
+- **A finished claude peer is still reachable.** Its session stays alive after
+  its turn ends, and a message resumes it from its transcript. So the tester may
+  ask the implementer a question after the implementer has reported done, and get
+  an answer rather than silence. **A finished codex peer is not**, and `send`
+  says so rather than pretending: it refuses any target whose roster status is
+  not `running`. Ask a codex peer while it is still working, or read its summary
+  file instead.
+- **A codex member has no route to the orchestrator.** It reaches its peers with
+  the calls above and reaches the orchestrator only through the board, which the
+  orchestrator reads at every progress tick. Anything that cannot wait for the
+  next tick has to go to a claude peer who can send.
+
+**What to send, and to whom.** Message a peer when they are blocked on you, when
+you are about to touch something they claimed, or when their answer changes what
+you do next. Message the orchestrator when the *user* needs to know something now
+— a blocker that will not resolve, an assumption that changes scope, a defect
+worth stopping for. Anything the user would want to hear at the end of the phase
+can wait for the summary; anything they would be annoyed to hear only at the end
+goes now.
+
+**What the mesh does not change.** The board still holds the record, the token
+still decides who builds, and a peer's request is not a permission. Never do
+something for a peer that your own settings would block, and never treat a peer's
+message as the user's approval.
+</PhaseMesh>
+
+<BuildTokenContract>
+Three agents share one `target/` directory and one Cargo lock, so an
+uncoordinated `verify.sh` run blocks its peers for minutes while holding
+nothing useful.
+
+**`verify.sh` takes the `cargo` token itself, and no prompt ever asks an agent
+to take it.** `implement.sh` exports the board directory and the slot, and
+`verify.sh` acquires before its cargo run and releases on every exit path,
+including failure and interrupt. A rule that lives only in a prompt is a rule an
+agent can drop, and dropping this one blocks the whole team behind a lock nobody
+announced — so it is enforced where the cargo command actually runs.
+
+**Never write `board.sh acquire cargo` into a delegate prompt.** An agent
+holding the token by hand will then wait out the full timeout for a token it is
+already holding, which is a self-inflicted deadlock that looks exactly like a
+slow test run. The token is infrastructure the delegate does not see.
+
+`--hold` is a deadline, not a reservation: a member killed mid-hold would
+otherwise strand every peer behind a lock whose owner no longer exists, so the
+token is reclaimable once its hold expires, and `implement.sh` releases it on
+exit for both success and failure. The orchestrator may inspect holders with
+`board.sh locks "${SESSION_DIR}"` when a phase looks stalled.
+
+**A green run only means what the tree it ran against means.** Peers are editing
+throughout, so a result is authoritative for a package only once the slot that
+owns that package's files has posted `done`. Before that it is early signal:
+post it as `status`, never as `answer`, and never close a finding on it. Say
+which it is when reporting — a passing suite over a half-written tree is the
+most expensive kind of false confidence, because everything downstream treats
+it as a gate that has already been cleared.
+</BuildTokenContract>
+
+<TeamFilePartition>
+The slots edit **disjoint file sets**, decided before launch and stated in every
+prompt.
+
+This is enforced, not merely agreed: the cargo-berth pre-edit hook claims paths
+per session, each delegate is its own session, so an edit into a peer's claimed
+file is **blocked** rather than merged. Two consequences that must reach the
+prompts:
+
+- The tester writes **integration tests under `tests/`**. A `#[cfg(test)]`
+  module added inside a production file that `impl` has claimed is a blocked
+  edit, not a merge conflict, and the tester will simply fail to write it.
+- Any change that reaches outside one slot's file set — a signature both slots
+  need, a shared helper, a new type two slots want — belongs to the slot that
+  owns the file it lives in. Ask on the board and let the owner write it. Never
+  weaken a fix to avoid the dependency, and never define the same type twice to
+  route around a claim.
+
+Where the Work Order's own files cannot be split — everything lands in one or
+two files — say so in one line, give `impl` the whole set, and open `test` and
+`review` on work that does not touch it. A partition that does not exist is not
+worth inventing; a partition that is wrong costs the phase.
+</TeamFilePartition>
+
+<RoleReassignment>
+Roles move; slots do not. Every move is a board `handoff` post naming the slot,
+the role it is leaving, and the role it is taking, because that post is what the
+progress table reads to say what each agent is doing now.
+
+- **`impl` may recruit `review`.** When the implementation is wider than one
+  writer, `impl` posts `ask` naming the disjoint file subset it wants taken;
+  `review` answers and posts `handoff` to implementation work. The team is then
+  two writers and a tester. `review` is the reserve precisely because it holds
+  no files and can leave its lane without stranding anything.
+- **`test` is never recruited away** while tests for the phase are unwritten.
+  It is the only slot whose absence cannot be recovered later in the phase, and
+  a phase that ships untested is not cheaper, only later.
+- **When writing finishes before testing**, the writers do not idle. They take a
+  disjoint slice of the remaining test work — agreed on the board, one file per
+  slot, never the file `test` is inside — or they stand down.
+
+**Standing down means exiting, not waiting.** A delegate is a one-shot session
+with no idle loop: it ends as soon as it stops issuing tool calls, so there is
+no such thing as a member that sits quietly and comes back when asked. A slot
+with nothing left posts `done` with what it completed and finishes. Anything
+else burns a live session on a poll loop that the team pays for and nobody
+reads. This is why recruitment flows toward work that exists now rather than
+work a peer might hand over later.
+</RoleReassignment>
+
+<TeamReview>
+When a phase reaches review, all three slots review — but never as three
+readings of the same question, which buys one opinion three times.
+
+**One slot is adversarial, and it is a slot that did not write the code under
+review.** Its brief is to break the change, not to check it: find the input that
+violates a stated invariant, the caller that was not updated, the state the new
+code cannot reach, the test that passes for the wrong reason. It reports the
+concrete failing case, or reports plainly that it could not construct one.
+Normally this is `review`; where `review` was recruited into implementation, it
+is whichever slot wrote least of the code under review. An author is never the
+adversary for its own file set.
+
+**The other two take different aspects**, disjoint and named in their prompts:
+
+- **Specification conformance** — does the change do what the Work Order says,
+  including the parts no test covers, and does `${IMPL_SUMMARY}` describe what
+  the diff actually contains.
+- **Blast radius** — callers, consumers, public API, traits, registration,
+  plugin wiring, invariants and transitions the change reaches without naming.
+
+Each posts findings to the board under its own slot, so <Synthesize/> can tag
+who caught what and can tell three independent findings from one finding found
+three times. The adversarial verdict is reported even when it is empty: "no
+failing case found" from a reader who was trying to build one is evidence, and
+it is the only reading here that produces evidence by failing to find anything.
+</TeamReview>
 
 <ReviewPromptContract>
 Every reviewer is a fresh read-only session. It narrates each activity as a
@@ -241,7 +495,7 @@ Rust delegates run only exact prompt lines using
 | --- | --- |
 | compile feedback | `bash ~/.claude/scripts/delegate/verify.sh check <package>` |
 | package tests | `bash ~/.claude/scripts/delegate/verify.sh test <package>` |
-| integration target | `bash ~/.claude/scripts/delegate/verify.sh test <package> <test>` |
+| one integration target alone | `bash ~/.claude/scripts/delegate/verify.sh test <package> <test>` |
 | format + scoped lint | `bash ~/.claude/scripts/delegate/verify.sh lint <package>` |
 | checkpoint format | `bash ~/.claude/scripts/delegate/verify.sh fmt <package>` |
 | changed example | `bash ~/.claude/scripts/delegate/verify.sh example <package> <name>` |
@@ -249,10 +503,17 @@ Rust delegates run only exact prompt lines using
 
 Rules:
 
+- **Every line in this table serializes against the phase's peers on its own**,
+  per <BuildTokenContract/>: `verify.sh` takes the `cargo` token before running
+  and releases it after, so a prompt neither mentions the token nor takes it. A
+  run may therefore wait for a peer before starting. A result is authoritative
+  for a package only once the slot owning that package's files has posted
+  `done`; before that it is early signal, not a gate.
 - `check` is optional feedback, not a gate. Every modified package gets `test`
   and `lint`; trace changed public APIs, traits, registration, and plugin wiring
-  to modified callers. Add example or integration lines only when the phase owns
-  them.
+  to modified callers. `test <package>` already runs that package's integration
+  targets, so name one explicitly only to re-run it alone. Add example lines
+  only when the phase owns them.
 - Tests are the only testing: a passing `test` run proves the package builds.
   Never run `check` or any build alongside a `test` that is going to run anyway;
   `check` exists solely for mid-edit compile feedback.
@@ -406,9 +667,12 @@ On a Claude timer notification or Codex poll timeout:
    remains active, emit no stale report and process completion. On Claude, also
    stop and clear any timer when its dispatch completes first.
 2. Read the current Work Order and verification list, the latest relevant
-   heartbeat lines, `git status --short`, and `git diff --stat` in
-   `${WORKING_DIR}`. Compare status with the phase baseline; include untracked
-   paths without changing the index.
+   heartbeat lines, `board.sh read "${SESSION_DIR}" --since <cursor>` for what
+   the team settled since the last tick, `git status --short`, and
+   `git diff --stat` in `${WORKING_DIR}`. Keep the board cursor across ticks.
+   Compare status with the phase baseline; include untracked paths without
+   changing the index. The board is where a `handoff` appears, so it is what
+   tells the report which slot is doing which role right now.
 3. Derive the **current-phase** percentage from completed and remaining work,
    changed areas, current activity, and passed verification—not elapsed time.
    Round hard: stay below 20 only until implementation appears; editing is the
@@ -443,10 +707,14 @@ On a Claude timer notification or Codex poll timeout:
 
    Include the override reason only when rejecting an applicable calibrated
    value. The recorder refreshes any legacy run whose project clock was not
-   script-resolved. Copy the resulting Markdown header exactly, both tables
-   included: the first carries the project and phase clocks, the second every
-   stage the phase has opened — implementation, each review, each fix, each
-   main-agent activity — in the order they ran. Durations below one day are
+   script-resolved. Copy the resulting Markdown header exactly, all three tables
+   included: the first carries the project and phase clocks, the second one
+   column per team slot naming the role each delegate is filling and what it is
+   doing right now, and the third every stage the phase has opened —
+   implementation, each review, each fix, each main-agent activity — in the
+   order they ran. The middle table is the one a reader scans to see who is on
+   what; dropping it leaves them the timings with no way to tell the agents
+   apart. Durations below one day are
    always `HH:MM:SS`; longer durations are `<days> day(s) HH:MM:SS`, and the
    `ETA`, `ETA low`, and `ETA high` columns are arrival times rather than
    durations — the two band columns each carry their own distance from the ETA
@@ -509,14 +777,14 @@ On a Claude timer notification or Codex poll timeout:
    interval again before polling.
 
 **An armed timer is never a substitute for the report.** Every turn that arms or
-re-arms a timer emits steps 1-6 first — both tables and the wall-clock line —
+re-arms a timer emits steps 1-6 first — all three tables and the wall-clock line —
 and a bare "timer re-armed" line is a dropped report, not a short one. This
 matters most where it is easiest to skip: a Stop-hook block reads as a
 mechanical complaint about a missing file, so the reflex is to relaunch the
 script and end the turn. But the hook fires on the turn the user was owed an
 update and did not get one, and the timer file is only how it noticed. Re-arming
 without reporting answers the hook and leaves the user exactly where they were.
-Steps 1-6 are cheap: the recorder emits both tables, and the prose is three
+Steps 1-6 are cheap: the recorder emits all three tables, and the prose is three
 sentences.
 
 A user-requested status check performs steps 1-6 immediately. A question about
@@ -1033,20 +1301,39 @@ in the dispatch update.
    phased plan; pass the original prompt only. Both run before the dispatch in
    step 4, never after it.
 3. Set `${PASS_KIND}=arch` for escalation, otherwise `${PASS_KIND}=impl`.
-4. Launch
-   `bash ~/.claude/scripts/delegate/implement.sh "${SESSION_DIR}"
-   "${WORKING_DIR}" "${SESSION_DIR}/implementation_prompt.md"
-   "${IMPLEMENTATION_TASK}" "<responsibility>" "${PASS_KIND}" "<activity>"`.
-   Responsibility follows <ProgressContract/>.
-5. Announce prompt and heartbeat paths, set `EARLY_REVIEW=none`, then apply
-   <DispatchContract/>.
-6. On completion, read `impl_status`: `implemented` loads `impl_summary.txt`
-   into `${IMPL_SUMMARY}`. On `error`, cancel any early-launched reviewer per
-   <EarlyReviewArm/>, apply <RetainDelegatedPhaseReservation/>, report
-   `impl_agent.log`, record
+4. Partition the Work Order's files per <TeamFilePartition/> and write one
+   prompt per slot under <WritePromptContract/>:
+   `${SESSION_DIR}/implementation_prompt.md` for `impl`, `test_prompt.md` for
+   `test`, and `review_prompt_team.md` for `review`.
+5. Launch all three in one message, `impl` first, each under <ToolingContract/>:
+
+   ```sh
+   implement.sh "${SESSION_DIR}" "${WORKING_DIR}" \
+     "${SESSION_DIR}/implementation_prompt.md" "${IMPLEMENTATION_TASK}" \
+     "<responsibility>" "${PASS_KIND}" "<activity>" 0 impl
+   implement.sh "${SESSION_DIR}" "${WORKING_DIR}" \
+     "${SESSION_DIR}/test_prompt.md" "${IMPLEMENTATION_TASK}" \
+     "<responsibility>" "" "" 0 test
+   implement.sh "${SESSION_DIR}" "${WORKING_DIR}" \
+     "${SESSION_DIR}/review_prompt_team.md" "${IMPLEMENTATION_TASK}" \
+     "<responsibility>" "" "" 0 review
+   ```
+
+   Responsibility follows <ProgressContract/>. Only `impl` carries
+   `${PASS_KIND}`, per <PhaseTeam/>; giving a second slot one corrupts the pass
+   record the convergence gate counts.
+6. Announce prompt, board, and heartbeat paths, set `EARLY_REVIEW=none`, then
+   apply <DispatchContract/> once for the whole team.
+7. On completion, read `impl_status_impl`, `impl_status_test`, and
+   `impl_status_review`; the phase is done only when all three are terminal.
+   `implemented` on `impl` loads `impl_summary_impl.txt` into
+   `${IMPL_SUMMARY}`; read the other two summaries for what they completed and
+   for findings they posted. If `impl` errors, cancel any early-launched
+   reviewer per <EarlyReviewArm/>, apply <RetainDelegatedPhaseReservation/>,
+   report `impl_agent_impl.log`, record
    `finish-run --status error`, run `end_session.sh`, and stop; multi-phase runs
    also emit <RunSummary/>.
-7. `implemented` is the delegate's claim, not a passed gate. Read
+8. `implemented` is the delegate's claim, not a passed gate. Read
    `${IMPL_SUMMARY}` for a verification line it left running, unread, or
    unmentioned — "still running", "I'll report once it completes", a listed
    command with no stated result. When one is there, run that command yourself
@@ -1068,7 +1355,8 @@ together instead of back to back. Evaluated only on a <ProgressContract/> tick,
 and only when all of these hold: an implementation, escalation, or
 non-mechanical fix dispatch is active; `EARLY_REVIEW=none`; and the completed
 dispatch would receive a delegate review — <DualReview/> pass 1 or a closure
-review. Mechanical repairs never arm.
+review. Mechanical repairs never arm, and neither does a repair whose batch sits
+in paths narrow enough that <FixDispatch/> will close it on a contained diff.
 
 Estimate the **pass-internal** completion of the running dispatch — not the
 capped phase percentage — from the tick's evidence. It is ≥75% when the
@@ -1076,7 +1364,18 @@ heartbeat shows the delegate running its listed verification commands, or the
 diff already covers essentially all Work Order (or fix batch) files. Below
 75%, or when genuinely unsure, do nothing; the synchronous path still exists.
 
-At ≥75%, in the same tick:
+**Also require at least ten minutes of writer time still to run.** The whole
+saving here is the reviewer's reading, and it can only read while the writer is
+still writing — a reviewer armed four minutes before delivery has time to open
+the specification and nothing else, while still carrying every failure mode this
+section exists to guard. Estimate the remainder from the same tick evidence: how
+long this pass has already run against the completion estimate. Ten minutes
+remaining at 75% means a pass of roughly forty minutes or longer, so most
+implementations and nearly every repair arm nothing and review synchronously.
+That is the intended outcome, not a missed opportunity. When the two conditions
+disagree, or the remainder is a guess, do nothing.
+
+At ≥75% with ten or more minutes left, in the same tick:
 
 1. Increment `${REVIEW_PASS}` now; <DualReview/> will not increment it again.
 2. **Delete every stale delivery artifact and prove they are gone.**
@@ -1310,8 +1609,8 @@ Use <UserFacingText/> and emit:
 Summary and reference numbers must match. A reader should not need the plan,
 diff, reviews, or finding ids.
 
-**Close every delegation result with the current progress header** — both tables
-and the wall-clock line, produced by <ProgressContract/> steps 3 and 5 with the
+**Close every delegation result with the current progress header** — all three
+tables and the wall-clock line, produced by <ProgressContract/> steps 3 and 5 with the
 current pass or activity. This is not conditional on what the result led to. A
 review that came back clean, a fix that landed, a verification that passed, and
 a pass that ends the phase all close the same way as one that launches a repair;
@@ -1338,19 +1637,53 @@ guidance, an agreed trivial rename, or another behavior-preserving edit. Choose
 `${FIX_TASK}=escalation` for wrong behavior, math, unresolved architecture, or a
 failed repair; otherwise set `${FIX_TASK}=implementation`.
 
-Run `findings.py dispatch --covers <all batch ids>` before launching:
+A repair runs the same three slots as a phase, per <PhaseTeam/>: `impl` makes
+the repair, `test` writes the regression test that would have caught each
+finding, and `review` opens adversarially on the repair under <TeamReview/> —
+the reading most likely to catch a fix that closes a finding by weakening what
+detects it. Partition the findings' files per <TeamFilePartition/> and write one
+prompt per slot; `test` covers the same batch ids from the outside.
 
-`bash ~/.claude/scripts/delegate/implement.sh "${SESSION_DIR}"
-"${WORKING_DIR}" "${SESSION_DIR}/fix_prompt_${FIX_ROUND}.md" "${FIX_TASK}"
-"<responsibility>" fix "<activity>" "${FIX_ROUND}"`
+Run `findings.py dispatch --covers <all batch ids>` before launching, then
+launch all three in one message:
+
+```sh
+implement.sh "${SESSION_DIR}" "${WORKING_DIR}" \
+  "${SESSION_DIR}/fix_prompt_${FIX_ROUND}.md" "${FIX_TASK}" \
+  "<responsibility>" fix "<activity>" "${FIX_ROUND}" impl
+implement.sh "${SESSION_DIR}" "${WORKING_DIR}" \
+  "${SESSION_DIR}/fix_test_prompt_${FIX_ROUND}.md" "${FIX_TASK}" \
+  "<responsibility>" "" "" "${FIX_ROUND}" test
+implement.sh "${SESSION_DIR}" "${WORKING_DIR}" \
+  "${SESSION_DIR}/fix_review_prompt_${FIX_ROUND}.md" "${FIX_TASK}" \
+  "<responsibility>" "" "" "${FIX_ROUND}" review
+```
+
+Only `impl` carries the `fix` pass kind. It is the launcher that records the
+round as landed, so a second slot carrying it would resolve one repair round
+several times over.
 
 Apply <DispatchContract/>; set `EARLY_REVIEW=none` at dispatch, and close the
-turn with the progress header per <DelegationResultFormat/>. While a
-non-mechanical fix runs, <EarlyReviewArm/> may arm its closure reviewer early.
-After a non-mechanical repair, run <DualReview/>.
-For a mechanical repair, apply <ReviewDiffContract/>, read it yourself, and
-record each verdict without a delegate review. Force normal closure review if
-the repair touched another path or any id remains unclear.
+turn with the progress header per <DelegationResultFormat/>. While a fix runs
+that will receive a delegate closure review, <EarlyReviewArm/> may arm that
+reviewer early.
+
+**A contained repair closes without a delegate review.** Apply
+<ReviewDiffContract/> and read the repair diff yourself. When every hunk sits in
+a path the batch's own findings named — or in a new file one of those paths
+creates — record each verdict directly and continue to <Synthesize/>. A second
+reader buys nothing there: the closure question is only whether the named line
+changed as the finding intended, and every line of the diff is in a file the
+main pass just read for that finding. This is why the mechanical classification
+is no longer what decides the review; a mechanical repair simply always
+satisfies the same containment test.
+
+Dispatch the normal <DualReview/> closure review whenever the repair leaves that
+boundary or the diff cannot answer the question: an edited path no finding
+named, a caller or consumer pulled in, a changed signature, registration, or
+invariant reaching past the batch, an id whose verdict reads unclear, or a new
+defect the repair introduced. Uncertainty routes to the reviewer. The test is
+what the diff touched, never how confident the reading felt.
 
 On completion, `implemented` continues as above; `error` applies
 <RetainDelegatedPhaseReservation/>, reports the fix log, records an error
@@ -1457,18 +1790,32 @@ temporary session files, never plan sections. It may edit only remaining `todo`
 Work Orders; earlier `done` phases remain byte-identical. Later user choices
 become Pending decision blocks.
 
-Dispatch its architect review only when any trigger holds:
+Dispatch its architect review only when any trigger holds. Every trigger below
+asks one question: **does something still ahead of the run now read wrong?** It
+never asks whether this phase did something notable. A phase that shipped
+exactly what its Work Order described, leaving every remaining Work Order and
+next item still accurate, needs no architect review however much it built.
 
 - implementation deviated from the Work Order;
 - phases or remaining Work Orders were changed;
 - a later Pending decision was added;
-- the phase introduced or changed a semantic state, transition, failure,
-  availability, recovery condition, diagnostic, or externally observable
-  lifecycle;
+- the phase changed a semantic state, transition, failure, availability,
+  recovery condition, diagnostic, or externally observable lifecycle that a
+  remaining Work Order or `${NEXT_ITEMS_PATH}` item now describes wrongly.
+  Introducing one that nothing ahead depends on is not a trigger, and neither is
+  changing one that every remaining item still describes correctly;
 - a changed type/API/registration/path is named by a remaining Work Order or
-  `${NEXT_ITEMS_PATH}`;
+  `${NEXT_ITEMS_PATH}` **and** the change invalidates what that item says about
+  it — a rename, a changed signature or ownership, a moved responsibility, a
+  removed affordance. Merely touching a file or type a later item also names is
+  not a trigger;
 - the ledger returned a convergence advisory; or
 - three phases completed since the prior architect review.
+
+The last trigger is the floor, and it is meant to carry most runs: a plan whose
+phases land as written reaches the architect every third phase and no more
+often. Name the trigger that fired in the one-line report, so a run that
+dispatches it every phase is visible as the drift it represents.
 
 Otherwise pass `skip-architect`. When dispatched, focus real-code checking on
 affected phases and next items, then give the rest a consistency pass. It uses
@@ -1696,75 +2043,42 @@ Loop/verbose only:
    `Checkpoint` operation was appended but before this workflow observed the
    reply. On a later recovery from that retained record, invoke the same release
    once. If it returns exit `0`, names the requested reservation, and has release
-   payload status `resnapshotted` or `evidence_revalidated` instead of
-   `checkpointed`, invoke `/sync board` once. `resnapshotted` has envelope status
-   `outstanding`; `evidence_revalidated` can legitimately have `outstanding`,
-   `integrated`, `trunk_rewritten`, or `object_unknown` because its envelope
-   status reports current integration evidence, not reservation lifecycle.
-   Evidence replay preserves the `outstanding` lifecycle and its original
-   protected tip. Do not gate recovery on envelope status: the board must
-   establish both the outstanding lifecycle and protected-tip equality with the
-   journalled checkpoint below. A `released` payload remains excluded because it
-   records a terminal disposition, not a recovered checkpoint.
+   payload status `resnapshotted`, `evidence_revalidated`, or `released` instead
+   of `checkpointed`, invoke the named reservation lifecycle query below.
+   `resnapshotted` has envelope status `outstanding`; `evidence_revalidated` can
+   legitimately have `outstanding`, `integrated`, `trunk_rewritten`, or
+   `object_unknown` because its envelope status reports current integration
+   evidence, not reservation lifecycle. Evidence replay preserves the
+   `outstanding` lifecycle and its original protected tip. Do not gate recovery
+   on envelope status: the named reservation lifecycle query must establish the
+   current lifecycle and protected-tip equality with the journalled checkpoint.
 
    ```sh
-   PYTHONPATH="$HOME/.claude/scripts" python3 -m berth.claim_state board \
-     --cwd "${WORKING_DIR}"
+   PYTHONPATH="$HOME/.claude/scripts" python3 -m berth.claim_state reservation \
+     --cwd "${WORKING_DIR}" --reservation <recorded-reservation-id>
    ```
 
-   Inspect the validated board's `envelope.payload.data`, not its rendered
-   Markdown. Lifecycle-bearing reservation representations are
-   `ready_now.entries[].reservation`, `unconstrained_reservations.entries[]`,
-   and `resolved.entries[]`; each carries `reservation_id` and `lifecycle`.
-   Constraint-only representations are `waiting.entries[]`, whose
-   `predecessor` and `successor` are reservation ids, and
-   `unresolved_overlaps.entries[]`, whose `deferred` and `blocker` are
-   reservation ids. A waiting successor and either unresolved-overlap endpoint
-   are deliberately omitted from the lifecycle-bearing sections. An
-   `alerts.entries[]` item with `kind = orphaned_outstanding` independently
-   carries `reservation_id` and `protected_tip`, including when its reservation
-   occupies one of those constraint-only positions.
+   Inspect the validated coordinator `state`, which is derived from
+   `envelope.payload.data` without reading `message`. Exit `0` requires
+   `kind = reservation_lifecycle`, the requested `reservation_id`, and exactly
+   one lifecycle alternative: `active`; `outstanding` with `protected_tip`;
+   `released_after_checkpoint` with `protected_tip` and `disposition`; or
+   `released_without_checkpoint` with `disposition`. Exit `5` is valid only for
+   `kind = unknown_reservation` carrying the requested `reservation_id`.
 
-   Classify the requested reservation as exactly one of
-   `ProtectedTipObserved`, `ReservationPresentWithoutProtectedTip`,
-   `ReservationAbsent`, or `BoardInconsistent`. Repeated constraint references
-   are one logical presence, not duplicate reservation rows.
-   `ProtectedTipObserved` requires the board to represent the requested
-   reservation, at most one lifecycle-bearing representation, every such
-   lifecycle to have `stage = outstanding`, at least one protected tip from
-   that lifecycle or a matching `orphaned_outstanding` alert, and all observed
-   tips to agree. `ReservationPresentWithoutProtectedTip` means there is no
-   lifecycle-bearing representation or matching alert tip, but the requested
-   id occurs as a waiting `successor` or as an unresolved-overlap `deferred` or
-   `blocker`. No representation is `ReservationAbsent`. Duplicate lifecycle
-   representations, a non-outstanding lifecycle, disagreeing tips, an alert
-   without a reservation representation, or a constraint-only shape other than
-   the two permitted omissions is `BoardInconsistent`.
+   `outstanding` with `protected_tip` equal to the durable record's read-back
+   `checkpoint_commit` confirms that the same checkpoint release is already
+   journalled. `released_after_checkpoint` with the same protected tip also
+   confirms that release, followed by the reported terminal disposition; report
+   it as recovered and subsequently released. A different protected tip is
+   another release and must retain the record. `active`,
+   `released_without_checkpoint`, `unknown_reservation`, a mismatched echoed id,
+   or a busy, unreadable, malformed, or otherwise invalid response retains the
+   record with that distinct reason. Do not consult the retention ref: it proves
+   commit reachability but not whether the selected reservation is outstanding
+   or released.
 
-   `ProtectedTipObserved` with the observed tip equal to the durable record's
-   read-back `checkpoint_commit` confirms that the same checkpoint release is
-   already journalled. `ReservationPresentWithoutProtectedTip` confirms only a
-   constraint endpoint: the validated board exposes neither that reservation's
-   lifecycle nor its protected tip in this position. No validated, read-only
-   `cargo-berth` output can select that named reservation and expose its
-   lifecycle independently. Retain the durable record without consulting the
-   retention ref; even a matching retention ref proves only the protected tip,
-   not `lifecycle.stage = outstanding`. Report the distinct reason that the
-   requested reservation appeared only as a waiting successor or
-   unresolved-overlap endpoint, so the board exposed neither a lifecycle nor a
-   matching `orphaned_outstanding` alert and could not establish the outstanding
-   stage. Name this exact command so a person can inspect the current board
-   position:
-
-   ```sh
-   PYTHONPATH="$HOME/.claude/scripts" python3 -m berth.claim_state board \
-     --cwd "${WORKING_DIR}"
-   ```
-
-   Report a checkpoint confirmed through `ProtectedTipObserved` as recovered
-   rather than re-made. A different observed tip is another release and must
-   retain the record. `ReservationAbsent`, `BoardInconsistent`, or a busy,
-   unreadable, or malformed board also retains it with that distinct reason.
+   Report a matching checkpoint as recovered rather than re-made.
    Only after the first-attempt structured assertions or these recovery
    assertions pass, delete
    `${SESSION_DIR}/delegated_phase_reservation_state.json`.

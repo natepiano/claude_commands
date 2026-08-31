@@ -8,7 +8,7 @@ Every external-CLI agent this configuration launches — `/plan:delegate`'s impl
 
 ### Registry schema
 
-`config/agents.conf` is an INI-style file with exactly three kinds of section. Comments (`#`) are stripped to end-of-line everywhere, including trailing inline comments on rows.
+`config/agents.conf` is an INI-style file with four kinds of section. Comments (`#`) are stripped to end-of-line everywhere, including trailing inline comments on rows.
 
 ```ini
 [assignments]                 # <function>=<family>, plus optional <function>.<subtask>=<family>
@@ -20,7 +20,17 @@ review=gpt-5.6-sol:xhigh
 
 [codex.agents]                # [<family>.agents] — <agent>=<comma-separated valid efforts>
 gpt-5.6-sol=low,medium,high,xhigh,max,ultra
+
+[delegate.options]            # [<function>.options] — launch flags, not agent rows
+codex_mesh=0
 ```
+
+An **options** section is the odd one out: it holds a function's launch flags
+rather than agent rows, `agents_resolve` never reads it, and the consumer that
+owns the flag reads its own key with `_agents_registry_get <function>.options
+<key>`. It is invisible to the family enumeration — which only ever loops `codex`
+and `claude` — so `/agent` neither lists nor edits it. `delegate.options` holds
+`codex_mesh` today.
 
 Vocabulary: a **family** is a CLI vendor (`codex` | `claude`); an **agent** is a model within a family (`gpt-5.6-sol`, `opus`); a **function** is a consumer; a **task** is `<function>.<subtask>` — exactly two segments.
 
@@ -94,6 +104,112 @@ Wrong arg count or a bad mode returns 2. A missing prompt file writes `Prompt no
 
 `AGENT_EXEC_EXTRA_ARGS` is appended to the family CLI's arg list. `AGENT_EXEC_DRY_RUN=1` prints the fully assembled command — every argv token `printf '%q'`-quoted by `agents_exec_print_argv`, with the redirection suffix, and a `cd <working_dir> && ` prefix on the claude branch — then exits 0 without executing. `agent_exec` exports nothing; consumers that need provenance re-resolve themselves.
 
+### Addressable codex delegates (`scripts/agents/codex_mesh.py`)
+
+`agent_exec`'s codex branch runs `codex exec`, a process nothing outside it can
+reach: a delegate launched that way takes one prompt and is unreachable until it
+exits. `codex_mesh.py` is the alternative launch path that gives a codex delegate
+an address, so peers and the orchestrator can message and interrupt it mid-run
+the way they already can a claude delegate. Opt-in per `[delegate.options]
+codex_mesh` in the registry (`0` by default), overridable for one run with
+`PLAN_DELEGATE_CODEX_MESH`; `implement.sh` reads it and branches.
+
+One `codex app-server` per delegate session, each delegate a thread on it:
+
+```
+codex_mesh.py serve  --session-dir <dir>                      # start/reuse, print port
+codex_mesh.py start  --session-dir --name --cwd --prompt-file \
+                     --summary-file --log-file [--model --effort --sandbox]
+codex_mesh.py send   --session-dir --to <name> --message <text>
+codex_mesh.py steer  --session-dir --to <name> --message <text>
+codex_mesh.py list   --session-dir
+codex_mesh.py stop   --session-dir
+```
+
+`serve` spawns `codex app-server --listen ws://127.0.0.1:<free port>` detached
+(`start_new_session=True`) and records `{port, pid}` in
+`<session_dir>/mesh_server.json`; a later call reuses that server when the pid is
+still alive. The transport is newline-delimited JSON-RPC over a hand-written
+RFC 6455 client — loopback only, so no `--ws-auth` token.
+
+`start` connects, calls `thread/start` then `turn/start`, writes the delegate's
+thread id and status into `<session_dir>/mesh_roster.json` under an exclusive
+`flock`, and **blocks for the whole turn**, translating the notification stream
+into the log file (`agent:`, `exec:`, `edit:`, `thinking`) that
+`heartbeat_watch.sh` narrates. On `turn/completed` it writes the final message to
+the summary file and exits, so `implement.sh`'s `wait`, heartbeat, awake timer,
+and pass recording are untouched.
+
+`send` calls `thread/queue/add`: the message lands at the start of the target's
+**next** turn. `steer` calls `turn/steer` with the roster's `expectedTurnId` and
+interrupts the turn in flight. Both address a delegate by mesh name through the
+roster file, which is why they work from an unrelated process — the orchestrator,
+or a peer delegate.
+
+`stop` SIGTERMs the recorded pid (SIGKILL after 5 s) and removes the server file.
+`scripts/delegate/end_session.sh` calls it, reading the session directory out of
+the run-active marker: the server is detached on purpose so it outlives each
+delegate, so the end of the run is the only point that knows nobody needs it.
+
+### Addressable codex delegates (`scripts/agents/codex_mesh.py`)
+
+`agent_exec`'s codex branch runs `codex exec`, which is a closed process: nothing
+outside it can hand the running agent a message. `codex_mesh.py` is the alternate
+launcher that removes that limit for `/plan:delegate`, and it is used only there.
+It is opt-in — `[delegate.options] codex_mesh` in the registry, overridable for a
+single run with `PLAN_DELEGATE_CODEX_MESH` — and off by default, so a phase runs
+exactly as before until it is set.
+
+Instead of one process per delegate, the session gets one `codex app-server`
+(`--listen ws://127.0.0.1:<port>`, newline-delimited JSON-RPC) and each delegate
+becomes a **thread** on it. A thread has an id, and an id is an address:
+
+```
+codex_mesh.py serve --session-dir DIR             # start/return the session server
+codex_mesh.py start --session-dir DIR --name N …  # launch a delegate, block until its turn ends
+codex_mesh.py send  --session-dir DIR --to N --message TEXT   # queued; lands at N's next turn
+codex_mesh.py steer --session-dir DIR --to N --message TEXT   # interrupts N's running turn now
+codex_mesh.py list  --session-dir DIR             # roster: name, status, thread id
+codex_mesh.py stop  --session-dir DIR             # reap the session server
+```
+
+`start` blocks for the delegate's lifetime — every turn of it, see below — and
+writes the same summary and log files `agent_exec` does, so `implement.sh`'s `wait`, heartbeat watch, awake timer
+and pass recording are unchanged — the only thing it adds is the address. Two
+files carry the session's mesh state, both under the delegate session directory:
+`mesh_server.json` (`{port, pid}`) and `mesh_roster.json`
+(`{name: {thread_id, turn_id, status}}`, every read-modify-write under
+`fcntl.LOCK_EX` because three delegates register concurrently).
+
+The protocol has three traps, each of which cost a run to rediscover:
+
+- `initialize` must pass `capabilities.experimentalApi: true`. Without it every
+  `thread/queue/*` method fails `-32600` with nothing naming the missing flag.
+- `thread/start`'s `sandbox` takes the SandboxMode **string**
+  (`"danger-full-access"`), not the `SandboxPolicy` object the schema shows for
+  other fields.
+- **The thread must not be `ephemeral`**, even though `agent_exec`'s codex branch
+  passes `--ephemeral`. An ephemeral thread refuses `thread/queue/add` outright
+  ("ephemeral thread does not support queued submissions") and refuses
+  `thread/name/set` as well, so ephemerality costs the mesh the one call peers
+  use most. The price of dropping it is the ordinary codex rollout file under
+  `~/.codex/sessions`, which is also what makes a delegate's transcript readable
+  after the fact. Naming is still best effort — a failed rename is not worth
+  losing a delegate over, and the roster file is the address of record.
+
+A delegate is **not one turn**. `send` puts a message in the thread queue and the
+server starts a turn for it by itself, so `start` cannot exit at the first
+`turn/completed` — that would strand the message and kill the delegate mid-reply.
+It instead checks `thread/queue/list` at each turn boundary and keeps streaming
+while work remains, plus a short grace window for a queued turn already in
+flight, and only then writes the summary and exits. The summary is the last
+turn's answer, so a peer's follow-up is reflected in what the orchestrator reads.
+
+The mirror of that: `send` **refuses** a delegate whose roster status is not
+`running`. The thread outlives the launcher, so the server would cheerfully start
+a turn for a late message with nothing streaming it and nothing writing the
+summary. A refusal is better than work no one ever sees.
+
 ### Catalog sync (`scripts/agents/sync_codex_catalog.sh`)
 
 Rewrites **only** `[codex.agents]`, leaving every other line of the file byte-identical. It requires `jq`, reads the top-level `model=` from `~/.codex/config.toml` and the visible models (`visibility == "list"`) from `~/.codex/models_cache.json`, and writes `slug=<efforts>` from each model's `supported_reasoning_levels[].effort` (order preserved; no levels → empty list). Details:
@@ -128,11 +244,14 @@ A thin dispatcher over the resolver:
 | `config/README.md` | The `## agents.conf` section: three-layer schema, `/agent` as the editor, sync behavior. |
 | `scripts/agents/agents_config.sh` | Resolver + editors + freshness-gated sync trigger. |
 | `scripts/agents/agent_exec.sh` | Family dispatch launcher, dry-run hook. |
+| `scripts/agents/codex_mesh.py` | Addressable codex launch path: session app-server, thread per delegate, `send`/`steer`/`list`/`stop`. |
 | `scripts/agents/agent_admin.sh` | `/agent` backend. |
 | `scripts/agents/sync_codex_catalog.sh` + `.plist` | `[codex.agents]` materialization, staleness warnings. |
+| `scripts/agents/codex_mesh.py` | Opt-in addressable launcher for codex `/plan:delegate` delegates: one app-server per session, one thread per delegate, `send`/`steer`/`list`/`stop`. |
 | `scripts/agents/heartbeat.sh`, `heartbeat_watch.sh` | Liveness log helpers used by the delegate wrappers (role header block, 60 s beats with an activity digest decoded from the agent log). |
 | `scripts/agents/test_agents_config.sh`, `test_agent_exec.sh`, `test_sync_codex_catalog.sh` | Self-contained fixture-conf suites (`mktemp -d`, temp `AGENTS_CONFIG_FILE`, print a "…passed" line, nonzero on failure). |
-| `scripts/delegate/implement.sh` / `review.sh` | `/plan:delegate`'s launchers. The implementation launcher adds optional pass kind/activity/fix-count arguments; the reviewer adds optional pass activity plus a `pass_index` (7th arg, default 1). Both write status, provenance, agent logs, and shared heartbeat data; when durable progress state exists, they also record the resolved called model/effort and pass outcome through `progress_history.py`. `review.sh` writes `review_findings_<N>.txt` / `review_agent_<N>.log` per pass and `ln -sfn`s the unnumbered names to the current one, so a run that failed to converge can be read back round by round while existing readers keep working. |
+| `scripts/delegate/implement.sh` / `review.sh` | `/plan:delegate`'s launchers. The implementation launcher adds optional pass kind/activity/fix-count arguments and a **required** `team_role` as its 9th (`impl`, `impl2`, `test`, `review`): both call sites run a three-agent phase team, so there is one artifact shape rather than a solo shape and a team shape. The role suffixes every artifact (`impl_status_<role>`, `impl_summary_<role>.txt`, `impl_agent_<role>.log`, `impl_agent_<role>`, `impl_awake_<role>`), tags the wrapper beats `<subtask>:<role>`, names the slot this dispatch posts under on the board, and is exported to the agent as `PLAN_DELEGATE_TEAM_ROLE` beside `PLAN_DELEGATE_BOARD_DIR`. Only the member the orchestrator gives a `pass_kind` records a progress pass — `start-pass` closes any open pass, so three concurrent recorders would leave the ledger describing whichever finished last. The reviewer adds optional pass activity plus a `pass_index` (7th arg, default 1). Both write status, provenance, agent logs, and shared heartbeat data; when durable progress state exists, they also record the resolved called model/effort and pass outcome through `progress_history.py`. `review.sh` writes `review_findings_<N>.txt` / `review_agent_<N>.log` per pass and `ln -sfn`s the unnumbered names to the current one, so a run that failed to converge can be read back round by round while existing readers keep working. |
+| `scripts/delegate/board.sh` | The phase team's coordination substrate: an append-only `board.log` plus `mkdir`-atomic tokens under `locks/`, shared by every member writing into one session directory. Commands are `post` / `read` / `acquire` / `release` / `renew` / `role` / `roles` / `locks`. A file rather than messages because a codex-family delegate has no `ListAgents`/`SendMessage` at all and the orchestrator is asleep between progress ticks — and because one append *is* the broadcast to every peer and the wrapper, where N-1 addressed sends can each half-fail. Post kinds are a closed set (`register`, `claim`, `release`, `ask`, `answer`, `status`, `blocked`, `handoff`) so a peer can scan for what concerns it; `read --since N` numbers every line before filtering, so a cursor counts board positions and stays valid across different filters. `role` is the only writer of `handoff`, and those lines are how `progress_history.py` learns which role each slot holds now. |
 | `scripts/delegate/progress_history.py` | Cross-agent append-only plan-delegate event recorder and aggregator. Durable per-run JSONL lives under `~/.local/state/plan-delegate/runs/`; live state remains in the session directory. `start-run` alone resolves and records the project clock from the supplied plan, matching worktree/branch history, or the run start. It renders separate project and phase progress sections with independent unchanged timers and unambiguous `HH:MM:SS` durations, and calibrates phase estimates from completed-phase history. `progress` requires `--cap-stage` on dual-layout calls and clamps the calibrated percentage to that stage's ceiling; `start-phase --work-order-file` records Work Order size metrics. |
 | `scripts/delegate/findings.py` | The delegate fix loop's convergence test — what replaced the fix-pass counter. Stable finding IDs (`F001…`) with states `open` / `fixed_pending_review` / `accepted`, held in `findings_state.json` beside the progress state and reset automatically when the active phase's `instance_id` changes. `gate` returns `converged` / `dispatch` / `stop`, gating on blocker+minor in round 1 and blocker only afterwards (nits never gate); `dispatch --covers` refuses a partial batch so one fix round repairs everything gating together. Stops on: a finding that failed to close twice, a finding reopened twice, two rounds with no decrease in the gating-open count, or a 10-round runaway backstop. Appends `finding_opened` / `finding_batch_dispatched` / `finding_verdict` / `finding_gate` to the same durable run JSONL. |
 | `scripts/delegate/test_progress_history.py`, `test_findings.py` | `python3 -m unittest scripts.delegate.test_progress_history scripts.delegate.test_findings` from `~/.claude`. Both drive the real CLIs in a temp session dir with `PLAN_DELEGATE_NOW_EPOCH` / `PLAN_DELEGATE_HISTORY_DIR` pinning time and storage. |
@@ -160,9 +279,31 @@ All four wrappers capture resolver stderr into their log (`agents_resolve "$TASK
 - Any awk that writes a user-supplied value into the conf passes it through `ENVIRON`, not `awk -v`. Row rewrites preserve trailing inline comments and spacing byte-exactly; conf writes go through a tmp file + `mv` (mode preserved), never in place.
 - `agent_exec` owns all redirection: wrappers must not redirect its stdout/stderr to a file, or dry-run output never reaches them. It exports nothing — provenance comes from the wrapper's own `agents_resolve`.
 - Callers pass **absolute** prompt/output/log paths to `agent_exec`.
+- `codex_mesh.py` resolves nothing. `implement.sh` resolves model and effort
+  through `agents_resolve` exactly as it does for `agent_exec`, then passes them
+  as `--model` / `--effort`; the mesh path changes only whether the delegate has
+  an address, never which agent runs or at what effort.
+- Every delegate in one phase shares one app-server, and its pid file is the only
+  record of it. A launch path that starts a server without writing
+  `mesh_server.json` leaks a process that nothing will reap.
 - Provenance files are four lines: `task=`, `family=`, `agent=`, `effort=`.
+- `codex_mesh.py` is a `/plan:delegate` launcher, not a second dispatcher. It
+  resolves nothing: `implement.sh` has already resolved family, agent and effort
+  through the registry and passes them in as `--model` / `--effort`. Anything
+  else that needs a codex agent still goes through `agent_exec`.
+- The session app-server is deliberately detached, so it outlives each delegate
+  and a peer can still reach a thread between turns. `end_session.sh` is the only
+  thing that reaps it (`codex_mesh.py stop`, from the session directory recorded
+  in the run-active marker); a launcher that killed it would break the mesh it
+  exists to provide.
+- A codex delegate's thread ends with its turn. Unlike a claude delegate, whose
+  background session stays resumable, a finished codex peer cannot be messaged —
+  `<PhaseMesh/>` in `commands/plan/delegate.md` states this, and the register
+  line's `reach=` field is what tells a peer which of the two it is addressing.
 - The fix pipeline runs unattended via launchd every 10 minutes (`com.natemccoy.style-fix.plist`, `StartInterval=600`, no idle gate). `agents_config.sh`, `agent_assignments.sh`, the three stage scripts, and `fix_report_parse.py` must never be left broken, and the resolver must keep working under `/bin/bash` (3.2).
 - `/plan:delegate` is itself implemented by `scripts/delegate/*`, so any rename or signature change to those launchers must land together with the `commands/plan/delegate.md` call-site edits in one change.
+- Every `implement.sh` dispatch is a member of a phase team: `team_role` is required, every artifact it writes is suffixed with that role, and at most one member of a phase carries a `pass_kind`. The board, not the launcher, is what a fourth concurrent member would change.
+- No `/plan:delegate` prompt tells an agent to acquire the `cargo` token. `verify.sh` takes it, and a prompt that takes it too deadlocks the agent against its own held token.
 - `cf_load_stage_assignment` keeps its five-argument out-var signature; `fix-usage.sh` and the print helpers call it positionally.
 - The report parser slices launchd runs on exact substrings of the driver's stage-start lines — a reword must keep those leading phrases byte-identical or update the parser in the same change.
 - In the fix pipeline stage scripts, do **not** add family guards around the exec-marker transcript filter or the usage-limit detection: the first handles both families by pattern union, the second's codex-worded grep no-ops on claude logs, and the durable lines print `(${STYLE_AGENT} …)` with the parser accepting any family word.
@@ -177,6 +318,24 @@ All four wrappers capture resolver stderr into their log (`agents_resolve "$TASK
 - **Sandbox write denials.** `~/.claude/config` is a sandbox deny path and `~/.local/state/` is outside the write allowlist, so anything that rewrites `config/agents.conf` or completes the sync (`/agent` edits, conf round-trips, warming the freshness gate) must run with `dangerouslyDisableSandbox: true`. Sandboxed, only the `mktemp` fails and the sync's warn-and-continue masks it as a merely-stale catalog.
 - **Double resolution per launch.** Wrapper (provenance) plus `agent_exec` (execution) each source `agents_config.sh`, so a stale freshness gate fires the sync twice and doubles its `WARNING:` lines. Expected, not a defect.
 - **Absolute paths for `agent_exec`.** The claude branch redirects after `cd <working_dir>`, so relative output/log paths resolve against `working_dir` there but against the caller's cwd on the codex branch (the prompt file is read pre-`cd` in both).
+- **`initialize` needs `capabilities.experimentalApi: true`.** Without it the
+  app-server accepts the handshake and then fails `thread/queue/add` and
+  `turn/steer` with `-32600` and no indication a capability is missing.
+- **`thread/start` takes the SandboxMode *string*** (`"danger-full-access"`), not
+  the `SandboxPolicy` object (`{"type": "dangerFullAccess"}`) the generated
+  schema shows for other fields. The object is rejected as `unknown variant`.
+- **`ephemeral: true` and `thread/name/set` are incompatible** — the rename
+  returns `-32600 "ephemeral thread does not support metadata updates"`. Delegates
+  are ephemeral to match `codex exec --ephemeral`, so naming is best-effort and
+  `mesh_roster.json` is the address of record.
+- **`--listen unix://<path>` closes every connection silently** while the server
+  stays up. Use `ws://127.0.0.1:<port>`.
+- **`codex queue --thread` exits 0 for a thread with no live session.** The
+  acknowledgement says nothing about delivery — do not use it as a reachability
+  test.
+- **A finished codex delegate is gone.** Its thread ends with its turn, unlike a
+  claude background session, which a message resumes from its transcript. `send`
+  to a delegate whose roster status is not `running` will not be read.
 - **`AGENT_EXEC_EXTRA_ARGS` is whitespace-split with no quote interpretation.** Flag+value pairs (`--add-dir /path`) work; no single argument may contain a space — no prompt preambles, no `--settings` JSON.
 - **`AGENT_EXEC_DRY_RUN=1`** is the testing hook: `%q`-quoted argv plus redirection suffix, with a `cd <dir> && ` prefix on the claude branch. Match smoke checks on substrings (`--full-auto`, `--sandbox read-only`, `-m <agent>`, the effort word), never whole lines — the codex effort token renders with escaped quotes (`model_reasoning_effort=\"high\"`).
 - **awk gotchas.** `function` is a reserved awk word — pass it as `-v fn=`. `awk -v` decodes backslash escapes, so a value containing `\n` / `\t` would corrupt the row; user-supplied values go through `ENVIRON["…"]`.
@@ -185,6 +344,9 @@ All four wrappers capture resolver stderr into their log (`agents_resolve "$TASK
 - **Last-writer-wins on conf rewrites.** The source-time sync and the `/agent` editors both rewrite the file with tmp + `mv` and no locking; interleaved writers can silently revert each other's change but never corrupt the file.
 - **claude-family output needs `python3`.** The claude branch logs stream-JSON and extracts the final result event into the output file; without `python3` the output file would be empty even though the log is complete. Claude-family `readonly` reviewers running the style loader script under `--permission-mode plan --print` is untested — a family switch may silently degrade style loading.
 - **`_agents_registry_get` returns 0 on a miss** (prints nothing) so it is safe under `set -e` in command substitution; use `_agents_registry_has_key` when you need presence as a condition.
+- **The `cargo` build token belongs to `verify.sh`, and never to a prompt.** `verify.sh` acquires `board.sh … cargo` itself from `PLAN_DELEGATE_BOARD_DIR` / `PLAN_DELEGATE_TEAM_ROLE` and releases it from one unified EXIT/INT/TERM path, so concurrent team members serialize their builds without being asked to. Putting the acquire in a prompt as well makes that agent wait out the full `--wait` against a token it already holds, and the symptom — a member that just sits there — is indistinguishable from a slow test. With either env var unset the token step is skipped entirely, which is what keeps a standalone `verify.sh` run unchanged.
+- **A green `verify.sh` only means what the tree it ran against means.** With three members editing one worktree, a pass is authoritative for a slot's work only after that slot has posted `done` to the board.
+- **cargo-berth claims are per harness session id, so cross-slot edits are blocked, not merged.** Three delegates are three claim holders: the tester cannot add a `#[cfg(test)]` block to a file `impl` claimed, which is why the contract routes it to an integration test under `tests/`.
 - **Editing a live launcher in place** (a script currently running) produces a spurious `unexpected EOF` exit 2 after the real work completes — bash re-reads the modified file at a stale byte offset. Check the status file and diff before treating it as a failure.
 - Sync `WARNING:` lines land in launchd stderr logs; they are not stage failures, and the usage-limit regexes are written not to match them.
 

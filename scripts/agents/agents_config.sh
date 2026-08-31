@@ -5,6 +5,20 @@
 # an agent and optional effort, and each family to its valid agent catalog.
 # Consumers resolve task names through agents_resolve or agent_exec.
 
+# Bash only, and it has to say so rather than limp along. Sourced into zsh this
+# file fails two ways at once: zsh leaves BASH_REMATCH unset, so every section
+# lookup below matches nothing and returns empty answers with no error; and zsh
+# expands aliases while parsing a sourced file, so an interactive alias named
+# after a keyword the read loops use -- `continue` is aliased in this setup --
+# turns each loop iteration into a spawned command and the lookup hangs outright.
+# Every consumer is a bash script, so refusing costs nothing and a wrong answer
+# from a registry lookup is worse than no answer.
+if [ -n "${ZSH_VERSION:-}" ]; then
+    printf '%s\n' "agents_config.sh: bash only; sourced into zsh it returns empty rows and can hang." >&2
+    printf '%s\n' "  use: bash -c 'source ~/.claude/scripts/agents/agents_config.sh; <call>'" >&2
+    return 1 2>/dev/null || exit 1
+fi
+
 AGENTS_CONFIG_FILE="${AGENTS_CONFIG_FILE:-$HOME/.claude/config/agents.conf}"
 AGENTS_CONFIG_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CODEX_CONFIG_FILE="${CODEX_CONFIG_FILE:-$HOME/.codex/config.toml}"

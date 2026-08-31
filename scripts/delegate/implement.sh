@@ -3,7 +3,7 @@
 #
 # Usage: implement.sh <session_dir> [working_dir] [prompt_file] [task]
 #                     [role_description] [pass_kind] [pass_activity] [fix_pass]
-#                     <team_role>
+#                     <team_role> [mesh_prefix]
 #   role_description — 1-2 lines describing this dispatch's responsibility,
 #   written as a header block into the shared heartbeat log
 #   pass_kind — impl, arch, or fix; enables durable progress recording
@@ -24,6 +24,13 @@
 #   <session_dir>/impl_summary_<role>.txt — the implementation summary
 #   <session_dir>/impl_agent_<role>.log   — full agent log
 #   <session_dir>/impl_agent_<role>       — resolved task, family, agent, and effort
+#   <session_dir>/impl_bg_id_<role>       — the background session's short id, on
+#                                     the claude path only. The session is left
+#                                     alive when its turn ends so a peer's message
+#                                     can resume it; whoever runs the phase stops
+#                                     it with `claude stop <id>`. Absent on the
+#                                     codex path, whose address is a thread id in
+#                                     <session_dir>/mesh_roster.json instead.
 #   <session_dir>/board.log         — shared coordination board; this launcher
 #                                     posts each member's start and end so peers
 #                                     learn of them without the orchestrator,
@@ -61,11 +68,21 @@ SLOT="_${TEAM_ROLE}"
 BEAT_TAG="${SUBTASK}:${TEAM_ROLE}"
 BOARD_AGENT="${TEAM_ROLE}"
 
+# The address peers type to reach this member. It has to be unique across every
+# delegate alive on the machine, not just within this phase, because the session
+# registry is machine-wide -- two projects running phase 3 at once would collide
+# on a bare role name. The session directory's basename is already unique per
+# run, so it carries that uniqueness into the mesh.
+MESH_PREFIX="${10:-$(basename "${SESSION_DIR}")}"
+MESH_PREFIX="$(printf '%s' "${MESH_PREFIX}" | tr -c '[:alnum:]._-' '-' | cut -c1-40)"
+MESH_NAME="${MESH_PREFIX}-${TEAM_ROLE}"
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SUMMARY_FILE="${SESSION_DIR}/impl_summary${SLOT}.txt"
 STATUS_FILE="${SESSION_DIR}/impl_status${SLOT}"
 LOG_FILE="${SESSION_DIR}/impl_agent${SLOT}.log"
 AGENT_FILE="${SESSION_DIR}/impl_agent${SLOT}"
+BG_ID_FILE="${SESSION_DIR}/impl_bg_id${SLOT}"
 BOARD_HELPER="${SCRIPT_DIR}/board.sh"
 HEARTBEAT_HELPER="${SCRIPT_DIR}/../agents/heartbeat.sh"
 HEARTBEAT_FILE="${SESSION_DIR}/heartbeat.log"
@@ -121,16 +138,73 @@ bash "${HEARTBEAT_HELPER}" "${HEARTBEAT_FILE}" header "${BEAT_TAG} (${AGENT_FAMI
 # Announce the member on the shared board. Peers read the board to learn who is
 # running in which role; the orchestrator sleeps between progress ticks, so
 # nothing else would tell them.
+# Opt-in: codex delegates run as threads on one app-server instead of as
+# `codex exec` processes, which is what makes them addressable. Off by default so
+# a phase behaves exactly as before until the flag is set. The registry holds the
+# standing choice; the env var overrides it for one run. A missing key reads as
+# empty, which fails the test below and leaves the plain launcher in place.
+CODEX_MESH="${PLAN_DELEGATE_CODEX_MESH:-$(_agents_registry_get delegate.options codex_mesh)}"
+if [[ "${AGENT_FAMILY}" == "codex" && "${CODEX_MESH}" == "1" ]]; then
+  USE_CODEX_MESH=1
+else
+  USE_CODEX_MESH=0
+fi
+
+# The register line carries the mesh address as well as the role, so a peer that
+# joined late can learn who to message without being told at launch. A family
+# with no address says so, and that is what stops a peer waiting on a reply that
+# can never arrive.
+# The two families are reached by different calls, so the address alone is not
+# enough: a peer that picks the wrong call sends into nothing and then waits on a
+# reply that was never queued.
+if [[ "${AGENT_FAMILY}" == "claude" ]]; then
+  MESH_FIELD="mesh=${MESH_NAME}; reach=SendMessage"
+elif [[ "${USE_CODEX_MESH}" == "1" ]]; then
+  MESH_FIELD="mesh=${MESH_NAME}; reach=codex_mesh.py"
+else
+  MESH_FIELD="mesh=none"
+fi
 bash "${BOARD_HELPER}" post "${SESSION_DIR}" "${BOARD_AGENT}" register \
-  "${SUBTASK} launcher up (${AGENT_FAMILY}/${AGENT_MODEL}:${AGENT_EFFORT:-unset}); status in impl_status${SLOT}" || true
+  "${SUBTASK} launcher up (${AGENT_FAMILY}/${AGENT_MODEL}:${AGENT_EFFORT:-unset}); ${MESH_FIELD}; status in impl_status${SLOT}" || true
 
 # The delegate's own verify.sh runs inherit these and take the cargo token with
 # them, so serialization does not depend on the agent remembering a prompt rule.
 export PLAN_DELEGATE_BOARD_DIR="${SESSION_DIR}"
 export PLAN_DELEGATE_TEAM_ROLE="${TEAM_ROLE}"
 
-bash "${SCRIPT_DIR}/../agents/agent_exec.sh" \
-  "${TASK}" write "${WORKING_DIR}" "${PROMPT_FILE}" "${SUMMARY_FILE}" "${LOG_FILE}" &
+# A claude-family delegate launches as a NAMED BACKGROUND session so it joins the
+# machine's session mesh: it can message its peers and the orchestrator, and both
+# can message it, mid-run. A --print delegate carries the same ListAgents and
+# SendMessage tools but registers nowhere -- two concurrent print sessions in one
+# directory each report "no reachable agents" while the other is live -- so the
+# tools would be there and reach nobody. A codex delegate reaches the same place
+# by a different road: `codex exec` really is unreachable from outside its own
+# process, but a thread on a shared `codex app-server` is addressable, so
+# codex_mesh.py launches it there instead. Without the flag, codex keeps the
+# plain launcher and coordinates through the board alone.
+if [[ "${AGENT_FAMILY}" == "claude" ]]; then
+  bash "${SCRIPT_DIR}/../agents/agent_bg.sh" \
+    "${MESH_NAME}" "${WORKING_DIR}" "${PROMPT_FILE}" "${SUMMARY_FILE}" \
+    "${LOG_FILE}" "${BG_ID_FILE}" "${AGENT_MODEL}" &
+elif [[ "${USE_CODEX_MESH}" == "1" ]]; then
+  # Same foreground behavior as the plain launcher: codex_mesh.py blocks until the
+  # delegate's turn ends, so the wait, heartbeat, and pass recording below are
+  # unchanged. What it adds is an address other delegates can send to.
+  rm -f "${BG_ID_FILE}"
+  python3 "${SCRIPT_DIR}/../agents/codex_mesh.py" start \
+    --session-dir "${SESSION_DIR}" \
+    --name "${MESH_NAME}" \
+    --cwd "${WORKING_DIR}" \
+    --prompt-file "${PROMPT_FILE}" \
+    --summary-file "${SUMMARY_FILE}" \
+    --log-file "${LOG_FILE}" \
+    --model "${AGENT_MODEL}" \
+    --effort "${AGENT_EFFORT:-}" &
+else
+  rm -f "${BG_ID_FILE}"
+  bash "${SCRIPT_DIR}/../agents/agent_exec.sh" \
+    "${TASK}" write "${WORKING_DIR}" "${PROMPT_FILE}" "${SUMMARY_FILE}" "${LOG_FILE}" &
+fi
 AGENT_PID=$!
 
 # Wrapper beats with an activity digest from the agent log: proves the process
