@@ -67,6 +67,11 @@ fi
 SLOT="_${TEAM_ROLE}"
 BEAT_TAG="${SUBTASK}:${TEAM_ROLE}"
 BOARD_AGENT="${TEAM_ROLE}"
+# Exported here rather than beside the other launcher exports below, because
+# start-pass runs well before that point and the recorder reads this to label
+# which team slot owns the one pass a phase records. Set it late and the label
+# is silently empty rather than wrong, which is worse.
+export PLAN_DELEGATE_TEAM_ROLE="${TEAM_ROLE}"
 
 # The address peers type to reach this member. It has to be unique across every
 # delegate alive on the machine, not just within this phase, because the session
@@ -170,7 +175,6 @@ bash "${BOARD_HELPER}" post "${SESSION_DIR}" "${BOARD_AGENT}" register \
 # The delegate's own verify.sh runs inherit these and take the cargo token with
 # them, so serialization does not depend on the agent remembering a prompt rule.
 export PLAN_DELEGATE_BOARD_DIR="${SESSION_DIR}"
-export PLAN_DELEGATE_TEAM_ROLE="${TEAM_ROLE}"
 
 # A claude-family delegate launches as a NAMED BACKGROUND session so it joins the
 # machine's session mesh: it can message its peers and the orchestrator, and both

@@ -68,6 +68,12 @@ table|json|csv`. Beyond those:
   every total is smaller than an unfiltered read of the same corpus. Pass
   `--status all` to include them.
 - `--stage`, `--label`, `--agent` substring filters on `stages` and `runs`
+- `--group role` — the phase-team slot (`impl`, `impl2`, `test`, `review`) that
+  recorded the pass. **Empty on every pass before 2026-08-31**, and on any
+  recorder that does not run through `implement.sh`, where it groups as `-`.
+  Note what it does and does not measure: only the one member the orchestrator
+  hands a `pass_kind` records a pass at all, so `role` names which member that
+  was — it does not make the other two agents on a team phase visible
 - `tests` — `--label`, `--agent`, `--raw` (it pins `stage=test` itself)
 - `phases` — `--sort fix_passes|total`, default `total`
 - `compare` — `--on <date>` (required), `--window` (default `14d`, the span taken

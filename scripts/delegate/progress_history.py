@@ -837,6 +837,10 @@ def _close_active_pass(
         return
     event = _event(state, "pass_finished", now)
     event["status"] = status
+    # Taken from the pass, not from the environment. A stale pass is closed by
+    # whichever launcher starts the next one, and reading the environment here
+    # would stamp the closer's slot onto the opener's work.
+    event["team_role"] = _string(current_pass.get("team_role"))
     event["pass_elapsed_seconds"] = max(
         0,
         int(now - _number(current_pass.get("started_at"), now)),
@@ -1037,6 +1041,23 @@ def _start_phase(args: argparse.Namespace) -> None:
     _append_event(state, event)
 
 
+# The slot this launcher occupies in its phase team, exported by implement.sh
+# before it calls start-pass. Only the one member the orchestrator hands a
+# pass_kind records a pass, so this labels which of the three that was --
+# without it a team phase and a solo phase produce identical rows.
+TEAM_ROLE_ENV = "PLAN_DELEGATE_TEAM_ROLE"
+
+
+def _team_role() -> str:
+    """The recording member's slot, empty when nothing named one.
+
+    Empty reads as unknown rather than as a slot: passes predating the field,
+    and any recorder that does not run through implement.sh, must stay
+    distinguishable from a launcher that really is the `impl` member.
+    """
+    return os.environ.get(TEAM_ROLE_ENV, "")
+
+
 def _start_pass(args: argparse.Namespace) -> None:
     if not _launcher_owned():
         raise SystemExit(f"start-pass is the launcher's to record. {PASS_OWNERSHIP_RULE}")
@@ -1065,12 +1086,14 @@ def _start_pass(args: argparse.Namespace) -> None:
         "started_at": now,
         "called_task": _arg_string(args, "called_task"),
         "called_agent": called_agent,
+        "team_role": _team_role(),
         "status": "active",
     }
     state["pass"] = current_pass
     _write_state(session_dir, state)
     event = _event(state, "pass_started", now)
     event["config_digest"] = _config_digest()
+    event["team_role"] = _team_role()
     _append_event(state, event)
     # The reviewer this pass belongs to has been rendering as an armed row since
     # its early launch; its real window supersedes that one rather than joining

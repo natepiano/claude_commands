@@ -26,6 +26,7 @@ class ProgressHistoryTests(unittest.TestCase):
     working_dir: Path  # pyright: ignore[reportUninitializedInstanceVariable]
     config_file: Path  # pyright: ignore[reportUninitializedInstanceVariable]
     agents_config_file: Path  # pyright: ignore[reportUninitializedInstanceVariable]
+    team_role: str  # pyright: ignore[reportUninitializedInstanceVariable]
 
     @override
     def setUp(self) -> None:
@@ -44,6 +45,7 @@ class ProgressHistoryTests(unittest.TestCase):
         # would differ per machine and per registry edit. write_agents_registry
         # writes to this same path: one file, so arm-review resolves the agent
         # the test wrote instead of reading an empty one beside it.
+        self.team_role = ""
         self.agents_config_file = self.root / ".claude" / "config" / "agents.conf"
         self.agents_config_file.parent.mkdir(parents=True, exist_ok=True)
         _ = subprocess.run(
@@ -83,6 +85,13 @@ class ProgressHistoryTests(unittest.TestCase):
         environment["TZ"] = "UTC"
         environment["PLAN_DELEGATE_NOW_EPOCH"] = str(at)
         environment["PLAN_DELEGATE_PASS_OWNER"] = "launcher"
+        # Popped rather than left alone: the suite copies the ambient
+        # environment, so a developer running with a slot exported would
+        # otherwise see it stamped on every pass these tests record.
+        if self.team_role:
+            environment["PLAN_DELEGATE_TEAM_ROLE"] = self.team_role
+        else:
+            _ = environment.pop("PLAN_DELEGATE_TEAM_ROLE", None)
         self.isolate_identity(environment)
         if claude_session:
             environment["CLAUDE_CODE_SESSION_ID"] = claude_session
@@ -103,6 +112,13 @@ class ProgressHistoryTests(unittest.TestCase):
         environment["TZ"] = "UTC"
         environment["PLAN_DELEGATE_NOW_EPOCH"] = str(at)
         environment["PLAN_DELEGATE_PASS_OWNER"] = "launcher"
+        # Popped rather than left alone: the suite copies the ambient
+        # environment, so a developer running with a slot exported would
+        # otherwise see it stamped on every pass these tests record.
+        if self.team_role:
+            environment["PLAN_DELEGATE_TEAM_ROLE"] = self.team_role
+        else:
+            _ = environment.pop("PLAN_DELEGATE_TEAM_ROLE", None)
         self.isolate_identity(environment)
         return subprocess.run(
             ["python3", str(SCRIPT), *arguments],
@@ -935,12 +951,56 @@ class ProgressHistoryTests(unittest.TestCase):
         self.assertEqual(len(second), 12)
         self.assertNotEqual(second, expected)
 
+    def test_a_pass_records_the_team_slot_that_launched_it(self) -> None:
+        """Which of the three members recorded this pass."""
+        self.team_role = "impl"
+        session_dir = self.start_run("slot", 23_000)
+        self.start_phase_and_pass(session_dir, 23_010)
+        started = self.pass_events("slot", "pass_started")
+        self.assertEqual(len(started), 1)
+        self.assertEqual(started[0].get("team_role"), "impl")
+
+    def test_a_pass_with_no_slot_records_an_empty_team_role(self) -> None:
+        """Empty is unknown, not a slot name.
+
+        Passes predating the field, and any recorder outside implement.sh, have
+        to stay separable from a launcher that really is the `impl` member.
+        """
+        session_dir = self.start_run("no-slot", 24_000)
+        self.start_phase_and_pass(session_dir, 24_010)
+        started = self.pass_events("no-slot", "pass_started")
+        self.assertEqual(len(started), 1)
+        self.assertEqual(started[0].get("team_role"), "")
+
     def test_an_unreadable_conf_leaves_the_digest_empty_and_records_the_pass(self) -> None:
         session_dir = self.start_run("no-registry", 21_000)
         self.start_phase_and_pass(session_dir, 21_010)
         started = self.pass_events("no-registry", "pass_started")
         self.assertEqual(len(started), 1)
         self.assertEqual(started[0].get("config_digest"), "")
+
+    def test_the_finished_pass_carries_the_slot_that_opened_it(self) -> None:
+        """The reader joins on finished events, so the slot has to survive there.
+
+        Taken from the pass record rather than the environment: a stale pass is
+        closed by whichever launcher starts the next one, and that launcher
+        holds its own slot.
+        """
+        self.team_role = "review"
+        session_dir = self.start_run("slot-finish", 25_000)
+        self.start_phase_and_pass(session_dir, 25_010)
+        self.team_role = "impl"
+        _ = self.run_command(
+            "finish-pass",
+            "--session-dir",
+            str(session_dir),
+            "--status",
+            "completed",
+            at=25_500,
+        )
+        finished = self.pass_events("slot-finish", "pass_finished")
+        self.assertEqual(len(finished), 1)
+        self.assertEqual(finished[0].get("team_role"), "review")
 
     def test_finish_pass_records_the_seconds_the_delegate_was_awake(self) -> None:
         session_dir = self.start_run("awake", 22_000)
