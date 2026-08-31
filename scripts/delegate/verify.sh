@@ -17,8 +17,10 @@
 #
 # Usage:
 #   verify.sh check <package>              fast compile feedback (lib + bins)
-#   verify.sh test <package>               unit tests (lib + bins)
-#   verify.sh test <package> <int_test>    one named integration test target
+#   verify.sh test <package>               unit + integration tests
+#                                          (lib + bins + tests)
+#   verify.sh test <package> <int_test>    one named integration test target,
+#                                          for re-running it alone
 #   verify.sh lint <package>               format, then scoped clippy (warnings denied)
 #                                          — both halves gated by config/lint.conf
 #   verify.sh fmt <package>                format only (checkpoint-commit backstop)
@@ -128,16 +130,46 @@ shift
 # rule applies here too — the thing that runs the work opens the window.
 PROGRESS_HISTORY="${HOME}/.claude/scripts/delegate/progress_history.py"
 ACTIVITY_SESSION_DIR="${PLAN_DELEGATE_SESSION_DIR:-}"
+
+# A phase runs three delegates against one target/ directory and one Cargo lock,
+# so every cargo run below has to be serialized against its peers. Taking the
+# token here rather than asking each delegate's prompt to take it is deliberate:
+# a rule that lives only in a prompt is a rule an agent can drop, and dropping
+# this one blocks the whole team behind a lock nobody announced.
+#
+# PLAN_DELEGATE_BOARD_DIR is deliberately not PLAN_DELEGATE_SESSION_DIR: that
+# variable also opens a progress activity window, and three concurrent windows
+# would collide in a recorder that keeps one.
+BOARD_HELPER="${HOME}/.claude/scripts/delegate/board.sh"
+BOARD_DIR="${PLAN_DELEGATE_BOARD_DIR:-}"
+BOARD_SLOT="${PLAN_DELEGATE_TEAM_ROLE:-}"
+TOKEN_HELD=0
+if [[ -n "${BOARD_DIR}" && -n "${BOARD_SLOT}" && -f "${BOARD_HELPER}" ]]; then
+    if bash "${BOARD_HELPER}" acquire "${BOARD_DIR}" "${BOARD_SLOT}" cargo \
+        --hold 3600 --wait 1800 >/dev/null 2>&1; then
+        TOKEN_HELD=1
+    else
+        echo "verify.sh: waited for the cargo token and did not get it; running anyway." >&2
+    fi
+fi
+
+release_token() {
+    [[ "${TOKEN_HELD}" -eq 1 ]] || return 0
+    TOKEN_HELD=0
+    bash "${BOARD_HELPER}" release "${BOARD_DIR}" "${BOARD_SLOT}" cargo >/dev/null 2>&1 || true
+}
+ACTIVITY_ACTIVE=0
 if [[ -n "${ACTIVITY_SESSION_DIR}" \
       && -f "${ACTIVITY_SESSION_DIR}/progress_history_state.json" ]]; then
     if python3 "${PROGRESS_HISTORY}" start-activity \
         --session-dir "${ACTIVITY_SESSION_DIR}" \
         --label "Verification" \
         --activity "${CMD} ${*:-workspace}" >/dev/null 2>&1; then
+        ACTIVITY_ACTIVE=1
         finish_activity() {
             local status=$1
-            # The stage table shows an outcome per row, and "completed" only
-            # says the window closed. Name what the gate actually did.
+            # An activity row shows an outcome, and "completed" only says the
+            # window closed. Name what the gate actually did.
             local result=""
             case "${status}" in
                 completed) result="pass" ;;
@@ -148,12 +180,23 @@ if [[ -n "${ACTIVITY_SESSION_DIR}" \
                 --status "${status}" \
                 --result "${result}" >/dev/null 2>&1 || true
         }
-        # EXIT alone would report success for a failed cargo run, so branch on the
-        # status the trap receives.
-        trap '[[ $? -eq 0 ]] && finish_activity completed || finish_activity error' EXIT
-        trap 'finish_activity interrupted' INT TERM
     fi
 fi
+
+# One exit path for both the progress window and the token, so a run that fails
+# or is interrupted still hands the token back instead of leaving its peers to
+# wait out the hold.
+verify_cleanup() {
+    local status=$1
+    if [[ "${ACTIVITY_ACTIVE}" -eq 1 ]]; then
+        finish_activity "${status}"
+    fi
+    release_token
+}
+# EXIT alone would report success for a failed cargo run, so branch on the
+# status the trap receives.
+trap '[[ $? -eq 0 ]] && verify_cleanup completed || verify_cleanup error' EXIT
+trap 'verify_cleanup interrupted' INT TERM
 
 case "$CMD" in
     check)
@@ -172,8 +215,15 @@ case "$CMD" in
             run_nextest --no-fail-fast -p "$PKG" --test "$TARGET"
         else
             FLAGS="$(target_flags "$PKG")"
+            # --tests adds the package's integration targets, matching what the
+            # lint half already compiles under clippy. Without it a phase could
+            # lint an integration test, pass its gate, and checkpoint without
+            # ever running it. The build cost is already sunk by lint; the
+            # measured runtime cost is seconds, because the expensive
+            # compile-fail suites are #[ignore]d and .config/nextest.toml keeps
+            # tool_id_boundary's downstream cases out of the default profile.
             # shellcheck disable=SC2086
-            run_nextest --no-fail-fast -p "$PKG" $FLAGS
+            run_nextest --no-fail-fast -p "$PKG" $FLAGS --tests
         fi
         ;;
     lint)
