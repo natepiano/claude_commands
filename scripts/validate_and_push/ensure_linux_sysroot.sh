@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-SYSROOT_VERSION="debian-bookworm-amd64-v4"
+SYSROOT_VERSION="debian-bookworm-amd64-v7"
 DEBIAN_MIRROR="${VALIDATE_LINUX_DEBIAN_MIRROR:-https://deb.debian.org/debian}"
 DEBIAN_SUITE="${VALIDATE_LINUX_DEBIAN_SUITE:-bookworm}"
 DEBIAN_ARCH="${VALIDATE_LINUX_DEBIAN_ARCH:-amd64}"
@@ -47,7 +47,7 @@ SYSROOT_LOCK_DIR="${SYSROOT}/.lock"
 CACHE_LOCK_DIR="${CACHE_DIR}/.lock"
 LOCK_STALE_SECONDS="${VALIDATE_LINUX_LOCK_STALE_SECONDS:-900}"
 LOCK_HOST="$(hostname 2>/dev/null || uname -n 2>/dev/null || printf 'unknown')"
-REQUESTED_PACKAGES="libwayland-dev libasound2-dev libasound2 libffi-dev libudev-dev libudev1"
+REQUESTED_PACKAGES="libwayland-dev libasound2-dev libasound2 libffi-dev libudev-dev libudev1 libegl-dev libxkbcommon-dev libpipewire-0.3-dev libspa-0.2-dev libgbm-dev libc6-dev linux-libc-dev"
 REQUIRED_PC_FILES="
 ${SYSROOT}/usr/lib/${TARGET_TRIPLE}/pkgconfig/wayland-client.pc
 ${SYSROOT}/usr/lib/${TARGET_TRIPLE}/pkgconfig/alsa.pc
@@ -55,6 +55,12 @@ ${SYSROOT}/usr/lib/${TARGET_TRIPLE}/libasound.so.2
 ${SYSROOT}/usr/lib/${TARGET_TRIPLE}/pkgconfig/libffi.pc
 ${SYSROOT}/usr/lib/${TARGET_TRIPLE}/pkgconfig/libudev.pc
 ${SYSROOT}/usr/lib/${TARGET_TRIPLE}/libudev.so.1
+${SYSROOT}/usr/lib/${TARGET_TRIPLE}/pkgconfig/egl.pc
+${SYSROOT}/usr/lib/${TARGET_TRIPLE}/pkgconfig/xkbcommon.pc
+${SYSROOT}/usr/lib/${TARGET_TRIPLE}/pkgconfig/libpipewire-0.3.pc
+${SYSROOT}/usr/lib/${TARGET_TRIPLE}/pkgconfig/gbm.pc
+${SYSROOT}/usr/lib/${TARGET_TRIPLE}/pkgconfig/libspa-0.2.pc
+${SYSROOT}/usr/include/inttypes.h
 "
 
 log() {
@@ -83,6 +89,9 @@ write_env_file() {
     printf '\n'
     printf 'export PKG_CONFIG_LIBDIR='
     quote_shell "${SYSROOT}/usr/lib/${TARGET_TRIPLE}/pkgconfig:${SYSROOT}/usr/share/pkgconfig"
+    printf '\n'
+    printf 'export BINDGEN_EXTRA_CLANG_ARGS_x86_64_unknown_linux_gnu='
+    quote_shell "--target=x86_64-unknown-linux-gnu --sysroot=${SYSROOT} -I${SYSROOT}/usr/include -I${SYSROOT}/usr/include/${TARGET_TRIPLE}"
     printf '\n'
   } > "$ENV_FILE"
 }
