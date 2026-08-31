@@ -65,7 +65,7 @@ STAGE_ORDER: list[str] = ["implementation", "review", "fix", "test", "final", "o
 GROUP_KEYS: list[str] = [
     "skill",
     "stage",
-    "role",
+    "slot",
     "label",
     "agent",
     "task",
@@ -117,7 +117,7 @@ class StageRow(TypedDict):
     label: str
     task: str
     agent: str
-    role: str
+    slot: str
     result: str
     status: str
     started_at: float
@@ -367,7 +367,9 @@ def _normalize(
         agent=agent,
         # Empty on every pre-2026-08-31 pass and on any recorder outside
         # implement.sh, so it groups as "-" rather than claiming a slot.
-        role=_string(event.get("team_role")),
+        # The one-day-old "team_role" spelling is not read: every event
+        # written under it carried an empty value, so nothing is lost.
+        slot=_string(event.get("team_slot")),
         result=result,
         status=_string(event.get("status")),
         started_at=started,
@@ -555,7 +557,7 @@ def _group_of(row: StageRow, keys: list[str]) -> tuple[str, ...]:
         "stage": row["stage"] or "-",
         "label": row["label"] or "-",
         "agent": row["agent"] or "-",
-        "role": row["role"] or "-",
+        "slot": row["slot"] or "-",
         "task": row["task"] or "-",
         "run": row["run"] or "-",
         "branch": row["branch"] or "-",

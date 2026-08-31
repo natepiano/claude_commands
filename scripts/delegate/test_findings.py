@@ -55,6 +55,11 @@ class FindingsLedgerTests(unittest.TestCase):
         environment = os.environ.copy()
         environment["PLAN_DELEGATE_NOW_EPOCH"] = str(at)
         environment["PLAN_DELEGATE_CONFIG"] = str(self.config_file)
+        # The gate reads pass events from the durable stream under this root.
+        # Left unset it resolves to the machine's own history, where a phase id
+        # this fixture invented would be answered by whatever happens to live
+        # there.
+        environment["PLAN_DELEGATE_HISTORY_DIR"] = str(self.root / "history")
         return environment
 
     def write_config(self, text: str) -> None:
@@ -93,6 +98,37 @@ class FindingsLedgerTests(unittest.TestCase):
         _ = (self.session_dir / "progress_history_state.json").write_text(
             json.dumps(state), encoding="utf-8"
         )
+
+    def write_pass_events(
+        self,
+        instance_id: str,
+        passes: list[tuple[str, str, str]],
+        slot_key: str = "team_slot",
+    ) -> None:
+        """Stand in for the recorder's durable stream: (kind, seat, status) rows.
+
+        In the order the passes opened. An empty status leaves the pass open,
+        which is the row a launcher still waiting on its agent contributes. An
+        empty `slot_key` writes no seat field at all, which is every pass the
+        back corpus recorded.
+        """
+        path = self.root / "history" / "runs" / f"{self.session_dir.name}.jsonl"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        lines: list[str] = []
+        for index, (kind, slot, status) in enumerate(passes):
+            started: dict[str, object] = {
+                "event_type": "pass_started",
+                "phase_instance_id": instance_id,
+                "pass_instance_id": f"pass-{index}",
+                "pass_kind": kind,
+            }
+            if slot_key:
+                started[slot_key] = slot
+            lines.append(json.dumps(started))
+            if status:
+                finished = {**started, "event_type": "pass_finished", "status": status}
+                lines.append(json.dumps(finished))
+        _ = path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
     def open_finding(self, severity: str, title: str, *, at: int = 1_000) -> str:
         return self.run_command(
@@ -396,6 +432,128 @@ class FindingsLedgerTests(unittest.TestCase):
         self.assertEqual(payload["passes_run"], 0)
         self.assertIsNone(payload["consecutive_same_kind"])
         self.assertEqual(payload["review_cancellations"], 0)
+
+    def test_three_seats_running_one_kind_each_do_not_trip_the_gate(self) -> None:
+        """A phase team is one round with three workers, not three rounds.
+
+        Every member records a pass of its own now, so the flat sequence reaches
+        the same-kind limit on the first team phase that ever runs. The limit is
+        about one seat being handed the same work repeatedly.
+        """
+        self.write_progress_state("phase-instance")
+        self.write_pass_events(
+            "phase-instance",
+            [
+                ("impl", "impl", "completed"),
+                ("impl", "test", "completed"),
+                ("impl", "review", "completed"),
+            ],
+        )
+        _ = self.open_finding("blocker", "null deref")
+        payload = self.gate()
+        self.assertEqual(payload["passes_run"], 3)
+        self.assertEqual(payload["consecutive_same_kind"], {"kind": "impl", "count": 1})
+        self.assertIsNone(payload["advisory"])
+
+    def test_one_seat_repeating_a_kind_trips_the_gate_beside_busy_peers(self) -> None:
+        """The run is counted inside a seat, so its peers cannot hide it."""
+        self.write_progress_state("phase-instance")
+        self.write_pass_events(
+            "phase-instance",
+            [
+                ("impl", "impl", "completed"),
+                ("fix", "test", "completed"),
+                ("impl", "impl", "completed"),
+                ("review", "review", "completed"),
+                ("impl", "impl", ""),
+            ],
+        )
+        _ = self.open_finding("blocker", "null deref")
+        payload = self.gate()
+        self.assertEqual(payload["consecutive_same_kind"], {"kind": "impl", "count": 3})
+        self.assertEqual(
+            payload["advisory"],
+            "3 consecutive impl passes ran without the phase advancing",
+        )
+
+    def test_passes_with_no_seat_are_counted_as_one_sequence(self) -> None:
+        """The back corpus and every solo phase keep today's answer exactly.
+
+        No pass recorded before seats existed carries one, so they share the
+        empty bucket and the run is computed over the flat sequence.
+        """
+        self.write_progress_state("phase-instance")
+        self.write_pass_events(
+            "phase-instance",
+            [
+                ("impl", "", "completed"),
+                ("impl", "", "completed"),
+                ("impl", "", "completed"),
+            ],
+            slot_key="",
+        )
+        _ = self.open_finding("blocker", "null deref")
+        payload = self.gate()
+        self.assertEqual(payload["consecutive_same_kind"], {"kind": "impl", "count": 3})
+        self.assertEqual(
+            payload["advisory"],
+            "3 consecutive impl passes ran without the phase advancing",
+        )
+
+    def test_one_canceled_review_per_seat_is_not_a_review_that_cannot_finish(self) -> None:
+        """Three reviewers interrupted once each is not one that never completes."""
+        self.write_progress_state("phase-instance")
+        self.write_pass_events(
+            "phase-instance",
+            [
+                ("review", "impl", "canceled"),
+                ("review", "test", "canceled"),
+                ("review", "review", "canceled"),
+            ],
+        )
+        _ = self.open_finding("blocker", "null deref")
+        payload = self.gate()
+        self.assertEqual(payload["review_cancellations"], 1)
+        self.assertIsNone(payload["advisory"])
+
+    def test_repeated_cancellations_in_one_seat_still_trip_the_review_limit(self) -> None:
+        self.write_progress_state("phase-instance")
+        self.write_pass_events(
+            "phase-instance",
+            [
+                ("review", "", "canceled"),
+                ("review", "", "canceled"),
+            ],
+            slot_key="",
+        )
+        _ = self.open_finding("blocker", "null deref")
+        payload = self.gate()
+        self.assertEqual(payload["review_cancellations"], 2)
+        self.assertEqual(
+            payload["advisory"],
+            "the blind review was canceled 2 times, so it is never completing",
+        )
+
+    def test_a_seat_recorded_before_the_field_was_renamed_stays_one_sequence(self) -> None:
+        """A phase that spans the rename must not read as two seats.
+
+        The field was `team_role` for a day. A launcher whose pass opened under
+        the old name and a peer opened under the new one are still two seats,
+        and the seat that repeated a kind is still the one that trips.
+        """
+        self.write_progress_state("phase-instance")
+        self.write_pass_events(
+            "phase-instance",
+            [
+                ("impl", "impl", "completed"),
+                ("impl", "impl", "completed"),
+                ("impl", "impl", "completed"),
+            ],
+            slot_key="team_role",
+        )
+        _ = self.open_finding("blocker", "null deref")
+        payload = self.gate()
+        self.assertEqual(payload["consecutive_same_kind"], {"kind": "impl", "count": 3})
 
     def test_reopening_an_accepted_finding_requires_evidence(self) -> None:
         _ = self.open_finding("blocker", "null deref")

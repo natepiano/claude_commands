@@ -33,8 +33,8 @@ rather than enforced:
   * the gating open count failed to decrease across `STALLED_ROUNDS` rounds
   * the phase spent its repair budget, which is the first round's gating count
     times `REPAIR_ROUNDS_PER_FINDING`, never below `MIN_REPAIR_BUDGET`
-  * `MAX_CONSECUTIVE_SAME_KIND_PASSES` passes of one kind ran in a row
-  * the blind review was canceled more than `MAX_REVIEW_CANCELLATIONS` times
+  * one seat ran `MAX_CONSECUTIVE_SAME_KIND_PASSES` passes of one kind in a row
+  * one seat had a review canceled more than `MAX_REVIEW_CANCELLATIONS` times
   * a runaway backstop at `RUNAWAY_ROUNDS` rounds
 
 Every one of those limits is set in `~/.claude/config/delegate.conf`, which is
@@ -60,7 +60,7 @@ import uuid
 from collections.abc import Callable
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import cast
+from typing import TypedDict, cast
 
 
 SCHEMA_VERSION = 1
@@ -414,13 +414,39 @@ def _history_root() -> Path:
     return Path.home() / ".local" / "state" / "plan-delegate"
 
 
-def _phase_passes(session_dir: Path, instance_id: str) -> list[tuple[str, str]]:
-    """Every pass this phase instance has run, as (kind, status) in order.
+class PhasePass(TypedDict):
+    """One pass a phase ran: what work it was, which seat ran it, how it ended.
+
+    `kind` stays semantic -- impl, fix, review, arch -- and says nothing about
+    who ran it. `slot` is the seat: a stable worker identity for the length of
+    one launcher, not the role that worker is performing, which changes during a
+    phase and lives on the coordination board.
+    """
+
+    kind: str
+    slot: str
+    status: str
+
+
+def _event_slot(event: dict[str, object]) -> str:
+    """The seat a pass event was stamped with, under whichever key wrote it.
+
+    The field was `team_role` for a day, before the value was understood to
+    name a seat. Reading both keeps a phase that spans the rename to one bucket
+    per seat instead of splitting each seat in two.
+    """
+    if "team_slot" in event:
+        return _string(event.get("team_slot"))
+    return _string(event.get("team_role"))
+
+
+def _phase_passes(session_dir: Path, instance_id: str) -> list[PhasePass]:
+    """Every pass this phase instance has run, in the order they opened.
 
     Read from the durable event stream rather than the session cache: the cache
-    holds only the pass currently running, and what the gate needs is the shape
-    of the whole phase. `finished` carries the outcome; a pass still running
-    contributes its `started` row with an empty status.
+    holds one pass per seat and what the gate needs is the whole phase.
+    `finished` carries the outcome; a pass still running contributes its
+    `started` row with an empty status.
     """
     if not instance_id:
         return []
@@ -429,7 +455,8 @@ def _phase_passes(session_dir: Path, instance_id: str) -> list[tuple[str, str]]:
         lines = path.read_text(encoding="utf-8").splitlines()
     except OSError:
         return []
-    passes: dict[str, tuple[int, str, str]] = {}
+    opened_at: dict[str, int] = {}
+    passes: dict[str, PhasePass] = {}
     for order, line in enumerate(lines):
         line = line.strip()
         if not line:
@@ -446,24 +473,68 @@ def _phase_passes(session_dir: Path, instance_id: str) -> list[tuple[str, str]]:
         if not pass_id:
             continue
         kind = _string(event.get("pass_kind"))
+        slot = _event_slot(event)
         status = _string(event.get("status")) if event_type == "pass_finished" else ""
         existing = passes.get(pass_id)
-        seen_at = existing[0] if existing else order
-        passes[pass_id] = (seen_at, kind or (existing[1] if existing else ""), status)
-    return [(kind, status) for _, kind, status in sorted(passes.values())]
+        _ = opened_at.setdefault(pass_id, order)
+        passes[pass_id] = PhasePass(
+            kind=kind or (existing["kind"] if existing else ""),
+            slot=slot or (existing["slot"] if existing else ""),
+            status=status,
+        )
+    return [passes[pass_id] for pass_id in sorted(passes, key=lambda key: opened_at[key])]
 
 
-def _consecutive_same_kind(passes: list[tuple[str, str]]) -> tuple[str, int]:
-    """The longest run of one pass kind ending at the most recent pass."""
-    if not passes:
-        return "", 0
-    kind = passes[-1][0]
-    run = 0
-    for entry_kind, _ in reversed(passes):
-        if entry_kind != kind:
-            break
-        run += 1
-    return kind, run
+def _passes_by_slot(passes: list[PhasePass]) -> dict[str, list[PhasePass]]:
+    """The phase's passes split into one sequence per seat, order preserved.
+
+    Passes with no seat land in one bucket together, which is every pass the
+    back corpus recorded and every pass of a phase run by a single launcher --
+    the sequence those see is the flat one, exactly as before seats existed.
+    """
+    by_slot: dict[str, list[PhasePass]] = {}
+    for entry in passes:
+        by_slot.setdefault(entry["slot"], []).append(entry)
+    return by_slot
+
+
+def _consecutive_same_kind(passes: list[PhasePass]) -> tuple[str, int]:
+    """The longest run of one kind ending at some seat's most recent pass.
+
+    Counted within a seat, never across seats. A phase team runs three launchers
+    at once, so three impl passes in the event stream are one round with three
+    workers; what this limit guards against is one seat being handed the same
+    kind of work over and over while the phase fails to advance, and only that
+    seat's own sequence shows it.
+    """
+    longest_kind = ""
+    longest_run = 0
+    by_slot = _passes_by_slot(passes)
+    for slot in sorted(by_slot):
+        seat_passes = by_slot[slot]
+        kind = seat_passes[-1]["kind"]
+        run = 0
+        for entry in reversed(seat_passes):
+            if entry["kind"] != kind:
+                break
+            run += 1
+        if run > longest_run:
+            longest_kind, longest_run = kind, run
+    return longest_kind, longest_run
+
+
+def _review_cancellations(passes: list[PhasePass]) -> int:
+    """The most times any one seat had a review pass canceled.
+
+    Per seat for the same reason the kind run is: the limit asks whether a
+    reviewer is never completing, and one cancellation each across three seats
+    is three reviewers interrupted once, not one that cannot finish.
+    """
+    per_slot: dict[str, int] = {}
+    for entry in passes:
+        if entry["kind"] == "review" and entry["status"] == "canceled":
+            per_slot[entry["slot"]] = per_slot.get(entry["slot"], 0) + 1
+    return max(per_slot.values(), default=0)
 
 
 def _repair_budget(state: dict[str, object]) -> int:
@@ -542,7 +613,7 @@ def _open_counts(state: dict[str, object]) -> dict[str, int]:
 def _advisory_reason(
     state: dict[str, object],
     gating_open: int,
-    passes: list[tuple[str, str]],
+    passes: list[PhasePass],
 ) -> str:
     """The convergence pattern worth reporting this round, or "" for none.
 
@@ -571,9 +642,7 @@ def _advisory_reason(
     kind, run = _consecutive_same_kind(passes)
     if run >= MAX_CONSECUTIVE_SAME_KIND_PASSES:
         return f"{run} consecutive {kind} passes ran without the phase advancing"
-    cancellations = sum(
-        1 for pass_kind, status in passes if pass_kind == "review" and status == "canceled"
-    )
+    cancellations = _review_cancellations(passes)
     if cancellations > MAX_REVIEW_CANCELLATIONS:
         return f"the blind review was canceled {cancellations} times, so it is never completing"
     # Stall and budget read live rounds: an abandoned round repaired nothing, so
@@ -716,9 +785,7 @@ def _gate_payload(state: dict[str, object], session_dir: Path) -> dict[str, obje
         "repair_budget": _repair_budget(state),
         "passes_run": len(passes),
         "consecutive_same_kind": {"kind": kind, "count": run} if run else None,
-        "review_cancellations": sum(
-            1 for pass_kind, status in passes if pass_kind == "review" and status == "canceled"
-        ),
+        "review_cancellations": _review_cancellations(passes),
     }
     if not batch:
         payload["verdict"] = "converged"

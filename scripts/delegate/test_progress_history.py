@@ -26,7 +26,7 @@ class ProgressHistoryTests(unittest.TestCase):
     working_dir: Path  # pyright: ignore[reportUninitializedInstanceVariable]
     config_file: Path  # pyright: ignore[reportUninitializedInstanceVariable]
     agents_config_file: Path  # pyright: ignore[reportUninitializedInstanceVariable]
-    team_role: str  # pyright: ignore[reportUninitializedInstanceVariable]
+    team_slot: str  # pyright: ignore[reportUninitializedInstanceVariable]
 
     @override
     def setUp(self) -> None:
@@ -45,7 +45,7 @@ class ProgressHistoryTests(unittest.TestCase):
         # would differ per machine and per registry edit. write_agents_registry
         # writes to this same path: one file, so arm-review resolves the agent
         # the test wrote instead of reading an empty one beside it.
-        self.team_role = ""
+        self.team_slot = ""
         self.agents_config_file = self.root / ".claude" / "config" / "agents.conf"
         self.agents_config_file.parent.mkdir(parents=True, exist_ok=True)
         _ = subprocess.run(
@@ -86,10 +86,10 @@ class ProgressHistoryTests(unittest.TestCase):
         environment["PLAN_DELEGATE_NOW_EPOCH"] = str(at)
         environment["PLAN_DELEGATE_PASS_OWNER"] = "launcher"
         # Popped rather than left alone: the suite copies the ambient
-        # environment, so a developer running with a slot exported would
+        # environment, so a developer running with a seat exported would
         # otherwise see it stamped on every pass these tests record.
-        if self.team_role:
-            environment["PLAN_DELEGATE_TEAM_ROLE"] = self.team_role
+        if self.team_slot:
+            environment["PLAN_DELEGATE_TEAM_ROLE"] = self.team_slot
         else:
             _ = environment.pop("PLAN_DELEGATE_TEAM_ROLE", None)
         self.isolate_identity(environment)
@@ -113,10 +113,10 @@ class ProgressHistoryTests(unittest.TestCase):
         environment["PLAN_DELEGATE_NOW_EPOCH"] = str(at)
         environment["PLAN_DELEGATE_PASS_OWNER"] = "launcher"
         # Popped rather than left alone: the suite copies the ambient
-        # environment, so a developer running with a slot exported would
+        # environment, so a developer running with a seat exported would
         # otherwise see it stamped on every pass these tests record.
-        if self.team_role:
-            environment["PLAN_DELEGATE_TEAM_ROLE"] = self.team_role
+        if self.team_slot:
+            environment["PLAN_DELEGATE_TEAM_ROLE"] = self.team_slot
         else:
             _ = environment.pop("PLAN_DELEGATE_TEAM_ROLE", None)
         self.isolate_identity(environment)
@@ -951,17 +951,17 @@ class ProgressHistoryTests(unittest.TestCase):
         self.assertEqual(len(second), 12)
         self.assertNotEqual(second, expected)
 
-    def test_a_pass_records_the_team_slot_that_launched_it(self) -> None:
+    def test_a_pass_records_the_team_seat_that_launched_it(self) -> None:
         """Which of the three members recorded this pass."""
-        self.team_role = "impl"
+        self.team_slot = "impl"
         session_dir = self.start_run("slot", 23_000)
         self.start_phase_and_pass(session_dir, 23_010)
         started = self.pass_events("slot", "pass_started")
         self.assertEqual(len(started), 1)
-        self.assertEqual(started[0].get("team_role"), "impl")
+        self.assertEqual(started[0].get("team_slot"), "impl")
 
-    def test_a_pass_with_no_slot_records_an_empty_team_role(self) -> None:
-        """Empty is unknown, not a slot name.
+    def test_a_pass_with_no_seat_records_an_empty_team_slot(self) -> None:
+        """Empty is unknown, not a seat name.
 
         Passes predating the field, and any recorder outside implement.sh, have
         to stay separable from a launcher that really is the `impl` member.
@@ -970,7 +970,7 @@ class ProgressHistoryTests(unittest.TestCase):
         self.start_phase_and_pass(session_dir, 24_010)
         started = self.pass_events("no-slot", "pass_started")
         self.assertEqual(len(started), 1)
-        self.assertEqual(started[0].get("team_role"), "")
+        self.assertEqual(started[0].get("team_slot"), "")
 
     def test_an_unreadable_conf_leaves_the_digest_empty_and_records_the_pass(self) -> None:
         session_dir = self.start_run("no-registry", 21_000)
@@ -979,19 +979,19 @@ class ProgressHistoryTests(unittest.TestCase):
         self.assertEqual(len(started), 1)
         self.assertEqual(started[0].get("config_digest"), "")
 
-    def test_the_finished_pass_carries_the_slot_that_opened_it(self) -> None:
-        """The reader joins on finished events, so the slot has to survive there.
+    def test_the_finished_pass_carries_the_seat_that_opened_it(self) -> None:
+        """The reader joins on finished events, so the seat has to survive there.
 
-        Taken from the pass record rather than the environment: a stale pass is
-        closed by whichever launcher starts the next one, and that launcher
-        holds its own slot.
+        Taken from the pass record rather than the environment: the phase ends
+        under the main agent, which holds no seat at all, and the pass it closes
+        still has to name the member that opened it.
         """
-        self.team_role = "review"
+        self.team_slot = "review"
         session_dir = self.start_run("slot-finish", 25_000)
         self.start_phase_and_pass(session_dir, 25_010)
-        self.team_role = "impl"
+        self.team_slot = ""
         _ = self.run_command(
-            "finish-pass",
+            "finish-phase",
             "--session-dir",
             str(session_dir),
             "--status",
@@ -1000,7 +1000,282 @@ class ProgressHistoryTests(unittest.TestCase):
         )
         finished = self.pass_events("slot-finish", "pass_finished")
         self.assertEqual(len(finished), 1)
-        self.assertEqual(finished[0].get("team_role"), "review")
+        self.assertEqual(finished[0].get("team_slot"), "review")
+
+    def start_phase(self, session_dir: Path, at: int) -> None:
+        _ = self.run_command(
+            "start-phase",
+            "--session-dir",
+            str(session_dir),
+            "--phase-id",
+            "3",
+            "--phase-title",
+            "Retry handling",
+            at=at,
+        )
+
+    def start_slot_pass(
+        self,
+        session_dir: Path,
+        slot: str,
+        pass_kind: str,
+        at: int,
+        called_model: str = "gpt-called",
+    ) -> None:
+        """Open a pass the way one member of a phase team opens its own."""
+        self.team_slot = slot
+        _ = self.run_command(
+            "start-pass",
+            "--session-dir",
+            str(session_dir),
+            "--pass-kind",
+            pass_kind,
+            "--activity",
+            f"{slot or 'unslotted'} work",
+            "--called-task",
+            "delegate.implementation",
+            "--called-family",
+            "codex",
+            "--called-model",
+            called_model,
+            "--called-effort",
+            "high",
+            at=at,
+        )
+
+    def finish_slot_pass(
+        self,
+        session_dir: Path,
+        slot: str,
+        status: str,
+        at: int,
+    ) -> None:
+        self.team_slot = slot
+        _ = self.run_command(
+            "finish-pass",
+            "--session-dir",
+            str(session_dir),
+            "--status",
+            status,
+            at=at,
+        )
+
+    def pass_slots(self, session_dir: Path) -> dict[str, dict[str, object]]:
+        """The recorder's per-slot pass records, as they sit on disk."""
+        parsed: object = json.loads(  # pyright: ignore[reportAny]
+            (session_dir / "progress_history_state.json").read_text(encoding="utf-8")
+        )
+        state = cast(dict[str, object], parsed)
+        slots = cast(dict[str, object], state["pass"])
+        return {slot: cast(dict[str, object], record) for slot, record in slots.items()}
+
+    def demote_to_legacy_pass(self, session_dir: Path, keep_seat: bool) -> None:
+        """Rewrite state the way a session that started before seats holds it.
+
+        One pass object under the key rather than a map, and the seat under the
+        `team_role` name it was stamped with for a day, which is what every run
+        already in flight has on disk when this recorder replaces the old one.
+        """
+        path = session_dir / "progress_history_state.json"
+        parsed: object = json.loads(path.read_text(encoding="utf-8"))  # pyright: ignore[reportAny]
+        state = cast(dict[str, object], parsed)
+        slots = cast(dict[str, object], state["pass"])
+        [record_value] = list(slots.values())
+        record = cast(dict[str, object], record_value)
+        seat = record.pop("team_slot", "")
+        if keep_seat:
+            record["team_role"] = seat
+        state["pass"] = record
+        _ = path.write_text(json.dumps(state, indent=2, sort_keys=True), encoding="utf-8")
+
+    def test_two_slots_hold_a_pass_of_their_own_at_the_same_time(self) -> None:
+        """A phase team runs a launcher per slot and the recorder holds them all.
+
+        With a single pass the second launcher to start closed the first, so the
+        ledger described whichever member happened to finish last.
+        """
+        session_dir = self.start_run("two-slots", 40_000)
+        self.start_phase(session_dir, 40_010)
+        self.start_slot_pass(session_dir, "impl", "impl", 40_020)
+        self.start_slot_pass(session_dir, "test", "fix", 40_030)
+        slots = self.pass_slots(session_dir)
+        self.assertEqual(sorted(slots), ["impl", "test"])
+        self.assertEqual(slots["impl"]["status"], "active")
+        self.assertEqual(slots["test"]["status"], "active")
+        self.assertEqual(
+            [
+                event.get("team_slot")
+                for event in self.pass_events("two-slots", "pass_started")
+            ],
+            ["impl", "test"],
+        )
+        self.assertEqual(self.pass_events("two-slots", "pass_finished"), [])
+
+    def test_three_slots_each_record_a_start_and_a_finish_of_their_own(self) -> None:
+        """The whole team's work reaches the ledger, in the order it happened."""
+        session_dir = self.start_run("three-slots", 41_000)
+        self.start_phase(session_dir, 41_010)
+        for offset, (slot, kind) in enumerate(
+            (("impl", "impl"), ("test", "fix"), ("review", "review"))
+        ):
+            self.start_slot_pass(session_dir, slot, kind, 41_020 + offset)
+        for offset, slot in enumerate(("test", "review", "impl")):
+            self.finish_slot_pass(session_dir, slot, "completed", 41_100 + offset)
+        started = self.pass_events("three-slots", "pass_started")
+        self.assertEqual(
+            [event.get("team_slot") for event in started],
+            ["impl", "test", "review"],
+        )
+        finished = self.pass_events("three-slots", "pass_finished")
+        self.assertEqual(
+            [event.get("team_slot") for event in finished],
+            ["test", "review", "impl"],
+        )
+        self.assertEqual(
+            {str(event.get("status")) for event in finished},
+            {"completed"},
+        )
+        # Each finish names the window its own slot opened, never a peer's.
+        self.assertEqual(
+            {
+                str(event.get("team_slot")): str(event.get("pass_instance_id"))
+                for event in finished
+            },
+            {
+                slot: str(record["instance_id"])
+                for slot, record in self.pass_slots(session_dir).items()
+            },
+        )
+
+    def test_a_slot_reopening_a_pass_interrupts_only_its_own(self) -> None:
+        """A stale pass is this slot's problem and nobody else's.
+
+        The peers belong to launchers still waiting on their own agents, so the
+        second dispatch of one member must leave their windows untouched.
+        """
+        session_dir = self.start_run("reopen", 42_000)
+        self.start_phase(session_dir, 42_010)
+        self.start_slot_pass(session_dir, "impl", "impl", 42_020)
+        self.start_slot_pass(session_dir, "test", "fix", 42_030)
+        peer_instance = self.pass_slots(session_dir)["test"]["instance_id"]
+        self.start_slot_pass(session_dir, "impl", "fix", 42_040)
+        finished = self.pass_events("reopen", "pass_finished")
+        self.assertEqual(len(finished), 1)
+        self.assertEqual(finished[0].get("team_slot"), "impl")
+        self.assertEqual(finished[0].get("status"), "interrupted")
+        slots = self.pass_slots(session_dir)
+        self.assertEqual(slots["test"]["status"], "active")
+        self.assertEqual(slots["test"]["instance_id"], peer_instance)
+        self.assertEqual(slots["impl"]["status"], "active")
+
+    def test_a_peer_cannot_finish_the_pass_another_slot_opened(self) -> None:
+        """finish-pass answers for the slot the environment names and no other.
+
+        The launcher that finishes is the launcher that started; a member that
+        closed a peer's window would end a pass whose agent is still working.
+        """
+        session_dir = self.start_run("peer-finish", 43_000)
+        self.start_phase(session_dir, 43_010)
+        self.start_slot_pass(session_dir, "impl", "impl", 43_020)
+        self.finish_slot_pass(session_dir, "test", "completed", 43_100)
+        self.assertEqual(self.pass_events("peer-finish", "pass_finished"), [])
+        self.assertEqual(self.pass_slots(session_dir)["impl"]["status"], "active")
+
+    def test_a_legacy_single_pass_object_still_finishes(self) -> None:
+        """A run already in flight keeps the pass it had open.
+
+        Its state holds one pass object instead of a map, so it reads as the
+        entry for the slot recorded on it and its launcher closes it exactly as
+        it would have.
+        """
+        session_dir = self.start_run("legacy", 44_000)
+        self.start_phase(session_dir, 44_010)
+        self.start_slot_pass(session_dir, "impl", "impl", 44_020)
+        instance = self.pass_slots(session_dir)["impl"]["instance_id"]
+        self.demote_to_legacy_pass(session_dir, keep_seat=True)
+        self.finish_slot_pass(session_dir, "impl", "completed", 44_100)
+        finished = self.pass_events("legacy", "pass_finished")
+        self.assertEqual(len(finished), 1)
+        self.assertEqual(finished[0].get("pass_instance_id"), instance)
+        self.assertEqual(finished[0].get("team_slot"), "impl")
+        self.assertEqual(self.pass_slots(session_dir)["impl"]["status"], "completed")
+
+    def test_a_legacy_pass_with_no_slot_reads_as_the_empty_slot(self) -> None:
+        """State written before the slot field existed carries no slot at all.
+
+        Empty is a slot like any other, so the recorder that opened it without
+        one is the recorder that closes it.
+        """
+        session_dir = self.start_run("legacy-unslotted", 45_000)
+        self.start_phase(session_dir, 45_010)
+        self.start_slot_pass(session_dir, "", "impl", 45_020)
+        instance = self.pass_slots(session_dir)[""]["instance_id"]
+        self.demote_to_legacy_pass(session_dir, keep_seat=False)
+        self.finish_slot_pass(session_dir, "", "completed", 45_100)
+        finished = self.pass_events("legacy-unslotted", "pass_finished")
+        self.assertEqual(len(finished), 1)
+        self.assertEqual(finished[0].get("pass_instance_id"), instance)
+        self.assertEqual(finished[0].get("team_slot"), "")
+        self.assertEqual(self.pass_slots(session_dir)[""]["status"], "completed")
+
+    def test_finishing_the_run_closes_every_open_slot(self) -> None:
+        """A run that stops mid-phase leaves no window open behind it.
+
+        The launchers that would have closed the peers are the processes that
+        went away with the run, so the cleanup that ends the phase has to close
+        all of them or they stay open in the ledger forever.
+        """
+        session_dir = self.start_run("run-end", 46_000)
+        self.start_phase(session_dir, 46_010)
+        for offset, (slot, kind) in enumerate(
+            (("impl", "impl"), ("test", "fix"), ("review", "review"))
+        ):
+            self.start_slot_pass(session_dir, slot, kind, 46_020 + offset)
+        self.team_slot = ""
+        _ = self.run_command(
+            "finish-run",
+            "--session-dir",
+            str(session_dir),
+            "--status",
+            "stopped",
+            at=46_200,
+        )
+        finished = self.pass_events("run-end", "pass_finished")
+        self.assertEqual(
+            sorted(str(event.get("team_slot")) for event in finished),
+            ["impl", "review", "test"],
+        )
+        self.assertEqual(
+            {str(event.get("status")) for event in finished},
+            {"interrupted"},
+        )
+        self.assertEqual(
+            {str(record["status"]) for record in self.pass_slots(session_dir).values()},
+            {"interrupted"},
+        )
+
+    def test_the_stage_table_gives_every_open_slot_a_running_row(self) -> None:
+        """Three agents at work read as three rows, not as whichever wrote last."""
+        session_dir = self.start_run("live-rows", 47_000)
+        self.start_phase(session_dir, 47_010)
+        self.start_slot_pass(session_dir, "impl", "impl", 47_020, called_model="gpt-impl")
+        self.start_slot_pass(session_dir, "test", "fix", 47_030, called_model="gpt-test")
+        self.team_slot = ""
+        header = self.run_progress(session_dir, 47_100)
+        stage_rows = self.table_rows(
+            header,
+            ["Stage", "Main", "Delegate", "Start", "Elapsed", "Result"],
+        )
+        self.assertEqual(
+            [(row[0], row[2], row[4], row[5]) for row in stage_rows],
+            [
+                ("Impl", "gpt-impl high", "00:01:20", "running"),
+                ("Fix 1", "gpt-test high", "00:01:10", "running"),
+            ],
+        )
+        # The main agent holds no slot, so its report names the window that
+        # opened first rather than the one that opened last.
+        self.assertIn("▸ **Impl - implementing**", header)
 
     def test_finish_pass_records_the_seconds_the_delegate_was_awake(self) -> None:
         session_dir = self.start_run("awake", 22_000)

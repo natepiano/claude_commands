@@ -40,11 +40,12 @@ DEFAULT_PERCENT_SPREAD = 10.0
 RATE_FACTOR_LIMIT = 2.0
 STATE_FILENAME = "progress_history_state.json"
 # Where the early reviewer lives between its launch and the ready sentinel that
-# releases its real pass. The recorder holds one pass at a time by design, so an
-# early launch has nowhere to be recorded and the stage table showed only the
-# implementer -- exactly during the window where the reader most needs to see
-# that two agents are running. This marker is presentation-only: it opens no
-# pass, and `findings.py` counts pass events, so convergence never sees it.
+# releases its real pass. A pass opened before the sentinel would file a verdict
+# on a final diff that does not exist yet, so an early launch has nowhere to be
+# recorded and the stage table showed only the implementer -- exactly during the
+# window where the reader most needs to see that two agents are running. This
+# marker is presentation-only: it opens no pass, and `findings.py` counts pass
+# events, so convergence never sees it.
 ARMED_REVIEW_KEY = "early_review"
 PROJECT_STARTED_PATTERN = re.compile(
     r"^[ \t]*-[ \t]+\*\*Project started:\*\*[ \t]*(?P<value>.+?)[ \t]*$",
@@ -765,7 +766,104 @@ def _ensure_project_timing(
     return state
 
 
-def _event(state: dict[str, object], event_type: str, now: float) -> dict[str, object]:
+# The seat this launcher occupies in its phase team, exported by implement.sh
+# before it calls start-pass. A phase runs three launchers against one state
+# file and each records its own pass, so this is the key their windows are kept
+# apart under -- without it a team phase and a solo phase produce identical rows.
+#
+# The variable says role and its value is a seat: `impl`, `impl2`, `test`,
+# `review` name the three chairs, not the work done in them. All three seats can
+# be implementing at one moment and reviewing at another; the role a seat holds
+# right now lives on the coordination board, which records it as a `handoff` and
+# never writes it here. Reading the value as a role is the mistake this comment
+# exists to stop -- the variable is the half with the wrong name, and it stays
+# that way because implement.sh exports it.
+TEAM_SLOT_ENV = "PLAN_DELEGATE_TEAM_ROLE"
+
+
+def _team_slot() -> str:
+    """The recording member's seat, empty when nothing named one.
+
+    Empty is a seat like any other rather than a missing value: passes predating
+    the field, and every recorder that does not run through implement.sh --
+    review.sh included -- record under it, and must stay distinguishable from a
+    launcher that really is sitting in `impl`.
+    """
+    return os.environ.get(TEAM_SLOT_ENV, "")
+
+
+def _record_slot(record: dict[str, object]) -> str:
+    """The seat stamped on a pass record, under whichever key wrote it.
+
+    The field was `team_role` for a day, until the value turned out to name the
+    seat rather than the work. A run in flight across that change holds the old
+    key on a pass it has already opened, and must not lose its seat halfway
+    through.
+    """
+    if "team_slot" in record:
+        return _string(record.get("team_slot"))
+    return _string(record.get("team_role"))
+
+
+def _pass_slots(state: dict[str, object]) -> dict[str, dict[str, object]]:
+    """Every pass this phase has recorded, keyed by the slot that opened it.
+
+    Returns the records state itself holds, so a caller that changes one changes
+    state. State written before the phase team existed holds a single pass
+    object instead of a map; it reads as the entry for its own seat,
+    which is how a run already in flight keeps its open pass. Migration happens
+    in memory and reaches disk only when something else writes state -- a run is
+    never rewritten for the change alone.
+    """
+    raw = _object_dict(state.get("pass"))
+    slots: dict[str, dict[str, object]] = {}
+    if raw is not None and "instance_id" in raw:
+        slots[_record_slot(raw)] = raw
+    elif raw is not None:
+        for slot, value in raw.items():
+            record = _object_dict(value)
+            if record is not None:
+                slots[slot] = record
+    state["pass"] = slots
+    return slots
+
+
+def _open_passes(state: dict[str, object]) -> dict[str, dict[str, object]]:
+    """The slots whose pass is still running, keyed the same way."""
+    return {
+        slot: record
+        for slot, record in _pass_slots(state).items()
+        if _string(record.get("status")) == "active"
+    }
+
+
+def _reporting_pass(state: dict[str, object]) -> dict[str, object] | None:
+    """The open pass a call that is not a pass lifecycle call reports against.
+
+    A launcher answers for its own slot. The main agent occupies no slot and
+    still has to stamp its events, render a header, calibrate against what it is
+    watching, and arm a review beside it, so it falls back to the pass that
+    opened first. First rather than last because that one covers the phase from
+    the front, and because a later slot opening must not move the header off the
+    window the reader has been following.
+    """
+    open_passes = _open_passes(state)
+    own = open_passes.get(_team_slot())
+    if own is not None:
+        return own
+    ordered = sorted(
+        open_passes.items(),
+        key=lambda entry: (_number(entry[1].get("started_at")), entry[0]),
+    )
+    return ordered[0][1] if ordered else None
+
+
+def _event(
+    state: dict[str, object],
+    event_type: str,
+    now: float,
+    pass_record: dict[str, object] | None = None,
+) -> dict[str, object]:
     event: dict[str, object] = {
         "schema_version": SCHEMA_VERSION,
         "spine_version": SPINE_VERSION,
@@ -798,8 +896,10 @@ def _event(state: dict[str, object], event_type: str, now: float) -> dict[str, o
     # Only the window that is open right now identifies an event. A finished
     # pass stays in state, so stamping it unconditionally attributed every
     # activity -- and every progress report made during one -- to whichever
-    # delegate happened to run before it.
-    current_pass = _object_dict(state.get("pass"))
+    # delegate happened to run before it. A pass lifecycle event names its own
+    # record instead: several slots are open at once, and the launcher that
+    # closes a stale pass is not always the one that opened it.
+    current_pass = pass_record if pass_record is not None else _reporting_pass(state)
     if current_pass is not None and _string(current_pass.get("status")) == "active":
         event.update(
             {
@@ -825,22 +925,29 @@ def _event(state: dict[str, object], event_type: str, now: float) -> dict[str, o
     return event
 
 
-def _close_active_pass(
+def _close_slot_pass(
     session_dir: Path,
     state: dict[str, object],
+    slot: str,
     status: str,
     now: float,
     agent_awake_seconds: int = -1,
-) -> None:
-    current_pass = _object_dict(state.get("pass"))
-    if current_pass is None or _string(current_pass.get("status")) != "active":
-        return
-    event = _event(state, "pass_finished", now)
+) -> bool:
+    """Close one slot's open pass, reporting whether there was one to close.
+
+    One slot's and no other's: a launcher that closes a peer's window ends a
+    pass whose agent is still working, and the ledger then describes a phase
+    that never happened.
+    """
+    current_pass = _open_passes(state).get(slot)
+    if current_pass is None:
+        return False
+    event = _event(state, "pass_finished", now, current_pass)
     event["status"] = status
     # Taken from the pass, not from the environment. A stale pass is closed by
-    # whichever launcher starts the next one, and reading the environment here
-    # would stamp the closer's slot onto the opener's work.
-    event["team_role"] = _string(current_pass.get("team_role"))
+    # whichever launcher starts the next one in that seat, and reading the
+    # environment here would stamp the closer's seat onto the opener's work.
+    event["team_slot"] = _record_slot(current_pass)
     event["pass_elapsed_seconds"] = max(
         0,
         int(now - _number(current_pass.get("started_at"), now)),
@@ -860,6 +967,23 @@ def _close_active_pass(
     current_pass["status"] = status
     current_pass["finished_at"] = now
     _write_state(session_dir, state)
+    return True
+
+
+def _close_open_passes(
+    session_dir: Path,
+    state: dict[str, object],
+    status: str,
+    now: float,
+) -> None:
+    """Close every slot's open pass, for a phase or a run that is ending.
+
+    A team phase leaves up to one window open per member. Closing a single one
+    of them leaves the rest open forever: the launchers that would have closed
+    them are the processes that just went away.
+    """
+    for slot in sorted(_open_passes(state)):
+        _ = _close_slot_pass(session_dir, state, slot, status, now)
 
 
 def _close_active_activity(
@@ -965,7 +1089,7 @@ def _start_run(args: argparse.Namespace) -> None:
         "project_plan_doc": project_timing["plan_doc"],
         "main_agent": main_agent,
         "phase": None,
-        "pass": None,
+        "pass": {},
         "project_last_percent": None,
         "project_percent_started_at": None,
         "phase_last_percent": None,
@@ -1028,7 +1152,7 @@ def _start_phase(args: argparse.Namespace) -> None:
         "status": "active",
     }
     state["phase"] = phase
-    state["pass"] = None
+    state["pass"] = {}
     state[ARMED_REVIEW_KEY] = None
     state["phase_last_percent"] = None
     state["phase_percent_started_at"] = None
@@ -1041,34 +1165,10 @@ def _start_phase(args: argparse.Namespace) -> None:
     _append_event(state, event)
 
 
-# The slot this launcher occupies in its phase team, exported by implement.sh
-# before it calls start-pass. Only the one member the orchestrator hands a
-# pass_kind records a pass, so this labels which of the three that was --
-# without it a team phase and a solo phase produce identical rows.
-TEAM_ROLE_ENV = "PLAN_DELEGATE_TEAM_ROLE"
-
-
-def _team_role() -> str:
-    """The recording member's slot, empty when nothing named one.
-
-    Empty reads as unknown rather than as a slot: passes predating the field,
-    and any recorder that does not run through implement.sh, must stay
-    distinguishable from a launcher that really is the `impl` member.
-    """
-    return os.environ.get(TEAM_ROLE_ENV, "")
-
-
 def _start_pass(args: argparse.Namespace) -> None:
     if not _launcher_owned():
         raise SystemExit(f"start-pass is the launcher's to record. {PASS_OWNERSHIP_RULE}")
     session_dir = _session_dir(args)
-    state = _read_state(session_dir)
-    phase = _object_dict(state.get("phase"))
-    if phase is None or _string(phase.get("status")) != "active":
-        raise SystemExit("Start a phase before starting a pass")
-    now = _now_epoch()
-    _close_active_pass(session_dir, state, "interrupted", now)
-    state = _read_state(session_dir)
     pass_kind = _arg_string(args, "pass_kind")
     fix_pass = _arg_integer(args, "fix_pass")
     called_agent = AgentIdentity(
@@ -1077,6 +1177,18 @@ def _start_pass(args: argparse.Namespace) -> None:
         effort=_arg_string(args, "called_effort", "unset") or "unset",
         session_id="",
     )
+    team_slot = _team_slot()
+    state = _read_state(session_dir)
+    phase = _object_dict(state.get("phase"))
+    if phase is None or _string(phase.get("status")) != "active":
+        raise SystemExit("Start a phase before starting a pass")
+    now = _now_epoch()
+    # This slot's stale pass and no other. The peers belong to launchers still
+    # waiting on their own agents, and a phase team opens all three within the
+    # same second: closing them here is the corruption this key exists to
+    # prevent, not the cleanup it looks like.
+    _ = _close_slot_pass(session_dir, state, team_slot, "interrupted", now)
+    state = _read_state(session_dir)
     _refresh_main_identity(state)
     current_pass: dict[str, object] = {
         "instance_id": str(uuid.uuid4()),
@@ -1086,14 +1198,15 @@ def _start_pass(args: argparse.Namespace) -> None:
         "started_at": now,
         "called_task": _arg_string(args, "called_task"),
         "called_agent": called_agent,
-        "team_role": _team_role(),
+        "team_slot": team_slot,
         "status": "active",
     }
-    state["pass"] = current_pass
+    slots = _pass_slots(state)
+    slots[team_slot] = current_pass
     _write_state(session_dir, state)
-    event = _event(state, "pass_started", now)
+    event = _event(state, "pass_started", now, current_pass)
     event["config_digest"] = _config_digest()
-    event["team_role"] = _team_role()
+    event["team_slot"] = team_slot
     _append_event(state, event)
     # The reviewer this pass belongs to has been rendering as an armed row since
     # its early launch; its real window supersedes that one rather than joining
@@ -1114,20 +1227,25 @@ def _finish_pass(args: argparse.Namespace) -> None:
                 "--orphaned-launcher closes the pass of a launcher the orchestrator "
                 + f"killed, so it takes --status canceled, not {status}"
             )
+    # The launcher that finishes is the launcher that started, so the slot comes
+    # from the environment here rather than from the record. Resolving it any
+    # other way would let one member close a peer's pass by being the only one
+    # still running.
+    slot = _team_slot()
     state = _read_state(session_dir)
-    if orphaned:
-        current = _object_dict(state.get("pass"))
-        if current is None or _string(current.get("status")) != "active":
-            raise SystemExit(
-                "No pass is open, so no launcher was orphaned and nothing was recorded"
-            )
-    _close_active_pass(
+    closed = _close_slot_pass(
         session_dir,
         state,
+        slot,
         status,
         _now_epoch(),
         _arg_integer(args, "agent_awake_seconds", -1),
     )
+    if orphaned and not closed:
+        raise SystemExit(
+            "No pass is open in this slot, so no launcher was orphaned and "
+            + "nothing was recorded"
+        )
 
 
 def _resolve_delegate_agent(task: str) -> AgentIdentity:
@@ -1179,8 +1297,7 @@ def _arm_review(args: argparse.Namespace) -> None:
     phase = _object_dict(state.get("phase"))
     if phase is None or _string(phase.get("status")) != "active":
         raise SystemExit("Start a phase before arming an early review")
-    current_pass = _object_dict(state.get("pass"))
-    if current_pass is None or _string(current_pass.get("status")) != "active":
+    if _reporting_pass(state) is None:
         raise SystemExit(
             "An early review is the reviewer that overlaps a running dispatch, so "
             + "a pass must be open. With none open the review is not early -- "
@@ -1483,12 +1600,7 @@ def _matching_scope(
     # Match on the open window, the same rule `_event` records by. A finished
     # pass left in state would otherwise match this activity's report against
     # samples from a delegate that is no longer running.
-    active_pass = _object_dict(state.get("pass"))
-    current_pass = (
-        active_pass
-        if active_pass is not None and _string(active_pass.get("status")) == "active"
-        else {}
-    )
+    current_pass = _reporting_pass(state) or {}
     main_agent = _object_dict(state.get("main_agent")) or {}
     called_agent = _object_dict(current_pass.get("called_agent")) or {}
     pass_kind = _string(current_pass.get("kind"))
@@ -1838,29 +1950,18 @@ def _started_window(event: dict[str, object], event_type: str) -> StageWindow:
     )
 
 
-def _live_window(state: dict[str, object], now: float) -> StageWindow | None:
-    """The window running right now, read from state rather than the events.
-
-    Its finishing event does not exist yet, and a session upgraded mid-phase has
-    an activity whose start event predates activity identity, so state is the
-    only source that always knows what is running.
-    """
-    current = _object_dict(state.get("pass"))
-    if current is not None and _string(current.get("status")) == "active":
-        model, effort = _agent_fields(current, "called_agent")
-        kind = _string(current.get("kind"))
-        label = ""
-    else:
-        current = _object_dict(state.get("activity"))
-        if current is None or _string(current.get("status")) != "active":
-            return None
-        model, effort = "", ""
-        kind = "activity"
-        label = _string(current.get("label"), "Work")
-    main_model, main_effort = _agent_fields(state, "main_agent")
+def _running_window(
+    current: dict[str, object],
+    kind: str,
+    label: str,
+    delegate: str,
+    main: str,
+    fallback_id: str,
+    now: float,
+) -> StageWindow:
     started_at = _number(current.get("started_at"), now)
     return StageWindow(
-        instance_id=_string(current.get("instance_id")) or "live",
+        instance_id=_string(current.get("instance_id")) or fallback_id,
         kind=kind,
         fix_round=_integer(current.get("fix_pass")),
         label=label,
@@ -1868,9 +1969,51 @@ def _live_window(state: dict[str, object], now: float) -> StageWindow | None:
         elapsed=max(0, int(now - started_at)),
         status="running",
         result="running",
-        delegate=_agent_display(model, effort),
-        main=_agent_display(main_model, main_effort),
+        delegate=delegate,
+        main=main,
     )
+
+
+def _live_windows(state: dict[str, object], now: float) -> list[StageWindow]:
+    """The windows running right now, read from state rather than the events.
+
+    Their finishing events do not exist yet, and a session upgraded mid-phase
+    has an activity whose start event predates activity identity, so state is
+    the only source that always knows what is running. A phase team runs a
+    launcher per slot and each opens its own pass, so this is a row apiece; the
+    main agent's activity is the running window only when no pass is open at
+    all, which is what makes verification a row and never a second one beside a
+    dispatch.
+    """
+    main = _agent_display(*_agent_fields(state, "main_agent"))
+    open_passes = _open_passes(state)
+    if open_passes:
+        return [
+            _running_window(
+                current,
+                _string(current.get("kind")),
+                "",
+                _agent_display(*_agent_fields(current, "called_agent")),
+                main,
+                f"live:{slot}",
+                now,
+            )
+            for slot, current in sorted(open_passes.items())
+        ]
+    activity = _object_dict(state.get("activity"))
+    if activity is None or _string(activity.get("status")) != "active":
+        return []
+    return [
+        _running_window(
+            activity,
+            "activity",
+            _string(activity.get("label"), "Work"),
+            "",
+            main,
+            "live",
+            now,
+        )
+    ]
 
 
 def _launcher_file_written_since(path_value: str, epoch: float) -> str | None:
@@ -1983,11 +2126,12 @@ def _phase_windows(
             )
         )
     if include_live:
-        live = _live_window(state, now)
-        if live is not None:
+        for live in _live_windows(state, now):
             windows[live["instance_id"]] = live
-        # Two rows can be running at once, and only here: an early-launched
-        # reviewer reading the diff the writer beside it is still producing.
+        # A phase team runs a launcher per slot, so several passes are open at
+        # once and each has a row above. The armed marker adds one more: an
+        # early-launched reviewer reading the diff a writer beside it is still
+        # producing, which has no pass of its own until the ready sentinel.
         armed = _armed_window(state, phase_instance_id, now)
         if armed is not None:
             windows[armed["instance_id"]] = armed
@@ -2455,12 +2599,14 @@ def _progress(args: argparse.Namespace) -> None:
     now = _now_epoch()
     state = _ensure_project_timing(session_dir, _read_state(session_dir), now)
     phase = _object_dict(state.get("phase"))
-    # The reported window is the launcher's pass when one is open, and otherwise
+    # The reported window is a launcher's pass when one is open, and otherwise
     # the main agent's activity. Both render the same third header line; only a
-    # pass carries convergence meaning.
+    # pass carries convergence meaning. Which pass, when a phase team has three
+    # of them open, is `_reporting_pass`; the stage table below the header is
+    # where the other two are visible.
     window_key = "pass"
-    current_pass = _object_dict(state.get("pass"))
-    if current_pass is None or _string(current_pass.get("status")) != "active":
+    current_pass = _reporting_pass(state)
+    if current_pass is None:
         activity = _object_dict(state.get("activity"))
         if activity is not None and _string(activity.get("status")) == "active":
             window_key = "activity"
@@ -2632,7 +2778,11 @@ def _progress(args: argparse.Namespace) -> None:
         )
     _append_event(state, event)
     state["pending_calibration"] = None
-    state[window_key] = current_pass
+    # The reported window is the object state already holds, so the activity
+    # edit above has landed either way; a pass is written back through its slot,
+    # never over the map that holds every slot's.
+    if window_key == "activity":
+        state["activity"] = current_pass
     _write_state(session_dir, state)
 
     phase_id = _string(phase.get("id"), "ad hoc")
@@ -2768,7 +2918,7 @@ def _finish_phase(args: argparse.Namespace) -> None:
     session_dir = _session_dir(args)
     state = _read_state(session_dir)
     now = _now_epoch()
-    _close_active_pass(session_dir, state, "interrupted", now)
+    _close_open_passes(session_dir, state, "interrupted", now)
     state = _read_state(session_dir)
     _close_active_activity(session_dir, state, "interrupted", "", now)
     state = _read_state(session_dir)
@@ -2915,7 +3065,8 @@ def _build_parser() -> argparse.ArgumentParser:
     _ = finish_pass.add_argument(
         "--orphaned-launcher",
         action="store_true",
-        help="close the open pass of a launcher the orchestrator killed (--status canceled only)",
+        help="close this slot's open pass when the orchestrator killed its "
+        + "launcher (--status canceled only)",
     )
     _ = finish_pass.add_argument(
         "--agent-awake-seconds",
@@ -2928,7 +3079,8 @@ def _build_parser() -> argparse.ArgumentParser:
 
     arm_review = subparsers.add_parser(
         "arm-review",
-        help="show an early-launched reviewer as a second running row beside the open pass",
+        help="show an early-launched reviewer as a running row beside the passes "
+        + "already open",
     )
     _ = arm_review.add_argument("--session-dir", required=True)
     _ = arm_review.add_argument("--activity", required=True)

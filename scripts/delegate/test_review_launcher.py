@@ -31,7 +31,9 @@ class OpenPass(TypedDict):
 
 
 # "pass" is a keyword, so the recorder's state key needs the functional form.
-ProgressState = TypedDict("ProgressState", {"pass": OpenPass})
+# The recorder keys the open passes by the team slot that opened each one, so
+# the value is a map even when a single launcher is running.
+ProgressState = TypedDict("ProgressState", {"pass": dict[str, OpenPass]})
 
 
 AGENTS_REGISTRY = """[assignments]
@@ -51,9 +53,10 @@ class ReviewLauncherPassTests(unittest.TestCase):
     """The early-launch contract: before the sentinel, no pass is recorded.
 
     The reviewer starts while the writer is still working, so the
-    implementation pass is open the whole time it runs. Any start-pass before
-    the sentinel closes that live pass as interrupted and files a review pass
-    for a verdict that cannot have read the final diff.
+    implementation pass is open the whole time it runs. A start-pass before the
+    sentinel files a review pass for a verdict that cannot have read the final
+    diff, and does it under the reviewer's own slot, where nothing later
+    reconciles it against the diff it never saw.
     """
 
     temporary: tempfile.TemporaryDirectory[str]  # pyright: ignore[reportUninitializedInstanceVariable]
@@ -207,7 +210,9 @@ class ReviewLauncherPassTests(unittest.TestCase):
             ProgressState,
             json.loads((session_dir / "progress_history_state.json").read_text()),
         )
-        open_pass = state["pass"]
+        open_passes = state["pass"]
+        self.assertEqual(len(open_passes), 1)
+        open_pass = next(iter(open_passes.values()))
         self.assertEqual(open_pass["kind"], "impl")
         self.assertEqual(open_pass["status"], "active")
 
