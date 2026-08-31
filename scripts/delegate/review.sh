@@ -85,10 +85,11 @@ SUFFIX="${LENS:+_${LENS}}"
 # run at once against one log, and `review` on all three lines cannot be read.
 BEAT_TAG="${SUBTASK}${LENS:+:${LENS}}"
 # The seat this pass records under, so three concurrent reviewers key three pass
-# records instead of each closing the last as interrupted.
-if [[ -n "${TEAM_SLOT}" ]]; then
-  export PLAN_DELEGATE_TEAM_ROLE="${TEAM_SLOT}"
-fi
+# records instead of each closing the last as interrupted. Exported even when the
+# lens is absent and the seat with it: the lens decides this launcher's seat, and
+# leaving the variable unset instead would let an inherited one decide it, which
+# is how a lone reviewer ends up closing a live seat's pass.
+export PLAN_DELEGATE_TEAM_ROLE="${TEAM_SLOT}"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 FINDINGS_FILE="${SESSION_DIR}/review_findings_${PASS_INDEX}${SUFFIX}.txt"

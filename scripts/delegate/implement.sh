@@ -6,8 +6,8 @@
 #                     <team_role> [mesh_prefix]
 #   role_description — 1-2 lines describing this dispatch's responsibility,
 #   written as a header block into the shared heartbeat log
-#   pass_kind — impl, test, fix, or review; enables durable progress recording
-#   and is this seat's opening role, stamped on its board register line
+#   pass_kind — required; impl, test, fix, or review. Every seat carries one.
+#   It is the seat's opening role, stamped on its board register line
 #   pass_activity — short user-facing description for the progress header
 #   fix_pass — required pass count when pass_kind is fix
 #   team_role — required; which member of the phase team this is (impl, test,
@@ -57,6 +57,25 @@ PASS_KIND="${6:-}"
 PASS_ACTIVITY="${7:-${ROLE_DESC%%$'\n'*}}"
 FIX_PASS="${8:-0}"
 TEAM_ROLE="${9:?Usage: implement.sh needs a team_role (impl, test, review) as its 9th argument}"
+
+# Every seat carries a kind, so an empty one is a dropped argument rather than a
+# choice. It used to be tolerated: the launcher skipped start-pass, ran the agent
+# normally, and left the seat's previous pass standing. A repair round dispatched
+# with the kind on `impl` alone then produced a phase whose ledger held one live
+# window and two records closed `error` an hour earlier -- and when that one
+# window closed, the recorder refused every progress call for having none open
+# while two agents were still posting to the board. Nothing in that sequence
+# looked like a launch fault, which is why it costs the run its ledger. Refuse
+# it at the argument instead. Whether a pass is *recorded* stays a property of
+# the session having recorder state, tested where start-pass is called.
+case "${PASS_KIND}" in
+  impl|test|fix|review) ;;
+  *)
+    echo "ERROR: pass_kind must be impl, test, fix, or review; got '${PASS_KIND}'." >&2
+    echo "It is the 6th argument and the seat's opening role. A team dispatch gives one to every seat." >&2
+    exit 2
+    ;;
+esac
 
 # Resolving a repair round is an explicit assignment, never a property of the
 # pass kind. Keying it off `fix` is what forced seats to misreport their work:
@@ -141,7 +160,7 @@ fi
 printf 'task=%s\nfamily=%s\nagent=%s\neffort=%s\n' \
   "${TASK}" "${AGENT_FAMILY}" "${AGENT_MODEL}" "${AGENT_EFFORT}" > "${AGENT_FILE}"
 
-if [[ -n "${PASS_KIND}" && -f "${PROGRESS_STATE}" ]]; then
+if [[ -f "${PROGRESS_STATE}" ]]; then
   if ! PLAN_DELEGATE_PASS_OWNER=launcher python3 "${PROGRESS_HELPER}" start-pass \
     --session-dir "${SESSION_DIR}" \
     --pass-kind "${PASS_KIND}" \
@@ -201,12 +220,10 @@ fi
 # freezes nothing. What must stay out is the reverse: reading PASS_KIND *later*
 # as the role, which would report every seat in its launch role for the whole
 # phase and lose the one movement the table exists to show.
-# A launch with no kind, or one outside the four words, stamps nothing rather
-# than inventing a role.
-case "${PASS_KIND}" in
-  impl|test|fix|review) ROLE_FIELD="role=${PASS_KIND}; " ;;
-  *)                    ROLE_FIELD="" ;;
-esac
+# The kind is one of the four words by the time this runs, so the field is
+# always present -- which is what makes a dispatch that lost it legible from
+# the board alone: a register line with no `role=` predates this check.
+ROLE_FIELD="role=${PASS_KIND}; "
 bash "${BOARD_HELPER}" post "${SESSION_DIR}" "${BOARD_AGENT}" register \
   "${SUBTASK} launcher up (${AGENT_FAMILY}/${AGENT_MODEL}:${AGENT_EFFORT:-unset}); ${MESH_FIELD}; ${ROLE_FIELD}status in impl_status${SLOT}" || true
 
@@ -265,7 +282,7 @@ wait "${HEARTBEAT_LOOP_PID}" 2>/dev/null || true
 
 if [[ "${AGENT_CODE}" -eq 0 ]]; then
   echo "implemented" > "${STATUS_FILE}"
-  if [[ -n "${PASS_KIND}" && -f "${PROGRESS_STATE}" ]]; then
+  if [[ -f "${PROGRESS_STATE}" ]]; then
     if ! PLAN_DELEGATE_PASS_OWNER=launcher python3 "${PROGRESS_HELPER}" finish-pass \
       --session-dir "${SESSION_DIR}" --status completed \
       --agent-awake-seconds "$(awake_seconds)"; then
@@ -293,7 +310,7 @@ if [[ "${AGENT_CODE}" -eq 0 ]]; then
   bash "${BOARD_HELPER}" release "${SESSION_DIR}" "${BOARD_AGENT}" cargo >/dev/null 2>&1 || true
 else
   echo "error" > "${STATUS_FILE}"
-  if [[ -n "${PASS_KIND}" && -f "${PROGRESS_STATE}" ]]; then
+  if [[ -f "${PROGRESS_STATE}" ]]; then
     PLAN_DELEGATE_PASS_OWNER=launcher python3 "${PROGRESS_HELPER}" finish-pass \
       --session-dir "${SESSION_DIR}" --status error \
       --agent-awake-seconds "$(awake_seconds)" \
