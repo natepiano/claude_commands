@@ -76,14 +76,20 @@ always, since a codex sub-session has no agent tool to launch anything with.
 ## delegate.conf
 
 The `/plan:delegate` tuning file: the convergence limits — how many automatic
-fix rounds one phase gets before the run stops and asks the user — plus the
-progress-report interval. `MIN_REPAIR_BUDGET` is the floor every phase gets
+fix rounds one phase runs before the gate remarks on how it is going — plus
+the progress-report interval. `MIN_REPAIR_BUDGET` is the floor every phase gets
 regardless of finding count (3);
 `REPAIR_ROUNDS_PER_FINDING` scales the budget above that floor from the first
 round's gating count (0.5, so 8 findings buy 4 rounds); `RUNAWAY_ROUNDS` is the
-hard ceiling (5). The rest bound the other stop conditions:
+hard ceiling (5). The rest bound the other patterns worth reporting:
 `MAX_FIX_ATTEMPTS`, `MAX_REOPENS`, `STALLED_ROUNDS`,
 `MAX_CONSECUTIVE_SAME_KIND_PASSES`, `MAX_REVIEW_CANCELLATIONS`.
+
+**None of these stops a phase.** `findings.py gate` answers `converged` or
+`dispatch` and nothing else; a limit that trips names itself in the verdict's
+`advisory` string and the round dispatches anyway. They decide when the main
+agent says something, not when it halts — the decision to stop is the user's,
+made from what gets reported.
 
 `PLAN_DELEGATE_PROGRESS_INTERVAL_SECONDS` is the odd one out: seconds between
 user-facing progress reports while a phase is active, read by
@@ -101,10 +107,6 @@ exit 2 before running the command. `PLAN_DELEGATE_CONFIG` overrides the path,
 which is how `test_findings.py` supplies its own limits rather than this
 machine's. Edits need `dangerouslyDisableSandbox: true` — the sandbox denies
 writes under `~/.claude/config`.
-
-One automatic mechanical-cleanup round can still run past a spent repair
-budget, once per phase, under `<MechanicalGateCleanup/>` in
-`commands/plan/delegate.md`; it is not configurable here.
 
 ## cargo-fmt-exclusions.json
 

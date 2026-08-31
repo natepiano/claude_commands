@@ -336,8 +336,8 @@ mid-run, without waiting for a phase to end.
   them in its `mesh=` field, so a member that missed the launch can still look
   one up.
 - **How you reach a name depends on its family**, and the register line says
-  which in its `reach=` field. Guessing wrong is silent: the message goes
-  nowhere and the sender waits on a reply that was never queued.
+  which in its `reach=` field. Using the wrong call fails silently: the message
+  goes nowhere and the sender waits on a reply that was never queued.
   - `reach=SendMessage` — a claude member, running as a named background
     session. Address the bare name; `ListAgents` confirms who is live.
   - `reach=codex_mesh.py` — a codex member, running as a thread on the phase's
