@@ -89,9 +89,9 @@ awake_seconds() {
 
 rm -f "${AWAKE_FILE}"
 echo "reviewing" > "${STATUS_FILE}"
-# Only meaningful while an early launch has a row in the stage table, and read
-# there only if it was written after that row was armed — so it is written on
-# every run, before anything can fail, rather than in the early branch alone.
+# Only meaningful while an early launch is showing in the progress report, and
+# read there only if it was written after the review was armed — so it is
+# written on every run, before anything can fail, not in the early branch alone.
 echo "$$" > "${SESSION_DIR}/review_pid"
 
 source "${SCRIPT_DIR}/../agents/agents_config.sh"

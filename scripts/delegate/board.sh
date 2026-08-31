@@ -50,8 +50,28 @@ MAX_MESSAGE_CHARS=900
 DEFAULT_HOLD_SECONDS=900
 
 die() { printf 'board.sh: %s\n' "$1" >&2; exit 2; }
-now_iso() { date +%Y-%m-%dT%H:%M:%S%z; }
-now_epoch() { date +%s; }
+
+# One clock for the whole run. The progress recorder reads roles back off this
+# log and places them on a timeline built from its own events, so the two have
+# to agree on what time it is -- a board stamped from the wall clock against a
+# ledger stamped from an override puts every role change outside every round.
+# `PLAN_DELEGATE_NOW_EPOCH` is that override, and `-r` versus `-d @` is the only
+# thing BSD and GNU date disagree about here.
+now_iso() {
+    if [[ -n "${PLAN_DELEGATE_NOW_EPOCH:-}" ]]; then
+        date -r "${PLAN_DELEGATE_NOW_EPOCH%%.*}" +%Y-%m-%dT%H:%M:%S%z 2>/dev/null \
+            || date -d "@${PLAN_DELEGATE_NOW_EPOCH%%.*}" +%Y-%m-%dT%H:%M:%S%z
+        return
+    fi
+    date +%Y-%m-%dT%H:%M:%S%z
+}
+now_epoch() {
+    if [[ -n "${PLAN_DELEGATE_NOW_EPOCH:-}" ]]; then
+        printf '%s\n' "${PLAN_DELEGATE_NOW_EPOCH%%.*}"
+        return
+    fi
+    date +%s
+}
 
 # One line, no control characters, bounded length: the three properties that
 # keep a concurrent append atomic and the log parseable.
@@ -238,8 +258,8 @@ cmd_role() {
   shift 3
   valid_token_name "$slot" || die "bad slot '$slot'"
   case "$role" in
-    impl|fix|test|review) ;;
-    *) die "role must be impl, fix, test, or review; got '$role'" ;;
+    impl|test|fix|review) ;;
+    *) die "role must be impl, test, fix, or review; got '$role'" ;;
   esac
   cmd_post "$session_dir" "$slot" handoff "role=${role} $(flatten "${@:-taking this role}")"
 }
@@ -262,11 +282,14 @@ cmd_roles() {
       next
     }
     /\] register: / {
-      if (slot in role) next
+      # A register carrying role= is a launcher opening the slot, and the latest
+      # one wins: the board spans the whole run and still holds every earlier
+      # round register. One without the field is an agent introducing itself and
+      # must not erase a role already taken; it only seeds a placeholder.
       if (match($0, /role=[A-Za-z0-9_]+/)) {
         r = substr($0, RSTART + 5, RLENGTH - 5)
         role[slot] = r
-      } else {
+      } else if (!(slot in role)) {
         role[slot] = ""
       }
     }

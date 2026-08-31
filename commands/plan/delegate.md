@@ -38,7 +38,6 @@ State:
   alongside `DISPATCH_HANDLE`; empty when review runs synchronously.
 - `EARLY_REVIEW`: `none` or `launched`; resets with every implementation or fix
   dispatch. Owned by <EarlyReviewArm/>.
-- `IMPLEMENTATION_TASK`: starts as `implementation`.
 - `APPLICATION_SMOKE_RESULT`: starts as `not_run`.
 - `STYLE_GATE_CONFIG`: plan hint captured during prompt composition.
 - `STYLE_REVIEW_DONE`: starts false. The durable true state is
@@ -92,7 +91,7 @@ under that directory. This avoids half-applied durable-state writes.
 </ToolingContract>
 
 <DispatchContract>
-Applies to implementation, review, fix, and architect launchers.
+Applies to every implementation, test, fix, and review launcher.
 
 1. Launch under <ToolingContract/> and save `${DISPATCH_HANDLE}`.
 2. Tell the user in one line what is running and what happens on completion.
@@ -190,8 +189,8 @@ not authorization; restate the pending question afterwards.
 
 <TypeDesignContract>
 Read `~/.claude/docs/type_design.md`. Apply it in the main review and copy it
-verbatim under `## Type Design Contract` into every implementation, fix,
-escalation, and broad-review prompt. Fresh delegates inherit nothing from prior
+verbatim under `## Type Design Contract` into every implementation, fix, and
+broad-review prompt. Fresh delegates inherit nothing from prior
 calls. Closure reviews omit it to remain scoped to the repair.
 </TypeDesignContract>
 
@@ -242,7 +241,7 @@ not build or test first just to prove it builds.
 </WritePromptContract>
 
 <PhaseTeam>
-Every implementation, escalation, and fix dispatch runs **three delegates at
+Every implementation and fix dispatch runs **three delegates at
 once**, never one. They share `${SESSION_DIR}` and `${WORKING_DIR}`, and each
 occupies a fixed **slot** that names its artifacts and its board identity:
 
@@ -312,6 +311,11 @@ that exists. Each `register` line says which case holds, in its `mesh=` field.
   at the end. The launcher stamps the role each slot opens in, so the progress
   table is never blank; after that, only this command keeps it true. Saying it
   in a `status` sentence does not count — the table reads the field, not prose.
+  **Every call adds a row.** The progress table starts a new row for the round
+  each time any slot changes role, so the reader watches `impl / test / test`
+  become `impl / impl / test` and then `review / review / review`. A change you
+  do not post is a shape the run never shows, and the row above it silently
+  claims your old role held the whole time.
 - A decision that is not on the board did not happen. Say it on the board first,
   then message a peer if it needs attention now.
 
@@ -659,7 +663,7 @@ open one by hand for other main-agent work with
 `progress_history.py start-activity --session-dir "${SESSION_DIR}" --label <label> --activity <what>`
 and close it with
 `finish-activity --session-dir "${SESSION_DIR}" --status <status> --result <outcome>`.
-Keep `--label` to one or two words -- it is the row's name in the stage table --
+Keep `--label` to one or two words -- it is the row's name in the round table --
 and make `--result` the short outcome that row should show: `pass`, `clean`,
 `no change`. Without one the row can only say `done`, which reports that the
 window closed rather than what it found. Activities sit in that table beside
@@ -701,8 +705,8 @@ On a Claude timer notification or Codex poll timeout:
    `python3 ~/.claude/scripts/delegate/progress_history.py phase-count --plan-doc "<plan>" [--phase-percent N]`
 4. Apply <EarlyReviewArm/>: the evidence steps 2-3 just gathered is its input,
    and this tick is its only trigger point. It runs **before** the recorder,
-   never after, so that when it does launch a reviewer the stage table this
-   tick is about to print already carries both rows.
+   never after, so that when it does launch a reviewer the round table this
+   tick is about to print already shows it working.
 5. Run:
 
    `python3 ~/.claude/scripts/delegate/progress_history.py calibrate --session-dir "${SESSION_DIR}" --candidate-percent "${PHASE_RAW_PERCENT}"`
@@ -714,14 +718,15 @@ On a Claude timer notification or Codex poll timeout:
 
    Include the override reason only when rejecting an applicable calibrated
    value. The recorder refreshes any legacy run whose project clock was not
-   script-resolved. Copy the resulting Markdown header exactly, all three tables
-   included: the first carries the project and phase clocks, the second one
-   column per team slot naming the role each delegate is filling and what it is
-   doing right now, and the third every stage the phase has opened —
-   implementation, each review, each fix, each main-agent activity — in the
-   order they ran. The middle table is the one a reader scans to see who is on
-   what; dropping it leaves them the timings with no way to tell the agents
-   apart. Durations below one day are
+   script-resolved. Copy the resulting Markdown header exactly, both tables and
+   the delegates line included: the first table carries the project and phase
+   clocks, the second one row per round — implementation, then each fix — with a
+   column per team slot naming the role that delegate is filling and how long it
+   has been at it, a further row each time the seats change role, and a row
+   apiece for each main-agent activity, in the order they ran. The line under it
+   names the delegate sitting in each seat. The second table is the one a reader
+   scans to see who is on what; dropping it leaves them the timings with no way
+   to tell the agents apart. Durations below one day are
    always `HH:MM:SS`; longer durations are `<days> day(s) HH:MM:SS`, and the
    `ETA`, `ETA low`, and `ETA high` columns are arrival times rather than
    durations — the two band columns each carry their own distance from the ETA
@@ -784,14 +789,14 @@ On a Claude timer notification or Codex poll timeout:
    interval again before polling.
 
 **An armed timer is never a substitute for the report.** Every turn that arms or
-re-arms a timer emits steps 1-6 first — all three tables and the wall-clock line —
+re-arms a timer emits steps 1-6 first — both tables and the wall-clock line —
 and a bare "timer re-armed" line is a dropped report, not a short one. This
 matters most where it is easiest to skip: a Stop-hook block reads as a
 mechanical complaint about a missing file, so the reflex is to relaunch the
 script and end the turn. But the hook fires on the turn the user was owed an
 update and did not get one, and the timer file is only how it noticed. Re-arming
 without reporting answers the hook and leaves the user exactly where they were.
-Steps 1-6 are cheap: the recorder emits all three tables, and the prose is three
+Steps 1-6 are cheap: the recorder emits both tables, and the prose is three
 sentences.
 
 A user-requested status check performs steps 1-6 immediately. A question about
@@ -800,7 +805,8 @@ took, what an earlier phase ran — is answered by
 
 `python3 ~/.claude/scripts/delegate/progress_history.py timeline --session-dir "${SESSION_DIR}" [--phase <id>]`
 
-which renders the same stage table for one phase or for every phase of the run.
+which renders one row per pass -- with the agent that ran each -- for one phase
+or for every phase of the run.
 Read the answer from it rather than counting passes from memory or grepping the
 event stream by hand. If the user stops
 updates, stop and clear any Claude timer and set
@@ -858,7 +864,8 @@ the briefing and discussion already described does not stale it.
 
 When an auto control arrives and every covered phase is freshly briefed, that
 control is the batch approval: set the approved `AUTO_WINDOW` and proceed to
-<SelectTask/> without repeating briefings or asking for `proceed`. If any
+<CoordinateDelegatedPhaseReservation/> without repeating briefings or asking for
+`proceed`. If any
 covered phase is unbriefed, stale, or has an unresolved decision, route to
 <AutoWindowBatchBriefing/>. Compressed rows and phase titles are not briefings.
 </BriefingFreshness>
@@ -892,22 +899,21 @@ Apply <CoreContract/>, <CompactionContract/>, <UserFacingText/>, and
 2. <ComposeWorkOrder/>
 3. <ResolveStyleDiffBase/>
 4. <VerbosePrePhaseGate/> when required
-5. <SelectTask/>
-6. <CoordinateDelegatedPhaseReservation/>
-7. <LaunchImplementation/>
-8. <DualReview/>
-9. <Synthesize/>
-10. <RunApplicationSmokeTest/>
-11. <RunProjectStyleReview/> — `single` only; loop and verbose run the run's one
+5. <CoordinateDelegatedPhaseReservation/>
+6. <LaunchImplementation/>
+7. <DualReview/>
+8. <Synthesize/>
+9. <RunApplicationSmokeTest/>
+10. <RunProjectStyleReview/> — `single` only; loop and verbose run the run's one
     style review from <FinalGate/> after the whole plan is green
-12. <RunPhaseReview/>
-13. <RunPhaseShrink/>
-14. <ConsiderNextItems/>
-15. <CheckpointCommit/>
-16. <DiscardPhaseReviewText/>
-17. <RecordPhaseCompletion/>
-18. <VerbosePostPhaseReport/> and applicable <VerbosePostPhaseGate/>
-19. <NextPhase/> or <RunSummary/>
+11. <RunPhaseReview/>
+12. <RunPhaseShrink/>
+13. <ConsiderNextItems/>
+14. <CheckpointCommit/>
+15. <DiscardPhaseReviewText/>
+16. <RecordPhaseCompletion/>
+17. <VerbosePostPhaseReport/> and applicable <VerbosePostPhaseGate/>
+18. <NextPhase/> or <RunSummary/>
 </ExecutionSteps>
 
 <PrepareSession>
@@ -995,7 +1001,8 @@ work, otherwise `none`; do not load style. Derive scoped verification per
 <VerificationContract/>.
 
 If an initial verbose invocation contains a bounded-auto control, resolve
-`AUTO_WINDOW` and run <AutoWindowBatchBriefing/> before <SelectTask/>. Otherwise
+`AUTO_WINDOW` and run <AutoWindowBatchBriefing/> before
+<CoordinateDelegatedPhaseReservation/>. Otherwise
 follow <AuthorizationContract/>.
 </ComposeWorkOrder>
 
@@ -1274,7 +1281,8 @@ fresh range is authorized by the auto control itself; otherwise route to
 <AutoWindowBatchBriefing>
 Resolve the covered todo phases and apply <BriefingFreshness/> first. If every
 covered phase is fresh, set the approved `AUTO_WINDOW` and continue directly to
-<SelectTask/> without another briefing or gate. Otherwise read every Work Order
+<CoordinateDelegatedPhaseReservation/> without another briefing or gate.
+Otherwise read every Work Order
 now and emit one complete <CombinedWindowBriefing/> for the covered range;
 surface any pending decision. Ask:
 
@@ -1284,17 +1292,6 @@ Approval runs the resolved range without intermediate gates. Narrowing updates
 `AUTO_WINDOW`; questions preserve the batch gate. The full combined preview,
 not a phase-title list or type table alone, owns batch authorization.
 </AutoWindowBatchBriefing>
-
-<SelectTask>
-Choose from the Work Order, never keyword matching:
-
-- `implementation`: ordinary feature work.
-- `escalation`: ambiguous architecture, numerical/transform mathematics, or a
-  failed behavioral attempt.
-
-`~/.claude/config/agents.conf` owns delegate family/model/effort. State the task
-in the dispatch update.
-</SelectTask>
 
 <LaunchImplementation>
 1. Once per phase, save `git status --short` to
@@ -1307,7 +1304,10 @@ in the dispatch update.
    "${SESSION_DIR}/implementation_prompt.md"`. Use `ad hoc` plus scope without a
    phased plan; pass the original prompt only. Both run before the dispatch in
    step 4, never after it.
-3. Set `${PASS_KIND}=arch` for escalation, otherwise `${PASS_KIND}=impl`.
+3. Set `${PASS_KIND}=impl`. Every implementation pass is `impl`, however
+   ambiguous the architecture or hard the mathematics: there is no escalation
+   task and no escalated kind. `~/.claude/config/agents.conf` owns delegate
+   family/model/effort, one row per kind. State the kind in the dispatch update.
 4. Partition the Work Order's files per <TeamFilePartition/> and write one
    prompt per slot under <WritePromptContract/>:
    `${SESSION_DIR}/implementation_prompt.md` for `impl`, `test_prompt.md` for
@@ -1316,19 +1316,24 @@ in the dispatch update.
 
    ```sh
    implement.sh "${SESSION_DIR}" "${WORKING_DIR}" \
-     "${SESSION_DIR}/implementation_prompt.md" "${IMPLEMENTATION_TASK}" \
+     "${SESSION_DIR}/implementation_prompt.md" impl \
      "<responsibility>" "${PASS_KIND}" "<activity>" 0 impl
    implement.sh "${SESSION_DIR}" "${WORKING_DIR}" \
-     "${SESSION_DIR}/test_prompt.md" "${IMPLEMENTATION_TASK}" \
-     "<responsibility>" "" "" 0 test
+     "${SESSION_DIR}/test_prompt.md" test \
+     "<responsibility>" test "<activity>" 0 test
    implement.sh "${SESSION_DIR}" "${WORKING_DIR}" \
-     "${SESSION_DIR}/review_prompt_team.md" "${IMPLEMENTATION_TASK}" \
-     "<responsibility>" "" "" 0 review
+     "${SESSION_DIR}/review_prompt_team.md" review \
+     "<responsibility>" review "<activity>" 0 review
    ```
 
-   Responsibility follows <ProgressContract/>. Only `impl` carries
-   `${PASS_KIND}`, per <PhaseTeam/>; giving a second slot one corrupts the pass
-   record the convergence gate counts.
+   Responsibility follows <ProgressContract/>. **All three seats carry a pass
+   kind**, so a team phase records three passes and stops being attributed to one
+   agent. The kind is the work the seat was assigned and nothing more — it names,
+   it never triggers, so a seat never misreports its work to avoid a side effect.
+   **Task and kind are the same word** on every seat: the fourth argument selects
+   the agent and the sixth records the pass, and both say what this seat is
+   doing. The vocabulary is `impl`, `test`, `fix`, `review` — nothing else
+   resolves, in `agents.conf` or in the ledger.
 6. Announce prompt, board, and heartbeat paths, set `EARLY_REVIEW=none`, then
    apply <DispatchContract/> once for the whole team.
 7. On completion, read `impl_status_impl`, `impl_status_test`, and
@@ -1359,11 +1364,13 @@ file named by the delegate is visible; stop if not. Capture the diff and status.
 <EarlyReviewArm>
 Launch the blind reviewer while the writer is still running, so both finish
 together instead of back to back. Evaluated only on a <ProgressContract/> tick,
-and only when all of these hold: an implementation, escalation, or
-non-mechanical fix dispatch is active; `EARLY_REVIEW=none`; and the completed
-dispatch would receive a delegate review — <DualReview/> pass 1 or a closure
-review. Mechanical repairs never arm, and neither does a repair whose batch sits
-in paths narrow enough that <FixDispatch/> will close it on a contained diff.
+and only when all of these hold: an implementation or fix dispatch is active;
+`EARLY_REVIEW=none`; and the completed dispatch would receive a delegate
+review — <DualReview/> pass 1 or a closure review. A behavior-preserving repair
+never arms — documentation, formatting, lint guidance, an agreed trivial rename —
+and neither does a repair whose batch sits in paths narrow enough that
+<FixDispatch/> will close it on a contained diff. That judgment is the
+orchestrator's own reading of the batch; no task name carries it.
 
 Estimate the **pass-internal** completion of the running dispatch — not the
 capped phase percentage — from the tick's evidence. It is ≥75% when the
@@ -1411,10 +1418,10 @@ At ≥75% with ten or more minutes left, in the same tick:
    final argument: `${SESSION_DIR}/final_diff_${REVIEW_PASS}.ready`. Save the
    handle as `${REVIEW_DISPATCH_HANDLE}` and set `EARLY_REVIEW=launched`. Do not
    disturb `${DISPATCH_HANDLE}` or the tick's timer re-arm.
-6. Give the reviewer its row in the stage table, so the tick's report shows two
-   agents working rather than one:
+6. Put the reviewer in the round table, so the tick's report shows two agents
+   working rather than one:
 
-   `python3 ~/.claude/scripts/delegate/progress_history.py arm-review --session-dir "${SESSION_DIR}" --activity "<what this reviewer is checking>" --called-task <delegate.review or delegate.architect>`
+   `python3 ~/.claude/scripts/delegate/progress_history.py arm-review --session-dir "${SESSION_DIR}" --activity "<what this reviewer is checking>" --called-task delegate.review`
 
    Run it before the recorder call in <ProgressContract/> step 5, which is what
    prints the table. The command opens no pass and writes no pass event, so it
@@ -1639,11 +1646,6 @@ file/line findings and intended behavior. Verification contains only implicated
 `verify.sh` lines—usually check and test, adding lint only for lint-related
 repairs.
 
-Set `${FIX_TASK}=mechanical` only when every item is documentation, formatting, lint
-guidance, an agreed trivial rename, or another behavior-preserving edit. Choose
-`${FIX_TASK}=escalation` for wrong behavior, math, unresolved architecture, or a
-failed repair; otherwise set `${FIX_TASK}=implementation`.
-
 A repair runs the same three slots as a phase, per <PhaseTeam/>: `impl` makes
 the repair, `test` writes the regression test that would have caught each
 finding, and `review` opens adversarially on the repair under <TeamReview/> —
@@ -1655,20 +1657,27 @@ Run `findings.py dispatch --covers <all batch ids>` before launching, then
 launch all three in one message:
 
 ```sh
-implement.sh "${SESSION_DIR}" "${WORKING_DIR}" \
-  "${SESSION_DIR}/fix_prompt_${FIX_ROUND}.md" "${FIX_TASK}" \
+PLAN_DELEGATE_RESOLVES_ROUND=1 implement.sh "${SESSION_DIR}" "${WORKING_DIR}" \
+  "${SESSION_DIR}/fix_prompt_${FIX_ROUND}.md" fix \
   "<responsibility>" fix "<activity>" "${FIX_ROUND}" impl
 implement.sh "${SESSION_DIR}" "${WORKING_DIR}" \
-  "${SESSION_DIR}/fix_test_prompt_${FIX_ROUND}.md" "${FIX_TASK}" \
-  "<responsibility>" "" "" "${FIX_ROUND}" test
+  "${SESSION_DIR}/fix_test_prompt_${FIX_ROUND}.md" test \
+  "<responsibility>" test "<activity>" "${FIX_ROUND}" test
 implement.sh "${SESSION_DIR}" "${WORKING_DIR}" \
-  "${SESSION_DIR}/fix_review_prompt_${FIX_ROUND}.md" "${FIX_TASK}" \
-  "<responsibility>" "" "" "${FIX_ROUND}" review
+  "${SESSION_DIR}/fix_review_prompt_${FIX_ROUND}.md" review \
+  "<responsibility>" review "<activity>" "${FIX_ROUND}" review
 ```
 
-Only `impl` carries the `fix` pass kind. It is the launcher that records the
-round as landed, so a second slot carrying it would resolve one repair round
-several times over.
+Each seat records the work it was assigned: the repairing seat `fix`, the test
+seat `test`, the review seat `review`.
+
+**`PLAN_DELEGATE_RESOLVES_ROUND=1` goes on exactly one seat**, and it is what
+marks the repair round landed. Only the launcher watches the worker exit, so only
+a launcher can say a repair landed; asking the orchestrator to record it later
+leaves a gap it can be killed or compacted inside, and that gap used to resolve
+as "fixed". Two seats carrying the signal would resolve one round twice over.
+The signal is separate from the kind precisely so a second repairing seat can
+record `fix` honestly without performing the resolution.
 
 Apply <DispatchContract/>; set `EARLY_REVIEW=none` at dispatch, and close the
 turn with the progress header per <DelegationResultFormat/>. While a fix runs
@@ -1681,9 +1690,9 @@ a path the batch's own findings named — or in a new file one of those paths
 creates — record each verdict directly and continue to <Synthesize/>. A second
 reader buys nothing there: the closure question is only whether the named line
 changed as the finding intended, and every line of the diff is in a file the
-main pass just read for that finding. This is why the mechanical classification
-is no longer what decides the review; a mechanical repair simply always
-satisfies the same containment test.
+main pass just read for that finding. Containment is the whole test, which is
+why no separate classification of the repair decides it: a behavior-preserving
+repair simply always satisfies the same containment test anyway.
 
 Dispatch the normal <DualReview/> closure review whenever the repair leaves that
 boundary or the diff cannot answer the question: an edited path no finding
@@ -2267,7 +2276,7 @@ answer from the completed report and preserve the gate.
 
 <NextPhase>
 If no todo phase remains, run <FinalGate/> then <RunSummary/>. Otherwise reset
-`REVIEW_PASS=0`, `IMPLEMENTATION_TASK=implementation`, and smoke to `not_run`.
+`REVIEW_PASS=0` and smoke to `not_run`.
 Style state is per-run, not per-phase: never reset it or delete its marker
 here, and never re-resolve `STYLE_DIFF_BASE`.
 

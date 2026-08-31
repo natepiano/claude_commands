@@ -315,13 +315,9 @@ class ProgressHistoryTests(unittest.TestCase):
                 "",
                 "**Phase 3: Retry handling**",
                 "",
-                "| Phase | Impl | Test | Review | Start    | Elapsed  | Result  |",
-                "| ----- | ---- | ---- | ------ | -------- | -------- | ------- |",
-                "| 3     | -    | -    | -      | 05:33:20 | 00:01:40 | running |",
-                "",
-                "| Stage | Main           | Delegate        | Start    | Elapsed  | Result  |",
-                "| ----- | -------------- | --------------- | -------- | -------- | ------- |",
-                "| Fix 2 | gpt-main xhigh | gpt-called high | 05:33:30 | 00:01:30 | running |",
+                "| Round | Impl | Test | Review | Start    | Elapsed | Result  |",
+                "| ----- | ---- | ---- | ------ | -------- | ------- | ------- |",
+                "| Fix 2 | -    | -    | -      | 05:33:30 | 1m      | running |",
                 "",
                 "▸ **Fix 2 - correcting retry recovery**",
                 "**now 1970-01-01 05:35:00 - next report 05:38:00**",
@@ -1014,6 +1010,18 @@ class ProgressHistoryTests(unittest.TestCase):
             at=at,
         )
 
+    def run_board(self, session_dir: Path, *arguments: str, at: int) -> None:
+        """Drive board.sh on the test's clock, so its stamps and the recorder's
+        events sit on one timeline instead of the board landing in the present."""
+        environment = os.environ.copy()
+        environment["PLAN_DELEGATE_NOW_EPOCH"] = str(at)
+        _ = subprocess.run(
+            ["bash", str(BOARD), arguments[0], str(session_dir), *arguments[1:]],
+            check=True,
+            capture_output=True,
+            env=environment,
+        )
+
     def start_slot_pass(
         self,
         session_dir: Path,
@@ -1021,6 +1029,7 @@ class ProgressHistoryTests(unittest.TestCase):
         pass_kind: str,
         at: int,
         called_model: str = "gpt-called",
+        fix_pass: int = 0,
     ) -> None:
         """Open a pass the way one member of a phase team opens its own."""
         self.team_slot = slot
@@ -1030,6 +1039,8 @@ class ProgressHistoryTests(unittest.TestCase):
             str(session_dir),
             "--pass-kind",
             pass_kind,
+            "--fix-pass",
+            str(fix_pass),
             "--activity",
             f"{slot or 'unslotted'} work",
             "--called-task",
@@ -1254,28 +1265,114 @@ class ProgressHistoryTests(unittest.TestCase):
             {"interrupted"},
         )
 
-    def test_the_stage_table_gives_every_open_slot_a_running_row(self) -> None:
-        """Three agents at work read as three rows, not as whichever wrote last."""
+    def test_a_round_gives_every_open_seat_its_own_column(self) -> None:
+        """Three agents at work read across one row, not as whichever wrote last."""
         session_dir = self.start_run("live-rows", 47_000)
         self.start_phase(session_dir, 47_010)
         self.start_slot_pass(session_dir, "impl", "impl", 47_020, called_model="gpt-impl")
-        self.start_slot_pass(session_dir, "test", "fix", 47_030, called_model="gpt-test")
+        self.start_slot_pass(session_dir, "test", "test", 47_030, called_model="gpt-test")
+        self.start_slot_pass(session_dir, "review", "review", 47_040, called_model="gpt-rev")
         self.team_slot = ""
         header = self.run_progress(session_dir, 47_100)
-        stage_rows = self.table_rows(
+        rows = self.table_rows(
             header,
-            ["Stage", "Main", "Delegate", "Start", "Elapsed", "Result"],
+            ["Round", "Impl", "Test", "Review", "Start", "Elapsed", "Result"],
         )
+        # One row, because the three seats are working one round. Each carries
+        # its own elapsed: they launch together but do not finish together, and
+        # a single shared number would hide exactly that.
         self.assertEqual(
-            [(row[0], row[2], row[4], row[5]) for row in stage_rows],
-            [
-                ("Impl", "gpt-impl high", "00:01:20", "running"),
-                ("Fix 1", "gpt-test high", "00:01:10", "running"),
-            ],
+            [(*row[:4], row[5], row[6]) for row in rows],
+            [("Impl", "impl 1m", "test 1m", "review 1m", "1m", "running")],
         )
         # The main agent holds no slot, so its report names the window that
         # opened first rather than the one that opened last.
         self.assertIn("▸ **Impl - implementing**", header)
+
+    def test_staggered_launcher_registers_do_not_split_a_round(self) -> None:
+        """Three launchers coming up seconds apart is one round, not four rows."""
+        session_dir = self.start_run("stagger", 46_000)
+        self.start_phase(session_dir, 46_010)
+        self.start_slot_pass(session_dir, "impl", "fix", 46_020, fix_pass=6)
+        # What implement.sh writes: each launcher registers with its opening role
+        # stamped, and they land a second or two apart because they start in
+        # sequence. That stagger is a roll-call, not the team changing shape.
+        for offset, slot, role in ((0, "impl", "fix"), (3, "test", "test"), (5, "review", "review")):
+            self.run_board(session_dir, "post", slot, "register", f"role={role}; up", at=46_020 + offset)
+        self.start_slot_pass(session_dir, "test", "test", 46_023, fix_pass=6)
+        self.start_slot_pass(session_dir, "review", "review", 46_025, fix_pass=6)
+        self.team_slot = ""
+        rows = self.table_rows(
+            self.run_progress(session_dir, 50_540),
+            ["Round", "Impl", "Test", "Review", "Start", "Elapsed", "Result"],
+        )
+        # One row. Before the register/handoff split this rendered four: a
+        # near-empty row per launch -- 0s, 2s, 2s -- and then the real one.
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(
+            (rows[0][0], rows[0][1], rows[0][2], rows[0][3], rows[0][5]),
+            ("Fix 6", "fix 1h15m", "test 1h15m", "review 1h15m", "1h15m"),
+        )
+
+    def test_a_round_gains_a_row_each_time_its_seats_change_role(self) -> None:
+        """Seats recruit each other, and every new shape gets its own row."""
+        session_dir = self.start_run("recruit", 49_000)
+        self.start_phase(session_dir, 49_010)
+        for slot in ("impl", "test", "review"):
+            self.run_board(session_dir, "post", slot, "register", "up", at=49_015)
+        # Opens two-on-tests: the review seat is a second pair of eyes there.
+        for slot, role in (("impl", "impl"), ("test", "test"), ("review", "test")):
+            self.run_board(session_dir, "role", slot, role, "opening", at=49_020)
+        for slot, kind in (("impl", "impl"), ("test", "test"), ("review", "review")):
+            self.start_slot_pass(session_dir, slot, kind, 49_020)
+        self.team_slot = ""
+        # Recruited across to write, then all three converge on review.
+        self.run_board(session_dir, "role", "review", "impl", "recruited", at=49_320)
+        for slot in ("impl", "test", "review"):
+            self.run_board(session_dir, "role", slot, "review", "converging", at=49_620)
+        header = self.run_progress(session_dir, 49_800)
+        rows = self.table_rows(
+            header,
+            ["Round", "Impl", "Test", "Review", "Start", "Elapsed", "Result"],
+        )
+        # One round, three shapes. The label names the round once: a repeat on
+        # the continuation rows would read as three rounds rather than as one
+        # team moving, and the result belongs to the round, so it sits on the
+        # row that closes it.
+        self.assertEqual(
+            [(row[0], row[1], row[2], row[3], row[5]) for row in rows],
+            [
+                ("Impl", "impl 5m", "test 5m", "test 5m", "5m"),
+                ("", "impl 5m", "test 5m", "impl 5m", "5m"),
+                ("", "review 3m", "review 3m", "review 3m", "3m"),
+            ],
+        )
+        # The seats are all still running, so only the last row can carry one.
+        self.assertEqual([row[6] for row in rows], ["", "", "running"])
+        # Which delegate is in which seat sits under the table, once, and the
+        # main agent is left out of it -- the reader is the main agent.
+        seats = " · ".join(f"{slot} gpt-called high" for slot in ("impl", "test", "review"))
+        self.assertIn(f"_delegates: {seats}_", header)
+
+    def test_a_second_round_is_a_second_row(self) -> None:
+        """A repair round is a row of its own, named by the number it carries."""
+        session_dir = self.start_run("rounds", 48_000)
+        self.start_phase(session_dir, 48_010)
+        for slot, kind in (("impl", "impl"), ("test", "test"), ("review", "review")):
+            self.start_slot_pass(session_dir, slot, kind, 48_020)
+            self.finish_slot_pass(session_dir, slot, "completed", 48_200)
+        for slot, kind in (("impl", "fix"), ("test", "test"), ("review", "review")):
+            self.start_slot_pass(session_dir, slot, kind, 48_300, fix_pass=1)
+        self.team_slot = ""
+        header = self.run_progress(session_dir, 48_400)
+        rows = self.table_rows(
+            header,
+            ["Round", "Impl", "Test", "Review", "Start", "Elapsed", "Result"],
+        )
+        self.assertEqual(
+            [(row[0], row[1], row[6]) for row in rows],
+            [("Impl", "impl 3m", "clean"), ("Fix 1", "fix 1m", "running")],
+        )
 
     def test_finish_pass_records_the_seconds_the_delegate_was_awake(self) -> None:
         session_dir = self.start_run("awake", 22_000)
@@ -1530,8 +1627,8 @@ class ProgressHistoryTests(unittest.TestCase):
         ]
         return rows[rows.index(header) + 1 :]
 
-    def test_the_team_row_reports_the_role_each_slot_holds_now(self) -> None:
-        """One row per phase, one column per agent, showing current role."""
+    def test_a_running_round_reports_the_role_each_seat_holds_now(self) -> None:
+        """One column per seat, showing the role it holds right now."""
         self.write_full_config()
         started_at = 60_000
         session_dir = self.start_run("team", started_at)
@@ -1549,43 +1646,13 @@ class ProgressHistoryTests(unittest.TestCase):
         # hand: what is under test is that the writer and the reader agree on a
         # format, which a hand-written fixture would assert nothing about.
         for slot in ("impl", "test", "review"):
-            _ = subprocess.run(
-                ["bash", str(BOARD), "post", str(session_dir), slot, "register", "up"],
-                check=True,
-                capture_output=True,
-            )
-            _ = subprocess.run(
-                ["bash", str(BOARD), "role", str(session_dir), slot, slot, "opening"],
-                check=True,
-                capture_output=True,
-            )
+            self.run_board(session_dir, "post", slot, "register", "up", at=started_at + 1)
+            self.run_board(session_dir, "role", slot, slot, "opening", at=started_at + 2)
         # The reviewer gets recruited into implementation: the slot keeps its
         # identity and its column, and only the role in the cell changes.
-        _ = subprocess.run(
-            ["bash", str(BOARD), "role", str(session_dir), "review", "impl", "recruited"],
-            check=True,
-            capture_output=True,
-        )
-        _ = self.run_command(
-            "start-pass",
-            "--session-dir",
-            str(session_dir),
-            "--pass-kind",
-            "impl",
-            "--fix-pass",
-            "0",
-            "--activity",
-            "wiring the adapter",
-            "--called-task",
-            "delegate.implementation",
-            "--called-family",
-            "codex",
-            "--called-model",
-            "gpt-called",
-            "--called-effort",
-            "high",
-            at=started_at + 10,
-        )
+        self.run_board(session_dir, "role", "review", "impl", "recruited", at=started_at + 3)
+        self.start_slot_pass(session_dir, "impl", "impl", started_at + 10)
+        self.team_slot = ""
         header = self.run_command(
             "progress",
             "--session-dir",
@@ -1604,13 +1671,18 @@ class ProgressHistoryTests(unittest.TestCase):
             "wiring the adapter",
             at=started_at + 300,
         )
-        team_rows = self.table_rows(
+        rows = self.table_rows(
             header,
-            ["Phase", "Impl", "Test", "Review", "Start", "Elapsed", "Result"],
+            ["Round", "Impl", "Test", "Review", "Start", "Elapsed", "Result"],
         )
-        self.assertEqual(team_rows[0][:4], ["4", "impl", "test", "impl"])
+        # The recruited reviewer reads `impl` under the Review column: the seat
+        # keeps its identity and its column, and only the role in the cell moves.
+        # Test and review have registered without opening a pass yet, so they
+        # report the role the board knows and no duration, which is the part that
+        # is genuinely unknown -- not a dash, which would read as idle.
+        self.assertEqual(rows[0][:4], ["Impl", "impl 4m", "test", "impl"])
 
-    def test_the_team_row_falls_back_when_no_board_exists(self) -> None:
+    def test_a_round_falls_back_when_no_board_exists(self) -> None:
         """A phase whose team has not registered still renders a row."""
         self.write_full_config()
         started_at = 60_000
@@ -1663,11 +1735,13 @@ class ProgressHistoryTests(unittest.TestCase):
             "working",
             at=started_at + 200,
         )
-        team_rows = self.table_rows(
+        rows = self.table_rows(
             header,
-            ["Phase", "Impl", "Test", "Review", "Start", "Elapsed", "Result"],
+            ["Round", "Impl", "Test", "Review", "Start", "Elapsed", "Result"],
         )
-        self.assertEqual(team_rows[0][:4], ["2", "-", "-", "-"])
+        # No board and no seat on the pass: the window sits in no round, so it
+        # renders on its own the way every solo run always has.
+        self.assertEqual(rows[0][:4], ["Impl", "-", "-", "-"])
 
     def test_the_stage_table_names_every_window_the_phase_opened(self) -> None:
         """Each pass and activity in start order, with what the ledger recorded."""
@@ -1803,23 +1877,37 @@ class ProgressHistoryTests(unittest.TestCase):
             "checking the remaining plan against what shipped",
             at=started_at + 700,
         )
-        stage_rows = self.table_rows(
+        rows = self.table_rows(
             header,
-            ["Stage", "Main", "Delegate", "Start", "Elapsed", "Result"],
+            ["Round", "Impl", "Test", "Review", "Start", "Elapsed", "Result"],
         )
+        # A solo run records no seat, so every window keeps a row and the
+        # per-window finding attribution it always had. The seat columns stay
+        # empty rather than guessing which one a slotless pass would have been.
         self.assertEqual(
-            [(row[0], row[4], row[5]) for row in stage_rows],
+            [(row[0], row[5], row[6]) for row in rows],
             [
-                ("Impl", "00:03:10", "done"),
-                ("Impl Review", "00:01:20", "2 found"),
-                ("Fix 1", "00:02:40", "2 landed"),
-                ("Review Fix 1", "00:00:40", "2 fixed"),
-                ("Verification", "00:00:40", "pass"),
-                ("Review 3", "00:00:40", "running"),
+                ("Impl", "3m", "done"),
+                ("Impl Review", "1m", "2 found"),
+                ("Fix 1", "2m", "2 landed"),
+                ("Review Fix 1", "40s", "2 fixed"),
+                ("Verification", "40s", "pass"),
+                ("Review 3", "40s", "running"),
             ],
         )
+        self.assertEqual({tuple(row[1:4]) for row in rows}, {("-", "-", "-")})
         self.assertIn("▸ **Review 3 - checking the remaining plan against what shipped**", header)
-        # The main agent ran verification itself, so that row has no delegate.
+        # Which agent ran each window is the `timeline` view's question, and the
+        # main agent ran verification itself, so that row has no delegate there.
+        stage_rows = self.table_rows(
+            self.run_command(
+                "timeline",
+                "--session-dir",
+                str(session_dir),
+                at=started_at + 700,
+            ),
+            ["Stage", "Main", "Delegate", "Start", "Elapsed", "Result"],
+        )
         self.assertEqual((stage_rows[4][1], stage_rows[4][2]), ("gpt-main xhigh", ""))
         self.assertEqual(stage_rows[0][1], "gpt-main xhigh")
 
@@ -1882,16 +1970,16 @@ class ProgressHistoryTests(unittest.TestCase):
             "correcting retry recovery",
             at=started_at + 160,
         )
-        stage_rows = self.table_rows(
+        rows = self.table_rows(
             header,
-            ["Stage", "Main", "Delegate", "Start", "Elapsed", "Result"],
+            ["Round", "Impl", "Test", "Review", "Start", "Elapsed", "Result"],
         )
+        # Neither window holds a seat -- the writer predates seats and the armed
+        # reviewer has no pass yet -- so there is no round for the reviewer to
+        # join and it keeps the row beside the writer that it always had.
         self.assertEqual(
-            [(row[0], row[2], row[4], row[5]) for row in stage_rows],
-            [
-                ("Fix 2", "gpt-called high", "00:02:30", "running"),
-                ("Review Fix 2", "gpt-blind max", "00:01:00", "running (early)"),
-            ],
+            [(row[0], row[5], row[6]) for row in rows],
+            [("Fix 2", "2m", "running"), ("Review Fix 2", "1m", "running (early)")],
         )
         # The report is about the writer, so the sentence beneath the table names
         # it -- not the reviewer, whose row is now the last one.

@@ -237,7 +237,7 @@ The single exception is a launcher the orchestrator killed, whose pass stays
 open: `finish-pass --status canceled --orphaned-launcher` closes it, and only
 that status, and only while a pass is open.
 
-`progress` writes the event and prints three tables under a line naming the
+`progress` writes the event and prints two tables under a line naming the
 worktree, the branch, and — when the plan's headings can be counted — the
 position of the phase in flight, `phase N of M`. That position is the finished
 count plus one, off the same headings the project percentage derives from, so
@@ -247,29 +247,72 @@ row and a phase row carrying the reported percentage, elapsed, ETA, unchanged,
 — when the plan's headings can be counted — how many phases are done, and last
 the best and worst arrival the percentage still allows.
 
-The second is the team table, under the phase heading: one row for the whole
-phase, with a column for each of the three slots — `Impl`, `Test`, `Review` —
-holding the role that slot is working in right now, plus the phase's start,
-elapsed, and finding result. A phase is one self-contained unit of
-implementation-or-fix, test, and review, so it reports as one row; the columns
-answer "who is doing what at this moment", which is the question a slot table
-can answer and a per-pass list cannot. The roles come from `board.log`, not from
-the launch arguments, because roles move during a phase: a reviewer gets
-recruited into implementation, and every slot converges on review at the end.
-`board.sh role` stamps a `role=<name>` field on each `handoff` line precisely so
-this is read back exactly rather than inferred from prose, and a slot that has
-registered but never handed off, or a phase with no board at all, shows `-`.
+The second is the round table, under the phase heading: one row per round,
+oldest first, with a column for each of the three slots — `Impl`, `Test`,
+`Review` — plus the round's start, elapsed, and finding result. A round is the
+unit that advances: it is dispatched, it lands, and the ledger stamps its number
+on every finding it produces, so it is the only row key whose start, elapsed and
+result all describe the same thing. The three seats working it read across as
+columns, each cell naming what that seat is doing and how long it has been doing
+it — `fix 11m`, `review 13m`. Under the table sits the running round's activity
+sentence, which no fixed-width column can carry, and then the wall clock.
 
-The third is the stage
-table, one row per window the phase has opened,
-oldest first: the stage, the main agent that orchestrated it, the delegate that
-ran it, its start time, its elapsed, and its result. It stays beside the team
-table rather than being replaced by it: the team row says what is happening, the
-stage table says what happened, and provenance needs both. Under the table
-sits the running stage's activity sentence, which no fixed-width column can
-carry, and then the wall clock.
+A row per *pass* cannot do this once a phase team exists. The three seats launch
+within the same second, so a per-pass table repeats one Start three times and
+learns nothing from it; worse, attributing findings by the interval from one row
+to the next gives the first two seats a window under a second wide and hands the
+whole phase to whichever registered last. Grouping by round removes the
+guesswork rather than narrowing it: `findings.py` already writes `round` on
+every event, so the Result cell is counted, not inferred from timestamps. What a
+round table cannot show — which model ran which seat, and a review overlapping
+the writer as a window of its own — is `timeline`'s question, and `timeline`
+still renders one row per window.
 
-Stage names come from the pass kind and its position among that kind in the
+A round is not one shape held to the end, so it is split again at every moment
+its seats changed role: each stretch over which no seat moved is a row. A phase
+opening `impl / test / test`, recruiting the third seat across to
+`impl / impl / test`, and converging on `review / review / review` renders as
+three rows under one round label. The label is printed once and the
+continuations leave it blank — repeating it would read as three rounds rather
+than one team moving — and the round's result sits on the row that closes it,
+since a round is the granularity the ledger stamps. Each cell carries that
+seat's own time within the stretch, so a seat that finished early shows less
+than the row's elapsed rather than being backdated to it.
+
+Roles come from `board.log`, not from the launch arguments, because they move
+during a phase. `board.sh role` stamps a `role=<name>` field on each `handoff`
+line, and the launcher stamps the same field on its `register` line, so a seat
+reports a role from second zero. The whole history is read rather than the
+latest entry: collapsing to the current answer would report the last shape as
+though it had held all along. A role a seat never posted is a shape the run
+never shows, which is why the verb's contract says to call it the moment the
+work changes. A seat whose board never spoke falls back to the kind its pass
+recorded; one that has registered without opening a pass shows the role alone,
+with no duration — the board knows what it is doing and nothing yet knows for
+how long.
+
+Because the recorder places board roles on a timeline built from its own
+events, `board.sh` and the recorder read the same clock: both honour
+`PLAN_DELEGATE_NOW_EPOCH`, so a board stamped from the wall clock can never sit
+outside a ledger stamped from an override and drop every role change out of
+every round.
+
+Under the table sits one line naming the delegate in each seat — `_delegates:
+impl <model> <effort> · …_` — for the round in flight. It is one answer per
+phase rather than per row, so a column repeating the same three values down
+every row would crowd out the roles for nothing. The main agent is omitted: the
+reader is the main agent, and `timeline` carries both identities per pass for
+anyone reconstructing a run after the fact.
+
+Windows that sit in no round keep a row apiece, named as they always were: a
+main-agent activity, which holds no seat, and every pass from a solo run, which
+records none. Those rows leave the seat columns empty and keep the per-window
+finding attribution — the interval running to whatever opened next — which is
+wrong for concurrent seats and exactly right for the sequential windows that
+still reach it. An early-armed reviewer joins the round it reads when there is
+one, and otherwise keeps its own row beside the writer.
+
+Window names come from the pass kind and its position among that kind in the
 phase — `Impl`, `Fix 1`, `Fix 2` — and a fix carries the round the ledger
 dispatched, so its number is the one convergence counts. A review is named for
 the pass whose diff it reads rather than for its own ordinal — `Impl Review`,
@@ -285,14 +328,19 @@ shows the change on the rows after it. Detection that comes back unknown leaves
 the stored identity alone, because a window that cannot answer must not erase
 the answer already recorded.
 
-Results come from the same event stream, over the interval that starts at one
-window and ends at the next: findings opened after a review make it `N found`,
-a landed repair batch makes a fix `N landed`, verdicts recorded after a closure
-review make it `N fixed` plus `M open` or `M new` where those apply, an activity
-shows the `--result` its own launcher recorded, and any non-completed status
-shows itself. The interval is what does the attributing — the main agent opens,
-dispatches, and settles findings in the gap after a window closes, not while it
-runs.
+A round's result is every finding the ledger stamped with that round: verdicts
+make it `N fixed` plus `M open` where those apply, findings opened make it
+`N found` alone or `N new` behind a settled count, and a round with nothing
+recorded reads `running` while it is open and `clean` once it is not.
+
+A row with no round is attributed the older way, over the interval that starts
+at one window and ends at the next: findings opened after a review make it
+`N found`, a landed repair batch makes a fix `N landed`, verdicts recorded after
+a closure review make it `N fixed`, an activity shows the `--result` its own
+launcher recorded, and any non-completed status shows itself. The interval is
+what does the attributing there — the main agent opens, dispatches, and settles
+findings in the gap after a window closes, not while it runs — and it holds
+because those windows are sequential. `timeline` attributes every row this way.
 
 Project and phase percentages have independent unchanged timers. Each also
 carries an ETA: the elapsed clock extended across what the displayed percentage

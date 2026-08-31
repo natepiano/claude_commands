@@ -6,7 +6,7 @@
 #                     <team_role> [mesh_prefix]
 #   role_description — 1-2 lines describing this dispatch's responsibility,
 #   written as a header block into the shared heartbeat log
-#   pass_kind — impl, arch, or fix; enables durable progress recording
+#   pass_kind — impl, test, fix, or review; enables durable progress recording
 #   pass_activity — short user-facing description for the progress header
 #   fix_pass — required pass count when pass_kind is fix
 #   team_role — required; which member of the phase team this is (impl, impl2,
@@ -50,12 +50,30 @@ set -euo pipefail
 SESSION_DIR="${1:?Usage: implement.sh <session_dir> [working_dir] [prompt_file] [task] [role_description]}"
 WORKING_DIR="${2:-$(pwd)}"
 PROMPT_FILE="${3:-${SESSION_DIR}/implementation_prompt.md}"
-SUBTASK="${4:-implementation}"
+SUBTASK="${4:-impl}"
 ROLE_DESC="${5:-work order at ${PROMPT_FILE}}"
 PASS_KIND="${6:-}"
 PASS_ACTIVITY="${7:-${ROLE_DESC%%$'\n'*}}"
 FIX_PASS="${8:-0}"
 TEAM_ROLE="${9:?Usage: implement.sh needs a team_role (impl, impl2, test, review) as its 9th argument}"
+
+# Resolving a repair round is an explicit assignment, never a property of the
+# pass kind. Keying it off `fix` is what forced seats to misreport their work:
+# every repairing seat wants to record `fix` honestly, but a second one doing so
+# would mark one round landed several times over and hand the next review defects
+# pre-labelled as repaired. So the orchestrator names exactly one resolver, and
+# the kind goes back to being only a name for the work.
+if [[ -n "${PLAN_DELEGATE_RESOLVES_ROUND+set}" ]]; then
+  RESOLVES_ROUND="${PLAN_DELEGATE_RESOLVES_ROUND}"
+elif [[ "${PASS_KIND}" == "fix" && "${TEAM_ROLE}" == "impl" ]]; then
+  # A session that loaded the prompt text before this change sets no signal, and
+  # under that text only the impl seat ever carried `fix`. This keeps a run that
+  # is already in flight resolving its rounds instead of stalling silently.
+  # Remove once no session predating the change can still be running.
+  RESOLVES_ROUND=1
+else
+  RESOLVES_ROUND=0
+fi
 TASK="delegate.${SUBTASK}"
 
 # The role indexes file paths and board fields, so hold it to a character set
@@ -175,7 +193,7 @@ fi
 # seat does both implementation and repair, and only PASS_KIND says which.
 #
 # Do NOT simplify this to keying every seat off PASS_KIND. The pass kinds are
-# impl/fix/review/arch and the roles are impl/fix/test/review -- close enough to
+# once were impl/fix/review/arch while the roles were impl/fix/test/review -- one
 # look interchangeable, and not. There is no `test` pass kind, so once every seat
 # carries one, a test seat would stamp `role=impl` on every phase and the Test
 # column would never read `test` again, losing the one distinction it exists to
@@ -268,7 +286,7 @@ if [[ "${AGENT_CODE}" -eq 0 ]]; then
   # repair landed. Asking the orchestrator to record it later leaves a gap it can
   # be killed or compacted inside, and that gap used to resolve as "fixed" --
   # handing the next review a defect pre-labelled as repaired.
-  if [[ "${PASS_KIND}" == "fix" && -f "${FINDINGS_STATE}" ]]; then
+  if [[ "${RESOLVES_ROUND}" == "1" && -f "${FINDINGS_STATE}" ]]; then
     python3 "${FINDINGS_HELPER}" landed --session-dir "${SESSION_DIR}" \
       || echo "ERROR: unable to record the repair round as landed." >&2
   fi
@@ -289,7 +307,7 @@ else
   fi
   # The attempt stands rather than being refunded: a worker that ran and then
   # failed may have left partial edits behind, and the launcher cannot tell.
-  if [[ "${PASS_KIND}" == "fix" && -f "${FINDINGS_STATE}" ]]; then
+  if [[ "${RESOLVES_ROUND}" == "1" && -f "${FINDINGS_STATE}" ]]; then
     python3 "${FINDINGS_HELPER}" abandon --session-dir "${SESSION_DIR}" --edits-landed \
       --reason "the ${SUBTASK} worker exited with code ${AGENT_CODE}" \
       || echo "ERROR: unable to record the repair round as abandoned." >&2
