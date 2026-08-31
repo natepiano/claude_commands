@@ -45,12 +45,18 @@ PASS_STAGE: dict[str, str] = {
     "test": "test",
     "fix": "fix",
     "review": "review",
-    # `arch` is escalation, not architecture review: 172 of its 180 events run
-    # `delegate.escalation` -- ambiguous architecture, transform mathematics, or
-    # a failed behavioral attempt -- which delegate.md dispatches alongside
-    # implementation and fix. Real architecture review is 1085 passes of kind
-    # `review` with task `delegate.architect`. The name points at the wrong one,
-    # so read the kind, never the word. Re-bucketing moves 5 completed rows.
+    # Escalation is implementation, not review: it is ambiguous architecture,
+    # transform mathematics, or a failed behavioral attempt, dispatched
+    # alongside implementation and fix. Real architecture review is 1085 passes
+    # of kind `review` carrying task `delegate.architect`.
+    #
+    # `arch` is a retired kind, kept forever because retiring one cannot rewrite
+    # events already written and dropping it would send the back corpus to
+    # `other`. It meant "escalated implementation", which was the agent tier
+    # leaking into the work kind: `delegate.escalation` runs under `fix` 917
+    # times and under `arch` only 172, so the same escalation was encoded two
+    # ways depending on the phase. The tier lives on `called_task` for every
+    # kind -- group by `stage,task` to separate escalated work from ordinary.
     "arch": "implementation",
 }
 ACTIVITY_STAGE: dict[str, str] = {
