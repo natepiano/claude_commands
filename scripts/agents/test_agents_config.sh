@@ -325,4 +325,84 @@ AGENT_EFFORT="max"
 AGENT_EFFORT=""
 [[ "$(agents_claude_args)" == "--model opus" ]] || fail "claude args without effort are wrong"
 
+# `caller` resolves through the agent running the shell, never through a switch.
+cat > "$TEST_DIR/caller.conf" <<'EOF'
+[assignments]
+friend=caller
+plain=codex
+
+[friend.codex]
+work=gpt-test:high
+
+[friend.claude]
+work=opus:max
+
+[plain.codex]
+work=gpt-test:high
+
+[plain.claude]
+work=opus:max
+
+[codex.agents]
+gpt-test=low,medium,high
+
+[claude.agents]
+opus=low,medium,high,max
+EOF
+write_fixture "$TEST_DIR/caller.conf"
+unset AGENTS_CALLER_FAMILY CODEX_THREAD_ID CLAUDE_CODE_SESSION_ID
+
+AGENTS_CALLER_FAMILY=codex agents_resolve friend.work
+[[ "$AGENT_FAMILY" == "codex" && "$AGENT_MODEL" == "gpt-test" ]] || fail "caller override to codex did not resolve the codex row"
+AGENTS_CALLER_FAMILY=claude agents_resolve friend.work
+[[ "$AGENT_FAMILY" == "claude" && "$AGENT_MODEL" == "opus" ]] || fail "caller override to claude did not resolve the claude row"
+CODEX_THREAD_ID=t agents_resolve friend.work
+[[ "$AGENT_FAMILY" == "codex" ]] || fail "CODEX_THREAD_ID did not identify a codex caller"
+CLAUDE_CODE_SESSION_ID=s agents_resolve friend.work
+[[ "$AGENT_FAMILY" == "claude" ]] || fail "CLAUDE_CODE_SESSION_ID did not identify a claude caller"
+CODEX_THREAD_ID=t CLAUDE_CODE_SESSION_ID=s agents_resolve friend.work
+[[ "$AGENT_FAMILY" == "codex" ]] || fail "codex did not win when both identity variables are set"
+assert_fails "caller with no detectable agent" agents_resolve friend.work
+stderr_out="$(agents_resolve friend.work 2>&1 >/dev/null || true)"
+[[ "$stderr_out" == *"no calling agent is detectable"* ]] || fail "undetectable caller did not fail as a caller error"
+agents_resolve plain.work
+[[ "$AGENT_FAMILY" == "codex" ]] || fail "a fixed assignment beside a caller stopped resolving"
+
+before="$TEST_DIR/caller-before.conf"
+cp "$AGENTS_CONFIG_FILE" "$before"
+assert_fails "switching a caller function" agents_set_assignment friend codex
+cmp "$before" "$AGENTS_CONFIG_FILE" || fail "rejected caller switch changed the registry"
+stderr_out="$(agents_set_assignment friend codex 2>&1 >/dev/null || true)"
+[[ "$stderr_out" == *"has no switch"* ]] || fail "caller switch did not explain itself"
+assert_fails "switching a function to caller" agents_set_assignment plain caller
+cmp "$before" "$AGENTS_CONFIG_FILE" || fail "rejected switch to caller changed the registry"
+
+expected="$TEST_DIR/caller-expected.conf"
+sed 's/^plain=codex$/plain=claude/' "$before" > "$expected"
+agents_set_all_assignments claude
+cmp "$expected" "$AGENTS_CONFIG_FILE" || fail "switch-all moved the caller assignment"
+agents_set_all_assignments codex
+cmp "$before" "$AGENTS_CONFIG_FILE" || fail "switch-all reversal around a caller was not byte-identical"
+
+function_list="$(AGENTS_CALLER_FAMILY=claude agents_list_function friend)"
+printf '%s\n' "$function_list" | grep -q '^task=friend.work family=claude agent=opus effort=max active=yes$' \
+    || fail "caller function did not mark the calling family live"
+printf '%s\n' "$function_list" | grep -q '^task=friend.work family=codex agent=gpt-test effort=high active=no$' \
+    || fail "caller function marked the other family live"
+printf '%s\n' "$function_list" | grep -q '^# current family: caller .*claude here' \
+    || fail "caller function did not report the detected family"
+
+assignment_list="$(AGENTS_CALLER_FAMILY=codex agents_list_assignments friend)"
+[[ "$(printf '%s\n' "$assignment_list" | grep -c '^task=friend.work ')" -eq 1 ]] || fail "detectable caller listed more than one family"
+printf '%s\n' "$assignment_list" | grep -q '^task=friend.work family=codex ' || fail "detectable caller listed the wrong family"
+assignment_list="$(agents_list_assignments friend)"
+[[ "$(printf '%s\n' "$assignment_list" | grep -c '^task=friend.work ')" -eq 2 ]] || fail "undetectable caller did not list both families"
+printf '%s\n' "$assignment_list" | grep -q 'none detectable here' || fail "undetectable caller listing did not say so"
+
+AGENTS_CALLER_FAMILY=claude agents_set_row friend.work opus:high
+[[ "$AGENT_ROW_ASSIGNMENT" == "caller" ]] || fail "row edit on a caller function did not expose the raw assignment"
+[[ "$AGENT_ROW_ACTIVE" == "yes" && "$AGENT_ROW_ACTIVE_FAMILY" == "claude" ]] || fail "row edit on a caller function did not report the calling family live"
+AGENTS_CALLER_FAMILY=codex agents_set_row friend.work opus:max
+[[ "$AGENT_ROW_ACTIVE" == "no" ]] || fail "row edit for the other family was reported live under a caller"
+
 echo "agents_config tests passed"

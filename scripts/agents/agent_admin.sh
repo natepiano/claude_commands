@@ -29,7 +29,10 @@ usage() {
         [[ "$switched" == "codex" ]] && ex_other="claude" || ex_other="codex"
     fi
     if [[ -n "$fn" ]]; then
-        family="$(_agents_registry_get assignments "$fn")"
+        # A caller function's example rows come from the family that would run
+        # from here; from outside any session, codex stands in.
+        family="$(_agents_concrete_family "$(_agents_registry_get assignments "$fn")")"
+        [[ -z "$family" && "$(_agents_registry_get assignments "$fn")" == "$AGENTS_CALLER_ASSIGNMENT" ]] && family="codex"
         if [[ -n "$family" ]]; then
             ex_fn="$fn"
             [[ "$family" == "codex" ]] && ex_other="claude" || ex_other="codex"
@@ -49,7 +52,10 @@ Usage: agent_admin.sh [skills | <function> | <family>] | <function> <codex|claud
   <function>               print just that function's rows
   <family>                 switch every function to the codex or claude family
   <function> <family>      switch a whole function to the codex or claude family
-                           — the only thing that changes which rows are live
+                           — the only thing that changes which rows are live.
+                           A function assigned 'caller' (ask_a_friend) has no
+                           switch: it runs on the family of the agent asking,
+                           so both of its row sets are live, one per family
   <function>.<subtask> <agent>[:<effort>]
                            edit one row; the agent names its own family, so
                            naming a dormant family's agent edits that row and
@@ -113,7 +119,9 @@ elif [[ "$#" -eq 2 ]]; then
     if [[ "$1" == *.* ]]; then
         agents_set_row "$1" "$2"
         fn="${1%%.*}"
-        if [[ "$AGENT_ROW_ACTIVE" == "yes" ]]; then
+        if [[ "$AGENT_ROW_ASSIGNMENT" == "$AGENTS_CALLER_ASSIGNMENT" ]]; then
+            echo "# updated [$fn.$AGENT_ROW_FAMILY] $1 — live whenever a $AGENT_ROW_FAMILY session runs $fn"
+        elif [[ "$AGENT_ROW_ACTIVE" == "yes" ]]; then
             echo "# updated [$fn.$AGENT_ROW_FAMILY] $1 — live"
         else
             echo "# updated [$fn.$AGENT_ROW_FAMILY] $1 — dormant:" \

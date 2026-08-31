@@ -151,8 +151,48 @@ _agents_families_inline() {
     done
 }
 
-# The family a task resolves through today: an exact-task assignment override
-# if one exists, otherwise the function's assignment.
+# `caller` in [assignments] means the function runs on the family of the agent
+# invoking it, not on a fixed one. ask_a_friend uses it: a friend of the caller's
+# own kind is the only friend that can talk back -- claude reaches claude by
+# SendMessage, codex reaches codex through codex_mesh.py, and a codex friend has
+# no route to a claude caller. A function assigned `caller` has no family switch.
+AGENTS_CALLER_ASSIGNMENT="caller"
+
+# The family of the agent running this shell. codex exports CODEX_THREAD_ID into
+# every shell it spawns and claude exports CLAUDE_CODE_SESSION_ID; codex wins when
+# both are present because a codex process launched from a claude session
+# inherits claude's variable and is still codex. AGENTS_CALLER_FAMILY overrides
+# detection, for tests and for a launcher that already knows. Empty when nothing
+# is detectable.
+_agents_caller_family() {
+    if [[ -n "${AGENTS_CALLER_FAMILY:-}" ]]; then
+        printf '%s' "$AGENTS_CALLER_FAMILY"
+    elif [[ -n "${CODEX_THREAD_ID:-}" ]]; then
+        printf '%s' codex
+    elif [[ -n "${CLAUDE_CODE_SESSION_ID:-}" ]]; then
+        printf '%s' claude
+    fi
+}
+
+# An assignment value as the family it means right now: `caller` becomes the
+# running agent's family (or empty), anything else is already a family.
+_agents_concrete_family() {
+    local raw="$1"
+    if [[ "$raw" == "$AGENTS_CALLER_ASSIGNMENT" ]]; then
+        _agents_caller_family
+    else
+        printf '%s' "$raw"
+    fi
+}
+
+_agents_caller_error() {
+    local context="$1"
+    echo "ERROR: [$context] is assigned '$AGENTS_CALLER_ASSIGNMENT': it runs on the calling agent's family, and no calling agent is detectable here." >&2
+    echo "       Run it from a codex or claude session, or set AGENTS_CALLER_FAMILY=<codex|claude>." >&2
+}
+
+# The assignment a task resolves through today: an exact-task override if one
+# exists, otherwise the function's. Raw -- may be `caller`.
 _agents_active_family() {
     local function="$1" subtask="$2" family
     family="$(_agents_registry_get assignments "$function.$subtask")"
@@ -160,6 +200,11 @@ _agents_active_family() {
         family="$(_agents_registry_get assignments "$function")"
     fi
     printf '%s' "$family"
+}
+
+# The concrete family a task runs on right now; empty for an undetectable caller.
+_agents_live_family() {
+    _agents_concrete_family "$(_agents_active_family "$1" "$2")"
 }
 
 _agents_effort_allowed() {
@@ -228,7 +273,22 @@ agents_resolve() {
         echo "       Configured assignments in $AGENTS_CONFIG_FILE: $configured" >&2
         return 1
     fi
+    if [[ "$family" == "$AGENTS_CALLER_ASSIGNMENT" ]]; then
+        family="$(_agents_caller_family)"
+        if [[ -z "$family" ]]; then
+            _agents_caller_error "$task"
+            return 1
+        fi
+    fi
+    _agents_resolve_in_family "$task" "$family"
+}
 
+# The part of resolution that follows family selection: section, row, pair.
+_agents_resolve_in_family() {
+    local task="$1" family="$2" function subtask section pair configured allowed_families
+
+    function="${task%%.*}"
+    subtask="${task#*.}"
     section="$function.$family"
     if ! _agents_config_has_section "$section"; then
         allowed_families="$(_agents_function_families_inline "$function")"
@@ -255,11 +315,32 @@ agents_resolve_print() {
         "$task" "$AGENT_FAMILY" "$AGENT_MODEL" "$AGENT_EFFORT"
 }
 
+_agents_resolve_print_in_family() {
+    local task="$1" family="$2"
+    AGENT_FAMILY="$family"
+    _agents_resolve_in_family "$task" "$family" || return 1
+    printf 'task=%s family=%s agent=%s effort=%s\n' \
+        "$task" "$AGENT_FAMILY" "$AGENT_MODEL" "$AGENT_EFFORT"
+}
+
+# Print one function's rows in one family, skipping sub-tasks an exact-task
+# assignment override shadows (those print once, from their own key).
+_agents_list_function_rows() {
+    local function="$1" family="$2" line subtask
+    while IFS= read -r line; do
+        subtask="${line%%=*}"
+        if [[ -n "$(_agents_registry_get assignments "$function.$subtask")" ]]; then
+            continue
+        fi
+        _agents_resolve_print_in_family "$function.$subtask" "$family" || return 1
+    done < <(_agents_config_section_values "$function.$family")
+}
+
 agents_list_assignments() {
-    local filter="${1:-}" assignment key family line subtask matched=0
+    local filter="${1:-}" assignment key family live matched=0
     while IFS= read -r assignment; do
         key="${assignment%%=*}"
-        family="${assignment#*=}"
+        family="$(agents_config_trim "${assignment#*=}")"
         if [[ -n "$filter" && "$key" != "$filter" && "$key" != "$filter".* ]]; then
             continue
         fi
@@ -268,13 +349,24 @@ agents_list_assignments() {
             agents_resolve_print "$key" || return 1
             continue
         fi
-        while IFS= read -r line; do
-            subtask="${line%%=*}"
-            if [[ -n "$(_agents_registry_get assignments "$key.$subtask")" ]]; then
-                continue
+        if [[ "$family" == "$AGENTS_CALLER_ASSIGNMENT" ]]; then
+            # A caller function has no single answer from outside a session:
+            # show the family that would run from here, or both when nothing
+            # says which.
+            live="$(_agents_caller_family)"
+            if [[ -n "$live" ]]; then
+                _agents_list_function_rows "$key" "$live" || return 1
+                echo "# $key: $AGENTS_CALLER_ASSIGNMENT — the calling agent's family ($live here)"
+            else
+                for live in codex claude; do
+                    _agents_config_has_section "$key.$live" || continue
+                    _agents_list_function_rows "$key" "$live" || return 1
+                done
+                echo "# $key: $AGENTS_CALLER_ASSIGNMENT — the calling agent's family (none detectable here)"
             fi
-            agents_resolve_print "$key.$subtask" || return 1
-        done < <(_agents_config_section_values "$key.$family")
+            continue
+        fi
+        _agents_list_function_rows "$key" "$family" || return 1
     done < <(_agents_config_section_values assignments)
     if [[ -n "$filter" && "$matched" -eq 0 ]]; then
         echo "ERROR: no [assignments] entry for '$filter'." >&2
@@ -287,7 +379,7 @@ agents_list_assignments() {
 # active family (plus any per-subtask assignment overrides).
 agents_list_function() {
     local function="$1" active family line key subtask pair model effort overrides=""
-    local row_active
+    local row_active live
 
     active="$(_agents_registry_get assignments "$function")"
     if [[ -z "$active" ]]; then
@@ -303,7 +395,7 @@ agents_list_function() {
             model="${pair%%:*}"
             effort=""
             [[ "$pair" == *:* ]] && effort="${pair#*:}"
-            if [[ "$(_agents_active_family "$function" "$subtask")" == "$family" ]]; then
+            if [[ "$(_agents_live_family "$function" "$subtask")" == "$family" ]]; then
                 row_active="yes"
             else
                 row_active="no"
@@ -317,6 +409,14 @@ agents_list_function() {
         [[ "$key" == "$function".* ]] || continue
         overrides="$overrides, ${key#"$function".}=$(agents_config_trim "${line#*=}")"
     done < <(_agents_config_section_values assignments)
+    if [[ "$active" == "$AGENTS_CALLER_ASSIGNMENT" ]]; then
+        live="$(_agents_caller_family)"
+        if [[ -n "$live" ]]; then
+            active="$AGENTS_CALLER_ASSIGNMENT — the calling agent's family ($live here)"
+        else
+            active="$AGENTS_CALLER_ASSIGNMENT — the calling agent's family (none detectable here)"
+        fi
+    fi
     if [[ -n "$overrides" ]]; then
         echo "# current family: $active (overrides:${overrides#,})"
     else
@@ -325,10 +425,20 @@ agents_list_function() {
 }
 
 agents_set_assignment() {
-    local function="$1" family="$2" section line subtask pair tmp_file allowed_families
+    local function="$1" family="$2" section line subtask pair tmp_file allowed_families current
 
     if [[ -z "$function" || "$function" == *.* ]]; then
         echo "ERROR: assignment function must be one segment; got '$function'." >&2
+        return 1
+    fi
+    current="$(_agents_registry_get assignments "$function")"
+    if [[ "$current" == "$AGENTS_CALLER_ASSIGNMENT" ]]; then
+        echo "ERROR: '$function' is assigned '$AGENTS_CALLER_ASSIGNMENT': it always runs on the calling agent's family and has no switch." >&2
+        echo "       Edit its rows instead: agent_admin.sh $function.<subtask> <agent>[:<effort>]" >&2
+        return 1
+    fi
+    if [[ "$family" == "$AGENTS_CALLER_ASSIGNMENT" ]]; then
+        echo "ERROR: '$AGENTS_CALLER_ASSIGNMENT' is not a switch target; it is written by hand in $AGENTS_CONFIG_FILE [assignments]." >&2
         return 1
     fi
     section="$function.$family"
@@ -379,6 +489,9 @@ agents_set_all_assignments() {
     fi
     while IFS= read -r line; do
         key="${line%%=*}"
+        # A caller function is not switched, so it is not validated against the
+        # target either; it already resolves through whichever family asks.
+        [[ "$(agents_config_trim "${line#*=}")" == "$AGENTS_CALLER_ASSIGNMENT" ]] && continue
         fn="${key%%.*}"
         section="$fn.$family"
         if ! _agents_config_has_section "$section"; then
@@ -407,7 +520,7 @@ agents_set_all_assignments() {
     done < <(_agents_config_section_values assignments)
 
     tmp_file="$(mktemp "${AGENTS_CONFIG_FILE}.XXXXXX")"
-    if ! awk -v fam="$family" '
+    if ! awk -v fam="$family" -v caller="$AGENTS_CALLER_ASSIGNMENT" '
         /^\[/ {
             in_section = ($0 == "[assignments]")
             print
@@ -419,11 +532,14 @@ agents_set_all_assignments() {
             before_comment = hash ? substr(content, 1, hash - 1) : content
             equals = index(before_comment, "=")
             if (equals) {
+                value = substr(before_comment, equals + 1)
+                gsub(/^[[:space:]]+|[[:space:]]+$/, "", value)
+                found = 1
+                if (value == caller) { print; next }
                 match(before_comment, /[[:space:]]*$/)
                 spacing = substr(before_comment, RSTART)
                 comment = hash ? substr(content, hash) : ""
                 print substr(before_comment, 1, equals) fam spacing comment
-                found = 1
                 next
             }
         }
@@ -439,8 +555,10 @@ agents_set_all_assignments() {
 
 # Edit one row. The agent names its own family, so the row written is the one
 # the agent could only ever have meant — never the merely-active one. Sets
-# AGENT_ROW_FAMILY (where it landed), AGENT_ROW_ACTIVE_FAMILY (what the task
-# resolves through today), and AGENT_ROW_ACTIVE (yes when those agree).
+# AGENT_ROW_FAMILY (where it landed), AGENT_ROW_ASSIGNMENT (the raw assignment,
+# `caller` included), AGENT_ROW_ACTIVE_FAMILY (what the task resolves through
+# today; empty for an undetectable caller), and AGENT_ROW_ACTIVE (yes when the
+# row's family is the one resolving today).
 agents_set_row() {
     local task="$1" pair="$2" function subtask family families active
     local section tmp_file configured
@@ -519,8 +637,9 @@ agents_set_row() {
     mv "$tmp_file" "$AGENTS_CONFIG_FILE"
 
     AGENT_ROW_FAMILY="$family"
-    AGENT_ROW_ACTIVE_FAMILY="$active"
-    if [[ "$family" == "$active" ]]; then
+    AGENT_ROW_ASSIGNMENT="$active"
+    AGENT_ROW_ACTIVE_FAMILY="$(_agents_concrete_family "$active")"
+    if [[ "$family" == "$AGENT_ROW_ACTIVE_FAMILY" ]]; then
         AGENT_ROW_ACTIVE="yes"
     else
         AGENT_ROW_ACTIVE="no"

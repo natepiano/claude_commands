@@ -16,7 +16,7 @@ I iterate on these almost every day to get them to work right for me - feel free
 ### Review & Planning
 - **module_review** - Multi-agent module-structure evaluation
 - **adhoc_review / phase_review / team_review** - Walk findings with the user, retrospect plan phases
-- **ask_a_friend** - Get a second opinion from codex
+- **ask_a_friend** - Get a second opinion from a friend of your own kind — claude asks claude, codex asks codex — over a live two-way channel, with follow-ups and optional implementation
 
 ### Release & CI
 - **release** - Unified release pipeline (version bump, changelog, publish, GitHub release)

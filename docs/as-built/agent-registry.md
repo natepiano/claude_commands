@@ -11,7 +11,7 @@ Every external-CLI agent this configuration launches — `/plan:delegate`'s impl
 `config/agents.conf` is an INI-style file with four kinds of section. Comments (`#`) are stripped to end-of-line everywhere, including trailing inline comments on rows.
 
 ```ini
-[assignments]                 # <function>=<family>, plus optional <function>.<subtask>=<family>
+[assignments]                 # <function>=<family>, plus optional <function>.<subtask>=<family>; `caller` = the family of the agent running it
 delegate=codex
 
 [delegate.codex]              # [<function>.<family>] — <subtask>=<agent>[:<effort>]
@@ -41,19 +41,19 @@ Every function carries *both* family sets, fully specified at all times, so a fa
 | `delegate` | `impl`, `test`, `fix`, `review` |
 | `cli` | `style_fix_review`, `commit_prep`, `merge_branch`, `interactive` |
 | `fix` | `style_eval`, `style_eval_review`, `style_fix`, `report` |
-| `ask_a_friend` | `consultation`, `implementation` |
+| `ask_a_friend` | `consultation` |
 | `team_review` | `expert` |
 | `api_review` | `reviewer`, `adversary` |
 | `module_review` | `reviewer`, `validation` |
 
-`[codex.agents]` is machine-generated (`gpt-5.6-sol`, `gpt-5.6-terra`, `gpt-5.6-luna`, `gpt-5.5`, `gpt-5.4`, `gpt-5.4-mini`, `gpt-5.3-codex-spark` today). `[claude.agents]` is hand-maintained: `fable`, `opus`, `sonnet`, each `low,medium,high,xhigh,max`. All seven functions are assigned `codex`.
+`[codex.agents]` is machine-generated (`gpt-5.6-sol`, `gpt-5.6-terra`, `gpt-5.6-luna`, `gpt-5.5`, `gpt-5.4`, `gpt-5.4-mini`, `gpt-5.3-codex-spark` today). `[claude.agents]` is hand-maintained: `fable`, `opus`, `sonnet`, each `low,medium,high,xhigh,max`. Six functions are assigned `codex`; `ask_a_friend` is assigned `caller` — it runs on the family of the agent asking, because only a like-to-like pair talks both ways (claude reaches claude by `SendMessage`, codex reaches codex through `codex_mesh.py`, and a codex friend has no route back to a claude caller).
 
 ### Resolution algorithm and precedence
 
 `agents_resolve <task>` sets `AGENT_FAMILY`, `AGENT_MODEL`, `AGENT_EFFORT` (effort may be empty) and returns nonzero with a stderr message naming the offending piece *and* the allowed values on any failure:
 
 1. Split the task at the first dot. Reject anything that is not exactly two non-empty segments.
-2. **Family precedence:** an exact-task key in `[assignments]` (`delegate.review=claude`) wins over the function key (`delegate=codex`). Neither present → error listing the configured assignments.
+2. **Family precedence:** an exact-task key in `[assignments]` (`delegate.review=claude`) wins over the function key (`delegate=codex`). Neither present → error listing the configured assignments. A value of `caller` maps to the running agent's family — `AGENTS_CALLER_FAMILY` if set, else `CODEX_THREAD_ID` ⇒ codex, else `CLAUDE_CODE_SESSION_ID` ⇒ claude (codex wins when both are set: a codex launched from a claude session inherits claude's variable); none detectable → error naming the override.
 3. Section `<function>.<family>` must exist → otherwise error listing the families that do have a set for that function.
 4. Row `<subtask>` must exist in that section → otherwise error listing the section's sub-tasks.
 5. Validate the pair: agent is everything before the first colon, effort everything after. A trailing colon with nothing after it is rejected. The agent must be a key in `[<family>.agents]`; a non-empty effort must appear in that agent's comma list. A catalog row with an *empty* effort list is legal and admits only bare (effort-less) pairs.
@@ -69,10 +69,10 @@ Public:
 - `agents_config_trim <value>` — strip leading/trailing whitespace; the shared primitive.
 - `agents_resolve <task>` — the algorithm above; sets `AGENT_FAMILY` / `AGENT_MODEL` / `AGENT_EFFORT`.
 - `agents_resolve_print <task>` — resolves, then prints one line: `task=… family=… agent=… effort=…`.
-- `agents_list_assignments [filter]` — walks `[assignments]`; for a bare function key it resolve-prints every row of the active set, skipping sub-tasks shadowed by an exact-task override (which are printed once from their own key). Returns nonzero if *any* row fails to resolve; with a filter that matches no assignment it errors.
-- `agents_list_function <function>` — prints every row of *both* families for one function as `task=… family=… agent=… effort=… active=yes|no`, then a `# current family: X` line (with `(overrides: …)` when exact-task assignments exist).
-- `agents_set_assignment <function> <family>` — validates that every row of `[<function>.<family>]` resolves, then awk-rewrites the `[assignments]` line. Any invalid row → reject, name the row, file untouched.
-- `agents_set_all_assignments <family>` — switches **every** `[assignments]` entry, exact-task overrides included, to one family. Validates the whole target set first — a function with no `[<function>.<family>]` section, an override key with no matching row, or any invalid row rejects the switch with the file untouched — then awk-rewrites every assignment line in one pass, preserving trailing inline comments and spacing byte-exactly.
+- `agents_list_assignments [filter]` — walks `[assignments]`; for a bare function key it resolve-prints every row of the active set, skipping sub-tasks shadowed by an exact-task override (which are printed once from their own key). Returns nonzero if *any* row fails to resolve; with a filter that matches no assignment it errors. A `caller` function prints the detected family's rows plus `# <fn>: caller — the calling agent's family (<fam> here)`, or both families' rows plus `(none detectable here)`.
+- `agents_list_function <function>` — prints every row of *both* families for one function as `task=… family=… agent=… effort=… active=yes|no`, then a `# current family: X` line (with `(overrides: …)` when exact-task assignments exist). For a `caller` function `active=yes` marks the detected family's rows and the line reads `# current family: caller — the calling agent's family (X here|none detectable here)`.
+- `agents_set_assignment <function> <family>` — validates that every row of `[<function>.<family>]` resolves, then awk-rewrites the `[assignments]` line. Any invalid row → reject, name the row, file untouched. A `caller` function has no switch — rejected, pointing at row edits — and `caller` is not a switch target.
+- `agents_set_all_assignments <family>` — switches **every** `[assignments]` entry, exact-task overrides included, to one family. Validates the whole target set first — a function with no `[<function>.<family>]` section, an override key with no matching row, or any invalid row rejects the switch with the file untouched — then awk-rewrites every assignment line in one pass, preserving trailing inline comments and spacing byte-exactly. `caller` lines are skipped: neither validated against the target nor rewritten.
 - `agents_set_row <task> <agent>[:<effort>]` — edits one row. The **agent** names the family (the two catalogs share no names), so the row written is the one the agent could only have meant, live or dormant; an agent listed by both catalogs is refused as ambiguous, and an agent whose family has no `[<function>.<family>]` section names the missing section. Validates the pair, then awk-rewrites the row preserving its trailing inline comment and spacing byte-exactly. Sets `AGENT_ROW_FAMILY`, `AGENT_ROW_ACTIVE_FAMILY`, `AGENT_ROW_ACTIVE`. Editing a row never changes which family is live.
 - `agents_codex_args` — one line: `-m <agent>`, plus `-c model_reasoning_effort="<effort>"` when effort is non-empty.
 - `agents_claude_args` — one line: `--model <agent>`, plus `--effort <effort>` when effort is non-empty.
@@ -262,7 +262,7 @@ A thin dispatcher over the resolver:
 | `scripts/fix/fix.sh` | Driver: loads all three stage assignments before checking `enabled`, logs `family/agent`, and renders the report through `agent_exec fix.report write "$HOME/.claude" <prompt> /tmp/fix-report.txt <log_dir>/report_render.txt` behind an activity grep, with a guarded prompt build and WARN-and-continue. |
 | `scripts/fix/style-eval-all.sh`, `style-eval-review-all.sh`, `style-fix-worktrees.sh` | Stage scripts; `case "$STYLE_AGENT"` dispatches on the *family*, `STYLE_AGENT_MODEL` is the agent, and the codex effort flag is wrapped in an `[[ -n … ]]` guard. |
 | `scripts/fix/fix-usage.sh`, `fix_report_parse.py` | Usage screen renders family/agent/effort columns (`<default>` for empty effort); the parser carries the family into `<family>-usage-limit` reason codes via `AGENT_LIMIT_LINE_RE` and the `AgentLimit` dataclass. |
-| `scripts/ask_a_friend/ask_a_friend.sh` / `implement.sh` | `ask_a_friend.consultation` / `ask_a_friend.implementation`, both `write` mode; protocol names are their own (`question.md` / `answer.txt`, status `asking→answered\|error`; `implementation_prompt.md` / `impl_summary.txt`, `impl_status`), logs `agent.log` / `impl_agent.log`, provenance `consult_agent` / `impl_agent`. |
+| `scripts/ask_a_friend/prepare_session.sh` / `launch_friend.sh` / `end_friend.sh` | `ask_a_friend.consultation`, resolved directly (not through `agent_exec`) because the friend is a live peer, not a one-shot: claude → `agent_bg.sh` with `AGENT_BG_DETACH=1` (the one `claude --bg --name <friend>` recipe; answers by `SendMessage`; `friend_id` for `claude stop`), codex → `codex_mesh.py start --resident` (a thread that outlives its turns; replies print between `=== reply from <friend> (N) ===` / `=== end reply ===`; `end` releases it). Protocol files: `friend_name`, `question.md`, `message_<N>.md`, `answer.txt` (codex), `status` `running\|ended\|error`, `agent.log`, provenance `consult_agent`. One friend carries consultation and implementation, so there is one row per family. |
 | `commands/team_review.md`, `api_review.md`, `module_review.md` | Call `agent_exec … readonly` directly, backgrounded, one call per lens/pass, with self-contained prompt files under wave-namespaced session dirs (`cycle2/`, `adversary/`, `pass3/`) and provenance captured in-session via `agents_resolve_print`. |
 | `commands/plan/delegate.md`, `commands/ask_a_friend.md`, `commands/fix.md` | Consumer docs: call sites, log/provenance names, and `/agent` as the switch surface. |
 
@@ -274,7 +274,7 @@ All four wrappers capture resolver stderr into their log (`agents_resolve "$TASK
 - Every function keeps **both** family sets fully specified, so switching families is a one-row edit; `agents_set_assignment` (and `agents_set_all_assignments`, across every function at once) refuses a switch if any row of the target set fails validation, and leaves the file untouched.
 - Agent names stay disjoint between `[codex.agents]` and `[claude.agents]` — `agents_set_row` infers the family from the agent and refuses a name listed by both rather than guessing.
 - Task names are exactly two segments. Empty effort means "omit the flag"; `agent:` with nothing after the colon is invalid; a catalog row with an empty effort list is valid and admits only bare pairs.
-- Only `agents_set_assignment` and `agents_set_all_assignments` change which family is live. `agents_set_row` writes a row (live or dormant) and never flips liveness.
+- Only `agents_set_assignment` and `agents_set_all_assignments` change which family is live. `agents_set_row` writes a row (live or dormant) and never flips liveness. The one exception is a `caller` function: its live family is whichever agent is asking, it is written by hand in the file, and neither switch touches it.
 - The sync rewrites only `[codex.agents]` and never touches assignments. `[claude.agents]` stays hand-maintained; alias warnings never auto-add, vanished-agent warnings never auto-repoint.
 - New lookups use `_agents_registry_get` / `_agents_registry_has_key` (literal key comparison). Never match keys with an unescaped `^key=` regex — dotted keys like `delegate.review` mis-match.
 - Any awk that writes a user-supplied value into the conf passes it through `ENVIRON`, not `awk -v`. Row rewrites preserve trailing inline comments and spacing byte-exactly; conf writes go through a tmp file + `mv` (mode preserved), never in place.
@@ -335,12 +335,15 @@ All four wrappers capture resolver stderr into their log (`agents_resolve "$TASK
   acknowledgement says nothing about delivery — do not use it as a reachability
   test.
 - **A finished codex delegate is gone.** Its thread ends with its turn, unlike a
-  claude background session, which a message resumes from its transcript. `send`
+  claude background session, which a message resumes from its transcript. The
+  exception is a thread started `--resident` (ask_a_friend's friend): it stays
+  `running` across turns, prints each reply as it lands, and ends only on
+  `codex_mesh.py end`. `send`
   to a delegate whose roster status is not `running` will not be read.
 - **`AGENT_EXEC_EXTRA_ARGS` is whitespace-split with no quote interpretation.** Flag+value pairs (`--add-dir /path`) work; no single argument may contain a space — no prompt preambles, no `--settings` JSON.
 - **`AGENT_EXEC_DRY_RUN=1`** is the testing hook: `%q`-quoted argv plus redirection suffix, with a `cd <dir> && ` prefix on the claude branch. Match smoke checks on substrings (`--full-auto`, `--sandbox read-only`, `-m <agent>`, the effort word), never whole lines — the codex effort token renders with escaped quotes (`model_reasoning_effort=\"high\"`).
 - **awk gotchas.** `function` is a reserved awk word — pass it as `-v fn=`. `awk -v` decodes backslash escapes, so a value containing `\n` / `\t` would corrupt the row; user-supplied values go through `ENVIRON["…"]`.
-- **`codex --sandbox read-only` panics** codex's system-configuration crate on macOS in some contexts, which is why ask_a_friend's conceptually read-only consult runs `write` (`--full-auto`). The delegate reviewer's `--sandbox read-only` usage is proven and stays. Codex launched from a Claude Code session needs `dangerouslyDisableSandbox: true` (and usually `run_in_background: true`).
+- **`codex --sandbox read-only` panics** codex's system-configuration crate on macOS in some contexts, which is why ask_a_friend's conceptually read-only consult ran `write` (`--full-auto`) while it went through `agent_exec`; today the friend is a mesh thread (`codex_mesh.py start --resident`) and never touches `--sandbox read-only`. The delegate reviewer's `--sandbox read-only` usage is proven and stays. Codex launched from a Claude Code session needs `dangerouslyDisableSandbox: true` (and usually `run_in_background: true`).
 - **`service_tier="fast"`** is passed on both codex paths in `cli_agent.sh`, including the interactive REPL — keep it.
 - **Last-writer-wins on conf rewrites.** The source-time sync and the `/agent` editors both rewrite the file with tmp + `mv` and no locking; interleaved writers can silently revert each other's change but never corrupt the file.
 - **claude-family output needs `python3`.** The claude branch logs stream-JSON and extracts the final result event into the output file; without `python3` the output file would be empty even though the log is complete. Claude-family `readonly` reviewers running the style loader script under `--permission-mode plan --print` is untested — a family switch may silently degrade style loading.

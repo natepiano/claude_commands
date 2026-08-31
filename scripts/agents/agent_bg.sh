@@ -4,6 +4,12 @@
 #
 # Usage: agent_bg.sh <mesh_name> <working_dir> <prompt_file> <summary_file>
 #                    <log_file> <id_file> [model] [poll_secs]
+#   env AGENT_BG_EFFORT=<effort>  adds --effort to the launch
+#   env AGENT_BG_DETACH=1         return once the session is registered, with
+#                                 its id in <id_file>, instead of waiting for
+#                                 its turn to end -- for a caller that talks to
+#                                 the session itself (ask_a_friend) rather than
+#                                 waiting on a summary
 #
 # Why this exists rather than agent_exec.sh: a delegate launched with
 # `claude --print` is INVISIBLE. It holds the ListAgents/SendMessage tools but
@@ -37,6 +43,8 @@ LOG_FILE="${5:?missing log_file}"
 ID_FILE="${6:?missing id_file}"
 MODEL="${7:-}"
 POLL_SECS="${8:-15}"
+EFFORT="${AGENT_BG_EFFORT:-}"
+DETACH="${AGENT_BG_DETACH:-0}"
 
 # Never the bare name: the user's interactive shell aliases `claude` to inject
 # `--remote-control "<dir> <date>"`, which turns `claude stop <id>` into a new
@@ -73,6 +81,9 @@ launch_args=(--bg --name "${MESH_NAME}"
 if [[ -n "${MODEL}" ]]; then
   launch_args+=(--model "${MODEL}")
 fi
+if [[ -n "${EFFORT}" ]]; then
+  launch_args+=(--effort "${EFFORT}")
+fi
 
 banner="$(cd "${WORKING_DIR}" && "${CLAUDE_BIN}" "${launch_args[@]}" \
             -- "$(cat "${PROMPT_FILE}")" 2>&1 || true)"
@@ -87,6 +98,10 @@ if [[ -z "${BG_ID}" ]]; then
   exit 1
 fi
 printf '%s\n' "${BG_ID}" > "${ID_FILE}"
+if [[ "${DETACH}" == "1" ]]; then
+  echo "launched ${MESH_NAME} (${BG_ID})"
+  exit 0
+fi
 
 agent_status() {
   "${CLAUDE_BIN}" agents --json 2>/dev/null | BG_ID="${BG_ID}" python3 -c '
@@ -101,7 +116,8 @@ except (json.JSONDecodeError, ValueError):
     sys.exit(0)
 for row in rows:
     if row.get("id") == wanted:
-        print(row.get("status") or "unknown")
+        # Background rows carry `state`; interactive rows carry `status`.
+        print(row.get("state") or row.get("status") or "unknown")
         break
 else:
     print("gone")

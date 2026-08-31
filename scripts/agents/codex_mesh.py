@@ -25,8 +25,14 @@ recording work unchanged.
 Verbs:
   serve  Start the session's app-server and record where it listens.
   start  Launch one delegate as a named thread; block until its turn ends.
+         With --resident, stay attached across turns instead: each finished
+         turn is printed to stdout and written to the summary file, the
+         thread keeps accepting `send`, and only `end` releases the block.
   send   Queue a message for a named delegate, delivered at its next turn.
   steer  Inject into a named delegate's running turn.
+  end    Finish a resident delegate: interrupt its running turn, if any, and
+         release its `start`.
+  stop   Stop the session's app-server.
   list   Print the roster of named delegates and what each is doing.
 """
 
@@ -49,7 +55,7 @@ import time
 from collections.abc import Callable
 from datetime import datetime
 from pathlib import Path
-from typing import TypedDict, cast, final
+from typing import TextIO, TypedDict, cast, final
 
 SERVER_FILE = "mesh_server.json"
 ROSTER_FILE = "mesh_roster.json"
@@ -58,6 +64,9 @@ CALL_TIMEOUT_SECS = 300
 SERVER_START_TIMEOUT_SECS = 30
 # How long to keep watching after a turn ends for a queued turn already in flight.
 QUEUE_GRACE_SECS = 3.0
+# A resident delegate sits between turns with nothing on the socket, so its loop
+# wakes this often to look for the end marker.
+RESIDENT_POLL_SECS = 1.0
 
 
 class RpcMessage(TypedDict, total=False):
@@ -356,6 +365,56 @@ def _free_port() -> int:
         return _bound_port(probe)
 
 
+def _live_server_port(session_dir: str) -> int | None:
+    """The session app-server's port when it is running, else None.
+
+    `ensure_server` would start one; the verbs that only ever wind things down
+    must not, or ending a delegate whose server already died would leave a
+    fresh server behind for nothing.
+    """
+    record = _read_json_object(_session_path(session_dir, SERVER_FILE))
+    port = record.get("port")
+    pid = record.get("pid")
+    if isinstance(port, int) and isinstance(pid, int) and _pid_alive(pid):
+        return port
+    return None
+
+
+def _end_marker_path(session_dir: str, name: str) -> Path:
+    return _session_path(session_dir, f"{name}.end")
+
+
+def _message_text(args: argparse.Namespace) -> str:
+    """The message for send/steer: --message-file wins, so a multi-line body
+    never has to survive shell quoting."""
+    path = _as_str(_attr(args, "message_file"))
+    if path:
+        return Path(path).read_text(encoding="utf-8")
+    return _as_str(_attr(args, "message"))
+
+
+def _deliver_reply(
+    name: str, index: int, text: str, failure: str, summary_path: Path, log: TextIO
+) -> None:
+    """Hand one finished resident turn to whoever is watching.
+
+    stdout is for a caller polling the terminal this runs in; the summary file
+    is for a reader that comes later; the log line keeps the heartbeat honest.
+    """
+    if text and failure:
+        body = f"{text}\n[error] {failure}"
+    elif text:
+        body = text
+    elif failure:
+        body = f"[error] {failure}"
+    else:
+        body = f"The delegate {name} produced no reply."
+    _ = summary_path.write_text(body + "\n", encoding="utf-8")
+    print(f"=== reply from {name} ({index}) ===\n{body}\n=== end reply ===", flush=True)
+    _ = log.write(f"[{_now_stamp()}] reply {index} delivered\n")
+    log.flush()
+
+
 def ensure_server(session_dir: str) -> int:
     """Return the port for this session's app-server, starting it if needed."""
     path = _session_path(session_dir, SERVER_FILE)
@@ -495,15 +554,28 @@ def command_start(args: argparse.Namespace) -> int:
         {"thread_id": thread_id, "turn_id": turn_id, "status": "running"},
     )
 
+    resident = _attr(args, "resident") is True
+    end_marker = _end_marker_path(session_dir, name)
+    end_marker.unlink(missing_ok=True)
+
     final_answer = ""
     failure = ""
+    replies = 0
     deadline = time.time() + timeout
     with log_path.open("a", encoding="utf-8") as log:
         _ = log.write(f"[{_now_stamp()}] mesh: {name} thread {thread_id}\n")
         log.flush()
         while time.time() < deadline:
-            frame = client.next_frame(deadline)
+            # A resident thread is silent between turns, so a full-deadline wait
+            # would sleep straight through `end`; wake often enough to see it.
+            if resident:
+                wait_until = min(deadline, time.time() + RESIDENT_POLL_SECS)
+            else:
+                wait_until = deadline
+            frame = client.next_frame(wait_until)
             if frame is None:
+                if resident and end_marker.exists():
+                    break
                 continue
             method = frame.get("method")
             params = _as_dict(frame.get("params"))
@@ -526,26 +598,50 @@ def command_start(args: argparse.Namespace) -> int:
                     text = _as_str(item.get("text"))
                     if text:
                         final_answer = text
-            elif method == "turn/completed":
-                completed = _as_dict(params.get("turn"))
-                failure = _as_str(_as_dict(completed.get("error")).get("message"))
-                if failure or not _more_work_coming(client, thread_id, deadline):
+            elif method in ("turn/completed", "turn/failed"):
+                if method == "turn/completed":
+                    completed = _as_dict(params.get("turn"))
+                    failure = _as_str(_as_dict(completed.get("error")).get("message"))
+                else:
+                    detail = _as_str(_as_dict(params.get("error")).get("message"))
+                    failure = detail or "turn failed"
+                if not resident:
+                    if (
+                        method == "turn/failed"
+                        or failure
+                        or not _more_work_coming(client, thread_id, deadline)
+                    ):
+                        break
+                    # A peer's message is waiting. The server starts that turn
+                    # by itself, so the only thing to do is keep streaming --
+                    # exiting here would strand the message and kill the
+                    # delegate mid-reply.
+                    continue
+                # Resident: every finished turn is a reply to deliver, an error
+                # included -- the caller is waiting on this one and would
+                # otherwise wait forever. The thread stays open for the next
+                # message; only `end` closes it.
+                replies += 1
+                _deliver_reply(name, replies, final_answer, failure, summary_path, log)
+                final_answer = ""
+                failure = ""
+                _update_roster(
+                    session_dir,
+                    name,
+                    {"thread_id": thread_id, "turn_id": "", "status": "running"},
+                )
+                if end_marker.exists():
                     break
-                # A peer's message is waiting. The server starts that turn by
-                # itself, so the only thing to do is keep streaming -- exiting
-                # here would strand the message and kill the delegate mid-reply.
-            elif method == "turn/failed":
-                detail = _as_str(_as_dict(params.get("error")).get("message"))
-                failure = detail or "turn failed"
-                break
         else:
             failure = f"no turn/completed within {timeout:.0f}s"
 
     # A background thread has no output redirect, so the summary file is the
-    # only place the caller can read the delegate's answer.
-    if not final_answer:
-        final_answer = failure or f"The delegate {name} produced no summary."
-    _ = summary_path.write_text(final_answer + "\n", encoding="utf-8")
+    # only place the caller can read the delegate's answer. A resident thread
+    # wrote each reply as it landed; only one that never replied needs this.
+    if not resident or replies == 0:
+        if not final_answer:
+            final_answer = failure or f"The delegate {name} produced no summary."
+        _ = summary_path.write_text(final_answer + "\n", encoding="utf-8")
     _update_roster(
         session_dir,
         name,
@@ -582,7 +678,7 @@ def command_send(args: argparse.Namespace) -> int:
             {
                 "threadId": record["thread_id"],
                 "clientUserMessageId": f"mesh-{secrets.token_hex(6)}",
-                "input": [{"type": "text", "text": _as_str(_attr(args, "message"))}],
+                "input": [{"type": "text", "text": _message_text(args)}],
             },
         ),
         "thread/queue/add",
@@ -611,13 +707,39 @@ def command_steer(args: argparse.Namespace) -> int:
             {
                 "threadId": record["thread_id"],
                 "expectedTurnId": turn_id,
-                "input": [{"type": "text", "text": _as_str(_attr(args, "message"))}],
+                "input": [{"type": "text", "text": _message_text(args)}],
             },
         ),
         "turn/steer",
     )
     client.close()
     print(f"steered {target}")
+    return 0
+
+
+def command_end(args: argparse.Namespace) -> int:
+    """Release a resident delegate: interrupt the turn it is on, then leave the
+    marker its `start` loop polls for. Nothing here starts a server -- a
+    delegate whose server is already gone is ended by the marker alone."""
+    session_dir = _as_str(_attr(args, "session_dir"))
+    target = _as_str(_attr(args, "to"))
+    record = _lookup(session_dir, target)
+    status = record.get("status", "unknown")
+    if status != "running":
+        print(f"{target} is {status}; nothing to end")
+        return 0
+    turn_id = record.get("turn_id", "")
+    port = _live_server_port(session_dir)
+    if turn_id and port is not None:
+        client = Client(port, f"end-{os.getpid()}")
+        # Best effort: a turn that finished between the roster read and this
+        # call answers with an error, and the marker below ends it either way.
+        _ = client.call(
+            "turn/interrupt", {"threadId": record["thread_id"], "turnId": turn_id}
+        )
+        client.close()
+    _end_marker_path(session_dir, target).touch()
+    print(f"ending {target}")
     return 0
 
 
@@ -690,19 +812,33 @@ def main(argv: list[str] | None = None) -> int:
     _ = start.add_argument("--effort", default="")
     _ = start.add_argument("--sandbox", default="danger-full-access")
     _ = start.add_argument("--timeout", type=float, default=86400.0)
+    _ = start.add_argument(
+        "--resident",
+        action="store_true",
+        help="stay attached across turns, delivering each reply, until `end`",
+    )
     start.set_defaults(handler=command_start)
 
     send = subparsers.add_parser("send", help="queue a message for a delegate")
     _ = send.add_argument("--session-dir", required=True)
     _ = send.add_argument("--to", required=True)
-    _ = send.add_argument("--message", required=True)
+    send_body = send.add_mutually_exclusive_group(required=True)
+    _ = send_body.add_argument("--message")
+    _ = send_body.add_argument("--message-file", help="read the message from this file")
     send.set_defaults(handler=command_send)
 
     steer = subparsers.add_parser("steer", help="interrupt a delegate's running turn")
     _ = steer.add_argument("--session-dir", required=True)
     _ = steer.add_argument("--to", required=True)
-    _ = steer.add_argument("--message", required=True)
+    steer_body = steer.add_mutually_exclusive_group(required=True)
+    _ = steer_body.add_argument("--message")
+    _ = steer_body.add_argument("--message-file", help="read the message from this file")
     steer.set_defaults(handler=command_steer)
+
+    end = subparsers.add_parser("end", help="release a resident delegate")
+    _ = end.add_argument("--session-dir", required=True)
+    _ = end.add_argument("--to", required=True)
+    end.set_defaults(handler=command_end)
 
     stop = subparsers.add_parser("stop", help="stop the session app-server")
     _ = stop.add_argument("--session-dir", required=True)
