@@ -113,6 +113,12 @@ store. `plan-delegate` is the only one.
 - **Add `worktree` to the grouping for a repo-level claim.** Implementation
   log-variance is 30.3% between worktrees against 16.3% between phases — the repo
   explains more of a timing difference than phase size does.
+- **The `test` stage holds two different things, so split it before reading a
+  median.** Verification runs (activity labels `verify`, `smoke`) are machine time
+  with a 14s median; a test seat authoring tests is agent time in the tens of
+  minutes. Both are testing, which is why both bucket to `test` — but one median
+  over the pair describes neither. `--group stage,label` separates them: a pass row
+  carries its kind as its label, an activity row carries its activity name.
 - **`phases` counting fix rounds is the metric with power**: one fix round off the
   median phase is about -19% of phase time.
 - **Fix-round count is a proxy.** It falls when implementers get more careful and

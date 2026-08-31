@@ -42,6 +42,7 @@ SPINE_VERSION = 1
 # stage: an unrecognised activity is unclassified data, not a final step.
 PASS_STAGE: dict[str, str] = {
     "impl": "implementation",
+    "test": "test",
     "fix": "fix",
     "review": "review",
     "arch": "review",
