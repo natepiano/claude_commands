@@ -45,7 +45,13 @@ PASS_STAGE: dict[str, str] = {
     "test": "test",
     "fix": "fix",
     "review": "review",
-    "arch": "review",
+    # `arch` is escalation, not architecture review: 172 of its 180 events run
+    # `delegate.escalation` -- ambiguous architecture, transform mathematics, or
+    # a failed behavioral attempt -- which delegate.md dispatches alongside
+    # implementation and fix. Real architecture review is 1085 passes of kind
+    # `review` with task `delegate.architect`. The name points at the wrong one,
+    # so read the kind, never the word. Re-bucketing moves 5 completed rows.
+    "arch": "implementation",
 }
 ACTIVITY_STAGE: dict[str, str] = {
     "verification": "test",
