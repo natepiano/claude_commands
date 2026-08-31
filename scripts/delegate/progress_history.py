@@ -3190,11 +3190,13 @@ def _progress(args: argparse.Namespace) -> None:
         else:
             current_pass = None
     if phase is None or _string(phase.get("status")) != "active" or current_pass is None:
-        # Name what the caller should do, not just what is missing. Every seat's
-        # pass having ended is the normal end of a dispatch, not a fault in the
-        # recorder -- and a tick that reads this as "tables unavailable" reports
-        # prose over a phase that has already finished, instead of reading the
-        # statuses and processing completion.
+        # State what is missing and nothing more. An earlier version of this
+        # message concluded that a closed pass meant a finished dispatch and
+        # told the caller to process completion; a live run then proved that
+        # wrong -- two seats had passes recorded `error` while their workers
+        # were still posting to the board -- and following it would have routed
+        # a healthy round through the abandon path. The recorder knows what its
+        # own records say; it does not know whether a worker is alive.
         open_slots = ", ".join(sorted(_open_passes(state))) or "none"
         phase_status = _string((phase or {}).get("status")) or "missing"
         activity_status = (
@@ -3203,8 +3205,10 @@ def _progress(args: argparse.Namespace) -> None:
         raise SystemExit(
             f"No open window to report: phase {phase_status}, "
             + f"open passes {open_slots}, activity {activity_status}. "
-            + "Every seat's pass ending is a finished dispatch: read each "
-            + "impl_status_<slot> and process completion rather than reporting."
+            + "This says nothing about whether the workers are alive: a pass "
+            + "can be closed while its worker still runs. Before concluding "
+            + "anything, check impl_status_<slot>, recent board posts, and "
+            + "whether the launcher has exited."
         )
     legacy_raw_percent = _arg_integer(args, "raw_percent", -1)
     legacy_percent = _arg_integer(args, "percent", -1)

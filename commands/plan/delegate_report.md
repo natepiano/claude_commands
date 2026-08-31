@@ -60,13 +60,16 @@ Everything below is the contract.
 
    `python3 ~/.claude/scripts/delegate/progress_history.py progress --session-dir "${SESSION_DIR}" --project-raw-percent "${PROJECT_RAW_PERCENT}" --project-percent "${PROJECT_RAW_PERCENT}" --phase-raw-percent "${PHASE_RAW_PERCENT}" --phase-percent "${PHASE_REPORTED_PERCENT}" --cap-stage "<stage>" --activity "<current activity>" [--phase-override-reason "<specific evidence>"]`
 
-   **`No open window to report` is not a table failure.** It says every seat's
-   pass has ended, which is a finished dispatch, so the answer is step 1's — read
-   each `impl_status_<slot>` and process completion. Do not re-arm and post
-   prose: a seat you believe is still working against a recorder that says its
-   pass closed is a seat that died, and the ledger is the one that watched it
-   exit. Never open an activity to make the tables render; that records
-   main-agent work that never happened.
+   **`No open window to report` does not mean the dispatch finished.** A pass
+   can be recorded closed while its worker is still running — a live run has
+   shown two seats carrying a closed pass while both were posting to the board —
+   so treating it as completion would route a healthy round through
+   <FixDispatch/>'s abandon path and lose the work. Establish which it is from
+   the seats themselves: `impl_status_<slot>`, board posts since the last
+   cursor, and whether the launcher has exited. Alive means say so in prose and
+   keep the run going; genuinely terminal means step 1's completion handling.
+   Never open an activity to make the tables render — that records main-agent
+   work that never happened.
 
    Include the override reason only when rejecting an applicable calibrated
    value. **Copy its Markdown output byte-for-byte** — the scope line,
