@@ -281,8 +281,11 @@ than the row's elapsed rather than being backdated to it.
 
 Roles come from `board.log`, not from the launch arguments, because they move
 during a phase. `board.sh role` stamps a `role=<name>` field on each `handoff`
-line, and the launcher stamps the same field on its `register` line, so a seat
-reports a role from second zero. The whole history is read rather than the
+line, and the launcher stamps the same field on its `register` line — the pass
+kind it was launched with, which is the opening role the Work Order's Seats
+field chose for that seat — so a seat reports a role from second zero.
+`board.sh post` refuses a `handoff` that does not lead with `role=`, so a move
+narrated in prose is rejected rather than lost. The whole history is read rather than the
 latest entry: collapsing to the current answer would report the last shape as
 though it had held all along. A role a seat never posted is a shape the run
 never shows, which is why the verb's contract says to call it the moment the
@@ -297,19 +300,28 @@ events, `board.sh` and the recorder read the same clock: both honour
 outside a ledger stamped from an override and drop every role change out of
 every round.
 
-Under the table sits one line naming the delegate in each seat — `_delegates:
-impl <model> <effort> · …_` — for the round in flight. It is one answer per
-phase rather than per row, so a column repeating the same three values down
-every row would crowd out the roles for nothing. The main agent is omitted: the
-reader is the main agent, and `timeline` carries both identities per pass for
-anyone reconstructing a run after the fact.
+Under the table sits one line per seat — `- **impl** <model> <effort> · 3m ago ·
+rerunning the scoped test` — naming the delegate in it for the round in flight
+and the last thing that seat said on the board, with its age. It is one answer
+per phase rather than per row, so a column repeating the same values down every
+row would crowd out the roles for nothing. The words are the seat's own: the
+launcher prefixes its exit posts `launcher:`, and the note keeps the seat's
+latest unprefixed line behind the launcher's kind — `done: hana_catalyst tests
+240 passed` rather than `done: fix finished` three times over. A seat that never
+narrated shows the launcher's words; one that has registered and said nothing
+shows `no board line yet`; a fresh `register` clears the previous occupant's
+words. The main agent is omitted: the reader is the main agent, and `timeline`
+carries both identities per pass for anyone reconstructing a run after the fact.
 
 Windows that sit in no round keep a row apiece, named as they always were: a
-main-agent activity, which holds no seat, and every pass from a solo run, which
-records none. Those rows leave the seat columns empty and keep the per-window
-finding attribution — the interval running to whatever opened next — which is
-wrong for concurrent seats and exactly right for the sequential windows that
-still reach it. An early-armed reviewer joins the round it reads when there is
+main-agent activity, which holds no seat, and every pass that records none — a
+solo run's, and the closure or broad reviewer `review.sh` launches between
+rounds. Such a pass is drawn in the seat its kind names — `review 9m` under
+Review, `impl 3m` under Impl — so a reader scanning the Review column for the
+closure review finds it rather than three dashes; an activity names no seat and
+keeps them. These rows keep the per-window finding attribution — the interval
+running to whatever opened next — which is wrong for concurrent seats and
+exactly right for the sequential windows that still reach it. An early-armed reviewer joins the round it reads when there is
 one, and otherwise keeps its own row beside the writer.
 
 Window names come from the pass kind and its position among that kind in the

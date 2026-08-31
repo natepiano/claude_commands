@@ -65,7 +65,9 @@ that builds the wrong thing.
 
 - Project Context: Delegation Context except **Style**, plus Constraints from
   prior phases.
-- Work Specification: Goal, Spec, Files verbatim, plus command-line amendments.
+- Work Specification: Goal, Spec, Files, Seats verbatim, plus command-line
+  amendments. Seats is what <LaunchImplementation/> partitions and opens from;
+  when a plan predates the field, the launch step decides and says so.
 - Capture **Style** only as `${STYLE_GATE_CONFIG}` for
   <RunProjectStyleReview/>.
 - Verification: translate Build/Test/Lint/Run/Smoke and Acceptance gate into

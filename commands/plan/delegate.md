@@ -212,18 +212,27 @@ calls. Closure reviews omit it to remain scoped to the repair.
 Every implementation or fix prompt contains these sections once:
 
 1. Role: write the requested code directly; do not ask questions. Name the
-   slot this prompt is for and the role it opens in, per <PhaseTeam/>.
+   slot this prompt is for and the role it opens in, taken from the Work
+   Order's **Seats** field per <PhaseTeam/>.
 2. Boundaries: do not commit, branch, or touch unrelated files; summarize files,
    reasons, and deviations when done, and **write that summary to this slot's
-   `impl_summary_<role>.txt` as the last act before finishing** — a background
+   `impl_summary_<slot>.txt` as the last act before finishing** — a background
    session has no output redirect, so a summary left only in the reply is a
    summary the orchestrator never sees. State this slot's file set and the
    peers' file sets per <TeamFilePartition/>, and that a peer's file is blocked
    rather than merged.
 3. Narration: before each activity, run
    `bash ~/.claude/scripts/delegate/board.sh post <concrete SESSION_DIR> <slot> status "<activity>"`.
-   Use short present-tense text and never read the heartbeat file.
-4. `## Team` — name the three concurrent slots and who holds which files. Copy
+   Use short present-tense text and never read the heartbeat file. Role
+   changes: **before the first tool call in a new role** — recruited into
+   writing, converging on review, standing down — run
+   `bash ~/.claude/scripts/delegate/board.sh role <concrete SESSION_DIR> <slot> <impl|fix|test|review> "<why>"`,
+   written out with the real path and this slot's name. A `status` sentence
+   saying the same thing does not count: the table reads the `role=` field,
+   and a move that is not posted is a row the run never shows.
+4. `## Team` — state the opening from Seats (`2 writers + 1 tester`, and the
+   role each slot opens in), then name the three concurrent slots and who holds
+   which files, each hub file with its one owner. Copy
    the board commands from <CoordinationBoard/>, and say a `verify.sh` run may
    pause while a peer finishes its own. Copy <BuildTokenContract/>'s
    delegate-facing prohibition: never mention, request, or acquire the cargo
@@ -256,13 +265,27 @@ style audit.
 <PhaseTeam>
 Every implementation and fix dispatch runs **three delegates at
 once**, never one. They share `${SESSION_DIR}` and `${WORKING_DIR}`, and each
-occupies a fixed **slot** that names its artifacts and its board identity:
+occupies a fixed **slot** that names its artifacts and its board identity. The
+**default opening**:
 
 | Slot | Opens as | Owns |
 | --- | --- | --- |
 | `impl` | the phase's implementation or repair | the Work Order's production files |
 | `test` | tests for the same specification | test targets under `tests/` and new test files |
 | `review` | reading the spec and the tree cold | nothing; it is the team's reserve |
+
+**The Work Order's `Seats:` field sets the opening and overrides this table.**
+Its first line names the opening — `1 writer + 1 tester + reserve` is the table
+above; `2 writers + 1 tester`, `1 writer + 2 testers`, and `3 writers` are the
+others — and a line per slot names that slot's files and, where it differs
+from the table, what it opens as. `impl` always opens as `impl` (`fix` in a
+repair). `test` opens as `test` wherever the phase has a **test lane** — a
+`tests/` directory in a touched crate and a Spec concrete enough to test before
+the implementation exists — and as a writer where it has none. `review` is the
+**flex seat**: it opens as whatever third role the opening needs — a second
+writer, a second tester, or the cold read. A plan compiled without the field
+opens as the table says, with the partition decided at launch per
+<TeamFilePartition/>.
 
 A slot is an identity and never changes. What a slot is *doing* is its **role**,
 and roles move during a phase per <RoleReassignment/>. Everything downstream —
@@ -274,8 +297,8 @@ implementation work is still slot `review`.
 Order defines the behavior, so tests can be written before any of it exists;
 a tester that waits for `impl` has converted a parallel team back into a queue.
 
-**Every seat carries its own `${PASS_KIND}`**, so a team phase records three
-passes. The recorder keys them by slot and closes only that slot's stale pass;
+**Every seat carries its own pass kind, which is its opening role**, so a team
+phase records three passes. The recorder keys them by slot and closes only that slot's stale pass;
 <LaunchImplementation/> step 5 owns the argument positions.
 
 Launch all three in **one message** so they run concurrently, each with its own
@@ -336,8 +359,9 @@ A member launched into the mesh is **addressable**: peers reach each other, the
 orchestrator reaches any of them, and a claude member reaches the orchestrator —
 mid-run, without waiting for a phase to end.
 
-- **Addresses** are `<mesh_prefix>-<role>`, where the prefix is the session
-  directory's basename: `phase3-a91c-impl`, `-test`, `-review`. A member is told
+- **Addresses** are `<mesh_prefix>-<slot>`, where the prefix is the session
+  directory's basename: `phase3-a91c-impl`, `-test`, `-review`. The slot, never
+  the role: a `review` seat writing code is still `-review`. A member is told
   its peers' names in its prompt, and every `register` line on the board repeats
   them in its `mesh=` field, so a member that missed the launch can still look
   one up.
@@ -415,8 +439,11 @@ already been cleared.
 </BuildTokenContract>
 
 <TeamFilePartition>
-The slots edit **disjoint file sets**, decided before launch and stated in every
-prompt.
+The slots edit **disjoint file sets**, decided in the Work Order's `Seats:`
+field — or at launch, when a plan predates it — and stated in every prompt. A
+**hub file** — a `lib.rs` or `mod.rs` re-export, `Cargo.toml`, plugin
+registration, a shared types file — has exactly one owner, named on that slot's
+Seats line; every other writer messages the owner for the line it needs.
 
 This is enforced, not merely agreed: the cargo-berth pre-edit hook claims paths
 per session, each delegate is its own session, so an edit into a peer's claimed
@@ -433,9 +460,9 @@ prompts:
   route around a claim.
 
 Where the Work Order's own files cannot be split — everything lands in one or
-two files — say so in one line, give `impl` the whole set, and open `test` and
-`review` on work that does not touch it. A partition that does not exist is not
-worth inventing; a partition that is wrong costs the phase.
+two files — the Seats opening line says so, `impl` gets the whole set, and
+`test` and `review` open on work that does not touch it. A partition that does
+not exist is not worth inventing; a partition that is wrong costs the phase.
 </TeamFilePartition>
 
 <RoleReassignment>
@@ -443,14 +470,18 @@ Roles move; slots do not. Every move is a board `handoff` post naming the slot,
 the role it is leaving, and the role it is taking, because that post is what the
 progress table reads to say what each agent is doing now.
 
-- **`impl` may recruit `review`.** When the implementation is wider than one
-  writer, `impl` messages `review` naming the disjoint file subset it wants
-  taken; `review` replies, then posts `handoff` so the table shows the move. The
-  team is then two writers and a tester. `review` is the reserve precisely because it holds
-  no files and can leave its lane without stranding anything.
+- **A writer may recruit the reserve, when the opening left one.** When the
+  implementation is wider than one writer, `impl` messages `review` naming the
+  disjoint file subset it wants taken; `review` replies, then posts `handoff`
+  so the table shows the move. The team is then two writers and a tester.
+  `review` is the reserve precisely because it holds no files and can leave its
+  lane without stranding anything. A phase whose Seats opened all three as
+  writers or testers has no reserve, and that was the field's decision, not a
+  gap to recruit around.
 - **`test` is never recruited away** while tests for the phase are unwritten.
   It is the only slot whose absence cannot be recovered later in the phase, and
-  a phase that ships untested is not cheaper, only later.
+  a phase that ships untested is not cheaper, only later. A `test` seat that
+  Seats opened as a writer has no tests to protect and moves like any writer.
 - **When writing finishes before testing**, the writers do not idle. They take a
   disjoint slice of the remaining test work — agreed on the board, one file per
   slot, never the file `test` is inside — or they stand down.
@@ -475,7 +506,10 @@ code cannot reach, the test that passes for the wrong reason. It reports the
 concrete failing case, or reports plainly that it could not construct one.
 Normally this is `review`; where `review` was recruited into implementation, it
 is whichever slot wrote least of the code under review. An author is never the
-adversary for its own file set.
+adversary for its own file set. With three writers no seat is a non-author of
+everything, so each seat takes the adversarial brief over a file set it did not
+write, assigned cross-wise, and the two aspects below are dealt out across the
+same three seats on the same rule.
 
 **The other two take different aspects**, disjoint and named in their prompts:
 
@@ -934,6 +968,9 @@ Build only from Delegation Context, the Work Order, and command-line amendments:
 
 ### Files and verification
 [modules, acceptance gate, meaningful checks]
+
+### Opening
+[the Seats opening line verbatim, or "default — no Seats field"]
 ```
 
 Rows include only load-bearing types explicitly named by the Work Order. Status
@@ -1054,18 +1091,26 @@ not a phase-title list or type table alone, owns batch authorization.
    "${SESSION_DIR}/implementation_prompt.md"`. Use `ad hoc` plus scope without a
    phased plan; pass the original prompt only. Both run before the dispatch in
    step 4, never after it.
-3. Set `${PASS_KIND}=impl`; `~/.claude/config/agents.conf` owns delegate
-   family/model/effort, one row per kind. State the kind in the dispatch update.
-4. Partition the Work Order's files per <TeamFilePartition/> and write one
-   prompt per slot under <WritePromptContract/>:
-   `${SESSION_DIR}/implementation_prompt.md` for `impl`, `test_prompt.md` for
-   `test`, and `review_prompt_team.md` for `review`.
-5. Launch all three in one message, `impl` first, each under <ToolingContract/>:
+3. `~/.claude/config/agents.conf` owns delegate family/model/effort, one row
+   per kind. Each seat's kind is its opening role from the Work Order's
+   `Seats:` field: `impl` for the `impl` slot, and for `test` and `review`
+   whatever their Seats lines open them as — `test` and `review` under the
+   default opening. State the opening in the dispatch update in ordinary
+   words: "opening 2 writers + 1 tester: impl on the hana side, review writing
+   the catalyst side, test on the catalyst tests".
+4. Take the partition and the opening from Seats and write one prompt per slot
+   under <WritePromptContract/>: `${SESSION_DIR}/implementation_prompt.md` for
+   `impl`, `test_prompt.md` for `test`, and `review_prompt_team.md` for
+   `review`. Only when the field is absent, partition per <TeamFilePartition/>
+   yourself and say so in the dispatch update.
+5. Launch all three in one message, `impl` first, each under <ToolingContract/>.
+   The fourth and sixth arguments are the seat's opening role, the same word in
+   both places; the default opening is:
 
    ```sh
    implement.sh "${SESSION_DIR}" "${WORKING_DIR}" \
      "${SESSION_DIR}/implementation_prompt.md" impl \
-     "<responsibility>" "${PASS_KIND}" "<activity>" 0 impl
+     "<responsibility>" impl "<activity>" 0 impl
    implement.sh "${SESSION_DIR}" "${WORKING_DIR}" \
      "${SESSION_DIR}/test_prompt.md" test \
      "<responsibility>" test "<activity>" 0 test
@@ -1074,6 +1119,9 @@ not a phase-title list or type table alone, owns batch authorization.
      "<responsibility>" review "<activity>" 0 review
    ```
 
+   A seat Seats opens in another role swaps both words and nothing else — the
+   `review` seat opening as a writer is
+   `implement.sh "${SESSION_DIR}" "${WORKING_DIR}" "${SESSION_DIR}/review_prompt_team.md" impl "<responsibility>" impl "<activity>" 0 review`.
    Responsibility follows <ProgressContract/>. **All three seats carry a pass
    kind**, so a team phase records three passes and stops being attributed to one
    agent. The kind is the work the seat was assigned and nothing more — it names,
@@ -1353,12 +1401,15 @@ file/line findings and intended behavior. Verification contains only implicated
 `verify.sh` lines—usually check and test, adding lint only for lint-related
 repairs.
 
-A repair runs the same three slots as a phase, per <PhaseTeam/>: `impl` makes
-the repair, `test` writes the regression test that would have caught each
-finding, and `review` opens adversarially on the repair under <TeamReview/> —
-the reading most likely to catch a fix that closes a finding by weakening what
-detects it. Partition the findings' files per <TeamFilePartition/> and write one
-prompt per slot; `test` covers the same batch ids from the outside.
+A repair runs the same three slots as a phase, per <PhaseTeam/>. The default
+opening is `fix` / `test` / `review`: `impl` makes the repair, `test` writes
+the regression test that would have caught each finding, and `review` opens
+adversarially on the repair under <TeamReview/> — the reading most likely to
+catch a fix that closes a finding by weakening what detects it. Partition the
+findings' files per <TeamFilePartition/> and write one prompt per slot; `test`
+covers the same batch ids from the outside. When the batch's files partition
+into disjoint sets, `review` opens as a second `fix` seat — task and kind both
+`fix` — and the dispatch update says so.
 
 Run `findings.py dispatch --covers <all batch ids>` before launching, then
 launch all three in one message:
@@ -1375,10 +1426,11 @@ implement.sh "${SESSION_DIR}" "${WORKING_DIR}" \
   "<responsibility>" review "<activity>" "${FIX_ROUND}" review
 ```
 
-Each seat records the work it was assigned: the repairing seat `fix`, the test
+Each seat records the work it was assigned: a repairing seat `fix`, the test
 seat `test`, the review seat `review`.
 
-**`PLAN_DELEGATE_RESOLVES_ROUND=1` goes on exactly one seat.** Only the launcher
+**`PLAN_DELEGATE_RESOLVES_ROUND=1` goes on exactly one seat**, whichever
+opening is in play. Only the launcher
 watches the worker exit, so only a launcher can say a repair landed; two seats
 carrying the signal would resolve one round twice over. The signal is separate
 from the pass kind precisely so a second repairing seat can record `fix`

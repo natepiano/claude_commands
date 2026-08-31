@@ -25,14 +25,17 @@
 #               slot has a reported role before it posts anything itself
 #   claim     — "I am taking these files / this work"
 #   release   — "I am done with these files / this work"
-#   ask       — a question addressed to one peer or to all
-#   answer    — a reply to an ask
 #   status    — progress narration
 #   blocked   — cannot proceed, and why
 #   handoff   — this slot changed role; always written by `board.sh role`, which
 #               stamps a machine-readable `role=<name>` field so the progress
-#               table can say what each agent is doing without parsing prose
-#   done      — this agent's assignment is complete
+#               table can say what each agent is doing without parsing prose.
+#               `post` refuses a handoff that does not lead with that field
+#   done      — this agent's assignment is complete. The launcher's own exit
+#               posts (`done`, `blocked`) carry a `launcher:` prefix so the
+#               progress report can tell them from the seat's words
+#
+# There is no `ask` and no `answer`: a question to a peer is a message.
 #
 # Produces:
 #   <session_dir>/board.log       — append-only broadcast log, one line per post
@@ -106,8 +109,19 @@ cmd_post() {
   valid_token_name "$agent" || die "agent name must be alphanumeric/._- and 1-64 chars: '$agent'"
   valid_kind "$kind" || die "unknown kind '$kind' (register claim release status blocked handoff done); ask a peer by message, not on the board"
   [[ $# -gt 0 ]] || die "post needs a message"
+  local body
+  body="$(flatten "$@")"
+  # A handoff is a role change and nothing else. The progress table reads the
+  # role= field off it, so a handoff written as prose is a movement the table
+  # never shows -- and the row above it then claims the old role held all
+  # along. Refusing it here sends narration to `status` and role changes
+  # through `role`, which writes the field.
+  local role_lead='^role=(impl|test|fix|review)( |$)'
+  if [[ "$kind" == "handoff" && ! "$body" =~ $role_lead ]]; then
+    die "handoff records a role change: use board.sh role <session_dir> <slot> <role> [note]; narrate with status"
+  fi
   mkdir -p "$session_dir"
-  printf '%s [%s] %s: %s\n' "$(now_iso)" "$agent" "$kind" "$(flatten "$@")" \
+  printf '%s [%s] %s: %s\n' "$(now_iso)" "$agent" "$kind" "$body" \
     >> "${session_dir}/board.log"
 }
 

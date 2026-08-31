@@ -37,6 +37,7 @@ WORK_ORDER_FIELD_LABELS = frozenset(
         "Goal",
         "Spec",
         "Files",
+        "Seats",
         "Acceptance gate",
         "Constraints from prior phases",
         "Pending decision",
@@ -447,6 +448,10 @@ def validate_work_order(
             errors.append(f"Work Order is missing **{field}:**")
         elif not sections[field].strip():
             errors.append(f"Work Order has an empty **{field}:** section")
+    # Seats is optional -- plans compiled before the field existed carry none --
+    # but a present field with nothing under it is a heading, not an opening.
+    if "Seats" in sections and not sections["Seats"].strip():
+        errors.append("Work Order has an empty **Seats:** section")
     if errors:
         raise WorkOrderValidationError(errors)
 

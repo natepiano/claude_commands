@@ -41,6 +41,8 @@ to rediscover after a context compaction lives in the doc.
 - **Stack:** <language + key frameworks/versions the work touches>
 - **Layout:** <only the dirs/files phases touch, as a short map>
 - **Key files:** <path — role> for each file a phase reads or modifies
+- **Test lanes:** <for each crate a phase touches, its `tests/` directory or
+  `none` — what a Work Order's **Seats** opens the `test` seat against>
 - **Build:** <for Rust always `bash ~/.claude/scripts/delegate/verify.sh check <pkg>`;
   otherwise the project's exact build command>
 - **Test:** <for Rust always `bash ~/.claude/scripts/delegate/verify.sh test <pkg>`;
@@ -87,6 +89,17 @@ This is the meat — do not paraphrase a resolved design down to a summary.>
 **Files:**
 - `<path>` — <what changes here>
 - ...
+
+**Seats:** <opening line: `N writers + M testers [+ reserve]` — then the split
+(by crate, module, or file group) or why nothing splits>
+- `impl` — <files it owns>; hub: `<path>` (<why every writer needs it>)
+- `test` — <what it writes from the Spec alone, and where under `tests/`>
+- `review` — reserve
+<!-- A slot is an identity; the role it opens in is what its line says. A line
+     without `opens as` opens in its own name. `review` is the flex seat and
+     takes whatever third role the opening needs: `opens as impl`, `opens as
+     test`, or `reserve`. A `test` seat with no test lane reads `opens as impl`.
+     Writers hold disjoint files; every hub file has exactly one owner. Rule 7. -->
 
 **Constraints from prior phases:** <concrete facts a delegate would otherwise
 re-derive — what earlier phases built, decisions that bind this phase. Empty for
@@ -207,4 +220,20 @@ Rules:
    a defect gets fixed where it lives, and an authored boundary that hides that is
    how a workaround gets built on purpose. See `~/.claude/docs/decision_criteria.md`
    → "Where a fix goes".
+7. **Seats decides the opening.** Every `todo` Work Order carries **Seats**;
+   `/plan:delegate` opens its three seats from it and partitions files by it
+   instead of deciding at launch. `impl` always opens as `impl` (`fix` in a
+   repair). `test` opens as `test` wherever the phase has a **test lane** — a
+   `tests/` directory in a touched crate (Delegation Context → **Test lanes**)
+   and a Spec concrete enough to test before the implementation exists; with
+   none, `test` opens as a writer and its line says `opens as impl`. `review`
+   is the flex seat: a second writer, a second tester, or the cold read
+   (`reserve`). Writers hold disjoint file sets. Each hub file — `lib.rs` /
+   `mod.rs` re-exports, `Cargo.toml`, plugin registration, a shared types
+   file — sits on exactly one writer's line as `hub:`; peers message that
+   owner for the line they need. A tester's line names what the Spec alone
+   lets it write; a Spec too thin for that is a reason to open the seat as a
+   writer. When nothing splits, the opening line says so and `impl` takes
+   every file. Three writers is a legal opening and changes the review split
+   (`/plan:delegate` → `<TeamReview/>`).
 

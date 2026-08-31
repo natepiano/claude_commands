@@ -1902,6 +1902,14 @@ RIGHT_ALIGNED_SUMMARY_COLUMNS = frozenset({"%", "Elapsed", "ETA", "ETA low", "ET
 # board caps a post far higher than a terminal line can hold, and a wrapped
 # narration costs the reader the three-line scan the note exists to give.
 BOARD_NOTE_CHARS = 72
+# What implement.sh puts in front of the `done` and `blocked` it posts on the
+# worker's exit, so the note can tell the launcher's line from the seat's own.
+LAUNCHER_PREFIX = "launcher:"
+# Where a window that sits in no round is drawn when its kind names a seat. A
+# lone reviewer between rounds -- the closure review, the broad review of a
+# solo run -- is doing review work, and a reader scanning the Review column for
+# it found three dashes. A main-agent activity names no seat and keeps them.
+LONE_SEATS: dict[str, str] = {"impl": "impl", "fix": "impl", "test": "test", "review": "review"}
 
 
 def _run_events(state: dict[str, object]) -> list[dict[str, object]]:
@@ -2298,11 +2306,17 @@ def _window_result(window: StageWindow, tally: FindingTally) -> str:
 
 
 class BoardActivity(TypedDict):
-    """The last thing a seat said on the board, and when it said it."""
+    """The latest board line under a seat, and the seat's own last words."""
 
     at: float
     kind: str
     message: str
+    # The seat's latest line that the launcher did not write, empty when the
+    # seat has said nothing itself since it was launched. Carried beside
+    # `message` because the launcher's `done` lands after the seat's final
+    # narration, and a note that read only the latest line reported every
+    # finished seat with the same boilerplate.
+    own: str
 
 
 class RoleChange(TypedDict):
@@ -2367,8 +2381,18 @@ def _board_role_changes(session_dir: Path) -> list[RoleChange]:
     return sorted(changes, key=lambda change: change["at"])
 
 
+def _launcher_authored(kind: str, message: str) -> bool:
+    """Whether a board line came from implement.sh rather than from the seat.
+
+    The launcher writes two kinds of line: `register`, which is always its, and
+    a `done` or `blocked` on exit, which it prefixes `launcher:` so the note can
+    tell it from a `done` the seat posted itself.
+    """
+    return kind == "register" or message.startswith(LAUNCHER_PREFIX)
+
+
 def _board_activity(session_dir: Path) -> dict[str, BoardActivity]:
-    """The most recent line each seat wrote to the board, keyed by slot.
+    """The most recent line under each seat on the board, keyed by slot.
 
     A seat that recorded no pass reaches the table with a role and no duration,
     and a role on its own cannot tell a seat deep in its work from one that
@@ -2381,6 +2405,12 @@ def _board_activity(session_dir: Path) -> dict[str, BoardActivity]:
     The latest line of any kind, not just `status`: a seat whose last act was a
     handoff or a `blocked` is exactly the seat a reader needs to hear about, and
     filtering to narration would render it as silent.
+
+    Beside it, the seat's own last words. The launcher posts `done` when the
+    worker exits, which is after the seat's final narration, so the latest line
+    of every finished seat is the launcher's boilerplate and the narration the
+    reader wanted sits one line up. A `register` clears them: it opens a new
+    occupancy of the seat, and words from the previous one do not describe it.
     """
     activity: dict[str, BoardActivity] = {}
     try:
@@ -2392,9 +2422,15 @@ def _board_activity(session_dir: Path) -> dict[str, BoardActivity]:
         at = _board_stamp(line)
         if match is None or at is None:
             continue
-        activity[match.group(1)] = BoardActivity(
-            at=at, kind=match.group(2), message=match.group(3).strip()
-        )
+        slot, kind, message = match.group(1), match.group(2), match.group(3).strip()
+        previous = activity.get(slot)
+        if kind == "register":
+            own = ""
+        elif _launcher_authored(kind, message):
+            own = previous["own"] if previous is not None else ""
+        else:
+            own = message
+        activity[slot] = BoardActivity(at=at, kind=kind, message=message, own=own)
     return activity
 
 
@@ -2404,12 +2440,14 @@ def _board_phrase(said: BoardActivity) -> str:
     A `status` is narration and reads as itself. Any other kind is named,
     because the kind is then the news -- `blocked` and `done` change what the
     reader should do next, where a bare message would look like more work in
-    progress. A handoff's `role=` field is dropped: the role it announces is
-    already in that seat's column, and repeating it here spends the line.
+    progress. The words are the seat's own wherever it has any: the launcher's
+    `done` supplies the kind and the seat's last narration supplies what it was
+    doing when it finished, which is what the reader asked. A leading `role=`
+    field is dropped: the role it announces is already in that seat's column,
+    and repeating it here spends the line.
     """
-    message = said["message"]
-    if said["kind"] == "handoff":
-        message = re.sub(r"^role=\S+\s*", "", message)
+    message = said["own"] or said["message"].removeprefix(LAUNCHER_PREFIX)
+    message = re.sub(r"^\s*role=\S+\s*", "", message).strip()
     body = message if said["kind"] == "status" else f"{said['kind']}: {message}"
     body = body.strip() or said["kind"]
     if len(body) > BOARD_NOTE_CHARS:
@@ -2626,6 +2664,17 @@ def _round_cells(
     return cells
 
 
+def _lone_cells(window: StageWindow) -> list[str]:
+    """The seat cells of a window in no round: its kind's seat filled, or none."""
+    cells = ["-"] * len(ROUND_SLOTS)
+    seat = LONE_SEATS.get(window["kind"])
+    if seat is not None:
+        cells[ROUND_SLOTS.index(seat)] = (
+            f"{window['kind']} {_compact_duration(window['elapsed'])}"
+        )
+    return cells
+
+
 def _round_rows(
     windows: list[StageWindow],
     labels: list[str],
@@ -2638,6 +2687,7 @@ def _round_rows(
     # it, by the interval running to whatever opened next. That slice is wrong
     # for concurrent seats, which is why a round does not use it -- but it is
     # exactly right for the sequential windows that still reach this branch.
+    # Its seat cells come from its kind: a lone review sits under Review.
     uppers = {
         window["instance_id"]: (
             windows[index + 1]["started_at"]
@@ -2656,7 +2706,7 @@ def _round_rows(
             rows.append(
                 [
                     entry["label"],
-                    *(["-"] * len(ROUND_SLOTS)),
+                    *_lone_cells(lone),
                     _clock_stamp(started_at),
                     _compact_duration(lone["elapsed"]),
                     _window_result(lone, tally),

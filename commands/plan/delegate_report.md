@@ -66,10 +66,22 @@ Everything below is the contract.
    Never reorder, edit, or omit any part of it: the recorder owns every column,
    duration format, and ETA band. When step 4 has armed an early reviewer, say
    below the tables that the writer and the reviewer are working at once.
-6. Add two or three ordinary-English sentences under <UserFacingText/>: open
+6. Read the round table as seats. Its three seat columns are the slots —
+   `impl`, `test`, `review` — identities that never change. Each cell is the
+   role that seat held over the row's stretch and for how long; a further row
+   opens whenever any seat changes role, so the reader watches
+   `impl / impl / test` become `review / review / review`. The first row of a
+   round is its opening. The lines under the table name, per seat, the agent
+   sitting in it and the last thing it said — the seat's own words, never the
+   launcher's. A lone reviewer between rounds sits in the Review column on a
+   row of its own.
+7. Add two or three ordinary-English sentences under <UserFacingText/>: open
    with what this phase gives the person using the tool, then its movement and
    what remains. One topic per sentence, no more than two clauses; when a topic
    holds more than two items, give the count and what they have in common.
+   When the opening is not the default, or a seat is doing something other than
+   its name, say so in those words: "the review seat is writing the catalyst
+   side".
 
    Not this:
 

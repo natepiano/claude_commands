@@ -168,6 +168,9 @@ block — nothing else. The prompt must include:
      it reaches work every phase already checkpointed; omit for non-Rust.
   7. **Invariants** — project-wide rules every phase must preserve (from the plan
      and from obvious code constraints).
+  8. **Test lanes** — for each crate a phase touches, its `tests/` directory
+     path or `none`. **Seats** (`<Restructure/>` step 2) is drafted from this
+     line without opening the tree again.
 - Output format: the `## Delegation Context` bullet block from the format doc,
   omitting `Project started` until `/plan:delegate`'s progress recorder resolves
   it. No prose, no findings list.
@@ -217,11 +220,14 @@ not codebase searching.
    chunk of work; do not over-split.
 
    **Right-size each phase — split signals.** A phase must be **delegate-sized**:
-   one fresh implementer (no prior context) builds it and gets the tree green in a
-   single pass. Whether the spine is inherited or freshly decomposed, test every
-   phase against these signals **before** drafting its Work Order. If any fires,
-   split the phase into delegate-sized units — the usual seam is **types →
-   systems/wiring → tests**, or one subsystem per file group.
+   three concurrent seats on disjoint file sets, with no prior context, get the
+   tree green in a single pass — one writer where the files cannot split, up to
+   three where they can. Whether the spine is inherited or freshly decomposed,
+   test every phase against these signals **before** drafting its Work Order.
+   If any fires, split the phase into delegate-sized units — the usual split is
+   **types → systems/wiring**, or one subsystem per file group. Tests are never
+   the split: the `test` seat writes them inside the phase, against the Spec,
+   while the writers build.
 
    - **Gate breadth:** the Acceptance gate would enumerate more than ~8–10
      distinct checks / test requirements. A long gate is the compile-time tell
@@ -230,12 +236,16 @@ not codebase searching.
      module plus its own cross-cutting surface (new schema/config, a new
      API/protocol boundary, a generated/compiled artifact such as a shader or
      migration, a new render/IPC/service path) — rather than extending an existing
-     one. Standing it up and fully testing it are separate units.
-   - **File span:** the Spec **creates** more than ~2–3 files, or expects a single
-     new/edited file to grow by many hundreds of lines.
-   - **Mixed kinds:** the phase bundles work that could each land and be reviewed
-     on its own — defining data types, wiring systems/routing, and proving with
-     tests — under one number.
+     one. Standing it up and wiring its callers are separate units when the
+     callers cannot compile until it lands.
+   - **File span:** the Spec expects a single new or edited file to grow by many
+     hundreds of lines. Creating several files is not this signal: independent
+     new files go to different seats (step 2, **Seats**), and split a phase only
+     when one cannot compile until another lands.
+   - **Serial kinds:** the phase bundles work whose second half cannot start
+     until the first compiles — data types, then the systems that consume them
+     — and each half is a real chunk. Bundling tests with the code they prove
+     is not this signal: the `test` seat writes them concurrently from the Spec.
    - **Compound goal:** the Goal joins two outcomes with "and" that need not ship
      together.
 
@@ -244,6 +254,11 @@ not codebase searching.
    an intermediate phase red. Cohesion beats count: never break one atomic change
    just to lower a number, and never merge unrelated work just to raise one.
 
+   **Divisibility check.** A phase whose Files cannot partition into two or more
+   owner sets **and** that has no test lane (Delegation Context → **Test lanes**)
+   idles two of three seats. Merge an independent-by-file sibling phase into it,
+   or let its **Seats** opening line say a single writer holds it and why.
+
 2. **For each phase, draft a Work Order** per the format doc:
    - **Goal** — one line, the observable outcome.
    - **Spec** — the implementation detail. Where the source doc has a resolved
@@ -251,6 +266,18 @@ not codebase searching.
      the Spec. Do NOT compress a settled decision to a summary — the delegate
      needs the detail to implement without searching.
    - **Files** — the files to create/modify, with line refs the doc already cites.
+   - **Seats** — the opening. One line `N writers + M testers [+ reserve]` and
+     where the work splits (by crate, module, or file group — or why it does
+     not), then one line per slot. `impl` always opens as `impl`. `test` opens
+     as `test` when the phase has a test lane — a `tests/` directory in a
+     touched crate (**Test lanes**) and a Spec concrete enough to test before
+     the code exists — and otherwise reads `opens as impl`. `review` is the
+     flex seat: `opens as impl`, `opens as test`, or `reserve`. Writers hold
+     disjoint files; every hub file (`lib.rs`/`mod.rs` re-exports,
+     `Cargo.toml`, plugin registration, a shared types file) sits on exactly
+     one writer's line as `hub:`; a tester's line names what the Spec alone
+     lets it write. Always present: when nothing splits, say so and give
+     `impl` everything. Format and rule 7 are the format doc's.
    - **Constraints from prior phases** — facts later phases need from earlier ones
      (what got built, decisions that bind). Empty for Phase 1.
    - **Acceptance gate** — the build/test/behavior proving the phase done.
@@ -284,7 +311,9 @@ not codebase searching.
   The newly created phases join the target set.
 - Compile **only** the target phases into Work Orders (steps 2–3 above, applied to
   each target). Already-complete `todo` Work Orders and all `done` phases are left
-  byte-for-byte unchanged — no churn, no drift.
+  byte-for-byte unchanged — no churn, no drift. A `todo` Work Order without
+  **Seats** is not already-complete: add that field from its Files and **Test
+  lanes**, and leave every other byte alone.
 - **Forward-propagate.** For each freshly compiled target phase, apply the
   **Propagate-Forward** rule from the format doc (`~/.claude/docs/delegate_plan_format.md`
   → "Forward-propagation"): push the facts it produces into the **Constraints from
@@ -333,7 +362,8 @@ PYTHONPATH="$HOME/.claude/scripts" python3 -m berth.work_order \
 ```
 
 The final validation covers the complete Work Order: non-empty Goal, Spec, and
-Files and lexical repository-relative paths. Any edit in this command that
+Files, lexical repository-relative paths, and a non-empty Seats wherever the
+field is present. Any edit in this command that
 changes Files or adds an implementation path must revalidate the whole Work
 Order before this command returns. Do not copy the parser into this command.
 </ValidateWorkOrders>
@@ -348,6 +378,7 @@ Order before this command returns. Do not copy the parser into this command.
 | --- | --- |
 | Compiled | <plan path → delegate-ready; N phases> |
 | Live phases | <count of todo phases, with titles> |
+| Seats | <per todo phase: `N: <opening line>`> |
 | Archived | <count of done phases preserved, or None> |
 | Stripped | <what design narrative was removed and folded where> |
 | Next | `/plan:delegate <plan path> phase <first todo N>` |
@@ -360,6 +391,7 @@ Order before this command returns. Do not copy the parser into this command.
 | --- | --- |
 | Mode | Reconcile (already delegate-ready) |
 | Compiled (new) | <target phases brought up to Work Order, with titles> |
+| Seats | <per compiled or re-seated phase: `N: <opening line>`> |
 | Propagated | <later phases whose Constraints from prior phases were updated, or None> |
 | Preserved | <count of done + already-compiled todo phases left untouched> |
 | Next | `/plan:delegate <plan path> phase <first todo N>` |
@@ -381,10 +413,13 @@ Then stop. Do not start implementing a phase.
   exists to remove.
 - Every remaining Work Order must satisfy the format doc's self-containment rule:
   a fresh codex implements it from the named files + Delegation Context, no search.
+  It also carries **Seats** (format doc rule 7), so the opening is decided here
+  and never at launch.
 - Never delete completed-phase history. Strip design *narrative*, not shipped facts.
-- Every phase must be **delegate-sized** (Restructure step 1): a fresh implementer
-  builds it green in one pass. Apply the split signals at compile time — an
-  over-size phase is a decomposition miss, not the delegate's problem to absorb.
+- Every phase must be **delegate-sized** (Restructure step 1): three seats on
+  disjoint files build it green in one pass, one writer where nothing splits.
+  Apply the split signals at compile time — an over-size phase is a
+  decomposition miss, not the delegate's problem to absorb.
 - Reconcile mode is **additive and surgical**: it compiles uncompiled/edited phases
   and propagates their facts forward (format doc → "Forward-propagation"). It never
   re-runs the full Explore sweep and never rewrites a `done` phase or an

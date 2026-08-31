@@ -55,11 +55,16 @@ If the conversation does not make the phase obvious, ask the user one clarifying
    **What deviated from the plan:** <bullets — scope changes, approach changes, anything the plan did not predict>
    **Surprises:** <bullets — things learned during implementation that the plan author did not know>
    **Implications for remaining phases:** <bullets — concrete effects on later phases; this is the bridge into Step 4>
+   **Split observed:** <bullets — which files or crates turned out independent; the hub file every writer needed; whether the test lane was real; whether a seat was recruited, and along which split>
    **State and consequence audit:** <one disposition per new or changed state/outcome, or `None`>
    ```
 
    Drop empty fields. Keep bullets short and concrete. This file is input to the
    remaining-phase review and closeout shrink; it never enters the repository.
+   Read **Split observed** from `${SESSION_DIR}/board.log` — the `register`
+   and `handoff` posts say which seat held which role, and when — and from the
+   three `impl_summary_<slot>.txt`; never reconstruct it from memory. It is what
+   `<MaintainWorkOrders/>` re-seats the remaining Work Orders from.
 
 <StateAndConsequenceAudit>
 Always perform this audit, including when the caller passes `skip-architect`.
@@ -119,7 +124,8 @@ has already applied the trigger test in `/plan:delegate`'s `<RunPhaseReview/>`
 and determined this phase produced nothing for an architect to find. Write
 `not run — phase matched its plan` into the final update's architect row and go
 straight to Step 5; the temporary retrospective's implications still get folded into the
-remaining Work Orders exactly as written there. Do not second-guess the token or
+remaining Work Orders exactly as written there, and its **Split observed**
+still re-seats them per `<MaintainWorkOrders/>`. Do not second-guess the token or
 re-derive the trigger test — the caller has the review results and the ledger,
 this command does not.
 
@@ -198,6 +204,11 @@ The prompt must include:
      make any item inaccurate, redundant, already satisfied, or aimed at the
      wrong target? Quote the current item and propose its exact replacement or
      removal with concrete evidence. Do not propose optional polish.
+  9. (Delegate-ready plans only) For each remaining phase, does its **Seats**
+     still describe a real partition against the code that now exists —
+     disjoint owner sets, one owner per hub file, a test lane that exists? Name
+     a better opening where one is visible, in the field's own words
+     (`N writers + M testers [+ reserve]`, then one line per slot).
 - **The narration instruction**, verbatim: *"Narrate as you go: before each new
   activity, output one short present-tense line of plain text naming it. These
   lines stream to a liveness monitor."* This is what makes the dispatch legible
@@ -277,18 +288,24 @@ byte-identical.
    (`~/.claude/docs/delegate_plan_format.md` → "Forward-propagation") for the facts
    the just-shipped phase produced. This is the single most important maintenance
    step: it is what lets the next `/plan:delegate` assemble without research.
-2. **Apply each Q6 finding** by editing the named Work Order in place — add the
+2. **Re-seat.** For each remaining Work Order that shares files or crates with
+   the shipped phase, revise its **Seats** from the retrospective's **Split
+   observed** and any Q9 finding: owner sets that turned out independent, the
+   hub file every writer needed, a test lane that was or was not real. Add
+   **Seats** to any remaining Work Order that lacks one (format doc rule 7).
+   Mechanical, no gate.
+3. **Apply each Q6 finding** by editing the named Work Order in place — add the
    missing constraint, fix the drifted file/line ref, adjust the **Spec** or
    **Acceptance gate**. Do not record these as prose-only notes; the Work Order
    text itself must change so it stays self-contained.
-3. **Self-containment check.** After edits, each remaining Work Order must still be
+4. **Self-containment check.** After edits, each remaining Work Order must still be
    implementable from its named files + Delegation Context alone. If a finding
    widened scope, update **Files** and **Spec** to match.
-4. **Own every consequence.** For each application-observable or
+5. **Own every consequence.** For each application-observable or
    user-actionable audit disposition, name the remaining Work Order that owns
    its surface and acceptance test. If none does, route the required work as a
    plan gap or next-item candidate; never leave it only in retrospective prose.
-5. **Revalidate the complete Work Orders.** Run the command below separately
+6. **Revalidate the complete Work Orders.** Run the command below separately
    for every remaining `todo` phase. Do not validate archived `done` Work
    Orders, which this command must leave byte-identical:
 
@@ -298,12 +315,12 @@ byte-identical.
      --phase <todo-phase>
    ```
 
-   This shared tagged contract validates Goal, Spec, and Files together. After
-   any Files edit or newly named implementation path, rerun this command;
-   failure blocks Step 6.
+   This shared tagged contract validates Goal, Spec, and Files together, and a
+   non-empty Seats wherever the field is present. After any Files edit or newly
+   named implementation path, rerun this command; failure blocks Step 6.
 
-Mechanical Work Order edits (added constraints, corrected refs, gate tweaks) need
-no user gate — they go straight in. A finding that changes a remaining phase's
+Mechanical Work Order edits (added constraints, corrected refs, gate tweaks, a
+re-seated opening) need no user gate — they go straight in. A finding that changes a remaining phase's
 *intent, scope, or ordering* is a significant finding: route it through
 `<SignificantFindings/>` below, and once resolved, write the outcome into the
 affected Work Order, not a prose review note.

@@ -7,17 +7,18 @@
 #   role_description — 1-2 lines describing this dispatch's responsibility,
 #   written as a header block into the shared heartbeat log
 #   pass_kind — impl, test, fix, or review; enables durable progress recording
+#   and is this seat's opening role, stamped on its board register line
 #   pass_activity — short user-facing description for the progress header
 #   fix_pass — required pass count when pass_kind is fix
 #   team_role — required; which member of the phase team this is (impl, impl2,
 #   test, review). Every dispatch is a team member -- the only two callers are
 #   the implementation and fix phases, and both run a team -- so there is one
-#   artifact shape rather than a solo shape and a team shape. Several launchers
+#   artifact layout rather than a solo one and a team one. Several launchers
 #   run at once against one session directory, so every artifact below is
-#   written per role; only the member the orchestrator gives a pass_kind
-#   records a progress pass, because the recorder closes any open pass when a
-#   new one starts and three concurrent passes would leave the ledger
-#   describing whichever happened to finish last.
+#   written per role, and every member records its own progress pass: the
+#   recorder keys passes by seat and closes only that seat's stale pass, so
+#   three concurrent passes describe three seats rather than whichever
+#   happened to finish last.
 #
 # Produces:
 #   <session_dir>/impl_status_<role>      — "implementing" while running, "implemented" on success, "error" on failure
@@ -189,33 +190,23 @@ else
 fi
 # The opening role is stamped here so the progress table has a real answer from
 # second zero, instead of a dash until some agent remembers to call `board.sh
-# role`. A seat opens in the role it is named for, with one exception: the impl
-# seat does both implementation and repair, and only PASS_KIND says which.
+# role`. The opening role is the kind: the orchestrator picks each seat's kind
+# from the Work Order's Seats field, so a `review` seat launched to write opens
+# as `impl`, and a `test` seat in a crate with no test lane opens as whatever
+# it was given. Nothing here reads the seat name -- the seat name is an
+# identity and says nothing about the work.
 #
-# Do NOT simplify this to keying every seat off PASS_KIND. Kinds and roles are
-# now the same four words -- impl, test, fix, review -- which is exactly what
-# makes the shortcut look safe. It is not: the kind is the work a seat was
-# assigned at launch and never moves, while the role is what that seat is doing
-# now and moves whenever a peer recruits it. Collapsing them freezes every seat
-# in its launch role and loses the one distinction the table exists to show: a
-# test seat doing its own job against one recruited into writing.
-# A seat whose name is not a role at all -- the drifted `impl2`, `main` -- stamps
-# nothing rather than inventing one.
-case "${BOARD_AGENT}" in
-  impl)
-    case "${PASS_KIND}" in
-      impl|fix) OPENING_ROLE="${PASS_KIND}" ;;
-      *)        OPENING_ROLE="impl" ;;
-    esac
-    ;;
-  test|review) OPENING_ROLE="${BOARD_AGENT}" ;;
-  *)           OPENING_ROLE="" ;;
+# The stamp is the opening only. Every later `board.sh role` handoff overrides
+# it and the recorder reads the whole board history, so stamping the kind here
+# freezes nothing. What must stay out is the reverse: reading PASS_KIND *later*
+# as the role, which would report every seat in its launch role for the whole
+# phase and lose the one movement the table exists to show.
+# A launch with no kind, or one outside the four words, stamps nothing rather
+# than inventing a role.
+case "${PASS_KIND}" in
+  impl|test|fix|review) ROLE_FIELD="role=${PASS_KIND}; " ;;
+  *)                    ROLE_FIELD="" ;;
 esac
-if [[ -n "${OPENING_ROLE}" ]]; then
-  ROLE_FIELD="role=${OPENING_ROLE}; "
-else
-  ROLE_FIELD=""
-fi
 bash "${BOARD_HELPER}" post "${SESSION_DIR}" "${BOARD_AGENT}" register \
   "${SUBTASK} launcher up (${AGENT_FAMILY}/${AGENT_MODEL}:${AGENT_EFFORT:-unset}); ${MESH_FIELD}; ${ROLE_FIELD}status in impl_status${SLOT}" || true
 
@@ -294,9 +285,11 @@ if [[ "${AGENT_CODE}" -eq 0 ]]; then
   bash "${HEARTBEAT_HELPER}" "${HEARTBEAT_FILE}" wrapper "${BEAT_TAG} agent finished" || true
   # A member that ends without saying so on the board leaves its peers waiting
   # on work already finished, so the launcher posts it rather than trusting the
-  # agent to have posted before it exited.
+  # agent to have posted before it exited. The `launcher:` prefix marks the
+  # line as the launcher's: it lands after the seat's own last narration, and
+  # the progress report keeps showing those words rather than this boilerplate.
   bash "${BOARD_HELPER}" post "${SESSION_DIR}" "${BOARD_AGENT}" done \
-    "${SUBTASK} finished; summary at impl_summary${SLOT}.txt" || true
+    "launcher: ${SUBTASK} finished; summary at impl_summary${SLOT}.txt" || true
   bash "${BOARD_HELPER}" release "${SESSION_DIR}" "${BOARD_AGENT}" cargo >/dev/null 2>&1 || true
 else
   echo "error" > "${STATUS_FILE}"
@@ -318,7 +311,7 @@ else
   # would otherwise hold the cargo token until its hold expired, stalling every
   # peer behind a lock whose owner is already gone.
   bash "${BOARD_HELPER}" post "${SESSION_DIR}" "${BOARD_AGENT}" blocked \
-    "${SUBTASK} exited with code ${AGENT_CODE}; this role is down" || true
+    "launcher: ${SUBTASK} exited with code ${AGENT_CODE}; this seat is down" || true
   bash "${BOARD_HELPER}" release "${SESSION_DIR}" "${BOARD_AGENT}" cargo >/dev/null 2>&1 || true
   exit "${AGENT_CODE}"
 fi

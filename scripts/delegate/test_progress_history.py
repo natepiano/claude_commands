@@ -315,9 +315,9 @@ class ProgressHistoryTests(unittest.TestCase):
                 "",
                 "**Phase 3: Retry handling**",
                 "",
-                "| Round | Impl | Test | Review | Start    | Elapsed | Result  |",
-                "| ----- | ---- | ---- | ------ | -------- | ------- | ------- |",
-                "| Fix 2 | -    | -    | -      | 05:33:30 | 1m      | running |",
+                "| Round | Impl   | Test | Review | Start    | Elapsed | Result  |",
+                "| ----- | ------ | ---- | ------ | -------- | ------- | ------- |",
+                "| Fix 2 | fix 1m | -    | -      | 05:33:30 | 1m      | running |",
                 "",
                 "▸ **Fix 2 - correcting retry recovery**",
                 "**now 1970-01-01 05:35:00 - next report 05:38:00**",
@@ -1739,6 +1739,67 @@ class ProgressHistoryTests(unittest.TestCase):
         self.assertIn("- **test** · 4m ago · writing the token race test", header)
         self.assertIn("- **review** gpt-called high · no board line yet", header)
 
+    def test_a_finished_seat_keeps_its_own_last_words_under_the_launcher_done(self) -> None:
+        """The launcher's exit post names the kind; the seat's narration names the work."""
+        started_at = 64_000
+        session_dir = self.start_run("ownwords", started_at)
+        self.start_phase(session_dir, started_at)
+        for slot in ("impl", "test"):
+            self.run_board(session_dir, "post", slot, "register", "role=fix; up", at=started_at + 1)
+            self.start_slot_pass(session_dir, slot, "fix", started_at + 10, fix_pass=1)
+        self.run_board(
+            session_dir, "post", "test", "status", "hana_catalyst tests 240 passed", at=started_at + 200
+        )
+        # What implement.sh posts on exit: after the seat's last line, and marked
+        # as the launcher's. Without the mark every finished seat read `fix
+        # finished` and the narration the reader wanted sat one line up, unseen.
+        self.run_board(
+            session_dir,
+            "post",
+            "test",
+            "done",
+            "launcher: fix finished; summary at impl_summary_test.txt",
+            at=started_at + 260,
+        )
+        # `impl` never narrated, so the launcher's words are all there are.
+        self.run_board(
+            session_dir,
+            "post",
+            "impl",
+            "done",
+            "launcher: fix finished; summary at impl_summary_impl.txt",
+            at=started_at + 270,
+        )
+        self.team_slot = ""
+        header = self.run_progress(session_dir, started_at + 300)
+        self.assertIn(
+            "- **test** gpt-called high · 40s ago · done: hana_catalyst tests 240 passed", header
+        )
+        self.assertIn(
+            "- **impl** gpt-called high · 30s ago · done: fix finished; summary at impl_summary_impl.txt",
+            header,
+        )
+
+    def test_the_board_refuses_a_handoff_that_names_no_role(self) -> None:
+        """A handoff is a role change; prose there is a movement the table never shows."""
+        session_dir = self.start_run("barehandoff", 65_000)
+        environment = os.environ.copy()
+        environment["PLAN_DELEGATE_NOW_EPOCH"] = "65001"
+        refused = subprocess.run(
+            ["bash", str(BOARD), "post", str(session_dir), "test", "handoff", "round 8 done"],
+            capture_output=True,
+            text=True,
+            env=environment,
+            check=False,
+        )
+        self.assertNotEqual(refused.returncode, 0)
+        self.assertIn("board.sh role", refused.stderr)
+        log = session_dir / "board.log"
+        self.assertNotIn("handoff", log.read_text(encoding="utf-8") if log.exists() else "")
+        # The verb writes the field the table reads, and is the way through.
+        self.run_board(session_dir, "role", "test", "review", "converging", at=65_002)
+        self.assertIn("[test] handoff: role=review converging", log.read_text(encoding="utf-8"))
+
     def test_a_round_falls_back_when_no_board_exists(self) -> None:
         """A phase whose team has not registered still renders a row."""
         self.write_full_config()
@@ -1797,8 +1858,9 @@ class ProgressHistoryTests(unittest.TestCase):
             ["Round", "Impl", "Test", "Review", "Start", "Elapsed", "Result"],
         )
         # No board and no seat on the pass: the window sits in no round, so it
-        # renders on its own the way every solo run always has.
-        self.assertEqual(rows[0][:4], ["Impl", "-", "-", "-"])
+        # renders on its own the way every solo run always has, drawn in the
+        # seat its kind names.
+        self.assertEqual(rows[0][:4], ["Impl", "impl 3m", "-", "-"])
 
     def test_the_stage_table_names_every_window_the_phase_opened(self) -> None:
         """Each pass and activity in start order, with what the ledger recorded."""
@@ -1939,8 +2001,7 @@ class ProgressHistoryTests(unittest.TestCase):
             ["Round", "Impl", "Test", "Review", "Start", "Elapsed", "Result"],
         )
         # A solo run records no seat, so every window keeps a row and the
-        # per-window finding attribution it always had. The seat columns stay
-        # empty rather than guessing which one a slotless pass would have been.
+        # per-window finding attribution it always had.
         self.assertEqual(
             [(row[0], row[5], row[6]) for row in rows],
             [
@@ -1952,7 +2013,20 @@ class ProgressHistoryTests(unittest.TestCase):
                 ("Review 3", "40s", "running"),
             ],
         )
-        self.assertEqual({tuple(row[1:4]) for row in rows}, {("-", "-", "-")})
+        # A slotless pass is drawn in the seat its kind names -- the closure
+        # review under Review, where a reader looks for it -- and a main-agent
+        # activity names no seat and keeps three dashes.
+        self.assertEqual(
+            [tuple(row[1:4]) for row in rows],
+            [
+                ("impl 3m", "-", "-"),
+                ("-", "-", "review 1m"),
+                ("fix 2m", "-", "-"),
+                ("-", "-", "review 40s"),
+                ("-", "-", "-"),
+                ("-", "-", "review 40s"),
+            ],
+        )
         self.assertIn("▸ **Review 3 - checking the remaining plan against what shipped**", header)
         # Which agent ran each window is the `timeline` view's question, and the
         # main agent ran verification itself, so that row has no delegate there.
