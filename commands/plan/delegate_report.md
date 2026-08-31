@@ -74,10 +74,13 @@ Everything below is the contract.
    Include the override reason only when rejecting an applicable calibrated
    value. **Copy its Markdown output byte-for-byte** — the scope line,
    both tables with every row and cell, the `Earlier:` line above the round
-   table when there is one, the delegates lines, and the wall clock.
-   Never reorder, edit, or omit any part of it: the recorder owns every column,
-   duration format, and ETA band. When step 4 has armed an early reviewer, say
-   below the tables that the writer and the reviewer are working at once.
+   table when there is one, and the wall clock. Never reorder, edit, or omit
+   any part of those: the recorder owns every column, duration format, and ETA
+   band. The one exception is the `- **Agent N**` lines under the round table:
+   they are the seats talking to each other, not to the user, so they are
+   step 7's input and are never pasted. When step 4 has armed an early
+   reviewer, say below the tables that the writer and the reviewer are working
+   at once.
 6. Read the round table as seats. It leads with `Stage`, `Start`, and `Elapsed`
    — `Stage` rather than `Round` because a row is not always a round: a
    verification, a smoke run, or a lone reviewer each own one. Its three seat
@@ -97,20 +100,59 @@ Everything below is the contract.
    - `done` — the stretch is over. Every row but the last of a live round.
 
    A cell with a role and no time or state is a seat that recorded no pass; the
-   board knew its role, the ledger never saw it. A further row opens whenever any
-   seat changes role, so the reader watches `impl / impl / test` become
-   `review / review / review`. The first row of a round is its opening. The
-   lines under the table lead with the same label and the slot in parentheses —
-   `- **Agent 2** (test) …` — then the agent sitting in that seat and the last
-   thing it said: the seat's own words, never the launcher's. A lone reviewer
-   between rounds sits in the `Agent 3` column on a row of its own.
+   board knew its role, the ledger never saw it. A further row opens whenever
+   the team actually moves, and its `Result` cell names the movement —
+   `Agent 3 → fix` — so the reader watches `impl / impl / test` become
+   `review / review / review` without diffing cells. The first row of a round
+   is its opening. The lines under the table lead with the same label and the
+   slot in parentheses — `- **Agent 2** (test) …` — then the agent sitting in
+   that seat and the last thing it said: the seat's own words, never the
+   launcher's. That narration is addressed to the other seats, which is why
+   step 7 rewrites it before it reaches the user. A lone reviewer between
+   rounds sits in the `Agent 3` column on a row of its own.
 
    The table carries the phase's **last three stages**, not all of them. An
    `Earlier:` line above it names what the cap left out, and the phase began
    there, not at the table's first row — never describe a phase as newly opened
    because its earlier rounds are off the table. When the user asks about work
    that line covers, answer from `timeline`, which still renders every pass.
-7. Add two or three ordinary-English sentences under <UserFacingText/>: open
+7. Write the seat lines yourself. One line per seat the recorder listed, with
+   the same lead — `- **Agent 2** (test)`, plus the agent when the recorder
+   names one — then a sentence of yours, not the seat's. Each line answers two
+   things: what the seat is doing in the phase's own terms, and whether it is
+   moving, waiting, or done. Build it from the seat's board lines since the
+   last cursor plus the Work Order, and hold these rules:
+
+   - Read the full board line, never the recorder's 72-character cut. A line
+     ending in `…` has lost its information and must never reach the user.
+   - Name work by what it changes for the phase — the Work Order item, the
+     defect being fixed, the tests being written — never by the team's own
+     shorthand for it. The team's lane names, gate names, and finding IDs mean
+     nothing outside the session.
+   - Coordination mechanics are not news. Claims, tokens, role announcements,
+     handoffs, "no-more-edits", gate reruns — report the state they imply and
+     name the mechanism only when a seat is stuck on it, with how long.
+   - A finding is named by the defect it describes, not by its ID or the
+     reviewer's phrasing.
+   - Give an age only when it is news — a seat silent long enough to look
+     stalled, or finished and how long ago. "1s ago" tells the reader nothing.
+   - One set of lines per report, from this tick's recorder output only. Never
+     carry a previous tick's lines forward or print two sets.
+
+   Not this:
+
+   ```text
+   - **Agent 1** (impl) gpt-5.6-sol xhigh · 1s ago · claim: token cargo acquired for up to 3600s
+   - **Agent 2** (test) gpt-5.6-sol xhigh · 18s ago · Identity lane compiles with six Catalyst defects and one test fixture c…
+   ```
+
+   This:
+
+   ```text
+   - **Agent 1** (impl) gpt-5.6-sol xhigh · starting its verification build.
+   - **Agent 2** (test) gpt-5.6-sol xhigh · fixing six compile errors its new identity tests turned up.
+   ```
+8. Add two or three ordinary-English sentences under <UserFacingText/>: open
    with what this phase gives the person using the tool, then its movement and
    what remains. One topic per sentence, no more than two clauses; when a topic
    holds more than two items, give the count and what they have in common.
