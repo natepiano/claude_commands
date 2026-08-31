@@ -1898,6 +1898,10 @@ SUMMARY_HEADERS: tuple[str, ...] = ("Scope", "%", "Elapsed", "ETA", "Unchanged")
 # so the alignment follows a column that moves. The two scope labels and the
 # phase tally read as words and stay left.
 RIGHT_ALIGNED_SUMMARY_COLUMNS = frozenset({"%", "Elapsed", "ETA", "ETA low", "ETA high"})
+# How much of a seat's last board line the note under the table carries. The
+# board caps a post far higher than a terminal line can hold, and a wrapped
+# narration costs the reader the three-line scan the note exists to give.
+BOARD_NOTE_CHARS = 72
 
 
 def _run_events(state: dict[str, object]) -> list[dict[str, object]]:
@@ -2293,6 +2297,14 @@ def _window_result(window: StageWindow, tally: FindingTally) -> str:
     return "done"
 
 
+class BoardActivity(TypedDict):
+    """The last thing a seat said on the board, and when it said it."""
+
+    at: float
+    kind: str
+    message: str
+
+
 class RoleChange(TypedDict):
     """One moment a slot took a role, as the coordination board recorded it."""
 
@@ -2353,6 +2365,56 @@ def _board_role_changes(session_dir: Path) -> list[RoleChange]:
             )
         )
     return sorted(changes, key=lambda change: change["at"])
+
+
+def _board_activity(session_dir: Path) -> dict[str, BoardActivity]:
+    """The most recent line each seat wrote to the board, keyed by slot.
+
+    A seat that recorded no pass reaches the table with a role and no duration,
+    and a role on its own cannot tell a seat deep in its work from one that
+    stopped an hour ago. The board can. Every delegate posts what it is about to
+    do before doing it, attributed to its slot, so the latest line and its age
+    answer the question a pass window alone cannot -- for a seat that has one as
+    much as for a seat that does not, since an open window says only that the
+    launcher is still waiting.
+
+    The latest line of any kind, not just `status`: a seat whose last act was a
+    handoff or a `blocked` is exactly the seat a reader needs to hear about, and
+    filtering to narration would render it as silent.
+    """
+    activity: dict[str, BoardActivity] = {}
+    try:
+        text = (session_dir / "board.log").read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return activity
+    for line in text.splitlines():
+        match = re.search(r"\[([^\]]+)\] (\w+): (.*)$", line)
+        at = _board_stamp(line)
+        if match is None or at is None:
+            continue
+        activity[match.group(1)] = BoardActivity(
+            at=at, kind=match.group(2), message=match.group(3).strip()
+        )
+    return activity
+
+
+def _board_phrase(said: BoardActivity) -> str:
+    """One seat's last board line, cut to fit a terminal row.
+
+    A `status` is narration and reads as itself. Any other kind is named,
+    because the kind is then the news -- `blocked` and `done` change what the
+    reader should do next, where a bare message would look like more work in
+    progress. A handoff's `role=` field is dropped: the role it announces is
+    already in that seat's column, and repeating it here spends the line.
+    """
+    message = said["message"]
+    if said["kind"] == "handoff":
+        message = re.sub(r"^role=\S+\s*", "", message)
+    body = message if said["kind"] == "status" else f"{said['kind']}: {message}"
+    body = body.strip() or said["kind"]
+    if len(body) > BOARD_NOTE_CHARS:
+        body = body[: BOARD_NOTE_CHARS - 1].rstrip() + "\u2026"
+    return body
 
 
 def _roles_over(changes: list[RoleChange], lower: float, upper: float) -> dict[str, str]:
@@ -2537,7 +2599,6 @@ def _round_cells(
     roles: dict[str, str],
     lower: float,
     upper: float,
-    running: bool,
     now: float,
 ) -> list[str]:
     """A cell per seat: what it was doing over this stretch, and for how long."""
@@ -2546,10 +2607,13 @@ def _round_cells(
     for slot in ROUND_SLOTS:
         member = by_slot.get(slot)
         if member is None:
-            # Registered on the board without opening a pass. The role is the
-            # answer the reader wants and the board already has it; the duration
-            # is the part that genuinely is not known.
-            cells.append(roles[slot] if running and roles.get(slot) else "-")
+            # A seat that recorded no pass: it was launched without a pass
+            # kind, or it died before `start-pass`. The board still knows its
+            # role, and knows it after the round closes -- the old reading gated
+            # this on the round running, so a finished round rendered its other
+            # seats as "-" and read as a solo pass. The duration is what is
+            # genuinely unknown here; the seat is not.
+            cells.append(roles.get(slot) or "-")
             continue
         # The board's role wins wherever it has one, for this stretch rather than
         # for now: it is the only source that tracks a seat recruited across, and
@@ -2610,7 +2674,7 @@ def _round_rows(
             rows.append(
                 [
                     entry["label"] if index == 0 else "",
-                    *_round_cells(members, roles, lower, upper, running, now),
+                    *_round_cells(members, roles, lower, upper, now),
                     _clock_stamp(lower),
                     _compact_duration(int(upper - lower)),
                     _round_result(_round_tally(findings, entry["number"]), running)
@@ -2621,23 +2685,45 @@ def _round_rows(
     return rows
 
 
-def _delegate_note(windows: list[StageWindow]) -> str:
-    """The agent behind each seat of the round in flight, or empty when none is.
+def _delegate_note(
+    windows: list[StageWindow],
+    activity: dict[str, BoardActivity],
+    now: float,
+) -> list[str]:
+    """A line per seat: the agent behind it, and the last thing it said.
 
     Which model is sitting in which seat is the thing a reader cannot recover
-    from the table and asks about first when a seat runs long. It goes under the
-    table rather than into it: it is one answer per phase, not per row, and a
-    column repeating the same three values down every row would crowd out the
-    roles. The main agent is left out -- the reader is the main agent.
+    from the table and asks about first when a seat runs long -- and it is not
+    the only thing the table cannot say. A duration is the age of an open pass
+    window, which grows whether the seat is working or wedged, and a seat that
+    recorded no pass shows a role and nothing else. The board line closes both
+    gaps: what the seat said last, and how long ago, which is the difference
+    between working and stalled.
+
+    It goes under the table rather than into it -- one answer per seat, not per
+    row, and a column repeating it down every row would crowd out the roles. The
+    main agent is left out; the reader is the main agent.
     """
     live = {
         window["slot"]: window["delegate"]
         for window in windows
         if window["slot"] and window["status"] in ("running", "armed", "open")
     }
-    named = [f"{slot} {live[slot]}" for slot in ROUND_SLOTS if live.get(slot)]
-    return f"_delegates: {' · '.join(named)}_" if named else ""
-
+    lines: list[str] = []
+    for slot in ROUND_SLOTS:
+        agent, said = live.get(slot), activity.get(slot)
+        if agent is None and said is None:
+            continue
+        if said is None:
+            # Launched and yet to narrate. Naming that is the useful answer: a
+            # seat short of its first line is either still starting or gone
+            # before it began, and neither should read to the reader as work.
+            detail = "no board line yet"
+        else:
+            age = _compact_duration(max(int(now - said["at"]), 0))
+            detail = f"{age} ago \u00b7 {_board_phrase(said)}"
+        lines.append(f"- **{slot}**{f' {agent}' if agent else ''} \u00b7 {detail}")
+    return lines
 
 def _stage_table(
     events: list[dict[str, object]],
@@ -3205,7 +3291,7 @@ def _progress(args: argparse.Namespace) -> None:
             _board_role_changes(session_dir),
             now,
         )
-        delegate_note = _delegate_note(stage_windows)
+        delegate_note = _delegate_note(stage_windows, _board_activity(session_dir), now)
         lines = [
             _scope_line(state, plan_phase_counts),
             "",
@@ -3223,7 +3309,7 @@ def _progress(args: argparse.Namespace) -> None:
             "",
             *_render_table(list(ROUND_HEADERS), round_rows, set()),
             "",
-            *([delegate_note, ""] if delegate_note else []),
+            *([*delegate_note, ""] if delegate_note else []),
             f"▸ **{live_label} - {_string(current_pass.get('activity'))}**",
             _clock_line(now, next_report_at),
         ]

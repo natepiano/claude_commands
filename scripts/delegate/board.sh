@@ -79,9 +79,15 @@ flatten() {
   printf '%s' "$*" | tr '\n\r\t' '   ' | tr -cd '[:print:]' | cut -c "1-${MAX_MESSAGE_CHARS}"
 }
 
+# `ask` and `answer` are deliberately absent. A question to a peer is a message
+# now -- SendMessage for a claude member, codex_mesh.py for a codex one -- and
+# leaving the kinds here would give a delegate two ways to ask one question,
+# with the board's way being the one nobody is listening on. Every kind that
+# remains is a record something later reads back: the progress table, a peer
+# resuming hours on, or the orchestrator at its next tick.
 valid_kind() {
   case "$1" in
-    register|claim|release|ask|answer|status|blocked|handoff|done) return 0 ;;
+    register|claim|release|status|blocked|handoff|done) return 0 ;;
     *) return 1 ;;
   esac
 }
@@ -98,7 +104,7 @@ cmd_post() {
   local kind="${3:?post needs <kind>}"
   shift 3
   valid_token_name "$agent" || die "agent name must be alphanumeric/._- and 1-64 chars: '$agent'"
-  valid_kind "$kind" || die "unknown kind '$kind' (register claim release ask answer status blocked handoff done)"
+  valid_kind "$kind" || die "unknown kind '$kind' (register claim release status blocked handoff done); ask a peer by message, not on the board"
   [[ $# -gt 0 ]] || die "post needs a message"
   mkdir -p "$session_dir"
   printf '%s [%s] %s: %s\n' "$(now_iso)" "$agent" "$kind" "$(flatten "$@")" \

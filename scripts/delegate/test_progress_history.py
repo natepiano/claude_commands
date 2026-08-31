@@ -1350,9 +1350,15 @@ class ProgressHistoryTests(unittest.TestCase):
         # The seats are all still running, so only the last row can carry one.
         self.assertEqual([row[6] for row in rows], ["", "", "running"])
         # Which delegate is in which seat sits under the table, once, and the
-        # main agent is left out of it -- the reader is the main agent.
-        seats = " · ".join(f"{slot} gpt-called high" for slot in ("impl", "test", "review"))
-        self.assertIn(f"_delegates: {seats}_", header)
+        # main agent is left out of it -- the reader is the main agent. Each
+        # seat carries its last board line and that line's age, because a role
+        # alone -- and an open pass window, which grows either way -- cannot say
+        # whether a seat is working or has been silent since it took the role.
+        for slot in ("impl", "test", "review"):
+            self.assertIn(
+                f"- **{slot}** gpt-called high · 3m ago · handoff: converging",
+                header,
+            )
 
     def test_a_second_round_is_a_second_row(self) -> None:
         """A repair round is a row of its own, named by the number it carries."""
@@ -1681,6 +1687,57 @@ class ProgressHistoryTests(unittest.TestCase):
         # report the role the board knows and no duration, which is the part that
         # is genuinely unknown -- not a dash, which would read as idle.
         self.assertEqual(rows[0][:4], ["Impl", "impl 4m", "test", "impl"])
+
+    def test_a_closed_round_keeps_the_roles_of_its_passless_seats(self) -> None:
+        """A finished round still names what its test and review seats were doing."""
+        started_at = 62_000
+        session_dir = self.start_run("closed", started_at)
+        self.start_phase(session_dir, started_at)
+        for slot in ("impl", "test", "review"):
+            self.run_board(session_dir, "post", slot, "register", "up", at=started_at + 1)
+            self.run_board(session_dir, "role", slot, slot, "opening", at=started_at + 2)
+        # One seat records a pass here; the other two are board-only for this
+        # round, which is what the closed round has to keep reporting.
+        self.start_slot_pass(session_dir, "impl", "impl", started_at + 10)
+        self.finish_slot_pass(session_dir, "impl", "completed", started_at + 310)
+        # A repair round opens behind it, so the closed round is read as history
+        # -- which is the case the reader was seeing collapse to a solo pass.
+        self.start_slot_pass(session_dir, "impl", "fix", started_at + 320, fix_pass=1)
+        self.team_slot = ""
+        rows = self.table_rows(
+            self.run_progress(session_dir, started_at + 400),
+            ["Round", "Impl", "Test", "Review", "Start", "Elapsed", "Result"],
+        )
+        # The board knows these two roles after the round closes exactly as it
+        # did while the round ran. Blanking them once it ends would render every
+        # finished round as a solo pass and lose the shape the team worked in.
+        self.assertEqual(rows[0][:4], ["Impl", "impl 5m", "test", "review"])
+
+    def test_each_seat_reports_its_last_board_line_and_its_age(self) -> None:
+        """The note under the table says what each seat said, and how long ago."""
+        started_at = 63_000
+        session_dir = self.start_run("narration", started_at)
+        self.start_phase(session_dir, started_at)
+        for slot in ("impl", "test"):
+            self.run_board(session_dir, "post", slot, "register", "up", at=started_at + 1)
+        self.start_slot_pass(session_dir, "impl", "impl", started_at + 10)
+        # `review` opens a pass and never narrates, which is the case the note
+        # has to name rather than leave looking like the other two.
+        self.start_slot_pass(session_dir, "review", "review", started_at + 10)
+        self.run_board(
+            session_dir, "post", "test", "status", "writing the token race test", at=started_at + 60
+        )
+        self.run_board(
+            session_dir, "post", "impl", "status", "rerunning the scoped test", at=started_at + 120
+        )
+        self.team_slot = ""
+        header = self.run_progress(session_dir, started_at + 300)
+        # The age is the whole point: a seat four minutes into one activity and a
+        # seat that has said nothing read differently, where two identical role
+        # words in the table do not.
+        self.assertIn("- **impl** gpt-called high · 3m ago · rerunning the scoped test", header)
+        self.assertIn("- **test** · 4m ago · writing the token race test", header)
+        self.assertIn("- **review** gpt-called high · no board line yet", header)
 
     def test_a_round_falls_back_when_no_board_exists(self) -> None:
         """A phase whose team has not registered still renders a row."""
