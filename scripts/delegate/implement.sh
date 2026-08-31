@@ -169,8 +169,36 @@ elif [[ "${USE_CODEX_MESH}" == "1" ]]; then
 else
   MESH_FIELD="mesh=none"
 fi
+# The opening role is stamped here so the progress table has a real answer from
+# second zero, instead of a dash until some agent remembers to call `board.sh
+# role`. A seat opens in the role it is named for, with one exception: the impl
+# seat does both implementation and repair, and only PASS_KIND says which.
+#
+# Do NOT simplify this to keying every seat off PASS_KIND. The pass kinds are
+# impl/fix/review/arch and the roles are impl/fix/test/review -- close enough to
+# look interchangeable, and not. There is no `test` pass kind, so once every seat
+# carries one, a test seat would stamp `role=impl` on every phase and the Test
+# column would never read `test` again, losing the one distinction it exists to
+# show: a test seat doing its own job against one recruited into writing.
+# A seat whose name is not a role at all -- the drifted `impl2`, `main` -- stamps
+# nothing rather than inventing one.
+case "${BOARD_AGENT}" in
+  impl)
+    case "${PASS_KIND}" in
+      impl|fix) OPENING_ROLE="${PASS_KIND}" ;;
+      *)        OPENING_ROLE="impl" ;;
+    esac
+    ;;
+  test|review) OPENING_ROLE="${BOARD_AGENT}" ;;
+  *)           OPENING_ROLE="" ;;
+esac
+if [[ -n "${OPENING_ROLE}" ]]; then
+  ROLE_FIELD="role=${OPENING_ROLE}; "
+else
+  ROLE_FIELD=""
+fi
 bash "${BOARD_HELPER}" post "${SESSION_DIR}" "${BOARD_AGENT}" register \
-  "${SUBTASK} launcher up (${AGENT_FAMILY}/${AGENT_MODEL}:${AGENT_EFFORT:-unset}); ${MESH_FIELD}; status in impl_status${SLOT}" || true
+  "${SUBTASK} launcher up (${AGENT_FAMILY}/${AGENT_MODEL}:${AGENT_EFFORT:-unset}); ${MESH_FIELD}; ${ROLE_FIELD}status in impl_status${SLOT}" || true
 
 # The delegate's own verify.sh runs inherit these and take the cargo token with
 # them, so serialization does not depend on the agent remembering a prompt rule.

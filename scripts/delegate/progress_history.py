@@ -2102,7 +2102,9 @@ def _board_roles(session_dir: Path) -> dict[str, str]:
     every slot converges on review at the end -- so the board, not the launch
     arguments, is what knows the current answer. `board.sh role` stamps a
     `role=<name>` field precisely so this can be read back exactly rather than
-    inferred from prose.
+    inferred from prose, and the launcher stamps the same field on its `register`
+    line so a slot reports a role from second zero instead of a dash until an
+    agent thinks to call it.
     """
     roles: dict[str, str] = {}
     board = session_dir / "board.log"
@@ -2115,12 +2117,15 @@ def _board_roles(session_dir: Path) -> dict[str, str]:
         if match is None:
             continue
         slot, kind, rest = match.group(1), match.group(2), match.group(3)
+        opening = re.search(r"\brole=(\w+)", rest)
         if kind == "register":
-            _ = roles.setdefault(slot, "")
+            # First register wins: the launcher posts one before the agent runs,
+            # and an agent that registers again mid-phase must not erase the role
+            # it has since taken. A role change is a `handoff`, never a register.
+            _ = roles.setdefault(slot, opening.group(1) if opening else "")
             continue
-        role_match = re.match(r"role=(\w+)", rest)
-        if role_match is not None:
-            roles[slot] = role_match.group(1)
+        if opening is not None:
+            roles[slot] = opening.group(1)
     return roles
 
 

@@ -305,6 +305,13 @@ that exists. Each `register` line says which case holds, in its `mesh=` field.
 - `board.sh read <session_dir> --since <cursor>` — everything new. Each line is
   numbered; keep the last number as the cursor. Read before every decision that
   depends on a peer, and always after acquiring a token.
+- `board.sh role <session_dir> <slot> <impl|fix|test|review> [note]` — **call
+  this the moment your slot starts doing something other than what it is named
+  for.** A slot is a fixed identity and its role is not: a `review` slot
+  recruited into writing is doing `impl`, and every slot converges on `review`
+  at the end. The launcher stamps the role each slot opens in, so the progress
+  table is never blank; after that, only this command keeps it true. Saying it
+  in a `status` sentence does not count — the table reads the field, not prose.
 - A decision that is not on the board did not happen. Say it on the board first,
   then message a peer if it needs attention now.
 

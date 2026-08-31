@@ -20,7 +20,9 @@
 #   board.sh locks   <session_dir>
 #
 # Post kinds (a closed set, so peers can scan for what concerns them):
-#   register  — "I am <slot>, opening in <role>"
+#   register  — "I am <slot>, opening in <role>". The launcher stamps the same
+#               machine-readable `role=<name>` field that `role` writes, so a
+#               slot has a reported role before it posts anything itself
 #   claim     — "I am taking these files / this work"
 #   release   — "I am done with these files / this work"
 #   ask       — a question addressed to one peer or to all
@@ -259,7 +261,15 @@ cmd_roles() {
       role[slot] = r
       next
     }
-    /\] register: / { if (!(slot in role)) role[slot] = "" }
+    /\] register: / {
+      if (slot in role) next
+      if (match($0, /role=[A-Za-z0-9_]+/)) {
+        r = substr($0, RSTART + 5, RLENGTH - 5)
+        role[slot] = r
+      } else {
+        role[slot] = ""
+      }
+    }
     END { for (s in role) printf "%s\t%s\n", s, role[s] }
   ' "$log"
 }
