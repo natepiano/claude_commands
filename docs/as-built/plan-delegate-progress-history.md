@@ -248,15 +248,31 @@ row and a phase row carrying the reported percentage, elapsed, ETA, unchanged,
 the best and worst arrival the percentage still allows.
 
 The second is the round table, under the phase heading: one row per round,
-oldest first, with a column for each of the three slots — `Agent 1`, `Agent 2`,
-`Agent 3`, the `impl`, `test`, `review` slots in that order, numbered so the
-header carries no role word the cell beneath could contradict — plus the
-round's start, elapsed, and finding result. A round is the unit that advances: it is dispatched, it lands, and the ledger stamps its number
+oldest first, led by `Stage`, `Start` and `Elapsed`, then a column for each of
+the three slots — `Agent 1`, `Agent 2`, `Agent 3`, the `impl`, `test`, `review`
+slots in that order, numbered so the header carries no role word the cell
+beneath could contradict — and closed by the finding result. The first column is
+`Stage` rather than `Round` because a row is not always a round: a verification,
+a smoke run, or a lone reviewer each own one. A round is nonetheless the unit
+that advances: it is dispatched, it lands, and the ledger stamps its number
 on every finding it produces, so it is the only row key whose start, elapsed and
 result all describe the same thing. The three seats working it read across as
-columns, each cell naming what that seat is doing and how long it has been doing
-it — `fix 11m`, `review 13m`. Under the table sits the running round's activity
+columns, each cell naming the role that seat held, how long it held it, and what
+it is doing at the end of the row's stretch — `fix 11m running`,
+`review 13m waiting`. Under the table sits the running round's activity
 sentence, which no fixed-width column can carry, and then the wall clock.
+
+The four seat states answer the question a duration cannot: an open window and a
+closed one both render a number, and a number that stopped growing looks exactly
+like one still growing. `done` is every stretch already over, which is every row
+but the last of a live round. Within that last row, `idle` is a seat whose
+window closed while its round did not — free for more work rather than finished
+with the phase — and an open window is `running` unless the seat's own last
+board line says it is held up, which is `waiting`. Only the board can supply
+that last one: a seat blocked on a peer's edit, on the cargo token, or on a gate
+has a live process and an open window, so the pass record cannot tell it from
+work, and three seats reading `running` while two sit on the third is the
+picture the word exists to correct.
 
 The table draws the last three stages only. A stage is one labelled unit of the
 phase — a round, a lone review, a run of verification — and a long phase runs

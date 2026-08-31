@@ -1892,12 +1892,17 @@ ROUND_SLOTS: tuple[str, ...] = ("impl", "test", "review")
 # so the reader can still find `impl_status_<slot>` and the `[slot]` board lines.
 SEAT_LABELS: dict[str, str] = {"impl": "Agent 1", "test": "Agent 2", "review": "Agent 3"}
 ROUND_HEADERS: tuple[str, ...] = (
-    "Round",
-    *(SEAT_LABELS[slot] for slot in ROUND_SLOTS),
+    "Stage",
     "Start",
     "Elapsed",
+    *(SEAT_LABELS[slot] for slot in ROUND_SLOTS),
     "Result",
 )
+# The statuses that mean a window is being worked right now. Narrower than the
+# set `_window_span` runs to the clock: a window left `open` is one whose finish
+# was never recorded, so its launcher is gone and its span is merely unbounded.
+# Reading that as work is the mistake the seat states exist to stop making.
+LIVE_WINDOW_STATUSES: tuple[str, ...] = ("running", "armed")
 # A pass kind's display name, where the two differ. `arch` is deliberately
 # absent: it is retired rather than renamed, and the handful of back-corpus
 # passes carrying it fall through to `.title()` unchanged.
@@ -1914,6 +1919,11 @@ BOARD_NOTE_CHARS = 72
 # What implement.sh puts in front of the `done` and `blocked` it posts on the
 # worker's exit, so the note can tell the launcher's line from the seat's own.
 LAUNCHER_PREFIX = "launcher:"
+# What a seat's own narration says when it is alive but not working: held up on
+# a peer's edit, on a token, on a gate. Nothing in the pass record separates that
+# from work -- the process is up and the window is open either way -- so the last
+# board line is the only source there is, and these are the words the seats use.
+WAITING_PHRASES: tuple[str, ...] = ("waiting", "wait for", "blocked on", "standing by")
 # Where a window that sits in no round is drawn when its kind names a seat. A
 # lone reviewer between rounds -- the closure review, the broad review of a
 # solo run -- is doing review work, and a reader scanning the review seat's column for
@@ -2712,14 +2722,52 @@ def _slot_occupancies(members: list[StageWindow]) -> dict[str, list[StageWindow]
     return occupancies
 
 
+def _seat_is_waiting(said: BoardActivity | None) -> bool:
+    """Whether a seat's last board line says it is held up rather than working."""
+    if said is None or said["message"].startswith(LAUNCHER_PREFIX):
+        # A launcher writes one line only as its seat exits, and a seat that has
+        # exited is not waiting on anything.
+        return False
+    if said["kind"] == "blocked":
+        return True
+    text = (said["own"] or said["message"]).lower()
+    return any(phrase in text for phrase in WAITING_PHRASES)
+
+
+def _seat_state(member: StageWindow, live: bool, said: BoardActivity | None) -> str:
+    """What this seat is doing at the end of the stretch its cell covers.
+
+    The duration cannot say it. An open window and a closed one both render a
+    number, and a number that stopped growing looks exactly like one still
+    growing, so the reader's first question -- is anyone still working -- is the
+    one the row could not answer.
+
+    `done` is every stretch that is already over, which is every row but the
+    last of a live round. Inside that last row three answers separate. A seat
+    whose window has closed is `idle`: finished with what it was given while the
+    round it belongs to is not, so it is a seat available for more work rather
+    than a phase that ended. A seat whose window is open is working, unless its
+    own narration says it is held up on a peer, a token, or a gate -- which the
+    records cannot see, and which is `waiting`. Three seats reading `running`
+    while two of them sit on the third is the picture this exists to correct.
+    """
+    if not live:
+        return "done"
+    if member["status"] not in LIVE_WINDOW_STATUSES:
+        return "idle"
+    return "waiting" if _seat_is_waiting(said) else "running"
+
+
 def _round_cells(
     members: list[StageWindow],
     roles: dict[str, str],
     lower: float,
     upper: float,
     now: float,
+    live: bool,
+    activity: dict[str, BoardActivity],
 ) -> list[str]:
-    """A cell per seat: what it was doing over this stretch, and for how long."""
+    """A cell per seat: its role over this stretch, how long, and its state."""
     occupancies = _slot_occupancies(members)
     cells: list[str] = []
     for slot in ROUND_SLOTS:
@@ -2749,17 +2797,36 @@ def _round_cells(
         role = (roles.get(slot) or member["kind"]) if member is seated[0] else member["kind"]
         opened, closed = _window_span(member, now)
         overlap = int(min(closed, upper) - max(opened, lower))
-        cells.append(f"{role} {_compact_duration(overlap)}" if overlap > 0 else role)
+        cells.append(
+            " ".join(
+                word
+                for word in (
+                    role,
+                    _compact_duration(overlap) if overlap > 0 else "",
+                    _seat_state(member, live, activity.get(slot)),
+                )
+                if word
+            )
+        )
     return cells
 
 
-def _lone_cells(window: StageWindow) -> list[str]:
+def _lone_cells(window: StageWindow, activity: dict[str, BoardActivity]) -> list[str]:
     """The seat cells of a window in no round: its kind's seat filled, or none."""
     cells = ["-"] * len(ROUND_SLOTS)
     seat = LONE_SEATS.get(window["kind"])
     if seat is not None:
-        cells[ROUND_SLOTS.index(seat)] = (
-            f"{window['kind']} {_compact_duration(window['elapsed'])}"
+        # One worker, so there is no round to outlive: it is either running or
+        # over, and `idle` -- a seat free while its round continues -- cannot
+        # arise here.
+        live = window["status"] in LIVE_WINDOW_STATUSES
+        said = activity.get(window["slot"]) if window["slot"] else None
+        cells[ROUND_SLOTS.index(seat)] = " ".join(
+            (
+                window["kind"],
+                _compact_duration(window["elapsed"]),
+                _seat_state(window, live, said),
+            )
         )
     return cells
 
@@ -2776,6 +2843,7 @@ def _round_table(
     labels: list[str],
     findings: list[dict[str, object]],
     changes: list[RoleChange],
+    activity: dict[str, BoardActivity],
     now: float,
 ) -> RoundTable:
     """The last ROUND_TABLE_STAGES stages, each split wherever its seats moved.
@@ -2803,16 +2871,16 @@ def _round_table(
     rows: list[list[str]] = []
     for entry in [entry for group in shown for entry in group]:
         members, started_at = entry["members"], entry["started_at"]
-        running = any(member["status"] in ("running", "armed") for member in members)
+        running = any(member["status"] in LIVE_WINDOW_STATUSES for member in members)
         if entry["number"] is None:
             lone = members[0]
             tally = _finding_tally(findings, started_at, uppers[lone["instance_id"]])
             rows.append(
                 [
                     entry["label"],
-                    *_lone_cells(lone),
                     _clock_stamp(started_at),
                     _compact_duration(lone["elapsed"]),
+                    *_lone_cells(lone, activity),
                     _window_result(lone, tally),
                 ]
             )
@@ -2828,9 +2896,12 @@ def _round_table(
             rows.append(
                 [
                     entry["label"] if index == 0 else "",
-                    *_round_cells(members, roles, lower, upper, now),
                     _clock_stamp(lower),
                     _compact_duration(int(upper - lower)),
+                    # Only the closing row of a live round is the present. Every
+                    # earlier segment is a stretch that ended, whatever its seats
+                    # are doing now.
+                    *_round_cells(members, roles, lower, upper, now, running and last, activity),
                     _round_result(_round_tally(findings, entry["number"]), running)
                     if last
                     else "",
@@ -3460,14 +3531,16 @@ def _progress(args: argparse.Namespace) -> None:
             if _string(event.get("phase_instance_id")) == phase_instance_id
             and _string(event.get("event_type")).startswith("finding_")
         ]
+        board_activity = _board_activity(session_dir)
         round_table = _round_table(
             stage_windows,
             stage_labels,
             phase_findings,
             _board_role_changes(session_dir),
+            board_activity,
             now,
         )
-        delegate_note = _delegate_note(stage_windows, _board_activity(session_dir), now)
+        delegate_note = _delegate_note(stage_windows, board_activity, now)
         lines = [
             _scope_line(state, plan_phase_counts),
             "",

@@ -78,12 +78,27 @@ Everything below is the contract.
    Never reorder, edit, or omit any part of it: the recorder owns every column,
    duration format, and ETA band. When step 4 has armed an early reviewer, say
    below the tables that the writer and the reviewer are working at once.
-6. Read the round table as seats. Its three seat columns are `Agent 1`,
-   `Agent 2`, `Agent 3` — the slots `impl`, `test`, `review` in that order,
-   identities that never change, numbered so the header carries no role word
-   the cell beneath could contradict. Each cell is the role that seat held over
-   the row's stretch and for how long; a further row opens whenever any seat
-   changes role, so the reader watches `impl / impl / test` become
+6. Read the round table as seats. It leads with `Stage`, `Start`, and `Elapsed`
+   — `Stage` rather than `Round` because a row is not always a round: a
+   verification, a smoke run, or a lone reviewer each own one. Its three seat
+   columns are `Agent 1`, `Agent 2`, `Agent 3` — the slots `impl`, `test`,
+   `review` in that order, identities that never change, numbered so the header
+   carries no role word the cell beneath could contradict. Each cell is the role
+   that seat held over the row's stretch, how long it held it, and what the seat
+   is doing at the end of it:
+
+   - `running` — its window is open and its last board line is work.
+   - `waiting` — open, but the seat says it is held up: on a peer's edit, on the
+     cargo token, on a gate. Three seats reading `running` while two sit on the
+     third is what this word exists to correct, and no clock shows it — a
+     waiting seat's elapsed grows exactly like a working one's.
+   - `idle` — its window has closed while the round has not, so the seat is free
+     for more work rather than finished with the phase.
+   - `done` — the stretch is over. Every row but the last of a live round.
+
+   A cell with a role and no time or state is a seat that recorded no pass; the
+   board knew its role, the ledger never saw it. A further row opens whenever any
+   seat changes role, so the reader watches `impl / impl / test` become
    `review / review / review`. The first row of a round is its opening. The
    lines under the table lead with the same label and the slot in parentheses —
    `- **Agent 2** (test) …` — then the agent sitting in that seat and the last
