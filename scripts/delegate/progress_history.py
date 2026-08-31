@@ -1934,6 +1934,13 @@ LONE_SEATS: dict[str, str] = {"impl": "impl", "fix": "impl", "test": "test", "re
 # table that tall is scrolled past rather than read. What a reader acts on is
 # the last few; the rest is history, and `timeline` still renders it in full.
 ROUND_TABLE_STAGES = 3
+# How close together two role movements are before they are one movement of the
+# team. Seats converge in sequence -- three `board.sh role` calls landing a
+# second or two apart -- and a boundary each would put a near-empty row on
+# every call. The cost is small: a movement inside the window describes its row
+# from the row's start, at most this many seconds early, which is invisible at
+# the minute granularity the table prints.
+ROLE_WAVE_SECONDS = 30.0
 
 
 def _run_events(state: dict[str, object]) -> list[dict[str, object]]:
@@ -2479,21 +2486,43 @@ def _board_phrase(said: BoardActivity) -> str:
     return body
 
 
-def _roles_over(changes: list[RoleChange], lower: float, upper: float) -> dict[str, str]:
+def _roles_over(changes: list[RoleChange], upper: float) -> dict[str, str]:
     """What each slot was doing across one stretch of a round.
 
-    The two kinds of board entry are read differently on purpose. A handoff is a
-    movement, so it counts only once it has happened: `at <= lower`. A register
-    is a launcher opening its slot, and the three of them land a second or two
-    apart, so a register anywhere in this stretch describes it from the start --
-    otherwise the opening roll-call reads as two seats sitting idle while the
-    third works, and splits the round into a row per launch.
+    Any entry before the stretch ends describes it from the start. For a
+    register that is the roll-call reasoning: the three launchers land a second
+    or two apart, and reading them strictly would show two seats idle while the
+    third works. For a handoff it holds because `_round_segments` opens a
+    boundary at every movement wave: a handoff inside this stretch is either
+    the movement that opened it or a member of that movement's wave, seconds
+    behind the boundary, and both belong to the whole stretch.
     """
     roles: dict[str, str] = {}
     for change in changes:
-        if change["at"] <= lower if change["kind"] == "handoff" else change["at"] < upper:
+        if change["at"] < upper:
             roles[change["slot"]] = change["role"]
     return roles
+
+
+def _role_movements(changes: list[RoleChange]) -> list[RoleChange]:
+    """The handoffs that changed what their slot was doing.
+
+    Seats re-announce the role they already hold -- an opening `board.sh role`
+    seconds after the launcher registered the same role, or narration routed
+    through `role` because it is the command that takes a note. Neither moves
+    the team, and a row split on one shows three columns identical to the row
+    above with a fresh clock: noise with a timestamp. A movement is a handoff
+    whose role differs from the one its slot was last reported doing, by any
+    entry kind -- a register opens an occupancy with a role, and re-stating that
+    role is no more a movement than re-stating a handoff's.
+    """
+    current: dict[str, str] = {}
+    movements: list[RoleChange] = []
+    for change in changes:
+        if change["kind"] == "handoff" and current.get(change["slot"]) != change["role"]:
+            movements.append(change)
+        current[change["slot"]] = change["role"]
+    return movements
 
 
 def _compact_duration(seconds: int) -> str:
@@ -2670,15 +2699,18 @@ def _round_segments(
         default=max(now, start),
     )
     end = max(end, start)
-    # Only a handoff splits: a register is a launcher opening its slot, and the
-    # three land seconds apart, so splitting on them would put a row on each
-    # launch. A handoff exactly at the round's start opens it rather than
-    # splitting it, and one at or past its end belongs to the round that follows.
+    # Only a movement splits: a register is a launcher opening its slot, and a
+    # handoff that re-states the role its slot already holds moves nothing, so
+    # splitting on either repeats the row above with a fresh clock. A movement
+    # exactly at the round's start opens it rather than splitting it, and one
+    # at or past its end belongs to the round that follows.
     # A seat re-occupied is the other way a round moves on, and the one no
     # handoff marks: a blind reviewer is a fresh session that takes the chair
     # after the writer's has exited, so nothing posts a movement between them.
-    # One boundary per wave rather than per launch -- the seats sit down seconds
-    # apart, and a boundary each would put a near-empty row on every one.
+    # One boundary per wave rather than per movement -- seats converge seconds
+    # apart, and a boundary each would put a near-empty row on every one, so a
+    # candidate within ROLE_WAVE_SECONDS of the boundary before it joins that
+    # boundary's row instead of opening its own.
     occupancies = _slot_occupancies(entry["members"])
     depth = max((len(windows) for windows in occupancies.values()), default=0)
     waves = {
@@ -2689,19 +2721,15 @@ def _round_segments(
         )
         for index in range(1, depth)
     }
-    boundaries = sorted(
-        {start}
-        | {
-            change["at"]
-            for change in changes
-            if change["kind"] == "handoff" and start < change["at"] < end
-        }
-        | {at for at in waves if start < at < end}
-    )
+    candidates = sorted({change["at"] for change in _role_movements(changes)} | waves)
+    boundaries = [start]
+    for at in candidates:
+        if start < at < end and at - boundaries[-1] >= ROLE_WAVE_SECONDS:
+            boundaries.append(at)
     segments: list[tuple[float, float, dict[str, str]]] = []
     for index, lower in enumerate(boundaries):
         upper = boundaries[index + 1] if index + 1 < len(boundaries) else end
-        segments.append((lower, upper, _roles_over(changes, lower, upper)))
+        segments.append((lower, upper, _roles_over(changes, upper)))
     return segments
 
 
@@ -2886,25 +2914,44 @@ def _round_table(
             )
             continue
         segments = _round_segments(entry, changes, now)
+        previous_roles: list[str] = []
         for index, (lower, upper, roles) in enumerate(segments):
             last = index + 1 == len(segments)
-            # The round label names the round once. A continuation row is the
-            # same round in a new shape, and repeating the name there would read
-            # as a second round rather than as the team having moved.
+            # Only the closing row of a live round is the present. Every
+            # earlier segment is a stretch that ended, whatever its seats
+            # are doing now.
+            cells = _round_cells(members, roles, lower, upper, now, running and last, activity)
+            # A continuation row exists because the team moved, and the reader
+            # should not have to diff two rows of cells to find where. The row's
+            # result cell says so in the table's own column terms, from the
+            # rendered cells rather than the board -- what it reports is exactly
+            # what changed on screen, whether a handoff or a re-seated chair
+            # caused it.
+            seat_roles = [cell.split()[0] for cell in cells]
+            moved = ", ".join(
+                f"{SEAT_LABELS[slot]} → {role}"
+                for slot, before, role in zip(ROUND_SLOTS, previous_roles, seat_roles)
+                if role != before and role != "-"
+            )
+            previous_roles = seat_roles
             # The result belongs to the round, which is the granularity the
-            # ledger stamps, so it sits on the row that closes it.
+            # ledger stamps, so it sits on the row that closes it, after the
+            # movement that opened the row if one did.
+            outcome = (
+                _round_result(_round_tally(findings, entry["number"]), running)
+                if last
+                else ""
+            )
+            # The round label names the round once. A continuation row is the
+            # same round with its seats moved, and repeating the name there
+            # would read as a second round rather than as the team having moved.
             rows.append(
                 [
                     entry["label"] if index == 0 else "",
                     _clock_stamp(lower),
                     _compact_duration(int(upper - lower)),
-                    # Only the closing row of a live round is the present. Every
-                    # earlier segment is a stretch that ended, whatever its seats
-                    # are doing now.
-                    *_round_cells(members, roles, lower, upper, now, running and last, activity),
-                    _round_result(_round_tally(findings, entry["number"]), running)
-                    if last
-                    else "",
+                    *cells,
+                    "; ".join(part for part in (moved, outcome) if part),
                 ]
             )
     return RoundTable(

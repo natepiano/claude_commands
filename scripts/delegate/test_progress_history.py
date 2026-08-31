@@ -1396,8 +1396,18 @@ class ProgressHistoryTests(unittest.TestCase):
                 ("", "review 3m running", "review 3m running", "review 3m running", "3m"),
             ],
         )
-        # The seats are all still running, so only the last row can carry one.
-        self.assertEqual([row[6] for row in rows], ["", "", "running"])
+        # A continuation row names the movement that opened it in its result
+        # cell, so the reader is not left diffing two rows of cells to find
+        # where the team moved; the round's tally still sits on the closing
+        # row, after the movement that opened it.
+        self.assertEqual(
+            [row[6] for row in rows],
+            [
+                "",
+                "Agent 3 → impl",
+                "Agent 1 → review, Agent 2 → review, Agent 3 → review; running",
+            ],
+        )
         # Which delegate is in which seat sits under the table, once, and the
         # main agent is left out of it -- the reader is the main agent. Each
         # seat carries its last board line and that line's age, because a role
@@ -1408,6 +1418,75 @@ class ProgressHistoryTests(unittest.TestCase):
                 f"- **{label}** ({slot}) gpt-called high · 3m ago · handoff: converging",
                 header,
             )
+
+    def test_a_role_reannouncement_does_not_split_a_round(self) -> None:
+        """A handoff that re-states the role its slot already holds is not a movement.
+
+        What live runs write: each seat opens with a `board.sh role` seconds
+        after its launcher registered the same role, and a seat routes narration
+        through `role` because it is the command that takes a note. Every such
+        line used to open a near-empty row whose columns matched the row above.
+        """
+        session_dir = self.start_run("reannounce", 52_000)
+        self.start_phase(session_dir, 52_010)
+        # The review slot is recruited to write from second zero, as fe9ae569
+        # ran it: its launcher registers role=impl and its pass kind is impl.
+        for offset, slot, kind in ((0, "impl", "impl"), (3, "review", "impl"), (5, "test", "test")):
+            self.run_board(
+                session_dir, "post", slot, "register", f"role={kind}; up", at=52_020 + offset
+            )
+            self.start_slot_pass(session_dir, slot, kind, 52_020 + offset)
+        # The opening announcements, a second apart, each naming the role the
+        # register already stamped.
+        for offset, slot, kind in ((15, "impl", "impl"), (16, "review", "impl"), (17, "test", "test")):
+            self.run_board(session_dir, "role", slot, kind, "opening task", at=52_020 + offset)
+        # Narration routed through `role`, minutes apart, role unchanged.
+        self.run_board(session_dir, "role", "review", "impl", "rechecking storage", at=53_500)
+        self.run_board(session_dir, "role", "review", "impl", "validating exports", at=54_100)
+        self.team_slot = ""
+        rows = self.table_rows(
+            self.run_progress(session_dir, 54_400),
+            ["Stage", "Start", "Elapsed", "Agent 1", "Agent 2", "Agent 3", "Result"],
+        )
+        # One row: nothing moved, so nothing splits.
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(
+            (rows[0][0], *rows[0][3:6]),
+            ("Impl", "impl 39m running", "test 39m running", "impl 39m running"),
+        )
+
+    def test_movements_seconds_apart_are_one_row(self) -> None:
+        """Seats converging one `board.sh role` at a time is one movement.
+
+        The calls land seconds apart because the seats run in sequence, and a
+        boundary per call would put a near-empty row on each. One boundary, and
+        the roles the later calls carry describe the row from its start.
+        """
+        session_dir = self.start_run("converge", 55_000)
+        self.start_phase(session_dir, 55_010)
+        for slot, role in (("impl", "impl"), ("test", "test"), ("review", "impl")):
+            self.run_board(session_dir, "post", slot, "register", f"role={role}; up", at=55_020)
+            self.start_slot_pass(session_dir, slot, role, 55_020)
+        for offset, slot in ((300, "impl"), (302, "test"), (304, "review")):
+            self.run_board(session_dir, "role", slot, "review", "converging", at=55_020 + offset)
+        self.team_slot = ""
+        rows = self.table_rows(
+            self.run_progress(session_dir, 55_500),
+            ["Stage", "Start", "Elapsed", "Agent 1", "Agent 2", "Agent 3", "Result"],
+        )
+        self.assertEqual(
+            [(row[0], *row[3:6], row[6]) for row in rows],
+            [
+                ("Impl", "impl 5m done", "test 5m done", "impl 5m done", ""),
+                (
+                    "",
+                    "review 3m running",
+                    "review 3m running",
+                    "review 3m running",
+                    "Agent 1 → review, Agent 2 → review, Agent 3 → review; running",
+                ),
+            ],
+        )
 
     def test_a_second_round_is_a_second_row(self) -> None:
         """A repair round is a row of its own, named by the number it carries."""
