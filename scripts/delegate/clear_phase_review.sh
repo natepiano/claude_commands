@@ -28,6 +28,11 @@ FILES=(
   "${SESSION_DIR}"/review_prompt_*.md
   "${SESSION_DIR}"/review_findings_*.txt
   "${SESSION_DIR}"/review_agent_*.log
+  # A phase's broad review runs one reviewer per lens, and each suffixes its own
+  # copy of the four unnumbered names above.
+  "${SESSION_DIR}"/review_findings_*
+  "${SESSION_DIR}"/review_agent_*
+  "${SESSION_DIR}"/review_status_*
 )
 
 if ((${#FILES[@]})); then

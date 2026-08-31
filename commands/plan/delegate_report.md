@@ -62,7 +62,8 @@ Everything below is the contract.
 
    Include the override reason only when rejecting an applicable calibrated
    value. **Copy its Markdown output byte-for-byte** — the scope line,
-   both tables with every row and cell, the delegates lines, and the wall clock.
+   both tables with every row and cell, the `Earlier:` line above the round
+   table when there is one, the delegates lines, and the wall clock.
    Never reorder, edit, or omit any part of it: the recorder owns every column,
    duration format, and ETA band. When step 4 has armed an early reviewer, say
    below the tables that the writer and the reviewer are working at once.
@@ -77,6 +78,12 @@ Everything below is the contract.
    `- **Agent 2** (test) …` — then the agent sitting in that seat and the last
    thing it said: the seat's own words, never the launcher's. A lone reviewer
    between rounds sits in the `Agent 3` column on a row of its own.
+
+   The table carries the phase's **last three stages**, not all of them. An
+   `Earlier:` line above it names what the cap left out, and the phase began
+   there, not at the table's first row — never describe a phase as newly opened
+   because its earlier rounds are off the table. When the user asks about work
+   that line covers, answer from `timeline`, which still renders every pass.
 7. Add two or three ordinary-English sentences under <UserFacingText/>: open
    with what this phase gives the person using the tool, then its movement and
    what remains. One topic per sentence, no more than two clauses; when a topic

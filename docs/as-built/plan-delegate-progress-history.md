@@ -258,6 +258,20 @@ columns, each cell naming what that seat is doing and how long it has been doing
 it — `fix 11m`, `review 13m`. Under the table sits the running round's activity
 sentence, which no fixed-width column can carry, and then the wall clock.
 
+The table draws the last three stages only. A stage is one labelled unit of the
+phase — a round, a lone review, a run of verification — and a long phase runs
+dozens of them: the one that prompted the cap reached ten repair rounds and
+eleven verifications, and its table ran sixty rows that were scrolled past
+rather than read. Consecutive entries sharing a label count as a single stage,
+so a run of verifications between two repair rounds spends one of the three
+slots instead of all three and cannot push the work that produced it off the
+bottom. Each stage the table keeps renders every row it owns, because a row is
+not a unit anyone asks for — the question is what happened over the last few
+stages, and a stage answers it whole. What the cap removed is named in one line
+above the table, `*Earlier: 21 stages not shown - Impl through Fix 9.*`, so a
+phase eleven hours deep cannot read as one that has barely started; `timeline`
+still renders the full history on demand.
+
 A row per *pass* cannot do this once a phase team exists. The three seats launch
 within the same second, so a per-pass table repeats one Start three times and
 learns nothing from it; worse, attributing findings by the interval from one row
@@ -316,14 +330,26 @@ carries both identities per pass for anyone reconstructing a run after the fact.
 
 Windows that sit in no round keep a row apiece, named as they always were: a
 main-agent activity, which holds no seat, and every pass that records none — a
-solo run's, and the closure or broad reviewer `review.sh` launches between
-rounds. Such a pass is drawn in the seat its kind names — `review 9m` under
+solo run's, and the closure reviewer `review.sh` launches between rounds. A
+broad review's three lens reviewers do record seats and join the round they
+read, one row below the writers. Such a seatless pass is drawn in the seat its
+kind names — `review 9m` under
 Agent 3, `impl 3m` under Agent 1 — so a reader scanning the review seat's
 column for the closure review finds it rather than three dashes; an activity
 names no seat and keeps them. These rows keep the per-window finding attribution — the interval
 running to whatever opened next — which is wrong for concurrent seats and
 exactly right for the sequential windows that still reach it. An early-armed reviewer joins the round it reads when there is
 one, and otherwise keeps its own row beside the writer.
+
+A round splits into a further row wherever a seat is occupied a second time,
+because that is a move no `handoff` marks: the writers' sessions have
+exited and the reviewers that take their chairs are fresh read-only ones that
+post no movement. The whole wave takes one boundary rather than one per launch,
+and each cell reports the occupancy that stretch falls in — so a phase reads
+`impl / test / impl` on one row and `review / review / review` on the next,
+with the round's result on the row that closes it. A later occupancy reports the
+kind its own pass recorded: the role the last occupant left on the board
+describes work that is already over.
 
 Window names come from the pass kind and its position among that kind in the
 phase — `Impl`, `Fix 1`, `Fix 2` — and a fix carries the round the ledger

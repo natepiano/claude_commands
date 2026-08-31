@@ -124,6 +124,43 @@ Applies to every implementation, test, fix, and review launcher.
    active; its terminal result drives the next workflow step.
 </DispatchContract>
 
+<DelegateLaunchFailure>
+A dispatch that dies in seconds never reached the provider, and a provider
+message it prints is a message some earlier call received. Seats launched
+together that fail within seconds of each other carrying **byte-identical text,
+the same retry-at timestamp included, are a local fault**: separate API calls do
+not produce identical text. Confirm it against
+`${SESSION_DIR}/mesh_server.log` — a launch that got out of this machine wrote
+to it, and one that added no line was answered by the session's own
+`codex app-server` from what it had cached. Never report delegates as
+unavailable, or a usage limit as reached, on the error text alone.
+
+`codex exec` cannot test this and must not be used to. It opens its own process
+against the API, where a dispatch attaches a thread to the long-lived server
+recorded in `${SESSION_DIR}/mesh_server.json` — a different path that can fail
+while `codex exec` answers. That disagreement is the wedged server's signature,
+not evidence delegates are back. The only valid probe is the dispatch itself.
+
+The launcher already tried. On a fast failure with no work done, `codex_mesh.py`
+abandons the inherited server, starts one of its own and runs the seat again,
+printing `retrying on a new app-server` to the seat's log. So an error that
+reaches you has usually already been tested against a clean server and is real.
+Read the log for that line before doing anything by hand: present, the retry
+happened and the failure survived it; absent, the launcher held back — the seat
+had already done work, or the failure took too long to be local — and the
+paragraphs above are yours to apply.
+
+Recovering by hand, in that case only. Check that no peer run claims the
+recorded pid or port before signalling anything —
+`grep -l '<pid>\|<port>' /tmp/claude/delegate/*/mesh_server.json` should name
+only this session's file, and any second file means leave the process alone.
+Then kill that pid, move `mesh_server.json` aside, and relaunch verbatim; the
+next launcher starts a fresh server. Leave `mesh_roster.json` alone — its other
+entries may name threads still live on a server that is fine. If the log **is**
+growing and the error arrives new on each launch, the limit is real and none of
+this applies.
+</DelegateLaunchFailure>
+
 <CodexDispatchWait>
 Codex only; no timer process:
 
@@ -220,16 +257,27 @@ Every implementation or fix prompt contains these sections once:
    session has no output redirect, so a summary left only in the reply is a
    summary the orchestrator never sees. State this slot's file set and the
    peers' file sets per <TeamFilePartition/>, and that a peer's file is blocked
-   rather than merged.
+   rather than merged. The summary also carries the three things no reader can
+   recover from the diff: **what this slot is unsure about, what it could not
+   verify, and what it touched outside its file set**. No reviewer receives a
+   summary, so a doubt left unstated arrives at review as a line of code that
+   looks deliberate.
 3. Narration: before each activity, run
    `bash ~/.claude/scripts/delegate/board.sh post <concrete SESSION_DIR> <slot> status "<activity>"`.
    Use short present-tense text and never read the heartbeat file. Role
    changes: **before the first tool call in a new role** — recruited into
-   writing, converging on review, standing down — run
+   writing, taking a slice of the test work, standing down — run
    `bash ~/.claude/scripts/delegate/board.sh role <concrete SESSION_DIR> <slot> <impl|fix|test|review> "<why>"`,
    written out with the real path and this slot's name. A `status` sentence
    saying the same thing does not count: the table reads the `role=` field,
    and a move that is not posted is a row the run never shows.
+
+   **The slot in every one of these commands is this prompt's slot.** Composing
+   three prompts from one draft carries the first slot into all three, and the
+   board then reads as one seat doing the whole round while two sit silent —
+   the attribution the required argument exists to keep. Nothing downstream can
+   catch it, because each post is well-formed. Before dispatch, check that the
+   three prompts name three different slots.
 4. `## Team` — state the opening from Seats (`2 writers + 1 tester`, and the
    role each slot opens in), then name the three concurrent slots and who holds
    which files, each hub file with its one owner. Copy
@@ -289,7 +337,7 @@ opens as the table says, with the partition decided at launch per
 
 A slot is an identity and never changes. What a slot is *doing* is its **role**,
 and roles move during a phase per <RoleReassignment/>. Everything downstream —
-the board, the progress table, the review split — reads the slot for identity
+the board, the progress table, every artifact name — reads the slot for identity
 and the role for activity, so keep the two distinct: `review` doing
 implementation work is still slot `review`.
 
@@ -338,8 +386,9 @@ cannot relay. Each `register` line says which case holds, in its `mesh=` field.
 - `board.sh role <session_dir> <slot> <impl|fix|test|review> [note]` — **call
   this the moment your slot starts doing something other than what it is named
   for.** A slot is a fixed identity and its role is not: a `review` slot
-  recruited into writing is doing `impl`, and every slot converges on `review`
-  at the end. The launcher stamps the opening role, so the table is never blank;
+  recruited into writing is doing `impl`, and a writer that takes a slice of the
+  remaining test work is doing `test`. The launcher stamps the opening role, so
+  the table is never blank;
   after that only this command keeps it true, and saying it in a `status`
   sentence does not count — the table reads the field, not prose. **Every call
   adds a row**, so a change you do not post is a shape the run never shows, and
@@ -496,34 +545,37 @@ work a peer might hand over later.
 </RoleReassignment>
 
 <TeamReview>
-When a phase reaches review, all three slots review — but never as three
-readings of the same question, which buys one opinion three times.
+A phase's broad review runs **three reviewers at once**, never one — and never
+three readings of the same question, which buys one opinion three times. Each
+takes a **lens**, disjoint and named in its prompt:
 
-**One slot is adversarial, and it is a slot that did not write the code under
-review.** Its brief is to break the change, not to check it: find the input that
-violates a stated invariant, the caller that was not updated, the state the new
-code cannot reach, the test that passes for the wrong reason. It reports the
-concrete failing case, or reports plainly that it could not construct one.
-Normally this is `review`; where `review` was recruited into implementation, it
-is whichever slot wrote least of the code under review. An author is never the
-adversary for its own file set. With three writers no seat is a non-author of
-everything, so each seat takes the adversarial brief over a file set it did not
-write, assigned cross-wise, and the two aspects below are dealt out across the
-same three seats on the same rule.
+| Lens | Reads for | Seat |
+| --- | --- | --- |
+| `adversary` | the failing case — the input that violates a stated invariant, the caller that was not updated, the state the new code cannot reach, the test that passes for the wrong reason | `review` |
+| `conformance` | what the Work Order says, including every part no test covers, and anything built that it never asked for | `impl` |
+| `reach` | callers, consumers, public API, traits, registration, plugin wiring, and the invariants and transitions the change reaches without naming | `test` |
 
-**The other two take different aspects**, disjoint and named in their prompts:
+No reviewer wrote any of the code — each is a fresh session per
+<ReviewPromptContract/> — so no lens has to be kept away from its own work and
+no assignment turns on who wrote what. **The seat is an address, not a
+judgment**: it names the column the
+reviewer occupies in the progress table and the suffix on its files, and
+`review.sh` derives it from the lens — so the lens is the only thing a call site
+chooses, and the two can never disagree.
 
-- **Specification conformance** — does the change do what the Work Order says,
-  including the parts no test covers, and does `${IMPL_SUMMARY}` describe what
-  the diff actually contains.
-- **Blast radius** — callers, consumers, public API, traits, registration,
-  plugin wiring, invariants and transitions the change reaches without naming.
+The adversary's brief is to break the change, not to check it. It reports the
+concrete failing case it built, or reports plainly that it could not build one:
+"no failing case found" from a reader who was trying is evidence, and it is the
+only reading here that produces evidence by finding nothing.
 
-Each posts findings to the board under its own slot, so <Synthesize/> can tag
-who caught what and can tell three independent findings from one finding found
-three times. The adversarial verdict is reported even when it is empty: "no
-failing case found" from a reader who was trying to build one is evidence, and
-it is the only reading here that produces evidence by failing to find anything.
+Findings come back as one `review_findings_<pass>_<lens>.txt` per lens. A
+read-only session cannot post to the board, so that file is the whole record —
+<Synthesize/> reads all three, tags each finding with the lens that caught it,
+and can tell three independent findings from one finding found three times.
+
+**A repair is not reviewed this way.** <ClosureReview/> is one reader over one
+batch of ids, and splitting a path-limited read three ways buys three passes
+over the same few hunks.
 </TeamReview>
 
 <ReviewPromptContract>
@@ -535,6 +587,9 @@ Do not repeat the implementer's listed verification or audit style. A reviewer
 may run one specific omitted check only when a plausible regression lies outside
 the listed gate, and must name that command. Broad reviews apply
 <TypeDesignContract/>; closure reviews apply only <ClosureReview/>.
+
+A broad review's prompt names its lens per <TeamReview/> and asks that lens's
+questions and no others; a closure review names no lens.
 </ReviewPromptContract>
 
 <VerificationContract>
@@ -641,7 +696,10 @@ unowned call.
 The one exception is a launcher the main agent killed — the <DualReview/>
 preemption. Close that slot's open pass with `finish-pass --status canceled
 --orphaned-launcher`, which the recorder accepts only for `canceled` and only
-while a pass is open. A killed fix dispatch leaves its findings
+while a pass is open. The slot comes from `PLAN_DELEGATE_TEAM_ROLE` on the call
+and never from the record — a launcher closes its own pass and nothing else, so
+the main agent standing in for one names the seat it is standing in for, once
+per killed launcher. A killed fix dispatch leaves its findings
 `repair_in_flight` for the same reason, so `findings.py abandon` per
 <FindingsLedger/> belongs beside this call.
 
@@ -1136,11 +1194,13 @@ not a phase-title list or type table alone, owns batch authorization.
    `impl_status_review`; the phase is done only when all three are terminal.
    `implemented` on `impl` loads `impl_summary_impl.txt` into
    `${IMPL_SUMMARY}`; read the other two summaries for what they completed and
-   for findings they posted. If `impl` errors, cancel any early-launched
-   reviewer per <EarlyReviewArm/>, apply <RetainDelegatedPhaseReservation/>,
-   report `impl_agent_impl.log`, record
-   `finish-run --status error`, run `end_session.sh`, and stop; multi-phase runs
-   also emit <RunSummary/>.
+   for findings they posted. If `impl` errors, apply <DelegateLaunchFailure/>
+   first — a seat that died in seconds is resolved there, not reported. A
+   genuine error then cancels any early-launched
+   reviewer per <EarlyReviewArm/>, applies <RetainDelegatedPhaseReservation/>,
+   reports `impl_agent_impl.log`, records
+   `finish-run --status error`, runs `end_session.sh`, and stops; multi-phase
+   runs also emit <RunSummary/>.
 8. `implemented` is the delegate's claim, not a passed gate. Read
    `${IMPL_SUMMARY}` for a verification line it left running, unread, or
    unmentioned — "still running", "I'll report once it completes", a listed
@@ -1201,18 +1261,27 @@ At an eligible tick, in that same tick:
 3. Apply <ReviewDiffContract/> to the current partial tree. The delegate has
    named no created files yet, so that check is vacuous; the snapshot is
    expected to be incomplete.
-4. Write the applicable early-form prompt — <BroadReviewPrompt/> for pass 1,
-   <ClosureReview/> for a fix — including the completion estimate, the partial
-   diff, and the exact final-diff and ready-sentinel paths below.
-5. Launch `review.sh` exactly as <DualReview/> step 3 does, appending one extra
-   final argument: `${SESSION_DIR}/final_diff_${REVIEW_PASS}.ready`. Save the
+4. Write the applicable early-form prompt — the `adversary` lens of
+   <BroadReviewPrompt/> for pass 1, <ClosureReview/> for a fix — including the
+   completion estimate, the partial diff, and the exact final-diff and
+   ready-sentinel paths below. **Only the adversary arms early.** It is the lens
+   that gains most from the extra time, and arming all three against a partial
+   tree would triple the exposure to the void verdict below; the other two
+   launch at completion under <DualReview/> step 3.
+5. Launch `review.sh` exactly as <DualReview/> step 3 does — with `adversary`
+   as its lens for pass 1 — appending one extra final argument:
+   `${SESSION_DIR}/final_diff_${REVIEW_PASS}.ready`. Save the
    handle as `${REVIEW_DISPATCH_HANDLE}` and set `EARLY_REVIEW=launched`. Leave
    `${DISPATCH_HANDLE}` and the tick's timer re-arm untouched.
 6. Before the recorder call in <ProgressContract/> step 5, put the reviewer in
    the round table:
 
-   `python3 ~/.claude/scripts/delegate/progress_history.py arm-review --session-dir "${SESSION_DIR}" --activity "<what this reviewer is checking>" --called-task delegate.review`
+   `python3 ~/.claude/scripts/delegate/progress_history.py arm-review --session-dir "${SESSION_DIR}" --activity "<what this reviewer is checking>" --called-task delegate.review [--lens adversary]`
 
+   Pass the same lens the launch carries, and none where the launch carries
+   none: the marker names the status and pid files it will watch for, and a
+   marker watching the unsuffixed pair while the launcher writes the suffixed
+   one retires the row on its first tick, reporting a live reviewer as gone.
    It is a presentation marker, not a pass event, so it cannot forge anything
    convergence counts. It resolves the same reviewer `review.sh` will, retires
    its row when `review.sh` errors or its process is gone, and is superseded
@@ -1228,7 +1297,7 @@ always may — early launch is opportunistic, never required.
 | Event | Required action |
 | --- | --- |
 | Primary completes | After <LaunchImplementation/> step 7, write the final diff to `${SESSION_DIR}/final_diff_${REVIEW_PASS}.diff` — a closure review stays limited to its paths per <ClosureReview/> — then create `${SESSION_DIR}/final_diff_${REVIEW_PASS}.ready`. **Never create the sentinel before the diff is fully written.** |
-| Primary errors, or the run stops | Kill the early reviewer. If the sentinel exists, close its pass with `finish-pass --status canceled --orphaned-launcher` per <PassOwnership/>; before the sentinel no pass was recorded, so record nothing — a pre-sentinel kill counts toward no advisory, including the blind-review cancellation one. |
+| Primary errors, or the run stops | Kill the early reviewer. If the sentinel exists, close its pass with `PLAN_DELEGATE_TEAM_ROLE=review … finish-pass --status canceled --orphaned-launcher` per <PassOwnership/> — the seat the `adversary` lens sits in; before the sentinel no pass was recorded, so record nothing — a pre-sentinel kill counts toward no advisory, including the blind-review cancellation one. |
 | Reviewer errors before delivery | Report it in one line, clear `${REVIEW_DISPATCH_HANDLE}`, set `EARLY_REVIEW=none`, and leave the numbered artifacts. The primary continues and is reviewed synchronously at completion under the next `${REVIEW_PASS}` index. |
 | A verdict arrives before delivery | **It is void.** The reviewer cannot have read a diff that does not exist yet, so discard its findings entirely rather than reading them as evidence: open nothing in the ledger, preempt nothing, route no blocker into a fix dispatch. Say in one line that it is discarded and why, then follow the reviewer-error row. A void verdict is often fluent and specific — a stale diff supports confident claims about missing work — so the check is the timing, never how convincing the text reads. |
 
@@ -1243,7 +1312,8 @@ reaches the record, and it is what keeps that report from having to guess.
 </EarlyReviewArm>
 
 <BroadReviewPrompt>
-Write `${SESSION_DIR}/review_prompt_${REVIEW_PASS}.md` under
+Write one prompt per lens at
+`${SESSION_DIR}/review_prompt_${REVIEW_PASS}_<lens>.md`, each under
 <ReviewPromptContract/> with:
 
 ```
@@ -1255,6 +1325,14 @@ code as needed. Report a numbered list; each item has a title, file:line,
 - nit: non-behavioral quality; style-guide conformance is out of scope
 End with APPROVE, APPROVE WITH FIXES, or REQUEST CHANGES. Do not invent findings.
 
+## Your lens
+[the lens name and what it reads for, from <TeamReview/>]
+
+Two other reviewers are reading this same diff under the other two lenses.
+Report only what yours covers: a finding another lens owns is that lens's to
+make, and duplicating it costs the synthesis a second opinion and buys a
+count instead.
+
 ## Specification
 [implementer's Work Specification verbatim]
 
@@ -1265,17 +1343,28 @@ End with APPROVE, APPROVE WITH FIXES, or REQUEST CHANGES. Do not invent findings
 [complete diff]
 
 ## Review Questions
-1. Complete and correct against the specification?
-2. Bugs, missed edges, or broken error handling?
-3. Unrequested implementation?
-4. Consistent with surrounding code?
-5. Are domain types clear, and are owned bare Option<T> values replaced or
-   justified at an external boundary?
+[this lens's questions, below, and no others]
 ```
 
-**Early form** (an <EarlyReviewArm/> launch only): the `## Diff` section holds
-the partial diff at launch, and an `## Implementation status` section is
-inserted before it:
+The questions are the lens, so each prompt carries only its own:
+
+- `adversary` — 1. What input, state, or ordering makes this change do the wrong
+  thing? 2. Which caller or consumer of a changed symbol was left behind?
+  3. Which test passes for a reason other than the behavior it names? Close with
+  the failing case you constructed, or with a plain statement that you could not
+  construct one.
+- `conformance` — 1. Complete and correct against the specification? 2. Anything
+  implemented that it did not ask for? 3. Consistent with surrounding code?
+  4. Are domain types clear, and are owned bare Option<T> values replaced or
+  justified at an external boundary?
+- `reach` — 1. What does the change reach without naming: callers, consumers,
+  public API, traits, registration, plugin wiring? 2. Which invariants or state
+  transitions does it change, and what still assumes the old ones? 3. Bugs,
+  missed edges, or broken error handling in what it reaches?
+
+**Early form** (an <EarlyReviewArm/> launch, which arms the `adversary` alone):
+the `## Diff` section holds the partial diff at launch, and an
+`## Implementation status` section is inserted before it:
 
 ```
 ## Implementation status
@@ -1300,37 +1389,60 @@ of reviewing the partial diff.
 </BroadReviewPrompt>
 
 <DualReview>
-1. If `EARLY_REVIEW=launched`, the reviewer is already armed and
+1. If `EARLY_REVIEW=launched`, the `adversary` is already armed and
    `${REVIEW_PASS}` already incremented: apply <ReviewDiffContract/> to the
    completed tree, deliver the final diff and ready sentinel per
-   <EarlyReviewArm/>, reset `EARLY_REVIEW=none`, and skip to step 4 with
-   `${REVIEW_DISPATCH_HANDLE}` as the blind-review handle. Otherwise increment
-   `${REVIEW_PASS}`. Pass 1 uses <BroadReviewPrompt/> over the whole
-   phase; later passes use <ClosureReview/> over one repair.
-2. Apply <ReviewDiffContract/> and create the applicable prompt.
-3. Launch
-   `bash ~/.claude/scripts/delegate/review.sh "${SESSION_DIR}"
-   "${WORKING_DIR}" "${SESSION_DIR}/review_prompt_${REVIEW_PASS}.md" review
-   "<responsibility>" "<activity>" "${REVIEW_PASS}"` under
-   <DispatchContract/>. Keep the blind-review handle.
-4. While it runs, perform the main review. Pass 1 reads changed code in risk
+   <EarlyReviewArm/>, reset `EARLY_REVIEW=none`, and keep
+   `${REVIEW_DISPATCH_HANDLE}` as that lens's handle. Otherwise increment
+   `${REVIEW_PASS}`. Pass 1 is the phase's broad review and runs the three
+   lenses of <TeamReview/> over <BroadReviewPrompt/>; later passes are one
+   reviewer over one repair, per <ClosureReview/>.
+2. Apply <ReviewDiffContract/> and create every prompt the pass needs.
+3. Launch each reviewer under <DispatchContract/>, pass 1's in one message so
+   they run concurrently — the two remaining lenses when the adversary was armed
+   early, all three otherwise:
+
+   ```sh
+   bash ~/.claude/scripts/delegate/review.sh "${SESSION_DIR}" "${WORKING_DIR}" \
+     "${SESSION_DIR}/review_prompt_${REVIEW_PASS}_<lens>.md" review \
+     "<responsibility>" "<activity>" "${REVIEW_PASS}" <lens>
+   ```
+
+   A closure review passes no lens and keeps the unsuffixed artifacts:
+
+   ```sh
+   bash ~/.claude/scripts/delegate/review.sh "${SESSION_DIR}" "${WORKING_DIR}" \
+     "${SESSION_DIR}/review_prompt_${REVIEW_PASS}.md" review \
+     "<responsibility>" "<activity>" "${REVIEW_PASS}"
+   ```
+
+   Keep every blind-review handle; one progress timer covers the whole set, as
+   it does for a phase team.
+4. While they run, perform the main review. Pass 1 reads changed code in risk
    order: Work Order paths, public API/traits/registration/plugin wiring, then
    remaining hunks. Verify spec, extras, codebase fit, <TypeDesignContract/>, and
-   `${IMPL_SUMMARY}` claims without loading or auditing the style guide. State
-   any honest coverage limit. Later passes read only repair paths and affected
-   callers, consumers, transitions, or invariants.
+   `${IMPL_SUMMARY}` claims without loading or auditing the style guide. The
+   summaries' self-reports per <WritePromptContract/> — what a slot was unsure
+   about, what it could not verify, what it touched outside its file set — are
+   this read's alone: no lens receives a summary, so a stated doubt is a place
+   only the main review can go looking. Say where this read did not reach. Later
+   passes read only repair paths and affected callers, consumers, transitions,
+   or invariants.
 5. If this main pass confirms a substantial, unambiguous spec-defined defect
-   while the blind review remains active, read its log once, cancel it, record
-   `finish-pass --status canceled --orphaned-launcher` per <PassOwnership/>,
-   open and gate the finding, and apply
-   <FixDispatch/> with useful partial-review evidence. Preempt at most once per
-   phase; never edit while an old-diff review remains active. A canceled review
-   supplies no verdict or direct-fix agreement.
-6. Otherwise finish the main pass and let <DispatchContract/> await the blind
-   reviewer by its host-specific path. On completion, `reviewed` loads
-   `review_findings.txt` into `${AGENT_REVIEW}`. On `error`, report it and
-   continue explicitly with the main review alone. Numbered artifacts remain
-   available through the unnumbered symlinks.
+   while blind reviewers remain active, read each log once, cancel them all, and
+   close each one's own pass with
+   `PLAN_DELEGATE_TEAM_ROLE=<seat> … finish-pass --status canceled
+   --orphaned-launcher` per <PassOwnership/>, then open and gate the finding and
+   apply <FixDispatch/> with useful partial-review evidence. Preempt at most once
+   per phase; never edit while an old-diff review remains active. A canceled
+   review supplies no verdict or direct-fix agreement.
+6. Otherwise finish the main pass and let <DispatchContract/> await every blind
+   reviewer by its host-specific path. Each `reviewed` loads its own
+   `review_findings_${REVIEW_PASS}_<lens>.txt` — a closure review, its unnumbered
+   symlink — into `${AGENT_REVIEW}`. A lens that reports `error` is named in one
+   line and the pass continues on the readings that landed, so the synthesis
+   records which lens is missing rather than presenting two as three. Numbered
+   artifacts remain available.
 </DualReview>
 
 <ClosureReview>
@@ -1403,8 +1515,8 @@ repairs.
 
 A repair runs the same three slots as a phase, per <PhaseTeam/>. The default
 opening is `fix` / `test` / `review`: `impl` makes the repair, `test` writes
-the regression test that would have caught each finding, and `review` opens
-adversarially on the repair under <TeamReview/> — the reading most likely to
+the regression test that would have caught each finding, and `review` reads the
+repair cold against the ids it claims to close — the reading most likely to
 catch a fix that closes a finding by weakening what detects it. Partition the
 findings' files per <TeamFilePartition/> and write one prompt per slot; `test`
 covers the same batch ids from the outside. When the batch's files partition
@@ -1454,6 +1566,7 @@ defect the repair introduced. Uncertainty routes to the reviewer. Judge the
 paths the diff touched, never how confident the reading felt.
 
 On completion, `implemented` continues as above; `error` applies
+<DelegateLaunchFailure/>, and then, if the error survives it,
 <RetainDelegatedPhaseReservation/>, reports the fix log, records an error
 outcome, clears the session marker, and stops. Both outcomes resolve the round
 in the ledger through the launcher. Any third outcome — the dispatch stopped,
@@ -1464,8 +1577,12 @@ reporting anything about the round.
 </FixDispatch>
 
 <Synthesize>
-1. Merge delegate and main findings, dedupe real issues, tag who caught each,
-   and discard refuted findings with a concrete explanation.
+1. Merge every lens's findings with the main review's, dedupe real issues, tag
+   the lens or reader that caught each, and discard refuted findings with a
+   concrete explanation. Three lenses landing on one hunk is one finding with
+   three witnesses, not three findings; three lenses disagreeing about that hunk
+   is a reviewer disagreement, which <DelegationResultFormat/> reports rather
+   than resolves by majority.
 2. Present <DelegationResultFormat/>. If the user is confused, apply
    <ExplainOnDemand/> before any choice.
 3. If all remaining issues are doc-only or one/two-line mechanical changes and

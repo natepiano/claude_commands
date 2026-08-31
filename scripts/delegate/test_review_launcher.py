@@ -107,7 +107,7 @@ class ReviewLauncherPassTests(unittest.TestCase):
         agents = self.root / "scripts" / "agents"
         delegate.mkdir(parents=True)
         agents.mkdir(parents=True)
-        for name in ("review.sh", "progress_history.py"):
+        for name in ("review.sh", "progress_history.py", "board.sh"):
             _ = shutil.copy2(DELEGATE_DIR / name, delegate / name)
         for name in ("agents_config.sh", "heartbeat.sh", "heartbeat_watch.sh"):
             _ = shutil.copy2(AGENTS_DIR / name, agents / name)
@@ -162,13 +162,16 @@ class ReviewLauncherPassTests(unittest.TestCase):
         )
         return session_dir
 
+    def review_command(self, session_dir: Path, lens: str, ready_file: str) -> list[str]:
+        return [
+            "bash", str(self.review_script), str(session_dir), str(self.working_dir),
+            str(self.prompt_file), "review", "blind review", "reviewing the diff",
+            "1", lens, ready_file,
+        ]
+
     def run_review(self, session_dir: Path, ready_file: Path) -> subprocess.CompletedProcess[str]:
         return subprocess.run(
-            [
-                "bash", str(self.review_script), str(session_dir), str(self.working_dir),
-                str(self.prompt_file), "review", "blind review", "reviewing the diff",
-                "1", str(ready_file),
-            ],
+            self.review_command(session_dir, "", str(ready_file)),
             check=False,
             capture_output=True,
             text=True,
@@ -239,6 +242,65 @@ class ReviewLauncherPassTests(unittest.TestCase):
                 ("pass_finished", "review"),
             ],
         )
+
+    def test_three_lenses_run_at_once_without_overwriting_each_other(self) -> None:
+        """The whole reason the lens exists: three reviewers, one session dir.
+
+        Unsuffixed artifacts and a shared pass slot made the three reviewers of
+        a broad review destroy each other's work -- the last launched owned
+        every file, and each start-pass closed the one before it as interrupted,
+        leaving the ledger describing whichever happened to finish last.
+        """
+        session_dir = self.start_implementation("lenses")
+        self.recorder("finish-pass", "--session-dir", str(session_dir), "--status", "completed")
+        lenses = ("adversary", "conformance", "reach")
+
+        running = [
+            subprocess.Popen(
+                self.review_command(session_dir, lens, ""),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                env=self.environment(),
+            )
+            for lens in lenses
+        ]
+        for process in running:
+            _, errors = process.communicate(timeout=120)
+            self.assertEqual(process.returncode, 0, errors)
+
+        for lens in lenses:
+            self.assertEqual(
+                (session_dir / f"review_status_{lens}").read_text().strip(), "reviewed"
+            )
+            self.assertTrue((session_dir / f"review_findings_1_{lens}.txt").is_file())
+            self.assertTrue((session_dir / f"review_agent_1_{lens}.log").is_file())
+
+        recorded = [
+            (event["event_type"], event.get("pass_kind"), event.get("team_slot"))
+            for event in self.pass_events("lenses")
+        ]
+        self.assertEqual(
+            sorted(entry for entry in recorded if entry[1] == "review"),
+            sorted(
+                [
+                    ("pass_started", "review", slot)
+                    for slot in ("review", "impl", "test")
+                ]
+                + [
+                    ("pass_finished", "review", slot)
+                    for slot in ("review", "impl", "test")
+                ]
+            ),
+        )
+        self.assertNotIn(
+            "interrupted",
+            [str(event.get("pass_status")) for event in self.pass_events("lenses")],
+        )
+
+        board = (session_dir / "board.log").read_text(encoding="utf-8")
+        for slot in ("impl", "test", "review"):
+            self.assertIn(f"[{slot}] register:", board)
 
     def test_the_wrapper_names_a_verdict_it_did_not_record(self) -> None:
         session_dir = self.start_implementation("void")

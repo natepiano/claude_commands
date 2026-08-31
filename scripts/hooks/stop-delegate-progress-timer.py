@@ -63,7 +63,13 @@ def running_work(session_dir: Path) -> str:
     """A short name for work in flight, or an empty string when idle."""
     if _text(session_dir / "impl_status") == "implementing":
         return "an implementation or fix pass"
-    if _text(session_dir / "review_status") == "reviewing":
+    # One name per lens when a broad review runs all three at once, and the
+    # unsuffixed one when a single reviewer does; any of them still reviewing
+    # is work in flight.
+    if any(
+        _text(path) == "reviewing"
+        for path in session_dir.glob("review_status*")
+    ):
         return "a review pass"
     state_text = _text(session_dir / "progress_history_state.json")
     if state_text:

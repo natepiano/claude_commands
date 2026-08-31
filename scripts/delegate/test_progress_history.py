@@ -1862,6 +1862,104 @@ class ProgressHistoryTests(unittest.TestCase):
         # seat its kind names.
         self.assertEqual(rows[0][:4], ["Impl", "impl 3m", "-", "-"])
 
+    def test_a_run_of_verifications_counts_as_one_stage(self) -> None:
+        """Consecutive windows sharing a label spend one of the table's slots."""
+        self.write_full_config()
+        started_at = 61_000
+        session_dir = self.start_run("verifications", started_at)
+        _ = self.run_command(
+            "start-phase",
+            "--session-dir",
+            str(session_dir),
+            "--phase-id",
+            "9",
+            "--phase-title",
+            "Retry budget",
+            at=started_at,
+        )
+        self.run_pass(
+            session_dir,
+            "impl",
+            0,
+            "writing the retry budget",
+            started_at + 10,
+            started_at + 200,
+        )
+        # A repair round triggers verification more than once -- a failure, a
+        # rerun, the scoped test that follows it -- and they land within a
+        # minute of each other.
+        for index in range(3):
+            _ = self.run_command(
+                "start-activity",
+                "--session-dir",
+                str(session_dir),
+                "--label",
+                "Verification",
+                "--activity",
+                "test hana_clerestory",
+                at=started_at + 220 + index * 40,
+            )
+            _ = self.run_command(
+                "finish-activity",
+                "--session-dir",
+                str(session_dir),
+                "--status",
+                "completed",
+                "--result",
+                "pass",
+                at=started_at + 240 + index * 40,
+            )
+        _ = self.run_command(
+            "start-pass",
+            "--session-dir",
+            str(session_dir),
+            "--pass-kind",
+            "fix",
+            "--fix-pass",
+            "1",
+            "--activity",
+            "repairing the budget",
+            "--called-task",
+            "delegate.implementation",
+            "--called-family",
+            "codex",
+            "--called-model",
+            "gpt-called",
+            "--called-effort",
+            "high",
+            at=started_at + 400,
+        )
+        header = self.run_command(
+            "progress",
+            "--session-dir",
+            str(session_dir),
+            "--project-raw-percent",
+            "40",
+            "--project-percent",
+            "40",
+            "--phase-raw-percent",
+            "60",
+            "--phase-percent",
+            "60",
+            "--cap-stage",
+            "implementation",
+            "--activity",
+            "repairing the budget",
+            at=started_at + 440,
+        )
+        rows = self.table_rows(
+            header,
+            ["Round", "Agent 1", "Agent 2", "Agent 3", "Start", "Elapsed", "Result"],
+        )
+        # Three stages, five rows: counting the verifications singly would have
+        # dropped the implementation the phase opened with and the first two of
+        # them, leaving a table that says nothing about how the work got here.
+        self.assertEqual(
+            [row[0] for row in rows],
+            ["Impl", "Verification", "Verification", "Verification", "Fix 1"],
+        )
+        self.assertNotIn("Earlier:", header)
+
     def test_the_stage_table_names_every_window_the_phase_opened(self) -> None:
         """Each pass and activity in start order, with what the ledger recorded."""
         self.write_full_config()
@@ -2001,27 +2099,24 @@ class ProgressHistoryTests(unittest.TestCase):
             ["Round", "Agent 1", "Agent 2", "Agent 3", "Start", "Elapsed", "Result"],
         )
         # A solo run records no seat, so every window keeps a row and the
-        # per-window finding attribution it always had.
+        # per-window finding attribution it always had -- for the last three
+        # stages, which is all the table draws. The three before them are named
+        # by the line above it rather than dropped without a word.
         self.assertEqual(
             [(row[0], row[5], row[6]) for row in rows],
             [
-                ("Impl", "3m", "done"),
-                ("Impl Review", "1m", "2 found"),
-                ("Fix 1", "2m", "2 landed"),
                 ("Review Fix 1", "40s", "2 fixed"),
                 ("Verification", "40s", "pass"),
                 ("Review 3", "40s", "running"),
             ],
         )
+        self.assertIn("*Earlier: 3 stages not shown - Impl through Fix 1.*", header)
         # A slotless pass is drawn in the seat its kind names -- the closure
         # review under Agent 3, where a reader looks for it -- and a main-agent
         # activity names no seat and keeps three dashes.
         self.assertEqual(
             [tuple(row[1:4]) for row in rows],
             [
-                ("impl 3m", "-", "-"),
-                ("-", "-", "review 1m"),
-                ("fix 2m", "-", "-"),
                 ("-", "-", "review 40s"),
                 ("-", "-", "-"),
                 ("-", "-", "review 40s"),

@@ -2,7 +2,7 @@
 # review.sh — Invoke the configured delegate agent for a read-only review.
 #
 # Usage: review.sh <session_dir> [working_dir] [prompt_file] [task]
-#                  [role_description] [pass_activity] [pass_index]
+#                  [role_description] [pass_activity] [pass_index] [lens]
 #                  [early_ready_file]
 #   role_description — 1-2 lines describing this review's responsibility,
 #   written as a header block into the shared heartbeat log
@@ -10,6 +10,14 @@
 #   pass_index — 1 for a phase's broad review, incrementing for each closure
 #   review after it. Artifacts are written per index and never overwritten:
 #   a run that failed to converge can be read back round by round.
+#   lens — which reading this reviewer is doing, when a phase's broad review
+#   runs all three at once: adversary, conformance, or reach. It suffixes every
+#   artifact below, so three concurrent reviewers never overwrite each other,
+#   and it selects the seat the pass records under. The seat assignment is
+#   fixed rather than meaningful — adversary sits in `review` because that is
+#   the column an early launch already claims, and the other two take the seats
+#   left. Empty is the single-reviewer layout: unsuffixed names, no seat, which
+#   is what a closure review and a solo broad review still run.
 #   early_ready_file — early-launch mode: the reviewer starts while the
 #   implementer is still running, so its start-pass is deferred until this
 #   sentinel appears (the recorder closes any active pass as interrupted when
@@ -17,7 +25,7 @@
 #   The orchestrator creates the sentinel after the implementation pass has
 #   finished and the final diff is written.
 #
-# Produces:
+# Produces (every name below takes a `_<lens>` suffix when a lens is given):
 #   <session_dir>/review_status            — "reviewing" while running, "reviewed" on success, "error" on failure
 #   <session_dir>/review_pid               — this wrapper's pid, so a progress
 #                                            report can tell an early-launched
@@ -51,26 +59,51 @@ SUBTASK="${4:-review}"
 ROLE_DESC="${5:-blind review of the current diff against its spec}"
 PASS_ACTIVITY="${6:-reviewing the current diff against its work order}"
 PASS_INDEX="${7:-1}"
-EARLY_READY_FILE="${8:-}"
+LENS="${8:-}"
+EARLY_READY_FILE="${9:-}"
 TASK="delegate.${SUBTASK}"
 
 case "${PASS_INDEX}" in
   ''|*[!0-9]*|0) PASS_INDEX=1 ;;
 esac
 
+# A closed set, like the pass kinds: an unrecognized lens would suffix artifacts
+# nobody reads and record a pass under a seat no column renders, both silently.
+case "${LENS}" in
+  '') TEAM_SLOT='' ;;
+  adversary) TEAM_SLOT=review ;;
+  conformance) TEAM_SLOT=impl ;;
+  reach) TEAM_SLOT=test ;;
+  *)
+    echo "ERROR: unknown review lens '${LENS}' (adversary, conformance, reach)" >&2
+    exit 2
+    ;;
+esac
+
+SUFFIX="${LENS:+_${LENS}}"
+# What the shared heartbeat log tags this reviewer's beats with. Three lenses
+# run at once against one log, and `review` on all three lines cannot be read.
+BEAT_TAG="${SUBTASK}${LENS:+:${LENS}}"
+# The seat this pass records under, so three concurrent reviewers key three pass
+# records instead of each closing the last as interrupted.
+if [[ -n "${TEAM_SLOT}" ]]; then
+  export PLAN_DELEGATE_TEAM_ROLE="${TEAM_SLOT}"
+fi
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-FINDINGS_FILE="${SESSION_DIR}/review_findings_${PASS_INDEX}.txt"
-STATUS_FILE="${SESSION_DIR}/review_status"
-LOG_FILE="${SESSION_DIR}/review_agent_${PASS_INDEX}.log"
+FINDINGS_FILE="${SESSION_DIR}/review_findings_${PASS_INDEX}${SUFFIX}.txt"
+STATUS_FILE="${SESSION_DIR}/review_status${SUFFIX}"
+LOG_FILE="${SESSION_DIR}/review_agent_${PASS_INDEX}${SUFFIX}.log"
 
 # Every reader of the unnumbered paths — the orchestrator's mid-run preemption
 # read, the heartbeat digest — keeps working while the per-pass history is kept.
-ln -sfn "review_findings_${PASS_INDEX}.txt" "${SESSION_DIR}/review_findings.txt"
-ln -sfn "review_agent_${PASS_INDEX}.log" "${SESSION_DIR}/review_agent.log"
-AGENT_FILE="${SESSION_DIR}/review_agent"
+ln -sfn "review_findings_${PASS_INDEX}${SUFFIX}.txt" "${SESSION_DIR}/review_findings${SUFFIX}.txt"
+ln -sfn "review_agent_${PASS_INDEX}${SUFFIX}.log" "${SESSION_DIR}/review_agent${SUFFIX}.log"
+AGENT_FILE="${SESSION_DIR}/review_agent${SUFFIX}"
 HEARTBEAT_HELPER="${SCRIPT_DIR}/../agents/heartbeat.sh"
+BOARD_HELPER="${SCRIPT_DIR}/board.sh"
 HEARTBEAT_FILE="${SESSION_DIR}/heartbeat.log"
-AWAKE_FILE="${SESSION_DIR}/review_awake"
+AWAKE_FILE="${SESSION_DIR}/review_awake${SUFFIX}"
 PROGRESS_HELPER="${SCRIPT_DIR}/progress_history.py"
 PROGRESS_STATE="${SESSION_DIR}/progress_history_state.json"
 HEARTBEAT_INTERVAL_SECS=60
@@ -87,12 +120,24 @@ awake_seconds() {
   esac
 }
 
+# A seated reviewer opens a new occupancy of a chair a writer has just left.
+# Without a line of its own the note under the progress table keeps showing the
+# words of the delegate that sat there while the code was being written, aged by
+# however long the review has run -- a line describing the wrong agent, which
+# reads as a stalled one. A lone reviewer holds no seat and posts nothing.
+# A blind reviewer is a fresh read-only session with no peers and no address, so
+# every line says `mesh=none`: nothing can reach it and nothing should wait to.
+board_post() {
+  [[ -n "${TEAM_SLOT}" ]] || return 0
+  bash "${BOARD_HELPER}" post "${SESSION_DIR}" "${TEAM_SLOT}" "$1" "$2" || true
+}
+
 rm -f "${AWAKE_FILE}"
 echo "reviewing" > "${STATUS_FILE}"
 # Only meaningful while an early launch is showing in the progress report, and
 # read there only if it was written after the review was armed — so it is
 # written on every run, before anything can fail, not in the early branch alone.
-echo "$$" > "${SESSION_DIR}/review_pid"
+echo "$$" > "${SESSION_DIR}/review_pid${SUFFIX}"
 
 source "${SCRIPT_DIR}/../agents/agents_config.sh"
 if ! agents_resolve "${TASK}" 2>"${LOG_FILE}"; then
@@ -102,6 +147,9 @@ fi
 
 printf 'task=%s\nfamily=%s\nagent=%s\neffort=%s\n' \
   "${TASK}" "${AGENT_FAMILY}" "${AGENT_MODEL}" "${AGENT_EFFORT}" > "${AGENT_FILE}"
+
+board_post register \
+  "${LENS} review up (${AGENT_FAMILY}/${AGENT_MODEL}:${AGENT_EFFORT:-unset}); mesh=none; role=review; status in review_status${SUFFIX}"
 
 PASS_STARTED=0
 record_pass_start() {
@@ -127,7 +175,7 @@ if [[ -z "${EARLY_READY_FILE}" ]]; then
   fi
 fi
 
-bash "${HEARTBEAT_HELPER}" "${HEARTBEAT_FILE}" header "${SUBTASK} (${AGENT_FAMILY}/${AGENT_MODEL}:${AGENT_EFFORT:-unset})" "${ROLE_DESC}" || true
+bash "${HEARTBEAT_HELPER}" "${HEARTBEAT_FILE}" header "${BEAT_TAG} (${AGENT_FAMILY}/${AGENT_MODEL}:${AGENT_EFFORT:-unset})" "${ROLE_DESC}" || true
 
 bash "${SCRIPT_DIR}/../agents/agent_exec.sh" \
   "${TASK}" readonly "${WORKING_DIR}" "${PROMPT_FILE}" "${FINDINGS_FILE}" "${LOG_FILE}" &
@@ -138,7 +186,7 @@ AGENT_PID=$!
 # reviewer's own streamed log (the tool it is running, the file it is reading,
 # its prompt-instructed narration lines).
 bash "${SCRIPT_DIR}/../agents/heartbeat_watch.sh" \
-  "${HEARTBEAT_FILE}" "${SUBTASK}" "${AGENT_PID}" "${LOG_FILE}" "${HEARTBEAT_INTERVAL_SECS}" \
+  "${HEARTBEAT_FILE}" "${BEAT_TAG}" "${AGENT_PID}" "${LOG_FILE}" "${HEARTBEAT_INTERVAL_SECS}" \
   "${AWAKE_FILE}" &
 HEARTBEAT_LOOP_PID=$!
 
@@ -189,10 +237,12 @@ if [[ "${AGENT_CODE}" -eq 0 ]]; then
   fi
   if [[ -n "${EARLY_READY_FILE}" && ! -e "${EARLY_READY_FILE}" ]]; then
     bash "${HEARTBEAT_HELPER}" "${HEARTBEAT_FILE}" wrapper \
-      "${SUBTASK} agent finished before delivery — no pass recorded, verdict void" || true
+      "${BEAT_TAG} agent finished before delivery — no pass recorded, verdict void" || true
   else
-    bash "${HEARTBEAT_HELPER}" "${HEARTBEAT_FILE}" wrapper "${SUBTASK} agent finished" || true
+    bash "${HEARTBEAT_HELPER}" "${HEARTBEAT_FILE}" wrapper "${BEAT_TAG} agent finished" || true
   fi
+  board_post done \
+    "launcher: ${LENS} review finished; findings in review_findings_${PASS_INDEX}${SUFFIX}.txt"
 else
   echo "error" > "${STATUS_FILE}"
   # An early reviewer that failed before its pass started recorded nothing;
@@ -203,6 +253,8 @@ else
       --agent-awake-seconds "$(awake_seconds)" \
       || echo "ERROR: unable to record the review pass error." >&2
   fi
-  bash "${HEARTBEAT_HELPER}" "${HEARTBEAT_FILE}" wrapper "${SUBTASK} agent exited with code ${AGENT_CODE}" || true
+  bash "${HEARTBEAT_HELPER}" "${HEARTBEAT_FILE}" wrapper "${BEAT_TAG} agent exited with code ${AGENT_CODE}" || true
+  board_post blocked \
+    "launcher: ${LENS} review exited with code ${AGENT_CODE}; this seat is down"
   exit "${AGENT_CODE}"
 fi

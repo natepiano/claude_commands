@@ -779,8 +779,8 @@ def _ensure_project_timing(
 # file and each records its own pass, so this is the key their windows are kept
 # apart under -- without it a team phase and a solo phase produce identical rows.
 #
-# The variable says role and its value is a seat: `impl`, `impl2`, `test`,
-# `review` name the three chairs, not the work done in them. All three seats can
+# The variable says role and its value is a seat: `impl`, `test`, `review`
+# name the three chairs, not the work done in them. All three seats can
 # be implementing at one moment and reviewing at another; the role a seat holds
 # right now lives on the coordination board, which records it as a `handoff` and
 # never writes it here. Reading the value as a role is the mistake this comment
@@ -1313,6 +1313,8 @@ def _arm_review(args: argparse.Namespace) -> None:
         )
     now = _now_epoch()
     called_task = _arg_string(args, "called_task", "delegate.review") or "delegate.review"
+    lens = _arg_string(args, "lens")
+    suffix = f"_{lens}" if lens else ""
     armed: dict[str, object] = {
         "instance_id": str(uuid.uuid4()),
         "kind": "review",
@@ -1321,8 +1323,11 @@ def _arm_review(args: argparse.Namespace) -> None:
         "started_at": now,
         "called_task": called_task,
         "called_agent": _resolve_delegate_agent(called_task),
-        "status_file": str(session_dir / "review_status"),
-        "pid_file": str(session_dir / "review_pid"),
+        # `review.sh` suffixes both files with its lens, so an armed reviewer
+        # must name the same pair the launcher it precedes will write. Empty is
+        # the single-reviewer layout and the unsuffixed names.
+        "status_file": str(session_dir / f"review_status{suffix}"),
+        "pid_file": str(session_dir / f"review_pid{suffix}"),
         "status": "armed",
     }
     state[ARMED_REVIEW_KEY] = armed
@@ -1914,6 +1919,11 @@ LAUNCHER_PREFIX = "launcher:"
 # solo run -- is doing review work, and a reader scanning the review seat's column for
 # it found three dashes. A main-agent activity names no seat and keeps them.
 LONE_SEATS: dict[str, str] = {"impl": "impl", "fix": "impl", "test": "test", "review": "review"}
+# How many stages the round table draws. A long phase runs dozens -- ten repair
+# rounds and eleven verifications in the one that prompted the cap -- and a
+# table that tall is scrolled past rather than read. What a reader acts on is
+# the last few; the rest is history, and `timeline` still renders it in full.
+ROUND_TABLE_STAGES = 3
 
 
 def _run_events(state: dict[str, object]) -> list[dict[str, object]]:
@@ -2589,6 +2599,39 @@ def _round_entries(windows: list[StageWindow], labels: list[str]) -> list[RoundE
     return sorted(entries, key=lambda entry: entry["started_at"])
 
 
+def _stage_groups(entries: list[RoundEntry]) -> list[list[RoundEntry]]:
+    """The phase's stages: consecutive entries sharing a label are one stage.
+
+    Only a window in no round repeats a label -- a round carries its number --
+    and those come in runs: the four verifications a repair round triggers land
+    seconds apart and are one stage of the phase, not four. Counting them singly
+    would let a run of them fill the whole table and push the repair work that
+    produced them off the bottom.
+    """
+    groups: list[list[RoundEntry]] = []
+    for entry in entries:
+        if groups and groups[-1][0]["label"] == entry["label"]:
+            groups[-1].append(entry)
+        else:
+            groups.append([entry])
+    return groups
+
+
+def _earlier_note(elided: list[list[RoundEntry]]) -> str:
+    """The one line standing in for the stages the table does not draw.
+
+    Without it a phase eleven hours and twenty stages deep opens on `Fix 9` and
+    reads as one that has barely started, and the reader cannot tell whether the
+    missing rows are a truncation or an absence.
+    """
+    if not elided:
+        return ""
+    first, last = elided[0][0]["label"], elided[-1][-1]["label"]
+    span = first if first == last else f"{first} through {last}"
+    stages = "stage" if len(elided) == 1 else "stages"
+    return f"*Earlier: {len(elided)} {stages} not shown - {span}.*"
+
+
 def _window_span(window: StageWindow, now: float) -> tuple[float, float]:
     """When a window opened and when it closed, an open one running to now."""
     started_at = window["started_at"]
@@ -2621,6 +2664,21 @@ def _round_segments(
     # three land seconds apart, so splitting on them would put a row on each
     # launch. A handoff exactly at the round's start opens it rather than
     # splitting it, and one at or past its end belongs to the round that follows.
+    # A seat re-occupied is the other way a round moves on, and the one no
+    # handoff marks: a blind reviewer is a fresh session that takes the chair
+    # after the writer's has exited, so nothing posts a movement between them.
+    # One boundary per wave rather than per launch -- the seats sit down seconds
+    # apart, and a boundary each would put a near-empty row on every one.
+    occupancies = _slot_occupancies(entry["members"])
+    depth = max((len(windows) for windows in occupancies.values()), default=0)
+    waves = {
+        min(
+            windows[index]["started_at"]
+            for windows in occupancies.values()
+            if len(windows) > index
+        )
+        for index in range(1, depth)
+    }
     boundaries = sorted(
         {start}
         | {
@@ -2628,12 +2686,30 @@ def _round_segments(
             for change in changes
             if change["kind"] == "handoff" and start < change["at"] < end
         }
+        | {at for at in waves if start < at < end}
     )
     segments: list[tuple[float, float, dict[str, str]]] = []
     for index, lower in enumerate(boundaries):
         upper = boundaries[index + 1] if index + 1 < len(boundaries) else end
         segments.append((lower, upper, _roles_over(changes, lower, upper)))
     return segments
+
+
+def _slot_occupancies(members: list[StageWindow]) -> dict[str, list[StageWindow]]:
+    """Each seat's windows in one round, oldest first.
+
+    A seat sits down more than once in a round wherever the round runs a stage
+    after the one it opened with: the three writers finish, and the three
+    reviewers that read what they wrote take the same three chairs. Keeping one
+    member per seat reported whichever occupancy happened to be last as though
+    it had held the round from the start.
+    """
+    occupancies: dict[str, list[StageWindow]] = defaultdict(list)
+    for member in members:
+        occupancies[member["slot"]].append(member)
+    for windows in occupancies.values():
+        windows.sort(key=lambda window: window["started_at"])
+    return occupancies
 
 
 def _round_cells(
@@ -2644,10 +2720,16 @@ def _round_cells(
     now: float,
 ) -> list[str]:
     """A cell per seat: what it was doing over this stretch, and for how long."""
-    by_slot = {member["slot"]: member for member in members}
+    occupancies = _slot_occupancies(members)
     cells: list[str] = []
     for slot in ROUND_SLOTS:
-        member = by_slot.get(slot)
+        # The occupancy this stretch falls in: the last one that had begun by
+        # the time the stretch ended.
+        seated = occupancies.get(slot, [])
+        member = next(
+            (window for window in reversed(seated) if window["started_at"] < upper),
+            None,
+        )
         if member is None:
             # A seat that recorded no pass: it was launched without a pass
             # kind, or it died before `start-pass`. The board still knows its
@@ -2661,7 +2743,10 @@ def _round_cells(
         # for now: it is the only source that tracks a seat recruited across, and
         # reading it per segment is what keeps an earlier row describing the team
         # that was. A seat whose board never spoke reports the kind it recorded.
-        role = roles.get(slot) or member["kind"]
+        # Only for the seat's opening occupancy, though: a later one is a
+        # different session in the same chair, and the role the last occupant
+        # left behind describes work that is already over.
+        role = (roles.get(slot) or member["kind"]) if member is seated[0] else member["kind"]
         opened, closed = _window_span(member, now)
         overlap = int(min(closed, upper) - max(opened, lower))
         cells.append(f"{role} {_compact_duration(overlap)}" if overlap > 0 else role)
@@ -2679,14 +2764,27 @@ def _lone_cells(window: StageWindow) -> list[str]:
     return cells
 
 
-def _round_rows(
+class RoundTable(TypedDict):
+    """The rows the round table draws, and the note for the ones it drops."""
+
+    rows: list[list[str]]
+    earlier: str
+
+
+def _round_table(
     windows: list[StageWindow],
     labels: list[str],
     findings: list[dict[str, object]],
     changes: list[RoleChange],
     now: float,
-) -> list[list[str]]:
-    """One row per round, split again wherever its seats changed role."""
+) -> RoundTable:
+    """The last ROUND_TABLE_STAGES stages, each split wherever its seats moved.
+
+    A stage keeps every row it owns: a repair round that recruited two seats
+    across renders the two rows that say so. The cap counts stages rather than
+    rows because a row is not a unit a reader asks for -- "what happened in the
+    last few stages" is the question, and a stage answers it whole.
+    """
     # A window with no round is attributed the way the stage table always did
     # it, by the interval running to whatever opened next. That slice is wrong
     # for concurrent seats, which is why a round does not use it -- but it is
@@ -2700,8 +2798,10 @@ def _round_rows(
         )
         for index, window in enumerate(windows)
     }
+    groups = _stage_groups(_round_entries(windows, labels))
+    shown = groups[-ROUND_TABLE_STAGES:]
     rows: list[list[str]] = []
-    for entry in _round_entries(windows, labels):
+    for entry in [entry for group in shown for entry in group]:
         members, started_at = entry["members"], entry["started_at"]
         running = any(member["status"] in ("running", "armed") for member in members)
         if entry["number"] is None:
@@ -2736,7 +2836,10 @@ def _round_rows(
                     else "",
                 ]
             )
-    return rows
+    return RoundTable(
+        rows=rows,
+        earlier=_earlier_note(groups[: len(groups) - len(shown)]),
+    )
 
 
 def _delegate_note(
@@ -3333,14 +3436,15 @@ def _progress(args: argparse.Namespace) -> None:
         # a Start, an Elapsed, and a Result that all mean something; the three
         # seats working it read across. Per-pass provenance -- which model ran
         # where, and a review overlapping the writer as its own row -- is the
-        # `timeline` view, which still renders one row per window.
+        # `timeline` view, which still renders one row per window, and so is the
+        # history behind the last few stages this table keeps.
         phase_findings = [
             event
             for event in run_events
             if _string(event.get("phase_instance_id")) == phase_instance_id
             and _string(event.get("event_type")).startswith("finding_")
         ]
-        round_rows = _round_rows(
+        round_table = _round_table(
             stage_windows,
             stage_labels,
             phase_findings,
@@ -3363,7 +3467,8 @@ def _progress(args: argparse.Namespace) -> None:
             "",
             f"**Phase {phase_id}: {phase_title}**",
             "",
-            *_render_table(list(ROUND_HEADERS), round_rows, set()),
+            *([round_table["earlier"], ""] if round_table["earlier"] else []),
+            *_render_table(list(ROUND_HEADERS), round_table["rows"], set()),
             "",
             *([*delegate_note, ""] if delegate_note else []),
             f"▸ **{live_label} - {_string(current_pass.get('activity'))}**",
@@ -3558,6 +3663,7 @@ def _build_parser() -> argparse.ArgumentParser:
     _ = arm_review.add_argument("--session-dir", required=True)
     _ = arm_review.add_argument("--activity", required=True)
     _ = arm_review.add_argument("--called-task", default="delegate.review")
+    _ = arm_review.add_argument("--lens", default="")
     arm_review.set_defaults(handler=_arm_review)
 
     disarm_review = subparsers.add_parser(

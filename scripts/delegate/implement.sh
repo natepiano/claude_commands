@@ -10,8 +10,8 @@
 #   and is this seat's opening role, stamped on its board register line
 #   pass_activity — short user-facing description for the progress header
 #   fix_pass — required pass count when pass_kind is fix
-#   team_role — required; which member of the phase team this is (impl, impl2,
-#   test, review). Every dispatch is a team member -- the only two callers are
+#   team_role — required; which member of the phase team this is (impl, test,
+#   review). Every dispatch is a team member -- the only two callers are
 #   the implementation and fix phases, and both run a team -- so there is one
 #   artifact layout rather than a solo one and a team one. Several launchers
 #   run at once against one session directory, so every artifact below is
@@ -56,7 +56,7 @@ ROLE_DESC="${5:-work order at ${PROMPT_FILE}}"
 PASS_KIND="${6:-}"
 PASS_ACTIVITY="${7:-${ROLE_DESC%%$'\n'*}}"
 FIX_PASS="${8:-0}"
-TEAM_ROLE="${9:?Usage: implement.sh needs a team_role (impl, impl2, test, review) as its 9th argument}"
+TEAM_ROLE="${9:?Usage: implement.sh needs a team_role (impl, test, review) as its 9th argument}"
 
 # Resolving a repair round is an explicit assignment, never a property of the
 # pass kind. Keying it off `fix` is what forced seats to misreport their work:

@@ -130,8 +130,13 @@ codex_mesh.py stop   --session-dir
 `serve` spawns `codex app-server --listen ws://127.0.0.1:<free port>` detached
 (`start_new_session=True`) and records `{port, pid}` in
 `<session_dir>/mesh_server.json`; a later call reuses that server when the pid is
-still alive. The transport is newline-delimited JSON-RPC over a hand-written
-RFC 6455 client — loopback only, so no `--ws-auth` token.
+still alive. Starting one takes an exclusive `flock` on
+`<session_dir>/mesh_server.lock`, because the three seats of a phase reach
+`ensure_server` inside the same second and unlocked each would start a server of
+its own, orphaning two. `ensure_server` returns the port **and whether this call
+is what started it** — the flag the retry below turns on. The transport is
+newline-delimited JSON-RPC over a hand-written RFC 6455 client — loopback only,
+so no `--ws-auth` token.
 
 `start` connects, calls `thread/start` then `turn/start`, writes the delegate's
 thread id and status into `<session_dir>/mesh_roster.json` under an exclusive
@@ -147,10 +152,30 @@ interrupts the turn in flight. Both address a delegate by mesh name through the
 roster file, which is why they work from an unrelated process — the orchestrator,
 or a peer delegate.
 
-`stop` SIGTERMs the recorded pid (SIGKILL after 5 s) and removes the server file.
-`scripts/delegate/end_session.sh` calls it, reading the session directory out of
-the run-active marker: the server is detached on purpose so it outlives each
-delegate, so the end of the run is the only point that knows nobody needs it.
+`stop` SIGTERMs each recorded pid (SIGKILL after 5 s) and removes the server
+file. `scripts/delegate/end_session.sh` calls it, reading the session directory
+out of the run-active marker: the server is detached on purpose so it outlives
+each delegate, so the end of the run is the only point that knows nobody needs
+it. That is also why it reaps `mesh_retired.json` as well as the live record —
+a server the retry below abandoned is left running, since it may still be
+finishing a peer delegate's turn.
+
+**Recovering from a wedged app-server.** A stuck server answers every thread
+that attaches with a provider message it cached earlier — no round trip — so a
+usage limit that was real hours ago is replayed word for word to work that would
+have succeeded. Reading the message cannot tell that from a live refusal; the
+launcher settles it by running the work again on a server it starts itself,
+which has cached nothing. `command_start` retries once when all four hold: the
+server was inherited rather than started by this call, the delegate produced no
+work, the failure arrived within `RETRY_FAST_FAILURE_SECS` (120), and the
+delegate is not resident. `produced_work` is the interlock — any completed item
+blocks the retry, because repeating the prompt would repeat edits already
+applied — and it is set conservatively, since a delegate wrongly held back loses
+a round while one wrongly retried loses its work to a second pass. `_retire_server`
+drops the record only when it still names the server that failed, so three seats
+racing the same recovery replace one server between them rather than three.
+Same failure on the fresh server means the provider really did refuse, and it is
+reported unchanged.
 
 ### Addressable codex delegates (`scripts/agents/codex_mesh.py`)
 
@@ -251,7 +276,7 @@ A thin dispatcher over the resolver:
 | `scripts/agents/codex_mesh.py` | Opt-in addressable launcher for codex `/plan:delegate` delegates: one app-server per session, one thread per delegate, `send`/`steer`/`list`/`stop`. |
 | `scripts/agents/heartbeat.sh`, `heartbeat_watch.sh` | Liveness log helpers used by the delegate wrappers (role header block, 60 s beats with an activity digest decoded from the agent log). |
 | `scripts/agents/test_agents_config.sh`, `test_agent_exec.sh`, `test_sync_codex_catalog.sh` | Self-contained fixture-conf suites (`mktemp -d`, temp `AGENTS_CONFIG_FILE`, print a "…passed" line, nonzero on failure). |
-| `scripts/delegate/implement.sh` / `review.sh` | `/plan:delegate`'s launchers. The implementation launcher adds optional pass kind/activity/fix-count arguments and a **required** `team_role` as its 9th (`impl`, `impl2`, `test`, `review`): both call sites run a three-agent phase team, so there is one artifact shape rather than a solo shape and a team shape. The role suffixes every artifact (`impl_status_<role>`, `impl_summary_<role>.txt`, `impl_agent_<role>.log`, `impl_agent_<role>`, `impl_awake_<role>`), tags the wrapper beats `<subtask>:<role>`, names the slot this dispatch posts under on the board, and is exported to the agent as `PLAN_DELEGATE_TEAM_ROLE` beside `PLAN_DELEGATE_BOARD_DIR`. Every member records its own progress pass: `state["pass"]` holds one record per seat, and `start-pass` closes only a stale pass of the same seat, so three concurrent recorders no longer leave the ledger describing whichever finished last. The launcher also stamps `role=<name>` on its `register` line, which is what fills the progress table's per-slot columns before any agent posts. The reviewer adds optional pass activity plus a `pass_index` (7th arg, default 1). Both write status, provenance, agent logs, and shared heartbeat data; when durable progress state exists, they also record the resolved called model/effort and pass outcome through `progress_history.py`. `review.sh` writes `review_findings_<N>.txt` / `review_agent_<N>.log` per pass and `ln -sfn`s the unnumbered names to the current one, so a run that failed to converge can be read back round by round while existing readers keep working. |
+| `scripts/delegate/implement.sh` / `review.sh` | `/plan:delegate`'s launchers. The implementation launcher adds optional pass kind/activity/fix-count arguments and a **required** `team_role` as its 9th (`impl`, `test`, `review`): both call sites run a three-agent phase team, so one artifact layout covers both rather than a solo set and a team set. The role suffixes every artifact (`impl_status_<role>`, `impl_summary_<role>.txt`, `impl_agent_<role>.log`, `impl_agent_<role>`, `impl_awake_<role>`), tags the wrapper beats `<subtask>:<role>`, names the slot this dispatch posts under on the board, and is exported to the agent as `PLAN_DELEGATE_TEAM_ROLE` beside `PLAN_DELEGATE_BOARD_DIR`. Every member records its own progress pass: `state["pass"]` holds one record per seat, and `start-pass` closes only a stale pass of the same seat, so three concurrent recorders no longer leave the ledger describing whichever finished last. The launcher also stamps `role=<name>` on its `register` line, which is what fills the progress table's per-slot columns before any agent posts. The reviewer adds optional pass activity, a `pass_index` (7th arg, default 1), and a `lens` (8th, before the early-ready sentinel that follows it). Both write status, provenance, agent logs, and shared heartbeat data; when durable progress state exists, they also record the resolved called model/effort and pass outcome through `progress_history.py`. `review.sh` writes `review_findings_<N>.txt` / `review_agent_<N>.log` per pass and `ln -sfn`s the unnumbered names to the current one, so a run that failed to converge can be read back round by round while existing readers keep working. A phase's broad review runs three reviewers at once under one lens each (`adversary`, `conformance`, `reach`), so the lens suffixes every one of those names plus `review_status`, `review_pid`, `review_agent`, and `review_awake`; empty is the single-reviewer layout a closure review and `commands/plan/phase_review.md` still run. The lens also selects the seat the pass records under — `review`, `impl`, `test` respectively, a fixed address rather than a judgment — which `review.sh` exports as `PLAN_DELEGATE_TEAM_ROLE` so three concurrent reviewers key three pass records instead of each closing the last as interrupted, and posts as a `register` line so the progress note stops attributing the previous occupant's words to the seat. `arm-review` takes a matching `--lens`, because the marker watches the status and pid files the launcher it precedes will write. |
 | `scripts/delegate/board.sh` | The phase team's coordination substrate: an append-only `board.log` plus `mkdir`-atomic tokens under `locks/`, shared by every member writing into one session directory. Commands are `post` / `read` / `acquire` / `release` / `renew` / `role` / `roles` / `locks`. A file rather than messages because one append *is* the broadcast to every peer and the wrapper, where N-1 addressed sends can each half-fail; because it outlives the turn that wrote it, so a member resumed hours later reads the whole history; and because a message channel cannot make anything mutually exclusive, which the `mkdir` tokens can. Post kinds are a closed set (`register`, `claim`, `release`, `status`, `blocked`, `handoff`, `done`) so a peer can scan for what concerns it — `ask` and `answer` are deliberately absent, since a question to a peer is a message (`SendMessage`, or `codex_mesh.py` for a codex member) and two ways to ask one question means one of them goes unread; `read --since N` numbers every line before filtering, so a cursor counts board positions and stays valid across different filters. `role` is the only writer of `handoff`, and those lines are how `progress_history.py` learns which role each slot holds now. |
 | `scripts/delegate/progress_history.py` | Cross-agent append-only plan-delegate event recorder and aggregator. Durable per-run JSONL lives under `~/.local/state/plan-delegate/runs/`; live state remains in the session directory. `start-run` alone resolves and records the project clock from the supplied plan, matching worktree/branch history, or the run start. It renders separate project and phase progress sections with independent unchanged timers and unambiguous `HH:MM:SS` durations, and calibrates phase estimates from completed-phase history. `progress` requires `--cap-stage` on dual-layout calls and clamps the calibrated percentage to that stage's ceiling; `start-phase --work-order-file` records Work Order size metrics. |
 | `scripts/delegate/findings.py` | The delegate fix loop's convergence test — what replaced the fix-pass counter. Stable finding IDs (`F001…`) with states `open` / `fixed_pending_review` / `accepted`, held in `findings_state.json` beside the progress state and reset automatically when the active phase's `instance_id` changes. `gate` returns `converged` / `dispatch` / `stop`, gating on blocker+minor in round 1 and blocker only afterwards (nits never gate); `dispatch --covers` refuses a partial batch so one fix round repairs everything gating together. Stops on: a finding that failed to close twice, a finding reopened twice, two rounds with no decrease in the gating-open count, or a 10-round runaway backstop. Appends `finding_opened` / `finding_batch_dispatched` / `finding_verdict` / `finding_gate` to the same durable run JSONL. |

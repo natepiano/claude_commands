@@ -32,7 +32,7 @@ Verbs:
   steer  Inject into a named delegate's running turn.
   end    Finish a resident delegate: interrupt its running turn, if any, and
          release its `start`.
-  stop   Stop the session's app-server.
+  stop   Stop the session's app-server, and any it replaced mid-run.
   list   Print the roster of named delegates and what each is doing.
 """
 
@@ -52,13 +52,19 @@ import struct
 import subprocess
 import sys
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from datetime import datetime
 from pathlib import Path
 from typing import TextIO, TypedDict, cast, final
 
 SERVER_FILE = "mesh_server.json"
 ROSTER_FILE = "mesh_roster.json"
+# Servers dropped by _retire_server, kept so `stop` can still reap them. A
+# retired server is abandoned rather than signalled: it may still be finishing a
+# peer delegate's turn, and the end of the run is the only moment that knows
+# nobody needs it.
+RETIRED_FILE = "mesh_retired.json"
+LOCK_FILE = "mesh_server.lock"
 CONNECT_TIMEOUT_SECS = 20
 CALL_TIMEOUT_SECS = 300
 SERVER_START_TIMEOUT_SECS = 30
@@ -67,6 +73,11 @@ QUEUE_GRACE_SECS = 3.0
 # A resident delegate sits between turns with nothing on the socket, so its loop
 # wakes this often to look for the end marker.
 RESIDENT_POLL_SECS = 1.0
+# How fast a failure has to arrive to be read as this machine's fault rather
+# than the provider's. An app-server that has wedged answers from what it
+# cached, without a round trip, so it fails in seconds; a refusal that travelled
+# to the provider and back does not arrive this quickly and this consistently.
+RETRY_FAST_FAILURE_SECS = 120.0
 
 
 class RpcMessage(TypedDict, total=False):
@@ -415,39 +426,94 @@ def _deliver_reply(
     log.flush()
 
 
-def ensure_server(session_dir: str) -> int:
-    """Return the port for this session's app-server, starting it if needed."""
-    path = _session_path(session_dir, SERVER_FILE)
-    record = _read_json_object(path)
-    port = record.get("port")
-    pid = record.get("pid")
-    if isinstance(port, int) and isinstance(pid, int) and _pid_alive(pid):
-        return port
+@contextlib.contextmanager
+def _server_lock(session_dir: str) -> Iterator[None]:
+    """Serialize starting and dropping this session's app-server.
 
-    chosen = _free_port()
+    The three seats of a phase launch in one message and reach `ensure_server`
+    within the same second. Unlocked, each reads no record, each starts a server
+    and each writes the file: two of the three are then orphaned, listening and
+    unreachable, and a retry that started a fresh server for every failed seat
+    would multiply them.
+    """
     Path(session_dir).mkdir(parents=True, exist_ok=True)
-    log_path = _session_path(session_dir, "mesh_server.log")
-    with log_path.open("ab") as log_handle:
-        process = subprocess.Popen(
-            ["codex", "app-server", "--listen", f"ws://127.0.0.1:{chosen}"],
-            stdout=subprocess.DEVNULL,
-            stderr=log_handle,
-            start_new_session=True,
-        )
-    deadline = time.time() + SERVER_START_TIMEOUT_SECS
-    while time.time() < deadline:
-        if process.poll() is not None:
-            raise SystemExit(f"codex_mesh: app-server exited immediately; see {log_path}")
+    with _session_path(session_dir, LOCK_FILE).open("a+", encoding="utf-8") as handle:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
         try:
-            probe = WebSocket(chosen)
-        except (OSError, ConnectionError):
-            time.sleep(0.4)
-            continue
-        probe.close()
-        served: ServerRecord = {"port": chosen, "pid": process.pid}
-        _ = path.write_text(json.dumps(served, indent=2), encoding="utf-8")
-        return chosen
-    raise SystemExit(f"codex_mesh: app-server did not accept connections on {chosen}")
+            yield
+        finally:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+
+def _retire_server(session_dir: str, port: int) -> bool:
+    """Drop the recorded server so the next `ensure_server` starts a fresh one.
+
+    Only when the record still names the server that failed: a peer seat racing
+    the same recovery may already have replaced it, and dropping its new server
+    would restart the cycle it just ended. The process is left running -- see
+    RETIRED_FILE -- and `stop` reaps it with the rest at the end of the run.
+
+    The roster is deliberately untouched. Its entries for other names may point
+    at threads that are live on a server this seat knows nothing about, and this
+    seat rewrites its own entry when it re-attaches.
+    """
+    with _server_lock(session_dir):
+        path = _session_path(session_dir, SERVER_FILE)
+        record = _read_json_object(path)
+        if record.get("port") != port:
+            return False
+        retired_path = _session_path(session_dir, RETIRED_FILE)
+        stored = _read_json_object(retired_path).get("servers")
+        servers: list[object] = cast("list[object]", stored) if isinstance(stored, list) else []
+        servers.append(record)
+        _ = retired_path.write_text(
+            json.dumps({"servers": servers}, indent=2), encoding="utf-8"
+        )
+        path.unlink(missing_ok=True)
+        return True
+
+
+def ensure_server(session_dir: str) -> tuple[int, bool]:
+    """This session's app-server port, and whether this call is what started it.
+
+    A caller that started the server just proved the provider was reachable
+    through a process nothing else has touched, so a failure against it is the
+    provider's answer. A caller that attached to one already running has proved
+    nothing of the kind -- see _retry_warranted.
+    """
+    with _server_lock(session_dir):
+        path = _session_path(session_dir, SERVER_FILE)
+        record = _read_json_object(path)
+        port = record.get("port")
+        pid = record.get("pid")
+        if isinstance(port, int) and isinstance(pid, int) and _pid_alive(pid):
+            return port, False
+
+        chosen = _free_port()
+        log_path = _session_path(session_dir, "mesh_server.log")
+        with log_path.open("ab") as log_handle:
+            process = subprocess.Popen(
+                ["codex", "app-server", "--listen", f"ws://127.0.0.1:{chosen}"],
+                stdout=subprocess.DEVNULL,
+                stderr=log_handle,
+                start_new_session=True,
+            )
+        deadline = time.time() + SERVER_START_TIMEOUT_SECS
+        while time.time() < deadline:
+            if process.poll() is not None:
+                raise SystemExit(
+                    f"codex_mesh: app-server exited immediately; see {log_path}"
+                )
+            try:
+                probe = WebSocket(chosen)
+            except (OSError, ConnectionError):
+                time.sleep(0.4)
+                continue
+            probe.close()
+            served: ServerRecord = {"port": chosen, "pid": process.pid}
+            _ = path.write_text(json.dumps(served, indent=2), encoding="utf-8")
+            return chosen, True
+        raise SystemExit(f"codex_mesh: app-server did not accept connections on {chosen}")
 
 
 # ---------------------------------------------------------------------------
@@ -501,11 +567,91 @@ def _more_work_coming(client: Client, thread_id: str, deadline: float) -> bool:
     return started
 
 
+class Attempt(TypedDict):
+    """What one run of a delegate against one app-server came to.
+
+    `produced_work` is the safety interlock on retrying: a delegate that
+    completed even one item may already have edited the tree, and running its
+    prompt again would apply those edits a second time.
+    """
+
+    failure: str
+    produced_work: bool
+    seconds: float
+
+
+def _retry_warranted(attempt: Attempt, fresh_server: bool, resident: bool) -> bool:
+    """Whether this failure is worth one more run against a clean app-server.
+
+    A wedged app-server replays a provider message it cached earlier to every
+    thread that attaches, with no round trip -- so the text reads exactly like a
+    usage limit or an outage while nothing is wrong with the account. Reading
+    the message cannot tell the two apart; running the same work against a
+    server this process just started can, because a fresh server has cached
+    nothing. Same failure twice means the provider really did refuse.
+
+    Four conditions, each of them narrowing:
+      * the failed server was inherited, so nothing has tested it this run;
+      * the delegate produced no work, so repeating its prompt repeats nothing;
+      * the failure arrived too fast to have reached the provider;
+      * and the delegate is not resident, where a caller is already holding the
+        replies and a silent second attempt would arrive behind them.
+    """
+    return (
+        not fresh_server
+        and not resident
+        and not attempt["produced_work"]
+        and attempt["seconds"] <= RETRY_FAST_FAILURE_SECS
+    )
+
+
 def command_start(args: argparse.Namespace) -> int:
     session_dir = _as_str(_attr(args, "session_dir"))
     name = _as_str(_attr(args, "name"))
+    resident = _attr(args, "resident") is True
+    port, fresh_server = ensure_server(session_dir)
+    attempt = _run_delegate(args, port)
+    if attempt["failure"] and _retry_warranted(attempt, fresh_server, resident):
+        _ = _retire_server(session_dir, port)
+        port, _fresh = ensure_server(session_dir)
+        elapsed = f"{attempt['seconds']:.0f}s"
+        note = f"the inherited app-server failed in {elapsed} without reaching"
+        print(f"codex_mesh: {name}: {note} the provider; retrying on a new one",
+              file=sys.stderr)
+        attempt = _run_delegate(args, port)
+    if attempt["failure"]:
+        print(f"codex_mesh: {name}: {attempt['failure']}", file=sys.stderr)
+        return 1
+    return 0
+
+
+def _run_delegate(args: argparse.Namespace, port: int) -> Attempt:
+    """Attach one delegate to the app-server on `port` and run it to its end."""
+    session_dir = _as_str(_attr(args, "session_dir"))
+    name = _as_str(_attr(args, "name"))
     timeout = _as_float(_attr(args, "timeout"), 86400.0)
-    port = ensure_server(session_dir)
+    opened = time.time()
+    try:
+        return _attach_and_run(args, port, session_dir, name, timeout, opened)
+    except (ConnectionError, OSError, SystemExit) as exc:
+        # A wedged or vanished server refuses the attach itself, so these are
+        # the same failure as one the turn reports and take the same recovery.
+        # Nothing has run at this point, which is what makes that safe.
+        return Attempt(
+            failure=str(exc) or exc.__class__.__name__,
+            produced_work=False,
+            seconds=time.time() - opened,
+        )
+
+
+def _attach_and_run(
+    args: argparse.Namespace,
+    port: int,
+    session_dir: str,
+    name: str,
+    timeout: float,
+    opened: float,
+) -> Attempt:
     prompt = Path(_as_str(_attr(args, "prompt_file"))).read_text(encoding="utf-8")
     log_path = Path(_as_str(_attr(args, "log_file")))
     summary_path = Path(_as_str(_attr(args, "summary_file")))
@@ -561,6 +707,12 @@ def command_start(args: argparse.Namespace) -> int:
     final_answer = ""
     failure = ""
     replies = 0
+    # Any completed item is work: not every item edits the tree, but telling
+    # which did means reading item types this module does not model, and the
+    # cost of being wrong runs one way. A delegate held back from a retry it
+    # deserved loses a round; one retried after it had already written loses
+    # the edits it made to a second pass over the same prompt.
+    produced_work = False
     deadline = time.time() + timeout
     with log_path.open("a", encoding="utf-8") as log:
         _ = log.write(f"[{_now_stamp()}] mesh: {name} thread {thread_id}\n")
@@ -591,6 +743,7 @@ def command_start(args: argparse.Namespace) -> int:
                         {"thread_id": thread_id, "turn_id": live, "status": "running"},
                     )
             elif method == "item/completed":
+                produced_work = True
                 item = _as_dict(params.get("item"))
                 _ = log.write(f"[{_now_stamp()}] {_describe_item(item)}\n")
                 log.flush()
@@ -622,6 +775,7 @@ def command_start(args: argparse.Namespace) -> int:
                 # otherwise wait forever. The thread stays open for the next
                 # message; only `end` closes it.
                 replies += 1
+                produced_work = True
                 _deliver_reply(name, replies, final_answer, failure, summary_path, log)
                 final_answer = ""
                 failure = ""
@@ -652,10 +806,9 @@ def command_start(args: argparse.Namespace) -> int:
         },
     )
     client.close()
-    if failure:
-        print(f"codex_mesh: {name}: {failure}", file=sys.stderr)
-        return 1
-    return 0
+    return Attempt(
+        failure=failure, produced_work=produced_work, seconds=time.time() - opened
+    )
 
 
 def command_send(args: argparse.Namespace) -> int:
@@ -670,7 +823,7 @@ def command_send(args: argparse.Namespace) -> int:
         raise SystemExit(
             f"codex_mesh: {target} is {status}, not running; read its summary file"
         )
-    port = ensure_server(session_dir)
+    port, _fresh = ensure_server(session_dir)
     client = Client(port, f"send-{os.getpid()}")
     _ = _require(
         client.call(
@@ -699,7 +852,7 @@ def command_steer(args: argparse.Namespace) -> int:
         raise SystemExit(
             f"codex_mesh: {target} has no running turn to steer ({detail}); use `send`"
         )
-    port = ensure_server(session_dir)
+    port, _fresh = ensure_server(session_dir)
     client = Client(port, f"steer-{os.getpid()}")
     _ = _require(
         client.call(
@@ -763,33 +916,46 @@ def command_stop(args: argparse.Namespace) -> int:
     detached so it outlives each delegate, which means the end of the run is the
     only place that knows it is finished with."""
     session_dir = _as_str(_attr(args, "session_dir"))
+    retired_path = _session_path(session_dir, RETIRED_FILE)
+    stored = _read_json_object(retired_path).get("servers")
+    retired = cast("list[object]", stored) if isinstance(stored, list) else []
     path = _session_path(session_dir, SERVER_FILE)
-    record = _read_json_object(path)
-    pid = record.get("pid")
-    if not isinstance(pid, int) or not _pid_alive(pid):
+    stopped = [
+        pid
+        for record in [*retired, _read_json_object(path)]
+        for pid in [_as_dict(record).get("pid")]
+        if isinstance(pid, int) and _reap(pid)
+    ]
+    retired_path.unlink(missing_ok=True)
+    path.unlink(missing_ok=True)
+    if not stopped:
         print("no app-server running")
-        path.unlink(missing_ok=True)
         return 0
+    print(f"stopped app-server {', '.join(str(pid) for pid in stopped)}")
+    return 0
+
+
+def _reap(pid: int) -> bool:
+    """Stop one app-server, escalating to SIGKILL. False if it was not running."""
+    if not _pid_alive(pid):
+        return False
     try:
         os.kill(pid, signal.SIGTERM)
     except OSError as exc:
         print(f"could not signal app-server {pid}: {exc}")
-        return 0
+        return False
     deadline = time.time() + 5.0
     while time.time() < deadline and _pid_alive(pid):
         time.sleep(0.2)
     if _pid_alive(pid):
-        try:
+        with contextlib.suppress(OSError):
             os.kill(pid, signal.SIGKILL)
-        except OSError:
-            pass
-    path.unlink(missing_ok=True)
-    print(f"stopped app-server {pid}")
-    return 0
+    return True
 
 
 def command_serve(args: argparse.Namespace) -> int:
-    print(ensure_server(_as_str(_attr(args, "session_dir"))))
+    port, _fresh = ensure_server(_as_str(_attr(args, "session_dir")))
+    print(port)
     return 0
 
 
