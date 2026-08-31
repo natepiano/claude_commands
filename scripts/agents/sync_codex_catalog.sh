@@ -21,6 +21,37 @@ fail() {
     exit 1
 }
 
+# One writer at a time. The sync is triggered implicitly by anything that sources
+# agents_config.sh, so a stale freshness gate fires it once per caller -- and a
+# delegate phase sources it three times at once. `mv` is atomic, so no reader
+# ever sees a torn file, but concurrent syncs still do identical work three times
+# over, and the last to finish writes a copy it read before the others started:
+# a row changed by `/agent` inside that window is silently reverted.
+LOCK_DIR="$(dirname "$CODEX_CATALOG_SYNC_STATE_FILE")/sync.lock"
+
+release_lock() {
+    [[ -n "${LOCK_HELD:-}" ]] && rmdir "$LOCK_DIR" 2>/dev/null
+    return 0
+}
+
+if [[ "$CHECK_ONLY" == false ]]; then
+    mkdir -p "$(dirname "$LOCK_DIR")"
+    # A lock left behind by a killed sync would block every later one, so a
+    # directory older than the longest plausible run is debris, not an owner.
+    if [[ -d "$LOCK_DIR" && -z "$(find "$LOCK_DIR" -maxdepth 0 -mmin -5 2>/dev/null)" ]]; then
+        rmdir "$LOCK_DIR" 2>/dev/null || true
+    fi
+    if mkdir "$LOCK_DIR" 2>/dev/null; then
+        LOCK_HELD=1
+        trap release_lock EXIT
+    else
+        # Another sync is mid-flight and will refresh both the catalog and the
+        # state file. This caller reads a valid conf either way.
+        echo "Codex agent catalog sync already running; skipping."
+        exit 0
+    fi
+fi
+
 registry_section_rows() {
     local section="$1"
     awk -v wanted="$section" '
@@ -292,6 +323,7 @@ warn_missing_claude_aliases
 tmp_file="$(mktemp "${AGENTS_CONFIG_FILE}.XXXXXX")"
 cleanup() {
     rm -f "$tmp_file"
+    release_lock
 }
 trap cleanup EXIT
 
@@ -340,7 +372,7 @@ fi
 
 chmod "$(stat -f '%Lp' "$AGENTS_CONFIG_FILE")" "$tmp_file"
 mv "$tmp_file" "$AGENTS_CONFIG_FILE"
-trap - EXIT
+trap release_lock EXIT
 mkdir -p "$(dirname "$CODEX_CATALOG_SYNC_STATE_FILE")"
 touch "$CODEX_CATALOG_SYNC_STATE_FILE"
 echo "Updated Codex agent catalog: $AGENTS_CONFIG_FILE"
