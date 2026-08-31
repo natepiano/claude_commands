@@ -110,9 +110,10 @@ Wrong arg count or a bad mode returns 2. A missing prompt file writes `Prompt no
 reach: a delegate launched that way takes one prompt and is unreachable until it
 exits. `codex_mesh.py` is the alternative launch path that gives a codex delegate
 an address, so peers and the orchestrator can message and interrupt it mid-run
-the way they already can a claude delegate. Opt-in per `[delegate.options]
-codex_mesh` in the registry (`0` by default), overridable for one run with
-`PLAN_DELEGATE_CODEX_MESH`; `implement.sh` reads it and branches.
+the way they already can a claude delegate. Selected per `[delegate.options]
+codex_mesh` in the registry (`1` by default, so the mesh is the normal codex
+launch path), overridable for one run with `PLAN_DELEGATE_CODEX_MESH`;
+`implement.sh` reads it and branches.
 
 One `codex app-server` per delegate session, each delegate a thread on it:
 

@@ -17,12 +17,14 @@ set -euo pipefail
 #
 # To commit a real structural change (a new function, subtask, or section):
 #
-#   touch config/agents.conf && AGENTS_CONF_COMMIT=1 git add config/agents.conf
+#   AGENTS_CONF_COMMIT=1 git add --renormalize config/agents.conf
 #
-# The touch is load-bearing. Once git has refreshed its stat cache for a path it
-# considers up to date, it compares nothing and runs no filter, so the override
-# reads as inert until the mtime moves again. Any edit does that on its own;
-# only a re-run against an already-refreshed file needs the touch.
+# `--renormalize` is load-bearing. Once git has refreshed its stat cache for a
+# path it considers up to date, a plain `git add` compares nothing and runs no
+# filter, so the override reads as inert. --renormalize re-runs the filter over
+# the working tree regardless. A `touch` moves the mtime and works too, but this
+# file sits on a guarded path where shell writes are refused, so --renormalize
+# is the form that works from inside a Claude Code session.
 #
 # Falls back to passing the content through whenever the pin cannot be read —
 # an untracked first add, or a repo state with no index entry — so the filter

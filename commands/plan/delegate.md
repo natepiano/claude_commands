@@ -283,20 +283,22 @@ completion notification as a finished assignment.
 The team coordinates through `${SESSION_DIR}/board.log`, written only with
 `bash ~/.claude/scripts/delegate/board.sh`.
 
-**Why a file even when messages work.** On the claude path every member is also
-reachable by name — see <PhaseMesh/> — but the board still carries the record,
-for three reasons. A post is a single broadcast that reaches both peers and the
-wrapper at once, where addressed sends are N-1 separate deliveries that can each
-fail and leave the team holding different pictures of one decision. The board
-outlives a turn, so a member that starts late, or is resumed hours later, reads
-the whole history rather than the messages that happened to arrive while it was
-listening. And a message cannot make anything mutually exclusive: only the
-token, taken with `mkdir`, decides who builds.
+**Why a file even when messages work.** Every member is reachable by name on
+both the claude and codex paths — see <PhaseMesh/> — but the board still carries
+the record, for three reasons. A post is a single broadcast that reaches both
+peers and the wrapper at once, where addressed sends are N-1 separate deliveries
+that can each fail and leave the team holding different pictures of one
+decision. The board outlives a turn, so a member that starts late, or is resumed
+hours later, reads the whole history rather than the messages that happened to
+arrive while it was listening. And a message cannot make anything mutually
+exclusive: only the token, taken with `mkdir`, decides who builds.
 
-When `agents.conf` resolves the delegate family to codex there is no mesh at all
-— a codex process has no reachable address, and the orchestrator is asleep
-between progress ticks and cannot relay — so the board is then the only channel
-that exists. Each `register` line says which case holds, in its `mesh=` field.
+A codex delegate is addressable because `[delegate.options] codex_mesh` is on,
+which runs it as a thread on the session's `codex app-server` instead of as its
+own unreachable `codex exec` process. Turn that off and the board is the only
+channel a codex member has, since the orchestrator is asleep between progress
+ticks and cannot relay. Each `register` line says which case holds, in its
+`mesh=` field.
 
 - `board.sh post <session_dir> <slot> <kind> <message>` — one broadcast line.
   Kinds are a closed set: `register`, `claim`, `release`, `ask`, `answer`,

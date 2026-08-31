@@ -161,11 +161,11 @@ bash "${HEARTBEAT_HELPER}" "${HEARTBEAT_FILE}" header "${BEAT_TAG} (${AGENT_FAMI
 # Announce the member on the shared board. Peers read the board to learn who is
 # running in which role; the orchestrator sleeps between progress ticks, so
 # nothing else would tell them.
-# Opt-in: codex delegates run as threads on one app-server instead of as
-# `codex exec` processes, which is what makes them addressable. Off by default so
-# a phase behaves exactly as before until the flag is set. The registry holds the
-# standing choice; the env var overrides it for one run. A missing key reads as
-# empty, which fails the test below and leaves the plain launcher in place.
+# codex delegates run as threads on one app-server instead of as `codex exec`
+# processes, which is what makes them addressable. On by default; set the key to
+# 0 for the plain launcher. The registry holds the standing choice; the env var
+# overrides it for one run. A missing key reads as empty, which fails the test
+# below and leaves the plain launcher in place.
 CODEX_MESH="${PLAN_DELEGATE_CODEX_MESH:-$(_agents_registry_get delegate.options codex_mesh)}"
 if [[ "${AGENT_FAMILY}" == "codex" && "${CODEX_MESH}" == "1" ]]; then
   USE_CODEX_MESH=1
@@ -192,12 +192,13 @@ fi
 # role`. A seat opens in the role it is named for, with one exception: the impl
 # seat does both implementation and repair, and only PASS_KIND says which.
 #
-# Do NOT simplify this to keying every seat off PASS_KIND. The pass kinds are
-# once were impl/fix/review/arch while the roles were impl/fix/test/review -- one
-# look interchangeable, and not. There is no `test` pass kind, so once every seat
-# carries one, a test seat would stamp `role=impl` on every phase and the Test
-# column would never read `test` again, losing the one distinction it exists to
-# show: a test seat doing its own job against one recruited into writing.
+# Do NOT simplify this to keying every seat off PASS_KIND. Kinds and roles are
+# now the same four words -- impl, test, fix, review -- which is exactly what
+# makes the shortcut look safe. It is not: the kind is the work a seat was
+# assigned at launch and never moves, while the role is what that seat is doing
+# now and moves whenever a peer recruits it. Collapsing them freezes every seat
+# in its launch role and loses the one distinction the table exists to show: a
+# test seat doing its own job against one recruited into writing.
 # A seat whose name is not a role at all -- the drifted `impl2`, `main` -- stamps
 # nothing rather than inventing one.
 case "${BOARD_AGENT}" in
@@ -230,8 +231,8 @@ export PLAN_DELEGATE_BOARD_DIR="${SESSION_DIR}"
 # tools would be there and reach nobody. A codex delegate reaches the same place
 # by a different road: `codex exec` really is unreachable from outside its own
 # process, but a thread on a shared `codex app-server` is addressable, so
-# codex_mesh.py launches it there instead. Without the flag, codex keeps the
-# plain launcher and coordinates through the board alone.
+# codex_mesh.py launches it there instead. With codex_mesh=0 it falls back to
+# the plain launcher and coordinates through the board alone.
 if [[ "${AGENT_FAMILY}" == "claude" ]]; then
   bash "${SCRIPT_DIR}/../agents/agent_bg.sh" \
     "${MESH_NAME}" "${WORKING_DIR}" "${PROMPT_FILE}" "${SUMMARY_FILE}" \

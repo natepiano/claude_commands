@@ -417,7 +417,7 @@ def _history_root() -> Path:
 class PhasePass(TypedDict):
     """One pass a phase ran: what work it was, which seat ran it, how it ended.
 
-    `kind` stays semantic -- impl, fix, review, arch -- and says nothing about
+    `kind` stays semantic -- impl, test, fix, review -- and says nothing about
     who ran it. `slot` is the seat: a stable worker identity for the length of
     one launcher, not the role that worker is performing, which changes during a
     phase and lives on the coordination board.
