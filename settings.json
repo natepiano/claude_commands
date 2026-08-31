@@ -198,6 +198,7 @@
   "skipWorkflowUsageWarning": true,
   "theme": "dark",
   "editorMode": "normal",
+  "crossSessionInbound": "accept",
   "autoCompactEnabled": true,
   "teammateMode": "in-process",
   "inputNeededNotifEnabled": true,
