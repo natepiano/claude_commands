@@ -106,6 +106,16 @@ store. `plan-delegate` is the only one.
 - **Compare agent:effort with `stages --group stage,task,agent`.** `called_agent`
   and `called_task` are stamped on every pass event, so the grouping reads the
   assignment off the data instead of reconstructing it.
+- **`task` and `stage` say the same thing for a delegate pass**, so group on one
+  or the other, not both, unless a second skill is in the window. Delegate tasks
+  are the four kinds — `impl`, `test`, `fix`, `review` — and `agents.conf` holds
+  one row per kind. It used to hold five keys where three (`architect`,
+  `mechanical`, `escalation`) named an agent tier rather than a job, and on
+  2026-08-30 the tier axis was removed and 6141 stored events were rewritten to
+  the kind each pass had actually run under. **Nothing is translated at read
+  time**, so a query over any window returns the four; the pre-migration logs
+  are kept at `~/.local/state/plan-delegate/backup-runs-2026-08-30-four-kinds`
+  and are the only place escalated work is separable from ordinary work.
 - **Stage totals are agent time, not elapsed.** The footer prints both and their
   ratio (about 1.7x parallel); summed stage seconds exceed the elapsed union.
 - **A cell needs roughly 80 samples** before a difference under 1.5x separates from

@@ -23,7 +23,7 @@ list_skills() {
 # subtasks and current agent so they are copy-pasteable.
 usage() {
     local fn="${1:-}" switched="${2:-}"
-    local ex_fn="delegate" ex_other="claude" ex_row="delegate.escalation"
+    local ex_fn="delegate" ex_other="claude" ex_row="delegate.review"
     local ex_pair="gpt-5.6-sol:max" family row_line
     if [[ -n "$switched" ]]; then
         [[ "$switched" == "codex" ]] && ex_other="claude" || ex_other="codex"

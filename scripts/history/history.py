@@ -45,19 +45,6 @@ PASS_STAGE: dict[str, str] = {
     "test": "test",
     "fix": "fix",
     "review": "review",
-    # Escalation is implementation, not review: it is ambiguous architecture,
-    # transform mathematics, or a failed behavioral attempt, dispatched
-    # alongside implementation and fix. Real architecture review is 1085 passes
-    # of kind `review` carrying task `delegate.architect`.
-    #
-    # `arch` is a retired kind, kept forever because retiring one cannot rewrite
-    # events already written and dropping it would send the back corpus to
-    # `other`. It meant "escalated implementation", which was the agent tier
-    # leaking into the work kind: `delegate.escalation` runs under `fix` 917
-    # times and under `arch` only 172, so the same escalation was encoded two
-    # ways depending on the phase. The tier lives on `called_task` for every
-    # kind -- group by `stage,task` to separate escalated work from ordinary.
-    "arch": "implementation",
 }
 ACTIVITY_STAGE: dict[str, str] = {
     # An activity may name its own stage outright; these are not aliases.
@@ -115,13 +102,24 @@ def _clean_label(label: str) -> str:
 def _clean_task(task: str) -> str:
     """A task name without its skill prefix, so it matches agents.conf keys.
 
-    The ledger holds both `delegate.escalation` (1089) and bare `escalation`
-    (21) for one tier. Stripping the prefix collapses them and leaves exactly
-    the names agents.conf uses -- implementation, review, architect, mechanical,
-    escalation -- so config and history speak the same words.
+    The ledger holds both `delegate.fix` and bare `fix` (21) for one task, and
+    only the bare name matches a config key.
+
+    Task and kind are the same four words -- impl, test, fix, review -- and the
+    stored logs say so directly. `agents.conf` once carried five delegate keys
+    where two named the work and three named how hard an agent to send
+    (`architect`, `mechanical`, `escalation`), so one field answered two
+    questions and neither could be read off a name. On 2026-08-30 the tier axis
+    was removed from the config and the 6141 events carrying a retired name were
+    rewritten in place to the kind each had actually run under; the pre-migration
+    logs are at `~/.local/state/plan-delegate/backup-runs-2026-08-30-four-kinds`.
+    Nothing is mapped at read time, so a retired name appearing here again means
+    a writer was missed, not a log to translate.
     """
     prefix, _, rest = task.partition(".")
     return rest if rest and prefix == "delegate" else task
+
+
 GROUP_KEYS: list[str] = [
     "skill",
     "stage",

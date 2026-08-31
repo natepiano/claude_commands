@@ -38,7 +38,7 @@ Every function carries *both* family sets, fully specified at all times, so a fa
 
 | Function | Sub-tasks |
 | --- | --- |
-| `delegate` | `implementation`, `review`, `architect`, `mechanical`, `escalation` |
+| `delegate` | `impl`, `test`, `fix`, `review` |
 | `cli` | `style_fix_review`, `commit_prep`, `merge_branch`, `interactive` |
 | `fix` | `style_eval`, `style_eval_review`, `style_fix`, `report` |
 | `ask_a_friend` | `consultation`, `implementation` |
@@ -302,7 +302,7 @@ All four wrappers capture resolver stderr into their log (`agents_resolve "$TASK
   line's `reach=` field is what tells a peer which of the two it is addressing.
 - The fix pipeline runs unattended via launchd every 10 minutes (`com.natemccoy.style-fix.plist`, `StartInterval=600`, no idle gate). `agents_config.sh`, `agent_assignments.sh`, the three stage scripts, and `fix_report_parse.py` must never be left broken, and the resolver must keep working under `/bin/bash` (3.2).
 - `/plan:delegate` is itself implemented by `scripts/delegate/*`, so any rename or signature change to those launchers must land together with the `commands/plan/delegate.md` call-site edits in one change.
-- Every `implement.sh` dispatch is a member of a phase team: `team_role` is required, every artifact it writes is suffixed with that role, and at most one member of a phase carries a `pass_kind`. The board, not the launcher, is what a fourth concurrent member would change.
+- Every `implement.sh` dispatch is a member of a phase team: `team_role` is required, every artifact it writes is suffixed with that role, and every member carries a `pass_kind`, so a team phase records one pass per seat rather than one for the whole phase. The kind names the work the seat was assigned and nothing else: the `test` seat records `test`, the review seat `review`, the repairing seat `impl` or `fix`. An earlier claim here that a `test` kind would rewrite the `implementation` stage across the back corpus was wrong -- adding a kind cannot change stored events, only adding a stage could. A kind never triggers behavior either: round resolution is `PLAN_DELEGATE_RESOLVES_ROUND=1`, set on exactly one seat, so a second seat can record `fix` honestly without resolving the round twice. The board, not the launcher, is what a fourth concurrent member would change.
 - No `/plan:delegate` prompt tells an agent to acquire the `cargo` token. `verify.sh` takes it, and a prompt that takes it too deadlocks the agent against its own held token.
 - `cf_load_stage_assignment` keeps its five-argument out-var signature; `fix-usage.sh` and the print helpers call it positionally.
 - The report parser slices launchd runs on exact substrings of the driver's stage-start lines — a reword must keep those leading phrases byte-identical or update the parser in the same change.

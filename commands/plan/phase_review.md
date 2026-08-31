@@ -146,16 +146,18 @@ Write the prompt to `${SESSION_DIR}/architect_prompt_<phase>.md`, then:
 bash ~/.claude/scripts/delegate/review.sh \
   "${SESSION_DIR}" "${WORKING_DIR}" \
   "${SESSION_DIR}/architect_prompt_<phase>.md" \
-  architect \
+  review \
   "<plan-doc filename> — phase: <phase>
 architect review of the remaining phases against what phase <phase> actually shipped" \
   "reviewing the remaining phases against what just shipped" \
   <pass_index>
 ```
 
-- `architect` is the subtask name; it resolves through
-  `[delegate.<family>]` in `~/.claude/config/agents.conf` like every other
-  delegate subtask.
+- `review` is the subtask name; it resolves through `[delegate.<family>]` in
+  `~/.claude/config/agents.conf` like every other delegate subtask. There is no
+  separate `architect` row: that key named an agent tier rather than a kind of
+  work, and every architecture-review pass ever recorded already ran as kind
+  `review`. The four subtasks are `impl`, `test`, `fix`, `review`.
 - `<pass_index>` continues the phase's review numbering — one past the last code
   review pass — so `review_findings_<N>.txt` never overwrites a code review's
   findings. Findings come back in that file.

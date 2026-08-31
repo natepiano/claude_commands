@@ -57,7 +57,7 @@ On success the edit prints a `# updated [<function>.<family>] <task> — live|do
 /agent module_review                      show just module_review's rows
 /agent claude                             every function switches to the claude family
 /agent delegate claude                    /plan:delegate switches to the claude family
-/agent delegate.escalation gpt-5.6-sol:max   set agent and effort for one subtask
+/agent delegate.review gpt-5.6-sol:max     set agent and effort for one subtask
 /agent cli.commit_prep sonnet             set agent, keep the CLI default effort
 ```
 
