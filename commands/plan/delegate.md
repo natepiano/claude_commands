@@ -925,7 +925,7 @@ on-disk shapes are:
 | --- | --- | --- |
 | `RepositoryNotEnrolled` | `/sync board` returning `unconfigured` | Owns no reservation; supplies no release argument. |
 | `EnrolledAwaitingFirstTouch` | `/sync board` returning `board_ready` | The registered edit hook still owns first-touch acquisition; supplies no release argument. |
-| `Active` | The edit hook, from a validated clear-check result whose acquisition is `appended` or `already_held` | Copies the returned reservation and coordination-run ids, phase, and protected phase-start HEAD; supplies a release argument. |
+| `Active` | The edit hook, from a clear check that acquired or already held the scopes | Copies the returned reservation and coordination-run ids, phase, and protected phase-start HEAD; supplies a release argument. |
 | `CheckpointCommittedAwaitingReleaseConfirmation` | <CheckpointCommit/> step 6, atomically replacing `Active` once that step's commit succeeds | Copies the active fields plus the full object id captured immediately from that commit; supplies a release argument, and resumes only at release confirmation. |
 
 These are
@@ -1585,9 +1585,13 @@ reporting anything about the round.
    than resolves by majority.
 2. Present <DelegationResultFormat/>. If the user is confused, apply
    <ExplainOnDemand/> before any choice.
-3. If all remaining issues are doc-only or one/two-line mechanical changes and
-   both reviews agree, the main agent applies them directly, reports why they
-   qualify, and continues. This exception exists only after <DualReview/>.
+3. If every remaining issue is trivial — doc-only, an agreed rename, or a
+   small mechanical change whose one correct edit is evident from the finding
+   itself, with no design judgment and no reviewer disputing the reading — the
+   main agent applies them all directly, runs the implicated `verify.sh` lines,
+   reports the edits and why they qualified, and continues. A fix round is
+   never dispatched for a batch that is trivial throughout; a single
+   non-trivial finding sends the whole batch through steps 4–5 instead.
 4. Apply <DecisionRouting/> before opening findings.
 5. Open every confirmed remaining issue, then obey `findings.py gate`:
    - `converged`: retain nits for retrospective; continue to smoke.
