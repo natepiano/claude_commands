@@ -30,7 +30,7 @@ failed on Linux looking for `/opt/homebrew/bin/python3`.
 
 | # | plist / installer | what it does | trigger | status |
 |---|---|---|---|---|
-| 1 | scripts/sccache/com.natemccoy.sccache.plist | starts the sccache server | RunAtLoad | |
+| 1 | scripts/sccache/com.natemccoy.sccache.plist | starts the sccache server | RunAtLoad | **DONE** - no service needed; only SCCACHE_IDLE_TIMEOUT=0 mattered, now in /etc/nixos/modules/development.nix. --start-server is redundant: the client starts the server on first use on both platforms. |
 | 2 | scripts/settings/ensure_git_filters.sh (generates its plist inline) | refreshes the filtered settings.json index after a write | WatchPaths | already guards on `command -v launchctl` |
 | 3 | scripts/fix/com.natemccoy.style-fix.plist | periodic style-fix pipeline | StartInterval | |
 | 4 | scripts/agents/com.natemccoy.codex-agent-catalog-sync.plist | keeps the agent catalog current | RunAtLoad + StartInterval | |
@@ -52,3 +52,11 @@ declarative.
 - **`scripts/release/restore_unreleased.sh`** uses `\n` in a sed replacement,
   which GNU sed expands and BSD sed does not. Pre-existing, not introduced here.
 - **Mac-side verification**: none of this has been run on the Mac yet.
+
+## Open question for the .plist files
+
+launchd does not expand `~` or `$HOME` inside `ProgramArguments`, so the Mac
+plists genuinely need absolute paths -- which is why `/Users/natemccoy` still
+appears in them and nowhere else. Options if that matters: generate each plist
+from a template at install time, or leave them, since they are macOS-only files
+that Linux never reads.
