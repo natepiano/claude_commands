@@ -20,7 +20,6 @@ from enum import Enum
 from pathlib import Path
 from typing import (
     ClassVar,
-    TypeAlias,
     cast,
     override,
 )
@@ -54,7 +53,11 @@ DIVERGENT_TIMING_BASE_COMMIT_COUNT = 32
 DIVERGENT_TIMING_COMMITS_PER_SUBJECT = 8
 TIMING_RETAINED_RESERVATION_COUNT = 2
 HISTORY_GIT_PROCESS_CEILING = 6
-LIVE_BOARD_GIT_PROCESS_CEILING = 3
+# The hook runs drift and the live board read inside one `hook post-tool-use`
+# process, so this bounds both together -- it was 3 when a canned drift result
+# could be substituted for the first half, and that substitution stopped being
+# possible when the two engine calls became one.
+LIVE_BOARD_GIT_PROCESS_CEILING = 9
 FNV_OFFSET_BASIS = 14_695_981_039_346_656_037
 FNV_PRIME = 1_099_511_628_211
 UINT64_MASK = (1 << 64) - 1
@@ -120,20 +123,43 @@ class HookInvocation:
         return 1 + len(self.cargo_berth_calls) + self.jq_call_count
 
 
-@dataclass(frozen=True)
-class InstalledTimedDrift:
-    """Run the installed engine for the measured drift command."""
+# Every PostToolUse route now costs the same two processes: the wrapper's bash,
+# and the one `exec cargo-berth hook post-tool-use` it hands off to. No jq at
+# all. The wrapper does not branch on the outcome, so nothing the hook itself does
+# can move this number -- what used to differ per outcome was a front end that
+# read the board in a second engine call and rendered incidents through jq, and
+# that front end is gone. A per-outcome expectation is what let this measurement
+# keep asserting a process count the wrapper had stopped producing. The only
+# cells that record more are the ones whose fixture injects a competing process
+# on purpose; see expected_hook_level_executables below.
+HOOK_LEVEL_EXECUTABLES = 2
 
 
-@dataclass(frozen=True)
-class FixedIncursionTimedDrift:
-    """Use one real incursion envelope to isolate the following live board read."""
+def expected_hook_level_executables(
+    git_race_transition: "GitRaceTransition",
+) -> int:
+    """Return the executables one hook invocation records for this fixture."""
 
-    envelope: dict[str, object]
+    # Two fixtures reproduce a race by having the instrumented git wrapper fire a
+    # real competing cargo-berth process -- a foreign `claim` against the same
+    # scope, or a concurrent `release` of the marker reservation -- while the
+    # engine is mid-`git status`. That process is logged to the same call log this
+    # count reads, so those cells record one executable beyond the two the hook
+    # front end itself spawns. It is the fixture's injection being counted, not
+    # the wrapper branching on an outcome.
+    if git_race_transition is GitRaceTransition.UNCHANGED:
+        return HOOK_LEVEL_EXECUTABLES
+    return HOOK_LEVEL_EXECUTABLES + 1
 
 
-TimedDriftExecution: TypeAlias = InstalledTimedDrift | FixedIncursionTimedDrift
-DEFAULT_INSTALLED_TIMED_DRIFT = InstalledTimedDrift()
+# `hook post-tool-use` writes its outcome into the JSON body on stdout and always
+# exits 0: the PostToolUse contract reads a non-zero exit as a failed hook, not as
+# a reported outcome, so the route has exactly one exit code and it cannot vary.
+# The per-route numbers that used to sit at these call sites -- 20 for a clear
+# tree, 21 for a widen or a replay stop -- belonged to the retired
+# `drift --post-tool-use-payload` route, which encoded the outcome in the exit
+# code because it had no JSON body to put it in.
+POST_TOOL_USE_HOOK_EXIT_CODE = 0
 
 
 class ProcessCacheTemperature(Enum):
@@ -403,7 +429,6 @@ class PostToolUseTimingCell:
 
     outcome: PostToolUseOutcome
     durable_proof_cache_states: tuple[DurableProofCacheState, ...]
-    expected_hook_level_executables: int
     expected_provenance_log_argv: int
     expected_provenance_rev_list_argv: int
     expected_equivalence_argv: int
@@ -696,12 +721,7 @@ PUBLISHED_POST_TOOL_USE_BOUND = PublishedPostToolUseBound(
                 "claim_separately_here",
             ),
             action_argv=(
-                (
-                    str(INSTALLED_BINARY),
-                    "drift",
-                    "--json",
-                    "--post-tool-use-payload",
-                ),
+                ("cargo-berth", "drift", "--json"),
                 ("cargo-berth", "identity", "clear-session", "--json"),
             ),
         ),
@@ -808,7 +828,6 @@ class InstalledFrontEndFixture(unittest.TestCase):
         fixture: ScratchPostToolUseRepository,
         process_cache_temperature: ProcessCacheTemperature = ProcessCacheTemperature.WARMED_EXECUTABLE_PAGES,
         hook: Path = POST_BASH_HOOK,
-        drift_execution: TimedDriftExecution = DEFAULT_INSTALLED_TIMED_DRIFT,
         session_id: str = "fixture-session",
     ) -> HookInvocation:
         """Run the canonical hook with forwarding engine, git, and jq traces."""
@@ -865,13 +884,6 @@ class InstalledFrontEndFixture(unittest.TestCase):
 
         hook_environment = self.base_environment.copy()
         hook_environment.update(fixture.transition_environment)
-        match drift_execution:
-            case InstalledTimedDrift():
-                timed_drift_source = "installed_engine"
-                fixed_drift_response = ""
-            case FixedIncursionTimedDrift(envelope):
-                timed_drift_source = "fixed_incursion"
-                fixed_drift_response = json.dumps(envelope, separators=(",", ":"))
         hook_environment.update(
             {
                 "BASH_ENV": str(bash_environment),
@@ -881,8 +893,6 @@ class InstalledFrontEndFixture(unittest.TestCase):
                 "CARGO_BERTH_TEST_GIT_TRACE": str(git_call_log),
                 "CARGO_BERTH_TEST_REAL_GIT": real_git,
                 "CARGO_BERTH_TEST_REAL_PATH": self.base_environment["PATH"],
-                "CARGO_BERTH_TEST_TIMED_DRIFT_SOURCE": timed_drift_source,
-                "CARGO_BERTH_TEST_FIXED_DRIFT_RESPONSE": fixed_drift_response,
                 "PATH": os.pathsep.join(
                     [str(fixture_bin), self.base_environment["PATH"]]
                 ),
@@ -974,7 +984,6 @@ class InstalledFrontEndFixture(unittest.TestCase):
     def run_installed_engine_post_tool_use_probe(
         self,
         repository_root: Path,
-        expected_exit_code: int,
         process_cache_temperature: ProcessCacheTemperature,
     ) -> PostToolUseEngineExecutionMeasurement:
         """Time the exact engine request issued across the PostToolUse boundary."""
@@ -986,7 +995,7 @@ class InstalledFrontEndFixture(unittest.TestCase):
         )
         self.assertEqual(
             completed.returncode,
-            expected_exit_code,
+            POST_TOOL_USE_HOOK_EXIT_CODE,
             f"fixed-cost PostToolUse engine probe failed: stdout={completed.stdout!r}, stderr={completed.stderr!r}",
         )
         decoded = cast(object, json.loads(completed.stdout))
@@ -999,7 +1008,6 @@ class InstalledFrontEndFixture(unittest.TestCase):
     def run_installed_engine_post_tool_use_elapsed_probe(
         self,
         repository_root: Path,
-        expected_exit_code: int,
         process_cache_temperature: ProcessCacheTemperature,
     ) -> float:
         """Time a PostToolUse engine route whose pass-through output may be empty."""
@@ -1011,7 +1019,7 @@ class InstalledFrontEndFixture(unittest.TestCase):
         )
         self.assertEqual(
             completed.returncode,
-            expected_exit_code,
+            POST_TOOL_USE_HOOK_EXIT_CODE,
             f"fixed-cost PostToolUse engine probe failed: stdout={completed.stdout!r}, stderr={completed.stderr!r}",
         )
         return elapsed_seconds
@@ -1038,12 +1046,7 @@ class InstalledFrontEndFixture(unittest.TestCase):
             TimedChildExecutablePages((INSTALLED_BINARY,)).invalidate_and_verify_cold()
         started_at = time.perf_counter()
         completed = subprocess.run(
-            [
-                str(INSTALLED_BINARY),
-                "drift",
-                "--json",
-                "--post-tool-use-payload",
-            ],
+            [str(INSTALLED_BINARY), "hook", "post-tool-use"],
             cwd=repository_root,
             env=environment,
             input=json.dumps(self.post_bash_payload_for(repository_root)),
@@ -1064,11 +1067,6 @@ command_name=${{1-}}
 shift || true
 printf '\\t%s' \"$@\" >> {shlex.quote(str(call_log))}
 printf '\\n' >> {shlex.quote(str(call_log))}
-if [ \"$command_name\" = drift ] \\
-    && [ \"$CARGO_BERTH_TEST_TIMED_DRIFT_SOURCE\" = fixed_incursion ]; then
-    printf '%s\\n' \"$CARGO_BERTH_TEST_FIXED_DRIFT_RESPONSE\"
-    exit 1
-fi
 unset BASH_ENV CARGO_BERTH_TEST_ROOT_SHELL_PID
 exec \"$CARGO_BERTH_TEST_BINARY\" \"$command_name\" \"$@\"
 """
@@ -2238,7 +2236,7 @@ exec \"$CARGO_BERTH_TEST_REAL_GIT\" \"$first_argument\" \"$@\"
         self,
         incident_cardinality: IncursionIncidentCardinality,
         retained_state: RetainedIncursionState,
-    ) -> tuple[ScratchPostToolUseRepository, FixedIncursionTimedDrift]:
+    ) -> ScratchPostToolUseRepository:
         """Build a fixed-reservation board with an exact retained-incident count."""
 
         fixture = self.new_scratch_post_tool_use_repository(
@@ -2254,7 +2252,6 @@ exec \"$CARGO_BERTH_TEST_REAL_GIT\" \"$first_argument\" \"$@\"
         _ = self.claim_scratch_scope(foreign_root, "tree:shared", SECOND_RUN)
         shared_root = fixture.repository_root / "shared"
         shared_root.mkdir()
-        observed_incursion: dict[str, object] = {}
         for incident_index in range(incident_cardinality.value):
             _ = (shared_root / f"entered-{incident_index}.txt").write_text(
                 f"incursion {incident_index}\n", encoding="utf-8"
@@ -2289,7 +2286,7 @@ exec \"$CARGO_BERTH_TEST_REAL_GIT\" \"$first_argument\" \"$@\"
             FIRST_RUN,
             WORKING_REPOSITORY_JOURNAL_RECORD_COUNT,
         )
-        return fixture, FixedIncursionTimedDrift(observed_incursion)
+        return fixture
 
     def post_tool_use_timing_cells(self) -> list[PostToolUseTimingCell]:
         no_proof = (DurableProofCacheState.NOT_APPLICABLE,)
@@ -2298,27 +2295,27 @@ exec \"$CARGO_BERTH_TEST_REAL_GIT\" \"$first_argument\" \"$@\"
             DurableProofCacheState.STORED,
         )
         return [
-            PostToolUseTimingCell(PostToolUseOutcome.TYPED_REPLAY_FAILURE, no_proof, 2, 0, 0, 0, "widen_requires_unreleased", 0),
-            PostToolUseTimingCell(PostToolUseOutcome.TYPED_CLEAR, no_proof, 2, 0, 0, 0, "", 6),
-            PostToolUseTimingCell(PostToolUseOutcome.ORDINARY_WIDEN, no_proof, 2, 0, 0, 0, "AUTO-WIDEN", 6),
-            PostToolUseTimingCell(PostToolUseOutcome.FIRST_TOUCH_ACQUISITION, no_proof, 2, 0, 0, 0, "FIRST-TOUCH CLAIM", 3),
-            PostToolUseTimingCell(PostToolUseOutcome.FOREIGN_ONLY_INCURSION, no_proof, 3, 0, 0, 0, "INCURSION", 9),
-            PostToolUseTimingCell(PostToolUseOutcome.RECORDED_INCURSION, no_proof, 4, 0, 0, 0, "", 9),
-            PostToolUseTimingCell(PostToolUseOutcome.UNREADABLE_JOURNAL, no_proof, 2, 0, 0, 0, "could not read the reservation ledger", 0),
-            PostToolUseTimingCell(PostToolUseOutcome.DUPLICATE_INCURSION_INCIDENT, no_proof, 2, 0, 0, 0, "REPLAY HARD STOP: duplicate_incursion_incident", 0),
-            PostToolUseTimingCell(PostToolUseOutcome.POST_WRITE_INCURSION_ACQUIRED, no_proof, 2, 0, 0, 0, "First-touch reservation", 3),
-            PostToolUseTimingCell(PostToolUseOutcome.POST_WRITE_INCURSION_NOT_ACQUIRED, no_proof, 2, 0, 0, 0, "nothing was reserved", 3),
-            PostToolUseTimingCell(PostToolUseOutcome.COLLISION, no_proof, 3, 0, 0, 0, "COLLISION", 6),
-            PostToolUseTimingCell(PostToolUseOutcome.ATTRIBUTION, no_proof, 3, 1, 1, 0, "Committed by", 12),
-            PostToolUseTimingCell(PostToolUseOutcome.LOST_EVIDENCE_RESOLVED_TRUNK, no_proof, 2, 0, 0, 0, "--integrated-as", 13),
-            PostToolUseTimingCell(PostToolUseOutcome.LOST_EVIDENCE_UNRESOLVED_TRUNK, no_proof, 2, 0, 0, 0, "Resolve trunk first", 9),
-            PostToolUseTimingCell(PostToolUseOutcome.TRUNK_EQUIVALENCE_POSITIVE, proof_states, 2, 0, 0, 7, "", 13),
-            PostToolUseTimingCell(PostToolUseOutcome.TRUNK_EQUIVALENCE_NEGATIVE, proof_states, 2, 0, 0, 6, "INTEGRATION EVIDENCE LOST", 12),
-            PostToolUseTimingCell(PostToolUseOutcome.SUCCESSOR_EQUIVALENCE_POSITIVE, proof_states, 2, 0, 0, 7, "", 14),
-            PostToolUseTimingCell(PostToolUseOutcome.SUCCESSOR_EQUIVALENCE_NEGATIVE, proof_states, 2, 0, 0, 6, "", 13),
-            PostToolUseTimingCell(PostToolUseOutcome.STALE_SESSION_MAPPING, no_proof, 2, 0, 0, 0, "stale_session_mapping", 4),
-            PostToolUseTimingCell(PostToolUseOutcome.STALE_MARKER_RUN, no_proof, 3, 0, 0, 0, "stale_marker_run", 6),
-            PostToolUseTimingCell(PostToolUseOutcome.SESSION_WORKTREE_MISMATCH, no_proof, 2, 0, 0, 0, "session_worktree_mismatch", 2),
+            PostToolUseTimingCell(PostToolUseOutcome.TYPED_REPLAY_FAILURE, no_proof, 0, 0, 0, "widen_requires_unreleased", 0),
+            PostToolUseTimingCell(PostToolUseOutcome.TYPED_CLEAR, no_proof, 0, 0, 0, "", 6),
+            PostToolUseTimingCell(PostToolUseOutcome.ORDINARY_WIDEN, no_proof, 0, 0, 0, "AUTO-WIDEN", 6),
+            PostToolUseTimingCell(PostToolUseOutcome.FIRST_TOUCH_ACQUISITION, no_proof, 0, 0, 0, "FIRST-TOUCH CLAIM", 3),
+            PostToolUseTimingCell(PostToolUseOutcome.FOREIGN_ONLY_INCURSION, no_proof, 0, 0, 0, "INCURSION", 9),
+            PostToolUseTimingCell(PostToolUseOutcome.RECORDED_INCURSION, no_proof, 0, 0, 0, "", 9),
+            PostToolUseTimingCell(PostToolUseOutcome.UNREADABLE_JOURNAL, no_proof, 0, 0, 0, "could not read the reservation ledger", 0),
+            PostToolUseTimingCell(PostToolUseOutcome.DUPLICATE_INCURSION_INCIDENT, no_proof, 0, 0, 0, "REPLAY HARD STOP: duplicate_incursion_incident", 0),
+            PostToolUseTimingCell(PostToolUseOutcome.POST_WRITE_INCURSION_ACQUIRED, no_proof, 0, 0, 0, "First-touch reservation", 3),
+            PostToolUseTimingCell(PostToolUseOutcome.POST_WRITE_INCURSION_NOT_ACQUIRED, no_proof, 0, 0, 0, "nothing was reserved", 3),
+            PostToolUseTimingCell(PostToolUseOutcome.COLLISION, no_proof, 0, 0, 0, "COLLISION", 6),
+            PostToolUseTimingCell(PostToolUseOutcome.ATTRIBUTION, no_proof, 1, 1, 0, "Committed by", 12),
+            PostToolUseTimingCell(PostToolUseOutcome.LOST_EVIDENCE_RESOLVED_TRUNK, no_proof, 0, 0, 0, "--integrated-as", 13),
+            PostToolUseTimingCell(PostToolUseOutcome.LOST_EVIDENCE_UNRESOLVED_TRUNK, no_proof, 0, 0, 0, "Resolve trunk first", 9),
+            PostToolUseTimingCell(PostToolUseOutcome.TRUNK_EQUIVALENCE_POSITIVE, proof_states, 0, 0, 7, "", 13),
+            PostToolUseTimingCell(PostToolUseOutcome.TRUNK_EQUIVALENCE_NEGATIVE, proof_states, 0, 0, 6, "INTEGRATION EVIDENCE LOST", 12),
+            PostToolUseTimingCell(PostToolUseOutcome.SUCCESSOR_EQUIVALENCE_POSITIVE, proof_states, 0, 0, 7, "", 14),
+            PostToolUseTimingCell(PostToolUseOutcome.SUCCESSOR_EQUIVALENCE_NEGATIVE, proof_states, 0, 0, 6, "", 13),
+            PostToolUseTimingCell(PostToolUseOutcome.STALE_SESSION_MAPPING, no_proof, 0, 0, 0, "stale_session_mapping", 4),
+            PostToolUseTimingCell(PostToolUseOutcome.STALE_MARKER_RUN, no_proof, 0, 0, 0, "stale_marker_run", 6),
+            PostToolUseTimingCell(PostToolUseOutcome.SESSION_WORKTREE_MISMATCH, no_proof, 0, 0, 0, "session_worktree_mismatch", 2),
         ]
 
     def assert_installed_engine_preflight(self) -> None:
@@ -2678,7 +2675,6 @@ exec \"$CARGO_BERTH_TEST_REAL_GIT\" \"$first_argument\" \"$@\"
                 post_tool_use_engine_replay = (
                     self.run_installed_engine_post_tool_use_probe(
                         replay_fixture.repository_root,
-                        21,
                         process_cache_temperature,
                     )
                 )
@@ -2693,7 +2689,6 @@ exec \"$CARGO_BERTH_TEST_REAL_GIT\" \"$first_argument\" \"$@\"
                     cumulative_samples["engine_post_tool_use_clear_route"].append(
                         self.run_installed_engine_post_tool_use_elapsed_probe(
                             clear_fixture.repository_root,
-                            20,
                             process_cache_temperature,
                         )
                     )
@@ -2708,7 +2703,6 @@ exec \"$CARGO_BERTH_TEST_REAL_GIT\" \"$first_argument\" \"$@\"
                     cumulative_samples["engine_post_tool_use_widen_route"].append(
                         self.run_installed_engine_post_tool_use_elapsed_probe(
                             widen_fixture.repository_root,
-                            21,
                             process_cache_temperature,
                         )
                     )
@@ -2864,7 +2858,7 @@ exec \"$CARGO_BERTH_TEST_REAL_GIT\" \"$first_argument\" \"$@\"
             "attribution_error_fraction": attribution_error_fraction,
             "allocation_method": "independent cumulative probes checked against a linear zero-Git intercept fitted from the median production outcome-matrix routes",
             "ledger_probe_boundary": "configured ledger open and replay are isolated by subtracting the unconfigured repository route; the replay-error exit is not used as the intercept",
-            "shim_engine_boundary_probe": "the canonical PostToolUse wrapper invoking the real engine for a working-journal replay failure, minus a wrapper-shaped script that starts Bash and resolves cargo-berth on PATH without executing it, minus the standalone engine executing the identical hook post-tool-use request",
+            "shim_engine_boundary_probe": "the canonical PostToolUse wrapper invoking the real engine for a working-journal replay failure, minus a stand-in script that starts Bash and resolves cargo-berth on PATH without executing it, minus the standalone engine executing the identical hook post-tool-use request",
             "engine_post_replay_mutation_probe": "the standalone ordinary-widen PostToolUse route minus the standalone typed-clear PostToolUse route over separately restored two-reservation, 214-record fixtures; both routes execute the same six Git command families, so their signed delta isolates changed-path observation, widening, mutation-lock, durable-append, response-construction, and route-completion work after replay",
             "component_sum_symbolic_reduction": component_sum_route_coefficients,
             "negative_median_delta_resolution": "none; signed independently measured differences remain visible",
@@ -3152,7 +3146,9 @@ exec \"$CARGO_BERTH_TEST_REAL_GIT\" \"$first_argument\" \"$@\"
                 expected_observations = (
                     (
                         PostToolUseObservationContract.HOOK_LEVEL_EXECUTABLE_COUNT,
-                        cell.expected_hook_level_executables,
+                        expected_hook_level_executables(
+                            fixture.git_race_transition
+                        ),
                         invocation.hook_level_executable_count,
                     ),
                     (
@@ -3333,7 +3329,10 @@ exec \"$CARGO_BERTH_TEST_REAL_GIT\" \"$first_argument\" \"$@\"
                     fixture, process_cache_temperature
                 )
                 self.assertEqual(invocation.process.returncode, 0)
-                self.assertEqual(invocation.hook_level_executable_count, 2)
+                self.assertEqual(
+                    invocation.hook_level_executable_count,
+                    expected_hook_level_executables(fixture.git_race_transition),
+                )
                 self.assertEqual(
                     invocation.process.stdout + invocation.process.stderr, ""
                 )
@@ -3439,7 +3438,10 @@ exec \"$CARGO_BERTH_TEST_REAL_GIT\" \"$first_argument\" \"$@\"
                     fixture, process_cache_temperature
                 )
                 self.assertEqual(invocation.process.returncode, 0)
-                self.assertEqual(invocation.hook_level_executable_count, 2)
+                self.assertEqual(
+                    invocation.hook_level_executable_count,
+                    expected_hook_level_executables(fixture.git_race_transition),
+                )
                 rendered = invocation.process.stdout + invocation.process.stderr
                 self.assertEqual(
                     rendered.count(required_text), alert_cardinality.value
@@ -3502,10 +3504,8 @@ exec \"$CARGO_BERTH_TEST_REAL_GIT\" \"$first_argument\" \"$@\"
             process_cache_temperature
             is ProcessCacheTemperature.WARMED_EXECUTABLE_PAGES
         ):
-            warmup_fixture, warmup_drift = (
-                self.prepare_incident_cardinality_timing_fixture(
-                    incident_cardinality, retained_state
-                )
+            warmup_fixture = self.prepare_incident_cardinality_timing_fixture(
+                incident_cardinality, retained_state
             )
             try:
                 self.assert_timing_repository_contract(
@@ -3516,9 +3516,7 @@ exec \"$CARGO_BERTH_TEST_REAL_GIT\" \"$first_argument\" \"$@\"
                         head_commit_count=SHALLOW_TIMING_HISTORY_COMMIT_COUNT,
                     ),
                 )
-                warmup = self.run_installed_engine_hook(
-                    warmup_fixture, drift_execution=warmup_drift
-                )
+                warmup = self.run_installed_engine_hook(warmup_fixture)
                 self.assertEqual(warmup.process.returncode, 0)
             finally:
                 warmup_fixture.cleanup()
@@ -3526,7 +3524,7 @@ exec \"$CARGO_BERTH_TEST_REAL_GIT\" \"$first_argument\" \"$@\"
         observed_git_argv: list[int] = []
         observed_git_sequences: list[tuple[str, ...]] = []
         for sample_index in range(POST_TOOL_USE_SAMPLE_COUNT):
-            fixture, fixed_drift = self.prepare_incident_cardinality_timing_fixture(
+            fixture = self.prepare_incident_cardinality_timing_fixture(
                 incident_cardinality, retained_state
             )
             try:
@@ -3551,12 +3549,13 @@ exec \"$CARGO_BERTH_TEST_REAL_GIT\" \"$first_argument\" \"$@\"
                 entries = cast(list[object], section["entries"])
                 self.assertEqual(len(entries), incident_cardinality.value)
                 invocation = self.run_installed_engine_hook(
-                    fixture,
-                    process_cache_temperature,
-                    drift_execution=fixed_drift,
+                    fixture, process_cache_temperature
                 )
                 self.assertEqual(invocation.process.returncode, 0)
-                self.assertEqual(invocation.hook_level_executable_count, 5)
+                self.assertEqual(
+                    invocation.hook_level_executable_count,
+                    expected_hook_level_executables(fixture.git_race_transition),
+                )
                 rendered = invocation.process.stdout + invocation.process.stderr
                 if retained_state is RetainedIncursionState.OUTSTANDING:
                     self.assertIn("STOP", rendered)
