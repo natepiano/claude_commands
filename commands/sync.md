@@ -8,21 +8,55 @@ description: Read the cargo-berth board, claim paths named directly, check phase
 drift, and operates reservation sequencing and integration. `cargo-berth` never
 reads Markdown, phases, or repository-specific structure.
 
-Use the installed executable on `PATH` only. Every invocation goes through
-`claim_state.py`, which sets `CARGO_BERTH_SESSION_ID` from
-`CLAUDE_CODE_SESSION_ID`, validates the frozen JSON envelope, checks that its
-status and exit code agree with the process exit code, and invokes the engine
-once. Never build, install, or retry the binary here.
+Use the installed executable on `PATH` only. Every invocation calls the engine
+directly. Never build, install, or retry the binary here.
 
-Set the module path for every command:
+## The invocation pattern
+
+Every command below runs this pattern once, substituting its own engine
+arguments. Run it as one Bash call so the engine runs once and its exit code
+survives:
 
 ```sh
-PYTHONPATH="$HOME/.claude/scripts" python3 -m berth.claim_state ...
+cd "$(git rev-parse --show-toplevel)" || exit 1
+envelope="${TMPDIR:-/tmp}/berth-envelope-$$.json"
+CARGO_BERTH_SESSION_ID="$CLAUDE_CODE_SESSION_ID" \
+  cargo-berth <engine arguments> --json >"$envelope"
+status=$?
+jq -r '(.presentation.blocks // []) as $blocks
+       | if ($blocks | length) == 0 then .message
+         else ($blocks
+               | map(if (.detail // "") == "" then .summary
+                     else .summary + "\n\n" + .detail end)
+               | join("\n\n"))
+         end' "$envelope"
+printf 'engine exit: %s\n' "$status"
 ```
 
-`--cwd "$PWD"` names the invocation directory, which may be any directory inside
-the repository. The coordinator resolves the repository top level with Git
-before invoking the engine. A directory outside a Git repository is an error.
+Three parts of it are not optional:
+
+- **`cd` to the repository top level.** `/sync` may be reached from any
+  directory inside the repository; the engine is invoked from its root. A
+  directory outside a Git repository is an error and stops the command.
+- **`CARGO_BERTH_SESSION_ID` from `CLAUDE_CODE_SESSION_ID`.** The engine reads
+  the coordination identity from its own variable, and the harness publishes the
+  session under a different one. An invocation missing it is a different actor.
+- **The exit code is captured before anything else runs.** The whole
+  authorization state machine below is phrased over exit codes, and a pipeline
+  reports the exit of its last stage, so `cargo-berth … | jq` would report `jq`'s
+  success for every engine refusal.
+
+The `jq` filter is transcription, never classification: it prints the blocks the
+engine already rendered, joined as the engine composed them, and falls back to
+the envelope's own message when a response carries no blocks. It reads no
+status, verb, or payload vocabulary, so a binary reporting something this
+installation has never heard of still prints. That is what makes installing a
+new binary the entire repair. Do not add wording, ordering, or interpretation to
+what it prints.
+
+`"$envelope"` holds the full response for the few commands below that name a
+field. Read those fields from it with `jq`; never re-derive from them anything
+the rendering already states.
 
 A repository that has not run `cargo-berth init` reports `unconfigured` and every
 command stops there, so this command is safe to reach from any repository.
@@ -31,19 +65,13 @@ command stops there, so this command is safe to reach from any repository.
 
 ### `/sync board`
 
-Run exactly:
+Engine arguments: `board`
 
-```sh
-PYTHONPATH="$HOME/.claude/scripts" python3 -m berth.claim_state board --cwd "$PWD"
-```
-
-The coordinator invokes `cargo-berth board --json` exactly once. Never invoke
-bare `board`: it can open the full-screen terminal or print only a pointer. Show
-`state.rendered_markdown`, not a pass-through of the engine's prose. Its JSON
-pointer rendering includes every envelope field, every field under
-`payload.data`, every additive alert, and a separate list of every `action`,
-`instruction`, `flag`, `flags`, `resolve_flag`, and `resolution` value. Do not
-drop a field or user action.
+Never invoke bare `board` without `--json`: it can open the full-screen terminal
+or print only a pointer. Show the rendering. It includes every envelope field,
+every field under `payload.data`, every additive alert, and a separate list of
+every `action`, `instruction`, `flag`, `flags`, `resolve_flag`, and `resolution`
+value. Do not drop a field or user action.
 
 `recovered_bypasses_this_invocation` is a one-read notice: show it on the read
 that adopted the pending marker. It is empty on the next read, while the durable
@@ -58,65 +86,55 @@ an explicit source. A reservation over the paths a phase edits now comes into
 being on first touch, so an explicit claim is for someone who wants to reserve
 paths ahead of touching them.
 
-```sh
-PYTHONPATH="$HOME/.claude/scripts" python3 -m berth.claim_state claim \
-  --cwd "$PWD" <file:path|tree:path>...
-```
+Engine arguments: `claim <file:path|tree:path>...`
 
 The command has one authorization state machine:
 
-1. **Blocked.** A neutral claim returning exit `1` has
-   `state.kind = blocked`. Show `state.rendered_markdown`; it is the shared
-   refusal rendering used by the `PreToolUse` shim. It names every holder's
-   reservation id, run id, branch or detached head, claim time, purpose, exact
-   shared scopes, and activity as either active or gone quiet with its last
-   activity time. It renders a `work_plan` source with plan and phase, an
-   `explicit` source as an explicit claim with no plan or phase, and a
-   `first_touch` source as a first-touch claim with no plan or phase. Never print
-   an empty plan/phase field or turn `first_touch` into `explicit`.
+1. **Blocked.** A neutral claim returning exit `1` is a refusal. Show the
+   rendering; it is the shared refusal rendering used by the `PreToolUse` hook.
+   It names every holder's reservation id, run id, branch or detached head, claim
+   time, purpose, exact shared scopes, and activity as either active or gone
+   quiet with its last activity time. It renders a `work_plan` source with plan
+   and phase, an `explicit` source as an explicit claim with no plan or phase,
+   and a `first_touch` source as a first-touch claim with no plan or phase. Never
+   print an empty plan/phase field or turn `first_touch` into `explicit`.
 
-   Read `state.scope_facts.kind`, never the presence of a sibling key. An
-   `exact_requested_scopes` value carries the blocked check's scopes under
-   `requested_scopes`; `holder_shared_scopes_only` means a blocked claim carries
-   the requested-path facts through each holder's exact `overlapping_scopes`.
+   The rendering already names the scopes the refusal concerns, and which holder
+   each one is shared with. Show it as written; do not reconstruct that from the
+   envelope's facts and do not describe the scopes in your own words.
 
-   Read `state.first_touch_dispositions`, never the presence of a sibling key. It
-   is empty unless a holder's source is `first_touch`, and it carries one entry
-   per such holder with the `release`, `integrated_as`, and `abandon` commands
-   that clear it. None of the answers below clears a first-touch holder: it was
-   acquired by whichever edit reached the paths first, so it may protect no work,
-   and only its own holder disposes of it. `release` must run from the holder's
-   worktree; both `resolve` dispositions run from anywhere but assert facts about
-   the holder's work, so the requester asks the holder rather than recording one.
+   Where a holder's source is `first_touch`, the rendering carries that holder's
+   own `release`, `integrated_as`, and `abandon` commands. Show them as written;
+   do not compose those command lines yourself. None of the answers below clears
+   a first-touch holder: it was acquired by whichever edit reached the paths
+   first, so it may protect no work, and only its own holder disposes of it.
+   `release` must run from the holder's worktree; both `resolve` dispositions run
+   from anywhere but assert facts about the holder's work, so the requester asks
+   the holder rather than recording one.
 
    Ask the user for exactly one answer for one holder. Answers 1 through 4
-   require a non-empty reason and are flags on `claim`, never separate verbs:
+   require a non-empty reason and are flags on `claim`, never separate verbs. The
+   rendering carries the menu the engine wrote; present those answers as it
+   states them rather than from a list held here.
 
-   Read each `state.answers[].kind`, never the presence of a flag key. A
-   `reasoned_claim` answer carries `selection`, the coordinator's spelling of
-   that answer; `leave_alone` carries neither an engine action nor a reason
-   requirement. The coordinator invocation below is the only way to submit an
-   answer.
-
-   1. **Land before the holder** — coordinator answer `--answer before
-      --blocker <reservation-id> --overlap-reason "<the user's non-empty
-      reason>"`. The requester takes the paths and integrates first; the holder is held
-      until the requester is on trunk. Use when the holder will build on this
+   1. **Land before the holder** — engine arguments gain `--before
+      <reservation-id> --overlap-why "<the user's non-empty reason>"`. The
+      requester takes the paths and integrates first; the holder is held until
+      the requester is on trunk. Use when the holder will build on this
       requester's change.
-   2. **Land after the holder** — coordinator answer `--answer after --blocker
-      <reservation-id> --overlap-reason "<the user's non-empty reason>"`.
-      The requester takes the paths and integrates second; it remains held until
-      the holder's protected tip is on trunk and is an ancestor of the
-      requester's `HEAD`. Use when the requester will build on the holder.
-   3. **Defer the order** — coordinator answer `--answer defer --blocker
-      <reservation-id> --overlap-reason "<the user's non-empty reason>"`.
-      The requester takes the paths, no ordering edge is added, and the unresolved overlap
-      stays visible on `cargo-berth board --json` until someone later sequences
-      it.
-   4. **Override** — coordinator answer `--answer override --blocker
-      <reservation-id> --overlap-reason "<the user's non-empty reason>"`.
-      The requester takes the paths, no ordering edge is added, and the override plus its
-      reason stays visible on `cargo-berth board --json`.
+   2. **Land after the holder** — engine arguments gain `--after
+      <reservation-id> --overlap-why "<the user's non-empty reason>"`. The
+      requester takes the paths and integrates second; it remains held until the
+      holder's protected tip is on trunk and is an ancestor of the requester's
+      `HEAD`. Use when the requester will build on the holder.
+   3. **Defer the order** — engine arguments gain `--defer <reservation-id>
+      --overlap-why "<the user's non-empty reason>"`. The requester takes the
+      paths, no ordering edge is added, and the unresolved overlap stays visible
+      on `cargo-berth board --json` until someone later sequences it.
+   4. **Override** — engine arguments gain `--override <reservation-id>
+      --overlap-why "<the user's non-empty reason>"`. The requester takes the
+      paths, no ordering edge is added, and the override plus its reason stays
+      visible on `cargo-berth board --json`.
    5. **Leave it alone.** Run no engine command, append nothing, and work
       elsewhere.
 
@@ -132,34 +150,43 @@ The command has one authorization state machine:
    and reason, run one answered invocation, for example:
 
    ```sh
-   PYTHONPATH="$HOME/.claude/scripts" python3 -m berth.claim_state claim \
-     --cwd "$PWD" <file:path|tree:path>... \
-     --answer after --blocker <reservation-id> \
-     --overlap-reason "<the user's non-empty reason>"
+   cd "$(git rev-parse --show-toplevel)" || exit 1
+   envelope="${TMPDIR:-/tmp}/berth-envelope-$$.json"
+   CARGO_BERTH_SESSION_ID="$CLAUDE_CODE_SESSION_ID" \
+     cargo-berth claim <file:path|tree:path>... \
+     --after <reservation-id> \
+     --overlap-why "<the user's non-empty reason>" --json >"$envelope"
+   status=$?
    ```
 
-   Exit `3` yields `state.kind = proposal_awaiting_approval`. Show
-   `state.rendered_markdown`; it includes every holder fact from the refusal,
-   the exact shared scopes, selected direction, reason, consequence, proposal,
-   and transient token, but not the five-answer menu. A proposal binds exactly
-   one displayed conflict, and its consequence must agree with its selected
-   answer. Retain `proposal_token` only as transient conversation state and ask
-   for approval of the answer already selected; do not ask for a different
-   answer. Stop. Never mint and spend a token in the same turn.
+   Exit `3` is a proposal awaiting approval. Show the rendering; it includes
+   every holder fact from the refusal, the exact shared scopes, selected
+   direction, reason, consequence, proposal, and transient token, but not the
+   five-answer menu. A proposal binds exactly one displayed conflict, and its
+   consequence must agree with its selected answer. Read the token from the
+   retained envelope with
+   `jq -r '.payload.data.proposal_token' "$envelope"`, retain it only as
+   transient conversation state, and ask for approval of the answer already
+   selected; do not ask for a different answer. Stop. Issuing a token and
+   spending it in the same turn is never permitted.
 
 3. **Claimed.** Only after a later, explicit approval, repeat the same answered
-   invocation with the exact token:
+   invocation with the exact token appended:
 
    ```sh
-   PYTHONPATH="$HOME/.claude/scripts" python3 -m berth.claim_state claim \
-     --cwd "$PWD" <file:path|tree:path>... \
-     --answer after --blocker <reservation-id> \
-     --overlap-reason "<the same user-supplied reason>" \
-     --proposal <exact-token>
+   cd "$(git rev-parse --show-toplevel)" || exit 1
+   envelope="${TMPDIR:-/tmp}/berth-envelope-$$.json"
+   CARGO_BERTH_SESSION_ID="$CLAUDE_CODE_SESSION_ID" \
+     cargo-berth claim <file:path|tree:path>... \
+     --after <reservation-id> \
+     --overlap-why "<the same user-supplied reason>" \
+     --proposal <exact-token> --json >"$envelope"
+   status=$?
    ```
 
-   Exit `0` yields `state.kind = claimed`. Show `state.rendered_markdown` and
-   return `reservation_id` explicitly.
+   Exit `0` is a successful claim. Show the rendering and return
+   `reservation_id` explicitly, read from the retained envelope with
+   `jq -r '.payload.data.reservation_id' "$envelope"`.
    If `session_mapping_publication.status = unavailable`, this is degraded
    success: the journal and reservation are durable, so report its diagnostic,
    continue, and name the reservation id explicitly from then on.
@@ -171,18 +198,18 @@ not staleness; discard the token, show the structured invalid-input diagnostic,
 and restart from an answered invocation without a token. Never apply a token in
 the turn that selects an answer or writes a reason.
 
+`--proposal` without one of `--before`, `--after`, `--defer`, or `--override` is
+refused by the engine's own command line at exit `5`, before any ledger read.
+
 `/plan:delegate` uses first-touch claiming at its edit boundary and does not
 reproduce proposal logic or read a second parser.
 
 ### `/sync check`
 
-This answers “did anything stray outside what was claimed?” Run drift's full
-phase-start comparison explicitly:
+This answers "did anything stray outside what was claimed?" Run drift's full
+phase-start comparison explicitly.
 
-```sh
-PYTHONPATH="$HOME/.claude/scripts" python3 -m berth.claim_state invoke \
-  --cwd "$PWD" --expected-verb drift -- drift --full --json
-```
+Engine arguments: `drift --full`
 
 `--full` is mandatory. The engine's fingerprint path issues three `git diff`
 commands and one `git ls-files` command. Do not use drift's cheap default, whose
@@ -192,38 +219,25 @@ the last observation.
 The engine's `check` verb remains reachable for its different question — whether
 a proposed path or edit collides with live reservations:
 
-```sh
-# /sync check-path <file:path|tree:path>...
-PYTHONPATH="$HOME/.claude/scripts" python3 -m berth.claim_state invoke \
-  --cwd "$PWD" --expected-verb check -- check <paths...> --json
-
-# /sync check-edit uses the same check invocation for paths an edit would touch.
-```
+- `/sync check-path <file:path|tree:path>...` — engine arguments:
+  `check <paths...>`
+- `/sync check-edit` uses the same `check` invocation for paths an edit would
+  touch.
 
 Never pass a run id to `check`; the engine resolves edit authorization itself.
-On a blocked check, show `state.rendered_markdown`; it is the same five-answer
-refusal shown by `/sync claim` and the edit shim. Read
-`state.scope_facts.kind = exact_requested_scopes` and show its
-`requested_scopes`; do not infer this variant from key presence. On a clear check,
-`state.kind = edit_authorized` and the state names whether acquisition was
-`appended`, `widened`, or `already_held`. If its session mapping is unavailable,
-show its nonblocking degraded-success diagnostic and reservation id and continue.
+Show the rendering either way. On a blocked check it is the same five-answer
+refusal shown by `/sync claim` and the edit hook, naming the scopes it concerns;
+on a clear check it says what was authorized and how. The engine states what a
+reader sees, so print that text and add nothing to it — do not classify the
+outcome, name the acquisition, or reconstruct any of it from the envelope.
 
 ### `/sync release`, `/sync sequence`, and `/sync integrate`
 
-Map directly to the phase-1 verbs and always request JSON:
+Map directly to the phase-1 verbs. Engine arguments:
 
-```sh
-PYTHONPATH="$HOME/.claude/scripts" python3 -m berth.claim_state invoke \
-  --cwd "$PWD" --expected-verb release -- release <reservation-id> --json
-
-PYTHONPATH="$HOME/.claude/scripts" python3 -m berth.claim_state invoke \
-  --cwd "$PWD" --expected-verb sequence -- \
-  sequence <first-reservation-id> <then-reservation-id> --why "<user reason>" --json
-
-PYTHONPATH="$HOME/.claude/scripts" python3 -m berth.claim_state invoke \
-  --cwd "$PWD" --expected-verb integrate -- integrate <reservation-id> --json
-```
+- `release <reservation-id>`
+- `sequence <first-reservation-id> <then-reservation-id> --why "<user reason>"`
+- `integrate <reservation-id>`
 
 Do not silently choose `integrate --force`; it skips recorded holds and requires
 the user's explicit direction and reason.
@@ -246,7 +260,7 @@ These rules bind every command before its ordinary transition:
 - `ledger_unreadable` at exit `4` is a genuine ledger/configuration failure, not
   `unconfigured`; report its diagnostic and establish no facts.
 - Exit `6` means the engine's single ten-second deadline is exhausted. Report
-  “the ledger is busy, try again” and name the exact command to rerun. Do not
+  "the ledger is busy, try again" and name the exact command to rerun. Do not
   retry, clear, or describe the ledger as unreadable.
 - Exit `5` is invalid input. Exit `7` belongs to the terminal board and is
   unreachable because `/sync board` always uses `--json`.
