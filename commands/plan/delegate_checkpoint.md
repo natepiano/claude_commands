@@ -41,11 +41,14 @@ Loop/verbose only:
    | `CheckpointCommittedAwaitingReleaseConfirmation` | Valid only as a resumed state: route directly to step 7, re-entering neither drift nor checkpoint creation. |
 
    ```sh
-   PYTHONPATH="$HOME/.claude/scripts" python3 -m berth.claim_state invoke \
-     --cwd "${WORKING_DIR}" --expected-verb drift -- drift --full --json
+   cd "$(git -C "${WORKING_DIR}" rev-parse --show-toplevel)" || exit 1
+   envelope="${TMPDIR:-/tmp}/berth-checkpoint-drift-$$.json"
+   CARGO_BERTH_SESSION_ID="$CLAUDE_CODE_SESSION_ID" \
+     cargo-berth drift --full --json >"$envelope"
+   status=$?
    ```
 
-   Require a validated exit-`0` result with `payload.kind = drift`,
+   Require an exit-`0` result with `payload.kind = drift`,
    `payload.data.comparison = full_phase_start`, and exactly one
    `payload.data.results` entry whose `reservation_id` equals the
    `reservation_id` in the durable `ActivePhaseReservation`. Bind that result to
@@ -95,9 +98,11 @@ Loop/verbose only:
    | Either inactive state | Invoke no release. |
 
    ```sh
-   PYTHONPATH="$HOME/.claude/scripts" python3 -m berth.claim_state invoke \
-     --cwd "${WORKING_DIR}" --expected-verb release -- \
-     release <recorded-reservation-id> --json
+   cd "$(git -C "${WORKING_DIR}" rev-parse --show-toplevel)" || exit 1
+   envelope="${TMPDIR:-/tmp}/berth-checkpoint-release-$$.json"
+   CARGO_BERTH_SESSION_ID="$CLAUDE_CODE_SESSION_ID" \
+     cargo-berth release <recorded-reservation-id> --json >"$envelope"
+   status=$?
    ```
 
    Do not pass a commit: `release` snapshots the invoking worktree's current
@@ -128,12 +133,15 @@ Loop/verbose only:
    checkpoint.
 
    ```sh
-   PYTHONPATH="$HOME/.claude/scripts" python3 -m berth.claim_state reservation \
-     --cwd "${WORKING_DIR}" --reservation <recorded-reservation-id>
+   cd "$(git -C "${WORKING_DIR}" rev-parse --show-toplevel)" || exit 1
+   envelope="${TMPDIR:-/tmp}/berth-checkpoint-lifecycle-$$.json"
+   CARGO_BERTH_SESSION_ID="$CLAUDE_CODE_SESSION_ID" \
+     cargo-berth board --reservation <recorded-reservation-id> --json >"$envelope"
+   status=$?
    ```
 
-   Inspect the validated coordinator `state`, which is derived from
-   `envelope.payload.data` without reading `message`. Exit `0` requires
+   Inspect `payload.data` in the retained envelope, without reading
+   `message`. Exit `0` requires
    `kind = reservation_lifecycle`, the requested `reservation_id`, and exactly
    one lifecycle alternative: `active`; `outstanding` with `protected_tip`;
    `released_after_checkpoint` with `protected_tip` and `disposition`; or

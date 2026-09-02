@@ -990,8 +990,11 @@ Do not dispatch until this contract reaches one of its four persisted states.
 1. When no state exists yet, invoke the shared `/sync board` entry point once:
 
    ```sh
-   PYTHONPATH="$HOME/.claude/scripts" python3 -m berth.claim_state board \
-     --cwd "${WORKING_DIR}"
+   cd "$(git -C "${WORKING_DIR}" rev-parse --show-toplevel)" || exit 1
+   envelope="${TMPDIR:-/tmp}/berth-delegate-board-$$.json"
+   CARGO_BERTH_SESSION_ID="$CLAUDE_CODE_SESSION_ID" \
+     cargo-berth board --json >"$envelope"
+   status=$?
    ```
 
    | Result | Action |
