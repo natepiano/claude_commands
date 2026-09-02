@@ -26,6 +26,24 @@ failed on Linux looking for `/opt/homebrew/bin/python3`.
 
 ## Remaining
 
+### launchd inventory (working through these one at a time)
+
+| # | plist / installer | what it does | trigger | status |
+|---|---|---|---|---|
+| 1 | scripts/sccache/com.natemccoy.sccache.plist | starts the sccache server | RunAtLoad | |
+| 2 | scripts/settings/ensure_git_filters.sh (generates its plist inline) | refreshes the filtered settings.json index after a write | WatchPaths | already guards on `command -v launchctl` |
+| 3 | scripts/fix/com.natemccoy.style-fix.plist | periodic style-fix pipeline | StartInterval | |
+| 4 | scripts/agents/com.natemccoy.codex-agent-catalog-sync.plist | keeps the agent catalog current | RunAtLoad + StartInterval | |
+| 5 | scripts/claude_to_codex/com.natemccoy.claude-to-codex-sync.plist | syncs claude config to codex | RunAtLoad + WatchPaths | |
+| 6 | scripts/kache/ninja.kunobi.kache-gc.plist | kache garbage collection | KeepAlive + StartInterval | |
+| 7 | scripts/prioritize/com.natemccoy.hanadocs-prioritize.plist | hanadocs prioritization watcher | KeepAlive + RunAtLoad | installer/status scripts are launchctl-only |
+
+launchd equivalents on NixOS are systemd user units: RunAtLoad -> `wantedBy =
+[ "default.target" ]`, StartInterval -> a `.timer`, WatchPaths -> a `.path`
+unit, KeepAlive -> `Restart = "always"`. Declare them in /etc/nixos, not by
+writing unit files from a script -- that is the whole point of the machine being
+declarative.
+
 - **launchd-only integrations** -- scripts/prioritize/, scripts/settings/
   (git-filter watcher), scripts/sccache/, scripts/agents/, scripts/fix/,
   scripts/claude_to_codex/. launchd does not exist on Linux. Decide per script:
