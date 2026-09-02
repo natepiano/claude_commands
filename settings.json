@@ -36,13 +36,13 @@
       "Bash(rg *)",
       "Bash(run_test.sh *)",
       "Bash(~/.claude/scripts/release/*)",
-      "Bash(//Users/natemccoy/rust/**/.git/**)",
+      "Bash(~/rust/**/.git/**)",
       "Edit(/\"$HOME/.claude/**)\"",
-      "Edit(//Users/natemccoy/Library/Application Support/**)",
+      "Edit(~/Library/Application Support/**)",
       "Edit(//tmp/claude/**)",
-      "Read(//Users/natemccoy/.cargo/registry/src**)",
-      "Read(//Users/natemccoy/Library/Application Support/**)",
-      "Read(//Users/natemccoy/rust/**)",
+      "Read(~/.cargo/registry/src**)",
+      "Read(~/Library/Application Support/**)",
+      "Read(~/rust/**)",
       "Read(//tmp/**)",
       "Read(//var/folders/rf/twhh0jfd243fpltn5k0w1t980000gn/T/**)",
       "Read(/private/tmp*)"
@@ -54,8 +54,8 @@
     ],
     "defaultMode": "auto",
     "additionalDirectories": [
-      "/Users/natemccoy/Library",
-      "/Users/natemccoy/rust",
+      "~/Library",
+      "~/rust",
       "/tmp",
       "/tmp/claude/"
     ],
@@ -190,11 +190,11 @@
     },
     "filesystem": {
       "allowWrite": [
-        "/Users/natemccoy/.cargo",
-        "/Users/natemccoy/.local/state/plan-delegate",
-        "/Users/natemccoy/Library/Application Support",
-        "/Users/natemccoy/Library/Caches/Mozilla.sccache",
-        "/Users/natemccoy/rust",
+        "~/.cargo",
+        "~/.local/state/plan-delegate",
+        "~/Library/Application Support",
+        "~/Library/Caches/Mozilla.sccache",
+        "~/rust",
         "/private/tmp",
         "/tmp"
       ]
@@ -250,7 +250,7 @@
       "**Protected IaC scopes**: IAM, RBAC, networking, quota, and node-pool resources; anything whose name or tag carries `prod` or `production` as a whole word or name segment",
       "### User-specific",
       "**Primary use of Claude Code**: software development (Rust workspace — bevy_brp_mcp, bevy_brp_extras, bevy_brp_mcp_macros)",
-      "**Trusted repo**: /Users/natemccoy/rust/bevy_brp and its remote https://github.com/natepiano/bevy_brp (PUBLIC — only this repo's own work should be pushed there; confidential material and secrets are never cleared into it by visibility)",
+      "**Trusted repo**: ~/rust/bevy_brp and its remote https://github.com/natepiano/bevy_brp (PUBLIC — only this repo's own work should be pushed there; confidential material and secrets are never cleared into it by visibility)",
       "**Org-specific CLIs**: None configured",
       "**routine under natepiano/ prefix qualifiers**: publishing to crates.io as bevy_brp_mcp, bevy_brp_extras, bevy_brp_mcp_macros is this repo's own routine publish workflow"
     ]
