@@ -58,7 +58,8 @@
       "/Users/natemccoy/rust",
       "/tmp",
       "/tmp/claude/"
-    ]
+    ],
+    "blockReadsOutsideWorkingDirectories": false
   },
   "hooks": {
     "PreToolUse": [
@@ -191,6 +192,11 @@
     ]
   },
   "alwaysThinkingEnabled": true,
+  "modelSettings": {
+    "claude-opus-5": {
+      "effortLevel": "high"
+    }
+  },
   "autoCompactWindow": 283800,
   "askUserQuestionTimeout": "never",
   "tui": "fullscreen",
@@ -198,9 +204,9 @@
   "skipWorkflowUsageWarning": true,
   "theme": "dark",
   "editorMode": "normal",
-  "crossSessionInbound": "accept",
   "autoCompactEnabled": true,
   "teammateMode": "in-process",
+  "crossSessionInbound": "accept",
   "inputNeededNotifEnabled": true,
   "agentPushNotifEnabled": true,
   "skipAutoPermissionPrompt": true,
