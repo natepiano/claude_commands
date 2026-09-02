@@ -74,7 +74,9 @@ Everything below is the contract.
    Include the override reason only when rejecting an applicable calibrated
    value. **Copy its Markdown output byte-for-byte** — the scope line,
    both tables with every row and cell, the `Earlier:` line above the round
-   table when there is one, and the wall clock. Never reorder, edit, or omit
+   table when there is one, the `- **Verification**` gate block under the
+   table when there is one (already condensed, one line per gate command),
+   and the wall clock. Never reorder, edit, or omit
    any part of those: the recorder owns every column, duration format, and ETA
    band. The one exception is the `- **Agent N**` lines under the round table:
    they are the seats talking to each other, not to the user, so they are

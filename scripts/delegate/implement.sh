@@ -122,6 +122,10 @@ MESH_NAME="${MESH_PREFIX}-${TEAM_ROLE}"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SUMMARY_FILE="${SESSION_DIR}/impl_summary${SLOT}.txt"
+# Truncate at launch: the "done" post below names this path unconditionally, so a
+# seat that reports on the board without writing a summary would otherwise leave
+# the previous round's file sitting at exactly the path the board line points to.
+: > "${SUMMARY_FILE}"
 STATUS_FILE="${SESSION_DIR}/impl_status${SLOT}"
 LOG_FILE="${SESSION_DIR}/impl_agent${SLOT}.log"
 AGENT_FILE="${SESSION_DIR}/impl_agent${SLOT}"

@@ -1488,6 +1488,101 @@ class ProgressHistoryTests(unittest.TestCase):
             ],
         )
 
+    def run_gate(
+        self,
+        session_dir: Path,
+        text: str,
+        started_at: int,
+        finished_at: int | None,
+        passed: bool = True,
+    ) -> None:
+        """One verification command, recorded the way the orchestrator runs it."""
+        _ = self.run_command(
+            "start-activity",
+            "--session-dir",
+            str(session_dir),
+            "--label",
+            "Verification",
+            "--activity",
+            text,
+            at=started_at,
+        )
+        if finished_at is None:
+            return
+        _ = self.run_command(
+            "finish-activity",
+            "--session-dir",
+            str(session_dir),
+            "--status",
+            "completed" if passed else "error",
+            "--result",
+            "pass" if passed else "fail",
+            at=finished_at,
+        )
+
+    def test_a_verification_block_is_one_row_with_its_gates_beneath(self) -> None:
+        """Gates run one command at a time, and a row per command was noise.
+
+        The pattern a live run rendered as seven anonymous rows: two gates
+        fail, the orchestrator repairs, the reruns pass. One row tells the
+        block's outcome; the notes under the table name each gate, with a
+        retry folded into the gate it reran rather than listed as a fresh one.
+        """
+        base = 70_000
+        session_dir = self.start_run("gates", base - 100)
+        self.start_phase(session_dir, base - 50)
+        self.run_gate(session_dir, "test hana", base, base + 30, passed=False)
+        self.run_gate(session_dir, "test hana_catalyst", base + 31, base + 36)
+        self.run_gate(session_dir, "test hana_catalyst identity", base + 37, base + 39)
+        self.run_gate(session_dir, "lint hana", base + 40, base + 47, passed=False)
+        self.run_gate(session_dir, "lint hana_catalyst", base + 48, base + 49)
+        self.run_gate(session_dir, "test hana", base + 107, base + 170)
+        self.run_gate(session_dir, "lint hana", base + 171, base + 182)
+        self.run_gate(session_dir, "doc hana", base + 200, None)
+        self.team_slot = ""
+        header = self.run_progress(session_dir, base + 212)
+        rows = self.table_rows(
+            header,
+            ["Stage", "Start", "Elapsed", "Agent 1", "Agent 2", "Agent 3", "Result"],
+        )
+        self.assertEqual(
+            [(row[0], row[2], *row[3:6], row[6]) for row in rows],
+            [("Verification", "3m", "-", "-", "-", "gate 6 running")],
+        )
+        for line in (
+            "- **Verification** (main agent) · 6 gates:",
+            "  - ✗→✓ test hana · 30s failed · passed on rerun 1m",
+            "  - ✓ test hana_catalyst · 5s",
+            "  - ✓ test hana_catalyst identity · 2s",
+            "  - ✗→✓ lint hana · 7s failed · passed on rerun 11s",
+            "  - ✓ lint hana_catalyst · 1s",
+            "  - ▸ doc hana · running 12s",
+        ):
+            self.assertIn(line, header)
+
+    def test_a_finished_verification_block_reports_its_retries(self) -> None:
+        """The Result cell alone answers whether verification went clean."""
+        base = 74_000
+        session_dir = self.start_run("gates-done", base - 100)
+        self.start_phase(session_dir, base - 50)
+        self.run_gate(session_dir, "test hana", base, base + 30, passed=False)
+        self.run_gate(session_dir, "lint hana", base + 40, base + 47)
+        self.run_gate(session_dir, "test hana", base + 107, base + 170)
+        # A pass keeps the report alive once the gates are over; the block
+        # stays a closed stage beside it.
+        self.start_slot_pass(session_dir, "review", "review", base + 300)
+        self.team_slot = ""
+        header = self.run_progress(session_dir, base + 360)
+        rows = self.table_rows(
+            header,
+            ["Stage", "Start", "Elapsed", "Agent 1", "Agent 2", "Agent 3", "Result"],
+        )
+        self.assertEqual(
+            [(row[0], row[6]) for row in rows],
+            [("Verification", "1 failed, reran clean"), ("Review", "running")],
+        )
+        self.assertIn("- **Verification** (main agent) · 2 gates:", header)
+
     def test_a_second_round_is_a_second_row(self) -> None:
         """A repair round is a row of its own, named by the number it carries."""
         session_dir = self.start_run("rounds", 48_000)
@@ -2085,12 +2180,14 @@ class ProgressHistoryTests(unittest.TestCase):
             header,
             ["Stage", "Start", "Elapsed", "Agent 1", "Agent 2", "Agent 3", "Result"],
         )
-        # Three stages, five rows: counting the verifications singly would have
-        # dropped the implementation the phase opened with and the first two of
-        # them, leaving a table that says nothing about how the work got here.
+        # Three stages, three rows: the verification run is one stage of the
+        # cap AND one row of the table, its gate-by-gate story in the notes
+        # beneath. Counting its windows singly once dropped the implementation
+        # the phase opened with; rendering them singly filled the table with
+        # rows a reader could tell apart only by result.
         self.assertEqual(
             [row[0] for row in rows],
-            ["Impl", "Verification", "Verification", "Verification", "Fix 1"],
+            ["Impl", "Verification", "Fix 1"],
         )
         self.assertNotIn("Earlier:", header)
 

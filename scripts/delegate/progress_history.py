@@ -135,6 +135,12 @@ class StageWindow(TypedDict):
     kind: str
     fix_round: int
     label: str
+    # What the window actually ran, for an activity: the `--activity` text the
+    # orchestrator opened it with ("test hana"). Empty for passes, whose work is
+    # described by kind and seat. The gate notes under the round table are the
+    # one reader of it -- the label alone renders a block of verification
+    # commands as identical rows.
+    text: str
     started_at: float
     elapsed: int
     status: str
@@ -2003,6 +2009,7 @@ def _started_window(event: dict[str, object], event_type: str) -> StageWindow:
         kind=kind,
         fix_round=_integer(event.get("fix_pass")),
         label=label,
+        text=_string(event.get("activity_text")) if kind == "activity" else "",
         started_at=started_at or _number(event.get("timestamp_epoch")),
         elapsed=0,
         status="open",
@@ -2021,6 +2028,7 @@ def _running_window(
     main: str,
     fallback_id: str,
     now: float,
+    text: str = "",
 ) -> StageWindow:
     started_at = _number(current.get("started_at"), now)
     return StageWindow(
@@ -2029,6 +2037,7 @@ def _running_window(
         kind=kind,
         fix_round=_integer(current.get("fix_pass")),
         label=label,
+        text=text,
         started_at=started_at,
         elapsed=max(0, int(now - started_at)),
         status="running",
@@ -2078,6 +2087,7 @@ def _live_windows(state: dict[str, object], now: float) -> list[StageWindow]:
             main,
             "live",
             now,
+            text=_string(activity.get("activity")),
         )
     ]
 
@@ -2154,6 +2164,7 @@ def _armed_window(
         kind="review",
         fix_round=0,
         label="",
+        text="",
         started_at=started_at,
         elapsed=max(0, int(now - started_at)),
         status="armed",
@@ -2198,6 +2209,13 @@ def _phase_windows(
         )
     if include_live:
         for live in _live_windows(state, now):
+            started = windows.get(live["instance_id"])
+            if started is not None and started["text"]:
+                # Every progress tick rewrites the state activity's text with
+                # its --activity narration, so the live record no longer says
+                # what the window ran. The start event does, and keeps saying
+                # it for as long as the window is open.
+                live["text"] = started["text"]
             windows[live["instance_id"]] = live
         # A phase team runs a launcher per slot, so several passes are open at
         # once and each has a row above. The armed marker adds one more: an
@@ -2559,6 +2577,67 @@ def _round_result(tally: FindingTally, running: bool) -> str:
     return "running" if running else "clean"
 
 
+def _gate_report(
+    label: str,
+    block: list[StageWindow],
+    now: float,
+) -> tuple[str, list[str]]:
+    """One verification block's Result cell, and the gate notes under the table.
+
+    A block is a run of consecutive main-agent activities sharing a label: the
+    phase gates, run one command at a time. Each distinct command is one gate,
+    and a window repeating an earlier command is the same gate run again after
+    a repair -- one line telling fail-then-pass is the story, where a row per
+    command rendered a healthy retry as a stretch of near-identical rows the
+    reader could tell apart only by result.
+    """
+    gates: dict[str, list[StageWindow]] = {}
+    for window in block:
+        gates.setdefault(window["text"] or window["label"], []).append(window)
+    lines: list[str] = []
+    failing = reran = 0
+    live_position = 0
+    for position, (text, runs) in enumerate(gates.items(), start=1):
+        last = runs[-1]
+        earlier_fails = sum(
+            1 for run in runs[:-1] if run["status"] not in LIVE_WINDOW_STATUSES
+        )
+        retried = (
+            f"failed {earlier_fails}x"
+            if earlier_fails > 1
+            else f"{_compact_duration(runs[0]['elapsed'])} failed"
+        )
+        if last["status"] in LIVE_WINDOW_STATUSES:
+            live_position = position
+            duration = _compact_duration(max(0, int(now - last["started_at"])))
+            if earlier_fails:
+                lines.append(f"  - ✗→▸ {text} · {retried} · rerunning {duration}")
+            else:
+                lines.append(f"  - ▸ {text} · running {duration}")
+        elif last["status"] == "completed":
+            duration = _compact_duration(last["elapsed"])
+            if earlier_fails:
+                reran += 1
+                lines.append(f"  - ✗→✓ {text} · {retried} · passed on rerun {duration}")
+            else:
+                lines.append(f"  - ✓ {text} · {duration}")
+        else:
+            failing += 1
+            lines.append(f"  - ✗ {text} · {_compact_duration(last['elapsed'])} failed")
+    count = len(gates)
+    header = f"- **{label}** (main agent) · {count} gate{'s' if count > 1 else ''}:"
+    if live_position:
+        summary = f"gate {live_position} running"
+    else:
+        parts: list[str] = []
+        if failing:
+            parts.append(f"{failing} failing")
+        if reran:
+            parts.append(f"{reran} failed, reran clean")
+        summary = ", ".join(parts) or (f"{count} pass" if count > 1 else "pass")
+    return summary, [header, *lines]
+
+
 def _round_of(window: StageWindow, open_round: int) -> int:
     """The round a window belongs to.
 
@@ -2864,6 +2943,11 @@ class RoundTable(TypedDict):
 
     rows: list[list[str]]
     earlier: str
+    # The gate notes for the newest collapsed verification block: its header
+    # line and one line per gate. Empty when the shown stages hold no such
+    # block. Only the newest block's -- an earlier one keeps its row and its
+    # tally, but its gate-by-gate story is history the reader is not acting on.
+    gates: list[str]
 
 
 def _round_table(
@@ -2897,66 +2981,96 @@ def _round_table(
     groups = _stage_groups(_round_entries(windows, labels))
     shown = groups[-ROUND_TABLE_STAGES:]
     rows: list[list[str]] = []
-    for entry in [entry for group in shown for entry in group]:
-        members, started_at = entry["members"], entry["started_at"]
-        running = any(member["status"] in LIVE_WINDOW_STATUSES for member in members)
-        if entry["number"] is None:
-            lone = members[0]
-            tally = _finding_tally(findings, started_at, uppers[lone["instance_id"]])
+    gate_lines: list[str] = []
+    for group in shown:
+        # A stage of two or more main-agent activities is a verification block:
+        # the gates of the phase, run one command at a time. One row for the
+        # block, with the gate-by-gate story -- which command, what happened,
+        # retries folded into their gate -- in the notes under the table, where
+        # a row per command told the reader nothing but pass/error.
+        if len(group) > 1 and all(
+            entry["number"] is None and entry["members"][0]["kind"] == "activity"
+            for entry in group
+        ):
+            block = [entry["members"][0] for entry in group]
+            summary, notes = _gate_report(group[0]["label"], block, now)
+            block_start = block[0]["started_at"]
+            block_end = max(_window_span(window, now)[1] for window in block)
             rows.append(
                 [
-                    entry["label"],
-                    _clock_stamp(started_at),
-                    _compact_duration(lone["elapsed"]),
-                    *_lone_cells(lone, activity),
-                    _window_result(lone, tally),
+                    group[0]["label"],
+                    _clock_stamp(block_start),
+                    _compact_duration(int(block_end - block_start)),
+                    *(["-"] * len(ROUND_SLOTS)),
+                    summary,
                 ]
             )
+            gate_lines = notes
             continue
-        segments = _round_segments(entry, changes, now)
-        previous_roles: list[str] = []
-        for index, (lower, upper, roles) in enumerate(segments):
-            last = index + 1 == len(segments)
-            # Only the closing row of a live round is the present. Every
-            # earlier segment is a stretch that ended, whatever its seats
-            # are doing now.
-            cells = _round_cells(members, roles, lower, upper, now, running and last, activity)
-            # A continuation row exists because the team moved, and the reader
-            # should not have to diff two rows of cells to find where. The row's
-            # result cell says so in the table's own column terms, from the
-            # rendered cells rather than the board -- what it reports is exactly
-            # what changed on screen, whether a handoff or a re-seated chair
-            # caused it.
-            seat_roles = [cell.split()[0] for cell in cells]
-            moved = ", ".join(
-                f"{SEAT_LABELS[slot]} → {role}"
-                for slot, before, role in zip(ROUND_SLOTS, previous_roles, seat_roles)
-                if role != before and role != "-"
-            )
-            previous_roles = seat_roles
-            # The result belongs to the round, which is the granularity the
-            # ledger stamps, so it sits on the row that closes it, after the
-            # movement that opened the row if one did.
-            outcome = (
-                _round_result(_round_tally(findings, entry["number"]), running)
-                if last
-                else ""
-            )
-            # The round label names the round once. A continuation row is the
-            # same round with its seats moved, and repeating the name there
-            # would read as a second round rather than as the team having moved.
-            rows.append(
-                [
-                    entry["label"] if index == 0 else "",
-                    _clock_stamp(lower),
-                    _compact_duration(int(upper - lower)),
-                    *cells,
-                    "; ".join(part for part in (moved, outcome) if part),
-                ]
-            )
+        for entry in group:
+            members, started_at = entry["members"], entry["started_at"]
+            running = any(member["status"] in LIVE_WINDOW_STATUSES for member in members)
+            if entry["number"] is None:
+                lone = members[0]
+                tally = _finding_tally(findings, started_at, uppers[lone["instance_id"]])
+                rows.append(
+                    [
+                        entry["label"],
+                        _clock_stamp(started_at),
+                        _compact_duration(lone["elapsed"]),
+                        *_lone_cells(lone, activity),
+                        _window_result(lone, tally),
+                    ]
+                )
+                continue
+            segments = _round_segments(entry, changes, now)
+            previous_roles: list[str] = []
+            for index, (lower, upper, roles) in enumerate(segments):
+                last = index + 1 == len(segments)
+                # Only the closing row of a live round is the present. Every
+                # earlier segment is a stretch that ended, whatever its seats
+                # are doing now.
+                cells = _round_cells(
+                    members, roles, lower, upper, now, running and last, activity
+                )
+                # A continuation row exists because the team moved, and the
+                # reader should not have to diff two rows of cells to find
+                # where. The row's result cell says so in the table's own
+                # column terms, from the rendered cells rather than the board
+                # -- what it reports is exactly what changed on screen, whether
+                # a handoff or a re-seated chair caused it.
+                seat_roles = [cell.split()[0] for cell in cells]
+                moved = ", ".join(
+                    f"{SEAT_LABELS[slot]} → {role}"
+                    for slot, before, role in zip(ROUND_SLOTS, previous_roles, seat_roles)
+                    if role != before and role != "-"
+                )
+                previous_roles = seat_roles
+                # The result belongs to the round, which is the granularity the
+                # ledger stamps, so it sits on the row that closes it, after
+                # the movement that opened the row if one did.
+                outcome = (
+                    _round_result(_round_tally(findings, entry["number"]), running)
+                    if last
+                    else ""
+                )
+                # The round label names the round once. A continuation row is
+                # the same round with its seats moved, and repeating the name
+                # there would read as a second round rather than as the team
+                # having moved.
+                rows.append(
+                    [
+                        entry["label"] if index == 0 else "",
+                        _clock_stamp(lower),
+                        _compact_duration(int(upper - lower)),
+                        *cells,
+                        "; ".join(part for part in (moved, outcome) if part),
+                    ]
+                )
     return RoundTable(
         rows=rows,
         earlier=_earlier_note(groups[: len(groups) - len(shown)]),
+        gates=gate_lines,
     )
 
 
@@ -3606,6 +3720,7 @@ def _progress(args: argparse.Namespace) -> None:
             *([round_table["earlier"], ""] if round_table["earlier"] else []),
             *_render_table(list(ROUND_HEADERS), round_table["rows"], set()),
             "",
+            *([*round_table["gates"], ""] if round_table["gates"] else []),
             *([*delegate_note, ""] if delegate_note else []),
             f"▸ **{live_label} - {_string(current_pass.get('activity'))}**",
             _clock_line(now, next_report_at),

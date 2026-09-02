@@ -116,8 +116,20 @@ except (json.JSONDecodeError, ValueError):
     sys.exit(0)
 for row in rows:
     if row.get("id") == wanted:
-        # Background rows carry `state`; interactive rows carry `status`.
-        print(row.get("state") or row.get("status") or "unknown")
+        # A background row now carries BOTH fields, and they disagree: `status`
+        # speaks the busy/idle vocabulary the poll loop below matches on, while
+        # `state` speaks working/blocked/done and goes stale -- a seat whose turn
+        # ended half an hour ago has been observed still reading `working`.
+        # Prefer `status`; fall back to `state` only when the row omits it, and
+        # translate it, because an untranslated `done` matches no case arm and
+        # the loop then spins until the session is stopped by hand.
+        status = row.get("status")
+        if status:
+            print(status)
+        else:
+            state = row.get("state")
+            print({"working": "busy", "done": "idle", "blocked": "idle"}.get(
+                state, state or "unknown"))
         break
 else:
     print("gone")

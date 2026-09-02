@@ -161,10 +161,14 @@ release_token() {
 ACTIVITY_ACTIVE=0
 if [[ -n "${ACTIVITY_SESSION_DIR}" \
       && -f "${ACTIVITY_SESSION_DIR}/progress_history_state.json" ]]; then
+    # The gate notes under the stage table print this text verbatim, so it is
+    # the invocation itself: "verify.sh test hana" names both the command that
+    # ran and the script to open when a gate misbehaves, where a bare
+    # "test hana" answered neither.
     if python3 "${PROGRESS_HISTORY}" start-activity \
         --session-dir "${ACTIVITY_SESSION_DIR}" \
         --label "Verification" \
-        --activity "${CMD} ${*:-workspace}" >/dev/null 2>&1; then
+        --activity "verify.sh ${CMD}${*:+ $*}" >/dev/null 2>&1; then
         ACTIVITY_ACTIVE=1
         finish_activity() {
             local status=$1

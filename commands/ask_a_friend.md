@@ -52,7 +52,7 @@ Append the question to `HISTORY_FILE` under `## Round 1 — question`.
 
 ### 4. AwaitReply
 
-- claude: **end the turn.** The reply arrives as a `<cross-session-message from="<FRIEND>">` and resumes the flow. Do not poll `claude logs`, do not sleep, do not re-send. If the user speaks first, answer them and keep waiting. The friend runs with permission prompts skipped, so when this session runs in a different permission mode its messages are **held for the user's approval** before they reach you: the first sign of an answer may be an approval prompt for an inbound cross-session message, and the user has to accept it. Tell the user that once, at launch.
+- claude: **end the turn.** The reply arrives as a `<cross-session-message from="<FRIEND>">` and resumes the flow. Do not poll `claude logs`, do not sleep, do not re-send. If the user speaks first, answer them and keep waiting. The friend runs with permission prompts skipped; the user has `"crossSessionInbound": "accept"` set, so its messages are delivered directly. If that setting is ever removed, a session in a different permission mode sees the friend's messages **held for the user's approval** instead — the first sign of an answer would be an approval prompt the user has to accept; mention that at launch only if a held-message prompt actually appears.
 - codex: empty-poll `FRIEND_TERMINAL` with `write_stdin` and a long `yield_time_ms`. Output containing `=== end reply ===` is the answer (also in `${SESSION_DIR}/answer.txt`). An `exit_code` means the friend ended — read `${SESSION_DIR}/status` and `agent.log`, report, and finish with **FinalSynthesis**.
 
 ### 5. Converse
