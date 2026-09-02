@@ -370,7 +370,7 @@ if [[ "$CHECK_ONLY" == true ]]; then
     exit 1
 fi
 
-chmod "$(stat -f '%Lp' "$AGENTS_CONFIG_FILE")" "$tmp_file"
+chmod "$(stat -f '%Lp' "$AGENTS_CONFIG_FILE" 2>/dev/null || stat -c '%a' "$AGENTS_CONFIG_FILE")" "$tmp_file"
 mv "$tmp_file" "$AGENTS_CONFIG_FILE"
 trap release_lock EXIT
 mkdir -p "$(dirname "$CODEX_CATALOG_SYNC_STATE_FILE")"

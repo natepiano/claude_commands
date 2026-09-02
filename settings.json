@@ -37,7 +37,7 @@
       "Bash(run_test.sh *)",
       "Bash(~/.claude/scripts/release/*)",
       "Bash(//Users/natemccoy/rust/**/.git/**)",
-      "Edit(//Users/natemccoy/.claude/**)",
+      "Edit(/\"$HOME/.claude/**)\"",
       "Edit(//Users/natemccoy/Library/Application Support/**)",
       "Edit(//tmp/claude/**)",
       "Read(//Users/natemccoy/.cargo/registry/src**)",
@@ -68,7 +68,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "/Users/natemccoy/.claude/scripts/berth/install/hooks/berth_pre_edit.sh"
+            "command": "\"$HOME/.claude/scripts/berth/install/hooks/berth_pre_edit.sh\""
           }
         ]
       }
@@ -86,7 +86,7 @@
           },
           {
             "type": "command",
-            "command": "/Users/natemccoy/.claude/scripts/berth/install/hooks/berth_session_start.sh"
+            "command": "\"$HOME/.claude/scripts/berth/install/hooks/berth_session_start.sh\""
           }
         ]
       },
@@ -95,7 +95,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "/opt/homebrew/bin/python3 /Users/natemccoy/.claude/scripts/hooks/session-start-delegate-resume.py"
+            "command": "\"$HOME/.claude/scripts/lib/py\" \"$HOME/.claude/scripts/hooks/session-start-delegate-resume.py\""
           }
         ]
       }
@@ -106,7 +106,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "/Users/natemccoy/.claude/scripts/berth/install/hooks/berth_post_bash.sh"
+            "command": "\"$HOME/.claude/scripts/berth/install/hooks/berth_post_bash.sh\""
           }
         ]
       },
@@ -123,7 +123,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "/opt/homebrew/bin/python3 /Users/natemccoy/.claude/scripts/hooks/post-tool-use-basedpyright.py"
+            "command": "\"$HOME/.claude/scripts/lib/py\" \"$HOME/.claude/scripts/hooks/post-tool-use-basedpyright.py\""
           }
         ]
       },
@@ -131,7 +131,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "/opt/homebrew/bin/python3 /Users/natemccoy/.claude/scripts/hooks/post-tool-use-context-usage.py"
+            "command": "\"$HOME/.claude/scripts/lib/py\" \"$HOME/.claude/scripts/hooks/post-tool-use-context-usage.py\""
           }
         ]
       },
@@ -139,11 +139,11 @@
         "hooks": [
           {
             "type": "command",
-            "command": "/opt/homebrew/bin/python3 /Users/natemccoy/.claude/scripts/hooks/post-tool-use-banned-words.py"
+            "command": "\"$HOME/.claude/scripts/lib/py\" \"$HOME/.claude/scripts/hooks/post-tool-use-banned-words.py\""
           },
           {
             "type": "command",
-            "command": "/opt/homebrew/bin/python3 /Users/natemccoy/.claude/scripts/hooks/post-tool-use-banned-words-block.py"
+            "command": "\"$HOME/.claude/scripts/lib/py\" \"$HOME/.claude/scripts/hooks/post-tool-use-banned-words-block.py\""
           }
         ]
       }
@@ -153,15 +153,15 @@
         "hooks": [
           {
             "type": "command",
-            "command": "/opt/homebrew/bin/python3 /Users/natemccoy/.claude/scripts/hooks/stop-delegate-continue.py"
+            "command": "\"$HOME/.claude/scripts/lib/py\" \"$HOME/.claude/scripts/hooks/stop-delegate-continue.py\""
           },
           {
             "type": "command",
-            "command": "/opt/homebrew/bin/python3 /Users/natemccoy/.claude/scripts/hooks/stop-delegate-progress-timer.py"
+            "command": "\"$HOME/.claude/scripts/lib/py\" \"$HOME/.claude/scripts/hooks/stop-delegate-progress-timer.py\""
           },
           {
             "type": "command",
-            "command": "/opt/homebrew/bin/python3 /Users/natemccoy/.claude/scripts/hooks/stop-assistant-prose-banned-words.py"
+            "command": "\"$HOME/.claude/scripts/lib/py\" \"$HOME/.claude/scripts/hooks/stop-assistant-prose-banned-words.py\""
           }
         ]
       }

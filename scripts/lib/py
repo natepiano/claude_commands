@@ -1,0 +1,32 @@
+#!/usr/bin/env bash
+# Find a python3 new enough for this repo, then exec it with our arguments.
+#
+# This repo uses match statements and `X | Y` unions, so it needs Python >= 3.10
+# (30 files would fail on less). On macOS the `python3` on PATH is Apple's
+# /usr/bin/python3, which is 3.9 -- which is why the hooks used to hardcode
+# /opt/homebrew/bin/python3. That path does not exist on Linux, so every hook
+# silently failed there. Choosing by VERSION rather than by path works on both.
+#
+# Order: explicit override first, then PATH -- correct on NixOS, and on a Mac
+# whose PATH puts homebrew ahead of /usr/bin -- then homebrew's usual locations
+# for a Mac whose PATH does not.
+set -uo pipefail
+
+NEED_MAJOR=3
+NEED_MINOR=10
+
+new_enough() {
+    command -v "$1" >/dev/null 2>&1 || [ -x "$1" ] || return 1
+    "$1" -c "import sys; sys.exit(0 if sys.version_info >= ($NEED_MAJOR, $NEED_MINOR) else 1)" 2>/dev/null
+}
+
+for candidate in "${CLAUDE_PYTHON:-}" python3 /opt/homebrew/bin/python3 /usr/local/bin/python3; do
+    [ -n "$candidate" ] || continue
+    if new_enough "$candidate"; then
+        exec "$candidate" "$@"
+    fi
+done
+
+echo "claude_commands: no python3 >= $NEED_MAJOR.$NEED_MINOR found (tried PATH and homebrew)." >&2
+echo "Set CLAUDE_PYTHON to one, or install a newer python3." >&2
+exit 127

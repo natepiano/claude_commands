@@ -6,9 +6,9 @@ Close exactly one issue in the Hanadocs Obsidian vault. This command works from 
 
 ## Fixed scope
 
-- Vault: `/Users/natemccoy/rust/hanadocs`
-- Issues: `/Users/natemccoy/rust/hanadocs/issues/*.md`
-- Rank updater: `/Users/natemccoy/.claude/scripts/prioritize/renumber.py`
+- Vault: `~/rust/hanadocs`
+- Issues: `~/rust/hanadocs/issues/*.md`
+- Rank updater: `~/.claude/scripts/prioritize/renumber.py`
 - Do not inspect or modify issues outside this vault.
 - Do not commit changes.
 
@@ -50,12 +50,12 @@ Examples:
 
 1. Read the full `$ARGUMENTS` and separate the recognized options from the issue selector. Reject unknown options and more than one requested issue with a concise usage message.
 2. Normalize an Obsidian wikilink by removing `[[`, `]]`, an optional alias after `|`, and an optional `.md` suffix. Preserve an explicitly supplied absolute path.
-3. Resolve candidates only under `/Users/natemccoy/rust/hanadocs/issues/`, in this order:
+3. Resolve candidates only under `~/rust/hanadocs/issues/`, in this order:
    - exact absolute or `issues/...` path;
    - exact filename or filename stem, case-insensitively;
    - exact title-like stem after treating runs of spaces, hyphens, and underscores as equivalent separators, case-insensitively;
    - unique case-insensitive substring of that normalized filename stem.
-4. Resolve the real path and require it to be a regular, non-symlink Markdown file whose real parent is `/Users/natemccoy/rust/hanadocs/issues`. Reject traversal and outside-vault paths.
+4. Resolve the real path and require it to be a regular, non-symlink Markdown file whose real parent is `~/rust/hanadocs/issues`. Reject traversal and outside-vault paths.
 5. Inspect the file's complete YAML frontmatter before changing it. Require exactly one top-level `status` property.
 6. Read the current APFS creation and modification timestamps before changing the file, and capture the frontmatter `date_created` value — it is the authoritative creation date you will restore the filesystem to after editing. Require the pre-edit filesystem creation and modification calendar dates in `America/New_York` to match the existing `date_created` and `date_modified` frontmatter dates. If either differs, the file was already inconsistent before this command touched it: stop without writing and report the mismatch; never choose the filesystem or YAML side implicitly.
 7. If the resolved issue is already closed, make no changes. Report its existing `date_closed` and `reason`; this command closes issues rather than revising prior closure records.
@@ -79,7 +79,7 @@ Use `apply_patch` to make the smallest possible edit to the selected issue's top
 Do not directly edit `backlog_score` or `backlog_rank`. After the closure edit succeeds, run:
 
 ```bash
-/usr/bin/python3 /Users/natemccoy/.claude/scripts/prioritize/renumber.py --apply
+/usr/bin/python3 ~/.claude/scripts/prioritize/renumber.py --apply
 ```
 
 This removes live score/rank fields from the closed issue and immediately recalculates the positions of every valid open issue. The background watcher may observe the same edit afterward; when the positions are already current, its check makes no further changes.

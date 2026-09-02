@@ -27,7 +27,7 @@ from zoneinfo import ZoneInfo
 import writer_lock  # pyright: ignore[reportImplicitRelativeImport]
 
 
-VAULT_PATH = Path("/Users/natemccoy/rust/hanadocs")
+VAULT_PATH = Path.home() / "rust/hanadocs"
 ISSUES_PATH = VAULT_PATH / "issues"
 GOALS_PATH = VAULT_PATH / "prioritization goals.md"
 RANKINGS_FILENAME = "backlog-rankings.jsonl"

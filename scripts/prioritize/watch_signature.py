@@ -10,8 +10,8 @@ import sys
 from pathlib import Path
 
 
-ISSUES_DIR = Path("/Users/natemccoy/rust/hanadocs/issues")
-GOALS_FILE = Path("/Users/natemccoy/rust/hanadocs/prioritization goals.md")
+ISSUES_DIR = Path.home() / "rust/hanadocs/issues"
+GOALS_FILE = Path.home() / "rust/hanadocs/prioritization goals.md"
 
 
 class SignatureError(RuntimeError):

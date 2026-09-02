@@ -16,8 +16,8 @@ from typing import cast
 import renumber  # pyright: ignore[reportImplicitRelativeImport]
 
 
-ISSUES_DIR = Path("/Users/natemccoy/rust/hanadocs/issues")
-GOALS_FILE = Path("/Users/natemccoy/rust/hanadocs/prioritization goals.md")
+ISSUES_DIR = Path.home() / "rust/hanadocs/issues"
+GOALS_FILE = Path.home() / "rust/hanadocs/prioritization goals.md"
 
 INPUT_FIELDS = (
     "status",

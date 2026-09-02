@@ -2,14 +2,14 @@
 
 set -uo pipefail
 
-SNAPSHOT_TOOL="/Users/natemccoy/.claude/scripts/prioritize/snapshot.py"
-RENUMBER_TOOL="/Users/natemccoy/.claude/scripts/prioritize/renumber.py"
-WRITER_LOCK_TOOL="/Users/natemccoy/.claude/scripts/prioritize/writer_lock.py"
-RUNNER_LOCK_TOOL="/Users/natemccoy/.claude/scripts/prioritize/runner_lock.py"
-SIGNATURE_TOOL="/Users/natemccoy/.claude/scripts/prioritize/watch_signature.py"
-ISSUES_DIR="/Users/natemccoy/rust/hanadocs/issues"
-GOALS_FILE="/Users/natemccoy/rust/hanadocs/prioritization goals.md"
-CACHE_DIR="/Users/natemccoy/Library/Caches/hanadocs-prioritize"
+SNAPSHOT_TOOL="$HOME/.claude/scripts/prioritize/snapshot.py"
+RENUMBER_TOOL="$HOME/.claude/scripts/prioritize/renumber.py"
+WRITER_LOCK_TOOL="$HOME/.claude/scripts/prioritize/writer_lock.py"
+RUNNER_LOCK_TOOL="$HOME/.claude/scripts/prioritize/runner_lock.py"
+SIGNATURE_TOOL="$HOME/.claude/scripts/prioritize/watch_signature.py"
+ISSUES_DIR="$HOME/rust/hanadocs/issues"
+GOALS_FILE="$HOME/rust/hanadocs/prioritization goals.md"
+CACHE_DIR="$HOME/Library/Caches/hanadocs-prioritize"
 SUCCESS_SNAPSHOT="$CACHE_DIR/semantic-inputs.json"
 STATE_DIR="/tmp/hanadocs-prioritize"
 RUNNER_LOCK_FILE="$STATE_DIR/runner.lock"

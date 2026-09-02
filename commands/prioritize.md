@@ -8,10 +8,10 @@ This command replaced the retired full-backlog multi-agent audit (2026-07-21). T
 
 ## Fixed scope
 
-- Vault: `/Users/natemccoy/rust/hanadocs`
-- Issues: `/Users/natemccoy/rust/hanadocs/issues/*.md`
-- Strategic goals: `/Users/natemccoy/rust/hanadocs/prioritization goals.md`
-- Rankings export: `/Users/natemccoy/rust/hanadocs/backlog-rankings.jsonl` (derived, watcher-written)
+- Vault: `~/rust/hanadocs`
+- Issues: `~/rust/hanadocs/issues/*.md`
+- Strategic goals: `~/rust/hanadocs/prioritization goals.md`
+- Rankings export: `~/rust/hanadocs/backlog-rankings.jsonl` (derived, watcher-written)
 - Never derive the vault from the current working directory. Never inspect or modify issues outside this vault.
 
 ## Arguments — band selection
@@ -25,7 +25,7 @@ Bands are rated internally against each other; different bands are only comparab
 
 ## Workflow
 
-1. **Preflight.** Run `/usr/bin/python3 /Users/natemccoy/.claude/scripts/prioritize/renumber.py` (dry-run). Require canonical state and a healthy watcher last-status in `/tmp/hanadocs-prioritize/`. List any issues reported as needing prioritization; they lack rubric values and can only be rated by the user (offer to survey them as in `/issue`), never invented.
+1. **Preflight.** Run `/usr/bin/python3 ~/.claude/scripts/prioritize/renumber.py` (dry-run). Require canonical state and a healthy watcher last-status in `/tmp/hanadocs-prioritize/`. List any issues reported as needing prioritization; they lack rubric values and can only be rated by the user (offer to survey them as in `/issue`), never invented.
 2. **Enumerate the band** from `backlog-rankings.jsonl` plus each member's current `backlog_goal`, `backlog_alignment`, `backlog_impact`, `backlog_urgency`, `backlog_effort` frontmatter.
 3. **Read every band issue in full.** No sampling. Note duplicate or overlapping scope between issues while reading.
 4. **Propose comparative ratings.** Re-rate `backlog_alignment` and `backlog_impact` relative to the band, using the full one-to-five-star range — the strongest few issues in the band take five stars. Adjust `backlog_urgency` or `backlog_effort` only on explicit evidence in the note; their anchors stay absolute. Change `backlog_goal` only when the note clearly serves a different goal.
@@ -60,7 +60,7 @@ Bands are rated internally against each other; different bands are only comparab
 
 ### Deterministic renumbering
 
-- `/Users/natemccoy/.claude/scripts/prioritize/renumber.py` is the mechanical scoring and dense-renumbering tool; vault paths are hard-coded in it.
+- `~/.claude/scripts/prioritize/renumber.py` is the mechanical scoring and dense-renumbering tool; vault paths are hard-coded in it.
 - Sort by `backlog_score` descending; equal scores preserve valid existing relative rank, with file path as the deterministic fallback for first runs and newly tied issues.
 - Dry-run is the default; `--apply` is required to write. It preserves unrelated frontmatter, note content, permissions, APFS creation time, and the modification calendar date (a ~1 ms mtime nudge invalidates Obsidian's metadata cache without changing the date `obsidian_knife` sees).
 - An open issue with missing or invalid rubric inputs loses any stale score/rank, is reported as needing prioritization, and never blocks ranking of valid issues.
@@ -69,9 +69,9 @@ Bands are rated internally against each other; different bands are only comparab
 
 ### Automatic ranking watcher
 
-- Source, setup/status helper, and runner live under `/Users/natemccoy/.claude/scripts/prioritize/`; the installed plist is `/Users/natemccoy/Library/LaunchAgents/com.natemccoy.hanadocs-prioritize.plist`.
+- Source, setup/status helper, and runner live under `~/.claude/scripts/prioritize/`; the installed plist is `~/Library/LaunchAgents/com.natemccoy.hanadocs-prioritize.plist`.
 - The daemon polls stable path/inode/size/mtime/ctime signatures of every issue file plus the goals note at a sub-second interval; it runs the semantic snapshot/scorer only after a signature changes. New, modified, renamed, and deleted issues all trigger ranking.
-- The semantic snapshot covers `status`, `depends_on`, `backlog_goal`, and the four rubric fields — never the generated fields, so the watcher's own writes cannot loop. Snapshots live in `/Users/natemccoy/Library/Caches/hanadocs-prioritize/`; event logs and last-status in `/tmp/hanadocs-prioritize/`.
+- The semantic snapshot covers `status`, `depends_on`, `backlog_goal`, and the four rubric fields — never the generated fields, so the watcher's own writes cannot loop. Snapshots live in `~/Library/Caches/hanadocs-prioritize/`; event logs and last-status in `/tmp/hanadocs-prioritize/`.
 - Every write entry point (watcher, direct `renumber.py --apply`) holds the shared OS-released writer lock at `/tmp/hanadocs-prioritize/writer.lock`; a separate runner lock coalesces overlapping save bursts. No stale-PID cleanup.
 - Body-only edits with unchanged ranking inputs are a no-op. Judgment reassessment is always an explicit `/prioritize` or `/issue` action.
 

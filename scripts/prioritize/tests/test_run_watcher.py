@@ -77,22 +77,22 @@ raise SystemExit(2)
 
         content = RUN_WATCHER.read_text(encoding="utf-8")
         replacements = {
-            'SNAPSHOT_TOOL="/Users/natemccoy/.claude/scripts/prioritize/snapshot.py"': (
+            'SNAPSHOT_TOOL="~/.claude/scripts/prioritize/snapshot.py"': (
                 f'SNAPSHOT_TOOL="{self.snapshot}"'
             ),
-            'RENUMBER_TOOL="/Users/natemccoy/.claude/scripts/prioritize/renumber.py"': (
+            'RENUMBER_TOOL="~/.claude/scripts/prioritize/renumber.py"': (
                 f'RENUMBER_TOOL="{self.renumber}"'
             ),
-            'SIGNATURE_TOOL="/Users/natemccoy/.claude/scripts/prioritize/watch_signature.py"': (
+            'SIGNATURE_TOOL="~/.claude/scripts/prioritize/watch_signature.py"': (
                 f'SIGNATURE_TOOL="{self.signature}"'
             ),
-            'ISSUES_DIR="/Users/natemccoy/rust/hanadocs/issues"': (
+            'ISSUES_DIR="~/rust/hanadocs/issues"': (
                 f'ISSUES_DIR="{self.issues}"'
             ),
-            'GOALS_FILE="/Users/natemccoy/rust/hanadocs/prioritization goals.md"': (
+            'GOALS_FILE="~/rust/hanadocs/prioritization goals.md"': (
                 f'GOALS_FILE="{self.goals}"'
             ),
-            'CACHE_DIR="/Users/natemccoy/Library/Caches/hanadocs-prioritize"': (
+            'CACHE_DIR="~/Library/Caches/hanadocs-prioritize"': (
                 f'CACHE_DIR="{self.cache}"'
             ),
             'STATE_DIR="/tmp/hanadocs-prioritize"': f'STATE_DIR="{self.state}"',

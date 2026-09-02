@@ -28,9 +28,9 @@ Reject extra arguments with the concise usage message
 
 ## Fixed scope
 
-- Vault: `/Users/natemccoy/rust/hanadocs`
-- Issues: `/Users/natemccoy/rust/hanadocs/issues/*.md`
-- Repositories: checkouts under `/Users/natemccoy/rust`
+- Vault: `~/rust/hanadocs`
+- Issues: `~/rust/hanadocs/issues/*.md`
+- Repositories: checkouts under `~/rust`
 - Never derive the vault from the current working directory.
 - Never inspect or modify issues outside this vault.
 
@@ -71,9 +71,9 @@ it. Do not choose from filenames remembered from an earlier conversation.
 ### 2. Resolve the owning repository
 
 Resolve the selected issue's `project` to one checkout under
-`/Users/natemccoy/rust`. An exact checkout basename is preferred. Many project
+`~/rust`. An exact checkout basename is preferred. Many project
 labels are not checkout names — `hana_diegetic` is work inside
-`/Users/natemccoy/rust/hana`, not its own repository — so inspect the issue's
+`~/rust/hana`, not its own repository — so inspect the issue's
 links, the referenced modules, and Cargo workspace metadata when the basename
 does not match.
 

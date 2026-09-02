@@ -62,7 +62,7 @@ die() { printf 'board.sh: %s\n' "$1" >&2; exit 2; }
 # thing BSD and GNU date disagree about here.
 now_iso() {
     if [[ -n "${PLAN_DELEGATE_NOW_EPOCH:-}" ]]; then
-        date -r "${PLAN_DELEGATE_NOW_EPOCH%%.*}" +%Y-%m-%dT%H:%M:%S%z 2>/dev/null \
+        { date -r "${PLAN_DELEGATE_NOW_EPOCH%%.*}" +%Y-%m-%dT%H:%M:%S%z 2>/dev/null || date -d "@${PLAN_DELEGATE_NOW_EPOCH%%.*}" +%Y-%m-%dT%H:%M:%S%z 2>/dev/null; } \
             || date -d "@${PLAN_DELEGATE_NOW_EPOCH%%.*}" +%Y-%m-%dT%H:%M:%S%z
         return
     fi

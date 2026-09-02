@@ -3,16 +3,16 @@
 set -u
 
 LABEL="com.natemccoy.hanadocs-prioritize"
-INSTALLED_PLIST="/Users/natemccoy/Library/LaunchAgents/com.natemccoy.hanadocs-prioritize.plist"
-SOURCE_PLIST="/Users/natemccoy/.claude/scripts/prioritize/com.natemccoy.hanadocs-prioritize.plist"
+INSTALLED_PLIST="$HOME/Library/LaunchAgents/com.natemccoy.hanadocs-prioritize.plist"
+SOURCE_PLIST="$HOME/.claude/scripts/prioritize/com.natemccoy.hanadocs-prioritize.plist"
 STATE_DIR="/tmp/hanadocs-prioritize"
 LAST_STATUS_FILE="$STATE_DIR/last-status"
 EVENT_LOG="$STATE_DIR/events.log"
 RUNNER_LOCK_FILE="$STATE_DIR/runner.lock"
-RUNNER_LOCK_TOOL="/Users/natemccoy/.claude/scripts/prioritize/runner_lock.py"
-WRITER_LOCK_TOOL="/Users/natemccoy/.claude/scripts/prioritize/writer_lock.py"
+RUNNER_LOCK_TOOL="$HOME/.claude/scripts/prioritize/runner_lock.py"
+WRITER_LOCK_TOOL="$HOME/.claude/scripts/prioritize/writer_lock.py"
 PENDING_FILE="$STATE_DIR/pending"
-SUCCESS_SNAPSHOT="/Users/natemccoy/Library/Caches/hanadocs-prioritize/semantic-inputs.json"
+SUCCESS_SNAPSHOT="$HOME/Library/Caches/hanadocs-prioritize/semantic-inputs.json"
 DOMAIN="gui/$(/usr/bin/id -u)"
 
 if [[ -L "$INSTALLED_PLIST" ]]; then

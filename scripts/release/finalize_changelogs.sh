@@ -35,7 +35,8 @@ for FILE in "${FILES[@]}"; do
   fi
 
   echo "  $FILE: [Unreleased] → [$VERSION] - $TODAY"
-  sed -i '' "s/## \[Unreleased\]/## [$VERSION] - $TODAY/" "$FILE"
+  sed -i.portbak "s/## \[Unreleased\]/## [$VERSION] - $TODAY/" "$FILE"
+  rm -f "$FILE".portbak
 
   # Verify it took
   if grep -q '## \[Unreleased\]' "$FILE"; then

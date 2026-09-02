@@ -6,10 +6,10 @@ Create a new issue in the hanadocs vault.
 
 The hanadocs vault lives at an absolute path on disk so this command works from any project. Do NOT use paths relative to the current working directory.
 
-- Vault root: `/Users/natemccoy/rust/hanadocs`
-- Template: `/Users/natemccoy/rust/hanadocs/.claude/templates/issue.yaml`
-- Issues directory: `/Users/natemccoy/rust/hanadocs/issues/`
-- Project base files: `/Users/natemccoy/rust/hanadocs/issues - <short>.base`
+- Vault root: `~/rust/hanadocs`
+- Template: `~/rust/hanadocs/.claude/templates/issue.yaml`
+- Issues directory: `~/rust/hanadocs/issues/`
+- Project base files: `~/rust/hanadocs/issues - <short>.base`
 
 ## Arguments
 
@@ -17,7 +17,7 @@ $ARGUMENTS contains: `<project-shorthand> <issue title on first line>\n<optional
 
 ## Project mapping
 
-Look up the project shorthand from the base files in the vault root (`/Users/natemccoy/rust/hanadocs/issues - <short>.base`). The mapping is:
+Look up the project shorthand from the base files in the vault root (`~/rust/hanadocs/issues - <short>.base`). The mapping is:
 
 | Shorthand | Project link | Base file |
 |-----------|-------------|-----------|
@@ -44,7 +44,7 @@ If the shorthand doesn't match any of these, tell the user and stop.
 
 1. Parse $ARGUMENTS: the first word is the project shorthand. The rest of the first line is the issue title. Any subsequent lines are body content.
 
-2. Derive the filename from the title: lowercase, keep spaces as-is (do NOT replace spaces with hyphens), remove special characters (including any literal hyphens — replace hyphens with spaces), collapse runs of whitespace, append `.md`. The file goes in `/Users/natemccoy/rust/hanadocs/issues/`. Example: title `fix branch name in ci run labels` → `fix branch name in ci run labels.md`.
+2. Derive the filename from the title: lowercase, keep spaces as-is (do NOT replace spaces with hyphens), remove special characters (including any literal hyphens — replace hyphens with spaces), collapse runs of whitespace, append `.md`. The file goes in `~/rust/hanadocs/issues/`. Example: title `fix branch name in ci run labels` → `fix branch name in ci run labels.md`.
 
 3. **Title length check**: If the derived filename (without `.md`) exceeds 50 characters, the title is too long for a filename. Ask the user to pick a shorter filename by offering 3 concise alternatives (3-6 words each) as options. The original long title then becomes a `##` heading at the top of the issue body.
 
@@ -92,7 +92,7 @@ If the shorthand doesn't match any of these, tell the user and stop.
      - `⭐⭐⭐⭐` — L: broad work requiring substantial coordination or integration
      - `⭐⭐⭐⭐⭐` — XL: a multi-phase initiative or epic, likely a decomposition candidate
 
-5. Read the template at `/Users/natemccoy/rust/hanadocs/.claude/templates/issue.yaml` and fill in:
+5. Read the template at `~/rust/hanadocs/.claude/templates/issue.yaml` and fill in:
    - `{{PROJECT}}` — the full project link name
    - `{{SHORT}}` — the project shorthand
    - `{{DATE}}` — today's date in YYYY-MM-DD format
@@ -116,7 +116,7 @@ If the shorthand doesn't match any of these, tell the user and stop.
    area: "[[unfiled]]"
    ```
 
-8. Create the file at `/Users/natemccoy/rust/hanadocs/issues/<derived-filename>.md` with the filled-in frontmatter followed by the body content. If the title was shortened in step 3, prepend the original long title as a `## ` heading before the body content.
+8. Create the file at `~/rust/hanadocs/issues/<derived-filename>.md` with the filled-in frontmatter followed by the body content. If the title was shortened in step 3, prepend the original long title as a `## ` heading before the body content.
 
 9. Show the user the created file path and a summary of what was created.
 
@@ -125,7 +125,7 @@ If the shorthand doesn't match any of these, tell the user and stop.
     Wait for the fields with a single **backgrounded** blocking command, then yield the turn and read the result from the task notification:
 
     ```bash
-    f="/Users/natemccoy/rust/hanadocs/issues/<derived-filename>.md"
+    f="~/rust/hanadocs/issues/<derived-filename>.md"
     until grep -q "backlog_rank" "$f"; do sleep 2; done
     grep -E "backlog_score|backlog_rank" "$f"
     cat /tmp/hanadocs-prioritize/last-status
@@ -140,6 +140,6 @@ If the shorthand doesn't match any of these, tell the user and stop.
 ## Important
 - Every issue's `return` carries **two** entries: the project base `[[issues - <short>.base]]` first, then `[[issues.base]]`. The template already does this — do not drop either one.
 - Do NOT commit the changes
-- The file must go in `/Users/natemccoy/rust/hanadocs/issues/` (absolute path)
+- The file must go in `~/rust/hanadocs/issues/` (absolute path)
 - Today's date comes from the MEMORY.md `# currentDate` section, or use the system date
 - This command works from any project's working directory — never resolve paths relative to the CWD

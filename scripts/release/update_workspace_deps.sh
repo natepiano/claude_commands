@@ -140,10 +140,12 @@ for DEP in "${DEPS[@]}"; do
     # Handle both simple (`dep = "1.0"`) and table (`dep = { version = "1.0", path = "..." }`) formats
     if [[ "$TABLE_FORM" == "true" ]]; then
       # Table format — update only the version value, preserve path and other fields
-      sed -i '' "/^${DEP}/s/version = \"[^\"]*\"/version = \"$VERSION\"/" Cargo.toml
+      sed -i.portbak "/^${DEP}/s/version = \"[^\"]*\"/version = \"$VERSION\"/" Cargo.toml
+      rm -f Cargo.toml.portbak
     else
       # Simple format — replace the whole value
-      sed -i '' "s/^${DEP} = .*/${DEP} = \"$VERSION\"/" Cargo.toml
+      sed -i.portbak "s/^${DEP} = .*/${DEP} = \"$VERSION\"/" Cargo.toml
+      rm -f Cargo.toml.portbak
     fi
     UPDATED=$(grep "^${DEP}" Cargo.toml | head -1)
     echo "  Cargo.toml now has: $UPDATED"

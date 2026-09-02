@@ -87,7 +87,7 @@ safe_remove_worktree() {
 }
 
 # Diagnostic: change cwd to $RUST_DIR so any unanchored `cargo` call from this
-# process or its children no longer references /Users/natemccoy/.claude. If the
+# process or its children no longer references $HOME/.claude. If the
 # fix log still shows that path tomorrow, the cargo invocation is coming
 # from a process *outside* this script's tree (e.g. an IDE/LSP/watcher).
 echo "[diag] style-fix-worktrees.sh starting: pid=$$ ppid=$PPID cwd_before=$(pwd)"

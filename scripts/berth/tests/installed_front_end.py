@@ -25,9 +25,9 @@ from typing import (
     override,
 )
 
-SCRIPTS_ROOT = Path("/Users/natemccoy/.claude/scripts")
+SCRIPTS_ROOT = Path.home() / ".claude/scripts"
 BERTH_ROOT = SCRIPTS_ROOT / "berth"
-INSTALLED_DIRECTORY = Path("/Users/natemccoy/.cargo/bin")
+INSTALLED_DIRECTORY = Path.home() / ".cargo/bin"
 INSTALLED_BINARY = INSTALLED_DIRECTORY / "cargo-berth"
 PRE_EDIT_HOOK = BERTH_ROOT / "install/hooks/berth_pre_edit.sh"
 POST_BASH_HOOK = BERTH_ROOT / "install/hooks/berth_post_bash.sh"

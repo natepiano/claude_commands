@@ -85,7 +85,8 @@ for PIN in "${PINS[@]}"; do
   fi
 
   echo "  Pinning ${DEP} to \"$VERSION\" in Cargo.toml..."
-  sed -i '' -E "s|${MATCH}.*|${DEP} = \"$VERSION\"|" Cargo.toml
+  sed -i.portbak -E "s|${MATCH}.*|${DEP} = \"$VERSION\"|" Cargo.toml
+  rm -f Cargo.toml.portbak
   PINNED=$(grep -E "$MATCH" Cargo.toml | head -1)
   echo "  Cargo.toml now has: $PINNED"
   if [[ "$PINNED" != "${DEP} = \"$VERSION\"" ]]; then

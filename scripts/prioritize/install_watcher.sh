@@ -3,15 +3,15 @@
 set -euo pipefail
 
 LABEL="com.natemccoy.hanadocs-prioritize"
-SOURCE_PLIST="/Users/natemccoy/.claude/scripts/prioritize/com.natemccoy.hanadocs-prioritize.plist"
-INSTALLED_PLIST="/Users/natemccoy/Library/LaunchAgents/com.natemccoy.hanadocs-prioritize.plist"
-RUNNER="/Users/natemccoy/.claude/scripts/prioritize/run_watcher.sh"
-SNAPSHOT_TOOL="/Users/natemccoy/.claude/scripts/prioritize/snapshot.py"
-RENUMBER_TOOL="/Users/natemccoy/.claude/scripts/prioritize/renumber.py"
-WRITER_LOCK_TOOL="/Users/natemccoy/.claude/scripts/prioritize/writer_lock.py"
-RUNNER_LOCK_TOOL="/Users/natemccoy/.claude/scripts/prioritize/runner_lock.py"
-SIGNATURE_TOOL="/Users/natemccoy/.claude/scripts/prioritize/watch_signature.py"
-CACHE_DIR="/Users/natemccoy/Library/Caches/hanadocs-prioritize"
+SOURCE_PLIST="$HOME/.claude/scripts/prioritize/com.natemccoy.hanadocs-prioritize.plist"
+INSTALLED_PLIST="$HOME/Library/LaunchAgents/com.natemccoy.hanadocs-prioritize.plist"
+RUNNER="$HOME/.claude/scripts/prioritize/run_watcher.sh"
+SNAPSHOT_TOOL="$HOME/.claude/scripts/prioritize/snapshot.py"
+RENUMBER_TOOL="$HOME/.claude/scripts/prioritize/renumber.py"
+WRITER_LOCK_TOOL="$HOME/.claude/scripts/prioritize/writer_lock.py"
+RUNNER_LOCK_TOOL="$HOME/.claude/scripts/prioritize/runner_lock.py"
+SIGNATURE_TOOL="$HOME/.claude/scripts/prioritize/watch_signature.py"
+CACHE_DIR="$HOME/Library/Caches/hanadocs-prioritize"
 STATE_DIR="/tmp/hanadocs-prioritize"
 LAST_STATUS_FILE="$STATE_DIR/last-status"
 EVENT_LOG="$STATE_DIR/events.log"
@@ -63,7 +63,7 @@ done
 
 /usr/bin/plutil -lint "$SOURCE_PLIST"
 /bin/mkdir -p \
-    "/Users/natemccoy/Library/LaunchAgents" \
+    "$HOME/Library/LaunchAgents" \
     "$CACHE_DIR" \
     "$STATE_DIR"
 
@@ -133,4 +133,4 @@ fi
 install_succeeded=1
 echo "Installed and started $LABEL"
 echo "Valid open issues are ranked immediately; incomplete issues remain unranked."
-echo "Use /Users/natemccoy/.claude/scripts/prioritize/status_watcher.sh to inspect it."
+echo "Use $HOME/.claude/scripts/prioritize/status_watcher.sh to inspect it."

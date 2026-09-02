@@ -43,7 +43,8 @@ for FILE in "${FILES[@]}"; do
     echo "  Skipping $FILE (not found)"
     continue
   fi
-  sed -i '' "s/## \[$VERSION\] - $TODAY/## [Unreleased]\n\n## [$VERSION] - $TODAY/" "$FILE"
+  sed -i.portbak "s/## \[$VERSION\] - $TODAY/## [Unreleased]\n\n## [$VERSION] - $TODAY/" "$FILE"
+  rm -f "$FILE".portbak
   echo "  $FILE → added [Unreleased]"
 done
 

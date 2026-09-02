@@ -579,7 +579,7 @@ for i in "${!projects[@]}"; do
             # Separate [[ ]] blocks: bash 3.2 mis-parses `=~ regex && other` in
             # one bracket (the regex operand swallows the &&).
             if [[ "$next_epoch" =~ ^[0-9]+$ ]] && [[ "$next_epoch" != "0" ]]; then
-                next_when=$(date -r "$next_epoch" '+%a %b %e %H:%M' 2>/dev/null | tr -s ' ')
+                next_when=$({ date -r "$next_epoch" '+%a %b %e %H:%M' 2>/dev/null || date -d "@$next_epoch" '+%a %b %e %H:%M' 2>/dev/null; } | tr -s ' ')
                 echo "SKIP: $proj (nothing due — next eval ${next_when:-pending})"
             else
                 echo "SKIP: $proj (nothing due)"
