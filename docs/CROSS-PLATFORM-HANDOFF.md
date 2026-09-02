@@ -31,7 +31,7 @@ failed on Linux looking for `/opt/homebrew/bin/python3`.
 | # | plist / installer | what it does | trigger | status |
 |---|---|---|---|---|
 | 1 | scripts/sccache/com.natemccoy.sccache.plist | starts the sccache server | RunAtLoad | **DONE** - no service needed; only SCCACHE_IDLE_TIMEOUT=0 mattered, now in /etc/nixos/modules/development.nix. --start-server is redundant: the client starts the server on first use on both platforms. |
-| 2 | scripts/settings/ensure_git_filters.sh (generates its plist inline) | refreshes the filtered settings.json index after a write | WatchPaths | already guards on `command -v launchctl` |
+| 2 | scripts/settings/ensure_git_filters.sh (generates its plist inline) | refreshes the filtered settings.json index after a write | WatchPaths | **DONE** - /etc/nixos/modules/claude-git-filters.nix is the systemd .path equivalent. refresh_filtered_index.sh no longer pins PATH to homebrew. Verified both ways: the false 'M' is silenced, a real edit still shows. |
 | 3 | scripts/fix/com.natemccoy.style-fix.plist | periodic style-fix pipeline | StartInterval | |
 | 4 | scripts/agents/com.natemccoy.codex-agent-catalog-sync.plist | keeps the agent catalog current | RunAtLoad + StartInterval | |
 | 5 | scripts/claude_to_codex/com.natemccoy.claude-to-codex-sync.plist | syncs claude config to codex | RunAtLoad + WatchPaths | |
