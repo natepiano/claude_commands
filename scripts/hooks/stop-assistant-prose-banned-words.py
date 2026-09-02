@@ -20,6 +20,7 @@ from banned_words_lib import (
     bump_counters,
     find_violations,
     format_counter_totals,
+    hooks_enabled,
     is_guide_reproduction,
 )
 
@@ -30,6 +31,9 @@ class StopPayload(TypedDict, total=False):
 
 
 def main() -> None:
+    if not hooks_enabled():
+        sys.exit(0)
+
     try:
         data: StopPayload = cast(StopPayload, json.load(sys.stdin))
     except json.JSONDecodeError:

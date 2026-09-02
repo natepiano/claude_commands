@@ -19,6 +19,7 @@ from banned_words_lib import (
     find_violations,
     format_counter_totals,
     get_stem_guidance,
+    hooks_enabled,
     is_guide_reproduction,
     is_introspection_command,
     is_read_only_command,
@@ -74,6 +75,9 @@ def extract_text(tool_name: str, tool_input: ToolInput, tool_response: ToolRespo
 
 
 def main() -> None:
+    if not hooks_enabled():
+        sys.exit(0)
+
     try:
         data: HookPayload = cast(HookPayload, json.load(sys.stdin))
     except json.JSONDecodeError:

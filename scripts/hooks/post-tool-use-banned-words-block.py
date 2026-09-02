@@ -17,6 +17,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 from banned_words_lib import (
     STYLE_GUIDE,
     find_violations,
+    hooks_enabled,
     is_guide_reproduction,
     is_introspection_command,
     is_read_only_command,
@@ -72,6 +73,9 @@ def extract_text(tool_name: str, tool_input: ToolInput, tool_response: ToolRespo
 
 
 def main() -> None:
+    if not hooks_enabled():
+        sys.exit(0)
+
     try:
         data: HookPayload = cast(HookPayload, json.load(sys.stdin))
     except json.JSONDecodeError:

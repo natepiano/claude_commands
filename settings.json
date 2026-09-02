@@ -134,6 +134,18 @@
             "command": "/opt/homebrew/bin/python3 /Users/natemccoy/.claude/scripts/hooks/post-tool-use-context-usage.py"
           }
         ]
+      },
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/opt/homebrew/bin/python3 /Users/natemccoy/.claude/scripts/hooks/post-tool-use-banned-words.py"
+          },
+          {
+            "type": "command",
+            "command": "/opt/homebrew/bin/python3 /Users/natemccoy/.claude/scripts/hooks/post-tool-use-banned-words-block.py"
+          }
+        ]
       }
     ],
     "Stop": [
@@ -146,6 +158,10 @@
           {
             "type": "command",
             "command": "/opt/homebrew/bin/python3 /Users/natemccoy/.claude/scripts/hooks/stop-delegate-progress-timer.py"
+          },
+          {
+            "type": "command",
+            "command": "/opt/homebrew/bin/python3 /Users/natemccoy/.claude/scripts/hooks/stop-assistant-prose-banned-words.py"
           }
         ]
       }

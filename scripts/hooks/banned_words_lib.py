@@ -23,6 +23,11 @@ COUNTER_LOCK = COUNTER_STATE.with_suffix(".lock")
 # write copies the live file here first, so `revert_to_backup()` undoes exactly
 # the last bump — used when a hit is deemed not to count (e.g. quoting a stem).
 COUNTER_BACKUP = COUNTER_STATE.with_name(COUNTER_STATE.name + ".bak")
+# Enforcement switch for the three banned-word hooks. Their registration in
+# settings.json is permanent; this file is what turns them on and off, so a flip
+# never rewrites settings.json through its clean filter. Edited with
+# /banned_word_hook. A missing file means enforcement is on.
+HOOK_CONFIG = Path.home() / ".claude" / "config" / "banned_words.conf"
 # Per-line allowance marker. Must be preceded by a comment opener (`#`, `//`,
 # or `<!--`) so casual prose mentions of the literal `allow-banned:` — e.g.
 # documentation describing the mechanism, or a backticked reference in chat —
@@ -40,6 +45,29 @@ INTROSPECTION_TOKENS = (
     "git log",
     "git show",
 )
+
+
+def hooks_enabled() -> bool:
+    """Whether the three banned-word hooks enforce, or pass straight through.
+
+    Only a literal `off` disables them. A missing file, an unreadable one, or a
+    value nobody recognizes all read as on: a hook that quietly stopped
+    enforcing because its config was mistyped is the failure this ordering
+    exists to prevent, and enforcement that fires when it should not is visible
+    the moment it happens.
+    """
+    try:
+        text = HOOK_CONFIG.read_text(encoding="utf-8")
+    except OSError:
+        return True
+    for line in text.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("#") or "=" not in stripped:
+            continue
+        key, _, value = stripped.partition("=")
+        if key.strip() == "enabled":
+            return value.strip().lower() != "off"
+    return True
 
 
 def is_introspection_command(command: str) -> bool:

@@ -1,4 +1,6 @@
 {
-  "scripts": [],
+  "scripts": [
+    "settings/setup_git_filter.sh"
+  ],
   "config": []
 }
