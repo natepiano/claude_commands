@@ -62,8 +62,23 @@ rollback_installation() {
 }
 trap rollback_installation EXIT HUP INT TERM
 
+# `cargo +stable` pins the toolchain through rustup, not through cargo: the
+# leading-plus argument is consumed by the rustup shim before cargo ever sees
+# it. NixOS installs cargo directly with no shim, so the same argument comes
+# back as "error: no such command: `+stable`" and the build cannot start at
+# all. Pin the toolchain only where something can honour the pin; without
+# rustup there is exactly one cargo, which is the one the pin would select.
+#
+# Written with ${var:+...} rather than an array so it stays correct under the
+# bash 3.2 that macOS ships, where an empty array expansion trips `set -u`.
+if command -v rustup >/dev/null 2>&1; then
+    toolchain_argument=+stable
+else
+    toolchain_argument=
+fi
+
 step='engine build'
-if ! CARGO_TARGET_DIR=$staging_directory/target cargo +stable build \
+if ! CARGO_TARGET_DIR=$staging_directory/target cargo ${toolchain_argument:+"$toolchain_argument"} build \
     --release \
     --manifest-path "$repository_path/Cargo.toml" \
     -p cargo-berth; then
@@ -71,9 +86,25 @@ if ! CARGO_TARGET_DIR=$staging_directory/target cargo +stable build \
     exit 1
 fi
 
+# `install -S` means two unrelated things. On BSD, as macOS ships it, it is the
+# safe-copy flag and takes no argument. On GNU coreutils it is --suffix and
+# CONSUMES the next argument, so `install -S -m 755 src dest` silently becomes
+# suffix="-m" with three operands, and coreutils rejects the last one:
+#
+#     install: target '/home/natepiano/.cargo/bin/cargo-berth': Not a directory
+#
+# The build succeeds, publication fails, and the rollback puts the old engine
+# back -- which is exactly how a stale cargo-berth survived a reinstall. Ask
+# for safe copy only where that is what the flag means.
+if [[ $(uname -s) == Darwin ]]; then
+    safe_copy_argument=-S
+else
+    safe_copy_argument=
+fi
+
 step='engine publication'
 binary_publication_state=ReplacementStarted
-if ! install -S -m 755 "$staging_directory/target/release/cargo-berth" "$binary_path"; then
+if ! install ${safe_copy_argument:+"$safe_copy_argument"} -m 755 "$staging_directory/target/release/cargo-berth" "$binary_path"; then
     printf 'cargo-berth install failed during %s: engine publication failed\n' "$step" >&2
     exit 1
 fi
