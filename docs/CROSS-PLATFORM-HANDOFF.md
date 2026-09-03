@@ -35,7 +35,7 @@ failed on Linux looking for `/opt/homebrew/bin/python3`.
 | 3 | scripts/fix/com.natemccoy.style-fix.plist | periodic style-fix pipeline | StartInterval | **DONE** - /etc/nixos/modules/style-fix.nix is a systemd .timer + oneshot. Uses OnUnitInactiveSec (gap measured from run END) rather than launchd's fire-regardless StartInterval; the pgrep guard stays for hand-started runs. Verified: fired on its own, ran fix.sh to completion, Result=success. Needed four prerequisites - codex installed (modules/codex.nix), a top-level `model` in ~/.codex/config.toml (modules/codex-config-seed.toml, or catalog sync fails silently), 34 `#!/bin/bash` shebangs converted (NixOS has only /bin/sh), and a guard on `source ~/.cargo/env` (rustup writes it, nix does not; `set -e` killed the run there). |
 | 4 | scripts/agents/com.natemccoy.codex-agent-catalog-sync.plist | keeps the agent catalog current | RunAtLoad + StartInterval | **DONE** - /etc/nixos/modules/codex-catalog-sync.nix: a .path unit on the two inputs (config.toml, models_cache.json) + hourly backstop timer. PathChanged catches rename-into-place (verified with transient units). Failure surfaces in systemctl --user --failed with the script's stderr in the journal (verified live, both failure modes). |
 | 5 | scripts/claude_to_codex/com.natemccoy.claude-to-codex-sync.plist | syncs claude config to codex | RunAtLoad + WatchPaths | **DONE** - /etc/nixos/modules/claude-to-codex-sync.nix: .path on commands/ + subdirs (inotify is not recursive; neither was WatchPaths - the Mac missed subdir edits too), service in default.target for RunAtLoad. Verified live: subdir edit fired the sync, 61 skills generated. New command subdirs need adding to the watch list. |
-| 6 | scripts/kache/ninja.kunobi.kache-gc.plist | kache garbage collection | RunAtLoad + StartInterval (the KeepAlive in this row was a misreading) | **DONE** - nothing to port: kache is not installed on NixOS (no binary, no store, no checkout) and this machine's compilation cache is sccache, already handled as item 1. If kache is ever installed there, add a timer module on the codex-catalog-sync pattern. |
+| 6 | scripts/kache/ninja.kunobi.kache-gc.plist | kache garbage collection | RunAtLoad + StartInterval | **DONE** - nothing to port: kache is not installed on NixOS (no binary, no store, no checkout) and this machine's compilation cache is sccache, already handled as item 1. The plist itself was removed from the repo on 2026-09-03; kache is no longer the cache backend on the Mac either. |
 | 7 | scripts/prioritize/com.natemccoy.hanadocs-prioritize.plist | hanadocs prioritization watcher | KeepAlive + RunAtLoad | installer/status scripts are launchctl-only |
 
 launchd equivalents on NixOS are systemd user units: RunAtLoad -> `wantedBy =
@@ -106,6 +106,5 @@ otherwise blocks on the tool shell's open pipe.
 
 ### Remaining launchd items
 
-4 codex-agent-catalog-sync, 5 claude-to-codex-sync, 6 kache-gc,
-7 hanadocs-prioritize. Item 7 is the big one: scripts/prioritize/ carries 77
+Only 7 hanadocs-prioritize. It is the big one: scripts/prioritize/ carries 77
 hardcoded macOS paths (/bin/sleep, /usr/bin/python3, /bin/launchctl).
