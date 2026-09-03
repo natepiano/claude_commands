@@ -43,7 +43,11 @@ for FILE in "${FILES[@]}"; do
     echo "  Skipping $FILE (not found)"
     continue
   fi
-  sed -i.portbak "s/## \[$VERSION\] - $TODAY/## [Unreleased]\n\n## [$VERSION] - $TODAY/" "$FILE"
+  # A literal backslash-newline in the replacement is the one form both BSD
+  # and GNU sed accept; GNU alone expands \n, so BSD would emit a literal n.
+  sed -i.portbak "s/## \[$VERSION\] - $TODAY/## [Unreleased]\\
+\\
+## [$VERSION] - $TODAY/" "$FILE"
   rm -f "$FILE".portbak
   echo "  $FILE → added [Unreleased]"
 done
