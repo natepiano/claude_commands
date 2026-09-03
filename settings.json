@@ -191,6 +191,7 @@
     "filesystem": {
       "allowWrite": [
         "~/.cargo",
+        "~/.claude",
         "~/.local/state/plan-delegate",
         "~/Library/Application Support",
         "~/Library/Caches/Mozilla.sccache",
