@@ -60,3 +60,38 @@ plists genuinely need absolute paths -- which is why `/Users/natemccoy` still
 appears in them and nowhere else. Options if that matters: generate each plist
 from a template at install time, or leave them, since they are macOS-only files
 that Linux never reads.
+
+## Tilde expansion: one real gap (2026-09-03)
+
+Claude Code expands `~` in `sandbox.filesystem.allowWrite`, but NOT when it
+derives sandbox write paths from an `Edit(~/...)` permission rule -- there the
+literal string is used. Confirmed on both platforms (Mac agent on 2.1.259; on
+NixOS this session's own sandbox write list carries a literal `~/.claude`).
+
+Consequence of the tilde conversion: `Edit(~/.claude/**)` no longer contributes
+a real write path, so sandboxed shell writes under `~/.claude` from another
+project cwd fail. `~/Library/Application Support` was unaffected because it has
+its own allowWrite line.
+
+FIX, applied on the Mac and still UNCOMMITTED there: add `"~/.claude",` to
+`sandbox.filesystem.allowWrite` in settings.json, after `"~/.cargo",`. Applies
+equally on Linux. Deliberately NOT made here, to avoid a conflict with the
+Mac's uncommitted copy -- pull it instead once the Mac commits.
+
+### Hazard when pulling settings.json on NixOS
+
+The repo's clean filter (scripts/settings/clean_settings_json.sh) strips `model`
+and `effortLevel`, so they live only in the working copy. A fast-forward that
+rewrites settings.json replaces it with the bare blob and both keys vanish with
+no warning. Before pulling:
+
+    jq -c '{model, effortLevel}' ~/.claude/settings.json
+
+then restore them afterwards and run scripts/settings/refresh_filtered_index.sh
+so `git status` goes quiet again.
+
+### Remaining launchd items
+
+4 codex-agent-catalog-sync, 5 claude-to-codex-sync, 6 kache-gc,
+7 hanadocs-prioritize. Item 7 is the big one: scripts/prioritize/ carries 77
+hardcoded macOS paths (/bin/sleep, /usr/bin/python3, /bin/launchctl).

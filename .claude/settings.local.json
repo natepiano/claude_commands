@@ -5,7 +5,6 @@
       "Bash(GH_DEBUG=1 gh repo view:*)",
       "Bash(RUSTC_WRAPPER=\"\" cargo check:*)",
       "Bash(bash ~/.claude/scripts/fix/fix.sh)",
-      "Bash(bash ~/.claude/scripts/ask_a_friend/ask_a_friend.sh \"/tmp/claude/ask_a_friend\" \"~/.claude\")",
       "Bash(bash ~/.claude/scripts/ask_a_friend/prepare_session.sh)",
       "Bash(bash ~/.claude/scripts/agents/agent_exec.sh:*)",
       "Bash(bash ~/.claude/scripts/fix/setup.sh)",

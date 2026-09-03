@@ -125,7 +125,7 @@ If the shorthand doesn't match any of these, tell the user and stop.
     Wait for the fields with a single **backgrounded** blocking command, then yield the turn and read the result from the task notification:
 
     ```bash
-    f="~/rust/hanadocs/issues/<derived-filename>.md"
+    f="$HOME/rust/hanadocs/issues/<derived-filename>.md"
     until grep -q "backlog_rank" "$f"; do sleep 2; done
     grep -E "backlog_score|backlog_rank" "$f"
     cat /tmp/hanadocs-prioritize/last-status
