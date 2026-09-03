@@ -14,6 +14,11 @@ set -euo pipefail
 
 SESSION_DIR="${1:?Usage: end_friend.sh <session_dir>}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# python3 goes through the repo shim, which picks an interpreter by VERSION
+# rather than by path: the python3 on PATH is Apple 3.9 on the Mac, and this
+# repo needs >= 3.10.
+PY="${SCRIPT_DIR}/../lib/py"
 STATUS_FILE="${SESSION_DIR}/status"
 AGENT_FILE="${SESSION_DIR}/consult_agent"
 MESH="${SCRIPT_DIR}/../agents/codex_mesh.py"
@@ -48,17 +53,17 @@ case "${FAMILY}" in
     fi
     ;;
   codex)
-    python3 "${MESH}" end --session-dir "${SESSION_DIR}" --to "${FRIEND}" || true
+    "$PY" "${MESH}" end --session-dir "${SESSION_DIR}" --to "${FRIEND}" || true
     # The resident loop notices the marker within about a second; give it a
     # moment to write its last status before the server under it goes away.
     for _ in 1 2 3 4 5 6 7 8 9 10; do
-      if python3 "${MESH}" list --session-dir "${SESSION_DIR}" | grep -q "^${FRIEND}	running	"; then
+      if "$PY" "${MESH}" list --session-dir "${SESSION_DIR}" | grep -q "^${FRIEND}	running	"; then
         sleep 0.5
       else
         break
       fi
     done
-    python3 "${MESH}" stop --session-dir "${SESSION_DIR}" || true
+    "$PY" "${MESH}" stop --session-dir "${SESSION_DIR}" || true
     ;;
   *)
     echo "end_friend.sh: unknown family '${FAMILY}' in ${AGENT_FILE}" >&2

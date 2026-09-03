@@ -20,7 +20,7 @@ This directory owns the engine refresh as well as the canonical wrappers. Run
 one command from any checkout of the `cargo-liner` repository:
 
 ```sh
-/Users/<you>/.claude/scripts/berth/install/install.sh /path/to/cargo-liner
+$HOME/.claude/scripts/berth/install/install.sh /path/to/cargo-liner
 ```
 
 The command builds `cargo-berth`, installs it in
@@ -34,12 +34,12 @@ Register the three absolute paths once, in `~/.claude/settings.json`:
     "hooks": {
       "PreToolUse":   [{ "matcher": "Edit|Write|NotebookEdit",
                          "hooks": [{ "type": "command",
-                                     "command": "/Users/<you>/.claude/scripts/berth/install/hooks/berth_pre_edit.sh" }] }],
+                                     "command": "$HOME/.claude/scripts/berth/install/hooks/berth_pre_edit.sh" }] }],
       "PostToolUse":  [{ "matcher": "Bash",
                          "hooks": [{ "type": "command",
-                                     "command": "/Users/<you>/.claude/scripts/berth/install/hooks/berth_post_bash.sh" }] }],
+                                     "command": "$HOME/.claude/scripts/berth/install/hooks/berth_post_bash.sh" }] }],
       "SessionStart": [{ "hooks": [{ "type": "command",
-                                     "command": "/Users/<you>/.claude/scripts/berth/install/hooks/berth_session_start.sh" }] }]
+                                     "command": "$HOME/.claude/scripts/berth/install/hooks/berth_session_start.sh" }] }]
     }
 
 That registration is global, so the wrappers run in every session. **Enrollment,

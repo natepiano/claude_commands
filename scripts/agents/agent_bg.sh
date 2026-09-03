@@ -35,6 +35,11 @@
 
 set -euo pipefail
 
+# python3 goes through the repo shim, which picks an interpreter by VERSION
+# rather than by path: the python3 on PATH is Apple 3.9 on the Mac, and this
+# repo needs >= 3.10.
+PY="${HOME}/.claude/scripts/lib/py"
+
 MESH_NAME="${1:?Usage: agent_bg.sh <mesh_name> <working_dir> <prompt_file> <summary_file> <log_file> <id_file> [model] [poll_secs]}"
 WORKING_DIR="${2:?missing working_dir}"
 PROMPT_FILE="${3:?missing prompt_file}"
@@ -104,7 +109,7 @@ if [[ "${DETACH}" == "1" ]]; then
 fi
 
 agent_status() {
-  "${CLAUDE_BIN}" agents --json 2>/dev/null | BG_ID="${BG_ID}" python3 -c '
+  "${CLAUDE_BIN}" agents --json 2>/dev/null | BG_ID="${BG_ID}" "$PY" -c '
 import json
 import os
 import sys

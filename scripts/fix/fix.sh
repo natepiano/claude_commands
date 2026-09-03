@@ -31,6 +31,11 @@ if [[ $# -gt 0 ]]; then
 fi
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+
+# python3 goes through the repo shim, which picks an interpreter by VERSION
+# rather than by path: the python3 on PATH is Apple 3.9 on the Mac, and this
+# repo needs >= 3.10.
+PY="$SCRIPT_DIR/../lib/py"
 LOG_DIR="$HOME/.local/logs/fix"
 LOG_FILE="$LOG_DIR/fix-$(date '+%Y%m%d-%H%M%S').log"
 LEGACY_LOG="$HOME/.local/logs/fix.log"
@@ -188,7 +193,7 @@ fi
 # Back-populate canonical settings.local.json permissions before every pass:
 # the style-fix agents depend on these permissions and the script is cheap.
 log "SETTINGS: back-populating canonical permissions..."
-python3 "$SCRIPT_DIR/backpopulate_settings.py" --apply >> "$LOG_FILE" 2>&1 || {
+"$PY" "$SCRIPT_DIR/backpopulate_settings.py" --apply >> "$LOG_FILE" 2>&1 || {
     log "WARNING: settings back-population failed"
 }
 

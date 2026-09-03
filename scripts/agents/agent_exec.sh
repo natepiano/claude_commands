@@ -2,6 +2,11 @@
 
 set -euo pipefail
 
+# python3 goes through the repo shim, which picks an interpreter by VERSION
+# rather than by path: the python3 on PATH is Apple 3.9 on the Mac, and this
+# repo needs >= 3.10.
+PY="${HOME}/.claude/scripts/lib/py"
+
 agents_exec_print_argv() {
     local separator="" argument
     for argument in "$@"; do
@@ -16,7 +21,7 @@ agents_exec_print_argv() {
 # this extracts the final result event's text into the output file to keep the
 # caller contract: output_file = final answer, log_file = full log.
 agents_claude_extract_result() {
-    python3 - "$1" "$2" <<'PY'
+    "$PY" - "$1" "$2" <<'PY'
 import json
 import sys
 

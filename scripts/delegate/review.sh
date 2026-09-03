@@ -92,6 +92,11 @@ BEAT_TAG="${SUBTASK}${LENS:+:${LENS}}"
 export PLAN_DELEGATE_TEAM_ROLE="${TEAM_SLOT}"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# python3 goes through the repo shim, which picks an interpreter by VERSION
+# rather than by path: the python3 on PATH is Apple 3.9 on the Mac, and this
+# repo needs >= 3.10.
+PY="${SCRIPT_DIR}/../lib/py"
 FINDINGS_FILE="${SESSION_DIR}/review_findings_${PASS_INDEX}${SUFFIX}.txt"
 STATUS_FILE="${SESSION_DIR}/review_status${SUFFIX}"
 LOG_FILE="${SESSION_DIR}/review_agent_${PASS_INDEX}${SUFFIX}.log"
@@ -155,7 +160,7 @@ board_post register \
 PASS_STARTED=0
 record_pass_start() {
   [[ -f "${PROGRESS_STATE}" ]] || return 0
-  if ! PLAN_DELEGATE_PASS_OWNER=launcher python3 "${PROGRESS_HELPER}" start-pass \
+  if ! PLAN_DELEGATE_PASS_OWNER=launcher "$PY" "${PROGRESS_HELPER}" start-pass \
     --session-dir "${SESSION_DIR}" \
     --pass-kind review \
     --activity "${PASS_ACTIVITY}" \
@@ -228,7 +233,7 @@ if [[ "${AGENT_CODE}" -eq 0 ]]; then
     record_pass_start || echo "ERROR: unable to record the review pass start." >&2
   fi
   if [[ -f "${PROGRESS_STATE}" && "${PASS_STARTED}" -eq 1 ]]; then
-    if ! PLAN_DELEGATE_PASS_OWNER=launcher python3 "${PROGRESS_HELPER}" finish-pass \
+    if ! PLAN_DELEGATE_PASS_OWNER=launcher "$PY" "${PROGRESS_HELPER}" finish-pass \
       --session-dir "${SESSION_DIR}" --status completed \
       --agent-awake-seconds "$(awake_seconds)"; then
       echo "ERROR: unable to record the review pass completion." >&2
@@ -249,7 +254,7 @@ else
   # An early reviewer that failed before its pass started recorded nothing;
   # there is no pass to close.
   if [[ -f "${PROGRESS_STATE}" && "${PASS_STARTED}" -eq 1 ]]; then
-    PLAN_DELEGATE_PASS_OWNER=launcher python3 "${PROGRESS_HELPER}" finish-pass \
+    PLAN_DELEGATE_PASS_OWNER=launcher "$PY" "${PROGRESS_HELPER}" finish-pass \
       --session-dir "${SESSION_DIR}" --status error \
       --agent-awake-seconds "$(awake_seconds)" \
       || echo "ERROR: unable to record the review pass error." >&2

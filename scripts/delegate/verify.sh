@@ -43,6 +43,11 @@
 
 set -euo pipefail
 
+# python3 goes through the repo shim, which picks an interpreter by VERSION
+# rather than by path: the python3 on PATH is Apple 3.9 on the Mac, and this
+# repo needs >= 3.10.
+PY="${HOME}/.claude/scripts/lib/py"
+
 # The single bottom layer: run(), lint.conf gating, fmt_cargo, run_nextest,
 # invoke_clippy, and the sandbox-failure detection all come from here.
 # shellcheck source=/dev/null
@@ -101,7 +106,7 @@ sys.exit(2)
 # lib-only and bin-only crates both work without compiling examples.
 target_flags() {
     local flags
-    if ! flags="$(cargo metadata --no-deps --format-version 1 | python3 -c "$TARGET_FLAGS_PY" "$1")"; then
+    if ! flags="$(cargo metadata --no-deps --format-version 1 | "$PY" -c "$TARGET_FLAGS_PY" "$1")"; then
         exit 2
     fi
     if [[ -z "$flags" ]]; then
@@ -113,7 +118,7 @@ target_flags() {
 
 example_features() {
     cargo metadata --no-deps --format-version 1 \
-        | python3 -c "$EXAMPLE_FEATURES_PY" "$1" "$2"
+        | "$PY" -c "$EXAMPLE_FEATURES_PY" "$1" "$2"
 }
 
 CMD="${1:-}"
@@ -165,7 +170,7 @@ if [[ -n "${ACTIVITY_SESSION_DIR}" \
     # the invocation itself: "verify.sh test hana" names both the command that
     # ran and the script to open when a gate misbehaves, where a bare
     # "test hana" answered neither.
-    if python3 "${PROGRESS_HISTORY}" start-activity \
+    if "$PY" "${PROGRESS_HISTORY}" start-activity \
         --session-dir "${ACTIVITY_SESSION_DIR}" \
         --label "Verification" \
         --activity "verify.sh ${CMD}${*:+ $*}" >/dev/null 2>&1; then
@@ -179,7 +184,7 @@ if [[ -n "${ACTIVITY_SESSION_DIR}" \
                 completed) result="pass" ;;
                 error) result="fail" ;;
             esac
-            python3 "${PROGRESS_HISTORY}" finish-activity \
+            "$PY" "${PROGRESS_HISTORY}" finish-activity \
                 --session-dir "${ACTIVITY_SESSION_DIR}" \
                 --status "${status}" \
                 --result "${result}" >/dev/null 2>&1 || true

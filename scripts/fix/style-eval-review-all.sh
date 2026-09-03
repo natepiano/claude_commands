@@ -22,6 +22,11 @@ set -euo pipefail
 export PATH="$HOME/.local/bin:$PATH"
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+
+# python3 goes through the repo shim, which picks an interpreter by VERSION
+# rather than by path: the python3 on PATH is Apple 3.9 on the Mac, and this
+# repo needs >= 3.10.
+PY="$SCRIPT_DIR/../lib/py"
 source "$SCRIPT_DIR/agent_assignments.sh"
 
 RUST_DIR="$HOME/rust"
@@ -196,7 +201,7 @@ for i in "${!names[@]}"; do
         continue
     fi
 
-    status=$(python3 "$HISTORY_HELPER" evaluation-status --project "$name" --field status 2>/dev/null || echo "missing")
+    status=$("$PY" "$HISTORY_HELPER" evaluation-status --project "$name" --field status 2>/dev/null || echo "missing")
     if [[ "$status" == "missing" ]]; then
         skipped_no_eval=$((skipped_no_eval + 1))
         continue
@@ -216,7 +221,7 @@ for i in "${!names[@]}"; do
         continue
     fi
     rm -f "$eval_file"
-    if ! python3 "$HISTORY_HELPER" export-evaluation --project "$name" --kind review --output "$eval_file"; then
+    if ! "$PY" "$HISTORY_HELPER" export-evaluation --project "$name" --kind review --output "$eval_file"; then
         echo "FAILED: $name (could not export pending evaluation)"
         skipped_no_eval=$((skipped_no_eval + 1))
         continue
@@ -273,7 +278,7 @@ for pid in "${pids[@]}"; do
         echo "WARN: $name (review agent exited $code)"
     fi
     if grep -q '^## Review Log$' "$eval_file" 2>/dev/null; then
-        python3 "$HISTORY_HELPER" save-evaluation \
+        "$PY" "$HISTORY_HELPER" save-evaluation \
             --project-root "${launch_roots[$idx]}" \
             --evaluation "$eval_file"
         rm -f "$eval_file"

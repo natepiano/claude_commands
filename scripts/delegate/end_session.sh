@@ -17,6 +17,11 @@
 
 set -euo pipefail
 
+# python3 goes through the repo shim, which picks an interpreter by VERSION
+# rather than by path: the python3 on PATH is Apple 3.9 on the Mac, and this
+# repo needs >= 3.10.
+PY="${HOME}/.claude/scripts/lib/py"
+
 if [[ -z "${CLAUDE_CODE_SESSION_ID:-}" ]]; then
   echo "No CLAUDE_CODE_SESSION_ID in the environment — nothing to clear."
   exit 0
@@ -28,7 +33,7 @@ if [[ -f "${MARKER}" ]]; then
   # The marker holds the session directory, which is where the mesh files live.
   SESSION_DIR="$(head -n 1 "${MARKER}")"
   if [[ -n "${SESSION_DIR}" && -f "${SESSION_DIR}/mesh_server.json" ]]; then
-    python3 "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/../agents/codex_mesh.py" \
+    "$PY" "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/../agents/codex_mesh.py" \
       stop --session-dir "${SESSION_DIR}" || true
   fi
   rm -f "${MARKER}"

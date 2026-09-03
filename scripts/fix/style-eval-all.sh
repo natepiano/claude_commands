@@ -19,6 +19,11 @@ set -euo pipefail
 export PATH="$HOME/.local/bin:$PATH"
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+
+# python3 goes through the repo shim, which picks an interpreter by VERSION
+# rather than by path: the python3 on PATH is Apple 3.9 on the Mac, and this
+# repo needs >= 3.10.
+PY="$SCRIPT_DIR/../lib/py"
 source "$SCRIPT_DIR/agent_assignments.sh"
 
 RUST_DIR="$HOME/rust"
@@ -170,7 +175,7 @@ write_failure_report() {
 kill_tree() {
     local root="$1" sig="${2:-TERM}"
     local pids
-    pids=$(python3 - "$root" <<'PY'
+    pids=$("$PY" - "$root" <<'PY'
 import subprocess, sys
 root = int(sys.argv[1])
 out = subprocess.run(["ps", "-axo", "pid=,ppid="], capture_output=True, text=True).stdout
@@ -256,7 +261,7 @@ clean_project_scratch() {
 
 evaluation_status_field() {
     local project="$1" field="$2"
-    python3 "$HISTORY_HELPER" evaluation-status --project "$project" --field "$field" 2>/dev/null || echo "missing"
+    "$PY" "$HISTORY_HELPER" evaluation-status --project "$project" --field "$field" 2>/dev/null || echo "missing"
 }
 
 evaluation_status_summary() {
@@ -289,7 +294,7 @@ finalize_no_findings_if_ready() {
     pending_evaluation_has_no_findings "$project" || return 1
     local summary rc=0
     summary=$(evaluation_status_summary "$project")
-    python3 "$HISTORY_HELPER" finalize-no-findings --project "$project" 2>/dev/null || rc=$?
+    "$PY" "$HISTORY_HELPER" finalize-no-findings --project "$project" 2>/dev/null || rc=$?
     if [[ $rc -eq 0 ]]; then
         if [[ -n "$project_root" ]]; then
             clean_project_scratch "$project" "$project_root"
@@ -520,7 +525,7 @@ for i in "${!projects[@]}"; do
     if [[ "$pending_status" == "no_findings" ]]; then
         summary=$(evaluation_status_summary "$proj")
         finalize_rc=0
-        python3 "$HISTORY_HELPER" finalize-no-findings --project "$proj" || finalize_rc=$?
+        "$PY" "$HISTORY_HELPER" finalize-no-findings --project "$proj" || finalize_rc=$?
         if [[ $finalize_rc -eq 0 ]]; then
             clean_project_scratch "$proj" "$project_root"
             echo "OK: $proj (no findings — $summary; recorded in history, pending finalized)"
@@ -552,7 +557,7 @@ for i in "${!projects[@]}"; do
     # eval-phase report parser turns "ERROR: <proj> (...)" into a failed cell.
     if ! $resume_pending; then
         due_err="$LOG_DIR/style_eval_${proj}.due-units.err"
-        due_count=$(python3 "$HISTORY_HELPER" due-units --project-root "$project_root" --field due_unit_count 2>"$due_err") && due_rc=0 || due_rc=$?
+        due_count=$("$PY" "$HISTORY_HELPER" due-units --project-root "$project_root" --field due_unit_count 2>"$due_err") && due_rc=0 || due_rc=$?
         if [[ $due_rc -ne 0 || ! "$due_count" =~ ^[0-9]+$ ]]; then
             # Strip parens/newlines so the reason survives the report parser's
             # "(...)" capture; keep it short.
@@ -575,7 +580,7 @@ for i in "${!projects[@]}"; do
             # no dormancy gate each unit re-arms on time alone, so the next eval
             # has a definite date — the soonest unit TTL expiry. Show that date
             # (local time, via BSD `date -r <epoch>`) instead of a TTL lecture.
-            next_epoch=$(python3 "$HISTORY_HELPER" due-units --project-root "$project_root" --field next_due_epoch 2>/dev/null)
+            next_epoch=$("$PY" "$HISTORY_HELPER" due-units --project-root "$project_root" --field next_due_epoch 2>/dev/null)
             # Separate [[ ]] blocks: bash 3.2 mis-parses `=~ regex && other` in
             # one bracket (the regex operand swallows the &&).
             if [[ "$next_epoch" =~ ^[0-9]+$ ]] && [[ "$next_epoch" != "0" ]]; then
@@ -594,7 +599,7 @@ for i in "${!projects[@]}"; do
         continue
     fi
 
-    python3 "$HISTORY_HELPER" start-run \
+    "$PY" "$HISTORY_HELPER" start-run \
         --project-root "$project_root" || {
         echo "FAILED: $proj (could not start pending run)"
         continue
@@ -665,7 +670,7 @@ for pid in "${pids[@]}"; do
         # through record-unit and are valid; start-run resumes an in-progress
         # evaluation instead of resetting it. If start-run itself fails we
         # still write a report so the cause is captured.
-        if ! python3 "$HISTORY_HELPER" start-run --project-root "$project_root"; then
+        if ! "$PY" "$HISTORY_HELPER" start-run --project-root "$project_root"; then
             write_failure_report "$name" "$a1_log" "$code" "$a1_helper" \
                 "" "" "" "failed-no-retry (start-run rejected)"
             echo "FAILED: $name (could not start retry — start-run rejected)"
@@ -699,7 +704,7 @@ for pid in "${pids[@]}"; do
             if [[ "$retry_status" == "no_findings" ]]; then
                 summary=$(evaluation_status_summary "$name")
                 finalize_rc=0
-                python3 "$HISTORY_HELPER" finalize-no-findings --project "$name" || finalize_rc=$?
+                "$PY" "$HISTORY_HELPER" finalize-no-findings --project "$name" || finalize_rc=$?
                 if [[ $finalize_rc -eq 0 ]]; then
                     clean_project_scratch "$name" "$project_root"
                     echo "RECOVERED: $name (no findings — $summary; recorded in history, pending finalized, retry succeeded)"
@@ -737,7 +742,7 @@ for pid in "${pids[@]}"; do
     if [[ "$eval_status" == "no_findings" ]]; then
         summary=$(evaluation_status_summary "$name")
         finalize_rc=0
-        python3 "$HISTORY_HELPER" finalize-no-findings --project "$name" || finalize_rc=$?
+        "$PY" "$HISTORY_HELPER" finalize-no-findings --project "$name" || finalize_rc=$?
         if [[ $finalize_rc -eq 3 ]]; then
             # Agent quit without an earned stop_reason. Loud failure, but the
             # history row is withheld (no fake-clean data) and the pending is

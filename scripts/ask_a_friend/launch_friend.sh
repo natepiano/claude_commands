@@ -32,6 +32,11 @@ WORKING_DIR="${2:?missing working_dir}"
 TASK="ask_a_friend.consultation"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# python3 goes through the repo shim, which picks an interpreter by VERSION
+# rather than by path: the python3 on PATH is Apple 3.9 on the Mac, and this
+# repo needs >= 3.10.
+PY="${SCRIPT_DIR}/../lib/py"
 AGENTS_DIR="${SCRIPT_DIR}/../agents"
 QUESTION_FILE="${SESSION_DIR}/question.md"
 ANSWER_FILE="${SESSION_DIR}/answer.txt"
@@ -73,7 +78,7 @@ case "${AGENT_FAMILY}" in
     echo "running" > "${STATUS_FILE}"
     echo "friend=${FRIEND} family=codex agent=${AGENT_MODEL} effort=${AGENT_EFFORT:-default}"
     echo "Replies print below; send follow-ups with codex_mesh.py send --to ${FRIEND}."
-    if python3 "${AGENTS_DIR}/codex_mesh.py" start --resident \
+    if "$PY" "${AGENTS_DIR}/codex_mesh.py" start --resident \
       --session-dir "${SESSION_DIR}" \
       --name "${FRIEND}" \
       --cwd "${WORKING_DIR}" \

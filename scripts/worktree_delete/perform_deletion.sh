@@ -18,6 +18,11 @@ if [[ -z "$WORKTREE_PATH" || -z "$BRANCH_NAME" ]]; then
 fi
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# python3 goes through the repo shim, which picks an interpreter by VERSION
+# rather than by path: the python3 on PATH is Apple 3.9 on the Mac, and this
+# repo needs >= 3.10.
+PY="$SCRIPT_DIR/../lib/py"
 # shellcheck source=confirm_gate.sh
 source "$SCRIPT_DIR/confirm_gate.sh"
 
@@ -96,7 +101,7 @@ if [[ -n "$STYLE_FIX_PROJECT" ]]; then
     if [[ -f "$HISTORY_HELPER" ]]; then
         echo ""
         echo "Style-fix worktree deleted — discarding fix pipeline pending state for: $PROJECT"
-        if python3 "$HISTORY_HELPER" discard-pending --project "$PROJECT"; then
+        if "$PY" "$HISTORY_HELPER" discard-pending --project "$PROJECT"; then
             echo "Pending state discarded."
         else
             echo "Warning: discard-pending failed for $PROJECT — the fix pipeline will keep skipping it until ~/rust/nate_style/.history/.pending/$PROJECT.json is removed."

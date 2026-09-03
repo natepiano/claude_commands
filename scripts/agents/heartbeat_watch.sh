@@ -21,9 +21,14 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
+# python3 goes through the repo shim, which picks an interpreter by VERSION
+# rather than by path: the python3 on PATH is Apple 3.9 on the Mac, and this
+# repo needs >= 3.10.
+PY="${SCRIPT_DIR}/../lib/py"
+
 digest() {
     [[ -s "${AGENT_LOG}" ]] || return 0
-    python3 - "${AGENT_LOG}" <<'PY'
+    "$PY" - "${AGENT_LOG}" <<'PY'
 import json
 import re
 import sys

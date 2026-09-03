@@ -12,6 +12,11 @@
 # NOTE: `gh` commands require dangerouslyDisableSandbox: true in Claude Code.
 set -euo pipefail
 
+# python3 goes through the repo shim, which picks an interpreter by VERSION
+# rather than by path: the python3 on PATH is Apple 3.9 on the Mac, and this
+# repo needs >= 3.10.
+PY="$HOME/.claude/scripts/lib/py"
+
 TEMPLATE_DIR="$HOME/rust/rust-template"
 
 usage() {
@@ -129,7 +134,7 @@ if [[ -n "$WORKSPACE_ROOT" ]]; then
 
   if [[ "$SHARED_DEP" == "true" ]]; then
     echo "=== Registering $NAME in [workspace.dependencies] ==="
-    python3 - "$ROOT/Cargo.toml" "$NAME" <<'PY'
+    "$PY" - "$ROOT/Cargo.toml" "$NAME" <<'PY'
 import re, sys
 path, name = sys.argv[1], sys.argv[2]
 src = open(path).read()
@@ -150,7 +155,7 @@ PY
   ROOTDIR=$(basename "$ROOT")
   if [[ -f "$CONF" ]]; then
     echo "=== Enrolling in fix pipeline ==="
-    python3 - "$CONF" "$ROOTDIR" "$NAME" <<'PY'
+    "$PY" - "$CONF" "$ROOTDIR" "$NAME" <<'PY'
 import sys
 conf, rootdir, name = sys.argv[1], sys.argv[2], sys.argv[3]
 lines = open(conf).read().splitlines()

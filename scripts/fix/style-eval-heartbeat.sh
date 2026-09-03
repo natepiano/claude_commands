@@ -12,6 +12,11 @@
 
 set -euo pipefail
 
+# python3 goes through the repo shim, which picks an interpreter by VERSION
+# rather than by path: the python3 on PATH is Apple 3.9 on the Mac, and this
+# repo needs >= 3.10.
+PY="$HOME/.claude/scripts/lib/py"
+
 PROJECT=""
 RECORD=""
 PID=""
@@ -88,7 +93,7 @@ esac
 NATE_STYLE_DIR="${STYLE_HISTORY_NATE_STYLE_DIR:-$HOME/rust/nate_style}"
 PENDING_FILE="$NATE_STYLE_DIR/.history/.pending/$PROJECT.json"
 
-python3 - "$PENDING_FILE" "$RECORD" "$PID" "$PROJECT_ROOT" "$LOG_FILE" "$EVAL_PATH" "$RESULTS_FILE" "$MESSAGE" <<'PY'
+"$PY" - "$PENDING_FILE" "$RECORD" "$PID" "$PROJECT_ROOT" "$LOG_FILE" "$EVAL_PATH" "$RESULTS_FILE" "$MESSAGE" <<'PY'
 from __future__ import annotations
 
 import fcntl

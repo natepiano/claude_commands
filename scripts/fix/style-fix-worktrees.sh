@@ -33,6 +33,11 @@ export PATH="$HOME/.local/bin:$PATH"
 source "$HOME/.cargo/env"
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+
+# python3 goes through the repo shim, which picks an interpreter by VERSION
+# rather than by path: the python3 on PATH is Apple 3.9 on the Mac, and this
+# repo needs >= 3.10.
+PY="$SCRIPT_DIR/../lib/py"
 source "$SCRIPT_DIR/agent_assignments.sh"
 
 RUST_DIR="$HOME/rust"
@@ -297,10 +302,10 @@ for entry in ${projects[@]+"${projects[@]}"}; do
 
     # Check 0: pending evaluation markdown exists with numbered findings.
     # No project-root evaluation markdown file is used as a sentinel anymore.
-    eval_status=$(python3 "$HISTORY_HELPER" evaluation-status --project "$name" --field status 2>/dev/null || echo "missing")
-    finding_count=$(python3 "$HISTORY_HELPER" evaluation-status --project "$name" --field finding_count 2>/dev/null || echo 0)
-    coverage=$(python3 "$HISTORY_HELPER" evaluation-status --project "$name" --field coverage 2>/dev/null || echo "unknown")
-    stop_reason=$(python3 "$HISTORY_HELPER" evaluation-status --project "$name" --field stop_reason 2>/dev/null || echo "unknown")
+    eval_status=$("$PY" "$HISTORY_HELPER" evaluation-status --project "$name" --field status 2>/dev/null || echo "missing")
+    finding_count=$("$PY" "$HISTORY_HELPER" evaluation-status --project "$name" --field finding_count 2>/dev/null || echo 0)
+    coverage=$("$PY" "$HISTORY_HELPER" evaluation-status --project "$name" --field coverage 2>/dev/null || echo "unknown")
+    stop_reason=$("$PY" "$HISTORY_HELPER" evaluation-status --project "$name" --field stop_reason 2>/dev/null || echo "unknown")
     [[ -z "$coverage" ]] && coverage="unknown"
     [[ -z "$stop_reason" ]] && stop_reason="in_progress"
     # Check A: The target _style_fix path must be free.
@@ -316,7 +321,7 @@ for entry in ${projects[@]+"${projects[@]}"}; do
                 if [[ -n "$subpath" ]]; then
                     finalized_work_dir="$worktree_dir/$subpath"
                 fi
-                if python3 "$HISTORY_HELPER" finalize-fix --project-root "$finalized_work_dir" --evaluation "$eval_file"; then
+                if "$PY" "$HISTORY_HELPER" finalize-fix --project-root "$finalized_work_dir" --evaluation "$eval_file"; then
                     echo "SKIP: $name (style_fix worktree already has Fix Summary; pending JSON updated)"
                 else
                     echo "SKIP: $name (style_fix worktree has Fix Summary but pending update failed)"
@@ -648,11 +653,11 @@ create_and_fix() {
     # write an evaluation markdown file into the style-fix worktree.
     mkdir -p "$(dirname "$scratch_eval")"
     rm -f "$scratch_eval"
-    python3 "$HISTORY_HELPER" export-evaluation --project "$proj" --kind fix --output "$scratch_eval"
+    "$PY" "$HISTORY_HELPER" export-evaluation --project "$proj" --kind fix --output "$scratch_eval"
     echo "[diag $proj] after pending evaluation export"
     progress "$proj" "phase=worktree-ready dir=$worktree_dir"
 
-    python3 "$HISTORY_HELPER" set-phase --project "$proj" --phase fix || true
+    "$PY" "$HISTORY_HELPER" set-phase --project "$proj" --phase fix || true
     echo "[diag $proj] after set-phase (about to build prompt + launch agent)"
 
     # Scoping values for the fix prompt
@@ -884,7 +889,7 @@ PROMPT_EOF
     if [[ "$SUPERVISE_TIMED_OUT" == "1" ]]; then
         echo "TIMEOUT: $proj ($STYLE_AGENT exceeded ${AGENT_TIMEOUT_SECS}s timeout)"
         progress "$proj" "phase=failed reason=timeout elapsed=${SUPERVISE_ELAPSED}s"
-        python3 "$HISTORY_HELPER" finalize-failure --project "$proj" --reason "$STYLE_AGENT exceeded ${AGENT_TIMEOUT_SECS}s timeout" || true
+        "$PY" "$HISTORY_HELPER" finalize-failure --project "$proj" --reason "$STYLE_AGENT exceeded ${AGENT_TIMEOUT_SECS}s timeout" || true
         if ! safe_remove_worktree "$repo_dir" "$worktree_dir"; then
             echo "ERROR: $proj (worktree directory persists at $worktree_dir after cleanup — manual intervention needed)"
             progress "$proj" "phase=failed reason=cleanup-leftover dir=$worktree_dir"
@@ -909,7 +914,7 @@ PROMPT_EOF
             fi
             echo "ERROR: $proj ($fail_reason)"
             progress "$proj" "phase=failed reason=agent-exit code=$agent_code"
-            python3 "$HISTORY_HELPER" finalize-failure --project "$proj" --reason "$fail_reason" || true
+            "$PY" "$HISTORY_HELPER" finalize-failure --project "$proj" --reason "$fail_reason" || true
             if ! safe_remove_worktree "$repo_dir" "$worktree_dir"; then
                 echo "ERROR: $proj (worktree directory persists at $worktree_dir after cleanup — manual intervention needed)"
                 progress "$proj" "phase=failed reason=cleanup-leftover dir=$worktree_dir"
@@ -1057,11 +1062,11 @@ VERIFY_EOF
         echo "FAIL: $proj (cargo check failed after style-fix; worktree left for review at $worktree_dir; see $build_check_log)"
         progress "$proj" "phase=failed reason=build-broken-after-fix log=$build_check_log"
         if [[ -f "$scratch_eval" ]]; then
-            python3 "$HISTORY_HELPER" save-evaluation \
+            "$PY" "$HISTORY_HELPER" save-evaluation \
                 --project-root "$agent_work_dir" \
                 --evaluation "$scratch_eval" || true
         fi
-        python3 "$HISTORY_HELPER" finalize-failure --project "$proj" \
+        "$PY" "$HISTORY_HELPER" finalize-failure --project "$proj" \
             --reason "cargo check failed after style-fix; worktree left at $worktree_dir for review" || true
         # Intentionally do NOT remove the worktree or branch here. The agent
         # finished writing its Fix Summary, the diff is reviewable, and the
@@ -1071,7 +1076,7 @@ VERIFY_EOF
         return 1
     fi
 
-    python3 "$HISTORY_HELPER" finalize-fix --project-root "$agent_work_dir" --evaluation "$scratch_eval" || {
+    "$PY" "$HISTORY_HELPER" finalize-fix --project-root "$agent_work_dir" --evaluation "$scratch_eval" || {
         echo "ERROR: $proj (could not finalize history)"
         progress "$proj" "phase=failed reason=finalize-history"
         return 1
@@ -1138,7 +1143,7 @@ if [[ ${#failed_names[@]} -gt 0 ]]; then
                 if [[ -n "$R_subpath" ]]; then
                     already_work_dir="$R_worktree_dir/$R_subpath"
                 fi
-                if python3 "$HISTORY_HELPER" finalize-fix --project-root "$already_work_dir" --evaluation "$R_eval_file"; then
+                if "$PY" "$HISTORY_HELPER" finalize-fix --project-root "$already_work_dir" --evaluation "$R_eval_file"; then
                     echo "RETRY OK: $proj (already applied)"
                     progress "$proj" "phase=done eval=$R_eval_file"
                     failed=$((failed - 1))

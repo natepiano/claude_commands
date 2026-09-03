@@ -3,6 +3,11 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+
+# python3 goes through the repo shim, which picks an interpreter by VERSION
+# rather than by path: the python3 on PATH is Apple 3.9 on the Mac, and this
+# repo needs >= 3.10.
+PY="$SCRIPT_DIR/../lib/py"
 SOURCE_DIR="$HOME/.claude/commands"
 LOG_DIR="/tmp/claude-to-codex-sync"
 LOCK_DIR="$LOG_DIR/lock"
@@ -18,7 +23,7 @@ timestamp() {
 }
 
 epoch_ms() {
-    /usr/bin/env python3 -c 'import time; print(int(time.time() * 1000))'
+    "$PY" -c 'import time; print(int(time.time() * 1000))'
 }
 
 log() {
@@ -56,7 +61,7 @@ while true; do
     rm -f "$PENDING_FILE"
     run_started_epoch_ms="$(epoch_ms)"
 
-    if /usr/bin/env python3 "$SYNC_SCRIPT" --force >> "$EVENT_LOG" 2>&1; then
+    if "$PY" "$SYNC_SCRIPT" --force >> "$EVENT_LOG" 2>&1; then
         run_finished_epoch_ms="$(epoch_ms)"
         duration_ms=$(( run_finished_epoch_ms - run_started_epoch_ms ))
         printf 'ok %s\n' "$(timestamp)" > "$LAST_STATUS_FILE"

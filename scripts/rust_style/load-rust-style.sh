@@ -1,6 +1,11 @@
 #!/usr/bin/env zsh
 set -euo pipefail
 
+# python3 goes through the repo shim, which picks an interpreter by VERSION
+# rather than by path: the python3 on PATH is Apple 3.9 on the Mac, and this
+# repo needs >= 3.10.
+PY="${HOME}/.claude/scripts/lib/py"
+
 list_files=false
 project_root=""
 shuffle=false
@@ -419,7 +424,7 @@ printf 'Rust style guide loaded — %d %s, %d lines (shared: %d %s, %d lines; pr
 
 counter_state="${HOME}/.claude/state/forbidden-word-counts.json"
 if [[ -s "$counter_state" ]]; then
-  counter_summary="$(python3 - "$counter_state" <<'PY'
+  counter_summary="$("$PY" - "$counter_state" <<'PY'
 import json
 import sys
 from pathlib import Path

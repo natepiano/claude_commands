@@ -121,6 +121,11 @@ MESH_PREFIX="$(printf '%s' "${MESH_PREFIX}" | tr -c '[:alnum:]._-' '-' | cut -c1
 MESH_NAME="${MESH_PREFIX}-${TEAM_ROLE}"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# python3 goes through the repo shim, which picks an interpreter by VERSION
+# rather than by path: the python3 on PATH is Apple 3.9 on the Mac, and this
+# repo needs >= 3.10.
+PY="${SCRIPT_DIR}/../lib/py"
 SUMMARY_FILE="${SESSION_DIR}/impl_summary${SLOT}.txt"
 # Truncate at launch: the "done" post below names this path unconditionally, so a
 # seat that reports on the board without writing a summary would otherwise leave
@@ -165,7 +170,7 @@ printf 'task=%s\nfamily=%s\nagent=%s\neffort=%s\n' \
   "${TASK}" "${AGENT_FAMILY}" "${AGENT_MODEL}" "${AGENT_EFFORT}" > "${AGENT_FILE}"
 
 if [[ -f "${PROGRESS_STATE}" ]]; then
-  if ! PLAN_DELEGATE_PASS_OWNER=launcher python3 "${PROGRESS_HELPER}" start-pass \
+  if ! PLAN_DELEGATE_PASS_OWNER=launcher "$PY" "${PROGRESS_HELPER}" start-pass \
     --session-dir "${SESSION_DIR}" \
     --pass-kind "${PASS_KIND}" \
     --fix-pass "${FIX_PASS}" \
@@ -254,7 +259,7 @@ elif [[ "${USE_CODEX_MESH}" == "1" ]]; then
   # delegate's turn ends, so the wait, heartbeat, and pass recording below are
   # unchanged. What it adds is an address other delegates can send to.
   rm -f "${BG_ID_FILE}"
-  python3 "${SCRIPT_DIR}/../agents/codex_mesh.py" start \
+  "$PY" "${SCRIPT_DIR}/../agents/codex_mesh.py" start \
     --session-dir "${SESSION_DIR}" \
     --name "${MESH_NAME}" \
     --cwd "${WORKING_DIR}" \
@@ -287,7 +292,7 @@ wait "${HEARTBEAT_LOOP_PID}" 2>/dev/null || true
 if [[ "${AGENT_CODE}" -eq 0 ]]; then
   echo "implemented" > "${STATUS_FILE}"
   if [[ -f "${PROGRESS_STATE}" ]]; then
-    if ! PLAN_DELEGATE_PASS_OWNER=launcher python3 "${PROGRESS_HELPER}" finish-pass \
+    if ! PLAN_DELEGATE_PASS_OWNER=launcher "$PY" "${PROGRESS_HELPER}" finish-pass \
       --session-dir "${SESSION_DIR}" --status completed \
       --agent-awake-seconds "$(awake_seconds)"; then
       echo "ERROR: unable to record the ${PASS_KIND} pass completion." >&2
@@ -300,7 +305,7 @@ if [[ "${AGENT_CODE}" -eq 0 ]]; then
   # be killed or compacted inside, and that gap used to resolve as "fixed" --
   # handing the next review a defect pre-labelled as repaired.
   if [[ "${RESOLVES_ROUND}" == "1" && -f "${FINDINGS_STATE}" ]]; then
-    python3 "${FINDINGS_HELPER}" landed --session-dir "${SESSION_DIR}" \
+    "$PY" "${FINDINGS_HELPER}" landed --session-dir "${SESSION_DIR}" \
       || echo "ERROR: unable to record the repair round as landed." >&2
   fi
   bash "${HEARTBEAT_HELPER}" "${HEARTBEAT_FILE}" wrapper "${BEAT_TAG} agent finished" || true
@@ -315,7 +320,7 @@ if [[ "${AGENT_CODE}" -eq 0 ]]; then
 else
   echo "error" > "${STATUS_FILE}"
   if [[ -f "${PROGRESS_STATE}" ]]; then
-    PLAN_DELEGATE_PASS_OWNER=launcher python3 "${PROGRESS_HELPER}" finish-pass \
+    PLAN_DELEGATE_PASS_OWNER=launcher "$PY" "${PROGRESS_HELPER}" finish-pass \
       --session-dir "${SESSION_DIR}" --status error \
       --agent-awake-seconds "$(awake_seconds)" \
       || echo "ERROR: unable to record the ${PASS_KIND} pass error." >&2
@@ -323,7 +328,7 @@ else
   # The attempt stands rather than being refunded: a worker that ran and then
   # failed may have left partial edits behind, and the launcher cannot tell.
   if [[ "${RESOLVES_ROUND}" == "1" && -f "${FINDINGS_STATE}" ]]; then
-    python3 "${FINDINGS_HELPER}" abandon --session-dir "${SESSION_DIR}" --edits-landed \
+    "$PY" "${FINDINGS_HELPER}" abandon --session-dir "${SESSION_DIR}" --edits-landed \
       --reason "the ${SUBTASK} worker exited with code ${AGENT_CODE}" \
       || echo "ERROR: unable to record the repair round as abandoned." >&2
   fi
