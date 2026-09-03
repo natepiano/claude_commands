@@ -36,8 +36,12 @@ usage() {
         if [[ -n "$family" ]]; then
             ex_fn="$fn"
             [[ "$family" == "codex" ]] && ex_other="claude" || ex_other="codex"
-            row_line=""
-            IFS= read -r row_line < <(_agents_config_section_values "$fn.$family") || true
+            # Take the first row without abandoning the producer mid-write --
+            # a single `read` from a process substitution closes the pipe and
+            # every later printf in it reports a broken pipe. See the note on
+            # _agents_registry_get in agents_config.sh.
+            row_line="$(_agents_config_section_values "$fn.$family")"
+            row_line="${row_line%%$'\n'*}"
             if [[ -n "$row_line" ]]; then
                 ex_row="$fn.${row_line%%=*}"
                 ex_pair="$(agents_config_trim "${row_line#*=}")"

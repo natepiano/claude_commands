@@ -88,23 +88,35 @@ _agents_section_keys_inline() {
     done < <(_agents_config_section_values "$section")
 }
 
+# These two return from inside the loop as soon as they find their row, so they
+# read the section into a variable first rather than looping over a process
+# substitution. Returning early from `while read ... < <(producer)` leaves the
+# producer writing into a pipe with no reader, and every remaining printf in
+# _agents_config_section_values reports "write error: Broken pipe" on stderr.
+# On the Mac that went to /tmp/style-fix-stderr.log and nobody looked; on NixOS
+# the systemd journal carries it, which is where the 39 lines per fix run came
+# from. The functions below that read their input to the end are fine as-is.
 _agents_registry_get() {
-    local section="$1" key="$2" line row_key value
+    local section="$1" key="$2" values line row_key value
+    values="$(_agents_config_section_values "$section")"
     while IFS= read -r line; do
+        [[ -n "$line" ]] || continue
         row_key="${line%%=*}"
         [[ "$row_key" == "$key" ]] || continue
         value="${line#*=}"
         agents_config_trim "$value"
         return 0
-    done < <(_agents_config_section_values "$section")
+    done <<< "$values"
 }
 
 _agents_registry_has_key() {
-    local section="$1" key="$2" line row_key
+    local section="$1" key="$2" values line row_key
+    values="$(_agents_config_section_values "$section")"
     while IFS= read -r line; do
+        [[ -n "$line" ]] || continue
         row_key="${line%%=*}"
         [[ "$row_key" == "$key" ]] && return 0
-    done < <(_agents_config_section_values "$section")
+    done <<< "$values"
     return 1
 }
 
