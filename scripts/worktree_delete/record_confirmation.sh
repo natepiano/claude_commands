@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # Writes the confirmation nonce for a worktree deletion. Invoked by the
 # /worktree_delete confirm step after the user confirms, so perform_deletion.sh
 # will accept the deletion.

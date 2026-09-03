@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # Rebases SOURCE_BRANCH onto TARGET_BRANCH so a subsequent fast-forward merge becomes possible.
 # The rebase runs in SOURCE_WORKTREE (passed in) — the source branch must be checked out somewhere.
 # Usage: rebase_source.sh <source_branch> <target_branch> <source_worktree>

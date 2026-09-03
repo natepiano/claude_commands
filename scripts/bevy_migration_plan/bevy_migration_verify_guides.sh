@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # Verify that Bevy migration guides directory exists and contains .md files
 #
 # Usage: verify_migration_guides.sh <guides-dir>

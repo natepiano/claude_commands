@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # Setup script for the fix pipeline launchd agent:
 #   com.natemccoy.style-fix  — style eval/review/fix every 10 min
 # Idempotent — safe to run multiple times. Only acts on what's missing.

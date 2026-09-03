@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # Discovers available worktrees for deletion
 # Usage: discover_worktrees.sh
 # Returns: Current context and worktree listing

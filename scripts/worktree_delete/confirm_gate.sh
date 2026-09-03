@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # Shared confirmation-gate helpers for worktree deletion.
 #
 # A path-keyed nonce file couples perform_deletion.sh to the interactive

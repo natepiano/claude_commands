@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # Run style evaluations on all opt-in projects in parallel.
 # Projects come from the [projects] allowlist in fix.conf.
 # Can be run standalone or called from fix.sh.

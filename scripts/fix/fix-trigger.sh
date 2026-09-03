@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # Launchd wrapper for fix.sh, invoked every StartInterval seconds by
 # com.natemccoy.style-fix. There is no idle gate, so every firing runs the
 # style pipeline and keeps the eval/review/fix queue full.

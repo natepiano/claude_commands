@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # Update the per-project style-eval pending JSON with liveness information.
 #
 # Records are written under:

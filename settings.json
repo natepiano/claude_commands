@@ -37,7 +37,7 @@
       "Bash(run_test.sh *)",
       "Bash(~/.claude/scripts/release/*)",
       "Bash(~/rust/**/.git/**)",
-      "Edit(/\"$HOME/.claude/**)\"",
+      "Edit(~/.claude/**)",
       "Edit(~/Library/Application Support/**)",
       "Edit(//tmp/claude/**)",
       "Read(~/.cargo/registry/src**)",

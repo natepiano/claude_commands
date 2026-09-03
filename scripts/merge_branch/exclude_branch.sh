@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # Adds a branch to the merge-from-branch exclusion list for this repo.
 # Writes to .git/config via `git config --local`, so it never gets committed.
 # Usage: exclude_branch.sh <branch-name>

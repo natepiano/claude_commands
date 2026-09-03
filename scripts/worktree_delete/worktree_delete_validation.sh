@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # Validates worktree deletion target and performs safety checks
 # Usage: worktree_delete_validation.sh <worktree_path>
 # Returns: JSON with validation status and details

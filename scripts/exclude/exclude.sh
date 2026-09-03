@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # Excludes a file from git tracking via .git/info/exclude
 # Usage: exclude.sh <filename>
 # Returns: Status of each operation performed

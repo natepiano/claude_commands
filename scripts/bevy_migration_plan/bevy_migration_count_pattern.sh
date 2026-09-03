@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # bevy_migration_count_pattern.sh - Generic pattern occurrence counter for migration analysis
 #
 # Usage:

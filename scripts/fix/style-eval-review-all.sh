@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # Run the style-eval-review prompt on every project with fresh pending evaluation markdown.
 # Runs after style-eval-all.sh and before style-fix-worktrees.sh in the
 # fix pipeline.

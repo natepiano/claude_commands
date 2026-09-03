@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # Gathers git status and diff for commit preparation
 # Usage: analyze_changes.sh
 # Returns: Combined git status and diff output

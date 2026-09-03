@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # Manual launcher for style-fix-worktrees.sh that accumulates log files
 # into ~/.local/logs/fix/ alongside the fix orchestrator runs, so
 # /fix report can pick them up.

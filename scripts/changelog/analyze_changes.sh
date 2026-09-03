@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # Gathers git status, diff, and repo URL for changelog preparation
 # Usage: analyze_changes.sh
 # Returns: Combined git status, diff, and remote URL

@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # Create style-fix worktrees for projects with pending evaluation findings.
 # For each eligible project: create a worktree, launch the configured style agent to apply fixes + clippy.
 # Projects come from the [projects] allowlist in fix.conf.

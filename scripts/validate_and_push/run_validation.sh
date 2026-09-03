@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # Run the local CI validation script.
 # IMPORTANT: This script must be invoked with dangerouslyDisableSandbox: true
 # because taplo panics under the macOS Mach IPC sandbox restrictions.

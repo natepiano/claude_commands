@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # Validates a selected source branch and tests merge feasibility
 # Usage: validate.sh <branch_name>
 # Returns: JSON with validation results

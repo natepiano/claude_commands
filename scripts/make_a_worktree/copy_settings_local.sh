@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # Copies settings.local.json to a worktree and adds it to the worktree's git exclude
 # Usage: copy_settings_local.sh <worktree_path>
 # Run from the source project directory

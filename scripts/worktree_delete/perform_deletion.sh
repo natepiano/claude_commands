@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # Removes a worktree and deletes its branch.
 # Usage: perform_deletion.sh <worktree_path> <branch_name>
 # Returns: Status of removal and branch deletion

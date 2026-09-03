@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # rg timeout shim — bounds every NON-INTERACTIVE ripgrep invocation so a
 # stdin-blocked rg can never hang forever.
 #

@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # there's a bug when we use this pre-tool use which would be better
 # that it shows the output twice which we definitely don't want
 # so for now we're just doing this post tool - such a drag

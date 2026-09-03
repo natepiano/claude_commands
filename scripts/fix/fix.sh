@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # Fix style orchestrator.
 # Usage: fix.sh [project]
 #        fix.sh run_once
@@ -38,7 +38,10 @@ CONF_FILE="$SCRIPT_DIR/fix.conf"
 RUN_LOG_RETENTION_MINUTES=1440
 MANUAL_LOG_RETENTION_DAYS=7
 
-source "$HOME/.cargo/env"
+# rustup writes ~/.cargo/env; nix does not. On NixOS cargo is already on PATH
+# from the system profile, and with `set -e` a bare `source` of a missing file
+# ends the run on this line with no log and no clue.
+[[ -f "$HOME/.cargo/env" ]] && source "$HOME/.cargo/env"
 source "$SCRIPT_DIR/agent_assignments.sh"
 export PATH="/opt/homebrew/bin:$HOME/.local/bin:$PATH"
 

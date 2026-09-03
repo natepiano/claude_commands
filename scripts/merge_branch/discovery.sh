@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # Discovers available local branches and validates current working tree for merge
 # Also detects worktrees associated with each branch
 # Usage: discovery.sh
