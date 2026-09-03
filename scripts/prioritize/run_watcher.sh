@@ -2,6 +2,11 @@
 
 set -uo pipefail
 
+# Every python3 here goes through the repo shim, which picks an interpreter
+# by VERSION rather than by path. These scripts used to pin "$PY" --
+# Apple 3.9 on the Mac, nonexistent on NixOS. The pin was never load-bearing:
+# the tests in tests/ import typing.override and cannot run under 3.9 at all.
+PY="$HOME/.claude/scripts/lib/py"
 SNAPSHOT_TOOL="$HOME/.claude/scripts/prioritize/snapshot.py"
 RENUMBER_TOOL="$HOME/.claude/scripts/prioritize/renumber.py"
 WRITER_LOCK_TOOL="$HOME/.claude/scripts/prioritize/writer_lock.py"
@@ -9,7 +14,7 @@ RUNNER_LOCK_TOOL="$HOME/.claude/scripts/prioritize/runner_lock.py"
 SIGNATURE_TOOL="$HOME/.claude/scripts/prioritize/watch_signature.py"
 ISSUES_DIR="$HOME/rust/hanadocs/issues"
 GOALS_FILE="$HOME/rust/hanadocs/prioritization goals.md"
-CACHE_DIR="$HOME/Library/Caches/hanadocs-prioritize"
+CACHE_DIR="${XDG_CACHE_HOME:-${HOME}/Library/Caches}/hanadocs-prioritize"
 SUCCESS_SNAPSHOT="$CACHE_DIR/semantic-inputs.json"
 STATE_DIR="/tmp/hanadocs-prioritize"
 RUNNER_LOCK_FILE="$STATE_DIR/runner.lock"
@@ -27,17 +32,17 @@ CANDIDATE_FILE=""
 POST_RUN_FILE=""
 
 umask 077
-if ! /bin/mkdir -p "$STATE_DIR" "$CACHE_DIR"; then
-    /usr/bin/printf 'hanadocs prioritize watcher: could not create runtime directories\n' >&2
+if ! mkdir -p "$STATE_DIR" "$CACHE_DIR"; then
+    printf 'hanadocs prioritize watcher: could not create runtime directories\n' >&2
     exit 2
 fi
 
 timestamp() {
-    /bin/date '+%Y-%m-%dT%H:%M:%S%z'
+    date '+%Y-%m-%dT%H:%M:%S%z'
 }
 
 log() {
-    /usr/bin/printf '[%s] pid=%s %s\n' "$(timestamp)" "$$" "$*" >> "$EVENT_LOG"
+    printf '[%s] pid=%s %s\n' "$(timestamp)" "$$" "$*" >> "$EVENT_LOG"
 }
 
 write_status() {
@@ -46,19 +51,19 @@ write_status() {
     local detail="$3"
     local temporary
 
-    temporary="$(/usr/bin/mktemp "$STATE_DIR/.last-status.XXXXXX")" || return 1
-    /usr/bin/printf '%s %s result=%s detail=%s\n' \
+    temporary="$(mktemp "$STATE_DIR/.last-status.XXXXXX")" || return 1
+    printf '%s %s result=%s detail=%s\n' \
         "$state" "$(timestamp)" "$result" "$detail" > "$temporary"
-    /bin/mv -f "$temporary" "$LAST_STATUS_FILE"
+    mv -f "$temporary" "$LAST_STATUS_FILE"
 }
 
 mark_pending() {
-    /usr/bin/touch "$PENDING_FILE"
+    touch "$PENDING_FILE"
 }
 
 discard_temporary_snapshots() {
-    [[ -n "$CANDIDATE_FILE" ]] && /bin/rm -f "$CANDIDATE_FILE"
-    [[ -n "$POST_RUN_FILE" ]] && /bin/rm -f "$POST_RUN_FILE"
+    [[ -n "$CANDIDATE_FILE" ]] && rm -f "$CANDIDATE_FILE"
+    [[ -n "$POST_RUN_FILE" ]] && rm -f "$POST_RUN_FILE"
     CANDIDATE_FILE=""
     POST_RUN_FILE=""
 }
@@ -71,25 +76,25 @@ settled_state_is_current() {
     if [[ ! -f "$SUCCESS_SNAPSHOT" ]]; then
         return 1
     fi
-    settle_snapshot="$(/usr/bin/mktemp "$CACHE_DIR/.semantic-inputs.settle.XXXXXX")" || {
+    settle_snapshot="$(mktemp "$CACHE_DIR/.semantic-inputs.settle.XXXXXX")" || {
         log "error: could not create settle snapshot"
         return 2
     }
 
-    /usr/bin/python3 "$SNAPSHOT_TOOL" --output "$settle_snapshot" >> "$EVENT_LOG" 2>&1
+    "$PY" "$SNAPSHOT_TOOL" --output "$settle_snapshot" >> "$EVENT_LOG" 2>&1
     snapshot_status=$?
     if (( snapshot_status != 0 )); then
-        /bin/rm -f "$settle_snapshot"
+        rm -f "$settle_snapshot"
         log "error: settle semantic snapshot failed exit=$snapshot_status"
         return 2
     fi
-    if ! /usr/bin/cmp -s "$settle_snapshot" "$SUCCESS_SNAPSHOT"; then
-        /bin/rm -f "$settle_snapshot"
+    if ! cmp -s "$settle_snapshot" "$SUCCESS_SNAPSHOT"; then
+        rm -f "$settle_snapshot"
         return 1
     fi
-    /bin/rm -f "$settle_snapshot"
+    rm -f "$settle_snapshot"
 
-    /usr/bin/python3 "$RENUMBER_TOOL" --check >> "$EVENT_LOG" 2>&1
+    "$PY" "$RENUMBER_TOOL" --check >> "$EVENT_LOG" 2>&1
     check_status=$?
     if (( check_status == 0 )); then
         return 0
@@ -109,8 +114,8 @@ trap cleanup EXIT
 
 debounce_events() {
     while true; do
-        /bin/rm -f "$PENDING_FILE"
-        /bin/sleep "$DEBOUNCE_SECONDS"
+        rm -f "$PENDING_FILE"
+        sleep "$DEBOUNCE_SECONDS"
         if [[ ! -e "$PENDING_FILE" ]]; then
             return
         fi
@@ -162,13 +167,13 @@ run_once() {
     local check_status
 
     discard_temporary_snapshots
-    CANDIDATE_FILE="$(/usr/bin/mktemp "$CACHE_DIR/.semantic-inputs.candidate.XXXXXX")" || {
+    CANDIDATE_FILE="$(mktemp "$CACHE_DIR/.semantic-inputs.candidate.XXXXXX")" || {
         log "error: could not create candidate snapshot"
         write_status "error" "snapshot" "candidate-create-failed" || true
         return 2
     }
 
-    /usr/bin/python3 "$SNAPSHOT_TOOL" --output "$CANDIDATE_FILE" >> "$EVENT_LOG" 2>&1
+    "$PY" "$SNAPSHOT_TOOL" --output "$CANDIDATE_FILE" >> "$EVENT_LOG" 2>&1
     apply_status=$?
     if (( apply_status != 0 )); then
         log "error: semantic snapshot failed exit=$apply_status"
@@ -176,10 +181,10 @@ run_once() {
         return "$apply_status"
     fi
 
-    if [[ -f "$SUCCESS_SNAPSHOT" ]] && /usr/bin/cmp -s "$CANDIDATE_FILE" "$SUCCESS_SNAPSHOT"; then
-        /bin/rm -f "$CANDIDATE_FILE"
+    if [[ -f "$SUCCESS_SNAPSHOT" ]] && cmp -s "$CANDIDATE_FILE" "$SUCCESS_SNAPSHOT"; then
+        rm -f "$CANDIDATE_FILE"
         CANDIDATE_FILE=""
-        /usr/bin/python3 "$RENUMBER_TOOL" --check >> "$EVENT_LOG" 2>&1
+        "$PY" "$RENUMBER_TOOL" --check >> "$EVENT_LOG" 2>&1
         check_status=$?
         if (( check_status == 0 )); then
             log "semantic inputs and generated ranking state unchanged"
@@ -193,7 +198,7 @@ run_once() {
         fi
 
         log "semantic inputs unchanged but generated ranking drifted; repairing"
-        /usr/bin/python3 "$RENUMBER_TOOL" --apply >> "$EVENT_LOG" 2>&1
+        "$PY" "$RENUMBER_TOOL" --apply >> "$EVENT_LOG" 2>&1
         apply_status=$?
         if (( apply_status != 0 )); then
             if (( apply_status == CONCURRENT_CHANGE_EXIT )); then
@@ -205,7 +210,7 @@ run_once() {
             write_status "error" "rank-repair" "exit-$apply_status" || true
             return "$apply_status"
         fi
-        /usr/bin/python3 "$RENUMBER_TOOL" --check >> "$EVENT_LOG" 2>&1
+        "$PY" "$RENUMBER_TOOL" --check >> "$EVENT_LOG" 2>&1
         check_status=$?
         if (( check_status != 0 )); then
             log "error: generated ranking repair validation failed exit=$check_status"
@@ -218,7 +223,7 @@ run_once() {
     fi
 
     log "semantic ranking inputs changed; applying score and rank update"
-    /usr/bin/python3 "$RENUMBER_TOOL" --apply >> "$EVENT_LOG" 2>&1
+    "$PY" "$RENUMBER_TOOL" --apply >> "$EVENT_LOG" 2>&1
     apply_status=$?
     if (( apply_status != 0 )); then
         if (( apply_status == CONCURRENT_CHANGE_EXIT )); then
@@ -231,7 +236,7 @@ run_once() {
         return "$apply_status"
     fi
 
-    /usr/bin/python3 "$RENUMBER_TOOL" --check >> "$EVENT_LOG" 2>&1
+    "$PY" "$RENUMBER_TOOL" --check >> "$EVENT_LOG" 2>&1
     check_status=$?
     if (( check_status != 0 )); then
         log "error: post-apply validation failed exit=$check_status; successful snapshot unchanged"
@@ -239,12 +244,12 @@ run_once() {
         return "$check_status"
     fi
 
-    POST_RUN_FILE="$(/usr/bin/mktemp "$CACHE_DIR/.semantic-inputs.post-run.XXXXXX")" || {
+    POST_RUN_FILE="$(mktemp "$CACHE_DIR/.semantic-inputs.post-run.XXXXXX")" || {
         log "error: could not create post-run snapshot"
         write_status "error" "snapshot" "post-run-create-failed" || true
         return 2
     }
-    /usr/bin/python3 "$SNAPSHOT_TOOL" --output "$POST_RUN_FILE" >> "$EVENT_LOG" 2>&1
+    "$PY" "$SNAPSHOT_TOOL" --output "$POST_RUN_FILE" >> "$EVENT_LOG" 2>&1
     apply_status=$?
     if (( apply_status != 0 )); then
         log "error: post-run semantic snapshot failed exit=$apply_status"
@@ -252,16 +257,16 @@ run_once() {
         return "$apply_status"
     fi
 
-    if ! /usr/bin/cmp -s "$CANDIDATE_FILE" "$POST_RUN_FILE"; then
+    if ! cmp -s "$CANDIDATE_FILE" "$POST_RUN_FILE"; then
         log "ranking inputs changed during renumber; scheduling one fresh pass"
         write_status "pending" "rerun" "inputs-changed-during-pass" || true
         mark_pending
         return 0
     fi
 
-    /bin/rm -f "$POST_RUN_FILE"
+    rm -f "$POST_RUN_FILE"
     POST_RUN_FILE=""
-    if ! /bin/mv -f "$CANDIDATE_FILE" "$SUCCESS_SNAPSHOT"; then
+    if ! mv -f "$CANDIDATE_FILE" "$SUCCESS_SNAPSHOT"; then
         log "error: could not commit successful semantic snapshot"
         write_status "error" "snapshot-commit" "atomic-move-failed" || true
         return 2
@@ -287,59 +292,59 @@ run_daemon() {
     fi
     log "persistent signature watcher started"
     while true; do
-        observed="$(/usr/bin/python3 "$SIGNATURE_TOOL" 2>> "$EVENT_LOG")"
+        observed="$("$PY" "$SIGNATURE_TOOL" 2>> "$EVENT_LOG")"
         signature_status=$?
         if (( signature_status != 0 )); then
             log "error: watch signature failed exit=$signature_status; retrying"
             write_status "error" "watch-signature" "exit-$signature_status" || true
             baseline=""
-            /bin/sleep "$ERROR_RETRY_SECONDS"
+            sleep "$ERROR_RETRY_SECONDS"
             continue
         fi
         if [[ -n "$baseline" ]] && [[ "$observed" == "$baseline" ]]; then
-            /bin/sleep "$POLL_SECONDS"
+            sleep "$POLL_SECONDS"
             continue
         fi
 
-        /bin/bash "$0"
+        bash "$0"
         runner_status=$?
         if (( runner_status != 0 )); then
             if (( runner_status == CONCURRENT_CHANGE_EXIT )); then
                 log "files changed during ranking; coalescing and retrying"
                 baseline=""
-                /bin/sleep "$CONCURRENT_RETRY_SECONDS"
+                sleep "$CONCURRENT_RETRY_SECONDS"
                 continue
             fi
             log "error: detected change was not ranked exit=$runner_status; retrying"
             baseline=""
-            /bin/sleep "$ERROR_RETRY_SECONDS"
+            sleep "$ERROR_RETRY_SECONDS"
             continue
         fi
 
-        after="$(/usr/bin/python3 "$SIGNATURE_TOOL" 2>> "$EVENT_LOG")"
+        after="$("$PY" "$SIGNATURE_TOOL" 2>> "$EVENT_LOG")"
         signature_status=$?
         if (( signature_status != 0 )); then
             log "error: post-run watch signature failed exit=$signature_status; retrying"
             baseline=""
-            /bin/sleep "$ERROR_RETRY_SECONDS"
+            sleep "$ERROR_RETRY_SECONDS"
             continue
         fi
         if [[ "$after" != "$observed" ]]; then
             settled_state_is_current
             settle_status=$?
-            confirmed="$(/usr/bin/python3 "$SIGNATURE_TOOL" 2>> "$EVENT_LOG")"
+            confirmed="$("$PY" "$SIGNATURE_TOOL" 2>> "$EVENT_LOG")"
             signature_status=$?
             if (( signature_status != 0 )); then
                 log "error: settle watch signature failed exit=$signature_status; retrying"
                 write_status "error" "watch-signature" "settle-exit-$signature_status" || true
                 baseline=""
-                /bin/sleep "$ERROR_RETRY_SECONDS"
+                sleep "$ERROR_RETRY_SECONDS"
                 continue
             fi
             if (( settle_status == 0 )) && [[ "$confirmed" == "$after" ]]; then
                 log "ranking writes changed file signatures; semantic inputs and ranks remain canonical"
                 baseline="$confirmed"
-                /bin/sleep "$POLL_SECONDS"
+                sleep "$POLL_SECONDS"
                 continue
             fi
             log "watched files changed during ranking or settle verification; starting one fresh pass"
@@ -347,7 +352,7 @@ run_daemon() {
             continue
         fi
         baseline="$after"
-        /bin/sleep "$POLL_SECONDS"
+        sleep "$POLL_SECONDS"
     done
 }
 
@@ -373,8 +378,8 @@ if [[ "${1:-}" != "--locked" ]]; then
 
     while true; do
         mark_pending
-        /usr/bin/python3 "$RUNNER_LOCK_TOOL" run "$RUNNER_LOCK_FILE" \
-            /bin/bash "$0" --locked
+        "$PY" "$RUNNER_LOCK_TOOL" run "$RUNNER_LOCK_FILE" \
+            bash "$0" --locked
         runner_status=$?
         if (( runner_status == RUNNER_BUSY_EXIT )); then
             log "watcher already running; marked one pending rerun"

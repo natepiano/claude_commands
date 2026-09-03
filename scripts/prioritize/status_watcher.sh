@@ -3,6 +3,11 @@
 set -u
 
 LABEL="com.natemccoy.hanadocs-prioritize"
+# Every python3 here goes through the repo shim, which picks an interpreter
+# by VERSION rather than by path. These scripts used to pin "$PY" --
+# Apple 3.9 on the Mac, nonexistent on NixOS. The pin was never load-bearing:
+# the tests in tests/ import typing.override and cannot run under 3.9 at all.
+PY="$HOME/.claude/scripts/lib/py"
 INSTALLED_PLIST="$HOME/Library/LaunchAgents/com.natemccoy.hanadocs-prioritize.plist"
 SOURCE_PLIST="$HOME/.claude/scripts/prioritize/com.natemccoy.hanadocs-prioritize.plist"
 STATE_DIR="/tmp/hanadocs-prioritize"
@@ -12,11 +17,11 @@ RUNNER_LOCK_FILE="$STATE_DIR/runner.lock"
 RUNNER_LOCK_TOOL="$HOME/.claude/scripts/prioritize/runner_lock.py"
 WRITER_LOCK_TOOL="$HOME/.claude/scripts/prioritize/writer_lock.py"
 PENDING_FILE="$STATE_DIR/pending"
-SUCCESS_SNAPSHOT="$HOME/Library/Caches/hanadocs-prioritize/semantic-inputs.json"
-DOMAIN="gui/$(/usr/bin/id -u)"
+SUCCESS_SNAPSHOT="${XDG_CACHE_HOME:-${HOME}/Library/Caches}/hanadocs-prioritize/semantic-inputs.json"
+DOMAIN="gui/$(id -u)"
 
 if [[ -L "$INSTALLED_PLIST" ]]; then
-    target="$(/usr/bin/readlink "$INSTALLED_PLIST")"
+    target="$(readlink "$INSTALLED_PLIST")"
     if [[ "$target" == "$SOURCE_PLIST" ]]; then
         echo "plist: installed (managed symlink)"
     else
@@ -47,13 +52,13 @@ else
 fi
 
 if [[ -f "$RUNNER_LOCK_TOOL" ]]; then
-    runner_state="$(/usr/bin/python3 "$RUNNER_LOCK_TOOL" status "$RUNNER_LOCK_FILE" 2>/dev/null)"
+    runner_state="$("$PY" "$RUNNER_LOCK_TOOL" status "$RUNNER_LOCK_FILE" 2>/dev/null)"
     echo "runner lock: $runner_state"
 else
     echo "runner lock: status tool missing"
 fi
 if [[ -f "$WRITER_LOCK_TOOL" ]]; then
-    writer_state="$(/usr/bin/python3 "$WRITER_LOCK_TOOL" --status 2>/dev/null)"
+    writer_state="$("$PY" "$WRITER_LOCK_TOOL" --status 2>/dev/null)"
     echo "writer lock: $writer_state"
 else
     echo "writer lock: status tool missing"
@@ -67,7 +72,7 @@ fi
 if [[ -f "$EVENT_LOG" ]]; then
     echo
     echo "Recent events:"
-    /usr/bin/tail -n 20 "$EVENT_LOG"
+    tail -n 20 "$EVENT_LOG"
 else
     echo "events: no watcher log yet"
 fi

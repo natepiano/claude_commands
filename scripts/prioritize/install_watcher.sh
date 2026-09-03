@@ -3,6 +3,11 @@
 set -euo pipefail
 
 LABEL="com.natemccoy.hanadocs-prioritize"
+# Every python3 here goes through the repo shim, which picks an interpreter
+# by VERSION rather than by path. These scripts used to pin "$PY" --
+# Apple 3.9 on the Mac, nonexistent on NixOS. The pin was never load-bearing:
+# the tests in tests/ import typing.override and cannot run under 3.9 at all.
+PY="$HOME/.claude/scripts/lib/py"
 SOURCE_PLIST="$HOME/.claude/scripts/prioritize/com.natemccoy.hanadocs-prioritize.plist"
 INSTALLED_PLIST="$HOME/Library/LaunchAgents/com.natemccoy.hanadocs-prioritize.plist"
 RUNNER="$HOME/.claude/scripts/prioritize/run_watcher.sh"
@@ -11,11 +16,11 @@ RENUMBER_TOOL="$HOME/.claude/scripts/prioritize/renumber.py"
 WRITER_LOCK_TOOL="$HOME/.claude/scripts/prioritize/writer_lock.py"
 RUNNER_LOCK_TOOL="$HOME/.claude/scripts/prioritize/runner_lock.py"
 SIGNATURE_TOOL="$HOME/.claude/scripts/prioritize/watch_signature.py"
-CACHE_DIR="$HOME/Library/Caches/hanadocs-prioritize"
+CACHE_DIR="${XDG_CACHE_HOME:-${HOME}/Library/Caches}/hanadocs-prioritize"
 STATE_DIR="/tmp/hanadocs-prioritize"
 LAST_STATUS_FILE="$STATE_DIR/last-status"
 EVENT_LOG="$STATE_DIR/events.log"
-DOMAIN="gui/$(/usr/bin/id -u)"
+DOMAIN="gui/$(id -u)"
 INITIAL_PASS_ATTEMPTS=120
 created_symlink=0
 bootstrap_started=0
@@ -25,7 +30,7 @@ preflight_snapshot=""
 cleanup() {
     local exit_status=$?
     set +e
-    [[ -n "$preflight_snapshot" ]] && /bin/rm -f "$preflight_snapshot"
+    [[ -n "$preflight_snapshot" ]] && rm -f "$preflight_snapshot"
     if (( install_succeeded == 0 )); then
         if (( bootstrap_started == 1 )); then
             /bin/launchctl bootout "$DOMAIN" "$INSTALLED_PLIST" >/dev/null 2>&1
@@ -36,9 +41,9 @@ cleanup() {
             fi
         fi
         if (( created_symlink == 1 )) && [[ -L "$INSTALLED_PLIST" ]]; then
-            current_target="$(/usr/bin/readlink "$INSTALLED_PLIST")"
+            current_target="$(readlink "$INSTALLED_PLIST")"
             if [[ "$current_target" == "$SOURCE_PLIST" ]]; then
-                /bin/rm -f "$INSTALLED_PLIST"
+                rm -f "$INSTALLED_PLIST"
             fi
         fi
     fi
@@ -62,26 +67,26 @@ for required_file in "$SOURCE_PLIST" "$RUNNER" "$SNAPSHOT_TOOL" "$RENUMBER_TOOL"
 done
 
 /usr/bin/plutil -lint "$SOURCE_PLIST"
-/bin/mkdir -p \
+mkdir -p \
     "$HOME/Library/LaunchAgents" \
     "$CACHE_DIR" \
     "$STATE_DIR"
 
-preflight_snapshot="$(/usr/bin/mktemp "$CACHE_DIR/.install-preflight.XXXXXX")"
-if ! /usr/bin/python3 "$SNAPSHOT_TOOL" \
+preflight_snapshot="$(mktemp "$CACHE_DIR/.install-preflight.XXXXXX")"
+if ! "$PY" "$SNAPSHOT_TOOL" \
     --output "$preflight_snapshot"; then
     echo "Refusing to install: ranking inputs could not be snapshotted safely." >&2
     exit 1
 fi
 
-if ! /usr/bin/python3 "$RENUMBER_TOOL" --check; then
+if ! "$PY" "$RENUMBER_TOOL" --check; then
     echo "Refusing to install: the currently valid subset is not mechanically canonical." >&2
     echo "Run renumber.py --apply, then retry installation." >&2
     exit 1
 fi
 
 if [[ -L "$INSTALLED_PLIST" ]]; then
-    current_target="$(/usr/bin/readlink "$INSTALLED_PLIST")"
+    current_target="$(readlink "$INSTALLED_PLIST")"
     if [[ "$current_target" != "$SOURCE_PLIST" ]]; then
         echo "Refusing to replace unexpected symlink: $INSTALLED_PLIST -> $current_target" >&2
         exit 1
@@ -90,14 +95,14 @@ elif [[ -e "$INSTALLED_PLIST" ]]; then
     echo "Refusing to replace unmanaged file: $INSTALLED_PLIST" >&2
     exit 1
 else
-    /bin/ln -s "$SOURCE_PLIST" "$INSTALLED_PLIST"
+    ln -s "$SOURCE_PLIST" "$INSTALLED_PLIST"
     created_symlink=1
 fi
 
 if /bin/launchctl print "$DOMAIN/$LABEL" >/dev/null 2>&1; then
     /bin/launchctl bootout "$DOMAIN" "$INSTALLED_PLIST"
 fi
-/bin/rm -f "$LAST_STATUS_FILE"
+rm -f "$LAST_STATUS_FILE"
 bootstrap_started=1
 /bin/launchctl bootstrap "$DOMAIN" "$INSTALLED_PLIST"
 /bin/launchctl kickstart -k "$DOMAIN/$LABEL"
@@ -110,22 +115,22 @@ fi
 watcher_result=""
 for ((_attempt = 0; _attempt < INITIAL_PASS_ATTEMPTS; _attempt++)); do
     if [[ -f "$LAST_STATUS_FILE" ]]; then
-        watcher_result="$(/usr/bin/awk '{print $1; exit}' "$LAST_STATUS_FILE")"
+        watcher_result="$(awk '{print $1; exit}' "$LAST_STATUS_FILE")"
         if [[ "$watcher_result" == "ok" || "$watcher_result" == "error" ]]; then
             break
         fi
     fi
-    /bin/sleep 0.25
+    sleep 0.25
 done
 
 if [[ "$watcher_result" != "ok" ]]; then
     echo "Watcher loaded, but its initial ranking pass did not succeed." >&2
-    [[ -f "$LAST_STATUS_FILE" ]] && /bin/cat "$LAST_STATUS_FILE" >&2
-    [[ -f "$EVENT_LOG" ]] && /usr/bin/tail -n 20 "$EVENT_LOG" >&2
+    [[ -f "$LAST_STATUS_FILE" ]] && cat "$LAST_STATUS_FILE" >&2
+    [[ -f "$EVENT_LOG" ]] && tail -n 20 "$EVENT_LOG" >&2
     exit 1
 fi
 
-if ! /usr/bin/python3 "$RENUMBER_TOOL" --check; then
+if ! "$PY" "$RENUMBER_TOOL" --check; then
     echo "Watcher started, but final valid-subset ranking validation failed." >&2
     exit 1
 fi

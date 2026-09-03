@@ -77,22 +77,22 @@ raise SystemExit(2)
 
         content = RUN_WATCHER.read_text(encoding="utf-8")
         replacements = {
-            'SNAPSHOT_TOOL="~/.claude/scripts/prioritize/snapshot.py"': (
+            'SNAPSHOT_TOOL="$HOME/.claude/scripts/prioritize/snapshot.py"': (
                 f'SNAPSHOT_TOOL="{self.snapshot}"'
             ),
-            'RENUMBER_TOOL="~/.claude/scripts/prioritize/renumber.py"': (
+            'RENUMBER_TOOL="$HOME/.claude/scripts/prioritize/renumber.py"': (
                 f'RENUMBER_TOOL="{self.renumber}"'
             ),
-            'SIGNATURE_TOOL="~/.claude/scripts/prioritize/watch_signature.py"': (
+            'SIGNATURE_TOOL="$HOME/.claude/scripts/prioritize/watch_signature.py"': (
                 f'SIGNATURE_TOOL="{self.signature}"'
             ),
-            'ISSUES_DIR="~/rust/hanadocs/issues"': (
+            'ISSUES_DIR="$HOME/rust/hanadocs/issues"': (
                 f'ISSUES_DIR="{self.issues}"'
             ),
-            'GOALS_FILE="~/rust/hanadocs/prioritization goals.md"': (
+            'GOALS_FILE="$HOME/rust/hanadocs/prioritization goals.md"': (
                 f'GOALS_FILE="{self.goals}"'
             ),
-            'CACHE_DIR="~/Library/Caches/hanadocs-prioritize"': (
+            'CACHE_DIR="${XDG_CACHE_HOME:-${HOME}/Library/Caches}/hanadocs-prioritize"': (
                 f'CACHE_DIR="{self.cache}"'
             ),
             'STATE_DIR="/tmp/hanadocs-prioritize"': f'STATE_DIR="{self.state}"',
@@ -172,10 +172,10 @@ class RunWatcherTests(unittest.TestCase):
         return owner
 
     def test_busy_one_shot_returns_retryable_status(self) -> None:
-        owner = self._start_lock_owner(["/bin/sleep", "0.5"])
+        owner = self._start_lock_owner(["sleep", "0.5"])
         try:
             result = subprocess.run(
-                ["/bin/bash", str(self.fixture.watcher)],
+                ["bash", str(self.fixture.watcher)],
                 check=False,
                 capture_output=True,
                 text=True,
@@ -195,7 +195,7 @@ class RunWatcherTests(unittest.TestCase):
             ]
         )
         daemon = subprocess.Popen(
-            ["/bin/bash", str(self.fixture.watcher), "--daemon"],
+            ["bash", str(self.fixture.watcher), "--daemon"],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
             start_new_session=True,
@@ -277,7 +277,7 @@ raise SystemExit(0)
         )
 
         daemon = subprocess.Popen(
-            ["/bin/bash", str(self.fixture.watcher), "--daemon"],
+            ["bash", str(self.fixture.watcher), "--daemon"],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
             start_new_session=True,
@@ -320,7 +320,7 @@ raise SystemExit(0)
         )
 
         daemon = subprocess.Popen(
-            ["/bin/bash", str(self.fixture.watcher), "--daemon"],
+            ["bash", str(self.fixture.watcher), "--daemon"],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
             start_new_session=True,
