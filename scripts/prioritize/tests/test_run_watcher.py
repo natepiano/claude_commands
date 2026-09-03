@@ -92,7 +92,7 @@ raise SystemExit(2)
             'GOALS_FILE="$HOME/rust/hanadocs/prioritization goals.md"': (
                 f'GOALS_FILE="{self.goals}"'
             ),
-            'CACHE_DIR="${XDG_CACHE_HOME:-${HOME}/Library/Caches}/hanadocs-prioritize"': (
+            'CACHE_DIR="${XDG_CACHE_HOME:-$HOME/$([ "$(uname -s)" = Darwin ] && echo Library/Caches || echo .cache)}/hanadocs-prioritize"': (
                 f'CACHE_DIR="{self.cache}"'
             ),
             'STATE_DIR="/tmp/hanadocs-prioritize"': f'STATE_DIR="{self.state}"',

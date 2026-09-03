@@ -17,7 +17,7 @@ RUNNER_LOCK_FILE="$STATE_DIR/runner.lock"
 RUNNER_LOCK_TOOL="$HOME/.claude/scripts/prioritize/runner_lock.py"
 WRITER_LOCK_TOOL="$HOME/.claude/scripts/prioritize/writer_lock.py"
 PENDING_FILE="$STATE_DIR/pending"
-SUCCESS_SNAPSHOT="${XDG_CACHE_HOME:-${HOME}/Library/Caches}/hanadocs-prioritize/semantic-inputs.json"
+SUCCESS_SNAPSHOT="${XDG_CACHE_HOME:-$HOME/$([ "$(uname -s)" = Darwin ] && echo Library/Caches || echo .cache)}/hanadocs-prioritize/semantic-inputs.json"
 DOMAIN="gui/$(id -u)"
 
 if [[ -L "$INSTALLED_PLIST" ]]; then

@@ -14,7 +14,14 @@ RUNNER_LOCK_TOOL="$HOME/.claude/scripts/prioritize/runner_lock.py"
 SIGNATURE_TOOL="$HOME/.claude/scripts/prioritize/watch_signature.py"
 ISSUES_DIR="$HOME/rust/hanadocs/issues"
 GOALS_FILE="$HOME/rust/hanadocs/prioritization goals.md"
-CACHE_DIR="${XDG_CACHE_HOME:-${HOME}/Library/Caches}/hanadocs-prioritize"
+# The cache root is chosen per platform, not by XDG alone. XDG_CACHE_HOME is
+# normally UNSET -- the spec says fall back to ~/.cache -- so a plain
+# "${XDG_CACHE_HOME:-$HOME/Library/Caches}" reproduces the macOS layout on
+# Linux rather than only on the Mac. It did: the first run on NixOS created
+# ~/Library/Caches, a directory nothing else on the box has any reason to own.
+# Darwin still gets Library/Caches so the Mac's existing snapshot keeps being
+# found; orphaning it would force a needless full re-score.
+CACHE_DIR="${XDG_CACHE_HOME:-$HOME/$([ "$(uname -s)" = Darwin ] && echo Library/Caches || echo .cache)}/hanadocs-prioritize"
 SUCCESS_SNAPSHOT="$CACHE_DIR/semantic-inputs.json"
 STATE_DIR="/tmp/hanadocs-prioritize"
 RUNNER_LOCK_FILE="$STATE_DIR/runner.lock"
