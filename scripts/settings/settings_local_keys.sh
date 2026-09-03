@@ -27,10 +27,16 @@ SETTINGS_LOCAL_KEYS_MISSING='. as $cur | [$local[0] | keys[] | . as $k | select(
 
 # Copy the local-only keys out of settings.json into the sidecar.
 #
-# An empty snapshot never overwrites a real one: a bare blob landing in the
-# working copy (smudge not installed, or failed) must not erase the backup
-# that exists to repair it. To drop a key for good, remove it from the sidecar
-# as well.
+# The sidecar mirrors whichever of these keys settings.json currently has, so
+# removing an override -- picking the default model, for one, which Claude Code
+# records by deleting the `model` key rather than writing one -- propagates
+# here and the smudge stops restoring it. That is the only way a key can ever
+# be retired; the cost is that a bad write which drops one key takes the backup
+# for it within seconds.
+#
+# The one case that is refused is an ALL-empty result: a bare blob landing in
+# the working copy (smudge not installed, or failed) must not erase the whole
+# backup that exists to repair it.
 settings_local_keys_snapshot() {
     local repo_root="$1" settings sidecar snapshot
     settings="$repo_root/settings.json"
