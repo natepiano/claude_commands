@@ -4,11 +4,23 @@
 # ensure_git_filters.sh (install + repair) and refresh_filtered_index.sh (the
 # launchd watcher). One table so the two can never drift.
 #
-# Fields: <driver name>:<clean script, repo-relative>:<filtered path>
+# Fields: <driver name>:<clean script>:<smudge command>:<filtered path>
+# Scripts are repo-relative; git runs filters from the working-tree root.
 GIT_FILTERS=(
-  "claude-settings:scripts/settings/clean_settings_json.sh:settings.json"
-  "claude-agents-conf:scripts/agents/clean_agents_conf.sh:config/agents.conf"
+  "claude-settings:scripts/settings/clean_settings_json.sh:scripts/settings/smudge_settings_json.sh:settings.json"
+  "claude-agents-conf:scripts/agents/clean_agents_conf.sh:cat:config/agents.conf"
 )
+
+# Split one GIT_FILTERS entry into GF_NAME, GF_CLEAN, GF_SMUDGE, GF_PATH.
+git_filters_parse() {
+    local entry="$1" rest
+    GF_NAME="${entry%%:*}"
+    rest="${entry#*:}"
+    GF_CLEAN="${rest%%:*}"
+    rest="${rest#*:}"
+    GF_SMUDGE="${rest%%:*}"
+    GF_PATH="${rest#*:}"
+}
 
 GIT_FILTERS_LABEL="com.natemccoy.claude-settings-git-refresh"
 
@@ -55,9 +67,9 @@ git_filters_refresh_path() {
 }
 
 git_filters_refresh_all() {
-    local repo_root="$1" entry rest
+    local repo_root="$1" entry
     for entry in "${GIT_FILTERS[@]}"; do
-        rest="${entry#*:}"
-        git_filters_refresh_path "$repo_root" "${rest%%:*}" "${rest#*:}"
+        git_filters_parse "$entry"
+        git_filters_refresh_path "$repo_root" "$GF_CLEAN" "$GF_PATH"
     done
 }

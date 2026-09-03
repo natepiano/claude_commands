@@ -78,18 +78,31 @@ settings.json, after `"~/.cargo"`. Committed on the Mac and pulled here, so both
 platforms carry it. Note the new entry only reaches a session started after the
 pull -- Claude Code freezes its sandbox config at session start.
 
-### Hazard when pulling settings.json on NixOS
+### settings.json local-only keys survive a pull
 
-The repo's clean filter (scripts/settings/clean_settings_json.sh) strips `model`,
-`effortLevel`, and `modelSettings`, so they live only in the working copy. A
-fast-forward that
-rewrites settings.json replaces it with the bare blob and all three vanish with
-no warning. Before pulling:
+FIXED: the clean filter (scripts/settings/clean_settings_json.sh) strips
+`model`, `effortLevel`, and `modelSettings`, so they live only in the working
+copy. They used to vanish whenever a pull rewrote settings.json, because the
+smudge was `cat`. Now the watcher (launchd here, the systemd path unit on
+NixOS, both running refresh_filtered_index.sh) copies those keys to
+`settings.local-keys.json` after every write, and the smudge
+(scripts/settings/smudge_settings_json.sh) merges them back into whatever git
+writes. ensure_git_filters.sh installs the smudge at session start and, before
+its index refresh, puts back any key the sidecar has and settings.json lacks.
+Key list and both jq expressions live in scripts/settings/settings_local_keys.sh.
 
-    jq -c '{model, effortLevel, modelSettings}' ~/.claude/settings.json
+One-time sequence on NixOS, because the smudge is not installed there until
+after the pull that would lose the keys:
 
-then restore them afterwards and run scripts/settings/refresh_filtered_index.sh
-so `git status` goes quiet again.
+    cd ~/.claude
+    jq '{model, effortLevel, modelSettings} | with_entries(select(.value != null))' settings.json > settings.local-keys.json
+    git pull
+    bash scripts/settings/ensure_git_filters.sh </dev/null
+    jq -c '{model, effortLevel}' settings.json
+
+The last line should print the values from before the pull. The `</dev/null`
+matters only from inside a Claude Code session, where the scripts' stdin drain
+otherwise blocks on the tool shell's open pipe.
 
 ### Remaining launchd items
 

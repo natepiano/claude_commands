@@ -20,13 +20,17 @@ set -uo pipefail
 # Three things are needed, and all three are per-machine:
 #   1. the filter drivers, in .git/config
 #   2. the launchd watcher, which keeps `git status` quiet after each write
-#   3. an index refresh right now, for changes made while any of this was missing
+#      and snapshots settings.json's local-only keys for the smudge to restore
+#   3. a restore, snapshot, and index refresh right now, for anything that
+#      happened while the above was missing
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 
 # shellcheck source=/dev/null
 source "$SCRIPT_DIR/git_filters_table.sh"
+# shellcheck source=/dev/null
+source "$SCRIPT_DIR/settings_local_keys.sh"
 
 if ! git -C "$REPO_ROOT" rev-parse --git-dir >/dev/null 2>&1; then
     echo "ensure_git_filters: $REPO_ROOT is not a git repository; skipping." >&2
@@ -36,15 +40,17 @@ fi
 # ── 1. filter drivers ──
 installed=()
 for entry in "${GIT_FILTERS[@]}"; do
-    name="${entry%%:*}"
-    rest="${entry#*:}"
-    script="${rest%%:*}"
+    git_filters_parse "$entry"
+    name="$GF_NAME"
 
-    current="$(git -C "$REPO_ROOT" config --local --get "filter.$name.clean" 2>/dev/null || true)"
-    [[ "$current" == "$script" ]] && continue
+    # Both halves are checked: a machine configured before the settings.json
+    # smudge existed has the right clean and a stale `cat` smudge.
+    current_clean="$(git -C "$REPO_ROOT" config --local --get "filter.$name.clean" 2>/dev/null || true)"
+    current_smudge="$(git -C "$REPO_ROOT" config --local --get "filter.$name.smudge" 2>/dev/null || true)"
+    [[ "$current_clean" == "$GF_CLEAN" && "$current_smudge" == "$GF_SMUDGE" ]] && continue
 
-    if git -C "$REPO_ROOT" config --local "filter.$name.clean" "$script" 2>/dev/null &&
-        git -C "$REPO_ROOT" config --local "filter.$name.smudge" cat 2>/dev/null &&
+    if git -C "$REPO_ROOT" config --local "filter.$name.clean" "$GF_CLEAN" 2>/dev/null &&
+        git -C "$REPO_ROOT" config --local "filter.$name.smudge" "$GF_SMUDGE" 2>/dev/null &&
         git -C "$REPO_ROOT" config --local "filter.$name.required" true 2>/dev/null; then
         installed+=("$name")
     else
@@ -73,10 +79,10 @@ ensure_watcher() {
     [[ "$REPO_ROOT" == "$live_dir" ]] || return 0
 
     local dst="$HOME/Library/LaunchAgents/$GIT_FILTERS_LABEL.plist"
-    local watch_paths="" entry rest desired
+    local watch_paths="" entry desired
     for entry in "${GIT_FILTERS[@]}"; do
-        rest="${entry#*:}"
-        watch_paths+="        <string>$REPO_ROOT/${rest#*:}</string>"$'\n'
+        git_filters_parse "$entry"
+        watch_paths+="        <string>$REPO_ROOT/$GF_PATH</string>"$'\n'
     done
 
     desired="$(
@@ -127,6 +133,10 @@ PLIST
 ensure_watcher
 
 # ── 3. catch up on anything that changed while the above was missing ──
+# Restore before snapshot: a checkout that ran with no smudge left a bare blob
+# in settings.json, and snapshotting that first would only confirm the loss.
+settings_local_keys_restore "$REPO_ROOT"
+settings_local_keys_snapshot "$REPO_ROOT"
 git_filters_refresh_all "$REPO_ROOT"
 
 if ((${#installed[@]} > 0)); then
