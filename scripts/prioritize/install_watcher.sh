@@ -8,6 +8,19 @@ LABEL="com.natemccoy.hanadocs-prioritize"
 # Apple 3.9 on the Mac, nonexistent on NixOS. The pin was never load-bearing:
 # the tests in tests/ import typing.override and cannot run under 3.9 at all.
 PY="$HOME/.claude/scripts/lib/py"
+# This script installs a launchd .plist, which only means anything on macOS.
+# On NixOS the same daemon is declared in /etc/nixos/modules/hanadocs-prioritize.nix
+# and installed by `rebuild`, so exit cleanly and say where to look rather than
+# failing partway through on a missing launchctl.
+if ! command -v launchctl >/dev/null 2>&1; then
+    echo "launchctl not present: this is macOS-only."
+    echo "On NixOS the watcher is a systemd user unit declared in"
+    echo "  /etc/nixos/modules/hanadocs-prioritize.nix"
+    echo "Install or restart it with: rebuild, or"
+    echo "  systemctl --user restart hanadocs-prioritize.service"
+    exit 0
+fi
+
 SOURCE_PLIST="$HOME/.claude/scripts/prioritize/com.natemccoy.hanadocs-prioritize.plist"
 INSTALLED_PLIST="$HOME/Library/LaunchAgents/com.natemccoy.hanadocs-prioritize.plist"
 RUNNER="$HOME/.claude/scripts/prioritize/run_watcher.sh"
@@ -33,8 +46,8 @@ cleanup() {
     [[ -n "$preflight_snapshot" ]] && rm -f "$preflight_snapshot"
     if (( install_succeeded == 0 )); then
         if (( bootstrap_started == 1 )); then
-            /bin/launchctl bootout "$DOMAIN" "$INSTALLED_PLIST" >/dev/null 2>&1
-            if /bin/launchctl print "$DOMAIN/$LABEL" >/dev/null 2>&1; then
+            launchctl bootout "$DOMAIN" "$INSTALLED_PLIST" >/dev/null 2>&1
+            if launchctl print "$DOMAIN/$LABEL" >/dev/null 2>&1; then
                 echo "CRITICAL: failed watcher installation is still loaded; run launchctl bootout manually." >&2
             else
                 echo "Rolled back the failed launchd installation." >&2
@@ -99,15 +112,15 @@ else
     created_symlink=1
 fi
 
-if /bin/launchctl print "$DOMAIN/$LABEL" >/dev/null 2>&1; then
-    /bin/launchctl bootout "$DOMAIN" "$INSTALLED_PLIST"
+if launchctl print "$DOMAIN/$LABEL" >/dev/null 2>&1; then
+    launchctl bootout "$DOMAIN" "$INSTALLED_PLIST"
 fi
 rm -f "$LAST_STATUS_FILE"
 bootstrap_started=1
-/bin/launchctl bootstrap "$DOMAIN" "$INSTALLED_PLIST"
-/bin/launchctl kickstart -k "$DOMAIN/$LABEL"
+launchctl bootstrap "$DOMAIN" "$INSTALLED_PLIST"
+launchctl kickstart -k "$DOMAIN/$LABEL"
 
-if ! /bin/launchctl print "$DOMAIN/$LABEL" >/dev/null 2>&1; then
+if ! launchctl print "$DOMAIN/$LABEL" >/dev/null 2>&1; then
     echo "Watcher installation could not be verified." >&2
     exit 1
 fi

@@ -33,10 +33,19 @@ else
     echo "plist: not installed"
 fi
 
-if /bin/launchctl print "$DOMAIN/$LABEL" >/dev/null 2>&1; then
-    echo "launchd: loaded"
+# launchd on the Mac, systemd on Linux -- same question, different service
+# manager. Guarding on the binary rather than on uname keeps this working if
+# either machine ever grows the other.
+if command -v launchctl >/dev/null 2>&1; then
+    if launchctl print "$DOMAIN/$LABEL" >/dev/null 2>&1; then
+        echo "launchd: loaded"
+    else
+        echo "launchd: not loaded"
+    fi
+elif command -v systemctl >/dev/null 2>&1; then
+    echo "systemd: $(systemctl --user is-active hanadocs-prioritize.service 2>/dev/null || echo unknown)"
 else
-    echo "launchd: not loaded"
+    echo "service manager: none recognized"
 fi
 
 if [[ -f "$LAST_STATUS_FILE" ]]; then
