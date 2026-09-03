@@ -2,4 +2,4 @@
 
 set -euo pipefail
 
-jq 'del(.model, .effortLevel)'
+jq 'del(.model, .effortLevel, .modelSettings)'

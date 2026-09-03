@@ -53,13 +53,13 @@
       "Bash(git stash:*)"
     ],
     "defaultMode": "auto",
+    "blockReadsOutsideWorkingDirectories": false,
     "additionalDirectories": [
       "~/Library",
       "~/rust",
       "/tmp",
       "/tmp/claude/"
-    ],
-    "blockReadsOutsideWorkingDirectories": false
+    ]
   },
   "hooks": {
     "PreToolUse": [
@@ -209,11 +209,6 @@
     ]
   },
   "alwaysThinkingEnabled": true,
-  "modelSettings": {
-    "claude-opus-5": {
-      "effortLevel": "high"
-    }
-  },
   "autoCompactWindow": 283800,
   "askUserQuestionTimeout": "never",
   "tui": "fullscreen",

@@ -80,12 +80,13 @@ pull -- Claude Code freezes its sandbox config at session start.
 
 ### Hazard when pulling settings.json on NixOS
 
-The repo's clean filter (scripts/settings/clean_settings_json.sh) strips `model`
-and `effortLevel`, so they live only in the working copy. A fast-forward that
-rewrites settings.json replaces it with the bare blob and both keys vanish with
+The repo's clean filter (scripts/settings/clean_settings_json.sh) strips `model`,
+`effortLevel`, and `modelSettings`, so they live only in the working copy. A
+fast-forward that
+rewrites settings.json replaces it with the bare blob and all three vanish with
 no warning. Before pulling:
 
-    jq -c '{model, effortLevel}' ~/.claude/settings.json
+    jq -c '{model, effortLevel, modelSettings}' ~/.claude/settings.json
 
 then restore them afterwards and run scripts/settings/refresh_filtered_index.sh
 so `git status` goes quiet again.
