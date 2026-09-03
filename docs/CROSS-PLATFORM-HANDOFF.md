@@ -73,10 +73,10 @@ a real write path, so sandboxed shell writes under `~/.claude` from another
 project cwd fail. `~/Library/Application Support` was unaffected because it has
 its own allowWrite line.
 
-FIX, applied on the Mac and still UNCOMMITTED there: add `"~/.claude",` to
-`sandbox.filesystem.allowWrite` in settings.json, after `"~/.cargo",`. Applies
-equally on Linux. Deliberately NOT made here, to avoid a conflict with the
-Mac's uncommitted copy -- pull it instead once the Mac commits.
+FIXED in a15d6b8: `"~/.claude"` added to `sandbox.filesystem.allowWrite` in
+settings.json, after `"~/.cargo"`. Committed on the Mac and pulled here, so both
+platforms carry it. Note the new entry only reaches a session started after the
+pull -- Claude Code freezes its sandbox config at session start.
 
 ### Hazard when pulling settings.json on NixOS
 
