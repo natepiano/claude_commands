@@ -19,6 +19,12 @@ synchronizes when either source is newer than the last successful sync. The
 Claude catalog is hand-maintained; the sync warns when the Claude CLI
 advertises a model alias that `[claude.agents]` does not yet list.
 
+`[claude.context]` is the fourth layer: `default=<window>` plus one
+`<family>=<first version>:<window>` row per Claude family (`opus=4.7:1m`). The
+context-usage hooks read it to place the auto-compaction trigger they warn
+against; nothing in the hook scripts names a model. A new family, or a family
+whose first 1M release changes, is a row here.
+
 ## lint.conf
 
 Which lint checks run, everywhere they run: `cache`, `mend`, `style_review`,

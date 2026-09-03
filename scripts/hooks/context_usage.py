@@ -34,21 +34,29 @@ PRECOMPUTE_RESERVE_TOKENS = 13_000
 # trigger the CLI will never use: a 258_000 setting on a 200k-context model
 # looks like a 225_000 trigger while compaction actually fires at 167_000.
 #
-# Transcribed from the CLI's model-capabilities table (2.1.233). The binary
-# resolves this in `KT`/`Z2`: an explicit `[1m]` suffix wins outright, otherwise
-# a `native_1m` model gets 1M on a first-party account.
-DEFAULT_CONTEXT_TOKENS = 200_000
-LONG_CONTEXT_TOKENS = 1_000_000
-NATIVE_1M_MODELS = frozenset(
-    {
-        "claude-sonnet-5",
-        "claude-opus-4-7",
-        "claude-opus-4-8",
-        "claude-opus-5",
-        "claude-fable-5",
-        "claude-mythos-5",
-    }
-)
+# Which models have which window is registry data, not code: the
+# `[claude.context]` section of agents.conf lists each family with the version
+# its 1M window starts at, plus a `default`. This module only parses model ids
+# and applies those rows. An exact-id table once lived here, listed
+# `claude-fable-5`, and missed `claude-fable-5-1`: the hook quoted a 167k
+# trigger on a 1M model and a live delegate run stalled at "100% full" with
+# over 800k tokens of headroom.
+AGENTS_CONFIG_ENV = "AGENTS_CONFIG_FILE"
+DEFAULT_AGENTS_CONFIG_PATH = Path("~/.claude/config/agents.conf").expanduser()
+CONTEXT_SECTION = "claude.context"
+
+# Used only when the registry itself cannot be read. The small window warns
+# early, and warning early costs a sentence while warning late costs the handoff.
+FALLBACK_CONTEXT_TOKENS = 200_000
+
+# What an explicit `[1m]` suffix on a model id means to the CLI. Suffix
+# semantics, not a model listing, so it stays in code.
+SUFFIX_1M_TOKENS = 1_000_000
+
+# `claude-<family>-<major>[-<minor>]`, the id form every model from Claude 4 on
+# uses. Legacy ids put the version first (`claude-3-5-haiku`); the registry
+# lists none of those, and not matching them is what sends them to the default.
+MODEL_ID = re.compile(r"^claude-(?P<family>[a-z]+)-(?P<major>\d+)(?:-(?P<minor>\d+))?$")
 
 # How far ahead of that trigger to start asking for a handoff doc. Deliberately
 # a fixed count, not a fraction of the window: it covers two absolute costs --
@@ -228,25 +236,85 @@ def normalize_model(model: str) -> str:
     return re.sub(r"-\d{8}$", "", name)
 
 
+class ContextRule(TypedDict):
+    floor: tuple[int, int]
+    window: int
+
+
+def parse_version(text: str) -> tuple[int, int] | None:
+    """Parse `4.7` / `5` into `(major, minor)`."""
+    major, _, minor = text.strip().partition(".")
+    try:
+        return int(major), int(minor or 0)
+    except ValueError:
+        return None
+
+
+def read_context_rules() -> tuple[int, dict[str, ContextRule]]:
+    """The `[claude.context]` section: the default window and one rule per family.
+
+    Same file and env override as agents_config.sh, same syntax: `#` comments,
+    inline or whole-line, and `key=value` rows. A row that does not parse is
+    skipped rather than fatal -- a hook must never break the tool it follows.
+    """
+    path = Path(os.environ.get(AGENTS_CONFIG_ENV) or DEFAULT_AGENTS_CONFIG_PATH)
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError:
+        return FALLBACK_CONTEXT_TOKENS, {}
+    default = FALLBACK_CONTEXT_TOKENS
+    rules: dict[str, ContextRule] = {}
+    in_section = False
+    for raw in text.splitlines():
+        line = raw.split("#", 1)[0].strip()
+        if not line:
+            continue
+        if line.startswith("["):
+            in_section = line == f"[{CONTEXT_SECTION}]"
+            continue
+        if not in_section:
+            continue
+        key, separator, value = line.partition("=")
+        if not separator:
+            continue
+        key, value = key.strip(), value.strip()
+        if key == "default":
+            parsed_default = parse_window(value)
+            if parsed_default is not None:
+                default = parsed_default
+            continue
+        version_text, has_window, window_text = value.partition(":")
+        window = parse_window(window_text) if has_window else None
+        floor = parse_version(version_text)
+        if window is None or floor is None:
+            continue
+        rules[key] = {"floor": floor, "window": window}
+    return default, rules
+
+
 def model_context_window(model: str | None) -> int:
     """The model's own context window, as the CLI resolves it.
 
-    An unrecognised model falls back to 200k rather than 1M: the smaller guess
-    warns early, and warning early costs a sentence while warning late costs the
-    handoff entirely. Assumes a first-party account -- on Bedrock/Vertex the CLI
-    consults `native_1m_3p` per provider, which a hook cannot see. It also cannot
-    see the account-level 1M credit gate (`longContext1mCreditsBlocked`), so a
-    blocked account is reported as 1M and warns late.
+    Assumes a first-party account -- on Bedrock/Vertex the CLI consults
+    `native_1m_3p` per provider, which a hook cannot see. It also cannot see the
+    account-level 1M credit gate (`longContext1mCreditsBlocked`), so a blocked
+    account is reported at the registry's window and warns late.
     """
+    default, rules = read_context_rules()
     if os.environ.get("CLAUDE_CODE_DISABLE_1M_CONTEXT"):
-        return DEFAULT_CONTEXT_TOKENS
+        return default
     if model is None:
-        return DEFAULT_CONTEXT_TOKENS
+        return default
     if "[1m]" in model.lower():
-        return LONG_CONTEXT_TOKENS
-    if normalize_model(model) in NATIVE_1M_MODELS:
-        return LONG_CONTEXT_TOKENS
-    return DEFAULT_CONTEXT_TOKENS
+        return SUFFIX_1M_TOKENS
+    parsed = MODEL_ID.match(normalize_model(model))
+    if parsed is None:
+        return default
+    rule = rules.get(parsed["family"])
+    if rule is None:
+        return default
+    version = (int(parsed["major"]), int(parsed["minor"] or 0))
+    return rule["window"] if version >= rule["floor"] else default
 
 
 def auto_compact_window(model: str | None = None) -> int | None:
