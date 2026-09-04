@@ -249,6 +249,20 @@ ensure_linux_cross_env() {
   LINUX_SYSROOT_PREPARED=1
 }
 
+# The x86_64-unknown-linux-gnu arms below link through zig against a downloaded
+# sysroot, which is what that target needs FROM macOS, where it is a cross
+# build. On a Linux host it is the NATIVE target: cargo links it with the system
+# cc, and forcing the cross path there fails at every build script with
+# "zig-linux-cc: line 33: exec: zig: not found". Keyed on host != target rather
+# than on `uname` so the Mac's cross path is untouched.
+cross_kind() {
+  if [ "$1" = "$HOST_TRIPLE" ]; then
+    printf 'native'
+  else
+    printf 'cross-%s' "$1"
+  fi
+}
+
 trim_target_line() {
   local target="$1"
   target="${target%%#*}"
@@ -261,8 +275,8 @@ run_target_clippy() {
   local target="$1"
   shift
 
-  case "$target" in
-    x86_64-unknown-linux-gnu)
+  case "$(cross_kind "$target")" in
+    cross-x86_64-unknown-linux-gnu)
       ensure_linux_cross_env
       env \
         CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER="${SCRIPT_DIR}/zig-linux-cc" \
@@ -291,8 +305,8 @@ run_target_clippy() {
 compile_target_tests() {
   local target="$1"
 
-  case "$target" in
-    x86_64-unknown-linux-gnu)
+  case "$(cross_kind "$target")" in
+    cross-x86_64-unknown-linux-gnu)
       ensure_linux_cross_env
       env \
         CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER="${SCRIPT_DIR}/zig-linux-cc" \
