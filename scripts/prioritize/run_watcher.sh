@@ -14,6 +14,13 @@ RUNNER_LOCK_TOOL="$HOME/.claude/scripts/prioritize/runner_lock.py"
 SIGNATURE_TOOL="$HOME/.claude/scripts/prioritize/watch_signature.py"
 ISSUES_DIR="$HOME/rust/hanadocs/issues"
 GOALS_FILE="$HOME/rust/hanadocs/prioritization goals.md"
+# The vault as a git checkout, for the index refresh after a re-rank. See
+# refresh_vault_git_index below for why that is this script's business.
+VAULT_DIR="$HOME/rust/hanadocs"
+VAULT_FILTER_NAME="hanadocs-strip-generated"
+# Vault-relative, because git resolves a pathspec against its own working
+# directory and every git call below runs with -C "$VAULT_DIR".
+VAULT_ISSUES_PATHSPEC="issues"
 # The cache root is chosen per platform, not by XDG alone. XDG_CACHE_HOME is
 # normally UNSET -- the spec says fall back to ~/.cache -- so a plain
 # "${XDG_CACHE_HOME:-$HOME/Library/Caches}" reproduces the macOS layout on
@@ -37,6 +44,10 @@ CONCURRENT_CHANGE_EXIT=3
 
 CANDIDATE_FILE=""
 POST_RUN_FILE=""
+# Set once a renumber pass has actually written issue notes, and never reset:
+# the locked loop can run several passes, and a later no-op must not cancel the
+# index refresh an earlier pass earned.
+RANKING_WRITE_OCCURRED=0
 
 umask 077
 if ! mkdir -p "$STATE_DIR" "$CACHE_DIR"; then
@@ -111,6 +122,80 @@ settled_state_is_current() {
     fi
     log "error: settle rank check failed exit=$check_status"
     return 2
+}
+
+# Make `git status` in the vault agree with `git diff` after a re-rank.
+#
+# THE PROBLEM. The vault's .gitattributes runs issues/*.md through a
+# `hanadocs-strip-generated` clean filter that drops the backlog_score and
+# backlog_rank lines this watcher writes, so a global re-rank is invisible to
+# git and produces no commit churn. `git diff` honours that and correctly
+# reports nothing. `git status` does NOT: an index entry records the size of the
+# FILTERED blob, so a note whose unfiltered size no longer matches reads as
+# modified on stat data alone, and status will not run a filter to find out
+# otherwise. After a re-rank that is every open issue at once -- 336 of them on
+# this vault -- which buries any real edit and makes the vault look unsafe to
+# commit.
+#
+# WHY HERE. This script is what makes those writes happen, so it is the one
+# place that knows a re-rank just finished. The alternative -- a filesystem
+# watcher on the vault, the way ~/.claude drives refresh_filtered_index.sh from
+# a launchd WatchPaths job and a systemd .path unit -- would need new machine
+# state on two platforms to rediscover a fact already known right here.
+#
+# WHY `git add --renormalize` AND NOT `git update-index --refresh`, which is the
+# obvious candidate and does not work. `--refresh` re-reads stat data but does
+# not put the file through the clean filter, so it cannot discover that a note
+# is unchanged in git's terms; it reports "needs update", exits 1, and leaves
+# the entry exactly as dirty as it found it. `--renormalize` re-runs the filter,
+# writes the resulting blob -- byte-identical to the one already stored, so the
+# index content does not move -- and records the WORKING TREE stat alongside it,
+# which is the part that makes status quiet and keeps it quiet.
+#
+# WHY IT CANNOT STAGE WORK YOU DID NOT ASK IT TO STAGE, which matters because
+# nothing reviews what a background daemon does to your index. `--renormalize`
+# on its own would stage a genuine edit, so it is never pointed at one: the
+# pathspec first EXCLUDES every note `git diff` reports as really changed. That
+# diff is the filter-aware comparison of working tree against index, so a note
+# whose change survives the filter is excluded by construction and stays visible
+# in status, unstaged. Everything else is provably identical to its stored blob,
+# and re-adding it is a no-op for content.
+#
+# `:(exclude,literal)` rather than a plain exclude: issue filenames are free
+# text and several contain glob characters, which pathspec would otherwise
+# interpret rather than match.
+#
+# This touches .git/index alone, never a watched file, so it cannot perturb the
+# signature this daemon polls and cannot wake itself in a loop.
+refresh_vault_git_index() {
+    local configured
+    local path
+    local -a pathspec=("$VAULT_ISSUES_PATHSPEC")
+
+    [[ -d "$VAULT_DIR/.git" ]] || return 0
+    command -v git >/dev/null 2>&1 || return 0
+
+    # No filter configured means no filtered paths to reconcile, and every issue
+    # note is then legitimately modified. Renormalizing would rewrite the index
+    # for all of them on every pass and buy nothing.
+    configured="$(git -C "$VAULT_DIR" config --get "filter.$VAULT_FILTER_NAME.clean" 2>/dev/null)"
+    if [[ -z "$configured" ]]; then
+        log "vault clean filter not configured; skipping index refresh"
+        return 0
+    fi
+
+    while IFS= read -r -d '' path; do
+        pathspec+=(":(exclude,literal)$path")
+    done < <(
+        git -C "$VAULT_DIR" diff --name-only -z -- "$VAULT_ISSUES_PATHSPEC" 2>/dev/null
+    )
+
+    if git -C "$VAULT_DIR" add --renormalize -- "${pathspec[@]}" >> "$EVENT_LOG" 2>&1; then
+        log "refreshed vault git index after ranking writes; real edits left alone=$(( ${#pathspec[@]} - 1 ))"
+    else
+        log "warning: vault git index refresh failed; status may report ranking churn"
+    fi
+    return 0
 }
 
 cleanup() {
@@ -225,6 +310,7 @@ run_once() {
             return "$check_status"
         fi
         log "repaired generated ranking state without semantic input changes"
+        RANKING_WRITE_OCCURRED=1
         write_status "ok" "repaired" "score-and-rank-canonical" || true
         return 0
     fi
@@ -250,6 +336,11 @@ run_once() {
         write_status "error" "post-apply-check" "exit-$check_status" || true
         return "$check_status"
     fi
+
+    # Set here rather than at either return below: the apply has written notes
+    # by this point, and it stays true whether this pass goes on to commit its
+    # snapshot or bails out to a fresh pass because the inputs moved underneath.
+    RANKING_WRITE_OCCURRED=1
 
     POST_RUN_FILE="$(mktemp "$CACHE_DIR/.semantic-inputs.post-run.XXXXXX")" || {
         log "error: could not create post-run snapshot"
@@ -418,6 +509,13 @@ while true; do
     if [[ -e "$PENDING_FILE" ]]; then
         log "pending filesystem event detected; starting one coalesced rerun"
         continue
+    fi
+
+    # Once per locked session, after the last pass, rather than inside run_once:
+    # a coalesced rerun would otherwise pay for a full index refresh on every
+    # pass, and only the final state of the notes is worth reconciling.
+    if (( RANKING_WRITE_OCCURRED == 1 )); then
+        refresh_vault_git_index
     fi
 
     exit "$last_status"

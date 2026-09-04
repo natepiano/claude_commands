@@ -373,8 +373,10 @@ class RenumberTests(unittest.TestCase):
         self.assertNotIn("backlog_score:", content)
         self.assertNotIn("backlog_rank:", content)
 
-    def test_ranks_are_dense_and_ties_preserve_unique_existing_order(self) -> None:
-        # Same score, with existing order intentionally opposite path order.
+    def test_ranks_are_dense_and_ignore_existing_order(self) -> None:
+        # Same score, with the existing ranks deliberately running counter to
+        # the filenames. The previous ordering used to win here, which is what
+        # let two checkouts of one vault disagree; the filename wins now.
         zulu = self.fixture.add("zulu.md", issue_text(generated=(15, 2)))
         alpha = self.fixture.add("alpha.md", issue_text(generated=(15, 7)))
 
@@ -385,7 +387,7 @@ class RenumberTests(unittest.TestCase):
         plan = renumber.build_plan(self.fixture.scope)
         ordered = sorted(plan.valid_open, key=lambda issue: issue.assigned_rank or 0)
 
-        self.assertEqual([issue.source.path for issue in ordered], [zulu, alpha, lower])
+        self.assertEqual([issue.source.path for issue in ordered], [alpha, zulu, lower])
         self.assertEqual([issue.assigned_rank for issue in ordered], [1, 2, 3])
 
         renumber.apply_plan(plan)
@@ -397,6 +399,42 @@ class RenumberTests(unittest.TestCase):
             )
             ranks.append(int(rank_line.partition(":")[2]))
         self.assertEqual(sorted(ranks), [1, 2, 3])
+
+    def test_ranking_is_reproducible_from_any_starting_ranks(self) -> None:
+        """The property that lets two checkouts of one vault agree.
+
+        Both hold the same issues with the same scores and differ only in the
+        ranks already written into them, which is exactly what a fresh clone
+        produces: the vault's clean filter keeps backlog_rank out of committed
+        blobs, so a new checkout starts blank while an old one carries months of
+        accumulated placement. If the assigned order comes out the same either
+        way, the two cannot drift apart.
+        """
+        names = ("alpha.md", "mike.md", "zulu.md")
+        for name in names:
+            _ = self.fixture.add(name, issue_text())
+        from_blank = [
+            (issue.source.path.name, issue.assigned_rank)
+            for issue in renumber.build_plan(self.fixture.scope).valid_open
+        ]
+
+        other = VaultFixture()
+        self.addCleanup(other.close)
+        # The same issues and scores, except every one already carries a rank
+        # and those ranks run counter to the filenames.
+        for rank, name in enumerate(reversed(names), start=1):
+            _ = (other.issues / name).write_bytes(
+                issue_text(generated=(15, rank)).encode("utf-8")
+            )
+        from_ranked = [
+            (issue.source.path.name, issue.assigned_rank)
+            for issue in renumber.build_plan(other.scope).valid_open
+        ]
+
+        self.assertEqual(from_blank, from_ranked)
+        self.assertEqual(
+            [name for name, _ in from_blank], ["alpha.md", "mike.md", "zulu.md"]
+        )
 
     def test_new_ties_fall_back_to_path(self) -> None:
         bravo = self.fixture.add("bravo.md", issue_text())

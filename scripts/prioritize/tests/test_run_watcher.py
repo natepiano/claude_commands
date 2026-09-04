@@ -15,6 +15,11 @@ PRIORITIZE_DIR = Path(__file__).parents[1]
 RUN_WATCHER = PRIORITIZE_DIR / "run_watcher.sh"
 RUNNER_LOCK = PRIORITIZE_DIR / "runner_lock.py"
 BUSY_EXIT = 75
+# The real filter, wired the way the vault wires it. Pointing these at stubs
+# would leave the interesting part -- whether git's own stat comparison goes
+# quiet -- untested.
+STRIP_GENERATED = PRIORITIZE_DIR / "strip_generated.py"
+PY_SHIM = PRIORITIZE_DIR.parent / "lib" / "py"
 
 
 @final
@@ -92,6 +97,10 @@ raise SystemExit(2)
             'GOALS_FILE="$HOME/rust/hanadocs/prioritization goals.md"': (
                 f'GOALS_FILE="{self.goals}"'
             ),
+            # Without this the fixture would aim the post-rank index refresh at
+            # the real vault, so running the suite would reach outside its
+            # temporary directory and rewrite a live .git/index.
+            'VAULT_DIR="$HOME/rust/hanadocs"': f'VAULT_DIR="{self.root}"',
             'CACHE_DIR="${XDG_CACHE_HOME:-$HOME/$([ "$(uname -s)" = Darwin ] && echo Library/Caches || echo .cache)}/hanadocs-prioritize"': (
                 f'CACHE_DIR="{self.cache}"'
             ),
@@ -302,6 +311,187 @@ raise SystemExit(0)
             if daemon.poll() is None:
                 os.killpg(daemon.pid, signal.SIGTERM)
                 _ = daemon.wait(timeout=2)
+
+    def _make_filtered_git_vault(self) -> Path:
+        """Turn the fixture root into a vault wired exactly like the real one.
+
+        A real repository, the real strip filter, and one committed issue note
+        whose stored blob therefore carries no backlog_rank. That is the only
+        setup under which the behaviour being tested even exists: the note has
+        to be tracked, filtered, and clean before a rank write can make it look
+        modified on stat data alone.
+        """
+        root = self.fixture.root
+        issue = self.fixture.issues / "issue.md"
+        _ = issue.write_text(
+            "---\ntitle: sample\nstage: backlog\n---\n\nbody\n",
+            encoding="utf-8",
+        )
+        _ = (root / ".gitattributes").write_text(
+            "issues/*.md filter=hanadocs-strip-generated\n", encoding="utf-8"
+        )
+
+        def git(*arguments: str) -> subprocess.CompletedProcess[str]:
+            return subprocess.run(
+                ["git", "-C", str(root), *arguments],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+
+        _ = git("init", "-q", "-b", "main")
+        _ = git("config", "user.email", "watcher-test@example.invalid")
+        _ = git("config", "user.name", "watcher test")
+        _ = git("config", "commit.gpgsign", "false")
+        _ = git(
+            "config",
+            "filter.hanadocs-strip-generated.clean",
+            f"{PY_SHIM} {STRIP_GENERATED}",
+        )
+        # Only the notes and the attributes file. The fixture also litters this
+        # directory with stub tools and cache/state dirs, which are scaffolding
+        # rather than vault content and would otherwise show up as changes.
+        _ = git("add", "issues", ".gitattributes")
+        _ = git("commit", "-q", "-m", "seed")
+        return issue
+
+    def _vault_status(self) -> str:
+        result = subprocess.run(
+            [
+                "git",
+                "-C",
+                str(self.fixture.root),
+                "status",
+                "--porcelain",
+                "--",
+                "issues",
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        return result.stdout
+
+    def _install_ranking_stubs(self, issue: Path, rank: str) -> None:
+        """Snapshot reads semantic inputs only; renumber writes a derived rank.
+
+        The split matters: a snapshot that saw the rank it just caused to be
+        written would report its own output as a changed input and the watcher
+        would loop, which is the same separation the real tools keep.
+        """
+        _ = self.fixture.snapshot.write_text(
+            f'''#!/usr/bin/env python3
+import argparse
+import hashlib
+from pathlib import Path
+
+parser = argparse.ArgumentParser()
+_ = parser.add_argument("--output", required=True)
+_ = parser.add_argument("--require-complete", action="store_true")
+args = parser.parse_args()
+text = Path({str(issue)!r}).read_text(encoding="utf-8")
+semantic = "".join(
+    line for line in text.splitlines(keepends=True)
+    if not line.startswith("backlog_rank:")
+)
+_ = Path(args.output).write_text(
+    hashlib.sha256(semantic.encode("utf-8")).hexdigest() + "\\n", encoding="utf-8"
+)
+''',
+            encoding="utf-8",
+        )
+        _ = self.fixture.renumber.write_text(
+            f'''#!/usr/bin/env python3
+import sys
+from pathlib import Path
+
+issue = Path({str(issue)!r})
+if "--apply" in sys.argv:
+    text = issue.read_text(encoding="utf-8")
+    lines = [
+        line for line in text.splitlines(keepends=True)
+        if not line.startswith("backlog_rank:")
+    ]
+    lines.insert(1, "backlog_rank: {rank}\\n")
+    _ = issue.write_text("".join(lines), encoding="utf-8")
+raise SystemExit(0)
+''',
+            encoding="utf-8",
+        )
+
+    def test_ranking_writes_leave_git_status_quiet(self) -> None:
+        issue = self._make_filtered_git_vault()
+        self.assertEqual(self._vault_status(), "")
+        self._install_ranking_stubs(issue, rank="900001")
+
+        result = subprocess.run(
+            ["bash", str(self.fixture.watcher)],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(result.returncode, 0, msg=result.stderr)
+
+        # The write really happened, so the note on disk no longer matches its
+        # committed blob byte for byte. Without the refresh this is precisely
+        # the state in which status reports the note as modified.
+        self.assertIn("backlog_rank: 900001", issue.read_text(encoding="utf-8"))
+        self.assertEqual(self._vault_status(), "")
+
+        staged = subprocess.run(
+            ["git", "-C", str(self.fixture.root), "diff", "--cached", "--name-only"],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(staged.stdout, "", "the refresh must never stage content")
+
+    def test_index_refresh_still_shows_a_real_edit(self) -> None:
+        issue = self._make_filtered_git_vault()
+        self._install_ranking_stubs(issue, rank="900002")
+
+        # A genuine body change, of the kind the filter does not strip, made
+        # before the watcher runs so the refresh has to decide about it.
+        _ = issue.write_text(
+            issue.read_text(encoding="utf-8") + "a real edit\n", encoding="utf-8"
+        )
+
+        result = subprocess.run(
+            ["bash", str(self.fixture.watcher)],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(result.returncode, 0, msg=result.stderr)
+
+        self.assertIn(" M issues/issue.md", self._vault_status())
+
+    def test_index_refresh_skipped_when_no_filter_configured(self) -> None:
+        issue = self._make_filtered_git_vault()
+        _ = subprocess.run(
+            [
+                "git",
+                "-C",
+                str(self.fixture.root),
+                "config",
+                "--unset",
+                "filter.hanadocs-strip-generated.clean",
+            ],
+            check=True,
+            capture_output=True,
+        )
+        self._install_ranking_stubs(issue, rank="900003")
+
+        result = subprocess.run(
+            ["bash", str(self.fixture.watcher)],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(result.returncode, 0, msg=result.stderr)
+
+        log = self.fixture.event_log.read_text(encoding="utf-8")
+        self.assertIn("vault clean filter not configured", log)
 
     def test_daemon_retries_concurrent_edits_without_error_backoff(self) -> None:
         attempt_marker = self.fixture.root / "concurrent-attempt"

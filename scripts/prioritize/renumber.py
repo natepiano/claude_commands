@@ -16,7 +16,6 @@ import re
 import stat
 import sys
 import tempfile
-from collections import Counter
 from dataclasses import dataclass, field
 from datetime import date, datetime
 from pathlib import Path
@@ -129,7 +128,6 @@ class Issue:
     frontmatter: Frontmatter
     status: str
     score: int | None = None
-    existing_rank: int | None = None
     assigned_rank: int | None = None
     dependency_names: tuple[str, ...] = ()
     open_dependencies: tuple[Issue, ...] = ()
@@ -317,16 +315,6 @@ def normalize_obsidian_links(value: str) -> str:
     return WIKILINK_RE.sub(displayed_text, value)
 
 
-def _parse_existing_rank(frontmatter: Frontmatter) -> int | None:
-    try:
-        occurrence = _one_field(frontmatter, "backlog_rank")
-    except ValueError:
-        return None
-    if occurrence is None or POSITIVE_INTEGER_RE.fullmatch(occurrence.raw_value) is None:
-        return None
-    return int(occurrence.raw_value)
-
-
 def _parse_dependency_name(raw_value: str) -> str:
     match = WIKILINK_VALUE_RE.fullmatch(raw_value)
     if match is None:
@@ -465,7 +453,6 @@ def _parse_issue(source: SourceFile, goals: tuple[Goal, ...]) -> Issue:
         source=source,
         frontmatter=frontmatter,
         status=status,
-        existing_rank=_parse_existing_rank(frontmatter),
     )
     if status == "closed":
         return issue
@@ -636,20 +623,34 @@ def build_plan(scope: Scope = PRODUCTION_SCOPE) -> RankingPlan:
                 open_dependencies.append(dependency)
         issue.open_dependencies = tuple(open_dependencies)
 
-    rank_counts = Counter(
-        issue.existing_rank
-        for issue in issues
-        if issue.is_valid_open and issue.existing_rank is not None
-    )
+    def sort_key(issue: Issue) -> tuple[int, str]:
+        """Order by score, then by filename, and by nothing else.
 
-    def sort_key(issue: Issue) -> tuple[int, int, int, str]:
+        THE ORDER MUST NOT DEPEND ON THE PREVIOUS ORDER. This key used to lead
+        with each issue's existing backlog_rank so that equally scored issues
+        kept the places they already held. That reads like a kindness and is not
+        one: it makes the ranking a function of the vault's local history rather
+        than of its content, so two checkouts that reach identical scores by
+        different routes rank them differently, each self-consistently, with
+        nothing in the repository able to reconcile the two. That is precisely
+        what had happened between the Mac and the Linux vault -- same 336
+        issues, same scores, different ranks.
+
+        The clone is what makes it unfixable rather than merely untidy.
+        backlog_rank is stripped from committed blobs by the vault's clean
+        filter, deliberately, so a fresh checkout starts with no ranks at all
+        while an older one carries months of accumulated placement. State that
+        git is designed not to store cannot also be a ranking input.
+
+        The filename is an arbitrary tiebreak but a reproducible one, which is
+        the property that matters here. It is compared as a bare name rather
+        than a full path so that a vault living under a different home
+        directory still orders identically.
+        """
         score = issue.score
         if score is None:
             raise PlanningError(f"valid issue has no score: {issue.source.path}")
-        stable_rank = issue.existing_rank
-        if stable_rank is not None and rank_counts[stable_rank] == 1:
-            return (-score, 0, stable_rank, str(issue.source.path))
-        return (-score, 1, 0, str(issue.source.path))
+        return (-score, issue.source.path.name)
 
     score_ranked = sorted(
         (issue for issue in issues if issue.is_valid_open), key=sort_key
