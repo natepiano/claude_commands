@@ -24,6 +24,29 @@ fail() {
     exit 1
 }
 
+# The replacement is built in a `mktemp` file, which is 0600, so the config's own
+# mode has to be read and restored before the `mv` or every reader loses access.
+# GNU and BSD `stat` spell the query differently and neither is quiet about the
+# other's spelling: GNU reads `-f` as --file-system and prints a block of
+# filesystem statistics on *stdout* before failing, so chaining the two forms with
+# `||` and capturing both feeds that block to chmod as if it were a mode. Each
+# form is therefore tried on its own and its answer checked to be an octal mode
+# before it is used.
+config_file_mode() {
+    local mode
+    for mode in \
+        "$(stat -c '%a' "$AGENTS_CONFIG_FILE" 2>/dev/null)" \
+        "$(stat -f '%Lp' "$AGENTS_CONFIG_FILE" 2>/dev/null)"; do
+        if [[ "$mode" =~ ^[0-7]{3,4}$ ]]; then
+            printf '%s\n' "$mode"
+            return 0
+        fi
+    done
+    # Neither spelling answered. 0644 keeps the file readable, which is the
+    # failure worth having: a sync that widens nothing and blocks nobody.
+    printf '644\n'
+}
+
 # One writer at a time. The sync is triggered implicitly by anything that sources
 # agents_config.sh, so a stale freshness gate fires it once per caller -- and a
 # delegate phase sources it three times at once. `mv` is atomic, so no reader
@@ -416,7 +439,7 @@ if [[ "$CHECK_ONLY" == true ]]; then
     exit 1
 fi
 
-chmod "$(stat -f '%Lp' "$AGENTS_CONFIG_FILE" 2>/dev/null || stat -c '%a' "$AGENTS_CONFIG_FILE")" "$tmp_file"
+chmod "$(config_file_mode)" "$tmp_file"
 mv "$tmp_file" "$AGENTS_CONFIG_FILE"
 trap release_lock EXIT
 checkpoint_sync_state

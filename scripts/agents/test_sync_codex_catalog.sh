@@ -306,4 +306,50 @@ if run_sync >/dev/null 2>&1; then
 fi
 cmp "$before" "$AGENTS" || fail "invalid cache changed the registry"
 
+# A rewrite must carry the config's own permissions across the temp file it is
+# built in, and must not let either `stat` spelling's diagnostics reach chmod.
+cat > "$AGENTS" <<'EOF'
+[assignments]
+fix=codex
+
+[fix.codex]
+style_eval=gpt-current:high
+
+[codex.agents]
+# Old generated body.
+gpt-stale=medium
+
+[claude.agents]
+fable=low,medium,high,max
+sonnet=low,medium,high,max
+EOF
+printf '%s\n' 'model = "gpt-current"' > "$CODEX_CONFIG"
+cat > "$MODELS_CACHE" <<'EOF'
+{"models":[
+  {"slug":"gpt-current","visibility":"list","supported_reasoning_levels":[{"effort":"medium"},{"effort":"high"}]}
+]}
+EOF
+rm -f "$SYNC_STATE"
+chmod 640 "$AGENTS"
+
+file_mode() {
+    local mode
+    for mode in "$(stat -c '%a' "$1" 2>/dev/null)" "$(stat -f '%Lp' "$1" 2>/dev/null)"; do
+        if [[ "$mode" =~ ^[0-7]{3,4}$ ]]; then
+            printf '%s\n' "$mode"
+            return 0
+        fi
+    done
+    printf 'unreadable\n'
+}
+
+run_sync >/dev/null 2>"$STDERR_FILE" || fail "sync failed while rewriting the catalog"
+stderr_text="$(<"$STDERR_FILE")"
+[[ "$stderr_text" != *chmod* ]] \
+    || fail "sync passed something other than a mode to chmod: $stderr_text"
+grep -q '^gpt-current=medium,high$' "$AGENTS" \
+    || fail "sync did not rewrite the catalog, so mode preservation was never exercised"
+[[ "$(file_mode "$AGENTS")" == 640 ]] \
+    || fail "rewrite did not preserve the config's mode: $(file_mode "$AGENTS")"
+
 echo "sync_codex_catalog tests passed"
