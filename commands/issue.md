@@ -25,6 +25,7 @@ Look up the project shorthand from the base files in the vault root (`~/rust/han
 | biz | biz | issues - biz.base |
 | brp | bevy_brp_mcp | issues - brp.base |
 | bwm | bevy_window_manager | issues - bwm.base |
+| cargo-berth | cargo-berth | issues - cargo-berth.base |
 | cargo-mend | cargo-mend | issues - cargo-mend.base |
 | cargo-port | cargo-port | issues - cargo-port.base |
 | conduit | hana_conduit | issues - conduit.base |
