@@ -76,6 +76,12 @@ case "${1:-status}" in
         if input=$(current_input); then
             echo "dell     showing: $input"
         else
+            # $input is what current_input printed before returning 1, since a
+            # failed command substitution still assigns what it wrote. So this
+            # line has two shapes, both wanted: when m1ddc answered with a
+            # value nobody recognises the value is quoted back, and when m1ddc
+            # itself failed -- which is what happens over ssh -- it printed
+            # nothing, $input is empty, and the parenthetical disappears.
             echo "dell     could not be read${input:+ (m1ddc said '$input')}"
         fi
         echo "samsung  no DDC/CI; run 'monitor.sh samsung' for why"

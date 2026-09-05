@@ -80,6 +80,10 @@ case "${1:-status}" in
             # machine reads it fine in that state. Something else is wrong:
             # the monitor asleep, the cable out, i2c gone, or an input this
             # script has no name for, such as HDMI 2 with nothing on it.
+            #
+            # $input carries whatever current_input printed before it returned
+            # 1, so the code appears when there was one and the parenthetical
+            # vanishes when ddcutil failed outright and printed nothing.
             echo "dell     unreadable${input:+ (input code $input)}"
         fi
         echo "samsung  no DDC/CI; run 'monitor.sh samsung' for why"
