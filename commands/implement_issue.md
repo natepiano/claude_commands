@@ -88,6 +88,8 @@ running any repository command.
 Read the complete issue, then verify it against current reality:
 
 - the live implementation and tests around the expected change;
+- the repository's `as-built/` docs, to see which of them this change would make
+  stale — Stage 6 records that as the `As-built disposition:` line;
 - the project's current goals from its README, roadmap, or design docs;
 - existing patterns the design should follow rather than reinvent;
 - active worktrees and dirty paths that the work would collide with.
@@ -190,6 +192,14 @@ completes, shape the accumulated record into a design doc that
   and types;
 - explicit exclusions that prevent scope growth;
 - acceptance criteria as observable behavior plus deterministic verification;
+- an `As-built disposition:` line, `create` or `amend`, deciding now what the
+  shipped work will owe the repo's reference docs. `amend` when the issue only
+  changes surface the existing `as-built/` docs already describe — name those
+  docs on the line; `create` when it adds something they do not cover, which
+  also updates its neighbours. Read the sibling `as-built/` docs in Stage 3
+  before choosing, and state the reason in one line. `/plan:to_as_built` reads
+  this line at the end of the run; a design doc that omits it makes that command
+  infer the answer from the diff without the design in front of it;
 - the repository's build, test, formatting, and lint commands from its
   `AGENTS.md`, quoted exactly — never substitute plain `cargo fmt` where
   `cargo +nightly fmt` is required, and use `cargo nextest run` where the
@@ -214,7 +224,9 @@ recommend exactly one next command, but do not invoke it:
   reason.
 
 State that nothing was implemented, no worktree or branch was created, the issue
-was not edited, and nothing was committed.
+was not edited, and nothing was committed. On either delegation path, add that
+`/plan:delegate` finishes by running `/plan:to_as_built` itself, which will act
+on the `As-built disposition:` line this design doc carries.
 
 ## Invariants
 

@@ -337,6 +337,11 @@ status line, done phases, untouched todo phases, links) exactly as found. Then g
 **Compile mode:** rewrite the doc **in place** to the format-doc structure:
 
 1. Title + a one-line `> **Status: IMPLEMENTATION PLAN — phased, delegate-ready.**`
+1b. Directly under it, the source doc's `As-built disposition:` line, carried
+   across verbatim when it has one. `/plan:to_as_built` reads it there at the end
+   of the run, so it survives this rewrite rather than going out with the
+   stripped narrative. A source doc without one leaves the line absent, which
+   that command reads as `create`.
 2. `## Delegation Context` = ${DELEGATION_CONTEXT}.
 3. `## Phases` — each phase with its `#### Work Order`. Completed phases keep their
    archive form (status `done`, Work Order, Retrospective) below or after the live

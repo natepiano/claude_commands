@@ -206,7 +206,9 @@ Then:
 - **Nothing to do** — no shrinkable `done` phase → say so in one line and stop.
 - **No `todo` phases remain** — say so in one line, note that `/plan:to_as_built`
   is the finishing move, and continue; shrinking makes that command's job
-  cheaper. Do not stop to ask.
+  cheaper. Under `/plan:delegate` that command runs on its own from
+  `<RunAsBuilt/>` after the final gate; standalone, the user runs it. Do not stop
+  to ask.
 - **Closeout validation** — require exactly one target phase and readable
   `${CLOSEOUT_DIR}/phase_review_retrospective_<id>.md` and
   `${CLOSEOUT_DIR}/phase_review_outcomes_<id>.md`. Reject an already-shrunk
@@ -513,4 +515,5 @@ Then stop.
 - Do not change code and do not commit.
 - After the last phase ships, `/plan:to_as_built` is still the finishing move.
   This command shrinks the archive; it does not convert the plan into a reference
-  doc, and it does not reconcile sibling docs.
+  doc, and it does not reconcile sibling docs. `/plan:delegate` invokes that
+  command itself from `<RunAsBuilt/>`; a standalone shrink leaves it to the user.

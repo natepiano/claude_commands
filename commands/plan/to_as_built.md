@@ -1,5 +1,5 @@
 ---
-description: Turn a fully-implemented phased plan into an as-built doc — an overview of the shipped feature for future implementers. Strips Work Order / phase scaffolding, keeps the load-bearing context (architecture, types, invariants, gotchas, rationale), and relocates it into the repo's as-built directory. Plans stamped `As-built disposition: amend` create no new doc — the shipped changes are folded into the existing as-built docs and the plan is deleted.
+description: Turn shipped work into an as-built doc — an overview of the feature for future implementers. Works from a fully-implemented phased plan, or from a diff when the work shipped without one. Strips Work Order / phase scaffolding, keeps the context that governs later changes (architecture, types, invariants, gotchas, rationale), and relocates it into the repo's as-built directory. Work stamped `As-built disposition: amend` creates no new doc — the shipped changes are folded into the existing as-built docs and the plan, if there is one, is deleted.
 ---
 
 # Plan → As-Built
@@ -15,10 +15,15 @@ existing as-built docs already describe, so the end state is those docs updated
 in place — no new doc, no fragment describing "the cleanup" as if it were a
 feature.
 
-**Usage:** `/plan:to_as_built [plan-doc-path]`
+**Usage:** `/plan:to_as_built [plan-doc-path] [--from-diff]`
 
 **Argument:** the implemented plan doc. If omitted, infer the single plan doc in
-conversation; if none, ask. Do not guess.
+conversation; if none, ask which one rather than choosing on your own.
+
+**`--from-diff`:** describe the shipped work from the repository diff instead of
+a plan doc. Use it when the work shipped without a phased plan — a
+`/plan:delegate single` ad hoc task, or any change already in the tree. The plan
+doc argument is then absent and nothing is deleted at the end.
 
 This command does not change code and does not commit.
 
@@ -38,24 +43,53 @@ This command does not change code and does not commit.
 ---
 
 <Verify>
-Resolve the plan path. Read it. Confirm **every phase is `done`**.
+**Resolve the source.** ${SOURCE} is `plan` or `diff`.
 
-If any phase is still `todo`, stop and tell the user which phases remain — an
-as-built doc describes shipped code, so it is premature. Do not proceed.
+`plan` — the default. Resolve the plan path. Read it. Confirm **every phase is
+`done`**. If any phase is still `todo`, stop and tell the user which phases
+remain — an as-built doc describes shipped code, so it is premature. Do not
+proceed.
+
+`diff` — selected by `--from-diff`, or when no plan doc was supplied and none can
+be inferred. Nothing is verified and nothing is deleted at the end, because there
+is no plan. Resolve the base:
+
+- This branch has commits ahead of trunk → the branch diff,
+  `git diff <trunk>...HEAD`, plus any uncommitted work in the tree.
+- It does not → the working tree alone: `git diff HEAD` plus untracked files.
+
+State the base and the changed-file count in one line. An empty diff stops the
+command — there is nothing shipped to describe.
 
 **Read the disposition.** An `As-built disposition:` line under the Status line
 sets ${DISPOSITION}: `amend` (fold changes into the existing as-built docs it
 names — no new doc) or `create`. Line absent → `create` (the default flow).
+
+In `diff` mode there is no plan to carry that line, so read it from the design
+doc the work implemented when one is named or can be inferred from the branch. If
+no such line exists anywhere, decide from the change surface — work that only
+alters surface the existing as-built docs already describe is `amend`, work that
+adds a feature they do not cover is `create` — and state the choice with its
+reason.
+
 State the mode in one line. Every later step branches on it.
 </Verify>
 
 ---
 
 <Distill>
-**Amend mode:** no new doc is distilled. Instead assemble the **change surface**
-from the plan you already read — per phase: the types, signatures, renames,
-deletions, invariants, and behavior the Work Orders shipped, corrected by their
-Retrospectives. Capture it as ${CHANGE_SURFACE} and skip to `<ProposeDestination/>`.
+**Amend mode:** no new doc is distilled. Instead assemble the **change surface** —
+the types, signatures, renames, deletions, invariants, and behavior the work
+shipped:
+
+- ${SOURCE} `plan` — from the plan you already read, per phase, as the Work
+  Orders shipped it and their Retrospectives corrected it.
+- ${SOURCE} `diff` — from the diff resolved in `<Verify/>`. Read it in full, and
+  read the changed files themselves wherever the diff alone does not show a
+  type's or a signature's finished shape. A diff shows what moved; the file
+  shows what it became.
+
+Capture it as ${CHANGE_SURFACE} and skip to `<ProposeDestination/>`.
 
 **Create mode** (the rest of this step):
 
@@ -64,10 +98,15 @@ codebase re-read.
 
 Dispatch ONE `Explore` (or `general-purpose`) subagent. Its prompt must include:
 
-- The absolute plan-doc path.
-- A directive to read the plan **and** the key shipped files it names (the
-  Delegation Context **Key files** and each Work Order's **Files**), so the
-  overview matches what actually exists, not only what was planned.
+- ${SOURCE} `plan` — the absolute plan-doc path, and a directive to read the plan
+  **and** the key shipped files it names (the Delegation Context **Key files**
+  and each Work Order's **Files**), so the overview matches what actually exists,
+  not only what was planned.
+- ${SOURCE} `diff` — the diff base resolved in `<Verify/>` and the list of
+  changed files, and a directive to read the diff **and** those files as they now
+  stand. There is no plan to state intent, so the shipped code is the only
+  source; where a change's purpose is not evident from the code, say so rather
+  than inventing a rationale.
 - The instruction to return an **as-built overview** that **keeps**:
   - **What it is** — one-paragraph summary of the feature and the problem it solves.
   - **How it works** — the architecture and data flow as built; the concrete
@@ -101,14 +140,21 @@ the as-built docs the disposition line names; if it names none, the sibling
 `as-built/` docs whose subjects ${CHANGE_SURFACE} touches. Then ask the user,
 phrased to stand alone:
 
-1. One plain-language line: "Fold the finished `<plan>` plan into the existing
-   reference docs it changed, then delete the plan."
-2. The operations, in human terms — Edit: each target doc (updated to match the
-   shipped code). Delete: `<plan path>` (its content now lives in those docs).
-3. A clear choice: confirm / keep the plan doc / adjust the target list.
+In `diff` mode there is no plan-doc location to take siblings from; use the
+as-built directory the flavor rule below resolves for this repo.
 
-On confirm, skip `<Relocate/>` and go to `<ReconcileAsBuilt/>`; the plan doc is
-deleted there, after the edits are applied.
+1. One plain-language line — ${SOURCE} `plan`: "Fold the finished `<plan>` plan
+   into the existing reference docs it changed, then delete the plan."
+   ${SOURCE} `diff`: "Update the existing reference docs to match what this work
+   changed."
+2. The operations, in human terms — Edit: each target doc (updated to match the
+   shipped code). Delete, `plan` mode only: `<plan path>` (its content now lives
+   in those docs); in `diff` mode there is nothing to delete, so say so.
+3. A clear choice: confirm / adjust the target list, plus keep the plan doc when
+   there is one.
+
+On confirm, skip `<Relocate/>` and go to `<ReconcileAsBuilt/>`; a plan doc, when
+there is one, is deleted there after the edits are applied.
 
 **Create mode** (the rest of this step):
 
@@ -136,6 +182,8 @@ STEP 2 work. Phrase the confirmation like this:
    not a code-level description:
    - Create: `<destination>/<filename>.md` (the new reference doc).
    - Delete: `<old plan path>` (the original plan, now replaced by the doc above).
+     In `diff` mode there is no plan, so this operation does not appear and the
+     question offers the creation alone.
 3. **A clear choice:** confirm both, keep the old plan, or use a different folder.
 
 **Do NOT** put your STEP 2 fact-check details into this question — symbol names,
@@ -160,7 +208,8 @@ of `<ReconcileAsBuilt/>`.
 3. Remove the original plan doc from its docs location (it has been superseded by
    the as-built). If the plan named a predecessor as-built to delete (e.g. an
    `as-built/<old>.md` the feature replaced), remove it too — but only what the
-   plan explicitly marks for deletion.
+   plan explicitly marks for deletion. In `diff` mode skip this step entirely:
+   there is no plan doc and nothing was marked for deletion.
 4. Fix any in-repo links that pointed at the old plan path, if you can find them
    cheaply; otherwise note them in the report for the user to update.
 
@@ -183,7 +232,8 @@ the "new as-built doc" input (there is none). The sibling/peer contradiction
 scan below still runs after the targeted folds. When the subagent returns and
 the edits spot-check clean against ${CHANGE_SURFACE}, delete the plan doc (the
 user already confirmed in `<ProposeDestination/>`) and fix any in-repo links
-that pointed at it.
+that pointed at it. In `diff` mode there is no plan doc: the edits are the
+whole act, nothing is deleted, and no links need repointing.
 
 **Both modes:**
 
@@ -195,12 +245,15 @@ Reconcile them so the as-built corpus and surrounding docs stay accurate.
 Dispatch ONE `general-purpose` subagent (it must be able to edit). Its prompt
 must include:
 
-- The absolute path of the **source plan** doc.
+- The absolute path of the **source plan** doc, when there is one. In `diff` mode
+  give the diff base and the changed-file list instead.
 - The absolute path of the **new** as-built doc just written.
-- The plan's **change surface**: the types, signatures, invariants, and behavior
-  this feature added or altered (carry these from the plan / the distilled
-  overview — do not make the subagent re-derive them from scratch).
-- The source plan directory path and as-built directory path. Directive:
+- The **change surface**: the types, signatures, invariants, and behavior this
+  feature added or altered (carry these from the plan or the diff and the
+  distilled overview — do not make the subagent re-derive them from scratch).
+- The as-built directory path, and the source plan directory path when there is a
+  plan; in `diff` mode the docs directory that holds the as-built directory takes
+  its place for the peer scan. Directive:
   - read each **sibling** as-built doc in the as-built directory and decide
     whether this feature contradicts anything it states;
   - read each **peer markdown** doc in the source plan directory (except the
@@ -259,6 +312,7 @@ Produce a succinct markdown table:
 | Area | Result |
 | --- | --- |
 | Mode | <create / amend> |
+| Source | <plan doc path / diff: base + changed-file count> |
 | As-built | <create: new path / amend: target docs updated, one line each> |
 | Removed | <old plan path; any predecessor + confirmed-obsolete as-built deleted, or None> |
 | Reconciled | <sibling as-built and peer source-doc edits made, one line each, or None> |
@@ -275,7 +329,11 @@ Then stop.
 ## Rules
 
 - Verify all phases `done` before distilling — never write an as-built for an
-  unfinished plan.
+  unfinished plan. In `diff` mode there is no plan to verify; an empty diff is
+  the equivalent stop, because nothing shipped.
+- A plan states intent and a diff does not. Working from a diff, describe what
+  the code now is and leave rationale you cannot source from the code unstated —
+  never reconstruct a "why" the shipped work does not support.
 - Offload the code re-read to the subagent (`<Distill/>`); the orchestrator must
   not re-explore the repo itself.
 - The as-built is for a future implementer: keep architecture, types, invariants,

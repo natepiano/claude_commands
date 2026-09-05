@@ -1,5 +1,5 @@
 ---
-description: Delegate phased work with review, repair, smoke gates, one branch-wide style review at the end of the project, as-built shrink, approved follow-up capture, and one checkpoint per phase. Supports automatic loop, verbose gating, bounded auto windows, and single no-commit mode.
+description: Delegate phased work with review, repair, smoke gates, one branch-wide style review at the end of the project, as-built shrink, an as-built doc pass at the end of the run, approved follow-up capture, and one checkpoint per phase. Supports automatic loop, verbose gating, bounded auto windows, and single no-commit mode.
 ---
 
 # Delegate
@@ -82,7 +82,8 @@ Paths are under `~/.claude/`.
   inline cleanup in <RunProjectStyleReview/>.
 - `single` never commits. Loop and verbose modes create exactly one
   <CheckpointCommit/> per completed phase, plus the one <FinalGateCommit/> that
-  closes the run. No other commit is allowed.
+  closes verification and the one <AsBuiltCommit/> that carries the run's
+  documentation. No other commit is allowed.
 - A checkpoint never pushes. If a phase explicitly needs a remote commit for a
   dependency pin, consumer, or CI run, pushing that working branch is mechanical
   phase work, not a user decision or prerequisite.
@@ -1744,7 +1745,7 @@ file. `Active` must already have been replaced by
 already have been deleted by the validated successful release. If either state
 survives, the phase is not complete and this section must not run.
 
-In `single`, also run `finish-run --status completed`, then
+In `single`, also run `finish-run --status completed`, then run <RunAsBuilt/>,
 apply <RetainDelegatedPhaseReservation/>, report that no checkpoint release was
 attempted, run `bash ~/.claude/scripts/delegate/end_session.sh`, and end. Other
 modes continue.
@@ -1776,8 +1777,8 @@ answer from the completed report and preserve the gate.
 </VerbosePostPhaseGate>
 
 <NextPhase>
-If no todo phase remains, run <FinalGate/> then <RunSummary/>. Otherwise reset
-`REVIEW_PASS=0` and smoke to `not_run`.
+If no todo phase remains, run <FinalGate/>, then <RunAsBuilt/>, then
+<RunSummary/>. Otherwise reset `REVIEW_PASS=0` and smoke to `not_run`.
 Style state is per-run, not per-phase: never reset it or delete its marker
 here, and never re-resolve `STYLE_DIFF_BASE`.
 
@@ -1848,6 +1849,57 @@ synthetic-final repairs — so the run leaves no uncommitted work behind.
    closing repairs.`
 </FinalGateCommit>
 
+<RunAsBuilt>
+Run once per run, and only on a complete ending: every phase `done` in loop or
+verbose, or a finished `single` task. Skip it on a user stop, an open pending
+decision, or an error — a partial project has no settled surface to describe —
+and state the skip in <RunSummary/>.
+
+Invoke `plan:to_as_built` and follow it completely:
+
+- A phased plan with every phase `done` — pass `${PLAN_DOC}`. Its per-phase
+  `As-built` blocks are the change surface, already prepared by
+  <RunPhaseShrink/>.
+- A `single` ad hoc task with no plan doc — pass `--from-diff`. `single` never
+  commits, so the working tree is the change surface.
+
+That command asks the user before it edits, relocates, or deletes anything, so it
+needs no gate here. It changes no code and commits nothing itself, so run
+<AsBuiltCommit/> after it and leave the run's tree clean. Carry both reports into
+<RunSummary/>. A refusal there is reported, not repaired, and leaves nothing to
+commit.
+</RunAsBuilt>
+
+<AsBuiltCommit>
+Loop and verbose only, at most once per run, immediately after <RunAsBuilt/>. It
+commits what that step produced — the as-built docs written, updated, or removed
+— so the run leaves no uncommitted work behind. `single` never commits: it skips
+this and reports the doc edits as uncommitted.
+
+1. With no changes in `git status --short`, skip it silently. An amend that found
+   nothing to correct is a valid outcome, not a failure.
+2. Confirm the changed paths are documentation only — the docs
+   `/plan:to_as_built` reported as created or edited, plus the plan doc it
+   deleted and any file the user confirmed for deletion or relocation. A changed
+   source file means something other than this step touched the tree: leave
+   everything uncommitted, report it, and do not commit.
+3. Stage those paths and commit exactly once:
+
+   ```
+   docs(<plan-slug>): as-built
+
+   <the docs created, updated, relocated, or removed>
+
+   Claude-Session: <session url>
+   ```
+
+   The subject is deliberately not `checkpoint(<plan-slug>)`. This commit carries
+   no phase, and a later run resolving its diff base scans for checkpoint
+   subjects — it must not find this one among them.
+4. Never push. This commit holds no phase reservation, so it invokes no drift
+   check and no release. Report `As-built <short hash> — <n> docs.`
+</AsBuiltCommit>
+
 <RunSummary>
 Emit on every multi-phase ending:
 
@@ -1858,6 +1910,8 @@ Emit on every multi-phase ending:
 | --- | --- | --- | --- |
 
 **Final gate:** [result or skipped reason]
+**As-built:** [docs created or updated, and the commit that carried them; in
+`single`, that they are uncommitted; or the reason the run never ran it]
 **Style review:** [range reviewed and result, or the reason the run never ran it]
 **Smoke checks still unperformed:** [phase + exact action, or none]
 **Deferred decisions still open:** [phase + decision, or none]
