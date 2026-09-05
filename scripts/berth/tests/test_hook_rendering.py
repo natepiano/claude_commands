@@ -134,6 +134,82 @@ class HookWrapperTests(InstalledFrontEndFixture):
                     "not on PATH", cast(str, specific["additionalContext"])
                 )
 
+    def test_pre_edit_wrapper_honors_the_bypass_before_reaching_the_engine(self) -> None:
+        """CARGO_BERTH_BYPASS=1 allows the edit even when the engine would hang.
+
+        The wrapper ends in `exec`, so once the engine is reached nothing can time
+        it out; the bypass has to be decided before that. The allow must still be
+        audited: a pending-bypass marker naming the editing action lands in the
+        common git directory for the next journal write to import. The same holds
+        with no engine on PATH at all.
+        """
+
+        repository_root = self.fixture_root / "bypass-repository"
+        repository_root.mkdir()
+        _ = self.git_command(repository_root, ["init", "--quiet"])
+        hanging_engine_directory = self.fixture_root / "hanging-engine"
+        hanging_engine_directory.mkdir()
+        hanging_engine = hanging_engine_directory / "cargo-berth"
+        _ = hanging_engine.write_text("#!/bin/sh\nsleep 30\n", encoding="utf-8")
+        hanging_engine.chmod(0o755)
+        hanging_path = os.pathsep.join(
+            [str(hanging_engine_directory), self.base_environment["PATH"]]
+        )
+        engineless_path = os.pathsep.join(
+            directory
+            for directory in self.base_environment["PATH"].split(os.pathsep)
+            if not (Path(directory) / "cargo-berth").exists()
+        )
+        payload = {**self.pre_edit_payload(), "cwd": str(repository_root)}
+
+        for case_name, path in (
+            ("hanging engine", hanging_path),
+            ("no engine", engineless_path),
+        ):
+            with self.subTest(case=case_name):
+                environment = {
+                    **self.base_environment,
+                    "PATH": path,
+                    "CARGO_BERTH_BYPASS": "1",
+                }
+                completed = subprocess.run(
+                    [str(PRE_EDIT_HOOK)],
+                    input=json.dumps(payload),
+                    capture_output=True,
+                    text=True,
+                    env=environment,
+                    cwd=repository_root,
+                    check=False,
+                    timeout=5,
+                )
+                self.assertEqual(completed.returncode, 0, completed.stderr)
+                self.assertEqual(completed.stderr, "")
+                published = cast(dict[str, object], json.loads(completed.stdout))
+                self.assertEqual(
+                    published["systemMessage"],
+                    "cargo-berth was bypassed for this edit by CARGO_BERTH_BYPASS=1.",
+                )
+                specific = cast(dict[str, object], published["hookSpecificOutput"])
+                self.assertEqual(specific["hookEventName"], "PreToolUse")
+                self.assertEqual(specific["permissionDecision"], "allow")
+                self.assertIn(
+                    "CARGO_BERTH_BYPASS=1",
+                    cast(str, specific["permissionDecisionReason"]),
+                )
+
+        markers = sorted((repository_root / ".git").glob("cargo-berth-pending-bypass-*.json"))
+        self.assertEqual(len(markers), 2)
+        for marker in markers:
+            with self.subTest(marker=marker.name):
+                self.assertTrue(marker.name.startswith("cargo-berth-pending-bypass-edit-"))
+                decoded = cast(dict[str, object], json.loads(marker.read_text(encoding="utf-8")))
+                self.assertEqual(decoded["action"], "editing")
+                cause = cast(dict[str, object], decoded["cause"])
+                self.assertEqual(cause["kind"], "environment_override")
+                self.assertTrue(cast(str, cause["bypassed_merge"]).startswith("edit-hook-"))
+                occurrence_time = cast(dict[str, object], decoded["occurrence_time"])
+                self.assertIn(occurrence_time["status"], ("known", "unavailable"))
+
     def test_installer_arms_rollback_after_complete_prior_backups(self) -> None:
         source = INSTALL_SCRIPT.read_text(encoding="utf-8")
         cleanup_trap = source.index("trap cleanup_staging EXIT HUP INT TERM")

@@ -9,7 +9,10 @@ picks the change up on its next hook invocation.
 - `hooks/berth_session_start.sh` — `SessionStart` board read.
 
 Each one checks that `cargo-berth` is on `PATH` and then `exec`s
-`cargo-berth hook <event>`. The engine decides every outcome and writes every
+`cargo-berth hook <event>`. The pre-edit wrapper first honors
+`CARGO_BERTH_BYPASS=1`: it allows the edit without reaching the engine and
+leaves a pending-bypass marker in the repository, because after the `exec`
+there is no shell left to time out a hung engine. The engine decides every outcome and writes every
 byte of the harness protocol response. The one thing a wrapper states on its own
 is what it states when there is no engine to ask: the pre-edit wrapper fails
 closed, and the other two publish a static repair notice.
