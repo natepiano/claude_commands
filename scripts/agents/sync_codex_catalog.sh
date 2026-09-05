@@ -8,6 +8,9 @@ CODEX_CONFIG_FILE="${CODEX_CONFIG_FILE:-$HOME/.codex/config.toml}"
 CODEX_MODELS_CACHE_FILE="${CODEX_MODELS_CACHE_FILE:-$HOME/.codex/models_cache.json}"
 CODEX_CATALOG_SYNC_STATE_FILE="${CODEX_CATALOG_SYNC_STATE_FILE:-$HOME/.local/state/codex-agent-catalog-sync/last_success}"
 CHECK_ONLY=false
+# Set when the cache did not name some visible model's efforts. Such a run still
+# writes every row it does know, but it must not close the freshness gate.
+CATALOG_INCOMPLETE=false
 
 if [[ "${1:-}" == "--check" ]]; then
     CHECK_ONLY=true
@@ -34,21 +37,47 @@ release_lock() {
     return 0
 }
 
+# The state file is the freshness gate agents_config.sh reads: it re-runs the
+# sync while the Codex config or the model cache is newer than it. Closing that
+# gate on a run that could not read some model's efforts would record a partial
+# answer as the settled one, so an incomplete run leaves the gate open and the
+# next caller re-reads the cache -- which is how a model whose efforts land
+# seconds after the sync ran gets picked up without anyone noticing the gap.
+checkpoint_sync_state() {
+    if [[ "$CATALOG_INCOMPLETE" == true ]]; then
+        echo "Codex agent catalog is incomplete; the next sync will re-read the cache." >&2
+        return 0
+    fi
+    mkdir -p "$(dirname "$CODEX_CATALOG_SYNC_STATE_FILE")"
+    touch "$CODEX_CATALOG_SYNC_STATE_FILE"
+}
+
 if [[ "$CHECK_ONLY" == false ]]; then
-    mkdir -p "$(dirname "$LOCK_DIR")"
+    state_dir="$(dirname "$CODEX_CATALOG_SYNC_STATE_FILE")"
+    if ! mkdir_error="$(mkdir -p "$state_dir" 2>&1)"; then
+        fail "cannot create the sync state directory $state_dir: $mkdir_error"
+    fi
     # A lock left behind by a killed sync would block every later one, so a
     # directory older than the longest plausible run is debris, not an owner.
     if [[ -d "$LOCK_DIR" && -z "$(find "$LOCK_DIR" -maxdepth 0 -mmin -5 2>/dev/null)" ]]; then
         rmdir "$LOCK_DIR" 2>/dev/null || true
     fi
-    if mkdir "$LOCK_DIR" 2>/dev/null; then
+    # `mkdir` fails both when a peer owns the lock and when the state directory
+    # is unwritable -- a sandboxed caller can create nothing under it. Only the
+    # first is contention, and only the directory now existing proves it. Reading
+    # every failure as a busy peer exits 0, which is the one answer that must not
+    # be wrong here: the caller then accepts whatever stale catalog is on disk
+    # and its `if ! sync` warning never fires.
+    if lock_error="$(mkdir "$LOCK_DIR" 2>&1)"; then
         LOCK_HELD=1
         trap release_lock EXIT
-    else
+    elif [[ -d "$LOCK_DIR" ]]; then
         # Another sync is mid-flight and will refresh both the catalog and the
         # state file. This caller reads a valid conf either way.
         echo "Codex agent catalog sync already running; skipping."
         exit 0
+    else
+        fail "cannot acquire the sync lock $LOCK_DIR: $lock_error"
     fi
 fi
 
@@ -210,6 +239,11 @@ while IFS= read -r model; do
     [[ -n "$model" ]] && cache_agents+=("$model")
 done <<< "$cache_agents_text"
 
+previous_catalog_rows=()
+while IFS= read -r row; do
+    previous_catalog_rows+=("$row")
+done < <(registry_section_rows codex.agents)
+
 catalog_rows=()
 selected_is_visible=false
 while IFS=$'\t' read -r model efforts; do
@@ -217,6 +251,24 @@ while IFS=$'\t' read -r model efforts; do
     [[ "$model" == "$codex_model" ]] && selected_is_visible=true
     if [[ ! "$model" =~ ^[[:alnum:]][[:alnum:]./_-]*$ ]]; then
         echo "WARNING: skipping Codex model '$model': slug contains unsupported characters." >&2
+        continue
+    fi
+    # Codex fills the cache in stages: a model reaches the visible catalog before
+    # its reasoning levels do, and every model that has settled carries at least
+    # one. So a visible model with none is a cache mid-write, not a model without
+    # efforts, and `<model>=` writes that falsehood into a generated file --
+    # _agents_validate_pair then rejects every `<model>:<effort>` against an empty
+    # allowed list, which reads as "that effort is wrong" rather than "nobody has
+    # said yet". Keep the last row that named efforts if there is one; otherwise
+    # leave the model out rather than assert something untrue about it.
+    if [[ -z "$efforts" ]]; then
+        CATALOG_INCOMPLETE=true
+        if prior_row="$(previous_catalog_row "$model")" && [[ "$prior_row" != *= ]]; then
+            echo "WARNING: Codex model '$model' has no reasoning levels in $CODEX_MODELS_CACHE_FILE yet; keeping its last known efforts." >&2
+            catalog_rows+=("$prior_row")
+        else
+            echo "WARNING: Codex model '$model' has no reasoning levels in $CODEX_MODELS_CACHE_FILE yet; leaving it out of [codex.agents] until the cache names them." >&2
+        fi
         continue
     fi
     catalog_rows+=("$model=$efforts")
@@ -248,11 +300,6 @@ fi
 
 [[ "${#catalog_rows[@]}" -gt 0 ]] || fail "visible Codex model catalog has no usable slugs"
 refreshed_catalog_rows=("${catalog_rows[@]}")
-
-previous_catalog_rows=()
-while IFS= read -r row; do
-    previous_catalog_rows+=("$row")
-done < <(registry_section_rows codex.agents)
 
 assigned_rows="$(
     awk '
@@ -358,8 +405,7 @@ done < "$AGENTS_CONFIG_FILE"
 
 if cmp -s "$tmp_file" "$AGENTS_CONFIG_FILE"; then
     if [[ "$CHECK_ONLY" == false ]]; then
-        mkdir -p "$(dirname "$CODEX_CATALOG_SYNC_STATE_FILE")"
-        touch "$CODEX_CATALOG_SYNC_STATE_FILE"
+        checkpoint_sync_state
     fi
     echo "Codex agent catalog is current."
     exit 0
@@ -373,6 +419,5 @@ fi
 chmod "$(stat -f '%Lp' "$AGENTS_CONFIG_FILE" 2>/dev/null || stat -c '%a' "$AGENTS_CONFIG_FILE")" "$tmp_file"
 mv "$tmp_file" "$AGENTS_CONFIG_FILE"
 trap release_lock EXIT
-mkdir -p "$(dirname "$CODEX_CATALOG_SYNC_STATE_FILE")"
-touch "$CODEX_CATALOG_SYNC_STATE_FILE"
+checkpoint_sync_state
 echo "Updated Codex agent catalog: $AGENTS_CONFIG_FILE"
