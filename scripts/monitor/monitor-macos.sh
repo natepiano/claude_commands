@@ -57,19 +57,33 @@ current_input() {
 
 # How long to wait for the panel to start answering for its new input.
 #
-# Sized against a measurement, not a hunch: the first real switch on this Mac
-# confirmed on the 4th attempt, about 3 seconds, out of a budget that was 5.
-# One spare attempt is not margin -- a slower settle, a busier machine or a
-# cold panel and the script would report "did not switch" while the screen had
-# in fact moved. That false failure is the worst way for this to be wrong,
-# since the person is looking at the proof it is lying.
+# Sized against measurements rather than a hunch, and against the SLOWER of the
+# two directions, because they are not symmetric:
 #
-# 10 costs nothing on success, because the loop stops as soon as the monitor
-# agrees. The extra seconds are only ever spent on a genuine failure, where
-# taking 10s to correctly report a dead monitor is no hardship.
+#     dell -> mac      3.83s   confirmed on attempt 4   (~3s settle)
+#     dell -> linux    1.42s   confirmed on attempt 2   (~1.2s settle)
 #
-# Caveat on the 3 seconds: one observation, one direction, one panel. If more
-# switches get timed and they cluster higher, raise this again.
+# Switching to the Mac is slower by roughly 2.5x, which fits the hardware: it
+# has to bring up DisplayPort alt mode over USB-C and re-enumerate USB, where
+# HDMI only retrains the link. So mac-ward is the number this constant has to
+# cover; linux-ward always comes home early, since the loop stops the moment
+# the monitor agrees.
+#
+# That asymmetry is also where the old budget of 5 was actually dangerous. It
+# left one spare attempt mac-ward and three linux-ward, so the exposure was
+# specific to switching TO the Mac -- which is the direction someone is most
+# likely to run while sitting at the Mac, unable to see the other machine. A
+# slower settle, a busier machine or a cold panel and the script would report
+# "did not switch" while the screen had in fact moved. That false failure is
+# the worst way for this to be wrong, since the person is looking at the proof
+# it is lying.
+#
+# 10 costs nothing on success. The extra seconds are only ever spent on a
+# genuine failure, where taking 10s to correctly report a dead monitor is no
+# hardship.
+#
+# Caveat: one observation per direction, warm panel, nothing else contending.
+# Neither figure is a floor. If later timings cluster higher, raise this again.
 CONFIRM_ATTEMPTS=10
 
 # Wait for the monitor to actually be on the requested input.
