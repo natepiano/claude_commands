@@ -55,18 +55,33 @@ current_input() {
     esac
 }
 
+# How long to wait for the panel to start answering for its new input.
+#
+# Sized against a measurement, not a hunch: the first real switch on this Mac
+# confirmed on the 4th attempt, about 3 seconds, out of a budget that was 5.
+# One spare attempt is not margin -- a slower settle, a busier machine or a
+# cold panel and the script would report "did not switch" while the screen had
+# in fact moved. That false failure is the worst way for this to be wrong,
+# since the person is looking at the proof it is lying.
+#
+# 10 costs nothing on success, because the loop stops as soon as the monitor
+# agrees. The extra seconds are only ever spent on a genuine failure, where
+# taking 10s to correctly report a dead monitor is no hardship.
+#
+# Caveat on the 3 seconds: one observation, one direction, one panel. If more
+# switches get timed and they cluster higher, raise this again.
+CONFIRM_ATTEMPTS=10
+
 # Wait for the monitor to actually be on the requested input.
 #
 # This is the only proof a write landed, because m1ddc's exit status is not one
-# -- run locally it returns 0 whether or not anything happened. The retries are
-# because a panel changing inputs takes a moment to answer for the new one; a
-# single immediate read can still report the old value and call a good switch a
-# failure.
+# -- run locally it returns 0 whether or not anything happened.
 confirm_input() {
     local want="$1" i
-    for i in 1 2 3 4 5; do
+    for ((i = 1; i <= CONFIRM_ATTEMPTS; i++)); do
         [[ "$(current_input 2>/dev/null)" == "$want" ]] && return 0
-        sleep 1
+        # No sleep after the last check: it would only delay the failure.
+        ((i < CONFIRM_ATTEMPTS)) && sleep 1
     done
     return 1
 }
