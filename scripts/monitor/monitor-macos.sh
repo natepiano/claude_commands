@@ -38,15 +38,37 @@ fi
 # either one.
 dell() { "$M1DDC" display "edid=$DELL_EDID" "$@" 2>&1; }
 
-# Prints "linux", "mac", or the raw value when it is neither.
+# Prints "linux" or "mac" and succeeds. Anything else is printed too, but FAILS
+# -- an unrecognised value here is far more likely to be the 110 constant above
+# than a real input, and passing it through as though it were a state is how a
+# dead monitor gets reported as a working one.
 current_input() {
     local out
     out=$(dell get input) || return 1
     case "$out" in
         "$INPUT_LINUX") echo linux ;;
         "$INPUT_MAC") echo mac ;;
-        *) echo "$out" ;;
+        *)
+            echo "$out"
+            return 1
+            ;;
     esac
+}
+
+# Wait for the monitor to actually be on the requested input.
+#
+# This is the only proof a write landed, because m1ddc's exit status is not one
+# -- run locally it returns 0 whether or not anything happened. The retries are
+# because a panel changing inputs takes a moment to answer for the new one; a
+# single immediate read can still report the old value and call a good switch a
+# failure.
+confirm_input() {
+    local want="$1" i
+    for i in 1 2 3 4 5; do
+        [[ "$(current_input 2>/dev/null)" == "$want" ]] && return 0
+        sleep 1
+    done
+    return 1
 }
 
 case "${1:-status}" in
@@ -54,7 +76,7 @@ case "${1:-status}" in
         if input=$(current_input); then
             echo "dell     showing: $input"
         else
-            echo "dell     could not be read from here"
+            echo "dell     could not be read${input:+ (m1ddc said '$input')}"
         fi
         echo "samsung  no DDC/CI; run 'monitor.sh samsung' for why"
         ;;
@@ -78,11 +100,18 @@ case "${1:-status}" in
         # No ssh fallback on this side, unlike the Linux one. This Mac can read
         # and write the Dell while the Dell is showing the other machine, so
         # there is never a state it has to reach across to escape.
-        if out=$(dell set input "$code"); then
+        #
+        # The write is judged by reading it back, not by m1ddc's exit status,
+        # which is 0 either way. Without this a switch against a monitor that
+        # is not listening prints "dell -> mac" and returns success.
+        out=$(dell set input "$code")
+        if confirm_input "$dest"; then
             echo "dell -> $dest"
         else
-            echo "monitor: could not switch the Dell" >&2
-            echo "$out" >&2
+            echo "monitor: the Dell did not switch to $dest" >&2
+            [[ -n "$out" ]] && echo "m1ddc said: $out" >&2
+            echo "m1ddc reports success even when nothing happens, so this means" >&2
+            echo "the monitor never took the value -- not that the command failed." >&2
             exit 1
         fi
 

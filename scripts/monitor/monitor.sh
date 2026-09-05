@@ -61,11 +61,31 @@ EOF
 TARGET=all
 DEST=""
 
+# Both setters refuse to be told two different things rather than letting the
+# last word win. "monitor.sh dell mac linux" is not a request, it is a typo or
+# a half-edited command line, and quietly resolving it to "linux" moves a
+# screen the person did not ask to move.
+set_target() {
+    if [[ "$TARGET" != all && "$TARGET" != "$1" ]]; then
+        echo "monitor: '$1' contradicts '$TARGET' -- name one monitor" >&2
+        exit 2
+    fi
+    TARGET="$1"
+}
+
+set_dest() {
+    if [[ -n "$DEST" && "$DEST" != "$1" ]]; then
+        echo "monitor: '$1' contradicts '$DEST' -- name one destination" >&2
+        exit 2
+    fi
+    DEST="$1"
+}
+
 for word in "$@"; do
     case "$word" in
-        dell | samsung | all) TARGET="$word" ;;
-        mac | macos | darwin) DEST=mac ;;
-        linux | natedev) DEST=linux ;;
+        dell | samsung | all) set_target "$word" ;;
+        mac | macos | darwin) set_dest mac ;;
+        linux | natedev) set_dest linux ;;
         -h | --help | help)
             usage
             exit 0

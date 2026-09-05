@@ -38,7 +38,13 @@ current_input() {
     case "$out" in
         *"sl=$DELL_INPUT_LINUX"*) echo linux ;;
         *"sl=$DELL_INPUT_MAC"*) echo mac ;;
-        *) echo "${out##*sl=}" ;;
+        *)
+            # Print it, but fail: an unrecognised code is a state this script
+            # has no name for, and reporting it as though it were one of the
+            # two machines would be wrong.
+            echo "${out##*sl=}"
+            return 1
+            ;;
     esac
 }
 
@@ -72,8 +78,9 @@ case "${1:-status}" in
         else
             # Not the ordinary consequence of the Dell showing the Mac -- this
             # machine reads it fine in that state. Something else is wrong:
-            # the monitor asleep, the cable out, i2c gone.
-            echo "dell     unreadable (asleep, unplugged, or i2c is gone)"
+            # the monitor asleep, the cable out, i2c gone, or an input this
+            # script has no name for, such as HDMI 2 with nothing on it.
+            echo "dell     unreadable${input:+ (input code $input)}"
         fi
         echo "samsung  no DDC/CI; run 'monitor.sh samsung' for why"
         ;;
@@ -100,6 +107,9 @@ case "${1:-status}" in
             exit 0
         fi
 
+        # No read-back needed here, unlike the macOS backend: ddcutil verifies
+        # what setvcp wrote by default (--verify is on unless --noverify says
+        # otherwise), so a zero exit really does mean the monitor took it.
         if dell setvcp 60 "$code" >/dev/null; then
             echo "dell -> $dest"
         elif switch_via_mac "$mac_code"; then

@@ -21,6 +21,8 @@ description: Switch which computer a monitor displays, over DDC/CI.
 
 Keyboard and mouse do not follow the picture. There is no KVM in either monitor; deskflow already shares the Mac's keyboard and mouse over the network, so they reach the Linux box whether or not it is on screen.
 
+The Mac writing its own input code (`set input 27`) has never actually been run — every Mac-side switch test went through a stub. Reading from the Mac is proven, and the `0x1b` value itself is proven from the Linux side, so this is expected to work; it is simply not yet a tested path. The first real `/monitor dell mac` issued on the Mac is what settles it.
+
 Either machine can drive the Dell no matter which one it is displaying. Both directions are tested, so a switch is never one-way and you can always get the screen back from where you are sitting.
 
 The Linux script keeps an ssh-to-the-Mac fallback anyway, for the case where the direct path stops working — the failure it covers is the one that would otherwise strand you. It should never fire; if it does, it announces itself, and it needs the 1Password agent to approve the key, so it can sit waiting on a tap.
