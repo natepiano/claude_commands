@@ -685,7 +685,7 @@ The following [X] guides from Bevy ${VERSION} do not apply to this codebase.
 2. Address HIGH priority changes (deprecated features)
 3. Consider MEDIUM and LOW priority improvements
 4. Test thoroughly after each category of changes
-5. Run `cargo check` and `cargo test` frequently
+5. Run `cargo check` and `cargo nextest run` frequently
 
 ---
 

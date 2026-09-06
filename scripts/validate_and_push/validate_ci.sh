@@ -321,11 +321,11 @@ compile_target_tests() {
         PKG_CONFIG_PATH= \
         PKG_CONFIG_ALLOW_CROSS=1 \
         PKG_CONFIG_ALLOW_CROSS_x86_64_unknown_linux_gnu=1 \
-        cargo test --target "$target" --workspace --all-features --tests --no-run \
+        cargo nextest run --target "$target" --workspace --all-features --tests --no-run \
         ${CROSS_EXCLUDE_ARGS[@]+"${CROSS_EXCLUDE_ARGS[@]}"}
       ;;
     *)
-      cargo test --target "$target" --workspace --all-features --tests --no-run \
+      cargo nextest run --target "$target" --workspace --all-features --tests --no-run \
         ${CROSS_EXCLUDE_ARGS[@]+"${CROSS_EXCLUDE_ARGS[@]}"}
       ;;
   esac

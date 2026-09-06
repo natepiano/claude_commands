@@ -62,7 +62,7 @@ rsync -a --delete --exclude 'target/' "$DEST"/pristine/ "$DEST"/work/   # fresh 
 ```
   `+stable` matters — a nightly-built binary fails against stable projects with `E0514`, which reads like a fresh bug.
 - The fix is confirmed only when mend exits 0 **and** the rewritten copy compiles: `cargo check --workspace --all-targets` in `$DEST/work` after the fix run.
-- Run `cargo test` (background it).
+- Run `cargo nextest run` (background it).
 - Report the before/after to the user: the original compiler errors, and what the run does now.
 
 **STEP 7 — Install**
