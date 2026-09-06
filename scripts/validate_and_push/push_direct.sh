@@ -9,7 +9,12 @@ set -euo pipefail
 # job gets diagnosed the tick it turns red rather than after the whole run
 # settles. This script therefore stops at the push and prints the identifiers
 # the tick loop needs.
+#
+# A repo's post-push hook (see post_push_hook.sh) runs right after the push.
+# Its failure is reported after the CI handoff and becomes this script's exit
+# status, so the handoff block is always printed.
 
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 BRANCH="$(git branch --show-current)"
 
 echo "Pushing ${BRANCH} to origin..."
@@ -17,6 +22,9 @@ git push origin "$BRANCH"
 
 SHA="$(git rev-parse HEAD)"
 REPO="$(gh repo view --json nameWithOwner -q .nameWithOwner)"
+
+HOOK_STATUS=0
+bash "${SCRIPT_DIR}/post_push_hook.sh" "$BRANCH" "$SHA" || HOOK_STATUS=$?
 
 # `gh run list --commit` requires a full SHA; a short SHA silently returns
 # nothing. The run also does not exist the instant the push lands.
@@ -46,3 +54,9 @@ fi
 echo
 echo "Watch this run with a 3-minute ScheduleWakeup tick. Do not block on"
 echo "\`gh run watch\`, and do not sleep-poll in-band."
+
+if [ "$HOOK_STATUS" -ne 0 ]; then
+  echo
+  echo "The post-push hook failed (see above); the push itself succeeded." >&2
+fi
+exit "$HOOK_STATUS"

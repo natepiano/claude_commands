@@ -104,3 +104,6 @@ if [[ -n "$MERGE_SHA" ]]; then
 else
   echo "Merged PR #${PR_NUMBER}. CI was green before merge."
 fi
+
+# The default branch has landed; run the repo's post-push hook, if it has one.
+bash "${SCRIPT_DIR}/post_push_hook.sh" "$DEFAULT_BRANCH" "$(git rev-parse HEAD)"

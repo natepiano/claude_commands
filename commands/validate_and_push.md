@@ -4,7 +4,7 @@ description: Run local CI validation, push to origin, and monitor GitHub CI
 
 Run `~/.claude/scripts/validate_and_push/validate_and_push.sh` with `dangerouslyDisableSandbox: true`.
 
-The script runs local validation, chooses the push path, and pushes directly when branch rules allow it. It does **not** watch CI — on the direct path it stops after the push and prints a `=== CI HANDOFF TO AGENT ===` block with the repo, branch, SHA, and run id. Watching is yours, and you drive it with the tick loop in <WatchCI/>.
+The script runs local validation, chooses the push path, and pushes directly when branch rules allow it. When the default branch lands, on either path, it runs the repo's post-push hook if one exists: `.claude/config/post_push.sh` at the repo root, run with `LANDED_SHA` and `LANDED_BRANCH` set (hana uses it to regenerate and push its public mirror). A hook failure is reported after the push and is the script's exit status; the push itself is never rolled back. It does **not** watch CI — on the direct path it stops after the push and prints a `=== CI HANDOFF TO AGENT ===` block with the repo, branch, SHA, and run id. Watching is yours, and you drive it with the tick loop in <WatchCI/>.
 
 Validation requires a clean worktree. Before strict validation, the script automatically applies every fix that cargo-mend marks as machine-applicable; these fixes do not require user approval. Rustfmt and taplo also run in write mode. After each successful fix step, any resulting changes are amended into the last commit (`git commit --amend --no-edit`) and validation continues automatically. Clippy runs only in strict check mode; any findings stop validation for manual fixes.
 
