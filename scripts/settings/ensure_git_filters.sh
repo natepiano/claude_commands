@@ -78,6 +78,15 @@ ensure_watcher() {
     live_dir="$(cd "${CLAUDE_CONFIG_DIR:-$HOME/.claude}" 2>/dev/null && pwd)" || return 0
     [[ "$REPO_ROOT" == "$live_dir" ]] || return 0
 
+    # nix-darwin owns this watcher now (modules/darwin/claude-git-filters.nix
+    # loads it as org.nixos.claude-git-filters). While that agent is loaded the
+    # legacy plist must stay gone: recreating it here re-registers a second
+    # copy on every session start, which is what kept undoing the Stage 4
+    # step 9a removal.
+    if launchctl print "gui/$(id -u)/org.nixos.claude-git-filters" >/dev/null 2>&1; then
+        return 0
+    fi
+
     local dst="$HOME/Library/LaunchAgents/$GIT_FILTERS_LABEL.plist"
     local watch_paths="" entry desired
     for entry in "${GIT_FILTERS[@]}"; do
