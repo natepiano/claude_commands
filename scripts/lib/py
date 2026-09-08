@@ -8,8 +8,9 @@
 # silently failed there. Choosing by VERSION rather than by path works on both.
 #
 # Order: explicit override first, then PATH -- correct on NixOS, and on a Mac
-# whose PATH puts homebrew ahead of /usr/bin -- then homebrew's usual locations
-# for a Mac whose PATH does not.
+# whose PATH puts homebrew ahead of /usr/bin -- then the nix-darwin system and
+# per-user profiles (a session started before nix reached PATH still finds
+# them), then homebrew's usual locations for a Mac whose PATH does not.
 set -uo pipefail
 
 NEED_MAJOR=3
@@ -20,7 +21,9 @@ new_enough() {
     "$1" -c "import sys; sys.exit(0 if sys.version_info >= ($NEED_MAJOR, $NEED_MINOR) else 1)" 2>/dev/null
 }
 
-for candidate in "${CLAUDE_PYTHON:-}" python3 /opt/homebrew/bin/python3 /usr/local/bin/python3; do
+for candidate in "${CLAUDE_PYTHON:-}" python3 \
+    /run/current-system/sw/bin/python3 "/etc/profiles/per-user/${USER:-}/bin/python3" \
+    /opt/homebrew/bin/python3 /usr/local/bin/python3; do
     [ -n "$candidate" ] || continue
     if new_enough "$candidate"; then
         exec "$candidate" "$@"
