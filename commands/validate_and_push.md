@@ -33,7 +33,7 @@ If any validation, push, or merge command fails, stop and report the failing ste
 
 <WatchCI>
 Watch the run on a **3-minute `ScheduleWakeup` tick**. Each tick is one status
-query, one status line to the user, and one re-arm. Nothing else.
+query, one stage-status table to the user, and one re-arm. Nothing else.
 
 **Never block on CI and never poll in-band.** No `gh run watch`, no
 `run_in_background` watcher, no `sleep`/`until` loop, no repeated queries inside
@@ -43,28 +43,60 @@ for half an hour and defers diagnosis of a red job until the whole run settles.
 Every `gh` call takes `dangerouslyDisableSandbox: true` — the sandbox network
 proxy breaks its TLS verification.
 
-**Each tick, run exactly this** (substitute repo and run id), then report:
+**Each tick, run exactly this** (substitute repo and run id):
 
 ```bash
 date '+%H:%M:%S %Z'
 gh run view <run-id> --repo <owner/repo> \
   --json createdAt,status,conclusion,jobs \
-  --jq '"created: \(.createdAt)  status: \(.status)  conclusion: \(.conclusion)",
-        (.jobs[] | select(.status != "completed" or .conclusion != "success")
-         | "\(.status) \(.conclusion // "-") \(.name) [\(.databaseId)]")'
+  --jq 'def secs: if . >= 60 then "\((./60)|floor)m \((.%60)|floor)s" else "\(.|floor)s" end;
+        def icon: if .status != "completed" then "…"
+                  elif .conclusion == "success" then "green"
+                  elif .conclusion == "skipped" then "skipped"
+                  elif .conclusion == "cancelled" then "cancelled"
+                  else "RED" end;
+        ((.createdAt|fromdateiso8601) as $c | (now - $c)) as $elapsed
+        | ([.jobs[]|select(.conclusion=="success")]|length) as $g
+        | ([.jobs[]|select(.conclusion=="skipped")]|length) as $s
+        | "run \(.status) \(.conclusion // "-") · elapsed \($elapsed|secs) · \($g) of \(.jobs|length) green\(if $s > 0 then " (\($s) skipped)" else "" end)",
+          "| stage | status | time |",
+          "|---|---|---|",
+          (.jobs[]
+           | (if .startedAt == null or (.startedAt|startswith("0001")) then null
+              else (.startedAt|fromdateiso8601) end) as $b
+           | (if .completedAt == null or (.completedAt|startswith("0001")) then now
+              else (.completedAt|fromdateiso8601) end) as $e
+           | "| \(.name) | \(icon) | \(if $b == null then "-" else (($e-$b)|secs) end) |")'
 ```
 
-The `select` prints only jobs that are not yet green, so the tick output shrinks
-as the run progresses and a red job is impossible to miss. Drop the `select` on
-the first tick to record the full job list.
+Never write `\"` inside the `--jq '...'` expression. The shell's single quotes
+already protect the double quotes, and the backslashes make jq fail to parse
+with `unexpected token "\\"`.
 
-**Lead every report with the clock time and the run's elapsed time**, computed
-from `createdAt`. Format:
+The command emits the finished table, ready to paste. It prints **every stage on
+every tick**, not only the ones still moving, so each report is a standing
+picture of the run instead of a diff the user has to reassemble from earlier
+ticks. A stage that has not started yet shows `-` for time; a running one shows
+time elapsed so far, recomputed at each tick.
 
-`**18:54:05 EDT** · run 32533199159 elapsed **24m 10s** · **11 of 12 green**`
+`skipped` is a normal conclusion for a conditional stage, not a failure. It is
+excluded from the green count, which is why a fully successful run can read
+`9 of 11 green (2 skipped)`. Never report a skipped stage as broken or as
+blocking the run — the run-level `conclusion` is what settles it.
 
-Then one line on what is left, or what broke. That is the whole report — a tick
-where nothing changed is two lines, not a recap.
+**Lead every report with the clock time and the run's elapsed time**, then the
+table:
+
+`**18:54:05 EDT** · run 32533199159 elapsed **24m 10s** · **9 of 11 green (2 skipped)**`
+
+| stage | status | time |
+|---|---|---|
+| Format Check | green | 17s |
+| Test Suite | … | 4m 55s |
+| cargo-mend Build Check | skipped | 0s |
+
+Then at most one line on what is left, or what broke. The table carries the
+detail — do not narrate it back row by row, and do not recap earlier ticks.
 
 **Re-arm before ending the turn**, always with `delaySeconds: 180`:
 
