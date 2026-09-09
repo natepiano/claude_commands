@@ -43,7 +43,16 @@ if command -v launchctl >/dev/null 2>&1; then
         echo "launchd: not loaded"
     fi
 elif command -v systemctl >/dev/null 2>&1; then
-    echo "systemd: $(systemctl --user is-active hanadocs-prioritize.service 2>/dev/null || echo unknown)"
+    # `is-active` answers `inactive` for a unit that does not exist as readily as
+    # for one that is merely stopped, and exits nonzero in both cases -- so the
+    # old `|| echo unknown` fired on top of output that was already there and
+    # emitted both words. Ask whether the unit is loaded first, which is what the
+    # launchctl branch above asks; `systemctl cat` exits 1 when it is not.
+    if systemctl --user cat hanadocs-prioritize.service >/dev/null 2>&1; then
+        echo "systemd: $(systemctl --user is-active hanadocs-prioritize.service 2>/dev/null)"
+    else
+        echo "systemd: not loaded"
+    fi
 else
     echo "service manager: none recognized"
 fi
