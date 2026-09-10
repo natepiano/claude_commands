@@ -194,6 +194,7 @@
       "allowWrite": [
         "~/.cargo",
         "~/.claude",
+        "~/.local/state/gh-1password",
         "~/.local/state/plan-delegate",
         "~/Library/Application Support",
         "~/Library/Caches/Mozilla.sccache",
