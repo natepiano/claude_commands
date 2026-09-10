@@ -177,7 +177,7 @@
     "rust-analyzer-lsp@claude-plugins-official": false
   },
   "sandbox": {
-    "enabled": true,
+    "enabled": false,
     "autoAllowBashIfSandboxed": true,
     "allowUnsandboxedCommands": true,
     "network": {
