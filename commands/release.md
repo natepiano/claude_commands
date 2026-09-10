@@ -383,7 +383,7 @@ curl -s "https://crates.io/api/v1/crates/${CRATE_NAME}" | jq -r '.crate.max_vers
   - Published README: Check `{dir}/Cargo.toml` for explicit `readme` field → resolve path relative to crate dir. Otherwise `{dir}/README.md` if it exists. Only these ship to crates.io.
 - Root README (`README.md`): tracked separately as **project README** — not published to crates.io for workspace projects. Only included in STEP 3 if it contains hardcoded version references.
 
-**Detect GitHub repo** (uses git remote to avoid sandbox TLS issues with `gh`):
+**Detect GitHub repo**:
 ```bash
 git remote get-url origin | sed 's|.*github.com[:/]||;s|\.git$||'
 ```
@@ -750,7 +750,7 @@ For workspace projects with multiple changelogs, format as:
 
 For single-crate projects, use the entries directly. In single-package mode, use the selected crate's entries directly (treat it like a single-crate project).
 
-**Write the release notes and run the script in a single unsandboxed command** (combining them avoids sandbox `$TMPDIR` mismatches):
+**Write the release notes and run the script in a single command** — the heredoc and the script that consumes it stay together:
 ```bash
 NOTES_FILE="$TMPDIR/release-notes-${VERSION}.md"
 cat > "$NOTES_FILE" << 'NOTES_EOF'
