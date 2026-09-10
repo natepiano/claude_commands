@@ -47,6 +47,19 @@ MANUAL_LOG_RETENTION_DAYS=7
 source "$SCRIPT_DIR/agent_assignments.sh"
 export PATH="/opt/homebrew/bin:$HOME/.local/bin:$PATH"
 
+# Cargo defaults to one job per core. This box has 32, and the link step for a
+# Bevy test binary runs to several GB, so an unrestricted `cargo test --no-run`
+# on a Bevy workspace can claim the whole machine. Measured 2026-09-10: a
+# bevy_brp fix run drove the user slice to 62.8 GB of 64.4 GB and filled the
+# entire 8 GB swapfile; the run died mid-build with no error and no exit
+# sentinel. Nothing OOM-killed it -- every kernel, cgroup and systemd-oomd
+# counter reads zero -- memory simply ran out underneath it. 24 leaves room for
+# the desktop session, the CI runner and the agents' own processes. The cap
+# lives here rather than in ~/.cargo/config.toml because that file is a
+# read-only symlink into the nix store, and because interactive builds should
+# stay uncapped. A caller may still override it.
+export CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-24}"
+
 mkdir -p "$LOG_DIR"
 # The pipeline runs every 10 minutes around the clock. Keep roughly one
 # day of scheduled logs plus a short manual-log window so report lists stay

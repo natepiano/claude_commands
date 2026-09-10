@@ -36,6 +36,11 @@ export PATH="$HOME/.local/bin:$PATH"
 # guard as fix.sh.
 [[ -f "$HOME/.cargo/env" ]] && source "$HOME/.cargo/env"
 
+# Same cap as fix.sh, repeated because this script is its own entry point: it
+# is called directly for a single project and cannot rely on the orchestrator
+# having exported it.
+export CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-24}"
+
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 
 # python3 goes through the repo shim, which picks an interpreter by VERSION
