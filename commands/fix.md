@@ -38,7 +38,7 @@ The `run` forms can take an optional project name:
 
 `<project>` may be either the active checkout name shown in the usage table's `Project` column or the preserved identity shown in `Project Key`. The scripts normalize both through `[active_checkout]`; do not create duplicate style entries for active worktrees.
 
-**Hard requirement: must run unsandboxed.** The script invokes `codex` and `claude`, which need write access to `~/.codex/sessions` and to many paths outside the sandbox allowlist. Per `~/.claude/CLAUDE.md` ("codex and fix pipeline scripts must run unsandboxed"), **always** invoke this with `dangerouslyDisableSandbox: true` from the start. Do not try the sandboxed run first — it will fail.
+**Always invoke this with `dangerouslyDisableSandbox: true` from the start.** The script launches `codex` and `claude`, which write to `~/.codex/sessions` and to many paths outside this tree.
 
 **Step 1: Refuse to launch if the fix pipeline is already running.** A second concurrent run will collide with the first one's worktrees and history files. Before launching, check:
 

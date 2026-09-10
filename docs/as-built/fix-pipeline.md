@@ -136,10 +136,6 @@ It draws three independent enablement diamonds (`eval_enabled`, `review_enabled`
 
 ## Invariants
 
-**Protected paths.** `CLAUDE.md`, `settings.json`, and the `commands/`, `skills/`, `hooks/`, `agents/` directories are excluded from the write sandbox. Edit them with the Edit/Write tools only — shell redirection, `sed -i`, and `mv` fail with `Operation not permitted`, and `dangerouslyDisableSandbox` is the wrong fix for this specific case (it is a deliberate config guard, not a proxy or IPC limitation).
-
-**Unsandboxed commands.** `launchctl`, and any `rm`/`ln` under `~/Library/LaunchAgents`, must run with `dangerouslyDisableSandbox: true` from the start. So must any invocation of the pipeline scripts themselves — they launch `codex` and `claude`, which need write access to `~/.codex/sessions` and to paths outside the sandbox allowlist. Do not try a sandboxed run first.
-
 **Bash 3.2.** Every `.sh` in this tree runs under macOS system bash with `#!/bin/bash`. No associative arrays, no `${var,,}`, no bash-4 constructs.
 
 **basedpyright at zero errors and zero warnings.** `pyrightconfig.json` carries an execution environment rooted at `scripts/fix`. Never use a file-level type ignore (`# pyright: reportAny=false`). Avoid `Any`; annotate signatures; use `TypedDict` for known-key dicts. A line-level `# pyright: ignore[...]` is the last resort.

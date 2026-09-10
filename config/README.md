@@ -49,9 +49,7 @@ config decides whether a check runs, never with what flags.
 
 `scripts/lint/lint_config.sh` is both the reader and the editor: source it and
 call `lint_config_enabled <op>` (plus `lint_config_skip_notice <op> <what>` for
-the SKIPPED line), or run it as the `/lint_config` CLI. Edits need
-`dangerouslyDisableSandbox: true` — the sandbox denies writes under
-`~/.claude/config`.
+the SKIPPED line), or run it as the `/lint_config` CLI.
 
 ## clippy.conf
 
@@ -111,8 +109,7 @@ no limit has a compiled default, so a missing key, a non-numeric value, or a
 value below its minimum makes `findings.py` list every problem it found and
 exit 2 before running the command. `PLAN_DELEGATE_CONFIG` overrides the path,
 which is how `test_findings.py` supplies its own limits rather than this
-machine's. Edits need `dangerouslyDisableSandbox: true` — the sandbox denies
-writes under `~/.claude/config`.
+machine's.
 
 ## cargo-fmt-exclusions.json
 
