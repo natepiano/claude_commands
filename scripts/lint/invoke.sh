@@ -185,7 +185,11 @@ invoke_doc() {
 # dependency on every pass and still never fits.
 # The knobs are LINT_-prefixed on purpose: sccache hashes every CARGO_*
 # variable into its cache key. --dry-run passes through to cargo sweep and
-# turns the prune into a listing. A missing cargo-sweep is an error, not a
+# turns the prune into a listing. A fresh target reports "nothing" at the
+# default window for a month, so the positive control that separates a
+# working sweep from a no-op is LINT_SWEEP_DAYS=0 lint sweep --dry-run: it
+# lists the whole evictable pool (25.64 GiB on natedev's hana the day the
+# window replaced the cap) while LINT_SWEEP_DAYS=30 lists nothing. A missing cargo-sweep is an error, not a
 # skip: a sweep that silently does nothing is the unbounded growth this exists
 # to stop.
 invoke_sweep() {
