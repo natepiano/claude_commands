@@ -47,10 +47,64 @@ entry cites an upstream fix that applies only because the local build predates i
 ### Reading a Linux row
 
 Every Linux row in the section means **no override needed here**, never *the
-Linux sandbox permits this*. Exit 0 in a default call cannot separate a live
-sandbox permitting the command from a sandbox that never applied to it. natedev
-corrected two of its own rows on this point (2026-09-10) after writing "On Linux
-`gh` runs sandboxed" when what it had measured was that `gh` works.
+Linux sandbox permits this*. natedev corrected two of its own rows on this point
+(2026-09-10) after writing "On Linux `gh` runs sandboxed" when what it had
+measured was that `gh` works.
+
+**The cause is now known, and it replaces the limit this section used to stop
+at.** The old wording said only that exit 0 in a default call cannot separate a
+live sandbox permitting the command from one that never applied — a statement
+about what a reader may conclude. It can now be put positively: **the sandbox
+cannot engage on the Linux machine at all.** Claude Code's Linux sandbox needs
+`bwrap` and `socat`, and neither is on `PATH` there — bubblewrap sits in the nix
+store only as a dependency of flatpak, fwupd, gnome-desktop and
+xdg-desktop-portal, never installed into a profile, and nothing in `/etc/nixos`
+installs either binary. Claude Code says so at startup: *sandbox is enabled but
+dependencies are missing … Commands will run WITHOUT sandboxing. Network and
+filesystem restrictions will NOT be enforced.* So `sandbox.enabled: true` and the
+whole `allowWrite`/`allowedDomains` block are inert there, and every Linux
+measurement either session has ever taken was taken in an unsandboxed shell.
+
+natedev found it 2026-09-10 while reproducing the Mac's `continue`-alias defect,
+which launched a nested Claude that printed the warning neither session had seen
+before. It checked the two binaries directly rather than resting on the message.
+
+**Every operational conclusion survives; only the reasoning beneath them is
+replaced.** "No override needed here" was correct each time it was written. So is
+the reading rule, now for a better reason: a Linux row still never means *the
+Linux sandbox permits this*, because there is nothing there to permit it.
+
+### A negative result carries the moment it was taken
+
+Measured 2026-09-10 on this Mac. A peer named a commit, `cf35d6ac`, and I
+reported it nonexistent on three checks: absent from `git cat-file` in all 17
+checkouts on this machine; HTTP 422 `No commit found for SHA` from `gh api
+repos/natepiano/hana/commits/cf35d6ac`, and the same for `bevy_brp`; and not the
+`headSha` of the CI run that had been cited. Every one was correct when taken.
+Two were false within minutes — the commit was real, pushed from a machine that
+is not this one, shortly after I asked.
+
+**What each negative measured, against what it was reported as:**
+
+- the local sweep measured *absent from this Mac*, and was read as *absent*
+- the 422 measured *not pushed as of the instant of that call*, and was read as
+  *nonexistent*
+- the `headSha` check concerned a fixed property of a completed run, and it held
+
+Only the third was about something that could not move underneath the answer.
+
+**This and the Linux row fail alike and need different cures** — natedev's
+distinction, and the reason the two sit next to each other. A stale negative was
+a real measurement of a real thing, so re-running it repairs it. A Linux row was
+never a measurement of what the reader took it for, so re-running it a hundred
+times yields the same exit 0 and the same wrong reading. Refresh the first;
+re-derive the second.
+
+**How to apply:** date a negative when you record one, and never let a negative
+about a shared remote stand as a property of the world. Re-run it immediately
+before acting on it, and name the machine and the moment it belongs to. The
+positive form needs none of this care — a commit that exists cannot stop existing
+underneath you.
 
 ### The built-in category is measurable in one direction only
 
