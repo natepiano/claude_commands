@@ -73,14 +73,16 @@ ls -t ~/.local/logs/fix/fix-*.log 2>/dev/null | head -1
 
 Tell the user: `Fix pipeline launched (shell <id>). Log: <path>.`
 
-**Step 4: Offer to arm the monitor.** In the same response, offer one short follow-up: `Want me to /fix monitor to stream phase transitions?` If the user says yes, execute <Monitor/> with no arguments. If they decline, stop.
+**Step 4: Arm the monitor. Automatically, without asking.** Execute <Monitor/> with no arguments as part of this same turn. Do not offer it, do not ask permission, do not wait for the user to request it — an interactive run is watched by definition, because the only reason to launch one from here rather than let the timer do it is to see it happen.
+
+This step is the interactive path only. The scheduled job never reaches it: `style-fix.timer` and the `org.nixos.style-fix` launchd agent invoke `fix.sh` directly through `fix-trigger.sh`, with no agent and no conversation to report into. `FIX_SCHEDULED=1` marks that path. Nothing here should arm a monitor when that marker is set.
 
 ### Notes
 
 - The full run can take an hour or more. The user does not need to keep this conversation open — the script runs detached and writes to disk.
 - `run` is the on-demand counterpart to the scheduled job; the schedule is unaffected. If a timer-triggered run is already in flight, Step 1 will catch it.
 - For testing only the review stage in isolation, prefer `~/.claude/scripts/fix/style-eval-review-all.sh [project]` — much faster than a full fix run. Called directly like this it also ignores stage enablement, for the same reason `/fix run` does.
-- Use `/fix report` after the run for a per-project matrix, or `/fix monitor` during the run for live updates.
+- Use `/fix report` after the run for a per-project matrix. Live updates need no command — Step 4 already armed the monitor.
 
 </Run>
 
@@ -147,6 +149,8 @@ It refuses collisions with an existing new key; it does not merge histories.
 
 Attach a persistent Monitor to whichever fix-related script the user just kicked off (style evaluation, style-fix worktrees, or the full orchestrator) and surface meaningful state transitions in real time. Skip the high-volume noise (SKIP lines, raw cargo output) — only emit lines the user would act on.
 
+**This section is normally reached from <Run/> Step 4, not typed.** An interactive `/fix run` arms it automatically; the user should never have to ask for it and should never be offered it. Typing `/fix monitor` remains valid for the one case Step 4 cannot cover: attaching to a run this conversation did not start — a scheduled run already in flight, or an interactive one from an earlier session.
+
 `monitor` takes no arguments. If the user passes any token after `monitor`, ignore the token and run the normal detection path.
 
 ### <DetectLog/>
@@ -154,6 +158,7 @@ Attach a persistent Monitor to whichever fix-related script the user just kicked
 Inspect the well-known log locations and pick the single most recently modified log within the last 2 hours. Older candidates are stale — do not pick them.
 
 ```bash
+bash -c '
 now=$(date +%s)
 for f in \
   ~/.local/logs/fix.log \
@@ -168,9 +173,12 @@ do
   m=$(stat -Lc %Y "$f" 2>/dev/null || stat -Lf %m "$f" 2>/dev/null) || continue
   echo "$((now - m))	$f"
 done | sort -n | head -5
+'
 ```
 
 Each line is `<age-in-seconds><TAB><path>`, freshest first. `stat -Lc %Y` is the GNU spelling and `stat -Lf %m` the BSD one, so this runs unchanged on both machines; `-L` matters because `~/.local/logs/fix.log` is a symlink to the newest run log and the link's own mtime stops moving once the run starts. A candidate is fresh when its age is under 7200 seconds.
+
+The `bash -c` wrapper is required, not stylistic. Both machines default to zsh, and the Bash tool runs the command under that shell. When a glob in the `for` list matches nothing — `style-fix-manual-*.log` whenever no manual run has happened — zsh treats it as an error, prints `no matches found: …` and never enters the loop, so detection returns nothing and the monitor looks like it found no logs. Bash leaves an unmatched pattern as a literal word, which the `[ -f "$f" ]` guard then skips, which is the behavior this loop is written for. Measured 2026-09-10: the unwrapped form failed here on the first glob and reported no candidates while a run was actively writing `~/.local/logs/fix.log`. Do not "simplify" this by removing the wrapper, and do not fix it with `setopt null_glob` — that is zsh-only and would break the Mac.
 
 Decision:
 - **Fresh candidate found** — set `${LOG_PATH}` to the newest fresh candidate and tell the user `Watching ${LOG_PATH} (last write Ns ago).` Proceed to <ArmMonitor/>.
