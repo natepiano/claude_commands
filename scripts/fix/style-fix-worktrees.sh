@@ -697,6 +697,32 @@ create_and_fix() {
     cp "$HOME/.claude/templates/settings_local.json" "$worktree_dir/.claude/settings.local.json"
     echo "[diag $proj] after settings.local.json copy"
 
+    # A worktree materializes the repo's tracked .envrc at a new absolute path,
+    # and direnv keys its allow database on that path -- so the copy arrives
+    # unauthorized, the devShell never loads, and rust-analyzer starts with no
+    # toolchain env. The editor then shows the fix worktree with lints it could
+    # not run, which reads as a broken fix rather than a missing shell.
+    # Inherit the source checkout's authorization rather than granting a fresh
+    # one: allow only when the two .envrc files are byte-identical AND the
+    # source is already allowed, so this can never trust an .envrc the user has
+    # not. `direnv status --json` needs direnv 2.33+; on anything older the
+    # parse yields nothing, the guard fails closed, and the worktree is simply
+    # left unauthorized as before.
+    if [[ -f "$worktree_dir/.envrc" ]] && command -v direnv >/dev/null 2>&1; then
+        local src_allowed
+        src_allowed="$(cd "$repo_dir" && direnv status --json 2>/dev/null \
+            | "$PY" -c 'import json,sys; print(json.load(sys.stdin)["state"]["foundRC"]["allowed"])' 2>/dev/null)"
+        if cmp -s "$repo_dir/.envrc" "$worktree_dir/.envrc" && [[ "$src_allowed" == "0" ]]; then
+            if direnv allow "$worktree_dir" 2>>"$log_file"; then
+                echo "[diag $proj] direnv allow: inherited authorization from $repo_dir"
+            else
+                echo "[diag $proj] direnv allow: command failed (worktree left unauthorized)"
+            fi
+        else
+            echo "[diag $proj] direnv allow: skipped (source allowed=${src_allowed:-unknown}, .envrc match=$(cmp -s "$repo_dir/.envrc" "$worktree_dir/.envrc" && echo yes || echo no))"
+        fi
+    fi
+
     # Materialize pending evaluation markdown only as a scratch handoff. Do not
     # write an evaluation markdown file into the style-fix worktree.
     mkdir -p "$(dirname "$scratch_eval")"
