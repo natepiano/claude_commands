@@ -21,6 +21,8 @@ Usage:
   lint doc [args...]              cargo doc, warnings denied
   lint fmt [args...]              cargo +nightly fmt --all
   lint nextest [args...]          cargo nextest run
+  lint sweep [args...]            cargo sweep: cap the target directory
+                                  (cargo-port's last lint command)
 
 Scope is resolved per run: mend, clippy, clippy-tests, doc, and nextest cover
 only the workspace members the working tree changed, widening to --workspace
@@ -30,9 +32,12 @@ scope yourself and skip resolution — gates that must cover everything
 (validate_ci.sh) pass --workspace explicitly. --manifest-path does NOT skip
 resolution: it names a manifest, not a package set, so resolution runs against
 that manifest's tree instead of the working directory. fmt is always --all: it
-compiles nothing, so the wider scope is free.
+compiles nothing, so the wider scope is free. sweep takes no scope either: it
+caps the target directory of the workspace in the current directory,
+cargo-port's cwd, and runs last in each of its lint runs. LINT_SWEEP_MAXSIZE
+(default 40GB) and LINT_SWEEP_INCREMENTAL_DAYS (default 14) tune it.
 
-mend/clippy/doc/fmt honor config/lint.conf (edit with /lint_config);
+mend/clippy/doc/fmt/sweep honor config/lint.conf (edit with /lint_config);
 LINT_CONFIG_FORCE=1 overrides the gate — push and release gates set it on
 steps they never allow to skip. Extra args (--manifest-path, --fix, --target,
 "-- <clippy lints>") pass through unchanged.
@@ -93,6 +98,7 @@ case "$CMD" in
   fmt)          fmt_cargo --all "$@" ;;
   nextest)      resolve_scope "$@"
                 run_nextest ${SCOPE[@]+"${SCOPE[@]}"} "$@" ;;
+  sweep)        invoke_sweep "$@" ;;
   --help|-h)    usage ;;
   *)
     usage >&2

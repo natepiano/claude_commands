@@ -164,3 +164,58 @@ invoke_doc() {
     fi
     run env RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --all-features "$@"
 }
+
+# Bound a project's target directory after cargo-port's per-save lint run, so
+# the cache stays warm without growing without limit. Runs from the project
+# root (cargo-port's cwd) and never resolves package scope: the cap is a
+# property of the target directory, not of which members changed. Three
+# passes, cheapest first:
+#   --installed drops output from toolchains rustup no longer has; a toolchain
+#     update orphans everything the old one compiled.
+#   --maxsize evicts oldest-compiled output until the directory fits. Stable
+#     cargo records compile time, not last use, so the first crossing can evict
+#     live dependencies once; LINT_SWEEP_MAXSIZE needs room above the working
+#     set, roughly double.
+#   incremental/ is invisible to cargo-sweep, so a find prunes its per-crate
+#     dirs untouched for LINT_SWEEP_INCREMENTAL_DAYS.
+# The knobs are LINT_-prefixed on purpose: sccache hashes every CARGO_*
+# variable into its cache key. --dry-run passes through to cargo sweep and
+# turns the prune into a listing. A missing cargo-sweep is an error, not a
+# skip: a sweep that silently does nothing is the unbounded growth this exists
+# to stop.
+invoke_sweep() {
+    if ! lint_config_enabled sweep; then
+        lint_config_skip_notice sweep "cargo sweep"
+        return 0
+    fi
+    if ! cargo sweep --version >/dev/null 2>&1; then
+        echo "cargo sweep is required: pkgs.cargo-sweep is missing from the nix dev module" >&2
+        exit 2
+    fi
+    local maxsize="${LINT_SWEEP_MAXSIZE:-40GB}"
+    local days="${LINT_SWEEP_INCREMENTAL_DAYS:-14}"
+    local dry_run=0 arg
+    for arg in "$@"; do
+        [[ "$arg" == "--dry-run" ]] && dry_run=1
+    done
+    run cargo sweep --installed "$@" .
+    run cargo sweep --maxsize "$maxsize" "$@" .
+    local target
+    target="$(cargo metadata --format-version 1 --no-deps \
+        | sed -n 's/.*"target_directory":"\([^"]*\)".*/\1/p')"
+    if [[ -z "$target" || ! -d "$target" ]]; then
+        echo "lint sweep: no target directory to prune"
+        return 0
+    fi
+    # Direct children of any incremental/ dir: one per crate, its mtime bumped
+    # by every incremental compile of that crate.
+    local -a find_args=("$target" -maxdepth 5 -type d -path '*/incremental/*'
+                        ! -path '*/incremental/*/*' -mtime +"$days" -prune)
+    if [[ $dry_run -eq 1 ]]; then
+        printf '+ (dry run) prune incremental dirs untouched for %s days under %s\n' "$days" "$target"
+        find "${find_args[@]}" -print
+    else
+        printf '+ prune incremental dirs untouched for %s days under %s\n' "$days" "$target"
+        find "${find_args[@]}" -print -exec rm -rf {} +
+    fi
+}

@@ -28,6 +28,7 @@ LINT_CONFIG_OPS=(
     "clippy|cargo clippy|/clippy clippy stage · invoke.sh clippy (lint CLI, fix pipeline, verify.sh lint)"
     "doc|cargo doc with -D warnings|/clippy doc stage · invoke.sh doc (lint doc)"
     "fmt|cargo +nightly fmt|/clippy format stage · invoke.sh fmt (lint fmt, verify.sh lint/fmt/final)"
+    "sweep|cargo sweep target-directory cap and stale incremental prune|invoke.sh sweep (lint sweep, cargo-port's last lint command)"
 )
 
 _lint_config_op_names() {
