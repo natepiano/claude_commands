@@ -32,6 +32,7 @@
       "Bash(git status *)",
       "Bash(git tag *)",
       "Bash(git worktree *)",
+      "Bash(kill:*)",
       "Bash(mkdir *)",
       "Bash(rg *)",
       "Bash(run_test.sh *)",
