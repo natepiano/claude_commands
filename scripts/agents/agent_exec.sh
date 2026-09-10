@@ -98,16 +98,22 @@ agents_exec_main() {
             else
                 command+=(--sandbox read-only)
             fi
-            command+=(-C "$working_dir" -o "$output_file" "$prompt")
+            # The prompt goes in on stdin, never as an argument: a broad review
+            # prompt carries the whole phase diff, and Linux caps one argv
+            # string at 128 KiB, so an argument form dies with
+            # "Argument list too long" (exit 126) before codex starts.
+            command+=(-C "$working_dir" -o "$output_file" -)
 
             if [[ "${AGENT_EXEC_DRY_RUN:-}" == "1" ]]; then
                 agents_exec_print_argv "${command[@]}"
+                printf ' < '
+                printf '%q' "$prompt_file"
                 printf ' > '
                 printf '%q' "$log_file"
                 printf ' 2>&1\n'
                 return 0
             fi
-            "${command[@]}" > "$log_file" 2>&1
+            "${command[@]}" < "$prompt_file" > "$log_file" 2>&1
             ;;
         claude)
             family_args_line="$(agents_claude_args)"
