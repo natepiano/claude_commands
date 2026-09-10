@@ -39,7 +39,10 @@ FIX_CONF_FILE = Path(
         str(Path.home() / ".claude" / "scripts" / "fix" / "fix.conf"),
     )
 )
-LOG_DIR = Path(os.environ.get("STYLE_HISTORY_LOG_DIR", "/private/tmp/claude"))
+# /tmp/claude, not /private/tmp/claude: on macOS /tmp *is* /private/tmp, and
+# on Linux /private does not exist. Must stay in step with LOG_DIR in the
+# three stage scripts — they hand paths under it to this helper.
+LOG_DIR = Path(os.environ.get("STYLE_HISTORY_LOG_DIR", "/tmp/claude"))
 
 # Stop reasons that mean the helper itself declared the run finished. A pending
 # whose stop_reason is anything else was abandoned mid-run (agent quit early,

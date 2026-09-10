@@ -2,7 +2,11 @@
 
 Automated style evaluation, evaluation review, and style-fix pipeline for opt-in Rust projects under `~/rust/`.
 
-Runs every 10 minutes via launchd.
+Runs every 10 minutes on both machines. The schedule is declared once in
+`/etc/nixos/modules/common/style-fix.nix` and rendered per platform by
+`nate.jobs`: a systemd user timer on Linux (`style-fix.timer`), a launchd user
+agent on macOS (`org.nixos.style-fix`, logging to
+`~/Library/Logs/nate-jobs/style-fix.log`). Both exec `fix-trigger.sh`.
 
 ## Files
 
@@ -10,15 +14,16 @@ Runs every 10 minutes via launchd.
 
 | File | Purpose |
 |------|---------|
-| `fix.sh` | Main entry point. Accepts an optional project filter or the literal `run_once`, which forces one evaluation + review + fix pass across all projects. `run_once` overrides only the three stage switches, so normal per-project safety and eligibility skips still apply. Emits a fix log that `/fix report` can render on demand. |
+| `fix.sh` | Main entry point. Accepts an optional project filter. Runs all three stages unless `FIX_SCHEDULED=1` is set (only `fix-trigger.sh` sets it), in which case the `enabled=` switches in `agent-assignments.conf` decide which stages run. Per-project safety and eligibility skips always apply. Emits a fix log that `/fix report` can render on demand. |
 | `fix-usage.sh` | Emits the no-argument `/fix` usage screen as preformatted Markdown with fixed-width, wrapped text blocks. `--json` exposes the same usage, agent, and project data for validation/tools. |
 | `fix.conf` | Pipeline configuration. `[projects]` is the opt-in allowlist for evaluation, review, and fixing; there is no deny list. Permissions back-population is repository-wide and visits every non-dot directory under `~/rust/` independently of the allowlist. Also contains the optional `[active_checkout]` redirect map (point a project's eval/fix at a worktree while keeping its identity/history), style quotas, timeouts, and project environment. No agent settings live here. |
 | `project_add.py` | Adds a project to `[projects]` only. Accepts checkout names, paths under `~/rust`, absolute paths, and `Cargo.toml` paths; workspace members are written as workspace-relative entries so their identity/history key stays the member directory name. |
 | `project_rename.py` | Renames a fix project key after a checkout/member path changes. Updates `[projects]`, `[active_checkout]`, and `[project_env]` entries and migrates history JSONL, pending JSON/lock, failure logs, and `.fix-project` markers. Refuses collisions instead of merging histories. |
 | `agent-assignments.conf` | Fix stage enablement. `[style_eval]`, `[style_eval_review]`, and `[style_fix]` each own only `enabled=`; family, agent, and effort assignments live under `[fix.<family>]` in `~/.claude/config/agents.conf`. |
 | `agent_assignments.sh` | Fix Bash helper for loading the three stage switches and resolving family, agent, and effort for `style_eval`, `style_eval_review`, and `style_fix` through `agents_resolve fix.<stage>`. |
-| `com.natemccoy.style-fix.plist` | launchd plist — triggers the pipeline every 10 minutes (no idle gate). |
-| `setup.sh` | Idempotent setup script — installs the one launchd agent, creates runtime directories, and retires the old pre-split agent. |
+| `fix-trigger.sh` | What the timer runs on both platforms: a `pgrep` guard against an in-flight `fix.sh`, then `FIX_SCHEDULED=1 exec fix.sh`. |
+| `com.natemccoy.style-fix.plist` | Retired. The hand-written launchd agent, kept only as the rollback target snapshotted into the Mac's `~/nixos-recovery/`. Not loaded; nix declares the schedule now. |
+| `setup.sh` | Retired stub. It used to bootstrap the plist above; it now refuses, because running it would install a second ten-minute agent beside the nix-managed one. |
 
 ### Style Evaluation
 
@@ -32,7 +37,7 @@ Runs every 10 minutes via launchd.
 
 | File | Purpose |
 |------|---------|
-| `style-fix-worktrees.sh` | For each project with pending findings: creates a `_style_fix` worktree, exports evaluation markdown to a scratch file under `/private/tmp/claude`, launches the `[style_fix]` agent to apply fixes (cargo mend, clippy, tests, style review), then launches a second run of the **same** agent to verify the applied fix against the Fix Summary (correcting mistakes and updating the summary), saves the Fix Summary back into pending JSON, and keeps `EVALUATION.md` out of the worktree. Other linked worktrees are allowed; the source tree the project resolves to must be clean, with the check narrowed to the member subpath for a workspace member. Can target a single project by name. |
+| `style-fix-worktrees.sh` | For each project with pending findings: creates a `_style_fix` worktree, exports evaluation markdown to a scratch file under `/tmp/claude`, launches the `[style_fix]` agent to apply fixes (cargo mend, clippy, tests, style review), then launches a second run of the **same** agent to verify the applied fix against the Fix Summary (correcting mistakes and updating the summary), saves the Fix Summary back into pending JSON, and keeps `EVALUATION.md` out of the worktree. Other linked worktrees are allowed; the source tree the project resolves to must be clean, with the check narrowed to the member subpath for a workspace member. Can target a single project by name. |
 
 ### Flowchart Diagram
 
@@ -51,7 +56,7 @@ but **no path argument**. With no path, `rg` searches stdin whenever stdin is
 not a terminal; claude's Bash tool hands each command an open stdin pipe that
 never delivers data and never closes, so that first `rg` blocked on `read()`
 forever. The eval stage's serial `wait` then stalled, the parent `fix.sh`
-stayed alive, and the launchd trigger's `pgrep` concurrency guard suppressed
+stayed alive, and the trigger's `pgrep` concurrency guard suppressed
 every subsequent run all night.
 
 Two layers now prevent a recurrence:
@@ -89,22 +94,22 @@ To modify the diagram, edit `fix-style-flow.dot` and re-run `python3 render-flow
 ## Pipeline flow
 
 ```
-style-fix job (every 10 min, no idle gate) — fix.sh [PROJECT | run_once]
+style-fix job (every 10 min, no idle gate) — FIX_SCHEDULED=1 fix.sh
   │
-  ├─ STYLE_EVAL_ENABLED? (run_once forces yes)
+  ├─ STYLE_EVAL_ENABLED? (scheduled runs only)
   │    ├─ no → log SKIP and continue to STYLE_REVIEW_ENABLED
   │    └─ yes → Phase 1: Style Evaluation (per project, parallel)
   │         Load style guide → survey code → carry forward valid findings
   │         → skip any project with pending findings or a _style_fix worktree
   │         → find new violations → store pending evaluation markdown
   │
-  ├─ STYLE_REVIEW_ENABLED? (run_once forces yes)
+  ├─ STYLE_REVIEW_ENABLED? (scheduled runs only)
   │    ├─ no → log SKIP and continue to STYLE_FIX_ENABLED
   │    └─ yes → Phase 2: Style Evaluation Review (per project, parallel)
   │         Review pending evaluation markdown with the configured review agent
   │         → save reviewed markdown back into pending JSON
   │
-  ├─ STYLE_FIX_ENABLED? (run_once forces yes)
+  ├─ STYLE_FIX_ENABLED? (scheduled runs only)
   │    ├─ no → log SKIP and continue to the report activity gate
   │    └─ yes → Phase 3: Style-Fix Worktrees (per project, parallel)
   │         Create _style_fix worktree (other linked worktrees allowed if the resolved
@@ -141,7 +146,7 @@ The JSON records:
 - `finding_count`: numbered findings currently in the evaluation markdown
 - `scratch_exports`: the scratch markdown files freshly exported from pending JSON
 
-The scratch files under `/private/tmp/claude` are phase handoffs, not source of
+The scratch files under `/tmp/claude` are phase handoffs, not source of
 truth:
 
 | Scratch file | Owner | Cleanup rule |

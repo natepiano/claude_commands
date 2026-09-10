@@ -167,7 +167,7 @@ The active style-fix scratch evaluation path for this project is: `$WORKTREE_EVA
 
 If the line above shows a real filesystem path, check whether that file exists.
 
-If the line above shows the literal string `$WORKTREE_EVAL_PATH` (i.e. no substitution was made, because this command was invoked directly rather than via the fix pipeline), derive the scratch path instead: take the project directory name and check `/private/tmp/claude/style_fix_<project>_evaluation.md`. For example, if `$ARGUMENTS` is `~/rust/my_project`, check `/private/tmp/claude/style_fix_my_project_evaluation.md`.
+If the line above shows the literal string `$WORKTREE_EVAL_PATH` (i.e. no substitution was made, because this command was invoked directly rather than via the fix pipeline), derive the scratch path instead: take the project directory name and check `/tmp/claude/style_fix_<project>_evaluation.md`. For example, if `$ARGUMENTS` is `~/rust/my_project`, check `/tmp/claude/style_fix_my_project_evaluation.md`.
 
 If that file exists, read it. These findings are already being addressed in a style-fix branch. When evaluating in Step 4, **do not re-discover** any finding that matches a style-fix scratch finding by title or by the same style rule applied to the same files. This prevents duplicate work between the primary evaluation and the in-progress worktree fixes.
 
@@ -348,4 +348,4 @@ If `--fix` was passed, you are running interactively and the user is waiting on 
 
 4. Tell the user once: "fix running, log: `<path>`. I'll surface phases as they arrive and post a final summary when codex finishes." Then **yield** — do not sleep, do not poll, do not re-read the log yourself.
 
-5. When the harness delivers the `run_in_background` completion event for the launcher (the `exec`'d `style-fix-worktrees.sh` returned), the Monitor will already have terminated on its own via the `phase=launcher-exit` sentinel. If for any reason it has not (e.g. the trap did not fire), call `TaskStop` on the Monitor's task id. Then read `/private/tmp/claude/style_fix_<project>_evaluation.md`'s `## Fix Summary` section plus the tail of the manual log. Post a final summary covering: applied/skipped/proposed findings, `cargo mend` status, and clippy status. If the final progress phase was `failed`, surface the `reason=` value first.
+5. When the harness delivers the `run_in_background` completion event for the launcher (the `exec`'d `style-fix-worktrees.sh` returned), the Monitor will already have terminated on its own via the `phase=launcher-exit` sentinel. If for any reason it has not (e.g. the trap did not fire), call `TaskStop` on the Monitor's task id. Then read `/tmp/claude/style_fix_<project>_evaluation.md`'s `## Fix Summary` section plus the tail of the manual log. Post a final summary covering: applied/skipped/proposed findings, `cargo mend` status, and clippy status. If the final progress phase was `failed`, surface the `reason=` value first.

@@ -30,7 +30,11 @@ __emit_launcher_exit() {
 trap __emit_launcher_exit EXIT
 
 export PATH="$HOME/.local/bin:$PATH"
-source "$HOME/.cargo/env"
+# rustup writes ~/.cargo/env; nix does not. On NixOS cargo is already on PATH
+# from the system profile, and with `set -e` a bare `source` of a missing file
+# ended this script on line 33 with nothing but a launcher-exit code=1. Same
+# guard as fix.sh.
+[[ -f "$HOME/.cargo/env" ]] && source "$HOME/.cargo/env"
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 
@@ -43,7 +47,11 @@ source "$SCRIPT_DIR/agent_assignments.sh"
 RUST_DIR="$HOME/rust"
 CONF_FILE="$SCRIPT_DIR/fix.conf"
 HISTORY_HELPER="$SCRIPT_DIR/style_history.py"
-LOG_DIR="/private/tmp/claude"
+# /tmp/claude, not /private/tmp/claude: on macOS /tmp *is* /private/tmp —
+# same directory, same inode — while on Linux /private does not exist and
+# cannot be created, so the old constant killed these scripts at the first
+# mkdir under `set -e`. One constant is correct on both platforms.
+LOG_DIR="/tmp/claude"
 SINGLE_PROJECT="${1:-}"
 STYLE_ENABLED=""
 STYLE_AGENT=""
@@ -102,6 +110,13 @@ echo "[diag] cwd_after_chdir=$(pwd)"
 # Parse conf file for the [projects] allowlist and settings.
 projects=()
 cf_ac_keys=()
+
+# A /fix skip comments the [projects] line out with this marker, so a skipped
+# entry is invisible to the parse loop below. Capture those separately: naming a
+# project explicitly overrides its skip (see the resurrection block after the
+# parse), while the unnamed all-projects form still honors it.
+FIX_SKIP_RE='^[[:space:]]*#FIX_SKIP#[[:space:]]+(.+)$'
+skipped_entries=()
 cf_ac_vals=()
 MAX_NEW_FINDINGS=""
 AGENT_TIMEOUT_SECS=""
@@ -117,6 +132,10 @@ fi
 if [[ -f "$CONF_FILE" ]]; then
     current_section=""
     while IFS= read -r line || [[ -n "$line" ]]; do
+        if [[ "$current_section" == "projects" && "$line" =~ $FIX_SKIP_RE ]]; then
+            skipped_entries+=("$(cf_trim "${BASH_REMATCH[1]}")")
+            continue
+        fi
         stripped="${line%%#*}"
         stripped="$(cf_trim "$stripped")"
         [[ -z "$stripped" ]] && continue
@@ -156,6 +175,28 @@ if [[ -f "$CONF_FILE" ]]; then
                 ;;
         esac
     done < "$CONF_FILE"
+fi
+
+# An explicitly named project overrides a temporary /fix skip — naming it is the
+# intent. An unmatched name is an error rather than a silent empty run, so a typo
+# does not read the same as "nothing to do".
+if [[ -n "$SINGLE_PROJECT" ]]; then
+    for skipped in ${skipped_entries[@]+"${skipped_entries[@]}"}; do
+        if [[ "${skipped##*/}" == "$SINGLE_PROJECT" ]]; then
+            echo "NOTE: $SINGLE_PROJECT is temporarily skipped; running it because it was named explicitly."
+            projects+=("$skipped")
+        fi
+    done
+    single_found=0
+    for entry in ${projects[@]+"${projects[@]}"}; do
+        if [[ "${entry##*/}" == "$SINGLE_PROJECT" ]]; then
+            single_found=1
+        fi
+    done
+    if (( ! single_found )); then
+        echo "ERROR: no [projects] entry named '$SINGLE_PROJECT' in $CONF_FILE" >&2
+        exit 1
+    fi
 fi
 
 if [[ -z "$MAX_NEW_FINDINGS" ]]; then
@@ -213,8 +254,10 @@ run_style_agent() {
     esac
 }
 
-if [[ "$STYLE_ENABLED" == "false" && "${FIX_FORCE_STYLE_STAGES:-0}" != "1" ]]; then
-    echo "Style fix is disabled."
+# Stage enablement is scheduled-run policy: only the scheduled run (which sets
+# FIX_SCHEDULED=1 via fix-trigger.sh) consults it. A standalone invocation runs.
+if [[ "${FIX_SCHEDULED:-0}" == "1" && "$STYLE_ENABLED" == "false" ]]; then
+    echo "Style fix is disabled for scheduled runs."
     exit 0
 fi
 
@@ -484,7 +527,7 @@ supervise_agent() {
     # the wrapping subshell — `tail -F` and the `while read` bash were reparented
     # to PID 1, kept inheriting our stdout (the pipe to tee in the parent
     # fix script), and held the pipeline open for 26+ hours, blocking
-    # launchd from firing the next night's run.
+    # the scheduler from firing the next night's run.
     : > "$log_file"  # ensure file exists so the offset math starts at 0
 
     echo "[diag $proj] launching $label agent ($STYLE_AGENT) in background"

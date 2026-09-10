@@ -34,7 +34,11 @@ NATE_STYLE_DIR="$HOME/rust/nate_style"
 CONF_FILE="$SCRIPT_DIR/fix.conf"
 CMD_FILE="$SCRIPT_DIR/style-eval-review-prompt.md"
 HISTORY_HELPER="$SCRIPT_DIR/style_history.py"
-LOG_DIR="/private/tmp/claude"
+# /tmp/claude, not /private/tmp/claude: on macOS /tmp *is* /private/tmp —
+# same directory, same inode — while on Linux /private does not exist and
+# cannot be created, so the old constant killed these scripts at the first
+# mkdir under `set -e`. One constant is correct on both platforms.
+LOG_DIR="/tmp/claude"
 SINGLE_PROJECT="${1:-}"
 STYLE_ENABLED=""
 STYLE_AGENT=""
@@ -49,11 +53,22 @@ mkdir -p "$LOG_DIR"
 # registry; agent-assignments.conf carries only enabled=.
 projects=()
 cf_ac_keys=()
+
+# A /fix skip comments the [projects] line out with this marker, so a skipped
+# entry is invisible to the parse loop below. Capture those separately: naming a
+# project explicitly overrides its skip (see the resurrection block after the
+# parse), while the unnamed all-projects form still honors it.
+FIX_SKIP_RE='^[[:space:]]*#FIX_SKIP#[[:space:]]+(.+)$'
+skipped_entries=()
 cf_ac_vals=()
 
 if [[ -f "$CONF_FILE" ]]; then
     current_section=""
     while IFS= read -r line || [[ -n "$line" ]]; do
+        if [[ "$current_section" == "projects" && "$line" =~ $FIX_SKIP_RE ]]; then
+            skipped_entries+=("$(cf_trim "${BASH_REMATCH[1]}")")
+            continue
+        fi
         stripped="${line%%#*}"
         stripped="$(cf_trim "$stripped")"
         [[ -z "$stripped" ]] && continue
@@ -80,11 +95,35 @@ if [[ -f "$CONF_FILE" ]]; then
     done < "$CONF_FILE"
 fi
 
+# An explicitly named project overrides a temporary /fix skip — naming it is the
+# intent. An unmatched name is an error rather than a silent empty run, so a typo
+# does not read the same as "nothing to do".
+if [[ -n "$SINGLE_PROJECT" ]]; then
+    for skipped in ${skipped_entries[@]+"${skipped_entries[@]}"}; do
+        if [[ "${skipped##*/}" == "$SINGLE_PROJECT" ]]; then
+            echo "NOTE: $SINGLE_PROJECT is temporarily skipped; running it because it was named explicitly."
+            projects+=("$skipped")
+        fi
+    done
+    single_found=0
+    for entry in ${projects[@]+"${projects[@]}"}; do
+        if [[ "${entry##*/}" == "$SINGLE_PROJECT" ]]; then
+            single_found=1
+        fi
+    done
+    if (( ! single_found )); then
+        echo "ERROR: no [projects] entry named '$SINGLE_PROJECT' in $CONF_FILE" >&2
+        exit 1
+    fi
+fi
+
 # Review has its own stage assignment. Empty model/effort values are filled from
 # the global agent registry before launch.
 cf_load_stage_assignment style_eval_review STYLE_ENABLED STYLE_AGENT STYLE_AGENT_MODEL STYLE_AGENT_EFFORT || exit 1
-if [[ "$STYLE_ENABLED" == "false" && "${FIX_FORCE_STYLE_STAGES:-0}" != "1" ]]; then
-    echo "Style evaluation review is disabled."
+# Stage enablement is scheduled-run policy: only the scheduled run (which sets
+# FIX_SCHEDULED=1 via fix-trigger.sh) consults it. A standalone invocation runs.
+if [[ "${FIX_SCHEDULED:-0}" == "1" && "$STYLE_ENABLED" == "false" ]]; then
+    echo "Style evaluation review is disabled for scheduled runs."
     exit 0
 fi
 if [[ "$STYLE_AGENT" == "codex" && ! -x "$CODEX_BIN" ]]; then

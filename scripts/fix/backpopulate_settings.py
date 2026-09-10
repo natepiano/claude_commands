@@ -29,9 +29,12 @@ SCRIPT_PATTERN = (
 )
 SCRIPT_RE = re.compile(SCRIPT_PATTERN)
 
+# Both machines' home shapes: /Users/<user> on macOS, /home/<user> on Linux.
+# Matching only one left every absolute permission recorded on the other
+# unrecognized, so it never folded into its canonical wildcard entry.
 ABS_SCRIPT_PATTERN = (
     r"^Bash\((bash\s+)?"
-    r"(/Users/\w+/(?:\.claude|rust)/[^\s)]+\.(?:sh|py))"
+    r"((?:/Users|/home)/[^/\s]+/(?:\.claude|rust)/[^\s)]+\.(?:sh|py))"
     r"([\s:].*)?\)$"
 )
 ABS_SCRIPT_RE = re.compile(ABS_SCRIPT_PATTERN)

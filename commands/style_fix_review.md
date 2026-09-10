@@ -220,7 +220,7 @@ If the draft fails any of these, do not send — fix and re-scan.
 </ConcernFormat>
 
 <ReadEvaluation>
-**Load the style-fix evaluation from pending JSON.** The fix pipeline does not write `EVALUATION.md` into style-fix worktrees. The durable evaluation markdown lives in `~/rust/nate_style/.history/.pending/<project>.json` under `evaluation_markdown`. Scratch files under `/private/tmp/claude` are exports only; their absence is not a reason to stop.
+**Load the style-fix evaluation from pending JSON.** The fix pipeline does not write `EVALUATION.md` into style-fix worktrees. The durable evaluation markdown lives in `~/rust/nate_style/.history/.pending/<project>.json` under `evaluation_markdown`. Scratch files under `/tmp/claude` are exports only; their absence is not a reason to stop.
 
 Run this from anywhere inside the style-fix worktree to derive the project name, inspect the pending state, and export the pending markdown to a temporary review file:
 
@@ -236,7 +236,7 @@ else
   project="${project%_style_fix}"
 fi
 status_json="$(python3 ~/.claude/scripts/fix/style_history.py evaluation-status --project "$project")"
-eval_path="/private/tmp/claude/style_fix_review_${project}_evaluation.md"
+eval_path="/tmp/claude/style_fix_review_${project}_evaluation.md"
 python3 ~/.claude/scripts/fix/style_history.py export-evaluation \
   --project "$project" \
   --kind review \
@@ -251,7 +251,7 @@ If the exported pending markdown has no `## Fix Summary`, do **not** review the 
 Instead, enter **Recovered Handoff Mode**:
 
 ```bash
-recovery_path="/private/tmp/claude/style_fix_review_${project}_recovered_evaluation.md"
+recovery_path="/tmp/claude/style_fix_review_${project}_recovered_evaluation.md"
 python3 ~/.claude/scripts/fix/style_history.py recover-evaluation \
   --project "$project" \
   --project-root "$worktree_dir" \

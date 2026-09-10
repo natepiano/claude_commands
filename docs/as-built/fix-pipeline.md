@@ -2,7 +2,7 @@
 
 ## What it is
 
-`scripts/fix/` is an unattended, launchd-driven pipeline that evaluates opt-in Rust projects under `~/rust/` against the shared style guide, reviews the resulting findings with a second agent, and then applies the fixes in a throwaway git worktree for the user to review at leisure. The problem it solves: style debt accumulates faster than anyone will pay it down by hand, and a style pass done interactively costs a full attention block per project. Here the work happens on a 10-minute schedule with no human in the loop, each project's state persists across runs, and the user's only interaction is reviewing a finished `_style_fix` worktree and merging it. The pipeline is style-only — it evaluates, reviews, and fixes, and does nothing else.
+`scripts/fix/` is an unattended, timer-driven pipeline that evaluates opt-in Rust projects under `~/rust/` against the shared style guide, reviews the resulting findings with a second agent, and then applies the fixes in a throwaway git worktree for the user to review at leisure. The problem it solves: style debt accumulates faster than anyone will pay it down by hand, and a style pass done interactively costs a full attention block per project. Here the work happens on a 10-minute schedule with no human in the loop, each project's state persists across runs, and the user's only interaction is reviewing a finished `_style_fix` worktree and merging it. The pipeline is style-only — it evaluates, reviews, and fixes, and does nothing else.
 
 ## How it works
 
@@ -10,23 +10,28 @@
 
 ### Trigger and concurrency
 
-One launchd job, `com.natemccoy.style-fix`, defined by `scripts/fix/com.natemccoy.style-fix.plist` and symlinked into `~/Library/LaunchAgents/` by `scripts/fix/setup.sh`. `StartInterval` is `600`, so it fires every ten minutes around the clock with **no idle gate** — a firing happens whether or not the machine is in use. `StandardOutPath` and `StandardErrorPath` go to `/tmp/style-fix-stdout.log` and `/tmp/style-fix-stderr.log`.
+One job, declared once for both machines in `/etc/nixos/modules/common/style-fix.nix` as a `nate.jobs` entry with `intervalSeconds = 600`. `nate.jobs` renders it per platform:
+
+| | Linux (natedev) | macOS |
+|---|---|---|
+| unit | `style-fix.timer` → `style-fix.service` (user units) | `org.nixos.style-fix` launchd user agent |
+| interval | `OnUnitInactiveSec=600s` — 600s after the previous run **finished** | `StartInterval 600` — every 600s regardless |
+| stdout/stderr | the journal (`journalctl --user -u style-fix`) | `~/Library/Logs/nate-jobs/style-fix.log` |
+| extras | `TimeoutStartSec=4h`, from `modules/linux/style-fix.nix` | — |
+
+There is **no idle gate** on either: a firing happens whether or not the machine is in use. The interval semantics differ on purpose — see the trigger's own header comment. Because launchd fires into a run that is still going and systemd does not, the `pgrep` guard in `fix-trigger.sh` is what absorbs the Mac's extra firings; on both platforms it also catches a `fix.sh` started by hand.
 
 The job runs `scripts/fix/fix-trigger.sh`, which is a concurrency guard plus an `exec`. It holds one variable, `FIX_ORCHESTRATOR_PATH="$HOME/.claude/scripts/fix/fix.sh"`, runs `pgrep -f` against that exact path, exits 0 if a run is already in flight, and otherwise `exec`s the orchestrator. The guard is accurate because `fix.sh` runs synchronously start to finish — `style-fix-worktrees.sh` waits on its backgrounded agents before returning — so the orchestrator's presence in the process table means "a run is still going."
 
-`setup.sh` is idempotent: it creates `~/.local/logs`, symlinks the one plist, bootstraps the agent if it is not loaded, and reloads it (`bootout` then `bootstrap`) only when the symlink target changed. It also retires the pre-split `com.natemccoy.clean-fix` label if one lingers in the domain.
+`scripts/fix/setup.sh` and `scripts/fix/com.natemccoy.style-fix.plist` are **retired**, superseded by the nix declaration above. The plist is kept as the rollback target snapshotted into the Mac's `~/nixos-recovery/`; `setup.sh` is a stub that refuses, because bootstrapping the old `com.natemccoy.style-fix` label would put a second ten-minute agent beside the nix-managed `org.nixos.style-fix` and both would fire.
 
 ### Orchestration — `fix.sh`
 
-`fix.sh` takes at most one argument:
+`fix.sh` takes at most one argument — an optional project name filtering all three stages to one target. There is no scope word and no mode word; any leading token is a project filter, and a second token is a usage error.
 
-- nothing — a normal scheduled pass
-- a project name — filters all three stages to one target
-- the literal `run_once` — forces all three stage switches on for this pass by exporting `FIX_FORCE_STYLE_STAGES=1`; it takes no further arguments
+What varies is not the argument but the environment. `FIX_SCHEDULED=1`, exported by `fix-trigger.sh` and by nothing else, is what makes a run consult the three `enabled=` switches; `stage_runs()` reads `[[ "$SCHEDULED" != "1" || "$1" == "true" ]]`, so an interactive run passes the gate unconditionally. `fix.sh` re-exports the value so the stage scripts apply the same rule when the orchestrator calls them, and they default it to `0` so a direct call runs too.
 
-There is no scope word. Any leading token that is not `run_once` is read as a project filter.
-
-Logging: `LOG_DIR` is `~/.local/logs/fix`, each run writes `fix-YYYYMMDD-HHMMSS.log`, and `~/.local/logs/fix.log` is re-pointed as a symlink to the newest run so older tooling and the plist stdout sink keep working. Retention runs at the top of every pass: `fix-*.log` and migrated `clean-fix-*.log` are pruned after `RUN_LOG_RETENTION_MINUTES=1440` (about a day) in two explicit `find` branches, and `style-fix-manual-*.log` after `MANUAL_LOG_RETENTION_DAYS=7`. The `log()` helper prefixes every line with `%Y-%m-%d %H:%M:%S`.
+Logging: `LOG_DIR` is `~/.local/logs/fix`, each run writes `fix-YYYYMMDD-HHMMSS.log`, and `~/.local/logs/fix.log` is re-pointed as a symlink to the newest run so older tooling keeps working. This symlink, not the platform's job log, is the portable place to tail a run. Retention runs at the top of every pass: `fix-*.log` and migrated `clean-fix-*.log` are pruned after `RUN_LOG_RETENTION_MINUTES=1440` (about a day) in two explicit `find` branches, and `style-fix-manual-*.log` after `MANUAL_LOG_RETENTION_DAYS=7`. The `log()` helper prefixes every line with `%Y-%m-%d %H:%M:%S`.
 
 Configuration read: `fix.sh` parses `fix.conf` itself for `[active_checkout]`, filling the parallel arrays `cf_ac_keys` / `cf_ac_vals`, and hard-errors if `[style_eval]` or `[style_fix]` still carries a stale `mode=`, `enabled=`, `agent=`, `model=`, or `effort=` row — those moved to `agent-assignments.conf` and `config/agents.conf`. `project_key()`, `checkout_root()`, and `project_filter_key()` normalize a user-supplied filter (entry, checkout path, checkout root, or bare name) down to the project's identity key.
 
@@ -34,7 +39,7 @@ Stage resolution: three calls to `cf_load_stage_assignment` for `style_eval`, `s
 
 Run body, in order:
 
-1. Start banner — one of `=== Starting fix (project: X) ===`, `=== Starting fix (run_once) ===`, or `=== Starting fix ===`. A `run_once` pass additionally prints a stage/agent:effort summary table.
+1. Start banner — one of `=== Starting fix (project: X) ===`, `=== Starting fix (scheduled) ===`, or `=== Starting fix ===`. Every non-scheduled pass additionally prints a stage/agent:effort summary table.
 2. `backpopulate_settings.py --apply` — unconditional, before every pass. This walks **every** non-dot directory under `~/rust/`, independent of the allowlist, back-populating canonical `settings.local.json` permissions that the style-fix agents depend on.
 3. Three independent stage gates. Each checks `<STAGE>_ENABLED == "true" || RUN_ONCE_REQUESTED == "true"`; when off it logs its own line (`SKIP: style eval disabled in agent-assignments.conf`, and the review and fix equivalents) and **falls through to the next stage** rather than ending the run.
 4. Completion banner — `=== Fix complete (Xm Ys) ===`.
@@ -73,7 +78,7 @@ Run body, in order:
 
 **Stage 2 — evaluation review (`style-eval-review-all.sh`).** Re-reads each project's pending markdown with the `fix.style_eval_review` agent and the prompt at `style-eval-review-prompt.md` (a plain prompt file, not a slash command), keeping, improving, amending, or removing each finding, then saves the reviewed markdown back into pending JSON. Eligibility: pending JSON has markdown, the markdown has at least one `### N.` numbered finding, and it does not yet contain a `## Review Log` section — so the stage is idempotent.
 
-**Stage 3 — style fix (`style-fix-worktrees.sh`).** For each project with pending findings: create a `<project>_style_fix` git worktree, write the `.fix-project` identity marker into it (and add that filename to the repo's `info/exclude`), export the pending markdown to a scratch file under `/private/tmp/claude`, then run the configured agent **twice**. Pass 1 applies the fixes and runs cargo mend, clippy, tests, and a style review, ending with a `## Fix Summary`. Pass 2 is the same agent verifying the applied fix against that summary, correcting mistakes and appending `## Fix Verification`. A `cargo check` build gate covers both passes; the finished summary is saved back into pending JSON, and `EVALUATION.md` is deliberately kept out of the worktree. The script installs an EXIT trap that always emits `[progress <proj>] phase=launcher-exit code=N` so a monitor tailing the log can self-terminate.
+**Stage 3 — style fix (`style-fix-worktrees.sh`).** For each project with pending findings: create a `<project>_style_fix` git worktree, write the `.fix-project` identity marker into it (and add that filename to the repo's `info/exclude`), export the pending markdown to a scratch file under `/tmp/claude`, then run the configured agent **twice**. Pass 1 applies the fixes and runs cargo mend, clippy, tests, and a style review, ending with a `## Fix Summary`. Pass 2 is the same agent verifying the applied fix against that summary, correcting mistakes and appending `## Fix Verification`. A `cargo check` build gate covers both passes; the finished summary is saved back into pending JSON, and `EVALUATION.md` is deliberately kept out of the worktree. The script installs an EXIT trap that always emits `[progress <proj>] phase=launcher-exit code=N` so a monitor tailing the log can self-terminate.
 
 After the pipeline, the human path is manual: `/style_fix_review` → `/merge_branch` → `/worktree_delete`.
 
@@ -107,7 +112,7 @@ An empty `/fix report` argument means current keyed-project state; newest-log mo
 
 ### Command surface
 
-`commands/fix.md` defines `/fix`, dispatching on the first token: `run`/`run_once`, `add`, `rename`, `monitor`, `report`/`list`, `eval`/`review`/`fix`/`agent`/`on`/`off`, `skip`. With no subcommand it runs `scripts/fix/fix-usage.sh` and relays stdout verbatim — the script owns section order, column widths, wrapping, and formatting, and `--json` exposes the same usage, agent, and project data for tooling. The project table has one status column, `Style`.
+`commands/fix.md` defines `/fix`, dispatching on the first token: `run`, `add`, `rename`, `monitor`, `report`/`list`, `eval`/`review`/`fix`/`agent`/`on`/`off`, `skip`. With no subcommand it runs `scripts/fix/fix-usage.sh` and relays stdout verbatim — the script owns section order, column widths, wrapping, and formatting, and `--json` exposes the same usage, agent, and project data for tooling. The project table has one status column, `Style`.
 
 ### Supporting helpers
 
@@ -120,7 +125,7 @@ An empty `/fix report` argument means current keyed-project state; newest-log mo
 | `style_admin.py`, `style_report.py` | Deterministic guideline admin operations and history-derived reporting. |
 | `backpopulate_settings.py` | Canonical `settings.local.json` permission back-population; dry-run unless `--apply`. |
 | `style-fix-manual.sh` | Manual launcher for `style-fix-worktrees.sh` that lands its log in `~/.local/logs/fix/` so `/fix report` picks it up. `--foreground` gives a real completion event. |
-| `style-fix-monitor.py` | Streams orchestrator + agent log lines and exits on `launcher-exit`. Replaces a `tail -F | awk` pipeline that relied on `pkill -f`, which the sandbox denies (macOS `sysmond`). |
+| `style-fix-monitor.py` | Streams orchestrator + agent log lines and exits on `launcher-exit`. Replaces a `tail -F \| awk` pipeline that relied on `pkill -f` to stop itself; reading the files in Python needs no process signalling and is one code path for both machines. |
 | `rg-shim.sh` | Retired `rg` timeout shim, kept as incident context only; not on PATH. |
 | `scripts/make_a_worktree/retarget_fix.py` | Redirect-only helper: `detect` / `apply` / `revert` against `[active_checkout]`. With `--commit` it commits `fix.conf` alone. It never touches `[projects]`, so the history key is always preserved. |
 | `scripts/worktree_delete/perform_deletion.sh` | Reads `.fix-project` to recover a worktree's identity key before deleting it. |
@@ -130,13 +135,13 @@ An empty `/fix report` argument means current keyed-project state; newest-log mo
 
 `fix-style-flow.dot` (graph id `fix_style`) is the hand-maintained source; `fix-style-flow.svg` is generated and never hand-edited. Current structure: four clusters (`cluster_eval`, `cluster_review`, `cluster_fix`, `cluster_manual`), 38 nodes, 47 edges, and exactly two terminals (`report_idle`, `delete_wt`).
 
-It draws three independent enablement diamonds (`eval_enabled`, `review_enabled`, `fix_enabled`), each labelled "(run_once forces yes)" and each falling through to the next stage on `no` rather than ending the run; a per-project `ttl_gate` whose two outcome edges route to distinct per-project terminals; and an `activity_gate` ahead of the report that splits into `report` and `report_idle`. Four labels are held in sync with the scripts by hand: the trigger interval (from the plist's `StartInterval`), project selection (the `[projects]` allowlist, `[active_checkout]` resolution, missing path / `Cargo.toml` skips), the findings cap (`[style_eval] max_new_findings`), and `prechecks` ("source tree").
+It draws three independent enablement diamonds (`eval_enabled`, `review_enabled`, `fix_enabled`), each labelled "(scheduled runs only)" and each falling through to the next stage on `no` rather than ending the run; a per-project `ttl_gate` whose two outcome edges route to distinct per-project terminals; and an `activity_gate` ahead of the report that splits into `report` and `report_idle`. Four labels are held in sync with the scripts by hand: the trigger interval (from `intervalSeconds` in `modules/common/style-fix.nix`), project selection (the `[projects]` allowlist, `[active_checkout]` resolution, missing path / `Cargo.toml` skips), the findings cap (`[style_eval] max_new_findings`), and `prechecks` ("source tree").
 
 `render-flow.py` parses cluster membership, labels, and colors out of the `.dot`, runs `neato -n2`, injects dashed cluster borders, aligns the tops of the three phase clusters (`PHASE_CLUSTER_IDS`), and rewrites the SVG `viewBox`.
 
 ## Invariants
 
-**Bash 3.2.** Every `.sh` in this tree runs under macOS system bash with `#!/bin/bash`. No associative arrays, no `${var,,}`, no bash-4 constructs.
+**Bash 3.2.** Every `.sh` in this tree is `#!/usr/bin/env bash` and avoids associative arrays, `${var,,}`, and other bash-4+ constructs. The path that forced this — the retired plist's `/bin/bash <script>`, macOS system bash 3.2 — is gone, and `env bash` now resolves to nix's bash 5.x on both machines. Keep the constraint anyway: it costs nothing, and `/bin/bash script.sh` still works on the Mac. Do not "modernize" a 3.2 workaround; several carry comments explaining a real misparse.
 
 **basedpyright at zero errors and zero warnings.** `pyrightconfig.json` carries an execution environment rooted at `scripts/fix`. Never use a file-level type ignore (`# pyright: reportAny=false`). Avoid `Any`; annotate signatures; use `TypedDict` for known-key dicts. A line-level `# pyright: ignore[...]` is the last resort.
 
@@ -160,11 +165,10 @@ It draws three independent enablement diamonds (`eval_enabled`, `review_enabled`
 
 ### Sanctioned compatibility survivals
 
-Six places deliberately keep a `clean`/`clean-fix` spelling. A name sweep must leave all six alone.
+Five places deliberately keep a `clean`/`clean-fix` spelling. A name sweep must leave all five alone.
 
 | Location | Why it survives |
 | --- | --- |
-| `scripts/fix/setup.sh:71` — `OLD_LABEL="com.natemccoy.clean-fix"` | Retires a pre-split launchd label that may still be registered in a user domain. Deleting the block strands that agent, loaded, forever. |
 | `scripts/fix/fix_report_parse.py:99-101` — `HISTORICAL_COMPLETE_RE` | Recognizes the two retired completion wordings. Without it every retained pre-rename log parses as an unfinished run. Do not assert these literals are absent from parser source — the historical set is exactly where they belong. |
 | `scripts/fix/fix.sh:51-52` — the `clean-fix-*.log` retention branch | Migrated logs carry the old filename prefix; without this branch they are never pruned. |
 | `commands/fix.md:168` — `<DetectLog/>`'s `/tmp/claude/clean-fix-*.log` candidate | Interactive logs written before the rename would otherwise be undiscoverable by `/fix monitor`. |
@@ -188,11 +192,11 @@ Six places deliberately keep a `clean`/`clean-fix` spelling. A name sweep must l
 - Re-rendering an unchanged source is byte-stable, so `cmp` against the checked-in SVG is the cheapest proof that an edit changed only what it meant to.
 - Automated Safari inspection is unavailable here — macOS denies the UI-capture permission. Rasterize in memory or verify structurally.
 
-**`setup.sh` compares symlink targets, not plist contents.** Editing a plist in place leaves the loaded agent stale and `setup.sh` reports "Already set up — nothing to do." An unsandboxed `launchctl bootout` / `bootstrap` pair is what loads a changed agent. When the job was explicitly booted out first, `setup.sh` then prints `Loaded launchd agent`, not `Reloaded` — expected, not a failure.
+**Changing the schedule is a nix edit, not a script edit.** The interval lives in `/etc/nixos/modules/common/style-fix.nix`; edit it there and have the user run `rebuild`. Nothing under `scripts/fix/` installs or reloads a timer any more.
 
 **Timestamps defeat `^` anchors.** `log()` prefixes `%Y-%m-%d %H:%M:%S` to every orchestrator line, so any `^`-anchored filter or matcher misses the completion banner. This is why `MONITOR_FILTER_REGEX` uses `(^|[[:space:]])=== `.
 
-**An unknown first argument is a silent no-op, not an error.** `fix.sh <anything-but-run_once>` is a project filter. A stale invocation like `fix.sh clean` or `fix.sh style` matches no project and the run does nothing visible — it does not fail loudly.
+**An unknown first argument used to be a silent no-op.** `fix.sh <anything>` is a project filter, and a stale invocation like `fix.sh clean` or `fix.sh style` matched no project. The three stage scripts now exit 1 with `ERROR: no [projects] entry named '<name>'` instead, so a typo and an idle allowlist no longer look alike. `No projects to evaluate.` at exit 0 now means what it says.
 
 **The job will run against edited code.** It fires every 600 seconds with no idle gate, so a change that moves the pipeline's inputs or its log directory must quiesce the job first, and mid-change firings against a half-edited tree are normal. Fresh logs appearing in `~/.local/logs/fix/` roughly ten minutes apart is healthy, not a runaway.
 
@@ -212,9 +216,11 @@ Six places deliberately keep a `clean`/`clean-fix` spelling. A name sweep must l
 
 ## Why
 
-**Why the pipeline is style-only.** It used to carry a second capability — a nightly `cargo clean` + build + mend + warmup pass — on the same orchestrator, the same conf file, the same report parser, and the same diagram. Every reader of any of those had to first answer "which scope am I in", and the config surface carried four sections (`[settings]`, `[build]`, `[cargo_run]`, `[examples]`) that only the retired capability used. Removing it left one purpose, one launchd job, one allowlist, and one four-column report; the rename followed because the old name described a capability that no longer exists.
+**Why the pipeline is style-only.** It used to carry a second capability — a nightly `cargo clean` + build + mend + warmup pass — on the same orchestrator, the same conf file, the same report parser, and the same diagram. Every reader of any of those had to first answer "which scope am I in", and the config surface carried four sections (`[settings]`, `[build]`, `[cargo_run]`, `[examples]`) that only the retired capability used. Removing it left one purpose, one scheduled job, one allowlist, and one four-column report; the rename followed because the old name described a capability that no longer exists.
 
-**Why the three stage switches are independent and fall through.** Each stage answers its own `enabled=` and, when off, logs a distinct `SKIP:` line and continues. A disabled eval stage does not prevent a review or a fix pass over work already pending. `run_once` forces all three on for a single invocation without writing anything to `agent-assignments.conf`, so the schedule's persistent settings survive an interactive override.
+**Why the three stage switches are independent and fall through.** Each stage answers its own `enabled=` and, when off, logs a distinct `SKIP:` line and continues. A disabled eval stage does not prevent a review or a fix pass over work already pending.
+
+**Why enablement is scheduled-run policy rather than a global off switch.** The switches exist to shape a job that fires 144 times a day; nothing about `/fix eval off` was ever meant to answer "should this fix, which I just asked for by hand, happen". Honoring them everywhere made three hand-invoked paths no-op — `/fix run` (which needed a `run_once` twin purely to escape its own gate), a standalone stage script, and `/style_eval <project> --fix`, which announced `fix running, log: <path>`, armed a monitor, and then watched a launcher exit 0 on `Style fix is disabled.`. Marking the *scheduled* caller instead of forcing the interactive ones inverts the default so that the failure mode is a stage that runs when you did not want it, which is visible, rather than one that silently does not. `run_once` disappeared in the same change: with the gate gone, `/fix run` already is it.
 
 **Why stage enablement and agent assignment live in different files.** Enablement is pipeline-local operational state that the user flips constantly (`/fix eval off`). Family/agent/effort is a cross-cutting concern shared with `/plan:delegate`, the CLI aliases, and the review teams, and lives in the one registry so a vendor switch is a one-line edit. `fix.sh` hard-errors if a stale `agent=`/`model=`/`effort=` row reappears in `fix.conf`, rather than silently honoring a value nothing reads.
 
@@ -231,7 +237,6 @@ Six places deliberately keep a `clean`/`clean-fix` spelling. A name sweep must l
 - **Splitting a conf-section deletion from its readers across two commits.** All three writers of the deleted `[build]` section reached it through a bounds lookup that *raises* on a missing section rather than degrading to a no-op, so a gap between the two commits would break `/fix add`, `/fix rename`, and worktree retargeting outright.
 - **Renaming the `.dot`/`.svg` in a different commit from a content change.** The rename and the re-render land together; splitting them points the renderer at basenames that do not exist.
 - **Keeping single-valued indirection after the second value went away** — a one-key `SCOPE_SECTION` map, `add_to_section`'s `unique_key` flag with its one-element result list, and the `scope` parameter on six `phase_skip.py` functions. Nothing left to resolve.
-- **Unrolling `setup.sh`'s `PLIST_NAMES` loop** now that it holds one element — churn for no behavior change.
 
 **Type and API refactors that were tempting but out of scope**
 
@@ -244,8 +249,7 @@ Six places deliberately keep a `clean`/`clean-fix` spelling. A name sweep must l
 - **Deleting the retired banner literals as name residue.** They are the compatibility path for retained logs; see above.
 - **Narrowing the parser's era-agnostic `*.log` enumeration to a name-prefixed pattern.** Migrated history would stop being reachable.
 - **Deleting only the retired scope words and keeping the surviving `style` pair.** With no scope arm left, `style` reads as a project filter matching nothing, so documenting it would document a silent no-match.
-- **Removing the pre-split `com.natemccoy.clean-fix` cleanup block from `setup.sh`.** It is unrelated history hygiene that still has a job.
-- **Adding a block that retires a `com.natemccoy.cargo-clean` lingering in another checkout's launchd domain.** Implementation-only unless a second machine exists.
+- **Reviving any launchd-agent management under `scripts/fix/`.** Both the pre-split `com.natemccoy.clean-fix` retirement and a hypothetical `com.natemccoy.cargo-clean` one went away with `setup.sh`, and neither label appears in the Mac's pre-migration launchd inventory, so nothing is stranded. Agent lifecycle belongs to the nixos flake now.
 
 **Testing and scope**
 

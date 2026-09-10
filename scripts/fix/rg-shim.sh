@@ -11,7 +11,7 @@
 # command an open stdin pipe that never receives data and never closes, so that
 # first rg blocks on read() forever. On 2026-06-02 two such agents wedged for
 # 11h, stalling the whole scheduled fix run; because the dead run stayed in
-# the process table, the launchd trigger's `pgrep` guard then suppressed every
+# the process table, the trigger's `pgrep` guard then suppressed every
 # subsequent run all night. See fix/README.md.
 #
 # What it does

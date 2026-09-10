@@ -32,7 +32,7 @@ digraph fix_style {
 
     node [fillcolor="#e8f4f8" color="#2980b9"]
 
-    start [label="Fix pipeline launchd trigger\n(every 10 minutes)" shape=oval fillcolor="#f0e6ff" color="#8e44ad" width=2.2 height=0.55 pos="470,1050!"]
+    start [label="Fix pipeline scheduled trigger\n(every 10 minutes)" shape=oval fillcolor="#f0e6ff" color="#8e44ad" width=2.2 height=0.55 pos="470,1050!"]
 
     // Cluster-first layout in points:
     // Phase 1 range = [-15.6, 315.6], center = 150.0
@@ -49,7 +49,7 @@ digraph fix_style {
         style=dashed color="#95a5a6" fontcolor="#7f8c8d" fontsize=9
         margin=12
 
-        eval_enabled [label="style_eval enabled?\n(run_once forces yes)" shape=diamond fillcolor="#fef9e7" color="#f39c12" width=1.6 height=0.9 pos="150,855!"]
+        eval_enabled [label="style_eval enabled?\n(scheduled runs only)" shape=diamond fillcolor="#fef9e7" color="#f39c12" width=1.6 height=0.9 pos="150,855!"]
         eval_foreach [label="For each project (parallel)\n(skip pending handoff or\nstyle-fix worktree)" height=0.65 pos="150,775!"]
         ttl_gate [label="due-units gate:\nany unit due?" shape=diamond fillcolor="#fef9e7" color="#f39c12" width=1.6 height=0.9 pos="150,695!"]
         load_style [label="Load style guide\n~/.claude/scripts/rust_style/load-rust-style.sh" height=0.55 pos="150,620!"]
@@ -70,7 +70,7 @@ digraph fix_style {
         style=dashed color="#95a5a6" fontcolor="#7f8c8d" fontsize=9
         margin=12
 
-        review_enabled [label="style_eval_review enabled?\n(run_once forces yes)" shape=diamond fillcolor="#fef9e7" color="#f39c12" width=1.8 height=0.9 pos="470,855!"]
+        review_enabled [label="style_eval_review enabled?\n(scheduled runs only)" shape=diamond fillcolor="#fef9e7" color="#f39c12" width=1.8 height=0.9 pos="470,855!"]
         review_foreach [label="For each pending evaluation\n(skip reviewed/fixed or\nstyle-fix worktree)" height=0.65 pos="470,775!"]
         review_eligible [label="findings and no\nReview Log?" shape=diamond fillcolor="#fef9e7" color="#f39c12" width=1.6 height=0.9 pos="470,695!"]
         export_review [label="Export pending evaluation\n→ review scratch" height=0.55 pos="470,615!"]
@@ -85,7 +85,7 @@ digraph fix_style {
         style=dashed color="#95a5a6" fontcolor="#7f8c8d" fontsize=9
         margin=12
 
-        fix_enabled [label="style_fix enabled?\n(run_once forces yes)" shape=diamond fillcolor="#fef9e7" color="#f39c12" width=1.6 height=0.9 pos="790,855!"]
+        fix_enabled [label="style_fix enabled?\n(scheduled runs only)" shape=diamond fillcolor="#fef9e7" color="#f39c12" width=1.6 height=0.9 pos="790,855!"]
         fix_foreach [label="For each project with\npending eval findings" height=0.55 pos="790,775!"]
         prechecks [label="Prechecks:\n- target _style_fix path is free\n- source tree is clean" height=0.65 pos="790,700!"]
         create_wt [label="git worktree add\n-b refactor/style\n{project}_style_fix" height=0.65 pos="790,620!"]

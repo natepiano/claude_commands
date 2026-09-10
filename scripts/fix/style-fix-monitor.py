@@ -3,9 +3,10 @@
 
 Replaces the inline `tail -F | awk` pipeline used by the /style_eval Monitor.
 That pipeline relied on `pkill -f` to terminate the tail when the launcher's
-EXIT trap fired, but inside the Claude Code sandbox `pkill` is denied access
-to macOS's `sysmond` process-list service and silently fails. This script
-avoids the issue by reading the log files directly in Python.
+EXIT trap fired, which was fragile: it depended on process signalling reaching
+the right pid from inside whatever ran it. Reading the log files directly in
+Python needs no signalling at all, so the helper stops itself on the
+`phase=launcher-exit` sentinel and behaves identically on both machines.
 
 Usage: style-fix-monitor.py <project-name>
 """
@@ -59,8 +60,8 @@ def main() -> int:
         _ = sys.stderr.write("usage: style-fix-monitor.py <project-name>\n")
         return 2
     project = sys.argv[1]
-    agent_log_path = f"/private/tmp/claude/style_fix_{project}.log"
-    verify_log_path = f"/private/tmp/claude/style_fix_verify_{project}.log"
+    agent_log_path = f"/tmp/claude/style_fix_{project}.log"
+    verify_log_path = f"/tmp/claude/style_fix_verify_{project}.log"
 
     manual_log_path: str | None = None
     while manual_log_path is None:

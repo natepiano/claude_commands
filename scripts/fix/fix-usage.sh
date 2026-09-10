@@ -29,8 +29,7 @@ load_usage_rows() {
     USAGE_DESCRIPTIONS=()
     USAGE_BREAK_AFTER=()
 
-    add_usage "/fix run [project]" "Style eval/review/fix. Optional project filters to one target." true
-    add_usage "/fix run_once" "Runs one eval + review + fix pass across all configured style projects, regardless of stage enablement." true
+    add_usage "/fix run [project]" "Runs one eval + review + fix pass now. Optional project filters to one target and overrides its skip." true
     add_usage "/fix add <path-or-project>" "Adds a Rust project to the style allowlist. Workspace members use workspace-relative entries." true
     add_usage "/fix rename <old> <new>" "Renames a fix project key and migrates history, pending state, and markers." true
     add_usage "/fix monitor" "Watches the latest fix log modified in the last 2 hours." true
@@ -40,10 +39,10 @@ load_usage_rows() {
     add_usage "/fix agent" "Shows all stage family, resolved agent, and effort assignments."
     add_usage "/agent fix <family>" "Switches the fix family in the shared agent registry."
     add_usage "/agent fix.<stage> <agent>[:<effort>]" "Edits a fix stage row; stages are style_eval, style_eval_review, and style_fix." true
-    add_usage "/fix on" "Enables all style stages."
-    add_usage "/fix off" "Disables all style stages."
-    add_usage "/fix eval on" "Enables one stage. Also works for review and fix."
-    add_usage "/fix eval off" "Disables one stage. Also works for review and fix." true
+    add_usage "/fix on" "Enables all style stages for the scheduled run."
+    add_usage "/fix off" "Disables all style stages for the scheduled run. /fix run is unaffected."
+    add_usage "/fix eval on" "Enables one scheduled stage. Also works for review and fix."
+    add_usage "/fix eval off" "Disables one scheduled stage. Also works for review and fix." true
     add_usage "/fix skip" "Shows targets currently skipped."
     add_usage "/fix skip <target>..." "Temporarily skips projects."
     add_usage "/fix skip enable <target>..." "Re-enables projects. Use enable-all to restore every temporary skip."
@@ -381,13 +380,13 @@ print_stage_text() {
     else
         status="DISABLED"
     fi
-    printf "%-7s %-8s %-7s %-12s %s\n" "$label" "$status" "$family" "${agent:-<default>}" "${effort:-<default>}"
+    printf "%-7s %-9s %-7s %-12s %s\n" "$label" "$status" "$family" "${agent:-<default>}" "${effort:-<default>}"
 }
 
 print_agents_rule() {
     repeat_dash 7
     printf ' '
-    repeat_dash 8
+    repeat_dash 9
     printf ' '
     repeat_dash 7
     printf ' '
@@ -400,7 +399,7 @@ print_agents_rule() {
 print_agents_text() {
     printf '## Agents\n\n'
     printf '```text\n'
-    printf "%-7s %-8s %-7s %-12s %s\n" "Stage" "Status" "Family" "Agent" "Effort"
+    printf "%-7s %-9s %-7s %-12s %s\n" "Stage" "Scheduled" "Family" "Agent" "Effort"
     print_agents_rule
     print_stage_text "eval" "style_eval"
     print_stage_text "review" "style_eval_review"

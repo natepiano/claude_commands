@@ -33,7 +33,11 @@ CONF_FILE="$SCRIPT_DIR/fix.conf"
 CMD_FILE="$HOME/.claude/commands/style_eval.md"
 HISTORY_HELPER="$SCRIPT_DIR/style_history.py"
 HEARTBEAT_HELPER="$SCRIPT_DIR/style-eval-heartbeat.sh"
-LOG_DIR="/private/tmp/claude"
+# /tmp/claude, not /private/tmp/claude: on macOS /tmp *is* /private/tmp —
+# same directory, same inode — while on Linux /private does not exist and
+# cannot be created, so the old constant killed these scripts at the first
+# mkdir under `set -e`. One constant is correct on both platforms.
+LOG_DIR="/tmp/claude"
 SINGLE_PROJECT="${1:-}"
 STYLE_ENABLED=""
 STYLE_AGENT=""
@@ -45,6 +49,13 @@ mkdir -p "$FAILURE_LOG_DIR"
 
 # Parse conf file for the [projects] allowlist and style_eval settings.
 project_entries=()  # opt-in eval projects (conf input): <dir> or <dir>/<subpath>
+
+# A /fix skip comments the [projects] line out with this marker, so a skipped
+# entry is invisible to the parse loop below. Capture those separately: naming a
+# project explicitly overrides its skip (see the resurrection block after the
+# parse), while the unnamed all-projects form still honors it.
+FIX_SKIP_RE='^[[:space:]]*#FIX_SKIP#[[:space:]]+(.+)$'
+skipped_entries=()
 cf_ac_keys=()  # [active_checkout] LHS: a [projects] entry being redirected
 cf_ac_vals=()  # [active_checkout] RHS: the checkout path to evaluate instead
 MAX_NEW_FINDINGS=""
@@ -61,6 +72,10 @@ fi
 if [[ -f "$CONF_FILE" ]]; then
     current_section=""
     while IFS= read -r line || [[ -n "$line" ]]; do
+        if [[ "$current_section" == "projects" && "$line" =~ $FIX_SKIP_RE ]]; then
+            skipped_entries+=("$(cf_trim "${BASH_REMATCH[1]}")")
+            continue
+        fi
         stripped="${line%%#*}"
         stripped="$(cf_trim "$stripped")"
         [[ -z "$stripped" ]] && continue
@@ -95,6 +110,28 @@ if [[ -f "$CONF_FILE" ]]; then
     done < "$CONF_FILE"
 fi
 
+# An explicitly named project overrides a temporary /fix skip — naming it is the
+# intent. An unmatched name is an error rather than a silent empty run, so a typo
+# does not read the same as "nothing to do".
+if [[ -n "$SINGLE_PROJECT" ]]; then
+    for skipped in ${skipped_entries[@]+"${skipped_entries[@]}"}; do
+        if [[ "${skipped##*/}" == "$SINGLE_PROJECT" ]]; then
+            echo "NOTE: $SINGLE_PROJECT is temporarily skipped; running it because it was named explicitly."
+            project_entries+=("$skipped")
+        fi
+    done
+    single_found=0
+    for entry in ${project_entries[@]+"${project_entries[@]}"}; do
+        if [[ "${entry##*/}" == "$SINGLE_PROJECT" ]]; then
+            single_found=1
+        fi
+    done
+    if (( ! single_found )); then
+        echo "ERROR: no [projects] entry named '$SINGLE_PROJECT' in $CONF_FILE" >&2
+        exit 1
+    fi
+fi
+
 if [[ -z "$MAX_NEW_FINDINGS" ]]; then
     echo "ERROR: [style_eval] max_new_findings is not set in $CONF_FILE" >&2
     exit 1
@@ -103,8 +140,8 @@ cf_load_stage_assignment style_eval STYLE_ENABLED STYLE_AGENT STYLE_AGENT_MODEL 
 
 # Backstop timeout for a single eval agent. Reuses the [style_fix] agent cap
 # (defaults to 2h if unset). Bounds a wedged agent so it cannot stall the serial
-# wait loop forever — the failure that left a 12h-old run holding the launchd
-# trigger's pgrep concurrency guard open, which suppressed every nightly run.
+# wait loop forever — the failure that left a 12h-old run holding the trigger's
+# pgrep concurrency guard open, which suppressed every nightly run.
 # The common trigger is the model issuing `rg PATTERN` with no path argument:
 # run non-interactively, rg reads from stdin, and that stdin is a pipe that
 # never closes, so rg blocks on read() indefinitely.
@@ -115,10 +152,15 @@ AGENT_TIMEOUT_SECS="${AGENT_TIMEOUT_SECS:-7200}"
 # commands too, so we filter to codex's exec marker — codex appends
 # ` in <cwd>` after every shell command it actually runs. For claude,
 # match the bash tool result preamble. Both narrow past prompt mentions.
+#
+# The cwd is always under $HOME, so match that rather than a literal /Users:
+# hardcoded, this silently answered "no" for every real call on Linux, where
+# the marker reads ` in /home/...`.
 agent_called_helper() {
     local log_file="$1"
     [[ -f "$log_file" ]] || return 1
-    grep -Eq 'style_history\.py[^\n]*(next-unit|record-unit)[^\n]*in /Users/' "$log_file" && return 0
+    local home_re="${HOME//./\\.}"
+    grep -Eq "style_history\.py[^\n]*(next-unit|record-unit)[^\n]*in ${home_re}/" "$log_file" && return 0
     grep -Eq '<bash-stdout>[^<]*style_history\.py[^<]*(next-unit|record-unit)' "$log_file"
 }
 
@@ -432,8 +474,10 @@ run_style_agent() {
     esac
 }
 
-if [[ "$STYLE_ENABLED" == "false" && "${FIX_FORCE_STYLE_STAGES:-0}" != "1" ]]; then
-    echo "Style evaluation is disabled."
+# Stage enablement is scheduled-run policy: only the scheduled run (which sets
+# FIX_SCHEDULED=1 via fix-trigger.sh) consults it. A standalone invocation runs.
+if [[ "${FIX_SCHEDULED:-0}" == "1" && "$STYLE_ENABLED" == "false" ]]; then
+    echo "Style evaluation is disabled for scheduled runs."
     exit 0
 fi
 
@@ -579,7 +623,8 @@ for i in "${!projects[@]}"; do
             # Caught up: every reviewable unit was reviewed within the TTL. With
             # no dormancy gate each unit re-arms on time alone, so the next eval
             # has a definite date — the soonest unit TTL expiry. Show that date
-            # (local time, via BSD `date -r <epoch>`) instead of a TTL lecture.
+            # (local time) instead of a TTL lecture. `date -r <epoch>` is the
+            # BSD spelling and `date -d @<epoch>` the GNU one; try both.
             next_epoch=$("$PY" "$HISTORY_HELPER" due-units --project-root "$project_root" --field next_due_epoch 2>/dev/null)
             # Separate [[ ]] blocks: bash 3.2 mis-parses `=~ regex && other` in
             # one bracket (the regex operand swallows the &&).

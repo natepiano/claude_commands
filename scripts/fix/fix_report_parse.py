@@ -82,7 +82,7 @@ FRAMEWORK_FILTER_REASONS: frozenset[str] = frozenset(
 
 # Orphan-stub skip reasons start with this prefix. The script emits the full
 # path after it (e.g. "style_fix orphan stub — manual cleanup required at
-# /Users/.../nateroids_style_fix") so the user has actionable detail in the
+# ~/rust/nateroids_style_fix") so the user has actionable detail in the
 # log. The parser normalizes the reason to the prefix for grouping and emits
 # a NOTE per project so the path surfaces under "Heads up" in the report.
 ORPHAN_STUB_PREFIX: str = "style_fix orphan stub"

@@ -14,27 +14,22 @@ When no subcommand is provided, run this script and relay its stdout exactly:
 
 The script owns the user-facing data, section order, column widths, wrapping, and formatting. Do not parse, summarize, truncate, filter, sort, merge, rename, rewrite, add rows, or convert its output to Markdown pipe tables. Do not read or reinterpret fix config files for this screen; the script output is the only source. If the script exits non-zero, show its stdout/stderr exactly and stop.
 
-Dispatch: `run`/`run_once` → <Run/>, `add` → <Add/>, `rename` → <Rename/>, `monitor` → <Monitor/>, `report`/`list` → <Report/>, `eval`/`review`/`fix`/`agent`/`on`/`off` → <StyleAgentConfig/>, `skip` → <Skip/>. Empty or unrecognized first token → run the usage script above, relay stdout exactly, and stop.
+Dispatch: `run` → <Run/>, `add` → <Add/>, `rename` → <Rename/>, `monitor` → <Monitor/>, `report`/`list` → <Report/>, `eval`/`review`/`fix`/`agent`/`on`/`off` → <StyleAgentConfig/>, `skip` → <Skip/>. Empty or unrecognized first token → run the usage script above, relay stdout exactly, and stop.
 
 <Run>
 
 ## run [project]
-## run_once
 
-### `run`, `run_once` — style pipeline execution
+### `run` — style pipeline execution
 
-Launch `~/.claude/scripts/fix/fix.sh` interactively, off the launchd schedule. Build the script arguments from the user command:
+Launch `~/.claude/scripts/fix/fix.sh` interactively, off the timer's schedule.
 
-- `run` — eval + review + fix worktrees across configured style projects; an optional project argument filters to one target
-- `run_once` — one eval + review + fix pass across every configured style project, regardless of the three persistent stage enablement settings
-
-The `run` forms can take an optional project name:
+An interactive run **always runs all three stages**. The `enabled=` switches in `agent-assignments.conf` are scheduled-run policy: only the scheduled job consults them (`style-fix.timer` on Linux, the `org.nixos.style-fix` launchd agent on macOS), because only it sets `FIX_SCHEDULED=1`. Nothing is written to that file, so the schedule's settings survive untouched.
 
 - `/fix run` — style eval/review/fix for all targets
 - `/fix run <project>` — style eval/review/fix for one target
-- `/fix run_once` — one forced style eval/review/fix pass for all style targets
 
-`run_once` takes no arguments. If any token follows it, run the usage script, relay stdout exactly, and stop. It does not change `agent-assignments.conf`; later scheduled runs continue using the persistent stage enablement settings. Normal per-project safety and eligibility skips still apply; only stage enablement is overridden.
+Normal per-project safety and eligibility skips still apply. A named project additionally overrides a temporary `/fix skip` — naming it is the intent — and a name matching no `[projects]` entry exits with an error rather than an empty run.
 
 `<project>` may be either the active checkout name shown in the usage table's `Project` column or the preserved identity shown in `Project Key`. The scripts normalize both through `[active_checkout]`; do not create duplicate style entries for active worktrees.
 
@@ -48,9 +43,9 @@ pgrep -fl fix.sh || true
 
 If anything matches, tell the user `Fix pipeline already running (PID …). Use /fix monitor to attach to the live log, or wait for it to finish.` Stop. Do not launch a second copy.
 
-**Step 2: Show the `run_once` execution summary.** Skip this step for `run`. For `run_once`, source `~/.claude/scripts/fix/agent_assignments.sh`, resolve `style_eval`, `style_eval_review`, and `style_fix` with `cf_load_stage_assignment`, and show:
+**Step 2: Show the execution summary.** Source `~/.claude/scripts/fix/agent_assignments.sh`, resolve `style_eval`, `style_eval_review`, and `style_fix` with `cf_load_stage_assignment`, and show:
 
-`One eval → eval_review → fix pass across all configured style projects. Persistent stage enablement is ignored for this run.`
+`One eval → eval_review → fix pass across <all configured style projects | project <name>>. Stage enablement applies to scheduled runs only.`
 
 Then render the current assignments as a Markdown table with exactly these columns and rows:
 
@@ -60,14 +55,15 @@ Then render the current assignments as a Markdown table with exactly these colum
 | eval_review | `<resolved agent>:<resolved effort>` |
 | fix | `<resolved agent>:<resolved effort>` |
 
-Use `<default>` when agent or effort is empty. This summary is informational; do not edit either assignment file.
+Use `<default>` when agent or effort is empty. This summary is informational; do not edit either assignment file. `fix.sh` logs the same summary into the run log.
 
 **Step 3: Launch.** The orchestrator writes its own timestamped log under `~/.local/logs/fix/fix-YYYYMMDD-HHMMSS.log` and updates the `~/.local/logs/fix.log` symlink to point at it. Don't pre-create or redirect — just launch:
 
 ```bash
 ~/.claude/scripts/fix/fix.sh [project]
-~/.claude/scripts/fix/fix.sh run_once
 ```
+
+Do **not** set `FIX_SCHEDULED` — that marker belongs to `fix-trigger.sh` and would make the run honor the stage switches.
 
 Use `Bash` with `dangerouslyDisableSandbox: true` and `run_in_background: true`. Capture the resulting bash shell id so the user can kill it later with `KillShell` if needed. After launch, resolve the active log path:
 
@@ -82,9 +78,8 @@ Tell the user: `Fix pipeline launched (shell <id>). Log: <path>.`
 ### Notes
 
 - The full run can take an hour or more. The user does not need to keep this conversation open — the script runs detached and writes to disk.
-- `run` is the on-demand counterpart to the launchd job; the schedule is unaffected. If a launchd-triggered run is already in flight, Step 1 will catch it.
-- `run_once` is a one-time style-stage override that does not persistently enable any stage.
-- For testing only the review stage in isolation, prefer `~/.claude/scripts/fix/style-eval-review-all.sh [project]` — much faster than a full fix run.
+- `run` is the on-demand counterpart to the scheduled job; the schedule is unaffected. If a timer-triggered run is already in flight, Step 1 will catch it.
+- For testing only the review stage in isolation, prefer `~/.claude/scripts/fix/style-eval-review-all.sh [project]` — much faster than a full fix run. Called directly like this it also ignores stage enablement, for the same reason `/fix run` does.
 - Use `/fix report` after the run for a per-project matrix, or `/fix monitor` during the run for live updates.
 
 </Run>
@@ -159,18 +154,23 @@ Attach a persistent Monitor to whichever fix-related script the user just kicked
 Inspect the well-known log locations and pick the single most recently modified log within the last 2 hours. Older candidates are stale — do not pick them.
 
 ```bash
-ls -lt --time=mtime \
-  /tmp/style-fix-stdout.log \
+now=$(date +%s)
+for f in \
   ~/.local/logs/fix.log \
+  ~/Library/Logs/nate-jobs/style-fix.log \
   ~/.local/logs/fix/style-fix-manual-*.log \
   /tmp/claude/style-fix-*.log \
   /tmp/claude/style-eval-*.log \
   /tmp/claude/clean-fix-*.log \
-  /tmp/claude/fix-*.log \
-  2>/dev/null | head -5
+  /tmp/claude/fix-*.log
+do
+  [ -f "$f" ] || continue
+  m=$(stat -Lc %Y "$f" 2>/dev/null || stat -Lf %m "$f" 2>/dev/null) || continue
+  echo "$((now - m))	$f"
+done | sort -n | head -5
 ```
 
-`mtime` from `stat -f '%m' <file>` gives a unix timestamp; compare against `$(date +%s)` and require the difference under 7200 seconds.
+Each line is `<age-in-seconds><TAB><path>`, freshest first. `stat -Lc %Y` is the GNU spelling and `stat -Lf %m` the BSD one, so this runs unchanged on both machines; `-L` matters because `~/.local/logs/fix.log` is a symlink to the newest run log and the link's own mtime stops moving once the run starts. A candidate is fresh when its age is under 7200 seconds.
 
 Decision:
 - **Fresh candidate found** — set `${LOG_PATH}` to the newest fresh candidate and tell the user `Watching ${LOG_PATH} (last write Ns ago).` Proceed to <ArmMonitor/>.
@@ -202,7 +202,7 @@ Otherwise tell the user: `Detected phase: <name>. Arming monitor on ${LOG_PATH}.
 - `timeout_ms`: `3600000`
 - `command`: `python3 ~/.claude/scripts/fix/style-fix-monitor.py ${PROJECT}`
 
-Derive `${PROJECT}` from the log before arming the helper. Use the first `Launched:` or worktree line that names the project. If the project cannot be derived, tell the user `Could not identify the project from ${LOG_PATH}; use tail -f ${LOG_PATH}.` Then stop. The helper tails both the manual log and the agent's own log (`/private/tmp/claude/style_fix_<project>.log`), translates the agent's phase sentinels to `phase=agent-step name=<...>`, and exits 0 on the `phase=launcher-exit` sentinel — no TaskStop needed. (A tail+grep pipeline cannot terminate itself at launcher-exit inside the sandbox: `pkill` is denied access to macOS's process-list service and shell job-control is unavailable.) Then report events per <StyleFixManualEvents/> and skip the rest of this section.
+Derive `${PROJECT}` from the log before arming the helper. Use the first `Launched:` or worktree line that names the project. If the project cannot be derived, tell the user `Could not identify the project from ${LOG_PATH}; use tail -f ${LOG_PATH}.` Then stop. The helper tails both the manual log and the agent's own log (`/tmp/claude/style_fix_<project>.log`), translates the agent's phase sentinels to `phase=agent-step name=<...>`, and exits 0 on the `phase=launcher-exit` sentinel — no TaskStop needed. (The tail+grep pipeline it replaced could not stop itself: terminating it meant `pkill`-ing the right pid, and shell job-control is unavailable here. Use the helper on both machines — one code path, no signalling.) Then report events per <StyleFixManualEvents/> and skip the rest of this section.
 
 For all other logs, fetch the live-monitor filter regex from the parser (single source of truth — keeps phase classification and live filtering in lockstep):
 
@@ -261,7 +261,7 @@ For Monitors armed with `style-fix-monitor.py`, emit one short line per event:
 
 ### Monitor notes
 
-- The orchestrator script `fix.sh` writes both to `~/.local/logs/fix.log` (via `tee`) and via the `com.natemccoy.style-fix` launchd job to `/tmp/style-fix-stdout.log` every 10 minutes. Either is valid; <DetectLog/> will prefer whichever is freshest.
+- The orchestrator script `fix.sh` tees to `~/.local/logs/fix.log` on both machines, so that symlink is the portable candidate and the one <DetectLog/> normally lands on. The scheduled job's own sink is per-platform — the journal on Linux (`journalctl --user -u style-fix`), `~/Library/Logs/nate-jobs/style-fix.log` on macOS — and only the macOS one is a file <DetectLog/> can stat.
 - Standalone runs of `style-eval-all.sh` or `style-fix-worktrees.sh` invoked interactively typically log to `/tmp/claude/<name>-<suffix>.log`. The detector pattern globs match those.
 - The Monitor uses `tail -F -n 0` so we start at the current end of the file — backlog is not re-emitted.
 - `grep --line-buffered` is required — without it, pipe buffering delays events by minutes and the monitor looks broken.
@@ -284,6 +284,8 @@ Read `~/.claude/scripts/fix/report-render.md` and follow it, substituting the re
 ## on|off
 
 Show fix pipeline agent assignments or set stage enablement. These commands do not run the eval, review, or fix phase for a project. Project-scoped execution is `/fix run <project>`.
+
+**Stage enablement governs the scheduled run only.** `enabled=false` means the timer's run skips that stage; it never blocks `/fix run`, `/style_eval --fix`, or a stage script called directly. Say so whenever you report a stage as disabled, so `DISABLED` is not read as "the pipeline is off".
 
 The fix stage assignment file is `~/.claude/scripts/fix/agent-assignments.conf`; it owns only stage `enabled=` values. The global agent registry is `~/.claude/config/agents.conf`; `[assignments] fix=<family>` selects the family and `[fix.<family>]` provides each stage's `agent[:effort]` row.
 

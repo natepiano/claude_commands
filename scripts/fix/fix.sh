@@ -1,34 +1,31 @@
 #!/usr/bin/env bash
 # Fix style orchestrator.
 # Usage: fix.sh [project]
-#        fix.sh run_once
 #   [project] — optionally filter the style eval, review, and fix pass
-#   run_once — run one pass across all configured projects, ignoring persistent
-#              stage enablement
+#
+# Stage enablement in agent-assignments.conf is scheduled-run policy, not a
+# global off switch. fix-trigger.sh (what the timer runs) sets FIX_SCHEDULED=1 and
+# only that run consults the `enabled=` switches. Every hand-invoked run — /fix
+# run, or a stage script called directly — runs all three stages regardless.
 
 set -euo pipefail
 
-RUN_ONCE_REQUESTED="false"
+SCHEDULED="${FIX_SCHEDULED:-0}"
+export FIX_SCHEDULED="$SCHEDULED"
+
 PROJECT_FILTER=""
-if [[ $# -gt 0 ]]; then
-    case "$1" in
-        run_once)
-            RUN_ONCE_REQUESTED="true"
-            if [[ $# -gt 1 ]]; then
-                echo "Usage: fix.sh run_once" >&2
-                exit 1
-            fi
-            export FIX_FORCE_STYLE_STAGES=1
-            ;;
-        *)
-            PROJECT_FILTER="$1"
-            if [[ $# -gt 1 ]]; then
-                echo "Usage: fix.sh [project]" >&2
-                exit 1
-            fi
-            ;;
-    esac
+if [[ $# -gt 1 ]]; then
+    echo "Usage: fix.sh [project]" >&2
+    exit 1
 fi
+if [[ $# -eq 1 ]]; then
+    PROJECT_FILTER="$1"
+fi
+
+# A stage runs unless this is the scheduled run and the stage is switched off.
+stage_runs() {
+    [[ "$SCHEDULED" != "1" || "$1" == "true" ]]
+}
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 
@@ -61,19 +58,22 @@ find "$LOG_DIR" -name 'clean-fix-*.log' -mmin +"$RUN_LOG_RETENTION_MINUTES" -del
 find "$LOG_DIR" -name 'style-fix-manual-*.log' -mtime +"$MANUAL_LOG_RETENTION_DAYS" -delete 2>/dev/null || true
 > "$LOG_FILE"
 # Maintain legacy single-file path as a symlink to the latest run so existing
-# tooling and the launchd plist stdout sink keep working.
+# tooling keeps working. This is the one log path that is the same on both
+# machines, so /fix monitor's detector leads with it.
 ln -sfn "$LOG_FILE" "$LEGACY_LOG"
 
 log() {
     echo "$(date '+%Y-%m-%d %H:%M:%S') $1" | tee -a "$LOG_FILE"
 }
 
-log_run_once_summary() {
+log_stage_summary() {
     local eval_agent="${STYLE_EVAL_MODEL:-<default>}:${STYLE_EVAL_EFFORT:-<default>}"
     local review_agent="${STYLE_REVIEW_MODEL:-<default>}:${STYLE_REVIEW_EFFORT:-<default>}"
     local fix_agent="${STYLE_FIX_MODEL:-<default>}:${STYLE_FIX_EFFORT:-<default>}"
+    local scope="all configured style projects"
+    [[ -n "$PROJECT_FILTER" ]] && scope="project $PROJECT_FILTER"
 
-    log "Run-once execution summary: one eval -> eval_review -> fix pass across all configured style projects; persistent stage enablement ignored."
+    log "Execution summary: one eval -> eval_review -> fix pass across $scope; stage enablement applies to scheduled runs only."
     {
         printf '%-12s %s\n' "Stage" "Agent:effort"
         printf '%-12s %s\n' "------------" "------------"
@@ -181,13 +181,13 @@ cf_load_stage_assignment style_fix \
 START_TIME=$SECONDS
 if [[ -n "$PROJECT_FILTER" ]]; then
     log "=== Starting fix (project: $PROJECT_FILTER) ==="
-elif [[ "$RUN_ONCE_REQUESTED" == "true" ]]; then
-    log "=== Starting fix (run_once) ==="
+elif [[ "$SCHEDULED" == "1" ]]; then
+    log "=== Starting fix (scheduled) ==="
 else
     log "=== Starting fix ==="
 fi
-if [[ "$RUN_ONCE_REQUESTED" == "true" ]]; then
-    log_run_once_summary
+if [[ "$SCHEDULED" != "1" ]]; then
+    log_stage_summary
 fi
 
 # Back-populate canonical settings.local.json permissions before every pass:
@@ -197,38 +197,39 @@ log "SETTINGS: back-populating canonical permissions..."
     log "WARNING: settings back-population failed"
 }
 
-# Run style evaluations and fixes when their stage assignments are enabled.
+# Run style evaluations and fixes. A scheduled run skips any stage switched
+# off in agent-assignments.conf; an interactive run always runs all three.
 style_args=()
 if [[ -n "$PROJECT_FILTER" ]]; then
     style_args+=("$(project_filter_key "$PROJECT_FILTER")")
 fi
-if [[ "$STYLE_EVAL_ENABLED" == "true" || "$RUN_ONCE_REQUESTED" == "true" ]]; then
+if stage_runs "$STYLE_EVAL_ENABLED"; then
     log "Starting style evaluations with family=$STYLE_EVAL_AGENT agent=${STYLE_EVAL_MODEL:-<default>} effort=${STYLE_EVAL_EFFORT:-<default>}..."
     "$SCRIPT_DIR/style-eval-all.sh" ${style_args[@]+"${style_args[@]}"} 2>&1 | tee -a "$LOG_FILE" || {
         log "WARNING: style evaluation script failed"
     }
 else
-    log "SKIP: style eval disabled in agent-assignments.conf"
+    log "SKIP: style eval disabled for scheduled runs in agent-assignments.conf"
 fi
 
 # Review pass over each project's pending evaluation markdown before the
 # fix stage spawns.
-if [[ "$STYLE_REVIEW_ENABLED" == "true" || "$RUN_ONCE_REQUESTED" == "true" ]]; then
+if stage_runs "$STYLE_REVIEW_ENABLED"; then
     log "Reviewing pending evaluation markdown with family=$STYLE_REVIEW_AGENT agent=${STYLE_REVIEW_MODEL:-<default>} effort=${STYLE_REVIEW_EFFORT:-<default>}..."
     "$SCRIPT_DIR/style-eval-review-all.sh" ${style_args[@]+"${style_args[@]}"} 2>&1 | tee -a "$LOG_FILE" || {
         log "WARNING: style eval review script failed"
     }
 else
-    log "SKIP: style eval review disabled in agent-assignments.conf"
+    log "SKIP: style eval review disabled for scheduled runs in agent-assignments.conf"
 fi
 
-if [[ "$STYLE_FIX_ENABLED" == "true" || "$RUN_ONCE_REQUESTED" == "true" ]]; then
+if stage_runs "$STYLE_FIX_ENABLED"; then
     log "Creating style-fix worktrees with family=$STYLE_FIX_AGENT agent=${STYLE_FIX_MODEL:-<default>} effort=${STYLE_FIX_EFFORT:-<default>}..."
     "$SCRIPT_DIR/style-fix-worktrees.sh" ${style_args[@]+"${style_args[@]}"} 2>&1 | tee -a "$LOG_FILE" || {
         log "WARNING: style-fix worktree script failed"
     }
 else
-    log "SKIP: style fix disabled in agent-assignments.conf"
+    log "SKIP: style fix disabled for scheduled runs in agent-assignments.conf"
 fi
 
 ELAPSED=$(( SECONDS - START_TIME ))
