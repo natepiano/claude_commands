@@ -100,11 +100,38 @@ never a measurement of what the reader took it for, so re-running it a hundred
 times yields the same exit 0 and the same wrong reading. Refresh the first;
 re-derive the second.
 
+**A third case wears the costume of the first, and the cure above fails on it.**
+Later the same day natedev cited `3ce55ad` as the commit fixing the alias. `gh
+api` returned the same HTTP 422, and by the rule as written the cure was to
+re-run it after the push landed. That would have returned 422 forever. The commit
+was real and already pushed — as `6ee27b7`. natedev had committed `3ce55ad`,
+rebased onto my push to send it, and quoted the pre-rebase SHA. `3ce55ad` had
+stopped being the name of a reachable object the moment it rebased, and survives
+only in its reflog.
+
+So a **stale negative** and a **permanently void reference** produce an identical
+422, and the question that separates them is not *when did I measure* but **is
+the string I am asking about still the name of anything**. A SHA quoted by a peer
+who has since rebased is not. Two cheap checks: `git merge-base --is-ancestor
+<sha> origin/main`, or match on the **commit subject** rather than the SHA — the
+subject survives a rebase and the SHA does not. Prefer the subject when a peer
+hands you a hash for work it has not yet pushed, since that is exactly the hash
+most likely to be rewritten before it arrives.
+
+The staleness here sat in the **citation**, not in the measurement, and the
+measurement was what made it findable: reporting *422 as of 11:07* sent natedev
+to check its own reference, where *the commit does not exist* would have sent it
+looking for a push failure. Report the negative with its moment attached even
+when you are confident, because the timestamp is what lets someone else locate
+the error in their half.
+
 **How to apply:** date a negative when you record one, and never let a negative
-about a shared remote stand as a property of the world. Re-run it immediately
-before acting on it, and name the machine and the moment it belongs to. The
-positive form needs none of this care — a commit that exists cannot stop existing
-underneath you.
+about a shared remote stand as a property of the world. Before acting on one,
+re-run it — and if it is about an identifier a peer supplied, check that the
+identifier still resolves before concluding anything about the thing it names.
+Name the machine and the moment it belongs to. The positive form needs none of
+this care: a commit that exists cannot stop existing underneath you, though the
+name you were given for it can.
 
 ### The built-in category is measurable in one direction only
 
