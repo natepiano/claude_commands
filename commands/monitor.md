@@ -6,23 +6,20 @@ description: Switch which computer a monitor displays, over DDC/CI.
 
 <ExecutionSteps>
     **EXECUTE THESE STEPS IN ORDER:**
-    **STEP 1:** Run `bash ~/.claude/scripts/monitor/monitor.sh $ARGUMENTS`. It picks the backend for whichever machine you are on — ddcutil on Linux, m1ddc on the Mac — so pass the arguments through unchanged rather than translating them.
-    **STEP 2:** Report the script output to the user. Do not add commentary when it succeeds; the script says what happened.
-    **STEP 3:** If it exits non-zero, report its stderr verbatim. Do not retry with different arguments and do not reach for `ddcutil`/`m1ddc` directly — the script already tries the Mac over ssh when the Dell cannot be driven from Linux, so a failure means both paths are gone.
+    **STEP 1:** Run `bash ~/.claude/scripts/monitor/monitor.sh $ARGUMENTS`. It picks the backend for whichever machine you are on — ddcutil on Linux, m1ddc on the Mac — so pass the arguments through unchanged.
+    **STEP 2:** Report the script output. Add no commentary when it succeeds.
+    **STEP 3:** On a non-zero exit, report its stderr verbatim. Do not retry with different arguments and do not reach for `ddcutil`/`m1ddc` directly — the script already tries the Mac over ssh when the Dell cannot be driven from Linux, so a failure means both paths are gone.
 </ExecutionSteps>
 
-## What it can and cannot do
+## Scope
 
-`/monitor mac`, `/monitor linux`, `/monitor dell mac`, `/monitor dell linux` all switch the Dell S3425DW. Naming no monitor means every switchable one, which today is the Dell alone.
+`/monitor mac`, `/monitor linux`, `/monitor dell mac`, `/monitor dell linux` all switch the Dell S3425DW. Naming no monitor means every switchable one, today the Dell alone.
 
-`/monitor samsung <anything>` prints why it cannot work and exits non-zero. The Samsung C34J79x implements no DDC/CI: its EDID reads perfectly from both machines, but i2c address 0x37 never answers — over DisplayPort from Linux, and over Thunderbolt from the Mac, which are unrelated stacks. It was displaying the Mac during that test, so it is not a case of a panel answering only on its live input, and its OSD has no DDC/CI toggle. Use its buttons or its own input auto-detection.
+`/monitor samsung <anything>` exits non-zero with the reason. The Samsung C34J79x implements no DDC/CI: its EDID reads from both machines but i2c 0x37 never answers — over DisplayPort from Linux and Thunderbolt from the Mac, unrelated stacks, while it was displaying the Mac — and its OSD has no DDC/CI toggle. Use its buttons or its input auto-detection.
 
-## Notes that matter when this misbehaves
+## When this misbehaves
 
-Keyboard and mouse do not follow the picture. There is no KVM in either monitor; deskflow already shares the Mac's keyboard and mouse over the network, so they reach the Linux box whether or not it is on screen.
-
-The Mac writing its own input code (`set input 27`) has never actually been run — every Mac-side switch test went through a stub. Reading from the Mac is proven, and the `0x1b` value itself is proven from the Linux side, so this is expected to work; it is simply not yet a tested path. The first real `/monitor dell mac` issued on the Mac is what settles it.
-
-Either machine can drive the Dell no matter which one it is displaying. Both directions are tested, so a switch is never one-way and you can always get the screen back from where you are sitting.
-
-The Linux script keeps an ssh-to-the-Mac fallback anyway, for the case where the direct path stops working — the failure it covers is the one that would otherwise strand you. It should never fire; if it does, it announces itself, and it needs the 1Password agent to approve the key, so it can sit waiting on a tap.
+- Keyboard and mouse do not follow the picture. Deskflow shares the Mac's over the network, so they reach the Linux box on screen or not.
+- Either machine drives the Dell whichever one it is displaying. Both directions are tested, so a switch is never one-way.
+- The Mac writing its own input code (`set input 27`) has only ever run through a stub. Reading from the Mac is proven and so is the `0x1b` value from the Linux side, so it is expected to work; the first real `/monitor dell mac` issued on the Mac settles it.
+- The Linux script's ssh-to-the-Mac fallback should never fire. If it does it announces itself, and it needs the 1Password agent to approve the key, so it can sit waiting on a tap.

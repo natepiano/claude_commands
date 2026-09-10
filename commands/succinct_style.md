@@ -1,20 +1,20 @@
 ---
-description: Load this before editing any file under ~/rust/nate_style/ or a repo-local docs/style/.
+description: Load before editing any command, skill, or style rule file.
 ---
 
-Load this before editing any file under `~/rust/nate_style/` or a repo-local `docs/style/`.
+Load before editing anything that enters a session as instructions: `~/.claude/commands/`, skills, and style rules under `~/rust/nate_style/` or a repo-local `docs/style/`.
 
 ## Context cost is real
 
-Style rules bulk-load into every session via `load-rust-style.sh`. 60+ files. Every sentence you add pays a token cost on every future agent turn. Accuracy first, then ruthless terseness.
+Style rules bulk-load into every session via `load-rust-style.sh`; a command loads whole on every invocation. Every sentence pays a token cost on every future turn. Accuracy first, then ruthless terseness — as short as it goes without losing what an agent needs to finish the work.
 
 ## Defaults
 
-- One-line scope notes beat paragraphs. A future reader reads the rule, not your explanation of it.
-- Finger-point to other rules by filename (`see foo.md`). Do **not** add to `see_also` unless the target is tiny or strongly load-bearing — the loader inlines see_also'd content, so additions duplicate, not redirect.
-- No meta-commentary. Do not explain the mistake that prompted the edit, do not say "reasoning by analogy fails," do not narrate what you cut.
-- Do not restate the rule elsewhere in the same file for emphasis.
-- Bump `date_modified` in frontmatter.
+- One-line scope notes beat paragraphs. A reader reads the rule, not your explanation of it.
+- Point at other files by name (`see foo.md`). In style rules, do **not** add to `see_also` unless the target is tiny or carries the rule itself — the loader inlines it, so additions duplicate instead of redirecting.
+- No meta-commentary. Do not explain the mistake that prompted the edit, do not narrate what you cut.
+- Do not restate a rule elsewhere in the same file for emphasis.
+- Style rules: bump `date_modified` in frontmatter.
 
 ## Cut list
 
@@ -24,7 +24,8 @@ Before submitting an edit, delete:
 - "Note that…" prefaces → just say the thing.
 - Full example blocks when a one-line example makes the same point.
 - Any sentence whose removal would not confuse a first-time reader.
+- Motivation, reassurance, and context the step itself already carries.
 
 ## Escalation
 
-If the edit needs more than ~3 lines of body text, it is probably a new rule file, not an amendment. Propose splitting it.
+A style edit needing more than ~3 lines of body is probably a new rule file, not an amendment. Propose splitting it.

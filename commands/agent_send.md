@@ -72,11 +72,11 @@ Never ask the recipient to do anything this session was denied permission to do 
 </Send>
 
 <Report>
-One or two lines: who it went to (name, status at send) and that it was delivered — or the error. Do not quote the message back; the user wrote it or just saw it composed.
+One or two lines: who it went to (name, status at send) and that it was delivered, or the error. Never quote the message back.
 
-In **respond mode**, add that a reply is expected and will be relayed when it arrives, then end the turn. The reply arrives as a `<cross-session-message from="...">` block; when it lands, relay it in two or three lines — sender and substance, not a full quote — unless the user asks for the whole thing. Do not poll `ListAgents` or send "have you answered?" follow-ups; a busy session replies at its next tool round.
+In **respond mode**, add that a reply is expected, then end the turn. It arrives as a `<cross-session-message from="...">` block; relay it in two or three lines — sender and substance — unless the user asks for the whole thing. Never poll `ListAgents` or send "have you answered?" follow-ups; a busy session replies at its next tool round.
 
-Then resume whatever this session was doing before the command, if anything was in progress.
+Then resume whatever was in progress before the command.
 </Report>
 
 ## Rules
