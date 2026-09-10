@@ -9,6 +9,7 @@
   "permissions": {
     "allow": [
       "Bash(cargo *)",
+      "Bash(cargo-berth *)",
       "Bash(gh *)",
       "Bash(git add *)",
       "Bash(git blame *)",
