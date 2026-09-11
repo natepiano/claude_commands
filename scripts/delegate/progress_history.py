@@ -652,24 +652,26 @@ def _explicit_plan_timing(
             plan_doc=str(plan_path),
         )
 
-    try:
-        git_path = plan_path.relative_to(working_dir)
-    except ValueError:
-        commit_times = ""
-    else:
-        commit_times = _git_value(
-            working_dir,
-            "log",
-            "--follow",
-            "--format=%cI",
-            "--",
-            str(git_path),
-        )
-    committed = [line.strip() for line in commit_times.splitlines() if line.strip()]
+    # The plan's own first checkpoint, never the plan file's first commit. A
+    # phased plan is routinely born as the previous plan's `-next.md` backlog,
+    # committed by that project's very first checkpoint — so dating a project
+    # from the file's birth measures its predecessor's whole run as this one's
+    # elapsed time, and the ETA extrapolates from a rate nobody worked at.
+    # <CheckpointCommit/> writes `checkpoint(<plan-slug>):` on every phase, and
+    # the closing paren keeps `github-runners` from matching
+    # `github-runners-next`.
+    checkpoint_times = _git_value(
+        working_dir,
+        "log",
+        "--fixed-strings",
+        f"--grep=checkpoint({plan_path.stem}):",
+        "--format=%cI",
+    )
+    committed = [line.strip() for line in checkpoint_times.splitlines() if line.strip()]
     if committed:
         value = committed[-1]
-        started_at = _iso_epoch(value, f"Git history for {plan_path}")
-        source = "plan_git"
+        started_at = _iso_epoch(value, f"First checkpoint for {plan_path}")
+        source = "plan_first_checkpoint"
     else:
         value = _iso_time(now)
         started_at = now
