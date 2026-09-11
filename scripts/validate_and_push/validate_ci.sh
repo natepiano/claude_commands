@@ -30,26 +30,19 @@ REPO_ROOT="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
 REPO_TARGET_DIR="${CARGO_TARGET_DIR:-${REPO_ROOT}/target}"
 export CARGO_TARGET_DIR="$REPO_TARGET_DIR"
 export VALIDATE_TARGET_DIR="$REPO_TARGET_DIR"
-HOST_TRIPLE="$(rustc -vV | sed -n 's/^host: //p')"
 
 # Canonical local CI mirror for Nate's Rust repos.
 # Variations:
 # - When the repo builds cargo-mend, fix and strict steps invoke that build
 #   instead of the installed binary, so a mend change gates its own push; all
 #   other repos use the installed cargo-mend through LINT_CMD
-# - Host clippy lints lib/bins/tests only (examples and benches excluded);
-#   benches are intentionally never run here — run them ad hoc
+# - Clippy lints --all-targets, the same scope CI uses; benches are linted but
+#   intentionally never run here — run them ad hoc
 # - `mend=off` in config/lint.conf skips both cargo-mend steps here, and only
 #   those two. Every other step ignores that file: a pre-push gate that silently
 #   no-ops is worse than a noisy one. mend is the exception because it rewrites
 #   source, so a mend release that emits a fix which does not compile blocks
 #   every push from an affected repo with nothing the repo can do about it
-# - If `.cargo/validate-targets` exists, each non-comment target listed there
-#   gets additive clippy plus test-binary compilation when it is this host's
-#   native triple; any other target is CI's job and is skipped with a notice.
-#   Cross-compiling from macOS was retired with the nix migration (Stage 4
-#   step 10): development happens on natedev, which runs the Linux target
-#   natively, so the zig linker shims and the Debian sysroot are gone.
 
 worktree_has_changes() {
   ! git diff --quiet || ! git diff --cached --quiet || [ -n "$(git ls-files --others --exclude-standard)" ]
@@ -115,25 +108,6 @@ run_autofix_step() {
   amend_fixes "$label"
 }
 
-trim_target_line() {
-  local target="$1"
-  target="${target%%#*}"
-  target="${target#"${target%%[![:space:]]*}"}"
-  target="${target%"${target##*[![:space:]]}"}"
-  printf '%s' "$target"
-}
-
-run_target_clippy() {
-  local target="$1"
-  shift
-  env LINT_CONFIG_FORCE=1 "$LINT_CMD" clippy --workspace --target "$target" "$@"
-}
-
-compile_target_tests() {
-  local target="$1"
-  cargo nextest run --target "$target" --workspace --all-features --tests --no-run
-}
-
 # The repo builds cargo-mend when a workspace member is named cargo-mend —
 # true both for the standalone repo and for a workspace that holds it. Keyed on
 # the package rather than the directory name so validation lints with the build
@@ -185,28 +159,6 @@ run_self_mend() {
   env RUSTC_WRAPPER= "$mend_bin" --workspace --all-targets "$@"
 }
 
-run_configured_target_checks() {
-  local targets_file=".cargo/validate-targets"
-  if [ ! -f "$targets_file" ]; then
-    return 0
-  fi
-
-  local target
-  while IFS= read -r target || [ -n "$target" ]; do
-    target="$(trim_target_line "$target")"
-    if [ -z "$target" ]; then
-      continue
-    fi
-    if [ "$target" != "$HOST_TRIPLE" ]; then
-      echo "=== STEP: skip ${target} ==="
-      echo "Configured target ${target} is not this host's native triple (${HOST_TRIPLE}); it is CI's job and is skipped here."
-      continue
-    fi
-    run_step "clippy ${target}" run_target_clippy "$target"
-    run_step "compile tests ${target}" compile_target_tests "$target"
-  done < "$targets_file"
-}
-
 resolve_mend_self_package
 
 if ! lint_config_enabled mend; then
@@ -221,15 +173,13 @@ run_autofix_step "rustfmt" env LINT_CONFIG_FORCE=1 "$LINT_CMD" fmt
 
 run_autofix_step "taplo" taplo fmt
 
-run_step "clippy" env LINT_CONFIG_FORCE=1 "$LINT_CMD" clippy-tests --workspace
+run_step "clippy" env LINT_CONFIG_FORCE=1 "$LINT_CMD" clippy --workspace
 
 # rustdoc across every member. `lint doc` scopes to changed members like the
 # other checks, so the dev-time run cannot see a doc link that rotted in an
 # untouched crate when a public item was renamed elsewhere. This is the sweep
 # that catches it, and the only place cargo doc runs workspace-wide.
 run_step "rustdoc" env LINT_CONFIG_FORCE=1 "$LINT_CMD" doc --workspace
-
-run_configured_target_checks
 
 run_step "nextest" "$LINT_CMD" nextest --workspace --all-features --tests
 
