@@ -9,9 +9,10 @@ awareness for whichever agent just ran a tool -- main thread or subagent.
 It stays quiet until the count is worth acting on. Below the notice threshold
 it says nothing, between notice and handoff it reports the count together with
 the point a handoff is actually requested, and at or above the handoff
-threshold it escalates to the instruction to write one. All three points are
-derived from the configured window in `context_usage.py`, shared with
-`stop-delegate-continue.py` so the two hooks cannot drift apart.
+threshold it escalates to the instruction to write one and exclude it from git
+locally. All three points are derived from the configured window in
+`context_usage.py`, shared with `stop-delegate-continue.py` so the two hooks
+cannot drift apart.
 
 The escalation also names the one case where stopping is the right move: an
 agent with nothing left to do but wait on background work. Its next request is
@@ -95,9 +96,13 @@ def build_context(tokens: int, window: int | None, is_subagent: bool) -> str | N
         "If you are partway through a task, write a handoff doc first: what you "
         "were doing, what is done, what is left, the files and decisions "
         "involved, and the exact next step. Save it to a durable file in the "
-        "repo — NOT the session scratchpad, which does not survive — and state "
-        "its path. Then proceed directly to your next action. After compaction, "
-        "read it back to pick up where you left off, and delete it once you have. "
+        "repo — NOT the session scratchpad, which does not survive — and the "
+        "moment it exists run `bash ~/.claude/scripts/exclude/exclude.sh "
+        "<repo-relative path>`, which is what /exclude runs: the doc belongs in "
+        ".git/info/exclude, never in .gitignore, so no later commit can pick it "
+        "up. Then state its path and proceed directly to your next action. "
+        "After compaction, read it back to pick up where you left off, and "
+        "delete it once you have. "
         "One exception to the rule against stopping: if you have nothing left to "
         "do but wait on subagents or other background work, end the turn. The "
         "wake-up is a request like any other, so compaction fires there without "
