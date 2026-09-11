@@ -25,8 +25,8 @@ State:
 - `AUTO_WINDOW`: `none`, `next N`, or `through X`.
 - `NEXT_ITEMS_PATH`: phased-plan sibling path named from the plan stem as
   lowercase kebab-case plus `-next.md`.
-- `NEXT_ITEMS_PENDING`: `${SESSION_DIR}/next_items_pending.md`; absent or empty
-  means no unreviewed additions or amendments.
+- `NEXT_ITEMS_PENDING`: `${SESSION_DIR}/next_items_pending.md`; add-ons
+  accumulated for <ReviewPendingAddOns/>. Absent or empty means none.
 - `PROGRESS_UPDATES_ENABLED`: starts true; user cancellation sets it false for
   the rest of the run.
 - `DISPATCH_HANDLE`: active launcher task handle (Claude) or managed terminal
@@ -66,7 +66,7 @@ it:
 | <ProgressReport/> | `commands/plan/delegate_report.md` | `/plan:delegate_report` |
 | <VerbosePostPhaseReport/>, <CombinedWindowReport/>, <RemainingWorkOutlook/> | `commands/plan/delegate_phase_report.md` | `/plan:delegate_phase_report` |
 | <CheckpointCommit/> | `commands/plan/delegate_checkpoint.md` | `/plan:delegate_checkpoint` |
-| <ConsiderNextItems/> | `commands/plan/delegate_next.md` | `/plan:delegate_next` |
+| <ConsiderNextItems/>, <ReviewPendingAddOns/> | `commands/plan/delegate_next.md` | `/plan:delegate_next` |
 | <ResolveStyleDiffBase/>, <RunProjectStyleReview/> | `commands/plan/delegate_style.md` | `/plan:delegate_style` |
 | <ComposeWorkOrder/> | `docs/delegate/compose_work_order.md` | — |
 
@@ -178,7 +178,9 @@ Codex only; no timer process:
    route to review, synthesis, repair, smoke, or the next stage immediately in
    this turn. Do not end the turn between completion and routing.
 4. A user message may interrupt the poll. Answer it, retain the session handle,
-   and resume this contract unless the user cancels or redirects the run.
+   and resume this contract unless the user cancels or redirects the run. An
+   instruction that steers the run is an interactive point: act on it, then
+   run <ReviewPendingAddOns/>.
 5. An early-launched reviewer occupies its own managed terminal under
    `REVIEW_DISPATCH_HANDLE`. Keep polling the primary dispatch session; each
    timeout is also the <EarlyReviewArm/> evaluation point. After the primary
@@ -804,10 +806,12 @@ plan doc is the only dirty path; then include it in the first checkpoint.
 
 Loop stops only for that dirty-tree guard, an unresolved current Pending
 decision, a real design choice, reviews conflicting on intended behavior, a
-required gate that cannot run, or delegate/environment error. It may also stop
-at a phase or auto-window boundary for <ConsiderNextItems/> approval, and only
-for that step's `gate` proposals — its `apply` ones are written and reported,
-never asked. The findings ledger is not on this list and never joins it: a
+required gate that cannot run, or delegate/environment error. It never stops
+for add-ons: <ConsiderNextItems/> accumulates them, and <ReviewPendingAddOns/>
+walks them only at an interactive point — one of those stops once its decision
+is resolved, a verbose gate outside a window, a user instruction that is more
+than an authorization word, <RunSummary/>, or `/plan:delegate_next`. The
+findings ledger is not on this list and never joins it: a
 convergence advisory is reported and the round runs. Everything else
 auto-routes, resequences, or defers. Verbose adds only its authorization gates.
 </AuthorizationContract>
@@ -1116,8 +1120,8 @@ repeat the overview, phase summaries, table, or verification section.
 </CombinedWindowBriefing>
 
 <VerbosePrePhaseGate>
-When `MODE=verbose` and no approved auto window is active, emit
-<PhaseBriefing/> and ask exactly:
+When `MODE=verbose` and no approved auto window is active, run
+<ReviewPendingAddOns/>, emit <PhaseBriefing/>, and ask exactly:
 
 `Start Phase N? Reply \`proceed\` to run only this phase, \`auto next N phases\`, \`auto through phase X\`, or \`stop\`.`
 
@@ -1131,8 +1135,8 @@ fresh range is authorized by the auto control itself; otherwise route to
 Resolve the covered todo phases and apply <BriefingFreshness/> first. If every
 covered phase is fresh, set the approved `AUTO_WINDOW` and continue directly to
 <CoordinateDelegatedPhaseReservation/> without another briefing or gate.
-Otherwise read every Work Order
-now and emit one complete <CombinedWindowBriefing/> for the covered range;
+Otherwise run <ReviewPendingAddOns/>, read every Work Order
+now, and emit one complete <CombinedWindowBriefing/> for the covered range;
 surface any pending decision. Ask:
 
 `Run phases <list> without stopping? Reply \`proceed\` to authorize all of them, \`proceed phase N\` to authorize only phase N and re-gate after it, or \`stop\`.`
@@ -1703,10 +1707,20 @@ work skips this section.
 <ConsiderNextItems>
 Read `~/.claude/commands/plan/delegate_next.md` in full and apply it after
 shrink, at each phase boundary. Phased plans only; the main agent performs the
-assessment and never launches another agent for it. Never work from memory of an
-earlier read — `Class` obedience and the single-line reporting rule are what
-drift. The user can invoke the same file as `/plan:delegate_next`.
+assessment and never launches another agent for it. It writes `apply`
+corrections, accumulates every add-on in `${NEXT_ITEMS_PENDING}`, and asks
+nothing. Never work from memory of an earlier read — `Class` obedience and the
+single-line reporting rule are what drift.
 </ConsiderNextItems>
+
+<ReviewPendingAddOns>
+Defined in `~/.claude/commands/plan/delegate_next.md`; read it in full before
+each run. It walks accumulated add-ons through `/adhoc_review` with
+`current / next / drop`, only at an interactive point and only when
+`${NEXT_ITEMS_PENDING}` is non-empty. It is the one route by which an add-on
+reaches the plan or `${NEXT_ITEMS_PATH}`. The user can invoke the same file as
+`/plan:delegate_next`.
+</ReviewPendingAddOns>
 
 <CheckpointCommit>
 Read `~/.claude/commands/plan/delegate_checkpoint.md` in full and apply it once
@@ -1763,7 +1777,8 @@ are what go missing. The user can invoke the same file as
 </VerbosePostPhaseReport>
 
 <VerbosePostPhaseGate>
-Skip when no todo phase remains or an auto window continues. Otherwise ask:
+Skip when no todo phase remains or an auto window continues. Otherwise run
+<ReviewPendingAddOns/>, then ask:
 
 `Reply \`continue\` when you are ready to review the next phase's pre-phase briefing, \`auto next N phases\` or \`auto through phase X\` to open a window, or \`stop\` to end the run.`
 
@@ -1915,6 +1930,7 @@ Emit on every multi-phase ending:
 **Style review:** [range reviewed and result, or the reason the run never ran it]
 **Smoke checks still unperformed:** [phase + exact action, or none]
 **Deferred decisions still open:** [phase + decision, or none]
+**Add-ons awaiting review:** [count, or none]
 **Reservation disposition:** [checkpointed and outstanding, retained with the
 reason this run stopped, or coordination not active]
 **Why the run stopped:** [complete, user stop, pending decision, or error]
@@ -1924,5 +1940,6 @@ Apply <UserFacingText/> and <RetainDelegatedPhaseReservation/> for every ending
 that did not complete <CheckpointCommit/>. Then run `progress_history.py finish-run` with
 `completed`, `stopped`, or `error`; it closes active pass/phase as incomplete
 when needed. Finally run `bash ~/.claude/scripts/delegate/end_session.sh` on
-every exit so the Stop hook cannot revive a finished run.
+every exit so the Stop hook cannot revive a finished run. Then run
+<ReviewPendingAddOns/>; the summary and its commits never wait on it.
 </RunSummary>

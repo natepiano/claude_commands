@@ -34,8 +34,9 @@ that builds the wrong thing.
    only what a phase already shipped — so run that audit against the resolution
    here and state its destination and owner alongside it. An in-repository
    destination is the Spec/Files/gate edit already being made. A destination in
-   another repository goes to the next-items file derived in step 5, and only
-   with the user's approval; never append to it automatically.
+   another repository goes to `${NEXT_ITEMS_PENDING}`, never straight to the
+   next-items file. This stop is an interactive point: run
+   <ReviewPendingAddOns/> after the resolution.
    After editing a resolution into Spec, Files, or the acceptance gate, rerun
    the shared validation above before continuing. A validation failure blocks
    dispatch.

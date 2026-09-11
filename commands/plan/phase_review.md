@@ -24,7 +24,7 @@ The plan doc should already be in conversation context — it is the doc the jus
 - Strip the `auto` and `skip-architect` tokens from `$ARGUMENTS` first — they are mode switches, not paths.
 - If exactly one plan doc is in scope, use it.
 - If `$ARGUMENTS` names a path, use that path (overrides inference).
-- If no plan doc is in scope, **ask the user** for the path before proceeding. Do not guess. This case should be rare.
+- If no plan doc is in scope, **ask the user** for the path before proceeding. Do not infer one. This case should be rare.
 - Under `/plan:delegate`, inherit its `${SESSION_DIR}` and `${WORKING_DIR}`.
   Invoked standalone, create a session with `prepare_session.sh` now so every
   temporary review artifact has an explicit owner.
@@ -125,7 +125,7 @@ and determined this phase produced nothing for an architect to find. Write
 `not run — phase matched its plan` into the final update's architect row and go
 straight to Step 5; the temporary retrospective's implications still get folded into the
 remaining Work Orders exactly as written there, and its **Split observed**
-still re-seats them per `<MaintainWorkOrders/>`. Do not second-guess the token or
+still re-seats them per `<MaintainWorkOrders/>`. Do not override the token or
 re-derive the trigger test — the caller has the review results and the ledger,
 this command does not.
 
@@ -234,26 +234,26 @@ reject unsupported or optional changes, then write validated proposals to
 `${SESSION_DIR}/next_item_amendments_<phase>.md` with `Action`, `Current`,
 `Target`, `Proposed`, `Why`, source phase, and **`Class`**.
 
-`Class` is `apply` or `gate`, and it decides whether the user is asked. This file
-is a backlog: writing an item into it commits nobody to building it, and the
-decision that matters happens later, when an item is scheduled into a phase.
-Rewriting a backlog record so it describes the code that now exists is the same
-operation `/plan:shrink` and `/plan:to_as_built` perform on completed phases — an
-as-built correction, never a decision. What earns a gate is a judgment about what
-is worth doing, not the maintenance of a record.
+`Class` is `apply` or `gate`, and it decides whether the user is asked.
+Rewriting an item the user already approved so it describes the code that now
+exists is the same operation `/plan:shrink` and `/plan:to_as_built` perform on
+completed phases — an as-built correction, never a decision. What earns a gate
+is a judgment about what is worth doing, and every new item is one.
 
-A proposal is **`apply`** when the shipped code decides it: any `add`; any
-`amend`, however large — a drifted file or line reference, a re-key onto a type
-this phase introduced, a re-target at the crate that now owns the work, a
-capability moved out because a phase absorbed it, a restatement of what would
-satisfy the item now that the surrounding code has changed; and any `remove` the
-shipped code has already satisfied. An `amend` is never gated for changing what
-the item asks for.
+A proposal is **`apply`** when the shipped code decides it and the item is
+already in `${NEXT_ITEMS_PATH}`: any `amend`, however large — a drifted file or
+line reference, a re-key onto a type this phase introduced, a re-target at the
+crate that now owns the work, a capability moved out because a phase absorbed
+it, a restatement of what would satisfy the item now that the surrounding code
+has changed; and any `remove` the shipped code has already satisfied. An `amend`
+is never gated for changing what the item asks for.
 
-A proposal is **`gate`** only when it rests on judgment rather than evidence: a
+A proposal is **`gate`** when it rests on judgment: **every `add`**, and a
 `remove` proposed because the work looks not worth doing, out of scope, or
-superseded by a direction nobody has taken yet. When the split is genuinely
-unclear, `apply` — a wrong backlog edit is one line to revert.
+superseded by a direction nobody has taken yet. Nothing new enters the next
+file, or the current plan, until the user places it through
+<ReviewPendingAddOns/>. When an `amend`/`remove` split is genuinely unclear,
+`apply` — a wrong record edit is one line to revert.
 
 **A defect in what this phase just shipped is never an `add`.** It is a
 current-phase defect: under `/plan:delegate` return it to <Synthesize/>, and
@@ -261,10 +261,11 @@ standalone fix it before Step 6. A Work Order's **Files** list is the scope the
 plan predicted, not a limit on what this phase may repair.
 
 Under `/plan:delegate`, stop there; <ConsiderNextItems/> writes the `apply` ones
-and owns the gate for the rest, plus auto-window batching. Invoked standalone,
-write every `apply` proposal to `${NEXT_ITEMS_PATH}` now and report it as one line
-naming the count and the file; present only the `gate` proposals through the
-approve/revise/reject gate before Step 6; apply approved ones; then delete the
+and accumulates the rest for <ReviewPendingAddOns/> at the run's next
+interactive point. Invoked standalone, write every `apply` proposal to
+`${NEXT_ITEMS_PATH}` now and report it as one line naming the count and the
+file; walk the `gate` proposals through <ReviewPendingAddOns/> in
+`~/.claude/commands/plan/delegate_next.md` before Step 6; then delete the
 artifact once every proposal is resolved.
 
 Do not route an `apply` proposal to the user under any framing — not as a
@@ -515,7 +516,8 @@ Style rules for the final update:
 - User decisions never use `AskUserQuestion`. Single decision → inline decision template; two or more → `/adhoc_review`. See `<SignificantFindings/>`, `<FilterFindingsForUserReview/>`, and `<DecisionPresentationTemplate/>` in Step 5.
 - In auto mode this command asks the user nothing: unresolved decisions become `**Pending decision:**` blocks in the affected Work Orders, surfaced later by the `/plan:delegate` pre-dispatch check.
 - Next-item amendments never use plan finding routing and never edit the next
-  file without approval; `/plan:delegate` batches them at its normal boundary.
+  file without approval; `/plan:delegate` accumulates them for its next
+  interactive point.
 - Never write retrospective, finding, reviewer, pass, or approval prose into the
   plan. Review text exists only under `${SESSION_DIR}` until the phase checkpoint.
 - Never edit an earlier `done` phase. A finding about past work becomes an
