@@ -5,12 +5,16 @@ provider message it cached earlier to every thread that attaches, so a local
 fault arrives wearing the exact words of a usage limit. What the code can check
 is not the message but the circumstances -- who started the server, how fast it
 failed, and whether the delegate had already written anything.
+
+ReplyDeliveryTests covers the other silent failure: a delegate's own summary
+file replaced by its last chat reply.
 """
 
 from __future__ import annotations
 
 import argparse
 import contextlib
+import io
 import json
 import subprocess
 import tempfile
@@ -75,6 +79,67 @@ class RetryDecisionTests(unittest.TestCase):
             codex_mesh._retry_warranted(  # pyright: ignore[reportPrivateUsage]
                 _attempt(), fresh_server=False, resident=True
             )
+        )
+
+
+class ReplyDeliveryTests(unittest.TestCase):
+    """Where a delegate's replies land, and whose file the summary is."""
+
+    temporary: tempfile.TemporaryDirectory[str]  # pyright: ignore[reportUninitializedInstanceVariable]
+    summary: Path  # pyright: ignore[reportUninitializedInstanceVariable]
+    replies: Path  # pyright: ignore[reportUninitializedInstanceVariable]
+
+    @override
+    def setUp(self) -> None:
+        self.temporary = tempfile.TemporaryDirectory()
+        root = Path(self.temporary.name)
+        self.summary = root / "impl_summary_impl.txt"
+        self.replies = root / "impl_reply_impl.txt"
+
+    @override
+    def tearDown(self) -> None:
+        self.temporary.cleanup()
+
+    def test_without_a_reply_file_the_summary_receives_the_answer(self) -> None:
+        # The friend launcher's contract: the answer file is the reply.
+        _ = self.summary.write_text("stale\n", encoding="utf-8")
+        codex_mesh._finish_summary(  # pyright: ignore[reportPrivateUsage]
+            self.summary, None, "seat", 1, "the answer"
+        )
+        self.assertEqual(self.summary.read_text(encoding="utf-8"), "the answer\n")
+
+    def test_the_delegates_own_summary_survives_its_last_reply(self) -> None:
+        # The incident: every seat's summary came back as its one-line
+        # acknowledgement, because the reply had been written over it.
+        _ = self.summary.write_text("files, doubts, unverified\n", encoding="utf-8")
+        codex_mesh._finish_summary(  # pyright: ignore[reportPrivateUsage]
+            self.summary, self.replies, "seat", 1, "Done."
+        )
+        self.assertEqual(
+            self.summary.read_text(encoding="utf-8"), "files, doubts, unverified\n"
+        )
+        self.assertIn("Done.", self.replies.read_text(encoding="utf-8"))
+
+    def test_a_summary_the_delegate_never_wrote_is_filled_from_the_reply(self) -> None:
+        # implement.sh truncates the file at launch, so empty at exit means the
+        # delegate skipped its last act and the reply is all there is.
+        _ = self.summary.write_text("", encoding="utf-8")
+        codex_mesh._finish_summary(  # pyright: ignore[reportPrivateUsage]
+            self.summary, self.replies, "seat", 1, "Done."
+        )
+        self.assertEqual(self.summary.read_text(encoding="utf-8"), "Done.\n")
+
+    def test_resident_replies_accumulate_in_order(self) -> None:
+        _ = self.summary.write_text("the delegate's summary\n", encoding="utf-8")
+        with contextlib.redirect_stdout(io.StringIO()), io.StringIO() as log:
+            for index, text in enumerate(("first", "second"), start=1):
+                codex_mesh._deliver_reply(  # pyright: ignore[reportPrivateUsage]
+                    "seat", index, text, "", self.summary, self.replies, log
+                )
+        delivered = self.replies.read_text(encoding="utf-8")
+        self.assertLess(delivered.index("first"), delivered.index("second"))
+        self.assertEqual(
+            self.summary.read_text(encoding="utf-8"), "the delegate's summary\n"
         )
 
 

@@ -23,9 +23,11 @@ from typing import TypedDict, cast, override
 DELEGATE_DIR = Path(__file__).parent
 AGENTS_DIR = DELEGATE_DIR.parent / "agents"
 
-# The wrapper calls this as: <task> write <working_dir> <prompt> <summary> <log>.
+# The wrapper calls this as: <task> write <working_dir> <prompt> <reply> <log>.
 # Writing both outputs and exiting immediately drives the wrapper's completion
-# branch without a model call.
+# branch without a model call; the wrapper copies the reply into the summary
+# file because the stub, like a delegate that skipped its last act, left it
+# empty.
 STUB_AGENT_EXEC = """#!/usr/bin/env bash
 set -euo pipefail
 printf 'Wrote the retry path.\\n' > "$5"
@@ -101,8 +103,13 @@ class ImplementLauncherSeatTests(unittest.TestCase):
         """Copy the real wrapper beside a stub agent, so nothing calls a model."""
         delegate = self.root / "scripts" / "delegate"
         agents = self.root / "scripts" / "agents"
+        lib = self.root / "scripts" / "lib"
         delegate.mkdir(parents=True)
         agents.mkdir(parents=True)
+        lib.mkdir(parents=True)
+        # The wrapper reaches python3 through ../lib/py, resolved from its own
+        # location, so the copy needs the interpreter shim beside it too.
+        _ = shutil.copy2(DELEGATE_DIR.parent / "lib" / "py", lib / "py")
         for name in ("implement.sh", "progress_history.py", "board.sh"):
             _ = shutil.copy2(DELEGATE_DIR / name, delegate / name)
         for name in ("agents_config.sh", "heartbeat.sh", "heartbeat_watch.sh"):

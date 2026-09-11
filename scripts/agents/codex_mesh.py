@@ -25,9 +25,13 @@ recording work unchanged.
 Verbs:
   serve  Start the session's app-server and record where it listens.
   start  Launch one delegate as a named thread; block until its turn ends.
+         The last reply lands in --summary-file, unless --reply-file names
+         where replies go: then the summary file belongs to the delegate,
+         which writes it as its own last act, and the reply fills it only
+         when the delegate left it empty.
          With --resident, stay attached across turns instead: each finished
-         turn is printed to stdout and written to the summary file, the
-         thread keeps accepting `send`, and only `end` releases the block.
+         turn is printed to stdout and delivered the same way, the thread
+         keeps accepting `send`, and only `end` releases the block.
   send   Queue a message for a named delegate, delivered at its next turn.
   steer  Inject into a named delegate's running turn.
   end    Finish a resident delegate: interrupt its running turn, if any, and
@@ -52,7 +56,7 @@ import struct
 import subprocess
 import sys
 import time
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Generator
 from datetime import datetime
 from pathlib import Path
 from typing import TextIO, TypedDict, cast, final
@@ -404,13 +408,28 @@ def _message_text(args: argparse.Namespace) -> str:
     return _as_str(_attr(args, "message"))
 
 
+def _record_reply(reply_path: Path, name: str, index: int, body: str) -> None:
+    """Append one reply to the reply file, framed the way stdout frames it."""
+    with reply_path.open("a", encoding="utf-8") as replies:
+        _ = replies.write(f"=== reply from {name} ({index}) ===\n{body}\n=== end reply ===\n")
+
+
 def _deliver_reply(
-    name: str, index: int, text: str, failure: str, summary_path: Path, log: TextIO
+    name: str,
+    index: int,
+    text: str,
+    failure: str,
+    summary_path: Path,
+    reply_path: Path | None,
+    log: TextIO,
 ) -> None:
     """Hand one finished resident turn to whoever is watching.
 
-    stdout is for a caller polling the terminal this runs in; the summary file
-    is for a reader that comes later; the log line keeps the heartbeat honest.
+    stdout is for a caller polling the terminal this runs in. The reply file,
+    when the caller named one, keeps every reply in order and leaves the
+    summary file to the delegate, which writes it as its own last act; without
+    one, the summary file receives the reply. The log line records that it
+    landed.
     """
     if text and failure:
         body = f"{text}\n[error] {failure}"
@@ -420,14 +439,36 @@ def _deliver_reply(
         body = f"[error] {failure}"
     else:
         body = f"The delegate {name} produced no reply."
-    _ = summary_path.write_text(body + "\n", encoding="utf-8")
+    if reply_path is None:
+        _ = summary_path.write_text(body + "\n", encoding="utf-8")
+    else:
+        _record_reply(reply_path, name, index, body)
     print(f"=== reply from {name} ({index}) ===\n{body}\n=== end reply ===", flush=True)
     _ = log.write(f"[{_now_stamp()}] reply {index} delivered\n")
     log.flush()
 
 
+def _finish_summary(
+    summary_path: Path, reply_path: Path | None, name: str, index: int, final_answer: str
+) -> None:
+    """Leave the delegate's answer where the caller will read it.
+
+    With no reply file the summary file receives the answer. With one, the
+    answer goes there, and the summary file is written only when the delegate
+    left it empty: the launcher truncates it at launch and the delegate fills
+    it as its last act, so a non-empty file is the delegate's own summary and
+    the last chat reply must not replace it.
+    """
+    if reply_path is None:
+        _ = summary_path.write_text(final_answer + "\n", encoding="utf-8")
+        return
+    _record_reply(reply_path, name, index, final_answer)
+    if not summary_path.exists() or summary_path.stat().st_size == 0:
+        _ = summary_path.write_text(final_answer + "\n", encoding="utf-8")
+
+
 @contextlib.contextmanager
-def _server_lock(session_dir: str) -> Iterator[None]:
+def _server_lock(session_dir: str) -> Generator[None]:
     """Serialize starting and dropping this session's app-server.
 
     The three seats of a phase launch in one message and reach `ensure_server`
@@ -655,6 +696,8 @@ def _attach_and_run(
     prompt = Path(_as_str(_attr(args, "prompt_file"))).read_text(encoding="utf-8")
     log_path = Path(_as_str(_attr(args, "log_file")))
     summary_path = Path(_as_str(_attr(args, "summary_file")))
+    reply_file = _as_str(_attr(args, "reply_file"))
+    reply_path = Path(reply_file) if reply_file else None
 
     client = Client(port, name)
     thread_params: dict[str, object] = {
@@ -776,7 +819,9 @@ def _attach_and_run(
                 # message; only `end` closes it.
                 replies += 1
                 produced_work = True
-                _deliver_reply(name, replies, final_answer, failure, summary_path, log)
+                _deliver_reply(
+                    name, replies, final_answer, failure, summary_path, reply_path, log
+                )
                 final_answer = ""
                 failure = ""
                 _update_roster(
@@ -789,13 +834,14 @@ def _attach_and_run(
         else:
             failure = f"no turn/completed within {timeout:.0f}s"
 
-    # A background thread has no output redirect, so the summary file is the
-    # only place the caller can read the delegate's answer. A resident thread
-    # wrote each reply as it landed; only one that never replied needs this.
+    # A background thread has no output redirect, so the summary or reply file
+    # is the only place the caller can read the delegate's answer. A resident
+    # thread delivered each reply as it landed; only one that never replied
+    # needs this.
     if not resident or replies == 0:
         if not final_answer:
             final_answer = failure or f"The delegate {name} produced no summary."
-        _ = summary_path.write_text(final_answer + "\n", encoding="utf-8")
+        _finish_summary(summary_path, reply_path, name, replies + 1, final_answer)
     _update_roster(
         session_dir,
         name,
@@ -973,6 +1019,11 @@ def main(argv: list[str] | None = None) -> int:
     _ = start.add_argument("--cwd", required=True)
     _ = start.add_argument("--prompt-file", required=True)
     _ = start.add_argument("--summary-file", required=True)
+    _ = start.add_argument(
+        "--reply-file",
+        default="",
+        help="append replies here; the summary file is then the delegate's own",
+    )
     _ = start.add_argument("--log-file", required=True)
     _ = start.add_argument("--model", default="")
     _ = start.add_argument("--effort", default="")

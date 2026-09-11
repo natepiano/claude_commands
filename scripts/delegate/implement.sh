@@ -22,7 +22,12 @@
 #
 # Produces:
 #   <session_dir>/impl_status_<role>      — "implementing" while running, "implemented" on success, "error" on failure
-#   <session_dir>/impl_summary_<role>.txt — the implementation summary
+#   <session_dir>/impl_summary_<role>.txt — the implementation summary, written
+#                                     by the delegate itself as its last act
+#   <session_dir>/impl_reply_<role>.txt   — the delegate's chat replies, in order,
+#                                     on the codex paths; the summary file is
+#                                     filled from the last one only when the
+#                                     delegate left it empty
 #   <session_dir>/impl_agent_<role>.log   — full agent log
 #   <session_dir>/impl_agent_<role>       — resolved task, family, agent, and effort
 #   <session_dir>/impl_bg_id_<role>       — the background session's short id, on
@@ -131,6 +136,8 @@ SUMMARY_FILE="${SESSION_DIR}/impl_summary${SLOT}.txt"
 # seat that reports on the board without writing a summary would otherwise leave
 # the previous round's file sitting at exactly the path the board line points to.
 : > "${SUMMARY_FILE}"
+REPLY_FILE="${SESSION_DIR}/impl_reply${SLOT}.txt"
+rm -f "${REPLY_FILE}"
 STATUS_FILE="${SESSION_DIR}/impl_status${SLOT}"
 LOG_FILE="${SESSION_DIR}/impl_agent${SLOT}.log"
 AGENT_FILE="${SESSION_DIR}/impl_agent${SLOT}"
@@ -265,13 +272,17 @@ elif [[ "${USE_CODEX_MESH}" == "1" ]]; then
     --cwd "${WORKING_DIR}" \
     --prompt-file "${PROMPT_FILE}" \
     --summary-file "${SUMMARY_FILE}" \
+    --reply-file "${REPLY_FILE}" \
     --log-file "${LOG_FILE}" \
     --model "${AGENT_MODEL}" \
     --effort "${AGENT_EFFORT:-}" &
 else
   rm -f "${BG_ID_FILE}"
+  # The plain launcher writes the delegate's last message to its output file,
+  # so that file is the reply file, never the summary: see the settle step
+  # after the wait below.
   bash "${SCRIPT_DIR}/../agents/agent_exec.sh" \
-    "${TASK}" write "${WORKING_DIR}" "${PROMPT_FILE}" "${SUMMARY_FILE}" "${LOG_FILE}" &
+    "${TASK}" write "${WORKING_DIR}" "${PROMPT_FILE}" "${REPLY_FILE}" "${LOG_FILE}" &
 fi
 AGENT_PID=$!
 
@@ -288,6 +299,16 @@ wait "${AGENT_PID}" || AGENT_CODE=$?
 
 kill "${HEARTBEAT_LOOP_PID}" 2>/dev/null || true
 wait "${HEARTBEAT_LOOP_PID}" 2>/dev/null || true
+
+# The summary file is the delegate's own, written as its last act, and its last
+# chat reply lands in REPLY_FILE instead -- a one-line acknowledgement must not
+# replace the summary the reviewers read. A delegate that skipped that act
+# leaves the summary empty, and then the reply is all there is. The mesh path
+# settles this itself; here it is repeated for the plain launcher and is a no-op
+# once the summary has content.
+if [[ ! -s "${SUMMARY_FILE}" && -s "${REPLY_FILE}" ]]; then
+  cp "${REPLY_FILE}" "${SUMMARY_FILE}"
+fi
 
 if [[ "${AGENT_CODE}" -eq 0 ]]; then
   echo "implemented" > "${STATUS_FILE}"
