@@ -58,6 +58,16 @@ export PATH="/opt/homebrew/bin:$HOME/.local/bin:$PATH"
 # lives here rather than in ~/.cargo/config.toml because that file is a
 # read-only symlink into the nix store, and because interactive builds should
 # stay uncapped. A caller may still override it.
+#
+# Revisited 2026-09-10, once xdg-desktop-portal was bounded at MemoryMax=2G
+# (nixos 05948d7). That portal was the 13.5 GB squatter present during the
+# failure above, so the obvious move was to lift the cap; it stays at 24. mold
+# became the linker the same day and trades memory for speed rather than
+# reducing it -- the measured 1.82x is a link-pass time, not a resident-size
+# change. Swap independently reads 6.4 of 8.0 GiB used at idle, leaving 1.6 GiB
+# for a concurrent Bevy link step to spill into, and that holds whatever the
+# portal does. Raising this costs a killed unattended run and buys wall-clock on
+# a job nobody waits for.
 export CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-24}"
 
 mkdir -p "$LOG_DIR"
