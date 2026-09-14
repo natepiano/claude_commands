@@ -121,8 +121,6 @@ Rules:
   it and say so. Surface any larger removal for the user to decide rather than
   doing it silently.
 - Respect the forbidden-words list in every comment you write.
-- If a rename would help readability, ask the user (their editor renames fast)
-  rather than renaming inline.
 </Reorganize>
 
 <Verify>

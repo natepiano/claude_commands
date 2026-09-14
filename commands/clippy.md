@@ -18,8 +18,8 @@ arguments can reach `lint clippy`, then strip them from `$ARGUMENTS`:
   work under review is already committed, as /plan:delegate's branch-wide review
   is. STOP and report if `git rev-parse --verify <ref>` does not resolve.
 - `no-agents` sets `NO_AGENTS = true`. This invocation runs every stage in the
-  main agent: no scan agent, no fix wave, whatever `config/clippy.conf` says. It
-  does not edit that file.
+  main agent: no fix wave, whatever `config/clippy.conf` says. It does not edit
+  that file. The scan is a script either way.
 
 If both `style-only` and `no-style` are present, STOP and report that they are
 mutually exclusive. `STYLE_ONLY`, `NO_STYLE`, and `NO_AGENTS` default to false;
@@ -36,9 +36,9 @@ environmental-failure handling anywhere in this skill — those still stop.
 
 Auto-proceed also sets `NO_AGENTS = true`. The callers that inject the token are
 delegate work orders and codex sub-sessions; a codex session has no agent tool
-to launch a scan or a fix wave with, and a delegate phase is already parallel at
-the phase level with a reservation held over the worktree. Both run every stage
-inline.
+to launch a fix wave with, and a delegate phase is already parallel at the phase
+level with a reservation held over the worktree. Both fix inline; both still run
+the scan script.
 </AutoProceed>
 
 <LoadOperationSwitches>
@@ -93,28 +93,29 @@ bash ~/.claude/scripts/lint/clippy_config.sh export
 
 It prints one `CLIPPY_<KEY>=<value>` line per key from
 `~/.claude/config/clippy.conf`, hand-edited like `config/delegate.conf`. The
-keys are `SCAN_AGENT`, `FANOUT`, `MIN_FINDINGS`, `MIN_FILES`, `MAX_AGENTS`,
-`FINDINGS_PER_AGENT`, and `PROGRESS_INTERVAL_SECONDS`.
+keys are `FANOUT`, `MIN_FINDINGS`, `MIN_FILES`, `MAX_AGENTS`,
+`FINDINGS_PER_AGENT`, and `PROGRESS_INTERVAL_SECONDS`. A `SCAN_AGENT` key is
+read by the script and ignored here: the scan is a shell script now, never an
+agent.
 
 **A non-zero exit means delegation is unavailable, not that the run stops.** The
 script reports every problem it found — a missing file, an unset key, a value
 that is not a number, a value below its minimum — and takes no default. Set
-`SCAN_AGENT=off` and `FANOUT=off` for this invocation, print the script's stderr
+`FANOUT=off` for this invocation, print the script's stderr
 verbatim under a one-line heading saying the pipeline is running inline because
 of it, and continue. The lint itself never depends on this file: running every
 stage in this agent is what the skill did before the file existed.
 
-If `NO_AGENTS = true`, skip the script entirely and treat both switches as off.
+If `NO_AGENTS = true`, skip the script entirely and treat `FANOUT` as off.
 
-`SCAN_AGENT=on` selects <ScanDispatch/> over the inline stage walk.
-`FANOUT=on` lets <Triage/> reach <FanOut/>. The two are independent: a scan
-agent with an inline fix batch is a normal combination, and so is the reverse.
+`FANOUT=on` lets <Triage/> reach <FanOut/>. It governs the fix wave only; the
+scan runs the same way either way.
 </LoadDelegationSettings>
 
 <WaveDirectory>
 Set `${WAVE_DIR}` to `/tmp/claude/clippy-<epoch seconds>` and create it, once
-per invocation, before the first agent launch. Everything an agent writes and
-everything supervision reads lives there: `findings.md` from <ScanPrompt/>,
+per invocation, before the scan. Everything the scan and the wave write lives
+there: `summary.txt` and the per-stage logs from <ScanDispatch/>,
 `assignments.md` from <FanOut/>, `report_<n>.md` from each fixer, and
 `heartbeat_<n>.log` per fixer.
 
@@ -132,87 +133,38 @@ Confirm using the script summary line. Then proceed.
 </LoadStyleGuide>
 
 <ScanDispatch>
-Runs the mend, clippy, and doc stages. With `CLIPPY_SCAN_AGENT=off` this agent
-runs them itself, inline, exactly as <RunMend/>, <RunMendFix/>, <RunClippy/>,
-and <RunDoc/> define them, and <ScanPrompt/> does not apply.
+Runs the mend, clippy, and doc stages. `~/.claude/scripts/lint/scan.sh` runs all
+of them in one shell process, honoring `config/lint.conf` itself; this agent
+backgrounds it once and reads what it wrote.
 
-With `CLIPPY_SCAN_AGENT=on`, launch **one** agent for all three. Not three
-agents: mend, clippy, and doc each take the same `target/` lock, so parallel
-scans serialize behind each other and behind rust-analyzer's check-on-save,
-turning a shorter wall clock into a longer one.
-
-What the agent buys is context, not speed. A workspace clippy run emits
-hundreds of lines of cargo output to yield a dozen findings, and the reading,
-the per-finding style-guide lookup, and the fix wording all happen where that
-output already is.
+No agent sits in the completion path, and that is the point. A subagent that
+backgrounds a command and yields is not resumed when the command finishes, so a
+scan agent strands the run half-done with nothing watching — the stages live in
+a script for that reason, not for speed. The context saving that once justified
+the agent survives: cargo's output goes to per-stage logs, and this agent reads
+a five-line summary.
 
 1. Execute <WaveDirectory/>.
-2. Launch one `Agent` call: `subagent_type: general-purpose`, `name:
-   clippy-scan`, prompt composed per <ScanPrompt/>.
-3. Tell the user in one line that the lint scan is running and that its findings
-   arrive as a batch.
-4. End the turn. The completion notification resumes the workflow. Do not poll
-   it, and do not arm a timer: there is one agent, no partition to supervise,
-   and nothing a mid-scan report could say that its findings will not.
+2. Run, with `run_in_background: true` and the sandbox disabled:
+   `~/.claude/scripts/lint/scan.sh ${WAVE_DIR} ${ARGUMENTS}`
+3. Tell the user in one line that the scan is running.
+4. End the turn. Never poll it and never arm a timer: the completion
+   notification resumes this session on its own.
 
-On completion:
+On completion, read `${WAVE_DIR}/summary.txt` — one line per stage, `STOP
+<reason>` for a hard stop, and `scan <ok|stop> done` last.
 
-- **A hard stop was reported** — a reverted mend fix, or an environmental
-  failure. Execute the matching stop from <RunMendFix/>, <RunMend/>,
-  <RunClippy/>, or <RunDoc/> using the material the agent returned. Do not re-run
-  the command to see for yourself: a reverted mend fix leaves the working tree
-  at exactly the state that reproduces it, and running mend again is what
-  destroys that.
-- **Findings** — read `${WAVE_DIR}/findings.md` and carry its rows into
-  <ReportFindings/> and <CreateBatchTodoList/>.
-- **`findings.md` missing or unreadable while the agent reported findings** —
-  the dispatch failed. Say so in one line and run the stages inline instead.
-  Never reconstruct rows from the agent's summary text.
+- **The final line is missing** — the script was killed. The run is unfinished,
+  never clean. Say so in one line and re-run it.
+- **A `STOP` line** — execute the matching stop from <RunMend/> or <RunMendFix/>,
+  using `mend.txt` and `mend_fix.txt` as the material. Do not re-run mend to see
+  for yourself: a reverted fix leaves the working tree at exactly the state that
+  reproduces it, and running mend again is what destroys that.
+- **Otherwise** — read each stage's log and carry its findings into
+  <ReportFindings/> and <CreateBatchTodoList/>. A stage marked `off` is reported
+  as off, never as clean. A non-zero `exit=` on clippy or doc is findings to
+  triage, not a failure to stop on.
 </ScanDispatch>
-
-<ScanPrompt>
-The scan agent is a fresh session that inherits nothing from this one — not the
-loaded style guide, not `config/lint.conf`, not any contract in this file. Every
-section below is composed into its prompt in full.
-
-1. **Role.** Run the listed lint commands and report what they found. Fix
-   nothing by hand. The one thing that writes to the tree is
-   `lint mend --fix`, which applies its own fixes; that is the tool working, not
-   the agent editing.
-2. **Commands**, in this order, each exactly as written, and each with the
-   sandbox disabled — a crate whose build script calls Swift Package Manager
-   fails under a nested sandbox in a way that reads as a broken dependency:
-   - `~/.claude/scripts/lint/lint mend` — skip when `LINT_OP_MEND=off`
-   - `~/.claude/scripts/lint/lint mend --fix` — only when the check found
-     fixable items
-   - `~/.claude/scripts/lint/lint clippy ${ARGUMENTS}` — skip when
-     `LINT_OP_CLIPPY=off`; pass the caller arguments through verbatim
-   - `~/.claude/scripts/lint/lint doc` — skip when `LINT_OP_DOC=off`
-   Substitute the resolved `LINT_OP_*` values from <LoadOperationSwitches/> into
-   the prompt rather than naming the variables: the agent cannot read them. A
-   skipped stage is reported as skipped, never as clean.
-3. **Hard stops**, copied verbatim from <RunMendFix/>, <RunMend/>, <RunClippy/>,
-   and <RunDoc/>, with one change in wording: where those sections say to stop
-   and present material to the user, the agent stops and **returns** that
-   material. It never retries a reverted mend fix, never applies one by hand,
-   and never continues to the next command after a hard stop.
-4. **Per finding**, before writing its row:
-   - Run the `lint:` frontmatter lookup —
-     `grep -l "^lint:.*\b<lint_name>\b" ~/rust/nate_style/rust/*.md docs/style/*.md 2>/dev/null`
-     — and name the matched file in the Rule column, `.md` dropped. No match is
-     `—`, never the word "none". Reading the matched rule file is enough; the
-     agent does not load the style guide.
-   - Write the fix approach as one imperative sentence naming the concrete edit.
-   - Add a Note only where one sentence cannot hold it.
-5. **Output.** Write the rows to `${WAVE_DIR}/findings.md` as the table in
-   <BatchDecisionPoint/> — its column rules, its Notes guidance, and both of its
-   worked examples of a bad and a good note, all copied verbatim into the
-   prompt. Return only a summary: per-stage counts, any hard stop, and the path
-   it wrote. The rows themselves stay in the file.
-6. **Boundaries.** No commits, no branch, no push. Write nothing outside
-   `${WAVE_DIR}` beyond what `mend --fix` rewrites on its own. Do not run any
-   cargo command that is not on the list above.
-</ScanPrompt>
 
 <RunMend>
 Execute: `~/.claude/scripts/lint/lint mend`
@@ -330,12 +282,6 @@ ran, hides the fact that the check was skipped.
 </ReportFindings>
 
 <CreateBatchTodoList>
-When <ScanDispatch/> ran an agent, the rows already exist in
-`${WAVE_DIR}/findings.md` with the `lint:` lookup done and the fix sentence
-written. Read them and apply only the grouping and ordering below. Do not
-re-derive a row, re-run a lookup, or reword a fix sentence to match a house
-style it already follows — the scan agent was given these same rules.
-
 Create a comprehensive todo list combining all clippy, rustdoc, AND unfixable mend issues:
 - Group related issues in same function/struct into single todos when logical
 - Each todo includes fix description and affected file locations
@@ -879,9 +825,8 @@ truth that maps clippy lints to the rule that governs them.
 **Do this step yourself — do not delegate it to a subagent** (Task/Agent tool, Codex sub-session, etc.). Run the diff commands and the rule-by-rule walk inline in this conversation so the user can watch progress rule-by-rule instead of waiting on an unauditable subagent turn.
 
 This is the one stage that never delegates, whatever `config/clippy.conf` says.
-`CLIPPY_SCAN_AGENT` and `CLIPPY_FANOUT` do not reach it: a lint command returns
-a finding a subagent can hand back intact, while the rule walk **is** the
-reporting, and the user reads it as it happens.
+`CLIPPY_FANOUT` does not reach it: the rule walk **is** the reporting, and the
+user reads it as it happens.
 
 1. Build the combined diff under review, then the additions-only text from it. **Untracked files are always included** — a new file is entirely added code, so `git diff --no-index /dev/null <file>` renders it as all-additions. Never review only tracked changes:
    ```bash
@@ -940,7 +885,7 @@ the pipeline has no step numbers.
 - **Load switches** — execute <LoadOperationSwitches/>: read which stages are enabled. Never skipped.
 - **Load delegation settings** — execute <LoadDelegationSettings/>: read who runs them. Never skipped, and never a reason to stop the run.
 - **Style-only exit** — if `STYLE_ONLY = true`, execute <StyleReview/> when enabled, report its result, and stop. Run no other stage.
-- **Lint scan** — execute <ScanDispatch/>: mend, the mend fix, clippy, and doc, in that order, in one agent or inline. <RunMend/>, <RunMendFix/>, <RunClippy/>, and <RunDoc/> define each command and its error handling whichever way it runs.
+- **Lint scan** — execute <ScanDispatch/>: mend, the mend fix, clippy, and doc, in that order, in one backgrounded script. <RunMend/>, <RunMendFix/>, <RunClippy/>, and <RunDoc/> define each command and its error handling.
 - **Style review** — execute <StyleReview/>: evaluate diff against style guide rules (loads style guide only if diff is non-empty). Runs regardless of what earlier stages found; only `LINT_OP_STYLE_REVIEW=off` skips it.
 - **Findings report** — execute <ReportFindings/>: present mend, clippy, and doc summary (fmt runs later, at the format stage, and is covered in the completion summary).
 - **Batch fix** — if manual mend, clippy, or doc issues found, execute <CreateBatchTodoList/> and <BatchDecisionPoint/>, then <Triage/>. Inline goes to <BatchExecution/>; a fan-out goes to <FanOut/>, <WaveSupervision/>, and <WaveConvergence/>.

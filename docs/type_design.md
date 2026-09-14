@@ -1,6 +1,6 @@
 # Type design
 
-> The user "never wants to look at a type and have to guess what it is for."
+> A reader should never have to look at a type and work out what it is for.
 
 Apply this to implementation, review, fixes, escalation, and plan revisions:
 
@@ -15,7 +15,7 @@ Apply this to implementation, review, fixes, escalation, and plan revisions:
   requires `Option<T>`, convert at that boundary into a domain type whose name
   and variants state what the presence or absence means. The design target is
   `SelfDocumenting<T>`: a reader should learn the domain meaning from the type
-  without tracing callers or guessing.
+  without tracing callers or inferring it.
 - Treat a vague type name or bare `Option<T>` as a design finding, not cosmetic
-  naming feedback. Reviewers must ask whether a more truthful type requires a
+  naming feedback. Reviewers must ask whether a more accurate type requires a
   better boundary, distinct states, or a small restructuring.

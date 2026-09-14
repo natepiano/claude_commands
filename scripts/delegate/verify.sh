@@ -23,6 +23,10 @@
 #                                          for re-running it alone
 #   verify.sh lint <package>               format, then scoped clippy (warnings denied)
 #                                          — both halves gated by config/lint.conf
+#   … [--features <list>]                  check, test, and lint accept one trailing
+#                                          `--features a,b` when the Work Order names
+#                                          it: code behind a non-default feature has
+#                                          no other route to a scoped gate
 #   verify.sh fmt <package>                format only (checkpoint-commit backstop)
 #                                          — gated by config/lint.conf
 #   verify.sh example <package> <name>     compile one example (only when the
@@ -121,6 +125,21 @@ example_features() {
         | "$PY" -c "$EXAMPLE_FEATURES_PY" "$1" "$2"
 }
 
+# Optional trailing `--features <list>` on check, test, and lint. The Work Order
+# names the exact list; the delegate still composes no flags of its own. Any
+# other leftover argument is a usage error rather than something to pass through.
+FEATURE_FLAGS=()
+take_features() {
+    if [[ $# -gt 0 && "$1" == "--features" && -n "${2:-}" ]]; then
+        FEATURE_FLAGS=(--features "$2")
+        shift 2
+    fi
+    if [[ $# -ne 0 ]]; then
+        usage
+        exit 2
+    fi
+}
+
 CMD="${1:-}"
 if [[ -z "$CMD" ]]; then
     usage
@@ -210,18 +229,26 @@ trap 'verify_cleanup interrupted' INT TERM
 case "$CMD" in
     check)
         PKG="${1:?verify.sh check <package>}"
+        shift
+        take_features "$@"
         FLAGS="$(target_flags "$PKG")"
         # shellcheck disable=SC2086
-        run cargo check -p "$PKG" $FLAGS
+        run cargo check -p "$PKG" $FLAGS "${FEATURE_FLAGS[@]}"
         ;;
     test)
         PKG="${1:?verify.sh test <package> [integration_test]}"
-        TARGET="${2:-}"
+        shift
+        TARGET=""
+        if [[ $# -gt 0 && "$1" != "--features" ]]; then
+            TARGET="$1"
+            shift
+        fi
+        take_features "$@"
         # --no-fail-fast: nextest cancels every remaining test after the first
         # failure, so one broken test silently hides the rest of the suite. A
         # phase gate has to report the whole result, not the first stop.
         if [[ -n "$TARGET" ]]; then
-            run_nextest --no-fail-fast -p "$PKG" --test "$TARGET"
+            run_nextest --no-fail-fast -p "$PKG" --test "$TARGET" "${FEATURE_FLAGS[@]}"
         else
             FLAGS="$(target_flags "$PKG")"
             # --tests adds the package's integration targets, matching what the
@@ -232,18 +259,20 @@ case "$CMD" in
             # compile-fail suites are #[ignore]d and .config/nextest.toml keeps
             # tool_id_boundary's downstream cases out of the default profile.
             # shellcheck disable=SC2086
-            run_nextest --no-fail-fast -p "$PKG" $FLAGS --tests
+            run_nextest --no-fail-fast -p "$PKG" $FLAGS --tests "${FEATURE_FLAGS[@]}"
         fi
         ;;
     lint)
         PKG="${1:?verify.sh lint <package>}"
+        shift
+        take_features "$@"
         fmt_cargo -p "$PKG"
         # target_flags shells out to cargo metadata, so resolve it only when
         # clippy is actually going to run.
         if lint_config_enabled clippy; then
             FLAGS="$(target_flags "$PKG")"
             # shellcheck disable=SC2086
-            invoke_clippy -p "$PKG" $FLAGS --tests
+            invoke_clippy -p "$PKG" $FLAGS --tests "${FEATURE_FLAGS[@]}"
         else
             lint_config_skip_notice clippy "cargo clippy -p $PKG"
         fi

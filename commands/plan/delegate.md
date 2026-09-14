@@ -1553,8 +1553,8 @@ seat `test`, the review seat `review`.
 opening is in play. Only the launcher
 watches the worker exit, so only a launcher can say a repair landed; two seats
 carrying the signal would resolve one round twice over. The signal is separate
-from the pass kind precisely so a second repairing seat can record `fix`
-honestly without performing the resolution.
+from the pass kind so a second repairing seat can record its pass as `fix`
+without also resolving the round.
 
 Apply <DispatchContract/>; set `EARLY_REVIEW=none` at dispatch, and close the
 turn with the progress header per <DelegationResultFormat/>. While a fix runs

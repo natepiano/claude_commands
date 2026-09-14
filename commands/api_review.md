@@ -194,7 +194,7 @@ leaves the tree green. Per phase:>
 
 **Set the disposition from the inventory.** Check the sibling `as-built/` directory next to `${DOC_PATH}`: if existing as-built docs already cover the reviewed surface (an API review of existing code almost always lands here), stamp `amend` and name those target docs — the finished work updates them in place; a separate `api_review_*` as-built would fragment the same subject across two docs. Stamp `create` only when the plan stands up a subsystem no existing doc covers. `/plan:to_phased_plan` preserves this line verbatim; `/plan:to_as_built` branches on it.
 
-Order phases so mechanical/low-risk changes (renames, re-exports, visibility narrowing) land before structural ones (trait extraction, entry-point merges). Renames of types/functions: note them as candidates for the user's editor-driven global rename rather than scripting them.
+Order phases so mechanical/low-risk changes (renames, re-exports, visibility narrowing) land before structural ones (trait extraction, entry-point merges).
 </WriteDoc>
 
 ---

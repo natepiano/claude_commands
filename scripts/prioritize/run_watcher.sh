@@ -384,17 +384,39 @@ run_daemon() {
     local signature_status
     local runner_status
     local settle_status
+    local py_direct
 
     if ! require_runtime; then
         return 2
     fi
+
+    # The shim picks an interpreter by version, and reaching it costs a bash
+    # process per call -- which this loop pays twice a second, forever, to
+    # re-answer a question whose answer does not move. Measured 2026-09-11 it
+    # was the largest single source of short-lived processes on this machine.
+    # Resolve once here and call the interpreter directly in the poll below.
+    # Anything unexpected falls back to the shim, so a resolution that fails
+    # costs the old process count rather than a dead daemon.
+    py_direct="$("$PY" -c 'import sys; print(sys.executable)' 2>> "$EVENT_LOG")"
+    if [[ -z "$py_direct" || ! -x "$py_direct" ]]; then
+        py_direct="$PY"
+        log "warning: could not resolve an interpreter directly; polling through the shim"
+    fi
+
     log "persistent signature watcher started"
     while true; do
-        observed="$("$PY" "$SIGNATURE_TOOL" 2>> "$EVENT_LOG")"
+        observed="$("$py_direct" "$SIGNATURE_TOOL" 2>> "$EVENT_LOG")"
         signature_status=$?
         if (( signature_status != 0 )); then
             log "error: watch signature failed exit=$signature_status; retrying"
             write_status "error" "watch-signature" "exit-$signature_status" || true
+            # An interpreter that has gone away -- garbage collected out of the
+            # nix store, uninstalled -- would otherwise fail this poll forever.
+            # Hand the next pass back to the shim, which re-resolves.
+            if [[ "$py_direct" != "$PY" && ! -x "$py_direct" ]]; then
+                py_direct="$PY"
+                log "interpreter no longer executable; polling through the shim"
+            fi
             baseline=""
             sleep "$ERROR_RETRY_SECONDS"
             continue
@@ -419,7 +441,7 @@ run_daemon() {
             continue
         fi
 
-        after="$("$PY" "$SIGNATURE_TOOL" 2>> "$EVENT_LOG")"
+        after="$("$py_direct" "$SIGNATURE_TOOL" 2>> "$EVENT_LOG")"
         signature_status=$?
         if (( signature_status != 0 )); then
             log "error: post-run watch signature failed exit=$signature_status; retrying"
@@ -430,7 +452,7 @@ run_daemon() {
         if [[ "$after" != "$observed" ]]; then
             settled_state_is_current
             settle_status=$?
-            confirmed="$("$PY" "$SIGNATURE_TOOL" 2>> "$EVENT_LOG")"
+            confirmed="$("$py_direct" "$SIGNATURE_TOOL" 2>> "$EVENT_LOG")"
             signature_status=$?
             if (( signature_status != 0 )); then
                 log "error: settle watch signature failed exit=$signature_status; retrying"

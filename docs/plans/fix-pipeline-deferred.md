@@ -49,9 +49,7 @@ than what it is *for* — a project-allowlist change, a project-rename migration
 plan, a history-state move, a worktree-redirect match, or a configuration-commit
 outcome.
 
-**Do this one in the editor, not through an agent.** A global rename is exact and
-instant there and slow and error-prone anywhere else; the right hand-off is this
-list, not a phase. Item 1 should land first, since it changes which types exist.
+Item 1 should land first, since it changes which types exist.
 
 ## 3. The report model hides domain outcomes behind generic types and strings
 
