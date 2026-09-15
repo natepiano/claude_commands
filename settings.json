@@ -212,7 +212,7 @@
       "~/.claude/scripts/validate_and_push/validate_ci.sh"
     ]
   },
-  "feedbackDrafts": "notify",
+  "feedbackDrafts": "quiet",
   "alwaysThinkingEnabled": true,
   "autoCompactWindow": 283800,
   "askUserQuestionTimeout": "never",
