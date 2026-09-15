@@ -171,7 +171,7 @@ invoke_doc() {
 # scope: size is a property of the target directory, not of which members
 # changed. sweep.py holds the policy (least recently used build units and
 # incremental dirs go first, cargo's build locks taken without waiting) and
-# the measurements behind it. The knob is LINT_SWEEP_BUDGET_GIB (default 48),
+# the measurements behind it. The knob is LINT_SWEEP_BUDGET_GIB (default 96),
 # LINT_-prefixed on purpose: sccache hashes every CARGO_* variable into its
 # cache key. --dry-run reports what would go and removes nothing.
 invoke_sweep() {

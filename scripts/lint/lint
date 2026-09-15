@@ -35,7 +35,7 @@ that manifest's tree instead of the working directory. fmt is always --all: it
 compiles nothing, so the wider scope is free. sweep takes no scope either: it
 removes the least recently used build output from the target directory of the
 workspace in the current directory, cargo-port's cwd, until it fits
-LINT_SWEEP_BUDGET_GIB (default 48), and runs last in each of cargo-port's lint
+LINT_SWEEP_BUDGET_GIB (default 96), and runs last in each of cargo-port's lint
 runs.
 
 mend/clippy/doc/fmt/sweep honor config/lint.conf (edit with /lint_config);

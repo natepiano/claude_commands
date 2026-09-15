@@ -10,10 +10,20 @@ this removes the least recently used build output until it fits:
                       hash, removed together
     incremental dir   one direct child of a build tree's incremental/
 
-The budget is LINT_SWEEP_BUDGET_GIB (default 48), summed over every file
+The budget is LINT_SWEEP_BUDGET_GIB (default 96), summed over every file
 under the target and build directories, so output this never removes (doc/,
 test-run folders, binaries cargo copied up out of deps/) still counts.
 --dry-run reports what would go and removes nothing.
+
+Why 96. A budget below the working set evicts output the next lint run needs,
+and because this runs after every lint run, that rebuild repeats on every
+save. Replaying hana's cycle into an empty target (2026-09-15: scoped and
+workspace clippy, doc and mend, the nextest test build, the external-client
+fixture, the app build) came to 56.9 GiB, of which the test build alone was
+33.5 GiB; the clerestory-tests suite adds 9.4 GiB. A rerun rebuilt nothing,
+but sweeping that target to 48 GiB made the next cycle rebuild nearly every
+workspace unit. 96 covers that working set with room for feature and profile
+variants.
 
 Why a budget and not an age window. An age window only removes what active
 development has stopped touching, and active development touches almost
@@ -58,7 +68,7 @@ from typing import Literal, TypedDict, cast
 
 GIB = 1 << 30
 DAY_SECONDS = 86_400
-DEFAULT_BUDGET_GIB = 48.0
+DEFAULT_BUDGET_GIB = 96.0
 BUDGET_ENV = "LINT_SWEEP_BUDGET_GIB"
 LOCK_NAMES = (".cargo-lock", ".cargo-build-lock", ".cargo-artifact-lock")
 HASHED_DIRS = (".fingerprint", "build", "deps", "examples")
