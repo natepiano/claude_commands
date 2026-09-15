@@ -905,8 +905,10 @@ follow <AuthorizationContract/>.
 Read `~/.claude/commands/plan/delegate_style.md` in full and apply it once per
 run, before the first dispatch. Loop and verbose only; `single` skips it and
 never sets a base. That file defines this contract and <RunProjectStyleReview/>.
-Never resolve the base from memory of an earlier read — the
-`purpose_built=false` question is asked exactly once and dispatch waits on it.
+Never resolve the base from memory of an earlier read. On the default branch
+with no other local branches and no branch named by the user, the run continues
+on the default branch without asking; only a detached HEAD or other existing
+branches raise the branch question, asked exactly once while dispatch waits.
 The user can invoke the same file as `/plan:delegate_style`.
 </ResolveStyleDiffBase>
 

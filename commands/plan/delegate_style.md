@@ -40,9 +40,16 @@ the working tree directly.
 3. `purpose_built=true` needs no user decision. Persist `project_base` to
    `${SESSION_DIR}/style_diff_base`, name the branch and how many commits the
    end-of-run style review will therefore cover in one line, and continue.
-4. `purpose_built=false` means HEAD is detached or sits on the default branch,
-   so the run would checkpoint onto a branch it does not own. Ask exactly once
-   and dispatch nothing until it is answered:
+4. `purpose_built=false` on the default branch with `other_branches=0`, and no
+   branch named in the invocation, needs no user decision either: nothing else
+   is in flight whose commits could mix into the style diff. Persist
+   `project_base`, say in one line that the run continues on the default branch
+   and the style diff starts at `project_base`, and continue. **Never stop to
+   ask here** — a run the user left unattended must not idle on a question with
+   one reasonable answer.
+5. Otherwise `purpose_built=false` — HEAD is detached, or other local branches
+   exist — means the run would checkpoint onto a branch it does not own. Ask
+   exactly once and dispatch nothing until it is answered:
 
    ```
    Each phase checkpoints, and the project-end style review diffs the branch to reach that committed work. Currently <reason>, so this project has no branch of its own to diff. Reply \`branch\` to create \`<suggested_branch>\` here and run on it, \`branch <name>\` to choose the name, or \`stay\` to keep this position and accept that anything else committed here lands in the same style diff.

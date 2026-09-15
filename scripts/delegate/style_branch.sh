@@ -21,6 +21,7 @@
 #   purpose_built=true|false
 #   reason=<one phrase>
 #   suggested_branch=<name>
+#   other_branches=<n>             local branches other than the default branch
 #
 # project_base is the parent of the first `checkpoint(<plan-slug>)` commit
 # reachable from HEAD — where this project started work — or HEAD itself when
@@ -133,6 +134,11 @@ resolve)
 
   SUGGESTED="${PLAN_SLUG:-delegate-run}"
 
+  OTHER_BRANCHES=0
+  while IFS= read -r name; do
+    [[ -n "${name}" && "${name}" != "${DEFAULT_BRANCH}" ]] && OTHER_BRANCHES=$((OTHER_BRANCHES + 1))
+  done < <(git for-each-ref --format='%(refname:short)' refs/heads 2>/dev/null || true)
+
   printf 'status=ok\n'
   printf 'repo_root=%s\n' "${REPO_ROOT}"
   printf 'current_branch=%s\n' "${CURRENT_BRANCH}"
@@ -146,6 +152,7 @@ resolve)
   printf 'purpose_built=%s\n' "${PURPOSE_BUILT}"
   printf 'reason=%s\n' "${REASON}"
   printf 'suggested_branch=%s\n' "${SUGGESTED}"
+  printf 'other_branches=%s\n' "${OTHER_BRANCHES}"
   ;;
 create)
   BRANCH_NAME="${3:-}"
