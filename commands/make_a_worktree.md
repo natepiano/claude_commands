@@ -6,6 +6,7 @@ Use TodoWrite tool to create initial todos:
 - "Suggest worktree and branch name to user"
 - "Get user approval for worktree creation"
 - "Create approved worktree and branch"
+- "Allow the worktree's .envrc so direnv-gated tooling works"
 - "Offer a fix pipeline eval/fix redirect if the worktree matches a project"
 
 <ExecutionSteps>
@@ -15,7 +16,8 @@ Use TodoWrite tool to create initial todos:
 **STEP 2:** Execute <GetUserApproval/>
 **STEP 3:** Execute <CreateWorktree/>
 **STEP 4:** Execute <CopySettingsLocal/>
-**STEP 5:** Execute <OfferFixPipelineRedirect/>
+**STEP 5:** Execute <AllowDirenv/>
+**STEP 6:** Execute <OfferFixPipelineRedirect/>
 </ExecutionSteps>
 
 <SuggestWorktreeName>
@@ -77,6 +79,21 @@ Mark third todo as completed when finished.
 - Run `bash ~/.claude/scripts/make_a_worktree/copy_settings_local.sh ../[worktree-name]`
 - Inform user: "Copied settings.local.json to worktree."
 </CopySettingsLocal>
+
+<AllowDirenv>
+**Approve the worktree's `.envrc` so direnv-gated tooling works there.**
+
+A fresh worktree carries the repo's `.envrc` but not direnv's approval, so the
+environment stays blocked. Anything that shells through `direnv exec` then fails
+without ever touching the code — cargo-port, for one, reports the lint column as
+environment-unavailable (yellow) rather than pass/fail.
+
+- Run `bash ~/.claude/scripts/make_a_worktree/direnv_allow.sh ../[worktree-name]`
+- If the output says there is no `.envrc`, SKIP silently — nothing to report.
+- Otherwise report the result in one line: allowed, plus whether the environment
+  probe passed. If the probe still fails, surface the script's warning so the
+  user knows lints in that worktree will not run yet.
+</AllowDirenv>
 
 <OfferFixPipelineRedirect>
 **Offer to point the fix pipeline's style eval/fix at this worktree.**
