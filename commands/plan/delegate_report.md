@@ -118,12 +118,13 @@ Everything below is the contract.
    there, not at the table's first row — never describe a phase as newly opened
    because its earlier rounds are off the table. When the user asks about work
    that line covers, answer from `timeline`, which still renders every pass.
-7. Write the seat lines yourself. One line per seat the recorder listed, with
-   the same lead — `- **Agent 2** (test)`, plus the agent when the recorder
-   names one — then a sentence of yours, not the seat's. Each line answers two
-   things: what the seat is doing in the phase's own terms, and whether it is
-   moving, waiting, or done. Build it from the seat's board lines since the
-   last cursor plus the Work Order, and hold these rules:
+7. Write the seat table yourself: one row per seat the recorder listed, columns
+   `#`, `Role`, `Model`, `Effort`, `Details`. Take the number and the slot from
+   the seat's label, the model and effort from the recorder when it names them
+   and `-` when it does not. `Details` is a sentence of yours, not the seat's,
+   answering two things: what the seat is doing in the phase's own terms, and
+   whether it is moving, waiting, or done. Build it from the seat's board lines
+   since the last cursor plus the Work Order, and hold these rules:
 
    - Read the full board line, never the recorder's 72-character cut. A line
      ending in `…` has lost its information and must never reach the user.
@@ -138,21 +139,25 @@ Everything below is the contract.
      reviewer's phrasing.
    - Give an age only when it is news — a seat silent long enough to look
      stalled, or finished and how long ago. "1s ago" tells the reader nothing.
-   - One set of lines per report, from this tick's recorder output only. Never
-     carry a previous tick's lines forward or print two sets.
+   - One table per report, from this tick's recorder output only. Never carry a
+     previous tick's rows forward or print two tables.
 
    Not this:
 
    ```text
-   - **Agent 1** (impl) gpt-5.6-sol xhigh · 1s ago · claim: token cargo acquired for up to 3600s
-   - **Agent 2** (test) gpt-5.6-sol xhigh · 18s ago · Identity lane compiles with six Catalyst defects and one test fixture c…
+   | # | Role | Model | Effort | Details |
+   |---|------|-------|--------|---------|
+   | 1 | impl | gpt-5.6-sol | xhigh | 1s ago · claim: token cargo acquired for up to 3600s |
+   | 2 | test | gpt-5.6-sol | xhigh | Identity lane compiles with six Catalyst defects and one test fixture c… |
    ```
 
    This:
 
    ```text
-   - **Agent 1** (impl) gpt-5.6-sol xhigh · starting its verification build.
-   - **Agent 2** (test) gpt-5.6-sol xhigh · fixing six compile errors its new identity tests turned up.
+   | # | Role | Model | Effort | Details |
+   |---|------|-------|--------|---------|
+   | 1 | impl | gpt-5.6-sol | xhigh | starting its verification build |
+   | 2 | test | gpt-5.6-sol | xhigh | fixing six compile errors its new identity tests turned up |
    ```
 8. Add two or three ordinary-English sentences under <UserFacingText/>: open
    with what this phase gives the person using the tool, then its movement and
