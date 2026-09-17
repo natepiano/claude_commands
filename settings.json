@@ -9,7 +9,6 @@
   "includeCoAuthoredBy": false,
   "permissions": {
     "allow": [
-      "Bash(zsh /home/natepiano/rust/graft-trial/trial3/launch.sh *)",
       "Bash(cargo *)",
       "Bash(cargo-berth *)",
       "Bash(gh *)",
