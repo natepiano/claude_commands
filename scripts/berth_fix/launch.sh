@@ -1,16 +1,16 @@
 #!/usr/bin/env bash
 
-# Address the single cargo-berth fixer session: attach, resume, or start it.
+# Open or attach the single cargo-berth fixer session.
 #
-# One fixer exists at a time, in one worktree, under one recorded session id, so
-# every reporter can reach it by name and every restart continues the same
-# conversation. Start and resume both run through here because a second copy of
-# the fixer is the one failure this script exists to prevent: `claude --bg -r`
-# on an already-running session starts a copy instead of refusing.
+# The fixer is resident: one conversation in one terminal, kept running so every
+# report reaches a session that already holds every earlier engagement. Reporters
+# message it by name and never start it, so this script is the only way one
+# starts — and a second copy, the failure it exists to prevent, has nowhere to
+# come from.
 #
-# The id is recorded rather than pinned: `--bg` assigns its own session id and
-# ignores `--session-id`, so only a session started in a terminal can be given
-# one up front.
+# It runs in a terminal rather than in the background because its engagement ends
+# in a merge to main, and auto mode escalates that merge to a user a background
+# session does not have.
 
 set -u
 
@@ -21,50 +21,47 @@ branch=fix/berth
 session_name=berth-fix
 state=$HOME/.claude/state/berth-fix
 record=$state/session.json
-lock=$state/launch.lock
 
 usage() {
     cat <<'USAGE'
 usage:
-  launch.sh                                    attach to the live fixer, or start it in this terminal
-  launch.sh --status                           report paths and liveness, launch nothing
-  launch.sh --report <dir> --reply-to <name>   ensure a background fixer exists, addressed to <name>
+  launch.sh             open the fixer in a Ghostty window, or reach the live one
+  launch.sh --here      open the fixer in this terminal instead of a window
+  launch.sh --status    report paths and liveness, open nothing
 USAGE
 }
 
-# A row in `claude agents --json` outlives the session it names: rows for dead
-# background sessions persist with state "blocked". Liveness is the row plus a
-# live process, so every caller goes through this.
+# The fixer is the live session sitting in the fix worktree. The worktree, not
+# the name, is the identity: a row in `claude agents --json` outlives the session
+# it names, finished sessions leave rows behind with no pid, and a renamed window
+# still answers from the same directory. Liveness is a row in $worktree with a pid
+# that answers, a resident terminal beating any leftover background row. Prints
+# `<pid> <name>`, and refreshes the record while it has the live session id in
+# hand — a resumed session is given a new id, so the record goes stale on every
+# restart unless something reads it back.
 live_fixer() {
-    local rows candidate kind identifier
-    rows=$(timeout 60 claude agents --json 2>/dev/null) || return 1
-    candidate=$(printf '%s' "$rows" | SESSION_NAME=$session_name python3 -c '
+    local candidates kind pid session name
+    candidates=$(timeout 60 claude agents --json 2>/dev/null | WORKTREE=$worktree python3 -c '
 import json, os, sys
 
-wanted = os.environ["SESSION_NAME"]
+wanted = os.environ["WORKTREE"]
 try:
     rows = json.load(sys.stdin)
 except ValueError:
-    sys.exit(1)
+    raise SystemExit(1)
+rows = [row for row in rows if row.get("cwd") == wanted and row.get("pid")]
+rows.sort(key=lambda row: row.get("kind") != "interactive")
 for row in rows:
-    if row.get("name") != wanted:
-        continue
-    if row.get("kind") == "background":
-        print("background", row.get("id", ""))
-    else:
-        print("interactive", row.get("pid", ""))
+    print(row.get("kind", "interactive"), row["pid"], row.get("sessionId", ""), row.get("name", ""))
 ') || return 1
-    [ -n "$candidate" ] || return 1
-
-    kind=${candidate%% *}
-    identifier=${candidate##* }
-    [ -n "$identifier" ] || return 1
-    if [ "$kind" = interactive ]; then
-        kill -0 "$identifier" 2>/dev/null || return 1
-    else
-        timeout 60 claude logs "$identifier" >/dev/null 2>&1 || return 1
-    fi
-    printf '%s %s\n' "$kind" "$identifier"
+    [ -n "$candidates" ] || return 1
+    while read -r kind pid session name; do
+        [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null || continue
+        [ -n "$session" ] && remember_session "$session" "$kind"
+        printf '%s %s\n' "$pid" "$name"
+        return 0
+    done <<< "$candidates"
+    return 1
 }
 
 recorded_session() {
@@ -96,40 +93,24 @@ with open(os.environ["RECORD"], "w") as handle:
 '
 }
 
-# A background session is assigned its id at launch, so it can only be read back
-# afterwards. It takes a few seconds to register.
-discover_session_id() {
-    local attempt=0
-    while [ "$attempt" -lt 15 ]; do
-        local found
-        found=$(timeout 60 claude agents --json 2>/dev/null | SESSION_NAME=$session_name python3 -c '
-import json, os, sys
-
-wanted = os.environ["SESSION_NAME"]
-try:
-    rows = json.load(sys.stdin)
-except ValueError:
-    raise SystemExit(1)
-for row in rows:
-    if row.get("name") == wanted and row.get("kind") == "background" and row.get("sessionId"):
-        print(row["sessionId"])
-        break
-' 2>/dev/null)
-        if [ -n "$found" ]; then
-            printf '%s\n' "$found"
-            return 0
-        fi
-        attempt=$((attempt + 1))
-        sleep 1
-    done
-    return 1
+# A terminal session takes the id it is given, so the conversation is pinned
+# before it starts; only `--bg` assigns its own and forces discovery afterwards.
+resume_flags=()
+set_resume_flags() {
+    local remembered
+    if remembered=$(recorded_session); then
+        resume_flags=(-r "$remembered")
+        return 0
+    fi
+    remembered=$(python3 -c 'import uuid; print(uuid.uuid4())') || return 1
+    resume_flags=(--session-id "$remembered")
+    remember_session "$remembered" "$1"
 }
 
 # The fixer used to live at $legacy_worktree. Relocation is the only way onto the
 # new path: that checkout still holds $branch, so `worktree add` would refuse, and
 # the recorded conversation is filed under the old directory, so its project
-# history moves with it or the next resume finds nothing to continue. Reached only
-# with no fixer live, since every caller checks that before preparing a worktree.
+# history moves with it or the next resume finds nothing to continue.
 relocate_legacy_worktree() {
     local projects=$HOME/.claude/projects
     git -C "$repository" worktree move "$legacy_worktree" "$worktree" || return 1
@@ -138,6 +119,8 @@ relocate_legacy_worktree() {
     fi
 }
 
+# The worktree is permanent: it outlives every engagement, and the fixer catches
+# it up from main when a new report arrives.
 ensure_worktree() {
     [ -d "$worktree" ] && return 0
     [ -d "$legacy_worktree" ] && { relocate_legacy_worktree; return; }
@@ -150,47 +133,46 @@ ensure_worktree() {
     bash "$HOME/.claude/scripts/make_a_worktree/direnv_allow.sh" "$worktree" >/dev/null 2>&1 || true
 }
 
-take_lock() {
-    mkdir "$lock" 2>/dev/null || {
-        printf 'another launch is in progress (%s); nothing started\n' "$lock" >&2
-        exit 3
-    }
-    trap 'rmdir "$lock" 2>/dev/null' EXIT HUP INT TERM
-}
-
 # CLAUDE_CODE_MESSAGING_SOCKET, its token, and the bridge session id name the
 # caller's session; a child inheriting them comes up wearing the caller's
 # identity. CLAUDE_CODE_ENTRYPOINT is left alone deliberately — stripping it
 # reads as hiding the caller and auto mode denies the launch.
-claude_child() {
+without_caller_identity() {
     env -u CLAUDE_CODE_MESSAGING_SOCKET \
         -u CLAUDE_CODE_MESSAGING_TOKEN \
         -u CLAUDE_CODE_BRIDGE_SESSION_ID \
-        claude "$@"
+        "$@"
 }
 
-mode=interactive
-report=
-reply_to=
+# `+new-window` hands the command to the running Ghostty instance and returns at
+# once, so the window outlives the shell that asked for it. With no instance to
+# hand it to, a detached Ghostty starts one.
+open_window() {
+    without_caller_identity ghostty +new-window --working-directory="$worktree" -e "$@" && return 0
+    without_caller_identity setsid ghostty --working-directory="$worktree" -e "$@" >/dev/null 2>&1 &
+    disown 2>/dev/null
+    return 0
+}
+
+report_live() {
+    local pid=${1%% *} name=${1#* }
+    printf 'fixer live: %s (pid %s) — reach it by name with SendMessage\n' "${name:-$session_name}" "$pid"
+}
+
+mode=window
 while [ $# -gt 0 ]; do
     case $1 in
         --status) mode=status ;;
-        --report) shift; report=${1-} ;;
-        --reply-to) shift; reply_to=${1-} ;;
+        --here) mode=here ;;
         -h|--help) usage; exit 0 ;;
         *) printf 'unknown argument: %s\n' "$1" >&2; usage >&2; exit 2 ;;
     esac
     shift
 done
-if [ -n "$report" ] || [ -n "$reply_to" ]; then
-    mode=report
-    if [ -z "$report" ] || [ -z "$reply_to" ]; then
-        printf -- '--report and --reply-to are used together\n' >&2
-        exit 2
-    fi
-fi
 
 if [ "$mode" = status ]; then
+    # First: it refreshes the record, and the conversation line below reads it.
+    found=$(live_fixer) || found=
     if [ -d "$worktree" ]; then
         printf 'worktree: %s\n' "$worktree"
     elif [ -d "$legacy_worktree" ]; then
@@ -205,67 +187,31 @@ if [ "$mode" = status ]; then
     else
         printf 'conversation: none yet\n'
     fi
-    if found=$(live_fixer); then
-        printf 'fixer: live %s\n' "$found"
-        [ "${found%% *}" = background ] && printf 'attach: claude attach %s\n' "${found##* }"
+    if [ -n "$found" ]; then
+        report_live "$found"
     else
-        printf 'fixer: not running\n'
-    fi
-    exit 0
-fi
-
-mkdir -p "$state/inbox"
-
-if [ "$mode" = report ]; then
-    take_lock
-    if found=$(live_fixer); then
-        printf 'already-live %s %s\n' "$session_name" "$found"
-        [ "${found%% *}" = background ] && printf 'attach: claude attach %s\n' "${found##* }"
-        exit 0
-    fi
-    ensure_worktree || { printf 'worktree preparation failed\n' >&2; exit 1; }
-    resume_flags=()
-    if remembered=$(recorded_session); then
-        resume_flags=(-r "$remembered")
-    fi
-    (
-        cd "$worktree" || exit 1
-        claude_child --bg -n "$session_name" "${resume_flags[@]+"${resume_flags[@]}"}" \
-            --permission-mode auto \
-            "/berth_fix --fixer --report $report --reply-to \"$reply_to\""
-    ) || { printf 'background launch failed\n' >&2; exit 1; }
-    printf 'launched %s\n' "$session_name"
-    if [ ${#resume_flags[@]} -eq 0 ]; then
-        if started=$(discover_session_id); then
-            remember_session "$started" background
-        else
-            printf 'session id not recorded; the next launch starts a fresh conversation\n' >&2
-        fi
+        printf 'fixer: not running (launch.sh opens it)\n'
     fi
     exit 0
 fi
 
 if found=$(live_fixer); then
-    if [ "${found%% *}" = background ]; then
-        exec claude attach "${found##* }"
-    fi
-    printf '%s is already running interactively (pid %s) in another terminal\n' \
-        "$session_name" "${found##* }"
+    report_live "$found"
     exit 0
 fi
-take_lock
+
+mkdir -p "$state/inbox"
 ensure_worktree || { printf 'worktree preparation failed\n' >&2; exit 1; }
-if remembered=$(recorded_session); then
-    resume_flags=(-r "$remembered")
-else
-    remembered=$(python3 -c 'import uuid; print(uuid.uuid4())') || exit 1
-    resume_flags=(--session-id "$remembered")
-    remember_session "$remembered" interactive
+set_resume_flags "$mode" || exit 1
+
+if [ "$mode" = here ]; then
+    cd "$worktree" || exit 1
+    exec env -u CLAUDE_CODE_MESSAGING_SOCKET \
+        -u CLAUDE_CODE_MESSAGING_TOKEN \
+        -u CLAUDE_CODE_BRIDGE_SESSION_ID \
+        claude -n "$session_name" "${resume_flags[@]}" --permission-mode auto "/berth_fix --fixer"
 fi
-cd "$worktree" || exit 1
-rmdir "$lock" 2>/dev/null
-trap - EXIT HUP INT TERM
-exec env -u CLAUDE_CODE_MESSAGING_SOCKET \
-    -u CLAUDE_CODE_MESSAGING_TOKEN \
-    -u CLAUDE_CODE_BRIDGE_SESSION_ID \
-    claude -n "$session_name" "${resume_flags[@]}" "/berth_fix --fixer"
+
+open_window claude -n "$session_name" "${resume_flags[@]}" --permission-mode auto "/berth_fix --fixer" \
+    || { printf 'window launch failed\n' >&2; exit 1; }
+printf 'opened %s in a Ghostty window\n' "$session_name"
