@@ -32,13 +32,27 @@ That script creates the PR branch, resets the local default branch to `origin/<d
 If any validation, push, or merge command fails, stop and report the failing step. Do not continue to later steps after a failure.
 
 <WatchCI>
-Watch the run on a **3-minute `ScheduleWakeup` tick**. Each tick is one status
-query, one stage-status table to the user, and one re-arm. Nothing else.
+Two watchers run together. Neither blocks the turn.
 
-**Never block on CI and never poll in-band.** No `gh run watch`, no
-`run_in_background` watcher, no `sleep`/`until` loop, no repeated queries inside
-a single turn. The wakeup *is* the wait. A blocking watch hides per-job progress
-for half an hour and defers diagnosis of a red job until the whole run settles.
+**Settle watcher** — start it once, in the same turn as the handoff block, before
+the first tick:
+
+```bash
+gh run watch <run-id> --repo <owner/repo> --exit-status
+```
+
+with `run_in_background: true` and `dangerouslyDisableSandbox: true`. Its
+task-notification is how you learn the run settled — exit 0 green, non-zero red —
+without waiting out a tick. On that notification, query status once, report, and
+stop the tick.
+
+**Progress tick** — a 3-minute `ScheduleWakeup`. Each tick is one status query,
+one stage-status table to the user, and one re-arm. Nothing else. It reports
+per-job progress the settle watcher cannot, and catches a red job mid-run.
+
+**Never block or poll in-band.** No foreground `gh run watch`, no `sleep`/`until`
+loop, no repeated queries inside a single turn. The background notification and
+the wakeup are both the wait.
 
 Every `gh` call takes `dangerouslyDisableSandbox: true` — the sandbox network
 proxy breaks its TLS verification.
@@ -120,15 +134,18 @@ detail — do not narrate it back row by row, and do not recap earlier ticks.
 3. Run `cargo mend --fail-on-warn` before the push. It is file-textual, so from
    macOS it still reads `cfg`-gated code that only Linux CI compiles.
 4. Commit, push, then **cancel the superseded run** with
-   `gh run cancel <old-run-id>` so it stops burning minutes.
-5. Re-arm on the new run id with `noop: false`.
+   `gh run cancel <old-run-id>` so it stops burning minutes, and `TaskStop` its
+   settle watcher.
+5. Start a settle watcher on the new run id and re-arm the tick with
+   `noop: false`.
 
 Fix and push without stopping to ask. Reach for the user only when the cause is
 a genuine tradeoff or a change in scope — a red CI job you know how to fix is
 neither.
 
 **When the run concludes green**, call `ScheduleWakeup({stop: true})` and report
-the summary block below. If it concludes red and the cause is outside the branch
+the summary block below. If the tick settles it first, `TaskStop` the settle
+watcher. If it concludes red and the cause is outside the branch
 (infrastructure, a flake you cannot reproduce, a failure already present on the
 default branch), say so plainly instead of guessing at a fix.
 </WatchCI>
