@@ -11,7 +11,7 @@ Fixed identifiers, so no session has to discover another:
 | | |
 |---|---|
 | fixer session | `berth-fix` — one conversation, resumed on every restart, accumulating context |
-| fix worktree | `~/rust/cargo-liner-berth-fix` on `fix/berth` |
+| fix worktree | `~/rust/berth-fix` on `fix/berth` |
 | engine source | `~/rust/cargo-liner/crates/cargo-berth` |
 | reports | `~/.claude/state/berth-fix/inbox/<utc>-<client>/` |
 | launcher | `~/.claude/scripts/berth_fix/launch.sh` |
@@ -69,7 +69,7 @@ A `no-defect`, `cannot-reproduce`, or `blocked` status gets the same block, with
 ## Fixer — `/berth_fix --fixer`
 
 <TakeTheRole>
-Verify `git rev-parse --show-toplevel` is `~/rust/cargo-liner-berth-fix` and the branch is `fix/berth`. If not, stop and say so — an engine built from another checkout reaches every live session on install.
+Verify `git rev-parse --show-toplevel` is `~/rust/berth-fix` and the branch is `fix/berth`. If not, stop and say so — an engine built from another checkout reaches every live session on install.
 
 Read `--report` when given. Then read every directory under `~/.claude/state/berth-fix/inbox/` with no `ack.md`, oldest first; those are reports that arrived while no fixer was running.
 
@@ -94,7 +94,7 @@ Two attempts without resolution: start an attempts log in the cargo-liner memory
 Only after the tests pass:
 
 ```bash
-bash ~/.claude/scripts/berth/install/install.sh ~/rust/cargo-liner-berth-fix
+bash ~/.claude/scripts/berth/install/install.sh ~/rust/berth-fix
 ```
 
 This publishes to `~/.cargo/bin` and restores the previous engine if publication fails. Every live session picks the new engine up on its next hook call, so the install is one coordinated act: immediately message **every** reporter with an open report to retry, not only the one that filed this one.

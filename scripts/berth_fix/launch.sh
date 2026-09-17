@@ -15,7 +15,8 @@
 set -u
 
 repository=$HOME/rust/cargo-liner
-worktree=$HOME/rust/cargo-liner-berth-fix
+worktree=$HOME/rust/berth-fix
+legacy_worktree=$HOME/rust/cargo-liner-berth-fix
 branch=fix/berth
 session_name=berth-fix
 state=$HOME/.claude/state/berth-fix
@@ -124,8 +125,22 @@ for row in rows:
     return 1
 }
 
+# The fixer used to live at $legacy_worktree. Relocation is the only way onto the
+# new path: that checkout still holds $branch, so `worktree add` would refuse, and
+# the recorded conversation is filed under the old directory, so its project
+# history moves with it or the next resume finds nothing to continue. Reached only
+# with no fixer live, since every caller checks that before preparing a worktree.
+relocate_legacy_worktree() {
+    local projects=$HOME/.claude/projects
+    git -C "$repository" worktree move "$legacy_worktree" "$worktree" || return 1
+    if [ -d "$projects/${legacy_worktree//\//-}" ] && [ ! -d "$projects/${worktree//\//-}" ]; then
+        mv "$projects/${legacy_worktree//\//-}" "$projects/${worktree//\//-}"
+    fi
+}
+
 ensure_worktree() {
     [ -d "$worktree" ] && return 0
+    [ -d "$legacy_worktree" ] && { relocate_legacy_worktree; return; }
     if git -C "$repository" show-ref --verify --quiet "refs/heads/$branch"; then
         git -C "$repository" worktree add "$worktree" "$branch" || return 1
     else
@@ -176,7 +191,13 @@ if [ -n "$report" ] || [ -n "$reply_to" ]; then
 fi
 
 if [ "$mode" = status ]; then
-    printf 'worktree: %s%s\n' "$worktree" "$([ -d "$worktree" ] || printf ' (absent)')"
+    if [ -d "$worktree" ]; then
+        printf 'worktree: %s\n' "$worktree"
+    elif [ -d "$legacy_worktree" ]; then
+        printf 'worktree: %s (moves to %s on the next launch)\n' "$legacy_worktree" "$worktree"
+    else
+        printf 'worktree: %s (absent)\n' "$worktree"
+    fi
     printf 'branch: %s\n' "$branch"
     printf 'session: %s\n' "$session_name"
     if remembered=$(recorded_session); then
