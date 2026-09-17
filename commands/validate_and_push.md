@@ -32,23 +32,32 @@ That script creates the PR branch, resets the local default branch to `origin/<d
 If any validation, push, or merge command fails, stop and report the failing step. Do not continue to later steps after a failure.
 
 <WatchCI>
-Two watchers run together. Neither blocks the turn.
+Settle watchers and a progress tick run together. Neither blocks the turn.
 
-**Settle watcher** — start it once, in the same turn as the handoff block, before
-the first tick:
+**Settle watchers** — one per run, started in the same turn as the handoff block,
+before the first tick:
 
 ```bash
 gh run watch <run-id> --repo <owner/repo> --exit-status
 ```
 
-with `run_in_background: true` and `dangerouslyDisableSandbox: true`. Its
-task-notification is how you learn the run settled — exit 0 green, non-zero red —
-without waiting out a tick. On that notification, query status once, report, and
-stop the tick.
+each with `run_in_background: true` and `dangerouslyDisableSandbox: true`. The
+task-notification is how you learn a run settled — exit 0 green, non-zero red —
+without waiting out a tick. Keep ticking until **every** watcher has fired.
 
-**Progress tick** — a 3-minute `ScheduleWakeup`. Each tick is one status query,
-one stage-status table to the user, and one re-arm. Nothing else. It reports
-per-job progress the settle watcher cannot, and catches a red job mid-run.
+The handoff block names the landed repo's run. When the post-push hook pushed a
+mirror, that mirror runs its own CI and needs its own watcher; take the repo from
+the hook's `mirror repo` line and its run id from:
+
+```bash
+gh run list --repo <mirror-repo> --limit 1 --json databaseId,headSha --jq '.[0] | "\(.databaseId) \(.headSha)"'
+```
+
+Confirm the `headSha` matches the mirror commit the hook pushed before watching it.
+
+**Progress tick** — a 3-minute `ScheduleWakeup`. Each tick is one run of the tick
+script, one table to the user, and one re-arm. Nothing else. It reports per-job
+progress the settle watchers cannot, and catches a red job mid-run.
 
 **Never block or poll in-band.** No foreground `gh run watch`, no `sleep`/`until`
 loop, no repeated queries inside a single turn. The background notification and
@@ -57,57 +66,29 @@ the wakeup are both the wait.
 Every `gh` call takes `dangerouslyDisableSandbox: true` — the sandbox network
 proxy breaks its TLS verification.
 
-**Each tick, run exactly this** (substitute repo and run id):
+**Each tick, run exactly this**, passing every run being watched:
 
 ```bash
-date '+%H:%M:%S %Z'
-gh run view <run-id> --repo <owner/repo> \
-  --json createdAt,status,conclusion,jobs \
-  --jq 'def secs: if . >= 60 then "\((./60)|floor)m \((.%60)|floor)s" else "\(.|floor)s" end;
-        def icon: if .status != "completed" then "…"
-                  elif .conclusion == "success" then "green"
-                  elif .conclusion == "skipped" then "skipped"
-                  elif .conclusion == "cancelled" then "cancelled"
-                  else "RED" end;
-        ((.createdAt|fromdateiso8601) as $c | (now - $c)) as $elapsed
-        | ([.jobs[]|select(.conclusion=="success")]|length) as $g
-        | ([.jobs[]|select(.conclusion=="skipped")]|length) as $s
-        | "run \(.status) \(.conclusion // "-") · elapsed \($elapsed|secs) · \($g) of \(.jobs|length) green\(if $s > 0 then " (\($s) skipped)" else "" end)",
-          "| stage | status | time |",
-          "|---|---|---|",
-          (.jobs[]
-           | (if .startedAt == null or (.startedAt|startswith("0001")) then null
-              else (.startedAt|fromdateiso8601) end) as $b
-           | (if .completedAt == null or (.completedAt|startswith("0001")) then now
-              else (.completedAt|fromdateiso8601) end) as $e
-           | "| \(.name) | \(icon) | \(if $b == null then "-" else (($e-$b)|secs) end) |")'
+~/.claude/scripts/validate_and_push/ci_tick.sh <owner/repo> <run-id> [<owner/repo> <run-id> ...]
 ```
 
-Never write `\"` inside the `--jq '...'` expression. The shell's single quotes
-already protect the double quotes, and the backslashes make jq fail to parse
-with `unexpected token "\\"`.
+It emits the clock time, a bullet per run, and **one** table whose columns are the
+runs and whose rows are the union of their stage names — a stage only one repo has
+reads `n/a` in the other. Under the table it prints a bold
+`**<repo> finished — <conclusion>**` for each settled run, so a finished run stays
+obvious while the other keeps going.
 
-The command emits the finished table, ready to paste. It prints **every stage on
-every tick**, not only the ones still moving, so each report is a standing
-picture of the run instead of a diff the user has to reassemble from earlier
-ticks. A stage that has not started yet shows `-` for time; a running one shows
-time elapsed so far, recomputed at each tick.
+Its output is already markdown. Paste it verbatim and **never wrap it in a code
+fence** — a fenced table renders as literal pipes.
+
+It prints **every stage on every tick**, not only the ones still moving, so each
+report is a standing picture instead of a diff the user has to reassemble. A stage
+that has not started shows `-`; a running one shows time elapsed so far.
 
 `skipped` is a normal conclusion for a conditional stage, not a failure. It is
 excluded from the green count, which is why a fully successful run can read
 `9 of 11 green (2 skipped)`. Never report a skipped stage as broken or as
 blocking the run — the run-level `conclusion` is what settles it.
-
-**Lead every report with the clock time and the run's elapsed time**, then the
-table:
-
-`**18:54:05 EDT** · run 32533199159 elapsed **24m 10s** · **9 of 11 green (2 skipped)**`
-
-| stage | status | time |
-|---|---|---|
-| Format Check | green | 17s |
-| Test Suite | … | 4m 55s |
-| cargo-mend Build Check | skipped | 0s |
 
 Then at most one line on what is left, or what broke. The table carries the
 detail — do not narrate it back row by row, and do not recap earlier ticks.
@@ -118,10 +99,10 @@ detail — do not narrate it back row by row, and do not recap earlier ticks.
   in the user's terminal
 - `noop: false` on any tick where a job flipped, you pushed a fix, or the run
   settled
-- Put the **full state in the `prompt`** — repo, run id, failing job's
-  `databaseId`, what is already confirmed green, and the exact next step. The
-  prompt is the only context that survives to the next tick, so it must stand
-  alone.
+- Put the **full state in the `prompt`** — every repo and run id still watched,
+  which have already settled, the failing job's `databaseId`, and the exact next
+  step. The prompt is the only context that survives to the next tick, so it must
+  stand alone.
 
 **When a job goes red**, diagnose it that same tick:
 
@@ -143,9 +124,10 @@ Fix and push without stopping to ask. Reach for the user only when the cause is
 a genuine tradeoff or a change in scope — a red CI job you know how to fix is
 neither.
 
-**When the run concludes green**, call `ScheduleWakeup({stop: true})` and report
-the summary block below. If the tick settles it first, `TaskStop` the settle
-watcher. If it concludes red and the cause is outside the branch
+**When every watched run concludes green**, call `ScheduleWakeup({stop: true})`
+and report the summary block below, one CI line per repo. A run the tick settles
+before its watcher fires gets a `TaskStop`. One repo finishing is not the end of
+the watch — keep ticking while any run is still moving. If it concludes red and the cause is outside the branch
 (infrastructure, a flake you cannot reproduce, a failure already present on the
 default branch), say so plainly instead of guessing at a fix.
 </WatchCI>
@@ -160,7 +142,7 @@ Tests:            <test summary>
 Mend:             <mend summary>
 Push:             <push summary>
 Commit:           <short commit>
-GitHub CI:        <ci summary, including run id and total elapsed>
+GitHub CI:        <per repo: run id, conclusion, total elapsed — mirror on its own line>
 Final state:      <final branch state>
 ```
 
