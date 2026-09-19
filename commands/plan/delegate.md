@@ -95,6 +95,55 @@ Paths are under `~/.claude/`.
   ledger ids, or other tooling mechanics in user-facing reports.
 </CoreContract>
 
+<TurnEndGate>
+Ending a turn is an action this command authorizes, never a default it falls
+back to. Every turn ends in exactly one of the conditions below, and **the
+turn's final line names which one**:
+
+`— holding: waiting on <handle>` · `gate: <name>` · `decision: <question>` ·
+`blocked: <cause>` · `done: run summary emitted`
+
+The closed list:
+
+- **waiting** — a background dispatch, verification, smoke run, or style pass is
+  live and nothing synchronous remains. Name the handle. <DispatchContract/>
+  step 4 and <BackgroundVerificationContract/> are this case.
+- **gate** — a gate this command defines reaches the user by design:
+  <VerbosePrePhaseGate/>, <VerbosePostPhaseGate/>, <ReviewPendingAddOns/>, or
+  the authorization round trip in <AuthorizationContract/>.
+- **decision** — a genuine user decision under <DecisionRouting/>. State the
+  question being asked.
+- **blocked** — a hard stop this command defines: a structural check that blocks
+  checkpoint, a refused tool call, a launch failure that survived
+  <DelegateLaunchFailure/>'s retry.
+- **done** — <RunSummary/> has been emitted.
+
+Nothing else authorizes a turn end, however complete it feels:
+
+- a finished workflow step, or a step boundary in <ExecutionSteps/>;
+- a report, table, briefing, or summary of work just completed;
+- a sentence naming what comes next;
+- context pressure or an approaching compaction — <CompactionContract/> already
+  forbids stopping for those.
+
+Two rules hold the gate shut rather than restating it:
+
+**Report after action.** In a turn that performs a step and reports it, the tool
+call comes first and the report follows. A report is never the last thing in a
+turn that still holds runnable work. <DispatchContract/> step 2 is the shape:
+launch, then say what is running.
+
+**Naming is committing.** Writing the next action in user-facing text obliges
+performing it in that same turn. A closing line of the form "Next: <X>" is this
+workflow's most frequent defect, and it diagnoses itself — an action specific
+enough to name is specific enough to call. Name it in the past tense, after the
+call, or not at all.
+
+A turn ending with no `— holding:` line is a defect in the run, and the user may
+treat it as one. When it is unclear which condition applies, none does: continue
+working.
+</TurnEndGate>
+
 <ToolingContract>
 Run every command under `~/.claude/scripts/delegate/` with
 `dangerouslyDisableSandbox: true`; do not try sandboxed first. Ledger and history
@@ -115,8 +164,10 @@ Applies to every implementation, test, fix, and review launcher.
 2. Tell the user in one line what is running and what happens on completion.
 3. Perform only synchronous work assigned by the call site: the main half of
    <DualReview/>. Do not inspect launcher output as a substitute for that review.
-4. Claude: if progress is enabled, arm <ProgressContract/>; then end the turn.
-   Task and timer notifications resume the workflow independently. Process the
+4. Claude: if progress is enabled, arm <ProgressContract/>; then end the turn
+   under <TurnEndGate/>, naming the handle in the `— holding: waiting on
+   <handle>` line. Task and timer notifications resume the workflow
+   independently. Process the
    first notification without waiting for the other. Re-arm before every
    subsequent turn that leaves work running -- a completed dispatch that hands
    straight off to verification, a smoke run, or a style pass is still running
@@ -856,8 +907,13 @@ For every decision raised by review, repair, or phase review:
 <ExecutionSteps>
 Execute in order:
 
-Apply <CoreContract/>, <CompactionContract/>, <UserFacingText/>, and
-<VerificationNarration/> throughout.
+Apply <CoreContract/>, <TurnEndGate/>, <CompactionContract/>,
+<UserFacingText/>, and <VerificationNarration/> throughout.
+
+The numbered steps below carry no turn boundaries. Consecutive steps run in one
+turn unless <TurnEndGate/> authorizes a stop between them. Steps 11 through 16
+in particular are one continuous sequence from phase review through completion
+recording, with no report emitted between them.
 
 1. <PrepareSession/>
 2. <ComposeWorkOrder/>
