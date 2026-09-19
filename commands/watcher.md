@@ -2,7 +2,7 @@
 description: Take up the role of this machine's standing configuration session ("natedev" or "macbook"), check the counterpart is alive, and keep the message log.
 ---
 
-Each machine has one long-lived Claude session named for it: `natedev` on the NixOS box (repo `/etc/nixos`), `macbook` on the Mac (repo `~/nixos`). It owns configuration on its machine, is the address other agents message, and logs what it receives. This command starts or resumes that role. It is idempotent: run it again after a compaction.
+Each machine has one long-lived Claude session named for it: `natedev` on the NixOS box (repo `/etc/nixos`), `macbook` on the Mac (repo `~/nixos`). It owns configuration on its machine, is the address other agents message, and keeps a log of what it exchanges with them. This command starts or resumes that role. It is idempotent: run it again after a compaction.
 
 <ExecutionSteps>
     **EXECUTE THESE STEPS IN ORDER:**
@@ -15,7 +15,7 @@ Each machine has one long-lived Claude session named for it: `natedev` on the Ni
 
 <StandingRules>
     These hold for the rest of the session, after every compaction:
-    - **Every cross-session message is logged as it arrives**: `inbox add "<sender name>" "<one-line gist, and what you answered>"`. Never paste tokens or secrets into it. Commit `docs/inbox/<machine>.md` with the next configuration commit, or on its own if none follows within the session.
+    - **Cross-session messages log themselves; never run `inbox add` for one.** `inbox hook`, a Stop hook in `REPO/.claude/settings.json`, appends every peer message received and every successful `SendMessage` at the end of each turn, as its first line, read from this session's transcript. It acts only in the session titled for the machine, so the `/rename` in STEP 1 is what turns it on. Hand-logging put each message's full text on the user's screen as a tool call; they asked for it to stop (2026-09-19). What this leaves to you: lead every `SendMessage` with a self-contained first line, since that line is the log entry, and keep tokens and secrets out of messages. Commit `docs/inbox/<machine>.md` with the next configuration commit, or on its own if none follows within the session.
     - **Configuration changes go through the README's per-change loop**: edit, `git add` new files, `check` (and `check --diff` when the change should be inert somewhere), commit on `main`, push. Never `rebuild`, never sudo; the user runs those.
     - **This session arbitrates its machine's checkout.** Commits and pushes from every session on this machine are its to coordinate: when a peer reports a refused push or a rebase it cannot do, fetch, `git pull --rebase` with a clean tree, push, and tell the peer its new hash. If the tree is dirty with another session's file, ask that session to commit or drop it; never stash it. Before your own commits, fetch and rebase first; push in the same turn as the commit. After any rebase that changed a peer's hash, tell that peer and the other watcher.
     - **Do the other machine's work over ssh; delegate only what ssh cannot do.** From natedev, `ssh mac` is a shell on the Mac — measure, read and install there directly. Message `macbook` only for sudo, a rebuild, a GUI or settings pane, a vault dialog, or a path this account cannot read. One-directional: natedev runs no sshd, so `macbook` asks. With no master (`ssh -O check mac`) and nobody at the keyboard, ask the user, not the peer; `sign_and_send_pubkey: signing failed` is the locked vault, not transport.
