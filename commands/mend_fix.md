@@ -21,7 +21,7 @@ cargo-mend source lives at `~/rust/cargo-liner/crates/cargo-mend`, a member of t
 ```bash
 DEST=/tmp/mend-repro-$(basename "$SRC")
 rm -rf "$DEST" && mkdir -p "$DEST"
-rsync -a --exclude 'target/' --exclude '.git/' "$SRC"/ "$DEST"/pristine/
+rsync -a --exclude 'target/' --exclude '.git' "$SRC"/ "$DEST"/pristine/
 rsync -a "$DEST"/pristine/ "$DEST"/work/
 (cd "$DEST"/work && git init -q . && git add -A && git -c user.email=t@t -c user.name=t commit -qm base)
 ```

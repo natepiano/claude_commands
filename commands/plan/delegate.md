@@ -310,7 +310,7 @@ Every implementation or fix prompt contains these sections once:
    `impl_summary_<slot>.txt` as the last act before finishing** — a background
    session has no output redirect, so a summary left only in the reply is a
    summary the orchestrator never sees. State this slot's file set and the
-   peers' file sets per <TeamFilePartition/>, and that a peer's file is blocked
+   peer's file set per <TeamFilePartition/>, and that a peer's file is blocked
    rather than merged. The summary also carries the three things no reader can
    recover from the diff: **what this slot is unsure about, what it could not
    verify, and what it touched outside its file set**. No reviewer receives a
@@ -319,35 +319,36 @@ Every implementation or fix prompt contains these sections once:
 3. Narration: before each activity, run
    `bash ~/.claude/scripts/delegate/board.sh post <concrete SESSION_DIR> <slot> status "<activity>"`.
    Use short present-tense text and never read the heartbeat file. Role
-   changes: **before the first tool call in a new role** — recruited into
-   writing, taking a slice of the test work, standing down — run
-   `bash ~/.claude/scripts/delegate/board.sh role <concrete SESSION_DIR> <slot> <impl|fix|test|review> "<why>"`,
+   changes: **before the first tool call in a new role** — taking a slice of
+   the test work, standing down — run
+   `bash ~/.claude/scripts/delegate/board.sh role <concrete SESSION_DIR> <slot> <impl|fix|test> "<why>"`,
    written out with the real path and this slot's name. A `status` sentence
    saying the same thing does not count: the table reads the `role=` field,
    and a move that is not posted is a row the run never shows.
 
    **The slot in every one of these commands is this prompt's slot.** Composing
-   three prompts from one draft carries the first slot into all three, and the
-   board then reads as one seat doing the whole round while two sit silent —
+   both prompts from one draft carries the first slot into both, and the board
+   then reads as one seat doing the whole round while the other sits silent —
    the attribution the required argument exists to keep. Nothing downstream can
    catch it, because each post is well-formed. Before dispatch, check that the
-   three prompts name three different slots.
-4. `## Team` — state the opening from Seats (`2 writers + 1 tester`, and the
-   role each slot opens in), then name the three concurrent slots and who holds
-   which files, each hub file with its one owner. Copy
+   two prompts name different slots.
+4. `## Team` — state the opening from Seats (`1 writer + 1 tester` or
+   `2 writers`, and the role each slot opens in), then name both slots and who
+   holds which files, each hub file with its one owner. Copy
    the board commands from <CoordinationBoard/>, and say a `verify.sh` run may
    pause while a peer finishes its own. Copy <BuildTokenContract/>'s
    delegate-facing prohibition: never mention, request, or acquire the cargo
    token. State the one rule plainly: **a question to a peer is a message, a
    decision is a board post**, and the board has no `ask` kind to fall back on.
-   Give this slot its own mesh name, both peers' names, the call that reaches
-   each of them, and — on the claude path — the orchestrator's name from
+   Give this slot its own mesh name, its peer's name, the call that reaches
+   it, and — on the claude path — the orchestrator's name from
    `ListAgents`, per <PhaseMesh/>. An address a member has to go looking for is
    one it will not use, and a codex peer needs the literal `codex_mesh.py`
    command line with the concrete `--session-dir` already filled in, not a
    description of it. A slot whose register line says `mesh=none` has no peer
    channel at all: say so, and tell it to read the board rather than wait on a
-   reply.
+   reply. A repair's lone seat per <FixDispatch/> has no peer: its `## Team`
+   carries only its file set and the token prohibition.
 5. `## Project Context`.
 6. `## Work Specification`.
 7. `## Type Design Contract` per <TypeDesignContract/>.
@@ -365,49 +366,47 @@ style audit.
 </WritePromptContract>
 
 <PhaseTeam>
-Every implementation and fix dispatch runs **three delegates at
-once**, never one. They share `${SESSION_DIR}` and `${WORKING_DIR}`, and each
+Every implementation dispatch runs **two delegates at once**; a repair runs
+one, per <FixDispatch/>. They share `${SESSION_DIR}` and `${WORKING_DIR}`, and each
 occupies a fixed **slot** that names its artifacts and its board identity. The
 **default opening**:
 
 | Slot | Opens as | Owns |
 | --- | --- | --- |
-| `impl` | the phase's implementation or repair | the Work Order's production files |
+| `impl` | the phase's implementation | the Work Order's production files |
 | `test` | tests for the same specification | test targets under `tests/` and new test files |
-| `review` | reading the spec and the tree cold | nothing; it is the team's reserve |
 
 **The Work Order's `Seats:` field sets the opening and overrides this table.**
-Its first line names the opening — `1 writer + 1 tester + reserve` is the table
-above; `2 writers + 1 tester`, `1 writer + 2 testers`, and `3 writers` are the
-others — and a line per slot names that slot's files and, where it differs
-from the table, what it opens as. `impl` always opens as `impl` (`fix` in a
-repair). `test` opens as `test` wherever the phase has a **test lane** — a
-`tests/` directory in a touched crate and a Spec concrete enough to test before
-the implementation exists — and as a writer where it has none. `review` is the
-**flex seat**: it opens as whatever third role the opening needs — a second
-writer, a second tester, or the cold read. A plan compiled without the field
-opens as the table says, with the partition decided at launch per
-<TeamFilePartition/>.
+Its first line names the opening — `1 writer + 1 tester` is the table above,
+`2 writers` the other — and a line per slot names that slot's files and, where
+it differs from the table, what it opens as. `impl` always opens as `impl`.
+`test` opens as `test` wherever the phase has a **test lane** — a `tests/`
+directory in a touched crate and a Spec concrete enough to test before the
+implementation exists — and as a writer where it has none. A plan compiled
+without the field opens as the table says, with the partition decided at launch
+per <TeamFilePartition/>. **A legacy three-seat field** maps down: drop its
+`review` line and fold that line's files into the surviving slot holding the
+same role (`impl` when both do), so `3 writers` becomes `2 writers` and either
+three-seat mix becomes `1 writer + 1 tester`.
 
 A slot is an identity and never changes. What a slot is *doing* is its **role**,
 and roles move during a phase per <RoleReassignment/>. Everything downstream —
 the board, the progress table, every artifact name — reads the slot for identity
-and the role for activity, so keep the two distinct: `review` doing
-implementation work is still slot `review`.
+and the role for activity, so keep the two distinct: `test` doing
+implementation work is still slot `test`.
 
 `test` opens against the **specification, not the implementation**. The Work
 Order defines the behavior, so tests can be written before any of it exists;
 a tester that waits for `impl` has converted a parallel team back into a queue.
 
 **Every seat carries its own pass kind, which is its opening role**, so a team
-phase records three passes. The recorder keys them by slot and closes only that slot's stale pass;
+phase records two passes. The recorder keys them by slot and closes only that slot's stale pass;
 <LaunchImplementation/> step 5 owns the argument positions.
 
-Launch all three in **one message** so they run concurrently, each with its own
+Launch both in **one message** so they run concurrently, each with its own
 prompt file and its slot as the ninth argument to `implement.sh`, then apply
 <DispatchContract/> once for the team: the progress timer covers the phase, not
-each member. <LaunchImplementation/> owns the rest of the procedure, and repairs
-run the same team under <FixDispatch/>.
+each member. <LaunchImplementation/> owns the rest of the procedure.
 
 The phase is complete only when every slot has a terminal `impl_status_<slot>`,
 not when the first one lands. Reading one slot's `implemented` as the phase's
@@ -422,7 +421,7 @@ The team coordinates through `${SESSION_DIR}/board.log`, written only with
 **Why a file even when messages work.** Every member is reachable by name on
 both paths — see <PhaseMesh/> — but the board is the durable broadcast record
 and the token owner, where messages are addressed and transient. One post
-reaches both peers and the wrapper at once; a member resumed hours later reads
+reaches the peer and the wrapper at once; a member resumed hours later reads
 the whole history rather than what arrived while it listened; and only the
 token, taken with `mkdir`, makes anything mutually exclusive. With
 `[delegate.options] codex_mesh=0` a codex member is unaddressable and the board
@@ -437,11 +436,10 @@ cannot relay. Each `register` line says which case holds, in its `mesh=` field.
   numbered; keep the last number as the cursor. Read after acquiring a token,
   and whenever you need what a peer has recorded rather than what it would say
   if asked — the role it holds now, whether it has posted `done`.
-- `board.sh role <session_dir> <slot> <impl|fix|test|review> [note]` — **call
-  this the moment your slot starts doing something other than what it is named
-  for.** A slot is a fixed identity and its role is not: a `review` slot
-  recruited into writing is doing `impl`, and a writer that takes a slice of the
-  remaining test work is doing `test`. The launcher stamps the opening role, so
+- `board.sh role <session_dir> <slot> <impl|fix|test> [note]` — **call this
+  the moment your slot starts doing something other than what it is named
+  for.** A slot is a fixed identity and its role is not: a writer that takes a
+  slice of the remaining test work is doing `test`. The launcher stamps the opening role, so
   the table is never blank;
   after that only this command keeps it true, and saying it in a `status`
   sentence does not count — the table reads the field, not prose. **Every call
@@ -463,10 +461,10 @@ orchestrator reaches any of them, and a claude member reaches the orchestrator �
 mid-run, without waiting for a phase to end.
 
 - **Addresses** are `<mesh_prefix>-<slot>`, where the prefix is the session
-  directory's basename: `phase3-a91c-impl`, `-test`, `-review`. The slot, never
-  the role: a `review` seat writing code is still `-review`. A member is told
-  its peers' names in its prompt, and every `register` line on the board repeats
-  them in its `mesh=` field, so a member that missed the launch can still look
+  directory's basename: `phase3-a91c-impl`, `-test`. The slot, never the
+  role: a `test` seat writing code is still `-test`. A member is told its
+  peer's name in its prompt, and every `register` line on the board repeats the
+  names in its `mesh=` field, so a member that missed the launch can still look
   one up.
 - **How you reach a name depends on its family**, and the register line says
   which in its `reach=` field. Using the wrong call fails silently: the message
@@ -491,7 +489,7 @@ mid-run, without waiting for a phase to end.
   says so rather than pretending: it refuses any target whose roster status is
   not `running`. Ask a codex peer while it is still working, or read its summary
   file instead.
-- **A codex member has no route to the orchestrator.** It reaches its peers with
+- **A codex member has no route to the orchestrator.** It reaches its peer with
   the calls above and reaches the orchestrator only through the board, which the
   orchestrator reads at every progress tick. Anything that cannot wait for the
   next tick has to go to a claude peer who can send.
@@ -514,8 +512,8 @@ reading.
 </PhaseMesh>
 
 <BuildTokenContract>
-Three agents share one `target/` directory and one Cargo lock, so an
-uncoordinated `verify.sh` run blocks its peers for minutes while holding
+Both agents share one `target/` directory and one Cargo lock, so an
+uncoordinated `verify.sh` run blocks its peer for minutes while holding
 nothing useful.
 
 **`verify.sh` takes the `cargo` token itself, and no prompt ever asks an agent
@@ -532,7 +530,7 @@ deadline, not a reservation, so a member killed mid-hold strands nobody behind
 its lock. The orchestrator may inspect holders with
 `board.sh locks "${SESSION_DIR}"` when a phase looks stalled.
 
-**A green run only means what the tree it ran against means.** Peers are editing
+**A green run only means what the tree it ran against means.** The peer is editing
 throughout, so a result is authoritative for a package only once the slot that
 owns that package's files has posted `done`. Before that it is early signal:
 post it as `status`, never close a finding on it, and say which it is when
@@ -564,7 +562,7 @@ prompts:
 
 Where the Work Order's own files cannot be split — everything lands in one or
 two files — the Seats opening line says so, `impl` gets the whole set, and
-`test` and `review` open on work that does not touch it. A partition that does
+`test` opens on work that does not touch it. A partition that does
 not exist is not worth inventing; a partition that is wrong costs the phase.
 </TeamFilePartition>
 
@@ -573,19 +571,11 @@ Roles move; slots do not. Every move is a board `handoff` post naming the slot,
 the role it is leaving, and the role it is taking, because that post is what the
 progress table reads to say what each agent is doing now.
 
-- **A writer may recruit the reserve, when the opening left one.** When the
-  implementation is wider than one writer, `impl` messages `review` naming the
-  disjoint file subset it wants taken; `review` replies, then posts `handoff`
-  so the table shows the move. The team is then two writers and a tester.
-  `review` is the reserve precisely because it holds no files and can leave its
-  lane without stranding anything. A phase whose Seats opened all three as
-  writers or testers has no reserve, and that was the field's decision, not a
-  gap to recruit around.
 - **`test` is never recruited away** while tests for the phase are unwritten.
   It is the only slot whose absence cannot be recovered later in the phase, and
   a phase that ships untested is not cheaper, only later. A `test` seat that
   Seats opened as a writer has no tests to protect and moves like any writer.
-- **When writing finishes before testing**, the writers do not idle. They take a
+- **When writing finishes before testing**, a writer does not idle. It takes a
   disjoint slice of the remaining test work — agreed on the board, one file per
   slot, never the file `test` is inside — or they stand down.
 
@@ -594,20 +584,20 @@ with no idle loop: it ends as soon as it stops issuing tool calls, so there is
 no such thing as a member that sits quietly and comes back when asked. A slot
 with nothing left posts `done` with what it completed and finishes. Anything
 else burns a live session on a poll loop that the team pays for and nobody
-reads. This is why recruitment flows toward work that exists now rather than
-work a peer might hand over later.
+reads. This is why a finished writer moves toward work that exists now rather
+than work a peer might hand over later.
 </RoleReassignment>
 
 <TeamReview>
-A phase's broad review runs **three reviewers at once**, never one — and never
-three readings of the same question, which buys one opinion three times. Each
-takes a **lens**, disjoint and named in its prompt:
+A phase's broad review runs **two reviewers at once**, never one — and never
+two readings of the same question, which buys one opinion twice. Each takes a
+**lens**, disjoint and named in its prompt; the main review per <DualReview/>
+is the third reader:
 
 | Lens | Reads for | Seat |
 | --- | --- | --- |
-| `adversary` | the failing case — the input that violates a stated invariant, the caller that was not updated, the state the new code cannot reach, the test that passes for the wrong reason | `review` |
-| `conformance` | what the Work Order says, including every part no test covers, and anything built that it never asked for | `impl` |
-| `reach` | callers, consumers, public API, traits, registration, plugin wiring, and the invariants and transitions the change reaches without naming | `test` |
+| `adversary` | the failing case — the input that violates a stated invariant, the caller that was not updated, the state the new code cannot reach, the test that passes for the wrong reason | `test` |
+| `contract` | what the Work Order says, including every part no test covers, and anything built that it never asked for; then what the change reaches without naming — callers, consumers, public API, traits, registration, plugin wiring, invariants and transitions | `impl` |
 
 No reviewer wrote any of the code — each is a fresh session per
 <ReviewPromptContract/> — so no lens has to be kept away from its own work and
@@ -624,12 +614,12 @@ only reading here that produces evidence by finding nothing.
 
 Findings come back as one `review_findings_<pass>_<lens>.txt` per lens. A
 read-only session cannot post to the board, so that file is the whole record —
-<Synthesize/> reads all three, tags each finding with the lens that caught it,
-and can tell three independent findings from one finding found three times.
+<Synthesize/> reads both, tags each finding with the lens that caught it, and
+can tell two independent findings from one finding found twice.
 
 **A repair is not reviewed this way.** <ClosureReview/> is one reader over one
-batch of ids, and splitting a path-limited read three ways buys three passes
-over the same few hunks.
+batch of ids, and splitting a path-limited read two ways buys two passes over
+the same few hunks.
 </TeamReview>
 
 <ReviewPromptContract>
@@ -655,7 +645,7 @@ Rust delegates run only exact prompt lines using
 | compile feedback | `bash ~/.claude/scripts/delegate/verify.sh check <package>` |
 | package tests | `bash ~/.claude/scripts/delegate/verify.sh test <package>` |
 | one integration target alone | `bash ~/.claude/scripts/delegate/verify.sh test <package> <test>` |
-| format + scoped lint | `bash ~/.claude/scripts/delegate/verify.sh lint <package>` |
+| mend fix, format, scoped clippy, rustdoc | `bash ~/.claude/scripts/delegate/verify.sh lint <package>` |
 | checkpoint format | `bash ~/.claude/scripts/delegate/verify.sh fmt <package>` |
 | changed example | `bash ~/.claude/scripts/delegate/verify.sh example <package> <name>` |
 | final workspace gate | `bash ~/.claude/scripts/delegate/verify.sh final` |
@@ -666,9 +656,12 @@ Rules:
   here takes the `cargo` token on its own, so a run may wait for a peer, and a
   result is a gate only once the slot owning that package's files has posted
   `done`.
-- `check` is optional feedback, not a gate. Every modified package gets `test`
-  and `lint`; trace changed public APIs, traits, registration, and plugin wiring
-  to modified callers. Name an integration target explicitly only to re-run it
+- `check` is optional feedback, not a gate. Every modified package gets `lint`
+  and then `test`, in that order: `lint` rewrites the tree (mend fixes, then
+  format), so a `test` run before it proves nothing about the tree that gets
+  committed, and a `test` run after it is the one that counts. Never run the
+  suites twice around a lint; run lint first, once. Trace changed public APIs,
+  traits, registration, and plugin wiring to modified callers. Name an integration target explicitly only to re-run it
   alone. Add example lines only when the phase owns them.
 - Tests are the only testing: a passing `test` run proves the package builds.
   Never run `check` or any build alongside a `test` that is going to run anyway;
@@ -706,7 +699,7 @@ Use `python3 ~/.claude/scripts/delegate/findings.py <command> --session-dir
 
 | Command | Purpose |
 | --- | --- |
-| `open --severity <blocker\|minor\|nit> --title <t> --file <p> [--line N] --caught-by <delegate\|main\|both> [--detail <d>]` | create an id |
+| `open --severity <blocker\|minor\|nit> --title <t> --file <p> [--line N] --caught-by <delegate\|main\|both> [--lens <adversary\|contract\|both>] [--detail <d>]` | create an id; `--lens` names the broad-review lens that raised it |
 | `status` | read the ledger for closure review |
 | `gate` | get `converged` or `dispatch`, plus batch and any advisory |
 | `dispatch --covers F001,F002,...` | record one complete repair batch |
@@ -1097,10 +1090,10 @@ Build only from Delegation Context, the Work Order, and command-line amendments:
 [the Seats opening line verbatim, or "default — no Seats field"]
 ```
 
-Rows include only load-bearing types explicitly named by the Work Order. Status
+Rows include only types the Work Order explicitly names as part of its change. Status
 is `New`, `Existing - Changes`, or `Existing - No Changes`, inferred from that
-Work Order without code research. Mark genuine uncertainty instead of guessing;
-say explicitly when no load-bearing type is specified. Write every cell under
+Work Order without code research. Where it leaves a status unclear, mark it
+uncertain rather than inventing one; say explicitly when it names no such type. Write every cell under
 <TypeTableCells/>.
 </PhaseBriefing>
 
@@ -1160,17 +1153,18 @@ window, and why the window can run without an intermediate stop]
 ```
 
 Keep the overview and phase summaries behavioral and high-level; do not replay
-each Work Order. The complete preview must still preserve the load-bearing
-state transitions, ownership, visible effects, dependencies, and exclusions
-the user needs to authorize the range.
+each Work Order. The complete preview must still preserve every state
+transition, ownership change, visible effect, dependency, and exclusion the
+user needs to authorize the range.
 
-Table rows include only load-bearing types explicitly named by the applicable
-Work Order. Use status `New`, `Existing - Changes`, or
+Table rows include only types the applicable Work Order explicitly names as
+part of its change. Use status `New`, `Existing - Changes`, or
 `Existing - No Changes`, inferred from that Work Order without code research.
 Order rows by editing sequence: covered phase order first, then the order each
 type is first introduced or changed within that phase. Never alphabetize the
-table or regroup it by crate. Mark genuine uncertainty instead of guessing;
-say explicitly when the window specifies no load-bearing type. Write every cell
+table or regroup it by crate. Where a Work Order leaves a status unclear, mark
+it uncertain rather than inventing one; say explicitly when the window names no
+such type. Write every cell
 under <TypeTableCells/>.
 
 Keep `### Wrap-up` short. It synthesizes the authorization boundary; it does not
@@ -1217,17 +1211,15 @@ not a phase-title list or type table alone, owns batch authorization.
    step 4, never after it.
 3. `~/.claude/config/agents.conf` owns delegate family/model/effort, one row
    per kind. Each seat's kind is its opening role from the Work Order's
-   `Seats:` field: `impl` for the `impl` slot, and for `test` and `review`
-   whatever their Seats lines open them as — `test` and `review` under the
-   default opening. State the opening in the dispatch update in ordinary
-   words: "opening 2 writers + 1 tester: impl on the hana side, review writing
-   the catalyst side, test on the catalyst tests".
+   `Seats:` field: `impl` for the `impl` slot, and for `test` whatever its
+   Seats line opens it as — `test` under the default opening. State the
+   opening in the dispatch update in ordinary words: "opening 2 writers: impl
+   on the hana side, test writing the catalyst side".
 4. Take the partition and the opening from Seats and write one prompt per slot
    under <WritePromptContract/>: `${SESSION_DIR}/implementation_prompt.md` for
-   `impl`, `test_prompt.md` for `test`, and `review_prompt_team.md` for
-   `review`. Only when the field is absent, partition per <TeamFilePartition/>
+   `impl` and `test_prompt.md` for `test`. Only when the field is absent, partition per <TeamFilePartition/>
    yourself and say so in the dispatch update.
-5. Launch all three in one message, `impl` first, each under <ToolingContract/>.
+5. Launch both in one message, `impl` first, each under <ToolingContract/>.
    The fourth and sixth arguments are the seat's opening role, the same word in
    both places; the default opening is:
 
@@ -1238,16 +1230,13 @@ not a phase-title list or type table alone, owns batch authorization.
    implement.sh "${SESSION_DIR}" "${WORKING_DIR}" \
      "${SESSION_DIR}/test_prompt.md" test \
      "<responsibility>" test "<activity>" 0 test
-   implement.sh "${SESSION_DIR}" "${WORKING_DIR}" \
-     "${SESSION_DIR}/review_prompt_team.md" review \
-     "<responsibility>" review "<activity>" 0 review
    ```
 
    A seat Seats opens in another role swaps both words and nothing else — the
-   `review` seat opening as a writer is
-   `implement.sh "${SESSION_DIR}" "${WORKING_DIR}" "${SESSION_DIR}/review_prompt_team.md" impl "<responsibility>" impl "<activity>" 0 review`.
-   Responsibility follows <ProgressContract/>. **All three seats carry a pass
-   kind**, so a team phase records three passes and stops being attributed to one
+   `test` seat opening as a writer is
+   `implement.sh "${SESSION_DIR}" "${WORKING_DIR}" "${SESSION_DIR}/test_prompt.md" impl "<responsibility>" impl "<activity>" 0 test`.
+   Responsibility follows <ProgressContract/>. **Both seats carry a pass
+   kind**, so a team phase records two passes and stops being attributed to one
    agent. The kind is the work the seat was assigned and nothing more — it names,
    it never triggers, so a seat never misreports its work to avoid a side effect.
    **Task and kind are the same word** on every seat: the fourth argument selects
@@ -1256,11 +1245,10 @@ not a phase-title list or type table alone, owns batch authorization.
    resolves, in `agents.conf` or in the ledger.
 6. Announce prompt, board, and heartbeat paths, set `EARLY_REVIEW=none`, then
    apply <DispatchContract/> once for the whole team.
-7. On completion, read `impl_status_impl`, `impl_status_test`, and
-   `impl_status_review`; the phase is done only when all three are terminal.
-   `implemented` on `impl` loads `impl_summary_impl.txt` into
-   `${IMPL_SUMMARY}`; read the other two summaries for what they completed and
-   for findings they posted. If `impl` errors, apply <DelegateLaunchFailure/>
+7. On completion, read `impl_status_impl` and `impl_status_test`; the phase is
+   done only when both are terminal. `implemented` on `impl` loads
+   `impl_summary_impl.txt` into `${IMPL_SUMMARY}`; read `impl_summary_test.txt`
+   for what it completed and for findings it posted. If `impl` errors, apply <DelegateLaunchFailure/>
    first — a seat that died in seconds is resolved there, not reported. A
    genuine error then cancels any early-launched
    reviewer per <EarlyReviewArm/>, applies <RetainDelegatedPhaseReservation/>,
@@ -1302,8 +1290,8 @@ opportunity. A behavior-preserving repair never arms — documentation,
 formatting, lint guidance, an agreed trivial rename — and neither does one whose
 batch sits in paths narrow enough that <FixDispatch/> will close it on a
 contained diff; that judgment is the orchestrator's own reading of the batch, as
-no task name carries it. When the two estimates disagree, or either is a guess,
-do nothing; the synchronous path still exists.
+no task name carries it. When the two estimates disagree, or either rests on no
+evidence, do nothing; the synchronous path still exists.
 
 At an eligible tick, in that same tick:
 
@@ -1331,9 +1319,9 @@ At an eligible tick, in that same tick:
    <BroadReviewPrompt/> for pass 1, <ClosureReview/> for a fix — including the
    completion estimate, the partial diff, and the exact final-diff and
    ready-sentinel paths below. **Only the adversary arms early.** It is the lens
-   that gains most from the extra time, and arming all three against a partial
-   tree would triple the exposure to the void verdict below; the other two
-   launch at completion under <DualReview/> step 3.
+   that gains most from the extra time, and arming both against a partial
+   tree would double the exposure to the void verdict below; `contract`
+   launches at completion under <DualReview/> step 3.
 5. Launch `review.sh` exactly as <DualReview/> step 3 does — with `adversary`
    as its lens for pass 1 — appending one extra final argument:
    `${SESSION_DIR}/final_diff_${REVIEW_PASS}.ready`. Save the
@@ -1363,7 +1351,7 @@ always may — early launch is opportunistic, never required.
 | Event | Required action |
 | --- | --- |
 | Primary completes | After <LaunchImplementation/> step 7, write the final diff to `${SESSION_DIR}/final_diff_${REVIEW_PASS}.diff` — a closure review stays limited to its paths per <ClosureReview/> — then create `${SESSION_DIR}/final_diff_${REVIEW_PASS}.ready`. **Never create the sentinel before the diff is fully written.** |
-| Primary errors, or the run stops | Kill the early reviewer. If the sentinel exists, close its pass with `PLAN_DELEGATE_TEAM_ROLE=review … finish-pass --status canceled --orphaned-launcher` per <PassOwnership/> — the seat the `adversary` lens sits in; before the sentinel no pass was recorded, so record nothing — a pre-sentinel kill counts toward no advisory, including the blind-review cancellation one. |
+| Primary errors, or the run stops | Kill the early reviewer. If the sentinel exists, close its pass with `PLAN_DELEGATE_TEAM_ROLE=test … finish-pass --status canceled --orphaned-launcher` per <PassOwnership/> — the seat the `adversary` lens sits in; before the sentinel no pass was recorded, so record nothing — a pre-sentinel kill counts toward no advisory, including the blind-review cancellation one. |
 | Reviewer errors before delivery | Report it in one line, clear `${REVIEW_DISPATCH_HANDLE}`, set `EARLY_REVIEW=none`, and leave the numbered artifacts. The primary continues and is reviewed synchronously at completion under the next `${REVIEW_PASS}` index. |
 | A verdict arrives before delivery | **It is void.** The reviewer cannot have read a diff that does not exist yet, so discard its findings entirely rather than reading them as evidence: open nothing in the ledger, preempt nothing, route no blocker into a fix dispatch. Say in one line that it is discarded and why, then follow the reviewer-error row. A void verdict is often fluent and specific — a stale diff supports confident claims about missing work — so the check is the timing, never how convincing the text reads. |
 
@@ -1374,7 +1362,8 @@ row it was given:
 
 Run it alongside clearing `${REVIEW_DISPATCH_HANDLE}` and `EARLY_REVIEW`. The
 row would retire itself at the next report anyway; this is how the reason
-reaches the record, and it is what keeps that report from having to guess.
+reaches the record, and it is what lets that report state the reason rather
+than infer one.
 </EarlyReviewArm>
 
 <BroadReviewPrompt>
@@ -1394,8 +1383,8 @@ End with APPROVE, APPROVE WITH FIXES, or REQUEST CHANGES. Do not invent findings
 ## Your lens
 [the lens name and what it reads for, from <TeamReview/>]
 
-Two other reviewers are reading this same diff under the other two lenses.
-Report only what yours covers: a finding another lens owns is that lens's to
+Another reviewer is reading this same diff under the other lens. Report only
+what yours covers: a finding another lens owns is that lens's to
 make, and duplicating it costs the synthesis a second opinion and buys a
 count instead.
 
@@ -1419,14 +1408,12 @@ The questions are the lens, so each prompt carries only its own:
   3. Which test passes for a reason other than the behavior it names? Close with
   the failing case you constructed, or with a plain statement that you could not
   construct one.
-- `conformance` — 1. Complete and correct against the specification? 2. Anything
-  implemented that it did not ask for? 3. Consistent with surrounding code?
-  4. Are domain types clear, and are owned bare Option<T> values replaced or
-  justified at an external boundary?
-- `reach` — 1. What does the change reach without naming: callers, consumers,
-  public API, traits, registration, plugin wiring? 2. Which invariants or state
-  transitions does it change, and what still assumes the old ones? 3. Bugs,
-  missed edges, or broken error handling in what it reaches?
+- `contract` — 1. Complete and correct against the specification? 2. Anything
+  implemented that it did not ask for? 3. What does the change reach without
+  naming — callers, consumers, public API, traits, registration, plugin wiring
+  — and what there still assumes an invariant or state transition it changed?
+  4. Consistent with surrounding code? 5. Are domain types clear, and are owned
+  bare Option<T> values replaced or justified at an external boundary?
 
 **Early form** (an <EarlyReviewArm/> launch, which arms the `adversary` alone):
 the `## Diff` section holds the partial diff at launch, and an
@@ -1460,13 +1447,13 @@ of reviewing the partial diff.
    completed tree, deliver the final diff and ready sentinel per
    <EarlyReviewArm/>, reset `EARLY_REVIEW=none`, and keep
    `${REVIEW_DISPATCH_HANDLE}` as that lens's handle. Otherwise increment
-   `${REVIEW_PASS}`. Pass 1 is the phase's broad review and runs the three
+   `${REVIEW_PASS}`. Pass 1 is the phase's broad review and runs the two
    lenses of <TeamReview/> over <BroadReviewPrompt/>; later passes are one
    reviewer over one repair, per <ClosureReview/>.
 2. Apply <ReviewDiffContract/> and create every prompt the pass needs.
 3. Launch each reviewer under <DispatchContract/>, pass 1's in one message so
-   they run concurrently — the two remaining lenses when the adversary was armed
-   early, all three otherwise:
+   they run concurrently — `contract` alone when the adversary was armed early,
+   both otherwise:
 
    ```sh
    bash ~/.claude/scripts/delegate/review.sh "${SESSION_DIR}" "${WORKING_DIR}" \
@@ -1507,7 +1494,7 @@ of reviewing the partial diff.
    `review_findings_${REVIEW_PASS}_<lens>.txt` — a closure review, its unnumbered
    symlink — into `${AGENT_REVIEW}`. A lens that reports `error` is named in one
    line and the pass continues on the readings that landed, so the synthesis
-   records which lens is missing rather than presenting two as three. Numbered
+   records which lens is missing rather than presenting one as two. Numbered
    artifacts remain available.
 </DualReview>
 
@@ -1518,9 +1505,11 @@ contains only:
 - Each open id, severity, file:line, and title verbatim.
 - Paths named by the fix plus new post-fix paths.
 - Diff limited to those paths, including new files.
-- Two questions: for each id, `FIXED`, `NOT FIXED`, or `UNCLEAR` with file/line
-  evidence; and whether this repair breaks any caller, consumer, transition, or
-  invariant of its changed symbols.
+- Three questions: for each id, `FIXED`, `NOT FIXED`, or `UNCLEAR` with
+  file/line evidence; for each id, the regression test that covers it and
+  whether it would fail without the repair — a testable id with no such test is
+  `NOT FIXED`; and whether this repair breaks any caller, consumer, transition,
+  or invariant of its changed symbols.
 
 Forbid whole-phase, style, polish, and already-reviewed design findings. An
 outside-path problem is valid only when a quoted repair hunk causes it. Omit the
@@ -1530,8 +1519,8 @@ broad questions and Type Design Contract.
 partial repair diff at launch, and the prompt opens with the same
 `## Implementation status` staging block as <BroadReviewPrompt/>'s early form —
 arm on the open ids, their surrounding code, and the partial diff; fire on the
-final path-limited diff when the ready sentinel appears; answer the two
-questions from the final diff only.
+final path-limited diff when the ready sentinel appears; answer the questions
+from the final diff only.
 
 After the main pass agrees, record `accepted` for fixed, `still_open` for not
 fixed/unclear, or `reopened` with the invalidating hunk. Open any new defect
@@ -1579,57 +1568,49 @@ file/line findings and intended behavior. Verification contains only implicated
 `verify.sh` lines—usually check and test, adding lint only for lint-related
 repairs.
 
-A repair runs the same three slots as a phase, per <PhaseTeam/>. The default
-opening is `fix` / `test` / `review`: `impl` makes the repair, `test` writes
-the regression test that would have caught each finding, and `review` reads the
-repair cold against the ids it claims to close — the reading most likely to
-catch a fix that closes a finding by weakening what detects it. Partition the
-findings' files per <TeamFilePartition/> and write one prompt per slot; `test`
-covers the same batch ids from the outside. When the batch's files partition
-into disjoint sets, `review` opens as a second `fix` seat — task and kind both
-`fix` — and the dispatch update says so.
+A repair runs **one seat**: slot `impl`, task and kind `fix`. It makes the
+repair and writes, for each testable finding, the regression test that would
+have caught it — one that fails without the repair — naming each test against
+its id in its summary. <ClosureReview/> is the cold read, so no seat is spent
+on one here. Its file set is the findings' files plus the test targets.
 
-Run `findings.py dispatch --covers <all batch ids>` before launching, then
-launch all three in one message:
+Run `findings.py dispatch --covers <all batch ids>` before launching, then:
 
 ```sh
 PLAN_DELEGATE_RESOLVES_ROUND=1 implement.sh "${SESSION_DIR}" "${WORKING_DIR}" \
   "${SESSION_DIR}/fix_prompt_${FIX_ROUND}.md" fix \
   "<responsibility>" fix "<activity>" "${FIX_ROUND}" impl
-implement.sh "${SESSION_DIR}" "${WORKING_DIR}" \
-  "${SESSION_DIR}/fix_test_prompt_${FIX_ROUND}.md" test \
-  "<responsibility>" test "<activity>" "${FIX_ROUND}" test
-implement.sh "${SESSION_DIR}" "${WORKING_DIR}" \
-  "${SESSION_DIR}/fix_review_prompt_${FIX_ROUND}.md" review \
-  "<responsibility>" review "<activity>" "${FIX_ROUND}" review
 ```
 
-Each seat records the work it was assigned: a repairing seat `fix`, the test
-seat `test`, the review seat `review`.
-
-**`PLAN_DELEGATE_RESOLVES_ROUND=1` goes on exactly one seat**, whichever
-opening is in play. Only the launcher
-watches the worker exit, so only a launcher can say a repair landed; two seats
-carrying the signal would resolve one round twice over. The signal is separate
-from the pass kind so a second repairing seat can record its pass as `fix`
-without also resolving the round.
+**`PLAN_DELEGATE_RESOLVES_ROUND=1` is what lets the launcher resolve the round**:
+only the launcher watches the worker exit, so only it can say a repair landed.
 
 Apply <DispatchContract/>; set `EARLY_REVIEW=none` at dispatch, and close the
 turn with the progress header per <DelegationResultFormat/>. While a fix runs
 that will receive a delegate closure review, <EarlyReviewArm/> may arm that
 reviewer early.
 
-**A contained repair closes without a delegate review.** Apply
-<ReviewDiffContract/> and read the repair diff yourself. When every hunk sits in
-a path the batch's own findings named — or in a new file one of those paths
-creates — record each verdict directly and continue to <Synthesize/>.
+**A repair the main read can close, closes without a delegate review.** Apply
+<ReviewDiffContract/> and read every repair hunk yourself. Close it directly —
+check each testable id has its regression test, record each verdict, and
+continue to <Synthesize/> — when the diff answers every id and each hunk is one
+of:
 
-Dispatch the normal <DualReview/> closure review whenever the repair leaves that
-boundary or the diff cannot answer the question: an edited path no finding
-named, a caller or consumer pulled in, a changed signature, registration, or
-invariant reaching past the batch, an id whose verdict reads unclear, or a new
-defect the repair introduced. Uncertainty routes to the reviewer. Judge the
-paths the diff touched, never how confident the reading felt.
+- a path the batch's own findings named, a new file one of those paths
+  creates, or a test file holding the batch's regression tests;
+- a doc comment, user-facing copy, or comment change in any path, with no
+  code change beside it;
+- a new private or crate-private type, function, or accessor whose every
+  caller is inside the repair diff.
+
+Dispatch the normal <DualReview/> closure review only when the diff cannot
+answer the question: a public API or signature change with a caller outside
+the diff, a registration, transition, or invariant reaching past the batch, an
+id whose verdict reads unclear, a claim the seat says it could not verify and
+the main read cannot verify either, or a new defect the repair introduced.
+Uncertainty routes to the reviewer; a hunk fully read and fully understood
+does not. A closure review costs a stage of the phase, so it is spent on a
+question, never on a path.
 
 On completion, `implemented` continues as above; `error` applies
 <DelegateLaunchFailure/>, and then, if the error survives it,
@@ -1644,10 +1625,10 @@ reporting anything about the round.
 
 <Synthesize>
 1. Merge every lens's findings with the main review's, dedupe real issues, tag
-   the lens or reader that caught each, and discard refuted findings with a
-   concrete explanation. Three lenses landing on one hunk is one finding with
-   three witnesses, not three findings; three lenses disagreeing about that hunk
-   is a reviewer disagreement, which <DelegationResultFormat/> reports rather
+   the lens or reader that caught each — `--lens` on `open` — and discard refuted findings with a
+   concrete explanation. Several readers landing on one hunk is one finding
+   with several witnesses, not several findings; readers disagreeing about that
+   hunk is a reviewer disagreement, which <DelegationResultFormat/> reports rather
    than resolves by majority.
 2. Present <DelegationResultFormat/>. If the user is confused, apply
    <ExplainOnDemand/> before any choice.

@@ -137,6 +137,43 @@ gpt-test=low,medium,high
 opus=low,medium,high,max
 EOF
 
+cat > "$TEST_DIR/model.conf" <<'EOF'
+[assignments]
+one=claude
+one.work=claude
+two=claude    # trailing comment
+friend=caller
+
+[one.codex]
+work=gpt-test:high
+bare=gpt-test
+
+[one.claude]
+work=opus:max
+bare=opus
+
+[two.codex]
+work=gpt-test:medium    # alias: w
+
+[two.claude]
+work=opus:max
+
+[friend.codex]
+work=gpt-test:high
+
+[friend.claude]
+work=opus:max
+
+[codex.agents]
+gpt-test=low,medium,high
+gpt-new=low,medium,high
+gpt-low=low
+
+[claude.agents]
+opus=low,medium,high,max
+sonnet=low,medium,high,max
+EOF
+
 write_fixture "$TEST_DIR/base.conf"
 source "$SCRIPT_DIR/agents_config.sh"
 
@@ -312,6 +349,61 @@ before="$TEST_DIR/switchall-base.conf"
 cp "$AGENTS_CONFIG_FILE" "$before"
 assert_fails "switch-all with a missing set" agents_set_all_assignments claude
 cmp "$before" "$AGENTS_CONFIG_FILE" || fail "rejected switch-all changed the registry"
+
+# A bare agent puts every function on it: fixed assignments switch to the
+# agent's family, every row of that family takes the agent with its effort
+# kept, and a caller function's set for that family moves too.
+write_fixture "$TEST_DIR/model.conf"
+before="$TEST_DIR/model-before.conf"
+expected="$TEST_DIR/model-expected.conf"
+cp "$AGENTS_CONFIG_FILE" "$before"
+sed -e 's/^one=claude$/one=codex/' \
+    -e 's/^one\.work=claude$/one.work=codex/' \
+    -e 's/^two=claude    # trailing comment$/two=codex    # trailing comment/' \
+    -e 's/^work=gpt-test:/work=gpt-new:/' \
+    -e 's/^bare=gpt-test$/bare=gpt-new/' \
+    "$before" > "$expected"
+agents_set_model gpt-new
+cmp "$expected" "$AGENTS_CONFIG_FILE" || fail "agent sweep changed the wrong lines"
+[[ "$AGENT_SWEEP_FAMILY" == "codex" ]] || fail "agent sweep reported the wrong family"
+agents_resolve two.work
+[[ "$AGENT_FAMILY" == "codex" && "$AGENT_MODEL" == "gpt-new" && "$AGENT_EFFORT" == "medium" ]] \
+    || fail "agent sweep did not keep the row's effort"
+
+# The other family's rows follow the same rule.
+agents_set_model sonnet
+agents_resolve one.work
+[[ "$AGENT_FAMILY" == "claude" && "$AGENT_MODEL" == "sonnet" && "$AGENT_EFFORT" == "max" ]] \
+    || fail "claude agent sweep did not switch and keep effort"
+AGENTS_CALLER_FAMILY=codex agents_resolve friend.work
+[[ "$AGENT_MODEL" == "gpt-new" ]] || fail "claude agent sweep touched the caller function's codex set"
+
+# A kept effort the agent's catalog lacks rejects the whole sweep.
+write_fixture "$TEST_DIR/model.conf"
+assert_fails "sweep to an agent missing a kept effort" agents_set_model gpt-low
+cmp "$before" "$AGENTS_CONFIG_FILE" || fail "rejected agent sweep changed the registry"
+assert_fails "sweep with an effort" agents_set_model gpt-new:high
+assert_fails "sweep to an unknown agent" agents_set_model nosuch
+cmp "$before" "$AGENTS_CONFIG_FILE" || fail "rejected agent sweep changed the registry"
+
+# Scoped to one function, only that function and its overrides move.
+sed -e 's/^one=claude$/one=codex/' \
+    -e 's/^one\.work=claude$/one.work=codex/' \
+    "$before" > "$expected"
+awk '/^\[/ { in_sec = ($0 == "[one.codex]") }
+     in_sec { sub(/=gpt-test/, "=gpt-new") }
+     { print }' "$expected" > "$expected.tmp" && mv "$expected.tmp" "$expected"
+agents_set_model gpt-new one
+cmp "$expected" "$AGENTS_CONFIG_FILE" || fail "scoped agent sweep changed lines outside its function"
+assert_fails "scoped sweep of an unknown function" agents_set_model gpt-new absent
+
+# A caller function keeps its assignment; only its set for that family moves.
+write_fixture "$TEST_DIR/model.conf"
+awk '/^\[/ { in_sec = ($0 == "[friend.codex]") }
+     in_sec { sub(/=gpt-test/, "=gpt-new") }
+     { print }' "$before" > "$expected"
+agents_set_model gpt-new friend
+cmp "$expected" "$AGENTS_CONFIG_FILE" || fail "scoped sweep of a caller function changed its assignment"
 
 AGENT_MODEL="gpt-test"
 AGENT_EFFORT="high"

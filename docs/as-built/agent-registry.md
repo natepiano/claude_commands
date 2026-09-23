@@ -73,6 +73,7 @@ Public:
 - `agents_list_function <function>` — prints every row of *both* families for one function as `task=… family=… agent=… effort=… active=yes|no`, then a `# current family: X` line (with `(overrides: …)` when exact-task assignments exist). For a `caller` function `active=yes` marks the detected family's rows and the line reads `# current family: caller — the calling agent's family (X here|none detectable here)`.
 - `agents_set_assignment <function> <family>` — validates that every row of `[<function>.<family>]` resolves, then awk-rewrites the `[assignments]` line. Any invalid row → reject, name the row, file untouched. A `caller` function has no switch — rejected, pointing at row edits — and `caller` is not a switch target.
 - `agents_set_all_assignments <family>` — switches **every** `[assignments]` entry, exact-task overrides included, to one family. Validates the whole target set first — a function with no `[<function>.<family>]` section, an override key with no matching row, or any invalid row rejects the switch with the file untouched — then awk-rewrites every assignment line in one pass, preserving trailing inline comments and spacing byte-exactly. `caller` lines are skipped: neither validated against the target nor rewritten.
+- `agents_set_model <agent> [function]` — puts every function, or one, on one agent, keeping each row's effort. The agent names its family, as in `agents_set_row`. Every fixed assignment in scope, exact-task overrides included, switches to that family, and every row of each `[<function>.<family>]` set takes the agent. A `caller` function keeps its assignment, but its set for that family takes the agent too, since that set is live whenever an agent of that family asks. Validates the whole change first — an unknown or ambiguous agent, an agent given with `:<effort>`, a missing set, an override with no row, or a kept effort the agent's catalog lacks rejects it with the file untouched — then one awk pass rewrites the assignment and row lines, preserving trailing comments and spacing. Sets `AGENT_SWEEP_FAMILY`.
 - `agents_set_row <task> <agent>[:<effort>]` — edits one row. The **agent** names the family (the two catalogs share no names), so the row written is the one the agent could only have meant, live or dormant; an agent listed by both catalogs is refused as ambiguous, and an agent whose family has no `[<function>.<family>]` section names the missing section. Validates the pair, then awk-rewrites the row preserving its trailing inline comment and spacing byte-exactly. Sets `AGENT_ROW_FAMILY`, `AGENT_ROW_ACTIVE_FAMILY`, `AGENT_ROW_ACTIVE`. Editing a row never changes which family is live.
 - `agents_codex_args` — one line: `-m <agent>`, plus `-c model_reasoning_effort="<effort>"` when effort is non-empty.
 - `agents_claude_args` — one line: `--model <agent>`, plus `--effort <effort>` when effort is non-empty.
@@ -131,7 +132,7 @@ codex_mesh.py stop   --session-dir
 (`start_new_session=True`) and records `{port, pid}` in
 `<session_dir>/mesh_server.json`; a later call reuses that server when the pid is
 still alive. Starting one takes an exclusive `flock` on
-`<session_dir>/mesh_server.lock`, because the three seats of a phase reach
+`<session_dir>/mesh_server.lock`, because the seats of a phase reach
 `ensure_server` inside the same second and unlocked each would start a server of
 its own, orphaning two. `ensure_server` returns the port **and whether this call
 is what started it** — the flag the retry below turns on. The transport is
@@ -172,8 +173,8 @@ delegate is not resident. `produced_work` is the interlock — any completed ite
 blocks the retry, because repeating the prompt would repeat edits already
 applied — and it is set conservatively, since a delegate wrongly held back loses
 a round while one wrongly retried loses its work to a second pass. `_retire_server`
-drops the record only when it still names the server that failed, so three seats
-racing the same recovery replace one server between them rather than three.
+drops the record only when it still names the server that failed, so seats
+racing the same recovery replace one server between them rather than one each.
 Same failure on the fresh server means the provider really did refuse, and it is
 reported unchanged.
 
@@ -205,7 +206,7 @@ and pass recording are unchanged — the only thing it adds is the address. Two
 files carry the session's mesh state, both under the delegate session directory:
 `mesh_server.json` (`{port, pid}`) and `mesh_roster.json`
 (`{name: {thread_id, turn_id, status}}`, every read-modify-write under
-`fcntl.LOCK_EX` because three delegates register concurrently).
+`fcntl.LOCK_EX` because the delegates register concurrently).
 
 The protocol has three traps, each of which cost a run to rediscover:
 
@@ -256,7 +257,9 @@ A thin dispatcher over the resolver:
 - `skills` → the unique sorted function names from `[assignments]`;
 - `<function>` → `agents_list_function` + usage with examples tuned to that function's real subtask and current pair;
 - `<family>` alone → `agents_set_all_assignments`, then a `# switched every function to <family>` line and the no-arg listing;
+- `<agent>` alone → `agents_set_model`, then `# switched every function to <agent> (<family>), efforts kept` and the no-arg listing;
 - `<function> <family>` → `agents_set_assignment`;
+- `<function> <agent>` → `agents_set_model <agent> <function>`, then a `# switched …` line (or `# set [<fn>.<family>] …` for a `caller` function) and the function's rows;
 - `<function>.<subtask> <agent>[:<effort>]` → `agents_set_row`, then a `# updated [<function>.<family>] <task> — live|dormant` line (dormant hints the `agent_admin.sh <fn> <family>` that would make it live), then the function's rows;
 - a lone dotted argument or three-plus args → usage on stderr, exit 1.
 
@@ -297,9 +300,9 @@ All four wrappers capture resolver stderr into their log (`agents_resolve "$TASK
 
 - The registry is the only home for family/agent/effort. Consumers resolve through `agents_resolve` or `agent_exec` and never re-derive flag vocabulary — `agents_codex_args` / `agents_claude_args` own it.
 - Every function keeps **both** family sets fully specified, so switching families is a one-row edit; `agents_set_assignment` (and `agents_set_all_assignments`, across every function at once) refuses a switch if any row of the target set fails validation, and leaves the file untouched.
-- Agent names stay disjoint between `[codex.agents]` and `[claude.agents]` — `agents_set_row` infers the family from the agent and refuses a name listed by both rather than guessing.
+- Agent names stay disjoint between `[codex.agents]` and `[claude.agents]` — `agents_set_row` infers the family from the agent and refuses a name listed by both instead of picking a family for it.
 - Task names are exactly two segments. Empty effort means "omit the flag"; `agent:` with nothing after the colon is invalid; a catalog row with an empty effort list is valid and admits only bare pairs.
-- Only `agents_set_assignment` and `agents_set_all_assignments` change which family is live. `agents_set_row` writes a row (live or dormant) and never flips liveness. The one exception is a `caller` function: its live family is whichever agent is asking, it is written by hand in the file, and neither switch touches it.
+- Only `agents_set_assignment`, `agents_set_all_assignments`, and `agents_set_model` change which family is live. `agents_set_row` writes a row (live or dormant) and never flips liveness. The one exception is a `caller` function: its live family is whichever agent is asking, it is written by hand in the file, and neither switch touches it.
 - The sync rewrites only `[codex.agents]` and never touches assignments. `[claude.agents]` stays hand-maintained; alias warnings never auto-add, vanished-agent warnings never auto-repoint.
 - New lookups use `_agents_registry_get` / `_agents_registry_has_key` (literal key comparison). Never match keys with an unescaped `^key=` regex — dotted keys like `delegate.review` mis-match.
 - Any awk that writes a user-supplied value into the conf passes it through `ENVIRON`, not `awk -v`. Row rewrites preserve trailing inline comments and spacing byte-exactly; conf writes go through a tmp file + `mv` (mode preserved), never in place.
@@ -328,12 +331,12 @@ All four wrappers capture resolver stderr into their log (`agents_resolve "$TASK
   line's `reach=` field is what tells a peer which of the two it is addressing.
 - The fix pipeline runs unattended via launchd every 10 minutes (`com.natemccoy.style-fix.plist`, `StartInterval=600`, no idle gate). `agents_config.sh`, `agent_assignments.sh`, the three stage scripts, and `fix_report_parse.py` must never be left broken, and the resolver must keep working under `/bin/bash` (3.2).
 - `/plan:delegate` is itself implemented by `scripts/delegate/*`, so any rename or signature change to those launchers must land together with the `commands/plan/delegate.md` call-site edits in one change.
-- Every `implement.sh` dispatch is a member of a phase team: `team_role` is required, every artifact it writes is suffixed with that role, and every member carries a `pass_kind`, so a team phase records one pass per seat rather than one for the whole phase. The kind names the work the seat was assigned and nothing else: the `test` seat records `test`, the review seat `review`, the repairing seat `impl` or `fix`. An earlier claim here that a `test` kind would rewrite the `implementation` stage across the back corpus was wrong -- adding a kind cannot change stored events, only adding a stage could. A kind never triggers behavior either: round resolution is `PLAN_DELEGATE_RESOLVES_ROUND=1`, set on exactly one seat, so a second seat can record `fix` honestly without resolving the round twice. The board, not the launcher, is what a fourth concurrent member would change.
+- Every `implement.sh` dispatch is a member of a phase team: `team_role` is required, every artifact it writes is suffixed with that role, and every member carries a `pass_kind`, so a team phase records one pass per seat rather than one for the whole phase. The kind names the work the seat was assigned and nothing else: the `test` seat records `test`, a writing seat `impl`, the repairing seat `fix`. An earlier claim here that a `test` kind would rewrite the `implementation` stage across the back corpus was wrong -- adding a kind cannot change stored events, only adding a stage could. A kind never triggers behavior either: round resolution is `PLAN_DELEGATE_RESOLVES_ROUND=1`, set on the one repairing seat, so recording `fix` never resolves a round by itself. The board, not the launcher, is what a third concurrent member would change.
 - No `/plan:delegate` prompt tells an agent to acquire the `cargo` token. `verify.sh` takes it, and a prompt that takes it too deadlocks the agent against its own held token.
 - `cf_load_stage_assignment` keeps its five-argument out-var signature; `fix-usage.sh` and the print helpers call it positionally.
 - The report parser slices launchd runs on exact substrings of the driver's stage-start lines — a reword must keep those leading phrases byte-identical or update the parser in the same change.
 - In the fix pipeline stage scripts, do **not** add family guards around the exec-marker transcript filter or the usage-limit detection: the first handles both families by pattern union, the second's codex-worded grep no-ops on claude logs, and the durable lines print `(${STYLE_AGENT} …)` with the parser accepting any family word.
-- Before committing, inspect `git diff config/agents.conf`: an unsandboxed run that sources the resolver can legitimately rewrite `[codex.agents]`. Fold sync drift in deliberately or exclude it, never let it ride silently. `settings.json`'s app-generated key reorder stays excluded, and `settings.json`'s `model` / `statusLine`, `~/.zshrc`'s interactive `claude` alias, `scripts/claude_to_codex/`, and `~/.codex/config.toml` are out of scope.
+- Before committing, inspect `git diff config/agents.conf`: an unsandboxed run that sources the resolver can legitimately rewrite `[codex.agents]`. Fold sync drift in deliberately or exclude it; never commit it unnoticed. `settings.json`'s app-generated key reorder stays excluded, and `settings.json`'s `model` / `statusLine`, `~/.zshrc`'s interactive `claude` alias, `scripts/claude_to_codex/`, and `~/.codex/config.toml` are out of scope.
 - Never use `AskUserQuestion` in the command docs; the review docs decide via in-session synthesis.
 
 ## Calibration / gotchas
@@ -374,7 +377,7 @@ All four wrappers capture resolver stderr into their log (`agents_resolve "$TASK
 - **`_agents_registry_get` returns 0 on a miss** (prints nothing) so it is safe under `set -e` in command substitution; use `_agents_registry_has_key` when you need presence as a condition.
 - **The `cargo` build token belongs to `verify.sh`, and never to a prompt.** `verify.sh` acquires `board.sh … cargo` itself from `PLAN_DELEGATE_BOARD_DIR` / `PLAN_DELEGATE_TEAM_ROLE` and releases it from one unified EXIT/INT/TERM path, so concurrent team members serialize their builds without being asked to. Putting the acquire in a prompt as well makes that agent wait out the full `--wait` against a token it already holds, and the symptom — a member that just sits there — is indistinguishable from a slow test. With either env var unset the token step is skipped entirely, which is what keeps a standalone `verify.sh` run unchanged.
 - **A green `verify.sh` only means what the tree it ran against means.** With three members editing one worktree, a pass is authoritative for a slot's work only after that slot has posted `done` to the board.
-- **cargo-berth claims are per harness session id, so cross-slot edits are blocked, not merged.** Three delegates are three claim holders: the tester cannot add a `#[cfg(test)]` block to a file `impl` claimed, which is why the contract routes it to an integration test under `tests/`.
+- **cargo-berth claims are per harness session id, so cross-slot edits are blocked, not merged.** Each delegate is its own claim holder: the tester cannot add a `#[cfg(test)]` block to a file `impl` claimed, which is why the contract routes it to an integration test under `tests/`.
 - **Editing a live launcher in place** (a script currently running) produces a spurious `unexpected EOF` exit 2 after the real work completes — bash re-reads the modified file at a stale byte offset. Check the status file and diff before treating it as a failure.
 - Sync `WARNING:` lines land in launchd stderr logs; they are not stage failures, and the usage-limit regexes are written not to match them.
 

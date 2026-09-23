@@ -225,6 +225,7 @@
   "theme": "dark",
   "editorMode": "normal",
   "autoCompactEnabled": true,
+  "switchModelsOnFlag": false,
   "teammateMode": "in-process",
   "crossSessionInbound": "accept",
   "inputNeededNotifEnabled": true,

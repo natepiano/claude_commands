@@ -2,7 +2,7 @@
 # board.sh — Shared coordination board and mutual-exclusion tokens for a
 # multi-agent delegate phase.
 #
-# Why a file and not messages: the three agents of a phase may be codex
+# Why a file and not messages: the agents of a phase may be codex
 # processes, which have no ListAgents/SendMessage tool at all, and the
 # orchestrator is asleep between progress ticks so it cannot relay. A file in
 # the shared session directory is the one channel every family can both write
@@ -270,7 +270,7 @@ cmd_renew() {
 
 # A role is what a slot is doing now, as opposed to the slot itself, which never
 # changes. Recording it through a command rather than free text is what lets the
-# progress table read a role back exactly instead of guessing from a sentence.
+# progress table read a role back exactly instead of inferring it from a sentence.
 cmd_role() {
   local session_dir="${1:?role needs <session_dir>}"
   local slot="${2:?role needs <slot>}"

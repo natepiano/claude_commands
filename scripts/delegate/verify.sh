@@ -5,12 +5,14 @@
 # cargo flags and makes no scope choices. Cargo's default target selection
 # compiles a package's examples even under `-p <pkg>`, so every dev-loop
 # subcommand pins explicit targets (--lib/--bins, derived from cargo metadata).
-# Nothing below `final` compiles examples or uses --all-targets; `final` is the
+# Nothing below `final` compiles examples or uses --all-targets (mend excepted,
+# see `lint`); `final` is the
 # plan-final full gate, run by the orchestrator, never by a phase delegate.
 #
-# The lint halves — clippy and fmt — are gated by config/lint.conf (edit it with
-# /lint_config), so one switch silences a check across /clippy, the fix pipeline, and
-# every delegate phase. A gated-off check prints a SKIPPED line and the command
+# The lint stages — mend, fmt, clippy, doc — are gated by config/lint.conf (edit
+# it with /lint_config), so one switch silences a check across /clippy, the fix
+# pipeline, and every delegate phase. A phase runs all four over its package;
+# only the branch-wide style review is left to the plan-final gate. A gated-off check prints a SKIPPED line and the command
 # still exits 0. Scope is never configurable: the target pinning above is a
 # correctness constraint, not a preference. cargo check and cargo nextest are
 # never gated — a phase that compiles nothing has verified nothing.
@@ -21,8 +23,9 @@
 #                                          (lib + bins + tests)
 #   verify.sh test <package> <int_test>    one named integration test target,
 #                                          for re-running it alone
-#   verify.sh lint <package>               format, then scoped clippy (warnings denied)
-#                                          — both halves gated by config/lint.conf
+#   verify.sh lint <package>               mend --fix, nightly fmt, scoped clippy
+#                                          (warnings denied), then rustdoc — every
+#                                          stage gated by config/lint.conf
 #   … [--features <list>]                  check, test, and lint accept one trailing
 #                                          `--features a,b` when the Work Order names
 #                                          it: code behind a non-default feature has
@@ -155,14 +158,14 @@ shift
 PROGRESS_HISTORY="${HOME}/.claude/scripts/delegate/progress_history.py"
 ACTIVITY_SESSION_DIR="${PLAN_DELEGATE_SESSION_DIR:-}"
 
-# A phase runs three delegates against one target/ directory and one Cargo lock,
+# A phase runs two delegates against one target/ directory and one Cargo lock,
 # so every cargo run below has to be serialized against its peers. Taking the
 # token here rather than asking each delegate's prompt to take it is deliberate:
 # a rule that lives only in a prompt is a rule an agent can drop, and dropping
 # this one blocks the whole team behind a lock nobody announced.
 #
 # PLAN_DELEGATE_BOARD_DIR is deliberately not PLAN_DELEGATE_SESSION_DIR: that
-# variable also opens a progress activity window, and three concurrent windows
+# variable also opens a progress activity window, and concurrent windows
 # would collide in a recorder that keeps one.
 BOARD_HELPER="${HOME}/.claude/scripts/delegate/board.sh"
 BOARD_DIR="${PLAN_DELEGATE_BOARD_DIR:-}"
@@ -266,6 +269,28 @@ case "$CMD" in
         PKG="${1:?verify.sh lint <package>}"
         shift
         take_features "$@"
+        # Order: mend rewrites first, fmt formats what mend wrote, then clippy
+        # and rustdoc read the settled tree. Every stage is gated by lint.conf.
+        # mend is the one stage below `final` that passes --all-targets: it
+        # needs the package's test and example targets to see every import
+        # and visibility site, and it compiles only this package's own targets.
+        if lint_config_enabled mend; then
+            MEND_LOG="$(mktemp)"
+            # pipefail is set, so a failing mend fails the pipeline; the log
+            # only decides which message names the failure.
+            if ! invoke_mend -p "$PKG" --fix "${FEATURE_FLAGS[@]}" 2>&1 | tee "$MEND_LOG"; then
+                if grep -qiE 'rolled back|revert' "$MEND_LOG"; then
+                    echo "verify.sh: cargo mend --fix rolled its rewrites back; the tree reproduces it — run /mend_fix" >&2
+                else
+                    echo "verify.sh: cargo mend --fix failed; see the output above" >&2
+                fi
+                rm -f "$MEND_LOG"
+                exit 1
+            fi
+            rm -f "$MEND_LOG"
+        else
+            lint_config_skip_notice mend "cargo mend --all-targets -p $PKG --fix"
+        fi
         fmt_cargo -p "$PKG"
         # target_flags shells out to cargo metadata, so resolve it only when
         # clippy is actually going to run.
@@ -276,6 +301,7 @@ case "$CMD" in
         else
             lint_config_skip_notice clippy "cargo clippy -p $PKG"
         fi
+        invoke_doc -p "$PKG" "${FEATURE_FLAGS[@]}"
         ;;
     fmt)
         PKG="${1:?verify.sh fmt <package>}"

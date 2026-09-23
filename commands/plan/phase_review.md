@@ -55,7 +55,7 @@ If the conversation does not make the phase obvious, ask the user one clarifying
    **What deviated from the plan:** <bullets — scope changes, approach changes, anything the plan did not predict>
    **Surprises:** <bullets — things learned during implementation that the plan author did not know>
    **Implications for remaining phases:** <bullets — concrete effects on later phases; this is the bridge into Step 4>
-   **Split observed:** <bullets — which files or crates turned out independent; the hub file every writer needed; whether the test lane was real; whether a seat was recruited, and along which split>
+   **Split observed:** <bullets — which files or crates turned out independent; the hub file every writer needed; whether the test lane was real; whether a writer finished early and took a test slice>
    **State and consequence audit:** <one disposition per new or changed state/outcome, or `None`>
    ```
 
@@ -63,7 +63,7 @@ If the conversation does not make the phase obvious, ask the user one clarifying
    remaining-phase review and closeout shrink; it never enters the repository.
    Read **Split observed** from `${SESSION_DIR}/board.log` — the `register`
    and `handoff` posts say which seat held which role, and when — and from the
-   three `impl_summary_<slot>.txt`; never reconstruct it from memory. It is what
+   two `impl_summary_<slot>.txt`; never reconstruct it from memory. It is what
    `<MaintainWorkOrders/>` re-seats the remaining Work Orders from.
 
 <StateAndConsequenceAudit>
@@ -177,7 +177,7 @@ The prompt must include:
 - The absolute `${NEXT_ITEMS_PATH}` and a directive to read it when it exists;
   absence means there are no approved next items to review.
 - The phase that just completed (number and title).
-- A directive to read the implemented code referenced by that phase (so its review is grounded in what actually exists, not what was planned).
+- A directive to read the implemented code referenced by that phase (so its review reads what actually exists, not what was planned).
 - A directive to read
   `${SESSION_DIR}/phase_review_retrospective_<phase>.md` and not search the plan
   for retrospective or review prose.
@@ -208,7 +208,7 @@ The prompt must include:
      still describe a real partition against the code that now exists —
      disjoint owner sets, one owner per hub file, a test lane that exists? Name
      a better opening where one is visible, in the field's own words
-     (`N writers + M testers [+ reserve]`, then one line per slot).
+     (`1 writer + 1 tester` or `2 writers`, then one line per slot).
 - **The narration instruction**, verbatim: *"Narrate as you go: before each new
   activity, output one short present-tense line of plain text naming it. These
   lines stream to a liveness monitor."* This is what makes the dispatch legible
@@ -375,7 +375,8 @@ how they apply here:
    phases yourself, preserve scope, API, invariants, tests, and ownership, update
    the affected Work Orders, and continue. State the change in one line. This is
    `<DecisionRouting/>`'s first rule and it is not discretionary: a phase that grew
-   too large, a seam in the wrong place, or two phases that should be one are
+   too large, a split between phases drawn in the wrong place, or two phases that
+   should be one are
    decisions about how work is packaged, not about what gets built, and they cost
    a one-line revert. Never spend a user turn on one.
 7. Make a recommendation. Do not ask the user to reason from labels.

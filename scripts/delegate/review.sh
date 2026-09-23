@@ -11,13 +11,11 @@
 #   review after it. Artifacts are written per index and never overwritten:
 #   a run that failed to converge can be read back round by round.
 #   lens — which reading this reviewer is doing, when a phase's broad review
-#   runs all three at once: adversary, conformance, or reach. It suffixes every
-#   artifact below, so three concurrent reviewers never overwrite each other,
-#   and it selects the seat the pass records under. The seat assignment is
-#   fixed rather than meaningful — adversary sits in `review` because that is
-#   the column an early launch already claims, and the other two take the seats
-#   left. Empty is the single-reviewer layout: unsuffixed names, no seat, which
-#   is what a closure review and a solo broad review still run.
+#   runs both at once: adversary or contract. It suffixes every artifact below,
+#   so concurrent reviewers never overwrite each other, and it selects the seat
+#   the pass records under. The seat assignment is fixed, not meaningful.
+#   Empty is the single-reviewer layout: unsuffixed names, no seat, which is
+#   what a closure review and a solo broad review still run.
 #   early_ready_file — early-launch mode: the reviewer starts while the
 #   implementer is still running, so its start-pass is deferred until this
 #   sentinel appears (the recorder closes any active pass as interrupted when
@@ -71,20 +69,19 @@ esac
 # nobody reads and record a pass under a seat no column renders, both silently.
 case "${LENS}" in
   '') TEAM_SLOT='' ;;
-  adversary) TEAM_SLOT=review ;;
-  conformance) TEAM_SLOT=impl ;;
-  reach) TEAM_SLOT=test ;;
+  adversary) TEAM_SLOT=test ;;
+  contract) TEAM_SLOT=impl ;;
   *)
-    echo "ERROR: unknown review lens '${LENS}' (adversary, conformance, reach)" >&2
+    echo "ERROR: unknown review lens '${LENS}' (adversary, contract)" >&2
     exit 2
     ;;
 esac
 
 SUFFIX="${LENS:+_${LENS}}"
-# What the shared heartbeat log tags this reviewer's beats with. Three lenses
-# run at once against one log, and `review` on all three lines cannot be read.
+# What the shared heartbeat log tags this reviewer's beats with. Two lenses
+# run at once against one log, and `review` on every line cannot be read.
 BEAT_TAG="${SUBTASK}${LENS:+:${LENS}}"
-# The seat this pass records under, so three concurrent reviewers key three pass
+# The seat this pass records under, so concurrent reviewers key separate pass
 # records instead of each closing the last as interrupted. Exported even when the
 # lens is absent and the seat with it: the lens decides this launcher's seat, and
 # leaving the variable unset instead would let an inherited one decide it, which

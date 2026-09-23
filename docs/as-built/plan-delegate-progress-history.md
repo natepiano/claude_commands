@@ -186,9 +186,9 @@ consecutive rounds with no decrease in the gating-open count;
 `RUNAWAY_ROUNDS` backstop.
 
 Each of these used to stop the phase and hand it to the user. They stopped too
-much: the stall test in particular fires on the honest pattern where every round
-repairs exactly what it was handed and the next gate finds something genuinely
-new, which reads as one open blocker round after round. The count cannot tell
+much: the stall test in particular fires on a converging phase whose every
+round repairs exactly what it was handed and whose next gate finds something
+genuinely new, which reads as one open blocker round after round. The count cannot tell
 that apart from a repair that will not take. So the tests were kept for what they
 are good at — naming the shape of a phase that is not converging — and the
 enforcement was dropped. The orchestrator reports the sentence and dispatches the
@@ -249,14 +249,14 @@ the best and worst arrival the percentage still allows.
 
 The second is the round table, under the phase heading: one row per round,
 oldest first, led by `Stage`, `Start` and `Elapsed`, then a column for each of
-the three slots — `Agent 1`, `Agent 2`, `Agent 3`, the `impl`, `test`, `review`
-slots in that order, numbered so the header carries no role word the cell
+the two slots — `Agent 1` and `Agent 2`, the `impl` and `test` slots in that
+order, numbered so the header carries no role word the cell
 beneath could contradict — and closed by the finding result. The first column is
 `Stage` rather than `Round` because a row is not always a round: a verification,
 a smoke run, or a lone reviewer each own one. A round is nonetheless the unit
 that advances: it is dispatched, it lands, and the ledger stamps its number
 on every finding it produces, so it is the only row key whose start, elapsed and
-result all describe the same thing. The three seats working it read across as
+result all describe the same thing. The seats working it read across as
 columns, each cell naming the role that seat held, how long it held it, and what
 it is doing at the end of the row's stretch — `fix 11m running`,
 `review 13m waiting`. Under the table sits the running round's activity
@@ -271,7 +271,7 @@ with the phase — and an open window is `running` unless the seat's own last
 board line says it is held up, which is `waiting`. Only the board can supply
 that last one: a seat blocked on a peer's edit, on the cargo token, or on a gate
 has a live process and an open window, so the pass record cannot tell it from
-work, and three seats reading `running` while two sit on the third is the
+work, and both seats reading `running` while one sits on the other is the
 picture the word exists to correct.
 
 The table draws the last three stages only. A stage is one labelled unit of the
@@ -288,12 +288,12 @@ above the table, `*Earlier: 21 stages not shown - Impl through Fix 9.*`, so a
 phase eleven hours deep cannot read as one that has barely started; `timeline`
 still renders the full history on demand.
 
-A row per *pass* cannot do this once a phase team exists. The three seats launch
-within the same second, so a per-pass table repeats one Start three times and
+A row per *pass* cannot do this once a phase team exists. The seats launch
+within the same second, so a per-pass table repeats one Start per seat and
 learns nothing from it; worse, attributing findings by the interval from one row
-to the next gives the first two seats a window under a second wide and hands the
-whole phase to whichever registered last. Grouping by round removes the
-guesswork rather than narrowing it: `findings.py` already writes `round` on
+to the next gives the first seat a window under a second wide and hands the
+whole phase to whichever registered last. Grouping by round settles attribution
+rather than narrowing it: `findings.py` already writes `round` on
 every event, so the Result cell is counted, not inferred from timestamps. What a
 round table cannot show — which model ran which seat, and a review overlapping
 the writer as a window of its own — is `timeline`'s question, and `timeline`
@@ -301,9 +301,9 @@ still renders one row per window.
 
 A round is not one shape held to the end, so it is split again at every moment
 its seats changed role: each stretch over which no seat moved is a row. A phase
-opening `impl / test / test`, recruiting the third seat across to
-`impl / impl / test`, and converging on `review / review / review` renders as
-three rows under one round label. The label is printed once and the
+opening `impl / test`, its writer finishing early and taking a slice of the
+tests as `test / test`, and converging on `review / review` renders as three
+rows under one round label. The label is printed once and the
 continuations leave it blank — repeating it would read as three rounds rather
 than one team moving — and the round's result sits on the row that closes it,
 since a round is the granularity the ledger stamps. Each cell carries that
@@ -338,7 +338,7 @@ per phase rather than per row, so a column repeating the same values down every
 row would crowd out the roles for nothing. The words are the seat's own: the
 launcher prefixes its exit posts `launcher:`, and the note keeps the seat's
 latest unprefixed line behind the launcher's kind — `done: hana_catalyst tests
-240 passed` rather than `done: fix finished` three times over. A seat that never
+240 passed` rather than the launcher's `done:` line on every seat. A seat that never
 narrated shows the launcher's words; one that has registered and said nothing
 shows `no board line yet`; a fresh `register` clears the previous occupant's
 words. The main agent is omitted: the reader is the main agent, and `timeline`
@@ -347,11 +347,11 @@ carries both identities per pass for anyone reconstructing a run after the fact.
 Windows that sit in no round keep a row apiece, named as they always were: a
 main-agent activity, which holds no seat, and every pass that records none — a
 solo run's, and the closure reviewer `review.sh` launches between rounds. A
-broad review's three lens reviewers do record seats and join the round they
+broad review's two lens reviewers do record seats and join the round they
 read, one row below the writers. Such a seatless pass is drawn in the seat its
 kind names — `review 9m` under
-Agent 3, `impl 3m` under Agent 1 — so a reader scanning the review seat's
-column for the closure review finds it rather than three dashes; an activity
+Agent 2, `impl 3m` under Agent 1 — so a reader finds the closure review in a
+seat's column rather than a row of dashes; an activity
 names no seat and keeps them. These rows keep the per-window finding attribution — the interval
 running to whatever opened next — which is wrong for concurrent seats and
 exactly right for the sequential windows that still reach it. An early-armed reviewer joins the round it reads when there is

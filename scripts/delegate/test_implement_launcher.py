@@ -217,16 +217,16 @@ class ImplementLauncherSeatTests(unittest.TestCase):
 
     def test_every_seat_records_its_own_pass_and_stamps_its_role(self) -> None:
         session_dir = self.start_phase("team")
-        for kind, slot in (("impl", "impl"), ("test", "test"), ("impl", "review")):
+        for kind, slot in (("impl", "impl"), ("impl", "test")):
             result = self.launch(session_dir, kind, slot)
             self.assertEqual(result.returncode, 0, result.stderr)
 
-        # Three records, keyed by seat rather than by what each is doing: the
-        # `review` seat opened as a second writer and is still slot `review`.
+        # Two records, keyed by seat rather than by what each is doing: the
+        # `test` seat opened as a second writer and is still slot `test`.
         passes = self.open_passes(session_dir)
         self.assertEqual(
             {slot: record["kind"] for slot, record in passes.items()},
-            {"impl": "impl", "test": "test", "review": "impl"},
+            {"impl": "impl", "test": "impl"},
         )
         self.assertEqual(
             {record["status"] for record in passes.values()}, {"completed"}
@@ -240,8 +240,8 @@ class ImplementLauncherSeatTests(unittest.TestCase):
             for line in (session_dir / "board.log").read_text(encoding="utf-8").splitlines()
             if "register:" in line
         ]
-        self.assertEqual(len(register), 3, register)
-        for line, expected in zip(register, ("role=impl", "role=test", "role=impl")):
+        self.assertEqual(len(register), 2, register)
+        for line, expected in zip(register, ("role=impl", "role=impl")):
             self.assertIn(expected, line)
 
 

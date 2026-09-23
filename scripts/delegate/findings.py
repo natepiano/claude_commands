@@ -501,8 +501,8 @@ def _passes_by_slot(passes: list[PhasePass]) -> dict[str, list[PhasePass]]:
 def _consecutive_same_kind(passes: list[PhasePass]) -> tuple[str, int]:
     """The longest run of one kind ending at some seat's most recent pass.
 
-    Counted within a seat, never across seats. A phase team runs three launchers
-    at once, so three impl passes in the event stream are one round with three
+    Counted within a seat, never across seats. A phase team runs its launchers
+    at once, so two impl passes in the event stream are one round with two
     workers; what this limit guards against is one seat being handed the same
     kind of work over and over while the phase fails to advance, and only that
     seat's own sequence shows it.
@@ -527,8 +527,8 @@ def _review_cancellations(passes: list[PhasePass]) -> int:
     """The most times any one seat had a review pass canceled.
 
     Per seat for the same reason the kind run is: the limit asks whether a
-    reviewer is never completing, and one cancellation each across three seats
-    is three reviewers interrupted once, not one that cannot finish.
+    reviewer is never completing, and one cancellation each across two seats
+    is two reviewers interrupted once, not one that cannot finish.
     """
     per_slot: dict[str, int] = {}
     for entry in passes:
@@ -560,6 +560,7 @@ def _summarize(entry: dict[str, object]) -> dict[str, object]:
         "file": _string(entry.get("file")),
         "title": _string(entry.get("title")),
         "caught_by": _string(entry.get("caught_by")),
+        "lens": _string(entry.get("lens")),
         "fix_attempts": _integer(entry.get("fix_attempts")),
         "reopen_count": _integer(entry.get("reopen_count")),
     }
@@ -683,6 +684,7 @@ def _open(args: argparse.Namespace) -> None:
         "title": _arg_string(args, "title"),
         "detail": _arg_string(args, "detail"),
         "caught_by": _arg_string(args, "caught_by"),
+        "lens": _arg_string(args, "lens"),
         "state": STATE_OPEN,
         "opened_at": now,
         "opened_round": len(_rounds(state)),
@@ -705,6 +707,7 @@ def _open(args: argparse.Namespace) -> None:
             "line": _arg_integer(args, "line"),
             "title": _arg_string(args, "title"),
             "caught_by": _arg_string(args, "caught_by"),
+            "lens": _arg_string(args, "lens"),
             "round": len(_rounds(state)),
         },
     )
@@ -948,7 +951,7 @@ def _landed(args: argparse.Namespace) -> None:
 def _abandon(args: argparse.Namespace) -> None:
     """Return an in-flight round's findings to open because its repair died.
 
-    This is the honest reading of a killed, crashed, or errored repair: the
+    This is what a killed, crashed, or errored repair actually leaves: the
     findings are open again, unreviewed, and the reason is appended to the event
     stream. It never edits history, and it never accepts anything.
 
@@ -1036,6 +1039,9 @@ def _build_parser() -> argparse.ArgumentParser:
     _ = opened.add_argument(
         "--caught-by", choices=("delegate", "main", "both"), required=True
     )
+    # Which broad-review lens raised it; empty for a closure review or the main
+    # review alone.
+    _ = opened.add_argument("--lens", choices=("adversary", "contract", "both"), default="")
     opened.set_defaults(handler=_open)
 
     verdict = subparsers.add_parser("verdict", help="record a closure review's outcome")

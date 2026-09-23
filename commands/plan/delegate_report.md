@@ -12,7 +12,7 @@ stop.
 `<ProgressReport/>` — the content of an update. `<ProgressContract/>` in
 `~/.claude/commands/plan/delegate.md` keeps the timing rules that say when one is
 owed. Never compose a report from memory of an earlier read: the byte-for-byte
-copy rule and the plain-English closing sentences are the parts that decay.
+copy rule and the ordinary-English closing sentences are the parts that decay.
 
 Everything below is the contract.
 
@@ -85,17 +85,17 @@ Everything below is the contract.
    at once.
 6. Read the round table as seats. It leads with `Stage`, `Start`, and `Elapsed`
    — `Stage` rather than `Round` because a row is not always a round: a
-   verification, a smoke run, or a lone reviewer each own one. Its three seat
-   columns are `Agent 1`, `Agent 2`, `Agent 3` — the slots `impl`, `test`,
-   `review` in that order, identities that never change, numbered so the header
+   verification, a smoke run, or a lone reviewer each own one. Its two seat
+   columns are `Agent 1` and `Agent 2` — the slots `impl` and `test` in that
+   order, identities that never change, numbered so the header
    carries no role word the cell beneath could contradict. Each cell is the role
    that seat held over the row's stretch, how long it held it, and what the seat
    is doing at the end of it:
 
    - `running` — its window is open and its last board line is work.
    - `waiting` — open, but the seat says it is held up: on a peer's edit, on the
-     cargo token, on a gate. Three seats reading `running` while two sit on the
-     third is what this word exists to correct, and no clock shows it — a
+     cargo token, on a gate. Both seats reading `running` while one sits on the
+     other is what this word exists to correct, and no clock shows it — a
      waiting seat's elapsed grows exactly like a working one's.
    - `idle` — its window has closed while the round has not, so the seat is free
      for more work rather than finished with the phase.
@@ -104,14 +104,14 @@ Everything below is the contract.
    A cell with a role and no time or state is a seat that recorded no pass; the
    board knew its role, the ledger never saw it. A further row opens whenever
    the team actually moves, and its `Result` cell names the movement —
-   `Agent 3 → fix` — so the reader watches `impl / impl / test` become
-   `review / review / review` without diffing cells. The first row of a round
+   `Agent 2 → impl` — so the reader watches `impl / test` become
+   `review / review` without diffing cells. The first row of a round
    is its opening. The lines under the table lead with the same label and the
    slot in parentheses — `- **Agent 2** (test) …` — then the agent sitting in
    that seat and the last thing it said: the seat's own words, never the
-   launcher's. That narration is addressed to the other seats, which is why
+   launcher's. That narration is addressed to the other seat, which is why
    step 7 rewrites it before it reaches the user. A lone reviewer between
-   rounds sits in the `Agent 3` column on a row of its own.
+   rounds sits in the `Agent 2` column on a row of its own.
 
    The table carries the phase's **last three stages**, not all of them. An
    `Earlier:` line above it names what the cap left out, and the phase began
@@ -164,7 +164,7 @@ Everything below is the contract.
    what remains. One topic per sentence, no more than two clauses; when a topic
    holds more than two items, give the count and what they have in common.
    When the opening is not the default, or a seat is doing something other than
-   its name, say so in those words: "the review seat is writing the catalyst
+   its name, say so in those words: "the test seat is writing the catalyst
    side".
 
    Not this:

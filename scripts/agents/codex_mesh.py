@@ -319,7 +319,7 @@ def _require(message: RpcMessage, what: str) -> dict[str, object]:
 
 
 # ---------------------------------------------------------------------------
-# Session state. Three delegates write the roster concurrently, so every
+# Session state. The delegates write the roster concurrently, so every
 # read-modify-write takes an exclusive lock on the file itself.
 # ---------------------------------------------------------------------------
 
@@ -471,9 +471,9 @@ def _finish_summary(
 def _server_lock(session_dir: str) -> Generator[None]:
     """Serialize starting and dropping this session's app-server.
 
-    The three seats of a phase launch in one message and reach `ensure_server`
+    The seats of a phase launch in one message and reach `ensure_server`
     within the same second. Unlocked, each reads no record, each starts a server
-    and each writes the file: two of the three are then orphaned, listening and
+    and each writes the file: all but one are then orphaned, listening and
     unreachable, and a retry that started a fresh server for every failed seat
     would multiply them.
     """

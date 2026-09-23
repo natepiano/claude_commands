@@ -66,10 +66,9 @@ class SeatsFieldTest(unittest.TestCase):
         self._validate(
             textwrap.dedent(
                 """
-                **Seats:** 1 writer + 1 tester + reserve — everything lands in `src/replay.rs`
+                **Seats:** 1 writer + 1 tester — everything lands in `src/replay.rs`
                 - `impl` — `src/replay.rs`
                 - `test` — `tests/replay.rs`, from Spec
-                - `review` — reserve
                 """
             )
         )

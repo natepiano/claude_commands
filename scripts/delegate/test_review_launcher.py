@@ -105,8 +105,13 @@ class ReviewLauncherPassTests(unittest.TestCase):
         """
         delegate = self.root / "scripts" / "delegate"
         agents = self.root / "scripts" / "agents"
+        lib = self.root / "scripts" / "lib"
         delegate.mkdir(parents=True)
         agents.mkdir(parents=True)
+        lib.mkdir(parents=True)
+        # The wrapper reaches python3 through ../lib/py, resolved from its own
+        # directory.
+        _ = shutil.copy2(DELEGATE_DIR.parent / "lib" / "py", lib / "py")
         for name in ("review.sh", "progress_history.py", "board.sh"):
             _ = shutil.copy2(DELEGATE_DIR / name, delegate / name)
         for name in ("agents_config.sh", "heartbeat.sh", "heartbeat_watch.sh"):
@@ -243,17 +248,17 @@ class ReviewLauncherPassTests(unittest.TestCase):
             ],
         )
 
-    def test_three_lenses_run_at_once_without_overwriting_each_other(self) -> None:
-        """The whole reason the lens exists: three reviewers, one session dir.
+    def test_both_lenses_run_at_once_without_overwriting_each_other(self) -> None:
+        """The whole reason the lens exists: two reviewers, one session dir.
 
-        Unsuffixed artifacts and a shared pass slot made the three reviewers of
+        Unsuffixed artifacts and a shared pass slot made the reviewers of
         a broad review destroy each other's work -- the last launched owned
         every file, and each start-pass closed the one before it as interrupted,
         leaving the ledger describing whichever happened to finish last.
         """
         session_dir = self.start_implementation("lenses")
         self.recorder("finish-pass", "--session-dir", str(session_dir), "--status", "completed")
-        lenses = ("adversary", "conformance", "reach")
+        lenses = ("adversary", "contract")
 
         running = [
             subprocess.Popen(
@@ -285,11 +290,11 @@ class ReviewLauncherPassTests(unittest.TestCase):
             sorted(
                 [
                     ("pass_started", "review", slot)
-                    for slot in ("review", "impl", "test")
+                    for slot in ("impl", "test")
                 ]
                 + [
                     ("pass_finished", "review", slot)
-                    for slot in ("review", "impl", "test")
+                    for slot in ("impl", "test")
                 ]
             ),
         )
@@ -299,7 +304,7 @@ class ReviewLauncherPassTests(unittest.TestCase):
         )
 
         board = (session_dir / "board.log").read_text(encoding="utf-8")
-        for slot in ("impl", "test", "review"):
+        for slot in ("impl", "test"):
             self.assertIn(f"[{slot}] register:", board)
 
     def test_the_wrapper_names_a_verdict_it_did_not_record(self) -> None:

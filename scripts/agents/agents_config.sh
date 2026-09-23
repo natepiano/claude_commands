@@ -135,7 +135,7 @@ _agents_function_families_inline() {
 
 # Every family whose catalog lists <agent>, inline for error text. Agent names
 # are disjoint across families, so exactly one match names a row's family and
-# two means the catalogs collided and the caller must refuse to guess.
+# two means the catalogs collided and the caller must refuse rather than pick.
 _agents_agent_families_inline() {
     local agent="$1" family first=1
     for family in codex claude; do
@@ -563,6 +563,118 @@ agents_set_all_assignments() {
         return 1
     fi
     mv "$tmp_file" "$AGENTS_CONFIG_FILE"
+}
+
+# Put every function -- or just <function> -- on one agent, keeping each row's
+# effort. The agent names its own family, as in agents_set_row. Each fixed
+# assignment in scope, exact-task overrides included, switches to that family,
+# and every row of each [<function>.<family>] set takes the agent. A `caller`
+# function keeps its assignment, but its set for that family takes the agent
+# too: that set is live whenever an agent of that family asks. Validated
+# wholesale first -- a missing set, an override with no row, or a kept effort
+# the agent's catalog lacks rejects the change with the file untouched -- then
+# one awk pass writes it. Sets AGENT_SWEEP_FAMILY.
+agents_set_model() {
+    local agent="$1" only="${2:-}" family line key value fn section row pair
+    local sections="" matched=0 tmp_file
+
+    if [[ -z "$agent" || "$agent" == *:* ]]; then
+        echo "ERROR: name the agent alone; each row keeps its own effort. Got '$agent'." >&2
+        return 1
+    fi
+    family="$(_agents_agent_families_inline "$agent")"
+    if [[ -z "$family" ]]; then
+        echo "ERROR: unknown agent '$agent'." >&2
+        echo "       Allowed agents in $AGENTS_CONFIG_FILE [codex.agents]: $(_agents_section_keys_inline codex.agents)" >&2
+        echo "       Allowed agents in $AGENTS_CONFIG_FILE [claude.agents]: $(_agents_section_keys_inline claude.agents)" >&2
+        return 1
+    fi
+    if [[ "$family" == *,* ]]; then
+        echo "ERROR: agent '$agent' is listed by more than one family ($family)." >&2
+        echo "       Remove the duplicate in $AGENTS_CONFIG_FILE so an agent names exactly one family." >&2
+        return 1
+    fi
+
+    while IFS= read -r line; do
+        key="${line%%=*}"
+        value="$(agents_config_trim "${line#*=}")"
+        fn="${key%%.*}"
+        [[ -n "$only" && "$fn" != "$only" ]] && continue
+        matched=1
+        section="$fn.$family"
+        if ! _agents_config_has_section "$section"; then
+            # A caller function with no set for this family has nothing to write.
+            [[ "$value" == "$AGENTS_CALLER_ASSIGNMENT" ]] && continue
+            echo "ERROR: cannot assign '$fn' to '$agent': missing [$section]." >&2
+            echo "       Allowed families with a configured set: $(_agents_function_families_inline "$fn")" >&2
+            return 1
+        fi
+        if [[ "$key" == *.* ]] && ! _agents_registry_has_key "$section" "${key#*.}"; then
+            echo "ERROR: cannot assign '$key' to '$agent': [$section] has no row '${key#*.}'." >&2
+            echo "       Allowed sub-tasks: $(_agents_section_keys_inline "$section")" >&2
+            return 1
+        fi
+        case " $sections " in
+            *" $section "*) continue ;;
+        esac
+        sections="$sections $section"
+        while IFS= read -r row; do
+            pair="$(agents_config_trim "${row#*=}")"
+            if ! _agents_validate_pair "$fn.${row%%=*}" "$family" "$agent${pair#"${pair%%:*}"}"; then
+                echo "ERROR: change rejected because [$section] row '${row%%=*}' keeps an effort '$agent' does not allow." >&2
+                return 1
+            fi
+        done < <(_agents_config_section_values "$section")
+    done < <(_agents_config_section_values assignments)
+    if [[ -n "$only" && "$matched" -eq 0 ]]; then
+        echo "ERROR: no [assignments] entry for '$only'." >&2
+        echo "       Configured assignments in $AGENTS_CONFIG_FILE: $(_agents_section_keys_inline assignments)" >&2
+        return 1
+    fi
+
+    tmp_file="$(mktemp "${AGENTS_CONFIG_FILE}.XXXXXX")"
+    if ! NEW_AGENT="$agent" awk -v fam="$family" -v only="$only" \
+        -v caller="$AGENTS_CALLER_ASSIGNMENT" -v secs="$sections " '
+        /^\[/ {
+            name = substr($0, 2, length($0) - 2)
+            in_assign = ($0 == "[assignments]")
+            in_rows = !in_assign && index(secs, " " name " ") > 0
+            print
+            next
+        }
+        in_assign || in_rows {
+            content = $0
+            hash = index(content, "#")
+            before_comment = hash ? substr(content, 1, hash - 1) : content
+            equals = index(before_comment, "=")
+            if (equals) {
+                value = substr(before_comment, equals + 1)
+                gsub(/^[[:space:]]+|[[:space:]]+$/, "", value)
+                match(before_comment, /[[:space:]]*$/)
+                spacing = substr(before_comment, RSTART)
+                comment = hash ? substr(content, hash) : ""
+                if (in_rows) {
+                    colon = index(value, ":")
+                    print substr(before_comment, 1, equals) ENVIRON["NEW_AGENT"] \
+                        (colon ? substr(value, colon) : "") spacing comment
+                    next
+                }
+                fn = substr(before_comment, 1, equals - 1)
+                sub(/\..*/, "", fn)
+                if ((only == "" || fn == only) && value != caller) {
+                    print substr(before_comment, 1, equals) fam spacing comment
+                    next
+                }
+            }
+        }
+        { print }
+    ' "$AGENTS_CONFIG_FILE" > "$tmp_file"; then
+        rm -f "$tmp_file"
+        echo "ERROR: rewrite failed; $AGENTS_CONFIG_FILE was not changed." >&2
+        return 1
+    fi
+    mv "$tmp_file" "$AGENTS_CONFIG_FILE"
+    AGENT_SWEEP_FAMILY="$family"
 }
 
 # Edit one row. The agent names its own family, so the row written is the one

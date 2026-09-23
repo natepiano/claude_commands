@@ -49,17 +49,22 @@ usage() {
         fi
     fi
     cat <<EOF
-Usage: agent_admin.sh [skills | <function> | <family>] | <function> <codex|claude> | <function>.<subtask> <agent>[:<effort>]
+Usage: agent_admin.sh [skills | <function> | <family> | <agent>] | <function> <codex|claude|agent> | <function>.<subtask> <agent>[:<effort>]
 
   (no args)                print every function, its family, and its resolved rows
   skills                   print the list of configured skills for use with agents
   <function>               print just that function's rows
   <family>                 switch every function to the codex or claude family
+  <agent>                  put every function on one agent, keeping each row's
+                           effort; the agent names its family, so this also
+                           switches every function to that family
   <function> <family>      switch a whole function to the codex or claude family
                            — the only thing that changes which rows are live.
                            A function assigned 'caller' (ask_a_friend) has no
                            switch: it runs on the family of the agent asking,
                            so both of its row sets are live, one per family
+  <function> <agent>       put one function on one agent, keeping each row's
+                           effort and switching it to the agent's family
   <function>.<subtask> <agent>[:<effort>]
                            edit one row; the agent names its own family, so
                            naming a dormant family's agent edits that row and
@@ -69,6 +74,7 @@ Usage: agent_admin.sh [skills | <function> | <family>] | <function> <codex|claud
 Examples:
   agent_admin.sh $ex_fn
   agent_admin.sh $ex_other   # switch every function at once
+  agent_admin.sh ${ex_pair%%:*}   # every function on one agent, efforts kept
   agent_admin.sh $ex_fn $ex_other
   agent_admin.sh $ex_row $ex_pair
   agent_admin.sh $ex_row ${ex_pair%%:*}   # keep the agent CLI default effort
@@ -116,6 +122,15 @@ elif [[ "$#" -eq 1 ]]; then
         usage "" "$1"
         exit 0
     fi
+    # A bare agent name puts every function on it; the agent names its family.
+    if [[ -n "$(_agents_agent_families_inline "$1")" ]]; then
+        agents_set_model "$1"
+        echo "# switched every function to $1 ($AGENT_SWEEP_FAMILY), efforts kept"
+        agents_list_assignments
+        echo ""
+        usage "" "$AGENT_SWEEP_FAMILY"
+        exit 0
+    fi
     agents_list_function "$1"
     echo ""
     usage "$1"
@@ -131,6 +146,15 @@ elif [[ "$#" -eq 2 ]]; then
             echo "# updated [$fn.$AGENT_ROW_FAMILY] $1 — dormant:" \
                 "$1 runs on $AGENT_ROW_ACTIVE_FAMILY. Make it live with:" \
                 "agent_admin.sh $fn $AGENT_ROW_FAMILY"
+        fi
+    elif ! _agents_config_has_section "$2.agents" \
+        && [[ -n "$(_agents_agent_families_inline "$2")" ]]; then
+        agents_set_model "$2" "$1"
+        fn="$1"
+        if [[ "$(_agents_registry_get assignments "$fn")" == "$AGENTS_CALLER_ASSIGNMENT" ]]; then
+            echo "# set [$fn.$AGENT_SWEEP_FAMILY] to $2, efforts kept — live whenever a $AGENT_SWEEP_FAMILY session runs $fn"
+        else
+            echo "# switched $fn to $2 ($AGENT_SWEEP_FAMILY), efforts kept"
         fi
     else
         agents_set_assignment "$1" "$2"

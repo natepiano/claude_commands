@@ -130,20 +130,25 @@ agents_exec_main() {
             if [[ -n "${AGENT_EXEC_EXTRA_ARGS:-}" ]]; then
                 command+=("${extra_args[@]}")
             fi
-            command+=(-- "$prompt")
+            # The prompt goes in on stdin, never as an argument: a broad review
+            # prompt carries the whole phase diff, and Linux caps one argv
+            # string at 128 KiB, so an argument form dies with
+            # "Argument list too long" (exit 126) before claude starts.
 
             if [[ "${AGENT_EXEC_DRY_RUN:-}" == "1" ]]; then
                 printf 'cd '
                 printf '%q' "$working_dir"
                 printf ' && '
                 agents_exec_print_argv "${command[@]}"
+                printf ' < '
+                printf '%q' "$prompt_file"
                 printf ' > '
                 printf '%q' "$log_file"
                 printf ' 2>&1\n'
                 return 0
             fi
             claude_code=0
-            ( cd "$working_dir" && "${command[@]}" > "$log_file" 2>&1 ) || claude_code=$?
+            ( cd "$working_dir" && "${command[@]}" < "$prompt_file" > "$log_file" 2>&1 ) || claude_code=$?
             agents_claude_extract_result "$log_file" "$output_file" || true
             return "$claude_code"
             ;;

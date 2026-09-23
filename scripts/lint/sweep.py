@@ -11,9 +11,10 @@ this removes the least recently used build output until it fits:
     incremental dir   one direct child of a build tree's incremental/
 
 The budget is LINT_SWEEP_BUDGET_GIB (default 96), summed over every file
-under the target and build directories, so output this never removes (doc/,
-test-run folders, binaries cargo copied up out of deps/) still counts.
---dry-run reports what would go and removes nothing.
+under the target and build directories, so output the budget sweep never
+removes (test-run folders, binaries cargo copied up out of deps/) still
+counts. doc/ has its own rule, below. --dry-run reports what would go and
+removes nothing.
 
 Why 96. A budget below the working set evicts output the next lint run needs,
 and because this runs after every lint run, that rebuild repeats on every
@@ -24,6 +25,23 @@ fixture, the app build) came to 56.9 GiB, of which the test build alone was
 but sweeping that target to 48 GiB made the next cycle rebuild nearly every
 workspace unit. 96 covers that working set with room for feature and profile
 variants.
+
+The doc index. rustdoc rewrites doc/search.index, doc/trait.impl and
+doc/type.impl when a crate finishes, and its peak memory tracks what those
+already hold rather than the crate it is documenting. They only grow: twelve
+consecutive `cargo doc --no-deps -p hana_video` runs, each preceded by
+appending a comment line that adds no documented item, grew search.index by
+313 KB per run while its file count held near 1850 (2026-09-22). hana's whole
+24-crate workspace documented into an empty target comes to a 21 MiB index and
+never peaks above 3 GiB, but the 1.18 GiB index that a week of per-save lint
+runs had left in place made that same single-crate build peak at 24.2 GiB —
+near 19 GiB of resident memory per GiB of index. That overflowed an 8 GiB swap
+file and held IO pressure at 90% while the CPU sat idle. So when those three
+directories together pass LINT_SWEEP_DOC_INDEX_MIB (default 250, which keeps
+the peak near 6 GiB), the whole doc tree goes and the next doc run rebuilds it
+in one pass. Removal takes doc/.lock, the only lock a rustdoc writing HTML
+holds: cargo's build locks cover compilation, which a doc build has left
+behind by then.
 
 Why a budget and not an age window. An age window only removes what active
 development has stopped touching, and active development touches almost
@@ -67,9 +85,16 @@ from datetime import datetime
 from typing import Literal, TypedDict, cast
 
 GIB = 1 << 30
+MIB = 1 << 20
 DAY_SECONDS = 86_400
 DEFAULT_BUDGET_GIB = 96.0
 BUDGET_ENV = "LINT_SWEEP_BUDGET_GIB"
+DEFAULT_DOC_INDEX_MIB = 250.0
+DOC_INDEX_ENV = "LINT_SWEEP_DOC_INDEX_MIB"
+DOC_DIR = "doc"
+DOC_LOCK_NAME = ".lock"
+# The cross-crate stores every rustdoc run reads and rewrites at its end.
+MERGE_DIRS = ("search.index", "trait.impl", "type.impl")
 LOCK_NAMES = (".cargo-lock", ".cargo-build-lock", ".cargo-artifact-lock")
 HASHED_DIRS = (".fingerprint", "build", "deps", "examples")
 FINGERPRINT_DIR = ".fingerprint"
@@ -307,8 +332,89 @@ def remove(groups: list[Group]) -> int:
     return failures
 
 
+def directory_blocks(directory: str) -> int:
+    """Disk blocks held under a directory, counting a hard-linked file once."""
+    seen: set[InodeKey] = set()
+    total = 0
+    frontier = [directory]
+    while frontier:
+        try:
+            with os.scandir(frontier.pop()) as entries:
+                listed = list(entries)
+        except OSError:
+            continue
+        for entry in listed:
+            try:
+                stat = entry.stat(follow_symlinks=False)
+            except OSError:
+                continue
+            if entry.is_dir(follow_symlinks=False):
+                frontier.append(entry.path)
+                continue
+            key = (stat.st_dev, stat.st_ino)
+            if key in seen:
+                continue
+            seen.add(key)
+            total += stat.st_blocks * 512
+    return total
+
+
+def lock_doc(doc: str) -> int | None:
+    """Take rustdoc's own lock without waiting; None when a doc run holds it."""
+    path = os.path.join(doc, DOC_LOCK_NAME)
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_CREAT, 0o600)
+    except OSError:
+        return None
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        os.close(fd)
+        return None
+    return fd
+
+
+def prune_doc_index(roots: list[str], budget: int, dry_run: bool) -> int:
+    """Remove a doc tree whose cross-crate index has grown past the budget."""
+    failures = 0
+    for root in roots:
+        doc = os.path.join(root, DOC_DIR)
+        if not os.path.isdir(doc):
+            continue
+        index = sum(directory_blocks(os.path.join(doc, name)) for name in MERGE_DIRS)
+        if index <= budget:
+            if dry_run:
+                print(f"lint sweep: {doc} index is {mib(index)}, within the {mib(budget)} budget")
+            continue
+        held = lock_doc(doc)
+        if held is None:
+            print(f"lint sweep: a rustdoc run holds {doc}/{DOC_LOCK_NAME}; doc kept")
+            continue
+        try:
+            size = directory_blocks(doc)
+            if not dry_run:
+                try:
+                    shutil.rmtree(doc)
+                except OSError as error:
+                    print(f"lint sweep: could not remove {doc}: {error}", file=sys.stderr)
+                    failures += 1
+                    continue
+            verb = "would remove" if dry_run else "removed"
+            print(
+                f"lint sweep: {doc} index is {mib(index)}, over the {mib(budget)} budget;"
+                + f" {verb} {doc} ({mib(size)}), rebuilt by the next doc run"
+            )
+        finally:
+            os.close(held)
+    return 1 if failures else 0
+
+
 def gib(size: int) -> str:
     return f"{size / GIB:.1f} GiB"
+
+
+def mib(size: int) -> str:
+    return f"{size / MIB:.1f} MiB"
 
 
 def when(timestamp: float) -> str:
@@ -339,7 +445,7 @@ def sweep(roots: list[str], trees: list[str], budget: int, dry_run: bool) -> int
     if left > budget:
         print(
             f"lint sweep: {gib(left)} remains over budget in output this sweep never removes"
-            + " (doc/, test-run folders, binaries copied out of deps/)"
+            + " (test-run folders, binaries copied out of deps/, doc/ under its own budget)"
         )
     return 1 if failures else 0
 
@@ -355,6 +461,17 @@ def budget_bytes() -> int | None:
     return int(value * GIB) if value >= 0 else None
 
 
+def doc_index_bytes() -> int | None:
+    raw = os.environ.get(DOC_INDEX_ENV, "")
+    if not raw:
+        return int(DEFAULT_DOC_INDEX_MIB * MIB)
+    try:
+        value = float(raw)
+    except ValueError:
+        return None
+    return int(value * MIB) if value >= 0 else None
+
+
 def main(argv: list[str]) -> int:
     dry_run = False
     for arg in argv:
@@ -367,6 +484,10 @@ def main(argv: list[str]) -> int:
     if budget is None:
         print(f"lint sweep: {BUDGET_ENV} must be a non-negative number of GiB", file=sys.stderr)
         return 2
+    doc_budget = doc_index_bytes()
+    if doc_budget is None:
+        print(f"lint sweep: {DOC_INDEX_ENV} must be a non-negative number of MiB", file=sys.stderr)
+        return 2
     roots = cargo_roots()
     if not roots:
         print("lint sweep: no target directory to sweep")
@@ -377,7 +498,8 @@ def main(argv: list[str]) -> int:
         print(f"lint sweep: a cargo build holds {blocked}; skipped")
         return 0
     try:
-        return sweep(roots, trees, budget, dry_run)
+        doc_status = prune_doc_index(roots, doc_budget, dry_run)
+        return sweep(roots, trees, budget, dry_run) or doc_status
     finally:
         release(held)
 

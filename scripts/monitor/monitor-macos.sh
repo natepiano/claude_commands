@@ -4,12 +4,13 @@
 #
 # Usage: monitor-macos.sh status
 #        monitor-macos.sh switch <mac|linux>
+#        monitor-macos.sh power <on|off>   -- refused; see below
 #
-# Needs m1ddc (`brew install m1ddc`). Apple Silicon only, which is what this
-# Mac is; m1ddc does not support Intel Macs.
+# Needs m1ddc, which nix-darwin installs. Apple Silicon only, which is what
+# this Mac is; m1ddc does not support Intel Macs.
 set -uo pipefail
 
-M1DDC=${M1DDC:-/opt/homebrew/bin/m1ddc}
+M1DDC=${M1DDC:-$(command -v m1ddc)}
 
 # Addressed by EDID rather than by the index m1ddc prints in `display list`,
 # because that index shifts as displays come and go and there are three here.
@@ -22,8 +23,8 @@ DELL_EDID=10AC91D1-0000-0000-0D24-0104B5502178
 INPUT_LINUX=17 # HDMI 1, from natedev
 INPUT_MAC=27   # USB-C, from this Mac
 
-if [[ ! -x "$M1DDC" ]]; then
-    echo "monitor: m1ddc not found at $M1DDC -- brew install m1ddc" >&2
+if [[ -z "$M1DDC" || ! -x "$M1DDC" ]]; then
+    echo "monitor: m1ddc not found on PATH -- it comes from nix-darwin" >&2
     exit 1
 fi
 
@@ -155,6 +156,14 @@ case "${1:-status}" in
             echo "This Mac can still reach the Dell -- 'monitor.sh dell mac' brings"
             echo "it back from here."
         fi
+        ;;
+
+    power)
+        # m1ddc exposes named features only, and power mode (d6) is not one of
+        # them, so there is no way to send it from here.
+        echo "monitor: the Mac cannot turn the Dell ${2:-on or off} -- m1ddc has no power command" >&2
+        echo "run 'monitor.sh dell ${2:-off}' on natedev" >&2
+        exit 1
         ;;
 
     *)

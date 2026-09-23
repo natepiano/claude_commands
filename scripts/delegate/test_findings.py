@@ -167,6 +167,18 @@ class FindingsLedgerTests(unittest.TestCase):
         self.close_round(["F001", "F002"])
         self.assertEqual(self.open_finding("blocker", "third"), "F003")
 
+    def test_a_finding_records_the_lens_that_caught_it(self) -> None:
+        self.write_progress_state("instance-a")
+        _ = self.run_command(
+            "open", "--severity", "minor", "--title", "stale caller",
+            "--caught-by", "delegate", "--lens", "contract",
+        )
+        _ = self.open_finding("minor", "main review only")
+        findings = cast(list[dict[str, object]], self.status()["findings"])
+        self.assertEqual([entry["lens"] for entry in findings], ["contract", ""])
+        opened = [event for event in self.events() if event["event_type"] == "finding_opened"]
+        self.assertEqual([event["lens"] for event in opened], ["contract", ""])
+
     def test_first_round_gates_blocker_and_minor_but_never_nits(self) -> None:
         _ = self.open_finding("blocker", "null deref")
         _ = self.open_finding("minor", "unused import")
@@ -341,7 +353,7 @@ class FindingsLedgerTests(unittest.TestCase):
     def test_a_gating_count_that_stops_decreasing_is_advised_not_blocked(self) -> None:
         """Each round closes its finding and the closure review opens a fresh one.
 
-        Which is also what an honest phase looks like when every round repairs
+        Which is also what a converging phase looks like when every round repairs
         what it was given and the next gate finds something new, so this is
         exactly the pattern a watcher must be told about rather than stopped by.
         """
@@ -501,14 +513,13 @@ class FindingsLedgerTests(unittest.TestCase):
         )
 
     def test_one_canceled_review_per_seat_is_not_a_review_that_cannot_finish(self) -> None:
-        """Three reviewers interrupted once each is not one that never completes."""
+        """Two reviewers interrupted once each is not one that never completes."""
         self.write_progress_state("phase-instance")
         self.write_pass_events(
             "phase-instance",
             [
                 ("review", "impl", "canceled"),
                 ("review", "test", "canceled"),
-                ("review", "review", "canceled"),
             ],
         )
         _ = self.open_finding("blocker", "null deref")

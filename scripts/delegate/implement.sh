@@ -17,7 +17,7 @@
 #   run at once against one session directory, so every artifact below is
 #   written per role, and every member records its own progress pass: the
 #   recorder keys passes by seat and closes only that seat's stale pass, so
-#   three concurrent passes describe three seats rather than whichever
+#   concurrent passes describe their own seats rather than whichever
 #   happened to finish last.
 #
 # Produces:
@@ -84,7 +84,7 @@ esac
 
 # Resolving a repair round is an explicit assignment, never a property of the
 # pass kind. Keying it off `fix` is what forced seats to misreport their work:
-# every repairing seat wants to record `fix` honestly, but a second one doing so
+# every repairing seat should record `fix`, but a second one doing so
 # would mark one round landed several times over and hand the next review defects
 # pre-labelled as repaired. So the orchestrator names exactly one resolver, and
 # the kind goes back to being only a name for the work.

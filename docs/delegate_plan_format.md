@@ -90,16 +90,14 @@ This is the meat — do not paraphrase a resolved design down to a summary.>
 - `<path>` — <what changes here>
 - ...
 
-**Seats:** <opening line: `N writers + M testers [+ reserve]` — then the split
+**Seats:** <opening line: `1 writer + 1 tester` or `2 writers` — then the split
 (by crate, module, or file group) or why nothing splits>
 - `impl` — <files it owns>; hub: `<path>` (<why every writer needs it>)
 - `test` — <what it writes from the Spec alone, and where under `tests/`>
-- `review` — reserve
 <!-- A slot is an identity; the role it opens in is what its line says. A line
-     without `opens as` opens in its own name. `review` is the flex seat and
-     takes whatever third role the opening needs: `opens as impl`, `opens as
-     test`, or `reserve`. A `test` seat with no test lane reads `opens as impl`.
-     Writers hold disjoint files; every hub file has exactly one owner. Rule 7. -->
+     without `opens as` opens in its own name. A `test` seat with no test lane
+     reads `opens as impl`. Writers hold disjoint files; every hub file has
+     exactly one owner. Rule 7. -->
 
 **Constraints from prior phases:** <concrete facts a delegate would otherwise
 re-derive — what earlier phases built, decisions that bind this phase. Empty for
@@ -208,7 +206,7 @@ Rules:
    Orders are byte-stable during shrink.
 5. **No design narrative in the plan.** Justification essays, alternatives
    considered, and resolved-decision debates do not belong in a delegate-ready
-   plan. `/plan:to_phased_plan` strips them; anything load-bearing becomes a Work Order
+   plan. `/plan:to_phased_plan` strips them; anything a phase depends on becomes a Work Order
    **Spec** line or a Delegation Context **Invariant**. The full rationale lives
    in the eventual as-built doc, not the implementation plan.
 6. **Every constraint names its source.** A boundary in **Layout**, **Files**,
@@ -221,19 +219,18 @@ Rules:
    how a workaround gets built on purpose. See `~/.claude/docs/decision_criteria.md`
    → "Where a fix goes".
 7. **Seats decides the opening.** Every `todo` Work Order carries **Seats**;
-   `/plan:delegate` opens its three seats from it and partitions files by it
-   instead of deciding at launch. `impl` always opens as `impl` (`fix` in a
-   repair). `test` opens as `test` wherever the phase has a **test lane** — a
-   `tests/` directory in a touched crate (Delegation Context → **Test lanes**)
-   and a Spec concrete enough to test before the implementation exists; with
-   none, `test` opens as a writer and its line says `opens as impl`. `review`
-   is the flex seat: a second writer, a second tester, or the cold read
-   (`reserve`). Writers hold disjoint file sets. Each hub file — `lib.rs` /
-   `mod.rs` re-exports, `Cargo.toml`, plugin registration, a shared types
-   file — sits on exactly one writer's line as `hub:`; peers message that
-   owner for the line they need. A tester's line names what the Spec alone
-   lets it write; a Spec too thin for that is a reason to open the seat as a
-   writer. When nothing splits, the opening line says so and `impl` takes
-   every file. Three writers is a legal opening and changes the review split
-   (`/plan:delegate` → `<TeamReview/>`).
+   `/plan:delegate` opens its two seats from it and partitions files by it
+   instead of deciding at launch. `impl` always opens as `impl`. `test` opens
+   as `test` wherever the phase has a **test lane** — a `tests/` directory in a
+   touched crate (Delegation Context → **Test lanes**) and a Spec concrete
+   enough to test before the implementation exists; with none, `test` opens as
+   a writer, its line says `opens as impl`, and the opening is `2 writers`.
+   Writers hold disjoint file sets. Each hub file — `lib.rs` / `mod.rs`
+   re-exports, `Cargo.toml`, plugin registration, a shared types file — sits
+   on exactly one writer's line as `hub:`; the other writer messages that owner
+   for the line it needs. A tester's line names what the Spec alone lets it
+   write; a Spec too thin for that is a reason to open the seat as a writer.
+   When nothing splits, the opening line says so and `impl` takes every file.
+   A repair runs one seat whatever Seats says. An older three-seat field maps
+   down per `/plan:delegate` → `<PhaseTeam/>`.
 

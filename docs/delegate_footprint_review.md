@@ -21,8 +21,8 @@ contradicts itself, found because five readers read it closely at once.
 
 | # | Where | Defect | Status |
 | --- | --- | --- | --- |
-| C1 | `<PhaseTeam/>` | "**Only `impl` is given a `${PASS_KIND}`**" contradicted `<LaunchImplementation/>` step 5 ("**All three seats carry a pass kind**") and the recorder, which keys open passes by slot and closes only the calling slot's stale pass (`progress_history.py:1188-1213`, `_pass_slots` / `_close_slot_pass`). The stale rule made the orchestrator launch `test` and `review` with an empty pass kind, which is why those seats showed a role and no duration in the round table. | **fixed** |
-| C2 | `<ProgressContract/>` | Describes "Two stage rows" and a reviewer row reading `running (early)`. The recorder emits a round table with seat columns; an armed reviewer occupies the Review seat, not a second stage row. | **fixed** |
+| C1 | `<PhaseTeam/>` | "**Only `impl` is given a `${PASS_KIND}`**" contradicted `<LaunchImplementation/>` step 5 ("**Both seats carry a pass kind**") and the recorder, which keys open passes by slot and closes only the calling slot's stale pass (`progress_history.py:1188-1213`, `_pass_slots` / `_close_slot_pass`). The stale rule made the orchestrator launch `test` and `review` with an empty pass kind, which is why those seats showed a role and no duration in the round table. | **fixed** |
+| C2 | `<ProgressContract/>` | Describes "Two stage rows" and a reviewer row reading `running (early)`. The recorder emits a round table with seat columns; an armed reviewer occupies the `test` seat's column, not a second stage row. | **fixed** |
 | C3 | `<DelegationResultFormat/>` 1638 | "all three tables" — the recorder emits two (`progress_history.py:3298,3310`). The phrase wraps across a line break, so a single-line grep misses it; an earlier pass wrongly cleared this finding on that evidence. | **fixed** |
 | C4 | `<BackgroundVerificationContract/>` 134-144 | Says Codex waits with progress disabled, then unconditionally says to arm a timer; `<ProgressContract/>` says Codex never launches that timer. | **fixed** |
 | C5 | `<RunSummary/>` 2377 | Lists `convergence reason` as a stop reason. `findings.py` emits only `converged` and `dispatch`; the run cannot stop for it. | **fixed** |
@@ -97,7 +97,7 @@ memory of an earlier read. `<TagReferenceContract/>` now carries the index table
 **`<ProgressContract/>` was split, not moved.** Timing stays resident because it
 fires every tick — the interval, the one-shot timer, both timer absolutes, the
 pass/activity distinction, the re-arm. Report *content* moved to
-`<ProgressReport/>`. That seam is better than either half of the original plan:
+`<ProgressReport/>`. That split is better than either half of the original plan:
 the resident part is small and unmissable, and the moved part is exactly what a
 user would want to invoke by hand.
 
@@ -153,7 +153,7 @@ a reachable failure.
 
 **D1 — read-on-demand split. RESOLVED 2026-08-31: approved and applied; see the section above.** The cut plan lands ~23%, not the 40-60% target,
 and it is close to the ceiling for prose editing: the reviewers were right to
-guard ~8KB of literals, and what remains is mostly load-bearing. Reaching the
+guard ~8KB of literals, and what remains is mostly text a run cannot do without. Reaching the
 target needs a structural change — moving sections the orchestrator needs only at
 one moment (the reservation contract, checkpoint recovery, the type-table cells)
 out to files it Reads at the point of use, the way `<UserFacingText/>` already

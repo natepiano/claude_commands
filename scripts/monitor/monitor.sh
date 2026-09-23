@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
-# Switch which computer a monitor is displaying, over DDC/CI.
+# Switch which computer a monitor is displaying, or turn it off and on, over
+# DDC/CI.
 #
 # Usage: monitor.sh [dell|samsung] [mac|linux]
+#        monitor.sh [dell|samsung] [on|off]
 #        monitor.sh                 -- report which input each monitor is on
 #
 # Words may come in either order, so "dell mac" and "mac dell" both work.
@@ -23,12 +25,15 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 usage() {
     cat <<'EOF'
 Usage: monitor.sh [dell|samsung] [mac|linux]
+       monitor.sh [dell|samsung] [on|off]
        monitor.sh                          report the current input of each monitor
 
   monitor.sh mac              point every switchable monitor at the Mac
   monitor.sh linux            point every switchable monitor at the Linux box
   monitor.sh dell mac         point the Dell at the Mac
   monitor.sh dell linux       point the Dell at the Linux box
+  monitor.sh dell off         turn the Dell off (Linux only)
+  monitor.sh dell on          turn the Dell back on (Linux only)
 
 The Samsung C34J79x cannot be switched by software; run `monitor.sh samsung`
 for the reason.
@@ -60,6 +65,7 @@ EOF
 
 TARGET=all
 DEST=""
+POWER=""
 
 # Both setters refuse to be told two different things rather than letting the
 # last word win. "monitor.sh dell mac linux" is not a request, it is a typo or
@@ -81,11 +87,20 @@ set_dest() {
     DEST="$1"
 }
 
+set_power() {
+    if [[ -n "$POWER" && "$POWER" != "$1" ]]; then
+        echo "monitor: '$1' contradicts '$POWER' -- say on or off, not both" >&2
+        exit 2
+    fi
+    POWER="$1"
+}
+
 for word in "$@"; do
     case "$word" in
         dell | samsung | all) set_target "$word" ;;
         mac | macos | darwin) set_dest mac ;;
         linux | natedev) set_dest linux ;;
+        on | off) set_power "$word" ;;
         -h | --help | help)
             usage
             exit 0
@@ -100,10 +115,17 @@ for word in "$@"; do
     esac
 done
 
+# A switch and a power change together are ambiguous -- "dell off mac" could
+# mean either order -- so the command is refused.
+if [[ -n "$DEST" && -n "$POWER" ]]; then
+    echo "monitor: '$POWER' and '$DEST' in one command -- run them separately" >&2
+    exit 2
+fi
+
 if [[ "$TARGET" == samsung ]]; then
     samsung_note
     # Asking about it is answerable; asking to switch it is not.
-    [[ -n "$DEST" ]] && exit 1
+    [[ -n "$DEST$POWER" ]] && exit 1
     exit 0
 fi
 
@@ -119,6 +141,10 @@ esac
 if [[ ! -x "$BACKEND" ]]; then
     echo "monitor: $BACKEND is missing or not executable" >&2
     exit 1
+fi
+
+if [[ -n "$POWER" ]]; then
+    exec "$BACKEND" power "$POWER"
 fi
 
 # No destination means the user asked what the state is, not to change it.

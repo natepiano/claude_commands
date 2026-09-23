@@ -4,6 +4,7 @@
 #
 # Usage: monitor-linux.sh status
 #        monitor-linux.sh switch <mac|linux>
+#        monitor-linux.sh power <on|off>
 #
 # Requires ddcutil and /dev/i2c-*, both of which come from
 # /etc/nixos/modules/monitor.nix. That module is where the findings behind the
@@ -21,6 +22,13 @@ DELL_MODEL='DELL S3425DW'
 # for it -- that is the name table coming up empty, not a rejection.
 DELL_INPUT_LINUX=0x11 # HDMI 1, from this machine
 DELL_INPUT_MAC=0x1b   # USB-C, from the Mac
+
+# Feature d6, power mode. The capability string offers 01, 04 and 05. 04 is
+# used for off because it reads back, so ddcutil's write verification holds;
+# 05 is write-only. Tested 2026-09-23: the panel still answers DDC while off,
+# so `on` wakes it from here without the power button.
+DELL_POWER_ON=0x01
+DELL_POWER_OFF=0x04
 
 # The same two inputs as m1ddc wants them: decimal, and named by EDID because a
 # display index shifts as displays come and go and the Mac has three.
@@ -131,6 +139,36 @@ case "${1:-status}" in
             echo "'monitor.sh dell linux' brings it back from here -- this machine can"
             echo "still drive the Dell while the Dell is showing the Mac. Keyboard and"
             echo "mouse never left, over deskflow."
+        fi
+        ;;
+
+    power)
+        state="${2:?monitor-linux.sh power needs on or off}"
+        case "$state" in
+            on) code=$DELL_POWER_ON ;;
+            off) code=$DELL_POWER_OFF ;;
+            *)
+                echo "monitor: '$state' is not on or off" >&2
+                exit 2
+                ;;
+        esac
+
+        if [[ "$(dell getvcp d6)" == *"sl=$code"* ]]; then
+            echo "dell is already $state"
+            exit 0
+        fi
+
+        # No Mac fallback: m1ddc has no command for feature d6.
+        if ! dell setvcp d6 "$code" >/dev/null; then
+            echo "monitor: could not turn the Dell $state" >&2
+            exit 1
+        fi
+        echo "dell -> $state"
+
+        if [[ "$state" == off ]]; then
+            echo
+            echo "'monitor.sh dell on' brings it back from here -- the Dell still"
+            echo "answers DDC while it is off."
         fi
         ;;
 

@@ -1,8 +1,8 @@
 ---
-description: Switch which computer a monitor displays, over DDC/CI.
+description: Switch which computer a monitor displays, or turn it off and on, over DDC/CI.
 ---
 
-**Arguments**: $ARGUMENTS — an optional monitor (`dell`, `samsung`) and an optional destination (`mac`, `linux`), in either order. No destination means report the current state.
+**Arguments**: $ARGUMENTS — an optional monitor (`dell`, `samsung`) and an optional destination (`mac`, `linux`) or power state (`on`, `off`), in either order. Naming neither means report the current state.
 
 <ExecutionSteps>
     **EXECUTE THESE STEPS IN ORDER:**
@@ -13,7 +13,7 @@ description: Switch which computer a monitor displays, over DDC/CI.
 
 ## Scope
 
-`/monitor mac`, `/monitor linux`, `/monitor dell mac`, `/monitor dell linux` all switch the Dell S3425DW. Naming no monitor means every switchable one, today the Dell alone.
+`/monitor mac`, `/monitor linux`, `/monitor dell mac`, `/monitor dell linux` all switch the Dell S3425DW. `/monitor dell off` and `/monitor dell on` power it down and up. Naming no monitor means every switchable one, today the Dell alone.
 
 `/monitor samsung <anything>` exits non-zero with the reason. The Samsung C34J79x implements no DDC/CI: its EDID reads from both machines but i2c 0x37 never answers — over DisplayPort from Linux and Thunderbolt from the Mac, unrelated stacks, while it was displaying the Mac — and its OSD has no DDC/CI toggle. Use its buttons or its input auto-detection.
 
@@ -23,3 +23,4 @@ description: Switch which computer a monitor displays, over DDC/CI.
 - Either machine drives the Dell whichever one it is displaying. Both directions are tested, so a switch is never one-way.
 - The Mac writing its own input code (`set input 27`) has only ever run through a stub. Reading from the Mac is proven and so is the `0x1b` value from the Linux side, so it is expected to work; the first real `/monitor dell mac` issued on the Mac settles it.
 - The Linux script's ssh-to-the-Mac fallback should never fire. If it does it announces itself, and it needs the 1Password agent to approve the key, so it can sit waiting on a tap.
+- `on` and `off` work from Linux only. m1ddc has no power command, so the Mac refuses them and says to run them on natedev. They have no ssh fallback either.

@@ -12,7 +12,7 @@ expensive codebase research is paid **once**, here, and baked into the doc.
 **Usage:** `/plan:to_phased_plan [plan-doc-path] [--out <path>]`
 
 **Argument:** the plan doc path. If omitted, infer the single plan doc in
-conversation; if none, ask for the path. Do not guess.
+conversation; if none, ask for the path rather than picking one.
 
 **`--out <path>`** (optional) writes the compiled plan to `<path>` and leaves the
 source doc untouched. Use it when the plan should live with the code it describes
@@ -220,9 +220,9 @@ not codebase searching.
    chunk of work; do not over-split.
 
    **Right-size each phase — split signals.** A phase must be **delegate-sized**:
-   three concurrent seats on disjoint file sets, with no prior context, get the
-   tree green in a single pass — one writer where the files cannot split, up to
-   three where they can. Whether the spine is inherited or freshly decomposed,
+   two concurrent seats on disjoint file sets, with no prior context, get the
+   tree green in a single pass — one writer where the files cannot split, two
+   where they can. Whether the spine is inherited or freshly decomposed,
    test every phase against these signals **before** drafting its Work Order.
    If any fires, split the phase into delegate-sized units — the usual split is
    **types → systems/wiring**, or one subsystem per file group. Tests are never
@@ -256,7 +256,7 @@ not codebase searching.
 
    **Divisibility check.** A phase whose Files cannot partition into two or more
    owner sets **and** that has no test lane (Delegation Context → **Test lanes**)
-   idles two of three seats. Merge an independent-by-file sibling phase into it,
+   idles one of two seats. Merge an independent-by-file sibling phase into it,
    or let its **Seats** opening line say a single writer holds it and why.
 
 2. **For each phase, draft a Work Order** per the format doc:
@@ -266,13 +266,12 @@ not codebase searching.
      the Spec. Do NOT compress a settled decision to a summary — the delegate
      needs the detail to implement without searching.
    - **Files** — the files to create/modify, with line refs the doc already cites.
-   - **Seats** — the opening. One line `N writers + M testers [+ reserve]` and
+   - **Seats** — the opening. One line `1 writer + 1 tester` or `2 writers` and
      where the work splits (by crate, module, or file group — or why it does
      not), then one line per slot. `impl` always opens as `impl`. `test` opens
      as `test` when the phase has a test lane — a `tests/` directory in a
      touched crate (**Test lanes**) and a Spec concrete enough to test before
-     the code exists — and otherwise reads `opens as impl`. `review` is the
-     flex seat: `opens as impl`, `opens as test`, or `reserve`. Writers hold
+     the code exists — and otherwise reads `opens as impl`. Writers hold
      disjoint files; every hub file (`lib.rs`/`mod.rs` re-exports,
      `Cargo.toml`, plugin registration, a shared types file) sits on exactly
      one writer's line as `hub:`; a tester's line names what the Spec alone
@@ -289,8 +288,8 @@ not codebase searching.
 3. **Fold design history into the phases, then drop the narrative.** Justification
    essays ("why this exists", "what's wrong with the old model"), alternatives,
    and resolved-decision debates (e.g. `D1–D6`) do NOT survive as prose. Each
-   load-bearing fact becomes either a Work Order **Spec** line in the phase it
-   constrains or a Delegation Context **Invariant**. Nothing useful is lost; the
+   fact a later phase depends on becomes either a Work Order **Spec** line in
+   the phase it constrains or a Delegation Context **Invariant**. Nothing useful is lost; the
    debate format is.
 
 4. **Preserve completed phases.** If a phase is already `done`, keep its status,
@@ -421,7 +420,7 @@ Then stop. Do not start implementing a phase.
   It also carries **Seats** (format doc rule 7), so the opening is decided here
   and never at launch.
 - Never delete completed-phase history. Strip design *narrative*, not shipped facts.
-- Every phase must be **delegate-sized** (Restructure step 1): three seats on
+- Every phase must be **delegate-sized** (Restructure step 1): two seats on
   disjoint files build it green in one pass, one writer where nothing splits.
   Apply the split signals at compile time — an over-size phase is a
   decomposition miss, not the delegate's problem to absorb.

@@ -209,7 +209,7 @@ class ServerRecordTests(unittest.TestCase):
         self.assertEqual(self.retired_ports(), [4321])
 
     def test_a_peer_that_already_replaced_the_server_is_left_alone(self) -> None:
-        # Three seats fail together and all three try this recovery. Only the
+        # The seats fail together and each tries this recovery. Only the
         # first drops a server; the others would otherwise drop the replacement
         # and restart the cycle they just ended.
         self.write_server(4321, self.sleeper())

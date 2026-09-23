@@ -4,7 +4,7 @@ description: Show or edit agent family, agent, and effort assignments in the sha
 
 # agent
 
-`$ARGUMENTS` — optional: `skills`, `<function>`, `<family>`, `<function> <family>`, or `<function>.<subtask> <agent>[:<effort>]`.
+`$ARGUMENTS` — optional: `skills`, `<function>`, `<family>`, `<agent>`, `<function> <family>`, `<function> <agent>`, or `<function>.<subtask> <agent>[:<effort>]`.
 
 Run:
 
@@ -44,6 +44,17 @@ A bare family name — no function — moves every `[assignments]` entry to that
 
 On success it prints `# switched every function to <family>` followed by the no-argument status output (rows in `task | family | agent | effort` form) and the usage block. Render the `# switched …` line as plain text first, then the rows per the Status rules above.
 
+## Put functions on one agent
+
+```text
+/agent <agent>
+/agent <function> <agent>
+```
+
+An agent name in place of a family puts every function (or just `<function>`) on that agent. Each row keeps its effort. The agent names its family, so every fixed assignment in scope also switches to that family, exact-task overrides included. A `caller` function keeps its assignment; its row set for that family takes the agent. It is validated wholesale first: a kept effort the agent's catalog lacks rejects the whole change and leaves the registry untouched. Name the agent alone — `:<effort>` is rejected.
+
+On success it prints `# switched every function to <agent> (<family>), efforts kept` (or `# switched <function> to <agent> (<family>), efforts kept`; for a `caller` function, `# set [<function>.<family>] to <agent>, efforts kept — live whenever a <family> session runs <function>`), then the matching status output and usage. Render the `#` line as plain text first, then the rows per the Status rules above.
+
 ## Edit a row
 
 ```text
@@ -60,6 +71,8 @@ On success the edit prints a `# updated [<function>.<family>] <task> — live|do
 /agent                                    show all assignments and rows
 /agent module_review                      show just module_review's rows
 /agent claude                             every function switches to the claude family
+/agent gpt-6-sol                          every function on gpt-6-sol (codex), efforts kept
+/agent delegate gpt-6-sol                 /plan:delegate on gpt-6-sol, efforts kept
 /agent delegate claude                    /plan:delegate switches to the claude family
 /agent delegate.review gpt-5.6-sol:max     set agent and effort for one subtask
 /agent cli.commit_prep sonnet             set agent, keep the CLI default effort
