@@ -67,44 +67,6 @@
     ]
   },
   "hooks": {
-    "PreToolUse": [
-      {
-        "matcher": "Edit|Write|NotebookEdit",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "\"$HOME/.claude/scripts/berth/install/hooks/berth_pre_edit.sh\""
-          }
-        ]
-      }
-    ],
-    "SessionStart": [
-      {
-        "hooks": [
-          {
-            "type": "command",
-            "command": "mkdir -p /tmp/claude"
-          },
-          {
-            "type": "command",
-            "command": "\"$HOME/.claude/scripts/settings/ensure_git_filters.sh\""
-          },
-          {
-            "type": "command",
-            "command": "\"$HOME/.claude/scripts/berth/install/hooks/berth_session_start.sh\""
-          }
-        ]
-      },
-      {
-        "matcher": "compact",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "\"$HOME/.claude/scripts/lib/py\" \"$HOME/.claude/scripts/hooks/session-start-delegate-resume.py\""
-          }
-        ]
-      }
-    ],
     "PostToolUse": [
       {
         "matcher": "Bash",
@@ -149,6 +111,44 @@
           {
             "type": "command",
             "command": "\"$HOME/.claude/scripts/lib/py\" \"$HOME/.claude/scripts/hooks/post-tool-use-banned-words-block.py\""
+          }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "Edit|Write|NotebookEdit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"$HOME/.claude/scripts/berth/install/hooks/berth_pre_edit.sh\""
+          }
+        ]
+      }
+    ],
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "mkdir -p /tmp/claude"
+          },
+          {
+            "type": "command",
+            "command": "\"$HOME/.claude/scripts/settings/ensure_git_filters.sh\""
+          },
+          {
+            "type": "command",
+            "command": "\"$HOME/.claude/scripts/berth/install/hooks/berth_session_start.sh\""
+          }
+        ]
+      },
+      {
+        "matcher": "compact",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"$HOME/.claude/scripts/lib/py\" \"$HOME/.claude/scripts/hooks/session-start-delegate-resume.py\""
           }
         ]
       }

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 
-# The settings.json keys that never reach a commit, and the sidecar that keeps
-# them alive across a checkout. Sourced by the clean and smudge filters, the
+# The settings.json keys and hook groups that never reach a commit, and the
+# sidecar that keeps them alive across a checkout. Sourced by the clean and smudge filters, the
 # watcher, and ensure_git_filters.sh -- one list so none of them can drift.
 #
 # Why a sidecar exists: git unlinks the old working copy before it runs the
@@ -13,17 +13,50 @@
 SETTINGS_LOCAL_KEYS_JSON='["model","effortLevel","modelSettings"]'
 SETTINGS_LOCAL_KEYS_SIDECAR="settings.local-keys.json"
 
-# jq: keep only the local-only keys of an object.
-SETTINGS_LOCAL_KEYS_PICK='with_entries(select(.key as $k | $keys | index($k) != null))'
+# Hook groups that belong to one machine, matched by a substring of any of
+# their commands. iTerm2's Claude Code integration adds a group running
+# ~/.config/iterm2/cc-status to every hook event on the Mac -- a path that
+# exists nowhere else, so committed it would fail on every event on natedev.
+# The sidecar keeps these under its own `hooks` key, holding only the local
+# groups, and the merge appends them per event rather than as a whole key.
+SETTINGS_LOCAL_HOOK_PATTERNS_JSON='["/.config/iterm2/cc-status"]'
 
-# jq: append the sidecar keys the input lacks, in the input's own key order.
+# jq definitions every program below starts with.
+SETTINGS_LOCAL_DEFS="def local_hook: any(.hooks[]?; (.command // \"\") as \$c | ${SETTINGS_LOCAL_HOOK_PATTERNS_JSON} | any(. as \$p | \$c | contains(\$p)));
+def local_hooks: with_entries(.value |= map(select(local_hook))) | with_entries(select(.value | length > 0));
+def shared_hooks: with_entries(.value |= map(select(local_hook | not))) | with_entries(select(.value | length > 0));"
+
+# jq: what the clean filter commits -- the input without its local-only keys
+# or local hook groups, its hook events sorted by name. Event order carries no
+# meaning, and iTerm2 rewrites the object alphabetically when it adds its
+# groups, so an unsorted blob would read as changed after every such write.
+SETTINGS_LOCAL_KEYS_STRIP="$SETTINGS_LOCAL_DEFS"'
+delpaths($keys | map([.]))
+| if has("hooks") then .hooks |= (shared_hooks | to_entries | sort_by(.key) | from_entries) else . end'
+
+# jq: keep only the local-only keys of an object, plus its local hook groups.
+SETTINGS_LOCAL_KEYS_PICK="$SETTINGS_LOCAL_DEFS"'
+. as $s
+| ($s | with_entries(select(.key as $k | $keys | index($k) != null)))
++ ($s.hooks // {} | local_hooks | if length == 0 then {} else {hooks: .} end)'
+
+# jq: append the sidecar keys the input lacks, in the input's own key order,
+# then each sidecar hook group its event lacks, at the end of that event.
 # An existing key is never touched, so a value the user just changed is not
 # rolled back by a stale snapshot, and a file with nothing missing comes out
 # byte-identical.
-SETTINGS_LOCAL_KEYS_MERGE='. as $cur | . + ($local[0] | with_entries(.key as $k | select(($cur | has($k)) | not)))'
+SETTINGS_LOCAL_KEYS_MERGE='. as $cur | ($local[0] // {}) as $l
+| . + ($l | del(.hooks) | with_entries(.key as $k | select(($cur | has($k)) | not)))
+| reduce (($l.hooks // {}) | to_entries[]) as $e (.;
+    reduce $e.value[] as $g (.;
+      if ((.hooks[$e.key] // []) | index([$g])) != null then .
+      else .hooks[$e.key] += [$g] end))'
 
-# jq: how many sidecar keys the input lacks.
-SETTINGS_LOCAL_KEYS_MISSING='. as $cur | [$local[0] | keys[] | . as $k | select(($cur | has($k)) | not)] | length'
+# jq: how many sidecar keys and hook groups the input lacks.
+SETTINGS_LOCAL_KEYS_MISSING='. as $cur | ($local[0] // {}) as $l
+| ([$l | del(.hooks) | keys[] | . as $k | select(($cur | has($k)) | not)] | length)
++ ([($l.hooks // {}) | to_entries[] | .key as $k | .value[] | . as $g
+    | select((($cur.hooks[$k] // []) | index([$g])) == null)] | length)'
 
 # Copy the local-only keys out of settings.json into the sidecar.
 #
