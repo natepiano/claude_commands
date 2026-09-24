@@ -31,6 +31,7 @@ REPO_TARGET_DIR="${CARGO_TARGET_DIR:-${REPO_ROOT}/target}"
 export CARGO_TARGET_DIR="$REPO_TARGET_DIR"
 export VALIDATE_TARGET_DIR="$REPO_TARGET_DIR"
 CROSS_TARGETS_FILE="${REPO_ROOT}/.claude/config/cross_targets"
+LOCAL_CI_FILE="${REPO_ROOT}/.claude/config/local_ci.sh"
 
 # Canonical local CI mirror for Nate's Rust repos.
 # Variations:
@@ -45,6 +46,9 @@ CROSS_TARGETS_FILE="${REPO_ROOT}/.claude/config/cross_targets"
 #   type-checks and never links, so a listed triple needs only
 #   `rustup target add`, with no cross linker or sysroot. List only non-host
 #   triples: the host is the clippy step below
+# - A repo can add the checks its own CI runs beyond these in
+#   `.claude/config/local_ci.sh`. It runs under bash after every other step and
+#   fails the validation when it exits non-zero; without the file nothing runs
 # - `mend=off` in config/lint.conf skips both cargo-mend steps here, and only
 #   those two. Every other step ignores that file: a pre-push gate that silently
 #   no-ops is worse than a noisy one. mend is the exception because it rewrites
@@ -229,6 +233,10 @@ elif [ -n "$MEND_SELF_PACKAGE" ]; then
   run_step "cargo-mend (in-repo build)" run_self_mend --fail-on-warn
 else
   run_step "cargo-mend" "$LINT_CMD" mend --workspace --fail-on-warn
+fi
+
+if [ -f "$LOCAL_CI_FILE" ]; then
+  run_step "local CI (${LOCAL_CI_FILE#"${REPO_ROOT}/"})" bash "$LOCAL_CI_FILE"
 fi
 
 echo ""
