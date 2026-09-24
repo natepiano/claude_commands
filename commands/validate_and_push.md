@@ -86,8 +86,9 @@ Its output is already markdown. Paste it verbatim and **never wrap it in a code
 fence** — a fenced table renders as literal pipes.
 
 It prints **every stage on every tick**, not only the ones still moving, so each
-report is a standing picture instead of a diff the user has to reassemble. A stage
-that has not started shows `-`; a running one shows time elapsed so far.
+report is a standing picture instead of a diff the user has to reassemble. Only a
+running stage shows a time, its elapsed time so far; a stage not yet started reads
+`waiting`, and a finished one shows only its conclusion.
 
 `skipped` is a normal conclusion for a conditional stage, not a failure. It is
 excluded from the green count, which is why a fully successful run can read
