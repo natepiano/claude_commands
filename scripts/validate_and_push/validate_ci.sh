@@ -30,6 +30,7 @@ REPO_ROOT="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
 REPO_TARGET_DIR="${CARGO_TARGET_DIR:-${REPO_ROOT}/target}"
 export CARGO_TARGET_DIR="$REPO_TARGET_DIR"
 export VALIDATE_TARGET_DIR="$REPO_TARGET_DIR"
+CROSS_TARGETS_FILE="${REPO_ROOT}/.claude/config/cross_targets"
 
 # Canonical local CI mirror for Nate's Rust repos.
 # Variations:
@@ -38,6 +39,12 @@ export VALIDATE_TARGET_DIR="$REPO_TARGET_DIR"
 #   other repos use the installed cargo-mend through LINT_CMD
 # - Clippy lints --all-targets, the same scope CI uses; benches are linted but
 #   intentionally never run here — run them ad hoc
+# - A repo can list extra target triples in `.claude/config/cross_targets`, one
+#   per line, `#` starting a comment. Each gets a workspace clippy with
+#   `--target`, the way hana lints its Windows code from Linux. Clippy
+#   type-checks and never links, so a listed triple needs only
+#   `rustup target add`, with no cross linker or sysroot. List only non-host
+#   triples: the host is the clippy step below
 # - `mend=off` in config/lint.conf skips both cargo-mend steps here, and only
 #   those two. Every other step ignores that file: a pre-push gate that silently
 #   no-ops is worse than a noisy one. mend is the exception because it rewrites
@@ -183,6 +190,30 @@ run_autofix_step "rustfmt" env LINT_CONFIG_FORCE=1 "$LINT_CMD" fmt
 run_autofix_step "taplo" taplo fmt
 
 run_step "clippy" env LINT_CONFIG_FORCE=1 "$LINT_CMD" clippy --workspace
+
+# Cross-target clippy for the triples listed in CROSS_TARGETS_FILE. Read into an
+# array first, so no step can drain the loop's stdin.
+CROSS_TARGETS=()
+if [ -f "$CROSS_TARGETS_FILE" ]; then
+  while IFS= read -r line || [ -n "$line" ]; do
+    target="${line%%#*}"
+    target="${target//[[:space:]]/}"
+    if [ -n "$target" ]; then
+      CROSS_TARGETS+=("$target")
+    fi
+  done <"$CROSS_TARGETS_FILE"
+fi
+if [ "${#CROSS_TARGETS[@]}" -gt 0 ]; then
+  INSTALLED_TARGETS="$(rustup target list --installed)"
+  for target in "${CROSS_TARGETS[@]}"; do
+    if ! grep -qxF "$target" <<<"$INSTALLED_TARGETS"; then
+      echo "!!! ${CROSS_TARGETS_FILE#"${REPO_ROOT}/"} lists ${target}, which is not installed."
+      echo "!!! Install it with: rustup target add ${target}"
+      exit 1
+    fi
+    run_step "clippy (${target})" env LINT_CONFIG_FORCE=1 "$LINT_CMD" clippy --workspace --target "$target"
+  done
+fi
 
 # rustdoc across every member. `lint doc` scopes to changed members like the
 # other checks, so the dev-time run cannot see a doc link that rotted in an

@@ -6,7 +6,7 @@ Run `~/.claude/scripts/validate_and_push/validate_and_push.sh` with `dangerously
 
 Two options exist for `/plan:delegate`'s CI points (`commands/plan/delegate_ci.md`) and are not used on a plain invocation: `--to <branch>` pushes `HEAD` to `origin/<branch>` on the direct path, and `--fix-commit <message>` commits validation fixes as a new commit instead of amending the last one.
 
-The script runs local validation, chooses the push path, and pushes directly when branch rules allow it. When the default branch lands, on either path, it runs the repo's post-push hook if one exists: `.claude/config/post_push.sh` at the repo root, run with `LANDED_SHA` and `LANDED_BRANCH` set (hana uses it to regenerate and push its public mirror). A hook failure is reported after the push and is the script's exit status; the push itself is never rolled back. It does **not** watch CI — on the direct path it stops after the push and prints a `=== CI HANDOFF TO AGENT ===` block with the repo, branch, SHA, and run id. Watching is yours, and you drive it with the tick loop in <WatchCI/>.
+The script runs local validation, chooses the push path, and pushes directly when branch rules allow it. When the default branch lands, on either path, it runs the repo's post-push hook if one exists: `.claude/config/post_push.sh` at the repo root, run with `LANDED_SHA` and `LANDED_BRANCH` set (hana uses it to regenerate and push its public mirror). A hook failure is reported after the push and is the script's exit status; the push itself is never rolled back. It does **not** watch CI — on the direct path it stops after the push and prints a `=== CI HANDOFF TO AGENT ===` block with the repo, branch, SHA, run id, url, and start time. Watching is yours, and you drive it with the tick loop in <WatchCI/>.
 
 Validation requires a clean worktree. Before strict validation, the script automatically applies every fix that cargo-mend marks as machine-applicable; these fixes do not require user approval. Rustfmt and taplo also run in write mode. After each successful fix step, any resulting changes are amended into the last commit (`git commit --amend --no-edit`) and validation continues automatically. Clippy runs only in strict check mode; any findings stop validation for manual fixes.
 
@@ -35,6 +35,8 @@ If any validation, push, or merge command fails, stop and report the failing ste
 
 <WatchCI>
 Settle watchers and a progress tick run together. Neither blocks the turn.
+
+As soon as the handoff block prints, give the user its bare `url` and its `started` time.
 
 **Settle watchers** — one per run, started in the same turn as the handoff block,
 before the first tick:
@@ -74,7 +76,7 @@ proxy breaks its TLS verification.
 ~/.claude/scripts/validate_and_push/ci_tick.sh <owner/repo> <run-id> [<owner/repo> <run-id> ...]
 ```
 
-It emits the clock time, a bullet per run, and **one** table whose columns are the
+It emits the clock time, a bullet per run with its bare URL and start time, and **one** table whose columns are the
 runs and whose rows are the union of their stage names — a stage only one repo has
 reads `n/a` in the other. Under the table it prints a bold
 `**<repo> finished — <conclusion>**` for each settled run, so a finished run stays

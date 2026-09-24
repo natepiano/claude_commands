@@ -3,8 +3,8 @@ set -euo pipefail
 
 # One combined stage table across one or more CI runs, for the /validate_and_push
 # progress tick. Columns are the runs; rows are the union of their stage names, so
-# a stage only one repo has reads `n/a` in the other. A settled run gets a bold
-# note under the table.
+# a stage only one repo has reads `n/a` in the other. Each run's bullet prints the
+# run's bare URL and start time. A settled run gets a bold note under the table.
 #
 # Usage: ci_tick.sh <owner/repo> <run-id> [<owner/repo> <run-id> ...]
 
@@ -22,7 +22,7 @@ while [ "$#" -gt 0 ]; do
   run="$2"
   shift 2
   gh run view "$run" --repo "$repo" \
-    --json createdAt,updatedAt,status,conclusion,jobs |
+    --json createdAt,updatedAt,status,conclusion,url,jobs |
     jq --arg label "${repo##*/}" --arg run "$run" '. + {label: $label, run_id: $run}' \
       >"$tmp/$i.json"
   i=$((i + 1))
@@ -57,7 +57,7 @@ jq -s -r --arg clock "$(date '+%H:%M:%S %Z')" '
         else (now - (.createdAt|fromdateiso8601)) end) as $elapsed
      | ([.jobs[]|select(.conclusion=="success")]|length) as $g
      | ([.jobs[]|select(.conclusion=="skipped")]|length) as $s
-     | "- **\(.label)** run `\(.run_id)` · \(.status) \(.conclusion // "-") · elapsed **\($elapsed|secs)** · **\($g) of \(.jobs|length) green\(if $s > 0 then " (\($s) skipped)" else "" end)**"),
+     | "- **\(.label)** run `\(.run_id)` \(.url) · started **\(.createdAt|fromdateiso8601|strflocaltime("%H:%M:%S %Z"))** · \(.status) \(.conclusion // "-") · elapsed **\($elapsed|secs)** · **\($g) of \(.jobs|length) green\(if $s > 0 then " (\($s) skipped)" else "" end)**"),
     "",
     ("| stage | " + ($labels | join(" | ")) + " |"),
     ("|---|" + ($labels | map("---|") | join(""))),

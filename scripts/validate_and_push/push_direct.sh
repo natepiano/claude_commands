@@ -30,10 +30,12 @@ bash "${SCRIPT_DIR}/post_push_hook.sh" "$BRANCH" "$SHA" || HOOK_STATUS=$?
 
 # `gh run list --commit` requires a full SHA; a short SHA silently returns
 # nothing. The run also does not exist the instant the push lands.
-RUN_ID=""
+RUN=""
 for i in $(seq 1 40); do
-  RUN_ID="$(gh run list --branch "$BRANCH" --commit "$SHA" --json databaseId --jq '.[0].databaseId' 2>/dev/null || true)"
-  if [ -n "$RUN_ID" ]; then
+  RUN="$(gh run list --branch "$BRANCH" --commit "$SHA" --json databaseId,createdAt \
+    --jq '.[0] | select(. != null) | "\(.databaseId) \(.createdAt | fromdateiso8601 | strflocaltime("%Y-%m-%d %H:%M:%S %Z"))"' \
+    2>/dev/null || true)"
+  if [ -n "$RUN" ]; then
     break
   fi
   echo "Attempt ${i}/40: no CI run yet for ${SHA}, waiting 3s..."
@@ -42,14 +44,16 @@ done
 
 echo
 echo "=== CI HANDOFF TO AGENT ==="
-echo "repo:   ${REPO}"
-echo "branch: ${BRANCH}"
-echo "sha:    ${SHA}"
-if [ -n "$RUN_ID" ]; then
-  echo "run_id: ${RUN_ID}"
-  echo "url:    https://github.com/${REPO}/actions/runs/${RUN_ID}"
+echo "repo:    ${REPO}"
+echo "branch:  ${BRANCH}"
+echo "sha:     ${SHA}"
+if [ -n "$RUN" ]; then
+  RUN_ID="${RUN%% *}"
+  echo "run_id:  ${RUN_ID}"
+  echo "url:     https://github.com/${REPO}/actions/runs/${RUN_ID}"
+  echo "started: ${RUN#* }"
 else
-  echo "run_id: none"
+  echo "run_id:  none"
   echo "No run appeared within 120s. Find it with:"
   echo "  gh run list --branch ${BRANCH} --commit ${SHA} --json databaseId,status"
 fi
