@@ -68,6 +68,7 @@ it:
 | <CheckpointCommit/> | `commands/plan/delegate_checkpoint.md` | `/plan:delegate_checkpoint` |
 | <ConsiderNextItems/>, <ReviewPendingAddOns/> | `commands/plan/delegate_next.md` | `/plan:delegate_next` |
 | <ResolveStyleDiffBase/>, <RunProjectStyleReview/> | `commands/plan/delegate_style.md` | `/plan:delegate_style` |
+| <PeriodicCI/>, <CICleanup/> | `commands/plan/delegate_ci.md` | `/plan:delegate_ci` |
 | <ComposeWorkOrder/> | `docs/delegate/compose_work_order.md` | — |
 
 Paths are under `~/.claude/`.
@@ -75,16 +76,18 @@ Paths are under `~/.claude/`.
 
 <CoreContract>
 - Never create a worktree or modify unrelated files. The only branch the run may
-  create is the one the user approves in <ResolveStyleDiffBase/>; never switch to
-  an existing branch.
+  create is the one the user approves in <ResolveStyleDiffBase/>, plus the remote
+  CI branch <PeriodicCI/> may push; never switch to an existing branch.
 - The main agent does not write implementation code unless the user explicitly
   asks. Exceptions: agreed doc-only/trivial post-review fixes and the single
   inline cleanup in <RunProjectStyleReview/>.
 - `single` never commits. Loop and verbose modes create exactly one
   <CheckpointCommit/> per completed phase, plus the one <FinalGateCommit/> that
   closes verification and the one <AsBuiltCommit/> that carries the run's
-  documentation. No other commit is allowed.
-- A checkpoint never pushes. If a phase explicitly needs a remote commit for a
+  documentation. <PeriodicCI/> may add `ci(<plan-slug>): …` commits for
+  validation fixes and CI repairs. No other commit is allowed.
+- A checkpoint never pushes; <PeriodicCI/> pushes between phases, every fifth
+  checkpoint of a plan with five or more phases. If a phase explicitly needs a remote commit for a
   dependency pin, consumer, or CI run, pushing that working branch is mechanical
   phase work, not a user decision or prerequisite.
 - A phase reservation is released only by the successful-checkpoint path in
@@ -109,8 +112,8 @@ The closed list:
   live and nothing synchronous remains. Name the handle. <DispatchContract/>
   step 4 and <BackgroundVerificationContract/> are this case.
 - **gate** — a gate this command defines reaches the user by design:
-  <VerbosePrePhaseGate/>, <VerbosePostPhaseGate/>, <ReviewPendingAddOns/>, or
-  the authorization round trip in <AuthorizationContract/>.
+  <VerbosePrePhaseGate/>, <VerbosePostPhaseGate/>, <ReviewPendingAddOns/>,
+  <CICleanup/>, or the authorization round trip in <AuthorizationContract/>.
 - **decision** — a genuine user decision under <DecisionRouting/>. State the
   question being asked.
 - **blocked** — a hard stop this command defines: a structural check that blocks
@@ -1831,11 +1834,13 @@ answer from the completed report and preserve the gate.
 </VerbosePostPhaseGate>
 
 <NextPhase>
-If no todo phase remains, run <FinalGate/>, then <RunAsBuilt/>, then
-<RunSummary/>. Otherwise reset `REVIEW_PASS=0` and smoke to `not_run`.
+If no todo phase remains, run <FinalGate/>, then <RunAsBuilt/>, then the final
+<PeriodicCI/> point and <CICleanup/>, then <RunSummary/>. Otherwise reset `REVIEW_PASS=0` and smoke to `not_run`.
 Style state is per-run, not per-phase: never reset it or delete its marker
 here, and never re-resolve `STYLE_DIFF_BASE`.
 
+- Every mode but `single`: first run <PeriodicCI/> when a CI point is due, and
+  repair a red CI result before dispatching.
 - Loop: announce next phase and return to <ComposeWorkOrder/>.
 - Verbose/no window: announce its briefing and return to <ComposeWorkOrder/>.
 - `next N`: decrement after completion; clear at zero, otherwise continue.
@@ -1970,6 +1975,9 @@ Emit on every multi-phase ending:
 **Smoke checks still unperformed:** [phase + exact action, or none]
 **Deferred decisions still open:** [phase + decision, or none]
 **Add-ons awaiting review:** [count, or none]
+**CI points:** [each point from `ci_points.log` with its result, remote
+branches merged and deleted or kept, or not applicable — fewer than five phases
+or `single`]
 **Reservation disposition:** [checkpointed and outstanding, retained with the
 reason this run stopped, or coordination not active]
 **Why the run stopped:** [complete, user stop, pending decision, or error]

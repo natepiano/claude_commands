@@ -15,10 +15,12 @@ set -euo pipefail
 # status, so the handoff block is always printed.
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-BRANCH="$(git branch --show-current)"
+# PUSH_TARGET_BRANCH (from validate_and_push.sh --to) names the remote branch
+# to push HEAD to; otherwise the current branch is pushed under its own name.
+BRANCH="${PUSH_TARGET_BRANCH:-$(git branch --show-current)}"
 
 echo "Pushing ${BRANCH} to origin..."
-git push origin "$BRANCH"
+git push origin "HEAD:refs/heads/${BRANCH}"
 
 SHA="$(git rev-parse HEAD)"
 REPO="$(gh repo view --json nameWithOwner -q .nameWithOwner)"

@@ -95,8 +95,17 @@ amend_fixes() {
     return 0
   fi
 
-  echo "=== STEP: amend ${label} fixes ==="
   git add -A
+  # VALIDATE_FIX_COMMIT_MESSAGE (validate_and_push.sh --fix-commit) keeps the
+  # last commit intact: the first fix step creates a commit with that message
+  # and later steps amend that commit only.
+  if [ -n "${VALIDATE_FIX_COMMIT_MESSAGE:-}" ] && [ "$(git log -1 --format=%B)" != "$VALIDATE_FIX_COMMIT_MESSAGE" ]; then
+    echo "=== STEP: commit ${label} fixes ==="
+    git commit --quiet -m "$VALIDATE_FIX_COMMIT_MESSAGE"
+    echo "Committed ${label} fixes as a new commit; continuing validation."
+    return 0
+  fi
+  echo "=== STEP: amend ${label} fixes ==="
   git commit --amend --no-edit --quiet
   echo "Amended ${label} fixes into the last commit; continuing validation."
 }
