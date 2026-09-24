@@ -198,7 +198,12 @@ echo "  Build: passed"
 echo ""
 echo "  Committing workspace dependency update..."
 git add Cargo.toml Cargo.lock
-git commit -m "chore: update workspace deps to $VERSION"
+# STEP 4's --edit-only --auto pass usually set these already, leaving nothing to commit
+if git diff --cached --quiet; then
+    echo "  Already at $VERSION — nothing to commit"
+else
+    git commit -m "chore: update workspace deps to $VERSION"
+fi
 
 echo ""
 echo "Workspace dependencies updated to $VERSION"
