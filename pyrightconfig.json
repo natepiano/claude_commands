@@ -22,6 +22,12 @@
       ]
     },
     {
+      "root": "scripts/whoami",
+      "extraPaths": [
+        "scripts/whoami"
+      ]
+    },
+    {
       "root": "scripts/banned_word_analysis",
       "extraPaths": [
         "scripts/banned_word_analysis",
