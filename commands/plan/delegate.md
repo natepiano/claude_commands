@@ -463,12 +463,14 @@ A member launched into the mesh is **addressable**: peers reach each other, the
 orchestrator reaches any of them, and a claude member reaches the orchestrator —
 mid-run, without waiting for a phase to end.
 
-- **Addresses** are `<mesh_prefix>-<slot>`, where the prefix is the session
-  directory's basename: `phase3-a91c-impl`, `-test`. The slot, never the
-  role: a `test` seat writing code is still `-test`. A member is told its
-  peer's name in its prompt, and every `register` line on the board repeats the
-  names in its `mesh=` field, so a member that missed the launch can still look
-  one up.
+- **Addresses** are `<project>-<slot>`, the project being the working tree's
+  directory name: `hana_catalyst-impl`, `-test`; a repair seat is `-fix`. The
+  slot, never the role: a `test` seat writing code is still `-test`. Get each
+  name from `bash ~/.claude/scripts/delegate/seat_name.sh "${WORKING_DIR}"
+  <slot> <kind>`, the launcher's own rule; never compose one. A member is told
+  its peer's name in its prompt, and every `register` line on the board repeats
+  the names in its `mesh=` field, so a member that missed the launch can still
+  look one up.
 - **How you reach a name depends on its family**, and the register line says
   which in its `reach=` field. Using the wrong call fails silently: the message
   goes nowhere and the sender waits on a reply that was never queued.
@@ -486,12 +488,12 @@ mid-run, without waiting for a phase to end.
   - `mesh=none` — that member has no address. Do not wait on a reply from it;
     read its board posts instead.
 - **A finished claude peer is still reachable.** Its session stays alive after
-  its turn ends, and a message resumes it from its transcript. So the tester may
-  ask the implementer a question after the implementer has reported done, and get
-  an answer rather than silence. **A finished codex peer is not**, and `send`
-  says so rather than pretending: it refuses any target whose roster status is
-  not `running`. Ask a codex peer while it is still working, or read its summary
-  file instead.
+  its turn ends, until <PhaseCleanup/>, and a message resumes it from its
+  transcript. So the tester may ask the implementer a question after the
+  implementer has reported done, and get an answer rather than silence. **A
+  finished codex peer is not**, and `send` says so rather than pretending: it
+  refuses any target whose roster status is not `running`. Ask a codex peer
+  while it is still working, or read its summary file instead.
 - **A codex member has no route to the orchestrator.** It reaches its peer with
   the calls above and reaches the orchestrator only through the board, which the
   orchestrator reads at every progress tick. Anything that cannot wait for the
@@ -926,7 +928,7 @@ recording, with no report emitted between them.
 12. <RunPhaseShrink/>
 13. <ConsiderNextItems/>
 14. <CheckpointCommit/>
-15. <DiscardPhaseReviewText/>
+15. <PhaseCleanup/>
 16. <RecordPhaseCompletion/>
 17. <VerbosePostPhaseReport/> and applicable <VerbosePostPhaseGate/>
 18. <NextPhase/> or <RunSummary/>
@@ -1779,15 +1781,18 @@ confirmed, so a failed or busy release applies
 <RetainDelegatedPhaseReservation/> rather than a retry.
 </CheckpointCommit>
 
-<DiscardPhaseReviewText>
+<PhaseCleanup>
 After <RunPhaseShrink/> and a successful checkpoint when one applies, run:
 
 `bash ~/.claude/scripts/delegate/clear_phase_review.sh "${SESSION_DIR}" <phase-id>`
+`python3 ~/.claude/scripts/delegate/remove_seats.py --session-dir "${SESSION_DIR}"`
 
-The script removes only this phase's review prose; structured progress history
+The first removes only this phase's review prose; structured progress history
 remains. Do not clear before shrink succeeds or while a checkpoint can still
-fail.
-</DiscardPhaseReviewText>
+fail. The second removes this run's claude seats, which nothing messages after
+the phase, and any seat a dead run left alive; a failure there is one line in
+the report, never a stop.
+</PhaseCleanup>
 
 <RecordPhaseCompletion>
 After smoke, phase review, shrink, next-item consideration, cleanup, and

@@ -10,6 +10,9 @@
 #                                 its turn to end -- for a caller that talks to
 #                                 the session itself (ask_a_friend) rather than
 #                                 waiting on a summary
+#   env AGENT_BG_LEDGER=<file>    append `<id>\t<mesh_name>` to <file> once the
+#                                 session is registered, for the caller's
+#                                 cleanup -- delegate/remove_seats.py reads it
 #
 # Why this exists rather than agent_exec.sh: a delegate launched with
 # `claude --print` is INVISIBLE. It holds the ListAgents/SendMessage tools but
@@ -30,8 +33,9 @@
 #
 # The session is deliberately LEFT ALIVE when its turn ends. A message resumes a
 # stopped-turn session from its transcript, so a finished implementer can still
-# answer the tester's question. Whoever runs the phase stops them at the end --
-# the id is in <id_file> for exactly that.
+# answer the tester's question. The caller ends it: a delegate seat through the
+# AGENT_BG_LEDGER record and delegate/remove_seats.py, a friend through the id
+# in <id_file>.
 
 set -euo pipefail
 
@@ -50,6 +54,7 @@ MODEL="${7:-}"
 POLL_SECS="${8:-15}"
 EFFORT="${AGENT_BG_EFFORT:-}"
 DETACH="${AGENT_BG_DETACH:-0}"
+LEDGER="${AGENT_BG_LEDGER:-}"
 
 # Never the bare name: the user's interactive shell aliases `claude` to inject
 # `--remote-control "<dir> <date>"`, which turns `claude stop <id>` into a new
@@ -94,8 +99,11 @@ banner="$(cd "${WORKING_DIR}" && "${CLAUDE_BIN}" "${launch_args[@]}" \
             -- "$(cat "${PROMPT_FILE}")" 2>&1 || true)"
 
 # The banner reads `backgrounded · <id> · <name>`; the separators are multibyte,
-# so match the id itself rather than splitting on them.
-BG_ID="$(printf '%s\n' "${banner}" | grep -oE '\b[0-9a-f]{8}\b' | head -1 || true)"
+# so match the id itself rather than splitting on them -- on that line alone. A
+# refused launch prints an error instead, and a path in it can carry an 8-hex
+# run: the caller's own session id sits in its scratchpad path, and taking that
+# as the seat's id hands the caller's session to whatever stops this seat.
+BG_ID="$(printf '%s\n' "${banner}" | grep 'backgrounded' | grep -oE '\b[0-9a-f]{8}\b' | head -1 || true)"
 if [[ -z "${BG_ID}" ]]; then
   printf '%s\n' "${banner}" > "${LOG_FILE}"
   echo "agent_bg.sh: could not start a background session; banner follows." >&2
@@ -103,6 +111,9 @@ if [[ -z "${BG_ID}" ]]; then
   exit 1
 fi
 printf '%s\n' "${BG_ID}" > "${ID_FILE}"
+if [[ -n "${LEDGER}" ]]; then
+  printf '%s\t%s\n' "${BG_ID}" "${MESH_NAME}" >> "${LEDGER}"
+fi
 if [[ "${DETACH}" == "1" ]]; then
   echo "launched ${MESH_NAME} (${BG_ID})"
   exit 0

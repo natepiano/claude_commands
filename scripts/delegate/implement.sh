@@ -33,10 +33,12 @@
 #   <session_dir>/impl_bg_id_<role>       — the background session's short id, on
 #                                     the claude path only. The session is left
 #                                     alive when its turn ends so a peer's message
-#                                     can resume it; whoever runs the phase stops
-#                                     it with `claude stop <id>`. Absent on the
-#                                     codex path, whose address is a thread id in
+#                                     can resume it. Absent on the codex path,
+#                                     whose address is a thread id in
 #                                     <session_dir>/mesh_roster.json instead.
+#   <session_dir>/seats             — every background session this run launched,
+#                                     `<id>\t<name>`, appended at launch;
+#                                     remove_seats.py removes them at phase end
 #   <session_dir>/board.log         — shared coordination board; this launcher
 #                                     posts each member's start and end so peers
 #                                     learn of them without the orchestrator,
@@ -116,16 +118,21 @@ BOARD_AGENT="${TEAM_ROLE}"
 # is silently empty rather than wrong, which is worse.
 export PLAN_DELEGATE_TEAM_ROLE="${TEAM_ROLE}"
 
-# The address peers type to reach this member. It has to be unique across every
-# delegate alive on the machine, not just within this phase, because the session
-# registry is machine-wide -- two projects running phase 3 at once would collide
-# on a bare role name. The session directory's basename is already unique per
-# run, so it carries that uniqueness into the mesh.
-MESH_PREFIX="${10:-$(basename "${SESSION_DIR}")}"
-MESH_PREFIX="$(printf '%s' "${MESH_PREFIX}" | tr -c '[:alnum:]._-' '-' | cut -c1-40)"
-MESH_NAME="${MESH_PREFIX}-${TEAM_ROLE}"
-
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# The address peers type to reach this member: `<project>-<slot>`, or
+# `<project>-fix` for a repair seat. seat_name.sh owns the rule, because the
+# orchestrator writes the same name into each peer's prompt before this runs.
+# A run whose orchestrator loaded the earlier rule tells its peers
+# `<session dir basename>-<slot>`, and its board already registers a seat under
+# that prefix, so it keeps the prefix for the rest of the run. Remove once no
+# run predating seat_name.sh can still be running.
+MESH_PREFIX="${10:-}"
+LEGACY_PREFIX="$(basename "${SESSION_DIR}")"
+if [[ -z "${MESH_PREFIX}" ]] && grep -qF "mesh=${LEGACY_PREFIX}-" "${SESSION_DIR}/board.log" 2>/dev/null; then
+  MESH_PREFIX="${LEGACY_PREFIX}"
+fi
+MESH_NAME="$(bash "${SCRIPT_DIR}/seat_name.sh" "${WORKING_DIR}" "${TEAM_ROLE}" "${PASS_KIND}" "${MESH_PREFIX}")"
 
 # python3 goes through the repo shim, which picks an interpreter by VERSION
 # rather than by path: the python3 on PATH is Apple 3.9 on the Mac, and this
@@ -258,7 +265,7 @@ export PLAN_DELEGATE_BOARD_DIR="${SESSION_DIR}"
 # codex_mesh.py launches it there instead. With codex_mesh=0 it falls back to
 # the plain launcher and coordinates through the board alone.
 if [[ "${AGENT_FAMILY}" == "claude" ]]; then
-  bash "${SCRIPT_DIR}/../agents/agent_bg.sh" \
+  AGENT_BG_LEDGER="${SESSION_DIR}/seats" bash "${SCRIPT_DIR}/../agents/agent_bg.sh" \
     "${MESH_NAME}" "${WORKING_DIR}" "${PROMPT_FILE}" "${SUMMARY_FILE}" \
     "${LOG_FILE}" "${BG_ID_FILE}" "${AGENT_MODEL}" &
 elif [[ "${USE_CODEX_MESH}" == "1" ]]; then

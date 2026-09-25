@@ -110,7 +110,7 @@ class ImplementLauncherSeatTests(unittest.TestCase):
         # The wrapper reaches python3 through ../lib/py, resolved from its own
         # location, so the copy needs the interpreter shim beside it too.
         _ = shutil.copy2(DELEGATE_DIR.parent / "lib" / "py", lib / "py")
-        for name in ("implement.sh", "progress_history.py", "board.sh"):
+        for name in ("implement.sh", "seat_name.sh", "progress_history.py", "board.sh"):
             _ = shutil.copy2(DELEGATE_DIR / name, delegate / name)
         for name in ("agents_config.sh", "heartbeat.sh", "heartbeat_watch.sh"):
             _ = shutil.copy2(AGENTS_DIR / name, agents / name)
