@@ -8,7 +8,7 @@ Perform a release for any Rust crate or workspace project.
 
 ## Usage
 - `/release` or `/release help` - Show this usage information
-- `/release patch` - Auto-detect latest published version and increment patch
+- `/release patch` - Release the next patch on this branch's line (main at `0.23.0-dev` with `0.22.8` published → `0.22.9`)
 - `/release patch dry-run` - Rehearse patch release without mutations
 - `/release X.Y.Z` - Release as final version (e.g., `0.18.0`)
 - `/release X.Y.Z-rc.N` - Release as RC version (e.g., `0.18.0-rc.1`)
@@ -124,6 +124,7 @@ All scriptable steps use shell scripts. The agent orchestrates script execution 
 
 **Universal scripts** in `~/.claude/scripts/release/`:
 - `validate_version.sh` — format, collision, and gap checking ⊘
+- `next_patch_version.sh` — next patch on the current branch's line, for `/release patch` ⊘
 - `pre_release_checks.sh` — git status, clippy, build, test, fmt ⊘ (deliberately ignores `config/lint.conf`; a check turned off with `/lint_config` still runs here, because a release gate that silently no-ops is worse than a noisy one). Takes an optional `--package <name>` to scope the compile-and-test gate to one crate
 - `create_release_branch.sh` — branch creation
 - `bump_versions.sh` — update [package] version fields
@@ -133,7 +134,7 @@ All scriptable steps use shell scripts. The agent orchestrates script execution 
 - `publish_crate.sh` — dry-run and publish a single crate ⊘
 - `update_workspace_deps.sh` — update internal cross-crate versions in root `Cargo.toml` `[workspace.dependencies]`; between publish phases with explicit names ⊘, or with `--edit-only --auto` (self-discovering, no crates.io wait, no commit) when bumping versions in STEP 4 and STEP 11
 - `push_release.sh` — tag, push branch, push tag ⊘
-- `verify_published.sh` — check crates.io versions ⊘
+- `verify_published.sh` — check each crate has the exact version published and not yanked ⊘
 - `create_github_release.sh` — create GitHub release ⊘
 - `restore_unreleased.sh` — add [Unreleased] sections back to changelogs
 
@@ -337,13 +338,13 @@ Same sequence as normal mode, but every "on main" step runs on `${BASE_BRANCH}` 
 
 **If argument is `patch` (with or without `dry-run`):**
 1. Detect the crate name: if `${PACKAGE}` is set, use it; otherwise the primary crate (single crate: from root `Cargo.toml`; workspace: from first `[workspace.members]` entry or first publish phase crate if config exists)
-2. Query crates.io for the latest published version:
+2. Derive the next patch from the line this branch is on (with `dangerouslyDisableSandbox: true`):
 ```bash
-curl -s "https://crates.io/api/v1/crates/${CRATE_NAME}" | jq -r '.crate.max_version'
+~/.claude/scripts/release/next_patch_version.sh ${CRATE_NAME}
 ```
-3. Increment the patch number (e.g., `0.18.0` → `0.18.1`)
-4. Set `${VERSION}` to the incremented version
-5. Mark this as a **patch release** (STEP 10 will be skipped)
+→ stdout is the version; stderr names the branch version, the line, and that line's highest published patch — report it. **Never derive it from crates.io's `max_version`**: that is the newest version from any branch, so with `0.23.0-rc.1` published and main at `0.23.0-dev` it would give `0.23.1`, which `validate_version.sh` accepts as the next 0.23 patch — publishing main's older line above the prerelease. Stop if the script exits 1 and ask for an explicit version.
+3. Set `${VERSION}` to the script's output
+4. Mark this as a **patch release** (STEP 11 restores the dev version that preceded it)
 
 **Otherwise, extract version from `$ARGUMENTS`** (strip `dry-run` if present).
 
