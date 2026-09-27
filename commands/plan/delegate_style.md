@@ -98,8 +98,11 @@ phase checkpoint never waits on one.
    cleanup verification. Never clear it during later fixes.
 6. Save `${SESSION_DIR}/style_review_after.diff` and
    `${SESSION_DIR}/style_review_after.status`, compare them with the before
-   snapshots, and read every style-induced hunk. If Rust/Cargo changed, rerun
-   `verify.sh test` and `lint` for every affected package. Failures use normal
+   snapshots, and read every style-induced hunk. If Rust/Cargo changed in
+   `single`, rerun `verify.sh test` and `lint` for every affected package. Loop
+   and verbose skip that per-package pass: <FinalGate/> step 4 reruns
+   `verify.sh final` and the workspace `clippy` scan over the cleanup, so a
+   per-package pass only runs the same checks twice. Failures use normal
    finding/fix routing.
 7. If cleanup reached runnable code, reset smoke to `not_run` and rerun
    <RunApplicationSmokeTest/>. The guard skips this section on return.
