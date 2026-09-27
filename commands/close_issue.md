@@ -12,6 +12,16 @@ Close exactly one issue in the Hanadocs Obsidian vault. This command works from 
 - Do not inspect or modify issues outside this vault.
 - Do not commit changes.
 
+## Platforms
+
+Check the platform with `uname -s` before resolving the issue.
+
+- **macOS (`Darwin`)**: run every step below, including the filesystem timestamp checks and "Reconcile filesystem timestamps".
+- **Linux**: the frontmatter dates are the only record. Skip resolve step 6's filesystem check, skip "Reconcile filesystem timestamps", and skip the filesystem part of verify step 1. Every other step is the same. This is because:
+  - the vault arrives by git checkout, which stamps every file with the checkout time (on natedev, 2026-09-27, none of the 408 issues had file dates matching their frontmatter);
+  - Linux cannot set a file's creation time, and `SetFile` does not exist there;
+  - no vault base reads `file.ctime` or `file.mtime`.
+
 ## Usage
 
 ```text
@@ -57,7 +67,7 @@ Examples:
    - unique case-insensitive substring of that normalized filename stem.
 4. Resolve the real path and require it to be a regular, non-symlink Markdown file whose real parent is `~/rust/hanadocs/issues`. Reject traversal and outside-vault paths.
 5. Inspect the file's complete YAML frontmatter before changing it. Require exactly one top-level `status` property.
-6. Read the current APFS creation and modification timestamps before changing the file, and capture the frontmatter `date_created` value — it is the authoritative creation date you will restore the filesystem to after editing. Require the pre-edit filesystem creation and modification calendar dates in `America/New_York` to match the existing `date_created` and `date_modified` frontmatter dates. If either differs, the file was already inconsistent before this command touched it: stop without writing and report the mismatch; never choose the filesystem or YAML side implicitly.
+6. macOS only (Linux skips this step; see "Platforms"): read the current APFS creation and modification timestamps before changing the file, and capture the frontmatter `date_created` value — it is the authoritative creation date you will restore the filesystem to after editing. Require the pre-edit filesystem creation and modification calendar dates in `America/New_York` to match the existing `date_created` and `date_modified` frontmatter dates. If either differs, the file was already inconsistent before this command touched it: stop without writing and report the mismatch; never choose the filesystem or YAML side implicitly.
 7. If the resolved issue is already closed, make no changes. Report its existing `date_closed` and `reason`; this command closes issues rather than revising prior closure records.
 8. If matching remains ambiguous, show at most five matching open issue paths and ask the user to identify one. Never choose arbitrarily.
 
@@ -86,6 +96,8 @@ This removes live score/rank fields from the closed issue and immediately recalc
 
 ## Reconcile filesystem timestamps
 
+macOS only. Linux skips this section; see "Platforms".
+
 Run this only after `renumber.py --apply` succeeds. By now the file has almost certainly been rewritten atomically by ranking and/or the background watcher, so its inode and APFS creation timestamp have changed and its birthtime reads as today. This is expected — do not treat it as an error and do not assert the inode or creation timestamp are unchanged. Instead, restore both filesystem timestamps from the issue's authoritative frontmatter dates. `SetFile` uses `MM/DD/YYYY` order; use noon to avoid midnight/DST calendar-date drift.
 
 1. Restore the creation timestamp to noon on `date_created` in `America/New_York`:
@@ -98,7 +110,7 @@ Restoring the creation timestamp requires `SetFile -d` against the frontmatter `
 
 ## Verify and report
 
-1. Re-read the selected issue and verify exactly one `status: closed`, the expected `date_closed`, matching `date_modified`, the resolved reason choice, unchanged `stage`, and no `backlog_score` or `backlog_rank`. Confirm the filesystem creation and modification calendar dates match `date_created` and `date_modified` after ranking and timestamp reconciliation — this is the same check as reconcile step 3 and must still hold at report time.
+1. Re-read the selected issue and verify exactly one `status: closed`, the expected `date_closed`, matching `date_modified`, the resolved reason choice, unchanged `stage`, and no `backlog_score` or `backlog_rank`. On macOS only, confirm the filesystem creation and modification calendar dates match `date_created` and `date_modified` after ranking and timestamp reconciliation — this is the same check as reconcile step 3 and must still hold at report time.
 2. Run the rank updater again without `--apply` and require it to report no pending mechanical changes. Missing or invalid ratings on other open issues may remain visible for `/prioritize`; they do not invalidate the closure or prevent valid open issues from being ranked.
 3. If the issue edit fails, do not run the rank updater. If automatic ranking fails after the issue was closed, leave the valid closure metadata in place, report the exact failure plainly, and do not claim the backlog positions are current.
 4. Report the clickable issue path, closure date, recorded reason or `no reason`, and whether automatic ranking was applied and verified.
