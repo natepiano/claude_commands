@@ -17,7 +17,7 @@ Every memory (`~/.claude/projects/*/memory/`; the Mac's over `ssh mac` if it ans
 </Scope>
 
 <Scope mode="rust">
-One target a night. Take `hana` unless LEDGER's last `rust/` entry was hana; otherwise the entry after the last one named in: cargo-liner, bevy_brp, nateroids, obsidian_knife, showrunner.
+One target a night, by weight: hana 12, cargo-liner 3, bevy_brp 2, showrunner 1, obsidian_knife 1, nateroids 1 (of 20). Over LEDGER's last 20 `rust/` entries (N of them), take the target with the largest `weight × N / 20 − its count`; ties go to the heavier weight, then this order.
 - A project: its code against its conventions and `~/rust/nate_style`, and style rules that cost more than they catch.
 - `showrunner`: the showrunner, producer and unit commands under `~/.claude/commands/` with their docs and scripts, against run history (`/history`) and delegate progress logs: steps that repeat work, stall, or wait on the user without need.
 </Scope>
