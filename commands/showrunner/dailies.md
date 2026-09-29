@@ -54,89 +54,104 @@ Read the current state, not memory, and check what you state the way
 
 ## Subjects
 
-Each unit, earliest `eta:` first, so the order itself shows who lands next; a
-unit with no ETA goes after those with one. Then each open topic; then the
-merge branch, only when a merge is held, testing or not pushed. A topic that
-closed since the last report gets none. A subject that needs the user goes
-first, ahead of the ETA order.
+Every unit, every time. Then each open topic; the merge branch is a topic only
+when a merge is held, testing or not pushed. A topic that closed since the last
+report gets none. A topic that only waits on one unit's phase gets no entry of
+its own: it goes in that unit's `waiting_on_it` and shares the unit's ETA.
 
-A topic that only waits on one unit's phase gets no section of its own. It goes
-under that unit as a `waiting on it:` line and shares the unit's `eta:`.
+The renderer orders the sections: subjects that need you first, then units by
+ETA, earliest first, then units with no ETA, then the other topics.
 
 ## Output
 
-```
-**Dailies (<Simple | Page | Elaborate>)**, <ZONE time> / <UTC time>
+The report comes from a fixed template, never written by hand. Write the input
+JSON, run the renderer, and paste its output word for word as the whole report.
+Never edit the output: to change a line, change the input and run it again.
+When the renderer refuses the input (exit 2), fix what it names and run again.
 
-### <unit>, Phase <N> of <M>
-- update: <what it is doing now>
-- eta: <HH:MM ZONE> (unchanged | changed: ±h:mm) | none measured | no ETA stated yet
-- waiting on it: <a topic that lands with this phase, and who waits>
-- needed: <the follow-up, and who does it>
-- then: <what the unit does after this, when it is not simply the next phase>
-
-### <open topic>
-- update: …
-- eta: …
-
-next run at <HH:MM> - nothing needed
+```sh
+python3 ~/.claude/scripts/production/dailies_render.py <scratchpad>/dailies_input.json \
+  --state <scratchpad>/dailies_state.json --log <LOG>
 ```
 
-- **First line:** names the length used, capitalized: `**Dailies (Simple)**, 19:05 PDT / 02:05 UTC`.
-- **Header:** one section header per subject, every unit reported in full.
-- **Title:** a unit title gives `Phase <N> of <M>` from its plan. Work outside a numbered plan gives its place in the unit's queue and what it is: `follow-up 1 of 3 (wording and look polish)`.
-- **update:** what the subject is doing now.
-- **eta:** always present. The unit's latest stated phase ETA, converted to
-  `ZONE`; for a topic, when it lands. Compare it with the ETA the last report
-  gave that subject (the `LOG` line below) and add one note:
-  - `eta: 18:38 PDT (unchanged)`
-  - `eta: 19:05 PDT (changed: +0:27)` or `(changed: -0:10)`
-  - `eta: 18:38 PDT (unchanged, overdue)` when the time has passed with no new one
-  - no note on a subject's first ETA
+- `--state` holds each unit's last reported phase and ETA. The renderer
+  compares this report against it for the change notes, then saves this
+  report's. Keep the same file for the whole production. When it is missing,
+  that report shows no change notes.
+- `--log` appends the `dailies ETAs:` line to `LOG`, so the next report can
+  compare. Write no such line by hand.
 
-  When there is none, never make one up. Send that unit `/unit:eta` in this turn
-  (the unmeasured-ETA rule in `/showrunner:produce`) and show
-  `eta: none measured - requested`.
-- **waiting on it:** only for a topic that lands with this unit's phase, e.g.
-  `waiting on it: the rear-card fix; trunk merges it and re-runs its one red test`.
-- **needed:** only when the subject needs a follow-up that nobody has started:
-  from you (the user), the showrunner or another unit. Say who.
-- **then:** the section's last line, only when what comes next is not simply
-  the plan's next phase. Two cases:
-  - The unit is on work inserted ahead of its plan (a follow-up, or a phase
-    added mid-run) while plan phases are still open. Name the plan phase it
-    goes back to, by number and what it does, and anything queued before it:
-    `then: precompose redesign and dimming, then back to the plan at Phase 41
-    (new tools placed by the arrangement engine)`.
-  - The unit is on its plan's last phase and has more work queued: name it and
-    its source: `then: the hana_organon plan (docs/hana/hana-organon-design.md),
-    six phases, once this phase is merged`. With nothing queued, `then: nothing
-    queued`.
+### Input
 
-  Read the plans and design docs for this, not the unit's queue alone. A unit's
-  own handoff may list only the work in front of it.
-- **Timeline:** after the last section and before the last line, a code block
-  drawing when each unit's phase lands, rows in the same order as the sections.
-  One column per 5 minutes from now (widen the step when the latest ETA is more
-  than 4 hours out, so no row passes about 50 columns). An axis row of hour
-  marks, then one row per unit: `█` from now to its ETA, `░` from the ETA to
-  the top of its range, `→` where a range runs past the axis end, then the ETA
-  and range as text. A unit with no ETA gets `?` and no bar.
+```json
+{
+  "length": "simple",
+  "zone": "America/Los_Angeles",
+  "next_run": "07:28",
+  "units": [
+    {
+      "unit": "tool-based-ui-trunk",
+      "label": "trunk",
+      "phase": "follow-up 3 of 4: look polish",
+      "update": "fixing the Open layout's overlapping members",
+      "eta": {"time": "07:40", "earliest": "07:35", "latest": "07:55", "detail": "checks and build included"},
+      "waiting_on_it": "the cable fix; widget merges it into Phase 18",
+      "needed": "the showrunner: merge the checkpoint",
+      "needs_user": false,
+      "then": "dimming after widget Phase 18, then nothing queued"
+    }
+  ],
+  "topics": [
+    {"title": "CI on init/catalyst", "update": "run 36579701444 is queued", "eta": "no ETA stated yet", "needed": null, "needs_user": false}
+  ]
+}
+```
 
-  ```
-           20:00       21:00       22:00       23:00
-  trunk    ███████ 20:30
-  GM       █████████████████████████████████░░░░→ 22:40 (to 04:59)
-  widget   ██████████████████████████████████ 22:43
-  ```
-- **Last line:** always the next scheduled run, from the schedule after any
-  restart: `next run at 20:10 - nothing needed` when no subject has a `needed:`,
-  or `next run at 20:10` when one does. With no schedule running, `no run
-  scheduled - nothing needed`.
-  The report replaces the turn's `— waiting on:` line.
+| Field | Rule |
+| --- | --- |
+| `length` | `simple`, `page` or `elaborate`, from the argument. |
+| `zone` | `ZONE`, as an IANA name. |
+| `next_run` | The next scheduled run, `HH:MM` in `ZONE`, after any restart. Leave it out when no schedule runs. |
+| `unit` | The unit's session name. |
+| `label` | The timeline row name, at most 8 characters. Defaults to the unit name without `-unit`. |
+| `phase` | `Phase <N> of <M>: <what it changes>` from the unit's plan. Work outside a numbered plan gives its place in the unit's queue: `follow-up <K> of <Q>: <what it changes>`. The renderer refuses anything else. |
+| `update` | What the unit is doing now, one line. The length sets how long (below). |
+| `eta` | The unit's latest stated phase ETA, in `ZONE`. `time` is `HH:MM`, `+1` for tomorrow (`11:21+1`); add `earliest` and `latest` when the unit gave a range. With no ETA, `none` in place of `time`, one of: `none measured - requested` (after sending that unit `/unit:eta` in this turn, the unmeasured-ETA rule in `/showrunner:produce`), `none measured`, `no ETA stated yet`. Never make one up. `detail` is an optional short note, such as what the time covers. |
+| `waiting_on_it` | Only for a topic that lands with this unit's phase, and who waits. |
+| `needed` | Only when the subject needs a follow-up nobody has started, from you (the user), the showrunner or another unit. Say who. |
+| `needs_user` | `true` when the subject waits on you. It then goes first. |
+| `then` | See below. Required on a follow-up and on a plan's last phase. |
+| topic `title`, `update`, `eta` | The topic's name, what it is doing now, and when it lands, as text. |
 
-After the report, write one `LOG` line with each subject's ETA as reported, so
-the next report can compare: `- HH:MM <zone>: dailies ETAs: <subject> <eta>; …`.
+**`then`** says what the unit does after this, when it is not simply the plan's
+next phase:
+- On work inserted ahead of its plan (a follow-up, or a phase added mid-run)
+  while plan phases are still open: name the plan phase it goes back to, by
+  number and what it does, and anything queued before it: `precompose redesign
+  and dimming, then back to the plan at Phase 41 (new tools placed by the
+  arrangement engine)`.
+- On its plan's last phase with more work queued: name it and its source: `the
+  hana_organon plan (docs/hana/hana-organon-design.md), six phases, once this
+  phase is merged`. With nothing queued, `nothing queued`.
+
+Read the plans and design docs for this, not the unit's queue alone. A unit's
+own handoff may list only the work in front of it.
+
+### What the renderer writes
+
+- **First line:** the length and both times: `**Dailies (Simple)**, 19:05 PDT / 02:05 UTC`.
+- **One section per subject:** `### <unit>, <phase>`, then `update:`, `eta:`,
+  and `waiting on it:`, `needed:` and `then:` when given.
+- **eta note:** against the last report's ETA for the same phase:
+  `(unchanged)`, `(changed: +0:27)`, or `(unchanged, overdue)` once the time
+  has passed. No note on a subject's first ETA or a new phase. A range follows
+  the note.
+- **Timeline:** a code block after the sections. Each row is white from now to
+  the ETA, with a green cell at the earliest time and a red cell at the latest;
+  `→` means the latest runs past the axis end; `?` means no ETA.
+- **Last line:** `next run at 20:10 - nothing needed` when no subject has a
+  `needed:`, `next run at 20:10` when one does, or `no run scheduled` without a
+  schedule. The report replaces the turn's `— waiting on:` line.
 
 ## Length
 
@@ -146,8 +161,9 @@ the next report can compare: `- HH:MM <zone>: dailies ETAs: <subject> <eta>; …
 | `page` | The `simple` line plus one more sentence of brief context: what a named thing is (a helper, seat, round or check) and why it matters now. Example: "fifth pass on the app's wording has started; the fourth left 16 tests expecting the old words. Trunk hands each pass to a short-lived helper agent, and each can run out of room partway, so the work takes several passes." |
 | `elaborate` | More on each subject: what is moving or at risk gets the most, what is only waiting the least. Up to two pages for the whole report, and only as long as the state needs. The user asks when they want more. |
 
-Every length keeps the same output: the same headers, `update:`, `eta:`,
-`needed:` and last line. Only the `update:` text grows.
+Every length keeps the same template; only the `update:` text grows. An
+`update` is always one line, at most 240 characters for `simple` and 480 for
+`page`; the renderer refuses a longer one.
 
 For every length:
 - Plain words. Technical terms are fine where they are the right ones.
