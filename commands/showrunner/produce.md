@@ -233,6 +233,7 @@ one-unit note: the user sees every unit on every tick, each checked in full.
 A `/showrunner:dailies` the user runs takes the next tick's slot: it runs the
 script, and then restarts the timer so the next tick comes N minutes after
 that report (`/showrunner:dailies` → Status check and clock).
+`/showrunner:interval <minutes>` changes N.
 
 Log the timer's `UNIT` and its next fire. Then check that this session is on
 the quota alert list (<QuotaAlert/>).
