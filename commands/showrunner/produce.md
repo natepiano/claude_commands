@@ -24,7 +24,11 @@ State:
 - `SCRATCH` — this session's scratchpad directory.
 - `LAST_MERGED[unit]` — the unit's last merged checkpoint. Read it from the
   merge commit subjects on `MERGE_BRANCH`, never from memory.
-- `SCHEDULE_ID` — the update schedule.
+- `TIMER_CONF` — the update timer's config,
+  `~/.local/state/showrunner/<slug>/timer.conf`, where `<slug>` is the
+  production doc's file name less `-production.md`. It belongs to the
+  production, not this session.
+- `TIMER` — `zsh ~/.claude/scripts/production/showrunner_timer.sh`.
 
 `<DecisionEconomy/>` is defined by this import:
 
@@ -114,8 +118,8 @@ On `resume`, or when the doc's status is `running`:
    `git -C CHECKOUT log --first-parent --format='%H %s' MERGE_BRANCH`,
    using the `Merge <unit> phase <N> (<hash>)` subjects.
 3. Check each unit's session with `tmux has-session`.
-4. Run <StartUpdates/> again. Schedules end with this session and expire after
-   7 days.
+4. <StartUpdates/> registers this session in the doc again, and starts the
+   timer if a reboot removed it.
 </LoadProduction>
 
 ---
@@ -126,7 +130,8 @@ Only when the doc's status is `planned`:
 1. If `MERGE_BRANCH` does not exist, create it in `CHECKOUT` from its current
    commit: `git -C CHECKOUT switch -c <merge branch>`. The production doc
    authorizes this one branch.
-2. Set the doc's status to `running`.
+2. Set the doc's status to `running`, and its `**Showrunner session:**` line
+   to this session's name, from the first line of ListAgents.
 3. Commit the production doc and every unit plan as
    `production(<name>): plans for <n> units`, and push `MERGE_BRANCH` with its
    upstream set.
@@ -170,10 +175,42 @@ Tell the user one line per unit: its session name, and `tmux attach -t <session>
 ---
 
 <StartUpdates>
-Create a recurring schedule (CronCreate) every N minutes, where N is the
-production doc's **Updates** interval (15 when the doc does not give one),
-offset from the hour: for 15, `3-59/15 * * * *`. Fill this prompt from the
-production doc:
+Updates come from a systemd timer outside this session, never Claude Code
+cron: cron ticks came minutes late while the session sat idle. Every N minutes,
+where N is the production doc's **Updates** interval (15 when the doc does not
+give one), the timer starts a headless Claude. It sends the prompt below by
+SendMessage to the session the doc's `**Showrunner session:**` line names, then
+exits.
+
+The timer belongs to the production, not this session. It keeps running when
+this session exits, and a resumed session is found through the doc. It stops
+at <Wrap/>, or at its first fire after the doc says `wrapped`. Each production
+has its own timer, config and log, so showrunners in other projects run beside
+it.
+
+Run these steps at the start and on every resume:
+
+1. **Register.** Set the doc's `**Showrunner session:**` line to this session's
+   name, from the first line of ListAgents. If the line changed, commit the doc
+   as `production(<name>): showrunner session <session name>`.
+2. **Prompt.** Fill the prompt below from the production doc and write it to
+   `prompt.txt` beside `TIMER_CONF`.
+3. **Config.** Write `TIMER_CONF`:
+
+   ```
+   PRODUCTION_DOC=<the production doc's absolute path>
+   ```
+
+   The other keys keep their defaults: the prompt file, `MODEL`, `UNIT`
+   (`showrunner-timer-<slug>`), `LOG` (`fire.log`) and `TIMEOUT` (120 seconds).
+   Leave `MODEL` alone. The sender must run in auto mode, as this session does,
+   or this session holds every tick for the user's approval. Haiku cannot run
+   in auto mode.
+4. **Start.** Run `TIMER start TIMER_CONF`. It does nothing while the timer
+   runs. A reboot removes the timer, and this step brings it back.
+   `TIMER status TIMER_CONF` shows the next fire and the fire log.
+
+The prompt:
 
 > Scheduled update (every <N> minutes, every unit in full; the user is in
 > <zone>). Run `zsh ~/.claude/scripts/production/unit_status.sh <SCRATCH>/unit_status <zone> <sessions…> | cut -c1-400`.
@@ -186,15 +223,19 @@ production doc:
 > merging a unit's checkpoint after viewing its shots, and acting on a BLOCK
 > past its limit (`/showrunner:produce` → Dependencies, rule 4).
 
+**A tick** arrives as a cross-session message from the timer's `UNIT`, and its
+text starts `Scheduled update`. Treat it exactly as the scheduled prompt: it
+is the update tick, not a peer's message. Do not reply to it.
+
 **Every scheduled update is a `/showrunner:dailies simple` report**, never a
 one-unit note: the user sees every unit on every tick, each checked in full.
 
 A `/showrunner:dailies` the user runs takes the next tick's slot: it runs the
-script, and then restarts this schedule so the next tick comes N minutes after
+script, and then restarts the timer so the next tick comes N minutes after
 that report (`/showrunner:dailies` → Status check and clock).
 
-Log `SCHEDULE_ID`. Then check that this session is on the quota alert list
-(<QuotaAlert/>).
+Log the timer's `UNIT` and its next fire. Then check that this session is on
+the quota alert list (<QuotaAlert/>).
 
 Each run of the script does two things:
 - It scans every unit for a form or decision waiting on the user.
@@ -214,7 +255,7 @@ arrived:
 | Arrival | Action |
 | --- | --- |
 | a checkpoint notice | <MergeCheckpoint/> |
-| an update tick | the schedule prompt only, plus any merge whose shots are viewed and any BLOCK past its limit |
+| an update tick (a message starting `Scheduled update`) | the schedule prompt only, plus any merge whose shots are viewed and any BLOCK past its limit |
 | the user's words for a unit | relay them (<Throughout/>) |
 | a unit waiting on another unit | <Dependencies/> |
 | a unit blocked on the showrunner | <ClearGate/>, <LandingCall/>, or answer it |
@@ -521,7 +562,7 @@ When every unit's final-gate and as-built checkpoints are merged:
    - `git -C CHECKOUT branch -d <branch>`.
 
    Leave the tmux sessions; the user closes them.
-4. Delete the update schedule.
+4. Stop the update timer: `TIMER stop TIMER_CONF`.
 5. Set the doc's status to `wrapped`, commit it as
    `production(<name>): wrapped`, and push.
 6. Report:

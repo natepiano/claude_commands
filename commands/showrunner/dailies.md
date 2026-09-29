@@ -9,16 +9,16 @@ In film, dailies are what the executive producer watches each day to see how
 the shoot is going. Here the showrunner reports the production to the executive
 producer: the user. Run it in the showrunner session during `/showrunner:produce`,
 whose state (`PRODUCTION_DOC`, `LOG`, `ZONE`, `UNITS`, `CHECKOUT`,
-`MERGE_BRANCH`) it uses.
+`MERGE_BRANCH`, `TIMER_CONF`, `TIMER`) it uses.
 
 **Usage:** `/showrunner:dailies [simple|page|elaborate]`. With no argument,
 `simple`. With any other argument, name the three choices and stop.
 
 ## Status check and clock
 
-While `/showrunner:produce` runs scheduled updates (its `SCHEDULE_ID` in `LOG`),
-a dailies the user runs takes the next tick's place. N is the production doc's
-**Updates** interval. Two steps do that:
+While `/showrunner:produce` runs scheduled updates (its update timer,
+`TIMER_CONF`), a dailies the user runs takes the next tick's place. N is the
+production doc's **Updates** interval. Two steps do that:
 
 1. **Check every unit.** Before Gather, run the status script that the
    scheduled-update prompt names. It checks every unit, each time: that its
@@ -26,15 +26,13 @@ a dailies the user runs takes the next tick's place. N is the production doc's
    and its latest step and ETA. Put anything it flags first (SESSION GONE,
    CLAUDE NOT RUNNING, FORM WAITING, a usage limit, a DECISION), as a scheduled
    tick does.
-2. **Reset the clock.** After the report, restart the schedule so the next tick
-   comes N minutes after this report. CronList to find the job. CronDelete it.
-   CronCreate it again with the prompt the last scheduled tick delivered, word
-   for word, and the minute field `<current minute mod N>-59/N`: at 19:21 with
-   N = 15, that is `6-59/15 * * * *`, so the next tick is 19:36. Log the new
-   `SCHEDULE_ID`.
+2. **Reset the clock.** After the report, restart the timer so the next tick
+   comes N minutes after this report. Run `TIMER stop TIMER_CONF`, then
+   `TIMER start TIMER_CONF`: at 19:21 with N = 15, the next tick is 19:36. Log
+   the next fire that `start` prints.
 
-A scheduled tick skips both steps. It has run the script already, and a restart
-at its own fire time would move the schedule by the scheduler's delay each tick.
+A scheduled tick skips both steps. It has run the script already, and its clock
+is already right.
 
 ## Gather
 
