@@ -157,12 +157,17 @@ invoke_mend() {
 # which other members share the invocation never changes a given crate's
 # warnings. The workspace-wide sweep it used to provide incidentally now runs
 # once at the push gate (validate_ci.sh), where it belongs.
+#
+# Features come from the caller too. A hardcoded --all-features made every
+# dev-loop doc run resolve a feature set that no check, clippy or test run
+# shares, and so compile its own copy of the dependency tree. The push gate
+# passes --all-features itself, where full coverage is the point.
 invoke_doc() {
     if ! lint_config_enabled doc; then
         lint_config_skip_notice doc "cargo doc $*"
         return 0
     fi
-    run env RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --all-features "$@"
+    run env RUSTDOCFLAGS="-D warnings" cargo doc --no-deps "$@"
 }
 
 # Keep a project's target directory under a size budget after cargo-port's

@@ -3,33 +3,47 @@
 #
 # Work Orders list exact invocations of this script; the delegate composes no
 # cargo flags and makes no scope choices. Cargo's default target selection
-# compiles a package's examples even under `-p <pkg>`, so every dev-loop
-# subcommand pins explicit targets (--lib/--bins, derived from cargo metadata).
-# Nothing below `final` compiles examples or uses --all-targets (mend excepted,
-# see `lint`); `final` is the
-# plan-final full gate, run by the orchestrator, never by a phase delegate.
+# compiles examples, so every dev-loop subcommand pins explicit targets
+# (--lib/--bins/--tests). Nothing below `final` compiles examples or uses
+# --all-targets (mend excepted, see `lint`); `final` is the plan-final full
+# gate, run by the orchestrator, never by a phase delegate.
+#
+# Package selection is always --workspace, with default features. Cargo
+# resolves features per invocation from the selected packages, so `-p <pkg>`
+# gives every member its own feature set for bevy and the rest of the
+# dependency tree, and each set is a separate compile of that tree in the
+# shared target directory: nine to eleven copies of bevy_render across the
+# members, which evict one another under the sweep budget and rebuild in
+# minutes each time a phase moves to a new package. --workspace resolves one
+# set for the whole tree, so every command below reuses one compiled copy.
+# The package argument still decides what runs and what is reported: nextest
+# filters to it with -E 'package(<pkg>)', and --features qualifies its list
+# with it. Only the compile covers the workspace.
 #
 # The lint stages — mend, fmt, clippy, doc — are gated by config/lint.conf (edit
 # it with /lint_config), so one switch silences a check across /clippy, the fix
-# pipeline, and every delegate phase. A phase runs all four over its package;
-# only the branch-wide style review is left to the plan-final gate. A gated-off check prints a SKIPPED line and the command
-# still exits 0. Scope is never configurable: the target pinning above is a
-# correctness constraint, not a preference. cargo check and cargo nextest are
-# never gated — a phase that compiles nothing has verified nothing.
+# pipeline, and every delegate phase. A phase runs all four; only the
+# branch-wide style review is left to the plan-final gate. A gated-off check
+# prints a SKIPPED line and the command still exits 0. Scope is never
+# configurable: the target pinning and the single package selection above are
+# correctness and cache constraints, not preferences. cargo check and cargo
+# nextest are never gated — a phase that compiles nothing has verified nothing.
 #
 # Usage:
-#   verify.sh check <package>              fast compile feedback (lib + bins)
-#   verify.sh test <package>               unit + integration tests
-#                                          (lib + bins + tests)
+#   verify.sh check <package>              fast compile feedback (workspace
+#                                          lib + bins)
+#   verify.sh test <package>               the package's unit + integration tests
+#                                          (workspace lib + bins + tests built)
 #   verify.sh test <package> <int_test>    one named integration test target,
 #                                          for re-running it alone
-#   verify.sh lint <package>               mend --fix, nightly fmt, scoped clippy
-#                                          (warnings denied), then rustdoc — every
-#                                          stage gated by config/lint.conf
+#   verify.sh lint <package>               mend --fix, nightly fmt, workspace
+#                                          clippy (warnings denied), then rustdoc
+#                                          — every stage gated by config/lint.conf
 #   … [--features <list>]                  check, test, and lint accept one trailing
 #                                          `--features a,b` when the Work Order names
 #                                          it: code behind a non-default feature has
-#                                          no other route to a scoped gate
+#                                          no other route to a gate. Names without a
+#                                          `/` are qualified as <package>/<name>
 #   verify.sh fmt <package>                format only (checkpoint-commit backstop)
 #                                          — gated by config/lint.conf
 #   verify.sh example <package> <name>     clippy one example (only when the
@@ -64,23 +78,13 @@ usage() {
     sed -n '/^# Usage:/,/^$/p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//' >&2
 }
 
-TARGET_FLAGS_PY='
+MEMBER_PY='
 import json
 import sys
 
 package_name = sys.argv[1]
 meta = json.load(sys.stdin)
-lib_kinds = {"lib", "rlib", "dylib", "cdylib", "staticlib", "proc-macro"}
-for package in meta["packages"]:
-    if package["name"] != package_name:
-        continue
-    kinds = {kind for target in package["targets"] for kind in target["kind"]}
-    flags = []
-    if kinds & lib_kinds:
-        flags.append("--lib")
-    if "bin" in kinds:
-        flags.append("--bins")
-    print(" ".join(flags))
+if any(package["name"] == package_name for package in meta["packages"]):
     sys.exit(0)
 print("verify.sh: package " + package_name + " not found in workspace", file=sys.stderr)
 sys.exit(2)
@@ -109,18 +113,13 @@ print("verify.sh: package " + package_name + " not found in workspace", file=sys
 sys.exit(2)
 '
 
-# Emits the explicit target flags (--lib and/or --bins) for a package, so
-# lib-only and bin-only crates both work without compiling examples.
-target_flags() {
-    local flags
-    if ! flags="$(cargo metadata --no-deps --format-version 1 | "$PY" -c "$TARGET_FLAGS_PY" "$1")"; then
+# The compile covers the workspace, so a misspelled package would otherwise
+# pass check and lint silently and leave nextest with an empty filter. Fail it
+# as a usage error instead.
+require_member() {
+    if ! cargo metadata --no-deps --format-version 1 | "$PY" -c "$MEMBER_PY" "$1"; then
         exit 2
     fi
-    if [[ -z "$flags" ]]; then
-        echo "verify.sh: package $1 has no lib or bin targets" >&2
-        exit 2
-    fi
-    printf '%s' "$flags"
 }
 
 example_features() {
@@ -128,13 +127,29 @@ example_features() {
         | "$PY" -c "$EXAMPLE_FEATURES_PY" "$1" "$2"
 }
 
+# Qualify each feature name in a comma list with the package, leaving names
+# that already carry a `/` (dep/feature, member/feature) as written. Under
+# --workspace an unqualified name turns the feature on in every selected member
+# that defines one by that name, and test-support and test each exist in two.
+qualify_features() {
+    local pkg="$1" list="$2" name out=""
+    local IFS=,
+    for name in $list; do
+        [[ -z "$name" ]] && continue
+        [[ "$name" != */* ]] && name="$pkg/$name"
+        out="${out:+$out,}$name"
+    done
+    printf '%s' "$out"
+}
+
 # Optional trailing `--features <list>` on check, test, and lint. The Work Order
 # names the exact list; the delegate still composes no flags of its own. Any
 # other leftover argument is a usage error rather than something to pass through.
+# The caller sets PKG before calling this.
 FEATURE_FLAGS=()
 take_features() {
     if [[ $# -gt 0 && "$1" == "--features" && -n "${2:-}" ]]; then
-        FEATURE_FLAGS=(--features "$2")
+        FEATURE_FLAGS=(--features "$(qualify_features "$PKG" "$2")")
         shift 2
     fi
     if [[ $# -ne 0 ]]; then
@@ -234,9 +249,8 @@ case "$CMD" in
         PKG="${1:?verify.sh check <package>}"
         shift
         take_features "$@"
-        FLAGS="$(target_flags "$PKG")"
-        # shellcheck disable=SC2086
-        run cargo check -p "$PKG" $FLAGS "${FEATURE_FLAGS[@]}"
+        require_member "$PKG"
+        run cargo check --workspace --lib --bins "${FEATURE_FLAGS[@]}"
         ;;
     test)
         PKG="${1:?verify.sh test <package> [integration_test]}"
@@ -247,38 +261,47 @@ case "$CMD" in
             shift
         fi
         take_features "$@"
+        require_member "$PKG"
         # --no-fail-fast: nextest cancels every remaining test after the first
         # failure, so one broken test silently hides the rest of the suite. A
         # phase gate has to report the whole result, not the first stop.
+        # The build covers the workspace (see the header); -E runs only this
+        # package's tests.
         if [[ -n "$TARGET" ]]; then
-            run_nextest --no-fail-fast -p "$PKG" --test "$TARGET" "${FEATURE_FLAGS[@]}"
+            # Integration test target names are unique across the workspace,
+            # so --test builds just that binary, under the workspace's
+            # feature resolution.
+            run_nextest --no-fail-fast --workspace --test "$TARGET" \
+                -E "package($PKG)" "${FEATURE_FLAGS[@]}"
         else
-            FLAGS="$(target_flags "$PKG")"
-            # --tests adds the package's integration targets, matching what the
-            # lint half already compiles under clippy. Without it a phase could
+            # --tests adds the integration targets, matching what the lint
+            # half already compiles under clippy. Without it a phase could
             # lint an integration test, pass its gate, and checkpoint without
-            # ever running it. The build cost is already sunk by lint; the
-            # measured runtime cost is seconds, because the expensive
-            # compile-fail suites are #[ignore]d and .config/nextest.toml keeps
-            # tool_id_boundary's downstream cases out of the default profile.
-            # shellcheck disable=SC2086
-            run_nextest --no-fail-fast -p "$PKG" $FLAGS --tests "${FEATURE_FLAGS[@]}"
+            # ever running it. The measured runtime cost is seconds, because
+            # the expensive compile-fail suites are #[ignore]d and
+            # .config/nextest.toml keeps tool_id_boundary's downstream cases
+            # out of the default profile.
+            run_nextest --no-fail-fast --workspace --lib --bins --tests \
+                -E "package($PKG)" "${FEATURE_FLAGS[@]}"
         fi
         ;;
     lint)
         PKG="${1:?verify.sh lint <package>}"
         shift
         take_features "$@"
+        require_member "$PKG"
         # Order: mend rewrites first, fmt formats what mend wrote, then clippy
         # and rustdoc read the settled tree. Every stage is gated by lint.conf.
         # mend is the one stage below `final` that passes --all-targets: it
-        # needs the package's test and example targets to see every import
-        # and visibility site, and it compiles only this package's own targets.
+        # needs the test and example targets to see every import and
+        # visibility site. It covers the workspace like the other stages, so
+        # --fix can also rewrite a member the phase did not edit, when this
+        # phase's change left an item there unused or over-visible.
         if lint_config_enabled mend; then
             MEND_LOG="$(mktemp)"
             # pipefail is set, so a failing mend fails the pipeline; the log
             # only decides which message names the failure.
-            if ! invoke_mend -p "$PKG" --fix "${FEATURE_FLAGS[@]}" 2>&1 | tee "$MEND_LOG"; then
+            if ! invoke_mend --workspace --fix "${FEATURE_FLAGS[@]}" 2>&1 | tee "$MEND_LOG"; then
                 if grep -qiE 'rolled back|revert' "$MEND_LOG"; then
                     echo "verify.sh: cargo mend --fix rolled its rewrites back; the tree reproduces it — run /mend_fix" >&2
                 else
@@ -289,19 +312,12 @@ case "$CMD" in
             fi
             rm -f "$MEND_LOG"
         else
-            lint_config_skip_notice mend "cargo mend --all-targets -p $PKG --fix"
+            lint_config_skip_notice mend "cargo mend --all-targets --workspace --fix"
         fi
+        # fmt compiles nothing, so it stays on the package the phase edited.
         fmt_cargo -p "$PKG"
-        # target_flags shells out to cargo metadata, so resolve it only when
-        # clippy is actually going to run.
-        if lint_config_enabled clippy; then
-            FLAGS="$(target_flags "$PKG")"
-            # shellcheck disable=SC2086
-            invoke_clippy -p "$PKG" $FLAGS --tests "${FEATURE_FLAGS[@]}"
-        else
-            lint_config_skip_notice clippy "cargo clippy -p $PKG"
-        fi
-        invoke_doc -p "$PKG" "${FEATURE_FLAGS[@]}"
+        invoke_clippy --workspace --lib --bins --tests "${FEATURE_FLAGS[@]}"
+        invoke_doc --workspace "${FEATURE_FLAGS[@]}"
         ;;
     fmt)
         PKG="${1:?verify.sh fmt <package>}"
@@ -313,10 +329,15 @@ case "$CMD" in
         FEATURES="$(example_features "$PKG" "$NAME")"
         # clippy, not check: `lint` never sees an example, so a check here let
         # lint errors in a changed example reach the merge branch twice.
+        # Example names are unique across the workspace, so --workspace
+        # --example builds this one example under the workspace's feature
+        # resolution. A required feature that resolution leaves off still
+        # makes its own variant; qualify_features names it on this package.
         if [[ -n "$FEATURES" ]]; then
-            invoke_clippy -p "$PKG" --example "$NAME" --features "$FEATURES"
+            invoke_clippy --workspace --example "$NAME" \
+                --features "$(qualify_features "$PKG" "$FEATURES")"
         else
-            invoke_clippy -p "$PKG" --example "$NAME"
+            invoke_clippy --workspace --example "$NAME"
         fi
         ;;
     example-test)
@@ -324,9 +345,10 @@ case "$CMD" in
         NAME="${2:?verify.sh example-test <package> <name>}"
         FEATURES="$(example_features "$PKG" "$NAME")"
         if [[ -n "$FEATURES" ]]; then
-            run_nextest -p "$PKG" --example "$NAME" --features "$FEATURES"
+            run_nextest --workspace --example "$NAME" -E "package($PKG)" \
+                --features "$(qualify_features "$PKG" "$FEATURES")"
         else
-            run_nextest -p "$PKG" --example "$NAME"
+            run_nextest --workspace --example "$NAME" -E "package($PKG)"
         fi
         ;;
     final)

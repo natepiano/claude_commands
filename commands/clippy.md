@@ -222,10 +222,9 @@ Check `git diff` after running to determine if fmt applied any changes.
 </RunFmt>
 
 <RunClippy>
-The `lint` wrapper supplies `--all-targets --all-features -- -D warnings` and
-resolves package scope per run: only the workspace members the working tree
-changed, widening to `--workspace` when a root manifest, lockfile, or shared
-tool config changed, when nothing changed, or when over half the members did.
+The `lint` wrapper supplies `--all-targets -- -D warnings` with default
+features, plus `--workspace` in a multi-member workspace, so every lint run
+shares one compiled dependency tree; the push gate adds `--all-features`.
 Pass `--workspace` or `-p <pkg>` in `$ARGUMENTS` to choose the scope yourself.
 
 Execute: `~/.claude/scripts/lint/lint clippy ${ARGUMENTS:-}`

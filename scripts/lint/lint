@@ -24,14 +24,15 @@ Usage:
   lint sweep [--dry-run]          hold the target directory under a size budget
                                   (cargo-port's last lint command)
 
-Scope is resolved per run: mend, clippy, clippy-tests, doc, and nextest cover
-only the workspace members the working tree changed, widening to --workspace
-when a root manifest, lockfile, or shared tool config changed, when nothing
-changed, or when over half did. Pass --workspace or -p <pkg> to choose the
-scope yourself and skip resolution — gates that must cover everything
-(validate_ci.sh) pass --workspace explicitly. --manifest-path does NOT skip
-resolution: it names a manifest, not a package set, so resolution runs against
-that manifest's tree instead of the working directory. fmt is always --all: it
+Scope is resolved per run: in a workspace with more than one member, mend,
+clippy, clippy-tests, doc, and nextest cover --workspace; a single-crate
+project gets no scope flags. Features are the default set unless the caller
+passes its own (the push gate passes --all-features). One package selection
+and one feature set for every run is what lets them all share one compiled
+dependency tree. Pass --workspace or -p <pkg> to choose the scope yourself and
+skip resolution. --manifest-path does NOT skip resolution: it names a
+manifest, not a package set, so resolution runs against that manifest's tree
+instead of the working directory. fmt is always --all: it
 compiles nothing, so the wider scope is free. sweep takes no scope either: it
 removes the least recently used build output from the target directory of the
 workspace in the current directory, cargo-port's cwd, until it fits
@@ -46,10 +47,13 @@ EOF
 }
 
 
-# Package scope. A workspace-wide lint recompiles every member on every run,
-# so this narrows to the members the working tree actually changed. It stays
-# out of the way when the caller already picked a PACKAGE scope -- --workspace
-# from a gate that must cover everything, or -p from a targeted run.
+# Package scope. Every run covers the whole workspace: cargo resolves features
+# from the selected packages, so narrowing to the members the working tree
+# changed gave each member set its own feature resolution and its own compiled
+# copy of the dependency tree, and those copies evicted one another. With one
+# selection, an unchanged member is a fingerprint check, not a recompile. It
+# stays out of the way when the caller already picked a PACKAGE scope --
+# --workspace from a gate, or -p from a targeted run.
 #
 # --manifest-path is deliberately not in that list, though it used to be. It
 # names a manifest, not a package set: aimed at a virtual workspace root it
@@ -57,8 +61,7 @@ EOF
 # per-project driver that passes it -- cargo-port's lint commands, the fix pipeline's
 # agent prompts -- silently lint the whole workspace, with no --workspace in
 # the argv to reveal it. The full argv goes to scope.py instead, which reads
-# the manifest path out of it and resolves against that tree. See scope.py for
-# the widen rules.
+# the manifest path out of it and resolves against that tree.
 lint_scope() {
     local arg
     for arg in "$@"; do
@@ -91,9 +94,9 @@ case "$CMD" in
   mend)         resolve_scope "$@"
                 invoke_mend ${SCOPE[@]+"${SCOPE[@]}"} "$@" ;;
   clippy)       resolve_scope "$@"
-                invoke_clippy ${SCOPE[@]+"${SCOPE[@]}"} --all-targets --all-features "$@" ;;
+                invoke_clippy ${SCOPE[@]+"${SCOPE[@]}"} --all-targets "$@" ;;
   clippy-tests) resolve_scope "$@"
-                invoke_clippy ${SCOPE[@]+"${SCOPE[@]}"} --all-features --tests "$@" ;;
+                invoke_clippy ${SCOPE[@]+"${SCOPE[@]}"} --tests "$@" ;;
   doc)          resolve_scope "$@"
                 invoke_doc ${SCOPE[@]+"${SCOPE[@]}"} "$@" ;;
   fmt)          fmt_cargo --all "$@" ;;

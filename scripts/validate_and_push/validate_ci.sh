@@ -193,7 +193,10 @@ run_autofix_step "rustfmt" env LINT_CONFIG_FORCE=1 "$LINT_CMD" fmt
 
 run_autofix_step "taplo" taplo fmt
 
-run_step "clippy" env LINT_CONFIG_FORCE=1 "$LINT_CMD" clippy --workspace
+# --all-features on clippy and rustdoc: the lint CLI and the dev loop run the
+# default feature set, so the whole tree shares one compiled copy of its
+# dependencies. The push gate is where feature-gated code gets covered.
+run_step "clippy" env LINT_CONFIG_FORCE=1 "$LINT_CMD" clippy --workspace --all-features
 
 # Cross-target clippy for the triples listed in CROSS_TARGETS_FILE. Read into an
 # array first, so no step can drain the loop's stdin.
@@ -215,15 +218,14 @@ if [ "${#CROSS_TARGETS[@]}" -gt 0 ]; then
       echo "!!! Install it with: rustup target add ${target}"
       exit 1
     fi
-    run_step "clippy (${target})" env LINT_CONFIG_FORCE=1 "$LINT_CMD" clippy --workspace --target "$target"
+    run_step "clippy (${target})" env LINT_CONFIG_FORCE=1 "$LINT_CMD" clippy --workspace --all-features --target "$target"
   done
 fi
 
-# rustdoc across every member. `lint doc` scopes to changed members like the
-# other checks, so the dev-time run cannot see a doc link that rotted in an
-# untouched crate when a public item was renamed elsewhere. This is the sweep
-# that catches it, and the only place cargo doc runs workspace-wide.
-run_step "rustdoc" env LINT_CONFIG_FORCE=1 "$LINT_CMD" doc --workspace
+# rustdoc across every member with every feature on. The dev-time run covers
+# the workspace with default features, so it cannot see a doc link that
+# rotted behind a non-default feature. This is the sweep that catches it.
+run_step "rustdoc" env LINT_CONFIG_FORCE=1 "$LINT_CMD" doc --workspace --all-features
 
 run_step "nextest" "$LINT_CMD" nextest --workspace --all-features --tests
 
