@@ -1,7 +1,7 @@
 ## communication
 
 ### word list
-- The forbidden-words list lives at `~/rust/nate_style/rust/forbidden-words.md`. It is enforced via `/rust_style` and `/style_eval` (loaded with the style guide), not at session start. Don't use those words in code, comments, or prose.
+- The forbidden-words list lives at `~/rust/nate_style/rust/forbidden-words.md`. `/rust_style` and `/style_eval` load it with the style guide; it is not loaded at session start. Three hooks enforce it in every session (`/banned_word_hook` turns them off and on): two PostToolUse hooks check each tool call and block on a match, and a Stop hook checks each turn's prose. Don't use those words in code, comments, or prose.
 
 ## decision criteria
 Applies to every session when coding and reviewing code. `/unit:delegate` imports the same file, where it defines `<DecisionEconomy/>`.
@@ -11,7 +11,7 @@ Applies to every session when coding and reviewing code. `/unit:delegate` import
 ## python
 - basedpyright (zed's LSP) must report zero errors and zero warnings
 - **NEVER** use file-level type ignores (e.g. `# pyright: reportAny=false` at top of file)
-- Avoid `Any`: annotate all signatures; use `TypedDict` for dicts with known keys; for stdlib `Any` returns (`json.loads()` etc.), annotate with a `TypedDict`/specific type. Last resort only: line-level `# pyright: ignore[reportAny]` on the specific line. Reference: `~/.claude/scripts/bevy_dependency_check.py`
+- Avoid `Any`: annotate all signatures; use `TypedDict` for dicts with known keys; for stdlib `Any` returns (`json.loads()` etc.), annotate with a `TypedDict`/specific type. Last resort only: line-level `# pyright: ignore[reportAny]` on the specific line. Reference: `~/.claude/scripts/bevy_migration_plan/bevy_migration_dependency_check.py`
 - **ALWAYS** `uv pip install`, never bare `pip install`
 
 ## running long commands (builds, tests, pushes)
@@ -27,8 +27,8 @@ Applies to every session when coding and reviewing code. `/unit:delegate` import
 
 ## git
 - **`git stash` is denied outright and no flag gets past it.** `permissions.deny` carries `Bash(git stash)`, `Bash(git stash *)` and `Bash(git stash:*)`. **The `allow` entries for `git stash list` do not make the read form runnable** — `Bash(git stash *)` matches it too, and deny wins. Do not soften this into "only the mutating forms are denied": that reads as licence to check for a stash before handing off, and the check itself gets refused.
-- **Never switch a remote to HTTPS to work around an SSH failure.** `url.git@github.com:.insteadOf` in `~/.config/git/config` rewrites an HTTPS URL back to SSH before any transport runs, so the HTTPS remote fails with an SSH error and the change buys nothing. Fix the cause instead — most often a locked vault, the clause below.
-- **A locked 1Password vault reads as a credentials problem and is not one.** The signature is `sign_and_send_pubkey: signing failed for ED25519 … communication with agent failed`, then `git@github.com: Permission denied (publickey).`, then `fatal: Could not read from remote repository.` and the stock "make sure you have the correct access rights" advice. Match the whole pairing: the advice alone reads as a bad or missing key and sends you off to regenerate one, or to try HTTPS above. And a locked vault does not look like a missing agent — it looks like a working one refusing one operation: `ssh-add -l` exits 0 and lists every identity it holds while signing is refused, so an agent check answers healthy and sends you looking elsewhere. The count is not the signal — the two machines hold different numbers of identities. Measured on natedev 2026-09-09 and 2026-09-10, and on the Mac 2026-09-10 as a same-turn pair. Unlock and re-run. Full account — mechanism, the four attempts, and the control that separates a locked vault from every other cause — in `~/nixos/docs/status.md`.
+- **Never switch a remote to HTTPS to work around an SSH failure.** `url.git@github.com:.insteadOf` in `~/.config/git/config` rewrites an HTTPS URL back to SSH before any transport runs, so the HTTPS remote fails with an SSH error and the change buys nothing. Fix the cause instead — most often a cold gpg-agent, the clause below.
+- **A cold gpg-agent reads as a credentials problem and is not one.** On both machines both GitHub credentials sit behind gpg-agent — git's ssh key inside the agent, gh's token in `~/.config/gh/token.gpg` — and 1Password is in neither path. One passphrase unlocks both for a week; after that, and after every reboot, the agent is cold by design. The ssh signature is `sign_and_send_pubkey: signing failed for ED25519 … agent refused operation`, then `git@github.com: Permission denied (publickey).`; gh's is its `gh auth login` hint. Both read as a bad key or a lost login, and neither is: never `gh auth login`, a new key or a credential helper. A cold agent does not look like a missing one — it looks like a working one refusing one operation: `ssh-add -l` exits 0 and lists the key while signing is refused, so an agent check answers healthy. Run `github-warm-status` (exit 0 only when both are warm; never prompts); if cold, ask the user to run `github-warmup` at a terminal on the failing machine, then re-run. Seen on the Mac 2026-09-12 and on natedev 2026-09-25. Full account in the nixos repo (`/etc/nixos` on natedev, `~/nixos` on the Mac): `modules/linux/gpg.nix`, `modules/darwin/gpg.nix`, `modules/common/gh.nix`.
 
 ## working with the user
 
