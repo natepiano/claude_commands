@@ -11,6 +11,7 @@ must not drift from it:
   production doc.
 - `/showrunner:produce` — runs the production from the showrunner session.
 - `/showrunner:dailies` — reports the production to the executive producer.
+- `/showrunner:interval` — changes how often the scheduled updates come.
 - `/unit:delegate` — a unit's run; it applies <ProductionUnit/> below.
 
 ---
@@ -55,9 +56,13 @@ The production doc sits beside the source plan as `<source-stem>-production.md`.
 - **Repository:** <main checkout path>
 - **Merge branch:** `<branch>` — every unit merges here; only the showrunner pushes it
 - **Showrunner checkout:** <path, on the merge branch>
+- **Showrunner session:** <the showrunner's SendMessage name, as ListAgents prints it> —
+  `/showrunner:produce` writes it at start and on every resume; the update timer
+  sends each tick to it
 - **Log:** <repo-relative path> — git-excluded; one line per event
 - **User zone:** <IANA zone> — every time the showrunner reports is in this zone plus UTC
-- **Updates:** every <N> minutes (default 15); each update reports every unit in full
+- **Updates:** every <N> minutes (default 15); each update reports every unit in full;
+  the update timer reads N from this line, and `/showrunner:interval` changes it
 - **Merge tests:** <packages tested on every merge besides the changed ones, e.g. the
   app crate>; omit if none
 - **Capacity:** <cores and memory read by /producer:greenlight, and the unit count it allows>
