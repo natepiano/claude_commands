@@ -5,7 +5,9 @@ Match by tool and login. Preserve inactive accounts' last observed values until
 that quota window expires; unknown or expired usage is YAML null. Never infer
 100% remaining from a reset. weekly_usage_checked_at records the observation in
 UTC so a saved reading is distinguishable from live usage. No credentials are
-saved. Other frontmatter and note bodies are preserved.
+saved. Other frontmatter and note bodies are preserved. Run as a script, it then
+hands the notes to quota_alert.py, which messages sessions when an account runs low;
+`refresh` (/quota_refresh) is the run after the user reports a usage reset.
 """
 
 from __future__ import annotations
@@ -13,11 +15,13 @@ from __future__ import annotations
 import asyncio
 import os
 import re
+import sys
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from agent_accounts import EASTERN, Report, live_reports
+from quota_alert import AgentNote, alert, current_session, refresh
 
 AGENTS_DIR = Path.home() / "rust" / "hanadocs" / "agents"
 RESET_FORMAT = "%Y-%m-%dT%H:%M:%S"
@@ -117,8 +121,8 @@ def apply(notes: list[Note], account: Report, checked_at: datetime) -> list[str]
     messages: list[str] = []
     stamp = {"date_modified": f'"[[{checked_at.astimezone().strftime("%Y-%m-%d")}]]"'}
     reset = account.weekly_reset
-    fresh = reset is not None and reset > checked_at
-    remaining = account.weekly_remaining if fresh else None
+    fresh = reset if reset is not None and reset > checked_at else None
+    remaining = account.weekly_remaining if fresh is not None else None
     matched = False
     for note in notes:
         if note.tool != account.tool.lower():
@@ -135,8 +139,8 @@ def apply(notes: list[Note], account: Report, checked_at: datetime) -> list[str]
                 expirations = account.limit_reset_expirations
                 updates["limit_reset"] = expirations[0].astimezone(EASTERN).isoformat(timespec="seconds") if expirations else "null"
             updates["weekly_remaining_usage"] = "null" if remaining is None else f"{remaining:g}"
-            if fresh:
-                updates["resets"] = local_reset(reset)
+            if fresh is not None:
+                updates["resets"] = local_reset(fresh)
             if remaining is not None:
                 updates["weekly_usage_checked_at"] = checked_at.isoformat(timespec="seconds")
         elif note.get("weekly_remaining_usage") is None or not still_ahead(note.get("resets")):
@@ -152,8 +156,12 @@ def apply(notes: list[Note], account: Report, checked_at: datetime) -> list[str]
     return messages
 
 
+def read_notes() -> list[Note]:
+    return [note for path in sorted(AGENTS_DIR.glob("*.md")) if (note := read_note(path))]
+
+
 def update() -> list[str]:
-    notes = [note for path in sorted(AGENTS_DIR.glob("*.md")) if (note := read_note(path))]
+    notes = read_notes()
     if not notes:
         return [f"no agent notes in {AGENTS_DIR}"]
     reports = asyncio.run(live_reports())
@@ -165,7 +173,12 @@ def update() -> list[str]:
 
 
 def main() -> None:
+    if sys.argv[1:] not in ([], ["refresh"]):
+        sys.exit("usage: agent_notes.py [refresh]")
     for line in update():
+        print(line)
+    notes: list[AgentNote] = list(read_notes())
+    for line in refresh(notes, current_session()) if sys.argv[1:] else alert(notes):
         print(line)
 
 
