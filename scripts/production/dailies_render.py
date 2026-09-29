@@ -33,6 +33,7 @@ PHASE = re.compile(r"^(?:Phase (\d+) of (\d+)|follow-up (\d+) of (\d+)): \S")
 TIME = re.compile(r"^\d{1,2}:\d{2}(?:\+\d+)?$")
 NONE = ("none measured - requested", "none measured", "no ETA stated yet")
 LABEL_LIMIT = 8
+RETURN = re.compile(r"\bthe plan at Phase \d+|\bplan done\b")
 WHITE = "⬜"
 GREEN = "🟩"
 RED = "🟥"
@@ -273,8 +274,8 @@ def parse_unit(value: object, where: str, length: str) -> Unit:
     total = int(plan_total or follow_total)
     if number > total:
         raise InputError(f"{where}.phase: {number} of {total}")
-    if then is None and follow_number is not None:
-        raise InputError(f"{where}.then: required for a follow-up; name the plan phase it returns to, or 'nothing queued'")
+    if follow_number is not None and (then is None or not RETURN.search(then)):
+        raise InputError(f"{where}.then: a follow-up names the plan phase it returns to ('the plan at Phase <N>'), or says 'plan done' after reading the plan")
     if then is None and number == total:
         raise InputError(f"{where}.then: required on a last phase; name the queued work, or 'nothing queued'")
     update = text(fields, "update", where)

@@ -120,7 +120,7 @@ python3 ~/.claude/scripts/production/dailies_render.py <scratchpad>/dailies_inpu
 | `waiting_on_it` | Only for a topic that lands with this unit's phase, and who waits. |
 | `needed` | Only when the subject needs a follow-up nobody has started, from you (the user), the showrunner or another unit. Say who. |
 | `needs_user` | `true` when the subject waits on you. It then goes first. |
-| `then` | See below. Required on a follow-up and on a plan's last phase. |
+| `then` | See below. Required on a follow-up and on a plan's last phase. On a follow-up it must name the plan phase the unit returns to (`the plan at Phase <N>`), or say `plan done`; the renderer refuses anything else. Read the plan doc's `todo` phases to write it. |
 | topic `title`, `update`, `eta` | The topic's name, what it is doing now, and when it lands, as text. |
 
 **`then`** says what the unit does after this, when it is not simply the plan's
