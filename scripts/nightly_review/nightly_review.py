@@ -9,8 +9,8 @@ NIGHT/digest.md and the ledger (/watcher). The night is skipped while the active
 less than MIN_REMAINING percent of its weekly usage left.
 
 `offer` is a UserPromptSubmit hook in /etc/nixos/.claude/settings.json. On the natedev session's
-first prompt from 05:00, once per night, it tells the session what the night produced so it asks
-the user whether to review it.
+first prompt from 05:00, once per night, it tells the session what the night produced, plus the
+ledger's deferred proposals, so it asks the user whether to see them now or defer them.
 """
 
 from __future__ import annotations
@@ -116,14 +116,31 @@ def offer(now: datetime, here: Callable[[], str | None] = current_session) -> st
     return context
 
 
+ASK = ("Before anything else this turn, ask the user once whether they want to see {what} now or defer it, "
+       "and show it only on yes. On defer, change its ledger line's `— proposed` to `— deferred` "
+       "(/watcher, nightly review rule).")
+
+
+def deferred() -> list[str]:
+    """Ledger lines ending `— deferred`; each morning's offer asks about them again."""
+    ledger = ROOT / "ledger.md"
+    if not ledger.exists():
+        return []
+    return [line.removeprefix("- ").removesuffix(" — deferred")
+            for line in ledger.read_text(encoding="utf-8").splitlines() if line.endswith(" — deferred")]
+
+
 def summary(directory: Path, launched: str) -> str:
+    held = deferred()
+    earlier = f" Deferred earlier: {'; '.join(held)}." if held else ""
     if launched.startswith("skipped:"):
-        return f"Nightly review {directory.name}: {launched}. Tell the user in one line."
+        ask = " " + ASK.format(what="the deferred proposals") if held else ""
+        return f"Nightly review {directory.name}: {launched}. Tell the user in one line.{earlier}{ask}"
     parts = [status(directory, mode) for mode in MODES]
     digest = "digest.md is ready" if (directory / "digest.md").exists() else "digest.md is not written yet"
-    return (f"Nightly review {directory.name} in {directory}: {'; '.join(parts)}; {digest}. "
-            "Before anything else this turn, ask the user once whether they want to review it now "
-            "(/watcher, nightly review rule).")
+    what = "it and the deferred proposals" if held else "it"
+    return (f"Nightly review {directory.name} in {directory}: {'; '.join(parts)}; {digest}.{earlier} "
+            + ASK.format(what=what))
 
 
 def main() -> None:

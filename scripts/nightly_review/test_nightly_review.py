@@ -117,6 +117,23 @@ class NightlyReviewTests(unittest.TestCase):
         self.assertIsNone(nightly_review.offer(MORNING, lambda: "boss of bosses"))
         self.assertFalse((directory / "offered").exists())
 
+    def test_offer_asks_and_carries_deferred_proposals(self) -> None:
+        _ = self.night("nightly-config: started\n")
+        _ = (self.root / "ledger.md").write_text(
+            "- 2026-09-27 config: Old one — accepted, applied\n- 2026-09-28 rust/hana: Warm runners — deferred\n")
+        context = nightly_review.offer(MORNING, lambda: "natedev") or ""
+        self.assertIn("Deferred earlier: 2026-09-28 rust/hana: Warm runners.", context)
+        self.assertNotIn("Old one", context)
+        self.assertIn("see it and the deferred proposals now or defer it, and show it only on yes", context)
+        self.assertIn("change its ledger line's `— proposed` to `— deferred`", context)
+
+    def test_offer_asks_about_deferred_on_a_skipped_night(self) -> None:
+        _ = self.night("skipped: claude 2 has 4% of its weekly usage left, under the 10% floor\n")
+        _ = (self.root / "ledger.md").write_text("- 2026-09-28 config: Kwin keys — deferred\n")
+        context = nightly_review.offer(MORNING, lambda: "natedev") or ""
+        self.assertIn("Deferred earlier: 2026-09-28 config: Kwin keys.", context)
+        self.assertIn("ask the user once whether they want to see the deferred proposals now or defer", context)
+
     def test_offer_reports_a_skipped_night(self) -> None:
         _ = self.night("skipped: claude 2 has 4% of its weekly usage left, under the 10% floor\n")
         context = nightly_review.offer(MORNING, lambda: "natedev") or ""
