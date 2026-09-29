@@ -284,6 +284,13 @@ not codebase searching.
      `verify.sh example <pkg> <name>` only in phases whose Files touch that
      example, and `verify.sh test <pkg> <int_test>` only in phases owning that
      integration test) — never workspace-wide or example-building commands.
+   - **UX rules** — only for a phase that changes what users see, in the app
+     or in any example, in a project
+     with a UX guide (Hana: `~/rust/hanadocs/ux`). Add a `**UX checks:**` line
+     to the Acceptance gate with the one-line tests of the rules the change
+     touches, from
+     `zsh ~/.claude/scripts/ux_style/load-ux-style.sh --checklist --tags <tags>`.
+     Never paste the whole guide; seats carry only these lines.
 
 3. **Fold design history into the phases, then drop the narrative.** Justification
    essays ("why this exists", "what's wrong with the old model"), alternatives,
