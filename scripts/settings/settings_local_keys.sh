@@ -30,9 +30,15 @@ def shared_hooks: with_entries(.value |= map(select(local_hook | not))) | with_e
 # or local hook groups, its hook events sorted by name. Event order carries no
 # meaning, and iTerm2 rewrites the object alphabetically when it adds its
 # groups, so an unsorted blob would read as changed after every such write.
+# A `hooks` key emptied because every group in it was local is dropped: the
+# smudge created it, so a blob committed without one round-trips.
 SETTINGS_LOCAL_KEYS_STRIP="$SETTINGS_LOCAL_DEFS"'
 delpaths($keys | map([.]))
-| if has("hooks") then .hooks |= (shared_hooks | to_entries | sort_by(.key) | from_entries) else . end'
+| if has("hooks") then
+    (.hooks | length) as $before
+    | .hooks |= (shared_hooks | to_entries | sort_by(.key) | from_entries)
+    | if $before > 0 and (.hooks | length) == 0 then del(.hooks) else . end
+  else . end'
 
 # jq: keep only the local-only keys of an object, plus its local hook groups.
 SETTINGS_LOCAL_KEYS_PICK="$SETTINGS_LOCAL_DEFS"'
