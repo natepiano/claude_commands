@@ -113,7 +113,7 @@ production format, with status `planned`:
 - **Log:** `docs/handoff/<name>-production-log.md`.
 - **User zone:** the zone in memory for where the user is now, or else the
   machine's zone.
-- **Updates:** every 10 minutes.
+- **Updates:** every 15 minutes (user, 2026-09-28).
 - **Close-out:** the source plans' production-level steps, meaning work that
   no one unit owns or that runs after the last merge. Examples: data or
   saved-state migrations, checks on other machines, final validation.

@@ -170,28 +170,27 @@ Tell the user one line per unit: its session name, and `tmux attach -t <session>
 ---
 
 <StartUpdates>
-Create a recurring schedule (CronCreate) at the doc's cadence, offset from the
-hour. For 10 minutes, use `3-59/10 * * * *`. Fill this prompt from the
+Create a recurring schedule (CronCreate) every N minutes, where N is the
+production doc's **Updates** interval (15 when the doc does not give one),
+offset from the hour: for 15, `3-59/15 * * * *`. Fill this prompt from the
 production doc:
 
-> Scheduled update (every <N> minutes, round robin across <units>; the user is
-> in <zone>). Run `zsh ~/.claude/scripts/production/unit_status.sh <SCRATCH>/unit_status <zone> <sessions…> | cut -c1-400 | tail -9`.
-> Its first line names this tick's focus unit. Then give the user
-> `/showrunner:dailies simple` for every unit and open topic, with `*` at the
-> start of the focus unit's section title. If the script shows SESSION GONE,
-> CLAUDE NOT RUNNING, FORM WAITING, a usage limit, or a DECISION for the user,
-> that subject goes first, with `needed:` saying what the user must do. Do no
-> other work in this turn, except `/unit:eta` requests and merging a unit's
-> checkpoint after viewing its shots.
+> Scheduled update (every <N> minutes, every unit in full; the user is in
+> <zone>). Run `zsh ~/.claude/scripts/production/unit_status.sh <SCRATCH>/unit_status <zone> <sessions…> | cut -c1-400`.
+> It checks every unit: its session and Claude are running, anything waiting
+> on the user, and its latest step and ETA. Then give the user
+> `/showrunner:dailies simple` for every unit and open topic. If the script
+> shows SESSION GONE, CLAUDE NOT RUNNING, FORM WAITING, a usage limit, or a
+> DECISION for the user, that subject goes first, with `needed:` saying what
+> the user must do. Do no other work in this turn, except `/unit:eta` requests
+> and merging a unit's checkpoint after viewing its shots.
 
 **Every scheduled update is a `/showrunner:dailies simple` report**, never a
-one-unit note: the user sees every unit on every tick, and the `*` shows which
-one the round robin looked at in depth.
+one-unit note: the user sees every unit on every tick, each checked in full.
 
 A `/showrunner:dailies` the user runs takes the next tick's slot: it runs the
-script, so the round robin moves on, and then restarts this schedule so the next
-tick comes N minutes after that report (`/showrunner:dailies` → Round robin and
-clock).
+script, and then restarts this schedule so the next tick comes N minutes after
+that report (`/showrunner:dailies` → Status check and clock).
 
 Log `SCHEDULE_ID`. Then check that this session is on the quota alert list
 (<QuotaAlert/>).

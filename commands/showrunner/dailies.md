@@ -14,21 +14,23 @@ whose state (`PRODUCTION_DOC`, `LOG`, `ZONE`, `UNITS`, `CHECKOUT`,
 **Usage:** `/showrunner:dailies [simple|page|elaborate]`. With no argument,
 `simple`. With any other argument, name the three choices and stop.
 
-## Round robin and clock
+## Status check and clock
 
 While `/showrunner:produce` runs scheduled updates (its `SCHEDULE_ID` in `LOG`),
-a dailies the user runs takes the next tick's place. Two steps do that:
+a dailies the user runs takes the next tick's place. N is the production doc's
+**Updates** interval. Two steps do that:
 
-1. **Take the slot.** Before Gather, run the status script that the
-   scheduled-update prompt names. Running it moves the round robin on, and its
-   first line names the focus unit. Put `*` at the start of that unit's title,
-   and put anything the script flags first (SESSION GONE, CLAUDE NOT RUNNING,
-   FORM WAITING, a usage limit, a DECISION), as a scheduled tick does.
+1. **Check every unit.** Before Gather, run the status script that the
+   scheduled-update prompt names. It checks every unit, each time: that its
+   session and Claude are running, any form or decision waiting on the user,
+   and its latest step and ETA. Put anything it flags first (SESSION GONE,
+   CLAUDE NOT RUNNING, FORM WAITING, a usage limit, a DECISION), as a scheduled
+   tick does.
 2. **Reset the clock.** After the report, restart the schedule so the next tick
    comes N minutes after this report. CronList to find the job. CronDelete it.
    CronCreate it again with the prompt the last scheduled tick delivered, word
    for word, and the minute field `<current minute mod N>-59/N`: at 19:21 with
-   N = 10, that is `1-59/10 * * * *`, so the next tick is 19:31. Log the new
+   N = 15, that is `6-59/15 * * * *`, so the next tick is 19:36. Log the new
    `SCHEDULE_ID`.
 
 A scheduled tick skips both steps. It has run the script already, and a restart
@@ -52,9 +54,11 @@ Read the current state, not memory, and check what you state the way
 
 ## Subjects
 
-Each unit, in the production doc's order; then each open topic; then the merge
-branch, only when a merge is held, testing or not pushed. A topic that closed
-since the last report gets none. A subject that needs the user goes first.
+Each unit, earliest `eta:` first, so the order itself shows who lands next; a
+unit with no ETA goes after those with one. Then each open topic; then the
+merge branch, only when a merge is held, testing or not pushed. A topic that
+closed since the last report gets none. A subject that needs the user goes
+first, ahead of the ETA order.
 
 A topic that only waits on one unit's phase gets no section of its own. It goes
 under that unit as a `waiting on it:` line and shares the unit's `eta:`.
@@ -75,13 +79,11 @@ under that unit as a `waiting on it:` line and shares the unit's `eta:`.
 - update: …
 - eta: …
 
-nothing needed
+next run at <HH:MM> - nothing needed
 ```
 
 - **First line:** names the length used, capitalized: `**Dailies (Simple)**, 19:05 PDT / 02:05 UTC`.
-- **Header:** one section header per subject. In a scheduled update, or a
-  dailies that took a tick's slot, the round robin's focus unit gets `*` at the
-  start of its title: `### * widget-unit, Phase 18`.
+- **Header:** one section header per subject, every unit reported in full.
 - **Title:** a unit title gives `Phase <N> of <M>` from its plan. Work outside a numbered plan gives its place in the unit's queue and what it is: `follow-up 1 of 3 (wording and look polish)`.
 - **update:** what the subject is doing now.
 - **eta:** always present. The unit's latest stated phase ETA, converted to
@@ -113,7 +115,24 @@ nothing needed
 
   Read the plans and design docs for this, not the unit's queue alone. A unit's
   own handoff may list only the work in front of it.
-- **Last line:** `nothing needed`, alone, only when no subject has a `needed:`.
+- **Timeline:** after the last section and before the last line, a code block
+  drawing when each unit's phase lands, rows in the same order as the sections.
+  One column per 5 minutes from now (widen the step when the latest ETA is more
+  than 4 hours out, so no row passes about 50 columns). An axis row of hour
+  marks, then one row per unit: `█` from now to its ETA, `░` from the ETA to
+  the top of its range, `→` where a range runs past the axis end, then the ETA
+  and range as text. A unit with no ETA gets `?` and no bar.
+
+  ```
+           20:00       21:00       22:00       23:00
+  trunk    ███████ 20:30
+  GM       █████████████████████████████████░░░░→ 22:40 (to 04:59)
+  widget   ██████████████████████████████████ 22:43
+  ```
+- **Last line:** always the next scheduled run, from the schedule after any
+  restart: `next run at 20:10 - nothing needed` when no subject has a `needed:`,
+  or `next run at 20:10` when one does. With no schedule running, `no run
+  scheduled - nothing needed`.
   The report replaces the turn's `— waiting on:` line.
 
 After the report, write one `LOG` line with each subject's ETA as reported, so
@@ -136,4 +155,4 @@ For every length:
   names (`look-b5`), batch letters or item numbers. The user does not see them.
 - Say "you" for the user.
 - Do no other work in this turn, except the `/unit:eta` requests and the two
-  round-robin steps.
+  steps in Status check and clock.
