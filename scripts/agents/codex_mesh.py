@@ -685,6 +685,32 @@ def _run_delegate(args: argparse.Namespace, port: int) -> Attempt:
         )
 
 
+def _thread_start_params(args: argparse.Namespace) -> dict[str, object]:
+    """The `thread/start` request for one delegate."""
+    params: dict[str, object] = {
+        "cwd": _as_str(_attr(args, "cwd")),
+        "approvalPolicy": "never",
+        # The SandboxMode string, not a SandboxPolicy object: the server rejects
+        # {"type": "dangerFullAccess"} with "unknown variant `type`".
+        "sandbox": _as_str(_attr(args, "sandbox")),
+        # Deliberately NOT ephemeral, unlike `codex exec --ephemeral`. An
+        # ephemeral thread refuses `thread/queue/add` outright ("ephemeral thread
+        # does not support queued submissions"), which is the one call peers use
+        # most -- so ephemerality would cost the mesh the thing it exists for.
+        # The price is the usual codex rollout file under ~/.codex/sessions.
+    }
+    model = _as_str(_attr(args, "model"))
+    if model:
+        params["model"] = model
+    # Empty inherits `service_tier` from ~/.codex/config.toml, as `codex exec`
+    # does. The server takes the config spelling and maps it itself ("fast"
+    # starts the thread on "priority").
+    service_tier = _as_str(_attr(args, "service_tier"))
+    if service_tier:
+        params["serviceTier"] = service_tier
+    return params
+
+
 def _attach_and_run(
     args: argparse.Namespace,
     port: int,
@@ -700,22 +726,9 @@ def _attach_and_run(
     reply_path = Path(reply_file) if reply_file else None
 
     client = Client(port, name)
-    thread_params: dict[str, object] = {
-        "cwd": _as_str(_attr(args, "cwd")),
-        "approvalPolicy": "never",
-        # The SandboxMode string, not a SandboxPolicy object: the server rejects
-        # {"type": "dangerFullAccess"} with "unknown variant `type`".
-        "sandbox": _as_str(_attr(args, "sandbox")),
-        # Deliberately NOT ephemeral, unlike `codex exec --ephemeral`. An
-        # ephemeral thread refuses `thread/queue/add` outright ("ephemeral thread
-        # does not support queued submissions"), which is the one call peers use
-        # most -- so ephemerality would cost the mesh the thing it exists for.
-        # The price is the usual codex rollout file under ~/.codex/sessions.
-    }
-    model = _as_str(_attr(args, "model"))
-    if model:
-        thread_params["model"] = model
-    started = _require(client.call("thread/start", thread_params), "thread/start")
+    started = _require(
+        client.call("thread/start", _thread_start_params(args)), "thread/start"
+    )
     thread_id = _as_str(_as_dict(started.get("thread")).get("id"))
     if not thread_id:
         raise SystemExit("codex_mesh: thread/start returned no thread id")
@@ -1027,6 +1040,7 @@ def main(argv: list[str] | None = None) -> int:
     _ = start.add_argument("--log-file", required=True)
     _ = start.add_argument("--model", default="")
     _ = start.add_argument("--effort", default="")
+    _ = start.add_argument("--service-tier", default="")
     _ = start.add_argument("--sandbox", default="danger-full-access")
     _ = start.add_argument("--timeout", type=float, default=86400.0)
     _ = start.add_argument(

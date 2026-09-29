@@ -23,14 +23,16 @@ gpt-5.6-sol=low,medium,high,xhigh,max,ultra
 
 [delegate.options]            # [<function>.options] — launch flags, not agent rows
 codex_mesh=0
+codex_service_tier=fast
 ```
 
 An **options** section is the odd one out: it holds a function's launch flags
-rather than agent rows, `agents_resolve` never reads it, and the consumer that
-owns the flag reads its own key with `_agents_registry_get <function>.options
-<key>`. It is invisible to the family enumeration — which only ever loops `codex`
-and `claude` — so `/agent` neither lists nor edits it. `delegate.options` holds
-`codex_mesh` today.
+rather than agent rows, and the consumer that owns the flag reads its own key with
+`_agents_registry_get <function>.options <key>`. It is invisible to the family
+enumeration — which only ever loops `codex` and `claude` — so `/agent` neither
+lists nor edits it. `delegate.options` holds `codex_mesh` and
+`codex_service_tier`. The tier is the one key `agents_resolve` reads itself,
+because it is a codex CLI flag like the effort (step 6 below).
 
 Vocabulary: a **family** is a CLI vendor (`codex` | `claude`); an **agent** is a model within a family (`gpt-5.6-sol`, `opus`); a **function** is a consumer; a **task** is `<function>.<subtask>` — exactly two segments.
 
@@ -50,13 +52,14 @@ Every function carries *both* family sets, fully specified at all times, so a fa
 
 ### Resolution algorithm and precedence
 
-`agents_resolve <task>` sets `AGENT_FAMILY`, `AGENT_MODEL`, `AGENT_EFFORT` (effort may be empty) and returns nonzero with a stderr message naming the offending piece *and* the allowed values on any failure:
+`agents_resolve <task>` sets `AGENT_FAMILY`, `AGENT_MODEL`, `AGENT_EFFORT` (effort may be empty), `AGENT_SERVICE_TIER` (codex only, may be empty) and returns nonzero with a stderr message naming the offending piece *and* the allowed values on any failure:
 
 1. Split the task at the first dot. Reject anything that is not exactly two non-empty segments.
 2. **Family precedence:** an exact-task key in `[assignments]` (`delegate.review=claude`) wins over the function key (`delegate=codex`). Neither present → error listing the configured assignments. A value of `caller` maps to the running agent's family — `AGENTS_CALLER_FAMILY` if set, else `CODEX_THREAD_ID` ⇒ codex, else `CLAUDE_CODE_SESSION_ID` ⇒ claude (codex wins when both are set: a codex launched from a claude session inherits claude's variable); none detectable → error naming the override.
 3. Section `<function>.<family>` must exist → otherwise error listing the families that do have a set for that function.
 4. Row `<subtask>` must exist in that section → otherwise error listing the section's sub-tasks.
 5. Validate the pair: agent is everything before the first colon, effort everything after. A trailing colon with nothing after it is rejected. The agent must be a key in `[<family>.agents]`; a non-empty effort must appear in that agent's comma list. A catalog row with an *empty* effort list is legal and admits only bare (effort-less) pairs.
+6. Speed tier, codex family only: `[<function>.options] codex_service_tier` must be `fast`, `flex`, or `default`; an absent key leaves `AGENT_SERVICE_TIER` empty and the launch inherits `service_tier` from `~/.codex/config.toml`. A claude row always gets an empty tier, because Claude's fast mode bills extra usage. An unknown value is an error, because codex silently runs an unrecognised tier at standard speed.
 
 Exact-task overrides exist for one-off cross-vendor setups; function-level assignment is the norm and the only thing `/agent <function> <family>` writes.
 
@@ -75,7 +78,7 @@ Public:
 - `agents_set_all_assignments <family>` — switches **every** `[assignments]` entry, exact-task overrides included, to one family. Validates the whole target set first — a function with no `[<function>.<family>]` section, an override key with no matching row, or any invalid row rejects the switch with the file untouched — then awk-rewrites every assignment line in one pass, preserving trailing inline comments and spacing byte-exactly. `caller` lines are skipped: neither validated against the target nor rewritten.
 - `agents_set_model <agent> [function]` — puts every function, or one, on one agent, keeping each row's effort. The agent names its family, as in `agents_set_row`. Every fixed assignment in scope, exact-task overrides included, switches to that family, and every row of each `[<function>.<family>]` set takes the agent. A `caller` function keeps its assignment, but its set for that family takes the agent too, since that set is live whenever an agent of that family asks. Validates the whole change first — an unknown or ambiguous agent, an agent given with `:<effort>`, a missing set, an override with no row, or a kept effort the agent's catalog lacks rejects it with the file untouched — then one awk pass rewrites the assignment and row lines, preserving trailing comments and spacing. Sets `AGENT_SWEEP_FAMILY`.
 - `agents_set_row <task> <agent>[:<effort>]` — edits one row. The **agent** names the family (the two catalogs share no names), so the row written is the one the agent could only have meant, live or dormant; an agent listed by both catalogs is refused as ambiguous, and an agent whose family has no `[<function>.<family>]` section names the missing section. Validates the pair, then awk-rewrites the row preserving its trailing inline comment and spacing byte-exactly. Sets `AGENT_ROW_FAMILY`, `AGENT_ROW_ACTIVE_FAMILY`, `AGENT_ROW_ACTIVE`. Editing a row never changes which family is live.
-- `agents_codex_args` — one line: `-m <agent>`, plus `-c model_reasoning_effort="<effort>"` when effort is non-empty.
+- `agents_codex_args` — one line: `-m <agent>`, plus `-c model_reasoning_effort="<effort>"` when effort is non-empty and `-c service_tier="<tier>"` when the tier is.
 - `agents_claude_args` — one line: `--model <agent>`, plus `--effort <effort>` when effort is non-empty.
 
 Both emitters print a single space-joined line meant to be word-split into an argv array (`read -r -a`), never `eval`'d; the codex effort token carries literal embedded quotes and is one argv token.
@@ -121,7 +124,7 @@ One `codex app-server` per delegate session, each delegate a thread on it:
 ```
 codex_mesh.py serve  --session-dir <dir>                      # start/reuse, print port
 codex_mesh.py start  --session-dir --name --cwd --prompt-file \
-                     --summary-file --log-file [--model --effort --sandbox]
+                     --summary-file --log-file [--model --effort --service-tier --sandbox]
 codex_mesh.py send   --session-dir --to <name> --message <text>
 codex_mesh.py steer  --session-dir --to <name> --message <text>
 codex_mesh.py list   --session-dir

@@ -19,6 +19,8 @@ cat > "$AGENTS_CONFIG_FILE" <<'EOF'
 codex_case=codex
 claude_case=claude
 bare_case=codex
+tier_case=codex
+tier_case.claude_task=claude
 
 [codex_case.codex]
 task=gpt-test:high
@@ -28,6 +30,15 @@ task=opus:max
 
 [bare_case.codex]
 task=gpt-bare
+
+[tier_case.codex]
+task=gpt-test:high
+
+[tier_case.claude]
+claude_task=opus:max
+
+[tier_case.options]
+codex_service_tier=fast
 
 [codex.agents]
 gpt-test=low,medium,high
@@ -66,32 +77,42 @@ run_dry() {
 
 codex_write="$(run_dry codex_case.task write)"
 assert_equal "codex write command is wrong" \
-    "codex exec -m gpt-test -c model_reasoning_effort=\\\"high\\\" --ephemeral --sandbox danger-full-access -C $WORKING_DIR -o $OUTPUT_FILE test\\ prompt > $LOG_FILE 2>&1" \
+    "codex exec -m gpt-test -c model_reasoning_effort=\\\"high\\\" --ephemeral --sandbox danger-full-access -C $WORKING_DIR -o $OUTPUT_FILE - < $PROMPT_FILE > $LOG_FILE 2>&1" \
     "$codex_write"
 
 codex_readonly="$(run_dry codex_case.task readonly)"
 assert_equal "codex readonly command is wrong" \
-    "codex exec -m gpt-test -c model_reasoning_effort=\\\"high\\\" --ephemeral --sandbox read-only -C $WORKING_DIR -o $OUTPUT_FILE test\\ prompt > $LOG_FILE 2>&1" \
+    "codex exec -m gpt-test -c model_reasoning_effort=\\\"high\\\" --ephemeral --sandbox read-only -C $WORKING_DIR -o $OUTPUT_FILE - < $PROMPT_FILE > $LOG_FILE 2>&1" \
     "$codex_readonly"
 
 claude_write="$(run_dry claude_case.task write)"
 assert_equal "claude write command is wrong" \
-    "cd $WORKING_DIR && claude --print --dangerously-skip-permissions --settings \\{\\\"sandbox\\\":\\{\\\"enabled\\\":false\\}\\} --verbose --output-format stream-json --model opus --effort max -- test\\ prompt > $LOG_FILE 2>&1" \
+    "cd $WORKING_DIR && claude --print --dangerously-skip-permissions --settings \\{\\\"sandbox\\\":\\{\\\"enabled\\\":false\\}\\} --verbose --output-format stream-json --model opus --effort max < $PROMPT_FILE > $LOG_FILE 2>&1" \
     "$claude_write"
 
 claude_readonly="$(run_dry claude_case.task readonly)"
 assert_equal "claude readonly command is wrong" \
-    "cd $WORKING_DIR && claude --print --permission-mode plan --settings \\{\\\"sandbox\\\":\\{\\\"enabled\\\":false\\}\\} --verbose --output-format stream-json --model opus --effort max -- test\\ prompt > $LOG_FILE 2>&1" \
+    "cd $WORKING_DIR && claude --print --permission-mode plan --settings \\{\\\"sandbox\\\":\\{\\\"enabled\\\":false\\}\\} --verbose --output-format stream-json --model opus --effort max < $PROMPT_FILE > $LOG_FILE 2>&1" \
     "$claude_readonly"
 
 bare_command="$(run_dry bare_case.task write)"
 assert_equal "bare pair did not omit the effort flag" \
-    "codex exec -m gpt-bare --ephemeral --sandbox danger-full-access -C $WORKING_DIR -o $OUTPUT_FILE test\\ prompt > $LOG_FILE 2>&1" \
+    "codex exec -m gpt-bare --ephemeral --sandbox danger-full-access -C $WORKING_DIR -o $OUTPUT_FILE - < $PROMPT_FILE > $LOG_FILE 2>&1" \
     "$bare_command"
+
+tier_command="$(run_dry tier_case.task readonly)"
+assert_equal "codex command did not carry the function's service tier" \
+    "codex exec -m gpt-test -c model_reasoning_effort=\\\"high\\\" -c service_tier=\\\"fast\\\" --ephemeral --sandbox read-only -C $WORKING_DIR -o $OUTPUT_FILE - < $PROMPT_FILE > $LOG_FILE 2>&1" \
+    "$tier_command"
+
+tier_claude_command="$(run_dry tier_case.claude_task readonly)"
+assert_equal "claude command carried a codex service tier" \
+    "cd $WORKING_DIR && claude --print --permission-mode plan --settings \\{\\\"sandbox\\\":\\{\\\"enabled\\\":false\\}\\} --verbose --output-format stream-json --model opus --effort max < $PROMPT_FILE > $LOG_FILE 2>&1" \
+    "$tier_claude_command"
 
 extra_command="$(AGENT_EXEC_EXTRA_ARGS='--add-dir /tmp/extra' run_dry codex_case.task write)"
 assert_equal "extra arguments were not appended" \
-    "codex exec -m gpt-test -c model_reasoning_effort=\\\"high\\\" --add-dir /tmp/extra --ephemeral --sandbox danger-full-access -C $WORKING_DIR -o $OUTPUT_FILE test\\ prompt > $LOG_FILE 2>&1" \
+    "codex exec -m gpt-test -c model_reasoning_effort=\\\"high\\\" --add-dir /tmp/extra --ephemeral --sandbox danger-full-access -C $WORKING_DIR -o $OUTPUT_FILE - < $PROMPT_FILE > $LOG_FILE 2>&1" \
     "$extra_command"
 
 MISSING_PROMPT="$TEST_DIR/missing.txt"

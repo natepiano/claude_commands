@@ -282,7 +282,8 @@ elif [[ "${USE_CODEX_MESH}" == "1" ]]; then
     --reply-file "${REPLY_FILE}" \
     --log-file "${LOG_FILE}" \
     --model "${AGENT_MODEL}" \
-    --effort "${AGENT_EFFORT:-}" &
+    --effort "${AGENT_EFFORT:-}" \
+    --service-tier "${AGENT_SERVICE_TIER:-}" &
 else
   rm -f "${BG_ID_FILE}"
   # The plain launcher writes the delegate's last message to its output file,

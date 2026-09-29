@@ -497,4 +497,53 @@ AGENTS_CALLER_FAMILY=claude agents_set_row friend.work opus:high
 AGENTS_CALLER_FAMILY=codex agents_set_row friend.work opus:max
 [[ "$AGENT_ROW_ACTIVE" == "no" ]] || fail "row edit for the other family was reported live under a caller"
 
+# Only a codex row gets a speed tier: Claude's fast mode bills extra usage.
+cat > "$TEST_DIR/tier.conf" <<'EOF'
+[assignments]
+tiered=codex
+tiered.claude_task=claude
+untiered=codex
+mistyped=codex
+
+[tiered.codex]
+work=gpt-test:high
+
+[tiered.claude]
+claude_task=opus:max
+
+[tiered.options]
+codex_service_tier=fast
+
+[untiered.codex]
+work=gpt-test:high
+
+[mistyped.codex]
+work=gpt-test:high
+
+[mistyped.options]
+codex_service_tier=fsat
+
+[codex.agents]
+gpt-test=low,medium,high
+
+[claude.agents]
+opus=low,medium,high,max
+EOF
+write_fixture "$TEST_DIR/tier.conf"
+
+agents_resolve tiered.work
+[[ "$AGENT_SERVICE_TIER" == "fast" ]] || fail "codex row did not carry its function's tier"
+[[ "$(agents_codex_args)" == '-m gpt-test -c model_reasoning_effort="high" -c service_tier="fast"' ]] \
+    || fail "codex args did not carry the tier"
+agents_resolve tiered.claude_task
+[[ -z "$AGENT_SERVICE_TIER" ]] || fail "claude row carried a codex tier"
+agents_resolve untiered.work
+[[ -z "$AGENT_SERVICE_TIER" ]] || fail "a function without the key did not inherit the codex config"
+[[ "$(agents_codex_args)" == '-m gpt-test -c model_reasoning_effort="high"' ]] \
+    || fail "codex args named a tier the registry does not set"
+# Codex silently runs an unknown tier at standard speed, so a typo must stop here.
+assert_fails "unknown service tier" agents_resolve mistyped.work
+stderr_out="$(agents_resolve mistyped.work 2>&1 >/dev/null || true)"
+[[ "$stderr_out" == *"Allowed values: fast, flex, default"* ]] || fail "unknown tier error did not list the allowed values"
+
 echo "agents_config tests passed"

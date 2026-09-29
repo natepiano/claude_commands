@@ -317,7 +317,31 @@ _agents_resolve_in_family() {
     fi
 
     AGENT_FAMILY="$family"
-    _agents_validate_pair "$task" "$family" "$pair"
+    _agents_validate_pair "$task" "$family" "$pair" || return 1
+    _agents_resolve_service_tier "$task" "$family"
+}
+
+# The speed tier is a codex setting, read from the function's options section as
+# `codex_service_tier`, so a claude agent never carries one: Claude's fast mode
+# bills extra usage. An absent key leaves it empty, and the launch then inherits
+# `service_tier` from ~/.codex/config.toml. Codex drops a tier it does not
+# recognise without a word and runs at standard speed, so an unknown value is
+# refused here instead.
+_agents_resolve_service_tier() {
+    local task="$1" family="$2" function tier
+
+    AGENT_SERVICE_TIER=""
+    [[ "$family" == "codex" ]] || return 0
+    function="${task%%.*}"
+    tier="$(_agents_registry_get "$function.options" codex_service_tier)"
+    case "$tier" in
+        ''|fast|flex|default) AGENT_SERVICE_TIER="$tier" ;;
+        *)
+            echo "ERROR: [$task] codex_service_tier '$tier' in [$function.options] is not a codex service tier." >&2
+            echo "       Allowed values: fast, flex, default" >&2
+            return 1
+            ;;
+    esac
 }
 
 agents_resolve_print() {
@@ -774,6 +798,9 @@ agents_codex_args() {
     printf '%s %s' '-m' "$AGENT_MODEL"
     if [[ -n "$AGENT_EFFORT" ]]; then
         printf ' %s %s' '-c' "model_reasoning_effort=\"$AGENT_EFFORT\""
+    fi
+    if [[ -n "${AGENT_SERVICE_TIER:-}" ]]; then
+        printf ' %s %s' '-c' "service_tier=\"$AGENT_SERVICE_TIER\""
     fi
     printf '\n'
 }

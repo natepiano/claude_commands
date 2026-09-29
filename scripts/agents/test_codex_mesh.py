@@ -82,6 +82,29 @@ class RetryDecisionTests(unittest.TestCase):
         )
 
 
+class ThreadStartTests(unittest.TestCase):
+    """The speed tier reaches the thread only when the registry sets one."""
+
+    @staticmethod
+    def params(service_tier: str) -> dict[str, object]:
+        return codex_mesh._thread_start_params(  # pyright: ignore[reportPrivateUsage]
+            argparse.Namespace(
+                cwd="/work",
+                sandbox="danger-full-access",
+                model="gpt-test",
+                service_tier=service_tier,
+            )
+        )
+
+    def test_a_registry_tier_is_sent_in_the_config_spelling(self) -> None:
+        self.assertEqual(self.params("fast").get("serviceTier"), "fast")
+
+    def test_no_tier_leaves_the_codex_config_in_charge(self) -> None:
+        # Sending any value here, even "default", would override the user's
+        # ~/.codex/config.toml; omitting the key is what inherits it.
+        self.assertNotIn("serviceTier", self.params(""))
+
+
 class ReplyDeliveryTests(unittest.TestCase):
     """Where a delegate's replies land, and whose file the summary is."""
 
