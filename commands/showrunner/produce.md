@@ -1,5 +1,5 @@
 ---
-description: Run a production as its showrunner — launch each unit's /plan:delegate session, merge and test every checkpoint on the merge branch, check visible work in screenshots before merging, clear waits between units, relay the user's words, and report each unit's ETA on a schedule.
+description: Run a production as its showrunner — launch each unit's /unit:delegate session, merge and test every checkpoint on the merge branch, check visible work in screenshots before merging, clear waits between units, relay the user's words, and report each unit's ETA on a schedule.
 ---
 
 # Produce
@@ -9,7 +9,7 @@ check, and all talk with the user. Units write the code. The showrunner writes
 none, and that includes merge conflicts: the unit whose change conflicts
 resolves it on its own branch.
 
-**Usage:** `/plan:produce <production-doc> [resume]`
+**Usage:** `/showrunner:produce <production-doc> [resume]`
 
 Read `~/.claude/docs/production_format.md` first. It defines:
 - the words;
@@ -79,6 +79,11 @@ State:
 - **Helpers.** Stop each named helper agent once its report is read.
 - **An auto-mode denial** is never retried or worked around. Tell the user what
   was denied and let them add a permission rule.
+- **Unmeasured ETAs.** Whenever a unit's phase ETA reads "none measured" or it
+  has stated none — in an update tick, a dailies report or its own message —
+  send it `From the showrunner: run /unit:eta (or read ~/.claude/commands/unit/eta.md if it is not in your skill list)` by SendMessage, in that same
+  turn. Ask once per phase; ask again only if it answered without a time. Until
+  it answers, report that ETA as `none measured - requested`.
 - **Every turn ends with** `— waiting on: <items>`, the user's items first.
 </Throughout>
 
@@ -101,7 +106,7 @@ State:
 <LoadProduction>
 Read the production doc. `CHECKOUT` must be on `MERGE_BRANCH`, or, when that
 branch does not exist yet, clean on the commit it will start from. Otherwise
-stop with `Run /plan:produce in a checkout on <merge branch>.`
+stop with `Run /showrunner:produce in a checkout on <merge branch>.`
 
 On `resume`, or when the doc's status is `running`:
 1. Read `LOG` from its last `### STATE` block.
@@ -152,7 +157,7 @@ For each unit without a live session:
    - Remove every `CLAUDE_*` variable from its environment. An inherited
      `CLAUDE_CODE_CHILD_SESSION` turns off transcript saving.
    - Launch:
-     `tmux new-session -d -s <session> -c <worktree> zsh -ic "ENABLE_TOOL_SEARCH=true command claude --remote-control <session> -n <session> --settings '{\"disableAgentView\": true}' '/plan:delegate <unit plan>'; exec zsh"`
+     `tmux new-session -d -s <session> -c <worktree> zsh -ic "ENABLE_TOOL_SEARCH=true command claude --remote-control <session> -n <session> --settings '{\"disableAgentView\": true}' '/unit:delegate <unit plan>'; exec zsh"`
 3. **Check.** Log the launch only after the pane shows `/remote-control is
    active`. The mobile session list lags by minutes; trust the pane.
 4. **Resume.** To bring back a unit whose session ended, use
@@ -169,18 +174,24 @@ Create a recurring schedule (CronCreate) at the doc's cadence, offset from the
 hour. For 10 minutes, use `3-59/10 * * * *`. Fill this prompt from the
 production doc:
 
-> Unit update (every <N> minutes, round robin across <units>; the user is in
-> <zone>). Run `zsh ~/.claude/scripts/production/unit_status.sh <SCRATCH>/unit_status <zone> <sessions…> | cut -c1-400 | tail -9`
-> and give the user one short update for that unit: which unit, the time from
-> the script, and in one or two sentences what it is doing now. Include the
-> unit's current phase ETA as it stated it (the script's last line with "ETA";
-> if that line is cut off, read the unit's pane for the full line), converted
-> to <zone>; if it has stated none, say "no ETA stated yet". Add no other
-> information. If the script shows SESSION GONE, CLAUDE NOT RUNNING, FORM
-> WAITING, a usage limit, or a DECISION for you, say so first and what the user
-> needs to do. Do no other work in this turn, except merging a unit's
-> checkpoint after viewing its shots. End with `— waiting on:`, listing first
-> anything that needs the user.
+> Scheduled update (every <N> minutes, round robin across <units>; the user is
+> in <zone>). Run `zsh ~/.claude/scripts/production/unit_status.sh <SCRATCH>/unit_status <zone> <sessions…> | cut -c1-400 | tail -9`.
+> Its first line names this tick's focus unit. Then give the user
+> `/showrunner:dailies simple` for every unit and open topic, with `*` at the
+> start of the focus unit's section title. If the script shows SESSION GONE,
+> CLAUDE NOT RUNNING, FORM WAITING, a usage limit, or a DECISION for the user,
+> that subject goes first, with `needed:` saying what the user must do. Do no
+> other work in this turn, except `/unit:eta` requests and merging a unit's
+> checkpoint after viewing its shots.
+
+**Every scheduled update is a `/showrunner:dailies simple` report**, never a
+one-unit note: the user sees every unit on every tick, and the `*` shows which
+one the round robin looked at in depth.
+
+A `/showrunner:dailies` the user runs takes the next tick's slot: it runs the
+script, so the round robin moves on, and then restarts this schedule so the next
+tick comes N minutes after that report (`/showrunner:dailies` → Round robin and
+clock).
 
 Log `SCHEDULE_ID`. Then check that this session is on the quota alert list
 (<QuotaAlert/>).
@@ -207,6 +218,7 @@ arrived:
 | a unit blocked on the showrunner | <ClearGate/>, <LandingCall/>, or answer it |
 | a unit's decision for the user | show it to the user; relay the answer |
 | a quota alert | <QuotaAlert/> |
+| the user asks for a status | `/showrunner:dailies`, `simple` unless they name a length |
 
 Merge one checkpoint at a time. A notice that arrives while a merge is testing
 waits its turn. When every unit's final checkpoints are merged, go to <Wrap/>.

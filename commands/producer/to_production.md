@@ -1,12 +1,12 @@
 ---
-description: Split greenlit phased plans into one delegate-ready plan per unit plus a production doc, so /plan:produce can launch the units.
+description: Split greenlit phased plans into one delegate-ready plan per unit plus a production doc, so /showrunner:produce can launch the units.
 ---
 
 # To Production
 
-**Purpose:** turn plans that `/plan:greenlight` judged a production into:
+**Purpose:** turn plans that `/producer:greenlight` judged a production into:
 - one delegate-ready plan per unit;
-- the production doc that `/plan:produce` runs from.
+- the production doc that `/showrunner:produce` runs from.
 
 The words and both formats are defined in:
 - `~/.claude/docs/production_format.md`;
@@ -14,10 +14,10 @@ The words and both formats are defined in:
 
 Read both first.
 
-**Usage:** `/plan:to_production <plan> [<plan>…] [--name <production>] [--merge-branch <branch>]`
+**Usage:** `/producer:to_production <plan> [<plan>…] [--name <production>] [--merge-branch <branch>]`
 
 This command writes plan docs only. It writes no code and makes no commits,
-branches or worktrees; `/plan:produce` creates those at launch.
+branches or worktrees; `/showrunner:produce` creates those at launch.
 
 ---
 
@@ -35,14 +35,14 @@ branches or worktrees; `/plan:produce` creates those at launch.
 ---
 
 <Locate>
-Resolve the plans as `/plan:greenlight` → <Locate/> does, and `${REPO}` from
+Resolve the plans as `/producer:greenlight` → <Locate/> does, and `${REPO}` from
 their repository.
 
 - **Name:** `--name`, or else the first source plan's file stem (for example
   `tool-based-ui`).
 - **Merge branch:** `--merge-branch`, or else the current branch of `${REPO}`
   when it is not the default branch, or else `production/<name>`, which
-  `/plan:produce` creates.
+  `/showrunner:produce` creates.
 
 State each default in one line.
 </Locate>
@@ -50,10 +50,10 @@ State each default in one line.
 ---
 
 <Units>
-Reuse the `/plan:greenlight` report for these plans if it is in the conversation
-and no plan changed since. Otherwise read `~/.claude/commands/plan/greenlight.md`
+Reuse the `/producer:greenlight` report for these plans if it is in the conversation
+and no plan changed since. Otherwise read `~/.claude/commands/producer/greenlight.md`
 and run its STEPS 1–5. A verdict of one delegate run stops this command:
-`Greenlight says one delegate run — <reason>. Run /plan:delegate <plan>.`
+`Greenlight says one delegate run — <reason>. Run /unit:delegate <plan>.`
 
 Apply the user's adjustments from the conversation, such as names, ownership
 and merged units.
@@ -153,7 +153,7 @@ Fix any failure before reporting.
 | Hub files | <file> → <owner>; or None |
 | Gates | G<k>: <unit> phase <N> waits on <unit> phase <M>; or None |
 | Source plan | <kept by <unit>; <n> phases moved out; resequenced <old→new>> |
-| Next | In a checkout of `${REPO}` on `<merge branch>`: `/plan:produce <production doc>` |
+| Next | In a checkout of `${REPO}` on `<merge branch>`: `/showrunner:produce <production doc>` |
 ```
 
 Then stop.

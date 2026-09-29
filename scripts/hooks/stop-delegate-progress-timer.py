@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Stop hook: refuse to end a /plan:delegate turn that leaves work unreported.
+"""Stop hook: refuse to end a /unit:delegate turn that leaves work unreported.
 
 A delegate run reports progress by arming a one-shot timer, ending the turn, and
 letting the timer notification re-invoke the agent. When the agent forgets to

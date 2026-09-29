@@ -22,7 +22,7 @@ conversation; if none, ask which one rather than choosing on your own.
 
 **`--from-diff`:** describe the shipped work from the repository diff instead of
 a plan doc. Use it when the work shipped without a phased plan — a
-`/plan:delegate single` ad hoc task, or any change already in the tree. The plan
+`/unit:delegate single` ad hoc task, or any change already in the tree. The plan
 doc argument is then absent and nothing is deleted at the end.
 
 This command does not change code and does not commit.

@@ -11,7 +11,7 @@ description: Launch a team of expert agents to review a topic across multiple di
 - Hard-filter proposed decisions before surfacing, through `<DecisionEconomy/>`. If a finding has converged into a concrete in-intent plan refinement with no meaningful user choice left, record it in `${WORKING_DOC}` and do not send it to `/adhoc_review`.
 - Surface only unresolved product/design choices where the user must choose among plausible alternatives or explicitly approve a scope/behavior change.
 
-`<DecisionEconomy/>` is defined by this import, shared with every session and with `/plan:delegate`:
+`<DecisionEconomy/>` is defined by this import, shared with every session and with `/unit:delegate`:
 
 @~/.claude/docs/decision_criteria.md
 

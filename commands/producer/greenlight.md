@@ -1,14 +1,14 @@
 ---
-description: Judge whether delegate-ready phased plans should run as a production — several /plan:delegate units in parallel under one showrunner — and propose the units, hub-file owners and gates between units.
+description: Judge whether delegate-ready phased plans should run as a production — several /unit:delegate units in parallel under one showrunner — and propose the units, hub-file owners and gates between units.
 ---
 
 # Greenlight
 
 **Purpose:** decide whether phased plans run faster as a **production** than as
-one `/plan:delegate` run. The words and the production doc are defined in
+one `/unit:delegate` run. The words and the production doc are defined in
 `~/.claude/docs/production_format.md`; read it first.
 
-**Usage:** `/plan:greenlight <plan> [<plan>…]`
+**Usage:** `/producer:greenlight <plan> [<plan>…]`
 
 **Argument:** one or more delegate-ready plans. If omitted, infer the single plan
 in the conversation; if there is none, ask for the path. A second plan joins as
@@ -108,7 +108,7 @@ is unmeasured. Never state a speedup that no measured run supports.
   overlap;
 - units that change what users see can each launch the app on their own port.
 
-Otherwise it is **one `/plan:delegate` run**. Give the reason in one line, for
+Otherwise it is **one `/unit:delegate` run**. Give the reason in one line, for
 example "every phase builds on the one before it".
 </Verdict>
 
@@ -123,7 +123,7 @@ example "every phase builds on the one before it".
 | Hub files | <file> → <owner unit>; or None |
 | Gates | G<k>: <unit> phase <N> waits on <unit> phase <M>; or None |
 | Capacity | <cores, memory; known load-sensitive flakes; ceiling measured or unmeasured> |
-| Next | `/plan:to_production <plan>…` or `/plan:delegate <plan>` |
+| Next | `/producer:to_production <plan>…` or `/unit:delegate <plan>` |
 ```
 
 Then stop.
@@ -139,4 +139,4 @@ Then stop.
   and point to `/plan:to_phased_plan`.
 - Proposals are packaging, not product choices. Make each call under
   `<DecisionEconomy/>` and state it in one line. The user adjusts at
-  `/plan:to_production`.
+  `/producer:to_production`.

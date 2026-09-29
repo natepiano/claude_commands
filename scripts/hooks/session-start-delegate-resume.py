@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""SessionStart(compact) hook: re-seat a /plan:delegate run after compaction.
+"""SessionStart(compact) hook: re-seat a /unit:delegate run after compaction.
 
 `delegate.md` already says to re-read the command file after compaction and
 resume the same control flow. The problem is where that instruction lives: in
@@ -36,13 +36,13 @@ class SessionStartInput(TypedDict, total=False):
 
 
 CONTEXT = """\
-A /plan:delegate run is active in this session and was just compacted. The \
+A /unit:delegate run is active in this session and was just compacted. The \
 summary above is not the whole picture -- compaction is a normal, expected event \
 in a long run, and the run continues.
 
 Before any further workflow action:
 
-1. Re-read ~/.claude/commands/plan/delegate.md in full. Do not reconstruct the \
+1. Re-read ~/.claude/commands/unit/delegate.md in full. Do not reconstruct the \
 workflow from the summary; a summarized workflow silently drops rules, and the \
 ones it drops are the ones that were not firing when compaction hit.
 2. Read back the handoff doc named in the summary and resume the control flow it \

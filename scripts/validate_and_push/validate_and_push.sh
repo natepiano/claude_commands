@@ -7,7 +7,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 
-# Options (both used by /plan:delegate's periodic CI point):
+# Options (both used by /unit:delegate's periodic CI point):
 #   --to <branch>          push HEAD to origin/<branch> instead of the current
 #                          branch; always the direct path, so a run on the
 #                          default branch reaches CI without landing on it

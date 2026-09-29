@@ -1,6 +1,6 @@
 # ExplainOnDemand
 
-Shared by `/plan:delegate` and `/plan:phase_review`. Both reference this file
+Shared by `/unit:delegate` and `/plan:phase_review`. Both reference this file
 rather than carrying their own copy, so the method cannot drift between them.
 
 `~/.claude/docs/user_facing_explanation.md` is the companion: it governs the

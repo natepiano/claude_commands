@@ -15,7 +15,7 @@ arguments can reach `lint clippy`, then strip them from `$ARGUMENTS`:
 - `since <ref>` sets `STYLE_SINCE = <ref>` and consumes the argument after it.
   <StyleReview/> then reviews everything that changed from that commit forward —
   committed work included — instead of the working tree alone. Use it when the
-  work under review is already committed, as /plan:delegate's branch-wide review
+  work under review is already committed, as /unit:delegate's branch-wide review
   is. STOP and report if `git rev-parse --verify <ref>` does not resolve.
 - `no-agents` sets `NO_AGENTS = true`. This invocation runs every stage in the
   main agent: no fix wave, whatever `config/clippy.conf` says. It does not edit
@@ -27,7 +27,7 @@ mutually exclusive. `STYLE_ONLY`, `NO_STYLE`, and `NO_AGENTS` default to false;
 </InvocationModes>
 
 <AutoProceed>
-If $ARGUMENTS contains the token `auto-proceed` (injected by /plan:delegate and
+If $ARGUMENTS contains the token `auto-proceed` (injected by /unit:delegate and
 the codex work orders it composes), this run is non-interactive: strip the token
 before any remaining arguments reach `lint clippy`, and <BatchDecisionPoint/>
 reports the batch then immediately executes it as **proceed** — no stop, no user
@@ -695,7 +695,7 @@ one that ended its turn blocked both count:
 4. If fixers remain, arm a fresh timer and end the turn.
 
 This is deliberately **not** the progress contract in
-`commands/plan/delegate.md`. No `progress_history.py`, no calibration, no ETA
+`commands/unit/delegate.md`. No `progress_history.py`, no calibration, no ETA
 bands, no cap stages: that machinery reads a plan document with phase headings,
 and /clippy has no plan.
 

@@ -37,7 +37,7 @@ Use `/lint_config` to view or change them. The two consumers read it on their
 next run, so a change is immediate:
 
 - the `/clippy` skill, at the start of every run — including runs started by
-  `/commit_prep` or a `/plan:delegate` work order
+  `/commit_prep` or a `/unit:delegate` work order
 - `scripts/delegate/verify.sh` — the `lint`, `fmt`, and `final` arms
 
 Deliberately not gated: `verify.sh check`/`test`/`example`, the workspace check
@@ -79,7 +79,7 @@ always, since a codex sub-session has no agent tool to launch anything with.
 
 ## delegate.conf
 
-The `/plan:delegate` tuning file: the convergence limits — how many automatic
+The `/unit:delegate` tuning file: the convergence limits — how many automatic
 fix rounds one phase runs before the gate remarks on how it is going — plus
 the progress-report interval. `MIN_REPAIR_BUDGET` is the floor every phase gets
 regardless of finding count (3);
@@ -98,7 +98,7 @@ made from what gets reported.
 `PLAN_DELEGATE_PROGRESS_INTERVAL_SECONDS` is the odd one out: seconds between
 user-facing progress reports while a phase is active, read by
 `scripts/delegate/progress_timer.sh` and by the main agent per
-`<ProgressContract/>` in `commands/plan/delegate.md` rather than by
+`<ProgressContract/>` in `commands/unit/delegate.md` rather than by
 `findings.py`. It has no default either — a missing or non-positive-integer
 value makes `progress_timer.sh` exit non-zero instead of timing at a length
 nobody chose.

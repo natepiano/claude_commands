@@ -1,5 +1,5 @@
 #!/usr/bin/env zsh
-# Unit status for /plan:produce's update schedule.
+# Unit status for /showrunner:produce's update schedule.
 # Usage: unit_status.sh <state-dir> <user-zone> <session>...
 # Each call scans every unit for a form or decision waiting on the user, then
 # reports the next unit in round-robin order.

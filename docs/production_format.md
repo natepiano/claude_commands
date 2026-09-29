@@ -1,15 +1,17 @@
 # Production format
 
-The shared contract for a **production**: several `/plan:delegate` runs building
-one deliverable in parallel, coordinated by one session. Four commands read or
-write this format and must not drift from it:
+The shared contract for a **production**: several `/unit:delegate` runs building
+one deliverable in parallel, coordinated by one session. The commands sit in one
+folder per role under `~/.claude/commands/`. These read or write this format and
+must not drift from it:
 
-- `/plan:greenlight` — judges whether phased plans should run as a production and
-  proposes the units.
-- `/plan:to_production` — splits the plans into unit plans and writes the
+- `/producer:greenlight` — judges whether phased plans should run as a
+  production and proposes the units.
+- `/producer:to_production` — splits the plans into unit plans and writes the
   production doc.
-- `/plan:produce` — runs the production from the showrunner session.
-- `/plan:delegate` — a unit's run; it applies <ProductionUnit/> below.
+- `/showrunner:produce` — runs the production from the showrunner session.
+- `/showrunner:dailies` — reports the production to the executive producer.
+- `/unit:delegate` — a unit's run; it applies <ProductionUnit/> below.
 
 ---
 
@@ -17,10 +19,14 @@ write this format and must not drift from it:
 
 - **Production** — the whole effort: its units, its merge branch, and its
   production doc.
-- **Showrunner** — the session running `/plan:produce`. It merges, tests, pushes,
+- **Executive producer** — the user. Every product, scope and irreversible
+  choice is theirs, and every report is to them.
+- **Producer** — the session that runs the `/producer:` commands: it greenlights
+  plans and splits them into a production doc and unit plans.
+- **Showrunner** — the session running `/showrunner:produce`. It merges, tests, pushes,
   makes the visual choices, clears waits between units, relays the user's words
   and reports on a schedule. It writes no implementation code.
-- **Unit** — one `/plan:delegate` run on one unit plan, in its own worktree,
+- **Unit** — one `/unit:delegate` run on one unit plan, in its own worktree,
   branch and session. Its session is that run's orchestrator, and its codex
   workers are its seats. A unit is named `<area>-unit`, e.g. `widget-unit`.
 - **Merge branch** — the branch every unit's checkpoints merge into. cargo-berth
@@ -45,7 +51,7 @@ The production doc sits beside the source plan as `<source-stem>-production.md`.
 
 ## Production Context
 
-- **Source plans:** <path(s)> — split on <date> by /plan:to_production
+- **Source plans:** <path(s)> — split on <date> by /producer:to_production
 - **Repository:** <main checkout path>
 - **Merge branch:** `<branch>` — every unit merges here; only the showrunner pushes it
 - **Showrunner checkout:** <path, on the merge branch>
@@ -54,7 +60,7 @@ The production doc sits beside the source plan as `<source-stem>-production.md`.
 - **Updates:** every <N> minutes, round robin across the units
 - **Merge tests:** <packages tested on every merge besides the changed ones, e.g. the
   app crate>; omit if none
-- **Capacity:** <cores and memory read by /plan:greenlight, and the unit count it allows>
+- **Capacity:** <cores and memory read by /producer:greenlight, and the unit count it allows>
 - **UX guide:** <path to the project's UX rules, e.g. `~/rust/hanadocs/ux`>; omit when
   nothing users see changes
 
@@ -102,7 +108,7 @@ Each gated phase carries its gate directly under the phase heading:
 ---
 
 <ProductionUnit>
-Applies to a `/plan:delegate` run whose plan header carries a
+Applies to a `/unit:delegate` run whose plan header carries a
 `> **Production:**` line. Read the production doc it names at the start of the
 run and after every compaction. Your row in its **Units** table gives your name,
 branch, port and the files you own.
@@ -175,7 +181,7 @@ branch, port and the files you own.
     apart.
 11. **Updates.** Each progress update is the recorder's `Phase <N> ETA: <time>`
     and the turn-end line, nothing more. The showrunner converts times into the
-    user's zone.
+    user's zone. When the showrunner asks for `/unit:eta`, run it at once.
 12. **Visual choices go to the showrunner.** Wording, spacing, layout, and
     which of two working options looks better are the showrunner's calls, made
     from the **UX guide**. Ask the showrunner, never the user. The showrunner

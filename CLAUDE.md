@@ -4,7 +4,7 @@
 - The forbidden-words list lives at `~/rust/nate_style/rust/forbidden-words.md`. It is enforced via `/rust_style` and `/style_eval` (loaded with the style guide), not at session start. Don't use those words in code, comments, or prose.
 
 ## decision criteria
-Applies to every session when coding and reviewing code. `/plan:delegate` imports the same file, where it defines `<DecisionEconomy/>`.
+Applies to every session when coding and reviewing code. `/unit:delegate` imports the same file, where it defines `<DecisionEconomy/>`.
 
 @~/.claude/docs/decision_criteria.md
 

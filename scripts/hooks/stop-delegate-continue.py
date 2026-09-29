@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Stop hook: keep a /plan:delegate run going across auto-compaction.
+"""Stop hook: keep a /unit:delegate run going across auto-compaction.
 
 Auto-compaction fires on the *next request*, never mid-turn. So an agent that
 ends its turn near the limit is doing the one thing that guarantees compaction
@@ -12,7 +12,7 @@ continuation is itself a new request, which is what actually lets compaction
 happen.
 
 It stays out of the way unless all of these hold:
-  * a /plan:delegate run is active in this session (marker file)
+  * a /unit:delegate run is active in this session (marker file)
   * context is at or past the same handoff threshold the PostToolUse hook uses
   * this turn is not already the product of a block (`stop_hook_active`)
   * the agent is the main thread, not a subagent
@@ -53,7 +53,7 @@ REASON = """\
 Delegate run active, {tokens:,} / {trigger:,} tokens ({percent}%). Do not end the \
 turn — compaction fires on the next request, never mid-turn, so stopping here is \
 what prevents it. Take the next workflow action and let it fire underneath you; \
-re-read ~/.claude/commands/plan/delegate.md afterwards.
+re-read ~/.claude/commands/unit/delegate.md afterwards.
 
 Waiting on a user decision instead? State it in one line and end the turn — this \
 will not block twice."""

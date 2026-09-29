@@ -98,7 +98,7 @@ table|json|csv`. Beyond those:
 
 **`--skill plan-delegate`** — the value is the store directory name under
 `~/.local/state/`, not the user-facing skill name. Every visible name says
-"delegate" (`/plan:delegate`, `[delegate.codex]`), but `--skill delegate` matches no
+"delegate" (`/unit:delegate`, `[delegate.codex]`), but `--skill delegate` matches no
 store. `plan-delegate` is the only one.
 
 ## Reading
