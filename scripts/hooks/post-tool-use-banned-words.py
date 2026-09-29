@@ -1,5 +1,11 @@
 #!/usr/bin/env python3
-"""PostToolUse hook: check Write/Edit/MultiEdit content for banned words.
+"""PostToolUse hook: check the text a tool call writes, and its output, for banned words.
+
+What is scanned per tool is defined once, in tool_call_text.scan_text: text a
+call removes or searches for (an Edit's old_string, the old side of a scripted
+replacement or the pattern of a grep in a Bash command) is never scanned, and a
+banned word in that text is not reported in the tool's output either; the rest
+of the output is.
 
 User sees a one-line systemMessage; agent sees the full violation list and
 recovery instructions via hookSpecificOutput.additionalContext. Local counters
@@ -9,7 +15,7 @@ are updated by the hook itself.
 import json
 import sys
 from pathlib import Path
-from typing import TypedDict, cast
+from typing import cast
 
 sys.path.insert(0, str(Path(__file__).parent))
 from banned_words_lib import (
@@ -25,53 +31,7 @@ from banned_words_lib import (
     is_read_only_command,
     is_read_only_tool,
 )
-
-
-class EditEntry(TypedDict, total=False):
-    new_string: str
-
-
-class ToolInput(TypedDict, total=False):
-    content: str
-    cmd: str
-    new_string: str
-    edits: list[EditEntry]
-    file_path: str
-    command: str
-    description: str
-
-
-class ToolResponse(TypedDict, total=False):
-    output: str
-    stdout: str
-    stderr: str
-
-
-class HookPayload(TypedDict, total=False):
-    tool_name: str
-    tool_input: ToolInput
-    tool_response: ToolResponse
-
-
-def extract_text(tool_name: str, tool_input: ToolInput, tool_response: ToolResponse) -> str:
-    parts: list[str] = []
-    if tool_name == "Write":
-        parts.append(tool_input.get("content", "") or "")
-    elif tool_name == "Edit":
-        parts.append(tool_input.get("new_string", "") or "")
-    elif tool_name == "MultiEdit":
-        edits: list[EditEntry] = tool_input.get("edits", []) or []
-        parts.extend(e.get("new_string", "") or "" for e in edits)
-    else:
-        parts.append(tool_input.get("command", "") or "")
-        parts.append(tool_input.get("cmd", "") or "")
-        parts.append(tool_input.get("description", "") or "")
-        parts.append(tool_input.get("content", "") or "")
-        parts.append(tool_input.get("new_string", "") or "")
-    parts.append(tool_response.get("output", "") or "")
-    parts.append(tool_response.get("stdout", "") or "")
-    parts.append(tool_response.get("stderr", "") or "")
-    return "\n".join(p for p in parts if p)
+from tool_call_text import HookPayload, ToolInput, ToolResponse, scan_text
 
 
 def main() -> None:
@@ -98,7 +58,7 @@ def main() -> None:
         if isinstance(raw_tool_response, dict)
         else ToolResponse()
     )
-    file_path: str = tool_input.get("file_path", "") or ""
+    file_path: str = tool_input.get("file_path", "") or tool_input.get("notebook_path", "") or ""
 
     if file_path:
         try:
@@ -121,7 +81,7 @@ def main() -> None:
     ):
         sys.exit(0)
 
-    text: str = extract_text(tool_name, tool_input, tool_response)
+    text: str = scan_text(tool_name, tool_input, tool_response)
     if not text:
         sys.exit(0)
 

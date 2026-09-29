@@ -429,6 +429,11 @@ def _entry_pattern(stem: str, override: str | None = None) -> re.Pattern[str]:
     return _stem_pattern(stem)
 
 
+def entry_pattern(stem: str) -> re.Pattern[str]:
+    """The pattern `find_violations` matches `stem` with, `regex:` override applied."""
+    return _entry_pattern(stem, load_overrides().get(stem))
+
+
 def bump_counters(stems: Iterable[str]) -> dict[str, CounterRecord]:
     """Increment local hit counters and return new totals for bumped stems."""
     unique = list(dict.fromkeys(stems))
