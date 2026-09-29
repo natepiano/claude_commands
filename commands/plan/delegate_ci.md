@@ -15,6 +15,10 @@ Everything below is the contract.
 ---
 
 <PeriodicCI>
+A production unit (plan header carries `> **Production:**`) skips this
+contract and <CICleanup/>: the showrunner runs CI on the merge branch
+(`~/.claude/docs/production_format.md` → <ProductionUnit/>).
+
 Loop and verbose only; `single` never pushes. Applies only when the plan doc
 has five or more phases, counting every `### Phase N — … · status:` heading,
 `done` ones included. A shorter plan skips this contract and <CICleanup/>.

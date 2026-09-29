@@ -70,6 +70,7 @@ it:
 | <ResolveStyleDiffBase/>, <RunProjectStyleReview/> | `commands/plan/delegate_style.md` | `/plan:delegate_style` |
 | <PeriodicCI/>, <CICleanup/> | `commands/plan/delegate_ci.md` | `/plan:delegate_ci` |
 | <ComposeWorkOrder/> | `docs/delegate/compose_work_order.md` | — |
+| <ProductionUnit/> | `docs/production_format.md` | — |
 
 Paths are under `~/.claude/`.
 </TagReferenceContract>
@@ -97,6 +98,18 @@ Paths are under `~/.claude/`.
   settled by the plan. Do not expose sandbox flags, scripts, status files,
   ledger ids, or other tooling mechanics in user-facing reports.
 </CoreContract>
+
+<ProductionUnit>
+When the plan header carries a `> **Production:**` line, this run is a unit of
+that production. Read `~/.claude/docs/production_format.md` → <ProductionUnit/>
+in full at <PrepareSession/> and after every compaction, and apply it
+throughout. It changes four things in this command:
+- it adds one commit kind to <CoreContract/>: merging the production's merge
+  branch into this branch;
+- it replaces <PeriodicCI/> and <CICleanup/>, because the showrunner runs CI;
+- it sends a checkpoint notice after <RecordPhaseCompletion/>;
+- it adds a landing rule to the repair rounds in <FixDispatch/>.
+</ProductionUnit>
 
 <TurnEndGate>
 Ending a turn is an action this command authorizes, never a default it falls
@@ -906,7 +919,8 @@ For every decision raised by review, repair, or phase review:
 Execute in order:
 
 Apply <CoreContract/>, <TurnEndGate/>, <CompactionContract/>,
-<UserFacingText/>, and <VerificationNarration/> throughout.
+<UserFacingText/>, and <VerificationNarration/> throughout, and
+<ProductionUnit/> when the plan header names a production.
 
 The numbered steps below carry no turn boundaries. Consecutive steps run in one
 turn unless <TurnEndGate/> authorizes a stop between them. Steps 11 through 16

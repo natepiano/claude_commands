@@ -12,6 +12,9 @@ commands read or write this format and must not drift from it:
   leaving the live zone and Delegation Context untouched.
 - `/plan:to_as_built` — distills the completed plan into an as-built overview.
 
+`/plan:to_production` also writes this format when it splits a plan into unit
+plans for a production (`~/.claude/docs/production_format.md`).
+
 The single design goal: **a compacted orchestrator can dispatch any remaining
 phase by copy-and-assemble, with zero codebase research.** Everything expensive
 to rediscover after a context compaction lives in the doc.
@@ -30,6 +33,11 @@ to rediscover after a context compaction lives in the doc.
      amend = on completion, fold the shipped changes into the named existing
      as-built docs — no new doc; create (or line absent) = distill a new as-built doc. -->
 > **As-built disposition: <amend | create>** — <amend: name the target as-built docs>
+
+<!-- Optional; set by /plan:to_production when the plan is one unit of a production.
+     Preserved verbatim by every command that edits this doc. /plan:delegate reads
+     it and applies <ProductionUnit/> from ~/.claude/docs/production_format.md. -->
+> **Production: <name>** — unit `<unit>`; production doc `<path>`
 
 ## Delegation Context
 <!-- Shared across all phases. /plan:delegate prepends this to every dispatch. -->
