@@ -306,9 +306,9 @@ stderr_out="$(agents_set_row bare.work opus:high 2>&1 >/dev/null || true)"
 [[ "$stderr_out" == *"no [bare.claude]"* ]] || fail "missing inferred-family set did not name the section"
 
 function_list="$(agents_list_function editable)"
-printf '%s\n' "$function_list" | grep -q '^task=editable.work family=codex agent=gpt-test effort=high active=yes$' \
+printf '%s\n' "$function_list" | grep -q '^task=editable.work family=codex agent=gpt-test effort=high active=yes tier=inherit$' \
     || fail "active codex row was not marked active"
-printf '%s\n' "$function_list" | grep -q '^task=editable.work family=claude agent=opus effort=max active=no$' \
+printf '%s\n' "$function_list" | grep -q '^task=editable.work family=claude agent=opus effort=max active=no tier=-$' \
     || fail "dormant claude row was not marked inactive"
 
 write_fixture "$TEST_DIR/list.conf"
@@ -477,9 +477,9 @@ agents_set_all_assignments codex
 cmp "$before" "$AGENTS_CONFIG_FILE" || fail "switch-all reversal around a caller was not byte-identical"
 
 function_list="$(AGENTS_CALLER_FAMILY=claude agents_list_function friend)"
-printf '%s\n' "$function_list" | grep -q '^task=friend.work family=claude agent=opus effort=max active=yes$' \
+printf '%s\n' "$function_list" | grep -q '^task=friend.work family=claude agent=opus effort=max active=yes tier=-$' \
     || fail "caller function did not mark the calling family live"
-printf '%s\n' "$function_list" | grep -q '^task=friend.work family=codex agent=gpt-test effort=high active=no$' \
+printf '%s\n' "$function_list" | grep -q '^task=friend.work family=codex agent=gpt-test effort=high active=no tier=inherit$' \
     || fail "caller function marked the other family live"
 printf '%s\n' "$function_list" | grep -q '^# current family: caller .*claude here' \
     || fail "caller function did not report the detected family"
@@ -545,5 +545,168 @@ agents_resolve untiered.work
 assert_fails "unknown service tier" agents_resolve mistyped.work
 stderr_out="$(agents_resolve mistyped.work 2>&1 >/dev/null || true)"
 [[ "$stderr_out" == *"Allowed values: fast, flex, default"* ]] || fail "unknown tier error did not list the allowed values"
+
+# A codex row with no registry tier shows what ~/.codex/config.toml gives it.
+printf 'model = "gpt-test"\nservice_tier = "fast"\n\n[profiles.x]\nservice_tier = "flex"\n' > "$TEST_DIR/codex-fast.toml"
+assignment_list="$(CODEX_CONFIG_FILE="$TEST_DIR/codex-fast.toml" agents_list_assignments untiered)"
+[[ "$assignment_list" == *"task=untiered.work family=codex agent=gpt-test effort=high tier=inherit(fast)"* ]] \
+    || fail "inherited tier did not show the Codex config value"
+assignment_list="$(agents_list_assignments tiered)"
+[[ "$assignment_list" == *"task=tiered.work family=codex agent=gpt-test effort=high tier=fast"* ]] \
+    || fail "resolved listing did not show the registry tier"
+[[ "$assignment_list" == *"task=tiered.claude_task family=claude agent=opus effort=max tier=-"* ]] \
+    || fail "claude row showed a tier"
+
+# Setting the tier at each level. `resting` runs claude, so its tier is stored
+# and dormant; `clauded` has no codex set, so nothing is written for it.
+cat > "$TEST_DIR/tierset.conf" <<'EOF'
+[assignments]
+kept=codex
+bare=codex
+resting=claude
+friend=caller
+clauded=claude
+
+[kept.codex]
+work=gpt-test:high
+check=gpt-test:high
+
+[kept.claude]
+work=opus:max
+check=opus:max
+
+[kept.options]
+codex_mesh=1    # another launch flag
+codex_service_tier=flex    # tuned
+
+[bare.codex]
+work=gpt-test:high
+
+[bare.claude]
+work=opus:max
+
+# ── next block ──
+[resting.codex]
+work=gpt-test:high
+
+[resting.claude]
+work=opus:max
+
+[friend.codex]
+work=gpt-test:high
+
+[friend.claude]
+work=opus:max
+
+[clauded.claude]
+work=opus:max
+
+[codex.agents]
+gpt-test=low,medium,high
+
+[claude.agents]
+opus=low,medium,high,max
+EOF
+write_fixture "$TEST_DIR/tierset.conf"
+before="$TEST_DIR/tierset-before.conf"
+expected="$TEST_DIR/tierset-expected.conf"
+cp "$AGENTS_CONFIG_FILE" "$before"
+
+# A function without an options section gets one after its last row.
+awk '{ print }
+     $0 == "[bare.claude]" { in_sec = 1 }
+     in_sec && $0 == "work=opus:max" { print ""; print "[bare.options]"; print "codex_service_tier=fast"; in_sec = 0 }' \
+    "$before" > "$expected"
+agents_set_service_tier fast bare
+cmp "$expected" "$AGENTS_CONFIG_FILE" || fail "function tier did not add an options section after the function's rows"
+agents_resolve bare.work
+[[ "$AGENT_SERVICE_TIER" == "fast" ]] || fail "function tier did not resolve"
+agents_set_service_tier inherit bare
+cmp "$before" "$AGENTS_CONFIG_FILE" || fail "inherit did not remove the section it emptied, byte for byte"
+
+# An existing key is replaced in place; inherit keeps the section's other flags.
+sed 's/^codex_service_tier=flex    # tuned$/codex_service_tier=fast    # tuned/' "$before" > "$expected"
+agents_set_service_tier fast kept
+cmp "$expected" "$AGENTS_CONFIG_FILE" || fail "function tier did not replace the key in place"
+sed '/^codex_service_tier=flex/d' "$before" > "$expected"
+agents_set_service_tier inherit kept
+cmp "$expected" "$AGENTS_CONFIG_FILE" || fail "inherit removed more than the tier key"
+[[ "$(_agents_registry_get kept.options codex_mesh)" == "1" ]] || fail "inherit dropped another launch flag"
+
+# A row key beats its function's key; inherit on the row falls back to it.
+write_fixture "$TEST_DIR/tierset.conf"
+awk '{ print } /^codex_service_tier=flex/ { print "codex_service_tier.check=default" }' "$before" > "$expected"
+agents_set_service_tier default kept.check
+cmp "$expected" "$AGENTS_CONFIG_FILE" || fail "row tier was not written after the section's last key"
+agents_resolve kept.check
+[[ "$AGENT_SERVICE_TIER" == "default" ]] || fail "row tier did not beat the function's tier"
+agents_resolve kept.work
+[[ "$AGENT_SERVICE_TIER" == "flex" ]] || fail "row tier leaked onto a sibling row"
+function_list="$(agents_list_function kept)"
+printf '%s\n' "$function_list" | grep -q '^task=kept.check family=codex agent=gpt-test effort=high active=yes tier=default$' \
+    || fail "row tier was not shown on its row"
+agents_set_service_tier inherit kept.check
+cmp "$before" "$AGENTS_CONFIG_FILE" || fail "row inherit did not restore the file"
+
+# A function-level write clears the row keys beneath it.
+agents_set_service_tier default kept.check
+agents_set_service_tier fast kept
+agents_resolve kept.check
+[[ "$AGENT_SERVICE_TIER" == "fast" ]] || fail "function tier left a row key in charge"
+if grep -q '^codex_service_tier.check=' "$AGENTS_CONFIG_FILE"; then fail "function tier did not clear the row key"; fi
+
+# Every function at once: each function with a codex set, row keys cleared.
+write_fixture "$TEST_DIR/tierset.conf"
+agents_set_service_tier default kept.check
+agents_set_service_tier fast
+[[ "$AGENT_TIER_FUNCTIONS" == "kept bare resting friend" ]] || fail "every-function tier covered '$AGENT_TIER_FUNCTIONS'"
+for fn in kept bare resting friend; do
+    [[ "$(_agents_registry_get "$fn.options" codex_service_tier)" == "fast" ]] || fail "every-function tier missed $fn"
+done
+if _agents_config_has_section clauded.options; then fail "every-function tier wrote a function with no codex set"; fi
+if grep -q '^codex_service_tier.check=' "$AGENTS_CONFIG_FILE"; then fail "every-function tier did not clear a row key"; fi
+
+# A claude function keeps its tier dormant: stored, shown, never passed on.
+agents_resolve resting.work
+[[ "$AGENT_FAMILY" == "claude" && -z "$AGENT_SERVICE_TIER" ]] || fail "a claude function carried its dormant tier"
+function_list="$(agents_list_function resting)"
+printf '%s\n' "$function_list" | grep -q '^task=resting.work family=codex agent=gpt-test effort=high active=no tier=fast$' \
+    || fail "dormant tier was not shown on the codex row"
+sed '/^codex_service_tier=flex/d' "$before" > "$expected"
+agents_set_service_tier inherit
+cmp "$expected" "$AGENTS_CONFIG_FILE" || fail "every-function inherit did not clear every key and emptied section"
+
+# Rejections leave the file alone.
+write_fixture "$TEST_DIR/tierset.conf"
+assert_fails "unknown tier word" agents_set_service_tier fsat kept
+assert_fails "tier for an unknown function" agents_set_service_tier fast absent
+assert_fails "tier for a function with no codex set" agents_set_service_tier fast clauded
+assert_fails "tier for an unknown row" agents_set_service_tier fast kept.absent
+assert_fails "tier for a three-segment task" agents_set_service_tier fast kept.work.x
+assert_fails "tier for an empty sub-task" agents_set_service_tier fast kept.
+cmp "$before" "$AGENTS_CONFIG_FILE" || fail "a rejected tier changed the registry"
+
+# agent_admin.sh routes a tier word at each level and says whether it runs.
+admin_first_line() {
+    local output
+    output="$(AGENTS_CONFIG_FILE="$AGENTS_CONFIG_FILE" CODEX_CONFIG_FILE="$CODEX_CONFIG_FILE" \
+        CODEX_MODELS_CACHE_FILE="$CODEX_MODELS_CACHE_FILE" \
+        CODEX_CATALOG_SYNC_STATE_FILE="$CODEX_CATALOG_SYNC_STATE_FILE" \
+        bash "$SCRIPT_DIR/agent_admin.sh" "$@")"
+    printf '%s' "${output%%$'\n'*}"
+}
+[[ "$(admin_first_line bare fast)" == "# set [bare.options] codex_service_tier=fast — live" ]] \
+    || fail "function tier message is wrong"
+[[ "$(admin_first_line resting.work flex)" == "# set [resting.options] codex_service_tier.work=flex — dormant: resting.work runs on claude. Make it live with: agent_admin.sh resting codex" ]] \
+    || fail "dormant row tier message is wrong"
+[[ "$(admin_first_line friend fast)" == "# set [friend.options] codex_service_tier=fast — live whenever a codex session runs friend" ]] \
+    || fail "caller tier message is wrong"
+[[ "$(admin_first_line kept.check inherit)" == "# cleared kept.check's own tier — it follows [kept.options] codex_service_tier: flex" ]] \
+    || fail "row inherit message is wrong"
+[[ "$(admin_first_line fast)" == "# set codex_service_tier=fast for every function — dormant for resting: they run on claude" ]] \
+    || fail "every-function tier message is wrong"
+[[ "$(admin_first_line inherit)" == "# cleared every function's codex tier — codex rows follow ~/.codex/config.toml, which sets no service_tier" ]] \
+    || fail "every-function inherit message is wrong"
+cmp "$expected" "$AGENTS_CONFIG_FILE" || fail "agent_admin.sh inherit did not clear every key"
 
 echo "agents_config tests passed"

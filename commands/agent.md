@@ -4,7 +4,7 @@ description: Show or edit agent family, agent, and effort assignments in the sha
 
 # agent
 
-`$ARGUMENTS` — optional: `skills`, `<function>`, `<family>`, `<agent>`, `<function> <family>`, `<function> <agent>`, or `<function>.<subtask> <agent>[:<effort>]`.
+`$ARGUMENTS` — optional: `skills`, `<function>`, `<family>`, `<agent>`, `<tier>`, `<function> <family>`, `<function> <agent>`, `<function> <tier>`, `<function>.<subtask> <agent>[:<effort>]`, or `<function>.<subtask> <tier>`.
 
 Run:
 
@@ -18,7 +18,7 @@ Relay the script's stdout and stderr exactly, except status output — see below
 
 ## Status
 
-No arguments prints every function's active family and resolved rows (one `task=… family=… agent=… effort=…` line per row); `/agent <function>` prints that function's rows for **both** families — each carrying an extra `active=yes|no` field — followed by a `# current family: X` comment line, with examples tuned to it. Both forms are followed by a blank line and the usage/examples block. **Always render the row lines as a markdown table** — never relay them raw. Use columns `task | family | agent | effort` for the no-argument form, and `task | family | agent | effort | active` for the `/agent <function>` form. Render the `# current family: X` line as plain text immediately after the table. An empty effort field means the agent CLI default; `active=no` means the row is stored but dormant — switching the function's family is what makes it live. Relay the usage/examples block after the table in a code block, and any warnings or errors exactly as printed.
+No arguments prints every function's active family and resolved rows (one `task=… family=… agent=… effort=… tier=…` line per row); `/agent <function>` prints that function's rows for **both** families — each carrying an extra `active=yes|no` field before `tier` — followed by a `# current family: X` comment line, with examples tuned to it. Both forms are followed by a blank line and the usage/examples block. **Always render the row lines as a markdown table** — never relay them raw. Use columns `task | family | agent | effort | tier` for the no-argument form, and `task | family | agent | effort | active | tier` for the `/agent <function>` form. Render the `# current family: X` line as plain text immediately after the table. An empty effort field means the agent CLI default; `tier` is the codex speed tier — `inherit(<x>)` means no registry tier, so `~/.codex/config.toml` gives `<x>`, and `-` marks a claude row, which never takes one; `active=no` means the row is stored but dormant — switching the function's family is what makes it live. Relay the usage/examples block after the table in a code block, and any warnings or errors exactly as printed.
 
 `/agent skills` prints the unique list of configured skills (one per line, no usage block) — relay it as-is.
 
@@ -42,7 +42,7 @@ The switch is rejected if any row in the target family set is invalid.
 
 A bare family name — no function — moves every `[assignments]` entry to that family, exact-task overrides included. It is validated wholesale first: one function missing a set for that family, or one invalid row in any of them, rejects the whole switch and leaves the registry untouched.
 
-On success it prints `# switched every function to <family>` followed by the no-argument status output (rows in `task | family | agent | effort` form) and the usage block. Render the `# switched …` line as plain text first, then the rows per the Status rules above.
+On success it prints `# switched every function to <family>` followed by the no-argument status output (rows in `task | family | agent | effort | tier` form) and the usage block. Render the `# switched …` line as plain text first, then the rows per the Status rules above.
 
 ## Put functions on one agent
 
@@ -65,6 +65,18 @@ The agent names its own family — `[codex.agents]` and `[claude.agents]` share 
 
 On success the edit prints a `# updated [<function>.<family>] <task> — live|dormant` line, then the affected function's rows and usage (same output as `/agent <function>`). Render the `# updated …` line as plain text first, then the rows per the Status rules above.
 
+## Set the codex speed tier
+
+```text
+/agent <fast|flex|default|inherit>
+/agent <function> <fast|flex|default|inherit>
+/agent <function>.<subtask> <fast|flex|default|inherit>
+```
+
+Writes `codex_service_tier` (or `codex_service_tier.<subtask>`, which beats it) in `[<function>.options]`, for every function with a codex set, one function, or one row. `inherit` deletes the key: a row then follows its function, a function `~/.codex/config.toml`. A wider level clears the row keys beneath it. Claude rows never take a tier — Claude fast mode bills extra usage — so a tier on a function running claude is stored dormant.
+
+It prints a `# set …` or `# cleared …` line, then `/agent <function>` output for a function or row, or no-argument status output for every function. Render the `#` line as plain text first, then the rows per the Status rules above.
+
 ## Examples
 
 ```text
@@ -76,6 +88,8 @@ On success the edit prints a `# updated [<function>.<family>] <task> — live|do
 /agent delegate claude                    /unit:delegate switches to the claude family
 /agent delegate.review gpt-5.6-sol:max     set agent and effort for one subtask
 /agent cli.commit_prep sonnet             set agent, keep the CLI default effort
+/agent delegate fast                      every codex delegate row on the fast tier
+/agent delegate.review inherit            review follows delegate's tier again
 ```
 
 `sonnet` is a claude agent, so that last example edits `[cli.claude]` even while `cli` runs on codex — it reports the row dormant and leaves the live codex row alone. To make it live: `/agent cli claude`.

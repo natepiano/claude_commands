@@ -49,7 +49,7 @@ usage() {
         fi
     fi
     cat <<EOF
-Usage: agent_admin.sh [skills | <function> | <family> | <agent>] | <function> <codex|claude|agent> | <function>.<subtask> <agent>[:<effort>]
+Usage: agent_admin.sh [skills | <function> | <family> | <agent> | <tier>] | <function> <codex|claude|agent|tier> | <function>.<subtask> <agent>[:<effort>|tier]
 
   (no args)                print every function, its family, and its resolved rows
   skills                   print the list of configured skills for use with agents
@@ -70,6 +70,13 @@ Usage: agent_admin.sh [skills | <function> | <family> | <agent>] | <function> <c
                            naming a dormant family's agent edits that row and
                            says so rather than erroring. Omit :<effort> to use
                            the agent CLI default
+  [<function>[.<subtask>]] <tier>
+                           set the codex speed tier for every function, one
+                           function, or one row: fast, flex, default, or
+                           inherit (drop the key; a row then follows its
+                           function, a function ~/.codex/config.toml). A wider
+                           level clears the row keys beneath it. Claude rows
+                           never take a tier: Claude fast mode bills extra usage
 
 Examples:
   agent_admin.sh $ex_fn
@@ -78,10 +85,77 @@ Examples:
   agent_admin.sh $ex_fn $ex_other
   agent_admin.sh $ex_row $ex_pair
   agent_admin.sh $ex_row ${ex_pair%%:*}   # keep the agent CLI default effort
+  agent_admin.sh $ex_fn fast   # codex speed tier for one function
+  agent_admin.sh $ex_row inherit   # the row follows its function's tier
 
 Functions/subtasks come from [assignments] and [<function>.<family>] in
 config/agents.conf; valid agents and efforts from [<family>.agents].
 EOF
+}
+
+is_tier() {
+    case "$1" in
+        fast|flex|default|inherit) return 0 ;;
+    esac
+    return 1
+}
+
+# What a codex row with no registry tier follows.
+codex_config_note() {
+    local tier
+    tier="$(_agents_codex_config_tier)"
+    if [[ -n "$tier" ]]; then
+        printf '~/.codex/config.toml: %s' "$tier"
+    else
+        printf '~/.codex/config.toml, which sets no service_tier'
+    fi
+}
+
+# Whether a tier written for <function> (or <function>.<subtask>) runs today.
+tier_liveness() {
+    local fn="$1" subtask="${2:-}" raw
+    if [[ -n "$subtask" ]]; then
+        raw="$(_agents_active_family "$fn" "$subtask")"
+    else
+        raw="$(_agents_registry_get assignments "$fn")"
+    fi
+    if [[ "$raw" == "$AGENTS_CALLER_ASSIGNMENT" ]]; then
+        echo "live whenever a codex session runs $fn"
+    elif [[ "$raw" == "codex" ]]; then
+        echo "live"
+    else
+        echo "dormant: ${fn}${subtask:+.$subtask} runs on $raw. Make it live with: agent_admin.sh $fn codex"
+    fi
+}
+
+# Set a tier and print the `#` line that reports it.
+set_tier() {
+    local tier="$1" scope="${2:-}" fn subtask="" dormant=""
+    agents_set_service_tier "$tier" "$scope"
+    if [[ -z "$scope" ]]; then
+        for fn in $AGENT_TIER_FUNCTIONS; do
+            [[ "$(_agents_registry_get assignments "$fn")" == "claude" ]] && dormant="$dormant, $fn"
+        done
+        if [[ "$tier" == "inherit" ]]; then
+            echo "# cleared every function's codex tier — codex rows follow $(codex_config_note)"
+        elif [[ -n "$dormant" ]]; then
+            echo "# set codex_service_tier=$tier for every function — dormant for${dormant#,}: they run on claude"
+        else
+            echo "# set codex_service_tier=$tier for every function — live"
+        fi
+        return 0
+    fi
+    fn="${scope%%.*}"
+    [[ "$scope" == *.* ]] && subtask="${scope#*.}"
+    if [[ "$tier" != "inherit" ]]; then
+        echo "# set [$fn.options] codex_service_tier${subtask:+.$subtask}=$tier — $(tier_liveness "$fn" "$subtask")"
+    elif [[ -z "$subtask" ]]; then
+        echo "# cleared $fn's codex tier — its codex rows follow $(codex_config_note)"
+    elif [[ -n "$(_agents_registry_get "$fn.options" codex_service_tier)" ]]; then
+        echo "# cleared $scope's own tier — it follows [$fn.options] codex_service_tier: $(_agents_registry_get "$fn.options" codex_service_tier)"
+    else
+        echo "# cleared $scope's own tier — it follows $(codex_config_note)"
+    fi
 }
 
 # Accept the user-facing command name while preserving the canonical registry
@@ -113,6 +187,13 @@ elif [[ "$#" -eq 1 ]]; then
         list_skills
         exit 0
     fi
+    if is_tier "$1"; then
+        set_tier "$1"
+        agents_list_assignments
+        echo ""
+        usage
+        exit 0
+    fi
     # A bare family name switches everything; no function is ever named for one.
     if _agents_config_has_section "$1.agents"; then
         agents_set_all_assignments "$1"
@@ -135,7 +216,10 @@ elif [[ "$#" -eq 1 ]]; then
     echo ""
     usage "$1"
 elif [[ "$#" -eq 2 ]]; then
-    if [[ "$1" == *.* ]]; then
+    if is_tier "$2"; then
+        set_tier "$2" "$1"
+        fn="${1%%.*}"
+    elif [[ "$1" == *.* ]]; then
         agents_set_row "$1" "$2"
         fn="${1%%.*}"
         if [[ "$AGENT_ROW_ASSIGNMENT" == "$AGENTS_CALLER_ASSIGNMENT" ]]; then

@@ -52,9 +52,9 @@ cli_agent_run() {
         codex)
             read -r -a agent_args <<< "$(agents_codex_args)"
             if [[ -z "$invocation" ]]; then
-                exec codex "${agent_args[@]}" -c service_tier="fast"
+                exec codex "${agent_args[@]}"
             fi
-            exec codex "${agent_args[@]}" -c service_tier="fast" "$invocation"
+            exec codex "${agent_args[@]}" "$invocation"
             ;;
         claude)
             read -r -a agent_args <<< "$(agents_claude_args)"

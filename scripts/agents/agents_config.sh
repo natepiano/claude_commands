@@ -327,13 +327,21 @@ _agents_resolve_in_family() {
 # `service_tier` from ~/.codex/config.toml. Codex drops a tier it does not
 # recognise without a word and runs at standard speed, so an unknown value is
 # refused here instead.
+# A row's own `codex_service_tier.<subtask>` beats the function's key.
+_agents_stored_service_tier() {
+    local function="$1" subtask="$2" tier
+    tier="$(_agents_registry_get "$function.options" "codex_service_tier.$subtask")"
+    [[ -n "$tier" ]] || tier="$(_agents_registry_get "$function.options" codex_service_tier)"
+    printf '%s' "$tier"
+}
+
 _agents_resolve_service_tier() {
     local task="$1" family="$2" function tier
 
     AGENT_SERVICE_TIER=""
     [[ "$family" == "codex" ]] || return 0
     function="${task%%.*}"
-    tier="$(_agents_registry_get "$function.options" codex_service_tier)"
+    tier="$(_agents_stored_service_tier "$function" "${task#*.}")"
     case "$tier" in
         ''|fast|flex|default) AGENT_SERVICE_TIER="$tier" ;;
         *)
@@ -344,19 +352,52 @@ _agents_resolve_service_tier() {
     esac
 }
 
+# The top-level `service_tier` in ~/.codex/config.toml: what a codex row with no
+# registry tier runs at. Empty when the Codex config sets none.
+_agents_codex_config_tier() {
+    local line
+    [[ -f "$CODEX_CONFIG_FILE" ]] || return 0
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        line="$(agents_config_trim "${line%%#*}")"
+        [[ "$line" == \[* ]] && return 0
+        if [[ "$line" =~ ^service_tier[[:space:]]*=[[:space:]]*\"?([^\"]*)\"?$ ]]; then
+            printf '%s' "${BASH_REMATCH[1]}"
+            return 0
+        fi
+    done < "$CODEX_CONFIG_FILE"
+}
+
+# A row's tier as /agent shows it: `-` for claude, which never takes one; the
+# registry tier for codex, or `inherit(<config.toml tier>)` when there is none.
+_agents_tier_display() {
+    local family="$1" tier="$2"
+    if [[ "$family" != "codex" ]]; then
+        printf '%s' '-'
+    elif [[ -n "$tier" ]]; then
+        printf '%s' "$tier"
+    else
+        tier="$(_agents_codex_config_tier)"
+        printf 'inherit%s' "${tier:+($tier)}"
+    fi
+}
+
+_agents_print_resolved() {
+    printf 'task=%s family=%s agent=%s effort=%s tier=%s\n' \
+        "$1" "$AGENT_FAMILY" "$AGENT_MODEL" "$AGENT_EFFORT" \
+        "$(_agents_tier_display "$AGENT_FAMILY" "$AGENT_SERVICE_TIER")"
+}
+
 agents_resolve_print() {
     local task="$1"
     agents_resolve "$task" || return 1
-    printf 'task=%s family=%s agent=%s effort=%s\n' \
-        "$task" "$AGENT_FAMILY" "$AGENT_MODEL" "$AGENT_EFFORT"
+    _agents_print_resolved "$task"
 }
 
 _agents_resolve_print_in_family() {
     local task="$1" family="$2"
     AGENT_FAMILY="$family"
     _agents_resolve_in_family "$task" "$family" || return 1
-    printf 'task=%s family=%s agent=%s effort=%s\n' \
-        "$task" "$AGENT_FAMILY" "$AGENT_MODEL" "$AGENT_EFFORT"
+    _agents_print_resolved "$task"
 }
 
 # Print one function's rows in one family, skipping sub-tasks an exact-task
@@ -415,7 +456,7 @@ agents_list_assignments() {
 # active family (plus any per-subtask assignment overrides).
 agents_list_function() {
     local function="$1" active family line key subtask pair model effort overrides=""
-    local row_active live
+    local row_active live tier
 
     active="$(_agents_registry_get assignments "$function")"
     if [[ -z "$active" ]]; then
@@ -436,8 +477,11 @@ agents_list_function() {
             else
                 row_active="no"
             fi
-            printf 'task=%s family=%s agent=%s effort=%s active=%s\n' \
-                "$function.$subtask" "$family" "$model" "$effort" "$row_active"
+            tier=""
+            [[ "$family" == "codex" ]] && tier="$(_agents_stored_service_tier "$function" "$subtask")"
+            tier="$(_agents_tier_display "$family" "$tier")"
+            printf 'task=%s family=%s agent=%s effort=%s active=%s tier=%s\n' \
+                "$function.$subtask" "$family" "$model" "$effort" "$row_active" "$tier"
         done < <(_agents_config_section_values "$function.$family")
     done
     while IFS= read -r line; do
@@ -792,6 +836,154 @@ agents_set_row() {
     else
         AGENT_ROW_ACTIVE="no"
     fi
+}
+
+# Set the codex speed tier for every function, for <function>, or for one
+# <function>.<subtask> row; `inherit` deletes the key at that level. A row key
+# beats its function's key, so a function or every-function write also deletes
+# the row keys beneath it: every codex row in scope then runs the named tier.
+# Only functions with a codex set are written. A function running claude keeps
+# the key dormant until it switches. A new [<function>.options] goes after the
+# function's last row, and a section left empty by `inherit` goes with it, so a
+# set and its inherit round-trip byte for byte. Sets AGENT_TIER_FUNCTIONS, the
+# functions in scope.
+agents_set_service_tier() {
+    local tier="$1" scope="${2:-}" function subtask="" line fn fns="" value="" tmp_file
+
+    case "$tier" in
+        fast|flex|default) value="$tier" ;;
+        inherit) ;;
+        *)
+            echo "ERROR: '$tier' is not a codex service tier." >&2
+            echo "       Allowed: fast, flex, default, or inherit to follow ~/.codex/config.toml" >&2
+            return 1
+            ;;
+    esac
+    if [[ -z "$scope" ]]; then
+        while IFS= read -r line; do
+            fn="${line%%=*}"
+            fn="${fn%%.*}"
+            case " $fns " in
+                *" $fn "*) continue ;;
+            esac
+            _agents_config_has_section "$fn.codex" && fns="$fns $fn"
+        done < <(_agents_config_section_values assignments)
+        if [[ -z "$fns" ]]; then
+            echo "ERROR: no function in [assignments] has a codex set; nothing takes a codex tier." >&2
+            return 1
+        fi
+    else
+        function="${scope%%.*}"
+        [[ "$scope" == *.* ]] && subtask="${scope#*.}"
+        if [[ -z "$function" || "$subtask" == *.* || ( "$scope" == *. ) ]]; then
+            echo "ERROR: '$scope' must be <function> or <function>.<subtask>." >&2
+            return 1
+        fi
+        if [[ -z "$(_agents_registry_get assignments "$function")" ]]; then
+            echo "ERROR: no [assignments] entry for '$function'." >&2
+            echo "       Configured assignments in $AGENTS_CONFIG_FILE: $(_agents_section_keys_inline assignments)" >&2
+            return 1
+        fi
+        if ! _agents_config_has_section "$function.codex"; then
+            echo "ERROR: '$function' has no [$function.codex], and the tier is a codex setting." >&2
+            return 1
+        fi
+        if [[ -n "$subtask" ]] && ! _agents_registry_has_key "$function.codex" "$subtask"; then
+            echo "ERROR: [$scope] missing sub-task '$subtask' in [$function.codex]." >&2
+            echo "       Allowed sub-tasks: $(_agents_section_keys_inline "$function.codex")" >&2
+            return 1
+        fi
+        fns=" $function"
+    fi
+
+    tmp_file="$(mktemp "${AGENTS_CONFIG_FILE}.XXXXXX")"
+    if ! TIER_FNS="$fns" TIER_ROW="$subtask" TIER_VALUE="$value" awk '
+        function key_of(line,    hash, equals, key) {
+            hash = index(line, "#")
+            if (hash) line = substr(line, 1, hash - 1)
+            equals = index(line, "=")
+            if (!equals) return ""
+            key = substr(line, 1, equals - 1)
+            gsub(/^[[:space:]]+|[[:space:]]+$/, "", key)
+            return key
+        }
+        BEGIN {
+            fns = ENVIRON["TIER_FNS"] " "
+            row = ENVIRON["TIER_ROW"]
+            value = ENVIRON["TIER_VALUE"]
+            target = "codex_service_tier" (row == "" ? "" : "." row)
+            prefix = "codex_service_tier."
+        }
+        # Pass 1: find each function'\''s options header, its tier keys, and
+        # the last row of its sections.
+        NR == FNR {
+            if (/^\[/) {
+                sec = substr($0, 2, index($0, "]") - 2)
+                fn = index(sec, ".") ? substr(sec, 1, index(sec, ".") - 1) : ""
+                mine = fn != "" && index(fns, " " fn " ") > 0
+                opts = mine && sec == fn ".options"
+                if (opts) header[fn] = FNR
+                next
+            }
+            if (/^[[:space:]]*$/) { blank[FNR] = 1; next }
+            if (!mine) next
+            key = key_of($0)
+            # A comment is never dropped, so only another line keeps a section.
+            if (key == "") { if (opts && !/^[[:space:]]*#/) other[fn] = 1; next }
+            if (!opts) { last_row[fn] = FNR; next }
+            if (key == target) {
+                has_target[fn] = 1
+                if (value == "") drop[FNR] = 1; else replace[FNR] = 1
+            } else if (row == "" && index(key, prefix) == 1) {
+                drop[FNR] = 1
+            } else {
+                other[fn] = 1
+                anchor[fn] = FNR
+            }
+            next
+        }
+        # Pass 2 opens by planning each function: insert the key, or drop a
+        # section inherit leaves empty along with the blank line above it.
+        FNR == 1 {
+            count = split(fns, list, " ")
+            for (i = 1; i <= count; i++) {
+                fn = list[i]
+                if (value == "") {
+                    if ((fn in header) && !(fn in other)) {
+                        drop[header[fn]] = 1
+                        if ((header[fn] - 1) in blank) drop[header[fn] - 1] = 1
+                    }
+                } else if (fn in has_target) {
+                    continue
+                } else if (fn in header) {
+                    insert[(fn in anchor) ? anchor[fn] : header[fn]] = target "=" value
+                } else if (fn in last_row) {
+                    insert[last_row[fn]] = "\n[" fn ".options]\n" target "=" value
+                } else {
+                    tail = tail "\n[" fn ".options]\n" target "=" value "\n"
+                }
+            }
+        }
+        FNR in drop { next }
+        FNR in replace {
+            hash = index($0, "#")
+            before_comment = hash ? substr($0, 1, hash - 1) : $0
+            match(before_comment, /[[:space:]]*$/)
+            spacing = substr(before_comment, RSTART)
+            print substr(before_comment, 1, index(before_comment, "=")) value spacing \
+                (hash ? substr($0, hash) : "")
+            next
+        }
+        { print }
+        FNR in insert { print insert[FNR] }
+        END { printf "%s", tail }
+    ' "$AGENTS_CONFIG_FILE" "$AGENTS_CONFIG_FILE" > "$tmp_file"; then
+        rm -f "$tmp_file"
+        echo "ERROR: rewrite failed; $AGENTS_CONFIG_FILE was not changed." >&2
+        return 1
+    fi
+    mv "$tmp_file" "$AGENTS_CONFIG_FILE"
+    AGENT_TIER_FUNCTIONS="${fns# }"
 }
 
 agents_codex_args() {
