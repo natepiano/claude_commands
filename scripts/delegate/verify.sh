@@ -32,7 +32,7 @@
 #                                          no other route to a scoped gate
 #   verify.sh fmt <package>                format only (checkpoint-commit backstop)
 #                                          — gated by config/lint.conf
-#   verify.sh example <package> <name>     compile one example (only when the
+#   verify.sh example <package> <name>     clippy one example (only when the
 #                                          phase changed that example)
 #   verify.sh example-test <package> <name>
 #                                          test one example (only when the
@@ -311,10 +311,12 @@ case "$CMD" in
         PKG="${1:?verify.sh example <package> <name>}"
         NAME="${2:?verify.sh example <package> <name>}"
         FEATURES="$(example_features "$PKG" "$NAME")"
+        # clippy, not check: `lint` never sees an example, so a check here let
+        # lint errors in a changed example reach the merge branch twice.
         if [[ -n "$FEATURES" ]]; then
-            run cargo check -p "$PKG" --example "$NAME" --features "$FEATURES"
+            invoke_clippy -p "$PKG" --example "$NAME" --features "$FEATURES"
         else
-            run cargo check -p "$PKG" --example "$NAME"
+            invoke_clippy -p "$PKG" --example "$NAME"
         fi
         ;;
     example-test)
