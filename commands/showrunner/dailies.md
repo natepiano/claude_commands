@@ -115,7 +115,7 @@ python3 ~/.claude/scripts/production/dailies_render.py <scratchpad>/dailies_inpu
 | `unit` | The unit's session name. |
 | `label` | The timeline row name, at most 8 characters. Defaults to the unit name without `-unit`. |
 | `phase` | `Phase <N> of <M>: <what it changes>` from the unit's plan. Work outside a numbered plan gives its place in the unit's queue: `follow-up <K> of <Q>: <what it changes>`. The renderer refuses anything else. |
-| `update` | What the unit is doing now, one line. The length sets how long (below). |
+| `update` | What the unit is doing now, one line. The length sets how long (below). A unit waiting on another unit says so, with the wait's start and expected clear times from `LOG` (`/showrunner:produce` → Dependencies). |
 | `eta` | The unit's latest stated phase ETA, in `ZONE`. `time` is `HH:MM`, `+1` for tomorrow (`11:21+1`); add `earliest` and `latest` when the unit gave a range. With no ETA, `none` in place of `time`, one of: `none measured - requested` (after sending that unit `/unit:eta` in this turn, the unmeasured-ETA rule in `/showrunner:produce`), `none measured`, `no ETA stated yet`. Never make one up. `detail` is an optional short note, such as what the time covers. |
 | `waiting_on_it` | Only for a topic that lands with this unit's phase, and who waits. |
 | `needed` | Only when the subject needs a follow-up nobody has started, from you (the user), the showrunner or another unit. Say who. |
@@ -170,5 +170,6 @@ For every length:
 - Name work by what it changes in the app, never by a unit's own labels: no helper
   names (`look-b5`), batch letters or item numbers. The user does not see them.
 - Say "you" for the user.
-- Do no other work in this turn, except the `/unit:eta` requests and the two
-  steps in Status check and clock.
+- Do no other work in this turn, except the `/unit:eta` requests, the two
+  steps in Status check and clock, and acting on a BLOCK past its limit
+  (`/showrunner:produce` → Dependencies, rule 4).

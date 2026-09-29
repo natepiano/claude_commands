@@ -182,8 +182,9 @@ production doc:
 > `/showrunner:dailies simple` for every unit and open topic. If the script
 > shows SESSION GONE, CLAUDE NOT RUNNING, FORM WAITING, a usage limit, or a
 > DECISION for the user, that subject goes first, with `needed:` saying what
-> the user must do. Do no other work in this turn, except `/unit:eta` requests
-> and merging a unit's checkpoint after viewing its shots.
+> the user must do. Do no other work in this turn, except `/unit:eta` requests,
+> merging a unit's checkpoint after viewing its shots, and acting on a BLOCK
+> past its limit (`/showrunner:produce` → Dependencies, rule 4).
 
 **Every scheduled update is a `/showrunner:dailies simple` report**, never a
 one-unit note: the user sees every unit on every tick, each checked in full.
@@ -199,8 +200,9 @@ Each run of the script does two things:
 - It scans every unit for a form or decision waiting on the user.
 - It reports the next unit in turn.
 
-It skips blocks that name the showrunner, because clearing those is your job,
-not the user's.
+A block that names the showrunner or another unit is not a wait on the user.
+The script prints it as `BLOCK in <unit>, open <age>: <text>`, the age counted
+from the first run that saw it. Clearing it is your job (<Dependencies/>).
 </StartUpdates>
 
 ---
@@ -212,8 +214,9 @@ arrived:
 | Arrival | Action |
 | --- | --- |
 | a checkpoint notice | <MergeCheckpoint/> |
-| an update tick | the schedule prompt only, plus any merge whose shots are viewed |
+| an update tick | the schedule prompt only, plus any merge whose shots are viewed and any BLOCK past its limit |
 | the user's words for a unit | relay them (<Throughout/>) |
+| a unit waiting on another unit | <Dependencies/> |
 | a unit blocked on the showrunner | <ClearGate/>, <LandingCall/>, or answer it |
 | a unit's decision for the user | show it to the user; relay the answer |
 | a quota alert | <QuotaAlert/> |
@@ -362,15 +365,78 @@ When a merged checkpoint is what a gate waits on, SendMessage the waiting unit:
 `From the showrunner: G<k> clear — <unit> phase <M> is on <merge branch> as <merge hash>. Merge <merge branch> and continue.`
 
 The unit checks this in git itself before it continues.
+
+When a gate's test under <Dependencies/> rule 1 passes without the gating
+checkpoint, lift the gate instead:
+
+`From the showrunner: G<k> lifted — your tests pass without <unit> phase <M> (<log path>). Continue.`
 </ClearGate>
 
 ---
 
-<LandingCall>
-Apply the user's rule (2026-09-28). A unit may wait on another unit's phase
-that has been through more than two repair rounds.
+<Dependencies>
+Apply the user's rules (2026-09-29). A unit waits on another unit only for code
+it needs. Every other wait is yours to clear, and fast.
 
-First read the gating unit's pane and the findings files in its delegate
+1. **Only missing code blocks a unit.** When a unit reports a wait on another
+   unit, name in that turn what it needs:
+   - **Code:** a function, fix or behavior that exists only in the other unit's
+     unmerged work. Only this is a block. A gate is a code block the producer
+     planned.
+   - **Files:** cargo-berth reservations or shared files, with no code needed.
+     Rule 3 clears it.
+   - **Preference:** "to avoid conflicts", "to build on their version". Never a
+     block; tell the unit to continue.
+
+   Before accepting a code block, have the waiting unit test it: in a scratch
+   worktree, merge `MERGE_BRANCH` without the other unit's work and run its
+   tests. Green means it is not blocked: tell it to continue, or lift the gate
+   (<ClearGate/>).
+2. **The unit waited on lands what is needed now.** Send it:
+
+   `From the showrunner: <waiting unit> waits on your <what>. Checkpoint at your next green point; if only part is needed, checkpoint that part first.`
+
+   It checkpoints with polish unfinished. A regression never lands: gates
+   pass, and the shots are no worse than `MERGE_BRANCH`. Polish not yet done is
+   not a regression.
+
+   Before any <LandingCall/> or fix-first request, list who waits on that
+   checkpoint and for what. Unless a waiting unit needs that fix, the unit
+   checkpoints first and fixes after.
+3. **File waits are your call.** Take the first option that works, tell each
+   unit what to run, and log the call. Each unit runs its own cargo-berth
+   commands.
+   1. The holding unit checkpoints what is green; merge it, and its
+      reservations release.
+   2. Release in batches: the holder releases what it is done with, you merge,
+      the waiting unit starts on those files, repeat.
+   3. Both units work in the same files under a berth ordering; whoever lands
+      second resolves the conflict.
+   4. The waiting unit moves its work to files nobody holds.
+4. **Waits have a limit.** Log each wait when it starts and when it clears:
+   - `- HH:MM <zone>: block: <waiting unit> on <unit> (<code | files>: <what>), clears ~HH:MM`
+   - `- HH:MM <zone>: block cleared: <waiting unit> on <unit>`
+
+   At 30 minutes past its clear time, or one hour open without movement, act
+   under rules 2 and 3 in that turn, an update tick included, and log the call.
+   A longer wait needs a logged reason. In the dailies, the waiting unit's
+   `update` names the wait with its start and clear times.
+
+   While it waits, give the waiting unit other work: parts of its next phase in
+   files nobody holds, its fix built in a scratch copy, tests, docs or research.
+5. **Two things still go to the user:** a wait that clears only by changing what
+   ships, and approvals that belong in a unit's own session.
+</Dependencies>
+
+---
+
+<LandingCall>
+Apply the user's rule (2026-09-28). A unit may wait on code in another unit's
+phase that has been through more than two repair rounds. First apply
+<Dependencies/> rule 2: the unit checkpoints what is green now, before more
+repair, unless the waiting unit needs the fix in repair.
+
+Otherwise, read the gating unit's pane and the findings files in its delegate
 session directory. If its latest round fixes only new edge cases, as the
 landing rule in <ProductionUnit/> defines them, send:
 

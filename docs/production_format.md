@@ -144,7 +144,9 @@ branch, port and the files you own.
    Worktrees share refs, so no fetch is needed. Check it yourself; a message
    saying the gate is clear is not proof. While it fails, end the turn with
    `— blocked: waiting on the showrunner: G<k> (<unit> phase <M> merged)`.
-   When it passes, merge the merge branch (item 5), then dispatch.
+   When it passes, merge the merge branch (item 5), then dispatch. The one
+   exception: the showrunner lifts a gate after item 13's test passes without
+   it (`From the showrunner: G<k> lifted — …`); dispatch then.
 7. **Landing rule** (user, 2026-09-28). When another unit waits on your current
    phase, or the showrunner sends a landing call, and a repair round turns up
    only new edge cases:
@@ -176,9 +178,10 @@ branch, port and the files you own.
    OK. Name each such file in your checkpoint notice as
    `also touches <path> (owner <unit>)`.
 10. **Turn-end lines.** A wait the showrunner can clear names it:
-    `— blocked: waiting on the showrunner: <what>`. A wait on the user never
-    mentions the showrunner, so the showrunner's status script can tell the two
-    apart.
+    `— blocked: waiting on the showrunner: <what>`. A wait on another unit is
+    one of these: `— blocked: waiting on the showrunner: <unit> <what>`. A wait
+    on the user never mentions the showrunner, so the showrunner's status script
+    can tell the two apart.
 11. **Updates.** Each progress update is the recorder's `Phase <N> ETA: <time>`
     and the turn-end line, nothing more. The showrunner converts times into the
     user's zone. When the showrunner asks for `/unit:eta`, run it at once.
@@ -186,4 +189,19 @@ branch, port and the files you own.
     which of two working options looks better are the showrunner's calls, made
     from the **UX guide**. Ask the showrunner, never the user. The showrunner
     alone brings a taste question to the user.
+13. **Waiting on another unit** (user, 2026-09-29). Only code you need that
+    exists only in another unit's unmerged work blocks you. Reservations, shared
+    files and "to avoid conflicts" do not; the showrunner clears those and names
+    the cargo-berth commands you run. Before reporting a code block, test it: in
+    a scratch worktree, merge the merge branch without that work and run your
+    tests. Green means you are not blocked; continue. A real block ends the turn
+    with item 10's line. While it lasts, take the work the showrunner names, or:
+    parts of your next phase in files nobody holds, your fix built in a scratch
+    copy, tests, docs or research.
+14. **When others wait on you** (user, 2026-09-29). Checkpoint at your next green
+    point, with polish unfinished if need be. If only part of your work is
+    needed, checkpoint that part first. A regression never lands: gates pass,
+    and the shots are no worse than the merge branch. A fix the showrunner asks
+    for comes after that checkpoint, unless the waiting unit needs it. This is
+    packaging under `<DecisionEconomy/>`; state it in one line.
 </ProductionUnit>

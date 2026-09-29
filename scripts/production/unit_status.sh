@@ -3,6 +3,7 @@
 # Usage: unit_status.sh <state-dir> <user-zone> <session>...
 # Each call checks every unit: that its session and Claude are running, any
 # form or decision waiting on the user, and its latest step, gate and ETA.
+# A block on the showrunner or another unit prints as a BLOCK line with its age.
 # No pipefail: each test reads grep's own status, and an early `grep -q` exit
 # would fail the `tail` before it with SIGPIPE.
 
@@ -18,21 +19,51 @@ units=("$@")
 TM=$(command -v tmux) || TM=$(nix build --no-link --print-out-paths 'nixpkgs#tmux^out')/bin/tmux
 mkdir -p "$DIR"
 SEEN=$DIR/decisions_seen
-touch "$SEEN"
+BLOCKS=$DIR/blocks_open
+touch "$SEEN" "$BLOCKS"
+
+# Prints how long unit $1's block, text $2, has been open, counted from the
+# first run that saw it. Each unit keeps one entry; a new block replaces it.
+block_age() {
+  local u=$1 now first
+  now=$(date +%s)
+  first=$(T=$2 awk -F'\t' -v u="$u" '$1 == u && $3 == ENVIRON["T"] { print $2 }' "$BLOCKS")
+  if [[ -z $first ]]; then
+    first=$now
+    awk -F'\t' -v u="$u" '$1 != u' "$BLOCKS" > "$BLOCKS.new"
+    print -r -- "$u"$'\t'"$now"$'\t'"$2" >> "$BLOCKS.new"
+    mv "$BLOCKS.new" "$BLOCKS"
+  fi
+  print -r -- "$(( (now - first) / 3600 ))h$(( (now - first) % 3600 / 60 ))m"
+}
+
+# Drops unit $1's block entry, once its latest turn-end line is no longer one.
+clear_block() {
+  awk -F'\t' -v u="$1" '$1 != u' "$BLOCKS" > "$BLOCKS.new" && mv "$BLOCKS.new" "$BLOCKS"
+}
 
 # Prints what waits on the user in unit $1, whose pane text is $2.
 # A unit waits on the user when it is idle and its latest turn-end line is decision or blocked.
 waiting_on_user() {
-  local u=$1 p=$2 last gate_no gate_text key start
+  local u=$1 p=$2 last gate_no gate_text key start o peer=
   print -r -- "$p" | tail -12 | grep -qE '^\s*[✢✻✽✶·*] [A-Z][a-z]+( [a-z]+)?…' && return
   if print -r -- "$p" | tail -15 | grep -q 'Enter to select'; then
     echo "FORM WAITING on you in $u: a question form is on its screen"
     return
   fi
   last=$(print -r -- "$p" | grep -nE '^\s*(— )?(holding|gate|decision|blocked|done):' | tail -1)
-  [[ $last == *'decision:'* || $last == *'blocked:'* ]] || return
-  # A block that waits on the showrunner is the showrunner's to clear, not the user's.
-  [[ $last == *showrunner* ]] && return
+  if [[ $last != *'decision:'* && $last != *'blocked:'* ]]; then
+    clear_block "$u"
+    return
+  fi
+  for o in $units; do [[ $o != $u && $last == *$o* ]] && peer=1; done
+  # A wait on the showrunner or another unit is the showrunner's to clear, not the user's.
+  if [[ $last == *showrunner* || -n $peer ]]; then
+    gate_text=${last#*:}
+    [[ $last == *'blocked:'* ]] && echo "BLOCK in $u, open $(block_age "$u" "${gate_text## #}"):${gate_text}"
+    return
+  fi
+  clear_block "$u"
   gate_no=${last%%:*}
   gate_text=${last#*:}
   key="$u|${gate_text## #}"
