@@ -197,8 +197,12 @@ branch, port and the files you own.
     tests. Green means you are not blocked; continue. A real block ends the turn
     with item 10's line. While it lasts, take the work the showrunner names, or:
     parts of your next phase in files nobody holds, your fix built in a scratch
-    copy, tests, docs or research.
-14. **When others wait on you** (user, 2026-09-29). Checkpoint at your next green
+    copy, tests, docs or research. Never commit another unit's lint or format
+    fixes: when `verify.sh lint` rewrites files outside your phase work, revert
+    those rewrites and tell the showrunner which unit's code needs them.
+14. **When others wait on you** (user, 2026-09-29). When your checkpoint turns
+    the merge branch red, in CI or lint, send a small fix checkpoint at once,
+    ahead of your phase work. Checkpoint at your next green
     point, with polish unfinished if need be. If only part of your work is
     needed, checkpoint that part first. A regression never lands: gates pass,
     and the shots are no worse than the merge branch. A fix the showrunner asks

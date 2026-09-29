@@ -403,9 +403,16 @@ it needs. Every other wait is yours to clear, and fast.
    Before any <LandingCall/> or fix-first request, list who waits on that
    checkpoint and for what. Unless a waiting unit needs that fix, the unit
    checkpoints first and fixes after.
-3. **File waits are your call.** Take the first option that works, tell each
-   unit what to run, and log the call. Each unit runs its own cargo-berth
-   commands.
+
+   The same holds when a merge turns `MERGE_BRANCH` red, in CI or lint: the
+   unit that caused it sends a small fix checkpoint at once, ahead of its phase
+   work, and you merge it at once. Never let it wait for the unit's next phase
+   checkpoint. Other units do not fix it in their own trees.
+3. **File waits are your call.** Landing beats ordering: prefer options 1 and
+   2. Use 3 only when the holder cannot reach green within rule 4's limit, and
+   keep at most one ordering on a file; a chain of three units means forcing a
+   checkpoint instead. Take the first option that works, tell each unit what to
+   run, and log the call. Each unit runs its own cargo-berth commands.
    1. The holding unit checkpoints what is green; merge it, and its
       reservations release.
    2. Release in batches: the holder releases what it is done with, you merge,
