@@ -33,6 +33,14 @@ else
     lint_config_skip_notice() { :; }
 fi
 
+# natedev's machine-wide pool of build slots (/etc/nixos
+# modules/linux/jobserver.nix). The session environment names it, but a shell
+# started before the pool existed does not, so join it here too. The Mac has no
+# /dev/steve and skips this.
+if [[ -z "${CARGO_MAKEFLAGS:-}" && -c /dev/steve && -r /dev/steve && -w /dev/steve ]]; then
+    export CARGO_MAKEFLAGS="--jobserver-auth=fifo:/dev/steve"
+fi
+
 run() {
     printf '+ %s\n' "$*"
     # A terminal on the other end means a human is watching, so run straight
@@ -167,13 +175,16 @@ invoke_mend() {
 # defaults to one per core and starts one rustdoc per member at 1 to 5 GB each:
 # overlapping workspace runs had 32 going (34 GB) when natedev ran out of memory
 # on 2026-09-30. The cap also paces any dependency compile inside the same run.
+# cargo ignores --jobs once it joins a shared pool (natedev's, above), and the
+# pool alone would allow 32 again, so the doc run leaves it for a private 8.
 # LINT_-prefixed like the sweep knobs below.
 invoke_doc() {
     if ! lint_config_enabled doc; then
         lint_config_skip_notice doc "cargo doc $*"
         return 0
     fi
-    run env RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --jobs "${LINT_DOC_JOBS:-8}" "$@"
+    run env -u CARGO_MAKEFLAGS -u MAKEFLAGS -u MFLAGS RUSTDOCFLAGS="-D warnings" \
+        cargo doc --no-deps --jobs "${LINT_DOC_JOBS:-8}" "$@"
 }
 
 # Keep a project's target directory under a size budget after cargo-port's
