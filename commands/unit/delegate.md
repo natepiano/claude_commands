@@ -1091,8 +1091,8 @@ yourself. Either way, report what was decided in one line.
 
 An answer is `cargo-berth claim <paths> --<choice> <holder> --overlap-why
 "<why>"`, `<choice>` one of `before`, `after`, `defer`, `override`; it records
-in one step and exits 0. Until that build is installed, an exit-3 answer prints
-a `--proposal` token: rerun the same command with it at once, without waiting.
+in one step and exits 0. If another holder also conflicts, it is refused and
+records nothing: split the claim so each call meets one holder.
 
 Every cargo-berth call is one plain command run in `${WORKING_DIR}`: no pipe,
 loop, `;`, `&&`, `$(...)`, redirect or env-var prefix. cargo-berth reads
