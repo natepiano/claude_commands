@@ -1,5 +1,5 @@
 {
   "threshold_percent": 1,
   "repeat_minutes": 30,
-  "notify": ["natedev", "boss of bosses"]
+  "notify": ["natedev", "showrunner"]
 }
