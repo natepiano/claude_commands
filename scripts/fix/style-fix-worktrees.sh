@@ -474,6 +474,19 @@ project_env_for() {
     done < "$CONF_FILE"
 }
 
+# Export the project's [project_env] assignments into the current shell, so
+# they reach the style-fix agent's cargo runs and the build gate. Call it in a
+# subshell to scope them to one project.
+export_project_env() {
+    local proj="$1"
+    local proj_env
+    proj_env=$(project_env_for "$proj")
+    if [[ -n "$proj_env" ]]; then
+        echo "[diag $proj] project_env: $proj_env"
+        export $proj_env
+    fi
+}
+
 # Launch the configured style agent and supervise it until it exits, goes
 # silent after producing its deliverable, or hits the hard timeout. Forwards
 # the agent's `>>> phase:` markers to stdout as progress lines, emits a
@@ -637,6 +650,50 @@ supervise_agent() {
     return 0
 }
 
+# Build gate: the agent self-reports build status in its Fix Summary, but
+# the field is free text and the runner has historically trusted it. Re-run
+# cargo check from outside the agent so a broken tree cannot be declared
+# successful. Matches the scope the agent itself uses for clippy.
+#
+# Every path that finalizes a fix as a success runs this gate first: the fix
+# pass in create_and_fix, and the retry loop's shortcut for a worktree that
+# already has a Fix Summary. The shortcut once skipped it, so a project that
+# failed this gate on its first attempt was retried straight to success
+# (bevy_brp, 2026-09-10).
+#
+# The caller exports the project's [project_env] first (export_project_env).
+# Args: proj cargo_scope_flag worktree_dir agent_work_dir scratch_eval
+# Returns 1 after recording the failure when cargo check fails, else 0.
+build_gate() {
+    local proj="$1"
+    local cargo_scope_flag="$2"
+    local worktree_dir="$3"
+    local agent_work_dir="$4"
+    local scratch_eval="$5"
+    local build_check_log="$RUN_DIR/$proj.build-check.log"
+    progress "$proj" "phase=build-gate log=$build_check_log"
+    if ! cargo check $cargo_scope_flag --all-targets --all-features \
+            --manifest-path "$worktree_dir/Cargo.toml" \
+            >"$build_check_log" 2>&1; then
+        echo "FAIL: $proj (cargo check failed after style-fix; worktree left for review at $worktree_dir; see $build_check_log)"
+        progress "$proj" "phase=failed reason=build-broken-after-fix log=$build_check_log"
+        if [[ -f "$scratch_eval" ]]; then
+            "$PY" "$HISTORY_HELPER" save-evaluation \
+                --project-root "$agent_work_dir" \
+                --evaluation "$scratch_eval" || true
+        fi
+        "$PY" "$HISTORY_HELPER" finalize-failure --project "$proj" \
+            --reason "cargo check failed after style-fix; worktree left at $worktree_dir for review" || true
+        # Intentionally do NOT remove the worktree or branch here. The agent
+        # finished writing its Fix Summary, the diff is reviewable, and the
+        # user needs to see what broke. The failure paths elsewhere in this
+        # script clean up because the agent never produced reviewable output;
+        # this path is the opposite case.
+        return 1
+    fi
+    return 0
+}
+
 # Per-project function: create worktree and launch the configured style agent
 create_and_fix() {
     local proj="$1"
@@ -657,12 +714,7 @@ create_and_fix() {
     # here so it reaches both the style-fix agent's cargo runs and the build-gate;
     # create_and_fix runs as its own backgrounded subshell, so this is scoped to
     # this project only.
-    local proj_env
-    proj_env=$(project_env_for "$proj")
-    if [[ -n "$proj_env" ]]; then
-        echo "[diag $proj] project_env: $proj_env"
-        export $proj_env
-    fi
+    export_project_env "$proj"
 
     echo "[diag $proj] create_and_fix start: pid=$$ cwd=$(pwd)"
     progress "$proj" "phase=worktree-create kind=$kind"
@@ -1124,29 +1176,8 @@ VERIFY_EOF
         progress "$proj" "phase=verify-incomplete reason=agent-exit code=${SUPERVISE_AGENT_CODE}"
     fi
 
-    # Build gate: the agent self-reports build status in its Fix Summary, but
-    # the field is free text and the runner has historically trusted it. Re-run
-    # cargo check from outside the agent so a broken tree cannot be declared
-    # successful. Matches the scope the agent itself uses for clippy.
-    local build_check_log="$RUN_DIR/$proj.build-check.log"
-    progress "$proj" "phase=build-gate log=$build_check_log"
-    if ! cargo check $cargo_scope_flag --all-targets --all-features \
-            --manifest-path "$worktree_dir/Cargo.toml" \
-            >"$build_check_log" 2>&1; then
-        echo "FAIL: $proj (cargo check failed after style-fix; worktree left for review at $worktree_dir; see $build_check_log)"
-        progress "$proj" "phase=failed reason=build-broken-after-fix log=$build_check_log"
-        if [[ -f "$scratch_eval" ]]; then
-            "$PY" "$HISTORY_HELPER" save-evaluation \
-                --project-root "$agent_work_dir" \
-                --evaluation "$scratch_eval" || true
-        fi
-        "$PY" "$HISTORY_HELPER" finalize-failure --project "$proj" \
-            --reason "cargo check failed after style-fix; worktree left at $worktree_dir for review" || true
-        # Intentionally do NOT remove the worktree or branch here. The agent
-        # finished writing its Fix Summary, the diff is reviewable, and the
-        # user needs to see what broke. The failure paths elsewhere in this
-        # script clean up because the agent never produced reviewable output;
-        # this path is the opposite case.
+    # Build gate: a broken tree must not reach finalize-fix (see build_gate).
+    if ! build_gate "$proj" "$cargo_scope_flag" "$worktree_dir" "$agent_work_dir" "$scratch_eval"; then
         return 1
     fi
 
@@ -1200,10 +1231,11 @@ if [[ ${#failed_names[@]} -gt 0 ]]; then
     for proj in "${failed_names[@]}"; do
         if load_record "$proj"; then
             # If the first attempt already produced a scratch evaluation with
-            # a Fix Summary, the run is effectively done. The
-            # "failure" was almost certainly a SIGTERM-on-grace race or a
-            # tolerant-cleanup gap. Finalize history and treat as success
-            # instead of recreating the worktree.
+            # a Fix Summary, the agent's work is done. The "failure" was a
+            # failed build gate (which leaves the worktree for review), a
+            # SIGTERM-on-grace race, or a tolerant-cleanup gap. Run the build
+            # gate, then finalize history and treat as success instead of
+            # recreating the worktree.
             #
             # Require a real git-linked worktree, not just a directory. The
             # scratch evaluation proves the agent reached the summary phase;
@@ -1216,6 +1248,21 @@ if [[ ${#failed_names[@]} -gt 0 ]]; then
                 already_work_dir="$R_worktree_dir"
                 if [[ -n "$R_subpath" ]]; then
                     already_work_dir="$R_worktree_dir/$R_subpath"
+                fi
+                # Same scope derivation as create_and_fix.
+                already_scope_flag="--workspace"
+                if [[ "$R_kind" == "workspace_member" ]]; then
+                    already_scope_flag="-p $R_pkg"
+                fi
+                # The subshell keeps this project's env out of later retries.
+                # build_gate emits the failed progress line and records
+                # finalize-failure itself.
+                if ! (
+                    export_project_env "$proj"
+                    build_gate "$proj" "$already_scope_flag" "$R_worktree_dir" "$already_work_dir" "$R_eval_file"
+                ); then
+                    echo "RETRY FAILED: $proj (cargo check failed after style-fix; worktree left for review at $R_worktree_dir)"
+                    continue
                 fi
                 if "$PY" "$HISTORY_HELPER" finalize-fix --project-root "$already_work_dir" --evaluation "$R_eval_file"; then
                     echo "RETRY OK: $proj (already applied)"
