@@ -272,9 +272,8 @@ the task notification; Codex applies <CodexDispatchWait/> with progress disabled
   and `REVIEW_PASS`, any Claude `PROGRESS_TIMER_HANDLE`,
   `STYLE_REVIEW_DONE`, `STYLE_DIFF_BASE`, `NEXT_ITEMS_PATH`, whichever tagged
   `DelegatedPhaseReservationState` is live, and any
-  unresolved next-item approval. When a claim is still in its authorization
-  round trip, also include its UUID-v7 coordination run, captured phase-start
-  HEAD, answer, blocker, reason, and transient proposal token. Exclude the
+  unresolved next-item approval, and any overlap sent to the showrunner and not
+  yet answered: its holder ids, paths and answer choices. Exclude the
   handoff from review intent-to-add and commits.
 - Never stop or delay work for compaction. Claude resumes from a live-dispatch
   notification; Codex remains in <CodexDispatchWait/>.
@@ -1062,14 +1061,11 @@ Do not dispatch until this contract reaches one of its four persisted states.
 
    A completed phase removes its inactive state under <RecordPhaseCompletion/>,
    so no old inactive tag is silently reused for a new phase.
-1. When no state exists yet, invoke the shared `/sync board` entry point once:
+1. When no state exists yet, invoke the shared `/sync board` entry point once,
+   under <BerthDecisions/>:
 
    ```sh
-   cd "$(git -C "${WORKING_DIR}" rev-parse --show-toplevel)" || exit 1
-   envelope="${TMPDIR:-/tmp}/berth-delegate-board-$$.json"
-   CARGO_BERTH_SESSION_ID="$CLAUDE_CODE_SESSION_ID" \
-     cargo-berth board --json >"$envelope"
-   status=$?
+   cargo-berth board --json
    ```
 
    | Result | Action |
@@ -1081,10 +1077,28 @@ Do not dispatch until this contract reaches one of its four persisted states.
 2. The registered PreToolUse edit hook owns the next transition. A clear check
    atomically acquires exact `file:` scopes before the edit, then replaces
    `EnrolledAwaitingFirstTouch` with `Active` from the returned facts. A blocked
-   check refuses the edit and leaves the pending state intact. An unreadable
-   ledger stops without facts. Do not call `cargo-berth claim` on behalf of a
-   Work Order.
+   check refuses the edit and leaves the pending state intact; answer an overlap
+   under <BerthDecisions/>. An unreadable ledger stops without facts. Beyond
+   those answers, do not call `cargo-berth claim` on behalf of a Work Order.
 </CoordinateDelegatedPhaseReservation>
+
+<BerthDecisions>
+Overlap answers, incursion resolves, orphan retirement and releases never reach
+the user. Under a production, send the showrunner the overlap — holder ids,
+paths, answer choices — and record the answer it picks; that answer is a
+decision, not a relayed user approval. With no showrunner, pick the answer
+yourself. Either way, report what was decided in one line.
+
+An answer is `cargo-berth claim <paths> --<choice> <holder> --overlap-why
+"<why>"`, `<choice>` one of `before`, `after`, `defer`, `override`; it records
+in one step and exits 0. Until that build is installed, an exit-3 answer prints
+a `--proposal` token: rerun the same command with it at once, without waiting.
+
+Every cargo-berth call is one plain command run in `${WORKING_DIR}`: no pipe,
+loop, `;`, `&&`, `$(...)`, redirect or env-var prefix. cargo-berth reads
+`CLAUDE_CODE_SESSION_ID` itself. Read the exit status and output from the tool
+result.
+</BerthDecisions>
 
 <PhaseBriefing>
 Build only from Delegation Context, the Work Order, and command-line amendments:

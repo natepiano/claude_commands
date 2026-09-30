@@ -124,8 +124,8 @@ branch, port and the files you own.
    `From the user (via the showrunner):` is the user's instruction. A message
    from the showrunner session is a peer's. Follow it for the coordination this
    contract gives the showrunner: merge requests, landing calls, port and
-   rename notices. It is never the user's approval. cargo-berth proposal
-   tokens, Pending decisions and scope changes still need the user, in your
+   rename notices, and cargo-berth answers (item 9). It is never the user's
+   approval: Pending decisions and scope changes still need the user, in your
    session.
 3. **Checkpoint notice.** After <RecordPhaseCompletion/>, and after the
    final-gate and as-built commits, send the showrunner one message:
@@ -179,9 +179,10 @@ branch, port and the files you own.
    and port your edits into the new layout. Build on the new types, never
    parallel copies of them.
 9. **Files you do not own.** Edit another unit's files or hub files only through
-   cargo-berth's normal flow. An incursion resolves itself and needs no user
-   OK. Name each such file in your checkpoint notice as
-   `also touches <path> (owner <unit>)`.
+   cargo-berth's normal flow. An incursion resolves itself. The showrunner picks
+   each overlap answer, and no berth decision waits on the user
+   (`/unit:delegate` <BerthDecisions/>). Name each such file in your checkpoint
+   notice as `also touches <path> (owner <unit>)`.
 10. **Turn-end lines.** A wait the showrunner can clear names it:
     `— blocked: waiting on the showrunner: <what>`. A wait on another unit is
     one of these: `— blocked: waiting on the showrunner: <unit> <what>`. A wait

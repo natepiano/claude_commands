@@ -65,6 +65,8 @@ State:
   - holds and landing calls;
   - which unit ports what;
   - packaging;
+  - cargo-berth overlap answers, incursion resolves, orphan retirement and
+    releases (<Dependencies/> rule 3);
   - a unit's as-built close-out form, when the choice is the logical one.
 
   Unusual as-built choices go to the user: a folder other than the usual
@@ -73,8 +75,6 @@ State:
 - **What reaches the user:**
   - a unit's `— decision:` for the user, shown in the unit's words, with the
     answer relayed back;
-  - cargo-berth proposals that need approval, which the user types into that
-    unit's session;
   - product and scope choices;
   - anything that cannot be undone;
   - a quota alert (<QuotaAlert/>).
@@ -454,7 +454,10 @@ it needs. Every other wait is yours to clear, and fast.
    2. Use 3 only when the holder cannot reach green within rule 4's limit, and
    keep at most one ordering on a file; a chain of three units means forcing a
    checkpoint instead. Take the first option that works, tell each unit what to
-   run, and log the call. Each unit runs its own cargo-berth commands.
+   run, and log the call. Each unit runs its own cargo-berth commands. When a
+   unit sends an overlap, reply in that turn with the answer it records —
+   `--before`, `--after`, `--defer` or `--override` on the named holder — and a
+   one-line why.
    1. The holding unit checkpoints what is green; merge it, and its
       reservations release.
    2. Release in batches: the holder releases what it is done with, you merge,

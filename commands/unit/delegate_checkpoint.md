@@ -40,12 +40,11 @@ Loop/verbose only:
    | `RepositoryNotEnrolled`, `EnrolledAwaitingFirstTouch` | Skip drift; neither owns a reservation. |
    | `CheckpointCommittedAwaitingReleaseConfirmation` | Valid only as a resumed state: route directly to step 7, re-entering neither drift nor checkpoint creation. |
 
+   Run each cargo-berth command in this checkpoint as written, under
+   `/unit:delegate` <BerthDecisions/>:
+
    ```sh
-   cd "$(git -C "${WORKING_DIR}" rev-parse --show-toplevel)" || exit 1
-   envelope="${TMPDIR:-/tmp}/berth-checkpoint-drift-$$.json"
-   CARGO_BERTH_SESSION_ID="$CLAUDE_CODE_SESSION_ID" \
-     cargo-berth drift --full --json >"$envelope"
-   status=$?
+   cargo-berth drift --full --json
    ```
 
    Require an exit-`0` result with `payload.kind = drift`,
@@ -98,11 +97,7 @@ Loop/verbose only:
    | Either inactive state | Invoke no release. |
 
    ```sh
-   cd "$(git -C "${WORKING_DIR}" rev-parse --show-toplevel)" || exit 1
-   envelope="${TMPDIR:-/tmp}/berth-checkpoint-release-$$.json"
-   CARGO_BERTH_SESSION_ID="$CLAUDE_CODE_SESSION_ID" \
-     cargo-berth release <recorded-reservation-id> --json >"$envelope"
-   status=$?
+   cargo-berth release <recorded-reservation-id> --json
    ```
 
    Do not pass a commit: `release` snapshots the invoking worktree's current
@@ -133,16 +128,11 @@ Loop/verbose only:
    checkpoint.
 
    ```sh
-   cd "$(git -C "${WORKING_DIR}" rev-parse --show-toplevel)" || exit 1
-   envelope="${TMPDIR:-/tmp}/berth-checkpoint-lifecycle-$$.json"
-   CARGO_BERTH_SESSION_ID="$CLAUDE_CODE_SESSION_ID" \
-     cargo-berth board --reservation <recorded-reservation-id> --json >"$envelope"
-   status=$?
+   cargo-berth board --reservation <recorded-reservation-id> --json
    ```
 
-   Inspect `payload.data` in the retained envelope, without reading
-   `message`. Exit `0` requires
-   `kind = reservation_lifecycle`, the requested `reservation_id`, and exactly
+   Inspect `payload.data` in its output, without reading `message`. Exit `0`
+   requires `kind = reservation_lifecycle`, the requested `reservation_id`, and exactly
    one lifecycle alternative: `active`; `outstanding` with `protected_tip`;
    `released_after_checkpoint` with `protected_tip` and `disposition`; or
    `released_without_checkpoint` with `disposition`. Exit `5` is valid only for
