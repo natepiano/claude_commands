@@ -20,6 +20,13 @@
 # filters to it with -E 'package(<pkg>)', and --features qualifies its list
 # with it. Only the compile covers the workspace.
 #
+# rustdoc is the exception: `lint` documents only the members that differ from
+# HEAD, found here rather than named by the delegate (CHANGED_MEMBERS_PY). A
+# workspace rustdoc starts one process per member at 1 to 5 GB each, and
+# overlapping runs ran natedev out of memory on 2026-09-30. Each distinct member
+# set pays its own dependency compile for that; the push gate still documents
+# the whole workspace.
+#
 # The lint stages — mend, fmt, clippy, doc — are gated by config/lint.conf (edit
 # it with /lint_config), so one switch silences a check across /clippy, the fix
 # pipeline, and every delegate phase. A phase runs all four; only the
@@ -38,6 +45,7 @@
 #                                          for re-running it alone
 #   verify.sh lint <package>               mend --fix, nightly fmt, workspace
 #                                          clippy (warnings denied), then rustdoc
+#                                          on the members that differ from HEAD
 #                                          — every stage gated by config/lint.conf
 #   … [--features <list>]                  check, test, and lint accept one trailing
 #                                          `--features a,b` when the Work Order names
@@ -111,6 +119,52 @@ for package in meta["packages"]:
     sys.exit(2)
 print("verify.sh: package " + package_name + " not found in workspace", file=sys.stderr)
 sys.exit(2)
+'
+
+# Workspace members with a file that differs from HEAD: staged, unstaged,
+# deleted, or new and not ignored. A phase commits nothing before its
+# checkpoint, so HEAD is where the phase started and this is the whole phase's
+# work, not its last edit. A file belongs to the member whose folder holds it,
+# the deepest one when members nest; a file outside every member (the root
+# manifest, Cargo.lock, docs/) adds none. A non-empty argv[1] is always
+# included: --features names that package, so cargo needs it selected.
+CHANGED_MEMBERS_PY='
+import json
+import os
+import subprocess
+import sys
+
+
+def git(*args: str) -> str:
+    result = subprocess.run(["git", *args], capture_output=True, text=True)
+    if result.returncode != 0:
+        print("verify.sh: git " + " ".join(args) + " failed: " + result.stderr.strip(), file=sys.stderr)
+        sys.exit(2)
+    return result.stdout
+
+
+meta = json.load(sys.stdin)
+members = set(meta["workspace_members"])
+roots = sorted(
+    (
+        (os.path.realpath(os.path.dirname(package["manifest_path"])), package["name"])
+        for package in meta["packages"]
+        if package["id"] in members
+    ),
+    key=lambda root: len(root[0]),
+    reverse=True,
+)
+top = os.path.realpath(git("rev-parse", "--show-toplevel").strip())
+paths = git("-C", top, "diff", "--name-only", "--no-renames", "-z", "HEAD").split("\0")
+paths += git("-C", top, "ls-files", "--others", "--exclude-standard", "-z").split("\0")
+changed = {sys.argv[1]} if sys.argv[1] else set()
+for path in filter(None, paths):
+    full = os.path.join(top, path)
+    for root, name in roots:
+        if full.startswith(root + os.sep):
+            changed.add(name)
+            break
+print("\n".join(sorted(changed)))
 '
 
 # The compile covers the workspace, so a misspelled package would otherwise
@@ -317,7 +371,24 @@ case "$CMD" in
         # fmt compiles nothing, so it stays on the package the phase edited.
         fmt_cargo -p "$PKG"
         invoke_clippy --workspace --lib --bins --tests "${FEATURE_FLAGS[@]}"
-        invoke_doc --workspace "${FEATURE_FLAGS[@]}"
+        # Found after mend, so a member its --fix rewrote is documented too.
+        FEATURE_MEMBER=""
+        if [[ ${#FEATURE_FLAGS[@]} -gt 0 ]]; then
+            FEATURE_MEMBER="$PKG"
+        fi
+        DOC_MEMBERS="$(cargo metadata --no-deps --format-version 1 \
+            | "$PY" -c "$CHANGED_MEMBERS_PY" "$FEATURE_MEMBER")"
+        DOC_SCOPE=()
+        while IFS= read -r member; do
+            if [[ -n "$member" ]]; then
+                DOC_SCOPE+=(-p "$member")
+            fi
+        done <<< "$DOC_MEMBERS"
+        if [[ ${#DOC_SCOPE[@]} -gt 0 ]]; then
+            invoke_doc "${DOC_SCOPE[@]}" "${FEATURE_FLAGS[@]}"
+        else
+            echo "verify.sh: no workspace member differs from HEAD; rustdoc skipped"
+        fi
         ;;
     fmt)
         PKG="${1:?verify.sh fmt <package>}"

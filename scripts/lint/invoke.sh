@@ -162,12 +162,18 @@ invoke_mend() {
 # dev-loop doc run resolve a feature set that no check, clippy or test run
 # shares, and so compile its own copy of the dependency tree. The push gate
 # passes --all-features itself, where full coverage is the point.
+#
+# At most LINT_DOC_JOBS (default 8) processes at once, for every caller. cargo
+# defaults to one per core and starts one rustdoc per member at 1 to 5 GB each:
+# overlapping workspace runs had 32 going (34 GB) when natedev ran out of memory
+# on 2026-09-30. The cap also paces any dependency compile inside the same run.
+# LINT_-prefixed like the sweep knobs below.
 invoke_doc() {
     if ! lint_config_enabled doc; then
         lint_config_skip_notice doc "cargo doc $*"
         return 0
     fi
-    run env RUSTDOCFLAGS="-D warnings" cargo doc --no-deps "$@"
+    run env RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --jobs "${LINT_DOC_JOBS:-8}" "$@"
 }
 
 # Keep a project's target directory under a size budget after cargo-port's
