@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import fcntl
 import hashlib
 import json
 import os
@@ -58,6 +59,11 @@ EXIT_INCOMPLETE_RUN = 3
 # a pre_filter regex with zero matches, or a candidate generator that
 # enumerated zero sites. Free for quota purposes and excluded from hit rates.
 FREE_SKIP_SOURCES = frozenset({"pre_filter", "candidates"})
+
+# Outcome statuses a finalize still resolves. record-unit stores `finding` for
+# an open finding until the fix is finalized, and a later finalize supersedes
+# `fix_failed`. Every other status is final and passes through unchanged.
+OPEN_OUTCOME_STATUSES = frozenset({"finding", "fix_failed"})
 
 
 class Outcome(TypedDict, total=False):
@@ -506,10 +512,46 @@ def eligible_project_roots() -> list[Path]:
     )
 
 
-def append_jsonl_history(path: Path, payload: HistoryRow) -> None:
+def history_line_start_time(line: str) -> str:
+    try:
+        parsed: object = json.loads(line)  # pyright: ignore[reportAny]
+    except json.JSONDecodeError:
+        return ""
+    if not isinstance(parsed, dict):
+        return ""
+    return cast(HistoryRow, cast(object, parsed)).get("start_time", "")
+
+
+def record_run_history(project: str, row: HistoryRow) -> None:
+    """Write `row` as the only history row for its run, keyed by start_time.
+
+    One pending can be finalized more than once: a failed build gate runs
+    finalize-failure, then the retry path runs finalize-fix on the same pending.
+    Appending each time counted the run twice (bevy_brp, 2026-09-10), so a later
+    finalize replaces the run's earlier row and moves it to the end, where
+    `last_review_index` expects the newest row. The directory lock serializes
+    concurrent finalizers; the temp file and rename keep readers from seeing a
+    partial file.
+    """
+    path = history_file(project)
     path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("a") as handle:
-        _ = handle.write(json.dumps(payload, sort_keys=True) + "\n")
+    start_time = row.get("start_time", "")
+    dir_fd = os.open(path.parent, os.O_RDONLY)
+    try:
+        fcntl.flock(dir_fd, fcntl.LOCK_EX)
+        lines = path.read_text().splitlines() if path.exists() else []
+        kept = [
+            line
+            for line in lines
+            if line.strip() and not (start_time and history_line_start_time(line) == start_time)
+        ]
+        kept.append(json.dumps(row, sort_keys=True))
+        tmp_path = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+        _ = tmp_path.write_text("\n".join(kept) + "\n")
+        os.replace(tmp_path, path)
+    finally:
+        # Closing the descriptor releases the lock.
+        os.close(dir_fd)
 
 
 def load_history(project: str) -> list[HistoryRow]:
@@ -1483,7 +1525,7 @@ def finalize_no_findings(project: str) -> None:
     }
     if fingerprint:
         row["fingerprint"] = fingerprint
-    append_jsonl_history(history_file(project), row)
+    record_run_history(project, row)
     remove_pending(project)
 
 
@@ -1505,8 +1547,18 @@ def is_finding_like(reviewed: ReviewedUnit) -> bool:
     if outcome.get("skipped_by") in FREE_SKIP_SOURCES:
         return False
     status = outcome.get("status")
-    finding_source = reviewed.get("finding_source") or outcome.get("finding_source")
-    return bool(finding_source) or status not in (None, "", "no_findings")
+    return bool(finding_source_of(reviewed)) or status not in (None, "", "no_findings")
+
+
+def finding_source_of(reviewed: ReviewedUnit) -> str:
+    """The unit's finding_source, whether top-level or inside its outcome."""
+    return reviewed.get("finding_source") or reviewed.get("outcome", {}).get("finding_source", "")
+
+
+def has_final_outcome(reviewed: ReviewedUnit) -> bool:
+    """True when a finalize must pass the unit's recorded outcome through unchanged."""
+    outcome: Outcome = reviewed.get("outcome", {})
+    return bool(outcome) and outcome.get("status") not in OPEN_OUTCOME_STATUSES
 
 
 def guideline_path(guideline_id: str, project_root: Path) -> Path:
@@ -1727,8 +1779,7 @@ def finalize_fix(project_root: Path, eval_path: Path) -> None:
     reviewed_units: list[ReviewedUnit] = []
     for reviewed in pending.get("reviewed_units", []):
         guideline_id = reviewed.get("guideline_id", "")
-        existing_outcome: Outcome = reviewed.get("outcome", {})
-        if existing_outcome and existing_outcome.get("status") != "fix_failed":
+        if has_final_outcome(reviewed):
             reviewed_units.append(reviewed)
             continue
         if guideline_id in fix_results:
@@ -1743,8 +1794,9 @@ def finalize_fix(project_root: Path, eval_path: Path) -> None:
                 "status": "eval_dropped",
                 "reason": "Recorded as a finding via record-unit but absent from evaluation markdown ## Improvements.",
             }
-        if "finding_source" in reviewed:
-            outcome["finding_source"] = reviewed["finding_source"]
+        finding_source = finding_source_of(reviewed)
+        if finding_source:
+            outcome["finding_source"] = finding_source
         reviewed_units.append({"guideline_id": guideline_id, "outcome": outcome})
     pending["reviewed_units"] = reviewed_units
     pending["phase"] = "fixed"
@@ -1760,7 +1812,7 @@ def finalize_fix(project_root: Path, eval_path: Path) -> None:
             "evaluation_summary": history_summary(pending),
             "reviewed_units": reviewed_units,
         }
-        append_jsonl_history(history_file(project), row)
+        record_run_history(project, row)
         pending["fix_history_recorded_at"] = now
     write_pending(project, pending)
 
@@ -1773,13 +1825,13 @@ def finalize_failure(project: str, reason: str) -> None:
     _ = refresh_evaluation_summary(pending)
     reviewed_units: list[ReviewedUnit] = []
     for reviewed in pending.get("reviewed_units", []):
-        existing_outcome: Outcome = reviewed.get("outcome", {})
-        if existing_outcome and existing_outcome.get("status") != "fix_failed":
+        if has_final_outcome(reviewed):
             reviewed_units.append(reviewed)
             continue
         outcome: Outcome = {"status": "fix_failed", "reason": reason}
-        if "finding_source" in reviewed:
-            outcome["finding_source"] = reviewed["finding_source"]
+        finding_source = finding_source_of(reviewed)
+        if finding_source:
+            outcome["finding_source"] = finding_source
         reviewed_units.append(
             {"guideline_id": reviewed.get("guideline_id", ""), "outcome": outcome}
         )
@@ -1795,7 +1847,7 @@ def finalize_failure(project: str, reason: str) -> None:
             "evaluation_summary": history_summary(pending),
             "reviewed_units": reviewed_units,
         }
-        append_jsonl_history(history_file(project), row)
+        record_run_history(project, row)
         pending["failure_history_recorded_at"] = now
     write_pending(project, pending)
 
