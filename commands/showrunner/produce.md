@@ -351,8 +351,22 @@ Input: the unit, phase, hash and shots from its notice.
    - Otherwise, confirm that `HEAD` is this unpushed merge and undo it with
      `git -C CHECKOUT reset --keep HEAD~1`. Send the unit the failing tests and
      the log path.
-10. **Green.** Push with `git -C CHECKOUT push origin <merge branch>`. Never
-    force-push. Log it:
+10. **Green.** Push through CI's mend, rustfmt and taplo checks, which the tests
+    above do not cover. With `dangerouslyDisableSandbox: true`, run in the
+    background:
+
+    ```sh
+    bash ~/.claude/scripts/validate_and_push/validate_and_push.sh --quick \
+      --to "<merge branch>" \
+      --fix-commit "ci(<name>): format fixes after <unit> phase <N>"
+    ```
+
+    It commits what those tools fix as that one commit, fails on a mend warning
+    they cannot fix, and pushes. Never force-push. Leave the CI run it reports
+    to <CIPoint/>. On a failure nothing was pushed: undo the merge and any fix
+    commit with `git -C CHECKOUT reset --keep origin/<merge branch>` (if the
+    failed step's own edits block it, `git -C CHECKOUT restore .` first), and
+    send the unit the failing step and the log. Log a push:
     `- HH:MM <zone>: <unit> phase <N> (<hash>) merged as <merge hash>; <packages> green; pushed`.
 11. **After the push:**
     - run <ClearGate/> for any gate this checkpoint clears;

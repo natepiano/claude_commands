@@ -32,6 +32,11 @@ export CARGO_TARGET_DIR="$REPO_TARGET_DIR"
 export VALIDATE_TARGET_DIR="$REPO_TARGET_DIR"
 CROSS_TARGETS_FILE="${REPO_ROOT}/.claude/config/cross_targets"
 LOCAL_CI_FILE="${REPO_ROOT}/.claude/config/local_ci.sh"
+# VALIDATE_QUICK=1 (validate_and_push.sh --quick) runs the cargo-mend, rustfmt
+# and taplo steps only: the CI jobs a merge fails without being tested for. The
+# showrunner pushes each merge this way, after its own tests, and runs the full
+# validation every fifth merge. clippy, rustdoc, nextest and local CI are skipped.
+VALIDATE_QUICK="${VALIDATE_QUICK:-0}"
 
 # Canonical local CI mirror for Nate's Rust repos.
 # Variations:
@@ -193,41 +198,45 @@ run_autofix_step "rustfmt" env LINT_CONFIG_FORCE=1 "$LINT_CMD" fmt
 
 run_autofix_step "taplo" taplo fmt
 
-# --all-features on clippy and rustdoc: the lint CLI and the dev loop run the
-# default feature set, so the whole tree shares one compiled copy of its
-# dependencies. The push gate is where feature-gated code gets covered.
-run_step "clippy" env LINT_CONFIG_FORCE=1 "$LINT_CMD" clippy --workspace --all-features
+if [ "$VALIDATE_QUICK" = 1 ]; then
+  echo "=== SKIPPED (--quick): clippy, rustdoc, nextest ==="
+else
+  # --all-features on clippy and rustdoc: the lint CLI and the dev loop run the
+  # default feature set, so the whole tree shares one compiled copy of its
+  # dependencies. The push gate is where feature-gated code gets covered.
+  run_step "clippy" env LINT_CONFIG_FORCE=1 "$LINT_CMD" clippy --workspace --all-features
 
-# Cross-target clippy for the triples listed in CROSS_TARGETS_FILE. Read into an
-# array first, so no step can drain the loop's stdin.
-CROSS_TARGETS=()
-if [ -f "$CROSS_TARGETS_FILE" ]; then
-  while IFS= read -r line || [ -n "$line" ]; do
-    target="${line%%#*}"
-    target="${target//[[:space:]]/}"
-    if [ -n "$target" ]; then
-      CROSS_TARGETS+=("$target")
-    fi
-  done <"$CROSS_TARGETS_FILE"
+  # Cross-target clippy for the triples listed in CROSS_TARGETS_FILE. Read into
+  # an array first, so no step can drain the loop's stdin.
+  CROSS_TARGETS=()
+  if [ -f "$CROSS_TARGETS_FILE" ]; then
+    while IFS= read -r line || [ -n "$line" ]; do
+      target="${line%%#*}"
+      target="${target//[[:space:]]/}"
+      if [ -n "$target" ]; then
+        CROSS_TARGETS+=("$target")
+      fi
+    done <"$CROSS_TARGETS_FILE"
+  fi
+  if [ "${#CROSS_TARGETS[@]}" -gt 0 ]; then
+    INSTALLED_TARGETS="$(rustup target list --installed)"
+    for target in "${CROSS_TARGETS[@]}"; do
+      if ! grep -qxF "$target" <<<"$INSTALLED_TARGETS"; then
+        echo "!!! ${CROSS_TARGETS_FILE#"${REPO_ROOT}/"} lists ${target}, which is not installed."
+        echo "!!! Install it with: rustup target add ${target}"
+        exit 1
+      fi
+      run_step "clippy (${target})" env LINT_CONFIG_FORCE=1 "$LINT_CMD" clippy --workspace --all-features --target "$target"
+    done
+  fi
+
+  # rustdoc across every member with every feature on. The dev-time run covers
+  # the workspace with default features, so it cannot see a doc link that
+  # rotted behind a non-default feature. This is the sweep that catches it.
+  run_step "rustdoc" env LINT_CONFIG_FORCE=1 "$LINT_CMD" doc --workspace --all-features
+
+  run_step "nextest" "$LINT_CMD" nextest --workspace --all-features --tests
 fi
-if [ "${#CROSS_TARGETS[@]}" -gt 0 ]; then
-  INSTALLED_TARGETS="$(rustup target list --installed)"
-  for target in "${CROSS_TARGETS[@]}"; do
-    if ! grep -qxF "$target" <<<"$INSTALLED_TARGETS"; then
-      echo "!!! ${CROSS_TARGETS_FILE#"${REPO_ROOT}/"} lists ${target}, which is not installed."
-      echo "!!! Install it with: rustup target add ${target}"
-      exit 1
-    fi
-    run_step "clippy (${target})" env LINT_CONFIG_FORCE=1 "$LINT_CMD" clippy --workspace --all-features --target "$target"
-  done
-fi
-
-# rustdoc across every member with every feature on. The dev-time run covers
-# the workspace with default features, so it cannot see a doc link that
-# rotted behind a non-default feature. This is the sweep that catches it.
-run_step "rustdoc" env LINT_CONFIG_FORCE=1 "$LINT_CMD" doc --workspace --all-features
-
-run_step "nextest" "$LINT_CMD" nextest --workspace --all-features --tests
 
 if ! lint_config_enabled mend; then
   lint_config_skip_notice mend "cargo-mend --fail-on-warn"
@@ -237,9 +246,17 @@ else
   run_step "cargo-mend" "$LINT_CMD" mend --workspace --fail-on-warn
 fi
 
-if [ -f "$LOCAL_CI_FILE" ]; then
+if [ ! -f "$LOCAL_CI_FILE" ]; then
+  :
+elif [ "$VALIDATE_QUICK" = 1 ]; then
+  echo "=== SKIPPED (--quick): local CI (${LOCAL_CI_FILE#"${REPO_ROOT}/"}) ==="
+else
   run_step "local CI (${LOCAL_CI_FILE#"${REPO_ROOT}/"})" bash "$LOCAL_CI_FILE"
 fi
 
 echo ""
-echo "=== ALL VALIDATION STEPS PASSED ==="
+if [ "$VALIDATE_QUICK" = 1 ]; then
+  echo "=== QUICK VALIDATION PASSED (mend, rustfmt, taplo) ==="
+else
+  echo "=== ALL VALIDATION STEPS PASSED ==="
+fi

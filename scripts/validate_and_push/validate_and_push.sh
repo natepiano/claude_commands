@@ -7,18 +7,22 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 
-# Options (both used by /unit:delegate's periodic CI point):
+# Options (--to and --fix-commit used by /unit:delegate's periodic CI point;
+# all three by the showrunner's merge push):
 #   --to <branch>          push HEAD to origin/<branch> instead of the current
 #                          branch; always the direct path, so a run on the
 #                          default branch reaches CI without landing on it
 #   --fix-commit <message> commit validation fixes as a new commit with this
 #                          message instead of amending the last commit, so a
 #                          recorded checkpoint commit is never rewritten
+#   --quick                run only the cargo-mend, rustfmt and taplo steps
+#                          (see validate_ci.sh)
 PUSH_TARGET_BRANCH=""
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --to) PUSH_TARGET_BRANCH="${2:?--to needs a branch name}"; shift 2 ;;
     --fix-commit) export VALIDATE_FIX_COMMIT_MESSAGE="${2:?--fix-commit needs a message}"; shift 2 ;;
+    --quick) export VALIDATE_QUICK=1; shift ;;
     *) echo "validate_and_push.sh: unknown argument: $1" >&2; exit 64 ;;
   esac
 done
