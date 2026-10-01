@@ -80,17 +80,7 @@
       "Bash(pwd)",
       "Bash(date)",
       "Bash(true)",
-      "Bash(git ls-files)",
-      "Bash(git -C * status)",
-      "Bash(git -C * status *)",
-      "Bash(git -C * log)",
-      "Bash(git -C * log *)",
-      "Bash(git -C * diff)",
-      "Bash(git -C * diff *)",
-      "Bash(git -C * show)",
-      "Bash(git -C * show *)",
-      "Bash(git -C * rev-parse)",
-      "Bash(git -C * rev-parse *)"
+      "Bash(git ls-files)"
     ],
     "deny": [
       "Bash(git stash)",
