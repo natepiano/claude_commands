@@ -44,7 +44,13 @@
 # log and exits 0 without the cargo token: seats re-ran unchanged trees 416
 # times in the week to 2026-10-01. A failure is never recorded, a `test` that
 # changed the tree records nothing, and a run outside a delegate session is
-# never cached.
+# never cached. end_session.sh deletes the records when the run ends.
+#
+# Each record carries what a repeat would cost: the run's wall time minus
+# cargo's own "Finished … in" build times, since a repeat on the same tree
+# builds nothing. Every hit appends that figure, with the worktree and branch,
+# to ~/.local/state/verify/saved.jsonl, which outlives the records;
+# verify_saved.py reports it.
 #
 # Usage:
 #   verify.sh check <package>              fast compile feedback (workspace
@@ -298,6 +304,7 @@ if [[ -n "${CACHE_SESSION_DIR}" && "${NO_CACHE}" -eq 0 \
 fi
 RUN_LOG=""
 RUN_KEY=""
+RUN_STARTED=0
 LOOKUP_KEY=""
 
 tree_key() {
@@ -312,11 +319,34 @@ cache_lookup() {
     [[ -n "${CACHE_DIR}" ]] || return 1
     LOOKUP_KEY="$(tree_key)"
     [[ -n "${LOOKUP_KEY}" && -f "${CACHE_DIR}/${LOOKUP_KEY}.pass" ]] || return 1
-    echo "verify.sh: PASS (recorded) — $(cat "${CACHE_DIR}/${LOOKUP_KEY}.pass")"
+    note_saved "$(sed -n 's/^saved_s=//p' "${CACHE_DIR}/${LOOKUP_KEY}.pass")" || true
+    echo "verify.sh: PASS (recorded) — $(head -n 1 "${CACHE_DIR}/${LOOKUP_KEY}.pass")"
     echo "verify.sh: the tree and every input are unchanged since, so nothing was rebuilt or re-run."
     echo "verify.sh: that run's output is ${CACHE_DIR}/${LOOKUP_KEY}.log; its last lines:"
     tail -n 5 "${CACHE_DIR}/${LOOKUP_KEY}.log" 2>/dev/null || true
     echo "verify.sh: add --no-cache to run it anyway (a flake hunt)."
+}
+
+SAVED_LEDGER="${VERIFY_SAVED_LEDGER:-${HOME}/.local/state/verify/saved.jsonl}"
+SAVED_LINE_PY='
+import json
+import sys
+from datetime import datetime, timezone
+
+at = datetime.now(timezone.utc).isoformat(timespec="seconds")
+worktree, branch, command, saved = sys.argv[1:5]
+print(json.dumps({"at": at, "worktree": worktree, "branch": branch, "command": command, "saved_s": int(saved or 0)}))
+'
+
+# One line per hit in the savings ledger; a ledger that cannot be written
+# loses the figure, never the pass.
+note_saved() {
+    local top branch
+    top="$(git rev-parse --show-toplevel 2>/dev/null)" || return 0
+    branch="$(git symbolic-ref --short -q HEAD || echo "detached $(git rev-parse --short HEAD)")"
+    mkdir -p "${SAVED_LEDGER%/*}" || return 0
+    "$PY" -c "$SAVED_LINE_PY" "$top" "$branch" "$CMD${ARGS[*]:+ ${ARGS[*]}}" "${1:-0}" \
+        >> "${SAVED_LEDGER}" 2>/dev/null || true
 }
 
 # Called on a 0 exit, before the token is released, so a peer queued on the
@@ -330,10 +360,22 @@ cache_record() {
         rm -f "${RUN_LOG}"
         return 0
     fi
+    local build saved
+    # Cargo prints "in 0.23s" or "in 1m 23s"; everything else in the run is
+    # what a repeat would pay again.
+    build="$({ grep -aoE 'Finished .* in ([0-9]+m )?[0-9.]+s' "${RUN_LOG}" || true; } \
+        | awk '{ t = $NF; sub(/s$/, "", t); m = 0
+                 if ($(NF - 1) ~ /^[0-9]+m$/) { m = $(NF - 1); sub(/m$/, "", m) }
+                 total += m * 60 + t }
+               END { printf "%d", total }')"
+    saved=$(( SECONDS - RUN_STARTED - ${build:-0} ))
+    if (( saved < 0 )); then
+        saved=0
+    fi
     mv -f "${RUN_LOG}" "${CACHE_DIR}/${key}.log"
-    printf '`verify.sh %s` passed %s, run by %s\n' "$CMD${ARGS[*]:+ ${ARGS[*]}}" \
+    printf '`verify.sh %s` passed %s, run by %s\nsaved_s=%d\n' "$CMD${ARGS[*]:+ ${ARGS[*]}}" \
         "$(date '+%Y-%m-%d %H:%M:%S')" "${PLAN_DELEGATE_TEAM_ROLE:-the orchestrator}" \
-        > "${CACHE_DIR}/${key}.pass.tmp"
+        "${saved}" > "${CACHE_DIR}/${key}.pass.tmp"
     mv -f "${CACHE_DIR}/${key}.pass.tmp" "${CACHE_DIR}/${key}.pass"
 }
 
@@ -386,6 +428,7 @@ fi
 if [[ -n "${CACHE_DIR}" && -n "${LOOKUP_KEY}" ]] && mkdir -p "${CACHE_DIR}"; then
     RUN_KEY="${LOOKUP_KEY}"
     RUN_LOG="${CACHE_DIR}/run.$$.log"
+    RUN_STARTED=${SECONDS}
     : > "${RUN_LOG}"
     exec > >(tee -a "${RUN_LOG}") 2> >(tee -a "${RUN_LOG}" >&2)
 fi

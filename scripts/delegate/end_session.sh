@@ -13,8 +13,11 @@
 # delegate so a peer can still reach a thread between turns -- so the end of
 # the run is the only point that knows nobody needs it any more.
 #
-# Safe to run when no run is active. The session directory itself is left alone;
-# heartbeat and delegate logs stay readable after the run.
+# Deletes the run's verify.sh pass records (verify_cache/); the time they saved
+# is already in ~/.local/state/verify/saved.jsonl.
+#
+# Safe to run when no run is active. The rest of the session directory is left
+# alone; heartbeat and delegate logs stay readable after the run.
 
 set -euo pipefail
 
@@ -40,6 +43,9 @@ if [[ -f "${MARKER}" ]]; then
   if [[ -n "${SESSION_DIR}" && -f "${SESSION_DIR}/mesh_server.json" ]]; then
     "$PY" "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/../agents/codex_mesh.py" \
       stop --session-dir "${SESSION_DIR}" || true
+  fi
+  if [[ -n "${SESSION_DIR}" && -d "${SESSION_DIR}/verify_cache" ]]; then
+    rm -rf -- "${SESSION_DIR}/verify_cache"
   fi
   rm -f "${MARKER}"
   echo "Delegate run ended; marker cleared."
