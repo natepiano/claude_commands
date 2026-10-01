@@ -1,5 +1,5 @@
 ---
-description: Split greenlit phased plans into one delegate-ready plan per unit plus a production doc, so /showrunner:produce can launch the units.
+description: Split greenlit phased plans into one delegate-ready plan per unit plus a production doc, so /showrunner:produce can launch the unit directors.
 ---
 
 # To Production

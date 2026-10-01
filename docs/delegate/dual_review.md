@@ -17,7 +17,7 @@ is the fourth reader:
 | --- | --- | --- |
 | `adversary` | the failing case — the input that violates a stated invariant, the caller that was not updated, the state the new code cannot reach, the test that passes for the wrong reason | `test` |
 | `contract` | what the Work Order says, including every part no test covers, and anything built that it never asked for; then what the change reaches without naming — callers, consumers, public API, traits, registration, plugin wiring, invariants and transitions | `impl` |
-| `craft` | the diff's code quality alone, judged by the three gods and the Rust style guide — names, idiom, needless concepts or layers, wasted work where code runs often | `review` |
+| `craft` | the diff's code quality alone, judged by the three gods and the Rust style guide — names, idiom, needless concepts or layers, wasted work where code runs often; in an API, the two means that most often serve the gods, ergonomics and type-system leverage | `review` |
 
 No reviewer wrote any of the code — each is a fresh session per
 <ReviewPromptContract/> — so no lens has to be kept away from its own work and

@@ -47,7 +47,7 @@ that builds the wrong thing.
    Infer absent work from the conversation.
 3. Run `progress_history.py start-run --session-dir "${SESSION_DIR}"
    --working-dir "${WORKING_DIR}" [--plan-doc <path>]`. It is idempotent; stop
-   if exact main-agent identity cannot be detected. The recorder alone owns the
+   if the unit director's exact identity cannot be detected. The recorder alone owns the
    project clock: for a supplied plan it validates and uses `Project started`,
    or derives and persists it from the plan's oldest Git commit or run start;
    for ad hoc work it reuses the latest plan-backed clock for the exact working
@@ -73,7 +73,7 @@ that builds the wrong thing.
   <RunProjectStyleReview/>.
 - Verification: translate Build/Test/Lint/Run/Smoke and Acceptance gate into
   <VerificationContract/> lines. Convert old raw Cargo/full-clippy entries to
-  scoped `verify.sh`; the main agent retains live smoke ownership.
+  scoped `verify.sh`; the unit director retains live smoke ownership.
 - Three Gods: <WritePromptContract/> item 9's section, verbatim.
 
 Do not open code to fill a plan gap. Name the gap and let review catch its

@@ -1,13 +1,13 @@
 ---
-description: Give the showrunner a measured ETA for this unit's current phase, built from the durations this run has already recorded, when the unit has not stated one.
+description: Give the showrunner a measured ETA for this unit's current phase, built from the durations this run has already recorded, when the unit director has not stated one.
 ---
 
 # ETA
 
 The showrunner asks for this when a unit's phase ETA reads "none measured" or
-it has stated none. Answer in this turn with a time the records back. This is a
-read of what was already measured; start no new runs, and do not pause the
-phase's work.
+its unit director has stated none. Answer in this turn with a time the records
+back. This is a read of what was already measured; start no new runs, and do
+not pause the phase's work.
 
 ## Steps
 

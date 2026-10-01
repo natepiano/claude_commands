@@ -1,7 +1,7 @@
 #!/usr/bin/env zsh
 # Unit status for /showrunner:produce's update schedule.
 # Usage: unit_status.sh <state-dir> <user-zone> <session>...
-# Each call checks every unit: that its session and Claude are running, any
+# Each call checks every unit director: that its session and Claude are running, any
 # form or decision waiting on the user, and its latest step, gate and ETA.
 # A block on the showrunner or another unit prints as a BLOCK line with its age.
 # No pipefail: each test reads grep's own status, and an early `grep -q` exit
@@ -43,7 +43,7 @@ clear_block() {
 }
 
 # Prints what waits on the user in unit $1, whose pane text is $2.
-# A unit waits on the user when it is idle and its latest turn-end line is decision or blocked.
+# A unit director waits on the user when it is idle and its latest turn-end line is decision or blocked.
 waiting_on_user() {
   local u=$1 p=$2 last gate_no gate_text key start o peer=
   print -r -- "$p" | tail -12 | grep -qE '^\s*[✢✻✽✶·*] [A-Z][a-z]+( [a-z]+)?…' && return

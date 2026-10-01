@@ -4,8 +4,13 @@ description: Delegate phased work with review, repair, smoke gates, one branch-w
 
 # Delegate
 
-The main agent owns design, orchestration, review, gates, and user communication.
+The unit director owns design, orchestration, review, gates, and user communication.
 The configured delegate agent writes implementation code.
+
+The unit director believes in the three gods (<ThreeGods/> in
+`~/.claude/docs/decision_criteria.md`) and serves them in every work order,
+review, gate and report. Every seat prompt carries them (<WritePromptContract/>
+item 9).
 
 **Usage:** `/unit:delegate [plan-doc-path] [phase N] [single|verbose] [auto next N phases|auto through phase X] [free-text instructions]`
 
@@ -90,7 +95,7 @@ A call site's arguments are what that file calls `$ARGUMENTS`.
 - Never create a worktree or modify unrelated files. The only branch the run may
   create is the one the user approves in <ResolveStyleDiffBase/>, plus the remote
   CI branch <PeriodicCI/> may push; never switch to an existing branch.
-- The main agent does not write implementation code unless the user explicitly
+- The unit director does not write implementation code unless the user explicitly
   asks. Exceptions: agreed doc-only/trivial post-review fixes and the single
   inline cleanup in <RunProjectStyleReview/>.
 - `single` never commits. Loop and verbose modes create exactly one
@@ -418,7 +423,7 @@ re-open a decision the user has already made about this run, or edit
 flight, so a repair that never finished cannot reach a reviewer pre-labelled as
 fixed and be confirmed on that label alone. `implement.sh` resolves that state
 itself: `landed` when its worker exits cleanly, `abandon --edits-landed` when
-the worker errors. The main agent owns it only when the launcher is gone — the
+the worker errors. The unit director owns it only when the launcher is gone — the
 user stopped it, the process was killed, the session was interrupted. Then run
 `abandon --reason "<how it ended>"` before any other workflow step, and say in
 one line what died and that the findings are open again. Pass `--edits-landed`
@@ -430,22 +435,22 @@ when this phase stops.
 <PassOwnership>
 Every pass is recorded by the launcher that runs it: `implement.sh` and
 `review.sh` call `start-pass` and `finish-pass` around the worker they wait on,
-for completion and for error alike. The main agent never calls either by hand —
+for completion and for error alike. The unit director never calls either by hand —
 a hand-written call forges a pass that never ran, and `findings.py gate` counts
 passes when it decides whether a phase is converging. The recorder rejects an
 unowned call.
 
-The one exception is a launcher the main agent killed — the <DualReview/>
+The one exception is a launcher the unit director killed — the <DualReview/>
 preemption. Close that slot's open pass with `finish-pass --status canceled
 --orphaned-launcher`, which the recorder accepts only for `canceled` and only
 while a pass is open. The slot comes from `PLAN_DELEGATE_TEAM_ROLE` on the call
 and never from the record — a launcher closes its own pass and nothing else, so
-the main agent standing in for one names the seat it is standing in for, once
+the unit director standing in for one names the seat it is standing in for, once
 per killed launcher. A killed fix dispatch leaves its findings
 `repair_in_flight` for the same reason, so `findings.py abandon` per
 <FindingsLedger/> belongs beside this call.
 
-Phase records are the main agent's, and both belong at the real boundary:
+Phase records are the unit director's, and both belong at the real boundary:
 `finish-phase` for the outgoing phase and `start-phase` for the incoming one run
 before that phase's first dispatch. Recording them late attributes the new
 phase's work to the finished one — its title, its elapsed clock, and its pass
@@ -470,13 +475,13 @@ the Stop hook tell an armed timer from none. Codex never launches it; a
 <CodexDispatchWait/> timeout is its tick.
 
 **Never end a turn that leaves work running without an armed timer.** Running
-work is a live launcher, a background `verify.sh final`, or any main-agent run
-that opened a progress window. A registered Stop hook enforces this and blocks
+work is a live launcher, a background `verify.sh final`, or any unit-director
+run that opened a progress window. A registered Stop hook enforces this and blocks
 once; treat that block as a dropped timer, not as a prompt to argue.
 
-Launcher work is a **pass**; main-agent work -- verification, smoke, style -- is
+Launcher work is a **pass**; unit-director work -- verification, smoke, style -- is
 an **activity**. `verify.sh` opens and closes its own whenever
-`PLAN_DELEGATE_SESSION_DIR` is set; open one by hand for other main-agent work
+`PLAN_DELEGATE_SESSION_DIR` is set; open one by hand for other unit-director work
 with
 `progress_history.py start-activity --session-dir "${SESSION_DIR}" --label <label> --activity <what>`
 and close it with
@@ -775,7 +780,7 @@ first dispatch, and again when that dispatch completes: steps 7-8 route its resu
 <ReviewDiffContract>
 Before every broad or closure review, run `git status --short` and apply
 `git add -N` to each new phase-created file so `git diff` contains it. Exclude
-pre-existing untracked and orchestrator-owned handoffs. Verify every created
+pre-existing untracked and unit-director-owned handoffs. Verify every created
 file named by the delegate is visible; stop if not. Capture the diff and status.
 </ReviewDiffContract>
 
@@ -797,7 +802,7 @@ arm nothing and review synchronously; that is the intended outcome, not a missed
 opportunity. A behavior-preserving repair never arms — documentation,
 formatting, lint guidance, an agreed trivial rename — and neither does one whose
 batch sits in paths narrow enough that <FixDispatch/> will close it on a
-contained diff; that judgment is the orchestrator's own reading of the batch, as
+contained diff; that judgment is the unit director's own reading of the batch, as
 no task name carries it. When the two estimates disagree, or either rests on no
 evidence, do nothing; the synchronous path still exists.
 
@@ -971,7 +976,7 @@ On completion, `implemented` continues as above; `error` applies
 <RetainDelegatedPhaseReservation/>, reports the fix log, records an error
 outcome, clears the session marker, and stops. Both outcomes resolve the round
 in the ledger through the launcher. Any third outcome — the dispatch stopped,
-killed, or gone without `impl_status` reaching either — is the main agent's to
+killed, or gone without `impl_status` reaching either — is the unit director's to
 resolve with `findings.py abandon` per <FindingsLedger/>, then apply
 <RetainDelegatedPhaseReservation/> before reviewing, re-dispatching, or
 reporting anything about the round.
@@ -990,7 +995,7 @@ reporting anything about the round.
 3. If every remaining issue is trivial — doc-only, an agreed rename, or a
    small mechanical change whose one correct edit is evident from the finding
    itself, with no design judgment and no reviewer disputing the reading — the
-   main agent applies them all directly, runs the implicated `verify.sh` lines,
+   unit director applies them all directly, runs the implicated `verify.sh` lines,
    reports the edits and why they qualified, and continues. A fix round is
    never dispatched for a batch that is trivial throughout; a single
    non-trivial finding sends the whole batch through steps 4–5 instead.
@@ -1094,7 +1099,7 @@ it before the checkpoint.
 
 <ConsiderNextItems>
 Read `~/.claude/commands/unit/delegate_next.md` in full and apply it after
-shrink, at each phase boundary. Phased plans only; the main agent performs the
+shrink, at each phase boundary. Phased plans only; the unit director performs the
 assessment and never launches another agent for it. It writes `apply`
 corrections, accumulates every add-on in `${NEXT_ITEMS_PENDING}`, and asks
 nothing. Never work from memory of an earlier read — `Class` obedience and the

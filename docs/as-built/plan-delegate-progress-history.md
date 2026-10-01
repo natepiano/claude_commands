@@ -69,7 +69,7 @@ phase's identity. A findings ledger without progress state still works; it just
 keeps no durable history. Each `finding_*` event repeats `phase_instance_id` and
 `phase_id`, so the fix loop's rounds join to the phase they belong to.
 
-The main agent's exact family, session id, model, and effort come from the
+The unit director's exact family, session id, model, and effort come from the
 active Claude or Codex transcript. `implement.sh` and `review.sh` provide the
 called task, family, model, and effort after resolving `config/agents.conf`.
 
@@ -99,7 +99,7 @@ Each progress event classifies the choice automatically:
 
 - `raw`: insufficient applicable history, so the raw estimate was shown;
 - `calibrated`: the statistically suggested percentage was shown;
-- `override`: the main agent chose another percentage from stronger current
+- `override`: the unit director chose another percentage from stronger current
   evidence.
 
 An override requires a non-empty reason naming that evidence. Aggregation keeps
@@ -154,10 +154,10 @@ been accepted, so it always returned something.
 State lives in `findings_state.json` beside the progress state and resets itself
 when the progress state's active `phase.instance_id` changes. Findings get stable
 ids (`F001…`) that survive across rounds, so "the same finding came back" is a
-fact the script can check rather than a judgment the orchestrator has to make.
+fact the script can check rather than a judgment the unit director has to make.
 Each finding is `open`, `fixed_pending_review`, or `accepted`.
 
-`gate` returns one of two verdicts and the orchestrator follows it — it never
+`gate` returns one of two verdicts and the unit director follows it — it never
 decides on its own whether to run another round:
 
 - `converged` — nothing gating is open; go to the smoke test.
@@ -191,7 +191,7 @@ round repairs exactly what it was handed and whose next gate finds something
 genuinely new, which reads as one open blocker round after round. The count cannot tell
 that apart from a repair that will not take. So the tests were kept for what they
 are good at — naming the shape of a phase that is not converging — and the
-enforcement was dropped. The orchestrator reports the sentence and dispatches the
+enforcement was dropped. The unit director reports the sentence and dispatches the
 round; the user watches the run and stops it themselves when it warrants.
 
 The repair budget is the first round's gating count times
@@ -233,7 +233,7 @@ progress_history.py aggregate [--percent <N>]
 calls, per invocation so the agent subprocess never inherits it. The recorder
 rejects an unowned call, because a hand-written pass forges one that never ran
 and `findings.py gate` counts passes to decide whether a phase is converging.
-The single exception is a launcher the orchestrator killed, whose pass stays
+The single exception is a launcher the unit director killed, whose pass stays
 open: `finish-pass --status canceled --orphaned-launcher` closes it, and only
 that status, and only while a pass is open.
 
@@ -341,11 +341,11 @@ latest unprefixed line behind the launcher's kind — `done: hana_catalyst tests
 240 passed` rather than the launcher's `done:` line on every seat. A seat that never
 narrated shows the launcher's words; one that has registered and said nothing
 shows `no board line yet`; a fresh `register` clears the previous occupant's
-words. The main agent is omitted: the reader is the main agent, and `timeline`
+words. The unit director is omitted: the reader is the unit director, and `timeline`
 carries both identities per pass for anyone reconstructing a run after the fact.
 
 Windows that sit in no round keep a row apiece, named as they always were: a
-main-agent activity, which holds no seat, and every pass that records none — a
+unit-director activity, which holds no seat, and every pass that records none — a
 solo run's, and the closure reviewer `review.sh` launches between rounds. A
 broad review's two lens reviewers do record seats and join the round they
 read, one row below the writers. Such a seatless pass is drawn in the seat its
@@ -375,10 +375,10 @@ the pass whose diff it reads rather than for its own ordinal — `Impl Review`,
 activity between them is transparent, so verification does not break the pair. A
 review with no unclaimed pass behind it, the closure review after verification,
 keeps the ordinal `Review 3`. An
-activity's name is its `--label`, and its `Delegate` cell is empty: the main
-agent ran that window itself. Both identity columns are read per window rather
-than per run, and `start-pass` and `start-activity` re-detect the orchestrator
-as they open, so a main agent that changes model or effort part way through
+activity's name is its `--label`, and its `Delegate` cell is empty: the unit
+director ran that window itself. Both identity columns are read per window rather
+than per run, and `start-pass` and `start-activity` re-detect the unit director
+as they open, so a unit director that changes model or effort part way through
 shows the change on the rows after it. Detection that comes back unknown leaves
 the stored identity alone, because a window that cannot answer must not erase
 the answer already recorded.
@@ -393,7 +393,7 @@ at one window and ends at the next: findings opened after a review make it
 `N found`, a landed repair batch makes a fix `N landed`, verdicts recorded after
 a closure review make it `N fixed`, an activity shows the `--result` its own
 launcher recorded, and any non-completed status shows itself. The interval is
-what does the attributing there — the main agent opens, dispatches, and settles
+what does the attributing there — the unit director opens, dispatches, and settles
 findings in the gap after a window closes, not while it runs — and it holds
 because those windows are sequential. `timeline` attributes every row this way.
 

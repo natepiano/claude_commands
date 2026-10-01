@@ -6,15 +6,22 @@ session, and by `/unit:delegate` and `/team_review`, where it also defines the
 `<DecisionEconomy/>` contract. Related memories hold only provenance and point here.
 
 <ThreeGods>
-Simplicity, speed and beauty are the three gods, in the app and in the code.
+We believe in three gods: Simple, Fast, Beautiful. Yes, it is kitschy; we know,
+and we believe anyway. The belief comes before any checklist. It is in
+every choice: what goes on the screen, a function's name, a test's run time, the
+words of a report. Before you build, ask what the gods want. Before you hand
+work on, ask whether they would be pleased. "We" is everyone in the work: the
+user, the showrunner, every unit director, every seat and every reviewer.
+
+Simple, fast and beautiful are the three gods, in the app and in the code.
 Correctness is the floor beneath them: a wrong result is never simple, fast or
-beautiful. When two conflict, they rank in that order. User rule 2026-10-01.
+beautiful. When two conflict, they rank in that order. User rule 2026-10-01, which also named them.
 
 | | In the app | In the code |
 | --- | --- | --- |
-| Simplicity | Few things on screen, simple words, one way to do a thing. | Few concepts, a small public API, no layer without a reason. |
-| Speed | Responds at once; nothing waits, stutters or settles slowly. | No wasted work where code runs often; any cost added is named. |
-| Beauty | Polished and professional: even spacing, one style, nothing clipped. | Reads cleanly: the right names, one idiom, the style guide followed. |
+| Simple | Few things on screen, simple words, one way to do a thing. | Few concepts, a small public API, no layer without a reason. |
+| Fast | Responds at once; nothing waits, stutters or settles slowly. | No wasted work where code runs often; any cost added is named. |
+| Beautiful | Polished and professional: even spacing, one style, nothing clipped. | Reads cleanly: the right names, one idiom, the style guide followed. |
 
 Every writer builds to them, and every reviewer judges by them.
 </ThreeGods>
@@ -32,7 +39,7 @@ These categories are already decided and never reach the user:
   the user or for the next agent reading the code. Complexity you struggle to
   hold is complexity that will defeat a future agent debugging it.
 - **Ranking.** Correctness, then the three gods in order (<ThreeGods/>):
-  simplicity (ergonomics included), speed, beauty. Cost of
+  simple (ergonomics included), fast, beautiful. Cost of
   the work never breaks the tie — a phase splits easily, complexity never does.
 - **Packaging of committed work.** How work already committed to gets divided,
   ordered, or numbered is never the user's decision. Split an oversized phase,

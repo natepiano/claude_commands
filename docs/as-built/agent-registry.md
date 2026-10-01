@@ -118,7 +118,7 @@ Wrong arg count or a bad mode returns 2. A missing prompt file writes `Prompt no
 `agent_exec`'s codex branch runs `codex exec`, a process nothing outside it can
 reach: a delegate launched that way takes one prompt and is unreachable until it
 exits. `codex_mesh.py` is the alternative launch path that gives a codex delegate
-an address, so peers and the orchestrator can message and interrupt it mid-run
+an address, so peers and the unit director can message and interrupt it mid-run
 the way they already can a claude delegate. Selected per `[delegate.options]
 codex_mesh` in the registry (`1` by default, so the mesh is the normal codex
 launch path), overridable for one run with `PLAN_DELEGATE_CODEX_MESH`;
@@ -158,7 +158,7 @@ and pass recording are untouched.
 `send` calls `thread/queue/add`: the message lands at the start of the target's
 **next** turn. `steer` calls `turn/steer` with the roster's `expectedTurnId` and
 interrupts the turn in flight. Both address a delegate by mesh name through the
-roster file, which is why they work from an unrelated process — the orchestrator,
+roster file, which is why they work from an unrelated process — the unit director,
 or a peer delegate.
 
 `stop` SIGTERMs each recorded pid (SIGKILL after 5 s) and removes the server
@@ -238,7 +238,7 @@ server starts a turn for it by itself, so `start` cannot exit at the first
 It instead checks `thread/queue/list` at each turn boundary and keeps streaming
 while work remains, plus a short grace window for a queued turn already in
 flight, and only then writes the summary and exits. The summary is the last
-turn's answer, so a peer's follow-up is reflected in what the orchestrator reads.
+turn's answer, so a peer's follow-up is reflected in what the unit director reads.
 
 The mirror of that: `send` **refuses** a delegate whose roster status is not
 `running`. The thread outlives the launcher, so the server would cheerfully start

@@ -27,9 +27,15 @@ must not drift from it:
 - **Showrunner** — the session running `/showrunner:produce`. It merges, tests, pushes,
   makes the visual choices, clears waits between units, relays the user's words
   and reports on a schedule. It writes no implementation code.
-- **Unit** — one `/unit:delegate` run on one unit plan, in its own worktree,
-  branch and session. Its session is that run's orchestrator, and its codex
-  workers are its seats. A unit is named `<area>-unit`, e.g. `widget-unit`.
+- **Unit** — one `/unit:delegate` run on one unit plan, in its own worktree and
+  branch. A unit is named `<area>-unit`, e.g. `widget-unit`. Its plan, worktree,
+  branch, phases, checkpoints and ETA are the unit's.
+- **Unit director** — the Claude session that runs a unit: the `/unit:delegate`
+  session the showrunner launches in tmux. It receives messages, decides, writes
+  Work Orders, dispatches seats, runs gates, checkpoints and reports. It writes
+  no implementation code.
+- **Seat** — a codex worker the unit director dispatches, as implementer or
+  reviewer.
 - **Merge branch** — the branch every unit's checkpoints merge into. cargo-berth
   calls it the trunk. In prose, call it by its branch name, because a unit may be
   named `trunk-unit`.
@@ -38,6 +44,8 @@ must not drift from it:
 
 User, 2026-09-28: production, showrunner and unit were chosen because Hana is a
 DCC app and the film words are short.
+
+User, 2026-10-01: the session that runs a unit is its unit director.
 
 ---
 
@@ -147,8 +155,8 @@ branch, port and the files you own.
 4. **The merge branch is the showrunner's.** Never merge into it or push it.
    <PeriodicCI/> and <CICleanup/> do not run in a unit; the showrunner runs CI
    on the merge branch.
-5. **One more commit kind.** Besides checkpoints, a unit may merge the merge
-   branch into its own branch, when a gate clears or the showrunner asks:
+5. **One more commit kind.** Besides checkpoints, a unit director may merge the
+   merge branch into the unit's branch, when a gate clears or the showrunner asks:
    `git merge --no-ff -m "merge(<plan-slug>): <merge branch> at <short hash> — <reason>" <merge branch>`.
    Resolve conflicts on your side, build and test, then continue.
 6. **Gates.** A phase with `**Blocked by:** G<k>` starts only once

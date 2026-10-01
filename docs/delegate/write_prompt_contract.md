@@ -16,7 +16,7 @@ Every implementation or fix prompt contains these sections once:
    reasons, and deviations when done, and **write that summary to this slot's
    `impl_summary_<slot>.txt` as the last act before finishing** — a background
    session has no output redirect, so a summary left only in the reply is a
-   summary the orchestrator never sees. State this slot's file set and the
+   summary the unit director never sees. State this slot's file set and the
    peer's file set per <TeamFilePartition/>, and that a peer's file is blocked
    rather than merged. The summary also carries the three things no reader can
    recover from the diff: **what this slot is unsure about, what it could not
@@ -51,7 +51,7 @@ Every implementation or fix prompt contains these sections once:
    token. State the one rule plainly: **a question to a peer is a message, a
    decision is a board post**, and the board has no `ask` kind to fall back on.
    Give this slot its own mesh name, its peer's name, the call that reaches
-   it, and — on the claude path — the orchestrator's name from
+   it, and — on the claude path — the unit director's name from
    `ListAgents`, per <PhaseMesh/>. An address a member has to go looking for is
    one it will not use, and a codex peer needs the literal `codex_mesh.py`
    command line with the concrete `--session-dir` already filled in, not a
@@ -69,15 +69,20 @@ Every implementation or fix prompt contains these sections once:
    ```
    ## Three Gods
 
-   Simplicity, speed and beauty are the three gods, in the app and in the code.
+   We believe in three gods: Simple, Fast, Beautiful. Yes, it is kitschy; we
+   know, and we believe anyway. The belief is in every choice you make here:
+   each name, each line, each test, each word of your reply. Before you write,
+   ask what the gods want. Before you report, ask whether they would be pleased.
+
+   Simple, fast and beautiful are the three gods, in the app and in the code.
    Correctness is the floor beneath them: a wrong result is never simple, fast or
    beautiful. When two conflict, they rank in that order.
 
    | | In the app | In the code |
    | --- | --- | --- |
-   | Simplicity | Few things on screen, simple words, one way to do a thing. | Few concepts, a small public API, no layer without a reason. |
-   | Speed | Responds at once; nothing waits, stutters or settles slowly. | No wasted work where code runs often; any cost added is named. |
-   | Beauty | Polished and professional: even spacing, one style, nothing clipped. | Reads cleanly: the right names, one idiom, the style guide followed. |
+   | Simple | Few things on screen, simple words, one way to do a thing. | Few concepts, a small public API, no layer without a reason. |
+   | Fast | Responds at once; nothing waits, stutters or settles slowly. | No wasted work where code runs often; any cost added is named. |
+   | Beautiful | Polished and professional: even spacing, one style, nothing clipped. | Reads cleanly: the right names, one idiom, the style guide followed. |
 
    Every writer builds to them, and every reviewer judges by them.
    ```
@@ -152,7 +157,7 @@ reaches the peer and the wrapper at once; a member resumed hours later reads
 the whole history rather than what arrived while it listened; and only the
 token, taken with `mkdir`, makes anything mutually exclusive. With
 `[delegate.options] codex_mesh=0` a codex member is unaddressable and the board
-is its only channel, since the orchestrator is asleep between progress ticks and
+is its only channel, since the unit director is asleep between progress ticks and
 cannot relay. Each `register` line says which case holds, in its `mesh=` field.
 
 - `board.sh post <session_dir> <slot> <kind> <message>` — one broadcast line.
@@ -175,7 +180,7 @@ cannot relay. Each `register` line says which case holds, in its `mesh=` field.
 - **One way to do each thing.** A question goes by message; a decision goes on
   the board. A decision that is not on the board did not happen, however plainly
   it was settled in messages — the board is what a peer resuming later, and the
-  orchestrator at its next tick, actually read.
+  unit director at its next tick, actually read.
 
 Narration goes through the board too: `board.sh post` takes the slot as a
 required argument, so attribution cannot be dropped, where a name an agent is
@@ -184,7 +189,7 @@ merely asked to prefix onto a heartbeat line reliably goes missing.
 
 <PhaseMesh>
 A member launched into the mesh is **addressable**: peers reach each other, the
-orchestrator reaches any of them, and a claude member reaches the orchestrator —
+unit director reaches any of them, and a claude member reaches the unit director —
 mid-run, without waiting for a phase to end.
 
 - **Addresses** are `<project>-<slot>`, the project being the working tree's
@@ -218,14 +223,14 @@ mid-run, without waiting for a phase to end.
   finished codex peer is not**, and `send` says so rather than pretending: it
   refuses any target whose roster status is not `running`. Ask a codex peer
   while it is still working, or read its summary file instead.
-- **A codex member has no route to the orchestrator.** It reaches its peer with
-  the calls above and reaches the orchestrator only through the board, which the
-  orchestrator reads at every progress tick. Anything that cannot wait for the
+- **A codex member has no route to the unit director.** It reaches its peer with
+  the calls above and reaches the unit director only through the board, which the
+  unit director reads at every progress tick. Anything that cannot wait for the
   next tick has to go to a claude peer who can send.
 
 **What to send, and to whom.** Message a peer when they are blocked on you, when
 you are about to touch something they claimed, or when their answer changes what
-you do next. Message the orchestrator when the *user* needs to know something now
+you do next. Message the unit director when the *user* needs to know something now
 — a blocker that will not resolve, an assumption that changes scope, a defect
 worth stopping for. Anything the user would want to hear at the end of the phase
 can wait for the summary; anything they would be annoyed to hear only at the end
@@ -256,7 +261,7 @@ holding the token by hand will then wait out the full timeout for a token it is
 already holding — a self-inflicted deadlock that looks exactly like a slow test
 run. The token is infrastructure the delegate does not see. `--hold` is a
 deadline, not a reservation, so a member killed mid-hold strands nobody behind
-its lock. The orchestrator may inspect holders with
+its lock. The unit director may inspect holders with
 `board.sh locks "${SESSION_DIR}"` when a phase looks stalled.
 
 **A green run only means what the tree it ran against means.** The peer is editing

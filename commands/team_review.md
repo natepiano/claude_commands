@@ -116,7 +116,7 @@ Every agent prompt begins with this preamble verbatim:
 Before evaluating, Read ~/rust/nate_style/review-charter.md — its ranked values, hard rules, and finding schema govern every finding you return. Follow its style-guide loading rule when the subject is Rust.
 ```
 
-Choose dimensions appropriate to ${REVIEW_TOPIC}. When the subject is code or a design that shapes code, the charter's four values — ergonomics, performance, type-system leverage, simplicity — must each be covered by some agent's lens (one agent may cover two). Common dimensions include:
+Choose dimensions appropriate to ${REVIEW_TOPIC}. When the subject is code or a design that shapes code, the charter's three gods — simple, fast, beautiful — and the two means that most often serve them in an API, ergonomics and type-system leverage, must each be covered by some agent's lens (one agent may cover two). Common dimensions include:
 
 - **Correctness & Completeness** — Does the design correctly and completely achieve ${REVIEW_INTENT}? What's missing, what edge cases or gaps would stop it working as intended? (Whether the *approach itself* is correct is a premise-challenge — see `<IntentFirewall/>`.)
 - **Architecture & Design** — Given the committed approach, is the structure sound, are responsibilities well-separated, does it achieve ${REVIEW_INTENT} cleanly, and will it scale *within that approach*? A "simpler alternative" or "don't do this" is a premise-challenge — raise it only under `<IntentFirewall/>`, not as a default lens.

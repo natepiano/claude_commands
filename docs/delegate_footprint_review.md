@@ -4,7 +4,7 @@ Team review of `~/.claude/commands/plan/delegate.md`, run 2026-08-31.
 Posture **strengthen**: the workflow's behavior is fixed; the only question is bytes.
 
 Subject at review time: **2385 lines / 18,811 words / 130,256 bytes**, loaded in
-full into the orchestrator's context on every `/plan:delegate` invocation.
+full into the unit director's context on every `/plan:delegate` invocation.
 
 Five reviewers (`team_review.expert` = gpt-5.6-sol:xhigh, readonly), one lens each:
 duplication and canonical home; rationale versus instruction; form and structure;
@@ -21,12 +21,12 @@ contradicts itself, found because five readers read it closely at once.
 
 | # | Where | Defect | Status |
 | --- | --- | --- | --- |
-| C1 | `<PhaseTeam/>` | "**Only `impl` is given a `${PASS_KIND}`**" contradicted `<LaunchImplementation/>` step 5 ("**Both seats carry a pass kind**") and the recorder, which keys open passes by slot and closes only the calling slot's stale pass (`progress_history.py:1188-1213`, `_pass_slots` / `_close_slot_pass`). The stale rule made the orchestrator launch `test` and `review` with an empty pass kind, which is why those seats showed a role and no duration in the round table. | **fixed** |
+| C1 | `<PhaseTeam/>` | "**Only `impl` is given a `${PASS_KIND}`**" contradicted `<LaunchImplementation/>` step 5 ("**Both seats carry a pass kind**") and the recorder, which keys open passes by slot and closes only the calling slot's stale pass (`progress_history.py:1188-1213`, `_pass_slots` / `_close_slot_pass`). The stale rule made the unit director launch `test` and `review` with an empty pass kind, which is why those seats showed a role and no duration in the round table. | **fixed** |
 | C2 | `<ProgressContract/>` | Describes "Two stage rows" and a reviewer row reading `running (early)`. The recorder emits a round table with seat columns; an armed reviewer occupies the `test` seat's column, not a second stage row. | **fixed** |
 | C3 | `<DelegationResultFormat/>` 1638 | "all three tables" — the recorder emits two (`progress_history.py:3298,3310`). The phrase wraps across a line break, so a single-line grep misses it; an earlier pass wrongly cleared this finding on that evidence. | **fixed** |
 | C4 | `<BackgroundVerificationContract/>` 134-144 | Says Codex waits with progress disabled, then unconditionally says to arm a timer; `<ProgressContract/>` says Codex never launches that timer. | **fixed** |
 | C5 | `<RunSummary/>` 2377 | Lists `convergence reason` as a stop reason. `findings.py` emits only `converged` and `dispatch`; the run cannot stop for it. | **fixed** |
-| C6 | `<FindingsLedger/>` | "The main agent owns `abandon`" — `implement.sh:286-315` already records `landed` on clean exit and `abandon --edits-landed` on worker error. The main agent owns it only when the launcher itself disappears. | **fixed** |
+| C6 | `<FindingsLedger/>` | "The main agent owns `abandon`" — `implement.sh:286-315` already records `landed` on clean exit and `abandon --edits-landed` on worker error. The unit director owns it only when the launcher itself disappears. | **fixed** |
 | C7 | `<LaunchImplementation/>` 1319-1322 | "no escalation task and no escalated kind" describes the retired difficulty-tier model. Note: the remaining `architect` occurrences are the **live** sibling review and its parsed `skip-architect` switch — preserve those byte-identically until the sibling command is renamed with them. | **fixed** |
 
 ## Applied
@@ -63,8 +63,8 @@ editing — reaching 40-60% needs D1.
 The user approved delegate.md becoming an index, and added the requirement that
 drove the naming: an extracted part the user might want to run by hand should be
 a slash command, not a passive doc. A slash command file is dual-purpose — the
-orchestrator reads it at its moment, and the user can type it when the
-orchestrator skips that moment.
+unit director reads it at its moment, and the user can type it when the
+unit director skips that moment.
 
 **Naming convention.**
 
@@ -122,7 +122,7 @@ Estimated total **≈30,000 bytes, ~23%**.
 | --- | ---: | ---: | --- | --- |
 | `<ProgressContract/>` | 11,032 | ~6,300 | 5/5 | The recorder owns its output. After "copy the Markdown exactly", ~1.9KB re-describes every table, column, duration, ETA band and clock the script renders. Replace with a byte-for-byte imperative naming the whole output units. |
 | `<EarlyReviewArm/>` | 7,760 | ~3,700 | 4/5 | Marker mechanics the recorder enforces (`arm-review` cannot create a pass; the real pass supersedes the marker). **Guarded:** the stale-sentinel story at 1407-1422 and the void-verdict rule are not cuttable — see below. |
-| `<CheckpointCommit/>` | 8,504 | ~3,000 | 4/5 | Steps 5-7 become state/result matrices. `claim_state.py` validates ids, cardinality, blockers and alternatives before `state` exists; the orchestrator keeps only the acceptance allowlist and the `protected_tip` comparison. |
+| `<CheckpointCommit/>` | 8,504 | ~3,000 | 4/5 | Steps 5-7 become state/result matrices. `claim_state.py` validates ids, cardinality, blockers and alternatives before `state` exists; the unit director keeps only the acceptance allowlist and the `protected_tip` comparison. |
 | Board + mesh + prompt `## Team` | 8,865 | ~3,200 | 5/5 | Three passages restate one channel split. Canonical homes: board owns the durable record and its commands, `<PhaseMesh/>` owns addresses, `<BuildTokenContract/>` owns mutual exclusion. |
 | Token + ledger + pass ownership | 6,524 | ~3,200 | 5/5 | `verify.sh` owns token acquisition and every release path; `findings.py` refuses partial batches and premature verdicts; the recorder rejects unowned pass calls. Keep only what the scripts cannot enforce. |
 | `<ConsiderNextItems/>` | 5,765 | ~2,200 | 3/5 | `phase_review.md` already assigns every proposal a `Class: apply\|gate`. The consumer re-derives the classification instead of obeying the field. |
@@ -154,13 +154,13 @@ a reachable failure.
 **D1 — read-on-demand split. RESOLVED 2026-08-31: approved and applied; see the section above.** The cut plan lands ~23%, not the 40-60% target,
 and it is close to the ceiling for prose editing: the reviewers were right to
 guard ~8KB of literals, and what remains is mostly text a run cannot do without. Reaching the
-target needs a structural change — moving sections the orchestrator needs only at
+target needs a structural change — moving sections the unit director needs only at
 one moment (the reservation contract, checkpoint recovery, the type-table cells)
 out to files it Reads at the point of use, the way `<UserFacingText/>` already
 treats `user_facing_explanation.md`. That trades resident footprint for a read
-the orchestrator can skip or forget, which is a reliability question, not a
+the unit director can skip or forget, which is a reliability question, not a
 packaging one. Surfaced because being wrong costs a subtly less reliable
-orchestrator rather than a one-line revert.
+unit director rather than a one-line revert.
 
 Everything else in this file is recorded, not surfaced: it is either a
 correctness fix or a cut with one sensible in-intent outcome. Consensus across

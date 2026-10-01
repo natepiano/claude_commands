@@ -17,7 +17,7 @@ Everything below is the contract.
 ---
 
 <ConsiderNextItems>
-Phased plans only. The main agent performs this assessment; do not launch another
+Phased plans only. The unit director performs this assessment; do not launch another
 agent. After shrink, read the current `As-built` block, phase diff,
 `${SESSION_DIR}/phase_review_outcomes_<phase>.md`, remaining `todo` Work Orders,
 `${SESSION_DIR}/next_item_amendments_<phase>.md` when present, and

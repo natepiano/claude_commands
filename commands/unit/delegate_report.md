@@ -68,7 +68,7 @@ Everything below is the contract.
    the seats themselves: `impl_status_<slot>`, board posts since the last
    cursor, and whether the launcher has exited. Alive means say so in prose and
    keep the run going; genuinely terminal means step 1's completion handling.
-   Never open an activity to make the tables render — that records main-agent
+   Never open an activity to make the tables render — that records unit-director
    work that never happened.
 
    Include the override reason only when rejecting an applicable calibrated
