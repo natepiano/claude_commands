@@ -45,10 +45,13 @@ STARTED = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}$")
 WHITE = "⬜"
 GREEN = "🟩"
 RED = "🟥"
+BLUE = "🟦"
 BLANK = "  "
 NOW_MARK = "▼ "
 CELL_WIDTH = 2
 ROW_LABEL_WIDTH = 9
+# A phase that started before the left edge has its start beside its name.
+START_FORMAT = "%b-%d %H:%M"
 # The timeline always spans 24 one-hour cells, labelled every three hours. It
 # opens six hours before the three-hour mark at or before now, so a phase that
 # started this morning shows its whole run, and now always sits a quarter to
@@ -147,7 +150,7 @@ def window_start(now: datetime) -> datetime:
 
 
 def draw(now: datetime, rows: list[Row]) -> list[str]:
-    """24 hourly cells: white from the phase's start (or the left edge) to the ETA, green at the earliest time, red at the latest; `→` past the right edge; a start before the left edge is written out after the times."""
+    """24 hourly cells: white from the phase's start (or the left edge) to the ETA, blue at the ETA, green at the earliest time, red at the latest; `→` past the right edge; a start before the left edge is written before the cells."""
     start = window_start(now)
 
     def column(moment: datetime) -> int:
@@ -162,12 +165,16 @@ def draw(now: datetime, rows: list[Row]) -> list[str]:
             axis.append(f"{hour:%H}")
         else:
             axis.append(BLANK)
-    lines = [" " * ROW_LABEL_WIDTH + "".join(axis).rstrip()]
+    early = {row.name: f"{row.estimate.started:{START_FORMAT}} " for row in rows
+             if row.estimate is not None and column(row.estimate.started) < 0}
+    start_width = max((len(text) for text in early.values()), default=0)
+    lines = [" " * (ROW_LABEL_WIDTH + start_width) + "".join(axis).rstrip()]
 
     last = WINDOW_HOURS - 1
     for row in rows:
+        prefix = f"{row.name:<{ROW_LABEL_WIDTH}}{early.get(row.name, ''):<{start_width}}"
         if row.estimate is None:
-            lines.append(f"{row.name:<{ROW_LABEL_WIDTH}}?")
+            lines.append(f"{prefix}?")
             continue
         estimate = row.estimate
         cells = [BLANK] * WINDOW_HOURS
@@ -177,15 +184,15 @@ def draw(now: datetime, rows: list[Row]) -> list[str]:
         ranged = (estimate.earliest, estimate.latest) != (estimate.eta, estimate.eta)
         if ranged and column(estimate.earliest) <= last:
             cells[max(0, column(estimate.earliest))] = GREEN
+        # Blue takes green's cell when the two share an hour; red keeps its own.
+        cells[max(0, min(column(estimate.eta), last))] = BLUE
         if ranged:
             cells[max(0, min(column(estimate.latest), last))] = RED
         arrow = "→" if column(estimate.latest) > last else ""
         span = f"{estimate.eta:%H:%M}"
         if ranged:
             span += f" ({estimate.earliest:%H:%M}–{estimate.latest:%H:%M})"
-        if column(estimate.started) < 0:
-            span += f", started {estimate.started:%b-%d %H:%M}"
-        lines.append(f"{row.name:<{ROW_LABEL_WIDTH}}{''.join(cells).rstrip()}{arrow} {span}")
+        lines.append(f"{prefix}{''.join(cells).rstrip()}{arrow} {span}")
     return lines
 
 

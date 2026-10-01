@@ -155,12 +155,14 @@ director's own handoff may list only the work in front of it.
 - **Timeline:** a code block after the sections, always 24 hours of one-hour
   cells, labelled every three hours, with `▼` at now. It opens six hours before
   the three-hour mark at or before now. Each row is white from the phase's
-  start (or the left edge, when it started earlier) to the ETA, with a green
-  cell at the earliest time and a red cell at the latest (no green or red
-  without a range); `→` means the latest
+  start (or the left edge, when it started earlier) to the ETA, with a blue
+  cell at the ETA, a green cell at the earliest time and a red cell at the
+  latest (no green or red without a range). When blue shares an hour with
+  green, blue takes it; red keeps its own. `→` means the latest
   runs past the right edge; `?` means no ETA. A phase that started before
-  the left edge gets its start after the times, as `mmm-dd hh:mm`:
-  `13:53 (11:08–20:25), started Sep-30 17:11`. User, 2026-10-01.
+  the left edge shows its start as `mmm-dd hh:mm` between its name and its
+  cells (`widget   Sep-30 17:11 ⬜⬜…`); other rows leave that space blank, so
+  the cells stay under the axis. User, 2026-10-01.
 - **Last line:** `next run at 20:10 - nothing needed` when no subject has a
   `needed:`, `next run at 20:10` when one does, or `no run scheduled` without a
   schedule. The report replaces the turn's `— waiting on:` line.
