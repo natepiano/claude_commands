@@ -64,6 +64,23 @@ Every implementation or fix prompt contains these sections once:
 7. `## Type Design Contract` per <TypeDesignContract/>.
 8. `## Verification` per <VerificationContract/>, exactly as listed and with
    nothing added around it.
+9. `## Three Gods`, carried verbatim; item 2's `rust_style` line still holds:
+
+   ```
+   ## Three Gods
+
+   Simplicity, speed and beauty are the three gods, in the app and in the code.
+   Correctness is the floor beneath them: a wrong result is never simple, fast or
+   beautiful. When two conflict, they rank in that order.
+
+   | | In the app | In the code |
+   | --- | --- | --- |
+   | Simplicity | Few things on screen, simple words, one way to do a thing. | Few concepts, a small public API, no layer without a reason. |
+   | Speed | Responds at once; nothing waits, stutters or settles slowly. | No wasted work where code runs often; any cost added is named. |
+   | Beauty | Polished and professional: even spacing, one style, nothing clipped. | Reads cleanly: the right names, one idiom, the style guide followed. |
+
+   Every writer builds to them, and every reviewer judges by them.
+   ```
 
 The Verification section carries the applicable command lines and every
 delegate-facing rule from <VerificationContract/>, with nothing added around

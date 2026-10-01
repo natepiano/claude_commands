@@ -307,6 +307,74 @@ class ReviewLauncherPassTests(unittest.TestCase):
         for slot in ("impl", "test"):
             self.assertIn(f"[{slot}] register:", board)
 
+    def test_three_lenses_run_at_once_each_in_a_seat_of_its_own(self) -> None:
+        """The craft lens joins the other two in the `review` seat.
+
+        No writer sits there, so its pass is a third record beside the two
+        lenses' and closes neither of them.
+        """
+        session_dir = self.start_implementation("three-lenses")
+        self.recorder("finish-pass", "--session-dir", str(session_dir), "--status", "completed")
+        seats = {"adversary": "test", "contract": "impl", "craft": "review"}
+
+        running = [
+            subprocess.Popen(
+                self.review_command(session_dir, lens, ""),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                env=self.environment(),
+            )
+            for lens in seats
+        ]
+        for process in running:
+            _, errors = process.communicate(timeout=120)
+            self.assertEqual(process.returncode, 0, errors)
+
+        for lens in seats:
+            self.assertEqual(
+                (session_dir / f"review_status_{lens}").read_text().strip(), "reviewed"
+            )
+            self.assertTrue((session_dir / f"review_findings_1_{lens}.txt").is_file())
+            self.assertTrue((session_dir / f"review_agent_1_{lens}.log").is_file())
+
+        events = self.pass_events("three-lenses")
+        reviews = [event for event in events if event.get("pass_kind") == "review"]
+        self.assertEqual(
+            sorted((str(event["event_type"]), str(event.get("team_slot"))) for event in reviews),
+            sorted(
+                (event_type, slot)
+                for event_type in ("pass_started", "pass_finished")
+                for slot in seats.values()
+            ),
+        )
+        self.assertNotIn(
+            "interrupted",
+            [str(event.get("status")) for event in events],
+        )
+
+        board = (session_dir / "board.log").read_text(encoding="utf-8")
+        for lens, slot in seats.items():
+            self.assertIn(f"[{slot}] register: {lens} review up", board)
+
+    def test_an_unknown_lens_is_refused_before_anything_runs(self) -> None:
+        session_dir = self.start_implementation("unknown-lens")
+        result = subprocess.run(
+            self.review_command(session_dir, "style", ""),
+            check=False,
+            capture_output=True,
+            text=True,
+            env=self.environment(),
+            timeout=120,
+        )
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertIn("unknown review lens 'style' (adversary, contract, craft)", result.stderr)
+        self.assertFalse((session_dir / "review_status_style").exists())
+        self.assertEqual(
+            [event["event_type"] for event in self.pass_events("unknown-lens")],
+            ["pass_started"],
+        )
+
     def test_the_wrapper_names_a_verdict_it_did_not_record(self) -> None:
         session_dir = self.start_implementation("void")
         result = self.run_review(session_dir, session_dir / "final_diff_1.ready")

@@ -3,7 +3,7 @@
 Read at the point of use from `/unit:delegate`. Defines `<RunPhaseReview/>` and
 `<RunPhaseShrink/>` in full.
 
-**Read when:** after smoke, once per phase, before the checkpoint.
+**Read when:** after smoke and `<UXReview/>`, once per phase, before the checkpoint.
 
 <RunPhaseReview>
 For phased plans, read `~/.claude/commands/plan/phase_review.md` in full and

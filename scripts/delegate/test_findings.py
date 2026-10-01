@@ -179,6 +179,32 @@ class FindingsLedgerTests(unittest.TestCase):
         opened = [event for event in self.events() if event["event_type"] == "finding_opened"]
         self.assertEqual([event["lens"] for event in opened], ["contract", ""])
 
+    def test_a_finding_names_every_lens_that_raised_it(self) -> None:
+        """One lens, several, or the legacy `both`, each stored as the ledger reads it."""
+        self.write_progress_state("instance-a")
+        for lens in ("craft", "adversary,craft", "ux", "both", "craft, ux,craft"):
+            _ = self.run_command(
+                "open", "--severity", "minor", "--title", f"raised by {lens}",
+                "--caught-by", "delegate", "--lens", lens,
+            )
+        expected = ["craft", "adversary,craft", "ux", "both", "craft,ux"]
+        findings = cast(list[dict[str, object]], self.status()["findings"])
+        self.assertEqual([entry["lens"] for entry in findings], expected)
+        opened = [event for event in self.events() if event["event_type"] == "finding_opened"]
+        self.assertEqual([event["lens"] for event in opened], expected)
+
+    def test_an_unknown_lens_is_refused_and_records_nothing(self) -> None:
+        self.write_progress_state("instance-a")
+        for lens in ("style", "adversary,style", "both,craft", "craft,"):
+            result = self.run_failing_command(
+                "open", "--severity", "minor", "--title", "misspelt lens",
+                "--caught-by", "delegate", "--lens", lens,
+            )
+            self.assertEqual(result.returncode, 2, lens)
+            self.assertIn("argument --lens: unknown lens", result.stderr)
+        self.assertEqual(self.status()["findings"], [])
+        self.assertEqual(self.events(), [])
+
     def test_first_round_gates_blocker_and_minor_but_never_nits(self) -> None:
         _ = self.open_finding("blocker", "null deref")
         _ = self.open_finding("minor", "unused import")

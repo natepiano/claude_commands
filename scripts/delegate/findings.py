@@ -71,6 +71,13 @@ SEVERITIES = ("blocker", "minor", "nit")
 FIRST_ROUND_GATING = ("blocker", "minor")
 LATER_ROUND_GATING = ("blocker",)
 
+# Every lens a finding can name. A closed set for the reason review.sh closes
+# its own: a misspelt lens would be stored, and every count by lens would miss it.
+REVIEW_LENSES = ("adversary", "contract", "craft", "ux")
+# What `--lens` took when the broad review had two lenses; it means
+# adversary,contract, and the ledger keeps the word its callers already write.
+LEGACY_BOTH_LENS = "both"
+
 STATE_OPEN = "open"
 # Dispatching a repair proves an attempt was launched, never that it landed, so
 # these are two states rather than one. A repair that dies -- killed, crashed,
@@ -1023,6 +1030,26 @@ def _status(args: argparse.Namespace) -> None:
     print(json.dumps(payload, indent=2, sort_keys=True))
 
 
+def _lens_list(value: str) -> str:
+    """`--lens` checked against REVIEW_LENSES: one lens, several, or `both`.
+
+    argparse runs the default through here too, so empty passes as no lens.
+    A list is stored with bare commas and no repeats, so a reader splits on one
+    character; `both` is stored as given.
+    """
+    if not value or value == LEGACY_BOTH_LENS:
+        return value
+    lenses = [part.strip() for part in value.split(",")]
+    unknown = [lens for lens in lenses if lens not in REVIEW_LENSES]
+    if unknown:
+        raise argparse.ArgumentTypeError(
+            f"unknown lens {', '.join(repr(lens) for lens in unknown)} in {value!r}: "
+            + f"give one of {', '.join(REVIEW_LENSES)}, a comma-separated list "
+            + f"of them, or {LEGACY_BOTH_LENS!r} alone for adversary,contract"
+        )
+    return ",".join(dict.fromkeys(lenses))
+
+
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Track plan-delegate review findings and bound the fix loop by convergence."
@@ -1039,9 +1066,11 @@ def _build_parser() -> argparse.ArgumentParser:
     _ = opened.add_argument(
         "--caught-by", choices=("delegate", "main", "both"), required=True
     )
-    # Which broad-review lens raised it; empty for a closure review or the main
-    # review alone.
-    _ = opened.add_argument("--lens", choices=("adversary", "contract", "both"), default="")
+    # Which broad-review lenses raised it, comma-separated: `adversary` and
+    # `contract` read the diff against its work order, `craft` reads its code
+    # quality, and `ux` is the UX screenshot reviewer's. Empty for a closure
+    # review or the main review alone.
+    _ = opened.add_argument("--lens", type=_lens_list, default="")
     opened.set_defaults(handler=_open)
 
     verdict = subparsers.add_parser("verdict", help="record a closure review's outcome")

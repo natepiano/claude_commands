@@ -11,9 +11,10 @@
 #   review after it. Artifacts are written per index and never overwritten:
 #   a run that failed to converge can be read back round by round.
 #   lens — which reading this reviewer is doing, when a phase's broad review
-#   runs both at once: adversary or contract. It suffixes every artifact below,
-#   so concurrent reviewers never overwrite each other, and it selects the seat
-#   the pass records under. The seat assignment is fixed, not meaningful.
+#   runs its three lenses at once: adversary, contract, or craft (code quality
+#   by the style guide). It suffixes every artifact below, so concurrent
+#   reviewers never overwrite each other, and it selects the seat the pass
+#   records under. The seat assignment is fixed, not meaningful.
 #   Empty is the single-reviewer layout: unsuffixed names, no seat, which is
 #   what a closure review and a solo broad review still run.
 #   early_ready_file — early-launch mode: the reviewer starts while the
@@ -71,14 +72,17 @@ case "${LENS}" in
   '') TEAM_SLOT='' ;;
   adversary) TEAM_SLOT=test ;;
   contract) TEAM_SLOT=impl ;;
+  # No writer sits in `review` since the three-seat team was folded into two,
+  # so the third lens takes it and its pass never closes a writer's window.
+  craft) TEAM_SLOT=review ;;
   *)
-    echo "ERROR: unknown review lens '${LENS}' (adversary, contract)" >&2
+    echo "ERROR: unknown review lens '${LENS}' (adversary, contract, craft)" >&2
     exit 2
     ;;
 esac
 
 SUFFIX="${LENS:+_${LENS}}"
-# What the shared heartbeat log tags this reviewer's beats with. Two lenses
+# What the shared heartbeat log tags this reviewer's beats with. Three lenses
 # run at once against one log, and `review` on every line cannot be read.
 BEAT_TAG="${SUBTASK}${LENS:+:${LENS}}"
 # The seat this pass records under, so concurrent reviewers key separate pass

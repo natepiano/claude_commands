@@ -2014,6 +2014,154 @@ class ProgressHistoryTests(unittest.TestCase):
             header,
         )
 
+    def broad_review(self, session_dir: Path, lenses: tuple[str, ...], started_at: int) -> None:
+        """Both seats write, then the broad review seats one pass per lens.
+
+        Each lens takes the seat review.sh gives it and posts the register line
+        the launcher posts, a second apart in the order given.
+        """
+        seats = {"adversary": "test", "contract": "impl", "craft": "review"}
+        self.start_phase(session_dir, started_at)
+        for offset, slot in enumerate(("impl", "test")):
+            self.start_slot_pass(session_dir, slot, slot, started_at + 10 + offset * 10)
+        for offset, slot in enumerate(("impl", "test")):
+            self.finish_slot_pass(session_dir, slot, "completed", started_at + 600 + offset * 10)
+        for offset, lens in enumerate(lenses):
+            at = started_at + 700 + offset
+            self.run_board(
+                session_dir, "post", seats[lens], "register",
+                f"{lens} review up; mesh=none; role=review", at=at,
+            )
+            self.start_slot_pass(session_dir, seats[lens], "review", at, called_model=f"gpt-{lens}")
+        self.team_slot = ""
+
+    def test_a_craft_review_draws_a_third_seat_column(self) -> None:
+        """The craft lens sits in `review`, and the table gains Agent 3 for it."""
+        started_at = 66_000
+        session_dir = self.start_run("craft-column", started_at)
+        # The craft lens lands a second ahead of the other two, which must not
+        # put a sliver of review in the writers' row.
+        self.broad_review(session_dir, ("craft", "adversary", "contract"), started_at)
+        header = self.run_progress(session_dir, started_at + 1_000)
+        rows = self.table_rows(
+            header,
+            ["Stage", "Start", "Elapsed", "Agent 1", "Agent 2", "Agent 3", "Result"],
+        )
+        self.assertEqual(
+            [row[3:] for row in rows],
+            [
+                ["impl 9m done", "test 9m done", "-", ""],
+                [
+                    "review 4m running",
+                    "review 4m running",
+                    "review 5m running",
+                    "Agent 1 → review, Agent 2 → review, Agent 3 → review; running",
+                ],
+            ],
+        )
+        self.assertIn(
+            "- **Agent 3** (review) gpt-craft high · 5m ago · register: craft review up",
+            header,
+        )
+
+    def test_a_review_without_the_craft_lens_keeps_two_seat_columns(self) -> None:
+        """No pass in `review`, no Agent 3: not in the header, not in the note.
+
+        The review seat's board line from an earlier phase outlives that phase,
+        and must not put a note line under a table with no column for it.
+        """
+        started_at = 67_000
+        session_dir = self.start_run("two-columns", started_at)
+        self.run_board(
+            session_dir, "post", "review", "status", "an earlier phase's craft notes",
+            at=started_at - 100,
+        )
+        self.broad_review(session_dir, ("adversary", "contract"), started_at)
+        header = self.run_progress(session_dir, started_at + 1_000)
+        rows = self.table_rows(
+            header,
+            ["Stage", "Start", "Elapsed", "Agent 1", "Agent 2", "Result"],
+        )
+        self.assertEqual(
+            [row[3:] for row in rows],
+            [
+                ["impl 9m done", "test 9m done", ""],
+                [
+                    "review 4m running",
+                    "review 5m running",
+                    "Agent 1 → review, Agent 2 → review; running",
+                ],
+            ],
+        )
+        self.assertNotIn("Agent 3", header)
+
+    def test_review_trial_reports_the_phase_lens_counts_and_review_minutes(self) -> None:
+        """The checkpoint notice line: one phase's ux and craft findings and review time."""
+        self.write_full_config()
+        started_at = 68_000
+        session_dir = self.start_run("trial", started_at)
+        refused = self.run_failing_command(
+            "review-trial", "--session-dir", str(session_dir), at=started_at + 5
+        )
+        self.assertNotEqual(refused.returncode, 0)
+        self.assertIn("No phase recorded", refused.stderr)
+
+        # An earlier phase, whose review time and craft finding are not this one's.
+        self.start_phase(session_dir, started_at + 10)
+        self.start_slot_pass(session_dir, "review", "review", started_at + 20)
+        self.finish_slot_pass(session_dir, "review", "completed", started_at + 620)
+        _ = self.run_findings(
+            session_dir, "open", "--severity", "minor", "--title", "earlier phase",
+            "--caught-by", "delegate", "--lens", "craft", at=started_at + 630,
+        )
+        self.team_slot = ""
+        _ = self.run_command(
+            "finish-phase", "--session-dir", str(session_dir), "--status", "completed",
+            at=started_at + 700,
+        )
+
+        base = started_at + 1_000
+        self.start_phase(session_dir, base)
+        # A writer's pass is not review time.
+        self.start_slot_pass(session_dir, "impl", "impl", base + 10)
+        self.finish_slot_pass(session_dir, "impl", "completed", base + 3_010)
+        # Every seat's review counts, whatever its status: 600 + 900 + 1200 s.
+        reviews = (("impl", 600, "completed"), ("test", 900, "completed"), ("review", 1_200, "error"))
+        for slot, _, _ in reviews:
+            self.start_slot_pass(session_dir, slot, "review", base + 3_100)
+        for slot, elapsed, status in reviews:
+            self.finish_slot_pass(session_dir, slot, status, base + 3_100 + elapsed)
+        self.team_slot = ""
+        # The UX helper's 350 s counts; the main agent's other work does not.
+        for label, opened, closed in (("UX review", 4_400, 4_750), ("Verify", 4_800, 5_300)):
+            _ = self.run_command(
+                "start-activity", "--session-dir", str(session_dir),
+                "--label", label, "--activity", label.lower(), at=base + opened,
+            )
+            _ = self.run_command(
+                "finish-activity", "--session-dir", str(session_dir), at=base + closed,
+            )
+        for lens in ("ux", "craft", "adversary,craft", "both", "contract"):
+            _ = self.run_findings(
+                session_dir, "open", "--severity", "minor", "--title", f"raised by {lens}",
+                "--caught-by", "delegate", "--lens", lens, at=base + 5_400,
+            )
+
+        # 3050 s is 50.8 minutes, which rounds to 51 rather than truncating to 50.
+        expected = "review trial: ux 1 findings, code 2 findings, review-seat minutes 51"
+        self.assertEqual(
+            self.run_command("review-trial", "--session-dir", str(session_dir), at=base + 5_500),
+            expected,
+        )
+        _ = self.run_command(
+            "finish-phase", "--session-dir", str(session_dir), "--status", "completed",
+            at=base + 5_600,
+        )
+        self.assertEqual(
+            self.run_command("review-trial", "--session-dir", str(session_dir), at=base + 5_700),
+            expected,
+        )
+
     def test_the_board_refuses_a_handoff_that_names_no_role(self) -> None:
         """A handoff is a role change; prose there is a movement the table never shows."""
         session_dir = self.start_run("barehandoff", 65_000)

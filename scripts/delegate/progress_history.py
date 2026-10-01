@@ -1889,23 +1889,20 @@ STAGE_HEADERS: tuple[str, ...] = (
     "Elapsed",
     "Result",
 )
-# The two slots a phase always runs, in the order they are reported. A slot is
-# a fixed identity; the role it is doing is what the cell shows, so a `test`
-# slot opened as a writer reads "impl" under Agent 2.
+# The two slots a phase always runs, in the order they are reported: the seats
+# that write. A slot is a fixed identity; the role it is doing is what the cell
+# shows, so a `test` slot opened as a writer reads "impl" under Agent 2.
 ROUND_SLOTS: tuple[str, ...] = ("impl", "test")
-# The header each slot is reported under, in ROUND_SLOTS order. A slot name
-# doubles as a role word, and `impl` under a column headed `Test` read as a
-# contradiction; a numbered seat carries no role, so the cell alone says what
-# the seat is doing. The bullets under the table keep the slot in parentheses
-# so the reader can still find `impl_status_<slot>` and the `[slot]` board lines.
-SEAT_LABELS: dict[str, str] = {"impl": "Agent 1", "test": "Agent 2"}
-ROUND_HEADERS: tuple[str, ...] = (
-    "Stage",
-    "Start",
-    "Elapsed",
-    *(SEAT_LABELS[slot] for slot in ROUND_SLOTS),
-    "Result",
-)
+# The seat the broad review's craft lens records under. No writer sits there,
+# so it is a third column only when a stage the table shows seated it, and a
+# table without one keeps the two columns it always had.
+REVIEW_SLOT = "review"
+# The header each slot is reported under. A slot name doubles as a role word,
+# and `impl` under a column headed `Test` read as a contradiction; a numbered
+# seat carries no role, so the cell alone says what the seat is doing. The
+# bullets under the table keep the slot in parentheses so the reader can still
+# find `impl_status_<slot>` and the `[slot]` board lines.
+SEAT_LABELS: dict[str, str] = {"impl": "Agent 1", "test": "Agent 2", REVIEW_SLOT: "Agent 3"}
 # The statuses that mean a window is being worked right now. Narrower than the
 # set `_window_span` runs to the clock: a window left `open` is one whose finish
 # was never recorded, so its launcher is gone and its span is merely unbounded.
@@ -1950,6 +1947,13 @@ ROUND_TABLE_STAGES = 3
 # from the row's start, at most this many seconds early, which is invisible at
 # the minute granularity the table prints.
 ROLE_WAVE_SECONDS = 30.0
+# The label the director opens an activity with while the UX helper judges the
+# phase's shots; review-trial counts that time as review time.
+UX_REVIEW_ACTIVITY_LABEL = "UX review"
+# What findings.py's `--lens both` stands for: the two lenses the broad review
+# ran before `craft` joined them.
+LEGACY_BOTH_LENS = "both"
+LEGACY_BOTH_LENSES: tuple[str, ...] = ("adversary", "contract")
 
 
 def _run_events(state: dict[str, object]) -> list[dict[str, object]]:
@@ -2422,8 +2426,9 @@ def _board_role_changes(session_dir: Path) -> list[RoleChange]:
             continue
         role = re.search(r"\brole=(\w+)", match.group(3))
         at = _board_stamp(line)
-        # A slot with no column -- a three-seat run's `review` -- has no cell a
-        # movement could change, so it must not split a row.
+        # The writing seats only. The craft reviewer in `review` never hands
+        # off, so it has no movement to split a row on, and its cell reads the
+        # kind its own pass recorded.
         if role is None or at is None or match.group(1) not in ROUND_SLOTS:
             continue
         changes.append(
@@ -2807,6 +2812,12 @@ def _round_segments(
         )
         for index in range(1, depth)
     }
+    # No writer sits in the review seat, so its first occupancy is a re-seating
+    # too: the craft reviewer sits down with the other lenses, and landing a
+    # second ahead of them must not put a sliver of review in the writers' row.
+    review_seated = occupancies.get(REVIEW_SLOT)
+    if review_seated:
+        waves.add(review_seated[0]["started_at"])
     candidates = sorted({change["at"] for change in _role_movements(changes)} | waves)
     boundaries = [start]
     for at in candidates:
@@ -2880,11 +2891,12 @@ def _round_cells(
     now: float,
     live: bool,
     activity: dict[str, BoardActivity],
+    slots: tuple[str, ...],
 ) -> list[str]:
-    """A cell per seat: its role over this stretch, how long, and its state."""
+    """A cell per seat in `slots`: its role over this stretch, how long, and its state."""
     occupancies = _slot_occupancies(members)
     cells: list[str] = []
-    for slot in ROUND_SLOTS:
+    for slot in slots:
         # The occupancy this stretch falls in: the last one that had begun by
         # the time the stretch ended.
         seated = occupancies.get(slot, [])
@@ -2925,9 +2937,13 @@ def _round_cells(
     return cells
 
 
-def _lone_cells(window: StageWindow, activity: dict[str, BoardActivity]) -> list[str]:
+def _lone_cells(
+    window: StageWindow,
+    activity: dict[str, BoardActivity],
+    slots: tuple[str, ...],
+) -> list[str]:
     """The seat cells of a window in no round: its kind's seat filled, or none."""
-    cells = ["-"] * len(ROUND_SLOTS)
+    cells = ["-"] * len(slots)
     seat = LONE_SEATS.get(window["kind"])
     if seat is not None:
         # One worker, so there is no round to outlive: it is either running or
@@ -2935,7 +2951,7 @@ def _lone_cells(window: StageWindow, activity: dict[str, BoardActivity]) -> list
         # arise here.
         live = window["status"] in LIVE_WINDOW_STATUSES
         said = activity.get(window["slot"]) if window["slot"] else None
-        cells[ROUND_SLOTS.index(seat)] = " ".join(
+        cells[slots.index(seat)] = " ".join(
             (
                 window["kind"],
                 _compact_duration(window["elapsed"]),
@@ -2955,6 +2971,30 @@ class RoundTable(TypedDict):
     # block. Only the newest block's -- an earlier one keeps its row and its
     # tally, but its gate-by-gate story is history the reader is not acting on.
     gates: list[str]
+    # The seats the rows have cells for, in column order: ROUND_SLOTS, and the
+    # review seat after them when a shown stage seated it.
+    slots: tuple[str, ...]
+
+
+def _round_headers(slots: tuple[str, ...]) -> list[str]:
+    """The round table's header, with a column for each seat in `slots`."""
+    return ["Stage", "Start", "Elapsed", *(SEAT_LABELS[slot] for slot in slots), "Result"]
+
+
+def _shown_slots(shown: list[list[RoundEntry]]) -> tuple[str, ...]:
+    """The seat columns the shown stages need.
+
+    The writers' two always, so a phase without a craft review keeps the table
+    it always drew. The review seat only when one of these stages seated it:
+    a column of dashes for a seat nothing sat in would read as a stalled agent.
+    """
+    seated = {
+        member["slot"]
+        for group in shown
+        for entry in group
+        for member in entry["members"]
+    }
+    return (*ROUND_SLOTS, REVIEW_SLOT) if REVIEW_SLOT in seated else ROUND_SLOTS
 
 
 def _round_table(
@@ -2987,6 +3027,7 @@ def _round_table(
     }
     groups = _stage_groups(_round_entries(windows, labels))
     shown = groups[-ROUND_TABLE_STAGES:]
+    slots = _shown_slots(shown)
     rows: list[list[str]] = []
     gate_lines: list[str] = []
     for group in shown:
@@ -3008,7 +3049,7 @@ def _round_table(
                     group[0]["label"],
                     _clock_stamp(block_start),
                     _compact_duration(int(block_end - block_start)),
-                    *(["-"] * len(ROUND_SLOTS)),
+                    *(["-"] * len(slots)),
                     summary,
                 ]
             )
@@ -3025,7 +3066,7 @@ def _round_table(
                         entry["label"],
                         _clock_stamp(started_at),
                         _compact_duration(lone["elapsed"]),
-                        *_lone_cells(lone, activity),
+                        *_lone_cells(lone, activity, slots),
                         _window_result(lone, tally),
                     ]
                 )
@@ -3038,7 +3079,7 @@ def _round_table(
                 # earlier segment is a stretch that ended, whatever its seats
                 # are doing now.
                 cells = _round_cells(
-                    members, roles, lower, upper, now, running and last, activity
+                    members, roles, lower, upper, now, running and last, activity, slots
                 )
                 # A continuation row exists because the team moved, and the
                 # reader should not have to diff two rows of cells to find
@@ -3049,7 +3090,7 @@ def _round_table(
                 seat_roles = [cell.split()[0] for cell in cells]
                 moved = ", ".join(
                     f"{SEAT_LABELS[slot]} → {role}"
-                    for slot, before, role in zip(ROUND_SLOTS, previous_roles, seat_roles)
+                    for slot, before, role in zip(slots, previous_roles, seat_roles)
                     if role != before and role != "-"
                 )
                 previous_roles = seat_roles
@@ -3078,6 +3119,7 @@ def _round_table(
         rows=rows,
         earlier=_earlier_note(groups[: len(groups) - len(shown)]),
         gates=gate_lines,
+        slots=slots,
     )
 
 
@@ -3085,8 +3127,9 @@ def _delegate_note(
     windows: list[StageWindow],
     activity: dict[str, BoardActivity],
     now: float,
+    slots: tuple[str, ...],
 ) -> list[str]:
-    """A line per seat: the agent behind it, and the last thing it said.
+    """A line per seat the table has a column for: its agent, and its last words.
 
     Which model is sitting in which seat is the thing a reader cannot recover
     from the table and asks about first when a seat runs long -- and it is not
@@ -3098,7 +3141,9 @@ def _delegate_note(
 
     It goes under the table rather than into it -- one answer per seat, not per
     row, and a column repeating it down every row would crowd out the roles. The
-    main agent is left out; the reader is the main agent.
+    main agent is left out; the reader is the main agent. So is a seat the
+    table draws no column for: the review seat's board line outlives the phase
+    that seated it, and a line with no column above it names nothing on screen.
     """
     live = {
         window["slot"]: window["delegate"]
@@ -3106,7 +3151,7 @@ def _delegate_note(
         if window["slot"] and window["status"] in ("running", "armed", "open")
     }
     lines: list[str] = []
-    for slot in ROUND_SLOTS:
+    for slot in slots:
         agent, said = live.get(slot), activity.get(slot)
         if agent is None and said is None:
             continue
@@ -3688,7 +3733,7 @@ def _progress(args: argparse.Namespace) -> None:
         )
         # One row per round, one column per seat. A round is what advances and
         # what the ledger stamps on its findings, so it is the row that can carry
-        # a Start, an Elapsed, and a Result that all mean something; the three
+        # a Start, an Elapsed, and a Result that all mean something; the
         # seats working it read across. Per-pass provenance -- which model ran
         # where, and a review overlapping the writer as its own row -- is the
         # `timeline` view, which still renders one row per window, and so is the
@@ -3708,7 +3753,9 @@ def _progress(args: argparse.Namespace) -> None:
             board_activity,
             now,
         )
-        delegate_note = _delegate_note(stage_windows, board_activity, now)
+        delegate_note = _delegate_note(
+            stage_windows, board_activity, now, round_table["slots"]
+        )
         lines = [
             _scope_line(state, plan_phase_counts),
             "",
@@ -3725,7 +3772,7 @@ def _progress(args: argparse.Namespace) -> None:
             f"**Phase {phase_id}: {phase_title}**",
             "",
             *([round_table["earlier"], ""] if round_table["earlier"] else []),
-            *_render_table(list(ROUND_HEADERS), round_table["rows"], set()),
+            *_render_table(_round_headers(round_table["slots"]), round_table["rows"], set()),
             "",
             *([*round_table["gates"], ""] if round_table["gates"] else []),
             *([*delegate_note, ""] if delegate_note else []),
@@ -3802,6 +3849,58 @@ def _finish_run(args: argparse.Namespace) -> None:
     state["status"] = run_status
     state["finished_at"] = now
     _write_state(session_dir, state)
+
+
+def _finding_lenses(event: dict[str, object]) -> set[str]:
+    """The lenses a `finding_opened` event names, with `both` read as its pair."""
+    lens = _string(event.get("lens"))
+    if lens == LEGACY_BOTH_LENS:
+        return set(LEGACY_BOTH_LENSES)
+    return {part.strip() for part in lens.split(",") if part.strip()}
+
+
+def _review_trial(args: argparse.Namespace) -> None:
+    """Print one line: what the phase's UX and craft lenses found, and review time.
+
+    It feeds the unit's checkpoint notice line, which the showrunner records with
+    review_regime.py. The phase is the one in state, active or just closed by
+    finish-phase, and only events stamped with its instance count. Minutes are
+    every seat's finished review passes, whatever their status, plus the UX
+    review activities, rounded to the nearest whole minute.
+    """
+    session_dir = _session_dir(args)
+    state = _read_state(session_dir)
+    phase = _object_dict(state.get("phase"))
+    instance_id = _string(phase.get("instance_id")) if phase is not None else ""
+    if not instance_id:
+        raise SystemExit(
+            f"No phase recorded in {_state_path(session_dir)}: review-trial reports "
+            + "the phase start-phase opened, and this run has not opened one"
+        )
+    ux_findings = 0
+    code_findings = 0
+    review_seconds = 0
+    for event in _run_events(state):
+        if _string(event.get("phase_instance_id")) != instance_id:
+            continue
+        event_type = _string(event.get("event_type"))
+        if event_type == "finding_opened":
+            lenses = _finding_lenses(event)
+            if "ux" in lenses:
+                ux_findings += 1
+            if "craft" in lenses:
+                code_findings += 1
+        elif event_type == "pass_finished" and _string(event.get("pass_kind")) == "review":
+            review_seconds += _integer(event.get("pass_elapsed_seconds"))
+        elif (
+            event_type == "activity_finished"
+            and _string(event.get("activity_label")) == UX_REVIEW_ACTIVITY_LABEL
+        ):
+            review_seconds += _integer(event.get("activity_elapsed_seconds"))
+    print(
+        f"review trial: ux {ux_findings} findings, code {code_findings} findings, "
+        + f"review-seat minutes {(review_seconds + 30) // 60}"
+    )
 
 
 def _aggregate(args: argparse.Namespace) -> None:
@@ -3983,6 +4082,14 @@ def _build_parser() -> argparse.ArgumentParser:
         required=True,
     )
     finish_run.set_defaults(handler=_finish_run)
+
+    review_trial = subparsers.add_parser(
+        "review-trial",
+        help="one line for the checkpoint notice: the phase's ux and craft finding "
+        + "counts and its review-seat minutes",
+    )
+    _ = review_trial.add_argument("--session-dir", required=True)
+    review_trial.set_defaults(handler=_review_trial)
 
     aggregate = subparsers.add_parser("aggregate")
     _ = aggregate.add_argument("--percent", type=int, default=-1)

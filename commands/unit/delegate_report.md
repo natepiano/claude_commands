@@ -85,12 +85,13 @@ Everything below is the contract.
    at once.
 6. Read the round table as seats. It leads with `Stage`, `Start`, and `Elapsed`
    — `Stage` rather than `Round` because a row is not always a round: a
-   verification, a smoke run, or a lone reviewer each own one. Its two seat
+   verification, a smoke run, or a lone reviewer each own one. Its seat
    columns are `Agent 1` and `Agent 2` — the slots `impl` and `test` in that
-   order, identities that never change, numbered so the header
-   carries no role word the cell beneath could contradict. Each cell is the role
-   that seat held over the row's stretch, how long it held it, and what the seat
-   is doing at the end of it:
+   order — plus `Agent 3`, slot `review` (the craft reviewer), only when a
+   shown stage seated it. Slots are identities that never change, numbered so
+   the header carries no role word the cell beneath could contradict. Each cell
+   is the role that seat held over the row's stretch, how long it held it, and
+   what the seat is doing at the end of it:
 
    - `running` — its window is open and its last board line is work.
    - `waiting` — open, but the seat says it is held up: on a peer's edit, on the

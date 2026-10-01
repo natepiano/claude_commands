@@ -394,7 +394,7 @@ Use `python3 ~/.claude/scripts/delegate/findings.py <command> --session-dir
 
 | Command | Purpose |
 | --- | --- |
-| `open --severity <blocker\|minor\|nit> --title <t> --file <p> [--line N] --caught-by <delegate\|main\|both> [--lens <adversary\|contract\|both>] [--detail <d>]` | create an id; `--lens` names the broad-review lens that raised it |
+| `open --severity <blocker\|minor\|nit> --title <t> --file <p> [--line N] --caught-by <delegate\|main\|both> [--lens <adversary\|contract\|craft\|ux>[,…]] [--detail <d>]` | create an id; `--lens` names every lens that raised it, comma-separated; legacy `both` means `adversary,contract` |
 | `status` | read the ledger for closure review |
 | `gate` | get `converged` or `dispatch`, plus batch and any advisory |
 | `dispatch --covers F001,F002,...` | record one complete repair batch |
@@ -594,7 +594,7 @@ recording, with no report emitted between them.
 6. <LaunchImplementation/>
 7. <DualReview/>
 8. <Synthesize/>
-9. <RunApplicationSmokeTest/>
+9. <RunApplicationSmokeTest/>, then <UXReview/>
 10. <RunProjectStyleReview/> — `single` only; loop and verbose run the run's one
     style review from <FinalGate/> after the whole plan is green
 11. <RunPhaseReview/>
@@ -827,9 +827,9 @@ At an eligible tick, in that same tick:
    <BroadReviewPrompt/> for pass 1, <ClosureReview/> for a fix — including the
    completion estimate, the partial diff, and the exact final-diff and
    ready-sentinel paths below. **Only the adversary arms early.** It is the lens
-   that gains most from the extra time, and arming both against a partial
-   tree would double the exposure to the void verdict below; `contract`
-   launches at completion under <DualReview/> step 3.
+   that gains most from the extra time, and arming every lens against a partial
+   tree would multiply the exposure to the void verdict below; `contract` and
+   `craft` launch at completion under <DualReview/> step 3.
 5. Launch `review.sh` exactly as <DualReview/> step 3 does — with `adversary`
    as its lens for pass 1 — appending one extra final argument:
    `${SESSION_DIR}/final_diff_${REVIEW_PASS}.ready`. Save the
@@ -978,12 +978,13 @@ reporting anything about the round.
 </FixDispatch>
 
 <Synthesize>
-1. Merge every lens's findings with the main review's, dedupe real issues, tag
-   the lens or reader that caught each — `--lens` on `open` — and discard refuted findings with a
-   concrete explanation. Several readers landing on one hunk is one finding
-   with several witnesses, not several findings; readers disagreeing about that
-   hunk is a reviewer disagreement, which <DelegationResultFormat/> reports rather
-   than resolves by majority.
+1. Merge every lens file's findings — `adversary`, `contract`, `craft` — and
+   any <UXReview/> rows with the main review's, dedupe real issues, tag the
+   lens or reader that caught each — `--lens` on `open` — and discard refuted
+   findings with a concrete explanation. Several readers landing on one hunk is
+   one finding with several witnesses, not several findings; readers
+   disagreeing about that hunk is a reviewer disagreement, which
+   <DelegationResultFormat/> reports rather than resolves by majority.
 2. Present <DelegationResultFormat/>. If the user is confused, apply
    <ExplainOnDemand/> before any choice.
 3. If every remaining issue is trivial — doc-only, an agreed rename, or a
@@ -995,7 +996,8 @@ reporting anything about the round.
    non-trivial finding sends the whole batch through steps 4–5 instead.
 4. Apply <DecisionRouting/> before opening findings.
 5. Open every confirmed remaining issue, then obey `findings.py gate`:
-   - `converged`: retain nits for retrospective; continue to smoke.
+   - `converged`: retain nits for retrospective; continue to smoke, then
+     <UXReview/>.
    - `dispatch`: apply <FixDispatch/> to the complete batch, then return here.
      When the payload carries an `advisory`, say it in one line and dispatch
      anyway per <FindingsLedger/>.
@@ -1009,30 +1011,70 @@ Your choice:
 3. Talk through an item first.
 ```
 
-Choice 1 applies <FixDispatch/>; choice 2 continues to smoke; choice 3 preserves
-the gate. With no gating issues, continue to <RunApplicationSmokeTest/>.
+Choice 1 applies <FixDispatch/>; choice 2 continues to smoke, then <UXReview/>;
+choice 3 preserves the gate. With no gating issues, continue to
+<RunApplicationSmokeTest/>, then <UXReview/>.
 </Synthesize>
 
 <RunApplicationSmokeTest>
 Read the diff. If no repository binary reaches its changes, record
-`not applicable — <reason>` and continue. Otherwise select the target from
-Delegation Context Run/Smoke, Acceptance gate, repository instructions, then
-manifest. A build, test binary, static example build, or delegate report is not
-a smoke test.
+`not applicable — <reason>` and continue to <UXReview/>. Otherwise select the
+target from Delegation Context Run/Smoke, Acceptance gate, repository
+instructions, then manifest. A build, test binary, static example build, or
+delegate report is not a smoke test.
 
 Launch the real product from `${WORKING_DIR}` with useful logging/backtraces,
 exercise the changed runtime behavior, observe stability, close cleanly, and
 record command/action/result. The launch compiles its own target — never run a
 build, `check`, or `test` pass first to prove it builds. Startup alone suffices only when no changed
-behavior can be invoked.
+behavior can be invoked. A pass continues to <UXReview/>.
 
 A panic, fatal log, unexpected exit, or wrong behavior is a blocker: route it
 through <Synthesize/>, then repeat review, synthesis, and smoke before later
 gates. If this environment cannot perform the interaction or locate an
 applicable executable, close the process, record `deferred — <exact human action
-and limitation>`, and continue without waiting. Deferred smoke allows the
-checkpoint but is batched at <FinalGate/> and reported by <RunSummary/>.
+and limitation>`, and continue to <UXReview/> without waiting. Deferred smoke
+allows the checkpoint but is batched at <FinalGate/> and reported by
+<RunSummary/>.
 </RunApplicationSmokeTest>
+
+<UXReview>
+Runs when the phase changes what users see, in the app or in any example; a
+phase that changes nothing on screen skips it and says so in one line. Guide:
+the UX guide the production doc names, else the one the repository's
+instructions name; with none, skip and say so in one line.
+
+1. After smoke has a build, take a shot of each changed view and state on the
+   run's port at normal size — the same shots the checkpoint notice sends
+   (<ProductionUnit/> item 3). Never view them yourself.
+2. Open an activity, arming the progress timer per <ProgressContract/>; the
+   label is exact, because `review-trial` counts it:
+   `progress_history.py start-activity --session-dir "${SESSION_DIR}" --label "UX review" --activity "<what the shots show>"`
+3. Spawn a fresh Claude Agent helper in the background with the showrunner's
+   design-check prompt, so the shots never enter your context:
+
+   > Read `~/.claude/commands/ux_eval.md` and follow it for these shots:
+   > <paths>. Guide: <path>. Context: <unit> phase <N> — <what changed, and
+   > every state the shots must show>. Also judge by the three gods
+   > (`<ThreeGods/>` in `~/.claude/docs/decision_criteria.md`) and these
+   > production rules: <the production doc's rules that concern looks>. You
+   > only review: edit nothing. Return only the verdict and the table.
+
+   Read its verdict once, then stop it with TaskStop. Close the activity with
+   `finish-activity --session-dir "${SESSION_DIR}" --result <pass|N defects>`.
+4. Open each defect row as a finding — blocker, because the showrunner's merge
+   check holds a checkpoint on any visible defect. A `no rule` row is still a
+   finding:
+   `findings.py open --severity blocker --lens ux --caught-by delegate --title <defect> --file <shot path> --detail "<rule>: <fix>"`
+   Then obey `findings.py gate` exactly as <Synthesize/> step 5 does, the same
+   repair round under <FixDispatch/>, except that `converged` continues to
+   <RunPhaseReview/>.
+5. Re-entered after a `ux` repair that changed the screen, this step replaces
+   1–4: re-shoot and re-judge only the rows raised — a fresh helper, under its
+   own `UX review` activity, given just those rows and their shots — and record
+   each with `findings.py verdict`. A `still_open` row returns to step 4's
+   gate. Then continue to <RunPhaseReview/>.
+</UXReview>
 
 <RunProjectStyleReview>
 Read `~/.claude/commands/unit/delegate_style.md` in full and apply it. This is
@@ -1045,8 +1087,9 @@ same file as `/unit:delegate_style`.
 </RunProjectStyleReview>
 
 <RunPhaseReview>
-Read `~/.claude/docs/delegate/run_phase_review.md` in full after smoke, once per
-phase. It also defines <RunPhaseShrink/>, which follows it before the checkpoint.
+Read `~/.claude/docs/delegate/run_phase_review.md` in full after smoke and
+<UXReview/>, once per phase. It also defines <RunPhaseShrink/>, which follows
+it before the checkpoint.
 </RunPhaseReview>
 
 <ConsiderNextItems>
@@ -1096,9 +1139,9 @@ the report, never a stop.
 </PhaseCleanup>
 
 <RecordPhaseCompletion>
-After smoke, phase review, shrink, next-item consideration, cleanup, and
-checkpoint when applicable, run `progress_history.py finish-phase --session-dir
-"${SESSION_DIR}" --status completed`.
+After smoke, UX review, phase review, shrink, next-item consideration, cleanup,
+and checkpoint when applicable, run `progress_history.py finish-phase
+--session-dir "${SESSION_DIR}" --status completed`.
 
 After a loop/verbose phase with `RepositoryNotEnrolled` or
 `EnrolledAwaitingFirstTouch`, delete its completed-phase state

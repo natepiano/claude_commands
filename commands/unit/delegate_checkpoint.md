@@ -160,4 +160,8 @@ Loop/verbose only:
    first-attempt reply or the matching already-journalled checkpoint above.
 8. Report `Checkpoint <short hash> — phase N: <title>.` Never push here. This
    report follows successful release when the phase was active.
+9. In a production unit, run
+   `python3 ~/.claude/scripts/delegate/progress_history.py review-trial --session-dir "${SESSION_DIR}"`
+   before <RecordPhaseCompletion/> closes the phase (it also works after), and
+   keep its line for the checkpoint notice (<ProductionUnit/> item 3).
 </CheckpointCommit>

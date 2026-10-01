@@ -130,7 +130,14 @@ branch, port and the files you own.
 3. **Checkpoint notice.** After <RecordPhaseCompletion/>, and after the
    final-gate and as-built commits, send the showrunner one message:
 
-   `From <unit>: phase <N> checkpoint <hash> — <title>. Shots: <paths | none, no visible change>. Phase <next> ETA: <HH:MM zone>`
+   ```
+   From <unit>: phase <N> checkpoint <hash> — <title>. Shots: <paths | none, no visible change>. Phase <next> ETA: <HH:MM zone>
+   review trial: ux <N> findings, code <N> findings, review-seat minutes <M>
+   ```
+
+   A phase checkpoint's notice carries the second line:
+   `progress_history.py review-trial`'s output, verbatim
+   (`/unit:delegate_checkpoint` step 9).
 
    A phase that changes what users see, in the app or in any example,
    includes shots from a real window at

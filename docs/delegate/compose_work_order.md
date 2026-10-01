@@ -74,6 +74,7 @@ that builds the wrong thing.
 - Verification: translate Build/Test/Lint/Run/Smoke and Acceptance gate into
   <VerificationContract/> lines. Convert old raw Cargo/full-clippy entries to
   scoped `verify.sh`; the main agent retains live smoke ownership.
+- Three Gods: <WritePromptContract/> item 9's section, verbatim.
 
 Do not open code to fill a plan gap. Name the gap and let review catch its
 effect. Mark the dispatch as assembled from the Work Order without research.
