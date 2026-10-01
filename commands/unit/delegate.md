@@ -330,7 +330,10 @@ Every implementation or fix prompt contains these sections once:
    recover from the diff: **what this slot is unsure about, what it could not
    verify, and what it touched outside its file set**. No reviewer receives a
    summary, so a doubt left unstated arrives at review as a line of code that
-   looks deliberate.
+   looks deliberate. Carry verbatim: "Do not open the `rust_style` skill or run
+   `load-rust-style.sh`; this run's one style audit happens at the end." That
+   audit is <RunProjectStyleReview/>; Codex lists `rust_style` to every seat,
+   which loads it unless told not to.
 3. Narration: before each activity, run
    `bash ~/.claude/scripts/delegate/board.sh post <concrete SESSION_DIR> <slot> status "<activity>"`.
    Use short present-tense text and never read the heartbeat file. Role
@@ -375,9 +378,7 @@ delegate-facing rule from <VerificationContract/>, with nothing added around
 them. It must also say: run only its listed commands, never raw Cargo; run each
 with the sandbox disabled; do not report until every command has exited and its
 output has been read. If an edited package has no listed `test` line, add that
-package's scoped `verify.sh test` and report it. Omit plan **Style** metadata
-and never load the style guide; <RunProjectStyleReview/> owns the run's one
-style audit.
+package's scoped `verify.sh test` and report it. Omit plan **Style** metadata.
 </WritePromptContract>
 
 <PhaseTeam>
