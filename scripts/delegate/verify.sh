@@ -40,8 +40,11 @@
 # PLAN_DELEGATE_SESSION_DIR set, a `test` or `lint` that exits 0 is recorded in
 # <session>/verify_cache/, keyed by the working tree as the run left it, the
 # arguments, rustc -vV, lint.conf, these scripts and the RUST*/CARGO_*/NEXTEST_*
-# environment. The same call on the same tree then prints that record and its
-# log and exits 0 without the cargo token: seats re-ran unchanged trees 416
+# environment. A plain `lint <package>` leaves the package out of the key:
+# every lint stage but fmt covers the workspace, and fmt covers every member
+# that differs from HEAD, so one lint record answers for each package. The same
+# call on the same tree then prints that record and its log and exits 0
+# without the cargo token: seats re-ran unchanged trees 416
 # times in the week to 2026-10-01. A failure is never recorded, a `test` that
 # changed the tree records nothing, and a run outside a delegate session is
 # never cached. end_session.sh deletes the records when the run ends.
@@ -60,9 +63,10 @@
 #                                          (workspace lib + bins + tests built)
 #   verify.sh test <package> <int_test>    one named integration test target,
 #                                          for re-running it alone
-#   verify.sh lint <package>               mend --fix, nightly fmt, workspace
-#                                          clippy (warnings denied), then rustdoc
-#                                          on the members that differ from HEAD
+#   verify.sh lint <package>               mend --fix, nightly fmt of the package
+#                                          and the members that differ from HEAD,
+#                                          workspace clippy (warnings denied), then
+#                                          rustdoc on the members that differ
 #                                          — every stage gated by config/lint.conf
 #   … [--features <list>]                  check, test, and lint accept one trailing
 #                                          `--features a,b` when the Work Order names
@@ -315,8 +319,12 @@ RUN_STARTED=0
 LOOKUP_KEY=""
 
 tree_key() {
+    local words=("$CMD" "${ARGS[@]}")
+    if [[ "$CMD" == lint && ${#ARGS[@]} -eq 1 ]]; then
+        words=(lint)
+    fi
     "$PY" -c "$TREE_KEY_PY" "${BASH_SOURCE[0]}" "$HOME/.claude/scripts/lint/invoke.sh" \
-        "${LINT_CONFIG_FILE:-$HOME/.claude/config/lint.conf}" -- "$CMD" "${ARGS[@]}" \
+        "${LINT_CONFIG_FILE:-$HOME/.claude/config/lint.conf}" -- "${words[@]}" \
         2>/dev/null || true
 }
 
@@ -363,6 +371,10 @@ cache_lookup() {
     note_event reused "${SECONDS}" 0 0 \
         "$(sed -n 's/^saved_s=//p' "${CACHE_DIR}/${LOOKUP_KEY}.pass")" || true
     echo "verify.sh: PASS (recorded) — $(head -n 1 "${CACHE_DIR}/${LOOKUP_KEY}.pass")"
+    if ! head -n 1 "${CACHE_DIR}/${LOOKUP_KEY}.pass" \
+        | grep -qF "\`verify.sh $CMD${ARGS[*]:+ ${ARGS[*]}}\`"; then
+        echo "verify.sh: lint covers the workspace and every changed member, so that pass answers this package too."
+    fi
     echo "verify.sh: the tree and every input are unchanged since, so nothing was rebuilt or re-run."
     echo "verify.sh: that run's output is ${CACHE_DIR}/${LOOKUP_KEY}.log; its last lines:"
     tail -n 5 "${CACHE_DIR}/${LOOKUP_KEY}.log" 2>/dev/null || true
@@ -586,8 +598,19 @@ case "$CMD" in
         else
             lint_config_skip_notice mend "cargo mend --all-targets --workspace --fix"
         fi
-        # fmt compiles nothing, so it stays on the package the phase edited.
-        fmt_cargo -p "$PKG"
+        # fmt compiles nothing, so it stays on the phase's own work: this
+        # package and every member that differs from HEAD once mend has run.
+        # Covering them all is what lets one lint record answer for each
+        # package (tree_key).
+        FMT_SCOPE=(-p "$PKG")
+        FMT_MEMBERS="$(cargo metadata --no-deps --format-version 1 \
+            | "$PY" -c "$CHANGED_MEMBERS_PY" "")"
+        while IFS= read -r member; do
+            if [[ -n "$member" && "$member" != "$PKG" ]]; then
+                FMT_SCOPE+=(-p "$member")
+            fi
+        done <<< "$FMT_MEMBERS"
+        fmt_cargo "${FMT_SCOPE[@]}"
         invoke_clippy --workspace --lib --bins --tests "${FEATURE_FLAGS[@]}"
         # Found after mend, so a member its --fix rewrote is documented too.
         FEATURE_MEMBER=""
