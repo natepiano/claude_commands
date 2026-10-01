@@ -913,20 +913,52 @@ def command_steer(args: argparse.Namespace) -> int:
         )
     port, _fresh = ensure_server(session_dir)
     client = Client(port, f"steer-{os.getpid()}")
-    _ = _require(
-        client.call(
+    message = _message_text(args)
+    reply = client.call(
+        "turn/steer",
+        {
+            "threadId": record["thread_id"],
+            "expectedTurnId": turn_id,
+            "input": [{"type": "text", "text": message}],
+        },
+    )
+    # The roster learns a new turn id only from the `start` loop streaming
+    # `turn/started`. Once that launcher is gone, a queued message still opens
+    # a new turn and the recorded id goes stale; the server names the live one
+    # in its refusal, so steer that turn and record it.
+    live = _live_turn_from_mismatch(reply)
+    if live:
+        reply = client.call(
             "turn/steer",
             {
                 "threadId": record["thread_id"],
-                "expectedTurnId": turn_id,
-                "input": [{"type": "text", "text": _message_text(args)}],
+                "expectedTurnId": live,
+                "input": [{"type": "text", "text": message}],
             },
-        ),
-        "turn/steer",
-    )
+        )
+        if not reply.get("error"):
+            _update_roster(
+                session_dir,
+                target,
+                {"thread_id": record["thread_id"], "turn_id": live, "status": "running"},
+            )
+    _ = _require(reply, "turn/steer")
     client.close()
     print(f"steered {target}")
     return 0
+
+
+def _live_turn_from_mismatch(reply: RpcMessage) -> str:
+    """The active turn id a `turn/steer` refusal names, or "" for any other
+    reply."""
+    text = _as_str(_as_dict(reply.get("error")).get("message"))
+    marker = "but found `"
+    start = text.find(marker)
+    if start < 0:
+        return ""
+    rest = text[start + len(marker) :]
+    end = rest.find("`")
+    return rest[:end] if end > 0 else ""
 
 
 def command_end(args: argparse.Namespace) -> int:
