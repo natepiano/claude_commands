@@ -709,4 +709,38 @@ admin_first_line() {
     || fail "every-function inherit message is wrong"
 cmp "$expected" "$AGENTS_CONFIG_FILE" || fail "agent_admin.sh inherit did not clear every key"
 
+# `pace` takes the pacer's fresh decision, and default when it is stale or absent.
+cat > "$TEST_DIR/pace.conf" <<'EOF'
+[assignments]
+paced=codex
+
+[paced.codex]
+work=gpt-test:high
+
+[paced.options]
+codex_service_tier=pace
+
+[codex.agents]
+gpt-test=low,medium,high
+
+[claude.agents]
+opus=low,medium,high,max
+EOF
+write_fixture "$TEST_DIR/pace.conf"
+CODEX_PACER_TIER_FILE="$TEST_DIR/pacer-tier"
+printf 'fast\n' > "$CODEX_PACER_TIER_FILE"
+agents_resolve paced.work
+[[ "$AGENT_SERVICE_TIER" == "fast" ]] || fail "pace did not take the pacer's fast"
+[[ "$(agents_list_assignments paced)" == *"task=paced.work family=codex agent=gpt-test effort=high tier=pace(fast)"* ]] \
+    || fail "pace did not show its current decision"
+touch -t 202001010000 "$CODEX_PACER_TIER_FILE"
+agents_resolve paced.work
+[[ "$AGENT_SERVICE_TIER" == "default" ]] || fail "a stale pacer decision was trusted"
+rm -f "$CODEX_PACER_TIER_FILE"
+agents_resolve paced.work
+[[ "$AGENT_SERVICE_TIER" == "default" ]] || fail "a missing pacer decision did not fall back to default"
+agents_set_service_tier default paced
+agents_set_service_tier pace paced
+[[ "$(_agents_registry_get paced.options codex_service_tier)" == "pace" ]] || fail "pace could not be set"
+
 echo "agents_config tests passed"

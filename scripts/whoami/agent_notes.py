@@ -6,8 +6,9 @@ that quota window expires; unknown or expired usage is YAML null. Never infer
 100% remaining from a reset. weekly_usage_checked_at records the observation in
 UTC so a saved reading is distinguishable from live usage. No credentials are
 saved. Other frontmatter and note bodies are preserved. Run as a script, it then
-hands the notes to quota_alert.py, which messages sessions when an account runs low;
-`refresh` (/quota_refresh) is the run after the user reports a usage reset.
+hands the notes to quota_alert.py, which messages sessions when an account runs low,
+and to codex_pacer.py, which decides the `pace` tier from them; `refresh`
+(/quota_refresh) is the run after the user reports a usage reset.
 """
 
 from __future__ import annotations
@@ -20,6 +21,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+import codex_pacer
 from agent_accounts import EASTERN, Report, live_reports
 from quota_alert import AgentNote, alert, current_session, refresh
 
@@ -180,6 +182,12 @@ def main() -> None:
     notes: list[AgentNote] = list(read_notes())
     for line in refresh(notes, current_session()) if sys.argv[1:] else alert(notes):
         print(line)
+    try:
+        _ = codex_pacer.tick(notes)
+    except (OSError, ValueError, KeyError, TypeError) as error:
+        # The pacer must never cost the notes or the alerts; launches fall back to
+        # default once its decision is ten minutes old.
+        print(f"codex pacer did not run: {error!r}")
 
 
 if __name__ == "__main__":

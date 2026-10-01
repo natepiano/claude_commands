@@ -72,7 +72,9 @@ Usage: agent_admin.sh [skills | <function> | <family> | <agent> | <tier>] | <fun
                            the agent CLI default
   [<function>[.<subtask>]] <tier>
                            set the codex speed tier for every function, one
-                           function, or one row: fast, flex, default, or
+                           function, or one row: fast, flex, default, pace
+                           (codex_pacer.py picks fast or default so the
+                           quota lasts to the next weekly reset), or
                            inherit (drop the key; a row then follows its
                            function, a function ~/.codex/config.toml). A wider
                            level clears the row keys beneath it. Claude rows
@@ -95,7 +97,7 @@ EOF
 
 is_tier() {
     case "$1" in
-        fast|flex|default|inherit) return 0 ;;
+        fast|flex|default|pace|inherit) return 0 ;;
     esac
     return 1
 }

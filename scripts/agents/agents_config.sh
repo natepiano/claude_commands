@@ -24,6 +24,7 @@ AGENTS_CONFIG_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CODEX_CONFIG_FILE="${CODEX_CONFIG_FILE:-$HOME/.codex/config.toml}"
 CODEX_MODELS_CACHE_FILE="${CODEX_MODELS_CACHE_FILE:-$HOME/.codex/models_cache.json}"
 CODEX_CATALOG_SYNC_STATE_FILE="${CODEX_CATALOG_SYNC_STATE_FILE:-$HOME/.local/state/codex-agent-catalog-sync/last_success}"
+CODEX_PACER_TIER_FILE="${CODEX_PACER_TIER_FILE:-$HOME/.local/state/codex-pacer/tier}"
 
 # Keep the materialized registry current between periodic launchd runs.
 if [[ -f "$AGENTS_CONFIG_FILE" \
@@ -328,6 +329,10 @@ _agents_resolve_in_family() {
 # recognise without a word and runs at standard speed, so an unknown value is
 # refused here instead.
 # A row's own `codex_service_tier.<subtask>` beats the function's key.
+# `pace` hands the choice to ~/.claude/scripts/whoami/codex_pacer.py, which the
+# agent-sessions timer runs every two minutes: each launch takes the tier it last
+# wrote, and default once that is over ten minutes old or missing (the Mac has no
+# pacer, so there `pace` is default).
 _agents_stored_service_tier() {
     local function="$1" subtask="$2" tier
     tier="$(_agents_registry_get "$function.options" "codex_service_tier.$subtask")"
@@ -339,16 +344,33 @@ _agents_resolve_service_tier() {
     local task="$1" family="$2" function tier
 
     AGENT_SERVICE_TIER=""
+    AGENT_SERVICE_TIER_PACED=""
     [[ "$family" == "codex" ]] || return 0
     function="${task%%.*}"
     tier="$(_agents_stored_service_tier "$function" "${task#*.}")"
     case "$tier" in
         ''|fast|flex|default) AGENT_SERVICE_TIER="$tier" ;;
+        pace)
+            AGENT_SERVICE_TIER="$(_agents_pace_tier)"
+            AGENT_SERVICE_TIER_PACED="yes"
+            ;;
         *)
             echo "ERROR: [$task] codex_service_tier '$tier' in [$function.options] is not a codex service tier." >&2
-            echo "       Allowed values: fast, flex, default" >&2
+            echo "       Allowed values: fast, flex, default, pace" >&2
             return 1
             ;;
+    esac
+}
+
+# The pacer's current decision, fast or default; default when it is stale or absent.
+_agents_pace_tier() {
+    local tier=""
+    if [[ -n "$(find "$CODEX_PACER_TIER_FILE" -mmin -10 2>/dev/null)" ]]; then
+        read -r tier < "$CODEX_PACER_TIER_FILE" || true
+    fi
+    case "$tier" in
+        fast) printf 'fast' ;;
+        *) printf 'default' ;;
     esac
 }
 
@@ -368,11 +390,14 @@ _agents_codex_config_tier() {
 }
 
 # A row's tier as /agent shows it: `-` for claude, which never takes one; the
-# registry tier for codex, or `inherit(<config.toml tier>)` when there is none.
+# registry tier for codex, `pace(<its current decision>)`, or
+# `inherit(<config.toml tier>)` when there is none.
 _agents_tier_display() {
     local family="$1" tier="$2"
     if [[ "$family" != "codex" ]]; then
         printf '%s' '-'
+    elif [[ "$tier" == "pace" ]]; then
+        printf 'pace(%s)' "$(_agents_pace_tier)"
     elif [[ -n "$tier" ]]; then
         printf '%s' "$tier"
     else
@@ -382,9 +407,11 @@ _agents_tier_display() {
 }
 
 _agents_print_resolved() {
+    local tier="$AGENT_SERVICE_TIER"
+    [[ -n "${AGENT_SERVICE_TIER_PACED:-}" ]] && tier="pace"
     printf 'task=%s family=%s agent=%s effort=%s tier=%s\n' \
         "$1" "$AGENT_FAMILY" "$AGENT_MODEL" "$AGENT_EFFORT" \
-        "$(_agents_tier_display "$AGENT_FAMILY" "$AGENT_SERVICE_TIER")"
+        "$(_agents_tier_display "$AGENT_FAMILY" "$tier")"
 }
 
 agents_resolve_print() {
@@ -851,11 +878,11 @@ agents_set_service_tier() {
     local tier="$1" scope="${2:-}" function subtask="" line fn fns="" value="" tmp_file
 
     case "$tier" in
-        fast|flex|default) value="$tier" ;;
+        fast|flex|default|pace) value="$tier" ;;
         inherit) ;;
         *)
             echo "ERROR: '$tier' is not a codex service tier." >&2
-            echo "       Allowed: fast, flex, default, or inherit to follow ~/.codex/config.toml" >&2
+            echo "       Allowed: fast, flex, default, pace, or inherit to follow ~/.codex/config.toml" >&2
             return 1
             ;;
     esac

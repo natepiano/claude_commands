@@ -68,10 +68,12 @@ On success the edit prints a `# updated [<function>.<family>] <task> — live|do
 ## Set the codex speed tier
 
 ```text
-/agent <fast|flex|default|inherit>
-/agent <function> <fast|flex|default|inherit>
-/agent <function>.<subtask> <fast|flex|default|inherit>
+/agent <fast|flex|default|pace|inherit>
+/agent <function> <fast|flex|default|pace|inherit>
+/agent <function>.<subtask> <fast|flex|default|pace|inherit>
 ```
+
+`pace` lets `~/.claude/scripts/whoami/codex_pacer.py` choose fast or default at each launch, so the Codex quota reaches every weekly reset with 5% left; it shows as `pace(<current choice>)`. Any other tier takes it back. `python3 ~/.claude/scripts/whoami/codex_pacer.py status` explains the plan — relay it as-is when asked how pacing stands.
 
 Writes `codex_service_tier` (or `codex_service_tier.<subtask>`, which beats it) in `[<function>.options]`, for every function with a codex set, one function, or one row. `inherit` deletes the key: a row then follows its function, a function `~/.codex/config.toml`. A wider level clears the row keys beneath it. Claude rows never take a tier — Claude fast mode bills extra usage — so a tier on a function running claude is stored dormant.
 
