@@ -29,6 +29,8 @@ not pause the phase's work.
 Send the showrunner one message, first line self-contained, with the time in
 the machine's zone:
 
-`From <unit>: Phase <N> ETA: <HH:MM zone> (range <HH:MM>–<HH:MM>), from <basis>.`
+`From <unit>: Phase <N> ETA: <HH:MM zone>, <P>% done (range <HH:MM>–<HH:MM>), from <basis>.`
+
+P is the phase row's `%` in the recorder's summary.
 
 Print the same line as this turn's update, then carry on with the phase.

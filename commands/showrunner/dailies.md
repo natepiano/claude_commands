@@ -91,9 +91,10 @@ python3 ~/.claude/scripts/production/dailies_render.py <scratchpad>/dailies_inpu
       "unit": "tool-based-ui-trunk",
       "label": "trunk",
       "phase": "follow-up 3 of 4: look polish",
+      "started": "2026-10-01T05:12",
       "held": null,
       "update": "fixing the Open layout's overlapping members",
-      "eta": {"time": "07:40", "earliest": "07:35", "latest": "07:55", "detail": "checks and build included"},
+      "eta": {"time": "07:40", "earliest": "07:35", "latest": "07:55", "percent": 80, "detail": "checks and build included"},
       "waiting_on_it": "the cable fix; widget merges it into Phase 18",
       "needed": "the showrunner: merge the checkpoint",
       "needs_user": false,
@@ -114,9 +115,11 @@ python3 ~/.claude/scripts/production/dailies_render.py <scratchpad>/dailies_inpu
 | `unit` | The unit director's session name. |
 | `label` | The timeline row name, at most 8 characters. Defaults to the unit name without `-unit`. |
 | `phase` | `Phase <N> of <M>: <what it changes>` from the unit's plan. Work outside a numbered plan gives its place in the unit's queue: `follow-up <K> of <Q>: <what it changes>`. The renderer refuses anything else. |
-| `held` | Required. When the phase's checkpoint waits unmerged, the reason in a few words, written to follow "not merged, because": `the design check found 16 defects, such as a main bar clipped in small windows`. `null` when no checkpoint waits. |
+| `started` | When the phase started, `YYYY-MM-DDTHH:MM` in `ZONE`, from the unit director or `LOG`. The timeline row starts there. |
+| `held` | Required. When the phase's checkpoint waits unmerged, the reason alone, in a few words, written to follow "not merged, because": `the design check found 16 defects`. `null` when no checkpoint waits. No examples here; the renderer refuses `such as`. |
+| `held_examples` | Optional examples for `held`, written to follow a comma: `such as a main bar clipped in small windows`. The renderer prints them only the first time that reason appears for the phase. |
 | `update` | What the unit is doing now, one line. The length sets how long (below). A unit waiting on another unit says so, with the wait's start and expected clear times from `LOG` (`/showrunner:produce` → Dependencies). |
-| `eta` | The unit's latest stated phase ETA, in `ZONE`. `time` is `HH:MM`, `+1` for tomorrow (`11:21+1`); add `earliest` and `latest` when the unit director gave a range. With no ETA, `none` in place of `time`, one of: `none measured - requested` (after sending that unit director `/unit:eta` in this turn, the unmeasured-ETA rule in `/showrunner:produce`), `none measured`, `no ETA stated yet`. Never make one up. `detail` is an optional short note, such as what the time covers. |
+| `eta` | The unit's latest stated phase ETA, in `ZONE`. `time` is `HH:MM`, `+1` for tomorrow (`11:21+1`); add `earliest` and `latest` when the unit director gave a range. With no ETA, `none` in place of `time`, one of: `none measured - requested` (after sending that unit director `/unit:eta` in this turn, the unmeasured-ETA rule in `/showrunner:produce`), `none measured`, `no ETA stated yet`. Never make one up. `percent` is required with `time`: the unit director's phase percent done (the recorder's phase `%`, 0–100), or `null` when it stated none. `detail` is an optional short note, such as what the time covers. |
 | `waiting_on_it` | Only for a topic that lands with this unit's phase, and who waits. |
 | `needed` | Only when the subject needs a follow-up nobody has started, from you (the user), the showrunner or another unit director. Say who. |
 | `needs_user` | `true` when the subject waits on you. It then goes first. |
@@ -142,14 +145,18 @@ director's own handoff may list only the work in front of it.
 - **First line:** the length and both times: `**Dailies (Simple)**, 19:05 PDT / 02:05 UTC`.
 - **One section per subject:** `### <unit>, <phase>`, then `held: not merged,
   because ...` when given, `update:`, `eta:`, and `waiting on it:`, `needed:`
-  and `then:` when given.
+  and `then:` when given. A held reason shows its examples only the first time.
+- **eta:** the time, then the percent done: `10:46 PDT, 85% done`.
 - **eta note:** against the last report's ETA for the same phase:
   `(unchanged)`, `(changed: +0:27)`, or `(unchanged, overdue)` once the time
   has passed. No note on a subject's first ETA or a new phase. A range follows
   the note.
-- **Timeline:** a code block after the sections. Each row is white from now to
-  the ETA, with a green cell at the earliest time and a red cell at the latest;
-  `→` means the latest runs past the axis end; `?` means no ETA.
+- **Timeline:** a code block after the sections, always 24 hours of one-hour
+  cells, labelled every three hours, with `▼` at now. It opens six hours before
+  the three-hour mark at or before now. Each row is white from the phase's
+  start (or the left edge, when it started earlier) to the ETA, with a green
+  cell at the earliest time and a red cell at the latest; `→` means the latest
+  runs past the right edge; `?` means no ETA. User, 2026-10-01.
 - **Last line:** `next run at 20:10 - nothing needed` when no subject has a
   `needed:`, `next run at 20:10` when one does, or `no run scheduled` without a
   schedule. The report replaces the turn's `— waiting on:` line.
@@ -171,7 +178,11 @@ For every length:
   merged (`/showrunner:produce` → Rules: one phase at a time). A held
   checkpoint keeps its phase in the heading until it merges.
 - **Say why it is held.** Whenever a checkpoint waits unmerged, `held` gives
-  the reason. The renderer refuses a unit without the field.
+  the reason. The renderer refuses a unit without the field. Give examples
+  once, in `held_examples`; after that the reason stands alone.
+- **Report against a count.** Once a report counts something, later updates
+  say how much of it is done: `8 of 16 fixed`. The renderer refuses an update
+  that does not report against a count in `held`. User, 2026-10-01.
 - **`update:` is the present only.** What the unit does now, not its history.
   It names no other phase number unless it says why that phase is here
   (`because ...`); the renderer refuses one that does. Later work goes in `then`.

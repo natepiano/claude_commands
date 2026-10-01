@@ -7,12 +7,14 @@ The input gives each subject's fields; this script owns the layout, so no line
 of the template can be dropped or renamed. It refuses, with exit 2, an input
 that breaks a template rule: a unit without its phase or `held`, a follow-up
 or last phase without `then`, an unknown field, an update too long for the
-length, or an update or held reason that names another phase without saying
-why.
+length, an update or held reason that names another phase without saying
+why, a held reason carrying its own examples, a held count the update does
+not report against (`<k> of <N>`), or an ETA time without its percent.
 
---state  JSON file holding each unit's last reported phase and ETA. The script
-         reads it to write `(unchanged)` / `(changed: ±h:mm)`, then saves this
-         report's ETAs to it.
+--state  JSON file holding each unit's last reported phase, ETA and held
+         reason. The script reads it to write `(unchanged)` / `(changed:
+         ±h:mm)` and to print a held reason's examples only the first time,
+         then saves this report's values to it.
 --log    appends the `dailies ETAs:` line to this file.
 --at     renders as if the clock read this local time (for checks).
 
@@ -21,7 +23,6 @@ The input format is in ~/.claude/commands/showrunner/dailies.md.
 
 import argparse
 import json
-import math
 import re
 import sys
 from dataclasses import dataclass
@@ -37,14 +38,23 @@ NONE = ("none measured - requested", "none measured", "no ETA stated yet")
 LABEL_LIMIT = 8
 RETURN = re.compile(r"\bthe plan at Phase \d+|\bplan done\b")
 PHASE_MENTION = re.compile(r"\bPhases? (\d+(?:\s*(?:,|and|-|–|to)\s*\d+)*)|\bP(\d+)\b")
+COUNT = re.compile(r"\b(\d+) [a-z]")
+EXAMPLES = re.compile(r"\bsuch as\b|\be\.g\.|\bfor example\b")
+STARTED = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}$")
 WHITE = "⬜"
 GREEN = "🟩"
 RED = "🟥"
 BLANK = "  "
+NOW_MARK = "▼ "
 CELL_WIDTH = 2
 ROW_LABEL_WIDTH = 9
-MAX_COLUMNS = 30
-STEPS_MINUTES = (5, 10, 15, 20, 30, 60, 120)
+# The timeline always spans 24 one-hour cells, labelled every three hours. It
+# opens six hours before the three-hour mark at or before now, so a phase that
+# started this morning shows its whole run, and now always sits a quarter to
+# a third of the way in.
+WINDOW_HOURS = 24
+LABEL_EVERY_HOURS = 3
+HOURS_BEFORE = 6
 
 JsonMap = dict[str, object]
 
@@ -60,6 +70,7 @@ class Eta:
     latest: str | None
     none: str | None
     detail: str | None
+    percent: int | None
 
 
 @dataclass(frozen=True)
@@ -67,7 +78,9 @@ class Unit:
     unit: str
     label: str
     phase: str
+    started: datetime
     held: str | None
+    held_examples: str | None
     update: str
     eta: Eta
     waiting_on_it: str | None
@@ -98,10 +111,12 @@ class Report:
 class Previous:
     phase: str
     eta: datetime | None
+    held: str | None
 
 
 @dataclass(frozen=True)
 class Estimate:
+    started: datetime
     eta: datetime
     earliest: datetime
     latest: datetime
@@ -125,52 +140,47 @@ def parse_time(text: str, now: datetime) -> datetime:
     return moment
 
 
-def axis_label(moment: datetime, now: datetime) -> str:
-    if moment - now > timedelta(hours=24):
-        return moment.strftime("%a %H:%M")
-    return moment.strftime("%H:%M")
+def window_start(now: datetime) -> datetime:
+    mark = now.replace(hour=now.hour - now.hour % LABEL_EVERY_HOURS, minute=0, second=0, microsecond=0)
+    return mark - timedelta(hours=HOURS_BEFORE)
 
 
 def draw(now: datetime, rows: list[Row]) -> list[str]:
-    """Each row is white from now to the ETA, green at the earliest time, red at the latest; `→` past the axis end."""
-    estimates = [row.estimate for row in rows if row.estimate is not None]
-    last_eta = max((estimate.eta for estimate in estimates), default=now)
-    axis_end = last_eta.replace(minute=0) + timedelta(hours=1)
-    if axis_end - last_eta < timedelta(minutes=15):
-        axis_end += timedelta(hours=1)
-    span_minutes = (axis_end - now).total_seconds() / 60
-    step = next((s for s in STEPS_MINUTES if span_minutes / s <= MAX_COLUMNS), STEPS_MINUTES[-1])
-    columns = math.ceil(span_minutes / step)
+    """24 hourly cells: white from the phase's start (or the left edge) to the ETA, green at the earliest time, red at the latest; `→` past the right edge."""
+    start = window_start(now)
 
     def column(moment: datetime) -> int:
-        return max(0, int((moment - now).total_seconds() // 60 // step))
+        return int((moment - start).total_seconds() // 3600)
 
-    axis = [" "] * (columns * CELL_WIDTH + 6)
-    hours_per_mark = max(1, math.ceil(6 * step / (60 * CELL_WIDTH)))
-    mark = now.replace(minute=0, second=0, microsecond=0) + timedelta(hours=1)
-    while mark <= axis_end:
-        position = column(mark) * CELL_WIDTH
-        mark_text = mark.strftime("%H:%M")
-        if position + len(mark_text) <= len(axis):
-            axis[position : position + len(mark_text)] = list(mark_text)
-        mark += timedelta(hours=hours_per_mark)
+    axis: list[str] = []
+    for index in range(WINDOW_HOURS):
+        hour = start + timedelta(hours=index)
+        if index == column(now):
+            axis.append(NOW_MARK)
+        elif hour.hour % LABEL_EVERY_HOURS == 0:
+            axis.append(f"{hour:%H}")
+        else:
+            axis.append(BLANK)
     lines = [" " * ROW_LABEL_WIDTH + "".join(axis).rstrip()]
 
+    last = WINDOW_HOURS - 1
     for row in rows:
         if row.estimate is None:
             lines.append(f"{row.name:<{ROW_LABEL_WIDTH}}?")
             continue
         estimate = row.estimate
-        cells = [BLANK] * columns
-        for index in range(min(column(estimate.eta) + 1, columns)):
+        cells = [BLANK] * WINDOW_HOURS
+        first = max(0, column(estimate.started))
+        for index in range(first, min(column(estimate.eta), last) + 1):
             cells[index] = WHITE
-        cells[min(column(estimate.earliest), columns - 1)] = GREEN
-        past_end = column(estimate.latest) >= columns
-        cells[min(column(estimate.latest), columns - 1)] = RED
-        bar = "".join(cells).rstrip()
-        arrow = "→" if past_end else ""
-        span = f"{axis_label(estimate.eta, now)} ({axis_label(estimate.earliest, now)}–{axis_label(estimate.latest, now)})"
-        lines.append(f"{row.name:<{ROW_LABEL_WIDTH}}{bar}{arrow} {span}")
+        if column(estimate.earliest) <= last:
+            cells[max(0, column(estimate.earliest))] = GREEN
+        cells[max(0, min(column(estimate.latest), last))] = RED
+        arrow = "→" if column(estimate.latest) > last else ""
+        span = f"{estimate.eta:%H:%M}"
+        if (estimate.earliest, estimate.latest) != (estimate.eta, estimate.eta):
+            span += f" ({estimate.earliest:%H:%M}–{estimate.latest:%H:%M})"
+        lines.append(f"{row.name:<{ROW_LABEL_WIDTH}}{''.join(cells).rstrip()}{arrow} {span}")
     return lines
 
 
@@ -233,7 +243,7 @@ def clock_text(fields: JsonMap, key: str, where: str) -> str | None:
 
 def parse_eta(value: object, where: str) -> Eta:
     fields = as_map(value, where)
-    check_keys(fields, {"time", "earliest", "latest", "none", "detail"}, where)
+    check_keys(fields, {"time", "earliest", "latest", "none", "detail", "percent"}, where)
     time = clock_text(fields, "time", where)
     earliest = clock_text(fields, "earliest", where)
     latest = clock_text(fields, "latest", where)
@@ -246,7 +256,14 @@ def parse_eta(value: object, where: str) -> Eta:
         raise InputError(f"{where}: give earliest and latest together, or neither")
     if time is None and earliest is not None:
         raise InputError(f"{where}: a range needs a time")
-    return Eta(time, earliest, latest, none, optional_text(fields, "detail", where))
+    percent = fields.get("percent")
+    if time is not None and "percent" not in fields:
+        raise InputError(f"{where}.percent: required with a time; the unit director's phase percent done (0-100), or null when it stated none")
+    if time is None and percent is not None:
+        raise InputError(f"{where}.percent: only with a time")
+    if percent is not None and (not isinstance(percent, int) or isinstance(percent, bool) or not 0 <= percent <= 100):
+        raise InputError(f"{where}.percent: a whole number from 0 to 100, or null")
+    return Eta(time, earliest, latest, none, optional_text(fields, "detail", where), percent)
 
 
 def check_update(update: str, length: str, where: str, key: str = "update") -> None:
@@ -274,11 +291,21 @@ def check_one_phase(line: str, number: int | None, key: str, where: str) -> None
         )
 
 
+def check_counts(held: str, update: str, where: str) -> None:
+    """A count in the held reason is what the update reports progress against."""
+    for count in COUNT.finditer(held):
+        total: str = count.group(1)
+        if not re.search(rf"\b\d+ of {total}\b", update):
+            raise InputError(
+                f"{where}.update: the held reason counts {total}; say how many of them are done, as '<k> of {total} ...'"
+            )
+
+
 def parse_unit(value: object, where: str, length: str) -> Unit:
     fields = as_map(value, where)
     check_keys(
         fields,
-        {"unit", "label", "phase", "held", "update", "eta", "waiting_on_it", "needed", "needs_user", "then"},
+        {"unit", "label", "phase", "started", "held", "held_examples", "update", "eta", "waiting_on_it", "needed", "needs_user", "then"},
         where,
     )
     if "held" not in fields:
@@ -288,6 +315,9 @@ def parse_unit(value: object, where: str, length: str) -> Unit:
     if len(label) > LABEL_LIMIT:
         raise InputError(f"{where}.label: {label!r} is longer than {LABEL_LIMIT}; give a short label")
     phase = text(fields, "phase", where)
+    started_text = text(fields, "started", where)
+    if not STARTED.match(started_text):
+        raise InputError(f"{where}.started: {started_text!r} must be the phase's start as YYYY-MM-DDTHH:MM in the zone")
     match = PHASE.match(phase)
     if match is None:
         raise InputError(
@@ -305,17 +335,27 @@ def parse_unit(value: object, where: str, length: str) -> Unit:
         raise InputError(f"{where}.then: required on a last phase; name the queued work, or 'nothing queued'")
     heading_number = int(plan_number) if plan_number else None
     held = optional_text(fields, "held", where)
-    if held is not None:
-        check_update(held, length, where, "held")
-        check_one_phase(held, heading_number, "held", where)
+    held_examples = optional_text(fields, "held_examples", where)
+    if held is None and held_examples is not None:
+        raise InputError(f"{where}.held_examples: only with a held reason")
     update = text(fields, "update", where)
     check_update(update, length, where)
     check_one_phase(update, heading_number, "update", where)
+    if held is not None:
+        check_update(held, length, where, "held")
+        check_one_phase(held, heading_number, "held", where)
+        if EXAMPLES.search(held):
+            raise InputError(f"{where}.held: give the reason alone; examples go in held_examples, shown only the first time")
+        check_counts(held, update, where)
+    if held_examples is not None:
+        check_update(held_examples, length, where, "held_examples")
     return Unit(
         unit=unit,
         label=label,
         phase=phase,
+        started=datetime.fromisoformat(started_text),
         held=held,
+        held_examples=held_examples,
         update=update,
         eta=parse_eta(fields.get("eta"), f"{where}.eta"),
         waiting_on_it=optional_text(fields, "waiting_on_it", where),
@@ -363,7 +403,8 @@ def load_state(path: Path | None) -> dict[str, Previous]:
         entry_fields = as_map(entry, f"{path}:{unit}")
         phase = text(entry_fields, "phase", f"{path}:{unit}")
         eta = optional_text(entry_fields, "eta", f"{path}:{unit}")
-        previous[unit] = Previous(phase, datetime.fromisoformat(eta) if eta else None)
+        held = optional_text(entry_fields, "held", f"{path}:{unit}")
+        previous[unit] = Previous(phase, datetime.fromisoformat(eta) if eta else None, held)
     return previous
 
 
@@ -371,7 +412,7 @@ def save_state(path: Path, report: Report, now: datetime) -> None:
     state: dict[str, dict[str, str | None]] = {}
     for unit in report.units:
         moment = parse_time(unit.eta.time, now) if unit.eta.time else None
-        state[unit.unit] = {"phase": unit.phase, "eta": moment.isoformat() if moment else None}
+        state[unit.unit] = {"phase": unit.phase, "eta": moment.isoformat() if moment else None, "held": unit.held}
     _ = path.write_text(json.dumps(state, indent=2) + "\n")
 
 
@@ -407,7 +448,8 @@ def eta_text(unit: Unit, previous: Previous | None, now: datetime, zone_name: st
             notes.append(note)
         if eta.earliest and eta.latest:
             notes.append(f"range {parse_time(eta.earliest, now):%H:%M}–{parse_time(eta.latest, now):%H:%M}")
-        words = clock(moment, now, zone_name) + (f" ({'; '.join(notes)})" if notes else "")
+        done = f"{eta.percent}% done" if eta.percent is not None else "percent done not stated"
+        words = f"{clock(moment, now, zone_name)}, {done}" + (f" ({'; '.join(notes)})" if notes else "")
     return f"{words}; {eta.detail}" if with_note and eta.detail else words
 
 
@@ -440,7 +482,10 @@ def render(report: Report, previous: dict[str, Previous], now: datetime, zone_na
     for unit in units:
         lines.append(f"### {unit.unit}, {unit.phase}")
         if unit.held:
-            lines.append(f"- held: not merged, because {unit.held}")
+            last = previous.get(unit.unit)
+            repeat = last is not None and last.phase == unit.phase and last.held == unit.held
+            examples = f", {unit.held_examples}" if unit.held_examples and not repeat else ""
+            lines.append(f"- held: not merged, because {unit.held}{examples}")
         lines.append(f"- update: {unit.update}")
         lines.append(f"- eta: {eta_text(unit, previous.get(unit.unit), now, zone_name, with_note=True)}")
         if unit.waiting_on_it:
@@ -461,7 +506,7 @@ def render(report: Report, previous: dict[str, Previous], now: datetime, zone_na
         moment = parse_time(unit.eta.time, now)
         earliest = parse_time(unit.eta.earliest, now) if unit.eta.earliest else moment
         latest = parse_time(unit.eta.latest, now) if unit.eta.latest else moment
-        rows.append(Row(unit.label, Estimate(moment, earliest, latest)))
+        rows.append(Row(unit.label, Estimate(unit.started, moment, earliest, latest)))
     lines.extend(["```", *draw(now, rows), "```", ""])
 
     needed = any(unit.needed for unit in report.units) or any(topic.needed for topic in report.topics)
