@@ -1,1 +1,0 @@
-../unit/delegate_style.md
