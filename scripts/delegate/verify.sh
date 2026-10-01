@@ -48,9 +48,10 @@
 #
 # Each record carries what a repeat would cost: the run's wall time minus
 # cargo's own "Finished … in" build times, since a repeat on the same tree
-# builds nothing. Every hit appends that figure, with the worktree and branch,
-# to ~/.local/state/verify/saved.jsonl, which outlives the records;
-# verify_saved.py reports it.
+# builds nothing. Every such call, --no-cache included, appends one line to
+# ~/.local/state/verify/events.jsonl: ran, failed, interrupted, or reused with
+# the seconds saved, plus machine, workspace, worktree, branch and commit. The
+# ledger outlives the records; /verify_saved reports it.
 #
 # Usage:
 #   verify.sh check <package>              fast compile feedback (workspace
@@ -296,11 +297,17 @@ for arg in "$@"; do
 done
 set -- "${ARGS[@]}"
 
+# Pass records and the call ledger (see the header): on for `test` and `lint` in
+# a delegate session. --no-cache turns off lookup and record; the call is still
+# logged.
 CACHE_SESSION_DIR="${PLAN_DELEGATE_BOARD_DIR:-${PLAN_DELEGATE_SESSION_DIR:-}}"
+VERIFY_DIR=""
 CACHE_DIR=""
-if [[ -n "${CACHE_SESSION_DIR}" && "${NO_CACHE}" -eq 0 \
-      && ( "$CMD" == test || "$CMD" == lint ) ]]; then
-    CACHE_DIR="${CACHE_SESSION_DIR}/verify_cache"
+if [[ -n "${CACHE_SESSION_DIR}" && ( "$CMD" == test || "$CMD" == lint ) ]]; then
+    VERIFY_DIR="${CACHE_SESSION_DIR}/verify_cache"
+    if [[ "${NO_CACHE}" -eq 0 ]]; then
+        CACHE_DIR="${VERIFY_DIR}"
+    fi
 fi
 RUN_LOG=""
 RUN_KEY=""
@@ -313,13 +320,48 @@ tree_key() {
         2>/dev/null || true
 }
 
+EVENTS_LEDGER="${VERIFY_EVENTS_LEDGER:-${HOME}/.local/state/verify/events.jsonl}"
+EVENT_PY='
+import json
+import socket
+import sys
+from datetime import datetime, timezone
+
+texts = ("workspace", "worktree", "branch", "commit", "command", "outcome", "session")
+counts = ("wait_s", "wall_s", "build_s", "saved_s")
+event: dict[str, str | int] = {
+    "at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+    "machine": socket.gethostname().split(".")[0],
+}
+event.update(zip(texts, sys.argv[1:8]))
+event.update((name, int(value or 0)) for name, value in zip(counts, sys.argv[8:12]))
+print(json.dumps(event))
+'
+
+# One ledger line per call: ran, failed, interrupted, or reused, with its
+# workspace (the repo every worktree shares), worktree, branch and commit. A
+# ledger that cannot be written loses the line, never the result.
+note_event() {
+    [[ -n "${VERIFY_DIR}" ]] || return 0
+    local outcome=$1 wait=$2 wall=$3 build=$4 saved=$5 top common branch commit
+    top="$(git rev-parse --show-toplevel 2>/dev/null)" || return 0
+    common="$(git rev-parse --path-format=absolute --git-common-dir 2>/dev/null)" || return 0
+    branch="$(git symbolic-ref --short -q HEAD || echo detached)"
+    commit="$(git rev-parse --short HEAD 2>/dev/null || true)"
+    mkdir -p "${EVENTS_LEDGER%/*}" || return 0
+    "$PY" -c "$EVENT_PY" "${common%/.git}" "$top" "$branch" "$commit" \
+        "$CMD${ARGS[*]:+ ${ARGS[*]}}" "$outcome" "${CACHE_SESSION_DIR##*/}" \
+        "$wait" "$wall" "$build" "$saved" >> "${EVENTS_LEDGER}" 2>/dev/null || true
+}
+
 # Succeeds, after printing the record, when this call already passed on this
 # tree. Sets LOOKUP_KEY either way.
 cache_lookup() {
     [[ -n "${CACHE_DIR}" ]] || return 1
     LOOKUP_KEY="$(tree_key)"
     [[ -n "${LOOKUP_KEY}" && -f "${CACHE_DIR}/${LOOKUP_KEY}.pass" ]] || return 1
-    note_saved "$(sed -n 's/^saved_s=//p' "${CACHE_DIR}/${LOOKUP_KEY}.pass")" || true
+    note_event reused "${SECONDS}" 0 0 \
+        "$(sed -n 's/^saved_s=//p' "${CACHE_DIR}/${LOOKUP_KEY}.pass")" || true
     echo "verify.sh: PASS (recorded) — $(head -n 1 "${CACHE_DIR}/${LOOKUP_KEY}.pass")"
     echo "verify.sh: the tree and every input are unchanged since, so nothing was rebuilt or re-run."
     echo "verify.sh: that run's output is ${CACHE_DIR}/${LOOKUP_KEY}.log; its last lines:"
@@ -327,56 +369,52 @@ cache_lookup() {
     echo "verify.sh: add --no-cache to run it anyway (a flake hunt)."
 }
 
-SAVED_LEDGER="${VERIFY_SAVED_LEDGER:-${HOME}/.local/state/verify/saved.jsonl}"
-SAVED_LINE_PY='
-import json
-import sys
-from datetime import datetime, timezone
-
-at = datetime.now(timezone.utc).isoformat(timespec="seconds")
-worktree, branch, command, saved = sys.argv[1:5]
-print(json.dumps({"at": at, "worktree": worktree, "branch": branch, "command": command, "saved_s": int(saved or 0)}))
-'
-
-# One line per hit in the savings ledger; a ledger that cannot be written
-# loses the figure, never the pass.
-note_saved() {
-    local top branch
-    top="$(git rev-parse --show-toplevel 2>/dev/null)" || return 0
-    branch="$(git symbolic-ref --short -q HEAD || echo "detached $(git rev-parse --short HEAD)")"
-    mkdir -p "${SAVED_LEDGER%/*}" || return 0
-    "$PY" -c "$SAVED_LINE_PY" "$top" "$branch" "$CMD${ARGS[*]:+ ${ARGS[*]}}" "${1:-0}" \
-        >> "${SAVED_LEDGER}" 2>/dev/null || true
-}
-
-# Called on a 0 exit, before the token is released, so a peer queued on the
-# same call finds the record. Keyed by the tree as the run left it: lint's
-# rewrites are part of what passed.
-cache_record() {
-    [[ -n "${RUN_LOG}" ]] || return 0
-    local key
-    key="$(tree_key)"
-    if [[ -z "${key}" || ( "$CMD" == test && "${key}" != "${RUN_KEY}" ) ]]; then
-        rm -f "${RUN_LOG}"
-        return 0
-    fi
-    local build saved
-    # Cargo prints "in 0.23s" or "in 1m 23s"; everything else in the run is
-    # what a repeat would pay again.
-    build="$({ grep -aoE 'Finished .* in ([0-9]+m )?[0-9.]+s' "${RUN_LOG}" || true; } \
+# Cargo prints "in 0.23s" or "in 1m 23s"; the rest of a run is what a repeat on
+# the same tree would pay again.
+build_seconds() {
+    { grep -aoE 'Finished .* in ([0-9]+m )?[0-9.]+s' "${RUN_LOG}" || true; } \
         | awk '{ t = $NF; sub(/s$/, "", t); m = 0
                  if ($(NF - 1) ~ /^[0-9]+m$/) { m = $(NF - 1); sub(/m$/, "", m) }
                  total += m * 60 + t }
-               END { printf "%d", total }')"
-    saved=$(( SECONDS - RUN_STARTED - ${build:-0} ))
-    if (( saved < 0 )); then
-        saved=0
+               END { printf "%d", total }'
+}
+
+# Records a pass under the tree as the run left it (lint's rewrites are part of
+# what passed), before the token is released so a peer queued on the same call
+# finds it. Fails when there is nothing to record.
+cache_record() {
+    local repeat=$1 key
+    key="$(tree_key)"
+    if [[ -z "${key}" || ( "$CMD" == test && "${key}" != "${RUN_KEY}" ) ]]; then
+        return 1
     fi
     mv -f "${RUN_LOG}" "${CACHE_DIR}/${key}.log"
     printf '`verify.sh %s` passed %s, run by %s\nsaved_s=%d\n' "$CMD${ARGS[*]:+ ${ARGS[*]}}" \
         "$(date '+%Y-%m-%d %H:%M:%S')" "${PLAN_DELEGATE_TEAM_ROLE:-the orchestrator}" \
-        "${saved}" > "${CACHE_DIR}/${key}.pass.tmp"
+        "${repeat}" > "${CACHE_DIR}/${key}.pass.tmp"
     mv -f "${CACHE_DIR}/${key}.pass.tmp" "${CACHE_DIR}/${key}.pass"
+}
+
+# Logs the finished run and records a pass. Runs once: INT/TERM and then EXIT
+# both reach it.
+finish_run() {
+    local status=$1 outcome=failed wall build repeat
+    [[ -n "${RUN_LOG}" ]] || return 0
+    wall=$(( SECONDS - RUN_STARTED ))
+    build="$(build_seconds)"
+    repeat=$(( wall - ${build:-0} ))
+    if (( repeat < 0 )); then
+        repeat=0
+    fi
+    case "${status}" in
+        completed) outcome=ran ;;
+        interrupted) outcome=interrupted ;;
+    esac
+    note_event "${outcome}" "${RUN_STARTED}" "${wall}" "${build:-0}" 0
+    if [[ "${status}" != completed || -z "${CACHE_DIR}" ]] || ! cache_record "${repeat}"; then
+        rm -f "${RUN_LOG}"
+    fi
+    RUN_LOG=""
 }
 
 if cache_lookup; then
@@ -425,9 +463,9 @@ if cache_lookup; then
     release_token
     exit 0
 fi
-if [[ -n "${CACHE_DIR}" && -n "${LOOKUP_KEY}" ]] && mkdir -p "${CACHE_DIR}"; then
+if [[ -n "${VERIFY_DIR}" ]] && mkdir -p "${VERIFY_DIR}"; then
     RUN_KEY="${LOOKUP_KEY}"
-    RUN_LOG="${CACHE_DIR}/run.$$.log"
+    RUN_LOG="${VERIFY_DIR}/run.$$.log"
     RUN_STARTED=${SECONDS}
     : > "${RUN_LOG}"
     exec > >(tee -a "${RUN_LOG}") 2> >(tee -a "${RUN_LOG}" >&2)
@@ -467,11 +505,7 @@ fi
 # wait out the hold.
 verify_cleanup() {
     local status=$1
-    if [[ "${status}" == completed ]]; then
-        cache_record || true
-    elif [[ -n "${RUN_LOG}" ]]; then
-        rm -f "${RUN_LOG}"
-    fi
+    finish_run "${status}" || true
     if [[ "${ACTIVITY_ACTIVE}" -eq 1 ]]; then
         finish_activity "${status}"
     fi
