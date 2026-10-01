@@ -41,7 +41,7 @@
 #                                     remove_seats.py removes them at phase end
 #   <session_dir>/board.log         — shared coordination board; this launcher
 #                                     posts each member's start and end so peers
-#                                     learn of them without the orchestrator,
+#                                     learn of them without the unit director,
 #                                     which is asleep between progress ticks
 #   <session_dir>/heartbeat.log     — shared liveness log for every dispatch in
 #                                     this session: a role header block at start,
@@ -88,7 +88,7 @@ esac
 # pass kind. Keying it off `fix` is what forced seats to misreport their work:
 # every repairing seat should record `fix`, but a second one doing so
 # would mark one round landed several times over and hand the next review defects
-# pre-labelled as repaired. So the orchestrator names exactly one resolver, and
+# pre-labelled as repaired. So the unit director names exactly one resolver, and
 # the kind goes back to being only a name for the work.
 if [[ -n "${PLAN_DELEGATE_RESOLVES_ROUND+set}" ]]; then
   RESOLVES_ROUND="${PLAN_DELEGATE_RESOLVES_ROUND}"
@@ -122,8 +122,8 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # The address peers type to reach this member: `<project>-<slot>`, or
 # `<project>-fix` for a repair seat. seat_name.sh owns the rule, because the
-# orchestrator writes the same name into each peer's prompt before this runs.
-# A run whose orchestrator loaded the earlier rule tells its peers
+# unit director writes the same name into each peer's prompt before this runs.
+# A run whose unit director loaded the earlier rule tells its peers
 # `<session dir basename>-<slot>`, and its board already registers a seat under
 # that prefix, so it keeps the prefix for the rest of the run. Remove once no
 # run predating seat_name.sh can still be running.
@@ -202,7 +202,7 @@ fi
 bash "${HEARTBEAT_HELPER}" "${HEARTBEAT_FILE}" header "${BEAT_TAG} (${AGENT_FAMILY}/${AGENT_MODEL}:${AGENT_EFFORT:-unset})" "${ROLE_DESC}" || true
 
 # Announce the member on the shared board. Peers read the board to learn who is
-# running in which role; the orchestrator sleeps between progress ticks, so
+# running in which role; the unit director sleeps between progress ticks, so
 # nothing else would tell them.
 # codex delegates run as threads on one app-server instead of as `codex exec`
 # processes, which is what makes them addressable. On by default; set the key to
@@ -232,7 +232,7 @@ else
 fi
 # The opening role is stamped here so the progress table has a real answer from
 # second zero, instead of a dash until some agent remembers to call `board.sh
-# role`. The opening role is the kind: the orchestrator picks each seat's kind
+# role`. The opening role is the kind: the unit director picks each seat's kind
 # from the Work Order's Seats field, so a `review` seat launched to write opens
 # as `impl`, and a `test` seat in a crate with no test lane opens as whatever
 # it was given. Nothing here reads the seat name -- the seat name is an
@@ -255,7 +255,7 @@ bash "${BOARD_HELPER}" post "${SESSION_DIR}" "${BOARD_AGENT}" register \
 export PLAN_DELEGATE_BOARD_DIR="${SESSION_DIR}"
 
 # A claude-family delegate launches as a NAMED BACKGROUND session so it joins the
-# machine's session mesh: it can message its peers and the orchestrator, and both
+# machine's session mesh: it can message its peers and the unit director, and both
 # can message it, mid-run. A --print delegate carries the same ListAgents and
 # SendMessage tools but registers nowhere -- two concurrent print sessions in one
 # directory each report "no reachable agents" while the other is live -- so the
@@ -330,7 +330,7 @@ if [[ "${AGENT_CODE}" -eq 0 ]]; then
     fi
   fi
   # Only the launcher watches the worker exit, so only the launcher can say a
-  # repair landed. Asking the orchestrator to record it later leaves a gap it can
+  # repair landed. Asking the unit director to record it later leaves a gap it can
   # be killed or compacted inside, and that gap used to resolve as "fixed" --
   # handing the next review a defect pre-labelled as repaired.
   if [[ "${RESOLVES_ROUND}" == "1" && -f "${FINDINGS_STATE}" ]]; then

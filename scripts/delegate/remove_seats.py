@@ -19,11 +19,11 @@ Every launch appends `<id>\\t<name>` to its run's `seats` ledger. This removes:
   * every seat in `--session-dir`'s ledger -- the caller's own run, at the end
     of a phase or of the run, when nothing will message those seats again;
   * every seat of a run that is not live, from any ledger under the delegate
-    root -- the sweep that catches a run whose orchestrator died before its
+    root -- the sweep that catches a run whose unit director died before its
     own cleanup ran.
 
 A run is live while a run-active marker names its session directory and the
-orchestrator session that wrote the marker is still listed, or while its
+unit director that wrote the marker is still listed, or while its
 heartbeat log moved in the last `LIVE_HEARTBEAT_SECS`. The heartbeat test
 covers a run with no marker, which prepare_session.sh skips outside a Claude
 session: a seat still working beats every minute.

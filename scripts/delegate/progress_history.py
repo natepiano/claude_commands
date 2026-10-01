@@ -121,12 +121,12 @@ class ProjectTiming(TypedDict):
 
 
 class StageWindow(TypedDict):
-    """One launcher pass or one main-agent activity.
+    """One launcher pass or one unit-director activity.
 
     Two tables read these. `timeline` renders one row apiece, which is the
     provenance view. The progress report groups them by `fix_round` and lays the
     seats out as columns, which is why `slot` is carried here rather than
-    recovered later: a window with no seat is a main-agent activity, and it is
+    recovered later: a window with no seat is a unit-director activity, and it is
     the absence of a seat that tells the two apart.
     """
 
@@ -136,7 +136,7 @@ class StageWindow(TypedDict):
     fix_round: int
     label: str
     # What the window actually ran, for an activity: the `--activity` text the
-    # orchestrator opened it with ("test hana"). Empty for passes, whose work is
+    # unit director opened it with ("test hana"). Empty for passes, whose work is
     # described by kind and seat. The gate notes under the round table are the
     # one reader of it -- the label alone renders a block of verification
     # commands as identical rows.
@@ -252,7 +252,7 @@ PASS_OWNERSHIP_RULE = (
     "hand-written call forges a pass that never ran. findings.py gate counts "
     "passes to decide whether a phase is converging, and forged passes stop a run "
     "for a condition that never happened. Launch the work through implement.sh or "
-    "review.sh. The single exception is a launcher the orchestrator killed: close "
+    "review.sh. The single exception is a launcher the unit director killed: close "
     "its still-open pass with 'finish-pass --status canceled --orphaned-launcher'."
 )
 
@@ -466,9 +466,9 @@ def _detect_main_identity(args: argparse.Namespace) -> AgentIdentity:
 
 
 def _refresh_main_identity(state: dict[str, object]) -> None:
-    """Re-read the orchestrator's identity whenever a window opens.
+    """Re-read the unit director's identity whenever a window opens.
 
-    `start-run` detects it once, and the main agent's model or effort can change
+    `start-run` detects it once, and the unit director's model or effort can change
     part way through a run. Detection that comes back unknown leaves the stored
     identity alone: a window that cannot answer must not erase the answer
     already recorded.
@@ -855,7 +855,7 @@ def _open_passes(state: dict[str, object]) -> dict[str, dict[str, object]]:
 def _reporting_pass(state: dict[str, object]) -> dict[str, object] | None:
     """The open pass a call that is not a pass lifecycle call reports against.
 
-    A launcher answers for its own slot. The main agent occupies no slot and
+    A launcher answers for its own slot. The unit director occupies no slot and
     still has to stamp its events, render a header, calibrate against what it is
     watching, and arm a review beside it, so it falls back to the pass that
     opened first. First rather than last because that one covers the phase from
@@ -1088,7 +1088,7 @@ def _start_run(args: argparse.Namespace) -> None:
     main_agent = _detect_main_identity(args)
     if main_agent["model"] == "unknown":
         raise SystemExit(
-            "Unable to detect the main agent model and effort; pass explicit --main-* values"
+            "Unable to detect the unit director's model and effort; pass explicit --main-* values"
         )
     state: dict[str, object] = {
         "schema_version": SCHEMA_VERSION,
@@ -1240,7 +1240,7 @@ def _finish_pass(args: argparse.Namespace) -> None:
             raise SystemExit(f"finish-pass is the launcher's to record. {PASS_OWNERSHIP_RULE}")
         if status != "canceled":
             raise SystemExit(
-                "--orphaned-launcher closes the pass of a launcher the orchestrator "
+                "--orphaned-launcher closes the pass of a launcher the unit director "
                 + f"killed, so it takes --status canceled, not {status}"
             )
     # The launcher that finishes is the launcher that started, so the slot comes
@@ -1267,7 +1267,7 @@ def _finish_pass(args: argparse.Namespace) -> None:
 def _resolve_delegate_agent(task: str) -> AgentIdentity:
     """Ask the shared agent registry which agent a task resolves to.
 
-    The early reviewer is armed by the orchestrator in the same turn it launches
+    The early reviewer is armed by the unit director in the same turn it launches
     `review.sh`, so the launcher has not written its resolved identity yet and
     waiting for it would be a poll. Resolving through the same bash entry point
     the launcher uses gives the Delegate cell the same answer with no race.
@@ -1726,7 +1726,7 @@ def _format_duration(seconds: int) -> str:
 
 
 def _pass_display(current_pass: dict[str, object]) -> str:
-    # An activity is main-agent work with no convergence meaning, so it carries a
+    # An activity is unit-director work with no convergence meaning, so it carries a
     # plain label instead of a pass kind. findings.py counts passes, never these.
     label = _string(current_pass.get("label"))
     if label:
@@ -1932,7 +1932,7 @@ WAITING_PHRASES: tuple[str, ...] = ("waiting", "wait for", "blocked on", "standi
 # Where a window that sits in no round is drawn when its kind names a seat. A
 # lone reviewer between rounds -- the closure review, the broad review of a
 # solo run -- is doing review work and reads in the `test` column, where the
-# adversary lens sits; a row of dashes would hide it. A main-agent activity
+# adversary lens sits; a row of dashes would hide it. A unit-director activity
 # names no seat and keeps them.
 LONE_SEATS: dict[str, str] = {"impl": "impl", "fix": "impl", "test": "test", "review": "test"}
 # How many stages the round table draws. A long phase runs dozens -- ten repair
@@ -1999,8 +1999,8 @@ def _started_window(event: dict[str, object], event_type: str) -> StageWindow:
         label = ""
         started_at = _number(event.get("pass_started_at"))
     else:
-        # An activity is the main agent working directly, so it has no delegate
-        # and the Delegate cell stays empty rather than repeating the orchestrator.
+        # An activity is the unit director working directly, so it has no delegate
+        # and the Delegate cell stays empty rather than repeating the unit director.
         model, effort = "", ""
         instance_id = _string(event.get("activity_instance_id"))
         kind = "activity"
@@ -2009,7 +2009,7 @@ def _started_window(event: dict[str, object], event_type: str) -> StageWindow:
     main_model, main_effort = _agent_fields(event, "main_agent")
     return StageWindow(
         instance_id=instance_id,
-        # An activity is the main agent, which sits in no seat. Passes recorded
+        # An activity is the unit director, which sits in no seat. Passes recorded
         # before the field existed also read empty, and land in the same place:
         # a row of their own rather than a seat's column.
         slot="" if event_type != "pass_started" else _record_slot(event),
@@ -2061,7 +2061,7 @@ def _live_windows(state: dict[str, object], now: float) -> list[StageWindow]:
     has an activity whose start event predates activity identity, so state is
     the only source that always knows what is running. A phase team runs a
     launcher per slot and each opens its own pass, so this is a row apiece; the
-    main agent's activity is the running window only when no pass is open at
+    unit director's activity is the running window only when no pass is open at
     all, which is what makes verification a row and never a second one beside a
     dispatch.
     """
@@ -2283,7 +2283,7 @@ def _finding_tally(
 ) -> FindingTally:
     """What the ledger recorded between one window opening and the next.
 
-    Findings are opened, dispatched, and settled by the main agent in the gap
+    Findings are opened, dispatched, and settled by the unit director in the gap
     after a window closes, so the interval that starts at a window and ends at
     its successor is what attributes them to the pass that produced them.
 
@@ -2596,7 +2596,7 @@ def _gate_report(
 ) -> tuple[str, list[str]]:
     """One verification block's Result cell, and the gate notes under the table.
 
-    A block is a run of consecutive main-agent activities sharing a label: the
+    A block is a run of consecutive unit-director activities sharing a label: the
     phase gates, run one command at a time. Each distinct command is one gate,
     and a window repeating an earlier command is the same gate run again after
     a repair -- one line telling fail-then-pass is the story, where a row per
@@ -2637,7 +2637,7 @@ def _gate_report(
             failing += 1
             lines.append(f"  - ✗ {text} · {_compact_duration(last['elapsed'])} failed")
     count = len(gates)
-    header = f"- **{label}** (main agent) · {count} gate{'s' if count > 1 else ''}:"
+    header = f"- **{label}** (unit director) · {count} gate{'s' if count > 1 else ''}:"
     if live_position:
         summary = f"gate {live_position} running"
     else:
@@ -2666,7 +2666,7 @@ class RoundEntry(TypedDict):
     label: str
     started_at: float
     # The round these seats worked, and None for a window that sits in no round:
-    # a main-agent activity, or a pass from a run that recorded no seat at all.
+    # a unit-director activity, or a pass from a run that recorded no seat at all.
     # The distinction picks the row's finding attribution, which is the whole
     # reason the two shapes stay separable rather than being forced into one.
     number: int | None
@@ -2679,7 +2679,7 @@ def _round_entries(windows: list[StageWindow], labels: list[str]) -> list[RoundE
     A round is the unit that advances -- it is dispatched, it lands, and the
     ledger stamps it on every finding it produces -- so it is the row, and the
     seats working it read across as columns. Everything else keeps a row
-    of its own: verification is the main agent between rounds, in no seat and in
+    of its own: verification is the unit director between rounds, in no seat and in
     no round, and a solo run records no seat at all, so both render one window
     per row exactly as they did before the phase team existed.
     """
@@ -3031,7 +3031,7 @@ def _round_table(
     rows: list[list[str]] = []
     gate_lines: list[str] = []
     for group in shown:
-        # A stage of two or more main-agent activities is a verification block:
+        # A stage of two or more unit-director activities is a verification block:
         # the gates of the phase, run one command at a time. One row for the
         # block, with the gate-by-gate story -- which command, what happened,
         # retries folded into their gate -- in the notes under the table, where
@@ -3141,7 +3141,7 @@ def _delegate_note(
 
     It goes under the table rather than into it -- one answer per seat, not per
     row, and a column repeating it down every row would crowd out the roles. The
-    main agent is left out; the reader is the main agent. So is a seat the
+    unit director is left out; the reader is the unit director. So is a seat the
     table draws no column for: the review seat's board line outlives the phase
     that seated it, and a line with no column above it names nothing on screen.
     """
@@ -3460,7 +3460,7 @@ def _progress(args: argparse.Namespace) -> None:
     state = _ensure_project_timing(session_dir, _read_state(session_dir), now)
     phase = _object_dict(state.get("phase"))
     # The reported window is a launcher's pass when one is open, and otherwise
-    # the main agent's activity. Both render the same third header line; only a
+    # the unit director's activity. Both render the same third header line; only a
     # pass carries convergence meaning. Which pass, when a phase team has two
     # of them open, is `_reporting_pass`; the stage table below the header is
     # where the other is visible.
@@ -4000,7 +4000,7 @@ def _build_parser() -> argparse.ArgumentParser:
     _ = finish_pass.add_argument(
         "--orphaned-launcher",
         action="store_true",
-        help="close this slot's open pass when the orchestrator killed its "
+        help="close this slot's open pass when the unit director killed its "
         + "launcher (--status canceled only)",
     )
     _ = finish_pass.add_argument(

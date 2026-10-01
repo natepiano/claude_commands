@@ -8,7 +8,7 @@
 # A repair seat -- slot impl, kind fix -- is `<project>-fix`.
 #
 # One script owns the rule because two callers need it: implement.sh launches
-# the seat under this name, and the orchestrator writes it into the peer's
+# the seat under this name, and the unit director writes it into the peer's
 # prompt before that launch. Two copies of the rule would drift, and a peer
 # told the wrong name sends into nothing.
 #

@@ -386,7 +386,7 @@ def _normalize(
         seconds = _integer(event.get("activity_elapsed_seconds"))
         started = _number(event.get("activity_started_at"))
         # 246 of these are label-less dispatches carrying the called agent and
-        # task; `main_agent` on them is the orchestrator that dispatched the
+        # task; `main_agent` on them is the unit director that dispatched the
         # work, not whoever did it.
         agent = _agent_label(event, "called_agent") or _agent_label(event, "main_agent")
         task = _clean_task(_string(event.get("called_task")))
@@ -720,7 +720,7 @@ def _cmd_stages(args: argparse.Namespace) -> None:
 
 
 def _test_outcome(text: str) -> str:
-    """pass, fail, or other, from whatever the orchestrator wrote as a result.
+    """pass, fail, or other, from whatever the unit director wrote as a result.
 
     The word boundary is the whole rule: a substring match read
     `refusal, bypass and recovery all correct` as a pass, out of `bypass`.

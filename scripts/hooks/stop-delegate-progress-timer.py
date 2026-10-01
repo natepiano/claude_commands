@@ -12,8 +12,8 @@ and no timer pending, and says which to fix.
 
 Live work is judged from what the run itself writes, not from the heartbeat
 alone: `delegate_working` keys on heartbeat freshness, so it sees launcher
-dispatches and misses the main agent's own verification, smoke, and style runs --
-exactly the case that goes unreported.
+dispatches and misses the unit director's own verification, smoke, and style
+runs -- exactly the case that goes unreported.
 
 Blocking is once-only, latched on this hook's own marker rather than on the
 shared `stop_hook_active` flag. That flag is set by any stop hook that blocks, so

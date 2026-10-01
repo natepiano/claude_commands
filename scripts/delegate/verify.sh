@@ -6,7 +6,7 @@
 # compiles examples, so every dev-loop subcommand pins explicit targets
 # (--lib/--bins/--tests). Nothing below `final` compiles examples or uses
 # --all-targets (mend excepted, see `lint`); `final` is the plan-final full
-# gate, run by the orchestrator, never by a phase delegate.
+# gate, run by the unit director, never by a phase delegate.
 #
 # Package selection is always --workspace, with default features. Cargo
 # resolves features per invocation from the selected packages, so `-p <pkg>`
@@ -79,7 +79,7 @@
 #   verify.sh example-test <package> <name>
 #                                          test one example (only when the
 #                                          example contains unit tests)
-#   verify.sh final                        full workspace gate (orchestrator only)
+#   verify.sh final                        full workspace gate (unit director only)
 #
 # Invocation policy — canonical flags, lint.conf gating, sandbox-failure
 # detection — lives in scripts/lint/invoke.sh, the
@@ -390,7 +390,7 @@ cache_record() {
     fi
     mv -f "${RUN_LOG}" "${CACHE_DIR}/${key}.log"
     printf '`verify.sh %s` passed %s, run by %s\nsaved_s=%d\n' "$CMD${ARGS[*]:+ ${ARGS[*]}}" \
-        "$(date '+%Y-%m-%d %H:%M:%S')" "${PLAN_DELEGATE_TEAM_ROLE:-the orchestrator}" \
+        "$(date '+%Y-%m-%d %H:%M:%S')" "${PLAN_DELEGATE_TEAM_ROLE:-the unit director}" \
         "${repeat}" > "${CACHE_DIR}/${key}.pass.tmp"
     mv -f "${CACHE_DIR}/${key}.pass.tmp" "${CACHE_DIR}/${key}.pass"
 }
@@ -422,9 +422,9 @@ if cache_lookup; then
 fi
 
 # Open a progress window for the duration of this run when a delegate session is
-# in scope. This is what the orchestrator's progress header reports against while
-# the main agent runs verification itself: an activity, not a pass, so
-# findings.py never counts it toward convergence. The launcher-owns-its-own-pass
+# in scope. This is what the unit director's progress header reports against
+# while it runs verification itself: an activity, not a pass, so findings.py
+# never counts it toward convergence. The launcher-owns-its-own-pass
 # rule applies here too — the thing that runs the work opens the window.
 PROGRESS_HISTORY="${HOME}/.claude/scripts/delegate/progress_history.py"
 ACTIVITY_SESSION_DIR="${PLAN_DELEGATE_SESSION_DIR:-}"

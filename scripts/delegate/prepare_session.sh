@@ -12,7 +12,7 @@
 # strand the run. end_session.sh removes it.
 #
 # First it removes every seat a dead run left alive (remove_seats.py), so a run
-# whose orchestrator died before its own cleanup never outlives the next start.
+# whose unit director died before its own cleanup never outlives the next start.
 #
 # Prints the session directory path to stdout (last line) for the caller to capture.
 

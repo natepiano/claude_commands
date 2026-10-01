@@ -67,9 +67,9 @@ class ProgressHistoryTests(unittest.TestCase):
         )
 
     def isolate_identity(self, environment: dict[str, str]) -> None:
-        """Point main-agent detection at the temporary home, not this machine's.
+        """Point unit-director detection at the temporary home, not this machine's.
 
-        Every window opening re-detects the orchestrator, and left alone that
+        Every window opening re-detects the unit director, and left alone that
         reads the real session transcript, so the recorded identity would be
         whichever model happens to be running the tests.
         """
@@ -979,7 +979,7 @@ class ProgressHistoryTests(unittest.TestCase):
         """The reader joins on finished events, so the seat has to survive there.
 
         Taken from the pass record rather than the environment: the phase ends
-        under the main agent, which holds no seat at all, and the pass it closes
+        under the unit director, which holds no seat at all, and the pass it closes
         still has to name the member that opened it.
         """
         self.team_slot = "review"
@@ -1292,7 +1292,7 @@ class ProgressHistoryTests(unittest.TestCase):
                 )
             ],
         )
-        # The main agent holds no slot, so its report names the window that
+        # The unit director holds no slot, so its report names the window that
         # opened first rather than the one that opened last.
         self.assertIn("▸ **Impl - implementing**", header)
 
@@ -1414,7 +1414,7 @@ class ProgressHistoryTests(unittest.TestCase):
             ],
         )
         # Which delegate is in which seat sits under the table, once, and the
-        # main agent is left out of it -- the reader is the main agent. Each
+        # unit director is left out of it -- the reader is the unit director. Each
         # seat carries its last board line and that line's age, because a role
         # alone -- and an open pass window, which grows either way -- cannot say
         # whether a seat is working or has been silent since it took the role.
@@ -1501,7 +1501,7 @@ class ProgressHistoryTests(unittest.TestCase):
         finished_at: int | None,
         passed: bool = True,
     ) -> None:
-        """One verification command, recorded the way the orchestrator runs it."""
+        """One verification command, recorded the way the unit director runs it."""
         _ = self.run_command(
             "start-activity",
             "--session-dir",
@@ -1529,7 +1529,7 @@ class ProgressHistoryTests(unittest.TestCase):
         """Gates run one command at a time, and a row per command was noise.
 
         The pattern a live run rendered as seven anonymous rows: two gates
-        fail, the orchestrator repairs, the reruns pass. One row tells the
+        fail, the unit director repairs, the reruns pass. One row tells the
         block's outcome; the notes under the table name each gate, with a
         retry folded into the gate it reran rather than listed as a fresh one.
         """
@@ -1555,7 +1555,7 @@ class ProgressHistoryTests(unittest.TestCase):
             [("Verification", "3m", "-", "-", "gate 6 running")],
         )
         for line in (
-            "- **Verification** (main agent) · 6 gates:",
+            "- **Verification** (unit director) · 6 gates:",
             "  - ✗→✓ test hana · 30s failed · passed on rerun 1m",
             "  - ✓ test hana_catalyst · 5s",
             "  - ✓ test hana_catalyst identity · 2s",
@@ -1586,7 +1586,7 @@ class ProgressHistoryTests(unittest.TestCase):
             [(row[0], row[5]) for row in rows],
             [("Verification", "1 failed, reran clean"), ("Review", "running")],
         )
-        self.assertIn("- **Verification** (main agent) · 2 gates:", header)
+        self.assertIn("- **Verification** (unit director) · 2 gates:", header)
 
     def test_a_second_round_is_a_second_row(self) -> None:
         """A repair round is a row of its own, named by the number it carries."""
@@ -2132,7 +2132,7 @@ class ProgressHistoryTests(unittest.TestCase):
         for slot, elapsed, status in reviews:
             self.finish_slot_pass(session_dir, slot, status, base + 3_100 + elapsed)
         self.team_slot = ""
-        # The UX helper's 350 s counts; the main agent's other work does not.
+        # The UX helper's 350 s counts; the unit director's other work does not.
         for label, opened, closed in (("UX review", 4_400, 4_750), ("Verify", 4_800, 5_300)):
             _ = self.run_command(
                 "start-activity", "--session-dir", str(session_dir),
@@ -2499,7 +2499,7 @@ class ProgressHistoryTests(unittest.TestCase):
         self.assertIn("*Earlier: 3 stages not shown - Impl through Fix 1.*", header)
         # A slotless pass is drawn in the seat its kind names -- the closure
         # review under Agent 2, the seat that reviews, where a reader looks for
-        # it -- and a main-agent activity names no seat and keeps both dashes.
+        # it -- and a unit-director activity names no seat and keeps both dashes.
         self.assertEqual(
             [tuple(row[3:5]) for row in rows],
             [
@@ -2510,7 +2510,7 @@ class ProgressHistoryTests(unittest.TestCase):
         )
         self.assertIn("▸ **Review 3 - checking the remaining plan against what shipped**", header)
         # Which agent ran each window is the `timeline` view's question, and the
-        # main agent ran verification itself, so that row has no delegate there.
+        # unit director ran verification itself, so that row has no delegate there.
         stage_rows = self.table_rows(
             self.run_command(
                 "timeline",
@@ -2811,7 +2811,7 @@ class ProgressHistoryTests(unittest.TestCase):
         self.assertIn("recorded no phase 9", missing.stderr)
 
     def test_a_window_picks_up_the_main_agent_changing_mid_run(self) -> None:
-        """`start-run` detects the orchestrator once, and it can change after."""
+        """`start-run` detects the unit director once, and it can change after."""
         started_at = 90_000
         session_dir = self.start_run("switched", started_at)
         transcript = self.root / ".claude" / "projects" / "demo" / "session-9.jsonl"

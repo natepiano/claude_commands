@@ -74,7 +74,7 @@ table|json|csv`. Beyond those:
   role: a seat's role changes within a run — all three implementing, then all
   three testing, any mix — so this names the chair, and `stage` names the work.
   It does not yet make a team phase visible. The recorder can now hold one open
-  pass per seat, but the orchestrator still hands `pass_kind` to a single
+  pass per seat, but the unit director still hands `pass_kind` to a single
   member, so `slot` names which member that was and the other two stay
   uncounted
 - `tests` — `--label`, `--agent`, `--raw` (it pins `stage=test` itself)

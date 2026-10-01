@@ -4,7 +4,7 @@
 #
 # Why a file and not messages: the agents of a phase may be codex
 # processes, which have no ListAgents/SendMessage tool at all, and the
-# orchestrator is asleep between progress ticks so it cannot relay. A file in
+# unit director is asleep between progress ticks so it cannot relay. A file in
 # the shared session directory is the one channel every family can both write
 # and read, and every post is a broadcast -- reaching all peers and the wrapper
 # at once -- rather than N-1 point-to-point sends that can each fail.
@@ -87,7 +87,7 @@ flatten() {
 # leaving the kinds here would give a delegate two ways to ask one question,
 # with the board's way being the one nobody is listening on. Every kind that
 # remains is a record something later reads back: the progress table, a peer
-# resuming hours on, or the orchestrator at its next tick.
+# resuming hours on, or the unit director at its next tick.
 valid_kind() {
   case "$1" in
     register|claim|release|status|blocked|handoff|done) return 0 ;;

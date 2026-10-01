@@ -917,9 +917,9 @@ def _in_flight_round(state: dict[str, object]) -> dict[str, object] | None:
 def _landed(args: argparse.Namespace) -> None:
     """Promote an in-flight round to review after its worker exited cleanly.
 
-    `implement.sh` calls this, not the orchestrator, for the same reason the
+    `implement.sh` calls this, not the unit director, for the same reason the
     launcher owns its own pass records: the launcher is the only party that
-    watches the worker exit. An orchestrator can be killed, compacted, or simply
+    watches the worker exit. A unit director can be killed, compacted, or simply
     distracted between the repair finishing and the ledger hearing about it, and
     every one of those gaps used to resolve as "fixed".
 

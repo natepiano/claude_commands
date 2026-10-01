@@ -21,7 +21,7 @@
 #   implementer is still running, so its start-pass is deferred until this
 #   sentinel appears (the recorder closes any active pass as interrupted when
 #   a new one starts, and the implementation pass is still open at launch).
-#   The orchestrator creates the sentinel after the implementation pass has
+#   The unit director creates the sentinel after the implementation pass has
 #   finished and the final diff is written.
 #
 # Produces (every name below takes a `_<lens>` suffix when a lens is given):
@@ -102,7 +102,7 @@ FINDINGS_FILE="${SESSION_DIR}/review_findings_${PASS_INDEX}${SUFFIX}.txt"
 STATUS_FILE="${SESSION_DIR}/review_status${SUFFIX}"
 LOG_FILE="${SESSION_DIR}/review_agent_${PASS_INDEX}${SUFFIX}.log"
 
-# Every reader of the unnumbered paths — the orchestrator's mid-run preemption
+# Every reader of the unnumbered paths — the unit director's mid-run preemption
 # read, the heartbeat digest — keeps working while the per-pass history is kept.
 ln -sfn "review_findings_${PASS_INDEX}${SUFFIX}.txt" "${SESSION_DIR}/review_findings${SUFFIX}.txt"
 ln -sfn "review_agent_${PASS_INDEX}${SUFFIX}.log" "${SESSION_DIR}/review_agent${SUFFIX}.log"
