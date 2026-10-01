@@ -35,6 +35,12 @@
       ]
     },
     {
+      "root": "scripts/message",
+      "extraPaths": [
+        "scripts/message"
+      ]
+    },
+    {
       "root": "scripts/banned_word_analysis",
       "extraPaths": [
         "scripts/banned_word_analysis",
