@@ -233,7 +233,7 @@ context size from its pane footer (`<session> | 157,352 | <model>`). When a
 unit is at 150,000 tokens or more and idle, type `/compact` into it:
 `tmux send-keys -t <session> -l "/compact"`, then `Enter` as a separate call.
 Idle means no spinner line (`✶ Doing… (12s …)`), nothing after `❯` except a
-ghost suggestion, and no form, permission prompt or menu on screen. A unit
+ghost suggestion (dim: `tmux capture-pane -e` shows `\e[2m` before it), and no form, permission prompt or menu on screen. A unit
 whose background seats are still running counts as idle, because it is only
 waiting on them. Never compact a unit that is mid-turn or showing a form.
 Log each one, with the unit's token count. (User, 2026-09-30.)
