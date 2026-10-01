@@ -5,6 +5,20 @@ the single source for that guidance: imported by `~/.claude/CLAUDE.md` for every
 session, and by `/unit:delegate` and `/team_review`, where it also defines the
 `<DecisionEconomy/>` contract. Related memories hold only provenance and point here.
 
+<ThreeGods>
+Simplicity, speed and beauty are the three gods, in the app and in the code.
+Correctness is the floor beneath them: a wrong result is never simple, fast or
+beautiful. When two conflict, they rank in that order. User rule 2026-10-01.
+
+| | In the app | In the code |
+| --- | --- | --- |
+| Simplicity | Few things on screen, simple words, one way to do a thing. | Few concepts, a small public API, no layer without a reason. |
+| Speed | Responds at once; nothing waits, stutters or settles slowly. | No wasted work where code runs often; any cost added is named. |
+| Beauty | Polished and professional: even spacing, one style, nothing clipped. | Reads cleanly: the right names, one idiom, the style guide followed. |
+
+Every writer builds to them, and every reviewer judges by them.
+</ThreeGods>
+
 <DecisionEconomy>
 If a decision has an obviously better answer, take it, record the choice where
 the decision lived, and do not ask the user.
@@ -17,11 +31,12 @@ These categories are already decided and never reach the user:
   premium, flawless one is always the answer — nothing less is acceptable, for
   the user or for the next agent reading the code. Complexity you struggle to
   hold is complexity that will defeat a future agent debugging it.
-- **Ranking.** Correctness, then simplicity and ergonomics, then speed. Cost of
+- **Ranking.** Correctness, then the three gods in order (<ThreeGods/>):
+  simplicity (ergonomics included), speed, beauty. Cost of
   the work never breaks the tie — a phase splits easily, complexity never does.
 - **Packaging of committed work.** How work already committed to gets divided,
   ordered, or numbered is never the user's decision. Split an oversized phase,
-  merge two that are really one, move a seam, resequence, renumber — decide it,
+  merge two that are really one, move where one phase ends, resequence, renumber — decide it,
   state it in one line, continue. The test is a single question: *does the
   finished deliverable behave differently under the two options?* If not, there
   is no decision to bring, only a plan to update. Asking here reads as deference
