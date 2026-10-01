@@ -44,5 +44,5 @@ Same semantics, different mechanisms, and only the mechanism matters when readin
 
     If any master is running, **ask the user (AskUserQuestion) whether to close them now** — name the hosts, and that closing costs one new connection setup on next use while leaving them holds the old window for up to that long. On yes, close each with `ssh -O exit <host>` (or the explicit `ControlPath` form), re-check, and report each gone. If none are open, say so in one line.
 
-    **STEP 7:** If STEP 2 chose both machines, message the other machine's session (SendMessage, after ListAgents for its name) to pull and rebuild, naming the commit and what derives from it on *that* platform. Log it with `inbox add <name> <text>` and commit `docs/inbox/natedev.md`. If that session is unreachable, tell the user the machine still needs a pull and rebuild by hand.
+    **STEP 7:** If STEP 2 chose both machines, message the other machine's standing session (/message) to pull and rebuild, naming the commit and what derives from it on *that* platform. If that session is unreachable, tell the user the machine still needs a pull and rebuild by hand.
 </ExecutionSteps>

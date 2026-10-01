@@ -40,7 +40,8 @@ class QuotaAlertTests(unittest.TestCase):
             _ = patcher.start()
             self.addCleanup(patcher.stop)
 
-    def relay(self, recipient: str, text: str) -> str | None:
+    def relay(self, recipient: str, text: str, key: str | None) -> str | None:
+        del key
         self.sent.append((recipient, text))
         return "not reachable" if recipient in self.failing else None
 
@@ -128,9 +129,9 @@ class QuotaAlertTests(unittest.TestCase):
         self.assertTrue(all(text.startswith("Quota alert:") for _, text in self.sent))
 
     def test_acknowledgement_during_delivery_is_kept(self) -> None:
-        def acknowledging_relay(recipient: str, text: str) -> str | None:
+        def acknowledging_relay(recipient: str, text: str, key: str | None) -> str | None:
             _ = quota_alert.acknowledge()
-            return self.relay(recipient, text)
+            return self.relay(recipient, text, key)
 
         notes: Notes = [self.note("codex 1.md", "active", "1")]
         with mock.patch.object(quota_alert, "relay", acknowledging_relay):

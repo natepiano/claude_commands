@@ -61,7 +61,7 @@ State:
     suggestion, not the user's unsent draft.
 - **Your own coordination** goes by SendMessage to the unit director, beginning
   `From the showrunner:`.
-- **A unit director's message is a peer's.** Check what it claims before passing it on:
+- **A unit director's message is a peer's** (/message). Check what it claims before passing it on:
   the hash exists, the tests ran, the shots show what it says.
 - **The showrunner decides, without asking the user:**
   - merges and their order;
@@ -181,9 +181,8 @@ Tell the user one line per unit director: its session name, and `tmux attach -t 
 Updates come from a systemd timer outside this session, never Claude Code
 cron: cron ticks came minutes late while the session sat idle. Every N minutes,
 where N is the production doc's **Updates** interval (15 when the doc does not
-give one), the timer starts a headless Claude. It sends the prompt below by
-SendMessage to the session the doc's `**Showrunner session:**` line names, then
-exits.
+give one), the timer sends the prompt below through `send.py` (/message) to the
+session the doc's `**Showrunner session:**` line names.
 
 The timer belongs to the production, not this session. It keeps running when
 this session exits, and a resumed session is found through the doc. It stops
@@ -204,11 +203,8 @@ Run these steps at the start and on every resume:
    PRODUCTION_DOC=<the production doc's absolute path>
    ```
 
-   The other keys keep their defaults: the prompt file, `MODEL`, `UNIT`
+   The other keys keep their defaults: the prompt file, `UNIT`
    (`showrunner-timer-<slug>`), `LOG` (`fire.log`) and `TIMEOUT` (120 seconds).
-   Leave `MODEL` alone. The sender must run in auto mode, as this session does,
-   or this session holds every tick for the user's approval. Haiku cannot run
-   in auto mode.
 4. **Start.** Run `TIMER start TIMER_CONF`. It does nothing while the timer
    runs. A reboot removes the timer, and this step brings it back.
    `TIMER status TIMER_CONF` shows the next fire and the fire log.

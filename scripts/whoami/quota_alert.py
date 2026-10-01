@@ -18,9 +18,10 @@ Whatever the user does is echoed by tell_others() to every configured session
 except the one they did it in, found from this process's ancestry, so a session
 holding an alert learns it is settled without the user repeating it.
 
-Delivery is a headless `claude -p` run, because the session-to-session channel is
-a tool, not a command. Messages carry note names, never logins: a recipient's
-inbox log can be committed.
+Delivery goes through ~/.claude/scripts/message/send.py as the sender
+`quota_alert`; a recipient it cannot reach has the message queued there, the
+latest per alert. Messages carry note names, never logins: a recipient's inbox
+log can be committed.
 """
 
 from __future__ import annotations
@@ -39,12 +40,14 @@ from typing import NamedTuple, NotRequired, Protocol, TypedDict, cast
 
 CONFIG = Path(__file__).with_name("quota_alert.json")
 STATE = Path(os.environ.get("XDG_STATE_HOME") or Path.home() / ".local" / "state") / "quota_alert.json"
-CLAUDE = Path.home() / ".local" / "bin" / "claude"
+SEND = Path(__file__).resolve().parent.parent / "message" / "send.py"
 SESSIONS = Path.home() / ".claude" / "sessions"
 PROTOCOL = Path.home() / ".claude" / "docs" / "quota_alerts.md"
 # One relay took 9 s when measured. The snapshot timer gives agent_notes.py 60 s in
-# all, and the relays run in parallel, so one timeout bounds the whole alert.
+# all, and the relays run in parallel, so one timeout bounds the whole alert:
+# send.py stops a relay at --timeout and kills it KILL_GRACE seconds later.
 RELAY_TIMEOUT = 40
+KILL_GRACE = 10
 
 
 class Config(TypedDict):
@@ -196,30 +199,30 @@ def restored_message(accounts: list[AgentNote], reason: str, threshold: float) -
     ])
 
 
-def relay(recipient: str, text: str) -> str | None:
+def relay(recipient: str, text: str, key: str | None) -> str | None:
     """Deliver text to one session; None when it arrived, otherwise why not."""
-    prompt = ('Load SendMessage with ToolSearch "select:SendMessage", then call it once with '
-              + f'to={json.dumps(recipient)}, summary="quota alert", and as message the text between '
-              + "the BEGIN and END lines, verbatim. Then print exactly SENT if the call succeeded, "
-              + f"or FAILED: and the error.\nBEGIN\n{text}\nEND")
+    command = [sys.executable, str(SEND), "--to", recipient, "--from", "quota_alert",
+               "--timeout", str(RELAY_TIMEOUT - KILL_GRACE), *(["--key", key] if key else [])]
     try:
-        done = subprocess.run([str(CLAUDE), "-p", "--model", "haiku", "--allowedTools", "SendMessage,ToolSearch"],
-                              input=prompt, capture_output=True, text=True, timeout=RELAY_TIMEOUT,
-                              cwd=Path.home(), check=False)
+        done = subprocess.run(command, input=text, capture_output=True, text=True, timeout=RELAY_TIMEOUT + 5,
+                              check=False)
     except (subprocess.TimeoutExpired, OSError) as error:
         return str(error)
-    answer = done.stdout.strip()
-    if done.returncode == 0 and answer.splitlines()[-1:] == ["SENT"]:
+    if done.returncode == 0:
         return None
-    return " ".join((answer or done.stderr.strip() or f"exit {done.returncode}").split())
+    return " ".join((done.stdout.strip() or done.stderr.strip() or f"exit {done.returncode}").split())
 
 
 def deliver(jobs: list[Job]) -> list[str | None]:
-    """Relay every job in parallel; one error or None per job, in order."""
+    """Relay every job in parallel; one error or None per job, in order.
+
+    A job's key keeps one queued copy per alert for a recipient that is not running.
+    """
     if not jobs:
         return []
+    keys = [f"quota {job.kind} {job.name}" if job.name else None for job in jobs]
     with ThreadPoolExecutor() as pool:
-        return list(pool.map(relay, [job.recipient for job in jobs], [job.text for job in jobs]))
+        return list(pool.map(relay, [job.recipient for job in jobs], [job.text for job in jobs], keys))
 
 
 def alert(notes: list[AgentNote], now: datetime | None = None) -> list[str]:
