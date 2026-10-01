@@ -147,7 +147,7 @@ def window_start(now: datetime) -> datetime:
 
 
 def draw(now: datetime, rows: list[Row]) -> list[str]:
-    """24 hourly cells: white from the phase's start (or the left edge) to the ETA, green at the earliest time, red at the latest; `→` past the right edge."""
+    """24 hourly cells: white from the phase's start (or the left edge) to the ETA, green at the earliest time, red at the latest; `→` past the right edge; a start before the left edge is written out after the times."""
     start = window_start(now)
 
     def column(moment: datetime) -> int:
@@ -183,6 +183,8 @@ def draw(now: datetime, rows: list[Row]) -> list[str]:
         span = f"{estimate.eta:%H:%M}"
         if ranged:
             span += f" ({estimate.earliest:%H:%M}–{estimate.latest:%H:%M})"
+        if column(estimate.started) < 0:
+            span += f", started {estimate.started:%b-%d %H:%M}"
         lines.append(f"{row.name:<{ROW_LABEL_WIDTH}}{''.join(cells).rstrip()}{arrow} {span}")
     return lines
 
