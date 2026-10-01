@@ -203,9 +203,10 @@ branch, port and the files you own.
     one of these: `— blocked: waiting on the showrunner: <unit> <what>`. A wait
     on the user never mentions the showrunner, so the showrunner's status script
     can tell the two apart.
-11. **Updates.** Each progress update is the recorder's `Phase <N> ETA: <time>, <P>% done`
-    (P is the phase row's `%` in the recorder's summary) and the turn-end line,
-    nothing more. The showrunner converts times into the
+11. **Updates.** Each progress update is the recorder's `Phase <N> ETA: <time>,
+    <P>% done (range <low>–<high>)` (P is the phase row's `%` and the range its
+    ETA low and high in the recorder's summary) and the turn-end line, nothing
+    more. The showrunner converts times into the
     user's zone. When the showrunner asks for `/unit:eta`, run it at once.
 12. **Visual choices go to the showrunner.** Wording, spacing, layout, and
     which of two working options looks better are the showrunner's calls, made

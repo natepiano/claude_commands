@@ -156,7 +156,8 @@ director's own handoff may list only the work in front of it.
   cells, labelled every three hours, with `▼` at now. It opens six hours before
   the three-hour mark at or before now. Each row is white from the phase's
   start (or the left edge, when it started earlier) to the ETA, with a green
-  cell at the earliest time and a red cell at the latest; `→` means the latest
+  cell at the earliest time and a red cell at the latest (no green or red
+  without a range); `→` means the latest
   runs past the right edge; `?` means no ETA. User, 2026-10-01.
 - **Last line:** `next run at 20:10 - nothing needed` when no subject has a
   `needed:`, `next run at 20:10` when one does, or `no run scheduled` without a

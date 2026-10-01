@@ -174,12 +174,14 @@ def draw(now: datetime, rows: list[Row]) -> list[str]:
         first = max(0, column(estimate.started))
         for index in range(first, min(column(estimate.eta), last) + 1):
             cells[index] = WHITE
-        if column(estimate.earliest) <= last:
+        ranged = (estimate.earliest, estimate.latest) != (estimate.eta, estimate.eta)
+        if ranged and column(estimate.earliest) <= last:
             cells[max(0, column(estimate.earliest))] = GREEN
-        cells[max(0, min(column(estimate.latest), last))] = RED
+        if ranged:
+            cells[max(0, min(column(estimate.latest), last))] = RED
         arrow = "→" if column(estimate.latest) > last else ""
         span = f"{estimate.eta:%H:%M}"
-        if (estimate.earliest, estimate.latest) != (estimate.eta, estimate.eta):
+        if ranged:
             span += f" ({estimate.earliest:%H:%M}–{estimate.latest:%H:%M})"
         lines.append(f"{row.name:<{ROW_LABEL_WIDTH}}{''.join(cells).rstrip()}{arrow} {span}")
     return lines
