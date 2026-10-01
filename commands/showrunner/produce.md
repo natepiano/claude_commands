@@ -545,11 +545,15 @@ landing rule in <ProductionUnit/> defines them, send:
 
 `From the showrunner: <waiting unit> waits on your phase <N> (G<k>). Apply the landing rule: finish this round, move the new edge cases to a follow-up phase, checkpoint.`
 
-Defects users can see are never deferred. Log the call.
+Before the hard landing, defects users can see are never deferred. Log the call.
 
-From a phase's third repair round on, its unit director applies the landing
-rule without a call (`production_format.md` → <ProductionUnit/> item 7, user
-2026-10-01). Send the call only to land a phase sooner.
+From a phase's third repair round on, its unit director applies the hard
+landing without a call: only regressions, broken function and failing tests
+or gates stay in the phase; every other finding, visible ones included, moves
+to the follow-up phase (`production_format.md` → <ProductionUnit/> item 7, user
+2026-10-01: eleven rounds on one phase is way too many). Send the call only to
+land a phase sooner. Each design check covers every view of the change at once
+(item 3), so findings come in one batch.
 </LandingCall>
 
 ---

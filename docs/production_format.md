@@ -150,7 +150,9 @@ branch, port and the files you own.
    A phase that changes what users see, in the app or in any example,
    includes shots from a real window at
    normal size on your port. They show each changed state, including the ones
-   the phase fixed. Then continue to the next phase; do not wait for the merge
+   the phase fixed. The first set covers every tool, side and state the change
+   reaches, so the design check finds the defects in one batch, not one per
+   round. Then continue to the next phase; do not wait for the merge
    unless that phase has a gate.
 4. **The merge branch is the showrunner's.** Never merge into it or push it.
    <PeriodicCI/> and <CICleanup/> do not run in a unit; the showrunner runs CI
@@ -187,8 +189,13 @@ branch, port and the files you own.
      Finish the round in flight, write the follow-up phase with its own Work
      Order, inserted after this one per `/plan:to_phased_plan` →
      <PhaseNumbering/>, then checkpoint.
+   - **Hard landing** (user, 2026-10-01: eleven repair rounds on one phase is
+     way too many). From the third repair round on, a finding stays in the
+     phase only when it is a regression the phase caused, breaks something
+     that worked, or fails a test or gate. Every other finding moves to the
+     follow-up phase, however visible, open since round 1 or found this round.
 
-   Everything else is fixed before the checkpoint, with no cap on rounds. This is packaging under
+   Before the hard landing, everything else is fixed before the checkpoint. This is packaging under
    `<DecisionEconomy/>`, so it never goes to the user as a question. State it
    in one line.
 8. **Changes from other units.** When the showrunner reports that a public item
