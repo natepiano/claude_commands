@@ -117,7 +117,7 @@ def offer(now: datetime, here: Callable[[], str | None] = current_session) -> st
 
 
 ASK = ("Before anything else this turn, ask the user once whether they want to see {what} now or defer it, "
-       "and show it only on yes. On defer, change its ledger line's `— proposed` to `— deferred` "
+       "and on yes present it with /nightly_next. On defer, change its ledger line's `— proposed` to `— deferred` "
        "(/watcher, nightly review rule).")
 
 

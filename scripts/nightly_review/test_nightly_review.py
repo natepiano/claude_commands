@@ -124,7 +124,7 @@ class NightlyReviewTests(unittest.TestCase):
         context = nightly_review.offer(MORNING, lambda: "natedev") or ""
         self.assertIn("Deferred earlier: 2026-09-28 rust/hana: Warm runners.", context)
         self.assertNotIn("Old one", context)
-        self.assertIn("see it and the deferred proposals now or defer it, and show it only on yes", context)
+        self.assertIn("see it and the deferred proposals now or defer it, and on yes present it with /nightly_next", context)
         self.assertIn("change its ledger line's `— proposed` to `— deferred`", context)
 
     def test_offer_asks_about_deferred_on_a_skipped_night(self) -> None:
