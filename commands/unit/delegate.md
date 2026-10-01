@@ -1609,8 +1609,9 @@ repairs.
 
 A repair runs **one seat**: slot `impl`, task and kind `fix`. It makes the
 repair and writes, for each testable finding, the regression test that would
-have caught it — one that fails without the repair — naming each test against
-its id in its summary. <ClosureReview/> is the cold read, so no seat is spent
+have caught it — one that fails without the repair. It names each test for the
+behavior it pins and puts the finding id only in its summary; an id in code
+outlives the review that defined it. <ClosureReview/> is the cold read, so no seat is spent
 on one here. Its file set is the findings' files plus the test targets.
 
 Run `findings.py dispatch --covers <all batch ids>` before launching, then:
