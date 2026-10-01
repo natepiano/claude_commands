@@ -170,5 +170,5 @@ For every length:
 - Say "you" for the user.
 - Do no other work in this turn, except the `/unit:eta` requests, the two
   steps in Status check and clock, acting on a BLOCK past its limit
-  (`/showrunner:produce` → Dependencies, rule 4), and compacting an idle unit
-  (`/showrunner:produce` → Compact idle units).
+  (`/showrunner:produce` → Dependencies, rule 4), and compacting a unit after
+  its checkpoint (`/showrunner:produce` → Compact after a checkpoint).

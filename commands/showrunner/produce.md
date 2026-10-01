@@ -222,21 +222,27 @@ The prompt:
 > the user must do. Do no other work in this turn, except `/unit:eta` requests,
 > merging a unit's checkpoint after viewing its shots, acting on a BLOCK
 > past its limit (`/showrunner:produce` → Dependencies, rule 4), and compacting
-> an idle unit (`/showrunner:produce` → Compact idle units).
+> a unit after its checkpoint (`/showrunner:produce` → Compact after a
+> checkpoint).
 
 **A tick** arrives as a cross-session message from the timer's `UNIT`, and its
 text starts `Scheduled update`. Treat it exactly as the scheduled prompt: it
 is the update tick, not a peer's message. Do not reply to it.
 
-**Compact idle units.** On every tick and every dailies, read each unit's
-context size from its pane footer (`<session> | 157,352 | <model>`). When a
-unit is at 150,000 tokens or more and idle, type `/compact` into it:
-`tmux send-keys -t <session> -l "/compact"`, then `Enter` as a separate call.
-Idle means no spinner line (`✶ Doing… (12s …)`), nothing after `❯` except a
-ghost suggestion (dim: `tmux capture-pane -e` shows `\e[2m` before it), and no form, permission prompt or menu on screen. A unit
-whose background seats are still running counts as idle, because it is only
-waiting on them. Never compact a unit that is mid-turn or showing a form.
-Log each one, with the unit's token count. (User, 2026-09-30.)
+**Compact after a checkpoint.** At most once per phase: on the first tick or
+dailies after a unit checkpoints a phase, read its context size from its pane
+footer (`<session> | 157,352 | <model>`). When it is at 150,000 tokens or more
+and idle, type `/compact` into it: `tmux send-keys -t <session> -l
+"/compact"`, then `Enter` as a separate call. Idle means no spinner line
+(`✶ Doing… (12s …)`), nothing after `❯` except a ghost suggestion (dim:
+`tmux capture-pane -e` shows `\e[2m` before it), and no form, permission
+prompt or menu on screen. A unit whose background seats are still running
+counts as idle, because it is only waiting on them. Never compact a unit that
+is mid-turn or showing a form. Between checkpoints, leave it to the unit's own
+automatic compaction. Log each one, with the unit's token count. (User,
+2026-09-30; cut to once per phase 2026-10-01: compacting on every tick doubled
+the compaction rate and saved no tokens, because a unit re-reads its files at
+once and passes 150K again within 12-20 minutes.)
 
 **Every scheduled update is a `/showrunner:dailies simple` report**, never a
 one-unit note: the user sees every unit on every tick, each checked in full.
