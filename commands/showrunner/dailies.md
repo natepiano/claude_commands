@@ -169,5 +169,6 @@ For every length:
   names (`look-b5`), batch letters or item numbers. The user does not see them.
 - Say "you" for the user.
 - Do no other work in this turn, except the `/unit:eta` requests, the two
-  steps in Status check and clock, and acting on a BLOCK past its limit
-  (`/showrunner:produce` → Dependencies, rule 4).
+  steps in Status check and clock, acting on a BLOCK past its limit
+  (`/showrunner:produce` → Dependencies, rule 4), and compacting an idle unit
+  (`/showrunner:produce` → Compact idle units).

@@ -220,12 +220,23 @@ The prompt:
 > shows SESSION GONE, CLAUDE NOT RUNNING, FORM WAITING, a usage limit, or a
 > DECISION for the user, that subject goes first, with `needed:` saying what
 > the user must do. Do no other work in this turn, except `/unit:eta` requests,
-> merging a unit's checkpoint after viewing its shots, and acting on a BLOCK
-> past its limit (`/showrunner:produce` → Dependencies, rule 4).
+> merging a unit's checkpoint after viewing its shots, acting on a BLOCK
+> past its limit (`/showrunner:produce` → Dependencies, rule 4), and compacting
+> an idle unit (`/showrunner:produce` → Compact idle units).
 
 **A tick** arrives as a cross-session message from the timer's `UNIT`, and its
 text starts `Scheduled update`. Treat it exactly as the scheduled prompt: it
 is the update tick, not a peer's message. Do not reply to it.
+
+**Compact idle units.** On every tick and every dailies, read each unit's
+context size from its pane footer (`<session> | 157,352 | <model>`). When a
+unit is at 150,000 tokens or more and idle, type `/compact` into it:
+`tmux send-keys -t <session> -l "/compact"`, then `Enter` as a separate call.
+Idle means no spinner line (`✶ Doing… (12s …)`), nothing after `❯` except a
+ghost suggestion, and no form, permission prompt or menu on screen. A unit
+whose background seats are still running counts as idle, because it is only
+waiting on them. Never compact a unit that is mid-turn or showing a form.
+Log each one, with the unit's token count. (User, 2026-09-30.)
 
 **Every scheduled update is a `/showrunner:dailies simple` report**, never a
 one-unit note: the user sees every unit on every tick, each checked in full.
