@@ -13,7 +13,8 @@ not report against (`<k> of <N>`), or an ETA time without its percent.
 
 --state  JSON file holding each unit's last reported phase, ETA and held
          reason. The script reads it to write `(unchanged)` / `(changed:
-         ±h:mm)` and to print a held reason's examples only the first time,
+         ±h:mm)` and, in a simple report, to print a held reason's examples
+         only the first time,
          then saves this report's values to it.
 --log    appends the `dailies ETAs:` line to this file.
 --at     renders as if the clock read this local time (for checks).
@@ -483,7 +484,7 @@ def render(report: Report, previous: dict[str, Previous], now: datetime, zone_na
         lines.append(f"### {unit.unit}, {unit.phase}")
         if unit.held:
             last = previous.get(unit.unit)
-            repeat = last is not None and last.phase == unit.phase and last.held == unit.held
+            repeat = report.length == "simple" and last is not None and last.phase == unit.phase and last.held == unit.held
             examples = f", {unit.held_examples}" if unit.held_examples and not repeat else ""
             lines.append(f"- held: not merged, because {unit.held}{examples}")
         lines.append(f"- update: {unit.update}")
