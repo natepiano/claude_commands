@@ -380,6 +380,15 @@ def relay(message: Message, timeout: float) -> Result:
     # An inherited CLAUDE_* variable makes the relay pass for the caller's session:
     # CLAUDE_CODE_MESSAGING_SOCKET, for one, is that session's inbox.
     env = {name: value for name, value in os.environ.items() if not name.startswith("CLAUDE")}
+    # A Mac keeps Claude's login in its keychain, which ssh cannot open; the user's
+    # `claude setup-token` token, encrypted behind gpg-agent, stands in for it.
+    token_file = Path.home() / ".config" / "claude" / "oauth-token.gpg"
+    if token_file.exists():
+        token = subprocess.run(["gpg", "--pinentry-mode", "error", "--quiet", "--decrypt", str(token_file)],
+                               capture_output=True, text=True, timeout=10, check=False)
+        if token.returncode != 0:
+            return Result("queued", f"gpg-agent is cold on {machine()}: run github-warmup there")
+        env["CLAUDE_CODE_OAUTH_TOKEN"] = token.stdout.strip()
     code, out, err = run(command, relay_prompt(message), timeout, env, Path.home())
     raw = STATE / "relay" / f"{file_name(message.to)}.jsonl"
     raw.parent.mkdir(parents=True, exist_ok=True)
