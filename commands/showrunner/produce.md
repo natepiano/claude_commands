@@ -505,8 +505,9 @@ it needs. Every other wait is yours to clear, and fast.
    A longer wait needs a logged reason. In the dailies, the waiting unit's
    `update` names the wait with its start and clear times.
 
-   While it waits, give the waiting unit other work: parts of its next phase in
-   files nobody holds, its fix built in a scratch copy, tests, docs or research.
+   While it waits, give the waiting unit other work inside its current phase:
+   its fix built in a scratch copy, tests, docs or research. Never its next
+   phase (Rules: one phase at a time).
 5. **Two things still go to the user:** a wait that clears only by changing what
    ships, and approvals that belong in a unit's own session.
 </Dependencies>
@@ -622,6 +623,10 @@ When every unit's final-gate and as-built checkpoints are merged:
 - Only the showrunner pushes the merge branch, and never with force.
 - Merge only from a checkpoint notice. Never merge a visible change before
   viewing its shots.
+- **One phase at a time.** A unit starts phase N+1 only after phase N is merged
+  into the merge branch. A held checkpoint is fixed inside phase N; the unit
+  never builds the next phase on top of it. User rule 2026-10-01: widget ran
+  Phases 29 and 30 at once, and the dailies could not say which phase it was in.
 - Never ask the user to review until <DesignCheck/> passed on the shots.
 - Never pass on a unit's claim without checking it.
 - Updates hold only what the schedule prompt allows.
