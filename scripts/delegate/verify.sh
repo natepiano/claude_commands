@@ -36,6 +36,16 @@
 # correctness and cache constraints, not preferences. cargo check and cargo
 # nextest are never gated — a phase that compiles nothing has verified nothing.
 #
+# A delegate session remembers passes. With PLAN_DELEGATE_BOARD_DIR or
+# PLAN_DELEGATE_SESSION_DIR set, a `test` or `lint` that exits 0 is recorded in
+# <session>/verify_cache/, keyed by the working tree as the run left it, the
+# arguments, rustc -vV, lint.conf, these scripts and the RUST*/CARGO_*/NEXTEST_*
+# environment. The same call on the same tree then prints that record and its
+# log and exits 0 without the cargo token: seats re-ran unchanged trees 416
+# times in the week to 2026-10-01. A failure is never recorded, a `test` that
+# changed the tree records nothing, and a run outside a delegate session is
+# never cached.
+#
 # Usage:
 #   verify.sh check <package>              fast compile feedback (workspace
 #                                          lib + bins)
@@ -52,7 +62,10 @@
 #                                          it: code behind a non-default feature has
 #                                          no other route to a gate. Names without a
 #                                          `/` are qualified as <package>/<name>
-#   verify.sh fmt <package>                format only (checkpoint-commit backstop)
+#   … --no-cache                           test and lint: run even when this
+#                                          exact call already passed on this
+#                                          tree (a flake hunt)
+#   verify.sh fmt <package>               format only (checkpoint-commit backstop)
 #                                          — gated by config/lint.conf
 #   verify.sh example <package> <name>     clippy one example (only when the
 #                                          phase changed that example)
@@ -167,6 +180,52 @@ for path in filter(None, paths):
 print("\n".join(sorted(changed)))
 '
 
+# The pass-record key (see the header). argv is the files whose content counts,
+# then `--`, then the call's words. The tree part is HEAD's tree plus the content
+# of every path that differs from it, staged, unstaged, deleted, or new and not
+# ignored; it writes no git objects. Any failure prints nothing, and an empty
+# key turns the record off for that run.
+TREE_KEY_PY='
+import hashlib
+import os
+import subprocess
+import sys
+
+
+def run(*args: str | bytes) -> bytes:
+    result = subprocess.run(list(args), capture_output=True)
+    if result.returncode != 0:
+        sys.exit(1)
+    return result.stdout
+
+
+def content(path: bytes) -> bytes:
+    if os.path.islink(path):
+        return b"link " + os.readlink(path)
+    if os.path.isfile(path):
+        with open(path, "rb") as handle:
+            return hashlib.sha256(handle.read()).digest()
+    return b"absent"
+
+
+split = sys.argv.index("--")
+top = run("git", "rev-parse", "--show-toplevel").strip()
+key = hashlib.sha256(top + b"\0" + run("git", "-C", top, "rev-parse", "HEAD^{tree}"))
+paths = run("git", "-C", top, "diff", "--name-only", "--no-renames", "-z", "HEAD").split(b"\0")
+paths += run("git", "-C", top, "ls-files", "--others", "--exclude-standard", "-z").split(b"\0")
+for path in sorted(set(filter(None, paths))):
+    key.update(path + b"\0" + content(os.path.join(top, path)))
+key.update(run("rustc", "-vV"))
+for name in sys.argv[1:split]:
+    key.update(content(name.encode()))
+for word in sys.argv[split + 1 :]:
+    key.update(b"\0" + word.encode())
+for name, value in sorted(os.environ.items()):
+    if name.startswith(("RUST", "CARGO_", "NEXTEST_")) and name != "CARGO_MAKEFLAGS":
+        key.update(("\0" + name + "=" + value).encode())
+print(key.hexdigest())
+'
+
 # The compile covers the workspace, so a misspelled package would otherwise
 # pass check and lint silently and leave nextest with an empty filter. Fail it
 # as a usage error instead.
@@ -219,6 +278,69 @@ if [[ -z "$CMD" ]]; then
 fi
 shift
 
+# --no-cache may sit anywhere after the subcommand; nothing below sees it.
+NO_CACHE=0
+ARGS=()
+for arg in "$@"; do
+    if [[ "$arg" == "--no-cache" ]]; then
+        NO_CACHE=1
+    else
+        ARGS+=("$arg")
+    fi
+done
+set -- "${ARGS[@]}"
+
+CACHE_SESSION_DIR="${PLAN_DELEGATE_BOARD_DIR:-${PLAN_DELEGATE_SESSION_DIR:-}}"
+CACHE_DIR=""
+if [[ -n "${CACHE_SESSION_DIR}" && "${NO_CACHE}" -eq 0 \
+      && ( "$CMD" == test || "$CMD" == lint ) ]]; then
+    CACHE_DIR="${CACHE_SESSION_DIR}/verify_cache"
+fi
+RUN_LOG=""
+RUN_KEY=""
+LOOKUP_KEY=""
+
+tree_key() {
+    "$PY" -c "$TREE_KEY_PY" "${BASH_SOURCE[0]}" "$HOME/.claude/scripts/lint/invoke.sh" \
+        "${LINT_CONFIG_FILE:-$HOME/.claude/config/lint.conf}" -- "$CMD" "${ARGS[@]}" \
+        2>/dev/null || true
+}
+
+# Succeeds, after printing the record, when this call already passed on this
+# tree. Sets LOOKUP_KEY either way.
+cache_lookup() {
+    [[ -n "${CACHE_DIR}" ]] || return 1
+    LOOKUP_KEY="$(tree_key)"
+    [[ -n "${LOOKUP_KEY}" && -f "${CACHE_DIR}/${LOOKUP_KEY}.pass" ]] || return 1
+    echo "verify.sh: PASS (recorded) — $(cat "${CACHE_DIR}/${LOOKUP_KEY}.pass")"
+    echo "verify.sh: the tree and every input are unchanged since, so nothing was rebuilt or re-run."
+    echo "verify.sh: that run's output is ${CACHE_DIR}/${LOOKUP_KEY}.log; its last lines:"
+    tail -n 5 "${CACHE_DIR}/${LOOKUP_KEY}.log" 2>/dev/null || true
+    echo "verify.sh: add --no-cache to run it anyway (a flake hunt)."
+}
+
+# Called on a 0 exit, before the token is released, so a peer queued on the
+# same call finds the record. Keyed by the tree as the run left it: lint's
+# rewrites are part of what passed.
+cache_record() {
+    [[ -n "${RUN_LOG}" ]] || return 0
+    local key
+    key="$(tree_key)"
+    if [[ -z "${key}" || ( "$CMD" == test && "${key}" != "${RUN_KEY}" ) ]]; then
+        rm -f "${RUN_LOG}"
+        return 0
+    fi
+    mv -f "${RUN_LOG}" "${CACHE_DIR}/${key}.log"
+    printf '`verify.sh %s` passed %s, run by %s\n' "$CMD${ARGS[*]:+ ${ARGS[*]}}" \
+        "$(date '+%Y-%m-%d %H:%M:%S')" "${PLAN_DELEGATE_TEAM_ROLE:-the orchestrator}" \
+        > "${CACHE_DIR}/${key}.pass.tmp"
+    mv -f "${CACHE_DIR}/${key}.pass.tmp" "${CACHE_DIR}/${key}.pass"
+}
+
+if cache_lookup; then
+    exit 0
+fi
+
 # Open a progress window for the duration of this run when a delegate session is
 # in scope. This is what the orchestrator's progress header reports against while
 # the main agent runs verification itself: an activity, not a pass, so
@@ -254,6 +376,20 @@ release_token() {
     TOKEN_HELD=0
     bash "${BOARD_HELPER}" release "${BOARD_DIR}" "${BOARD_SLOT}" cargo >/dev/null 2>&1 || true
 }
+
+# Again with the token held: a peer running this same call on this tree held
+# the token until its pass was recorded.
+if cache_lookup; then
+    release_token
+    exit 0
+fi
+if [[ -n "${CACHE_DIR}" && -n "${LOOKUP_KEY}" ]] && mkdir -p "${CACHE_DIR}"; then
+    RUN_KEY="${LOOKUP_KEY}"
+    RUN_LOG="${CACHE_DIR}/run.$$.log"
+    : > "${RUN_LOG}"
+    exec > >(tee -a "${RUN_LOG}") 2> >(tee -a "${RUN_LOG}" >&2)
+fi
+
 ACTIVITY_ACTIVE=0
 if [[ -n "${ACTIVITY_SESSION_DIR}" \
       && -f "${ACTIVITY_SESSION_DIR}/progress_history_state.json" ]]; then
@@ -288,6 +424,11 @@ fi
 # wait out the hold.
 verify_cleanup() {
     local status=$1
+    if [[ "${status}" == completed ]]; then
+        cache_record || true
+    elif [[ -n "${RUN_LOG}" ]]; then
+        rm -f "${RUN_LOG}"
+    fi
     if [[ "${ACTIVITY_ACTIVE}" -eq 1 ]]; then
         finish_activity "${status}"
     fi

@@ -69,7 +69,9 @@ The Verification section carries the applicable command lines and every
 delegate-facing rule from <VerificationContract/>, with nothing added around
 them. It must also say: run only its listed commands, never raw Cargo; run each
 with the sandbox disabled; do not report until every command has exited and its
-output has been read. If an edited package has no listed `test` line, add that
+output has been read. A run that prints `PASS (recorded)` is that gate's result,
+and the log it names is the output to read; add `--no-cache` only to re-run a
+passing gate on purpose, as in a flake hunt. If an edited package has no listed `test` line, add that
 package's scoped `verify.sh test` and report it. Omit plan **Style** metadata.
 </WritePromptContract>
 
