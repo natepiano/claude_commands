@@ -379,7 +379,8 @@ Input: the unit, phase, hash and shots from its notice.
       defect rows of all its design checks, both from `LOG`; the last three come
       from the unit's `review trial:` checkpoint line. A phase started before
       the unit's trial began is `--regime before`. After every sixth trial row,
-      run `review_regime.py report` and give the user the table with one line
+      run `review_regime.py report --since 2026-09-28` (design checks began
+      then) and give the user the table with one line
       on whether the trial pays for itself. User decision 2026-10-01: a UX
       reviewer and a code reviewer in every phase, kept only if they cut holds
       and merge defects for less than they add in time.

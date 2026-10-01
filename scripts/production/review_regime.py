@@ -6,7 +6,7 @@ Usage:
                        --started <ISO> --merged <ISO> --holds <K> --merge-defects <D>
                        [--ux-findings <N>] [--code-findings <N>] [--review-minutes <M>]
                        [--note <text>]
-  review_regime.py report
+  review_regime.py report [--since <ISO date>]
 
 The trial (user decision 2026-10-01) adds a UX reviewer to every phase that
 changes the screen and a code-quality reviewer to every phase, both judging by
@@ -124,8 +124,8 @@ def median_of(values: list[float]) -> str:
     return f"{statistics.median(values):.1f}" if values else "-"
 
 
-def report() -> None:
-    rows = read_rows()
+def report(since: str | None) -> None:
+    rows = [row for row in read_rows() if since is None or row.merged >= since]
     lines = ["| | before | trial |", "| --- | --- | --- |"]
     groups = {regime: [row for row in rows if row.regime == regime] for regime in REGIMES}
 
@@ -160,12 +160,13 @@ def main() -> int:
     _ = adding.add_argument("--code-findings", type=int)
     _ = adding.add_argument("--review-minutes", type=float)
     _ = adding.add_argument("--note")
-    _ = commands.add_parser("report")
+    reporting = commands.add_parser("report")
+    _ = reporting.add_argument("--since", help="only phases merged on or after this ISO date; design checks began 2026-09-28")
     arguments = parser.parse_args()
     if cast(str, arguments.command) == "add":
         add(arguments)
     else:
-        report()
+        report(cast(str | None, arguments.since))
     return 0
 
 
