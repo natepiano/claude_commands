@@ -174,6 +174,16 @@ def update() -> list[str]:
     return messages
 
 
+def mark_tier(plan: codex_pacer.Plan) -> None:
+    """Show on the active Codex note the tier codex launches carry right now."""
+    called = codex_pacer.launch_tier(codex_pacer.registry_tier(), plan["tier"])
+    stamp = {"date_modified": f'"[[{datetime.now().strftime("%Y-%m-%d")}]]"'}
+    for note in read_notes():
+        if note.tool == "codex":
+            active = note.get("state") == "active"
+            _ = set_fields(note, {"tier": ("fast" if called == "fast" else "regular") if active else "null"}, stamp)
+
+
 def main() -> None:
     if sys.argv[1:] not in ([], ["refresh"]):
         sys.exit("usage: agent_notes.py [refresh]")
@@ -183,7 +193,7 @@ def main() -> None:
     for line in refresh(notes, current_session()) if sys.argv[1:] else alert(notes):
         print(line)
     try:
-        _ = codex_pacer.tick(notes)
+        mark_tier(codex_pacer.tick(notes))
     except (OSError, ValueError, KeyError, TypeError) as error:
         # The pacer must never cost the notes or the alerts; launches fall back to
         # default once its decision is ten minutes old.
