@@ -73,6 +73,11 @@ it:
 | <ProductionUnit/> | `docs/production_format.md` | — |
 
 Paths are under `~/.claude/`.
+
+`/clippy` and the `plan:` commands a run uses are loaded the same way: Read the
+file, never the Skill tool. Claude Code puts every skill a session invoked back
+after each compaction for the rest of the session; a file loaded by Read is not.
+A call site's arguments are what that file calls `$ARGUMENTS`.
 </TagReferenceContract>
 
 <CoreContract>
@@ -1725,8 +1730,10 @@ same file as `/unit:delegate_style`.
 </RunProjectStyleReview>
 
 <RunPhaseReview>
-For phased plans, invoke `plan:phase_review` with this run's `SESSION_DIR` and
-`WORKING_DIR`; pass `auto` in loop/verbose and make `${NEXT_ITEMS_PATH}` available.
+For phased plans, read `~/.claude/commands/plan/phase_review.md` in full and
+apply it with this run's `SESSION_DIR` and `WORKING_DIR`; its arguments are `auto`
+in loop/verbose, plus `skip-architect` as below. Make `${NEXT_ITEMS_PATH}`
+available.
 Its retrospective, review outcomes, and proposed next-item amendments are
 temporary session files, never plan sections. It may edit only remaining `todo`
 Work Orders; earlier `done` phases remain byte-identical. Later user choices
@@ -1766,8 +1773,9 @@ section.
 </RunPhaseReview>
 
 <RunPhaseShrink>
-For a phased plan, invoke `plan:shrink "${PLAN_DOC}" --phases <current-id>
---closeout "${SESSION_DIR}"` after phase review and before checkpoint. This is
+For a phased plan, read `~/.claude/commands/plan/shrink.md` in full and apply it
+with arguments `"${PLAN_DOC}" --phases <current-id> --closeout "${SESSION_DIR}"`
+after phase review and before checkpoint. This is
 the final plan mutation for the phase. It replaces only the current phase's
 `Work Order` with `As-built`; prior `done` phases must remain byte-identical and
 remaining `todo` phases must retain the forward edits from phase review.
@@ -1889,8 +1897,9 @@ Loop/verbose only after plan exhaustion:
 
 1. Launch `verify.sh final` under <BackgroundVerificationContract/>. It owns workspace
    fmt-check, all-targets check, and full tests.
-2. For Rust, invoke `clippy auto-proceed no-style` inline. Style stays out of
-   this step; step 4 owns it.
+2. For Rust, read `~/.claude/commands/clippy.md` in full and apply it inline
+   with arguments `auto-proceed no-style`. Style stays out of this step; step 4
+   owns it.
 3. On failure, create a synthetic phase `final` / `Final verification` once:
    capture a new baseline, run `start-phase`, reset review and smoke state, open
    the concrete failures in the ledger, then use its gate plus <FixDispatch/>.
@@ -1948,7 +1957,8 @@ verbose, or a finished `single` task. Skip it on a user stop, an open pending
 decision, or an error — a partial project has no settled surface to describe —
 and state the skip in <RunSummary/>.
 
-Invoke `plan:to_as_built` and follow it completely:
+Read `~/.claude/commands/plan/to_as_built.md` in full and follow it completely,
+with these arguments:
 
 - A phased plan with every phase `done` — pass `${PLAN_DOC}`. Its per-phase
   `As-built` blocks are the change surface, already prepared by

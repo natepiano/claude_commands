@@ -90,9 +90,9 @@ phase checkpoint never waits on one.
    the style pass would reach Rust/Cargo work the project did not write.
 4. Save combined diff/status to `${SESSION_DIR}/style_review_before.diff` and
    `${SESSION_DIR}/style_review_before.status`, announce the single cleanup and
-   the range it covers, and invoke the `clippy` skill inline as
-   `style-only auto-proceed` — for loop and verbose, as
-   `style-only auto-proceed since ${STYLE_DIFF_BASE}`. `Off`, error, or
+   the range it covers, and read `~/.claude/commands/clippy.md` in full and
+   apply it inline with arguments `style-only auto-proceed` — for loop and
+   verbose, `style-only auto-proceed since ${STYLE_DIFF_BASE}`. `Off`, error, or
    unresolved choice blocks completion.
 5. On successful review, set true and write the result to the marker before any
    cleanup verification. Never clear it during later fixes.
