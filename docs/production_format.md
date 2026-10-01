@@ -167,23 +167,28 @@ branch, port and the files you own.
    When it passes, merge the merge branch (item 5), then dispatch. The one
    exception: the showrunner lifts a gate after item 13's test passes without
    it (`From the showrunner: G<k> lifted — …`); dispatch then.
-7. **Landing rule** (user, 2026-09-28). When another unit waits on your current
-   phase, or the showrunner sends a landing call, and a repair round turns up
-   only new edge cases:
-   - finish the round in flight;
-   - move the remaining edge cases into a follow-up phase with its own Work
+7. **What a phase fixes** (user, 2026-09-28 and 2026-10-01). Reviews, design
+   checks and smoke runs keep finding things. Two rules decide which of them
+   this phase fixes before its checkpoint.
+   - **Its own change only.** A phase fixes defects in what its Work Order
+     delivers and regressions it caused. A defect that was there before the
+     phase, or lives in another unit's code, is not this phase's: send it to
+     the showrunner with its evidence, and the showrunner routes it to the
+     owning unit's plan. Never widen a repair round to take it in.
+   - **Landing rule.** After the phase's second repair round, or sooner when
+     another unit waits on the phase or the showrunner sends a landing call, a
+     finding moves to a follow-up phase when all of these hold:
+     - it is new this round;
+     - it is not a regression from the last fix;
+     - the user would not see it in normal use;
+     - no waiting unit depends on it;
+     - no test or gate fails because of it.
+
+     Finish the round in flight, write the follow-up phase with its own Work
      Order, inserted after this one per `/plan:to_phased_plan` →
-     <PhaseNumbering/>;
-   - then checkpoint.
+     <PhaseNumbering/>, then checkpoint.
 
-   A finding moves only when all of these hold:
-   - it is new this round;
-   - it is not a regression from the last fix;
-   - the user would not see it in normal use;
-   - the waiting unit does not depend on it;
-   - no test or gate fails because of it.
-
-   Everything else is fixed before the checkpoint. This is packaging under
+   Everything else is fixed before the checkpoint, with no cap on rounds. This is packaging under
    `<DecisionEconomy/>`, so it never goes to the user as a question. State it
    in one line.
 8. **Changes from other units.** When the showrunner reports that a public item

@@ -419,7 +419,11 @@ each checkpoint with shots, spawn a fresh helper agent with this prompt:
 > verdict and the table.
 
 Read its verdict, then stop the helper. `pass` lets the merge go on. Send
-each defect to the unit director. A `no rule` defect is still a defect. If it is a
+each defect in the phase's own change to its unit director. Route every other
+defect (one that was there before the phase, or lives in another unit's code)
+to the unit that owns it, as work in that unit's plan, never into this
+phase's repair round (`production_format.md` → <ProductionUnit/> item 7). A
+`no rule` defect is still a defect. If it is a
 choice the user's taste must settle, apply <DesignAuthority/>; otherwise add
 the rule to the guide.
 </DesignCheck>
@@ -542,6 +546,10 @@ landing rule in <ProductionUnit/> defines them, send:
 `From the showrunner: <waiting unit> waits on your phase <N> (G<k>). Apply the landing rule: finish this round, move the new edge cases to a follow-up phase, checkpoint.`
 
 Defects users can see are never deferred. Log the call.
+
+From a phase's third repair round on, its unit director applies the landing
+rule without a call (`production_format.md` → <ProductionUnit/> item 7, user
+2026-10-01). Send the call only to land a phase sooner.
 </LandingCall>
 
 ---
