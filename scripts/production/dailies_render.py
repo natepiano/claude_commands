@@ -5,8 +5,10 @@ Usage: dailies_render.py <input.json> [--state <state.json>] [--log <log.md>] [-
 
 The input gives each subject's fields; this script owns the layout, so no line
 of the template can be dropped or renamed. It refuses, with exit 2, an input
-that breaks a template rule: a unit without its phase, a follow-up or last
-phase without `then`, an unknown field, or an update too long for the length.
+that breaks a template rule: a unit without its phase or `held`, a follow-up
+or last phase without `then`, an unknown field, an update too long for the
+length, or an update or held reason that names another phase without saying
+why.
 
 --state  JSON file holding each unit's last reported phase and ETA. The script
          reads it to write `(unchanged)` / `(changed: ±h:mm)`, then saves this
@@ -34,6 +36,7 @@ TIME = re.compile(r"^\d{1,2}:\d{2}(?:\+\d+)?$")
 NONE = ("none measured - requested", "none measured", "no ETA stated yet")
 LABEL_LIMIT = 8
 RETURN = re.compile(r"\bthe plan at Phase \d+|\bplan done\b")
+PHASE_MENTION = re.compile(r"\bPhases? (\d+(?:\s*(?:,|and|-|–|to)\s*\d+)*)|\bP(\d+)\b")
 WHITE = "⬜"
 GREEN = "🟩"
 RED = "🟥"
@@ -64,6 +67,7 @@ class Unit:
     unit: str
     label: str
     phase: str
+    held: str | None
     update: str
     eta: Eta
     waiting_on_it: str | None
@@ -245,19 +249,40 @@ def parse_eta(value: object, where: str) -> Eta:
     return Eta(time, earliest, latest, none, optional_text(fields, "detail", where))
 
 
-def check_update(update: str, length: str, where: str) -> None:
+def check_update(update: str, length: str, where: str, key: str = "update") -> None:
     limit = LENGTHS[length]
     if limit is not None and len(update) > limit:
-        raise InputError(f"{where}.update: {len(update)} characters; a {length} update is one short line, at most {limit}")
+        raise InputError(f"{where}.{key}: {len(update)} characters; a {length} {key} is one short line, at most {limit}")
+
+
+def other_phases(line: str, number: int | None) -> list[int]:
+    """Phase numbers `line` names other than the heading's (`None` on a follow-up)."""
+    named: list[int] = []
+    for match in PHASE_MENTION.finditer(line):
+        mention: str = match.group(1) or match.group(2)
+        named.extend(int(digits.group(0)) for digits in re.finditer(r"\d+", mention))
+    return [found for found in named if found != number]
+
+
+def check_one_phase(line: str, number: int | None, key: str, where: str) -> None:
+    """A line may name another phase only when it says why that phase is here."""
+    others = other_phases(line, number)
+    if others and "because" not in line:
+        raise InputError(
+            f"{where}.{key}: names Phase {', '.join(str(found) for found in others)} outside the heading's phase; "
+            + "name only the heading's phase, or say why the other is here ('because ...'). Later work goes in `then`."
+        )
 
 
 def parse_unit(value: object, where: str, length: str) -> Unit:
     fields = as_map(value, where)
     check_keys(
         fields,
-        {"unit", "label", "phase", "update", "eta", "waiting_on_it", "needed", "needs_user", "then"},
+        {"unit", "label", "phase", "held", "update", "eta", "waiting_on_it", "needed", "needs_user", "then"},
         where,
     )
+    if "held" not in fields:
+        raise InputError(f"{where}.held: required; the reason the phase's checkpoint is not merged, or null when no checkpoint waits")
     unit = text(fields, "unit", where)
     label = optional_text(fields, "label", where) or unit.removesuffix("-unit")
     if len(label) > LABEL_LIMIT:
@@ -278,12 +303,19 @@ def parse_unit(value: object, where: str, length: str) -> Unit:
         raise InputError(f"{where}.then: a follow-up names the plan phase it returns to ('the plan at Phase <N>'), or says 'plan done' after reading the plan")
     if then is None and number == total:
         raise InputError(f"{where}.then: required on a last phase; name the queued work, or 'nothing queued'")
+    heading_number = int(plan_number) if plan_number else None
+    held = optional_text(fields, "held", where)
+    if held is not None:
+        check_update(held, length, where, "held")
+        check_one_phase(held, heading_number, "held", where)
     update = text(fields, "update", where)
     check_update(update, length, where)
+    check_one_phase(update, heading_number, "update", where)
     return Unit(
         unit=unit,
         label=label,
         phase=phase,
+        held=held,
         update=update,
         eta=parse_eta(fields.get("eta"), f"{where}.eta"),
         waiting_on_it=optional_text(fields, "waiting_on_it", where),
@@ -407,6 +439,8 @@ def render(report: Report, previous: dict[str, Previous], now: datetime, zone_na
         topic_section(topic)
     for unit in units:
         lines.append(f"### {unit.unit}, {unit.phase}")
+        if unit.held:
+            lines.append(f"- held: not merged, because {unit.held}")
         lines.append(f"- update: {unit.update}")
         lines.append(f"- eta: {eta_text(unit, previous.get(unit.unit), now, zone_name, with_note=True)}")
         if unit.waiting_on_it:

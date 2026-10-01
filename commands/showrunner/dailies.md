@@ -91,6 +91,7 @@ python3 ~/.claude/scripts/production/dailies_render.py <scratchpad>/dailies_inpu
       "unit": "tool-based-ui-trunk",
       "label": "trunk",
       "phase": "follow-up 3 of 4: look polish",
+      "held": null,
       "update": "fixing the Open layout's overlapping members",
       "eta": {"time": "07:40", "earliest": "07:35", "latest": "07:55", "detail": "checks and build included"},
       "waiting_on_it": "the cable fix; widget merges it into Phase 18",
@@ -113,6 +114,7 @@ python3 ~/.claude/scripts/production/dailies_render.py <scratchpad>/dailies_inpu
 | `unit` | The unit's session name. |
 | `label` | The timeline row name, at most 8 characters. Defaults to the unit name without `-unit`. |
 | `phase` | `Phase <N> of <M>: <what it changes>` from the unit's plan. Work outside a numbered plan gives its place in the unit's queue: `follow-up <K> of <Q>: <what it changes>`. The renderer refuses anything else. |
+| `held` | Required. When the phase's checkpoint waits unmerged, the reason in a few words, written to follow "not merged, because": `the design check found 16 defects, such as a main bar clipped in small windows`. `null` when no checkpoint waits. |
 | `update` | What the unit is doing now, one line. The length sets how long (below). A unit waiting on another unit says so, with the wait's start and expected clear times from `LOG` (`/showrunner:produce` → Dependencies). |
 | `eta` | The unit's latest stated phase ETA, in `ZONE`. `time` is `HH:MM`, `+1` for tomorrow (`11:21+1`); add `earliest` and `latest` when the unit gave a range. With no ETA, `none` in place of `time`, one of: `none measured - requested` (after sending that unit `/unit:eta` in this turn, the unmeasured-ETA rule in `/showrunner:produce`), `none measured`, `no ETA stated yet`. Never make one up. `detail` is an optional short note, such as what the time covers. |
 | `waiting_on_it` | Only for a topic that lands with this unit's phase, and who waits. |
@@ -138,8 +140,9 @@ own handoff may list only the work in front of it.
 ### What the renderer writes
 
 - **First line:** the length and both times: `**Dailies (Simple)**, 19:05 PDT / 02:05 UTC`.
-- **One section per subject:** `### <unit>, <phase>`, then `update:`, `eta:`,
-  and `waiting on it:`, `needed:` and `then:` when given.
+- **One section per subject:** `### <unit>, <phase>`, then `held: not merged,
+  because ...` when given, `update:`, `eta:`, and `waiting on it:`, `needed:`
+  and `then:` when given.
 - **eta note:** against the last report's ETA for the same phase:
   `(unchanged)`, `(changed: +0:27)`, or `(unchanged, overdue)` once the time
   has passed. No note on a subject's first ETA or a new phase. A range follows
@@ -164,6 +167,14 @@ Every length keeps the same template; only the `update:` text grows. An
 `page`; the renderer refuses a longer one.
 
 For every length:
+- **One phase per unit.** The heading names one phase: the oldest one not yet
+  merged (`/showrunner:produce` → Rules: one phase at a time). A held
+  checkpoint keeps its phase in the heading until it merges.
+- **Say why it is held.** Whenever a checkpoint waits unmerged, `held` gives
+  the reason. The renderer refuses a unit without the field.
+- **`update:` is the present only.** What the unit does now, not its history.
+  It names no other phase number unless it says why that phase is here
+  (`because ...`); the renderer refuses one that does. Later work goes in `then`.
 - Plain words. Technical terms are fine where they are the right ones.
 - Name work by what it changes in the app, never by a unit's own labels: no helper
   names (`look-b5`), batch letters or item numbers. The user does not see them.
