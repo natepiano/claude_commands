@@ -90,6 +90,7 @@ python3 ~/.claude/scripts/production/dailies_render.py <scratchpad>/dailies_inpu
     {
       "unit": "tool-based-ui-trunk",
       "label": "trunk",
+      "project": "tools you build and edit in the 3D scene",
       "phase": "follow-up 3 of 4: look polish",
       "started": "2026-10-01T05:12",
       "held": null,
@@ -114,6 +115,7 @@ python3 ~/.claude/scripts/production/dailies_render.py <scratchpad>/dailies_inpu
 | `next_run` | The next scheduled run, `HH:MM` in `ZONE`, after any restart. Leave it out when no schedule runs. |
 | `unit` | The unit director's session name. |
 | `label` | The timeline row name, at most 8 characters. Defaults to the unit name without `-unit`. |
+| `project` | The goal of the unit's whole plan, in a few words, from its plan doc's opening: what you get when every phase is done. Not this phase, and not a list. Example: `tools you build and edit in the 3D scene`. It is the section heading. |
 | `phase` | `Phase <N> of <M>: <what it changes>` from the unit's plan. Work outside a numbered plan gives its place in the unit's queue: `follow-up <K> of <Q>: <what it changes>`. The renderer refuses anything else. |
 | `started` | When the phase started, `YYYY-MM-DDTHH:MM` in `ZONE`, from the unit director or `LOG`. The timeline row starts there. |
 | `held` | Required. When the phase's checkpoint waits unmerged, the reason alone, in a few words, written to follow "not merged, because": `the design check found 16 defects`. `null` when no checkpoint waits. No examples here; the renderer refuses `such as`. |
@@ -143,7 +145,7 @@ director's own handoff may list only the work in front of it.
 ### What the renderer writes
 
 - **First line:** the length and both times: `**Dailies (Simple)**, 19:05 PDT / 02:05 UTC`.
-- **One section per subject:** `### <unit>, <phase>`, then `held: not merged,
+- **One section per subject:** `### <unit>: <project>`, then `phase:`, `held: not merged,
   because ...` when given, `update:`, `eta:`, and `waiting on it:`, `needed:`
   and `then:` when given. In `simple`, a held reason shows its examples only
   the first time.

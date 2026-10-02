@@ -87,6 +87,7 @@ class Eta:
 class Unit:
     unit: str
     label: str
+    project: str
     phase: str
     started: datetime
     held: str | None
@@ -326,7 +327,7 @@ def parse_unit(value: object, where: str, length: str) -> Unit:
     fields = as_map(value, where)
     check_keys(
         fields,
-        {"unit", "label", "phase", "started", "held", "held_examples", "update", "eta", "waiting_on_it", "needed", "needs_user", "then"},
+        {"unit", "label", "project", "phase", "started", "held", "held_examples", "update", "eta", "waiting_on_it", "needed", "needs_user", "then"},
         where,
     )
     if "held" not in fields:
@@ -373,6 +374,7 @@ def parse_unit(value: object, where: str, length: str) -> Unit:
     return Unit(
         unit=unit,
         label=label,
+        project=text(fields, "project", where),
         phase=phase,
         started=datetime.fromisoformat(started_text),
         held=held,
@@ -527,7 +529,8 @@ def render(report: Report, previous: dict[str, Previous], now: datetime, zone_na
     for topic in user_topics:
         topic_section(topic)
     for unit in units:
-        lines.append(f"### {unit.unit}, {unit.phase}")
+        lines.append(f"### {unit.unit}: {unit.project}")
+        lines.append(f"- phase: {unit.phase}")
         if unit.held:
             last = previous.get(unit.unit)
             repeat = report.length == "simple" and last is not None and last.phase == unit.phase and last.held == unit.held
