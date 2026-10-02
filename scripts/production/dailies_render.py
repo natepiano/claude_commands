@@ -517,8 +517,8 @@ def ordered_units(report: Report, now: datetime) -> list[Unit]:
     return [unit for _, unit in sorted(enumerate(report.units), key=key)]
 
 
-def render(report: Report, previous: dict[str, Previous], now: datetime, zone_name: str, utc_now: datetime) -> list[str]:
-    lines = [f"**Dailies ({report.length.capitalize()})**, {now:%H:%M} {zone_name} / {utc_now:%H:%M} UTC", ""]
+def render(report: Report, previous: dict[str, Previous], now: datetime, zone_name: str) -> list[str]:
+    lines = [f"**Dailies ({report.length.capitalize()})**, {now:%H:%M} {zone_name}", ""]
     user_topics = [topic for topic in report.topics if topic.needs_user]
     other_topics = [topic for topic in report.topics if not topic.needs_user]
     units = ordered_units(report, now)
@@ -595,13 +595,12 @@ def main(arguments: list[str]) -> int:
     aware = datetime.fromisoformat(at).replace(tzinfo=zone) if at else datetime.now(zone)
     zone_name = aware.strftime("%Z")
     now = aware.replace(second=0, microsecond=0, tzinfo=None)
-    utc_now = aware.astimezone(ZoneInfo("UTC"))
     try:
         check_changes(report, previous, now)
     except InputError as error:
         print(f"dailies_render: {error}", file=sys.stderr)
         return 2
-    print("\n".join(render(report, previous, now, zone_name, utc_now)))
+    print("\n".join(render(report, previous, now, zone_name)))
     if state_path is not None:
         save_state(state_path, report, now)
     if log_path is not None:

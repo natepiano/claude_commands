@@ -39,7 +39,7 @@ is already right.
 Read the current state, not memory, and check what you state the way
 `/showrunner:produce` checks a unit director's claims.
 
-1. **Time.** `TZ=<ZONE> date '+%H:%M %Z'; date -u '+%H:%M UTC'`.
+1. **Time.** `TZ=<ZONE> date '+%H:%M %Z'`. `ZONE` only, never UTC (user, 2026-10-02).
 2. **Log.** The latest `### STATE` block in `LOG` and every event after it.
 3. **Each unit.** Capture its unit director's pane
    (`tmux capture-pane -p -t <session> -S -60`): the phase, what it is doing now, its latest phase ETA, and any `— decision:`,
@@ -144,7 +144,7 @@ director's own handoff may list only the work in front of it.
 
 ### What the renderer writes
 
-- **First line:** the length and both times: `**Dailies (Simple)**, 19:05 PDT / 02:05 UTC`.
+- **First line:** the length and the time in `ZONE`: `**Dailies (Simple)**, 19:05 PDT`.
 - **One section per subject:** `### <unit>: <project>`, then `phase:`, `held: not merged,
   because ...` when given, `update:`, `eta:`, and `waiting on it:`, `needed:`
   and `then:` when given. In `simple`, a held reason shows its examples only

@@ -41,8 +41,8 @@ State:
 
 <Throughout>
 - **Time.** Before writing any time, run
-  `TZ=<ZONE> date '+%H:%M %Z'; date -u '+%H:%M UTC'`. Unit directors state times in the
-  machine's zone; convert them to `ZONE`.
+  `TZ=<ZONE> date '+%H:%M %Z'`. Give every time in `ZONE` only, never UTC (user,
+  2026-10-02). Unit directors state times in the machine's zone; convert them to `ZONE`.
 - **Log.** Write one line per event in `LOG`: `- HH:MM <zone>: <event>`. Every
   ten events, and before a compaction, add a `### STATE <time>` block. It gives:
   - each unit's phase, last merged checkpoint and what it waits on;
@@ -93,8 +93,7 @@ State:
   it answers, report that ETA as `none measured - requested`.
 - **Every turn ends with** `— waiting on: <items>`, the user's items first.
 - **Next dailies.** Every reply to the user ends with the time now and the next
-  dailies report's time, in `ZONE` and UTC: `09:37 PDT / 16:37 UTC · next dailies
-  09:53 PDT / 16:53 UTC`. Read the next fire from `systemctl --user list-timers
+  dailies report's time, in `ZONE`: `09:37 PDT · next dailies 09:53 PDT`. Read the next fire from `systemctl --user list-timers
   showrunner-timer-<name>.timer --no-pager`, never from memory (user, 2026-10-02).
 </Throughout>
 
