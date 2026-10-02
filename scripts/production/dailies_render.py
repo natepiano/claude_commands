@@ -9,7 +9,9 @@ that breaks a template rule: a unit without its phase or `held`, a follow-up
 or last phase without `then`, an unknown field, an update too long for the
 length, an update or held reason that names another phase without saying
 why, a held reason carrying its own examples, a held count the update does
-not report against (`<k> of <N>`), or an ETA time without its percent.
+not report against (`<k> of <N>`), an ETA time without its percent, or an
+ETA that moved CHANGE_NEEDS_WHY_MINUTES or more since the last report
+without `why`.
 
 --state  JSON file holding each unit's last reported phase, ETA and held
          reason. The script reads it to write `(unchanged)` / `(changed:
@@ -36,6 +38,9 @@ LENGTHS = {"simple": 240, "page": 480, "elaborate": None}
 PHASE = re.compile(r"^(?:Phase (\d+) of (\d+)|follow-up (\d+) of (\d+)): \S")
 TIME = re.compile(r"^\d{1,2}:\d{2}(?:\+\d+)?$")
 NONE = ("none measured - requested", "none measured", "no ETA stated yet")
+# An ETA that moved this much since the last report carries its reason (user,
+# 2026-10-01: why a unit's timing changed is an important detail).
+CHANGE_NEEDS_WHY_MINUTES = 15
 LABEL_LIMIT = 8
 RETURN = re.compile(r"\bthe plan at Phase \d+|\bplan done\b")
 PHASE_MENTION = re.compile(r"\bPhases? (\d+(?:\s*(?:,|and|-|–|to)\s*\d+)*)|\bP(\d+)\b")
@@ -75,6 +80,7 @@ class Eta:
     none: str | None
     detail: str | None
     percent: int | None
+    why: str | None
 
 
 @dataclass(frozen=True)
@@ -255,7 +261,7 @@ def clock_text(fields: JsonMap, key: str, where: str) -> str | None:
 
 def parse_eta(value: object, where: str) -> Eta:
     fields = as_map(value, where)
-    check_keys(fields, {"time", "earliest", "latest", "none", "detail", "percent"}, where)
+    check_keys(fields, {"time", "earliest", "latest", "none", "detail", "percent", "why"}, where)
     time = clock_text(fields, "time", where)
     earliest = clock_text(fields, "earliest", where)
     latest = clock_text(fields, "latest", where)
@@ -275,7 +281,10 @@ def parse_eta(value: object, where: str) -> Eta:
         raise InputError(f"{where}.percent: only with a time")
     if percent is not None and (not isinstance(percent, int) or isinstance(percent, bool) or not 0 <= percent <= 100):
         raise InputError(f"{where}.percent: a whole number from 0 to 100, or null")
-    return Eta(time, earliest, latest, none, optional_text(fields, "detail", where), percent)
+    why = optional_text(fields, "why", where)
+    if why is not None and time is None:
+        raise InputError(f"{where}.why: only with a time")
+    return Eta(time, earliest, latest, none, optional_text(fields, "detail", where), percent, why)
 
 
 def check_update(update: str, length: str, where: str, key: str = "update") -> None:
@@ -438,14 +447,40 @@ def clock(moment: datetime, now: datetime, zone_name: str) -> str:
     return f"{moment:%a} {base}"
 
 
-def change_note(moment: datetime, previous: Previous | None, phase: str, now: datetime) -> str | None:
+def change_minutes(moment: datetime, previous: Previous | None, phase: str) -> int | None:
+    """Minutes the ETA moved since the last report of the same phase; `None` on a first ETA or a new phase."""
     if previous is None or previous.phase != phase or previous.eta is None:
         return None
-    minutes = round((moment - previous.eta).total_seconds() / 60)
+    return round((moment - previous.eta).total_seconds() / 60)
+
+
+def change_note(moment: datetime, previous: Previous | None, phase: str, now: datetime, why: str | None) -> str | None:
+    minutes = change_minutes(moment, previous, phase)
+    if minutes is None:
+        return None
     if minutes == 0:
         return "unchanged, overdue" if moment < now else "unchanged"
     hours, rest = divmod(abs(minutes), 60)
-    return f"changed: {'+' if minutes > 0 else '-'}{hours}:{rest:02d}"
+    note = f"changed: {'+' if minutes > 0 else '-'}{hours}:{rest:02d}"
+    return f"{note} because {why}" if why else note
+
+
+def check_changes(report: Report, previous: dict[str, Previous], now: datetime) -> None:
+    """An ETA that moved CHANGE_NEEDS_WHY_MINUTES or more since the last report says why."""
+    for index, unit in enumerate(report.units):
+        if unit.eta.time is None or unit.eta.why is not None:
+            continue
+        minutes = change_minutes(parse_time(unit.eta.time, now), previous.get(unit.unit), unit.phase)
+        if minutes is not None and abs(minutes) >= CHANGE_NEEDS_WHY_MINUTES:
+            raise InputError(
+                f"units[{index}].eta.why: the ETA moved {minutes:+d} minutes since the last report; "
+                + "say why in a few words (rendered after 'because'), from the unit director's own reports"
+            )
+
+
+def range_clock(moment: datetime, now: datetime) -> str:
+    """A range end: the bare time today, the weekday before it on any other day."""
+    return f"{moment:%H:%M}" if moment.date() == now.date() else f"{moment:%a %H:%M}"
 
 
 def eta_text(unit: Unit, previous: Previous | None, now: datetime, zone_name: str, with_note: bool) -> str:
@@ -455,11 +490,11 @@ def eta_text(unit: Unit, previous: Previous | None, now: datetime, zone_name: st
     else:
         moment = parse_time(eta.time, now)
         notes: list[str] = []
-        note = change_note(moment, previous, unit.phase, now) if with_note else None
+        note = change_note(moment, previous, unit.phase, now, eta.why) if with_note else None
         if note:
             notes.append(note)
         if eta.earliest and eta.latest:
-            notes.append(f"range {parse_time(eta.earliest, now):%H:%M}–{parse_time(eta.latest, now):%H:%M}")
+            notes.append(f"range {range_clock(parse_time(eta.earliest, now), now)}–{range_clock(parse_time(eta.latest, now), now)}")
         done = f"{eta.percent}% done" if eta.percent is not None else "percent done not stated"
         words = f"{clock(moment, now, zone_name)}, {done}" + (f" ({'; '.join(notes)})" if notes else "")
     return f"{words}; {eta.detail}" if with_note and eta.detail else words
@@ -555,6 +590,11 @@ def main(arguments: list[str]) -> int:
     zone_name = aware.strftime("%Z")
     now = aware.replace(second=0, microsecond=0, tzinfo=None)
     utc_now = aware.astimezone(ZoneInfo("UTC"))
+    try:
+        check_changes(report, previous, now)
+    except InputError as error:
+        print(f"dailies_render: {error}", file=sys.stderr)
+        return 2
     print("\n".join(render(report, previous, now, zone_name, utc_now)))
     if state_path is not None:
         save_state(state_path, report, now)

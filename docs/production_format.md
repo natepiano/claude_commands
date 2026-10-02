@@ -232,9 +232,14 @@ branch, port and the files you own.
     tests. Green means you are not blocked; continue. A real block ends the turn
     with item 10's line. While it lasts, take the work the showrunner names, or:
     parts of your next phase in files nobody holds, your fix built in a scratch
-    copy, tests, docs or research. Never commit another unit's lint or format
-    fixes: when `verify.sh lint` rewrites files outside your phase work, revert
-    those rewrites and tell the showrunner which unit's code needs them.
+    copy, tests, docs or research.
+15. **A failed lint** (user, 2026-10-01: 12 lint runs in a row on an
+    unchanged tree failed on the same error; 60 failed lints in one day cost
+    about 75 minutes). Lint covers the whole workspace. When it fails, fix
+    the error it names, wherever it is in the workspace, then lint once.
+    Never re-run lint on a tree that has not changed. Fix a file you do not
+    own through item 9, and name it in your checkpoint notice. Tell your seats
+    this in every Work Order that runs lint.
 14. **When others wait on you** (user, 2026-09-29). When your checkpoint turns
     the merge branch red, in CI or lint, send a small fix checkpoint at once,
     ahead of your phase work. Checkpoint at your next green
