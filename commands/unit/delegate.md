@@ -1073,7 +1073,12 @@ instructions name; with none, skip and say so in one line.
    > production rules: <the production doc's rules that concern looks>. You
    > only review: edit nothing. Return only the verdict and the table.
 
-   Read its verdict once, then stop it with TaskStop. Close the activity with
+   Read its verdict once, then stop it with TaskStop. Save each canonical
+   candidate it lists, without viewing it, into a slot still empty:
+   `mkdir -p <guide>/examples/<stem> && magick <shot> -crop <crop> +repage <guide>/examples/<stem>/<slot>.png`.
+   Saving it approves it for use now. Add one line to
+   `<guide>/examples/pending.md`, which holds it for the user's final approval:
+   `- <stem>/<slot>.png — <why it is clear> — <unit>, <date>`. Close the activity with
    `finish-activity --session-dir "${SESSION_DIR}" --result <pass|N defects>`.
 4. Open each defect row as a finding — blocker, because the showrunner's merge
    check holds a checkpoint on any visible defect. A `no rule` row is still a

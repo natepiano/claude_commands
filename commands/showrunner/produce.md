@@ -439,7 +439,18 @@ missing or stale: spawn a fresh helper agent with this prompt:
 > rules: <the doc's Production rules that concern looks>. Return only the
 > verdict and the table.
 
-Read its verdict, then stop the helper. `pass` lets the merge go on. Send
+Read its verdict, then stop the helper. Save each canonical candidate it
+lists, without viewing it, into a slot still empty: `mkdir -p
+<guide>/examples/<stem> && magick <shot> -crop <crop> +repage
+<guide>/examples/<stem>/<slot>.png`. Saving it approves it for use now; add
+`- <stem>/<slot>.png — <why it is clear> — showrunner, <date>` to
+`<guide>/examples/pending.md`, which holds every saved example for the user's
+final approval (units add theirs too). Bring the pending ones to the user in
+one batch, never while more important work needs them: not in a dailies
+report, not while a unit or a merge waits on them, and at the latest at
+close-out. Send each file with SendUserFile, without viewing it. On approval,
+drop its line; on a rejection, delete the file and its line, so the slot is
+empty again. `pass` lets the merge go on. Send
 each defect in the phase's own change to its unit director. Route every other
 defect (one that was there before the phase, or lives in another unit's code)
 to the unit that owns it, as work in that unit's plan, never into this

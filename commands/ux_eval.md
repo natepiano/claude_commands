@@ -64,6 +64,13 @@ With `--context`, check that the shots show every state it names. A state no
 shot shows is a defect: Shot `—`, Rule `context`, Defect `no shot shows <state>`.
 
 Report any polish defect no rule covers yet as Rule `no rule: <proposed-stem>`.
+
+Look for canonical examples while judging. A shot is a candidate when it shows
+one rule broken so clearly that the defect needs no explaining (`bad`), or one
+rule met so well it is the look to copy (`good`). The guide keeps one of each
+per rule at `<guide>/examples/<stem>/bad.png` and `good.png`. List the folder
+(`ls`, never view it) and propose only a slot that is still empty. Propose at
+most three, each cropped to the region that shows the rule and nothing else.
 </Judge>
 
 ---
@@ -123,7 +130,18 @@ Verdict: pass | defects
 Under `readable-contrast` and `readable-size`, the Defect names the measured
 number and the floor: `Log body 3.3:1 over the lit horizon (floor 4.5:1)`.
 
-`pass` means no rows. Then stop.
+`pass` means no rows. When you found canonical candidates, add after the
+table:
+
+```markdown
+Canonical candidates
+
+| Shot | Rule | Slot | Crop (full-size px) | Why it is clear |
+| --- | --- | --- | --- | --- |
+| <full-size shot path> | <stem> | bad \| good | WxH+X+Y | <one line> |
+```
+
+Then stop.
 </Report>
 
 ---
@@ -133,4 +151,4 @@ number and the floor: `Log body 3.3:1 over the lit horizon (floor 4.5:1)`.
 - Read only. No edits, commits, branches or worktrees.
 - Judge only what the shots show. A defect names its place in the shot.
 - One defect seen in several shots is one row listing each shot.
-- Output nothing but the verdict and the table.
+- Output nothing but the verdict, the table and any canonical candidates.
