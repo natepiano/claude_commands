@@ -45,16 +45,21 @@
 # that differs from HEAD, so one lint record answers for each package. The same
 # call on the same tree then prints that record and its log and exits 0
 # without the cargo token: seats re-ran unchanged trees 416
-# times in the week to 2026-10-01. A failure is never recorded, a `test` that
-# changed the tree records nothing, and a run outside a delegate session is
-# never cached. end_session.sh deletes the records when the run ends.
+# times in the week to 2026-10-01. A failed `lint` is recorded the same way
+# and replayed with its full output and exit status, since lint on an
+# unchanged tree fails the same way (one seat ran 12 in a row on 2026-10-01).
+# A failed `test` is never recorded (tests flake), nor a run cut short by a
+# usage error, the sandbox or a kill. A `test` that changed the tree records
+# nothing, and a run outside a delegate session is never cached.
+# end_session.sh deletes the records when the run ends.
 #
 # Each record carries what a repeat would cost: the run's wall time minus
 # cargo's own "Finished … in" build times, since a repeat on the same tree
 # builds nothing. Every such call, --no-cache included, appends one line to
-# ~/.local/state/verify/events.jsonl: ran, failed, interrupted, or reused with
-# the seconds saved, plus machine, workspace, worktree, branch and commit. The
-# ledger outlives the records; /verify_saved reports it.
+# ~/.local/state/verify/events.jsonl: ran, failed, interrupted, reused (a
+# pass) or replayed (a lint failure) with the seconds saved, plus machine,
+# workspace, worktree, branch and commit. The ledger outlives the records;
+# /verify_saved reports it.
 #
 # Usage:
 #   verify.sh check <package>              fast compile feedback (workspace
@@ -74,8 +79,9 @@
 #                                          no other route to a gate. Names without a
 #                                          `/` are qualified as <package>/<name>
 #   … --no-cache                           test and lint: run even when this
-#                                          exact call already passed on this
-#                                          tree (a flake hunt)
+#                                          exact call already passed (or lint
+#                                          failed) on this tree, a flake hunt;
+#                                          the result replaces the record
 #   verify.sh fmt <package>               format only (checkpoint-commit backstop)
 #                                          — gated by config/lint.conf
 #   verify.sh example <package> <name>     clippy one example (only when the
@@ -301,22 +307,20 @@ for arg in "$@"; do
 done
 set -- "${ARGS[@]}"
 
-# Pass records and the call ledger (see the header): on for `test` and `lint` in
-# a delegate session. --no-cache turns off lookup and record; the call is still
-# logged.
+# Records and the call ledger (see the header): on for `test` and `lint` in a
+# delegate session. --no-cache turns off the lookup; its result is still
+# recorded, so a flake hunt that passes clears a recorded lint failure.
 CACHE_SESSION_DIR="${PLAN_DELEGATE_BOARD_DIR:-${PLAN_DELEGATE_SESSION_DIR:-}}"
-VERIFY_DIR=""
 CACHE_DIR=""
 if [[ -n "${CACHE_SESSION_DIR}" && ( "$CMD" == test || "$CMD" == lint ) ]]; then
-    VERIFY_DIR="${CACHE_SESSION_DIR}/verify_cache"
-    if [[ "${NO_CACHE}" -eq 0 ]]; then
-        CACHE_DIR="${VERIFY_DIR}"
-    fi
+    CACHE_DIR="${CACHE_SESSION_DIR}/verify_cache"
 fi
 RUN_LOG=""
 RUN_KEY=""
 RUN_STARTED=0
 LOOKUP_KEY=""
+LOOKUP_STATUS=0
+EXIT_STATUS=0
 
 tree_key() {
     local words=("$CMD" "${ARGS[@]}")
@@ -346,11 +350,11 @@ event.update((name, int(value or 0)) for name, value in zip(counts, sys.argv[8:1
 print(json.dumps(event))
 '
 
-# One ledger line per call: ran, failed, interrupted, or reused, with its
-# workspace (the repo every worktree shares), worktree, branch and commit. A
-# ledger that cannot be written loses the line, never the result.
+# One ledger line per call: ran, failed, interrupted, reused or replayed, with
+# its workspace (the repo every worktree shares), worktree, branch and commit.
+# A ledger that cannot be written loses the line, never the result.
 note_event() {
-    [[ -n "${VERIFY_DIR}" ]] || return 0
+    [[ -n "${CACHE_DIR}" ]] || return 0
     local outcome=$1 wait=$2 wall=$3 build=$4 saved=$5 top common branch commit
     top="$(git rev-parse --show-toplevel 2>/dev/null)" || return 0
     common="$(git rev-parse --path-format=absolute --git-common-dir 2>/dev/null)" || return 0
@@ -363,22 +367,37 @@ note_event() {
 }
 
 # Succeeds, after printing the record, when this call already passed on this
-# tree. Sets LOOKUP_KEY either way.
+# tree, or (lint) already failed on it; LOOKUP_STATUS is the status to exit
+# with. Sets LOOKUP_KEY either way, --no-cache included.
 cache_lookup() {
+    local record outcome="" word
     [[ -n "${CACHE_DIR}" ]] || return 1
     LOOKUP_KEY="$(tree_key)"
-    [[ -n "${LOOKUP_KEY}" && -f "${CACHE_DIR}/${LOOKUP_KEY}.pass" ]] || return 1
-    note_event reused "${SECONDS}" 0 0 \
-        "$(sed -n 's/^saved_s=//p' "${CACHE_DIR}/${LOOKUP_KEY}.pass")" || true
-    echo "verify.sh: PASS (recorded) — $(head -n 1 "${CACHE_DIR}/${LOOKUP_KEY}.pass")"
-    if ! head -n 1 "${CACHE_DIR}/${LOOKUP_KEY}.pass" \
-        | grep -qF "\`verify.sh $CMD${ARGS[*]:+ ${ARGS[*]}}\`"; then
-        echo "verify.sh: lint covers the workspace and every changed member, so that pass answers this package too."
+    [[ -n "${LOOKUP_KEY}" && "${NO_CACHE}" -eq 0 ]] || return 1
+    record="${CACHE_DIR}/${LOOKUP_KEY}"
+    if [[ -f "${record}.pass" ]]; then
+        record+=.pass outcome=reused word=PASS
+    elif [[ -f "${record}.fail" ]]; then
+        record+=.fail outcome=replayed word=FAIL
     fi
-    echo "verify.sh: the tree and every input are unchanged since, so nothing was rebuilt or re-run."
-    echo "verify.sh: that run's output is ${CACHE_DIR}/${LOOKUP_KEY}.log; its last lines:"
-    tail -n 5 "${CACHE_DIR}/${LOOKUP_KEY}.log" 2>/dev/null || true
-    echo "verify.sh: add --no-cache to run it anyway (a flake hunt)."
+    [[ -n "${outcome}" ]] || return 1
+    LOOKUP_STATUS="$(sed -n 's/^status=//p' "${record}")"
+    LOOKUP_STATUS="${LOOKUP_STATUS:-0}"
+    note_event "${outcome}" "${SECONDS}" 0 0 "$(sed -n 's/^saved_s=//p' "${record}")" || true
+    echo "verify.sh: ${word} (recorded) — $(head -n 1 "${record}")"
+    if ! head -n 1 "${record}" | grep -qF "\`verify.sh $CMD${ARGS[*]:+ ${ARGS[*]}}\`"; then
+        echo "verify.sh: lint covers the workspace and every changed member, so that result answers this package too."
+    fi
+    if [[ "${outcome}" == reused ]]; then
+        echo "verify.sh: the tree and every input are unchanged since, so nothing was rebuilt or re-run."
+        echo "verify.sh: that run's output is ${CACHE_DIR}/${LOOKUP_KEY}.log; its last lines:"
+        tail -n 5 "${CACHE_DIR}/${LOOKUP_KEY}.log" 2>/dev/null || true
+        echo "verify.sh: add --no-cache to run it anyway (a flake hunt)."
+        return 0
+    fi
+    echo "verify.sh: the tree and every input are unchanged since, so lint would fail the same way; nothing was re-run. Its output:"
+    cat "${CACHE_DIR}/${LOOKUP_KEY}.log" 2>/dev/null || true
+    echo "verify.sh: FAIL (recorded), status ${LOOKUP_STATUS}: fix the error above, wherever it is in the workspace, then lint again. --no-cache runs it anyway."
 }
 
 # Cargo prints "in 0.23s" or "in 1m 23s"; the rest of a run is what a repeat on
@@ -391,26 +410,41 @@ build_seconds() {
                END { printf "%d", total }'
 }
 
-# Records a pass under the tree as the run left it (lint's rewrites are part of
-# what passed), before the token is released so a peer queued on the same call
-# finds it. Fails when there is nothing to record.
+# Records a pass, or a lint failure, under the tree as the run left it (lint's
+# rewrites are part of the result), before the token is released so a peer
+# queued on the same call finds it. A record replaces the other kind on the
+# same tree. Fails when there is nothing to record.
 cache_record() {
-    local repeat=$1 key
+    local kind=$1 repeat=$2 key verb=passed other=fail
     key="$(tree_key)"
     if [[ -z "${key}" || ( "$CMD" == test && "${key}" != "${RUN_KEY}" ) ]]; then
         return 1
     fi
+    if [[ "${kind}" == fail ]]; then
+        verb="failed with status ${EXIT_STATUS}" other=pass
+    fi
     mv -f "${RUN_LOG}" "${CACHE_DIR}/${key}.log"
-    printf '`verify.sh %s` passed %s, run by %s\nsaved_s=%d\n' "$CMD${ARGS[*]:+ ${ARGS[*]}}" \
-        "$(date '+%Y-%m-%d %H:%M:%S')" "${PLAN_DELEGATE_TEAM_ROLE:-the unit director}" \
-        "${repeat}" > "${CACHE_DIR}/${key}.pass.tmp"
-    mv -f "${CACHE_DIR}/${key}.pass.tmp" "${CACHE_DIR}/${key}.pass"
+    printf '`verify.sh %s` %s %s, run by %s\nsaved_s=%d\nstatus=%d\n' \
+        "$CMD${ARGS[*]:+ ${ARGS[*]}}" "${verb}" "$(date '+%Y-%m-%d %H:%M:%S')" \
+        "${PLAN_DELEGATE_TEAM_ROLE:-the unit director}" "${repeat}" "${EXIT_STATUS}" \
+        > "${CACHE_DIR}/${key}.${kind}.tmp"
+    mv -f "${CACHE_DIR}/${key}.${kind}.tmp" "${CACHE_DIR}/${key}.${kind}"
+    rm -f "${CACHE_DIR}/${key}.${other}"
 }
 
-# Logs the finished run and records a pass. Runs once: INT/TERM and then EXIT
-# both reach it.
+# A failed lint is the tree's own answer unless the run never reached a
+# verdict: a usage or tooling error (2), the sandbox (3), or a kill (a status
+# past 128, or a compiler SIGKILL in the log, as earlyoom deals out).
+lint_failure_is_the_tree() {
+    [[ "$CMD" == lint ]] || return 1
+    (( EXIT_STATUS != 2 && EXIT_STATUS != 3 && EXIT_STATUS < 128 )) || return 1
+    ! grep -qaE 'SIGKILL|signal: 9' "${RUN_LOG}"
+}
+
+# Logs the finished run and records a pass or a lint failure. Runs once:
+# INT/TERM and then EXIT both reach it.
 finish_run() {
-    local status=$1 outcome=failed wall build repeat
+    local status=$1 outcome=failed wall build repeat kind=""
     [[ -n "${RUN_LOG}" ]] || return 0
     wall=$(( SECONDS - RUN_STARTED ))
     build="$(build_seconds)"
@@ -419,18 +453,19 @@ finish_run() {
         repeat=0
     fi
     case "${status}" in
-        completed) outcome=ran ;;
+        completed) outcome=ran kind=pass ;;
         interrupted) outcome=interrupted ;;
+        error) lint_failure_is_the_tree && kind=fail ;;
     esac
     note_event "${outcome}" "${RUN_STARTED}" "${wall}" "${build:-0}" 0
-    if [[ "${status}" != completed || -z "${CACHE_DIR}" ]] || ! cache_record "${repeat}"; then
+    if [[ -z "${kind}" || -z "${CACHE_DIR}" ]] || ! cache_record "${kind}" "${repeat}"; then
         rm -f "${RUN_LOG}"
     fi
     RUN_LOG=""
 }
 
 if cache_lookup; then
-    exit 0
+    exit "${LOOKUP_STATUS}"
 fi
 
 # Open a progress window for the duration of this run when a delegate session is
@@ -470,14 +505,14 @@ release_token() {
 }
 
 # Again with the token held: a peer running this same call on this tree held
-# the token until its pass was recorded.
+# the token until its result was recorded.
 if cache_lookup; then
     release_token
-    exit 0
+    exit "${LOOKUP_STATUS}"
 fi
-if [[ -n "${VERIFY_DIR}" ]] && mkdir -p "${VERIFY_DIR}"; then
+if [[ -n "${CACHE_DIR}" ]] && mkdir -p "${CACHE_DIR}"; then
     RUN_KEY="${LOOKUP_KEY}"
-    RUN_LOG="${VERIFY_DIR}/run.$$.log"
+    RUN_LOG="${CACHE_DIR}/run.$$.log"
     RUN_STARTED=${SECONDS}
     : > "${RUN_LOG}"
     exec > >(tee -a "${RUN_LOG}") 2> >(tee -a "${RUN_LOG}" >&2)
@@ -524,8 +559,8 @@ verify_cleanup() {
     release_token
 }
 # EXIT alone would report success for a failed cargo run, so branch on the
-# status the trap receives.
-trap '[[ $? -eq 0 ]] && verify_cleanup completed || verify_cleanup error' EXIT
+# status the trap receives; a lint failure record keeps it.
+trap 'EXIT_STATUS=$?; [[ ${EXIT_STATUS} -eq 0 ]] && verify_cleanup completed || verify_cleanup error' EXIT
 trap 'verify_cleanup interrupted' INT TERM
 
 case "$CMD" in

@@ -2,8 +2,9 @@
 """Report the time verify.sh pass records saved, for any span and workspace.
 
 Reads ~/.local/state/verify/events.jsonl, one line per delegate `test`/`lint`
-call, which verify.sh appends: ran, failed, interrupted, or reused with
-saved_s, the recorded run's wall time minus cargo's build time. The Mac's
+call, which verify.sh appends: ran, failed, interrupted, reused (a recorded
+pass) or replayed (a recorded lint failure) with saved_s, the recorded run's
+wall time minus cargo's build time. The Mac's
 ledger is read over ssh. A workspace is the repo every worktree shares, named
 by its folder (hana), so both machines and every worktree add into it.
 
@@ -119,7 +120,7 @@ def main() -> None:
         if workspace_filter and Path(event["workspace"]).name != workspace_filter:
             continue
         tally = tallies.setdefault(group_key(event, by), Tally())
-        if event["outcome"] == "reused":
+        if event["outcome"] in ("reused", "replayed"):
             tally.reused += 1
             tally.saved += event["saved_s"]
         elif event["outcome"] == "ran":
