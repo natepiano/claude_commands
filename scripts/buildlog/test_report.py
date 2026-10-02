@@ -50,12 +50,21 @@ class ReportTests(unittest.TestCase):
         lines = text.splitlines()
 
         self.assertLess(lines.index("### clippy"), lines.index("### mend"))
-        self.assertLess(lines.index("### mend"), lines.index("### Summary"))
+        self.assertLess(lines.index("### mend"), lines.index("### Summary: successes"))
+        self.assertLess(lines.index("### Summary: successes"), lines.index("### Summary: failures"))
+        self.assertLess(lines.index("### Summary: failures"), lines.index("### Summary: all"))
         self.assertIn("| verify.sh (agents) | 1 | 0 | 40.0 s | 40.0 s | 3.0 s | 37.0 s | 0 |", lines)
         self.assertIn("| cargo-port | 2 | 1 | 15.0 s | 10.0 s – 20.0 s | 4.0 s | 6.0 s |  |", lines)
-        summary = lines[lines.index("### Summary") :]
-        self.assertIn("| mend | 3 | 1 | 1.2 min | 23.3 s |  |", summary)
-        self.assertIn("| **All steps** | 4 | 2 | 1.7 min | 25.0 s |  |", summary)
+        successes = lines[lines.index("### Summary: successes") : lines.index("### Summary: failures")]
+        self.assertIn("| mend | 2 | 50.0 s | 25.0 s |  |", successes)
+        self.assertIn("| **All steps** | 2 | 50.0 s | 25.0 s |  |", successes)
+        self.assertFalse(any(line.startswith("| clippy") for line in successes))
+        failures = lines[lines.index("### Summary: failures") : lines.index("### Summary: all")]
+        self.assertIn("| clippy | 1 | 30.0 s | 30.0 s |  |", failures)
+        self.assertIn("| mend | 1 | 20.0 s | 20.0 s |  |", failures)
+        combined = lines[lines.index("### Summary: all") :]
+        self.assertIn("| mend | 3 | 1 | 1.2 min | 23.3 s |  |", combined)
+        self.assertIn("| **All steps** | 4 | 2 | 1.7 min | 25.0 s |  |", combined)
         self.assertIn("| reused | 1 |  | 1.0 min |", lines)
         self.assertIn("| CI | 1 | 0 | 10.0 min | 10.0 min |", lines)
         self.assertIn("1 steps under a temp folder (scratch and test builds) are left out.", text)

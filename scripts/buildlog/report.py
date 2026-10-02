@@ -1,7 +1,7 @@
 """buildlog report: one local day as markdown, a section per kind of step split by caller, then a summary.
 
-The summary at the bottom has one row per kind, every caller together, and a
-total. Steps that ran under a temp folder (scratch crates, buildlog's own test
+The summary at the bottom comes three times, successes, failures and all: one
+row per kind, every caller together, and a total. Steps that ran under a temp folder (scratch crates, buildlog's own test
 runs) are left out and counted in the footer.
 """
 
@@ -165,19 +165,28 @@ def ci_section(connection: sqlite3.Connection, day: str) -> tuple[list[str], str
     return section, f"CI: {runs} runs, {failed} failed, {seconds(total)} in all; jobs queued {seconds(queue)} on average."
 
 
-def summary(connection: sqlite3.Connection, day: str, found: list[str]) -> list[str]:
+SUMMARIES = [("successes", "status = 0", False), ("failures", "status <> 0", False), ("all", "1", True)]
+
+
+def summary(connection: sqlite3.Connection, day: str, found: list[str], which: str, with_failed: bool) -> list[str]:
+    """One row per kind, every caller together, then the total; kinds with no runs in the set are left out."""
     select = "count(*), sum(status <> 0), sum(duration_s), avg(duration_s), max(peak_mem_bytes)"
+    where = f"{ON_DAY} AND NOT {SCRATCH} AND {which}"
     rows = {
         cast(str, row[0]): row[1:]
-        for row in fetch(connection, f"SELECT step, {select} FROM steps WHERE {ON_DAY} AND NOT {SCRATCH} GROUP BY step", day)
+        for row in fetch(connection, f"SELECT step, {select} FROM steps WHERE {where} GROUP BY step", day)
     }
-    total = fetch(connection, f"SELECT {select} FROM steps WHERE {ON_DAY} AND NOT {SCRATCH}", day)[0]
+    total = fetch(connection, f"SELECT {select} FROM steps WHERE {where}", day)[0]
+    if not total[0]:
+        return ["None."]
 
     def line(name: str, row: Row) -> list[str]:
-        return [name, count(row[0]), count(row[1]), seconds(row[2]), seconds(row[3]), gib(row[4])]
+        failed = [count(row[1])] if with_failed else []
+        return [name, count(row[0]), *failed, seconds(row[2]), seconds(row[3]), gib(row[4])]
 
-    body = [line(kind, rows[kind]) for kind in found] + [line("**All steps**", total)]
-    return table(["Kind", "Runs", "Failed", "Total", "Avg", "Peak memory"], body)
+    body = [line(kind, rows[kind]) for kind in found if kind in rows] + [line("**All steps**", total)]
+    head = ["Kind", "Runs", *(["Failed"] if with_failed else []), "Total", "Avg", "Peak memory"]
+    return table(head, body)
 
 
 def mac_note() -> str:
@@ -198,9 +207,13 @@ def report(connection: sqlite3.Connection, day: str) -> str:
         lines += kind_section(connection, day, kind, hosts)
     calls, calls_line = calls_section(connection, day)
     ci, ci_line = ci_section(connection, day)
-    lines += calls + ci + ["### Summary", ""]
-    lines += summary(connection, day, found) if found else ["No build steps recorded."]
-    lines += ["", calls_line, ci_line]
+    lines += calls + ci
+    if found:
+        for name, which, with_failed in SUMMARIES:
+            lines += [f"### Summary: {name}", "", *summary(connection, day, found, which, with_failed), ""]
+    else:
+        lines += ["### Summary", "", "No build steps recorded.", ""]
+    lines += [calls_line, ci_line]
     footer = mac_note() + " Peak memory includes file cache."
     if scratch:
         footer += f" {scratch} steps under a temp folder (scratch and test builds) are left out."
