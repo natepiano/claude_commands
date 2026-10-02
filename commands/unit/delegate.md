@@ -356,11 +356,18 @@ Rules:
   here takes the `cargo` token on its own, so a run may wait for a peer, and a
   result is a gate only once the slot owning that package's files has posted
   `done`.
-- `check` is optional feedback, not a gate. Every modified package gets `lint`
-  and then `test`, in that order: `lint` rewrites the tree (mend fixes, then
-  format), so a `test` run before it proves nothing about the tree that gets
-  committed, and a `test` run after it is the one that counts. Never run the
-  suites twice around a lint; run lint first, once. Trace changed public APIs,
+- `check` is optional feedback, not a gate. After the seat's last edit, run
+  `lint` once, naming any one modified package, then `test` for every modified
+  package. Lint is never per crate: one run covers the whole workspace (mend
+  and clippy across it, format and rustdoc for every changed member). A failed
+  lint means fix the error it names, wherever it is in the workspace, then lint
+  once more; never re-run lint on a tree that has not changed. User,
+  2026-10-01: a Work Order that said "for each crate, lint first" cost 13 lint
+  runs of one workspace, all failing on one error. Lint comes before test
+  because `lint` rewrites the tree (mend fixes, then format), so a `test` run
+  before it proves nothing about the tree that gets committed, and a `test`
+  run after it is the one that counts. Never run the suites twice around a
+  lint. Trace changed public APIs,
   traits, registration, and plugin wiring to modified callers. Name an integration target explicitly only to re-run it
   alone. Add example lines only when the phase owns them.
 - Tests are the only testing: a passing `test` run proves the package builds.

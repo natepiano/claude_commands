@@ -237,7 +237,9 @@ branch, port and the files you own.
     unchanged tree failed on the same error; 60 failed lints in one day cost
     about 75 minutes). Lint covers the whole workspace. When it fails, fix
     the error it names, wherever it is in the workspace, then lint once.
-    Never re-run lint on a tree that has not changed. Fix a file you do not
+    Never re-run lint on a tree that has not changed. A Work Order runs lint
+    once after the seat's edits, never once per crate; per crate is right
+    only for test (`/unit:delegate`). Fix a file you do not
     own through item 9, and name it in your checkpoint notice. Tell your seats
     this in every Work Order that runs lint.
 14. **When others wait on you** (user, 2026-09-29). When your checkpoint turns
