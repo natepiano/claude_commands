@@ -1086,6 +1086,16 @@ instructions name; with none, skip and say so in one line.
    own `UX review` activity, given just those rows and their shots — and record
    each with `findings.py verdict`. A `still_open` row returns to step 4's
    gate. Then continue to <RunPhaseReview/>.
+6. **The notice's verdict.** In a production unit, the checkpoint notice's
+   `design check:` line (<ProductionUnit/> item 3) is one fresh helper's
+   verdict on exactly the shots the notice sends, from a build of the
+   checkpoint's code. Step 5's partial re-judge does not count, nor does a
+   verdict from before any later change to what users see (a repair, a merge
+   of the merge branch). In those cases, before the notice, re-shoot the whole
+   set and judge it once more as in steps 1–3. Send on a `pass`, or with each
+   defect moved to a follow-up phase (item 7's landing rule); a defect left in
+   the phase goes back to step 4. The showrunner merges on that line and runs
+   no check of its own (user rule 2026-10-01).
 </UXReview>
 
 <RunProjectStyleReview>

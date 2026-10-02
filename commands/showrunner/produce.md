@@ -219,7 +219,7 @@ The prompt:
 > shows SESSION GONE, CLAUDE NOT RUNNING, FORM WAITING, a usage limit, or a
 > DECISION for the user, that subject goes first, with `needed:` saying what
 > the user must do. Do no other work in this turn, except `/unit:eta` requests,
-> merging a unit's checkpoint after viewing its shots, acting on a BLOCK
+> merging a unit's checkpoint on a fresh design-check pass, acting on a BLOCK
 > past its limit (`/showrunner:produce` → Dependencies, rule 4), and compacting
 > a unit director after its checkpoint (`/showrunner:produce` → Compact after a
 > checkpoint).
@@ -320,10 +320,23 @@ Input: the unit, phase, hash and shots from its notice.
    production code. One with no consumer goes back to the unit director as a
    finding.
 6. **Design check.** A change users can see, in the app or in any example,
-   needs shots. Run
-   <DesignCheck/>. Send each defect back to the unit director with the shot path, the
+   needs shots and the unit's own verdict on them: the notice's `design check:`
+   line (`production_format.md` → <ProductionUnit/> item 3). The unit runs the
+   check before sending; you do not repeat it.
+   - **Fresh pass:** the line says `pass`, or names a follow-up phase for each
+     defect, from a fresh helper on exactly the notice's shots, built from the
+     notice's hash. Merge.
+   - **Missing or stale:** no line, other shots than the notice sends, or a
+     build from before a later change to what users see. Run <DesignCheck/>
+     yourself, and tell the unit director in one line that its notice lacked a
+     fresh verdict.
+   - **Defects left in the phase:** send the notice back; the unit repairs
+     them, re-judges and sends a new notice.
+
+   Send each defect back to the unit director with the shot path, the
    rule and the fix, and do not merge. Never ask the user whether a visible
-   defect matters.
+   defect matters. User rule 2026-10-01 (nightly review): the unit judges its
+   own shots before it moves on, so holds are not found after it has.
 7. **Merge.** Write the message to `<SCRATCH>/merge_<short hash>.msg`:
 
    ```
@@ -409,8 +422,12 @@ guide named in the production doc holds the rules that make the bar concrete.
 ---
 
 <DesignCheck>
-Screenshots and the guide never load into the showrunner's own context. For
-each checkpoint with shots, spawn a fresh helper agent with this prompt:
+Screenshots and the guide never load into the showrunner's own context: never
+Read a shot, not even to look before a merge or before the user sees it. The
+2026-10-01 nightly review counted 116 shots (227k tokens) loaded there in 2.6
+days. Units run this check themselves before each checkpoint notice
+(<MergeCheckpoint/> step 6). Run it here only when a notice's verdict is
+missing or stale: spawn a fresh helper agent with this prompt:
 
 > Read `~/.claude/commands/ux_eval.md` and follow it for these shots:
 > <paths>. Guide: <UX guide path>. Context: <unit> phase <N> — <what
@@ -650,8 +667,8 @@ When every unit's final-gate and as-built checkpoints are merged:
 - The showrunner writes no implementation code, tests or Work Orders in a unit's
   files.
 - Only the showrunner pushes the merge branch, and never with force.
-- Merge only from a checkpoint notice. Never merge a visible change before
-  viewing its shots.
+- Merge only from a checkpoint notice. Never merge a visible change before a
+  fresh design-check pass on its shots (<MergeCheckpoint/> step 6).
 - **One phase at a time.** A unit starts phase N+1 only after phase N is merged
   into the merge branch. A held checkpoint is fixed inside phase N; the unit
   never builds the next phase on top of it. User rule 2026-10-01: widget ran

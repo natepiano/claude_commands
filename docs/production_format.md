@@ -141,6 +141,7 @@ branch, port and the files you own.
    ```
    From <unit>: phase <N> checkpoint <hash> — <title>. Shots: <paths | none, no visible change>. Phase <next> ETA: <HH:MM zone>
    review trial: ux <N> findings, code <N> findings, review-seat minutes <M>
+   design check: <pass | N defects, each moved to <phase>> — fresh helper on exactly these shots, built from <hash>
    ```
 
    A phase checkpoint's notice carries the second line:
@@ -152,8 +153,20 @@ branch, port and the files you own.
    normal size on your port. They show each changed state, including the ones
    the phase fixed. The first set covers every tool, side and state the change
    reaches, so the design check finds the defects in one batch, not one per
-   round. Then continue to the next phase; do not wait for the merge
-   unless that phase has a gate.
+   round.
+
+   Such a notice carries the third line: the verdict of the design check
+   (`/unit:delegate` → <UXReview/>) that a fresh helper gave on exactly the
+   shots this notice sends, taken from a build of `<hash>`. A verdict on other
+   shots, or on a build from before a later change to what users see, is
+   stale: re-shoot and re-judge before sending. Send the notice on a `pass`,
+   or with each defect moved to a follow-up phase under item 7, named on the
+   line. User rule 2026-10-01 (nightly review): 2 of about 25 notices carried
+   a fresh verdict, and 3 holds were caught after the unit had moved on, 187
+   minutes in 2.6 days; with a fresh pass the merge followed in 1–2 minutes.
+
+   Start the next phase only after the showrunner merges this one
+   (`/showrunner:produce` → Rules, one phase at a time).
 4. **The merge branch is the showrunner's.** Never merge into it or push it.
    <PeriodicCI/> and <CICleanup/> do not run in a unit; the showrunner runs CI
    on the merge branch.
