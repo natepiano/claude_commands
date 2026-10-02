@@ -1066,8 +1066,9 @@ instructions name; with none, skip and say so in one line.
    design-check prompt, so the shots never enter your context:
 
    > Read `~/.claude/commands/ux_eval.md` and follow it for these shots:
-   > <paths>. Guide: <path>. Context: <unit> phase <N> — <what changed, and
-   > every state the shots must show>. Also judge by the three gods
+   > <paths>. Guide: <path>. Scale: <shot pixels per logical pixel>. Context:
+   > <unit> phase <N> — <what changed, every state the shots must show, and
+   > each shot's window size in logical pixels>. Also judge by the three gods
    > (`<ThreeGods/>` in `~/.claude/docs/decision_criteria.md`) and these
    > production rules: <the production doc's rules that concern looks>. You
    > only review: edit nothing. Return only the verdict and the table.

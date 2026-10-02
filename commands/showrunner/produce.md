@@ -433,8 +433,9 @@ days. Units run this check themselves before each checkpoint notice
 missing or stale: spawn a fresh helper agent with this prompt:
 
 > Read `~/.claude/commands/ux_eval.md` and follow it for these shots:
-> <paths>. Guide: <UX guide path>. Context: <unit> phase <N> — <what
-> changed, and every state the shots must show>. Also apply these production
+> <paths>. Guide: <UX guide path>. Scale: <shot pixels per logical pixel>.
+> Context: <unit> phase <N> — <what changed, every state the shots must
+> show, and each shot's window size in logical pixels>. Also apply these production
 > rules: <the doc's Production rules that concern looks>. Return only the
 > verdict and the table.
 
