@@ -29,7 +29,7 @@ from urllib.parse import quote
 
 import store
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 LOCK_NAME = "index.lock"
 MARK_BYTES = 256
 BUSY_TIMEOUT_MS = 30_000
@@ -52,6 +52,13 @@ STEP_COLUMNS: list[Column] = [
     ("worktree_name", "TEXT", "worktree's folder name"),
     ("branch", "TEXT", "branch, or 'detached'"),
     ("sha", "TEXT", "short commit"),
+    (
+        "tree_key",
+        "TEXT",
+        "sha256 of the files the step saw (HEAD's tree plus every changed path's content, treekey.py);"
+        + " NULL when they changed during the step or are unknown. `buildlog tree-key [dir]` prints a folder's",
+    ),
+    ("tree_changed", "INTEGER", "1 when the files changed during the step (fmt, mend --fix, an edit), 0 when not, NULL when unknown"),
     ("caller", "TEXT", "verify, cargo-port, validate_ci (push gate), agent, alias (a person at a terminal), unknown"),
     ("seat", "TEXT", "delegate seat (PLAN_DELEGATE_TEAM_ROLE)"),
     ("delegate_session", "TEXT", "delegate session folder name"),
@@ -99,17 +106,25 @@ CALL_COLUMNS: list[Column] = [
     ("host", "TEXT", "host"),
     ("started_at", "TEXT", "UTC ISO"),
     ("ended_at", "TEXT", "UTC ISO"),
-    ("tool", "TEXT", "verify.sh"),
-    ("command", "TEXT", "'lint hana', 'test hana_diegetic', ..."),
-    ("verb", "TEXT", "check, test, lint, fmt, example, example-test, final"),
+    ("tool", "TEXT", "verify.sh (an agent's call), port-lint (cargo-port's lint command)"),
+    ("caller", "TEXT", "verify for verify.sh (NULL before 2026-10-02), cargo-port for port-lint"),
+    ("command", "TEXT", "'lint hana', 'test hana_diegetic', 'port-lint clippy', ..."),
+    ("verb", "TEXT", "verify.sh: check, test, lint, fmt, example, example-test, final; port-lint: clippy, mend, sweep"),
     ("package", "TEXT", "the package named"),
-    ("outcome", "TEXT", "ran, failed, interrupted, reused (a recorded pass), replayed (a recorded lint failure)"),
+    (
+        "outcome",
+        "TEXT",
+        "ran, failed, interrupted, reused (a recorded pass), replayed (a recorded failure),"
+        + " deferred (port-lint: an agent or a cargo was busy in the worktree)",
+    ),
     ("status", "INTEGER", "exit status, NULL when unknown or interrupted"),
     ("cached", "INTEGER", "1 when the call could use a pass record (a delegate session's test or lint)"),
     ("wait_s", "INTEGER", "seconds before the run began (the cargo token)"),
     ("wall_s", "INTEGER", "seconds the run took"),
     ("build_s", "INTEGER", "cargo's own build seconds, NULL when unmeasured"),
     ("saved_s", "INTEGER", "seconds a reused or replayed record saved"),
+    ("reuses", "TEXT", "port-lint: steps.id of the step a reused or replayed call stood in for"),
+    ("reason", "TEXT", "port-lint: the line a deferred call printed, naming who was busy"),
     ("cwd", "TEXT", "where it ran"),
     ("repo_path", "TEXT", "repo every worktree shares"),
     ("repo", "TEXT", "repo name"),
@@ -181,7 +196,11 @@ TABLES: dict[str, tuple[list[Column], str, str]] = {
         "PRIMARY KEY (step_id, binary, test)",
         "per-test rows of a nextest step, kept only for tests that failed, were retried, took over 1 s or hit SLOW",
     ),
-    "calls": (CALL_COLUMNS, "", "one row per verify.sh call; its steps carry call_id"),
+    "calls": (
+        CALL_COLUMNS,
+        "",
+        "one row per verify.sh call (its steps carry call_id), and per port-lint call that ran nothing",
+    ),
     "ci_runs": (CI_RUN_COLUMNS, "PRIMARY KEY (run_id, attempt)", "GitHub Actions run attempts of natepiano/hana"),
     "ci_jobs": (CI_JOB_COLUMNS, "", "their jobs"),
     "ci_steps": (CI_STEP_COLUMNS, "PRIMARY KEY (job_id, number)", "the jobs' steps"),
@@ -198,10 +217,10 @@ VIEWS: dict[str, tuple[str, str]] = {
 FROM steps GROUP BY day, host, repo, step, caller""",
     ),
     "call_outcomes": (
-        "verify.sh calls per local day, host, repo, verb and outcome: calls, wall_s, saved_s",
-        """SELECT date(started_at, 'localtime') AS day, host, repo, verb, outcome,
+        "calls per local day, host, repo, tool, verb and outcome: calls, wall_s, saved_s",
+        """SELECT date(started_at, 'localtime') AS day, host, repo, tool, verb, outcome,
        count(*) AS calls, sum(wall_s) AS wall_s, sum(saved_s) AS saved_s
-FROM calls GROUP BY day, host, repo, verb, outcome""",
+FROM calls GROUP BY day, host, repo, tool, verb, outcome""",
     ),
     "slow_tests": (
         "tests over 1 s or reported SLOW, per repo and test: runs, avg_s, max_s, slow_runs, last_at",
@@ -265,6 +284,7 @@ def create_schema(connection: sqlite3.Connection) -> None:
         statements.append(f"CREATE TABLE {table} ({', '.join(body)})")
         statements.append(f"CREATE INDEX {table}_src ON {table} (src)")
     statements.append("CREATE INDEX steps_started ON steps (started_at)")
+    statements.append("CREATE INDEX steps_tree ON steps (worktree, step, tree_key)")
     statements.append("CREATE INDEX tests_step ON tests (step_id)")
     statements.append("CREATE INDEX calls_started ON calls (started_at)")
     statements.append("CREATE INDEX ci_jobs_run ON ci_jobs (run_id, attempt)")

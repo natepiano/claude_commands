@@ -5,6 +5,7 @@
   buildlog schema                   tables, columns, views and example queries
   buildlog report [YYYY-MM-DD]      one day (default today) as markdown: each kind by caller, then a summary
   buildlog reindex                  rebuild the index from the JSON lines
+  buildlog tree-key [DIR]           the tree key of DIR's worktree (default the current folder; treekey.py)
   buildlog sync                     exchange records with the Mac (natedev's hourly job)
   buildlog ci                       record new GitHub Actions run attempts
   buildlog hourly                   sync, then ci, each whatever the other did
@@ -16,6 +17,7 @@ Records live in ~/.local/state/buildlog (BUILDLOG_DIR moves it); see store.py.
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
 import sys
 import time
@@ -28,6 +30,7 @@ import record
 import report
 import store
 import sync
+import treekey
 
 EXAMPLES: list[tuple[str, str]] = [
     (
@@ -55,7 +58,8 @@ EXAMPLES: list[tuple[str, str]] = [
     (
         "How much time did verify.sh pass records save per repo this week?",
         "SELECT repo, sum(calls) AS calls, sum(saved_s) AS saved_s FROM call_outcomes"
-        + " WHERE outcome IN ('reused', 'replayed') AND day >= date('now', 'localtime', '-6 days') GROUP BY repo",
+        + " WHERE tool = 'verify.sh' AND outcome IN ('reused', 'replayed')"
+        + " AND day >= date('now', 'localtime', '-6 days') GROUP BY repo",
     ),
     (
         "Which steps used the most memory?",
@@ -195,6 +199,12 @@ def main(argv: list[str]) -> int:
         return schema()
     if command == "report":
         return day_report(rest)
+    if command == "tree-key":
+        key = treekey.tree_key(rest[0] if rest else os.getcwd())
+        if key is None:
+            return 1
+        print(key)
+        return 0
     if command == "reindex":
         lines = index.reindex()
         print(f"buildlog reindex: {lines} records indexed in {index.index_path()}")

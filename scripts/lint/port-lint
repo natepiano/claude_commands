@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+# port-lint -- cargo-port's lint command: defer while someone works in the
+# worktree, reuse a recorded clippy or mend step on the same files, or run
+# lint. See ~/.claude/scripts/buildlog/port_lint.py. bash 3.2 for the Mac.
+exec "$HOME/.claude/scripts/lib/py" "$HOME/.claude/scripts/buildlog/port_lint.py" "$@"

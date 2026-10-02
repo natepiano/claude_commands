@@ -70,11 +70,32 @@ class ReportTests(unittest.TestCase):
         self.assertIn("1 steps under a temp folder (scratch and test builds) are left out.", text)
         self.assertNotIn("agent (direct)", text)
 
+    def test_port_lint_calls_have_their_own_section(self) -> None:
+        self.write(
+            self.root / "natedev" / "2026-10.jsonl",
+            step("c1", step="clippy", caller="cargo-port", duration_s=30.0),
+            call("v1", outcome="reused", saved_s=60),
+            call("p1", tool="port-lint", outcome="reused", saved_s=90),
+            call("p2", tool="port-lint", outcome="reused", saved_s=30),
+            call("p3", tool="port-lint", outcome="deferred", status=75),
+        )
+        text = self.render()
+        lines = text.splitlines()
+        verify = lines[lines.index("### Agent calls (verify.sh)") : lines.index("### cargo-port calls (port-lint)")]
+        self.assertIn("| reused | 1 |  | 1.0 min |", verify)
+        port = lines[lines.index("### cargo-port calls (port-lint)") : lines.index("### CI") if "### CI" in lines else None]
+        self.assertIn("| Outcome | Calls | Saved |", port)
+        self.assertIn("| reused | 2 | 2.0 min |", port)
+        self.assertIn("| deferred | 1 |  |", port)
+        self.assertIn("Agent calls: 1 (1 reused), 1.0 min saved by pass records.", lines)
+        self.assertIn("cargo-port calls: 3 (2 reused, 1 deferred), 2.0 min saved by recorded steps.", lines)
+
     def test_empty_day(self) -> None:
         text = self.render()
         self.assertIn("No build steps recorded.", text)
         self.assertIn("Agent calls: none.", text)
         self.assertIn("CI: no runs.", text)
+        self.assertNotIn("cargo-port calls", text)
 
 
 if __name__ == "__main__":

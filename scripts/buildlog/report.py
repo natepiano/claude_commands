@@ -24,7 +24,7 @@ CALLER_LABELS = {
     "validate_ci": "push gate",
     "unknown": "unknown",
 }
-OUTCOME_ORDER = ["ran", "failed", "interrupted", "reused", "replayed"]
+OUTCOME_ORDER = ["ran", "failed", "interrupted", "reused", "replayed", "deferred"]
 SCRATCH = "(cwd LIKE '/tmp/%' OR cwd LIKE '/var/folders/%' OR cwd LIKE '/private/var/folders/%')"
 ON_DAY = "date(started_at, 'localtime') = ?"
 COMMON_HEAD = ["Runs", "Failed", "Avg", "Range"]
@@ -130,21 +130,41 @@ def kind_section(connection: sqlite3.Connection, day: str, kind: str, hosts: int
     return [f"### {kind}", "", *table(["Caller", *COMMON_HEAD, *(column.title for column in extra)], body), ""]
 
 
-def calls_section(connection: sqlite3.Connection, day: str) -> tuple[list[str], str]:
+def outcomes(connection: sqlite3.Connection, day: str, tool: str) -> list[Row]:
+    """outcome, calls, wall and saved seconds of one tool's calls, in OUTCOME_ORDER."""
     rows = fetch(
         connection,
-        f"SELECT outcome, count(*), sum(wall_s), sum(saved_s) FROM calls WHERE {ON_DAY} GROUP BY outcome",
+        f"SELECT outcome, count(*), sum(wall_s), sum(saved_s) FROM calls WHERE {ON_DAY} AND tool = ? GROUP BY outcome",
         day,
+        tool,
     )
+    rows.sort(key=lambda row: OUTCOME_ORDER.index(str(row[0])) if row[0] in OUTCOME_ORDER else len(OUTCOME_ORDER))
+    return rows
+
+
+def calls_section(connection: sqlite3.Connection, day: str) -> tuple[list[str], str]:
+    rows = outcomes(connection, day, "verify.sh")
     if not rows:
         return [], "Agent calls: none."
-    rows.sort(key=lambda row: OUTCOME_ORDER.index(str(row[0])) if row[0] in OUTCOME_ORDER else len(OUTCOME_ORDER))
     body = [[str(row[0]), count(row[1]), some_seconds(row[2]), some_seconds(row[3])] for row in rows]
     total = sum(cast(int, row[1]) for row in rows)
     saved = sum(cast(int, row[3] or 0) for row in rows)
     parts = ", ".join(f"{count(row[1])} {row[0]}" for row in rows)
     section = ["### Agent calls (verify.sh)", "", *table(["Outcome", "Calls", "Wall", "Saved"], body), ""]
     return section, f"Agent calls: {total} ({parts}), {seconds(saved)} saved by pass records."
+
+
+def port_lint_section(connection: sqlite3.Connection, day: str) -> tuple[list[str], list[str]]:
+    """cargo-port's lint calls that ran nothing; the ones that ran are its steps above. Nothing at all when none."""
+    rows = outcomes(connection, day, "port-lint")
+    if not rows:
+        return [], []
+    body = [[str(row[0]), count(row[1]), some_seconds(row[3])] for row in rows]
+    total = sum(cast(int, row[1]) for row in rows)
+    saved = sum(cast(int, row[3] or 0) for row in rows)
+    parts = ", ".join(f"{count(row[1])} {row[0]}" for row in rows)
+    section = ["### cargo-port calls (port-lint)", "", *table(["Outcome", "Calls", "Saved"], body), ""]
+    return section, [f"cargo-port calls: {total} ({parts}), {seconds(saved)} saved by recorded steps."]
 
 
 def ci_section(connection: sqlite3.Connection, day: str) -> tuple[list[str], str]:
@@ -206,14 +226,15 @@ def report(connection: sqlite3.Connection, day: str) -> str:
     for kind in found:
         lines += kind_section(connection, day, kind, hosts)
     calls, calls_line = calls_section(connection, day)
+    port_lint, port_lint_line = port_lint_section(connection, day)
     ci, ci_line = ci_section(connection, day)
-    lines += calls + ci
+    lines += calls + port_lint + ci
     if found:
         for name, which, with_failed in SUMMARIES:
             lines += [f"### Summary: {name}", "", *summary(connection, day, found, which, with_failed), ""]
     else:
         lines += ["### Summary", "", "No build steps recorded.", ""]
-    lines += [calls_line, ci_line]
+    lines += [calls_line, *port_lint_line, ci_line]
     footer = mac_note() + " Peak memory includes file cache."
     if scratch:
         footer += f" {scratch} steps under a temp folder (scratch and test builds) are left out."

@@ -313,6 +313,34 @@ class IndexTests(unittest.TestCase):
         self.assertEqual(runs, [(1, 1, 2, 600.0), (1, 2, 1, 600.0)])
         self.assertEqual(len(self.rows("SELECT * FROM ci_steps")), 3)
 
+    def test_tree_and_port_lint_columns(self) -> None:
+        self.write(
+            self.host_file,
+            step("s0", tree_key="k" * 64, tree_changed=False),
+            step("s1", tree_key=None, tree_changed=True),
+            step("s2"),
+            call("p0", tool="port-lint", caller="cargo-port", outcome="reused", reuses="s0", saved_s=42),
+            call("p1", tool="port-lint", caller="cargo-port", outcome="deferred", status=75, reason="port-lint: deferred"),
+        )
+        _ = index.update()
+        steps = self.rows("SELECT id, tree_key, tree_changed FROM steps ORDER BY id")
+        self.assertEqual(steps, [("s0", "k" * 64, 0), ("s1", None, 1), ("s2", None, None)])
+        calls = self.rows("SELECT id, tool, caller, outcome, status, reuses, reason FROM calls ORDER BY id")
+        self.assertEqual(
+            calls,
+            [
+                ("p0", "port-lint", "cargo-port", "reused", 0, "s0", None),
+                ("p1", "port-lint", "cargo-port", "deferred", 75, None, "port-lint: deferred"),
+            ],
+        )
+        plan = self.rows(
+            "EXPLAIN QUERY PLAN SELECT id FROM steps WHERE worktree = ? AND step = ? AND tree_key = ?",
+            "/r/feature",
+            "clippy",
+            "k" * 64,
+        )
+        self.assertIn("steps_tree", str(plan))
+
     def test_cli_query_json(self) -> None:
         self.write(self.host_file, step("s0", status=0), step("s1", status=101))
         result = subprocess.run(

@@ -1,12 +1,20 @@
 #!/usr/bin/env python3
 """Write one build-log record: a step run() ran, or a verify.sh call.
 
+port_lint.py writes its own call records through write_call() here.
+
   record.py step STATUS START END TTY LOG PEAK ARGV...
       From invoke.sh's run(), detached, after every step. START and END are
       epoch seconds; TTY is 1 when a terminal watched the step (no log is
       captured then); LOG is the step's output handed off by run(), PEAK the
       file the cgroup scope wrote memory.peak to. Either may be empty. Both
-      are deleted here.
+      are deleted here. BUILDLOG_TREE_START is the tree key `key` printed
+      before the step; the key taken here, after it, decides tree_key and
+      tree_changed.
+  record.py key ARGV...
+      From invoke.sh's run(), before every step: print the tree key
+      (treekey.py) of the worktree the step would be recorded under, or
+      nothing.
   record.py call OUTCOME STATUS CACHED WAIT WALL BUILD SAVED ELAPSED VERB [ARG...]
       From verify.sh, once per call. OUTCOME is ran, failed, interrupted,
       reused or replayed; CACHED is 1 when the call was eligible for a pass
@@ -37,6 +45,7 @@ from typing import TypedDict, cast
 
 import parse
 import store
+import treekey
 
 RECORD_VERSION = 1
 GIT_TIMEOUT_S = 5
@@ -181,6 +190,13 @@ def peak_bytes(path: str) -> int | None:
         return None
 
 
+def tree_facts(start: str | None, end: str | None) -> dict[str, object]:
+    """The key when the tree was the same before and after the step; tree_changed only when both are known."""
+    if not start or not end:
+        return {"tree_key": None, "tree_changed": None}
+    return {"tree_key": start if start == end else None, "tree_changed": start != end}
+
+
 def keep_log(data: bytes, host: str, epoch: float, record_id: str) -> str:
     relative = f"{host}/{store.LOGS_DIR}/{store.month(epoch)}/{record_id}.log.gz"
     target = store.root() / relative
@@ -202,6 +218,8 @@ def step(args: list[str]) -> None:
         status = int(status_text)
         host = store.host_name()
         cwd = os.getcwd()
+        directory = git_directory(argv, cwd)
+        tree = tree_facts(os.environ.get("BUILDLOG_TREE_START"), treekey.tree_key(directory))
         name = parse.step_name(argv)
         record_id = new_id(host, start)
         facts = parse.no_facts()
@@ -225,7 +243,8 @@ def step(args: list[str]) -> None:
             "step": name,
             "argv": argv,
             "cwd": cwd,
-            **git_facts(git_directory(argv, cwd)),
+            **git_facts(directory),
+            **tree,
             "caller": caller(tty),
             **who(),
             "call_id": os.environ.get("BUILDLOG_CALL_ID") or None,
@@ -250,21 +269,39 @@ def optional_int(text: str) -> int | None:
     return int(float(text)) if text.strip() else None
 
 
-def call(args: list[str]) -> None:
-    outcome, status, cached, wait, wall, build, saved, elapsed, verb = args[:9]
-    words = args[9:]
+def write_call(started: float, fields: dict[str, object], record_id: str | None = None) -> None:
+    """Append a call record: fields hold what the tool knows, this adds where, when and for whom.
+
+    verify.sh and port-lint both write through here. reuses and reason are
+    port-lint's; verify.sh leaves them NULL.
+    """
     end = time.time()
     host = store.host_name()
     cwd = os.getcwd()
-    started = end - float(elapsed or 0)
     record: dict[str, object] = {
         "kind": "call",
         "v": RECORD_VERSION,
-        "id": os.environ.get("BUILDLOG_CALL_ID") or new_id(host, started),
+        "id": record_id or new_id(host, started),
         "host": host,
         "started_at": store.utc_iso(started),
         "ended_at": store.utc_iso(end),
+        "reuses": None,
+        "reason": None,
+        **fields,
+        "cwd": cwd,
+        **git_facts(cwd),
+        **who(),
+        "backfilled": False,
+    }
+    store.append_line(store.host_file(host, started), record)
+
+
+def call(args: list[str]) -> None:
+    outcome, status, cached, wait, wall, build, saved, elapsed, verb = args[:9]
+    words = args[9:]
+    fields: dict[str, object] = {
         "tool": "verify.sh",
+        "caller": os.environ.get("BUILDLOG_CALLER") or "verify",
         "command": " ".join([verb, *words]),
         "verb": verb,
         "package": words[0] if words and verb != "final" else None,
@@ -275,12 +312,8 @@ def call(args: list[str]) -> None:
         "wall_s": optional_int(wall) or 0,
         "build_s": optional_int(build),
         "saved_s": optional_int(saved) or 0,
-        "cwd": cwd,
-        **git_facts(cwd),
-        **who(),
-        "backfilled": False,
     }
-    store.append_line(store.host_file(host, started), record)
+    write_call(time.time() - float(elapsed or 0), fields, os.environ.get("BUILDLOG_CALL_ID"))
 
 
 def backfilled_ids() -> set[str]:
@@ -329,6 +362,7 @@ def backfill(args: list[str]) -> None:
             "started_at": store.utc_iso(at - event["wait_s"] - event["wall_s"]),
             "ended_at": store.utc_iso(at),
             "tool": "verify.sh",
+            "caller": "verify",
             "command": event["command"],
             "verb": words[0] if words else None,
             "package": words[1] if len(words) > 1 else None,
@@ -368,6 +402,10 @@ def main(argv: list[str]) -> int:
         if command == "step":
             detach()
             step(rest)
+        elif command == "key":
+            found = treekey.tree_key(git_directory(rest, os.getcwd()))
+            if found:
+                print(found)
         elif command == "call":
             call(rest)
         else:

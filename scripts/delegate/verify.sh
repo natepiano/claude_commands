@@ -227,11 +227,13 @@ def content(path: bytes) -> bytes:
 
 
 split = sys.argv.index("--")
-top = run("git", "rev-parse", "--show-toplevel").strip()
-key = hashlib.sha256(top + b"\0" + run("git", "-C", top, "rev-parse", "HEAD^{tree}"))
-paths = run("git", "-C", top, "diff", "--name-only", "--no-renames", "-z", "HEAD").split(b"\0")
-paths += run("git", "-C", top, "ls-files", "--others", "--exclude-standard", "-z").split(b"\0")
-for path in sorted(set(filter(None, paths))):
+# --no-optional-locks and git status, not git diff: diff rewrites a stat-dirty
+# index even with the flag (git 2.54), and the index of this worktree belongs to the
+# session working in it. Same paths: staged, unstaged, deleted, untracked.
+top = run("git", "--no-optional-locks", "rev-parse", "--show-toplevel").strip()
+key = hashlib.sha256(top + b"\0" + run("git", "--no-optional-locks", "-C", top, "rev-parse", "HEAD^{tree}"))
+status = run("git", "--no-optional-locks", "-C", top, "status", "--porcelain", "-z", "--untracked-files=all", "--no-renames")
+for path in sorted({entry[3:] for entry in status.split(b"\0") if len(entry) > 3}):
     key.update(path + b"\0" + content(os.path.join(top, path)))
 key.update(run("rustc", "-vV"))
 for name in sys.argv[1:split]:

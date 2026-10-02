@@ -46,10 +46,19 @@ fi
 # tee'd output its build time, diagnostics and test results — in
 # ~/.local/state/buildlog, which `buildlog query` answers SQL over.
 #
-# The hook adds no wait a build can see. buildlog_begin reads the clock
+# The hook adds one wait a build can see. buildlog_begin first has record.py
+# print the tree key (treekey.py) of the files the step starts on, before the
+# clock starts: 57 ms median per step on a hana worktree (natedev, 2026-10-02,
+# load average 20 to 30; 15 ms starting python, 21 ms imports, 10 ms git). The
+# recorder takes the key again after the step and records it only when the
+# two agree, so a step during which the files changed has none; port-lint
+# reuses a step by that key. Then buildlog_begin reads the clock
 # (EPOCHREALTIME without a fork; perl on the Mac's bash 3.2); buildlog_end
 # renames the log out of the way, since run() reuses its name for the next
 # step, and starts record.py detached, with no descriptor of ours, to read it.
+# The key goes to it in BUILDLOG_TREE_START, not as an argument: a shell that
+# sourced an older copy of this file still calls record.py step with today's
+# arguments.
 # The recorder ignores SIGHUP from birth: a terminal that closes as the last
 # step ends (a pty wrapper, a closed pane) killed it before its own setsid.
 # On natedev buildlog_exec also runs the step in its own systemd scope, whose
@@ -80,9 +89,12 @@ buildlog_now() {
     [[ -n "${BUILDLOG_NOW:-}" ]] || BUILDLOG_NOW="$(date +%s 2>/dev/null)"
 }
 
+# buildlog_begin ARGV...
 buildlog_begin() {
-    BUILDLOG_START="" BUILDLOG_PEAK="" BUILDLOG_NOW=""
+    BUILDLOG_START="" BUILDLOG_PEAK="" BUILDLOG_NOW="" BUILDLOG_TREE=""
     [[ "${BUILDLOG_OFF:-0}" != 1 && -f "$BUILDLOG_RECORD" ]] || return 0
+    BUILDLOG_TREE="$("$HOME/.claude/scripts/lib/py" "$BUILDLOG_RECORD" key ${1+"$@"} </dev/null 2>/dev/null)" \
+        || BUILDLOG_TREE=""
     buildlog_now
     BUILDLOG_START="${BUILDLOG_NOW:-}"
     if [[ "${BUILDLOG_SCOPE:-1}" != 0 && -S "${XDG_RUNTIME_DIR:-/nonexistent}/systemd/private" \
@@ -118,20 +130,22 @@ buildlog_end() {
         mv -f "$log" "$held" 2>/dev/null || held=""
     fi
     if [[ "${BUILDLOG_SYNC:-0}" == 1 ]]; then
-        "$HOME/.claude/scripts/lib/py" "$BUILDLOG_RECORD" step "$status" "$BUILDLOG_START" \
-            "${BUILDLOG_NOW:-}" "$tty" "$held" "${BUILDLOG_PEAK:-}" ${1+"$@"} </dev/null >/dev/null 2>&1
+        BUILDLOG_TREE_START="${BUILDLOG_TREE:-}" "$HOME/.claude/scripts/lib/py" "$BUILDLOG_RECORD" step \
+            "$status" "$BUILDLOG_START" "${BUILDLOG_NOW:-}" "$tty" "$held" "${BUILDLOG_PEAK:-}" ${1+"$@"} \
+            </dev/null >/dev/null 2>&1
     else
         ( trap '' HUP
-          "$HOME/.claude/scripts/lib/py" "$BUILDLOG_RECORD" step "$status" "$BUILDLOG_START" \
-            "${BUILDLOG_NOW:-}" "$tty" "$held" "${BUILDLOG_PEAK:-}" ${1+"$@"} </dev/null >/dev/null 2>&1 & )
+          BUILDLOG_TREE_START="${BUILDLOG_TREE:-}" "$HOME/.claude/scripts/lib/py" "$BUILDLOG_RECORD" step \
+            "$status" "$BUILDLOG_START" "${BUILDLOG_NOW:-}" "$tty" "$held" "${BUILDLOG_PEAK:-}" ${1+"$@"} \
+            </dev/null >/dev/null 2>&1 & )
     fi
-    BUILDLOG_START=""
+    BUILDLOG_START="" BUILDLOG_TREE=""
     return 0
 }
 
 run() {
     printf '+ %s\n' "$*"
-    buildlog_begin || true
+    buildlog_begin "$@" || true
     # A terminal on the other end means a human is watching, so run straight
     # through and keep the colors. The tee below is what costs them: cargo and
     # mend see a pipe, not a tty, and drop their ANSI. It buys only the sandbox

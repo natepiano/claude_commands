@@ -34,6 +34,7 @@ AMBIENT = (
     "CODEX_THREAD_ID",
     "CLAUDE_CODE_SESSION_ID",
     "MANIFEST_PATH",
+    "BUILDLOG_TREE_START",
 )
 Record = dict[str, object]
 
@@ -226,6 +227,35 @@ class RecordTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         record = self.records()[-1]
         self.assertEqual((record["cwd"], record["repo_path"], record["branch"]), (str(elsewhere), str(self.repo), "main"))
+
+    def key(self, *argv: str, cwd: Path | None = None) -> str:
+        result = self.record("key", *argv, cwd=cwd)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return result.stdout.strip()
+
+    def test_tree_key_kept_only_when_the_files_held_still(self) -> None:
+        key = self.key(*NEXTEST)
+        self.assertRegex(key, r"^[0-9a-f]{64}$")
+        held = self.step(0, "0", "", "", NEXTEST, {"BUILDLOG_TREE_START": key})
+        self.assertEqual((held["tree_key"], held["tree_changed"]), (key, False))
+        moved = self.step(0, "0", "", "", NEXTEST, {"BUILDLOG_TREE_START": "0" * 64})
+        self.assertEqual((moved["tree_key"], moved["tree_changed"]), (None, True))
+        unknown = self.step(0, "0", "", "", NEXTEST)
+        self.assertEqual((unknown["tree_key"], unknown["tree_changed"]), (None, None))
+        _ = (self.repo / "new.rs").write_text("\n")
+        self.assertNotEqual(self.key(*NEXTEST), key)
+
+    def test_key_follows_the_manifest_and_is_empty_outside_git(self) -> None:
+        elsewhere = self.base / "elsewhere"
+        elsewhere.mkdir()
+        self.assertEqual(self.key(cwd=elsewhere), "")
+        manifest = ["cargo", "clippy", "--manifest-path", str(self.repo / "Cargo.toml")]
+        self.assertEqual(self.key(*manifest, cwd=elsewhere), self.key())
+        start = {"BUILDLOG_TREE_START": "0" * 64}
+        result = self.record("step", "0", str(START), "", "0", "", "", *SWEEP, cwd=elsewhere, extra=start)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        record = self.records()[-1]
+        self.assertEqual((record["tree_key"], record["tree_changed"]), (None, None))
 
     def test_outside_git_has_no_git_facts(self) -> None:
         elsewhere = self.base / "elsewhere"
