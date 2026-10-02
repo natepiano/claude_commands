@@ -1,0 +1,13 @@
++ cargo clippy --workspace --all-targets -- -D warnings
+    Checking alpha v0.1.0 (/tmp/claude-1000/-etc-nixos/96b016bf-87cf-4a19-af7a-77425852c2e2/scratchpad/buildlog_dev/ws/crates/alpha)
+    Checking beta v0.1.0 (/tmp/claude-1000/-etc-nixos/96b016bf-87cf-4a19-af7a-77425852c2e2/scratchpad/buildlog_dev/ws/crates/beta)
+error: unused variable: `unused_variable`
+ --> crates/beta/src/lib.rs:5:9
+  |
+5 |     let unused_variable = 5;
+  |         ^^^^^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_unused_variable`
+  |
+  = note: `-D unused-variables` implied by `-D warnings`
+  = help: to override `-D warnings` add `#[allow(unused_variables)]`
+
+error: could not compile `beta` (lib) due to 1 previous error

@@ -55,11 +55,12 @@
 #
 # Each record carries what a repeat would cost: the run's wall time minus
 # cargo's own "Finished … in" build times, since a repeat on the same tree
-# builds nothing. Every such call, --no-cache included, appends one line to
-# ~/.local/state/verify/events.jsonl: ran, failed, interrupted, reused (a
-# pass) or replayed (a lint failure) with the seconds saved, plus machine,
-# workspace, worktree, branch and commit. The ledger outlives the records;
-# /verify_saved reports it.
+# builds nothing. Every call, of every verb, in a delegate session or not,
+# leaves one call record in the build log (~/.local/state/buildlog; `buildlog
+# schema` lists its fields): ran, failed, interrupted, reused (a pass) or
+# replayed (a lint failure), with the seconds saved and the repo, worktree,
+# branch and commit. The steps it ran carry the same call id. The build log
+# outlives the records; /verify_saved reports the time saved.
 #
 # Usage:
 #   verify.sh check <package>              fast compile feedback (workspace
@@ -307,7 +308,12 @@ for arg in "$@"; do
 done
 set -- "${ARGS[@]}"
 
-# Records and the call ledger (see the header): on for `test` and `lint` in a
+# Every step run() runs below carries this call's id, which buildlog joins to
+# the call record note_event writes.
+export BUILDLOG_CALLER=verify
+export BUILDLOG_CALL_ID="v$(date -u +%Y%m%dT%H%M%S)-$$-$RANDOM"
+
+# Pass records (see the header): on for `test` and `lint` in a
 # delegate session. --no-cache turns off the lookup; its result is still
 # recorded, so a flake hunt that passes clears a recorded lint failure.
 CACHE_SESSION_DIR="${PLAN_DELEGATE_BOARD_DIR:-${PLAN_DELEGATE_SESSION_DIR:-}}"
@@ -318,6 +324,7 @@ fi
 RUN_LOG=""
 RUN_KEY=""
 RUN_STARTED=0
+CALL_NOTED=0
 LOOKUP_KEY=""
 LOOKUP_STATUS=0
 EXIT_STATUS=0
@@ -332,38 +339,22 @@ tree_key() {
         2>/dev/null || true
 }
 
-EVENTS_LEDGER="${VERIFY_EVENTS_LEDGER:-${HOME}/.local/state/verify/events.jsonl}"
-EVENT_PY='
-import json
-import socket
-import sys
-from datetime import datetime, timezone
-
-texts = ("workspace", "worktree", "branch", "commit", "command", "outcome", "session")
-counts = ("wait_s", "wall_s", "build_s", "saved_s")
-event: dict[str, str | int] = {
-    "at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
-    "machine": socket.gethostname().split(".")[0],
-}
-event.update(zip(texts, sys.argv[1:8]))
-event.update((name, int(value or 0)) for name, value in zip(counts, sys.argv[8:12]))
-print(json.dumps(event))
-'
-
-# One ledger line per call: ran, failed, interrupted, reused or replayed, with
-# its workspace (the repo every worktree shares), worktree, branch and commit.
-# A ledger that cannot be written loses the line, never the result.
+# note_event OUTCOME WAIT WALL BUILD SAVED STATUS: this call's one record in
+# the build log (see the header), the first time it is called. OUTCOME is ran,
+# failed, interrupted, reused or replayed; an empty STATUS or BUILD is unknown.
+# record.py adds the repo, worktree, branch and commit. A record that cannot be
+# written is lost, never the result.
 note_event() {
-    [[ -n "${CACHE_DIR}" ]] || return 0
-    local outcome=$1 wait=$2 wall=$3 build=$4 saved=$5 top common branch commit
-    top="$(git rev-parse --show-toplevel 2>/dev/null)" || return 0
-    common="$(git rev-parse --path-format=absolute --git-common-dir 2>/dev/null)" || return 0
-    branch="$(git symbolic-ref --short -q HEAD || echo detached)"
-    commit="$(git rev-parse --short HEAD 2>/dev/null || true)"
-    mkdir -p "${EVENTS_LEDGER%/*}" || return 0
-    "$PY" -c "$EVENT_PY" "${common%/.git}" "$top" "$branch" "$commit" \
-        "$CMD${ARGS[*]:+ ${ARGS[*]}}" "$outcome" "${CACHE_SESSION_DIR##*/}" \
-        "$wait" "$wall" "$build" "$saved" >> "${EVENTS_LEDGER}" 2>/dev/null || true
+    [[ "${CALL_NOTED}" -eq 0 ]] || return 0
+    CALL_NOTED=1
+    [[ -f "${BUILDLOG_RECORD:-}" ]] || return 0
+    local outcome=$1 wait=$2 wall=$3 build=$4 saved=$5 status=$6 cached=0
+    if [[ -n "${CACHE_DIR}" ]]; then
+        cached=1
+    fi
+    "$PY" "$BUILDLOG_RECORD" call "$outcome" "$status" "$cached" "$wait" "$wall" \
+        "$build" "$saved" "${SECONDS}" "$CMD" ${ARGS[@]+"${ARGS[@]}"} \
+        </dev/null >/dev/null 2>&1 || true
 }
 
 # Succeeds, after printing the record, when this call already passed on this
@@ -383,7 +374,8 @@ cache_lookup() {
     [[ -n "${outcome}" ]] || return 1
     LOOKUP_STATUS="$(sed -n 's/^status=//p' "${record}")"
     LOOKUP_STATUS="${LOOKUP_STATUS:-0}"
-    note_event "${outcome}" "${SECONDS}" 0 0 "$(sed -n 's/^saved_s=//p' "${record}")" || true
+    note_event "${outcome}" "${SECONDS}" 0 0 "$(sed -n 's/^saved_s=//p' "${record}")" \
+        "${LOOKUP_STATUS}" || true
     echo "verify.sh: ${word} (recorded) — $(head -n 1 "${record}")"
     if ! head -n 1 "${record}" | grep -qF "\`verify.sh $CMD${ARGS[*]:+ ${ARGS[*]}}\`"; then
         echo "verify.sh: lint covers the workspace and every changed member, so that result answers this package too."
@@ -444,7 +436,7 @@ lint_failure_is_the_tree() {
 # Logs the finished run and records a pass or a lint failure. Runs once:
 # INT/TERM and then EXIT both reach it.
 finish_run() {
-    local status=$1 outcome=failed wall build repeat kind=""
+    local status=$1 outcome=failed wall build repeat kind="" code="${EXIT_STATUS}"
     [[ -n "${RUN_LOG}" ]] || return 0
     wall=$(( SECONDS - RUN_STARTED ))
     build="$(build_seconds)"
@@ -454,10 +446,10 @@ finish_run() {
     fi
     case "${status}" in
         completed) outcome=ran kind=pass ;;
-        interrupted) outcome=interrupted ;;
+        interrupted) outcome=interrupted code="" ;;
         error) lint_failure_is_the_tree && kind=fail ;;
     esac
-    note_event "${outcome}" "${RUN_STARTED}" "${wall}" "${build:-0}" 0
+    note_event "${outcome}" "${RUN_STARTED}" "${wall}" "${build:-0}" 0 "${code}"
     if [[ -z "${kind}" || -z "${CACHE_DIR}" ]] || ! cache_record "${kind}" "${repeat}"; then
         rm -f "${RUN_LOG}"
     fi
@@ -510,10 +502,10 @@ if cache_lookup; then
     release_token
     exit "${LOOKUP_STATUS}"
 fi
+RUN_STARTED=${SECONDS}
 if [[ -n "${CACHE_DIR}" ]] && mkdir -p "${CACHE_DIR}"; then
     RUN_KEY="${LOOKUP_KEY}"
     RUN_LOG="${CACHE_DIR}/run.$$.log"
-    RUN_STARTED=${SECONDS}
     : > "${RUN_LOG}"
     exec > >(tee -a "${RUN_LOG}") 2> >(tee -a "${RUN_LOG}" >&2)
 fi
@@ -551,8 +543,15 @@ fi
 # or is interrupted still hands the token back instead of leaving its peers to
 # wait out the hold.
 verify_cleanup() {
-    local status=$1
+    local status=$1 outcome=ran code="${EXIT_STATUS}"
     finish_run "${status}" || true
+    # finish_run notes only a run with a record log; every other call is noted
+    # here (note_event notes a call once). Its build time is unknown.
+    case "${status}" in
+        error) outcome=failed ;;
+        interrupted) outcome=interrupted code="" ;;
+    esac
+    note_event "${outcome}" "${RUN_STARTED}" $(( SECONDS - RUN_STARTED )) "" 0 "${code}" || true
     if [[ "${ACTIVITY_ACTIVE}" -eq 1 ]]; then
         finish_activity "${status}"
     fi

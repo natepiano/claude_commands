@@ -1,0 +1,3 @@
+#!/usr/bin/env bash
+# buildlog -- see cli.py. The shim picks a python3 >= 3.10 on both machines.
+exec "$HOME/.claude/scripts/lib/py" "$HOME/.claude/scripts/buildlog/cli.py" "$@"

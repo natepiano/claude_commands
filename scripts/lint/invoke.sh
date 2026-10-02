@@ -41,8 +41,97 @@ if [[ -z "${CARGO_MAKEFLAGS:-}" && -c /dev/steve && -r /dev/steve && -w /dev/ste
     export CARGO_MAKEFLAGS="--jobserver-auth=fifo:/dev/steve"
 fi
 
+# The build log (~/.claude/scripts/buildlog): every step run() runs leaves one
+# record — what ran, where, for whom, how long, its exit status, and from the
+# tee'd output its build time, diagnostics and test results — in
+# ~/.local/state/buildlog, which `buildlog query` answers SQL over.
+#
+# The hook adds no wait a build can see. buildlog_begin reads the clock
+# (EPOCHREALTIME without a fork; perl on the Mac's bash 3.2); buildlog_end
+# renames the log out of the way, since run() reuses its name for the next
+# step, and starts record.py detached, with no descriptor of ours, to read it.
+# The recorder ignores SIGHUP from birth: a terminal that closes as the last
+# step ends (a pty wrapper, a closed pane) killed it before its own setsid.
+# On natedev buildlog_exec also runs the step in its own systemd scope, whose
+# cgroup memory.peak is the step's peak memory, page cache included. That moves
+# the step from the caller's scope (a terminal's, with its own OOM policy) to
+# app.slice. Per step, starting the recorder costs about 2 ms and the scope 8
+# ms more (natedev, 2026-10-02); BUILDLOG_SCOPE=0 turns the scope off,
+# BUILDLOG_OFF=1 the whole hook. Callers run with set -euo pipefail, so none
+# of this may fail, print, or change a status: the begin and end calls sit
+# behind `|| true`, and the step's status is the step's own.
+#
+# fd 3 carries the step's stderr past systemd-run, whose own complaints go to
+# /dev/null. --expand-environment=no keeps the argv as given: by default
+# systemd-run rewrites $VAR, ${VAR} and $$ in it, as ExecStart= would. The
+# marker file is written inside the scope just before the step starts, so its
+# absence afterwards proves the scope never ran the step (no user manager, a
+# sandbox without its socket, a systemd older than 254 that rejects the
+# option), and run() runs it plainly.
+BUILDLOG_RECORD="$HOME/.claude/scripts/buildlog/record.py"
+BUILDLOG_SCOPE_SH='exec 2>&3 3>&-; { : > "$0"; } 2>/dev/null || exit 125; "$@"; s=$?; cat "/sys/fs/cgroup$(sed -n "s/^0:://p" /proc/self/cgroup)/memory.peak" > "$0" 2>/dev/null; exit $s'
+
+buildlog_now() {
+    if [[ -n "${EPOCHREALTIME:-}" ]]; then
+        BUILDLOG_NOW="${EPOCHREALTIME/,/.}"
+    elif [[ -x /usr/bin/perl ]]; then
+        BUILDLOG_NOW="$(/usr/bin/perl -MTime::HiRes=time -e 'printf "%.6f", time' 2>/dev/null)"
+    fi
+    [[ -n "${BUILDLOG_NOW:-}" ]] || BUILDLOG_NOW="$(date +%s 2>/dev/null)"
+}
+
+buildlog_begin() {
+    BUILDLOG_START="" BUILDLOG_PEAK="" BUILDLOG_NOW=""
+    [[ "${BUILDLOG_OFF:-0}" != 1 && -f "$BUILDLOG_RECORD" ]] || return 0
+    buildlog_now
+    BUILDLOG_START="${BUILDLOG_NOW:-}"
+    if [[ "${BUILDLOG_SCOPE:-1}" != 0 && -S "${XDG_RUNTIME_DIR:-/nonexistent}/systemd/private" \
+          && -r /proc/self/cgroup ]] && command -v systemd-run >/dev/null 2>&1; then
+        BUILDLOG_PEAK="${TMPDIR:-/tmp}/buildlog.$$.$RANDOM.peak"
+    fi
+}
+
+buildlog_exec() {
+    if [[ -z "${BUILDLOG_PEAK:-}" ]]; then
+        "$@"
+        return
+    fi
+    local status=0
+    systemd-run --user --scope --quiet --collect --expand-environment=no -- \
+        /bin/sh -c "$BUILDLOG_SCOPE_SH" "$BUILDLOG_PEAK" "$@" 3>&2 2>/dev/null
+    status=$?
+    if [[ -e "$BUILDLOG_PEAK" ]]; then
+        return $status
+    fi
+    "$@"
+}
+
+# buildlog_end STATUS LOG TTY ARGV...
+buildlog_end() {
+    [[ -n "${BUILDLOG_START:-}" ]] || return 0
+    local status=$1 log=$2 tty=$3 held=""
+    shift 3
+    BUILDLOG_NOW=""
+    buildlog_now
+    if [[ -n "$log" && -f "$log" ]]; then
+        held="${TMPDIR:-/tmp}/buildlog.$$.$RANDOM$RANDOM.log"
+        mv -f "$log" "$held" 2>/dev/null || held=""
+    fi
+    if [[ "${BUILDLOG_SYNC:-0}" == 1 ]]; then
+        "$HOME/.claude/scripts/lib/py" "$BUILDLOG_RECORD" step "$status" "$BUILDLOG_START" \
+            "${BUILDLOG_NOW:-}" "$tty" "$held" "${BUILDLOG_PEAK:-}" ${1+"$@"} </dev/null >/dev/null 2>&1
+    else
+        ( trap '' HUP
+          "$HOME/.claude/scripts/lib/py" "$BUILDLOG_RECORD" step "$status" "$BUILDLOG_START" \
+            "${BUILDLOG_NOW:-}" "$tty" "$held" "${BUILDLOG_PEAK:-}" ${1+"$@"} </dev/null >/dev/null 2>&1 & )
+    fi
+    BUILDLOG_START=""
+    return 0
+}
+
 run() {
     printf '+ %s\n' "$*"
+    buildlog_begin || true
     # A terminal on the other end means a human is watching, so run straight
     # through and keep the colors. The tee below is what costs them: cargo and
     # mend see a pipe, not a tty, and drop their ANSI. It buys only the sandbox
@@ -51,9 +140,10 @@ run() {
     if [[ -t 1 ]]; then
         local tty_status=0
         set +e
-        "$@"
+        buildlog_exec "$@"
         tty_status=$?
         set -e
+        buildlog_end "$tty_status" "" 1 "$@" || true
         return $tty_status
     fi
     local log="${TMPDIR:-/tmp}/lint_invoke.$$.log"
@@ -61,10 +151,11 @@ run() {
     # tee keeps output streaming: heartbeat_watch.sh digests the agent log to
     # prove a delegate is alive, so buffering a long build looks like a hang.
     set +e
-    "$@" 2>&1 | tee "$log"
+    buildlog_exec "$@" 2>&1 | tee "$log"
     status=${PIPESTATUS[0]}
     set -e
     if [[ $status -ne 0 ]] && grep -q "$SANDBOX_SIGNATURE" "$log"; then
+        buildlog_end "$status" "$log" 0 "$@" || true
         rm -f "$log"
         cat >&2 <<'EOF'
 
@@ -83,6 +174,7 @@ unsandboxed run needs approval, not whether it runs unsandboxed.
 EOF
         exit 3
     fi
+    buildlog_end "$status" "$log" 0 "$@" || true
     rm -f "$log"
     return $status
 }

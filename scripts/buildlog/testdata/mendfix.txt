@@ -1,0 +1,30 @@
++ env RUSTC_WRAPPER= cargo mend --all-targets --workspace --fix
+    Checking alpha v0.1.0 (/tmp/claude-1000/-etc-nixos/96b016bf-87cf-4a19-af7a-77425852c2e2/scratchpad/buildlog_dev/wsfix/crates/alpha)
+    Checking beta v0.1.0 (/tmp/claude-1000/-etc-nixos/96b016bf-87cf-4a19-af7a-77425852c2e2/scratchpad/buildlog_dev/wsfix/crates/beta)
+warning: unused variable: `unused_variable`
+ --> crates/beta/src/lib.rs:5:9
+  |
+5 |     let unused_variable = 5;
+  |         ^^^^^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_unused_variable`
+  |
+  = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused variable: `unused_variable`
+ --> crates/beta/src/lib.rs:5:9
+  |
+5 |     let unused_variable = 5;
+  |         ^^^^^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_unused_variable`
+  |
+  = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused variable: `unused_variable`
+ --> crates/beta/src/lib.rs:5:9
+  |
+5 |     let unused_variable = 5;
+  |         ^^^^^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_unused_variable`
+  |
+  = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+summary: 1 compiler warning - 1 fixable with `cargo mend --fix-compiler`
+    Finished in 0.25s (check: 0.25s, mend: 0.00s)
+mend: applied 1 visibility narrowing(s)

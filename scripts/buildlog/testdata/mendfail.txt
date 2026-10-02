@@ -1,0 +1,11 @@
++ env RUSTC_WRAPPER= cargo mend --all-targets --workspace --fail-on-warn
+warning: unused variable: `unused_variable`
+ --> crates/beta/src/lib.rs:5:9
+  |
+5 |     let unused_variable = 5;
+  |         ^^^^^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_unused_variable`
+  |
+  = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+summary: 1 compiler warning - 1 fixable with `cargo mend --fix-compiler`
+    Finished in 0.06s (check: 0.06s, mend: 0.00s)

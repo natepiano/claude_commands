@@ -1,0 +1,3 @@
++ /home/natepiano/.claude/scripts/lib/py /home/natepiano/.claude/scripts/lint/sweep.py --dry-run
+lint sweep: /tmp/claude-1000/-etc-nixos/96b016bf-87cf-4a19-af7a-77425852c2e2/scratchpad/buildlog_dev/ws/target/doc index is 0.0 MiB, within the 250.0 MiB budget
+lint sweep: /tmp/claude-1000/-etc-nixos/96b016bf-87cf-4a19-af7a-77425852c2e2/scratchpad/buildlog_dev/ws/target is 0.0 GiB, within the 96.0 GiB budget

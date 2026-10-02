@@ -1,0 +1,6 @@
++ env -u CARGO_MAKEFLAGS -u MAKEFLAGS -u MFLAGS RUSTDOCFLAGS=-D warnings cargo doc --no-deps --jobs 8 --workspace
+    Checking alpha v0.1.0 (/tmp/claude-1000/-etc-nixos/96b016bf-87cf-4a19-af7a-77425852c2e2/scratchpad/buildlog_dev/ws/crates/alpha)
+ Documenting alpha v0.1.0 (/tmp/claude-1000/-etc-nixos/96b016bf-87cf-4a19-af7a-77425852c2e2/scratchpad/buildlog_dev/ws/crates/alpha)
+ Documenting beta v0.1.0 (/tmp/claude-1000/-etc-nixos/96b016bf-87cf-4a19-af7a-77425852c2e2/scratchpad/buildlog_dev/ws/crates/beta)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.39s
+   Generated /tmp/claude-1000/-etc-nixos/96b016bf-87cf-4a19-af7a-77425852c2e2/scratchpad/buildlog_dev/ws/target/doc/alpha/index.html and 1 other file

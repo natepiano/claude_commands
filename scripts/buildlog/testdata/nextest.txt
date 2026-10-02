@@ -1,0 +1,108 @@
++ cargo nextest run --workspace --retries 2 --no-fail-fast
+   Compiling alpha v0.1.0 (/tmp/claude-1000/-etc-nixos/96b016bf-87cf-4a19-af7a-77425852c2e2/scratchpad/buildlog_dev/ws/crates/alpha)
+   Compiling beta v0.1.0 (/tmp/claude-1000/-etc-nixos/96b016bf-87cf-4a19-af7a-77425852c2e2/scratchpad/buildlog_dev/ws/crates/beta)
+warning: unused variable: `unused_variable`
+ --> crates/beta/src/lib.rs:5:9
+  |
+5 |     let unused_variable = 5;
+  |         ^^^^^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_unused_variable`
+  |
+  = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: `beta` (lib) generated 1 warning (run `cargo fix --lib -p beta` to apply 1 suggestion)
+warning: `beta` (lib test) generated 1 warning (1 duplicate)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 3.16s
+────────────
+ Nextest run ID c0637c77-e702-4aa7-b26b-fa8884c75675 with nextest profile: default
+    Starting 5 tests across 2 binaries
+  TRY 1 FAIL [   0.003s] (───) alpha tests::fails
+  stdout ───
+
+    running 1 test
+    test tests::fails ... FAILED
+
+    failures:
+
+    failures:
+        tests::fails
+
+    test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 3 filtered out; finished in 0.00s
+
+  stderr ───
+
+    thread 'tests::fails' (115763) panicked at crates/alpha/src/lib.rs:30:9:
+    assertion `left == right` failed: deliberate failure
+      left: 3
+     right: 4
+    note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+        PASS [   0.003s] (1/5) beta tests::doubles
+        PASS [   0.003s] (2/5) alpha tests::adds
+  TRY 1 FAIL [   0.003s] (───) alpha tests::flaky
+  stdout ───
+
+    running 1 test
+    test tests::flaky ... FAILED
+
+    failures:
+
+    failures:
+        tests::flaky
+
+    test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 3 filtered out; finished in 0.00s
+
+  stderr ───
+
+    thread 'tests::flaky' (115761) panicked at crates/alpha/src/lib.rs:46:13:
+    first attempt fails
+    note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+  TRY 2 PASS [   0.003s] (3/5) alpha tests::flaky
+  TRY 2 FAIL [   0.003s] (───) alpha tests::fails
+  stdout ───
+
+    running 1 test
+    test tests::fails ... FAILED
+
+    failures:
+
+    failures:
+        tests::fails
+
+    test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 3 filtered out; finished in 0.00s
+
+  stderr ───
+
+    thread 'tests::fails' (115775) panicked at crates/alpha/src/lib.rs:30:9:
+    assertion `left == right` failed: deliberate failure
+      left: 3
+     right: 4
+    note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+  TRY 3 FAIL [   0.003s] (4/5) alpha tests::fails
+  stdout ───
+
+    running 1 test
+    test tests::fails ... FAILED
+
+    failures:
+
+    failures:
+        tests::fails
+
+    test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 3 filtered out; finished in 0.00s
+
+  stderr ───
+
+    thread 'tests::fails' (115777) panicked at crates/alpha/src/lib.rs:30:9:
+    assertion `left == right` failed: deliberate failure
+      left: 3
+     right: 4
+    note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+        PASS [   1.505s] (5/5) alpha tests::slow
+────────────
+     Summary [   1.505s] 5 tests run: 4 passed (1 flaky), 1 failed, 0 skipped
+   FLAKY 2/3 [   0.003s] (3/5) alpha tests::flaky
+  TRY 3 FAIL [   0.003s] (4/5) alpha tests::fails
+error: test run failed
