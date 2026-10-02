@@ -194,6 +194,17 @@ branch, port and the files you own.
      phase only when it is a regression the phase caused, breaks something
      that worked, or fails a test or gate. Every other finding moves to the
      follow-up phase, however visible, open since round 1 or found this round.
+   - **One batch per check** (2026-10-01, measured: late repair rounds came
+     mostly from one visual defect found live after each fix). Every live
+     check or set of shots after a fix covers every view the phase changes,
+     and all its findings go to the next round together. Never send one
+     defect, fix it, then look again.
+   - **A fix that fails twice** (2026-10-01, measured: one bar-fit finding
+     failed four times before the fifth attempt held). When the same finding
+     is still open after two fixes, send no third seat pass with the same
+     approach. First find why the fixes did not hold, write it in the
+     attempts log, then dispatch once with an approach that addresses that
+     cause.
 
    Before the hard landing, everything else is fixed before the checkpoint. This is packaging under
    `<DecisionEconomy/>`, so it never goes to the user as a question. State it
