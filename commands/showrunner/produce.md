@@ -92,6 +92,10 @@ State:
   turn. Ask once per phase; ask again only if it answered without a time. Until
   it answers, report that ETA as `none measured - requested`.
 - **Every turn ends with** `— waiting on: <items>`, the user's items first.
+- **Next dailies.** Every reply to the user ends with the time now and the next
+  dailies report's time, in `ZONE` and UTC: `09:37 PDT / 16:37 UTC · next dailies
+  09:53 PDT / 16:53 UTC`. Read the next fire from `systemctl --user list-timers
+  showrunner-timer-<name>.timer --no-pager`, never from memory (user, 2026-10-02).
 </Throughout>
 
 ---
