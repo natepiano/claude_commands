@@ -47,6 +47,7 @@ SLOW_TEST_S = 1.0
 MEND_APPLIED = re.compile(r"^\s*mend: applied\b(.*)$")
 MEND_NONE = re.compile(r"^\s*mend: no\b.*\bfix(?:es)? available")
 # "would remove" is --dry-run's wording and frees nothing, so only "removed".
+SWEEP_ORPHANS = re.compile(r"\bremoved \d+ orphaned files \((\d+(?:\.\d+)?) (GiB|MiB)\)")
 SWEEP_UNITS = re.compile(r"\bremoved \d+ build units and \d+ incremental dirs \((\d+(?:\.\d+)?) (GiB|MiB)\)")
 SWEEP_DOC = re.compile(r"\bremoved \S.* \((\d+(?:\.\d+)?) (GiB|MiB)\), rebuilt by the next doc run")
 UNIT_BYTES = {"GiB": 1 << 30, "MiB": 1 << 20}
@@ -288,7 +289,7 @@ def mend_fixes(lines: list[str]) -> int | None:
 def sweep_freed(lines: list[str]) -> int:
     freed = 0
     for line in lines:
-        for pattern in (SWEEP_UNITS, SWEEP_DOC):
+        for pattern in (SWEEP_ORPHANS, SWEEP_UNITS, SWEEP_DOC):
             match = pattern.search(line)
             if match:
                 freed += int(float(match.group(1)) * UNIT_BYTES[match.group(2)])

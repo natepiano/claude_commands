@@ -54,6 +54,12 @@
       ]
     },
     {
+      "root": "scripts/lint",
+      "extraPaths": [
+        "scripts/lint"
+      ]
+    },
+    {
       "root": "."
     }
   ]

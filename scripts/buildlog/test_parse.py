@@ -27,7 +27,8 @@ NEXTEST_TIMEOUT = """\
 """
 
 SWEEP_REMOVED = """\
-lint sweep: /r/target is 98.0 GiB, over the 96.0 GiB budget
+lint sweep: /r/target is 99.5 GiB, over the 96.0 GiB budget
+lint sweep: removed 158 orphaned files (1.5 GiB), copied-up output whose build unit is gone; left 98.0 GiB
 lint sweep: removed 3 build units and 1 incremental dirs (2.0 GiB), last used 2026-09-01 10:00 to 2026-09-20 11:00; left 96.0 GiB
 lint sweep: /r/target/doc index is 300.0 MiB, over the 250.0 MiB budget; removed /r/target/doc (100.0 MiB), rebuilt by the next doc run
 """
@@ -177,9 +178,9 @@ class SweepTests(unittest.TestCase):
     def test_within_budget_dry_run_frees_nothing(self) -> None:
         self.assertEqual(facts("sweep", "sweep")["sweep_freed_bytes"], 0)
 
-    def test_removed_units_and_doc(self) -> None:
+    def test_removed_orphans_units_and_doc(self) -> None:
         result = parse.log_facts("sweep", SWEEP_REMOVED)
-        self.assertEqual(result["sweep_freed_bytes"], 2 * GIB + 100 * MIB)
+        self.assertEqual(result["sweep_freed_bytes"], 3 * GIB + GIB // 2 + 100 * MIB)
 
     def test_would_remove_frees_nothing(self) -> None:
         result = parse.log_facts("sweep", SWEEP_REMOVED.replace("removed", "would remove"))

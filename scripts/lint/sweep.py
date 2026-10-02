@@ -7,16 +7,35 @@ this removes the least recently used build output until it fits:
 
     build unit        every entry under a build tree's .fingerprint/, build/,
                       deps/ and examples/ that carries one unit's 16-hex-digit
-                      hash, removed together
+                      hash, and the copies cargo made of its output (below),
+                      removed together
     incremental dir   one direct child of a build tree's incremental/
 
-The budget is LINT_SWEEP_BUDGET_GIB (default 96), summed over every file
-under the target and build directories, so output the budget sweep never
-removes (test-run folders, binaries cargo copied up out of deps/) still
+The budget is the first of: LINT_SWEEP_BUDGET_GIB in the environment;
+sweep_budget_gib.<repo> in config/lint.conf, where <repo> is the name of the
+directory holding the git common dir, so every worktree of a repo shares it;
+sweep_budget_gib there; 24 GiB. It is summed over every file under the target
+and build directories, so output the budget sweep never
+removes (test-run folders, files it cannot match to a build unit) still
 counts. doc/ has its own rule, below. --dry-run reports what would go and
 removes nothing.
 
-Why 96. A budget below the working set evicts output the next lint run needs,
+Copied-up output. For a binary, an example, a dylib or a library named on the
+command line, cargo also puts the unit's file under its unhashed name, from
+deps/ into the build tree itself and within examples/, and writes a dep-info
+file beside it (<name without extension>.d) whose first line names that copy.
+It hard-links on Linux and copies on macOS (clonefile, cargo #10060), and does
+so again on every build of the unit, fresh or not. A copy belongs to the unit
+whose file has its inode or, for a copy that is not a link, the same name and
+size; it and its dep-info go with that unit. A copy no unit claims, holding
+its only link, that its dep-info names, is output of a unit already removed:
+the next build of that unit replaces it, so every run removes it, over budget
+or not. Before this rule a copy outlived its unit and its blocks counted
+against the budget for good: 51 GiB of examples in one hana worktree
+(2026-10-02), so each sweep there evicted units the next lint run rebuilt.
+Any other unhashed file stays.
+
+Why hana's is 96. A budget below the working set evicts output the next lint run needs,
 and because this runs after every lint run, that rebuild repeats on every
 save. Replaying hana's cycle into an empty target (2026-09-15: scoped and
 workspace clippy, doc and mend, the nextest test build, the external-client
@@ -24,7 +43,8 @@ fixture, the app build) came to 56.9 GiB, of which the test build alone was
 33.5 GiB; the clerestory-tests suite adds 9.4 GiB. A rerun rebuilt nothing,
 but sweeping that target to 48 GiB made the next cycle rebuild nearly every
 workspace unit. 96 covers that working set with room for feature and profile
-variants.
+variants. The 24 GiB default covers the other projects' whole targets
+(cargo-liner 12 GiB, nateroids 11 GiB on 2026-10-02) twice over.
 
 The doc index. rustdoc rewrites doc/search.index, doc/trait.impl and
 doc/type.impl when a crate finishes, and its peak memory tracks what those
@@ -75,6 +95,7 @@ from __future__ import annotations
 
 import fcntl
 import json
+import math
 import os
 import shutil
 import subprocess
@@ -87,8 +108,14 @@ from typing import Literal, TypedDict, cast
 GIB = 1 << 30
 MIB = 1 << 20
 DAY_SECONDS = 86_400
-DEFAULT_BUDGET_GIB = 96.0
+DEFAULT_BUDGET_GIB = 24.0
 BUDGET_ENV = "LINT_SWEEP_BUDGET_GIB"
+BUDGET_KEY = "sweep_budget_gib"
+CONFIG_ENV = "LINT_CONFIG_FILE"
+DEFAULT_CONFIG = os.path.join("~", ".claude", "config", "lint.conf")
+GIT_DIR = ".git"
+GITDIR_PREFIX = "gitdir:"
+COMMONDIR_FILE = "commondir"
 DEFAULT_DOC_INDEX_MIB = 250.0
 DOC_INDEX_ENV = "LINT_SWEEP_DOC_INDEX_MIB"
 DOC_DIR = "doc"
@@ -99,13 +126,19 @@ LOCK_NAMES = (".cargo-lock", ".cargo-build-lock", ".cargo-artifact-lock")
 HASHED_DIRS = (".fingerprint", "build", "deps", "examples")
 FINGERPRINT_DIR = ".fingerprint"
 INCREMENTAL_DIR = "incremental"
+# The hashed directory a unit's own file stays in, and the directory, relative
+# to the build tree, that cargo copies it up into.
+COPY_DIRS = {"deps": "", "examples": "examples"}
+DEP_INFO_SUFFIX = ".d"
+# A dep-info file's first line starts with the output it describes.
+DEP_INFO_HEAD = 4096
 # target/debug, target/<triple>/debug, target/<custom>/<triple>/debug.
 MAX_TREE_DEPTH = 3
 HASH_LENGTH = 16
 HEX_DIGITS = frozenset("0123456789abcdef")
 
 InodeKey = tuple[int, int]
-GroupKind = Literal["unit", "incremental"]
+GroupKind = Literal["unit", "incremental", "orphan"]
 
 
 class CargoMetadata(TypedDict, total=False):
@@ -129,6 +162,7 @@ class Scan:
     blocks: dict[InodeKey, int] = field(default_factory=dict)
     links: dict[InodeKey, int] = field(default_factory=dict)
     groups: list[Group] = field(default_factory=list)
+    orphans: Group = field(default_factory=lambda: Group(kind="orphan"))
 
 
 def unit_hash(name: str) -> str | None:
@@ -138,6 +172,15 @@ def unit_hash(name: str) -> str | None:
     if not separator or len(suffix) != HASH_LENGTH or not set(suffix) <= HEX_DIGITS:
         return None
     return suffix
+
+
+def copied_name(name: str) -> str:
+    """name without its unit hash, '-' read as '_': cargo names a copy after
+    its target, hyphens kept, and the unit's own file after the crate."""
+    stem, dot, rest = name.partition(".")
+    if unit_hash(name) is not None:
+        stem = stem[: -HASH_LENGTH - 1]
+    return (stem + dot + rest).replace("-", "_")
 
 
 def cargo_roots() -> list[str]:
@@ -224,18 +267,125 @@ def newest_times(directory: str) -> tuple[float, float]:
     return used, modified
 
 
+def listing(directory: str) -> list[os.DirEntry[str]]:
+    try:
+        with os.scandir(directory) as entries:
+            return list(entries)
+    except OSError:
+        return []
+
+
+def copied_up(directory: str) -> list[os.DirEntry[str]]:
+    """Regular files in directory without a unit hash: the copies and their dep-info."""
+    return [
+        entry
+        for entry in listing(directory)
+        if not entry.name.startswith(".")
+        and unit_hash(entry.name) is None
+        and entry.is_file(follow_symlinks=False)
+    ]
+
+
+def dep_info_output(path: str, directory: str) -> str | None:
+    """Name of the copy in directory that a dep-info file says it describes."""
+    try:
+        with open(path, "rb") as handle:
+            head = handle.read(DEP_INFO_HEAD)
+    except OSError:
+        return None
+    target, separator, _ = head.partition(b":")
+    if not separator:
+        return None
+    parent, name = os.path.split(os.fsdecode(target).replace("\\ ", " "))
+    stem = os.path.basename(path)[: -len(DEP_INFO_SUFFIX)]
+    if os.path.basename(parent) != os.path.basename(directory) or os.path.splitext(name)[0] != stem:
+        return None
+    return name
+
+
+def twin(copy: os.stat_result, candidates: list[tuple[os.DirEntry[str], Group]]) -> Group | None:
+    """The unit a copy came from: its file has the copy's inode, or the same size
+    when cargo copied rather than linked."""
+    same_size: Group | None = None
+    for entry, group in candidates:
+        try:
+            stat = entry.stat(follow_symlinks=False)
+        except OSError:
+            continue
+        if (stat.st_dev, stat.st_ino) == (copy.st_dev, copy.st_ino):
+            return group
+        if same_size is None and stat.st_size == copy.st_size:
+            same_size = group
+    return same_size
+
+
+def attach(path: str, group: Group, roots: dict[str, Group]) -> None:
+    group.entries.append(path)
+    roots[path] = group
+
+
+def claim_copies(
+    directory: str,
+    entries: list[os.DirEntry[str]],
+    candidates: dict[str, list[tuple[os.DirEntry[str], Group]]],
+    roots: dict[str, Group],
+    orphans: Group,
+) -> None:
+    """Give each copy in directory, with its dep-info, to the unit it came from,
+    or to orphans when that unit is gone; leave a file that matches neither."""
+    dep_infos = {
+        entry.name[: -len(DEP_INFO_SUFFIX)]: entry for entry in entries if entry.name.endswith(DEP_INFO_SUFFIX)
+    }
+    owners: dict[str, Group] = {}
+    kept: set[str] = set()
+    for entry in entries:
+        if entry.name.endswith(DEP_INFO_SUFFIX):
+            continue
+        stem = os.path.splitext(entry.name)[0]
+        try:
+            stat = entry.stat(follow_symlinks=False)
+        except OSError:
+            kept.add(stem)
+            continue
+        group = twin(stat, candidates.get(copied_name(entry.name), []))
+        if (
+            group is None
+            and stat.st_nlink == 1
+            and stem in dep_infos
+            and dep_info_output(dep_infos[stem].path, directory) is not None
+        ):
+            group = orphans
+        if group is None:
+            kept.add(stem)
+            continue
+        _ = owners.setdefault(stem, group)
+        attach(entry.path, group, roots)
+    for stem, entry in dep_infos.items():
+        if stem in kept:
+            continue
+        group = owners.get(stem)
+        if group is None:
+            name = dep_info_output(entry.path, directory)
+            if name is None or os.path.lexists(os.path.join(directory, name)):
+                continue
+            group = orphans
+        attach(entry.path, group, roots)
+
+
 def group_roots(trees: list[str], scan: Scan) -> dict[str, Group]:
     """Map each removable entry's path to its group, with last-use times filled in."""
     roots: dict[str, Group] = {}
     for tree in trees:
+        directories = {source: os.path.normpath(os.path.join(tree, copied)) for source, copied in COPY_DIRS.items()}
+        copies = {source: copied_up(directory) for source, directory in directories.items()}
+        # The hashed files each copy could have come from, by copied_name.
+        candidates: dict[str, dict[str, list[tuple[os.DirEntry[str], Group]]]] = {
+            source: {copied_name(entry.name): [] for entry in entries if not entry.name.endswith(DEP_INFO_SUFFIX)}
+            for source, entries in copies.items()
+        }
         units: dict[str, Group] = {}
         for hashed in HASHED_DIRS:
-            try:
-                with os.scandir(os.path.join(tree, hashed)) as entries:
-                    listed = list(entries)
-            except OSError:
-                continue
-            for entry in listed:
+            for entry in listing(os.path.join(tree, hashed)):
                 digest = unit_hash(entry.name)
                 if digest is None:
                     continue
@@ -244,24 +394,24 @@ def group_roots(trees: list[str], scan: Scan) -> dict[str, Group]:
                     group = Group(kind="unit")
                     units[digest] = group
                     scan.groups.append(group)
-                group.entries.append(entry.path)
-                roots[entry.path] = group
+                attach(entry.path, group, roots)
                 if hashed == FINGERPRINT_DIR and entry.is_dir(follow_symlinks=False):
                     used, compiled = newest_times(entry.path)
                     group.last_used = max(group.last_used, used)
                     group.compiled = max(group.compiled, compiled)
+                if hashed in candidates:
+                    sources = candidates[hashed].get(copied_name(entry.name))
+                    if sources is not None:
+                        sources.append((entry, group))
         for group in units.values():
             if group.last_used == 0.0:
                 # No fingerprint dir survives for this hash, so nothing reads
                 # these entries any more; their own mtimes are all there is.
                 mtimes = [os.lstat(path).st_mtime for path in group.entries]
                 group.last_used = group.compiled = max(mtimes)
-        try:
-            with os.scandir(os.path.join(tree, INCREMENTAL_DIR)) as entries:
-                listed = list(entries)
-        except OSError:
-            continue
-        for entry in listed:
+        for source, directory in directories.items():
+            claim_copies(directory, copies[source], candidates[source], roots, scan.orphans)
+        for entry in listing(os.path.join(tree, INCREMENTAL_DIR)):
             _, modified = newest_times(entry.path)
             group = Group(kind="incremental", entries=[entry.path], last_used=modified, compiled=modified)
             scan.groups.append(group)
@@ -291,27 +441,33 @@ def walk(directory: str, owner: Group | None, roots: dict[str, Group], scan: Sca
             group.inodes.append(key)
 
 
-def choose(scan: Scan, total: int, budget: int) -> tuple[list[Group], int]:
-    """Least recently used groups to remove, and the size left once they go.
+def freed_by(group: Group, scan: Scan, remaining: dict[InodeKey, int]) -> int:
+    """Blocks that come back once a group's links go, counting them off remaining.
 
-    A file's blocks come back only when its last link goes, so a binary cargo
-    hard-linked out of deps/ frees nothing until that copy goes too.
+    A file's blocks come back only when its last link goes, so a file with a
+    link outside the group frees nothing until that link goes too.
     """
+    freed = 0
+    for key in group.inodes:
+        remaining[key] -= 1
+        if remaining[key] == 0:
+            freed += scan.blocks[key]
+    return freed
+
+
+def choose(scan: Scan, total: int, budget: int, remaining: dict[InodeKey, int]) -> tuple[list[Group], int]:
+    """Least recently used groups to remove, and the size left once they go."""
     now = time.time()
     order = sorted(
         scan.groups,
         key=lambda group: (-int((now - group.last_used) // DAY_SECONDS), group.compiled),
     )
-    remaining = dict(scan.links)
     chosen: list[Group] = []
     for group in order:
         if total <= budget:
             break
         chosen.append(group)
-        for key in group.inodes:
-            remaining[key] -= 1
-            if remaining[key] == 0:
-                total -= scan.blocks[key]
+        total -= freed_by(group, scan, remaining)
     return chosen, total
 
 
@@ -421,22 +577,33 @@ def when(timestamp: float) -> str:
     return datetime.fromtimestamp(timestamp).strftime("%Y-%m-%d %H:%M")
 
 
-def sweep(roots: list[str], trees: list[str], budget: int, dry_run: bool) -> int:
+def sweep(roots: list[str], trees: list[str], budget: int, source: str, dry_run: bool) -> int:
     scan = Scan()
     owners = group_roots(trees, scan)
     for root in roots:
         walk(root, None, owners, scan)
     total = sum(scan.blocks.values())
     label = ", ".join(roots)
+    state = "within" if total <= budget else "over"
+    print(f"lint sweep: {label} is {gib(total)}, {state} the {gib(budget)} budget ({source})")
+    verb, result = ("would remove", "would leave") if dry_run else ("removed", "left")
+    remaining = dict(scan.links)
+    failures = 0
+    orphans = scan.orphans
+    if orphans.entries:
+        freed = freed_by(orphans, scan, remaining)
+        total -= freed
+        failures += 0 if dry_run else remove([orphans])
+        print(
+            f"lint sweep: {verb} {len(orphans.entries)} orphaned files ({gib(freed)}),"
+            + f" copied-up output whose build unit is gone; {result} {gib(total)}"
+        )
     if total <= budget:
-        print(f"lint sweep: {label} is {gib(total)}, within the {gib(budget)} budget")
-        return 0
-    print(f"lint sweep: {label} is {gib(total)}, over the {gib(budget)} budget")
-    chosen, left = choose(scan, total, budget)
-    failures = 0 if dry_run else remove(chosen)
+        return 1 if failures else 0
+    chosen, left = choose(scan, total, budget, remaining)
+    failures += 0 if dry_run else remove(chosen)
     if chosen:
         units = sum(1 for group in chosen if group.kind == "unit")
-        verb, result = ("would remove", "would leave") if dry_run else ("removed", "left")
         print(
             f"lint sweep: {verb} {units} build units and {len(chosen) - units} incremental dirs"
             + f" ({gib(total - left)}), last used {when(chosen[0].last_used)}"
@@ -445,31 +612,89 @@ def sweep(roots: list[str], trees: list[str], budget: int, dry_run: bool) -> int
     if left > budget:
         print(
             f"lint sweep: {gib(left)} remains over budget in output this sweep never removes"
-            + " (test-run folders, binaries copied out of deps/, doc/ under its own budget)"
+            + " (test-run folders, files it cannot match to a build unit, doc/ under its own budget)"
         )
     return 1 if failures else 0
 
 
-def budget_bytes() -> int | None:
-    raw = os.environ.get(BUDGET_ENV, "")
-    if not raw:
-        return int(DEFAULT_BUDGET_GIB * GIB)
+def size_bytes(raw: str, unit: int) -> int | None:
+    """raw as a non-negative number of units, in bytes; None for anything else."""
     try:
         value = float(raw)
     except ValueError:
         return None
-    return int(value * GIB) if value >= 0 else None
+    return int(value * unit) if math.isfinite(value) and value >= 0 else None
+
+
+def config_values(path: str) -> dict[str, str]:
+    """lint.conf's key=value pairs, read as lint_config.sh's _lint_config_raw
+    reads them: '#' starts a comment, [section] lines are skipped, the first
+    value of a key wins."""
+    try:
+        with open(path, encoding="utf-8") as handle:
+            lines = handle.readlines()
+    except OSError:
+        return {}
+    values: dict[str, str] = {}
+    for raw in lines:
+        line = raw.split("#", 1)[0].strip()
+        if not line or (line.startswith("[") and line.endswith("]")) or "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        _ = values.setdefault(key.strip(), value.strip())
+    return values
+
+
+def repo_name(directory: str) -> str | None:
+    """Name of the directory holding the git common dir of the repo directory is
+    in: every worktree of a repo shares it. Read from the .git files rather than
+    from git, which a bare PATH may not reach."""
+    current = os.path.abspath(directory)
+    while not os.path.lexists(os.path.join(current, GIT_DIR)):
+        parent = os.path.dirname(current)
+        if parent == current:
+            return None
+        current = parent
+    common = os.path.join(current, GIT_DIR)
+    if os.path.isfile(common):
+        # A linked worktree: .git names its private git dir, whose commondir
+        # file leads back to the shared one.
+        try:
+            with open(common, encoding="utf-8") as handle:
+                pointer = handle.readline().strip()
+        except OSError:
+            return None
+        if not pointer.startswith(GITDIR_PREFIX):
+            return None
+        common = os.path.join(current, pointer[len(GITDIR_PREFIX) :].strip())
+        try:
+            with open(os.path.join(common, COMMONDIR_FILE), encoding="utf-8") as handle:
+                common = os.path.join(common, handle.readline().strip())
+        except FileNotFoundError:
+            pass
+        except OSError:
+            return None
+    return os.path.basename(os.path.dirname(os.path.normpath(common))) or None
+
+
+def budget_bytes(environ: dict[str, str], config: str, repo: str | None) -> tuple[int | None, str]:
+    """The sweep budget, None when its value is malformed, and where it came from."""
+    raw = environ.get(BUDGET_ENV, "")
+    if raw:
+        return size_bytes(raw, GIB), f"{BUDGET_ENV} in the environment"
+    values = config_values(config)
+    keys = [f"{BUDGET_KEY}.{repo}", BUDGET_KEY] if repo else [BUDGET_KEY]
+    for key in keys:
+        if values.get(key):
+            return size_bytes(values[key], GIB), f"{key} in {config}"
+    return int(DEFAULT_BUDGET_GIB * GIB), f"the default, no {BUDGET_KEY} in {config}"
 
 
 def doc_index_bytes() -> int | None:
     raw = os.environ.get(DOC_INDEX_ENV, "")
     if not raw:
         return int(DEFAULT_DOC_INDEX_MIB * MIB)
-    try:
-        value = float(raw)
-    except ValueError:
-        return None
-    return int(value * MIB) if value >= 0 else None
+    return size_bytes(raw, MIB)
 
 
 def main(argv: list[str]) -> int:
@@ -480,9 +705,10 @@ def main(argv: list[str]) -> int:
         else:
             print(f"lint sweep: unknown argument {arg}", file=sys.stderr)
             return 2
-    budget = budget_bytes()
+    config = os.path.expanduser(os.environ.get(CONFIG_ENV) or DEFAULT_CONFIG)
+    budget, source = budget_bytes(dict(os.environ), config, repo_name(os.getcwd()))
     if budget is None:
-        print(f"lint sweep: {BUDGET_ENV} must be a non-negative number of GiB", file=sys.stderr)
+        print(f"lint sweep: {source} must be a non-negative number of GiB", file=sys.stderr)
         return 2
     doc_budget = doc_index_bytes()
     if doc_budget is None:
@@ -499,7 +725,7 @@ def main(argv: list[str]) -> int:
         return 0
     try:
         doc_status = prune_doc_index(roots, doc_budget, dry_run)
-        return sweep(roots, trees, budget, dry_run) or doc_status
+        return sweep(roots, trees, budget, source, dry_run) or doc_status
     finally:
         release(held)
 

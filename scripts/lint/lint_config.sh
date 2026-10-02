@@ -16,7 +16,8 @@
 #   lint_config.sh export             LINT_OP_<NAME>=on|off lines
 #   lint_config.sh enabled <op>       exit 0 if on, 1 if off (no output)
 #
-# A missing config file means every check is on.
+# A missing config file means every check is on. The sweep_budget_gib keys in
+# the same file are sizes, not switches: sweep.py reads them, this file does not.
 
 LINT_CONFIG_FILE="${LINT_CONFIG_FILE:-$HOME/.claude/config/lint.conf}"
 

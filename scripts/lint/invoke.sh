@@ -299,8 +299,9 @@ invoke_doc() {
 # scope: size is a property of the target directory, not of which members
 # changed. sweep.py holds the policy (least recently used build units and
 # incremental dirs go first, cargo's build locks taken without waiting) and
-# the measurements behind it. The knobs are LINT_SWEEP_BUDGET_GIB (default 96)
-# and LINT_SWEEP_DOC_INDEX_MIB (default 250, the doc/ cross-crate index past
+# the measurements behind it. The budget is sweep_budget_gib.<repo> or
+# sweep_budget_gib in config/lint.conf (24 GiB, hana 96), which
+# LINT_SWEEP_BUDGET_GIB overrides; the other knob is LINT_SWEEP_DOC_INDEX_MIB (default 250, the doc/ cross-crate index past
 # which the whole doc tree goes, because rustdoc's peak memory tracks that
 # index rather than the crate it documents). Both are LINT_-prefixed on
 # purpose: sccache hashes every CARGO_* variable into its cache key.

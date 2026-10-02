@@ -35,9 +35,10 @@ manifest, not a package set, so resolution runs against that manifest's tree
 instead of the working directory. fmt is always --all: it
 compiles nothing, so the wider scope is free. sweep takes no scope either: it
 removes the least recently used build output from the target directory of the
-workspace in the current directory, cargo-port's cwd, until it fits
-LINT_SWEEP_BUDGET_GIB (default 96), and runs last in each of cargo-port's lint
-runs.
+workspace in the current directory, cargo-port's cwd, until it fits the
+budget: LINT_SWEEP_BUDGET_GIB if set, else sweep_budget_gib.<repo> or
+sweep_budget_gib in config/lint.conf (24 GiB, hana 96), and runs last in each
+of cargo-port's lint runs.
 
 mend/clippy/doc/fmt/sweep honor config/lint.conf (edit with /lint_config);
 LINT_CONFIG_FORCE=1 overrides the gate — push and release gates set it on
