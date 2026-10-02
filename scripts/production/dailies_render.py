@@ -285,7 +285,10 @@ def parse_eta(value: object, where: str) -> Eta:
     why = optional_text(fields, "why", where)
     if why is not None and time is None:
         raise InputError(f"{where}.why: only with a time")
-    return Eta(time, earliest, latest, none, optional_text(fields, "detail", where), percent, why)
+    detail = optional_text(fields, "detail", where)
+    if detail is not None and detail.lower().startswith("from"):
+        raise InputError(f"{where}.detail: never say where the ETA came from; say what the time covers, or leave it out")
+    return Eta(time, earliest, latest, none, detail, percent, why)
 
 
 def check_update(update: str, length: str, where: str, key: str = "update") -> None:
