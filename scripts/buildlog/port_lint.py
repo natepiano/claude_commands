@@ -11,7 +11,9 @@ child), whose folder is the worktree or inside it; or a process named cargo*
 other than cargo-handler and cargo-port, whose cwd is inside it. A lint then
 would compete with that work for the build lock and the CPU, and lint files
 that are still changing. A probe that is missing, fails or takes over 10 s is
-skipped.
+skipped. Sweep never defers: it takes cargo's build locks without waiting and
+skips the target folder when a build holds one (lint/sweep.py), so it cannot
+compete with a build, and deferring it let target folders outgrow their budget.
 
 Reuse, clippy and mend only, and only without extra args: when a step on this
 host already ran the argv `lint` would run, in the same worktree, on the same
@@ -307,7 +309,7 @@ def main(argv: list[str]) -> int:
     cwd = os.getcwd()
     worktree = treekey.worktree(cwd) or cwd
     try:
-        reason = deferral(real(worktree))
+        reason = None if command == "sweep" else deferral(real(worktree))
     except Exception:  # noqa: BLE001 -- a broken check lints rather than defers forever
         store.note_error("port-lint deferral")
         reason = None

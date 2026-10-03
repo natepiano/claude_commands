@@ -13,6 +13,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from typing import cast, override
+from unittest import mock
 
 import port_lint
 import store
@@ -119,6 +120,21 @@ class BusyTests(unittest.TestCase):
         ]
         self.assertEqual(port_lint.busy_cargo(processes, str(worktree)), ("cargo pid 14 (cargo-clippy)", str(member)))
         self.assertIsNone(port_lint.busy_cargo(processes[:4], str(worktree)))
+
+
+class SweepTests(unittest.TestCase):
+    def test_sweep_runs_while_clippy_defers(self) -> None:
+        point_root_at(self, Path(self.enterContext(tempfile.TemporaryDirectory())) / "buildlog")
+        ran: list[list[str]] = []
+
+        def execv(_path: object, args: list[str]) -> None:
+            ran.append(args)
+
+        _ = self.enterContext(mock.patch.object(port_lint, "deferral", return_value="port-lint: deferred — busy"))
+        _ = self.enterContext(mock.patch("os.execv", execv))
+        self.assertEqual(port_lint.main(["clippy"]), port_lint.DEFERRED)
+        _ = port_lint.main(["sweep"])
+        self.assertEqual(ran, [[str(port_lint.LINT), "sweep"]])
 
 
 class ReuseTests(unittest.TestCase):
