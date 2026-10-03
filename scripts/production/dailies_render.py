@@ -151,6 +151,18 @@ def parse_time(text: str, now: datetime) -> datetime:
     return moment
 
 
+def parse_range_end(text: str, now: datetime, eta: datetime, *, earliest: bool) -> datetime:
+    """A range end, on the day that keeps it on its side of the ETA: earliest at or before, latest at or after."""
+    moment = parse_time(text, now)
+    if "+" in text:
+        return moment
+    if earliest and moment > eta:
+        return moment - timedelta(days=1)
+    if not earliest and moment < eta:
+        return moment + timedelta(days=1)
+    return moment
+
+
 def window_start(now: datetime) -> datetime:
     mark = now.replace(hour=now.hour - now.hour % LABEL_EVERY_HOURS, minute=0, second=0, microsecond=0)
     return mark - timedelta(hours=HOURS_BEFORE)
@@ -499,7 +511,7 @@ def eta_text(unit: Unit, previous: Previous | None, now: datetime, zone_name: st
         if note:
             notes.append(note)
         if eta.earliest and eta.latest:
-            notes.append(f"range {range_clock(parse_time(eta.earliest, now), now)}–{range_clock(parse_time(eta.latest, now), now)}")
+            notes.append(f"range {range_clock(parse_range_end(eta.earliest, now, moment, earliest=True), now)}–{range_clock(parse_range_end(eta.latest, now, moment, earliest=False), now)}")
         done = f"{eta.percent}% done" if eta.percent is not None else "percent done not stated"
         words = f"{clock(moment, now, zone_name)}, {done}" + (f" ({'; '.join(notes)})" if notes else "")
     return f"{words}; {eta.detail}" if with_note and eta.detail else words
@@ -557,8 +569,8 @@ def render(report: Report, previous: dict[str, Previous], now: datetime, zone_na
             rows.append(Row(unit.label, None))
             continue
         moment = parse_time(unit.eta.time, now)
-        earliest = parse_time(unit.eta.earliest, now) if unit.eta.earliest else moment
-        latest = parse_time(unit.eta.latest, now) if unit.eta.latest else moment
+        earliest = parse_range_end(unit.eta.earliest, now, moment, earliest=True) if unit.eta.earliest else moment
+        latest = parse_range_end(unit.eta.latest, now, moment, earliest=False) if unit.eta.latest else moment
         rows.append(Row(unit.label, Estimate(unit.started, moment, earliest, latest)))
     lines.extend(["```", *draw(now, rows), "```", ""])
 
