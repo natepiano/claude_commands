@@ -648,7 +648,8 @@ it needs. Every other wait is yours to clear, and fast.
       only the user can lift it.
    3. **Tell the user exactly what to do,** in one line they can act on from
       a phone: the session, then the exact words to type or the exact allow
-      rule to add. Put it in `needed:` and send it with PushNotification too.
+      rule to add. Put it in `needed:` and send it as a <Notify/> priority 2
+      alert.
    4. **Rule 4's limit holds.** Read the pane again each hour, and repeat 1–3.
       A `needed:` line never repeats unchanged from tick to tick.
    5. **Prevent the next one.** When a routine action for the unit is refused
@@ -656,6 +657,28 @@ it needs. Every other wait is yours to clear, and fast.
       produced the refused form. Name the fix to the user: a command change,
       or an allow rule only they can add.
 </Dependencies>
+
+<Notify>
+Phone alerts go through Pushover (user's pick, 2026-10-03), because the user
+often ignores ordinary push notifications:
+
+`~/.claude/scripts/notify/pushover.py [--priority 0|1|2] "Hana: <unit or topic>" "<message>"`
+
+The message is the one action or fact, under 200 characters. Exit 0 means
+sent. On 1 (refused or unreachable) or 2 (bad usage or missing keys), fall back
+to PushNotification and say so in the log. Never read or print
+`~/.config/pushover/env`. Every send is logged in
+`~/.local/state/notify/pushover.log`.
+
+| Priority | When |
+| --- | --- |
+| 2: emergency, repeats every 5 min until the user taps Acknowledge | Work has stopped, and only the user can restart it: a block under <Dependencies/> rule 6, after steps 1–2, carrying the exact action; a cold gpg-agent stopping every push (the user runs `github-warmup`). Send once per block. |
+| 1: high | The user is needed, but nothing has stopped: a product decision only they can make while units have other work; main's CI red after <PromoteMain/>; a block still open an hour after they acknowledged it. That last one says what changed, never the same text again. |
+| 0: normal | A unit's whole plan finished and merged; before/after shots ready for the user's review. |
+
+Never sent: dailies, ETAs, routine merges, green CI, flakes rerun, and hardware
+checks that wait on the user's travel.
+</Notify>
 
 ---
 
