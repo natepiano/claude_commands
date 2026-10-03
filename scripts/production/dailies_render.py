@@ -61,6 +61,15 @@ GREEN = "🟩"
 RED = "🟥"
 BLUE = "🟦"
 BLANK = "  "
+# The `ascii` chart: only characters a code font has, so the desktop app keeps
+# every row aligned, which it cannot with the coloured squares (user,
+# 2026-10-03: the coloured chart by default, this one when remote).
+LINE = "──"
+CROSS = "┼─"
+DOT = "● "
+DOT_RANGED = "●·"
+DOTS = "··"
+CAP = "┤ "
 NOW_MARK = "▼ "
 # A unit under a /build_hold carries this marker; no marker means not held
 # (user, 2026-10-03: "Without that marker I will assume it is not held").
@@ -132,6 +141,7 @@ class Topic:
 @dataclass(frozen=True)
 class Report:
     length: str
+    chart: str
     zone: str
     next_run: str | None
     units: list[Unit]
@@ -168,6 +178,25 @@ class Row:
     plan: PlanProgress | None
 
 
+@dataclass(frozen=True)
+class ChartStyle:
+    """The timeline's cells, each two columns wide, and whether `(earliest–latest)` follows the ETA."""
+
+    run: str
+    earliest: str
+    eta: str
+    eta_ranged: str
+    range_fill: str
+    latest: str
+    show_range: bool
+
+
+CHART_STYLES = {
+    "default": ChartStyle(WHITE, GREEN, BLUE, BLUE, BLANK, RED, show_range=True),
+    "ascii": ChartStyle(LINE, CROSS, DOT, DOT_RANGED, DOTS, CAP, show_range=False),
+}
+
+
 def parse_time(text: str, now: datetime) -> datetime:
     """`HH:MM`, with `+N` for N days later; a time more than two hours before now is tomorrow."""
     clock_part, _, days = text.partition("+")
@@ -197,8 +226,8 @@ def window_start(now: datetime) -> datetime:
     return mark - timedelta(hours=HOURS_BEFORE)
 
 
-def draw(now: datetime, rows: list[Row]) -> list[str]:
-    """24 hourly cells: white from the phase's start (or the left edge) to the ETA, blue at the ETA, green at the earliest time, red at the latest; `→` past the right edge; a start before the left edge is written before the cells."""
+def draw(now: datetime, rows: list[Row], style: ChartStyle) -> list[str]:
+    """24 hourly cells in `style`: the run from the phase's start (or the left edge) to the ETA, marks at the earliest time, the ETA and the latest, and the range filled between the ETA and the latest; `→` past the right edge; a start before the left edge is written before the cells."""
     start = window_start(now)
 
     def column(moment: datetime) -> int:
@@ -228,18 +257,23 @@ def draw(now: datetime, rows: list[Row]) -> list[str]:
         estimate = row.estimate
         cells = [BLANK] * WINDOW_HOURS
         first = max(0, column(estimate.started))
-        for index in range(first, min(column(estimate.eta), last) + 1):
-            cells[index] = WHITE
+        eta_cell = max(0, min(column(estimate.eta), last))
+        latest_cell = max(0, min(column(estimate.latest), last))
+        for index in range(first, eta_cell + 1):
+            cells[index] = style.run
         ranged = (estimate.earliest, estimate.latest) != (estimate.eta, estimate.eta)
         if ranged and column(estimate.earliest) <= last:
-            cells[max(0, column(estimate.earliest))] = GREEN
-        # Blue takes green's cell when the two share an hour; red keeps its own.
-        cells[max(0, min(column(estimate.eta), last))] = BLUE
+            cells[max(0, column(estimate.earliest))] = style.earliest
+        # The ETA takes the earliest time's cell when the two share an hour;
+        # the latest keeps its own.
+        cells[eta_cell] = style.eta_ranged if ranged and latest_cell > eta_cell else style.eta
         if ranged:
-            cells[max(0, min(column(estimate.latest), last))] = RED
+            for index in range(eta_cell + 1, latest_cell):
+                cells[index] = style.range_fill
+            cells[latest_cell] = style.latest
         arrow = "→" if column(estimate.latest) > last else ""
         span = f"{estimate.eta:%H:%M}"
-        if ranged:
+        if ranged and style.show_range:
             span += f" ({estimate.earliest:%H:%M}–{estimate.latest:%H:%M})"
         lines.append(f"{prefix}{''.join(cells).rstrip()}{arrow} {span}{hold}")
     return with_plans(lines, rows)
@@ -516,17 +550,20 @@ def parse_topic(value: object, where: str, length: str) -> Topic:
 
 def parse_report(value: object) -> Report:
     fields = as_map(value, "input")
-    check_keys(fields, {"length", "zone", "next_run", "units", "topics"}, "input")
+    check_keys(fields, {"length", "chart", "zone", "next_run", "units", "topics"}, "input")
     length = text(fields, "length", "input")
     if length not in LENGTHS:
         raise InputError(f"input.length: must be one of {', '.join(LENGTHS)}")
+    chart = optional_text(fields, "chart", "input") or "default"
+    if chart not in CHART_STYLES:
+        raise InputError(f"input.chart: must be one of {', '.join(CHART_STYLES)}")
     zone = text(fields, "zone", "input")
     next_run = clock_text(fields, "next_run", "input")
     units = [parse_unit(item, f"units[{index}]", length) for index, item in enumerate(as_list(fields.get("units"), "input.units"))]
     if not units:
         raise InputError("input.units: every unit is reported, so the list cannot be empty")
     topics = [parse_topic(item, f"topics[{index}]", length) for index, item in enumerate(as_list(fields.get("topics"), "input.topics"))]
-    return Report(length, zone, next_run, units, topics)
+    return Report(length, chart, zone, next_run, units, topics)
 
 
 def load_state(path: Path | None) -> dict[str, Previous]:
@@ -683,7 +720,7 @@ def render(report: Report, previous: dict[str, Previous], now: datetime, zone_na
         earliest = parse_range_end(unit.eta.earliest, now, moment, earliest=True) if unit.eta.earliest else moment
         latest = parse_range_end(unit.eta.latest, now, moment, earliest=False) if unit.eta.latest else moment
         rows.append(Row(unit.label, Estimate(unit.started, moment, earliest, latest), on_hold, plan))
-    lines.extend(["```", *draw(now, rows), "```", ""])
+    lines.extend(["```", *draw(now, rows, CHART_STYLES[report.chart]), "```", ""])
 
     needed = any(unit.needed for unit in report.units) or any(topic.needed for topic in report.topics)
     tail = "" if needed else " - nothing needed"

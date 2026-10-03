@@ -111,6 +111,7 @@ python3 ~/.claude/scripts/production/dailies_render.py <scratchpad>/dailies_inpu
 | Field | Rule |
 | --- | --- |
 | `length` | `simple`, `page` or `elaborate`, from the argument. |
+| `chart` | `default` (the coloured squares) or `ascii` (only characters a code font has, for when you are remote). Leave it out for `default`. It stays as you last set it: "ascii mode" sets `ascii` and "switch back to default" removes it. User, 2026-10-03. |
 | `zone` | `ZONE`, as an IANA name. |
 | `next_run` | The next scheduled run, `HH:MM` in `ZONE`, after any restart. Leave it out when no schedule runs. |
 | `unit` | The unit director's session name. |
@@ -179,6 +180,10 @@ names another plan's document. User, 2026-10-02.
   whole plan's percent done (earlier phases whole, this one at its `percent`),
   then ten blocks, one per 10% rounded, and `│` at 100%, with `100%` above it
   on the axis line. A follow-up row has none. User, 2026-10-03.
+  The `ascii` chart draws the same rows with characters a code font has,
+  because the desktop app draws emoji wider than two columns: `──` while the
+  phase runs, `┼─` at the earliest time, `●` at the ETA, `·` dots to `┤` at
+  the latest, and no `(earliest–latest)` text, so the row fits. User, 2026-10-03.
 - **Last line:** `next run at 20:10 - nothing needed` when no subject has a
   `needed:`, `next run at 20:10` when one does, or `no run scheduled` without a
   schedule. The report replaces the turn's `— waiting on:` line.
