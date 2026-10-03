@@ -370,6 +370,12 @@ Input: the unit, phase, hash and shots from its notice.
    done
    ```
 
+   Then add a step for each changed example (`crates/<pkg>/examples/<name>.rs`
+   or `crates/<pkg>/examples/<name>/`): `verify.sh example <pkg> <name>`, with
+   its own `_EXIT` line. Tests and the quick push never run clippy on an example,
+   and CI's Clippy job does (`--all-targets`). On 2026-10-03, examples' Phase 1
+   turned the merge branch red this way.
+
    When the notification arrives, read the `_EXIT` lines once.
 9. **Red.** Rerun each red package once, alone.
    - Green alone, and memory names it as a known load-sensitive flake: log it
