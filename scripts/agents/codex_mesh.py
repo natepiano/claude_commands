@@ -34,8 +34,8 @@ Verbs:
          keeps accepting `send`, and only `end` releases the block.
   send   Queue a message for a named delegate, delivered at its next turn.
   steer  Inject into a named delegate's running turn.
-  end    Finish a resident delegate: interrupt its running turn, if any, and
-         release its `start`.
+  end    Finish a resident delegate: drop its queued messages, interrupt its
+         running turn, if any, and release its `start`.
   stop   Stop the session's app-server, and any it replaced mid-run.
   list   Print the roster of named delegates and what each is doing.
 """
@@ -962,9 +962,14 @@ def _live_turn_from_mismatch(reply: RpcMessage) -> str:
 
 
 def command_end(args: argparse.Namespace) -> int:
-    """Release a resident delegate: interrupt the turn it is on, then leave the
-    marker its `start` loop polls for. Nothing here starts a server -- a
-    delegate whose server is already gone is ended by the marker alone."""
+    """Release a resident delegate: drop the messages queued for it, interrupt
+    the turn it is on, then leave the marker its `start` loop polls for.
+    Nothing here starts a server -- a delegate whose server is already gone is
+    ended by the marker alone.
+
+    The queue goes first because the server opens a new turn for each queued
+    message on its own: a delegate ended with messages waiting comes back, one
+    turn per message, long after its `start` has returned."""
     session_dir = _as_str(_attr(args, "session_dir"))
     target = _as_str(_attr(args, "to"))
     record = _lookup(session_dir, target)
@@ -972,19 +977,68 @@ def command_end(args: argparse.Namespace) -> int:
     if status != "running":
         print(f"{target} is {status}; nothing to end")
         return 0
-    turn_id = record.get("turn_id", "")
     port = _live_server_port(session_dir)
-    if turn_id and port is not None:
+    dropped = 0
+    if port is not None:
         client = Client(port, f"end-{os.getpid()}")
-        # Best effort: a turn that finished between the roster read and this
-        # call answers with an error, and the marker below ends it either way.
-        _ = client.call(
-            "turn/interrupt", {"threadId": record["thread_id"], "turnId": turn_id}
-        )
+        thread_id = record["thread_id"]
+        dropped = _drop_queued_messages(client, thread_id)
+        # A queued message opens a turn the `start` loop never saw, so the
+        # roster's id may be stale; the server names the live one.
+        turn_id = _live_turn(client, thread_id) or record.get("turn_id", "")
+        if turn_id:
+            # Best effort: a turn that finished between the read and this call
+            # answers with an error, and the marker below ends it either way.
+            _ = client.call(
+                "turn/interrupt", {"threadId": thread_id, "turnId": turn_id}
+            )
         client.close()
     _end_marker_path(session_dir, target).touch()
-    print(f"ending {target}")
+    suffix = f", dropped {dropped} queued message(s)" if dropped else ""
+    print(f"ending {target}{suffix}")
     return 0
+
+
+# Upper bound on queue reads while draining; a list returns one page at a time.
+END_QUEUE_DRAIN_ROUNDS = 50
+
+
+def _drop_queued_messages(client: Client, thread_id: str) -> int:
+    """Delete every message queued for a thread; returns how many went."""
+    dropped = 0
+    for _ in range(END_QUEUE_DRAIN_ROUNDS):
+        listed = client.call("thread/queue/list", {"threadId": thread_id})
+        items = _as_dict(listed.get("result")).get("data")
+        if not isinstance(items, list) or not items:
+            break
+        for item in cast("list[object]", items):
+            submission = _as_str(_as_dict(item).get("id"))
+            if not submission:
+                continue
+            reply = client.call(
+                "thread/queue/delete",
+                {"threadId": thread_id, "queuedSubmissionId": submission},
+            )
+            if not reply.get("error"):
+                dropped += 1
+    return dropped
+
+
+def _live_turn(client: Client, thread_id: str) -> str:
+    """The thread's running turn id, or "" when none runs.
+
+    The server has no read for it; a steer against an id that cannot match is
+    refused with the live id named. Should a server ever accept it, the text is
+    an instruction to stop, which is what the caller wants anyway."""
+    probe = client.call(
+        "turn/steer",
+        {
+            "threadId": thread_id,
+            "expectedTurnId": "end-probe",
+            "input": [{"type": "text", "text": "Stop now: make no edits and end your turn."}],
+        },
+    )
+    return _live_turn_from_mismatch(probe)
 
 
 def command_list(args: argparse.Namespace) -> int:
