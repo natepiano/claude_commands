@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Turn banned-word hook enforcement on or off.
 
-The three hooks stay registered in settings.json permanently. This flips the
+The two hooks stay registered in settings.json permanently. This flips the
 switch they read, so enforcement changes without touching settings.json --
 which carries a git clean filter and would need JSON surgery on every flip.
 """
@@ -13,8 +13,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 from banned_words_lib import HOOK_CONFIG, hooks_enabled
 
 GOVERNED_HOOKS = (
-    ("PostToolUse", "post-tool-use-banned-words.py", "messages the violation"),
-    ("PostToolUse", "post-tool-use-banned-words-block.py", "blocks until it is fixed"),
+    ("PostToolUse", "post-tool-use-banned-words.py", "blocks and messages the violation"),
     ("Stop", "stop-assistant-prose-banned-words.py", "scans the emitted turn"),
 )
 DEFAULT_CONFIG = """# Banned-word hook enforcement — on or off.

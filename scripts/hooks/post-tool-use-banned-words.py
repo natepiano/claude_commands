@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""PostToolUse hook: check the text a tool call writes, and its output, for banned words.
+"""PostToolUse hook: block a tool call whose written text or output has a banned word.
 
 What is scanned per tool is defined once, in tool_call_text.scan_text: text a
 call removes or searches for (an Edit's old_string, the old side of a scripted
@@ -7,45 +7,62 @@ replacement or the pattern of a grep in a Bash command) is never scanned, and a
 banned word in that text is not reported in the tool's output either; the rest
 of the output is.
 
-User sees a one-line systemMessage; agent sees the full violation list and
-recovery instructions via hookSpecificOutput.additionalContext. Local counters
-are updated by the hook itself.
+One JSON object carries the whole verdict: `decision: block` with a short
+reason, so the agent must address the violation before moving on; a one-line
+systemMessage for the user; and the full violation list and recovery
+instructions for the agent via hookSpecificOutput.additionalContext. Local
+counters are updated by the hook itself.
+
+The hook has no matcher, so it runs after every tool call. A read-only tool
+exits on its name, before the banned-word machinery is imported.
 """
 
 import json
 import sys
-from pathlib import Path
-from typing import cast
+from typing import TYPE_CHECKING, cast
 
-sys.path.insert(0, str(Path(__file__).parent))
-from banned_words_lib import (
-    COUNTER_STATE,
-    STYLE_GUIDE,
-    bump_counters,
-    find_violations,
-    format_counter_totals,
-    get_stem_guidance,
-    hooks_enabled,
-    is_guide_reproduction,
-    is_introspection_command,
-    is_read_only_command,
-    is_read_only_tool,
-)
-from tool_call_text import HookPayload, ToolInput, ToolResponse, scan_text
+if TYPE_CHECKING:
+    from tool_call_text import HookPayload
+
+# Tools that only read — they never author content this turn. Their output is
+# just file/search content the agent is inspecting, so scanning it only produces
+# false positives (a Read of a file that legitimately uses a banned term, a Grep
+# whose pattern is the term itself).
+READ_ONLY_TOOLS = frozenset({"Read", "Grep", "Glob", "NotebookRead", "LS"})
 
 
 def main() -> None:
-    if not hooks_enabled():
-        sys.exit(0)
-
     try:
-        data: HookPayload = cast(HookPayload, json.load(sys.stdin))
+        data = cast("HookPayload", json.load(sys.stdin))
     except json.JSONDecodeError:
         sys.exit(0)
 
     tool_name: str = data.get("tool_name", "") or ""
-    if is_read_only_tool(tool_name):
+    if tool_name in READ_ONLY_TOOLS:
         sys.exit(0)
+
+    # Imported past the read-only exit: the banned-word machinery is most of
+    # this hook's start-up time.
+    from pathlib import Path
+
+    sys.path.insert(0, str(Path(__file__).parent))
+    from banned_words_lib import (
+        COUNTER_STATE,
+        STYLE_GUIDE,
+        bump_counters,
+        find_violations,
+        format_counter_totals,
+        get_stem_guidance,
+        hooks_enabled,
+        is_guide_reproduction,
+        is_introspection_command,
+        is_read_only_command,
+    )
+    from tool_call_text import ToolInput, ToolResponse, scan_text
+
+    if not hooks_enabled():
+        sys.exit(0)
+
     # Some MCP tools deliver `tool_input`/`tool_response` as a string instead
     # of a dict — defend against that before calling .get() on them.
     raw_tool_input: object = data.get("tool_input", {})
@@ -92,6 +109,7 @@ def main() -> None:
     seen: set[tuple[str, int]] = set()
     bullets: list[str] = []
     stems_in_order: list[str] = []
+    lines_by_stem: dict[str, list[int]] = {}
     for v in violations:
         key = (v.stem, v.line_no)
         if key in seen:
@@ -99,17 +117,36 @@ def main() -> None:
         seen.add(key)
         if v.stem not in stems_in_order:
             stems_in_order.append(v.stem)
+            lines_by_stem[v.stem] = []
+        lines_by_stem[v.stem].append(v.line_no)
         snippet = v.line[:140]
         bullets.append(
             f"  - line {v.line_no}: matched {v.match!r} (banned stem: {v.stem!r})\n      > {snippet}"
         )
 
     # Skip content that reproduces the banned-word list/machinery (docs about
-    # the mechanism, a copy of the guide) so it does not bump every counter.
+    # the mechanism, a copy of the guide) so it does not block on its own
+    # self-reference or bump every counter.
     if is_guide_reproduction(text, len(stems_in_order)):
         sys.exit(0)
 
-    bumped = bump_counters(stems_in_order)
+    parts = [
+        f"{stem} (line{'s' if len(lines_by_stem[stem]) > 1 else ''} {', '.join(str(n) for n in lines_by_stem[stem])})"
+        for stem in stems_in_order
+    ]
+    block = {
+        "decision": "block",
+        "reason": f"⛔ fix banned word(s): {', '.join(parts)}",
+    }
+
+    try:
+        bumped = bump_counters(stems_in_order)
+    except OSError:
+        # The counter lock could not be opened. The block does not depend on
+        # the counters, so it still goes out; the detail, which reports counter
+        # totals, does not.
+        print(json.dumps(block))
+        return
 
     short_file = Path(file_path).name if file_path else tool_name
     stems_label = ", ".join(stems_in_order)
@@ -144,6 +181,7 @@ def main() -> None:
     )
 
     output = {
+        **block,
         "continue": True,
         "systemMessage": system_msg,
         "hookSpecificOutput": {

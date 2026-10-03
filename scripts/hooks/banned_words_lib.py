@@ -23,7 +23,7 @@ COUNTER_LOCK = COUNTER_STATE.with_suffix(".lock")
 # write copies the live file here first, so `revert_to_backup()` undoes exactly
 # the last bump — used when a hit is deemed not to count (e.g. quoting a stem).
 COUNTER_BACKUP = COUNTER_STATE.with_name(COUNTER_STATE.name + ".bak")
-# Enforcement switch for the three banned-word hooks. Their registration in
+# Enforcement switch for the two banned-word hooks. Their registration in
 # settings.json is permanent; this file is what turns them on and off, so a flip
 # never rewrites settings.json through its clean filter. Edited with
 # /banned_word_hook. A missing file means enforcement is on.
@@ -48,7 +48,7 @@ INTROSPECTION_TOKENS = (
 
 
 def hooks_enabled() -> bool:
-    """Whether the three banned-word hooks enforce, or pass straight through.
+    """Whether the two banned-word hooks enforce, or pass straight through.
 
     Only a literal `off` disables them. A missing file, an unreadable one, or a
     value nobody recognizes all read as on: a hook that quietly stopped
@@ -81,18 +81,6 @@ def is_introspection_command(command: str) -> bool:
        the diff would flag the same content twice and double-bump counters.
     """
     return any(tok in command for tok in INTROSPECTION_TOKENS)
-
-
-# Tools that only read — they never author content this turn. The PostToolUse
-# hook has no matcher, so it runs on every tool and scans `tool_response.output`;
-# for these that output is just file/search content the agent is inspecting, so
-# scanning it only produces false positives (a Read of a file that legitimately
-# uses a banned term, a Grep whose pattern is the term itself).
-READ_ONLY_TOOLS = frozenset({"Read", "Grep", "Glob", "NotebookRead", "LS"})
-
-
-def is_read_only_tool(tool_name: str) -> bool:
-    return tool_name in READ_ONLY_TOOLS
 
 
 # Read-only shell programs: the command string is a search pattern or path and
@@ -469,7 +457,7 @@ def bump_counters(stems: Iterable[str]) -> dict[str, CounterRecord]:
 def get_stem_guidance(stem: str) -> str:
     """Return the per-stem body from the style guide (between this heading and the next ###).
 
-    Used by the messaging hook so the agent gets the substitutes and rule prose
+    Used by the PostToolUse hook so the agent gets the substitutes and rule prose
     inline without needing to open the style guide on every violation.
     """
     guide = _read_guide()

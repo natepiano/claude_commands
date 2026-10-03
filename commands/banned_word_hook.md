@@ -22,21 +22,20 @@ If the write fails with `Operation not permitted`, re-run it with
 `~/.claude/config` in some configurations.
 
 Relay the script's output as-is. It prints the transition, the switch file, and
-the three hooks the setting governs.
+the two hooks the setting governs.
 
 ## What the switch does
 
-The three hooks stay registered in `~/.claude/settings.json` permanently:
+The two hooks stay registered in `~/.claude/settings.json` permanently:
 
 | Event | Hook | Role |
 |---|---|---|
-| `PostToolUse` | `post-tool-use-banned-words.py` | messages the violation and bumps the counter |
-| `PostToolUse` | `post-tool-use-banned-words-block.py` | blocks so the violation is addressed before moving on |
+| `PostToolUse` | `post-tool-use-banned-words.py` | blocks until the violation is fixed, messages it and bumps the counter |
 | `Stop` | `stop-assistant-prose-banned-words.py` | scans the turn just emitted and blocks until it is rewritten |
 
 Each one calls `hooks_enabled()` in `scripts/hooks/banned_words_lib.py` before
-doing anything else, and that function reads `config/banned_words.conf`. Setting
-it to `off` makes all three exit without reading their payload.
+scanning anything, and that function reads `config/banned_words.conf`. Setting
+it to `off` makes both exit without a scan.
 
 Registration and enforcement are deliberately separate. `settings.json` carries
 a git clean filter, so flipping enforcement by adding and removing hook entries

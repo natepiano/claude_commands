@@ -1,6 +1,6 @@
-"""The text of a tool call that the banned-word PostToolUse hooks scan.
+"""The text of a tool call that the banned-word PostToolUse hook scans.
 
-Both hooks scan the text a call writes and the tool's output. Text a call
+The hook scans the text a call writes and the tool's output. Text a call
 removes or searches for is not scanned: Edit and MultiEdit contribute
 `new_string`, never `old_string`; a NotebookEdit that deletes a cell
 contributes nothing; and in a Bash command, `mask_removed_text` blanks the
@@ -68,7 +68,7 @@ _PY_REMOVAL = re.compile(rf"(?:\.replace|\bre\.subn?)\(\s*({_PY_STRING})\s*,", r
 
 
 def scan_text(tool_name: str, tool_input: ToolInput, tool_response: ToolResponse) -> str:
-    """The text the hooks scan for one call: what it writes, then its output."""
+    """The text the hook scans for one call: what it writes, then its output."""
     parts: list[str] = []
     searched: set[str] = set()
     if tool_name == "Write":
