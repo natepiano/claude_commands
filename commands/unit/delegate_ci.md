@@ -68,8 +68,12 @@ earlier one is unresolved; repair it first (step 4).
    through <FixDispatch/>, commit each repair once as
    `ci(<plan-slug>): <what the repair fixed>`, and rerun step 1. No phase review
    or checkpoint for the synthetic phase.
-3. **Watch.** From the script's `=== CI HANDOFF TO AGENT ===` block, record the
-   repo, run id, and SHA in `${SESSION_DIR}/ci_watch`, then launch
+3. **Watch.** From the script's `=== CI HANDOFF TO AGENT ===` block, take the
+   repo, run id, and SHA. `run_id: none` means the repo's CI does not run on a
+   push to this branch: start a run with
+   `gh workflow run <workflow> --ref <ci-branch>`, where `<workflow>` is the CI
+   workflow file under `.github/workflows/`, and take its id from the run URL
+   it prints. Record them in `${SESSION_DIR}/ci_watch`, then launch
    `gh run watch <run-id> --repo <repo> --exit-status` with
    `run_in_background: true`. Its task notification is the result; never poll.
    Continue to the next phase meanwhile — the macOS runner is slow, and the
@@ -89,11 +93,10 @@ the `holding` case of <TurnEndGate/>.
 
 <CICleanup>
 Loop and verbose only, after the final <PeriodicCI/> point is green and before
-<RunSummary/>. Skip it when `${SESSION_DIR}/ci_remote_branches` is absent or
-empty. Ask once:
+<RunSummary/>. Ask once:
 
 ```
-The run pushed <branch list> for CI and the last run is green. Reply `merge` to merge <run branch> into <default branch> with /validate_and_push and delete <remote branch list>, or `keep` to leave everything as it is.
+The last CI run on <ci branch> is green. Reply `merge` to merge <run branch> into <default branch> with /validate_and_push, or `keep` to leave everything as it is.
 ```
 
 This is a `gate` under <TurnEndGate/>; nothing else waits on it.
@@ -102,17 +105,17 @@ On `merge`:
 
 1. **Run on the default branch** (the CI branch was `delegate/<plan-slug>`): run
    `/validate_and_push` here with no options; its own PR path applies when branch
-   rules require one.
+   rules require one. After its push succeeds, delete the CI branch with
+   `git push origin --delete delegate/<plan-slug>`, since no worktree owns it.
 2. **Run on its own branch:** never switch this worktree's branch. Find the
    worktree holding the default branch with `git worktree list`. If it is clean,
    merge there — `git -C <that worktree> merge --ff-only <run branch>`, or
    `--no-ff` when a fast-forward is impossible — then run `/validate_and_push`
    from that worktree. If no worktree holds the default branch, fast-forward it
    with `git fetch . <run branch>:<default branch>`. A dirty default worktree, a
-   merge conflict, or a refused fast-forward stops here: report which, and
-   delete nothing.
-3. After the push succeeds, delete each listed branch with
-   `git push origin --delete <branch>`. Local branches stay.
+   merge conflict, or a refused fast-forward stops here: report which. The
+   run's branch stays on origin; `/worktree_delete` deletes it with the
+   worktree.
 
-On `keep`: change nothing and name the remote branches in <RunSummary/>.
+On `keep`: change nothing and name the CI branch in <RunSummary/>.
 </CICleanup>

@@ -151,7 +151,8 @@ Only when the doc's status is `planned`:
 For each unit without a live unit director:
 
 1. **Worktree.** If it is absent, run
-   `git -C CHECKOUT worktree add <worktree> -b <branch> <merge branch>`. When the
+   `git -C CHECKOUT worktree add <worktree> -b <branch> <merge branch>`, then
+   `git -C CHECKOUT push -u origin <branch>`. When the
    repository has `.claude/config/berth.toml`, also set
    `git -C CHECKOUT config branch.<branch>.cargoBerthTarget <merge branch>`, so
    cargo-berth measures the unit against the merge branch.
@@ -297,6 +298,11 @@ Input: the unit, phase, hash and shots from its notice.
    `git -C CHECKOUT merge-base --is-ancestor <LAST_MERGED[unit]> <hash>` must
    succeed, so nothing merged before is dropped. A unit's first merge has no
    `LAST_MERGED` and skips this check.
+
+   The hash must also be on origin: after `git -C CHECKOUT fetch origin
+   <branch>`, `git -C CHECKOUT merge-base --is-ancestor <hash> origin/<branch>`
+   succeeds. If it fails, tell the unit director to push its branch. The merge
+   does not wait.
 2. **Scope.** `git -C CHECKOUT diff --name-only <merge branch>...<hash>` lists
    the unit's changes. Every path must be:
    - in the unit's **Owns**;
@@ -477,7 +483,48 @@ Then watch its run with
 Red CI goes to the unit director whose unit owns the failing files. It fixes the failure as
 its next checkpoint, and you merge that as usual. Log each point and its
 result.
+
+When validation passes, start <PromoteMain/>'s smoke launch before the next
+merge. When the watch reports green, finish <PromoteMain/>.
 </CIPoint>
+
+---
+
+<PromoteMain>
+Moves `main` to the sha a <CIPoint/> pushed, when that sha builds and runs.
+Every check is on that exact sha.
+
+1. **Validation.** The CIPoint's local validation passed.
+2. **Smoke launch.** Right after validation, with `CHECKOUT` still at the sha,
+   run in the background with `dangerouslyDisableSandbox: true`:
+
+   ```sh
+   bash ~/.claude/scripts/production/smoke_launch.sh CHECKOUT <sha> <SCRATCH>/smoke_<short sha>.log
+   ```
+
+   It builds `hana`, starts it on port 15790 with an empty config directory,
+   waits until BRP answers, and shuts it down. Merge nothing while it runs.
+   Exit 0 is a pass.
+3. **GitHub CI.** The run concluded `success`. In
+   `gh run view <run-id> --json jobs`, every job concluded `success` or
+   `skipped`, and the jobs that compile and test on Linux and on macOS
+   (`Test Suite`, `macOS: Compile and Test`) concluded `success`. The macOS job
+   skips when the Mac's runner is offline; that misses the bar.
+4. **Not dirty.** After `git -C CHECKOUT fetch origin main`,
+   `git -C CHECKOUT merge-base --is-ancestor origin/main <sha>` succeeds. If
+   main has commits the merge branch lacks, leave main alone and make it a
+   topic in the next dailies.
+5. **Push.** `git -C CHECKOUT push origin <sha>:refs/heads/main`, never with
+   force. It starts one more CI run on the same sha.
+6. **Local main.** Find the worktree on `main` with
+   `git -C CHECKOUT worktree list`. Fast-forward it with
+   `git -C <it> merge --ff-only <sha>` only when its tree is clean and
+   `git -C <it> rev-list --count <sha>..main` is 0. Otherwise leave it and say
+   why in the log line.
+
+Log `- HH:MM <zone>: main promoted to <short sha> (<n> commits)`, or
+`- HH:MM <zone>: main not promoted at <short sha>: <reason>`.
+</PromoteMain>
 
 ---
 
@@ -646,7 +693,7 @@ every unit director.
 <Wrap>
 When every unit's final-gate and as-built checkpoints are merged:
 
-1. Run a final <CIPoint/>.
+1. Run a final <CIPoint/>, then <PromoteMain/> on its sha.
 2. Work through the production doc's **Close-out** items in order:
    - an item the **Production rules** pre-approve runs as written;
    - any other item that cannot be undone gets the user's OK first;
@@ -656,7 +703,9 @@ When every unit's final-gate and as-built checkpoints are merged:
    (`git -C CHECKOUT branch --merged <merge branch>` lists it). Then:
    - retire any cargo-berth reservation the worktree still holds;
    - `git -C CHECKOUT worktree remove <worktree>`;
-   - `git -C CHECKOUT branch -d <branch>`.
+   - `git -C CHECKOUT branch -d <branch>`;
+   - `git -C CHECKOUT push origin --delete <branch>`, when
+     `git -C CHECKOUT ls-remote --exit-code --heads origin <branch>` finds it.
 
    Leave the tmux sessions; the user closes them.
 4. Stop the update timer: `TIMER stop TIMER_CONF`.
@@ -671,7 +720,8 @@ When every unit's final-gate and as-built checkpoints are merged:
    | Merge branch | `<branch>` at <hash>, pushed |
    | CI | <last point: green / red → repaired in <hash>> |
    | Close-out | <each item: done / waiting on you> |
-   | Next | <what is left for the user, e.g. merging `<merge branch>` into the default branch> |
+   | Main | promoted to <hash> (<n> commits), or why not |
+   | Next | <what is left for the user, e.g. close-out items waiting on them> |
    ```
 </Wrap>
 
@@ -681,7 +731,8 @@ When every unit's final-gate and as-built checkpoints are merged:
 
 - The showrunner writes no implementation code, tests or Work Orders in a unit's
   files.
-- Only the showrunner pushes the merge branch, and never with force.
+- Only the showrunner pushes the merge branch and main, never with force.
+  Units push only their own branch.
 - Merge only from a checkpoint notice. Never merge a visible change before a
   fresh design-check pass on its shots (<MergeCheckpoint/> step 6).
 - **One phase at a time.** A unit starts phase N+1 only after phase N is merged

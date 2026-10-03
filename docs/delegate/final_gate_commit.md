@@ -29,9 +29,10 @@ synthetic-final repairs — so the run leaves no uncommitted work behind.
 
    Keep the `checkpoint(<plan-slug>)` subject: <ResolveStyleDiffBase/> reads it
    to place a later run's diff base.
-5. Never push. This commit holds no phase reservation, so it invokes no drift
-   check and no release. Report `Final gate <short hash> — style review and
-   closing repairs.`
+5. This commit holds no phase reservation, so it invokes no drift check and no
+   release. Run <PushCheckpoint/> (`commands/unit/delegate_checkpoint.md`), then
+   report `Final gate <short hash> — style review and closing repairs.` with its
+   push note, if any.
 </FinalGateCommit>
 
 <RunAsBuilt>
@@ -82,6 +83,7 @@ this and reports the doc edits as uncommitted.
    The subject is deliberately not `checkpoint(<plan-slug>)`. This commit carries
    no phase, and a later run resolving its diff base scans for checkpoint
    subjects — it must not find this one among them.
-4. Never push. This commit holds no phase reservation, so it invokes no drift
-   check and no release. Report `As-built <short hash> — <n> docs.`
+4. This commit holds no phase reservation, so it invokes no drift check and no
+   release. Run <PushCheckpoint/>, then report `As-built <short hash> — <n>
+   docs.` with its push note, if any.
 </AsBuiltCommit>

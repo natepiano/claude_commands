@@ -13,7 +13,8 @@ remembered from conversation, from the harness session mapping, or re-derived
 from current `HEAD` is not proof and will silently accept the wrong checkpoint.
 
 `/unit:delegate` reads this file once per completed phase in loop and verbose
-mode. It defines `<CheckpointCommit/>` in full. `single` never commits.
+mode. It defines `<CheckpointCommit/>` and `<PushCheckpoint/>` in full. `single`
+never commits.
 
 Everything below is the contract.
 
@@ -158,10 +159,33 @@ Loop/verbose only:
    <RetainDelegatedPhaseReservation/>. The checkpoint commit exists, but the
    phase does not complete until a later invocation confirms either the normal
    first-attempt reply or the matching already-journalled checkpoint above.
-8. Report `Checkpoint <short hash> — phase N: <title>.` Never push here. This
-   report follows successful release when the phase was active.
+8. Run <PushCheckpoint/>, then report `Checkpoint <short hash> — phase N:
+   <title>.` with its push note, if any. This report follows successful release
+   when the phase was active.
 9. In a production unit, run
    `python3 ~/.claude/scripts/delegate/progress_history.py review-trial --session-dir "${SESSION_DIR}"`
    before <RecordPhaseCompletion/> closes the phase (it also works after), and
    keep its line for the checkpoint notice (<ProductionUnit/> item 3).
 </CheckpointCommit>
+
+<PushCheckpoint>
+Puts each commit on origin, so the work survives this machine. Runs after a
+successful release in <CheckpointCommit/>, and after <FinalGateCommit/> and
+<AsBuiltCommit/>. Run each git command with `dangerouslyDisableSandbox: true`.
+
+1. **Branch.** The current branch, under its own name. On the default branch
+   (`gh repo view --json defaultBranchRef -q .defaultBranchRef.name`), push to
+   `delegate/<plan-slug>` instead, so unfinished work never lands there.
+2. **Ancestry.** `git fetch origin <branch>`; a branch origin lacks yet is
+   fine. If origin has it and
+   `git merge-base --is-ancestor origin/<branch> HEAD` fails, do not push. The
+   note is `push skipped: origin/<branch> has commits this branch lacks`.
+3. **Push.** `git push -u origin <branch>`; on the default branch,
+   `git push origin HEAD:refs/heads/delegate/<plan-slug>`. Never force.
+4. **Failure.** A failed push does not fail the commit. The note is
+   `push failed: <reason>`, and the next push carries both. For
+   `sign_and_send_pubkey: signing failed … agent refused operation` or
+   `Permission denied (publickey)`, run `github-warm-status`; when it reports
+   cold, the note asks the user to run `github-warmup` at a terminal on this
+   machine. Never `gh auth login`, a new key, or an HTTPS remote.
+</PushCheckpoint>

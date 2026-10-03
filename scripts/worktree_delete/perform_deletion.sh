@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Removes a worktree and deletes its branch.
+# Removes a worktree and deletes its branch, locally and on origin.
 # Usage: perform_deletion.sh <worktree_path> <branch_name>
 # Returns: Status of removal and branch deletion
 #
@@ -90,6 +90,19 @@ if ! git branch -D "$BRANCH_NAME"; then
 fi
 echo "Branch deleted."
 
+# A failed remote deletion is reported after the style-fix cleanup below and
+# becomes the exit status.
+REMOTE_STATUS=0
+if git ls-remote --exit-code --heads origin "$BRANCH_NAME" >/dev/null 2>&1; then
+    echo ""
+    echo "Deleting origin/$BRANCH_NAME"
+    if git push origin --delete "$BRANCH_NAME"; then
+        echo "Remote branch deleted."
+    else
+        REMOTE_STATUS=1
+    fi
+fi
+
 # A <project>_style_fix worktree carries a fix pipeline pending JSON in
 # fixed_findings state. The history row is already recorded by finalize-fix;
 # the pending file is the only leftover, and while it exists every fix run
@@ -108,3 +121,9 @@ if [[ -n "$STYLE_FIX_PROJECT" ]]; then
         fi
     fi
 fi
+
+if [[ "$REMOTE_STATUS" -ne 0 ]]; then
+    echo ""
+    echo "Error: could not delete origin/$BRANCH_NAME; the worktree and local branch are gone."
+fi
+exit "$REMOTE_STATUS"

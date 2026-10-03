@@ -50,15 +50,31 @@ if [[ -n "$UNCOMMITTED" ]]; then
     HAS_UNCOMMITTED=true
 fi
 
-# Check for unpushed commits
+# Check for unpushed commits, and for commits that only origin/<branch> holds:
+# deletion removes that remote branch too.
 HAS_UNPUSHED=false
 UNPUSHED_COUNT=0
+HAS_REMOTE_BRANCH=false
+HAS_REMOTE_ONLY=false
+REMOTE_ONLY_COUNT=0
 if git -C "$SELECTED_WORKTREE" remote get-url origin >/dev/null 2>&1; then
-    git -C "$SELECTED_WORKTREE" fetch origin >/dev/null 2>&1
-    if git -C "$SELECTED_WORKTREE" rev-parse --abbrev-ref @{upstream} >/dev/null 2>&1; then
-        UNPUSHED_COUNT=$(git -C "$SELECTED_WORKTREE" rev-list @{upstream}..HEAD --count 2>/dev/null || echo "0")
-        if [[ "$UNPUSHED_COUNT" -gt 0 ]]; then
-            HAS_UNPUSHED=true
+    git -C "$SELECTED_WORKTREE" fetch --prune origin >/dev/null 2>&1
+    if git -C "$SELECTED_WORKTREE" rev-parse --abbrev-ref '@{upstream}' >/dev/null 2>&1; then
+        UNPUSHED_COUNT=$(git -C "$SELECTED_WORKTREE" rev-list '@{upstream}..HEAD' --count 2>/dev/null || echo "0")
+    else
+        # No upstream: unpushed means on no branch of origin.
+        UNPUSHED_COUNT=$(git -C "$SELECTED_WORKTREE" rev-list --count HEAD --not --remotes=origin 2>/dev/null || echo "0")
+    fi
+    if [[ "$UNPUSHED_COUNT" -gt 0 ]]; then
+        HAS_UNPUSHED=true
+    fi
+    if git -C "$SELECTED_WORKTREE" rev-parse --verify -q "refs/remotes/origin/$TARGET_BRANCH" >/dev/null; then
+        HAS_REMOTE_BRANCH=true
+        # --exclude patterns for --remotes are relative to refs/remotes/.
+        REMOTE_ONLY_COUNT=$(git -C "$SELECTED_WORKTREE" rev-list --count "refs/remotes/origin/$TARGET_BRANCH" \
+            --not --exclude="origin/$TARGET_BRANCH" --exclude=origin/HEAD --remotes=origin 2>/dev/null || echo "0")
+        if [[ "$REMOTE_ONLY_COUNT" -gt 0 ]]; then
+            HAS_REMOTE_ONLY=true
         fi
     fi
 fi
@@ -69,5 +85,8 @@ echo "{
   \"target_branch\": \"$TARGET_BRANCH\",
   \"has_uncommitted\": $HAS_UNCOMMITTED,
   \"has_unpushed\": $HAS_UNPUSHED,
-  \"unpushed_count\": $UNPUSHED_COUNT
+  \"unpushed_count\": $UNPUSHED_COUNT,
+  \"has_remote_branch\": $HAS_REMOTE_BRANCH,
+  \"has_remote_only\": $HAS_REMOTE_ONLY,
+  \"remote_only_count\": $REMOTE_ONLY_COUNT
 }"

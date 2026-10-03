@@ -70,7 +70,7 @@ it:
 | --- | --- | --- |
 | <ProgressReport/> | `commands/unit/delegate_report.md` | `/unit:delegate_report` |
 | <VerbosePostPhaseReport/>, <CombinedWindowReport/>, <RemainingWorkOutlook/> | `commands/unit/delegate_phase_report.md` | `/unit:delegate_phase_report` |
-| <CheckpointCommit/> | `commands/unit/delegate_checkpoint.md` | `/unit:delegate_checkpoint` |
+| <CheckpointCommit/>, <PushCheckpoint/> | `commands/unit/delegate_checkpoint.md` | `/unit:delegate_checkpoint` |
 | <ConsiderNextItems/>, <ReviewPendingAddOns/> | `commands/unit/delegate_next.md` | `/unit:delegate_next` |
 | <ResolveStyleDiffBase/>, <RunProjectStyleReview/> | `commands/unit/delegate_style.md` | `/unit:delegate_style` |
 | <PeriodicCI/>, <CICleanup/> | `commands/unit/delegate_ci.md` | `/unit:delegate_ci` |
@@ -94,7 +94,7 @@ A call site's arguments are what that file calls `$ARGUMENTS`.
 <CoreContract>
 - Never create a worktree or modify unrelated files. The only branch the run may
   create is the one the user approves in <ResolveStyleDiffBase/>, plus the remote
-  CI branch <PeriodicCI/> may push; never switch to an existing branch.
+  branch <PushCheckpoint/> pushes; never switch to an existing branch.
 - The unit director does not write implementation code unless the user explicitly
   asks. Exceptions: agreed doc-only/trivial post-review fixes and the single
   inline cleanup in <RunProjectStyleReview/>.
@@ -103,10 +103,10 @@ A call site's arguments are what that file calls `$ARGUMENTS`.
   closes verification and the one <AsBuiltCommit/> that carries the run's
   documentation. <PeriodicCI/> may add `ci(<plan-slug>): …` commits for
   validation fixes and CI repairs. No other commit is allowed.
-- A checkpoint never pushes; <PeriodicCI/> pushes between phases, every fifth
-  checkpoint of a plan with five or more phases. If a phase explicitly needs a remote commit for a
-  dependency pin, consumer, or CI run, pushing that working branch is mechanical
-  phase work, not a user decision or prerequisite.
+- Every commit the run makes is pushed by <PushCheckpoint/>, fast-forward only,
+  to the working branch's own name on origin, never to the default branch.
+  <PeriodicCI/> runs CI on it every fifth checkpoint of a plan with five or more
+  phases.
 - A phase reservation is released only by the successful-checkpoint path in
   <CheckpointCommit/>. Cancellation, error, failed commit, `single`, user stop,
   and failed release never release it or delete its durable record.
@@ -1148,9 +1148,10 @@ remembered from conversation, taken from the harness session mapping, or
 re-derived from current `HEAD` is not proof and will silently accept the wrong
 checkpoint. The user can invoke the same file as `/unit:delegate_checkpoint`.
 
-Never push here. The phase does not complete until the reservation release is
-confirmed, so a failed or busy release applies
-<RetainDelegatedPhaseReservation/> rather than a retry.
+The phase does not complete until the reservation release is confirmed, so a
+failed or busy release applies <RetainDelegatedPhaseReservation/> rather than a
+retry. <PushCheckpoint/> runs only after that release; a failed push never
+fails the checkpoint.
 </CheckpointCommit>
 
 <PhaseCleanup>
@@ -1283,9 +1284,8 @@ Emit on every multi-phase ending:
 **Smoke checks still unperformed:** [phase + exact action, or none]
 **Deferred decisions still open:** [phase + decision, or none]
 **Add-ons awaiting review:** [count, or none]
-**CI points:** [each point from `ci_points.log` with its result, remote
-branches merged and deleted or kept, or not applicable — fewer than five phases
-or `single`]
+**CI points:** [each point from `ci_points.log` with its result, the CI branch
+merged or kept, or not applicable — fewer than five phases or `single`]
 **Reservation disposition:** [checkpointed and outstanding, retained with the
 reason this run stopped, or coordination not active]
 **Why the run stopped:** [complete, user stop, pending decision, or error]

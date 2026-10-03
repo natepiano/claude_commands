@@ -1,5 +1,5 @@
 ---
-description: Discover worktrees and safely delete one and its branch, checking for uncommitted and unpushed work first.
+description: Discover worktrees and safely delete one and its branch, locally and on origin, checking for uncommitted and unpushed work first.
 ---
 
 PROTECTED_BRANCHES = main
@@ -66,16 +66,18 @@ Update each todo status to "in_progress" when starting that step, and "completed
 <CheckUnpushedCommits>
     - Check the validation results from <ValidateDeletionTarget/>
     - If has_unpushed is true with unpushed_count > 0, WARN user they'll be lost and ask for confirmation
+    - If has_remote_only is true, WARN the same way: origin/[BRANCH_NAME] holds remote_only_count commits no other branch on origin has, and deletion removes it
 </CheckUnpushedCommits>
 
 <GetFinalConfirmation>
     - Display summary of what will be deleted:
       - Worktree path
       - Branch name
-      - Whether it has unpushed commits
+      - origin/[BRANCH_NAME], when has_remote_branch is true
+      - Whether it has unpushed commits, or commits only origin/[BRANCH_NAME] holds
 
     ## Confirm Deletion
-    - **confirm** - Proceed with deletion of [WORKTREE_PATH] and branch [BRANCH_NAME]
+    - **confirm** - Proceed with deletion of [WORKTREE_PATH] and branch [BRANCH_NAME], plus origin/[BRANCH_NAME] when it exists
     - **cancel** - Exit without deleting
 
     Please select one of the keywords above.
@@ -91,7 +93,7 @@ Update each todo status to "in_progress" when starting that step, and "completed
 
 <PerformDeletion>
     - **IMPORTANT**: Use `dangerouslyDisableSandbox: true` — `git worktree remove` deletes files outside the sandbox's allowed write paths
-    - Run `bash ~/.claude/scripts/worktree_delete/perform_deletion.sh $SELECTED_WORKTREE $TARGET_BRANCH` to remove the worktree and delete the branch
+    - Run `bash ~/.claude/scripts/worktree_delete/perform_deletion.sh $SELECTED_WORKTREE $TARGET_BRANCH` to remove the worktree and delete the branch, locally and on origin. A non-zero exit after "Branch deleted." means only the origin deletion failed; report it
     - The script requires the confirmation nonce from <GetFinalConfirmation/>; if it reports "no confirmation nonce", the confirm step was skipped — return to <GetFinalConfirmation/> rather than retrying
     - Report success to user
 </PerformDeletion>
@@ -110,5 +112,5 @@ UNHAPPY PATH: Stop and ask user for guidance if:
 - Trying to delete ${PROTECTED_BRANCHES} worktree or branch
 - Trying to delete current worktree
 - Target worktree has uncommitted changes (unless user acknowledges)
-- Target branch has unpushed commits (unless user acknowledges)
+- Target branch has unpushed commits, or commits only its origin branch holds (unless user acknowledges)
 - User doesn't explicitly confirm deletion
