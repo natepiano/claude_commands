@@ -3,11 +3,15 @@
 
 from __future__ import annotations
 
+import os
 import tempfile
+import time
 import unittest
 from contextlib import closing
+from datetime import datetime
 from pathlib import Path
 from typing import override
+from unittest import mock
 
 import index
 import report
@@ -96,6 +100,14 @@ class ReportTests(unittest.TestCase):
         self.assertIn("Agent calls: none.", text)
         self.assertIn("CI: no runs.", text)
         self.assertNotIn("cargo-port calls", text)
+
+    def test_sync_time_names_its_zone_and_an_earlier_day(self) -> None:
+        self.addCleanup(time.tzset)
+        with mock.patch.dict(os.environ, {"TZ": "America/New_York"}):
+            time.tzset()
+            now = datetime.fromisoformat("2026-10-03T15:00:00-04:00")
+            self.assertEqual(report.sync_time("2026-10-03T16:14:00+00:00", now), "12:14 EDT")
+            self.assertEqual(report.sync_time("2026-10-02T16:14:00+00:00", now), "2026-10-02 12:14 EDT")
 
 
 if __name__ == "__main__":

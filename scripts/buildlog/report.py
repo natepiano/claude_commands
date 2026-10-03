@@ -209,12 +209,18 @@ def summary(connection: sqlite3.Connection, day: str, found: list[str], which: s
     return table(head, body)
 
 
+def sync_time(last: str, now: datetime) -> str:
+    """Local time with its zone, and the date too when it is not today."""
+    at = datetime.fromisoformat(last).astimezone()
+    return at.strftime("%H:%M %Z" if at.date() == now.astimezone().date() else "%Y-%m-%d %H:%M %Z")
+
+
 def mac_note() -> str:
     status = sync.read_status()
     if status is None:
         return "Mac: not synced yet."
     last = status["last_ok"]
-    when = datetime.fromisoformat(last).astimezone().strftime("%H:%M") if last else "never"
+    when = sync_time(last, datetime.now()) if last else "never"
     return f"Mac rows as of the {when} sync." if status["ok"] else f"Mac: the last sync failed; last good sync {when}."
 
 
@@ -235,7 +241,7 @@ def report(connection: sqlite3.Connection, day: str) -> str:
     else:
         lines += ["### Summary", "", "No build steps recorded.", ""]
     lines += [calls_line, *port_lint_line, ci_line]
-    footer = mac_note() + " Peak memory includes file cache."
+    footer = mac_note() + " Peak memory counts files the step read or wrote that stayed in RAM, so it runs above what the step's processes used."
     if scratch:
         footer += f" {scratch} steps under a temp folder (scratch and test builds) are left out."
     lines += ["", footer]
