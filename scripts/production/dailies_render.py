@@ -252,9 +252,18 @@ def display_width(line: str) -> int:
 
 def with_plans(lines: list[str], rows: list[Row]) -> list[str]:
     """Each row's whole-plan progress in one right-aligned column past the longest row, with `100%` over its end line."""
-    plans = {row.name: f"Phase {row.plan.number} of {row.plan.total} - {row.plan.percent}%" for row in rows if row.plan is not None}
-    if not plans:
+    progress = [row.plan for row in rows if row.plan is not None]
+    if not progress:
         return lines
+    # Each number pads to its column's widest, so `Phase`, `of`, `-` and `%` line up.
+    number_width = max(len(str(plan.number)) for plan in progress)
+    total_width = max(len(str(plan.total)) for plan in progress)
+    percent_width = max(len(str(plan.percent)) for plan in progress)
+    plans = {
+        row.name: f"Phase {row.plan.number:>{number_width}} of {row.plan.total:>{total_width}} - {row.plan.percent:>{percent_width}}%"
+        for row in rows
+        if row.plan is not None
+    }
     left = max(display_width(line) for line in lines) + PLAN_GAP
     text_width = max(len(text) for text in plans.values())
     header = f"{lines[0]}{' ' * (left - display_width(lines[0]) + text_width + 1 + PLAN_BLOCKS)}{PLAN_FULL}"
