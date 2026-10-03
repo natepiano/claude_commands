@@ -168,7 +168,8 @@ For each unit without a live unit director:
      outside this session's scope.
    - Remove every `CLAUDE_*` variable from its environment. An inherited
      `CLAUDE_CODE_CHILD_SESSION` turns off transcript saving.
-   - `SHOWRUNNER_UNIT` marks it as yours: `/build_hold` skips it and tells you.
+   - `SHOWRUNNER_UNIT` marks it as yours: `/notify_top_level` messages reach
+     you, not it. Pass on what applies to it.
    - Launch:
      `tmux new-session -d -s <session> -c <worktree> -e SHOWRUNNER_UNIT=<slug> zsh -ic "ENABLE_TOOL_SEARCH=true command claude --remote-control <session> -n <session> --settings '{\"disableAgentView\": true}' '/unit:delegate <unit plan>'; exec zsh"`
 3. **Check.** Log the launch only after the pane shows `/remote-control is
