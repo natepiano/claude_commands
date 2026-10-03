@@ -617,37 +617,87 @@ case "$CMD" in
         # visibility site. It covers the workspace like the other stages, so
         # --fix can also rewrite a member the phase did not edit, when this
         # phase's change left an item there unused or over-visible.
-        if lint_config_enabled mend; then
-            MEND_LOG="$(mktemp)"
+        #
+        # A clippy-linked cargo-mend (invoke.sh, mend_clippy_probe) runs
+        # clippy's lints in its own compile, and then stands in for the clippy
+        # step, so the workspace compiles once. fmt moves first, so those lints
+        # read the formatted tree, as stock clippy did after fmt. A --fix that
+        # wrote prints a report from before its last rewrite: fmt runs again
+        # and a read-only mend (cargo replays its cached diagnostics) reports
+        # on the settled tree. Lint then fails on any warning left, all targets
+        # included, where clippy failed on any in --lib --bins --tests; a report
+        # that shows no warning count falls back to stock clippy.
+        MEND_COVERS_CLIPPY=0
+        if lint_config_enabled mend && lint_config_enabled clippy; then
+            mend_clippy_probe
+            if [[ "$MEND_CLIPPY_STATE" == active ]]; then
+                MEND_COVERS_CLIPPY=1
+            fi
+        fi
+        # lint_mend [--fix]: one mend run. Sets MEND_APPLIED (1 when --fix
+        # wrote) and MEND_WARNINGS (mend_clippy_warnings, empty when the report
+        # shows no count). The log lives only as long as the run.
+        lint_mend() {
+            local log
+            log="$(mktemp)"
             # pipefail is set, so a failing mend fails the pipeline; the log
             # only decides which message names the failure.
-            if ! invoke_mend --workspace --fix "${FEATURE_FLAGS[@]}" 2>&1 | tee "$MEND_LOG"; then
-                if grep -qiE 'rolled back|revert' "$MEND_LOG"; then
+            if ! invoke_mend --workspace "$@" "${FEATURE_FLAGS[@]}" 2>&1 | tee "$log"; then
+                if grep -qiE 'rolled back|revert' "$log"; then
                     echo "verify.sh: cargo mend --fix rolled its rewrites back; the tree reproduces it — run /mend_fix" >&2
                 else
-                    echo "verify.sh: cargo mend --fix failed; see the output above" >&2
+                    echo "verify.sh: cargo mend${*:+ $*} failed; see the output above" >&2
                 fi
-                rm -f "$MEND_LOG"
+                rm -f "$log"
                 exit 1
             fi
-            rm -f "$MEND_LOG"
-        else
-            lint_config_skip_notice mend "cargo mend --all-targets --workspace --fix"
-        fi
+            MEND_APPLIED=0
+            if grep -q '^mend: applied' "$log"; then
+                MEND_APPLIED=1
+            fi
+            MEND_WARNINGS="$(mend_clippy_warnings "$log")" || MEND_WARNINGS=""
+            rm -f "$log"
+        }
         # fmt compiles nothing, so it stays on the phase's own work: this
         # package and every member that differs from HEAD once mend has run.
         # Covering them all is what lets one lint record answer for each
         # package (tree_key).
-        FMT_SCOPE=(-p "$PKG")
-        FMT_MEMBERS="$(cargo metadata --no-deps --format-version 1 \
-            | "$PY" -c "$CHANGED_MEMBERS_PY" "")"
-        while IFS= read -r member; do
-            if [[ -n "$member" && "$member" != "$PKG" ]]; then
-                FMT_SCOPE+=(-p "$member")
+        lint_fmt() {
+            local member
+            FMT_SCOPE=(-p "$PKG")
+            FMT_MEMBERS="$(cargo metadata --no-deps --format-version 1 \
+                | "$PY" -c "$CHANGED_MEMBERS_PY" "")"
+            while IFS= read -r member; do
+                if [[ -n "$member" && "$member" != "$PKG" ]]; then
+                    FMT_SCOPE+=(-p "$member")
+                fi
+            done <<< "$FMT_MEMBERS"
+            fmt_cargo "${FMT_SCOPE[@]}"
+        }
+        if [[ $MEND_COVERS_CLIPPY -eq 1 ]]; then
+            lint_fmt
+        fi
+        if lint_config_enabled mend; then
+            lint_mend --fix
+            if [[ $MEND_COVERS_CLIPPY -eq 1 && $MEND_APPLIED -eq 1 ]]; then
+                lint_fmt
+                lint_mend
             fi
-        done <<< "$FMT_MEMBERS"
-        fmt_cargo "${FMT_SCOPE[@]}"
-        invoke_clippy --workspace --lib --bins --tests "${FEATURE_FLAGS[@]}"
+        else
+            lint_config_skip_notice mend "cargo mend --all-targets --workspace --fix"
+        fi
+        if [[ $MEND_COVERS_CLIPPY -eq 0 ]]; then
+            lint_fmt
+            invoke_clippy --workspace --lib --bins --tests "${FEATURE_FLAGS[@]}"
+        elif [[ -z "$MEND_WARNINGS" ]]; then
+            echo "verify.sh: cargo mend's report shows no warning count; running stock clippy"
+            invoke_clippy --workspace --lib --bins --tests "${FEATURE_FLAGS[@]}"
+        elif [[ "$MEND_WARNINGS" -gt 0 ]]; then
+            echo "verify.sh: $MEND_WARNINGS compiler warnings remain, clippy's included (it ran inside cargo mend); lint denies warnings: fix the ones above" >&2
+            exit 1
+        else
+            echo "verify.sh: clippy ran inside cargo mend's compile and left no warnings; the stock clippy step is skipped"
+        fi
         # Found after mend, so a member its --fix rewrote is documented too.
         FEATURE_MEMBER=""
         if [[ ${#FEATURE_FLAGS[@]} -gt 0 ]]; then

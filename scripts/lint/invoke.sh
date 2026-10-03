@@ -251,6 +251,63 @@ invoke_clippy() {
         ${clippy_args[@]+"${clippy_args[@]}"}
 }
 
+# The clippy-linked cargo-mend (~/rust/cargo-liner/crates/cargo-mend-clippy)
+# registers clippy's lints in mend's compiler driver, so one mend compile also
+# does clippy's work. `cargo mend --clippy-status` names the installed build
+# (50 to 100 ms on natedev at load 100). mend_clippy_probe runs it once per
+# process and sets MEND_CLIPPY_STATE:
+#   active  clippy-linked and built for the host rustc
+#   absent  plain cargo-mend, one too old for the flag, or none: today's flow
+#   stale   built for another rustc, or no longer loads (a toolchain update
+#           removed the librustc_driver it links): stock clippy runs, and the
+#           user gets one alert per host rustc
+# LINT_ALERT_SENDER replaces pushover.py, for tests; the stamps live under
+# XDG_STATE_HOME.
+MEND_CLIPPY_STATE=""
+# shellcheck disable=SC2088 # shown to the user, not expanded
+MEND_CLIPPY_INSTALL="~/rust/cargo-liner/crates/cargo-mend-clippy/install.sh"
+LINT_PUSHOVER="$HOME/.claude/scripts/notify/pushover.py"
+LINT_ALERT_SENDER="${LINT_ALERT_SENDER:-$LINT_PUSHOVER}"
+
+mend_clippy_probe() {
+    [[ -z "$MEND_CLIPPY_STATE" ]] || return 0
+    local out status=0
+    out="$(cargo mend --clippy-status 2>&1 </dev/null)" || status=$?
+    if [[ $status -eq 0 && "$out" == *'"clippy":"active"'* ]]; then
+        MEND_CLIPPY_STATE=active
+    elif [[ "$out" == *'"clippy":"rustc_mismatch"'* ]]; then
+        MEND_CLIPPY_STATE=stale
+        mend_clippy_alert "cargo-mend's clippy was built for another rustc"
+    elif [[ "$out" == *"error while loading shared libraries"* || "$out" == *"Library not loaded"* ]]; then
+        MEND_CLIPPY_STATE=stale
+        mend_clippy_alert "cargo-mend no longer loads"
+    else
+        MEND_CLIPPY_STATE=absent
+    fi
+}
+
+# The run that creates the stamp sends the alert, detached so the lint never
+# waits on the network; a failed send removes the stamp for a later run. The
+# Pushover keys exist only on natedev.
+mend_clippy_alert() {
+    local what=$1 host dir stamp
+    host="$("${RUSTC:-rustc}" -V 2>/dev/null)" || host=""
+    host="${host:-unknown rustc}"
+    echo "invoke.sh: $what ($host); stock clippy runs. The user reinstalls it with $MEND_CLIPPY_INSTALL" >&2
+    dir="${XDG_STATE_HOME:-$HOME/.local/state}/mend-clippy"
+    stamp="$dir/alerted-$(printf '%s' "$host" | tr -c 'A-Za-z0-9.' '-')"
+    mkdir -p "$dir" 2>/dev/null || return 0
+    ( set -C; : > "$stamp" ) 2>/dev/null || return 0
+    local -a send=("$LINT_ALERT_SENDER" --priority 1 "lint: cargo-mend needs a reinstall"
+        "$what ($host). Run $MEND_CLIPPY_INSTALL")
+    if [[ "$LINT_ALERT_SENDER" == "$LINT_PUSHOVER" && "$(uname -s)" == Darwin ]]; then
+        # shellcheck disable=SC2088 # the tilde is for natedev's shell
+        send=(ssh -o BatchMode=yes -o ConnectTimeout=10 natedev
+            "~/.claude/scripts/notify/pushover.py $(printf '%q ' "${send[@]:1}")")
+    fi
+    ( trap '' HUP; "${send[@]}" || rm -f "$stamp" ) </dev/null >/dev/null 2>&1 &
+}
+
 invoke_mend() {
     if ! lint_config_enabled mend; then
         lint_config_skip_notice mend "cargo mend --workspace"
@@ -261,7 +318,24 @@ invoke_mend() {
     # Scope comes from the caller (the lint CLI resolves it, or a caller like
     # the fix pipeline passes --manifest-path). Forcing --workspace here silently
     # overrode both: a per-project run linted the whole workspace instead.
+    # The probe only alerts here: an active clippy-linked mend lints as
+    # `cargo clippy` does without -D warnings (CLIPPY_ARGS unset), so a
+    # warning never stops --fix. A caller that drops its clippy step denies
+    # the warnings left afterwards (verify.sh lint, mend_clippy_warnings).
+    # The argv stays the same in every state: port-lint matches it.
+    mend_clippy_probe
     run env RUSTC_WRAPPER= cargo mend --all-targets "$@"
+}
+
+# mend_clippy_warnings LOG: the compiler warnings, clippy's among them, that an
+# active-path mend run reported, 0 for none. cargo-mend has no machine-readable
+# count (its --json report and --fail-on-warn cover only mend's own findings),
+# so this reads its summary: `summary: N compiler warnings`, or `No findings.`
+# or a summary without that row for none. Fails when the log has neither, so
+# the caller runs stock clippy instead of passing.
+mend_clippy_warnings() {
+    sed -nE $'s/\x1b\\[[0-9;]*m//g; s/^summary: +([0-9]+) compiler warnings?( .*)?$/\\1/p; s/^(No findings\\.|summary: ).*/0/p' "$1" \
+        | tail -n 1 | grep .
 }
 
 # Scope comes from the caller, like mend and clippy. --workspace used to be
