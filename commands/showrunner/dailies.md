@@ -142,6 +142,13 @@ next phase:
 Read the plans and design docs for this, not the unit's queue alone. A unit
 director's own handoff may list only the work in front of it.
 
+Phases run in number order, so `then` never names a phase at or before the
+heading's: `Phase 3 of 3` followed by `then: Phase 2` reads as impossible.
+When a unit runs its phases out of order, renumber its plan so the numbers
+follow the run order (packaging: your call), tell the unit director, and report
+the new numbers. The renderer refuses a `then` that goes backwards, unless it
+names another plan's document. User, 2026-10-02.
+
 ### What the renderer writes
 
 - **First line:** the length and the time in `ZONE`: `**Dailies (Simple)**, 19:05 PDT`.
@@ -201,6 +208,24 @@ For every length:
 - Name work by what it changes in the app, never by a unit director's own labels: no helper
   names (`look-b5`), batch letters or item numbers. The user does not see them.
 - Say "you" for the user.
+- **Read it as the user before you paste it.** Read every line of the
+  rendered report as someone who sees only the app and this report. A line
+  that cannot be true as written is a defect in the production: fix its cause
+  (renumber the plan, correct the state, ask the unit director), then render
+  again. A line that would make the user ask "what does that mean?" gets new
+  words. Never paste it and explain it afterwards. Bad lines from 2026-10-02
+  (user), each with what it should have said:
+
+  | Bad | Why | Better |
+  | --- | --- | --- |
+  | `Phase 3 of 3` with `then: Phase 2 (tool-face sizing)` | Impossible as written: the lane ran its phases out of order. | Renumber the plan first: `Phase 2 of 3` with `then: Phase 3 (tool-face sizing)`. |
+  | `a helper is retaking every view, 4 of 9 shots done` | Shorthand: "retaking every view" says nothing. | `taking new screenshots to check the glow change, 4 of 9 done` |
+  | `its stale file holds from the merged work are released` | Production plumbing that changes nothing you see. | Leave it out. |
+  | `the writer and tester are renaming every crate; file clashes get settled at its checkpoint` | Seat roles and plumbing. | `renaming Composite to Assembly in every crate's code and tests` |
+
+  The renderer refuses the plumbing words it knows (`PLUMBING`: berth,
+  reservation, holder, file holds, file clashes, writer, tester, retake,
+  re-shoot). That list is a net, not the rule: the read is the rule.
 - Do no other work in this turn, except the `/unit:eta` requests, the two
   steps in Status check and clock, acting on a BLOCK past its limit
   (`/showrunner:produce` → Dependencies, rule 4), and compacting a unit

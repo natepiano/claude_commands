@@ -9,9 +9,10 @@ that breaks a template rule: a unit without its phase or `held`, a follow-up
 or last phase without `then`, an unknown field, an update too long for the
 length, an update or held reason that names another phase without saying
 why, a held reason carrying its own examples, a held count the update does
-not report against (`<k> of <N>`), an ETA time without its percent, or an
+not report against (`<k> of <N>`), an ETA time without its percent, an
 ETA that moved CHANGE_NEEDS_WHY_MINUTES or more since the last report
-without `why`.
+without `why`, a `then` naming a phase at or before the heading's, or a line
+using the production's own plumbing words (PLUMBING).
 
 --state  JSON file holding each unit's last reported phase, ETA and held
          reason. The script reads it to write `(unchanged)` / `(changed:
@@ -47,6 +48,13 @@ PHASE_MENTION = re.compile(r"\bPhases? (\d+(?:\s*(?:,|and|-|–|to)\s*\d+)*)|\bP
 COUNT = re.compile(r"\b(\d+) [a-z]")
 EXAMPLES = re.compile(r"\bsuch as\b|\be\.g\.|\bfor example\b")
 STARTED = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}$")
+# Words for the production's own coordination, which you never see in the app
+# (user, 2026-10-02: "i have no idea what a stale file holds from the merged
+# work are released even means"; "retaking every view" and "file clashes get
+# settled at its checkpoint" were the same).
+PLUMBING = re.compile(r"\b(?:berth|reservations?|incursions?|holders?|file holds?|file clash\w*|writers?|testers?|retak\w*|re-?shoot\w*)\b", re.IGNORECASE)
+# A `then` that names another plan's document may name that plan's phases.
+OTHER_PLAN = re.compile(r"\S+\.md\b")
 WHITE = "⬜"
 GREEN = "🟩"
 RED = "🟥"
@@ -309,13 +317,40 @@ def check_update(update: str, length: str, where: str, key: str = "update") -> N
         raise InputError(f"{where}.{key}: {len(update)} characters; a {length} {key} is one short line, at most {limit}")
 
 
-def other_phases(line: str, number: int | None) -> list[int]:
-    """Phase numbers `line` names other than the heading's (`None` on a follow-up)."""
+def phases_named(line: str) -> list[int]:
+    """Every phase number `line` names."""
     named: list[int] = []
     for match in PHASE_MENTION.finditer(line):
         mention: str = match.group(1) or match.group(2)
         named.extend(int(digits.group(0)) for digits in re.finditer(r"\d+", mention))
-    return [found for found in named if found != number]
+    return named
+
+
+def other_phases(line: str, number: int | None) -> list[int]:
+    """Phase numbers `line` names other than the heading's (`None` on a follow-up)."""
+    return [found for found in phases_named(line) if found != number]
+
+
+def check_then_order(then: str, number: int, where: str) -> None:
+    """Plan phases run in number order, so what comes next never has a lower number."""
+    if OTHER_PLAN.search(then):
+        return
+    earlier = [found for found in phases_named(then) if found <= number]
+    if earlier:
+        raise InputError(
+            f"{where}.then: names Phase {', '.join(str(found) for found in earlier)} after this Phase {number}, which reads as impossible. "
+            + "Renumber the plan so its numbers follow the run order (packaging: the showrunner's call), then report the new numbers."
+        )
+
+
+def check_words(line: str, key: str, where: str) -> None:
+    """A line says what changes in the app, in words you know, without the production's plumbing."""
+    found = PLUMBING.search(line)
+    if found is not None:
+        raise InputError(
+            f"{where}.{key}: {found.group(0)!r} is the production's own plumbing or shorthand, which the user never sees; "
+            + "say what changes in the app, or leave it out"
+        )
 
 
 def check_one_phase(line: str, number: int | None, key: str, where: str) -> None:
@@ -371,6 +406,12 @@ def parse_unit(value: object, where: str, length: str) -> Unit:
     if then is None and number == total:
         raise InputError(f"{where}.then: required on a last phase; name the queued work, or 'nothing queued'")
     heading_number = int(plan_number) if plan_number else None
+    if then is not None and heading_number is not None:
+        check_then_order(then, heading_number, where)
+    for key in ("phase", "held", "held_examples", "update", "waiting_on_it", "needed", "then"):
+        line = optional_text(fields, key, where)
+        if line is not None:
+            check_words(line, key, where)
     held = optional_text(fields, "held", where)
     held_examples = optional_text(fields, "held_examples", where)
     if held is None and held_examples is not None:
