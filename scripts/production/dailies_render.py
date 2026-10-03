@@ -29,6 +29,7 @@ import argparse
 import json
 import re
 import sys
+import unicodedata
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -66,6 +67,13 @@ NOW_MARK = "▼ "
 BUILD_HOLD_MARK = "build hold"
 CELL_WIDTH = 2
 ROW_LABEL_WIDTH = 9
+# Right of each row, right-aligned: `Phase N of M - P%` for the whole plan,
+# then ten blocks, one per 10% rounded, and a line at 100% (user, 2026-10-03).
+PLAN_BLOCKS = 10
+PLAN_FILL = "█"
+PLAN_END = "│"
+PLAN_FULL = "100%"
+PLAN_GAP = 3
 # A phase that started before the left edge has its start beside its name.
 START_FORMAT = "%b-%d %H:%M"
 # The timeline always spans 24 one-hour cells, labelled every three hours. It
@@ -146,10 +154,18 @@ class Estimate:
 
 
 @dataclass(frozen=True)
+class PlanProgress:
+    number: int
+    total: int
+    percent: int
+
+
+@dataclass(frozen=True)
 class Row:
     name: str
     estimate: Estimate | None
     build_hold: bool
+    plan: PlanProgress | None
 
 
 def parse_time(text: str, now: datetime) -> datetime:
@@ -226,7 +242,31 @@ def draw(now: datetime, rows: list[Row]) -> list[str]:
         if ranged:
             span += f" ({estimate.earliest:%H:%M}–{estimate.latest:%H:%M})"
         lines.append(f"{prefix}{''.join(cells).rstrip()}{arrow} {span}{hold}")
-    return lines
+    return with_plans(lines, rows)
+
+
+def display_width(line: str) -> int:
+    """Terminal columns: wide characters, the coloured cells among them, take two."""
+    return sum(2 if unicodedata.east_asian_width(char) in "WF" else 1 for char in line)
+
+
+def with_plans(lines: list[str], rows: list[Row]) -> list[str]:
+    """Each row's whole-plan progress in one right-aligned column past the longest row, with `100%` over its end line."""
+    plans = {row.name: f"Phase {row.plan.number} of {row.plan.total} - {row.plan.percent}%" for row in rows if row.plan is not None}
+    if not plans:
+        return lines
+    left = max(display_width(line) for line in lines) + PLAN_GAP
+    text_width = max(len(text) for text in plans.values())
+    header = f"{lines[0]}{' ' * (left - display_width(lines[0]) + text_width + 1 + PLAN_BLOCKS)}{PLAN_FULL}"
+    drawn = [header]
+    for line, row in zip(lines[1:], rows, strict=True):
+        if row.plan is None:
+            drawn.append(line)
+            continue
+        blocks = round(row.plan.percent / 10)
+        bar = PLAN_FILL * blocks + " " * (PLAN_BLOCKS - blocks)
+        drawn.append(f"{line}{' ' * (left - display_width(line))}{plans[row.name]:>{text_width}} {bar}{PLAN_END}")
+    return drawn
 
 
 def as_map(value: object, where: str) -> JsonMap:
@@ -577,6 +617,16 @@ def ordered_units(report: Report, now: datetime) -> list[Unit]:
     return [unit for _, unit in sorted(enumerate(report.units), key=key)]
 
 
+def plan_progress(unit: Unit) -> PlanProgress | None:
+    """The whole plan's percent done: earlier phases whole, this one at its stated percent (none stated counts as 0); a follow-up has none."""
+    match = PHASE.match(unit.phase)
+    if match is None or match.group(1) is None:
+        return None
+    number, total = int(match.group(1)), int(match.group(2))
+    done = (number - 1 + (unit.eta.percent or 0) / 100) / total
+    return PlanProgress(number, total, round(100 * done))
+
+
 def render(report: Report, previous: dict[str, Previous], now: datetime, zone_name: str) -> list[str]:
     lines = [f"**Dailies ({report.length.capitalize()})**, {now:%H:%M} {zone_name}", ""]
     user_topics = [topic for topic in report.topics if topic.needs_user]
@@ -616,13 +666,14 @@ def render(report: Report, previous: dict[str, Previous], now: datetime, zone_na
     rows: list[Row] = []
     for unit in units:
         on_hold = unit.build_hold is not None
+        plan = plan_progress(unit)
         if unit.eta.time is None:
-            rows.append(Row(unit.label, None, on_hold))
+            rows.append(Row(unit.label, None, on_hold, plan))
             continue
         moment = parse_time(unit.eta.time, now)
         earliest = parse_range_end(unit.eta.earliest, now, moment, earliest=True) if unit.eta.earliest else moment
         latest = parse_range_end(unit.eta.latest, now, moment, earliest=False) if unit.eta.latest else moment
-        rows.append(Row(unit.label, Estimate(unit.started, moment, earliest, latest), on_hold))
+        rows.append(Row(unit.label, Estimate(unit.started, moment, earliest, latest), on_hold, plan))
     lines.extend(["```", *draw(now, rows), "```", ""])
 
     needed = any(unit.needed for unit in report.units) or any(topic.needed for topic in report.topics)

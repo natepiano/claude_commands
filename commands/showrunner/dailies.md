@@ -175,6 +175,10 @@ names another plan's document. User, 2026-10-02.
   the left edge shows its start as `mmm-dd hh:mm` between its name and its
   cells (`widget   Sep-30 17:11 ⬜⬜…`); other rows leave that space blank, so
   the cells stay under the axis. User, 2026-10-01. A unit under a build hold ends its row with `build hold`.
+  Right of the rows, in one right-aligned column: `Phase N of M - P%`, the
+  whole plan's percent done (earlier phases whole, this one at its `percent`),
+  then ten blocks, one per 10% rounded, and `│` at 100%, with `100%` above it
+  on the axis line. A follow-up row has none. User, 2026-10-03.
 - **Last line:** `next run at 20:10 - nothing needed` when no subject has a
   `needed:`, `next run at 20:10` when one does, or `no run scheduled` without a
   schedule. The report replaces the turn's `— waiting on:` line.
