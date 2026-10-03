@@ -245,6 +245,9 @@
   "alwaysThinkingEnabled": true,
   "autoCompactWindow": 283800,
   "askUserQuestionTimeout": "never",
+  "remote": {
+    "defaultEnvironmentId": "env_01DRVkPj3Ec3qaNwfki4iyms"
+  },
   "tui": "fullscreen",
   "skipDangerousModePermissionPrompt": true,
   "skipWorkflowUsageWarning": true,
