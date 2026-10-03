@@ -516,7 +516,10 @@ Every check is on that exact sha.
    main has commits the merge branch lacks, leave main alone and make it a
    topic in the next dailies.
 5. **Push.** `git -C CHECKOUT push origin <sha>:refs/heads/main`, never with
-   force. It starts one more CI run on the same sha.
+   force. It starts one more CI run on the same sha. This plain push leaves
+   the public bevy_hana mirror alone: the mirror updates only when main lands
+   through validate_and_push, whose post-push hook publishes it (user,
+   2026-10-03).
 6. **Local main.** Find the worktree on `main` with
    `git -C CHECKOUT worktree list`. Fast-forward it with
    `git -C <it> merge --ff-only <sha>` only when its tree is clean and
