@@ -26,26 +26,19 @@ has five or more phases, counting every `### Phase N — … · status:` heading
 Why (user, 2026-09-23): per-phase gates run scoped lints and Linux tests only,
 so a long run drifted many phases from a green macOS CI before anyone saw it.
 
-**CI points.** A regular point is due after <CheckpointCommit/> when five or
-more of this plan's checkpoints are not yet on the remote CI branch. The final
-point runs after <RunAsBuilt/> when at least one is not. Count from git, never
-from memory:
+**CI points.** A regular point is due after <CheckpointCommit/> when this
+plan's checkpoint count is a multiple of five. The final point always runs after
+<RunAsBuilt/>. Count from git, never from memory:
 
 ```sh
-git fetch origin "<ci-branch>" 2>/dev/null
-base=$(git rev-parse --verify -q "origin/<ci-branch>" || echo "${STYLE_DIFF_BASE}")
-git rev-list --count --grep='^checkpoint(<plan-slug>): ' "${base}..HEAD"
+git rev-list --count --grep='^checkpoint(<plan-slug>): ' "${STYLE_DIFF_BASE}..HEAD"
 ```
 
-With neither a remote branch nor a `STYLE_DIFF_BASE`, count every checkpoint of
-this plan reachable from `HEAD`.
+With no `STYLE_DIFF_BASE`, count every checkpoint of this plan reachable from
+`HEAD`.
 
-**CI branch.** The current branch, pushed under its own name. On the default
-branch (`gh repo view --json defaultBranchRef -q .defaultBranchRef.name`), push
-to `delegate/<plan-slug>` instead, so unfinished work never lands on the default
-branch. Creating that remote branch is authorized by this contract. Append each
-remote branch the run creates (one absent from `git ls-remote --heads origin`
-before the first push) to `${SESSION_DIR}/ci_remote_branches`.
+**CI branch.** The branch <PushCheckpoint/> pushes: the current branch, or
+`delegate/<plan-slug>` on the default branch. It is already on origin.
 
 **A red point blocks the next.** A regular or final point cannot start while an
 earlier one is unresolved; repair it first (step 4).
@@ -82,7 +75,7 @@ earlier one is unresolved; repair it first (step 4).
    checkpoint, then repair before dispatching another. Diagnose from the failed
    jobs as `commands/validate_and_push.md` `<WatchCI/>` describes, repair through
    the synthetic `ci` phase of step 2, and run a new point at once (step 1),
-   without waiting for five more checkpoints. Cancel the superseded run with
+   without waiting for the next multiple of five. Cancel the superseded run with
    `gh run cancel`. A green result clears `${SESSION_DIR}/ci_watch`.
 5. Append `<point> <sha> <run id> <green|red → repaired in <sha>>` to
    `${SESSION_DIR}/ci_points.log` for <RunSummary/>.

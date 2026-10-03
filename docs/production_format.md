@@ -168,6 +168,7 @@ branch, port and the files you own.
    Start the next phase only after the showrunner merges this one
    (`/showrunner:produce` → Rules, one phase at a time).
 4. **The merge branch is the showrunner's.** Never merge into it or push it.
+   Push only your own branch; <PushCheckpoint/> does it at each checkpoint.
    <PeriodicCI/> and <CICleanup/> do not run in a unit; the showrunner runs CI
    on the merge branch.
 5. **One more commit kind.** Besides checkpoints, a unit director may merge the

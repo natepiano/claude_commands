@@ -30,6 +30,13 @@ if ! wt_check_and_consume "$WORKTREE_PATH" "$BRANCH_NAME"; then
     exit 1
 fi
 
+ORIGIN_DEFAULT="$(git symbolic-ref --quiet --short refs/remotes/origin/HEAD 2>/dev/null || true)"
+CURRENT_BRANCH="$(git branch --show-current)"
+if [[ "$BRANCH_NAME" == "main" || "$BRANCH_NAME" == "${ORIGIN_DEFAULT#origin/}" || "$BRANCH_NAME" == "$CURRENT_BRANCH" ]]; then
+    echo "Error: refusing to delete protected or current branch: $BRANCH_NAME"
+    exit 1
+fi
+
 cleanup_residual_directory() {
     local project_dir="$1"
 
