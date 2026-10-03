@@ -18,7 +18,10 @@ sweep_budget_gib there; 24 GiB. It is summed over every file under the target
 and build directories, so output the budget sweep never
 removes (test-run folders, files it cannot match to a build unit) still
 counts. doc/ has its own rule, below. --dry-run reports what would go and
-removes nothing.
+removes nothing. --target-dir DIR sweeps DIR in place of the directories
+cargo metadata reports for the working directory: hana's CI runners call it
+that way after every job, with no workspace to ask (/etc/nixos,
+modules/linux/hana-runners.nix).
 
 Copied-up output. For a binary, an example, a dylib or a library named on the
 command line, cargo also puts the unit's file under its unhashed name, from
@@ -74,13 +77,15 @@ hana's deps/), and a rustflags change strands a whole second copy of the tree
 --maxsize counts incremental/ against the cap but never removes from it.
 
 Last use. cargo reads a unit's fingerprint JSON whenever the unit is in a
-build graph, so the newest atime in .fingerprint/<unit>/ is its last use.
-relatime refreshes an atime at most once a day, so eviction orders by whole
-days since last use, then by compile time (newest mtime) inside a day. An
-incremental dir's mtime moves on every compile of its crate. Anything that
-reads every fingerprint JSON resets every atime and erases that order;
+build graph, so the newest atime of the files in .fingerprint/<unit>/ is its
+last use. relatime refreshes an atime at most once a day, so eviction orders
+by whole days since last use, then by compile time (newest mtime) inside a
+day. An incremental dir's mtime moves on every compile of its crate. Anything
+that reads every fingerprint JSON resets every atime and erases that order;
 cargo-sweep --installed does exactly that, and running it before --time kept
-this sweep's predecessor from removing anything at all.
+this sweep's predecessor from removing anything at all. Listing a directory
+refreshes the directory's own atime the same way, so this scan, or a du,
+would mark every unit used if that atime counted; it does not.
 
 Concurrency. cargo 1.98.1 holds flock() on .cargo-lock, .cargo-build-lock
 and .cargo-artifact-lock for the whole build (checked 2026-09-15 by probing
@@ -122,6 +127,7 @@ DOC_DIR = "doc"
 DOC_LOCK_NAME = ".lock"
 # The cross-crate stores every rustdoc run reads and rewrites at its end.
 MERGE_DIRS = ("search.index", "trait.impl", "type.impl")
+TARGET_DIR_FLAG = "--target-dir"
 LOCK_NAMES = (".cargo-lock", ".cargo-build-lock", ".cargo-artifact-lock")
 HASHED_DIRS = (".fingerprint", "build", "deps", "examples")
 FINGERPRINT_DIR = ".fingerprint"
@@ -253,9 +259,11 @@ def release(held: list[int]) -> None:
 
 
 def newest_times(directory: str) -> tuple[float, float]:
-    """Newest atime-or-mtime and newest mtime over a directory and its direct children."""
-    stat = os.lstat(directory)
-    used, modified = max(stat.st_atime, stat.st_mtime), stat.st_mtime
+    """Newest atime-or-mtime and newest mtime over a directory and its direct
+    children, leaving out the directory's own atime: listing it, as this scan
+    and du do, refreshes that."""
+    modified = os.lstat(directory).st_mtime
+    used = modified
     try:
         with os.scandir(directory) as entries:
             for entry in entries:
@@ -699,9 +707,16 @@ def doc_index_bytes() -> int | None:
 
 def main(argv: list[str]) -> int:
     dry_run = False
-    for arg in argv:
+    target_dir: str | None = None
+    args = iter(argv)
+    for arg in args:
         if arg == "--dry-run":
             dry_run = True
+        elif arg == TARGET_DIR_FLAG:
+            target_dir = next(args, None)
+            if target_dir is None:
+                print(f"lint sweep: {TARGET_DIR_FLAG} needs a directory", file=sys.stderr)
+                return 2
         else:
             print(f"lint sweep: unknown argument {arg}", file=sys.stderr)
             return 2
@@ -714,7 +729,10 @@ def main(argv: list[str]) -> int:
     if doc_budget is None:
         print(f"lint sweep: {DOC_INDEX_ENV} must be a non-negative number of MiB", file=sys.stderr)
         return 2
-    roots = cargo_roots()
+    if target_dir is None:
+        roots = cargo_roots()
+    else:
+        roots = [os.path.realpath(target_dir)] if os.path.isdir(target_dir) else []
     if not roots:
         print("lint sweep: no target directory to sweep")
         return 0

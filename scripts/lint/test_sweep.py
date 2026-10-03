@@ -11,8 +11,9 @@ import subprocess
 import tempfile
 import time
 import unittest
-from contextlib import redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
+from unittest import mock
 
 import sweep
 
@@ -155,6 +156,17 @@ class GroupTests(SweepCase):
         self.assertEqual(claimed, [])
 
 
+class LastUseTests(SweepCase):
+    def test_listing_a_fingerprint_dir_is_not_a_use(self) -> None:
+        target = self.target()
+        fingerprint = target.tree / ".fingerprint" / f"app-{APP}"
+        compiled = fingerprint.stat().st_mtime
+        # A listing refreshes the directory's atime and nothing else.
+        os.utime(fingerprint, (time.time(), compiled))
+        _, owners = scanned(target)
+        self.assertEqual(owners[str(fingerprint)].last_used, compiled)
+
+
 class DepInfoTests(SweepCase):
     def test_names_the_copy_in_its_directory(self) -> None:
         target = self.target()
@@ -221,6 +233,21 @@ class SweepTests(SweepCase):
         self.assertEqual([path for path in gone if path.exists()], [])
         self.assertTrue(target.demo.exists())
         self.assertTrue(target.tool.exists())
+
+
+class TargetDirTests(SweepCase):
+    def test_sweeps_the_named_directory_without_a_workspace(self) -> None:
+        target = self.target()
+        output = io.StringIO()
+        with mock.patch.dict(os.environ, {sweep.BUDGET_ENV: "1024"}), redirect_stdout(output):
+            status = sweep.main([sweep.TARGET_DIR_FLAG, str(target.root), "--dry-run"])
+        self.assertEqual(status, 0)
+        self.assertIn(f"lint sweep: {target.root} is ", output.getvalue())
+        self.assertEqual([path for path in target.orphans if not path.exists()], [])
+
+    def test_flag_without_a_directory_is_an_error(self) -> None:
+        with redirect_stderr(io.StringIO()):
+            self.assertEqual(sweep.main([sweep.TARGET_DIR_FLAG]), 2)
 
 
 CONFIG = """\
