@@ -204,6 +204,8 @@ else
   # --all-features on clippy and rustdoc: the lint CLI and the dev loop run the
   # default feature set, so the whole tree shares one compiled copy of its
   # dependencies. The push gate is where feature-gated code gets covered.
+  # Passing arguments also keeps this stock clippy, the final authority: the
+  # lint CLI hands only an argument-free `lint clippy` to a clippy-linked mend.
   run_step "clippy" env LINT_CONFIG_FORCE=1 "$LINT_CMD" clippy --workspace --all-features
 
   # Cross-target clippy for the triples listed in CROSS_TARGETS_FILE. Read into

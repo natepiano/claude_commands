@@ -13,7 +13,9 @@ usage() {
   cat <<EOF
 Usage:
   lint mend [args...]             cargo mend --all-targets
-  lint clippy [args] [-- lints]   clippy --all-targets, -D warnings
+  lint clippy [args] [-- lints]   clippy --all-targets, -D warnings; with no
+                                  args and a clippy-linked cargo-mend, the
+                                  read-only \`lint mend\` run answers for it
   lint clippy-tests [args] [-- lints]
                                   clippy over lib/bins/tests only —
                                   validate_ci's host shape (no examples or
@@ -88,6 +90,51 @@ resolve_scope() {
     done < <(lint_scope "$@")
 }
 
+# A clippy-linked cargo-mend (invoke.sh, mend_clippy_probe) runs clippy's
+# lints inside its own compile. An argument-free `lint clippy`, the call
+# port-lint and /clippy make, then runs the read-only `lint mend` instead of
+# stock clippy: the same argv, so the two share cargo's cache, and whichever
+# runs second is a cache replay. Any argument keeps stock clippy: it asks for
+# what mend cannot do (extra lints, --fix) or parts from `lint mend`'s argv
+# and so from its cache. The push gate (validate_ci.sh) passes --workspace
+# --all-features, so stock clippy stays its final authority. mend=off in
+# lint.conf keeps stock clippy too.
+mend_covers_clippy() {
+    lint_config_enabled clippy && lint_config_enabled mend || return 1
+    mend_clippy_probe
+    [[ "$MEND_CLIPPY_STATE" == active ]]
+}
+
+# clippy_in_mend SCOPE...: `cargo clippy --all-targets -- -D warnings`,
+# answered by mend. It fails where that fails: mend failed (a compile error, a
+# denied lint), or its report counts a compiler warning, clippy's included,
+# which -D warnings makes an error; 101 is cargo's status for a failed
+# compile. A report with no count runs stock clippy. On a terminal, cargo
+# keeps its colors through the tee: CARGO_TERM_COLOR leaves the build cache
+# alone.
+clippy_in_mend() {
+    local log status=0 warnings
+    log="$(mktemp)"
+    if [[ -t 1 && -z "${CARGO_TERM_COLOR:-}" ]]; then
+        export CARGO_TERM_COLOR=always
+    fi
+    invoke_mend "$@" 2>&1 | tee "$log" || status=$?
+    warnings="$(mend_clippy_warnings "$log")" || warnings=""
+    rm -f "$log"
+    if [[ $status -ne 0 ]]; then
+        return $status
+    fi
+    if [[ -z "$warnings" ]]; then
+        echo "lint: cargo mend's report shows no warning count; running stock clippy"
+        invoke_clippy "$@" --all-targets
+    elif [[ "$warnings" -gt 0 ]]; then
+        echo "lint: clippy denies warnings, and cargo mend's compile left $warnings, clippy's lints included" >&2
+        return 101
+    else
+        echo "lint: clippy ran inside cargo mend's compile and left no warnings"
+    fi
+}
+
 CMD="${1:-}"
 [[ $# -gt 0 ]] && shift
 
@@ -95,7 +142,11 @@ case "$CMD" in
   mend)         resolve_scope "$@"
                 invoke_mend ${SCOPE[@]+"${SCOPE[@]}"} "$@" ;;
   clippy)       resolve_scope "$@"
-                invoke_clippy ${SCOPE[@]+"${SCOPE[@]}"} --all-targets "$@" ;;
+                if [[ $# -eq 0 ]] && mend_covers_clippy; then
+                    clippy_in_mend ${SCOPE[@]+"${SCOPE[@]}"}
+                else
+                    invoke_clippy ${SCOPE[@]+"${SCOPE[@]}"} --all-targets "$@"
+                fi ;;
   clippy-tests) resolve_scope "$@"
                 invoke_clippy ${SCOPE[@]+"${SCOPE[@]}"} --tests "$@" ;;
   doc)          resolve_scope "$@"

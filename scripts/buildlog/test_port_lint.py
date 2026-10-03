@@ -82,6 +82,13 @@ class ArgvTests(unittest.TestCase):
         self.assertTrue(port_lint.stands_in("mend", MEND, None))
         self.assertTrue(port_lint.stands_in("clippy", CLIPPY, None))
 
+    def test_mend_never_stands_in_for_clippy(self) -> None:
+        # The read-only mend `lint clippy` runs with a clippy-linked mend active exits 0
+        # over warnings, and the build log cannot tell whether it ran clippy's lints.
+        for fixes in (None, 0):
+            with self.subTest(fixes=fixes):
+                self.assertFalse(port_lint.stands_in("clippy", MEND, fixes))
+
 
 class BusyTests(unittest.TestCase):
     def test_probe_rows(self) -> None:
@@ -185,6 +192,19 @@ class ReuseTests(unittest.TestCase):
             lint_step("fixed", "2026-10-02T11:00:00.000Z", step="mend", argv=[*MEND, "--fix"], mend_fixes=1),
         )
         self.assertEqual(self.found("mend"), "plain")
+
+    def test_clippy_reuses_only_stock_clippy(self) -> None:
+        self.write(
+            lint_step("stock", "2026-10-02T10:00:00.000Z"),
+            lint_step("in-mend", "2026-10-02T11:00:00.000Z", step="mend", argv=MEND, warnings=3),
+        )
+        self.assertEqual(self.found(), "stock")
+        # `lint mend` exits 0 over the same warnings, so its own reuse takes the newer step.
+        self.assertEqual(self.found("mend"), "in-mend")
+
+    def test_a_mend_step_alone_leaves_clippy_to_run(self) -> None:
+        self.write(lint_step("in-mend", "2026-10-02T11:00:00.000Z", step="mend", argv=MEND, warnings=0))
+        self.assertIsNone(self.found())
 
 
 class CommandTests(unittest.TestCase):

@@ -321,8 +321,9 @@ invoke_mend() {
     # The probe only alerts here: an active clippy-linked mend lints as
     # `cargo clippy` does without -D warnings (CLIPPY_ARGS unset), so a
     # warning never stops --fix. A caller that drops its clippy step denies
-    # the warnings left afterwards (verify.sh lint, mend_clippy_warnings).
-    # The argv stays the same in every state: port-lint matches it.
+    # the warnings left afterwards through mend_clippy_warnings: verify.sh
+    # lint, and the lint CLI's argument-free `lint clippy`, which runs this
+    # same argv. The argv stays the same in every state: port-lint matches it.
     mend_clippy_probe
     run env RUSTC_WRAPPER= cargo mend --all-targets "$@"
 }

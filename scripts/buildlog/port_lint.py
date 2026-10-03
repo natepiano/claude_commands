@@ -23,6 +23,16 @@ counts: an agent's, a terminal's, cargo-port's own. A step with a signal
 status, a usage error (2) or a sandbox failure (3) never does, and neither
 does a mend --fix that applied fixes.
 
+With a clippy-linked cargo-mend active, `lint clippy` runs the read-only
+`lint mend` in place of stock clippy and fails on any warning it reports
+(lint/lint, clippy_in_mend). Clippy's rule stays: only a stock clippy step
+stands in, on either path, since stock clippy's result on the same files and
+rustc is the one that run answers for. A mend step never stands in for
+clippy: the build log does not record whether it ran clippy's lints, and its
+status is 0 over warnings that fail clippy, with no log kept to replay. Its
+argv is `lint mend`'s, so the `port-lint mend` cargo-port runs after clippy
+reuses it, and the pair compiles once.
+
 Run: otherwise exec `lint <command> [ARG...]`, so cargo-port sees lint's
 output and status directly; the build log records its steps with caller
 cargo-port. Sweep never reuses: it acts on the target folder, which the tree
@@ -207,7 +217,7 @@ def deferral(worktree: str) -> str | None:
 
 
 def lint_argv(command: str, argv: list[str]) -> bool:
-    """Whether a step's argv is the one `lint <command>` runs in a workspace: scope flags in any order."""
+    """Whether a step's argv is the one stock `lint <command>` runs in a workspace: scope flags in any order."""
     if command == "clippy":
         if argv[: len(CLIPPY)] != CLIPPY or "--" not in argv:
             return False
