@@ -60,6 +60,12 @@
       ]
     },
     {
+      "root": "scripts/notify",
+      "extraPaths": [
+        "scripts/notify"
+      ]
+    },
+    {
       "root": "."
     }
   ]
