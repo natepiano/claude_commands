@@ -17,6 +17,13 @@ from typing import cast, override
 SCRIPT = Path(__file__).with_name("progress_history.py")
 FINDINGS = Path(__file__).with_name("findings.py")
 BOARD = Path(__file__).with_name("board.sh")
+# Four reports per finished phase, as (raw percent, percent of the phase's time
+# already spent): the shape of startup-polish Phase 5's history on 2026-10-03.
+# Looked up at the exact number, each raw percent answers with its own time
+# spent -- 78 says 40, 82 says 20, 84 says 55, 86 says 15 -- so four ticks a few
+# points apart drew four ETAs hours apart.
+SWING_REPORTS: tuple[tuple[int, int], ...] = ((86, 15), (82, 20), (78, 40), (84, 55))
+SUMMARY_HEADER = ["Scope", "%", "Elapsed", "ETA", "Unchanged", "ETA low", "ETA high"]
 
 
 class ProgressHistoryTests(unittest.TestCase):
@@ -263,6 +270,94 @@ class ProgressHistoryTests(unittest.TestCase):
             "completed",
             at=started_at + 410,
         )
+
+    def seed_calibration_history(
+        self,
+        name: str,
+        cap_stage: str,
+        reports: tuple[tuple[int, int], ...],
+        phases: int = 5,
+    ) -> None:
+        """Write finished phases straight into the history the calibrator reads.
+
+        Each report is (raw percent, percent of the phase's time spent), made by
+        the identity `start_phase_and_pass` records, so every one is a sample in
+        the current run's narrowest scope. Driving hundreds of CLI calls to reach
+        the same rows would only slow the suite.
+        """
+        duration = 10_000
+        lines: list[str] = []
+        for index in range(phases):
+            started_at = 1_000_000 + index * duration
+            phase: dict[str, object] = {
+                "schema_version": 1,
+                "phase_instance_id": f"{name}-{index}",
+                "phase_started_at": started_at,
+            }
+            for raw_percent, spent_percent in reports:
+                event: dict[str, object] = {
+                    **phase,
+                    "event_type": "progress_reported",
+                    "timestamp_epoch": started_at + duration * spent_percent // 100,
+                    "raw_percent": raw_percent,
+                    "percent": raw_percent,
+                    "cap_stage": cap_stage,
+                    "pass_kind": "fix",
+                    "main_agent": {"model": "gpt-main", "effort": "xhigh"},
+                    "called_agent": {"model": "gpt-called", "effort": "high"},
+                }
+                lines.append(json.dumps(event))
+            finished: dict[str, object] = {
+                **phase,
+                "event_type": "phase_finished",
+                "status": "completed",
+                "timestamp_epoch": started_at + duration,
+            }
+            lines.append(json.dumps(finished))
+        path = self.history_dir / "runs" / f"{name}.jsonl"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        _ = path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+    def calibrate_and_report(
+        self,
+        session_dir: Path,
+        raw_percent: int,
+        cap_stage: str,
+        at: int,
+    ) -> tuple[int, str]:
+        """Run one tick the way the report contract does: calibrate, then report
+        the suggestion. Returns the suggestion and the phase row's ETA cell."""
+        calibration_text = self.run_command(
+            "calibrate",
+            "--session-dir",
+            str(session_dir),
+            "--candidate-percent",
+            str(raw_percent),
+            "--cap-stage",
+            cap_stage,
+            at=at,
+        )
+        parsed: object = json.loads(calibration_text)  # pyright: ignore[reportAny]
+        suggestion = cast(int, cast(dict[str, object], parsed)["suggested_percent"])
+        header = self.run_command(
+            "progress",
+            "--session-dir",
+            str(session_dir),
+            "--project-raw-percent",
+            "50",
+            "--project-percent",
+            "50",
+            "--phase-raw-percent",
+            str(raw_percent),
+            "--phase-percent",
+            str(suggestion),
+            "--cap-stage",
+            cap_stage,
+            "--activity",
+            "running the last gates",
+            at=at,
+        )
+        return suggestion, self.table_rows(header, SUMMARY_HEADER)[1][3]
 
     def test_header_and_calibration_use_completed_history(self) -> None:
         for index in range(5):
@@ -636,7 +731,7 @@ class ProgressHistoryTests(unittest.TestCase):
                 "user.email=plan-delegate@example.invalid",
                 "commit",
                 "-m",
-                "add plan",
+                "checkpoint(derived): phase 1",
             ],
             cwd=self.working_dir,
             check=True,
@@ -672,7 +767,7 @@ class ProgressHistoryTests(unittest.TestCase):
         state_object: object = json.loads(state_text)  # pyright: ignore[reportAny]
         state = cast(dict[str, object], state_object)
         self.assertEqual(state["project_started_at"], float(commit_time))
-        self.assertEqual(state["project_start_source"], "plan_git")
+        self.assertEqual(state["project_start_source"], "plan_first_checkpoint")
         persisted_text = plan_path.read_text(encoding="utf-8")
         persisted_value = persisted_text.split(
             "- **Project started:** ",
@@ -1719,6 +1814,89 @@ class ProgressHistoryTests(unittest.TestCase):
         self.assertEqual(progress_event["suggested_percent"], 25)
         self.assertEqual(progress_event["suggested_adjustment_percentage_points"], -40)
         self.assertEqual(progress_event["reported_adjustment_percentage_points"], -30)
+
+    def test_neighbouring_percents_in_one_stage_draw_one_steady_eta(self) -> None:
+        """A few points' change in the entered percent moves the ETA a little.
+
+        Calibrating on the exact number gave the SWING_REPORTS history's four
+        neighbouring entries suggestions of 40, 20, 55 and 15, so an hour into
+        the phase the ETA read 08:03, 10:33, 07:22 and 12:13 for one unchanged
+        state of the work. Drawn from the stage's history around each number,
+        the four land within one five-point step and half an hour of each other.
+        """
+        self.seed_calibration_history("swing", "implementation", SWING_REPORTS)
+        started_at = 20_000
+        session_dir = self.start_run("current", started_at)
+        self.start_phase_and_pass(session_dir, started_at)
+
+        ticks = [
+            self.calibrate_and_report(
+                session_dir, raw_percent, "implementation", at=started_at + 3_600
+            )
+            for raw_percent in (78, 82, 84, 86)
+        ]
+
+        self.assertEqual(
+            ticks,
+            [
+                (30, "today 08:53"),
+                (30, "today 08:53"),
+                (35, "today 08:24"),
+                (35, "today 08:24"),
+            ],
+        )
+
+    def test_calibration_draws_on_the_stage_the_phase_has_reached(self) -> None:
+        """An 84 entered during closure is nearly done; one during implementation
+        is not. The named stage's history decides the suggestion, and a report at
+        another stage refuses a calibration drawn for this one."""
+        self.seed_calibration_history("swing", "implementation", SWING_REPORTS)
+        self.seed_calibration_history("closing", "closure", ((84, 80),))
+        started_at = 20_000
+        session_dir = self.start_run("current", started_at)
+        self.start_phase_and_pass(session_dir, started_at)
+
+        self.assertEqual(
+            self.calibrate_and_report(session_dir, 84, "closure", at=started_at + 3_600),
+            (80, "today 06:48"),
+        )
+        self.assertEqual(
+            self.calibrate_and_report(
+                session_dir, 84, "implementation", at=started_at + 3_660
+            ),
+            (35, "today 08:27"),
+        )
+
+        _ = self.run_command(
+            "calibrate",
+            "--session-dir",
+            str(session_dir),
+            "--candidate-percent",
+            "84",
+            "--cap-stage",
+            "implementation",
+            at=started_at + 3_720,
+        )
+        failure = self.run_failing_command(
+            "progress",
+            "--session-dir",
+            str(session_dir),
+            "--project-raw-percent",
+            "50",
+            "--project-percent",
+            "50",
+            "--phase-raw-percent",
+            "84",
+            "--phase-percent",
+            "35",
+            "--cap-stage",
+            "closure",
+            "--activity",
+            "running the last gates",
+            at=started_at + 3_720,
+        )
+        self.assertNotEqual(failure.returncode, 0)
+        self.assertIn("drawn for stage implementation, not closure", failure.stderr)
 
 
     def test_eta_is_omitted_at_both_endpoints(self) -> None:

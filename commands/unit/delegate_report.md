@@ -53,9 +53,10 @@ Everything below is the contract.
    already working in the round table this tick prints.
 5. Run:
 
-   `python3 ~/.claude/scripts/delegate/progress_history.py calibrate --session-dir "${SESSION_DIR}" --candidate-percent "${PHASE_RAW_PERCENT}"`
+   `python3 ~/.claude/scripts/delegate/progress_history.py calibrate --session-dir "${SESSION_DIR}" --candidate-percent "${PHASE_RAW_PERCENT}" --cap-stage "<stage>"`
 
-   Use its phase suggestion when applicable; otherwise keep the raw value. Then
+   Pass the same stage to both calls; `progress` refuses a calibration drawn
+   for another. Use its phase suggestion when applicable; otherwise keep the raw value. Then
    run:
 
    `python3 ~/.claude/scripts/delegate/progress_history.py progress --session-dir "${SESSION_DIR}" --project-raw-percent "${PROJECT_RAW_PERCENT}" --project-percent "${PROJECT_RAW_PERCENT}" --phase-raw-percent "${PHASE_RAW_PERCENT}" --phase-percent "${PHASE_REPORTED_PERCENT}" --cap-stage "<stage>" --activity "<current activity>" [--phase-override-reason "<specific evidence>"]`

@@ -35,6 +35,13 @@ MIN_CALIBRATION_SAMPLES = 5
 # have shown; a run with enough matching samples replaces it with its own
 # measured error, so this only ever governs the first runs of a fresh history.
 DEFAULT_PERCENT_SPREAD = 10.0
+# How far apart two entered percentages may sit and still calibrate each other.
+# The entered percent is itself off by about DEFAULT_PERCENT_SPREAD, so history
+# ten points either side describes the same moment of a phase as well as history
+# at the exact number does. An exact match handed each tick its own handful of
+# reports: four ticks entering 78, 82, 84 and 86 drew suggestions of 40, 20, 55
+# and 15, and the ETA built on them moved by more than nine hours between ticks.
+CALIBRATION_WINDOW = 10
 # The widest the best and worst case may stray from the reported rate: at worst
 # the work is half as far along as it says, at best twice.
 RATE_FACTOR_LIMIT = 2.0
@@ -96,6 +103,7 @@ class AgentIdentity(TypedDict):
 class CalibrationSample(TypedDict):
     percent: int
     raw_percent: int
+    cap_stage: str
     suggested_percent: int
     decision_source: str
     override_reason: str
@@ -1473,6 +1481,7 @@ def _calibration_samples(events: list[dict[str, object]]) -> list[CalibrationSam
                     CalibrationSample(
                         percent=percent,
                         raw_percent=raw_percent,
+                        cap_stage=_string(report.get("cap_stage")),
                         suggested_percent=suggested_percent,
                         decision_source=_string(report.get("decision_source"), "legacy"),
                         override_reason=_string(report.get("override_reason")),
@@ -1600,24 +1609,20 @@ def _sample_metrics(samples: list[CalibrationSample], current_hold: int) -> dict
     }
 
 
-def _matching_scope(
+def _calibration_scopes(
     samples: list[CalibrationSample],
-    candidate_percent: int,
     state: dict[str, object],
-) -> tuple[str, list[CalibrationSample]]:
-    exact = [sample for sample in samples if sample["raw_percent"] == candidate_percent]
-    candidates = exact
-    percent_scope = "exact_percent"
-    if len(candidates) < MIN_CALIBRATION_SAMPLES:
-        nearby = [
-            sample
-            for sample in samples
-            if abs(sample["raw_percent"] - candidate_percent) <= 5
-        ]
-        if len(nearby) > len(candidates):
-            candidates = nearby
-            percent_scope = "within_5_percentage_points"
+    cap_stage: str,
+) -> list[tuple[str, list[CalibrationSample]]]:
+    """Every history a suggestion may draw on, narrowest first.
 
+    The stage is a fact and the percent is an estimate, so a named stage narrows
+    every identity scope and the whole history sits behind them as the widest.
+    An 86 entered during implementation and an 86 entered during closure sit
+    hours apart, and pooling them is how one tick drew a suggestion of 55 between
+    neighbours of 20 and 15. With no stage named the identity scopes are the
+    whole ladder.
+    """
     # Match on the open window, the same rule `_event` records by. A finished
     # pass left in state would otherwise match this activity's report against
     # samples from a delegate that is no longer running.
@@ -1630,39 +1635,102 @@ def _matching_scope(
     called_model = _string(called_agent.get("model"))
     called_effort = _string(called_agent.get("effort"))
 
-    filters: list[tuple[str, list[CalibrationSample]]] = [
+    identity: list[tuple[str, Callable[[CalibrationSample], bool]]] = [
         (
             "main_called_pass",
-            [
-                sample
-                for sample in candidates
-                if sample["pass_kind"] == pass_kind
-                and sample["main_model"] == main_model
-                and sample["main_effort"] == main_effort
-                and sample["called_model"] == called_model
-                and sample["called_effort"] == called_effort
-            ],
+            lambda sample: sample["pass_kind"] == pass_kind
+            and sample["main_model"] == main_model
+            and sample["main_effort"] == main_effort
+            and sample["called_model"] == called_model
+            and sample["called_effort"] == called_effort,
         ),
         (
             "called_pass",
-            [
-                sample
-                for sample in candidates
-                if sample["pass_kind"] == pass_kind
-                and sample["called_model"] == called_model
-                and sample["called_effort"] == called_effort
-            ],
+            lambda sample: sample["pass_kind"] == pass_kind
+            and sample["called_model"] == called_model
+            and sample["called_effort"] == called_effort,
         ),
-        (
-            "pass",
-            [sample for sample in candidates if sample["pass_kind"] == pass_kind],
-        ),
-        ("all_models_and_passes", candidates),
+        ("pass", lambda sample: sample["pass_kind"] == pass_kind),
+        ("all_models_and_passes", lambda _sample: True),
     ]
-    for scope, scoped_samples in filters:
-        if len(scoped_samples) >= MIN_CALIBRATION_SAMPLES:
-            return f"{percent_scope}:{scope}", scoped_samples
-    return f"{percent_scope}:insufficient", candidates
+    if not cap_stage:
+        return [
+            (name, [sample for sample in samples if matches(sample)])
+            for name, matches in identity
+        ]
+    staged = [sample for sample in samples if sample["cap_stage"] == cap_stage]
+    return [
+        *(
+            (f"stage_{name}", [sample for sample in staged if matches(sample)])
+            for name, matches in identity
+        ),
+        ("all_stages", samples),
+    ]
+
+
+def _window_weight(sample: CalibrationSample, candidate_percent: int) -> float:
+    """How far one report speaks for the entered percent: fully at the same
+    number, fading to nothing at the edge of CALIBRATION_WINDOW."""
+    distance = abs(sample["raw_percent"] - candidate_percent)
+    return max(0.0, 1.0 - distance / CALIBRATION_WINDOW)
+
+
+def _window_totals(
+    samples: list[CalibrationSample],
+    candidate_percent: int,
+) -> tuple[float, float]:
+    """A scope's weight around the entered percent, and its weighted bias sum."""
+    weight = 0.0
+    weighted_bias = 0.0
+    for sample in samples:
+        sample_weight = _window_weight(sample, candidate_percent)
+        weight += sample_weight
+        weighted_bias += sample_weight * sample["raw_bias_percentage_points"]
+    return weight, weighted_bias
+
+
+def _smoothed_bias(
+    scopes: list[tuple[str, list[CalibrationSample]]],
+    candidate_percent: int,
+) -> tuple[float, float]:
+    """The bias the history around this percent shows, and the widest scope's weight.
+
+    Each narrower scope leans on the one around it until it holds
+    MIN_CALIBRATION_SAMPLES of weight of its own, so the answer slides from the
+    broad history to the matching one as samples accumulate. Picking one scope
+    and one exact percent outright made the answer jump wherever either choice
+    flipped; this blend moves only as far as the entered percent does. The
+    widest scope's weight decides whether history says anything at all.
+    """
+    *narrower, (_, widest) = scopes
+    support, weighted_bias = _window_totals(widest, candidate_percent)
+    bias = weighted_bias / support if support > 0 else 0.0
+    for _, scoped in reversed(narrower):
+        weight, weighted_bias = _window_totals(scoped, candidate_percent)
+        bias = (weighted_bias + MIN_CALIBRATION_SAMPLES * bias) / (
+            weight + MIN_CALIBRATION_SAMPLES
+        )
+    return bias, support
+
+
+def _matching_scope(
+    scopes: list[tuple[str, list[CalibrationSample]]],
+    candidate_percent: int,
+) -> tuple[str, list[CalibrationSample]]:
+    """The narrowest scope that clears the sample floor on its own weight, cut to
+    its reports inside the window: the history the suggestion leans on most, and
+    the one the metrics beside it describe."""
+    window = f"within_{CALIBRATION_WINDOW}_percentage_points"
+    for name, scoped in scopes:
+        weight, _ = _window_totals(scoped, candidate_percent)
+        if weight >= MIN_CALIBRATION_SAMPLES:
+            return f"{window}:{name}", [
+                sample for sample in scoped if _window_weight(sample, candidate_percent) > 0
+            ]
+    _, widest = scopes[-1]
+    return f"{window}:insufficient", [
+        sample for sample in widest if _window_weight(sample, candidate_percent) > 0
+    ]
 
 
 def _current_hold_seconds(state: dict[str, object], candidate_percent: int, now: float) -> int:
@@ -1686,23 +1754,25 @@ def _calibrate(args: argparse.Namespace) -> None:
     candidate = _arg_integer(args, "candidate_percent")
     if not 0 <= candidate <= 100:
         raise SystemExit("--candidate-percent must be between 0 and 100")
+    cap_stage = _arg_string(args, "cap_stage")
     events, ignored = _load_events()
-    all_samples = _calibration_samples(events)
-    scope, samples = _matching_scope(all_samples, candidate, state)
-    metrics = _sample_metrics(samples, 0)
-    sample_count = _integer(metrics.get("sample_count"))
-    median_bias = _number(metrics.get("median_raw_bias_percentage_points"))
+    scopes = _calibration_scopes(_calibration_samples(events), state, cap_stage)
+    scope, samples = _matching_scope(scopes, candidate)
+    bias, support = _smoothed_bias(scopes, candidate)
+    apply_suggestion = support >= MIN_CALIBRATION_SAMPLES
     suggestion = candidate
-    if sample_count >= MIN_CALIBRATION_SAMPLES:
-        corrected = max(5.0, min(95.0, candidate - median_bias))
+    if apply_suggestion:
+        corrected = max(5.0, min(95.0, candidate - bias))
         suggestion = int(5 * round(corrected / 5.0))
     current_hold = _current_hold_seconds(state, suggestion, now)
     metrics = _sample_metrics(samples, current_hold)
     calibration: dict[str, object] = {
         "calibration_id": str(uuid.uuid4()),
         "candidate_percent": candidate,
+        "cap_stage": cap_stage,
         "suggested_percent": suggestion,
-        "apply_suggestion": sample_count >= MIN_CALIBRATION_SAMPLES,
+        "smoothed_bias_percentage_points": _round_metric(bias),
+        "apply_suggestion": apply_suggestion,
         "minimum_samples": MIN_CALIBRATION_SAMPLES,
         "scope": scope,
         "current_unchanged_seconds": current_hold,
@@ -1750,6 +1820,7 @@ def _progress_decision(
     reported_percent: int,
     override_reason: str,
     scope: str,
+    cap_stage: str,
 ) -> dict[str, object]:
     reason_option = (
         "--override-reason" if scope == "legacy" else f"--{scope}-override-reason"
@@ -1765,9 +1836,16 @@ def _progress_decision(
                 f"The pending {scope} calibration candidate does not match its raw percent; "
                 + "run calibrate again"
             )
+        # A suggestion drawn from one stage's history says nothing about another's.
+        calibrated_stage = _string(calibration.get("cap_stage"))
+        if calibrated_stage and calibrated_stage != cap_stage:
+            raise SystemExit(
+                f"The pending {scope} calibration was drawn for stage {calibrated_stage}, "
+                + f"not {cap_stage or 'none'}; run calibrate again with the same --cap-stage"
+            )
         suggested_percent = _integer(calibration.get("suggested_percent"), raw_percent)
         apply_suggestion = calibration.get("apply_suggestion") is True
-        bias_value = calibration.get("median_raw_bias_percentage_points")
+        bias_value = calibration.get("smoothed_bias_percentage_points")
         historical_bias = (
             _number(bias_value) if isinstance(bias_value, int | float) else None
         )
@@ -3324,13 +3402,11 @@ def _percent_spread(calibration: dict[str, object] | None) -> float:
     """How far off the percentage has actually run, when history can say.
 
     A calibration that cleared its sample floor has measured this reporter's
-    error at this percentage against phases that finished, which beats any
+    error around this percentage against phases that finished, which beats any
     constant. Below the floor the measurement is noise wearing a number, so the
     default stands.
     """
-    if calibration is None:
-        return DEFAULT_PERCENT_SPREAD
-    if _integer(calibration.get("sample_count")) < MIN_CALIBRATION_SAMPLES:
+    if calibration is None or calibration.get("apply_suggestion") is not True:
         return DEFAULT_PERCENT_SPREAD
     measured = calibration.get("median_raw_absolute_error_percentage_points")
     if not isinstance(measured, int | float):
@@ -3530,6 +3606,7 @@ def _progress(args: argparse.Namespace) -> None:
 
     if not 0 <= phase_raw_percent <= 100 or not 0 <= phase_percent <= 100:
         raise SystemExit("Percent values must be between 0 and 100")
+    cap_stage = _arg_string(args, "cap_stage")
     phase_calibration = _object_dict(state.get("pending_calibration"))
     phase_override_reason = (
         _arg_string(args, "phase_override_reason")
@@ -3542,6 +3619,7 @@ def _progress(args: argparse.Namespace) -> None:
         phase_percent,
         phase_override_reason,
         "phase" if uses_dual_layout else "legacy",
+        cap_stage,
     )
     # The project clock is derived, never estimated. An agent eyeballing phase
     # headings misses the archived ones; counting them here removes the judgment
@@ -3571,8 +3649,8 @@ def _progress(args: argparse.Namespace) -> None:
             project_percent,
             _arg_string(args, "project_override_reason"),
             "project",
+            cap_stage,
         )
-    cap_stage = _arg_string(args, "cap_stage")
     if uses_dual_layout and not cap_stage:
         raise SystemExit(
             "--cap-stage is required: name the gate this phase has actually reached ("
@@ -4034,6 +4112,7 @@ def _build_parser() -> argparse.ArgumentParser:
     calibrate = subparsers.add_parser("calibrate")
     _ = calibrate.add_argument("--session-dir", required=True)
     _ = calibrate.add_argument("--candidate-percent", type=int, required=True)
+    _ = calibrate.add_argument("--cap-stage", choices=tuple(PROGRESS_CAPS), default="")
     calibrate.set_defaults(handler=_calibrate)
 
     progress = subparsers.add_parser("progress")
