@@ -595,6 +595,27 @@ it needs. Every other wait is yours to clear, and fast.
    3. Both units work in the same files under a berth ordering; whoever lands
       second resolves the conflict.
    4. The waiting unit moves its work to files nobody holds.
+
+   **Merge order is yours, one pair of units at a time** (user, 2026-10-03).
+   cargo-berth's default, `default_answer = "first_ready"`, lets whichever
+   checkpoint is ready first merge first, and the other unit brings that work
+   in at its own merge. That default covers only the overlaps you have not
+   ordered. Never follow it blindly. At each checkpoint and each update tick,
+   read every overlap on the berth board. Order a pair yourself
+   (`cargo-berth sequence <first> <then> --why "<why>"`, or the unit director's
+   `--before`/`--after`) when first-ready costs more later:
+   - Work that others build on lands first: a rename, a moved API, a file
+     format change, a hub-file refactor. Hold a small ready checkpoint behind
+     it, so the small change adapts once and no later merge has to adapt to it.
+   - A fix that a waiting unit needs, or one that turns `MERGE_BRANCH` green,
+     lands first (rule 2).
+   - When two large diffs share files, the one that is harder to redo lands
+     first, and the other resolves the conflicts.
+   - A short hold is worth taking when it saves longer rework. Log the trade in
+     one line: who waits, for how long, and what it saves. The hold is a wait
+     under rule 4, with a clear time.
+
+   Log each ordering with its why. Lift it once the reason has merged.
 4. **Waits have a limit.** Log each wait when it starts and when it clears:
    - `- HH:MM <zone>: block: <waiting unit> on <unit> (<code | files>: <what>), clears ~HH:MM`
    - `- HH:MM <zone>: block cleared: <waiting unit> on <unit>`
