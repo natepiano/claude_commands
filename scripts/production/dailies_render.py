@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Render the /showrunner:dailies report from its fixed template.
 
-Usage: dailies_render.py <input.json> [--state <state.json>] [--log <log.md>] [--at <YYYY-MM-DDTHH:MM>]
+Usage: dailies_render.py [<input.json>] [--chart default|ascii] [--state <state.json>] [--log <log.md>] [--at <YYYY-MM-DDTHH:MM>]
 
 The input gives each subject's fields; this script owns the layout, so no line
 of the template can be dropped or renamed. It refuses, with exit 2, an input
@@ -21,6 +21,8 @@ using the production's own plumbing words (PLUMBING).
          then saves this report's values to it.
 --log    appends the `dailies ETAs:` line to this file.
 --at     renders as if the clock read this local time (for checks).
+--chart  sets the chart mode in CHART_CONF, which every showrunner's dailies
+         read; with no input file it only sets the mode.
 
 The input format is in ~/.claude/commands/showrunner/dailies.md.
 """
@@ -70,6 +72,10 @@ DOT = "● "
 DOT_RANGED = "●·"
 DOTS = "··"
 CAP = "┤ "
+# The chart mode every showrunner's dailies use, kept in one file so no
+# session has to remember it (user, 2026-10-03). `--chart` sets it.
+CHART_CONF = Path.home() / ".local/state/showrunner/dailies.conf"
+CHART_KEY = "chart"
 NOW_MARK = "▼ "
 # A unit under a /build_hold carries this marker; no marker means not held
 # (user, 2026-10-03: "Without that marker I will assume it is not held").
@@ -548,15 +554,33 @@ def parse_topic(value: object, where: str, length: str) -> Topic:
     )
 
 
-def parse_report(value: object) -> Report:
+def read_chart(path: Path) -> str:
+    """The `chart=` line of the conf; `default` when the file or the line is missing."""
+    try:
+        lines = path.read_text().splitlines()
+    except FileNotFoundError:
+        return "default"
+    for line in lines:
+        key, _, value = line.partition("=")
+        if key.strip() == CHART_KEY:
+            chart = value.strip()
+            if chart not in CHART_STYLES:
+                raise InputError(f"{path}: chart={chart!r} must be one of {', '.join(CHART_STYLES)}; set it with --chart")
+            return chart
+    return "default"
+
+
+def write_chart(path: Path, chart: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    _ = path.write_text(f"{CHART_KEY}={chart}\n")
+
+
+def parse_report(value: object, chart: str) -> Report:
     fields = as_map(value, "input")
-    check_keys(fields, {"length", "chart", "zone", "next_run", "units", "topics"}, "input")
+    check_keys(fields, {"length", "zone", "next_run", "units", "topics"}, "input")
     length = text(fields, "length", "input")
     if length not in LENGTHS:
         raise InputError(f"input.length: must be one of {', '.join(LENGTHS)}")
-    chart = optional_text(fields, "chart", "input") or "default"
-    if chart not in CHART_STYLES:
-        raise InputError(f"input.chart: must be one of {', '.join(CHART_STYLES)}")
     zone = text(fields, "zone", "input")
     next_run = clock_text(fields, "next_run", "input")
     units = [parse_unit(item, f"units[{index}]", length) for index, item in enumerate(as_list(fields.get("units"), "input.units"))]
@@ -736,17 +760,26 @@ def log_line(report: Report, now: datetime, zone_name: str) -> str:
 
 def main(arguments: list[str]) -> int:
     parser = argparse.ArgumentParser(description="Render the /showrunner:dailies report from its fixed template.")
-    _ = parser.add_argument("input", type=Path)
+    _ = parser.add_argument("input", type=Path, nargs="?")
+    _ = parser.add_argument("--chart", choices=sorted(CHART_STYLES), help=f"set the chart mode in {CHART_CONF} for every showrunner")
     _ = parser.add_argument("--state", type=Path)
     _ = parser.add_argument("--log", type=Path)
     _ = parser.add_argument("--at")
     options = parser.parse_args(arguments)
-    input_path = cast(Path, options.input)
+    input_path = cast(Path | None, options.input)
+    chart = cast(str | None, options.chart)
+    if chart is not None:
+        write_chart(CHART_CONF, chart)
+        print(f"dailies chart: {chart} ({CHART_CONF})", file=sys.stderr)
+    if input_path is None:
+        if chart is None:
+            parser.error("give an input file, --chart, or both")
+        return 0
     state_path = cast(Path | None, options.state)
     log_path = cast(Path | None, options.log)
     at = cast(str | None, options.at)
     try:
-        report = parse_report(cast(object, json.loads(input_path.read_text())))
+        report = parse_report(cast(object, json.loads(input_path.read_text())), read_chart(CHART_CONF))
         previous = load_state(state_path)
     except (InputError, json.JSONDecodeError, OSError) as error:
         print(f"dailies_render: {error}", file=sys.stderr)

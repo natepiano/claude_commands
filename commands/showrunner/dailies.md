@@ -1,6 +1,6 @@
 ---
 description: Report a running production's state to the executive producer (the user) — every unit and every open topic — at one of three lengths, simple (default), page or elaborate.
-argument-hint: "[simple|page|elaborate]"
+argument-hint: "[simple|page|elaborate] [default|ascii]"
 ---
 
 # Dailies
@@ -11,8 +11,17 @@ producer: the user. Run it in the showrunner session during `/showrunner:produce
 whose state (`PRODUCTION_DOC`, `LOG`, `ZONE`, `UNITS`, `CHECKOUT`,
 `MERGE_BRANCH`, `TIMER_CONF`, `TIMER`) it uses.
 
-**Usage:** `/showrunner:dailies [simple|page|elaborate]`. With no argument,
-`simple`. With any other argument, name the three choices and stop.
+**Usage:** `/showrunner:dailies [simple|page|elaborate] [default|ascii]`. With
+no length, `simple`. With any other argument, name the choices and stop.
+
+**Chart mode.** `default` draws the timeline in coloured squares; `ascii`
+draws it with characters a code font has, for when you are remote, since the
+desktop app draws emoji wider than two columns. The mode lives in
+`~/.local/state/showrunner/dailies.conf`, which every showrunner's renderer
+reads, so no session remembers it. A mode argument sets it before the report:
+run `python3 ~/.claude/scripts/production/dailies_render.py --chart <mode>`.
+So do your words: "ascii mode", "switch back to default". It holds until
+changed. User, 2026-10-03.
 
 ## Status check and clock
 
@@ -111,7 +120,6 @@ python3 ~/.claude/scripts/production/dailies_render.py <scratchpad>/dailies_inpu
 | Field | Rule |
 | --- | --- |
 | `length` | `simple`, `page` or `elaborate`, from the argument. |
-| `chart` | `default` (the coloured squares) or `ascii` (only characters a code font has, for when you are remote). Leave it out for `default`. It stays as you last set it: "ascii mode" sets `ascii` and "switch back to default" removes it. User, 2026-10-03. |
 | `zone` | `ZONE`, as an IANA name. |
 | `next_run` | The next scheduled run, `HH:MM` in `ZONE`, after any restart. Leave it out when no schedule runs. |
 | `unit` | The unit director's session name. |
