@@ -61,6 +61,9 @@ RED = "🟥"
 BLUE = "🟦"
 BLANK = "  "
 NOW_MARK = "▼ "
+# A unit under a /build_hold carries this marker; no marker means not held
+# (user, 2026-10-03: "Without that marker I will assume it is not held").
+BUILD_HOLD_MARK = "build hold"
 CELL_WIDTH = 2
 ROW_LABEL_WIDTH = 9
 # A phase that started before the left edge has its start beside its name.
@@ -100,6 +103,7 @@ class Unit:
     started: datetime
     held: str | None
     held_examples: str | None
+    build_hold: str | None
     update: str
     eta: Eta
     waiting_on_it: str | None
@@ -145,6 +149,7 @@ class Estimate:
 class Row:
     name: str
     estimate: Estimate | None
+    build_hold: bool
 
 
 def parse_time(text: str, now: datetime) -> datetime:
@@ -200,8 +205,9 @@ def draw(now: datetime, rows: list[Row]) -> list[str]:
     last = WINDOW_HOURS - 1
     for row in rows:
         prefix = f"{row.name:<{ROW_LABEL_WIDTH}}{early.get(row.name, ''):<{start_width}}"
+        hold = f" {BUILD_HOLD_MARK}" if row.build_hold else ""
         if row.estimate is None:
-            lines.append(f"{prefix}?")
+            lines.append(f"{prefix}?{hold}")
             continue
         estimate = row.estimate
         cells = [BLANK] * WINDOW_HOURS
@@ -219,7 +225,7 @@ def draw(now: datetime, rows: list[Row]) -> list[str]:
         span = f"{estimate.eta:%H:%M}"
         if ranged:
             span += f" ({estimate.earliest:%H:%M}–{estimate.latest:%H:%M})"
-        lines.append(f"{prefix}{''.join(cells).rstrip()}{arrow} {span}")
+        lines.append(f"{prefix}{''.join(cells).rstrip()}{arrow} {span}{hold}")
     return lines
 
 
@@ -377,7 +383,7 @@ def parse_unit(value: object, where: str, length: str) -> Unit:
     fields = as_map(value, where)
     check_keys(
         fields,
-        {"unit", "label", "project", "phase", "started", "held", "held_examples", "update", "eta", "waiting_on_it", "needed", "needs_user", "then"},
+        {"unit", "label", "project", "phase", "started", "held", "held_examples", "build_hold", "update", "eta", "waiting_on_it", "needed", "needs_user", "then"},
         where,
     )
     if "held" not in fields:
@@ -408,7 +414,7 @@ def parse_unit(value: object, where: str, length: str) -> Unit:
     heading_number = int(plan_number) if plan_number else None
     if then is not None and heading_number is not None:
         check_then_order(then, heading_number, where)
-    for key in ("phase", "held", "held_examples", "update", "waiting_on_it", "needed", "then"):
+    for key in ("phase", "held", "held_examples", "build_hold", "update", "waiting_on_it", "needed", "then"):
         line = optional_text(fields, key, where)
         if line is not None:
             check_words(line, key, where)
@@ -435,6 +441,7 @@ def parse_unit(value: object, where: str, length: str) -> Unit:
         started=datetime.fromisoformat(started_text),
         held=held,
         held_examples=held_examples,
+        build_hold=optional_text(fields, "build_hold", where),
         update=update,
         eta=parse_eta(fields.get("eta"), f"{where}.eta"),
         waiting_on_it=optional_text(fields, "waiting_on_it", where),
@@ -587,11 +594,13 @@ def render(report: Report, previous: dict[str, Previous], now: datetime, zone_na
     for unit in units:
         lines.append(f"### {unit.unit}: {unit.project}")
         lines.append(f"- phase: {unit.phase}")
+        if unit.build_hold:
+            lines.append(f"- {BUILD_HOLD_MARK}: {unit.build_hold}")
         if unit.held:
             last = previous.get(unit.unit)
             repeat = report.length == "simple" and last is not None and last.phase == unit.phase and last.held == unit.held
             examples = f", {unit.held_examples}" if unit.held_examples and not repeat else ""
-            lines.append(f"- held: not merged, because {unit.held}{examples}")
+            lines.append(f"- checkpoint: not merged, because {unit.held}{examples}")
         lines.append(f"- update: {unit.update}")
         lines.append(f"- eta: {eta_text(unit, previous.get(unit.unit), now, zone_name, with_note=True)}")
         if unit.waiting_on_it:
@@ -606,13 +615,14 @@ def render(report: Report, previous: dict[str, Previous], now: datetime, zone_na
 
     rows: list[Row] = []
     for unit in units:
+        on_hold = unit.build_hold is not None
         if unit.eta.time is None:
-            rows.append(Row(unit.label, None))
+            rows.append(Row(unit.label, None, on_hold))
             continue
         moment = parse_time(unit.eta.time, now)
         earliest = parse_range_end(unit.eta.earliest, now, moment, earliest=True) if unit.eta.earliest else moment
         latest = parse_range_end(unit.eta.latest, now, moment, earliest=False) if unit.eta.latest else moment
-        rows.append(Row(unit.label, Estimate(unit.started, moment, earliest, latest)))
+        rows.append(Row(unit.label, Estimate(unit.started, moment, earliest, latest), on_hold))
     lines.extend(["```", *draw(now, rows), "```", ""])
 
     needed = any(unit.needed for unit in report.units) or any(topic.needed for topic in report.topics)
