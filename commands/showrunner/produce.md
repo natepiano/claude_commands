@@ -507,9 +507,10 @@ Every check is on that exact sha.
    Exit 0 is a pass.
 3. **GitHub CI.** The run concluded `success`. In
    `gh run view <run-id> --json jobs`, every job concluded `success` or
-   `skipped`, and the jobs that compile and test on Linux and on macOS
-   (`Test Suite`, `macOS: Compile and Test`) concluded `success`. The macOS job
-   skips when the Mac's runner is offline; that misses the bar.
+   `skipped`, and `Test Suite` (Linux) concluded `success`.
+   `macOS: Compile and Test` skipped because its runner is offline passes; the
+   log line then adds `macOS skipped (runner offline)`. A macOS job that ran
+   and failed blocks. User rule 2026-10-02.
 4. **Not dirty.** After `git -C CHECKOUT fetch origin main`,
    `git -C CHECKOUT merge-base --is-ancestor origin/main <sha>` succeeds. If
    main has commits the merge branch lacks, leave main alone and make it a
