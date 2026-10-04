@@ -678,6 +678,14 @@ to PushNotification and say so in the log. Never read or print
 `~/.config/pushover/env`. Every send is logged in
 `~/.local/state/notify/pushover.log`.
 
+**Push whenever work waits on the user.** When the production or any unit is
+blocked on something only the user can do (a rebuild, `github-warmup`, an
+approval, a login, a physical action), push the moment you learn it: what is
+blocked, the exact action, and on which machine. One push per new block.
+Units tell you, and you push; the machine-config session (natedev, macbook)
+pushes for blocks it owns. Each block has one owner. User, 2026-10-04, after a
+rebuild waited 1.5 h with no push.
+
 | Priority | When |
 | --- | --- |
 | 2: emergency, repeats every 5 min until the user taps Acknowledge | Work has stopped, and only the user can restart it: a block under <Dependencies/> rule 6, after steps 1–2, carrying the exact action; a cold gpg-agent stopping every push (the user runs `github-warmup`). Send once per block. |
