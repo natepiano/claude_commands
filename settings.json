@@ -51,7 +51,7 @@
       "Read(/private/tmp*)",
       "mcp__brp",
       "Bash(~/.claude/scripts/berth_fix/*)",
-      "Bash(zsh ~/.claude/scripts/production/showrunner_timer.sh *)",
+      "Bash(zsh ~/.claude/scripts/delegate/unit_notifier.sh *)",
       "Bash(bash ~/.claude/scripts/delegate/verify.sh *)",
       "Bash(bash ~/.claude/scripts/delegate/progress_timer.sh *)",
       "Bash(zsh ~/.claude/scripts/message/notifier.sh *)",
@@ -188,10 +188,6 @@
           {
             "type": "command",
             "command": "\"$HOME/.claude/scripts/lib/py\" \"$HOME/.claude/scripts/hooks/stop-delegate-continue.py\""
-          },
-          {
-            "type": "command",
-            "command": "\"$HOME/.claude/scripts/lib/py\" \"$HOME/.claude/scripts/hooks/stop-delegate-progress-timer.py\""
           },
           {
             "type": "command",
