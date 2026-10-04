@@ -41,7 +41,7 @@ State:
 <Throughout>
 - **Time.** Before writing any time, run
   `TZ=<ZONE> date '+%H:%M %Z'`. Give every time in `ZONE` only, never UTC (user,
-  2026-10-02). Unit directors state times in the machine's zone; convert them to `ZONE`.
+  2026-10-02). Unit directors state times in `ZONE` (user, 2026-10-04); convert any that arrive in another zone.
 - **Log.** Write one line per event in `LOG`: `- HH:MM <zone>: <event>`. Every
   ten events, and before a compaction, add a `### STATE <time>` block. It gives:
   - each unit's phase, last merged checkpoint and what it waits on;

@@ -4,7 +4,7 @@ description: Answer a question about build, lint, test and CI timings, failures 
 
 `$ARGUMENTS` is the question.
 
-Empty, or only a date → run `~/.claude/scripts/buildlog/buildlog report [YYYY-MM-DD]` (default today) and show its markdown unchanged. Add at most one line after it, only for something the tables do not show.
+Empty, or only a date → run `TZ=America/Los_Angeles ~/.claude/scripts/buildlog/buildlog report [YYYY-MM-DD]` (default today; the user reads PDT) and show its markdown unchanged. Add at most one line after it, only for something the tables do not show.
 Then run `python3 ~/.claude/scripts/production/review_regime.py watch` and show its line under the report, unless it starts `acknowledged`. On exit 3, also run `~/.claude/scripts/notify/pushover.py --priority 1 "Hana: review watch" "<the line>"`. User, 2026-10-04: every build report shows the 12-phase review watch until the user acknowledges it; drop this paragraph once it reads `acknowledged`.
 
 Otherwise:

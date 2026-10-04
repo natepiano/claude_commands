@@ -244,8 +244,9 @@ branch, port and the files you own.
 11. **Updates.** Each progress update is the recorder's `Phase <N> ETA: <time>,
     <P>% done (range <low>–<high>)` (P is the phase row's `%` and the range its
     ETA low and high in the recorder's summary) and the turn-end line, nothing
-    more. The showrunner converts times into the
-    user's zone. When the showrunner asks for `/unit:eta`, run it at once.
+    more. Every time is in the production doc's **User zone**: convert the
+    recorder's machine times (`TZ=<zone> date -d <time> '+%H:%M %Z'`). User,
+    2026-10-04. When the showrunner asks for `/unit:eta`, run it at once.
 12. **Visual choices go to the showrunner.** Wording, spacing, layout, and
     which of two working options looks better are the showrunner's calls, made
     from the **UX guide**. Ask the showrunner, never the user. The showrunner
