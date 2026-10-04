@@ -67,6 +67,19 @@
       ]
     },
     {
+      "root": "scripts/production",
+      "extraPaths": [
+        "scripts/production",
+        "scripts/build_hold"
+      ]
+    },
+    {
+      "root": "scripts/build_hold",
+      "extraPaths": [
+        "scripts/build_hold"
+      ]
+    },
+    {
       "root": "."
     }
   ]
