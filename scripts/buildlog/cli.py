@@ -8,7 +8,7 @@
   buildlog tree-key [DIR]           the tree key of DIR's worktree (default the current folder; treekey.py)
   buildlog sync                     exchange records with the Mac (natedev's hourly job)
   buildlog ci                       record new GitHub Actions run attempts
-  buildlog hourly                   sync, then ci, each whatever the other did
+  buildlog hourly                   sync, ci, then Rust release check
   buildlog backfill-verify [LEDGER] copy verify.sh's old events.jsonl ledger in, once
 
 Records live in ~/.local/state/buildlog (BUILDLOG_DIR moves it); see store.py.
@@ -28,6 +28,7 @@ import ci
 import index
 import record
 import report
+import rust_release
 import store
 import sync
 import treekey
@@ -176,7 +177,7 @@ def day_report(args: list[str]) -> int:
 
 def hourly() -> int:
     status = 0
-    for name, job in (("sync", sync.sync), ("ci", ci.ci)):
+    for name, job in (("sync", sync.sync), ("ci", ci.ci), ("rust release", rust_release.check_release)):
         try:
             status |= job()
         except Exception as error:  # noqa: BLE001 -- one job's failure must not cost the other its run

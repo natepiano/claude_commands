@@ -15,6 +15,7 @@ from unittest import mock
 
 import index
 import report
+import rust_release
 from test_index import STAMP, Record, call, ci_job, ci_run, encode, local_day, point_root_at, step
 
 
@@ -37,6 +38,69 @@ class ReportTests(unittest.TestCase):
         _ = index.update()
         with closing(index.read_only()) as connection:
             return report.report(connection, day or local_day(STAMP))
+
+    def write_release(self, trial: rust_release.TrialOutcome, pin: str | None = "1.99.0") -> None:
+        state: rust_release.ReleaseState = {
+            "check_day": "2026-11-12",
+            "stable_version": "1.100.0",
+            "release_date": "2026-11-12",
+            "pin": pin,
+            "trial": trial,
+            "text_sent": True,
+        }
+        rust_release.write_state(state)
+
+    def test_report_shows_finished_rust_trial_line_once(self) -> None:
+        self.write_release({
+            "status": "finished", "version": "1.100.0", "warnings": 7, "warning_crates": 3,
+            "errors": 0, "error_crates": 0, "mend_builds": True, "target_gib": 1.5, "mend_target_gib": 0.5,
+        })
+        lines = self.render().splitlines()
+        expected = "Rust 1.100.0 out since 11-12; hana on 1.99.0. Trial: 7 new warnings in 3 crates, cargo-mend builds."
+        self.assertEqual(1, lines.count(expected))
+
+    def test_report_shows_waiting_rust_trial_reason(self) -> None:
+        self.write_release({"status": "waiting", "version": "1.100.0", "reason": "513 GiB free, needs 550"})
+        self.assertIn(
+            "Rust 1.100.0 out since 11-12; hana on 1.99.0. Trial: waiting, 513 GiB free, needs 550.",
+            self.render().splitlines(),
+        )
+
+    def test_report_shows_failed_rust_trial_step_and_reason(self) -> None:
+        self.write_release({
+            "status": "failed", "version": "1.100.0", "step": "clippy", "reason": "error: clippy broke",
+            "target_gib": 1.5, "mend_target_gib": 0,
+        })
+        self.assertIn(
+            "Rust 1.100.0 out since 11-12; hana on 1.99.0. Trial: failed, clippy: error: clippy broke.",
+            self.render().splitlines(),
+        )
+
+    def test_report_omits_rust_line_without_state_or_after_pin_catches_up(self) -> None:
+        self.assertNotIn("Rust 1.100.0 out", self.render())
+        self.write_release({"status": "waiting", "version": "1.100.0", "reason": "awaiting quiet hours"}, pin="1.100.0")
+        self.assertNotIn("Rust 1.100.0 out", self.render())
+
+    def test_report_shows_finished_rust_errors_and_mend_result(self) -> None:
+        for mend_builds, mend_text in ((True, "cargo-mend builds"), (False, "cargo-mend does not build")):
+            with self.subTest(mend_builds=mend_builds):
+                self.write_release({
+                    "status": "finished", "version": "1.100.0", "warnings": 2, "warning_crates": 1,
+                    "errors": 1, "error_crates": 1, "mend_builds": mend_builds,
+                    "target_gib": 1.5, "mend_target_gib": 0.5,
+                })
+                self.assertIn(
+                    f"Rust 1.100.0 out since 11-12; hana on 1.99.0. Trial: 2 new warnings in 1 crate, 1 error in 1 crate, {mend_text}.",
+                    self.render().splitlines(),
+                )
+
+    def test_report_omits_rust_line_while_pin_is_absent(self) -> None:
+        self.write_release({
+            "status": "finished", "version": "1.100.0", "warnings": 0, "warning_crates": 0,
+            "errors": 0, "error_crates": 0, "mend_builds": True,
+            "target_gib": 0, "mend_target_gib": 0,
+        }, pin=None)
+        self.assertNotIn("Rust 1.100.0 out", self.render())
 
     def test_test_builds_split_whole_package_and_filter_calls_with_daily_hours_and_p75(self) -> None:
         started_at = "2026-10-04T12:00:00Z"
