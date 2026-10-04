@@ -8,16 +8,18 @@ Read at the point of use from `/unit:delegate`. Defines `<DualReview/>`,
 completes, or when `<EarlyReviewArm/>` arms a reviewer.
 
 <TeamReview>
-A phase's broad review runs **three reviewers at once**, never one — and never
+A phase's broad review runs **two reviewers at once**, never one — and never
 two readings of the same question, which buys one opinion twice. Each takes a
 **lens**, disjoint and named in its prompt; the main review per <DualReview/>
-is the fourth reader:
+is the third reader:
 
 | Lens | Reads for | Seat |
 | --- | --- | --- |
 | `adversary` | the failing case — the input that violates a stated invariant, the caller that was not updated, the state the new code cannot reach, the test that passes for the wrong reason | `test` |
 | `contract` | what the Work Order says, including every part no test covers, and anything built that it never asked for; then what the change reaches without naming — callers, consumers, public API, traits, registration, plugin wiring, invariants and transitions | `impl` |
-| `craft` | the diff's code quality alone, judged by the three gods and the Rust style guide — names, idiom, needless concepts or layers, wasted work where code runs often; in an API, the two means that most often serve the gods, ergonomics and type-system leverage | `review` |
+
+The `craft` lens is off since 2026-10-04 (user: review trial ended); the run's
+style review still audits style.
 
 No reviewer wrote any of the code — each is a fresh session per
 <ReviewPromptContract/> — so no lens has to be kept away from its own work and
@@ -34,12 +36,12 @@ only reading here that produces evidence by finding nothing.
 
 Findings come back as one `review_findings_<pass>_<lens>.txt` per lens. A
 read-only session cannot post to the board, so that file is the whole record —
-<Synthesize/> reads every lens file, tags each finding with the lens that
-caught it, and can tell two independent findings from one finding found twice.
+<Synthesize/> reads both, tags each finding with the lens that caught it, and
+can tell two independent findings from one finding found twice.
 
 **A repair is not reviewed this way.** <ClosureReview/> is one reader over one
-batch of ids, and splitting a path-limited read by lens buys several passes
-over the same few hunks.
+batch of ids, and splitting a path-limited read two ways buys two passes over
+the same few hunks.
 </TeamReview>
 
 <ReviewPromptContract>
@@ -47,9 +49,9 @@ Every reviewer is a fresh read-only session. It narrates each activity as a
 short output line so the wrapper heartbeat remains live. It does not receive a
 heartbeat path and never receives `${IMPL_SUMMARY}`.
 
-Do not repeat the implementer's listed verification. Only the `craft` lens
-audits style. A reviewer may run one specific omitted check only when a
-plausible regression lies outside the listed gate, and must name that command. Broad reviews apply
+Do not repeat the implementer's listed verification or audit style. A reviewer
+may run one specific omitted check only when a plausible regression lies outside
+the listed gate, and must name that command. Broad reviews apply
 <TypeDesignContract/>; closure reviews apply only <ClosureReview/>.
 
 A broad review's prompt names its lens per <TeamReview/> and asks that lens's
@@ -73,8 +75,8 @@ End with APPROVE, APPROVE WITH FIXES, or REQUEST CHANGES. Do not invent findings
 ## Your lens
 [the lens name and what it reads for, from <TeamReview/>]
 
-Two other reviewers are reading this same diff under the other lenses. Report
-only what yours covers: a finding another lens owns is that lens's to
+Another reviewer is reading this same diff under the other lens. Report only
+what yours covers: a finding another lens owns is that lens's to
 make, and duplicating it costs the synthesis a second opinion and buys a
 count instead.
 
@@ -107,21 +109,6 @@ The questions are the lens, so each prompt carries only its own:
   — and what there still assumes an invariant or state transition it changed?
   4. Consistent with surrounding code? 5. Are domain types clear, and are owned
   bare Option<T> values replaced or justified at an external boundary?
-- `craft` — 1. Where is the code more complex than the work needs — a concept,
-  layer, or public item it could drop? 2. Where does it waste work in code that
-  runs often? 3. Which names, idioms or structure break the style guide (cite
-  the rule stem)? Before answering, load the guide:
-  `zsh ~/.claude/scripts/rust_style/load-rust-style.sh --project-root <concrete WORKING_DIR>`.
-  If its output is cut short or saved to a file, read the saved file, or list
-  the files with `--list-files` and read each. With no Rust in the diff, judge
-  by the gods alone.
-
-The `craft` prompt replaces the template's `nit` line:
-
-```
-- nit: taste no rule or god backs. Style-guide conformance is in scope: a
-  broken style rule, named by its stem, or a god the code fails is minor.
-```
 
 **Early form** (an <EarlyReviewArm/> launch, which arms the `adversary` alone):
 the `## Diff` section holds the partial diff at launch, and an
@@ -155,13 +142,13 @@ of reviewing the partial diff.
    completed tree, deliver the final diff and ready sentinel per
    <EarlyReviewArm/>, reset `EARLY_REVIEW=none`, and keep
    `${REVIEW_DISPATCH_HANDLE}` as that lens's handle. Otherwise increment
-   `${REVIEW_PASS}`. Pass 1 is the phase's broad review and runs the three
+   `${REVIEW_PASS}`. Pass 1 is the phase's broad review and runs the two
    lenses of <TeamReview/> over <BroadReviewPrompt/>; later passes are one
    reviewer over one repair, per <ClosureReview/>.
 2. Apply <ReviewDiffContract/> and create every prompt the pass needs.
 3. Launch each reviewer under <DispatchContract/>, pass 1's in one message so
-   they run concurrently — `contract` and `craft` when the adversary was armed
-   early, all three otherwise:
+   they run concurrently — `contract` alone when the adversary was armed early,
+   both otherwise:
 
    ```sh
    bash ~/.claude/scripts/delegate/review.sh "${SESSION_DIR}" "${WORKING_DIR}" \
@@ -203,8 +190,8 @@ of reviewing the partial diff.
    `review_findings_${REVIEW_PASS}_<lens>.txt` — a closure review, its unnumbered
    symlink — into `${AGENT_REVIEW}`. A lens that reports `error` is named in one
    line and the pass continues on the readings that landed, so the synthesis
-   records which lens is missing rather than presenting the rest as all three.
-   Numbered artifacts remain available.
+   records which lens is missing rather than presenting one as two. Numbered
+   artifacts remain available.
 </DualReview>
 
 <ClosureReview>

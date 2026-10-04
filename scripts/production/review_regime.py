@@ -1,24 +1,31 @@
 #!/usr/bin/env python3
-"""Track whether the review regime trial pays for itself.
+"""Track whether the extra review seats pay for themselves.
 
 Usage:
-  review_regime.py add --unit <unit> --phase <N> --regime before|trial
+  review_regime.py add --unit <unit> --phase <N> --regime before|trial|after
                        --started <ISO> --merged <ISO> --holds <K> --merge-defects <D>
                        [--ux-findings <N>] [--code-findings <N>] [--review-minutes <M>]
                        [--note <text>]
   review_regime.py report [--since <ISO date>]
+  review_regime.py watch
+  review_regime.py ack
 
-The trial (user decision 2026-10-01) adds a UX reviewer to every phase that
-changes the screen and a code-quality reviewer to every phase, both judging by
-the three gods in ~/.claude/docs/decision_criteria.md. The showrunner adds one
-row per merged phase; `report` compares the phases before the trial with the
-phases under it:
+The trial (user decision 2026-10-01) added a UX reviewer to every phase that
+changes the screen and a code-quality reviewer (the `craft` lens) to every
+phase, both judging by the three gods in ~/.claude/docs/decision_criteria.md.
+It ended 2026-10-04 (user decision): the code-quality reviewer was dropped, and
+a phase started after that is `after`. The showrunner adds one row per merged
+phase; `report` compares the phases before, under and after the trial:
 
 - better: fewer holds at merge and fewer defects found by the merge design check;
 - cost: longer phases (start to merge) and more review-seat minutes.
 
 `holds` counts the checkpoints of the phase the showrunner held; `merge-defects`
 counts the defect rows across all of that phase's merge design checks.
+
+`watch` counts `after` phases toward WATCH_PHASES. Once the count is reached it
+exits 3, the report waiting for the user, until `ack` records their
+acknowledgment.
 """
 
 import argparse
@@ -32,7 +39,12 @@ from pathlib import Path
 from typing import cast
 
 LEDGER = Path.home() / ".claude/data/review_regime.jsonl"
-REGIMES = ("before", "trial")
+WATCH = Path.home() / ".claude/data/review_regime_watch.json"
+REGIMES = ("before", "trial", "after")
+# User decision 2026-10-04: the `after` phases watched before the report goes to the user.
+WATCH_PHASES = 12
+# `watch` exits with this while the finished report waits for the user's acknowledgment.
+WAITING_FOR_ACKNOWLEDGMENT = 3
 
 
 @dataclass(frozen=True)
@@ -126,11 +138,11 @@ def median_of(values: list[float]) -> str:
 
 def report(since: str | None) -> None:
     rows = [row for row in read_rows() if since is None or row.merged >= since]
-    lines = ["| | before | trial |", "| --- | --- | --- |"]
+    lines = [f"| | {' | '.join(REGIMES)} |", "| --- " * (len(REGIMES) + 1) + "|"]
     groups = {regime: [row for row in rows if row.regime == regime] for regime in REGIMES}
 
     def line(name: str, value: Callable[[list[Row]], str]) -> None:
-        lines.append(f"| {name} | {value(groups['before'])} | {value(groups['trial'])} |")
+        lines.append(f"| {name} | {' | '.join(value(groups[regime]) for regime in REGIMES)} |")
 
     line("phases merged", lambda group: str(len(group)))
     line("holds per phase (mean)", lambda group: mean_of([float(row.holds) for row in group]))
@@ -143,6 +155,40 @@ def report(since: str | None) -> None:
     line("UX reviewer findings per phase (mean)", lambda group: mean_of([float(row.ux_findings) for row in group if row.ux_findings is not None]))
     line("code reviewer findings per phase (mean)", lambda group: mean_of([float(row.code_findings) for row in group if row.code_findings is not None]))
     print("\n".join(lines))
+
+
+def watched_phases() -> int:
+    return sum(1 for row in read_rows() if row.regime == "after")
+
+
+def acknowledged() -> str | None:
+    if not WATCH.exists():
+        return None
+    moment = cast(dict[str, object], json.loads(WATCH.read_text())).get("acknowledged")
+    return moment if isinstance(moment, str) else None
+
+
+def watch() -> int:
+    moment = acknowledged()
+    if moment is not None:
+        print(f"acknowledged {moment}")
+        return 0
+    merged = watched_phases()
+    if merged < WATCH_PHASES:
+        print(f"{merged} of {WATCH_PHASES} phases merged without the extra code reviewer")
+        return 0
+    print(f"{WATCH_PHASES} of {WATCH_PHASES} phases merged without the extra code reviewer: report ready, waiting for your acknowledgment")
+    return WAITING_FOR_ACKNOWLEDGMENT
+
+
+def ack() -> None:
+    merged = watched_phases()
+    if merged < WATCH_PHASES:
+        raise SystemExit(f"review_regime: the watch has {merged} of {WATCH_PHASES} phases; nothing to acknowledge yet")
+    moment = datetime.now().astimezone().isoformat(timespec="minutes")
+    WATCH.parent.mkdir(parents=True, exist_ok=True)
+    _ = WATCH.write_text(json.dumps({"acknowledged": moment}) + "\n")
+    print(f"acknowledged {moment}")
 
 
 def main() -> int:
@@ -162,11 +208,18 @@ def main() -> int:
     _ = adding.add_argument("--note")
     reporting = commands.add_parser("report")
     _ = reporting.add_argument("--since", help="only phases merged on or after this ISO date; design checks began 2026-09-28")
+    _ = commands.add_parser("watch", help=f"count `after` phases toward {WATCH_PHASES}; exit {WAITING_FOR_ACKNOWLEDGMENT} while the report waits for the user")
+    _ = commands.add_parser("ack", help="record the user's acknowledgment of the finished watch")
     arguments = parser.parse_args()
-    if cast(str, arguments.command) == "add":
+    command = cast(str, arguments.command)
+    if command == "add":
         add(arguments)
-    else:
+    elif command == "report":
         report(cast(str | None, arguments.since))
+    elif command == "watch":
+        return watch()
+    else:
+        ack()
     return 0
 
 

@@ -401,17 +401,20 @@ Input: the unit, phase, hash and shots from its notice.
     - run <CrossUnitChange/> when the change renamed or removed public items,
       or restructured files;
     - after every fifth merge since the last CI point, run <CIPoint/>.
-    - record the phase for the review trial:
-      `python3 ~/.claude/scripts/production/review_regime.py add --unit <unit> --phase <N> --regime trial --started <ISO> --merged <ISO> --holds <K> --merge-defects <D> --ux-findings <N> --code-findings <N> --review-minutes <M>`.
+    - record the phase in the review ledger:
+      `python3 ~/.claude/scripts/production/review_regime.py add --unit <unit> --phase <N> --regime after --started <ISO> --merged <ISO> --holds <K> --merge-defects <D> --ux-findings <N> --code-findings <N> --review-minutes <M>`.
       `holds` counts this phase's held checkpoints and `merge-defects` the
       defect rows of all its design checks, both from `LOG`; the last three come
-      from the unit's `review trial:` checkpoint line. A phase started before
-      the unit's trial began is `--regime before`. After every sixth trial row,
-      run `review_regime.py report --since 2026-09-28` (design checks began
-      then) and give the user the table with one line
-      on whether the trial pays for itself. User decision 2026-10-01: a UX
-      reviewer and a code reviewer in every phase, kept only if they cut holds
-      and merge defects for less than they add in time.
+      from the unit's `review trial:` checkpoint line. A phase already running
+      when its unit got the 2026-10-04 relay (code reviewer dropped) is
+      `--regime trial`.
+    - then run `review_regime.py watch` (user decision 2026-10-04: watch 12
+      phases without the code reviewer). The first time it exits 3, run
+      `report --since 2026-09-28`, push at once
+      (`~/.claude/scripts/notify/pushover.py --priority 1 "Hana: review watch" "<one line; the table is in this session>"`),
+      log it, and give the user the table. While it exits 3, every dailies
+      pushes again and its `Review watch` topic needs the user. Run
+      `review_regime.py ack` only on the user's own acknowledgment.
 </MergeCheckpoint>
 
 ---
