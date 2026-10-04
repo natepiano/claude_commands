@@ -380,8 +380,10 @@ Input: the unit, phase, hash and shots from its notice.
      `git -C CHECKOUT reset --keep HEAD~1`. Send the unit director the failing
      tests and the log path.
 10. **Green.** Push through CI's mend, rustfmt and taplo checks, which the tests
-    above do not cover. With `dangerouslyDisableSandbox: true`, run in the
-    background:
+    above do not cover. Before this push, check for an older queued or running
+    CI run on the merge branch. Add `--cancel-prior` when this push supersedes
+    it and no CI point is watching its result or diagnosing a red run. With
+    `dangerouslyDisableSandbox: true`, run in the background:
 
     ```sh
     bash ~/.claude/scripts/validate_and_push/validate_and_push.sh --quick \
@@ -482,8 +484,11 @@ the rule to the guide.
 ---
 
 <CIPoint>
-Validation needs a clean tree, so merge nothing while it runs. With
-`dangerouslyDisableSandbox: true`, run in the background:
+Validation needs a clean tree, so merge nothing while it runs. Before this
+push, check for an older queued or running CI run on the merge branch. Add
+`--cancel-prior` when this push supersedes it and no CI point is watching its
+result or diagnosing a red run. With `dangerouslyDisableSandbox: true`, run in
+the background:
 
 ```sh
 bash ~/.claude/scripts/validate_and_push/validate_and_push.sh \
