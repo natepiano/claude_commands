@@ -101,15 +101,18 @@ State:
   pasted word for word, with:
   - `--next-run <HH:MM>`: `next_due` from `NOTIFIER status UPDATES` in `ZONE`,
     never from memory (user, 2026-10-02); left out when no schedule runs.
-  - `--build-hold-release <release>`: only while a build hold runs, one you
-    placed or one you hold your units for: the release ETA the session timing
-    under it stated, `HH:MM` or `HH:MM+N`, or a dailies `eta` none text when it
-    stated none; never made up. Dropped once the hold is released.
+  - `--build-hold-since <HH:MM> --build-hold-for <text> --build-hold-release <release>`,
+    all three, only while a build hold runs, one you placed or one you hold
+    your units for: its start; what it is for, written to follow "for"; and the
+    release ETA the session timing under it stated, `HH:MM` or `HH:MM+N`, or a
+    dailies `eta` none text when it stated none, never made up. Dropped once
+    the hold is released.
   - `--nothing-needed`: when no subject needs a follow-up nobody has started.
 
-  It prints `build hold - release eta: 11:40 PDT (3 minutes)` while a hold
-  runs, then `11:37 PDT · next dailies 11:53 PDT - nothing needed`. A dailies
-  report ends with the same footer, from its input. User, 2026-10-04.
+  It prints `build hold: since 11:34 PDT, for the frame-time lane's breakdown
+  of what each added tool costs - release eta: 11:40 PDT (3 minutes)` while a
+  hold runs, then `11:37 PDT · next dailies 11:53 PDT - nothing needed`. A
+  dailies report ends with the same footer, from its input. User, 2026-10-04.
 </Throughout>
 
 ---
