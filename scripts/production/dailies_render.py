@@ -77,13 +77,14 @@ BLUE = "🟦"
 BLANK = "  "
 # The `ascii` chart: only characters a code font has, so the desktop app keeps
 # every row aligned, which it cannot with the coloured squares (user,
-# 2026-10-03: the coloured chart by default, this one when remote).
+# 2026-10-03: the coloured chart by default, this one when remote). The app's
+# code font, Anthropic Mono, has `─`, `━` and `●` on one centre line but no
+# `┼` or `┤`; those came from another font, 2-3 px lower (2026-10-04). So a
+# heavy line marks the earliest-to-latest range instead of crossbars.
 LINE = "──"
-CROSS = "┼─"
+BAND = "━━"
 DOT = "● "
-DOT_RANGED = "●·"
-DOTS = "··"
-CAP = "┤ "
+DOT_RANGED = "●━"
 # The chart mode every showrunner's dailies use, kept in one file so no
 # session has to remember it (user, 2026-10-03). `--chart` sets it.
 CHART_CONF = Path.home() / ".local/state/showrunner/dailies.conf"
@@ -228,6 +229,7 @@ class ChartStyle:
 
     run: str
     earliest: str
+    before_eta: str
     eta: str
     eta_ranged: str
     range_fill: str
@@ -236,8 +238,8 @@ class ChartStyle:
 
 
 CHART_STYLES = {
-    "default": ChartStyle(WHITE, GREEN, BLUE, BLUE, BLANK, RED, show_range=True),
-    "ascii": ChartStyle(LINE, CROSS, DOT, DOT_RANGED, DOTS, CAP, show_range=False),
+    "default": ChartStyle(WHITE, GREEN, WHITE, BLUE, BLUE, BLANK, RED, show_range=True),
+    "ascii": ChartStyle(LINE, BAND, BAND, DOT, DOT_RANGED, BAND, BAND, show_range=False),
 }
 
 
@@ -286,7 +288,7 @@ def window_start(now: datetime, rows: list[Row]) -> datetime:
 
 
 def draw(now: datetime, rows: list[Row], style: ChartStyle) -> list[str]:
-    """24 hourly cells in `style`: the run from the phase's start (or the left edge) to the ETA, marks at the earliest time, the ETA and the latest, and the range filled between the ETA and the latest; `→` past the right edge; a start before the left edge is written before the cells."""
+    """24 hourly cells in `style`: the run from the phase's start (or the left edge) to the ETA, marks at the earliest time, the ETA and the latest, and `before_eta` and `range_fill` cells between them; `→` past the right edge; a start before the left edge is written before the cells."""
     start = window_start(now, rows)
 
     def column(moment: datetime) -> int:
@@ -322,7 +324,10 @@ def draw(now: datetime, rows: list[Row], style: ChartStyle) -> list[str]:
             cells[index] = style.run
         ranged = (estimate.earliest, estimate.latest) != (estimate.eta, estimate.eta)
         if ranged and column(estimate.earliest) <= last:
-            cells[max(0, column(estimate.earliest))] = style.earliest
+            earliest_cell = max(0, column(estimate.earliest))
+            cells[earliest_cell] = style.earliest
+            for index in range(earliest_cell + 1, eta_cell):
+                cells[index] = style.before_eta
         # The ETA takes the earliest time's cell when the two share an hour;
         # the latest keeps its own.
         cells[eta_cell] = style.eta_ranged if ranged and latest_cell > eta_cell else style.eta

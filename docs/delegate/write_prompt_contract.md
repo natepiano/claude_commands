@@ -50,6 +50,8 @@ Every implementation or fix prompt contains these sections once:
    delegate-facing prohibition: never mention, request, or acquire the cargo
    token. State the one rule plainly: **a question to a peer is a message, a
    decision is a board post**, and the board has no `ask` kind to fall back on.
+   State too: **say where anything you pass to a peer came from**; only the unit
+   director relays the user's words, labelled as the user's. User, 2026-10-04.
    Give this slot its own mesh name, its peer's name, the call that reaches
    it, and — on the claude path — the unit director's name from
    `ListAgents`, per <PhaseMesh/>. An address a member has to go looking for is
@@ -57,8 +59,9 @@ Every implementation or fix prompt contains these sections once:
    command line with the concrete `--session-dir` already filled in, not a
    description of it. A slot whose register line says `mesh=none` has no peer
    channel at all: say so, and tell it to read the board rather than wait on a
-   reply. A repair's lone seat per <FixDispatch/> has no peer: its `## Team`
-   carries only its file set and the token prohibition.
+   reply. A repair seat per <FixDispatch/> has no peer: its `## Team` carries
+   its file set, the other repair seats' files as read only, and the token
+   prohibition.
 5. `## Project Context`.
 6. `## Work Specification`.
 7. `## Type Design Contract` per <TypeDesignContract/>.

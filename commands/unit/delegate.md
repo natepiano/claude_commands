@@ -927,17 +927,19 @@ file/line findings and intended behavior. Verification contains only implicated
 `verify.sh` lines—usually check and test, adding lint only for lint-related
 repairs.
 
-A repair runs **one seat**: slot `impl`, task and kind `fix`. It makes the
-repair and writes, for each testable finding, the regression test that would
+A repair runs **one seat per file set no other seat touches**: when the failing
+tests or findings split that way, always run as many seats as you can reasonably
+manage; otherwise one. User, 2026-10-04. The first is slot `impl`, the rest
+`fix2`, `fix3`…, each task and kind `fix`, each with its own
+`fix_prompt_${FIX_ROUND}[_<slot>].md`. Each seat makes its repair and writes, for each testable finding, the regression test that would
 have caught it — one that fails without the repair. A finding about what is
 drawn gets a test that renders and reads the pixels back, or a live pixel check
 the prompt names; a test of components, constants or hand-written pointer hits
 does not count. It names each test for the behavior it pins and puts the
 finding id only in its summary; an id in code outlives the review that defined
 it. <ClosureReview/> is the cold read, so no seat is spent
-on one here. Its file set is the findings' files plus the test targets. When a
-round runs parallel seats (a showrunner ruling), both prompts name one owner for
-each file or surface the seats share.
+on one here. A seat's file set is its findings' files plus their test targets;
+its prompt names every other seat's files as read only.
 
 Run `findings.py dispatch --covers <all batch ids>` before launching, then:
 
@@ -949,6 +951,8 @@ PLAN_DELEGATE_RESOLVES_ROUND=1 implement.sh "${SESSION_DIR}" "${WORKING_DIR}" \
 
 **`PLAN_DELEGATE_RESOLVES_ROUND=1` is what lets the launcher resolve the round**:
 only the launcher watches the worker exit, so only it can say a repair landed.
+Each further seat runs the same call with `PLAN_DELEGATE_RESOLVES_ROUND=0`, its
+own prompt and its slot; the round is done only once every seat has exited.
 
 Apply <DispatchContract/>; set `EARLY_REVIEW=none` at dispatch, and close the
 turn with the progress header per <DelegationResultFormat/>. While a fix runs
