@@ -259,15 +259,11 @@ invoke_clippy() {
 #   active  clippy-linked and built for the host rustc
 #   absent  plain cargo-mend, one too old for the flag, or none: today's flow
 #   stale   built for another rustc, or no longer loads (a toolchain update
-#           removed the librustc_driver it links): stock clippy runs, and the
-#           user gets one alert per host rustc
-# LINT_ALERT_SENDER replaces pushover.py, for tests; the stamps live under
-# XDG_STATE_HOME.
+#           removed the librustc_driver it links): stock clippy runs, and
+#           mend_rebuild.sh rebuilds it in the background
+# MEND_CLIPPY_REBUILD replaces mend_rebuild.sh, for tests.
 MEND_CLIPPY_STATE=""
-# shellcheck disable=SC2088 # shown to the user, not expanded
-MEND_CLIPPY_INSTALL="~/rust/cargo-liner/crates/cargo-mend-clippy/install.sh"
-LINT_PUSHOVER="$HOME/.claude/scripts/notify/pushover.py"
-LINT_ALERT_SENDER="${LINT_ALERT_SENDER:-$LINT_PUSHOVER}"
+MEND_CLIPPY_REBUILD="${MEND_CLIPPY_REBUILD:-$HOME/.claude/scripts/lint/mend_rebuild.sh}"
 
 mend_clippy_probe() {
     [[ -z "$MEND_CLIPPY_STATE" ]] || return 0
@@ -277,35 +273,37 @@ mend_clippy_probe() {
         MEND_CLIPPY_STATE=active
     elif [[ "$out" == *'"clippy":"rustc_mismatch"'* ]]; then
         MEND_CLIPPY_STATE=stale
-        mend_clippy_alert "cargo-mend's clippy was built for another rustc"
+        mend_clippy_rebuild "cargo-mend's clippy was built for another rustc"
     elif [[ "$out" == *"error while loading shared libraries"* || "$out" == *"Library not loaded"* ]]; then
         MEND_CLIPPY_STATE=stale
-        mend_clippy_alert "cargo-mend no longer loads"
+        mend_clippy_rebuild "cargo-mend no longer loads"
     else
         MEND_CLIPPY_STATE=absent
     fi
 }
 
-# The run that creates the stamp sends the alert, detached so the lint never
-# waits on the network; a failed send removes the stamp for a later run. The
-# Pushover keys exist only on natedev.
-mend_clippy_alert() {
-    local what=$1 host dir stamp
+# Starts mend_rebuild.sh in a session of its own (setsid, or perl's on the Mac,
+# which has no setsid) and orphaned, so the lint never waits for the build and
+# an interrupted lint does not end it. The script takes a lock, builds at most
+# once an hour and alerts the user only when it cannot rebuild. A lint inside
+# the Claude Code sandbox (SANDBOX_RUNTIME=1) starts nothing: the sandbox can
+# refuse the ssh fetch and the writes to ~/.cache for its own reasons, so the
+# next lint outside it rebuilds.
+mend_clippy_rebuild() {
+    local what=$1 host log
     host="$("${RUSTC:-rustc}" -V 2>/dev/null)" || host=""
     host="${host:-unknown rustc}"
-    echo "invoke.sh: $what ($host); stock clippy runs. The user reinstalls it with $MEND_CLIPPY_INSTALL" >&2
-    dir="${XDG_STATE_HOME:-$HOME/.local/state}/mend-clippy"
-    stamp="$dir/alerted-$(printf '%s' "$host" | tr -c 'A-Za-z0-9.' '-')"
-    mkdir -p "$dir" 2>/dev/null || return 0
-    ( set -C; : > "$stamp" ) 2>/dev/null || return 0
-    local -a send=("$LINT_ALERT_SENDER" --priority 1 "lint: cargo-mend needs a reinstall"
-        "$what ($host). Run $MEND_CLIPPY_INSTALL")
-    if [[ "$LINT_ALERT_SENDER" == "$LINT_PUSHOVER" && "$(uname -s)" == Darwin ]]; then
-        # shellcheck disable=SC2088 # the tilde is for natedev's shell
-        send=(ssh -o BatchMode=yes -o ConnectTimeout=10 natedev
-            "~/.claude/scripts/notify/pushover.py $(printf '%q ' "${send[@]:1}")")
+    if [[ "${SANDBOX_RUNTIME:-}" == 1 ]]; then
+        echo "invoke.sh: $what ($host); stock clippy runs. The next lint outside the Claude Code sandbox rebuilds it" >&2
+        return 0
     fi
-    ( trap '' HUP; "${send[@]}" || rm -f "$stamp" ) </dev/null >/dev/null 2>&1 &
+    log="${XDG_STATE_HOME:-$HOME/.local/state}/mend-clippy/rebuild.log"
+    echo "invoke.sh: $what ($host); stock clippy runs. It rebuilds in the background, a minute or more, at most once an hour; log: $log" >&2
+    local -a detach=(setsid)
+    # shellcheck disable=SC2016 # perl expands these
+    command -v setsid >/dev/null 2>&1 ||
+        detach=(perl -MPOSIX -e 'POSIX::setsid(); exec { $ARGV[0] } @ARGV or die "exec $ARGV[0]: $!\n"' --)
+    ( trap '' HUP; "${detach[@]}" "$MEND_CLIPPY_REBUILD" </dev/null >/dev/null 2>&1 & )
 }
 
 invoke_mend() {
