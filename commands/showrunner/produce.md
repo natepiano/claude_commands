@@ -27,11 +27,10 @@ State:
 - `SCRATCH` — this session's scratchpad directory.
 - `LAST_MERGED[unit]` — the unit's last merged checkpoint. Read it from the
   merge commit subjects on `MERGE_BRANCH`, never from memory.
-- `TIMER_CONF` — the update timer's config,
-  `~/.local/state/showrunner/<slug>/timer.conf`, where `<slug>` is the
-  production doc's file name less `-production.md`. It belongs to the
-  production, not this session.
-- `TIMER` — `zsh ~/.claude/scripts/production/showrunner_timer.sh`.
+- `NOTIFIER` — `zsh ~/.claude/scripts/message/notifier.sh`.
+- `UPDATES` — `showrunner-<slug>`, where `<slug>` is the production doc's file
+  name less `-production.md`.
+- `PROMPT_FILE` — `~/.local/state/showrunner/<slug>/prompt.txt`.
 
 `<DecisionEconomy/>` is defined by this import:
 
@@ -93,8 +92,8 @@ State:
   it answers, report that ETA as `none measured - requested`.
 - **Every turn ends with** `— waiting on: <items>`, the user's items first.
 - **Next dailies.** Every reply to the user ends with the time now and the next
-  dailies report's time, in `ZONE`: `09:37 PDT · next dailies 09:53 PDT`. Read the next fire from `systemctl --user list-timers
-  showrunner-timer-<name>.timer --no-pager`, never from memory (user, 2026-10-02).
+  dailies report's time, in `ZONE`: `09:37 PDT · next dailies 09:53 PDT`. Read
+  `next_due` from `NOTIFIER status UPDATES`, never from memory (user, 2026-10-02).
 </Throughout>
 
 ---
@@ -124,8 +123,8 @@ On `resume`, or when the doc's status is `running`:
    `git -C CHECKOUT log --first-parent --format='%H %s' MERGE_BRANCH`,
    using the `Merge <unit> phase <N> (<hash>)` subjects.
 3. Check each unit director's session with `tmux has-session`.
-4. <StartUpdates/> registers this session in the doc again, and starts the
-   timer if a reboot removed it.
+4. <StartUpdates/> registers this session in the doc again and runs step 3 to
+   retarget the instance. A reboot needs nothing.
 </LoadProduction>
 
 ---
@@ -184,17 +183,13 @@ Tell the user one line per unit director: its session name, and `tmux attach -t 
 ---
 
 <StartUpdates>
-Updates come from a systemd timer outside this session, never Claude Code
-cron: cron ticks came minutes late while the session sat idle. Every N minutes,
-where N is the production doc's **Updates** interval (15 when the doc does not
-give one), the timer sends the prompt below through `send.py` (/message) to the
-session the doc's `**Showrunner session:**` line names.
+The declared notifier job sends updates outside this session. Every N minutes,
+where N is the production doc's **Updates** interval (15 when absent), it sends
+the prompt below through `send.py` (/message) to this session's ID.
 
-The timer belongs to the production, not this session. It keeps running when
-this session exits, and a resumed session is found through the doc. It stops
-at <Wrap/>, or at its first fire after the doc says `wrapped`. Each production
-has its own timer, config and log, so showrunners in other projects run beside
-it.
+The instance belongs to the production and keeps running when this session
+exits. On resume, retarget it. Remove it at <Wrap/>; its check removes it after
+the doc says `wrapped`. Each production has its own instance and log.
 
 Run these steps at the start and on every resume:
 
@@ -202,18 +197,14 @@ Run these steps at the start and on every resume:
    name, from the first line of ListAgents. If the line changed, commit the doc
    as `production(<name>): showrunner session <session name>`.
 2. **Prompt.** Fill the prompt below from the production doc and write it to
-   `prompt.txt` beside `TIMER_CONF`.
-3. **Config.** Write `TIMER_CONF`:
-
-   ```
-   PRODUCTION_DOC=<the production doc's absolute path>
-   ```
-
-   The other keys keep their defaults: the prompt file, `UNIT`
-   (`showrunner-timer-<slug>`), `LOG` (`fire.log`) and `TIMEOUT` (120 seconds).
-4. **Start.** Run `TIMER start TIMER_CONF`. It does nothing while the timer
-   runs. A reboot removes the timer, and this step brings it back.
-   `TIMER status TIMER_CONF` shows the next fire and the fire log.
+   `PROMPT_FILE`.
+3. **Register instance.** Run `NOTIFIER new UPDATES --to
+   session:$CLAUDE_CODE_SESSION_ID --every <N from the doc's **Updates:** line>
+   --prompt-file PROMPT_FILE --from showrunner-timer-<slug> --check "zsh
+   $HOME/.claude/scripts/production/production_check.sh <absolute doc path>"`.
+   A repeated `new` retargets without moving the clock.
+4. **Status.** Run `NOTIFIER status UPDATES` for the next tick and fire log.
+   The declared job runs the ticks.
 
 The prompt:
 
@@ -230,7 +221,7 @@ The prompt:
 > a unit director after its checkpoint (`/showrunner:produce` → Compact after a
 > checkpoint).
 
-**A tick** arrives as a cross-session message from the timer's `UNIT`, and its
+**A tick** arrives as a cross-session message from `showrunner-timer-<slug>`, and its
 text starts `Scheduled update`. Treat it exactly as the scheduled prompt: it
 is the update tick, not a peer's message. Do not reply to it.
 
@@ -254,11 +245,11 @@ once and passes 150K again within 12-20 minutes.)
 one-unit note: the user sees every unit on every tick, each checked in full.
 
 A `/showrunner:dailies` the user runs takes the next tick's slot: it runs the
-script, and then restarts the timer so the next tick comes N minutes after
+script, and then runs `NOTIFIER restart UPDATES` so the next tick comes N minutes after
 that report (`/showrunner:dailies` → Status check and clock).
 `/showrunner:interval <minutes>` changes N.
 
-Log the timer's `UNIT` and its next fire. Then check that this session is on
+Log `UPDATES` and its `next_due`. Then check that this session is on
 the quota alert list (<QuotaAlert/>).
 
 Each run of the script does two things:
@@ -789,7 +780,7 @@ When every unit's final-gate and as-built checkpoints are merged:
      `git -C CHECKOUT ls-remote --exit-code --heads origin <branch>` finds it.
 
    Leave the tmux sessions; the user closes them.
-4. Stop the update timer: `TIMER stop TIMER_CONF`.
+4. Remove the update instance: `NOTIFIER remove UPDATES`.
 5. Set the doc's status to `wrapped`, commit it as
    `production(<name>): wrapped`, and push.
 6. Report:

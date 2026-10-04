@@ -9,7 +9,7 @@ In film, dailies are what the executive producer watches each day to see how
 the shoot is going. Here the showrunner reports the production to the executive
 producer: the user. Run it in the showrunner session during `/showrunner:produce`,
 whose state (`PRODUCTION_DOC`, `LOG`, `ZONE`, `UNITS`, `CHECKOUT`,
-`MERGE_BRANCH`, `TIMER_CONF`, `TIMER`) it uses.
+`MERGE_BRANCH`, `NOTIFIER`, `UPDATES`) it uses.
 
 **Usage:** `/showrunner:dailies [simple|page|elaborate] [default|ascii]`. With
 no length, `simple`. With any other argument, name the choices and stop.
@@ -25,8 +25,8 @@ changed. User, 2026-10-03.
 
 ## Status check and clock
 
-While `/showrunner:produce` runs scheduled updates (its update timer,
-`TIMER_CONF`), a dailies the user runs takes the next tick's place. N is the
+While `/showrunner:produce` runs scheduled updates through `UPDATES`, a
+dailies the user runs takes the next tick's place. N is the
 production doc's **Updates** interval. Two steps do that:
 
 1. **Check every unit.** Before Gather, run the status script that the
@@ -35,10 +35,8 @@ production doc's **Updates** interval. Two steps do that:
    and its latest step and ETA. Put anything it flags first (SESSION GONE,
    CLAUDE NOT RUNNING, FORM WAITING, a usage limit, a DECISION), as a scheduled
    tick does.
-2. **Reset the clock.** After the report, restart the timer so the next tick
-   comes N minutes after this report. Run `TIMER stop TIMER_CONF`, then
-   `TIMER start TIMER_CONF`: at 19:21 with N = 15, the next tick is 19:36. Log
-   the next fire that `start` prints.
+2. **Reset the clock.** After the report, run `NOTIFIER restart UPDATES`:
+   at 19:21 with N = 15, the next tick is 19:36. Log the `next_due` it prints.
 
 A scheduled tick skips both steps. It has run the script already, and its clock
 is already right.
