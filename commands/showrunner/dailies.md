@@ -188,7 +188,9 @@ names another plan's document. User, 2026-10-02.
   cells, labelled every three hours, with `▼` at now. It always rolls to fit
   the rows: it opens at the three-hour mark at or before the earliest phase
   start, and later only as far as keeps every latest time in view, never past
-  now's mark (`12 15 18 21 00 03 ▼ 09`). User, 2026-10-04. Each row is white from the phase's
+  now's mark (`12 15 18 21 00 03 ▼ 09`). While the chart is wider than the app
+  shows (95 columns), it opens later still, three hours at a time, so the plan
+  bars fit. User, 2026-10-04. Each row is white from the phase's
   start (or the left edge, when it started earlier) to the ETA, with a blue
   cell at the ETA, a green cell at the earliest time and a red cell at the
   latest (no green or red without a range). When blue shares an hour with
@@ -199,8 +201,8 @@ names another plan's document. User, 2026-10-02.
   the cells stay under the axis. User, 2026-10-01. A unit under a build hold ends its row with `build hold`.
   Right of the rows, in one right-aligned column: `Phase N of M - P%`, the
   whole plan's percent done (earlier phases whole, this one at its `percent`),
-  then ten blocks, one per 10% rounded, and `│` at 100%, with `100%` above it
-  on the axis line. A follow-up row has none. User, 2026-10-03.
+  then ten blocks, one per 10% rounded, and `│` at 100%, with `100%` ending above
+  it on the axis line. A follow-up row has none. User, 2026-10-03.
   The `ascii` chart draws the same rows with characters a code font has,
   because the desktop app draws emoji wider than two columns: `──` while the
   phase runs, a heavy `━━` from the earliest time to the latest, `●` at the

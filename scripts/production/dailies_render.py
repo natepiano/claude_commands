@@ -110,8 +110,12 @@ START_FORMAT = "%b-%d %H:%M"
 # The timeline always spans 24 one-hour cells, labelled every three hours. It
 # rolls to fit the rows: it opens at the three-hour mark at or before the
 # earliest phase start, and later only as far as keeps every latest time in
-# view, never past now's mark. User, 2026-10-04.
+# view, never past now's mark. While the chart is wider than CHART_WIDTH it
+# opens later still, three hours at a time, so the plan bars fit. User, 2026-10-04.
 WINDOW_HOURS = 24
+# Columns the desktop app's code block shows: a 95-column row stayed whole, a
+# 107-column row wrapped its plan bar (2026-10-04).
+CHART_WIDTH = 95
 LABEL_EVERY_HOURS = 3
 
 JsonMap = dict[str, object]
@@ -287,9 +291,25 @@ def window_start(now: datetime, rows: list[Row]) -> datetime:
     return min(max(first_start, fits_end), now_mark)
 
 
+def chart_width(lines: list[str]) -> int:
+    return max(display_width(line) for line in lines)
+
+
 def draw(now: datetime, rows: list[Row], style: ChartStyle) -> list[str]:
-    """24 hourly cells in `style`: the run from the phase's start (or the left edge) to the ETA, marks at the earliest time, the ETA and the latest, and `before_eta` and `range_fill` cells between them; `→` past the right edge; a start before the left edge is written before the cells."""
-    start = window_start(now, rows)
+    """The chart from `window_start`, or, while it is wider than CHART_WIDTH, the narrowest opening up to now's mark."""
+    opening = window_start(now, rows)
+    now_mark = mark_at_or_before(now)
+    chart = draw_from(opening, now, rows, style)
+    while chart_width(chart) > CHART_WIDTH and opening < now_mark:
+        opening += timedelta(hours=LABEL_EVERY_HOURS)
+        later = draw_from(opening, now, rows, style)
+        if chart_width(later) < chart_width(chart):
+            chart = later
+    return chart
+
+
+def draw_from(start: datetime, now: datetime, rows: list[Row], style: ChartStyle) -> list[str]:
+    """24 hourly cells from `start` in `style`: the run from the phase's start (or the left edge) to the ETA, marks at the earliest time, the ETA and the latest, and `before_eta` and `range_fill` cells between them; `→` past the right edge; a start before the left edge is written before the cells."""
 
     def column(moment: datetime) -> int:
         return int((moment - start).total_seconds() // 3600)
@@ -364,7 +384,8 @@ def with_plans(lines: list[str], rows: list[Row]) -> list[str]:
     }
     left = max(display_width(line) for line in lines) + PLAN_GAP
     text_width = max(len(text) for text in plans.values())
-    header = f"{lines[0]}{' ' * (left - display_width(lines[0]) + text_width + 1 + PLAN_BLOCKS)}{PLAN_FULL}"
+    # `100%` ends over the end line, so the axis is no wider than a row.
+    header = f"{lines[0]}{' ' * (left - display_width(lines[0]) + text_width + 2 + PLAN_BLOCKS - len(PLAN_FULL))}{PLAN_FULL}"
     drawn = [header]
     for line, row in zip(lines[1:], rows, strict=True):
         if row.plan is None:
