@@ -25,6 +25,7 @@ CI_DIR = "ci"
 LOGS_DIR = "logs"
 ERRORS_NAME = "errors.log"
 SYNC_STATUS_NAME = "sync.json"
+DISK_NAME = "disk.json"
 
 
 def root() -> Path:
@@ -48,6 +49,10 @@ def month(epoch: float) -> str:
 
 def host_file(host: str, epoch: float) -> Path:
     return root() / host / f"{month(epoch)}.jsonl"
+
+
+def sample_file(host: str, epoch: float) -> Path:
+    return root() / host / f"samples-{month(epoch)}.jsonl"
 
 
 def append_line(path: Path, record: object) -> None:

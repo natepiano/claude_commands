@@ -13,6 +13,7 @@ from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from typing import cast
 
+import disk
 import sync
 import rust_release
 
@@ -31,6 +32,7 @@ SCRATCH_LABEL = "scratch (temp folders)"
 ON_DAY = "date(started_at, 'localtime') = ?"
 COMMON_HEAD = ["Runs", "Failed", "Avg", "Range"]
 COMMON_SQL = "count(*), sum(status <> 0), avg(duration_s), min(duration_s), max(duration_s)"
+MAX_SAMPLE_GAP_S = 5 * 60
 # 2026-10-01–04 log: 1 edit 12.54 min, 2–3 16.09, 4–7 20.94, 8+ 31.28.
 # One test per two edits leaves headroom for most gaps to stay within 2–3;
 # the 4–7 bin is where recovery time starts to climb.
@@ -167,6 +169,71 @@ def kind_section(connection: sqlite3.Connection, day: str, kind: str, hosts: int
         for row in rows
     ]
     return [f"### {kind}", "", *table(["Caller", *COMMON_HEAD, *(column.title for column in extra)], body), ""]
+
+
+def memory_pressure_section(connection: sqlite3.Connection, day: str, hosts: int) -> list[str]:
+    """The largest step stalls and the day's sampled machine memory pressure."""
+    stalled = fetch(
+        connection,
+        f"SELECT {SCRATCH} AS is_scratch, s.step, s.caller, s.host, s.mem_stall_some_s,"
+        + " (SELECT count(*) FROM steps other WHERE other.host = s.host"
+        + " AND other.started_at <= s.started_at AND s.started_at < other.ended_at)"
+        + " FROM steps s WHERE date(s.started_at, 'localtime') = ? AND s.mem_stall_some_s > 0"
+        + " ORDER BY s.mem_stall_some_s DESC LIMIT 5",
+        day,
+    )
+    samples = fetch(
+        connection,
+        "SELECT host, at, boot_id, mem_used_bytes, swap_used_bytes, stall_some_us, stall_full_us"
+        + " FROM samples WHERE date(at, 'localtime') = ? ORDER BY host, at",
+        day,
+    )
+    if not stalled and not samples:
+        return ["Memory pressure: no samples and no step stalls.", ""]
+
+    section = ["### Memory pressure", "", "Source: 60 s machine samples and step cgroup stall counters.", ""]
+    if stalled:
+        body = [
+            [SCRATCH_LABEL if is_scratch else caller_label(caller, host, hosts), str(step), seconds(stall), count(at_once)]
+            for is_scratch, step, caller, host, stall, at_once in stalled
+        ]
+        section += [*table(["Caller", "Kind", "Stall", "At once"], body), ""]
+    if not samples:
+        section += ["60 s samples: none; machine stall: unavailable.", ""]
+        return section
+
+    previous: dict[str, tuple[str, str, int, int]] = {}
+    some_us = full_us = 0
+    for host, at, boot_id, _, _, some, full in samples:
+        machine = str(host)
+        before = previous.get(machine)
+        if before is None:
+            earlier = fetch(
+                connection,
+                "SELECT at, boot_id, stall_some_us, stall_full_us FROM samples"
+                + " WHERE host = ? AND at < ? ORDER BY at DESC LIMIT 1",
+                machine,
+                at,
+            )
+            before = (str(earlier[0][0]), str(earlier[0][1]), cast(int, earlier[0][2]), cast(int, earlier[0][3])) if earlier else None
+        now_some, now_full = cast(int, some), cast(int, full)
+        if before is not None and 0 <= (datetime.fromisoformat(str(at)) - datetime.fromisoformat(before[0])).total_seconds() <= MAX_SAMPLE_GAP_S:
+            if boot_id == before[1]:
+                some_us += max(0, now_some - before[2])
+                full_us += max(0, now_full - before[3])
+            else:
+                some_us += now_some
+                full_us += now_full
+        previous[machine] = str(at), str(boot_id), now_some, now_full
+
+    peak_memory = max(cast(int, row[3]) for row in samples)
+    peak_swap = max(cast(int, row[4]) for row in samples)
+    section += [
+        f"60 s samples: peak used memory {gib(peak_memory)}, peak swap {gib(peak_swap)}; "
+        + f"machine stall: some {seconds(some_us / 1_000_000)}, full {seconds(full_us / 1_000_000)}.",
+        "",
+    ]
+    return section
 
 
 def outcomes(connection: sqlite3.Connection, day: str, tool: str) -> list[Row]:
@@ -425,6 +492,26 @@ def sync_time(last: str, now: datetime) -> str:
     return at.strftime("%H:%M %Z" if at.date() == now.astimezone().date() else "%Y-%m-%d %H:%M %Z")
 
 
+def disk_section() -> list[str]:
+    snapshot = disk.read_snapshot()
+    if snapshot is None:
+        return []
+    rows = [[row["label"], gib(row["bytes"])] for row in snapshot["rows"]]
+    rows.append(["other", gib(max(0, snapshot["used"] - sum(row["bytes"] for row in snapshot["rows"])))])
+    floor = snapshot["floor"]
+    free_label = f"free (floor {gib(floor)})" if floor is not None else "free"
+    rows.append([free_label, gib(snapshot["free"])])
+    measured = sync_time(snapshot["measured_at"], datetime.now())
+    return [
+        f"### Disk: {snapshot['host']}",
+        "",
+        *table(["Where", "Size"], rows),
+        "",
+        f"Measured by the buildlog disk job at {measured}: allocated blocks, each hard-linked file once.",
+        "",
+    ]
+
+
 def mac_note() -> str:
     status = sync.read_status()
     if status is None:
@@ -440,10 +527,11 @@ def report(connection: sqlite3.Connection, day: str) -> str:
     lines = [f"## Builds, {date.fromisoformat(day).strftime('%A %Y-%m-%d')}", ""]
     for kind in found:
         lines += kind_section(connection, day, kind, hosts)
+    lines += memory_pressure_section(connection, day, hosts)
     calls, calls_line = calls_section(connection, day)
     port_lint, port_lint_line = port_lint_section(connection, day)
     ci, ci_line = ci_section(connection, day)
-    lines += calls + test_builds_section(connection, day) + port_lint + ci + tests_per_edit_section(connection, day)
+    lines += calls + test_builds_section(connection, day) + port_lint + ci + tests_per_edit_section(connection, day) + disk_section()
     if found:
         for name, which, with_failed in SUMMARIES:
             lines += [f"### Summary: {name}", "", *summary(connection, day, found, which, with_failed), ""]
