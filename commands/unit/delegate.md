@@ -272,9 +272,12 @@ Codex only; no timer process:
 </CodexDispatchWait>
 
 <BackgroundVerificationContract>
-For `verify.sh final`, launch under <ToolingContract/>, export
-`PLAN_DELEGATE_SESSION_DIR="${SESSION_DIR}"` so `verify.sh` opens its own
-progress window, and tell the user what is running. Nothing else reports on it,
+Run every `verify.sh` call as one plain command,
+`bash ~/.claude/scripts/delegate/verify.sh --session-dir "${SESSION_DIR}" <verb> …`,
+with no env prefix, redirect or trailing command: the settings allow rule
+matches only that shape, and the task notification already carries its exit
+code. For `verify.sh final`, launch under <ToolingContract/> so `verify.sh`
+opens its own progress window, and tell the user what is running. Nothing else reports on it,
 so the timer matters more here, not less: Claude arms one under
 <ProgressContract/> exactly as a dispatch does and ends the turn, resuming from
 the task notification; Codex applies <CodexDispatchWait/> with progress disabled.
@@ -487,8 +490,8 @@ run that opened a progress window. A registered Stop hook enforces this and bloc
 once; treat that block as a dropped timer, not as a prompt to argue.
 
 Launcher work is a **pass**; unit-director work -- verification, smoke, style -- is
-an **activity**. `verify.sh` opens and closes its own whenever
-`PLAN_DELEGATE_SESSION_DIR` is set; open one by hand for other unit-director work
+an **activity**. `verify.sh` opens and closes its own whenever it runs with
+`--session-dir`; open one by hand for other unit-director work
 with
 `progress_history.py start-activity --session-dir "${SESSION_DIR}" --label <label> --activity <what>`
 and close it with
@@ -1165,6 +1168,12 @@ remains. Do not clear before shrink succeeds or while a checkpoint can still
 fail. The second removes this run's claude seats, which nothing messages after
 the phase, and any seat a dead run left alive; a failure there is one line in
 the report, never a stop.
+
+Then end everything else this phase started: TaskStop each Claude Agent
+helper, end finished launchers and progress timers, and shut down every Hana or
+example app it launched. Never touch what another session started. Mid-phase,
+stop each helper once its result is read and each app once no step uses it.
+User, 2026-10-03.
 </PhaseCleanup>
 
 <RecordPhaseCompletion>
