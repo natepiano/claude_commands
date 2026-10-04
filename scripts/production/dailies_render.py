@@ -12,8 +12,9 @@ why, a held reason carrying its own examples, a held count the update does
 not report against (`<k> of <N>`), an ETA time without its percent, an
 ETA that moved CHANGE_NEEDS_WHY_MINUTES or more since the last report
 without `why`, a `then` naming a phase at or before the heading's, a goal
-without its measured numbers, or a line using the production's own plumbing
-words (PLUMBING).
+without its measured numbers, a unit with `build_hold` and no
+`build_hold_release` or that field with no unit held, or a line using the
+production's own plumbing words (PLUMBING).
 
 --state  JSON file holding each unit's last reported phase, ETA, held
          reason and the phase's first ETA. The script reads it to write `(unchanged)` / `(changed:
@@ -163,6 +164,7 @@ class Report:
     chart: str
     zone: str
     next_run: str | None
+    build_hold_release: str | None
     units: list[Unit]
     topics: list[Topic]
 
@@ -643,7 +645,7 @@ def write_chart(path: Path, chart: str) -> None:
 
 def parse_report(value: object, chart: str) -> Report:
     fields = as_map(value, "input")
-    check_keys(fields, {"length", "zone", "next_run", "units", "topics"}, "input")
+    check_keys(fields, {"length", "zone", "next_run", "build_hold_release", "units", "topics"}, "input")
     length = text(fields, "length", "input")
     if length not in LENGTHS:
         raise InputError(f"input.length: must be one of {', '.join(LENGTHS)}")
@@ -653,7 +655,26 @@ def parse_report(value: object, chart: str) -> Report:
     if not units:
         raise InputError("input.units: every unit is reported, so the list cannot be empty")
     topics = [parse_topic(item, f"topics[{index}]", length) for index, item in enumerate(as_list(fields.get("topics"), "input.topics"))]
-    return Report(length, chart, zone, next_run, units, topics)
+    release = parse_release(fields, units)
+    return Report(length, chart, zone, next_run, release, units, topics)
+
+
+def parse_release(fields: JsonMap, units: list[Unit]) -> str | None:
+    """The build hold's release ETA: required while a unit has `build_hold`, refused when none does."""
+    release = optional_text(fields, "build_hold_release", "input")
+    held = any(unit.build_hold is not None for unit in units)
+    if held and release is None:
+        raise InputError(
+            "input.build_hold_release: required while a unit has build_hold; the release ETA the unit timing under the hold stated, "
+            + f"as HH:MM or HH:MM+N, or one of {', '.join(repr(choice) for choice in NONE)}"
+        )
+    if not held and release is not None:
+        raise InputError("input.build_hold_release: only while a unit has build_hold")
+    if release is not None and not TIME.match(release) and release not in NONE:
+        raise InputError(
+            f"input.build_hold_release: {release!r} is not HH:MM or HH:MM+N, nor one of {', '.join(repr(choice) for choice in NONE)}"
+        )
+    return release
 
 
 def load_state(path: Path | None) -> dict[str, Previous]:
@@ -748,6 +769,16 @@ def range_clock(moment: datetime, now: datetime) -> str:
     return f"{moment:%H:%M}" if moment.date() == now.date() else f"{moment:%a %H:%M}"
 
 
+def release_text(release: str, now: datetime, zone_name: str) -> str:
+    """A NONE text as given; a time in the zone, with its weekday on any day but today, and the minutes from now to it (user, 2026-10-04)."""
+    if release in NONE:
+        return release
+    moment = parse_time(release, now)
+    minutes = round((moment - now).total_seconds() / 60)
+    count = f"{abs(minutes)} minute{'' if abs(minutes) == 1 else 's'}"
+    return f"{range_clock(moment, now)} {zone_name} ({'overdue ' if minutes < 0 else ''}{count})"
+
+
 def eta_text(unit: Unit, previous: Previous | None, now: datetime, zone_name: str, with_note: bool) -> str:
     eta = unit.eta
     if eta.time is None:
@@ -840,6 +871,10 @@ def render(report: Report, previous: dict[str, Previous], now: datetime, zone_na
         latest = parse_range_end(unit.eta.latest, now, moment, earliest=False) if unit.eta.latest else moment
         rows.append(Row(unit.label, Estimate(unit.started, moment, earliest, latest), on_hold, plan))
     lines.extend(["```", *draw(now, rows, CHART_STYLES[report.chart]), "```", ""])
+    # A build hold shows its release ETA between the timeline and the last
+    # line (user, 2026-10-04).
+    if report.build_hold_release is not None:
+        lines.extend([f"{BUILD_HOLD_MARK} - release eta: {release_text(report.build_hold_release, now, zone_name)}", ""])
 
     needed = any(unit.needed for unit in report.units) or any(topic.needed for topic in report.topics)
     tail = "" if needed else " - nothing needed"
