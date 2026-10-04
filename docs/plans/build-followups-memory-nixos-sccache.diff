@@ -1,0 +1,49 @@
+# sccache runs its server in the service's own process (build-followups-memory, Phase 3)
+#
+# Against /etc/nixos 408b3d8. `sccache --start-server` hands the server to a
+# child and exits 0, so systemd marks the unit done and stops the child; the
+# next build's client then starts a server inside its own run-*.scope.
+# SCCACHE_START_SERVER=1 with SCCACHE_NO_DAEMON=1 and no argument runs the
+# server in the foreground (tested on sccache 0.15.0, scratch port: the
+# process stays up with no child, answers --show-stats, exits 0 on
+# --stop-server). The variable goes on ExecStart only: with it set, any other
+# command fails ("`SCCACHE_START_SERVER=1` can't be used with other
+# commands"), which would make ExecStartPre's --stop-server a silent no-op.
+#
+# After the rebuild, with no build running (the restart stops the stray
+# server that a build step's scope now holds):
+#   systemctl --user restart sccache
+#   systemctl --user is-active sccache          # active, and stays active
+#   cat /proc/$(systemctl --user show --property=MainPID --value sccache)/cgroup
+#                                               # ends in builds.slice/sccache.service
+#   sccache --show-stats                        # answers
+--- a/modules/linux/development.nix
++++ b/modules/linux/development.nix
+@@ -142,10 +142,14 @@
+     };
+ 
+     # sccache executes every compile in the server's cgroup, so the server
+-    # itself must be in builds.slice alongside the build steps. A session's
+-    # client starts its own server whenever none answers; stop whichever
+-    # server holds the port before each start. Five seconds between restarts
+-    # stays under systemd's start limit.
++    # itself must be in builds.slice alongside the build steps. With
++    # SCCACHE_START_SERVER=1 and SCCACHE_NO_DAEMON=1 sccache runs the server in
++    # its own process; `--start-server` hands it to a child and exits, and
++    # systemd then stops the unit and the child with it. The variable is set
++    # on ExecStart alone, because every other sccache command refuses to run
++    # with it set. A session's client starts its own server whenever none
++    # answers; stop whichever server holds the port before each start. Five
++    # seconds between restarts stays under systemd's start limit.
+     services.sccache = {
+       description = "Compilation cache in the build memory slice";
+       wantedBy = [ "default.target" ];
+@@ -158,7 +162,7 @@
+       };
+       serviceConfig = {
+         ExecStartPre = "-${pkgs.sccache}/bin/sccache --stop-server";
+-        ExecStart = "${pkgs.sccache}/bin/sccache --start-server";
++        ExecStart = "${pkgs.coreutils}/bin/env SCCACHE_START_SERVER=1 ${pkgs.sccache}/bin/sccache";
+         Slice = "builds.slice";
+         Restart = "on-failure";
+         RestartSec = 5;

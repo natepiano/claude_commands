@@ -170,7 +170,11 @@ run() {
             return "$status"
         fi
         RUN_LAST_ATTEMPT_KILLED=1
+        if [[ -n "${MEM_KILL_FILE:-}" ]]; then
+            printf x >> "$MEM_KILL_FILE"
+        fi
         if (( attempt == 2 )); then
+            [[ -z "${MEM_KILL_FILE:-}" ]] || : > "${MEM_KILL_FILE}.stopped"
             echo "killed for memory twice: $*" >&2
             rm -f "$step_log"
             return 137
@@ -500,7 +504,15 @@ note_event() {
     if [[ -n "${CACHE_DIR}" ]]; then
         cached=1
     fi
-    "$PY" "$BUILDLOG_RECORD" call "$outcome" "$status" "$cached" "$wait" "$wall" \
+    local mem_kills=0
+    if [[ -n "${MEM_KILL_FILE:-}" && -f "$MEM_KILL_FILE" ]]; then
+        mem_kills=$(wc -c < "$MEM_KILL_FILE")
+    fi
+    local mem_kill_stopped=0
+    if [[ -n "${MEM_KILL_FILE:-}" && -f "${MEM_KILL_FILE}.stopped" ]]; then
+        mem_kill_stopped=1
+    fi
+    BUILDLOG_MEM_KILLS="$mem_kills" BUILDLOG_MEM_KILL_STOPPED="$mem_kill_stopped" "$PY" "$BUILDLOG_RECORD" call "$outcome" "$status" "$cached" "$wait" "$wall" \
         "$build" "$saved" "${SECONDS}" "$CMD" ${ARGS[@]+"${ARGS[@]}"} \
         </dev/null >/dev/null 2>&1 || true
 }
@@ -654,6 +666,7 @@ if cache_lookup; then
     exit "${LOOKUP_STATUS}"
 fi
 RUN_STARTED=${SECONDS}
+MEM_KILL_FILE="$(mktemp)"
 if [[ -n "${CACHE_DIR}" ]] && mkdir -p "${CACHE_DIR}"; then
     RUN_KEY="${LOOKUP_KEY}"
     RUN_LOG="${CACHE_DIR}/run.$$.log"
@@ -703,6 +716,8 @@ verify_cleanup() {
         interrupted) outcome=interrupted code="" ;;
     esac
     note_event "${outcome}" "${RUN_STARTED}" $(( SECONDS - RUN_STARTED )) "" 0 "${code}" || true
+    [[ -z "${MEM_KILL_FILE:-}" ]] || rm -f "$MEM_KILL_FILE"
+    [[ -z "${MEM_KILL_FILE:-}" ]] || rm -f "${MEM_KILL_FILE}.stopped"
     if [[ "${ACTIVITY_ACTIVE}" -eq 1 ]]; then
         finish_activity "${status}"
     fi

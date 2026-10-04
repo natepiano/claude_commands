@@ -10,6 +10,8 @@
   buildlog ci                       record new GitHub Actions run attempts
   buildlog disk                     measure disk usage for the next report
   buildlog sample                   record machine memory and stall counters once
+  buildlog snapshot                 record slice and zram counters now
+  buildlog memory START END         report memory between offset-bearing instants
   buildlog hourly                   sync, ci, then Rust release check
   buildlog backfill-verify [LEDGER] copy verify.sh's old events.jsonl ledger in, once
 
@@ -29,6 +31,7 @@ from typing import cast
 import ci
 import disk
 import index
+import memory
 import record
 import report
 import rust_release
@@ -229,8 +232,20 @@ def main(argv: list[str]) -> int:
         if rest:
             print("usage: buildlog sample", file=sys.stderr)
             return 2
-        sample.sample()
+        taken = sample.sample()
+        try:
+            _ = memory.write_snapshot(taken.at, taken.host)
+        except (OSError, ValueError) as error:
+            print(f"buildlog sample: memory snapshot unavailable: {error}", file=sys.stderr)
         return 0
+    if command == "snapshot":
+        if rest:
+            print("usage: buildlog snapshot", file=sys.stderr)
+            return 2
+        print(json.dumps(memory.snapshot(), separators=(",", ":")))
+        return 0
+    if command == "memory":
+        return memory.memory_command(rest)
     if command == "hourly":
         return hourly()
     if command == "backfill-verify":

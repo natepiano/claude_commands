@@ -477,11 +477,13 @@ class ReportTests(unittest.TestCase):
                 section = report.memory_pressure_section(connection, "2026-10-02", 0)
         self.assertTrue(any("some 2.0 s" in line and "full 1.0 s" in line for line in section))
 
-    def test_memory_pressure_empty_day_has_one_message_and_no_table(self) -> None:
+    def test_memory_pressure_empty_day_shows_instrument_availability(self) -> None:
         lines = self.render().splitlines()
-        self.assertIn("Memory pressure: no samples and no step stalls.", lines)
-        self.assertNotIn("### Memory pressure", lines)
-        self.assertFalse(any(line.startswith("Source: 60 s machine samples") for line in lines))
+        self.assertIn("### Memory pressure", lines)
+        self.assertIn("memory waits: none", lines)
+        self.assertIn("sccache service: unavailable", lines)
+        self.assertIn("unsliced steps: none", lines)
+        self.assertIn("memory kills: none", lines)
 
     def test_kinds_by_caller_then_one_summary_row_per_kind(self) -> None:
         self.write(

@@ -95,38 +95,73 @@ Measured 2026-10-04 11:59–12:25 PDT, read-only, from the earlyoom journal, the
 
 **Ruled out:** a `steve-clients` group (160efd9's ACL already grants the runner users, and group membership is fixed at login); removing `CARGO_BUILD_JOBS` before a CI log proves the jobserver connects.
 
-### Phase 3 — A measured working day · status: todo
+### Phase 3 — Instruments for the measured day · status: done
 
-**Starts when** natedev has run the diff header's sandbox check (prints `OPEN_OK`), applied `docs/plans/build-followups-memory-nixos.diff`, and the user has rebuilt with no CI job running. First confirm the rebuild took: `zramctl` shows the zram device, the user `builds.slice` and `hana-ci.slice` carry their MemoryHigh, MemoryMax and MemorySwapMax, and `systemctl --user status sccache` is active.
+#### As-built
 
-**Two checks on the rebuild itself:**
-- The next Linux CI job's log has no `failed to connect to jobserver` warning. When a successful job shows that, remove `CARGO_BUILD_JOBS = "8"` from the runners in a new `/etc/nixos` diff for natedev. Until then it is the fallback that stops cargo taking all 32 cores per runner; the Phase 2 diff keeps it.
-- Every kind of build runs where the design puts it: a session step and its compiles (`builds.slice`, the compiles in `builds.slice/sccache.service`), the nightly Rust trial (`builds.slice`, through the `buildlog` unit), and a CI job (`hana-ci.slice`). A session's sccache client starts its own server, outside the slice, whenever none answers, so the minute sample job also records whether `sccache.service`'s cgroup holds a process, and the report names the minutes it did not.
+- **Slice snapshots.** `buildlog snapshot` writes a `memory_snapshot` record stamped with its instant: per slice (`builds`, `ci`, or absent) `memory.events` (`high`, `max`, `oom_kill`), `memory.peak`, `memory.swap.peak`, the limits, and the `memory.pressure` `some` total as `stall_some_us` (or a named unavailable state), plus zram's data and compressed sizes. `buildlog sample` also writes one every minute: `sample.sample()` returns `SampleTaken(at, host)` and cli.py's `sample` command passes it to `memory.write_snapshot(at, host)`; a snapshot failure prints `memory snapshot unavailable` to stderr and never fails the sample.
+- **Window report.** `buildlog memory START END` (ISO instants with offsets; `memory.window_report`) counts only this host's records (`store.host_name()`). It prints earlyoom and kernel OOM kills from the journal; then per slice, between the snapshots nearest each edge within 2 minutes (`SNAPSHOT_DISTANCE_S = 120`, else "no snapshot within 2 min of …"), the `high`/`max`/`oom_kill` deltas, the pressure delta as "stall +N.N s" (or "stall unavailable"), and peak and swap peak against their limits; then memory waits, minutes sccache ran outside its service, unsliced steps ("N fell back to a plain run, M never tried a scope"), memory kills and zram. Window edges round up to the next millisecond (`stored_bound`) to match stored records.
+- **Report rules.** Journal unavailable (journalctl error or nonzero exit) prints "journal unavailable", never zero kills; an empty window is zero kills. memory.peak is a lifetime high, so it is the window's peak only when it rose in the window, else "at most X GiB (no new high in the window)". A counter (events, peak or stall) that falls in the window is a reset: "reset in the window; since the reset …". Memory kills read "N calls passed after a re-run, M failed later, K stopped after a step was killed twice".
+- **Daily report.** `buildlog report` shows the same lines (`memory.instrument_lines`) under its memory heading, aggregated across hosts, even on a day with no samples.
+- **Schema 7.** `samples.sccache_in_service` (1 when `sccache.service`'s cgroup holds a process, 0 when empty, NULL without `builds.slice`); `steps.slice` (`builds` / `fallback` / `none`, from the scope marker `invoke.sh` leaves); `calls.mem_kills` and `calls.mem_kill_stopped`, which verify.sh counts per call in a temp file and passes as `BUILDLOG_MEM_KILLS` and `BUILDLOG_MEM_KILL_STOPPED` (set on the second kill, the `killed for memory twice` exit) to `record.py call`; indexed `memory_snapshots`.
+- **Where builds run** (live, 2026-10-04). The sccache server runs alone in `builds.slice/sccache.service`; cargo, its sccache client and some rustc processes run in `builds.slice/run-*.scope` (the client compiles non-cacheable work locally). Both are inside `builds.slice`, as is the `buildlog` unit that runs the nightly Rust trial.
+- **Machine** (`/etc/nixos` diffs: `docs/plans/build-followups-memory-nixos-*.diff`). `sccache.service` runs its server in the foreground (`SCCACHE_START_SERVER=1` on ExecStart only). `hana-ci.slice` has MemoryMax 18G only, no MemoryHigh, and the runners `OOMPolicy=continue`, so a kill at MemoryMax takes one compiler, not the runner. `builds.slice` keeps MemoryHigh 26G as the admission line. The runners carry no `CARGO_BUILD_JOBS`: a clean CI run's Linux jobs used the steve jobserver with no `failed to connect to jobserver` warning.
 
-**The measured day** is one working day in PDT with explicit start and end instants. natedev's clock is EDT and `report.py` groups by machine local time, so pass the PDT window rather than reading a report's day. Measure against the target:
-- earlyoom kills (`journalctl -u earlyoom`, `sending SIG(TERM|KILL) to process`) and kernel OOM kills inside either slice;
-- each slice's `memory.events` (`high`, `max`, `oom_kill`) and `memory.peak` / `memory.swap.peak`, snapshotted at the start and end, since the minute samples of `builds_anon_bytes` / `ci_anon_bytes` miss short peaks; swap peaks against MemorySwapMax (builds 4G, CI 2G);
-- memory waits from `steps.mem_wait_s` (not `wait_s`, which is the cargo-token wait): count, total, longest, and how many reached the 15-minute limit; check that the report's `memory waits:` line agrees with the `waiting for memory since …` lines agents saw;
-- steps that fell back to an unsliced run because the scope could not be created (`invoke.sh`);
-- verify.sh's memory-kill retries and `killed for memory twice` exits. verify.sh pairs a signal in the step's log with any earlyoom or kernel kill in the step's window; check whether an unrelated kill in the same window was ever counted, and if it was, tie the kill to the step's own processes;
-- zram's compression ratio (`zramctl`);
-- CI's run time against a successful CI run from before the diff (the 2026-10-04 runs were killed and are not a runtime baseline);
-- the next `/build_hold` release that happens in the window, if any: when each held session's build started, its memory wait and the pressure. Phase 4 reads this. Do not stage a hold to produce one.
+**Files:**
+- `scripts/buildlog/memory.py` — `snapshot`, `write_snapshot`, `window_report`, `instrument_lines`, `stored_bound`
+- `scripts/buildlog/sample.py` — minute sample, `sccache_in_service`, `SampleTaken`
+- `scripts/buildlog/cli.py` — `snapshot` and `memory` commands; `sample` writes the minute snapshot
+- `scripts/buildlog/record.py`, `scripts/buildlog/index.py` — schema 7 fields and the `memory_snapshots` table
+- `scripts/buildlog/report.py` — instrument lines in the daily report
+- `scripts/delegate/verify.sh` — memory-kill count and twice-killed stop
+- `scripts/buildlog/test_memory_window.py`, `test_memory_records.py`, `test_sample.py`, `test_report.py`, `test_index.py`, `scripts/delegate/test_verify_memory_kill.py` — stub the cgroup tree, `journalctl` and `zramctl`; never read the real cgroup tree or journal, never write `~/.local/state/buildlog`
 
-Tune the slice numbers from what it shows. A changed limit needs another measured day after it. Say whether per-crate admission or nextest thread limits are needed after all. The per-slice sample fields read "unavailable" before the rebuild; one still unavailable after it is a deployment fault.
+**Binds later work:** the measured working day runs `buildlog memory START END` per window and per CI run, and takes a run's own peak from the minute samples (`ci_anon_bytes` / `builds_anon_bytes`), never from memory.peak. The window report is host-scoped; the daily report is not. Snapshots exist only from when this code is live on `~/.claude` main (about 830 KB a day). The CI jobserver check is closed.
 
-Baseline before the diff: natedev's stopgap 160efd9 put CI in steve on 2026-10-04. The first CI run with it, 37227844227, still lost both Linux jobs to earlyoom: the hana bin's rustc was killed at 12:29:58 and 12:30:09 PDT, about 3.3 GB RSS each with oom_score_adj 500, at about 2.8 of 56.5 GB available. Sharing steve's slots alone does not stop the kills.
+**Gotchas:**
+- `sccache --start-server` forks the server and exits, so a service using it dies at start; with `SCCACHE_START_SERVER` in the environment every other sccache command fails, hence ExecStart only.
+- MemoryHigh on a slice that holds a heartbeat (the runner's Runner.Listener) stalls it until GitHub drops the runner; such a slice gets MemoryMax only and its services `OOMPolicy=continue`.
+- memory.peak never falls without a reset; CI's reads above its 18G limit, from before the limit existed.
+- At its ceiling CI hits MemoryMax thousands of times with no kill: a large `max` delta is reclaim, and its cost shows as stall seconds.
 
-**Seats:** `1 writer + 1 tester` — the writer measures and writes the result and any follow-up `/etc/nixos` diff; the tester independently checks cgroup placement, the journals, the CI proof and the day's conclusion.
+**Ruled out:** a `CARGO_BUILD_JOBS` fallback on the runners (the steve jobserver reaches CI jobs); a 10-minute snapshot search (an edge's snapshot more than 2 minutes off misplaces the window); a per-call kill count alone (it cannot tell two single kills from one step killed twice, hence `mem_kill_stopped`).
 
 ### Phase 4 — Build holds name their holders and release cleanly · status: todo
 
-Three fixes needed whatever Phase 3 finds, and one step that depends on it:
+Three fixes needed whatever the measured day finds. The step that depends on it, releasing one session at a time, is in Phase 5.
 - **Holder files are the one source.** `/build_hold` already writes one file per holder in `~/.local/state/build-hold/` (ratio-unit, shipped), each one free-text line: the holder, an ISO time, the test and the reason. Give each file `since`, `for` and `release_eta`, where `release_eta` is either a time or an explicit unknown (`hold` takes no ETA today, and its two-hour "ask me" rule is an escalation time, not an ETA). Read the old one-line form too. `dailies_render.py` derives both its report and `--footer` hold lines from these files, for any number of holders, so a showrunner no longer passes `--build-hold-release` by hand; update the showrunner commands that pass it. Model the states as types, not `BuildHold | None` and a string that is either a time or "unknown": no hold or active holders, and a known or unknown release time, at the file and JSON boundaries.
 - **The last holder releases.** The release step sends "released, builds may resume" only when the last holder's file is gone; otherwise it names who still holds.
-- **The quiet test checks load.** Before the held test, the quiet check also requires the 1-minute load average below a stated bound, waits at most a stated time, and tells the holder what is still running when the load stays high (CI, another session).
-- **One session at a time, only if needed.** If Phase 3's observed release shows the admission already staggers the sessions, say so and drop this step. Otherwise `/build_hold release` releases sessions one at a time. The command broadcasts its release today, so this needs a release addressed to one session at a time and an acknowledgement from each.
+- **The quiet test checks load.** Before the held test, the quiet check also requires the 1-minute load average below 8 (a quarter of the 32 cores), waits at most 10 minutes, and tells the holder what is still running when the load stays high (CI, another session).
+- **One holder state.** `scripts/production/dailies_render.py` renders from one `BuildHold | None`, a free-form release string and unit hold markers passed in separately, which can disagree with several holder files. Read the holder files into one semantic state, no holders or active holders, each with a release that is a time or unknown; render one entry per holder; the report, the footer and the unit hold markers agree after a partial release.
+- **A callable helper.** The hold, quiet check and release live only as prose in `commands/build_hold.md`. Move the quiet check and the release decision into a script that takes the holder directory and the load and process readings as inputs, so tests can drive it, and have the command call it. `scripts/buildlog/rust_release.py` treats any regular file in the hold directory as a hold; keep that through the format change.
 
-Tests cover no holder, a legacy file, several holders at once, an unknown ETA, a load that stays high, and a partial release.
+Tests cover no holder, a legacy file, several holders at once, an unknown ETA, a load that stays high, a partial release, and a report, footer and unit markers that agree after it.
 
-**Seats:** `1 writer + 1 tester` — the writer owns the holder-file contract: `commands/build_hold.md`, `scripts/production/dailies_render.py`, the showrunner commands that pass hold flags; the tester writes the cases above against that contract.
+The measured day (Phase 5) runs during this phase.
+
+**Seats:** `1 writer + 1 tester` — the writer owns the helper script, `commands/build_hold.md`, `scripts/production/dailies_render.py` and the showrunner commands that pass hold flags; the tester writes the helper and renderer cases with fake holder files, load and processes.
+
+### Phase 5 — A measured working day · status: todo
+
+**The window** opens when Phase 3's records are live on `~/.claude` main (the buildlog timers run from there): take the start snapshot then and write its instant here, in PDT. It closes 24 hours later, a full day and night, because the production's units build overnight; take the end snapshot then and run the day's report over the window.
+
+**Constraints from prior phases:** `buildlog memory START END` (`scripts/buildlog/memory.py`) reads the snapshots nearest each edge, within 2 minutes, and counts only this host's records; the minute sample (`buildlog sample`, `scripts/buildlog/sample.py` and `cli.py`) writes one snapshot a minute with each slice's `memory.pressure` `some` total; the index is schema 7 (`scripts/buildlog/index.py`). `memory.peak` is a slice's lifetime high. rustc runs in `builds.slice/run-*.scope` under the sccache client as well as in `sccache.service`. Live since 2026-10-04: sccache in the foreground (nixos e669461), `hana-ci.slice` with no MemoryHigh and its runners at OOMPolicy=continue (087c7c1), no CARGO_BUILD_JOBS (832dad4); the CI jobserver check is closed.
+
+**Before the clock starts:** on the deployed sampler, `buildlog memory` over the last 10 minutes shows no missing snapshot and no unavailable journal. During the day, a figure whose window shows a missing snapshot, an unavailable journal or a reset at an edge is inconclusive: say so, and repeat that window or rebuild the figure from the minute snapshots inside it.
+
+Measure against the target, a normal working day with no earlyoom kill, from the report plus:
+- CI's run time against a successful CI run from before the Phase 2 diff (the 2026-10-04 runs were killed and are not a runtime baseline);
+- CI at its ceiling. In CI run 37227844227 attempt 4 (green 14:14 PDT 2026-10-04) the two Linux jobs peaked at 8.3 and 16.7 GiB, `hana-ci.slice` hit its 18G MemoryMax about 23,800 times (`max` events 3930 → 27773) and its memory stall grew 44.7 s in about 11 min, with no kill. Run 37236742478 (14:35–14:51 PDT, the first without CARGO_BUILD_JOBS) peaked at 16.5 and 11.1 GiB, with `max` events +33.1K, stall +33.9 s, no kill and no jobserver warning. For each CI run in the window, run `buildlog memory START END` over the run's own start and end (from `gh run view`) and record the slice's MemoryMax hits (the `max` events delta), its stall seconds (the `memory.pressure` some-total delta) and any `oom_kill`; `memory.peak` is the slice's lifetime high, so a run's own peak is the highest minute sample's `ci_anon_bytes` over the run. Name the threshold that would justify raising CI's MemoryMax, and judge the day against it. The ceilings already sum past RAM (builds 34G + CI 18G + `app.slice` about 9G + system, on 60 GiB; `builds.slice` peaked at 32 GiB on 2026-10-04), so any raise to CI comes out of `builds.slice`'s MemoryMax and the sum holds;
+- whether verify.sh ever counted a kill from outside the step as the step's own; if it did, tie the kill to the step's own processes;
+- whether the report's `memory waits:` line agrees with the `waiting for memory since …` lines agents saw;
+- the next `/build_hold` release that happens in the window, if any: when each held session's build started, its memory wait and the pressure. Do not stage a hold to produce one.
+- overlapping CI runs: both runners share `hana-ci.slice`, so label a figure from overlapping runs as shared-slice, and base the per-run comparison and the threshold only on runs that ran alone;
+- the day's hold time and workload (sessions building, CI runs). If holds kept session builds off for much of the day, repeat the day. If no natural release happens, the one-session-at-a-time step is unmeasured and says so.
+
+Tune the slice numbers from what it shows. A changed limit needs another measured day after it. Say whether per-crate admission or nextest thread limits are needed after all. A per-slice sample field that still reads "unavailable" is a deployment fault.
+
+- **One session at a time, only if needed.** If the observed release shows the admission already staggers the sessions, say so and drop this step. Otherwise `/build_hold release` releases sessions one at a time. The command broadcasts its release today, so this needs a release addressed to one session at a time and an acknowledgement from each.
+
+Baseline before the diff: natedev's stopgap 160efd9 put CI in steve on 2026-10-04. The first CI run with it, 37227844227, still lost both Linux jobs to earlyoom: the hana bin's rustc was killed at 12:29:58 and 12:30:09 PDT, about 3.3 GB RSS each with oom_score_adj 500, at about 2.8 of 56.5 GB available. Sharing steve's slots alone does not stop the kills.
+
+**Seats:** `1 writer + 1 tester` — the writer measures and writes the result, any follow-up `/etc/nixos` diff, and the one-at-a-time release if it is needed; the tester independently checks the journals, the CI proof and the day's conclusion. The tester's slot covers record completeness, the independent journal and CI checks, and the tests for the one-at-a-time release if it is built.

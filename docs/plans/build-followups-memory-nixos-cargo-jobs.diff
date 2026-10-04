@@ -1,0 +1,22 @@
+# Against /etc/nixos 087c7c1. CI run 37227844227 attempt 4 (green 14:14 PDT 2026-10-04):
+# Linux Compile and Test Suite printed no "failed to connect to jobserver", so the
+# sandbox reaches steve's pool and the eight-job fallback goes.
+# Apply: git -C /etc/nixos apply <this file>
+diff --git a/modules/linux/hana-runners.nix b/modules/linux/hana-runners.nix
+index f1dc0f5..cfba5db 100644
+--- a/modules/linux/hana-runners.nix
++++ b/modules/linux/hana-runners.nix
+@@ -528,10 +528,9 @@ in
+         # the checkout its predecessor compiled, and the cache is written for a
+         # workflow that does not happen here. Writing it also costs build time.
+         CARGO_INCREMENTAL = "0";
+-        # Keep eight jobs as the fallback until a CI log proves the sandbox
+-        # can connect to steve's shared pool (./jobserver.nix).
+-        CARGO_BUILD_JOBS = "8";
+-        # The ACL in jobserver.nix grants the runner users access.
++        # The ACL in jobserver.nix grants the runner users access. CI run
++        # 37227844227 attempt 4 (2026-10-04) compiled both Linux jobs through
++        # it with no jobserver warning, so no CARGO_BUILD_JOBS fallback.
+         CARGO_MAKEFLAGS = "--jobserver-auth=fifo:/dev/steve";
+         HANA_BRP_PORT = toString r.brpPort;
+         # The target sweep; see mkSweepHook above.

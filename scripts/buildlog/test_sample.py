@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import io
 import json
 import os
 import re
@@ -11,10 +12,13 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from contextlib import redirect_stderr
 from datetime import datetime
 from pathlib import Path
 from typing import cast, override
+from unittest.mock import patch
 
+import cli
 import sample
 from test_index import use_test_log
 
@@ -95,7 +99,7 @@ class SampleTests(unittest.TestCase):
         self.assertEqual(result.stderr.splitlines(), ["buildlog sample is Linux only (requires /proc)."])
         self.assertEqual(list(self.root.rglob("*.jsonl")), [])
 
-    def test_cli_sample_appends_exactly_one_record_under_buildlog_dir(self) -> None:
+    def test_cli_sample_appends_sample_and_snapshot_under_buildlog_dir(self) -> None:
         proc = self.root / "proc"
         proc.mkdir(parents=True)
         _ = (proc / "meminfo").write_text("MemTotal: 16384 kB\nMemAvailable: 4096 kB\nSwapTotal: 8192 kB\nSwapFree: 1024 kB\n")
@@ -107,7 +111,19 @@ class SampleTests(unittest.TestCase):
         ci.mkdir()
         _ = (builds / "memory.stat").write_text("anon 123456\n")
         _ = (ci / "memory.stat").write_text("anon 654321\n")
-        environment = {**os.environ, "BUILDLOG_DIR": str(self.root), "BUILDLOG_BUILDS_CGROUP": str(builds), "BUILDLOG_CI_CGROUP": str(ci)}
+        for cgroup in (builds, ci):
+            for name, value in (
+                ("memory.events", "high 0\nmax 0\noom_kill 0\n"),
+                ("memory.peak", "123456\n"),
+                ("memory.swap.peak", "0\n"),
+                ("memory.high", "max\n"),
+                ("memory.max", "max\n"),
+                ("memory.swap.max", "max\n"),
+                ("memory.pressure", "some total=2500000\nfull total=100000\n"),
+            ):
+                _ = (cgroup / name).write_text(value)
+        environment = {**os.environ, "BUILDLOG_DIR": str(self.root), "BUILDLOG_BUILDS_CGROUP": str(builds),
+                       "BUILDLOG_CI_CGROUP": str(ci), "BUILDLOG_ZRAM": str(self.root / "absent-zram")}
         command = (
             "import sys; from pathlib import Path; sys.path.insert(0, sys.argv[1]); "
             "import sample, cli; proc = Path(sys.argv[2]); "
@@ -129,7 +145,7 @@ class SampleTests(unittest.TestCase):
         self.assertEqual(files[0].parent.name, host)
         self.assertRegex(files[0].name, r"^samples-\d{4}-\d{2}\.jsonl$")
         lines = files[0].read_text().splitlines()
-        self.assertEqual(len(lines), 1)
+        self.assertEqual(len(lines), 2)
         record = cast(Record, json.loads(lines[0]))
         self.assertEqual(record["kind"], "sample")
         self.assertEqual(record["host"], host)
@@ -143,6 +159,34 @@ class SampleTests(unittest.TestCase):
             self.assertIsInstance(record[field], int)
             self.assertGreaterEqual(cast(int, record[field]), 0)
         self.assertFalse((self.root / "index.sqlite").exists())
+        snapshot = cast(Record, json.loads(lines[1]))
+        self.assertEqual(snapshot["kind"], "memory_snapshot")
+        self.assertEqual(snapshot["at"], record["at"])
+        self.assertEqual(snapshot["host"], host)
+        slices = cast(dict[str, Record], snapshot["slices"])
+        self.assertEqual(slices["ci"]["stall_some_us"], 2_500_000)
+
+    def test_snapshot_failure_still_keeps_minute_sample(self) -> None:
+        proc = self.root / "proc"
+        proc.mkdir(parents=True)
+        _ = (proc / "meminfo").write_text("MemTotal: 16 kB\nMemAvailable: 4 kB\nSwapTotal: 8 kB\nSwapFree: 1 kB\n")
+        _ = (proc / "pressure").write_text("some total=100\nfull total=20\n")
+        _ = (proc / "boot_id").write_text("test-boot\n")
+        stderr = io.StringIO()
+        with patch.dict(os.environ, {"BUILDLOG_DIR": str(self.root),
+                                  "BUILDLOG_BUILDS_CGROUP": str(self.root / "absent-builds"),
+                                  "BUILDLOG_CI_CGROUP": str(self.root / "absent-ci"),
+                                  "BUILDLOG_ZRAM": str(self.root / "absent-zram")}), \
+             patch.object(sample, "MEMINFO", proc / "meminfo"), \
+             patch.object(sample, "PRESSURE", proc / "pressure"), \
+             patch.object(sample, "BOOT_ID", proc / "boot_id"), \
+             patch("memory.write_snapshot", side_effect=OSError("snapshot failed")), \
+             redirect_stderr(stderr):
+            self.assertEqual(cli.main(["sample"]), 0)
+        lines = next(self.root.glob("*/samples-*.jsonl")).read_text().splitlines()
+        self.assertEqual(len(lines), 1)
+        self.assertEqual(cast(Record, json.loads(lines[0]))["kind"], "sample")
+        self.assertIn("memory snapshot unavailable: snapshot failed", stderr.getvalue())
 
 
 if __name__ == "__main__":

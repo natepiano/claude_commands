@@ -244,6 +244,7 @@ def step(args: list[str]) -> None:
             if status != 0:
                 log = keep_log(data, host, start, record_id)
         memory = peak_and_stall(peak)
+        step_slice = "none" if not peak else "builds" if Path(peak).is_file() else "fallback"
         record: dict[str, object] = {
             "kind": "step",
             "v": RECORD_VERSION,
@@ -253,6 +254,7 @@ def step(args: list[str]) -> None:
             "ended_at": store.utc_iso(end),
             "duration_s": round(end - start, 3),
             "mem_wait_s": int(os.environ.get("BUILDLOG_MEM_WAIT_S", "0")),
+            "slice": step_slice,
             "step": name,
             "argv": argv,
             "cwd": cwd,
@@ -327,6 +329,8 @@ def call(args: list[str]) -> None:
         "wall_s": optional_int(wall) or 0,
         "build_s": optional_int(build),
         "saved_s": optional_int(saved) or 0,
+        "mem_kills": int(os.environ.get("BUILDLOG_MEM_KILLS", "0")),
+        "mem_kill_stopped": os.environ.get("BUILDLOG_MEM_KILL_STOPPED") == "1",
     }
     write_call(time.time() - float(elapsed or 0), fields, os.environ.get("BUILDLOG_CALL_ID"))
 
