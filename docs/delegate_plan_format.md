@@ -92,6 +92,7 @@ to rediscover after a context compaction lives in the doc.
 **Spec:**
 <the implementation detail, verbatim from the design where one exists: types,
 signatures, APIs, patterns, edge cases. Name files with line refs where known.
+Text that moves or resizes gets its minimum readable size and where it goes.
 This is the meat — do not paraphrase a resolved design down to a summary.>
 
 **Files:**

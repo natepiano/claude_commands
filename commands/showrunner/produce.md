@@ -434,6 +434,9 @@ guide named in the production doc holds the rules that make the bar concrete.
   the user, so no one asks again.
 - A flaw found in one unit's shots is a flaw to look for in every unit's
   surfaces. Send it to the unit director of each unit that has it.
+- Before a ruling says to copy a working model, check that model live with one
+  probe. A ruling that moves text states its minimum readable size and where
+  it goes.
 </DesignAuthority>
 
 ---

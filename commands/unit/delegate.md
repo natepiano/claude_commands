@@ -607,9 +607,12 @@ recording, with no report emitted between them.
 4. <VerbosePrePhaseGate/> when required
 5. <CoordinateDelegatedPhaseReservation/>
 6. <LaunchImplementation/>
-7. <DualReview/>
+7. <DualReview/>. Beside the implementation pass's review, run
+   <RunApplicationSmokeTest/> and <UXReview/> steps 1–3; open their rows and let
+   the first <Synthesize/> gate them with the code findings.
 8. <Synthesize/>
-9. <RunApplicationSmokeTest/>, then <UXReview/>
+9. <RunApplicationSmokeTest/>, then <UXReview/>, unless step 7 ran them and no
+   later change reached the app or the screen
 10. <RunProjectStyleReview/> — `single` only; loop and verbose run the run's one
     style review from <FinalGate/> after the whole plan is green
 11. <RunPhaseReview/>
@@ -938,10 +941,15 @@ repairs.
 
 A repair runs **one seat**: slot `impl`, task and kind `fix`. It makes the
 repair and writes, for each testable finding, the regression test that would
-have caught it — one that fails without the repair. It names each test for the
-behavior it pins and puts the finding id only in its summary; an id in code
-outlives the review that defined it. <ClosureReview/> is the cold read, so no seat is spent
-on one here. Its file set is the findings' files plus the test targets.
+have caught it — one that fails without the repair. A finding about what is
+drawn gets a test that renders and reads the pixels back, or a live pixel check
+the prompt names; a test of components, constants or hand-written pointer hits
+does not count. It names each test for the behavior it pins and puts the
+finding id only in its summary; an id in code outlives the review that defined
+it. <ClosureReview/> is the cold read, so no seat is spent
+on one here. Its file set is the findings' files plus the test targets. When a
+round runs parallel seats (a showrunner ruling), both prompts name one owner for
+each file or surface the seats share.
 
 Run `findings.py dispatch --covers <all batch ids>` before launching, then:
 
@@ -971,6 +979,13 @@ of:
   code change beside it;
 - a new private or crate-private type, function, or accessor whose every
   caller is inside the repair diff.
+
+**A repair to what is drawn is proved live before it closes.** Before closing
+the round or dispatching its closure review, launch the build and probe each
+repaired visible finding in the running app (BRP for a Bevy app): hover it,
+crop the shot, read the drawn pixels or layout. A visible finding that fails a second time gets a live
+diagnosis of its cause before any new seat, and the next prompt carries the
+measured cause.
 
 Dispatch the normal <DualReview/> closure review only when the diff cannot
 answer the question: a public API or signature change with a caller outside
