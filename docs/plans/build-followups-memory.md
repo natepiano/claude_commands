@@ -167,36 +167,25 @@ Measured 2026-10-04 11:59–12:25 PDT, read-only, from the earlyoom journal, the
 
 **Gotchas:** With `UnknownCores`, `quiet` waits its full `--max-wait` before reporting busy, since the verdict cannot change; `os.cpu_count()` is never `None` on Linux, so the path is rare. `dailies_render.py --footer` needs `--zone`.
 
-### Phase 6 — verify.sh refuses an example whose tests never run · status: todo
+### Phase 6 — verify.sh refuses an example whose tests never run · status: done
 
-#### Work Order
+#### As-built
 
-**Goal:** `verify.sh test <pkg>` and `verify.sh final` refuse a workspace where an example holds `#[cfg(test)]` code that cargo will never test, and say exactly which manifest lines fix it.
-
-**Source:** routed by the showrunner, 2026-10-04, from the tool-based-ui showrunner. cargo builds examples with `test = false` by default, so `take_test_targets`, `final`'s `nextest --workspace` and CI skip every inline `#[cfg(test)]` in an example. 11 hana examples hold tests that never ran; font_features' new tests "passed" under `verify.sh test hana_diegetic` while `verify.sh example-test hana_diegetic font_features` failed 2 of 3.
-
-**Spec:**
-- **What counts.** An example target (`kind` `example` in `cargo metadata --no-deps`) whose `test` is `false` and whose source holds a line matching `^\s*#\[cfg\(test\)\]`. Its source is the file `src_path` names; for an example in its own directory (`examples/<name>/main.rs`), every `.rs` file under that directory. The first match gives the file and line.
-- **`verify.sh test <pkg>`.** The package's gate run (no `--filter`, no integration target) checks `<pkg>`'s examples before any cache lookup and before any build: a cached result never stands in for the check, because the scanned sources are not in the cache key. Read the metadata once and share it with `take_test_targets`. `--filter` and a named target are feedback runs and are not refused. A refusal lists every offending example of the package, exits 2 and builds nothing; it is never cached as the tree's test result.
-- **`verify.sh final`.** Checks every workspace member's examples the same way, before any cache lookup and before `fmt_cargo --check`, and refuses with the whole list.
-- **The refusal text,** one block per example: `example <name> holds tests that never run: <file>:<line> has #[cfg(test)], and cargo builds examples with test = false.` Then the fix, in `<manifest_path>`: when the manifest already has an `[[example]]` entry with that name (read with `tomllib`), `add test = true to its [[example]] entry`; otherwise the three lines `[[example]]` / `name = "<name>"` / `test = true`.
-- **Tests** in `scripts/delegate/test_verify_untested_examples.py`, each with a scratch cargo package under a temporary directory. Run the real `verify.sh` command routing (not extracted functions), with real `cargo metadata` and stubs on `PATH` for everything that would build or format, so nothing compiles. Cases: an example with `#[cfg(test)]` and no entry is refused with its file, line and the three lines, exit 2, and no stub build or format ran; one with an existing `[[example]]` entry is told to add `test = true` to it; a directory example is found in a module file; `test = true` passes; an example with no `#[cfg(test)]` passes; `--filter` and a named integration target are not refused; a tree whose passing result is already cached is still refused; `final` lists offenders from two members and runs no format check.
-- **Landing.** The guard refuses any hana branch whose 11 examples lack `test = true`. That manifest fix belongs to tool-based-ui's examples unit. The showrunner holds the merge of this phase to `~/.claude` main until the tool-based-ui showrunner confirms its units carry it; this phase builds and checkpoints as usual.
+- `verify.sh test <pkg>` as a gate run (no `--filter`, no named target; `--features` allowed) and `verify.sh final` read `cargo metadata --no-deps --format-version 1` once into `GATE_METADATA` and pipe it to `UNTESTED_EXAMPLES_PY` with the package name, or `--workspace` for `final`. The check runs before the cache lookup, any build and `final`'s format check, so a recorded pass never stands in for it; `--filter` and named-target runs are feedback runs and skip it.
+- An offender is an example target with `test` false whose source holds a line matching `^\s*#\[cfg\(test\)\]`; the first match gives the file and line. A directory example (`examples/<name>/main.rs`) is scanned through every `.rs` file under its directory.
+- Each offender gets one block on stderr, blocks separated by a blank line, then exit 2 with nothing built: `example <name> holds tests that never run: <file>:<line> has #[cfg(test)], and cargo builds examples with test = false.` The fix follows: `in <manifest>: add test = true to its [[example]] entry` when the manifest (read with `tomllib`) already names the example, otherwise `in <manifest>:` and the three lines `[[example]]` / `name = "<name>"` / `test = true`.
+- `read_metadata` prints `GATE_METADATA` when set and runs `cargo metadata` otherwise; `require_member` and `take_test_targets` read through it, so a gate run reads metadata once.
+- The header's `test` and `final` usage lines say each refuses examples with tests cargo skips.
 
 **Files:**
-- `scripts/delegate/verify.sh` — the example check in the `test` gate run and in `final`; the header's `test` and `final` comments
-- `scripts/delegate/test_verify_untested_examples.py` — scratch-package cases
+- `scripts/delegate/verify.sh` — `UNTESTED_EXAMPLES_PY`, `read_metadata`, the check before `cache_lookup`, header comments
+- `scripts/delegate/test_verify_untested_examples.py` — eight scratch-package cases through real verify.sh routing: real `cargo metadata`, a cargo stub on `PATH` that passes `metadata` to real cargo and logs every other call, and a git stub that fixes the pass-record key
 
-**Seats:** `1 writer + 1 tester` — the check and its tests split by file.
-- `impl` — `scripts/delegate/verify.sh`; hub: `scripts/delegate/verify.sh`
-- `test` — `scripts/delegate/test_verify_untested_examples.py`, written from the Spec alone
+**Binds later work:** Phase 8's verify.sh acknowledgement goes after this refusal, at the first build step past the memory wait. A new verify.sh routing test follows `test_verify_untested_examples.py`'s stub pattern.
 
-**Constraints from prior phases:**
-- `verify.sh` embeds its metadata readers as Python strings run by `$PY` (`TEST_TARGETS_PY`, `MEMBER_PY`); `take_test_targets` reads `cargo metadata --no-deps --format-version 1` once. `require_member` exits 2 on a usage error. A step killed for memory re-runs once, and no status of 128 or more is cached as the tree's failure.
-- `scripts/delegate/test_verify_memory_kill.py` runs verify.sh's functions against stubs on `PATH`; follow its pattern.
-- A test never builds hana or loads the real machine.
+**Gotchas:** A failing `cargo metadata` exits with cargo's status under `set -e`, not 2. hana main has 7 offending examples; the ~/.claude main merge is held until tool-based-ui adds `test = true`.
 
-**Acceptance gate:** `python3 -m unittest discover -s scripts/delegate -p 'test_verify_*.py'` green; `bash -n scripts/delegate/verify.sh`; `basedpyright` 0 errors and 0 warnings on the new test file.
+**Ruled out:** Python 3.10 support for the check: the repo already needs 3.11+ (`tomllib`).
 
 ### Phase 7 — A measured working day · status: todo
 
@@ -271,5 +260,6 @@ Baseline before the diff: natedev's stopgap 160efd9 put CI in steve on 2026-10-0
 **Constraints from prior phases:**
 - Holder files in `~/.local/state/build-hold/` (`BUILD_HOLD_DIR` overrides it; tests always set it) are one JSON line `{"holder", "since", "for", "release_eta"}`; `read_holders` and `scripts/buildlog/rust_release.py` treat every regular file there as a hold. `release` prints `released, builds may resume.` only when no holder file remains. `ReleaseEta = KnownReleaseEta | UnknownReleaseEta`; `quiet_verdict` takes `Cores = KnownCores | UnknownCores`.
 - Tests never write `~/.local/state/build-hold` or the real release directory.
+- `verify.sh test <pkg>` (gate run) and `verify.sh final` read `cargo metadata --no-deps` once into `GATE_METADATA` and refuse an example holding `#[cfg(test)]` with `test = false` (exit 2) before the cache lookup and before any build; `read_metadata` reuses that read for `require_member` and `take_test_targets`. The acknowledgement goes after that refusal, at the first build step past the memory wait. `scripts/delegate/test_verify_untested_examples.py` shows the pattern for running real verify.sh routing with stubs on `PATH` (cargo passes `metadata` through; git is stubbed so the pass-record key is fixed).
 
 **Acceptance gate:** `python3 -m unittest discover -s scripts/build_hold -p 'test_*.py'` green; `bash -n scripts/delegate/verify.sh`; `basedpyright` 0 errors and 0 warnings on changed Python.
