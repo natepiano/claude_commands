@@ -10,7 +10,7 @@
 - **Showrunner checkout:** `/home/natepiano/worktrees/claude-build-followups-trunk`
 - **Showrunner session:** natedev
 - **Log:** `docs/plans/build-followups-log.md` — git-excluded; one line per event
-- **User zone:** America/New_York — every time the showrunner reports is in this zone only
+- **User zone:** America/Los_Angeles — every time the showrunner reports is in this zone only (user, 2026-10-04: "operate in PDT going forward")
 - **Updates:** every 30 minutes; each update reports every unit in full
 - **Merge tests:** `python3 -m unittest discover -s scripts/buildlog -p 'test_*.py'` (with `BUILDLOG_DIR` set to a temp dir until Phase 2 merges) and `basedpyright scripts/buildlog`, run in the showrunner checkout
 - **Capacity:** one unit; its seats share natedev's build slots (steve)
