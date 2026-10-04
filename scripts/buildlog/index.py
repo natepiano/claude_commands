@@ -29,7 +29,7 @@ from urllib.parse import quote
 
 import store
 
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 7
 LOCK_NAME = "index.lock"
 MARK_BYTES = 256
 BUSY_TIMEOUT_MS = 30_000
@@ -44,6 +44,7 @@ STEP_COLUMNS: list[Column] = [
     ("ended_at", "TEXT", "UTC ISO time"),
     ("duration_s", "REAL", "wall time of the step"),
     ("mem_wait_s", "INTEGER", "seconds the step waited for memory before it started"),
+    ("slice", "TEXT", "builds when the scope ran, fallback when it failed, none when no scope was tried"),
     ("step", "TEXT", "clippy, mend, doc, fmt, nextest, check, sweep, or the program run"),
     ("argv", "TEXT", "the command as a JSON array"),
     ("cwd", "TEXT", "where it ran"),
@@ -126,6 +127,8 @@ CALL_COLUMNS: list[Column] = [
     ("wall_s", "INTEGER", "seconds the run took"),
     ("build_s", "INTEGER", "cargo's own build seconds, NULL when unmeasured"),
     ("saved_s", "INTEGER", "seconds a reused or replayed record saved"),
+    ("mem_kills", "INTEGER", "memory-killed attempts during this verify.sh call"),
+    ("mem_kill_stopped", "INTEGER", "1 when a step was killed for memory twice and stopped this verify.sh call"),
     ("reuses", "TEXT", "port-lint: steps.id of the step a reused or replayed call stood in for"),
     ("reason", "TEXT", "port-lint: the line a deferred call printed, naming who was busy"),
     ("cwd", "TEXT", "where it ran"),
@@ -200,9 +203,18 @@ SAMPLE_COLUMNS: list[Column] = [
     ("mem_used_bytes", "INTEGER", "MemTotal minus MemAvailable"),
     ("swap_used_bytes", "INTEGER", "SwapTotal minus SwapFree"),
     ("builds_anon_bytes", "INTEGER", "anon memory in the user builds.slice; process memory"),
+    ("sccache_in_service", "INTEGER", "1 when sccache.service has a process, 0 when empty, NULL without builds.slice"),
     ("ci_anon_bytes", "INTEGER", "anon memory in hana-ci.slice; process memory"),
     ("stall_some_us", "INTEGER", "machine memory some stall counter since boot, microseconds"),
     ("stall_full_us", "INTEGER", "machine memory full stall counter since boot, microseconds"),
+]
+
+MEMORY_SNAPSHOT_COLUMNS: list[Column] = [
+    ("src", "TEXT", "source file"),
+    ("host", "TEXT", "machine's short host name"),
+    ("at", "TEXT", "UTC ISO snapshot time"),
+    ("slices", "TEXT", "JSON cgroup events, peaks and limits by slice"),
+    ("zram", "TEXT", "JSON zram storage at the snapshot time"),
 ]
 
 TABLES: dict[str, tuple[list[Column], str, str]] = {
@@ -221,6 +233,7 @@ TABLES: dict[str, tuple[list[Column], str, str]] = {
     "ci_jobs": (CI_JOB_COLUMNS, "", "their jobs"),
     "ci_steps": (CI_STEP_COLUMNS, "PRIMARY KEY (job_id, number)", "the jobs' steps"),
     "samples": (SAMPLE_COLUMNS, "", "one 60 s machine memory sample; counters reset on reboot"),
+    "memory_snapshots": (MEMORY_SNAPSHOT_COLUMNS, "", "slice and zram counters at a requested instant"),
 }
 
 VIEWS: dict[str, tuple[str, str]] = {
@@ -307,6 +320,7 @@ def create_schema(connection: sqlite3.Connection) -> None:
     statements.append("CREATE INDEX calls_started ON calls (started_at)")
     statements.append("CREATE INDEX ci_jobs_run ON ci_jobs (run_id, attempt)")
     statements.append("CREATE INDEX samples_host_at ON samples (host, at)")
+    statements.append("CREATE INDEX memory_snapshots_at ON memory_snapshots (at)")
     for view, (_, select) in VIEWS.items():
         statements.append(f"CREATE VIEW {view} AS {select}")
     for statement in statements:
@@ -409,6 +423,10 @@ def add_sample(connection: sqlite3.Connection, record: dict[str, object], src: s
     insert(connection, "samples", pick({**record, "src": src}, SAMPLE_COLUMNS))
 
 
+def add_memory_snapshot(connection: sqlite3.Connection, record: dict[str, object], src: str) -> None:
+    insert(connection, "memory_snapshots", pick({**record, "src": src}, MEMORY_SNAPSHOT_COLUMNS))
+
+
 def add_ci_run(connection: sqlite3.Connection, record: dict[str, object], src: str) -> None:
     jobs = record.get("jobs")
     job_list = cast(list[object], jobs) if isinstance(jobs, list) else []
@@ -455,7 +473,8 @@ def add_ci_run(connection: sqlite3.Connection, record: dict[str, object], src: s
             insert(connection, "ci_steps", pick(step_row, CI_STEP_COLUMNS))
 
 
-ADDERS = {"step": add_step, "call": add_call, "ci_run": add_ci_run, "sample": add_sample}
+ADDERS = {"step": add_step, "call": add_call, "ci_run": add_ci_run, "sample": add_sample,
+          "memory_snapshot": add_memory_snapshot}
 
 
 def forget(connection: sqlite3.Connection, src: str) -> None:

@@ -99,7 +99,21 @@ def anon_bytes(cgroup: Path) -> int | Unmeasured:
     return Unmeasured.VALUE
 
 
-def sample() -> None:
+def sccache_in_service(builds: Path) -> int | Unmeasured:
+    if not builds.is_dir():
+        return Unmeasured.VALUE
+    try:
+        return int(bool((builds / "sccache.service/cgroup.procs").read_text().strip()))
+    except OSError:
+        return 0
+
+
+class SampleTaken(NamedTuple):
+    at: float
+    host: str
+
+
+def sample() -> SampleTaken:
     """Append the current machine counters to a separate monthly JSONL file."""
     if not all(path.exists() for path in (MEMINFO, PRESSURE, BOOT_ID)):
         raise SystemExit("buildlog sample is Linux only (requires /proc).")
@@ -108,7 +122,9 @@ def sample() -> None:
     boot_id = parse_boot_id(BOOT_ID.read_text())
     memory = parse_meminfo(MEMINFO.read_text())
     stalls = parse_pressure(PRESSURE.read_text())
-    builds = anon_bytes(Path(os.environ.get("BUILDLOG_BUILDS_CGROUP", f"/sys/fs/cgroup/user.slice/user-{os.getuid()}.slice/user@{os.getuid()}.service/builds.slice")))
+    builds_path = Path(os.environ.get("BUILDLOG_BUILDS_CGROUP", f"/sys/fs/cgroup/user.slice/user-{os.getuid()}.slice/user@{os.getuid()}.service/builds.slice"))
+    builds = anon_bytes(builds_path)
+    sccache = sccache_in_service(builds_path)
     ci = anon_bytes(Path(os.environ.get("BUILDLOG_CI_CGROUP", str(CI_CGROUP))))
     record: dict[str, object] = {
         "kind": "sample",
@@ -118,8 +134,10 @@ def sample() -> None:
         "mem_used_bytes": memory.memory_bytes,
         "swap_used_bytes": memory.swap_bytes,
         "builds_anon_bytes": builds if isinstance(builds, int) else None,
+        "sccache_in_service": sccache if isinstance(sccache, int) else None,
         "ci_anon_bytes": ci if isinstance(ci, int) else None,
         "stall_some_us": stalls.some_us,
         "stall_full_us": stalls.full_us,
     }
     store.append_line(store.sample_file(host, at), record)
+    return SampleTaken(at, host)

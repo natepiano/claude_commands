@@ -290,7 +290,7 @@ class IndexTests(unittest.TestCase):
         with closing(sqlite3.connect(index.index_path())) as connection:
             _ = connection.execute("PRAGMA user_version = 5")
         self.assertEqual(index.update(), 1)
-        self.assertEqual(self.rows("PRAGMA user_version"), [(6,)])
+        self.assertEqual(self.rows("PRAGMA user_version"), [(index.SCHEMA_VERSION,)])
         self.assertEqual(self.rows("SELECT mem_wait_s FROM steps"), [(12,)])
 
     def test_memory_stall_columns_and_samples_ingest(self) -> None:

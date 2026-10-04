@@ -14,6 +14,7 @@ from datetime import date, datetime, timedelta
 from typing import cast
 
 import disk
+import memory
 import sync
 import rust_release
 
@@ -202,9 +203,7 @@ def memory_pressure_section(connection: sqlite3.Connection, day: str, hosts: int
         + " FROM samples WHERE date(at, 'localtime') = ? ORDER BY host, at",
         day,
     )
-    if not stalled and not samples and not longest:
-        return ["Memory pressure: no samples and no step stalls.", ""]
-
+    instruments = memory.instrument_lines(connection, "date({column}, 'localtime') = ?", (day,))
     section = ["### Memory pressure", "", "Source: 60 s machine samples and step cgroup stall counters.", ""]
     if longest:
         is_scratch, caller, host = longest[0]
@@ -212,6 +211,7 @@ def memory_pressure_section(connection: sqlite3.Connection, day: str, hosts: int
         section += [f"memory waits: {count(waits[0])} steps, total {seconds(waits[1])}, longest {seconds(waits[2])} ({who})", ""]
     else:
         section += ["memory waits: none", ""]
+    section += [*instruments, ""]
     if stalled:
         body = [
             [SCRATCH_LABEL if is_scratch else caller_label(caller, host, hosts), str(step), seconds(stall), count(at_once)]
