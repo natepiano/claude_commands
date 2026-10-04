@@ -51,7 +51,10 @@ Read the current state, not memory, and check what you state the way
 3. **Each unit.** Capture its unit director's pane
    (`tmux capture-pane -p -t <session> -S -60`): the phase, what it is doing now, its latest phase ETA, and any `— decision:`,
    `— blocked:` or form waiting. Text after `❯` may be a prompt suggestion, not
-   the user's draft.
+   the user's draft: `capture-pane -e` shows a suggestion dimmed (`ESC[2m`).
+   Note when the ETA was stated. One stated over an hour ago gets `/unit:eta`
+   this turn, and its `detail` reads `set HH:MM` until a new one arrives. User,
+   2026-10-04.
 4. **Merge branch.** Its last merge, whether it is pushed, and anything held or
    testing.
 5. **Open topics.** Everything in `LOG` not yet closed: held quota alerts, CI,
