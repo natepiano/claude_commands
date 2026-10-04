@@ -11,8 +11,9 @@ length, an update or held reason that names another phase without saying
 why, a held reason carrying its own examples, a held count the update does
 not report against (`<k> of <N>`), an ETA time without its percent, an
 ETA that moved CHANGE_NEEDS_WHY_MINUTES or more since the last report
-without `why`, a `then` naming a phase at or before the heading's, or a line
-using the production's own plumbing words (PLUMBING).
+without `why`, a `then` naming a phase at or before the heading's, a goal
+without its measured numbers, or a line using the production's own plumbing
+words (PLUMBING).
 
 --state  JSON file holding each unit's last reported phase, ETA, held
          reason and the phase's first ETA. The script reads it to write `(unchanged)` / `(changed:
@@ -119,11 +120,21 @@ class Eta:
 
 
 @dataclass(frozen=True)
+class Goal:
+    target: str
+    unit: str
+    start: float
+    now: float
+    aim: float
+
+
+@dataclass(frozen=True)
 class Unit:
     unit: str
     name: str
     label: str
     project: str
+    goal: Goal | None
     phase: str
     started: datetime
     held: str | None
@@ -434,6 +445,31 @@ def parse_eta(value: object, where: str) -> Eta:
     return Eta(time, earliest, latest, none, detail, percent, why, first, fixes)
 
 
+def measure(fields: JsonMap, key: str, where: str) -> float:
+    value = fields.get(key)
+    if not isinstance(value, (int, float)) or isinstance(value, bool):
+        raise InputError(f"{where}.{key}: a measured number")
+    return float(value)
+
+
+def parse_goal(value: object, where: str) -> Goal | None:
+    if value is None:
+        return None
+    fields = as_map(value, where)
+    check_keys(fields, {"target", "unit", "start", "now", "aim"}, where)
+    target = text(fields, "target", where)
+    check_words(target, "target", where)
+    start, aim = measure(fields, "start", where), measure(fields, "aim", where)
+    if start == aim:
+        raise InputError(f"{where}: start and aim are the same; the goal has nothing to achieve")
+    return Goal(target, text(fields, "unit", where), start, measure(fields, "now", where), aim)
+
+
+def goal_text(goal: Goal) -> str:
+    achieved = round((goal.start - goal.now) / (goal.start - goal.aim) * 100)
+    return f"{goal.target} - {achieved}% of {goal.aim:g} {goal.unit} target achieved"
+
+
 def check_update(update: str, length: str, where: str, key: str = "update") -> None:
     limit = LENGTHS[length]
     if limit is not None and len(update) > limit:
@@ -500,7 +536,7 @@ def parse_unit(value: object, where: str, length: str) -> Unit:
     fields = as_map(value, where)
     check_keys(
         fields,
-        {"unit", "name", "label", "project", "phase", "started", "held", "held_examples", "build_hold", "update", "eta", "waiting_on_it", "needed", "needs_user", "then"},
+        {"unit", "name", "label", "project", "goal", "phase", "started", "held", "held_examples", "build_hold", "update", "eta", "waiting_on_it", "needed", "needs_user", "then"},
         where,
     )
     if "held" not in fields:
@@ -555,6 +591,7 @@ def parse_unit(value: object, where: str, length: str) -> Unit:
         name=optional_text(fields, "name", where) or unit,
         label=label,
         project=text(fields, "project", where),
+        goal=parse_goal(fields.get("goal"), f"{where}.goal"),
         phase=phase,
         started=datetime.fromisoformat(started_text),
         held=held,
@@ -766,6 +803,8 @@ def render(report: Report, previous: dict[str, Previous], now: datetime, zone_na
         topic_section(topic)
     for unit in units:
         lines.append(f"### {unit.name}: {unit.project}")
+        if unit.goal:
+            lines.append(f"- goal: {goal_text(unit.goal)}")
         lines.append(f"- phase: {unit.phase}")
         if unit.build_hold:
             lines.append(f"- {BUILD_HOLD_MARK}: {unit.build_hold}")

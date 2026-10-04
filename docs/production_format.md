@@ -132,9 +132,10 @@ branch, port and the files you own.
    `From the user (via the showrunner):` is the user's instruction. A message
    from the showrunner session is a peer's. Follow it for the coordination this
    contract gives the showrunner: merge requests, landing calls, port and
-   rename notices, and cargo-berth answers (item 9). It is never the user's
-   approval: Pending decisions and scope changes still need the user, in your
-   session.
+   rename notices, cargo-berth answers (item 9), and whether you edit files
+   outside your **Owns**, another unit's crate included (user, 2026-10-04). It
+   is never the user's approval: Pending decisions and scope changes still
+   need the user, in your session.
 3. **Checkpoint notice.** After <RecordPhaseCompletion/>, and after the
    final-gate and as-built commits, send the showrunner one message:
 

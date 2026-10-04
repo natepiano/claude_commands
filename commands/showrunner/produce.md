@@ -69,6 +69,10 @@ State:
   - packaging;
   - cargo-berth overlap answers, incursion resolves, orphan retirement and
     releases (<Dependencies/> rule 3);
+  - whether a unit edits files outside its **Owns**, another unit's crate
+    included: settle it by who holds the files on the berth board and when
+    each holder merges, as <Dependencies/> rule 3 settles a file wait. No
+    rule needs the user's OK for this (user, 2026-10-04);
   - a unit director's as-built close-out form, when the choice is the logical one.
 
   Unusual as-built choices go to the user: a folder other than the usual
@@ -79,7 +83,8 @@ State:
     words, with the answer relayed back;
   - product and scope choices;
   - anything that cannot be undone;
-  - a quota alert (<QuotaAlert/>).
+  - a quota alert (<QuotaAlert/>);
+  - the discussion agenda (<Agenda/>).
 - **Long commands** run in the background. The task notification is the wait;
   never poll.
 - **Helpers.** Stop each named helper agent once its report is read.
@@ -428,6 +433,12 @@ guide named in the production doc holds the rules that make the bar concrete.
 - Before a ruling says to copy a working model, check that model live with one
   probe. A ruling that moves text states its minimum readable size and where
   it goes.
+- A ruling that sets a pattern every example shares (how a list of options
+  reads, what a chip says) goes into the repository's example guide
+  (`docs/fairy_dust/canonical-example.md` in hana). Send the unit that owns the
+  examples the exact text with the ruling, to add in its worktree in the
+  current phase; at that phase's merge, check the guide carries it, or send it
+  back. User, 2026-10-04.
 </DesignAuthority>
 
 ---
@@ -695,6 +706,25 @@ rebuild waited 1.5 h with no push.
 Never sent: dailies, ETAs, routine merges, green CI, flakes rerun, and hardware
 checks that wait on the user's travel.
 </Notify>
+
+---
+
+<Agenda>
+A phase that runs past 8 hours is talked over with the user (user,
+2026-10-04). It never blocks the unit.
+
+- **When.** In the tick or turn that first sees a phase 8 hours past its
+  start, or an ETA more than 8 hours after its start, add it.
+- **The item.** The unit and phase, hours so far, ETA and repair rounds; what
+  took the time, from `LOG` and the unit director's reports; the options
+  (land now under <LandingCall/>, split, cut scope) and your pick.
+- **Where.** `- HH:MM <zone>: agenda: <item>` in `LOG`, listed in every
+  `### STATE` while open. The dailies carry one topic, `For discussion with
+  you`, naming the open items.
+- **When the user is here.** In the first reply to a message from the user,
+  after answering it, list the open items. Never push for it.
+- Close one with `- HH:MM <zone>: agenda closed: <item>: <what was decided>`.
+</Agenda>
 
 ---
 

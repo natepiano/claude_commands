@@ -124,6 +124,7 @@ python3 ~/.claude/scripts/production/dailies_render.py <scratchpad>/dailies_inpu
 | `name` | The plan the unit runs, when its session name does not say it (a lane that took on another plan): `hana_organon`. Defaults to `unit`. |
 | `label` | The timeline row name, at most 8 characters. Defaults to the unit name without `-unit`. |
 | `project` | The goal of the unit's whole plan, in a few words, from its plan doc's opening: what you get when every phase is done. Not this phase, and not a list. Example: `tools you build and edit in the 3D scene`. It is the section heading. |
+| `goal` | Required when the unit owns a measurable goal: `target` (the goal in words, its number included), `unit` (`ms`), and the measured `start`, `now` and `aim` from the unit's latest measured run. The renderer prints `goal: <target> - <x>% of <aim> <unit> target achieved`, x from the three numbers. A goal with no number yet gets one before the next report: ask the unit director for a measured baseline and settle the aim. User, 2026-10-04. |
 | `phase` | `Phase <N> of <M>: <what it changes>` from the unit's plan. Work outside a numbered plan gives its place in the unit's queue: `follow-up <K> of <Q>: <what it changes>`. The renderer refuses anything else. |
 | `started` | When the phase started, `YYYY-MM-DDTHH:MM` in `ZONE`, from the unit director or `LOG`. The timeline row starts there. |
 | `held` | Required. When the phase's checkpoint waits unmerged, the reason alone, in a few words, written to follow "not merged, because": `the design check found 16 defects`. `null` when no checkpoint waits. No examples here; the renderer refuses `such as`. |
@@ -162,7 +163,7 @@ names another plan's document. User, 2026-10-02.
 ### What the renderer writes
 
 - **First line:** the length and the time in `ZONE`: `**Dailies (Simple)**, 19:05 PDT`.
-- **One section per subject:** `### <unit>: <project>`, then `phase:`, `build hold:`
+- **One section per subject:** `### <unit>: <project>`, then `goal:` when given, `phase:`, `build hold:`
   and `checkpoint: not merged, because ...` when given, `update:`, `eta:`, and
   `waiting on it:`, `needed:` and `then:` when given. In `simple`, a held
   reason shows its examples only the first time. The word "held" is kept for
@@ -245,6 +246,10 @@ For every length:
   | `a helper is retaking every view, 4 of 9 shots done` | Shorthand: "retaking every view" says nothing. | `taking new screenshots to check the glow change, 4 of 9 done` |
   | `its stale file holds from the merged work are released` | Production plumbing that changes nothing you see. | Leave it out. |
   | `the writer and tester are renaming every crate; file clashes get settled at its checkpoint` | Seat roles and plumbing. | `renaming Composite to Assembly in every crate's code and tests` |
+  | `then: Phase 8 (fault words say what they hold)` | The plan's heading copied; it names no result you would notice (user, 2026-10-04). | `then: Phase 8 (error messages say plainly what went wrong)` |
+
+  A `phase:` or `then:` is never the plan's heading copied: say what you
+  will notice in the app when it is done.
 
   The renderer refuses the plumbing words it knows (`PLUMBING`: berth,
   reservation, holder, file holds, file clashes, writer, tester, retake,
