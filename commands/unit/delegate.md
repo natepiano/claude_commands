@@ -206,6 +206,13 @@ Applies to every implementation, test, fix, and review launcher.
    work, and its timer is the one most often dropped.
 5. Codex: apply <CodexDispatchWait/>. Never end the turn while the launcher is
    active; its terminal result drives the next workflow step.
+6. A launcher killed at its time limit leaves its Codex seat running with no
+   one watching. Arm a Monitor on `${SESSION_DIR}/board.log` until that seat
+   posts its own `done`, not a `launcher:` line. Once it has, and its last lint
+   and test passed after its last edit, end it with `codex_mesh.py end
+   --session-dir "${SESSION_DIR}" --to <seat>` (never `stop`, which ends every
+   seat on the server). Then record the outcome the launcher would have; for a
+   repair, that is <FixDispatch/>'s third outcome.
 </DispatchContract>
 
 <DelegateLaunchFailure>
