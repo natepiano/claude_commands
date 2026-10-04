@@ -154,6 +154,42 @@ def calls_section(connection: sqlite3.Connection, day: str) -> tuple[list[str], 
     return section, f"Agent calls: {total} ({parts}), {seconds(saved)} saved by pass records."
 
 
+def test_builds_section(connection: sqlite3.Connection, day: str) -> list[str]:
+    rows = fetch(
+        connection,
+        f"SELECT command, build_s FROM calls WHERE {ON_DAY} AND tool = 'verify.sh' AND verb = 'test' AND build_s IS NOT NULL",
+        day,
+    )
+    if not rows:
+        return []
+
+    builds: dict[str, list[int]] = {"whole-package": [], "--filter": []}
+    for command, build in rows:
+        scope = "--filter" if "--filter" in str(command).split() else "whole-package"
+        builds[scope].append(cast(int, build))
+
+    body = [
+        ["Baseline 2026-10-01/02", "whole-package", seconds(5.20 * 3600), seconds(137)],
+        ["Baseline 2026-10-04 from 00:07 EDT", "whole-package", seconds(5.0 * 3600), seconds(103)],
+        ["Baseline 2026-10-04 from 00:07 EDT", "--filter", seconds(14.4 * 3600), seconds(71)],
+    ]
+    for scope, values in builds.items():
+        if values:
+            ordered = sorted(values)
+            body.append([day, scope, seconds(sum(values)), seconds(ordered[(3 * len(ordered) - 1) // 4])])
+
+    return [
+        "### Test builds (temporary)",
+        "",
+        "Source: build log `verify.sh test` calls with measured `build_s`; p75 is the nearest rank.",
+        "",
+        *table(["Period", "Scope", "Build/day", "p75 build/call"], body),
+        "",
+        "Temporary: kept until the user calls the result settled.",
+        "",
+    ]
+
+
 def port_lint_section(connection: sqlite3.Connection, day: str) -> tuple[list[str], list[str]]:
     """cargo-port's lint calls that ran nothing; the ones that ran are its steps above. Nothing at all when none."""
     rows = outcomes(connection, day, "port-lint")
@@ -234,7 +270,7 @@ def report(connection: sqlite3.Connection, day: str) -> str:
     calls, calls_line = calls_section(connection, day)
     port_lint, port_lint_line = port_lint_section(connection, day)
     ci, ci_line = ci_section(connection, day)
-    lines += calls + port_lint + ci
+    lines += calls + test_builds_section(connection, day) + port_lint + ci
     if found:
         for name, which, with_failed in SUMMARIES:
             lines += [f"### Summary: {name}", "", *summary(connection, day, found, which, with_failed), ""]
