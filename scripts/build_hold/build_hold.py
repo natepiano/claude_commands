@@ -25,16 +25,29 @@ SAFE = re.compile(r"[^A-Za-z0-9._-]")
 
 
 @dataclass(frozen=True)
-class KnownRelease:
+class KnownReleaseEta:
     at: datetime
 
 
 @dataclass(frozen=True)
-class UnknownRelease:
+class UnknownReleaseEta:
     pass
 
 
-ReleaseEta = KnownRelease | UnknownRelease
+ReleaseEta = KnownReleaseEta | UnknownReleaseEta
+
+
+@dataclass(frozen=True)
+class KnownCores:
+    count: int
+
+
+@dataclass(frozen=True)
+class UnknownCores:
+    pass
+
+
+Cores = KnownCores | UnknownCores
 
 
 @dataclass(frozen=True)
@@ -122,7 +135,7 @@ def read_holder(path: Path) -> Holder:
     except FileNotFoundError:
         raise
     except (OSError, UnicodeError):
-        return Holder(path.name, fallback, "unreadable holder file", UnknownRelease())
+        return Holder(path.name, fallback, "unreadable holder file", UnknownReleaseEta())
     try:
         raw = cast(object, json.loads(content))
         if isinstance(raw, dict):
@@ -132,18 +145,18 @@ def read_holder(path: Path) -> Holder:
             purpose = fields.get("for")
             release = fields.get("release_eta")
             if isinstance(name, str) and isinstance(since, str) and isinstance(purpose, str) and isinstance(release, str):
-                eta: ReleaseEta = UnknownRelease() if release == "unknown" else KnownRelease(aware_instant(release))
+                eta: ReleaseEta = UnknownReleaseEta() if release == "unknown" else KnownReleaseEta(aware_instant(release))
                 return Holder(name, aware_instant(since), purpose, eta)
     except (ValueError, TypeError):
         pass
     match = INSTANT.search(content)
     if match is None:
-        return Holder(path.name, fallback, content, UnknownRelease())
+        return Holder(path.name, fallback, content, UnknownReleaseEta())
     try:
         since = aware_instant(match.group())
     except ValueError:
         since = fallback
-    return Holder(path.name, since, content[match.end():].lstrip(" ,;:-").strip(), UnknownRelease())
+    return Holder(path.name, since, content[match.end():].lstrip(" ,;:-").strip(), UnknownReleaseEta())
 
 
 def read_holders(directory: Path) -> HoldState:
@@ -162,7 +175,7 @@ def read_holders(directory: Path) -> HoldState:
 
 
 def release_eta_text(release: ReleaseEta) -> str:
-    if isinstance(release, UnknownRelease):
+    if isinstance(release, UnknownReleaseEta):
         return "unknown"
     return release.at.astimezone().strftime("%H:%M %Z")
 
@@ -216,15 +229,17 @@ def release_hold(directory: Path, name: str) -> str:
     return "released; still held by " + "; ".join(holder_text(holder) for holder in state.holders)
 
 
-def quiet_verdict(load_1m: float, cores: int, processes: Sequence[Process], user: str) -> Quiet | Busy:
+def quiet_verdict(load_1m: float, cores: Cores, processes: Sequence[Process], user: str) -> Quiet | Busy:
     own = Counter(process.command for process in processes if process.user == user and process.command in BUILD_COMMANDS)
     reasons: list[str] = []
     if own:
         reasons.append("your builds still running: " + ", ".join(f"{count} {command}" for command, count in sorted(own.items(), key=lambda item: (-item[1], item[0]))))
-    if load_1m >= cores / 4:
+    if isinstance(cores, UnknownCores):
+        reasons.append("core count unavailable, so the load limit cannot be judged")
+    elif load_1m >= cores.count / 4:
         heaviest = sorted(processes, key=lambda process: process.cpu_percent, reverse=True)[:5]
         running = ", ".join(f"{process.user} {process.command} {process.cpu_percent:g}%" for process in heaviest)
-        reasons.append(f"1-minute load {load_1m:g} is at or above {cores / 4:g}; heaviest: {running or 'none visible'}")
+        reasons.append(f"1-minute load {load_1m:g} is at or above {cores.count / 4:g}; heaviest: {running or 'none visible'}")
     return Busy(tuple(reasons)) if reasons else Quiet()
 
 
@@ -242,13 +257,18 @@ def read_processes() -> list[Process]:
     return processes
 
 
+def read_cores() -> Cores:
+    count = os.cpu_count()
+    return UnknownCores() if count is None else KnownCores(count)
+
+
 def wait_for_quiet(
     max_wait: float = 600,
     *,
     clock: Callable[[], float] = time.monotonic,
     sleep: Callable[[float], None] = time.sleep,
     load: Callable[[], float] = lambda: os.getloadavg()[0],
-    cores: Callable[[], int | None] = os.cpu_count,
+    cores: Callable[[], Cores] = read_cores,
     processes: Callable[[], Sequence[Process]] = read_processes,
     user: str | None = None,
 ) -> Quiet | Busy:
@@ -257,7 +277,7 @@ def wait_for_quiet(
     current_user = user or os.environ.get("USER", "")
     deadline = clock() + max_wait
     while True:
-        result = quiet_verdict(load(), cores() or 1, processes(), current_user)
+        result = quiet_verdict(load(), cores(), processes(), current_user)
         if isinstance(result, Quiet) or clock() >= deadline:
             return result
         sleep(min(10, max(0, deadline - clock())))

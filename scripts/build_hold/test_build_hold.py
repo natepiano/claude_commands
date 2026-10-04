@@ -47,7 +47,7 @@ class HolderTests(unittest.TestCase):
             self.assertEqual(state.holders[0].name, "old-seat")
             self.assertEqual(state.holders[0].since, datetime.fromisoformat("2026-10-04T10:56:00-07:00"))
             self.assertIn("the focused test", state.holders[0].purpose)
-            self.assertIsInstance(state.holders[0].release, build_hold.UnknownRelease)
+            self.assertIsInstance(state.holders[0].release, build_hold.UnknownReleaseEta)
 
     def test_legacy_without_instant_uses_mtime_and_whole_line(self) -> None:
         with tempfile.TemporaryDirectory() as scratch:
@@ -62,7 +62,7 @@ class HolderTests(unittest.TestCase):
             self.assertEqual(state.holders[0].purpose, line)
             self.assertAlmostEqual(state.holders[0].since.timestamp(), instant.timestamp(), delta=1)
             self.assertIsNotNone(state.holders[0].since.tzinfo)
-            self.assertIsInstance(state.holders[0].release, build_hold.UnknownRelease)
+            self.assertIsInstance(state.holders[0].release, build_hold.UnknownReleaseEta)
 
     def test_json_holders_are_ordered_by_since_and_release_is_typed(self) -> None:
         with tempfile.TemporaryDirectory() as scratch:
@@ -72,10 +72,10 @@ class HolderTests(unittest.TestCase):
             state = build_hold.read_holders(folder)
             assert isinstance(state, build_hold.ActiveHolders)
             self.assertEqual([holder.name for holder in state.holders], ["earlier", "later"])
-            self.assertIsInstance(state.holders[0].release, build_hold.KnownRelease)
-            self.assertIsInstance(state.holders[1].release, build_hold.UnknownRelease)
+            self.assertIsInstance(state.holders[0].release, build_hold.KnownReleaseEta)
+            self.assertIsInstance(state.holders[1].release, build_hold.UnknownReleaseEta)
             known = state.holders[0].release
-            assert isinstance(known, build_hold.KnownRelease)
+            assert isinstance(known, build_hold.KnownReleaseEta)
             self.assertEqual(known.at, datetime.fromisoformat("2026-10-04T11:15:00-07:00"))
 
     def test_each_regular_file_remains_a_hold_when_content_is_bad(self) -> None:
@@ -131,22 +131,42 @@ class QuietTests(unittest.TestCase):
 
         with mock.patch.object(subprocess, "check_output", side_effect=fake_ps):
             processes = build_hold.read_processes()
-        verdict = build_hold.quiet_verdict(1.0, 32, processes, user)
+        verdict = build_hold.quiet_verdict(1.0, build_hold.KnownCores(32), processes, user)
         self.assertIsInstance(verdict, build_hold.Busy)
         assert isinstance(verdict, build_hold.Busy)
         self.assertIn("1 cargo", "; ".join(verdict.reasons))
-        high_load = build_hold.quiet_verdict(8.0, 32, processes, user)
+        high_load = build_hold.quiet_verdict(8.0, build_hold.KnownCores(32), processes, user)
         assert isinstance(high_load, build_hold.Busy)
         self.assertIn("natepiano cargo", "; ".join(high_load.reasons))
 
     def test_quiet_requires_both_low_load_and_no_user_build(self) -> None:
         others = [build_hold.Process(41, "ci", "cargo", 80.0)]
-        self.assertIsInstance(build_hold.quiet_verdict(7.99, 32, others, "nate"), build_hold.Quiet)
-        self.assertIsInstance(build_hold.quiet_verdict(8.0, 32, others, "nate"), build_hold.Busy)
+        self.assertIsInstance(build_hold.quiet_verdict(7.99, build_hold.KnownCores(32), others, "nate"), build_hold.Quiet)
+        self.assertIsInstance(build_hold.quiet_verdict(8.0, build_hold.KnownCores(32), others, "nate"), build_hold.Busy)
         own = [build_hold.Process(42, "nate", "rustc", 12.0)]
-        self.assertIsInstance(build_hold.quiet_verdict(1.0, 32, own, "nate"), build_hold.Busy)
+        self.assertIsInstance(build_hold.quiet_verdict(1.0, build_hold.KnownCores(32), own, "nate"), build_hold.Busy)
         nextest = [build_hold.Process(43, "nate", "cargo-nextest", 1.0)]
-        self.assertIsInstance(build_hold.quiet_verdict(1.0, 32, nextest, "nate"), build_hold.Busy)
+        self.assertIsInstance(build_hold.quiet_verdict(1.0, build_hold.KnownCores(32), nextest, "nate"), build_hold.Busy)
+
+    def test_unknown_cores_names_uncertainty_while_known_cores_are_quiet(self) -> None:
+        with tempfile.TemporaryDirectory() as scratch, mock.patch.dict(os.environ, {"BUILD_HOLD_DIR": scratch}):
+            unknown = build_hold.wait_for_quiet(
+                0, clock=lambda: 0.0, load=lambda: 1.0,
+                cores=lambda: build_hold.UnknownCores(), processes=lambda: [], user="nate",
+            )
+            known = build_hold.wait_for_quiet(
+                0, clock=lambda: 0.0, load=lambda: 1.0,
+                cores=lambda: build_hold.KnownCores(32), processes=lambda: [], user="nate",
+            )
+        self.assertEqual(unknown, build_hold.Busy(("core count unavailable, so the load limit cannot be judged",)))
+        self.assertIsInstance(known, build_hold.Quiet)
+
+    def test_cpu_count_is_converted_to_a_core_state(self) -> None:
+        with tempfile.TemporaryDirectory() as scratch, mock.patch.dict(os.environ, {"BUILD_HOLD_DIR": scratch}):
+            with mock.patch.object(os, "cpu_count", return_value=None):
+                self.assertIsInstance(build_hold.read_cores(), build_hold.UnknownCores)
+            with mock.patch.object(os, "cpu_count", return_value=32):
+                self.assertEqual(build_hold.read_cores(), build_hold.KnownCores(32))
 
     def test_own_builds_are_grouped_by_command_largest_first(self) -> None:
         processes = [
@@ -155,7 +175,7 @@ class QuietTests(unittest.TestCase):
             *[build_hold.Process(pid, "nate", "cargo", 1.0) for pid in range(37, 43)],
             build_hold.Process(43, "ci", "rustc", 1.0),
         ]
-        verdict = build_hold.quiet_verdict(1.0, 32, processes, "nate")
+        verdict = build_hold.quiet_verdict(1.0, build_hold.KnownCores(32), processes, "nate")
         self.assertEqual(verdict, build_hold.Busy(("your builds still running: 34 rustc, 6 cargo, 3 cargo-nextest",)))
 
     def test_high_load_for_entire_wait_names_ci_and_other_session(self) -> None:
@@ -179,7 +199,7 @@ class QuietTests(unittest.TestCase):
             clock=clock,
             sleep=sleep,
             load=lambda: 9.0,
-            cores=lambda: 32,
+            cores=lambda: build_hold.KnownCores(32),
             processes=lambda: running,
             user="nate",
         )
@@ -202,7 +222,7 @@ class QuietTests(unittest.TestCase):
             clock=lambda: 0.0,
             sleep=lambda seconds: self.fail(f"unexpected sleep: {seconds}"),
             load=lambda: 1.0,
-            cores=lambda: 32,
+            cores=lambda: build_hold.KnownCores(32),
             processes=lambda: [build_hold.Process(77, "nate", "cargo", 2.0)],
             user="nate",
         )

@@ -46,7 +46,7 @@ from typing import cast
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "build_hold"))
-from build_hold import ActiveHolders, HoldState, KnownRelease, NoHolders, Holder, holder_directory, read_holders
+from build_hold import ActiveHolders, HoldState, KnownReleaseEta, NoHolders, Holder, holder_directory, read_holders
 
 LENGTHS = {"simple": 240, "page": 480, "elaborate": None}
 PHASE = re.compile(r"^(?:Phase (\d+) of (\d+)|follow-up (\d+) of (\d+)): \S")
@@ -337,13 +337,14 @@ def draw_from(start: datetime, now: datetime, rows: list[Row], style: ChartStyle
             cells[earliest_cell] = style.earliest
             for index in range(earliest_cell + 1, eta_cell):
                 cells[index] = style.before_eta
-        # The ETA takes the earliest time's cell when the two share an hour;
-        # the latest keeps its own.
+        # The ETA takes the earliest time's cell when the two share an hour,
+        # and keeps its own cell when the latest time shares it.
         cells[eta_cell] = style.eta_ranged if ranged and latest_cell > eta_cell else style.eta
         if ranged:
             for index in range(eta_cell + 1, latest_cell):
                 cells[index] = style.range_fill
-            cells[latest_cell] = style.latest
+            if latest_cell > eta_cell:
+                cells[latest_cell] = style.latest
         arrow = "→" if column(estimate.latest) > last else ""
         span = f"{estimate.eta:%H:%M}"
         if ranged and style.show_range:
@@ -723,6 +724,11 @@ def parse_report(value: object, chart: str) -> Report:
         raise InputError("units.build_hold: a unit is marked but no holder file exists; remove the stale unit marker")
     if not marked and isinstance(hold, ActiveHolders):
         raise InputError("units.build_hold: holder files are active but no unit is marked; mark the held unit")
+    if isinstance(hold, ActiveHolders):
+        holder_names = {holder.name for holder in hold.holders}
+        for unit in units:
+            if unit.build_hold and unit.unit in holder_names:
+                raise InputError(f"units.build_hold: {unit.unit} holds the build hold itself; remove its marker")
     return Report(length, chart, zone, next_run, hold, units, topics)
 
 
@@ -818,7 +824,7 @@ def range_clock(moment: datetime, now: datetime) -> str:
     return f"{moment:%H:%M}" if moment.date() == now.date() else f"{moment:%a %H:%M}"
 
 
-def release_text(release: KnownRelease, now: datetime, zone: ZoneInfo) -> str:
+def release_text(release: KnownReleaseEta, now: datetime, zone: ZoneInfo) -> str:
     """A release time in the report zone, with weekday and minutes until it."""
     local = release.at.astimezone(zone)
     moment = local.replace(tzinfo=None)
@@ -830,7 +836,7 @@ def release_text(release: KnownRelease, now: datetime, zone: ZoneInfo) -> str:
 def hold_line(holder: Holder, now: datetime, zone: ZoneInfo) -> str:
     """A holder's line, shared by reports and reply footers."""
     since = holder.since.astimezone(zone)
-    release = release_text(holder.release, now, zone) if isinstance(holder.release, KnownRelease) else "unknown"
+    release = release_text(holder.release, now, zone) if isinstance(holder.release, KnownReleaseEta) else "unknown"
     return f"{BUILD_HOLD_MARK}: {holder.name} since {since:%H:%M} {since:%Z}, for {holder.purpose} - release eta: {release}"
 
 

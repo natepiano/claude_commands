@@ -134,16 +134,27 @@ class DailiesHoldTests(unittest.TestCase):
     def test_report_footer_and_marker_agree_after_partial_release(self) -> None:
         _ = self.write_holder("first", "2026-10-04T10:50:00-07:00", "the first test")
         _ = self.write_holder("second", "2026-10-04T10:56:00-07:00", "the second test")
+        units = [unit(True), {**unit(True), "unit": "frame-time", "label": "frame"}]
         release = self.run_script(HOLD_SCRIPT, "release", "--holder", "first")
         self.assertEqual(release.returncode, 0, release.stderr)
         self.assertIn("still held by second", release.stdout)
-        report = self.assert_ok(self.report(True))
+        report = self.assert_ok(self.report(True, extra={"units": units}))
         footer = self.assert_ok(self.footer())
         hold_lines = [line for line in report if line.startswith("build hold:")]
         self.assertEqual(hold_lines, ["build hold: second since 10:56 PDT, for the second test - release eta: unknown"])
         self.assertEqual([line for line in footer if line.startswith("build hold:")], hold_lines)
-        self.assertEqual(len([line for line in report if line.startswith("widget") and "build hold" in line]), 1)
-        self.assertEqual(len([line for line in report if "first" in line and line.startswith("build hold:")]), 0)
+        for label in ("widget", "frame"):
+            self.assertEqual(len([line for line in report if line.startswith(label) and "build hold" in line]), 1)
+        self.assertFalse((self.folder / "first").exists())
+        self.assertTrue((self.folder / "second").exists())
+
+    def test_active_holder_cannot_mark_its_own_unit(self) -> None:
+        _ = self.write_holder("frame-time", "2026-10-04T10:56:00-07:00", "the focused test")
+        units = [unit(True), {**unit(True), "unit": "frame-time", "label": "frame"}]
+        self.assert_refused(
+            self.report(True, extra={"units": units}),
+            "units.build_hold: frame-time holds the build hold itself; remove its marker",
+        )
 
 
 if __name__ == "__main__":

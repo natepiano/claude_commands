@@ -217,6 +217,19 @@ class TimelineWindowTests(unittest.TestCase):
         ]
         self.assertTrue(self.axis(units, "2026-10-04T14:59").startswith("12"))
 
+    def test_same_hour_latest_keeps_eta_marker_in_both_chart_styles(self) -> None:
+        fields = report(False)
+        fields["units"] = [{**unit(False), "eta": {"time": "12:40", "earliest": "11:30", "latest": "12:55", "percent": 60}}]
+        with tempfile.TemporaryDirectory() as scratch:
+            input_path = Path(scratch) / "report.json"
+            _ = input_path.write_text(json.dumps(fields))
+            for chart, marker in (("default", "🟦"), ("ascii", "● ")):
+                with self.subTest(chart=chart):
+                    result = run([str(input_path), "--at", AT, "--chart", chart], scratch)
+                    self.assertEqual(result.code, 0, result.error)
+                    row = next(line for line in timeline(result.lines) if line.startswith("widget"))
+                    self.assertIn(marker, row)
+
 
 if __name__ == "__main__":
     _ = unittest.main()
