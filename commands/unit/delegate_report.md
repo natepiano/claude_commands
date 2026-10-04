@@ -8,8 +8,8 @@ the current session and already knows the session directory, the phase, and
 which dispatches are live. If no delegate run is active, say so in one line and
 stop.
 
-`/unit:delegate` reads this file at every timer tick and poll timeout. It defines
-`<ProgressReport/>` — the content of an update. `<ProgressContract/>` in
+`/unit:delegate` reads this file at every notifier tick and Codex poll timeout.
+It defines `<ProgressReport/>` — the content of an update. `<ProgressContract/>` in
 `~/.claude/commands/unit/delegate.md` keeps the timing rules that say when one is
 owed. Never compose a report from memory of an earlier read: the byte-for-byte
 copy rule and the ordinary-English closing sentences are the parts that decay.
@@ -20,9 +20,10 @@ Everything below is the contract.
 
 <ProgressReport>
 1. Check launcher state first. For Codex, `exit_code` alone marks terminal
-   completion; a returned `session_id` without it remains active. If no dispatch
-   remains active, emit no stale report and process completion. On Claude, also
-   stop and clear any timer when its dispatch completes first.
+   completion; a returned `session_id` without it remains active. If no dispatch,
+   background verification or open activity remains active, emit no stale
+   report and process completion. Ticks arriving
+   during a report, or several together, get one report.
 2. Read the current Work Order and verification list, the latest relevant
    heartbeat lines, `board.sh read "${SESSION_DIR}" --since <cursor>`,
    `git status --short`, and `git diff --stat` in `${WORKING_DIR}`. Keep the

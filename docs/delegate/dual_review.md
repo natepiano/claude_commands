@@ -177,8 +177,8 @@ of reviewing the partial diff.
      "<responsibility>" "<activity>" "${REVIEW_PASS}"
    ```
 
-   Keep every blind-review handle; one progress timer covers the whole set, as
-   it does for a phase team.
+   Keep every blind-review handle; the run's one notifier instance covers the
+   whole Claude set, and the Codex poll covers its set.
 4. While they run, perform the main review. Pass 1 reads changed code in risk
    order: Work Order paths, public API/traits/registration/plugin wiring, then
    remaining hunks. Verify spec, extras, codebase fit, <TypeDesignContract/>, and

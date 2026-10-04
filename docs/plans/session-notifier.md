@@ -141,60 +141,26 @@
 
 **Ruled out:** honouring `PLAN_DELEGATE_ACTIVE_DIR` in `end_session.sh`, since `prepare_session.sh` never writes a marker there; removing a stale run's instance in `check`, since a unit parked overnight on the user keeps its instance (matching marker, no running work, exit 1).
 
-### Phase 3 — Units on the notifier  · status: todo
+### Phase 3 — Units on the notifier  · status: done
 
-#### Work Order
+#### As-built
 
-**Blocked by:** G1 — the showrunner has cut over: `zsh ~/.claude/scripts/message/notifier.sh status showrunner-tool-based-ui` shows two `| exit 0 |` lines, and `systemctl --user list-timers 'showrunner-timer-*' --no-pager` lists none. The unit director checks this at phase start; unmet, it asks the showrunner and waits.
-
-**Goal:** new Claude runs get their notifier instance from `prepare_session.sh`, `delegate.md` arms no timer, `/unit:interval` changes one unit's timing, `unit_status.sh` flags `TICKS FAILING`, and `showrunner_timer.sh` is gone.
-
-**Spec:**
-
-*`scripts/delegate/prepare_session.sh`:* inside the `CLAUDE_CODE_SESSION_ID` block after the marker is written (`:32-35`), run `zsh "<repo>/scripts/delegate/unit_notifier.sh" "${CLAUDE_CODE_SESSION_ID}"` and print its `next_due` line after `Session ready at <dir>`; on failure print `notifier instance not created: <output>` and continue (the session still starts). A Codex unit has no `CLAUDE_CODE_SESSION_ID`, so it gets no instance; its poll timeout stays its tick.
-
-*`commands/unit/delegate.md`* (cut about 50 lines; keep `<ProgressReport/>` content, the pass/activity bookkeeping `:501-512` that the check reads, and `<CodexDispatchWait/>`):
-- Delete `PROGRESS_UPDATES_ENABLED` (`:35-36`) and `PROGRESS_TIMER_HANDLE` (`:39-40`), and their handoff entries (`:296-298`).
-- `:199-206`: the unit ends its turn after dispatch; drop arming and re-arming. `:287-290`, `:864-865`, `:933-937`, `:1089`, `:1197`: drop the timer clauses. `:306-308`: drop it when it describes the progress-timer Stop hook.
-- Rewrite `<ProgressContract>` (`:479-540`) to: the interval key sets the Codex poll timeout and a Claude unit's notifier interval. `prepare_session.sh` creates the run's instance `delegate-<run id>` (run id = basename of SESSION_DIR) and `end_session.sh` removes it; the agent arms nothing. While work runs, the notifier sends `/unit:delegate_report` from sender `delegate-<run id>` every N minutes: that message is the tick, and it composes `<ProgressReport/>`. Each `progress_history.py progress` call restarts the clock, and `--hold` keeps at most one tick waiting. The bookkeeping `:501-512` stays. A tick never stands in for the completion report (adapt `:527-534`). The user stops updates → `zsh ~/.claude/scripts/message/notifier.sh stop delegate-<run id>`; resumes → `start`; one unit's timing → `/unit:interval <min>`.
-- PrepareSession (`:638-641`): `prepare_session.sh` also creates the notifier instance.
-
-*`commands/unit/delegate_report.md`:* delete the timer clause `:24-25`; `:11` says it is read at every notifier tick and Codex poll timeout; add: ticks that arrive during a report, or several at once, get one report.
-
-*`commands/unit/interval.md`* (new, in the form of `commands/unit/eta.md`, frontmatter `description` + `argument-hint: "[minutes]"`): `/unit:interval [minutes]`. Instance `delegate-<run id>`, run id = basename of the path in `/tmp/claude/delegate/active/$CLAUDE_CODE_SESSION_ID`. No argument → `zsh ~/.claude/scripts/message/notifier.sh status delegate-<run id>`. With one → `… interval delegate-<run id> <minutes>`, exit 2 = refused; tell the user the next tick from the printed `next_due`. Codex units: not available (no instance); say so.
-
-*`scripts/production/unit_status.sh`:* after `CLAUDE NOT RUNNING` (`:89`), for a unit with a pid: `sessions.py id <pid>` → session id → `/tmp/claude/delegate/active/<id>` → SESSION_DIR (no marker: print nothing); when `delegate_run.py check <id> <dir>` exits 0 and `notifier.sh health delegate-<run id>` exits 1, print `TICKS FAILING (<health line without "failing: ">)`. Use `<repo>/scripts/lib/py` for both Python calls.
-
-*Docs:* `config/delegate.conf:47-57`, `config/README.md:98-104` and `docs/as-built/plan-delegate-progress-history.md:438-445`: the key sets the Codex poll timeout and the default interval of a Claude unit's notifier instance; Claude units no longer launch `progress_timer.sh`.
-
-*Delete* `scripts/production/showrunner_timer.sh` and fix each tracked reference outside `settings.json` and `docs/plans/` that `git grep -l showrunner_timer` lists.
-
-*Checkpoint notice to the showrunner* (besides the usual content):
-1. **settings.json, one commit by the showrunner:** in `permissions.allow`, add `"Bash(zsh ~/.claude/scripts/delegate/unit_notifier.sh *)"` and remove `"Bash(zsh ~/.claude/scripts/production/showrunner_timer.sh *)"` (`:54`); keep the `progress_timer.sh` allow (`:56`, `/clippy` uses the script); in `hooks.Stop`, remove the `stop-delegate-progress-timer.py` entry (`:190-193`); in the same commit, `git rm scripts/hooks/stop-delegate-progress-timer.py`. Make it before the first unit moves: a moved unit arms no timer, and that hook would block its turns.
-2. **Live units, one at a time, each at its own checkpoint:** `zsh ~/.claude/scripts/delegate/unit_notifier.sh <the unit's Claude session id>` (the ids are the file names in `/tmp/claude/delegate/active/`; `sessions.py id <name>` maps a session name), then message the unit director: re-read `commands/unit/delegate.md` `<ProgressContract/>`; the notifier ticks you now; stop arming `progress_timer.sh`. Confirm a `| exit 0 |` line in `notifier.sh status delegate-<run id>` after its first tick. Until a unit moves, `unit_status.sh` shows it as `TICKS FAILING (no instance)` while it has running work.
-3. **Mac:** the launchd job is checked by `nix eval` only until a unit runs there.
+- `scripts/delegate/prepare_session.sh`, when `CLAUDE_CODE_SESSION_ID` is set, writes the marker under the fixed `ACTIVE_DIR=/tmp/claude/delegate/active`, then runs `PLAN_DELEGATE_ACTIVE_DIR=$ACTIVE_DIR zsh unit_notifier.sh <id>` (pinned, so an inherited test variable cannot point it at another marker). It prints the `next_due=…` line, or `notifier instance not created: <output>` and carries on; `Session ready at <dir>` stays the last line. A Codex run has no id and gets no instance; its poll timeout is its tick.
+- `commands/unit/delegate.md` arms no timer: `PROGRESS_UPDATES_ENABLED`, `PROGRESS_TIMER_HANDLE` and every `progress_timer.sh` clause are gone. `<ProgressContract>`: the interval key sets the Codex poll timeout and the Claude instance interval; `<PrepareSession>` creates `delegate-<run id>` (run id = basename of `SESSION_DIR`), `end_session.sh` removes it; the notifier's `/unit:delegate_report` from `delegate-<run id>` is the Claude tick; each `progress_history.py progress` call restarts the clock and `--hold` keeps at most one tick waiting. On `notifier instance not created` the unit says the run gets no ticks until `unit_notifier.sh "$CLAUDE_CODE_SESSION_ID"` succeeds. User stops updates → `notifier.sh stop delegate-<run id>`, resumes → `start`. A tick never replaces the completion report.
+- `commands/unit/delegate_report.md`: `<ProgressReport/>` step 1 counts a dispatch, a background verification or an open activity as running work, so ticks during `verify.sh final` and UX review still report; ticks arriving during a report, or several together, get one report.
+- `commands/unit/interval.md`: `/unit:interval [minutes]` resolves `delegate-<run id>` from `/tmp/claude/delegate/active/$CLAUDE_CODE_SESSION_ID`; no argument runs `notifier.sh status`, a positive integer runs `notifier.sh interval` (exit 2 = refused) and reports the next tick from `next_due` in local time. Unavailable on a Codex unit.
+- `scripts/production/unit_status.sh`, for a unit with a pid: `sessions.py id <pid>` → marker → `SESSION_DIR`; when `delegate_run.py check` exits 0 and `notifier.sh health delegate-<run id>` exits 1, it prints `TICKS FAILING (<health line without "failing: ">)`. No marker prints nothing.
 
 **Files:**
 - `scripts/delegate/prepare_session.sh` — creates the instance.
-- `commands/unit/delegate.md` — timer text out; `<ProgressContract>` rewritten.
-- `commands/unit/delegate_report.md` — timer clause out; one report per burst of ticks.
-- `commands/unit/interval.md` — new: `/unit:interval`.
+- `commands/unit/{delegate,delegate_report}.md` — ticks come from the notifier.
+- `commands/unit/interval.md` — `/unit:interval`.
 - `scripts/production/unit_status.sh` — `TICKS FAILING`.
-- `config/delegate.conf`, `config/README.md`, `docs/as-built/plan-delegate-progress-history.md` — what the interval key sets now.
-- `scripts/production/showrunner_timer.sh` — deleted, with the references `git grep` lists.
+- `config/delegate.conf`, `config/README.md`, `docs/as-built/plan-delegate-progress-history.md`, `docs/delegate/{write_prompt_contract,dual_review}.md` — the notifier instance in place of the progress timer.
+- `scripts/production/showrunner_timer.sh` — deleted; no tracked reference remains outside `settings.json` and `docs/plans/`.
 
-**Seats:** `2 writers` — commands and docs vs scripts; no test lane covers `prepare_session.sh` or `unit_status.sh`.
-- `impl` — `commands/unit/delegate.md`, `commands/unit/delegate_report.md`, `commands/unit/interval.md`, `config/delegate.conf`, `config/README.md`, `docs/as-built/plan-delegate-progress-history.md`.
-- `test` — opens as impl: `scripts/delegate/prepare_session.sh`, `scripts/production/unit_status.sh`, the deletion of `scripts/production/showrunner_timer.sh` and the references it leaves outside `commands/unit/` and the `impl` files.
+**Binds later work:** `prepare_session.sh`'s last line is `Session ready at <dir>`, from which the unit director reads `SESSION_DIR`; a `next_due=` or `notifier instance not created:` line comes before it. The showrunner reads `TICKS FAILING (<reason>)` from `unit_status.sh`; a live unit not yet moved to the notifier reads `TICKS FAILING (no instance)` while it has running work.
 
-**Constraints from prior phases:**
-- Phase 1: `notifier.sh` (`new`, `start`, `stop`, `status`, `interval`, `health`, `remove`; `restart` prints `next_due=<epoch> (<local time>)`; `health` exits 1 with `failing: <reason>`); `sessions.py id <pid|name>` prints a live record's session id; the declared `nate.jobs.session-notifier` ticks every 15 s once the user has rebuilt; the showrunner's instance is `showrunner-<slug>` and `commands/showrunner/*` no longer name `showrunner_timer.sh`. A check past the instance's `TIMEOUT` is killed and logged `skip check timeout`. `basedpyright` exits 3 here over a missing `.venv`; its `0 errors, 0 warnings, 0 notes` line is the gate.
-- Phase 2: `scripts/delegate/unit_notifier.sh <claude_session_id>` makes or retargets `delegate-<run id>` (`--every` from `delegate.conf`, `--command '/unit:delegate_report'`, `--hold`, check `delegate_run.py check <id> <dir>`), exit 1 with no marker. `delegate_run.py check` exits 0 running work, 1 none, 2 run over, 3 usage. `end_session.sh` already removes the instance, calling `notifier.sh remove` with the environment it was given, so `NOTIFIER_STATE_DIR` reaches it. `progress_history.py progress` restarts the instance and reads the next report from its `next_due`; with no instance it falls back to the `progress_timer` marker, then the interval. `unit_notifier.sh` reads the interval as the leading digits of `PLAN_DELEGATE_PROGRESS_INTERVAL_SECONDS` (a trailing comment is ignored; missing key or unreadable config gives 900 s) and exits 2 on a usage error. `PLAN_DELEGATE_ACTIVE_DIR` is honoured only by `delegate_run.py` and `unit_notifier.sh`, for tests; `prepare_session.sh` and `end_session.sh` use the fixed `/tmp/claude/delegate/active`, so `prepare_session.sh` must not run `unit_notifier.sh` with that variable set elsewhere. `test_progress_history.py`'s `run_unowned_command` clears an ambient `PLAN_DELEGATE_TEAM_ROLE`, so the suite passes when a seat runs it.
-- `commands/unit/delegate.md` line refs in the Spec were read before the showrunner's test-cadence edit (~`:370`) landed; locate each edit by its section tag (`<ProgressContract>`, `<DispatchContract>`, `<CompactionContract>`, `<EarlyReviewArm>`, `<DelegationResultFormat>`, `<UXReview>`, `<PhaseCleanup>`, `<PrepareSession>`) and re-read the file before editing.
+**Gotchas:** a seat can inherit the unit director's `CLAUDE_CODE_SESSION_ID`, so tests run `prepare_session.sh` and `end_session.sh` only with a fresh id and a temp `NOTIFIER_STATE_DIR`. `unit_notifier.sh` reads `0` as 1 minute and only a missing or non-numeric key as 900 s; Codex requires a positive integer. Until `settings.json` drops the `stop-delegate-progress-timer.py` Stop hook (a showrunner edit), that hook can block the turns of a unit that arms no timer.
 
-**Acceptance gate:**
-1. Sandbox: `id=$(uuidgen | tr A-Z a-z); st=$(mktemp -d); CLAUDE_CODE_SESSION_ID=$id NOTIFIER_STATE_DIR=$st bash scripts/delegate/prepare_session.sh` leaves `$st/delegate-<run id>/conf` with `TARGET=session:$id`, `EVERY=15`, `COMMAND=/unit:delegate_report`, `HOLD=1` and a `CHECK` naming `delegate_run.py check $id`; then `CLAUDE_CODE_SESSION_ID=$id NOTIFIER_STATE_DIR=$st bash scripts/delegate/end_session.sh` removes that instance and `/tmp/claude/delegate/active/$id`.
-2. `zsh -n scripts/production/unit_status.sh`, and run against this lane's tmux session (`session-notifier`) while a seat runs, it prints `TICKS FAILING (no instance)`.
-3. `git grep -nE 'progress_timer|PROGRESS_TIMER_HANDLE|PROGRESS_UPDATES_ENABLED' -- commands/unit/` prints nothing.
-4. `scripts/production/showrunner_timer.sh` is gone and `git grep -l showrunner_timer -- ':!settings.json' ':!docs/plans/'` prints nothing.
-5. `scripts/lib/py -m unittest scripts.delegate.test_progress_history scripts.delegate.test_delegate_check` still green.
+**Ruled out:** printing `next_due` after `Session ready at <dir>`, since the unit director reads `SESSION_DIR` from the last line; removing `<CompactionContract>`'s Stop-hook sentence, since it describes `stop-delegate-continue.py`, not the progress-timer hook.

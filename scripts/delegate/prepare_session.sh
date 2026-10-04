@@ -30,8 +30,19 @@ SESSION_DIR="/tmp/claude/delegate/${SESSION_ID}"
 mkdir -p "${SESSION_DIR}"
 
 if [[ -n "${CLAUDE_CODE_SESSION_ID:-}" ]]; then
-  mkdir -p /tmp/claude/delegate/active
-  printf '%s\n' "${SESSION_DIR}" > "/tmp/claude/delegate/active/${CLAUDE_CODE_SESSION_ID}"
+  ACTIVE_DIR=/tmp/claude/delegate/active
+  mkdir -p "${ACTIVE_DIR}"
+  printf '%s\n' "${SESSION_DIR}" > "${ACTIVE_DIR}/${CLAUDE_CODE_SESSION_ID}"
+  # Pinned: an inherited test override would send the notifier to another marker.
+  if notifier_output="$(PLAN_DELEGATE_ACTIVE_DIR="${ACTIVE_DIR}" zsh "${SCRIPT_DIR}/unit_notifier.sh" "${CLAUDE_CODE_SESSION_ID}" 2>&1)"; then
+    while IFS= read -r line; do
+      if [[ "${line}" == next_due=* ]]; then
+        printf '%s\n' "${line}"
+      fi
+    done <<< "${notifier_output}"
+  else
+    printf 'notifier instance not created: %s\n' "${notifier_output}"
+  fi
 fi
 
 echo "Session ready at ${SESSION_DIR}"

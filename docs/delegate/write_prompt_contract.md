@@ -137,8 +137,9 @@ phase records two passes. The recorder keys them by slot and closes only that sl
 
 Launch both in **one message** so they run concurrently, each with its own
 prompt file and its slot as the ninth argument to `implement.sh`, then apply
-<DispatchContract/> once for the team: the progress timer covers the phase, not
-each member. <LaunchImplementation/> owns the rest of the procedure.
+<DispatchContract/> once for the team: the run's one notifier instance covers
+the Claude phase; the Codex poll covers its phase. <LaunchImplementation/> owns
+the rest of the procedure.
 
 The phase is complete only when every slot has a terminal `impl_status_<slot>`,
 not when the first one lands. Reading one slot's `implemented` as the phase's

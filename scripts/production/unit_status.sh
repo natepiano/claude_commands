@@ -17,6 +17,11 @@ shift 2
 units=("$@")
 # `^out` alone: `nixpkgs#tmux` without it also prints the man output's path.
 TM=$(command -v tmux) || TM=$(nix build --no-link --print-out-paths 'nixpkgs#tmux^out')/bin/tmux
+REPO=${0:A:h:h:h}
+PY=$REPO/scripts/lib/py
+SESSIONS=$REPO/scripts/message/sessions.py
+CHECK=$REPO/scripts/hooks/delegate_run.py
+NOTIFIER=$REPO/scripts/message/notifier.sh
 mkdir -p "$DIR"
 SEEN=$DIR/decisions_seen
 BLOCKS=$DIR/blocks_open
@@ -87,6 +92,18 @@ for u in $units; do
   if ! $TM has-session -t "$u" 2>/dev/null; then echo 'SESSION GONE'; continue; fi
   pid=$(pgrep -f "^claude --resume .* --remote-control $u|^claude --remote-control $u" | head -1)
   [[ -z $pid ]] && echo 'CLAUDE NOT RUNNING'
+  if [[ -n $pid ]]; then
+    session_id=$("$PY" "$SESSIONS" id "$pid" 2>/dev/null)
+    if [[ -n $session_id && -f /tmp/claude/delegate/active/$session_id ]]; then
+      session_dir=$(< "/tmp/claude/delegate/active/$session_id")
+      if [[ -n $session_dir ]] && "$PY" "$CHECK" check "$session_id" "$session_dir" >/dev/null 2>&1; then
+        health=$(zsh "$NOTIFIER" health "delegate-${session_dir:t}" 2>&1)
+        if (( $? == 1 )); then
+          print -r -- "TICKS FAILING (${health#failing: })"
+        fi
+      fi
+    fi
+  fi
   p=$($TM capture-pane -p -J -S -400 -t "$u")
   waiting_on_user "$u" "$p"
   pane=$(print -r -- "$p" | tail -150)

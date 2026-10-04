@@ -95,13 +95,12 @@ hard ceiling (5). The rest bound the other patterns worth reporting:
 agent says something, not when it halts — the decision to stop is the user's,
 made from what gets reported.
 
-`PLAN_DELEGATE_PROGRESS_INTERVAL_SECONDS` is the odd one out: seconds between
-user-facing progress reports while a phase is active, read by
-`scripts/delegate/progress_timer.sh` and by the main agent per
-`<ProgressContract/>` in `commands/unit/delegate.md` rather than by
-`findings.py`. It has no default either — a missing or non-positive-integer
-value makes `progress_timer.sh` exit non-zero instead of timing at a length
-nobody chose.
+`PLAN_DELEGATE_PROGRESS_INTERVAL_SECONDS` sets the Codex poll timeout and the
+default interval of a Claude unit's notifier instance. It is read by
+`scripts/delegate/unit_notifier.sh` and by the main agent per
+`<ProgressContract/>` in `commands/unit/delegate.md`, not by `findings.py`.
+Claude units do not launch `progress_timer.sh`. A missing or non-numeric value
+makes the notifier use 900 seconds; Codex requires a positive integer.
 
 `scripts/delegate/findings.py` reads the file at startup, so an edit applies to
 the next `findings.py gate` with nothing to restart. The file is authoritative:

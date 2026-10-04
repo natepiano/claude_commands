@@ -32,12 +32,8 @@ State:
   lowercase kebab-case plus `-next.md`.
 - `NEXT_ITEMS_PENDING`: `${SESSION_DIR}/next_items_pending.md`; add-ons
   accumulated for <ReviewPendingAddOns/>. Absent or empty means none.
-- `PROGRESS_UPDATES_ENABLED`: starts true; user cancellation sets it false for
-  the rest of the run.
 - `DISPATCH_HANDLE`: active launcher task handle (Claude) or managed terminal
   `session_id` (Codex).
-- `PROGRESS_TIMER_HANDLE`: Claude only; starts empty and identifies its current
-  one-shot managed background timer.
 - `REVIEW_PASS`: review dispatch count for the current phase; starts at 0.
 - `REVIEW_DISPATCH_HANDLE`: handle of an early-launched blind reviewer running
   alongside `DISPATCH_HANDLE`; empty when review runs synchronously.
@@ -196,14 +192,9 @@ Applies to every implementation, test, fix, and review launcher.
 2. Tell the user in one line what is running and what happens on completion.
 3. Perform only synchronous work assigned by the call site: the main half of
    <DualReview/>. Do not inspect launcher output as a substitute for that review.
-4. Claude: if progress is enabled, arm <ProgressContract/>; then end the turn
-   under <TurnEndGate/>, naming the handle in the `— holding: waiting on
-   <handle>` line. Task and timer notifications resume the workflow
-   independently. Process the
-   first notification without waiting for the other. Re-arm before every
-   subsequent turn that leaves work running -- a completed dispatch that hands
-   straight off to verification, a smoke run, or a style pass is still running
-   work, and its timer is the one most often dropped.
+4. Claude: end the turn under <TurnEndGate/>, naming the handle in the
+   `— holding: waiting on <handle>` line. Task and notifier messages resume
+   the workflow independently; process the first without waiting for the other.
 5. Codex: apply <CodexDispatchWait/>. Never end the turn while the launcher is
    active; its terminal result drives the next workflow step.
 6. A launcher killed at its time limit leaves its Codex seat running with no
@@ -257,12 +248,12 @@ Codex only; no timer process:
 
 1. Empty-poll `${DISPATCH_HANDLE}` with `write_stdin`. Set `yield_time_ms` to the
    configured interval from <ProgressContract/>, capped by
-   `background_terminal_max_timeout`; when progress is disabled, use the
-   maximum. Do not use shell `wait`, `sleep`, a status-file loop, or a second
+   `background_terminal_max_timeout`; when the user has stopped updates, use
+   the maximum. Do not use shell `wait`, `sleep`, a status-file loop, or a second
    terminal.
 2. A result with the same `session_id` and no `exit_code` means the interval
-   elapsed and the launcher remains active. If progress is enabled, apply
-   <ProgressContract/>, then poll the same session again.
+   elapsed and the launcher remains active. Unless the user stopped updates,
+   apply <ProgressContract/>, then poll the same session again.
 3. An initial launch or poll result with `exit_code` means the launcher finished.
    Clear `${DISPATCH_HANDLE}`, read the call site's status/result files, and
    route to review, synthesis, repair, smoke, or the next stage immediately in
@@ -284,18 +275,17 @@ Run every `verify.sh` call as one plain command,
 with no env prefix, redirect or trailing command: the settings allow rule
 matches only that shape, and the task notification already carries its exit
 code. For `verify.sh final`, launch under <ToolingContract/> so `verify.sh`
-opens its own progress window, and tell the user what is running. Nothing else reports on it,
-so the timer matters more here, not less: Claude arms one under
-<ProgressContract/> exactly as a dispatch does and ends the turn, resuming from
-the task notification; Codex applies <CodexDispatchWait/> with progress disabled.
+opens its own progress window, and tell the user what is running. Claude ends
+the turn and resumes from a task or notifier message; Codex applies
+<CodexDispatchWait/> with progress disabled.
 </BackgroundVerificationContract>
 
 <CompactionContract>
 - Do not maintain a handoff before the context hook requests one.
 - When requested, write it in the repository and include the hook's fields plus
-  `MODE`, `AUTO_WINDOW`, the last authorization, `PROGRESS_UPDATES_ENABLED`, any
-  live `DISPATCH_HANDLE`, any live `REVIEW_DISPATCH_HANDLE` with `EARLY_REVIEW`
-  and `REVIEW_PASS`, any Claude `PROGRESS_TIMER_HANDLE`,
+  `MODE`, `AUTO_WINDOW`, the last authorization, whether the user stopped
+  progress updates, any live `DISPATCH_HANDLE`, any live
+  `REVIEW_DISPATCH_HANDLE` with `EARLY_REVIEW` and `REVIEW_PASS`,
   `STYLE_REVIEW_DONE`, `STYLE_DIFF_BASE`, `NEXT_ITEMS_PATH`, whichever tagged
   `DelegatedPhaseReservationState` is live, and any
   unresolved next-item approval, and any overlap sent to the showrunner and not
@@ -480,26 +470,19 @@ counts all describe the wrong phase.
 </PassOwnership>
 
 <ProgressContract>
-Before every progress-enabled wait, set `${PROGRESS_INTERVAL_SECONDS}` from
+Before every Codex poll, set `${PROGRESS_INTERVAL_SECONDS}` from
 `PLAN_DELEGATE_PROGRESS_INTERVAL_SECONDS` in `~/.claude/config/delegate.conf`.
-It is the Claude timer delay and the Codex poll timeout. There is no default:
-if it is missing or is not a positive integer, stop and tell the user to set it.
-
-Claude keeps exactly one one-shot timer in a managed background terminal while
-work is running and progress is enabled. Launch:
-
-`bash ~/.claude/scripts/delegate/progress_timer.sh "${SESSION_DIR}" "${PROGRESS_INTERVAL_SECONDS}"`
-
-Save its handle and end the turn normally. The timer contains no loop and runs
-no agent. Use the script rather than a bare `sleep`: it records the armed
-deadline in `${SESSION_DIR}/progress_timer` and clears it on exit, which lets
-the Stop hook tell an armed timer from none. Codex never launches it; a
-<CodexDispatchWait/> timeout is its tick.
-
-**Never end a turn that leaves work running without an armed timer.** Running
-work is a live launcher, a background `verify.sh final`, or any unit-director
-run that opened a progress window. A registered Stop hook enforces this and blocks
-once; treat that block as a dropped timer, not as a prompt to argue.
+The key sets the Codex poll timeout and a Claude unit's notifier interval.
+For Codex, a missing or non-positive integer is an error; tell the user to set
+it. <PrepareSession/> creates Claude's `delegate-<run id>` instance, where
+the run id is the basename of `${SESSION_DIR}`; `end_session.sh` removes it.
+The agent arms nothing. When `prepare_session.sh` prints `notifier instance not
+created`, say so in one line: this run gets no ticks until
+`zsh ~/.claude/scripts/delegate/unit_notifier.sh "$CLAUDE_CODE_SESSION_ID"`
+succeeds. While work runs, the notifier sends
+`/unit:delegate_report` from `delegate-<run id>` every interval. That message
+is the Claude tick. Each `progress_history.py progress` call restarts its
+clock; `--hold` keeps at most one tick waiting.
 
 Launcher work is a **pass**; unit-director work -- verification, smoke, style -- is
 an **activity**. `verify.sh` opens and closes its own whenever it runs with
@@ -514,7 +497,7 @@ the row can only say `done`, which reports that the window closed rather than
 what it found. Activities sit beside passes and are invisible to `findings.py`,
 which is why <PassOwnership/> forbids faking a pass for the same purpose.
 
-On a Claude timer notification or Codex poll timeout, compose the update per
+On a Claude notifier tick or Codex poll timeout, compose the update per
 <ProgressReport/>, which
 `~/.claude/commands/unit/delegate_report.md` defines in full. Read that file and
 follow it; a report written from memory of an earlier read drops the
@@ -522,24 +505,16 @@ byte-for-byte copy rule first. It also owns this tick's <EarlyReviewArm/>
 trigger point and the query that answers questions about work already finished.
 The user can invoke the same file as `/unit:delegate_report`.
 
-Afterwards, if the dispatch remains active, Claude reads the interval again,
-launches a fresh one-shot timer, replaces the handle, and ends the turn. Codex
-returns immediately to <CodexDispatchWait/> on the same session and reads the
-interval again before polling.
-
-**An armed timer is never a substitute for the report.** Every turn that arms or
-re-arms one emits the full report first — both tables and the wall-clock line —
-and a bare "timer re-armed" line is a dropped report, not a short one. This
-matters most where it is easiest to skip: a Stop-hook block reads as a mechanical
-complaint about a missing file, so the reflex is to relaunch the script and end
-the turn. But the hook fires on the turn the user was owed an update and did not
-get one, and the timer file is only how it noticed. Re-arming without reporting
-answers the hook and leaves the user exactly where they were.
+After a Codex report, return to <CodexDispatchWait/> on the same session and
+read the interval again before polling. A tick never replaces the completion
+report: when work finishes, report its result and current progress header even
+if a tick arrived recently.
 
 A user-requested status check emits <ProgressReport/> immediately. If the user
-stops updates, stop and clear any Claude timer and set
-`PROGRESS_UPDATES_ENABLED=false` for the rest of the run; Codex keeps polling
-without reports.
+stops updates, run
+`zsh ~/.claude/scripts/message/notifier.sh stop delegate-<run id>` for Claude;
+Codex keeps polling without reports. Resume Claude updates with `start` on the
+same instance. Change one unit's interval with `/unit:interval <min>`.
 </ProgressContract>
 
 <AuthorizationContract>
@@ -640,7 +615,8 @@ recording, with no report emitted between them.
 <PrepareSession>
 Run `bash ~/.claude/scripts/delegate/prepare_session.sh` under
 <ToolingContract/>. Capture `SESSION_DIR` and set `WORKING_DIR`. The script also
-creates the run-active marker; every exit must eventually run `end_session.sh`
+creates the run-active marker and Claude's notifier instance; every exit must
+eventually run `end_session.sh`
 through <RunSummary/> or single-mode completion.
 </PrepareSession>
 
@@ -864,8 +840,8 @@ At an eligible tick, in that same tick:
    as its lens for pass 1 — appending one extra final argument:
    `${SESSION_DIR}/final_diff_${REVIEW_PASS}.ready`. Save the
    handle as `${REVIEW_DISPATCH_HANDLE}` and set `EARLY_REVIEW=launched`. Leave
-   `${DISPATCH_HANDLE}` and the tick's timer re-arm untouched.
-6. Before the recorder call in <ProgressContract/> step 5, put the reviewer in
+   `${DISPATCH_HANDLE}` untouched.
+6. Before the recorder call in <ProgressReport/> step 5, put the reviewer in
    the round table:
 
    `python3 ~/.claude/scripts/delegate/progress_history.py arm-review --session-dir "${SESSION_DIR}" --activity "<what this reviewer is checking>" --called-task delegate.review [--lens adversary]`
@@ -933,12 +909,12 @@ Summary and reference numbers must match. A reader should not need the plan,
 diff, reviews, or finding ids.
 
 **Close every delegation result with the current progress header** — both tables
-and the wall-clock line, produced by <ProgressContract/> steps 3 and 5 with the
+and the wall-clock line, produced by <ProgressReport/> steps 3 and 5 with the
 current pass or activity. This is unconditional: the numbered items say what
 happened, and the tables say how far into the phase and the plan it happened,
-which is the half the user cannot reconstruct. Emit it after any launch and
-after the timer is armed, printed below the sections above exactly as the
-recorder emits it. Should the recorder answer that no window is open, the
+which is the half the user cannot reconstruct. Emit it after any launch,
+printed below the sections above exactly as the recorder emits it. Should the
+recorder answer that no window is open, the
 launcher has not recorded its pass yet: try once more, then continue without the
 tables rather than stalling the turn.
 </DelegationResultFormat>
@@ -1089,7 +1065,7 @@ instructions name; with none, skip and say so in one line.
 1. After smoke has a build, take a shot of each changed view and state on the
    run's port at normal size — the same shots the checkpoint notice sends
    (<ProductionUnit/> item 3). Never view them yourself.
-2. Open an activity, arming the progress timer per <ProgressContract/>; the
+2. Open an activity; the
    label is exact, because `review-trial` counts it:
    `progress_history.py start-activity --session-dir "${SESSION_DIR}" --label "UX review" --activity "<what the shots show>"`
 3. Spawn a fresh Claude Agent helper in the background with the showrunner's
@@ -1197,7 +1173,7 @@ the phase, and any seat a dead run left alive; a failure there is one line in
 the report, never a stop.
 
 Then end everything else this phase started: TaskStop each Claude Agent
-helper, end finished launchers and progress timers, and shut down every Hana or
+helper, end finished launchers, and shut down every Hana or
 example app it launched. Never touch what another session started. Mid-phase,
 stop each helper once its result is read and each app once no step uses it.
 User, 2026-10-03.
