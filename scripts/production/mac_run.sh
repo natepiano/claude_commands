@@ -41,12 +41,13 @@ print "HEAD=$head"
 ssh $host "cd $clone && ~/.cargo/bin/cargo build -q -p hana" || { print "build failed"; exit 6 }
 
 # perl's alarm stops hana after the hold; 142 (SIGALRM) means it stayed up.
-ssh $host "cd $clone && BRP_EXTRAS_PORT=$port perl -e 'alarm shift; exec @ARGV' $hold ./target/debug/hana > $log 2>&1"
+# Run outside cargo, so Bevy needs the asset root that `cargo run` would give it.
+ssh $host "cd $clone && BEVY_ASSET_ROOT=\$HOME/$clone/crates/hana BRP_EXTRAS_PORT=$port perl -e 'alarm shift; exec @ARGV' $hold ./target/debug/hana > $log 2>&1"
 run_exit=$?
 if (( run_exit == 142 )); then
   print "stayed up ${hold}s"
   exit 0
 fi
 print "exited early: $run_exit"
-ssh $host "tail -20 $log"
+ssh $host "grep -v 'CommandQueue has un-applied' $log | tail -20"
 exit 7
