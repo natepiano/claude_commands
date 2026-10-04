@@ -69,6 +69,13 @@ class SampleTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             _ = sample.parse_boot_id(" \n")
 
+    def test_slice_anon_reads_fixture_and_marks_missing_slice_unmeasured(self) -> None:
+        builds = self.root / "builds.slice"
+        builds.mkdir(parents=True)
+        _ = (builds / "memory.stat").write_text("file 99\nanon 123456\n")
+        self.assertEqual(sample.anon_bytes(builds), 123456)
+        self.assertIs(sample.anon_bytes(self.root / "missing.slice"), sample.Unmeasured.VALUE)
+
     def test_sample_on_a_host_without_proc_prints_one_line_and_exits_nonzero(self) -> None:
         missing = self.root / "no-proc" / "meminfo"
         command = (
@@ -89,9 +96,26 @@ class SampleTests(unittest.TestCase):
         self.assertEqual(list(self.root.rglob("*.jsonl")), [])
 
     def test_cli_sample_appends_exactly_one_record_under_buildlog_dir(self) -> None:
-        environment = {**os.environ, "BUILDLOG_DIR": str(self.root)}
+        proc = self.root / "proc"
+        proc.mkdir(parents=True)
+        _ = (proc / "meminfo").write_text("MemTotal: 16384 kB\nMemAvailable: 4096 kB\nSwapTotal: 8192 kB\nSwapFree: 1024 kB\n")
+        _ = (proc / "pressure").write_text("some total=100\nfull total=20\n")
+        _ = (proc / "boot_id").write_text("d963a34a-50fa-48a8-8485-8b219c45fe02\n")
+        builds = self.root / "builds.slice"
+        ci = self.root / "ci.slice"
+        builds.mkdir(parents=True)
+        ci.mkdir()
+        _ = (builds / "memory.stat").write_text("anon 123456\n")
+        _ = (ci / "memory.stat").write_text("anon 654321\n")
+        environment = {**os.environ, "BUILDLOG_DIR": str(self.root), "BUILDLOG_BUILDS_CGROUP": str(builds), "BUILDLOG_CI_CGROUP": str(ci)}
+        command = (
+            "import sys; from pathlib import Path; sys.path.insert(0, sys.argv[1]); "
+            "import sample, cli; proc = Path(sys.argv[2]); "
+            "sample.MEMINFO = proc / 'meminfo'; sample.PRESSURE = proc / 'pressure'; "
+            "sample.BOOT_ID = proc / 'boot_id'; sys.exit(cli.main(['sample']))"
+        )
         result = subprocess.run(
-            [sys.executable, str(CLI), "sample"],
+            [sys.executable, "-c", command, str(CLI.parent), str(proc)],
             env=environment,
             capture_output=True,
             text=True,
@@ -113,6 +137,8 @@ class SampleTests(unittest.TestCase):
         self.assertEqual(files[0].name, "samples-" + str(record["at"])[:7] + ".jsonl")
         self.assertTrue(datetime.fromisoformat(str(record["at"])))
         self.assertTrue(re.fullmatch(r"[0-9a-f-]{36}", str(record["boot_id"])))
+        self.assertEqual(record["builds_anon_bytes"], 123456)
+        self.assertEqual(record["ci_anon_bytes"], 654321)
         for field in ("mem_used_bytes", "swap_used_bytes", "stall_some_us", "stall_full_us"):
             self.assertIsInstance(record[field], int)
             self.assertGreaterEqual(cast(int, record[field]), 0)

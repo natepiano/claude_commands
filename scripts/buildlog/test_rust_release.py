@@ -38,12 +38,15 @@ def compiler_message(package: str, level: str, code: str, line: int) -> str:
 
 @final
 class FakeRunner:
-    def __init__(self, clone: Path, *, fail: str = "", timeout: str = "", diagnostics: str = "", clippy_exit: int = 0) -> None:
+    def __init__(self, clone: Path, *, fail: str = "", timeout: str = "", diagnostics: str = "", clippy_exit: int = 0, killed: str = "", kill_status: int = 137, kill_output: str = "") -> None:
         self.clone = clone
         self.fail = fail
         self.timeout = timeout
         self.diagnostics = diagnostics
         self.clippy_exit = clippy_exit
+        self.killed = killed
+        self.kill_status = kill_status
+        self.kill_output = kill_output
         self.calls: list[tuple[list[str], Path | None, dict[str, str], int]] = []
 
     def __call__(self, args: list[str], cwd: Path | None, env: dict[str, str], timeout: int) -> subprocess.CompletedProcess[str]:
@@ -63,6 +66,8 @@ class FakeRunner:
             raise subprocess.TimeoutExpired(args, timeout)
         if step == self.fail:
             return subprocess.CompletedProcess(args, 1, "", f"error: {step} broke\n")
+        if step == self.killed:
+            return subprocess.CompletedProcess(args, self.kill_status, "", self.kill_output)
         output = "abc123\n" if step == "revision" else self.diagnostics if step == "clippy" else ""
         return subprocess.CompletedProcess(args, self.clippy_exit if step == "clippy" else 0, output, "")
 
@@ -316,6 +321,24 @@ class RustReleaseTests(unittest.TestCase):
         calls = len(runner.calls)
         self.assertEqual(0, self.invoke(runner=runner))
         self.assertEqual(calls, len(runner.calls))
+
+    def test_killed_trial_waits_and_retries_next_night(self) -> None:
+        clone = self.scratch / "rust-release-trial-1.100.0"
+        for status, output in ((137, ""), (1, "process failed: signal: 9\n"), (1, "process failed: signal 15\n"), (143, "")):
+            with self.subTest(status=status, output=output):
+                rust_release.state_path().unlink(missing_ok=True)
+                killed = FakeRunner(clone, killed="clippy", kill_status=status, kill_output=output)
+                self.assertEqual(0, self.invoke(runner=killed))
+                state = rust_release.read_state()
+                assert state is not None
+                self.assertEqual("waiting", state["trial"]["status"])
+                self.assertFalse(clone.exists())
+                retry = FakeRunner(clone)
+                self.assertEqual(0, self.invoke(at=datetime(2026, 11, 13, 3), runner=retry))
+                state = rust_release.read_state()
+                assert state is not None
+                self.assertEqual("finished", state["trial"]["status"])
+                self.assertEqual("cargo", retry.calls[-1][0][0])
 
     def test_hold_arriving_mid_trial_deletes_clone_and_leaves_pending(self) -> None:
         clone = self.scratch / "rust-release-trial-1.100.0"

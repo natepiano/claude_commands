@@ -29,7 +29,7 @@ from urllib.parse import quote
 
 import store
 
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 LOCK_NAME = "index.lock"
 MARK_BYTES = 256
 BUSY_TIMEOUT_MS = 30_000
@@ -43,6 +43,7 @@ STEP_COLUMNS: list[Column] = [
     ("started_at", "TEXT", "UTC ISO time; date(started_at,'localtime') gives the local day"),
     ("ended_at", "TEXT", "UTC ISO time"),
     ("duration_s", "REAL", "wall time of the step"),
+    ("mem_wait_s", "INTEGER", "seconds the step waited for memory before it started"),
     ("step", "TEXT", "clippy, mend, doc, fmt, nextest, check, sweep, or the program run"),
     ("argv", "TEXT", "the command as a JSON array"),
     ("cwd", "TEXT", "where it ran"),
@@ -198,6 +199,8 @@ SAMPLE_COLUMNS: list[Column] = [
     ("boot_id", "TEXT", "Linux boot ID; changed ID marks a reboot"),
     ("mem_used_bytes", "INTEGER", "MemTotal minus MemAvailable"),
     ("swap_used_bytes", "INTEGER", "SwapTotal minus SwapFree"),
+    ("builds_anon_bytes", "INTEGER", "anon memory in the user builds.slice; process memory"),
+    ("ci_anon_bytes", "INTEGER", "anon memory in hana-ci.slice; process memory"),
     ("stall_some_us", "INTEGER", "machine memory some stall counter since boot, microseconds"),
     ("stall_full_us", "INTEGER", "machine memory full stall counter since boot, microseconds"),
 ]

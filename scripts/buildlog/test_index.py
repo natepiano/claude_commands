@@ -284,15 +284,24 @@ class IndexTests(unittest.TestCase):
         self.assertEqual(self.rows("SELECT name FROM sqlite_master WHERE name = 'leftover'"), [])
         self.assertEqual(self.ids(), ["s0", "s1"])
 
+    def test_schema_five_rebuilds_with_memory_admission_columns(self) -> None:
+        self.write(self.host_file, step("s0", mem_wait_s=12))
+        _ = index.update()
+        with closing(sqlite3.connect(index.index_path())) as connection:
+            _ = connection.execute("PRAGMA user_version = 5")
+        self.assertEqual(index.update(), 1)
+        self.assertEqual(self.rows("PRAGMA user_version"), [(6,)])
+        self.assertEqual(self.rows("SELECT mem_wait_s FROM steps"), [(12,)])
+
     def test_memory_stall_columns_and_samples_ingest(self) -> None:
         self.assertGreater(index.SCHEMA_VERSION, 4)
         sample_file = self.root / "natedev" / "samples-2026-10.jsonl"
         self.write(
             self.host_file,
-            step("s0", peak_mem_bytes=123456, mem_stall_some_s=1.25, mem_stall_full_s=0.25),
+            step("s0", peak_mem_bytes=123456, mem_stall_some_s=1.25, mem_stall_full_s=0.25, mem_wait_s=7),
             step("s1", peak_mem_bytes=123456),
         )
-        self.write(sample_file, sample(STAMP), sample("2026-10-02T12:01:00.000Z", stall_some_us=1_500_000))
+        self.write(sample_file, sample(STAMP, builds_anon_bytes=2**30, ci_anon_bytes=2 * 2**30), sample("2026-10-02T12:01:00.000Z", stall_some_us=1_500_000))
         self.assertEqual(index.update(), 4)
         self.assertEqual(
             self.rows("SELECT id, mem_stall_some_s, mem_stall_full_s FROM steps ORDER BY id"),
@@ -309,6 +318,8 @@ class IndexTests(unittest.TestCase):
             ],
         )
         self.assertEqual(index.update(), 0)
+        self.assertEqual(self.rows("SELECT mem_wait_s FROM steps ORDER BY id"), [(7,), (None,)])
+        self.assertEqual(self.rows("SELECT builds_anon_bytes, ci_anon_bytes FROM samples ORDER BY at"), [(2**30, 2 * 2**30), (None, None)])
 
     def test_schema_command_lists_samples_and_stall_columns(self) -> None:
         result = subprocess.run(
