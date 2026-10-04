@@ -492,6 +492,20 @@ class RustReleaseTests(unittest.TestCase):
         second.unlink()
         self.assertFalse(rust_release.build_hold_active(folder))
 
+    def test_json_holder_file_is_still_an_active_build_hold(self) -> None:
+        folder = self.scratch / "build-hold"
+        folder.mkdir()
+        holder = folder / "slot-one"
+        _ = holder.write_text(json.dumps({
+            "holder": "slot one",
+            "since": "2026-11-12T03:00:00-05:00",
+            "for": "the focused test",
+            "release_eta": "unknown",
+        }) + "\n")
+        self.assertTrue(rust_release.build_hold_active(folder))
+        holder.unlink()
+        self.assertFalse(rust_release.build_hold_active(folder))
+
     def test_two_part_pin_covers_patch_releases_and_channel_names_are_absent(self) -> None:
         texts: list[tuple[str, str]] = []
         self.assertEqual(0, self.invoke(pin="1.99", version="1.99.1", texts=texts))

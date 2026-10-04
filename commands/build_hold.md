@@ -1,17 +1,10 @@
 ---
-description: Ask every other top-level session on this machine to stop its cargo builds while you run one test, then release them. Args - `hold <test and why>` or `release`.
+description: Ask every other top-level session on this machine to stop its cargo builds while you run one test, then release them. Args - `hold <test and why> [eta HH:MM]`, `quiet`, `status`, or `release`.
 ---
 
-`$ARGUMENTS` is `hold <test and why>` or `release`.
+`$ARGUMENTS` is `hold <test and why> [eta HH:MM in the IANA zone you state times in]`, `quiet`, `status`, or `release`.
 
-1. On hold, create `~/.local/state/build-hold/` with
-   `mkdir -p ~/.local/state/build-hold`. Name your own file for the holder,
-   replacing every character outside `A-Za-z0-9._-` with `-`. Write one line
-   containing the holder, the current ISO time, and the test and reason. Then send with
-   `/notify_top_level --here`: `/build_hold from <you>: stop any cargo or
-   verify.sh you are running and start none until I release. No release after
-   2 h: ask me. For: <test and why>`
-2. After a hold, start the test once `pgrep -u "$USER" '^(cargo|rustc|cargo-nextest)$'` prints nothing. Wait with Monitor, never a sleep loop. CI runners are not asked.
-3. Release as soon as the test ends, pass or fail: remove only your holder file
-   from `~/.local/state/build-hold/`, then send with `/notify_top_level
-   --here`: `/build_hold from <you>: released, builds may resume.`
+1. On `hold`, run `python3 ~/.claude/scripts/build_hold/build_hold.py hold --holder <your session name> --for '<test and why>'` and pass `--release-eta HH:MM --zone <the IANA zone you state times in>` only when you have a measured release time today in that zone. Send the printed text with `/notify_top_level --here`. Its "No release after 2 h: ask me" line is an escalation, never a release ETA.
+2. Before the held test, run `python3 ~/.claude/scripts/build_hold/build_hold.py quiet`. It checks this user's build processes and requires the 1-minute load below one quarter of the cores. It waits up to 10 minutes by itself; run it in the background or under Monitor, never in a separate sleep loop. If it exits 1, read the listed processes and load, then wait for the busy work to finish before retrying. CI runners are not asked to stop.
+3. `status` runs `python3 ~/.claude/scripts/build_hold/build_hold.py status` to list every holder.
+4. Release as soon as the test ends, pass or fail: run `python3 ~/.claude/scripts/build_hold/build_hold.py release --holder <your session name>`. Send `/build_hold from <you>: <printed text>` with `/notify_top_level --here`. Only the last holder prints `released, builds may resume.`; a partial release names every remaining holder.
