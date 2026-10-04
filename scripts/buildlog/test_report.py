@@ -20,12 +20,14 @@ from test_index import STAMP, Record, call, ci_job, ci_run, encode, local_day, p
 
 class ReportTests(unittest.TestCase):
     root: Path  # pyright: ignore[reportUninitializedInstanceVariable]
+    records: list[Record]  # pyright: ignore[reportUninitializedInstanceVariable]
 
     @override
     def setUp(self) -> None:
         temporary = self.enterContext(tempfile.TemporaryDirectory())
         self.root = Path(temporary) / "buildlog"
         point_root_at(self, self.root)
+        self.records = []
 
     def write(self, path: Path, *records: Record) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -53,7 +55,7 @@ class ReportTests(unittest.TestCase):
         self.write(self.root / "natedev" / "2026-10.jsonl", *records)
 
         lines = self.render("2026-10-04").splitlines()
-        section = lines[lines.index("### Test builds (temporary)") : lines.index("### Summary")]
+        section = lines[lines.index("### Test builds (temporary)") : lines.index("### Tests per edit")]
         self.assertIn("| 2026-10-04 | whole-package | 1.0 h | 18.0 min |", section)
         self.assertIn("| 2026-10-04 | --filter | 15.0 min | 4.5 min |", section)
         self.assertEqual(2, sum(line.startswith("| 2026-10-04 |") for line in section))
@@ -81,6 +83,229 @@ class ReportTests(unittest.TestCase):
         section = lines[lines.index("### Test builds (temporary)") : lines.index("### Summary")]
         self.assertIn("| 2026-10-04 | whole-package | 1.5 min | 1.5 min |", section)
         self.assertFalse(any(line.startswith("| 2026-10-04 | --filter |") for line in section))
+
+    def verify_call(
+        self,
+        number: int,
+        *trees: str | None,
+        seat: str | None = "seat-a",
+        session: str = "session-a",
+        verb: str = "test",
+        command: str = "test hana",
+        status: int | None = 0,
+        outcome: str | None = None,
+        minute: int | None = None,
+        day: str = "2026-10-02",
+    ) -> None:
+        at = f"{day}T12:{(number * 5 if minute is None else minute):02d}:00.000Z"
+        call_id = f"call-{number}"
+        self.records.append(
+            call(
+                call_id,
+                started_at=at,
+                ended_at=at,
+                delegate_session=seat,
+                session=session,
+                verb=verb,
+                command=command,
+                status=status,
+                outcome=outcome or ("ran" if status == 0 else "failed"),
+            )
+        )
+        for offset, tree in enumerate(trees):
+            self.records.append(
+                step(
+                    f"{call_id}-step-{offset}",
+                    started_at=at,
+                    ended_at=at,
+                    call_id=call_id,
+                    tree_key=tree,
+                    status=status,
+                    caller="verify",
+                    step="nextest" if verb == "test" else "clippy",
+                )
+            )
+
+    def render_calls(self) -> str:
+        self.write(self.root / "natedev" / "2026-10.jsonl", *self.records)
+        return self.render()
+
+    def per_edit_tables(self, day: str | None = None) -> tuple[list[list[str]], list[list[str]]]:
+        self.write(self.root / "natedev" / "2026-10.jsonl", *self.records)
+        _ = index.update()
+        with closing(index.read_only()) as connection:
+            lines = report.tests_per_edit_section(connection, day or local_day(STAMP))
+        tables: list[list[list[str]]] = []
+        previous = "other"
+        for line in lines:
+            if line.startswith("|"):
+                if previous != "table":
+                    tables.append([])
+                tables[-1].append([cell.strip() for cell in line.strip("|").split("|")])
+                previous = "table"
+            else:
+                previous = "other"
+        self.assertEqual(len(tables), 2)
+        return tables[0], tables[1]
+
+    def cell(self, table: list[list[str]], label: str, heading: str) -> str:
+        matching = [row for row in table[2:] if row[0] == label]
+        self.assertEqual(len(matching), 1, f"row for {label}: {table}")
+        return matching[0][table[0].index(heading)]
+
+    def test_same_tree_has_no_edit_and_changed_tree_has_one(self) -> None:
+        self.verify_call(0, "tree-a")
+        self.verify_call(1, "tree-a")
+        self.verify_call(2, "tree-b")
+        ratios, _ = self.per_edit_tables()
+        self.assertEqual(self.cell(ratios, "2026-10-02", "Tests"), "3")
+        self.assertEqual(self.cell(ratios, "2026-10-02", "Edits"), "1")
+        self.assertEqual(self.cell(ratios, "2026-10-02", "Tests/edit"), "3.00")
+
+    def test_lint_rewrite_inside_a_call_is_not_a_seat_edit(self) -> None:
+        self.verify_call(0, "tree-a")
+        self.verify_call(1, "tree-a", None, "tree-b", verb="lint", command="lint hana")
+        self.verify_call(2, "tree-b")
+        ratios, _ = self.per_edit_tables()
+        self.assertEqual(self.cell(ratios, "2026-10-02", "Edits"), "0")
+
+    def test_call_without_known_tree_does_not_break_the_chain(self) -> None:
+        self.verify_call(0, "tree-a")
+        self.verify_call(1, None, verb="lint", command="lint hana")
+        self.verify_call(2, "tree-b")
+        ratios, _ = self.per_edit_tables()
+        self.assertEqual(self.cell(ratios, "2026-10-02", "Edits"), "1")
+
+    def test_delegate_session_then_session_identifies_independent_seats(self) -> None:
+        self.verify_call(0, "tree-a", seat="delegate-a", session="shared")
+        self.verify_call(1, "tree-b", seat="delegate-b", session="shared")
+        self.verify_call(2, "tree-b", seat="delegate-a", session="shared")
+        self.verify_call(3, "tree-c", seat=None, session="fallback")
+        self.verify_call(4, "tree-d", seat=None, session="fallback")
+        ratios, _ = self.per_edit_tables()
+        self.assertEqual(self.cell(ratios, "2026-10-02", "Edits"), "2")
+        self.assertEqual(self.cell(ratios, "2026-10-02", "Tests"), "5")
+
+    def test_whole_and_filtered_test_calls_both_count(self) -> None:
+        self.verify_call(0, "tree-a")
+        self.verify_call(1, "tree-b", command="test hana --filter parser")
+        ratios, _ = self.per_edit_tables()
+        self.assertEqual(self.cell(ratios, "2026-10-02", "Tests"), "2")
+        self.assertEqual(self.cell(ratios, "2026-10-02", "Edits"), "1")
+        self.assertEqual(self.cell(ratios, "2026-10-02", "Tests/edit"), "2.00")
+
+    def test_daily_trend_sums_seats_and_shows_all_seven_days_newest_first(self) -> None:
+        self.verify_call(0, "tree-a", day="2026-10-01", seat="seat-a")
+        self.verify_call(1, "tree-b", day="2026-10-04", seat="seat-a")
+        self.verify_call(2, "tree-x", day="2026-10-04", seat="seat-b")
+        self.verify_call(3, "tree-y", day="2026-10-04", seat="seat-b")
+        ratios, _ = self.per_edit_tables("2026-10-04")
+        self.assertEqual(ratios[0], ["Day", "Tests", "Edits", "Tests/edit", "Target"])
+        self.assertEqual([row[0] for row in ratios[2:]], [
+            "2026-10-04", "2026-10-03", "2026-10-02", "2026-10-01",
+            "2026-09-30", "2026-09-29", "2026-09-28",
+        ])
+        self.assertEqual(self.cell(ratios, "2026-10-04", "Tests"), "3")
+        self.assertEqual(self.cell(ratios, "2026-10-04", "Edits"), "2")
+        self.assertEqual(self.cell(ratios, "2026-10-03", "Tests"), "0")
+        self.assertEqual(self.cell(ratios, "2026-10-03", "Target"), "—")
+
+    def test_target_labels_below_on_target_and_above_at_two_decimals(self) -> None:
+        self.verify_call(0, "tree-0", day="2026-10-01")
+        for number in range(1, 9):
+            self.verify_call(number, f"tree-{number}", verb="lint", command="lint hana", day="2026-10-01")
+        self.verify_call(9, "tree-a", seat="other", day="2026-10-02", minute=0)
+        self.verify_call(10, "tree-b", seat="other", day="2026-10-02", minute=5)
+        self.verify_call(11, "tree-x", seat="third", day="2026-10-03", minute=0)
+        self.verify_call(12, "tree-y", seat="third", day="2026-10-03", verb="lint", command="lint hana", minute=5)
+        self.verify_call(13, "tree-z", seat="third", day="2026-10-03", verb="lint", command="lint hana", minute=10)
+        ratios, _ = self.per_edit_tables("2026-10-03")
+        self.assertEqual(self.cell(ratios, "2026-10-01", "Tests/edit"), "0.12")
+        self.assertEqual(self.cell(ratios, "2026-10-01", "Target"), "below")
+        self.assertEqual(self.cell(ratios, "2026-10-02", "Target"), "above")
+        self.assertEqual(self.cell(ratios, "2026-10-03", "Target"), "on target")
+
+    def test_failure_tracks_edits_since_green_and_minutes_until_next_green(self) -> None:
+        self.verify_call(0, "tree-a", minute=0)
+        self.verify_call(1, "tree-b", verb="lint", command="lint hana", minute=5)
+        self.verify_call(2, "tree-c", status=1, minute=10)
+        self.verify_call(3, "tree-c", minute=35)
+        _, bins = self.per_edit_tables()
+        self.assertEqual(self.cell(bins, "2–3", "Failures"), "1")
+        self.assertEqual(self.cell(bins, "2–3", "Avg to next green"), "25.0 min")
+
+    def test_failure_at_zero_edits_has_recovery_time_in_zero_bin(self) -> None:
+        self.verify_call(0, "tree-a", minute=0, command="test hana --filter parser")
+        self.verify_call(1, "tree-a", status=1, minute=10)
+        self.verify_call(2, "tree-a", minute=25)
+        _, bins = self.per_edit_tables()
+        self.assertEqual([row[0] for row in bins[2:]], ["0", "1", "2–3", "4–7", "8+"])
+        self.assertEqual(self.cell(bins, "0", "Failures"), "1")
+        self.assertEqual(self.cell(bins, "0", "Avg to next green"), "15.0 min")
+        self.assertNotIn("outside these bins", self.render_calls())
+
+    def test_failed_outcome_without_status_counts_and_reused_green_recovers(self) -> None:
+        self.verify_call(0, "tree-a", minute=0)
+        self.verify_call(1, "tree-b", minute=5, status=None, outcome="failed")
+        self.verify_call(2, "tree-b", minute=10, status=0, outcome="interrupted")
+        self.verify_call(3, "tree-b", minute=25, status=0, outcome="reused")
+        _, bins = self.per_edit_tables()
+        self.assertEqual(self.cell(bins, "1", "Failures"), "1")
+        self.assertEqual(self.cell(bins, "1", "Avg to next green"), "20.0 min")
+
+    def test_nonzero_test_status_counts_as_failure_without_failed_outcome(self) -> None:
+        self.verify_call(0, "tree-a", minute=0)
+        self.verify_call(1, "tree-a", minute=5, status=1, outcome="ran")
+        self.verify_call(2, "tree-a", minute=15)
+        _, bins = self.per_edit_tables()
+        self.assertEqual(self.cell(bins, "0", "Failures"), "1")
+        self.assertEqual(self.cell(bins, "0", "Avg to next green"), "10.0 min")
+
+    def test_failures_at_three_four_seven_and_eight_edits_use_correct_bins(self) -> None:
+        number = 0
+        for edits in (3, 4, 7, 8):
+            seat = f"seat-{edits}"
+            self.verify_call(number, "tree-0", seat=seat, minute=0)
+            number += 1
+            for changed in range(1, edits):
+                self.verify_call(number, f"tree-{changed}", seat=seat, verb="lint", command="lint hana", minute=changed)
+                number += 1
+            self.verify_call(number, f"tree-{edits}", seat=seat, status=1, minute=edits)
+            number += 1
+            self.verify_call(number, f"tree-{edits}", seat=seat, minute=edits + 10)
+            number += 1
+        _, bins = self.per_edit_tables()
+        self.assertEqual(self.cell(bins, "1", "Failures"), "0")
+        self.assertEqual(self.cell(bins, "2–3", "Failures"), "1")
+        self.assertEqual(self.cell(bins, "4–7", "Failures"), "2")
+        self.assertEqual(self.cell(bins, "8+", "Failures"), "1")
+
+    def test_failure_without_later_green_counts_but_not_in_average(self) -> None:
+        self.verify_call(0, "tree-a", minute=0)
+        self.verify_call(1, "tree-b", verb="lint", command="lint hana", minute=5)
+        self.verify_call(2, "tree-c", status=1, minute=10)
+        _, bins = self.per_edit_tables()
+        self.assertEqual(self.cell(bins, "2–3", "Failures"), "1")
+        self.assertEqual(self.cell(bins, "2–3", "Avg to next green"), "")
+        text = self.render_calls()
+        self.assertIn("1 without a later green", text)
+
+    def test_rendered_tests_per_edit_section_has_two_tables_target_and_source(self) -> None:
+        self.verify_call(0, "tree-a")
+        self.verify_call(1, "tree-b")
+        text = self.render_calls()
+        lines = text.splitlines()
+        self.assertIn("### Tests per edit", lines)
+        section_start = lines.index("### Tests per edit")
+        section_end = next((index for index in range(section_start + 1, len(lines)) if lines[index].startswith("### ")), len(lines))
+        section = lines[section_start:section_end]
+        self.assertEqual(sum(line.startswith("|---") for line in section), 2)
+        self.assertIn("Target", "\n".join(section))
+        source_lines = [line for line in section if line.startswith("Source:")]
+        self.assertEqual(len(source_lines), 2)
+        self.assertRegex(source_lines[0], r"target \d")
+        self.assertIn("2026-09-26–2026-10-02", source_lines[0])
+        self.assertIn("2026-09-26–2026-10-02", source_lines[1])
 
     def test_kinds_by_caller_then_one_summary_row_per_kind(self) -> None:
         self.write(

@@ -10,7 +10,7 @@ from __future__ import annotations
 import sqlite3
 from collections.abc import Callable
 from dataclasses import dataclass
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from typing import cast
 
 import sync
@@ -30,6 +30,11 @@ SCRATCH_LABEL = "scratch (temp folders)"
 ON_DAY = "date(started_at, 'localtime') = ?"
 COMMON_HEAD = ["Runs", "Failed", "Avg", "Range"]
 COMMON_SQL = "count(*), sum(status <> 0), avg(duration_s), min(duration_s), max(duration_s)"
+# 2026-10-01–04 log: 1 edit 12.54 min, 2–3 16.09, 4–7 20.94, 8+ 31.28.
+# One test per two edits leaves headroom for most gaps to stay within 2–3;
+# the 4–7 bin is where recovery time starts to climb.
+TESTS_PER_EDIT_TARGET = 0.5
+EDIT_BINS = ("0", "1", "2–3", "4–7", "8+")
 
 Row = tuple[object, ...]
 
@@ -63,6 +68,32 @@ class Column:
     title: str
     sql: str
     show: Callable[[object], str]
+
+
+@dataclass(frozen=True)
+class KnownCallTrees:
+    first: str
+    last: str
+
+
+@dataclass
+class DailyTestsPerEdit:
+    tests: int = 0
+    edits: int = 0
+
+
+@dataclass
+class FailureRecoveryBin:
+    failures: int = 0
+    recovered: int = 0
+    minutes_to_green: float = 0.0
+
+
+@dataclass
+class TestsPerEditWindow:
+    first_day: str
+    daily: dict[str, DailyTestsPerEdit]
+    recovery_bins: list[FailureRecoveryBin]
 
 
 EXTRA: dict[str, list[Column]] = {
@@ -228,6 +259,141 @@ def ci_section(connection: sqlite3.Connection, day: str) -> tuple[list[str], str
     return section, f"CI: {runs} runs, {failed} failed, {seconds(total)} in all; jobs queued {seconds(queue)} on average."
 
 
+def call_trees(connection: sqlite3.Connection, end_day: str) -> dict[str, KnownCallTrees]:
+    """First and last known step trees in each verify call; unkeyed calls are absent."""
+    rows = fetch(
+        connection,
+        " ".join(
+            (
+                "SELECT s.call_id, s.tree_key FROM steps s JOIN calls c ON c.id = s.call_id",
+                "WHERE c.tool = 'verify.sh' AND s.tree_key IS NOT NULL",
+                "AND date(c.started_at, 'localtime') <= ?",
+                "ORDER BY s.call_id, s.started_at, s.id",
+            )
+        ),
+        end_day,
+    )
+    trees: dict[str, KnownCallTrees] = {}
+    for call_id, tree_key in rows:
+        call = cast(str, call_id)
+        key = cast(str, tree_key)
+        previous = trees.get(call)
+        trees[call] = KnownCallTrees(previous.first if previous else key, key)
+    return trees
+
+
+def failure_bin(edits: int) -> int:
+    if edits == 0:
+        return 0
+    if edits == 1:
+        return 1
+    if edits <= 3:
+        return 2
+    return 3 if edits <= 7 else 4
+
+
+def tests_per_edit_data(connection: sqlite3.Connection, end_day: str) -> TestsPerEditWindow:
+    """Track each seat through the query's last day, including calls before the displayed window."""
+    rows = fetch(
+        connection,
+        " ".join(
+            (
+                "SELECT id, started_at, ended_at, date(started_at, 'localtime'),",
+                "coalesce(nullif(delegate_session, ''), nullif(session, '')), verb, status, outcome",
+                "FROM calls WHERE tool = 'verify.sh'",
+                "AND date(started_at, 'localtime') <= ?",
+                "ORDER BY started_at, id",
+            )
+        ),
+        end_day,
+    )
+    trees = call_trees(connection, end_day)
+    first_day = (date.fromisoformat(end_day) - timedelta(days=6)).isoformat()
+    daily: dict[str, DailyTestsPerEdit] = {}
+    bins = [FailureRecoveryBin() for _ in EDIT_BINS]
+    last_tree: dict[str, str] = {}
+    edits_since_green: dict[str, int] = {}
+    waiting_for_green: dict[str, list[tuple[int, datetime]]] = {}
+
+    for call_id, started_at, ended_at, call_day, seat_value, verb, status, outcome in rows:
+        if seat_value is None:
+            continue
+        seat = cast(str, seat_value)
+        day = cast(str, call_day)
+        in_window = day >= first_day
+        activity = daily.setdefault(day, DailyTestsPerEdit()) if in_window else None
+        span = trees.get(cast(str, call_id))
+        if span is not None:
+            previous = last_tree.get(seat)
+            if previous is not None and previous != span.first:
+                edits_since_green[seat] = edits_since_green.get(seat, 0) + 1
+                if activity is not None:
+                    activity.edits += 1
+            last_tree[seat] = span.last
+
+        if verb != "test":
+            continue
+        if activity is not None:
+            activity.tests += 1
+        finished_at = datetime.fromisoformat(cast(str, ended_at or started_at))
+        if status == 0 and outcome in ("ran", "reused"):
+            for bin_index, failed_at in waiting_for_green.pop(seat, []):
+                recovery = bins[bin_index]
+                recovery.recovered += 1
+                recovery.minutes_to_green += max(0.0, (finished_at - failed_at).total_seconds() / 60)
+            edits_since_green[seat] = 0
+        elif outcome != "interrupted" and (outcome == "failed" or status is not None and status != 0) and in_window:
+            edits = edits_since_green.get(seat, 0)
+            bin_index = failure_bin(edits)
+            bins[bin_index].failures += 1
+            waiting_for_green.setdefault(seat, []).append((bin_index, finished_at))
+    return TestsPerEditWindow(first_day, daily, bins)
+
+
+def target_status(activity: DailyTestsPerEdit) -> str:
+    if not activity.edits:
+        return "—"
+    ratio = f"{activity.tests / activity.edits:.2f}"
+    target = f"{TESTS_PER_EDIT_TARGET:.2f}"
+    if ratio == target:
+        return "on target"
+    return "above" if float(ratio) > TESTS_PER_EDIT_TARGET else "below"
+
+
+def tests_per_edit_section(connection: sqlite3.Connection, day: str) -> list[str]:
+    window = tests_per_edit_data(connection, day)
+    report_day = date.fromisoformat(day)
+    activity_rows: list[list[str]] = []
+    for offset in range(7):
+        activity_day = (report_day - timedelta(days=offset)).isoformat()
+        activity = window.daily.get(activity_day, DailyTestsPerEdit())
+        activity_rows.append([
+            activity_day,
+            count(activity.tests),
+            count(activity.edits),
+            f"{activity.tests / activity.edits:.2f}" if activity.edits else "—",
+            target_status(activity),
+        ])
+    recovery_rows = [
+        [label, count(recovery.failures), seconds(recovery.minutes_to_green * 60 / recovery.recovered) if recovery.recovered else ""]
+        for label, recovery in zip(EDIT_BINS, window.recovery_bins, strict=True)
+    ]
+    unresolved = sum(recovery.failures - recovery.recovered for recovery in window.recovery_bins)
+    notes = [f"Source: verify.sh failed test calls and step tree keys, {window.first_day}–{day}"]
+    if unresolved:
+        notes.append(f"{unresolved} without a later green")
+    return [
+        "### Tests per edit",
+        "",
+        *table(["Day", "Tests", "Edits", "Tests/edit", "Target"], activity_rows),
+        f"Source: verify.sh test calls and step tree keys, {window.first_day}–{day}; target {TESTS_PER_EDIT_TARGET:g} tests/edit; — means no observed edit.",
+        "",
+        *table(["Edits since green", "Failures", "Avg to next green"], recovery_rows),
+        "; ".join(notes) + ".",
+        "",
+    ]
+
+
 SUMMARIES = [("successes", "status = 0", False), ("failures", "status <> 0", False), ("all", "1", True)]
 
 
@@ -276,7 +442,7 @@ def report(connection: sqlite3.Connection, day: str) -> str:
     calls, calls_line = calls_section(connection, day)
     port_lint, port_lint_line = port_lint_section(connection, day)
     ci, ci_line = ci_section(connection, day)
-    lines += calls + test_builds_section(connection, day) + port_lint + ci
+    lines += calls + test_builds_section(connection, day) + port_lint + ci + tests_per_edit_section(connection, day)
     if found:
         for name, which, with_failed in SUMMARIES:
             lines += [f"### Summary: {name}", "", *summary(connection, day, found, which, with_failed), ""]
