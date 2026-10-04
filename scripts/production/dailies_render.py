@@ -122,6 +122,7 @@ class Eta:
 @dataclass(frozen=True)
 class Unit:
     unit: str
+    name: str
     label: str
     project: str
     phase: str
@@ -485,7 +486,7 @@ def parse_unit(value: object, where: str, length: str) -> Unit:
     fields = as_map(value, where)
     check_keys(
         fields,
-        {"unit", "label", "project", "phase", "started", "held", "held_examples", "build_hold", "update", "eta", "waiting_on_it", "needed", "needs_user", "then"},
+        {"unit", "name", "label", "project", "phase", "started", "held", "held_examples", "build_hold", "update", "eta", "waiting_on_it", "needed", "needs_user", "then"},
         where,
     )
     if "held" not in fields:
@@ -537,6 +538,7 @@ def parse_unit(value: object, where: str, length: str) -> Unit:
         check_update(held_examples, length, where, "held_examples")
     return Unit(
         unit=unit,
+        name=optional_text(fields, "name", where) or unit,
         label=label,
         project=text(fields, "project", where),
         phase=phase,
@@ -749,7 +751,7 @@ def render(report: Report, previous: dict[str, Previous], now: datetime, zone_na
     for topic in user_topics:
         topic_section(topic)
     for unit in units:
-        lines.append(f"### {unit.unit}: {unit.project}")
+        lines.append(f"### {unit.name}: {unit.project}")
         lines.append(f"- phase: {unit.phase}")
         if unit.build_hold:
             lines.append(f"- {BUILD_HOLD_MARK}: {unit.build_hold}")
