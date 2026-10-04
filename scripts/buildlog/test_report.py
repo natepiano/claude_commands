@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import override
 from unittest import mock
 
+import disk
 import index
 import report
 from test_index import STAMP, Record, call, ci_job, ci_run, encode, local_day, point_root_at, sample, step
@@ -501,6 +502,93 @@ class ReportTests(unittest.TestCase):
         self.assertIn("Agent calls: none.", text)
         self.assertIn("CI: no runs.", text)
         self.assertNotIn("cargo-port calls", text)
+
+    def test_disk_section_precedes_summaries_with_steps(self) -> None:
+        unit = 2**30
+        snapshot: disk.DiskSnapshot = {
+            "measured_at": "2026-10-04T16:14:00+00:00",
+            "host": "natedev",
+            "rows": [
+                {"label": "~/rust", "bytes": unit},
+                {"label": "/tmp", "bytes": 2 * unit},
+                {"label": "CI runner 1", "bytes": unit},
+                {"label": "CI runner 2", "bytes": unit},
+            ],
+            "used": 10 * unit,
+            "free": 7 * unit,
+            "floor": 500 * unit,
+        }
+        self.write(self.root / "natedev" / "2026-10.jsonl", step("one"))
+
+        with mock.patch("report.disk.read_snapshot", return_value=snapshot) as read_snapshot:
+            with mock.patch("report.sync_time", return_value="12:14 EDT"):
+                lines = self.render().splitlines()
+
+        self.assertLess(lines.index("### Disk: natedev"), lines.index("### Summary: successes"))
+        section = lines[lines.index("### Disk: natedev") : lines.index("### Summary: successes")]
+        self.assertEqual(
+            [
+                "### Disk: natedev",
+                "",
+                "| Where | Size |",
+                "|---|--:|",
+                "| ~/rust | 1.0 GiB |",
+                "| /tmp | 2.0 GiB |",
+                "| CI runner 1 | 1.0 GiB |",
+                "| CI runner 2 | 1.0 GiB |",
+                "| other | 5.0 GiB |",
+                "| free (floor 500.0 GiB) | 7.0 GiB |",
+                "",
+                "Measured by the buildlog disk job at 12:14 EDT: allocated blocks, each hard-linked file once.",
+                "",
+            ],
+            section,
+        )
+        read_snapshot.assert_called_once_with()
+
+    def test_disk_section_precedes_empty_summary_without_floor(self) -> None:
+        snapshot: disk.DiskSnapshot = {
+            "measured_at": "2026-10-04T16:14:00+00:00",
+            "host": "natedev",
+            "rows": [
+                {"label": "~/rust", "bytes": 0},
+                {"label": "/tmp", "bytes": 0},
+                {"label": "CI runner 1", "bytes": 0},
+                {"label": "CI runner 2", "bytes": 0},
+            ],
+            "used": 0,
+            "free": 2**30,
+            "floor": None,
+        }
+        with mock.patch("report.disk.read_snapshot", return_value=snapshot):
+            lines = self.render().splitlines()
+
+        self.assertLess(lines.index("### Disk: natedev"), lines.index("### Summary"))
+        self.assertIn("| free | 1.0 GiB |", lines)
+        self.assertNotIn("free (floor", "\n".join(lines))
+
+    def test_disk_section_clamps_other_when_rows_exceed_used(self) -> None:
+        unit = 2**30
+        snapshot: disk.DiskSnapshot = {
+            "measured_at": "2026-10-04T16:14:00+00:00",
+            "host": "natedev",
+            "rows": [{"label": "~/rust", "bytes": 30 * unit}],
+            "used": 10 * unit,
+            "free": unit,
+            "floor": None,
+        }
+        with mock.patch("report.disk.read_snapshot", return_value=snapshot):
+            lines = report.disk_section()
+
+        self.assertIn("| other | 0.0 GiB |", lines)
+        self.assertNotIn("| other | -20.0 GiB |", lines)
+
+    def test_no_disk_section_without_snapshot(self) -> None:
+        with mock.patch("report.disk.read_snapshot", return_value=None):
+            lines = self.render().splitlines()
+
+        self.assertFalse(any(line.startswith("### Disk:") for line in lines))
+        self.assertIn("### Summary", lines)
 
     def test_sync_time_names_its_zone_and_an_earlier_day(self) -> None:
         self.addCleanup(time.tzset)

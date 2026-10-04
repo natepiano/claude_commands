@@ -8,6 +8,7 @@
   buildlog tree-key [DIR]           the tree key of DIR's worktree (default the current folder; treekey.py)
   buildlog sync                     exchange records with the Mac (natedev's hourly job)
   buildlog ci                       record new GitHub Actions run attempts
+  buildlog disk                     measure disk usage for the next report
   buildlog sample                   record machine memory and stall counters once
   buildlog hourly                   sync, then ci, each whatever the other did
   buildlog backfill-verify [LEDGER] copy verify.sh's old events.jsonl ledger in, once
@@ -26,6 +27,7 @@ from datetime import date
 from typing import cast
 
 import ci
+import disk
 import index
 import record
 import report
@@ -215,6 +217,13 @@ def main(argv: list[str]) -> int:
         return sync.sync()
     if command == "ci":
         return ci.ci()
+    if command == "disk":
+        try:
+            disk.write_snapshot(disk.snapshot())
+        except disk.InvalidFloor as error:
+            print(f"buildlog disk: {error}", file=sys.stderr)
+            return 1
+        return 0
     if command == "sample":
         if rest:
             print("usage: buildlog sample", file=sys.stderr)
