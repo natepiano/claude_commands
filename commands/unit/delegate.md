@@ -367,8 +367,11 @@ Rules:
   here takes the `cargo` token on its own, so a run may wait for a peer, and a
   result is a gate only once the slot owning that package's files has posted
   `done`.
-- `check` and `test --filter` are feedback while iterating, never a gate:
-  iterate on them, not on the full suite. After the seat's last edit, run
+- `check` and `test --filter` are feedback while iterating, never a gate.
+  Run `check` after each batch of edits, and `test --filter` once per finished
+  change, naming all its tests in one call (repeat `--filter`). Never re-run
+  either on a tree that has not changed. User, 2026-10-04: seats ran a
+  `--filter` after every edit, 619 test runs in six hours. After the seat's last edit, run
   `lint` once, naming any one modified package, then `test` for every modified
   package. Lint is never per crate: one run covers the whole workspace (mend
   and clippy across it, format and rustdoc for every changed member). A failed

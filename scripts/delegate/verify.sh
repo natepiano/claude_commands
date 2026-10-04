@@ -42,10 +42,13 @@
 # arguments, rustc -vV, lint.conf, these scripts and the RUST*/CARGO_*/NEXTEST_*
 # environment. A plain `lint <package>` leaves the package out of the key:
 # every lint stage but fmt covers the workspace, and fmt covers every member
-# that differs from HEAD, so one lint record answers for each package. The same
-# call on the same tree then prints that record and its log and exits 0
-# without the cargo token: seats re-ran unchanged trees 416
-# times in the week to 2026-10-01. A failed `lint` is recorded the same way
+# that differs from HEAD, so one lint record answers for each package. A
+# `test --filter` key holds its names sorted, each once, so one set of names
+# finds one record whatever order a call gives them in. The same call on the
+# same tree then prints that record and its log and exits 0 without the cargo
+# token: seats re-ran unchanged trees 416 times in the week to 2026-10-01. A
+# `test --filter` reuse prints one line instead, since iteration feedback needs
+# only the verdict. A failed `lint` is recorded the same way
 # and replayed with its full output and exit status, since lint on an
 # unchanged tree fails the same way (one seat ran 12 in a row on 2026-10-01).
 # A failed `test` is never recorded (tests flake), nor a run cut short by a
@@ -69,12 +72,17 @@
 #                                          (workspace lib + bins + tests built)
 #   verify.sh test <package> <int_test>    one named integration test target,
 #                                          for re-running it alone
-#   verify.sh test <package> --filter <name>
+#   verify.sh test <package> --filter <name> [--filter <name> …]
 #                                          only the package's tests whose name
-#                                          contains <name>, while iterating;
+#                                          contains any <name>, while iterating;
 #                                          never a gate: its pass is recorded
 #                                          under its own words, so it never
-#                                          answers `test <package>`
+#                                          answers `test <package>`. Repeat
+#                                          --filter to run a change's tests in
+#                                          one call; in a delegate session the
+#                                          same names, in any order, on an
+#                                          unchanged tree print one line and
+#                                          build nothing
 #   verify.sh lint <package>               mend --fix, nightly fmt of the package
 #                                          and the members that differ from HEAD,
 #                                          workspace clippy (warnings denied), then
@@ -346,11 +354,31 @@ CALL_NOTED=0
 LOOKUP_KEY=""
 LOOKUP_STATUS=0
 EXIT_STATUS=0
+FILTER_RUN=0
+if [[ "$CMD" == test && " ${ARGS[*]} " == *" --filter "* ]]; then
+    FILTER_RUN=1
+fi
 
 tree_key() {
-    local words=("$CMD" "${ARGS[@]}")
+    local words=("$CMD" "${ARGS[@]}") names=() name
     if [[ "$CMD" == lint && ${#ARGS[@]} -eq 1 ]]; then
         words=(lint)
+    elif [[ "${FILTER_RUN}" -eq 1 ]]; then
+        # The filter names go last, sorted, each once (see the header).
+        words=("$CMD")
+        set -- "${ARGS[@]}"
+        while [[ $# -gt 0 ]]; do
+            if [[ "$1" == --filter && $# -gt 1 ]]; then
+                names+=("$2")
+                shift 2
+            else
+                words+=("$1")
+                shift
+            fi
+        done
+        while IFS= read -r name; do
+            words+=(--filter "$name")
+        done < <(printf '%s\n' "${names[@]}" | LC_ALL=C sort -u)
     fi
     "$PY" -c "$TREE_KEY_PY" "${BASH_SOURCE[0]}" "$HOME/.claude/scripts/lint/invoke.sh" \
         "${LINT_CONFIG_FILE:-$HOME/.claude/config/lint.conf}" -- "${words[@]}" \
@@ -394,6 +422,10 @@ cache_lookup() {
     LOOKUP_STATUS="${LOOKUP_STATUS:-0}"
     note_event "${outcome}" "${SECONDS}" 0 0 "$(sed -n 's/^saved_s=//p' "${record}")" \
         "${LOOKUP_STATUS}" || true
+    if [[ "${FILTER_RUN}" -eq 1 ]]; then
+        echo "verify.sh: ${word} (recorded), skipped — $(head -n 1 "${record}"); the tree and every input are unchanged since, so nothing was built or run (--no-cache runs it anyway)."
+        return 0
+    fi
     echo "verify.sh: ${word} (recorded) — $(head -n 1 "${record}")"
     if ! head -n 1 "${record}" | grep -qF "\`verify.sh $CMD${ARGS[*]:+ ${ARGS[*]}}\`"; then
         echo "verify.sh: lint covers the workspace and every changed member, so that result answers this package too."
@@ -592,17 +624,18 @@ case "$CMD" in
         PKG="${1:?verify.sh test <package> [integration_test]}"
         shift
         TARGET=""
-        FILTER=""
+        FILTERS=()
         if [[ $# -gt 0 && "$1" != --* ]]; then
             TARGET="$1"
             shift
         fi
-        # --filter and --features in either order; a target takes no filter.
+        # --filter, as often as named, and --features in any order; a target
+        # takes no filter.
         REST=()
         while [[ $# -gt 0 ]]; do
-            if [[ "$1" == "--filter" && -z "$TARGET" && -z "$FILTER" \
+            if [[ "$1" == "--filter" && -z "$TARGET" \
                   && "${2:-}" =~ ^[A-Za-z0-9_:]+$ ]]; then
-                FILTER="$2"
+                FILTERS+=("$2")
                 shift 2
             else
                 REST+=("$1")
@@ -616,9 +649,18 @@ case "$CMD" in
         # phase gate has to report the whole result, not the first stop.
         # The build covers the workspace (see the header); -E runs only this
         # package's tests.
-        if [[ -n "$FILTER" ]]; then
+        if [[ ${#FILTERS[@]} -gt 0 ]]; then
+            # Any of the names: & binds tighter than |, so a union of two or
+            # more goes in parentheses.
+            FILTER="test(${FILTERS[0]})"
+            for name in "${FILTERS[@]:1}"; do
+                FILTER+=" | test($name)"
+            done
+            if [[ ${#FILTERS[@]} -gt 1 ]]; then
+                FILTER="($FILTER)"
+            fi
             run_nextest --no-fail-fast --workspace --lib --bins --tests \
-                -E "package($PKG) & test($FILTER)" "${FEATURE_FLAGS[@]}"
+                -E "package($PKG) & $FILTER" "${FEATURE_FLAGS[@]}"
         elif [[ -n "$TARGET" ]]; then
             # Integration test target names are unique across the workspace,
             # so --test builds just that binary, under the workspace's
