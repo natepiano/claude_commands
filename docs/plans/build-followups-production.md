@@ -37,7 +37,7 @@
 ## Close-out
 
 - followups-unit Phase 1 on main: mark `~/.local/state/nightly-review/ledger.md` line 15 accepted with the main sha — done (0bbccc0).
-- stalls-unit Phase 1 on main: natedev adds the `buildlog sample` timer the unit names to `/etc/nixos` (commit, push); the user rebuilds.
+- stalls-unit Phase 1 and followups-unit Phase 3 on main: natedev adds the `buildlog sample` (60 s) and `buildlog disk` (10 min) timers to `/etc/nixos`; the user rebuilds — done (nixos d2b7778, rebuilt 11:55 PDT).
 - notifier-unit Phase 1 on main: natedev tells the tool-based-ui showrunner about `validate_and_push.sh --cancel-prior` and the rule in `produce.md` — done 10:52 PDT.
 - Delete `/etc/nixos/adhoc_review_2026-10-04.md` — done.
 
