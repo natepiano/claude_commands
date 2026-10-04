@@ -525,9 +525,10 @@ def remove(groups: list[Group]) -> int:
     return failures
 
 
-def directory_blocks(directory: str) -> int:
-    """Disk blocks held under a directory, counting a hard-linked file once."""
-    seen: set[InodeKey] = set()
+def directory_blocks(directory: str, seen: set[InodeKey] | None = None) -> int:
+    """Disk blocks under a directory, counting inodes already in seen once."""
+    if seen is None:
+        seen = set()
     total = 0
     frontier = [directory]
     while frontier:

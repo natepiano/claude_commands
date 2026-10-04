@@ -5,7 +5,7 @@
 
 ## Context
 
-- **Source:** the user's adhoc review of 2026-10-04 (natedev session), five follow-up tasks recorded there; Phases 1–2 are below; on 2026-10-04 memory stalls moved to stalls-unit, tests per edit to ratio-unit, and cancelling a superseded CI run to notifier-unit. The user asked for them to run as a production with natedev as showrunner.
+- **Source:** the user's adhoc review of 2026-10-04 (natedev session), five follow-up tasks recorded there; Phases 1–2 are below; Phase 3, the Disk table, the user added on 2026-10-04 through the showrunner; on 2026-10-04 memory stalls moved to stalls-unit, tests per edit to ratio-unit, and cancelling a superseded CI run to notifier-unit. The user asked for them to run as a production with natedev as showrunner.
 - **Already done, do not redo:** `test --filter` takes several names (`verify.sh` 953ed15), and `commands/unit/delegate.md:360-364` already tells seats to run `check` after each batch of edits and `test --filter` once per finished change.
 - **This repo is every session's live configuration.** `~/.claude` main is what every Claude session on natedev and the Mac loads. Edit only this worktree. Run the worktree's copies (`./scripts/...`), never `~/.claude/scripts/...`, when testing a change.
 - **The build log** lives in `~/.local/state/buildlog` (`scripts/buildlog/store.py`; `BUILDLOG_DIR` moves it). `buildlog schema` lists its tables (steps, calls, ci_runs, ci_jobs, tests) and columns; `buildlog query "<SQL>"` reads it. Read the real log freely, but never write to or delete from it in a test.
@@ -70,3 +70,28 @@
 
 **Ruled out:**
 - A test-only default location in `store.py`: the shared test setup makes it unneeded.
+
+### Phase 3 — Disk usage in the build report · status: done
+
+#### As-built
+
+- `buildlog disk` (`cli.py`, listed in its usage docstring) writes `<store.root()>/disk.json` (`store.DISK_NAME`) atomically, `disk.json.tmp` then `replace`, and prints nothing on success. The floor is read before the walk: a malformed one prints `buildlog disk: <reason>` to stderr and exits 1, leaving the previous `disk.json` in place.
+- `scripts/buildlog/disk.py`: `DiskRow(TypedDict)` (`label`, `bytes`); `DiskSnapshot(TypedDict)` (`measured_at` via `store.utc_iso`, `host` via `store.host_name()`, `rows`, `used`, `free`, `floor: int | None`); `FOLDERS`, the four rows in order: `~/rust`, `/tmp`, `CI runner 1` (`/var/lib/hana-ci/hana-linux-1`), `CI runner 2` (`/var/lib/hana-ci/hana-linux-2`), `~` expanded at measure time; frozen `FilesystemUsage(used, free)` and `filesystem_usage(path)` from `os.statvfs` (used `(f_blocks - f_bfree) * f_frsize`, free `f_bavail * f_frsize`); `read_floor() -> int | None` from lint.conf's `sweep_free_floor_gib.<host>` (else `sweep_free_floor_gib`) through `sweep.config_values` and `sweep.floor_bytes`, raising `InvalidFloor` on a malformed value; `measure(folders, usage: Callable[[], FilesystemUsage], floor) -> DiskSnapshot`, which walks the folders, then calls `usage` once and stamps `measured_at`; `snapshot()`, `write_snapshot(snapshot)`, `read_snapshot() -> DiskSnapshot | None` (None when missing or unreadable).
+- Counting is allocated blocks (`st_blocks * 512`), each inode once across all rows in row order, through one `seen` set shared by every `sweep.directory_blocks(directory, seen=None)` call: a file hard-linked into two rows counts in the first only, so `other` is exactly what the rows leave. Callers that pass no `seen` count per directory as before.
+- `report.py`'s `disk_section()` renders after the CI section and before `### Summary: successes` (or `### Summary` on a day with no steps): `### Disk: <host>`, a `["Where", "Size"]` table of the four rows, `other` (used minus the rows, clamped at zero), `free (floor N GiB)` or plain `free` without a floor, then `Measured by the buildlog disk job at <sync_time>: allocated blocks, each hard-linked file once.` No snapshot (the Mac, or before the job's first run) leaves the section out.
+- `disk.py` reaches `sweep` by putting `scripts/lint` at the front of `sys.path`; `pyrightconfig.json`'s `scripts/buildlog` environment lists `scripts/lint` in `extraPaths`.
+
+**Files:**
+- `scripts/buildlog/disk.py` — the rows, `measure`, `read_floor`/`InvalidFloor`, the snapshot file.
+- `scripts/buildlog/cli.py` — the `disk` command.
+- `scripts/buildlog/store.py` — `DISK_NAME`.
+- `scripts/buildlog/report.py` — `disk_section()`.
+- `scripts/lint/sweep.py` — `directory_blocks` with the optional shared `seen` set.
+- `scripts/buildlog/test_disk.py` — fake-tree tests: hard links within and across rows, an unreadable folder, usage read once after the walk, malformed floor, snapshot round trip under the suite log; `snapshot()` runs only with `FOLDERS`, the walk and `filesystem_usage` patched.
+- `scripts/buildlog/test_report.py` — the Disk section's rows, floor label, placement with and without steps, `other` clamping, absence without a snapshot.
+- `scripts/lint/test_sweep.py` — a hard link across two calls sharing `seen` counts once.
+- `pyrightconfig.json` — `scripts/lint` on the buildlog environment's `extraPaths`.
+
+**Gotchas:** The walk takes 13 s warm and 67 s cold, so the report only reads `disk.json` and never walks. The 10-minute timer that runs `buildlog disk` (`nate.jobs.buildlog-disk`) lives in `/etc/nixos`, not this repo. Rows and used are read at different moments, so churn during the walk moves `other`; it clamps at zero. A directory the walk cannot read (each runner's `rustup/tmp`) is skipped and its blocks fall into `other`; the runner folders read because `natepiano` is in groups `hana-linux-1` and `hana-linux-2`. All five rows sit on the one ext4 filesystem `/`; `/tmp` is not a separate mount.
+
+**Ruled out:** walking at report time (13–67 s per report); measuring the Mac's disk (natedev only, by the user's scope).

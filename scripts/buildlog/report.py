@@ -13,6 +13,7 @@ from dataclasses import dataclass
 from datetime import date, datetime
 from typing import cast
 
+import disk
 import sync
 
 KIND_ORDER = ["fmt", "check", "clippy", "mend", "doc", "nextest", "sweep"]
@@ -258,6 +259,26 @@ def sync_time(last: str, now: datetime) -> str:
     return at.strftime("%H:%M %Z" if at.date() == now.astimezone().date() else "%Y-%m-%d %H:%M %Z")
 
 
+def disk_section() -> list[str]:
+    snapshot = disk.read_snapshot()
+    if snapshot is None:
+        return []
+    rows = [[row["label"], gib(row["bytes"])] for row in snapshot["rows"]]
+    rows.append(["other", gib(max(0, snapshot["used"] - sum(row["bytes"] for row in snapshot["rows"])))])
+    floor = snapshot["floor"]
+    free_label = f"free (floor {gib(floor)})" if floor is not None else "free"
+    rows.append([free_label, gib(snapshot["free"])])
+    measured = sync_time(snapshot["measured_at"], datetime.now())
+    return [
+        f"### Disk: {snapshot['host']}",
+        "",
+        *table(["Where", "Size"], rows),
+        "",
+        f"Measured by the buildlog disk job at {measured}: allocated blocks, each hard-linked file once.",
+        "",
+    ]
+
+
 def mac_note() -> str:
     status = sync.read_status()
     if status is None:
@@ -276,7 +297,7 @@ def report(connection: sqlite3.Connection, day: str) -> str:
     calls, calls_line = calls_section(connection, day)
     port_lint, port_lint_line = port_lint_section(connection, day)
     ci, ci_line = ci_section(connection, day)
-    lines += calls + test_builds_section(connection, day) + port_lint + ci
+    lines += calls + test_builds_section(connection, day) + port_lint + ci + disk_section()
     if found:
         for name, which, with_failed in SUMMARIES:
             lines += [f"### Summary: {name}", "", *summary(connection, day, found, which, with_failed), ""]

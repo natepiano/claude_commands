@@ -124,6 +124,23 @@ class SweepCase(unittest.TestCase):
         return Target(Path(self.enterContext(tempfile.TemporaryDirectory())).resolve())
 
 
+class DirectoryBlocksTests(SweepCase):
+    def test_shared_seen_counts_a_hard_link_in_the_first_directory_only(self) -> None:
+        base = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
+        first = base / "first"
+        second = base / "second"
+        source = write(first / "output")
+        second.mkdir()
+        os.link(source, second / "output")
+        blocks = source.stat().st_blocks * 512
+
+        self.assertEqual(sweep.directory_blocks(str(first)), blocks)
+        self.assertEqual(sweep.directory_blocks(str(second)), blocks)
+        seen: set[sweep.InodeKey] = set()
+        self.assertEqual(sweep.directory_blocks(str(first), seen), blocks)
+        self.assertEqual(sweep.directory_blocks(str(second), seen), 0)
+
+
 class GroupTests(SweepCase):
     def test_hard_linked_copy_and_dep_info_join_their_unit(self) -> None:
         target = self.target()

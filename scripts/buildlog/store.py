@@ -25,6 +25,7 @@ CI_DIR = "ci"
 LOGS_DIR = "logs"
 ERRORS_NAME = "errors.log"
 SYNC_STATUS_NAME = "sync.json"
+DISK_NAME = "disk.json"
 
 
 def root() -> Path:
