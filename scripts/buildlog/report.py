@@ -15,6 +15,7 @@ from typing import cast
 
 import disk
 import sync
+import rust_release
 
 KIND_ORDER = ["fmt", "check", "clippy", "mend", "doc", "nextest", "sweep"]
 CALLER_LABELS = {
@@ -536,7 +537,7 @@ def report(connection: sqlite3.Connection, day: str) -> str:
             lines += [f"### Summary: {name}", "", *summary(connection, day, found, which, with_failed), ""]
     else:
         lines += ["### Summary", "", "No build steps recorded.", ""]
-    lines += [calls_line, *port_lint_line, ci_line]
+    lines += [calls_line, *port_lint_line, ci_line, *rust_release.report_line()]
     notes = [
         mac_note(),
         "Peak memory is measured on natedev only. It counts files the step read or wrote that stayed in RAM, so it runs above what the step's processes used.",

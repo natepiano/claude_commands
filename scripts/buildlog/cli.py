@@ -10,7 +10,7 @@
   buildlog ci                       record new GitHub Actions run attempts
   buildlog disk                     measure disk usage for the next report
   buildlog sample                   record machine memory and stall counters once
-  buildlog hourly                   sync, then ci, each whatever the other did
+  buildlog hourly                   sync, ci, then Rust release check
   buildlog backfill-verify [LEDGER] copy verify.sh's old events.jsonl ledger in, once
 
 Records live in ~/.local/state/buildlog (BUILDLOG_DIR moves it); see store.py.
@@ -31,6 +31,7 @@ import disk
 import index
 import record
 import report
+import rust_release
 import sample
 import store
 import sync
@@ -180,7 +181,7 @@ def day_report(args: list[str]) -> int:
 
 def hourly() -> int:
     status = 0
-    for name, job in (("sync", sync.sync), ("ci", ci.ci)):
+    for name, job in (("sync", sync.sync), ("ci", ci.ci), ("rust release", rust_release.check_release)):
         try:
             status |= job()
         except Exception as error:  # noqa: BLE001 -- one job's failure must not cost the other its run
