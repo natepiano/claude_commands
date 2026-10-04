@@ -360,6 +360,10 @@ def draw_from(start: datetime, now: datetime, rows: list[Row], style: ChartStyle
         if ranged and style.show_range:
             span += f" ({estimate.earliest:%H:%M}–{estimate.latest:%H:%M})"
         lines.append(f"{prefix}{''.join(cells).rstrip()}{arrow} {span}{hold}")
+    # The axis ends with the widest row, so its labels never widen the chart.
+    indent = ROW_LABEL_WIDTH + start_width
+    reach = max((display_width(line) - indent for line in lines[1:]), default=0)
+    lines[0] = " " * indent + "".join(axis[: -(-reach // 2)]).rstrip()
     return with_plans(lines, rows)
 
 
