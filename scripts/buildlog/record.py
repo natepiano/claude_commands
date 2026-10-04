@@ -7,7 +7,7 @@ port_lint.py writes its own call records through write_call() here.
       From invoke.sh's run(), detached, after every step. START and END are
       epoch seconds; TTY is 1 when a terminal watched the step (no log is
       captured then); LOG is the step's output handed off by run(), PEAK the
-      file the cgroup scope wrote memory.peak to. Either may be empty. Both
+      file the cgroup scope wrote memory.peak and memory.pressure to. Either may be empty. Both
       are deleted here. BUILDLOG_TREE_START is the tree key `key` printed
       before the step; the key taken here, after it, decides tree_key and
       tree_changed.
@@ -41,9 +41,10 @@ import sys
 import time
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import TypedDict, cast
+from typing import NamedTuple, TypedDict, cast
 
 import parse
+import sample
 import store
 import treekey
 
@@ -177,17 +178,27 @@ def rustc_version(argv: list[str], cwd: str) -> str | None:
     return text.strip() if text else None
 
 
-def peak_bytes(path: str) -> int | None:
+class StepScopeMemory(NamedTuple):
+    peak_bytes: int | sample.Unmeasured
+    stall_some_s: float | sample.Unmeasured
+    stall_full_s: float | sample.Unmeasured
+
+
+def peak_and_stall(path: str) -> StepScopeMemory:
     if not path:
-        return None
+        return StepScopeMemory(sample.Unmeasured.VALUE, sample.Unmeasured.VALUE, sample.Unmeasured.VALUE)
     try:
-        text = Path(path).read_text().strip()
+        lines = Path(path).read_text().splitlines()
     except OSError:
-        return None
+        return StepScopeMemory(sample.Unmeasured.VALUE, sample.Unmeasured.VALUE, sample.Unmeasured.VALUE)
     try:
-        return int(text) if text else None
+        peak = int(lines[0]) if lines else sample.Unmeasured.VALUE
     except ValueError:
-        return None
+        peak = sample.Unmeasured.VALUE
+    stalls = sample.parse_pressure("\n".join(lines[1:]), require_both=False)
+    some = stalls.some_us / 1_000_000 if isinstance(stalls.some_us, int) else sample.Unmeasured.VALUE
+    full = stalls.full_us / 1_000_000 if isinstance(stalls.full_us, int) else sample.Unmeasured.VALUE
+    return StepScopeMemory(peak, some, full)
 
 
 def tree_facts(start: str | None, end: str | None) -> dict[str, object]:
@@ -232,6 +243,7 @@ def step(args: list[str]) -> None:
                 store.note_error(f"parse {name} {held}")
             if status != 0:
                 log = keep_log(data, host, start, record_id)
+        memory = peak_and_stall(peak)
         record: dict[str, object] = {
             "kind": "step",
             "v": RECORD_VERSION,
@@ -251,7 +263,9 @@ def step(args: list[str]) -> None:
             "tty": tty,
             "status": status,
             "rustc": None if name == "sweep" else rustc_version(argv, cwd),
-            "peak_mem_bytes": peak_bytes(peak),
+            "peak_mem_bytes": memory.peak_bytes if isinstance(memory.peak_bytes, int) else None,
+            "mem_stall_some_s": memory.stall_some_s if isinstance(memory.stall_some_s, float) else None,
+            "mem_stall_full_s": memory.stall_full_s if isinstance(memory.stall_full_s, float) else None,
             **facts,
             "log": log,
         }

@@ -17,6 +17,8 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import cast, override
 
+import record as recorder
+import sample
 from test_index import point_root_at
 
 SCRIPT = Path(__file__).with_name("record.py")
@@ -168,11 +170,51 @@ class RecordTests(unittest.TestCase):
         self.assertFalse(handoff.exists())
         self.assertFalse(peak.exists())
 
+    def test_step_records_cgroup_memory_stall_seconds(self) -> None:
+        peak = self.base / "peak-pressure"
+        _ = peak.write_text("\n".join([
+            "123456",
+            "some avg10=0.00 avg60=0.01 avg300=0.02 total=1250000",
+            "full avg10=0.00 avg60=0.00 avg300=0.00 total=250000",
+            "",
+        ]))
+        record = self.step(0, "0", "", str(peak), SWEEP)
+        self.assertEqual(record["peak_mem_bytes"], 123456)
+        self.assertEqual(record["mem_stall_some_s"], 1.25)
+        self.assertEqual(record["mem_stall_full_s"], 0.25)
+        self.assertFalse(peak.exists())
+
+    def test_scope_memory_names_its_values_and_marks_missing_stalls_unmeasured(self) -> None:
+        peak = self.peak_file()
+        memory = recorder.peak_and_stall(str(peak))
+        self.assertIsInstance(memory, recorder.StepScopeMemory)
+        self.assertEqual(memory.peak_bytes, 123456)
+        self.assertIs(memory.stall_some_s, sample.Unmeasured.VALUE)
+        self.assertIs(memory.stall_full_s, sample.Unmeasured.VALUE)
+
+    def test_scope_memory_uses_shared_pressure_parser_for_partial_counters(self) -> None:
+        peak = self.base / "partial-pressure"
+        _ = peak.write_text("123456\nsome avg10=0.00 total=1250000\n")
+        memory = recorder.peak_and_stall(str(peak))
+        self.assertEqual(memory.stall_some_s, 1.25)
+        self.assertIs(memory.stall_full_s, sample.Unmeasured.VALUE)
+        recorded = self.step(0, "0", "", str(peak), SWEEP)
+        self.assertEqual(recorded["mem_stall_some_s"], 1.25)
+        self.assertIsNone(recorded["mem_stall_full_s"])
+
+    def test_step_accepts_older_peak_only_file_without_stalls(self) -> None:
+        record = self.step(0, "0", "", str(self.peak_file()), SWEEP)
+        self.assertEqual(record["peak_mem_bytes"], 123456)
+        self.assertIsNone(record.get("mem_stall_some_s"))
+        self.assertIsNone(record.get("mem_stall_full_s"))
+
     def test_passing_step_keeps_no_log(self) -> None:
         handoff = self.handoff()
         record = self.step(0, "0", str(handoff), "", NEXTEST)
         self.assertIsNone(record["log"])
         self.assertIsNone(record["peak_mem_bytes"])
+        self.assertIsNone(record.get("mem_stall_some_s"))
+        self.assertIsNone(record.get("mem_stall_full_s"))
         self.assertEqual(record["tests_run"], 5)
         self.assertFalse(handoff.exists())
         self.assertEqual(list(self.root.glob("*/logs")), [])

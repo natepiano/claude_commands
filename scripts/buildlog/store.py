@@ -50,6 +50,10 @@ def host_file(host: str, epoch: float) -> Path:
     return root() / host / f"{month(epoch)}.jsonl"
 
 
+def sample_file(host: str, epoch: float) -> Path:
+    return root() / host / f"samples-{month(epoch)}.jsonl"
+
+
 def append_line(path: Path, record: object) -> None:
     data = (json.dumps(record, separators=(",", ":"), ensure_ascii=False) + "\n").encode()
     path.parent.mkdir(parents=True, exist_ok=True)

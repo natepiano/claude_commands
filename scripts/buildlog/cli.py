@@ -8,6 +8,7 @@
   buildlog tree-key [DIR]           the tree key of DIR's worktree (default the current folder; treekey.py)
   buildlog sync                     exchange records with the Mac (natedev's hourly job)
   buildlog ci                       record new GitHub Actions run attempts
+  buildlog sample                   record machine memory and stall counters once
   buildlog hourly                   sync, then ci, each whatever the other did
   buildlog backfill-verify [LEDGER] copy verify.sh's old events.jsonl ledger in, once
 
@@ -28,6 +29,7 @@ import ci
 import index
 import record
 import report
+import sample
 import store
 import sync
 import treekey
@@ -213,6 +215,12 @@ def main(argv: list[str]) -> int:
         return sync.sync()
     if command == "ci":
         return ci.ci()
+    if command == "sample":
+        if rest:
+            print("usage: buildlog sample", file=sys.stderr)
+            return 2
+        sample.sample()
+        return 0
     if command == "hourly":
         return hourly()
     if command == "backfill-verify":

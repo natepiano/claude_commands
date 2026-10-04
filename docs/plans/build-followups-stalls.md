@@ -27,19 +27,31 @@
 
 ## Phases
 
-### Phase 1 — Memory stalls · status: todo
+### Phase 1 — Memory stalls · status: done
 
-#### Work Order
+#### As-built
 
-**Goal:** the report shows when memory, not CPU, held builds back: which steps stalled, how long, and how many steps ran at once.
+- Each step records its cgroup memory stall time at step end: `BUILDLOG_SCOPE_SH` in `scripts/lint/invoke.sh` writes `memory.peak` and the `memory.pressure` `some`/`full` totals into the file `record.py` parses, stored as seconds in `steps.mem_stall_some_s` and `steps.mem_stall_full_s` (index schema 5). Natedev only, like peak memory; a step without a pressure file stores null, which the report treats as no stall.
+- `buildlog sample` appends one machine sample (time, used memory, swap used, boot id, `/proc/pressure/memory` `some`/`full` totals) to `samples-<YYYY-MM>.jsonl` beside the step records; `index.py` ingests the file into a `samples` table.
+- The daily report's "Memory pressure" section (`memory_pressure_section`) states its source, then a table of the five steps with the most stall (caller, kind, stall seconds, and how many steps on that host ran at once at the step's start), then one line with the day's peak used memory and swap (labelled as 60 s samples) and total machine stall. An empty day prints one line.
 
-**Spec:**
-- **Why:** `peak_mem_bytes` is per step and includes page cache, so it misses the real risk, many steps at once. The 2026-09-30 freeze filled RAM and swap; at 05:52 EDT 2026-10-04 swap was 7/7 GiB and the report showed nothing.
-- **Per step:** where `record.py` reads the step's cgroup `memory.peak`, also read its `memory.pressure` `some` and `full` totals at step end, stored as stall seconds in new `steps` columns (schema change through the store's own migration path). Natedev only, like peak memory.
-- **Per day, machine-wide:** a `buildlog sample` command records one row (time, used memory, swap used, `/proc/pressure/memory` `some` and `full` totals) into a new table. A systemd user timer runs it every 60 s; that timer goes in `/etc/nixos`, which this unit does not edit: write the command and its test, and name the timer's exact command line in the checkpoint notice for the showrunner to install. The sample costs one short process a minute; measure its run time and state it.
-- **Section "Memory pressure":** the day's peak used memory and swap (from the samples, labelled as 60 s samples), total stall time (from the counter deltas, across reboots), and the steps with the most stall: kind, caller, stall seconds, and how many steps ran at once at their start (overlapping intervals in `steps`). Empty days print one line, not an empty table.
+**Files:**
+- `scripts/lint/invoke.sh` — `BUILDLOG_SCOPE_SH` writes `memory.peak` and `memory.pressure` to the scope file
+- `scripts/buildlog/record.py` — parses the scope file into peak bytes and stall seconds
+- `scripts/buildlog/sample.py` — the sample command and the meminfo, pressure and boot id parsers
+- `scripts/buildlog/store.py` — `sample_file` names the monthly samples file
+- `scripts/buildlog/index.py` — schema 5: step stall columns, the `samples` table and its indexes
+- `scripts/buildlog/cli.py` — the `sample` command
+- `scripts/buildlog/report.py` — `memory_pressure_section`
+- `scripts/buildlog/test_{record,index,store,sample,report}.py` — fixture tests for the parsers, ingest and the section
 
-**Files:** `scripts/buildlog/record.py`, `scripts/buildlog/store.py`, `scripts/buildlog/cli.py`, `scripts/buildlog/buildlog`, `scripts/buildlog/report.py`, a new `scripts/buildlog/sample.py`, and their tests.
+**Gotchas:**
+- Machine stall deltas count only between samples at most 5 minutes apart, since a counter rise across a longer gap cannot be placed on a day; across a boot id change the later counter is the delta.
+- Temp-folder steps are left out of the stall table but counted in "at once".
+- `peak_mem_bytes` is per step and includes page cache; it does not show the risk of many steps running at once.
+- `buildlog sample` is Linux only: without `/proc` (the Mac) it prints one line and exits nonzero. The 60 s natedev systemd user timer that runs it belongs in `/etc/nixos`, not this repo; without it the `samples` table stays empty.
+- Ingesting a month of samples (43,200 rows) costs 0.32 s the first time, then 2 ms.
+- `basedpyright` exits 3 in every checkout because `pyrightconfig.json` names an absent `.venv`; the counts line, not the exit code, is the lint result.
 
-**Acceptance gate:** Test and Lint green; a step recorded in a test cgroup or a fixture carries stall seconds; the section renders from fixture rows.
+**Ruled out:** a direct table write from `buildlog sample` — the per-minute sample never opens the SQLite index.
 

@@ -62,7 +62,8 @@ fi
 # The recorder ignores SIGHUP from birth: a terminal that closes as the last
 # step ends (a pty wrapper, a closed pane) killed it before its own setsid.
 # On natedev buildlog_exec also runs the step in its own systemd scope, whose
-# cgroup memory.peak is the step's peak memory, page cache included. That moves
+# cgroup memory.peak and memory.pressure measure the step's peak memory and
+# memory stalls. Peak memory includes page cache. The scope moves
 # the step from the caller's scope (a terminal's, with its own OOM policy) to
 # app.slice. Per step, starting the recorder costs about 2 ms and the scope 8
 # ms more (natedev, 2026-10-02); BUILDLOG_SCOPE=0 turns the scope off,
@@ -78,7 +79,7 @@ fi
 # sandbox without its socket, a systemd older than 254 that rejects the
 # option), and run() runs it plainly.
 BUILDLOG_RECORD="$HOME/.claude/scripts/buildlog/record.py"
-BUILDLOG_SCOPE_SH='exec 2>&3 3>&-; { : > "$0"; } 2>/dev/null || exit 125; "$@"; s=$?; cat "/sys/fs/cgroup$(sed -n "s/^0:://p" /proc/self/cgroup)/memory.peak" > "$0" 2>/dev/null; exit $s'
+BUILDLOG_SCOPE_SH='exec 2>&3 3>&-; { : > "$0"; } 2>/dev/null || exit 125; "$@"; s=$?; cgroup="/sys/fs/cgroup$(sed -n "s/^0:://p" /proc/self/cgroup)"; cat "$cgroup/memory.peak" "$cgroup/memory.pressure" > "$0" 2>/dev/null; exit $s'
 
 buildlog_now() {
     if [[ -n "${EPOCHREALTIME:-}" ]]; then
