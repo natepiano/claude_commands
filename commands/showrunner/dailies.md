@@ -246,7 +246,7 @@ For every length:
   | `a helper is retaking every view, 4 of 9 shots done` | Shorthand: "retaking every view" says nothing. | `taking new screenshots to check the glow change, 4 of 9 done` |
   | `its stale file holds from the merged work are released` | Production plumbing that changes nothing you see. | Leave it out. |
   | `the writer and tester are renaming every crate; file clashes get settled at its checkpoint` | Seat roles and plumbing. | `renaming Composite to Assembly in every crate's code and tests` |
-  | `then: Phase 8 (fault words say what they hold)` | The plan's heading copied; it names no result you would notice (user, 2026-10-04). | `then: Phase 8 (error messages say plainly what went wrong)` |
+  | `then: Phase 8 (fault words say what they hold)` | The plan's heading copied; it names no result you would notice (user, 2026-10-04). | `then: Phase 8 (error messages say clearly what went wrong)` |
 
   A `phase:` or `then:` is never the plan's heading copied: say what you
   will notice in the app when it is done.
