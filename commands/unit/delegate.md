@@ -348,6 +348,7 @@ Rust delegates run only exact prompt lines using
 | compile feedback | `bash ~/.claude/scripts/delegate/verify.sh check <package>` |
 | package tests | `bash ~/.claude/scripts/delegate/verify.sh test <package>` |
 | one integration target alone | `bash ~/.claude/scripts/delegate/verify.sh test <package> <test>` |
+| only the tests whose name contains `<name>`, while iterating | `bash ~/.claude/scripts/delegate/verify.sh test <package> --filter <name>` |
 | mend fix, format, scoped clippy, rustdoc | `bash ~/.claude/scripts/delegate/verify.sh lint <package>` |
 | checkpoint format | `bash ~/.claude/scripts/delegate/verify.sh fmt <package>` |
 | changed example | `bash ~/.claude/scripts/delegate/verify.sh example <package> <name>` |
@@ -359,7 +360,8 @@ Rules:
   here takes the `cargo` token on its own, so a run may wait for a peer, and a
   result is a gate only once the slot owning that package's files has posted
   `done`.
-- `check` is optional feedback, not a gate. After the seat's last edit, run
+- `check` and `test --filter` are feedback while iterating, never a gate:
+  iterate on them, not on the full suite. After the seat's last edit, run
   `lint` once, naming any one modified package, then `test` for every modified
   package. Lint is never per crate: one run covers the whole workspace (mend
   and clippy across it, format and rustdoc for every changed member). A failed
