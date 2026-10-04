@@ -22,6 +22,15 @@ CLI = Path(__file__).with_name("cli.py")
 TESTDATA = Path(__file__).with_name("testdata")
 STAMP = "2026-10-02T12:00:00.000Z"
 Record = dict[str, object]
+_TEST_LOG = tempfile.TemporaryDirectory(prefix="buildlog-tests-")
+_TEST_ROOT = Path(_TEST_LOG.name) / "buildlog"
+
+
+def use_test_log() -> None:
+    os.environ["BUILDLOG_DIR"] = str(_TEST_ROOT)
+
+
+use_test_log()
 
 
 def local_day(stamp: str) -> str:
@@ -144,7 +153,7 @@ def ci_run(run_id: int, attempt: int, jobs: list[Record]) -> Record:
 
 
 def point_root_at(test: unittest.TestCase, root: Path) -> None:
-    """BUILDLOG_DIR for this test only; store.root() reads it on every call."""
+    """Override the suite's temporary log root for this test only."""
     previous = os.environ.get("BUILDLOG_DIR")
     os.environ["BUILDLOG_DIR"] = str(root)
 
@@ -155,6 +164,29 @@ def point_root_at(test: unittest.TestCase, root: Path) -> None:
             os.environ["BUILDLOG_DIR"] = previous
 
     test.addCleanup(restore)
+
+
+class LogIsolationTests(unittest.TestCase):
+    def test_each_module_uses_a_temporary_log(self) -> None:
+        environment = {key: value for key, value in os.environ.items() if key != "BUILDLOG_DIR"}
+        real_root = Path.home() / ".local/state/buildlog"
+        for module in sorted(Path(__file__).parent.glob("test_*.py")):
+            with self.subTest(module=module.name):
+                result = subprocess.run(
+                    [
+                        sys.executable,
+                        "-c",
+                        "import importlib, store, sys; importlib.import_module(sys.argv[1]); print(store.root())",
+                        module.stem,
+                    ],
+                    cwd=module.parent,
+                    env=environment,
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertNotEqual(Path(result.stdout.strip()), real_root, module.name)
 
 
 def encode(record: Record) -> bytes:

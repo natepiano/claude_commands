@@ -16,6 +16,9 @@ from pathlib import Path
 from typing import cast, override
 
 import sample
+from test_index import use_test_log
+
+use_test_log()
 
 CLI = Path(__file__).with_name("cli.py")
 Record = dict[str, object]

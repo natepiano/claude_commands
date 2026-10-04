@@ -56,6 +56,10 @@ Read the current state, not memory, and check what you state the way
    testing.
 5. **Open topics.** Everything in `LOG` not yet closed: held quota alerts, CI,
    defects routed between units, gates, and items waiting on the user.
+6. **Review watch.** `python3 ~/.claude/scripts/production/review_regime.py watch`.
+   Until it prints `acknowledged`, its line is the `Review watch` topic every
+   report; exit 3 sets `needs_user` (`/showrunner:produce` →
+   <MergeCheckpoint/> step 11). User, 2026-10-04.
 
 ## Subjects
 

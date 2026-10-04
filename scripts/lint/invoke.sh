@@ -277,61 +277,6 @@ invoke_clippy() {
         ${clippy_args[@]+"${clippy_args[@]}"}
 }
 
-# The clippy-linked cargo-mend (~/rust/cargo-liner/crates/cargo-mend-clippy)
-# registers clippy's lints in mend's compiler driver, so one mend compile also
-# does clippy's work. `cargo mend --clippy-status` names the installed build
-# (50 to 100 ms on natedev at load 100). mend_clippy_probe runs it once per
-# process and sets MEND_CLIPPY_STATE:
-#   active  clippy-linked and built for the host rustc
-#   absent  plain cargo-mend, one too old for the flag, or none: today's flow
-#   stale   built for another rustc, or no longer loads (a toolchain update
-#           removed the librustc_driver it links): stock clippy runs, and
-#           mend_rebuild.sh rebuilds it in the background
-# MEND_CLIPPY_REBUILD replaces mend_rebuild.sh, for tests.
-MEND_CLIPPY_STATE=""
-MEND_CLIPPY_REBUILD="${MEND_CLIPPY_REBUILD:-$HOME/.claude/scripts/lint/mend_rebuild.sh}"
-
-mend_clippy_probe() {
-    [[ -z "$MEND_CLIPPY_STATE" ]] || return 0
-    local out status=0
-    out="$(cargo mend --clippy-status 2>&1 </dev/null)" || status=$?
-    if [[ $status -eq 0 && "$out" == *'"clippy":"active"'* ]]; then
-        MEND_CLIPPY_STATE=active
-    elif [[ "$out" == *'"clippy":"rustc_mismatch"'* ]]; then
-        MEND_CLIPPY_STATE=stale
-        mend_clippy_rebuild "cargo-mend's clippy was built for another rustc"
-    elif [[ "$out" == *"error while loading shared libraries"* || "$out" == *"Library not loaded"* ]]; then
-        MEND_CLIPPY_STATE=stale
-        mend_clippy_rebuild "cargo-mend no longer loads"
-    else
-        MEND_CLIPPY_STATE=absent
-    fi
-}
-
-# Starts mend_rebuild.sh in a session of its own (setsid, or perl's on the Mac,
-# which has no setsid) and orphaned, so the lint never waits for the build and
-# an interrupted lint does not end it. The script takes a lock, builds at most
-# once an hour and alerts the user only when it cannot rebuild. A lint inside
-# the Claude Code sandbox (SANDBOX_RUNTIME=1) starts nothing: the sandbox can
-# refuse the ssh fetch and the writes to ~/.cache for its own reasons, so the
-# next lint outside it rebuilds.
-mend_clippy_rebuild() {
-    local what=$1 host log
-    host="$("${RUSTC:-rustc}" -V 2>/dev/null)" || host=""
-    host="${host:-unknown rustc}"
-    if [[ "${SANDBOX_RUNTIME:-}" == 1 ]]; then
-        echo "invoke.sh: $what ($host); stock clippy runs. The next lint outside the Claude Code sandbox rebuilds it" >&2
-        return 0
-    fi
-    log="${XDG_STATE_HOME:-$HOME/.local/state}/mend-clippy/rebuild.log"
-    echo "invoke.sh: $what ($host); stock clippy runs. It rebuilds in the background, a minute or more, at most once an hour; log: $log" >&2
-    local -a detach=(setsid)
-    # shellcheck disable=SC2016 # perl expands these
-    command -v setsid >/dev/null 2>&1 ||
-        detach=(perl -MPOSIX -e 'POSIX::setsid(); exec { $ARGV[0] } @ARGV or die "exec $ARGV[0]: $!\n"' --)
-    ( trap '' HUP; "${detach[@]}" "$MEND_CLIPPY_REBUILD" </dev/null >/dev/null 2>&1 & )
-}
-
 invoke_mend() {
     if ! lint_config_enabled mend; then
         lint_config_skip_notice mend "cargo mend --workspace"
@@ -342,25 +287,7 @@ invoke_mend() {
     # Scope comes from the caller (the lint CLI resolves it, or a caller like
     # the fix pipeline passes --manifest-path). Forcing --workspace here silently
     # overrode both: a per-project run linted the whole workspace instead.
-    # The probe only alerts here: an active clippy-linked mend lints as
-    # `cargo clippy` does without -D warnings (CLIPPY_ARGS unset), so a
-    # warning never stops --fix. A caller that drops its clippy step denies
-    # the warnings left afterwards through mend_clippy_warnings: verify.sh
-    # lint, and the lint CLI's argument-free `lint clippy`, which runs this
-    # same argv. The argv stays the same in every state: port-lint matches it.
-    mend_clippy_probe
     run env RUSTC_WRAPPER= cargo mend --all-targets "$@"
-}
-
-# mend_clippy_warnings LOG: the compiler warnings, clippy's among them, that an
-# active-path mend run reported, 0 for none. cargo-mend has no machine-readable
-# count (its --json report and --fail-on-warn cover only mend's own findings),
-# so this reads its summary: `summary: N compiler warnings`, or `No findings.`
-# or a summary without that row for none. Fails when the log has neither, so
-# the caller runs stock clippy instead of passing.
-mend_clippy_warnings() {
-    sed -nE $'s/\x1b\\[[0-9;]*m//g; s/^summary: +([0-9]+) compiler warnings?( .*)?$/\\1/p; s/^(No findings\\.|summary: ).*/0/p' "$1" \
-        | tail -n 1 | grep .
 }
 
 # Scope comes from the caller, like mend and clippy. --workspace used to be

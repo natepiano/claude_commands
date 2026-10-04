@@ -13,6 +13,9 @@ from typing import cast, override
 from unittest import mock
 
 import store
+from test_index import use_test_log
+
+use_test_log()
 
 
 class StoreTests(unittest.TestCase):

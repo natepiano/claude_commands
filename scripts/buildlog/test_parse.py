@@ -12,6 +12,9 @@ import unittest
 from pathlib import Path
 
 import parse
+from test_index import use_test_log
+
+use_test_log()
 
 TESTDATA = Path(__file__).with_name("testdata")
 GIB = 1 << 30

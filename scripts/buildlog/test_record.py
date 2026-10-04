@@ -19,6 +19,7 @@ from typing import cast, override
 
 import record as recorder
 import sample
+from test_index import point_root_at
 
 SCRIPT = Path(__file__).with_name("record.py")
 TESTDATA = Path(__file__).with_name("testdata")
@@ -71,6 +72,7 @@ class RecordTests(unittest.TestCase):
     def setUp(self) -> None:
         self.base = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
         self.root = self.base / "buildlog"
+        point_root_at(self, self.root)
         self.repo = self.base / "hana"
         self.repo.mkdir()
         _ = self.git("init", "-q", "-b", "main", cwd=self.repo)
