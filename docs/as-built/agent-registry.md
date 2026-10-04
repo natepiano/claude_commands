@@ -22,7 +22,7 @@ review=gpt-5.6-sol:xhigh
 gpt-5.6-sol=low,medium,high,xhigh,max,ultra
 
 [delegate.options]            # [<function>.options] — launch flags, not agent rows
-codex_mesh=0
+codex_mesh=1
 codex_service_tier=fast
 ```
 
@@ -61,7 +61,7 @@ Every function carries *both* family sets, fully specified at all times, so a fa
 3. Section `<function>.<family>` must exist → otherwise error listing the families that do have a set for that function.
 4. Row `<subtask>` must exist in that section → otherwise error listing the section's sub-tasks.
 5. Validate the pair: agent is everything before the first colon, effort everything after. A trailing colon with nothing after it is rejected. The agent must be a key in `[<family>.agents]`; a non-empty effort must appear in that agent's comma list. A catalog row with an *empty* effort list is legal and admits only bare (effort-less) pairs.
-6. Speed tier, codex family only: `[<function>.options] codex_service_tier.<subtask>`, else `codex_service_tier`, must be `fast`, `flex`, or `default`; an absent key leaves `AGENT_SERVICE_TIER` empty and the launch inherits `service_tier` from `~/.codex/config.toml`. A claude row always gets an empty tier, because Claude's fast mode bills extra usage. An unknown value is an error, because codex silently runs an unrecognised tier at standard speed.
+6. Speed tier, codex family only: `[<function>.options] codex_service_tier.<subtask>`, else `codex_service_tier`, must be `fast`, `flex`, `default`, or `pace`; `pace` takes the tier `scripts/whoami/codex_pacer.py` last wrote (`fast` or `default`), and `default` once that is over ten minutes old or missing. An absent key leaves `AGENT_SERVICE_TIER` empty and the launch inherits `service_tier` from `~/.codex/config.toml`. A claude row always gets an empty tier, because Claude's fast mode bills extra usage. An unknown value is an error, because codex silently runs an unrecognised tier at standard speed.
 
 Exact-task overrides exist for one-off cross-vendor setups; function-level assignment is the norm and the only thing `/agent <function> <family>` writes.
 
@@ -120,8 +120,9 @@ reach: a delegate launched that way takes one prompt and is unreachable until it
 exits. `codex_mesh.py` is the alternative launch path that gives a codex delegate
 an address, so peers and the unit director can message and interrupt it mid-run
 the way they already can a claude delegate. Selected per `[delegate.options]
-codex_mesh` in the registry (`1` by default, so the mesh is the normal codex
-launch path), overridable for one run with `PLAN_DELEGATE_CODEX_MESH`;
+codex_mesh` in the registry (`1` as shipped, so the mesh is the normal codex
+launch path; a missing key reads as off), overridable for one run with
+`PLAN_DELEGATE_CODEX_MESH`;
 `implement.sh` reads it and branches.
 
 One `codex app-server` per delegate session, each delegate a thread on it:
@@ -149,10 +150,11 @@ so no `--ws-auth` token.
 
 `start` connects, calls `thread/start` then `turn/start`, writes the delegate's
 thread id and status into `<session_dir>/mesh_roster.json` under an exclusive
-`flock`, and **blocks for the whole turn**, translating the notification stream
+`flock`, and **blocks until its last turn ends**, translating the notification stream
 into the log file (`agent:`, `exec:`, `edit:`, `thinking`) that
-`heartbeat_watch.sh` narrates. On `turn/completed` it writes the final message to
-the summary file and exits, so `implement.sh`'s `wait`, heartbeat, awake timer,
+`heartbeat_watch.sh` narrates. On a `turn/completed` with nothing queued it writes the final message to
+the summary file — or, given `--reply-file` as `implement.sh` passes, to that
+file, filling the summary only when the delegate left it empty — and exits, so `implement.sh`'s `wait`, heartbeat, awake timer,
 and pass recording are untouched.
 
 `send` calls `thread/queue/add`: the message lands at the start of the target's
@@ -190,10 +192,11 @@ reported unchanged.
 
 `agent_exec`'s codex branch runs `codex exec`, which is a closed process: nothing
 outside it can hand the running agent a message. `codex_mesh.py` is the alternate
-launcher that removes that limit for `/unit:delegate`, and it is used only there.
-It is opt-in — `[delegate.options] codex_mesh` in the registry, overridable for a
-single run with `PLAN_DELEGATE_CODEX_MESH` — and off by default, so a phase runs
-exactly as before until it is set.
+launcher that removes that limit for `/unit:delegate` and for `/ask_a_friend`'s
+codex friend (`start --resident`).
+It is on by default — `[delegate.options] codex_mesh=1` in the registry, overridable
+for a single run with `PLAN_DELEGATE_CODEX_MESH`; `0`, or a missing key, runs a
+phase on `codex exec` instead.
 
 Instead of one process per delegate, the session gets one `codex app-server`
 (`--listen ws://127.0.0.1:<port>`, newline-delimited JSON-RPC) and each delegate
@@ -285,7 +288,7 @@ A thin dispatcher over the resolver:
 | `scripts/agents/codex_mesh.py` | Addressable codex launch path: session app-server, thread per delegate, `send`/`steer`/`list`/`stop`. |
 | `scripts/agents/agent_admin.sh` | `/agent` backend. |
 | `scripts/agents/sync_codex_catalog.sh` + `.plist` | `[codex.agents]` materialization, staleness warnings. |
-| `scripts/agents/codex_mesh.py` | Opt-in addressable launcher for codex `/unit:delegate` delegates: one app-server per session, one thread per delegate, `send`/`steer`/`list`/`stop`. |
+| `scripts/agents/codex_mesh.py` | Default addressable launcher for codex `/unit:delegate` delegates: one app-server per session, one thread per delegate, `send`/`steer`/`list`/`stop`. |
 | `scripts/agents/heartbeat.sh`, `heartbeat_watch.sh` | Liveness log helpers used by the delegate wrappers (role header block, 60 s beats with an activity digest decoded from the agent log). |
 | `scripts/agents/test_agents_config.sh`, `test_agent_exec.sh`, `test_sync_codex_catalog.sh` | Self-contained fixture-conf suites (`mktemp -d`, temp `AGENTS_CONFIG_FILE`, print a "…passed" line, nonzero on failure). |
 | `scripts/delegate/implement.sh` / `review.sh` | `/unit:delegate`'s launchers. The implementation launcher adds a **required** pass kind as its 6th argument, optional activity and fix-count arguments, and a **required** `team_role` as its 9th (`impl` or `test`; the legacy `review` writer seat is still accepted): a phase runs a two-seat team and a repair its one `impl` seat, so one artifact layout covers both rather than a solo set and a team set. The role suffixes every artifact (`impl_status_<role>`, `impl_summary_<role>.txt`, `impl_agent_<role>.log`, `impl_agent_<role>`, `impl_awake_<role>`), tags the wrapper beats `<subtask>:<role>`, names the slot this dispatch posts under on the board, and is exported to the agent as `PLAN_DELEGATE_TEAM_ROLE` beside `PLAN_DELEGATE_BOARD_DIR`. Every member records its own progress pass: `state["pass"]` holds one record per seat, and `start-pass` closes only a stale pass of the same seat, so three concurrent recorders no longer leave the ledger describing whichever finished last. The launcher also stamps `role=<name>` on its `register` line, which is what fills the progress table's per-slot columns before any agent posts. The kind is checked against the four words at the argument, because an empty one used to be tolerated: the launcher skipped `start-pass`, ran its agent normally, and left the seat's previous pass standing -- so a repair round dispatched with the kind on `impl` alone produced a phase whose ledger held one live window and two records closed `error` an hour before, and refused every progress call once that one window closed. Nothing in the sequence looked like a launch fault; a register line with no `role=` field is the signature. The reviewer adds optional pass activity, a `pass_index` (7th arg, default 1), and a `lens` (8th, before the early-ready sentinel that follows it). Both write status, provenance, agent logs, and shared heartbeat data; when durable progress state exists, they also record the resolved called model/effort and pass outcome through `progress_history.py`. `review.sh` writes `review_findings_<N>.txt` / `review_agent_<N>.log` per pass and `ln -sfn`s the unnumbered names to the current one, so a run that failed to converge can be read back round by round while existing readers keep working. A phase's broad review runs three reviewers at once under one lens each (`adversary`, `contract`, `craft`), so the lens suffixes every one of those names plus `review_status`, `review_pid`, `review_agent`, and `review_awake`; empty is the single-reviewer layout a closure review and `commands/plan/phase_review.md` still run. The lens also selects the seat the pass records under — `test`, `impl`, `review` respectively, a fixed address rather than a judgment; the `review` seat renders as an `Agent 3` column only when a shown stage seated it — which `review.sh` exports as `PLAN_DELEGATE_TEAM_ROLE`, empty lens included, so a lone reviewer cannot inherit a seat from its environment and close a live pass there so three concurrent reviewers key three pass records instead of each closing the last as interrupted, and posts as a `register` line so the progress note stops attributing the previous occupant's words to the seat. `arm-review` takes a matching `--lens`, because the marker watches the status and pid files the launcher it precedes will write. |
@@ -325,16 +328,18 @@ All four wrappers capture resolver stderr into their log (`agents_resolve "$TASK
   record of it. A launch path that starts a server without writing
   `mesh_server.json` leaks a process that nothing will reap.
 - Provenance files are four lines: `task=`, `family=`, `agent=`, `effort=`.
-- `codex_mesh.py` is a `/unit:delegate` launcher, not a second dispatcher. It
-  resolves nothing: `implement.sh` has already resolved family, agent and effort
-  through the registry and passes them in as `--model` / `--effort`. Anything
+- `codex_mesh.py` is a launcher for `/unit:delegate` and `/ask_a_friend`, not a
+  second dispatcher. It resolves nothing: `implement.sh` and `launch_friend.sh`
+  have already resolved family, agent and effort through the registry and pass
+  them in as `--model` / `--effort`. Anything
   else that needs a codex agent still goes through `agent_exec`.
 - The session app-server is deliberately detached, so it outlives each delegate
   and a peer can still reach a thread between turns. `end_session.sh` is the only
   thing that reaps it (`codex_mesh.py stop`, from the session directory recorded
   in the run-active marker); a launcher that killed it would break the mesh it
   exists to provide.
-- A codex delegate's thread ends with its turn. Unlike a claude delegate, whose
+- A codex delegate's launcher ends with its last turn, and `send` then refuses it
+  though the thread persists. Unlike a claude delegate, whose
   background session stays resumable, a finished codex peer cannot be messaged —
   `<PhaseMesh/>` in `commands/unit/delegate.md` states this, and the register
   line's `reach=` field is what tells a peer which of the two it is addressing.
@@ -363,15 +368,15 @@ All four wrappers capture resolver stderr into their log (`agents_resolve "$TASK
   schema shows for other fields. The object is rejected as `unknown variant`.
 - **`ephemeral: true` and `thread/name/set` are incompatible** — the rename
   returns `-32600 "ephemeral thread does not support metadata updates"`. Delegates
-  are ephemeral to match `codex exec --ephemeral`, so naming is best-effort and
-  `mesh_roster.json` is the address of record.
+  are not ephemeral, since an ephemeral thread also refuses `thread/queue/add`;
+  naming stays best-effort and `mesh_roster.json` is the address of record.
 - **`--listen unix://<path>` closes every connection silently** while the server
   stays up. Use `ws://127.0.0.1:<port>`.
 - **`codex queue --thread` exits 0 for a thread with no live session.** The
   acknowledgement says nothing about delivery — do not use it as a reachability
   test.
-- **A finished codex delegate is gone.** Its thread ends with its turn, unlike a
-  claude background session, which a message resumes from its transcript. The
+- **A finished codex delegate is gone.** Its thread persists, but `send` refuses
+  it once `start` returns, unlike a claude background session, which a message resumes from its transcript. The
   exception is a thread started `--resident` (ask_a_friend's friend): it stays
   `running` across turns, prints each reply as it lands, and ends only on
   `codex_mesh.py end`. `send`
