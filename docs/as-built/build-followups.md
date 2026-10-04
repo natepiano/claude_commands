@@ -36,7 +36,7 @@ Agents' test builds linked far more than the tests they ran, and the daily build
 8. `### Tests per edit` (not part of this feature)
 9. `### Disk: <host>`, only when a snapshot exists
 10. `### Summary: successes`, `failures`, `all`, or `### Summary` / `No build steps recorded.` on a day with no steps
-11. The calls, port-lint and CI totals lines, then the Mac-sync and peak-memory notes
+11. The calls, port-lint and CI totals lines and the Rust release line (not part of this feature), then the Mac-sync and peak-memory notes
 
 ### Test target selection
 
@@ -118,7 +118,7 @@ Measured by the buildlog disk job at 12:14 EDT: allocated blocks, each hard-link
 - The report never walks the disk; it reads `disk.json` only. `buildlog disk` is its one writer and replaces it by rename, so a reader sees a whole snapshot, old or new.
 - Every inode counts once across all Disk rows, in `FOLDERS` order, through one shared `seen`; `other` is used minus the rows, clamped at zero.
 - `disk.json` stays at the log root beside `sync.json`. `buildlog sync` moves only `<host>/` and `ci/`, so the snapshot never reaches the Mac, and the Mac's report has no Disk section.
-- `report.py` keeps one style: `table()`, `seconds()`, `count()`, `gib()`. A section names its source and is one table with at most one line under it. Times carry their zone, and their date when not today.
+- `report.py` keeps one style: `table()`, `seconds()`, `count()`, `gib()`. A section names its source and has at most one line under each table. Times carry their zone, and their date when not today.
 - The test-builds table stays until the user calls the result settled.
 
 ## Calibration / gotchas
