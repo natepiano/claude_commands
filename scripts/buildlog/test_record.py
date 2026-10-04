@@ -17,6 +17,8 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import cast, override
 
+from test_index import point_root_at
+
 SCRIPT = Path(__file__).with_name("record.py")
 TESTDATA = Path(__file__).with_name("testdata")
 START = datetime(2026, 10, 2, 12, 0, tzinfo=UTC).timestamp()
@@ -68,6 +70,7 @@ class RecordTests(unittest.TestCase):
     def setUp(self) -> None:
         self.base = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
         self.root = self.base / "buildlog"
+        point_root_at(self, self.root)
         self.repo = self.base / "hana"
         self.repo.mkdir()
         _ = self.git("init", "-q", "-b", "main", cwd=self.repo)

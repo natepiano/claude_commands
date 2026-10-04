@@ -27,17 +27,21 @@
 
 ## Phases
 
-### Phase 1 — CI: cancel a superseded run · status: todo
+### Phase 1 — CI: cancel a superseded run · status: done
 
-#### Work Order
+#### As-built
 
-**Goal:** a push can cancel the branch's older CI run when its result no longer matters, so a newer run does not queue behind it, and the showrunner weighs that choice at every push.
+- `validate_and_push.sh --cancel-prior` cancels superseded CI after a direct push, on both the `--to` path and the default direct push. It takes the workflow names from the pushed sha's own runs, lists each workflow's `queued` and `in_progress` runs on the branch (one `gh run list --status` call per status), cancels every run on another sha, and prints `cancelled run <id> (<sha7>)` per cancel.
+- Cancellation is best effort: a failed list or cancel prints a warning on stderr and the loop continues; the script exits with `push_direct.sh`'s status, so a post-push hook failure still cancels and still fails the run.
+- When no run for the pushed sha has appeared, it prints `no run for <sha7> yet; nothing cancelled` and cancels nothing. Without the flag, no cancel query runs.
+- `produce.md`, at <MergeCheckpoint/> step 10 and <CIPoint/>, before the push: check for an older queued or running run on the merge branch, and add `--cancel-prior` when this push supersedes it and no CI point is watching it or diagnosing a red run.
 
-**Spec:**
-- `validate_and_push.sh --cancel-prior`: after its push, cancel every queued or in-progress run of the same workflow on the same branch whose head sha is not the one just pushed (`gh run list --branch … --json databaseId,headSha,status`, `gh run cancel`). Print one line per cancelled run. Without the flag nothing changes. No workflow file is edited: the choice stays per push.
-- `commands/showrunner/produce.md`, at <MergeCheckpoint/> step 10 and <CIPoint/>: one short rule. Before a push, check for an older run of the merge branch still queued or running; pass `--cancel-prior` when the new push supersedes it and nothing waits on its result (not a CI point being watched, not a red run being diagnosed). Load `succinct_style` before editing a command file.
-- Test it with a stub `gh` first on `PATH` that records its arguments.
+**Files:**
+- `scripts/validate_and_push/validate_and_push.sh` — the `--cancel-prior` flag and `cancel_prior_runs`.
+- `scripts/validate_and_push/test_cancel_prior.sh` — stub `git`/`gh` test over disposable copies of `validate_and_push.sh` and `push_direct.sh`; nine cases, including failed cancels, failed queries, hook failures and a missing successor run.
+- `commands/showrunner/produce.md` — the cancel-prior rule at both push points.
 
-**Files:** `scripts/validate_and_push/validate_and_push.sh`, `commands/showrunner/produce.md`, a test script beside `validate_and_push.sh`.
+**Gotchas:** `gh`'s own error text is suppressed, so a warning names what failed, not why.
 
-**Acceptance gate:** Lint green; the stub test shows the right runs cancelled and none without the flag.
+**Ruled out:** cancelling older runs when the pushed sha has no run — the branch would be left with no current CI result.
+

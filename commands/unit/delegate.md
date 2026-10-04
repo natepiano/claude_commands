@@ -345,7 +345,7 @@ Rust delegates run only exact prompt lines using
 | compile feedback | `bash ~/.claude/scripts/delegate/verify.sh check <package>` |
 | package tests | `bash ~/.claude/scripts/delegate/verify.sh test <package>` |
 | one integration target alone | `bash ~/.claude/scripts/delegate/verify.sh test <package> <test>` |
-| only the tests whose name contains `<name>`, while iterating | `bash ~/.claude/scripts/delegate/verify.sh test <package> --filter <name>` |
+| only the tests whose name contains `<name>`, while iterating | `bash ~/.claude/scripts/delegate/verify.sh test <package> --filter <name> [--filter <name> …]` |
 | mend fix, format, scoped clippy, rustdoc | `bash ~/.claude/scripts/delegate/verify.sh lint <package>` |
 | checkpoint format | `bash ~/.claude/scripts/delegate/verify.sh fmt <package>` |
 | changed example | `bash ~/.claude/scripts/delegate/verify.sh example <package> <name>` |
@@ -833,9 +833,9 @@ At an eligible tick, in that same tick:
    <BroadReviewPrompt/> for pass 1, <ClosureReview/> for a fix — including the
    completion estimate, the partial diff, and the exact final-diff and
    ready-sentinel paths below. **Only the adversary arms early.** It is the lens
-   that gains most from the extra time, and arming every lens against a partial
-   tree would multiply the exposure to the void verdict below; `contract` and
-   `craft` launch at completion under <DualReview/> step 3.
+   that gains most from the extra time, and arming both against a partial
+   tree would double the exposure to the void verdict below; `contract`
+   launches at completion under <DualReview/> step 3.
 5. Launch `review.sh` exactly as <DualReview/> step 3 does — with `adversary`
    as its lens for pass 1 — appending one extra final argument:
    `${SESSION_DIR}/final_diff_${REVIEW_PASS}.ready`. Save the
@@ -996,7 +996,7 @@ reporting anything about the round.
 </FixDispatch>
 
 <Synthesize>
-1. Merge every lens file's findings — `adversary`, `contract`, `craft` — and
+1. Merge every lens file's findings — `adversary`, `contract` — and
    any <UXReview/> rows with the main review's, dedupe real issues, tag the
    lens or reader that caught each — `--lens` on `open` — and discard refuted
    findings with a concrete explanation. Several readers landing on one hunk is

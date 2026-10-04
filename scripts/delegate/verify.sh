@@ -18,7 +18,8 @@
 # set for the whole tree, so every command below reuses one compiled copy.
 # The package argument still decides what runs and what is reported: nextest
 # filters to it with -E 'package(<pkg>)', and --features qualifies its list
-# with it. Only the compile covers the workspace.
+# with it. `test` builds the named package's test targets, plus workspace libs
+# when the package has a lib.
 #
 # rustdoc is the exception: `lint` documents only the members that differ from
 # HEAD, found here rather than named by the delegate (CHANGED_MEMBERS_PY). A
@@ -69,7 +70,7 @@
 #   verify.sh check <package>              fast compile feedback (workspace
 #                                          lib + bins)
 #   verify.sh test <package>               the package's unit + integration tests
-#                                          (workspace lib + bins + tests built)
+#                                          (package targets; workspace libs if any)
 #   verify.sh test <package> <int_test>    one named integration test target,
 #                                          for re-running it alone
 #   verify.sh test <package> --filter <name> [--filter <name> …]
@@ -167,6 +168,46 @@ for package in meta["packages"]:
     sys.exit(2)
 print("verify.sh: package " + package_name + " not found in workspace", file=sys.stderr)
 sys.exit(2)
+'
+
+# Select the named package's test targets. Named targets with unavailable
+# required features would error instead of being skipped by --tests, and names
+# shared across members would select both; either case uses the broad flags.
+TEST_TARGETS_PY='
+import json
+import sys
+
+package_name = sys.argv[1]
+meta = json.load(sys.stdin)
+package = next(package for package in meta["packages"] if package["name"] == package_name)
+features = package["features"]
+enabled = set()
+pending = features.get("default", []) + [
+    name[len(package_name) + 1 :] for name in sys.argv[2].split(",") if name.startswith(package_name + "/")
+]
+while pending:
+    name = pending.pop()
+    if name in features and name not in enabled:
+        enabled.add(name)
+        pending += features[name]
+flags = {"bin": "--bin", "test": "--test", "example": "--example", "bench": "--bench"}
+shared = {
+    (target["kind"][0], target["name"])
+    for other in meta["packages"]
+    if other["name"] != package_name
+    for target in other["targets"]
+}
+has_lib = any(target["kind"][0] in {"lib", "rlib", "dylib", "cdylib", "staticlib", "proc-macro"} for target in package["targets"])
+selection = ["--lib"] if has_lib else []
+for target in package["targets"]:
+    kind = target["kind"][0]
+    if kind not in flags or (kind != "bin" and not target["test"]):
+        continue
+    if not set(target.get("required-features", [])) <= enabled or (kind, target["name"]) in shared:
+        selection = (["--lib"] if has_lib else []) + ["--bins", "--tests"]
+        break
+    selection += [flags[kind], target["name"]]
+print("\n".join(selection or ["--bins", "--tests"]))
 '
 
 # Workspace members with a file that differs from HEAD: staged, unstaged,
@@ -275,6 +316,18 @@ require_member() {
 example_features() {
     cargo metadata --no-deps --format-version 1 \
         | "$PY" -c "$EXAMPLE_FEATURES_PY" "$1" "$2"
+}
+
+TEST_SELECTION=()
+take_test_targets() {
+    local words word
+    words="$(cargo metadata --no-deps --format-version 1 \
+        | "$PY" -c "$TEST_TARGETS_PY" "$PKG" "${FEATURE_FLAGS[1]:-}")"
+    while IFS= read -r word; do
+        if [[ -n "$word" ]]; then
+            TEST_SELECTION+=("$word")
+        fi
+    done <<< "$words"
 }
 
 # Qualify each feature name in a comma list with the package, leaving names
@@ -647,8 +700,7 @@ case "$CMD" in
         # --no-fail-fast: nextest cancels every remaining test after the first
         # failure, so one broken test silently hides the rest of the suite. A
         # phase gate has to report the whole result, not the first stop.
-        # The build covers the workspace (see the header); -E runs only this
-        # package's tests.
+        # Keep workspace feature resolution; -E runs only this package's tests.
         if [[ ${#FILTERS[@]} -gt 0 ]]; then
             # Any of the names: & binds tighter than |, so a union of two or
             # more goes in parentheses.
@@ -659,8 +711,7 @@ case "$CMD" in
             if [[ ${#FILTERS[@]} -gt 1 ]]; then
                 FILTER="($FILTER)"
             fi
-            run_nextest --no-fail-fast --workspace --lib --bins --tests \
-                -E "package($PKG) & $FILTER" "${FEATURE_FLAGS[@]}"
+            TEST_FILTER="package($PKG) & $FILTER"
         elif [[ -n "$TARGET" ]]; then
             # Integration test target names are unique across the workspace,
             # so --test builds just that binary, under the workspace's
@@ -668,15 +719,21 @@ case "$CMD" in
             run_nextest --no-fail-fast --workspace --test "$TARGET" \
                 -E "package($PKG)" "${FEATURE_FLAGS[@]}"
         else
-            # --tests adds the integration targets, matching what the lint
-            # half already compiles under clippy. Without it a phase could
-            # lint an integration test, pass its gate, and checkpoint without
-            # ever running it. The measured runtime cost is seconds, because
-            # the expensive compile-fail suites are #[ignore]d and
-            # .config/nextest.toml keeps tool_id_boundary's downstream cases
-            # out of the default profile.
-            run_nextest --no-fail-fast --workspace --lib --bins --tests \
-                -E "package($PKG)" "${FEATURE_FLAGS[@]}"
+            TEST_FILTER="package($PKG)"
+        fi
+        if [[ -z "$TARGET" ]]; then
+            # Build only the targets this package's tests live in
+            # (TEST_TARGETS_PY): --lib, which cannot be narrowed to one member
+            # under --workspace and is left out for a package without a lib,
+            # and the package's own bins and test-enabled targets. --bins
+            # --tests linked every member's test executables, 78 in hana, to
+            # run one package's; this links 4 (2026-10-04). The integration
+            # tests stay in, matching what the lint half compiles under
+            # clippy: without them a phase could lint an integration test,
+            # pass its gate, and checkpoint without ever running it.
+            take_test_targets
+            run_nextest --no-fail-fast --workspace "${TEST_SELECTION[@]}" \
+                -E "$TEST_FILTER" "${FEATURE_FLAGS[@]}"
         fi
         ;;
     lint)
@@ -691,87 +748,37 @@ case "$CMD" in
         # visibility site. It covers the workspace like the other stages, so
         # --fix can also rewrite a member the phase did not edit, when this
         # phase's change left an item there unused or over-visible.
-        #
-        # A clippy-linked cargo-mend (invoke.sh, mend_clippy_probe) runs
-        # clippy's lints in its own compile, and then stands in for the clippy
-        # step, so the workspace compiles once. fmt moves first, so those lints
-        # read the formatted tree, as stock clippy did after fmt. A --fix that
-        # wrote prints a report from before its last rewrite: fmt runs again
-        # and a read-only mend (cargo replays its cached diagnostics) reports
-        # on the settled tree. Lint then fails on any warning left, all targets
-        # included, where clippy failed on any in --lib --bins --tests; a report
-        # that shows no warning count falls back to stock clippy.
-        MEND_COVERS_CLIPPY=0
-        if lint_config_enabled mend && lint_config_enabled clippy; then
-            mend_clippy_probe
-            if [[ "$MEND_CLIPPY_STATE" == active ]]; then
-                MEND_COVERS_CLIPPY=1
-            fi
-        fi
-        # lint_mend [--fix]: one mend run. Sets MEND_APPLIED (1 when --fix
-        # wrote) and MEND_WARNINGS (mend_clippy_warnings, empty when the report
-        # shows no count). The log lives only as long as the run.
-        lint_mend() {
-            local log
-            log="$(mktemp)"
+        if lint_config_enabled mend; then
+            MEND_LOG="$(mktemp)"
             # pipefail is set, so a failing mend fails the pipeline; the log
             # only decides which message names the failure.
-            if ! invoke_mend --workspace "$@" "${FEATURE_FLAGS[@]}" 2>&1 | tee "$log"; then
-                if grep -qiE 'rolled back|revert' "$log"; then
+            if ! invoke_mend --workspace --fix "${FEATURE_FLAGS[@]}" 2>&1 | tee "$MEND_LOG"; then
+                if grep -qiE 'rolled back|revert' "$MEND_LOG"; then
                     echo "verify.sh: cargo mend --fix rolled its rewrites back; the tree reproduces it — run /mend_fix" >&2
                 else
-                    echo "verify.sh: cargo mend${*:+ $*} failed; see the output above" >&2
+                    echo "verify.sh: cargo mend --fix failed; see the output above" >&2
                 fi
-                rm -f "$log"
+                rm -f "$MEND_LOG"
                 exit 1
             fi
-            MEND_APPLIED=0
-            if grep -q '^mend: applied' "$log"; then
-                MEND_APPLIED=1
-            fi
-            MEND_WARNINGS="$(mend_clippy_warnings "$log")" || MEND_WARNINGS=""
-            rm -f "$log"
-        }
+            rm -f "$MEND_LOG"
+        else
+            lint_config_skip_notice mend "cargo mend --all-targets --workspace --fix"
+        fi
         # fmt compiles nothing, so it stays on the phase's own work: this
         # package and every member that differs from HEAD once mend has run.
         # Covering them all is what lets one lint record answer for each
         # package (tree_key).
-        lint_fmt() {
-            local member
-            FMT_SCOPE=(-p "$PKG")
-            FMT_MEMBERS="$(cargo metadata --no-deps --format-version 1 \
-                | "$PY" -c "$CHANGED_MEMBERS_PY" "")"
-            while IFS= read -r member; do
-                if [[ -n "$member" && "$member" != "$PKG" ]]; then
-                    FMT_SCOPE+=(-p "$member")
-                fi
-            done <<< "$FMT_MEMBERS"
-            fmt_cargo "${FMT_SCOPE[@]}"
-        }
-        if [[ $MEND_COVERS_CLIPPY -eq 1 ]]; then
-            lint_fmt
-        fi
-        if lint_config_enabled mend; then
-            lint_mend --fix
-            if [[ $MEND_COVERS_CLIPPY -eq 1 && $MEND_APPLIED -eq 1 ]]; then
-                lint_fmt
-                lint_mend
+        FMT_SCOPE=(-p "$PKG")
+        FMT_MEMBERS="$(cargo metadata --no-deps --format-version 1 \
+            | "$PY" -c "$CHANGED_MEMBERS_PY" "")"
+        while IFS= read -r member; do
+            if [[ -n "$member" && "$member" != "$PKG" ]]; then
+                FMT_SCOPE+=(-p "$member")
             fi
-        else
-            lint_config_skip_notice mend "cargo mend --all-targets --workspace --fix"
-        fi
-        if [[ $MEND_COVERS_CLIPPY -eq 0 ]]; then
-            lint_fmt
-            invoke_clippy --workspace --lib --bins --tests "${FEATURE_FLAGS[@]}"
-        elif [[ -z "$MEND_WARNINGS" ]]; then
-            echo "verify.sh: cargo mend's report shows no warning count; running stock clippy"
-            invoke_clippy --workspace --lib --bins --tests "${FEATURE_FLAGS[@]}"
-        elif [[ "$MEND_WARNINGS" -gt 0 ]]; then
-            echo "verify.sh: $MEND_WARNINGS compiler warnings remain, clippy's included (it ran inside cargo mend); lint denies warnings: fix the ones above" >&2
-            exit 1
-        else
-            echo "verify.sh: clippy ran inside cargo mend's compile and left no warnings; the stock clippy step is skipped"
-        fi
+        done <<< "$FMT_MEMBERS"
+        fmt_cargo "${FMT_SCOPE[@]}"
+        invoke_clippy --workspace --lib --bins --tests "${FEATURE_FLAGS[@]}"
         # Found after mend, so a member its --fix rewrote is documented too.
         FEATURE_MEMBER=""
         if [[ ${#FEATURE_FLAGS[@]} -gt 0 ]]; then

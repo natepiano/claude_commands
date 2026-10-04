@@ -1,8 +1,8 @@
 """buildlog report: one local day as markdown, a section per kind of step split by caller, then a summary.
 
 The summary at the bottom comes three times, successes, failures and all: one
-row per kind, every caller together, and a total. Steps that ran under a temp folder (scratch crates, buildlog's own test
-runs) are left out and counted in the footer.
+row per kind, every caller together, and a total. Steps under temp folders
+appear as one scratch caller in each kind's table.
 """
 
 from __future__ import annotations
@@ -26,6 +26,7 @@ CALLER_LABELS = {
 }
 OUTCOME_ORDER = ["ran", "failed", "interrupted", "reused", "replayed", "deferred"]
 SCRATCH = "(cwd LIKE '/tmp/%' OR cwd LIKE '/var/folders/%' OR cwd LIKE '/private/var/folders/%')"
+SCRATCH_LABEL = "scratch (temp folders)"
 ON_DAY = "date(started_at, 'localtime') = ?"
 COMMON_HEAD = ["Runs", "Failed", "Avg", "Range"]
 COMMON_SQL = "count(*), sum(status <> 0), avg(duration_s), min(duration_s), max(duration_s)"
@@ -104,7 +105,7 @@ def fetch(connection: sqlite3.Connection, sql: str, *params: object) -> list[Row
 
 
 def kinds(connection: sqlite3.Connection, day: str) -> list[str]:
-    found = [cast(str, row[0]) for row in fetch(connection, f"SELECT DISTINCT step FROM steps WHERE {ON_DAY} AND NOT {SCRATCH}", day)]
+    found = [cast(str, row[0]) for row in fetch(connection, f"SELECT DISTINCT step FROM steps WHERE {ON_DAY}", day)]
     return [kind for kind in KIND_ORDER if kind in found] + sorted(kind for kind in found if kind not in KIND_ORDER)
 
 
@@ -118,13 +119,19 @@ def kind_section(connection: sqlite3.Connection, day: str, kind: str, hosts: int
     select = ", ".join([COMMON_SQL, *(column.sql for column in extra)])
     rows = fetch(
         connection,
-        f"SELECT host, caller, {select} FROM steps WHERE {ON_DAY} AND step = ? AND NOT {SCRATCH}"
-        + " GROUP BY host, caller ORDER BY count(*) DESC",
+        f"SELECT {SCRATCH} AS is_scratch, CASE WHEN {SCRATCH} THEN NULL ELSE host END AS caller_host,"
+        + f" CASE WHEN {SCRATCH} THEN NULL ELSE caller END AS grouped_caller, {select}"
+        + f" FROM steps WHERE {ON_DAY} AND step = ?"
+        + " GROUP BY is_scratch, caller_host, grouped_caller ORDER BY count(*) DESC",
         day,
         kind,
     )
     body = [
-        [caller_label(row[1], row[0], hosts), *common(row[2:7]), *(column.show(value) for column, value in zip(extra, row[7:], strict=True))]
+        [
+            SCRATCH_LABEL if row[0] else caller_label(row[2], row[1], hosts),
+            *common(row[3:8]),
+            *(column.show(value) for column, value in zip(extra, row[8:], strict=True)),
+        ]
         for row in rows
     ]
     return [f"### {kind}", "", *table(["Caller", *COMMON_HEAD, *(column.title for column in extra)], body), ""]
@@ -152,6 +159,42 @@ def calls_section(connection: sqlite3.Connection, day: str) -> tuple[list[str], 
     parts = ", ".join(f"{count(row[1])} {row[0]}" for row in rows)
     section = ["### Agent calls (verify.sh)", "", *table(["Outcome", "Calls", "Wall", "Saved"], body), ""]
     return section, f"Agent calls: {total} ({parts}), {seconds(saved)} saved by pass records."
+
+
+def test_builds_section(connection: sqlite3.Connection, day: str) -> list[str]:
+    rows = fetch(
+        connection,
+        f"SELECT command, build_s FROM calls WHERE {ON_DAY} AND tool = 'verify.sh' AND verb = 'test' AND build_s IS NOT NULL",
+        day,
+    )
+    if not rows:
+        return []
+
+    builds: dict[str, list[int]] = {"whole-package": [], "--filter": []}
+    for command, build in rows:
+        scope = "--filter" if "--filter" in str(command).split() else "whole-package"
+        builds[scope].append(cast(int, build))
+
+    body = [
+        ["Baseline 2026-10-01/02", "whole-package", seconds(5.20 * 3600), seconds(137)],
+        ["Baseline 2026-10-04 from 00:07 EDT", "whole-package", seconds(5.0 * 3600), seconds(103)],
+        ["Baseline 2026-10-04 from 00:07 EDT", "--filter", seconds(14.4 * 3600), seconds(71)],
+    ]
+    for scope, values in builds.items():
+        if values:
+            ordered = sorted(values)
+            body.append([day, scope, seconds(sum(values)), seconds(ordered[(3 * len(ordered) - 1) // 4])])
+
+    return [
+        "### Test builds (temporary)",
+        "",
+        "Source: build log `verify.sh test` calls with measured `build_s`; p75 is the nearest rank.",
+        "",
+        *table(["Period", "Scope", "Build/day", "p75 build/call"], body),
+        "",
+        "Temporary: kept until the user calls the result settled.",
+        "",
+    ]
 
 
 def port_lint_section(connection: sqlite3.Connection, day: str) -> tuple[list[str], list[str]]:
@@ -191,7 +234,7 @@ SUMMARIES = [("successes", "status = 0", False), ("failures", "status <> 0", Fal
 def summary(connection: sqlite3.Connection, day: str, found: list[str], which: str, with_failed: bool) -> list[str]:
     """One row per kind, every caller together, then the total; kinds with no runs in the set are left out."""
     select = "count(*), sum(status <> 0), sum(duration_s), avg(duration_s), max(peak_mem_bytes)"
-    where = f"{ON_DAY} AND NOT {SCRATCH} AND {which}"
+    where = f"{ON_DAY} AND {which}"
     rows = {
         cast(str, row[0]): row[1:]
         for row in fetch(connection, f"SELECT step, {select} FROM steps WHERE {where} GROUP BY step", day)
@@ -227,14 +270,13 @@ def mac_note() -> str:
 def report(connection: sqlite3.Connection, day: str) -> str:
     found = kinds(connection, day)
     hosts = cast(int, fetch(connection, f"SELECT count(DISTINCT host) FROM steps WHERE {ON_DAY} AND NOT {SCRATCH}", day)[0][0])
-    scratch = cast(int, fetch(connection, f"SELECT count(*) FROM steps WHERE {ON_DAY} AND {SCRATCH}", day)[0][0])
     lines = [f"## Builds, {date.fromisoformat(day).strftime('%A %Y-%m-%d')}", ""]
     for kind in found:
         lines += kind_section(connection, day, kind, hosts)
     calls, calls_line = calls_section(connection, day)
     port_lint, port_lint_line = port_lint_section(connection, day)
     ci, ci_line = ci_section(connection, day)
-    lines += calls + port_lint + ci
+    lines += calls + test_builds_section(connection, day) + port_lint + ci
     if found:
         for name, which, with_failed in SUMMARIES:
             lines += [f"### Summary: {name}", "", *summary(connection, day, found, which, with_failed), ""]
@@ -245,7 +287,5 @@ def report(connection: sqlite3.Connection, day: str) -> str:
         mac_note(),
         "Peak memory is measured on natedev only. It counts files the step read or wrote that stayed in RAM, so it runs above what the step's processes used.",
     ]
-    if scratch:
-        notes.append(f"{scratch} steps under a temp folder (scratch and test builds) are left out.")
     lines += ["", *(f"- {note}" for note in notes)]
     return "\n".join(lines)
