@@ -11,6 +11,9 @@ from pathlib import Path
 from typing import override
 
 import treekey
+from test_index import use_test_log
+
+use_test_log()
 
 # No signing, hooks or identity from the user's own git config, for the
 # test's commits and for treekey's own git calls alike.

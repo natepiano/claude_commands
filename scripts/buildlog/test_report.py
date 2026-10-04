@@ -106,19 +106,45 @@ class ReportTests(unittest.TestCase):
         self.assertIn("| verify.sh (agents) | 1 | 0 | 40.0 s | 40.0 s | 3.0 s | 37.0 s | 0 |", lines)
         self.assertIn("| cargo-port | 2 | 1 | 15.0 s | 10.0 s – 20.0 s | 4.0 s | 6.0 s |  |", lines)
         successes = lines[lines.index("### Summary: successes") : lines.index("### Summary: failures")]
+        self.assertIn("| clippy | 1 | 1.0 s | 1.0 s |  |", successes)
         self.assertIn("| mend | 2 | 50.0 s | 25.0 s |  |", successes)
-        self.assertIn("| **All steps** | 2 | 50.0 s | 25.0 s |  |", successes)
-        self.assertFalse(any(line.startswith("| clippy") for line in successes))
+        self.assertIn("| **All steps** | 3 | 51.0 s | 17.0 s |  |", successes)
         failures = lines[lines.index("### Summary: failures") : lines.index("### Summary: all")]
         self.assertIn("| clippy | 1 | 30.0 s | 30.0 s |  |", failures)
         self.assertIn("| mend | 1 | 20.0 s | 20.0 s |  |", failures)
         combined = lines[lines.index("### Summary: all") :]
         self.assertIn("| mend | 3 | 1 | 1.2 min | 23.3 s |  |", combined)
-        self.assertIn("| **All steps** | 4 | 2 | 1.7 min | 25.0 s |  |", combined)
+        self.assertIn("| **All steps** | 5 | 2 | 1.7 min | 20.2 s |  |", combined)
         self.assertIn("| reused | 1 |  | 1.0 min |", lines)
         self.assertIn("| CI | 1 | 0 | 10.0 min | 10.0 min |", lines)
-        self.assertIn("1 steps under a temp folder (scratch and test builds) are left out.", text)
-        self.assertNotIn("agent (direct)", text)
+        self.assertIn("| scratch (temp folders) | 1 | 0 | 1.0 s | 1.0 s |  |  |  |", lines)
+        self.assertNotIn("steps under a temp folder", text)
+
+    def test_scratch_steps_form_one_caller_per_kind_and_count_toward_peak_memory(self) -> None:
+        gib = 1073741824
+        self.write(
+            self.root / "natedev" / "2026-10.jsonl",
+            step("regular", step="fmt", duration_s=30.0, peak_mem_bytes=gib),
+            step("scratch-tmp", step="fmt", cwd="/tmp/agent/crate", caller="verify", duration_s=10.0, peak_mem_bytes=2 * gib),
+            step("scratch-private", step="doc", cwd="/private/var/folders/agent", status=101, peak_mem_bytes=4 * gib),
+        )
+        self.write(
+            self.root / "macbook" / "2026-10.jsonl",
+            step("scratch-mac", host="macbook", step="fmt", cwd="/var/folders/agent", caller="alias", duration_s=20.0),
+        )
+
+        lines = self.render().splitlines()
+        fmt = lines[lines.index("### fmt") : lines.index("### doc")]
+        self.assertIn("| scratch (temp folders) | 2 | 0 | 15.0 s | 10.0 s – 20.0 s |", fmt)
+        self.assertEqual(1, sum(line.startswith("| scratch (temp folders) |") for line in fmt))
+        doc = lines[lines.index("### doc") : lines.index("### Summary: successes")]
+        self.assertIn("| scratch (temp folders) | 1 | 1 | 10.0 s | 10.0 s |  |  |", doc)
+        successes = lines[lines.index("### Summary: successes") : lines.index("### Summary: failures")]
+        self.assertIn("| fmt | 3 | 1.0 min | 20.0 s | 2.0 GiB |", successes)
+        failures = lines[lines.index("### Summary: failures") : lines.index("### Summary: all")]
+        self.assertIn("| doc | 1 | 10.0 s | 10.0 s | 4.0 GiB |", failures)
+        combined = lines[lines.index("### Summary: all") :]
+        self.assertIn("| **All steps** | 4 | 1 | 1.2 min | 17.5 s | 4.0 GiB |", combined)
 
     def test_port_lint_calls_have_their_own_section(self) -> None:
         self.write(
