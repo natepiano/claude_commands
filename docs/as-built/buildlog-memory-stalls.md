@@ -110,6 +110,7 @@ The build log records how long each build step waited on memory. A machine-wide 
 - **The machine line has no host label.** It merges every host that has samples. Today only natedev samples, so it is natedev's figure. A second sampling host would add its stall into the same number.
 - **The scope file keeps its old name.** It is still `BUILDLOG_PEAK`, a `*.peak` temp file and `record.py step`'s `PEAK` argument, but it now holds peak and pressure.
 - **Peak still counts page cache.** The report's closing note says so. Stall, not peak, is the evidence of memory starvation.
+- **A step's peak and stall leave out its compiles.** `rustc-wrapper = "sccache"` hands every compile to the one shared sccache server. The server starts rustc (and rustc starts the linker) in the cgroup of whichever session started the server. So a step's scope holds cargo, build scripts, the sccache clients and test processes, but not the compiler or the linker. Seen 2026-10-04 12:2x PDT: two live rustc processes were children of the server in a session's `tmux-spawn` scope, while their step's scope held only sccache clients. The machine sample does see the compiles.
 - **The cgroup path assumes cgroup v2.** The scope string reads the unified `0::` line of `/proc/self/cgroup`.
 - **basedpyright exits 3 in every checkout.** `pyrightconfig.json` names an absent `.venv`. The lint result is the error and warning counts line, not the exit code.
 
