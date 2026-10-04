@@ -77,12 +77,12 @@ def run(arguments: list[str], scratch: str) -> Run:
     return Run(result.returncode, result.stdout.splitlines(), result.stderr)
 
 
-def render(fields: dict[str, object]) -> Run:
-    """Render the report at AT."""
+def render(fields: dict[str, object], at: str = AT) -> Run:
+    """Render the report at `at`."""
     with tempfile.TemporaryDirectory() as scratch:
         input_path = Path(scratch) / "dailies_input.json"
         _ = input_path.write_text(json.dumps(fields))
-        return run([str(input_path), "--at", AT], scratch)
+        return run([str(input_path), "--at", at], scratch)
 
 
 def footer(*arguments: str, at: str = AT) -> Run:
@@ -291,6 +291,31 @@ class FooterAloneTests(unittest.TestCase):
         for arguments in (["--zone", ZONE], hold_flags("11:40")):
             with self.subTest(arguments=arguments), tempfile.TemporaryDirectory() as scratch:
                 self.refused(run(arguments, scratch), "go with --footer")
+
+
+def ranged_unit(label: str, phase: str, started: str, eta: dict[str, object]) -> dict[str, object]:
+    return {**unit(False), "unit": f"{label}-unit", "label": label, "phase": phase, "started": started, "eta": eta}
+
+
+class TimelineWindowTests(unittest.TestCase):
+    def axis(self, units: list[dict[str, object]], at: str) -> str:
+        run_result = render({"length": "simple", "zone": ZONE, "units": units}, at)
+        self.assertEqual(run_result.code, 0, run_result.error)
+        return timeline(run_result.lines)[0].strip()
+
+    def test_narrow_chart_opens_at_the_earliest_start(self) -> None:
+        self.assertTrue(self.axis([unit(False)], AT).startswith("06"))
+
+    def test_wide_chart_drops_past_hours_so_plan_bars_fit(self) -> None:
+        units = [
+            ranged_unit("widget", "Phase 41 of 48: holes", "2026-10-04T08:50",
+                        {"time": "16:41", "earliest": "15:06", "latest": "18:19", "percent": 65}),
+            ranged_unit("trunk", "Phase 59 of 69: landing", "2026-10-03T22:36",
+                        {"time": "17:51", "earliest": "15:36", "latest": "20:48", "percent": 85}),
+            ranged_unit("frame", "Phase 6 of 7: dimming", "2026-10-04T11:58",
+                        {"time": "21:12", "earliest": "16:35", "latest": "06:26+1", "percent": 25}),
+        ]
+        self.assertTrue(self.axis(units, "2026-10-04T14:59").startswith("12"))
 
 
 if __name__ == "__main__":
