@@ -297,6 +297,10 @@ whatever arrived:
 | a quota alert | <QuotaAlert/> |
 | the user asks for a status | `/showrunner:dailies`, `simple` unless they name a length |
 
+A unit repairing failing tests that split by file runs parallel repair seats
+(`/unit:delegate` → <FixDispatch/>); one that runs a lone seat on them gets
+told to split. User, 2026-10-04.
+
 Merge one checkpoint at a time. A notice that arrives while a merge is testing
 waits its turn. When every unit's final checkpoints are merged, go to <Wrap/>.
 </Direct>

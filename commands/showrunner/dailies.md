@@ -51,7 +51,10 @@ Read the current state, not memory, and check what you state the way
 3. **Each unit.** Capture its unit director's pane
    (`tmux capture-pane -p -t <session> -S -60`): the phase, what it is doing now, its latest phase ETA, and any `— decision:`,
    `— blocked:` or form waiting. Text after `❯` may be a prompt suggestion, not
-   the user's draft.
+   the user's draft: `capture-pane -e` shows a suggestion dimmed (`ESC[2m`).
+   Note when the ETA was stated. One stated over an hour ago gets `/unit:eta`
+   this turn, and its `detail` reads `set HH:MM` until a new one arrives. User,
+   2026-10-04.
 4. **Merge branch.** Its last merge, whether it is pushed, and anything held or
    testing.
 5. **Open topics.** Everything in `LOG` not yet closed: held quota alerts, CI,
@@ -200,8 +203,9 @@ names another plan's document. User, 2026-10-02.
   on the axis line. A follow-up row has none. User, 2026-10-03.
   The `ascii` chart draws the same rows with characters a code font has,
   because the desktop app draws emoji wider than two columns: `──` while the
-  phase runs, `┼─` at the earliest time, `●` at the ETA, `·` dots to `┤` at
-  the latest, and no `(earliest–latest)` text, so the row fits. User, 2026-10-03.
+  phase runs, a heavy `━━` from the earliest time to the latest, `●` at the
+  ETA, and no `(earliest–latest)` text, so the row fits. User, 2026-10-03.
+  Only glyphs the app's Anthropic Mono has: it lacks `┼` and `┤`.
 - **Footer:** the reply footer (`/showrunner:produce` → Footer), from
   `next_run`, `build_hold` and whether any subject has `needed:`. The
   report replaces the turn's `— waiting on:` line.
