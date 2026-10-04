@@ -13,13 +13,14 @@
 - **User zone:** America/Los_Angeles — every time the showrunner reports is in this zone only (user, 2026-10-04: "operate in PDT going forward")
 - **Updates:** every 30 minutes; each update reports every unit in full
 - **Merge tests:** `python3 -m unittest discover -s scripts/buildlog -p 'test_*.py'` (with `BUILDLOG_DIR` set to a temp dir until Phase 2 merges) and `basedpyright scripts/buildlog`, run in the showrunner checkout
-- **Capacity:** one unit; its seats share natedev's build slots (steve)
+- **Capacity:** two units; its seats share natedev's build slots (steve)
 
 ## Units
 
 | Unit | Plan | Worktree | Branch | Session | Port | Owns |
 | --- | --- | --- | --- | --- | --- | --- |
-| followups-unit | `docs/plans/build-followups.md` | `/home/natepiano/worktrees/claude-build-followups` | `build-followups-unit` | `build-followups` | — | `scripts/delegate/verify.sh`, `scripts/buildlog/`, `scripts/validate_and_push/`, `commands/unit/delegate.md` (the `--filter` row), `commands/showrunner/produce.md` (the cancel-prior rule) |
+| followups-unit | `docs/plans/build-followups.md` | `/home/natepiano/worktrees/claude-build-followups` | `build-followups-unit` | `build-followups` | — | `scripts/delegate/verify.sh`, `scripts/buildlog/`, `scripts/validate_and_push/`, `commands/unit/delegate.md` (the `--filter` row), `commands/showrunner/produce.md` (the cancel-prior rule, until Phase 5 moved) |
+| notifier-unit | `docs/plans/build-followups-notifier.md` | `/home/natepiano/worktrees/claude-build-followups-notifier` | `build-followups-notifier` | `session-notifier` (resumed in `~/.claude`, the directory its session began in) | — | `scripts/validate_and_push/`, `commands/showrunner/produce.md` (the cancel-prior rule); promoted from tool-based-ui by the user 2026-10-04 |
 
 ## Hub files
 
