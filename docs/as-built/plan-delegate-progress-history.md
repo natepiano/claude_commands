@@ -435,14 +435,14 @@ tick lands on a later day. The elapsed and unchanged columns are durations, whic
 say how long but never when, and an ETA says when the work lands rather than when
 this report was made; this line is what tells a reader whether the report in
 front of them is current and how long until the next one. The next tick comes
-from the Claude unit's `delegate-<run id>` notifier instance when present;
-`progress` restarts that clock when it reports. Without an instance, the
-recorder falls back to `${SESSION_DIR}/progress_timer` when that marker is
-armed, then to `PLAN_DELEGATE_PROGRESS_INTERVAL_SECONDS` in `delegate.conf`.
-The key sets the Codex poll timeout and the default interval of a Claude unit's
-notifier instance. Claude units no longer launch `progress_timer.sh`; it remains
-for other callers. An unusable interval drops the clause instead of stopping
-the header.
+from the Claude unit's `delegate-<run id>` notifier instance: each rendered
+`progress` call runs `notifier.sh restart` on it and names the `next_due` that
+restart prints. With no instance, or a restart that fails, the recorder falls
+back to a still-future deadline in `${SESSION_DIR}/progress_timer`, then to now
+plus `PLAN_DELEGATE_PROGRESS_INTERVAL_SECONDS` in `delegate.conf`. That key sets
+the Codex poll timeout and the default interval of a Claude unit's notifier
+instance; `/unit:interval` changes one run's interval. An unusable interval
+drops the clause instead of stopping the header.
 
 `aggregate` calibrates phase estimates by
 raw percentage and pass kind and emits raw/suggested/reported error plus
