@@ -2376,7 +2376,10 @@ class ProgressHistoryTests(unittest.TestCase):
             )
 
         # 3050 s is 50.8 minutes, which rounds to 51 rather than truncating to 50.
-        expected = "review trial: ux 1 findings, code 2 findings, review-seat minutes 51"
+        expected = (
+            "review trial: ux 1 findings, code 2 findings, review-seat minutes 51, "
+            + "ux check minutes 6, ux repair minutes 0"
+        )
         self.assertEqual(
             self.run_command("review-trial", "--session-dir", str(session_dir), at=base + 5_500),
             expected,
@@ -2388,6 +2391,48 @@ class ProgressHistoryTests(unittest.TestCase):
         self.assertEqual(
             self.run_command("review-trial", "--session-dir", str(session_dir), at=base + 5_700),
             expected,
+        )
+
+    def test_review_trial_reports_the_screenshot_check_and_its_repair_minutes(self) -> None:
+        """The check's own minutes, and only the fix rounds that covered a ux finding."""
+        self.write_full_config()
+        base = 72_000
+        session_dir = self.start_run("uxcost", base)
+        self.start_phase(session_dir, base + 10)
+        _ = self.run_command(
+            "start-activity", "--session-dir", str(session_dir),
+            "--label", "UX review", "--activity", "judging the shots", at=base + 100,
+        )
+        _ = self.run_command("finish-activity", "--session-dir", str(session_dir), at=base + 250)
+
+        def repair(finding: str, lens: str, round_number: int, seats: tuple[tuple[str, int], ...], at: int) -> None:
+            _ = self.run_findings(
+                session_dir, "open", "--severity", "blocker", "--title", f"{lens} finding",
+                "--file", "src/lib.rs", "--caught-by", "delegate", "--lens", lens, at=at,
+            )
+            _ = self.run_findings(session_dir, "gate", at=at + 5)
+            _ = self.run_findings(session_dir, "dispatch", "--covers", finding, at=at + 10)
+            for slot, _ in seats:
+                self.start_slot_pass(session_dir, slot, "fix", at + 20, fix_pass=round_number)
+            for slot, elapsed in seats:
+                self.finish_slot_pass(session_dir, slot, "completed", at + 20 + elapsed)
+            self.team_slot = ""
+            _ = self.run_findings(session_dir, "landed", at=at + 2_000)
+            _ = self.run_findings(
+                session_dir, "verdict", "--id", finding, "--state", "accepted",
+                "--evidence", "repaired", at=at + 2_010,
+            )
+
+        # Round 1 repairs a code finding: none of its 600 s is the check's.
+        repair("F001", "adversary", 1, (("impl", 600),), base + 300)
+        # Round 2 repairs a ux finding on two seats: 900 + 300 s is 20 minutes.
+        repair("F002", "ux", 2, (("impl", 900), ("test", 300)), base + 3_000)
+
+        # 150 s rounds to 3 minutes, not 2.
+        self.assertEqual(
+            self.run_command("review-trial", "--session-dir", str(session_dir), at=base + 6_000),
+            "review trial: ux 1 findings, code 0 findings, review-seat minutes 3, "
+            + "ux check minutes 3, ux repair minutes 20",
         )
 
     def test_the_board_refuses_a_handoff_that_names_no_role(self) -> None:

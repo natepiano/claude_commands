@@ -41,7 +41,7 @@ State:
 <Throughout>
 - **Time.** Before writing any time, run
   `TZ=<ZONE> date '+%H:%M %Z'`. Give every time in `ZONE` only, never UTC (user,
-  2026-10-02). Unit directors state times in the machine's zone; convert them to `ZONE`.
+  2026-10-02). Unit directors state times in `ZONE` (user, 2026-10-04); convert any that arrive in another zone.
 - **Log.** Write one line per event in `LOG`: `- HH:MM <zone>: <event>`. Every
   ten events, and before a compaction, add a `### STATE <time>` block. It gives:
   - each unit's phase, last merged checkpoint and what it waits on;
@@ -401,17 +401,22 @@ Input: the unit, phase, hash and shots from its notice.
     - run <CrossUnitChange/> when the change renamed or removed public items,
       or restructured files;
     - after every fifth merge since the last CI point, run <CIPoint/>.
-    - record the phase for the review trial:
-      `python3 ~/.claude/scripts/production/review_regime.py add --unit <unit> --phase <N> --regime trial --started <ISO> --merged <ISO> --holds <K> --merge-defects <D> --ux-findings <N> --code-findings <N> --review-minutes <M>`.
+    - record the phase in the review ledger:
+      `python3 ~/.claude/scripts/production/review_regime.py add --unit <unit> --phase <N> --regime after --started <ISO> --merged <ISO> --holds <K> --merge-defects <D> --ux-findings <N> --code-findings <N> --review-minutes <M> --ux-check-minutes <U> --ux-repair-minutes <R>`.
       `holds` counts this phase's held checkpoints and `merge-defects` the
       defect rows of all its design checks, both from `LOG`; the last three come
-      from the unit's `review trial:` checkpoint line. A phase started before
-      the unit's trial began is `--regime before`. After every sixth trial row,
-      run `review_regime.py report --since 2026-09-28` (design checks began
-      then) and give the user the table with one line
-      on whether the trial pays for itself. User decision 2026-10-01: a UX
-      reviewer and a code reviewer in every phase, kept only if they cut holds
-      and merge defects for less than they add in time.
+      from the unit's `review trial:` checkpoint line. A phase whose broad
+      review ran the `craft` lens is `--regime trial`. The 12-phase report
+      says whether the screenshot check's minutes (check plus its repairs) buy
+      fewer holds and merge defects (user, 2026-10-04).
+    - then run `review_regime.py watch` (user decision 2026-10-04: watch 12
+      phases without the code reviewer). The first time it exits 3, run
+      `report --since 2026-09-28`, push at once
+      (`~/.claude/scripts/notify/pushover.py --priority 1 "Hana: review watch" "<one line; the table is in this session>"`),
+      log it, and give the user the table. While it exits 3, the dailies
+      `Review watch` topic needs the user, and every build report (`/builds`,
+      every 4 hours) carries it and pushes again. Run `review_regime.py ack`
+      only on the user's own acknowledgment.
 </MergeCheckpoint>
 
 ---
@@ -695,7 +700,9 @@ approval, a login, a physical action), push the moment you learn it: what is
 blocked, the exact action, and on which machine. One push per new block.
 Units tell you, and you push; the machine-config session (natedev, macbook)
 pushes for blocks it owns. Each block has one owner. User, 2026-10-04, after a
-rebuild waited 1.5 h with no push.
+rebuild waited 1.5 h with no push. A rebuild is pushed even when nothing waits
+on it, at priority 1: the user wants a text for every rebuild needed (user,
+2026-10-04).
 
 | Priority | When |
 | --- | --- |
