@@ -5,18 +5,18 @@
 
 ## Context
 
-- **Source:** the user's adhoc review of 2026-10-04 (natedev session), five follow-up tasks recorded there, Phase 4 of `docs/plans/build-followups.md`, moved here by the showrunner (2026-10-04) to run beside followups-unit; followups-unit's Phase 2 (temp-folder rows, test isolation) and other units also edit `report.py`: whoever lands second resolves conflicts. The user asked for them to run as a production with natedev as showrunner.
+- **Source:** the user's adhoc review of 2026-10-04 (natedev session), five follow-up tasks recorded there, Phase 4 of `docs/plans/build-followups.md`, moved here by the showrunner (2026-10-04) to run beside followups-unit; followups-unit's Phase 2 (temp-folder rows, test isolation) also edited `report.py`; its conflicts with this plan were resolved in 01e11dc. The user asked for them to run as a production with natedev as showrunner.
 - **Already done, do not redo:** `test --filter` takes several names (`verify.sh` 953ed15), and `commands/unit/delegate.md:360-364` already tells seats to run `check` after each batch of edits and `test --filter` once per finished change.
 - **This repo is every session's live configuration.** `~/.claude` main is what every Claude session on natedev and the Mac loads. Edit only this worktree. Run the worktree's copies (`./scripts/...`), never `~/.claude/scripts/...`, when testing a change.
-- **The build log** lives in `~/.local/state/buildlog` (`scripts/buildlog/store.py`; `BUILDLOG_DIR` moves it). `buildlog schema` lists its tables (steps, calls, ci_runs, ci_jobs, tests) and columns; `buildlog query "<SQL>"` reads it. Read the real log freely, but never write to or delete from it in a test.
+- **The build log** lives in `~/.local/state/buildlog` (`scripts/buildlog/store.py`; `BUILDLOG_DIR` moves it). `buildlog schema` lists its tables (steps, tests, calls, ci_runs, ci_jobs, ci_steps, samples) and columns; `buildlog query "<SQL>"` reads it. Read the real log freely, but never write to or delete from it in a test.
 - **Times** in every report and section carry their zone (EDT), and their date when not today.
 
 ## Delegation Context
 
 - **Project:** `~/.claude` (commands, skills and scripts; Python 3.13 and shell, no Rust).
 - **Project started:** 2026-10-04T16:13:27+00:00
-- **Layout:** `scripts/delegate/verify.sh`; `scripts/buildlog/{report,record,store,index,sync,cli,ci,treekey}.py` with `test_*.py` beside them; `scripts/validate_and_push/validate_and_push.sh`; `commands/showrunner/produce.md`; `commands/unit/delegate.md`.
-- **Test:** `env BUILDLOG_DIR=$(mktemp -d) python3 -m unittest discover -s scripts/buildlog -p 'test_*.py'` from the worktree root (Phase 2 makes the tests set their own location; drop the `env` after it).
+- **Layout:** `scripts/delegate/verify.sh`; `scripts/buildlog/{report,record,store,index,sync,cli,ci,treekey,sample,disk,rust_release}.py` with `test_*.py` beside them; `scripts/validate_and_push/validate_and_push.sh`; `commands/showrunner/produce.md`; `commands/unit/delegate.md`.
+- **Test:** `python3 -m unittest discover -s scripts/buildlog -p 'test_*.py'` from the worktree root; `test_index` sets `BUILDLOG_DIR` on import.
 - **Lint:** `basedpyright scripts/buildlog` with zero errors and zero warnings, and `bash -n` (or `zsh -n` for a zsh script) on each changed shell script.
 - **Invariants:**
   - Python (user rules): annotate every signature; no `Any` (a `TypedDict` for dicts with known keys); no file-level type ignores; `uv pip install`, never `pip install`.
@@ -52,4 +52,39 @@
 
 **Ruled out:**
 - A tree key column on `calls`: the `steps` join supplies it with no schema change, so `index.py` and `record.py` are unchanged.
+
+### Phase 2 — Know when a new Rust is out, and what adopting it costs · status: done
+
+#### As-built
+
+- `rust_release.check_release()` runs third in `cli.py` `hourly()`, after sync and ci and before `index.update()`, on the existing `buildlog hourly` user timer (every 3600 s from `~/.claude`, only `PATH` set). It returns 0 unless something failed.
+- Pin: `[toolchain] channel` from `git -C ~/rust/hana show origin/init/catalyst:rust-toolchain.toml`, read-only; hana's checkout is never fetched or touched. A two-part pin `X.Y` covers every `X.Y.z`; versions compare as integer tuples. A missing file or a channel name is no pin: nothing shown or sent, and the record stays with `pin` None, so a returning pin does not re-trial or re-text.
+- Once per local day the check fetches `https://static.rust-lang.org/dist/channel-rust-stable.toml` (`urllib`, 30 s) and parses it with `tomllib`: version = first word of `pkg.rust.version`, date = top-level `date`. A failed fetch goes to `store.note_error`, the run keeps working from the saved release (pin refresh, trial, text), returns 1 and fetches again next hour.
+- A stable newer than the pin is pending until its trial runs. The trial starts only in quiet hours 02:00–05:00 local, with no file in `~/.local/state/build-hold/` (`/build_hold` writes one per holder: holder, ISO time, what for; release removes it), empty output from `pgrep -u "$USER" '^(cargo|rustc|cargo-nextest)$'`, and free space on the home filesystem (`os.statvfs`) of at least the floor plus `TRIAL_HEADROOM_GIB = 50`. The floor is `sweep_free_floor_gib.<host>`, else `sweep_free_floor_gib`, in `config/lint.conf` (first value wins; no key, no floor). Otherwise the state holds `TrialWaiting` with the reason, and a later hourly run tries again.
+- Each trial step is a subprocess in its own process group with a timeout that kills the group (toolchain 30 min, clippy 2 h, mend 1 h); `CARGO_MAKEFLAGS="--jobserver-auth=fifo:/dev/steve"` is set when unset and `/dev/steve` is a readable, writable character device. Steps: `rustup toolchain install <ver> --profile minimal --component clippy --component rustc-dev` (left installed for the bump); `git clone --local --no-checkout ~/rust/hana` into `rust-release-trial-<ver>` under the temp dir, detached at the `origin/init/catalyst` sha.
+- Clippy in the clone: `nix develop .#ci -c cargo +<ver> clippy --workspace --all-targets --all-features --message-format=json` with `CARGO_INCREMENTAL=0`, the mold link flag and no `-D warnings`. `compiler-message` warnings and errors are counted per crate, deduplicated by package, level, lint code and primary span; every warning counts as new. Compiler errors finish the trial with an error count, and mend still runs.
+- Mend: `RUSTC_BOOTSTRAP=1 CARGO_TARGET_DIR=<clone>/mend-target cargo +<ver> install --path ~/rust/cargo-liner/crates/cargo-mend --root <clone>/mend-root`; exit 0 is `cargo-mend builds`, anything else the result `cargo-mend does not build`. The sizes of `<clone>/target` and `<clone>/mend-target` in GiB go into the state to calibrate the headroom, and a `finally` deletes the clone on every outcome.
+- The hold is checked after every step; a hold arriving mid-trial stops it, deletes the clone and leaves the version pending. Any other step failure or timeout gives `TrialFailed` with the step and its first error line. A failed trial is not retried.
+- State: `store.root() / "rust_release.json"`, written atomically (`.tmp`, then `replace`). `ReleaseState` holds the check day, latest stable and its date, `pin: str | None` (None: hana has no pin), the outcome `TrialWaiting | TrialFinished | TrialFailed`, the target sizes and whether the text was sent.
+- Text, once per version, at the end of the first quiet-hours run after the version is found: `scripts/notify/pushover.py --priority 0` as a subprocess, title `Rust 1.100.0 out`, message `Rust 1.100.0 out: 7 new warnings in 3 crates, cargo-mend builds. Tell natedev bump or wait.`; errors are named (`2 errors in 1 crate`). A waiting trial sends its reason instead (`trial waiting: 513 GiB free, needs 550`), and the later result reaches only the report. A send error goes to `store.note_error`; `~/.config/pushover/env` is never read.
+- `report_line()` adds to `report()`'s one-line block while a stable newer than the pin is out: `Rust 1.100.0 out since 11-12; hana on 1.99.0. Trial: 7 new warnings in 3 crates, cargo-mend builds.`, or `Trial: waiting, <reason>.` / `Trial: failed, <reason>.`. No pin, no state, or a pin that caught up gives an empty list.
+
+**Files:**
+- `scripts/buildlog/rust_release.py` — the daily check, trial, text, state types and `report_line()`
+- `scripts/buildlog/cli.py` — `hourly()` runs the check after sync and ci
+- `scripts/buildlog/report.py` — includes `rust_release.report_line()` in the one-line block
+- `commands/build_hold.md` — hold writes a per-holder file, release removes it
+- `scripts/buildlog/test_rust_release.py`, `scripts/buildlog/test_report.py` — behavior tests with fakes; the report line's three forms and its absence
+
+**Gotchas:**
+- hana has no `rust-toolchain.toml` on `origin/init/catalyst` yet, so the check stays silent until one lands.
+- natedev has 528 GiB free against 550 needed (500 floor + 50 headroom), so a trial today waits on disk.
+- The trial runs inside the hourly job, so sync and CI wait while it runs (up to 3.5 h, at night only).
+- hana's `.#ci` shell carries no Rust toolchain; rustup's is used, and the job `PATH`'s `cargo` is the rustup proxy, which is why `cargo +<ver>` works from the hourly job.
+- Tests never touch hana, the network or the real state: every outside effect (fetch, pin read, subprocess runner, clock, free space, hold check, pgrep, text sender) is a parameter whose default is the real one, and tests pass fakes.
+
+**Ruled out:**
+- Trialing a release a newer stable has superseded: never the bump target.
+- `-D warnings` and CI's windows-gnu clippy in the trial: every Linux warning gets counted, and CI already holds the pin at zero.
+- One shared hold marker: overlapping holds need a file per holder.
 
