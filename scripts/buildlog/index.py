@@ -29,7 +29,7 @@ from urllib.parse import quote
 
 import store
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 LOCK_NAME = "index.lock"
 MARK_BYTES = 256
 BUSY_TIMEOUT_MS = 30_000
@@ -68,6 +68,8 @@ STEP_COLUMNS: list[Column] = [
     ("status", "INTEGER", "exit status; 128+n for signal n"),
     ("rustc", "TEXT", "rustc -V for the step's toolchain"),
     ("peak_mem_bytes", "INTEGER", "cgroup memory.peak of the step (page cache included); natedev only"),
+    ("mem_stall_some_s", "REAL", "seconds at least one task waited on memory; natedev only"),
+    ("mem_stall_full_s", "REAL", "seconds every task waited on memory; natedev only"),
     ("finished_s", "REAL", "cargo's own 'Finished ... in' build time (mend: its check time)"),
     ("crates_compiled", "INTEGER", "Compiling/Checking/Documenting lines"),
     ("warnings", "INTEGER", "distinct warning diagnostics"),
@@ -189,6 +191,17 @@ CI_STEP_COLUMNS: list[Column] = [
     ("duration_s", "REAL", "completed_at - started_at"),
 ]
 
+SAMPLE_COLUMNS: list[Column] = [
+    ("src", "TEXT", "source file"),
+    ("host", "TEXT", "machine's short host name"),
+    ("at", "TEXT", "UTC ISO sample time"),
+    ("boot_id", "TEXT", "Linux boot ID; changed ID marks a reboot"),
+    ("mem_used_bytes", "INTEGER", "MemTotal minus MemAvailable"),
+    ("swap_used_bytes", "INTEGER", "SwapTotal minus SwapFree"),
+    ("stall_some_us", "INTEGER", "machine memory some stall counter since boot, microseconds"),
+    ("stall_full_us", "INTEGER", "machine memory full stall counter since boot, microseconds"),
+]
+
 TABLES: dict[str, tuple[list[Column], str, str]] = {
     "steps": (STEP_COLUMNS, "", "one row per step invoke.sh's run() ran: clippy, mend, doc, fmt, nextest, check, sweep"),
     "tests": (
@@ -204,6 +217,7 @@ TABLES: dict[str, tuple[list[Column], str, str]] = {
     "ci_runs": (CI_RUN_COLUMNS, "PRIMARY KEY (run_id, attempt)", "GitHub Actions run attempts of natepiano/hana"),
     "ci_jobs": (CI_JOB_COLUMNS, "", "their jobs"),
     "ci_steps": (CI_STEP_COLUMNS, "PRIMARY KEY (job_id, number)", "the jobs' steps"),
+    "samples": (SAMPLE_COLUMNS, "", "one 60 s machine memory sample; counters reset on reboot"),
 }
 
 VIEWS: dict[str, tuple[str, str]] = {
@@ -284,10 +298,12 @@ def create_schema(connection: sqlite3.Connection) -> None:
         statements.append(f"CREATE TABLE {table} ({', '.join(body)})")
         statements.append(f"CREATE INDEX {table}_src ON {table} (src)")
     statements.append("CREATE INDEX steps_started ON steps (started_at)")
+    statements.append("CREATE INDEX steps_host_started ON steps (host, started_at)")
     statements.append("CREATE INDEX steps_tree ON steps (worktree, step, tree_key)")
     statements.append("CREATE INDEX tests_step ON tests (step_id)")
     statements.append("CREATE INDEX calls_started ON calls (started_at)")
     statements.append("CREATE INDEX ci_jobs_run ON ci_jobs (run_id, attempt)")
+    statements.append("CREATE INDEX samples_host_at ON samples (host, at)")
     for view, (_, select) in VIEWS.items():
         statements.append(f"CREATE VIEW {view} AS {select}")
     for statement in statements:
@@ -386,6 +402,10 @@ def add_call(connection: sqlite3.Connection, record: dict[str, object], src: str
     insert(connection, "calls", pick(record, CALL_COLUMNS))
 
 
+def add_sample(connection: sqlite3.Connection, record: dict[str, object], src: str) -> None:
+    insert(connection, "samples", pick({**record, "src": src}, SAMPLE_COLUMNS))
+
+
 def add_ci_run(connection: sqlite3.Connection, record: dict[str, object], src: str) -> None:
     jobs = record.get("jobs")
     job_list = cast(list[object], jobs) if isinstance(jobs, list) else []
@@ -432,7 +452,7 @@ def add_ci_run(connection: sqlite3.Connection, record: dict[str, object], src: s
             insert(connection, "ci_steps", pick(step_row, CI_STEP_COLUMNS))
 
 
-ADDERS = {"step": add_step, "call": add_call, "ci_run": add_ci_run}
+ADDERS = {"step": add_step, "call": add_call, "ci_run": add_ci_run, "sample": add_sample}
 
 
 def forget(connection: sqlite3.Connection, src: str) -> None:

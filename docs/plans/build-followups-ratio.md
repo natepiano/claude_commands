@@ -27,20 +27,29 @@
 
 ## Phases
 
-### Phase 1 — Tests per edit · status: todo
+### Phase 1 — Tests per edit · status: done
 
-#### Work Order
+#### As-built
 
-**Goal:** the report tracks how often seats run tests per edit, with the goal of driving it down without letting failures go unseen long enough to cost more to fix.
+- `report()` renders a "Tests per edit" section from `tests_per_edit_section(connection, day) -> list[str]`, after the test-build, port-lint and CI sections and before the summaries.
+- `tests_per_edit_data(connection, end_day) -> TestsPerEditWindow` walks every `verify.sh` call through the report day in `started_at` order, per seat = `coalesce(nullif(delegate_session,''), nullif(session,''))`. `call_trees(connection, end_day) -> dict[str, KnownCallTrees]` gives each call its first and last known `steps.tree_key`, joined to `calls` by `steps.call_id` for `tool='verify.sh'`.
+- An edit is a difference between the tree a seat's call ended on (its last step with a known key) and the tree its next call started on (first known key), so a lint call's own formatting rewrite is not an edit. A call with no known key is skipped and does not break the chain. Chains run over the whole log through the report day; tests, edits and failures count only inside the 7-day window.
+- Tests are `verb = 'test'` calls, whole and `--filter`. Green = status 0 and outcome `ran` or `reused`; it resets the seat's edits since green and closes its open failures. Failure = outcome not `interrupted`, and outcome `failed` or a nonzero status.
+- Trend table: 7 day rows (`DailyTestsPerEdit`, all seats summed), newest first: Day, Tests, Edits, Tests/edit, Target. `target_status(activity) -> str` gives `—` (no edits), `on target`, `above` or `below`, comparing ratio and target at two decimals; 0.5 is a sweet spot, not a ceiling.
+- Bins table: `EDIT_BINS = ("0", "1", "2–3", "4–7", "8+")`, chosen by `failure_bin(edits: int) -> int`, each a `FailureRecoveryBin` (failures, recovered, minutes_to_green) shown as Failures and Avg to next green. The `0` bin holds failures right after a green. Bins cover the same 7 days as the trend; a failure with no later green counts in its bin but not in its average, and the line under the table gives how many.
+- Each table has one source line naming the window `{first_day}–{day}`.
+- `TESTS_PER_EDIT_TARGET = 0.5`; its comment gives the source: the 2026-10-01–04 log, average minutes to green 1 edit 12.54, 2–3 16.09, 4–7 20.94, 8+ 31.28; one test per two edits keeps most gaps within 2–3, before the climb at 4–7.
 
-**Spec:**
-- **Edits:** for each seat (`calls.delegate_session`, else `session`), an edit is a change of tree key between its consecutive verify.sh calls.
-- **Ratio:** test calls (whole and `--filter`) per edit, per seat and per day.
-- **Cost of testing late:** for each failed test call, the edits since that seat's last green test, and the minutes from the failure to its next green test.
-- **The sweet spot:** group failures by edits since the last green (1, 2–3, 4–7, 8+) with the average minutes to the next green and the count. The target ratio is a named constant in `report.py` with a comment giving its source: set it from the data at the end of this phase, where the minutes to green start to climb, and state the number and the reasoning in the checkpoint notice.
-- **Section "Tests per edit":** the day's ratio against the target and the 7-day trend in one table; the bins in a second table. No more.
+**Files:**
+- `scripts/buildlog/report.py` — the section, its data pass (`TestsPerEditWindow`), the target constant
+- `scripts/buildlog/test_report.py` — behavior tests for edits, ratio, bins, target labels and rendering
 
-**Files:** `scripts/buildlog/report.py`, `scripts/buildlog/test_report.py`, and `scripts/buildlog/index.py` or `record.py` only if the tree key is not already in `calls`.
+**Gotchas:**
+- `calls` has no tree key; only `steps` does.
+- 137 backfilled test calls carry outcome `failed` with status NULL, which is why the failure test checks outcome as well as status.
+- `cli.py report` and `cli.py query` run `index.update()`, which writes the live index; the read-only path to the real log is `index.read_only()`.
+- basedpyright exits 3 on every checkout because `pyrightconfig` names a missing `.venv`; the bar is 0 errors, 0 warnings.
 
-**Acceptance gate:** Test and Lint green; the section renders for 2026-10-04 from the real log, read-only.
+**Ruled out:**
+- A tree key column on `calls`: the `steps` join supplies it with no schema change, so `index.py` and `record.py` are unchanged.
 

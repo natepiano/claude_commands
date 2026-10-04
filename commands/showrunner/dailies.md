@@ -56,6 +56,10 @@ Read the current state, not memory, and check what you state the way
    testing.
 5. **Open topics.** Everything in `LOG` not yet closed: held quota alerts, CI,
    defects routed between units, gates, and items waiting on the user.
+6. **Review watch.** `python3 ~/.claude/scripts/production/review_regime.py watch`.
+   Until it prints `acknowledged`, its line is the `Review watch` topic every
+   report; exit 3 sets `needs_user` (`/showrunner:produce` →
+   <MergeCheckpoint/> step 11). User, 2026-10-04.
 
 ## Subjects
 
@@ -129,6 +133,7 @@ python3 ~/.claude/scripts/production/dailies_render.py <scratchpad>/dailies_inpu
 | `started` | When the phase started, `YYYY-MM-DDTHH:MM` in `ZONE`, from the unit director or `LOG`. The timeline row starts there. |
 | `held` | Required. When the phase's checkpoint waits unmerged, the reason alone, in a few words, written to follow "not merged, because": `the design check found 16 defects`. `null` when no checkpoint waits. No examples here; the renderer refuses `such as`. |
 | `build_hold` | Only while the unit is under a `/build_hold` (its unit director told to stop builds): since when and for what, written to follow `build hold:`: `since 10:00, for the frame-time lane's release timings`. Leave it out otherwise. No marker means not held (user, 2026-10-03: "Without that marker I will assume it is not held"). |
+| `build_hold_release` | Required while any unit has `build_hold`; refused otherwise. The release ETA the unit timing under the hold stated, `HH:MM` or `HH:MM+N` in `ZONE`, or one of the `eta` none texts. Never make one up. |
 | `held_examples` | Optional examples for `held`, written to follow a comma: `such as a main bar clipped in small windows`. In a `simple` report the renderer prints them only the first time that reason appears for the phase; `page` and `elaborate` always print them. |
 | `update` | What the unit is doing now, one line. The length sets how long (below). A unit waiting on another unit says so, with the wait's start and expected clear times from `LOG` (`/showrunner:produce` → Dependencies). |
 | `eta` | The unit's latest stated phase ETA, in `ZONE`. `time` is `HH:MM`, `+1` for tomorrow (`11:21+1`); add `earliest` and `latest` when the unit director gave a range. With no ETA, `none` in place of `time`, one of: `none measured - requested` (after sending that unit director `/unit:eta` in this turn, the unmeasured-ETA rule in `/showrunner:produce`), `none measured`, `no ETA stated yet`. Never make one up. `percent` is required with `time`: the unit director's phase percent done (the recorder's phase `%`, 0–100), or `null` when it stated none. `detail` is an optional short note on what the time covers (`checks and build included`). It never says where the ETA came from: no `from the recorder`, no `from past runs` (user, 2026-10-02); the renderer refuses a `detail` that starts with `from`. `why` says in a few words why the ETA moved since the last report, from the unit director's own reports (`the four remaining app tests need a new floor anchor`); the renderer prints it after `because` and refuses a move of 15 minutes or more without it (user, 2026-10-01). |
@@ -197,6 +202,10 @@ names another plan's document. User, 2026-10-02.
   because the desktop app draws emoji wider than two columns: `──` while the
   phase runs, `┼─` at the earliest time, `●` at the ETA, `·` dots to `┤` at
   the latest, and no `(earliest–latest)` text, so the row fits. User, 2026-10-03.
+- **Build hold:** while a unit has `build_hold`, a line between the timeline
+  and the last line: `build hold - release eta: 11:15 PDT (4 minutes)`, with
+  `(1 minute)`, `(0 minutes)` at the time, `(overdue 6 minutes)` past it, the
+  weekday on another day (`Mon 09:30 PDT`), and no count on a none text. User, 2026-10-04.
 - **Last line:** `next run at 20:10 - nothing needed` when no subject has a
   `needed:`, `next run at 20:10` when one does, or `no run scheduled` without a
   schedule. The report replaces the turn's `— waiting on:` line.

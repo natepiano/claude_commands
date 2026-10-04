@@ -16,17 +16,19 @@ from unittest import mock
 import disk
 import index
 import report
-from test_index import STAMP, Record, call, ci_job, ci_run, encode, local_day, point_root_at, step
+from test_index import STAMP, Record, call, ci_job, ci_run, encode, local_day, point_root_at, sample, step
 
 
 class ReportTests(unittest.TestCase):
     root: Path  # pyright: ignore[reportUninitializedInstanceVariable]
+    records: list[Record]  # pyright: ignore[reportUninitializedInstanceVariable]
 
     @override
     def setUp(self) -> None:
         temporary = self.enterContext(tempfile.TemporaryDirectory())
         self.root = Path(temporary) / "buildlog"
         point_root_at(self, self.root)
+        self.records = []
 
     def write(self, path: Path, *records: Record) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -54,7 +56,7 @@ class ReportTests(unittest.TestCase):
         self.write(self.root / "natedev" / "2026-10.jsonl", *records)
 
         lines = self.render("2026-10-04").splitlines()
-        section = lines[lines.index("### Test builds (temporary)") : lines.index("### Summary")]
+        section = lines[lines.index("### Test builds (temporary)") : lines.index("### Tests per edit")]
         self.assertIn("| 2026-10-04 | whole-package | 1.0 h | 18.0 min |", section)
         self.assertIn("| 2026-10-04 | --filter | 15.0 min | 4.5 min |", section)
         self.assertEqual(2, sum(line.startswith("| 2026-10-04 |") for line in section))
@@ -82,6 +84,333 @@ class ReportTests(unittest.TestCase):
         section = lines[lines.index("### Test builds (temporary)") : lines.index("### Summary")]
         self.assertIn("| 2026-10-04 | whole-package | 1.5 min | 1.5 min |", section)
         self.assertFalse(any(line.startswith("| 2026-10-04 | --filter |") for line in section))
+
+    def verify_call(
+        self,
+        number: int,
+        *trees: str | None,
+        seat: str | None = "seat-a",
+        session: str = "session-a",
+        verb: str = "test",
+        command: str = "test hana",
+        status: int | None = 0,
+        outcome: str | None = None,
+        minute: int | None = None,
+        day: str = "2026-10-02",
+    ) -> None:
+        at = f"{day}T12:{(number * 5 if minute is None else minute):02d}:00.000Z"
+        call_id = f"call-{number}"
+        self.records.append(
+            call(
+                call_id,
+                started_at=at,
+                ended_at=at,
+                delegate_session=seat,
+                session=session,
+                verb=verb,
+                command=command,
+                status=status,
+                outcome=outcome or ("ran" if status == 0 else "failed"),
+            )
+        )
+        for offset, tree in enumerate(trees):
+            self.records.append(
+                step(
+                    f"{call_id}-step-{offset}",
+                    started_at=at,
+                    ended_at=at,
+                    call_id=call_id,
+                    tree_key=tree,
+                    status=status,
+                    caller="verify",
+                    step="nextest" if verb == "test" else "clippy",
+                )
+            )
+
+    def render_calls(self) -> str:
+        self.write(self.root / "natedev" / "2026-10.jsonl", *self.records)
+        return self.render()
+
+    def per_edit_tables(self, day: str | None = None) -> tuple[list[list[str]], list[list[str]]]:
+        self.write(self.root / "natedev" / "2026-10.jsonl", *self.records)
+        _ = index.update()
+        with closing(index.read_only()) as connection:
+            lines = report.tests_per_edit_section(connection, day or local_day(STAMP))
+        tables: list[list[list[str]]] = []
+        previous = "other"
+        for line in lines:
+            if line.startswith("|"):
+                if previous != "table":
+                    tables.append([])
+                tables[-1].append([cell.strip() for cell in line.strip("|").split("|")])
+                previous = "table"
+            else:
+                previous = "other"
+        self.assertEqual(len(tables), 2)
+        return tables[0], tables[1]
+
+    def cell(self, table: list[list[str]], label: str, heading: str) -> str:
+        matching = [row for row in table[2:] if row[0] == label]
+        self.assertEqual(len(matching), 1, f"row for {label}: {table}")
+        return matching[0][table[0].index(heading)]
+
+    def test_same_tree_has_no_edit_and_changed_tree_has_one(self) -> None:
+        self.verify_call(0, "tree-a")
+        self.verify_call(1, "tree-a")
+        self.verify_call(2, "tree-b")
+        ratios, _ = self.per_edit_tables()
+        self.assertEqual(self.cell(ratios, "2026-10-02", "Tests"), "3")
+        self.assertEqual(self.cell(ratios, "2026-10-02", "Edits"), "1")
+        self.assertEqual(self.cell(ratios, "2026-10-02", "Tests/edit"), "3.00")
+
+    def test_lint_rewrite_inside_a_call_is_not_a_seat_edit(self) -> None:
+        self.verify_call(0, "tree-a")
+        self.verify_call(1, "tree-a", None, "tree-b", verb="lint", command="lint hana")
+        self.verify_call(2, "tree-b")
+        ratios, _ = self.per_edit_tables()
+        self.assertEqual(self.cell(ratios, "2026-10-02", "Edits"), "0")
+
+    def test_call_without_known_tree_does_not_break_the_chain(self) -> None:
+        self.verify_call(0, "tree-a")
+        self.verify_call(1, None, verb="lint", command="lint hana")
+        self.verify_call(2, "tree-b")
+        ratios, _ = self.per_edit_tables()
+        self.assertEqual(self.cell(ratios, "2026-10-02", "Edits"), "1")
+
+    def test_delegate_session_then_session_identifies_independent_seats(self) -> None:
+        self.verify_call(0, "tree-a", seat="delegate-a", session="shared")
+        self.verify_call(1, "tree-b", seat="delegate-b", session="shared")
+        self.verify_call(2, "tree-b", seat="delegate-a", session="shared")
+        self.verify_call(3, "tree-c", seat=None, session="fallback")
+        self.verify_call(4, "tree-d", seat=None, session="fallback")
+        ratios, _ = self.per_edit_tables()
+        self.assertEqual(self.cell(ratios, "2026-10-02", "Edits"), "2")
+        self.assertEqual(self.cell(ratios, "2026-10-02", "Tests"), "5")
+
+    def test_whole_and_filtered_test_calls_both_count(self) -> None:
+        self.verify_call(0, "tree-a")
+        self.verify_call(1, "tree-b", command="test hana --filter parser")
+        ratios, _ = self.per_edit_tables()
+        self.assertEqual(self.cell(ratios, "2026-10-02", "Tests"), "2")
+        self.assertEqual(self.cell(ratios, "2026-10-02", "Edits"), "1")
+        self.assertEqual(self.cell(ratios, "2026-10-02", "Tests/edit"), "2.00")
+
+    def test_daily_trend_sums_seats_and_shows_all_seven_days_newest_first(self) -> None:
+        self.verify_call(0, "tree-a", day="2026-10-01", seat="seat-a")
+        self.verify_call(1, "tree-b", day="2026-10-04", seat="seat-a")
+        self.verify_call(2, "tree-x", day="2026-10-04", seat="seat-b")
+        self.verify_call(3, "tree-y", day="2026-10-04", seat="seat-b")
+        ratios, _ = self.per_edit_tables("2026-10-04")
+        self.assertEqual(ratios[0], ["Day", "Tests", "Edits", "Tests/edit", "Target"])
+        self.assertEqual([row[0] for row in ratios[2:]], [
+            "2026-10-04", "2026-10-03", "2026-10-02", "2026-10-01",
+            "2026-09-30", "2026-09-29", "2026-09-28",
+        ])
+        self.assertEqual(self.cell(ratios, "2026-10-04", "Tests"), "3")
+        self.assertEqual(self.cell(ratios, "2026-10-04", "Edits"), "2")
+        self.assertEqual(self.cell(ratios, "2026-10-03", "Tests"), "0")
+        self.assertEqual(self.cell(ratios, "2026-10-03", "Target"), "—")
+
+    def test_target_labels_below_on_target_and_above_at_two_decimals(self) -> None:
+        self.verify_call(0, "tree-0", day="2026-10-01")
+        for number in range(1, 9):
+            self.verify_call(number, f"tree-{number}", verb="lint", command="lint hana", day="2026-10-01")
+        self.verify_call(9, "tree-a", seat="other", day="2026-10-02", minute=0)
+        self.verify_call(10, "tree-b", seat="other", day="2026-10-02", minute=5)
+        self.verify_call(11, "tree-x", seat="third", day="2026-10-03", minute=0)
+        self.verify_call(12, "tree-y", seat="third", day="2026-10-03", verb="lint", command="lint hana", minute=5)
+        self.verify_call(13, "tree-z", seat="third", day="2026-10-03", verb="lint", command="lint hana", minute=10)
+        ratios, _ = self.per_edit_tables("2026-10-03")
+        self.assertEqual(self.cell(ratios, "2026-10-01", "Tests/edit"), "0.12")
+        self.assertEqual(self.cell(ratios, "2026-10-01", "Target"), "below")
+        self.assertEqual(self.cell(ratios, "2026-10-02", "Target"), "above")
+        self.assertEqual(self.cell(ratios, "2026-10-03", "Target"), "on target")
+
+    def test_failure_tracks_edits_since_green_and_minutes_until_next_green(self) -> None:
+        self.verify_call(0, "tree-a", minute=0)
+        self.verify_call(1, "tree-b", verb="lint", command="lint hana", minute=5)
+        self.verify_call(2, "tree-c", status=1, minute=10)
+        self.verify_call(3, "tree-c", minute=35)
+        _, bins = self.per_edit_tables()
+        self.assertEqual(self.cell(bins, "2–3", "Failures"), "1")
+        self.assertEqual(self.cell(bins, "2–3", "Avg to next green"), "25.0 min")
+
+    def test_failure_at_zero_edits_has_recovery_time_in_zero_bin(self) -> None:
+        self.verify_call(0, "tree-a", minute=0, command="test hana --filter parser")
+        self.verify_call(1, "tree-a", status=1, minute=10)
+        self.verify_call(2, "tree-a", minute=25)
+        _, bins = self.per_edit_tables()
+        self.assertEqual([row[0] for row in bins[2:]], ["0", "1", "2–3", "4–7", "8+"])
+        self.assertEqual(self.cell(bins, "0", "Failures"), "1")
+        self.assertEqual(self.cell(bins, "0", "Avg to next green"), "15.0 min")
+        self.assertNotIn("outside these bins", self.render_calls())
+
+    def test_failed_outcome_without_status_counts_and_reused_green_recovers(self) -> None:
+        self.verify_call(0, "tree-a", minute=0)
+        self.verify_call(1, "tree-b", minute=5, status=None, outcome="failed")
+        self.verify_call(2, "tree-b", minute=10, status=0, outcome="interrupted")
+        self.verify_call(3, "tree-b", minute=25, status=0, outcome="reused")
+        _, bins = self.per_edit_tables()
+        self.assertEqual(self.cell(bins, "1", "Failures"), "1")
+        self.assertEqual(self.cell(bins, "1", "Avg to next green"), "20.0 min")
+
+    def test_nonzero_test_status_counts_as_failure_without_failed_outcome(self) -> None:
+        self.verify_call(0, "tree-a", minute=0)
+        self.verify_call(1, "tree-a", minute=5, status=1, outcome="ran")
+        self.verify_call(2, "tree-a", minute=15)
+        _, bins = self.per_edit_tables()
+        self.assertEqual(self.cell(bins, "0", "Failures"), "1")
+        self.assertEqual(self.cell(bins, "0", "Avg to next green"), "10.0 min")
+
+    def test_failures_at_three_four_seven_and_eight_edits_use_correct_bins(self) -> None:
+        number = 0
+        for edits in (3, 4, 7, 8):
+            seat = f"seat-{edits}"
+            self.verify_call(number, "tree-0", seat=seat, minute=0)
+            number += 1
+            for changed in range(1, edits):
+                self.verify_call(number, f"tree-{changed}", seat=seat, verb="lint", command="lint hana", minute=changed)
+                number += 1
+            self.verify_call(number, f"tree-{edits}", seat=seat, status=1, minute=edits)
+            number += 1
+            self.verify_call(number, f"tree-{edits}", seat=seat, minute=edits + 10)
+            number += 1
+        _, bins = self.per_edit_tables()
+        self.assertEqual(self.cell(bins, "1", "Failures"), "0")
+        self.assertEqual(self.cell(bins, "2–3", "Failures"), "1")
+        self.assertEqual(self.cell(bins, "4–7", "Failures"), "2")
+        self.assertEqual(self.cell(bins, "8+", "Failures"), "1")
+
+    def test_failure_without_later_green_counts_but_not_in_average(self) -> None:
+        self.verify_call(0, "tree-a", minute=0)
+        self.verify_call(1, "tree-b", verb="lint", command="lint hana", minute=5)
+        self.verify_call(2, "tree-c", status=1, minute=10)
+        _, bins = self.per_edit_tables()
+        self.assertEqual(self.cell(bins, "2–3", "Failures"), "1")
+        self.assertEqual(self.cell(bins, "2–3", "Avg to next green"), "")
+        text = self.render_calls()
+        self.assertIn("1 without a later green", text)
+
+    def test_rendered_tests_per_edit_section_has_two_tables_target_and_source(self) -> None:
+        self.verify_call(0, "tree-a")
+        self.verify_call(1, "tree-b")
+        text = self.render_calls()
+        lines = text.splitlines()
+        self.assertIn("### Tests per edit", lines)
+        section_start = lines.index("### Tests per edit")
+        section_end = next((index for index in range(section_start + 1, len(lines)) if lines[index].startswith("### ")), len(lines))
+        section = lines[section_start:section_end]
+        self.assertEqual(sum(line.startswith("|---") for line in section), 2)
+        self.assertIn("Target", "\n".join(section))
+        source_lines = [line for line in section if line.startswith("Source:")]
+        self.assertEqual(len(source_lines), 2)
+        self.assertRegex(source_lines[0], r"target \d")
+        self.assertIn("2026-09-26–2026-10-02", source_lines[0])
+        self.assertIn("2026-09-26–2026-10-02", source_lines[1])
+
+    def memory_section(self) -> list[str]:
+        lines = self.render().splitlines()
+        start = lines.index("### Memory pressure")
+        end = next((offset for offset in range(start + 1, len(lines)) if lines[offset].startswith("### ")), len(lines))
+        return lines[start:end]
+
+    def test_memory_pressure_ranks_five_stalled_steps_and_counts_same_host_overlap(self) -> None:
+        self.write(
+            self.root / "natedev" / "2026-10.jsonl",
+            step("s1", caller="verify", started_at="2026-10-02T12:00:00.000Z", ended_at="2026-10-02T12:10:00.000Z", mem_stall_some_s=12.0),
+            step("s2", step="mend", started_at="2026-10-02T12:01:00.000Z", ended_at="2026-10-02T12:09:00.000Z", mem_stall_some_s=9.0),
+            step("s3", started_at="2026-10-02T12:02:00.000Z", ended_at="2026-10-02T12:08:00.000Z", mem_stall_some_s=8.0),
+            step("s4", started_at="2026-10-02T12:03:00.000Z", ended_at="2026-10-02T12:04:00.000Z", mem_stall_some_s=7.0),
+            step("s5", started_at="2026-10-02T12:04:00.000Z", ended_at="2026-10-02T12:05:00.000Z", mem_stall_some_s=6.0),
+            step("s6", started_at="2026-10-02T12:05:00.000Z", ended_at="2026-10-02T12:06:00.000Z", mem_stall_some_s=5.0),
+        )
+        self.write(
+            self.root / "mac" / "2026-10.jsonl",
+            step("other-host", host="mac", started_at="2026-10-02T12:00:00.000Z", ended_at="2026-10-02T12:10:00.000Z"),
+        )
+        section = self.memory_section()
+        self.assertIn("| Caller | Kind | Stall | At once |", section)
+        self.assertIn("| verify.sh (agents) (natedev) | clippy | 12.0 s | 1 |", section)
+        self.assertIn("| agent (direct) (natedev) | mend | 9.0 s | 2 |", section)
+        self.assertTrue(any("| 8.0 s | 3 |" in line for line in section))
+        self.assertTrue(any("| 7.0 s | 4 |" in line for line in section))
+        self.assertTrue(any("| 6.0 s | 4 |" in line for line in section))
+        self.assertFalse(any("5.0 s" in line for line in section))
+        self.assertEqual(sum(line.startswith("| ") and ("| clippy |" in line or "| mend |" in line) for line in section), 5)
+        self.assertLess(self.render().index("### clippy"), self.render().index("### Memory pressure"))
+
+    def test_memory_pressure_labels_temp_folder_stalls_as_scratch_and_counts_their_overlap(self) -> None:
+        self.write(
+            self.root / "natedev" / "2026-10.jsonl",
+            step("scratch", cwd="/tmp/scratch", mem_stall_some_s=30.0, ended_at="2026-10-02T12:10:00.000Z"),
+            step("kept", caller="verify", mem_stall_some_s=5.0, ended_at="2026-10-02T12:10:00.000Z"),
+        )
+        section = self.memory_section()
+        self.assertIn("| scratch (temp folders) | clippy | 30.0 s | 2 |", section)
+        self.assertIn("| verify.sh (agents) | clippy | 5.0 s | 2 |", section)
+
+    def test_memory_pressure_uses_sample_peaks_and_reboot_counter_deltas(self) -> None:
+        self.write(
+            self.root / "natedev" / "samples-2026-10.jsonl",
+            sample("2026-10-02T12:00:00.000Z", mem_used_bytes=4 * 2**30, swap_used_bytes=2 * 2**30, stall_some_us=10_000_000, stall_full_us=2_000_000),
+            sample("2026-10-02T12:01:00.000Z", mem_used_bytes=8 * 2**30, swap_used_bytes=7 * 2**30, stall_some_us=12_000_000, stall_full_us=3_000_000),
+            sample("2026-10-02T12:02:00.000Z", boot_id="boot-b", mem_used_bytes=6 * 2**30, swap_used_bytes=5 * 2**30, stall_some_us=500_000, stall_full_us=100_000),
+            sample("2026-10-02T12:03:00.000Z", boot_id="boot-b", mem_used_bytes=5 * 2**30, swap_used_bytes=4 * 2**30, stall_some_us=1_500_000, stall_full_us=500_000),
+        )
+        section = self.memory_section()
+        self.assertTrue(any("Source:" in line and "60 s" in line and "step" in line and "stall" in line for line in section))
+        self.assertTrue(any("8.0 GiB" in line and "7.0 GiB" in line for line in section))
+        self.assertTrue(any("3.5 s" in line and "1.5 s" in line for line in section))
+
+    def test_memory_pressure_samples_without_stalled_steps_have_no_table(self) -> None:
+        self.write(self.root / "natedev" / "samples-2026-10.jsonl", sample(STAMP))
+        section = self.memory_section()
+        self.assertFalse(any(line.startswith("|") for line in section))
+        self.assertTrue(any("4.0 GiB" in line and "2.0 GiB" in line for line in section))
+        self.assertTrue(any("some 0.0 s" in line and "full 0.0 s" in line for line in section))
+
+    def test_memory_pressure_compares_adjacent_samples_per_host(self) -> None:
+        self.write(
+            self.root / "natedev" / "samples-2026-10.jsonl",
+            sample("2026-10-02T12:00:00.000Z", stall_some_us=20_000_000, stall_full_us=5_000_000),
+            sample("2026-10-02T12:02:00.000Z", stall_some_us=21_000_000, stall_full_us=5_200_000),
+        )
+        self.write(
+            self.root / "mac" / "samples-2026-10.jsonl",
+            sample("2026-10-02T12:01:00.000Z", host="mac", stall_some_us=40_000_000, stall_full_us=8_000_000),
+            sample("2026-10-02T12:03:00.000Z", host="mac", stall_some_us=42_000_000, stall_full_us=8_300_000),
+        )
+        section = self.memory_section()
+        self.assertTrue(any("some 3.0 s" in line and "full 0.5 s" in line for line in section))
+
+    def test_memory_pressure_ignores_counter_rise_across_a_long_sampling_gap(self) -> None:
+        self.write(
+            self.root / "natedev" / "samples-2026-10.jsonl",
+            sample("2026-10-01T12:00:00.000Z", stall_some_us=10_000_000, stall_full_us=2_000_000),
+            sample(STAMP, stall_some_us=12_000_000, stall_full_us=3_000_000),
+        )
+        section = self.memory_section()
+        self.assertTrue(any("some 0.0 s" in line and "full 0.0 s" in line for line in section))
+
+    def test_memory_pressure_counts_counter_rise_across_midnight_when_samples_are_close(self) -> None:
+        self.addCleanup(time.tzset)
+        with mock.patch.dict(os.environ, {"TZ": "UTC"}):
+            time.tzset()
+            self.write(
+                self.root / "natedev" / "samples-2026-10.jsonl",
+                sample("2026-10-01T23:59:00.000Z", stall_some_us=10_000_000, stall_full_us=2_000_000),
+                sample("2026-10-02T00:01:00.000Z", stall_some_us=12_000_000, stall_full_us=3_000_000),
+            )
+            _ = index.update()
+            with closing(index.read_only()) as connection:
+                section = report.memory_pressure_section(connection, "2026-10-02", 0)
+        self.assertTrue(any("some 2.0 s" in line and "full 1.0 s" in line for line in section))
+
+    def test_memory_pressure_empty_day_has_one_message_and_no_table(self) -> None:
+        lines = self.render().splitlines()
+        self.assertIn("Memory pressure: no samples and no step stalls.", lines)
+        self.assertNotIn("### Memory pressure", lines)
+        self.assertFalse(any(line.startswith("Source: 60 s machine samples") for line in lines))
 
     def test_kinds_by_caller_then_one_summary_row_per_kind(self) -> None:
         self.write(

@@ -26,8 +26,9 @@ not pause the phase's work.
 
 ## Answer
 
-Send the showrunner one message, first line self-contained, with the time in
-the machine's zone:
+Send the showrunner one message, first line self-contained, with every time
+in the production doc's **User zone**, converted from the recorder's machine
+time (user, 2026-10-04):
 
 `From <unit>: Phase <N> ETA: <HH:MM zone>, <P>% done (range <HH:MM>–<HH:MM>), from <basis>.`
 

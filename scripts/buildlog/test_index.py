@@ -90,6 +90,22 @@ def call(record_id: str, **fields: object) -> Record:
     return record
 
 
+def sample(at: str, **fields: object) -> Record:
+    record: Record = {
+        "kind": "sample",
+        "v": 1,
+        "host": "natedev",
+        "at": at,
+        "boot_id": "boot-a",
+        "mem_used_bytes": 4 * 2**30,
+        "swap_used_bytes": 2 * 2**30,
+        "stall_some_us": 1_000_000,
+        "stall_full_us": 200_000,
+    }
+    record.update(fields)
+    return record
+
+
 def ci_job(job_id: int, name: str, conclusion: str, times: tuple[str, str, str]) -> Record:
     created, started, completed = times
     return {
@@ -267,6 +283,41 @@ class IndexTests(unittest.TestCase):
         self.assertEqual(self.rows("PRAGMA user_version"), [(index.SCHEMA_VERSION,)])
         self.assertEqual(self.rows("SELECT name FROM sqlite_master WHERE name = 'leftover'"), [])
         self.assertEqual(self.ids(), ["s0", "s1"])
+
+    def test_memory_stall_columns_and_samples_ingest(self) -> None:
+        self.assertGreater(index.SCHEMA_VERSION, 4)
+        sample_file = self.root / "natedev" / "samples-2026-10.jsonl"
+        self.write(
+            self.host_file,
+            step("s0", peak_mem_bytes=123456, mem_stall_some_s=1.25, mem_stall_full_s=0.25),
+            step("s1", peak_mem_bytes=123456),
+        )
+        self.write(sample_file, sample(STAMP), sample("2026-10-02T12:01:00.000Z", stall_some_us=1_500_000))
+        self.assertEqual(index.update(), 4)
+        self.assertEqual(
+            self.rows("SELECT id, mem_stall_some_s, mem_stall_full_s FROM steps ORDER BY id"),
+            [("s0", 1.25, 0.25), ("s1", None, None)],
+        )
+        self.assertEqual(
+            self.rows(
+                "SELECT host, at, boot_id, mem_used_bytes, swap_used_bytes, stall_some_us, stall_full_us"
+                + " FROM samples ORDER BY at"
+            ),
+            [
+                ("natedev", STAMP, "boot-a", 4 * 2**30, 2 * 2**30, 1_000_000, 200_000),
+                ("natedev", "2026-10-02T12:01:00.000Z", "boot-a", 4 * 2**30, 2 * 2**30, 1_500_000, 200_000),
+            ],
+        )
+        self.assertEqual(index.update(), 0)
+
+    def test_schema_command_lists_samples_and_stall_columns(self) -> None:
+        result = subprocess.run(
+            [sys.executable, str(CLI), "schema"], capture_output=True, text=True, check=False, timeout=60
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("TABLE samples", result.stdout)
+        self.assertIn("mem_stall_some_s", result.stdout)
+        self.assertIn("mem_stall_full_s", result.stdout)
 
     def test_reindex_reads_everything_again(self) -> None:
         self.write(self.host_file, step("s0"), step("s1"), call("c0"))
