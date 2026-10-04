@@ -5,6 +5,7 @@ Usage:
   review_regime.py add --unit <unit> --phase <N> --regime before|trial|after
                        --started <ISO> --merged <ISO> --holds <K> --merge-defects <D>
                        [--ux-findings <N>] [--code-findings <N>] [--review-minutes <M>]
+                       [--ux-check-minutes <U>] [--ux-repair-minutes <R>]
                        [--note <text>]
   review_regime.py report [--since <ISO date>]
   review_regime.py watch
@@ -59,6 +60,8 @@ class Row:
     ux_findings: int | None
     code_findings: int | None
     review_minutes: float | None
+    ux_check_minutes: float | None
+    ux_repair_minutes: float | None
     note: str | None
 
     def hours(self) -> float:
@@ -79,6 +82,8 @@ def read_rows() -> list[Row]:
             continue
         record = cast(dict[str, object], json.loads(line))
         minutes = record.get("review_minutes")
+        check_minutes = record.get("ux_check_minutes")
+        repair_minutes = record.get("ux_repair_minutes")
         note = record.get("note")
         rows.append(
             Row(
@@ -92,6 +97,8 @@ def read_rows() -> list[Row]:
                 ux_findings=optional_int(record, "ux_findings"),
                 code_findings=optional_int(record, "code_findings"),
                 review_minutes=float(minutes) if isinstance(minutes, int | float) else None,
+                ux_check_minutes=float(check_minutes) if isinstance(check_minutes, int | float) else None,
+                ux_repair_minutes=float(repair_minutes) if isinstance(repair_minutes, int | float) else None,
                 note=note if isinstance(note, str) else None,
             )
         )
@@ -116,6 +123,8 @@ def add(arguments: argparse.Namespace) -> None:
         ux_findings=cast(int | None, arguments.ux_findings),
         code_findings=cast(int | None, arguments.code_findings),
         review_minutes=cast(float | None, arguments.review_minutes),
+        ux_check_minutes=cast(float | None, arguments.ux_check_minutes),
+        ux_repair_minutes=cast(float | None, arguments.ux_repair_minutes),
         note=cast(str | None, arguments.note),
     )
     if row.hours() < 0:
@@ -151,6 +160,14 @@ def report(since: str | None) -> None:
     line(
         "review-seat minutes per phase (mean)",
         lambda group: mean_of([row.review_minutes for row in group if row.review_minutes is not None]),
+    )
+    line(
+        "screenshot check minutes per phase (mean)",
+        lambda group: mean_of([row.ux_check_minutes for row in group if row.ux_check_minutes is not None]),
+    )
+    line(
+        "repair minutes after its findings per phase (mean)",
+        lambda group: mean_of([row.ux_repair_minutes for row in group if row.ux_repair_minutes is not None]),
     )
     line("UX reviewer findings per phase (mean)", lambda group: mean_of([float(row.ux_findings) for row in group if row.ux_findings is not None]))
     line("code reviewer findings per phase (mean)", lambda group: mean_of([float(row.code_findings) for row in group if row.code_findings is not None]))
@@ -205,6 +222,8 @@ def main() -> int:
     _ = adding.add_argument("--ux-findings", type=int)
     _ = adding.add_argument("--code-findings", type=int)
     _ = adding.add_argument("--review-minutes", type=float)
+    _ = adding.add_argument("--ux-check-minutes", type=float)
+    _ = adding.add_argument("--ux-repair-minutes", type=float)
     _ = adding.add_argument("--note")
     reporting = commands.add_parser("report")
     _ = reporting.add_argument("--since", help="only phases merged on or after this ISO date; design checks began 2026-09-28")

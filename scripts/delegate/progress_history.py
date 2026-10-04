@@ -294,6 +294,12 @@ def _string(value: object, default: str = "") -> str:
     return value if isinstance(value, str) else default
 
 
+def _string_list(value: object) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    return [item for item in cast(list[object], value) if isinstance(item, str)]
+
+
 def _integer(value: object, default: int = 0) -> int:
     if isinstance(value, bool):
         return default
@@ -3972,9 +3978,11 @@ def _review_trial(args: argparse.Namespace) -> None:
 
     It feeds the unit's checkpoint notice line, which the showrunner records with
     review_regime.py. The phase is the one in state, active or just closed by
-    finish-phase, and only events stamped with its instance count. Minutes are
-    every seat's finished review passes, whatever their status, plus the UX
-    review activities, rounded to the nearest whole minute.
+    finish-phase, and only events stamped with its instance count. Review-seat
+    minutes are every seat's finished review passes, whatever their status, plus
+    the UX review activities. The screenshot check's own cost follows: its `UX
+    review` activities alone, then every fix pass of a round whose dispatched
+    batch covered a `ux` finding. All round to the nearest whole minute.
     """
     session_dir = _session_dir(args)
     state = _read_state(session_dir)
@@ -3988,6 +3996,10 @@ def _review_trial(args: argparse.Namespace) -> None:
     ux_findings = 0
     code_findings = 0
     review_seconds = 0
+    ux_check_seconds = 0
+    ux_finding_ids: set[str] = set()
+    dispatched: list[dict[str, object]] = []
+    fix_passes: list[dict[str, object]] = []
     for event in _run_events(state):
         if _string(event.get("phase_instance_id")) != instance_id:
             continue
@@ -3996,18 +4008,39 @@ def _review_trial(args: argparse.Namespace) -> None:
             lenses = _finding_lenses(event)
             if "ux" in lenses:
                 ux_findings += 1
+                ux_finding_ids.add(_string(event.get("finding_id")))
             if "craft" in lenses:
                 code_findings += 1
+        elif event_type == "finding_batch_dispatched":
+            dispatched.append(event)
         elif event_type == "pass_finished" and _string(event.get("pass_kind")) == "review":
             review_seconds += _integer(event.get("pass_elapsed_seconds"))
+        elif event_type == "pass_finished" and _string(event.get("pass_kind")) == "fix":
+            fix_passes.append(event)
         elif (
             event_type == "activity_finished"
             and _string(event.get("activity_label")) == UX_REVIEW_ACTIVITY_LABEL
         ):
-            review_seconds += _integer(event.get("activity_elapsed_seconds"))
+            elapsed = _integer(event.get("activity_elapsed_seconds"))
+            review_seconds += elapsed
+            ux_check_seconds += elapsed
+    # A fix pass carries the round the ledger dispatched (`fix_pass`), and the
+    # dispatch names the findings that round covers.
+    ux_rounds = {
+        _integer(event.get("round"))
+        for event in dispatched
+        if ux_finding_ids.intersection(_string_list(event.get("covered")))
+    }
+    ux_repair_seconds = sum(
+        _integer(event.get("pass_elapsed_seconds"))
+        for event in fix_passes
+        if _integer(event.get("fix_pass")) in ux_rounds
+    )
     print(
         f"review trial: ux {ux_findings} findings, code {code_findings} findings, "
-        + f"review-seat minutes {(review_seconds + 30) // 60}"
+        + f"review-seat minutes {(review_seconds + 30) // 60}, "
+        + f"ux check minutes {(ux_check_seconds + 30) // 60}, "
+        + f"ux repair minutes {(ux_repair_seconds + 30) // 60}"
     )
 
 

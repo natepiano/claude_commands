@@ -141,7 +141,7 @@ branch, port and the files you own.
 
    ```
    From <unit>: phase <N> checkpoint <hash> — <title>. Shots: <paths | none, no visible change>. Phase <next> ETA: <HH:MM zone>
-   review trial: ux <N> findings, code <N> findings, review-seat minutes <M>
+   review trial: ux <N> findings, code <N> findings, review-seat minutes <M>, ux check minutes <U>, ux repair minutes <R>
    design check: <pass | N defects, each moved to <phase>> — fresh helper on exactly these shots, built from <hash>
    ```
 

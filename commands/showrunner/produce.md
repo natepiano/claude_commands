@@ -402,11 +402,13 @@ Input: the unit, phase, hash and shots from its notice.
       or restructured files;
     - after every fifth merge since the last CI point, run <CIPoint/>.
     - record the phase in the review ledger:
-      `python3 ~/.claude/scripts/production/review_regime.py add --unit <unit> --phase <N> --regime after --started <ISO> --merged <ISO> --holds <K> --merge-defects <D> --ux-findings <N> --code-findings <N> --review-minutes <M>`.
+      `python3 ~/.claude/scripts/production/review_regime.py add --unit <unit> --phase <N> --regime after --started <ISO> --merged <ISO> --holds <K> --merge-defects <D> --ux-findings <N> --code-findings <N> --review-minutes <M> --ux-check-minutes <U> --ux-repair-minutes <R>`.
       `holds` counts this phase's held checkpoints and `merge-defects` the
       defect rows of all its design checks, both from `LOG`; the last three come
       from the unit's `review trial:` checkpoint line. A phase whose broad
-      review ran the `craft` lens is `--regime trial`.
+      review ran the `craft` lens is `--regime trial`. The 12-phase report
+      says whether the screenshot check's minutes (check plus its repairs) buy
+      fewer holds and merge defects (user, 2026-10-04).
     - then run `review_regime.py watch` (user decision 2026-10-04: watch 12
       phases without the code reviewer). The first time it exits 3, run
       `report --since 2026-09-28`, push at once
