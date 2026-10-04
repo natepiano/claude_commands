@@ -2,6 +2,7 @@
 """Render the /showrunner:dailies report from its fixed template.
 
 Usage: dailies_render.py [<input.json>] [--chart default|ascii] [--state <state.json>] [--log <log.md>] [--at <YYYY-MM-DDTHH:MM>]
+       dailies_render.py --footer --zone <IANA zone> [--next-run <HH:MM>] [--build-hold-release <release>] [--nothing-needed] [--at <YYYY-MM-DDTHH:MM>]
 
 The input gives each subject's fields; this script owns the layout, so no line
 of the template can be dropped or renamed. It refuses, with exit 2, an input
@@ -25,6 +26,10 @@ production's own plumbing words (PLUMBING).
 --at     renders as if the clock read this local time (for checks).
 --chart  sets the chart mode in CHART_CONF, which every showrunner's dailies
          read; with no input file it only sets the mode.
+--footer prints only the footer every showrunner reply and every report ends
+         with (`footer`), at the current time in --zone. --next-run,
+         --build-hold-release and --nothing-needed carry what the report
+         input's next_run, build_hold_release and needed fields do.
 
 The input format is in ~/.claude/commands/showrunner/dailies.md.
 """
@@ -38,7 +43,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import cast
-from zoneinfo import ZoneInfo
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 LENGTHS = {"simple": 240, "page": 480, "elaborate": None}
 PHASE = re.compile(r"^(?:Phase (\d+) of (\d+)|follow-up (\d+) of (\d+)): \S")
@@ -670,11 +675,14 @@ def parse_release(fields: JsonMap, units: list[Unit]) -> str | None:
         )
     if not held and release is not None:
         raise InputError("input.build_hold_release: only while a unit has build_hold")
-    if release is not None and not TIME.match(release) and release not in NONE:
-        raise InputError(
-            f"input.build_hold_release: {release!r} is not HH:MM or HH:MM+N, nor one of {', '.join(repr(choice) for choice in NONE)}"
-        )
+    if release is not None:
+        check_release(release, "input.build_hold_release")
     return release
+
+
+def check_release(release: str, where: str) -> None:
+    if not TIME.match(release) and release not in NONE:
+        raise InputError(f"{where}: {release!r} is not HH:MM or HH:MM+N, nor one of {', '.join(repr(choice) for choice in NONE)}")
 
 
 def load_state(path: Path | None) -> dict[str, Previous]:
@@ -779,6 +787,14 @@ def release_text(release: str, now: datetime, zone_name: str) -> str:
     return f"{range_clock(moment, now)} {zone_name} ({'overdue ' if minutes < 0 else ''}{count})"
 
 
+def footer(now: datetime, zone_name: str, next_run: str | None, release: str | None, *, nothing_needed: bool) -> list[str]:
+    """What every showrunner reply and every report ends with: the build hold's release while one runs, then the time now and the next report (user, 2026-10-04)."""
+    lines = [f"{BUILD_HOLD_MARK} - release eta: {release_text(release, now, zone_name)}", ""] if release is not None else []
+    schedule = f"next dailies {range_clock(parse_time(next_run, now), now)} {zone_name}" if next_run else "no dailies scheduled"
+    lines.append(f"{now:%H:%M} {zone_name} · {schedule}{' - nothing needed' if nothing_needed else ''}")
+    return lines
+
+
 def eta_text(unit: Unit, previous: Previous | None, now: datetime, zone_name: str, with_note: bool) -> str:
     eta = unit.eta
     if eta.time is None:
@@ -871,14 +887,8 @@ def render(report: Report, previous: dict[str, Previous], now: datetime, zone_na
         latest = parse_range_end(unit.eta.latest, now, moment, earliest=False) if unit.eta.latest else moment
         rows.append(Row(unit.label, Estimate(unit.started, moment, earliest, latest), on_hold, plan))
     lines.extend(["```", *draw(now, rows, CHART_STYLES[report.chart]), "```", ""])
-    # A build hold shows its release ETA between the timeline and the last
-    # line (user, 2026-10-04).
-    if report.build_hold_release is not None:
-        lines.extend([f"{BUILD_HOLD_MARK} - release eta: {release_text(report.build_hold_release, now, zone_name)}", ""])
-
     needed = any(unit.needed for unit in report.units) or any(topic.needed for topic in report.topics)
-    tail = "" if needed else " - nothing needed"
-    lines.append(f"next run at {report.next_run}{tail}" if report.next_run else f"no run scheduled{tail}")
+    lines.extend(footer(now, zone_name, report.next_run, report.build_hold_release, nothing_needed=not needed))
     return lines
 
 
@@ -888,6 +898,33 @@ def log_line(report: Report, now: datetime, zone_name: str) -> str:
     return f"- {now:%H:%M} {zone_name}: dailies ETAs: {'; '.join(parts)}"
 
 
+def local_now(zone: str, where: str, at: str | None) -> tuple[datetime, str]:
+    """The minute now, or `at`, as a local time in the IANA zone, and the zone's abbreviation."""
+    try:
+        info = ZoneInfo(zone)
+    except (ZoneInfoNotFoundError, ValueError):
+        raise InputError(f"{where}: {zone!r} is not an IANA zone name") from None
+    try:
+        aware = datetime.fromisoformat(at).replace(tzinfo=info) if at else datetime.now(info)
+    except ValueError:
+        raise InputError(f"--at: {at!r} is not YYYY-MM-DDTHH:MM") from None
+    return aware.replace(second=0, microsecond=0, tzinfo=None), aware.strftime("%Z")
+
+
+def footer_main(zone: str, next_run: str | None, release: str | None, at: str | None, *, nothing_needed: bool) -> int:
+    try:
+        if next_run is not None and not TIME.match(next_run):
+            raise InputError(f"--next-run: {next_run!r} is not HH:MM or HH:MM+N")
+        if release is not None:
+            check_release(release, "--build-hold-release")
+        now, abbreviation = local_now(zone, "--zone", at)
+    except InputError as error:
+        print(f"dailies_render: {error}", file=sys.stderr)
+        return 2
+    print("\n".join(footer(now, abbreviation, next_run, release, nothing_needed=nothing_needed)))
+    return 0
+
+
 def main(arguments: list[str]) -> int:
     parser = argparse.ArgumentParser(description="Render the /showrunner:dailies report from its fixed template.")
     _ = parser.add_argument("input", type=Path, nargs="?")
@@ -895,40 +932,50 @@ def main(arguments: list[str]) -> int:
     _ = parser.add_argument("--state", type=Path)
     _ = parser.add_argument("--log", type=Path)
     _ = parser.add_argument("--at")
+    _ = parser.add_argument("--footer", action="store_true", help="print only the footer every showrunner reply and every report ends with")
+    _ = parser.add_argument("--zone", help="with --footer: the production's zone, as an IANA name")
+    _ = parser.add_argument("--next-run", help="with --footer: the next scheduled report, HH:MM or HH:MM+N; leave it out when none is scheduled")
+    _ = parser.add_argument("--build-hold-release", help="with --footer, while a build hold runs: its release ETA, HH:MM, HH:MM+N or a none text")
+    _ = parser.add_argument("--nothing-needed", action="store_true", help="with --footer: no subject needs a follow-up nobody has started")
     options = parser.parse_args(arguments)
     input_path = cast(Path | None, options.input)
     chart = cast(str | None, options.chart)
+    state_path = cast(Path | None, options.state)
+    log_path = cast(Path | None, options.log)
+    at = cast(str | None, options.at)
+    zone = cast(str | None, options.zone)
+    next_run = cast(str | None, options.next_run)
+    release = cast(str | None, options.build_hold_release)
+    nothing_needed = cast(bool, options.nothing_needed)
+    if cast(bool, options.footer):
+        if input_path is not None or chart is not None or state_path is not None or log_path is not None:
+            parser.error("--footer takes no input file, --chart, --state or --log")
+        if zone is None:
+            parser.error("--footer needs --zone")
+        return footer_main(zone, next_run, release, at, nothing_needed=nothing_needed)
+    if zone is not None or next_run is not None or release is not None or nothing_needed:
+        parser.error("--zone, --next-run, --build-hold-release and --nothing-needed go with --footer; a report takes them from its input")
     if chart is not None:
         write_chart(CHART_CONF, chart)
         print(f"dailies chart: {chart} ({CHART_CONF})", file=sys.stderr)
     if input_path is None:
         if chart is None:
-            parser.error("give an input file, --chart, or both")
+            parser.error("give an input file, --chart (or both), or --footer")
         return 0
-    state_path = cast(Path | None, options.state)
-    log_path = cast(Path | None, options.log)
-    at = cast(str | None, options.at)
     try:
         report = parse_report(cast(object, json.loads(input_path.read_text())), read_chart(CHART_CONF))
         previous = load_state(state_path)
+        now, abbreviation = local_now(report.zone, "input.zone", at)
+        check_changes(report, previous, now)
     except (InputError, json.JSONDecodeError, OSError) as error:
         print(f"dailies_render: {error}", file=sys.stderr)
         return 2
-    zone = ZoneInfo(report.zone)
-    aware = datetime.fromisoformat(at).replace(tzinfo=zone) if at else datetime.now(zone)
-    zone_name = aware.strftime("%Z")
-    now = aware.replace(second=0, microsecond=0, tzinfo=None)
-    try:
-        check_changes(report, previous, now)
-    except InputError as error:
-        print(f"dailies_render: {error}", file=sys.stderr)
-        return 2
-    print("\n".join(render(report, previous, now, zone_name)))
+    print("\n".join(render(report, previous, now, abbreviation)))
     if state_path is not None:
         save_state(state_path, report, now, previous)
     if log_path is not None:
         with log_path.open("a") as log:
-            _ = log.write(log_line(report, now, zone_name) + "\n")
+            _ = log.write(log_line(report, now, abbreviation) + "\n")
     return 0
 
 
