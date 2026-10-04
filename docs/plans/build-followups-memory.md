@@ -46,4 +46,4 @@ Build the approved design. A build that has to wait says why and since when, and
 
 - `/build_hold release` releases sessions one at a time behind Phase 2's admission. If the admission alone staggers them, measure it, say so, and drop the extra step.
 - The quiet test before the held test also checks the load average, not only `pgrep`.
-- The hold writes `~/.local/state/build_hold/active.json` (`since`, `for`, `release_eta`) and deletes it on release. `dailies_render.py --footer` reads it, so a showrunner no longer passes `--build-hold-release` by hand.
+- ratio-unit's Phase 2 makes `/build_hold` write a per-holder file in `~/.local/state/build-hold/`. Give it `since`, `for` and `release_eta` rather than adding a second file, and have `dailies_render.py --footer` read it, so a showrunner no longer passes `--build-hold-release` by hand. Whoever lands second on `commands/build_hold.md` resolves the conflict.
