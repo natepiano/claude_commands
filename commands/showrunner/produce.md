@@ -816,6 +816,11 @@ When every unit's final-gate and as-built checkpoints are merged:
   Units push only their own branch.
 - Merge only from a checkpoint notice. Never merge a visible change before a
   fresh design-check pass on its shots (<MergeCheckpoint/> step 6).
+- **Check intent before ruling.** Before ruling that a design-check finding
+  must change something deliberate-looking, read the repository's
+  `docs/design-decisions.md`, the plan and the as-built docs; if intent stays
+  unclear, keep it. When the user overrules a ruling or settles intent, add the
+  entry there. User, 2026-10-04, after two such rulings were reversed.
 - **One phase at a time.** A unit starts phase N+1 only after phase N is merged
   into the merge branch. A held checkpoint is fixed inside phase N; the unit
   never builds the next phase on top of it. User rule 2026-10-01: widget ran

@@ -40,6 +40,9 @@ zsh ~/.claude/scripts/ux_style/load-ux-style.sh --checklist [--guide <dir>] [--t
 
 Pass `--guide` and `--tags` through only when given. Each line reads
 `<stem> — <title> — <test>`.
+
+Then read `docs/design-decisions.md` in the working directory's repository,
+when it exists. What it records as deliberate is never a defect.
 </LoadChecklist>
 
 ---
