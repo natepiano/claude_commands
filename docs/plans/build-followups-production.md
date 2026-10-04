@@ -1,0 +1,44 @@
+# Production — build-followups
+
+> **Status: PRODUCTION — running.** The five follow-ups from the user's 2026-10-04 adhoc review: cheaper test builds, and a build report that shows temp-folder builds, memory stalls and tests per edit, plus cancelling a superseded CI run.
+
+## Production Context
+
+- **Source plans:** `docs/plans/build-followups.md` — written 2026-10-04 by natedev from the adhoc review's five follow-up tasks (user: "launch it as a plan for a unit director to execute"; "you must use /showrunner:produce for this and start running dailies")
+- **Repository:** `/home/natepiano/.claude`
+- **Merge branch:** `build-followups` — every unit merges here; only the showrunner pushes it
+- **Showrunner checkout:** `/home/natepiano/worktrees/claude-build-followups-trunk`
+- **Showrunner session:** natedev
+- **Log:** `docs/plans/build-followups-log.md` — git-excluded; one line per event
+- **User zone:** America/New_York — every time the showrunner reports is in this zone only
+- **Updates:** every 30 minutes; each update reports every unit in full
+- **Merge tests:** `python3 -m unittest discover -s scripts/buildlog -p 'test_*.py'` (with `BUILDLOG_DIR` set to a temp dir until Phase 2 merges) and `basedpyright scripts/buildlog`, run in the showrunner checkout
+- **Capacity:** one unit; its seats share natedev's build slots (steve)
+
+## Units
+
+| Unit | Plan | Worktree | Branch | Session | Port | Owns |
+| --- | --- | --- | --- | --- | --- | --- |
+| followups-unit | `docs/plans/build-followups.md` | `/home/natepiano/worktrees/claude-build-followups` | `build-followups-unit` | `build-followups` | — | `scripts/delegate/verify.sh`, `scripts/buildlog/`, `scripts/validate_and_push/`, `commands/unit/delegate.md` (the `--filter` row), `commands/showrunner/produce.md` (the cancel-prior rule) |
+
+## Hub files
+
+| File | Owner unit | Other units that touch it |
+| --- | --- | --- |
+
+## Gates
+
+| Gate | Waiting | Waits on | Clears when |
+| --- | --- | --- | --- |
+
+## Close-out
+
+- Phase 1 on main: mark `~/.local/state/nightly-review/ledger.md` line 15 accepted with the main sha.
+- Phase 3 on main: natedev adds the `buildlog sample` timer the unit names to `/etc/nixos` (commit, push); the user rebuilds.
+- Phase 5 on main: natedev tells the tool-based-ui showrunner about `validate_and_push.sh --cancel-prior` and the rule in `produce.md`.
+- Delete `/etc/nixos/adhoc_review_2026-10-04.md`.
+
+## Production rules
+
+- **No CI on this repo** (natedev, 2026-10-04). `~/.claude` has no workflows, so the Merge tests replace `verify.sh test`, and <CIPoint/>, the smoke launch, the Mac run and `validate_and_push.sh` do not apply.
+- **Each merged phase goes to main at once** (natedev, 2026-10-04), since every phase is useful alone and `~/.claude` main is the live configuration. After a merge's tests pass: merge `main` into `build-followups` if main moved, push `build-followups`, fast-forward `~/.claude` main to it (`git -C ~/.claude merge --ff-only <sha>`; other sessions' uncommitted files there stay untouched), and push main only when `origin/main..main` held no other session's commits before the fast-forward. Then the Mac pulls: `ssh mac 'cd ~/.claude && git pull --ff-only natedev:/home/natepiano/.claude main'`.
