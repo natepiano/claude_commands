@@ -14,8 +14,8 @@ ETA that moved CHANGE_NEEDS_WHY_MINUTES or more since the last report
 without `why`, a `then` naming a phase at or before the heading's, or a line
 using the production's own plumbing words (PLUMBING).
 
---state  JSON file holding each unit's last reported phase, ETA and held
-         reason. The script reads it to write `(unchanged)` / `(changed:
+--state  JSON file holding each unit's last reported phase, ETA, held
+         reason and the phase's first ETA. The script reads it to write `(unchanged)` / `(changed:
          ±h:mm)` and, in a simple report, to print a held reason's examples
          only the first time,
          then saves this report's values to it.
@@ -115,6 +115,8 @@ class Eta:
     detail: str | None
     percent: int | None
     why: str | None
+    first: datetime | None
+    fixes: int
 
 
 @dataclass(frozen=True)
@@ -159,6 +161,7 @@ class Previous:
     phase: str
     eta: datetime | None
     held: str | None
+    first: datetime | None
 
 
 @dataclass(frozen=True)
@@ -377,7 +380,7 @@ def clock_text(fields: JsonMap, key: str, where: str) -> str | None:
 
 def parse_eta(value: object, where: str) -> Eta:
     fields = as_map(value, where)
-    check_keys(fields, {"time", "earliest", "latest", "none", "detail", "percent", "why"}, where)
+    check_keys(fields, {"time", "earliest", "latest", "none", "detail", "percent", "why", "first", "fixes"}, where)
     time = clock_text(fields, "time", where)
     earliest = clock_text(fields, "earliest", where)
     latest = clock_text(fields, "latest", where)
@@ -403,7 +406,17 @@ def parse_eta(value: object, where: str) -> Eta:
     detail = optional_text(fields, "detail", where)
     if detail is not None and detail.lower().startswith("from"):
         raise InputError(f"{where}.detail: never say where the ETA came from; say what the time covers, or leave it out")
-    return Eta(time, earliest, latest, none, detail, percent, why)
+    first_text = optional_text(fields, "first", where)
+    try:
+        first = datetime.fromisoformat(first_text) if first_text is not None else None
+    except ValueError:
+        raise InputError(f"{where}.first: the phase's first ETA as YYYY-MM-DDTHH:MM") from None
+    fixes = fields.get("fixes", 0)
+    if not isinstance(fixes, int) or isinstance(fixes, bool) or fixes < 0:
+        raise InputError(f"{where}.fixes: the fix rounds added since the first ETA, a whole number from 0")
+    if time is None and (first is not None or fixes):
+        raise InputError(f"{where}: first and fixes only with a time")
+    return Eta(time, earliest, latest, none, detail, percent, why, first, fixes)
 
 
 def check_update(update: str, length: str, where: str, key: str = "update") -> None:
@@ -600,15 +613,39 @@ def load_state(path: Path | None) -> dict[str, Previous]:
         phase = text(entry_fields, "phase", f"{path}:{unit}")
         eta = optional_text(entry_fields, "eta", f"{path}:{unit}")
         held = optional_text(entry_fields, "held", f"{path}:{unit}")
-        previous[unit] = Previous(phase, datetime.fromisoformat(eta) if eta else None, held)
+        first = optional_text(entry_fields, "first", f"{path}:{unit}")
+        previous[unit] = Previous(phase, datetime.fromisoformat(eta) if eta else None, held, datetime.fromisoformat(first) if first else None)
     return previous
 
 
-def save_state(path: Path, report: Report, now: datetime) -> None:
+def first_eta(unit: Unit, previous: Previous | None, now: datetime) -> datetime | None:
+    """The phase's first stated ETA: the input's `first`, else the state's for the same phase, else this report's."""
+    if unit.eta.first is not None:
+        return unit.eta.first
+    if previous is not None and previous.phase == unit.phase and previous.first is not None:
+        return previous.first
+    return parse_time(unit.eta.time, now) if unit.eta.time else None
+
+
+def drift_text(unit: Unit, previous: Previous | None, now: datetime, zone_name: str) -> str | None:
+    """The first ETA, how far the current one has moved from it and the fix rounds added since; `None` until it moves."""
+    first = first_eta(unit, previous, now)
+    if first is None or unit.eta.time is None:
+        return None
+    minutes = round((parse_time(unit.eta.time, now) - first).total_seconds() / 60)
+    if minutes == 0 and unit.eta.fixes == 0:
+        return None
+    hours, rest = divmod(abs(minutes), 60)
+    rounds = f", {unit.eta.fixes} fix round{'' if unit.eta.fixes == 1 else 's'} added" if unit.eta.fixes else ""
+    return f"{clock(first, now, zone_name)} (now {'-' if minutes < 0 else '+'}{hours}:{rest:02d}{rounds})"
+
+
+def save_state(path: Path, report: Report, now: datetime, previous: dict[str, Previous]) -> None:
     state: dict[str, dict[str, str | None]] = {}
     for unit in report.units:
         moment = parse_time(unit.eta.time, now) if unit.eta.time else None
-        state[unit.unit] = {"phase": unit.phase, "eta": moment.isoformat() if moment else None, "held": unit.held}
+        first = first_eta(unit, previous.get(unit.unit), now)
+        state[unit.unit] = {"phase": unit.phase, "eta": moment.isoformat() if moment else None, "held": unit.held, "first": first.isoformat() if first else None}
     _ = path.write_text(json.dumps(state, indent=2) + "\n")
 
 
@@ -723,6 +760,9 @@ def render(report: Report, previous: dict[str, Previous], now: datetime, zone_na
             lines.append(f"- checkpoint: not merged, because {unit.held}{examples}")
         lines.append(f"- update: {unit.update}")
         lines.append(f"- eta: {eta_text(unit, previous.get(unit.unit), now, zone_name, with_note=True)}")
+        drift = drift_text(unit, previous.get(unit.unit), now, zone_name)
+        if drift:
+            lines.append(f"- first eta: {drift}")
         if unit.waiting_on_it:
             lines.append(f"- waiting on it: {unit.waiting_on_it}")
         if unit.needed:
@@ -795,7 +835,7 @@ def main(arguments: list[str]) -> int:
         return 2
     print("\n".join(render(report, previous, now, zone_name)))
     if state_path is not None:
-        save_state(state_path, report, now)
+        save_state(state_path, report, now, previous)
     if log_path is not None:
         with log_path.open("a") as log:
             _ = log.write(log_line(report, now, zone_name) + "\n")

@@ -132,6 +132,7 @@ python3 ~/.claude/scripts/production/dailies_render.py <scratchpad>/dailies_inpu
 | `held_examples` | Optional examples for `held`, written to follow a comma: `such as a main bar clipped in small windows`. In a `simple` report the renderer prints them only the first time that reason appears for the phase; `page` and `elaborate` always print them. |
 | `update` | What the unit is doing now, one line. The length sets how long (below). A unit waiting on another unit says so, with the wait's start and expected clear times from `LOG` (`/showrunner:produce` → Dependencies). |
 | `eta` | The unit's latest stated phase ETA, in `ZONE`. `time` is `HH:MM`, `+1` for tomorrow (`11:21+1`); add `earliest` and `latest` when the unit director gave a range. With no ETA, `none` in place of `time`, one of: `none measured - requested` (after sending that unit director `/unit:eta` in this turn, the unmeasured-ETA rule in `/showrunner:produce`), `none measured`, `no ETA stated yet`. Never make one up. `percent` is required with `time`: the unit director's phase percent done (the recorder's phase `%`, 0–100), or `null` when it stated none. `detail` is an optional short note on what the time covers (`checks and build included`). It never says where the ETA came from: no `from the recorder`, no `from past runs` (user, 2026-10-02); the renderer refuses a `detail` that starts with `from`. `why` says in a few words why the ETA moved since the last report, from the unit director's own reports (`the four remaining app tests need a new floor anchor`); the renderer prints it after `because` and refuses a move of 15 minutes or more without it (user, 2026-10-01). |
+| `eta.first`, `eta.fixes` | The phase's first stated ETA (`YYYY-MM-DDTHH:MM`), and the fix rounds added since it. `first` seeds the state once; the state then keeps it for the phase. Give `fixes` every report: the repair rounds started after the first ETA. User, 2026-10-03. |
 | `waiting_on_it` | Only for a topic that lands with this unit's phase, and who waits. |
 | `needed` | Only when the subject needs a follow-up nobody has started, from you (the user), the showrunner or another unit director. Say who. |
 | `needs_user` | `true` when the subject waits on you. It then goes first. |
@@ -170,7 +171,9 @@ names another plan's document. User, 2026-10-02.
 - **eta:** the time, then the percent done: `10:46 PDT, 85% done`.
 - **eta note:** against the last report's ETA for the same phase:
   `(unchanged)`, `(changed: +0:27 because <why>)`, or `(unchanged, overdue)`
-  once the time has passed. No note on a subject's first ETA or a new phase. A
+  once the time has passed. No note on a subject's first ETA or a new phase.
+- **first eta:** once the ETA has moved from the phase's first: `05:43 PDT (now
+  +17:12, 8 fix rounds added)`. User, 2026-10-03. A
   range follows the note; an end on another day carries its weekday
   (`range Fri 08:24–Sat 07:37`).
 - **Timeline:** a code block after the sections, always 24 hours of one-hour
