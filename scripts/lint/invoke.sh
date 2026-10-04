@@ -92,7 +92,7 @@ buildlog_now() {
 
 # buildlog_begin ARGV...
 buildlog_begin() {
-    BUILDLOG_START="" BUILDLOG_PEAK="" BUILDLOG_NOW="" BUILDLOG_TREE=""
+    BUILDLOG_START="" BUILDLOG_PEAK="" BUILDLOG_NOW="" BUILDLOG_TREE="" BUILDLOG_MEM_WAIT_S=0
     [[ "${BUILDLOG_OFF:-0}" != 1 && -f "$BUILDLOG_RECORD" ]] || return 0
     BUILDLOG_TREE="$("$HOME/.claude/scripts/lib/py" "$BUILDLOG_RECORD" key ${1+"$@"} </dev/null 2>/dev/null)" \
         || BUILDLOG_TREE=""
@@ -104,13 +104,38 @@ buildlog_begin() {
     fi
 }
 
+buildlog_wait_for_memory() {
+    BUILDLOG_MEM_WAIT_S=0
+    local cgroup="${BUILDLOG_BUILDS_CGROUP:-/sys/fs/cgroup/user.slice/user-$(id -u).slice/user@$(id -u).service/builds.slice}"
+    local high current started waited=0 interval="${BUILDLOG_MEM_POLL_S:-5}" limit="${BUILDLOG_MEM_WAIT_LIMIT_S:-900}"
+    [[ "$interval" =~ ^[0-9]+$ && "$interval" -gt 0 ]] || interval=5
+    [[ "$limit" =~ ^[0-9]+$ && "$limit" -ge 0 ]] || limit=900
+    [[ -r "$cgroup/memory.high" && -r "$cgroup/memory.current" ]] || return 0
+    read -r high < "$cgroup/memory.high" || return 0
+    [[ "$high" =~ ^[0-9]+$ ]] || return 0
+    started=$SECONDS
+    while [[ -r "$cgroup/memory.current" ]]; do
+        read -r current < "$cgroup/memory.current" || break
+        [[ "$current" =~ ^[0-9]+$ ]] || break
+        (( current > high )) || break
+        if (( waited == 0 )); then
+            awk -v used="$current" -v soft="$high" -v since="$(TZ=America/Los_Angeles date '+%H:%M %Z')" \
+                'BEGIN { printf "waiting for memory since %s: builds use %.1f of %.1f GiB\n", since, used / 1073741824, soft / 1073741824 > "/dev/stderr" }'
+        fi
+        (( SECONDS - started < limit )) || { echo 'memory wait limit reached after 15 min; starting anyway' >&2; break; }
+        sleep "$interval"
+        waited=$(( SECONDS - started ))
+    done
+    BUILDLOG_MEM_WAIT_S=$(( SECONDS - started ))
+}
+
 buildlog_exec() {
     if [[ -z "${BUILDLOG_PEAK:-}" ]]; then
         "$@"
         return
     fi
     local status=0
-    systemd-run --user --scope --quiet --collect --expand-environment=no -- \
+    systemd-run --user --scope --quiet --collect --expand-environment=no --slice=builds.slice -- \
         /bin/sh -c "$BUILDLOG_SCOPE_SH" "$BUILDLOG_PEAK" "$@" 3>&2 2>/dev/null
     status=$?
     if [[ -e "$BUILDLOG_PEAK" ]]; then
@@ -131,12 +156,12 @@ buildlog_end() {
         mv -f "$log" "$held" 2>/dev/null || held=""
     fi
     if [[ "${BUILDLOG_SYNC:-0}" == 1 ]]; then
-        BUILDLOG_TREE_START="${BUILDLOG_TREE:-}" "$HOME/.claude/scripts/lib/py" "$BUILDLOG_RECORD" step \
+        BUILDLOG_TREE_START="${BUILDLOG_TREE:-}" BUILDLOG_MEM_WAIT_S="${BUILDLOG_MEM_WAIT_S:-0}" "$HOME/.claude/scripts/lib/py" "$BUILDLOG_RECORD" step \
             "$status" "$BUILDLOG_START" "${BUILDLOG_NOW:-}" "$tty" "$held" "${BUILDLOG_PEAK:-}" ${1+"$@"} \
             </dev/null >/dev/null 2>&1
     else
         ( trap '' HUP
-          BUILDLOG_TREE_START="${BUILDLOG_TREE:-}" "$HOME/.claude/scripts/lib/py" "$BUILDLOG_RECORD" step \
+          BUILDLOG_TREE_START="${BUILDLOG_TREE:-}" BUILDLOG_MEM_WAIT_S="${BUILDLOG_MEM_WAIT_S:-0}" "$HOME/.claude/scripts/lib/py" "$BUILDLOG_RECORD" step \
             "$status" "$BUILDLOG_START" "${BUILDLOG_NOW:-}" "$tty" "$held" "${BUILDLOG_PEAK:-}" ${1+"$@"} \
             </dev/null >/dev/null 2>&1 & )
     fi
@@ -144,9 +169,14 @@ buildlog_end() {
     return 0
 }
 
-run() {
+run_once() {
     printf '+ %s\n' "$*"
     buildlog_begin "$@" || true
+    if [[ -n "${BUILDLOG_PEAK:-}" ]]; then
+        buildlog_wait_for_memory
+        buildlog_now
+        BUILDLOG_START="${BUILDLOG_NOW:-}"
+    fi
     # A terminal on the other end means a human is watching, so run straight
     # through and keep the colors. The tee below is what costs them: cargo and
     # mend see a pipe, not a tty, and drop their ANSI. It buys only the sandbox
@@ -195,6 +225,10 @@ EOF
     rm -f "$log"
     sweep_after_step "$@" || true
     return $status
+}
+
+run() {
+    run_once "$@"
 }
 
 # Every step, failed or not, leaves its workspace's target swept (sweep.py,

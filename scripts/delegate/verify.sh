@@ -131,6 +131,55 @@ PY="${HOME}/.claude/scripts/lib/py"
 # shellcheck source=/dev/null
 source "$HOME/.claude/scripts/lint/invoke.sh"
 
+# A failed step may be a process killed by earlyoom or the kernel. Keep the
+# journal query here so tests can put a journalctl stub first on PATH.
+memory_kill_in_journal() {
+    local started=$1 ended=$2
+    journalctl -u earlyoom --since "$started" --until "$ended" --no-pager 2>/dev/null \
+        | grep -E 'sending SIG(TERM|KILL) to process' >/dev/null && return 0
+    journalctl -k --since "$started" --until "$ended" --no-pager 2>/dev/null \
+        | grep -E 'Memory cgroup out of memory|Out of memory: Killed' >/dev/null
+}
+
+step_was_killed_for_memory() {
+    local log=$1 started=$2 ended=$3
+    grep -qaE 'SIGKILL|SIGTERM|signal: (9|15)' "$log" || return 1
+    memory_kill_in_journal "$started" "$ended"
+}
+
+run() {
+    local attempt status started ended step_log
+    RUN_LAST_ATTEMPT_KILLED=0
+    step_log="$(mktemp)"
+    for attempt in 1 2; do
+        started="$(date '+%Y-%m-%d %H:%M:%S %z')"
+        if run_once "$@" 2>&1 | tee "$step_log"; then
+            RUN_LAST_ATTEMPT_KILLED=0
+            rm -f "$step_log"
+            return 0
+        else
+            status=${PIPESTATUS[0]}
+        fi
+        ended="$(date '+%Y-%m-%d %H:%M:%S %z')"
+        RUN_LAST_ATTEMPT_KILLED=0
+        if grep -qaE 'SIGKILL|signal: 9' "$step_log"; then
+            RUN_LAST_ATTEMPT_KILLED=1
+        fi
+        if ! step_was_killed_for_memory "$step_log" "$started" "$ended"; then
+            rm -f "$step_log"
+            return "$status"
+        fi
+        RUN_LAST_ATTEMPT_KILLED=1
+        if (( attempt == 2 )); then
+            echo "killed for memory twice: $*" >&2
+            rm -f "$step_log"
+            return 137
+        fi
+        echo "killed for memory: $*; retrying once" >&2
+        : > "$step_log"
+    done
+}
+
 usage() {
     sed -n '/^# Usage:/,/^$/p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//' >&2
 }
@@ -528,12 +577,11 @@ cache_record() {
 }
 
 # A failed lint is the tree's own answer unless the run never reached a
-# verdict: a usage or tooling error (2), the sandbox (3), or a kill (a status
-# past 128, or a compiler SIGKILL in the log, as earlyoom deals out).
+# verdict: a usage or tooling error (2), the sandbox (3), or a kill.
 lint_failure_is_the_tree() {
     [[ "$CMD" == lint ]] || return 1
     (( EXIT_STATUS != 2 && EXIT_STATUS != 3 && EXIT_STATUS < 128 )) || return 1
-    ! grep -qaE 'SIGKILL|signal: 9' "${RUN_LOG}"
+    (( ${RUN_LAST_ATTEMPT_KILLED:-0} == 0 ))
 }
 
 # Logs the finished run and records a pass or a lint failure. Runs once:
@@ -752,7 +800,14 @@ case "$CMD" in
             MEND_LOG="$(mktemp)"
             # pipefail is set, so a failing mend fails the pipeline; the log
             # only decides which message names the failure.
-            if ! invoke_mend --workspace --fix "${FEATURE_FLAGS[@]}" 2>&1 | tee "$MEND_LOG"; then
+            if invoke_mend --workspace --fix "${FEATURE_FLAGS[@]}" 2>&1 | tee "$MEND_LOG"; then
+                :
+            else
+                mend_status=${PIPESTATUS[0]}
+                if (( mend_status == 137 )); then
+                    rm -f "$MEND_LOG"
+                    exit 137
+                fi
                 if grep -qiE 'rolled back|revert' "$MEND_LOG"; then
                     echo "verify.sh: cargo mend --fix rolled its rewrites back; the tree reproduces it — run /mend_fix" >&2
                 else

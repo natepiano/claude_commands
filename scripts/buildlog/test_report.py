@@ -416,8 +416,8 @@ class ReportTests(unittest.TestCase):
     def test_memory_pressure_uses_sample_peaks_and_reboot_counter_deltas(self) -> None:
         self.write(
             self.root / "natedev" / "samples-2026-10.jsonl",
-            sample("2026-10-02T12:00:00.000Z", mem_used_bytes=4 * 2**30, swap_used_bytes=2 * 2**30, stall_some_us=10_000_000, stall_full_us=2_000_000),
-            sample("2026-10-02T12:01:00.000Z", mem_used_bytes=8 * 2**30, swap_used_bytes=7 * 2**30, stall_some_us=12_000_000, stall_full_us=3_000_000),
+            sample("2026-10-02T12:00:00.000Z", mem_used_bytes=4 * 2**30, swap_used_bytes=2 * 2**30, stall_some_us=10_000_000, stall_full_us=2_000_000, builds_anon_bytes=2 * 2**30, ci_anon_bytes=3 * 2**30),
+            sample("2026-10-02T12:01:00.000Z", mem_used_bytes=8 * 2**30, swap_used_bytes=7 * 2**30, stall_some_us=12_000_000, stall_full_us=3_000_000, builds_anon_bytes=4 * 2**30, ci_anon_bytes=5 * 2**30),
             sample("2026-10-02T12:02:00.000Z", boot_id="boot-b", mem_used_bytes=6 * 2**30, swap_used_bytes=5 * 2**30, stall_some_us=500_000, stall_full_us=100_000),
             sample("2026-10-02T12:03:00.000Z", boot_id="boot-b", mem_used_bytes=5 * 2**30, swap_used_bytes=4 * 2**30, stall_some_us=1_500_000, stall_full_us=500_000),
         )
@@ -425,6 +425,13 @@ class ReportTests(unittest.TestCase):
         self.assertTrue(any("Source:" in line and "60 s" in line and "step" in line and "stall" in line for line in section))
         self.assertTrue(any("8.0 GiB" in line and "7.0 GiB" in line for line in section))
         self.assertTrue(any("3.5 s" in line and "1.5 s" in line for line in section))
+        self.assertTrue(any("peak builds 4.0 GiB, peak CI 5.0 GiB (process memory)" in line for line in section))
+        self.assertIn("memory waits: none", section)
+
+    def test_memory_pressure_sums_admission_waits_and_names_longest_caller(self) -> None:
+        self.write(self.root / "natedev" / "2026-10.jsonl", step("s1", mem_wait_s=12, caller="verify"), step("s2", mem_wait_s=4))
+        section = self.memory_section()
+        self.assertIn("memory waits: 2 steps, total 16.0 s, longest 12.0 s (verify.sh (agents))", section)
 
     def test_memory_pressure_samples_without_stalled_steps_have_no_table(self) -> None:
         self.write(self.root / "natedev" / "samples-2026-10.jsonl", sample(STAMP))

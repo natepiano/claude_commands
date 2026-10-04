@@ -39,6 +39,7 @@ AMBIENT = (
     "CLAUDE_CODE_SESSION_ID",
     "MANIFEST_PATH",
     "BUILDLOG_TREE_START",
+    "BUILDLOG_MEM_WAIT_S",
 )
 Record = dict[str, object]
 
@@ -183,6 +184,74 @@ class RecordTests(unittest.TestCase):
         self.assertEqual(record["mem_stall_some_s"], 1.25)
         self.assertEqual(record["mem_stall_full_s"], 0.25)
         self.assertFalse(peak.exists())
+
+    def test_step_records_memory_wait_separately_from_build_duration(self) -> None:
+        record = self.step(0, "0", "", "", SWEEP, {"BUILDLOG_MEM_WAIT_S": "23"})
+        self.assertEqual(record["mem_wait_s"], 23)
+        self.assertEqual(record["duration_s"], 12.5)
+
+    def test_piped_run_records_memory_wait_outside_step_duration(self) -> None:
+        cgroup = self.base / "builds.slice"
+        cgroup.mkdir()
+        _ = (cgroup / "memory.high").write_text(f"{2**30}\n")
+        _ = (cgroup / "memory.current").write_text(f"{2 * 2**30}\n")
+        runtime = self.base / "runtime" / "systemd"
+        runtime.mkdir(parents=True)
+        with socket.socket(socket.AF_UNIX) as manager:
+            manager.bind(str(runtime / "private"))
+            systemd_run = self.base / "systemd-run"
+            _ = systemd_run.write_text(
+                '#!/bin/sh\nwhile [ "$1" != -- ]; do shift; done\n'
+                + 'shift\npeak="$4"\nshift 4\nprintf "123\\n" > "$peak"\n"$@"\n'
+            )
+            systemd_run.chmod(0o755)
+            command = (
+                'source "$1"; BUILDLOG_RECORD="$2"; sweep_after_step() { :; }; '
+                'run_once bash -c "printf step\\n"'
+            )
+            result = subprocess.run(
+                ["bash", "-c", command, "bash", str(SCRIPT.parent.parent / "lint" / "invoke.sh"), str(SCRIPT)],
+                cwd=self.repo,
+                env=self.environment(
+                    PATH=f"{self.base}:{os.environ['PATH']}",
+                    XDG_RUNTIME_DIR=str(runtime.parent),
+                    BUILDLOG_BUILDS_CGROUP=str(cgroup), BUILDLOG_MEM_POLL_S="1", BUILDLOG_MEM_WAIT_LIMIT_S="1",
+                    BUILDLOG_SYNC="1",
+                ),
+                capture_output=True, text=True, check=False, timeout=10,
+            )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        record = self.records()[-1]
+        wait = record["mem_wait_s"]
+        duration = record["duration_s"]
+        assert isinstance(wait, int)
+        assert isinstance(duration, (int, float))
+        self.assertGreaterEqual(wait, 1)
+        self.assertLess(duration, 0.8)
+
+    def test_memory_admission_waits_and_explains_limit(self) -> None:
+        cgroup = self.base / "builds.slice"
+        cgroup.mkdir()
+        _ = (cgroup / "memory.high").write_text(f"{2**30}\n")
+        _ = (cgroup / "memory.current").write_text(f"{2 * 2**30}\n")
+        command = 'source "$1"; buildlog_wait_for_memory; printf "%s\\n" "$BUILDLOG_MEM_WAIT_S"'
+        environment = self.environment(BUILDLOG_BUILDS_CGROUP=str(cgroup), BUILDLOG_MEM_POLL_S="1", BUILDLOG_MEM_WAIT_LIMIT_S="1")
+        result = subprocess.run(
+            ["bash", "-c", command, "bash", str(SCRIPT.parent.parent / "lint" / "invoke.sh")],
+            env=environment, capture_output=True, text=True, check=False, timeout=5,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertRegex(result.stderr, r"waiting for memory since \d\d:\d\d P[DS]T: builds use 2\.0 of 1\.0 GiB")
+        self.assertIn("memory wait limit reached after 15 min; starting anyway", result.stderr)
+        self.assertGreaterEqual(int(result.stdout.strip()), 1)
+        missing = self.base / "missing.slice"
+        result = subprocess.run(
+            ["bash", "-c", command, "bash", str(SCRIPT.parent.parent / "lint" / "invoke.sh")],
+            env=self.environment(BUILDLOG_BUILDS_CGROUP=str(missing)), capture_output=True, text=True, check=False, timeout=5,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stderr, "")
+        self.assertEqual(result.stdout.strip(), "0")
 
     def test_scope_memory_names_its_values_and_marks_missing_stalls_unmeasured(self) -> None:
         peak = self.peak_file()

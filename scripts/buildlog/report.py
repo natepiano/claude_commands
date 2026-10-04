@@ -173,6 +173,19 @@ def kind_section(connection: sqlite3.Connection, day: str, kind: str, hosts: int
 
 def memory_pressure_section(connection: sqlite3.Connection, day: str, hosts: int) -> list[str]:
     """The largest step stalls and the day's sampled machine memory pressure."""
+    waits = fetch(
+        connection,
+        "SELECT count(*), sum(mem_wait_s), max(mem_wait_s) FROM steps"
+        + " WHERE date(started_at, 'localtime') = ? AND mem_wait_s > 0",
+        day,
+    )[0]
+    longest = fetch(
+        connection,
+        f"SELECT {SCRATCH} AS is_scratch, caller, host FROM steps"
+        + " WHERE date(started_at, 'localtime') = ? AND mem_wait_s > 0"
+        + " ORDER BY mem_wait_s DESC LIMIT 1",
+        day,
+    )
     stalled = fetch(
         connection,
         f"SELECT {SCRATCH} AS is_scratch, s.step, s.caller, s.host, s.mem_stall_some_s,"
@@ -184,14 +197,21 @@ def memory_pressure_section(connection: sqlite3.Connection, day: str, hosts: int
     )
     samples = fetch(
         connection,
-        "SELECT host, at, boot_id, mem_used_bytes, swap_used_bytes, stall_some_us, stall_full_us"
+        "SELECT host, at, boot_id, mem_used_bytes, swap_used_bytes, stall_some_us, stall_full_us,"
+        + " builds_anon_bytes, ci_anon_bytes"
         + " FROM samples WHERE date(at, 'localtime') = ? ORDER BY host, at",
         day,
     )
-    if not stalled and not samples:
+    if not stalled and not samples and not longest:
         return ["Memory pressure: no samples and no step stalls.", ""]
 
     section = ["### Memory pressure", "", "Source: 60 s machine samples and step cgroup stall counters.", ""]
+    if longest:
+        is_scratch, caller, host = longest[0]
+        who = SCRATCH_LABEL if is_scratch else caller_label(caller, host, hosts)
+        section += [f"memory waits: {count(waits[0])} steps, total {seconds(waits[1])}, longest {seconds(waits[2])} ({who})", ""]
+    else:
+        section += ["memory waits: none", ""]
     if stalled:
         body = [
             [SCRATCH_LABEL if is_scratch else caller_label(caller, host, hosts), str(step), seconds(stall), count(at_once)]
@@ -204,7 +224,7 @@ def memory_pressure_section(connection: sqlite3.Connection, day: str, hosts: int
 
     previous: dict[str, tuple[str, str, int, int]] = {}
     some_us = full_us = 0
-    for host, at, boot_id, _, _, some, full in samples:
+    for host, at, boot_id, _, _, some, full, _, _ in samples:
         machine = str(host)
         before = previous.get(machine)
         if before is None:
@@ -228,9 +248,12 @@ def memory_pressure_section(connection: sqlite3.Connection, day: str, hosts: int
 
     peak_memory = max(cast(int, row[3]) for row in samples)
     peak_swap = max(cast(int, row[4]) for row in samples)
+    peak_builds = max((row[7] for row in samples if isinstance(row[7], int)), default=None)
+    peak_ci = max((row[8] for row in samples if isinstance(row[8], int)), default=None)
+    slice_peaks = f"peak builds {gib(peak_builds) if peak_builds is not None else 'unavailable'}, peak CI {gib(peak_ci) if peak_ci is not None else 'unavailable'} (process memory)"
     section += [
         f"60 s samples: peak used memory {gib(peak_memory)}, peak swap {gib(peak_swap)}; "
-        + f"machine stall: some {seconds(some_us / 1_000_000)}, full {seconds(full_us / 1_000_000)}.",
+        + f"{slice_peaks}; machine stall: some {seconds(some_us / 1_000_000)}, full {seconds(full_us / 1_000_000)}.",
         "",
     ]
     return section

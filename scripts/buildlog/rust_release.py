@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import signal
 import shutil
 import socket
@@ -289,6 +290,14 @@ def remove_clone(path: Path) -> None:
         shutil.rmtree(path)
 
 
+def trial_step_was_killed(result: subprocess.CompletedProcess[str]) -> bool:
+    if result.returncode == 0:
+        return False
+    return result.returncode >= 128 or result.returncode in (-9, -15) or bool(
+        re.search(r"SIG(?:KILL|TERM)|signal:? (?:9|15)\b", result.stdout + "\n" + result.stderr)
+    )
+
+
 def default_trial_parent() -> Path:
     return Path(tempfile.gettempdir())
 
@@ -315,6 +324,8 @@ def trial_release(
             result = run_command(args, cwd, step_env, timeout)
             if held():
                 return {"status": "waiting", "version": version, "reason": "build hold active"}
+            if trial_step_was_killed(result):
+                return {"status": "waiting", "version": version, "reason": f"{step} killed; retry next night"}
             if result.returncode != 0:
                 reason = first_error(result)
                 break
@@ -325,6 +336,8 @@ def trial_release(
             revision = run_command(["git", "-C", str(HANA), "rev-parse", "origin/init/catalyst"], None, env, 30)
             if held():
                 return {"status": "waiting", "version": version, "reason": "build hold active"}
+            if trial_step_was_killed(revision):
+                return {"status": "waiting", "version": version, "reason": "revision killed; retry next night"}
             if revision.returncode != 0:
                 reason = first_error(revision)
             else:
@@ -332,6 +345,8 @@ def trial_release(
                 checkout = run_command(["git", "-C", str(clone), "checkout", "--detach", sha], None, env, 600)
                 if held():
                     return {"status": "waiting", "version": version, "reason": "build hold active"}
+                if trial_step_was_killed(checkout):
+                    return {"status": "waiting", "version": version, "reason": "checkout killed; retry next night"}
                 if checkout.returncode != 0:
                     reason = first_error(checkout)
             if not reason:
@@ -342,6 +357,8 @@ def trial_release(
                 clippy = run_command(["nix", "develop", ".#ci", "-c", "cargo", f"+{version}", "clippy", "--workspace", "--all-targets", "--all-features", "--message-format=json"], clone, clippy_env, 7200)
                 if held():
                     return {"status": "waiting", "version": version, "reason": "build hold active"}
+                if trial_step_was_killed(clippy):
+                    return {"status": "waiting", "version": version, "reason": "clippy killed; retry next night"}
                 warnings, warning_crates, errors, error_crates = diagnostic_counts(clippy.stdout)
                 if clippy.returncode != 0 and errors == 0:
                     reason = first_error(clippy)
@@ -353,6 +370,8 @@ def trial_release(
                 mend = run_command(["cargo", f"+{version}", "install", "--path", str(Path.home() / "rust/cargo-liner/crates/cargo-mend"), "--root", str(clone / "mend-root")], clone, mend_env, 3600)
                 if held():
                     return {"status": "waiting", "version": version, "reason": "build hold active"}
+                if trial_step_was_killed(mend):
+                    return {"status": "waiting", "version": version, "reason": "cargo-mend killed; retry next night"}
                 mend_builds = mend.returncode == 0
         target_gib = directory_gib(clone / "target")
         mend_target_gib = directory_gib(clone / "mend-target")

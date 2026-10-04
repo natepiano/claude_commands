@@ -252,6 +252,7 @@ def step(args: list[str]) -> None:
             "started_at": store.utc_iso(start),
             "ended_at": store.utc_iso(end),
             "duration_s": round(end - start, 3),
+            "mem_wait_s": int(os.environ.get("BUILDLOG_MEM_WAIT_S", "0")),
             "step": name,
             "argv": argv,
             "cwd": cwd,
