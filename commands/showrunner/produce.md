@@ -698,7 +698,9 @@ approval, a login, a physical action), push the moment you learn it: what is
 blocked, the exact action, and on which machine. One push per new block.
 Units tell you, and you push; the machine-config session (natedev, macbook)
 pushes for blocks it owns. Each block has one owner. User, 2026-10-04, after a
-rebuild waited 1.5 h with no push.
+rebuild waited 1.5 h with no push. A rebuild is pushed even when nothing waits
+on it, at priority 1: the user wants a text for every rebuild needed (user,
+2026-10-04).
 
 | Priority | When |
 | --- | --- |
