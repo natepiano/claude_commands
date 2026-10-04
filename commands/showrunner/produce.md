@@ -405,16 +405,16 @@ Input: the unit, phase, hash and shots from its notice.
       `python3 ~/.claude/scripts/production/review_regime.py add --unit <unit> --phase <N> --regime after --started <ISO> --merged <ISO> --holds <K> --merge-defects <D> --ux-findings <N> --code-findings <N> --review-minutes <M>`.
       `holds` counts this phase's held checkpoints and `merge-defects` the
       defect rows of all its design checks, both from `LOG`; the last three come
-      from the unit's `review trial:` checkpoint line. A phase already running
-      when its unit got the 2026-10-04 relay (code reviewer dropped) is
-      `--regime trial`.
+      from the unit's `review trial:` checkpoint line. A phase whose broad
+      review ran the `craft` lens is `--regime trial`.
     - then run `review_regime.py watch` (user decision 2026-10-04: watch 12
       phases without the code reviewer). The first time it exits 3, run
       `report --since 2026-09-28`, push at once
       (`~/.claude/scripts/notify/pushover.py --priority 1 "Hana: review watch" "<one line; the table is in this session>"`),
-      log it, and give the user the table. While it exits 3, every dailies
-      pushes again and its `Review watch` topic needs the user. Run
-      `review_regime.py ack` only on the user's own acknowledgment.
+      log it, and give the user the table. While it exits 3, the dailies
+      `Review watch` topic needs the user, and every build report (`/builds`,
+      every 4 hours) carries it and pushes again. Run `review_regime.py ack`
+      only on the user's own acknowledgment.
 </MergeCheckpoint>
 
 ---
