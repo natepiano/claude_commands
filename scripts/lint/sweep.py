@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 """Keep a cargo project's target directory under a size budget.
 
-cargo-port runs `lint sweep` last in every per-project lint run, and
-`invoke.sh` hands the call here. When the target directory is over budget,
-this removes the least recently used build output until it fits:
+invoke.sh's run() starts `lint sweep` in the background after every build
+step, at most once every 5 minutes per working directory, and cargo-port runs
+it last in every per-project lint run; `invoke.sh` hands the call here. When
+the target directory is over budget, this removes the least recently used
+build output until it fits:
 
     build unit        every entry under a build tree's .fingerprint/, build/,
                       deps/ and examples/ that carries one unit's 16-hex-digit
@@ -48,6 +50,18 @@ but sweeping that target to 48 GiB made the next cycle rebuild nearly every
 workspace unit. 96 covers that working set with room for feature and profile
 variants. The 24 GiB default covers the other projects' whole targets
 (cargo-liner 12 GiB, nateroids 11 GiB on 2026-10-02) twice over.
+
+The disk floor. Each budget fits the disk; together they do not (hana 96 GiB
+in each of 9 worktrees, 24 in 7 other repos, CI 160 x 2), and natedev's disk
+filled on 2026-10-03. So when lint.conf sets sweep_free_floor_gib.<host>, or
+sweep_free_floor_gib, and the disk holding the home has less free than that,
+every sweep also removes the least recently used build output across every
+cargo target directory (one holding .rustc_info.json) under FLOOR_ROOTS that
+no build holds, until the floor is free again: an idle worktree's output goes
+before a busy one's. One sweep holds the floor at a time, and it keeps every
+idle target's cargo locks while it scans, so a build starting there waits. --floor-only skips the working
+directory's own sweep, as disk-floor.nix's 2-minute timer runs it. CI's
+targets are not under FLOOR_ROOTS, and its accounts cannot read lint.conf.
 
 The doc index. rustdoc rewrites doc/search.index, doc/trait.impl and
 doc/type.impl when a crate finishes, and its peak memory tracks what those
@@ -103,9 +117,11 @@ import json
 import math
 import os
 import shutil
+import socket
 import subprocess
 import sys
 import time
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Literal, TypedDict, cast
@@ -140,6 +156,19 @@ DEP_INFO_SUFFIX = ".d"
 DEP_INFO_HEAD = 4096
 # target/debug, target/<triple>/debug, target/<custom>/<triple>/debug.
 MAX_TREE_DEPTH = 3
+FLOOR_KEY = "sweep_free_floor_gib"
+FLOOR_ONLY_FLAG = "--floor-only"
+# Every cargo target directory on natedev was under one of these (2026-10-03).
+FLOOR_ROOTS = ("~/rust", "~/.local/state", "/tmp")
+FLOOR_LOCK = os.path.join("~", ".local", "state", "lint-sweep", "floor.lock")
+# A nightly worktree's target is 5 below its root, a scratch crate's under
+# /tmp/claude-<uid>/<project>/<session>/scratchpad/ up to 7.
+FLOOR_SEARCH_DEPTH = 8
+FLOOR_SKIP = frozenset({".git", "node_modules"})
+# cargo writes this at a target directory's root on every build. Not
+# CACHEDIR.TAG: cargo writes that only when it creates the directory itself,
+# and mend's wrapper creates hana worktrees' first.
+RUSTC_INFO = ".rustc_info.json"
 HASH_LENGTH = 16
 HEX_DIGITS = frozenset("0123456789abcdef")
 
@@ -523,9 +552,9 @@ def directory_blocks(directory: str) -> int:
     return total
 
 
-def lock_doc(doc: str) -> int | None:
-    """Take rustdoc's own lock without waiting; None when a doc run holds it."""
-    path = os.path.join(doc, DOC_LOCK_NAME)
+def try_lock(path: str) -> int | None:
+    """An exclusive lock on path, created if missing, without waiting; None when
+    another process holds it."""
     try:
         fd = os.open(path, os.O_RDONLY | os.O_CREAT, 0o600)
     except OSError:
@@ -550,7 +579,8 @@ def prune_doc_index(roots: list[str], budget: int, dry_run: bool) -> int:
             if dry_run:
                 print(f"lint sweep: {doc} index is {mib(index)}, within the {mib(budget)} budget")
             continue
-        held = lock_doc(doc)
+        # rustdoc's own lock.
+        held = try_lock(os.path.join(doc, DOC_LOCK_NAME))
         if held is None:
             print(f"lint sweep: a rustdoc run holds {doc}/{DOC_LOCK_NAME}; doc kept")
             continue
@@ -585,15 +615,32 @@ def when(timestamp: float) -> str:
     return datetime.fromtimestamp(timestamp).strftime("%Y-%m-%d %H:%M")
 
 
-def sweep(roots: list[str], trees: list[str], budget: int, source: str, dry_run: bool) -> int:
+def scan_roots(roots: list[str], trees: list[str]) -> Scan:
     scan = Scan()
     owners = group_roots(trees, scan)
     for root in roots:
         walk(root, None, owners, scan)
+    return scan
+
+
+def sweep(roots: list[str], trees: list[str], budget: int, source: str, dry_run: bool) -> int:
+    scan = scan_roots(roots, trees)
     total = sum(scan.blocks.values())
     label = ", ".join(roots)
     state = "within" if total <= budget else "over"
     print(f"lint sweep: {label} is {gib(total)}, {state} the {gib(budget)} budget ({source})")
+    left, failures = shrink(scan, total, budget, dry_run)
+    if left > budget:
+        print(
+            f"lint sweep: {gib(left)} remains over budget in output this sweep never removes"
+            + " (test-run folders, files it cannot match to a build unit, doc/ under its own budget)"
+        )
+    return 1 if failures else 0
+
+
+def shrink(scan: Scan, total: int, budget: int, dry_run: bool) -> tuple[int, int]:
+    """Remove the orphans, then the least recently used groups until total fits
+    budget, and say what went; returns the size left and the failed removals."""
     verb, result = ("would remove", "would leave") if dry_run else ("removed", "left")
     remaining = dict(scan.links)
     failures = 0
@@ -607,7 +654,7 @@ def sweep(roots: list[str], trees: list[str], budget: int, source: str, dry_run:
             + f" copied-up output whose build unit is gone; {result} {gib(total)}"
         )
     if total <= budget:
-        return 1 if failures else 0
+        return total, failures
     chosen, left = choose(scan, total, budget, remaining)
     failures += 0 if dry_run else remove(chosen)
     if chosen:
@@ -617,12 +664,81 @@ def sweep(roots: list[str], trees: list[str], budget: int, source: str, dry_run:
             + f" ({gib(total - left)}), last used {when(chosen[0].last_used)}"
             + f" to {when(chosen[-1].last_used)}; {result} {gib(left)}"
         )
-    if left > budget:
+    return left, failures
+
+
+def target_dirs(roots: Sequence[str]) -> list[str]:
+    """Every cargo target directory under roots."""
+    found: set[str] = set()
+    for root in roots:
+        frontier = [(os.path.expanduser(root), 0)]
+        while frontier:
+            directory, depth = frontier.pop()
+            if os.path.isfile(os.path.join(directory, RUSTC_INFO)):
+                found.add(os.path.realpath(directory))
+                continue
+            if depth < FLOOR_SEARCH_DEPTH:
+                frontier.extend(
+                    (entry.path, depth + 1)
+                    for entry in listing(directory)
+                    if entry.name not in FLOOR_SKIP and entry.is_dir(follow_symlinks=False)
+                )
+    return sorted(found)
+
+
+def free_bytes(path: str) -> int:
+    stat = os.statvfs(path)
+    return stat.f_bavail * stat.f_frsize
+
+
+def floor_bytes(values: dict[str, str], host: str) -> tuple[int | None, str | None]:
+    """The free-space floor and the key it came from: (None, None) when none is
+    set, (None, key) when its value is malformed."""
+    for key in (f"{FLOOR_KEY}.{host}", FLOOR_KEY):
+        if values.get(key):
+            return size_bytes(values[key], GIB), key
+    return None, None
+
+
+def hold_floor(floor: int, dry_run: bool, roots: Sequence[str] = FLOOR_ROOTS, lock: str = FLOOR_LOCK) -> int:
+    """Below floor bytes free, remove the least recently used build output across
+    every target directory no build holds until floor is free again."""
+    home = os.path.expanduser("~")
+    free = free_bytes(home)
+    if free >= floor:
+        return 0
+    lock_path = os.path.expanduser(lock)
+    os.makedirs(os.path.dirname(lock_path), exist_ok=True)
+    guard = try_lock(lock_path)
+    if guard is None:
+        print(f"lint sweep: {gib(free)} free, under the {gib(floor)} floor; another sweep is holding it")
+        return 0
+    held: list[int] = []
+    try:
+        idle: list[str] = []
+        trees: list[str] = []
+        busy = 0
+        for root in target_dirs(roots):
+            root_trees = build_trees(root)
+            root_held, blocked = lock_trees(root_trees)
+            if blocked is not None:
+                busy += 1
+                continue
+            held.extend(root_held)
+            idle.append(root)
+            trees.extend(root_trees)
+        scan = scan_roots(idle, trees)
+        total = sum(scan.blocks.values())
         print(
-            f"lint sweep: {gib(left)} remains over budget in output this sweep never removes"
-            + " (test-run folders, files it cannot match to a build unit, doc/ under its own budget)"
+            f"lint sweep: {gib(free)} free, under the {gib(floor)} floor; choosing from {len(idle)}"
+            + f" target dirs ({gib(total)}), {busy} left alone while a build holds them"
         )
-    return 1 if failures else 0
+        _, failures = shrink(scan, total, total - (floor - free), dry_run)
+        print(f"lint sweep: {gib(free_bytes(home))} free")
+        return 1 if failures else 0
+    finally:
+        release(held)
+        os.close(guard)
 
 
 def size_bytes(raw: str, unit: int) -> int | None:
@@ -707,11 +823,14 @@ def doc_index_bytes() -> int | None:
 
 def main(argv: list[str]) -> int:
     dry_run = False
+    floor_only = False
     target_dir: str | None = None
     args = iter(argv)
     for arg in args:
         if arg == "--dry-run":
             dry_run = True
+        elif arg == FLOOR_ONLY_FLAG:
+            floor_only = True
         elif arg == TARGET_DIR_FLAG:
             target_dir = next(args, None)
             if target_dir is None:
@@ -721,6 +840,18 @@ def main(argv: list[str]) -> int:
             print(f"lint sweep: unknown argument {arg}", file=sys.stderr)
             return 2
     config = os.path.expanduser(os.environ.get(CONFIG_ENV) or DEFAULT_CONFIG)
+    floor, floor_key = floor_bytes(config_values(config), socket.gethostname())
+    if floor is None and floor_key is not None:
+        print(f"lint sweep: {floor_key} in {config} must be a non-negative number of GiB", file=sys.stderr)
+        return 2
+    status = 0 if floor_only else sweep_workspace(target_dir, config, dry_run)
+    if floor is not None:
+        status = hold_floor(floor, dry_run) or status
+    return status
+
+
+def sweep_workspace(target_dir: str | None, config: str, dry_run: bool) -> int:
+    """Sweep target_dir, or the working directory's workspace, to its budget."""
     budget, source = budget_bytes(dict(os.environ), config, repo_name(os.getcwd()))
     if budget is None:
         print(f"lint sweep: {source} must be a non-negative number of GiB", file=sys.stderr)

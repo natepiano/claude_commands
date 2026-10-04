@@ -158,9 +158,11 @@ run() {
         tty_status=$?
         set -e
         buildlog_end "$tty_status" "" 1 "$@" || true
+        sweep_after_step "$@" || true
         return $tty_status
     fi
-    local log="${TMPDIR:-/tmp}/lint_invoke.$$.log"
+    # $RANDOM too: a background sweep's run() shares this shell's $$.
+    local log="${TMPDIR:-/tmp}/lint_invoke.$$.$RANDOM.log"
     local status=0
     # tee keeps output streaming: heartbeat_watch.sh digests the agent log to
     # prove a delegate is alive, so buffering a long build looks like a hang.
@@ -190,7 +192,30 @@ EOF
     fi
     buildlog_end "$status" "$log" 0 "$@" || true
     rm -f "$log"
+    sweep_after_step "$@" || true
     return $status
+}
+
+# Every step, failed or not, leaves its workspace's target swept (sweep.py,
+# which also holds natedev's disk floor). The sweep runs in the background, so
+# no step waits for it, at most once every SWEEP_EVERY_S per working directory:
+# it takes cargo's locks while it scans, a few seconds, and a build starting
+# then waits for it.
+SWEEP_EVERY_S=300
+
+sweep_after_step() {
+    local arg now last=0 dir stamp
+    for arg in "$@"; do
+        [[ "$arg" == */sweep.py ]] && return 0
+    done
+    dir="${XDG_RUNTIME_DIR:-${TMPDIR:-/tmp}}/lint-sweep"
+    stamp="$dir/${PWD//\//%}"
+    now="${EPOCHSECONDS:-$(date +%s)}"
+    [[ -r "$stamp" ]] && read -r last < "$stamp"
+    [[ "$last" =~ ^[0-9]+$ ]] || last=0
+    (( now - last >= SWEEP_EVERY_S )) || return 0
+    mkdir -p "$dir" && printf '%s\n' "$now" > "$stamp" || return 0
+    ( trap '' HUP; invoke_sweep </dev/null >/dev/null 2>&1 & )
 }
 
 have_nextest() {

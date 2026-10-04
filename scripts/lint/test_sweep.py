@@ -4,9 +4,11 @@ go with a build unit, which are orphans, and which stay."""
 
 from __future__ import annotations
 
+import fcntl
 import io
 import os
 import shutil
+import socket
 import subprocess
 import tempfile
 import time
@@ -239,7 +241,8 @@ class TargetDirTests(SweepCase):
     def test_sweeps_the_named_directory_without_a_workspace(self) -> None:
         target = self.target()
         output = io.StringIO()
-        with mock.patch.dict(os.environ, {sweep.BUDGET_ENV: "1024"}), redirect_stdout(output):
+        environ = {sweep.BUDGET_ENV: "1024", sweep.CONFIG_ENV: "/nonexistent/lint.conf"}
+        with mock.patch.dict(os.environ, environ), redirect_stdout(output):
             status = sweep.main([sweep.TARGET_DIR_FLAG, str(target.root), "--dry-run"])
         self.assertEqual(status, 0)
         self.assertIn(f"lint sweep: {target.root} is ", output.getvalue())
@@ -248,6 +251,95 @@ class TargetDirTests(SweepCase):
     def test_flag_without_a_directory_is_an_error(self) -> None:
         with redirect_stderr(io.StringIO()):
             self.assertEqual(sweep.main([sweep.TARGET_DIR_FLAG]), 2)
+
+
+def cargo_target(base: Path, name: str, digest: str, used: float) -> tuple[Path, Path]:
+    """A target directory with one unit last used at used: (its build tree, the unit's file)."""
+    root = base / name / "target"
+    tree = root / "debug"
+    output = unit(tree, "deps", name, digest, used)
+    _ = (root / sweep.RUSTC_INFO).write_text("{}")
+    return tree, output
+
+
+class FloorTests(SweepCase):
+    def base(self) -> Path:
+        return Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
+
+    def hold(self, base: Path, floor: int, free: list[int]) -> tuple[int, str]:
+        output = io.StringIO()
+        with mock.patch.object(sweep, "free_bytes", side_effect=free), redirect_stdout(output):
+            status = sweep.hold_floor(floor, False, [str(base)], str(base / "floor.lock"))
+        return status, output.getvalue()
+
+    def test_host_key_then_default_key(self) -> None:
+        values = {"sweep_free_floor_gib.natedev": "500", "sweep_free_floor_gib": "50", "sweep_free_floor_gib.mac": "x"}
+        self.assertEqual(sweep.floor_bytes(values, "natedev"), (500 * GIB, "sweep_free_floor_gib.natedev"))
+        self.assertEqual(sweep.floor_bytes(values, "other"), (50 * GIB, "sweep_free_floor_gib"))
+        self.assertEqual(sweep.floor_bytes(values, "mac"), (None, "sweep_free_floor_gib.mac"))
+        self.assertEqual(sweep.floor_bytes({}, "natedev"), (None, None))
+
+    def test_finds_cargo_targets_and_nothing_inside_them(self) -> None:
+        base = self.base()
+        _ = cargo_target(base, "repo", APP, time.time())
+        _ = cargo_target(base / "repo" / "target", "nested", DEMO, time.time())
+        _ = cargo_target(base / ".git", "hidden", TOOL, time.time())
+        _ = write(base / "uv" / "CACHEDIR.TAG")
+        self.assertEqual(sweep.target_dirs([str(base)]), [str(base / "repo" / "target")])
+
+    def test_below_the_floor_the_least_recently_used_unit_of_any_target_goes(self) -> None:
+        base = self.base()
+        now = time.time()
+        _, idle = cargo_target(base, "idle", APP, now - 5 * DAY)
+        _, busy = cargo_target(base, "busy", DEMO, now)
+        status, output = self.hold(base, 10 * GIB, [10 * GIB - SIZE, 10 * GIB])
+        self.assertEqual(status, 0)
+        self.assertFalse(idle.exists())
+        self.assertTrue(busy.exists())
+        self.assertIn("removed 1 build units", output)
+
+    def test_a_target_a_build_holds_is_left_alone(self) -> None:
+        base = self.base()
+        tree, held = cargo_target(base, "held", APP, time.time() - 5 * DAY)
+        lock = os.open(tree / sweep.LOCK_NAMES[0], os.O_RDONLY | os.O_CREAT)
+        self.addCleanup(os.close, lock)
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        _, other = cargo_target(base, "other", DEMO, time.time())
+        _, output = self.hold(base, 10 * GIB, [10 * GIB - SIZE, 10 * GIB])
+        self.assertTrue(held.exists())
+        self.assertFalse(other.exists())
+        self.assertIn("1 left alone while a build holds them", output)
+
+    def test_at_the_floor_or_while_another_sweep_holds_it_nothing_goes(self) -> None:
+        base = self.base()
+        _, output_file = cargo_target(base, "repo", APP, time.time() - 5 * DAY)
+        self.assertEqual(self.hold(base, 10 * GIB, [10 * GIB]), (0, ""))
+        guard = sweep.try_lock(str(base / "floor.lock"))
+        assert guard is not None
+        self.addCleanup(os.close, guard)
+        status, output = self.hold(base, 10 * GIB, [GIB])
+        self.assertEqual(status, 0)
+        self.assertIn("another sweep is holding it", output)
+        self.assertTrue(output_file.exists())
+
+    def test_floor_only_skips_the_workspace_and_holds_the_configured_floor(self) -> None:
+        config = self.base() / "lint.conf"
+        _ = config.write_text("sweep_free_floor_gib.testhost=7\n")
+        with (
+            mock.patch.dict(os.environ, {sweep.CONFIG_ENV: str(config)}),
+            mock.patch.object(socket, "gethostname", return_value="testhost"),
+            mock.patch.object(sweep, "sweep_workspace") as workspace,
+            mock.patch.object(sweep, "hold_floor", return_value=0) as floor,
+        ):
+            self.assertEqual(sweep.main([sweep.FLOOR_ONLY_FLAG]), 0)
+        workspace.assert_not_called()
+        floor.assert_called_once_with(7 * GIB, False)
+
+    def test_malformed_floor_is_an_error(self) -> None:
+        config = self.base() / "lint.conf"
+        _ = config.write_text("sweep_free_floor_gib=lots\n")
+        with mock.patch.dict(os.environ, {sweep.CONFIG_ENV: str(config)}), redirect_stderr(io.StringIO()):
+            self.assertEqual(sweep.main([sweep.FLOOR_ONLY_FLAG]), 2)
 
 
 CONFIG = """\
