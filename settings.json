@@ -53,6 +53,7 @@
       "Bash(~/.claude/scripts/berth_fix/*)",
       "Bash(zsh ~/.claude/scripts/production/showrunner_timer.sh *)",
       "Bash(bash ~/.claude/scripts/delegate/verify.sh *)",
+      "Bash(bash ~/.claude/scripts/delegate/progress_timer.sh *)",
       "Bash(cat *)",
       "Bash(head *)",
       "Bash(tail *)",
