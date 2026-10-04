@@ -69,6 +69,12 @@
 #                                          (workspace lib + bins + tests built)
 #   verify.sh test <package> <int_test>    one named integration test target,
 #                                          for re-running it alone
+#   verify.sh test <package> --filter <name>
+#                                          only the package's tests whose name
+#                                          contains <name>, while iterating;
+#                                          never a gate: its pass is recorded
+#                                          under its own words, so it never
+#                                          answers `test <package>`
 #   verify.sh lint <package>               mend --fix, nightly fmt of the package
 #                                          and the members that differ from HEAD,
 #                                          workspace clippy (warnings denied), then
@@ -91,6 +97,9 @@
 #                                          test one example (only when the
 #                                          example contains unit tests)
 #   verify.sh final                        full workspace gate (unit director only)
+#   verify.sh --session-dir <dir> …        any of the above inside a delegate
+#                                          session; same as setting
+#                                          PLAN_DELEGATE_SESSION_DIR=<dir>
 #
 # Invocation policy — canonical flags, lint.conf gating, sandbox-failure
 # detection — lives in scripts/lint/invoke.sh, the
@@ -290,6 +299,13 @@ take_features() {
         exit 2
     fi
 }
+
+# A flag, not an env prefix, so a call stays one plain command that the
+# settings.json allow rule matches.
+if [[ "${1:-}" == "--session-dir" ]]; then
+    export PLAN_DELEGATE_SESSION_DIR="${2:?verify.sh --session-dir <dir> <command> ...}"
+    shift 2
+fi
 
 CMD="${1:-}"
 if [[ -z "$CMD" ]]; then
@@ -576,18 +592,34 @@ case "$CMD" in
         PKG="${1:?verify.sh test <package> [integration_test]}"
         shift
         TARGET=""
-        if [[ $# -gt 0 && "$1" != "--features" ]]; then
+        FILTER=""
+        if [[ $# -gt 0 && "$1" != --* ]]; then
             TARGET="$1"
             shift
         fi
-        take_features "$@"
+        # --filter and --features in either order; a target takes no filter.
+        REST=()
+        while [[ $# -gt 0 ]]; do
+            if [[ "$1" == "--filter" && -z "$TARGET" && -z "$FILTER" \
+                  && "${2:-}" =~ ^[A-Za-z0-9_:]+$ ]]; then
+                FILTER="$2"
+                shift 2
+            else
+                REST+=("$1")
+                shift
+            fi
+        done
+        take_features ${REST[@]+"${REST[@]}"}
         require_member "$PKG"
         # --no-fail-fast: nextest cancels every remaining test after the first
         # failure, so one broken test silently hides the rest of the suite. A
         # phase gate has to report the whole result, not the first stop.
         # The build covers the workspace (see the header); -E runs only this
         # package's tests.
-        if [[ -n "$TARGET" ]]; then
+        if [[ -n "$FILTER" ]]; then
+            run_nextest --no-fail-fast --workspace --lib --bins --tests \
+                -E "package($PKG) & test($FILTER)" "${FEATURE_FLAGS[@]}"
+        elif [[ -n "$TARGET" ]]; then
             # Integration test target names are unique across the workspace,
             # so --test builds just that binary, under the workspace's
             # feature resolution.
