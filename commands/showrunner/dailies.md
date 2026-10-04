@@ -203,8 +203,9 @@ names another plan's document. User, 2026-10-02.
   on the axis line. A follow-up row has none. User, 2026-10-03.
   The `ascii` chart draws the same rows with characters a code font has,
   because the desktop app draws emoji wider than two columns: `──` while the
-  phase runs, `┼─` at the earliest time, `●` at the ETA, `·` dots to `┤` at
-  the latest, and no `(earliest–latest)` text, so the row fits. User, 2026-10-03.
+  phase runs, a heavy `━━` from the earliest time to the latest, `●` at the
+  ETA, and no `(earliest–latest)` text, so the row fits. User, 2026-10-03.
+  Only glyphs the app's Anthropic Mono has: it lacks `┼` and `┤`.
 - **Footer:** the reply footer (`/showrunner:produce` → Footer), from
   `next_run`, `build_hold` and whether any subject has `needed:`. The
   report replaces the turn's `— waiting on:` line.
