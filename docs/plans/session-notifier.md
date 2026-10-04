@@ -118,55 +118,28 @@
 - GNU `timeout` for the check — absent on the Mac.
 - A systemd timer per instance — one 15 s job ticks every instance.
 
-### Phase 2 — Unit plumbing  · status: todo
+### Phase 2 — Unit plumbing  · status: done
 
-#### Work Order
+#### As-built
 
-**Goal:** a unit's notifier instance can be made, gated, restarted by every report and removed, with no live run changed yet: nothing creates a `delegate-*` instance until Phase 3 wires `prepare_session.sh`.
-
-**Spec:**
-
-*`scripts/hooks/delegate_run.py`:*
-- `ACTIVE_DIR` reads `PLAN_DELEGATE_ACTIVE_DIR` from the environment, default `/tmp/claude/delegate/active` (`:20`).
-- Add `running_work(session_dir: Path) -> str | None`, the logic of `stop-delegate-progress-timer.py:62-86` with one fix: implementing work is any `impl_status` or `impl_status_*` file reading `implementing` (launchers write `impl_status_<role>`, `implement.sh:112,148`). It returns a short label of the running work, or `None`. The Stop hook keeps its own copy and is not edited (the showrunner removes it after Phase 3).
-- Add `check(claude_session_id: str, session_dir: Path) -> int`: `2` when the marker `marker_path(claude_session_id)` is missing or does not hold `str(session_dir)` (the run ended or a new run replaced it); else `0` when `running_work(session_dir)` finds work; else `1`. A stale run (no activity for `MAX_AGE_SECONDS`) is not removed: its marker still matches, it has no running work, and it exits 1, so a unit parked overnight on the user keeps its instance.
-- Add a CLI under `if __name__ == "__main__":` — `delegate_run.py check <claude_session_id> <session_dir>` exits with `check()`'s code; a usage error exits 3 (the notifier logs it as a skip and keeps the instance; exit 2 would remove it).
-
-*`scripts/delegate/unit_notifier.sh <claude_session_id>`* (zsh, new, executable): makes or retargets the unit's instance.
-- Reads the marker `${PLAN_DELEGATE_ACTIVE_DIR:-/tmp/claude/delegate/active}/<claude_session_id>` → `SESSION_DIR`; no marker → message on stderr, exit 1. `run_id = ${SESSION_DIR:t}`.
-- Interval: `PLAN_DELEGATE_PROGRESS_INTERVAL_SECONDS` from `${PLAN_DELEGATE_CONFIG:-$HOME/.claude/config/delegate.conf}`, read with a zsh `KEY=VALUE` loop; minutes = seconds / 60 rounded up, at least 1; key missing → 15.
-- Runs `zsh <repo>/scripts/message/notifier.sh new delegate-<run_id> --to session:<claude_session_id> --every <min> --command '/unit:delegate_report' --check "<repo>/scripts/lib/py <repo>/scripts/hooks/delegate_run.py check <claude_session_id> <SESSION_DIR>" --hold`, repo = `${SCRIPT:h:h:h}` (absolute paths: the job's PATH is fixed), and passes its output and exit code through.
-
-*`scripts/delegate/end_session.sh`:* before `rm -f "${MARKER}"` (`:50`), `zsh "<repo>/scripts/message/notifier.sh" remove "delegate-$(basename "${SESSION_DIR}")" >/dev/null 2>&1 || true`, repo derived from the script's own path as the file already does for `PY` (`:24-27`).
-
-*`scripts/delegate/progress_history.py`:*
-- In `_progress`, after the "No open window" exit (`:3552-3572`) and before `next_report_at` (`:3692`), run `zsh <repo>/scripts/message/notifier.sh restart delegate-<run_id>` (`run_id = session_dir.name`, zsh from `shutil.which`, timeout 10 s, output captured, never raising). When `PLAN_DELEGATE_NOW_EPOCH` is set, pass it to the child as `NOTIFIER_NOW_EPOCH`. Parse `^next_due=(\d+)` from its stdout; any failure (no zsh, no instance, exit ≠ 0, no match) gives `None`.
-- `_next_report_at()` (`:1914-1939`) takes that value first; then the `progress_timer` marker (`:1923-1937`, kept for runs started before the cutover); then the interval (`:1938-1939`).
+- `scripts/hooks/delegate_run.py`: `ACTIVE_DIR` reads `PLAN_DELEGATE_ACTIVE_DIR` (default `/tmp/claude/delegate/active`). `running_work(session_dir: Path) -> str | None` labels work in flight: an `impl_status` or `impl_status_*` file reading `implementing`, a `review_status*` file reading `reviewing`, or a `progress_history_state.json` activity with status `active`; otherwise `None`. `check(claude_session_id: str, session_dir: Path) -> int` returns 2 when the marker is missing or names another dir, 0 with running work, 1 when idle. CLI `delegate_run.py check <claude_session_id> <session_dir>` exits with that code; a usage error exits 3.
+- `scripts/delegate/unit_notifier.sh <claude_session_id>` (zsh) reads the marker into `SESSION_DIR`, takes `run_id = ${SESSION_DIR:t}` and repo `${SCRIPT:h:h:h}`, then `exec`s `notifier.sh new delegate-<run_id> --to session:<id> --every <min> --command /unit:delegate_report --check "<repo>/scripts/lib/py <repo>/scripts/hooks/delegate_run.py check <id> <SESSION_DIR>" --hold`. It exits 1 on a missing or empty marker, 2 on a usage error, and otherwise with `notifier.sh`'s code.
+- `scripts/delegate/end_session.sh` runs `notifier.sh remove delegate-<run id>` (path relative to the script, errors ignored) before it removes the marker.
+- `scripts/delegate/progress_history.py`: `_restart_unit_notifier(session_dir: Path) -> int | None` runs `zsh notifier.sh restart delegate-<run id>` on every `progress` call (10 s timeout, `PLAN_DELEGATE_NOW_EPOCH` copied to `NOTIFIER_NOW_EPOCH`) and parses `^next_due=(\d+)`; any failure gives `None`. `_next_report_at(session_dir, now, notifier_due)` prefers that value, then the `progress_timer` marker, then the interval.
 
 **Files:**
-- `scripts/hooks/delegate_run.py` — `PLAN_DELEGATE_ACTIVE_DIR`, `running_work()`, `check()`, CLI.
-- `scripts/delegate/unit_notifier.sh` — new: the unit's instance.
-- `scripts/delegate/end_session.sh` — removes the instance.
-- `scripts/delegate/progress_history.py` — restart on every report; next report from `next_due`.
-- `scripts/delegate/test_delegate_check.py` — new: `delegate_run.py check` and `unit_notifier.sh` through subprocess.
-- `scripts/delegate/test_progress_history.py` — a clock test for the notifier path.
+- `scripts/hooks/delegate_run.py` — the `ACTIVE_DIR` override, `running_work()`, `check()`, the `check` CLI.
+- `scripts/delegate/unit_notifier.sh` — makes or retargets the unit's instance.
+- `scripts/delegate/end_session.sh` — removes the instance at run end.
+- `scripts/delegate/progress_history.py` — restarts the instance on each report; clock line from `next_due`.
+- `scripts/delegate/test_delegate_check.py` — `check` exit codes and the `unit_notifier.sh` conf, by subprocess.
+- `scripts/delegate/test_progress_history.py` — `test_the_clock_line_uses_the_restarted_unit_notifier`; helper `run_unowned_command` clears an ambient `PLAN_DELEGATE_TEAM_ROLE`.
 
-**Seats:** `1 writer + 1 tester` — the code is one chain (check → instance → restart), so one writer holds it; the tests drive CLIs by subprocess from the Spec.
-- `impl` — `scripts/hooks/delegate_run.py`, `scripts/delegate/unit_notifier.sh`, `scripts/delegate/end_session.sh`, `scripts/delegate/progress_history.py`.
-- `test` — `scripts/delegate/test_delegate_check.py`: with `PLAN_DELEGATE_ACTIVE_DIR` and a temp session dir, `check` exits 2 with no marker and with a marker naming another dir, 1 with no running work, 0 for `impl_status_impl` = `implementing`, a `review_status*` reading `reviewing`, and an active `progress_history_state.json` activity; 3 on a usage error; `unit_notifier.sh` with `NOTIFIER_STATE_DIR` and `PLAN_DELEGATE_CONFIG` temp values writes a conf with `TARGET=session:<id>`, `EVERY=<rounded minutes>`, `COMMAND=/unit:delegate_report`, `HOLD=1` and a `CHECK` naming `delegate_run.py check <id> <dir>`, and exits 1 with no marker. `scripts/delegate/test_progress_history.py`: beside `:642-682`, an instance made by `notifier.sh new delegate-<run id> … --every 15` in a temp `NOTIFIER_STATE_DIR`, then `progress` at `PLAN_DELEGATE_NOW_EPOCH`: the clock line names minute start + 15 min and the instance's `LAST_RESTART` equals the clock; the existing marker and interval cases still pass.
+**Binds later work:** `unit_notifier.sh <claude_session_id>` writes a conf with `TARGET=session:<id>`, `EVERY=<minutes>`, `COMMAND=/unit:delegate_report`, `HOLD=1` and a `CHECK` naming `delegate_run.py check <id> <dir>`; it exits 1 with no marker and 2 on a usage error. `check` exits 0 with running work, 1 idle (the tick skips), 2 when the run ended or a new run replaced it (the tick removes the instance), 3 on a usage error (the tick skips). `end_session.sh` removes `delegate-<run id>`, and `notifier.sh remove` inherits its environment, so `NOTIFIER_STATE_DIR` sandboxes it. Each `progress` call restarts the instance, and the report's clock line names the instance's `next_due`; with no instance it falls back to the `progress_timer` marker, then the interval. Interval: the leading digits of `PLAN_DELEGATE_PROGRESS_INTERVAL_SECONDS` in `${PLAN_DELEGATE_CONFIG:-$HOME/.claude/config/delegate.conf}`, so a trailing `# comment` keeps the value; an unreadable file or missing key gives 900 s; minutes round up, at least 1. `PLAN_DELEGATE_ACTIVE_DIR` is a test override honoured only by `delegate_run.py` and `unit_notifier.sh`; `prepare_session.sh` and `end_session.sh` use the fixed `/tmp/claude/delegate/active`, so a live caller must leave it unset or pointed where the marker is written.
 
-**Constraints from prior phases:**
-- Phase 1 built `scripts/message/notifier.sh` with the CLI, files, environment variables and exit codes in its Spec: `new` keeps an existing `state`; `restart` prints exactly one line `next_due=<epoch> (<local time>)`; `remove` exits 0 when the instance is gone; a check's exit 2 removes the instance, any other nonzero skips.
-- `NOTIFIER_STATE_DIR`, `NOTIFIER_NOW_EPOCH` and `NOTIFIER_SEND` sandbox it for tests; the declared job reads only the default state dir, so test instances never tick.
-- The check runs in the background under a watchdog bounded by the instance's `TIMEOUT` (default 120 s); a check still running then is killed and logged `skip check timeout`, so `delegate_run.py check` must stay a quick file read. `new` refuses an empty `--command` or `--prompt-file` (exit 2).
-- `basedpyright` exits 3 in this checkout because `pyrightconfig.json` names a `.venv` that does not exist; the gate is its `0 errors, 0 warnings, 0 notes` line, not its exit code.
+**Gotchas:** every `CHECK` word is `(q)`-quoted, so a repo path with spaces survives `notifier.sh`'s `(Q)(z)` split. `progress` spawns one zsh per call even for a run with no instance. `check` runs under the notifier's check watchdog (instance `TIMEOUT`, default 120 s) and stays a quick file read. `stop-delegate-progress-timer.py` keeps its own copy of the running-work logic, without the `impl_status_*` match. Tests that run `progress_history.py` commands must clear an ambient `PLAN_DELEGATE_TEAM_ROLE`, or they fail when the suite runs under a team role.
 
-**Acceptance gate:**
-1. `basedpyright scripts/hooks/delegate_run.py scripts/delegate/progress_history.py scripts/delegate/test_progress_history.py scripts/delegate/test_delegate_check.py` — 0 errors, 0 warnings, 0 notes.
-2. `scripts/lib/py -m unittest scripts.delegate.test_progress_history scripts.delegate.test_delegate_check` green.
-3. `zsh -n scripts/delegate/unit_notifier.sh && bash -n scripts/delegate/end_session.sh`.
-4. Live, by the unit director while a seat runs: `scripts/lib/py scripts/hooks/delegate_run.py check "$CLAUDE_CODE_SESSION_ID" <this run's SESSION_DIR>; echo $?` prints `0`, and with `/tmp/claude/delegate/none` as the dir prints `2`.
-5. `ls ~/.local/state/notifier` lists no `delegate-*` instance.
+**Ruled out:** honouring `PLAN_DELEGATE_ACTIVE_DIR` in `end_session.sh`, since `prepare_session.sh` never writes a marker there; removing a stale run's instance in `check`, since a unit parked overnight on the user keeps its instance (matching marker, no running work, exit 1).
 
 ### Phase 3 — Units on the notifier  · status: todo
 
@@ -216,7 +189,8 @@
 
 **Constraints from prior phases:**
 - Phase 1: `notifier.sh` (`new`, `start`, `stop`, `status`, `interval`, `health`, `remove`; `restart` prints `next_due=<epoch> (<local time>)`; `health` exits 1 with `failing: <reason>`); `sessions.py id <pid|name>` prints a live record's session id; the declared `nate.jobs.session-notifier` ticks every 15 s once the user has rebuilt; the showrunner's instance is `showrunner-<slug>` and `commands/showrunner/*` no longer name `showrunner_timer.sh`. A check past the instance's `TIMEOUT` is killed and logged `skip check timeout`. `basedpyright` exits 3 here over a missing `.venv`; its `0 errors, 0 warnings, 0 notes` line is the gate.
-- Phase 2: `scripts/delegate/unit_notifier.sh <claude_session_id>` makes or retargets `delegate-<run id>` (`--every` from `delegate.conf`, `--command '/unit:delegate_report'`, `--hold`, check `delegate_run.py check <id> <dir>`), exit 1 with no marker. `delegate_run.py check` exits 0 running work, 1 none, 2 run over, 3 usage. `end_session.sh` already removes the instance. `progress_history.py progress` restarts the instance and reads the next report from its `next_due`.
+- Phase 2: `scripts/delegate/unit_notifier.sh <claude_session_id>` makes or retargets `delegate-<run id>` (`--every` from `delegate.conf`, `--command '/unit:delegate_report'`, `--hold`, check `delegate_run.py check <id> <dir>`), exit 1 with no marker. `delegate_run.py check` exits 0 running work, 1 none, 2 run over, 3 usage. `end_session.sh` already removes the instance, calling `notifier.sh remove` with the environment it was given, so `NOTIFIER_STATE_DIR` reaches it. `progress_history.py progress` restarts the instance and reads the next report from its `next_due`; with no instance it falls back to the `progress_timer` marker, then the interval. `unit_notifier.sh` reads the interval as the leading digits of `PLAN_DELEGATE_PROGRESS_INTERVAL_SECONDS` (a trailing comment is ignored; missing key or unreadable config gives 900 s) and exits 2 on a usage error. `PLAN_DELEGATE_ACTIVE_DIR` is honoured only by `delegate_run.py` and `unit_notifier.sh`, for tests; `prepare_session.sh` and `end_session.sh` use the fixed `/tmp/claude/delegate/active`, so `prepare_session.sh` must not run `unit_notifier.sh` with that variable set elsewhere. `test_progress_history.py`'s `run_unowned_command` clears an ambient `PLAN_DELEGATE_TEAM_ROLE`, so the suite passes when a seat runs it.
+- `commands/unit/delegate.md` line refs in the Spec were read before the showrunner's test-cadence edit (~`:370`) landed; locate each edit by its section tag (`<ProgressContract>`, `<DispatchContract>`, `<CompactionContract>`, `<EarlyReviewArm>`, `<DelegationResultFormat>`, `<UXReview>`, `<PhaseCleanup>`, `<PrepareSession>`) and re-read the file before editing.
 
 **Acceptance gate:**
 1. Sandbox: `id=$(uuidgen | tr A-Z a-z); st=$(mktemp -d); CLAUDE_CODE_SESSION_ID=$id NOTIFIER_STATE_DIR=$st bash scripts/delegate/prepare_session.sh` leaves `$st/delegate-<run id>/conf` with `TARGET=session:$id`, `EVERY=15`, `COMMAND=/unit:delegate_report`, `HOLD=1` and a `CHECK` naming `delegate_run.py check $id`; then `CLAUDE_CODE_SESSION_ID=$id NOTIFIER_STATE_DIR=$st bash scripts/delegate/end_session.sh` removes that instance and `/tmp/claude/delegate/active/$id`.

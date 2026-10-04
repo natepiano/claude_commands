@@ -9,6 +9,7 @@ import hashlib
 import json
 import os
 import re
+import shutil
 import statistics
 import subprocess
 import tempfile
@@ -1911,15 +1912,44 @@ def _eta_seconds(percent: int, elapsed: int) -> int | None:
     return int(elapsed * (100 - percent) / percent)
 
 
-def _next_report_at(session_dir: Path, now: float) -> float | None:
+def _restart_unit_notifier(session_dir: Path) -> int | None:
+    """Restart an existing unit instance and return its next due epoch."""
+    zsh = shutil.which("zsh")
+    if zsh is None:
+        return None
+    notifier = Path(__file__).resolve().parents[1] / "message" / "notifier.sh"
+    environment = os.environ.copy()
+    if configured_now := environment.get("PLAN_DELEGATE_NOW_EPOCH"):
+        environment["NOTIFIER_NOW_EPOCH"] = configured_now
+    try:
+        result = subprocess.run(
+            [zsh, str(notifier), "restart", f"delegate-{session_dir.name}"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+            env=environment,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if result.returncode != 0:
+        return None
+    match = re.search(r"^next_due=(\d+)", result.stdout, re.MULTILINE)
+    return int(match.group(1)) if match is not None else None
+
+
+def _next_report_at(session_dir: Path, now: float, notifier_due: int | None) -> float | None:
     """When the next progress report is due, in epoch seconds.
 
-    progress_timer.sh clears its marker as it ticks, so at the usual reporting
-    moment -- after the tick, before the next timer is armed -- no marker exists
-    and the configured interval supplies the answer. A marker still present and
+    A restarted notifier instance supplies the actual next deadline. For runs
+    without one, progress_timer.sh clears its marker as it ticks, so at the
+    usual reporting moment -- after the tick, before the next timer is armed --
+    no marker exists and the configured interval supplies the answer. A marker still present and
     still ahead of the clock is a timer genuinely armed right now, and that
     deadline beats an interval added to the current time.
     """
+    if notifier_due is not None:
+        return notifier_due
     try:
         marker_text = (session_dir / TIMER_MARKER_FILENAME).read_text(encoding="utf-8")
     except OSError:
@@ -3689,7 +3719,7 @@ def _progress(args: argparse.Namespace) -> None:
     phase_elapsed = max(0, int(now - _number(phase.get("started_at"), now)))
     pass_elapsed = max(0, int(now - _number(current_pass.get("started_at"), now)))
     total_elapsed = max(0, int(now - _number(state.get("project_started_at"), now)))
-    next_report_at = _next_report_at(session_dir, now)
+    next_report_at = _next_report_at(session_dir, now, _restart_unit_notifier(session_dir))
     event = _event(state, "progress_reported", now)
     event.update(
         {

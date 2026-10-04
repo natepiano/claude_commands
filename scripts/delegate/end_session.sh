@@ -47,6 +47,11 @@ if [[ -f "${MARKER}" ]]; then
   if [[ -n "${SESSION_DIR}" && -d "${SESSION_DIR}/verify_cache" ]]; then
     rm -rf -- "${SESSION_DIR}/verify_cache"
   fi
+  if [[ -n "${SESSION_DIR}" ]]; then
+    SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+    zsh "${SCRIPT_DIR}/../message/notifier.sh" remove "delegate-$(basename "${SESSION_DIR}")" \
+      >/dev/null 2>&1 || true
+  fi
   rm -f "${MARKER}"
   echo "Delegate run ended; marker cleared."
 else

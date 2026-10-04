@@ -12,6 +12,7 @@ import unittest
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import cast, override
+from unittest.mock import patch
 
 
 SCRIPT = Path(__file__).with_name("progress_history.py")
@@ -681,6 +682,51 @@ class ProgressHistoryTests(unittest.TestCase):
         self.assertIn("**now 1970-01-01 05:35:00**", unusable)
         self.assertNotIn("next report", unusable)
 
+    def test_the_clock_line_uses_the_restarted_unit_notifier(self) -> None:
+        started_at = 20_000
+        report_at = started_at + 100
+        session_dir = self.start_run("notifier-clock", started_at)
+        self.start_phase_and_pass(session_dir, started_at)
+        state_dir = self.root / "notifier"
+        environment = os.environ.copy()
+        environment["NOTIFIER_STATE_DIR"] = str(state_dir)
+        environment["NOTIFIER_NOW_EPOCH"] = str(started_at)
+        environment["TZ"] = "UTC"
+        _ = subprocess.run(
+            [
+                "zsh",
+                str(SCRIPT.parents[1] / "message" / "notifier.sh"),
+                "new",
+                f"delegate-{session_dir.name}",
+                "--to",
+                "session:test-claude-session",
+                "--every",
+                "15",
+                "--command",
+                "/unit:delegate_report",
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+            env=environment,
+        )
+        # A legacy marker must yield to the live instance's new deadline.
+        _ = (session_dir / "progress_timer").write_text(
+            f"deadline_epoch={started_at + 400}\npid=1234\ninterval_seconds=600\n",
+            encoding="utf-8",
+        )
+        with patch.dict(os.environ, {"NOTIFIER_STATE_DIR": str(state_dir)}):
+            report = self.run_progress(session_dir, at=report_at)
+        self.assertIn("**now 1970-01-01 05:35:00 - next report 05:50:00**", report)
+        state = dict(
+            line.split("=", 1)
+            for line in (state_dir / f"delegate-{session_dir.name}" / "state")
+            .read_text(encoding="utf-8")
+            .splitlines()
+        )
+        self.assertEqual(state["LAST_RESTART"], str(report_at))
+        self.assertEqual(state["NEXT_DUE"], str(report_at + 15 * 60))
+
     def run_progress(self, session_dir: Path, at: int) -> str:
         return self.run_command(
             "progress",
@@ -911,6 +957,10 @@ class ProgressHistoryTests(unittest.TestCase):
         environment["TZ"] = "UTC"
         environment["PLAN_DELEGATE_NOW_EPOCH"] = str(at)
         _ = environment.pop("PLAN_DELEGATE_PASS_OWNER", None)
+        if self.team_slot:
+            environment["PLAN_DELEGATE_TEAM_ROLE"] = self.team_slot
+        else:
+            _ = environment.pop("PLAN_DELEGATE_TEAM_ROLE", None)
         return subprocess.run(
             ["python3", str(SCRIPT), *arguments],
             check=False,
