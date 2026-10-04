@@ -1,5 +1,5 @@
 ---
-description: Walk through decisions one at a time using behavior-first, decision-ready context, one atomic question, a recommendation, relevant pending decisions, and optional working-doc synchronization.
+description: Walk through decisions one at a time using behavior-first, decision-ready context, one atomic question, a recommendation, relevant pending decisions, and a transient decision doc by default.
 ---
 
 Use this when the user has just received a long list — recommendations, findings, options, todos — and wants to review them deliberately one by one instead of responding to the whole wall of text.
@@ -26,25 +26,16 @@ Find the list to review. Look in this order:
 
 If more than one list could be intended, ask which list or section; do not
 combine them. Otherwise, determine the count but do not reply yet. Carry the
-count into the Step 2 question without listing the items.
+count into Step 2 without listing the items.
 
 ## Step 2: Set up where decisions get recorded
 
-Decide whether there is a working doc in this conversation — a file path the user has been editing or named this session.
+By default the review gets a transient doc: a new file at the working repo's root, excluded from git with `bash ~/.claude/scripts/exclude/exclude.sh <path>` (the scratchpad does not survive compaction), headed with today's date and where the items came from. It holds each decision and any action the decision leaves pending, and is deleted in Step 5. Create it without asking, and open the first item with one line: `N items; decisions in <path>, deleted when the review ends.` An item may also be acted on as soon as it is decided; the doc then records that it was done.
 
-Then ask **one** question, picking the form that matches the situation:
+Ask first only when an obvious doc is in scope that the user did not name, a file they have been editing or named this session that the decisions belong in:
+  > `N items. Record decisions in <relative/path/to/doc.md> (recommended)? (yes / transient doc)`
 
-- **A doc is already in scope:** name it.
-  > `N items. Record decisions in <relative/path/to/doc.md> (recommended)? (yes / different path / none)`
-- **No doc is in scope:** say so.
-  > `N items. No working doc in this conversation. Record decisions in a doc? (suggest one (recommended) / path to use / none)`
-
-Wait for the answer before creating a doc or continuing to Step 3.
-
-Rules:
-- Never use the placeholder phrase "existing path" — either name the doc or say there isn't one.
-- If the user gives a path that doesn't exist, create it with a one-line header (today's date + where the items came from).
-- If the user picks `none`, skip the doc-writing step in Step 4 and just summarize at the end.
+Wait for that answer before continuing. Never write "existing path": name the doc. If the user names a path that doesn't exist, create it with the same one-line header.
 
 ## Step 3: Build the todo list
 
@@ -112,7 +103,7 @@ For each item, in order:
    - If the user says they are lost, confused, or asks what the introduced concepts mean, treat that as a failed initial explanation and stop asking for a decision. Apply repair-downward-then-upward from the shared file: **the upward repair here is Step 3.5** — run it now, whether or not it ran earlier. Re-running it mid-walk costs one turn; iterating item detail at ever finer grain costs many and does not terminate.
    - If the user asks a clarifying question, answer it without recording a decision or advancing. Re-present the choices only when useful.
    - If the user proposes a modification, restate only the revised decision, update the recommendation or example as needed, and wait for explicit acknowledgment before recording it.
-8. When they clearly acknowledge a terminal choice (including terse approvals such as `agreed`, `approved`, `okay`, or `continue` when unambiguous), record the decision to the working doc if one is in scope, mark the task `completed`, and move to the next item.
+8. When they clearly acknowledge a terminal choice (including terse approvals such as `agreed`, `approved`, `okay`, or `continue` when unambiguous), record the decision, and any action it leaves pending, in the doc, mark the task `completed`, and move to the next item.
 
 Do not ask "continue or add more?" between items — assume continue unless the user volunteers something.
 
@@ -159,8 +150,8 @@ This is a scaffold, not a demand for headings when a very small item reads more 
 
 When every item is done:
 
-- If a working doc was used: one-line summary — `Wrote decisions for N completed items to <path>`.
-- Otherwise: summarize inline, one line per item — `1. <label> → <decision>`.
+- Transient doc: summarize inline, one line per item — `1. <label> → <decision>` — then every action still pending (or `none pending`), then delete the doc.
+- A doc the user chose: one-line summary — `Wrote decisions for N completed items to <path>`. It stays.
 - Ensure every task has a terminal status.
 
 ## Rules
@@ -173,7 +164,7 @@ an item does not land. These are the ones specific to walking a list.
 - One item at a time. Never present two items in the same turn.
 - **Model-level questions get model-level answers, at Step 3.5's altitude** — participants, what is durable versus transient, how they connect, one worked instance — and then return to the item. Adopt the user's wording verbatim if they restate the model themselves.
 - Keep the recommendation scoped to the active question. Put adjacent unresolved consequences in **Still pending** rather than deciding them implicitly.
-- Step 2's working-doc question is a choice like any other: mark exactly one option recommended.
+- Step 2's doc question, when asked, is a choice like any other: mark exactly one option recommended.
 - Avoid unsolicited before/after code comparisons. This never permits omitting the triggering situation.
 - If the user says skip, use a supported skipped/cancelled terminal status; if none exists, mark it completed with the skip noted. Then move on without arguing.
 - If they want to revisit an earlier item, jump back. Don't insist on linear order.

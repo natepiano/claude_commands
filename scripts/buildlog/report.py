@@ -241,8 +241,11 @@ def report(connection: sqlite3.Connection, day: str) -> str:
     else:
         lines += ["### Summary", "", "No build steps recorded.", ""]
     lines += [calls_line, *port_lint_line, ci_line]
-    footer = mac_note() + " Peak memory counts files the step read or wrote that stayed in RAM, so it runs above what the step's processes used."
+    notes = [
+        mac_note(),
+        "Peak memory is measured on natedev only. It counts files the step read or wrote that stayed in RAM, so it runs above what the step's processes used.",
+    ]
     if scratch:
-        footer += f" {scratch} steps under a temp folder (scratch and test builds) are left out."
-    lines += ["", footer]
+        notes.append(f"{scratch} steps under a temp folder (scratch and test builds) are left out.")
+    lines += ["", *(f"- {note}" for note in notes)]
     return "\n".join(lines)
