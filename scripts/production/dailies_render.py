@@ -92,12 +92,11 @@ PLAN_GAP = 3
 # A phase that started before the left edge has its start beside its name.
 START_FORMAT = "%b-%d %H:%M"
 # The timeline always spans 24 one-hour cells, labelled every three hours. It
-# opens six hours before the three-hour mark at or before now, so a phase that
-# started this morning shows its whole run, and now always sits a quarter to
-# a third of the way in.
+# rolls to fit the rows: it opens at the three-hour mark at or before the
+# earliest phase start, and later only as far as keeps every latest time in
+# view, never past now's mark. User, 2026-10-04.
 WINDOW_HOURS = 24
 LABEL_EVERY_HOURS = 3
-HOURS_BEFORE = 6
 
 JsonMap = dict[str, object]
 
@@ -231,14 +230,29 @@ def parse_range_end(text: str, now: datetime, eta: datetime, *, earliest: bool) 
     return moment
 
 
-def window_start(now: datetime) -> datetime:
-    mark = now.replace(hour=now.hour - now.hour % LABEL_EVERY_HOURS, minute=0, second=0, microsecond=0)
-    return mark - timedelta(hours=HOURS_BEFORE)
+def mark_at_or_before(moment: datetime) -> datetime:
+    return moment.replace(hour=moment.hour - moment.hour % LABEL_EVERY_HOURS, minute=0, second=0, microsecond=0)
+
+
+def window_start(now: datetime, rows: list[Row]) -> datetime:
+    """The three-hour mark at or before the earliest start, moved later only as far as keeps every latest time and now in view, and never past now's mark."""
+    estimates = [row.estimate for row in rows if row.estimate is not None]
+    now_mark = mark_at_or_before(now)
+    if not estimates:
+        return now_mark
+    first_start = mark_at_or_before(min(estimate.started for estimate in estimates))
+    end = max(now, *(estimate.latest for estimate in estimates)).replace(minute=0, second=0, microsecond=0)
+    # The latest mark that leaves `end` in the last cell or earlier.
+    earliest_open = end - timedelta(hours=WINDOW_HOURS - 1)
+    fits_end = mark_at_or_before(earliest_open)
+    if fits_end < earliest_open:
+        fits_end += timedelta(hours=LABEL_EVERY_HOURS)
+    return min(max(first_start, fits_end), now_mark)
 
 
 def draw(now: datetime, rows: list[Row], style: ChartStyle) -> list[str]:
     """24 hourly cells in `style`: the run from the phase's start (or the left edge) to the ETA, marks at the earliest time, the ETA and the latest, and the range filled between the ETA and the latest; `→` past the right edge; a start before the left edge is written before the cells."""
-    start = window_start(now)
+    start = window_start(now, rows)
 
     def column(moment: datetime) -> int:
         return int((moment - start).total_seconds() // 3600)

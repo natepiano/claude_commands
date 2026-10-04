@@ -176,8 +176,10 @@ names another plan's document. User, 2026-10-02.
   range follows the note; an end on another day carries its weekday
   (`range Fri 08:24–Sat 07:37`).
 - **Timeline:** a code block after the sections, always 24 hours of one-hour
-  cells, labelled every three hours, with `▼` at now. It opens six hours before
-  the three-hour mark at or before now. Each row is white from the phase's
+  cells, labelled every three hours, with `▼` at now. It always rolls to fit
+  the rows: it opens at the three-hour mark at or before the earliest phase
+  start, and later only as far as keeps every latest time in view, never past
+  now's mark (`12 15 18 21 00 03 ▼ 09`). User, 2026-10-04. Each row is white from the phase's
   start (or the left edge, when it started earlier) to the ETA, with a blue
   cell at the ETA, a green cell at the earliest time and a red cell at the
   latest (no green or red without a range). When blue shares an hour with
