@@ -1,10 +1,10 @@
 # Production — build-followups
 
-> **Status: PRODUCTION — running.** The five follow-ups from the user's 2026-10-04 adhoc review: cheaper test builds, and a build report that shows temp-folder builds, memory stalls and tests per edit, plus cancelling a superseded CI run, and a disk usage table (added by the user 2026-10-04).
+> **Status: PRODUCTION — running.** The five follow-ups from the user's 2026-10-04 adhoc review: cheaper test builds, and a build report that shows temp-folder builds, memory stalls and tests per edit, plus cancelling a superseded CI run, and a disk usage table (added by the user 2026-10-04); then builds that fit in memory, so earlyoom stops firing (the user, 2026-10-04).
 
 ## Production Context
 
-- **Source plans:** `docs/plans/build-followups.md`, `docs/plans/build-followups-stalls.md`, `docs/plans/build-followups-ratio.md`, and `docs/plans/build-followups-notifier.md` (now `docs/as-built/validate-and-push-cancel-prior.md`) — written 2026-10-04 by natedev from the adhoc review's five follow-up tasks (user: "launch it as a plan for a unit director to execute"; "you must use /showrunner:produce for this and start running dailies")
+- **Source plans:** `docs/plans/build-followups.md`, `docs/plans/build-followups-stalls.md`, `docs/plans/build-followups-ratio.md`, `docs/plans/build-followups-memory.md` (the user, 2026-10-04 11:46 PDT), and `docs/plans/build-followups-notifier.md` (now `docs/as-built/validate-and-push-cancel-prior.md`) — written 2026-10-04 by natedev from the adhoc review's five follow-up tasks (user: "launch it as a plan for a unit director to execute"; "you must use /showrunner:produce for this and start running dailies")
 - **Repository:** `/home/natepiano/.claude`
 - **Merge branch:** `build-followups` — every unit merges here; only the showrunner pushes it
 - **Showrunner checkout:** `/home/natepiano/worktrees/claude-build-followups-trunk`
@@ -21,7 +21,7 @@
 | --- | --- | --- | --- | --- | --- | --- |
 | followups-unit | `docs/plans/build-followups.md` | `/home/natepiano/worktrees/claude-build-followups` | `build-followups-unit` | `build-followups` | — | `scripts/delegate/verify.sh`, `scripts/buildlog/`, `commands/unit/delegate.md` (the `--filter` row) |
 | notifier-unit | `docs/as-built/validate-and-push-cancel-prior.md` (run done; as-built merged as 8772951) | `/home/natepiano/worktrees/claude-build-followups-notifier` | `build-followups-notifier` | `session-notifier` (resumed in `~/.claude`, the directory its session began in) | — | `scripts/validate_and_push/`, `commands/showrunner/produce.md` (the cancel-prior rule); promoted from tool-based-ui by the user 2026-10-04 |
-| stalls-unit | `docs/plans/build-followups-stalls.md` | `/home/natepiano/worktrees/claude-build-followups-stalls` | `build-followups-stalls` | `nightly-config` (resumed in `/etc/nixos`) | — | memory stall recording and its report section; promoted by the user 2026-10-04 |
+| stalls-unit | `docs/plans/build-followups-stalls.md`, then `docs/plans/build-followups-memory.md` | `/home/natepiano/worktrees/claude-build-followups-stalls` | `build-followups-stalls` | `nightly-config` (resumed in `/etc/nixos`) | — | memory stall recording and its report section; then memory admission: may edit `scripts/delegate/verify.sh`, `scripts/validate_and_push/`, `commands/build_hold.md`, `scripts/production/dailies_render.py` (`--footer`); promoted by the user 2026-10-04 |
 | ratio-unit | `docs/plans/build-followups-ratio.md` | `/home/natepiano/worktrees/claude-build-followups-ratio` | `build-followups-ratio` | `nightly-rust` (resumed in `~/rust`) | — | the tests-per-edit report section; promoted by the user 2026-10-04 |
 
 ## Hub files
