@@ -148,11 +148,61 @@ Measured 2026-10-04 11:59–12:25 PDT, read-only, from the earlyoom journal, the
 
 **Ruled out:** passing hold details as renderer flags (`--build-hold-release`, the `build_hold` input field) — the holder files are the one source.
 
-### Phase 5 — A measured working day · status: todo
+### Phase 5 — Held units and unknown core counts · status: done
+
+#### As-built
+
+- `parse_report` in `scripts/production/dailies_render.py` refuses a unit marker whose `unit` equals an active holder's name, since that unit runs the held test: `InputError("units.build_hold: <unit> holds the build hold itself; remove its marker")`, exit 2. While any holder file remains, every other marked unit stays held and keeps `build hold` after a partial release, with one hold line per holder in the report and footer.
+- `scripts/build_hold/build_hold.py` has `Cores = KnownCores(count) | UnknownCores` (frozen dataclasses). `read_cores()` converts `os.cpu_count()` at that boundary and is the injectable `cores` reader.
+- `quiet_verdict(load_1m, cores, processes, user)` takes `Cores`. With `UnknownCores` it skips the load comparison and adds the reason `core count unavailable, so the load limit cannot be judged`, so the verdict is `Busy`, still listing this user's running builds; `KnownCores(32)` at load 1 with no builds is `Quiet`.
+- `ReleaseEta = KnownReleaseEta | UnknownReleaseEta` (formerly `KnownRelease`/`UnknownRelease`) in `build_hold.py`, `dailies_render.py` and every test.
+- `draw_from` sets the latest cell only when `latest_cell > eta_cell`, so a row whose ETA and latest time fall in one hour keeps its ETA marker in both chart styles.
+
+**Files:**
+- `scripts/build_hold/build_hold.py` — core-count states, `read_cores()`, ETA states; `test_build_hold.py` beside it — unknown-core and known-core verdicts
+- `scripts/production/dailies_render.py` — the holder's-own-unit refusal, the same-hour ETA cell; `test_dailies_render_holds.py` — two marked units through a partial release, the own-unit refusal; `test_dailies_render.py` — the same-hour ETA marker in both chart styles
+- `commands/showrunner/dailies.md` — the unit `build_hold` row: a holder's own unit is never marked
+
+**Binds later work:** A unit's `unit` field is its session name, the same name a holder writes as `holder`; markers are checked against active holders' own units. The ETA types are `KnownReleaseEta`/`UnknownReleaseEta`, and the old names no longer exist. Any load-against-cores comparison matches on `Cores`, never on `None`.
+
+**Gotchas:** With `UnknownCores`, `quiet` waits its full `--max-wait` before reporting busy, since the verdict cannot change; `os.cpu_count()` is never `None` on Linux, so the path is rare. `dailies_render.py --footer` needs `--zone`.
+
+### Phase 6 — verify.sh refuses an example whose tests never run · status: todo
 
 #### Work Order
 
-**Goal:** a measured 24-hour working day on natedev, judged against the target of no earlyoom kill, with the slice limits tuned from it; and Phase 4's hold follow-ups built while the day runs.
+**Goal:** `verify.sh test <pkg>` and `verify.sh final` refuse a workspace where an example holds `#[cfg(test)]` code that cargo will never test, and say exactly which manifest lines fix it.
+
+**Source:** routed by the showrunner, 2026-10-04, from the tool-based-ui showrunner. cargo builds examples with `test = false` by default, so `take_test_targets`, `final`'s `nextest --workspace` and CI skip every inline `#[cfg(test)]` in an example. 11 hana examples hold tests that never ran; font_features' new tests "passed" under `verify.sh test hana_diegetic` while `verify.sh example-test hana_diegetic font_features` failed 2 of 3.
+
+**Spec:**
+- **What counts.** An example target (`kind` `example` in `cargo metadata --no-deps`) whose `test` is `false` and whose source holds a line matching `^\s*#\[cfg\(test\)\]`. Its source is the file `src_path` names; for an example in its own directory (`examples/<name>/main.rs`), every `.rs` file under that directory. The first match gives the file and line.
+- **`verify.sh test <pkg>`.** The package's gate run (no `--filter`, no integration target) checks `<pkg>`'s examples before any cache lookup and before any build: a cached result never stands in for the check, because the scanned sources are not in the cache key. Read the metadata once and share it with `take_test_targets`. `--filter` and a named target are feedback runs and are not refused. A refusal lists every offending example of the package, exits 2 and builds nothing; it is never cached as the tree's test result.
+- **`verify.sh final`.** Checks every workspace member's examples the same way, before any cache lookup and before `fmt_cargo --check`, and refuses with the whole list.
+- **The refusal text,** one block per example: `example <name> holds tests that never run: <file>:<line> has #[cfg(test)], and cargo builds examples with test = false.` Then the fix, in `<manifest_path>`: when the manifest already has an `[[example]]` entry with that name (read with `tomllib`), `add test = true to its [[example]] entry`; otherwise the three lines `[[example]]` / `name = "<name>"` / `test = true`.
+- **Tests** in `scripts/delegate/test_verify_untested_examples.py`, each with a scratch cargo package under a temporary directory. Run the real `verify.sh` command routing (not extracted functions), with real `cargo metadata` and stubs on `PATH` for everything that would build or format, so nothing compiles. Cases: an example with `#[cfg(test)]` and no entry is refused with its file, line and the three lines, exit 2, and no stub build or format ran; one with an existing `[[example]]` entry is told to add `test = true` to it; a directory example is found in a module file; `test = true` passes; an example with no `#[cfg(test)]` passes; `--filter` and a named integration target are not refused; a tree whose passing result is already cached is still refused; `final` lists offenders from two members and runs no format check.
+- **Landing.** The guard refuses any hana branch whose 11 examples lack `test = true`. That manifest fix belongs to tool-based-ui's examples unit. The showrunner holds the merge of this phase to `~/.claude` main until the tool-based-ui showrunner confirms its units carry it; this phase builds and checkpoints as usual.
+
+**Files:**
+- `scripts/delegate/verify.sh` — the example check in the `test` gate run and in `final`; the header's `test` and `final` comments
+- `scripts/delegate/test_verify_untested_examples.py` — scratch-package cases
+
+**Seats:** `1 writer + 1 tester` — the check and its tests split by file.
+- `impl` — `scripts/delegate/verify.sh`; hub: `scripts/delegate/verify.sh`
+- `test` — `scripts/delegate/test_verify_untested_examples.py`, written from the Spec alone
+
+**Constraints from prior phases:**
+- `verify.sh` embeds its metadata readers as Python strings run by `$PY` (`TEST_TARGETS_PY`, `MEMBER_PY`); `take_test_targets` reads `cargo metadata --no-deps --format-version 1` once. `require_member` exits 2 on a usage error. A step killed for memory re-runs once, and no status of 128 or more is cached as the tree's failure.
+- `scripts/delegate/test_verify_memory_kill.py` runs verify.sh's functions against stubs on `PATH`; follow its pattern.
+- A test never builds hana or loads the real machine.
+
+**Acceptance gate:** `python3 -m unittest discover -s scripts/delegate -p 'test_verify_*.py'` green; `bash -n scripts/delegate/verify.sh`; `basedpyright` 0 errors and 0 warnings on the new test file.
+
+### Phase 7 — A measured working day · status: todo
+
+#### Work Order
+
+**Goal:** a measured 24-hour working day on natedev, judged against the target of no earlyoom kill, with the slice limits tuned from it.
 
 **Started:** 2026-10-04 15:26:32 PDT (start snapshot, natedev; the check over 15:16–15:26 PDT showed no missing snapshot and a readable journal). Closes 2026-10-05 15:26 PDT.
 
@@ -165,45 +215,61 @@ Measure against the target, a normal working day with no earlyoom kill, from the
 - CI at its ceiling. In CI run 37227844227 attempt 4 (green 14:14 PDT 2026-10-04) the two Linux jobs peaked at 8.3 and 16.7 GiB, `hana-ci.slice` hit its 18G MemoryMax about 23,800 times (`max` events 3930 → 27773) and its memory stall grew 44.7 s in about 11 min, with no kill. Run 37236742478 (14:35–14:51 PDT, the first without CARGO_BUILD_JOBS) peaked at 16.5 and 11.1 GiB, with `max` events +33.1K, stall +33.9 s, no kill and no jobserver warning. For each CI run in the window, run `buildlog memory START END` over the run's own start and end (from `gh run view`) and record the slice's MemoryMax hits (the `max` events delta), its stall seconds (the `memory.pressure` some-total delta) and any `oom_kill`. `memory.peak` is the slice's lifetime high, so for a run that ran alone, report "highest observed minute sample": the largest `ci_anon_bytes` among this host's samples (`samples.host`) inside the run, with how many minute samples the run has against its length in minutes. A sample is taken once a minute, so it can miss a shorter peak; judge a limit change on the `max` events, stall seconds and `oom_kill` alongside it, never on the sample alone. Name the threshold that would justify raising CI's MemoryMax, and judge the day against it. The ceilings already sum past RAM (builds 34G + CI 18G + `app.slice` about 9G + system, on 60 GiB; `builds.slice` peaked at 32 GiB on 2026-10-04), so any raise to CI comes out of `builds.slice`'s MemoryMax and the sum holds;
 - whether verify.sh ever counted a kill from outside the step as the step's own; if it did, tie the kill to the step's own processes;
 - whether the report's `memory waits:` line agrees with the `waiting for memory since …` lines agents saw;
-- the next `/build_hold` release that happens in the window, if any: when each held session's build started, its memory wait and the pressure. Do not stage a hold to produce one. Phase 4's helper reaches the sessions only when natedev merges the Phase 4 checkpoint to `~/.claude` main: write that instant here in PDT. A release before it ran the old prose command and says nothing about the helper;
+- the next `/build_hold` release that happens in the window, if any: when each held session's build started, its memory wait and the pressure. Do not stage a hold to produce one. Phase 4's helper reached the sessions when `~/.claude` main took the Phase 4 checkpoint, 2026-10-04 16:01:44 PDT. A release before that instant ran the old prose command and says nothing about the helper;
 - overlapping CI runs: both runners share `hana-ci.slice`, so label a figure from overlapping runs as shared-slice, and base the per-run comparison and the threshold only on runs that ran alone;
 - the day's hold time and workload (sessions building, CI runs). If holds kept session builds off for much of the day, repeat the day. If no natural release happens, the one-session-at-a-time step is unmeasured and says so.
 
 Tune the slice numbers from what it shows. A changed limit needs another measured day after it. Say whether per-crate admission or nextest thread limits are needed after all. A per-slice sample field that still reads "unavailable" is a deployment fault.
 
-*One session at a time, only if needed.* If the observed release shows the admission already staggers the sessions, say so and drop this step. Otherwise `/build_hold release` releases sessions one at a time:
-- Only the last holder starts it. While another holder file remains, `release` names who still holds and releases no session (Phase 4's behavior).
-- The holder's file stays until the last session is released, so `status`, the renderer and `rust_release.py` keep seeing the hold, and every session not yet released stays held.
-- The progress is a typed state in `build_hold.py`, one per session in release order: waiting, released, acknowledged, or no reply. It is stored in a file beside the holder file and read back on each step, never kept in the holder's memory.
-- A session acknowledges once its first build step has started, past any `waiting for memory` wait. The acknowledgement proves admission, not that the build finished.
-- A session that has not acknowledged 5 minutes after its release becomes "no reply" and the next session is released; the release text names it.
-- Tests: partial progress (some released, some waiting), a missing acknowledgement, and another active holder.
+*The staggering verdict.* From the observed release, say whether the admission already staggers the held sessions. If it does not, Phase 8 builds the one-session-at-a-time release; if it does, or no natural release happened, say so and Phase 8 is dropped or stays unmeasured.
 
-*Hold follow-ups from Phase 4* (build these during the day; they do not wait on the measurement):
-- **Which units stay held.** A hold stops every session, so while any holder file remains, every unit the showrunner told to stop stays held, and all marked units keep their marker after a partial release. A unit whose name is an active holder's name runs the held test and is not held: `dailies_render.py` refuses its marker, naming the holder. Acceptance: two marked units and two holders, the first holder releases, and both rows keep `build hold` with one hold line; a marker on the unit named by an active holder is refused.
-- **Core count as a state.** `wait_for_quiet` takes `os.cpu_count()` as `int | None` and treats `None` as one core. Convert it at that boundary to `KnownCores(count)` or `UnknownCores`; `UnknownCores` gives `Busy(("core count unavailable, so the load limit cannot be judged",))`.
-- **ETA names.** Rename `KnownRelease` and `UnknownRelease` to `KnownReleaseEta` and `UnknownReleaseEta`, in `build_hold.py`, `dailies_render.py` and the tests.
+*Who takes the end snapshot.* The unit director takes it at 2026-10-05 15:26 PDT whatever the state of Phase 6's merge; this phase never waits on another phase to keep its window. Sources the writer and the checker both use: hold times from each holder file's `since`; release times from the `/build_hold release` output in the session transcripts and natedev's relay log; each session's build start from build-log `steps.started_at` and `mem_wait_s`.
 
 Baseline before the diff: natedev's stopgap 160efd9 put CI in steve on 2026-10-04. The first CI run with it, 37227844227, still lost both Linux jobs to earlyoom: the hana bin's rustc was killed at 12:29:58 and 12:30:09 PDT, about 3.3 GB RSS each with oom_score_adj 500, at about 2.8 of 56.5 GB available. Sharing steve's slots alone does not stop the kills.
 
 **Files:**
-- `docs/plans/build-followups-memory.md` — the day's figures, the Phase 4 merge instant, the CI threshold and the conclusions, in this phase
+- `docs/plans/build-followups-memory.md` — the day's figures, the CI threshold and the conclusions, in this phase
 - `docs/plans/build-followups-memory-nixos-*.diff` — any follow-up `/etc/nixos` diff for natedev
-- `scripts/build_hold/build_hold.py` — the core-count state, the ETA names, and the one-at-a-time release if it is needed
-- `scripts/build_hold/test_build_hold.py` — tests for those
-- `commands/build_hold.md` — the one-at-a-time release steps, if it is needed
-- `scripts/production/dailies_render.py` — refuses a marker on an active holder's own unit; the renamed ETA types
-- `scripts/production/test_dailies_render_holds.py` — the two-unit cases
 - `scripts/buildlog/{memory,sample,cli,index}.py` — the instruments, read only
 
 **Seats:** `1 writer + 1 tester` — the measurement and the test lane are disjoint.
-- `impl` — measures the day and writes the result; owns any `/etc/nixos` diff, `scripts/build_hold/build_hold.py`, `commands/build_hold.md` and `scripts/production/dailies_render.py`; hub: `docs/plans/build-followups-memory.md` (the result lands here; the tester sends its checks to the writer)
-- `test` — independently checks the journals, the CI figures and the record completeness; writes `scripts/build_hold/test_build_hold.py` and `scripts/production/test_dailies_render_holds.py` from the Spec alone
+- `impl` — measures the day and writes the result; owns any `/etc/nixos` diff; hub: `docs/plans/build-followups-memory.md` (the result lands here; the tester sends its checks to the writer)
+- `test` — independently checks the journals, the CI figures and the record completeness from the same sources
 
 **Constraints from prior phases:**
 - `buildlog memory START END` (`scripts/buildlog/memory.py`) reads the snapshots nearest each edge, within 2 minutes, and counts only this host's records; the minute sample (`buildlog sample`, `scripts/buildlog/sample.py` and `cli.py`) writes one snapshot a minute with each slice's `memory.pressure` `some` total; the index is schema 7 (`scripts/buildlog/index.py`). `memory.peak` is a slice's lifetime high. rustc runs in `builds.slice/run-*.scope` under the sccache client as well as in `sccache.service`.
 - Live since 2026-10-04: sccache in the foreground (nixos e669461), `hana-ci.slice` with no MemoryHigh and its runners at OOMPolicy=continue (087c7c1), no CARGO_BUILD_JOBS (832dad4); the CI jobserver check is closed. This supersedes Phase 2's notes that the machine half is not live and that `CARGO_BUILD_JOBS` stays at 8: plan no deployment or jobserver change from them.
-- Phase 4: each holder file in `~/.local/state/build-hold/` (`BUILD_HOLD_DIR` overrides it; tests always set it) is one JSON line `{"holder", "since", "for", "release_eta"}`, where `release_eta` is an ISO instant or `unknown`; the old one-line form still reads. `scripts/build_hold/build_hold.py` has `hold` (`--release-eta HH:MM` needs `--zone`), `quiet`, `release` and `status`. `release` prints `released, builds may resume.` only when no holder file remains, else `released; still held by …`. `quiet` is busy while this user's `cargo`, `rustc` or `cargo-nextest` runs or the 1-minute load is at or above a quarter of the cores, and waits at most 10 minutes; `ps` needs `user:32`, or procps cuts long names. `HoldState = NoHolders | ActiveHolders`, `ReleaseEta = KnownRelease | UnknownRelease`. `dailies_render.py` reads holds through `read_dailies_hold()` and refuses a unit marker with no holder file, active holders with no marked unit, and plumbing words in a holder's purpose. `scripts/buildlog/rust_release.py` treats any regular file in the hold directory as a hold.
+- Phase 4: each holder file in `~/.local/state/build-hold/` (`BUILD_HOLD_DIR` overrides it; tests always set it) is one JSON line `{"holder", "since", "for", "release_eta"}`, where `release_eta` is an ISO instant or `unknown`; the old one-line form still reads. `scripts/build_hold/build_hold.py` has `hold` (`--release-eta HH:MM` needs `--zone`), `quiet`, `release` and `status`. `release` prints `released, builds may resume.` only when no holder file remains, else `released; still held by …`. `quiet` is busy while this user's `cargo`, `rustc` or `cargo-nextest` runs or the 1-minute load is at or above a quarter of the cores, and waits at most 10 minutes; `ps` needs `user:32`, or procps cuts long names. `HoldState = NoHolders | ActiveHolders`, `ReleaseEta = KnownReleaseEta | UnknownReleaseEta`, and `quiet_verdict` takes `Cores = KnownCores | UnknownCores` (Phase 5). `dailies_render.py` reads holds through `read_dailies_hold()` and refuses a unit marker with no holder file, active holders with no marked unit, and plumbing words in a holder's purpose. `scripts/buildlog/rust_release.py` treats any regular file in the hold directory as a hold.
 - Times carry their zone; natedev's clock and journal are EDT, and this plan states PDT.
 
-**Acceptance gate:** the day's report, each CI run's figures, the threshold and the conclusions written in this phase, each figure's window complete or marked inconclusive; `python3 -m unittest discover -s scripts/build_hold -p 'test_*.py'` and `python3 -m unittest discover -s scripts/production -p 'test_*.py'` green; `basedpyright` 0 errors and 0 warnings on changed Python; `bash -n` on any changed shell.
+**Acceptance gate:** the day's report, each CI run's figures, the threshold and the conclusions written in this phase, each figure's window complete or marked inconclusive; the staggering verdict stated; `bash -n` on any changed shell.
+
+### Phase 8 — One session at a time · status: todo
+
+#### Work Order
+
+**Goal:** when Phase 7 finds the admission does not stagger held sessions, the last holder's `/build_hold release` releases them one at a time, each after the previous one's build has started.
+
+**Spec:**
+- Runs only if Phase 7's verdict says the admission does not stagger the sessions; otherwise this phase is dropped.
+- Only the last holder starts it. While another holder file remains, `release` names who still holds and releases no session (Phase 4's behavior). The holder's file stays until the last session is released, so `status`, the renderer and `rust_release.py` keep seeing the hold.
+- Release progress is one typed state per held session, in release order: `AwaitingRelease`, `ReleasedAwaitingBuildStart(released_at)`, `BuildStarted(started_at)`, `NoReply(released_at)`, each carrying only the instants valid in it. It is stored in `~/.local/state/build-hold-release/` (`BUILD_HOLD_RELEASE_DIR` overrides it), never in the holder directory, which every reader treats as holds; read back on each step, never kept in memory.
+- `release` messages one session at a time, by the same message path `/build_hold` uses today. A session moves to `BuildStarted` when `verify.sh` starts its first build step past any memory wait and writes its acknowledgement, keyed by session name, into the release directory. The acknowledgement proves admission, not a finished build.
+- A session with no acknowledgement 5 minutes after its release becomes `NoReply`; the next session is released and the release text names it.
+- Tests: partial progress (some released, some waiting), a missing acknowledgement, another active holder, and `status`, the dailies renderer and `rust_release.py` showing no phantom holder from the release directory, including after the last release clears it.
+
+**Files:**
+- `scripts/build_hold/build_hold.py` — release states, release directory, one-at-a-time release
+- `scripts/build_hold/test_build_hold.py` — the cases above
+- `commands/build_hold.md` — the one-at-a-time release steps
+- `scripts/delegate/verify.sh` — the acknowledgement at the first build step
+
+**Seats:** `1 writer + 1 tester` — the helper and its tests split by file.
+- `impl` — `scripts/build_hold/build_hold.py`, `commands/build_hold.md`, `scripts/delegate/verify.sh`; hub: `scripts/build_hold/build_hold.py`
+- `test` — `scripts/build_hold/test_build_hold.py`, written from the Spec alone
+
+**Constraints from prior phases:**
+- Holder files in `~/.local/state/build-hold/` (`BUILD_HOLD_DIR` overrides it; tests always set it) are one JSON line `{"holder", "since", "for", "release_eta"}`; `read_holders` and `scripts/buildlog/rust_release.py` treat every regular file there as a hold. `release` prints `released, builds may resume.` only when no holder file remains. `ReleaseEta = KnownReleaseEta | UnknownReleaseEta`; `quiet_verdict` takes `Cores = KnownCores | UnknownCores`.
+- Tests never write `~/.local/state/build-hold` or the real release directory.
+
+**Acceptance gate:** `python3 -m unittest discover -s scripts/build_hold -p 'test_*.py'` green; `bash -n scripts/delegate/verify.sh`; `basedpyright` 0 errors and 0 warnings on changed Python.
