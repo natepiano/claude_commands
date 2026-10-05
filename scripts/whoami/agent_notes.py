@@ -14,18 +14,22 @@ and to codex_pacer.py, which decides the `pace` tier from them; `refresh`
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import re
 import sys
+import tempfile
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from typing import cast
 
 import codex_pacer
 from agent_accounts import EASTERN, Report, live_reports
 from quota_alert import AgentNote, alert, current_session, refresh
 
 AGENTS_DIR = Path.home() / "rust" / "hanadocs" / "agents"
+READINGS_LOG = Path.home() / ".local/state/agent-notes/readings.jsonl"
 RESET_FORMAT = "%Y-%m-%dT%H:%M:%S"
 FIELD = re.compile(r"^([A-Za-z_][\w-]*):[ \t]*(.*?)[ \t]*$")
 
@@ -118,6 +122,42 @@ def still_ahead(value: str | None) -> bool:
         return False
 
 
+def append_readings(readings: list[dict[str, object]], checked_at: datetime) -> None:
+    """Keep the recent readings and replace the log in one write."""
+    READINGS_LOG.parent.mkdir(parents=True, exist_ok=True)
+    cutoff = checked_at.astimezone(timezone.utc) - timedelta(days=8)
+    kept: list[dict[str, object]] = []
+    try:
+        with READINGS_LOG.open(encoding="utf-8") as existing:
+            for line in existing:
+                try:
+                    entry = cast(object, json.loads(line))
+                    if not isinstance(entry, dict):
+                        continue
+                    record = cast(dict[str, object], entry)
+                    at_text = record.get("at")
+                    if not isinstance(at_text, str):
+                        continue
+                    at = datetime.fromisoformat(at_text)
+                    if at.tzinfo is not None and at.astimezone(timezone.utc) >= cutoff:
+                        kept.append(record)
+                except (ValueError, TypeError, KeyError):
+                    continue
+    except FileNotFoundError:
+        pass
+    kept.extend(readings)
+    temporary: str | None = None
+    try:
+        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=READINGS_LOG.parent, prefix=".readings-", delete=False) as output:
+            temporary = output.name
+            for entry in kept:
+                _ = output.write(json.dumps(entry, separators=(",", ":")) + "\n")
+        os.replace(temporary, READINGS_LOG)
+    finally:
+        if temporary is not None and os.path.exists(temporary):
+            os.unlink(temporary)
+
+
 def apply(notes: list[Note], account: Report, checked_at: datetime) -> list[str]:
     """Write only the matching account's live quota; retain dated inactive readings."""
     messages: list[str] = []
@@ -126,6 +166,7 @@ def apply(notes: list[Note], account: Report, checked_at: datetime) -> list[str]
     fresh = reset if reset is not None and reset > checked_at else None
     remaining = account.weekly_remaining if fresh is not None else None
     matched = False
+    readings: list[dict[str, object]] = []
     for note in notes:
         if note.tool != account.tool.lower():
             continue
@@ -151,6 +192,13 @@ def apply(notes: list[Note], account: Report, checked_at: datetime) -> list[str]
             updates["weekly_usage_checked_at"] = "null"
         if set_fields(note, updates, stamp):
             messages.append(f"{note.path.name}: " + ", ".join(f"{k}={v}" for k, v in updates.items()))
+            if active and remaining is not None:
+                readings.append({"account": note.path.stem, "at": checked_at.astimezone(timezone.utc).isoformat(timespec="seconds"), "remaining": remaining})
+    if readings:
+        try:
+            append_readings(readings, checked_at)
+        except (OSError, UnicodeError) as error:
+            messages.append(f"readings log: {error}")
     if account.email and not matched:
         messages.append(f"{account.tool}: no note has login {account.email}")
     if account.problem or account.quota_problem:
