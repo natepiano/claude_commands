@@ -4,7 +4,8 @@
 `launch` runs from the nightly-review timer on natedev (/etc/nixos/modules/linux/nightly-review.nix).
 It starts `/nightly_review config` and `/nightly_review rust` in named, detached tmux sessions with
 Remote Control under the same names, replacing the previous night's unless the user is attached to
-it. Each agent writes NIGHT/<mode>.md and messages natedev, which distills the proposals into
+it. A session under that name that no nightly review started is left running, and that review skips
+the night. Each agent writes NIGHT/<mode>.md and messages natedev, which distills the proposals into
 NIGHT/digest.md and the ledger (/watcher). The night is skipped while the active Claude account has
 less than MIN_REMAINING percent of its weekly usage left.
 
@@ -72,6 +73,9 @@ def start(mode: str) -> str:
     if running(mode):
         if tmux("list-clients", "-t", name).stdout.strip():
             return f"{name}: you are attached, so last night's session was left running"
+        # A session promoted out of a nightly review keeps its tmux name.
+        if f"/nightly_review {mode}" not in tmux("list-panes", "-F", "#{pane_start_command}", "-t", name).stdout:
+            return f"{name}: another session holds this name, so tonight's review did not start"
         _ = tmux("kill-session", "-t", name)
     claude = shlex.join(["claude", "--remote-control", name, "-n", name, "--add-dir", str(Path.home() / ".claude"),
                          "--settings", str(SETTINGS), f"/nightly_review {mode}"])

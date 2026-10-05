@@ -36,7 +36,8 @@ production doc's **Updates** interval. Two steps do that:
    CLAUDE NOT RUNNING, FORM WAITING, a usage limit, a DECISION), as a scheduled
    tick does.
 2. **Reset the clock.** After the report, run `NOTIFIER restart UPDATES`:
-   at 19:21 with N = 15, the next tick is 19:36. Log the `next_due` it prints.
+   at 19:21 with N = 15, the next tick is 19:36. An aligned timer keeps the
+   clock: at 19:21 with N = 60, 20:00; at 19:45, 21:00. Log the `next_due` it prints.
 
 A scheduled tick skips both steps. It has run the script already, and its clock
 is already right.
@@ -85,7 +86,7 @@ When the renderer refuses the input (exit 2), fix what it names and run again.
 
 ```sh
 python3 ~/.claude/scripts/production/dailies_render.py <scratchpad>/dailies_input.json \
-  --state <scratchpad>/dailies_state.json --log <LOG>
+  --state <scratchpad>/dailies_state.json --log <LOG> --outstanding <OUTSTANDING>
 ```
 
 - `--state` holds each unit's last reported phase and ETA. The renderer
@@ -210,7 +211,7 @@ names another plan's document. User, 2026-10-02.
   ETA, and no `(earliest–latest)` text, so the row fits. User, 2026-10-03.
   Only glyphs the app's Anthropic Mono has: it lacks `┼` and `┤`.
 - **Footer:** the reply footer (`/showrunner:produce` → Footer), from
-  `next_run`, the holder files and whether any subject has `needed:`. The
+  `next_run`, the holder files, `OUTSTANDING` and whether any subject has `needed:`. The
   report replaces the turn's `— waiting on:` line.
 
 ## Length

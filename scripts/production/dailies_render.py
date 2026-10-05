@@ -4,6 +4,7 @@
 Usage: dailies_render.py [<input.json>] [--chart default|ascii] [--state <state.json>] [--log <log.md>] [--at <YYYY-MM-DDTHH:MM>]
        dailies_render.py --footer --zone <IANA zone> [--next-run <HH:MM>]
                          [--nothing-needed] [--at <YYYY-MM-DDTHH:MM>]
+Both forms take [--outstanding <outstanding.json>].
 
 The input gives each subject's fields; this script owns the layout, so no line
 of the template can be dropped or renamed. It refuses, with exit 2, an input
@@ -30,6 +31,9 @@ production's own plumbing words (PLUMBING).
 --footer prints only the footer every showrunner reply and every report ends
          with (`footer`), at the current time in --zone. The hold lines come
          from BUILD_HOLD_DIR or ~/.local/state/build-hold.
+--outstanding  JSON list of what waits on the user, `[{"since":
+         "YYYY-MM-DDTHH:MM", "text": "..."}]`; every footer lists it under
+         `waiting on you:`. A missing file is an empty list.
 
 The input format is in ~/.claude/commands/showrunner/dailies.md.
 """
@@ -172,6 +176,13 @@ class Topic:
     eta: str
     needed: str | None
     needs_user: bool
+
+
+@dataclass(frozen=True)
+class Outstanding:
+    since: datetime
+    text: str
+    after: datetime | None = None
 
 
 @dataclass(frozen=True)
@@ -560,6 +571,32 @@ def check_plumbing(line: str, name: str) -> None:
         )
 
 
+def read_outstanding(path: Path | None) -> list[Outstanding]:
+    """What waits on the user, oldest first; no file means nothing waits."""
+    if path is None or not path.exists():
+        return []
+    entries = cast(object, json.loads(path.read_text()))
+    if not isinstance(entries, list):
+        raise InputError(f"{path}: expected a JSON list")
+    items: list[Outstanding] = []
+    for index, entry in enumerate(cast(list[object], entries)):
+        where = f"{path}[{index}]"
+        if not isinstance(entry, dict):
+            raise InputError(f"{where}: expected an object")
+        fields = cast(dict[str, object], entry)
+        check_keys(fields, {"since", "text", "after"}, where)
+        since, text, after = fields.get("since"), fields.get("text"), fields.get("after")
+        if not isinstance(since, str) or not STARTED.match(since):
+            raise InputError(f"{where}.since: expected YYYY-MM-DDTHH:MM")
+        if after is not None and (not isinstance(after, str) or not STARTED.match(after)):
+            raise InputError(f"{where}.after: expected YYYY-MM-DDTHH:MM")
+        if not isinstance(text, str) or not text.strip() or "\n" in text:
+            raise InputError(f"{where}.text: expected one non-empty line")
+        check_plumbing(text, f"{where}.text")
+        items.append(Outstanding(datetime.fromisoformat(since), text, datetime.fromisoformat(after) if after else None))
+    return sorted(items, key=lambda item: item.since)
+
+
 def read_dailies_hold() -> HoldState:
     """Read holders and check the purpose that appears in reports and footers."""
     hold = read_holders(holder_directory())
@@ -845,13 +882,23 @@ def hold_line(holder: Holder, now: datetime, zone: ZoneInfo) -> str:
     return f"{BUILD_HOLD_MARK}: {holder.name} since {since:%H:%M} {since:%Z}, for {holder.purpose} - release eta: {release}"
 
 
-def footer(now: datetime, zone: ZoneInfo, zone_name: str, next_run: str | None, hold: HoldState, *, nothing_needed: bool) -> list[str]:
-    """One line per active holder, then the time and next report."""
+def footer(
+    now: datetime, zone: ZoneInfo, zone_name: str, next_run: str | None, hold: HoldState, outstanding: list[Outstanding], *, nothing_needed: bool
+) -> list[str]:
+    """One line per active holder, what waits on the user, then the time and next report."""
     lines = [hold_line(holder, now, zone) for holder in hold.holders] if isinstance(hold, ActiveHolders) else []
     if lines:
         lines.append("")
+    # An item the user deferred stays hidden until its `after` time, in the report's zone.
+    local_now = now.astimezone(zone).replace(tzinfo=None) if now.tzinfo else now
+    outstanding = [item for item in outstanding if item.after is None or item.after <= local_now]
+    if outstanding:
+        lines.append("waiting on you:")
+        lines.extend(f"- {item.text} (since {range_clock(item.since, now)})" for item in outstanding)
+        lines.append("")
     schedule = f"next dailies {range_clock(parse_time(next_run, now), now)} {zone_name}" if next_run else "no dailies scheduled"
-    lines.append(f"{now:%H:%M} {zone_name} · {schedule}{' - nothing needed' if nothing_needed else ''}")
+    quiet = nothing_needed and not outstanding
+    lines.append(f"{now:%H:%M} {zone_name} · {schedule}{' - nothing needed' if quiet else ''}")
     return lines
 
 
@@ -894,7 +941,7 @@ def plan_progress(unit: Unit) -> PlanProgress | None:
     return PlanProgress(number, total, round(100 * done))
 
 
-def render(report: Report, previous: dict[str, Previous], now: datetime, zone_name: str) -> list[str]:
+def render(report: Report, previous: dict[str, Previous], now: datetime, zone_name: str, outstanding: list[Outstanding]) -> list[str]:
     lines = [f"**Dailies ({report.length.capitalize()})**, {now:%H:%M} {zone_name}", ""]
     user_topics = [topic for topic in report.topics if topic.needs_user]
     other_topics = [topic for topic in report.topics if not topic.needs_user]
@@ -945,7 +992,7 @@ def render(report: Report, previous: dict[str, Previous], now: datetime, zone_na
         rows.append(Row(unit.label, Estimate(unit.started, moment, earliest, latest), unit.build_hold, plan))
     lines.extend(["```", *draw(now, rows, CHART_STYLES[report.chart]), "```", ""])
     needed = any(unit.needed for unit in report.units) or any(topic.needed for topic in report.topics)
-    lines.extend(footer(now, ZoneInfo(report.zone), zone_name, report.next_run, report.build_hold, nothing_needed=not needed))
+    lines.extend(footer(now, ZoneInfo(report.zone), zone_name, report.next_run, report.build_hold, outstanding, nothing_needed=not needed))
     return lines
 
 
@@ -968,16 +1015,17 @@ def local_now(zone: str, where: str, at: str | None) -> tuple[datetime, str]:
     return aware.replace(second=0, microsecond=0, tzinfo=None), aware.strftime("%Z")
 
 
-def footer_main(zone: str, next_run: str | None, at: str | None, *, nothing_needed: bool) -> int:
+def footer_main(zone: str, next_run: str | None, at: str | None, outstanding_path: Path | None, *, nothing_needed: bool) -> int:
     try:
         if next_run is not None and not TIME.match(next_run):
             raise InputError(f"--next-run: {next_run!r} is not HH:MM or HH:MM+N")
         now, abbreviation = local_now(zone, "--zone", at)
         hold = read_dailies_hold()
-    except (InputError, OSError) as error:
+        outstanding = read_outstanding(outstanding_path)
+    except (InputError, json.JSONDecodeError, OSError) as error:
         print(f"dailies_render: {error}", file=sys.stderr)
         return 2
-    print("\n".join(footer(now, ZoneInfo(zone), abbreviation, next_run, hold, nothing_needed=nothing_needed)))
+    print("\n".join(footer(now, ZoneInfo(zone), abbreviation, next_run, hold, outstanding, nothing_needed=nothing_needed)))
     return 0
 
 
@@ -992,6 +1040,7 @@ def main(arguments: list[str]) -> int:
     _ = parser.add_argument("--zone", help="with --footer: the production's zone, as an IANA name")
     _ = parser.add_argument("--next-run", help="with --footer: the next scheduled report, HH:MM or HH:MM+N; leave it out when none is scheduled")
     _ = parser.add_argument("--nothing-needed", action="store_true", help="with --footer: no subject needs a follow-up nobody has started")
+    _ = parser.add_argument("--outstanding", type=Path, help="JSON list of what waits on the user, shown in every footer")
     options = parser.parse_args(arguments)
     input_path = cast(Path | None, options.input)
     chart = cast(str | None, options.chart)
@@ -1001,12 +1050,13 @@ def main(arguments: list[str]) -> int:
     zone = cast(str | None, options.zone)
     next_run = cast(str | None, options.next_run)
     nothing_needed = cast(bool, options.nothing_needed)
+    outstanding_path = cast(Path | None, options.outstanding)
     if cast(bool, options.footer):
         if input_path is not None or chart is not None or state_path is not None or log_path is not None:
             parser.error("--footer takes no input file, --chart, --state or --log")
         if zone is None:
             parser.error("--footer needs --zone")
-        return footer_main(zone, next_run, at, nothing_needed=nothing_needed)
+        return footer_main(zone, next_run, at, outstanding_path, nothing_needed=nothing_needed)
     if zone is not None or next_run is not None or nothing_needed:
         parser.error("--zone, --next-run and --nothing-needed go with --footer; a report takes them from its input")
     if chart is not None:
@@ -1021,10 +1071,11 @@ def main(arguments: list[str]) -> int:
         previous = load_state(state_path)
         now, abbreviation = local_now(report.zone, "input.zone", at)
         check_changes(report, previous, now)
+        outstanding = read_outstanding(outstanding_path)
     except (InputError, json.JSONDecodeError, OSError) as error:
         print(f"dailies_render: {error}", file=sys.stderr)
         return 2
-    print("\n".join(render(report, previous, now, abbreviation)))
+    print("\n".join(render(report, previous, now, abbreviation, outstanding)))
     if state_path is not None:
         save_state(state_path, report, now, previous)
     if log_path is not None:
