@@ -54,7 +54,9 @@ Read the current state, not memory, and check what you state the way
    the user's draft: `capture-pane -e` shows a suggestion dimmed (`ESC[2m`).
    Note when the ETA was stated. One stated over an hour ago gets `/unit:eta`
    this turn, and its `detail` reads `set HH:MM` until a new one arrives. User,
-   2026-10-04.
+   2026-10-04. An ETA already past is not shown as the ETA: send `/unit:eta`
+   and report `none measured - requested` until the new one comes. User,
+   2026-10-04 ("why does widget gantt lane say 17:26 ... when you ran this at 17:39?").
 4. **Merge branch.** Its last merge, whether it is pushed, and anything held or
    testing.
 5. **Open topics.** Everything in `LOG` not yet closed: held quota alerts, CI,
