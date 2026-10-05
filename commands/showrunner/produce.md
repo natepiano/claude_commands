@@ -107,6 +107,12 @@ State:
     stop builds. The renderer refuses a marker with no holder file, or active
     holder files with no marked unit.
   - `--nothing-needed`: when no subject needs a follow-up nobody has started.
+  - `--outstanding <OUTSTANDING>`, always, on the footer and on every dailies
+    render. `OUTSTANDING` is `~/.local/state/showrunner/outstanding/<slug>.json`:
+    `[{"since": "YYYY-MM-DDTHH:MM", "text": "..."}]`, one entry per thing the
+    user must do or decide, each with enough context to recall it without my
+    memory (what, where, why). Add an entry the moment it arises; remove it only
+    when the user addresses it and tells you. User, 2026-10-05.
 
   It prints `build hold: <holder> since 11:34 PDT, for the frame-time lane's breakdown
   of what each added tool costs - release eta: 11:40 PDT (3 minutes)` while a

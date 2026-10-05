@@ -85,7 +85,7 @@ When the renderer refuses the input (exit 2), fix what it names and run again.
 
 ```sh
 python3 ~/.claude/scripts/production/dailies_render.py <scratchpad>/dailies_input.json \
-  --state <scratchpad>/dailies_state.json --log <LOG>
+  --state <scratchpad>/dailies_state.json --log <LOG> --outstanding <OUTSTANDING>
 ```
 
 - `--state` holds each unit's last reported phase and ETA. The renderer
@@ -210,7 +210,7 @@ names another plan's document. User, 2026-10-02.
   ETA, and no `(earliest–latest)` text, so the row fits. User, 2026-10-03.
   Only glyphs the app's Anthropic Mono has: it lacks `┼` and `┤`.
 - **Footer:** the reply footer (`/showrunner:produce` → Footer), from
-  `next_run`, the holder files and whether any subject has `needed:`. The
+  `next_run`, the holder files, `OUTSTANDING` and whether any subject has `needed:`. The
   report replaces the turn's `— waiting on:` line.
 
 ## Length
