@@ -536,9 +536,11 @@ merge. When the watch reports green, finish <PromoteMain/>.
 
 **Mac run.** After every green CI on the merge branch, run its sha on the Mac
 in the background: `zsh ~/.claude/scripts/production/mac_run.sh <CHECKOUT> <sha> 60`.
-It builds, checks hana stays up 60 s, and stops it. Exit 3 means the Mac is
-unreachable: skip it. It never gates a merge; a failure goes to the unit
-whose merge it was. User, 2026-10-04.
+It builds, checks hana stays up 60 s, and stops it, then builds and runs each
+demo example (list in the script) for 20 s with the command you would type, so
+each starts at once from the clone `~/rust/hana_catalyst_mac`. Exit 3 means the
+Mac is unreachable: skip it. It never gates a merge; a failure (7 hana, 8 an
+example) goes to the unit whose merge it was. User, 2026-10-04 and 2026-10-05.
 </CIPoint>
 
 ---
