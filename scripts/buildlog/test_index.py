@@ -407,6 +407,55 @@ class IndexTests(unittest.TestCase):
         self.assertEqual(runs, [(1, 1, 2, 600.0), (1, 2, 1, 600.0)])
         self.assertEqual(len(self.rows("SELECT * FROM ci_steps")), 3)
 
+    def test_ci_jobs_distinguish_rerun_from_carried_over_and_exclude_carried_time(self) -> None:
+        original = ("2026-10-02T12:00:00Z", "2026-10-02T12:00:30Z", "2026-10-02T12:02:30Z")
+        carried = ("2026-10-03T12:20:00Z", original[1], original[2])
+        rerun = ("2026-10-03T12:20:00Z", "2026-10-03T12:20:10Z", "2026-10-03T12:21:10Z")
+        fresh = ("2026-10-03T12:30:00Z", "2026-10-03T12:30:05Z", "2026-10-03T12:31:05Z")
+        self.write(
+            self.root / "ci" / "2026-10.jsonl",
+            ci_run(1, 2, [ci_job(21, "Clippy", "success", carried), ci_job(22, "Test", "failure", rerun)]),
+            ci_run(1, 1, [ci_job(11, "Clippy", "success", original)]),
+            ci_run(2, 1, [ci_job(31, "Clippy", "success", fresh)]),
+        )
+        _ = index.update()
+
+        self.assertEqual(
+            self.rows("SELECT job_id, run_state, duration_s, queued_s FROM ci_jobs ORDER BY job_id"),
+            [(11, "ran", 120.0, 30.0), (21, "carried_over", None, None), (22, "ran", 60.0, 10.0), (31, "ran", 60.0, 5.0)],
+        )
+        self.assertEqual(
+            self.rows(
+                "SELECT day, name, jobs, failed, avg_s, max_s, avg_queue_s, max_queue_s"
+                + " FROM ci_job_days ORDER BY day, name"
+            ),
+            [
+                ("2026-10-02", "Clippy", 1, 0, 120.0, 120.0, 30.0, 30.0),
+                ("2026-10-03", "Clippy", 1, 0, 60.0, 60.0, 5.0, 5.0),
+                ("2026-10-03", "Test", 1, 1, 60.0, 60.0, 10.0, 10.0),
+            ],
+        )
+
+    def test_ci_skipped_and_zero_queue_jobs_have_distinct_states(self) -> None:
+        same_stamp = "2026-10-02T12:00:00Z"
+        skipped = ("2026-10-02T12:01:00Z", "2026-10-02T12:01:00Z", "2026-10-02T12:00:59Z")
+        self.write(
+            self.root / "ci" / "2026-10.jsonl",
+            ci_run(1, 1, [ci_job(11, "Zero", "success", (same_stamp, same_stamp, "2026-10-02T12:01:00Z")), ci_job(12, "Skipped", "skipped", skipped)]),
+        )
+        _ = index.update()
+
+        self.assertEqual(
+            self.rows("SELECT job_id, run_state, duration_s, queued_s FROM ci_jobs ORDER BY job_id"),
+            [(11, "ran", 60.0, 0.0), (12, "skipped", None, None)],
+        )
+
+    def test_ci_job_run_states_name_the_persisted_outcomes(self) -> None:
+        self.assertEqual(
+            {state.value for state in index.JobRunState},
+            {"ran", "skipped", "carried_over"},
+        )
+
     def test_tree_and_port_lint_columns(self) -> None:
         self.write(
             self.host_file,
