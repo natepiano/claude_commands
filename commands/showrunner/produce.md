@@ -690,23 +690,33 @@ it needs. Every other wait is yours to clear, and fast.
    unit blocked on the user, do all of this in that turn:
    1. **Find the real cause** in the unit director's transcript, not in its
       one-line `blocked:`. Name the exact action that was refused and the
-      reason given.
+      reason given. A refusal covers the outcome, not the command: another
+      tool, a script or another session counts the same. Never send the unit
+      another route, and never do it for the unit (user, 2026-10-05: trunk
+      sat 3 h on a refused plan read, and my "use the Read tool" was refused too).
+      One exception: a read-only command on files our sessions wrote (its
+      plan, its handoff). Type the go-ahead the unit asks for into its tmux
+      pane yourself and tell the user in one line (user, 2026-10-05).
+      Anything that writes, deletes, pushes or reaches outside our files
+      waits for the user.
    2. **Restart everything that does not need that action.** Phase work from
       the unit's drafts while a plan edit waits. A checkpoint that stays local
       while a push waits (you merge from the local branch). Tests, traces and
       research. Only work that needs the refused action itself waits. Never
       retry the refused action in another form: the refusal forbids that, and
       only the user can lift it.
-   3. **Tell the user exactly what to do,** in one line they can act on from
-      a phone: the session, then the exact words to type or the exact allow
-      rule to add. Put it in `needed:` and send it as a <Notify/> priority 2
-      alert.
+   3. **Otherwise, tell the user exactly what to do,** in one line they can act on from
+      a phone: the session, the exact words to type or the exact allow rule
+      to add, and why the check refused it, in a few words. Put it in
+      `needed:` and send it as a <Notify/> priority 2 alert.
    4. **Rule 4's limit holds.** Read the pane again each hour, and repeat 1–3.
       A `needed:` line never repeats unchanged from tick to tick.
    5. **Prevent the next one.** When a routine action for the unit is refused
       (reading its own plan, a plain `git push`), find which command file
       produced the refused form. Name the fix to the user: a command change,
-      or an allow rule only they can add.
+      or an allow rule only they can add. A content reason (`[Instruction
+      Poisoning]` on a plan read) means the check distrusts what it read, not
+      how, so a different command form never fixes it.
 </Dependencies>
 
 <Notify>
