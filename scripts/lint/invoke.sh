@@ -106,27 +106,46 @@ buildlog_begin() {
 
 buildlog_wait_for_memory() {
     BUILDLOG_MEM_WAIT_S=0
-    local cgroup="${BUILDLOG_BUILDS_CGROUP:-/sys/fs/cgroup/user.slice/user-$(id -u).slice/user@$(id -u).service/builds.slice}"
-    local high current started waited=0 interval="${BUILDLOG_MEM_POLL_S:-5}" limit="${BUILDLOG_MEM_WAIT_LIMIT_S:-900}"
+    local meminfo="${BUILDLOG_MEMINFO:-/proc/meminfo}"
+    local line available_kb started announced=0 interval="${BUILDLOG_MEM_POLL_S:-5}" limit="${BUILDLOG_MEM_WAIT_LIMIT_S:-900}"
     [[ "$interval" =~ ^[0-9]+$ && "$interval" -gt 0 ]] || interval=5
     [[ "$limit" =~ ^[0-9]+$ && "$limit" -ge 0 ]] || limit=900
-    [[ -r "$cgroup/memory.high" && -r "$cgroup/memory.current" ]] || return 0
-    read -r high < "$cgroup/memory.high" || return 0
-    [[ "$high" =~ ^[0-9]+$ ]] || return 0
-    started=$SECONDS
-    while [[ -r "$cgroup/memory.current" ]]; do
-        read -r current < "$cgroup/memory.current" || break
-        [[ "$current" =~ ^[0-9]+$ ]] || break
-        (( current > high )) || break
-        if (( waited == 0 )); then
-            awk -v used="$current" -v soft="$high" -v since="$(TZ=America/Los_Angeles date '+%H:%M %Z')" \
-                'BEGIN { printf "waiting for memory since %s: builds use %.1f of %.1f GiB\n", since, used / 1073741824, soft / 1073741824 > "/dev/stderr" }'
+    while [[ -r "$meminfo" ]]; do
+        available_kb=""
+        while IFS= read -r line || [[ -n "$line" ]]; do
+            if [[ "$line" =~ ^MemAvailable:[[:space:]]+([0-9]+)[[:space:]]+kB[[:space:]]*$ ]]; then
+                available_kb="${BASH_REMATCH[1]}"
+                break
+            fi
+        done < "$meminfo" 2>/dev/null || break
+        [[ -n "$available_kb" ]] || break
+        (( 10#$available_kb < 12582912 )) || break
+        if (( announced == 0 )); then
+            started=$SECONDS
+            awk -v free="$available_kb" -v since="$(TZ=America/Los_Angeles date '+%H:%M %Z')" \
+                'BEGIN { printf "waiting for memory since %s: the machine has %.1f GiB free; a build starts at 12.0\n", since, free / 1048576 > "/dev/stderr" }'
+            announced=1
         fi
         (( SECONDS - started < limit )) || { echo 'memory wait limit reached after 15 min; starting anyway' >&2; break; }
         sleep "$interval"
-        waited=$(( SECONDS - started ))
     done
-    BUILDLOG_MEM_WAIT_S=$(( SECONDS - started ))
+    if (( announced != 0 )); then
+        BUILDLOG_MEM_WAIT_S=$(( SECONDS - started ))
+    fi
+}
+
+buildlog_step_compiles() {
+    local arg
+    for arg in "$@"; do
+        [[ "$arg" == */sweep.py ]] && return 1
+    done
+    [[ "${1:-}" == cargo ]] || return 0
+    shift
+    if [[ "${1:-}" == +* ]]; then
+        shift
+    fi
+    [[ "${1:-}" == fmt ]] && return 1
+    return 0
 }
 
 buildlog_exec() {
@@ -172,8 +191,10 @@ buildlog_end() {
 run_once() {
     printf '+ %s\n' "$*"
     buildlog_begin "$@" || true
-    if [[ -n "${BUILDLOG_PEAK:-}" ]]; then
+    if buildlog_step_compiles "$@"; then
         buildlog_wait_for_memory
+    fi
+    if [[ -n "${BUILDLOG_START:-}" ]]; then
         buildlog_now
         BUILDLOG_START="${BUILDLOG_NOW:-}"
     fi

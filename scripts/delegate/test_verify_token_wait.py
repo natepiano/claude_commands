@@ -71,6 +71,8 @@ esac
         source = self.root / "src" / "lib.rs"
         source.parent.mkdir()
         _ = source.write_text("pub fn value() -> u8 { 1 }\n")
+        meminfo = self.root / "meminfo"
+        _ = meminfo.write_text("MemAvailable: 50331648 kB\n")
         self.environment = {
             **{name: value for name, value in os.environ.items()
                if name not in {"PLAN_DELEGATE_BOARD_DIR", "PLAN_DELEGATE_TEAM_ROLE"}},
@@ -89,6 +91,7 @@ esac
             "XDG_CACHE_HOME": str(self.root / "cache"),
             "BUILDLOG_DIR": str(self.root / "buildlog"),
             "BUILDLOG_BUILDS_CGROUP": str(self.root / "cgroup"),
+            "BUILDLOG_MEMINFO": str(meminfo),
             "BUILDLOG_CI_CGROUP": str(self.root / "cgroup"),
             "BUILDLOG_ZRAM": str(self.root / "zram"),
             "BUILDLOG_OFF": "1",
