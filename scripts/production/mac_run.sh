@@ -20,12 +20,15 @@ log=/tmp/mac_run_hana.log
 example_hold=20
 # crate, example, then its required feature when it has one.
 examples=(
-  "hana_diegetic typography typography_overlay"
+  "hana_diegetic typography"
   "hana_diegetic units"
   "hana_diegetic widgets"
   "hana_diegetic diegetic_text_stress"
   "hana_conduit playground"
   "hana_lagrange showcase fit_overlay"
+  "hana_liminal all_modes"
+  "hana_valence staggered_unfold"
+  "hana_mimesis_tools show_beam"
 )
 
 ssh -o ConnectTimeout=6 -o BatchMode=yes $host true 2>/dev/null || { print "mac unreachable"; exit 3 }
