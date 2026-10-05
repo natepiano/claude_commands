@@ -6,7 +6,7 @@ Usage:
                        --started <ISO> --merged <ISO> --holds <K> --merge-defects <D>
                        [--ux-findings <N>] [--code-findings <N>] [--review-minutes <M>]
                        [--ux-check-minutes <U>] [--ux-repair-minutes <R>]
-                       [--note <text>]
+                       [--excluded <reason>] [--note <text>]
   review_regime.py report [--since <ISO date>]
   review_regime.py watch
   review_regime.py ack
@@ -22,14 +22,16 @@ phase; `report` compares the phases before, under and after the trial:
 - cost: longer phases (start to merge) and more review-seat minutes.
 
 `holds` counts the checkpoints of the phase the showrunner held; `merge-defects`
-counts the defect rows across all of that phase's merge design checks.
+counts the defect rows its merge design checks found in the phase's own work,
+moved ones included and rows the check calls older than the phase left out.
 
-A phase recorded with `--ux-check-minutes 0` changed nothing on screen, so it
-cannot show what the screenshot check buys: `report` leaves it out, and `watch`
-counts only `after` phases whose screenshots were checked toward WATCH_PHASES
-(user, 2026-10-05: eleven build-tool phases made the first count bad). Once the
-count is reached it exits 3, the report waiting for the user, until `ack`
-records their acknowledgment.
+A phase the comparison cannot use carries the reason in `excluded`: it changed
+nothing on screen (`--ux-check-minutes 0` records that), no merge design check
+judged it, or the log lacks the check's count. `report` and `watch` use only the
+rest (user, 2026-10-05: eleven build-tool phases made the first count bad; every
+row was marked from the production logs that day). Once `watch` counts
+WATCH_PHASES `after` phases it exits 3, the report waiting for the user, until
+`ack` records their acknowledgment.
 """
 
 import argparse
@@ -49,6 +51,8 @@ REGIMES = ("before", "trial", "after")
 WATCH_PHASES = 12
 # `watch` exits with this while the finished report waits for the user's acknowledgment.
 WAITING_FOR_ACKNOWLEDGMENT = 3
+# `add` records this reason for a phase whose screenshot check took no minutes.
+NO_VISIBLE_CHANGE = "no visible change"
 
 
 @dataclass(frozen=True)
@@ -66,6 +70,7 @@ class Row:
     ux_check_minutes: float | None
     ux_repair_minutes: float | None
     note: str | None
+    excluded: str | None
 
     def hours(self) -> float:
         return (datetime.fromisoformat(self.merged) - datetime.fromisoformat(self.started)).total_seconds() / 3600
@@ -88,6 +93,7 @@ def read_rows() -> list[Row]:
         check_minutes = record.get("ux_check_minutes")
         repair_minutes = record.get("ux_repair_minutes")
         note = record.get("note")
+        excluded = record.get("excluded")
         rows.append(
             Row(
                 unit=str(record["unit"]),
@@ -103,6 +109,7 @@ def read_rows() -> list[Row]:
                 ux_check_minutes=float(check_minutes) if isinstance(check_minutes, int | float) else None,
                 ux_repair_minutes=float(repair_minutes) if isinstance(repair_minutes, int | float) else None,
                 note=note if isinstance(note, str) else None,
+                excluded=excluded if isinstance(excluded, str) else None,
             )
         )
     return rows
@@ -115,6 +122,10 @@ def add(arguments: argparse.Namespace) -> None:
         parsed = datetime.fromisoformat(moment)
         if parsed.tzinfo is None:
             raise SystemExit(f"review_regime: --{label} {moment!r} needs a UTC offset")
+    check_minutes = cast(float | None, arguments.ux_check_minutes)
+    excluded = cast(str | None, arguments.excluded)
+    if excluded is None and check_minutes == 0:
+        excluded = NO_VISIBLE_CHANGE
     row = Row(
         unit=cast(str, arguments.unit),
         phase=cast(str, arguments.phase),
@@ -126,9 +137,10 @@ def add(arguments: argparse.Namespace) -> None:
         ux_findings=cast(int | None, arguments.ux_findings),
         code_findings=cast(int | None, arguments.code_findings),
         review_minutes=cast(float | None, arguments.review_minutes),
-        ux_check_minutes=cast(float | None, arguments.ux_check_minutes),
+        ux_check_minutes=check_minutes,
         ux_repair_minutes=cast(float | None, arguments.ux_repair_minutes),
         note=cast(str | None, arguments.note),
+        excluded=excluded,
     )
     if row.hours() < 0:
         raise SystemExit("review_regime: --merged is before --started")
@@ -137,7 +149,7 @@ def add(arguments: argparse.Namespace) -> None:
     LEDGER.parent.mkdir(parents=True, exist_ok=True)
     with LEDGER.open("a") as ledger:
         _ = ledger.write(json.dumps(asdict(row)) + "\n")
-    print(f"added {row.unit} phase {row.phase} ({row.regime}): {row.holds} holds, {row.merge_defects} merge defects, {row.hours():.1f} h")
+    print(f"added {row.unit} phase {row.phase} ({row.regime}): {row.holds} holds, {row.merge_defects} merge defects, {row.hours():.1f} h" + (f"; excluded: {row.excluded}" if row.excluded else ""))
 
 
 def mean_of(values: list[float]) -> str:
@@ -149,7 +161,7 @@ def median_of(values: list[float]) -> str:
 
 
 def report(since: str | None) -> None:
-    rows = [row for row in read_rows() if (since is None or row.merged >= since) and row.ux_check_minutes != 0]
+    rows = [row for row in read_rows() if (since is None or row.merged >= since) and row.excluded is None]
     lines = [f"| | {' | '.join(REGIMES)} |", "| --- " * (len(REGIMES) + 1) + "|"]
     groups = {regime: [row for row in rows if row.regime == regime] for regime in REGIMES}
 
@@ -178,7 +190,7 @@ def report(since: str | None) -> None:
 
 
 def watched_phases() -> int:
-    return sum(1 for row in read_rows() if row.regime == "after" and (row.ux_check_minutes or 0) > 0)
+    return sum(1 for row in read_rows() if row.regime == "after" and row.excluded is None)
 
 
 def acknowledged() -> str | None:
@@ -227,6 +239,7 @@ def main() -> int:
     _ = adding.add_argument("--review-minutes", type=float)
     _ = adding.add_argument("--ux-check-minutes", type=float)
     _ = adding.add_argument("--ux-repair-minutes", type=float)
+    _ = adding.add_argument("--excluded", help=f"why the comparison cannot use this phase; --ux-check-minutes 0 records {NO_VISIBLE_CHANGE!r}")
     _ = adding.add_argument("--note")
     reporting = commands.add_parser("report")
     _ = reporting.add_argument("--since", help="only phases merged on or after this ISO date; design checks began 2026-09-28")

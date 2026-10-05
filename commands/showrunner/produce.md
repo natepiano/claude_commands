@@ -429,14 +429,17 @@ Input: the unit, phase, hash and shots from its notice.
     - record the phase in the review ledger:
       `python3 ~/.claude/scripts/production/review_regime.py add --unit <unit> --phase <N> --regime after --started <ISO> --merged <ISO> --holds <K> --merge-defects <D> --ux-findings <N> --code-findings <N> --review-minutes <M> --ux-check-minutes <U> --ux-repair-minutes <R>`.
       `holds` counts this phase's held checkpoints and `merge-defects` the
-      defect rows of all its design checks, both from `LOG`; the last three come
+      defect rows its merge design checks found in its own work, moved ones
+      included and rows the check calls older left out, both from `LOG`. A
+      phase no merge design check judged adds `--excluded "no merge design
+      check"`, and `report` and `watch` leave it out. The last three come
       from the unit's `review trial:` checkpoint line. A phase whose broad
       review ran the `craft` lens is `--regime trial`. The 12-phase report
       says whether the screenshot check's minutes (check plus its repairs) buy
       fewer holds and merge defects (user, 2026-10-04).
     - then run `review_regime.py watch` (user decision 2026-10-04: watch 12
-      phases without the code reviewer; since 2026-10-05 only phases whose
-      screenshots were checked count). The first time it exits 3, run
+      phases without the code reviewer; since 2026-10-05 only phases with no
+      `excluded` reason count). The first time it exits 3, run
       `report --since 2026-09-28`, push at once
       (`~/.claude/scripts/notify/pushover.py --priority 1 "Hana: review watch" "<one line; the table is in this session>"`),
       log it, and give the user the table. While it exits 3, the dailies
