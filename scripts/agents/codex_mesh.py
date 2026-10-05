@@ -57,9 +57,10 @@ import subprocess
 import sys
 import time
 from collections.abc import Callable, Generator
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import TextIO, TypedDict, cast, final
+from typing import NotRequired, TextIO, TypedDict, cast, final
 
 SERVER_FILE = "mesh_server.json"
 ROSTER_FILE = "mesh_roster.json"
@@ -82,6 +83,13 @@ RESIDENT_POLL_SECS = 1.0
 # cached, without a round trip, so it fails in seconds; a refusal that travelled
 # to the provider and back does not arrive this quickly and this consistently.
 RETRY_FAST_FAILURE_SECS = 120.0
+CAPACITY_WAIT_SECS = 30.0
+CAPACITY_MAX_WAIT_SECS = 300.0
+CAPACITY_BUDGET_SECS = 1200.0
+WAITING_CAPACITY = "waiting_capacity"
+CAPACITY_EXHAUSTED = "capacity_exhausted"
+LAUNCHER_ATTACHED_STATUSES = frozenset(("running", WAITING_CAPACITY))
+ENDABLE_STATUSES = LAUNCHER_ATTACHED_STATUSES | {CAPACITY_EXHAUSTED}
 
 
 class RpcMessage(TypedDict, total=False):
@@ -103,6 +111,7 @@ class ThreadRecord(TypedDict):
     thread_id: str
     turn_id: str
     status: str
+    launcher_pid: NotRequired[int]
 
 
 # The three places an untyped value enters this module. Each is confined to one
@@ -292,7 +301,7 @@ class Client:
         self._ws.settimeout(remaining)
         try:
             return self._ws.recv()
-        except (TimeoutError, OSError):
+        except TimeoutError:
             return None
 
     def next_frame(self, deadline: float) -> RpcMessage | None:
@@ -397,6 +406,64 @@ def _live_server_port(session_dir: str) -> int | None:
 
 def _end_marker_path(session_dir: str, name: str) -> Path:
     return _session_path(session_dir, f"{name}.end")
+
+
+@contextlib.contextmanager
+def _pending_file(session_dir: str, name: str) -> Generator[TextIO]:
+    path = _session_path(session_dir, f"{name}.pending.json")
+    with path.open("a+", encoding="utf-8") as handle:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        try:
+            yield handle
+        finally:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+
+def _pending_for_thread(handle: TextIO, thread_id: str) -> list[str]:
+    _ = handle.seek(0)
+    stored = _as_dict(_loads(handle.read()))
+    if stored.get("thread_id") != thread_id:
+        return []
+    messages = stored.get("messages")
+    return [item for item in cast("list[object]", messages) if isinstance(item, str)] if isinstance(messages, list) else []
+
+
+def _write_pending(handle: TextIO, thread_id: str, messages: list[str]) -> None:
+    _ = handle.seek(0)
+    _ = handle.truncate()
+    _ = handle.write(json.dumps({"thread_id": thread_id, "messages": messages}))
+    handle.flush()
+
+
+def _add_pending(session_dir: str, name: str, thread_id: str, message: str) -> None:
+    with _pending_file(session_dir, name) as handle:
+        messages = _pending_for_thread(handle, thread_id)
+        messages.append(message)
+        _write_pending(handle, thread_id, messages)
+
+
+def _move_queue_to_pending(client: Client, session_dir: str, name: str, thread_id: str) -> None:
+    """Park queued text locally before an idle server opens another turn."""
+    for _ in range(END_QUEUE_DRAIN_ROUNDS):
+        listed = _require(client.call("thread/queue/list", {"threadId": thread_id}), "thread/queue/list")
+        items = listed.get("data")
+        if not isinstance(items, list) or not items:
+            return
+        for item in cast("list[object]", items):
+            queued = _as_dict(item)
+            submission = _as_str(queued.get("id"))
+            inputs = queued.get("input")
+            if not submission or not isinstance(inputs, list):
+                continue
+            messages = [
+                _as_str(_as_dict(part).get("text")) for part in cast("list[object]", inputs)
+                if _as_str(_as_dict(part).get("type")) == "text"
+            ]
+            if messages:
+                _add_pending(session_dir, name, thread_id, "\n".join(messages))
+            _ = _require(client.call("thread/queue/delete", {
+                "threadId": thread_id, "queuedSubmissionId": submission
+            }), "thread/queue/delete")
 
 
 def _message_text(args: argparse.Namespace) -> str:
@@ -589,6 +656,11 @@ def _more_work_coming(client: Client, thread_id: str, deadline: float) -> bool:
     items = _as_dict(listed.get("result")).get("data")
     if isinstance(items, list) and items:
         return True
+    live = _read_live_turn(client, thread_id)
+    if isinstance(live, ThreadStateUnknown):
+        raise SystemExit(f"thread {thread_id}: thread/read failed: {live.reason}")
+    if not isinstance(live, ThreadIdle):
+        return True
     # Frames are held locally rather than pushed back as they arrive: a frame
     # returned to the buffer is the next thing `next_frame` hands out, so
     # push-as-you-go would re-serve the same frame and never reach the socket.
@@ -608,20 +680,110 @@ def _more_work_coming(client: Client, thread_id: str, deadline: float) -> bool:
     return started
 
 
-class Attempt(TypedDict):
-    """What one run of a delegate against one app-server came to.
+@dataclass(frozen=True)
+class TurnCompleted:
+    """The turn finished successfully."""
 
-    `produced_work` is the safety interlock on retrying: a delegate that
-    completed even one item may already have edited the tree, and running its
-    prompt again would apply those edits a second time.
-    """
+
+@dataclass(frozen=True)
+class TurnRefusedForCapacity:
+    detail: str
+
+
+@dataclass(frozen=True)
+class TurnFailed:
+    detail: str
+
+
+TurnOutcome = TurnCompleted | TurnRefusedForCapacity | TurnFailed
+
+
+@dataclass(frozen=True)
+class RunCompleted:
+    """The delegate ended without a failure."""
+
+
+@dataclass(frozen=True)
+class FailedBeforeThread:
+    """No thread id exists, so a fast retry may repeat the original prompt."""
 
     failure: str
-    produced_work: bool
     seconds: float
 
 
-def _retry_warranted(attempt: Attempt, fresh_server: bool, resident: bool) -> bool:
+@dataclass(frozen=True)
+class FailedWithThread:
+    """The thread exists; its original prompt must never be submitted again."""
+
+    thread_id: str
+    failure: str
+    seconds: float
+
+
+@dataclass(frozen=True)
+class CapacityRetriesExhausted:
+    """The original task still needs a turn, but its launcher is stopping."""
+
+    thread_id: str
+    retries: int
+    minutes: int
+
+    def message(self, name: str) -> str:
+        return (
+            f"model still at capacity after {self.retries} retries over {self.minutes} min; "
+            f"thread {self.thread_id} stays on the roster (codex_mesh.py end --to {name})"
+        )
+
+
+RunOutcome = RunCompleted | FailedBeforeThread | FailedWithThread | CapacityRetriesExhausted
+
+
+@dataclass(frozen=True)
+class ThreadIdle:
+    """The server says no turn is active."""
+
+
+@dataclass(frozen=True)
+class ThreadLive:
+    turn_id: str
+
+
+@dataclass(frozen=True)
+class ThreadActiveWithoutTurn:
+    """A turn is active but its id is not persisted in thread/read yet."""
+
+
+@dataclass(frozen=True)
+class ThreadStateUnknown:
+    reason: str
+
+
+ThreadState = ThreadIdle | ThreadLive | ThreadActiveWithoutTurn | ThreadStateUnknown
+
+
+def _capacity_clock() -> float:
+    return time.monotonic()
+
+
+def _capacity_sleep(seconds: float) -> None:
+    time.sleep(seconds)
+
+
+def _turn_outcome(method: str, params: dict[str, object]) -> TurnOutcome:
+    turn = _as_dict(params.get("turn"))
+    error = _as_dict(turn.get("error")) if method == "turn/completed" else _as_dict(params.get("error"))
+    detail = _as_str(error.get("message"))
+    info = error.get("codexErrorInfo")
+    if info in ("serverOverloaded", "flexUnavailable") or (
+        isinstance(info, dict) and ("serverOverloaded" in info or "flexUnavailable" in info)
+    ) or "Selected model is at capacity" in detail:
+        return TurnRefusedForCapacity(detail)
+    if method == "turn/failed" or detail or turn.get("status") in ("failed", "interrupted"):
+        return TurnFailed(detail or "turn failed")
+    return TurnCompleted()
+
+
+def _retry_warranted(outcome: RunOutcome, fresh_server: bool, resident: bool) -> bool:
     """Whether this failure is worth one more run against a clean app-server.
 
     A wedged app-server replays a provider message it cached earlier to every
@@ -633,7 +795,7 @@ def _retry_warranted(attempt: Attempt, fresh_server: bool, resident: bool) -> bo
 
     Four conditions, each of them narrowing:
       * the failed server was inherited, so nothing has tested it this run;
-      * the delegate produced no work, so repeating its prompt repeats nothing;
+      * no thread exists, so repeating the prompt cannot repeat work;
       * the failure arrived too fast to have reached the provider;
       * and the delegate is not resident, where a caller is already holding the
         replies and a silent second attempt would arrive behind them.
@@ -641,8 +803,8 @@ def _retry_warranted(attempt: Attempt, fresh_server: bool, resident: bool) -> bo
     return (
         not fresh_server
         and not resident
-        and not attempt["produced_work"]
-        and attempt["seconds"] <= RETRY_FAST_FAILURE_SECS
+        and isinstance(outcome, FailedBeforeThread)
+        and outcome.seconds <= RETRY_FAST_FAILURE_SECS
     )
 
 
@@ -650,23 +812,64 @@ def command_start(args: argparse.Namespace) -> int:
     session_dir = _as_str(_attr(args, "session_dir"))
     name = _as_str(_attr(args, "name"))
     resident = _attr(args, "resident") is True
+    existing = _read_json_object(_session_path(session_dir, ROSTER_FILE)).get(name)
+    old_port = _live_server_port(session_dir)
+    if isinstance(existing, dict):
+        old_entry = _as_dict(cast("object", existing))
+        old_thread = _as_str(old_entry.get("thread_id"))
+        if old_thread:
+            launcher_pid = old_entry.get("launcher_pid")
+            if old_entry.get("status") == WAITING_CAPACITY:
+                if isinstance(launcher_pid, int) and _pid_alive(launcher_pid):
+                    print(
+                        f"codex_mesh: {name}: thread {old_thread} is waiting for capacity; use codex_mesh.py end --to {name} before relaunching",
+                        file=sys.stderr,
+                    )
+                    return 2
+                # A dead waiting launcher cannot resume this thread.
+                old_thread = ""
+        if old_thread and old_port is not None:
+            try:
+                check = Client(old_port, f"relaunch-{os.getpid()}")
+                try:
+                    live = _read_live_turn(check, old_thread)
+                finally:
+                    check.close()
+            except (ConnectionError, OSError, SystemExit) as exc:
+                live = ThreadStateUnknown(str(exc) or exc.__class__.__name__)
+            if isinstance(live, ThreadStateUnknown):
+                print(
+                    f"codex_mesh: {name}: thread {old_thread}'s state could not be read ({live.reason}); use codex_mesh.py end --to {name} before relaunching",
+                    file=sys.stderr,
+                )
+                return 2
+            if not isinstance(live, ThreadIdle):
+                print(
+                    f"codex_mesh: {name}: thread {old_thread} has a live turn; use codex_mesh.py end --to {name} before relaunching",
+                    file=sys.stderr,
+                )
+                return 2
     port, fresh_server = ensure_server(session_dir)
-    attempt = _run_delegate(args, port)
-    if attempt["failure"] and _retry_warranted(attempt, fresh_server, resident):
+    outcome = _run_delegate(args, port)
+    if _retry_warranted(outcome, fresh_server, resident):
         _ = _retire_server(session_dir, port)
         port, _fresh = ensure_server(session_dir)
-        elapsed = f"{attempt['seconds']:.0f}s"
+        assert isinstance(outcome, FailedBeforeThread)
+        elapsed = f"{outcome.seconds:.0f}s"
         note = f"the inherited app-server failed in {elapsed} without reaching"
         print(f"codex_mesh: {name}: {note} the provider; retrying on a new one",
               file=sys.stderr)
-        attempt = _run_delegate(args, port)
-    if attempt["failure"]:
-        print(f"codex_mesh: {name}: {attempt['failure']}", file=sys.stderr)
+        outcome = _run_delegate(args, port)
+    if isinstance(outcome, (FailedBeforeThread, FailedWithThread)):
+        print(f"codex_mesh: {name}: {outcome.failure}", file=sys.stderr)
+        return 1
+    if isinstance(outcome, CapacityRetriesExhausted):
+        print(f"codex_mesh: {name}: {outcome.message(name)}", file=sys.stderr)
         return 1
     return 0
 
 
-def _run_delegate(args: argparse.Namespace, port: int) -> Attempt:
+def _run_delegate(args: argparse.Namespace, port: int) -> RunOutcome:
     """Attach one delegate to the app-server on `port` and run it to its end."""
     session_dir = _as_str(_attr(args, "session_dir"))
     name = _as_str(_attr(args, "name"))
@@ -675,14 +878,7 @@ def _run_delegate(args: argparse.Namespace, port: int) -> Attempt:
     try:
         return _attach_and_run(args, port, session_dir, name, timeout, opened)
     except (ConnectionError, OSError, SystemExit) as exc:
-        # A wedged or vanished server refuses the attach itself, so these are
-        # the same failure as one the turn reports and take the same recovery.
-        # Nothing has run at this point, which is what makes that safe.
-        return Attempt(
-            failure=str(exc) or exc.__class__.__name__,
-            produced_work=False,
-            seconds=time.time() - opened,
-        )
+        return FailedBeforeThread(str(exc) or exc.__class__.__name__, time.time() - opened)
 
 
 def _thread_start_params(args: argparse.Namespace) -> dict[str, object]:
@@ -718,7 +914,7 @@ def _attach_and_run(
     name: str,
     timeout: float,
     opened: float,
-) -> Attempt:
+) -> RunOutcome:
     prompt = Path(_as_str(_attr(args, "prompt_file"))).read_text(encoding="utf-8")
     log_path = Path(_as_str(_attr(args, "log_file")))
     summary_path = Path(_as_str(_attr(args, "summary_file")))
@@ -733,169 +929,285 @@ def _attach_and_run(
     if not thread_id:
         raise SystemExit("codex_mesh: thread/start returned no thread id")
 
-    # Best effort: the server-side name is only a convenience for `codex agents`,
-    # and send/steer address delegates through this session's roster, written
-    # just below. A rename that fails is not worth losing a delegate over.
-    _ = client.call("thread/name/set", {"threadId": thread_id, "name": name})
-    _update_roster(
-        session_dir, name, {"thread_id": thread_id, "turn_id": "", "status": "starting"}
-    )
+    with _pending_file(session_dir, name) as pending_file:
+        previous = _as_dict(_read_json_object(
+            _session_path(session_dir, ROSTER_FILE)
+        ).get(name))
+        previous_thread = _as_str(previous.get("thread_id"))
+        if previous_thread and previous_thread != thread_id:
+            dropped = len(_pending_for_thread(pending_file, previous_thread))
+            _ = pending_file.seek(0)
+            _ = pending_file.truncate()
+            with log_path.open("a", encoding="utf-8") as log:
+                stamp = datetime.now().astimezone().isoformat(timespec="seconds")
+                _ = log.write(
+                    f"[{stamp}] mesh: dropped {dropped} held messages for thread {previous_thread} on relaunch\n"
+                )
+        _update_roster(
+            session_dir, name, {"thread_id": thread_id, "turn_id": "", "status": "starting"}
+        )
 
-    turn_params: dict[str, object] = {
-        "threadId": thread_id,
-        "input": [{"type": "text", "text": prompt}],
-    }
-    effort = _as_str(_attr(args, "effort"))
-    if effort:
-        turn_params["effort"] = effort
-    turn = _require(client.call("turn/start", turn_params), "turn/start")
-    turn_id = _as_str(_as_dict(turn.get("turn")).get("id"))
-    _update_roster(
-        session_dir,
-        name,
-        {"thread_id": thread_id, "turn_id": turn_id, "status": "running"},
-    )
-
+    turn_id = ""
     resident = _attr(args, "resident") is True
     end_marker = _end_marker_path(session_dir, name)
     end_marker.unlink(missing_ok=True)
-
     final_answer = ""
     failure = ""
     replies = 0
-    # Any completed item is work: not every item edits the tree, but telling
-    # which did means reading item types this module does not model, and the
-    # cost of being wrong runs one way. A delegate held back from a retry it
-    # deserved loses a round; one retried after it had already written loses
-    # the edits it made to a second pass over the same prompt.
-    produced_work = False
+    capacity_waited = 0.0
+    capacity_retries = 0
+    resume_owed = False
+    retry_waited = False
+    run_outcome: RunOutcome = RunCompleted()
     deadline = time.time() + timeout
-    with log_path.open("a", encoding="utf-8") as log:
-        _ = log.write(f"[{_now_stamp()}] mesh: {name} thread {thread_id}\n")
-        log.flush()
-        while time.time() < deadline:
-            # A resident thread is silent between turns, so a full-deadline wait
-            # would sleep straight through `end`; wake often enough to see it.
-            if resident:
-                wait_until = min(deadline, time.time() + RESIDENT_POLL_SECS)
-            else:
-                wait_until = deadline
-            frame = client.next_frame(wait_until)
-            if frame is None:
-                if resident and end_marker.exists():
-                    break
-                continue
-            method = frame.get("method")
-            params = _as_dict(frame.get("params"))
-            if _as_str(params.get("threadId")) not in ("", thread_id):
-                continue
-            if method == "turn/started":
-                live = _as_str(_as_dict(params.get("turn")).get("id"))
-                if live:
-                    turn_id = live
-                    _update_roster(
-                        session_dir,
-                        name,
-                        {"thread_id": thread_id, "turn_id": live, "status": "running"},
-                    )
-            elif method == "item/completed":
-                produced_work = True
-                item = _as_dict(params.get("item"))
-                _ = log.write(f"[{_now_stamp()}] {_describe_item(item)}\n")
-                log.flush()
-                if _as_str(item.get("type")) == "agentMessage":
-                    text = _as_str(item.get("text"))
-                    if text:
-                        final_answer = text
-            elif method in ("turn/completed", "turn/failed"):
-                if method == "turn/completed":
-                    completed = _as_dict(params.get("turn"))
-                    failure = _as_str(_as_dict(completed.get("error")).get("message"))
-                else:
-                    detail = _as_str(_as_dict(params.get("error")).get("message"))
-                    failure = detail or "turn failed"
-                if not resident:
-                    if (
-                        method == "turn/failed"
-                        or failure
-                        or not _more_work_coming(client, thread_id, deadline)
-                    ):
+    try:
+        # The roster is written before this call: a disconnect after thread
+        # creation must still leave its id reachable.
+        _ = client.call("thread/name/set", {"threadId": thread_id, "name": name})
+        turn_id = _start_turn(client, args, thread_id, prompt)
+        _update_roster(session_dir, name, {"thread_id": thread_id, "turn_id": turn_id, "status": "running"})
+        with log_path.open("a", encoding="utf-8") as log:
+            _ = log.write(f"[{_now_stamp()}] mesh: {name} thread {thread_id}\n")
+            log.flush()
+            while time.time() < deadline:
+                # A resident thread must wake to see `end` between turns.
+                wait_until = min(deadline, time.time() + RESIDENT_POLL_SECS) if resident else deadline
+                frame = client.next_frame(wait_until)
+                if frame is None:
+                    if end_marker.exists():
                         break
-                    # A peer's message is waiting. The server starts that turn
-                    # by itself, so the only thing to do is keep streaming --
-                    # exiting here would strand the message and kill the
-                    # delegate mid-reply.
                     continue
-                # Resident: every finished turn is a reply to deliver, an error
-                # included -- the caller is waiting on this one and would
-                # otherwise wait forever. The thread stays open for the next
-                # message; only `end` closes it.
-                replies += 1
-                produced_work = True
-                _deliver_reply(
-                    name, replies, final_answer, failure, summary_path, reply_path, log
-                )
-                final_answer = ""
-                failure = ""
-                _update_roster(
-                    session_dir,
-                    name,
-                    {"thread_id": thread_id, "turn_id": "", "status": "running"},
-                )
-                if end_marker.exists():
-                    break
-        else:
-            failure = f"no turn/completed within {timeout:.0f}s"
+                method = frame.get("method")
+                params = _as_dict(frame.get("params"))
+                if _as_str(params.get("threadId")) not in ("", thread_id):
+                    continue
+                if method == "turn/started":
+                    live = _as_str(_as_dict(params.get("turn")).get("id"))
+                    if live:
+                        turn_id = live
+                        _update_roster(session_dir, name, {"thread_id": thread_id, "turn_id": live, "status": "running"})
+                elif method == "item/completed":
+                    item = _as_dict(params.get("item"))
+                    _ = log.write(f"[{_now_stamp()}] {_describe_item(item)}\n")
+                    log.flush()
+                    if _as_str(item.get("type")) == "agentMessage":
+                        text = _as_str(item.get("text"))
+                        if text:
+                            final_answer = text
+                elif method in ("turn/completed", "turn/failed"):
+                    turn_outcome = _turn_outcome(method, params)
+                    if isinstance(turn_outcome, TurnRefusedForCapacity):
+                        resume_owed = True
+                        retry_waited = False
+                        _move_queue_to_pending(client, session_dir, name, thread_id)
+                        remaining = CAPACITY_BUDGET_SECS - capacity_waited
+                        if remaining <= 0:
+                            run_outcome = CapacityRetriesExhausted(
+                                thread_id, capacity_retries, int(CAPACITY_BUDGET_SECS / 60)
+                            )
+                            failure = run_outcome.message(name)
+                            _update_roster(session_dir, name, {
+                                "thread_id": thread_id, "turn_id": "", "status": CAPACITY_EXHAUSTED
+                            })
+                            break
+                        # A queued peer message may already have opened a turn.
+                        # Stream it, then return here with the task still owed.
+                        with _pending_file(session_dir, name):
+                            current = _as_dict(_read_json_object(
+                                _session_path(session_dir, ROSTER_FILE)
+                            ).get(name))
+                            if end_marker.exists() or current.get("thread_id") != thread_id:
+                                reason = "ended" if end_marker.exists() else "replaced"
+                                _ = log.write(f"[{_now_stamp()}] capacity launcher {reason}; no resume turn started\n")
+                                log.flush()
+                                return FailedWithThread(thread_id, f"capacity launcher {reason}", time.time() - opened)
+                        live = _read_live_turn(client, thread_id)
+                        if isinstance(live, ThreadStateUnknown):
+                            raise SystemExit(f"thread {thread_id}: thread/read failed: {live.reason}")
+                        if not isinstance(live, ThreadIdle):
+                            continue
+                    if resume_owed:
+                        if not retry_waited:
+                            remaining = CAPACITY_BUDGET_SECS - capacity_waited
+                            wait = min(CAPACITY_WAIT_SECS * 2.0 ** capacity_retries,
+                                       CAPACITY_MAX_WAIT_SECS, remaining)
+                            capacity_retries += 1
+                            with _pending_file(session_dir, name):
+                                _update_roster(session_dir, name, {
+                                    "thread_id": thread_id, "turn_id": "",
+                                    "status": WAITING_CAPACITY, "launcher_pid": os.getpid(),
+                                })
+                            live = _read_live_turn(client, thread_id)
+                            if isinstance(live, ThreadStateUnknown):
+                                raise SystemExit(f"thread {thread_id}: thread/read failed: {live.reason}")
+                            if not isinstance(live, ThreadIdle):
+                                continue
+                            next_at = datetime.now().astimezone().timestamp() + wait
+                            next_stamp = datetime.fromtimestamp(next_at).astimezone().isoformat(timespec="seconds")
+                            _ = log.write(f"[{datetime.now().astimezone().isoformat(timespec='seconds')}] capacity retry {capacity_retries}: next turn at {next_stamp}\n")
+                            log.flush()
+                            wait_started = _capacity_clock()
+                            _capacity_sleep(wait)
+                            capacity_waited += max(wait, _capacity_clock() - wait_started)
+                            retry_waited = True
+                        live = _read_live_turn(client, thread_id)
+                        if isinstance(live, ThreadStateUnknown):
+                            raise SystemExit(f"thread {thread_id}: thread/read failed: {live.reason}")
+                        if not isinstance(live, ThreadIdle):
+                            if isinstance(live, ThreadLive):
+                                turn_id = live.turn_id
+                            else:
+                                turn_id = ""
+                            with _pending_file(session_dir, name):
+                                current = _as_dict(_read_json_object(
+                                    _session_path(session_dir, ROSTER_FILE)
+                                ).get(name))
+                                if end_marker.exists() or current.get("thread_id") != thread_id:
+                                    reason = "ended" if end_marker.exists() else "replaced"
+                                    _ = log.write(f"[{_now_stamp()}] capacity launcher {reason}; no resume turn started\n")
+                                    log.flush()
+                                    return FailedWithThread(thread_id, f"capacity launcher {reason}", time.time() - opened)
+                                _update_roster(session_dir, name, {
+                                    "thread_id": thread_id, "turn_id": turn_id, "status": "running"
+                                })
+                            continue
+                        with _pending_file(session_dir, name) as pending_file:
+                            current = _as_dict(_read_json_object(
+                                _session_path(session_dir, ROSTER_FILE)
+                            ).get(name))
+                            if end_marker.exists() or current.get("thread_id") != thread_id:
+                                reason = "ended" if end_marker.exists() else "replaced"
+                                _ = log.write(f"[{_now_stamp()}] capacity launcher {reason}; no resume turn started\n")
+                                log.flush()
+                                return FailedWithThread(thread_id, f"capacity launcher {reason}", time.time() - opened)
+                            messages = _pending_for_thread(pending_file, thread_id)
+                            turn_id = _start_turn(
+                                client, args, thread_id,
+                                "Your last turn stopped because the model was at capacity. Continue from where you stopped; your edits are already in the tree.",
+                                tuple(messages),
+                            )
+                            _write_pending(pending_file, thread_id, [])
+                            _update_roster(session_dir, name, {
+                                "thread_id": thread_id, "turn_id": turn_id, "status": "running"
+                            })
+                        resume_owed = False
+                        continue
+                    # A finished turn may have a peer turn opening behind it.
+                    if not resident and _more_work_coming(client, thread_id, deadline):
+                        continue
+                    failure = turn_outcome.detail if isinstance(turn_outcome, TurnFailed) else ""
+                    if not resident:
+                        break
+                    replies += 1
+                    _deliver_reply(name, replies, final_answer, failure, summary_path, reply_path, log)
+                    final_answer = ""
+                    failure = ""
+                    _update_roster(session_dir, name, {"thread_id": thread_id, "turn_id": "", "status": "running"})
+                    if end_marker.exists():
+                        break
+            else:
+                failure = f"no turn/completed within {timeout:.0f}s"
+        # A queued peer message can open a turn after the last completion
+        # notification. Check once more before this launcher stops watching.
+        if not resident or failure or end_marker.exists():
+            _end_unwatched_turn(port, thread_id, log_path)
+        if not resident or replies == 0:
+            _finish_summary(summary_path, reply_path, name, replies + 1, final_answer or failure or f"The delegate {name} produced no summary.")
+        if not isinstance(run_outcome, CapacityRetriesExhausted):
+            _update_roster(session_dir, name, {"thread_id": thread_id, "turn_id": turn_id, "status": "failed" if failure else "done"})
+        if isinstance(run_outcome, CapacityRetriesExhausted):
+            return run_outcome
+        return FailedWithThread(thread_id, failure, time.time() - opened) if failure else RunCompleted()
+    except (ConnectionError, OSError, SystemExit) as exc:
+        # Once thread/start returned, even a disconnected turn/start may have
+        # begun work. Keep its id and never resubmit the original prompt.
+        _end_unwatched_turn(port, thread_id, log_path)
+        failure = str(exc) or exc.__class__.__name__
+        if _as_dict(_read_json_object(_session_path(session_dir, ROSTER_FILE)).get(name)).get("thread_id") == thread_id:
+            _update_roster(session_dir, name, {"thread_id": thread_id, "turn_id": turn_id, "status": "failed"})
+        return FailedWithThread(thread_id, failure, time.time() - opened)
+    finally:
+        client.close()
 
-    # A background thread has no output redirect, so the summary or reply file
-    # is the only place the caller can read the delegate's answer. A resident
-    # thread delivered each reply as it landed; only one that never replied
-    # needs this.
-    if not resident or replies == 0:
-        if not final_answer:
-            final_answer = failure or f"The delegate {name} produced no summary."
-        _finish_summary(summary_path, reply_path, name, replies + 1, final_answer)
-    _update_roster(
-        session_dir,
-        name,
-        {
-            "thread_id": thread_id,
-            "turn_id": turn_id,
-            "status": "failed" if failure else "done",
-        },
-    )
-    client.close()
-    return Attempt(
-        failure=failure, produced_work=produced_work, seconds=time.time() - opened
-    )
+
+def _start_turn(
+    client: Client, args: argparse.Namespace, thread_id: str, message: str,
+    pending: tuple[str, ...] = (),
+) -> str:
+    inputs: list[dict[str, str]] = [{"type": "text", "text": message}]
+    inputs.extend({"type": "text", "text": item} for item in pending)
+    params: dict[str, object] = {"threadId": thread_id, "input": inputs}
+    effort = _as_str(_attr(args, "effort"))
+    if effort:
+        params["effort"] = effort
+    result = _require(client.call("turn/start", params), "turn/start")
+    return _as_str(_as_dict(result.get("turn")).get("id"))
+
+
+def _end_unwatched_turn(port: int, thread_id: str, log_path: Path) -> None:
+    """Best effort cleanup when this launcher cannot watch another turn."""
+    try:
+        client = Client(port, f"cleanup-{os.getpid()}")
+        try:
+            _ = _drop_queued_messages(client, thread_id)
+            live = _read_live_turn(client, thread_id)
+            turn_id = _interruptible_turn_id(client, thread_id, live)
+            if isinstance(turn_id, ThreadLive):
+                _ = client.call("turn/interrupt", {
+                    "threadId": thread_id, "turnId": turn_id.turn_id
+                })
+            elif isinstance(turn_id, (ThreadStateUnknown, ThreadActiveWithoutTurn)):
+                reason = turn_id.reason if isinstance(turn_id, ThreadStateUnknown) else "no turn id"
+                with log_path.open("a", encoding="utf-8") as log:
+                    _ = log.write(f"[{_now_stamp()}] thread {thread_id} could not be interrupted ({reason})\n")
+        finally:
+            client.close()
+    except (ConnectionError, OSError, SystemExit) as exc:
+        with log_path.open("a", encoding="utf-8") as log:
+            _ = log.write(f"[{_now_stamp()}] thread {thread_id} could not be interrupted ({exc})\n")
 
 
 def command_send(args: argparse.Namespace) -> int:
     session_dir = _as_str(_attr(args, "session_dir"))
     target = _as_str(_attr(args, "to"))
-    record = _lookup(session_dir, target)
-    status = record.get("status", "unknown")
-    if status != "running":
-        # The thread outlives the launcher, so the server would happily start a
-        # turn for this message -- with nothing streaming it and nothing writing
-        # the summary. Silent work is worse than a refusal.
-        raise SystemExit(
-            f"codex_mesh: {target} is {status}, not running; read its summary file"
-        )
-    port, _fresh = ensure_server(session_dir)
-    client = Client(port, f"send-{os.getpid()}")
-    _ = _require(
-        client.call(
-            "thread/queue/add",
-            {
-                "threadId": record["thread_id"],
-                "clientUserMessageId": f"mesh-{secrets.token_hex(6)}",
-                "input": [{"type": "text", "text": _message_text(args)}],
-            },
-        ),
-        "thread/queue/add",
-    )
-    client.close()
+    with _pending_file(session_dir, target) as pending_file:
+        record = _lookup(session_dir, target)
+        if _end_marker_path(session_dir, target).exists():
+            print(f"codex_mesh: {target} is being ended; message not delivered", file=sys.stderr)
+            return 2
+        status = record.get("status", "unknown")
+        if status == CAPACITY_EXHAUSTED:
+            print(
+                f"codex_mesh: {target} is out of retries and has no launcher; a message would start a turn nobody watches (codex_mesh.py end --to {target})",
+                file=sys.stderr,
+            )
+            return 2
+        if status not in LAUNCHER_ATTACHED_STATUSES:
+            raise SystemExit(
+                f"codex_mesh: {target} is {status}, not running; read its summary file"
+            )
+        if status == WAITING_CAPACITY:
+            messages = _pending_for_thread(pending_file, record["thread_id"])
+            messages.append(_message_text(args))
+            _write_pending(pending_file, record["thread_id"], messages)
+            print(f"message for {target} will be delivered when the seat resumes")
+            return 0
+        port, _fresh = ensure_server(session_dir)
+        client = Client(port, f"send-{os.getpid()}")
+        try:
+            _ = _require(
+                client.call(
+                    "thread/queue/add",
+                    {
+                        "threadId": record["thread_id"],
+                        "clientUserMessageId": f"mesh-{secrets.token_hex(6)}",
+                        "input": [{"type": "text", "text": _message_text(args)}],
+                    },
+                ),
+                "thread/queue/add",
+            )
+        finally:
+            client.close()
     print(f"queued for {target}")
     return 0
 
@@ -974,9 +1286,13 @@ def command_end(args: argparse.Namespace) -> int:
     target = _as_str(_attr(args, "to"))
     record = _lookup(session_dir, target)
     status = record.get("status", "unknown")
-    if status != "running":
+    if status not in ENDABLE_STATUSES:
         print(f"{target} is {status}; nothing to end")
         return 0
+    with _pending_file(session_dir, target) as pending_file:
+        _end_marker_path(session_dir, target).touch()
+        _ = pending_file.seek(0)
+        _ = pending_file.truncate()
     port = _live_server_port(session_dir)
     dropped = 0
     if port is not None:
@@ -985,15 +1301,20 @@ def command_end(args: argparse.Namespace) -> int:
         dropped = _drop_queued_messages(client, thread_id)
         # A queued message opens a turn the `start` loop never saw, so the
         # roster's id may be stale; the server names the live one.
-        turn_id = _live_turn(client, thread_id) or record.get("turn_id", "")
-        if turn_id:
+        state = _interruptible_turn_id(client, thread_id, _read_live_turn(client, thread_id))
+        if isinstance(state, ThreadLive):
             # Best effort: a turn that finished between the read and this call
             # answers with an error, and the marker below ends it either way.
             _ = client.call(
-                "turn/interrupt", {"threadId": thread_id, "turnId": turn_id}
+                "turn/interrupt", {"threadId": thread_id, "turnId": state.turn_id}
             )
         client.close()
-    _end_marker_path(session_dir, target).touch()
+        if isinstance(state, ThreadStateUnknown):
+            print(f"codex_mesh: {target}: thread {thread_id} could not be read ({state.reason})", file=sys.stderr)
+            return 1
+        if isinstance(state, ThreadActiveWithoutTurn):
+            print(f"codex_mesh: {target}: thread {thread_id} could not be interrupted (no turn id)", file=sys.stderr)
+            return 1
     suffix = f", dropped {dropped} queued message(s)" if dropped else ""
     print(f"ending {target}{suffix}")
     return 0
@@ -1024,21 +1345,46 @@ def _drop_queued_messages(client: Client, thread_id: str) -> int:
     return dropped
 
 
-def _live_turn(client: Client, thread_id: str) -> str:
-    """The thread's running turn id, or "" when none runs.
+def _read_live_turn(client: Client, thread_id: str) -> ThreadState:
+    """Read the active turn without sending text into the thread."""
+    reply = client.call("thread/read", {"threadId": thread_id, "includeTurns": True})
+    error = reply.get("error")
+    if error:
+        return ThreadStateUnknown(_as_str(_as_dict(error).get("message")) or "thread/read failed")
+    thread = _as_dict(_as_dict(reply.get("result")).get("thread"))
+    if not thread:
+        return ThreadStateUnknown("thread/read returned no thread")
+    status = _as_str(_as_dict(thread.get("status")).get("type"))
+    if status in ("idle", "notLoaded"):
+        return ThreadIdle()
+    if status != "active":
+        return ThreadStateUnknown(f"unrecognized status {status or '(missing)'}")
+    turns = thread.get("turns")
+    if isinstance(turns, list):
+        for turn in reversed(cast("list[object]", turns)):
+            record = _as_dict(turn)
+            if record.get("status") == "inProgress":
+                turn_id = _as_str(record.get("id"))
+                if turn_id:
+                    return ThreadLive(turn_id)
+    # Active is enough to refuse a relaunch, even if the server has not yet
+    # persisted the new turn in the read response.
+    return ThreadActiveWithoutTurn()
 
-    The server has no read for it; a steer against an id that cannot match is
-    refused with the live id named. Should a server ever accept it, the text is
-    an instruction to stop, which is what the caller wants anyway."""
-    probe = client.call(
-        "turn/steer",
-        {
-            "threadId": thread_id,
-            "expectedTurnId": "end-probe",
-            "input": [{"type": "text", "text": "Stop now: make no edits and end your turn."}],
-        },
-    )
-    return _live_turn_from_mismatch(probe)
+
+def _interruptible_turn_id(client: Client, thread_id: str, state: ThreadState) -> ThreadState:
+    if not isinstance(state, ThreadActiveWithoutTurn):
+        return state
+    # This probe can steer only if the expected id matches. An empty id cannot
+    # match an active turn, and the mismatch names the real id.
+    reply = client.call("turn/steer", {
+        "threadId": thread_id, "expectedTurnId": "", "input": []
+    })
+    turn_id = _live_turn_from_mismatch(reply)
+    if turn_id:
+        return ThreadLive(turn_id)
+    reread = _read_live_turn(client, thread_id)
+    return reread
 
 
 def command_list(args: argparse.Namespace) -> int:

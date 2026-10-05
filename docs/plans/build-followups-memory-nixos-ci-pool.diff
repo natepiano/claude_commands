@@ -1,0 +1,161 @@
+--- a/modules/linux/jobserver.nix	2026-10-04 21:36:27.149637724 -0400
++++ b/modules/linux/jobserver.nix	2026-10-04 21:36:53.371833019 -0400
+@@ -16,6 +16,34 @@
+ { pkgs, username, ... }:
+ let
+   steve = pkgs.callPackage ./pkgs/steve.nix { };
++
++  # One slot pool, served at /dev/<devName>.
++  pool =
++    { description, devName, jobs }:
++    {
++      inherit description;
++      wantedBy = [ "multi-user.target" ];
++      # A restart drops the device out from under running builds, which then
++      # fail on their next slot request. Changes apply at the next boot, or live
++      # through stevie (`stevie -s /dev/<devName> -J 24`, `-A 16384`).
++      restartIfChanged = false;
++      serviceConfig = {
++        Type = "exec";
++        # --min-memory-avail 12288: stop handing out slots while MemAvailable
++        # is under 12 GiB, and resume when it recovers. Running jobs keep going
++        # and every build keeps its free slot, so builds slow down instead of
++        # stopping. earlyoom acts at about 3 GiB, so jobs already running have
++        # about 9 GiB plus swap to grow into before anything is killed.
++        ExecStart = "${steve}/bin/steve --dev-name ${devName} --jobs ${toString jobs} --min-memory-avail 12288 --user steve";
++        Restart = "always";
++        RestartSec = 1;
++        # Upstream's scheduling: a slot handed out late stalls every build.
++        CPUSchedulingPolicy = "fifo";
++        CPUSchedulingPriority = 10;
++        # The kernel OOM killer must never pick the pool over a build.
++        OOMScoreAdjust = -1000;
++      };
++    };
+ in
+ {
+   # stevie reads and adjusts the running pool: `stevie -t` prints free slots.
+@@ -42,37 +70,38 @@
+ 
+   # Owned by the user rather than shared through a group: group membership is
+   # fixed at login, so a group would lock out every session already running.
+-  # The CI runners (./hana-runners.nix) get an ACL entry, so CI and the sessions
+-  # draw on one pool. Slots do not bound memory: builds.slice and hana-ci.slice
+-  # cap each side after its builds take their slots.
++  # The CI runners (./hana-runners.nix) draw on a pool of their own,
++  # /dev/steve-ci, open to them through an ACL entry and readable by the user
++  # with `stevie -s /dev/steve-ci -t`.
+   services.udev.extraRules = ''
+-    ACTION=="add", ENV{DEVNAME}=="/dev/steve", OWNER="${username}", MODE="0600", RUN+="${pkgs.acl}/bin/setfacl -m u:hana-linux-1:rw,u:hana-linux-2:rw /dev/steve"
++    ACTION=="add", ENV{DEVNAME}=="/dev/steve", OWNER="${username}", MODE="0600"
++    ACTION=="add", ENV{DEVNAME}=="/dev/steve-ci", OWNER="${username}", MODE="0600", RUN+="${pkgs.acl}/bin/setfacl -m u:hana-linux-1:rw,u:hana-linux-2:rw /dev/steve-ci"
+   '';
+ 
+-  systemd.services.steve = {
+-    description = "Machine-wide build slot pool (GNU make jobserver)";
+-    wantedBy = [ "multi-user.target" ];
+-    # A restart drops the device out from under running builds, which then fail
+-    # on their next slot request. Changes apply at the next boot, or live
+-    # through stevie (`stevie -J 24`, `stevie -A 16384`).
+-    restartIfChanged = false;
+-    serviceConfig = {
+-      Type = "exec";
++  systemd.services = {
++    steve = pool {
++      description = "Machine-wide build slot pool (GNU make jobserver)";
+       # --jobs 31: every client also runs one job without a slot, so a lone
+       # build runs 31 + 1 = 32, what cargo -j32 runs today.
+-      # --min-memory-avail 12288: stop handing out slots while MemAvailable is
+-      # under 12 GiB, and resume when it recovers. Running jobs keep going and
+-      # every build keeps its free slot, so builds slow down instead of
+-      # stopping. earlyoom acts at about 3 GiB, so jobs already running have
+-      # about 9 GiB plus swap to grow into before anything is killed.
+-      ExecStart = "${steve}/bin/steve --jobs 31 --min-memory-avail 12288 --user steve";
+-      Restart = "always";
+-      RestartSec = 1;
+-      # Upstream's scheduling: a slot handed out late stalls every build.
+-      CPUSchedulingPolicy = "fifo";
+-      CPUSchedulingPriority = 10;
+-      # The kernel OOM killer must never pick the pool over a build.
+-      OOMScoreAdjust = -1000;
++      devName = "steve";
++      jobs = 31;
++    };
++
++    # CI'S OWN POOL. hana-ci.slice caps CI at 18G, but slots from the shared
++    # pool came with no regard to that cap: steve sees only the machine's
++    # MemAvailable. On 2026-10-04 at 18:18 PDT two CI jobs (Test Suite and
++    # Rendering Diagnostic) held 26 slots between them while the sessions were
++    # quiet, 26 rustc of which 17 were linking test binaries with mold, 17.5
++    # GiB in all, and the kernel killed a rustc at the slice's MemoryMax with
++    # the machine at 43 of 60 GiB (hana run 37250536724). About 0.67 GiB a
++    # slot: 14 slots plus each job's free one is 16 at once, about 10.7 GiB at
++    # that mix and 14.6 GiB with two 3.1 GiB release rustc among them, under
++    # the 18G cap. The same 12 GiB memory floor applies, so CI still waits
++    # when the machine is short.
++    steve-ci = pool {
++      description = "Build slot pool for the hana CI runners (GNU make jobserver)";
++      devName = "steve-ci";
++      jobs = 14;
+     };
+   };
+ }
+--- a/modules/linux/hana-runners.nix	2026-10-04 21:36:27.152396335 -0400
++++ b/modules/linux/hana-runners.nix	2026-10-04 21:37:01.597241940 -0400
+@@ -402,7 +402,7 @@
+     forEach (
+       r:
+       lib.nameValuePair "github-runner-${r.name}" {
+-        after = [ "${credentialName}.service" "steve.service" ];
++        after = [ "${credentialName}.service" "steve-ci.service" ];
+         requires = [ "${credentialName}.service" ];
+         serviceConfig = {
+           Restart = lib.mkForce "always";
+@@ -528,10 +528,11 @@
+         # the checkout its predecessor compiled, and the cache is written for a
+         # workflow that does not happen here. Writing it also costs build time.
+         CARGO_INCREMENTAL = "0";
+-        # The ACL in jobserver.nix grants the runner users access. CI run
+-        # 37227844227 attempt 4 (2026-10-04) compiled both Linux jobs through
+-        # it with no jobserver warning, so no CARGO_BUILD_JOBS fallback.
+-        CARGO_MAKEFLAGS = "--jobserver-auth=fifo:/dev/steve";
++        # CI's own slot pool; the ACL in jobserver.nix grants the runner users
++        # access. CI run 37227844227 attempt 4 (2026-10-04) compiled both Linux
++        # jobs through the shared pool with no jobserver warning, so no
++        # CARGO_BUILD_JOBS fallback.
++        CARGO_MAKEFLAGS = "--jobserver-auth=fifo:/dev/steve-ci";
+         HANA_BRP_PORT = toString r.brpPort;
+         # The target sweep; see mkSweepHook above.
+         ACTIONS_RUNNER_HOOK_JOB_COMPLETED = "${mkSweepHook r}";
+@@ -554,7 +555,7 @@
+         OOMPolicy = "continue";
+         # PrivateDevices hides the host device and DevicePolicy blocks it even
+         # after binding, so both grants are needed for the jobserver.
+-        DeviceAllow = [ "char-rtc r" "/dev/steve rw" ];
++        DeviceAllow = [ "char-rtc r" "/dev/steve-ci rw" ];
+ 
+         # The cache tree is created and owned by the tmpfiles rules above, at
+         # boot. ProtectSystem = "strict" makes /var/lib read-only, so the unit
+@@ -580,7 +581,7 @@
+         # empty /tmp, the same unit with this BindPaths sees the host's
+         # directory and its contents, and a write through it under
+         # ProtectSystem=strict lands on the host.
+-        BindPaths = [ "/tmp/cargo-tile" "-/dev/steve" ];
++        BindPaths = [ "/tmp/cargo-tile" "-/dev/steve-ci" ];
+ 
+         # systemd-coredump writes to /var/lib/systemd/coredump, on disk and
+         # outside every tmpfs here. A job runs with the runner's credentials in
+@@ -605,9 +606,10 @@
+   # before the token was decrypted and fail with a registration error that says
+   # nothing about ordering.
+ 
+-  # THE AGGREGATE BUDGET. CI and sessions share steve's slots, but a compiler
+-  # can grow after admission. Bevy task pools and nested jobs also consume
+-  # memory outside cargo's slot accounting. This slice holds both CI runners,
++  # THE AGGREGATE BUDGET. CI takes its slots from its own pool, sized to fit
++  # this ceiling (./jobserver.nix), but a compiler can grow after admission.
++  # Bevy task pools and nested jobs also consume memory outside cargo's slot
++  # accounting. This slice holds both CI runners,
+   # and 18G is the hard ceiling with nothing below it that throttles. A
+   # MemoryHigh of 10G stalled both jobs at memory pressure 90% until GitHub
+   # dropped the runners (run 37227844227, 13:56 PDT 2026-10-04): each
