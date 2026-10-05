@@ -747,11 +747,16 @@ def load_state(path: Path | None) -> dict[str, Previous]:
     return previous
 
 
+def same_phase(previous: str, current: str) -> bool:
+    """One phase across reports: the same place in the plan, or the same words after a renumber."""
+    return previous.split(" of ", 1)[0] == current.split(" of ", 1)[0] or previous.split(": ", 1)[-1] == current.split(": ", 1)[-1]
+
+
 def first_eta(unit: Unit, previous: Previous | None, now: datetime) -> datetime | None:
     """The phase's first stated ETA: the input's `first`, else the state's for the same phase, else this report's."""
     if unit.eta.first is not None:
         return unit.eta.first
-    if previous is not None and previous.phase == unit.phase and previous.first is not None:
+    if previous is not None and same_phase(previous.phase, unit.phase) and previous.first is not None:
         return previous.first
     return parse_time(unit.eta.time, now) if unit.eta.time else None
 
@@ -790,7 +795,7 @@ def clock(moment: datetime, now: datetime, zone_name: str) -> str:
 
 def change_minutes(moment: datetime, previous: Previous | None, phase: str) -> int | None:
     """Minutes the ETA moved since the last report of the same phase; `None` on a first ETA or a new phase."""
-    if previous is None or previous.phase != phase or previous.eta is None:
+    if previous is None or not same_phase(previous.phase, phase) or previous.eta is None:
         return None
     return round((moment - previous.eta).total_seconds() / 60)
 
@@ -910,7 +915,7 @@ def render(report: Report, previous: dict[str, Previous], now: datetime, zone_na
         lines.append(f"- phase: {unit.phase}")
         if unit.held:
             last = previous.get(unit.unit)
-            repeat = report.length == "simple" and last is not None and last.phase == unit.phase and last.held == unit.held
+            repeat = report.length == "simple" and last is not None and same_phase(last.phase, unit.phase) and last.held == unit.held
             examples = f", {unit.held_examples}" if unit.held_examples and not repeat else ""
             lines.append(f"- checkpoint: not merged, because {unit.held}{examples}")
         lines.append(f"- update: {unit.update}")

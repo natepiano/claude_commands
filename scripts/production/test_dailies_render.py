@@ -231,5 +231,24 @@ class TimelineWindowTests(unittest.TestCase):
                     self.assertIn(marker, row)
 
 
+class RenumberedPhaseTests(unittest.TestCase):
+    def test_a_renumbered_plan_keeps_the_phase_history(self) -> None:
+        fields = report(held=False)
+        renumbered = unit(held=False)
+        renumbered["phase"] = "Phase 2 of 4: small text reads clearly"
+        renumbered["eta"] = {"time": "12:40", "percent": 60, "why": "one more repair round"}
+        fields["units"] = [renumbered]
+        with tempfile.TemporaryDirectory() as scratch:
+            input_path = Path(scratch) / "dailies_input.json"
+            state_path = Path(scratch) / "dailies_state.json"
+            _ = input_path.write_text(json.dumps(fields))
+            saved = {"phase": "Phase 2 of 3: small text reads clearly", "eta": "2026-10-04T12:10:00", "held": None, "first": "2026-10-04T11:30:00"}
+            _ = state_path.write_text(json.dumps({"widget-enhancements": saved}))
+            result = run([str(input_path), "--at", AT, "--state", str(state_path)], scratch)
+        self.assertEqual(result.code, 0, result.error)
+        self.assertIn("(changed: +0:30 because one more repair round)", "\n".join(result.lines))
+        self.assertIn("- first eta: 11:30 PDT (now +1:10)", result.lines)
+
+
 if __name__ == "__main__":
     _ = unittest.main()
