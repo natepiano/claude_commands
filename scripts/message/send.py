@@ -27,7 +27,8 @@ same recipient inside the window is skipped; `ack` skips every later send with
 the key until `reopen`. The window counts from the last attempt, delivered or
 not, as the queue keeps what did not arrive.
 
-Outcomes, printed as one line and logged as one JSON line in STATE/log.jsonl:
+(user, 2026-10-05) Outcomes are printed as one line and logged with the full
+message text as one JSON line in STATE/log.jsonl:
   SENT: how                                                       exit 0
   SKIPPED: why   acknowledged, or inside the repeat window        exit 0
   QUEUED: why    a Claude recipient not reached; kept in          exit 1
@@ -71,7 +72,7 @@ Outcome = Literal["sent", "skipped", "queued", "failed"]
 EXIT: dict[Outcome, int] = {"sent": 0, "skipped": 0, "queued": 1, "failed": 3}
 
 LogEntry = TypedDict("LogEntry", {"time": str, "machine": str, "from": str, "to": str, "key": str | None,
-                                  "summary": str, "outcome": Outcome, "detail": str})
+                                  "summary": str, "text": str, "outcome": Outcome, "detail": str})
 Queued = TypedDict("Queued", {"time": str, "from": str, "to": str, "key": str | None, "summary": str,
                               "text": str, "reason": str})
 
@@ -205,7 +206,7 @@ def enqueue(message: Message, reason: str, at: datetime) -> None:
 def log(message: Message, result: Result, at: datetime) -> None:
     entry: LogEntry = {"time": at.isoformat(), "machine": machine(), "from": message.sender, "to": message.to,
                        "key": message.key, "summary": message.text.strip().splitlines()[0] if message.text.strip()
-                       else "", "outcome": result.outcome, "detail": result.detail}
+                       else "", "text": message.text, "outcome": result.outcome, "detail": result.detail}
     STATE.mkdir(parents=True, exist_ok=True)
     with locked(), open(STATE / "log.jsonl", "a", encoding="utf-8") as handle:
         _ = handle.write(json.dumps(entry) + "\n")

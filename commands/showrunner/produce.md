@@ -743,7 +743,8 @@ The message is the one action or fact, under 200 characters. Exit 0 means
 sent. On 1 (refused or unreachable) or 2 (bad usage or missing keys), fall back
 to PushNotification and say so in the log. Never read or print
 `~/.config/pushover/env`. Every send is logged in
-`~/.local/state/notify/pushover.log`.
+`~/.local/state/notify/pushover.jsonl`, one JSON line holding the time,
+priority, title, full message and outcome.
 
 **Push whenever work waits on the user.** When the production or any unit is
 blocked on something only the user can do (a rebuild, `github-warmup`, an

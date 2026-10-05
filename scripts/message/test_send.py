@@ -72,6 +72,22 @@ class SendTests(unittest.TestCase):
             self.assertEqual(self.send("--key", "k", "--repeat-minutes", "30", "--text", "four").outcome, "sent")
         self.assertEqual([entry["outcome"] for entry in self.log()], ["sent", "skipped", "sent", "sent"])
 
+    def test_log_keeps_full_text_for_every_outcome(self) -> None:
+        sent = "sent heading\nsent detail"
+        skipped = "skipped heading\nskipped detail"
+        queued = "queued heading\nqueued detail"
+        failed = "failed heading\nfailed detail"
+        self.assertEqual(self.send("--key", "k", "--repeat-minutes", "30", "--text", sent).outcome, "sent")
+        self.assertEqual(self.send("--key", "k", "--repeat-minutes", "30", "--text", skipped).outcome, "skipped")
+        self.outcome = send.Result("queued", "relay unavailable")
+        self.assertEqual(self.send("--text", queued).outcome, "queued")
+        self.outcome = send.Result("failed", "relay failed")
+        self.assertEqual(self.send("--text", failed).outcome, "failed")
+        for entry, text, outcome in zip(self.log(), (sent, skipped, queued, failed),
+                                        ("sent", "skipped", "queued", "failed"), strict=True):
+            self.assertEqual((entry["from"], entry["to"], entry["outcome"], entry["text"]),
+                             ("test", "bogus", outcome, text))
+
     def test_ack_skips_until_reopen(self) -> None:
         _ = send.acknowledge("k")
         self.assertIn("already acknowledged", send.acknowledge("k"))
