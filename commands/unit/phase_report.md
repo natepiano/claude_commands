@@ -1,6 +1,10 @@
+---
+description: Write the report for a delegate phase that finished without one, or whose report was thin.
+---
+
 # Delegate — phase report
 
-**Usage:** `/unit:delegate_phase_report`
+**Usage:** `/unit:phase_report`
 
 Type this when a phase finished and no report arrived, or when the report that
 arrived was thin. It runs inside the current session and already knows the plan,

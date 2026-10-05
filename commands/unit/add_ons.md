@@ -1,6 +1,10 @@
+---
+description: Review the add-ons a delegate run has collected for later.
+---
+
 # Delegate — next items
 
-**Usage:** `/unit:delegate_next`
+**Usage:** `/unit:add_ons`
 
 Type this to review the add-ons a delegate run has accumulated: it walks
 `${NEXT_ITEMS_PENDING}` through <ReviewPendingAddOns/> now. It runs inside the
@@ -53,7 +57,7 @@ interactive point: it is already stopped waiting on the user for a project
 decision, a verbose gate outside an auto window is about to ask, the user has
 just steered the run with an instruction that is more than an authorization
 word, the run is ending through <RunSummary/>, or the user typed
-`/unit:delegate_next`. Automatic mode never stops for this; a run the user has
+`/unit:add_ons`. Automatic mode never stops for this; a run the user has
 walked away from accumulates and stays silent.
 
 At a stop for a decision, resolve that decision first. Then say

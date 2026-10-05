@@ -36,4 +36,4 @@ check_words=("$REPO/scripts/lib/py" "$REPO/scripts/hooks/delegate_run.py" check 
 check=${(j: :)${(q)check_words[@]}}
 exec zsh "$REPO/scripts/message/notifier.sh" new "delegate-$run_id" \
   --to "session:$session_id" --every "$minutes" \
-  --command '/unit:delegate_report' --check "$check" --hold
+  --command '/unit:report' --check "$check" --hold

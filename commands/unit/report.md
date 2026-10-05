@@ -1,6 +1,10 @@
+---
+description: Show what this unit's delegate run and its agents are doing right now.
+---
+
 # Delegate — status report
 
-**Usage:** `/unit:delegate_report`
+**Usage:** `/unit:report`
 
 Type this when a run has gone quiet, when an update arrived without its tables,
 or any time you want to know what the agents are doing right now. It runs inside

@@ -894,6 +894,9 @@ When every unit's final-gate and as-built checkpoints are merged:
   into the merge branch. A held checkpoint is fixed inside phase N; the unit
   never builds the next phase on top of it. User rule 2026-10-01: widget ran
   Phases 29 and 30 at once, and the dailies could not say which phase it was in.
+- **Disk.** Units keep saved run output under a few GB (`/unit:delegate` →
+  <ToolingContract/>). When builds turn cold for no reason, run `df -h /` and
+  find the large output before anything else. User, 2026-10-04.
 - Never ask the user to review until <DesignCheck/> passed on the shots.
 - Never pass on a unit director's claim without checking it.
 - Updates hold only what the schedule prompt allows.

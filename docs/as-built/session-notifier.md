@@ -2,7 +2,7 @@
 
 ## What it is
 
-The session notifier sends a message to a live Claude session on a schedule: the scheduled-update prompt (a `/showrunner:dailies simple` report) to a showrunner, and `/unit:delegate_report` ticks to a `/unit:delegate` unit director. Each schedule is a named **instance** stored on disk. One declared 15 s job runs `notifier.sh tick` on both machines and sends every instance that is due. Before each send, the instance's own check command decides whether to send, skip or remove the instance. No agent arms or re-arms a timer. The schedule lives outside the session, so it keeps going through ended turns, compaction and restarts, and it works the same on Linux (natedev) and the Mac.
+The session notifier sends a message to a live Claude session on a schedule: the scheduled-update prompt (a `/showrunner:dailies simple` report) to a showrunner, and `/unit:report` ticks to a `/unit:delegate` unit director. Each schedule is a named **instance** stored on disk. One declared 15 s job runs `notifier.sh tick` on both machines and sends every instance that is due. Before each send, the instance's own check command decides whether to send, skip or remove the instance. No agent arms or re-arms a timer. The schedule lives outside the session, so it keeps going through ended turns, compaction and restarts, and it works the same on Linux (natedev) and the Mac.
 
 ## How it works
 
@@ -21,7 +21,7 @@ The session notifier sends a message to a live Claude session on a schedule: the
 | `scripts/hooks/delegate_run.py` | `check` CLI: the unit instance's check. Also a library the delegate hooks import. |
 | `scripts/delegate/progress_history.py` | `progress` restarts the unit's instance and names its next tick in the report's clock line. |
 | `commands/showrunner/{produce,dailies,interval}.md` | Create, restart, retime and remove the showrunner instance. |
-| `commands/unit/delegate.md` `<ProgressContract>`, `commands/unit/delegate_report.md`, `commands/unit/interval.md` | How a unit treats its ticks, and `/unit:interval`. |
+| `commands/unit/delegate.md` `<ProgressContract>`, `commands/unit/report.md`, `commands/unit/interval.md` | How a unit treats its ticks, and `/unit:interval`. |
 | `config/delegate.conf` | `PLAN_DELEGATE_PROGRESS_INTERVAL_SECONDS`, the unit interval. |
 | `/etc/nixos/modules/common/session-notifier.nix` | The 15 s job. |
 | `scripts/message/test_notifier.py`, `test_sessions.py`, `scripts/delegate/test_delegate_check.py` | CLI tests, run through the `NOTIFIER_*` variables. |
@@ -127,11 +127,11 @@ Each Claude delegate run gets `delegate-<run id>`, where the run id is the basen
 
 ```
 notifier.sh new delegate-<run id> --to session:<id> --every <minutes> \
-  --command /unit:delegate_report --hold \
+  --command /unit:report --hold \
   --check "<repo>/scripts/lib/py <repo>/scripts/hooks/delegate_run.py check <id> <SESSION_DIR>"
 ```
 
-So the unit gets `/unit:delegate_report` every interval while work runs, from sender `delegate-<run id>`, with at most one tick waiting. The unit director arms nothing. On each tick it reads `delegate_report.md` and composes `<ProgressReport/>`; ticks that arrive during a report, or several at once, get one report. A tick never replaces the completion report. If the user stops updates, the unit runs `notifier.sh stop delegate-<run id>`, and `start` to resume; `restart` from later reports keeps a stopped instance stopped.
+So the unit gets `/unit:report` every interval while work runs, from sender `delegate-<run id>`, with at most one tick waiting. The unit director arms nothing. On each tick it reads `report.md` and composes `<ProgressReport/>`; ticks that arrive during a report, or several at once, get one report. A tick never replaces the completion report. If the user stops updates, the unit runs `notifier.sh stop delegate-<run id>`, and `start` to resume; `restart` from later reports keeps a stopped instance stopped.
 
 `end_session.sh` runs `notifier.sh remove delegate-<run id>` (errors ignored) before it deletes the marker. A run that dies without `end_session.sh` loses its instance at the next due slot after its marker is gone or replaced (check exit 2). A unit parked on the user keeps its instance; its check exits 1 and each slot is skipped.
 

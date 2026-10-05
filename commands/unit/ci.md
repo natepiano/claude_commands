@@ -1,6 +1,10 @@
+---
+description: Run a delegate run's periodic CI point now, or one the run skipped.
+---
+
 # Delegate — periodic CI
 
-**Usage:** `/unit:delegate_ci`
+**Usage:** `/unit:ci`
 
 Type this when a run skipped a CI point, or to run one now. It runs inside the
 current session and already knows the plan doc, the plan slug, and the mode. If
