@@ -761,6 +761,19 @@ class ThreadStateUnknown:
 ThreadState = ThreadIdle | ThreadLive | ThreadActiveWithoutTurn | ThreadStateUnknown
 
 
+@dataclass(frozen=True)
+class RelaunchAllowed:
+    """Cleanup found no confirmed live turn that it could not interrupt."""
+
+
+@dataclass(frozen=True)
+class RelaunchBlockedByLiveTurn:
+    """The old thread still has a turn this launcher could not stop."""
+
+
+UnwatchedTurnCleanupResult = RelaunchAllowed | RelaunchBlockedByLiveTurn
+
+
 def _capacity_clock() -> float:
     return time.monotonic()
 
@@ -819,7 +832,20 @@ def command_start(args: argparse.Namespace) -> int:
         old_thread = _as_str(old_entry.get("thread_id"))
         if old_thread:
             launcher_pid = old_entry.get("launcher_pid")
-            if old_entry.get("status") == WAITING_CAPACITY:
+            if old_entry.get("status") == "failed":
+                # A failed entry is always its launcher's last write.
+                if old_port is not None:
+                    cleanup = _end_unwatched_turn(
+                        old_port, old_thread, Path(_as_str(_attr(args, "log_file")))
+                    )
+                    if isinstance(cleanup, RelaunchBlockedByLiveTurn):
+                        print(
+                            f"codex_mesh: {name}: thread {old_thread} still has a live turn that could not be interrupted; relaunch once it ends",
+                            file=sys.stderr,
+                        )
+                        return 2
+                old_thread = ""
+            elif old_entry.get("status") == WAITING_CAPACITY:
                 if isinstance(launcher_pid, int) and _pid_alive(launcher_pid):
                     print(
                         f"codex_mesh: {name}: thread {old_thread} is waiting for capacity; use codex_mesh.py end --to {name} before relaunching",
@@ -1110,7 +1136,7 @@ def _attach_and_run(
         # A queued peer message can open a turn after the last completion
         # notification. Check once more before this launcher stops watching.
         if not resident or failure or end_marker.exists():
-            _end_unwatched_turn(port, thread_id, log_path)
+            _ = _end_unwatched_turn(port, thread_id, log_path)
         if not resident or replies == 0:
             _finish_summary(summary_path, reply_path, name, replies + 1, final_answer or failure or f"The delegate {name} produced no summary.")
         if not isinstance(run_outcome, CapacityRetriesExhausted):
@@ -1121,7 +1147,7 @@ def _attach_and_run(
     except (ConnectionError, OSError, SystemExit) as exc:
         # Once thread/start returned, even a disconnected turn/start may have
         # begun work. Keep its id and never resubmit the original prompt.
-        _end_unwatched_turn(port, thread_id, log_path)
+        _ = _end_unwatched_turn(port, thread_id, log_path)
         failure = str(exc) or exc.__class__.__name__
         if _as_dict(_read_json_object(_session_path(session_dir, ROSTER_FILE)).get(name)).get("thread_id") == thread_id:
             _update_roster(session_dir, name, {"thread_id": thread_id, "turn_id": turn_id, "status": "failed"})
@@ -1144,7 +1170,16 @@ def _start_turn(
     return _as_str(_as_dict(result.get("turn")).get("id"))
 
 
-def _end_unwatched_turn(port: int, thread_id: str, log_path: Path) -> None:
+def _log_uninterrupted_thread(log_path: Path, thread_id: str, reason: str) -> None:
+    with log_path.open("a", encoding="utf-8") as log:
+        _ = log.write(
+            f"[{_now_stamp()}] thread {thread_id} could not be interrupted ({reason})\n"
+        )
+
+
+def _end_unwatched_turn(
+    port: int, thread_id: str, log_path: Path
+) -> UnwatchedTurnCleanupResult:
     """Best effort cleanup when this launcher cannot watch another turn."""
     try:
         client = Client(port, f"cleanup-{os.getpid()}")
@@ -1153,18 +1188,27 @@ def _end_unwatched_turn(port: int, thread_id: str, log_path: Path) -> None:
             live = _read_live_turn(client, thread_id)
             turn_id = _interruptible_turn_id(client, thread_id, live)
             if isinstance(turn_id, ThreadLive):
-                _ = client.call("turn/interrupt", {
+                reply = client.call("turn/interrupt", {
                     "threadId": thread_id, "turnId": turn_id.turn_id
                 })
+                if "error" in reply:
+                    reason = _as_str(_as_dict(reply["error"]).get("message")) or "turn/interrupt failed"
+                    remaining = _read_live_turn(client, thread_id)
+                    if isinstance(remaining, (ThreadLive, ThreadActiveWithoutTurn)):
+                        _log_uninterrupted_thread(log_path, thread_id, reason)
+                        return RelaunchBlockedByLiveTurn()
+                    if isinstance(remaining, ThreadStateUnknown):
+                        _log_uninterrupted_thread(log_path, thread_id, reason)
             elif isinstance(turn_id, (ThreadStateUnknown, ThreadActiveWithoutTurn)):
                 reason = turn_id.reason if isinstance(turn_id, ThreadStateUnknown) else "no turn id"
-                with log_path.open("a", encoding="utf-8") as log:
-                    _ = log.write(f"[{_now_stamp()}] thread {thread_id} could not be interrupted ({reason})\n")
+                _log_uninterrupted_thread(log_path, thread_id, reason)
+                if isinstance(turn_id, ThreadActiveWithoutTurn):
+                    return RelaunchBlockedByLiveTurn()
         finally:
             client.close()
     except (ConnectionError, OSError, SystemExit) as exc:
-        with log_path.open("a", encoding="utf-8") as log:
-            _ = log.write(f"[{_now_stamp()}] thread {thread_id} could not be interrupted ({exc})\n")
+        _log_uninterrupted_thread(log_path, thread_id, str(exc))
+    return RelaunchAllowed()
 
 
 def command_send(args: argparse.Namespace) -> int:
