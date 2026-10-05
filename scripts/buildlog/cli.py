@@ -175,7 +175,8 @@ def day_report(args: list[str]) -> int:
     except ValueError:
         print("usage: buildlog report [YYYY-MM-DD]", file=sys.stderr)
         return 2
-    _ = launches.collect()
+    counts = launches.collect()
+    print(f"buildlog launches: {counts.summary()}", file=sys.stderr)
     _ = index.update()
     connection = index.read_only()
     try:
@@ -214,7 +215,7 @@ def main(argv: list[str]) -> int:
         if rest:
             print("usage: buildlog launches", file=sys.stderr)
             return 2
-        print(f"buildlog launches: {launches.collect()} added")
+        print(f"buildlog launches: {launches.collect().summary()}")
         return 0
     if command == "tree-key":
         key = treekey.tree_key(rest[0] if rest else os.getcwd())
