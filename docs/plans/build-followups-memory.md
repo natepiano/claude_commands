@@ -181,7 +181,7 @@ Measured 2026-10-04 11:59–12:25 PDT, read-only, from the earlyoom journal, the
 - `scripts/delegate/verify.sh` — `UNTESTED_EXAMPLES_PY`, `read_metadata`, the check before `cache_lookup`, header comments
 - `scripts/delegate/test_verify_untested_examples.py` — eight scratch-package cases through real verify.sh routing: real `cargo metadata`, a cargo stub on `PATH` that passes `metadata` to real cargo and logs every other call, and a git stub that fixes the pass-record key
 
-**Binds later work:** Phase 15's verify.sh acknowledgement goes after this refusal, at the first build step past the memory wait. A new verify.sh routing test follows `test_verify_untested_examples.py`'s stub pattern.
+**Binds later work:** Phase 16's verify.sh acknowledgement goes after this refusal, at the first build step past the memory wait. A new verify.sh routing test follows `test_verify_untested_examples.py`'s stub pattern.
 
 **Gotchas:** A failing `cargo metadata` exits with cargo's status under `set -e`, not 2. hana main has 7 offending examples; the ~/.claude main merge is held until tool-based-ui adds `test = true`.
 
@@ -370,7 +370,24 @@ Measured 2026-10-04 11:59–12:25 PDT, read-only, from the earlyoom journal, the
 - Rewriting `scripts/buildlog/index.py`'s `verb` column description, which still lists `example-test`: it documents recorded rows, which include the old verb.
 - Failing closed when a build token is not acquired: the step still runs, and cargo's own folder lock serializes one folder.
 
-### Phase 14 — A measured working day · status: todo
+### Phase 14 — A failed Codex seat relaunches · status: done
+
+#### As-built
+
+- `command_start` treats a `failed` roster entry as having no launcher, because `failed` is always its launcher's last write; the old thread no longer holds the slot, and the relaunch starts a new thread on the same server. This is the one exception to "a relaunch replaces an entry only on `ThreadIdle`". With no recorded server it starts a new server and never reads the old thread.
+- With a recorded server it first repeats the dead launcher's cleanup on the old thread through `_end_unwatched_turn(port, thread_id, log_path) -> UnwatchedTurnCleanupResult` (`RelaunchAllowed | RelaunchBlockedByLiveTurn`), logging to the seat's `--log-file`: drop queued messages, interrupt a live turn.
+- A refused `turn/interrupt` re-reads the thread. Still `ThreadLive`, or `ThreadActiveWithoutTurn`, logs `thread <id> could not be interrupted (<reason>)` and blocks: exit 2 with `codex_mesh: <seat>: thread <id> still has a live turn that could not be interrupted; relaunch once it ends`. An unreadable thread or unknown status (e.g. `systemError`) or a connection failure is logged and relaunched. The launcher's own exit paths ignore the result.
+- `running` and `done` entries keep the `ThreadIdle`-only relaunch and refuse on a live turn or an unreadable thread; a `waiting_capacity` entry with a live launcher still refuses; `failed` stays outside `ENDABLE_STATUSES`.
+
+**Files:**
+- `scripts/agents/codex_mesh.py` — `command_start`'s failed-entry relaunch; `_end_unwatched_turn` and its typed result.
+- `scripts/agents/test_codex_mesh.py` — six `test_failed_seat_*` cases (unknown status, interrupt before `thread/start`, refused interrupt with the turn still live or ended, active turn with no id, no server record); the stub app-server's `thread/read` answers a named status per thread.
+
+**Gotchas:** `turn/interrupt` answers with an error when the turn ended between the read and the call; only a re-read tells that apart from a turn still live.
+
+**Ruled out:** adding `failed` to `ENDABLE_STATUSES` (a relaunch no longer needs `end` first); recording `launcher_pid` on a failed entry (the status is always the launcher's last write).
+
+### Phase 15 — A measured working day · status: todo
 
 #### Work Order
 
@@ -398,7 +415,7 @@ Measure against the target, a normal working day with no earlyoom kill, from the
 
 Tune the slice numbers from what it shows. A changed limit needs another measured day after it. Say whether per-crate admission or nextest thread limits are needed after all. A per-slice sample field that still reads "unavailable" is a deployment fault.
 
-*The staggering verdict.* From the observed release, say whether the admission already staggers the held sessions. If it does not, Phase 15 builds the one-session-at-a-time release; if it does, Phase 15 is dropped. If no natural release happened after Phase 10's admission went live, say so: the verdict is open and Phase 15 stays deferred until such a release is observed, never dropped for want of one. The verdict also says whether a session whose first build is a BRP launch needs an acknowledgement of its own, since launches do not run through `invoke.sh` and acknowledge nothing today.
+*The staggering verdict.* From the observed release, say whether the admission already staggers the held sessions. If it does not, Phase 16 builds the one-session-at-a-time release; if it does, Phase 16 is dropped. If no natural release happened after Phase 10's admission went live, say so: the verdict is open and Phase 16 stays deferred until such a release is observed, never dropped for want of one. The verdict also says whether a session whose first build is a BRP launch needs an acknowledgement of its own, since launches do not run through `invoke.sh` and acknowledge nothing today.
 
 *Who takes the end snapshot.* The unit director takes it at 2026-10-05 15:26 PDT whatever the state of Phase 6's merge; this phase never waits on another phase to keep its window. Sources the writer and the checker both use: hold times from each holder file's `since`; release times from the `/build_hold release` output in the session transcripts and natedev's relay log; each session's build start from build-log `steps.started_at` and `mem_wait_s`.
 
@@ -424,20 +441,20 @@ Baseline before the diff: natedev's stopgap 160efd9 put CI in steve on 2026-10-0
 
 **Acceptance gate:** the original day reported at 2026-10-05 15:26 PDT; each newer control (CI's pool from 18:43 PDT, the builds slice from 19:36 PDT, Phase 10's admission once live) labeled provisional until its own complete day, with its workload and snapshot coverage; the day's report, each CI run's figures, the threshold and the conclusions written in this phase, each figure's window complete or marked inconclusive; the staggering verdict stated; `bash -n` on any changed shell.
 
-### Phase 15 — One session at a time · status: todo
+### Phase 16 — One session at a time · status: todo
 
 #### Work Order
 
-**Goal:** when Phase 14 finds the admission does not stagger held sessions, the last holder's `/build_hold release` releases them one at a time, each after the previous one's first build step is past its memory wait and starting its compiler.
+**Goal:** when Phase 15 finds the admission does not stagger held sessions, the last holder's `/build_hold release` releases them one at a time, each after the previous one's first build step is past its memory wait and starting its compiler.
 
 **Spec:**
-- Runs only if Phase 14's verdict says the admission does not stagger the sessions. A verdict that it does drops this phase; with no observed release the verdict is open and this phase stays deferred until one is observed.
+- Runs only if Phase 15's verdict says the admission does not stagger the sessions. A verdict that it does drops this phase; with no observed release the verdict is open and this phase stays deferred until one is observed.
 - Only the last holder starts it. While another holder file remains, `release` names who still holds and releases no session (Phase 4's behavior). The holder's file stays until the last session is released, so `status`, the renderer and `rust_release.py` keep seeing the hold.
 - Release progress is one typed state per held session, in release order: `AwaitingRelease`, `ReleasedAwaitingAdmission(released_at)`, `WaitingForMemory(released_at, wait_started_at)`, `PastMemoryWait(wait_ended_at, outcome)` with outcome `Granted`, `TimedOut` or `MeminfoUnavailable`, `NoAdmissionAck(released_at)`, each carrying only the instants valid in it. `wait_ended_at` is when the memory wait returned: only `Granted` says memory was there, and no outcome proves the compiler started. It is stored in `~/.local/state/build-hold-release/` (`BUILD_HOLD_RELEASE_DIR` overrides it), never in the holder directory, which every reader treats as holds; read back on each step, never kept in memory.
 - `release` messages one session at a time, directly (below). A session moves to `WaitingForMemory` when its first build step starts a memory wait, and to `PastMemoryWait` when that wait returns, whatever the outcome, since its build proceeds either way: `buildlog_wait_for_memory` in `scripts/lint/invoke.sh` (`:107`) writes the first mark when it begins to wait, and `run_once` (`:191`) writes the second right after the wait returns (`:195`), as the last thing before the step's `buildlog_exec` (`:209`, `:222`), both keyed by the session's id (below) into the release directory. A step that does not wait writes only the second. A call that builds nothing (an example-gate refusal, a pass-record hit) writes none.
 - **Who is released.** The holds know holders, not held sessions (`build_hold.py:220`), and today's release goes to every top-level session (`commands/build_hold.md:10`). The hold text `hold` prints (`build_hold.py:217`), which `/build_hold` sends to every top-level session (`commands/build_hold.md:7`), tells each recipient to run `python3 ~/.claude/scripts/build_hold/build_hold.py wait` at once, and `commands/build_hold.md` gains that recipient step. A session that finds the hold, top-level session or unit director, registers with `build_hold.py wait`, which records its `CLAUDE_CODE_SESSION_ID` in arrival order in the release directory. That id is the one identity: `release` resolves it to the session's name through the live session records (`scripts/message/sessions.py`) and sends to that session alone with `scripts/message/send.py --to <name>`, never the `/notify_top_level` broadcast, and after `NoAdmissionAck` moves to the next. `invoke.sh` keys its marks by the same variable, which a unit director's seats inherit through `implement.sh` and the codex server (no `shell_environment_policy` filters it); a step with no id in its environment writes no mark. A registered session missing from the live records becomes `NoAdmissionAck` at its turn, named in the release text. `status` and the dailies renderer show each held session's state. The acknowledgement proves admission, not a finished build.
 - A session with no mark 5 minutes after its release becomes `NoAdmissionAck`; the next session is released and the release text names it. A session in `WaitingForMemory` is not unresponsive: the next release waits for its `PastMemoryWait`, which the wait's own limit bounds (`BUILDLOG_MEM_WAIT_LIMIT_S`, 900 s by default), so two held builds never start together when memory frees. A `WaitingForMemory` older than that limit plus one minute becomes `NoAdmissionAck`.
-- **The driver.** `release` stays running in the last holder's session: it messages one session, polls the release directory every 15 s, and moves on at a `PastMemoryWait` or a `NoAdmissionAck`. Progress is the stored states, so `release --resume` continues after a restart. A session whose first build is a BRP launch writes no mark, since launches do not run through `invoke.sh`, and becomes `NoAdmissionAck` after 5 minutes; when Phase 14's verdict says launch builds need an acknowledgement of their own, this Work Order gains it before dispatch.
+- **The driver.** `release` stays running in the last holder's session: it messages one session, polls the release directory every 15 s, and moves on at a `PastMemoryWait` or a `NoAdmissionAck`. Progress is the stored states, so `release --resume` continues after a restart. A session whose first build is a BRP launch writes no mark, since launches do not run through `invoke.sh`, and becomes `NoAdmissionAck` after 5 minutes; when Phase 15's verdict says launch builds need an acknowledgement of their own, this Work Order gains it before dispatch.
 - **One lock.** `release.lock` in the release directory (`flock`) serializes `wait`, every `release` step, `release --resume` and the final check. `wait` registers only while a holder file exists, under the lock. Under the same lock, `release` removes the last holder file only after re-reading the registrations and finding none still `AwaitingRelease`, so a session that registers during the release is released in its turn, and one that arrives after the hold is gone finds no hold and builds.
 - Tests: a received hold whose recipient runs `wait` is released in its turn, and its mark ends its turn; partial progress (some released, some waiting), a missing mark, another active holder, a memory wait longer than 5 minutes holding the next release until it returns, a registration during a release released in its turn, a resumed release that finishes and clears the hold, one direct send per step to the registered session's name (`send.py` stubbed), a seat-shaped environment whose mark carries the unit director's id, and `status`, the dailies renderer and `rust_release.py` showing no phantom holder from the release directory, including after the last release clears it.
 

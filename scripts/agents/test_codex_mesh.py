@@ -163,6 +163,10 @@ class MeshCommandTests(unittest.TestCase):
     announce_live_completion: bool  # pyright: ignore[reportUninitializedInstanceVariable]
     queued: list[dict[str, object]]  # pyright: ignore[reportUninitializedInstanceVariable]
     read_failure: str  # pyright: ignore[reportUninitializedInstanceVariable]
+    thread_statuses: dict[str, str]  # pyright: ignore[reportUninitializedInstanceVariable]
+    interrupt_error: str  # pyright: ignore[reportUninitializedInstanceVariable]
+    interrupt_error_ends_turn: bool  # pyright: ignore[reportUninitializedInstanceVariable]
+    hide_turn_id_from_steer: bool  # pyright: ignore[reportUninitializedInstanceVariable]
     hide_live_turn_id: bool  # pyright: ignore[reportUninitializedInstanceVariable]
     next_thread_id: str  # pyright: ignore[reportUninitializedInstanceVariable]
     auto_turn_starts: int  # pyright: ignore[reportUninitializedInstanceVariable]
@@ -182,6 +186,10 @@ class MeshCommandTests(unittest.TestCase):
         self.announce_live_completion = False
         self.queued = []
         self.read_failure = ""
+        self.thread_statuses = {}
+        self.interrupt_error = ""
+        self.interrupt_error_ends_turn = False
+        self.hide_turn_id_from_steer = False
         self.hide_live_turn_id = False
         self.next_thread_id = THREAD_ID
         self.auto_turn_starts = 0
@@ -323,12 +331,15 @@ class MeshCommandTests(unittest.TestCase):
                 return [{"id": request["id"], "error": {"message": "read refused"}}]
             if self.read_failure == "timeout":
                 return []
+            thread_id = cast("str", params.get("threadId", THREAD_ID))
             turns: list[dict[str, object]] = []
             if self.live_turn and not self.hide_live_turn_id:
                 turns.append({"id": self.live_turn, "status": "inProgress"})
             frames = [_reply(request, {"thread": {
-                "id": THREAD_ID,
-                "status": {"type": "active" if self.live_turn else "idle"},
+                "id": thread_id,
+                "status": {"type": self.thread_statuses.get(thread_id) or (
+                    "active" if self.live_turn else "idle"
+                )},
                 "turns": turns,
             }})]
             if self.live_turn and self.announce_live_completion:
@@ -339,6 +350,8 @@ class MeshCommandTests(unittest.TestCase):
             return frames
         if method == "turn/steer":
             if self.live_turn:
+                if self.hide_turn_id_from_steer:
+                    return [{"id": request["id"], "error": {"message": "turn id unavailable"}}]
                 frames: list[dict[str, object]] = [
                     {"id": request["id"], "error": {"message": f"expected turn, but found `{self.live_turn}`"}}
                 ]
@@ -350,6 +363,10 @@ class MeshCommandTests(unittest.TestCase):
                 return frames
             return [{"id": request["id"], "error": {"message": "no live turn"}}]
         if method == "turn/interrupt":
+            if self.interrupt_error:
+                if self.interrupt_error_ends_turn:
+                    self.live_turn = ""
+                return [{"id": request["id"], "error": {"message": self.interrupt_error}}]
             if params.get("turnId") == self.live_turn:
                 self.live_turn = ""
                 return [_reply(request, {})]
@@ -611,6 +628,121 @@ class MeshCommandTests(unittest.TestCase):
         self.assertEqual(len(self.methods("thread/start")), 1)
         self.assertFalse(any(str(request.get("id", "")).startswith("relaunch")
                              for request in self.methods("thread/read")))
+        self.assertEqual(self.seat_record()["thread_id"], THREAD_ID)
+
+    def test_failed_seat_relaunches_when_old_thread_has_unknown_status(self) -> None:
+        old_thread = "old-failed-thread"
+        _ = (self.session_dir / codex_mesh.ROSTER_FILE).write_text(json.dumps({
+            "seat": {"thread_id": old_thread, "turn_id": "", "status": "failed"}
+        }), encoding="utf-8")
+        self.thread_statuses[old_thread] = "systemError"
+
+        code, errors = self.run_start()
+
+        self.assertEqual((code, errors), (0, ""))
+        self.assertEqual(len(self.methods("thread/start")), 1)
+        self.assertEqual(self.seat_record()["thread_id"], THREAD_ID)
+        log = (self.session_dir / "seat.log").read_text(encoding="utf-8")
+        self.assertIn(old_thread, log)
+        self.assertIn("could not be interrupted", log)
+
+    def test_failed_seat_interrupts_old_turn_before_starting_thread(self) -> None:
+        old_thread = "old-failed-thread"
+        old_turn = "old-live-turn"
+        _ = (self.session_dir / codex_mesh.ROSTER_FILE).write_text(json.dumps({
+            "seat": {"thread_id": old_thread, "turn_id": old_turn, "status": "failed"}
+        }), encoding="utf-8")
+        self.live_turn = old_turn
+
+        code, errors = self.run_start()
+
+        self.assertEqual((code, errors), (0, ""))
+        interrupts = self.methods("turn/interrupt")
+        self.assertEqual(len(interrupts), 1)
+        self.assertEqual(cast("dict[str, object]", interrupts[0]["params"]), {
+            "threadId": old_thread, "turnId": old_turn,
+        })
+        self.assertLess(self.server.requests.index(interrupts[0]),
+                        self.server.requests.index(self.methods("thread/start")[0]))
+        self.assertEqual(self.seat_record()["thread_id"], THREAD_ID)
+
+    def test_failed_seat_refuses_relaunch_when_interrupt_errors_and_turn_stays_live(self) -> None:
+        old_thread = "old-failed-thread"
+        old_turn = "old-live-turn"
+        _ = (self.session_dir / codex_mesh.ROSTER_FILE).write_text(json.dumps({
+            "seat": {"thread_id": old_thread, "turn_id": old_turn, "status": "failed"}
+        }), encoding="utf-8")
+        self.live_turn = old_turn
+        self.interrupt_error = "interrupt refused"
+
+        code, errors = self.run_start()
+
+        self.assertEqual(code, 2)
+        self.assertIn(f"thread {old_thread} still has a live turn", errors)
+        self.assertEqual(self.methods("thread/start"), [])
+        self.assertEqual(self.live_turn, old_turn)
+        self.assertIn(
+            f"thread {old_thread} could not be interrupted (interrupt refused)",
+            (self.session_dir / "seat.log").read_text(encoding="utf-8"),
+        )
+
+    def test_failed_seat_relaunches_when_turn_ends_after_interrupt_error(self) -> None:
+        old_thread = "old-failed-thread"
+        old_turn = "old-live-turn"
+        _ = (self.session_dir / codex_mesh.ROSTER_FILE).write_text(json.dumps({
+            "seat": {"thread_id": old_thread, "turn_id": old_turn, "status": "failed"}
+        }), encoding="utf-8")
+        self.live_turn = old_turn
+        self.interrupt_error = "turn already ended"
+        self.interrupt_error_ends_turn = True
+
+        code, errors = self.run_start()
+
+        self.assertEqual((code, errors), (0, ""))
+        self.assertEqual(len(self.methods("turn/interrupt")), 1)
+        old_reads = [request for request in self.methods("thread/read")
+                     if cast("dict[str, object]", request["params"])["threadId"] == old_thread]
+        self.assertEqual(len(old_reads), 2)
+        self.assertEqual(len(self.methods("thread/start")), 1)
+        self.assertEqual(self.seat_record()["thread_id"], THREAD_ID)
+
+    def test_failed_seat_refuses_relaunch_when_active_turn_has_no_id(self) -> None:
+        old_thread = "old-failed-thread"
+        _ = (self.session_dir / codex_mesh.ROSTER_FILE).write_text(json.dumps({
+            "seat": {"thread_id": old_thread, "turn_id": "", "status": "failed"}
+        }), encoding="utf-8")
+        self.live_turn = "old-live-turn"
+        self.hide_live_turn_id = True
+        self.hide_turn_id_from_steer = True
+
+        code, errors = self.run_start()
+
+        self.assertEqual(code, 2)
+        self.assertIn(f"thread {old_thread} still has a live turn", errors)
+        self.assertEqual(self.methods("thread/start"), [])
+        self.assertEqual(self.methods("turn/interrupt"), [])
+        self.assertIn(
+            f"thread {old_thread} could not be interrupted (no turn id)",
+            (self.session_dir / "seat.log").read_text(encoding="utf-8"),
+        )
+
+    def test_failed_seat_without_server_record_starts_on_new_server(self) -> None:
+        old_thread = "old-failed-thread"
+        _ = (self.session_dir / codex_mesh.ROSTER_FILE).write_text(json.dumps({
+            "seat": {"thread_id": old_thread, "turn_id": "", "status": "failed"}
+        }), encoding="utf-8")
+        (self.session_dir / codex_mesh.SERVER_FILE).unlink()
+
+        with patch.object(codex_mesh, "ensure_server", return_value=(self.server.port, True)) as ensure:
+            code, errors = self.run_start()
+
+        self.assertEqual((code, errors), (0, ""))
+        ensure.assert_called_once()
+        self.assertEqual(len(self.methods("thread/start")), 1)
+        self.assertFalse(any(
+            cast("dict[str, object]", request.get("params", {})).get("threadId") == old_thread
+            for request in self.methods("thread/read")
+        ))
         self.assertEqual(self.seat_record()["thread_id"], THREAD_ID)
 
     def test_replaced_waiting_launcher_starts_no_resume_turn(self) -> None:
