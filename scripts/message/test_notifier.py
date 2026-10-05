@@ -9,8 +9,11 @@ import subprocess
 import tempfile
 import time
 import unittest
+from datetime import datetime
 from pathlib import Path
 from typing import override
+from unittest import mock
+from zoneinfo import ZoneInfo
 
 
 SCRIPT = Path(__file__).with_name("notifier.sh")
@@ -113,6 +116,31 @@ class NotifierTests(unittest.TestCase):
         self.assertTrue(self.successful("interval", "example", "3", now=NOW + 190).startswith(f"next_due={MINUTE + 360} ("))
         self.assertEqual(self.conf()["EVERY"], "3")
         self.assertEqual(self.run_cli("interval", "example", "0").returncode, 2)
+
+    def test_aligned_schedule_lands_on_the_clock(self) -> None:
+        def at(zone: str, hour: int, minute: int) -> int:
+            return int(datetime(2026, 10, 5, hour, minute, 30, tzinfo=ZoneInfo(zone)).timestamp())
+
+        def next_due(*args: str, now: int) -> int:
+            return int(self.successful(*args, now=now).split("=", 1)[1].split(" ", 1)[0])
+
+        la = "America/Los_Angeles"
+        with mock.patch.dict(os.environ, {"TZ": la}):
+            _ = self.new(every=60)
+            self.assertEqual(next_due("align", "example", "on", now=at(la, 10, 5)), at(la, 11, 0) - 30)
+            self.assertEqual(self.conf()["ALIGN"], "1")
+            self.assertIn("every 60 min on the clock, enabled", self.successful("status", "example"))
+            _ = self.successful("tick", now=at(la, 11, 0))
+            self.assertEqual(int(self.state()["NEXT_DUE"]), at(la, 12, 0) - 30)
+            # A slot under half an interval away is skipped.
+            self.assertEqual(next_due("restart", "example", now=at(la, 11, 55)), at(la, 13, 0) - 30)
+            self.assertEqual(next_due("interval", "example", "30", now=at(la, 12, 10)), at(la, 12, 30) - 30)
+            self.assertEqual(next_due("align", "example", "off", now=at(la, 12, 10)), at(la, 12, 40) - 30)
+            self.assertEqual(self.run_cli("align", "example", "maybe").returncode, 2)
+        kolkata = "Asia/Kolkata"
+        with mock.patch.dict(os.environ, {"TZ": kolkata}):
+            _ = self.successful("interval", "example", "60")
+            self.assertEqual(next_due("align", "example", "on", now=at(kolkata, 10, 5)), at(kolkata, 11, 0) - 30)
 
     def test_due_tick_send_arguments_and_log_format(self) -> None:
         _ = self.new("--from", "sender", "--timeout", "7")

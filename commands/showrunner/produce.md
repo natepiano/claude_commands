@@ -112,7 +112,8 @@ State:
     `[{"since": "YYYY-MM-DDTHH:MM", "text": "..."}]`, one entry per thing the
     user must do or decide, each with enough context to recall it without my
     memory (what, where, why). Add an entry the moment it arises; remove it only
-    when the user addresses it and tells you. User, 2026-10-05.
+    when the user addresses it and tells you. An entry the user defers gets
+    `"after": "YYYY-MM-DDTHH:MM"` (local) and stays hidden until then. User, 2026-10-05.
 
   It prints `build hold: <holder> since 11:34 PDT, for the frame-time lane's breakdown
   of what each added tool costs - release eta: 11:40 PDT (3 minutes)` while a
@@ -225,8 +226,9 @@ Run these steps at the start and on every resume:
 3. **Register instance.** Run `NOTIFIER new UPDATES --to
    session:$CLAUDE_CODE_SESSION_ID --every <N from the doc's **Updates:** line>
    --prompt-file PROMPT_FILE --from showrunner-timer-<slug> --check "zsh
-   $HOME/.claude/scripts/production/production_check.sh <absolute doc path>"`.
-   A repeated `new` retargets without moving the clock.
+   $HOME/.claude/scripts/production/production_check.sh <absolute doc path>"`,
+   plus `--aligned` when that line says on the hour. A repeated `new` retargets
+   without moving the clock.
 4. **Status.** Run `NOTIFIER status UPDATES` for the next tick and fire log.
    The declared job runs the ticks.
 

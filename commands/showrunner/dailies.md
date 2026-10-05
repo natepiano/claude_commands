@@ -36,7 +36,8 @@ production doc's **Updates** interval. Two steps do that:
    CLAUDE NOT RUNNING, FORM WAITING, a usage limit, a DECISION), as a scheduled
    tick does.
 2. **Reset the clock.** After the report, run `NOTIFIER restart UPDATES`:
-   at 19:21 with N = 15, the next tick is 19:36. Log the `next_due` it prints.
+   at 19:21 with N = 15, the next tick is 19:36. An aligned timer keeps the
+   clock: at 19:21 with N = 60, 20:00; at 19:45, 21:00. Log the `next_due` it prints.
 
 A scheduled tick skips both steps. It has run the script already, and its clock
 is already right.

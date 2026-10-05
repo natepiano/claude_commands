@@ -15,7 +15,7 @@ SESSIONS_DIR=${NOTIFIER_SESSIONS_DIR:-$HOME/.claude/sessions}
 NOW=${NOTIFIER_NOW_EPOCH:-$EPOCHSECONDS}
 
 die() { print -u2 -r -- "notifier.sh: $*"; exit 2 }
-usage() { die 'usage: notifier.sh new <instance> --to <target> --every <min> (--command <text> | --prompt-file <path>) [--from <sender>] [--check <cmd>] [--hold] [--timeout <s>]; start|stop|status|fire|restart|remove|health <instance>; interval <instance> <min>; status|tick' }
+usage() { die 'usage: notifier.sh new <instance> --to <target> --every <min> (--command <text> | --prompt-file <path>) [--from <sender>] [--check <cmd>] [--hold] [--aligned] [--timeout <s>]; start|stop|status|fire|restart|remove|health <instance>; interval <instance> <min>; align <instance> on|off; status|tick' }
 
 [[ $NOW == <0-> ]] || die "invalid clock: $NOW"
 
@@ -52,6 +52,7 @@ write_conf() {
     print -r -- "FROM=${conf[FROM]}"
     print -r -- "CHECK=${conf[CHECK]:-}"
     print -r -- "HOLD=${conf[HOLD]}"
+    print -r -- "ALIGN=${conf[ALIGN]:-0}"
     print -r -- "TIMEOUT=${conf[TIMEOUT]}"
   } > "$tmp"
   mv -f -- "$tmp" "$dir/conf"
@@ -69,9 +70,26 @@ write_state() {
   mv -f -- "$tmp" "$dir/state"
 }
 
+# An aligned instance fires on the local clock's multiples of EVERY (every 60:
+# on the hour), and skips a slot less than half an interval away.
 schedule() {
-  state[NEXT_DUE]=$(( NOW - NOW % 60 + conf[EVERY] * 60 ))
+  local period=$(( conf[EVERY] * 60 )) offset local_now
+  if [[ ${conf[ALIGN]:-0} == 1 ]]; then
+    offset=$(utc_offset)
+    local_now=$(( NOW + offset ))
+    state[NEXT_DUE]=$(( local_now - local_now % period + period - offset ))
+    (( state[NEXT_DUE] - NOW < period / 2 )) && state[NEXT_DUE]=$(( state[NEXT_DUE] + period ))
+  else
+    state[NEXT_DUE]=$(( NOW - NOW % 60 + period ))
+  fi
   write_state
+}
+
+utc_offset() {
+  local zone=$(strftime %z $NOW)
+  local seconds=$(( ${zone[2,3]} * 3600 + ${zone[4,5]} * 60 ))
+  [[ ${zone[1]} == - ]] && seconds=$(( -seconds ))
+  print -r -- $seconds
 }
 
 local_time() { strftime "$1" "$2" }
@@ -91,7 +109,7 @@ log_error() { print -r -- "$fired | $1" >> "$STATE_DIR/notifier.log" }
 
 cmd_new() {
   (( $# >= 2 )) || usage
-  local name=$1 dir lock_fd target='' every='' command='' prompt_file='' sender='' check='' hold=0 timeout=120
+  local name=$1 dir lock_fd target='' every='' command='' prompt_file='' sender='' check='' hold=0 align=0 timeout=120
   local command_given=0 prompt_given=0
   shift
   valid_name "$name"
@@ -110,6 +128,7 @@ cmd_new() {
         esac
         shift 2 ;;
       --hold) hold=1; shift ;;
+      --aligned) align=1; shift ;;
       *) usage ;;
     esac
   done
@@ -126,7 +145,7 @@ cmd_new() {
   [[ -e $dir/lock ]] || : > "$dir/lock"
   zsystem flock -f lock_fd "$dir/lock" || die "cannot lock $name"
   typeset -A conf state
-  conf=(TARGET "$target" EVERY "$every" FROM "$sender" CHECK "$check" HOLD "$hold" TIMEOUT "$timeout")
+  conf=(TARGET "$target" EVERY "$every" FROM "$sender" CHECK "$check" HOLD "$hold" ALIGN "$align" TIMEOUT "$timeout")
   (( command_given )) && conf[COMMAND]=$command
   (( prompt_given )) && conf[PROMPT_FILE]=$prompt_file
   write_conf
@@ -154,6 +173,12 @@ cmd_state() {
     restart) state[LAST_RESTART]=$NOW; schedule; next_line ;;
     interval)
       conf[EVERY]=$3
+      write_conf
+      state[LAST_RESTART]=$NOW
+      schedule
+      next_line ;;
+    align)
+      conf[ALIGN]=$3
       write_conf
       state[LAST_RESTART]=$NOW
       schedule
@@ -276,7 +301,9 @@ cmd_status() {
   read_state
   local mode=stopped
   [[ ${state[ENABLED]:-0} == 1 ]] && mode=enabled
-  print -r -- "$name → ${conf[TARGET]} every ${conf[EVERY]} min, $mode"
+  local aligned=''
+  [[ ${conf[ALIGN]:-0} == 1 ]] && aligned=' on the clock'
+  print -r -- "$name → ${conf[TARGET]} every ${conf[EVERY]} min$aligned, $mode"
   next_line
   time_line last_sent "${state[LAST_SENT]}"
   time_line last_restart "${state[LAST_RESTART]}"
@@ -369,6 +396,13 @@ case $action in
   interval)
     (( $# == 2 )) || usage
     cmd_state interval "$1" "$2" ;;
+  align)
+    (( $# == 2 )) || usage
+    case $2 in
+      on) cmd_state align "$1" 1 ;;
+      off) cmd_state align "$1" 0 ;;
+      *) usage ;;
+    esac ;;
   fire)
     (( $# == 1 )) || usage
     valid_name "$1"
