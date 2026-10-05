@@ -25,10 +25,12 @@ CALLER_LABELS = {
     "agent": "agent (direct)",
     "alias": "terminal",
     "validate_ci": "push gate",
+    "brp-launch": "example launches (brp)",
     "unknown": "unknown",
 }
 OUTCOME_ORDER = ["ran", "failed", "interrupted", "reused", "replayed", "deferred"]
 SCRATCH = "(cwd LIKE '/tmp/%' OR cwd LIKE '/var/folders/%' OR cwd LIKE '/private/var/folders/%')"
+GROUP_AS_SCRATCH = f"({SCRATCH} AND caller != 'brp-launch')"
 SCRATCH_LABEL = "scratch (temp folders)"
 ON_DAY = "date(started_at, 'localtime') = ?"
 COMMON_HEAD = ["Runs", "Failed", "Avg", "Range"]
@@ -149,13 +151,69 @@ def caller_label(caller: object, host: object, hosts: int) -> str:
     return f"{label} ({host})" if hosts > 1 else label
 
 
+def wait_row(label: str, waits: list[tuple[float, str, str, str]], unit: str) -> list[str]:
+    """Summarize measured waits, keeping parallel seats as separate time."""
+    if not waits:
+        return [label, "none", "", "", "", ""]
+    positive = [(duration, owner, name, at) for duration, owner, name, at in waits if duration > 0]
+    waited = f"{len(positive)} of {len(waits)} {unit}"
+    if not positive:
+        return [label, "none", "0", waited, f"0.0 {'job' if unit == 'jobs' else 'seat'}-hours", ""]
+    longest, _, name, at = max(positive, key=lambda entry: entry[0])
+    when = datetime.fromisoformat(at.replace("Z", "+00:00")).astimezone().strftime("%H:%M %Z")
+    totals: dict[str, float] = {}
+    for duration, owner, _, _ in positive:
+        totals[owner] = totals.get(owner, 0.0) + duration
+    worst = ", ".join(
+        f"{owner} {seconds(duration)}" for owner, duration in sorted(totals.items(), key=lambda item: (-item[1], item[0]))[:3]
+    )
+    hours = f"{sum(duration for duration, _, _, _ in positive) / 3600:.1f} {'job' if unit == 'jobs' else 'seat'}-hours"
+    return [label, f"{seconds(longest)} ({name}, {when})", str(sum(duration > 300 for duration, _, _, _ in positive)), waited, hours, worst]
+
+
+def wait_seconds(value: object) -> float:
+    return float(value) if isinstance(value, int | float) else 0.0
+
+
+def waiting_section(connection: sqlite3.Connection, day: str) -> list[str]:
+    calls = fetch(
+        connection,
+        "SELECT token_wait_s, coalesce(worktree_name, '(unknown worktree)'), started_at FROM calls"
+        + " WHERE date(started_at, 'localtime') = ?",
+        day,
+    )
+    steps = fetch(
+        connection,
+        "SELECT mem_wait_s, coalesce(worktree_name, '(unknown worktree)'), seat, started_at FROM steps"
+        + " WHERE date(started_at, 'localtime') = ? AND mem_wait_s IS NOT NULL",
+        day,
+    )
+    jobs = fetch(
+        connection,
+        "SELECT j.queued_s, j.workflow, j.name, j.created_at FROM ci_jobs AS j"
+        + " JOIN ci_runs AS r ON j.run_id = r.run_id AND j.attempt = r.attempt"
+        + " WHERE date(r.started_at, 'localtime') = ? AND j.run_state = 'ran' AND j.queued_s IS NOT NULL",
+        day,
+    )
+    rows = [
+        wait_row("Build-folder turn", [(wait_seconds(duration), str(tree), str(tree), str(at)) for duration, tree, at in calls], "calls"),
+        wait_row(
+            "Memory admission",
+            [(wait_seconds(duration), str(tree), f"{tree} {seat}" if seat else str(tree), str(at)) for duration, tree, seat, at in steps],
+            "steps",
+        ),
+        wait_row("CI queue", [(wait_seconds(duration), f"{workflow} / {name}", f"{workflow} / {name}", str(at)) for duration, workflow, name, at in jobs], "jobs"),
+    ]
+    return ["### Waiting", "", *table(["Wait", "Longest", "Over 5 min", "Waited", "Total", "Worst"], rows), ""]
+
+
 def kind_section(connection: sqlite3.Connection, day: str, kind: str, hosts: int) -> list[str]:
     extra = EXTRA.get(kind, [])
     select = ", ".join([COMMON_SQL, *(column.sql for column in extra)])
     rows = fetch(
         connection,
-        f"SELECT {SCRATCH} AS is_scratch, CASE WHEN {SCRATCH} THEN NULL ELSE host END AS caller_host,"
-        + f" CASE WHEN {SCRATCH} THEN NULL ELSE caller END AS grouped_caller, {select}"
+        f"SELECT {GROUP_AS_SCRATCH} AS is_scratch, CASE WHEN {GROUP_AS_SCRATCH} THEN NULL ELSE host END AS caller_host,"
+        + f" CASE WHEN {GROUP_AS_SCRATCH} THEN NULL ELSE caller END AS grouped_caller, {select}"
         + f" FROM steps WHERE {ON_DAY} AND step = ?"
         + " GROUP BY is_scratch, caller_host, grouped_caller ORDER BY count(*) DESC",
         day,
@@ -561,8 +619,9 @@ def mac_note() -> str:
 
 def report(connection: sqlite3.Connection, day: str) -> str:
     found = kinds(connection, day)
-    hosts = cast(int, fetch(connection, f"SELECT count(DISTINCT host) FROM steps WHERE {ON_DAY} AND NOT {SCRATCH}", day)[0][0])
+    hosts = cast(int, fetch(connection, f"SELECT count(DISTINCT host) FROM steps WHERE {ON_DAY} AND NOT {GROUP_AS_SCRATCH}", day)[0][0])
     lines = [f"## Builds, {date.fromisoformat(day).strftime('%A %Y-%m-%d')}", ""]
+    lines += waiting_section(connection, day)
     for kind in found:
         lines += kind_section(connection, day, kind, hosts)
     lines += memory_pressure_section(connection, day, hosts)

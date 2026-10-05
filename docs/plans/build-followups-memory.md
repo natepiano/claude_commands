@@ -233,9 +233,270 @@ Measured 2026-10-04 11:59–12:25 PDT, read-only, from the earlyoom journal, the
 - Queuing a message to an out-of-retries thread: it would open a turn that nothing streams.
 - Changing the service tier: the pacer stayed on `default` through every capacity stop.
 
-### Phase 9 — verify.sh builds in a named target folder · status: todo
+### Phase 9 — The build report opens with the day's waits · status: done
+
+#### As-built
+
+- `report()` in `scripts/buildlog/report.py` puts `### Waiting` right after `## Builds, <day>`, before the kind sections; the `memory waits:` line under Memory pressure is unchanged. Rows, in order: `Build-folder turn` (`calls.token_wait_s > 0`, `<n> of <calls> calls`, by `worktree_name`), `Memory admission` (`steps.mem_wait_s > 0`, `<n> of <steps> steps`, by `worktree_name`, naming the seat when the step has one), `CI queue` (`ci_jobs.queued_s > 0` over `ran` jobs with a known queue time, `<n> of <jobs> jobs`, `Worst` as `<workflow> / <job name>`).
+- Columns: `Wait`, `Longest` (the wait, who, and the time with its zone), `Over 5 min` (above 300 s), `Waited`, `Total` (seat-hours; job-hours for CI), `Worst` (top three by summed wait, in minutes). Durations use `seconds()`; a kind with nothing on the day prints `none` and blank cells after it; no averages.
+- verify.sh times the cargo token acquisition, a timed-out wait included, and passes it as `BUILDLOG_TOKEN_WAIT_S`; the call record stores `token_wait_s`, 0 when the value is not a whole number. Index schema 9 adds `calls.token_wait_s INTEGER` (0 for a record without it) and keys `ci_job_days` by the run attempt's `started_at`, the same day `ci_section` and the CI queue row use. `wait_s` keeps its meaning: metadata, pass-record lookups and the token wait together.
+- `launches.collect()` turns each `brp_launch` result in `~/.claude/projects/*/*.jsonl` (`BUILDLOG_TRANSCRIPTS` replaces the root) into a `build` step with caller `brp-launch`: `ended_at` is `metadata.launch_timestamp`, `started_at` that minus the launch's duration, `cwd` the crate, repo and worktree from `parameters.path`, `session` the transcript's id, argv `cargo build --workspace --bin <target>` when `metadata.launched_as` is `app`, else `--example <target>`, `--release` when set, and no memory fields (the build runs in the session's own scope). It reads `mcpMeta.structuredContent`, list `tool_result` items, and `<task-notification><result>JSON</result>` strings in user message and queue-operation content.
+- Each launch is its own file, `launch-<sha256(session:timestamp)>.jsonl` in the host folder, written to a temporary file and hard-linked into place, so a repeat run writes nothing twice. `launches_state.json` in the store root holds each transcript's offset, head and tail marks, so a repeat run reads only new lines.
+- `day_report` collects launches before `index.update()`, so `buildlog report` shows a launch in the same invocation. `CALLER_LABELS` maps `brp-launch` to `example launches (brp)`, a duration covering build and app start; launches from temporary folders group under their worktree, not as scratch (`GROUP_AS_SCRATCH`), and the host count follows the same rule.
+
+**Files:**
+- `scripts/buildlog/report.py` — the Waiting section; the `brp-launch` label and grouping
+- `scripts/buildlog/launches.py` — the launch collector
+- `scripts/buildlog/cli.py` — `buildlog launches`; `day_report` collects before `index.update()`
+- `scripts/buildlog/record.py` — `token_wait_s` on the call record; `optional_int` returns None for a non-integer
+- `scripts/buildlog/index.py` — schema 9, `calls.token_wait_s`, `ci_job_days` by run attempt
+- `scripts/delegate/verify.sh` — the cargo token wait measurement
+- `scripts/buildlog/test_{report,launches,index,record}.py`, `scripts/delegate/test_verify_token_wait.py` — the cases; the last drives real verify.sh routing with a cargo stub on `PATH`
+
+**Binds later work:** index schema 9 and `calls.token_wait_s`; the Waiting section as the report's home for waits; `brp-launch` steps carry no memory fields; "Launches started without a path are recorded" re-reads `launches_state.json` once; `test_verify_token_wait.py` is the verify.sh routing harness later verify.sh tests extend.
+
+**Gotchas:**
+- A long `brp_launch` finishes as an MCP task, so its result is a `<task-notification>` string, not a `tool_result`; `binary_path` appears for examples too, so only `metadata.launched_as` names an app.
+- A launch without `parameters.path` is skipped (122 of 360 real launches); `metadata.workspace` holds only the folder name.
+- The Build-folder turn row reads `none` until verify.sh with the token wait is on `~/.claude` main.
+- Fixtures in a made-up result shape missed the traps above; transcript fixtures copy real lines.
+
+**Ruled out:** a Claude Code hook on `brp_launch` (a settings change); a buildlog record written from inside bevy_brp_mcp (a published crate in another repository); appending launches to the host's monthly file (the per-launch file makes the record id the dedupe); counting a timed-out token wait as zero (it is real queueing time).
+
+### Phase 10 — A build waits for free memory, not for the slice's soft limit · status: todo
 
 #### Work Order
+
+**Goal:** a build step waits to start while the machine has less than 12 GiB of memory available, the floor below which steve stops handing out build slots, instead of while `builds.slice` sits above its `memory.high`, which the slice no longer has.
+
+**Source:** natedev (showrunner), 2026-10-04 19:29 PDT, accepting the unit director's memory proposal. `/etc/nixos` 6459e48 drops `builds.slice`'s MemoryHigh, raises its MemoryMax from 34G to 44G and keeps MemorySwapMax 4G, and gives MemoryLow 8G to `user.slice`, `user-1000.slice`, `user@1000.service` and `app.slice`; it went live at 19:36 PDT (generation 199), when the user also reverted the runtime override (MemoryHigh 38G, MemoryMax 44G) applied at 19:21 PDT. natedev read it live: `memory.high` max, `memory.max` 44.0G, `memory.low` 8.0G at all four levels, MemAvailable 42 GiB. Measured on 2026-10-04: MemoryHigh throttled every build for 45 minutes over one test run's growth; the slice's process memory reached 31.1 GiB with 18.5 million `high` events, no `max` event and no kill; widget's full test step peaked at 19.2–25.4 GiB; 25 test binaries came to about 12 GiB of page cache, which `memory.high` and `memory.current` both count. Since then `memory.high` reads `max` and today's admission (`buildlog_wait_for_memory`, `scripts/lint/invoke.sh:107-130`) returns at once on every step (`:115`), so builds have no admission at all until this phase lands. steve already stops handing out slots while MemAvailable is under 12 GiB (`--min-memory-avail 12288`, `/etc/nixos/modules/linux/jobserver.nix:32-37`), and earlyoom acts at about 3 GiB.
+
+**Spec:**
+- **What it waits on.** `buildlog_wait_for_memory` waits while the machine's `MemAvailable` is under 12 GiB (12288 MiB, steve's floor). It reads `/proc/meminfo`; `BUILDLOG_MEMINFO` names another file, and every test sets it. A file that is missing or unreadable, or has no `MemAvailable` line with a whole number of kB, means no wait. It no longer reads `memory.high` or `memory.current`, and no longer reads `BUILDLOG_BUILDS_CGROUP` (`memory.py` and `sample.py` still read that variable for their own figures).
+- **Every step waits.** `run_once` (`scripts/lint/invoke.sh:172-179`) calls the gate only when `BUILDLOG_PEAK` is set, so a step that records nothing (`BUILDLOG_SCOPE=0`) has no admission today. The gate runs for every build step; only a recorded step's `started_at` and `mem_wait_s` take the wait.
+- **What it says.** On its first check below the floor it prints once to stderr `waiting for memory since HH:MM PDT: the machine has X.X GiB free; a build starts at 12.0` (the time in America/Los_Angeles with its zone, X.X the MemAvailable it read). It rechecks every `BUILDLOG_MEM_POLL_S` seconds (5 by default) and after `BUILDLOG_MEM_WAIT_LIMIT_S` (900 by default) prints `memory wait limit reached after 15 min; starting anyway` and starts. These two knobs, `BUILDLOG_MEM_WAIT_S`, and the step's start time, which excludes the wait, keep their Phase 2 meaning, so `steps.mem_wait_s` and the Waiting section's Memory admission row read the same as before.
+- **Ruled out:** a per-run memory cap in verify.sh (natedev, 2026-10-04: widget's drawn-pixel test group already bounds the largest step); keeping a `memory.high` gate beside the new one (the slice has none since 6459e48, and a page-cache count throttles builds that are not short of memory).
+- **Tests,** with a fixture meminfo file under a temporary root and never the real `/proc/meminfo` or cgroup tree: a step waits while the file shows under 12 GiB and starts once it shows 12 GiB or more, with its wait in `mem_wait_s` and its start time after the wait; the message prints once with the free figure and its zone; the limit message prints and the step starts; a missing file, a file with no `MemAvailable` line and a non-numeric value each mean no wait; a step run with `BUILDLOG_SCOPE=0` waits too. The routing test that sets `BUILDLOG_BUILDS_CGROUP` for invoke.sh's sake (`scripts/delegate/test_verify_token_wait.py:91`) points `BUILDLOG_MEMINFO` at a file well above the floor instead.
+
+**Files:**
+- `scripts/lint/invoke.sh` — `buildlog_wait_for_memory` waits on MemAvailable
+- `scripts/buildlog/test_record.py` — the memory admission cases (`:193-250` today)
+- `scripts/delegate/test_verify_token_wait.py` — its fixture points `BUILDLOG_MEMINFO` above the floor
+
+**Seats:** `1 writer + 1 tester` — the gate and its tests split by file.
+- `impl` — `scripts/lint/invoke.sh`; hub: `scripts/lint/invoke.sh`
+- `test` — `scripts/buildlog/test_record.py`, `scripts/delegate/test_verify_token_wait.py`, written from the Spec alone
+
+**Constraints from prior phases:**
+- Phase 2: `invoke.sh` runs each step in a `builds.slice` scope; `run_once` calls `buildlog_wait_for_memory` before the step (`:176`), the step's `started_at` excludes the wait, and the waited seconds reach `steps.mem_wait_s` through `BUILDLOG_MEM_WAIT_S`. A pipe element runs in a subshell, so the wait and its seconds stay before the pipe.
+- Phase 9: the Waiting section's Memory admission row reads `steps.mem_wait_s` on the day; the index is schema 9. `test_verify_token_wait.py` runs real verify.sh routing with a cargo stub on `PATH`.
+- Tests never read the real `/proc/meminfo`, cgroup tree or journal, never write `~/.local/state/buildlog` or `~/.local/state/build-hold`, and never build.
+- Times carry their zone; natedev's clock and journal are EDT, and this plan states PDT.
+
+**Acceptance gate:** `python3 -m unittest discover -s scripts/buildlog -p 'test_*.py'` and `python3 -m unittest discover -s scripts/delegate -p 'test_verify_*.py'` green; `bash -n scripts/lint/invoke.sh`; `basedpyright` 0 errors and 0 warnings on changed Python.
+
+### Phase 11 — A sweep that clears build caches for something else says so · status: todo
+
+#### Work Order
+
+**Goal:** when the disk floor's sweep removes build caches because something other than build output is filling the disk, or removes more than 32 GiB at once, natedev hears it after that first sweep, by message and on the phone, with the directories outside the build caches that grew.
+
+**Source:** natedev (showrunner), 2026-10-04 19:55 PDT. Between 19:37 and 19:46 PDT three floor sweeps removed 234.7 GiB of build caches (35.2, 89.0 and 110.5 GiB; `journalctl --user -u disk-floor.service`), and nothing said so. The cause was frame's timing traces, about 300 GB, not cache growth: buildlog-disk's 19:53 PDT snapshot measured `/tmp` at 405 GB, and `/tmp` held 143 GiB at 19:57 PDT once they were gone. Every build after those sweeps started cold, and a cold build is a wait. Free space fell 32.5, 36.9 and 27.9 GiB in the 5, 6 and 3 minutes before those three sweeps. The same journal holds 103 sweeps on 2026-10-04 that removed output: apart from these three, none removed more than 29.2 GiB (09:33 PDT). The only alert today is disk-floor's own (`/etc/nixos/modules/linux/disk-floor.nix`), a high-priority phone alert sent once free space is under 300 GiB. On 2026-10-04 the sweeps held free space near 500 GiB, so it never fired.
+
+**Spec:**
+- **When it alerts.** `hold_floor` (`scripts/lint/sweep.py:704-742`) alerts after a sweep that removed output when either holds:
+  - *something else is filling the disk:* free space fell more than 10 GiB beyond what the build caches grew since the previous floor sweep, and that sweep was at most 30 minutes earlier;
+  - *one sweep removed a lot:* the sweep removed more than 32 GiB.
+  On 2026-10-04 the first test held about 30 GiB of unexplained fall before each of the three trace-driven sweeps. The second sits between the largest ordinary sweep (29.2 GiB) and the smallest trace-driven one (35.2). Both thresholds are constants with this evidence beside them.
+- **What counts as build caches.** The previous sweep's figures are its free space and build-cache bytes after it ran, measured once its removals finish, never the remainder `shrink` estimates (`sweep.py:642`), which counts a failed removal as gone. They are kept in `floor.json` in the sweep's state directory: `~/.local/state/lint-sweep/`, which `LINT_SWEEP_STATE_DIR` overrides and every test sets. A floor sweep with no earlier record, or an earlier record more than 30 minutes old, writes the record and sends no growth alert. Build-cache bytes are counted in three parts:
+  - the idle target directories the sweep already scans;
+  - every target directory it leaves alone because a build holds it, measured with `directory_blocks`;
+  - CI's two runner folders, `/var/lib/hana-ci/hana-linux-1` and `-2`, measured the same way and never swept.
+  Without the last two, a busy worktree or a CI job growing would read as something else filling the disk. The busy and CI figures are taken once per sweep; the sweep never changes them.
+- **What it says.** It sends one message to natedev with `scripts/message/send.py --to natedev --from disk_floor --timeout 30`, the text on stdin. It sends the same text with `scripts/notify/pushover.py --priority 0 "natedev: build caches swept" <text>`.
+  - The text names: the sweep's time in PDT; what it removed; how far free space fell since the previous sweep against how much the build caches grew; which threshold fired.
+  - It then names the three directories outside the build caches that grew most, with their growth and size, measured by buildlog-disk at the times it names. When such a directory's largest child holds more than half of its growth, it names that child as well.
+  - It names the snapshot's two measurement times and how much of the fall the measured folders' growth explains. The rest is named as outside the measured folders: buildlog-disk measures `~/rust`, `/tmp` and the CI folders, while the sweep also covers `~/.local/state`. A snapshot older than 15 minutes is named as such.
+  - When buildlog-disk's snapshot has no earlier measurement to compare against, the text says so and names the three largest directories outside the build caches.
+  - A send that fails prints to stderr and never fails the sweep.
+  - At most one such alert per hour, counted from the last alert at least one channel delivered; send.py queueing it for natedev counts as delivered. Each channel's result is printed. When both fail, the next qualifying sweep tries again.
+- **The directories outside the build caches come from buildlog-disk** (`scripts/buildlog/disk.py`, every 10 minutes), never from a fresh `du` of `/`.
+  - Its walk of the measured folders (`FOLDERS`, `:34-39`) also records each directory one and two levels under each folder that holds at least 1 GiB outside cargo target directories (a directory holding `.rustc_info.json`, as `sweep.target_dirs` finds them), with those bytes.
+  - Before it writes, it reads the snapshot it is about to replace. Each recorded directory then carries its growth since that snapshot's `measured_at`: a directory the earlier snapshot did not list grew by its whole size.
+  - The snapshot keeps its existing fields, so the build report's disk table (`scripts/buildlog/report.py:591`) reads it unchanged. The sweep reads `disk.json` from `BUILDLOG_DIR`, or `~/.local/state/buildlog`, by path. A snapshot that is missing, unreadable or of the old shape means the text says the measurement is unavailable; the snapshot read returns a named state for each case, not `DiskSnapshot | None`.
+- **Ruled out:** changing disk-floor's own 300 GiB alert or its priority; stopping the sweep when growth comes from elsewhere. The floor still holds; the alert is how the cause gets stopped.
+- **Tests,** under a temporary root, with the sends replaced so that no test calls send.py or Pushover, and with fixture target folders and fixture `disk.json` files. Never the real disk, journal or state:
+  - a sweep after a fall the build caches explain sends nothing;
+  - a fall 10 GiB beyond their growth within 30 minutes sends one alert naming the grown directories and the child that holds most of one's growth;
+  - a busy target's growth and a CI folder's growth count as build caches;
+  - an earlier record over 30 minutes old sends no growth alert;
+  - a removal over 32 GiB alerts on its own;
+  - a removal that fails leaves its bytes in the recorded build-cache figure;
+  - both sends failing leaves the next qualifying sweep free to alert, and one channel delivering counts as sent;
+  - a second qualifying sweep within the hour sends nothing;
+  - a failed send leaves the sweep's exit status unchanged;
+  - buildlog-disk records directories outside target folders with their growth since the previous snapshot, a new directory growing by its whole size, and nested directories counted at each level without counting a hard-linked file twice;
+  - the build report's disk table reads both the new and the old snapshot shape.
+
+**Files:**
+- `scripts/lint/sweep.py` — the floor record, the two tests, the alert
+- `scripts/lint/test_sweep.py` — the sweep cases above
+- `scripts/buildlog/disk.py` — directories outside the build caches and their growth
+- `scripts/buildlog/test_disk.py` — the measurement cases above
+- `scripts/buildlog/test_report.py` — the disk table reads both snapshot shapes
+
+**Seats:** `2 writers` — the sweep alert and the disk measurement have separate hubs and tests; they meet only at `disk.json`'s shape, which the disk writer posts first.
+- `impl` — `scripts/lint/sweep.py`, `scripts/lint/test_sweep.py`; hub: `scripts/lint/sweep.py`
+- `test` — `scripts/buildlog/disk.py`, `scripts/buildlog/test_disk.py`, `scripts/buildlog/test_report.py`; hub: `scripts/buildlog/disk.py`
+
+**Constraints from prior phases:**
+- `disk.py` imports `sweep` at load (`sys.path` insert of `scripts/lint`), so `sweep.py` never imports from `scripts/buildlog` at load. It reads `disk.json` as a file.
+- `hold_floor` runs from every build step's background sweep as well as from disk-floor's 2-minute timer (`sweep.py --floor-only`); the floor lock (`FLOOR_LOCK`) already lets one run at a time, and the record and the alert stamp are written under it.
+- Tests never read the real journal, `/var/lib/hana-ci` or `/proc`, never write `~/.local/state/lint-sweep` or `~/.local/state/buildlog`, never call `send.py` or `pushover.py`, and never build.
+- Times carry their zone; natedev's clock and journal are EDT, and this plan states PDT.
+
+**Acceptance gate:** `python3 -m unittest discover -s scripts/lint -p 'test_sweep.py'` and `python3 -m unittest discover -s scripts/buildlog -p 'test_*.py'` green; `basedpyright` 0 errors and 0 warnings on changed Python. Smoke: `BUILDLOG_DIR=<scratch> buildlog disk` run twice on the real tree; the second `disk.json` lists the directories outside the build caches with their growth.
+
+### Phase 12 — Launches started without a path are recorded · status: todo
+
+#### Work Order
+
+**Goal:** every `brp_launch` in the transcripts becomes a build step, including a launch called without a `path` parameter.
+
+**Source:** the unit director's smoke run of Phase 9 on a copy of the real build log, 2026-10-04 20:10 PDT. The collector recorded 238 of the 360 launches in the transcripts. All 122 it missed carry `metadata.working_directory` but have no `parameters.path`, because the launch used the session's own folder. `launch_record` (`scripts/buildlog/launches.py`) needs `parameters.path` for the worktree fields, so it drops them. The missed launches include 2026-10-01 and 2026-10-03 launches. This was moved out of Phase 9 under the production's hard landing rule: it is no regression, and no test fails.
+
+**Spec:**
+- When `parameters.path` is absent, take the repo and worktree fields from `record.git_facts(metadata.working_directory)`, the crate folder inside the worktree. `parameters.path` stays first when present. A launch with neither a usable path nor a working directory is still skipped.
+- **A worktree that is gone.** `record.git_facts` returns unknown fields for a removed worktree. Such a launch is still recorded, with unknown worktree fields, and counted as unresolved. A back-filled launch leaves branch and SHA blank, so collection-time facts never pose as launch-time ones.
+- **Why a launch is skipped.** `launch_record` (`launches.py:73`) returns a named outcome (recorded, not a launch, no result, no location) instead of `dict | None`, and the collector counts each.
+- Collection state written by Phase 9 marks every existing transcript as read to its end. So the next run would never revisit the missed lines. Revisit them once, without writing any launch twice: the record id, session plus `launch_timestamp`, already prevents duplicates.
+- **Tests,** with fixture transcripts under a temporary root: a launch with no `parameters.path` becomes one step whose worktree is the git worktree holding its working directory, and a second run adds nothing. A run over a transcript whose state was saved before this phase picks up such a launch once; an interrupted re-read resumes without writing a launch twice.
+
+**Files:**
+- `scripts/buildlog/launches.py` — the working-directory fallback and the one-time re-read
+- `scripts/buildlog/test_launches.py` — the cases above
+
+**Seats:** `1 writer + 1 tester` — the collector and its tests split by file.
+- `impl` — `scripts/buildlog/launches.py`; hub: `scripts/buildlog/launches.py`
+- `test` — `scripts/buildlog/test_launches.py`, written from the Spec alone
+
+**Constraints from prior phases:**
+- Phase 9: `launches.collect()` keeps per-transcript offset, head and tail marks in `launches_state.json` in the store root. It writes one `launch-<sha256(session:timestamp)>.jsonl` file per launch in the host folder. It reads results from `mcpMeta.structuredContent`, from list `tool_result` items, and from `<task-notification>` strings. Its argv uses `--bin` only when `metadata.launched_as` is `app`. `BUILDLOG_TRANSCRIPTS` overrides the transcript root, and tests always set it.
+- Tests never read the real `~/.claude/projects` and never write `~/.local/state/buildlog`.
+
+**Acceptance gate:** `python3 -m unittest discover -s scripts/buildlog -p 'test_*.py'` green; `basedpyright` 0 errors and 0 warnings on changed Python; a smoke run of `buildlog report` over a copy of the real store collects every launch that has a working directory and prints the eligible, recorded and unresolved counts.
+
+### Phase 13 — A measured working day · status: todo
+
+#### Work Order
+
+**Goal:** a measured 24-hour working day on natedev, judged against the target of no earlyoom kill, with the slice limits tuned from it.
+
+**Started:** 2026-10-04 15:26:32 PDT (start snapshot, natedev; the check over 15:16–15:26 PDT showed no missing snapshot and a readable journal). Closes 2026-10-05 15:26 PDT.
+
+**Spec:**
+
+*The window.* It opened when Phase 3's records were live on `~/.claude` main (the buildlog timers run from there). It closes 24 hours later, a full day and night, because the production's units build overnight: take the end snapshot then and run the day's report over the window. During the day, a figure whose window shows a missing snapshot, an unavailable journal or a reset at an edge is inconclusive: say so, and repeat that window or rebuild the figure from the minute snapshots inside it.
+
+Measure against the target, a normal working day with no earlyoom kill, from the report plus:
+- CI's run time against a successful CI run from before the Phase 2 diff (the 2026-10-04 runs were killed and are not a runtime baseline);
+- CI at its ceiling. In CI run 37227844227 attempt 4 (green 14:14 PDT 2026-10-04) the two Linux jobs peaked at 8.3 and 16.7 GiB, `hana-ci.slice` hit its 18G MemoryMax about 23,800 times (`max` events 3930 → 27773) and its memory stall grew 44.7 s in about 11 min, with no kill. Run 37236742478 (14:35–14:51 PDT, the first without CARGO_BUILD_JOBS) peaked at 16.5 and 11.1 GiB, with `max` events +33.1K, stall +33.9 s, no kill and no jobserver warning. For each CI run in the window, run `buildlog memory START END` over the run's own start and end (from `gh run view`) and record the slice's MemoryMax hits (the `max` events delta), its stall seconds (the `memory.pressure` some-total delta) and any `oom_kill`. `memory.peak` is the slice's lifetime high, so for a run that ran alone, report "highest observed minute sample": the largest `ci_anon_bytes` among this host's samples (`samples.host`) inside the run, with how many minute samples the run has against its length in minutes. A sample is taken once a minute, so it can miss a shorter peak; judge a limit change on the `max` events, stall seconds and `oom_kill` alongside it, never on the sample alone. Name the threshold that would justify raising CI's MemoryMax, and judge the day against it. Before 6459e48 the ceilings already summed past RAM (builds 34G + CI 18G + `app.slice` about 9G + system, on 60 GiB; `builds.slice` peaked at 32 GiB on 2026-10-04), so any raise to CI comes out of `builds.slice`'s MemoryMax and the sum holds;
+- the showrunner's readings inside the window, to check against the figures above: run 37247551616 (c14a984b7, 17:26:47–17:36:29 PDT 2026-10-04) was green with 13 jobs; CI processes peaked at 8.4 GiB, builds at 10.7 GiB, used memory at 33.7 GiB and swap at 21.7 GiB; stall some 1.2 min, full 0.9 min; no earlyoom or kernel kill;
+- the CI kill at 18:18:46 PDT 2026-10-04 (hana run 37250536724, red): the kernel killed a CI rustc at `hana-ci.slice`'s 18G MemoryMax (memcg OOM, the slice's 2G swap full) with the machine at 43 of 60 GiB. The kill-time task list held 26 rustc from Test Suite and Rendering Diagnostic, 17 of them linking with mold: 17.5 GiB, about 0.67 GiB a slot, because CI took 26 of the shared pool's slots while the sessions were quiet. The proposed repair is CI's own slot pool, `/dev/steve-ci` at 14 slots with the same 12 GiB floor (`docs/plans/build-followups-memory-nixos-ci-pool.diff`, sent to natedev 18:40 PDT): at most 16 CI units at once, projected 10.7 GiB at that mix and 14.6 GiB with two 3.1 GiB release rustc among them. It went live as `/etc/nixos` 06416b5, rebuilt at 18:43:35 PDT 2026-10-04 (generation 198): split every CI figure there, judge the runs after it against that projection, and count the change's own measured day from that instant;
+- the builds slice change: `/etc/nixos` 6459e48 drops `builds.slice`'s MemoryHigh, raises its MemoryMax to 44G and gives MemoryLow 8G from `user.slice` down to `app.slice`, live since 19:36 PDT 2026-10-04 (generation 199); before it, the user's runtime override (MemoryHigh 38G, MemoryMax 44G) held from 19:21 PDT, reverted at the switch. Split every builds figure at both instants, as for CI's pool, and count the change's own measured day from 19:36 PDT. From then until Phase 10 lands, builds have no memory admission at all. From then the ceilings, builds 44G and CI 18G, sum past RAM by design: a slice at its ceiling ends in one compiler kill and never a throttle, so judge the day on kills and stall seconds, not on the sum;
+- the cold caches: between 19:37 and 19:46 PDT 2026-10-04 three disk-floor sweeps removed 234.7 GiB of build caches while frame's timing traces filled `/tmp`, so the builds after them rebuilt from cold. Mark build times in that stretch as cold-cache and keep them out of any limit judged on build length. Phase 11's alert names such a stretch when it happens again in the window;
+- launch builds: `launches.py` records brp_launch builds with `slice: none` and no memory or admission fields. Correlate their intervals with kills and pressure, mark their memory unmeasured, and say whether launch builds need admission. The launch count is final only once Phase 12 has landed;
+- whether verify.sh ever counted a kill from outside the step as the step's own; if it did, tie the kill to the step's own processes;
+- whether the report's `memory waits:` line agrees with the `waiting for memory since …` lines agents saw;
+- the next `/build_hold` release that happens in the window, if any: when each held session's build started, its memory wait and the pressure. Do not stage a hold to produce one. Phase 4's helper reached the sessions when `~/.claude` main took the Phase 4 checkpoint, 2026-10-04 16:01:44 PDT. A release before that instant ran the old prose command and says nothing about the helper;
+- overlapping CI runs: both runners share `hana-ci.slice`, so label a figure from overlapping runs as shared-slice, and base the per-run comparison and the threshold only on runs that ran alone;
+- the day's hold time and workload (sessions building, CI runs). If holds kept session builds off for much of the day, repeat the day. If no natural release happens, the one-session-at-a-time step is unmeasured and says so.
+
+Tune the slice numbers from what it shows. A changed limit needs another measured day after it. Say whether per-crate admission or nextest thread limits are needed after all. A per-slice sample field that still reads "unavailable" is a deployment fault.
+
+*The staggering verdict.* From the observed release, say whether the admission already staggers the held sessions. If it does not, Phase 14 builds the one-session-at-a-time release; if it does, or no natural release happened, say so and Phase 14 is dropped or stays unmeasured.
+
+*Who takes the end snapshot.* The unit director takes it at 2026-10-05 15:26 PDT whatever the state of Phase 6's merge; this phase never waits on another phase to keep its window. Sources the writer and the checker both use: hold times from each holder file's `since`; release times from the `/build_hold release` output in the session transcripts and natedev's relay log; each session's build start from build-log `steps.started_at` and `mem_wait_s`.
+
+Baseline before the diff: natedev's stopgap 160efd9 put CI in steve on 2026-10-04. The first CI run with it, 37227844227, still lost both Linux jobs to earlyoom: the hana bin's rustc was killed at 12:29:58 and 12:30:09 PDT, about 3.3 GB RSS each with oom_score_adj 500, at about 2.8 of 56.5 GB available. Sharing steve's slots alone does not stop the kills.
+
+**Files:**
+- `docs/plans/build-followups-memory.md` — the day's figures, the CI threshold and the conclusions, in this phase
+- `docs/plans/build-followups-memory-nixos-*.diff` — any follow-up `/etc/nixos` diff for natedev; `-ci-pool.diff` is CI's own slot pool
+- `scripts/buildlog/{memory,sample,cli,index}.py` — the instruments, read only
+
+**Seats:** `1 writer + 1 tester` — the measurement and the test lane are disjoint.
+- `impl` — measures the day and writes the result; owns any `/etc/nixos` diff; hub: `docs/plans/build-followups-memory.md` (the result lands here; the tester sends its checks to the writer)
+- `test` — independently checks the journals, the CI figures and the record completeness from the same sources
+
+**Constraints from prior phases:**
+- `buildlog memory START END` (`scripts/buildlog/memory.py`) reads the snapshots nearest each edge, within 2 minutes, and counts only this host's records; the minute sample (`buildlog sample`, `scripts/buildlog/sample.py` and `cli.py`) writes one snapshot a minute with each slice's `memory.pressure` `some` total; the index is schema 8 since Phase 7 (`ci_jobs.run_state`: a job GitHub carried into a re-run attempt is `carried_over` and has no times of its own, so a re-run's CI figures use the attempt's own `ran` jobs), 9 after Phase 9 (`scripts/buildlog/index.py`). The window opened before Phase 9 changed how waits and launch builds are recorded and before Phase 10 moved the memory admission to MemAvailable: the day's memory verdict stands on the window as measured, and any reading of those phases' effects is a separate, later figure. `memory.peak` is a slice's lifetime high. rustc runs in `builds.slice/run-*.scope` under the sccache client as well as in `sccache.service`.
+- Live since 2026-10-04: sccache in the foreground (nixos e669461), `hana-ci.slice` with no MemoryHigh and its runners at OOMPolicy=continue (087c7c1), no CARGO_BUILD_JOBS (832dad4); the CI jobserver check is closed. This supersedes Phase 2's notes that the machine half is not live and that `CARGO_BUILD_JOBS` stays at 8: plan no deployment or jobserver change from them.
+- Phase 4: each holder file in `~/.local/state/build-hold/` (`BUILD_HOLD_DIR` overrides it; tests always set it) is one JSON line `{"holder", "since", "for", "release_eta"}`, where `release_eta` is an ISO instant or `unknown`; the old one-line form still reads. `scripts/build_hold/build_hold.py` has `hold` (`--release-eta HH:MM` needs `--zone`), `quiet`, `release` and `status`. `release` prints `released, builds may resume.` only when no holder file remains, else `released; still held by …`. `quiet` is busy while this user's `cargo`, `rustc` or `cargo-nextest` runs or the 1-minute load is at or above a quarter of the cores, and waits at most 10 minutes; `ps` needs `user:32`, or procps cuts long names. `HoldState = NoHolders | ActiveHolders`, `ReleaseEta = KnownReleaseEta | UnknownReleaseEta`, and `quiet_verdict` takes `Cores = KnownCores | UnknownCores` (Phase 5). `dailies_render.py` reads holds through `read_dailies_hold()` and refuses a unit marker with no holder file, active holders with no marked unit, and plumbing words in a holder's purpose. `scripts/buildlog/rust_release.py` treats any regular file in the hold directory as a hold.
+- Times carry their zone; natedev's clock and journal are EDT, and this plan states PDT.
+
+**Acceptance gate:** the original day reported at 2026-10-05 15:26 PDT; each newer control (CI's pool from 18:43 PDT, the builds slice from 19:36 PDT, Phase 10's admission once live) labeled provisional until its own complete day, with its workload and snapshot coverage; the day's report, each CI run's figures, the threshold and the conclusions written in this phase, each figure's window complete or marked inconclusive; the staggering verdict stated; `bash -n` on any changed shell.
+
+### Phase 14 — One session at a time · status: todo
+
+#### Work Order
+
+**Goal:** when Phase 13 finds the admission does not stagger held sessions, the last holder's `/build_hold release` releases them one at a time, each after the previous one's build has started.
+
+**Spec:**
+- Runs only if Phase 13's verdict says the admission does not stagger the sessions; otherwise this phase is dropped.
+- Only the last holder starts it. While another holder file remains, `release` names who still holds and releases no session (Phase 4's behavior). The holder's file stays until the last session is released, so `status`, the renderer and `rust_release.py` keep seeing the hold.
+- Release progress is one typed state per held session, in release order: `AwaitingRelease`, `ReleasedAwaitingAdmission(released_at)`, `PastMemoryWait(admitted_at, outcome)` with outcome `Granted`, `TimedOut` or `MeminfoUnavailable`, `NoAdmissionAck(released_at)`, each carrying only the instants valid in it. It is stored in `~/.local/state/build-hold-release/` (`BUILD_HOLD_RELEASE_DIR` overrides it), never in the holder directory, which every reader treats as holds; read back on each step, never kept in memory.
+- `release` messages one session at a time, by the same message path `/build_hold` uses today. A session moves to `PastMemoryWait` when its first build step is past the memory wait, whatever the outcome, since its build has started either way: `run_once` in `scripts/lint/invoke.sh` (`:172-179`) writes the acknowledgement right after `buildlog_wait_for_memory` returns, keyed by session name, into the release directory. A call that builds nothing (an example-gate refusal, a pass-record hit) writes none.
+- **Who is released.** The holds know holders, not held sessions (`build_hold.py:220`), and today's release goes to every top-level session (`commands/build_hold.md:10`). A session that finds the hold records itself, in arrival order, in the release directory; `release` messages those sessions one at a time by name, through the relay `/build_hold` uses, and after `NoAdmissionAck` moves to the next. `status` and the dailies renderer show each held session's state. The acknowledgement proves admission, not a finished build.
+- A session with no acknowledgement 5 minutes after its release becomes `NoAdmissionAck`; the next session is released and the release text names it.
+- **The driver.** `release` stays running in the last holder's session: it messages one session, polls the release directory every 15 s, and moves on at an acknowledgement or after 5 minutes. A held session registers with `build_hold.py wait --session <name>` when it finds the hold. Progress is the stored states, so `release --resume` continues after a restart. A session whose first build is a BRP launch writes no acknowledgement, since launches do not run through `invoke.sh`, and becomes `NoAdmissionAck` after 5 minutes.
+- Tests: partial progress (some released, some waiting), a missing acknowledgement, another active holder, and `status`, the dailies renderer and `rust_release.py` showing no phantom holder from the release directory, including after the last release clears it.
+
+**Files:**
+- `scripts/build_hold/build_hold.py` — release states, release directory, one-at-a-time release
+- `scripts/build_hold/test_build_hold.py` — the cases above
+- `commands/build_hold.md` — the one-at-a-time release steps
+- `scripts/lint/invoke.sh` — the acknowledgement after the memory wait
+- `scripts/production/dailies_render.py` — each held session's release state
+- `scripts/delegate/test_verify_release_ack.py` — the acknowledgement routing cases
+- `scripts/production/test_dailies_render_holds.py` — each held session's state
+
+**Seats:** `1 writer + 1 tester` — the helper and its tests split by file.
+- `impl` — `scripts/build_hold/build_hold.py`, `commands/build_hold.md`, `scripts/lint/invoke.sh`, `scripts/production/dailies_render.py`; hub: `scripts/build_hold/build_hold.py`
+- `test` — `scripts/build_hold/test_build_hold.py`, `scripts/delegate/test_verify_release_ack.py` (a delayed memory wait acknowledges after it, an example-gate refusal and a pass-record hit acknowledge nothing) and `scripts/production/test_dailies_render_holds.py`, written from the Spec alone
+
+**Constraints from prior phases:**
+- Phase 10: `buildlog_wait_for_memory` waits while the machine's MemAvailable is under 12 GiB (`BUILDLOG_MEMINFO` names the file; tests always set it), so the acknowledgement follows that wait.
+- Holder files in `~/.local/state/build-hold/` (`BUILD_HOLD_DIR` overrides it; tests always set it) are one JSON line `{"holder", "since", "for", "release_eta"}`; `read_holders` and `scripts/buildlog/rust_release.py` treat every regular file there as a hold. `release` prints `released, builds may resume.` only when no holder file remains. `ReleaseEta = KnownReleaseEta | UnknownReleaseEta`; `quiet_verdict` takes `Cores = KnownCores | UnknownCores`.
+- Tests never write `~/.local/state/build-hold` or the real release directory.
+- Phase 6's example-test guard is reverted on build-followups as df7301b until hana's examples fix lands; the showrunner restores it by reverting df7301b. With the guard present, `verify.sh test <pkg>` (gate run) and `verify.sh final` refuse an example holding `#[cfg(test)]` with `test = false` (exit 2) before the cache lookup and before any build. The acknowledgement goes at the first build step past the memory wait, so it follows that refusal either way; while the guard is reverted, the routing test drops its example-gate case. If the Follow-up's "examples carry no tests" rule lands first, the guard refuses any example holding `#[cfg(test)]`. `git show 7692f80:scripts/delegate/test_verify_untested_examples.py` shows the pattern for running real verify.sh routing with stubs on `PATH` (cargo passes `metadata` through; git is stubbed so the pass-record key is fixed).
+
+**Acceptance gate:** `python3 -m unittest discover -s scripts/build_hold -p 'test_*.py'`, `python3 -m unittest discover -s scripts/delegate -p 'test_verify_release_ack.py'` and `python3 -m unittest discover -s scripts/production -p 'test_dailies_render*.py'` green; `bash -n scripts/lint/invoke.sh`; `basedpyright` 0 errors and 0 warnings on changed Python.
+
+## Follow-ups
+
+Work that waits on a trigger outside this plan. None is a numbered phase; each lands as one checkpoint when its trigger holds.
+
+### Follow-up — the example-test guard returns with the rule "examples carry no tests"
+
+**Trigger:** tool-based-ui tells the showrunner that its examples Phase 8, which strips the `#[cfg(test)]` modules from examples, is on init/catalyst and merged into every live unit branch. Nothing is done before then.
+
+**What lands, in one checkpoint:** revert df7301b, which restores Phase 6's guard, and change its rule in the same checkpoint. The rule is now that examples carry no tests. The guard flags any example whose source holds a `#[cfg(test)]` module, whether or not the target sets `test = true`, and the refusal no longer tells the user to set `test = true`. The trigger and the place the check runs are unchanged: `verify.sh test <pkg>` as a gate run and `verify.sh final`, before the cache lookup and before any build, with exit 2.
+
+**Source:** natedev (showrunner), 2026-10-04 evening PDT, relaying tool-based-ui's ruling after the user questioned tests in examples.
+
+## Parked
+
+Work taken out of the phase sequence. Each entry keeps its Work Order and returns as a new phase when its condition holds.
+
+### Parked — verify.sh builds in a named target folder
+
+**Parked 2026-10-04 19:12 PDT by the showrunner:** the user stopped the widget-examples lane after its P7, and that lane was the one consumer of per-helper build folders; building this now adds disk use and parallel-build memory with no user for it. It comes back when the build report's Waiting section shows real time spent queueing for a worktree's build slot.
+
+#### When it returns
+
+On return: the token wait (`calls.token_wait_s`, schema 9) shipped in Phase 9, so this phase is per-folder tokens and `target_dir` only, at the next schema version after 9; the example guard it names is the Follow-up's "examples carry no tests" rule once that lands.
 
 **Goal:** `verify.sh … --target-dir <name>` runs every cargo step of that call in `<worktree>/target/<name>`, under a cargo token of that folder's own, so a helper with its own folder never waits on the shared folder's lock; its pass records count the same as the shared folder's, and the build log records which folder each call used.
 
@@ -277,125 +538,3 @@ Measured 2026-10-04 11:59–12:25 PDT, read-only, from the earlyoom journal, the
 - Times carry their zone; natedev's clock and journal are EDT, and this plan states PDT.
 
 **Acceptance gate:** `python3 -m unittest discover -s scripts/delegate -p 'test_verify_*.py'` and `python3 -m unittest discover -s scripts/buildlog -p 'test_*.py'` green; `python3 -m unittest discover -s scripts/lint -p 'test_sweep.py'` green; `bash -n` on `scripts/delegate/verify.sh`, `scripts/lint/invoke.sh` and `scripts/delegate/implement.sh`; `basedpyright` 0 errors and 0 warnings on changed Python.
-
-### Phase 10 — The build report opens with the day's waits · status: todo
-
-#### Work Order
-
-**Goal:** the daily build report opens with a Waiting section that shows, for each kind of wait, the tail first (the longest wait and how many ran past 5 minutes), then the total in seat-hours and the worst worktrees; and the example builds the Bevy launcher runs for screenshots appear in the build log under their own caller.
-
-**Source:** natedev (showrunner), 2026-10-04 evening PDT: the user is trying to eliminate waiting and could not see it in the report. On 2026-10-04, 624 of 2,148 verify.sh calls waited, 7.0 seat-hours in all, the longest 13.8 min, 17 over 5 min; the worst worktrees were frame-time (116 min), widget-examples (96 min) and geometry-material (79 min). Memory admission held 13 steps for 1.1 h, the longest 15.0 min (startup-polish impl, 16:30 PDT), and the five longest all came between 16:30 and 16:55 PDT; today that is one line under Memory pressure. A tool-based-ui unit director reported example builds of 12 and 24 min while verify.sh `example` calls maxed at 1.8 min. Found by the unit director the same evening: those builds are the brp MCP server's `brp_launch` (bevy_brp_mcp 0.23.0-rc.1), which runs `cargo build --workspace --example <name> --message-format=json` from the workspace root before it starts the app. verify.sh `example` only runs clippy. The launch goes through no verify.sh, memory gate, cgroup scope or buildlog, so nothing records it. Its one record is the tool result in the Claude Code transcript: on 2026-10-04 in widget-examples (`~/.claude/projects/-home-natepiano-rust-widget-examples/1b3853e3-82ff-4618-904b-b75f2edfe005.jsonl`), `font_features` took `launch_duration_ms` 1468425 (24.5 min, ended 16:40:18 PDT) and `sizes` 719108 (12.0 min, ended 16:54:57 PDT).
-
-**Spec:**
-- **Where it sits.** `report()` in `scripts/buildlog/report.py` (`:561-583`) puts `### Waiting` right after the `## Builds, <day>` heading, before the kind sections. The `memory waits:` line under Memory pressure stays as it is.
-- **One row per kind of wait,** in this order, with columns `Wait`, `Longest`, `Over 5 min`, `Waited`, `Total`, `Worst`:
-  - `Build-folder turn` — `calls.token_wait_s` on the day (`date(started_at, 'localtime')`), every call outcome. A call waited when `token_wait_s > 0` (Phase 9's seconds spent waiting for the build folder's cargo token, not `wait_s`, which also counts metadata and pass-record lookups). `Waited` reads `<n> of <calls> calls`. A worktree is `worktree_name`; a call in a named target folder (Phase 9's `calls.target_dir` other than `shared`) is `<worktree_name>/<target_dir>`.
-  - `Memory admission` — `steps.mem_wait_s` on the day; a step waited when `mem_wait_s > 0`. `Waited` reads `<n> of <steps> steps`. A worktree is `worktree_name`.
-  - `CI queue` — `ci_jobs.queued_s` of the day's `ran` jobs with a known queue time (Phase 7), the day keyed by the job's run attempt as `ci_section` keys it. A job waited when `queued_s > 0`. `Waited` reads `<n> of <jobs> jobs`. `Worst` names jobs (`<workflow> / <job name>`), since CI has no worktree.
-- **The cells.** `Longest` is the wait, then who and when: `13.8 min (frame-time, 15:52 PDT)`, the time in the zone the report prints elsewhere, always with its zone; a memory wait also names the seat when it has one (`startup-polish impl`). `Over 5 min` counts waits above 300 s. `Total` is the sum labelled seat-hours (`7.0 seat-hours`), because parallel seats overlap; CI's reads job-hours. `Worst` is the top three by summed wait, each with its minutes (`frame-time 116 min, widget-examples 96 min, geometry-material 79 min`). Durations use the report's existing `seconds()` format. A kind with nothing on the day prints `none` in `Longest` and blank cells after it, so the row still shows the kind was measured. No averages.
-- **Launch builds as a caller.** A new collector, `buildlog launches` (`scripts/buildlog/launches.py`, wired in `cli.py`), reads Claude Code transcripts `~/.claude/projects/*/*.jsonl` (`BUILDLOG_TRANSCRIPTS` overrides the root; tests always set it) for `mcp__brp__brp_launch` tool results carrying `launch_duration_ms`. Each becomes one step record in the store, written the way `record.py` writes steps: step `build`, caller `brp-launch`, `ended_at` the result's `metadata.launch_timestamp`, `started_at` that minus `metadata.launch_duration_ms`, `duration_s`, `cwd` the result's `metadata.working_directory` (the crate), the repo and worktree fields from the call's `parameters.path` (the worktree; `metadata.workspace` holds only its folder name), `session` the transcript's session id, `argv` `cargo build --workspace --example <target_name> --message-format=json` (the launcher's command; `--release` when the result says so), and no memory fields (the build runs in the session's own scope, so none are measured). The launch includes the app's start after the build, so the description of the new caller says the duration covers build and start. It reads each transcript from the byte offset it last stopped at, kept in a state file in the store root next to `ci_state.json`, so a repeat run reads only new lines; a launch already recorded is never written twice (its key is the session id plus `launch_timestamp`). `day_report` in `scripts/buildlog/cli.py` (`:169-179`) runs it before `index.update()`, so the launches it writes are in the index that report reads. A launch's record id is the session id plus its `launch_timestamp`, so a run that stops between writing records and saving its offset writes nothing twice when retried. `CALLER_LABELS` (`report.py:22-29`) gains `brp-launch` → `example launches (brp)`, so the launches show in the kind sections under that caller. Read one real `brp_launch` result line from the transcript named in Source, read only, to copy its shape into the test fixture.
-- **One day key for CI jobs.** `ci_job_days` in `scripts/buildlog/index.py` keys a job's day by its run attempt's `started_at` (join `ci_runs` on `run_id` and `attempt`), as `ci_section` and the CI queue row do, so all three put a job on the same day. `SCHEMA_VERSION` goes from 9 to 10.
-- **Ruled out:** a Claude Code hook on `brp_launch` (a settings change) and a buildlog record from inside bevy_brp_mcp (a published crate in another repository that should not depend on this tool).
-- **Tests,** with fixture records and transcripts under a temporary root: the section is first after the heading; each kind's longest, over-5-min count, waited count, seat-hour total and top three, including a call in a named target folder shown as `<worktree>/<folder>` and a CI job that was carried over or has no known queue time left out; a kind with no waits prints `none`; the launch collector turns a `brp_launch` result into one step with the right start, end, duration, caller and worktree, ignores other tool results, writes nothing twice across two runs, and reads only new lines on the second, with fixtures in the result's nested shape (`metadata`, `parameters`); `buildlog report` over a fixture transcript shows a new launch in the same invocation; a job created just after local midnight in a run attempt started before it lands on the run's day in `ci_job_days`, `ci_section` and the CI queue row.
-
-**Files:**
-- `scripts/buildlog/report.py` — the Waiting section, the `brp-launch` caller label, collecting launches before the report
-- `scripts/buildlog/launches.py` — the launch collector (new)
-- `scripts/buildlog/cli.py` — `buildlog launches`, the usage line, collecting before `index.update()` in `day_report`
-- `scripts/buildlog/index.py` — `ci_job_days` keyed by the run attempt, `SCHEMA_VERSION` 10
-- `scripts/buildlog/test_index.py` — the `ci_job_days` midnight case
-- `scripts/buildlog/test_report.py` — the Waiting section cases
-- `scripts/buildlog/test_launches.py` — the collector cases (new)
-
-**Seats:** `1 writer + 1 tester` — the code and its tests split by file.
-- `impl` — `scripts/buildlog/report.py`, `scripts/buildlog/launches.py`, `scripts/buildlog/cli.py`, `scripts/buildlog/index.py`; hub: `scripts/buildlog/report.py`
-- `test` — `scripts/buildlog/test_report.py`, `scripts/buildlog/test_launches.py`, `scripts/buildlog/test_index.py`, written from the Spec alone
-
-**Constraints from prior phases:**
-- `calls.wait_s` is verify.sh's seconds from script start to run start: `cargo metadata` and the untested-example gate, both pass-record lookups and the cargo token wait (`verify.sh:754`, passed at `:685` and `:804`); a reused or replayed call passes its whole elapsed time (`:607`). It does not cover steve's slots, cargo's own folder lock or the memory gate. `steps.mem_wait_s` comes from `buildlog_wait_for_memory` (`scripts/lint/invoke.sh:107-130`), which polls every 5 s and gives up at 900 s; the step's `started_at` excludes the wait.
-- Phase 7: `ci_jobs.run_state` is `ran`, `skipped` or `carried_over` (`JobRunState`), `queued_s` is NULL unless the job ran and its stamps give a queue time, and `ci_section` keys a day's jobs by their run attempt's `started_at`. Phase 9: `calls.target_dir` is `shared` or the `--target-dir` name; index schema 9.
-- The index is rebuilt from the source files whenever `PRAGMA user_version` differs from `SCHEMA_VERSION`. Tests point the store root at a temporary directory and never write `~/.local/state/buildlog`; `test_report.py` imports its record helpers from `test_index.py`.
-- Times carry their zone; natedev's clock and journal are EDT, and this plan states PDT.
-
-**Acceptance gate:** `python3 -m unittest discover -s scripts/buildlog -p 'test_*.py'` green; `basedpyright` 0 errors and 0 warnings on changed Python.
-
-### Phase 11 — A measured working day · status: todo
-
-#### Work Order
-
-**Goal:** a measured 24-hour working day on natedev, judged against the target of no earlyoom kill, with the slice limits tuned from it.
-
-**Started:** 2026-10-04 15:26:32 PDT (start snapshot, natedev; the check over 15:16–15:26 PDT showed no missing snapshot and a readable journal). Closes 2026-10-05 15:26 PDT.
-
-**Spec:**
-
-*The window.* It opened when Phase 3's records were live on `~/.claude` main (the buildlog timers run from there). It closes 24 hours later, a full day and night, because the production's units build overnight: take the end snapshot then and run the day's report over the window. During the day, a figure whose window shows a missing snapshot, an unavailable journal or a reset at an edge is inconclusive: say so, and repeat that window or rebuild the figure from the minute snapshots inside it.
-
-Measure against the target, a normal working day with no earlyoom kill, from the report plus:
-- CI's run time against a successful CI run from before the Phase 2 diff (the 2026-10-04 runs were killed and are not a runtime baseline);
-- CI at its ceiling. In CI run 37227844227 attempt 4 (green 14:14 PDT 2026-10-04) the two Linux jobs peaked at 8.3 and 16.7 GiB, `hana-ci.slice` hit its 18G MemoryMax about 23,800 times (`max` events 3930 → 27773) and its memory stall grew 44.7 s in about 11 min, with no kill. Run 37236742478 (14:35–14:51 PDT, the first without CARGO_BUILD_JOBS) peaked at 16.5 and 11.1 GiB, with `max` events +33.1K, stall +33.9 s, no kill and no jobserver warning. For each CI run in the window, run `buildlog memory START END` over the run's own start and end (from `gh run view`) and record the slice's MemoryMax hits (the `max` events delta), its stall seconds (the `memory.pressure` some-total delta) and any `oom_kill`. `memory.peak` is the slice's lifetime high, so for a run that ran alone, report "highest observed minute sample": the largest `ci_anon_bytes` among this host's samples (`samples.host`) inside the run, with how many minute samples the run has against its length in minutes. A sample is taken once a minute, so it can miss a shorter peak; judge a limit change on the `max` events, stall seconds and `oom_kill` alongside it, never on the sample alone. Name the threshold that would justify raising CI's MemoryMax, and judge the day against it. The ceilings already sum past RAM (builds 34G + CI 18G + `app.slice` about 9G + system, on 60 GiB; `builds.slice` peaked at 32 GiB on 2026-10-04), so any raise to CI comes out of `builds.slice`'s MemoryMax and the sum holds;
-- the showrunner's readings inside the window, to check against the figures above: run 37247551616 (c14a984b7, 17:26:47–17:36:29 PDT 2026-10-04) was green with 13 jobs; CI processes peaked at 8.4 GiB, builds at 10.7 GiB, used memory at 33.7 GiB and swap at 21.7 GiB; stall some 1.2 min, full 0.9 min; no earlyoom or kernel kill;
-- the CI kill at 18:18:46 PDT 2026-10-04 (hana run 37250536724, red): the kernel killed a CI rustc at `hana-ci.slice`'s 18G MemoryMax (memcg OOM, the slice's 2G swap full) with the machine at 43 of 60 GiB. The kill-time task list held 26 rustc from Test Suite and Rendering Diagnostic, 17 of them linking with mold: 17.5 GiB, about 0.67 GiB a slot, because CI took 26 of the shared pool's slots while the sessions were quiet. The proposed repair is CI's own slot pool, `/dev/steve-ci` at 14 slots with the same 12 GiB floor (`docs/plans/build-followups-memory-nixos-ci-pool.diff`, sent to natedev 18:40 PDT): at most 16 CI units at once, projected 10.7 GiB at that mix and 14.6 GiB with two 3.1 GiB release rustc among them. It went live as `/etc/nixos` 06416b5, rebuilt at 18:43:35 PDT 2026-10-04 (generation 198): split every CI figure there, judge the runs after it against that projection, and count the change's own measured day from that instant;
-- whether verify.sh ever counted a kill from outside the step as the step's own; if it did, tie the kill to the step's own processes;
-- whether the report's `memory waits:` line agrees with the `waiting for memory since …` lines agents saw;
-- the next `/build_hold` release that happens in the window, if any: when each held session's build started, its memory wait and the pressure. Do not stage a hold to produce one. Phase 4's helper reached the sessions when `~/.claude` main took the Phase 4 checkpoint, 2026-10-04 16:01:44 PDT. A release before that instant ran the old prose command and says nothing about the helper;
-- overlapping CI runs: both runners share `hana-ci.slice`, so label a figure from overlapping runs as shared-slice, and base the per-run comparison and the threshold only on runs that ran alone;
-- the day's hold time and workload (sessions building, CI runs). If holds kept session builds off for much of the day, repeat the day. If no natural release happens, the one-session-at-a-time step is unmeasured and says so.
-
-Tune the slice numbers from what it shows. A changed limit needs another measured day after it. Say whether per-crate admission or nextest thread limits are needed after all. A per-slice sample field that still reads "unavailable" is a deployment fault.
-
-*The staggering verdict.* From the observed release, say whether the admission already staggers the held sessions. If it does not, Phase 12 builds the one-session-at-a-time release; if it does, or no natural release happened, say so and Phase 12 is dropped or stays unmeasured.
-
-*Who takes the end snapshot.* The unit director takes it at 2026-10-05 15:26 PDT whatever the state of Phase 6's merge; this phase never waits on another phase to keep its window. Sources the writer and the checker both use: hold times from each holder file's `since`; release times from the `/build_hold release` output in the session transcripts and natedev's relay log; each session's build start from build-log `steps.started_at` and `mem_wait_s`.
-
-Baseline before the diff: natedev's stopgap 160efd9 put CI in steve on 2026-10-04. The first CI run with it, 37227844227, still lost both Linux jobs to earlyoom: the hana bin's rustc was killed at 12:29:58 and 12:30:09 PDT, about 3.3 GB RSS each with oom_score_adj 500, at about 2.8 of 56.5 GB available. Sharing steve's slots alone does not stop the kills.
-
-**Files:**
-- `docs/plans/build-followups-memory.md` — the day's figures, the CI threshold and the conclusions, in this phase
-- `docs/plans/build-followups-memory-nixos-*.diff` — any follow-up `/etc/nixos` diff for natedev; `-ci-pool.diff` is CI's own slot pool
-- `scripts/buildlog/{memory,sample,cli,index}.py` — the instruments, read only
-
-**Seats:** `1 writer + 1 tester` — the measurement and the test lane are disjoint.
-- `impl` — measures the day and writes the result; owns any `/etc/nixos` diff; hub: `docs/plans/build-followups-memory.md` (the result lands here; the tester sends its checks to the writer)
-- `test` — independently checks the journals, the CI figures and the record completeness from the same sources
-
-**Constraints from prior phases:**
-- `buildlog memory START END` (`scripts/buildlog/memory.py`) reads the snapshots nearest each edge, within 2 minutes, and counts only this host's records; the minute sample (`buildlog sample`, `scripts/buildlog/sample.py` and `cli.py`) writes one snapshot a minute with each slice's `memory.pressure` `some` total; the index is schema 8 since Phase 7 (`ci_jobs.run_state`: a job GitHub carried into a re-run attempt is `carried_over` and has no times of its own, so a re-run's CI figures use the attempt's own `ran` jobs), 9 after Phase 9 and 10 after Phase 10 (`scripts/buildlog/index.py`). The window opened before Phases 9 and 10 changed how waits and launch builds are recorded: the day's memory verdict stands on the window as measured, and any reading of those phases' effects is a separate, later figure. `memory.peak` is a slice's lifetime high. rustc runs in `builds.slice/run-*.scope` under the sccache client as well as in `sccache.service`.
-- Live since 2026-10-04: sccache in the foreground (nixos e669461), `hana-ci.slice` with no MemoryHigh and its runners at OOMPolicy=continue (087c7c1), no CARGO_BUILD_JOBS (832dad4); the CI jobserver check is closed. This supersedes Phase 2's notes that the machine half is not live and that `CARGO_BUILD_JOBS` stays at 8: plan no deployment or jobserver change from them.
-- Phase 4: each holder file in `~/.local/state/build-hold/` (`BUILD_HOLD_DIR` overrides it; tests always set it) is one JSON line `{"holder", "since", "for", "release_eta"}`, where `release_eta` is an ISO instant or `unknown`; the old one-line form still reads. `scripts/build_hold/build_hold.py` has `hold` (`--release-eta HH:MM` needs `--zone`), `quiet`, `release` and `status`. `release` prints `released, builds may resume.` only when no holder file remains, else `released; still held by …`. `quiet` is busy while this user's `cargo`, `rustc` or `cargo-nextest` runs or the 1-minute load is at or above a quarter of the cores, and waits at most 10 minutes; `ps` needs `user:32`, or procps cuts long names. `HoldState = NoHolders | ActiveHolders`, `ReleaseEta = KnownReleaseEta | UnknownReleaseEta`, and `quiet_verdict` takes `Cores = KnownCores | UnknownCores` (Phase 5). `dailies_render.py` reads holds through `read_dailies_hold()` and refuses a unit marker with no holder file, active holders with no marked unit, and plumbing words in a holder's purpose. `scripts/buildlog/rust_release.py` treats any regular file in the hold directory as a hold.
-- Times carry their zone; natedev's clock and journal are EDT, and this plan states PDT.
-
-**Acceptance gate:** the day's report, each CI run's figures, the threshold and the conclusions written in this phase, each figure's window complete or marked inconclusive; the staggering verdict stated; `bash -n` on any changed shell.
-
-### Phase 12 — One session at a time · status: todo
-
-#### Work Order
-
-**Goal:** when Phase 11 finds the admission does not stagger held sessions, the last holder's `/build_hold release` releases them one at a time, each after the previous one's build has started.
-
-**Spec:**
-- Runs only if Phase 11's verdict says the admission does not stagger the sessions; otherwise this phase is dropped.
-- Only the last holder starts it. While another holder file remains, `release` names who still holds and releases no session (Phase 4's behavior). The holder's file stays until the last session is released, so `status`, the renderer and `rust_release.py` keep seeing the hold.
-- Release progress is one typed state per held session, in release order: `AwaitingRelease`, `ReleasedAwaitingAdmission(released_at)`, `AdmittedPastMemoryWait(admitted_at)`, `NoReply(released_at)`, each carrying only the instants valid in it. It is stored in `~/.local/state/build-hold-release/` (`BUILD_HOLD_RELEASE_DIR` overrides it), never in the holder directory, which every reader treats as holds; read back on each step, never kept in memory.
-- `release` messages one session at a time, by the same message path `/build_hold` uses today. A session moves to `AdmittedPastMemoryWait` when its first build step is admitted: `run_once` in `scripts/lint/invoke.sh` (`:172-179`) writes the acknowledgement right after `buildlog_wait_for_memory` returns, keyed by session name, into the release directory. A call that builds nothing (an example-gate refusal, a pass-record hit) writes none.
-- **Who is released.** The holds know holders, not held sessions (`build_hold.py:220`), and today's release goes to every top-level session (`commands/build_hold.md:10`). A session that finds the hold records itself, in arrival order, in the release directory; `release` messages those sessions one at a time by name, through the relay `/build_hold` uses, and after `NoReply` moves to the next. `status` and the dailies renderer show each held session's state. The acknowledgement proves admission, not a finished build.
-- A session with no acknowledgement 5 minutes after its release becomes `NoReply`; the next session is released and the release text names it.
-- Tests: partial progress (some released, some waiting), a missing acknowledgement, another active holder, and `status`, the dailies renderer and `rust_release.py` showing no phantom holder from the release directory, including after the last release clears it.
-
-**Files:**
-- `scripts/build_hold/build_hold.py` — release states, release directory, one-at-a-time release
-- `scripts/build_hold/test_build_hold.py` — the cases above
-- `commands/build_hold.md` — the one-at-a-time release steps
-- `scripts/lint/invoke.sh` — the acknowledgement after the memory wait
-- `scripts/production/dailies_render.py` — each held session's release state
-
-**Seats:** `1 writer + 1 tester` — the helper and its tests split by file.
-- `impl` — `scripts/build_hold/build_hold.py`, `commands/build_hold.md`, `scripts/lint/invoke.sh`, `scripts/production/dailies_render.py`; hub: `scripts/build_hold/build_hold.py`
-- `test` — `scripts/build_hold/test_build_hold.py`, a verify routing test under `scripts/delegate/` (a delayed memory wait acknowledges after it, an example-gate refusal and a pass-record hit acknowledge nothing) and the dailies renderer's per-session cases, written from the Spec alone
-
-**Constraints from prior phases:**
-- Holder files in `~/.local/state/build-hold/` (`BUILD_HOLD_DIR` overrides it; tests always set it) are one JSON line `{"holder", "since", "for", "release_eta"}`; `read_holders` and `scripts/buildlog/rust_release.py` treat every regular file there as a hold. `release` prints `released, builds may resume.` only when no holder file remains. `ReleaseEta = KnownReleaseEta | UnknownReleaseEta`; `quiet_verdict` takes `Cores = KnownCores | UnknownCores`.
-- Tests never write `~/.local/state/build-hold` or the real release directory.
-- Phase 6's example-test guard is reverted on build-followups as df7301b until hana's examples fix lands; the showrunner restores it by reverting df7301b. With the guard present, `verify.sh test <pkg>` (gate run) and `verify.sh final` refuse an example holding `#[cfg(test)]` with `test = false` (exit 2) before the cache lookup and before any build. The acknowledgement goes at the first build step past the memory wait, so it follows that refusal either way; while the guard is reverted, the routing test drops its example-gate case. `git show 7692f80:scripts/delegate/test_verify_untested_examples.py` shows the pattern for running real verify.sh routing with stubs on `PATH` (cargo passes `metadata` through; git is stubbed so the pass-record key is fixed).
-
-**Acceptance gate:** `python3 -m unittest discover -s scripts/build_hold -p 'test_*.py'` green; `bash -n scripts/delegate/verify.sh`; `basedpyright` 0 errors and 0 warnings on changed Python.

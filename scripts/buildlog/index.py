@@ -30,7 +30,7 @@ from urllib.parse import quote
 
 import store
 
-SCHEMA_VERSION = 8
+SCHEMA_VERSION = 9
 LOCK_NAME = "index.lock"
 MARK_BYTES = 256
 BUSY_TIMEOUT_MS = 30_000
@@ -69,7 +69,7 @@ STEP_COLUMNS: list[Column] = [
         + " NULL when they changed during the step or are unknown. `buildlog tree-key [dir]` prints a folder's",
     ),
     ("tree_changed", "INTEGER", "1 when the files changed during the step (fmt, mend --fix, an edit), 0 when not, NULL when unknown"),
-    ("caller", "TEXT", "verify, cargo-port, validate_ci (push gate), agent, alias (a person at a terminal), unknown"),
+    ("caller", "TEXT", "verify, cargo-port, validate_ci (push gate), brp-launch (build and app start), agent, alias, unknown"),
     ("seat", "TEXT", "delegate seat (PLAN_DELEGATE_TEAM_ROLE)"),
     ("delegate_session", "TEXT", "delegate session folder name"),
     ("session", "TEXT", "Claude Code session id or Codex thread id"),
@@ -131,7 +131,8 @@ CALL_COLUMNS: list[Column] = [
     ),
     ("status", "INTEGER", "exit status, NULL when unknown or interrupted"),
     ("cached", "INTEGER", "1 when the call could use a pass record (a delegate session's test or lint)"),
-    ("wait_s", "INTEGER", "seconds before the run began (the cargo token)"),
+    ("wait_s", "INTEGER", "seconds from script start until the run began"),
+    ("token_wait_s", "INTEGER", "seconds spent acquiring the cargo token, a wait that timed out included; 0 when verify.sh sought none"),
     ("wall_s", "INTEGER", "seconds the run took"),
     ("build_s", "INTEGER", "cargo's own build seconds, NULL when unmeasured"),
     ("saved_s", "INTEGER", "seconds a reused or replayed record saved"),
@@ -289,10 +290,11 @@ FROM steps WHERE status != 0""",
     ),
     "ci_job_days": (
         "CI jobs per local day, workflow and job name: jobs, failed, avg_s, max_s, avg_queue_s, max_queue_s",
-        """SELECT date(created_at, 'localtime') AS day, workflow, name, count(*) AS jobs,
-       sum(conclusion = 'failure') AS failed, round(avg(duration_s)) AS avg_s, max(duration_s) AS max_s,
-       round(avg(queued_s)) AS avg_queue_s, max(queued_s) AS max_queue_s
-FROM ci_jobs WHERE run_state != 'carried_over' GROUP BY day, workflow, name""",
+        """SELECT date(r.started_at, 'localtime') AS day, j.workflow, j.name, count(*) AS jobs,
+       sum(j.conclusion = 'failure') AS failed, round(avg(j.duration_s)) AS avg_s, max(j.duration_s) AS max_s,
+       round(avg(j.queued_s)) AS avg_queue_s, max(j.queued_s) AS max_queue_s
+FROM ci_jobs AS j JOIN ci_runs AS r ON j.run_id = r.run_id AND j.attempt = r.attempt
+WHERE j.run_state != 'carried_over' GROUP BY day, j.workflow, j.name""",
     ),
 }
 
@@ -430,6 +432,7 @@ def add_step(connection: sqlite3.Connection, record: dict[str, object], src: str
 def add_call(connection: sqlite3.Connection, record: dict[str, object], src: str) -> None:
     record = {
         **record,
+        "token_wait_s": record.get("token_wait_s", 0),
         "src": src,
         "repo": folder_name(record.get("repo_path")),
         "worktree_name": folder_name(record.get("worktree")),

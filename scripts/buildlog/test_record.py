@@ -411,6 +411,7 @@ class RecordTests(unittest.TestCase):
             "backfilled": False,
         }
         self.assertEqual({key: record[key] for key in expected}, expected)
+        self.assertEqual(record["token_wait_s"], 0)
         started = datetime.fromisoformat(str(record["started_at"]))
         ended = datetime.fromisoformat(str(record["ended_at"]))
         self.assertAlmostEqual((ended - started).total_seconds(), 5.0, delta=0.002)
@@ -421,6 +422,29 @@ class RecordTests(unittest.TestCase):
         self.assertEqual((record["verb"], record["package"], record["status"], record["build_s"]), ("final", None, None, None))
         self.assertIs(record["cached"], False)
         self.assertNotEqual(record["id"], CALL_ID)
+
+    def test_call_records_cargo_token_wait_separately_from_total_wait(self) -> None:
+        result = self.record(
+            "call", "ran", "0", "0", "9", "1", "", "0", "10", "test", "hana",
+            extra={"BUILDLOG_TOKEN_WAIT_S": "4"},
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        call_record = self.records()[-1]
+        self.assertEqual(call_record["token_wait_s"], 4)
+        self.assertEqual(call_record["wait_s"], 9)
+
+    def test_call_records_zero_token_wait_when_value_is_invalid(self) -> None:
+        for value in ("", "abc"):
+            with self.subTest(value=value):
+                before = len(self.records())
+                result = self.record(
+                    "call", "ran", "0", "0", "9", "1", "", "0", "10", "test", "hana",
+                    extra={"BUILDLOG_TOKEN_WAIT_S": value},
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+                records = self.records()
+                self.assertEqual(len(records), before + 1)
+                self.assertEqual(records[-1]["token_wait_s"], 0)
 
     def test_backfill_is_idempotent(self) -> None:
         same = ledger_line()
