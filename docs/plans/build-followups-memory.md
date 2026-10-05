@@ -287,67 +287,35 @@ Measured 2026-10-04 11:59–12:25 PDT, read-only, from the earlyoom journal, the
 
 **Ruled out:** a `memory.high` gate — `builds.slice` has no MemoryHigh (MemoryMax 44G), and `memory.high` counts page cache, throttling builds not short of memory; a per-run memory cap in verify.sh — widget's drawn-pixel test group already bounds the largest step.
 
-### Phase 11 — A sweep that clears build caches for something else says so · status: todo
+### Phase 11 — A sweep that clears build caches for something else says so · status: done
 
-#### Work Order
+#### As-built
 
-**Goal:** when the disk floor's sweep removes build caches because something other than build output is filling the disk, or removes more than 32 GiB at once, natedev hears it after that first sweep, by message and on the phone, with the directories outside the build caches that grew.
-
-**Source:** natedev (showrunner), 2026-10-04 19:55 PDT. Between 19:37 and 19:46 PDT three floor sweeps removed 234.7 GiB of build caches (35.2, 89.0 and 110.5 GiB; `journalctl --user -u disk-floor.service`), and nothing said so. The cause was frame's timing traces, about 300 GB, not cache growth: buildlog-disk's 19:53 PDT snapshot measured `/tmp` at 405 GB, and `/tmp` held 143 GiB at 19:57 PDT once they were gone. Every build after those sweeps started cold, and a cold build is a wait. Free space fell 32.5, 36.9 and 27.9 GiB in the 5, 6 and 3 minutes before those three sweeps. The same journal holds 103 sweeps on 2026-10-04 that removed output: apart from these three, none removed more than 29.2 GiB (09:33 PDT). The only alert today is disk-floor's own (`/etc/nixos/modules/linux/disk-floor.nix`), a high-priority phone alert sent once free space is under 300 GiB. On 2026-10-04 the sweeps held free space near 500 GiB, so it never fired.
-
-**Spec:**
-- **When it alerts.** `hold_floor` (`scripts/lint/sweep.py:704-742`) alerts after a sweep that removed output when either holds:
-  - *something else is filling the disk:* free space fell more than 10 GiB beyond what the build caches grew since the previous floor sweep, and that sweep was at most 30 minutes earlier;
-  - *one sweep removed a lot:* the sweep removed more than 32 GiB.
-  On 2026-10-04 the first test held about 30 GiB of unexplained fall before each of the three trace-driven sweeps. The second sits between the largest ordinary sweep (29.2 GiB) and the smallest trace-driven one (35.2). Both thresholds are constants with this evidence beside them.
-- **What counts as build caches.** The previous sweep's figures are its free space and build-cache bytes after it ran, measured once its removals finish, never the remainder `shrink` estimates (`sweep.py:642`), which counts a failed removal as gone. They are kept in `floor.json` in the sweep's state directory: `~/.local/state/lint-sweep/`, which `LINT_SWEEP_STATE_DIR` overrides and every test sets. A floor sweep with no earlier record, or an earlier record more than 30 minutes old, writes the record and sends no growth alert. Build-cache bytes are counted in three parts:
-  - the idle target directories the sweep already scans;
-  - every target directory it leaves alone because a build holds it, measured with `directory_blocks`;
-  - CI's two runner folders, `/var/lib/hana-ci/hana-linux-1` and `-2`, measured the same way and never swept.
-  Without the last two, a busy worktree or a CI job growing would read as something else filling the disk. The busy and CI figures are taken once per sweep; the sweep never changes them.
-- **What it says.** It sends one message to natedev with `scripts/message/send.py --to natedev --from disk_floor --timeout 30`, the text on stdin. It sends the same text with `scripts/notify/pushover.py --priority 0 "natedev: build caches swept" <text>`.
-  - The text names: the sweep's time in PDT; what it removed; how far free space fell since the previous sweep against how much the build caches grew; which threshold fired.
-  - It then names the three directories outside the build caches that grew most, with their growth and size, measured by buildlog-disk at the times it names. When such a directory's largest child holds more than half of its growth, it names that child as well.
-  - It names the snapshot's two measurement times and how much of the fall the measured folders' growth explains. The rest is named as outside the measured folders: buildlog-disk measures `~/rust`, `/tmp` and the CI folders, while the sweep also covers `~/.local/state`. A snapshot older than 15 minutes is named as such.
-  - When buildlog-disk's snapshot has no earlier measurement to compare against, the text says so and names the three largest directories outside the build caches.
-  - A send that fails prints to stderr and never fails the sweep.
-  - At most one such alert per hour, counted from the last alert at least one channel delivered; send.py queueing it for natedev counts as delivered. Each channel's result is printed. When both fail, the next qualifying sweep tries again.
-- **The directories outside the build caches come from buildlog-disk** (`scripts/buildlog/disk.py`, every 10 minutes), never from a fresh `du` of `/`.
-  - Its walk of the measured folders (`FOLDERS`, `:34-39`) also records each directory one and two levels under each folder that holds at least 1 GiB outside cargo target directories (a directory holding `.rustc_info.json`, as `sweep.target_dirs` finds them), with those bytes.
-  - Before it writes, it reads the snapshot it is about to replace. Each recorded directory then carries its growth since that snapshot's `measured_at`: a directory the earlier snapshot did not list grew by its whole size.
-  - The snapshot keeps its existing fields, so the build report's disk table (`scripts/buildlog/report.py:591`) reads it unchanged. The sweep reads `disk.json` from `BUILDLOG_DIR`, or `~/.local/state/buildlog`, by path. A snapshot that is missing, unreadable or of the old shape means the text says the measurement is unavailable; the snapshot read returns a named state for each case, not `DiskSnapshot | None`.
-- **Ruled out:** changing disk-floor's own 300 GiB alert or its priority; stopping the sweep when growth comes from elsewhere. The floor still holds; the alert is how the cause gets stopped.
-- **Tests,** under a temporary root, with the sends replaced so that no test calls send.py or Pushover, and with fixture target folders and fixture `disk.json` files. Never the real disk, journal or state:
-  - a sweep after a fall the build caches explain sends nothing;
-  - a fall 10 GiB beyond their growth within 30 minutes sends one alert naming the grown directories and the child that holds most of one's growth;
-  - a busy target's growth and a CI folder's growth count as build caches;
-  - an earlier record over 30 minutes old sends no growth alert;
-  - a removal over 32 GiB alerts on its own;
-  - a removal that fails leaves its bytes in the recorded build-cache figure;
-  - both sends failing leaves the next qualifying sweep free to alert, and one channel delivering counts as sent;
-  - a second qualifying sweep within the hour sends nothing;
-  - a failed send leaves the sweep's exit status unchanged;
-  - buildlog-disk records directories outside target folders with their growth since the previous snapshot, a new directory growing by its whole size, and nested directories counted at each level without counting a hard-linked file twice;
-  - the build report's disk table reads both the new and the old snapshot shape.
+- `hold_floor` (`scripts/lint/sweep.py`) writes `floor.json` in `${LINT_SWEEP_STATE_DIR:-~/.local/state/lint-sweep}` under `FLOOR_LOCK` after each floor sweep: its time, free bytes and build-cache bytes measured once removals finish (a failed removal stays counted), and the last delivered alert. Read states: `NoFloorRecord | FloorRecord`, `NoDeliveredAlert | DeliveredAlert`.
+- Build-cache bytes = the idle target dirs the sweep scans + busy target dirs + `/var/lib/hana-ci/hana-linux-1` and `-2` (never swept); the last two are measured once per sweep with `directory_blocks`.
+- After a sweep that removed output, it alerts when free space fell more than 10 GiB beyond build-cache growth since a floor sweep at most 30 min earlier, or when the sweep removed more than 32 GiB. 32 GiB sits between the largest ordinary sweep (29.2 GiB) and the smallest of three driven by frame's timing traces (35.2 GiB) on 2026-10-04 PDT. With no earlier record, or one over 30 min old, it writes the record and sends no growth alert.
+- One text goes to `scripts/message/send.py --to natedev --from disk_floor --timeout 30` (stdin) and `scripts/notify/pushover.py --priority 0 "natedev: build caches swept" <text>`. At most one an hour, counted from the last alert a channel delivered (send.py exit 0, or 1 = queued; Pushover exit 0); both failing leaves the next qualifying sweep free to send. Each channel's result prints; a failed send prints to stderr and leaves the sweep's exit status unchanged.
+- The text: sweep time in PDT, bytes removed, the threshold that fired; fall and cache growth since the previous sweep, naming its time; buildlog-disk's two measurement times, a snapshot over 15 min old named as such; measured-folder growth from `outside_build_cache_totals` and how much of the fall beyond cache growth it covers (clamped, never negative; omitted with no earlier floor sweep), the rest named as outside the measured folders; the top 3 grown directories outside the caches with growth and size, plus the largest child when it holds more than half that growth. Signed changes are worded by sign; `~` for home and middle-shortened paths keep it under Pushover's 1,024 characters.
+- `disk.json` is read by path from `${BUILDLOG_DIR:-~/.local/state/buildlog}` into `AvailableDiskMeasurement` or `UnavailableDiskMeasurement` with its reason (missing, unreadable, or a snapshot without the new fields), which the text prints as "buildlog-disk measurement unavailable (<reason>)". With no earlier measurement, the text names the three largest directories outside the caches.
+- `buildlog disk` (`scripts/buildlog/disk.py`, every 10 min) adds `outside_build_caches` (directories one and two levels under each `FOLDERS` entry holding ≥1 GiB outside cargo target dirs, i.e. dirs with `.rustc_info.json`; bytes, growth since the previous snapshot's `measured_at`, a new directory growing by its whole size, largest child, `child_bytes`), `outside_build_cache_totals` per measured folder, and `previous_measured_at`. A hard-linked file counts once. Existing fields stay, so `scripts/buildlog/report.py`'s disk table reads both formats; a prior snapshot without totals counts as no earlier measurement.
 
 **Files:**
-- `scripts/lint/sweep.py` — the floor record, the two tests, the alert
-- `scripts/lint/test_sweep.py` — the sweep cases above
-- `scripts/buildlog/disk.py` — directories outside the build caches and their growth
-- `scripts/buildlog/test_disk.py` — the measurement cases above
-- `scripts/buildlog/test_report.py` — the disk table reads both snapshot shapes
+- `scripts/lint/sweep.py` — floor record, thresholds, alert text, sends
+- `scripts/lint/test_sweep.py` — alert, delivery, record and text cases
+- `scripts/buildlog/disk.py` — outside-cache directories and folder totals with growth
+- `scripts/buildlog/test_disk.py` — exclusion, hard links, growth, deletion, a snapshot without the new fields
+- `scripts/buildlog/test_report.py` — the disk table reads old and new snapshots
 
-**Seats:** `2 writers` — the sweep alert and the disk measurement have separate hubs and tests; they meet only at `disk.json`'s shape, which the disk writer posts first.
-- `impl` — `scripts/lint/sweep.py`, `scripts/lint/test_sweep.py`; hub: `scripts/lint/sweep.py`
-- `test` — `scripts/buildlog/disk.py`, `scripts/buildlog/test_disk.py`, `scripts/buildlog/test_report.py`; hub: `scripts/buildlog/disk.py`
+**Binds later work:** `floor.json` and `disk.json` hold only the latest sweep and measurement, so past sweeps come from `journalctl --user -u disk-floor.service`; `sweep.py` reads `disk.json` by path and never imports `scripts/buildlog`, since `disk.py` imports `sweep` at load.
 
-**Constraints from prior phases:**
-- `disk.py` imports `sweep` at load (`sys.path` insert of `scripts/lint`), so `sweep.py` never imports from `scripts/buildlog` at load. It reads `disk.json` as a file.
-- `hold_floor` runs from every build step's background sweep as well as from disk-floor's 2-minute timer (`sweep.py --floor-only`); the floor lock (`FLOOR_LOCK`) already lets one run at a time, and the record and the alert stamp are written under it.
-- Tests never read the real journal, `/var/lib/hana-ci` or `/proc`, never write `~/.local/state/lint-sweep` or `~/.local/state/buildlog`, never call `send.py` or `pushover.py`, and never build.
-- Times carry their zone; natedev's clock and journal are EDT, and this plan states PDT.
+**Gotchas:**
+- send.py exits 1 when it queues a message; that counts as delivered.
+- `disk.py` walks each folder twice (all bytes, then outside target dirs); the first walk is the cost (35 s under load average 104), the second adds about 3 s.
+- A file hard-linked into both a target dir and a non-target dir counts outside the caches, so `/tmp`'s outside total can exceed its row.
+- buildlog-disk measures `~/rust`, `/tmp` and the CI folders; the sweep also covers `~/.local/state`, so growth there reads as outside the measured folders.
+- `hold_floor` runs from every build step's background sweep and from disk-floor's 2-minute timer (`sweep.py --floor-only`); `FLOOR_LOCK` lets one run at a time.
 
-**Acceptance gate:** `python3 -m unittest discover -s scripts/lint -p 'test_sweep.py'` and `python3 -m unittest discover -s scripts/buildlog -p 'test_*.py'` green; `basedpyright` 0 errors and 0 warnings on changed Python. Smoke: `BUILDLOG_DIR=<scratch> buildlog disk` run twice on the real tree; the second `disk.json` lists the directories outside the build caches with their growth.
+**Ruled out:** changing disk-floor's own 300 GiB high-priority alert, or stopping the sweep when growth comes from elsewhere — the floor still holds, and the alert is how the cause gets stopped; a fresh `du` of `/` (directories come from buildlog-disk); a third walk for folder totals (counted from the outside walk).
 
 ### Phase 12 — Launches started without a path are recorded · status: todo
 
@@ -427,6 +395,7 @@ Baseline before the diff: natedev's stopgap 160efd9 put CI in steve on 2026-10-0
 - Phase 4: each holder file in `~/.local/state/build-hold/` (`BUILD_HOLD_DIR` overrides it; tests always set it) is one JSON line `{"holder", "since", "for", "release_eta"}`, where `release_eta` is an ISO instant or `unknown`; the old one-line form still reads. `scripts/build_hold/build_hold.py` has `hold` (`--release-eta HH:MM` needs `--zone`), `quiet`, `release` and `status`. `release` prints `released, builds may resume.` only when no holder file remains, else `released; still held by …`. `quiet` is busy while this user's `cargo`, `rustc` or `cargo-nextest` runs or the 1-minute load is at or above a quarter of the cores, and waits at most 10 minutes; `ps` needs `user:32`, or procps cuts long names. `HoldState = NoHolders | ActiveHolders`, `ReleaseEta = KnownReleaseEta | UnknownReleaseEta`, and `quiet_verdict` takes `Cores = KnownCores | UnknownCores` (Phase 5). `dailies_render.py` reads holds through `read_dailies_hold()` and refuses a unit marker with no holder file, active holders with no marked unit, and plumbing words in a holder's purpose. `scripts/buildlog/rust_release.py` treats any regular file in the hold directory as a hold.
 - Times carry their zone; natedev's clock and journal are EDT, and this plan states PDT.
 - Phase 10: `buildlog_wait_for_memory` (`scripts/lint/invoke.sh`) waits while `MemAvailable` is under 12 GiB (`BUILDLOG_MEMINFO`, default `/proc/meminfo`) before every step that compiles, recorded or not; `buildlog_step_compiles` lets `sweep.py` and `cargo [+toolchain] fmt` start at once; `steps.mem_wait_s` is non-zero only when the gate waited.
+- Phase 11: each floor sweep rewrites `~/.local/state/lint-sweep/floor.json`, which holds the latest sweep only (`measured_at`, `free_bytes`, `build_cache_bytes`, `last_alert_at`); a sweep that removes more than 32 GiB, or follows a fall of more than 10 GiB beyond build-cache growth, alerts natedev (`send.py --from disk_floor`) and by Pushover, at most once an hour. Read past sweeps from `journalctl --user -u disk-floor` (EDT stamps), not from `floor.json`. `buildlog disk`'s `disk.json`, also the latest only, carries `outside_build_caches` and `outside_build_cache_totals` with growth since the previous snapshot.
 
 **Acceptance gate:** the original day reported at 2026-10-05 15:26 PDT; each newer control (CI's pool from 18:43 PDT, the builds slice from 19:36 PDT, Phase 10's admission once live) labeled provisional until its own complete day, with its workload and snapshot coverage; the day's report, each CI run's figures, the threshold and the conclusions written in this phase, each figure's window complete or marked inconclusive; the staggering verdict stated; `bash -n` on any changed shell.
 
