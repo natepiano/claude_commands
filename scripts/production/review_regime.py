@@ -24,9 +24,12 @@ phase; `report` compares the phases before, under and after the trial:
 `holds` counts the checkpoints of the phase the showrunner held; `merge-defects`
 counts the defect rows across all of that phase's merge design checks.
 
-`watch` counts `after` phases toward WATCH_PHASES. Once the count is reached it
-exits 3, the report waiting for the user, until `ack` records their
-acknowledgment.
+A phase recorded with `--ux-check-minutes 0` changed nothing on screen, so it
+cannot show what the screenshot check buys: `report` leaves it out, and `watch`
+counts only `after` phases whose screenshots were checked toward WATCH_PHASES
+(user, 2026-10-05: eleven build-tool phases made the first count bad). Once the
+count is reached it exits 3, the report waiting for the user, until `ack`
+records their acknowledgment.
 """
 
 import argparse
@@ -146,7 +149,7 @@ def median_of(values: list[float]) -> str:
 
 
 def report(since: str | None) -> None:
-    rows = [row for row in read_rows() if since is None or row.merged >= since]
+    rows = [row for row in read_rows() if (since is None or row.merged >= since) and row.ux_check_minutes != 0]
     lines = [f"| | {' | '.join(REGIMES)} |", "| --- " * (len(REGIMES) + 1) + "|"]
     groups = {regime: [row for row in rows if row.regime == regime] for regime in REGIMES}
 
@@ -175,7 +178,7 @@ def report(since: str | None) -> None:
 
 
 def watched_phases() -> int:
-    return sum(1 for row in read_rows() if row.regime == "after")
+    return sum(1 for row in read_rows() if row.regime == "after" and (row.ux_check_minutes or 0) > 0)
 
 
 def acknowledged() -> str | None:
@@ -192,9 +195,9 @@ def watch() -> int:
         return 0
     merged = watched_phases()
     if merged < WATCH_PHASES:
-        print(f"{merged} of {WATCH_PHASES} phases merged without the extra code reviewer")
+        print(f"{merged} of {WATCH_PHASES} phases that change the screen merged without the extra code reviewer")
         return 0
-    print(f"{WATCH_PHASES} of {WATCH_PHASES} phases merged without the extra code reviewer: report ready, waiting for your acknowledgment")
+    print(f"{WATCH_PHASES} of {WATCH_PHASES} phases that change the screen merged without the extra code reviewer: report ready, waiting for your acknowledgment")
     return WAITING_FOR_ACKNOWLEDGMENT
 
 

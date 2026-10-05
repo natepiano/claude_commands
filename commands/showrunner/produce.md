@@ -429,7 +429,8 @@ Input: the unit, phase, hash and shots from its notice.
       says whether the screenshot check's minutes (check plus its repairs) buy
       fewer holds and merge defects (user, 2026-10-04).
     - then run `review_regime.py watch` (user decision 2026-10-04: watch 12
-      phases without the code reviewer). The first time it exits 3, run
+      phases without the code reviewer; since 2026-10-05 only phases whose
+      screenshots were checked count). The first time it exits 3, run
       `report --since 2026-09-28`, push at once
       (`~/.claude/scripts/notify/pushover.py --priority 1 "Hana: review watch" "<one line; the table is in this session>"`),
       log it, and give the user the table. While it exits 3, the dailies
