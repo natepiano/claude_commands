@@ -165,6 +165,14 @@ class ReportFooterTests(unittest.TestCase):
         expected = ["waiting on you:", "- send the Bevy PR (since Sat 09:05)", "- pick the demo scene (since 10:40)", "", "11:00 PDT · next dailies 11:30 PDT"]
         self.assertEqual(lines, expected)
 
+    def test_deferred_item_hides_until_its_after_time(self) -> None:
+        items = [{"since": "2026-10-04T08:36", "text": "send the Bevy PR", "after": "2026-10-04T19:00"}, {"since": "2026-10-04T10:40", "text": "pick the demo scene", "after": "2026-10-04T10:59"}]
+        with tempfile.TemporaryDirectory() as scratch:
+            path = Path(scratch) / "outstanding.json"
+            _ = path.write_text(json.dumps(items))
+            lines = self.lines(footer("--next-run", "11:30", "--outstanding", str(path)))
+        self.assertEqual(lines, ["waiting on you:", "- pick the demo scene (since 10:40)", "", "11:00 PDT · next dailies 11:30 PDT"])
+
     def test_held_unit_has_no_section_line(self) -> None:
         lines = self.lines(render(report(True), holders=[holder("2026-10-04T11:15:00-07:00")]))
         section = lines[: lines.index(FENCE)]

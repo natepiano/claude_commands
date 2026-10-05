@@ -182,6 +182,7 @@ class Topic:
 class Outstanding:
     since: datetime
     text: str
+    after: datetime | None = None
 
 
 @dataclass(frozen=True)
@@ -583,14 +584,16 @@ def read_outstanding(path: Path | None) -> list[Outstanding]:
         if not isinstance(entry, dict):
             raise InputError(f"{where}: expected an object")
         fields = cast(dict[str, object], entry)
-        check_keys(fields, {"since", "text"}, where)
-        since, text = fields.get("since"), fields.get("text")
+        check_keys(fields, {"since", "text", "after"}, where)
+        since, text, after = fields.get("since"), fields.get("text"), fields.get("after")
         if not isinstance(since, str) or not STARTED.match(since):
             raise InputError(f"{where}.since: expected YYYY-MM-DDTHH:MM")
+        if after is not None and (not isinstance(after, str) or not STARTED.match(after)):
+            raise InputError(f"{where}.after: expected YYYY-MM-DDTHH:MM")
         if not isinstance(text, str) or not text.strip() or "\n" in text:
             raise InputError(f"{where}.text: expected one non-empty line")
         check_plumbing(text, f"{where}.text")
-        items.append(Outstanding(datetime.fromisoformat(since), text))
+        items.append(Outstanding(datetime.fromisoformat(since), text, datetime.fromisoformat(after) if after else None))
     return sorted(items, key=lambda item: item.since)
 
 
@@ -886,6 +889,9 @@ def footer(
     lines = [hold_line(holder, now, zone) for holder in hold.holders] if isinstance(hold, ActiveHolders) else []
     if lines:
         lines.append("")
+    # An item the user deferred stays hidden until its `after` time, in the report's zone.
+    local_now = now.astimezone(zone).replace(tzinfo=None) if now.tzinfo else now
+    outstanding = [item for item in outstanding if item.after is None or item.after <= local_now]
     if outstanding:
         lines.append("waiting on you:")
         lines.extend(f"- {item.text} (since {range_clock(item.since, now)})" for item in outstanding)
