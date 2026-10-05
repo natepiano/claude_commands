@@ -36,6 +36,7 @@ class NightlyReviewTests(unittest.TestCase):
         self.root: Path = Path()
         self.live: set[str] = set()
         self.attached: set[str] = set()
+        self.foreign: set[str] = set()
         self.calls: list[list[str]] = []
 
     @override
@@ -54,6 +55,9 @@ class NightlyReviewTests(unittest.TestCase):
             return done(code=0 if name in self.live else 1)
         if verb == "list-clients":
             return done("/dev/pts/3: nightly-config\n" if name in self.attached else "")
+        if verb == "list-panes":
+            mode = name.removeprefix("nightly-")
+            return done("zsh -ic \"claude --resume x\"\n" if name in self.foreign else f"zsh -ic \"claude '/nightly_review {mode}'\"\n")
         self.live.discard(name)
         return done()
 
@@ -85,6 +89,15 @@ class NightlyReviewTests(unittest.TestCase):
         lines = self.launched([])
         self.assertEqual(lines[0], "nightly-config: started")
         self.assertIn("left running", lines[1])
+        self.assertEqual(len(self.calls), 1)
+
+    def test_a_session_no_review_started_is_left_running(self) -> None:
+        self.live = {"nightly-config", "nightly-rust"}
+        self.foreign = {"nightly-config"}
+        lines = self.launched([])
+        self.assertIn("another session holds this name", lines[0])
+        self.assertIn("nightly-config", self.live)
+        self.assertEqual(lines[1], "nightly-rust: started")
         self.assertEqual(len(self.calls), 1)
 
     def test_low_quota_skips_the_night(self) -> None:
