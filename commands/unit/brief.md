@@ -1,6 +1,10 @@
+---
+description: Show the next phase's briefing in a delegate run, or give one a gate skipped.
+---
+
 # Delegate — briefing
 
-**Usage:** `/unit:delegate_brief`
+**Usage:** `/unit:brief`
 
 Type this when a gate asked to start a phase without its briefing, or to see the
 next phase's briefing now. It runs inside the current session and already knows

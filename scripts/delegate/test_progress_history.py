@@ -703,7 +703,7 @@ class ProgressHistoryTests(unittest.TestCase):
                 "--every",
                 "15",
                 "--command",
-                "/unit:delegate_report",
+                "/unit:report",
             ],
             check=True,
             capture_output=True,

@@ -117,7 +117,7 @@ class DelegateCheckTests(unittest.TestCase):
         )
         self.assertEqual(conf["TARGET"], f"session:{self.session_id}")
         self.assertEqual(conf["EVERY"], "16")
-        self.assertEqual(conf["COMMAND"], "/unit:delegate_report")
+        self.assertEqual(conf["COMMAND"], "/unit:report")
         self.assertEqual(conf["HOLD"], "1")
         self.assertIn("delegate_run.py check", conf["CHECK"])
         self.assertIn(self.session_id, conf["CHECK"])

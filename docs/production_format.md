@@ -147,7 +147,7 @@ branch, port and the files you own.
 
    A phase checkpoint's notice carries the second line:
    `progress_history.py review-trial`'s output, verbatim
-   (`/unit:delegate_checkpoint` step 9).
+   (`/unit:checkpoint` step 9).
 
    A phase that changes what users see, in the app or in any example,
    includes shots from a real window at
