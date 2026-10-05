@@ -801,8 +801,8 @@ def load_state(path: Path | None) -> dict[str, Previous]:
 
 
 def same_phase(previous: str, current: str) -> bool:
-    """One phase across reports: the same place in the plan, or the same words after a renumber."""
-    return previous.split(" of ", 1)[0] == current.split(" of ", 1)[0] or previous.split(": ", 1)[-1] == current.split(": ", 1)[-1]
+    """One phase across reports has the same title, even after a renumber; a saved phase with no title matches none."""
+    return previous.partition(": ")[2] == current.partition(": ")[2]
 
 
 def first_eta(unit: Unit, previous: Previous | None, now: datetime) -> datetime | None:

@@ -182,6 +182,7 @@ names another plan's document. User, 2026-10-02.
 - **eta note:** against the last report's ETA for the same phase:
   `(unchanged)`, `(changed: +0:27 because <why>)`, or `(unchanged, overdue)`
   once the time has passed. No note on a subject's first ETA or a new phase.
+  A new phase has a new title; a renumbered phase with the same title keeps its notes.
 - **first eta:** once the ETA has moved from the phase's first: `05:43 PDT (now
   +17:12, 8 fix rounds added)`. User, 2026-10-03. A
   range follows the note; an end on another day carries its weekday
