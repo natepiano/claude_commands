@@ -23,18 +23,26 @@ import sqlite3
 from collections.abc import Generator
 from contextlib import contextmanager
 from datetime import datetime
+from enum import StrEnum
 from pathlib import Path
 from typing import BinaryIO, cast
 from urllib.parse import quote
 
 import store
 
-SCHEMA_VERSION = 7
+SCHEMA_VERSION = 8
 LOCK_NAME = "index.lock"
 MARK_BYTES = 256
 BUSY_TIMEOUT_MS = 30_000
 
 Column = tuple[str, str, str]
+
+
+class JobRunState(StrEnum):
+    RAN = "ran"
+    SKIPPED = "skipped"
+    CARRIED_OVER = "carried_over"
+
 
 STEP_COLUMNS: list[Column] = [
     ("id", "TEXT PRIMARY KEY", "host-UTC time-random"),
@@ -173,11 +181,16 @@ CI_JOB_COLUMNS: list[Column] = [
     ("branch", "TEXT", "head branch"),
     ("status", "TEXT", "completed"),
     ("conclusion", "TEXT", "success, failure, cancelled, skipped"),
+    (
+        "run_state",
+        "TEXT",
+        "ran, skipped, or carried_over; an attempt above 1 is carried over when started_at precedes created_at",
+    ),
     ("created_at", "TEXT", "queued at, UTC ISO"),
     ("started_at", "TEXT", "UTC ISO"),
     ("completed_at", "TEXT", "UTC ISO"),
-    ("duration_s", "REAL", "completed_at - started_at; NULL when skipped"),
-    ("queued_s", "REAL", "started_at - created_at; NULL when skipped"),
+    ("duration_s", "REAL", "completed_at - started_at; NULL when skipped or carried over"),
+    ("queued_s", "REAL", "started_at - created_at; NULL when skipped, carried over, or stamps give no queue time"),
     ("runner", "TEXT", "runner name"),
     ("labels", "TEXT", "runner labels, comma separated"),
 ]
@@ -279,7 +292,7 @@ FROM steps WHERE status != 0""",
         """SELECT date(created_at, 'localtime') AS day, workflow, name, count(*) AS jobs,
        sum(conclusion = 'failure') AS failed, round(avg(duration_s)) AS avg_s, max(duration_s) AS max_s,
        round(avg(queued_s)) AS avg_queue_s, max(queued_s) AS max_queue_s
-FROM ci_jobs GROUP BY day, workflow, name""",
+FROM ci_jobs WHERE run_state != 'carried_over' GROUP BY day, workflow, name""",
     ),
 }
 
@@ -344,7 +357,7 @@ def open_for_update() -> sqlite3.Connection:
     return connection
 
 
-def seconds_between(start: object, end: object) -> float | None:
+def elapsed_seconds(start: object, end: object) -> float | None:
     if not isinstance(start, str) or not isinstance(end, str) or not start or not end:
         return None
     try:
@@ -352,7 +365,12 @@ def seconds_between(start: object, end: object) -> float | None:
         last = datetime.fromisoformat(end.replace("Z", "+00:00"))
     except ValueError:
         return None
-    return round((last - first).total_seconds(), 3)
+    return (last - first).total_seconds()
+
+
+def seconds_between(start: object, end: object) -> float | None:
+    elapsed = elapsed_seconds(start, end)
+    return round(elapsed, 3) if elapsed is not None else None
 
 
 def folder_name(path: object) -> str | None:
@@ -443,7 +461,17 @@ def add_ci_run(connection: sqlite3.Connection, record: dict[str, object], src: s
         job = cast(dict[str, object], item)
         labels = job.get("labels")
         label_text = ",".join(str(label) for label in cast(list[object], labels)) if isinstance(labels, list) else None
-        skipped = job.get("conclusion") == "skipped"
+        attempt = record.get("attempt")
+        # On a re-run, GitHub copies each finished job under a new job_id, with
+        # created_at at the re-run and started_at/completed_at from the earlier attempt.
+        queue_elapsed = elapsed_seconds(job.get("created_at"), job.get("started_at"))
+        carried_over = isinstance(attempt, int) and attempt > 1 and queue_elapsed is not None and queue_elapsed < 0
+        if carried_over:
+            run_state = JobRunState.CARRIED_OVER
+        elif job.get("conclusion") == "skipped":
+            run_state = JobRunState.SKIPPED
+        else:
+            run_state = JobRunState.RAN
         job_row = {
             **job,
             "src": src,
@@ -451,12 +479,13 @@ def add_ci_run(connection: sqlite3.Connection, record: dict[str, object], src: s
             "attempt": record.get("attempt"),
             "workflow": record.get("workflow"),
             "branch": record.get("branch"),
-            # GitHub stamps a skipped job's completed_at a second before its
-            # started_at; it never ran, so it has no time to average.
-            "duration_s": None if skipped else seconds_between(job.get("started_at"), job.get("completed_at")),
-            "queued_s": None if skipped else seconds_between(job.get("created_at"), job.get("started_at")),
+            "run_state": run_state,
             "labels": label_text,
         }
+        if run_state is JobRunState.RAN:
+            job_row["duration_s"] = seconds_between(job.get("started_at"), job.get("completed_at"))
+            if queue_elapsed is not None and queue_elapsed >= 0:
+                job_row["queued_s"] = round(queue_elapsed, 3)
         insert(connection, "ci_jobs", pick(job_row, CI_JOB_COLUMNS))
         steps = job.get("steps")
         for entry in cast(list[object], steps) if isinstance(steps, list) else []:

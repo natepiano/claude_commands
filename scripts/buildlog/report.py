@@ -341,13 +341,28 @@ def ci_section(connection: sqlite3.Connection, day: str) -> tuple[list[str], str
     )
     if not rows:
         return [], "CI: no runs."
-    queue = fetch(connection, f"SELECT avg(queued_s) FROM ci_jobs WHERE {ON_DAY}", day)[0][0]
+    queue, left_out = fetch(
+        connection,
+        "SELECT avg(queued_s), coalesce(sum(run_state != 'skipped' AND queued_s IS NULL), 0)"
+        + " FROM ci_jobs AS j JOIN ci_runs AS r ON j.run_id = r.run_id AND j.attempt = r.attempt"
+        + " WHERE date(r.started_at, 'localtime') = ?",
+        day,
+    )[0]
     body = [[str(row[0]), *common(row[1:6])] for row in rows]
     runs = sum(cast(int, row[1]) for row in rows)
     failed = sum(cast(int, row[2] or 0) for row in rows)
     total = sum(cast(float, row[6] or 0.0) for row in rows)
     section = ["### CI", "", *table(["Workflow", *COMMON_HEAD], body), ""]
-    return section, f"CI: {runs} runs, {failed} failed, {seconds(total)} in all; jobs queued {seconds(queue)} on average."
+    omitted = cast(int, left_out)
+    if queue is None:
+        queue_clause = "no job has a known queue time"
+        if omitted:
+            queue_clause += f" ({omitted} left out)"
+    else:
+        queue_clause = f"jobs queued {seconds(queue)} on average"
+        if omitted:
+            queue_clause += f", {omitted} without a known queue time left out"
+    return section, f"CI: {runs} runs, {failed} failed, {seconds(total)} in all; {queue_clause}."
 
 
 def call_trees(connection: sqlite3.Connection, end_day: str) -> dict[str, KnownCallTrees]:

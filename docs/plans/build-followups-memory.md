@@ -181,13 +181,155 @@ Measured 2026-10-04 11:59–12:25 PDT, read-only, from the earlyoom journal, the
 - `scripts/delegate/verify.sh` — `UNTESTED_EXAMPLES_PY`, `read_metadata`, the check before `cache_lookup`, header comments
 - `scripts/delegate/test_verify_untested_examples.py` — eight scratch-package cases through real verify.sh routing: real `cargo metadata`, a cargo stub on `PATH` that passes `metadata` to real cargo and logs every other call, and a git stub that fixes the pass-record key
 
-**Binds later work:** Phase 8's verify.sh acknowledgement goes after this refusal, at the first build step past the memory wait. A new verify.sh routing test follows `test_verify_untested_examples.py`'s stub pattern.
+**Binds later work:** Phase 12's verify.sh acknowledgement goes after this refusal, at the first build step past the memory wait. A new verify.sh routing test follows `test_verify_untested_examples.py`'s stub pattern.
 
 **Gotchas:** A failing `cargo metadata` exits with cargo's status under `set -e`, not 2. hana main has 7 offending examples; the ~/.claude main merge is held until tool-based-ui adds `test = true`.
 
 **Ruled out:** Python 3.10 support for the check: the repo already needs 3.11+ (`tomllib`).
 
-### Phase 7 — A measured working day · status: todo
+### Phase 7 — Unknown CI queue times · status: done
+
+#### As-built
+
+- `class JobRunState(StrEnum)`: `RAN = "ran"`, `SKIPPED = "skipped"`, `CARRIED_OVER = "carried_over"`, decided once per job at index time and stored in `ci_jobs.run_state`. `carried_over` when the run attempt is above 1 and `started_at` precedes `created_at`; else `skipped` when the conclusion is `skipped`; else `ran`. The rule reads only the row's own stamps, so file and attempt order never matter.
+- Only a `ran` row stores `duration_s` and `queued_s`; `carried_over` and `skipped` rows hold NULL for both. A `ran` job's `queued_s` is `started_at - created_at` when both stamps parse and the result is zero or more, else NULL (unknown, never negative).
+- `elapsed_seconds(start, end) -> float | None` returns the unrounded difference; `seconds_between()` wraps it, rounded to 3 places.
+- `ci_job_days` leaves `carried_over` rows out of every column and keys days by `date(created_at,'localtime')`.
+- `ci_section` counts the day's jobs through their run attempt (`JOIN ci_runs` on `run_id` and `attempt`, day = `date(r.started_at,'localtime')`), averages known `queued_s`, and counts non-skipped jobs with NULL `queued_s` as left out: `jobs queued <avg> on average.`, `jobs queued <avg> on average, <N> without a known queue time left out.`, or `no job has a known queue time` + ` (<N> left out)` when N > 0 + `.`.
+
+**Files:**
+- `scripts/buildlog/index.py` — `JobRunState`, `run_state`, queue and duration rules, `ci_job_days`, `SCHEMA_VERSION = 8`
+- `scripts/buildlog/report.py` — `ci_section`'s day key, average and clause
+- `scripts/buildlog/test_index.py`, `test_report.py` — the run states, zero queue, view exclusion, clause forms, midnight day key
+
+**Binds later work:** the build-report Waiting phase's CI queue row reads only `ran` jobs with a known `queued_s` and keys days as `ci_section` does; it also re-keys `ci_job_days` by run attempt. The next schema change bumps `SCHEMA_VERSION` from 8 (`open_for_update` rebuilds on any `user_version` mismatch).
+
+**Gotchas:**
+- On a re-run, GitHub copies every finished job into the new attempt under a new `job_id`, `created_at` at the re-run, `started_at`/`completed_at` from the earlier attempt; read raw, it gives a negative queue time and a second copy of the duration.
+- `ci_section` keys a job's day by its run attempt's `started_at`, `ci_job_days` by the job's `created_at`; a job created just after local midnight in a run started before it lands on different days.
+
+**Ruled out:** keying `ci_section` by job `created_at` (drops post-midnight jobs of a run started before midnight); looking up each re-run job's earlier-attempt twin (the stamp rule marks the same rows).
+
+### Phase 8 — A Codex seat survives "model at capacity" · status: todo
+
+#### Work Order
+
+**Goal:** when the model is at capacity, a Codex seat waits and resumes its own thread on its own roster entry, and only reports the seat down after its retries run out, naming the thread; a relaunch never orphans a thread that is still running.
+
+**Source:** natedev (showrunner), 2026-10-04 evening PDT, relaying the user through the tool-based-ui showrunner: fix it, do not work around it. Today the launcher prints `codex_mesh: <seat>: Selected model is at capacity. Please try a different model.`, exits 1, and the board shows `this seat is down` (`scripts/delegate/implement.sh`, `review.sh`). `command_start` in `scripts/agents/codex_mesh.py` retries on a new app-server only for a fast failure with no work done (`RETRY_FAST_FAILURE_SECS`, `_retry_warranted`), so a seat that has done work is never retried. Sometimes the thread keeps running after the launcher quits: trunk's thread at 14:55 PDT made edits and took the cargo lock, and a relaunch then made a new thread under the same roster name, so the old one could no longer be reached. Lost today: trunk at 02:04, 14:55, 14:56 (its relaunch failed in 3 s), 16:04 and 17:02 PDT, about 65 min; widget 2, examples 1 and frame 2 more, about 20 min; this unit 6 stops in Phase 5. Config: `[delegate.codex] fix=gpt-6-sol:high`, `codex_mesh=1`, `codex_service_tier=pace`; the pacer chose `default` all day (its last tier change was 2026-10-03 12:02 PDT), so a tier change is not the fix.
+
+**Spec:**
+- **How a turn ended** is one typed outcome, read where `_attach_and_run` handles `turn/completed` and `turn/failed`: completed, refused for capacity, or failed. Capacity is read from the error's structured field when the installed app-server's protocol has one for it (`codex app-server generate-json-schema` prints the protocol; codex-cli 0.159.3 is installed), and from the message `Selected model is at capacity` otherwise. Only capacity takes the path below; every other failure keeps today's handling, including the fast-failure retry on a new app-server.
+- **Capacity resumes the same thread.** The launcher keeps the thread id and its roster entry, waits, then starts a new turn on that thread telling the delegate its last turn stopped because the model was at capacity and to continue from where it stopped, its edits are already in the tree. It never calls `thread/start` again for the seat and never re-sends the original prompt. Before starting that turn it checks for a live turn on the thread (`_live_turn`); if one runs (a peer's queued message starts one by itself), it streams that turn instead.
+- **Backoff.** The first wait is 30 s, each next wait doubles up to 5 min, and the retries stop once 20 min of waiting have passed. During a wait the roster entry keeps the thread id with a status that says it is waiting for capacity, so `list` shows it and `send` and `end` still reach it: `send` (today it refuses any status but `running`, `codex_mesh.py:873`) queues a message to a thread that is waiting for capacity or out of retries, delivered at that thread's next turn and starting none by itself, and `end` treats both states as live, dropping queued messages and interrupting any live turn; each wait writes one line to the seat log with the retry number and when the next turn starts. The waits are injectable, so tests never sleep.
+- **A failure is classified by what exists.** `Attempt`, with its `produced_work` flag and empty `failure` sentinel, becomes one typed outcome: failed before any thread existed (the fast-failure retry on a new app-server may run), or failed with a thread, live or uncertain (the prompt is never sent again; the thread is resumed, or reported as below). A connection error after `turn/start` is the second kind. The relaunch refusal reads liveness with a call that cannot steer the thread, not the `_live_turn` steer probe.
+- **Out of retries.** Only then does `start` exit 1. Its last line names the thread and how to reach it: `codex_mesh: <seat>: model still at capacity after <N> retries over <M> min; thread <thread id> stays on the roster (codex_mesh.py send or end --to <seat>)`. The roster entry keeps that thread id.
+- **The launcher never leaves a thread running unwatched.** On every failure path, before `start` returns, a thread with a live turn is either streamed to its end or ended (`end`'s drop-queued-messages and interrupt). Find why trunk's thread kept running after its launcher quit (one candidate: the loop breaks on a failed turn without checking `_more_work_coming`, so a peer's queued message starts a new turn on the abandoned thread), name the cause in the code comment, and close it.
+- **A relaunch never orphans a thread.** When `start` finds a roster entry under its name whose thread has a live turn on the current app-server, it refuses with exit 2 and a line naming the thread and `end`, and starts nothing. An entry whose thread has no live turn, or whose server is gone, is replaced as today.
+- **Tests** in `scripts/agents/test_codex_mesh.py`, driven by a stubbed app-server (an in-process WebSocket server speaking the JSON-RPC frames `Client` uses, so no codex runs): a capacity refusal followed by a completed turn resumes the same thread id, issues no second `thread/start`, and exits 0; the waits follow 30 s, 60 s, 120 s, 240 s, 300 s and stop at the 20-minute budget with exit 1 and the out-of-retries line naming the thread; a live turn found before a resume is streamed and no extra turn starts; a non-capacity failure takes today's path; a relaunch under a name whose thread has a live turn exits 2 and starts no thread; `send` and `end` reach an entry waiting for capacity and one out of retries; a disconnect after `turn/start` never sends the prompt again; the roster keeps the thread id through every case.
+
+**Files:**
+- `scripts/agents/codex_mesh.py` — the turn outcome, the capacity resume and backoff, the out-of-retries line, the unwatched-thread fix, the relaunch refusal
+- `scripts/agents/test_codex_mesh.py` — the stubbed app-server and the cases above
+
+**Seats:** `1 writer + 1 tester` — the launcher and its tests split by file.
+- `impl` — `scripts/agents/codex_mesh.py`; hub: `scripts/agents/codex_mesh.py`
+- `test` — `scripts/agents/test_codex_mesh.py`, written from the Spec alone
+
+**Constraints from prior phases:**
+- Every delegate seat of this run runs through the live `~/.claude/scripts/agents/codex_mesh.py`: seats edit only the worktree copy, and a test never starts a real `codex app-server` or reaches the provider.
+- `_retry_warranted` holds the fast-failure retry on a new app-server, guarded by `Attempt.produced_work`; `_retire_server` leaves the roster untouched; `command_end` drops queued messages before interrupting. Keep all three.
+- Times carry their zone; natedev's clock and journal are EDT, and this plan states PDT.
+
+**Acceptance gate:** `python3 -m unittest discover -s scripts/agents -p 'test_codex_mesh.py'` green; `basedpyright` 0 errors and 0 warnings on changed Python.
+
+### Phase 9 — verify.sh builds in a named target folder · status: todo
+
+#### Work Order
+
+**Goal:** `verify.sh … --target-dir <name>` runs every cargo step of that call in `<worktree>/target/<name>`, under a cargo token of that folder's own, so a helper with its own folder never waits on the shared folder's lock; its pass records count the same as the shared folder's, and the build log records which folder each call used.
+
+**Source:** natedev (showrunner), 2026-10-04 evening PDT. widget-examples gives up to 2 helpers their own build folders so they stop queueing on one folder's lock; the user wants the waits gone. The settings allow rule (`settings.json:55`, `Bash(bash ~/.claude/scripts/delegate/verify.sh *)`) runs verify.sh as one plain command, so a `CARGO_TARGET_DIR=` prefix would prompt the user: the folder has to be a flag. This goes to `~/.claude` main as soon as it merges. Today verify.sh neither sets nor reads `CARGO_TARGET_DIR`, and every seat under `implement.sh` takes the one `cargo` token (`verify.sh:729-740`).
+
+**Spec:**
+- **The flag.** `--target-dir <name>` may sit anywhere after the verb, like `--no-cache`, and is stripped from `ARGS` in the same loop (`verify.sh:501-511`), so nothing below sees it: `FILTER_RUN`, the untested-example gate's argument count (`verify.sh:695-696`), `tree_key`'s `lint` collapse (`verify.sh:540`) and the recorded command text (`verify.sh:614`, `:653`) are unchanged. The name matches `^[a-z][a-z0-9-]{0,31}$` and is not one of the folders cargo makes directly under `target/` (`debug`, `release`, `doc`, `tmp`, `package`, `nextest`; a constant with that comment). Anything else is refused with exit 2 and one line naming the rule, before any cargo runs: a slash, `..`, an absolute path, an empty or missing value, a reserved name, or the flag given twice. A name in `rustc --print target-list` is refused too, since cargo puts cross-compiled output under `target/<triple>`.
+- **Every cargo step uses the folder.** Right after the flag is read, verify.sh exports `CARGO_TARGET_DIR=<toplevel>/target/<name>`, where `<toplevel>` is `git rev-parse --show-toplevel` (the root `TREE_KEY_PY` hashes). Every cargo call of the run inherits it: the `run()` steps, `cargo metadata` (`verify.sh:429`, `:440`, `:697`, `:929`, `:943`), mend (`env RUSTC_WRAPPER=`), rustdoc (`env -u CARGO_MAKEFLAGS`) and the background sweep. Without the flag, verify.sh leaves `CARGO_TARGET_DIR` exactly as the caller's environment has it. The flag wins over a caller's `CARGO_TARGET_DIR`. The call's build folder is one typed location, and the token and the record follow it: `Shared` (no flag, and no caller `CARGO_TARGET_DIR` or one that resolves to `<toplevel>/target`): token `cargo`, record `shared`; `Named(<name>)`: token `cargo-<name>`, record `<name>`; `External(<path>)` (a caller's `CARGO_TARGET_DIR` anywhere else): token `cargo-ext-<first 8 hex of sha256 of the path>`, record `external:<path>`.
+- **One token per folder.** The shared folder keeps the `cargo` token; `--target-dir <name>` takes `cargo-<name>` (board.sh's resource pattern, `board.sh:100-102`, accepts it). Acquire, `release_token` and the second cache lookup use that one name. `implement.sh`, when a seat exits on either path (`implement.sh:348`, `:370`), releases every `cargo` and `cargo-*` token that seat holds, found under `<session_dir>/locks/`; `cmd_release` already refuses a token another holder owns.
+- **Pass records count across folders.** `TREE_KEY_PY` leaves `CARGO_TARGET_DIR` out of the environment it hashes, next to `CARGO_MAKEFLAGS` (`verify.sh:416-418`), so a `test` or `lint` pass in `seat-1` is found by the same call in the shared folder, and the reverse. The cache directory stays `<board or session dir>/verify_cache`. The helper folder sits under `target/`, which the repos ignore, so it never enters `git status` or the key.
+- **The sweep follows the folder.** `sweep_after_step` (`scripts/lint/invoke.sh:241-254`) keys its once-per-300-s stamp by `$PWD` and `CARGO_TARGET_DIR`, so a helper folder's sweep never postpones the shared folder's.
+- **The token wait on its own.** verify.sh measures the seconds it spends acquiring the cargo token (0 when it takes none) and passes them to `record.py call`; the call record gains `token_wait_s`, and the index `calls.token_wait_s` INTEGER, described as seconds waiting for the build folder's cargo token, 0 when none was taken. `wait_s` keeps today's meaning.
+- **The sweep finds named folders.** `scripts/lint/sweep.py` stops discovering target directories at the outer `target/` (`sweep.py:671`) and counts nested files against the outer budget without their build units. It treats each `target/<name>` that holds a cargo layout as its own root with its own budget and eviction, and the outer folder's sweep leaves them out.
+- **The build log records the folder.** verify.sh exports `BUILDLOG_TARGET_DIR` as the record value of the call's location; `record.py`'s `write_call` (`scripts/buildlog/record.py:289-313`) writes it as the call record's `target_dir` field. The index's `calls` table gains `target_dir` TEXT, described as the build folder: `shared` for the worktree's `target/`, else the `--target-dir` name, a folder under `target/`. A call record with no field reads `shared`: every call before this phase used the shared folder, and port-lint records set none. `SCHEMA_VERSION` goes from 8 to 9, so `open_for_update` rebuilds the index.
+- **Unchanged:** steve's slots (`CARGO_MAKEFLAGS`, `invoke.sh:36-42`), the memory admission (`buildlog_wait_for_memory`, `invoke.sh:107-130`) and the per-step cgroup peak (`buildlog_exec`, `buildlog_end`). A call without the flag behaves exactly as today.
+- **Docs.** The usage block in verify.sh's header (`verify.sh:70-114`) gains a `… --target-dir <name>` entry: what it builds where, the token it takes, and that its passes count in the shared folder. `<BuildTokenContract/>` in `docs/delegate/write_prompt_contract.md` (`:252-277`) says the token is per build folder: the shared `target/` has `cargo`, and a named folder its own.
+- **Tests.** In a new `scripts/delegate/test_verify_target_dir.py`, through real verify.sh routing with the stubs of `test_verify_untested_examples.py` (a cargo stub on `PATH` that also logs `CARGO_TARGET_DIR` for each call, a git stub): `test <pkg> --target-dir seat-1` and `lint <pkg> --target-dir seat-1` run every cargo call with `CARGO_TARGET_DIR=<toplevel>/target/seat-1`; each refused form exits 2 with no cargo call; without the flag, each cargo call sees the caller's `CARGO_TARGET_DIR`; with `PLAN_DELEGATE_BOARD_DIR` and `PLAN_DELEGATE_TEAM_ROLE` set, the board log shows `cargo-seat-1` taken and released with the flag and `cargo` without; a `test` pass recorded with `--target-dir seat-1` is reused by the same call without it (no `nextest run` call, `PASS (recorded)`), and the reverse; the flag before `--filter` and after it gives the same run. An inherited `CARGO_TARGET_DIR` outside the worktree's `target/` takes its `cargo-ext-` token and records `external:<path>`; a name in the target list is refused; a slow preflight with no token contention records `token_wait_s` 0, and a call that waits on a held token records the wait. In `scripts/lint/test_sweep.py`: a named folder under `target/` is swept as its own root and left out of the outer folder's budget. In `scripts/buildlog/test_record.py` and `test_index.py`: the call record carries `target_dir` and `token_wait_s`, and a record without them indexes as `shared` and 0.
+
+**Files:**
+- `scripts/delegate/verify.sh` — the flag, its refusals, `CARGO_TARGET_DIR`, the per-folder token, the key, `BUILDLOG_TARGET_DIR`, the usage block
+- `scripts/lint/invoke.sh` — the sweep stamp keyed by folder
+- `scripts/lint/sweep.py` — named folders under `target/` swept as their own roots
+- `scripts/delegate/implement.sh` — the seat-exit release of every cargo token the seat holds
+- `scripts/buildlog/record.py` — `target_dir` on the call record
+- `scripts/buildlog/index.py` — `calls.target_dir`, `SCHEMA_VERSION` 9
+- `docs/delegate/write_prompt_contract.md` — `<BuildTokenContract/>`'s per-folder token
+- `scripts/delegate/test_verify_target_dir.py` — the routing cases above (new)
+- `scripts/buildlog/test_record.py`, `scripts/buildlog/test_index.py` — the record and index cases
+- `scripts/lint/test_sweep.py` — the nested-folder sweep case
+
+**Seats:** `1 writer + 1 tester` — the scripts and their tests split by file.
+- `impl` — `scripts/delegate/verify.sh`, `scripts/lint/invoke.sh`, `scripts/lint/sweep.py`, `scripts/delegate/implement.sh`, `scripts/buildlog/record.py`, `scripts/buildlog/index.py`, `docs/delegate/write_prompt_contract.md`; hub: `scripts/delegate/verify.sh`
+- `test` — `scripts/delegate/test_verify_target_dir.py`, `scripts/lint/test_sweep.py`, `scripts/buildlog/test_record.py`, `scripts/buildlog/test_index.py`, written from the Spec alone
+
+**Constraints from prior phases:**
+- `verify.sh test <pkg>` (gate run) and `verify.sh final` read `cargo metadata --no-deps` once into `GATE_METADATA` and refuse an example holding `#[cfg(test)]` with `test = false` (exit 2) before the cache lookup and any build (Phase 6). `scripts/delegate/test_verify_untested_examples.py` runs real verify.sh routing with stubs on `PATH`: cargo passes `metadata` to real cargo and logs every other call, git is stubbed so the pass-record key is fixed, and the environment strips `PLAN_DELEGATE_BOARD_DIR`/`PLAN_DELEGATE_TEAM_ROLE` and sets `BUILDLOG_OFF=1`, `BUILDLOG_SCOPE=0`, `BUILD_HOLD_DIR` and `CARGO_TARGET_DIR`.
+- Phase 7 made the index schema 8 (`ci_jobs.run_state`); `open_for_update` rebuilds the index whenever `PRAGMA user_version` differs from `SCHEMA_VERSION`. Tests point the store root at a temporary directory and never write `~/.local/state/buildlog`.
+- Every delegate seat of this run runs the live `~/.claude/scripts/delegate/verify.sh` and `implement.sh`: seats edit only the worktree copies.
+- Times carry their zone; natedev's clock and journal are EDT, and this plan states PDT.
+
+**Acceptance gate:** `python3 -m unittest discover -s scripts/delegate -p 'test_verify_*.py'` and `python3 -m unittest discover -s scripts/buildlog -p 'test_*.py'` green; `python3 -m unittest discover -s scripts/lint -p 'test_sweep.py'` green; `bash -n` on `scripts/delegate/verify.sh`, `scripts/lint/invoke.sh` and `scripts/delegate/implement.sh`; `basedpyright` 0 errors and 0 warnings on changed Python.
+
+### Phase 10 — The build report opens with the day's waits · status: todo
+
+#### Work Order
+
+**Goal:** the daily build report opens with a Waiting section that shows, for each kind of wait, the tail first (the longest wait and how many ran past 5 minutes), then the total in seat-hours and the worst worktrees; and the example builds the Bevy launcher runs for screenshots appear in the build log under their own caller.
+
+**Source:** natedev (showrunner), 2026-10-04 evening PDT: the user is trying to eliminate waiting and could not see it in the report. On 2026-10-04, 624 of 2,148 verify.sh calls waited, 7.0 seat-hours in all, the longest 13.8 min, 17 over 5 min; the worst worktrees were frame-time (116 min), widget-examples (96 min) and geometry-material (79 min). Memory admission held 13 steps for 1.1 h, the longest 15.0 min (startup-polish impl, 16:30 PDT), and the five longest all came between 16:30 and 16:55 PDT; today that is one line under Memory pressure. A tool-based-ui unit director reported example builds of 12 and 24 min while verify.sh `example` calls maxed at 1.8 min. Found by the unit director the same evening: those builds are the brp MCP server's `brp_launch` (bevy_brp_mcp 0.23.0-rc.1), which runs `cargo build --workspace --example <name> --message-format=json` from the workspace root before it starts the app. verify.sh `example` only runs clippy. The launch goes through no verify.sh, memory gate, cgroup scope or buildlog, so nothing records it. Its one record is the tool result in the Claude Code transcript: on 2026-10-04 in widget-examples (`~/.claude/projects/-home-natepiano-rust-widget-examples/1b3853e3-82ff-4618-904b-b75f2edfe005.jsonl`), `font_features` took `launch_duration_ms` 1468425 (24.5 min, ended 16:40:18 PDT) and `sizes` 719108 (12.0 min, ended 16:54:57 PDT).
+
+**Spec:**
+- **Where it sits.** `report()` in `scripts/buildlog/report.py` (`:561-583`) puts `### Waiting` right after the `## Builds, <day>` heading, before the kind sections. The `memory waits:` line under Memory pressure stays as it is.
+- **One row per kind of wait,** in this order, with columns `Wait`, `Longest`, `Over 5 min`, `Waited`, `Total`, `Worst`:
+  - `Build-folder turn` — `calls.token_wait_s` on the day (`date(started_at, 'localtime')`), every call outcome. A call waited when `token_wait_s > 0` (Phase 9's seconds spent waiting for the build folder's cargo token, not `wait_s`, which also counts metadata and pass-record lookups). `Waited` reads `<n> of <calls> calls`. A worktree is `worktree_name`; a call in a named target folder (Phase 9's `calls.target_dir` other than `shared`) is `<worktree_name>/<target_dir>`.
+  - `Memory admission` — `steps.mem_wait_s` on the day; a step waited when `mem_wait_s > 0`. `Waited` reads `<n> of <steps> steps`. A worktree is `worktree_name`.
+  - `CI queue` — `ci_jobs.queued_s` of the day's `ran` jobs with a known queue time (Phase 7), the day keyed by the job's run attempt as `ci_section` keys it. A job waited when `queued_s > 0`. `Waited` reads `<n> of <jobs> jobs`. `Worst` names jobs (`<workflow> / <job name>`), since CI has no worktree.
+- **The cells.** `Longest` is the wait, then who and when: `13.8 min (frame-time, 15:52 PDT)`, the time in the zone the report prints elsewhere, always with its zone; a memory wait also names the seat when it has one (`startup-polish impl`). `Over 5 min` counts waits above 300 s. `Total` is the sum labelled seat-hours (`7.0 seat-hours`), because parallel seats overlap; CI's reads job-hours. `Worst` is the top three by summed wait, each with its minutes (`frame-time 116 min, widget-examples 96 min, geometry-material 79 min`). Durations use the report's existing `seconds()` format. A kind with nothing on the day prints `none` in `Longest` and blank cells after it, so the row still shows the kind was measured. No averages.
+- **Launch builds as a caller.** A new collector, `buildlog launches` (`scripts/buildlog/launches.py`, wired in `cli.py`), reads Claude Code transcripts `~/.claude/projects/*/*.jsonl` (`BUILDLOG_TRANSCRIPTS` overrides the root; tests always set it) for `mcp__brp__brp_launch` tool results carrying `launch_duration_ms`. Each becomes one step record in the store, written the way `record.py` writes steps: step `build`, caller `brp-launch`, `ended_at` the result's `metadata.launch_timestamp`, `started_at` that minus `metadata.launch_duration_ms`, `duration_s`, `cwd` the result's `metadata.working_directory` (the crate), the repo and worktree fields from the call's `parameters.path` (the worktree; `metadata.workspace` holds only its folder name), `session` the transcript's session id, `argv` `cargo build --workspace --example <target_name> --message-format=json` (the launcher's command; `--release` when the result says so), and no memory fields (the build runs in the session's own scope, so none are measured). The launch includes the app's start after the build, so the description of the new caller says the duration covers build and start. It reads each transcript from the byte offset it last stopped at, kept in a state file in the store root next to `ci_state.json`, so a repeat run reads only new lines; a launch already recorded is never written twice (its key is the session id plus `launch_timestamp`). `day_report` in `scripts/buildlog/cli.py` (`:169-179`) runs it before `index.update()`, so the launches it writes are in the index that report reads. A launch's record id is the session id plus its `launch_timestamp`, so a run that stops between writing records and saving its offset writes nothing twice when retried. `CALLER_LABELS` (`report.py:22-29`) gains `brp-launch` → `example launches (brp)`, so the launches show in the kind sections under that caller. Read one real `brp_launch` result line from the transcript named in Source, read only, to copy its shape into the test fixture.
+- **One day key for CI jobs.** `ci_job_days` in `scripts/buildlog/index.py` keys a job's day by its run attempt's `started_at` (join `ci_runs` on `run_id` and `attempt`), as `ci_section` and the CI queue row do, so all three put a job on the same day. `SCHEMA_VERSION` goes from 9 to 10.
+- **Ruled out:** a Claude Code hook on `brp_launch` (a settings change) and a buildlog record from inside bevy_brp_mcp (a published crate in another repository that should not depend on this tool).
+- **Tests,** with fixture records and transcripts under a temporary root: the section is first after the heading; each kind's longest, over-5-min count, waited count, seat-hour total and top three, including a call in a named target folder shown as `<worktree>/<folder>` and a CI job that was carried over or has no known queue time left out; a kind with no waits prints `none`; the launch collector turns a `brp_launch` result into one step with the right start, end, duration, caller and worktree, ignores other tool results, writes nothing twice across two runs, and reads only new lines on the second, with fixtures in the result's nested shape (`metadata`, `parameters`); `buildlog report` over a fixture transcript shows a new launch in the same invocation; a job created just after local midnight in a run attempt started before it lands on the run's day in `ci_job_days`, `ci_section` and the CI queue row.
+
+**Files:**
+- `scripts/buildlog/report.py` — the Waiting section, the `brp-launch` caller label, collecting launches before the report
+- `scripts/buildlog/launches.py` — the launch collector (new)
+- `scripts/buildlog/cli.py` — `buildlog launches`, the usage line, collecting before `index.update()` in `day_report`
+- `scripts/buildlog/index.py` — `ci_job_days` keyed by the run attempt, `SCHEMA_VERSION` 10
+- `scripts/buildlog/test_index.py` — the `ci_job_days` midnight case
+- `scripts/buildlog/test_report.py` — the Waiting section cases
+- `scripts/buildlog/test_launches.py` — the collector cases (new)
+
+**Seats:** `1 writer + 1 tester` — the code and its tests split by file.
+- `impl` — `scripts/buildlog/report.py`, `scripts/buildlog/launches.py`, `scripts/buildlog/cli.py`, `scripts/buildlog/index.py`; hub: `scripts/buildlog/report.py`
+- `test` — `scripts/buildlog/test_report.py`, `scripts/buildlog/test_launches.py`, `scripts/buildlog/test_index.py`, written from the Spec alone
+
+**Constraints from prior phases:**
+- `calls.wait_s` is verify.sh's seconds from script start to run start: `cargo metadata` and the untested-example gate, both pass-record lookups and the cargo token wait (`verify.sh:754`, passed at `:685` and `:804`); a reused or replayed call passes its whole elapsed time (`:607`). It does not cover steve's slots, cargo's own folder lock or the memory gate. `steps.mem_wait_s` comes from `buildlog_wait_for_memory` (`scripts/lint/invoke.sh:107-130`), which polls every 5 s and gives up at 900 s; the step's `started_at` excludes the wait.
+- Phase 7: `ci_jobs.run_state` is `ran`, `skipped` or `carried_over` (`JobRunState`), `queued_s` is NULL unless the job ran and its stamps give a queue time, and `ci_section` keys a day's jobs by their run attempt's `started_at`. Phase 9: `calls.target_dir` is `shared` or the `--target-dir` name; index schema 9.
+- The index is rebuilt from the source files whenever `PRAGMA user_version` differs from `SCHEMA_VERSION`. Tests point the store root at a temporary directory and never write `~/.local/state/buildlog`; `test_report.py` imports its record helpers from `test_index.py`.
+- Times carry their zone; natedev's clock and journal are EDT, and this plan states PDT.
+
+**Acceptance gate:** `python3 -m unittest discover -s scripts/buildlog -p 'test_*.py'` green; `basedpyright` 0 errors and 0 warnings on changed Python.
+
+### Phase 11 — A measured working day · status: todo
 
 #### Work Order
 
@@ -202,6 +344,7 @@ Measured 2026-10-04 11:59–12:25 PDT, read-only, from the earlyoom journal, the
 Measure against the target, a normal working day with no earlyoom kill, from the report plus:
 - CI's run time against a successful CI run from before the Phase 2 diff (the 2026-10-04 runs were killed and are not a runtime baseline);
 - CI at its ceiling. In CI run 37227844227 attempt 4 (green 14:14 PDT 2026-10-04) the two Linux jobs peaked at 8.3 and 16.7 GiB, `hana-ci.slice` hit its 18G MemoryMax about 23,800 times (`max` events 3930 → 27773) and its memory stall grew 44.7 s in about 11 min, with no kill. Run 37236742478 (14:35–14:51 PDT, the first without CARGO_BUILD_JOBS) peaked at 16.5 and 11.1 GiB, with `max` events +33.1K, stall +33.9 s, no kill and no jobserver warning. For each CI run in the window, run `buildlog memory START END` over the run's own start and end (from `gh run view`) and record the slice's MemoryMax hits (the `max` events delta), its stall seconds (the `memory.pressure` some-total delta) and any `oom_kill`. `memory.peak` is the slice's lifetime high, so for a run that ran alone, report "highest observed minute sample": the largest `ci_anon_bytes` among this host's samples (`samples.host`) inside the run, with how many minute samples the run has against its length in minutes. A sample is taken once a minute, so it can miss a shorter peak; judge a limit change on the `max` events, stall seconds and `oom_kill` alongside it, never on the sample alone. Name the threshold that would justify raising CI's MemoryMax, and judge the day against it. The ceilings already sum past RAM (builds 34G + CI 18G + `app.slice` about 9G + system, on 60 GiB; `builds.slice` peaked at 32 GiB on 2026-10-04), so any raise to CI comes out of `builds.slice`'s MemoryMax and the sum holds;
+- the showrunner's readings inside the window, to check against the figures above: run 37247551616 (c14a984b7, 17:26:47–17:36:29 PDT 2026-10-04) was green with 13 jobs; CI processes peaked at 8.4 GiB, builds at 10.7 GiB, used memory at 33.7 GiB and swap at 21.7 GiB; stall some 1.2 min, full 0.9 min; no earlyoom or kernel kill;
 - whether verify.sh ever counted a kill from outside the step as the step's own; if it did, tie the kill to the step's own processes;
 - whether the report's `memory waits:` line agrees with the `waiting for memory since …` lines agents saw;
 - the next `/build_hold` release that happens in the window, if any: when each held session's build started, its memory wait and the pressure. Do not stage a hold to produce one. Phase 4's helper reached the sessions when `~/.claude` main took the Phase 4 checkpoint, 2026-10-04 16:01:44 PDT. A release before that instant ran the old prose command and says nothing about the helper;
@@ -210,7 +353,7 @@ Measure against the target, a normal working day with no earlyoom kill, from the
 
 Tune the slice numbers from what it shows. A changed limit needs another measured day after it. Say whether per-crate admission or nextest thread limits are needed after all. A per-slice sample field that still reads "unavailable" is a deployment fault.
 
-*The staggering verdict.* From the observed release, say whether the admission already staggers the held sessions. If it does not, Phase 8 builds the one-session-at-a-time release; if it does, or no natural release happened, say so and Phase 8 is dropped or stays unmeasured.
+*The staggering verdict.* From the observed release, say whether the admission already staggers the held sessions. If it does not, Phase 12 builds the one-session-at-a-time release; if it does, or no natural release happened, say so and Phase 12 is dropped or stays unmeasured.
 
 *Who takes the end snapshot.* The unit director takes it at 2026-10-05 15:26 PDT whatever the state of Phase 6's merge; this phase never waits on another phase to keep its window. Sources the writer and the checker both use: hold times from each holder file's `since`; release times from the `/build_hold release` output in the session transcripts and natedev's relay log; each session's build start from build-log `steps.started_at` and `mem_wait_s`.
 
@@ -226,24 +369,25 @@ Baseline before the diff: natedev's stopgap 160efd9 put CI in steve on 2026-10-0
 - `test` — independently checks the journals, the CI figures and the record completeness from the same sources
 
 **Constraints from prior phases:**
-- `buildlog memory START END` (`scripts/buildlog/memory.py`) reads the snapshots nearest each edge, within 2 minutes, and counts only this host's records; the minute sample (`buildlog sample`, `scripts/buildlog/sample.py` and `cli.py`) writes one snapshot a minute with each slice's `memory.pressure` `some` total; the index is schema 7 (`scripts/buildlog/index.py`). `memory.peak` is a slice's lifetime high. rustc runs in `builds.slice/run-*.scope` under the sccache client as well as in `sccache.service`.
+- `buildlog memory START END` (`scripts/buildlog/memory.py`) reads the snapshots nearest each edge, within 2 minutes, and counts only this host's records; the minute sample (`buildlog sample`, `scripts/buildlog/sample.py` and `cli.py`) writes one snapshot a minute with each slice's `memory.pressure` `some` total; the index is schema 8 since Phase 7 (`ci_jobs.run_state`: a job GitHub carried into a re-run attempt is `carried_over` and has no times of its own, so a re-run's CI figures use the attempt's own `ran` jobs), 9 after Phase 9 and 10 after Phase 10 (`scripts/buildlog/index.py`). The window opened before Phases 9 and 10 changed how waits and launch builds are recorded: the day's memory verdict stands on the window as measured, and any reading of those phases' effects is a separate, later figure. `memory.peak` is a slice's lifetime high. rustc runs in `builds.slice/run-*.scope` under the sccache client as well as in `sccache.service`.
 - Live since 2026-10-04: sccache in the foreground (nixos e669461), `hana-ci.slice` with no MemoryHigh and its runners at OOMPolicy=continue (087c7c1), no CARGO_BUILD_JOBS (832dad4); the CI jobserver check is closed. This supersedes Phase 2's notes that the machine half is not live and that `CARGO_BUILD_JOBS` stays at 8: plan no deployment or jobserver change from them.
 - Phase 4: each holder file in `~/.local/state/build-hold/` (`BUILD_HOLD_DIR` overrides it; tests always set it) is one JSON line `{"holder", "since", "for", "release_eta"}`, where `release_eta` is an ISO instant or `unknown`; the old one-line form still reads. `scripts/build_hold/build_hold.py` has `hold` (`--release-eta HH:MM` needs `--zone`), `quiet`, `release` and `status`. `release` prints `released, builds may resume.` only when no holder file remains, else `released; still held by …`. `quiet` is busy while this user's `cargo`, `rustc` or `cargo-nextest` runs or the 1-minute load is at or above a quarter of the cores, and waits at most 10 minutes; `ps` needs `user:32`, or procps cuts long names. `HoldState = NoHolders | ActiveHolders`, `ReleaseEta = KnownReleaseEta | UnknownReleaseEta`, and `quiet_verdict` takes `Cores = KnownCores | UnknownCores` (Phase 5). `dailies_render.py` reads holds through `read_dailies_hold()` and refuses a unit marker with no holder file, active holders with no marked unit, and plumbing words in a holder's purpose. `scripts/buildlog/rust_release.py` treats any regular file in the hold directory as a hold.
 - Times carry their zone; natedev's clock and journal are EDT, and this plan states PDT.
 
 **Acceptance gate:** the day's report, each CI run's figures, the threshold and the conclusions written in this phase, each figure's window complete or marked inconclusive; the staggering verdict stated; `bash -n` on any changed shell.
 
-### Phase 8 — One session at a time · status: todo
+### Phase 12 — One session at a time · status: todo
 
 #### Work Order
 
-**Goal:** when Phase 7 finds the admission does not stagger held sessions, the last holder's `/build_hold release` releases them one at a time, each after the previous one's build has started.
+**Goal:** when Phase 11 finds the admission does not stagger held sessions, the last holder's `/build_hold release` releases them one at a time, each after the previous one's build has started.
 
 **Spec:**
-- Runs only if Phase 7's verdict says the admission does not stagger the sessions; otherwise this phase is dropped.
+- Runs only if Phase 11's verdict says the admission does not stagger the sessions; otherwise this phase is dropped.
 - Only the last holder starts it. While another holder file remains, `release` names who still holds and releases no session (Phase 4's behavior). The holder's file stays until the last session is released, so `status`, the renderer and `rust_release.py` keep seeing the hold.
-- Release progress is one typed state per held session, in release order: `AwaitingRelease`, `ReleasedAwaitingBuildStart(released_at)`, `BuildStarted(started_at)`, `NoReply(released_at)`, each carrying only the instants valid in it. It is stored in `~/.local/state/build-hold-release/` (`BUILD_HOLD_RELEASE_DIR` overrides it), never in the holder directory, which every reader treats as holds; read back on each step, never kept in memory.
-- `release` messages one session at a time, by the same message path `/build_hold` uses today. A session moves to `BuildStarted` when `verify.sh` starts its first build step past any memory wait and writes its acknowledgement, keyed by session name, into the release directory. The acknowledgement proves admission, not a finished build.
+- Release progress is one typed state per held session, in release order: `AwaitingRelease`, `ReleasedAwaitingAdmission(released_at)`, `AdmittedPastMemoryWait(admitted_at)`, `NoReply(released_at)`, each carrying only the instants valid in it. It is stored in `~/.local/state/build-hold-release/` (`BUILD_HOLD_RELEASE_DIR` overrides it), never in the holder directory, which every reader treats as holds; read back on each step, never kept in memory.
+- `release` messages one session at a time, by the same message path `/build_hold` uses today. A session moves to `AdmittedPastMemoryWait` when its first build step is admitted: `run_once` in `scripts/lint/invoke.sh` (`:172-179`) writes the acknowledgement right after `buildlog_wait_for_memory` returns, keyed by session name, into the release directory. A call that builds nothing (an example-gate refusal, a pass-record hit) writes none.
+- **Who is released.** The holds know holders, not held sessions (`build_hold.py:220`), and today's release goes to every top-level session (`commands/build_hold.md:10`). A session that finds the hold records itself, in arrival order, in the release directory; `release` messages those sessions one at a time by name, through the relay `/build_hold` uses, and after `NoReply` moves to the next. `status` and the dailies renderer show each held session's state. The acknowledgement proves admission, not a finished build.
 - A session with no acknowledgement 5 minutes after its release becomes `NoReply`; the next session is released and the release text names it.
 - Tests: partial progress (some released, some waiting), a missing acknowledgement, another active holder, and `status`, the dailies renderer and `rust_release.py` showing no phantom holder from the release directory, including after the last release clears it.
 
@@ -251,11 +395,12 @@ Baseline before the diff: natedev's stopgap 160efd9 put CI in steve on 2026-10-0
 - `scripts/build_hold/build_hold.py` — release states, release directory, one-at-a-time release
 - `scripts/build_hold/test_build_hold.py` — the cases above
 - `commands/build_hold.md` — the one-at-a-time release steps
-- `scripts/delegate/verify.sh` — the acknowledgement at the first build step
+- `scripts/lint/invoke.sh` — the acknowledgement after the memory wait
+- `scripts/production/dailies_render.py` — each held session's release state
 
 **Seats:** `1 writer + 1 tester` — the helper and its tests split by file.
-- `impl` — `scripts/build_hold/build_hold.py`, `commands/build_hold.md`, `scripts/delegate/verify.sh`; hub: `scripts/build_hold/build_hold.py`
-- `test` — `scripts/build_hold/test_build_hold.py`, written from the Spec alone
+- `impl` — `scripts/build_hold/build_hold.py`, `commands/build_hold.md`, `scripts/lint/invoke.sh`, `scripts/production/dailies_render.py`; hub: `scripts/build_hold/build_hold.py`
+- `test` — `scripts/build_hold/test_build_hold.py`, a verify routing test under `scripts/delegate/` (a delayed memory wait acknowledges after it, an example-gate refusal and a pass-record hit acknowledge nothing) and the dailies renderer's per-session cases, written from the Spec alone
 
 **Constraints from prior phases:**
 - Holder files in `~/.local/state/build-hold/` (`BUILD_HOLD_DIR` overrides it; tests always set it) are one JSON line `{"holder", "since", "for", "release_eta"}`; `read_holders` and `scripts/buildlog/rust_release.py` treat every regular file there as a hold. `release` prints `released, builds may resume.` only when no holder file remains. `ReleaseEta = KnownReleaseEta | UnknownReleaseEta`; `quiet_verdict` takes `Cores = KnownCores | UnknownCores`.

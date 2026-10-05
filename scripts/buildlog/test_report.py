@@ -523,6 +523,70 @@ class ReportTests(unittest.TestCase):
         self.assertIn("| scratch (temp folders) | 1 | 0 | 1.0 s | 1.0 s |  |  |  |", lines)
         self.assertNotIn("steps under a temp folder", text)
 
+    def test_ci_queue_summary_when_all_queue_times_are_known(self) -> None:
+        self.write(
+            self.root / "ci" / "2026-10.jsonl",
+            ci_run(1, 1, [ci_job(11, "Test", "success", ("2026-10-02T12:00:00Z", "2026-10-02T12:00:30Z", "2026-10-02T12:02:30Z"))]),
+        )
+        summary = next(line for line in self.render().splitlines() if line.startswith("CI: "))
+        self.assertEqual(summary.split("; ", 1)[1], "jobs queued 30.0 s on average.")
+
+    def test_ci_queue_summary_uses_run_attempt_day_for_job_created_after_midnight(self) -> None:
+        first_start = datetime(2026, 10, 1, 12).astimezone().isoformat()
+        first_job_start = datetime(2026, 10, 1, 12, 0, 10).astimezone().isoformat()
+        first_end = datetime(2026, 10, 1, 12, 2).astimezone().isoformat()
+        rerun_start = datetime(2026, 10, 2, 23, 59).astimezone().isoformat()
+        job_created = datetime(2026, 10, 3, 0, 1).astimezone().isoformat()
+        job_started = datetime(2026, 10, 3, 0, 1, 30).astimezone().isoformat()
+        job_completed = datetime(2026, 10, 3, 0, 3).astimezone().isoformat()
+        first = ci_run(1, 1, [ci_job(11, "Test", "success", (first_start, first_job_start, first_end))])
+        first.update({"created_at": first_start, "started_at": first_start, "updated_at": first_end})
+        rerun = ci_run(1, 2, [ci_job(21, "Test", "success", (job_created, job_started, job_completed))])
+        rerun.update({"created_at": rerun_start, "started_at": rerun_start, "updated_at": job_completed})
+        self.write(self.root / "ci" / "2026-10.jsonl", first, rerun)
+
+        summary = next(line for line in self.render("2026-10-02").splitlines() if line.startswith("CI: "))
+        self.assertEqual(summary.split("; ", 1)[1], "jobs queued 30.0 s on average.")
+        self.assertIn("CI: no runs.", self.render("2026-10-03"))
+
+    def test_ci_queue_summary_counts_unknown_times_but_not_skipped_jobs_as_left_out(self) -> None:
+        original = ("2026-10-02T12:00:00Z", "2026-10-02T12:00:30Z", "2026-10-02T12:02:30Z")
+        carried = ("2026-10-02T12:20:00Z", original[1], original[2])
+        skipped = ("2026-10-02T12:21:00Z", "2026-10-02T12:21:00Z", "2026-10-02T12:20:59Z")
+        self.write(
+            self.root / "ci" / "2026-10.jsonl",
+            ci_run(1, 1, [ci_job(11, "Test", "success", original)]),
+            ci_run(1, 2, [
+                ci_job(21, "Test", "success", carried),
+                ci_job(22, "Skipped", "skipped", skipped),
+                ci_job(23, "Other", "success", ("2026-10-02T12:22:00Z", "unknown", "unknown")),
+            ]),
+        )
+        summary = next(line for line in self.render().splitlines() if line.startswith("CI: "))
+        self.assertEqual(summary.split("; ", 1)[1], "jobs queued 30.0 s on average, 2 without a known queue time left out.")
+
+    def test_ci_queue_summary_when_no_job_has_a_known_queue_time(self) -> None:
+        original = ("2026-10-02T12:00:00Z", "2026-10-02T12:00:30Z", "2026-10-02T12:02:30Z")
+        carried = ("2026-10-03T12:20:00Z", original[1], original[2])
+        rerun = ci_run(1, 2, [ci_job(21, "Test", "success", carried)])
+        rerun.update({"created_at": "2026-10-03T12:20:00Z", "started_at": "2026-10-03T12:20:00Z", "updated_at": "2026-10-03T12:30:00Z"})
+        self.write(
+            self.root / "ci" / "2026-10.jsonl",
+            ci_run(1, 1, [ci_job(11, "Test", "success", original)]),
+            rerun,
+        )
+        summary = next(line for line in self.render("2026-10-03").splitlines() if line.startswith("CI: "))
+        self.assertEqual(summary.split("; ", 1)[1], "no job has a known queue time (1 left out).")
+
+    def test_ci_queue_summary_with_only_skipped_jobs_has_no_left_out_suffix(self) -> None:
+        skipped = ("2026-10-02T12:01:00Z", "2026-10-02T12:01:00Z", "2026-10-02T12:00:59Z")
+        self.write(
+            self.root / "ci" / "2026-10.jsonl",
+            ci_run(1, 1, [ci_job(11, "Skipped", "skipped", skipped)]),
+        )
+        summary = next(line for line in self.render().splitlines() if line.startswith("CI: "))
+        self.assertEqual(summary.split("; ", 1)[1], "no job has a known queue time.")
+
     def test_scratch_steps_form_one_caller_per_kind_and_count_toward_peak_memory(self) -> None:
         gib = 1073741824
         self.write(
