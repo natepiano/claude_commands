@@ -66,7 +66,7 @@ from completing instead of silently passing it.
 
 ## What this file deliberately does not gate
 
-- **`verify.sh check` / `test` / `example` / `example-test`, and the workspace
+- **`verify.sh check` / `test` / `example`, and the workspace
   check and test inside `verify.sh final`.** Those are correctness gates, not
   lints. A delegate phase that compiles nothing has verified nothing.
 - **`pre_release_checks.sh` and `validate_ci.sh`.** A release or CI check that

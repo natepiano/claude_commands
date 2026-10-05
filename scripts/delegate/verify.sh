@@ -4,8 +4,9 @@
 # Work Orders list exact invocations of this script; the delegate composes no
 # cargo flags and makes no scope choices. Cargo's default target selection
 # compiles examples, so every dev-loop subcommand pins explicit targets
-# (--lib/--bins/--tests). Nothing below `final` compiles examples or uses
-# --all-targets (mend excepted, see `lint`); `final` is the plan-final full
+# (--lib/--bins/--tests). `test` includes examples with test = true; other
+# examples are left out. Nothing below `final` uses --all-targets (mend
+# excepted, see `lint`); `final` is the plan-final full
 # gate, run by the unit director, never by a phase delegate.
 #
 # Package selection is always --workspace, with default features. Cargo
@@ -70,7 +71,8 @@
 #   verify.sh check <package>              fast compile feedback (workspace
 #                                          lib + bins)
 #   verify.sh test <package>               the package's unit + integration tests
-#                                          (package targets; workspace libs if any)
+#                                          (package targets; workspace libs if any);
+#                                          refuse examples that hold a test
 #   verify.sh test <package> <int_test>    one named integration test target,
 #                                          for re-running it alone
 #   verify.sh test <package> --filter <name> [--filter <name> …]
@@ -102,10 +104,8 @@
 #                                          — gated by config/lint.conf
 #   verify.sh example <package> <name>     clippy one example (only when the
 #                                          phase changed that example)
-#   verify.sh example-test <package> <name>
-#                                          test one example (only when the
-#                                          example contains unit tests)
-#   verify.sh final                        full workspace gate (unit director only)
+#   verify.sh final                        full workspace gate; refuse examples
+#                                          that hold a test (unit director only)
 #   verify.sh --session-dir <dir> …        any of the above inside a delegate
 #                                          session; same as setting
 #                                          PLAN_DELEGATE_SESSION_DIR=<dir>
@@ -263,6 +263,54 @@ for target in package["targets"]:
 print("\n".join(selection or ["--bins", "--tests"]))
 '
 
+UNTESTED_EXAMPLES_PY='
+import json
+from pathlib import Path
+import re
+import sys
+
+meta = json.load(sys.stdin)
+members = set(meta["workspace_members"])
+packages = [package for package in meta["packages"] if package["id"] in members]
+package_name = sys.argv[1]
+if package_name != "--workspace":
+    packages = [package for package in packages if package["name"] == package_name]
+    if not packages:
+        print("verify.sh: package " + package_name + " not found in workspace", file=sys.stderr)
+        sys.exit(2)
+
+test_marker = re.compile(r"^\s*(#\[(?:cfg\(test\)|(?:\w+::)*test)\])")
+offenders = []
+for package in packages:
+    for target in package["targets"]:
+        if "example" not in target["kind"]:
+            continue
+        source = Path(target["src_path"])
+        if source.name == "main.rs" and source.parent.parent.name == "examples":
+            sources = sorted(source.parent.rglob("*.rs"))
+        else:
+            sources = [source]
+        for path in sources:
+            for line_number, line in enumerate(path.read_text().splitlines(), 1):
+                if match := test_marker.match(line):
+                    offenders.append((target["name"], path, line_number, match.group(1), package["name"]))
+                    break
+            else:
+                continue
+            break
+
+for index, (name, path, line_number, attribute, package_name) in enumerate(offenders):
+    if index:
+        print(file=sys.stderr)
+    print(
+        f"example {name} holds a test: {path}:{line_number} has {attribute}, and examples carry no tests.",
+        file=sys.stderr,
+    )
+    print(f"move it into {package_name}\x27s src/ or tests/, or delete it.", file=sys.stderr)
+if offenders:
+    sys.exit(2)
+'
+
 # Workspace members with a file that differs from HEAD: staged, unstaged,
 # deleted, or new and not ignored. A phase commits nothing before its
 # checkpoint, so HEAD is where the phase started and this is the whole phase's
@@ -360,8 +408,16 @@ print(key.hexdigest())
 # The compile covers the workspace, so a misspelled package would otherwise
 # pass check and lint silently and leave nextest with an empty filter. Fail it
 # as a usage error instead.
+read_metadata() {
+    if [[ -n "${GATE_METADATA:-}" ]]; then
+        printf '%s\n' "$GATE_METADATA"
+    else
+        cargo metadata --no-deps --format-version 1
+    fi
+}
+
 require_member() {
-    if ! cargo metadata --no-deps --format-version 1 | "$PY" -c "$MEMBER_PY" "$1"; then
+    if ! read_metadata | "$PY" -c "$MEMBER_PY" "$1"; then
         exit 2
     fi
 }
@@ -374,7 +430,7 @@ example_features() {
 TEST_SELECTION=()
 take_test_targets() {
     local words word
-    words="$(cargo metadata --no-deps --format-version 1 \
+    words="$(read_metadata \
         | "$PY" -c "$TEST_TARGETS_PY" "$PKG" "${FEATURE_FLAGS[1]:-}")"
     while IFS= read -r word; do
         if [[ -n "$word" ]]; then
@@ -427,6 +483,11 @@ if [[ -z "$CMD" ]]; then
     exit 2
 fi
 shift
+
+if [[ "$CMD" == example-test ]]; then
+    echo 'verify.sh: example-test is removed: examples carry no tests (user, 2026-10-04).' >&2
+    exit 2
+fi
 
 # --no-cache may sit anywhere after the subcommand; nothing below sees it.
 NO_CACHE=0
@@ -619,6 +680,22 @@ finish_run() {
     fi
     RUN_LOG=""
 }
+
+# Checked before the cache lookup and any build, so a recorded pass never
+# stands in for the rule that examples carry no tests.
+GATE_METADATA=""
+if [[ "$CMD" == final || ( "$CMD" == test && ( ${#ARGS[@]} -eq 1 \
+    || ( ${#ARGS[@]} -eq 3 && "${ARGS[1]}" == --features ) ) ) ]]; then
+    GATE_METADATA="$(cargo metadata --no-deps --format-version 1)"
+    if [[ "$CMD" == final ]]; then
+        EXAMPLE_SCOPE=--workspace
+    else
+        EXAMPLE_SCOPE="${ARGS[0]}"
+    fi
+    if ! "$PY" -c "$UNTESTED_EXAMPLES_PY" "$EXAMPLE_SCOPE" <<< "$GATE_METADATA"; then
+        exit 2
+    fi
+fi
 
 if cache_lookup; then
     exit "${LOOKUP_STATUS}"
@@ -890,17 +967,6 @@ case "$CMD" in
                 --features "$(qualify_features "$PKG" "$FEATURES")"
         else
             invoke_clippy --workspace --example "$NAME"
-        fi
-        ;;
-    example-test)
-        PKG="${1:?verify.sh example-test <package> <name>}"
-        NAME="${2:?verify.sh example-test <package> <name>}"
-        FEATURES="$(example_features "$PKG" "$NAME")"
-        if [[ -n "$FEATURES" ]]; then
-            run_nextest --workspace --example "$NAME" -E "package($PKG)" \
-                --features "$(qualify_features "$PKG" "$FEATURES")"
-        else
-            run_nextest --workspace --example "$NAME" -E "package($PKG)"
         fi
         ;;
     final)
