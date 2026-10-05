@@ -8,6 +8,7 @@
   buildlog tree-key [DIR]           the tree key of DIR's worktree (default the current folder; treekey.py)
   buildlog sync                     exchange records with the Mac (natedev's hourly job)
   buildlog ci                       record new GitHub Actions run attempts
+  buildlog launches                 collect example build and start times from Claude Code
   buildlog disk                     measure disk usage for the next report
   buildlog sample                   record machine memory and stall counters once
   buildlog snapshot                 record slice and zram counters now
@@ -31,6 +32,7 @@ from typing import cast
 import ci
 import disk
 import index
+import launches
 import memory
 import record
 import report
@@ -173,6 +175,7 @@ def day_report(args: list[str]) -> int:
     except ValueError:
         print("usage: buildlog report [YYYY-MM-DD]", file=sys.stderr)
         return 2
+    _ = launches.collect()
     _ = index.update()
     connection = index.read_only()
     try:
@@ -207,6 +210,12 @@ def main(argv: list[str]) -> int:
         return schema()
     if command == "report":
         return day_report(rest)
+    if command == "launches":
+        if rest:
+            print("usage: buildlog launches", file=sys.stderr)
+            return 2
+        print(f"buildlog launches: {launches.collect()} added")
+        return 0
     if command == "tree-key":
         key = treekey.tree_key(rest[0] if rest else os.getcwd())
         if key is None:

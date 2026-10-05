@@ -28,6 +28,7 @@ _TEST_ROOT = Path(_TEST_LOG.name) / "buildlog"
 
 def use_test_log() -> None:
     os.environ["BUILDLOG_DIR"] = str(_TEST_ROOT)
+    os.environ["BUILDLOG_TRANSCRIPTS"] = str(Path(_TEST_LOG.name) / "transcripts")
 
 
 use_test_log()
@@ -412,11 +413,17 @@ class IndexTests(unittest.TestCase):
         carried = ("2026-10-03T12:20:00Z", original[1], original[2])
         rerun = ("2026-10-03T12:20:00Z", "2026-10-03T12:20:10Z", "2026-10-03T12:21:10Z")
         fresh = ("2026-10-03T12:30:00Z", "2026-10-03T12:30:05Z", "2026-10-03T12:31:05Z")
+        second_attempt = ci_run(1, 2, [ci_job(21, "Clippy", "success", carried), ci_job(22, "Test", "failure", rerun)])
+        second_attempt.update({"created_at": "2026-10-03T12:20:00Z", "started_at": "2026-10-03T12:20:00Z",
+                               "updated_at": "2026-10-03T12:32:00Z"})
+        other_run = ci_run(2, 1, [ci_job(31, "Clippy", "success", fresh)])
+        other_run.update({"created_at": "2026-10-03T12:30:00Z", "started_at": "2026-10-03T12:30:00Z",
+                          "updated_at": "2026-10-03T12:32:00Z"})
         self.write(
             self.root / "ci" / "2026-10.jsonl",
-            ci_run(1, 2, [ci_job(21, "Clippy", "success", carried), ci_job(22, "Test", "failure", rerun)]),
+            second_attempt,
             ci_run(1, 1, [ci_job(11, "Clippy", "success", original)]),
-            ci_run(2, 1, [ci_job(31, "Clippy", "success", fresh)]),
+            other_run,
         )
         _ = index.update()
 
@@ -435,6 +442,31 @@ class IndexTests(unittest.TestCase):
                 ("2026-10-03", "Test", 1, 1, 60.0, 60.0, 10.0, 10.0),
             ],
         )
+
+    def test_ci_job_days_uses_run_attempt_day_across_local_midnight(self) -> None:
+        before_midnight = datetime(2026, 10, 2, 23, 59).astimezone().isoformat()
+        after_midnight = datetime(2026, 10, 3, 0, 1).astimezone().isoformat()
+        started = datetime(2026, 10, 3, 0, 2).astimezone().isoformat()
+        completed = datetime(2026, 10, 3, 0, 4).astimezone().isoformat()
+        run = ci_run(3, 1, [ci_job(31, "Midnight", "success", (after_midnight, started, completed))])
+        run.update({"created_at": before_midnight, "started_at": before_midnight, "updated_at": completed})
+        self.write(self.root / "ci" / "2026-10.jsonl", run)
+        _ = index.update()
+
+        self.assertEqual(
+            self.rows("SELECT day, name, jobs, avg_queue_s FROM ci_job_days"),
+            [("2026-10-02", "Midnight", 1, 60.0)],
+        )
+        self.assertEqual(self.rows("SELECT queued_s, run_state FROM ci_jobs"), [(60.0, "ran")])
+
+    def test_call_token_wait_defaults_to_zero_for_old_records(self) -> None:
+        self.write(self.host_file, call("old"), call("new", token_wait_s=13))
+        _ = index.update()
+        self.assertEqual(
+            self.rows("SELECT id, token_wait_s FROM calls ORDER BY id"),
+            [("new", 13), ("old", 0)],
+        )
+        self.assertEqual(index.SCHEMA_VERSION, 9)
 
     def test_ci_skipped_and_zero_queue_jobs_have_distinct_states(self) -> None:
         same_stamp = "2026-10-02T12:00:00Z"

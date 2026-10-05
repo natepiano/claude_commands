@@ -20,6 +20,7 @@ port_lint.py writes its own call records through write_call() here.
       reused or replayed; CACHED is 1 when the call was eligible for a pass
       record; WAIT, WALL, BUILD and SAVED are whole seconds, ELAPSED the
       script's $SECONDS at the end. STATUS and BUILD may be empty (unknown).
+      BUILDLOG_TOKEN_WAIT_S is the time spent acquiring the cargo token.
   record.py backfill-verify [LEDGER]
       Copy verify.sh's old call ledger (~/.local/state/verify/events.jsonl)
       into call records, once: each line gets an id from its own hash, so a
@@ -283,7 +284,10 @@ def step(args: list[str]) -> None:
 
 
 def optional_int(text: str) -> int | None:
-    return int(float(text)) if text.strip() else None
+    try:
+        return int(float(text)) if text.strip() else None
+    except (ValueError, OverflowError):
+        return None
 
 
 def write_call(started: float, fields: dict[str, object], record_id: str | None = None) -> None:
@@ -326,6 +330,7 @@ def call(args: list[str]) -> None:
         "status": optional_int(status),
         "cached": cached == "1",
         "wait_s": optional_int(wait) or 0,
+        "token_wait_s": optional_int(os.environ.get("BUILDLOG_TOKEN_WAIT_S", "0")) or 0,
         "wall_s": optional_int(wall) or 0,
         "build_s": optional_int(build),
         "saved_s": optional_int(saved) or 0,

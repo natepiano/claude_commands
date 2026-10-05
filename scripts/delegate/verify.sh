@@ -457,6 +457,7 @@ RUN_LOG=""
 RUN_KEY=""
 RUN_STARTED=0
 CALL_NOTED=0
+TOKEN_WAIT_S=0
 LOOKUP_KEY=""
 LOOKUP_STATUS=0
 EXIT_STATUS=0
@@ -512,7 +513,7 @@ note_event() {
     if [[ -n "${MEM_KILL_FILE:-}" && -f "${MEM_KILL_FILE}.stopped" ]]; then
         mem_kill_stopped=1
     fi
-    BUILDLOG_MEM_KILLS="$mem_kills" BUILDLOG_MEM_KILL_STOPPED="$mem_kill_stopped" "$PY" "$BUILDLOG_RECORD" call "$outcome" "$status" "$cached" "$wait" "$wall" \
+    BUILDLOG_MEM_KILLS="$mem_kills" BUILDLOG_MEM_KILL_STOPPED="$mem_kill_stopped" BUILDLOG_TOKEN_WAIT_S="${TOKEN_WAIT_S:-0}" "$PY" "$BUILDLOG_RECORD" call "$outcome" "$status" "$cached" "$wait" "$wall" \
         "$build" "$saved" "${SECONDS}" "$CMD" ${ARGS[@]+"${ARGS[@]}"} \
         </dev/null >/dev/null 2>&1 || true
 }
@@ -645,12 +646,14 @@ BOARD_DIR="${PLAN_DELEGATE_BOARD_DIR:-}"
 BOARD_SLOT="${PLAN_DELEGATE_TEAM_ROLE:-}"
 TOKEN_HELD=0
 if [[ -n "${BOARD_DIR}" && -n "${BOARD_SLOT}" && -f "${BOARD_HELPER}" ]]; then
+    TOKEN_WAIT_STARTED=$SECONDS
     if bash "${BOARD_HELPER}" acquire "${BOARD_DIR}" "${BOARD_SLOT}" cargo \
         --hold 3600 --wait 1800 >/dev/null 2>&1; then
         TOKEN_HELD=1
     else
         echo "verify.sh: waited for the cargo token and did not get it; running anyway." >&2
     fi
+    TOKEN_WAIT_S=$(( SECONDS - TOKEN_WAIT_STARTED ))
 fi
 
 release_token() {

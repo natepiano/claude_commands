@@ -40,6 +40,64 @@ class ReportTests(unittest.TestCase):
         with closing(index.read_only()) as connection:
             return report.report(connection, day or local_day(STAMP))
 
+    def waiting_rows(self, day: str = "2026-10-02") -> dict[str, list[str]]:
+        lines = self.render(day).splitlines()
+        self.assertEqual(lines[2], "### Waiting")
+        start = lines.index("### Waiting")
+        end = next(i for i in range(start + 1, len(lines)) if lines[i].startswith("### "))
+        table = [line for line in lines[start:end] if line.startswith("|")]
+        self.assertEqual(
+            [cell.strip() for cell in table[0].strip("|").split("|")],
+            ["Wait", "Longest", "Over 5 min", "Waited", "Total", "Worst"],
+        )
+        rows = [[cell.strip() for cell in line.strip("|").split("|")] for line in table[2:]]
+        self.assertEqual([row[0] for row in rows], ["Build-folder turn", "Memory admission", "CI queue"])
+        return {row[0]: row[1:] for row in rows}
+
+    def test_waiting_section_shows_each_tail_and_top_three(self) -> None:
+        at = "2026-10-02T12:00:00Z"
+        calls = [
+            call(f"call-{name}-{wait}", started_at=at, worktree=f"/r/{name}", token_wait_s=wait)
+            for name, wait in (("alpha", 600), ("alpha", 360), ("beta", 420), ("gamma", 240), ("delta", 0))
+        ]
+        calls.append(call("other-day", started_at="2026-10-01T12:00:00Z", token_wait_s=7200))
+        steps = [
+            step(f"step-{name}", started_at=at, worktree=f"/r/{name}", seat=seat, mem_wait_s=wait)
+            for name, seat, wait in (("alpha", "impl", 900), ("beta", "test", 600), ("gamma", None, 360), ("delta", None, 0))
+        ]
+        self.write(self.root / "natedev" / "2026-10.jsonl", *calls, *steps)
+        jobs = [
+            ci_job(number, name, "success", (f"2026-10-02T12:{minute:02d}:00Z", f"2026-10-02T12:{minute + wait // 60:02d}:00Z", f"2026-10-02T12:{minute + wait // 60 + 1:02d}:00Z"))
+            for number, name, minute, wait in ((1, "Alpha", 0, 600), (2, "Beta", 12, 420), (3, "Gamma", 22, 360), (4, "Zero", 35, 0))
+        ]
+        jobs.append(ci_job(5, "Unknown", "success", ("2026-10-02T12:40:00Z", "unknown", "unknown")))
+        first = ci_run(1, 1, jobs)
+        carried = ci_run(2, 2, [ci_job(21, "Carried", "success", (
+            "2026-10-02T13:00:00Z", "2026-10-02T12:10:00Z", "2026-10-02T12:11:00Z",
+        ))])
+        carried.update({"created_at": "2026-10-02T13:00:00Z", "started_at": "2026-10-02T13:00:00Z", "updated_at": "2026-10-02T13:10:00Z"})
+        self.write(self.root / "ci" / "2026-10.jsonl", first, carried)
+
+        rows = self.waiting_rows()
+        zone = datetime.fromisoformat(at.replace("Z", "+00:00")).astimezone().strftime("%H:%M %Z")
+        self.assertEqual(rows["Build-folder turn"], [
+            f"10.0 min (alpha, {zone})", "3", "4 of 5 calls", "0.5 seat-hours",
+            "alpha 16.0 min, beta 7.0 min, gamma 4.0 min",
+        ])
+        self.assertEqual(rows["Memory admission"], [
+            f"15.0 min (alpha impl, {zone})", "3", "3 of 4 steps", "0.5 seat-hours",
+            "alpha 15.0 min, beta 10.0 min, gamma 6.0 min",
+        ])
+        self.assertEqual(rows["CI queue"], [
+            f"10.0 min (CI / Alpha, {zone})", "3", "3 of 4 jobs", "0.4 job-hours",
+            "CI / Alpha 10.0 min, CI / Beta 7.0 min, CI / Gamma 6.0 min",
+        ])
+
+    def test_waiting_rows_remain_visible_when_no_wait_was_recorded(self) -> None:
+        rows = self.waiting_rows()
+        self.assertEqual(rows, {name: ["none", "", "", "", ""] for name in
+                                ("Build-folder turn", "Memory admission", "CI queue")})
+
     def write_release(self, trial: rust_release.TrialOutcome, pin: str | None = "1.99.0") -> None:
         state: rust_release.ReleaseState = {
             "check_day": "2026-11-12",
@@ -523,6 +581,20 @@ class ReportTests(unittest.TestCase):
         self.assertIn("| scratch (temp folders) | 1 | 0 | 1.0 s | 1.0 s |  |  |  |", lines)
         self.assertNotIn("steps under a temp folder", text)
 
+    def test_launch_in_temp_folder_counts_host_for_caller_labels(self) -> None:
+        self.write(
+            self.root / "natedev" / "2026-10.jsonl",
+            step("local", host="natedev", caller="verify", step="check"),
+        )
+        self.write(
+            self.root / "mac" / "2026-10.jsonl",
+            step("launch", host="mac", caller="brp-launch", step="build", cwd="/tmp/app"),
+        )
+
+        lines = self.render().splitlines()
+        self.assertTrue(any(line.startswith("| verify.sh (agents) (natedev) |") for line in lines))
+        self.assertTrue(any(line.startswith("| example launches (brp) (mac) |") for line in lines))
+
     def test_ci_queue_summary_when_all_queue_times_are_known(self) -> None:
         self.write(
             self.root / "ci" / "2026-10.jsonl",
@@ -547,7 +619,9 @@ class ReportTests(unittest.TestCase):
 
         summary = next(line for line in self.render("2026-10-02").splitlines() if line.startswith("CI: "))
         self.assertEqual(summary.split("; ", 1)[1], "jobs queued 30.0 s on average.")
+        self.assertEqual(self.waiting_rows()["CI queue"][2], "1 of 1 jobs")
         self.assertIn("CI: no runs.", self.render("2026-10-03"))
+        self.assertEqual(self.waiting_rows("2026-10-03")["CI queue"], ["none", "", "", "", ""])
 
     def test_ci_queue_summary_counts_unknown_times_but_not_skipped_jobs_as_left_out(self) -> None:
         original = ("2026-10-02T12:00:00Z", "2026-10-02T12:00:30Z", "2026-10-02T12:02:30Z")
