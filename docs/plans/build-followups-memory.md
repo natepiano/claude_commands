@@ -263,37 +263,29 @@ Measured 2026-10-04 11:59–12:25 PDT, read-only, from the earlyoom journal, the
 
 **Ruled out:** a Claude Code hook on `brp_launch` (a settings change); a buildlog record written from inside bevy_brp_mcp (a published crate in another repository); appending launches to the host's monthly file (the per-launch file makes the record id the dedupe); counting a timed-out token wait as zero (it is real queueing time).
 
-### Phase 10 — A build waits for free memory, not for the slice's soft limit · status: todo
+### Phase 10 — A build waits for free memory, not for the slice's soft limit · status: done
 
-#### Work Order
+#### As-built
 
-**Goal:** a build step waits to start while the machine has less than 12 GiB of memory available, the floor below which steve stops handing out build slots, instead of while `builds.slice` sits above its `memory.high`, which the slice no longer has.
-
-**Source:** natedev (showrunner), 2026-10-04 19:29 PDT, accepting the unit director's memory proposal. `/etc/nixos` 6459e48 drops `builds.slice`'s MemoryHigh, raises its MemoryMax from 34G to 44G and keeps MemorySwapMax 4G, and gives MemoryLow 8G to `user.slice`, `user-1000.slice`, `user@1000.service` and `app.slice`; it went live at 19:36 PDT (generation 199), when the user also reverted the runtime override (MemoryHigh 38G, MemoryMax 44G) applied at 19:21 PDT. natedev read it live: `memory.high` max, `memory.max` 44.0G, `memory.low` 8.0G at all four levels, MemAvailable 42 GiB. Measured on 2026-10-04: MemoryHigh throttled every build for 45 minutes over one test run's growth; the slice's process memory reached 31.1 GiB with 18.5 million `high` events, no `max` event and no kill; widget's full test step peaked at 19.2–25.4 GiB; 25 test binaries came to about 12 GiB of page cache, which `memory.high` and `memory.current` both count. Since then `memory.high` reads `max` and today's admission (`buildlog_wait_for_memory`, `scripts/lint/invoke.sh:107-130`) returns at once on every step (`:115`), so builds have no admission at all until this phase lands. steve already stops handing out slots while MemAvailable is under 12 GiB (`--min-memory-avail 12288`, `/etc/nixos/modules/linux/jobserver.nix:32-37`), and earlyoom acts at about 3 GiB.
-
-**Spec:**
-- **What it waits on.** `buildlog_wait_for_memory` waits while the machine's `MemAvailable` is under 12 GiB (12288 MiB, steve's floor). It reads `/proc/meminfo`; `BUILDLOG_MEMINFO` names another file, and every test sets it. A file that is missing or unreadable, or has no `MemAvailable` line with a whole number of kB, means no wait. It no longer reads `memory.high` or `memory.current`, and no longer reads `BUILDLOG_BUILDS_CGROUP` (`memory.py` and `sample.py` still read that variable for their own figures).
-- **Every step waits.** `run_once` (`scripts/lint/invoke.sh:172-179`) calls the gate only when `BUILDLOG_PEAK` is set, so a step that records nothing (`BUILDLOG_SCOPE=0`) has no admission today. The gate runs for every build step; only a recorded step's `started_at` and `mem_wait_s` take the wait.
-- **What it says.** On its first check below the floor it prints once to stderr `waiting for memory since HH:MM PDT: the machine has X.X GiB free; a build starts at 12.0` (the time in America/Los_Angeles with its zone, X.X the MemAvailable it read). It rechecks every `BUILDLOG_MEM_POLL_S` seconds (5 by default) and after `BUILDLOG_MEM_WAIT_LIMIT_S` (900 by default) prints `memory wait limit reached after 15 min; starting anyway` and starts. These two knobs, `BUILDLOG_MEM_WAIT_S`, and the step's start time, which excludes the wait, keep their Phase 2 meaning, so `steps.mem_wait_s` and the Waiting section's Memory admission row read the same as before.
-- **Ruled out:** a per-run memory cap in verify.sh (natedev, 2026-10-04: widget's drawn-pixel test group already bounds the largest step); keeping a `memory.high` gate beside the new one (the slice has none since 6459e48, and a page-cache count throttles builds that are not short of memory).
-- **Tests,** with a fixture meminfo file under a temporary root and never the real `/proc/meminfo` or cgroup tree: a step waits while the file shows under 12 GiB and starts once it shows 12 GiB or more, with its wait in `mem_wait_s` and its start time after the wait; the message prints once with the free figure and its zone; the limit message prints and the step starts; a missing file, a file with no `MemAvailable` line and a non-numeric value each mean no wait; a step run with `BUILDLOG_SCOPE=0` waits too. The routing test that sets `BUILDLOG_BUILDS_CGROUP` for invoke.sh's sake (`scripts/delegate/test_verify_token_wait.py:91`) points `BUILDLOG_MEMINFO` at a file well above the floor instead.
+- `buildlog_wait_for_memory` holds a step while `MemAvailable` in `${BUILDLOG_MEMINFO:-/proc/meminfo}` is under 12 GiB (12582912 kB, steve's slot floor), polling every `BUILDLOG_MEM_POLL_S` (5 s) up to `BUILDLOG_MEM_WAIT_LIMIT_S` (900 s), then prints `memory wait limit reached after 15 min; starting anyway`.
+- Its first read below the floor prints once to stderr `waiting for memory since HH:MM PDT: the machine has X.X GiB free; a build starts at 12.0`. A missing or unreadable file, or no `MemAvailable: <digits> kB` line, means no wait.
+- `run_once` gates every step that compiles, recorded or not (`BUILDLOG_SCOPE=0` too); `buildlog_step_compiles` lets `*/sweep.py` and `cargo [+toolchain] fmt` start at once.
+- The clock starts at the first below-floor read, so `BUILDLOG_MEM_WAIT_S` → `steps.mem_wait_s` is non-zero only when the gate waited; a recorded step's `started_at` is taken after the wait.
 
 **Files:**
-- `scripts/lint/invoke.sh` — `buildlog_wait_for_memory` waits on MemAvailable
-- `scripts/buildlog/test_record.py` — the memory admission cases (`:193-250` today)
-- `scripts/delegate/test_verify_token_wait.py` — its fixture points `BUILDLOG_MEMINFO` above the floor
+- `scripts/lint/invoke.sh` — the gate, `buildlog_step_compiles`, the call in `run_once`
+- `scripts/buildlog/test_record.py` — admission cases on fixture meminfo files, incl. a FIFO slow read above the floor and sweep/fmt exemptions
+- `scripts/delegate/test_verify_token_wait.py` — routing fixture points `BUILDLOG_MEMINFO` at a 48 GiB meminfo
 
-**Seats:** `1 writer + 1 tester` — the gate and its tests split by file.
-- `impl` — `scripts/lint/invoke.sh`; hub: `scripts/lint/invoke.sh`
-- `test` — `scripts/buildlog/test_record.py`, `scripts/delegate/test_verify_token_wait.py`, written from the Spec alone
+**Binds later work:** a Memory admission entry means a real wait below 12 GiB MemAvailable; the gate's three ends (released, limit reached, no reading → no wait) map to `PastMemoryWait`'s `Granted`, `TimedOut`, `MeminfoUnavailable`; the disk-floor sweep is never held by the gate.
 
-**Constraints from prior phases:**
-- Phase 2: `invoke.sh` runs each step in a `builds.slice` scope; `run_once` calls `buildlog_wait_for_memory` before the step (`:176`), the step's `started_at` excludes the wait, and the waited seconds reach `steps.mem_wait_s` through `BUILDLOG_MEM_WAIT_S`. A pipe element runs in a subshell, so the wait and its seconds stay before the pipe.
-- Phase 9: the Waiting section's Memory admission row reads `steps.mem_wait_s` on the day; the index is schema 9. `test_verify_token_wait.py` runs real verify.sh routing with a cargo stub on `PATH`.
-- Tests never read the real `/proc/meminfo`, cgroup tree or journal, never write `~/.local/state/buildlog` or `~/.local/state/build-hold`, and never build.
-- Times carry their zone; natedev's clock and journal are EDT, and this plan states PDT.
+**Gotchas:**
+- `invoke_sweep` runs `sweep.py` through `run_once`, so any step-level gate reaches the sweep unless `buildlog_step_compiles` exempts it.
+- The gate sets `BUILDLOG_MEM_WAIT_S` in the calling shell, so it runs before the `buildlog_exec | tee` pipe.
+- The limit message says "15 min" whatever `BUILDLOG_MEM_WAIT_LIMIT_S` holds.
+- Tests never read the real `/proc/meminfo`; `memory.py` and `sample.py` still read `BUILDLOG_BUILDS_CGROUP`, the gate does not.
 
-**Acceptance gate:** `python3 -m unittest discover -s scripts/buildlog -p 'test_*.py'` and `python3 -m unittest discover -s scripts/delegate -p 'test_verify_*.py'` green; `bash -n scripts/lint/invoke.sh`; `basedpyright` 0 errors and 0 warnings on changed Python.
+**Ruled out:** a `memory.high` gate — `builds.slice` has no MemoryHigh (MemoryMax 44G), and `memory.high` counts page cache, throttling builds not short of memory; a per-run memory cap in verify.sh — widget's drawn-pixel test group already bounds the largest step.
 
 ### Phase 11 — A sweep that clears build caches for something else says so · status: todo
 
@@ -434,6 +426,7 @@ Baseline before the diff: natedev's stopgap 160efd9 put CI in steve on 2026-10-0
 - Live since 2026-10-04: sccache in the foreground (nixos e669461), `hana-ci.slice` with no MemoryHigh and its runners at OOMPolicy=continue (087c7c1), no CARGO_BUILD_JOBS (832dad4); the CI jobserver check is closed. This supersedes Phase 2's notes that the machine half is not live and that `CARGO_BUILD_JOBS` stays at 8: plan no deployment or jobserver change from them.
 - Phase 4: each holder file in `~/.local/state/build-hold/` (`BUILD_HOLD_DIR` overrides it; tests always set it) is one JSON line `{"holder", "since", "for", "release_eta"}`, where `release_eta` is an ISO instant or `unknown`; the old one-line form still reads. `scripts/build_hold/build_hold.py` has `hold` (`--release-eta HH:MM` needs `--zone`), `quiet`, `release` and `status`. `release` prints `released, builds may resume.` only when no holder file remains, else `released; still held by …`. `quiet` is busy while this user's `cargo`, `rustc` or `cargo-nextest` runs or the 1-minute load is at or above a quarter of the cores, and waits at most 10 minutes; `ps` needs `user:32`, or procps cuts long names. `HoldState = NoHolders | ActiveHolders`, `ReleaseEta = KnownReleaseEta | UnknownReleaseEta`, and `quiet_verdict` takes `Cores = KnownCores | UnknownCores` (Phase 5). `dailies_render.py` reads holds through `read_dailies_hold()` and refuses a unit marker with no holder file, active holders with no marked unit, and plumbing words in a holder's purpose. `scripts/buildlog/rust_release.py` treats any regular file in the hold directory as a hold.
 - Times carry their zone; natedev's clock and journal are EDT, and this plan states PDT.
+- Phase 10: `buildlog_wait_for_memory` (`scripts/lint/invoke.sh`) waits while `MemAvailable` is under 12 GiB (`BUILDLOG_MEMINFO`, default `/proc/meminfo`) before every step that compiles, recorded or not; `buildlog_step_compiles` lets `sweep.py` and `cargo [+toolchain] fmt` start at once; `steps.mem_wait_s` is non-zero only when the gate waited.
 
 **Acceptance gate:** the original day reported at 2026-10-05 15:26 PDT; each newer control (CI's pool from 18:43 PDT, the builds slice from 19:36 PDT, Phase 10's admission once live) labeled provisional until its own complete day, with its workload and snapshot coverage; the day's report, each CI run's figures, the threshold and the conclusions written in this phase, each figure's window complete or marked inconclusive; the staggering verdict stated; `bash -n` on any changed shell.
 
@@ -471,6 +464,7 @@ Baseline before the diff: natedev's stopgap 160efd9 put CI in steve on 2026-10-0
 - Holder files in `~/.local/state/build-hold/` (`BUILD_HOLD_DIR` overrides it; tests always set it) are one JSON line `{"holder", "since", "for", "release_eta"}`; `read_holders` and `scripts/buildlog/rust_release.py` treat every regular file there as a hold. `release` prints `released, builds may resume.` only when no holder file remains. `ReleaseEta = KnownReleaseEta | UnknownReleaseEta`; `quiet_verdict` takes `Cores = KnownCores | UnknownCores`.
 - Tests never write `~/.local/state/build-hold` or the real release directory.
 - Phase 6's example-test guard is reverted on build-followups as df7301b until hana's examples fix lands; the showrunner restores it by reverting df7301b. With the guard present, `verify.sh test <pkg>` (gate run) and `verify.sh final` refuse an example holding `#[cfg(test)]` with `test = false` (exit 2) before the cache lookup and before any build. The acknowledgement goes at the first build step past the memory wait, so it follows that refusal either way; while the guard is reverted, the routing test drops its example-gate case. If the Follow-up's "examples carry no tests" rule lands first, the guard refuses any example holding `#[cfg(test)]`. `git show 7692f80:scripts/delegate/test_verify_untested_examples.py` shows the pattern for running real verify.sh routing with stubs on `PATH` (cargo passes `metadata` through; git is stubbed so the pass-record key is fixed).
+- Phase 10: `buildlog_wait_for_memory` (`scripts/lint/invoke.sh`) waits while `MemAvailable` is under 12 GiB (`BUILDLOG_MEMINFO`, default `/proc/meminfo`) before every step that compiles, recorded or not; `buildlog_step_compiles` lets `sweep.py` and `cargo [+toolchain] fmt` start at once; `steps.mem_wait_s` is non-zero only when the gate waited.
 
 **Acceptance gate:** `python3 -m unittest discover -s scripts/build_hold -p 'test_*.py'`, `python3 -m unittest discover -s scripts/delegate -p 'test_verify_release_ack.py'` and `python3 -m unittest discover -s scripts/production -p 'test_dailies_render*.py'` green; `bash -n scripts/lint/invoke.sh`; `basedpyright` 0 errors and 0 warnings on changed Python.
 

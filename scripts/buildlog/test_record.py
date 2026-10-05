@@ -7,11 +7,13 @@ import gzip
 import json
 import os
 import re
+import select
 import shutil
 import socket
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from datetime import UTC, datetime
 from pathlib import Path
@@ -191,10 +193,8 @@ class RecordTests(unittest.TestCase):
         self.assertEqual(record["duration_s"], 12.5)
 
     def test_piped_run_records_memory_wait_outside_step_duration(self) -> None:
-        cgroup = self.base / "builds.slice"
-        cgroup.mkdir()
-        _ = (cgroup / "memory.high").write_text(f"{2**30}\n")
-        _ = (cgroup / "memory.current").write_text(f"{2 * 2**30}\n")
+        meminfo = self.base / "meminfo"
+        _ = meminfo.write_text("MemAvailable: 11534336 kB\n")
         runtime = self.base / "runtime" / "systemd"
         runtime.mkdir(parents=True)
         with socket.socket(socket.AF_UNIX) as manager:
@@ -209,49 +209,190 @@ class RecordTests(unittest.TestCase):
                 'source "$1"; BUILDLOG_RECORD="$2"; sweep_after_step() { :; }; '
                 'run_once bash -c "printf step\\n"'
             )
-            result = subprocess.run(
+            process = subprocess.Popen(
                 ["bash", "-c", command, "bash", str(SCRIPT.parent.parent / "lint" / "invoke.sh"), str(SCRIPT)],
                 cwd=self.repo,
                 env=self.environment(
                     PATH=f"{self.base}:{os.environ['PATH']}",
                     XDG_RUNTIME_DIR=str(runtime.parent),
-                    BUILDLOG_BUILDS_CGROUP=str(cgroup), BUILDLOG_MEM_POLL_S="1", BUILDLOG_MEM_WAIT_LIMIT_S="1",
+                    BUILDLOG_OFF="0", BUILDLOG_SCOPE="1",
+                    BUILDLOG_MEMINFO=str(meminfo), BUILDLOG_MEM_POLL_S="1", BUILDLOG_MEM_WAIT_LIMIT_S="5",
                     BUILDLOG_SYNC="1",
                 ),
-                capture_output=True, text=True, check=False, timeout=10,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
             )
-        self.assertEqual(result.returncode, 0, result.stderr)
+            try:
+                assert process.stderr is not None
+                readable, _, _ = select.select([process.stderr], [], [], 5)
+                self.assertTrue(readable, "memory wait message did not arrive")
+                first_message = cast(str, process.stderr.readline())
+                self.assertIn("waiting for memory since ", first_message)
+                time.sleep(1.1)
+                released_at = time.time()
+                _ = meminfo.write_text("MemAvailable: 12582912 kB\n")
+                output, remaining_errors = process.communicate(timeout=8)
+                errors = first_message + remaining_errors
+            finally:
+                if process.poll() is None:
+                    process.kill()
+                    _ = process.communicate()
+        self.assertEqual(process.returncode, 0, errors)
+        self.assertIn("step", output)
+        self.assertEqual(errors.count("waiting for memory since "), 1)
+        self.assertNotIn("memory wait limit reached", errors)
         record = self.records()[-1]
         wait = record["mem_wait_s"]
         duration = record["duration_s"]
+        started = datetime.fromisoformat(str(record["started_at"]).replace("Z", "+00:00")).timestamp()
         assert isinstance(wait, int)
         assert isinstance(duration, (int, float))
         self.assertGreaterEqual(wait, 1)
+        self.assertGreaterEqual(started, released_at - 0.01)
         self.assertLess(duration, 0.8)
 
-    def test_memory_admission_waits_and_explains_limit(self) -> None:
-        cgroup = self.base / "builds.slice"
-        cgroup.mkdir()
-        _ = (cgroup / "memory.high").write_text(f"{2**30}\n")
-        _ = (cgroup / "memory.current").write_text(f"{2 * 2**30}\n")
+    def test_memory_admission_explains_limit_once(self) -> None:
+        meminfo = self.base / "meminfo"
+        _ = meminfo.write_text("MemAvailable: 11010048 kB\n")
         command = 'source "$1"; buildlog_wait_for_memory; printf "%s\\n" "$BUILDLOG_MEM_WAIT_S"'
-        environment = self.environment(BUILDLOG_BUILDS_CGROUP=str(cgroup), BUILDLOG_MEM_POLL_S="1", BUILDLOG_MEM_WAIT_LIMIT_S="1")
+        environment = self.environment(BUILDLOG_MEMINFO=str(meminfo), BUILDLOG_MEM_POLL_S="1", BUILDLOG_MEM_WAIT_LIMIT_S="1")
         result = subprocess.run(
             ["bash", "-c", command, "bash", str(SCRIPT.parent.parent / "lint" / "invoke.sh")],
             env=environment, capture_output=True, text=True, check=False, timeout=5,
         )
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertRegex(result.stderr, r"waiting for memory since \d\d:\d\d P[DS]T: builds use 2\.0 of 1\.0 GiB")
+        self.assertRegex(result.stderr, r"waiting for memory since \d\d:\d\d P[DS]T: the machine has 10\.5 GiB free; a build starts at 12\.0")
+        self.assertEqual(result.stderr.count("waiting for memory since "), 1)
         self.assertIn("memory wait limit reached after 15 min; starting anyway", result.stderr)
         self.assertGreaterEqual(int(result.stdout.strip()), 1)
-        missing = self.base / "missing.slice"
-        result = subprocess.run(
+
+    def test_memory_admission_skips_unreadable_or_invalid_meminfo(self) -> None:
+        command = 'source "$1"; buildlog_wait_for_memory; printf "%s\\n" "$BUILDLOG_MEM_WAIT_S"'
+        cases = {
+            "missing": self.base / "missing-meminfo",
+            "unreadable": self.base / "directory",
+            "no available line": self.base / "without-available",
+            "non-numeric available": self.base / "invalid-available",
+            "at floor": self.base / "at-floor",
+            "above floor": self.base / "above-floor",
+        }
+        cases["unreadable"].mkdir()
+        _ = cases["no available line"].write_text("MemFree: 1000 kB\n")
+        _ = cases["non-numeric available"].write_text("MemAvailable: unknown kB\n")
+        _ = cases["at floor"].write_text("MemAvailable: 12582912 kB\n")
+        _ = cases["above floor"].write_text("MemAvailable: 13631488 kB\n")
+        for name, meminfo in cases.items():
+            with self.subTest(name=name):
+                result = subprocess.run(
+                    ["bash", "-c", command, "bash", str(SCRIPT.parent.parent / "lint" / "invoke.sh")],
+                    env=self.environment(BUILDLOG_MEMINFO=str(meminfo)),
+                    capture_output=True, text=True, check=False, timeout=5,
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(result.stderr, "")
+                self.assertEqual(result.stdout.strip(), "0")
+
+    def test_memory_admission_does_not_count_a_slow_read_above_floor(self) -> None:
+        meminfo = self.base / "meminfo-fifo"
+        os.mkfifo(meminfo)
+        command = 'source "$1"; SECONDS=0; printf "ready\\n"; buildlog_wait_for_memory; printf "%s\\n" "$BUILDLOG_MEM_WAIT_S"'
+        process = subprocess.Popen(
             ["bash", "-c", command, "bash", str(SCRIPT.parent.parent / "lint" / "invoke.sh")],
-            env=self.environment(BUILDLOG_BUILDS_CGROUP=str(missing)), capture_output=True, text=True, check=False, timeout=5,
+            env=self.environment(BUILDLOG_MEMINFO=str(meminfo)),
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        )
+        try:
+            assert process.stdout is not None
+            self.assertEqual(process.stdout.readline(), "ready\n")
+            time.sleep(1.1)
+            with meminfo.open("w") as writer:
+                _ = writer.write("MemAvailable: 12582912 kB\n")
+            output, errors = process.communicate(timeout=5)
+        finally:
+            if process.poll() is None:
+                process.kill()
+                _ = process.communicate()
+        self.assertEqual(process.returncode, 0, errors)
+        self.assertEqual(errors, "")
+        self.assertEqual(output.strip(), "0")
+
+    def test_sweep_step_starts_without_memory_wait(self) -> None:
+        sweep = self.base / "sweep.py"
+        _ = sweep.write_text('print("sweep started")\n')
+        self.assert_step_starts_without_memory_wait([sys.executable, str(sweep)], "sweep started")
+
+    def test_cargo_fmt_step_starts_without_memory_wait(self) -> None:
+        cargo = self.base / "cargo"
+        _ = cargo.write_text('#!/bin/sh\nprintf "fmt started\\n"\n')
+        cargo.chmod(0o755)
+        for toolchain in ([], ["+nightly"]):
+            with self.subTest(toolchain=toolchain):
+                self.assert_step_starts_without_memory_wait(["cargo", *toolchain, "fmt"], "fmt started")
+
+    def assert_step_starts_without_memory_wait(self, argv: list[str], output_line: str) -> None:
+        meminfo = self.base / "meminfo"
+        _ = meminfo.write_text("MemAvailable: 11534336 kB\n")
+        command = (
+            'source "$1"; BUILDLOG_RECORD="$2"; sweep_after_step() { :; }; '
+            'shift 2; run_once "$@"; printf "wait=%s\\n" "$BUILDLOG_MEM_WAIT_S"'
+        )
+        result = subprocess.run(
+            ["bash", "-c", command, "bash", str(SCRIPT.parent.parent / "lint" / "invoke.sh"), str(SCRIPT), *argv],
+            cwd=self.repo,
+            env=self.environment(PATH=f"{self.base}:{os.environ['PATH']}", BUILDLOG_OFF="0", BUILDLOG_SCOPE="0",
+                                 BUILDLOG_MEMINFO=str(meminfo), BUILDLOG_MEM_POLL_S="1",
+                                 BUILDLOG_MEM_WAIT_LIMIT_S="0", BUILDLOG_SYNC="1"),
+            capture_output=True, text=True, check=False, timeout=5,
         )
         self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn(output_line, result.stdout)
+        self.assertIn("wait=0", result.stdout)
         self.assertEqual(result.stderr, "")
-        self.assertEqual(result.stdout.strip(), "0")
+        self.assertEqual(self.records()[-1]["mem_wait_s"], 0)
+
+    def test_unscoped_step_waits_for_memory(self) -> None:
+        meminfo = self.base / "meminfo"
+        _ = meminfo.write_text("MemAvailable: 11534336 kB\n")
+        marker = self.base / "step-started"
+        step = self.base / "step.sh"
+        _ = step.write_text('#!/bin/sh\n: > "$STEP_MARKER"\nprintf "step\\n"\n')
+        step.chmod(0o755)
+        command = (
+            'source "$1"; BUILDLOG_RECORD="$2"; sweep_after_step() { :; }; '
+            'run_once "$3"; printf "wait=%s\\n" "$BUILDLOG_MEM_WAIT_S"'
+        )
+        process = subprocess.Popen(
+            ["bash", "-c", command, "bash", str(SCRIPT.parent.parent / "lint" / "invoke.sh"), str(SCRIPT), str(step)],
+            cwd=self.repo,
+            env=self.environment(BUILDLOG_OFF="0", BUILDLOG_SCOPE="0", BUILDLOG_MEMINFO=str(meminfo),
+                                 BUILDLOG_MEM_POLL_S="1", BUILDLOG_MEM_WAIT_LIMIT_S="5", BUILDLOG_SYNC="1",
+                                 STEP_MARKER=str(marker)),
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        )
+        try:
+            assert process.stderr is not None
+            readable, _, _ = select.select([process.stderr], [], [], 5)
+            self.assertTrue(readable, "memory wait message did not arrive")
+            first_message = cast(str, process.stderr.readline())
+            self.assertIn("waiting for memory since ", first_message)
+            self.assertFalse(marker.exists())
+            time.sleep(1.1)
+            released_at = time.time()
+            _ = meminfo.write_text("MemAvailable: 12582912 kB\n")
+            output, remaining_errors = process.communicate(timeout=8)
+            errors = first_message + remaining_errors
+        finally:
+            if process.poll() is None:
+                process.kill()
+                _ = process.communicate()
+        self.assertEqual(process.returncode, 0, errors)
+        self.assertIn("step", output)
+        self.assertRegex(output, r"wait=[1-9][0-9]*")
+        self.assertNotIn("memory wait limit reached", errors)
+        self.assertGreaterEqual(marker.stat().st_mtime, released_at)
+        record = self.records()[-1]
+        started = datetime.fromisoformat(str(record["started_at"]).replace("Z", "+00:00")).timestamp()
+        self.assertGreaterEqual(started, released_at - 0.01)
+        self.assertEqual(record["mem_wait_s"], int(output.split("wait=")[-1].strip()))
 
     def test_scope_memory_names_its_values_and_marks_missing_stalls_unmeasured(self) -> None:
         peak = self.peak_file()
