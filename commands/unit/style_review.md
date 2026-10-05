@@ -1,6 +1,10 @@
+---
+description: Run the end-of-run style audit over a delegate run's branch.
+---
+
 # Delegate — style review
 
-**Usage:** `/unit:delegate_style`
+**Usage:** `/unit:style_review`
 
 Type this when a run reached its end without the style audit, or when you want
 the audit re-run over the project's branch. It runs inside the current session

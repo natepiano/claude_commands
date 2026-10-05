@@ -64,13 +64,13 @@ it:
 
 | Contract | File | Command |
 | --- | --- | --- |
-| <ProgressReport/> | `commands/unit/delegate_report.md` | `/unit:delegate_report` |
-| <VerbosePostPhaseReport/>, <CombinedWindowReport/>, <RemainingWorkOutlook/> | `commands/unit/delegate_phase_report.md` | `/unit:delegate_phase_report` |
-| <CheckpointCommit/>, <PushCheckpoint/> | `commands/unit/delegate_checkpoint.md` | `/unit:delegate_checkpoint` |
-| <ConsiderNextItems/>, <ReviewPendingAddOns/> | `commands/unit/delegate_next.md` | `/unit:delegate_next` |
-| <ResolveStyleDiffBase/>, <RunProjectStyleReview/> | `commands/unit/delegate_style.md` | `/unit:delegate_style` |
-| <PeriodicCI/>, <CICleanup/> | `commands/unit/delegate_ci.md` | `/unit:delegate_ci` |
-| <VerbosePrePhaseGate/>, <BriefingFreshness/>, <PhaseBriefing/>, <TypeTableCells/>, <CombinedWindowBriefing/>, <AutoWindowBatchBriefing/> | `commands/unit/delegate_brief.md` | `/unit:delegate_brief` |
+| <ProgressReport/> | `commands/unit/report.md` | `/unit:report` |
+| <VerbosePostPhaseReport/>, <CombinedWindowReport/>, <RemainingWorkOutlook/> | `commands/unit/phase_report.md` | `/unit:phase_report` |
+| <CheckpointCommit/>, <PushCheckpoint/> | `commands/unit/checkpoint.md` | `/unit:checkpoint` |
+| <ConsiderNextItems/>, <ReviewPendingAddOns/> | `commands/unit/add_ons.md` | `/unit:add_ons` |
+| <ResolveStyleDiffBase/>, <RunProjectStyleReview/> | `commands/unit/style_review.md` | `/unit:style_review` |
+| <PeriodicCI/>, <CICleanup/> | `commands/unit/ci.md` | `/unit:ci` |
+| <VerbosePrePhaseGate/>, <BriefingFreshness/>, <PhaseBriefing/>, <TypeTableCells/>, <CombinedWindowBriefing/>, <AutoWindowBatchBriefing/> | `commands/unit/brief.md` | `/unit:brief` |
 | <ComposeWorkOrder/> | `docs/delegate/compose_work_order.md` | — |
 | <WritePromptContract/>, <PhaseTeam/>, <CoordinationBoard/>, <PhaseMesh/>, <BuildTokenContract/>, <TeamFilePartition/>, <RoleReassignment/> | `docs/delegate/write_prompt_contract.md` | — |
 | <LaunchImplementation/> | `docs/delegate/launch_implementation.md` | — |
@@ -183,6 +183,11 @@ under that directory. This avoids half-applied durable-state writes.
 - Codex: launch the same command in a managed unified-exec terminal with
   `tty: true` and a short initial yield; retain its returned `session_id`. Do not
   shell-background the launcher: it waits for its worker and remains attached.
+- Saved run output (traces, captures, logs) stays under a few GB: read each run
+  and delete it before the next. A disk-floor sweeper keeps 500 GiB free on `/`
+  by deleting every unit's build caches. Ask natedev for room before a run that
+  must keep more. Put this rule in every seat and helper prompt that saves
+  output. User, 2026-10-04: 300 GB of traces cost 235 GiB of caches.
 </ToolingContract>
 
 <DispatchContract>
@@ -480,7 +485,7 @@ The agent arms nothing. When `prepare_session.sh` prints `notifier instance not
 created`, say so in one line: this run gets no ticks until
 `zsh ~/.claude/scripts/delegate/unit_notifier.sh "$CLAUDE_CODE_SESSION_ID"`
 succeeds. While work runs, the notifier sends
-`/unit:delegate_report` from `delegate-<run id>` every interval. That message
+`/unit:report` from `delegate-<run id>` every interval. That message
 is the Claude tick. Each `progress_history.py progress` call restarts its
 clock; `--hold` keeps at most one tick waiting.
 
@@ -499,11 +504,11 @@ which is why <PassOwnership/> forbids faking a pass for the same purpose.
 
 On a Claude notifier tick or Codex poll timeout, compose the update per
 <ProgressReport/>, which
-`~/.claude/commands/unit/delegate_report.md` defines in full. Read that file and
+`~/.claude/commands/unit/report.md` defines in full. Read that file and
 follow it; a report written from memory of an earlier read drops the
 byte-for-byte copy rule first. It also owns this tick's <EarlyReviewArm/>
 trigger point and the query that answers questions about work already finished.
-The user can invoke the same file as `/unit:delegate_report`.
+The user can invoke the same file as `/unit:report`.
 
 After a Codex report, return to <CodexDispatchWait/> on the same session and
 read the interval again before polling. A tick never replaces the completion
@@ -551,7 +556,7 @@ required gate that cannot run, or delegate/environment error. It never stops
 for add-ons: <ConsiderNextItems/> accumulates them, and <ReviewPendingAddOns/>
 walks them only at an interactive point — one of those stops once its decision
 is resolved, a verbose gate outside a window, a user instruction that is more
-than an authorization word, <RunSummary/>, or `/unit:delegate_next`. The
+than an authorization word, <RunSummary/>, or `/unit:add_ons`. The
 findings ledger is not on this list and never joins it: a
 convergence advisory is reported and the round runs. Everything else
 auto-routes, resequences, or defers. Verbose adds only its authorization gates.
@@ -635,14 +640,14 @@ follow <AuthorizationContract/>.
 </ComposeWorkOrder>
 
 <ResolveStyleDiffBase>
-Read `~/.claude/commands/unit/delegate_style.md` in full and apply it once per
+Read `~/.claude/commands/unit/style_review.md` in full and apply it once per
 run, before the first dispatch. Loop and verbose only; `single` skips it and
 never sets a base. That file defines this contract and <RunProjectStyleReview/>.
 Never resolve the base from memory of an earlier read. On the default branch
 with no other local branches and no branch named by the user, the run continues
 on the default branch without asking; only a detached HEAD or other existing
 branches raise the branch question, asked exactly once while dispatch waits.
-The user can invoke the same file as `/unit:delegate_style`.
+The user can invoke the same file as `/unit:style_review`.
 </ResolveStyleDiffBase>
 
 <DelegatedPhaseReservationContract>
@@ -767,10 +772,10 @@ result.
 </BerthDecisions>
 
 <VerbosePrePhaseGate>
-Read `~/.claude/commands/unit/delegate_brief.md` in full at every pre-phase gate,
+Read `~/.claude/commands/unit/brief.md` in full at every pre-phase gate,
 briefing, or auto control, and before a phase report's types table. It also defines
 <BriefingFreshness/>, <PhaseBriefing/>, <TypeTableCells/>, <CombinedWindowBriefing/>,
-and <AutoWindowBatchBriefing/>. The user can invoke it as `/unit:delegate_brief`.
+and <AutoWindowBatchBriefing/>. The user can invoke it as `/unit:brief`.
 </VerbosePrePhaseGate>
 
 <LaunchImplementation>
@@ -1115,13 +1120,13 @@ instructions name; with none, skip and say so in one line.
 </UXReview>
 
 <RunProjectStyleReview>
-Read `~/.claude/commands/unit/delegate_style.md` in full and apply it. This is
+Read `~/.claude/commands/unit/style_review.md` in full and apply it. This is
 the run's single style audit, over everything the project built rather than one
 phase: `single` runs it after first smoke, loop and verbose from <FinalGate/>.
 Phases never run it — they carry no style gate, and a phase checkpoint never
 waits on one. Never run it from memory of an earlier read; the after-cleanup
 reverification and the smoke reset are what get dropped. The user can invoke the
-same file as `/unit:delegate_style`.
+same file as `/unit:style_review`.
 </RunProjectStyleReview>
 
 <RunPhaseReview>
@@ -1131,7 +1136,7 @@ it before the checkpoint.
 </RunPhaseReview>
 
 <ConsiderNextItems>
-Read `~/.claude/commands/unit/delegate_next.md` in full and apply it after
+Read `~/.claude/commands/unit/add_ons.md` in full and apply it after
 shrink, at each phase boundary. Phased plans only; the unit director performs the
 assessment and never launches another agent for it. It writes `apply`
 corrections, accumulates every add-on in `${NEXT_ITEMS_PENDING}`, and asks
@@ -1140,23 +1145,23 @@ single-line reporting rule are what drift.
 </ConsiderNextItems>
 
 <ReviewPendingAddOns>
-Defined in `~/.claude/commands/unit/delegate_next.md`; read it in full before
+Defined in `~/.claude/commands/unit/add_ons.md`; read it in full before
 each run. It walks accumulated add-ons through `/adhoc_review` with
 `current / next / drop`, only at an interactive point and only when
 `${NEXT_ITEMS_PENDING}` is non-empty. It is the one route by which an add-on
 reaches the plan or `${NEXT_ITEMS_PATH}`. The user can invoke the same file as
-`/unit:delegate_next`.
+`/unit:add_ons`.
 </ReviewPendingAddOns>
 
 <CheckpointCommit>
-Read `~/.claude/commands/unit/delegate_checkpoint.md` in full and apply it once
+Read `~/.claude/commands/unit/checkpoint.md` in full and apply it once
 per completed phase. Loop and verbose only; `single` never commits.
 
 This is durable state with no cheap undo, so read the whole contract before
 acting on any part of it, and read the reservation record from disk. A value
 remembered from conversation, taken from the harness session mapping, or
 re-derived from current `HEAD` is not proof and will silently accept the wrong
-checkpoint. The user can invoke the same file as `/unit:delegate_checkpoint`.
+checkpoint. The user can invoke the same file as `/unit:checkpoint`.
 
 The phase does not complete until the reservation release is confirmed, so a
 failed or busy release applies <RetainDelegatedPhaseReservation/> rather than a
@@ -1202,14 +1207,14 @@ modes continue.
 </RecordPhaseCompletion>
 
 <VerbosePostPhaseReport>
-Read `~/.claude/commands/unit/delegate_phase_report.md` in full and apply it
+Read `~/.claude/commands/unit/phase_report.md` in full and apply it
 after a completed verbose phase outside an auto window. Inside an active window,
 emit no per-phase report; when the window's last phase completes, emit one
 combined report instead. That file defines this contract,
 <CombinedWindowReport/>, and <RemainingWorkOutlook/>. Never compose the report
 from memory of an earlier read — the phase count and the closing control line
 are what go missing. The user can invoke the same file as
-`/unit:delegate_phase_report`.
+`/unit:phase_report`.
 </VerbosePostPhaseReport>
 
 <VerbosePostPhaseGate>

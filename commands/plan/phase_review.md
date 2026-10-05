@@ -265,7 +265,7 @@ and accumulates the rest for <ReviewPendingAddOns/> at the run's next
 interactive point. Invoked standalone, write every `apply` proposal to
 `${NEXT_ITEMS_PATH}` now and report it as one line naming the count and the
 file; walk the `gate` proposals through <ReviewPendingAddOns/> in
-`~/.claude/commands/unit/delegate_next.md` before Step 6; then delete the
+`~/.claude/commands/unit/add_ons.md` before Step 6; then delete the
 artifact once every proposal is resolved.
 
 Do not route an `apply` proposal to the user under any framing — not as a

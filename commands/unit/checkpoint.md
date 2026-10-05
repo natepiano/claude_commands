@@ -1,6 +1,10 @@
+---
+description: Commit and push a finished delegate phase and release its reservation, when the run did not.
+---
+
 # Delegate — checkpoint
 
-**Usage:** `/unit:delegate_checkpoint`
+**Usage:** `/unit:checkpoint`
 
 Type this when a phase finished and was never committed, or when a run stopped
 between the commit and the reservation release. It runs inside the current
