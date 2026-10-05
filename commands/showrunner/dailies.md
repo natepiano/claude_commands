@@ -54,7 +54,9 @@ Read the current state, not memory, and check what you state the way
    the user's draft: `capture-pane -e` shows a suggestion dimmed (`ESC[2m`).
    Note when the ETA was stated. One stated over an hour ago gets `/unit:eta`
    this turn, and its `detail` reads `set HH:MM` until a new one arrives. User,
-   2026-10-04.
+   2026-10-04. An ETA already past is not shown as the ETA: send `/unit:eta`
+   and report `none measured - requested` until the new one comes. User,
+   2026-10-04 ("why does widget gantt lane say 17:26 ... when you ran this at 17:39?").
 4. **Merge branch.** Its last merge, whether it is pushed, and anything held or
    testing.
 5. **Open topics.** Everything in `LOG` not yet closed: held quota alerts, CI,
@@ -237,7 +239,8 @@ For every length:
   that does not report against a count in `held`. User, 2026-10-01.
 - **`update:` is the present only.** What the unit does now, not its history.
   It names no other phase number unless it says why that phase is here
-  (`because ...`); the renderer refuses one that does. Later work goes in `then`.
+  (`because ...`); the renderer refuses one that does. Later work goes in `then`,
+  never in both: an update says nothing about what follows this phase. User, 2026-10-04.
 - Plain words. Technical terms are fine where they are the right ones.
 - Name work by what it changes in the app, never by a unit director's own labels: no helper
   names (`look-b5`), batch letters or item numbers. The user does not see them.
@@ -257,6 +260,7 @@ For every length:
   | `its stale file holds from the merged work are released` | Production plumbing that changes nothing you see. | Leave it out. |
   | `the writer and tester are renaming every crate; file clashes get settled at its checkpoint` | Seat roles and plumbing. | `renaming Composite to Assembly in every crate's code and tests` |
   | `then: Phase 8 (fault words say what they hold)` | The plan's heading copied; it names no result you would notice (user, 2026-10-04). | `then: Phase 8 (error messages say clearly what went wrong)` |
+  | `the full widget tests and a live check run. The next fix, words on the first frame, starts once this phase merges.` | Repeats `then:` (user, 2026-10-04). | `the full widget tests and a live check run.` |
 
   A `phase:` or `then:` is never the plan's heading copied: say what you
   will notice in the app when it is done.

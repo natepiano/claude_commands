@@ -181,8 +181,12 @@ successful release in <CheckpointCommit/>, and after <FinalGateCommit/> and
    `git merge-base --is-ancestor origin/<branch> HEAD` fails, do not push. The
    note is `push skipped: origin/<branch> has commits this branch lacks`.
 3. **Push.** `git push -u origin <branch>`; on the default branch,
-   `git push origin HEAD:refs/heads/delegate/<plan-slug>`. Never force.
-4. **Failure.** A failed push does not fail the commit. The note is
+   `git push origin HEAD:refs/heads/delegate/<plan-slug>`. Never force. Run
+   each step as its own command, never joined to another with `;` or `&&`:
+   the allow list covers `git push` alone, and a joined line goes to the
+   auto-mode classifier as a whole.
+4. **Failure.** A failed push does not fail the commit, and never stops the
+   run. An auto-mode refusal is a failed push. The note is
    `push failed: <reason>`, and the next push carries both. For
    `sign_and_send_pubkey: signing failed … agent refused operation` or
    `Permission denied (publickey)`, run `github-warm-status`; when it reports
