@@ -794,6 +794,32 @@ class ReportTests(unittest.TestCase):
         self.assertIn("| other | 0.0 GiB |", lines)
         self.assertNotIn("| other | -20.0 GiB |", lines)
 
+    def test_disk_table_reads_old_and_new_snapshot_shapes(self) -> None:
+        base: disk.DiskSnapshot = {
+            "measured_at": "2026-10-04T16:14:00+00:00",
+            "host": "natedev",
+            "rows": [{"label": "/tmp", "bytes": 2**30}],
+            "used": 2 * 2**30,
+            "free": 3 * 2**30,
+            "floor": None,
+        }
+        disk.write_snapshot(base)
+        old_lines = report.disk_section()
+        expanded: disk.DiskSnapshot = {
+            **base,
+            "previous_measured_at": "2026-10-04T16:04:00+00:00",
+            "outside_build_caches": [{
+                "path": "/tmp/traces", "bytes": 2**30, "growth_bytes": 2**30,
+                "largest_child_path": None, "largest_child_growth_bytes": None,
+            }],
+            "outside_build_cache_totals": [
+                {"label": "/tmp", "bytes": 2**30, "growth_bytes": 2**30},
+            ],
+        }
+        disk.write_snapshot(expanded)
+        self.assertEqual(report.disk_section(), old_lines)
+        self.assertIn("| /tmp | 1.0 GiB |", old_lines)
+
     def test_no_disk_section_without_snapshot(self) -> None:
         with mock.patch("report.disk.read_snapshot", return_value=None):
             lines = self.render().splitlines()

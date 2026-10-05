@@ -124,7 +124,9 @@ import time
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 from datetime import datetime
+from pathlib import Path
 from typing import Literal, TypedDict, cast
+from zoneinfo import ZoneInfo
 
 GIB = 1 << 30
 MIB = 1 << 20
@@ -161,6 +163,17 @@ FLOOR_ONLY_FLAG = "--floor-only"
 # Every cargo target directory on natedev was under one of these (2026-10-03).
 FLOOR_ROOTS = ("~/rust", "~/.local/state", "/tmp")
 FLOOR_LOCK = os.path.join("~", ".local", "state", "lint-sweep", "floor.lock")
+FLOOR_STATE_ENV = "LINT_SWEEP_STATE_DIR"
+BUILDLOG_DIR_ENV = "BUILDLOG_DIR"
+CI_TARGETS = ("/var/lib/hana-ci/hana-linux-1", "/var/lib/hana-ci/hana-linux-2")
+GROWTH_WINDOW_SECONDS = 30 * 60
+SNAPSHOT_MAX_AGE_SECONDS = 15 * 60
+ALERT_INTERVAL_SECONDS = 60 * 60
+# Three trace-driven sweeps on 2026-10-04 followed about 30 GiB of unexplained
+# loss each; their smallest removal was 35.2 GiB, versus 29.2 GiB at most otherwise.
+UNEXPLAINED_FALL_BYTES = 10 * GIB
+LARGE_REMOVAL_BYTES = 32 * GIB
+PACIFIC = ZoneInfo("America/Los_Angeles")
 # A nightly worktree's target is 5 below its root, a scratch crate's under
 # /tmp/claude-<uid>/<project>/<session>/scratchpad/ up to 7.
 FLOOR_SEARCH_DEPTH = 8
@@ -198,6 +211,74 @@ class Scan:
     links: dict[InodeKey, int] = field(default_factory=dict)
     groups: list[Group] = field(default_factory=list)
     orphans: Group = field(default_factory=lambda: Group(kind="orphan"))
+
+
+@dataclass(frozen=True)
+class FloorRecord:
+    measured_at: float
+    free_bytes: int
+    build_cache_bytes: int
+    alert_history: NoDeliveredAlert | DeliveredAlert
+
+
+@dataclass(frozen=True)
+class NoFloorRecord:
+    pass
+
+
+@dataclass(frozen=True)
+class NoDeliveredAlert:
+    pass
+
+
+@dataclass(frozen=True)
+class DeliveredAlert:
+    at: float
+
+
+@dataclass(frozen=True)
+class NoEarlierDiskMeasurement:
+    pass
+
+
+@dataclass(frozen=True)
+class EarlierDiskMeasurement:
+    measured_at: datetime
+
+
+@dataclass(frozen=True)
+class NoLargestGrowingChild:
+    pass
+
+
+@dataclass(frozen=True)
+class LargestGrowingChild:
+    path: str
+    growth_bytes: int
+
+
+@dataclass(frozen=True)
+class OutsideCacheDirectory:
+    path: str
+    bytes: int
+    growth_bytes: int
+    largest_child: NoLargestGrowingChild | LargestGrowingChild
+
+
+@dataclass(frozen=True)
+class AvailableDiskMeasurement:
+    measured_at: datetime
+    comparison: NoEarlierDiskMeasurement | EarlierDiskMeasurement
+    directories: list[OutsideCacheDirectory]
+    outside_cache_growth_bytes: int
+
+
+@dataclass(frozen=True)
+class UnavailableDiskMeasurement:
+    reason: Literal["missing", "unreadable", "old shape"]
+
+
+DiskMeasurement = AvailableDiskMeasurement | UnavailableDiskMeasurement
 
 
 def unit_hash(name: str) -> str | None:
@@ -701,6 +782,207 @@ def floor_bytes(values: dict[str, str], host: str) -> tuple[int | None, str | No
     return None, None
 
 
+def floor_record_path() -> Path:
+    state = os.environ.get(FLOOR_STATE_ENV) or "~/.local/state/lint-sweep"
+    return Path(os.path.expanduser(state)) / "floor.json"
+
+
+def read_floor_record(path: Path) -> NoFloorRecord | FloorRecord:
+    try:
+        value = cast(object, json.loads(path.read_text()))
+    except (OSError, ValueError):
+        return NoFloorRecord()
+    if not isinstance(value, dict):
+        return NoFloorRecord()
+    data = cast(dict[str, object], value)
+    measured = data.get("measured_at")
+    free = data.get("free_bytes")
+    caches = data.get("build_cache_bytes")
+    alert = data.get("last_alert_at")
+    if (not isinstance(measured, (int, float)) or not math.isfinite(measured)
+            or not isinstance(free, (int, float)) or not math.isfinite(free)
+            or not isinstance(caches, (int, float)) or not math.isfinite(caches)):
+        return NoFloorRecord()
+    if alert is not None and (not isinstance(alert, (int, float)) or not math.isfinite(alert)):
+        return NoFloorRecord()
+    history = DeliveredAlert(float(alert)) if alert is not None else NoDeliveredAlert()
+    return FloorRecord(float(measured), int(free), int(caches), history)
+
+
+def write_floor_record(path: Path, record: FloorRecord) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    partial = path.with_name(path.name + ".tmp")
+    alert_at = record.alert_history.at if isinstance(record.alert_history, DeliveredAlert) else None
+    _ = partial.write_text(json.dumps({
+        "measured_at": record.measured_at,
+        "free_bytes": record.free_bytes,
+        "build_cache_bytes": record.build_cache_bytes,
+        "last_alert_at": alert_at,
+    }) + "\n")
+    _ = partial.replace(path)
+
+
+def read_disk_measurement() -> DiskMeasurement:
+    directory = os.environ.get(BUILDLOG_DIR_ENV) or "~/.local/state/buildlog"
+    path = Path(os.path.expanduser(directory)) / "disk.json"
+    try:
+        raw = cast(object, json.loads(path.read_text()))
+    except FileNotFoundError:
+        return UnavailableDiskMeasurement("missing")
+    except (OSError, ValueError):
+        return UnavailableDiskMeasurement("unreadable")
+    if not isinstance(raw, dict) or "outside_build_caches" not in raw or "previous_measured_at" not in raw or "outside_build_cache_totals" not in raw:
+        return UnavailableDiskMeasurement("old shape")
+    data = cast(dict[str, object], raw)
+    try:
+        measured_raw = data["measured_at"]
+        previous_raw = data["previous_measured_at"]
+        directories_raw = data["outside_build_caches"]
+        totals_raw = data["outside_build_cache_totals"]
+        if not isinstance(measured_raw, str) or not isinstance(directories_raw, list) or not isinstance(totals_raw, list):
+            raise ValueError("invalid measurement")
+        measured = datetime.fromisoformat(measured_raw.replace("Z", "+00:00"))
+        if measured.tzinfo is None:
+            raise ValueError("measurement lacks zone")
+        comparison: NoEarlierDiskMeasurement | EarlierDiskMeasurement = NoEarlierDiskMeasurement()
+        if previous_raw is not None:
+            if not isinstance(previous_raw, str):
+                raise ValueError("invalid previous measurement")
+            earlier = datetime.fromisoformat(previous_raw.replace("Z", "+00:00"))
+            if earlier.tzinfo is None:
+                raise ValueError("previous measurement lacks zone")
+            comparison = EarlierDiskMeasurement(earlier)
+        directories: list[OutsideCacheDirectory] = []
+        for item_raw in cast(list[object], directories_raw):
+            item = item_raw
+            if not isinstance(item, dict):
+                raise ValueError("invalid directory")
+            directory = cast(dict[str, object], item)
+            name, size, growth = directory["path"], directory["bytes"], directory["growth_bytes"]
+            child, child_growth = directory["largest_child_path"], directory["largest_child_growth_bytes"]
+            if not isinstance(name, str) or not isinstance(size, int) or not isinstance(growth, int):
+                raise ValueError("invalid directory figures")
+            if child is not None and not isinstance(child, str):
+                raise ValueError("invalid child")
+            if child_growth is not None and not isinstance(child_growth, int):
+                raise ValueError("invalid child growth")
+            if (child is None) != (child_growth is None):
+                raise ValueError("incomplete child")
+            largest = LargestGrowingChild(child, child_growth) if child is not None and child_growth is not None else NoLargestGrowingChild()
+            directories.append(OutsideCacheDirectory(name, size, growth, largest))
+        growth_total = 0
+        for total_raw in cast(list[object], totals_raw):
+            if not isinstance(total_raw, dict):
+                raise ValueError("invalid folder total")
+            total = cast(dict[str, object], total_raw)
+            if (not isinstance(total.get("label"), str) or not isinstance(total.get("bytes"), int)
+                    or not isinstance(total.get("growth_bytes"), int)):
+                raise ValueError("invalid folder figures")
+            growth_total += cast(int, total["growth_bytes"])
+        return AvailableDiskMeasurement(measured, comparison, directories, growth_total)
+    except (KeyError, TypeError, ValueError, OverflowError):
+        return UnavailableDiskMeasurement("old shape")
+
+
+def pacific_time(timestamp: float | datetime) -> str:
+    value = timestamp.astimezone(PACIFIC) if isinstance(timestamp, datetime) else datetime.fromtimestamp(timestamp, PACIFIC)
+    return value.strftime("%Y-%m-%d %H:%M %Z")
+
+
+def movement(amount: int, increase: str, decrease: str) -> str:
+    if amount > 0:
+        return f"{increase} {gib(amount)}"
+    if amount < 0:
+        return f"{decrease} {gib(-amount)}"
+    return f"stayed level at {gib(0)}"
+
+
+def alert_path(path: str, limit: int) -> str:
+    home = os.path.expanduser("~")
+    if path == home or path.startswith(home + os.sep):
+        path = "~" + path[len(home):]
+    if len(path) <= limit:
+        return path
+    leaf = path.rsplit("/", 1)[-1]
+    prefix = path[:max(0, limit - len(leaf) - 2)]
+    return f"{prefix}…/{leaf}"
+
+
+def disk_measurement_lines(measurement: DiskMeasurement, free_fall: int, cache_growth: int,
+                           now: float, explain_fall: bool = True, path_limit: int = 256) -> list[str]:
+    if isinstance(measurement, UnavailableDiskMeasurement):
+        return [f"buildlog-disk measurement unavailable ({measurement.reason})."]
+    age = now - measurement.measured_at.timestamp()
+    stale = f"; stale by {int(age // 60)} minutes" if age > SNAPSHOT_MAX_AGE_SECONDS else ""
+    if isinstance(measurement.comparison, NoEarlierDiskMeasurement):
+        lines = [f"buildlog-disk measured {pacific_time(measurement.measured_at)}{stale}."]
+        lines.append("No earlier buildlog-disk measurement to compare; largest directories outside build caches:")
+        ranked = sorted(measurement.directories, key=lambda item: item.bytes, reverse=True)[:3]
+    else:
+        lines = [f"buildlog-disk measured {pacific_time(measurement.comparison.measured_at)} to {pacific_time(measurement.measured_at)}{stale}."]
+        lines.append("Directories outside build caches that grew most:")
+        ranked = sorted((item for item in measurement.directories if item.growth_bytes > 0), key=lambda item: item.growth_bytes, reverse=True)[:3]
+        lines.append(f"Measured folders {movement(measurement.outside_cache_growth_bytes, 'grew', 'shrank')} outside build caches.")
+        if explain_fall:
+            unaccounted = max(0, free_fall - cache_growth)
+            covered = min(max(measurement.outside_cache_growth_bytes, 0), unaccounted)
+            remainder = unaccounted - covered
+            coverage = ("cover all of it" if remainder == 0
+                        else f"cover {gib(covered)}; {gib(remainder)} remains outside measured folders")
+            lines.append(f"Of {gib(unaccounted)} of the fall beyond cache growth, measured folders {coverage}.")
+    for item in ranked:
+        detail = (f"grew {gib(item.growth_bytes)}, size {gib(item.bytes)}"
+                  if isinstance(measurement.comparison, EarlierDiskMeasurement) else f"size {gib(item.bytes)}")
+        lines.append(f"- {alert_path(item.path, path_limit)}: {detail}")
+        if (isinstance(measurement.comparison, EarlierDiskMeasurement)
+                and isinstance(item.largest_child, LargestGrowingChild)
+                and item.largest_child.growth_bytes > item.growth_bytes / 2):
+            lines.append(f"  largest child {alert_path(item.largest_child.path, path_limit)} grew {gib(item.largest_child.growth_bytes)}")
+    if not ranked:
+        lines.append("No directory growth is listed in this measurement.")
+    return lines
+
+
+def floor_alert_text(now: float, removed: int, previous: NoFloorRecord | FloorRecord,
+                     free_fall: int, cache_growth: int, reasons: list[str],
+                     measurement: DiskMeasurement) -> str:
+    comparison = (f"Since the previous sweep at {pacific_time(previous.measured_at)}, free space "
+                  + f"{movement(-free_fall, 'rose', 'fell')} while build caches {movement(cache_growth, 'grew', 'shrank')}."
+                  if isinstance(previous, FloorRecord) else "No earlier floor sweep to compare.")
+    for path_limit in (256, 128, 96, 72, 56, 40, 24, 16):
+        message = "\n".join([
+            f"Disk floor sweep at {pacific_time(now)} removed {gib(removed)} of build caches.",
+            comparison,
+            f"Alert threshold: {'; '.join(reasons)}.",
+            *disk_measurement_lines(measurement, free_fall, cache_growth, now,
+                                    isinstance(previous, FloorRecord), path_limit),
+        ])
+        if len(message) <= 1024:
+            return message
+    return message
+
+
+def send_floor_alert(message: str) -> bool:
+    scripts = Path(__file__).resolve().parents[1]
+    commands = [
+        ("message", [sys.executable, str(scripts / "message/send.py"), "--to", "natedev", "--from", "disk_floor", "--timeout", "30"]),
+        ("phone", [sys.executable, str(scripts / "notify/pushover.py"), "--priority", "0", "natedev: build caches swept", message]),
+    ]
+    delivered = False
+    for channel, command in commands:
+        try:
+            result = subprocess.run(command, input=message if channel == "message" else None, text=True, capture_output=True, timeout=40)
+            if result.returncode == 0 or (channel == "message" and result.returncode == 1):
+                delivered = True
+                state = "queued" if result.returncode == 1 else "delivered"
+                print(f"lint sweep: {channel} alert {state}")
+            else:
+                print(f"lint sweep: {channel} alert failed ({result.returncode}): {result.stderr.strip()}", file=sys.stderr)
+        except (OSError, subprocess.TimeoutExpired) as error:
+            print(f"lint sweep: {channel} alert failed: {error}", file=sys.stderr)
+    return delivered
+
+
 def hold_floor(floor: int, dry_run: bool, roots: Sequence[str] = FLOOR_ROOTS, lock: str = FLOOR_LOCK) -> int:
     """Below floor bytes free, remove the least recently used build output across
     every target directory no build holds until floor is free again."""
@@ -716,26 +998,53 @@ def hold_floor(floor: int, dry_run: bool, roots: Sequence[str] = FLOOR_ROOTS, lo
         return 0
     held: list[int] = []
     try:
+        record_path = floor_record_path()
+        previous = read_floor_record(record_path)
         idle: list[str] = []
         trees: list[str] = []
-        busy = 0
+        busy: list[str] = []
         for root in target_dirs(roots):
             root_trees = build_trees(root)
             root_held, blocked = lock_trees(root_trees)
             if blocked is not None:
-                busy += 1
+                busy.append(root)
                 continue
             held.extend(root_held)
             idle.append(root)
             trees.extend(root_trees)
         scan = scan_roots(idle, trees)
         total = sum(scan.blocks.values())
+        unchanged_caches = sum(directory_blocks(path) for path in (*busy, *CI_TARGETS))
+        before_caches = total + unchanged_caches
         print(
             f"lint sweep: {gib(free)} free, under the {gib(floor)} floor; choosing from {len(idle)}"
-            + f" target dirs ({gib(total)}), {busy} left alone while a build holds them"
+            + f" target dirs ({gib(total)}), {len(busy)} left alone while a build holds them"
         )
         _, failures = shrink(scan, total, total - (floor - free), dry_run)
-        print(f"lint sweep: {gib(free_bytes(home))} free")
+        after_free = free_bytes(home)
+        print(f"lint sweep: {gib(after_free)} free")
+        if not dry_run:
+            now = time.time()
+            after_caches = sum(directory_blocks(path) for path in idle) + unchanged_caches
+            removed = max(0, before_caches - after_caches)
+            history = previous.alert_history if isinstance(previous, FloorRecord) else NoDeliveredAlert()
+            if removed > 0 and (isinstance(history, NoDeliveredAlert) or now - history.at >= ALERT_INTERVAL_SECONDS):
+                free_fall = previous.free_bytes - free if isinstance(previous, FloorRecord) else 0
+                cache_growth = before_caches - previous.build_cache_bytes if isinstance(previous, FloorRecord) else 0
+                recent = isinstance(previous, FloorRecord) and 0 <= now - previous.measured_at <= GROWTH_WINDOW_SECONDS
+                growth_fired = recent and free_fall - cache_growth > UNEXPLAINED_FALL_BYTES
+                removal_fired = removed > LARGE_REMOVAL_BYTES
+                if growth_fired or removal_fired:
+                    reasons: list[str] = []
+                    if growth_fired:
+                        reasons.append("free space fell more than 10 GiB beyond build-cache growth")
+                    if removal_fired:
+                        reasons.append("removed more than 32 GiB in one sweep")
+                    message = floor_alert_text(now, removed, previous, free_fall, cache_growth,
+                                               reasons, read_disk_measurement())
+                    if send_floor_alert(message):
+                        history = DeliveredAlert(time.time())
+            write_floor_record(record_path, FloorRecord(now, after_free, after_caches, history))
         return 1 if failures else 0
     finally:
         release(held)

@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import fcntl
 import io
+import json
 import os
 import shutil
 import socket
@@ -14,7 +15,9 @@ import tempfile
 import time
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
+from datetime import datetime
 from pathlib import Path
+from typing import cast
 from unittest import mock
 
 import sweep
@@ -281,13 +284,324 @@ def cargo_target(base: Path, name: str, digest: str, used: float) -> tuple[Path,
 
 class FloorTests(SweepCase):
     def base(self) -> Path:
-        return Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
+        base = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
+        self.enterContext(mock.patch.dict(os.environ, {
+            sweep.FLOOR_STATE_ENV: str(base / "state"),
+            sweep.BUILDLOG_DIR_ENV: str(base / "buildlog"),
+        }))
+        _ = self.enterContext(mock.patch.object(sweep, "CI_TARGETS", (str(base / "ci-1"), str(base / "ci-2"))))
+        return base
 
     def hold(self, base: Path, floor: int, free: list[int]) -> tuple[int, str]:
         output = io.StringIO()
         with mock.patch.object(sweep, "free_bytes", side_effect=free), redirect_stdout(output):
             status = sweep.hold_floor(floor, False, [str(base)], str(base / "floor.lock"))
         return status, output.getvalue()
+
+    def prior(self, free: int, caches: int, age: int = 60, alert_at: float | None = None) -> None:
+        sweep.write_floor_record(
+            sweep.floor_record_path(),
+            sweep.FloorRecord(time.time() - age, free, caches,
+                              sweep.DeliveredAlert(alert_at) if alert_at is not None else sweep.NoDeliveredAlert()),
+        )
+
+    def test_cache_growth_explains_free_space_fall(self) -> None:
+        base = self.base()
+        _, output_file = cargo_target(base, "repo", APP, time.time() - DAY)
+        caches = sweep.directory_blocks(str(base / "repo" / "target"))
+        self.prior(10 * GIB, caches - SIZE)
+        with (mock.patch.object(sweep, "UNEXPLAINED_FALL_BYTES", 1),
+              mock.patch.object(sweep, "send_floor_alert") as send):
+            status, _ = self.hold(base, 10 * GIB, [10 * GIB - SIZE // 2, 10 * GIB])
+        self.assertEqual(status, 0)
+        self.assertFalse(output_file.exists())
+        send.assert_not_called()
+
+    def test_unexplained_fall_alerts_with_disk_directories_and_child(self) -> None:
+        base = self.base()
+        _, _ = cargo_target(base, "repo", APP, time.time() - DAY)
+        self.prior(30 * GIB, sweep.directory_blocks(str(base / "repo" / "target")))
+        snapshot = {
+            "measured_at": "2026-10-04T19:53:00-07:00",
+            "previous_measured_at": "2026-10-04T19:43:00-07:00",
+            "outside_build_cache_totals": [{"label": "/tmp", "bytes": 27 * GIB, "growth_bytes": 15 * GIB}],
+            "outside_build_caches": [
+                {"path": "/tmp/traces", "bytes": 20 * GIB, "growth_bytes": 12 * GIB,
+                 "largest_child_path": "/tmp/traces/frame", "largest_child_growth_bytes": 10 * GIB},
+                {"path": "/tmp/other", "bytes": 7 * GIB, "growth_bytes": 3 * GIB,
+                 "largest_child_path": None, "largest_child_growth_bytes": None},
+            ],
+        }
+        path = base / "buildlog" / "disk.json"
+        path.parent.mkdir()
+        _ = path.write_text(json.dumps(snapshot))
+        with mock.patch.object(sweep, "send_floor_alert", return_value=True) as send:
+            status, _ = self.hold(base, 10 * GIB, [9 * GIB, 11 * GIB])
+        self.assertEqual(status, 0)
+        message = cast(str, send.call_args.args[0])
+        self.assertIn("/tmp/traces", message)
+        self.assertIn("/tmp/traces/frame", message)
+        self.assertIn("2026-10-04 19:53 PDT", message)
+        self.assertIn("outside measured folders", message)
+        self.assertIn("stale", message)
+        self.assertFalse((base / "repo" / "target" / "debug" / "deps" / f"repo-{APP}").exists())
+
+    def test_busy_and_ci_growth_count_as_build_caches(self) -> None:
+        base = self.base()
+        idle_tree, _ = cargo_target(base, "idle", APP, time.time() - DAY)
+        busy_tree, _ = cargo_target(base, "busy", DEMO, time.time())
+        ci = base / "ci-1"
+        _ = write(ci / "existing")
+        baseline = sum(sweep.directory_blocks(str(path)) for path in (idle_tree.parent, busy_tree.parent, ci))
+        self.prior(20 * GIB, baseline)
+        _ = write(busy_tree / "extra", 2 * SIZE)
+        _ = write(ci / "extra", 2 * SIZE)
+        lock = os.open(busy_tree / sweep.LOCK_NAMES[0], os.O_RDONLY | os.O_CREAT)
+        self.addCleanup(os.close, lock)
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        with (mock.patch.object(sweep, "UNEXPLAINED_FALL_BYTES", SIZE),
+              mock.patch.object(sweep, "send_floor_alert") as send):
+            status, _ = self.hold(base, 20 * GIB, [20 * GIB - 3 * SIZE, 20 * GIB])
+        self.assertEqual(status, 0)
+        send.assert_not_called()
+        record = sweep.read_floor_record(sweep.floor_record_path())
+        self.assertIsInstance(record, sweep.FloorRecord)
+        assert isinstance(record, sweep.FloorRecord)
+        self.assertEqual(record.build_cache_bytes, sum(sweep.directory_blocks(str(path)) for path in (idle_tree.parent, busy_tree.parent, ci)))
+
+    def test_old_record_does_not_trigger_growth_alert(self) -> None:
+        base = self.base()
+        _, _ = cargo_target(base, "repo", APP, time.time() - DAY)
+        self.prior(30 * GIB, 0, age=31 * 60)
+        with mock.patch.object(sweep, "send_floor_alert") as send:
+            self.assertEqual(self.hold(base, 10 * GIB, [9 * GIB, 11 * GIB])[0], 0)
+        send.assert_not_called()
+
+    def test_large_removal_alerts_without_prior_record(self) -> None:
+        base = self.base()
+        _, _ = cargo_target(base, "repo", APP, time.time() - DAY)
+        with (mock.patch.object(sweep, "LARGE_REMOVAL_BYTES", 1),
+              mock.patch.object(sweep, "send_floor_alert", return_value=True) as send):
+            self.assertEqual(self.hold(base, 10 * GIB, [9 * GIB, 11 * GIB])[0], 0)
+        self.assertIn("No earlier floor sweep", cast(str, send.call_args.args[0]))
+        self.assertIn("measurement unavailable (missing)", cast(str, send.call_args.args[0]))
+
+    def test_failed_removal_stays_in_record_and_send_failure_keeps_status(self) -> None:
+        base = self.base()
+        tree, output_file = cargo_target(base, "repo", APP, time.time() - DAY)
+        before = sweep.directory_blocks(str(tree.parent))
+        with (mock.patch.object(sweep, "remove", return_value=1),
+              mock.patch.object(sweep, "LARGE_REMOVAL_BYTES", 1),
+              mock.patch.object(sweep, "send_floor_alert") as send):
+            status, _ = self.hold(base, 10 * GIB, [9 * GIB, 9 * GIB])
+        self.assertEqual(status, 1)
+        self.assertTrue(output_file.exists())
+        record = sweep.read_floor_record(sweep.floor_record_path())
+        self.assertIsInstance(record, sweep.FloorRecord)
+        assert isinstance(record, sweep.FloorRecord)
+        self.assertEqual(record.build_cache_bytes, before)
+        send.assert_not_called()
+
+    def test_both_sends_failing_retry_and_one_delivery_stamps_hour(self) -> None:
+        base = self.base()
+        _, _ = cargo_target(base, "first", APP, time.time() - DAY)
+        with (mock.patch.object(sweep, "LARGE_REMOVAL_BYTES", 1),
+              mock.patch.object(sweep, "send_floor_alert", side_effect=[False, True]) as send):
+            self.assertEqual(self.hold(base, 10 * GIB, [9 * GIB, 11 * GIB])[0], 0)
+            _, _ = cargo_target(base, "second", DEMO, time.time() - DAY)
+            self.assertEqual(self.hold(base, 10 * GIB, [9 * GIB, 11 * GIB])[0], 0)
+            _, _ = cargo_target(base, "third", TOOL, time.time() - DAY)
+            self.assertEqual(self.hold(base, 10 * GIB, [9 * GIB, 11 * GIB])[0], 0)
+        self.assertEqual(send.call_count, 2)
+        record = sweep.read_floor_record(sweep.floor_record_path())
+        self.assertIsInstance(record, sweep.FloorRecord)
+        assert isinstance(record, sweep.FloorRecord)
+        self.assertIsInstance(record.alert_history, sweep.DeliveredAlert)
+
+    def test_alert_delivery_failure_never_changes_exit_status(self) -> None:
+        base = self.base()
+        _, _ = cargo_target(base, "repo", APP, time.time() - DAY)
+        with (mock.patch.object(sweep, "LARGE_REMOVAL_BYTES", 1),
+              mock.patch.object(subprocess, "run", side_effect=OSError("offline")),
+              redirect_stderr(io.StringIO()) as errors):
+            self.assertEqual(self.hold(base, 10 * GIB, [9 * GIB, 11 * GIB])[0], 0)
+        self.assertIn("message alert failed", errors.getvalue())
+        self.assertIn("phone alert failed", errors.getvalue())
+
+    def test_one_channel_delivering_counts_and_both_results_print(self) -> None:
+        output = io.StringIO()
+        errors = io.StringIO()
+        results = [
+            subprocess.CompletedProcess([], 1, "", "relay unavailable"),
+            subprocess.CompletedProcess([], 0, "", ""),
+        ]
+        with (mock.patch.object(subprocess, "run", side_effect=results) as run,
+              redirect_stdout(output), redirect_stderr(errors)):
+            self.assertTrue(sweep.send_floor_alert("disk notice"))
+        self.assertEqual(run.call_count, 2)
+        self.assertEqual(run.call_args_list[0].kwargs["input"], "disk notice")
+        self.assertEqual(run.call_args_list[1].args[0][-1], "disk notice")
+        self.assertIn("message alert queued", output.getvalue())
+        self.assertIn("phone alert delivered", output.getvalue())
+
+    def test_queued_message_stamps_record_and_suppresses_next_alert(self) -> None:
+        base = self.base()
+        _, _ = cargo_target(base, "first", APP, time.time() - DAY)
+        results = [subprocess.CompletedProcess([], 1, "", ""), subprocess.CompletedProcess([], 3, "", "offline")]
+        with (mock.patch.object(sweep, "LARGE_REMOVAL_BYTES", 1),
+              mock.patch.object(subprocess, "run", side_effect=results) as run):
+            self.assertEqual(self.hold(base, 10 * GIB, [9 * GIB, 11 * GIB])[0], 0)
+            record = sweep.read_floor_record(sweep.floor_record_path())
+            self.assertIsInstance(record, sweep.FloorRecord)
+            assert isinstance(record, sweep.FloorRecord)
+            self.assertIsInstance(record.alert_history, sweep.DeliveredAlert)
+            _, _ = cargo_target(base, "second", DEMO, time.time() - DAY)
+            self.assertEqual(self.hold(base, 10 * GIB, [9 * GIB, 11 * GIB])[0], 0)
+        self.assertEqual(run.call_count, 2)
+
+    def test_delivered_stamp_uses_time_after_send(self) -> None:
+        base = self.base()
+        _, _ = cargo_target(base, "repo", APP, time.time() - DAY)
+        start = time.time()
+        clock = [start]
+
+        def deliver(_message: str) -> bool:
+            clock[0] = start + 80
+            return True
+
+        with (mock.patch.object(sweep, "LARGE_REMOVAL_BYTES", 1),
+              mock.patch.object(time, "time", side_effect=lambda: clock[0]),
+              mock.patch.object(sweep, "send_floor_alert", side_effect=deliver)):
+            self.assertEqual(self.hold(base, 10 * GIB, [9 * GIB, 11 * GIB])[0], 0)
+        record = sweep.read_floor_record(sweep.floor_record_path())
+        assert isinstance(record, sweep.FloorRecord)
+        self.assertEqual(record.measured_at, start)
+        self.assertEqual(record.alert_history, sweep.DeliveredAlert(start + 80))
+
+    def test_missing_and_corrupt_floor_records_have_named_state(self) -> None:
+        _ = self.base()
+        path = sweep.floor_record_path()
+        self.assertEqual(sweep.read_floor_record(path), sweep.NoFloorRecord())
+        path.parent.mkdir()
+        _ = path.write_text("broken json")
+        self.assertEqual(sweep.read_floor_record(path), sweep.NoFloorRecord())
+
+    def test_disk_measurement_names_missing_unreadable_and_old_shape(self) -> None:
+        base = self.base()
+        self.assertEqual(sweep.read_disk_measurement(), sweep.UnavailableDiskMeasurement("missing"))
+        path = base / "buildlog" / "disk.json"
+        path.parent.mkdir()
+        _ = path.write_text("not json")
+        self.assertEqual(sweep.read_disk_measurement(), sweep.UnavailableDiskMeasurement("unreadable"))
+        _ = path.write_text(json.dumps({"measured_at": "2026-10-04T19:53:00-07:00", "rows": []}))
+        self.assertEqual(sweep.read_disk_measurement(), sweep.UnavailableDiskMeasurement("old shape"))
+        _ = path.write_text(json.dumps({"measured_at": "2026-10-04T19:53:00-07:00",
+                                        "previous_measured_at": "2026-10-04T19:43:00-07:00",
+                                        "outside_build_caches": []}))
+        self.assertEqual(sweep.read_disk_measurement(), sweep.UnavailableDiskMeasurement("old shape"))
+
+    def test_no_prior_disk_measurement_names_largest_directories(self) -> None:
+        base = self.base()
+        path = base / "buildlog" / "disk.json"
+        path.parent.mkdir()
+        _ = path.write_text(json.dumps({
+            "measured_at": "2026-10-04T19:53:00-07:00",
+            "previous_measured_at": None,
+            "outside_build_cache_totals": [{"label": "/tmp", "bytes": 10 * GIB, "growth_bytes": 10 * GIB}],
+            "outside_build_caches": [
+                {"path": f"/tmp/{name}", "bytes": size * GIB, "growth_bytes": size * GIB,
+                 "largest_child_path": None, "largest_child_growth_bytes": None}
+                for name, size in (("one", 1), ("four", 4), ("two", 2), ("three", 3))
+            ],
+        }))
+        lines = sweep.disk_measurement_lines(sweep.read_disk_measurement(), 0, 0, time.time())
+        text = "\n".join(lines)
+        self.assertIn("No earlier buildlog-disk measurement", text)
+        self.assertIn("/tmp/four", text)
+        self.assertIn("/tmp/three", text)
+        self.assertIn("/tmp/two", text)
+        self.assertNotIn("/tmp/one", text)
+
+    def test_folder_totals_include_deleted_directories_and_small_files(self) -> None:
+        base = self.base()
+        _, _ = cargo_target(base, "repo", APP, time.time() - DAY)
+        self.prior(30 * GIB, sweep.directory_blocks(str(base / "repo" / "target")))
+        path = base / "buildlog" / "disk.json"
+        path.parent.mkdir()
+        _ = path.write_text(json.dumps({
+            "measured_at": "2026-10-04T19:53:00-07:00",
+            "previous_measured_at": "2026-10-04T19:43:00-07:00",
+            "outside_build_cache_totals": [{"label": "/tmp", "bytes": 2 * GIB, "growth_bytes": -2 * GIB}],
+            "outside_build_caches": [
+                {"path": "/tmp/new", "bytes": 2 * GIB, "growth_bytes": 2 * GIB,
+                 "largest_child_path": None, "largest_child_growth_bytes": None},
+            ],
+        }))
+        with mock.patch.object(sweep, "send_floor_alert", return_value=True) as send:
+            self.assertEqual(self.hold(base, 10 * GIB, [9 * GIB, 11 * GIB])[0], 0)
+        message = cast(str, send.call_args.args[0])
+        self.assertIn("Measured folders shrank 2.0 GiB", message)
+        self.assertIn("/tmp/new: grew 2.0 GiB", message)
+        self.assertIn("cover 0.0 GiB", message)
+
+    def test_snapshot_growth_above_fall_covers_all_without_negative_remainder(self) -> None:
+        now = time.time()
+        measurement = sweep.AvailableDiskMeasurement(
+            datetime.fromtimestamp(now - 60, sweep.PACIFIC),
+            sweep.EarlierDiskMeasurement(datetime.fromtimestamp(now - 660, sweep.PACIFIC)),
+            [], 30 * GIB,
+        )
+        previous = sweep.FloorRecord(now - 120, 30 * GIB, 0, sweep.NoDeliveredAlert())
+        message = sweep.floor_alert_text(now, 35 * GIB, previous, 20 * GIB, 0,
+                                         ["removed more than 32 GiB in one sweep"], measurement)
+        self.assertIn("cover all of it", message)
+        self.assertNotIn("-10.0 GiB", message)
+        self.assertEqual(message.count(sweep.pacific_time(measurement.measured_at)), 1)
+        assert isinstance(measurement.comparison, sweep.EarlierDiskMeasurement)
+        self.assertEqual(message.count(sweep.pacific_time(measurement.comparison.measured_at)), 1)
+
+    def test_no_prior_floor_sweep_omits_explained_fall(self) -> None:
+        now = time.time()
+        measurement = sweep.AvailableDiskMeasurement(
+            datetime.fromtimestamp(now, sweep.PACIFIC),
+            sweep.EarlierDiskMeasurement(datetime.fromtimestamp(now - 600, sweep.PACIFIC)),
+            [], 30 * GIB,
+        )
+        message = sweep.floor_alert_text(now, 35 * GIB, sweep.NoFloorRecord(), 0, 0,
+                                         ["removed more than 32 GiB in one sweep"], measurement)
+        self.assertIn("No earlier floor sweep", message)
+        self.assertNotIn("fall beyond cache growth", message)
+
+    def test_free_space_rise_uses_rising_wording(self) -> None:
+        now = time.time()
+        previous = sweep.FloorRecord(now - 60, 20 * GIB, 0, sweep.NoDeliveredAlert())
+        message = sweep.floor_alert_text(now, 35 * GIB, previous, -2 * GIB, -1 * GIB,
+                                         ["removed more than 32 GiB in one sweep"],
+                                         sweep.UnavailableDiskMeasurement("missing"))
+        self.assertIn("free space rose 2.0 GiB", message)
+        self.assertIn("build caches shrank 1.0 GiB", message)
+        self.assertNotIn("-2.0 GiB", message)
+
+    def test_long_paths_fit_phone_and_keep_each_last_component(self) -> None:
+        now = time.time()
+        directories = [
+            sweep.OutsideCacheDirectory(
+                f"/tmp/{'a' * 290}/directory{index}", 20 * GIB, 10 * GIB,
+                sweep.LargestGrowingChild(f"/tmp/{'b' * 290}/child{index}", 8 * GIB),
+            ) for index in range(3)
+        ]
+        measurement = sweep.AvailableDiskMeasurement(
+            datetime.fromtimestamp(now, sweep.PACIFIC),
+            sweep.EarlierDiskMeasurement(datetime.fromtimestamp(now - 600, sweep.PACIFIC)),
+            directories, 30 * GIB,
+        )
+        previous = sweep.FloorRecord(now - 60, 30 * GIB, 0, sweep.NoDeliveredAlert())
+        message = sweep.floor_alert_text(now, 35 * GIB, previous, 20 * GIB, 0,
+                                         ["removed more than 32 GiB in one sweep"], measurement)
+        self.assertLessEqual(len(message), 1024)
+        for index in range(3):
+            self.assertIn(f"directory{index}", message)
+            self.assertIn(f"child{index}", message)
 
     def test_host_key_then_default_key(self) -> None:
         values = {"sweep_free_floor_gib.natedev": "500", "sweep_free_floor_gib": "50", "sweep_free_floor_gib.mac": "x"}
