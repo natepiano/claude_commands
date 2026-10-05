@@ -183,6 +183,11 @@ under that directory. This avoids half-applied durable-state writes.
 - Codex: launch the same command in a managed unified-exec terminal with
   `tty: true` and a short initial yield; retain its returned `session_id`. Do not
   shell-background the launcher: it waits for its worker and remains attached.
+- Saved run output (traces, captures, logs) stays under a few GB: read each run
+  and delete it before the next. A disk-floor sweeper keeps 500 GiB free on `/`
+  by deleting every unit's build caches. Ask natedev for room before a run that
+  must keep more. Put this rule in every seat and helper prompt that saves
+  output. User, 2026-10-04: 300 GB of traces cost 235 GiB of caches.
 </ToolingContract>
 
 <DispatchContract>
