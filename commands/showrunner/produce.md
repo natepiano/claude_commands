@@ -663,6 +663,11 @@ it needs. Every other wait is yours to clear, and fast.
    - A short hold is worth taking when it saves longer rework. Log the trade in
      one line: who waits, for how long, and what it saves. The hold is a wait
      under rule 4, with a clear time.
+   - **Order shared layout when a phase starts, not at its merge.** Read the
+     new phase's file list against every running phase. Code two units both
+     change in behaviour (not a one-line hook) gets one owner until that owner
+     merges; the other unit holds those edits and merges after it, bringing the
+     owner's work in once. Tell both in that turn. User, 2026-10-04.
 
    Log each ordering with its why. Lift it once the reason has merged.
 4. **Waits have a limit.** Log each wait when it starts and when it clears:
