@@ -124,8 +124,9 @@ import time
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 from datetime import datetime
+from enum import Enum
 from pathlib import Path
-from typing import Literal, TypedDict, cast
+from typing import Literal, TypeGuard, TypedDict, cast
 from zoneinfo import ZoneInfo
 
 GIB = 1 << 30
@@ -219,11 +220,15 @@ class FloorRecord:
     free_bytes: int
     build_cache_bytes: int
     alert_history: NoDeliveredAlert | DeliveredAlert
+    push_history: NoDeliveredAlert | DeliveredAlert
 
 
 @dataclass(frozen=True)
 class NoFloorRecord:
     pass
+
+
+NO_FLOOR_RECORD = NoFloorRecord()
 
 
 @dataclass(frozen=True)
@@ -279,6 +284,11 @@ class UnavailableDiskMeasurement:
 
 
 DiskMeasurement = AvailableDiskMeasurement | UnavailableDiskMeasurement
+
+
+class FloorAlertChannels(Enum):
+    NATEDEV = "natedev"
+    NATEDEV_AND_PHONE = "natedev_and_phone"
 
 
 def unit_hash(name: str) -> str | None:
@@ -787,6 +797,10 @@ def floor_record_path() -> Path:
     return Path(os.path.expanduser(state)) / "floor.json"
 
 
+def _finite_number(value: object) -> TypeGuard[int | float]:
+    return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value)
+
+
 def read_floor_record(path: Path) -> NoFloorRecord | FloorRecord:
     try:
         value = cast(object, json.loads(path.read_text()))
@@ -799,25 +813,29 @@ def read_floor_record(path: Path) -> NoFloorRecord | FloorRecord:
     free = data.get("free_bytes")
     caches = data.get("build_cache_bytes")
     alert = data.get("last_alert_at")
-    if (not isinstance(measured, (int, float)) or not math.isfinite(measured)
-            or not isinstance(free, (int, float)) or not math.isfinite(free)
-            or not isinstance(caches, (int, float)) or not math.isfinite(caches)):
+    push = data.get("last_push_at")
+    if not _finite_number(measured) or not _finite_number(free) or not _finite_number(caches):
         return NoFloorRecord()
-    if alert is not None and (not isinstance(alert, (int, float)) or not math.isfinite(alert)):
+    if alert is not None and not _finite_number(alert):
+        return NoFloorRecord()
+    if push is not None and not _finite_number(push):
         return NoFloorRecord()
     history = DeliveredAlert(float(alert)) if alert is not None else NoDeliveredAlert()
-    return FloorRecord(float(measured), int(free), int(caches), history)
+    push_history = DeliveredAlert(float(push)) if push is not None else NoDeliveredAlert()
+    return FloorRecord(float(measured), int(free), int(caches), history, push_history)
 
 
 def write_floor_record(path: Path, record: FloorRecord) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     partial = path.with_name(path.name + ".tmp")
     alert_at = record.alert_history.at if isinstance(record.alert_history, DeliveredAlert) else None
+    push_at = record.push_history.at if isinstance(record.push_history, DeliveredAlert) else None
     _ = partial.write_text(json.dumps({
         "measured_at": record.measured_at,
         "free_bytes": record.free_bytes,
         "build_cache_bytes": record.build_cache_bytes,
         "last_alert_at": alert_at,
+        "last_push_at": push_at,
     }) + "\n")
     _ = partial.replace(path)
 
@@ -909,10 +927,13 @@ def alert_path(path: str, limit: int) -> str:
 
 
 def disk_measurement_lines(measurement: DiskMeasurement, free_fall: int, cache_growth: int,
-                           now: float, explain_fall: bool = True, path_limit: int = 256) -> list[str]:
+                           now: float, explain_fall: bool = True, path_limit: int = 256,
+                           previous: NoFloorRecord | FloorRecord = NO_FLOOR_RECORD) -> list[str]:
     if isinstance(measurement, UnavailableDiskMeasurement):
         return [f"buildlog-disk measurement unavailable ({measurement.reason})."]
     age = now - measurement.measured_at.timestamp()
+    measured_before_fall = (explain_fall and isinstance(previous, FloorRecord)
+                            and measurement.measured_at.timestamp() <= previous.measured_at)
     stale = f"; stale by {int(age // 60)} minutes" if age > SNAPSHOT_MAX_AGE_SECONDS else ""
     if isinstance(measurement.comparison, NoEarlierDiskMeasurement):
         lines = [f"buildlog-disk measured {pacific_time(measurement.measured_at)}{stale}."]
@@ -923,13 +944,16 @@ def disk_measurement_lines(measurement: DiskMeasurement, free_fall: int, cache_g
         lines.append("Directories outside build caches that grew most:")
         ranked = sorted((item for item in measurement.directories if item.growth_bytes > 0), key=lambda item: item.growth_bytes, reverse=True)[:3]
         lines.append(f"Measured folders {movement(measurement.outside_cache_growth_bytes, 'grew', 'shrank')} outside build caches.")
-        if explain_fall:
+        if explain_fall and not measured_before_fall:
             unaccounted = max(0, free_fall - cache_growth)
             covered = min(max(measurement.outside_cache_growth_bytes, 0), unaccounted)
             remainder = unaccounted - covered
             coverage = ("cover all of it" if remainder == 0
-                        else f"cover {gib(covered)}; {gib(remainder)} remains outside measured folders")
+                        else f"cover {gib(covered)}; {gib(remainder)} came after {pacific_time(measurement.measured_at)} or outside measured folders")
             lines.append(f"Of {gib(unaccounted)} of the fall beyond cache growth, measured folders {coverage}.")
+    if measured_before_fall:
+        unaccounted = max(0, free_fall - cache_growth)
+        lines.append(f"The {gib(unaccounted)} fall beyond cache growth came after buildlog-disk's last measurement at {pacific_time(measurement.measured_at)}.")
     for item in ranked:
         detail = (f"grew {gib(item.growth_bytes)}, size {gib(item.bytes)}"
                   if isinstance(measurement.comparison, EarlierDiskMeasurement) else f"size {gib(item.bytes)}")
@@ -955,19 +979,37 @@ def floor_alert_text(now: float, removed: int, previous: NoFloorRecord | FloorRe
             comparison,
             f"Alert threshold: {'; '.join(reasons)}.",
             *disk_measurement_lines(measurement, free_fall, cache_growth, now,
-                                    isinstance(previous, FloorRecord), path_limit),
+                                    isinstance(previous, FloorRecord), path_limit, previous),
         ])
         if len(message) <= 1024:
             return message
     return message
 
 
-def send_floor_alert(message: str) -> bool:
+def floor_out_of_reach_text(now: float, removed: int, free: int, floor: int,
+                            held_count: int, held_bytes: int, ci_bytes: int,
+                            measurement: DiskMeasurement, failures: int) -> str:
+    held = f"{held_count} target dirs a build holds ({gib(held_bytes)}), which the sweep takes once their builds end; " if held_count else ""
+    for path_limit in (256, 128, 96, 72, 56, 40, 24, 16):
+        message = "\n".join([
+            f"Disk floor sweep at {pacific_time(now)} removed {gib(removed)} and has no build cache left that it may remove; free space is {gib(free)}, under the {gib(floor)} floor.",
+            f"To get back over the floor, free {gib(floor - free)} outside build caches.",
+            f"Not swept: {held}CI's targets ({gib(ci_bytes)}).",
+            *([f"Could not remove {failures} {'path' if failures == 1 else 'paths'} this sweep; the next sweep tries again."] if failures else []),
+            *disk_measurement_lines(measurement, 0, 0, now, False, path_limit),
+        ])
+        if len(message) <= 1024:
+            return message
+    return message
+
+
+def send_floor_alert(message: str, channels: FloorAlertChannels) -> bool:
     scripts = Path(__file__).resolve().parents[1]
     commands = [
         ("message", [sys.executable, str(scripts / "message/send.py"), "--to", "natedev", "--from", "disk_floor", "--timeout", "30"]),
-        ("phone", [sys.executable, str(scripts / "notify/pushover.py"), "--priority", "0", "natedev: build caches swept", message]),
     ]
+    if channels is FloorAlertChannels.NATEDEV_AND_PHONE:
+        commands.append(("phone", [sys.executable, str(scripts / "notify/pushover.py"), "--priority", "0", "natedev: disk under its floor", message]))
     delivered = False
     for channel, command in commands:
         try:
@@ -1014,13 +1056,16 @@ def hold_floor(floor: int, dry_run: bool, roots: Sequence[str] = FLOOR_ROOTS, lo
             trees.extend(root_trees)
         scan = scan_roots(idle, trees)
         total = sum(scan.blocks.values())
-        unchanged_caches = sum(directory_blocks(path) for path in (*busy, *CI_TARGETS))
+        held_bytes = sum(directory_blocks(path) for path in busy)
+        ci_bytes = sum(directory_blocks(path) for path in CI_TARGETS)
+        unchanged_caches = held_bytes + ci_bytes
         before_caches = total + unchanged_caches
         print(
             f"lint sweep: {gib(free)} free, under the {gib(floor)} floor; choosing from {len(idle)}"
             + f" target dirs ({gib(total)}), {len(busy)} left alone while a build holds them"
         )
-        _, failures = shrink(scan, total, total - (floor - free), dry_run)
+        budget = total - (floor - free)
+        left, failures = shrink(scan, total, budget, dry_run)
         after_free = free_bytes(home)
         print(f"lint sweep: {gib(after_free)} free")
         if not dry_run:
@@ -1028,7 +1073,15 @@ def hold_floor(floor: int, dry_run: bool, roots: Sequence[str] = FLOOR_ROOTS, lo
             after_caches = sum(directory_blocks(path) for path in idle) + unchanged_caches
             removed = max(0, before_caches - after_caches)
             history = previous.alert_history if isinstance(previous, FloorRecord) else NoDeliveredAlert()
-            if removed > 0 and (isinstance(history, NoDeliveredAlert) or now - history.at >= ALERT_INTERVAL_SECONDS):
+            push_history = previous.push_history if isinstance(previous, FloorRecord) else NoDeliveredAlert()
+            push_due = isinstance(push_history, NoDeliveredAlert) or now - push_history.at >= ALERT_INTERVAL_SECONDS
+            # (user, 2026-10-05) Only an exhausted sweep still under the floor reaches the phone; other alerts reach natedev alone.
+            if left > budget and after_free < floor and push_due:
+                message = floor_out_of_reach_text(now, removed, after_free, floor, len(busy),
+                                                   held_bytes, ci_bytes, read_disk_measurement(), failures)
+                if send_floor_alert(message, FloorAlertChannels.NATEDEV_AND_PHONE):
+                    push_history = DeliveredAlert(time.time())
+            elif removed > 0 and (isinstance(history, NoDeliveredAlert) or now - history.at >= ALERT_INTERVAL_SECONDS):
                 free_fall = previous.free_bytes - free if isinstance(previous, FloorRecord) else 0
                 cache_growth = before_caches - previous.build_cache_bytes if isinstance(previous, FloorRecord) else 0
                 recent = isinstance(previous, FloorRecord) and 0 <= now - previous.measured_at <= GROWTH_WINDOW_SECONDS
@@ -1042,9 +1095,9 @@ def hold_floor(floor: int, dry_run: bool, roots: Sequence[str] = FLOOR_ROOTS, lo
                         reasons.append("removed more than 32 GiB in one sweep")
                     message = floor_alert_text(now, removed, previous, free_fall, cache_growth,
                                                reasons, read_disk_measurement())
-                    if send_floor_alert(message):
+                    if send_floor_alert(message, FloorAlertChannels.NATEDEV):
                         history = DeliveredAlert(time.time())
-            write_floor_record(record_path, FloorRecord(now, after_free, after_caches, history))
+            write_floor_record(record_path, FloorRecord(now, after_free, after_caches, history, push_history))
         return 1 if failures else 0
     finally:
         release(held)

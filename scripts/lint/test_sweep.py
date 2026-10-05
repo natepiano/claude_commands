@@ -290,7 +290,15 @@ class FloorTests(SweepCase):
             sweep.BUILDLOG_DIR_ENV: str(base / "buildlog"),
         }))
         _ = self.enterContext(mock.patch.object(sweep, "CI_TARGETS", (str(base / "ci-1"), str(base / "ci-2"))))
+        _ = self.enterContext(mock.patch.object(
+            sweep, "send_floor_alert", side_effect=AssertionError("unexpected floor alert send")))
         return base
+
+    def test_base_blocks_unexpected_alert_send(self) -> None:
+        _ = self.base()
+        self.assertIsInstance(sweep.send_floor_alert, mock.Mock)
+        with self.assertRaisesRegex(AssertionError, "unexpected floor alert send"):
+            _ = sweep.send_floor_alert("test", sweep.FloorAlertChannels.NATEDEV)
 
     def hold(self, base: Path, floor: int, free: list[int]) -> tuple[int, str]:
         output = io.StringIO()
@@ -298,11 +306,13 @@ class FloorTests(SweepCase):
             status = sweep.hold_floor(floor, False, [str(base)], str(base / "floor.lock"))
         return status, output.getvalue()
 
-    def prior(self, free: int, caches: int, age: int = 60, alert_at: float | None = None) -> None:
+    def prior(self, free: int, caches: int, age: int = 60, alert_at: float | None = None,
+              push_at: float | None = None) -> None:
         sweep.write_floor_record(
             sweep.floor_record_path(),
             sweep.FloorRecord(time.time() - age, free, caches,
-                              sweep.DeliveredAlert(alert_at) if alert_at is not None else sweep.NoDeliveredAlert()),
+                              sweep.DeliveredAlert(alert_at) if alert_at is not None else sweep.NoDeliveredAlert(),
+                              sweep.DeliveredAlert(push_at) if push_at is not None else sweep.NoDeliveredAlert()),
         )
 
     def test_cache_growth_explains_free_space_fall(self) -> None:
@@ -342,7 +352,9 @@ class FloorTests(SweepCase):
         self.assertIn("/tmp/traces", message)
         self.assertIn("/tmp/traces/frame", message)
         self.assertIn("2026-10-04 19:53 PDT", message)
-        self.assertIn("outside measured folders", message)
+        self.assertIn("came after buildlog-disk's last measurement at 2026-10-04 19:53 PDT", message)
+        self.assertNotIn("outside measured folders", message)
+        self.assertEqual(send.call_args.args[1], sweep.FloorAlertChannels.NATEDEV)
         self.assertIn("stale", message)
         self.assertFalse((base / "repo" / "target" / "debug" / "deps" / f"repo-{APP}").exists())
 
@@ -385,6 +397,116 @@ class FloorTests(SweepCase):
             self.assertEqual(self.hold(base, 10 * GIB, [9 * GIB, 11 * GIB])[0], 0)
         self.assertIn("No earlier floor sweep", cast(str, send.call_args.args[0]))
         self.assertIn("measurement unavailable (missing)", cast(str, send.call_args.args[0]))
+        self.assertEqual(send.call_args.args[1], sweep.FloorAlertChannels.NATEDEV)
+
+    def test_exhausted_cache_under_floor_alerts_phone_and_natedev(self) -> None:
+        base = self.base()
+        _, output_file = cargo_target(base, "idle", APP, time.time() - DAY)
+        busy_tree, _ = cargo_target(base, "busy", DEMO, time.time())
+        _ = write(base / "ci-1" / "output")
+        held_bytes = sweep.directory_blocks(str(busy_tree.parent))
+        ci_bytes = sweep.directory_blocks(str(base / "ci-1"))
+        lock = os.open(busy_tree / sweep.LOCK_NAMES[0], os.O_RDONLY | os.O_CREAT)
+        self.addCleanup(os.close, lock)
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        with mock.patch.object(sweep, "send_floor_alert", return_value=True) as send:
+            self.assertEqual(self.hold(base, 10 * GIB, [9 * GIB, 9 * GIB])[0], 0)
+        self.assertFalse(output_file.exists())
+        self.assertEqual(send.call_count, 1)
+        self.assertEqual(send.call_args.args[1], sweep.FloorAlertChannels.NATEDEV_AND_PHONE)
+        message = cast(str, send.call_args.args[0])
+        self.assertIn("has no build cache left that it may remove", message)
+        self.assertIn("free space is 9.0 GiB, under the 10.0 GiB floor", message)
+        self.assertIn("free 1.0 GiB outside build caches", message)
+        self.assertIn(f"Not swept: 1 target dirs a build holds ({sweep.gib(held_bytes)})", message)
+        self.assertIn(f"CI's targets ({sweep.gib(ci_bytes)})", message)
+        self.assertNotIn("Could not remove", message)
+        record = sweep.read_floor_record(sweep.floor_record_path())
+        assert isinstance(record, sweep.FloorRecord)
+        self.assertIsInstance(record.push_history, sweep.DeliveredAlert)
+        self.assertIsInstance(record.alert_history, sweep.NoDeliveredAlert)
+
+    def test_exhausted_cache_alerts_even_when_nothing_was_removed(self) -> None:
+        base = self.base()
+        with mock.patch.object(sweep, "send_floor_alert", return_value=True) as send:
+            self.assertEqual(self.hold(base, 10 * GIB, [9 * GIB, 9 * GIB])[0], 0)
+        self.assertEqual(send.call_count, 1)
+        self.assertEqual(send.call_args.args[1], sweep.FloorAlertChannels.NATEDEV_AND_PHONE)
+        self.assertIn("removed 0.0 GiB", cast(str, send.call_args.args[0]))
+        self.assertIn("Not swept: CI's targets (0.0 GiB).", cast(str, send.call_args.args[0]))
+
+    def test_under_floor_with_removable_units_left_sends_no_push(self) -> None:
+        base = self.base()
+        _, first = cargo_target(base, "first", APP, time.time() - 2 * DAY)
+        _, second = cargo_target(base, "second", DEMO, time.time() - DAY)
+        with mock.patch.object(sweep, "send_floor_alert") as send:
+            self.assertEqual(self.hold(base, 10 * GIB, [10 * GIB - 1, 10 * GIB - 1])[0], 0)
+        self.assertTrue(first.exists() or second.exists())
+        send.assert_not_called()
+
+    def test_natedev_alert_hour_does_not_hold_back_push(self) -> None:
+        base = self.base()
+        self.prior(10 * GIB, 0, alert_at=time.time() - 10 * 60)
+        with mock.patch.object(sweep, "send_floor_alert", return_value=True) as send:
+            self.assertEqual(self.hold(base, 10 * GIB, [9 * GIB, 9 * GIB])[0], 0)
+        self.assertEqual(send.call_count, 1)
+        self.assertEqual(send.call_args.args[1], sweep.FloorAlertChannels.NATEDEV_AND_PHONE)
+
+    def test_recent_push_holds_next_push_for_its_own_hour(self) -> None:
+        base = self.base()
+        self.prior(10 * GIB, 0, push_at=time.time() - 10 * 60)
+        with mock.patch.object(sweep, "send_floor_alert") as send:
+            self.assertEqual(self.hold(base, 10 * GIB, [9 * GIB, 9 * GIB])[0], 0)
+        send.assert_not_called()
+
+    def test_push_older_than_hour_is_due_again(self) -> None:
+        base = self.base()
+        self.prior(10 * GIB, 0, push_at=time.time() - 61 * 60)
+        with mock.patch.object(sweep, "send_floor_alert", return_value=True) as send:
+            self.assertEqual(self.hold(base, 10 * GIB, [9 * GIB, 9 * GIB])[0], 0)
+        self.assertEqual(send.call_count, 1)
+        self.assertEqual(send.call_args.args[1], sweep.FloorAlertChannels.NATEDEV_AND_PHONE)
+
+    def test_failed_push_does_not_start_its_hour(self) -> None:
+        base = self.base()
+        with mock.patch.object(sweep, "send_floor_alert", side_effect=[False, True]) as send:
+            self.assertEqual(self.hold(base, 10 * GIB, [9 * GIB, 9 * GIB])[0], 0)
+            first = sweep.read_floor_record(sweep.floor_record_path())
+            assert isinstance(first, sweep.FloorRecord)
+            self.assertIsInstance(first.push_history, sweep.NoDeliveredAlert)
+            self.assertEqual(self.hold(base, 10 * GIB, [9 * GIB, 9 * GIB])[0], 0)
+        self.assertEqual(send.call_count, 2)
+        latest = sweep.read_floor_record(sweep.floor_record_path())
+        assert isinstance(latest, sweep.FloorRecord)
+        self.assertIsInstance(latest.push_history, sweep.DeliveredAlert)
+
+    def test_delivered_push_stamp_uses_time_after_send(self) -> None:
+        base = self.base()
+        start = time.time()
+        clock = [start]
+
+        def deliver(_message: str, _channels: sweep.FloorAlertChannels) -> bool:
+            clock[0] = start + 80
+            return True
+
+        with (mock.patch.object(time, "time", side_effect=lambda: clock[0]),
+              mock.patch.object(sweep, "send_floor_alert", side_effect=deliver)):
+            self.assertEqual(self.hold(base, 10 * GIB, [9 * GIB, 9 * GIB])[0], 0)
+        record = sweep.read_floor_record(sweep.floor_record_path())
+        assert isinstance(record, sweep.FloorRecord)
+        self.assertEqual(record.measured_at, start)
+        self.assertEqual(record.push_history, sweep.DeliveredAlert(start + 80))
+
+    def test_recent_push_allows_natedev_removal_alert(self) -> None:
+        base = self.base()
+        _, _ = cargo_target(base, "repo", APP, time.time() - DAY)
+        self.prior(10 * GIB, 0, push_at=time.time() - 10 * 60)
+        with (mock.patch.object(sweep, "LARGE_REMOVAL_BYTES", 1),
+              mock.patch.object(sweep, "send_floor_alert", return_value=True) as send):
+            self.assertEqual(self.hold(base, 10 * GIB, [9 * GIB, 9 * GIB])[0], 0)
+        self.assertEqual(send.call_count, 1)
+        self.assertEqual(send.call_args.args[1], sweep.FloorAlertChannels.NATEDEV)
+        self.assertIn("removed more than 32 GiB", cast(str, send.call_args.args[0]))
 
     def test_failed_removal_stays_in_record_and_send_failure_keeps_status(self) -> None:
         base = self.base()
@@ -392,7 +514,7 @@ class FloorTests(SweepCase):
         before = sweep.directory_blocks(str(tree.parent))
         with (mock.patch.object(sweep, "remove", return_value=1),
               mock.patch.object(sweep, "LARGE_REMOVAL_BYTES", 1),
-              mock.patch.object(sweep, "send_floor_alert") as send):
+              mock.patch.object(sweep, "send_floor_alert", return_value=False) as send):
             status, _ = self.hold(base, 10 * GIB, [9 * GIB, 9 * GIB])
         self.assertEqual(status, 1)
         self.assertTrue(output_file.exists())
@@ -400,7 +522,10 @@ class FloorTests(SweepCase):
         self.assertIsInstance(record, sweep.FloorRecord)
         assert isinstance(record, sweep.FloorRecord)
         self.assertEqual(record.build_cache_bytes, before)
-        send.assert_not_called()
+        self.assertEqual(send.call_count, 1)
+        self.assertEqual(send.call_args.args[1], sweep.FloorAlertChannels.NATEDEV_AND_PHONE)
+        message = cast(str, send.call_args.args[0])
+        self.assertIn("Not swept: CI's targets (0.0 GiB).\nCould not remove 1 path this sweep; the next sweep tries again.", message)
 
     def test_both_sends_failing_retry_and_one_delivery_stamps_hour(self) -> None:
         base = self.base()
@@ -419,14 +544,16 @@ class FloorTests(SweepCase):
         self.assertIsInstance(record.alert_history, sweep.DeliveredAlert)
 
     def test_alert_delivery_failure_never_changes_exit_status(self) -> None:
+        send_floor_alert = sweep.send_floor_alert
         base = self.base()
         _, _ = cargo_target(base, "repo", APP, time.time() - DAY)
         with (mock.patch.object(sweep, "LARGE_REMOVAL_BYTES", 1),
               mock.patch.object(subprocess, "run", side_effect=OSError("offline")),
+              mock.patch.object(sweep, "send_floor_alert", wraps=send_floor_alert),
               redirect_stderr(io.StringIO()) as errors):
             self.assertEqual(self.hold(base, 10 * GIB, [9 * GIB, 11 * GIB])[0], 0)
         self.assertIn("message alert failed", errors.getvalue())
-        self.assertIn("phone alert failed", errors.getvalue())
+        self.assertNotIn("phone alert failed", errors.getvalue())
 
     def test_one_channel_delivering_counts_and_both_results_print(self) -> None:
         output = io.StringIO()
@@ -437,19 +564,30 @@ class FloorTests(SweepCase):
         ]
         with (mock.patch.object(subprocess, "run", side_effect=results) as run,
               redirect_stdout(output), redirect_stderr(errors)):
-            self.assertTrue(sweep.send_floor_alert("disk notice"))
+            self.assertTrue(sweep.send_floor_alert("disk notice", sweep.FloorAlertChannels.NATEDEV_AND_PHONE))
         self.assertEqual(run.call_count, 2)
         self.assertEqual(run.call_args_list[0].kwargs["input"], "disk notice")
-        self.assertEqual(run.call_args_list[1].args[0][-1], "disk notice")
+        phone_command = cast(list[str], run.call_args_list[1].args[0])
+        self.assertEqual(phone_command[-4:], ["--priority", "0", "natedev: disk under its floor", "disk notice"])
         self.assertIn("message alert queued", output.getvalue())
         self.assertIn("phone alert delivered", output.getvalue())
 
+    def test_natedev_only_channel_never_calls_phone(self) -> None:
+        result = subprocess.CompletedProcess([], 1, "", "")
+        with mock.patch.object(subprocess, "run", return_value=result) as run:
+            self.assertTrue(sweep.send_floor_alert("disk notice", sweep.FloorAlertChannels.NATEDEV))
+        self.assertEqual(run.call_count, 1)
+        message_command = cast(list[str], run.call_args.args[0])
+        self.assertIn("message/send.py", message_command[1])
+
     def test_queued_message_stamps_record_and_suppresses_next_alert(self) -> None:
+        send_floor_alert = sweep.send_floor_alert
         base = self.base()
         _, _ = cargo_target(base, "first", APP, time.time() - DAY)
-        results = [subprocess.CompletedProcess([], 1, "", ""), subprocess.CompletedProcess([], 3, "", "offline")]
+        results = [subprocess.CompletedProcess([], 1, "", "")]
         with (mock.patch.object(sweep, "LARGE_REMOVAL_BYTES", 1),
-              mock.patch.object(subprocess, "run", side_effect=results) as run):
+              mock.patch.object(subprocess, "run", side_effect=results) as run,
+              mock.patch.object(sweep, "send_floor_alert", wraps=send_floor_alert)):
             self.assertEqual(self.hold(base, 10 * GIB, [9 * GIB, 11 * GIB])[0], 0)
             record = sweep.read_floor_record(sweep.floor_record_path())
             self.assertIsInstance(record, sweep.FloorRecord)
@@ -457,7 +595,7 @@ class FloorTests(SweepCase):
             self.assertIsInstance(record.alert_history, sweep.DeliveredAlert)
             _, _ = cargo_target(base, "second", DEMO, time.time() - DAY)
             self.assertEqual(self.hold(base, 10 * GIB, [9 * GIB, 11 * GIB])[0], 0)
-        self.assertEqual(run.call_count, 2)
+        self.assertEqual(run.call_count, 1)
 
     def test_delivered_stamp_uses_time_after_send(self) -> None:
         base = self.base()
@@ -465,7 +603,7 @@ class FloorTests(SweepCase):
         start = time.time()
         clock = [start]
 
-        def deliver(_message: str) -> bool:
+        def deliver(_message: str, _channels: object) -> bool:
             clock[0] = start + 80
             return True
 
@@ -485,6 +623,41 @@ class FloorTests(SweepCase):
         path.parent.mkdir()
         _ = path.write_text("broken json")
         self.assertEqual(sweep.read_floor_record(path), sweep.NoFloorRecord())
+
+    def test_old_floor_record_has_no_push_and_push_stamp_round_trips(self) -> None:
+        _ = self.base()
+        path = sweep.floor_record_path()
+        path.parent.mkdir()
+        _ = path.write_text(json.dumps({"measured_at": 100.0, "free_bytes": 5, "build_cache_bytes": 8,
+                                        "last_alert_at": 90.0}))
+        old = sweep.read_floor_record(path)
+        self.assertEqual(old, sweep.FloorRecord(100.0, 5, 8, sweep.DeliveredAlert(90.0),
+                                                sweep.NoDeliveredAlert()))
+        record = sweep.FloorRecord(100.0, 5, 8, sweep.DeliveredAlert(90.0), sweep.DeliveredAlert(95.0))
+        sweep.write_floor_record(path, record)
+        self.assertEqual(json.loads(path.read_text())["last_push_at"], 95.0)
+        self.assertEqual(sweep.read_floor_record(path), record)
+
+    def test_invalid_push_stamp_makes_floor_record_unavailable(self) -> None:
+        _ = self.base()
+        path = sweep.floor_record_path()
+        path.parent.mkdir()
+        for value in ("yesterday", float("nan"), float("inf")):
+            _ = path.write_text(json.dumps({"measured_at": 100.0, "free_bytes": 5, "build_cache_bytes": 8,
+                                            "last_alert_at": None, "last_push_at": value}))
+            self.assertEqual(sweep.read_floor_record(path), sweep.NoFloorRecord())
+
+    def test_boolean_floor_fields_make_record_unavailable(self) -> None:
+        _ = self.base()
+        path = sweep.floor_record_path()
+        path.parent.mkdir()
+        record = {"measured_at": 100.0, "free_bytes": 5, "build_cache_bytes": 8,
+                  "last_alert_at": 90.0, "last_push_at": 95.0}
+        for field in record:
+            for value in (True, False):
+                with self.subTest(field=field, value=value):
+                    _ = path.write_text(json.dumps({**record, field: value}))
+                    self.assertEqual(sweep.read_floor_record(path), sweep.NoFloorRecord())
 
     def test_disk_measurement_names_missing_unreadable_and_old_shape(self) -> None:
         base = self.base()
@@ -542,7 +715,7 @@ class FloorTests(SweepCase):
         message = cast(str, send.call_args.args[0])
         self.assertIn("Measured folders shrank 2.0 GiB", message)
         self.assertIn("/tmp/new: grew 2.0 GiB", message)
-        self.assertIn("cover 0.0 GiB", message)
+        self.assertIn("came after buildlog-disk's last measurement", message)
 
     def test_snapshot_growth_above_fall_covers_all_without_negative_remainder(self) -> None:
         now = time.time()
@@ -551,7 +724,7 @@ class FloorTests(SweepCase):
             sweep.EarlierDiskMeasurement(datetime.fromtimestamp(now - 660, sweep.PACIFIC)),
             [], 30 * GIB,
         )
-        previous = sweep.FloorRecord(now - 120, 30 * GIB, 0, sweep.NoDeliveredAlert())
+        previous = sweep.FloorRecord(now - 120, 30 * GIB, 0, sweep.NoDeliveredAlert(), sweep.NoDeliveredAlert())
         message = sweep.floor_alert_text(now, 35 * GIB, previous, 20 * GIB, 0,
                                          ["removed more than 32 GiB in one sweep"], measurement)
         self.assertIn("cover all of it", message)
@@ -559,6 +732,20 @@ class FloorTests(SweepCase):
         self.assertEqual(message.count(sweep.pacific_time(measurement.measured_at)), 1)
         assert isinstance(measurement.comparison, sweep.EarlierDiskMeasurement)
         self.assertEqual(message.count(sweep.pacific_time(measurement.comparison.measured_at)), 1)
+
+    def test_measurement_within_fall_places_remainder_after_its_time(self) -> None:
+        now = time.time()
+        measured = datetime.fromtimestamp(now - 30, sweep.PACIFIC)
+        measurement = sweep.AvailableDiskMeasurement(
+            measured,
+            sweep.EarlierDiskMeasurement(datetime.fromtimestamp(now - 600, sweep.PACIFIC)),
+            [], 2 * GIB,
+        )
+        previous = sweep.FloorRecord(now - 120, 30 * GIB, 0, sweep.NoDeliveredAlert(),
+                                     sweep.NoDeliveredAlert())
+        message = sweep.floor_alert_text(now, 0, previous, 10 * GIB, 0, [], measurement)
+        self.assertIn(f"8.0 GiB came after {sweep.pacific_time(measured)} or outside measured folders", message)
+        self.assertNotIn("remains outside measured folders", message)
 
     def test_no_prior_floor_sweep_omits_explained_fall(self) -> None:
         now = time.time()
@@ -574,7 +761,7 @@ class FloorTests(SweepCase):
 
     def test_free_space_rise_uses_rising_wording(self) -> None:
         now = time.time()
-        previous = sweep.FloorRecord(now - 60, 20 * GIB, 0, sweep.NoDeliveredAlert())
+        previous = sweep.FloorRecord(now - 60, 20 * GIB, 0, sweep.NoDeliveredAlert(), sweep.NoDeliveredAlert())
         message = sweep.floor_alert_text(now, 35 * GIB, previous, -2 * GIB, -1 * GIB,
                                          ["removed more than 32 GiB in one sweep"],
                                          sweep.UnavailableDiskMeasurement("missing"))
@@ -595,7 +782,7 @@ class FloorTests(SweepCase):
             sweep.EarlierDiskMeasurement(datetime.fromtimestamp(now - 600, sweep.PACIFIC)),
             directories, 30 * GIB,
         )
-        previous = sweep.FloorRecord(now - 60, 30 * GIB, 0, sweep.NoDeliveredAlert())
+        previous = sweep.FloorRecord(now - 60, 30 * GIB, 0, sweep.NoDeliveredAlert(), sweep.NoDeliveredAlert())
         message = sweep.floor_alert_text(now, 35 * GIB, previous, 20 * GIB, 0,
                                          ["removed more than 32 GiB in one sweep"], measurement)
         self.assertLessEqual(len(message), 1024)

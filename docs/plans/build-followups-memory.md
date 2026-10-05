@@ -181,7 +181,7 @@ Measured 2026-10-04 11:59–12:25 PDT, read-only, from the earlyoom journal, the
 - `scripts/delegate/verify.sh` — `UNTESTED_EXAMPLES_PY`, `read_metadata`, the check before `cache_lookup`, header comments
 - `scripts/delegate/test_verify_untested_examples.py` — eight scratch-package cases through real verify.sh routing: real `cargo metadata`, a cargo stub on `PATH` that passes `metadata` to real cargo and logs every other call, and a git stub that fixes the pass-record key
 
-**Binds later work:** Phase 17's verify.sh acknowledgement goes after this refusal, at the first build step past the memory wait. A new verify.sh routing test follows `test_verify_untested_examples.py`'s stub pattern.
+**Binds later work:** Phase 18's verify.sh acknowledgement goes after this refusal, at the first build step past the memory wait. A new verify.sh routing test follows `test_verify_untested_examples.py`'s stub pattern.
 
 **Gotchas:** A failing `cargo metadata` exits with cargo's status under `set -e`, not 2. hana main has 7 offending examples; the ~/.claude main merge is held until tool-based-ui adds `test = true`.
 
@@ -408,7 +408,35 @@ Measured 2026-10-04 11:59–12:25 PDT, read-only, from the earlyoom journal, the
 
 **Ruled out:** the renderer importing from `scripts/whoami`: it parses the flat frontmatter itself; `render` splicing the Agents lines in after `footer` returns: `footer` places them.
 
-### Phase 16 — A measured working day · status: todo
+### Phase 16 — The phone hears about the disk only when the user has something to do · status: done
+
+#### As-built
+
+- After a sweep that is not a dry run, `hold_floor` in `scripts/lint/sweep.py` sends at most one alert (user, 2026-10-05). Floor out of reach — `shrink` chose every removable build unit and incremental dir and still leaves `left > budget`, and free space measured after the removals is under the floor — goes to the phone (`pushover.py --priority 0 "natedev: disk under its floor"`) and to natedev, whether or not the sweep removed anything. A sweep that ends under the floor with removable output still left sends none; the next sweep takes the rest.
+- The floor-out-of-reach alert has its own hour, `FloorRecord.push_history` (`last_push_at` in `floor.json`), apart from `alert_history` (`last_alert_at`). When it is due it is the only alert sent; when its hour holds it back, the growth and large-removal alerts keep their thresholds, text and hour, and go to natedev alone.
+- `send_floor_alert(message, channels)` takes `FloorAlertChannels.NATEDEV` or `NATEDEV_AND_PHONE` and returns whether any channel delivered.
+- `floor_out_of_reach_text` gives the sweep time and amount removed, free space against the floor, the amount to free outside build caches, a `Not swept:` line (held target dirs, CI's targets), `Could not remove <n> path(s) this sweep; the next sweep tries again.` when removals failed, then buildlog-disk's lines without the coverage line. The coverage line, with the fall starting at the previous sweep's `measured_at`: a measurement at or before that start reads `The <unaccounted> fall beyond cache growth came after buildlog-disk's last measurement at <time>.`; otherwise a remainder reads `<remainder> came after <time> or outside measured folders`.
+- `read_floor_record` rejects a JSON boolean or non-finite number in any of its five fields through `_finite_number`; a record without `last_push_at` reads with `NoDeliveredAlert`.
+- Every push is logged (user, 2026-10-05): `pushover.py` appends one JSON line per call to `~/.local/state/notify/pushover.jsonl` with `time`, `priority`, `title`, `message` as posted after the cuts, and `outcome` (`sent`, `sent, receipt <r>`, `unreachable: <error>`, `refused: <errors>`, `keys missing`). Keys are never logged, a usage error logs nothing, an unwritable log leaves the exit status unchanged, and a reply that is not a JSON object counts as refused. Every message is logged with its text (user, 2026-10-05): each `log.jsonl` line `send.py` writes carries `text`, for every outcome.
+
+**Files:**
+- `scripts/lint/sweep.py` — floor sweep, alert channels, alert texts, floor record
+- `scripts/notify/pushover.py` — Pushover sender and its JSON log
+- `scripts/message/send.py` — message sender; log lines carry the full text
+- `scripts/lint/test_sweep.py`, `scripts/notify/test_pushover.py`, `scripts/message/test_send.py` — tests
+- `commands/showrunner/produce.md` — names the push log
+
+**Binds later work:** Only the floor-out-of-reach alert reaches the phone; the growth and large-removal alerts reach natedev alone. A past push reads back from `pushover.jsonl`, a past message from `log.jsonl` `text`.
+
+**Gotchas:**
+- A failed removal does not hold back the phone push; the push names the failed count.
+- `alert_path` keeps each path's last component whole, so a text passes 1,024 characters only with leaf names over ~100 characters; `pushover.py` cuts at `MESSAGE_MAX`, after the action lines.
+- `FloorTests.base()` patches `send_floor_alert` to fail the test; a test that needs the real sender captures it before `base()` and wraps it with `subprocess.run` mocked.
+- The old `~/.local/state/notify/pushover.log` stays on disk; nothing writes or reads it.
+
+**Ruled out:** cutting a path's last component to fit 1,024 characters; withholding the push when a removal failed.
+
+### Phase 17 — A measured working day · status: todo
 
 #### Work Order
 
@@ -436,16 +464,19 @@ Measure against the target, a normal working day with no earlyoom kill, from the
 
 Tune the slice numbers from what it shows. A changed limit needs another measured day after it. Say whether per-crate admission or nextest thread limits are needed after all. A per-slice sample field that still reads "unavailable" is a deployment fault.
 
-*The staggering verdict.* From the observed release, say whether the admission already staggers the held sessions. If it does not, Phase 17 builds the one-session-at-a-time release; if it does, Phase 17 is dropped. If no natural release happened after Phase 10's admission went live, say so: the verdict is open and Phase 17 stays deferred until such a release is observed, never dropped for want of one. The verdict also says whether a session whose first build is a BRP launch needs an acknowledgement of its own, since launches do not run through `invoke.sh` and acknowledge nothing today.
+*The staggering verdict.* From the observed release, say whether the admission already staggers the held sessions. If it does not, Phase 18 builds the one-session-at-a-time release; if it does, Phase 18 is dropped. If no natural release happened after Phase 10's admission went live, say so: the verdict is open and Phase 18 stays deferred until such a release is observed, never dropped for want of one. The verdict also says whether a session whose first build is a BRP launch needs an acknowledgement of its own, since launches do not run through `invoke.sh` and acknowledge nothing today.
 
 *Who takes the end snapshot.* The unit director takes it at 2026-10-05 15:26 PDT whatever the state of Phase 6's merge; this phase never waits on another phase to keep its window. Sources the writer and the checker both use: hold times from each holder file's `since`; release times from the `/build_hold release` output in the session transcripts and natedev's relay log; each session's build start from build-log `steps.started_at` and `mem_wait_s`.
 
 Baseline before the diff: natedev's stopgap 160efd9 put CI in steve on 2026-10-04. The first CI run with it, 37227844227, still lost both Linux jobs to earlyoom: the hana bin's rustc was killed at 12:29:58 and 12:30:09 PDT, about 3.3 GB RSS each with oom_score_adj 500, at about 2.8 of 56.5 GB available. Sharing steve's slots alone does not stop the kills.
 
+- A disk interval with no sweep on record is inconclusive, never "no sweep": the background sweep after each build step (`scripts/lint/invoke.sh:262`) discards its output, `floor.json` keeps only the latest sweep, and the alert hours can hold a notice back. The day's figures say which cold-cache intervals the record cannot cover.
+
 **Files:**
 - `docs/plans/build-followups-memory.md` — the day's figures, the CI threshold and the conclusions, in this phase
 - `docs/plans/build-followups-memory-nixos-*.diff` — any follow-up `/etc/nixos` diff for natedev; `-ci-pool.diff` is CI's own slot pool
 - `scripts/buildlog/{memory,sample,cli,index,launches,report}.py` — the instruments, read only
+- `scripts/lint/{invoke.sh,sweep.py}` — the background sweep and the floor record, read only
 
 **Seats:** `1 writer + 1 tester` — the measurement and the test lane are disjoint.
 - `impl` — measures the day and writes the result; owns any `/etc/nixos` diff; hub: `docs/plans/build-followups-memory.md` (the result lands here; the tester sends its checks to the writer)
@@ -457,27 +488,47 @@ Baseline before the diff: natedev's stopgap 160efd9 put CI in steve on 2026-10-0
 - Phase 4: each holder file in `~/.local/state/build-hold/` (`BUILD_HOLD_DIR` overrides it; tests always set it) is one JSON line `{"holder", "since", "for", "release_eta"}`, where `release_eta` is an ISO instant or `unknown`; the old one-line form still reads. `scripts/build_hold/build_hold.py` has `hold` (`--release-eta HH:MM` needs `--zone`), `quiet`, `release` and `status`. `release` prints `released, builds may resume.` only when no holder file remains, else `released; still held by …`. `quiet` is busy while this user's `cargo`, `rustc` or `cargo-nextest` runs or the 1-minute load is at or above a quarter of the cores, and waits at most 10 minutes; `ps` needs `user:32`, or procps cuts long names. `HoldState = NoHolders | ActiveHolders`, `ReleaseEta = KnownReleaseEta | UnknownReleaseEta`, and `quiet_verdict` takes `Cores = KnownCores | UnknownCores` (Phase 5). `dailies_render.py` reads holds through `read_dailies_hold()` and refuses a unit marker with no holder file, active holders with no marked unit, and plumbing words in a holder's purpose. `scripts/buildlog/rust_release.py` treats any regular file in the hold directory as a hold.
 - Times carry their zone; natedev's clock and journal are EDT, and this plan states PDT.
 - Phase 10: `buildlog_wait_for_memory` (`scripts/lint/invoke.sh`) waits while `MemAvailable` is under 12 GiB (`BUILDLOG_MEMINFO`, default `/proc/meminfo`) before every step that compiles, recorded or not; `buildlog_step_compiles` lets `sweep.py` and `cargo [+toolchain] fmt` start at once; `steps.mem_wait_s` is non-zero only when the gate waited.
-- Phase 11: each floor sweep rewrites `~/.local/state/lint-sweep/floor.json`, which holds the latest sweep only (`measured_at`, `free_bytes`, `build_cache_bytes`, `last_alert_at`); a sweep that removes more than 32 GiB, or follows a fall of more than 10 GiB beyond build-cache growth, alerts natedev (`send.py --from disk_floor`) and by Pushover, at most once an hour. Read past sweeps from `journalctl --user -u disk-floor` (EDT stamps), not from `floor.json`. `buildlog disk`'s `disk.json`, also the latest only, carries `outside_build_caches` and `outside_build_cache_totals` with growth since the previous snapshot.
+- Phase 11: each floor sweep rewrites `~/.local/state/lint-sweep/floor.json`, which holds the latest sweep only (`measured_at`, `free_bytes`, `build_cache_bytes`, `last_alert_at`, and since Phase 16 `last_push_at`); a sweep that removes more than 32 GiB, or follows a fall of more than 10 GiB beyond build-cache growth, alerts natedev alone (`send.py --from disk_floor`), at most once an hour. Phase 16: only a sweep that has removed every build cache it may and still ends under the floor also pushes to the phone, at most once an hour on its own clock. Every push is logged with its full text in `~/.local/state/notify/pushover.jsonl`, and every message in `~/.local/state/message/log.jsonl` (`text`). Read past sweeps from `journalctl --user -u disk-floor` (EDT stamps), not from `floor.json`. `buildlog disk`'s `disk.json`, also the latest only, carries `outside_build_caches` and `outside_build_cache_totals` with growth since the previous snapshot.
 - Phase 12: `launches.py` records a launch started without a `path` against its `working_directory`'s worktree; a launch whose location is outside any repository or no longer exists is stored with `worktree` null. Branch and SHA are read when the collector runs, not when the launch ran: launches the first re-read recovers from transcript lines read before Phase 12 carry no branch or SHA, and an unknown-worktree launch has neither. `collect()` returns `LaunchCounts` for its one pass (`recorded`, `added`, `unresolved` for new records with no worktree, `no_location`, `no_result`, `not_a_launch`), printed by `buildlog launches` and on stderr by the day's report. Smoke on a copy of the store, 2026-10-04 22:1x PDT: 366 launches found and recorded, 125 new, 37 with an unknown worktree, 6 results without launch facts.
 
 **Acceptance gate:** the original day reported at 2026-10-05 15:26 PDT; each newer control (CI's pool from 18:43 PDT, the builds slice from 19:36 PDT, Phase 10's admission once live) labeled provisional until its own complete day, with its workload and snapshot coverage; the day's report, each CI run's figures, the threshold and the conclusions written in this phase, each figure's window complete or marked inconclusive; the staggering verdict stated; `bash -n` on any changed shell.
 
-### Phase 17 — One session at a time · status: todo
+### Phase 18 — One session at a time · status: todo
 
 #### Work Order
 
-**Goal:** when Phase 16 finds the admission does not stagger held sessions, the last holder's `/build_hold release` releases them one at a time, each after the previous one's first build step is past its memory wait and starting its compiler.
+**Pending decision:** **When may the next session be released?**
+
+Actual problem:
+The driver releases the next session 5 minutes after a release with no mark (`NoAdmissionAck`). A session whose first build starts late, or whose first build is a BRP launch (which writes no mark), can then compile alongside the next one, the overlap this phase exists to stop.
+
+What exists now:
+- The Work Order advances on `NoAdmissionAck` after 5 minutes, and adds a launch acknowledgement only if Phase 17's verdict asks for one.
+
+What should change:
+- Advance only on a known admission (a `MemoryGateReturned` mark, or a launch acknowledgement added in this phase), with a longer named timeout for a session that never builds.
+
+Recommendation:
+Advance only on a known admission, instrument the BRP launch path here rather than waiting on Phase 17's verdict, and keep a 15-minute `NoAdmissionAck` for a session that never builds; add a test where a late first build would have overlapped.
+
+Approve this direction, or modify it?
+
+**Goal:** when Phase 17 finds the admission does not stagger held sessions, the last holder's `/build_hold release` releases them one at a time, each after the previous one's first build step is past its memory wait and starting its compiler.
 
 **Spec:**
-- Runs only if Phase 16's verdict says the admission does not stagger the sessions. A verdict that it does drops this phase; with no observed release the verdict is open and this phase stays deferred until one is observed.
+- Runs only if Phase 17's verdict says the admission does not stagger the sessions. A verdict that it does drops this phase; with no observed release the verdict is open and this phase stays deferred until one is observed.
 - Only the last holder starts it. While another holder file remains, `release` names who still holds and releases no session (Phase 4's behavior). The holder's file stays until the last session is released, so `status`, the renderer and `rust_release.py` keep seeing the hold.
 - Release progress is one typed state per held session, in release order: `AwaitingRelease`, `ReleasedAwaitingAdmission(released_at)`, `WaitingForMemory(released_at, wait_started_at)`, `PastMemoryWait(wait_ended_at, outcome)` with outcome `Granted`, `TimedOut` or `MeminfoUnavailable`, `NoAdmissionAck(released_at)`, each carrying only the instants valid in it. `wait_ended_at` is when the memory wait returned: only `Granted` says memory was there, and no outcome proves the compiler started. It is stored in `~/.local/state/build-hold-release/` (`BUILD_HOLD_RELEASE_DIR` overrides it), never in the holder directory, which every reader treats as holds; read back on each step, never kept in memory.
 - `release` messages one session at a time, directly (below). A session moves to `WaitingForMemory` when its first build step starts a memory wait, and to `PastMemoryWait` when that wait returns, whatever the outcome, since its build proceeds either way: `buildlog_wait_for_memory` in `scripts/lint/invoke.sh` (`:107`) writes the first mark when it begins to wait, and `run_once` (`:191`) writes the second right after the wait returns (`:195`), as the last thing before the step's `buildlog_exec` (`:209`, `:222`), both keyed by the session's id (below) into the release directory. A step that does not wait writes only the second. A call that builds nothing (an example-gate refusal, a pass-record hit) writes none.
 - **Who is released.** The holds know holders, not held sessions (`build_hold.py:220`), and today's release goes to every top-level session (`commands/build_hold.md:10`). The hold text `hold` prints (`build_hold.py:217`), which `/build_hold` sends to every top-level session (`commands/build_hold.md:7`), tells each recipient to run `python3 ~/.claude/scripts/build_hold/build_hold.py wait` at once, and `commands/build_hold.md` gains that recipient step. A session that finds the hold, top-level session or unit director, registers with `build_hold.py wait`, which records its `CLAUDE_CODE_SESSION_ID` in arrival order in the release directory. That id is the one identity: `release` resolves it to the session's name through the live session records (`scripts/message/sessions.py`) and sends to that session alone with `scripts/message/send.py --to <name>`, never the `/notify_top_level` broadcast, and after `NoAdmissionAck` moves to the next. `invoke.sh` keys its marks by the same variable, which a unit director's seats inherit through `implement.sh` and the codex server (no `shell_environment_policy` filters it); a step with no id in its environment writes no mark. A registered session missing from the live records becomes `NoAdmissionAck` at its turn, named in the release text. `status` and the dailies renderer show each held session's state. The acknowledgement proves admission, not a finished build.
 - A session with no mark 5 minutes after its release becomes `NoAdmissionAck`; the next session is released and the release text names it. A session in `WaitingForMemory` is not unresponsive: the next release waits for its `PastMemoryWait`, which the wait's own limit bounds (`BUILDLOG_MEM_WAIT_LIMIT_S`, 900 s by default), so two held builds never start together when memory frees. A `WaitingForMemory` older than that limit plus one minute becomes `NoAdmissionAck`.
-- **The driver.** `release` stays running in the last holder's session: it messages one session, polls the release directory every 15 s, and moves on at a `PastMemoryWait` or a `NoAdmissionAck`. Progress is the stored states, so `release --resume` continues after a restart. A session whose first build is a BRP launch writes no mark, since launches do not run through `invoke.sh`, and becomes `NoAdmissionAck` after 5 minutes; when Phase 16's verdict says launch builds need an acknowledgement of their own, this Work Order gains it before dispatch.
+- **The driver.** `release` stays running in the last holder's session: it messages one session, polls the release directory every 15 s, and moves on at a `PastMemoryWait` or a `NoAdmissionAck`. Progress is the stored states, so `release --resume` continues after a restart. A session whose first build is a BRP launch writes no mark, since launches do not run through `invoke.sh`, and becomes `NoAdmissionAck` after 5 minutes; when Phase 17's verdict says launch builds need an acknowledgement of their own, this Work Order gains it before dispatch.
 - **One lock.** `release.lock` in the release directory (`flock`) serializes `wait`, every `release` step, `release --resume` and the final check. `wait` registers only while a holder file exists, under the lock. Under the same lock, `release` removes the last holder file only after re-reading the registrations and finding none still `AwaitingRelease`, so a session that registers during the release is released in its turn, and one that arrives after the hold is gone finds no hold and builds.
 - Tests: a received hold whose recipient runs `wait` is released in its turn, and its mark ends its turn; partial progress (some released, some waiting), a missing mark, another active holder, a memory wait longer than 5 minutes holding the next release until it returns, a registration during a release released in its turn, a resumed release that finishes and clears the hold, one direct send per step to the registered session's name (`send.py` stubbed), a seat-shaped environment whose mark carries the unit director's id, and `status`, the dailies renderer and `rust_release.py` showing no phantom holder from the release directory, including after the last release clears it.
+
+- **Every recipient is accounted for.** The `/notify_top_level` broadcast is forwarded asynchronously, so an empty roster proves nothing. The hold records the recipients `scripts/message/top_level.py` forwarded it to, and the last holder's final check clears the hold only once each has registered or passed a named `NoRegistration` timeout. Tests: an empty roster and a late registration.
+- **A release is a delivery.** `release` stores the send's outcome as `Delivered`, `Queued` or `Failed` (`send.py` exit 0, 1, 3), sent to the registered id's own socket (`scripts/message/sessions.py:82`), never a name two sessions may share. The admission clock starts only at `Delivered`; `status` and the dailies renderer show a queued or failed release. Tests: each outcome and a duplicate name.
+- **States say what was observed.** `PastMemoryWait` becomes `MemoryGateReturned(outcome)`: `invoke.sh:107` reports only the elapsed wait today, so this phase adds the outcome (`Granted`, `TimedOut`, `MeminfoUnavailable`). A step with no session id is a named state, not a missing mark, and only compiling steps write marks. Tests: immediate admission, each outcome, and the exempt sweep and fmt commands.
 
 **Files:**
 - `scripts/build_hold/build_hold.py` — release states, release directory, one-at-a-time release
@@ -488,6 +539,8 @@ Baseline before the diff: natedev's stopgap 160efd9 put CI in steve on 2026-10-0
 - `scripts/delegate/test_verify_release_ack.py` — the acknowledgement routing cases
 - `scripts/production/test_dailies_render_holds.py` — each held session's state
 - `scripts/message/{sessions,send}.py` — the live session records and the direct send, read only
+- `scripts/message/top_level.py` — the recipients the hold was forwarded to
+- `commands/notify_top_level.md` — the broadcast, read only
 
 **Seats:** `1 writer + 1 tester` — the helper and its tests split by file.
 - `impl` — `scripts/build_hold/build_hold.py`, `commands/build_hold.md`, `scripts/lint/invoke.sh`, `scripts/production/dailies_render.py`; hub: `scripts/build_hold/build_hold.py`

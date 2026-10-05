@@ -8,7 +8,8 @@ Priority 0 is a normal notification, 1 high (sounds in Pushover's quiet hours),
 for at most EXPIRE_S. Which events get which priority is each caller's policy.
 
 The keys are in KEYS_FILE (PUSHOVER_USER, PUSHOVER_TOKEN; 0600, filled in by the
-user). Nothing here prints them. Every send is logged to LOG_FILE.
+user). Nothing here prints them. (user, 2026-10-05) Each LOG_FILE JSON line
+holds the local time, priority, posted title and message, and outcome.
 
 Exit 0 sent, 1 Pushover refused it or could not be reached, 2 usage or keys
 missing.
@@ -28,7 +29,7 @@ from typing import TypedDict, cast
 
 API_URL = "https://api.pushover.net/1/messages.json"
 KEYS_FILE = Path.home() / ".config" / "pushover" / "env"
-LOG_FILE = Path.home() / ".local" / "state" / "notify" / "pushover.log"
+LOG_FILE = Path.home() / ".local" / "state" / "notify" / "pushover.jsonl"
 PRIORITIES = ("0", "1", "2")
 RETRY_S = 300
 EXPIRE_S = 10800
@@ -88,11 +89,15 @@ def http_post(url: str, data: bytes) -> tuple[int, bytes]:
         return error.code, error.read()
 
 
-def log(priority: str, title: str, outcome: str) -> None:
-    LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
-    stamp = datetime.now().astimezone().strftime("%Y-%m-%d %H:%M:%S %Z")
-    with LOG_FILE.open("a") as out:
-        _ = out.write(f"{stamp} | p{priority} | {title} | {outcome}\n")
+def log(priority: str, title: str, message: str, outcome: str) -> None:
+    entry = {"time": datetime.now().astimezone().replace(microsecond=0).isoformat(),
+             "priority": priority, "title": title, "message": message, "outcome": outcome}
+    try:
+        LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
+        with LOG_FILE.open("a", encoding="utf-8") as out:
+            _ = out.write(json.dumps(entry) + "\n")
+    except OSError as error:
+        print(f"pushover: could not write log: {error}", file=sys.stderr)
 
 
 def send(argv: list[str], keys_file: Path = KEYS_FILE, post: Post = http_post) -> int:
@@ -106,29 +111,32 @@ def send(argv: list[str], keys_file: Path = KEYS_FILE, post: Post = http_post) -
         print(USAGE, file=sys.stderr)
         return 2
     title, message = argv
+    title, message = title[:TITLE_MAX], message[:MESSAGE_MAX]
     keys = read_keys(keys_file)
     if keys is None:
+        log(priority, title, message, "keys missing")
         print(f"pushover: PUSHOVER_USER and PUSHOVER_TOKEN must both be set in {keys_file}", file=sys.stderr)
         return 2
     data = urllib.parse.urlencode(fields(keys, title, message, priority)).encode()
     try:
         status, raw = post(API_URL, data)
     except (urllib.error.URLError, TimeoutError) as error:
-        log(priority, title, f"unreachable: {error}")
+        log(priority, title, message, f"unreachable: {error}")
         print(f"pushover: could not reach Pushover: {error}", file=sys.stderr)
         return 1
     try:
-        reply = cast(Reply, json.loads(raw))
+        decoded = cast(object, json.loads(raw))
     except json.JSONDecodeError:
-        reply = Reply()
+        decoded = None
+    reply = cast(Reply, cast(object, decoded)) if isinstance(decoded, dict) else Reply()
     if status == 200 and reply.get("status") == 1:
         receipt = reply.get("receipt")
         outcome = f"sent, receipt {receipt}" if receipt else "sent"
-        log(priority, title, outcome)
+        log(priority, title, message, outcome)
         print(f"pushover: {outcome}")
         return 0
     errors = "; ".join(reply.get("errors", [])) or f"HTTP {status}"
-    log(priority, title, f"refused: {errors}")
+    log(priority, title, message, f"refused: {errors}")
     print(f"pushover: refused: {errors}", file=sys.stderr)
     return 1
 
