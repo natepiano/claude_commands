@@ -20,6 +20,10 @@ that builds the wrong thing.
    and lexical paths. Work Orders do not declare reservations; the edit hook
    claims exact paths on first touch.
 
+   Read plan sections with the Read tool (Grep for the heading, then
+   `offset`/`limit`), never `sed`, `cat` or `awk` through Bash: the auto-mode
+   check refuses those as instruction poisoning.
+
    Then scan the target Work Order for `**Pending decision:**`.
    Verify cited code still matches the block. **Re-test the block against
    <DecisionRouting/> before presenting it** — a block is a claim that a decision
