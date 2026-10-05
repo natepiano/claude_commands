@@ -16,6 +16,7 @@ AT = "2026-10-04T11:00"
 ZONE = "America/Los_Angeles"
 FENCE = "```"
 FOR = "the frame-time lane's breakdown of what each added tool costs"
+AGENT_LINES = ["### Agents", "- none active", ""]
 
 
 @dataclass(frozen=True)
@@ -55,6 +56,9 @@ def holder(release: str = "unknown", name: str = "frame-time", since: str = "202
 
 
 def run(arguments: list[str], scratch: str, holders: list[dict[str, str]] | None = None) -> Run:
+    # HOME puts the renderer's AGENTS_DIR and READINGS_LOG under this test directory.
+    (Path(scratch) / "rust/hanadocs/agents").mkdir(parents=True, exist_ok=True)
+    (Path(scratch) / ".local/state/agent-notes").mkdir(parents=True, exist_ok=True)
     hold_dir = Path(scratch) / "holds"
     hold_dir.mkdir(exist_ok=True)
     for index, record in enumerate(holders or []):
@@ -107,7 +111,7 @@ class ReportFooterTests(unittest.TestCase):
     def test_hold_line_and_unit_marker(self) -> None:
         lines = self.lines(render(report(True), holders=[holder("2026-10-04T11:15:00-07:00")]))
         self.assertIn("12:40 build hold", next(row for row in timeline(lines) if row.startswith("widget")))
-        self.assertEqual(after_timeline(lines), ["", f"build hold: frame-time since 10:56 PDT, for {FOR} - release eta: 11:15 PDT (15 minutes)", "", "11:00 PDT · next dailies 11:30 PDT - nothing needed"])
+        self.assertEqual(after_timeline(lines), ["", f"build hold: frame-time since 10:56 PDT, for {FOR} - release eta: 11:15 PDT (15 minutes)", "", *AGENT_LINES, "11:00 PDT · next dailies 11:30 PDT - nothing needed"])
 
     def test_one_minute_is_singular(self) -> None:
         tail = self.tail(render(report(True), holders=[holder("2026-10-04T11:01:00-07:00")]))
@@ -146,15 +150,15 @@ class ReportFooterTests(unittest.TestCase):
         records = [holder("2026-10-04T11:01:00-07:00")]
         report_tail = after_timeline(self.lines(render(report(True), holders=records)))
         footer_lines = self.lines(footer("--next-run", "11:30", "--nothing-needed", holders=records))
-        self.assertEqual(report_tail, ["", *footer_lines])
+        self.assertEqual(report_tail, ["", *footer_lines[:-1], *AGENT_LINES, footer_lines[-1]])
 
     def test_no_hold_and_no_schedule(self) -> None:
-        self.assertEqual(after_timeline(self.lines(render(report(False, next_run=None)))), ["", "11:00 PDT · no dailies scheduled - nothing needed"])
+        self.assertEqual(after_timeline(self.lines(render(report(False, next_run=None)))), ["", *AGENT_LINES, "11:00 PDT · no dailies scheduled - nothing needed"])
         self.assertEqual(self.lines(footer()), ["11:00 PDT · no dailies scheduled"])
 
     def test_a_needed_subject_drops_nothing_needed(self) -> None:
         tail = self.tail(render(report(False, needed="the showrunner settles the shared font")))
-        self.assertEqual(tail, ["", "11:00 PDT · next dailies 11:30 PDT"])
+        self.assertEqual(tail, ["", *AGENT_LINES, "11:00 PDT · next dailies 11:30 PDT"])
 
     def test_outstanding_items_list_and_drop_nothing_needed(self) -> None:
         items = [{"since": "2026-10-03T09:05", "text": "send the Bevy PR"}, {"since": "2026-10-04T10:40", "text": "pick the demo scene"}]

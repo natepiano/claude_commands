@@ -1,11 +1,14 @@
 """Account attribution and stale-data behavior of the vault writer."""
 
+import json
 import tempfile
 import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import override
+from unittest.mock import patch
 
+import agent_notes
 from agent_accounts import Quota, Report, reset_credits
 from agent_notes import Note, apply, local_reset, read_note
 
@@ -22,6 +25,7 @@ class AgentNotesTests(unittest.TestCase):
         directory = tempfile.TemporaryDirectory()
         self.addCleanup(directory.cleanup)
         self.root = Path(directory.name)
+        _ = self.enterContext(patch.object(agent_notes, "READINGS_LOG", self.root / "readings.jsonl", create=True))
 
     def note(self, name: str, email: str, extra: str = "") -> Note:
         path = self.root / name
@@ -104,6 +108,50 @@ class AgentNotesTests(unittest.TestCase):
         _ = apply([note], Report("Claude", email="a@example.com"), self.now)
         self.assertEqual(note.get("limit_reset"), "2026-10-22")
         self.assertEqual(note.get("limit_reset_count"), "1")
+
+    def test_reading_for_each_active_value_and_none_for_null_or_inactive(self):
+        checked = datetime(2026, 10, 5, 19, 45, tzinfo=timezone.utc)
+        first = self.note("claude 1.md", "a@example.com")
+        second = self.note("claude 2.md", "a@example.com")
+        inactive = self.note("claude 3.md", "b@example.com")
+        weekly = Quota("Weekly", 40, checked + timedelta(days=2))
+        _ = apply([second, inactive, first], Report("Claude", email="a@example.com", quotas=[weekly]), checked)
+        path = self.root / "readings.jsonl"
+        records = [json.loads(line) for line in path.read_text().splitlines()]
+        self.assertCountEqual(records, [
+            {"account": "claude 1", "at": "2026-10-05T19:45:00+00:00", "remaining": 60},
+            {"account": "claude 2", "at": "2026-10-05T19:45:00+00:00", "remaining": 60},
+        ])
+        _ = apply([first, second, inactive], Report("Claude", email="a@example.com"), checked + timedelta(minutes=2))
+        self.assertEqual(len(path.read_text().splitlines()), 2)
+        self.assertEqual(inactive.get("state"), "inactive")
+
+    def test_reading_log_keeps_only_the_last_eight_days(self):
+        checked = datetime(2026, 10, 5, 19, 45, tzinfo=timezone.utc)
+        note = self.note("claude 1.md", "a@example.com")
+        path = self.root / "readings.jsonl"
+        old = {"account": "claude 1", "at": "2026-09-27T19:44:59+00:00", "remaining": 70}
+        recent = {"account": "claude 1", "at": "2026-09-27T19:45:00+00:00", "remaining": 65}
+        _ = path.write_text(json.dumps(old) + "\n" + json.dumps(recent) + "\n")
+        _ = apply([note], Report("Claude", email="a@example.com", quotas=[
+            Quota("Weekly", 40, checked + timedelta(days=2))
+        ]), checked)
+        records = [json.loads(line) for line in path.read_text().splitlines()]
+        self.assertEqual(records, [recent, {
+            "account": "claude 1", "at": "2026-10-05T19:45:00+00:00", "remaining": 60,
+        }])
+
+    def test_unwritable_log_reports_once_and_keeps_note_write(self):
+        checked = datetime(2026, 10, 5, 19, 45, tzinfo=timezone.utc)
+        note = self.note("claude 1.md", "a@example.com")
+        (self.root / "readings.jsonl").mkdir()
+        messages = apply([note], Report("Claude", email="a@example.com", quotas=[
+            Quota("Weekly", 40, checked + timedelta(days=2))
+        ]), checked)
+        self.assertEqual(note.get("weekly_remaining_usage"), "60")
+        self.assertEqual(note.get("weekly_usage_checked_at"), "2026-10-05T19:45:00+00:00")
+        self.assertEqual(len(messages), 2)
+        self.assertEqual(sum("log" in message.lower() or "readings" in message.lower() for message in messages), 1)
 
 
 if __name__ == "__main__":

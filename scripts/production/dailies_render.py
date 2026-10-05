@@ -40,6 +40,7 @@ The input format is in ~/.claude/commands/showrunner/dailies.md.
 
 import argparse
 import json
+import math
 import re
 import sys
 import unicodedata
@@ -90,6 +91,8 @@ DOT_RANGED = "●━"
 # The chart mode every showrunner's dailies use, kept in one file so no
 # session has to remember it (user, 2026-10-03). `--chart` sets it.
 CHART_CONF = Path.home() / ".local/state/showrunner/dailies.conf"
+AGENTS_DIR = Path.home() / "rust" / "hanadocs" / "agents"
+READINGS_LOG = Path.home() / ".local/state/agent-notes/readings.jsonl"
 CHART_KEY = "chart"
 NOW_MARK = "▼ "
 # A unit under a /build_hold carries this marker on its timeline row; no
@@ -239,6 +242,19 @@ class ChartStyle:
     range_fill: str
     latest: str
     show_range: bool
+
+
+@dataclass(frozen=True, order=True)
+class _AgentReading:
+    at: datetime
+    used_percent: float
+
+
+@dataclass(frozen=True)
+class _AgentWeekUsage:
+    reset_at: datetime
+    checked_at: datetime
+    used_percent: float
 
 
 CHART_STYLES = {
@@ -882,13 +898,148 @@ def hold_line(holder: Holder, now: datetime, zone: ZoneInfo) -> str:
     return f"{BUILD_HOLD_MARK}: {holder.name} since {since:%H:%M} {since:%Z}, for {holder.purpose} - release eta: {release}"
 
 
+def machine_local(value: datetime) -> datetime:
+    """Interpret an offset-free wall time in the machine's time zone."""
+    return value.astimezone()
+
+
+def agent_time(value: str | None) -> datetime | None:
+    if not value or value == "null":
+        return None
+    try:
+        return machine_local(datetime.fromisoformat(value))
+    except ValueError:
+        return None
+
+
+def agent_number(value: str | None) -> float | None:
+    if value is None or value == "null":
+        return None
+    try:
+        number = float(value)
+    except ValueError:
+        return None
+    return number if math.isfinite(number) else None
+
+
+def agent_fields(path: Path) -> dict[str, str]:
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except (OSError, UnicodeError):
+        return {}
+    if not lines or lines[0] != "---":
+        return {}
+    if "---" not in lines[1:]:
+        return {}
+    fields: dict[str, str] = {}
+    for line in lines[1:]:
+        if line == "---":
+            break
+        if (match := re.fullmatch(r"([A-Za-z_][\w-]*):\s*(.*?)\s*", line)) is not None:
+            fields[match.group(1)] = match.group(2).strip("\"'")
+    return fields
+
+
+def agent_readings() -> dict[str, list[_AgentReading]]:
+    readings: dict[str, list[_AgentReading]] = {}
+    try:
+        lines = READINGS_LOG.read_text(encoding="utf-8").splitlines()
+    except (OSError, UnicodeError):
+        return readings
+    for line in lines:
+        try:
+            item = cast(object, json.loads(line))
+            if not isinstance(item, dict):
+                continue
+            record = cast(dict[str, object], item)
+            account = record.get("account")
+            at_text = record.get("at")
+            remaining = record.get("remaining")
+            if not isinstance(account, str) or not isinstance(at_text, str):
+                continue
+            at = datetime.fromisoformat(at_text)
+            if at.tzinfo is None or isinstance(remaining, bool) or not isinstance(remaining, (int, float)) or not math.isfinite(remaining):
+                continue
+            readings.setdefault(account, []).append(_AgentReading(at, 100 - remaining))
+        except (ValueError, TypeError, KeyError):
+            continue
+    return readings
+
+
+def agent_refill(reset: datetime, now: datetime, zone: ZoneInfo) -> str:
+    local = reset.astimezone(zone)
+    return f"{local:%H:%M} today" if local.date() == now.date() else f"{local:%a %H:%M}"
+
+
+def agent_resets(fields: dict[str, str], zone: ZoneInfo) -> str:
+    raw = fields.get("limit_reset_count")
+    try:
+        count = int(raw) if raw is not None else None
+    except ValueError:
+        count = None
+    if count is None:
+        return "resets unknown"
+    if count <= 0:
+        return "no resets available"
+    expiration = agent_time(fields.get("limit_reset"))
+    until = f" until {expiration.astimezone(zone):%b %-d}" if expiration else ""
+    return f"{count} reset{'' if count == 1 else 's'} available{until}"
+
+
+def agent_line(name: str, fields: dict[str, str], readings: list[_AgentReading], now: datetime, zone: ZoneInfo) -> str:
+    resets = agent_resets(fields, zone)
+    reset = agent_time(fields.get("resets"))
+    refill = agent_refill(reset, now, zone) if reset and reset.timestamp() > now.replace(tzinfo=zone).timestamp() else None
+    remaining = agent_number(fields.get("weekly_remaining_usage"))
+    if remaining is None or refill is None or reset is None:
+        return f"- {name}: week's usage unknown; {'refills ' + refill if refill else 'refill time unknown'}; {resets}"
+    week = _AgentWeekUsage(reset, agent_time(fields.get("weekly_usage_checked_at")) or now.replace(tzinfo=zone), 100 - remaining)
+    if week.used_percent >= 100:
+        return f"- {name}: {week.used_percent:g}% of the week used; out until its {refill} refill; {resets}"
+    last_refill = machine_local((week.reset_at - timedelta(days=7)).replace(tzinfo=None))
+    first_allowed = max(last_refill.timestamp(), now.replace(tzinfo=zone).timestamp() - timedelta(hours=24).total_seconds())
+    recent = sorted(reading for reading in readings if first_allowed <= reading.at.timestamp() <= week.checked_at.timestamp())
+    if len(recent) >= 2 and recent[-1].at.timestamp() - recent[0].at.timestamp() >= 3600:
+        rate = (recent[-1].used_percent - recent[0].used_percent) / (recent[-1].at.timestamp() - recent[0].at.timestamp())
+    else:
+        elapsed = week.checked_at.timestamp() - last_refill.timestamp()
+        rate = week.used_percent / elapsed if elapsed > 0 else 0
+    if rate <= 0:
+        pace = f"lasts to its {refill} refill"
+    else:
+        run_out_seconds = week.checked_at.timestamp() + (100 - week.used_percent) / rate
+        rounded_seconds = math.floor((run_out_seconds + 30) / 60) * 60
+        run_out = datetime.fromtimestamp(rounded_seconds, zone)
+        if run_out.timestamp() >= week.reset_at.timestamp():
+            pace = f"lasts to its {refill} refill"
+        else:
+            time_text = f"{run_out:%H:%M %Z} today" if run_out.date() == now.date() else f"{run_out:%a %H:%M %Z}"
+            pace = f"runs out about {time_text}, before its {refill} refill"
+    return f"- {name}: {week.used_percent:g}% of the week used; {pace}; {resets}"
+
+
+def agent_section(now: datetime, zone: ZoneInfo) -> list[str]:
+    readings = agent_readings()
+    lines = ["### Agents"]
+    for path in sorted(AGENTS_DIR.glob("*.md")):
+        fields = agent_fields(path)
+        if fields.get("state") == "active":
+            lines.append(agent_line(path.stem, fields, readings.get(path.stem, []), now, zone))
+    if len(lines) == 1:
+        lines.append("- none active")
+    lines.append("")
+    return lines
+
+
 def footer(
-    now: datetime, zone: ZoneInfo, zone_name: str, next_run: str | None, hold: HoldState, outstanding: list[Outstanding], *, nothing_needed: bool
+    now: datetime, zone: ZoneInfo, zone_name: str, next_run: str | None, hold: HoldState, outstanding: list[Outstanding], *,
+    nothing_needed: bool, agent_lines: list[str]
 ) -> list[str]:
     """One line per active holder, what waits on the user, then the time and next report."""
     lines = [hold_line(holder, now, zone) for holder in hold.holders] if isinstance(hold, ActiveHolders) else []
     if lines:
         lines.append("")
+    lines.extend(agent_lines)
     # An item the user deferred stays hidden until its `after` time, in the report's zone.
     local_now = now.astimezone(zone).replace(tzinfo=None) if now.tzinfo else now
     outstanding = [item for item in outstanding if item.after is None or item.after <= local_now]
@@ -992,7 +1143,9 @@ def render(report: Report, previous: dict[str, Previous], now: datetime, zone_na
         rows.append(Row(unit.label, Estimate(unit.started, moment, earliest, latest), unit.build_hold, plan))
     lines.extend(["```", *draw(now, rows, CHART_STYLES[report.chart]), "```", ""])
     needed = any(unit.needed for unit in report.units) or any(topic.needed for topic in report.topics)
-    lines.extend(footer(now, ZoneInfo(report.zone), zone_name, report.next_run, report.build_hold, outstanding, nothing_needed=not needed))
+    zone = ZoneInfo(report.zone)
+    lines.extend(footer(now, zone, zone_name, report.next_run, report.build_hold, outstanding,
+                        nothing_needed=not needed, agent_lines=agent_section(now, zone)))
     return lines
 
 
@@ -1025,7 +1178,8 @@ def footer_main(zone: str, next_run: str | None, at: str | None, outstanding_pat
     except (InputError, json.JSONDecodeError, OSError) as error:
         print(f"dailies_render: {error}", file=sys.stderr)
         return 2
-    print("\n".join(footer(now, ZoneInfo(zone), abbreviation, next_run, hold, outstanding, nothing_needed=nothing_needed)))
+    print("\n".join(footer(now, ZoneInfo(zone), abbreviation, next_run, hold, outstanding,
+                           nothing_needed=nothing_needed, agent_lines=[])))
     return 0
 
 

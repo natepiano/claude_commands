@@ -210,6 +210,7 @@ names another plan's document. User, 2026-10-02.
   phase runs, a heavy `━━` from the earliest time to the latest, `●` at the
   ETA, and no `(earliest–latest)` text, so the row fits. User, 2026-10-03.
   Only glyphs the app's Anthropic Mono has: it lacks `┼` and `┤`.
+- **Agents:** after the chart and any build-hold lines, one line per active account shows its week used, when it runs out at its current pace or lasts to refill, and its available resets: `- claude 1: 40% of the week used; runs out about Tue 07:10 PDT, before its Sun 23:00 refill; 1 reset available until Oct 22` (user, 2026-10-05).
 - **Footer:** the reply footer (`/showrunner:produce` → Footer), from
   `next_run`, the holder files, `OUTSTANDING` and whether any subject has `needed:`. The
   report replaces the turn's `— waiting on:` line.
