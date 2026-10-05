@@ -85,9 +85,25 @@ if [[ ! "${MESH_NAME}" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$ ]]; then
   exit 2
 fi
 
+# `claude --bg` runs the session in a spare process of one long-lived per-user
+# daemon, so the session inherits the environment of whichever launch started
+# the daemon, not this one's: on 2026-10-05 every unit's seats took one unit's
+# cargo token and filed into its session. Hand the seat its delegate variables
+# through settings, empty when unset (every reader treats empty as unset), and
+# keep them off the launch below so a daemon it starts carries none.
+SEAT_ENV_NAMES=(PLAN_DELEGATE_BOARD_DIR PLAN_DELEGATE_TEAM_ROLE)
+seat_settings="$("$PY" -c '
+import json
+import os
+import sys
+
+env = {name: os.environ.get(name, "") for name in sys.argv[1:]}
+print(json.dumps({"sandbox": {"enabled": False}, "env": env}))
+' "${SEAT_ENV_NAMES[@]}")"
+
 launch_args=(--bg --name "${MESH_NAME}"
              --dangerously-skip-permissions
-             --settings '{"sandbox":{"enabled":false}}')
+             --settings "${seat_settings}")
 if [[ -n "${MODEL}" ]]; then
   launch_args+=(--model "${MODEL}")
 fi
@@ -95,7 +111,10 @@ if [[ -n "${EFFORT}" ]]; then
   launch_args+=(--effort "${EFFORT}")
 fi
 
-banner="$(cd "${WORKING_DIR}" && "${CLAUDE_BIN}" "${launch_args[@]}" \
+banner="$(cd "${WORKING_DIR}" \
+            && env -u PLAN_DELEGATE_BOARD_DIR -u PLAN_DELEGATE_TEAM_ROLE \
+                   -u PLAN_DELEGATE_RESOLVES_ROUND \
+                   "${CLAUDE_BIN}" "${launch_args[@]}" \
             -- "$(cat "${PROMPT_FILE}")" 2>&1 || true)"
 
 # The banner reads `backgrounded · <id> · <name>`; the separators are multibyte,

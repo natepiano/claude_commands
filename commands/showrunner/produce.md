@@ -107,6 +107,13 @@ State:
     stop builds. The renderer refuses a marker with no holder file, or active
     holder files with no marked unit.
   - `--nothing-needed`: when no subject needs a follow-up nobody has started.
+  - `--outstanding <OUTSTANDING>`, always, on the footer and on every dailies
+    render. `OUTSTANDING` is `~/.local/state/showrunner/outstanding/<slug>.json`:
+    `[{"since": "YYYY-MM-DDTHH:MM", "text": "..."}]`, one entry per thing the
+    user must do or decide, each with enough context to recall it without my
+    memory (what, where, why). Add an entry the moment it arises; remove it only
+    when the user addresses it and tells you. An entry the user defers gets
+    `"after": "YYYY-MM-DDTHH:MM"` (local) and stays hidden until then. User, 2026-10-05.
 
   It prints `build hold: <holder> since 11:34 PDT, for the frame-time lane's breakdown
   of what each added tool costs - release eta: 11:40 PDT (3 minutes)` while a
@@ -219,8 +226,9 @@ Run these steps at the start and on every resume:
 3. **Register instance.** Run `NOTIFIER new UPDATES --to
    session:$CLAUDE_CODE_SESSION_ID --every <N from the doc's **Updates:** line>
    --prompt-file PROMPT_FILE --from showrunner-timer-<slug> --check "zsh
-   $HOME/.claude/scripts/production/production_check.sh <absolute doc path>"`.
-   A repeated `new` retargets without moving the clock.
+   $HOME/.claude/scripts/production/production_check.sh <absolute doc path>"`,
+   plus `--aligned` when that line says on the hour. A repeated `new` retargets
+   without moving the clock.
 4. **Status.** Run `NOTIFIER status UPDATES` for the next tick and fire log.
    The declared job runs the ticks.
 
@@ -423,13 +431,17 @@ Input: the unit, phase, hash and shots from its notice.
     - record the phase in the review ledger:
       `python3 ~/.claude/scripts/production/review_regime.py add --unit <unit> --phase <N> --regime after --started <ISO> --merged <ISO> --holds <K> --merge-defects <D> --ux-findings <N> --code-findings <N> --review-minutes <M> --ux-check-minutes <U> --ux-repair-minutes <R>`.
       `holds` counts this phase's held checkpoints and `merge-defects` the
-      defect rows of all its design checks, both from `LOG`; the last three come
+      defect rows its merge design checks found in its own work, moved ones
+      included and rows the check calls older left out, both from `LOG`. A
+      phase no merge design check judged adds `--excluded "no merge design
+      check"`, and `report` and `watch` leave it out. The last three come
       from the unit's `review trial:` checkpoint line. A phase whose broad
       review ran the `craft` lens is `--regime trial`. The 12-phase report
       says whether the screenshot check's minutes (check plus its repairs) buy
       fewer holds and merge defects (user, 2026-10-04).
     - then run `review_regime.py watch` (user decision 2026-10-04: watch 12
-      phases without the code reviewer). The first time it exits 3, run
+      phases without the code reviewer; since 2026-10-05 only phases with no
+      `excluded` reason count). The first time it exits 3, run
       `report --since 2026-09-28`, push at once
       (`~/.claude/scripts/notify/pushover.py --priority 1 "Hana: review watch" "<one line; the table is in this session>"`),
       log it, and give the user the table. While it exits 3, the dailies
@@ -529,9 +541,11 @@ merge. When the watch reports green, finish <PromoteMain/>.
 
 **Mac run.** After every green CI on the merge branch, run its sha on the Mac
 in the background: `zsh ~/.claude/scripts/production/mac_run.sh <CHECKOUT> <sha> 60`.
-It builds, checks hana stays up 60 s, and stops it. Exit 3 means the Mac is
-unreachable: skip it. It never gates a merge; a failure goes to the unit
-whose merge it was. User, 2026-10-04.
+It builds, checks hana stays up 60 s, and stops it, then builds and runs each
+demo example (list in the script) for 20 s with the command you would type, so
+each starts at once from the clone `~/rust/hana_catalyst_mac`. Exit 3 means the
+Mac is unreachable: skip it. It never gates a merge; a failure (7 hana, 8 an
+example) goes to the unit whose merge it was. User, 2026-10-04 and 2026-10-05.
 </CIPoint>
 
 ---
@@ -690,23 +704,33 @@ it needs. Every other wait is yours to clear, and fast.
    unit blocked on the user, do all of this in that turn:
    1. **Find the real cause** in the unit director's transcript, not in its
       one-line `blocked:`. Name the exact action that was refused and the
-      reason given.
+      reason given. A refusal covers the outcome, not the command: another
+      tool, a script or another session counts the same. Never send the unit
+      another route, and never do it for the unit (user, 2026-10-05: trunk
+      sat 3 h on a refused plan read, and my "use the Read tool" was refused too).
+      One exception: a read-only command on files our sessions wrote (its
+      plan, its handoff). Type the go-ahead the unit asks for into its tmux
+      pane yourself and tell the user in one line (user, 2026-10-05).
+      Anything that writes, deletes, pushes or reaches outside our files
+      waits for the user.
    2. **Restart everything that does not need that action.** Phase work from
       the unit's drafts while a plan edit waits. A checkpoint that stays local
       while a push waits (you merge from the local branch). Tests, traces and
       research. Only work that needs the refused action itself waits. Never
       retry the refused action in another form: the refusal forbids that, and
       only the user can lift it.
-   3. **Tell the user exactly what to do,** in one line they can act on from
-      a phone: the session, then the exact words to type or the exact allow
-      rule to add. Put it in `needed:` and send it as a <Notify/> priority 2
-      alert.
+   3. **Otherwise, tell the user exactly what to do,** in one line they can act on from
+      a phone: the session, the exact words to type or the exact allow rule
+      to add, and why the check refused it, in a few words. Put it in
+      `needed:` and send it as a <Notify/> priority 2 alert.
    4. **Rule 4's limit holds.** Read the pane again each hour, and repeat 1–3.
       A `needed:` line never repeats unchanged from tick to tick.
    5. **Prevent the next one.** When a routine action for the unit is refused
       (reading its own plan, a plain `git push`), find which command file
       produced the refused form. Name the fix to the user: a command change,
-      or an allow rule only they can add.
+      or an allow rule only they can add. A content reason (`[Instruction
+      Poisoning]` on a plan read) means the check distrusts what it read, not
+      how, so a different command form never fixes it.
 </Dependencies>
 
 <Notify>
