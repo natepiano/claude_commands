@@ -181,7 +181,7 @@ Measured 2026-10-04 11:59–12:25 PDT, read-only, from the earlyoom journal, the
 - `scripts/delegate/verify.sh` — `UNTESTED_EXAMPLES_PY`, `read_metadata`, the check before `cache_lookup`, header comments
 - `scripts/delegate/test_verify_untested_examples.py` — eight scratch-package cases through real verify.sh routing: real `cargo metadata`, a cargo stub on `PATH` that passes `metadata` to real cargo and logs every other call, and a git stub that fixes the pass-record key
 
-**Binds later work:** Phase 18's verify.sh acknowledgement goes after this refusal, at the first build step past the memory wait. A new verify.sh routing test follows `test_verify_untested_examples.py`'s stub pattern.
+**Binds later work:** Phase 19's verify.sh acknowledgement goes after this refusal, at the first build step past the memory wait. A new verify.sh routing test follows `test_verify_untested_examples.py`'s stub pattern.
 
 **Gotchas:** A failing `cargo metadata` exits with cargo's status under `set -e`, not 2. hana main has 7 offending examples; the ~/.claude main merge is held until tool-based-ui adds `test = true`.
 
@@ -436,7 +436,23 @@ Measured 2026-10-04 11:59–12:25 PDT, read-only, from the earlyoom journal, the
 
 **Ruled out:** cutting a path's last component to fit 1,024 characters; withholding the push when a removal failed.
 
-### Phase 17 — A measured working day · status: todo
+### Phase 17 — A renumbered phase starts its ETA history afresh · status: done
+
+#### As-built
+
+- `same_phase` in `scripts/production/dailies_render.py` treats two reports as one phase only when the title after the first `: ` matches (`partition`, so a saved phase with no title matches none); the number no longer counts. A renumbered phase with the same title keeps its change note, first ETA and held-example history.
+- A new title gets no `(changed: …)` or `(unchanged)` note and no `why` demand; its first ETA is `eta.first` when given, else this report's ETA; the state saves the new title, ETA and first ETA; a simple report prints the held examples again.
+
+**Files:**
+- `scripts/production/dailies_render.py` — `same_phase`, read by `change_minutes`, `first_eta` and the simple report's held-example repeat
+- `scripts/production/test_dailies_render.py` — `ChangedPhaseTitleTests`: the reported renumber, an explicit `eta.first`, held examples, a saved phase with no title
+- `commands/showrunner/dailies.md` — under the eta note: a new phase has a new title; a renumbered phase with the same title keeps its notes
+
+**Gotchas:** `load_state` accepts any phase string, so `same_phase` must not assume a saved phase carries `: `.
+
+**Ruled out:** hiding the first-ETA line when a new phase reports fix rounds: `drift_text` shows `(now +0:00, N fix rounds added)` by design, the same as on a unit's first report.
+
+### Phase 18 — A measured working day · status: todo
 
 #### Work Order
 
@@ -464,7 +480,7 @@ Measure against the target, a normal working day with no earlyoom kill, from the
 
 Tune the slice numbers from what it shows. A changed limit needs another measured day after it. Say whether per-crate admission or nextest thread limits are needed after all. A per-slice sample field that still reads "unavailable" is a deployment fault.
 
-*The staggering verdict.* From the observed release, say whether the admission already staggers the held sessions. If it does not, Phase 18 builds the one-session-at-a-time release; if it does, Phase 18 is dropped. If no natural release happened after Phase 10's admission went live, say so: the verdict is open and Phase 18 stays deferred until such a release is observed, never dropped for want of one. The verdict also says whether a session whose first build is a BRP launch needs an acknowledgement of its own, since launches do not run through `invoke.sh` and acknowledge nothing today.
+*The staggering verdict.* From the observed release, say whether the admission already staggers the held sessions. If it does not, Phase 19 builds the one-session-at-a-time release; if it does, Phase 19 is dropped. If no natural release happened after Phase 10's admission went live, say so: the verdict is open and Phase 19 stays deferred until such a release is observed, never dropped for want of one. The verdict also says whether a session whose first build is a BRP launch needs an acknowledgement of its own, since launches do not run through `invoke.sh` and acknowledge nothing today.
 
 *Who takes the end snapshot.* The unit director takes it at 2026-10-05 15:26 PDT whatever the state of Phase 6's merge; this phase never waits on another phase to keep its window. Sources the writer and the checker both use: hold times from each holder file's `since`; release times from the `/build_hold release` output in the session transcripts and natedev's relay log; each session's build start from build-log `steps.started_at` and `mem_wait_s`.
 
@@ -493,7 +509,7 @@ Baseline before the diff: natedev's stopgap 160efd9 put CI in steve on 2026-10-0
 
 **Acceptance gate:** the original day reported at 2026-10-05 15:26 PDT; each newer control (CI's pool from 18:43 PDT, the builds slice from 19:36 PDT, Phase 10's admission once live) labeled provisional until its own complete day, with its workload and snapshot coverage; the day's report, each CI run's figures, the threshold and the conclusions written in this phase, each figure's window complete or marked inconclusive; the staggering verdict stated; `bash -n` on any changed shell.
 
-### Phase 18 — One session at a time · status: todo
+### Phase 19 — One session at a time · status: todo
 
 #### Work Order
 
@@ -503,26 +519,26 @@ Actual problem:
 The driver releases the next session 5 minutes after a release with no mark (`NoAdmissionAck`). A session whose first build starts late, or whose first build is a BRP launch (which writes no mark), can then compile alongside the next one, the overlap this phase exists to stop.
 
 What exists now:
-- The Work Order advances on `NoAdmissionAck` after 5 minutes, and adds a launch acknowledgement only if Phase 17's verdict asks for one.
+- The Work Order advances on `NoAdmissionAck` after 5 minutes, and adds a launch acknowledgement only if Phase 18's verdict asks for one.
 
 What should change:
 - Advance only on a known admission (a `MemoryGateReturned` mark, or a launch acknowledgement added in this phase), with a longer named timeout for a session that never builds.
 
 Recommendation:
-Advance only on a known admission, instrument the BRP launch path here rather than waiting on Phase 17's verdict, and keep a 15-minute `NoAdmissionAck` for a session that never builds; add a test where a late first build would have overlapped.
+Advance only on a known admission, instrument the BRP launch path here rather than waiting on Phase 18's verdict, and keep a 15-minute `NoAdmissionAck` for a session that never builds; add a test where a late first build would have overlapped.
 
 Approve this direction, or modify it?
 
-**Goal:** when Phase 17 finds the admission does not stagger held sessions, the last holder's `/build_hold release` releases them one at a time, each after the previous one's first build step is past its memory wait and starting its compiler.
+**Goal:** when Phase 18 finds the admission does not stagger held sessions, the last holder's `/build_hold release` releases them one at a time, each after the previous one's first build step is past its memory wait and starting its compiler.
 
 **Spec:**
-- Runs only if Phase 17's verdict says the admission does not stagger the sessions. A verdict that it does drops this phase; with no observed release the verdict is open and this phase stays deferred until one is observed.
+- Runs only if Phase 18's verdict says the admission does not stagger the sessions. A verdict that it does drops this phase; with no observed release the verdict is open and this phase stays deferred until one is observed.
 - Only the last holder starts it. While another holder file remains, `release` names who still holds and releases no session (Phase 4's behavior). The holder's file stays until the last session is released, so `status`, the renderer and `rust_release.py` keep seeing the hold.
 - Release progress is one typed state per held session, in release order: `AwaitingRelease`, `ReleasedAwaitingAdmission(released_at)`, `WaitingForMemory(released_at, wait_started_at)`, `PastMemoryWait(wait_ended_at, outcome)` with outcome `Granted`, `TimedOut` or `MeminfoUnavailable`, `NoAdmissionAck(released_at)`, each carrying only the instants valid in it. `wait_ended_at` is when the memory wait returned: only `Granted` says memory was there, and no outcome proves the compiler started. It is stored in `~/.local/state/build-hold-release/` (`BUILD_HOLD_RELEASE_DIR` overrides it), never in the holder directory, which every reader treats as holds; read back on each step, never kept in memory.
 - `release` messages one session at a time, directly (below). A session moves to `WaitingForMemory` when its first build step starts a memory wait, and to `PastMemoryWait` when that wait returns, whatever the outcome, since its build proceeds either way: `buildlog_wait_for_memory` in `scripts/lint/invoke.sh` (`:107`) writes the first mark when it begins to wait, and `run_once` (`:191`) writes the second right after the wait returns (`:195`), as the last thing before the step's `buildlog_exec` (`:209`, `:222`), both keyed by the session's id (below) into the release directory. A step that does not wait writes only the second. A call that builds nothing (an example-gate refusal, a pass-record hit) writes none.
 - **Who is released.** The holds know holders, not held sessions (`build_hold.py:220`), and today's release goes to every top-level session (`commands/build_hold.md:10`). The hold text `hold` prints (`build_hold.py:217`), which `/build_hold` sends to every top-level session (`commands/build_hold.md:7`), tells each recipient to run `python3 ~/.claude/scripts/build_hold/build_hold.py wait` at once, and `commands/build_hold.md` gains that recipient step. A session that finds the hold, top-level session or unit director, registers with `build_hold.py wait`, which records its `CLAUDE_CODE_SESSION_ID` in arrival order in the release directory. That id is the one identity: `release` resolves it to the session's name through the live session records (`scripts/message/sessions.py`) and sends to that session alone with `scripts/message/send.py --to <name>`, never the `/notify_top_level` broadcast, and after `NoAdmissionAck` moves to the next. `invoke.sh` keys its marks by the same variable, which a unit director's seats inherit through `implement.sh` and the codex server (no `shell_environment_policy` filters it); a step with no id in its environment writes no mark. A registered session missing from the live records becomes `NoAdmissionAck` at its turn, named in the release text. `status` and the dailies renderer show each held session's state. The acknowledgement proves admission, not a finished build.
 - A session with no mark 5 minutes after its release becomes `NoAdmissionAck`; the next session is released and the release text names it. A session in `WaitingForMemory` is not unresponsive: the next release waits for its `PastMemoryWait`, which the wait's own limit bounds (`BUILDLOG_MEM_WAIT_LIMIT_S`, 900 s by default), so two held builds never start together when memory frees. A `WaitingForMemory` older than that limit plus one minute becomes `NoAdmissionAck`.
-- **The driver.** `release` stays running in the last holder's session: it messages one session, polls the release directory every 15 s, and moves on at a `PastMemoryWait` or a `NoAdmissionAck`. Progress is the stored states, so `release --resume` continues after a restart. A session whose first build is a BRP launch writes no mark, since launches do not run through `invoke.sh`, and becomes `NoAdmissionAck` after 5 minutes; when Phase 17's verdict says launch builds need an acknowledgement of their own, this Work Order gains it before dispatch.
+- **The driver.** `release` stays running in the last holder's session: it messages one session, polls the release directory every 15 s, and moves on at a `PastMemoryWait` or a `NoAdmissionAck`. Progress is the stored states, so `release --resume` continues after a restart. A session whose first build is a BRP launch writes no mark, since launches do not run through `invoke.sh`, and becomes `NoAdmissionAck` after 5 minutes; when Phase 18's verdict says launch builds need an acknowledgement of their own, this Work Order gains it before dispatch.
 - **One lock.** `release.lock` in the release directory (`flock`) serializes `wait`, every `release` step, `release --resume` and the final check. `wait` registers only while a holder file exists, under the lock. Under the same lock, `release` removes the last holder file only after re-reading the registrations and finding none still `AwaitingRelease`, so a session that registers during the release is released in its turn, and one that arrives after the hold is gone finds no hold and builds.
 - Tests: a received hold whose recipient runs `wait` is released in its turn, and its mark ends its turn; partial progress (some released, some waiting), a missing mark, another active holder, a memory wait longer than 5 minutes holding the next release until it returns, a registration during a release released in its turn, a resumed release that finishes and clears the hold, one direct send per step to the registered session's name (`send.py` stubbed), a seat-shaped environment whose mark carries the unit director's id, and `status`, the dailies renderer and `rust_release.py` showing no phantom holder from the release directory, including after the last release clears it.
 

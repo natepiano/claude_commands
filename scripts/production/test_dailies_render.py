@@ -10,6 +10,7 @@ import tempfile
 import unittest
 from dataclasses import dataclass
 from pathlib import Path
+from typing import ClassVar, cast
 
 SCRIPT = Path(__file__).with_name("dailies_render.py")
 AT = "2026-10-04T11:00"
@@ -269,6 +270,71 @@ class RenumberedPhaseTests(unittest.TestCase):
         self.assertEqual(result.code, 0, result.error)
         self.assertIn("(changed: +0:30 because one more repair round)", "\n".join(result.lines))
         self.assertIn("- first eta: 11:30 PDT (now +1:10)", result.lines)
+
+
+class ChangedPhaseTitleTests(unittest.TestCase):
+    OLD_PHASE: ClassVar[str] = "Phase 16 of 18: A measured working day"
+    NEW_PHASE: ClassVar[str] = "Phase 16 of 19: The phone hears about the disk only when the user has something to do"
+    AT: ClassVar[str] = "2026-10-05T13:30"
+
+    def render_new_phase(self, *, first: str | None = None, held: str | None = None, old_phase: str = OLD_PHASE) -> tuple[Run, dict[str, object]]:
+        fields = report(held=False, next_run=None)
+        current = {**unit(False), "phase": self.NEW_PHASE, "started": "2026-10-05T12:00", "held": held}
+        eta: dict[str, object] = {"time": "13:42", "percent": 60}
+        if first is not None:
+            eta["first"] = first
+        current["eta"] = eta
+        if held is not None:
+            current["held_examples"] = "such as a main bar clipped in small windows"
+        fields["units"] = [current]
+        previous = {"phase": old_phase, "eta": "2026-10-05T16:30:00", "held": held, "first": "2026-10-05T14:30:00"}
+        with tempfile.TemporaryDirectory() as scratch:
+            input_path = Path(scratch) / "dailies_input.json"
+            state_path = Path(scratch) / "dailies_state.json"
+            _ = input_path.write_text(json.dumps(fields))
+            _ = state_path.write_text(json.dumps({"widget-enhancements": previous}))
+            result = run([str(input_path), "--at", self.AT, "--state", str(state_path)], scratch)
+            saved = cast(dict[str, object], json.loads(state_path.read_text()))
+        return result, saved
+
+    def test_new_title_resets_prior_eta_and_first_eta(self) -> None:
+        result, saved = self.render_new_phase()
+        self.assertEqual(result.code, 0, result.error)
+        self.assertIn("- eta: 13:42 PDT, 60% done", result.lines)
+        self.assertFalse(any("(changed:" in line or "(unchanged" in line for line in result.lines))
+        self.assertFalse(any(line.startswith("- first eta:") for line in result.lines))
+        self.assertEqual(saved, {"widget-enhancements": {
+            "phase": self.NEW_PHASE, "eta": "2026-10-05T13:42:00", "held": None, "first": "2026-10-05T13:42:00",
+        }})
+        self.assertEqual(after_timeline(result.lines), ["", *AGENT_LINES, "13:30 PDT · no dailies scheduled - nothing needed"])
+
+    def test_new_title_uses_explicit_first_eta(self) -> None:
+        result, saved = self.render_new_phase(first="2026-10-05T13:00")
+        self.assertEqual(result.code, 0, result.error)
+        self.assertIn("- eta: 13:42 PDT, 60% done", result.lines)
+        self.assertIn("- first eta: 13:00 PDT (now +0:42)", result.lines)
+        self.assertEqual(saved, {"widget-enhancements": {
+            "phase": self.NEW_PHASE, "eta": "2026-10-05T13:42:00", "held": None, "first": "2026-10-05T13:00:00",
+        }})
+        self.assertEqual(after_timeline(result.lines), ["", *AGENT_LINES, "13:30 PDT · no dailies scheduled - nothing needed"])
+
+    def test_saved_phase_without_title_counts_as_new(self) -> None:
+        result, saved = self.render_new_phase(old_phase="Phase 16 of 18")
+        self.assertEqual(result.code, 0, result.error)
+        self.assertFalse(any("(changed:" in line or "(unchanged" in line for line in result.lines))
+        self.assertEqual(saved["widget-enhancements"], {
+            "phase": self.NEW_PHASE, "eta": "2026-10-05T13:42:00", "held": None, "first": "2026-10-05T13:42:00",
+        })
+
+    def test_new_title_repeats_held_examples_in_simple_report(self) -> None:
+        reason = "the design check found defects"
+        result, saved = self.render_new_phase(held=reason)
+        self.assertEqual(result.code, 0, result.error)
+        self.assertIn(f"- checkpoint: not merged, because {reason}, such as a main bar clipped in small windows", result.lines)
+        self.assertEqual(saved, {"widget-enhancements": {
+            "phase": self.NEW_PHASE, "eta": "2026-10-05T13:42:00", "held": reason, "first": "2026-10-05T13:42:00",
+        }})
+        self.assertEqual(after_timeline(result.lines), ["", *AGENT_LINES, "13:30 PDT · no dailies scheduled - nothing needed"])
 
 
 if __name__ == "__main__":
