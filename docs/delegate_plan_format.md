@@ -79,9 +79,10 @@ to rediscover after a context compaction lives in the doc.
      Full procedure: /plan:to_phased_plan → <PhaseNumbering/>. -->
 
 ### Phase N — <title>  · status: todo
-<!-- status ∈ {todo, done}. /plan:phase_review flips it, then /unit:delegate
-     shrinks the phase to As-built before checkpoint. Review prose never enters
-     this document. -->
+<!-- status ∈ {todo, done}. The checkpoint flips it in loop/verbose, and
+     /unit:delegate shrinks the phase to As-built after the code commit
+     (~/.claude/docs/delegate/phase_end.md → <PhaseEnd/>). Review prose never
+     enters this document. -->
 
 #### Work Order
 <!-- The dispatch prompt. Self-contained against Delegation Context + named files.
@@ -123,7 +124,7 @@ them; nothing workspace-wide.>
 ### Phase N — <title>  · status: done
 
 #### Work Order
-<the dispatched work order; /plan:shrink replaces this span before checkpoint>
+<the dispatched work order; /plan:shrink replaces this span after the code commit>
 
 Retrospective and review outcomes live only under the delegate session directory.
 `/plan:phase_review` first propagates durable decisions into remaining Work
@@ -208,8 +209,9 @@ Rules:
    design's concrete types/signatures/constraints into the Work Order. Do not
    compress a settled decision into a one-liner — the delegate needs the detail.
 4. **Live zone vs archive zone.** Remaining (`todo`) phases are dispatch-ready
-   Work Orders. Every completed (`done`) phase is immediately reduced to the
-   `As-built` archive form before checkpoint. Retrospective, finding, reviewer,
+   Work Orders. Every completed (`done`) phase is reduced to the `As-built`
+   archive form by its own shrink commit, after its code commit
+   (`~/.claude/docs/delegate/phase_end.md` → <PhaseEnd/>). Retrospective, finding, reviewer,
    and approval prose never persists in the plan. `/plan:shrink --closeout`
    changes only the current phase; earlier `As-built` blocks and remaining Work
    Orders are byte-stable during shrink.

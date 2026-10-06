@@ -84,7 +84,7 @@ A unit's `then` in the dailies input is a JSON list of one-line items, one per u
 
 **Gotchas:** `UpcomingWork.items` is non-empty through `parse_upcoming_work`, not by construction.
 
-### Phase 3 — A unit commits its code before the shrink, and shrinks beside the next phase · status: todo
+### Phase 3 — A unit commits its code before the shrink, and shrinks beside the next phase · status: done
 
 #### Work Order
 
@@ -107,6 +107,8 @@ Work only in worktree `/home/natepiano/worktrees/claude-build-followups-enh-show
 - **The commit kinds** (<CoreContract/>): one checkpoint and one shrink commit per completed phase, plus the final-gate and as-built commits; the shrink commit is the only one made while seats run, and it touches only the plan doc.
 - **The two notices** (`docs/production_format.md` item 3): the checkpoint notice as today, sent before the plan review; then `From <unit>: phase <N> shrink <hash> — plan doc only.`, merged like any checkpoint whose only path is the unit's own plan doc, with no `review trial` or `design check` line. The checkpoint notice's `Phase <next> ETA` counts from the code commit.
 - **Shrink placement** (`docs/delegate/run_phase_review.md`): <RunPhaseReview/> runs after the checkpoint notice and before the next phase's <ComposeWorkOrder/>; <RunPhaseShrink/> runs after the next phase's launch and before the shrink commit. Its rule that remaining `todo` phases keep the plan review's forward edits holds; the phase the seats are running is one of them.
+- **One doc holds the order** (the user, ~15:50 PDT, via the showrunner: "if 3 files share the same insructions, shouldn't those instructions be in their own file, reerenced by the skill? we have precedent for this"; the showrunner: write it once in a new doc). `docs/delegate/phase_end.md` defines <PhaseEnd/>: the code commit and its "code ready" notice, the plan review, the add-on check, worker cleanup and `finish-phase`, the next launch, the shrink beside the seats with its plan-doc-only commit and notice, the no-next-phase and verbose variants, and the routes below. `commands/unit/delegate.md`, `commands/unit/checkpoint.md`, `commands/unit/add_ons.md`, `commands/plan/shrink.md`, `commands/plan/phase_review.md`, `docs/delegate/run_phase_review.md` and `docs/production_format.md` each point to it in one line and keep only their own steps. Precedents: `docs/decision_criteria.md` and `docs/production_format.md`.
+- **Routes after the code commit** (the showrunner approved, ~16:10 PDT): a defect the plan review finds in the committed phase becomes a follow-up phase inserted next and run next; source-comment edits the review makes go into the next phase's checkpoint commit.
 - **Compaction and failure** (<CompactionContract/>, <RetainDelegatedPhaseReservation/>): a handoff written while a shrink is pending names that phase. A shrink that fails its structural check blocks only the shrink commit; the seats keep running, and the unit director repairs the shrink before the next checkpoint, which refuses while an earlier phase still has a Work Order.
 
 **Files:**
@@ -114,6 +116,10 @@ Work only in worktree `/home/natepiano/worktrees/claude-build-followups-enh-show
 - `commands/unit/checkpoint.md` — <ShrinkCommit/>; <CheckpointCommit/> step 2 and step 8's report.
 - `docs/delegate/run_phase_review.md` — where the review and the shrink run.
 - `docs/production_format.md` — item 3's two notices.
+- `docs/delegate/phase_end.md` — new; <PhaseEnd/>.
+- `commands/unit/add_ons.md` — <ConsiderNextItems/> runs after the plan review and before the shrink.
+- `commands/plan/shrink.md` — the shrink follows the code commit; plus the four wording swaps from the live checkout's uncommitted edit.
+- `commands/plan/phase_review.md` — the review follows the code commit; the two routes above.
 
 **Seats:** 2 writers.
 - `impl` — `commands/unit/delegate.md`; post `done` without waiting for the other seat.
@@ -206,6 +212,7 @@ Work only in worktree `/home/natepiano/worktrees/claude-build-followups-enh-show
 - `test` — `scripts/production/test_merge_checkpoint.py` from the Spec alone, with real `git` in temporary repositories and a temporary bare `origin`, stubs on `PATH` for `verify.sh`, `validate_and_push.sh`, `review_regime.py` and `ssh` recording argv: each step's `held` and `failed` cases with no merge left behind; a red package reset and a known flake continuing; the green `git` path merging diverged `origin/main`, pushing, promoting a second temporary checkout by fast-forward and reading the Mac's `rc=`; a promote refused by an uncommitted file fails without undoing the push; the record call's argv and the LOG line. Owns the final suite run. Then the audit table, in its summary.
 
 **Constraints from prior phases:**
+- A shrink notice (`From <unit>: phase <N> shrink <hash> — plan doc only.`, or `— plan doc and <next-items path>.`) merges with no review-ledger row and no CI count (the showrunner, 16:2x PDT, doing it by hand until this lands).
 - Phase 1 (as built): `add_unit.py` reads the production doc with `read_production(path) -> Production` (doc, slug, merge_branch, checkout, showrunner_session, log, zone) and `production_field(lines, field) -> str`; import them, never a second parser.
 - Phase 4 (as built at its merge): it edits `produce.md` <LaunchUnits/>; this phase edits <MergeCheckpoint/>. Starts beside Phase 4 once Phase 1 merges, claiming `produce.md` after it.
 - Tests never push anywhere but a temporary bare repository, never run real `ssh`, and never write the real `~/.claude` checkout or `~/.local/state/`.

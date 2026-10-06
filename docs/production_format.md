@@ -136,8 +136,9 @@ branch, port and the files you own.
    outside your **Owns**, another unit's crate included (user, 2026-10-04). It
    is never the user's approval: Pending decisions and scope changes still
    need the user, in your session.
-3. **Checkpoint notice.** After <RecordPhaseCompletion/>, and after the
-   final-gate and as-built commits, send the showrunner one message:
+3. **Commit notices.** The checkpoint hash is mergeable at once. Also send a
+   notice after each final-gate and as-built commit. Timing:
+   `~/.claude/docs/delegate/phase_end.md` → <PhaseEnd/>.
 
    ```
    From <unit>: phase <N> checkpoint <hash> — <title>. Shots: <paths | none, no visible change>. Phase <next> ETA: <HH:MM zone>
@@ -147,7 +148,20 @@ branch, port and the files you own.
 
    A phase checkpoint's notice carries the second line:
    `progress_history.py review-trial`'s output, verbatim
-   (`/unit:checkpoint` step 9).
+   (`/unit:checkpoint` step 9). `Phase <next> ETA` counts from the code
+   checkpoint commit.
+
+   The shrink notice has this form:
+
+   ```
+   From <unit>: phase <N> shrink <hash> — plan doc only.
+   ```
+
+   When the commit also carries the approved next-items file, the notice ends
+   `— plan doc and <next-items path>.` instead. The showrunner merges it like
+   any checkpoint whose only paths are the unit's own plan files, with no
+   review-ledger row and no CI count. The shrink notice carries no `review trial` or `design check`
+   line.
 
    The as-built notice's title names what moved: each doc created, amended,
    moved or deleted, and each link repointed, this doc's **Units** row
@@ -170,7 +184,7 @@ branch, port and the files you own.
    a fresh verdict, and 3 holds were caught after the unit had moved on, 187
    minutes in 2.6 days; with a fresh pass the merge followed in 1–2 minutes.
 
-   Start every later phase that can run beside this one now, under berth, each
+   Under <PhaseEnd/> step 6, start each next phase that can run under berth,
    with its own checkpoint (`/showrunner:produce` → Rules, parallel by default).
 4. **The merge branch is the showrunner's.** Never merge into it or push it.
    Push only your own branch; <PushCheckpoint/> does it at each checkpoint.

@@ -1,5 +1,5 @@
 ---
-description: Rewrite completed plan phases into short as-built records; closeout mode shrinks one phase from ephemeral review artifacts before checkpoint.
+description: Rewrite completed plan phases into short as-built records; closeout mode shrinks one phase after its code commit.
 ---
 
 # Plan Shrink
@@ -34,9 +34,10 @@ Parse `--phases` and `--closeout` before <ResolvePlan/> and remove them from the
 path arguments. Set `${CLOSEOUT_DIR}` only when closeout was supplied; reject a
 missing directory, multiple phase ids, or closeout without `--phases`.
 
-`/unit:delegate` runs closeout mode after every phase review and before its
-checkpoint. Standalone mode remains for legacy accumulated plans and immediately
-before `/plan:to_as_built`.
+`/unit:delegate` runs closeout mode after the code commit, beside the next
+phase's seats, then makes a plan-doc-only shrink commit. Standalone mode remains
+for legacy accumulated plans and immediately before `/plan:to_as_built`.
+Phase-end order: `~/.claude/docs/delegate/phase_end.md` → <PhaseEnd/>.
 
 This command does not change code and does not commit.
 
@@ -145,7 +146,7 @@ start; read that record.
        print("no run record")
    ```
 
-   The `(active is not None and i == 0)` guard is load-bearing: the marker's run
+   The `(active is not None and i == 0)` guard decides the match: the marker's run
    is authoritative regardless of directory, but without a marker only a run whose
    `working_dir` **is** the cwd may match. Dropping the guard makes the newest run
    on the machine win from any directory.
@@ -160,11 +161,11 @@ head carries a `## Delegation Context` section. A plan doc that fails this is no
 delegate-ready and this command does not apply to it — say so and stop.
 
 **Running mid-run is fine** — shrinking only touches `done` phases, and the
-phase `/unit:delegate` is working is `todo`. Two consequences to state in one line
-when a run is active: any copy of the doc already in the orchestrator's context is
-now stale (a later `Edit` against pre-shrink text will fail loudly, not
-silently), and the next checkpoint commit will carry the shrink along with its
-phase.
+phase `/unit:delegate` is working is `todo`. Under `/unit:delegate`, the code
+checkpoint is already committed; closeout shrink runs beside the next phase's
+seats and receives its own plan-doc-only commit. State in one line that any copy
+of the doc already in the orchestrator's context is stale (a later `Edit`
+against pre-shrink text will fail loudly, not silently).
 </ResolvePlan>
 
 ---
@@ -296,7 +297,7 @@ Each prompt must include:
   byte-for-byte** from the original. No file may contain a `#### Work Order`,
   `### Retrospective`, or `Phase <id> Review` heading.
 - Return, per phase: `phase <id>: <orig lines> → <new lines>` plus a one-clause
-  note for anything kept that reads like narration and why it was load-bearing.
+  note for anything kept that reads like narration and why it had to stay.
 
 <KeepDrop>
 The replacement block reads as a record of code that exists. Present tense,
@@ -323,7 +324,7 @@ to fix it. "The `PostToolUse` shim invokes `drift` with a named comparison
 selector", not "Phase 13's shim invokes…". Omit the line if none.>
 
 **Gotchas:** <durable traps: calibration constants, invariants enforced by
-construction, environment or tooling constraints that still bite. Omit if none.>
+construction, environment or tooling constraints that still cause failures. Omit if none.>
 
 **Ruled out:** <one clause each — proposals that were considered and rejected and
 would otherwise be re-proposed. Omit if none.>
@@ -338,7 +339,7 @@ would otherwise be re-proposed. Omit if none.>
 - Invariants and the mechanism enforcing them ("non-empty by construction:
   private field, fallible constructor").
 - Durable gotchas from the Retrospective's **Surprises**: anything that still
-  bites someone touching this code.
+  trips up someone touching this code.
 - Deviations from the Work Order, folded into the as-built statement — not
   narrated as deviations. The Work Order's plan for a file it never created is
   simply absent from the block.
