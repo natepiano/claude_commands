@@ -214,7 +214,7 @@ def record(window_id: str, title: str, seconds: int, display: str, path: Path) -
     except OSError:
         path.unlink(missing_ok=True)
         raise
-    if result.returncode in (124, 137):
+    if result.returncode in (124, 137, -9):
         path.unlink(missing_ok=True)
         return error(
             f"stopped by the outer timeout at {duration} s ({seconds} s + 15 s): "
