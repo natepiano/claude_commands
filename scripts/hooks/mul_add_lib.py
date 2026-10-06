@@ -7,10 +7,20 @@ import re
 from bisect import bisect_right
 from enum import Enum
 
-from fn_length_lib import (_Token, _body_opener, _level, _macro_before, _pairs, _parents, _read_text, _read_toml, _table, _tokens)  # pyright: ignore[reportPrivateUsage]
+from fn_length_lib import (
+    ClippyLintLevel, ConfiguredClippyLint, RustToken, UnavailableClippyLint, body_opener,
+    macro_before, pair_delimiters, read_clippy_lint, read_text,
+    target_may_be_no_std, tokenize_rust,
+)
 
 
 class ScopeState(Enum):
+    """EXEMPT passes no_std targets and files whose crate root is uncertain.
+
+    Uncertain roots include missing lib.rs/main.rs, build.rs, and paths outside
+    src/, tests/, examples/, or benches/.
+    """
+
     ENABLED = "enabled"
     DISABLED = "disabled"
     EXEMPT = "exempt"
@@ -96,57 +106,24 @@ def _attribute_exempts(attribute: str) -> bool:
 
 
 def suboptimal_flops_scope(rs_file: os.PathLike[str] | str) -> SuboptimalFlopsLintScope:
-    """Resolve this package's effective nursery or suboptimal_flops level."""
-    try:
-        for parent in _parents(os.path.dirname(os.path.abspath(rs_file))):
-            manifest = os.path.join(parent, "Cargo.toml")
-            if not os.path.isfile(manifest):
-                continue
-            raw = _read_text(manifest)
-            data = _read_toml(raw)
-            if "package" in data:
-                package_dir = parent
-                package = data
-                break
-        else:
-            return SuboptimalFlopsLintScope(ScopeState.NO_PACKAGE)
-
-        lints = _table(package.get("lints"))
-        if lints.get("workspace") is True:
-            package_table = _table(package.get("package"))
-            workspace_path = package_table.get("workspace")
-            if isinstance(workspace_path, str):
-                workspace = _read_toml(_read_text(os.path.join(package_dir, workspace_path, "Cargo.toml")))
-            else:
-                workspace = {}
-                for parent in _parents(package_dir):
-                    manifest = os.path.join(parent, "Cargo.toml")
-                    if os.path.isfile(manifest):
-                        candidate = _read_toml(_read_text(manifest))
-                        if "workspace" in candidate:
-                            workspace = candidate
-                            break
-            clippy = _table(_table(_table(workspace.get("workspace")).get("lints")).get("clippy"))
-        else:
-            clippy = _table(lints.get("clippy"))
-        level = _level(clippy["suboptimal_flops"]) if "suboptimal_flops" in clippy else _level(clippy.get("nursery"))
-        state = ScopeState.ENABLED if level in {"warn", "deny", "forbid"} else ScopeState.DISABLED
-        if state is ScopeState.ENABLED:
-            for root_name in ("lib.rs", "main.rs"):
-                for root_dir in (os.path.join(package_dir, "src"), package_dir):
-                    root_file = os.path.join(root_dir, root_name)
-                    if os.path.isfile(root_file) and "#![no_std]" in _read_text(root_file):
-                        return SuboptimalFlopsLintScope(ScopeState.EXEMPT)
-        return SuboptimalFlopsLintScope(state)
-    except (OSError, ValueError, UnicodeError):
+    """Resolve this target's effective nursery or suboptimal_flops level."""
+    configured = read_clippy_lint(rs_file, "suboptimal_flops", "nursery")
+    if not isinstance(configured, ConfiguredClippyLint):
+        return SuboptimalFlopsLintScope(
+            ScopeState.NO_PACKAGE if configured is UnavailableClippyLint.NO_PACKAGE else ScopeState.DISABLED
+        )
+    if configured.level not in {ClippyLintLevel.WARN, ClippyLintLevel.DENY, ClippyLintLevel.FORBID}:
         return SuboptimalFlopsLintScope(ScopeState.DISABLED)
+    if target_may_be_no_std(rs_file, configured.package_dir):
+        return SuboptimalFlopsLintScope(ScopeState.EXEMPT)
+    return SuboptimalFlopsLintScope(ScopeState.ENABLED)
 
 
-def _visible(source: str, comments: dict[int, int], tokens: list[_Token], pairs: dict[int, int]) -> str:
+def _visible(source: str, comments: dict[int, int], tokens: list[RustToken], pairs: dict[int, int]) -> str:
     spans = [(start, end) for end, start in comments.items()]
     spans.extend((match.start(), match.end()) for match in _LITERALS.finditer(source))
     for index, token in enumerate(tokens):
-        if token.text != "!" or not _macro_before(source, token.start, comments):
+        if token.text != "!" or not macro_before(source, token.start, comments):
             continue
         opener = index + 1
         while opener < len(tokens) and tokens[opener].text not in {"{", "(", "["}:
@@ -168,7 +145,7 @@ def _visible(source: str, comments: dict[int, int], tokens: list[_Token], pairs:
 
 
 def _functions(
-    source: str, visible: str, tokens: list[_Token], pairs: dict[int, int], comments: dict[int, int]
+    source: str, visible: str, tokens: list[RustToken], pairs: dict[int, int], comments: dict[int, int]
 ) -> list[tuple[int, int, int]]:
     if (
         sum(token.text in {"{", "(", "[", "#[", "#!["} for token in tokens) != len(pairs)
@@ -195,7 +172,7 @@ def _functions(
                 pending |= exempt
             index = close + 1
             continue
-        if word == "!" and _macro_before(source, token.start, comments):
+        if word == "!" and macro_before(source, token.start, comments):
             opener = index + 1
             while opener < len(tokens) and tokens[opener].text not in {"{", "(", "["}:
                 if tokens[opener].text in {";", "}"}:
@@ -205,7 +182,7 @@ def _functions(
                 index = pairs[opener] + 1
                 continue
         if word in {"fn", "impl", "trait", "mod"} and index >= signature_end:
-            opener = _body_opener(tokens, pairs, index + 1)
+            opener = body_opener(tokens, pairs, index + 1)
             if word == "fn" and opener in pairs and not (inherited[-1] or pending):
                 previous = max(visible.rfind(";", 0, token.start), visible.rfind("{", 0, token.start), visible.rfind("}", 0, token.start))
                 prefix = visible[previous + 1:token.start]
@@ -228,7 +205,7 @@ def _functions(
     return bodies
 
 
-def _atom(lexemes: list[_Token], index: int, direction: int) -> tuple[int, int]:
+def _atom(lexemes: list[RustToken], index: int, direction: int) -> tuple[int, int]:
     if not 0 <= index < len(lexemes):
         return -1, -1
     token = lexemes[index].text
@@ -277,7 +254,7 @@ def _literal_compatible(text: str, excluded: set[str]) -> bool:
     return False
 
 
-def _sqrt_receiver(lexemes: list[_Token], expr_start: int, expr_end: int) -> bool:
+def _sqrt_receiver(lexemes: list[RustToken], expr_start: int, expr_end: int) -> bool:
     cursor = expr_end
     while cursor < len(lexemes) and lexemes[cursor].text == ")":
         opening, _ = _atom(lexemes, cursor, -1)
@@ -325,7 +302,7 @@ def _find_in_body(
         fields = (match.group(1) for match in re.finditer(r"(?<!\d)\.([A-Za-z_]\w*|\d+)\b", expression))
         return all(field in scalar_fields for field in fields)
 
-    lexemes = [_Token(match.group(), start + match.start(), start + match.end()) for match in _LEX.finditer(body)]
+    lexemes = [RustToken(match.group(), start + match.start(), start + match.end()) for match in _LEX.finditer(body)]
     statement_boundaries = [index for index, lexeme in enumerate(lexemes) if lexeme.text in {";", "{", "}"}]
     nested_starts = [range_start for range_start, _ in nested]
     const_starts = [range_start for range_start, _ in const_ranges]
@@ -447,11 +424,11 @@ def float_mul_add_findings(rs_file: os.PathLike[str] | str) -> tuple[SuboptimalF
     scope = suboptimal_flops_scope(rs_file)
     if not scope.enabled:
         return scope, []
-    source = _read_text(os.fspath(rs_file))
+    source = read_text(os.fspath(rs_file))
     if not re.search(r"\*[^;{}]*[+-]|[+-][^;{}]*\*", source):
         return scope, []
-    tokens, comments = _tokens(source)
-    pairs = _pairs(tokens)
+    tokens, comments = tokenize_rust(source)
+    pairs = pair_delimiters(tokens)
     visible = _visible(source, comments, tokens, pairs)
     bodies = _functions(source, visible, tokens, pairs, comments)
     opening_at = {token.start: index for index, token in enumerate(tokens) if token.text == "{"}
