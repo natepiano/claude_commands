@@ -151,6 +151,7 @@ Work only in worktree `/home/natepiano/worktrees/claude-build-followups-stalls`,
 
 **Spec:**
 - `_read_live_turn`: `systemError` returns `ThreadIdle()` alongside `idle` and `notLoaded`, with a one-line comment naming its meaning and the upstream source above. Any status the protocol does not define still returns `ThreadStateUnknown`.
+- The capacity budget is per busy spell, not per seat: `capacity_waited` and `capacity_retries` (`codex_mesh.py:983-984`) never reset today, so a long seat's separate busy spells share one 20-minute budget and later spells start at a longer wait. Reset both to 0 when a turn completes without a capacity refusal. The schedule within a spell stays 30 s doubling to a 300 s cap, 1200 s in all.
 - Nothing else in the capacity loop, `_retry_warranted` or the relaunch path changes unless a test below fails without it; say so in the checkpoint if one does.
 - Stub app-server (`test_codex_mesh.py`): after any turn that ends with an error (`turn/failed`, or `turn/completed` carrying `error`), `thread/read` answers `systemError` for that thread until the next `turn/start`, as the real server does; an entry a test sets in `thread_statuses` still wins.
 - `test_failed_seat_relaunches_when_old_thread_has_unknown_status` (line 632) uses `systemError` as its unknown status; give it a status the protocol does not define (`retired`), so it keeps covering the unknown path.
@@ -166,6 +167,7 @@ Work only in worktree `/home/natepiano/worktrees/claude-build-followups-stalls`,
   - a non-capacity turn failure (`test_other_turn_failure_does_not_use_capacity_backoff`) exits with the turn's own error text and no `thread/read failed`;
   - a failed seat whose old thread reads `systemError` relaunches, sends no `turn/interrupt`, and logs no "could not be interrupted";
   - `end` on a seat whose thread reads `systemError` logs no "could not be interrupted".
+  - a seat refused, then completing a turn, then refused again starts its second wait at 30 s with the full 1200 s budget.
 
 **Constraints from prior phases:** this phase touches no Phase 1 or Phase 2 file.
 - Tests never start a real `codex` or app-server, never reach the network, and never write `~/.codex`.
