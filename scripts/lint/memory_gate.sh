@@ -45,7 +45,7 @@ buildlog_wait_for_memory() {
             build_hold_mark WaitingForMemory
         fi
         if (( SECONDS - started >= limit )); then
-            echo 'memory wait limit reached; starting anyway' >&2
+            echo 'memory wait limit reached after 15 min; starting anyway' >&2
             BUILDLOG_MEM_OUTCOME=TimedOut
             break
         fi
