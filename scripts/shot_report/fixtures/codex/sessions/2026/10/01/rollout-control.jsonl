@@ -1,0 +1,5 @@
+{"timestamp":"2026-10-01T00:00:00.000Z","type":"session_meta","payload":{"id":"codex-control","timestamp":"2026-10-01T00:00:00.000Z","cwd":"/fictional/project-orion","source":"cli"}}
+{"timestamp":"2026-10-01T00:02:00.000Z","type":"response_item","payload":{"type":"function_call","name":"exec_command","arguments":"{\"cmd\":\"curl -X POST -d '{\\\"method\\\":\\\"brp_extras_screenshot\\\"}' http://localhost:15702\"}","call_id":"codex-curl"}}
+{"timestamp":"2026-10-01T00:02:08.000Z","type":"response_item","payload":{"type":"function_call_output","call_id":"codex-curl","output":"saved /fictional/shots/codex-raw.png"}}
+{"timestamp":"2026-10-01T00:30:00.000Z","type":"response_item","payload":{"type":"function_call","name":"exec_command","arguments":"{\"cmd\":\"python3 /fictional/hana_shot.py shot --view orion\"}","call_id":"codex-hana"}}
+{"timestamp":"2026-10-01T00:30:09.000Z","type":"response_item","payload":{"type":"function_call_output","call_id":"codex-hana","output":"saved /fictional/shots/codex-framed.png"}}
