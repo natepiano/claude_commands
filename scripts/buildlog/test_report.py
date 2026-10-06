@@ -3,20 +3,24 @@
 
 from __future__ import annotations
 
+import json
 import os
+import subprocess
 import tempfile
 import time
 import unittest
 from contextlib import closing
-from datetime import datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import override
 from unittest import mock
 
 import disk
+import ci
 import index
 import report
 import rust_release
+import sync
 from test_index import STAMP, Record, call, ci_job, ci_run, encode, local_day, point_root_at, sample, step
 
 
@@ -29,6 +33,9 @@ class ReportTests(unittest.TestCase):
         temporary = self.enterContext(tempfile.TemporaryDirectory())
         self.root = Path(temporary) / "buildlog"
         point_root_at(self, self.root)
+        self.enterContext(mock.patch.dict(os.environ, {"HOME": temporary}))
+        _ = self.enterContext(mock.patch.object(subprocess, "run"))
+        _ = self.enterContext(mock.patch.object(ci, "gh_get"))
         self.records = []
 
     def write(self, path: Path, *records: Record) -> None:
@@ -39,6 +46,14 @@ class ReportTests(unittest.TestCase):
         _ = index.update()
         with closing(index.read_only()) as connection:
             return report.report(connection, day or local_day(STAMP))
+
+    def poll_stamp(self, at: datetime, complete: bool = True) -> None:
+        path = self.root / "ci" / "polled.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        _ = path.write_text(json.dumps({ci.REPOS[0]: {"polled_at": at.astimezone(UTC).isoformat(), "complete": complete}}))
+
+    def ci_line(self, day: str) -> str:
+        return next(line for line in self.render(day).splitlines() if line.startswith("CI: "))
 
     def waiting_rows(self, day: str = "2026-10-02") -> dict[str, list[str]]:
         lines = self.render(day).splitlines()
@@ -564,21 +579,21 @@ class ReportTests(unittest.TestCase):
         self.assertLess(lines.index("### mend"), lines.index("### Summary: successes"))
         self.assertLess(lines.index("### Summary: successes"), lines.index("### Summary: failures"))
         self.assertLess(lines.index("### Summary: failures"), lines.index("### Summary: all"))
-        self.assertIn("| verify.sh (agents) | 1 | 0 | 40.0 s | 40.0 s | 3.0 s | 37.0 s | 0 |", lines)
-        self.assertIn("| cargo-port | 2 | 1 | 15.0 s | 10.0 s – 20.0 s | 4.0 s | 6.0 s |  |", lines)
+        self.assertIn("| verify.sh (agents) | 1 | 0 | 40.0 s | 40.0 s | 40.0 s | 3.0 s | 3.0 s | 37.0 s | 37.0 s | 0 |", lines)
+        self.assertIn("| cargo-port | 2 | 1 | 15.0 s | 20.0 s | 10.0 s – 20.0 s | 4.0 s | 4.0 s | 6.0 s | 6.0 s |  |", lines)
         successes = lines[lines.index("### Summary: successes") : lines.index("### Summary: failures")]
-        self.assertIn("| clippy | 1 | 1.0 s | 1.0 s |  |", successes)
-        self.assertIn("| mend | 2 | 50.0 s | 25.0 s |  |", successes)
-        self.assertIn("| **All steps** | 3 | 51.0 s | 17.0 s |  |", successes)
+        self.assertIn("| clippy | 1 | 1.0 s | 1.0 s | 1.0 s |  |", successes)
+        self.assertIn("| mend | 2 | 50.0 s | 25.0 s | 40.0 s |  |", successes)
+        self.assertIn("| **All steps** | 3 | 51.0 s | 17.0 s | 40.0 s |  |", successes)
         failures = lines[lines.index("### Summary: failures") : lines.index("### Summary: all")]
-        self.assertIn("| clippy | 1 | 30.0 s | 30.0 s |  |", failures)
-        self.assertIn("| mend | 1 | 20.0 s | 20.0 s |  |", failures)
+        self.assertIn("| clippy | 1 | 30.0 s | 30.0 s | 30.0 s |  |", failures)
+        self.assertIn("| mend | 1 | 20.0 s | 20.0 s | 20.0 s |  |", failures)
         combined = lines[lines.index("### Summary: all") :]
-        self.assertIn("| mend | 3 | 1 | 1.2 min | 23.3 s |  |", combined)
-        self.assertIn("| **All steps** | 5 | 2 | 1.7 min | 20.2 s |  |", combined)
+        self.assertIn("| mend | 3 | 1 | 1.2 min | 23.3 s | 40.0 s |  |", combined)
+        self.assertIn("| **All steps** | 5 | 2 | 1.7 min | 20.2 s | 40.0 s |  |", combined)
         self.assertIn("| reused | 1 |  | 1.0 min |", lines)
-        self.assertIn("| CI | 1 | 0 | 10.0 min | 10.0 min |", lines)
-        self.assertIn("| scratch (temp folders) | 1 | 0 | 1.0 s | 1.0 s |  |  |  |", lines)
+        self.assertIn("| CI | 1 | 0 | 0 | 10.0 min | 10.0 min | 10.0 min |", lines)
+        self.assertIn("| scratch (temp folders) | 1 | 0 | 1.0 s | 1.0 s | 1.0 s |  |  |  |  |", lines)
         self.assertNotIn("steps under a temp folder", text)
 
     def test_launch_in_temp_folder_counts_host_for_caller_labels(self) -> None:
@@ -601,7 +616,20 @@ class ReportTests(unittest.TestCase):
             ci_run(1, 1, [ci_job(11, "Test", "success", ("2026-10-02T12:00:00Z", "2026-10-02T12:00:30Z", "2026-10-02T12:02:30Z"))]),
         )
         summary = next(line for line in self.render().splitlines() if line.startswith("CI: "))
-        self.assertEqual(summary.split("; ", 1)[1], "jobs queued 30.0 s on average.")
+        self.assertEqual(summary.split("; ", 1)[1], "jobs queued 30.0 s on average, p95 30.0 s; CI never polled.")
+
+    def test_ci_queue_p95_uses_the_same_jobs_as_average(self) -> None:
+        at = datetime.fromisoformat("2026-10-02T12:00:00+00:00")
+        jobs = [
+            ci_job(number, f"Job {number}", "success", (
+                at.isoformat(),
+                (at + timedelta(seconds=wait)).isoformat(),
+                (at + timedelta(seconds=wait + 1)).isoformat(),
+            ))
+            for number, wait in enumerate((10, 20, 30), 1)
+        ]
+        self.write(self.root / "ci" / "2026-10.jsonl", ci_run(1, 1, jobs))
+        self.assertIn("jobs queued 20.0 s on average, p95 30.0 s", self.ci_line("2026-10-02"))
 
     def test_ci_queue_summary_uses_run_attempt_day_for_job_created_after_midnight(self) -> None:
         first_start = datetime(2026, 10, 1, 12).astimezone().isoformat()
@@ -618,9 +646,9 @@ class ReportTests(unittest.TestCase):
         self.write(self.root / "ci" / "2026-10.jsonl", first, rerun)
 
         summary = next(line for line in self.render("2026-10-02").splitlines() if line.startswith("CI: "))
-        self.assertEqual(summary.split("; ", 1)[1], "jobs queued 30.0 s on average.")
+        self.assertEqual(summary.split("; ", 1)[1], "jobs queued 30.0 s on average, p95 30.0 s; CI never polled.")
         self.assertEqual(self.waiting_rows()["CI queue"][2], "1 of 1 jobs")
-        self.assertIn("CI: no runs.", self.render("2026-10-03"))
+        self.assertIn("CI: no runs; CI never polled.", self.render("2026-10-03"))
         self.assertEqual(self.waiting_rows("2026-10-03")["CI queue"], ["none", "", "", "", ""])
 
     def test_ci_queue_summary_counts_unknown_times_but_not_skipped_jobs_as_left_out(self) -> None:
@@ -637,7 +665,7 @@ class ReportTests(unittest.TestCase):
             ]),
         )
         summary = next(line for line in self.render().splitlines() if line.startswith("CI: "))
-        self.assertEqual(summary.split("; ", 1)[1], "jobs queued 30.0 s on average, 2 without a known queue time left out.")
+        self.assertEqual(summary.split("; ", 1)[1], "jobs queued 30.0 s on average, p95 30.0 s, 2 without a known queue time left out; CI never polled.")
 
     def test_ci_queue_summary_when_no_job_has_a_known_queue_time(self) -> None:
         original = ("2026-10-02T12:00:00Z", "2026-10-02T12:00:30Z", "2026-10-02T12:02:30Z")
@@ -650,7 +678,7 @@ class ReportTests(unittest.TestCase):
             rerun,
         )
         summary = next(line for line in self.render("2026-10-03").splitlines() if line.startswith("CI: "))
-        self.assertEqual(summary.split("; ", 1)[1], "no job has a known queue time (1 left out).")
+        self.assertEqual(summary.split("; ", 1)[1], "no job has a known queue time (1 left out); CI never polled.")
 
     def test_ci_queue_summary_with_only_skipped_jobs_has_no_left_out_suffix(self) -> None:
         skipped = ("2026-10-02T12:01:00Z", "2026-10-02T12:01:00Z", "2026-10-02T12:00:59Z")
@@ -659,7 +687,7 @@ class ReportTests(unittest.TestCase):
             ci_run(1, 1, [ci_job(11, "Skipped", "skipped", skipped)]),
         )
         summary = next(line for line in self.render().splitlines() if line.startswith("CI: "))
-        self.assertEqual(summary.split("; ", 1)[1], "no job has a known queue time.")
+        self.assertEqual(summary.split("; ", 1)[1], "no job has a known queue time; CI never polled.")
 
     def test_scratch_steps_form_one_caller_per_kind_and_count_toward_peak_memory(self) -> None:
         gib = 1073741824
@@ -676,16 +704,16 @@ class ReportTests(unittest.TestCase):
 
         lines = self.render().splitlines()
         fmt = lines[lines.index("### fmt") : lines.index("### doc")]
-        self.assertIn("| scratch (temp folders) | 2 | 0 | 15.0 s | 10.0 s – 20.0 s |", fmt)
+        self.assertIn("| scratch (temp folders) | 2 | 0 | 15.0 s | 20.0 s | 10.0 s – 20.0 s |", fmt)
         self.assertEqual(1, sum(line.startswith("| scratch (temp folders) |") for line in fmt))
         doc = lines[lines.index("### doc") : lines.index("### Summary: successes")]
-        self.assertIn("| scratch (temp folders) | 1 | 1 | 10.0 s | 10.0 s |  |  |", doc)
+        self.assertIn("| scratch (temp folders) | 1 | 1 | 10.0 s | 10.0 s | 10.0 s |  |  |  |", doc)
         successes = lines[lines.index("### Summary: successes") : lines.index("### Summary: failures")]
-        self.assertIn("| fmt | 3 | 1.0 min | 20.0 s | 2.0 GiB |", successes)
+        self.assertIn("| fmt | 3 | 1.0 min | 20.0 s | 30.0 s | 2.0 GiB |", successes)
         failures = lines[lines.index("### Summary: failures") : lines.index("### Summary: all")]
-        self.assertIn("| doc | 1 | 10.0 s | 10.0 s | 4.0 GiB |", failures)
+        self.assertIn("| doc | 1 | 10.0 s | 10.0 s | 10.0 s | 4.0 GiB |", failures)
         combined = lines[lines.index("### Summary: all") :]
-        self.assertIn("| **All steps** | 4 | 1 | 1.2 min | 17.5 s | 4.0 GiB |", combined)
+        self.assertIn("| **All steps** | 4 | 1 | 1.2 min | 17.5 s | 30.0 s | 4.0 GiB |", combined)
 
     def test_port_lint_calls_have_their_own_section(self) -> None:
         self.write(
@@ -711,7 +739,7 @@ class ReportTests(unittest.TestCase):
         text = self.render()
         self.assertIn("No build steps recorded.", text)
         self.assertIn("Agent calls: none.", text)
-        self.assertIn("CI: no runs.", text)
+        self.assertIn("CI: no runs; CI never polled.", text)
         self.assertNotIn("cargo-port calls", text)
 
     def test_disk_section_precedes_summaries_with_steps(self) -> None:
@@ -732,7 +760,7 @@ class ReportTests(unittest.TestCase):
         self.write(self.root / "natedev" / "2026-10.jsonl", step("one"))
 
         with mock.patch("report.disk.read_snapshot", return_value=snapshot) as read_snapshot:
-            with mock.patch("report.sync_time", return_value="12:14 EDT"):
+            with mock.patch("sync.sync_time", return_value="12:14 EDT"):
                 lines = self.render().splitlines()
 
         self.assertLess(lines.index("### Disk: natedev"), lines.index("### Summary: successes"))
@@ -832,8 +860,125 @@ class ReportTests(unittest.TestCase):
         with mock.patch.dict(os.environ, {"TZ": "America/New_York"}):
             time.tzset()
             now = datetime.fromisoformat("2026-10-03T15:00:00-04:00")
-            self.assertEqual(report.sync_time("2026-10-03T16:14:00+00:00", now), "12:14 EDT")
-            self.assertEqual(report.sync_time("2026-10-02T16:14:00+00:00", now), "2026-10-02 12:14 EDT")
+            self.assertEqual(sync.sync_time("2026-10-03T16:14:00+00:00", now), "12:14 EDT")
+            self.assertEqual(sync.sync_time("2026-10-02T16:14:00+00:00", now), "2026-10-02 12:14 EDT")
+
+    def test_nearest_rank_matches_p95_boundaries_and_single_value(self) -> None:
+        self.assertEqual(report.nearest_rank(list(range(1, 21)), 95), 19)
+        self.assertEqual(report.nearest_rank(list(range(1, 22)), 95), 20)
+        self.assertEqual(report.nearest_rank([37], 95), 37)
+        self.assertEqual(report.nearest_rank([360, 720, 1080, 1440], 75), 1080)
+
+    def test_ci_freshness_for_today_and_a_past_day(self) -> None:
+        now = datetime.now(UTC)
+        today = now.astimezone().date().isoformat()
+        yesterday = (now.astimezone().date() - timedelta(days=1)).isoformat()
+        old = now - timedelta(hours=3)
+        self.poll_stamp(old)
+        stale = self.ci_line(today)
+        self.assertTrue(stale.startswith("CI: no runs; "))
+        self.assertIn(f"CI recorded through {sync.sync_time(old.isoformat(), now)}, no poll since", stale)
+
+        self.poll_stamp(now - timedelta(minutes=30))
+        self.assertEqual(self.ci_line(today), "CI: no runs.")
+
+        self.poll_stamp(now, complete=False)
+        capped = self.ci_line(today)
+        self.assertIn(f"CI recorded through {sync.sync_time(now.isoformat(), now)}", capped)
+        self.assertIn("the last poll was capped", capped)
+        self.assertEqual(self.ci_line(yesterday), "CI: no runs.")
+
+    def test_missing_ci_stamp_reports_never_polled(self) -> None:
+        today = datetime.now().astimezone().date().isoformat()
+        self.assertEqual(self.ci_line(today), "CI: no runs; CI never polled.")
+
+    def test_ci_cancellation_count_and_p95_follow_workflow_runs(self) -> None:
+        today = datetime.now().astimezone().date().isoformat()
+        at = datetime.now(UTC).replace(microsecond=0)
+        runs: list[Record] = []
+        for number, (conclusion, duration) in enumerate((("success", 60), ("failure", 120), ("cancelled", 180)), 1):
+            run = ci_run(number, 1, [])
+            run.update({
+                "conclusion": conclusion,
+                "created_at": at.isoformat(),
+                "started_at": at.isoformat(),
+                "updated_at": (at + timedelta(seconds=duration)).isoformat(),
+            })
+            runs.append(run)
+        self.write(self.root / "ci" / "2026-10.jsonl", *runs)
+        lines = self.render(today).splitlines()
+        self.assertIn("| Workflow | Runs | Failed | Cancelled | Avg | p95 | Range |", lines)
+        self.assertIn("| CI | 3 | 1 | 1 | 2.0 min | 3.0 min | 1.0 min – 3.0 min |", lines)
+        summary = next(line for line in lines if line.startswith("CI: "))
+        self.assertIn("3 runs, 1 failed, 1 cancelled", summary)
+
+        runs[2]["conclusion"] = "success"
+        self.write(self.root / "ci" / "2026-10.jsonl", *runs)
+        self.assertNotIn("cancelled", self.ci_line(today))
+
+    def test_pause_note_precedes_last_good_mac_sync(self) -> None:
+        self.root.mkdir(parents=True, exist_ok=True)
+        _ = (self.root / "sync.json").write_text(json.dumps({
+            "at": "2026-10-06T10:00:00Z", "peer": "mac", "ok": True,
+            "last_ok": "2026-10-06T10:00:00Z",
+        }))
+        _ = (self.root / "sync_paused.json").write_text(json.dumps({
+            "since": "2026-10-06T11:00:00Z", "why": "Mac hold",
+        }))
+        note = report.mac_note()
+        self.assertTrue(note.startswith("Mac: sync paused since "))
+        self.assertIn("(Mac hold). Mac rows as of the ", note)
+
+    def test_every_step_kind_and_summary_places_p95_after_average(self) -> None:
+        kinds = ("check", "clippy", "doc", "nextest", "mend", "fmt")
+        records = [
+            step(f"{kind}-{value}", step=kind, duration_s=float(value), finished_s=float(value * 2),
+                 mend_s=float(value * 3), mend_check_s=float(value * 4))
+            for kind in kinds for value in range(1, 22)
+        ]
+        self.write(self.root / "natedev" / "2026-10.jsonl", *records)
+        lines = self.render().splitlines()
+        for kind in kinds:
+            with self.subTest(kind=kind):
+                start = lines.index(f"### {kind}")
+                head = [cell.strip() for cell in lines[start + 2].strip("|").split("|")]
+                row = [cell.strip() for cell in lines[start + 4].strip("|").split("|")]
+                self.assertEqual(head[head.index("Avg") + 1], "p95")
+                self.assertEqual(row[head.index("Avg")], "11.0 s")
+                self.assertEqual(row[head.index("p95")], "20.0 s")
+                for title, expected in (("Build", "40.0 s"), ("Mend's own", "1.0 min"), ("Check", "1.3 min")):
+                    if title in head:
+                        self.assertEqual(head[head.index(title) + 1], f"{title} p95")
+                        self.assertEqual(row[head.index(f"{title} p95")], expected)
+        for name in ("successes", "failures", "all"):
+            start = lines.index(f"### Summary: {name}")
+            if name == "failures":
+                continue
+            head = [cell.strip() for cell in lines[start + 2].strip("|").split("|")]
+            self.assertEqual(head[head.index("Avg") + 1], "p95")
+            first = [cell.strip() for cell in lines[start + 4].strip("|").split("|")]
+            self.assertEqual(first[head.index("p95")], "20.0 s")
+
+    def test_failure_summary_and_edits_since_green_show_p95(self) -> None:
+        for number, recovery in enumerate((5, 10, 20)):
+            seat = f"seat-{number}"
+            base = number * 15
+            self.verify_call(number * 3, "tree-a", seat=seat, minute=base)
+            self.verify_call(number * 3 + 1, "tree-b", seat=seat, status=1, minute=base + 1)
+            self.verify_call(number * 3 + 2, "tree-b", seat=seat, minute=base + 1 + recovery)
+        _, bins = self.per_edit_tables()
+        self.assertEqual(bins[0][bins[0].index("Avg to next green") + 1], "p95 to next green")
+        self.assertEqual(self.cell(bins, "1", "p95 to next green"), "20.0 min")
+
+        self.write(self.root / "natedev" / "2026-10.jsonl", *self.records,
+                   step("failed-one", step="fmt", duration_s=10.0, status=1),
+                   step("failed-two", step="fmt", duration_s=20.0, status=1))
+        lines = self.render().splitlines()
+        start = lines.index("### Summary: failures")
+        head = [cell.strip() for cell in lines[start + 2].strip("|").split("|")]
+        row = [cell.strip() for cell in lines[start + 4].strip("|").split("|")]
+        self.assertEqual(head[head.index("Avg") + 1], "p95")
+        self.assertEqual(row[head.index("p95")], "20.0 s")
 
 
 if __name__ == "__main__":

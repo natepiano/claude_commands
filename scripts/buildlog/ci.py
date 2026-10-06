@@ -21,6 +21,7 @@ from __future__ import annotations
 import json
 import subprocess
 import time
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import NotRequired, TypedDict, cast
@@ -86,6 +87,24 @@ class RepoState(TypedDict):
     backfill_complete: bool
 
 
+@dataclass(frozen=True)
+class CompletedPoll:
+    polled_at: str
+
+
+@dataclass(frozen=True)
+class CappedPoll:
+    polled_at: str
+
+
+@dataclass(frozen=True)
+class NeverPolled:
+    pass
+
+
+PollState = CompletedPoll | CappedPoll | NeverPolled
+
+
 class GhError(Exception):
     pass
 
@@ -142,6 +161,46 @@ def write_state(state: dict[str, RepoState]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     partial = path.with_name(path.name + ".tmp")
     _ = partial.write_text(json.dumps(state, indent=2) + "\n")
+    _ = partial.replace(path)
+
+
+def polled_path() -> Path:
+    return store.root() / store.CI_DIR / store.CI_POLLED_NAME
+
+
+def _read_polled() -> dict[str, object]:
+    try:
+        data = cast(object, json.loads(polled_path().read_text()))
+    except (OSError, ValueError):
+        return {}
+    return cast(dict[str, object], data) if isinstance(data, dict) else {}
+
+
+def read_poll_state(repo: str) -> PollState:
+    record = _read_polled().get(repo)
+    if not isinstance(record, dict):
+        return NeverPolled()
+    fields = cast(dict[str, object], record)
+    polled_at = fields.get("polled_at")
+    complete = fields.get("complete")
+    if not isinstance(polled_at, str) or not isinstance(complete, bool):
+        return NeverPolled()
+    try:
+        at = datetime.fromisoformat(polled_at.replace("Z", "+00:00"))
+    except ValueError:
+        return NeverPolled()
+    if at.tzinfo is None:
+        return NeverPolled()
+    return CompletedPoll(polled_at) if complete else CappedPoll(polled_at)
+
+
+def write_polled(repo: str, complete: bool) -> None:
+    records = _read_polled()
+    records[repo] = {"polled_at": store.utc_iso(time.time()), "complete": complete}
+    path = polled_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    partial = path.with_name(path.name + ".tmp")
+    _ = partial.write_text(json.dumps(records) + "\n")
     _ = partial.replace(path)
 
 
@@ -287,6 +346,8 @@ def ci() -> int:
             print(f"buildlog ci: {repo}: {error}")
             status = 1
             complete = False
+        else:
+            write_polled(repo, complete)
         if complete and not backfilled:
             state[repo] = {"backfill_complete": True}
             write_state(state)
