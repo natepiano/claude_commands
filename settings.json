@@ -124,6 +124,10 @@
           {
             "type": "command",
             "command": "\"$HOME/.claude/scripts/lib/py\" \"$HOME/.claude/scripts/hooks/post-tool-use-basedpyright.py\""
+          },
+          {
+            "type": "command",
+            "command": "\"$HOME/.claude/scripts/lib/py\" \"$HOME/.claude/scripts/hooks/post-tool-use-fn-length.py\""
           }
         ]
       },
