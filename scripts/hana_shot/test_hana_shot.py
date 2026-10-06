@@ -30,6 +30,22 @@ NAMES = ((11, "Log"), (12, "Twin"), (13, "Twin"))
 TOOLS = ((30, GRAYSCALE, 3, "hana.effect.grayscale"), (20, GRAYSCALE, 1, "hana.effect.grayscale"), (40, BLUR, 2, "hana.effect.blur"))
 EXTRA_ENTITY = 77
 SHOT_SIZE = (4, 3)
+REMOTE_HOST = "natemccoy@mac"
+# Fake scp and ssh: the remote host is a local folder, and every call is logged as one JSON line.
+FAKE_REMOTE = """\
+#!{python}
+import json, shutil, sys
+from pathlib import Path
+remote = Path({remote!r})
+name = Path(sys.argv[0]).name
+with open({log!r}, "a") as handle:
+    handle.write(json.dumps([name, *sys.argv[1:]]) + "\\n")
+if name == "scp":
+    if {copies!r}:
+        shutil.copyfile(remote / Path(sys.argv[2]).name, sys.argv[3])
+else:
+    (remote / Path(sys.argv[-1]).name).unlink(missing_ok=True)
+"""
 
 
 class Request(TypedDict):
@@ -91,6 +107,7 @@ class Fake:
         self.calls: list[Call] = []
         self.frame: int = 0
         self.screenshot: str = "ok"
+        self.remote: Path | None = None
         self.release: threading.Event = threading.Event()
         self.lock: threading.Lock = threading.Lock()
 
@@ -124,7 +141,10 @@ class Fake:
                 return {"result": None}
             if self.screenshot == "busy-always" or (self.screenshot == "busy-once" and screenshots == 1):
                 return {"error": {"code": -32603, "message": "Screenshot already in progress"}}
-            _ = Path(cast(str, params["path"])).write_bytes(png(*SHOT_SIZE))
+            path = Path(cast(str, params["path"]))
+            if self.remote is not None:
+                path = self.remote / path.name
+            _ = path.write_bytes(png(*SHOT_SIZE))
             return {"result": {"path": params["path"], "status": "ok"}}
         return {"result": None}
 
@@ -188,7 +208,13 @@ class HanaShotTest(unittest.TestCase):
         return self.scratch / "cache" / "hana-shot" / "timings.jsonl"
 
     def run_script(self, *args: str) -> subprocess.CompletedProcess[str]:
-        environment = {**os.environ, "XDG_CACHE_HOME": str(self.scratch / "cache"), "HANA_SHOT_CAPTURE_TIMEOUT": "1"}
+        environment = {
+            **os.environ,
+            "XDG_CACHE_HOME": str(self.scratch / "cache"),
+            "HANA_SHOT_CAPTURE_TIMEOUT": "1",
+            # RemoteTests puts its fake scp and ssh here.
+            "PATH": f"{self.scratch / 'bin'}{os.pathsep}{os.environ.get('PATH', '')}",
+        }
         return subprocess.run(
             [sys.executable, str(SCRIPT), *args],
             cwd=self.scratch, env=environment, capture_output=True, text=True, timeout=60, check=False,
@@ -344,6 +370,67 @@ class ShotTests(HanaShotTest):
         result = self.shot("--mode", "home")
         self.assertEqual(result.returncode, 1)
         self.assertIn("already in progress", result.stderr)
+
+
+class RemoteTests(HanaShotTest):
+    def fake_remote(self, copies: bool) -> Path:
+        """Point the fake Hana's writes at a folder standing in for the remote host, and fake scp and ssh."""
+        remote = self.scratch / "remote"
+        remote.mkdir()
+        self.fake.remote = remote
+        bin_directory = self.scratch / "bin"
+        bin_directory.mkdir()
+        source = FAKE_REMOTE.format(python=sys.executable, remote=str(remote), log=str(self.ssh_log), copies=copies)
+        for name in ("scp", "ssh"):
+            fake = bin_directory / name
+            _ = fake.write_text(source)
+            fake.chmod(0o755)
+        return remote
+
+    @property
+    def ssh_log(self) -> Path:
+        return self.scratch / "ssh.jsonl"
+
+    def ssh_calls(self) -> list[list[str]]:
+        if not self.ssh_log.exists():
+            return []
+        return [cast(list[str], json.loads(line)) for line in self.ssh_log.read_text().splitlines()]
+
+    def test_remote_shot_copies_the_png_back_and_removes_it_there(self) -> None:
+        remote = self.fake_remote(copies=True)
+        result = self.shot("--mode", "home", "--remote", REMOTE_HOST)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue((self.scratch / "shot.png").read_bytes().startswith(b"\x89PNG"))
+        [screenshot] = self.fake.methods("brp_extras/screenshot")
+        remote_path = cast(str, screenshot["path"])
+        self.assertRegex(remote_path, r"^/tmp/hana_shot_[0-9]+_1\.png$")
+        [copy, removal] = self.ssh_calls()
+        self.assertEqual(copy[:3], ["scp", "-q", f"{REMOTE_HOST}:{remote_path}"])
+        self.assertEqual(Path(copy[3]).parent, self.scratch)
+        self.assertEqual(removal, ["ssh", REMOTE_HOST, "rm", "-f", remote_path])
+        self.assertEqual(list(remote.iterdir()), [])
+        self.assertEqual([path.name for path in self.scratch.glob(".shot-*")], [])
+        line = cast(dict[str, object], json.loads(self.timings.read_text()))
+        self.assertEqual(line["host"], "mac")
+
+    def test_remote_copy_that_leaves_no_file_fails(self) -> None:
+        remote = self.fake_remote(copies=False)
+        result = self.shot("--mode", "home", "--remote", REMOTE_HOST)
+        self.assertEqual(result.returncode, 1, result.stderr)
+        [screenshot] = self.fake.methods("brp_extras/screenshot")
+        self.assertIn(f"no PNG came back from {REMOTE_HOST}:{screenshot['path']}", result.stderr)
+        self.assertEqual([call[0] for call in self.ssh_calls()], ["scp"], "the remote shot is kept")
+        self.assertEqual(len(list(remote.iterdir())), 1)
+        self.assertFalse((self.scratch / "shot.png").exists())
+        self.assertFalse(self.timings.exists())
+
+    def test_launch_and_shutdown_are_refused_with_remote(self) -> None:
+        for flag in ("--launch", "--shutdown"):
+            with self.subTest(flag=flag):
+                result = self.shot("--mode", "home", "--remote", REMOTE_HOST, flag)
+                self.assertEqual(result.returncode, 2, result.stderr)
+                self.assertIn("this machine only", result.stderr)
+        self.assertEqual(self.fake.calls, [])
 
 
 class PoseTests(HanaShotTest):
