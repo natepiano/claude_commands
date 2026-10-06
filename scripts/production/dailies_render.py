@@ -970,35 +970,50 @@ def agent_line(name: str, fields: dict[str, str], readings: list[Reading], now: 
         return f"- {name}: week's usage unknown; {'refills ' + refill if refill else 'refill time unknown'}; {resets}"
     week = _AgentWeekUsage(reset, agent_time(fields.get("weekly_usage_checked_at")) or now.replace(tzinfo=zone), 100 - remaining)
     if week.used_percent >= 100:
-        return f"- {name}: {week.used_percent:g}% of the week used; out until its {refill} refill; {resets}"
+        return f"- {name}: {week.used_percent:g}%; ran out, back at its {refill} refill; {resets}"
     last_refill = machine_local((week.reset_at - timedelta(days=7)).replace(tzinfo=None))
     first_allowed = max(last_refill.timestamp(), now.replace(tzinfo=zone).timestamp() - run_out.WINDOW.total_seconds())
+    drop = run_out.latest_drop(readings, week.checked_at.timestamp())
+    if drop is not None:
+        first_allowed = max(first_allowed, drop)
     rate = run_out.trailing_rate(readings, first_allowed, week.checked_at.timestamp())
     if rate is None:
-        elapsed = week.checked_at.timestamp() - last_refill.timestamp()
+        elapsed = week.checked_at.timestamp() - first_allowed
         rate = week.used_percent / elapsed if elapsed > 0 else 0
     if rate <= 0:
-        pace = f"lasts to its {refill} refill"
+        pace = f"does not run out at this pace, so it hits its {refill} refill first"
     else:
         empty_seconds = week.checked_at.timestamp() + (100 - week.used_percent) / rate * lean
         rounded_seconds = math.floor((empty_seconds + 30) / 60) * 60
         empty_at = datetime.fromtimestamp(rounded_seconds, zone)
+        time_text = f"{empty_at:%H:%M %Z} today" if empty_at.date() == now.date() else f"{empty_at:%a %H:%M %Z}"
         if empty_at.timestamp() >= week.reset_at.timestamp():
-            pace = f"lasts to its {refill} refill"
+            pace = f"runs out about {time_text}, so it hits its {refill} refill first"
         else:
-            time_text = f"{empty_at:%H:%M %Z} today" if empty_at.date() == now.date() else f"{empty_at:%a %H:%M %Z}"
             pace = f"runs out about {time_text}, before its {refill} refill"
-    return f"- {name}: {week.used_percent:g}% of the week used; {pace}; {resets}"
+    return f"- {name}: {week.used_percent:g}%; {pace}; {resets}"
 
 
-def agent_section(now: datetime, zone: ZoneInfo) -> list[str]:
+def agent_section(now: datetime, zone: ZoneInfo, *, at: str | None = None) -> list[str]:
     readings = run_out.read_readings(READINGS_LOG)
     lean = run_out.lean(RUN_OUTS_LOG)
     lines = ["### Agents"]
+    stamped = datetime.fromisoformat(at) if at is not None else None
+    if stamped is not None and stamped.tzinfo is None:
+        stamped = stamped.replace(tzinfo=zone)
+    minute_end = stamped.timestamp() + 60 if stamped is not None else None
     for path in sorted(AGENTS_DIR.glob("*.md")):
         fields = agent_fields(path)
         if fields.get("state") == "active":
-            lines.append(agent_line(path.stem, fields, readings.get(path.stem, []), now, zone, lean))
+            account_readings = readings.get(path.stem, [])
+            if minute_end is not None:
+                account_readings = [reading for reading in account_readings if reading.at.timestamp() < minute_end]
+                checked_at = agent_time(fields.get("weekly_usage_checked_at"))
+                if checked_at is not None and checked_at.timestamp() >= minute_end and account_readings:
+                    latest = account_readings[-1]
+                    fields["weekly_usage_checked_at"] = latest.at.isoformat()
+                    fields["weekly_remaining_usage"] = str(100 - latest.used_percent)
+            lines.append(agent_line(path.stem, fields, account_readings, now, zone, lean))
     if len(lines) == 1:
         lines.append("- none active")
     lines.append("")
@@ -1069,7 +1084,8 @@ def plan_progress(unit: Unit) -> PlanProgress | None:
     return PlanProgress(number, total, round(100 * done))
 
 
-def render(report: Report, previous: dict[str, Previous], now: datetime, zone_name: str, outstanding: list[Outstanding]) -> list[str]:
+def render(report: Report, previous: dict[str, Previous], now: datetime, zone_name: str, outstanding: list[Outstanding],
+           *, at: str | None = None) -> list[str]:
     lines = [f"**Dailies ({report.length.capitalize()})**, {now:%H:%M} {zone_name}", ""]
     user_topics = [topic for topic in report.topics if topic.needs_user]
     other_topics = [topic for topic in report.topics if not topic.needs_user]
@@ -1122,7 +1138,7 @@ def render(report: Report, previous: dict[str, Previous], now: datetime, zone_na
     needed = any(unit.needed for unit in report.units) or any(topic.needed for topic in report.topics)
     zone = ZoneInfo(report.zone)
     lines.extend(footer(now, zone, zone_name, report.next_run, report.build_hold, outstanding,
-                        nothing_needed=not needed, agent_lines=agent_section(now, zone)))
+                        nothing_needed=not needed, agent_lines=agent_section(now, zone, at=at)))
     return lines
 
 
@@ -1157,7 +1173,7 @@ def footer_main(zone: str, next_run: str | None, at: str | None, outstanding_pat
         print(f"dailies_render: {error}", file=sys.stderr)
         return 2
     print("\n".join(footer(now, ZoneInfo(zone), abbreviation, next_run, hold, outstanding,
-                           nothing_needed=nothing_needed, agent_lines=agent_section(now, ZoneInfo(zone)))))
+                           nothing_needed=nothing_needed, agent_lines=agent_section(now, ZoneInfo(zone), at=at))))
     return 0
 
 
@@ -1207,7 +1223,7 @@ def main(arguments: list[str]) -> int:
     except (InputError, json.JSONDecodeError, OSError) as error:
         print(f"dailies_render: {error}", file=sys.stderr)
         return 2
-    print("\n".join(render(report, previous, now, abbreviation, outstanding)))
+    print("\n".join(render(report, previous, now, abbreviation, outstanding, at=at)))
     if state_path is not None:
         save_state(state_path, report, now, previous)
     if log_path is not None:

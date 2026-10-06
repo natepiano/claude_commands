@@ -38,20 +38,26 @@ The user, via natedev, 2026-10-06 06:2x PDT: "can we create an edit hook - i am 
 
 ## Delegation Context
 
-- **Project:** `~/.claude` — Claude Code commands, skills, hooks and scripts; this plan records a too_many_lines baseline (Phase 1), makes every showrunner reply end with the current footer through a Stop hook (Phase 2), adds a PostToolUse hook that blocks Claude edits leaving a Rust function over clippy's limit (Phase 3), extends it to Codex seats (Phase 4), and re-measures (Phase 5). Work in the worktree `/home/natepiano/worktrees/claude-build-followups-stalls` on branch `build-followups-stalls` (unit `stalls-unit` of production `build-followups`).
+- **Project:** `~/.claude` — Claude Code commands, skills, hooks and scripts; this plan records a too_many_lines baseline (Phase 1), makes every showrunner reply end with the current footer through a Stop hook (Phase 2), adds a PostToolUse hook that blocks Claude edits leaving a Rust function over clippy's limit (Phase 3), fixes three production status defects the showrunner routed here (Phase 4), adds a stall watcher that bumps an idle unit and tells its showrunner, and routes every repair through `implement.sh` (Phase 5), extends the hook to Codex seats (Phase 6), and re-measures (Phase 7). Work in the worktree `/home/natepiano/worktrees/claude-build-followups-stalls` on branch `build-followups-stalls` (unit `stalls-unit` of production `build-followups`).
 - **Project started:** 2026-10-06T15:12:44.327+00:00
 - **Stack:** Python 3.13, standard library only (`json`, `re`, `tomllib`, `dataclasses`, `pathlib`, `subprocess`, `shlex`, `zoneinfo`, `unittest`); `scripts/lib/py` picks a Python ≥ 3.10 on each machine (3.13 on natedev and the Mac, so `tomllib` is present). Codex CLI 0.160.1 on natedev, 0.154.0 on the Mac.
 - **Layout:**
-  - `scripts/production/dailies_render.py` — `--footer` also prints the Agents lines (Phase 2); `test_dailies_render.py` and `test_dailies_render_agents.py` beside it
+  - `scripts/production/dailies_render.py` — `--footer` also prints the Agents lines (Phase 2), judged as of the stamp (Phase 4); `test_dailies_render.py` and `test_dailies_render_agents.py` beside it
+  - `scripts/whoami/run_out.py` — readings log, trailing rate, run-out lean; `test_run_out.py` beside it (Phase 4)
+  - `scripts/production/unit_status.sh` — the showrunner's per-unit status; `test_unit_status.py` beside it (Phase 4)
+  - `config/showrunners.json` — shared showrunner config: quota-alert fields and `stall_minutes` (new, Phase 5; replaces `scripts/whoami/quota_alert.json`)
+  - `scripts/production/showrunners.py` — the config, and the showrunners read from the `showrunner-*` notifier instances; `test_showrunners.py` beside it (new, Phase 5)
+  - `scripts/production/stall_watch.py` — the stall watcher, run by the `stall-watch` notifier instance; `test_stall_watch.py` beside it (new, Phase 5)
+  - `scripts/whoami/quota_alert.py` — reads the shared config; `test_quota_alert.py` beside it (Phase 5)
   - `scripts/hooks/stop-showrunner-footer.py` — the Stop hook entry; `scripts/hooks/showrunner_footer.py` — production lookup, footer render, comparison; `scripts/hooks/test_stop_showrunner_footer.py` — their tests (new, Phase 2)
   - `commands/showrunner/produce.md` — the Footer section (Phase 2)
   - `scripts/hooks/fn_length_lib.py` — the checker: lint scope, function discovery, clippy's count (new, Phase 3)
-  - `scripts/hooks/post-tool-use-fn-length.py` — the hook entry for Claude payloads (Phase 3) and Codex `apply_patch` payloads (Phase 4) (new)
-  - `scripts/hooks/test_fn_length.py` — its tests (new, Phase 3; extended Phase 4)
-  - `scripts/hooks/codex_hooks.py` — installs and trusts the Codex hook (new, Phase 4)
-  - `scripts/hooks/test_codex_hooks.py` — its tests, with a stub `codex` on `PATH` (new, Phase 4)
+  - `scripts/hooks/post-tool-use-fn-length.py` — the hook entry for Claude payloads (Phase 3) and Codex `apply_patch` payloads (Phase 6) (new)
+  - `scripts/hooks/test_fn_length.py` — its tests (new, Phase 3; extended Phase 6)
+  - `scripts/hooks/codex_hooks.py` — installs and trusts the Codex hook (new, Phase 6)
+  - `scripts/hooks/test_codex_hooks.py` — its tests, with a stub `codex` on `PATH` (new, Phase 6)
   - `settings.json` — Stop hook registration (Phase 2); Claude edit hook registration (Phase 3)
-  - outside the repository, at run time: `~/.local/state/fn-length-hook/blocks.jsonl`; `~/.codex/hooks.json` and `~/.codex/config.toml` `[hooks.state]` on each machine (Phase 4)
+  - outside the repository, at run time: `~/.local/state/fn-length-hook/blocks.jsonl`; `~/.codex/hooks.json` and `~/.codex/config.toml` `[hooks.state]` on each machine (Phase 6)
 - **Key files:**
   - `scripts/hooks/post-tool-use-banned-words.py` — the blocking convention: one JSON object with `decision: "block"`, a short `reason`, `continue: true`, a one-line `systemMessage`, and `hookSpecificOutput: {hookEventName: "PostToolUse", additionalContext}`; read-only tools exit before heavy imports
   - `scripts/hooks/banned_words_lib.py` — the sibling-library convention the new library follows
@@ -61,9 +67,9 @@ The user, via natedev, 2026-10-06 06:2x PDT: "can we create an edit hook - i am 
   - `scripts/agents/codex_mesh.py:256-319` — JSON-RPC client convention (`initialize` with `clientInfo` and `capabilities: {"experimentalApi": true}`, string request ids, `_require`); read only, unchanged by this plan
   - `pyrightconfig.json` — `scripts/hooks` is an execution environment with itself on `extraPaths`, so tests import `fn_length_lib` directly
   - `~/.local/state/nightly-review/2026-10-06/work/lints/{cost.py,loop.py,clippy_fail_lints.py,tml_lengths.py}` — the measurement scripts, read-only over `~/.local/state/buildlog/index.sqlite` and its gzip step logs; outside the repository and never edited (user, 2026-10-06: "using … cost.py, loop.py and clippy_fail_lints.py")
-- **Test lanes:** `scripts/hooks/` and `scripts/production/` — `test_*.py` beside the scripts; this repository has no `tests/` directories.
+- **Test lanes:** `scripts/hooks/`, `scripts/production/` and `scripts/whoami/` — `test_*.py` beside the scripts; this repository has no `tests/` directories.
 - **Build:** none — Python and JSON; nothing compiles.
-- **Test:** `python3 -m unittest discover -s scripts/hooks -p 'test_stop_showrunner_footer.py'` and `python3 -m unittest discover -s scripts/production -p 'test_dailies_render*.py'` (Phase 2); `python3 -m unittest discover -s scripts/hooks -p 'test_fn_length.py'` and `-p 'test_codex_hooks.py'` (Phases 3–4); run from the worktree root.
+- **Test:** `python3 -m unittest discover -s scripts/hooks -p 'test_stop_showrunner_footer.py'` and `python3 -m unittest discover -s scripts/production -p 'test_dailies_render*.py'` (Phase 2); `python3 -m unittest discover -s scripts/hooks -p 'test_fn_length.py'` and `-p 'test_codex_hooks.py'` (Phases 3 and 6); `python3 -m unittest discover -s scripts/whoami -p 'test_run_out.py'` and `-s scripts/production -p 'test_unit_status.py'` (Phase 4); `python3 -m unittest discover -s scripts/production -p 'test_showrunners.py'`, `-p 'test_stall_watch.py'` and `-s scripts/whoami -p 'test_quota_alert.py'` and `-s scripts/message -p 'test_notifier.py'` (Phase 5); run from the worktree root.
 - **Lint:** `basedpyright <each changed .py file>` passes when its output ends `0 errors, 0 warnings, 0 notes`; it exits 3 in every checkout because `pyrightconfig.json` names a `.venv` no checkout has, so its exit status says nothing. `python3 -m json.tool settings.json > /dev/null` after editing `settings.json`.
 - **Style:** none — not Rust (showrunner, 2026-10-06).
 - **Invariants:**
@@ -73,7 +79,7 @@ The user, via natedev, 2026-10-06 06:2x PDT: "can we create an edit hook - i am 
   - A test never writes the real `~/.codex`, `~/.local/state/fn-length-hook` or `~/.local/state/buildlog`, never runs the real `codex` or `cargo`, and never edits `settings.json` beyond the Phase 3 registration (production rules). Live checks against real files are the unit director's, in the Acceptance gates.
   - Running `codex` from a Claude session needs `dangerouslyDisableSandbox`: codex writes `~/.codex` and fails with "Operation not permitted" otherwise (`/etc/nixos/modules/common/codex.nix`).
   - Python is typed throughout with no `Any` and no file-level type ignores; basedpyright reports 0 errors and 0 warnings (user rule, `~/.claude/CLAUDE.md`).
-  - `~/.claude` main is the live configuration and each merged phase goes to it at once (production rule): the Claude hook goes live when Phase 3 reaches main, the Codex hook when Phase 4's install runs on each machine.
+  - `~/.claude` main is the live configuration and each merged phase goes to it at once (production rule): the Claude hook goes live when Phase 3 reaches main, the Codex hook when Phase 6's install runs on each machine.
   - Times carry their zone: this plan states PDT (America/Los_Angeles); natedev's clock and journal are EDT; buildlog stamps are UTC.
 
 ## Phases
@@ -137,7 +143,7 @@ Measured 2026-10-06 08:17 PDT over every hana clippy step since the first, 2026-
 - `fn_length_lib` holds `count_body_lines` (clippy's loop, quirks kept), `measure_functions` (one regex-tokenizer scan), `lint_scope` and `long_functions`. Scope: nearest `[package]` manifest, `lints.workspace` followed to `[workspace.lints.clippy]`, `too_many_lines` else `pedantic` at warn, deny or forbid; threshold from the nearest `clippy.toml` or `.clippy.toml`, else 100; any read or parse error disables.
 - Exemption follows attribute attachment: `allow`, `expect` or `cfg_attr(…, allow|expect(…))` naming `clippy::too_many_lines` or `clippy::pedantic`; every outer attribute pending since the last `;`, `{` or `}` attaches to the next item, exempting a `fn` or everything inside an `impl`, `trait`, `mod` or `fn` block; `#![…]` exempts the rest of its block. A keyword inside a signature (`-> impl Fn()`) is not an item.
 - Measured: against clippy on obsidian_knife, 544 of 546 functions match in name and count, the two misses inside a `macro_rules!` body in `src/yaml_frontmatter.rs`; hana main has 0 non-exempt functions over 100 and 43 exempt ones. Cost: +13.4 ms CPU per Rust edit over a bare launch (budget 20 ms); in-process CPU p95 9.75 ms over 1,544 files; 64.5 ms CPU on the 17,321-line file.
-- Live smoke from a Claude session started after the merge records T_claude (PDT): pending.
+- T_claude: 2026-10-06 11:51 PDT, when the hook reached `~/.claude` main. Live smoke from a fresh Claude session at 11:52 PDT: a 101-line `Write` printed the block reason and logged an `"agent": "claude"` line.
 
 **Files:**
 - `scripts/hooks/fn_length_lib.py` — tokenizer, function scan, clippy line count, lint scope lookup.
@@ -151,7 +157,84 @@ Measured 2026-10-06 08:17 PDT over every hana clippy step since the first, 2026-
 
 **Ruled out:** measuring inside macro bodies, since clippy sees expanded code the scan cannot expand; frozen dataclasses, whose import cost alone broke the 20 ms budget.
 
-### Phase 4 — Codex seats get the same block after `apply_patch` · status: todo
+### Phase 4 — Production status reads what is true: run-out after a reset, Claude through its pane, footers as of their stamp · status: done
+
+#### As-built
+
+- `run_out.latest_drop(readings: list[Reading], end: float) -> float | None`: the time of the latest reading at or before `end` whose used percent is below the one before it (a weekly refill or a redeemed reset), else `None`.
+- `dailies_render.agent_line` starts the pace window at the latest of the computed weekly refill, `now − WINDOW` and `latest_drop(readings, checked_at)`; the week-pace fallback (no trailing rate) divides used percent by the time since that same start.
+- `dailies_render.agent_section(now, zone, *, at=None)`, passed `at` by `render()` and `footer_main`: when the note's `weekly_usage_checked_at` is later than the stamped minute, each line uses the account's latest `readings.jsonl` reading at or before that minute's end, and only readings up to it for the pace; with none by then the note stands. Without `--at` nothing changes.
+- Every Agents line (dailies section and footer) takes one form, then the unchanged resets part: `claude 1: 25%; runs out about Tue 22:02 PDT, before its Sun 23:00 refill; 1 reset available until Oct 22` (`22:02 PDT today` when it falls today) · `…; runs out about Mon 04:00 PDT, so it hits its Sun 23:00 refill first; …` · `…: 1%; does not run out at this pace, so it hits its Sun 23:00 refill first; …` (rate at or below 0) · `…: 100%; ran out, back at its Sun 23:00 refill; …`. Unknown usage keeps `week's usage unknown`; no line says `of the week used` or `lasts to`.
+- `unit_status.sh` (`pane_claude_pid`) reads the session's pane pid with `$TM display-message -p -t "$u" '#{pane_pid}'`, walks its descendants breadth-first from one `ps -eo pid=,ppid=,args=` read in `awk`, and takes the first whose args begin `claude ` or equal `claude`; none prints `CLAUDE NOT RUNNING`. A unit whose remote-control name differs from its tmux session reads as running. The script holds no stalled-unit check.
+
+**Files:**
+- `scripts/whoami/run_out.py` — readings log, trailing rate, run-out lean, `latest_drop`.
+- `scripts/whoami/test_run_out.py` — `latest_drop` cases.
+- `scripts/production/dailies_render.py` — footer and Agents lines: window start, fallback, run-out wording, as of `--at`.
+- `scripts/production/test_dailies_render_agents.py` — reset, as-of-stamp and wording cases.
+- `scripts/hooks/test_stop_showrunner_footer.py` — the hook passes a footer whose readings changed after its stamp.
+- `scripts/production/unit_status.sh` — per-unit status; Claude found through the pane.
+- `scripts/production/test_unit_status.py` — pane cases, `tmux` and `ps` stubbed on `PATH`.
+- `commands/showrunner/dailies.md` — the **Agents** description and example in run-out words.
+
+**Binds later work:** the stall watcher ports `unit_status.sh`'s pane walk (`#{pane_pid}`, breadth-first over descendants, first whose args begin `claude`); stalled-unit detection belongs to the stall watcher, not `unit_status.sh`.
+
+**Gotchas:** adding a `timedelta` to an aware datetime drops `fold`, so the end of a stamped minute is computed in absolute time, or a repeated fall-back hour admits the next hour's readings. Reset count and lean have no history and a stamp has minute resolution, so a reading or codex reset inside the stamped minute but after the render can still change a re-rendered line; one re-render clears it.
+
+**Ruled out:** reset-count history for past stamps — the race it closes is minute-wide and about weekly; finding Claude by `pgrep -f "--remote-control $u"` — the remote-control name need not match the tmux session; a separate showrunner registry with register/remove — the `showrunner-*` notifier instances already are that set; the delegate status file as running-work evidence — it reads status text without a live process.
+
+### Phase 5 — A stall watcher bumps an idle unit and tells its showrunner · status: todo
+
+#### Work Order
+
+Work only in worktree `/home/natepiano/worktrees/claude-build-followups-stalls`, branch `build-followups-stalls`. State every time in PDT.
+
+**Source:** the user, 2026-10-06 11:59–12:12 PDT, through the showrunner (natedev), growing its 11:20 PDT stalled-unit report; three additions from the showrunner at 12:50 PDT. Measured: at 10:52 PDT this unit ended a turn on a `holding:` line with nothing running and sat idle about 40 minutes; organon (tool-based-ui) had a seat finish at 10:57 PDT and nothing woke it until 12:00, after a repair sent to the seat by message skipped the recorder and the ledger. Nothing outside either session noticed, and nothing could have woken them.
+
+**Goal:** every unit of every running production is checked once a minute from outside any session, from the moment this phase is installed; a unit idle 5 minutes with nothing running is sent a message telling it to continue, and its showrunner is told, once per idle stretch. A showrunner is known by the update instance `/showrunner:produce` already creates, so a new one is covered with no other step. A repair always goes through `implement.sh`, never to a seat by message.
+
+**Spec:**
+- **Shared showrunner config.** `config/showrunners.json` (tracked) replaces `scripts/whoami/quota_alert.json`: `threshold_percent`, `repeat_minutes` and `notify` move there unchanged, plus `stall_minutes: 5`.
+- **The showrunners are the `showrunner-*` notifier instances.** `/showrunner:produce` `<StartUpdates/>` creates `showrunner-<slug>` on start and every resume, and `<Wrap/>` removes it, as does its check once the doc says `wrapped` (`commands/showrunner/produce.md:236-262`, `:923`); so the set of instances is the set of running productions, with no second registry and nothing to register. Each instance's `conf` (`~/.local/state/notifier/<instance>/conf`) gives the showrunner's session (`TARGET=session:<id>`) and its prompt file (`PROMPT_FILE=…`); the prompt's `unit_status.sh <scratch> <zone> <tmux session…>` command (`produce.md:258`) gives the zone and every unit's tmux session, the same list the showrunner's own status run uses. At 12:50 PDT the instances were `showrunner-build-followups` (units `hook`, `mul_add`), `showrunner-tool-based-ui` (six units, organon in `tool-based-ui-geometry-material`) and `showrunner-pr-13-gamepads` (`gamepad`), so every running production is covered the moment the watcher runs. `scripts/production/showrunners.py` owns both reads, converting at the read boundary into `ShowrunnerSettings` (the config) and `RunningShowrunner` (slug, session target, zone, unit sessions); it has a `list` command. `SHOWRUNNERS_CONFIG` and `NOTIFIER_STATE_DIR` (already `notifier.sh`'s) override the two paths, so tests use temporary ones. An instance whose conf or prompt lacks a field is skipped with one stderr line.
+- **Quota alerts read it.** `quota_alert.py` loads `ShowrunnerSettings` through `showrunners.py`, and every path that sends to `notify` today — the alert (`quota_alert.py:408`), the restored notice (`:421`) and `tell_others` (`:470`) — sends to the union of `notify` and every running showrunner's session, once per recipient: each is resolved with `sessions.py socket <name|session:id>` and sent to that socket, so a showrunner also named in `notify` is not told twice. Behavior is otherwise unchanged. `scripts/whoami/quota_alert.json` is deleted; `docs/quota_alerts.md` names the new file.
+- **Produce starts the watcher.** `commands/showrunner/produce.md` `<StartUpdates/>` gains one step: create the `stall-watch` notifier instance when it does not exist. `<QuotaAlert/>`'s hand check of the `notify` list is replaced by a sentence saying every showrunner with an update instance is alerted. `<Wrap/>` is unchanged: removing the update instance ends the watch.
+- **Installed at merge.** The unit director creates the `stall-watch` instance once this phase reaches `~/.claude` main, so the running productions are watched at once, not at each showrunner's next resume.
+- **The watcher runs outside every session.** `notifier.sh` gains a run-only instance: `new <instance> --every <min> --run <cmd> [--timeout <s>]`, which takes no `--to`, `--command`, `--prompt-file` or `--check`; each due tick runs `<cmd>` under the instance timeout and sends nothing; a non-zero exit or a timeout is one line in the instance's `fire.log`, a zero exit writes nothing; `status` prints `<instance> runs <cmd> every <N> min`. The watcher is `scripts/production/stall_watch.py`, run by one instance `stall-watch` (`notifier.sh new stall-watch --every 1 --run "$HOME/.claude/scripts/lib/py $HOME/.claude/scripts/production/stall_watch.py"`; the notifier ticks every 15 s on both machines). It sends its own messages. A tick takes a non-blocking lock on `~/.local/state/stall-watch/lock` and exits 0 at once when an earlier tick still holds it. Never a hook.
+- **Which units.** Every unit session of every running showrunner whose tmux session exists. Claude is found through the tmux pane's descendants as `unit_status.sh` does (`#{pane_pid}`, breadth-first, first whose args begin `claude `), then `scripts/message/sessions.py id <pid>` and `~/.claude/sessions/<pid>.json` (`messagingSocketPath`), never through Claude's own session name: organon runs in tmux session `tool-based-ui-geometry-material`, and this unit's remote-control name has differed from its tmux session.
+- **Stalled means all of these, for `stall_minutes`:** the pane's text is unchanged (the watcher keeps a hash and the time it last changed per unit in `~/.local/state/stall-watch/`); the session transcript (`~/.claude/projects/*/<session id>.jsonl`) and every file under its `subagents/` directory are unmodified; no process descends from the Claude pid whose command is a shell (`zsh`, `bash`, `sh`) or a delegate launcher (`implement.sh`, `review.sh`, `verify.sh`). Only a live process counts as running work: a delegate status file that says `implementing` with no launcher or seat process alive is no evidence (`scripts/hooks/delegate_run.py:97` reads status text alone), so the watcher does not consult it. That is the minimum: a unit waiting at a gate is flagged too.
+- **On a stall, once per idle stretch** (a pane change starts a new stretch): (1) bump the unit: `send.py --to uds:<messagingSocketPath> --from stall-watch` with "stall-watch: you have been idle since <HH:MM zone> with nothing running. Continue your run; if you are waiting on someone, say on whom in one line."; (2) tell its showrunner: `send.py --to uds:<socket from sessions.py socket session:<id>> --from stall-watch` with "<unit> idle since <HH:MM zone>, nothing running; bumped. Last status: <the pane's latest turn-end line, `(— )?(holding|gate|decision|blocked|done):…`, or `none on screen`>". Times are in the production's zone. Each send carries `--key stall-watch:<unit>:<stretch start>:<bump|tell>`. The two recipients' outcomes are kept apart: a recipient whose send exited 0 is never sent again in that stretch, and only a recipient whose send failed is retried on the next tick, with the same key. A queued `uds:` message is read by nobody (`send.py:20-37`; only `scripts/prioritize/run_watcher.sh` reads a queue), so a retry cannot deliver twice. All of a tick's sends start together and the tick waits at most 90 s for them; a send still running then is stopped and counts as failed.
+- **A repair goes through `implement.sh`.** `commands/unit/delegate.md` `<FixDispatch/>` gains one rule: every repair, a follow-up to a seat that is still open included, is a dispatch through `implement.sh`; repair work is never sent to a seat by message (`codex_mesh.py send`, SendMessage). A message-borne repair skips the pass recorder and the findings ledger, and nothing wakes the unit director when it ends (organon, tool-based-ui, 2026-10-06 10:57–12:00 PDT). Questions to a seat still go by message (`docs/delegate/write_prompt_contract.md:184`).
+
+**Files:**
+- `config/showrunners.json` — new; `scripts/whoami/quota_alert.json` — deleted.
+- `scripts/production/showrunners.py` — new: `ShowrunnerSettings`, and the `RunningShowrunner` list read from the notifier instances and their prompt files.
+- `scripts/production/test_showrunners.py` — new.
+- `scripts/whoami/quota_alert.py`; `scripts/whoami/test_quota_alert.py`; `docs/quota_alerts.md`
+- `scripts/production/stall_watch.py` — new.
+- `scripts/production/test_stall_watch.py` — new.
+- `scripts/message/notifier.sh` — the run-only instance; `scripts/message/test_notifier.py`
+- `commands/showrunner/produce.md` — `<StartUpdates/>`, `<QuotaAlert/>`.
+- `commands/unit/delegate.md` — `<FixDispatch/>` (also touches; owner followups-unit, run done).
+
+**Seats:** 1 writer + 1 tester.
+- `impl` — `config/showrunners.json`, `scripts/production/showrunners.py`, `scripts/whoami/quota_alert.py`, `docs/quota_alerts.md`, `scripts/production/stall_watch.py`, `scripts/message/notifier.sh`, `commands/showrunner/produce.md`, `commands/unit/delegate.md`, and the deletion of `scripts/whoami/quota_alert.json`.
+- `test` — `scripts/production/test_showrunners.py`, `scripts/whoami/test_quota_alert.py`, `scripts/production/test_stall_watch.py`, `scripts/message/test_notifier.py`, written from the Spec alone, with stub `tmux`, `ps` and `send.py`, a temporary notifier state directory, config and transcript files; never the real `~/.local/state`, sessions or sockets:
+  - showrunners: read from `showrunner-*` instance confs and their prompt files (session target, zone, unit sessions); another instance name is ignored; a conf or prompt missing a field is skipped; quota alerts, restored notices and `tell_others` reach `notify` plus every showrunner session, once each when a `notify` name and an instance resolve to one socket;
+  - a stalled unit is bumped and its showrunner told once, and not again on the next ticks of the same stretch; a pane change then a new 5-minute stretch reports again; when the bump arrives and the showrunner's message fails, the next tick resends only the showrunner's message; three stalled units with a stub `send.py` that takes 20 s are all sent within one tick; a tick that finds the lock held exits 0 and sends nothing;
+  - not stalled: a unit with a running shell, with an `implement.sh` seat, or with a transcript or subagent file modified within 5 minutes; stalled: a unit whose delegate status says `implementing` with no live process;
+  - a new `showrunner-<slug>` instance is covered on the next tick with no other step; a removed one is not;
+  - the bump goes to the unit's own socket from `~/.claude/sessions/<pid>.json` even when its remote-control name differs from its tmux session.
+  - notifier: a `--run` instance runs its command once per due tick, sends nothing, logs a non-zero exit and a timeout to `fire.log` and a zero exit not at all; `new` refuses `--run` beside `--to`, `--command`, `--prompt-file` or `--check`.
+
+**Constraints from prior phases:**
+- Phase 4 (as built): `unit_status.sh` finds Claude through the pane; port that walk, do not call the script.
+- Production rules: never edit `/etc/nixos` or `settings.json`; tests never run the real `tmux`, `ps` or `send.py` against live sessions.
+
+**Acceptance gate:**
+- From the worktree root: `python3 -m unittest discover -s scripts/production -p 'test_showrunners.py'`, `-p 'test_stall_watch.py'`, `python3 -m unittest discover -s scripts/whoami -p 'test_quota_alert.py'`, `python3 -m unittest discover -s scripts/message -p 'test_notifier.py'` green; basedpyright 0 errors and 0 warnings on the changed `.py` files; `zsh -n scripts/message/notifier.sh`.
+- Live (unit director, once the merge reaches `~/.claude` main): create the `stall-watch` instance; `showrunners.py list` names build-followups, tool-based-ui and pr-13-gamepads with no showrunner resumed; `notifier.sh status stall-watch` shows the instance; a scratch unit session left idle 6 minutes receives the bump and natedev receives the report once.
+
+### Phase 6 — Codex seats get the same block after `apply_patch` · status: todo
 
 #### Work Order
 
@@ -191,11 +274,11 @@ Work only in worktree `/home/natepiano/worktrees/claude-build-followups-stalls`,
 - Install (unit director, after the merge reaches `~/.claude` main and the Mac has pulled): `"$HOME/.claude/scripts/lib/py" "$HOME/.claude/scripts/hooks/codex_hooks.py" install`, then `check`, on natedev (`dangerouslyDisableSandbox`), and on the Mac over `ssh mac` printing `rc=$?` inside the command (Mac ssh always exits 0). Both print `trusted …`; the Mac's existing PostToolUse groups 0 and 1 and its SessionStart entry are unchanged.
 - End-to-end smoke (natedev, then the Mac over `ssh mac`; the two run different Codex versions): in a scratchpad crate denying `pedantic`, `codex exec --skip-git-repo-check -C <crate> "<ask for one function of 101 statement lines added with apply_patch>"` (`dangerouslyDisableSandbox`); the run's output shows the reason and `blocks.jsonl` gains an `"agent": "codex"` line, on each machine. Delete the crate. T_codex is the time both smokes have passed.
 
-### Phase 5 — Re-measure four days after both hooks are live · status: todo
+### Phase 7 — Re-measure four days after both hooks are live · status: todo
 
 #### Work Order
 
-**Blocked by:** G1 — 96 hours after T_codex (Phase 4's As-built). The window must hold no hours from before T_codex.
+**Starts:** 96 hours after T_codex (Phase 6's As-built) — a wait on the clock, not a production gate. The window must hold no hours from before T_codex.
 
 Work only in worktree `/home/natepiano/worktrees/claude-build-followups-stalls`, branch `build-followups-stalls`. State every time in PDT.
 
@@ -214,7 +297,7 @@ Work only in worktree `/home/natepiano/worktrees/claude-build-followups-stalls`,
 **Seats:** 1 writer — `impl` runs the commands and reports; nothing splits and there is no code or test lane.
 
 **Constraints from prior phases:**
-- Phase 1's As-built holds the baseline: 13.3 too_many_lines failed steps per 100 hana clippy steps, 4.9 sole-cause per 100, 1.07 h sole-cause seat time a day (run 2026-10-06 08:17 PDT, span 3.96 days). Phase 3's As-built holds T_claude, Phase 4's T_codex.
+- Phase 1's As-built holds the baseline: 13.3 too_many_lines failed steps per 100 hana clippy steps, 4.9 sole-cause per 100, 1.07 h sole-cause seat time a day (run 2026-10-06 08:17 PDT, span 3.96 days). Phase 3's As-built holds T_claude, Phase 6's T_codex.
 - Phase 3 (as built): functions inside a `macro_rules!` or `name! { … }` body are never measured, and `cfg(test)` modules in a package-root `examples/` target are skipped (examples are not built in test mode); a failed `blocks.jsonl` append is silent.
 - The scripts and the buildlog are read-only (user, 2026-10-06).
 - Saved run output stays under a few GB: read each run and delete it before the next.

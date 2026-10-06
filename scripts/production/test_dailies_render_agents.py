@@ -116,6 +116,66 @@ class DailiesAgentsTests(unittest.TestCase):
     def agent_lines(self, lines: list[str]) -> list[str]:
         return [line for line in lines if line.startswith(("* claude ", "* codex ")) or line == "* none active"]
 
+    def run_footer(self, at: str) -> str:
+        output, errors = io.StringIO(), io.StringIO()
+        with redirect_stdout(output), redirect_stderr(errors):
+            code = dailies_render.main(["--footer", "--zone", ZONE, "--at", at])
+        self.assertEqual(code, 0, errors.getvalue())
+        return output.getvalue()
+
+    def test_reset_starts_a_new_trailing_pace(self) -> None:
+        self.note("claude 1", usage="81", checked="2026-10-06T17:11:00+00:00")
+        self.log(
+            ("claude 1", "2026-10-05T19:25:00+00:00", 58),
+            ("claude 1", "2026-10-06T13:15:00+00:00", 1),
+            ("claude 1", "2026-10-06T13:17:00+00:00", 100),
+            ("claude 1", "2026-10-06T17:11:00+00:00", 81),
+        )
+        line = self.agent_lines(self.run_report(at="2026-10-06T10:11"))[0]
+        self.assertIn("19%; runs out about", line)
+        self.assertIn("before its Sun 23:00 refill", line)
+        self.assertNotIn("lasts to its", line)
+
+    def test_week_pace_fallback_counts_from_redeemed_reset(self) -> None:
+        self.note("claude 1", usage="20", checked="2026-10-06T13:47:00+00:00")
+        self.log(
+            ("claude 1", "2026-10-06T13:15:00+00:00", 1),
+            ("claude 1", "2026-10-06T13:17:00+00:00", 100),
+            ("claude 1", "2026-10-06T13:47:00+00:00", 20),
+        )
+        line = self.agent_lines(self.run_report(at="2026-10-06T06:47"))[0]
+        self.assertIn("80%; runs out about 06:55 PDT today", line)
+
+    def test_stamped_footer_uses_readings_through_end_of_stamped_minute(self) -> None:
+        stamp = "2026-10-06T10:11"
+        self.note("claude 1", usage="81", checked="2026-10-06T17:11:30+00:00")
+        self.log(
+            ("claude 1", "2026-10-06T15:11:00+00:00", 91),
+            ("claude 1", "2026-10-06T17:11:30+00:00", 81),
+        )
+        before = self.run_footer(stamp)
+        self.assertIn("* claude 1: 19%", before)
+        self.note("claude 1", usage="80", checked="2026-10-06T17:12:10+00:00")
+        self.log(
+            ("claude 1", "2026-10-06T15:11:00+00:00", 91),
+            ("claude 1", "2026-10-06T17:11:30+00:00", 81),
+            ("claude 1", "2026-10-06T17:12:10+00:00", 80),
+        )
+        self.assertEqual(self.run_footer(stamp), before)
+        self.assertIn("* claude 1: 20%", self.run_footer("2026-10-06T10:12"))
+
+    def test_stamped_minute_uses_its_own_repeated_hour_reading(self) -> None:
+        """Each fall-back minute ends 60 seconds after its own instant."""
+        self.note("claude 1", usage="79", resets="2026-11-07T12:00:00-08:00",
+                  checked="2026-11-01T09:31:05+00:00", count=None, limit=None)
+        self.log(
+            ("claude 1", "2026-11-01T08:59:30+00:00", 81),
+            ("claude 1", "2026-11-01T09:30:30+00:00", 80),
+            ("claude 1", "2026-11-01T09:31:05+00:00", 79),
+        )
+        self.assertIn("* claude 1: 19%;", self.run_footer("2026-11-01T01:59-07:00"))
+        self.assertIn("* claude 1: 20%;", self.run_footer("2026-11-01T01:30-08:00"))
+
     def test_approved_lines_order_and_footer_position(self) -> None:
         self.note("claude 1", usage="60", checked="2026-10-05T08:10:00+00:00")
         self.note("codex 2", usage="22", resets="2026-10-11T02:25:00",
@@ -130,8 +190,8 @@ class DailiesAgentsTests(unittest.TestCase):
         _ = self.readings.write_text("{bad json}\n" + self.readings.read_text())
         lines = self.run_report(waiting=True, held=True)
         self.assertEqual(self.agent_lines(lines), [
-            "* claude 1: 40% of the week used; runs out about Tue 07:10 PDT, before its Sun 23:00 refill; 1 reset available until Oct 22",
-            "* codex 2: 78% of the week used; runs out about 20:45 PDT today, before its Sun 02:25 refill; 1 reset available until Oct 29",
+            "* claude 1: 40%; runs out about Tue 07:10 PDT, before its Sun 23:00 refill; 1 reset available until Oct 22",
+            "* codex 2: 78%; runs out about 20:45 PDT today, before its Sun 02:25 refill; 1 reset available until Oct 29",
         ])
         chart_end = len(lines) - 1 - lines[::-1].index("```")
         hold = next(i for i, line in enumerate(lines) if line.startswith("* build hold:"))
@@ -152,6 +212,27 @@ class DailiesAgentsTests(unittest.TestCase):
         self.assertEqual(footer_lines[:4], ["", "---", "12:45 PDT update:", ""])
         self.assertEqual(footer_lines[-1], "* no dailies scheduled")
 
+    def test_agent_lines_use_run_out_words_for_every_usage_state(self) -> None:
+        """All four known-usage states use the specified full line."""
+        self.note("claude 1", usage="60", checked="2026-10-05T08:10:00+00:00")
+        self.note("claude 2", usage="60", count="0", limit=None)
+        self.note("codex 1", usage="99", resets="2026-10-11T12:45:00", count=None, limit=None)
+        self.note("codex 2", usage="0", count=None, limit=None)
+        self.log(
+            ("claude 1", "2026-10-05T06:10:00+00:00", 64),
+            ("claude 1", "2026-10-05T08:10:00+00:00", 60),
+            ("claude 2", "2026-10-05T17:45:00+00:00", 60),
+            ("claude 2", "2026-10-05T19:45:00+00:00", 60),
+        )
+        lines = self.agent_lines(self.run_report())
+        self.assertEqual(lines, [
+            "* claude 1: 40%; runs out about Tue 07:10 PDT, before its Sun 23:00 refill; 1 reset available until Oct 22",
+            "* claude 2: 40%; does not run out at this pace, so it hits its Sun 23:00 refill first; no resets available",
+            "* codex 1: 1%; runs out about Tue 11:45 PST, so it hits its Sun 12:45 refill first; resets unknown",
+            "* codex 2: 100%; ran out, back at its Sun 23:00 refill; resets unknown",
+        ])
+        self.assertFalse(any("of the week used" in line or "lasts to" in line for line in lines))
+
     def test_repeated_hour_run_out_shows_pst(self) -> None:
         self.note("claude 1", usage="20", resets="2026-11-07T12:00:00-08:00",
                   checked="2026-11-01T07:30:00+00:00", count=None, limit=None)
@@ -160,7 +241,7 @@ class DailiesAgentsTests(unittest.TestCase):
             ("claude 1", "2026-11-01T07:30:00+00:00", 20),
         )
         self.assertEqual(self.agent_lines(self.run_report(at="2026-11-01T00:45")), [
-            "* claude 1: 80% of the week used; runs out about 01:30 PST today, before its Sat 12:00 refill; resets unknown",
+            "* claude 1: 80%; runs out about 01:30 PST today, before its Sat 12:00 refill; resets unknown",
         ])
 
     def test_run_out_rounds_across_fall_back(self) -> None:
@@ -171,7 +252,7 @@ class DailiesAgentsTests(unittest.TestCase):
             ("claude 1", "2026-11-01T07:59:45+00:00", 10),
         )
         self.assertEqual(self.agent_lines(self.run_report(at="2026-11-01T01:00")), [
-            "* claude 1: 90% of the week used; runs out about 01:00 PST today, before its Sat 12:00 refill; resets unknown",
+            "* claude 1: 90%; runs out about 01:00 PST today, before its Sat 12:00 refill; resets unknown",
         ])
 
     def test_agents_follow_multiple_holds_before_schedule(self) -> None:
@@ -196,7 +277,7 @@ class DailiesAgentsTests(unittest.TestCase):
             ("claude 1", "2026-10-05T19:45:00+00:00", 60),
         )
         self.assertEqual(self.agent_lines(self.run_report()), [
-            "* claude 1: 40% of the week used; runs out about Wed 00:45 PDT, before its Sun 12:45 refill; resets unknown",
+            "* claude 1: 40%; runs out about Wed 00:45 PDT, before its Sun 12:45 refill; resets unknown",
         ])
 
     def test_past_run_outs_lean_the_prediction_early(self) -> None:
@@ -206,14 +287,14 @@ class DailiesAgentsTests(unittest.TestCase):
             ("claude 1", "2026-10-05T19:45:00+00:00", 60),
         )
         self.assertEqual(self.agent_lines(self.run_report()), [
-            "* claude 1: 40% of the week used; runs out about 18:45 PDT today, before its Sun 23:00 refill; resets unknown",
+            "* claude 1: 40%; runs out about 18:45 PDT today, before its Sun 23:00 refill; resets unknown",
         ])
         _ = self.run_outs.write_text("".join(json.dumps(record) + "\n" for record in [
             {"account": "codex 2", "ended": "2026-10-06T02:18:47+00:00", "ratios": [0.5, 0.5]},
             {"account": "claude 1", "ended": "2026-10-06T13:15:56+00:00", "ratios": [0.5, 0.5]},
         ]))
         self.assertEqual(self.agent_lines(self.run_report()), [
-            "* claude 1: 40% of the week used; runs out about 15:45 PDT today, before its Sun 23:00 refill; resets unknown",
+            "* claude 1: 40%; runs out about 15:45 PDT today, before its Sun 23:00 refill; resets unknown",
         ])
 
     def test_readings_before_last_refill_are_ignored(self) -> None:
@@ -224,13 +305,13 @@ class DailiesAgentsTests(unittest.TestCase):
             ("claude 1", "2026-10-05T19:45:00+00:00", 60),
         )
         self.assertEqual(self.agent_lines(self.run_report()), [
-            "* claude 1: 40% of the week used; runs out about 14:15 PDT today, before its Mon 11:45 refill; resets unknown",
+            "* claude 1: 40%; runs out about 14:15 PDT today, before its Mon 11:45 refill; resets unknown",
         ])
 
     def test_missing_or_unreadable_log_uses_week_pace(self) -> None:
         self.note("claude 1", usage="60", resets="2026-10-11T12:45:00", count=None, limit=None)
         expected = [
-            "* claude 1: 40% of the week used; runs out about Wed 00:45 PDT, before its Sun 12:45 refill; resets unknown",
+            "* claude 1: 40%; runs out about Wed 00:45 PDT, before its Sun 12:45 refill; resets unknown",
         ]
         self.assertEqual(self.agent_lines(self.run_report()), expected)
         self.readings.mkdir()
@@ -247,9 +328,9 @@ class DailiesAgentsTests(unittest.TestCase):
             ("codex 1", "2026-10-05T19:45:00+00:00", 60),
         )
         self.assertEqual(self.agent_lines(self.run_report()), [
-            "* claude 1: 40% of the week used; lasts to its Sun 12:45 refill; no resets available",
-            "* claude 2: 1% of the week used; lasts to its Sun 12:45 refill; 2 resets available until Oct 22",
-            "* codex 1: 40% of the week used; lasts to its 23:00 today refill; 1 reset available",
+            "* claude 1: 40%; does not run out at this pace, so it hits its Sun 12:45 refill first; no resets available",
+            "* claude 2: 1%; runs out about Tue 11:45 PST, so it hits its Sun 12:45 refill first; 2 resets available until Oct 22",
+            "* codex 1: 40%; does not run out at this pace, so it hits its 23:00 today refill first; 1 reset available",
         ])
 
     def test_unknown_usage_and_no_active_note(self) -> None:
@@ -267,7 +348,7 @@ class DailiesAgentsTests(unittest.TestCase):
         self.note("claude 1", usage="0", count="1")
         self.note("codex 1", usage=None, resets=None, count=None, limit=None)
         self.assertEqual(self.agent_lines(self.run_report()), [
-            "* claude 1: 100% of the week used; out until its Sun 23:00 refill; 1 reset available until Oct 22",
+            "* claude 1: 100%; ran out, back at its Sun 23:00 refill; 1 reset available until Oct 22",
             "* codex 1: week's usage unknown; refill time unknown; resets unknown",
         ])
 
