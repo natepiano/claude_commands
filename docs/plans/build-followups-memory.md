@@ -609,35 +609,30 @@ For a CI MemoryMax increase, require an isolated post-pool run with a CI `oom_ki
 
 **Ruled out:** a p75 formula change for small groups — the old formula and `nearest_rank` pick the same index for every n.
 
-### Phase 22 — A damaged release record cannot strand a hold · status: todo
+### Phase 22 — A damaged release record cannot strand a hold · status: done
 
-#### Work Order
+#### As-built
 
-**Goal:** a build hold whose release record cannot be read still ends: the first command that changes the record sets the damaged one aside, and the hold finishes by releasing every waiting session at once. The dailies test covers every release state and gate outcome.
-
-**Spec:**
-- **Why (Phase 19's phase review, 2026-10-05 PDT):** `read_cycle` (`build_hold.py:426`) raises `ReleaseRecordReadError` on a record it cannot parse. `status` and the dailies footer print `release_record_error_line` (`build_hold.py:60`), but `release`, `release --resume`, `wait`, `mark` and `record-recipient` exit 1 on it while the holder file stays, so nobody can end the hold. Every waiting session waits for a release that never comes, and a second `hold` while another holder is active fails the same way.
-- **The command that finds damage sets it aside.** `hold`, `release`, `release --resume`, `wait`, `mark` and `record-recipient`, under `release.lock`, on a `ReleaseRecordReadError`: rename the cycle's `cycle.json` (or `current` itself, when that is what cannot be read) to `<name>.damaged-<UTC as YYYYMMDDTHHMMSSZ>`, remove `current`, print `release record could not be read (<error>); set aside as <path>; this hold now releases every session at once`, and carry on as a hold with no cycle. `status` and the dailies footer only read: they change nothing.
-- **The error line says how to end it.** `release_record_error_line` reads `release record could not be read: <error>; /build_hold release sets it aside and ends the hold`, so `status` and the dailies footer both name the recovery.
-- **A hold with no cycle ends as holds did before Phase 19.** `read_cycle() is None` already sends `release` to `release_hold` (`build_hold.py:766`): the last holder's release removes its file, and `commands/build_hold.md` broadcasts the release to every session, each build still passing its own memory gate. `hold` with another holder active and no cycle writes its holder file without opening a cycle, because a new cycle would hold only the sessions that register after it and strand the ones before. `wait` with no cycle prints `no hold cycle: wait for the release broadcast`, and `commands/build_hold.md` tells a recipient that this line means the release will come as a broadcast.
-- Tests, every one with `BUILD_HOLD_DIR` and `BUILD_HOLD_RELEASE_DIR` set to temporary directories: for a damaged `cycle.json` and for a damaged `current`, `release` by the last holder sets it aside, removes the holder file and prints the all-at-once line; `release` by one of two holders sets it aside and names who still holds; `hold` while another holder is active sets it aside, writes its holder file and opens no cycle, and the last release then takes the no-cycle path; `wait`, `mark` and `record-recipient` set it aside and `wait` prints the no-cycle line; `status` prints the error line with its recovery and leaves the record byte-identical. The dailies footer renders each release state (`AwaitingRelease`, `RecipientGone`, `DeliveryFailed`, `DeliveryQueued`, `ReleasedAwaitingAdmission`, `WaitingForMemory`, `MemoryGateReturned` with each of `Granted`, `TimedOut` and `MeminfoUnavailable`, `NoAdmissionAck`, `NoRegistration`) and the damaged-record line with its recovery.
+- `read_cycle` validates the whole `HoldCycle` shape: top-level object; `id`, `opened_at`, `release_started_at` strings; `holders` maps names to objects with `since` and `released_at` strings; `recipients` maps session ids to name strings; `entries` is a list of objects, each through `read_release_state`. Any failure, unparseable JSON included, raises `ReleaseRecordReadError` naming what is wrong.
+- `read_cycle_for_change() -> HoldCycle | NoCycle | DamagedRecordSetAside` (frozen dataclasses; `DamagedRecordSetAside.path` is the renamed file) runs under `release.lock` for `hold`, `release`, `release --resume`, `wait`, `mark` and `record-recipient`. On damage it renames `cycle.json` (when it exists or is a dangling symlink) or else `current` to `<name>.damaged-<UTC YYYYMMDDTHHMMSSZ>` (`-2`, `-3`… when taken), removes `current`, and prints `release record could not be read (<error>); set aside as <path>; this hold now releases every session at once`.
+- `release_record_error_line` reads `release record could not be read: <error>; /build_hold release sets it aside and ends the hold`. `status` (`main`) and `footer` in `scripts/production/dailies_render.py` print it and change nothing.
+- With no cycle: `hold` beside another active holder writes its holder file and opens no cycle, since a new cycle would strand the sessions registered before it; `wait` prints `no hold cycle: wait for the release broadcast`; `mark` prints `no hold cycle`; `release` always goes through `release_cycle`, whose no-cycle branch calls `release_hold` under the lock and ends with `released, builds may resume. No hold cycle: broadcast this release to every session.` A partial release still names the remaining holders; a cycle release's final line never carries the broadcast clause.
+- `release --resume` without `--holder` picks the holder whose release began when a cycle exists, the sole holder when its own call set damage aside, and otherwise exits 1 with `release needs --holder, or --resume for an active release`, keeping the holder file.
+- `commands/build_hold.md` step 1 says the no-cycle `wait` line means the release comes as a broadcast; step 4 broadcasts with `/notify_top_level --here` on the no-cycle final line, each session's next build still passing its own memory gate.
 
 **Files:**
-- `scripts/build_hold/build_hold.py` — setting a damaged record aside, the error line's recovery, `hold` with no cycle
-- `commands/build_hold.md` — what the no-cycle `wait` line means
-- `scripts/build_hold/test_build_hold.py` — the damaged-record cases
-- `scripts/production/test_dailies_render_holds.py` — every release state and gate outcome, and the damaged-record line
-- `scripts/production/dailies_render.py` — the footer, read only
+- `scripts/build_hold/build_hold.py` — full-shape `read_cycle`, `NoCycle`, `DamagedRecordSetAside`, `read_cycle_for_change`, the no-cycle paths, the error line's recovery
+- `commands/build_hold.md` — the no-cycle `wait` line and the broadcast on the no-cycle final release
+- `scripts/build_hold/test_build_hold.py` — damaged `cycle.json`, `current`, dangling symlink and ten malformed shapes across every changing command; read-only `status`; no-cycle hold, release, resume and broadcast line (`test_intact_cycle_final_line_does_not_request_broadcast`)
+- `scripts/production/test_dailies_render_holds.py` — every release state (`AwaitingRelease`, `RecipientGone`, `DeliveryFailed`, `DeliveryQueued`, `ReleasedAwaitingAdmission`, `WaitingForMemory`, `MemoryGateReturned` with `Granted` / `TimedOut` / `MeminfoUnavailable`, `NoAdmissionAck`, `NoRegistration`) and the damaged `cycle.json` and `current` lines with their recovery, the record left byte-identical
 
-**Seats:** `1 writer + 1 tester`.
-- `impl` — `scripts/build_hold/build_hold.py`, `commands/build_hold.md`; hub: `scripts/build_hold/build_hold.py`
-- `test` — `scripts/build_hold/test_build_hold.py`, `scripts/production/test_dailies_render_holds.py`, written from the Spec alone
+**Gotchas:**
+- A holder joining a no-cycle hold sees nothing in its `hold` output; only the final release line tells it to broadcast.
+- `read_release_state` assumes a mapping (`"entries": [null]` raises `AttributeError`, outside every `except` in the read path); `read_cycle` checks each entry is an object before calling it.
+- Set-aside files are never cleaned up; they stay beside the cycle for inspection.
+- Tests set `BUILD_HOLD_DIR` and `BUILD_HOLD_RELEASE_DIR` to temporary directories, so none writes `~/.local/state/build-hold` or `~/.local/state/build-hold-release`.
 
-**Constraints from prior phases:**
-- Phase 19: `release.lock` (`flock` in `BUILD_HOLD_RELEASE_DIR`) serializes cycle creation, `wait`, every `release` step and the final check. `start_hold` opens a new cycle when no holder exists, without reading the old one. `read_cycle` validates every entry through `read_release_state`. `ReleaseRecordReadError` subclasses `ValueError`; `status` (`main`) and `footer` in `scripts/production/dailies_render.py` catch it and print `release_record_error_line`. `build_hold_mark` in `scripts/lint/memory_gate.sh` runs `mark` and never fails a build step on its exit.
-- Tests never write `~/.local/state/build-hold` or `~/.local/state/build-hold-release`, never send a real message and never run a live `/build_hold`.
-
-**Acceptance gate:** `python3 -m unittest discover -s scripts/build_hold -p 'test_*.py'` and `python3 -m unittest discover -s scripts/production -p 'test_dailies_render*.py'` green; `basedpyright` 0 errors and 0 warnings on changed Python. `basedpyright` exits 3 in every checkout of this repository because `pyrightconfig.json` names a `.venv` none has; that exit alone does not fail the gate when its output reports 0 errors and 0 warnings.
+**Ruled out:** catching `AttributeError` in the read path instead of validating the shape — it would also hide defects in the code; `release --resume` releasing the sole holder of any no-cycle hold — it could end a hold nobody had begun releasing.
 
 ## Parked
 

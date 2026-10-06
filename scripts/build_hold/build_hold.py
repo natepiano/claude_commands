@@ -16,7 +16,7 @@ from collections import Counter
 from collections.abc import Callable, Generator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
-from datetime import datetime, time as ClockTime, timedelta
+from datetime import datetime, time as ClockTime, timedelta, timezone
 from pathlib import Path
 from typing import Literal, Required, TypedDict, cast
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -57,8 +57,18 @@ class ReleaseRecordReadError(ValueError):
     """The stored hold cycle cannot be read safely."""
 
 
+@dataclass(frozen=True)
+class NoCycle:
+    pass
+
+
+@dataclass(frozen=True)
+class DamagedRecordSetAside:
+    path: Path
+
+
 def release_record_error_line(error: ReleaseRecordReadError) -> str:
-    return f"release record could not be read: {error}"
+    return f"release record could not be read: {error}; /build_hold release sets it aside and ends the hold"
 
 
 @dataclass(frozen=True)
@@ -428,12 +438,62 @@ def read_cycle() -> HoldCycle | None:
         path = cycle_path()
         if path is None:
             return None
-        cycle = cast(HoldCycle, json.loads(path.read_text()))
-        for entry in cycle["entries"]:
-            _ = read_release_state(entry)
-        return cycle
+        record = cast(object, json.loads(path.read_text()))
+        if not isinstance(record, dict):
+            raise ValueError("invalid hold cycle: expected object")
+        cycle = cast(dict[str, object], record)
+        for field in ("id", "opened_at", "release_started_at"):
+            if not isinstance(cycle.get(field), str):
+                raise ValueError(f"invalid {field}: expected string")
+        holders = cycle.get("holders")
+        if not isinstance(holders, dict):
+            raise ValueError("invalid holders: expected object")
+        for name, instants in cast(dict[object, object], holders).items():
+            if not isinstance(name, str) or not isinstance(instants, dict):
+                raise ValueError("invalid holder: expected name and object")
+            fields = cast(dict[str, object], instants)
+            if not isinstance(fields.get("since"), str) or not isinstance(fields.get("released_at"), str):
+                raise ValueError(f"invalid holder {name}: expected since and released_at strings")
+        recipients = cycle.get("recipients")
+        if not isinstance(recipients, dict):
+            raise ValueError("invalid recipients: expected object")
+        if any(not isinstance(name, str) or not isinstance(session_id, str)
+               for session_id, name in cast(dict[object, object], recipients).items()):
+            raise ValueError("invalid recipients: expected string names and session IDs")
+        entries = cycle.get("entries")
+        if not isinstance(entries, list):
+            raise ValueError("invalid entries: expected list")
+        for index, entry in enumerate(cast(list[object], entries)):
+            if not isinstance(entry, dict):
+                raise ValueError(f"invalid entry {index}: expected object")
+            _ = read_release_state(cast(dict[str, object], entry))
+        return cast(HoldCycle, cast(object, cycle))
     except (OSError, ValueError, TypeError, KeyError) as error:
         raise ReleaseRecordReadError(str(error)) from error
+
+
+def read_cycle_for_change() -> HoldCycle | NoCycle | DamagedRecordSetAside:
+    """Read a cycle while release.lock is held, setting damage aside if found."""
+    try:
+        cycle = read_cycle()
+        return NoCycle() if cycle is None else cycle
+    except ReleaseRecordReadError as error:
+        current = release_directory() / "current"
+        try:
+            path = cycle_path()
+        except (OSError, ValueError):
+            path = None
+        damaged = path if path is not None and (path.is_symlink() or path.exists()) else current
+        timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        destination = damaged.with_name(f"{damaged.name}.damaged-{timestamp}")
+        suffix = 2
+        while destination.exists():
+            destination = damaged.with_name(f"{damaged.name}.damaged-{timestamp}-{suffix}")
+            suffix += 1
+        _ = damaged.rename(destination)
+        current.unlink(missing_ok=True)
+        print(f"release record could not be read ({error}); set aside as {destination}; this hold now releases every session at once", flush=True)
+        return DamagedRecordSetAside(destination)
 
 
 def save_cycle(cycle: HoldCycle) -> None:
@@ -456,12 +516,11 @@ def start_hold(directory: Path, name: str, purpose: str, request: ReleaseRequest
         if isinstance(read_holders(directory), NoHolders):
             cycle = open_cycle(now)
         else:
-            cycle = read_cycle()
-            if cycle is None:
-                cycle = open_cycle(now)
+            cycle = read_cycle_for_change()
         notice = write_hold(directory, name, purpose, request, now)
-        cycle["holders"][name] = {"since": now.isoformat(), "released_at": ""}
-        save_cycle(cycle)
+        if not isinstance(cycle, (NoCycle, DamagedRecordSetAside)):
+            cycle["holders"][name] = {"since": now.isoformat(), "released_at": ""}
+            save_cycle(cycle)
         return notice + " Run python3 ~/.claude/scripts/build_hold/build_hold.py wait now in this session."
 
 
@@ -471,8 +530,8 @@ def record_recipients(recipients: Sequence[tuple[str, str]]) -> None:
     with release_lock():
         if isinstance(read_holders(holder_directory()), NoHolders):
             return
-        cycle = read_cycle()
-        if cycle is None:
+        cycle = read_cycle_for_change()
+        if isinstance(cycle, (NoCycle, DamagedRecordSetAside)):
             return
         for name, session_id in recipients:
             if session_id:
@@ -491,9 +550,9 @@ def register_wait(session_id: str, name: str = "") -> str:
     with release_lock():
         if isinstance(read_holders(holder_directory()), NoHolders):
             return "no build hold"
-        cycle = read_cycle()
-        if cycle is None:
-            return "no hold cycle"
+        cycle = read_cycle_for_change()
+        if isinstance(cycle, (NoCycle, DamagedRecordSetAside)):
+            return "no hold cycle: wait for the release broadcast"
         existing = next((entry for entry in cycle["entries"] if entry["session_id"] == session_id), None)
         if existing is None:
             cycle["entries"].append(new_entry(session_id, name or cycle["recipients"].get(session_id, session_id)))
@@ -518,8 +577,8 @@ def mark_gate(session_id: str, state: str, outcome: str = "") -> str:
     with release_lock():
         if isinstance(read_holders(holder_directory()), NoHolders):
             return "no build hold"
-        cycle = read_cycle()
-        if cycle is None:
+        cycle = read_cycle_for_change()
+        if isinstance(cycle, (NoCycle, DamagedRecordSetAside)):
             return "no hold cycle"
         for entry in cycle["entries"]:
             if entry["session_id"] != session_id:
@@ -640,9 +699,12 @@ def advance_release(cycle: HoldCycle, now: datetime, *, clock: Callable[[], date
 def release_cycle(directory: Path, name: str) -> str:
     while True:
         with release_lock():
-            cycle = read_cycle()
-            if cycle is None:
-                raise ValueError("no hold cycle")
+            cycle = read_cycle_for_change()
+            if isinstance(cycle, (NoCycle, DamagedRecordSetAside)):
+                result = release_hold(directory, name)
+                if result == "released, builds may resume.":
+                    return result + " No hold cycle: broadcast this release to every session."
+                return result
             path = holder_path(directory, name)
             if not path.is_file():
                 raise ValueError(f"{name} held nothing")
@@ -757,15 +819,17 @@ def main(arguments: list[str]) -> int:
             name = cast(str | None, options.holder)
             resume_requested = cast(bool, options.resume)
             if name is None and resume_requested:
-                cycle = read_cycle()
-                if cycle is not None:
-                    name = next((holder for holder, instants in cycle["holders"].items() if instants["released_at"] and holder_path(holder_directory(), holder).is_file()), None)
+                with release_lock():
+                    cycle = read_cycle_for_change()
+                    if not isinstance(cycle, (NoCycle, DamagedRecordSetAside)):
+                        name = next((holder for holder, instants in cycle["holders"].items() if instants["released_at"] and holder_path(holder_directory(), holder).is_file()), None)
+                    elif isinstance(cycle, DamagedRecordSetAside):
+                        state = read_holders(holder_directory())
+                        if isinstance(state, ActiveHolders) and len(state.holders) == 1:
+                            name = state.holders[0].name
             if name is None:
                 raise ValueError("release needs --holder, or --resume for an active release")
-            if read_cycle() is None:
-                print(release_hold(holder_directory(), name))
-            else:
-                print(release_cycle(holder_directory(), name))
+            print(release_cycle(holder_directory(), name))
         elif action == "wait":
             print(register_wait(os.environ.get("CLAUDE_CODE_SESSION_ID", "")))
         elif action == "mark":

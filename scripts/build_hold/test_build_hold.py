@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import io
 import os
+import re
 import subprocess
 import tempfile
 import threading
@@ -259,6 +260,217 @@ class CommandTests(IsolatedBuildHoldTest):
             env={**os.environ, "BUILD_HOLD_DIR": str(folder)},
         )
 
+    def damage_record(self, kind: str, scratch: Path, *, two_holders: bool = False) -> tuple[Path, bytes]:
+        folder = scratch / "holders"
+        for name in (("first", "second") if two_holders else ("first",)):
+            held = self.run_cli(folder, "hold", "--holder", name, "--for", f"{name} test")
+            self.assertEqual(held.returncode, 0, held.stderr)
+        release = scratch / "release"
+        cycle_id = (release / "current").read_text().strip()
+        path = release / "current" if kind == "current" else release / cycle_id / "cycle.json"
+        content = b"invalid-current\n" if kind == "current" else b"{invalid json\n"
+        _ = path.write_bytes(content)
+        return path, content
+
+    def assert_record_set_aside(self, path: Path, content: bytes, output: str, scratch: Path) -> None:
+        copies = list(path.parent.glob(path.name + ".damaged-*"))
+        self.assertEqual(len(copies), 1)
+        copy = copies[0]
+        self.assertRegex(copy.name, "^" + re.escape(path.name) + r"\.damaged-\d{8}T\d{6}Z$")
+        self.assertEqual(copy.read_bytes(), content)
+        self.assertFalse(path.exists())
+        self.assertFalse((scratch / "release" / "current").exists())
+        self.assertIn(f"; set aside as {copy}; this hold now releases every session at once", output)
+
+    def test_last_release_sets_aside_each_damaged_record(self) -> None:
+        for kind in ("cycle", "current"):
+            scratch = self.scratch / kind
+            scratch.mkdir()
+            with self.subTest(kind=kind):
+                with mock.patch.dict(os.environ, {
+                    "BUILD_HOLD_DIR": str(scratch / "holders"),
+                    "BUILD_HOLD_RELEASE_DIR": str(scratch / "release"),
+                }):
+                    path, content = self.damage_record(kind, scratch)
+                    result = self.run_cli(scratch / "holders", "release", "--holder", "first")
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assert_record_set_aside(path, content, result.stdout, scratch)
+                    self.assertEqual(result.stdout.splitlines()[-1], "released, builds may resume. No hold cycle: broadcast this release to every session.")
+                    self.assertFalse((scratch / "holders" / "first").exists())
+
+    def test_malformed_cycle_shapes_set_aside_on_release_and_report_on_status(self) -> None:
+        for label, error_field in (("null entry", "entry 0"), ("number entry", "entry 0"),
+                                   ("holders list", "holders"), ("null holder", "holder"),
+                                   ("holder instant", "holder first"), ("missing holders", "holders"),
+                                   ("recipients list", "recipients"), ("recipient name", "recipients"),
+                                   ("null release start", "release_started_at"),
+                                   ("top-level list", "hold cycle")):
+            scratch = self.scratch / label.replace(" ", "-")
+            scratch.mkdir()
+            with self.subTest(shape=label), mock.patch.dict(os.environ, {
+                "BUILD_HOLD_DIR": str(scratch / "holders"),
+                "BUILD_HOLD_RELEASE_DIR": str(scratch / "release"),
+            }):
+                held = self.run_cli(scratch / "holders", "hold", "--holder", "first", "--for", "first test")
+                self.assertEqual(held.returncode, 0, held.stderr)
+                release = scratch / "release"
+                path = release / (release / "current").read_text().strip() / "cycle.json"
+                valid = cast(dict[str, object], json.loads(path.read_text()))
+                malformed_cases: dict[str, object] = {
+                    "null entry": {**valid, "entries": [None]},
+                    "number entry": {**valid, "entries": [1]},
+                    "holders list": {**valid, "holders": []},
+                    "null holder": {**valid, "holders": {"first": None}},
+                    "holder instant": {**valid, "holders": {"first": {"since": 1, "released_at": ""}}},
+                    "missing holders": {key: value for key, value in valid.items() if key != "holders"},
+                    "recipients list": {**valid, "recipients": []},
+                    "recipient name": {**valid, "recipients": {"session": 1}},
+                    "null release start": {**valid, "release_started_at": None},
+                    "top-level list": [],
+                }
+                malformed = malformed_cases[label]
+                content = (json.dumps(malformed) + "\n").encode()
+                _ = path.write_bytes(content)
+                status = self.run_cli(scratch / "holders", "status")
+                self.assertEqual(status.returncode, 0, status.stderr)
+                self.assertIn("release record could not be read:", status.stdout)
+                self.assertIn(error_field, status.stdout)
+                self.assertIn("/build_hold release sets it aside and ends the hold", status.stdout)
+                self.assertEqual(path.read_bytes(), content)
+                result = self.run_cli(scratch / "holders", "release", "--holder", "first")
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assert_record_set_aside(path, content, result.stdout, scratch)
+                self.assertEqual(result.stdout.splitlines()[-1], "released, builds may resume. No hold cycle: broadcast this release to every session.")
+                self.assertFalse((scratch / "holders" / "first").exists())
+
+    def test_dangling_cycle_link_is_set_aside_instead_of_current(self) -> None:
+        held = self.run_cli(self.scratch / "holders", "hold", "--holder", "first", "--for", "first test")
+        self.assertEqual(held.returncode, 0, held.stderr)
+        release = self.scratch / "release"
+        path = release / (release / "current").read_text().strip() / "cycle.json"
+        path.unlink()
+        path.symlink_to("missing-cycle.json")
+        result = self.run_cli(self.scratch / "holders", "release", "--holder", "first")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        copies = list(path.parent.glob("cycle.json.damaged-*"))
+        self.assertEqual(len(copies), 1)
+        self.assertTrue(copies[0].is_symlink())
+        self.assertEqual(copies[0].readlink(), Path("missing-cycle.json"))
+        self.assertFalse(path.is_symlink())
+        self.assertFalse((release / "current").exists())
+        self.assertIn(f"set aside as {copies[0]}", result.stdout)
+        self.assertFalse((self.scratch / "holders" / "first").exists())
+
+    def test_partial_release_sets_aside_damaged_record_and_names_remaining_holder(self) -> None:
+        for kind in ("cycle", "current"):
+            scratch = self.scratch / kind
+            scratch.mkdir()
+            with self.subTest(kind=kind), mock.patch.dict(os.environ, {
+                "BUILD_HOLD_DIR": str(scratch / "holders"),
+                "BUILD_HOLD_RELEASE_DIR": str(scratch / "release"),
+            }):
+                path, content = self.damage_record(kind, scratch, two_holders=True)
+                result = self.run_cli(scratch / "holders", "release", "--holder", "first")
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assert_record_set_aside(path, content, result.stdout, scratch)
+                self.assertIn("still held by second", result.stdout)
+                self.assertFalse((scratch / "holders" / "first").exists())
+                self.assertTrue((scratch / "holders" / "second").exists())
+
+    def test_resume_sets_aside_damaged_current_and_releases_only_holder(self) -> None:
+        path, content = self.damage_record("current", self.scratch)
+        result = self.run_cli(self.scratch / "holders", "release", "--resume")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assert_record_set_aside(path, content, result.stdout, self.scratch)
+        self.assertIn("released, builds may resume.", result.stdout)
+        self.assertFalse((self.scratch / "holders" / "first").exists())
+
+    def test_resume_after_earlier_damage_does_not_release_holder(self) -> None:
+        path, content = self.damage_record("cycle", self.scratch)
+        with mock.patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": "waiting-session"}):
+            waited = self.run_cli(self.scratch / "holders", "wait")
+        self.assertEqual(waited.returncode, 0, waited.stderr)
+        self.assert_record_set_aside(path, content, waited.stdout, self.scratch)
+        resumed = self.run_cli(self.scratch / "holders", "release", "--resume")
+        self.assertEqual(resumed.returncode, 1)
+        self.assertIn("release needs --holder, or --resume for an active release", resumed.stderr)
+        self.assertTrue((self.scratch / "holders" / "first").exists())
+
+    def test_intact_cycle_final_line_does_not_request_broadcast(self) -> None:
+        held = self.run_cli(self.scratch / "holders", "hold", "--holder", "first", "--for", "first test")
+        self.assertEqual(held.returncode, 0, held.stderr)
+        release = self.scratch / "release"
+        path = release / (release / "current").read_text().strip() / "cycle.json"
+        cycle = cast(dict[str, object], json.loads(path.read_text()))
+        cycle["release_started_at"] = (datetime.now().astimezone() - timedelta(minutes=2)).isoformat()
+        _ = path.write_text(json.dumps(cycle) + "\n")
+        result = self.run_cli(self.scratch / "holders", "release", "--holder", "first")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue(result.stdout.strip().startswith("released, builds may resume."))
+        self.assertNotIn("No hold cycle: broadcast this release to every session.", result.stdout)
+
+    def test_new_holder_after_damage_shares_broadcast_release(self) -> None:
+        for kind in ("cycle", "current"):
+            scratch = self.scratch / kind
+            scratch.mkdir()
+            with self.subTest(kind=kind), mock.patch.dict(os.environ, {
+                "BUILD_HOLD_DIR": str(scratch / "holders"),
+                "BUILD_HOLD_RELEASE_DIR": str(scratch / "release"),
+            }):
+                path, content = self.damage_record(kind, scratch)
+                old_cycles = list((scratch / "release").glob("*/cycle.json"))
+                held = self.run_cli(scratch / "holders", "hold", "--holder", "second", "--for", "second test")
+                self.assertEqual(held.returncode, 0, held.stderr)
+                self.assert_record_set_aside(path, content, held.stdout, scratch)
+                self.assertTrue((scratch / "holders" / "second").exists())
+                self.assertEqual(list((scratch / "release").glob("*/cycle.json")), [] if kind == "cycle" else old_cycles)
+                first = self.run_cli(scratch / "holders", "release", "--holder", "first")
+                self.assertEqual(first.returncode, 0, first.stderr)
+                self.assertIn("still held by second", first.stdout)
+                final = self.run_cli(scratch / "holders", "release", "--holder", "second")
+                self.assertEqual(final.returncode, 0, final.stderr)
+                self.assertEqual(final.stdout.strip(), "released, builds may resume. No hold cycle: broadcast this release to every session.")
+                self.assertFalse((scratch / "holders" / "second").exists())
+
+    def test_wait_mark_and_recipient_set_aside_damaged_record(self) -> None:
+        commands = (
+            ("wait",),
+            ("mark", "--session-id", "first", "--state", "MemoryGateReturned", "--outcome", "Granted"),
+            ("record-recipient", "--session-id", "first", "--name", "first session"),
+        )
+        for kind in ("cycle", "current"):
+            for command in commands:
+                scratch = self.scratch / (kind + "-" + command[0])
+                scratch.mkdir()
+                with self.subTest(kind=kind, command=command[0]), mock.patch.dict(os.environ, {
+                    "BUILD_HOLD_DIR": str(scratch / "holders"),
+                    "BUILD_HOLD_RELEASE_DIR": str(scratch / "release"),
+                    "CLAUDE_CODE_SESSION_ID": "first",
+                }):
+                    path, content = self.damage_record(kind, scratch)
+                    result = self.run_cli(scratch / "holders", *command)
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assert_record_set_aside(path, content, result.stdout, scratch)
+                    if command[0] == "wait":
+                        self.assertIn("no hold cycle: wait for the release broadcast", result.stdout)
+
+    def test_status_reports_recovery_without_changing_damaged_record(self) -> None:
+        for kind in ("cycle", "current"):
+            scratch = self.scratch / kind
+            scratch.mkdir()
+            with self.subTest(kind=kind), mock.patch.dict(os.environ, {
+                "BUILD_HOLD_DIR": str(scratch / "holders"),
+                "BUILD_HOLD_RELEASE_DIR": str(scratch / "release"),
+            }):
+                path, content = self.damage_record(kind, scratch)
+                result = self.run_cli(scratch / "holders", "status")
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn("release record could not be read:", result.stdout)
+                self.assertIn("/build_hold release sets it aside and ends the hold", result.stdout)
+                self.assertEqual(path.read_bytes(), content)
+                self.assertTrue((scratch / "release" / "current").exists())
+                self.assertEqual(list(path.parent.glob(path.name + ".damaged-*")), [])
+
     def test_idle_mark_wait_and_recipient_record_leave_release_directory_absent(self) -> None:
         release = self.scratch / "release"
         self.assertFalse(release.exists())
@@ -366,7 +578,7 @@ class CommandTests(IsolatedBuildHoldTest):
             self.assertNotIn("builds may resume", partial.stdout)
             final = self.run_cli(folder, "release", "--holder", "second")
             self.assertEqual(final.returncode, 0, final.stderr)
-            self.assertEqual(final.stdout.strip(), "released, builds may resume.")
+            self.assertEqual(final.stdout.strip(), "released, builds may resume. No hold cycle: broadcast this release to every session.")
             self.assertFalse(second.exists())
             self.assertEqual(self.run_cli(folder, "status").stdout.strip(), "no build hold")
 
@@ -699,6 +911,8 @@ class ReleaseStateTests(IsolatedBuildHoldTest):
         assert cycle is not None
         cycle["entries"][0] = {"session_id": "first", "name": "first", "state": "ReleasedAwaitingAdmission", "released_at": "broken"}
         build_hold.save_cycle(cycle)
+        path = self.scratch / "release" / cycle["id"] / "cycle.json"
+        before = path.read_bytes()
         output = io.StringIO()
         errors = io.StringIO()
         with redirect_stdout(output), redirect_stderr(errors):
@@ -707,6 +921,8 @@ class ReleaseStateTests(IsolatedBuildHoldTest):
         self.assertEqual(errors.getvalue(), "")
         self.assertIn("holder since", output.getvalue())
         self.assertIn("release record could not be read: invalid released_at for first", output.getvalue())
+        self.assertIn("/build_hold release sets it aside and ends the hold", output.getvalue())
+        self.assertEqual(path.read_bytes(), before)
 
     def test_new_hold_replaces_damaged_cycle_when_no_holder_remains(self) -> None:
         _ = self.begin("first")
@@ -725,19 +941,23 @@ class ReleaseStateTests(IsolatedBuildHoldTest):
         self.assertEqual(current["entries"], [])
         self.assertTrue((self.scratch / "holders" / "new-holder").exists())
 
-    def test_new_hold_refuses_damaged_cycle_while_holder_remains(self) -> None:
+    def test_new_hold_sets_aside_damaged_cycle_while_holder_remains(self) -> None:
         _ = self.begin("first")
         cycle = build_hold.read_cycle()
         assert cycle is not None
         cycle["entries"][0] = {"session_id": "first", "name": "first", "state": "ReleasedAwaitingAdmission", "released_at": "broken"}
         build_hold.save_cycle(cycle)
-        with self.assertRaises(build_hold.ReleaseRecordReadError):
-            _ = build_hold.start_hold(self.scratch / "holders", "new-holder", "new test",
-                                      build_hold.NoReleaseEta(), datetime.now().astimezone())
+        output = io.StringIO()
+        with redirect_stdout(output):
+            notice = build_hold.start_hold(self.scratch / "holders", "new-holder", "new test",
+                                           build_hold.NoReleaseEta(), datetime.now().astimezone())
+        self.assertIn("new-holder", notice)
+        self.assertIn("this hold now releases every session at once", output.getvalue() + notice)
+        self.assertIsNone(build_hold.read_cycle())
         self.assertTrue((self.scratch / "holders" / "holder").exists())
-        self.assertFalse((self.scratch / "holders" / "new-holder").exists())
+        self.assertTrue((self.scratch / "holders" / "new-holder").exists())
 
-    def test_resume_refuses_damaged_release_record_and_keeps_holder(self) -> None:
+    def test_resume_sets_aside_damaged_release_record_and_ends_hold(self) -> None:
         _ = self.begin("first")
         cycle = build_hold.read_cycle()
         assert cycle is not None
@@ -747,10 +967,10 @@ class ReleaseStateTests(IsolatedBuildHoldTest):
         errors = io.StringIO()
         with redirect_stdout(output), redirect_stderr(errors):
             result = build_hold.main(["release", "--resume"])
-        self.assertEqual(result, 1)
-        self.assertEqual(output.getvalue(), "")
-        self.assertIn("invalid released_at for first", errors.getvalue())
-        self.assertTrue((self.scratch / "holders" / "holder").exists())
+        self.assertEqual(result, 0, errors.getvalue())
+        self.assertIn("this hold now releases every session at once", output.getvalue())
+        self.assertIn("released, builds may resume.", output.getvalue())
+        self.assertFalse((self.scratch / "holders" / "holder").exists())
 
     def test_old_cycle_registration_and_mark_do_not_reach_new_hold(self) -> None:
         _ = self.begin("old-session")
