@@ -6,7 +6,7 @@ from __future__ import annotations
 import argparse
 from collections.abc import Callable, Generator
 from concurrent.futures import Future, ThreadPoolExecutor
-from contextlib import contextmanager
+from contextlib import closing, contextmanager
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 import http.client
@@ -24,7 +24,7 @@ import sys
 import tempfile
 import time
 import tomllib
-from typing import NamedTuple, NotRequired, TypedDict, cast
+from typing import IO, NamedTuple, NotRequired, TypedDict, cast
 
 
 REFUSED_PORT = 15702
@@ -46,6 +46,8 @@ MAX_MARGIN = 0.45
 SHOT_DIRECTORY_LIMIT = 1_073_741_824
 MAX_AGE_SECONDS = 604_800
 PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
+# Wakes the remote display and holds it until the run closes this shell's stdin; -t ends it if that never comes.
+REMOTE_KEEP_AWAKE = "caffeinate -u -t 3600 & echo awake; cat > /dev/null; kill $!"
 
 ORBIT_CAM = "hana_lagrange::orbit_cam::OrbitCam"
 EDITOR_CAMERA = "hana::camera::editor_camera::EditorCamera"
@@ -495,6 +497,9 @@ class Session:
         self.brp: Brp = brp
         self.remote: str | None = remote
         self.remote_shots: int = 0
+        # True when Hana runs on macOS; start() asks a remote host.
+        self.macos: bool = remote is None and sys.platform == "darwin"
+        self.keep_awake: subprocess.Popen[bytes] | None = None
         self.camera: int = 0
         self.frame_ms: float | None = None
         self.tool_types: list[str] | None = None
@@ -504,6 +509,7 @@ class Session:
         self.window_level_set: bool = False
 
     def start(self) -> CameraState:
+        system = None if self.remote is None else POOL.submit(remote_system, self.remote)
         camera_rows = POOL.submit(
             self.brp.query,
             {"data": {"components": [ORBIT_CAM, GLOBAL_TRANSFORM, CAMERA]}, "filter": {"with": [EDITOR_CAMERA]}},
@@ -514,7 +520,20 @@ class Session:
             raise Failure(f"expected one editor camera, found {len(rows)}")
         self.camera = rows[0]["entity"]
         self.frame_ms = diagnostics.result()["frame_time_ms"]["current"]
+        if system is not None:
+            self.macos = system.result() == "Darwin"
         return camera_state(rows[0]["components"])
+
+    def close(self) -> None:
+        """End the remote keep-awake: with its stdin closed, the remote shell kills caffeinate."""
+        if self.keep_awake is None:
+            return
+        try:
+            _ = self.keep_awake.communicate(timeout=CALL_TIMEOUT)
+        except subprocess.TimeoutExpired:
+            self.keep_awake.kill()
+            _ = self.keep_awake.wait()
+        self.keep_awake = None
 
     def read_camera(self) -> CameraState:
         return camera_state(self.brp.components(self.camera, [ORBIT_CAM, GLOBAL_TRANSFORM, CAMERA]))
@@ -970,6 +989,39 @@ def remove_remote(remote: RemoteFile) -> None:
     )
 
 
+def remote_system(host: str) -> str:
+    """The remote kernel name; an empty answer fails, since Tailscale SSH can report exit 0 after a failure."""
+    try:
+        answer = subprocess.run(
+            ["ssh", host, "uname", "-s"],
+            stdin=subprocess.DEVNULL, capture_output=True, text=True, check=False, timeout=CALL_TIMEOUT,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise Failure(f"could not ask {host} for its system over ssh: {exc}") from exc
+    system = answer.stdout.strip()
+    if answer.returncode != 0 or not system:
+        detail = answer.stderr.strip() or f"ssh exited {answer.returncode}"
+        raise Failure(f"ssh {host} uname -s gave no answer ({detail})")
+    return system
+
+
+def keep_awake(host: str) -> subprocess.Popen[bytes]:
+    """Hold the remote display awake until Session.close; returns once caffeinate runs."""
+    process = subprocess.Popen(
+        ["ssh", host, REMOTE_KEEP_AWAKE], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+    )
+    started = POOL.submit(cast(IO[bytes], process.stdout).readline)
+    try:
+        awake = started.result(timeout=CALL_TIMEOUT).strip() == b"awake"
+    except TimeoutError:
+        awake = False
+    if not awake:
+        process.kill()
+        _ = process.wait()
+        raise Failure(f"could not keep the display awake on {host}: caffeinate did not start over ssh")
+    return process
+
+
 def magick() -> str:
     found = shutil.which("magick")
     if found is None:
@@ -1009,7 +1061,7 @@ def take(session: Session, shot: Shot, final: Path) -> Result:
     start = time.perf_counter()
     if shot.window is not None:
         ensure_window(session, shot.window)
-    if sys.platform == "darwin":
+    if session.macos:
         keep_visible(session)
     target_future = POOL.submit(resolve_one, session, shot)
     before = session.read_camera()
@@ -1110,9 +1162,12 @@ def keep_visible(session: Session) -> None:
     rows = session.brp.query({"data": {}, "filter": {"with": [PRIMARY_WINDOW]}})
     if len(rows) == 1:
         session.brp.mutate(rows[0]["entity"], WINDOW, ".window_level", "AlwaysOnTop")
-    caffeinate = shutil.which("caffeinate")
-    if caffeinate is not None:
-        _ = subprocess.Popen([caffeinate, "-u", "-t", "30"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    if session.remote is not None:
+        session.keep_awake = keep_awake(session.remote)
+    else:
+        caffeinate = shutil.which("caffeinate")
+        if caffeinate is not None:
+            _ = subprocess.Popen([caffeinate, "-u", "-t", "30"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     session.window_level_set = True
     session.wait_frames(2)
 
@@ -1651,17 +1706,17 @@ def with_overrides(shot: Shot, args: Arguments) -> Shot:
 def run_shots(
     brp: Brp, shots: list[Shot], out: str | None, remote: str | None, on_result: Callable[[Result], None],
 ) -> list[Result]:
-    session = Session(brp, remote)
-    _ = session.start()
-    sha = git_sha(Path.cwd())
-    results: list[Result] = []
-    for shot, path in zip(shots, output_paths(out, [shot.label for shot in shots]), strict=True):
-        result = take(session, shot, path)
-        window = session.last_state.size if session.last_state else (0, 0)
-        log_timing(result, brp.port, sha, session.frame_ms, window, remote)
-        on_result(result)
-        results.append(result)
-    return results
+    with closing(Session(brp, remote)) as session:
+        _ = session.start()
+        sha = git_sha(Path.cwd())
+        results: list[Result] = []
+        for shot, path in zip(shots, output_paths(out, [shot.label for shot in shots]), strict=True):
+            result = take(session, shot, path)
+            window = session.last_state.size if session.last_state else (0, 0)
+            log_timing(result, brp.port, sha, session.frame_ms, window, remote)
+            on_result(result)
+            results.append(result)
+        return results
 
 
 def command_shot(args: Arguments) -> int:
@@ -1878,8 +1933,10 @@ def views_check(args: Arguments, path: Path) -> int:
     out = args.out or tempfile.mkdtemp(prefix="hana-shot-check-")
     failures: list[str] = []
     passed: list[str] = []
-    with instance(args.port, args.launch, args.shutdown, args.worktree, args.binary) as brp:
-        session = Session(brp, args.remote)
+    with (
+        instance(args.port, args.launch, args.shutdown, args.worktree, args.binary) as brp,
+        closing(Session(brp, args.remote)) as session,
+    ):
         _ = session.start()
         sha = git_sha(path.parent)
         today = datetime.now().strftime("%Y-%m-%d")
