@@ -1,6 +1,6 @@
 # cache-evict: the disk floor takes from the least used build cache first
 
-> **Status: IMPLEMENTATION PLAN — phased, delegate-ready; awaiting the showrunner's approval.** Below its free-space floor, the disk floor sweep removes only the shortfall, but today it spreads that across every idle target by compile age, so each active unit loses part of its working set. This plan makes it take from the least recently used target first, records each target's last build so a test rerun counts as use, names in the journal whose cache went, gives a unit director a read-only forecast before a large build, and re-measures a day later.
+> **Status: IMPLEMENTATION PLAN — phased, delegate-ready; approved by the showrunner 2026-10-06 (Phase 2 `--forecast` dropped, the re-measure renumbered Phase 2).** Below its free-space floor, the disk floor sweep removes only the shortfall, but today it spreads that across every idle target by compile age, so each active unit loses part of its working set. This plan makes it take from the least recently used target first, records each target's last build so a test rerun counts as use, names in the journal whose cache went, and re-measures a day later.
 
 > **Production: build-followups** — unit `cache-evict-unit`; production doc `docs/plans/build-followups-production.md`
 
@@ -32,13 +32,12 @@ i.e. figuring out the safest buld cache to delete in such situations so we don't
 - **A target's last use** is the newest of its use stamp's mtime and its units' `last_used`. The stamp `.lint-sweep-used` at the target root is written by every workspace sweep, before its lock check, so a step that ran in that workspace counts even when it compiled nothing; the units' times cover builds outside `lint` that compiled something. `--target-dir` (CI) writes no stamp.
 - **The workspace budget sweep keeps today's order.** Its groups share one target, so the target key is constant there; nothing in it changes.
 - **One line per target in every floor removal**, so the journal names whose cache went and how recently it was used: `lint sweep: the floor took <GiB> from <target>, last used <when>` (`would take` on a dry run). No `removed` in it (parse.py).
-- **A read-only forecast** for a unit director before a large build: `sweep.py --forecast <GiB>` prints the room above the floor and, for a build of that size, the per-target lines it would cost, from a scan that takes no cargo lock (a 3-minute scan under held locks would stall every build).
-- **Not in this plan: the floor's size.** 500 GiB free against 655 GiB of session caches is what makes every build evict active output; ordering only decides who pays. Changing it trades disk-full risk for cache, which is the showrunner's and the user's call; the numbers above go to the showrunner with this plan.
-- **Wording outside this unit's files goes to the showrunner:** the <ToolingContract/> sentence in `commands/unit/delegate.md` (enh-showrunner-unit's from its Phase 5) and the header comment of `/etc/nixos/modules/linux/disk-floor.nix` (natedev's). Phase 1 and Phase 2 each send their replacement text.
+- **Every build goes ahead, trial merges included** (showrunner, 2026-10-06): the floor takes the shortfall from the least recently used target, so a unit director has nothing to consult first; no forecast tool.
+- **Wording outside this unit's files goes to the showrunner:** natedev has enh-showrunner-unit correct the <ToolingContract/> sentence in `commands/unit/delegate.md`; Phase 1 sends natedev the header comment for `/etc/nixos/modules/linux/disk-floor.nix`.
 
 ## Delegation Context
 
-- **Project:** `~/.claude` — Claude Code commands, skills, hooks and scripts. This plan changes the disk floor's eviction order in `scripts/lint/sweep.py` (Phase 1), adds its read-only forecast (Phase 2), and re-measures a day after Phase 1 is live (Phase 3). Work in the worktree `/home/natepiano/worktrees/claude-build-followups-cache-evict` on branch `build-followups-cache-evict` (unit `cache-evict-unit` of production `build-followups`). Name both in every Work Order.
+- **Project:** `~/.claude` — Claude Code commands, skills, hooks and scripts. This plan changes the disk floor's eviction order in `scripts/lint/sweep.py` (Phase 1) and re-measures a day after it is live (Phase 2). Work in the worktree `/home/natepiano/worktrees/claude-build-followups-cache-evict` on branch `build-followups-cache-evict` (unit `cache-evict-unit` of production `build-followups`). Name both in every Work Order.
 - **Project started:** 2026-10-06T22:31:00+00:00
 - **Stack:** Python 3.13, standard library only.
 - **Layout:**
@@ -68,7 +67,7 @@ i.e. figuring out the safest buld cache to delete in such situations so we don't
 
 | Gate | Waiting | Waits on | Clears when |
 | --- | --- | --- | --- |
-| G1 | Phase 3 | 24 h after Phase 1 reaches `~/.claude` main (T_live, its As-built) | the clock |
+| G1 | Phase 2 | 24 h after Phase 1 reaches `~/.claude` main (T_live, its As-built) | the clock |
 
 ## Phases
 
@@ -107,34 +106,7 @@ Work only in worktree `/home/natepiano/worktrees/claude-build-followups-cache-ev
 
 **Acceptance gate:** `test_sweep.py` passes; basedpyright reports `0 errors, 0 warnings, 0 notes` on both Python files; the live check's two lists are in the As-built, and the new order's 60 GiB list takes from no target used in the last hour while any idle target used earlier holds output.
 
-### Phase 2 — A read-only forecast before a large build · status: todo
-
-#### Work Order
-
-Work only in worktree `/home/natepiano/worktrees/claude-build-followups-cache-evict`, branch `build-followups-cache-evict`. State every time in PDT.
-
-**Goal:** a unit director about to write a large build folder learns, before building, how much room sits above the floor and whose caches a build of that size would cost.
-
-**Constraints from prior phases:** Phase 1's order, `target_used`, stamp and per-target line format; read its As-built.
-
-**Spec:**
-- `sweep.py --forecast <GiB>` (a non-negative number; anything else exits 2 naming the flag). It implies floor only and removes nothing. No floor configured for the host: print `lint sweep: no floor on <host>; a build costs no other cache` and exit 0.
-- It probes each target's cargo locks with `lock_trees` and releases them at once, to class targets busy or idle as of now, then scans the idle ones with no lock held.
-- Output: `lint sweep: <free> free, <room> above the <floor> floor`; when `<GiB>` fits in the room, `lint sweep: a <GiB> build fits; the floor takes nothing`; otherwise `lint sweep: a <GiB> build leaves the floor <shortfall> short` followed by Phase 1's per-target lines with `would take`, then `lint sweep: <n> target dirs a build holds now are left out`. Exit 0.
-- Header: a short paragraph on the forecast and when to run it.
-- **Text for natedev**, sent with the checkpoint notice: a replacement for `commands/unit/delegate.md`'s <ToolingContract/> sentence: the sweeper keeps 500 GiB free by removing build output, least recently used target first and only the shortfall; before a build that writes a large new folder, `~/.claude/scripts/lib/py ~/.claude/scripts/lint/sweep.py --forecast <GiB>` names whose caches it would cost; a trial merge builds in the unit's own worktree and needs no new folder.
-
-**Tests:** room enough → nothing would go and no file is removed; a shortfall → per-target `would take` lines in Phase 1's order and every file still present; a busy target is left out and counted; no locks are held during the scan (a lock taken by the test after the probe does not block the forecast); a malformed value exits 2; no floor configured → the no-floor line, exit 0.
-
-**Files:**
-- `scripts/lint/sweep.py` — `--forecast`, header paragraph
-- `scripts/lint/test_sweep.py` — the tests above
-
-**Seats:** 1 writer.
-
-**Acceptance gate:** `test_sweep.py` passes; basedpyright reports `0 errors, 0 warnings, 0 notes` on both files; one live `--forecast 60` run on natedev (read only) is quoted in the As-built with its wall time.
-
-### Phase 3 — Re-measure a day after the target order went live · status: todo
+### Phase 2 — Re-measure a day after the target order went live · status: todo
 
 #### Work Order
 
@@ -149,7 +121,7 @@ Work only in worktree `/home/natepiano/worktrees/claude-build-followups-cache-ev
 - From `journalctl --user -u disk-floor.service` (EDT) for B and W: timer sweeps that removed output, GiB taken, and the hours from each sweep back to the newest unit it took (median, min, max), parsed as this plan's "What exists today" did.
 - From W's per-target lines: GiB taken from targets whose last use was under 1 h, 1–6 h and over 6 h before the sweep, and the five targets that lost the most.
 - From the build log (`?mode=ro`): `sum(sweep_freed_bytes)` of `step='sweep'` on natedev for B and W.
-- Verdict, no threshold: the share of W's GiB taken from targets used under 1 h before the sweep, and GiB a day in W against B. When W still takes more a day than the session caches hold (655 GiB on 2026-10-06), send natedev the floor-size numbers again.
+- Verdict, no threshold: the share of W's GiB taken from targets used under 1 h before the sweep, and GiB a day in W against B.
 
 **Files:** `docs/plans/build-followups-cache-evict.md` — the As-built.
 
