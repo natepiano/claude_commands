@@ -189,6 +189,34 @@ raise SystemExit(1 if record['to'] in fail else 0)
             return []
         return [json.loads(line) for line in self.send_log.read_text().splitlines()]
 
+    def test_rename_preserves_reported_unit_and_showrunner_stretches(self) -> None:
+        import stall_watch
+        old_state = stall_watch.STATE_DIR
+        stall_watch.STATE_DIR = self.state
+        try:
+            self.state.mkdir()
+            old = stall_watch.stretch_path("showrunner", "unit-one")
+            _ = old.write_text('{"reported_status": "holding", "bump_sent": true, "tell_sent": true}')
+            stall_watch.rename_state("unit-one", "new-unit", "showrunner", "showrunner", ["new-unit"])
+            self.assertFalse(old.exists())
+            self.assertTrue(stall_watch.stretch_path("showrunner", "new-unit").exists())
+            stall_watch.rename_state("showrunner", "new-showrunner", "showrunner", "new-showrunner", ["new-unit"])
+            self.assertTrue(stall_watch.stretch_path("new-showrunner", "new-unit").exists())
+        finally:
+            stall_watch.STATE_DIR = old_state
+
+    def test_reported_unit_is_not_bumped_again_after_rename(self) -> None:
+        self.assertEqual(self.tick(START).returncode, 0)
+        self.assertEqual(self.tick(START + 300).returncode, 0)
+        self.assertEqual(len(self.sent()), 2)
+        renamed = subprocess.run([sys.executable, str(SCRIPT.with_name("showrunners.py")),
+                                  "rename", "unit-one", "new-unit"], env=self.environment,
+                                 capture_output=True, text=True, check=False)
+        self.assertEqual(renamed.returncode, 0, renamed.stderr)
+        self.panes["new-unit"] = self.panes.pop("unit-one")
+        self.assertEqual(self.tick(START + 301).returncode, 0)
+        self.assertEqual(len(self.sent()), 2)
+
     def test_stalled_unit_is_bumped_and_told_once_until_latest_turn_end_changes(self) -> None:
         self.assertEqual(self.tick(START).returncode, 0)
         self.assertEqual(self.sent(), [])
@@ -215,6 +243,15 @@ raise SystemExit(1 if record['to'] in fail else 0)
         second = self.sent()[2:]
         self.assertEqual(len(second), 2)
         self.assertNotEqual({item["key"] for item in first}, {item["key"] for item in second})
+
+    def test_pane_process_running_claude_is_bumped_and_told(self) -> None:
+        pid = self.children[0].pid
+        self.panes["unit-one"]["pane_pid"] = pid
+        self.process_rows = [f"{pid} 1 claude --remote-control unit-one"]
+        self.assertEqual(self.tick(START).returncode, 0)
+        self.assertEqual(len(list(self.state.glob("*.json"))), 1)
+        self.assertEqual(self.tick(START + 300).returncode, 0)
+        self.assertEqual({item["key"].rsplit(":", 1)[-1] for item in self.sent()}, {"bump", "tell"})
 
     def test_shell_seen_then_gone_starts_a_new_idle_stretch(self) -> None:
         _ = self.tick(START)
