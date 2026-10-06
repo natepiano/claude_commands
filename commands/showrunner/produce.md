@@ -548,8 +548,8 @@ choice the user's taste must settle, apply <DesignAuthority/>; otherwise add
 the rule to the guide.
 
 Any Hana shot the showrunner or its helpers take uses `/hana_shot` (stored
-views in `crates/hana/brp_views.toml`); a unit director working a camera out by
-hand gets pointed at it.
+views in `crates/hana/brp_views.toml`), every view in one call; a unit director
+or helper working a camera out by hand gets pointed at it.
 </DesignCheck>
 
 ---
