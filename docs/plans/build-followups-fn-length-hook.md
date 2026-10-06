@@ -39,6 +39,7 @@ The user, via natedev, 2026-10-06 06:2x PDT: "can we create an edit hook - i am 
 ## Delegation Context
 
 - **Project:** `~/.claude` — Claude Code commands, skills, hooks and scripts; this plan records a too_many_lines baseline (Phase 1), adds a PostToolUse hook that blocks Claude edits leaving a Rust function over clippy's limit (Phase 2), extends it to Codex seats (Phase 3), and re-measures (Phase 4). Work in the worktree `/home/natepiano/worktrees/claude-build-followups-stalls` on branch `build-followups-stalls` (unit `stalls-unit` of production `build-followups`).
+- **Project started:** 2026-10-06T15:12:44.327+00:00
 - **Stack:** Python 3.13, standard library only (`json`, `re`, `tomllib`, `dataclasses`, `pathlib`, `subprocess`, `unittest`); `scripts/lib/py` picks a Python ≥ 3.10 on each machine (3.13 on natedev and the Mac, so `tomllib` is present). Codex CLI 0.160.1 on natedev, 0.154.0 on the Mac.
 - **Layout:**
   - `scripts/hooks/fn_length_lib.py` — the checker: lint scope, function discovery, clippy's count (new, Phase 2)
@@ -73,32 +74,29 @@ The user, via natedev, 2026-10-06 06:2x PDT: "can we create an edit hook - i am 
 
 ## Phases
 
-### Phase 1 — Baseline: too_many_lines failures and seat time before the hook · status: todo
+### Phase 1 — Baseline: too_many_lines failures and seat time before the hook · status: done
 
-#### Work Order
+#### As-built
 
-Work only in worktree `/home/natepiano/worktrees/claude-build-followups-stalls`, branch `build-followups-stalls`. State every time in PDT.
+Measured 2026-10-06 08:17 PDT over every hana clippy step since the first, 2026-10-02 09:09 PDT (span 3.96 days), by the four scripts in `~/.local/state/nightly-review/2026-10-06/work/lints/` (hashes in the re-measure's Work Order, all matching) and the read-only totals query on `~/.local/state/buildlog/index.sqlite`; every command exits 0.
 
-**Goal:** the plan records, from the same scripts Phase 4 reruns, how often too_many_lines fails hana's clippy steps and how much seat time those failures cost, normalized so a busier or quieter week compares fairly.
-
-**Spec:**
-- Confirm the scripts are the ones measured below: `sha256sum` in `~/.local/state/nightly-review/2026-10-06/work/lints/` gives `c2de2087…5d4fa cost.py`, `a7757653…f9abf loop.py`, `e178642d…841ce clippy_fail_lints.py`, `18754c36…6522 tml_lengths.py` (full hashes: `c2de20870ab2de9b5438e469c565d25c48185438ab42dd77807d817655b5d4fa`, `a775765b96311a783c8d6af8cdc925071b89b4ac423ae8ffa75b88fe81bf9abf`, `e178642d9bb1690562c132d824256198cc8f6e622b779b94ca76abbc75e841ce`, `18754c36c8c545928a082e3bded49c688f029221b917b0f1e6c164028e4b6522`). A mismatch stops the phase and is reported.
-- The buildlog's hana clippy steps begin 2026-10-02T16:09Z (09:09 PDT); every window of 4 days or more is all the data. Run from that directory, in the background, with `set -o pipefail`: `python3 cost.py 4 too_many_lines`, `python3 loop.py 4 too_many_lines`, `python3 clippy_fail_lints.py 4`, `python3 tml_lengths.py 4`, and the totals query `select count(*), sum(status!=0) from steps where repo='hana' and step='clippy' and started_at>=datetime('now','-4 days')` against `~/.local/state/buildlog/index.sqlite` opened read-only (`?mode=ro`). Record the run time in PDT and the window's span in days.
-- Derive: too_many_lines-including failed steps per 100 hana clippy steps; sole-cause failed steps per 100; sole-cause seat time per day = (`loop.py` failed-call wall + repair-gap sum) / span days.
-- The plan author's run, 2026-10-06 06:26 PDT, span 3.89 days (2026-10-02 09:09 PDT to 2026-10-06 06:26 PDT): 1,485 hana clippy steps, 457 failed. too_many_lines is the most frequent failing lint: in 194 failed steps (277 diagnostics; next is suboptimal_flops in 119) = **13.1 per 100 clippy steps**, 49.9 a day. 72 failed on nothing else = **4.8 per 100**, 18.5 a day. `cost.py`: sole-cause lint-call wall 1.61 h (median 48 s, 5 steps without a call record), clippy step time 0.47 h; diagnostics 200 in `src` paths (some hold `#[cfg(test)]` modules), 77 in test or example paths. `loop.py`: 67 sole-cause failed lint calls, failed-call wall 1.58 h; 62 had a next lint call within 1,800 s, gap median 115 s, p75 155 s, sum 2.40 h; that next call passed 44 times, failed again 18; 3 had none. **Sole-cause seat time 3.98 h = 1.02 h a day.** `tml_lengths.py`: 209 distinct flagged functions, length p25 103, median 107, p75 120, p90 139, max 178; 10 over 150; 59 in test files by path. Last 24 h alone: 451 steps, 175 failed, 78 with too_many_lines (17.3 per 100), 22 sole-cause (4.9 per 100); loop 19 calls, wall 0.41 h, gap 0.73 h.
-- Write the phase's numbers into its As-built in the form above. They supersede the author's run; a difference over 2 per 100 in either rate is named in the checkpoint notice.
+- **too_many_lines failed steps: 13.3 per 100 hana clippy steps.** 1,516 steps, 473 failed; too_many_lines is the most frequent failing lint, in 201 failed steps (290 diagnostics; next is suboptimal_flops in 120), 50.7 a day.
+- **Sole-cause failed steps: 4.9 per 100.** 75 failed on nothing else, 18.9 a day.
+- **Sole-cause seat time: 1.07 h a day.** `loop.py` failed-call wall 1.69 h + repair-gap sum 2.57 h = 4.26 h over 3.96 days.
+- `cost.py`: sole-cause lint-call wall 1.73 h (median 49 s, 5 steps without a call record), clippy step time 0.54 h; diagnostics 210 in `src` paths (some hold `#[cfg(test)]` modules), 80 in test or example paths.
+- `loop.py`: 70 sole-cause failed lint calls; 64 had a next lint call within 1,800 s, gap median 117 s, p75 162 s; that next call passed 45 times, failed again 19; 4 had none.
+- `tml_lengths.py`: 216 distinct flagged functions, length p25 103, median 107, p75 120, p90 140, max 180; 12 over 150, none over 200; 62 in test files by path.
+- Last 24 h alone: 482 steps, 191 failed, 85 with too_many_lines (17.6 per 100), 25 sole-cause (5.2 per 100); loop 22 calls, wall 0.52 h, gap 0.90 h.
+- The plan author's run (2026-10-06 06:26 PDT, span 3.89 days) gave 13.1 and 4.8 per 100 and 1.02 h a day; both rates are within 2 per 100 of it.
 
 **Files:**
-- `docs/plans/build-followups-fn-length-hook.md` — this phase's As-built (the closeout writes it).
+- `docs/plans/build-followups-fn-length-hook.md` — this record.
 
-**Seats:** 1 writer — `impl` runs the commands and reports the numbers; nothing splits and there is no code or test lane.
+**Binds later work:** the re-measure compares against 13.3 per 100, 4.9 per 100 and 1.07 h a day; its success limits are ≤ 3.3 per 100 and ≤ 0.27 h a day.
 
-**Constraints from prior phases:** none.
-- The scripts and the buildlog are read-only; never copy, edit or move them (user, 2026-10-06).
-- Saved run output stays under a few GB: read each run and delete it before the next.
-
-**Acceptance gate:**
-- All four hashes match, all five commands exit 0, and the As-built carries both rates, the seat time per day, the span and the run time.
+**Gotchas:**
+- `loop.py` counts sole-cause calls it later skips for lacking an end time, so its count runs 1–2 above follow-up plus none (70 vs 64 + 4; the author's run 67 vs 62 + 3); seat time uses its wall and gap sums as printed.
+- A 4-day window covers every hana clippy step only until 2026-10-06 09:09 PDT; the totals query's `min(started_at)` gives the span's start.
 
 ### Phase 2 — Claude edits that leave a function over the limit are blocked at once · status: todo
 
@@ -206,9 +204,9 @@ Work only in worktree `/home/natepiano/worktrees/claude-build-followups-stalls`,
 **Goal:** the plan states whether the hook cut too_many_lines failures at the source, against Phase 1's baseline and a stated threshold, with proof that both hooks fired.
 
 **Spec:**
-- Confirm the four script hashes from Phase 1. Run, in the background, from `~/.local/state/nightly-review/2026-10-06/work/lints/`: `python3 cost.py 4 too_many_lines`, `python3 loop.py 4 too_many_lines`, `python3 clippy_fail_lints.py 4`, `python3 tml_lengths.py 4`, and Phase 1's totals query, between T_codex + 96 h and T_codex + 100 h, so the 4-day window starts after T_codex.
-- Derive the same three numbers as Phase 1, per 100 clippy steps and per day.
-- **Success** when all three hold: too_many_lines-including failed steps per 100 hana clippy steps ≤ 25% of Phase 1's rate (the author's run gives ≤ 3.3); sole-cause seat time per day ≤ 25% of Phase 1's (≤ 0.26 h); and the control — `blocks.jsonl` holds at least one `"agent": "claude"` and one `"agent": "codex"` line inside the window, counting natedev's file and the Mac's read over `ssh mac`. A failed control means a hook did not fire, and the rates say nothing about the hook.
+- Confirm the four script hashes: `sha256sum` in `~/.local/state/nightly-review/2026-10-06/work/lints/` gives `c2de20870ab2de9b5438e469c565d25c48185438ab42dd77807d817655b5d4fa cost.py`, `a775765b96311a783c8d6af8cdc925071b89b4ac423ae8ffa75b88fe81bf9abf loop.py`, `e178642d9bb1690562c132d824256198cc8f6e622b779b94ca76abbc75e841ce clippy_fail_lints.py`, `18754c36c8c545928a082e3bded49c688f029221b917b0f1e6c164028e4b6522 tml_lengths.py`; a mismatch stops the phase. Run, in the background with `set -o pipefail`, from `~/.local/state/nightly-review/2026-10-06/work/lints/`: `python3 cost.py 4 too_many_lines`, `python3 loop.py 4 too_many_lines`, `python3 clippy_fail_lints.py 4`, `python3 tml_lengths.py 4`, and the totals query `select count(*), sum(status!=0), min(started_at) from steps where repo='hana' and step='clippy' and started_at>=datetime('now','-4 days')` against `~/.local/state/buildlog/index.sqlite` opened read-only (`?mode=ro`), between T_codex + 96 h and T_codex + 100 h, so the 4-day window starts after T_codex.
+- Derive the same three numbers as Phase 1: too_many_lines-including failed steps (`clippy_fail_lints.py`) per 100 hana clippy steps; sole-cause failed steps (`cost.py`) per 100; sole-cause seat time per day = (`loop.py` failed-call wall + repair-gap sum) / span days, the span running from the window's first hana clippy step to the run.
+- **Success** when all three hold: too_many_lines-including failed steps per 100 hana clippy steps ≤ 25% of Phase 1's rate (13.3 per 100, so ≤ 3.3); sole-cause seat time per day ≤ 25% of Phase 1's (1.07 h, so ≤ 0.27 h); and the control — `blocks.jsonl` holds at least one `"agent": "claude"` and one `"agent": "codex"` line inside the window, counting natedev's file and the Mac's read over `ssh mac`. A failed control means a hook did not fire, and the rates say nothing about the hook.
 - Residuals: for each too_many_lines diagnostic in the window's failed steps (file and line from the step log), say whether a block for that file precedes it in `blocks.jsonl` (the hook fired; the agent linted before splitting) or none does (an edit the hook did not see: a shell edit, rustfmt growth past the limit, or a person). Report the two counts and the five most frequent files.
 - Write the numbers, the verdict and the residual counts into this phase's As-built, and send the showrunner the verdict line.
 
@@ -218,7 +216,7 @@ Work only in worktree `/home/natepiano/worktrees/claude-build-followups-stalls`,
 **Seats:** 1 writer — `impl` runs the commands and reports; nothing splits and there is no code or test lane.
 
 **Constraints from prior phases:**
-- Phase 1's As-built holds the baseline rates and seat time; Phase 2's holds T_claude, Phase 3's T_codex.
+- Phase 1's As-built holds the baseline: 13.3 too_many_lines failed steps per 100 hana clippy steps, 4.9 sole-cause per 100, 1.07 h sole-cause seat time a day (run 2026-10-06 08:17 PDT, span 3.96 days). Phase 2's As-built holds T_claude, Phase 3's T_codex.
 - The scripts and the buildlog are read-only (user, 2026-10-06).
 - Saved run output stays under a few GB: read each run and delete it before the next.
 
