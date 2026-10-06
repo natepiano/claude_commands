@@ -53,7 +53,7 @@ class DailiesHoldTests(unittest.TestCase):
         _ = path.write_text(json.dumps({"holder": name, "since": since, "for": purpose, "release_eta": release}) + "\n")
         return path
 
-    def write_cycle(self, states: list[tuple[str, str]]) -> None:
+    def write_cycle(self, states: list[tuple[str, str]], *, outcomes: dict[str, str] | None = None) -> None:
         release = self.scratch / "release"
         directory = release / CYCLE_ID
         directory.mkdir(parents=True)
@@ -71,7 +71,7 @@ class DailiesHoldTests(unittest.TestCase):
                 entry["wait_started_at"] = "2026-10-04T10:58:00-07:00"
             if state == "MemoryGateReturned":
                 entry["wait_ended_at"] = "2026-10-04T10:59:30-07:00"
-                entry["outcome"] = "Granted"
+                entry["outcome"] = (outcomes or {}).get(session_id, "Granted")
             entries.append(entry)
         cycle: dict[str, object] = {
             "id": CYCLE_ID,
@@ -150,18 +150,25 @@ class DailiesHoldTests(unittest.TestCase):
 
     def test_footer_and_report_name_each_release_state_before_agents(self) -> None:
         _ = self.write_holder("seat", "2026-10-04T10:56:00-07:00", "the focused test")
-        self.write_cycle([
+        states = [
             ("first", "MemoryGateReturned"), ("second", "AwaitingRelease"),
             ("third", "DeliveryQueued"), ("fourth", "DeliveryFailed"),
-            ("fifth", "RecipientGone"),
-        ])
+            ("fifth", "RecipientGone"), ("sixth", "ReleasedAwaitingAdmission"),
+            ("seventh", "WaitingForMemory"), ("eighth", "MemoryGateReturned"),
+            ("ninth", "MemoryGateReturned"), ("tenth", "NoAdmissionAck"),
+            ("eleventh", "NoRegistration"),
+        ]
+        outcomes = {"first": "Granted", "eighth": "TimedOut", "ninth": "MeminfoUnavailable"}
+        self.write_cycle(states, outcomes=outcomes)
         for lines in (self.assert_ok(self.report(True)), self.assert_ok(self.footer())):
             hold_index = next(index for index, line in enumerate(lines) if line.startswith("build hold:"))
-            state_lines = [line for line in lines if any(state in line for state in (
-                "MemoryGateReturned", "AwaitingRelease", "DeliveryQueued", "DeliveryFailed", "RecipientGone",
-            ))]
-            self.assertEqual(len(state_lines), 5)
-            self.assertTrue(all(lines.index(line) > hold_index for line in state_lines))
+            for index, (session_id, state) in enumerate(states, start=1):
+                expected = f"session {index} [{session_id}]: {state}"
+                if state == "MemoryGateReturned":
+                    expected += f"({outcomes[session_id]})"
+                matches = [line for line in lines if line.strip() == expected]
+                self.assertEqual(matches, ["  " + expected])
+                self.assertGreater(lines.index(matches[0]), hold_index)
             self.assertTrue(any("next session 2 [second] at 11:00:30 PDT" in line for line in lines))
 
     def test_footer_and_report_keep_hold_lines_when_release_record_is_damaged(self) -> None:
@@ -172,14 +179,30 @@ class DailiesHoldTests(unittest.TestCase):
         entries = cast(list[dict[str, str]], cycle["entries"])
         entries[0]["released_at"] = "broken"
         _ = path.write_text(json.dumps(cycle) + "\n")
+        before = path.read_bytes()
         report = self.assert_ok(self.report(True))
         footer = self.assert_ok(self.footer())
         for lines in (report, footer):
             hold_index = next(index for index, line in enumerate(lines) if line.startswith("build hold:"))
-            error_line = "release record could not be read: invalid released_at for first"
+            error_line = "release record could not be read: invalid released_at for first; /build_hold release sets it aside and ends the hold"
             self.assertEqual([line.strip() for line in lines if error_line in line], [error_line])
             self.assertLess(hold_index, next(index for index, line in enumerate(lines) if error_line in line))
         self.assertLess(next(index for index, line in enumerate(report) if error_line in line), report.index("### Agents"))
+        self.assertEqual(path.read_bytes(), before)
+
+    def test_footer_reports_damaged_current_without_changing_it(self) -> None:
+        _ = self.write_holder("seat", "2026-10-04T10:56:00-07:00", "the focused test")
+        self.write_cycle([("first", "AwaitingRelease")])
+        path = self.scratch / "release" / "current"
+        content = b"invalid-current\n"
+        _ = path.write_bytes(content)
+        lines = self.assert_ok(self.footer())
+        self.assertIn(
+            "  release record could not be read: invalid current hold cycle; /build_hold release sets it aside and ends the hold",
+            lines,
+        )
+        self.assertEqual(path.read_bytes(), content)
+        self.assertEqual(list(path.parent.glob("current.damaged-*")), [])
 
     def test_legacy_holder_renders_unknown_release(self) -> None:
         _ = (self.folder / "old-seat").write_text("old seat, 2026-10-04T10:56:00-07:00, the focused test\n")
