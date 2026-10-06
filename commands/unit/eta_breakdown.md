@@ -13,7 +13,7 @@ Answer in this turn from what is already recorded; start no runs and do not paus
 
 ## Answer
 
-Print it, and send it to the showrunner when it asked:
+Print it as plain Markdown, a first line and bullets, never inside a code block: the fence below only shows the shape, and monospace is hard to read (user, 2026-10-06). Send it to the showrunner when it asked:
 
 ```
 <unit> phase <N>: <what the phase delivers, in plain words>. ETA <HH:MM zone>
