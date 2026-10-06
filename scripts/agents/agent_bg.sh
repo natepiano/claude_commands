@@ -91,7 +91,7 @@ fi
 # cargo token and filed into its session. Hand the seat its delegate variables
 # through settings, empty when unset (every reader treats empty as unset), and
 # keep them off the launch below so a daemon it starts carries none.
-SEAT_ENV_NAMES=(PLAN_DELEGATE_BOARD_DIR PLAN_DELEGATE_TEAM_ROLE)
+SEAT_ENV_NAMES=(PLAN_DELEGATE_BOARD_DIR PLAN_DELEGATE_TEAM_ROLE AGENTS_CONFIG_FILE)
 seat_settings="$("$PY" -c '
 import json
 import os
@@ -112,7 +112,7 @@ if [[ -n "${EFFORT}" ]]; then
 fi
 
 banner="$(cd "${WORKING_DIR}" \
-            && env -u PLAN_DELEGATE_BOARD_DIR -u PLAN_DELEGATE_TEAM_ROLE \
+            && env -u PLAN_DELEGATE_BOARD_DIR -u PLAN_DELEGATE_TEAM_ROLE -u AGENTS_CONFIG_FILE \
                    -u PLAN_DELEGATE_RESOLVES_ROUND \
                    "${CLAUDE_BIN}" "${launch_args[@]}" \
             -- "$(cat "${PROMPT_FILE}")" 2>&1 || true)"
