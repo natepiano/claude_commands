@@ -239,10 +239,10 @@ branch, port and the files you own.
    Before the notice, on a clean tree, trial-merge the owner's current tip in
    your own worktree (`git merge --no-commit --no-ff <owner tip>`), run the
    tests that cover those files, then `git merge --abort`; never commit the
-   trial. Fix every break on your
-   side. A break only the owner's in-flight work can fix goes to the owner
-   before the notice: what breaks and who fixes it, named on the line. The
-   owner never absorbs your break in a repair round. User, 2026-10-06.
+   trial. Fix every break on your side. A break only the owner's in-flight
+   work can fix goes to the owner before the notice: what breaks and who fixes
+   it, named on the line. The owner never absorbs your break in a repair
+   round. User, 2026-10-06.
 10. **Turn-end lines.** A wait the showrunner can clear names it:
     `— blocked: waiting on the showrunner: <what>`. A wait on another unit is
     one of these: `— blocked: waiting on the showrunner: <unit> <what>`. A wait
