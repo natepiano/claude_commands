@@ -562,35 +562,21 @@ For a CI MemoryMax increase, require an isolated post-pool run with a CI `oom_ki
 
 **Ruled out:** staggering held sessions by the memory gate alone (it does not stagger them); a fixed 5-minute admission timeout (a first build that starts 10 minutes after delivery overlaps the next).
 
-### Phase 20 — Every live session hears a broadcast · status: todo
+### Phase 20 — Every live session hears a broadcast · status: done
 
-#### Work Order
+#### As-built
 
-**Goal:** `/notify_top_level` reaches every live top-level session, including two that share a name, so every session receives the build-hold notice.
-
-**Spec:**
-- **Why (found by Phase 19's review, routed by the showrunner 2026-10-05 22:00 PDT):** `scripts/message/top_level.py` prints each name once (`main`, sorted unique names), and `commands/notify_top_level.md` step 2 sends one `SendMessage` per printed name. When two live sessions share a name, one of them never receives the broadcast. Phase 19 records both session ids for a hold, so the one that missed the notice reaches `NoRegistration` and the hold still clears, but that session never heard the hold.
-- **One line per live session.** `top_level.py` prints one line per live top-level session that `forwarded_sessions` returns, not one per name: `<name>\tuds:<messagingSocketPath>`, sorted by name and then address. The socket comes from the same session record (`~/.claude/sessions/*.json`, the field `scripts/message/sessions.py` reads). Unit directors stay left out.
-- **This session is left out by its id alone.** A name can belong to two sessions, so a name never leaves a session out: `forwarded_sessions` drops its `me` parameter and `top_level.py` drops `--self` (`commands/notify_top_level.md` is its only caller). It leaves out the record whose `sessionId` is `CLAUDE_CODE_SESSION_ID`. With that variable unset or empty it records nothing, prints `top_level: CLAUDE_CODE_SESSION_ID is unset, so this session cannot be left out` on stderr and exits 2; `/notify_top_level` always runs inside a session, which has it.
-- **A session with no address is named, not recorded.** Each live record becomes an `AddressableSession(name, session_id, address)` or an `UnaddressableSession(name, session_id)` at the read boundary, and the rest of `top_level.py` works from those two types. Only addressable sessions are printed and recorded as hold recipients through `build_hold.py record-recipient`; a session that cannot be messaged cannot hear the hold, so recording it would only cost the release its `NoRegistration` wait. Each unaddressable session is named on stderr as `not reachable: <name> [<session id>] has no messaging socket`.
-- **The broadcast sends by address.** `commands/notify_top_level.md` step 1 says each line is a name and its address, and step 2 sends `SendMessage` to the `uds:` address (the form an incoming message's `from` carries), naming the session by its name in what it reports. Step 3 names a held or refused delivery by name and address, so two sessions that share a name can be told apart, and reports each `not reachable` line as a session that was not told. Peers on other machines keep their ListAgents name.
-- Tests (`NOTIFIER_SESSIONS_DIR` set to a temporary directory; `record-recipient` stubbed; no real send): two live sessions with one name print two lines with distinct addresses and both are recorded; a session with no socket path is neither printed nor recorded and is named on stderr; this session's own id is left out while another session with its name is printed; an unset or empty `CLAUDE_CODE_SESSION_ID` exits 2 with its line and records nothing; a unit director is left out; the existing Phase 19 cases still pass, rewritten without `--self`.
+- `scripts/message/top_level.py` takes no arguments and prints one line per live, non-unit top-level session, `<name>\tuds:<messagingSocketPath>`, sorted by name then address. Two sessions that share a name print two lines and both are recorded as hold recipients through `build_hold.py record-recipient`; `main` returns 1 when a record fails.
+- `forwarded_sessions(sessions_dir, unit)` turns each live record of `~/.claude/sessions/*.json` into `AddressableSession(name, session_id, address)` or `UnaddressableSession(name, session_id)` at the read boundary. Only addressable sessions are printed and recorded, since a session that cannot be messaged cannot hear the hold; each unaddressable one is named on stderr as `not reachable: <name> [<session id>] has no messaging socket`.
+- This session is left out by `CLAUDE_CODE_SESSION_ID` alone, never by name, since a name can belong to two sessions. `--self` and the `me` parameter are gone: any argument prints `usage: top_level.py` and exits 2. With the id unset or empty it prints `top_level: CLAUDE_CODE_SESSION_ID is unset, so this session cannot be left out` on stderr, records nothing and exits 2.
+- `/notify_top_level` sends `SendMessage` to each `uds:` address and reports each session by name. A held or refused delivery is named by name and address, so two sessions with one name stay distinct; each `not reachable` line is reported as a session that was not told. Peers on other machines keep their ListAgents name.
 
 **Files:**
-- `scripts/message/top_level.py` — one line per live session with its `uds:` address, exclusion by id alone, and the two session types
-- `scripts/message/test_top_level.py` — the address cases
-- `commands/notify_top_level.md` — send to each address
-- `scripts/message/sessions.py` — the record's socket field, read only
+- `scripts/message/top_level.py` — the per-session list, the two session types, hold-recipient recording
+- `commands/notify_top_level.md` — sends to each `uds:` address; the only caller of `top_level.py`
+- `scripts/message/test_top_level.py` — duplicate names, ordering, missing or empty sockets, own-id exclusion, unset id, unit directors, ended or reused pids, record failure, `--self` rejected
 
-**Seats:** `1 writer + 1 tester`.
-- `impl` — `scripts/message/top_level.py`, `commands/notify_top_level.md`
-- `test` — `scripts/message/test_top_level.py`, written from the Spec alone
-
-**Constraints from prior phases:**
-- Phase 19: `forwarded_sessions(me, sessions_dir, unit)` (`top_level.py:53`) returns `(name, session_id)` for each live, non-unit session and leaves this session out by `CLAUDE_CODE_SESSION_ID`, or by name when that is unset; `main` (`top_level.py:76`) records each one as a hold recipient through `build_hold.py record-recipient` and returns 1 when a record fails. The build-hold release itself never uses the broadcast.
-- Tests never write `~/.claude/sessions` or send a real message.
-
-**Acceptance gate:** `python3 -m unittest discover -s scripts/message -p 'test_top_level.py'` and `python3 -m unittest discover -s scripts/build_hold -p 'test_*.py'` green; `basedpyright` 0 errors and 0 warnings on changed Python. `basedpyright` exits 3 in every checkout of this repository because `pyrightconfig.json` names a `.venv` none has; that exit alone does not fail the gate when its output reports 0 errors and 0 warnings.
+**Gotchas:** a record whose `messagingSocketPath` is set counts as addressable even when the socket file is gone, because `top_level.py` keys on the path and judges liveness by the pid's `procStart`; `sessions.py` treats the same record as not live.
 
 ### Phase 21 — The build report says how current CI is, and its p95 · status: todo
 

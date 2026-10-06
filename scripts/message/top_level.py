@@ -1,9 +1,7 @@
 #!/usr/bin/env python3
-"""Print the top-level Claude sessions on this machine, one name per line.
+"""Print each other top-level Claude session's name and messaging address.
 
-  top_level.py --self NAME
-
-Top level is every live session except NAME and the unit directors a showrunner
+Top level is every live session except this session and the unit directors a showrunner
 launched. A unit director runs in a tmux session carrying UNIT_MARK (set by
 /showrunner:produce at launch); its showrunner passes messages on to it.
 
@@ -18,12 +16,13 @@ import os
 import subprocess
 import sys
 from collections.abc import Callable
+from dataclasses import dataclass
 from pathlib import Path
 from typing import TypedDict, cast
 
 SESSIONS_DIR = Path.home() / ".claude" / "sessions"
 UNIT_MARK = "SHOWRUNNER_UNIT"
-USAGE = "usage: top_level.py --self NAME"
+USAGE = "usage: top_level.py"
 
 
 class Session(TypedDict, total=False):
@@ -32,6 +31,23 @@ class Session(TypedDict, total=False):
     name: str
     tmux: str
     sessionId: str
+    messagingSocketPath: str
+
+
+@dataclass(frozen=True, slots=True)
+class AddressableSession:
+    name: str
+    session_id: str
+    address: str
+
+
+@dataclass(frozen=True, slots=True)
+class UnaddressableSession:
+    name: str
+    session_id: str
+
+
+ForwardedSession = AddressableSession | UnaddressableSession
 
 
 def proc_start(pid: int) -> str | None:
@@ -50,8 +66,8 @@ def is_unit(tmux_target: str) -> bool:
     return result.returncode == 0 and result.stdout.startswith(f"{UNIT_MARK}=")
 
 
-def forwarded_sessions(me: str, sessions_dir: Path = SESSIONS_DIR, unit: Callable[[str], bool] = is_unit) -> list[tuple[str, str]]:
-    sessions: list[tuple[str, str]] = []
+def forwarded_sessions(sessions_dir: Path = SESSIONS_DIR, unit: Callable[[str], bool] = is_unit) -> list[ForwardedSession]:
+    sessions: list[ForwardedSession] = []
     own_id = os.environ.get("CLAUDE_CODE_SESSION_ID", "")
     for path in sessions_dir.glob("*.json"):
         try:
@@ -60,33 +76,47 @@ def forwarded_sessions(me: str, sessions_dir: Path = SESSIONS_DIR, unit: Callabl
             continue
         name, pid = session.get("name", ""), session.get("pid")
         session_id = session.get("sessionId", "")
-        if not name or not session_id or (session_id == own_id if own_id else name == me) or pid is None or proc_start(pid) != session.get("procStart"):
+        if not name or not session_id or session_id == own_id or pid is None or proc_start(pid) != session.get("procStart"):
             continue
         tmux = session.get("tmux")
         if tmux and unit(tmux):
             continue
-        sessions.append((name, session_id))
-    return sorted(sessions)
-
-
-def top_level(me: str, sessions_dir: Path = SESSIONS_DIR, unit: Callable[[str], bool] = is_unit) -> list[str]:
-    return sorted({name for name, _ in forwarded_sessions(me, sessions_dir, unit)})
+        socket_path = session.get("messagingSocketPath")
+        if isinstance(socket_path, str) and socket_path:
+            sessions.append(AddressableSession(name, session_id, f"uds:{socket_path}"))
+        else:
+            sessions.append(UnaddressableSession(name, session_id))
+    return sorted(
+        sessions,
+        key=lambda session: (
+            session.name,
+            session.address if isinstance(session, AddressableSession) else "",
+            session.session_id,
+        ),
+    )
 
 
 def main(argv: list[str]) -> int:
-    if len(argv) != 2 or argv[0] != "--self" or not argv[1]:
+    if argv:
         print(USAGE, file=sys.stderr)
         return 2
+    if not os.environ.get("CLAUDE_CODE_SESSION_ID"):
+        print("top_level: CLAUDE_CODE_SESSION_ID is unset, so this session cannot be left out", file=sys.stderr)
+        return 2
     sessions_dir = Path(os.environ.get("NOTIFIER_SESSIONS_DIR", str(Path.home() / ".claude" / "sessions")))
-    recipients = forwarded_sessions(argv[1], sessions_dir)
+    sessions = forwarded_sessions(sessions_dir)
+    recipients = [session for session in sessions if isinstance(session, AddressableSession)]
+    for session in sessions:
+        if isinstance(session, UnaddressableSession):
+            print(f"not reachable: {session.name} [{session.session_id}] has no messaging socket", file=sys.stderr)
     hold_script = Path(__file__).resolve().parent.parent / "build_hold" / "build_hold.py"
-    for name, session_id in recipients:
-        result = subprocess.run([sys.executable, str(hold_script), "record-recipient", "--session-id", session_id, "--name", name], capture_output=True)
+    for session in recipients:
+        result = subprocess.run([sys.executable, str(hold_script), "record-recipient", "--session-id", session.session_id, "--name", session.name], capture_output=True)
         if result.returncode != 0:
-            print(f"could not record recipient {name} [{session_id}]", file=sys.stderr)
+            print(f"could not record recipient {session.name} [{session.session_id}]", file=sys.stderr)
             return 1
-    for name in sorted({name for name, _ in recipients}):
-        print(name)
+    for session in recipients:
+        print(f"{session.name}\t{session.address}")
     return 0
 
 
