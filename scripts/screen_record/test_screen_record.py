@@ -20,6 +20,7 @@ REAL_TIMEOUT = shutil.which("timeout")
 STUB_BODY = r'''
 import json
 import os
+import signal
 import sys
 import time
 from pathlib import Path
@@ -61,11 +62,15 @@ elif name == "ffmpeg":
     with clip.open("wb") as output:
         output.truncate(settings.get("file_size", 1000))
     if settings.get("hang"):
+        if settings.get("ignore_term"):
+            signal.signal(signal.SIGTERM, signal.SIG_IGN)
         time.sleep(60)
     sys.exit(settings.get("ffmpeg_exit", 0))
 elif name == "timeout":
     if settings.get("short"):
         args[1] = "1"
+    if settings.get("short_kill_after"):
+        args[0] = "--kill-after=1"
     executable = settings["real_timeout"]
     os.execv(executable, [executable, *args])
 '''
@@ -346,6 +351,18 @@ class ScreenRecordTests(unittest.TestCase):
         self.assertEqual(self.calls_for("timeout")[0][:3], ["--kill-after=5", "17", "ffmpeg"])
         self.assertIn("outer timeout at 17 s", result.stderr)
         self.assertEqual(result.stdout, "")
+        self.assertEqual(list(self.clips.glob("*.mp4")), [])
+
+    def test_timeout_kill_step_signal_death_exits_like_137(self) -> None:
+        self.settings["ffmpeg_exit"] = 137
+        expected = self.run_script("--window", "debug", "--seconds", "2")
+        self.assertEqual(expected.returncode, 3, expected.stderr)
+        self.assertEqual(list(self.clips.glob("*.mp4")), [])
+
+        self.settings.update({"hang": True, "ignore_term": True, "short": True, "short_kill_after": True})
+        result = self.run_script("--window", "debug", "--seconds", "2")
+        self.assertEqual((result.returncode, result.stdout, result.stderr),
+                         (expected.returncode, expected.stdout, expected.stderr))
         self.assertEqual(list(self.clips.glob("*.mp4")), [])
 
     def test_prunes_clips_older_than_seven_days(self) -> None:
