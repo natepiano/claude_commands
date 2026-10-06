@@ -49,6 +49,9 @@ CONTEXT_SECTION = "claude.context"
 # early, and warning early costs a sentence while warning late costs the handoff.
 FALLBACK_CONTEXT_TOKENS = 200_000
 
+# Marks a transcript line that copies the already-billed system prompt.
+PROMPT_SNAPSHOT_MARKER = '"type":"prompt_snapshot"'
+
 # What an explicit `[1m]` suffix on a model id means to the CLI. Suffix
 # semantics, not a model listing, so it stays in code.
 SUFFIX_1M_TOKENS = 1_000_000
@@ -261,7 +264,13 @@ def read_context_rules() -> tuple[int, dict[str, ContextRule]]:
     try:
         text = path.read_text(encoding="utf-8")
     except OSError:
-        return FALLBACK_CONTEXT_TOKENS, {}
+        # An override that has gone away -- a deleted scratch copy a long-lived
+        # `--bg` daemon still names -- falls back to the default registry, not
+        # to the small window.
+        try:
+            text = DEFAULT_AGENTS_CONFIG_PATH.read_text(encoding="utf-8")
+        except OSError:
+            return FALLBACK_CONTEXT_TOKENS, {}
     default = FALLBACK_CONTEXT_TOKENS
     rules: dict[str, ContextRule] = {}
     in_section = False
@@ -411,7 +420,14 @@ def read_tail(path: Path, size: int) -> list[str]:
 
 
 def pending_line_bytes(text: str) -> int:
-    """A pending line's contribution, with base64 media priced as images."""
+    """A pending line's contribution, with base64 media priced as images.
+
+    A `prompt_snapshot` line is a transcript-only copy of the system prompt and
+    tool list, already billed, so it contributes nothing. Counting it put a
+    seat at 135,812 tokens while its next request billed 86,392 (2026-10-06).
+    """
+    if PROMPT_SNAPSHOT_MARKER in text:
+        return 0
     if len(text) < 4096:
         return len(text) + 1
     stripped, images = BASE64_RUN.subn("", text)

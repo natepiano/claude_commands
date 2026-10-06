@@ -232,7 +232,8 @@ Every length keeps the same template; only the `update:` text grows. An
 
 For every length:
 - **One phase per unit.** The heading names one phase: the oldest one not yet
-  merged (`/showrunner:produce` → Rules: one phase at a time). A held
+  merged (`/showrunner:produce` → Rules: parallel by default); `update` names
+  any other phase running beside it, with `because`. A held
   checkpoint keeps its phase in the heading until it merges.
 - **Say why it is held.** Whenever a checkpoint waits unmerged, `held` gives
   the reason. The renderer refuses a unit without the field. Give examples

@@ -93,7 +93,7 @@ State:
   own message — send the unit director `From the showrunner: run /unit:eta (or read ~/.claude/commands/unit/eta.md if it is not in your skill list)` by SendMessage, in that same
   turn. Ask once per phase; ask again only if it answered without a time. Until
   it answers, report that ETA as `none measured - requested`.
-- **Waiting on block.** After the footer, leave two empty lines, write `Waiting on:`, leave one empty line, then write one `* ` bullet per item. Put the user's items first. Name each item by what it is and what it is doing, never by a task, agent or session id. Every item not waiting on the user ends with its ETA in `ZONE`, from measured runs (`CI on widget's tooltip work, ETA 13:03 PDT (12:50–13:19)`), or `no ETA measured`; never an item alone. User, 2026-10-06.
+- **Waiting on block.** After the footer, leave two empty lines, write `Waiting on:`, leave one empty line, then write one `* ` bullet per item. The user's items come first. Every other item leads with its ETA from measured runs, without the zone, soonest first: `19:45 (18:20–23:55) - startup Phase 16`; items with none follow, led by `no ETA measured - `. Name each item by what it is and what it is doing, never by a task, agent or session id. User, 2026-10-06.
 - **Footer.** Paste the output of
   `python3 ~/.claude/scripts/production/dailies_render.py --footer --zone <ZONE>`,
   word for word before the Waiting on block. It starts with a blank line and `---`, then
@@ -226,6 +226,7 @@ For each unit without a live unit director:
      `tmux new-session -d -s <session> -c <worktree> -e SHOWRUNNER_UNIT=<slug> zsh -ic "ENABLE_TOOL_SEARCH=true command claude --remote-control <session> -n <session> --settings '{\"disableAgentView\": true}' '/unit:delegate <unit plan>'; exec zsh"`
 3. **Check.** Log the launch only after the pane shows `/remote-control is
    active`. The mobile session list lags by minutes; trust the pane.
+   Run `$HOME/.claude/scripts/lib/py $HOME/.claude/scripts/production/showrunners.py add <this session's name> --zone <zone> --unit <session>`.
 4. **Resume.** To bring back a unit director whose session ended, use
    `claude --resume <session-id> --remote-control <session> -n <session>`, which
    keeps its link and its place in the list.
@@ -257,7 +258,10 @@ Run these steps at the start and on every resume:
    $HOME/.claude/scripts/production/production_check.sh <absolute doc path>"`,
    plus `--aligned` when that line says on the hour. A repeated `new` retargets
    without moving the clock.
-4. **Status.** Run `NOTIFIER status UPDATES` for the next tick and fire log.
+   Run `$HOME/.claude/scripts/lib/py $HOME/.claude/scripts/production/showrunners.py add <this session's name> --zone <zone> --unit <each unit's tmux session>`, using the name from ListAgents.
+4. **Stall watch.** If `NOTIFIER status stall-watch` reports no instance, run
+   `NOTIFIER new stall-watch --every 1 --run "$HOME/.claude/scripts/lib/py $HOME/.claude/scripts/production/stall_watch.py"`.
+5. **Status.** Run `NOTIFIER status UPDATES` for the next tick and fire log.
    The declared job runs the ticks.
 
 The prompt:
@@ -303,8 +307,7 @@ script, and then runs `NOTIFIER restart UPDATES` so the next tick comes N minute
 that report (`/showrunner:dailies` → Status check and clock).
 `/showrunner:interval <minutes>` changes N.
 
-Log `UPDATES` and its `next_due`. Then check that this session is on
-the quota alert list (<QuotaAlert/>).
+Log `UPDATES` and its `next_due`. Read the quota alert protocol (<QuotaAlert/>).
 
 Each run of the script does two things:
 - It scans every unit director for a form or decision waiting on the user.
@@ -730,9 +733,9 @@ it needs. Every other wait is yours to clear, and fast.
    A longer wait needs a logged reason. In the dailies, the waiting unit's
    `update` names the wait with its start and clear times.
 
-   While it waits, give the waiting unit other work inside its current phase:
-   its fix built in a scratch copy, tests, docs or research. Never its next
-   phase (Rules: one phase at a time).
+   While it waits, start the waiting unit's next phase that does not need the
+   wait (Rules: parallel by default); else work inside its current phase: its
+   fix built in a scratch copy, tests, docs or research.
 5. **Two things still go to the user:** a wait that clears only by changing what
    ships, and approvals that belong in a unit director's own session.
 6. **A block on the user is still yours** (user, 2026-10-03, after trunk sat
@@ -882,9 +885,7 @@ them, how to tell the three kinds apart, and what a receiver does are in
 `~/.claude/docs/quota_alerts.md`. Read it at <StartUpdates/> and follow it; this
 section adds only what the showrunner role needs.
 
-**The list.** At <StartUpdates/>, check that this session's name, as ListAgents
-gives it for "This session is", is in the `notify` list the doc names. The user
-keeps the list: if the name is missing, tell them once; never edit the file.
+This session is on the quota alert list because <StartUpdates/> adds it.
 
 **Unit directors act through you.** They are not on the list, so each notice
 reaches them only as your relay (<Throughout/>):
@@ -920,7 +921,8 @@ When every unit's final-gate and as-built checkpoints are merged:
      `git -C CHECKOUT ls-remote --exit-code --heads origin <branch>` finds it.
 
    Leave the tmux sessions; the user closes them.
-4. Remove the update instance: `NOTIFIER remove UPDATES`.
+4. Remove the update instance with `NOTIFIER remove UPDATES`, then run
+   `$HOME/.claude/scripts/lib/py $HOME/.claude/scripts/production/showrunners.py remove <this session's name>`.
 5. Set the doc's status to `wrapped`, commit it as
    `production(<name>): wrapped`, and push.
 6. Report:
@@ -952,10 +954,21 @@ When every unit's final-gate and as-built checkpoints are merged:
   `docs/design-decisions.md`, the plan and the as-built docs; if intent stays
   unclear, keep it. When the user overrules a ruling or settles intent, add the
   entry there. User, 2026-10-04, after two such rulings were reversed.
-- **One phase at a time.** A unit starts phase N+1 only after phase N is merged
-  into the merge branch. A held checkpoint is fixed inside phase N; the unit
-  never builds the next phase on top of it. User rule 2026-10-01: widget ran
-  Phases 29 and 30 at once, and the dailies could not say which phase it was in.
+- **Parallel by default.** Plan for parallelism; the user never has to find it.
+  Every phase that can run safely runs now. At each ETA, notice or new item, ask
+  which waiting work could start, and start it unasked:
+  - A unit's later phase runs beside its current one, with its own seats, berth
+    reservation and checkpoint. A checkpoint commits only its own phase's paths.
+    Where files overlap, it claims after the earlier phase and builds on its tree.
+  - Gates run side by side: review, live check, shots and design check run
+    alongside the final lint and tests, with one repair round for all findings.
+    A code change reruns lint and test before the checkpoint.
+  - New work goes to whichever unit can start it soonest, not to the owner's
+    queue, when its files can be fenced through berth.
+  - A held checkpoint is fixed inside its own phase. Dailies name the oldest
+    unmerged phase, with the others in `update`. If builds queue on the shared
+    lock, run fewer at once, never none. User, 2026-10-06, replacing the
+    2026-10-01 one-phase rule.
 - **Disk.** Units keep saved run output under a few GB (`/unit:delegate` →
   <ToolingContract/>). When builds turn cold for no reason, run `df -h /` and
   find the large output before anything else. User, 2026-10-04.

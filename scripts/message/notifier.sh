@@ -15,7 +15,7 @@ SESSIONS_DIR=${NOTIFIER_SESSIONS_DIR:-$HOME/.claude/sessions}
 NOW=${NOTIFIER_NOW_EPOCH:-$EPOCHSECONDS}
 
 die() { print -u2 -r -- "notifier.sh: $*"; exit 2 }
-usage() { die 'usage: notifier.sh new <instance> --to <target> --every <min> (--command <text> | --prompt-file <path>) [--from <sender>] [--check <cmd>] [--hold] [--aligned] [--timeout <s>]; start|stop|status|fire|restart|remove|health <instance>; interval <instance> <min>; align <instance> on|off; status|tick' }
+usage() { die 'usage: notifier.sh new <instance> --every <min> (--run <cmd> | --to <target> (--command <text> | --prompt-file <path>)) [--from <sender>] [--check <cmd>] [--hold] [--aligned] [--timeout <s>]; start|stop|status|fire|restart|remove|health <instance>; interval <instance> <min>; align <instance> on|off; status|tick' }
 
 [[ $NOW == <0-> ]] || die "invalid clock: $NOW"
 
@@ -49,6 +49,7 @@ write_conf() {
     print -r -- "EVERY=${conf[EVERY]}"
     [[ -n ${conf[COMMAND]:-} ]] && print -r -- "COMMAND=${conf[COMMAND]}"
     [[ -n ${conf[PROMPT_FILE]:-} ]] && print -r -- "PROMPT_FILE=${conf[PROMPT_FILE]}"
+    [[ -n ${conf[RUN]:-} ]] && print -r -- "RUN=${conf[RUN]}"
     print -r -- "FROM=${conf[FROM]}"
     print -r -- "CHECK=${conf[CHECK]:-}"
     print -r -- "HOLD=${conf[HOLD]}"
@@ -109,19 +110,20 @@ log_error() { print -r -- "$fired | $1" >> "$STATE_DIR/notifier.log" }
 
 cmd_new() {
   (( $# >= 2 )) || usage
-  local name=$1 dir lock_fd target='' every='' command='' prompt_file='' sender='' check='' hold=0 align=0 timeout=120
-  local command_given=0 prompt_given=0
+  local name=$1 dir lock_fd target='' every='' command='' prompt_file='' run='' sender='' check='' hold=0 align=0 timeout=120
+  local command_given=0 prompt_given=0 run_given=0
   shift
   valid_name "$name"
   while (( $# )); do
     case $1 in
-      --to|--every|--command|--prompt-file|--from|--check|--timeout)
+      --to|--every|--command|--prompt-file|--run|--from|--check|--timeout)
         (( $# >= 2 )) || usage
         case $1 in
           --to) target=$2 ;;
           --every) every=$2 ;;
           --command) command=$2; command_given=1 ;;
           --prompt-file) prompt_file=$2; prompt_given=1 ;;
+          --run) run=$2; run_given=1 ;;
           --from) sender=$2 ;;
           --check) check=$2 ;;
           --timeout) timeout=$2 ;;
@@ -132,9 +134,14 @@ cmd_new() {
       *) usage ;;
     esac
   done
-  [[ -n $target ]] || usage
   valid_minutes "$every"
-  (( command_given + prompt_given == 1 )) || usage
+  if (( run_given )); then
+    [[ -n $run && -z $target && -z $sender && -z $check ]] || usage
+    (( ! command_given && ! prompt_given && ! hold && ! align )) || usage
+  else
+    [[ -n $target ]] || usage
+    (( command_given + prompt_given == 1 )) || usage
+  fi
   (( command_given )) && [[ -z $command ]] && usage
   (( prompt_given )) && [[ -z $prompt_file ]] && usage
   [[ $timeout == <1-> ]] || die "timeout must be whole seconds above 0: $timeout"
@@ -148,6 +155,7 @@ cmd_new() {
   conf=(TARGET "$target" EVERY "$every" FROM "$sender" CHECK "$check" HOLD "$hold" ALIGN "$align" TIMEOUT "$timeout")
   (( command_given )) && conf[COMMAND]=$command
   (( prompt_given )) && conf[PROMPT_FILE]=$prompt_file
+  (( run_given )) && conf[RUN]=$run
   write_conf
   if [[ ! -e $dir/state ]]; then
     state=(ENABLED 1 NEXT_DUE 0 LAST_SENT 0 LAST_RESTART 0 LAST_TARGET '')
@@ -192,7 +200,7 @@ cmd_state() {
 instance_tick() {
   local name=$1 forced=$2 show_next=$3 dir lock_fd fired result rc socket
   local check_pid watchdog_pid timeout_marker
-  local -a check_words send_args
+  local -a check_words run_words send_args
   typeset -A conf state
   dir=$(instance_dir "$name")
   [[ -r $dir/conf && -r $dir/state ]] || return 0
@@ -207,6 +215,32 @@ instance_tick() {
   (( show_next )) && next_line
   zsystem flock -u "$lock_fd"
   fired=$(fired_stamp)
+
+  if [[ -n ${conf[RUN]:-} ]]; then
+    run_words=(${(Q)${(z)conf[RUN]}})
+    timeout_marker="$dir/.run-timeout.$$.$RANDOM"
+    "${run_words[@]}" > "$dir/run.log" 2>&1 &
+    check_pid=$!
+    (
+      zselect -t "$(( conf[TIMEOUT] * 100 ))" >/dev/null 2>&1
+      if kill -0 "$check_pid" 2>/dev/null; then
+        : > "$timeout_marker"
+        kill -TERM "$check_pid" 2>/dev/null
+      fi
+    ) &
+    watchdog_pid=$!
+    wait "$check_pid"
+    rc=$?
+    kill -TERM "$watchdog_pid" 2>/dev/null
+    wait "$watchdog_pid" 2>/dev/null
+    if [[ -e $timeout_marker ]]; then
+      rm -f -- "$timeout_marker"
+      print -r -- "$fired | run timeout" >> "$dir/fire.log"
+    elif (( rc != 0 )); then
+      print -r -- "$fired | run exit $rc" >> "$dir/fire.log"
+    fi
+    return 0
+  fi
 
   if [[ -n ${conf[CHECK]:-} ]]; then
     check_words=(${(Q)${(z)conf[CHECK]}})
@@ -303,7 +337,11 @@ cmd_status() {
   [[ ${state[ENABLED]:-0} == 1 ]] && mode=enabled
   local aligned=''
   [[ ${conf[ALIGN]:-0} == 1 ]] && aligned=' on the clock'
-  print -r -- "$name → ${conf[TARGET]} every ${conf[EVERY]} min$aligned, $mode"
+  if [[ -n ${conf[RUN]:-} ]]; then
+    print -r -- "$name runs ${conf[RUN]} every ${conf[EVERY]} min, $mode"
+  else
+    print -r -- "$name → ${conf[TARGET]} every ${conf[EVERY]} min$aligned, $mode"
+  fi
   next_line
   time_line last_sent "${state[LAST_SENT]}"
   time_line last_restart "${state[LAST_RESTART]}"
@@ -367,7 +405,7 @@ cmd_health() {
 
 cmd_tick() {
   local tick_fd dir name
-  typeset -A state
+  typeset -A state conf
   [[ -d $STATE_DIR ]] || mkdir -p -- "$STATE_DIR" || return 0
   [[ -e $STATE_DIR/.tick.lock ]] || : > "$STATE_DIR/.tick.lock"
   zsystem flock -t 0 -f tick_fd "$STATE_DIR/.tick.lock" || return 0
@@ -378,7 +416,14 @@ cmd_tick() {
     [[ ${state[ENABLED]:-0} == 1 && ${state[NEXT_DUE]:-0} == <0-> ]] || continue
     (( NOW >= state[NEXT_DUE] )) || continue
     name=${dir:t}
-    ( instance_tick "$name" 0 0 || { fired=$(fired_stamp); log_error "tick failed: $name"; } ) &
+    read_conf
+    if [[ -n ${conf[RUN]:-} ]]; then
+      # Run-only jobs own their watchdog and fire log after this tick returns.
+      ( instance_tick "$name" 0 0 || { fired=$(fired_stamp); log_error "tick failed: $name"; } ) \
+        >/dev/null 2>&1 &!
+    else
+      ( instance_tick "$name" 0 0 || { fired=$(fired_stamp); log_error "tick failed: $name"; } ) &
+    fi
   done
   wait
   zsystem flock -u "$tick_fd"
