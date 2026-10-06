@@ -258,14 +258,10 @@ def waiting_format_error(bullets: list[str], now: datetime) -> str | None:
 def block_reason(instance_dirs: list[str], reply: str,
                  states: dict[str, FooterState]) -> str | None:
     productions = [production for path in instance_dirs if (production := read_production(Path(path))) is not None]
-    if not productions:
+    if not productions or all(states[production.slug] is FooterState.OFF for production in productions):
         return None
     lines = reply_lines(reply)
     waiting = waiting_bullets(lines)
-    if waiting is None and all(states[production.slug] is FooterState.OFF for production in productions):
-        return ("Waiting on block missing or malformed; footers are off "
-                "(/showrunner:footer on turns them back on). End with two empty lines, "
-                "`Waiting on:`, an empty line, then `* <item>` bullets.")
     footer_lines, bullets = waiting if waiting is not None else ([], [])
     if waiting is not None:
         for production in productions:
