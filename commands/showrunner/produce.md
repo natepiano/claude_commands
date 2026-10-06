@@ -95,12 +95,19 @@ State:
   own message — send the unit director `From the showrunner: run /unit:eta (or read ~/.claude/commands/unit/eta.md if it is not in your skill list)` by SendMessage, in that same
   turn. Ask once per phase; ask again only if it answered without a time. Until
   it answers, report that ETA as `none measured - requested`.
-- **Every turn ends with** `— waiting on: <items>`, the user's items first. Name each item by what it is and what it is doing, never by a task, agent or session id.
-- **Footer.** Every reply to the user ends with the output of
+- **Waiting on block.** After the footer, leave two empty lines, write `Waiting on:`, leave one empty line, then write one `* ` bullet per item. Put the user's items first. Name each item by what it is and what it is doing, never by a task, agent or session id.
+- **Footer.** Paste the output of
   `python3 ~/.claude/scripts/production/dailies_render.py --footer --zone <ZONE>`,
-  pasted word for word, with:
-  - `--next-run <HH:MM>`: `next_due` from `NOTIFIER status UPDATES` in `ZONE`,
-    never from memory (user, 2026-10-02); left out when no schedule runs.
+  word for word before the Waiting on block. It starts with a blank line and `---`, then
+  `HH:MM <zone> update:` and a blank line. Its `* ` bullets list each build
+  hold, each agent in the dailies report's words, then
+  `next dailies: HH:MM <zone>` or `no dailies scheduled`. A later day's
+  schedule includes its weekday. The last bullet ends ` - nothing needed`
+  when it applies. Put outstanding items in the Waiting on block, user's
+  first. Pass:
+  - `--next-run <HH:MM[+N]>`: `next_due` from `NOTIFIER status UPDATES` in
+    `ZONE`, with `+N` when it falls N days later, never from memory (user,
+    2026-10-02); leave it out when no schedule runs.
   - Build holds come from the holder files in `~/.local/state/build-hold/`:
     one line per active holder, including after a partial release. In a dailies
     input, mark `units[i].build_hold: true` when you told that unit director to
@@ -115,10 +122,33 @@ State:
     when the user addresses it and tells you. An entry the user defers gets
     `"after": "YYYY-MM-DDTHH:MM"` (local) and stays hidden until then. User, 2026-10-05.
 
-  It prints `build hold: <holder> since 11:34 PDT, for the frame-time lane's breakdown
-  of what each added tool costs - release eta: 11:40 PDT (3 minutes)` while a
-  hold runs, then `11:37 PDT · next dailies 11:53 PDT - nothing needed`. A
-  dailies report ends with the same file-backed footer. User, 2026-10-04.
+  `scripts/hooks/stop-showrunner-footer.py` checks each reply in the session
+  targeted by `UPDATES` (<StartUpdates/> step 3). It uses the production doc's
+  running status and `ZONE`, notifier `next_due`, and `OUTSTANDING`. When the
+  footer's last bullet ends ` - nothing needed`, it passes `--nothing-needed`.
+  When the footer's update minute is at most five minutes old, it renders
+  with `--at` for that minute and its zone occurrence. A missing or outdated
+  footer or Waiting on block blocks the reply with the exact footer lines and
+  Waiting on shape. End the reply with those lines and the Waiting on block.
+  The hook passes a reply after any Stop-hook block and passes on errors.
+
+  Example with a hold and an active agent (user, 2026-10-04):
+
+  ```text
+
+  ---
+  11:37 PDT update:
+
+  * build hold: <holder> since 11:34 PDT, for the frame-time lane's breakdown of what each added tool costs - release eta: 11:40 PDT (3 minutes)
+  * claude 1: …
+  * next dailies: 11:53 PDT - nothing needed
+
+
+  Waiting on:
+
+  * <item>
+  ```
+  A dailies report ends with the same footer.
 </Throughout>
 
 ---
@@ -858,7 +888,7 @@ keeps the list: if the name is missing, tell them once; never edit the file.
 reaches them only as your relay (<Throughout/>):
 - `Quota alert:` — tell every unit director to start no new delegate work on
   that tool; running seats finish and the unit director does the rest itself. Hold the alert as one
-  item per account, listed first in every `— waiting on:` with the percent left
+  item per account, listed first in every Waiting on block with the percent left
   and the reset time, until it is acknowledged or restored.
 - `Quota alert acknowledged:` — drop the held item. Paused work stays paused.
 - `Quota restored:` — tell every unit director delegation on that tool can

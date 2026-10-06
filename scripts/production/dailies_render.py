@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """Render the /showrunner:dailies report from its fixed template.
 
-Usage: dailies_render.py [<input.json>] [--chart default|ascii] [--state <state.json>] [--log <log.md>] [--at <YYYY-MM-DDTHH:MM>]
-       dailies_render.py --footer --zone <IANA zone> [--next-run <HH:MM>]
-                         [--nothing-needed] [--at <YYYY-MM-DDTHH:MM>]
+Usage: dailies_render.py [<input.json>] [--chart default|ascii] [--state <state.json>] [--log <log.md>] [--at <YYYY-MM-DDTHH:MM[±HH:MM]>]
+       dailies_render.py --footer --zone <IANA zone> [--next-run <HH:MM[+N]>]
+                         [--nothing-needed] [--at <YYYY-MM-DDTHH:MM[±HH:MM]>]
 Both forms take [--outstanding <outstanding.json>].
 
 The input gives each subject's fields; this script owns the layout, so no line
@@ -25,15 +25,19 @@ production's own plumbing words (PLUMBING).
          only the first time,
          then saves this report's values to it.
 --log    appends the `dailies ETAs:` line to this file.
---at     renders as if the clock read this local time (for checks).
+--at     renders as if the clock read this local time (for checks); an offset
+         identifies an occurrence in a repeated hour.
 --chart  sets the chart mode in CHART_CONF, which every showrunner's dailies
          read; with no input file it only sets the mode.
---footer prints only the footer every showrunner reply and every report ends
-         with (`footer`), at the current time in --zone. The hold lines come
-         from BUILD_HOLD_DIR or ~/.local/state/build-hold.
+--footer prints the separated bullet footer before every showrunner reply's
+         Waiting on block and at every report's end, at the current time in
+         --zone. Its Agents bullets
+         use the report's words. Hold lines come from BUILD_HOLD_DIR or
+         ~/.local/state/build-hold.
 --outstanding  JSON list of what waits on the user, `[{"since":
-         "YYYY-MM-DDTHH:MM", "text": "..."}]`; every footer lists it under
-         `waiting on you:`. A missing file is an empty list.
+         "YYYY-MM-DDTHH:MM", "text": "..."}]`; outstanding items suppress
+         ` - nothing needed` and belong in the showrunner's Waiting on block,
+         which this renderer does not print. A missing file is an empty list.
 
 The input format is in ~/.claude/commands/showrunner/dailies.md.
 """
@@ -1005,30 +1009,25 @@ def footer(
     now: datetime, zone: ZoneInfo, zone_name: str, next_run: str | None, hold: HoldState, outstanding: list[Outstanding], *,
     nothing_needed: bool, agent_lines: list[str]
 ) -> list[str]:
-    """One line per active holder, what waits on the user, then the time and next report."""
-    lines = [hold_line(holder, now, zone) for holder in hold.holders] if isinstance(hold, ActiveHolders) else []
+    """The separated update footer shared by replies and dailies reports."""
+    items = [hold_line(holder, now, zone) for holder in hold.holders] if isinstance(hold, ActiveHolders) else []
     if isinstance(hold, ActiveHolders):
         try:
             cycle = read_cycle()
         except ReleaseRecordReadError as error:
-            lines.append(f"  {release_record_error_line(error)}")
+            items.append(f"  {release_record_error_line(error)}")
         else:
             if cycle is not None and any(holder.name in cycle["holders"] for holder in hold.holders):
-                lines.extend(f"  {line}" for line in cycle_status_lines(cycle, now, zone))
-    if lines:
-        lines.append("")
-    lines.extend(agent_lines)
+                items.extend(f"  {line}" for line in cycle_status_lines(cycle, now, zone))
+    items.extend(line.removeprefix("- ") for line in agent_lines if line and line != "### Agents")
     # An item the user deferred stays hidden until its `after` time, in the report's zone.
     local_now = now.astimezone(zone).replace(tzinfo=None) if now.tzinfo else now
     outstanding = [item for item in outstanding if item.after is None or item.after <= local_now]
-    if outstanding:
-        lines.append("waiting on you:")
-        lines.extend(f"- {item.text} (since {range_clock(item.since, now)})" for item in outstanding)
-        lines.append("")
-    schedule = f"next dailies {range_clock(parse_time(next_run, now), now)} {zone_name}" if next_run else "no dailies scheduled"
+    schedule = f"next dailies: {range_clock(parse_time(next_run, now), now)} {zone_name}" if next_run else "no dailies scheduled"
     quiet = nothing_needed and not outstanding
-    lines.append(f"{now:%H:%M} {zone_name} · {schedule}{' - nothing needed' if quiet else ''}")
-    return lines
+    items.append(f"{schedule}{' - nothing needed' if quiet else ''}")
+    return ["", "---", f"{now:%H:%M} {zone_name} update:", "",
+            *(f"{item[:2]}* {item[2:]}" if item.startswith("  ") else f"* {item}" for item in items)]
 
 
 def eta_text(unit: Unit, previous: Previous | None, now: datetime, zone_name: str, with_note: bool) -> str:
@@ -1140,9 +1139,10 @@ def local_now(zone: str, where: str, at: str | None) -> tuple[datetime, str]:
     except (ZoneInfoNotFoundError, ValueError):
         raise InputError(f"{where}: {zone!r} is not an IANA zone name") from None
     try:
-        aware = datetime.fromisoformat(at).replace(tzinfo=info) if at else datetime.now(info)
+        supplied = datetime.fromisoformat(at) if at else datetime.now(info)
+        aware = supplied.replace(tzinfo=info) if supplied.tzinfo is None else supplied.astimezone(info)
     except ValueError:
-        raise InputError(f"--at: {at!r} is not YYYY-MM-DDTHH:MM") from None
+        raise InputError(f"--at: {at!r} is not YYYY-MM-DDTHH:MM[±HH:MM]") from None
     return aware.replace(second=0, microsecond=0, tzinfo=None), aware.strftime("%Z")
 
 
@@ -1157,7 +1157,7 @@ def footer_main(zone: str, next_run: str | None, at: str | None, outstanding_pat
         print(f"dailies_render: {error}", file=sys.stderr)
         return 2
     print("\n".join(footer(now, ZoneInfo(zone), abbreviation, next_run, hold, outstanding,
-                           nothing_needed=nothing_needed, agent_lines=[])))
+                           nothing_needed=nothing_needed, agent_lines=agent_section(now, ZoneInfo(zone)))))
     return 0
 
 
@@ -1168,11 +1168,11 @@ def main(arguments: list[str]) -> int:
     _ = parser.add_argument("--state", type=Path)
     _ = parser.add_argument("--log", type=Path)
     _ = parser.add_argument("--at")
-    _ = parser.add_argument("--footer", action="store_true", help="print only the footer every showrunner reply and every report ends with")
+    _ = parser.add_argument("--footer", action="store_true", help="print the separated bullet footer, including the report's Agents lines")
     _ = parser.add_argument("--zone", help="with --footer: the production's zone, as an IANA name")
     _ = parser.add_argument("--next-run", help="with --footer: the next scheduled report, HH:MM or HH:MM+N; leave it out when none is scheduled")
     _ = parser.add_argument("--nothing-needed", action="store_true", help="with --footer: no subject needs a follow-up nobody has started")
-    _ = parser.add_argument("--outstanding", type=Path, help="JSON list of what waits on the user, shown in every footer")
+    _ = parser.add_argument("--outstanding", type=Path, help="JSON list of what waits on the user; suppresses nothing needed when due")
     options = parser.parse_args(arguments)
     input_path = cast(Path | None, options.input)
     chart = cast(str | None, options.chart)
