@@ -131,30 +131,38 @@ Baseline at 2026-10-06 08:39:09 PDT over hana clippy steps since 2026-10-02 09:0
 
 **Ruled out:** x86-64-v4 for 512-bit vectors, because its LLVM tuning keeps 256-bit `ymm` (0 `zmm` lines against 14 for znver5); only znver5/native emits `zmm`.
 
-### Phase 2 — The nightly release check builds with FMA like CI · status: todo
+### Phase 2 — The nightly release check builds with FMA like CI · status: done
 
-#### Work Order
+#### As-built
 
-**Blocked by:** G1.
+`trial_release()`'s clippy step in `scripts/buildlog/rust_release.py:356` runs with `CARGO_INCREMENTAL=0` and `CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS` set to `"-C link-arg=-fuse-ld=mold -C target-cpu=x86-64-v3"`, byte-identical to hana `origin/init/catalyst:.github/workflows/ci.yml:77`; `origin/main` keeps the mold-only string until catalyst merges. `test_rust_release.py:272` asserts that string on the recorded clippy call's environment; the 28 tests pass, and basedpyright reports 0 errors, 0 warnings, 0 notes on both files. The flag changes the clippy build's target hash; the release clone's target is fresh each run, so no cache is lost.
 
-Work only in worktree `/home/natepiano/worktrees/claude-build-followups-mul-add`, branch `build-followups-mul-add`. State every time in PDT.
+The live run is deferred to the next nightly release check's clippy step, the first run with the new flags; its buildlog entry shows whether that step finished. A manual run is a full hana clippy build in a fresh clone.
 
-**Goal:** `rust_release.py`'s clippy run uses CI's new rustflags string, and a hana binary built after G1 shows the gain in real code.
+Real-code check, `objdump -d -C --no-show-raw-insn` counted per function, on two debug test binaries of the same crate in the same checkout, `~/rust/tool-based-ui-trunk`, one from each side of the user `~/.cargo/config.toml` change at 2026-10-06 09:45:18 PDT (its line 84: `[target.x86_64-unknown-linux-gnu] rustflags = ["-C", "target-cpu=x86-64-v3"]`). The crate metadata hash changes with the flags, and the after binary uses VEX encodings (`vmulss`).
 
-**Spec:**
-- `scripts/buildlog/rust_release.py:356`: the env value becomes `"-C link-arg=-fuse-ld=mold -C target-cpu=x86-64-v3"`, byte-identical to hana `origin/main` `ci.yml` (read it with `git -C ~/rust/hana show origin/main:.github/workflows/ci.yml`); `test_rust_release.py:272` expects the new string.
-- Real-code check (unit director, read-only): find a hana binary built after G1 cleared (a `target/debug/hana` or test binary under any `~/worktrees` or `~/rust` hana checkout, by mtime after G1's time) and one built before it; `objdump -d --no-show-raw-insn` each and count the instructions that reference `fmaf`/`fma` — a direct `call <fmaf>` and the address load before an indirect `call *%reg` (`fmaf@GOTPCREL` or objdump's `# … <fmaf>` comment), since Phase 1 found the default build calls through a register — and `vfmadd` instructions. Report both counts for both binaries and their paths and mtimes. Count per function and leave out `compiler_builtins` symbols: Rust's runtime `fmaf_with_fma`/`fma_with_fma` hold `vfmadd` in every build, so a whole-binary count proves nothing. Also name one hana function that calls `mul_add` and quote its instructions from both binaries. When no hana binary from before G1 survives the organic rebuild, Phase 1's `default` binary (`fma_proof/default`, if still present) or a fresh `rustc -O` build of `fma.rs` without the flag is the before control; say which.
-- **Constraints from prior phases:** on natedev, `CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS` joins the user `~/.cargo/config.toml` table, so after G1 `rust_release.py`'s clippy run passes each flag twice with the same values; that is expected, not a failure. CI's environment string alone passes each once (Phase 1). The default build's `fmaf` is Rust's `compiler_builtins` dispatcher, called through a register after a `fmaf@GOTPCREL` load.
+| Binary | mtime (PDT) | `fmaf`/`fma` refs outside compiler_builtins | `vfmadd` outside compiler_builtins |
+| --- | --- | --: | --: |
+| before: `target/debug/deps/hana_diegetic-b1b1c996f3b409b2` | 2026-10-06 08:34:58 | 7 in 4 functions | 0 |
+| after: `target/debug/deps/hana_diegetic-4e978e40151ca765` | 2026-10-06 10:11:13 | 0 | 80 in 10 functions |
+
+- Before, refs per function: naga constant_evaluator math closure#35 3; `<f32>::mul_add` 1; `<f64>::mul_add` 2; `<glam::f32::vec2::Vec2>::mul_add` 1. compiler_builtins holds 2 `vfmadd` in 2 functions, the runtime `fmaf_with_fma`/`fma_with_fma`.
+- After, `vfmadd` per function: `<f32>::mul_add` 1; `<f64>::mul_add` 2; `<glam::f32::vec2::Vec2>::mul_add` 2; six `image::metadata::cicp::CicpRgb::cast_pixels_by_fallback::<…>` 12 each; `naga::proc::constant_evaluator::component_wise_float::<3, 1>` 3. No compiler_builtins fma symbol is linked.
+
+`hana_diegetic::render::fill_batch::dim_control_color` (`fill_batch.rs:2009`, `color.red.mul_add(0.2126, color.green.mul_add(0.7152, color.blue * 0.0722))`) calls `<f32>::mul_add` out of line twice in both binaries (`call <<f32>::mul_add>`; the after build has `vmulss` beside it). The callee:
+- before, `<f32>::mul_add` @5691b20: `push %rax` / `mov 0x51a0030(%rip),%rax  # <fmaf$got>` / `call *%rax` / `pop %rax` / `ret`
+- after, `<f32>::mul_add` @65f8af0: `vmovss %xmm1,-0x4(%rsp)` / `vmovaps %xmm0,%xmm1` / `vmovss -0x4(%rsp),%xmm0` / `vfmadd213ss %xmm2,%xmm1,%xmm0` / `ret`
 
 **Files:**
-- `scripts/buildlog/rust_release.py` — the env string.
-- `scripts/buildlog/test_rust_release.py` — the expected string.
+- `scripts/buildlog/rust_release.py` — the clippy step's rustflags string (line 356).
+- `scripts/buildlog/test_rust_release.py` — the expected string (line 272).
+- `docs/as-built/buildlog-tests-per-edit-rust-release.md` — the `clippy` step row (line 76) names the new string.
 
-**Seats:** 1 writer + 1 tester.
-`impl` — `scripts/buildlog/rust_release.py`.
-`test` — `scripts/buildlog/test_rust_release.py`. The objdump check is the unit director's.
-
-**Acceptance gate:** `python3 -m unittest discover -s scripts/buildlog -p 'test_rust_release.py'` green; basedpyright 0/0 on both files; outside `compiler_builtins`, the objdump counts show `fmaf`/`fma` references before G1 and none after, with `vfmadd` after, and the named hana function's quoted instructions show the same.
+**Gotchas:**
+- hana debug builds do not inline `mul_add`: callers call `<f32>::mul_add` out of line, so the per-function proof is in that callee, not the caller.
+- objdump on a linked binary names the GOT slot `<fmaf$got>`; `fmaf@GOTPCREL` is assembler text from `--emit=asm` and never appears in `objdump -d` output.
+- After the flag, compiler_builtins' `fmaf` is not linked at all, because nothing calls it; its absence is the expected state.
+- On natedev the clippy run passes each target flag twice with the same values, the environment string plus the user `~/.cargo/config.toml` table, by design; CI's environment alone passes each once.
 
 ### Phase 3 — Claude edits that leave a float multiply-add are told to write mul_add · status: todo
 

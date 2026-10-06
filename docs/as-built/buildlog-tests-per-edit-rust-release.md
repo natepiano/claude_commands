@@ -73,7 +73,7 @@ Otherwise `waiting_reason()` returns the first failing reason (`build hold activ
 | `toolchain` | `rustup toolchain install <ver> --profile minimal --component clippy --component rustc-dev` | 1800 s |
 | `clone` | `git clone --local --no-checkout ~/rust/hana <clone>` | 600 s |
 | `revision` | `git -C ~/rust/hana rev-parse origin/init/catalyst`, then `git -C <clone> checkout --detach <sha>` | 30 s, 600 s |
-| `clippy` | in the clone: `nix develop .#ci -c cargo +<ver> clippy --workspace --all-targets --all-features --message-format=json`, with `CARGO_INCREMENTAL=0` and `CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS="-C link-arg=-fuse-ld=mold"` | 7200 s |
+| `clippy` | in the clone: `nix develop .#ci -c cargo +<ver> clippy --workspace --all-targets --all-features --message-format=json`, with `CARGO_INCREMENTAL=0` and `CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS="-C link-arg=-fuse-ld=mold -C target-cpu=x86-64-v3"`, byte-identical to hana CI's (`docs/plans/build-followups-mul-add.md` Phase 2) | 7200 s |
 | `cargo-mend` | in the clone: `cargo +<ver> install --path ~/rust/cargo-liner/crates/cargo-mend --root <clone>/mend-root`, with `RUSTC_BOOTSTRAP=1` and `CARGO_TARGET_DIR=<clone>/mend-target` | 3600 s |
 
 - `run_process()` starts each step in its own session (`start_new_session=True`). On timeout it sends `SIGKILL` to the whole process group, then raises `TimeoutExpired`.
