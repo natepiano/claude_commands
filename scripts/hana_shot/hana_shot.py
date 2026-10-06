@@ -1325,9 +1325,9 @@ def format_view(name: str, view: ViewValue) -> str:
     table = cast(dict[str, object], cast(object, view))
     lines = [f"[views.{name}]"]
     width = max((len(key) for key in table), default=0)
-    for key in VIEW_KEYS:
-        if key in table:
-            lines.append(f"{key.ljust(width)} = {toml_value(table[key])}")
+    # Sorted, as taplo's reorder_keys leaves them, so a push's format pass never rewrites the file.
+    for key in sorted(table):
+        lines.append(f"{key.ljust(width)} = {toml_value(table[key])}")
     return "\n".join(lines) + "\n"
 
 
