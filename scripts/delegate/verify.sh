@@ -728,10 +728,78 @@ if [[ -n "${BOARD_DIR}" && -n "${BOARD_SLOT}" && -f "${BOARD_HELPER}" ]]; then
         --pid $$ --hold 3600 --wait 1800 >/dev/null 2>&1; then
         TOKEN_HELD=1
     else
-        echo "verify.sh: waited for the cargo token and did not get it; running anyway." >&2
+        echo "verify.sh: waited for the cargo token and did not get it." >&2
+        exit 1
     fi
     TOKEN_WAIT_S=$(( SECONDS - TOKEN_WAIT_STARTED ))
 fi
+
+# Fork before starting each step. The child creates its own session, records
+# its group leader under the token guard, and only then starts the command.
+# This also covers the first instant of a step, when a killed verify cannot
+# leave a command that a periodic process scan has not found yet.
+STEP_OWNER_PY='
+import fcntl
+import json
+import os
+from pathlib import Path
+import signal
+import subprocess
+import sys
+
+lock = Path(sys.argv[1])
+holder = sys.argv[2]
+command = sys.argv[3:]
+
+def identity(pid):
+    try:
+        fields = Path(f"/proc/{pid}/stat").read_text().rsplit(") ", 1)[1].split()
+        return fields[19]
+    except (OSError, IndexError):
+        return subprocess.check_output(["ps", "-p", str(pid), "-o", "lstart="],
+                                       text=True, stderr=subprocess.DEVNULL).strip()
+
+child = os.fork()
+if child:
+    def forward(signum, _frame):
+        try:
+            os.killpg(child, signum)
+        except ProcessLookupError:
+            # The child has not created its new group yet, or has exited.
+            try:
+                os.kill(child, signum)
+            except ProcessLookupError:
+                pass
+
+    for signum in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
+        signal.signal(signum, forward)
+    _, status = os.waitpid(child, 0)
+    sys.exit(os.waitstatus_to_exitcode(status))
+
+os.setsid()
+with (lock.parent / "cargo.guard").open("a+") as guard:
+    fcntl.flock(guard, fcntl.LOCK_EX)
+    if (lock / "holder_pid").read_text() != holder:
+        sys.exit(125)
+    record = lock / f"owned.{os.getpid()}.tmp"
+    record.write_text(json.dumps({"group": os.getpid(), "start": identity(os.getpid())}))
+    os.replace(record, lock / "owned")
+    fcntl.flock(guard, fcntl.LOCK_UN)
+
+sys.exit(subprocess.call(command))
+'
+
+# Preserve the shared invocation policy (including systemd scopes and its
+# fallback), changing only the command it launches while this token is held.
+eval "$(declare -f buildlog_exec | sed '1s/buildlog_exec/buildlog_exec_unowned/')"
+buildlog_exec() {
+    if [[ "${TOKEN_HELD}" -eq 1 ]]; then
+        buildlog_exec_unowned python3 -c "$STEP_OWNER_PY" \
+            "${BOARD_DIR}/locks/cargo.d" "$$" "$@"
+    else
+        buildlog_exec_unowned "$@"
+    fi
+}
 
 release_token() {
     [[ "${TOKEN_HELD}" -eq 1 ]] || return 0
@@ -806,7 +874,15 @@ verify_cleanup() {
 # EXIT alone would report success for a failed cargo run, so branch on the
 # status the trap receives; a lint failure record keeps it.
 trap 'EXIT_STATUS=$?; [[ ${EXIT_STATUS} -eq 0 ]] && verify_cleanup completed || verify_cleanup error' EXIT
-trap 'verify_cleanup interrupted' INT TERM
+verify_interrupted() {
+    trap - EXIT INT TERM HUP
+    EXIT_STATUS=$((128 + $1))
+    verify_cleanup interrupted
+    exit "$EXIT_STATUS"
+}
+trap 'verify_interrupted 2' INT
+trap 'verify_interrupted 15' TERM
+trap 'verify_interrupted 1' HUP
 
 case "$CMD" in
     check)
