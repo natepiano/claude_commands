@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Install and trust the fn-length PostToolUse hook for Codex."""
+"""Install and trust the Rust PostToolUse hooks for Codex."""
 
 from __future__ import annotations
 
@@ -14,8 +14,23 @@ import time
 from typing import cast
 
 
-COMMAND = '"$HOME/.claude/scripts/lib/py" "$HOME/.claude/scripts/hooks/post-tool-use-fn-length.py"'
-HANDLER: dict[str, object] = {"type": "command", "command": COMMAND, "timeout": 10}
+class CodexHook:
+    """A named PostToolUse handler that must be installed and trusted."""
+
+    __slots__: tuple[str, ...] = ("name", "command")
+
+    def __init__(self, name: str, script: str) -> None:
+        self.name: str = name
+        self.command: str = f'"$HOME/.claude/scripts/lib/py" "$HOME/.claude/scripts/hooks/{script}"'
+
+    def handler(self) -> dict[str, object]:
+        return {"type": "command", "command": self.command, "timeout": 10}
+
+
+HOOKS: tuple[CodexHook, ...] = (
+    CodexHook("fn-length", "post-tool-use-fn-length.py"),
+    CodexHook("mul_add", "post-tool-use-mul-add.py"),
+)
 
 
 class HookError(Exception):
@@ -23,11 +38,12 @@ class HookError(Exception):
 
 
 class LocatedHook:
-    """The fn-length handler as listed by the app-server."""
+    """A named handler as listed by the app-server."""
 
-    __slots__: tuple[str, ...] = ("key", "current_hash", "trust_status", "enabled")
+    __slots__: tuple[str, ...] = ("hook", "key", "current_hash", "trust_status", "enabled")
 
-    def __init__(self, key: str, current_hash: str, trust_status: str, enabled: bool) -> None:
+    def __init__(self, hook: CodexHook, key: str, current_hash: str, trust_status: str, enabled: bool) -> None:
+        self.hook: CodexHook = hook
         self.key: str = key
         self.current_hash: str = current_hash
         self.trust_status: str = trust_status
@@ -35,9 +51,12 @@ class LocatedHook:
 
 
 class MissingHook:
-    """No matching user-layer fn-length handler was listed."""
+    """No matching user-layer handler was listed."""
 
-    __slots__: tuple[str, ...] = ()
+    __slots__: tuple[str, ...] = ("hook",)
+
+    def __init__(self, hook: CodexHook) -> None:
+        self.hook: CodexHook = hook
 
 
 def _object(value: object, description: str) -> dict[str, object]:
@@ -62,7 +81,7 @@ def _command_binary() -> str:
     return os.path.abspath(found) if found else os.path.join(_home(), ".local", "bin", "codex")
 
 
-def _matching_group(group: object) -> bool:
+def _matching_group(group: object, hook: CodexHook) -> bool:
     if not isinstance(group, dict):
         return False
     fields = cast(dict[str, object], group)
@@ -72,7 +91,7 @@ def _matching_group(group: object) -> bool:
     return any(
         isinstance(handler, dict)
         and cast(dict[str, object], handler).get("type") == "command"
-        and cast(dict[str, object], handler).get("command") == COMMAND
+        and cast(dict[str, object], handler).get("command") == hook.command
         and cast(dict[str, object], handler).get("timeout") == 10
         for handler in handlers
     )
@@ -93,9 +112,11 @@ def _install_file(path: str) -> None:
     if not isinstance(groups_value, list):
         raise HookError(f"{path}: invalid PostToolUse groups")
     groups = cast(list[object], groups_value)
-    if any(_matching_group(group) for group in groups):
+    missing = [hook for hook in HOOKS if not any(_matching_group(group, hook) for group in groups)]
+    if not missing:
         return
-    groups.append({"matcher": "apply_patch", "hooks": [HANDLER]})
+    for hook in missing:
+        groups.append({"matcher": "apply_patch", "hooks": [hook.handler()]})
     directory = os.path.dirname(path)
     os.makedirs(directory, exist_ok=True)
     descriptor, temporary = tempfile.mkstemp(prefix=".hooks-", suffix=".json", dir=directory)
@@ -180,12 +201,12 @@ class AppServer:
             return _object(response.get("result"), f"{method} result")
 
 
-def _listed_hook(server: AppServer, path: str) -> LocatedHook | MissingHook:
+def _listed_hooks(server: AppServer, path: str) -> dict[CodexHook, LocatedHook | MissingHook]:
     result = server.call("hooks/list", {"cwds": [_home()]})
     data = result.get("data")
     if not isinstance(data, list):
         raise HookError("invalid hooks/list data")
-    selected: LocatedHook | MissingHook = MissingHook()
+    selected: dict[CodexHook, LocatedHook | MissingHook] = {hook: MissingHook(hook) for hook in HOOKS}
     for workspace in cast(list[object], data):
         hooks = _object(workspace, "hooks/list workspace").get("hooks")
         if not isinstance(hooks, list):
@@ -196,10 +217,12 @@ def _listed_hook(server: AppServer, path: str) -> LocatedHook | MissingHook:
                 entry.get("eventName") != "postToolUse"
                 or entry.get("matcher") != "apply_patch"
                 or entry.get("handlerType") != "command"
-                or entry.get("command") != COMMAND
                 or entry.get("timeoutSec") != 10
                 or entry.get("sourcePath") != path
             ):
+                continue
+            hook = next((hook for hook in HOOKS if entry.get("command") == hook.command), None)
+            if hook is None:
                 continue
             key = entry.get("key")
             current_hash = entry.get("currentHash")
@@ -207,11 +230,13 @@ def _listed_hook(server: AppServer, path: str) -> LocatedHook | MissingHook:
             enabled = entry.get("enabled")
             if not isinstance(key, str) or not isinstance(current_hash, str) or not isinstance(trust_status, str) or not isinstance(enabled, bool):
                 raise HookError("incomplete hooks/list entry")
-            found = LocatedHook(key, current_hash, trust_status, enabled)
+            found = LocatedHook(hook, key, current_hash, trust_status, enabled)
+            previous = selected[hook]
             if found.trust_status == "trusted" and found.enabled:
-                return found
-            if isinstance(selected, MissingHook) or (found.trust_status == "trusted" and selected.trust_status != "trusted"):
-                selected = found
+                selected[hook] = found
+            elif not (isinstance(previous, LocatedHook) and previous.trust_status == "trusted" and previous.enabled):
+                if isinstance(previous, MissingHook) or (found.trust_status == "trusted" and previous.trust_status != "trusted"):
+                    selected[hook] = found
     return selected
 
 
@@ -221,7 +246,7 @@ def _status(entry: LocatedHook | MissingHook) -> str:
     return "disabled" if not entry.enabled else entry.trust_status
 
 
-def _run(action: str) -> None:
+def _run(action: str) -> int:
     codex_home = _codex_home()
     binary = _command_binary()
     path = os.path.join(codex_home, "hooks.json")
@@ -234,22 +259,30 @@ def _run(action: str) -> None:
             {"clientInfo": {"name": "codex_hooks", "version": "1.0"},
              "capabilities": {"experimentalApi": True}},
         )
-        entry = _listed_hook(server, path)
-        if action == "install" and isinstance(entry, LocatedHook) and entry.trust_status in {"untrusted", "modified"}:
-            _ = server.call(
-                "config/batchWrite",
-                {"edits": [{"keyPath": "hooks.state",
-                            "value": {entry.key: {"trusted_hash": entry.current_hash}},
-                            "mergeStrategy": "upsert"}],
-                 "reloadUserConfig": True},
-            )
-            entry = _listed_hook(server, path)
-        if not isinstance(entry, LocatedHook) or entry.trust_status != "trusted" or not entry.enabled:
-            raise HookError(_status(entry))
+        entries = _listed_hooks(server, path)
         if action == "install":
-            print(f"trusted {entry.key}")
+            for hook in HOOKS:
+                entry = entries[hook]
+                if isinstance(entry, LocatedHook) and entry.trust_status in {"untrusted", "modified"}:
+                    _ = server.call(
+                        "config/batchWrite",
+                        {"edits": [{"keyPath": "hooks.state",
+                                    "value": {entry.key: {"trusted_hash": entry.current_hash}},
+                                    "mergeStrategy": "upsert"}],
+                         "reloadUserConfig": True},
+                    )
+                    entries = _listed_hooks(server, path)
     finally:
         server.close()
+    success = all(isinstance(entry, LocatedHook) and entry.trust_status == "trusted" and entry.enabled
+                  for entry in entries.values())
+    for hook in HOOKS:
+        entry = entries[hook]
+        if action == "install" and success and isinstance(entry, LocatedHook):
+            print(f"{hook.name} codex hook: trusted {entry.key}")
+        else:
+            print(f"{hook.name} codex hook: {_status(entry)}")
+    return 0 if success else 1
 
 
 def main() -> int:
@@ -257,11 +290,10 @@ def main() -> int:
         print("usage: codex_hooks.py <install|check>", file=sys.stderr)
         return 1
     try:
-        _run(sys.argv[1])
+        return _run(sys.argv[1])
     except (HookError, OSError) as error:
-        print(f"fn-length codex hook: {error}", file=sys.stderr)
+        print(f"codex hooks: {error}", file=sys.stderr)
         return 1
-    return 0
 
 
 if __name__ == "__main__":

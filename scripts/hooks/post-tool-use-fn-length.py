@@ -5,63 +5,10 @@ from __future__ import annotations
 
 import sys
 
+TYPE_CHECKING = False
 
-class AppliedRustEdits:
-    """Rust files left by one successful edit, in payload order."""
-
-    __slots__: tuple[str, ...] = ("agent", "tool", "cwd", "files")
-
-    def __init__(self, agent: str, tool: str, cwd: str, files: tuple[str, ...]) -> None:
-        self.agent: str = agent
-        self.tool: str = tool
-        self.cwd: str = cwd
-        self.files: tuple[str, ...] = files
-
-
-class IgnoredEdit:
-    """A payload with no Rust file whose final contents can be checked."""
-
-    __slots__: tuple[str, ...] = ()
-
-
-def _patch_files(patch: str) -> tuple[str, ...]:
-    files: list[str] = []
-    update_index = -1
-    for line in patch.splitlines():
-        if line.startswith("*** Add File: ") or line.startswith("*** Update File: "):
-            path = line.split(": ", 1)[1]
-            files.append(path)
-            update_index = len(files) - 1 if line.startswith("*** Update File: ") else -1
-        elif line.startswith("*** Move to: ") and update_index >= 0:
-            files[update_index] = line.removeprefix("*** Move to: ")
-            update_index = -1
-        elif line.startswith("*** Delete File: "):
-            update_index = -1
-    return tuple(dict.fromkeys(path for path in files if path.endswith(".rs")))
-
-
-def _payload(raw: str) -> AppliedRustEdits | IgnoredEdit:
-    import json
-    from typing import cast
-
-    data = cast(object, json.loads(raw))
-    if not isinstance(data, dict):
-        return IgnoredEdit()
-    fields = cast(dict[str, object], data)
-    tool = fields.get("tool_name")
-    cwd = fields.get("cwd")
-    tool_input = fields.get("tool_input")
-    if not isinstance(tool, str) or not isinstance(cwd, str) or not isinstance(tool_input, dict):
-        return IgnoredEdit()
-    inputs = cast(dict[str, object], tool_input)
-    if tool == "apply_patch":
-        patch = inputs.get("command")
-        files = _patch_files(patch) if isinstance(patch, str) else ()
-        return AppliedRustEdits("codex", tool, cwd, files) if files else IgnoredEdit()
-    file_path = inputs.get("file_path")
-    if tool in {"Edit", "MultiEdit", "Write"} and isinstance(file_path, str) and file_path.endswith(".rs"):
-        return AppliedRustEdits("claude", tool, cwd, (file_path,))
-    return IgnoredEdit()
+if TYPE_CHECKING:
+    from fn_length_lib import AppliedRustEdits
 
 
 def _log_block(
@@ -95,8 +42,10 @@ def main() -> None:
     raw = sys.stdin.read()
     if ".rs" not in raw and "\\u" not in raw:
         return
+    from fn_length_lib import IgnoredEdit, applied_rust_edits
+
     try:
-        edit = _payload(raw)
+        edit = applied_rust_edits(raw)
     except (ValueError, UnicodeError):
         return
     if isinstance(edit, IgnoredEdit):
@@ -110,6 +59,7 @@ def main() -> None:
 
         descriptions: list[str] = []
         affected: list[tuple[str, int, int]] = []
+        records: list[tuple[str, int, list[dict[str, str | int]]]] = []
         for file_path in edit.files:
             file = os.path.realpath(os.path.join(root, file_path))
             if not os.path.isfile(file):
@@ -127,11 +77,11 @@ def main() -> None:
                 for function in functions
             )
             affected.append((shown, len(functions), scope.threshold))
-            _log_block(
-                edit, file, scope.threshold,
+            records.append((
+                file, scope.threshold,
                 [{"name": function.name, "line": function.line, "lines": function.lines}
                  for function in functions],
-            )
+            ))
         if not descriptions:
             return
         total = sum(count for _, count, _ in affected)
@@ -148,6 +98,8 @@ def main() -> None:
                 for file, count, threshold in affected
             )
             summary = f"{total} function(s) over limits: {limits}"
+        for file, threshold, functions in records:
+            _log_block(edit, file, threshold, functions)
         print(
             json.dumps(
                 {

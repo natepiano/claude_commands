@@ -170,8 +170,8 @@ branch, port and the files you own.
    a fresh verdict, and 3 holds were caught after the unit had moved on, 187
    minutes in 2.6 days; with a fresh pass the merge followed in 1–2 minutes.
 
-   Start the next phase only after the showrunner merges this one
-   (`/showrunner:produce` → Rules, one phase at a time).
+   Start every later phase that can run beside this one now, under berth, each
+   with its own checkpoint (`/showrunner:produce` → Rules, parallel by default).
 4. **The merge branch is the showrunner's.** Never merge into it or push it.
    Push only your own branch; <PushCheckpoint/> does it at each checkpoint.
    <PeriodicCI/> and <CICleanup/> do not run in a unit; the showrunner runs CI
