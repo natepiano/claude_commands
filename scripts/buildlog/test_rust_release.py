@@ -269,7 +269,7 @@ class RustReleaseTests(unittest.TestCase):
         self.assertEqual(clone, clippy[1])
         self.assertEqual(7200, clippy[3])
         self.assertEqual("0", clippy[2]["CARGO_INCREMENTAL"])
-        self.assertEqual("-C link-arg=-fuse-ld=mold", clippy[2]["CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS"])
+        self.assertEqual("-C link-arg=-fuse-ld=mold -C target-cpu=x86-64-v3", clippy[2]["CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS"])
         mend = runner.calls[-1]
         self.assertEqual("1", mend[2]["RUSTC_BOOTSTRAP"])
         self.assertEqual(str(clone / "mend-target"), mend[2]["CARGO_TARGET_DIR"])
