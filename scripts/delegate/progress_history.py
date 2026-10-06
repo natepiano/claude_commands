@@ -3454,31 +3454,19 @@ def _unchanged_cell(seconds: int) -> str:
     return _format_duration(seconds) if seconds > 0 else ""
 
 
-def _scope_line(state: dict[str, object], counts: dict[str, object]) -> str:
-    """Where the run is working, and how far into the plan that leaves it.
+def _scope_line(state: dict[str, object]) -> str:
+    """Where the run is working: the worktree, and the branch when it differs.
 
-    Worktree and branch say where; neither says how much plan is left. The
-    position is the ordinal of the heading the active phase actually occupies,
-    looked up by the id `start-phase` named. Counting finished phases and adding
-    one is wrong: `/plan:phase_review` flips a phase to `done` before its
-    checkpoint, so for the whole review window the phase in flight is counted
-    twice and the position runs one ahead. A plan whose phases could not be
-    counted, or whose headings do not name the active phase, keeps the short
-    form rather than showing a position nothing verified.
+    How far through the plan the run is belongs to the Phases column, and the
+    phase in flight is named by its id in the Phase row. The line carries no
+    position of its own: a plan with deferred earlier phases or retired ids
+    puts the active phase at an ordinal that matches neither number.
     """
-    line = f"{_string(state.get('worktree'))} - {_string(state.get('branch'))}"
-    if counts.get("available") is not True:
-        return f"**{line}**"
-    order = counts.get("order")
-    phase = _object_dict(state.get("phase"))
-    if phase is None or not isinstance(order, list):
-        return f"**{line}**"
-    identifiers = [identifier for identifier in cast(list[object], order) if isinstance(identifier, str)]
-    active = _string(phase.get("id"))
-    if active not in identifiers:
-        return f"**{line}**"
-    total = _integer(counts.get("total"))
-    return f"**{line} - phase {identifiers.index(active) + 1} of {total}**"
+    worktree = _string(state.get("worktree"))
+    branch = _string(state.get("branch"))
+    if not branch or branch == worktree:
+        return f"**{worktree}**"
+    return f"**{worktree} - {branch}**"
 
 
 def _timeline(args: argparse.Namespace) -> None:
@@ -3871,7 +3859,7 @@ def _progress(args: argparse.Namespace) -> None:
             stage_windows, board_activity, now, round_table["slots"]
         )
         lines = [
-            _scope_line(state, plan_phase_counts),
+            _scope_line(state),
             "",
             *_render_table(
                 summary_headers,

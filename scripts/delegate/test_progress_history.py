@@ -3232,21 +3232,20 @@ class ProgressHistoryTests(unittest.TestCase):
         )
 
 
-    def test_the_header_names_the_phase_position_in_the_plan(self) -> None:
-        """Worktree and branch say where the run is, not how much plan is left.
+    def test_the_header_names_no_position_when_ids_and_order_disagree(self) -> None:
+        """A deferred earlier phase and a retired id leave three numbers apart.
 
-        The position is the ordinal of the heading the phase in flight actually
-        occupies, looked up by the id `start-phase` named, off the same headings
-        the project percentage derives from.
+        Phase 3 is in flight, one of four phases is done, and the active
+        heading is the second. The header names where the run is and no
+        position; the Phase row names the id and the Phases column the count.
         """
         session_dir = self.start_run("position", 0)
         plan_path = self.working_dir / "docs" / "position.md"
         _ = plan_path.write_text(
             plan_path.read_text(encoding="utf-8")
-            + "### Phase 1 — Shrunk archive form (`bbac234`)\n\n"
-            + "### Phase 2 — Completed  · status: done\n\n"
+            + "### Phase 1 — Deferred  · status: todo\n\n"
             + "### Phase 3 — Live work  · status: todo\n\n"
-            + "### Phase 4 — Waiting  · status: todo\n\n"
+            + "### Phase 4 — Shrunk archive form (`bbac234`)\n\n"
             + "### Phase 5 — Waiting  · status: todo\n\n",
             encoding="utf-8",
         )
@@ -3271,56 +3270,45 @@ class ProgressHistoryTests(unittest.TestCase):
         )
         self.assertEqual(
             header.splitlines()[0],
-            "**bevy_hana_rubric - feature/rubric - phase 3 of 5**",
+            "**bevy_hana_rubric - feature/rubric**",
         )
-        # The supplied 90 is advisory; two finished phases and a half-done third
-        # of five is 50, and the position above counts the same headings.
-        self.assertIn("| Project |  50 | ", header)
-        self.assertIn("| 2 of 5 done |", header)
+        # The supplied 90 is advisory; one finished phase and a half-done
+        # second of four is 38.
+        self.assertIn("| Project |  38 | ", header)
+        self.assertIn("| 1 of 4 done |", header)
+        self.assertIn("| Phase 3 |", header)
 
-    def test_the_position_holds_while_the_phase_review_window_marks_it_done(
+    def test_the_header_names_a_worktree_once_when_its_branch_shares_the_name(
         self,
     ) -> None:
-        """`/plan:phase_review` flips the phase to done before its checkpoint.
-
-        For that whole window the phase in flight is also a finished phase, so
-        counting finished phases and adding one names the phase after it. The
-        position must keep naming the phase `start-phase` opened.
-        """
-        session_dir = self.start_run("position", 0)
-        plan_path = self.working_dir / "docs" / "position.md"
-        _ = plan_path.write_text(
-            plan_path.read_text(encoding="utf-8")
-            + "### Phase 1 — Shrunk archive form (`bbac234`)\n\n"
-            + "### Phase 2 — Completed  · status: done\n\n"
-            + "### Phase 3 — Live work  · status: done\n\n"
-            + "### Phase 4 — Waiting  · status: todo\n\n"
-            + "### Phase 5 — Waiting  · status: todo\n\n",
-            encoding="utf-8",
+        _ = subprocess.run(
+            ["git", "symbolic-ref", "HEAD", "refs/heads/bevy_hana_rubric"],
+            cwd=self.working_dir,
+            check=True,
+            capture_output=True,
+            text=True,
         )
+        session_dir = self.start_run("same_name", 0)
         self.start_phase_and_pass(session_dir, 70_000)
         header = self.run_command(
             "progress",
             "--session-dir",
             str(session_dir),
             "--project-raw-percent",
-            "90",
+            "50",
             "--project-percent",
-            "90",
+            "50",
             "--phase-raw-percent",
             "50",
             "--phase-percent",
             "50",
             "--cap-stage",
-            "closure",
+            "implementation",
             "--activity",
-            "reviewing the remaining phases",
+            "writing the retry path",
             at=80_000,
         )
-        self.assertEqual(
-            header.splitlines()[0],
-            "**bevy_hana_rubric - feature/rubric - phase 3 of 5**",
-        )
+        self.assertEqual(header.splitlines()[0], "**bevy_hana_rubric**")
 
 
 class PhaseCountTests(unittest.TestCase):
