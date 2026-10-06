@@ -1,5 +1,5 @@
 {
   "threshold_percent": 2,
   "repeat_minutes": 30,
-  "notify": ["natedev", "showrunner"]
+  "notify": ["natedev", "showrunner", "bevy_brp", "cargo-liner"]
 }
