@@ -518,6 +518,10 @@ phase's repair round (`production_format.md` → <ProductionUnit/> item 7). A
 `no rule` defect is still a defect. If it is a
 choice the user's taste must settle, apply <DesignAuthority/>; otherwise add
 the rule to the guide.
+
+Any Hana shot the showrunner or its helpers take uses `/hana_shot` (stored
+views in `crates/hana/brp_views.toml`); a unit director working a camera out by
+hand gets pointed at it.
 </DesignCheck>
 
 ---

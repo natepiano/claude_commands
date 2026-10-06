@@ -1079,7 +1079,11 @@ instructions name; with none, skip and say so in one line.
 
 1. After smoke has a build, take a shot of each changed view and state on the
    run's port at normal size — the same shots the checkpoint notice sends
-   (<ProductionUnit/> item 3). Never view them yourself.
+   (<ProductionUnit/> item 3). Never view them yourself. In Hana, shoot with
+   `/hana_shot`: a stored view (`crates/hana/brp_views.toml`) or an ad hoc
+   `--target`, never a camera worked out by hand. A changed view the file
+   lacks gets `views add`; when the scene changed, run `views check` and commit
+   the file with the phase.
 2. Open an activity; the
    label is exact, because `review-trial` counts it:
    `progress_history.py start-activity --session-dir "${SESSION_DIR}" --label "UX review" --activity "<what the shots show>"`
