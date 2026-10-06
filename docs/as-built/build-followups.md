@@ -11,8 +11,8 @@ Agents' test builds linked far more than the tests they ran, and the daily build
 | File | Role |
 | --- | --- |
 | `scripts/delegate/verify.sh` | `TEST_TARGETS_PY` picks the targets from `cargo metadata`; `take_test_targets` reads them into `TEST_SELECTION`; the `test` arm builds with them. |
-| `scripts/buildlog/report.py` | `report()` assembles the day. `SCRATCH`, `SCRATCH_LABEL`, `kind_section`, `summary` for scratch rows; `test_builds_section`; `disk_section`. |
-| `scripts/buildlog/disk.py` | The Disk rows (`FOLDERS`), the walk (`measure`), the floor (`read_floor`, `InvalidFloor`), the snapshot file. |
+| `scripts/buildlog/report.py` | `report()` assembles the day. `SCRATCH`, `GROUP_AS_SCRATCH`, `SCRATCH_LABEL`, `kind_section`, `summary` for scratch rows; `test_builds_section`; `disk_section`. |
+| `scripts/buildlog/disk.py` | The Disk rows (`FOLDERS`), the walk (`measure`), the floor (`read_floor`, `InvalidFloor`), the snapshot file, and the directories outside the build caches that the disk-floor alerts read (`docs/as-built/build-memory-admission.md`). |
 | `scripts/buildlog/cli.py` | `buildlog disk`, listed in the usage docstring. |
 | `scripts/buildlog/store.py` | `root()` (`BUILDLOG_DIR` moves it), `DISK_NAME`, `host_name()`, `utc_iso()`. |
 | `scripts/lint/sweep.py` | `directory_blocks(directory, seen=None)`, `config_values`, `floor_bytes`, shared with the lint sweep. |
@@ -27,16 +27,19 @@ Agents' test builds linked far more than the tests they ran, and the daily build
 `report(connection, day)` emits, in order:
 
 1. `## Builds, <Weekday YYYY-MM-DD>`
-2. `### <kind>` for each kind seen that day (`KIND_ORDER` first), one row per caller by run count, the scratch row among them
-3. Memory pressure (not part of this feature)
-4. `### Agent calls (verify.sh)`
-5. `### Test builds (temporary)`, only on a day with a measured `verify.sh test` call
-6. `### cargo-port calls (port-lint)`
-7. `### CI`
-8. `### Tests per edit` (not part of this feature)
-9. `### Disk: <host>`, only when a snapshot exists
-10. `### Summary: successes`, `failures`, `all`, or `### Summary` / `No build steps recorded.` on a day with no steps
-11. The calls, port-lint and CI totals lines and the Rust release line (not part of this feature), then the Mac-sync and peak-memory notes
+2. `### Waiting` (build-folder turns, memory admission, CI queue; see `docs/as-built/build-memory-admission.md`)
+3. `### <kind>` for each kind seen that day (`KIND_ORDER` first), one row per caller by run count, the scratch row among them
+4. `### Memory pressure`, always present: memory waits, the sccache, unsliced-step and memory-kill lines, the stall table and the sample line (`docs/as-built/buildlog-memory-stalls.md`, `docs/as-built/build-memory-admission.md`)
+5. `### Agent calls (verify.sh)`
+6. `### Test builds (temporary)`, only on a day with a measured `verify.sh test` call
+7. `### cargo-port calls (port-lint)`
+8. `### CI`
+9. `### Tests per edit` (`docs/as-built/buildlog-tests-per-edit-rust-release.md`)
+10. `### Disk: <host>`, only when a snapshot exists
+11. `### Summary: successes`, `failures`, `all`, or `### Summary` / `No build steps recorded.` on a day with no steps
+12. The calls, port-lint and CI totals lines and the Rust release line, then the Mac-sync and peak-memory notes
+
+Every average carries a `p95` beside it, by nearest rank (`nearest_rank(values, percent)`, sorted index `(percent*n+99)//100-1`): each kind table (`COMMON_HEAD` is `Runs, Failed, Avg, p95, Range`; each `AverageColumn` adds `<title> p95`), the summaries (`Kind, Runs, [Failed], Total, Avg, p95, Peak memory`) and the CI table (`Workflow, Runs, Failed, Cancelled, Avg, p95, Range`).
 
 ### Test target selection
 
@@ -46,11 +49,11 @@ The arm runs `cargo nextest --no-fail-fast --workspace <selection> -E <filter>` 
 
 ### Test builds table
 
-`test_builds_section(connection, day)` reads `calls` rows with `tool = 'verify.sh'`, `verb = 'test'` and a non-null `build_s`. A call is `--filter` when `--filter` is a whole word of its `command`, otherwise whole-package. The section is a source line, a `Period | Scope | Build/day | p75 build/call` table holding three fixed baseline rows and then one row per scope seen that day (total build time and nearest-rank p75, `ordered[(3n - 1) // 4]`, both through `seconds()`), and the line `Temporary: kept until the user calls the result settled.`
+`test_builds_section(connection, day)` reads `calls` rows with `tool = 'verify.sh'`, `verb = 'test'` and a non-null `build_s`. A call is `--filter` when `--filter` is a whole word of its `command`, otherwise whole-package. The section is a source line, a `Period | Scope | Build/day | p75 build/call` table holding three fixed baseline rows and then one row per scope seen that day (total build time and nearest-rank p75, `nearest_rank(values, 75)`, both through `seconds()`), and the line `Temporary: kept until the user calls the result settled.`
 
 ### Scratch rows
 
-`SCRATCH` is a SQL predicate on `cwd`: `/tmp/%`, `/var/folders/%`, `/private/var/folders/%`. `kind_section` selects it as `is_scratch` and nulls host and caller on scratch rows, so `GROUP BY is_scratch, caller_host, grouped_caller` folds every temp-folder step of a kind into one row labelled `SCRATCH_LABEL`, across hosts and callers. `kinds` and `summary` apply no scratch filter, so kind discovery and all three summaries, totals and peak memory included, count scratch steps. The host count in `report()` leaves them out: it decides whether caller labels carry a `(host)` suffix, and the scratch row names no host.
+`SCRATCH` is a SQL predicate on `cwd`: `/tmp/%`, `/var/folders/%`, `/private/var/folders/%`. `GROUP_AS_SCRATCH` is `SCRATCH` for every caller except `brp-launch`: a BRP launch from a temp folder stays under its own caller, `example launches (brp)`. `kind_section` selects `GROUP_AS_SCRATCH` as `is_scratch` and nulls host and caller on those rows, so `GROUP BY is_scratch, caller_host, grouped_caller` folds every other temp-folder step of a kind into one row labelled `SCRATCH_LABEL`, across hosts and callers. `kinds` and `summary` apply no scratch filter, so kind discovery and all three summaries, totals and peak memory included, count scratch steps. The host count in `report()` leaves out the rows `GROUP_AS_SCRATCH` folds: it decides whether caller labels carry a `(host)` suffix, and the scratch row names no host. The memory-pressure stall table labels by `SCRATCH` itself.
 
 ### Disk table
 
@@ -67,18 +70,24 @@ class DiskRow(TypedDict):
     label: str
     bytes: int
 
-class DiskSnapshot(TypedDict):
+class MeasuredDiskSnapshot(TypedDict):
     measured_at: str     # store.utc_iso, stamped after the walk
     host: str            # store.host_name(), the short name
     rows: list[DiskRow]  # FOLDERS order
     used: int
     free: int
     floor: int | None    # bytes; None when lint.conf sets none
+    previous_measured_at: str | None
+    outside_build_caches: list[OutsideBuildCacheDirectory]
+    outside_build_cache_totals: list[OutsideBuildCacheTotal]
 
-def measure(folders: list[tuple[str, str]], usage: Callable[[], FilesystemUsage], floor: int | None) -> DiskSnapshot
+def measure(folders: list[tuple[str, str]], usage: Callable[[], FilesystemUsage], floor: int | None,
+            previous: PreviousOutsideMeasurement = NO_EARLIER_OUTSIDE_MEASUREMENT) -> MeasuredDiskSnapshot
 ```
 
-`measure` expands `~` and walks the rows in order with one `seen: set[sweep.InodeKey]` passed to every `sweep.directory_blocks(path, seen)` call, then calls `usage()` once, then stamps `measured_at`. A row's size is allocated blocks (`st_blocks * 512`, symlinks not followed), each `(st_dev, st_ino)` counted once across all rows: a file hard-linked into two rows counts in the first. `directory_blocks` skips any directory or entry it cannot read; called without `seen`, it counts per directory, as the sweep's own doc-index sizing does.
+`DiskSnapshot`, what `read_snapshot` returns, has the same keys with the last three `NotRequired`, so a `disk.json` written before they existed still reads. The Disk table uses only the first six; the three outside-cache keys (directories one and two levels under each `FOLDERS` entry holding at least 1 GiB outside cargo target dirs, with growth since `previous_measured_at`) serve the disk-floor alerts in `scripts/lint/sweep.py` (`docs/as-built/build-memory-admission.md`).
+
+`measure` expands `~` and walks the rows in order with one `seen: set[sweep.InodeKey]` passed to every `sweep.directory_blocks(path, seen)` call, then measures the outside-cache directories, then calls `usage()` once, then stamps `measured_at`. A row's size is allocated blocks (`st_blocks * 512`, symlinks not followed), each `(st_dev, st_ino)` counted once across all rows: a file hard-linked into two rows counts in the first. `directory_blocks` skips any directory or entry it cannot read; called without `seen`, it counts per directory, as the sweep's own doc-index sizing does.
 
 `filesystem_usage(path)` is a frozen `FilesystemUsage(used, free)` from `os.statvfs`: used is `(f_blocks - f_bfree) * f_frsize`, free is `f_bavail * f_frsize`, the numbers `df -B1 /` prints as Used and Avail.
 
