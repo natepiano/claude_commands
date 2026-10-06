@@ -13,7 +13,9 @@ synthetic-final repairs — so the run leaves no uncommitted work behind.
 1. With no changes in `git status --short`, skip it silently.
 2. Confirm the changed paths are only the ones the gate touched: the
    before/after snapshots in <RunProjectStyleReview/> plus the synthetic phase's
-   own baseline name them. Anything else stays uncommitted and is reported
+   own baseline name them, plus any source-comment edit the last phase's plan
+   review left in the tree (`~/.claude/docs/delegate/phase_end.md` →
+   <PhaseEnd/> step 3). Anything else stays uncommitted and is reported
    instead; never sweep an unrelated path into this commit.
 3. Run `verify.sh fmt <package>` for every touched package and include the
    result.
