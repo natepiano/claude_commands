@@ -24,31 +24,22 @@ The Build memory topic's closing condition failed at 06:54 PDT on 2026-10-06. Tw
 ## Delegation Context
 
 - **Project:** `~/.claude`. Work in worktree `/home/natepiano/worktrees/claude-build-followups-stalls`, branch `build-followups-stalls`.
+- **Project started:** 2026-10-06T14:22:47.217+00:00
 - **Stack:** bash (`scripts/lint/invoke.sh`); tests in Python `unittest` beside it (`scripts/lint/test_*.py`).
 - **Test:** `(cd scripts/lint && python3 -m unittest discover -q)`; `bash -n scripts/lint/invoke.sh`.
 - **Invariants:** the step's exit status and output are unchanged. A failed write to `/proc/self/oom_score_adj` is silent and never stops the step (`invoke.sh`'s callers run `set -euo pipefail`). The Mac, which has no scope, is unchanged.
 
 ## Phases
 
-### Phase 1 — Build steps run at oom_score_adj 500 · status: todo
+### Phase 1 — Build steps run at oom_score_adj 500 · status: done
 
-#### Work Order
+#### As-built
 
-Work only in worktree `/home/natepiano/worktrees/claude-build-followups-stalls`, branch `build-followups-stalls`. State every time in PDT.
+`BUILDLOG_SCOPE_SH` in `scripts/lint/invoke.sh` runs `{ echo 500 > /proc/self/oom_score_adj; } 2>/dev/null || true;` after its marker write and before `"$@"`, so every process a build step starts in its builds.slice scope inherits oom_score_adj 500 and earlyoom kills build steps before CI (100) and sessions (200), the largest first; the step's exit status and output are unchanged. The `|| true` keeps a failed write from ending the scope shell when a caller exports `SHELLOPTS=errexit`.
 
-**Goal:** every process a natedev build step starts inside its builds.slice scope carries oom_score_adj 500.
+**Files:**
+- `scripts/lint/invoke.sh` — the scope string and the comment above it stating the kill order
+- `scripts/lint/test_invoke_scope.py` — runs the extracted string under `/bin/sh -c` with fd 3 set as `buildlog_exec` sets it: step and child read 500, exit 7 passes through, a failed write stays silent under exported errexit; the 500 checks skip when the runner already runs at 500 or more
+- `docs/as-built/build-memory-admission.md` — the kill-order row and the 2026-10-06 06:54 PDT case
 
-**Spec:**
-- In `BUILDLOG_SCOPE_SH`, after the marker write and before `"$@"`: `{ echo 500 > /proc/self/oom_score_adj; } 2>/dev/null;`. Nothing else in the string changes.
-- Update the comment block above `BUILDLOG_SCOPE_SH` with one sentence: the scope raises oom_score_adj to 500, so earlyoom kills build steps before CI (100) and sessions (200), the largest first.
-- Update `docs/as-built/build-memory-admission.md` where it describes the kill order, with the 2026-10-06 06:54 PDT case in one line.
-
-**Files:** `scripts/lint/invoke.sh`, `scripts/lint/test_invoke_scope.py` (new), `docs/as-built/build-memory-admission.md`.
-
-**Seats:** 1 writer + 1 tester.
-- `impl`: `scripts/lint/invoke.sh` and the as-built.
-- `test`: `scripts/lint/test_invoke_scope.py`, from the Spec alone. It runs the `BUILDLOG_SCOPE_SH` string through `/bin/sh -c` with a temporary marker path, without systemd-run. The step is `sh -c 'cat /proc/self/oom_score_adj'` and prints 500. A child of the step also prints 500. The step's exit status passes through (exit 7 → 7). When the write fails, the step still runs and nothing reaches stderr; the test makes it fail by running the string with `/proc/self/oom_score_adj` replaced by a read-only path, or skips with a reason when it cannot.
-
-**Acceptance gate:**
-- Both test commands green.
-- Live check (unit director, natedev, after the merge reaches `~/.claude` main): while any real build step runs, `/proc/<its rustc pid>/oom_score_adj` reads 500.
+**Gotchas:** compiles the sccache server runs live under `sccache.service`, not under the step, so the scope's 500 never reaches them; they get 500 from `OOMScoreAdjust=500` on that unit in /etc/nixos (`modules/linux/development.nix`), alongside dropping earlyoom's `--prefer` (`modules/linux/memory.nix`).

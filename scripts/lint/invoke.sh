@@ -78,8 +78,10 @@ fi
 # absence afterwards proves the scope never ran the step (no user manager, a
 # sandbox without its socket, a systemd older than 254 that rejects the
 # option), and run() runs it plainly.
+# The scope raises oom_score_adj to 500, so earlyoom kills build steps before
+# CI (100) and sessions (200), the largest first.
 BUILDLOG_RECORD="$HOME/.claude/scripts/buildlog/record.py"
-BUILDLOG_SCOPE_SH='exec 2>&3 3>&-; { : > "$0"; } 2>/dev/null || exit 125; "$@"; s=$?; cgroup="/sys/fs/cgroup$(sed -n "s/^0:://p" /proc/self/cgroup)"; cat "$cgroup/memory.peak" "$cgroup/memory.pressure" > "$0" 2>/dev/null; exit $s'
+BUILDLOG_SCOPE_SH='exec 2>&3 3>&-; { : > "$0"; } 2>/dev/null || exit 125; { echo 500 > /proc/self/oom_score_adj; } 2>/dev/null || true; "$@"; s=$?; cgroup="/sys/fs/cgroup$(sed -n "s/^0:://p" /proc/self/cgroup)"; cat "$cgroup/memory.peak" "$cgroup/memory.pressure" > "$0" 2>/dev/null; exit $s'
 source "$(dirname "${BASH_SOURCE[0]}")/memory_gate.sh"
 
 buildlog_now() {
