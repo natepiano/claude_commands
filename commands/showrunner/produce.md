@@ -93,7 +93,7 @@ State:
   own message — send the unit director `From the showrunner: run /unit:eta (or read ~/.claude/commands/unit/eta.md if it is not in your skill list)` by SendMessage, in that same
   turn. Ask once per phase; ask again only if it answered without a time. Until
   it answers, report that ETA as `none measured - requested`.
-- **Waiting on block.** After the footer, leave two empty lines, write `Waiting on:`, leave one empty line, then write one `* ` bullet per item. Put the user's items first. Name each item by what it is and what it is doing, never by a task, agent or session id. Every item not waiting on the user ends with its ETA in `ZONE`, from measured runs (`CI on widget's tooltip work, ETA 13:03 PDT (12:50–13:19)`), or `no ETA measured`; never an item alone. User, 2026-10-06.
+- **Waiting on block.** After the footer, leave two empty lines, write `Waiting on:`, leave one empty line, then write one `* ` bullet per item. The user's items come first. Every other item leads with its ETA from measured runs, without the zone, soonest first: `19:45 (18:20–23:55) - startup Phase 16`; items with none follow, led by `no ETA measured - `. Name each item by what it is and what it is doing, never by a task, agent or session id. User, 2026-10-06.
 - **Footer.** Paste the output of
   `python3 ~/.claude/scripts/production/dailies_render.py --footer --zone <ZONE>`,
   word for word before the Waiting on block. It starts with a blank line and `---`, then
