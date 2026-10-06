@@ -257,6 +257,91 @@ class TimelineWindowTests(unittest.TestCase):
                     self.assertIn(marker, row)
 
 
+class UpcomingWorkTests(unittest.TestCase):
+    def render_then(self, length: str, then: object, phase: str = "Phase 2 of 3: small text reads clearly") -> Run:
+        current = {**unit(False), "phase": phase, "then": then}
+        return render({"length": length, "zone": ZONE, "units": [current]})
+
+    def test_three_items_show_only_the_next_item_in_simple(self) -> None:
+        items = ["Phase 3: labels stay legible", "Phase 4: panels match", "Phase 5: saved scenes reopen"]
+        result = self.render_then("simple", items)
+        self.assertEqual(result.code, 0, result.error)
+        self.assertEqual([line for line in result.lines if "then:" in line or line.startswith("  - ")], [f"- then: {items[0]}"])
+        self.assertNotIn(items[1], "\n".join(result.lines))
+        self.assertNotIn(items[2], "\n".join(result.lines))
+
+    def test_three_items_are_sub_bullets_in_page_and_elaborate(self) -> None:
+        items = ["Phase 3: labels stay legible", "Phase 4: panels match", "Phase 5: saved scenes reopen"]
+        for length in ("page", "elaborate"):
+            with self.subTest(length=length):
+                result = self.render_then(length, items)
+                self.assertEqual(result.code, 0, result.error)
+                first = result.lines.index("- then:")
+                self.assertEqual(result.lines[first:first + 4], ["- then:", *(f"  - {item}" for item in items)])
+                self.assertEqual(sum(line.startswith("- then:") for line in result.lines), 1)
+
+    def test_one_item_list_and_plain_string_stay_inline_at_every_length(self) -> None:
+        item = "Phase 3: labels stay legible"
+        for length in ("simple", "page", "elaborate"):
+            for then in ([item], item):
+                with self.subTest(length=length, then=then):
+                    result = self.render_then(length, then)
+                    self.assertEqual(result.code, 0, result.error)
+                    self.assertIn(f"- then: {item}", result.lines)
+                    self.assertNotIn("- then:", result.lines)
+                    self.assertNotIn(f"  - {item}", result.lines)
+
+    def test_empty_list_and_empty_item_are_refused_as_then(self) -> None:
+        for then in ([], ["Phase 3: labels stay legible", ""], ["  "]):
+            with self.subTest(then=then):
+                result = self.render_then("simple", then)
+                self.assertEqual(result.code, 2)
+                self.assertIn("units[0].then", result.error)
+
+    def test_non_string_item_is_refused_as_then(self) -> None:
+        result = self.render_then("simple", ["Phase 3: labels stay legible", 4])
+        self.assertEqual(result.code, 2)
+        self.assertIn("units[0].then", result.error)
+
+    def test_each_item_checks_phase_order(self) -> None:
+        result = self.render_then("page", ["Phase 3: labels stay legible", "Phase 1: panels match"])
+        self.assertEqual(result.code, 2)
+        self.assertIn("units[0].then", result.error)
+        self.assertIn("Phase 1", result.error)
+
+    def test_numeric_phase_labels_in_later_items_check_order(self) -> None:
+        phase = "Phase 64 of 80: front output jacks start a cable"
+        for label, earlier in (("63: jack panels match", "Phase 63"), ("63–65: jack panels match", "Phase 63"), ("63: update README.md", "Phase 63")):
+            with self.subTest(label=label):
+                result = self.render_then("page", ["65: connect a cable", label], phase)
+                self.assertEqual(result.code, 2)
+                self.assertIn("units[0].then", result.error)
+                self.assertIn(earlier, result.error)
+
+    def test_each_item_checks_user_facing_words(self) -> None:
+        result = self.render_then("page", ["Phase 3: labels stay legible", "Release file holds"])
+        self.assertEqual(result.code, 2)
+        self.assertIn("units[0].then", result.error)
+        self.assertIn("file holds", result.error)
+
+    def test_last_phase_still_requires_then(self) -> None:
+        current = {**unit(False), "phase": "Phase 3 of 3: panels match"}
+        result = render({"length": "simple", "zone": ZONE, "units": [current]})
+        self.assertEqual(result.code, 2)
+        self.assertIn("units[0].then: required on a last phase", result.error)
+
+    def test_follow_up_return_can_be_in_any_item(self) -> None:
+        phase = "follow-up 1 of 2: smooth the panel edges"
+        result = self.render_then("page", ["Finish panel edges", "return to the plan at Phase 3"], phase)
+        self.assertEqual(result.code, 0, result.error)
+
+    def test_follow_up_without_return_is_refused(self) -> None:
+        phase = "follow-up 1 of 2: smooth the panel edges"
+        result = self.render_then("page", ["Finish panel edges", "Check saved scenes"], phase)
+        self.assertEqual(result.code, 2)
+        self.assertIn("units[0].then: a follow-up names the plan phase", result.error)
+
+
 class RenumberedPhaseTests(unittest.TestCase):
     def test_a_renumbered_plan_keeps_the_phase_history(self) -> None:
         fields = report(held=False)
