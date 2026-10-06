@@ -1052,8 +1052,11 @@ def _attach_and_run(
                             raise SystemExit(f"thread {thread_id}: thread/read failed: {live.reason}")
                         if not isinstance(live, ThreadIdle):
                             continue
+                    else:
+                        capacity_waited = 0.0
+                        capacity_retries = 0
                     if resume_owed:
-                        if not retry_waited:
+                        if isinstance(turn_outcome, TurnRefusedForCapacity) and not retry_waited:
                             remaining = CAPACITY_BUDGET_SECS - capacity_waited
                             wait = min(CAPACITY_WAIT_SECS * 2.0 ** capacity_retries,
                                        CAPACITY_MAX_WAIT_SECS, remaining)
@@ -1399,7 +1402,8 @@ def _read_live_turn(client: Client, thread_id: str) -> ThreadState:
     if not thread:
         return ThreadStateUnknown("thread/read returned no thread")
     status = _as_str(_as_dict(thread.get("status")).get("type"))
-    if status in ("idle", "notLoaded"):
+    # app-server/src/thread_status.rs: systemError means the last turn failed; none is active.
+    if status in ("idle", "notLoaded", "systemError"):
         return ThreadIdle()
     if status != "active":
         return ThreadStateUnknown(f"unrecognized status {status or '(missing)'}")

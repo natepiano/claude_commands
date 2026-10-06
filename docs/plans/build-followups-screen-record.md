@@ -113,43 +113,20 @@ First consumer: `startup` (Hana's startup-animation video). Reply to it by SendM
 
 **Gotchas:** A live check of `TICKS FAILING` prints nothing while every instance is healthy; prove the line with a temp `PLAN_DELEGATE_ACTIVE_DIR` whose marker names a run with no notifier instance. Tests point `PLAN_DELEGATE_ACTIVE_DIR` and `NOTIFIER_STATE_DIR` at temp directories and never touch the real marker or notifier state.
 
-### Phase 3 — A Codex seat survives a refused turn: `systemError` means no live turn · status: todo
+### Phase 3 — A Codex seat survives a refused turn: `systemError` means no live turn · status: done
 
-#### Work Order
+#### As-built
 
-Work only in worktree `/home/natepiano/worktrees/claude-build-followups-stalls`, branch `build-followups-stalls`. State every time in PDT (America/Los_Angeles).
-
-**Source:** the user via trunk, 2026-10-06 05:1x PDT: Codex seats keep crashing mid-turn; "fixed, not worked around. Codex stays the seat we use." Seats die with `codex_mesh: <seat>: thread <id>: thread/read failed: unrecognized status systemError`, often then "could not be interrupted"; 10+ deaths since 2026-10-05 in widget-enhancements, frame-time, organon and trunk.
-
-**Cause (showrunner's probe, checked):** every errored turn in `~/.codex/sessions/2026/10/05` and `/06` (45 of 45) ends in `task_complete` error "Selected model is at capacity. Please try a different model.", `codex_error_info` `server_overloaded`; the latest death, thread `01a1111b-c366-7340-a82a-b1fcc9208e6d`, ends so at 05:07:55 PDT. The app-server (codex rust-v0.160.1, same in 0.159.3) then sets the thread status `systemError` (`app-server/src/thread_status.rs:174-179, 456`; via `note_system_error`, `bespoke_event_handling.rs:1030-1033`). `systemError` is not terminal: the thread is loaded, no turn runs, the last turn ended in an error; `turn/start` has no status gate and `note_turn_started` clears it (`thread_status.rs:147-151`). `ThreadStatus` is `notLoaded | idle | systemError | active{activeFlags}` (`codex app-server generate-ts`, `v2/ThreadStatus.ts`). `_read_live_turn` (`codex_mesh.py:1392`, check at 1402) accepts only `idle`, `notLoaded` and `active`, so the capacity loop's `thread/read` (1050) gets `ThreadStateUnknown` and 1052 raises `SystemExit`; the capacity retry from Phase 8 (179aeb5) has never run against the real server. The stub at `test_codex_mesh.py:340` answers `idle` after a refused turn, so no test caught it.
-
-**Goal:** a seat whose turn is refused for capacity backs off and resumes on the same thread, as Phase 8 designed; a seat whose turn fails otherwise reports that turn's own error; relaunch and `end` treat a `systemError` thread as having no live turn.
-
-**Spec:**
-- `_read_live_turn`: `systemError` returns `ThreadIdle()` alongside `idle` and `notLoaded`, with a one-line comment naming its meaning and the upstream source above. Any status the protocol does not define still returns `ThreadStateUnknown`.
-- The capacity budget is per busy spell, not per seat: `capacity_waited` and `capacity_retries` (`codex_mesh.py:983-984`) never reset today, so a long seat's separate busy spells share one 20-minute budget and later spells start at a longer wait. Reset both to 0 when a turn completes without a capacity refusal. The schedule within a spell stays 30 s doubling to a 300 s cap, 1200 s in all.
-- Nothing else in the capacity loop, `_retry_warranted` or the relaunch path changes unless a test below fails without it; say so in the checkpoint if one does.
-- Stub app-server (`test_codex_mesh.py`): after any turn that ends with an error (`turn/failed`, or `turn/completed` carrying `error`), `thread/read` answers `systemError` for that thread until the next `turn/start`, as the real server does; an entry a test sets in `thread_statuses` still wins.
-- `test_failed_seat_relaunches_when_old_thread_has_unknown_status` (line 632) uses `systemError` as its unknown status; give it a status the protocol does not define (`retired`), so it keeps covering the unknown path.
+- `_read_live_turn` returns `ThreadIdle()` for `idle`, `notLoaded` and `systemError`; any other status returns `ThreadStateUnknown`, which the capacity loop raises as `thread/read failed`. A seat refused for capacity backs off and resumes on the same thread; relaunch and `end` find no live turn on a `systemError` thread and send no `turn/interrupt`.
+- Upstream (codex rust-v0.160.1): the app-server sets `systemError` after any failed turn, a capacity refusal (`server_overloaded`) included, and `note_turn_started` clears it (`app-server/src/thread_status.rs`, `bespoke_event_handling.rs`); the protocol's `ThreadStatus` is `notLoaded | idle | systemError | active{activeFlags}` (`v2/ThreadStatus.ts` from `codex app-server generate-ts`).
+- The capacity budget is per busy spell: in `_attach_and_run`, `capacity_waited` and `capacity_retries` reset at one site, before the `resume_owed` branch, whenever a turn ends without a capacity refusal, a peer turn that completes while a resume is owed included. Within a spell the wait runs 30 s doubling to a 300 s cap, 1200 s in all; on exhaustion the seat prints `codex_mesh: <seat>: model still at capacity after 7 retries over 20 min; thread <id> stays on the roster (codex_mesh.py end --to <seat>)` and the roster reads `capacity_exhausted`.
+- An owed resume starts at once after a turn that ends without a capacity refusal, since a completed turn proves the model is answering; only a capacity refusal earns a wait.
 
 **Files:**
-- `scripts/agents/codex_mesh.py` — `_read_live_turn` accepts `systemError`.
-- `scripts/agents/test_codex_mesh.py` — the stub's error status; the unknown-status test's status; the new tests.
+- `scripts/agents/codex_mesh.py` — `_read_live_turn` status mapping; the per-spell budget reset and owed-resume wait in `_attach_and_run`.
+- `scripts/agents/test_codex_mesh.py` — the stub app-server answers `systemError` after an errored turn (`turn/failed`, or `turn/completed` carrying `error`) until the next `turn/start`, an explicit `thread_statuses` entry winning; the `completed_then_capacity` outcome; budget-reset, relaunch and `end` tests; `test_failed_seat_relaunches_when_old_thread_has_unknown_status` uses `retired`, a status the protocol does not define.
 
-**Seats:** 1 writer + 1 tester.
-- `impl` — `scripts/agents/codex_mesh.py`.
-- `test` — `scripts/agents/test_codex_mesh.py`:
-  - every existing capacity test (`test_capacity_*`, `test_structured_capacity_error_resumes_the_same_thread`) passes with the stub answering `systemError` after the refusal, and resumes on the same thread without repeating the prompt;
-  - a non-capacity turn failure (`test_other_turn_failure_does_not_use_capacity_backoff`) exits with the turn's own error text and no `thread/read failed`;
-  - a failed seat whose old thread reads `systemError` relaunches, sends no `turn/interrupt`, and logs no "could not be interrupted";
-  - `end` on a seat whose thread reads `systemError` logs no "could not be interrupted".
-  - a seat refused, then completing a turn, then refused again starts its second wait at 30 s with the full 1200 s budget.
-
-**Constraints from prior phases:** this phase touches no Phase 1 or Phase 2 file.
-- Tests never start a real `codex` or app-server, never reach the network, and never write `~/.codex`.
-- Saved run output stays under a few GB; read each run and delete it before the next.
-
-**Acceptance gate:**
-- From the worktree root, `python3 -m unittest scripts.agents.test_codex_mesh` green.
-- `basedpyright scripts/agents/codex_mesh.py scripts/agents/test_codex_mesh.py` reports 0 errors and 0 warnings (the counts are the gate).
-- The checkpoint notice says what a seat now prints when a capacity refusal outlasts the 20-minute budget.
+**Gotchas:**
+- `systemError` is not terminal: the thread stays loaded and `turn/start` has no status gate, so a resume on the same thread is valid.
+- A stub that answers `idle` after a refused turn hides the crash; the capacity tests exercise the real server's behavior only through the stub's `systemError` rule.
+- Seats run the live `~/.claude` copy of `codex_mesh.py`, so the fix protects seats only once it is promoted there.

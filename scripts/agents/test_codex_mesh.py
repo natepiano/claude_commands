@@ -164,6 +164,7 @@ class MeshCommandTests(unittest.TestCase):
     queued: list[dict[str, object]]  # pyright: ignore[reportUninitializedInstanceVariable]
     read_failure: str  # pyright: ignore[reportUninitializedInstanceVariable]
     thread_statuses: dict[str, str]  # pyright: ignore[reportUninitializedInstanceVariable]
+    error_threads: set[str]  # pyright: ignore[reportUninitializedInstanceVariable]
     interrupt_error: str  # pyright: ignore[reportUninitializedInstanceVariable]
     interrupt_error_ends_turn: bool  # pyright: ignore[reportUninitializedInstanceVariable]
     hide_turn_id_from_steer: bool  # pyright: ignore[reportUninitializedInstanceVariable]
@@ -187,6 +188,7 @@ class MeshCommandTests(unittest.TestCase):
         self.queued = []
         self.read_failure = ""
         self.thread_statuses = {}
+        self.error_threads = set()
         self.interrupt_error = ""
         self.interrupt_error_ends_turn = False
         self.hide_turn_id_from_steer = False
@@ -228,10 +230,17 @@ class MeshCommandTests(unittest.TestCase):
         if method == "thread/start":
             return [_reply(request, {"thread": {"id": self.next_thread_id}})]
         if method == "turn/start":
+            self.error_threads.discard(cast("str", params.get("threadId", THREAD_ID)))
             self.turn_starts += 1
             self.queued.clear()
             turn_id = f"turn-{self.turn_starts}"
             outcome = self.outcomes.pop(0) if self.outcomes else "completed"
+            if outcome in {
+                "capacity", "capacity_final_queued", "capacity_queued",
+                "capacity_structured", "capacity_completed", "failed",
+                "completed_then_capacity",
+            }:
+                self.error_threads.add(THREAD_ID)
             if outcome == "disconnect":
                 return [_reply(request, {"turn": {"id": turn_id}})]
             if outcome == "capacity":
@@ -296,6 +305,19 @@ class MeshCommandTests(unittest.TestCase):
                         "threadId": THREAD_ID, "turn": {"id": "peer-turn"}
                     }),
                 ]
+            elif outcome == "completed_then_capacity":
+                return [
+                    _reply(request, {"turn": {"id": turn_id}}),
+                    _notice("turn/completed", {
+                        "threadId": THREAD_ID, "turn": {"id": turn_id}
+                    }),
+                    _notice("turn/started", {
+                        "threadId": THREAD_ID, "turn": {"id": "next-turn"}
+                    }),
+                    _notice("turn/failed", {
+                        "threadId": THREAD_ID, "error": {"message": CAPACITY}
+                    }),
+                ]
             else:
                 finished = _notice(
                     "turn/completed", {"threadId": THREAD_ID, "turn": {"id": turn_id}}
@@ -311,6 +333,7 @@ class MeshCommandTests(unittest.TestCase):
             if self.live_turn:
                 self.queued.append(item)
             else:
+                self.error_threads.discard(THREAD_ID)
                 self.auto_turn_starts += 1
                 self.live_turn = "queued-turn"
                 self.announce_live_completion = True
@@ -338,7 +361,8 @@ class MeshCommandTests(unittest.TestCase):
             frames = [_reply(request, {"thread": {
                 "id": thread_id,
                 "status": {"type": self.thread_statuses.get(thread_id) or (
-                    "active" if self.live_turn else "idle"
+                    "active" if self.live_turn else
+                    "systemError" if thread_id in self.error_threads else "idle"
                 )},
                 "turns": turns,
             }})]
@@ -437,8 +461,36 @@ class MeshCommandTests(unittest.TestCase):
         code, errors = self.run_start()
         self.assertEqual(code, 1)
         self.assertIn("ordinary failure", errors)
+        self.assertNotIn("thread/read failed", errors)
+        self.assertEqual(self.waits, [])
         self.assertEqual(len(self.methods("turn/start")), 1)
         self.assertEqual(self.seat_record()["thread_id"], THREAD_ID)
+
+    def test_capacity_budget_resets_after_a_completed_turn(self) -> None:
+        self.outcomes = ["capacity", "completed_then_capacity"] + ["capacity"] * 20
+        args = self.start_args()
+        args.resident = True
+
+        outcome = codex_mesh._run_delegate(args, self.server.port)  # pyright: ignore[reportPrivateUsage]
+
+        self.assertIsInstance(outcome, codex_mesh.CapacityRetriesExhausted)
+        self.assertEqual(self.waits, [30.0, 30.0, 60.0, 120.0, 240.0, 300.0, 300.0, 150.0])
+        self.assertEqual(sum(self.waits[1:]), 1200.0)
+        self.assertEqual(len(self.methods("thread/start")), 1)
+
+    def test_capacity_budget_resets_after_a_peer_turn_completes(self) -> None:
+        self.outcomes = ["capacity", "capacity_with_peer"] + ["capacity"] * 20
+
+        code, errors = self.run_start()
+
+        self.assertEqual(code, 1)
+        self.assertIn("model still at capacity", errors)
+        self.assertIn(THREAD_ID, errors)
+        self.assertEqual(self.waits, [30.0, 30.0, 60.0, 120.0, 240.0, 300.0, 300.0, 150.0])
+        self.assertEqual(sum(self.waits[1:]), 1200.0)
+        self.assertEqual(len(self.methods("thread/start")), 1)
+        self.assertEqual(self.seat_record()["thread_id"], THREAD_ID)
+        self.assertEqual(self.seat_record()["status"], "capacity_exhausted")
 
     def test_failed_turn_does_not_abandon_a_peers_queued_turn(self) -> None:
         self.outcomes = ["failed_with_queued"]
@@ -456,7 +508,8 @@ class MeshCommandTests(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertEqual(len(self.methods("thread/start")), 1)
         self.assertEqual(len(self.methods("turn/start")), 2)
-        self.assertEqual(self.waits, [30.0])
+        self.assertEqual(self.waits, [])
+        self.assertNotIn("capacity retry", (self.session_dir / "seat.log").read_text(encoding="utf-8"))
         self.assertEqual(self.seat_record()["thread_id"], THREAD_ID)
 
     def test_disconnect_after_turn_start_never_repeats_the_prompt(self) -> None:
@@ -635,7 +688,7 @@ class MeshCommandTests(unittest.TestCase):
         _ = (self.session_dir / codex_mesh.ROSTER_FILE).write_text(json.dumps({
             "seat": {"thread_id": old_thread, "turn_id": "", "status": "failed"}
         }), encoding="utf-8")
-        self.thread_statuses[old_thread] = "systemError"
+        self.thread_statuses[old_thread] = "retired"
 
         code, errors = self.run_start()
 
@@ -645,6 +698,22 @@ class MeshCommandTests(unittest.TestCase):
         log = (self.session_dir / "seat.log").read_text(encoding="utf-8")
         self.assertIn(old_thread, log)
         self.assertIn("could not be interrupted", log)
+
+    def test_failed_seat_relaunches_when_old_thread_has_system_error(self) -> None:
+        old_thread = "old-failed-thread"
+        _ = (self.session_dir / codex_mesh.ROSTER_FILE).write_text(json.dumps({
+            "seat": {"thread_id": old_thread, "turn_id": "", "status": "failed"}
+        }), encoding="utf-8")
+        self.thread_statuses[old_thread] = "systemError"
+
+        code, errors = self.run_start()
+
+        self.assertEqual((code, errors), (0, ""))
+        self.assertEqual(len(self.methods("thread/start")), 1)
+        self.assertEqual(self.methods("turn/interrupt"), [])
+        self.assertEqual(self.seat_record()["thread_id"], THREAD_ID)
+        log = (self.session_dir / "seat.log").read_text(encoding="utf-8")
+        self.assertNotIn("could not be interrupted", log)
 
     def test_failed_seat_interrupts_old_turn_before_starting_thread(self) -> None:
         old_thread = "old-failed-thread"
@@ -811,6 +880,23 @@ class MeshCommandTests(unittest.TestCase):
         interrupts = self.methods("turn/interrupt")
         self.assertEqual(len(interrupts), 1)
         self.assertEqual(cast("dict[str, object]", interrupts[0]["params"])["turnId"], "peer-turn")
+
+    def test_end_on_system_error_thread_has_no_turn_to_interrupt(self) -> None:
+        _ = (self.session_dir / codex_mesh.ROSTER_FILE).write_text(json.dumps({
+            "seat": {"thread_id": THREAD_ID, "turn_id": "", "status": "running"}
+        }), encoding="utf-8")
+        self.thread_statuses[THREAD_ID] = "systemError"
+
+        with contextlib.redirect_stdout(io.StringIO()) as output, \
+             contextlib.redirect_stderr(io.StringIO()) as errors:
+            code = codex_mesh.command_end(argparse.Namespace(
+                session_dir=str(self.session_dir), to="seat"
+            ))
+
+        self.assertEqual(code, 0)
+        self.assertEqual(output.getvalue(), "ending seat\n")
+        self.assertEqual(errors.getvalue(), "")
+        self.assertEqual(self.methods("turn/interrupt"), [])
 
     def test_capacity_exhaustion_has_a_distinct_run_outcome(self) -> None:
         """Retry exhaustion is control state, not failure text."""
