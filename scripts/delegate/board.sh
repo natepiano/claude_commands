@@ -12,7 +12,7 @@
 # Usage:
 #   board.sh post    <session_dir> <agent> <kind> <message...>
 #   board.sh read    <session_dir> [--since N] [--from AGENT] [--kind KIND]
-#   board.sh acquire <session_dir> <agent> <resource> [--hold SECONDS] [--wait SECONDS]
+#   board.sh acquire <session_dir> <agent> <resource> [--pid PID] [--hold SECONDS] [--wait SECONDS]
 #   board.sh release <session_dir> <agent> <resource>
 #   board.sh renew   <session_dir> <agent> <resource> [--hold SECONDS]
 #   board.sh role    <session_dir> <slot> <role> [note...]
@@ -40,6 +40,7 @@
 # Produces:
 #   <session_dir>/board.log       — append-only broadcast log, one line per post
 #   <session_dir>/locks/<res>.d/  — token directory; existence IS the lock
+#   <session_dir>/locks/<res>.d/holder_pid — optional pid of the token holder
 #
 # Concurrency: each post is a single write() to an O_APPEND file descriptor,
 # which is the same guarantee heartbeat.sh relies on for its concurrent wrapper
@@ -152,6 +153,27 @@ cmd_read() {
 
 lock_dir() { printf '%s/locks/%s.d' "$1" "$2"; }
 
+# Keep this file and its inode after each use. An open descriptor holds the
+# lock until this shell closes it or exits.
+lock_guard() {
+  if ! exec 9>>"$1"; then
+    return 2
+  fi
+  local status
+  if python3 -c 'import fcntl, sys
+try:
+    fcntl.flock(int(sys.argv[1]), fcntl.LOCK_EX | fcntl.LOCK_NB)
+except BlockingIOError:
+    sys.exit(75)' 9 2>/dev/null; then
+    return 0
+  else
+    status=$?
+  fi
+  exec 9>&-
+  [[ "$status" -eq 75 ]] && return 1
+  return 2
+}
+
 # Read a lock's metadata. Absent metadata means the directory was created a
 # moment ago and its holder has not written itself in yet; treat that as a live
 # lock held by an unknown agent rather than as a free one, so a race never
@@ -165,11 +187,37 @@ lock_is_expired() {
   (( $(now_epoch) > expires ))
 }
 
+pid_is_gone() {
+  local state status
+  if state="$(ps -p "$1" -o stat= 2>/dev/null)"; then
+    [[ "$state" == Z* ]]
+  else
+    status=$?
+    [[ "$status" -eq 1 && -z "$state" ]]
+  fi
+}
+
+lock_stale_reason() {
+  local holder_pid
+  holder_pid="$(cat "$1/holder_pid" 2>/dev/null || true)"
+  if [[ "$holder_pid" =~ ^[1-9][0-9]*$ ]] && pid_is_gone "$holder_pid"; then
+    printf 'pid %s' "$holder_pid"
+    return 0
+  fi
+  if lock_is_expired "$1"; then
+    printf 'expired'
+    return 0
+  fi
+  return 1
+}
+
 write_lock_meta() {
-  local dir="$1" agent="$2" hold="$3"
+  local dir="$1" agent="$2" hold="$3" holder_pid="$4"
   printf '%s' "$agent" > "${dir}/holder"
   printf '%s' "$(( $(now_epoch) + hold ))" > "${dir}/expires"
-  printf '%s' "$$" > "${dir}/pid"
+  if [[ -n "$holder_pid" ]]; then
+    printf '%s' "$holder_pid" > "${dir}/holder_pid"
+  fi
 }
 
 cmd_acquire() {
@@ -177,11 +225,14 @@ cmd_acquire() {
   local agent="${2:?acquire needs <agent>}"
   local resource="${3:?acquire needs <resource>}"
   shift 3
-  local hold="$DEFAULT_HOLD_SECONDS" wait_secs=0
+  local hold="$DEFAULT_HOLD_SECONDS" wait_secs=0 holder_pid=""
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --hold) hold="${2:?--hold needs seconds}"; shift 2 ;;
       --wait) wait_secs="${2:?--wait needs seconds}"; shift 2 ;;
+      --pid) [[ $# -ge 2 ]] || die "--pid must be a positive integer"
+             [[ "$2" =~ ^[1-9][0-9]*$ ]] || die "--pid must be a positive integer"
+             holder_pid="$2"; shift 2 ;;
       *) die "acquire: unknown option '$1'" ;;
     esac
   done
@@ -189,33 +240,43 @@ cmd_acquire() {
   valid_token_name "$resource" || die "bad resource name '$resource'"
   [[ "$hold" =~ ^[0-9]+$ ]] && (( hold > 0 )) || die "--hold must be a positive integer"
   [[ "$wait_secs" =~ ^[0-9]+$ ]] || die "--wait must be a non-negative integer"
-
-  local dir; dir="$(lock_dir "$session_dir" "$resource")"
+  local dir guard; dir="$(lock_dir "$session_dir" "$resource")"
+  guard="${session_dir}/locks/${resource}.guard"
   mkdir -p "${session_dir}/locks"
   local deadline=$(( $(now_epoch) + wait_secs ))
 
   while :; do
     if mkdir "$dir" 2>/dev/null; then
-      write_lock_meta "$dir" "$agent" "$hold"
+      write_lock_meta "$dir" "$agent" "$hold" "$holder_pid"
       cmd_post "$session_dir" "$agent" claim "token ${resource} acquired for up to ${hold}s"
       printf 'acquired %s\n' "$resource"
       return 0
     fi
 
-    # Held. Reclaim it only once it is provably past its own deadline: a
-    # delegate can be killed mid-hold, and a token no dying process ever
-    # releases would strand the phase behind a lock nobody owns.
-    if lock_is_expired "$dir"; then
-      local previous; previous="$(lock_holder "$dir")"
-      rm -rf "$dir"
-      if mkdir "$dir" 2>/dev/null; then
-        write_lock_meta "$dir" "$agent" "$hold"
-        cmd_post "$session_dir" "$agent" claim \
-          "token ${resource} reclaimed from ${previous} after its hold expired"
-        printf 'acquired %s (reclaimed from %s)\n' "$resource" "$previous"
-        return 0
+    # Only one waiter can remove a stale lock. Check it again under the guard,
+    # since another waiter may have replaced it after the first check.
+    if lock_stale_reason "$dir" >/dev/null; then
+      if lock_guard "$guard"; then
+        local reason previous
+        if reason="$(lock_stale_reason "$dir")"; then
+          previous="$(lock_holder "$dir")"
+          rm -rf "$dir"
+          if mkdir "$dir" 2>/dev/null; then
+            write_lock_meta "$dir" "$agent" "$hold" "$holder_pid"
+            exec 9>&-
+            if [[ "$reason" == pid\ * ]]; then
+              cmd_post "$session_dir" "$agent" claim \
+                "token ${resource} reclaimed from ${previous}: holder pid ${reason#pid } is gone"
+            else
+              cmd_post "$session_dir" "$agent" claim \
+                "token ${resource} reclaimed from ${previous} after its hold expired"
+            fi
+            printf 'acquired %s (reclaimed from %s)\n' "$resource" "$previous"
+            return 0
+          fi
+        fi
+        exec 9>&-
       fi
-      continue
     fi
 
     (( $(now_epoch) < deadline )) || break
@@ -231,15 +292,35 @@ cmd_release() {
   local agent="${2:?release needs <agent>}"
   local resource="${3:?release needs <resource>}"
   local dir; dir="$(lock_dir "$session_dir" "$resource")"
-  [[ -d "$dir" ]] || { printf 'not held %s\n' "$resource"; return 0; }
+  local guard="${session_dir}/locks/${resource}.guard"
+  local attempt lock_status guarded=0
+  if [[ -d "$dir" ]] && command -v python3 >/dev/null 2>&1; then
+    for ((attempt=0; attempt<200; attempt++)); do
+      if lock_guard "$guard"; then
+        guarded=1
+        break
+      else
+        lock_status=$?
+      fi
+      (( lock_status == 1 )) || break
+      sleep 0.05
+    done
+  fi
+  if [[ ! -d "$dir" ]]; then
+    (( guarded == 0 )) || exec 9>&-
+    printf 'not held %s\n' "$resource"
+    return 0
+  fi
   local holder; holder="$(lock_holder "$dir")"
   # Releasing a token another agent now holds would hand a third agent a lock
   # while the real holder is still working behind it.
   if [[ "$holder" != "$agent" && "$holder" != "unknown" ]]; then
+    (( guarded == 0 )) || exec 9>&-
     printf 'board.sh: %s does not hold %s (holder is %s)\n' "$agent" "$resource" "$holder" >&2
     return 1
   fi
   rm -rf "$dir"
+  (( guarded == 0 )) || exec 9>&-
   cmd_post "$session_dir" "$agent" release "token ${resource} released"
   printf 'released %s\n' "$resource"
 }
