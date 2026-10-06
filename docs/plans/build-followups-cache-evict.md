@@ -29,7 +29,7 @@ i.e. figuring out the safest buld cache to delete in such situations so we don't
 ## Decisions (unit director)
 
 - **Target first.** Below the floor, removable output is ordered by its target's last use, oldest target first, and inside a target by today's key. The shortfall still sets how much goes, so the least used target loses output until the floor is met, then the next one; a target used minutes ago goes last. This is the user's rule ("get rid of the least used to get us under our threshold") at the granularity a unit owns: one worktree's target.
-- **A target's last use** is the newest of its use stamp's mtime and its units' `last_used`. The stamp `.lint-sweep-used` at the target root is written by every workspace sweep, before its lock check, so a step that ran in that workspace counts even when it compiled nothing; the units' times cover builds outside `lint` that compiled something. `--target-dir` (CI) writes no stamp.
+- **A target's last use** is the newest of its use stamp's mtime and its units' `last_used`. The stamp `.lint-sweep-used` at the target root is written by every workspace sweep that is not a dry run, before its lock check, so a step that ran in that workspace counts even when it compiled nothing; the units' times cover builds outside `lint` that compiled something. `--target-dir` (CI) and `--dry-run` write no stamp.
 - **The workspace budget sweep keeps today's order.** Its groups share one target, so the target key is constant there; nothing in it changes.
 - **One line per target in every floor removal**, so the journal names whose cache went and how recently it was used: `lint sweep: the floor took <GiB> from <target>, last used <when>` (`would take` on a dry run). No `removed` in it (parse.py).
 - **Every build goes ahead, trial merges included** (showrunner, 2026-10-06): the floor takes the shortfall from the least recently used target, so a unit director has nothing to consult first; no forecast tool.
@@ -43,7 +43,7 @@ i.e. figuring out the safest buld cache to delete in such situations so we don't
 - **Layout:**
   - `scripts/lint/sweep.py` — budget sweep, doc-index prune, disk floor, floor alerts; header docstring holds the policy and its measurements
   - `scripts/lint/test_sweep.py` — its tests; `FloorTests` (helpers `base()`, `hold()`, `cargo_target()`, `unit()`) covers the floor
-  - `config/lint.conf` — `sweep_free_floor_gib.natedev=500` and its comment (lines 69–74)
+  - `config/lint.conf` — `sweep_free_floor_gib.natedev` (300 GiB since the user lowered it from 500 on 2026-10-06) and its comment
   - outside the repository: `~/.local/state/lint-sweep/` (floor lock, `floor.json`), `journalctl --user -u disk-floor.service` (EDT), `~/.local/state/buildlog/index.sqlite` (UTC; read only, `?mode=ro`)
 - **Key files:** `scripts/lint/sweep.py` (`Group`, `group_roots`, `scan_roots`, `choose`, `shrink`, `hold_floor`, `sweep_workspace`, `main`, header paragraphs "The disk floor" and "Last use"); `scripts/lint/invoke.sh:229–248` (`sweep_after_step`), `:355–369` (`invoke_sweep`); `scripts/buildlog/parse.py:49–52` (the lines it counts); `docs/as-built/build-memory-admission.md` "Disk-floor alerts" (as-built to amend at run end).
 - **Test lanes:** `scripts/lint/` — `test_*.py` beside the scripts.
@@ -61,7 +61,7 @@ i.e. figuring out the safest buld cache to delete in such situations so we don't
   - Python is typed throughout with no `Any` and no file-level type ignores.
   - `~/.claude` main is the live configuration; each merged phase reaches it at once, and every build step on natedev runs the new sweep from then on.
   - Times carry their zone: this plan states PDT; natedev's journal and `when()` print EDT; build-log stamps are UTC.
-  - Saved run output stays under a few GB: read each run and delete it before the next. A disk-floor sweeper keeps 500 GiB free on `/` by removing build output, least recently used target first once Phase 1 merges.
+  - Saved run output stays under a few GB: read each run and delete it before the next. A disk-floor sweeper keeps the floor free on `/` (500 GiB; 300 GiB once natedev lands the user's change of 2026-10-06 on `build-followups`) by removing build output, least recently used target first once Phase 1 merges.
 
 ## Gates
 
@@ -71,40 +71,33 @@ i.e. figuring out the safest buld cache to delete in such situations so we don't
 
 ## Phases
 
-### Phase 1 — Below the floor, the least recently used target loses output first · status: todo
+### Phase 1 — Below the floor, the least recently used target loses output first · status: done
 
-#### Work Order
+#### As-built
 
-Work only in worktree `/home/natepiano/worktrees/claude-build-followups-cache-evict`, branch `build-followups-cache-evict`. State every time in PDT.
+- **Use stamp.** `USE_STAMP = ".lint-sweep-used"`. `sweep_workspace()` sets its mtime to now in every root `cargo_roots()` returns (creating it empty if missing), before `lock_trees`, so a sweep skipped because a build holds a lock still records the step. A dry run and `--target-dir` (CI) write none; a write failure is ignored.
+- **Target last use.** `target_last_use(root, groups) -> float` is the newest of the stamp's mtime (0 when absent) and the target's groups' `last_used`.
+- **One order.** `Group.build_tree` (required) and `Group.target_used: float = 0.0`; `Scan.orphans` holds one orphan group per build tree. `hold_floor` sets every group's `target_used` from its target. `choose()` sorts by `(target_used, -whole days since last_used, compiled)` and returns `(group, freed)` pairs. The workspace sweep leaves `target_used` at 0, so its order and output are unchanged.
+- **Taken bytes.** `shrink()` returns `(left, failures, taken)`: orphan groups and chosen groups, each with its freed bytes; on a real run a group with any entry that failed to remove is left out. The removal line's `last used <oldest> to <newest>` spans the oldest and newest `last_used` among the chosen groups.
+- **Per-target lines.** After the existing removal lines, `hold_floor` prints one line per target that lost output, largest first: `lint sweep: the floor took <gib> from <target>, last used <when(target last use)>` (`would take` on a dry run). Orphan bytes count toward their target. No floor line contains `removed`; the aggregate orphan line is unchanged.
 
-**Goal:** a build that pushes `/` under the floor costs output from the least recently used idle targets, not a slice of every active unit's working set, and the journal names each target that lost output.
-
-**Spec:**
-- **Use stamp.** `USE_STAMP = ".lint-sweep-used"`. `sweep_workspace()`, when `target_dir is None`, sets the stamp's mtime to now in every root `cargo_roots()` returned (create it empty if missing), before `lock_trees`, so a skipped sweep still records the step. `--target-dir` writes none. A failure to write it is ignored (never fails the sweep).
-- **Target last use.** `target_last_use(root, groups) -> float`: the newest of the stamp's mtime (0 when absent) and `max(group.last_used)` over the target's groups (0 when none).
-- **Group knows its target.** `Group` gains `target_used: float = 0.0`. `hold_floor` fills it for every group of each idle target from `target_last_use` (map each group to its target through the build tree it came from; `group_roots` iterates trees, so a tree→root map built in `hold_floor` from `build_trees(root)` serves). The workspace sweep leaves it 0.
-- **One order.** `choose()` sorts by `(group.target_used, -whole days since last_used, group.compiled)`. With `target_used` 0 everywhere the workspace sweep's order is unchanged.
-- **Per-target lines.** `choose()` returns each chosen group with the bytes it freed. After the existing removal line, a floor sweep prints one line per target that lost output, largest first: `lint sweep: the floor took <gib> from <target>, last used <when(target_used)>`; a dry run says `would take`. Only `hold_floor` prints them; the workspace sweep's output is unchanged. Paths print in full. No line contains `removed`.
-- **Docs in this unit's files.** Rewrite the header's "The disk floor" paragraph: the shortfall sets how much goes; targets go least recently used first, by the stamp and the units' times; a target a build holds is never touched; why (the 2026-10-06 numbers: 801 GiB taken by the timer that day, median 3.0 h since last use; the 60 GiB simulation). Add to "Last use": a no-op build writes nothing under `target/`, so only the stamp records it. Update `config/lint.conf`'s floor comment to the new rule.
-- **Live check, read only, after the tests pass:** a scratchpad script imports this worktree's `sweep`, scans `target_dirs(FLOOR_ROOTS)` without taking locks, and prints, for 60 GiB of shortfall, the targets the new order takes from and how much, beside today's order. Record both lists in the As-built. It removes nothing.
-- **Text for natedev**, sent with the checkpoint notice: the replacement header comment for `disk-floor.nix` lines 2–4 ("the least recently used output of every idle target" → least recently used target first, only the shortfall).
-
-**Tests** (`FloorTests`):
-- An idle target last used 1 h ago whose units were all compiled 3 h ago, and one last used 10 min ago holding one unit compiled 5 h ago; a one-unit shortfall removes a unit of the first and nothing of the second. (Today's order would take the second's.)
-- A target whose units are old but whose stamp is fresh goes after one whose units are newer and has no stamp.
-- A shortfall larger than the oldest target empties it, then takes from the next oldest only what remains.
-- The per-target line names the target and its last use; `would take` on a dry run; no output line contains `removed` beyond the existing removal line.
-- `sweep_workspace` writes the stamp in each root, also when a build holds a lock (the sweep is skipped); `--target-dir` writes none.
-- Update `test_below_the_floor_the_least_recently_used_unit_of_any_target_goes` to the target rule (rename it); the busy-target and at-the-floor tests stay as they are.
+**Live check (read only, 2026-10-06 ~15:50 PDT, 60 GiB shortfall):** 42 targets, 659.1 GiB scanned.
+- Target-first order: `/home/natepiano/rust/bevy_brp_0.20.0-rc1/target` 35.8 GiB (last used 12:46 PDT), `/home/natepiano/rust/bevy_brp/target` 23.0 GiB (12:59 PDT). Nothing else.
+- Prior global unit order: bevy_brp_0.20.0-rc1 35.8 GiB (12:46 PDT), bevy_brp 19.1 GiB (12:59 PDT), `/home/natepiano/rust/tool-based-ui-frame-time/target` 3.2 GiB (15:40 PDT), `/home/natepiano/rust/tool-based-ui-demo/target` 0.7 GiB (15:44 PDT).
 
 **Files:**
-- `scripts/lint/sweep.py` — stamp, target last use, order, per-target lines, header
-- `scripts/lint/test_sweep.py` — the tests above
-- `config/lint.conf` — floor comment
+- `scripts/lint/sweep.py` — use stamp, target last use, target-first floor order, per-target floor lines, orphans per build tree; the header's "The disk floor" and "Last use" paragraphs describe the rule.
+- `scripts/lint/test_sweep.py` — tests for target order, a fresh stamp outweighing older units, a shortfall exhausting the oldest target before the next, dry-run lines, stamping under a held lock, no stamp on a dry run or a named target, orphan-only floor lines, a failed removal leaving its target out, and the removal line spanning oldest to newest unit.
+- `config/lint.conf` — the floor comment states the shortfall and target-first rule.
 
-**Seats:** 1 writer.
+**Binds later work:** the re-measure reads the per-target lines `lint sweep: the floor took <gib> from <target>, last used <when>` from the disk-floor.service journal; they include orphan bytes and exclude groups whose removal failed, so each is GiB actually taken. The removal line's `last used <oldest> to <newest>` range spans the oldest and newest `last_used` among the chosen groups, not the first and last chosen. natedev's floor is 300 GiB (`sweep_free_floor_gib.natedev=300`), live on `build-followups` and `~/.claude` main by 15:47 PDT 2026-10-06.
 
-**Acceptance gate:** `test_sweep.py` passes; basedpyright reports `0 errors, 0 warnings, 0 notes` on both Python files; the live check's two lists are in the As-built, and the new order's 60 GiB list takes from no target used in the last hour while any idle target used earlier holds output.
+**Gotchas:**
+- A no-op cargo build writes nothing under `target/`, and relatime refreshes atimes at most once a day, so only the stamp records a step that compiled nothing.
+- The stamp lags a lint step by up to 5 minutes (`invoke.sh`'s sweep rate limit at line 246); that only reorders targets used within the same 5 minutes, all of which sort after every longer-idle target.
+- `scripts/buildlog/parse.py` counts journal lines containing `removed`, so the per-target lines avoid the word.
+
+**Ruled out:** a `--forecast` mode (the re-measure reads the journal instead); moving the stamp ahead of `invoke.sh`'s rate limit (the lag only reorders targets used within the same 5 minutes).
 
 ### Phase 2 — Re-measure a day after the target order went live · status: todo
 
@@ -116,15 +109,16 @@ Work only in worktree `/home/natepiano/worktrees/claude-build-followups-cache-ev
 
 **Goal:** show whether the floor now takes from the least used targets, and what it costs per day, against the 2026-10-06 numbers.
 
-**Spec (read only):**
-- Window W: T_live to T_live + 24 h; baseline B: the 24 h before T_live.
-- From `journalctl --user -u disk-floor.service` (EDT) for B and W: timer sweeps that removed output, GiB taken, and the hours from each sweep back to the newest unit it took (median, min, max), parsed as this plan's "What exists today" did.
-- From W's per-target lines: GiB taken from targets whose last use was under 1 h, 1–6 h and over 6 h before the sweep, and the five targets that lost the most.
-- From the build log (`?mode=ro`): `sum(sweep_freed_bytes)` of `step='sweep'` on natedev for B and W.
-- Verdict, no threshold: the share of W's GiB taken from targets used under 1 h before the sweep, and GiB a day in W against B.
+**Spec:** every step reads; nothing outside the As-built is written.
+- T_live: the commit time of the first `~/.claude` main commit that contains the Phase 1 checkpoint (`git log --format=%H -1 --grep='^checkpoint(build-followups-cache-evict): phase 1 ' build-followups-cache-evict`): `git -C ~/.claude log --ancestry-path --reverse --format='%h %cI' <checkpoint>..main | head -1`. Window W: T_live to T_live + 24 h; baseline B: the 24 h before T_live. The user lowered the floor from 500 to 300 GiB on 2026-10-06; `sweep_free_floor_gib.natedev=300` was live on `build-followups` and `~/.claude` main by 15:47 PDT, and this branch merged `build-followups` after the Phase 1 checkpoint. Name the floor in force beside every figure, split B or W at the moment the floor changed when it falls inside one, and take the change's time from `git log -S'sweep_free_floor_gib.natedev=300' build-followups -- config/lint.conf` and the time it reached `~/.claude` main.
+- From `journalctl --user -u disk-floor.service` (EDT) for B and W: timer sweeps that removed output, GiB taken, orphan GiB (the `orphaned files` line) apart, and the hours from each sweep back to the newest unit it took (median, min, max), from the `last used <oldest> to <newest>` removal line. In W that line spans oldest to newest unit; in B it named the last unit chosen, which under the old order was the newest by whole days, so label B's figure as that. Flag a sweep with a `could not remove` line as incomplete. Printed GiB are rounded.
+- From W's per-target lines (timer removals): GiB taken from targets whose last use was under 1 h, 1–6 h and over 6 h before the sweep, and the five targets that lost the most. The per-target lines of a complete sweep sum to its removal and orphan lines within rounding.
+- From the build log (`~/.local/state/buildlog/index.sqlite`, `?mode=ro`; schema in `scripts/buildlog/index.py`): `sum(sweep_freed_bytes)` of `step='sweep'` on natedev for B and W, reported as its own daily total beside the timer's.
+- Verdict, no threshold: the share of W's timer GiB taken from targets used under 1 h before the sweep, and GiB a day in W against B, compared within each floor segment (500 or 300 GiB). If the floor removed nothing in W, say so: zero GiB, no top five, no age share, the lowest free space W reached, and that the live order stays unobserved beyond Phase 1's read-only check.
 
-**Files:** `docs/plans/build-followups-cache-evict.md` — the As-built.
+**Files:**
+- `docs/plans/build-followups-cache-evict.md` — the As-built.
 
 **Seats:** 1 writer — `impl` runs the commands and reports.
 
-**Acceptance gate:** every command exits 0; the As-built holds the B/W table, the per-age split, the five targets and the verdict.
+**Acceptance gate:** every command exits 0; the As-built holds the B/W table with the floor beside each figure, the per-age split and the five targets (or the quiet-window statement), and the verdict.
