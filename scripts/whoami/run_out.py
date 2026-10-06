@@ -85,6 +85,20 @@ def trailing_rate(readings: list[Reading], start: float, end: float) -> float | 
     return (inside[-1].used_percent - inside[0].used_percent) / span
 
 
+def latest_drop(readings: list[Reading], end: float) -> float | None:
+    """Time of the latest usage drop by `end`, including a refill or redeemed reset."""
+    previous: Reading | None = None
+    latest: float | None = None
+    for reading in readings:
+        at = reading.at.timestamp()
+        if at > end:
+            break
+        if previous is not None and reading.used_percent < previous.used_percent:
+            latest = at
+        previous = reading
+    return latest
+
+
 def episodes(readings: list[Reading]) -> list[tuple[list[Reading], Reading]]:
     """Each run-out: its readings since the refill before it, up to the first reading at its last level.
 

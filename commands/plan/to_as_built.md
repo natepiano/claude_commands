@@ -18,7 +18,7 @@ feature.
 **Usage:** `/plan:to_as_built [plan-doc-path] [--from-diff]`
 
 **Argument:** the implemented plan doc. If omitted, infer the single plan doc in
-conversation; if none, ask which one rather than choosing on your own.
+conversation; if none, work from the diff (`--from-diff`).
 
 **`--from-diff`:** describe the shipped work from the repository diff instead of
 a plan doc. Use it when the work shipped without a phased plan — a
@@ -34,7 +34,7 @@ This command does not change code and does not commit.
 
 **STEP 1:** Execute <Verify/>
 **STEP 2:** Execute <Distill/>
-**STEP 3:** Execute <ProposeDestination/>
+**STEP 3:** Execute <ChooseDestination/>
 **STEP 4:** Execute <Relocate/>
 **STEP 5:** Execute <ReconcileAsBuilt/>
 **STEP 6:** Execute <Report/>
@@ -89,7 +89,7 @@ shipped:
   type's or a signature's finished shape. A diff shows what moved; the file
   shows what it became.
 
-Capture it as ${CHANGE_SURFACE} and skip to `<ProposeDestination/>`.
+Capture it as ${CHANGE_SURFACE} and skip to `<ChooseDestination/>`.
 
 **Create mode** (the rest of this step):
 
@@ -134,31 +134,21 @@ needed. Do not pad — keep it to load-bearing content.
 
 ---
 
-<ProposeDestination>
+<ChooseDestination>
 **Amend mode:** the destination is the existing docs. Resolve the target list:
 the as-built docs the disposition line names; if it names none, the sibling
-`as-built/` docs whose subjects ${CHANGE_SURFACE} touches. Then ask the user,
-phrased to stand alone:
+`as-built/` docs whose subjects ${CHANGE_SURFACE} touches.
 
 In `diff` mode there is no plan-doc location to take siblings from; use the
 as-built directory the flavor rule below resolves for this repo.
 
-1. One plain-language line — ${SOURCE} `plan`: "Fold the finished `<plan>` plan
-   into the existing reference docs it changed, then delete the plan."
-   ${SOURCE} `diff`: "Update the existing reference docs to match what this work
-   changed."
-2. The operations, in human terms — Edit: each target doc (updated to match the
-   shipped code). Delete, `plan` mode only: `<plan path>` (its content now lives
-   in those docs); in `diff` mode there is nothing to delete, so say so.
-3. A clear choice: confirm / adjust the target list, plus keep the plan doc when
-   there is one.
-
-On confirm, skip `<Relocate/>` and go to `<ReconcileAsBuilt/>`; a plan doc, when
-there is one, is deleted there after the edits are applied.
+State the target list in one line, then skip `<Relocate/>` and go to
+`<ReconcileAsBuilt/>`; a plan doc, when there is one, is deleted there after the
+edits are applied.
 
 **Create mode** (the rest of this step):
 
-Determine the repo flavor and propose the as-built directory:
+Determine the repo flavor and choose the as-built directory:
 
 - **Flavor A — workspace** (root `Cargo.toml` has `[workspace]`, members under
   `crates/*`, and docs are organized per-project as `docs/<project>/…`): the
@@ -171,29 +161,9 @@ In practice the as-built dir is `as-built/` as a sibling of the plan doc's
 location (matching how delegate-ready plans already link `as-built/…`). Examine
 the repo to confirm which flavor applies.
 
-**Then ask the user to confirm — and write the question so it stands on its own.**
-The user may not remember what `/plan:to_as_built` does and has no view into your
-STEP 2 work. Phrase the confirmation like this:
-
-1. **One plain-language line of context first:** what this command is about to do
-   — "Convert the finished `<plan>` plan into a clean reference doc for whoever
-   edits this code next, then file it under `as-built/`." No domain jargon.
-2. **The two file operations, stated plainly** with the human consequence of each,
-   not a code-level description:
-   - Create: `<destination>/<filename>.md` (the new reference doc).
-   - Delete: `<old plan path>` (the original plan, now replaced by the doc above).
-     In `diff` mode there is no plan, so this operation does not appear and the
-     question offers the creation alone.
-3. **A clear choice:** confirm both, keep the old plan, or use a different folder.
-
-**Do NOT** put your STEP 2 fact-check details into this question — symbol names,
-type signatures, magic numbers, what you corrected against the shipped tree. That
-work is internal; surfacing it here buries the actual question and confuses the
-reader. If the distillation needed corrections worth mentioning, save them for the
-final STEP 6 report, not the confirmation prompt.
-
-Moving and deleting files is the user's call — do not relocate before they confirm.
-</ProposeDestination>
+Choose the filename, then state in one line the doc to create and, in `plan`
+mode, the plan it replaces.
+</ChooseDestination>
 
 ---
 
@@ -201,7 +171,7 @@ Moving and deleting files is the user's call — do not relocate before they con
 **Amend mode:** skipped — nothing is created; the plan doc is deleted at the end
 of `<ReconcileAsBuilt/>`.
 
-**Create mode** — after the user confirms the destination:
+**Create mode:**
 
 1. Create the as-built directory if it does not exist.
 2. Write the distilled as-built doc at `<destination>/<filename>.md`.
@@ -210,8 +180,7 @@ of `<ReconcileAsBuilt/>`.
    `as-built/<old>.md` the feature replaced), remove it too — but only what the
    plan explicitly marks for deletion. In `diff` mode skip this step entirely:
    there is no plan doc and nothing was marked for deletion.
-4. Fix any in-repo links that pointed at the old plan path, if you can find them
-   cheaply; otherwise note them in the report for the user to update.
+4. Fix every in-repo link that pointed at the old plan path.
 
 Do not commit.
 </Relocate>
@@ -221,18 +190,17 @@ Do not commit.
 <ReconcileAsBuilt>
 **Amend mode: this step is the primary act.** The subagent's directive changes
 from "check siblings for contradictions" to "fold ${CHANGE_SURFACE} into the
-target docs": for each target doc from `<ProposeDestination/>`, rewrite the
+target docs": for each target doc from `<ChooseDestination/>`, rewrite the
 stale types/signatures/invariants/behavior to the shipped state and integrate
 what the plan added — as current design, not as a changelog. A change with no
 home doc gets a new section appended to the closest existing as-built; only if
 genuinely nothing fits, return it in a `needs_new_doc` list (suggested path +
-reason) for the orchestrator to confirm — never create a file unilaterally.
+reason) for the orchestrator to create — the subagent never creates a file.
 The subagent prompt gets the target-doc list and ${CHANGE_SURFACE} in place of
 the "new as-built doc" input (there is none). The sibling/peer contradiction
 scan below still runs after the targeted folds. When the subagent returns and
-the edits spot-check clean against ${CHANGE_SURFACE}, delete the plan doc (the
-user already confirmed in `<ProposeDestination/>`) and fix any in-repo links
-that pointed at it. In `diff` mode there is no plan doc: the edits are the
+the edits spot-check clean against ${CHANGE_SURFACE}, delete the plan doc and
+fix every in-repo link that pointed at it. In `diff` mode there is no plan doc: the edits are the
 whole act, nothing is deleted, and no links need repointing.
 
 **Both modes:**
@@ -283,11 +251,11 @@ must include:
   migration shim they must not remove, or a gotcha that still bites); that is
   rare. When in doubt, cut it. If stripping the historical narrative leaves a
   doc that is wholly about a replaced/removed design, treat it as `obsolete`
-  (return path + reason for the orchestrator to confirm deletion) rather than
+  (return path + reason for the orchestrator to delete) rather than
   keeping a hollow record.
 - If a doc is rendered **wholly obsolete** (its feature was replaced/removed),
   do **not** delete it. Return its path plus a one-line reason in an
-  `obsolete` list for the orchestrator to confirm.
+  `obsolete` list for the orchestrator to delete.
 - Output: a structured result — `edited` (paths + one-line summary of each fix),
   `peer_docs_scanned` (paths checked in the source plan directory),
   `obsolete` (paths + reason), and `relocate` (path + destination + reason).
@@ -295,12 +263,10 @@ must include:
 After the subagent returns:
 - The content edits are already applied; spot-check them against the change
   surface for accuracy.
-- For each `obsolete` doc, **state the path and reason and ask the user to
-  confirm deletion** before removing it. Deleting a file is the user's call.
-- For each `relocate` doc, state the path, destination, and reason and ask the
-  user to confirm the move. On confirm, move the file into the as-built
-  directory and fix in-repo links to its old path (including links in the new
-  as-built doc).
+- Decide each `obsolete`, `relocate`, and `needs_new_doc` entry yourself and act
+  on it: delete the doc; move it into the as-built directory and fix in-repo
+  links to its old path (including links in the new as-built doc); or create
+  it. State each in one line.
 </ReconcileAsBuilt>
 
 ---
@@ -314,11 +280,11 @@ Produce a succinct markdown table:
 | Mode | <create / amend> |
 | Source | <plan doc path / diff: base + changed-file count> |
 | As-built | <create: new path / amend: target docs updated, one line each> |
-| Removed | <old plan path; any predecessor + confirmed-obsolete as-built deleted, or None> |
+| Removed | <old plan path; any predecessor + obsolete as-built deleted, or None> |
 | Reconciled | <sibling as-built and peer source-doc edits made, one line each, or None> |
 | Relocated | <peer docs moved into as-built/, or None> |
 | Flavor | <A workspace / B package; create mode only> |
-| Links to fix | <paths needing a manual link update, or None> |
+| Links fixed | <paths whose links were repointed, or None> |
 ```
 
 Then stop.
@@ -338,17 +304,14 @@ Then stop.
   not re-explore the repo itself.
 - The as-built is for a future implementer: keep architecture, types, invariants,
   gotchas, and rationale; drop phase/Work Order/process scaffolding.
-- Get explicit user confirmation before relocating or deleting any file. Write
-  that confirmation so it stands alone — one plain line of context + the two file
-  operations in human terms. Never dump distillation fact-check internals (symbols,
-  signatures, magic numbers) into the question.
+- Never ask the user. The session running this command chooses the folder and
+  filename and makes every create, delete, and move, stating each in one line;
+  the user asks for a redo if they disagree (user, 2026-10-06).
 - Reconcile sibling as-built docs and peer docs in the source-doc directory after
-  writing the new one: apply content fixes in place (fix, do not flag), but
-  confirm with the user before deleting an obsolete doc.
-- Peer docs classified as current-state contracts are offered for relocation
-  into `as-built/` — moved only on user confirmation.
+  writing the new one: apply content fixes in place (fix, do not flag) and
+  delete obsolete docs.
+- Peer docs classified as current-state contracts move into `as-built/`.
 - `amend` disposition: no new doc and no distillation — fold the plan's change
-  surface into the existing as-built docs, then delete the plan (user-confirmed).
-  `needs_new_doc` items require explicit user confirmation before any file is
-  created.
+  surface into the existing as-built docs, then delete the plan. The
+  orchestrator creates any `needs_new_doc` items.
 - Do not change code and do not commit.

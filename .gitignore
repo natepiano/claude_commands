@@ -16,6 +16,8 @@
 !commands/**
 !config/
 !config/**
+/config/showrunners.json
+/config/showrunners.lock
 !docs/
 !docs/**
 !scripts/

@@ -986,7 +986,9 @@ of:
 **A repair to what is drawn is proved live before it closes.** Before closing
 the round or dispatching its closure review, launch the build and probe each
 repaired visible finding in the running app (BRP for a Bevy app): hover it,
-crop the shot, read the drawn pixels or layout. A visible finding that fails a second time gets a live
+crop the shot, read the drawn pixels or layout. In Hana, shoot with
+`/hana_shot` (a stored view or `--target`), every view in one call, never a
+camera worked out by hand. A visible finding that fails a second time gets a live
 diagnosis of its cause before any new seat, and the next prompt carries the
 measured cause.
 
@@ -1081,7 +1083,7 @@ instructions name; with none, skip and say so in one line.
    run's port at normal size — the same shots the checkpoint notice sends
    (<ProductionUnit/> item 3). Never view them yourself. In Hana, shoot with
    `/hana_shot`: a stored view (`crates/hana/brp_views.toml`) or an ad hoc
-   `--target`, never a camera worked out by hand. A changed view the file
+   `--target`, every view in one call, never a camera worked out by hand. A changed view the file
    lacks gets `views add`; when the scene changed, run `views check` and commit
    the file with the phase.
 2. Open an activity; the

@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import override
 
 import run_out
-from run_out import Reading, episodes, lean, ratios, read_run_outs, record_run_outs, trailing_rate
+from run_out import Reading, episodes, latest_drop, lean, ratios, read_run_outs, record_run_outs, trailing_rate
 
 START = datetime(2026, 10, 5, 12, 0, tzinfo=timezone.utc)
 
@@ -44,6 +44,20 @@ class RunOutTests(unittest.TestCase):
         self.assertIsNone(trailing_rate(readings, START.timestamp(), (START + timedelta(hours=1)).timestamp()))
         readings = climb([10, 20])
         self.assertAlmostEqual(trailing_rate(readings, START.timestamp(), (START + timedelta(hours=1)).timestamp()) or 0, 10 / 3600)
+
+    def test_latest_drop_finds_refill_then_redeemed_reset(self) -> None:
+        readings = climb([42, 99, 0, 19, 5, 20])
+        self.assertEqual(latest_drop(readings, readings[3].at.timestamp()), readings[2].at.timestamp())
+        self.assertEqual(latest_drop(readings, readings[-1].at.timestamp()), readings[4].at.timestamp())
+
+    def test_latest_drop_ignores_readings_after_end(self) -> None:
+        readings = climb([42, 99, 0, 19, 5])
+        self.assertEqual(latest_drop(readings, readings[3].at.timestamp()), readings[2].at.timestamp())
+        self.assertIsNone(latest_drop(readings, readings[1].at.timestamp()))
+
+    def test_latest_drop_is_none_without_a_drop(self) -> None:
+        self.assertIsNone(latest_drop([], START.timestamp()))
+        self.assertIsNone(latest_drop(climb([0, 20, 20, 99]), (START + timedelta(hours=3)).timestamp()))
 
     def test_run_out_at_empty_and_reset_when_nearly_out_count(self) -> None:
         emptied = climb([80, 90, 100, 100])

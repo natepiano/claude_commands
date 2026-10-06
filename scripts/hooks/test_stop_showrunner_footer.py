@@ -163,6 +163,37 @@ class ShowrunnerFooterHookTests(unittest.TestCase):
             with self.subTest(items=waiting.count("\n* ")):
                 self.assert_passes(self.run_hook("Done.\n" + footer + waiting))
 
+    def test_footer_stays_valid_when_a_reading_arrives_after_its_stamp(self) -> None:
+        zone = ZoneInfo(ZONE)
+        stamp = datetime.fromtimestamp(datetime.now(zone).timestamp() - 60, zone).replace(second=0, microsecond=0)
+        account = self.root / "rust/hanadocs/agents/test agent.md"
+        readings = self.root / ".local/state/agent-notes/readings.jsonl"
+        before_at = stamp + timedelta(seconds=20)
+        after_at = stamp + timedelta(minutes=1, seconds=10)
+
+        def note(remaining: int, checked: datetime) -> None:
+            _ = account.write_text(
+                "---\nstate: active\n"
+                + f"weekly_remaining_usage: {remaining}\n"
+                + f"weekly_usage_checked_at: {checked.isoformat()}\n"
+                + f"resets: {(stamp + timedelta(days=3)).isoformat()}\n"
+                + "limit_reset_count: 0\n---\n",
+                encoding="utf-8",
+            )
+
+        def reading(remaining: int, at: datetime) -> str:
+            return json.dumps({"account": "test agent", "at": at.isoformat(), "remaining": remaining}) + "\n"
+
+        note(81, before_at)
+        _ = readings.write_text(reading(81, before_at), encoding="utf-8")
+        footer = self.footer(at=stamp)
+        self.assertIn("* test agent: 19%", footer)
+
+        note(80, after_at)
+        _ = readings.write_text(reading(81, before_at) + reading(80, after_at), encoding="utf-8")
+        self.assertEqual(self.footer(at=stamp), footer)
+        self.assert_passes(self.run_hook("Done.\n" + footer + WAITING_BLOCK))
+
     def test_missing_footer_blocks_with_exact_current_lines_and_active_agent(self) -> None:
         reason = self.assert_blocked_with_current_footer("Done.")
         self.assertIn("\n---\n", reason)

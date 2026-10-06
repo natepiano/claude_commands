@@ -1,6 +1,6 @@
 # Quota alerts: the receiver's protocol
 
-natedev's agent-sessions timer checks every active Claude and Codex account's weekly usage every 2 minutes (`~/.claude/scripts/whoami/agent_notes.py`, which writes `~/rust/hanadocs/agents/*.md`) and messages the sessions in `~/.claude/scripts/whoami/quota_alert.json` (`notify`, by session name). Mechanics: the docstring of `quota_alert.py` beside it.
+natedev's agent-sessions timer checks every active Claude and Codex account's weekly usage every 2 minutes (`~/.claude/scripts/whoami/agent_notes.py`, which writes `~/rust/hanadocs/agents/*.md`) and messages `always` and each showrunner in `~/.claude/config/showrunners.json` by session name. `/showrunner:produce` adds each showrunner. Mechanics: the docstring of `quota_alert.py` beside it.
 
 Notices arrive through `send.py` (/message) from the relay `quota_alert`, which cannot be answered; a session not running when one is sent has it queued. Tell them apart by the first line:
 

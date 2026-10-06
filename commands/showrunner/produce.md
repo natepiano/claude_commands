@@ -72,12 +72,10 @@ State:
   - whether a unit edits files outside its **Owns**, another unit's crate
     included: settle it by who holds the files on the berth board and when
     each holder merges, as <Dependencies/> rule 3 settles a file wait. No
-    rule needs the user's OK for this (user, 2026-10-04);
-  - a unit director's as-built close-out form, when the choice is the logical one.
-
-  Unusual as-built choices go to the user: a folder other than the usual
-  as-built folder, a change to the main plan's scope, or deleting anything
-  besides the unit plan.
+    rule needs the user's OK for this (user, 2026-10-04).
+- **As-built close-out** is the unit director's: it decides, reports what moved,
+  and never asks (user, 2026-10-06). A scope change to the main plan is a
+  product choice, not an as-built one.
 - **What reaches the user:**
   - a unit director's `— decision:` for the user, shown in the unit director's
     words, with the answer relayed back;
@@ -95,7 +93,7 @@ State:
   own message — send the unit director `From the showrunner: run /unit:eta (or read ~/.claude/commands/unit/eta.md if it is not in your skill list)` by SendMessage, in that same
   turn. Ask once per phase; ask again only if it answered without a time. Until
   it answers, report that ETA as `none measured - requested`.
-- **Waiting on block.** After the footer, leave two empty lines, write `Waiting on:`, leave one empty line, then write one `* ` bullet per item. Put the user's items first. Name each item by what it is and what it is doing, never by a task, agent or session id.
+- **Waiting on block.** After the footer, leave two empty lines, write `Waiting on:`, leave one empty line, then write one `* ` bullet per item. The user's items come first. Every other item leads with its ETA from measured runs, without the zone, soonest first: `19:45 (18:20–23:55) - startup Phase 16`; items with none follow, led by `no ETA measured - `. Name each item by what it is and what it is doing, never by a task, agent or session id. User, 2026-10-06.
 - **Footer.** Paste the output of
   `python3 ~/.claude/scripts/production/dailies_render.py --footer --zone <ZONE>`,
   word for word before the Waiting on block. It starts with a blank line and `---`, then
@@ -228,6 +226,7 @@ For each unit without a live unit director:
      `tmux new-session -d -s <session> -c <worktree> -e SHOWRUNNER_UNIT=<slug> zsh -ic "ENABLE_TOOL_SEARCH=true command claude --remote-control <session> -n <session> --settings '{\"disableAgentView\": true}' '/unit:delegate <unit plan>'; exec zsh"`
 3. **Check.** Log the launch only after the pane shows `/remote-control is
    active`. The mobile session list lags by minutes; trust the pane.
+   Run `$HOME/.claude/scripts/lib/py $HOME/.claude/scripts/production/showrunners.py add <this session's name> --zone <zone> --unit <session>`.
 4. **Resume.** To bring back a unit director whose session ended, use
    `claude --resume <session-id> --remote-control <session> -n <session>`, which
    keeps its link and its place in the list.
@@ -259,7 +258,10 @@ Run these steps at the start and on every resume:
    $HOME/.claude/scripts/production/production_check.sh <absolute doc path>"`,
    plus `--aligned` when that line says on the hour. A repeated `new` retargets
    without moving the clock.
-4. **Status.** Run `NOTIFIER status UPDATES` for the next tick and fire log.
+   Run `$HOME/.claude/scripts/lib/py $HOME/.claude/scripts/production/showrunners.py add <this session's name> --zone <zone> --unit <each unit's tmux session>`, using the name from ListAgents.
+4. **Stall watch.** If `NOTIFIER status stall-watch` reports no instance, run
+   `NOTIFIER new stall-watch --every 1 --run "$HOME/.claude/scripts/lib/py $HOME/.claude/scripts/production/stall_watch.py"`.
+5. **Status.** Run `NOTIFIER status UPDATES` for the next tick and fire log.
    The declared job runs the ticks.
 
 The prompt:
@@ -305,8 +307,7 @@ script, and then runs `NOTIFIER restart UPDATES` so the next tick comes N minute
 that report (`/showrunner:dailies` → Status check and clock).
 `/showrunner:interval <minutes>` changes N.
 
-Log `UPDATES` and its `next_due`. Then check that this session is on
-the quota alert list (<QuotaAlert/>).
+Log `UPDATES` and its `next_due`. Read the quota alert protocol (<QuotaAlert/>).
 
 Each run of the script does two things:
 - It scans every unit director for a form or decision waiting on the user.
@@ -550,8 +551,8 @@ choice the user's taste must settle, apply <DesignAuthority/>; otherwise add
 the rule to the guide.
 
 Any Hana shot the showrunner or its helpers take uses `/hana_shot` (stored
-views in `crates/hana/brp_views.toml`); a unit director working a camera out by
-hand gets pointed at it.
+views in `crates/hana/brp_views.toml`), every view in one call; a unit director
+or helper working a camera out by hand gets pointed at it.
 </DesignCheck>
 
 ---
@@ -884,9 +885,7 @@ them, how to tell the three kinds apart, and what a receiver does are in
 `~/.claude/docs/quota_alerts.md`. Read it at <StartUpdates/> and follow it; this
 section adds only what the showrunner role needs.
 
-**The list.** At <StartUpdates/>, check that this session's name, as ListAgents
-gives it for "This session is", is in the `notify` list the doc names. The user
-keeps the list: if the name is missing, tell them once; never edit the file.
+This session is on the quota alert list because <StartUpdates/> adds it.
 
 **Unit directors act through you.** They are not on the list, so each notice
 reaches them only as your relay (<Throughout/>):
@@ -922,7 +921,8 @@ When every unit's final-gate and as-built checkpoints are merged:
      `git -C CHECKOUT ls-remote --exit-code --heads origin <branch>` finds it.
 
    Leave the tmux sessions; the user closes them.
-4. Remove the update instance: `NOTIFIER remove UPDATES`.
+4. Remove the update instance with `NOTIFIER remove UPDATES`, then run
+   `$HOME/.claude/scripts/lib/py $HOME/.claude/scripts/production/showrunners.py remove <this session's name>`.
 5. Set the doc's status to `wrapped`, commit it as
    `production(<name>): wrapped`, and push.
 6. Report:
