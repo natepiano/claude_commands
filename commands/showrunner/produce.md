@@ -347,7 +347,9 @@ Input: the unit, phase, hash and shots from its notice.
    If this change moves, splits or deletes files the other unit has in flight,
    apply <CrossUnitChange/> step 2 before merging. If the overlap is only an
    edit to the same file, tell that unit director in one line which file
-   changed under it.
+   changed under it, and to merge the merge branch at its next pause between
+   seat tasks, not at its own checkpoint, so conflicts are settled while small.
+   User, 2026-10-05.
 5. **New public items.** Each new `pub` item in the diff needs a user in
    production code. One with no consumer goes back to the unit director as a
    finding.
