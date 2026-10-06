@@ -111,46 +111,29 @@ A unit's `then` in the dailies input is a JSON list of one-line items, one per u
 
 ### Phase 4 — A unit can wait on standby, and promote and produce use the command · status: done
 
-**Blocked by:** G1 — stalls-unit phase 6 merged into `build-followups` (cleared: `966b814`, merged into this branch as `86a9b19`)
+#### As-built
 
-#### Work Order
-
-Work only in worktree `/home/natepiano/worktrees/claude-build-followups-enh-showrunner`, branch `build-followups-enh-showrunner`. State every time in PDT.
-
-**Source:** the user, 2026-10-06 14:0x PDT, through the showrunner (natedev): "... and even a unit that just needs to sit there and be ready to go". The rest of the original Phase 1, split out by the unit director 2026-10-06 14:5x PDT because it edits the four hub files stalls-unit Phase 6 changes.
-
-**Goal:** `/showrunner:add_unit <name> --standby` starts a unit that does nothing until the showrunner sends it work, and the stall watcher never bumps it while it waits. `promote_unit.md` uses `add_unit.py --resume` for its launch and record steps, and `produce.md` <LaunchUnits/> shrinks to the command.
-
-**Spec:**
-- **Standby mode:** `add_unit.py` and `add_unit.md` gain `--standby`, a third named state `Standby` beside `PlanGiven` and `BriefGiven`; exactly one of the three. It writes no plan; the row's Plan cell reads `standby`; the commit subject ends `(standby)`; the prompt is `You are <name>-unit in production <slug> (doc <path>), under the showrunner <session>, on standby. Work only in your worktree <worktree>, branch <branch>. Do nothing until the showrunner sends you work.`; step 7 passes `--standby` to `showrunners.py add`; the LOG line says `standby`.
-- **The registry:** `showrunners.py add` gains `--standby`, which records the unit in that showrunner's `standby` list; `showrunners.py ready <session> --unit <name>` takes it out, and the showrunner runs it when it hands the unit work, changing the Units row's Plan cell from `standby` to the plan. The config reader converts each unit into a named state (working or standby) at the boundary. `stall_watch.py` never bumps or reports a standby unit.
-- **Promote:** `promote_unit.md` keeps steps 1, 2 and 5 (find it, check fit, stop it) and replaces steps 3, 4, 6 and 7 with one call of `add_unit.py --resume <sessionId> --cwd <cwd> --plan <plan>`.
-- **Produce:** <LaunchUnits/> becomes the command, one line per unit to start, plus what stays the showrunner's own: typing `/compact` into a unit director blocked on a full context, and **Resume** (step 4). <StartRun/>'s worktree and launch steps point to it.
+- `add_unit.py --standby` is a third named launch state, `Standby` beside `PlanGiven` and `BriefGiven` in `UnitLaunch.plan`; exactly one of the three, else exit 2 with no change. It writes no plan, the Units row's Plan cell reads `standby`, the commit subject ends `(standby)` (`recorded_mode` accepts it), the prompt tells the unit to do nothing until the showrunner sends work, and `showrunners.py add --standby` records it.
+- `showrunners.py` keeps a per-showrunner `standby` list; the config reader turns each unit into `WorkingUnit | StandbyUnit` (`UnitState`) at the boundary. `showrunners.py ready <session> --unit <name>` takes a unit off standby (one not on standby: prints `<unit> is not on standby`, exit 0, no change); `list` marks `<unit>:standby`. The showrunner runs `ready` when it hands the unit work and changes the Plan cell from `standby` to the plan.
+- `stall_watch.py` skips a standby unit before any bump or notice, and a last turn line starting `done:` resets the stretch and skips the unit.
+- Units rows are read cell by cell: `cell_value(value: str) -> str` (first backticked span, else text before ` — `, shared with `production_field`) and `unit_rows(lines: list[str]) -> tuple[int, list[str]]` (insert index, data rows). A unit's existing row is adopted (`NoUnitRow | ExistingUnitRow`) when Plan, Worktree, Branch and Session agree; its Port and Owns stand, and `--port`/`--owns` (`OmittedCell | SuppliedCell`) must match them.
+- `add_unit.py --check` runs `launch_request` and `preflight` only: exit 0 or 2, nothing written or started.
+- `promote_unit.md` order: find, check fit (normalized unit name), plan, `add_unit.py --check`, stop, launch and record (`add_unit.py --resume <sessionId> --cwd <cwd> --plan <plan>`), tell the user (both names when the name changed). `produce.md` <LaunchUnits/> runs `add_unit.py --production PRODUCTION_DOC <name> --plan <unit plan>` per unit (`--standby` for one waiting on work), with `<name>` the Unit value without `-unit`; typing `/compact` into a blocked unit director and **Resume** stay the showrunner's own.
 
 **Files:**
-- `commands/showrunner/add_unit.md` — `--standby`.
-- `scripts/production/add_unit.py` — the `Standby` state; `scripts/production/test_add_unit.py`.
-- `scripts/production/showrunners.py` — `--standby` and `ready`; `scripts/production/test_showrunners.py`.
-- `scripts/production/stall_watch.py` — skips a standby unit; `scripts/production/test_stall_watch.py`.
-- `commands/showrunner/produce.md` — <LaunchUnits/> shrinks to the command.
-- `commands/showrunner/promote_unit.md` — steps 3, 4, 6 and 7 call the script.
+- `scripts/production/add_unit.py` — `Standby` state, row adoption, `cell_value`/`unit_rows`, `--check`; `test_add_unit.py`.
+- `scripts/production/showrunners.py` — standby registry, `WorkingUnit | StandbyUnit`, `add --standby`, `ready`; `test_showrunners.py`.
+- `scripts/production/stall_watch.py` — skips standby, resets on `done:`; `test_stall_watch.py`.
+- `commands/showrunner/add_unit.md` — `--standby`; `promote_unit.md` — the order above; `produce.md` — <LaunchUnits/> as the command.
 
-**Seats:** 1 writer + 1 tester.
-- `impl` — `commands/showrunner/add_unit.md`, `scripts/production/add_unit.py`, `scripts/production/showrunners.py`, `scripts/production/stall_watch.py`, `commands/showrunner/produce.md`, `commands/showrunner/promote_unit.md`; post `done` without waiting for the test seat.
-- `test` — the standby cases in `scripts/production/test_add_unit.py`, `scripts/production/test_showrunners.py` and `scripts/production/test_stall_watch.py`, from the Spec alone; owns the final suite run:
-  - `--standby`: the row's Plan cell reads `standby`, the config lists the unit as standby, no plan is written, the prompt is the standby one, and the stall watcher skips the unit while it stays idle; after `ready` it is bumped as any unit;
-  - `--standby` with `--plan` or `--brief` exits 2 with no change;
-  - `showrunners.py ready` on a unit that is not standby changes nothing and says so.
+**Binds later work:** the checkpoint-merge command reads a unit's Units row (Branch, Owns) only through `cell_value` and `unit_rows`; stall-watch changes keep the standby skip and the `done:` reset.
 
-**Constraints from prior phases:**
-- Phase 1 (as built): `add_unit.py` and its typed launch request; add the state, never a parallel path. `UnitLaunch.plan` is `PlanGiven | BriefGiven` — `Standby` joins that union; `recorded_mode` reads the mode from the commit subject `production(<slug>): add unit <unit> (<mode>)` and must accept `standby`; `prompt_for` gains the standby prompt; every refusal stays in `preflight`, before any write; tmux targets are `=<name>`.
-- stalls-unit Phase 5 (as built): every edit of `config/showrunners.json` goes through `showrunners.py`'s locked write (`change()`), and `stall_watch.py` reads units from it.
-- stalls-unit Phase 6 (as built at G1; it also makes `stall_watch.py` find a unit whose pane process is `claude` itself): `showrunners.py rename` and `import` of both prompt forms, `unit_status.sh … --showrunner <session>`, the `tmux-names` instance; build on them, never a parallel copy.
-- Tests never start a real `claude`, `tmux` or `systemd-run`, never write the real `~/.claude/config/showrunners.json`, `~/.local/state/` or a real production doc, and never push anywhere but a temporary bare repository.
+**Gotchas:**
+- Every row of a real production doc is backticked and carries commentary; empty-table tests do not show it.
+- produce.md has no <StartRun/>; launch lives in <LaunchUnits/>.
+- `--check` does no tmux lookup: a tmux name collision can still refuse after the stop.
 
-**Acceptance gate:**
-- From the worktree root, `python3 -m unittest discover -s scripts/production -p 'test_add_unit.py'`, `-p 'test_showrunners.py'` and `-p 'test_stall_watch.py'` green; basedpyright 0 errors and 0 warnings on the changed `.py` files.
-- Live (natedev, once the merge reaches `~/.claude` main): `/showrunner:add_unit add-scratch --standby` prints the attach line, the pane shows remote control active, `showrunners.py list` shows `add-scratch` standby, and the stall watcher does not bump it over 6 idle minutes. Then remove it as in Phase 1's live gate.
+**Ruled out:** rewriting a pre-filled Units row to the script's own form.
 
 ### Phase 5 — One command merges a checkpoint, and every other showrunner step gets a script-or-not verdict · status: todo
 
@@ -182,25 +165,29 @@ Work only in worktree `/home/natepiano/worktrees/claude-build-followups-enh-show
   <MergeCheckpoint/>'s report to the user carries these lines, plus one line in the same form for each unit worktree the showrunner then merges the merge branch into.
 - The last line printed is `send <unit>: <message>`: the merged line with the next step, or the hold or failure and what the unit does.
 - `commands/showrunner/produce.md` <MergeCheckpoint/>: steps 1–3 and 7–10 and the record step become the call, run in the background; steps 4–6 (other units, new public items, design check), <ClearGate/>, <CrossUnitChange/>, <CIPoint/> and `review_regime.py watch` stay the showrunner's, read from the script's lines.
+- **Stall watch** (the showrunner, 2026-10-06 16:5x PDT, routing it to this unit as `stall_watch.py`'s owner): the rule is idle 10+ minutes, nothing running, no external block. `stall_watch.py` sends no bump and no showrunner notice while the last turn-end line on a unit's pane is `— blocked: …`; it treats that line as it treats `done:`, a fresh stretch, so the idle clock starts at the next status that is not a block. Seen 16:23 PDT (cache-evict, `— blocked: waiting on the showrunner: G1 …`) and 16:4x PDT (mul_add, `— blocked: the 96-hour measurement window …`).
+- **Footers off** (the user's footer rule, relayed by the showrunner 2026-10-06 16:5x PDT): turning footers off drops the Waiting on block as well. `commands/showrunner/produce.md` still gives the old rule in two places, line 96 ("or after the reply when footers are off, leave two empty lines, write `Waiting on:`…") and lines 133–136 ("reports off, end each reply with the Waiting on block alone"); both say that off drops the Waiting on block too. hook-unit's footer commit (`showrunner_footer.py`, its test and `footer.md`) lands about 17:25 PDT; read it before editing so the wording matches.
 - **The audit:** every other step in `produce.md` and `commands/showrunner/dailies.md` the showrunner must remember — building the dailies input from `unit_status.sh`, the idle check, promotion and the Mac pull included — one row each: the step, where it lives, `script` or `judgment`, and why. Written into this phase's As-built; each `script` row the unit director turns into a follow-up phase with its own Work Order.
 
 **Files:**
 - `scripts/production/merge_checkpoint.py` — new.
 - `scripts/production/test_merge_checkpoint.py` — new.
 - `commands/showrunner/produce.md` — <MergeCheckpoint/> calls the script.
+- `scripts/production/stall_watch.py` — no bump while the last status is `— blocked:`; `scripts/production/test_stall_watch.py`.
 
 **Seats:** 1 writer + 1 tester.
-- `impl` — `scripts/production/merge_checkpoint.py`, `commands/showrunner/produce.md`; post `done` without waiting for the test seat.
-- `test` — `scripts/production/test_merge_checkpoint.py` from the Spec alone, with real `git` in temporary repositories and a temporary bare `origin`, stubs on `PATH` for `verify.sh`, `validate_and_push.sh`, `review_regime.py` and `ssh` recording argv: each step's `held` and `failed` cases with no merge left behind; a red package reset and a known flake continuing; the green `git` path merging diverged `origin/main`, pushing, promoting a second temporary checkout by fast-forward and reading the Mac's `rc=`; a promote refused by an uncommitted file fails without undoing the push; the record call's argv and the LOG line; the `into:` lines, with a gate the merge clears and with none, and one per **Promote** checkout; the record call's full real argv; a promote that fails after the push prints the `into:` lines reached, and a re-run resumes at that promote; the promote fast-forwards to the pushed tip after a diverged `origin/main` merge; `--shrink` with the plan doc and the next-items file merges, and is `held` when another path is staged or the phase's code checkpoint has not merged. Owns the final suite run. Then the audit table, in its summary.
+- `impl` — `scripts/production/merge_checkpoint.py`, `commands/showrunner/produce.md`, `scripts/production/stall_watch.py`; post `done` without waiting for the test seat.
+- `test` — `scripts/production/test_merge_checkpoint.py` from the Spec alone, with real `git` in temporary repositories and a temporary bare `origin`, stubs on `PATH` for `verify.sh`, `validate_and_push.sh`, `review_regime.py` and `ssh` recording argv: each step's `held` and `failed` cases with no merge left behind; a red package reset and a known flake continuing; the green `git` path merging diverged `origin/main`, pushing, promoting a second temporary checkout by fast-forward and reading the Mac's `rc=`; a promote refused by an uncommitted file fails without undoing the push; the record call's argv and the LOG line; the `into:` lines, with a gate the merge clears and with none, and one per **Promote** checkout; the record call's full real argv; a promote that fails after the push prints the `into:` lines reached, and a re-run resumes at that promote; the promote fast-forwards to the pushed tip after a diverged `origin/main` merge; `--shrink` with the plan doc and the next-items file merges, and is `held` when another path is staged or the phase's code checkpoint has not merged. Also `scripts/production/test_stall_watch.py`: a unit idle past the stall minutes whose last status is `— blocked: waiting on the showrunner: G1 …` gets no bump and no notice; the same for `— blocked: the 96-hour measurement window …`; a unit whose last status is `— holding: …` with nothing running is still bumped. Owns the final suite run. Then the audit table, in its summary.
 
 **Constraints from prior phases:**
 - A shrink notice (`From <unit>: phase <N> shrink <hash> — plan doc only.`, or `— plan doc and <next-items path>.`) merges with no review-ledger row and no CI count (the showrunner, 16:2x PDT, doing it by hand until this lands).
 - Phase 1 (as built): `add_unit.py` reads the production doc with `read_production(path) -> Production` (doc, slug, merge_branch, checkout, showrunner_session, log, zone) and `production_field(lines, field) -> str`; import them, never a second parser.
+- Phase 4 (as built): `add_unit.py` reads a Units cell with `cell_value(cell) -> str` (its first backticked span, else its text before ` — `, the rule `production_field` uses) and the table with `unit_rows(lines)`; read the unit's row (Branch, Owns) through them, since a production's rows are backticked. `stall_watch.py` skips a standby unit before any bump, and resets the stretch on a `done:` line (`TURN_END`); the blocked rule sits beside that reset.
 - Phase 4 (as built at its merge): it edits `produce.md` <LaunchUnits/>; this phase edits <MergeCheckpoint/>. Starts beside Phase 4 once Phase 1 merges, claiming `produce.md` after it.
 - Tests never push anywhere but a temporary bare repository, never run real `ssh`, and never write the real `~/.claude` checkout or `~/.local/state/`.
 - Only the showrunner merges (production_format item 4): the live gate is natedev's.
 - Phase 3 (as built at its merge): a unit sends a second notice, `From <unit>: phase <N> shrink <hash> — plan doc only.`, for a commit whose only path is its plan doc. `merge_checkpoint.py` takes it with `--shrink`: ancestry, scope (the plan doc and, when present, the unit's `<plan stem>-next.md`, else `held`), `held` until the same phase's code checkpoint is on `MERGE_BRANCH` (its `Merge <unit> phase <N> (` subject), conflicts, merge and push, with no package tests and no `review_regime.py add`; <MergeCheckpoint/> names the call. Runs after Phase 3.
 
 **Acceptance gate:**
-- From the worktree root, `python3 -m unittest discover -s scripts/production -p 'test_merge_checkpoint.py'` green; basedpyright 0 errors and 0 warnings on the changed `.py` files.
+- From the worktree root, `python3 -m unittest discover -s scripts/production -p 'test_merge_checkpoint.py'` and `-p 'test_stall_watch.py'` green; basedpyright 0 errors and 0 warnings on the changed `.py` files.
 - Live (natedev, once the merge reaches `~/.claude` main): the next checkpoint any unit sends is merged with the script; its lines match what the showrunner would have done by hand, and the As-built carries the audit table.
