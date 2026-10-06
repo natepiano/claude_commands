@@ -3,9 +3,9 @@
 # stays up for SECONDS, then stop it. User, 2026-10-04: after each green CI on
 # the merge branch, when the Mac is reachable.
 #
-# Then it builds and runs each demo example for EXAMPLE_HOLD seconds with the
-# same cargo command you would type, so `cargo run` in the clone starts at
-# once. User, 2026-10-05: the Ian Hubert demo runs from this clone.
+# Then it builds each demo example with the same cargo arguments you would
+# type, so `cargo run` in the clone starts at once, and runs it for
+# EXAMPLE_HOLD seconds. User, 2026-10-05: the Ian Hubert demo runs from this clone.
 #
 # Usage: mac_run.sh <repo dir> <sha> [seconds, default 60]
 # Exit: 0 all stayed up; 3 Mac unreachable; 5 wrong tree; 6 build failed;
@@ -82,9 +82,10 @@ for entry in $examples; do
     failed=1
     continue
   fi
-  # cargo run execs the example, so the alarm reaches it; the pkill catches a
-  # survivor. The bracket keeps pkill from matching its own shell.
-  ssh $host "cd $clone && BRP_EXTRAS_PORT=$port perl -e 'alarm shift; exec @ARGV' $example_hold ~/.cargo/bin/cargo run -q $args > $example_log 2>&1"
+  # Run the built binary, as for hana: the Mac's cargo is a wrapper script that
+  # waits on its child, so an alarm on `cargo run` never reaches the example.
+  # The pkill catches a survivor; the bracket keeps it from matching its shell.
+  ssh $host "cd $clone && BEVY_ASSET_ROOT=\$HOME/$clone/crates/$parts[1] BRP_EXTRAS_PORT=$port perl -e 'alarm shift; exec @ARGV' $example_hold ./target/debug/examples/$parts[2] > $example_log 2>&1"
   example_exit=$?
   ssh $host "pkill -f '[h]ana_catalyst_mac/target/debug/examples/$parts[2]'"
   if (( example_exit == 142 )); then
