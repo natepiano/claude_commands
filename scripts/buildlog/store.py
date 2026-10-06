@@ -25,6 +25,8 @@ CI_DIR = "ci"
 LOGS_DIR = "logs"
 ERRORS_NAME = "errors.log"
 SYNC_STATUS_NAME = "sync.json"
+SYNC_PAUSED_NAME = "sync_paused.json"
+CI_POLLED_NAME = "polled.json"
 DISK_NAME = "disk.json"
 
 

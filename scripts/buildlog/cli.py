@@ -7,6 +7,8 @@
   buildlog reindex                  rebuild the index from the JSON lines
   buildlog tree-key [DIR]           the tree key of DIR's worktree (default the current folder; treekey.py)
   buildlog sync                     exchange records with the Mac (natedev's hourly job)
+  buildlog sync pause <why>         pause Mac contact while hourly keeps running
+  buildlog sync resume              resume Mac contact
   buildlog ci                       record new GitHub Actions run attempts
   buildlog launches                 collect example build and start times from Claude Code
   buildlog disk                     measure disk usage for the next report
@@ -228,7 +230,14 @@ def main(argv: list[str]) -> int:
         print(f"buildlog reindex: {lines} records indexed in {index.index_path()}")
         return 0
     if command == "sync":
-        return sync.sync()
+        if not rest:
+            return sync.sync()
+        if rest[0] == "pause" and len(rest) > 1:
+            return sync.pause(" ".join(rest[1:]))
+        if rest == ["resume"]:
+            return sync.resume()
+        print("usage: buildlog sync [pause <why> | resume]", file=sys.stderr)
+        return 2
     if command == "ci":
         return ci.ci()
     if command == "disk":

@@ -8,11 +8,12 @@ appear as one scratch caller in each kind's table.
 from __future__ import annotations
 
 import sqlite3
-from collections.abc import Callable
-from dataclasses import dataclass
+from collections.abc import Callable, Sequence
+from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
 from typing import cast
 
+import ci
 import disk
 import memory
 import sync
@@ -33,8 +34,9 @@ SCRATCH = "(cwd LIKE '/tmp/%' OR cwd LIKE '/var/folders/%' OR cwd LIKE '/private
 GROUP_AS_SCRATCH = f"({SCRATCH} AND caller != 'brp-launch')"
 SCRATCH_LABEL = "scratch (temp folders)"
 ON_DAY = "date(started_at, 'localtime') = ?"
-COMMON_HEAD = ["Runs", "Failed", "Avg", "Range"]
-COMMON_SQL = "count(*), sum(status <> 0), avg(duration_s), min(duration_s), max(duration_s)"
+COMMON_HEAD = ["Runs", "Failed", "Avg", "p95", "Range"]
+COMMON_SQL = "count(*), sum(status <> 0), avg(duration_s), min(duration_s), max(duration_s), group_concat(duration_s)"
+CI_STALE_AFTER_S = 2 * 3600
 MAX_SAMPLE_GAP_S = 5 * 60
 # 2026-10-01–04 log: 1 edit 12.54 min, 2–3 16.09, 4–7 20.94, 8+ 31.28.
 # One test per two edits leaves headroom for most gaps to stay within 2–3;
@@ -69,11 +71,29 @@ def gib(value: object) -> str:
     return f"{float(value) / 2**30:.1f} GiB" if isinstance(value, int | float) else ""
 
 
+def nearest_rank(values: Sequence[float], percent: int) -> float:
+    return sorted(values)[(percent * len(values) + 99) // 100 - 1]
+
+
+def percentile_values(value: object) -> list[float]:
+    return [float(part) for part in value.split(",")] if isinstance(value, str) and value else []
+
+
+def p95(value: object) -> str:
+    values = percentile_values(value)
+    return seconds(nearest_rank(values, 95)) if values else ""
+
+
 @dataclass(frozen=True)
 class Column:
     title: str
     sql: str
     show: Callable[[object], str]
+
+
+@dataclass(frozen=True)
+class AverageColumn(Column):
+    values_sql: str
 
 
 @dataclass(frozen=True)
@@ -93,6 +113,7 @@ class FailureRecoveryBin:
     failures: int = 0
     recovered: int = 0
     minutes_to_green: float = 0.0
+    recovery_minutes: list[float] = field(default_factory=list)
 
 
 @dataclass
@@ -103,20 +124,20 @@ class TestsPerEditWindow:
 
 
 EXTRA: dict[str, list[Column]] = {
-    "check": [Column("Build", "avg(finished_s)", seconds), Column("Warnings", "sum(warnings)", count)],
+    "check": [AverageColumn("Build", "avg(finished_s)", seconds, "finished_s"), Column("Warnings", "sum(warnings)", count)],
     "clippy": [
-        Column("Build", "avg(finished_s)", seconds),
+        AverageColumn("Build", "avg(finished_s)", seconds, "finished_s"),
         Column("Warnings", "sum(warnings)", count),
         Column("Errors", "sum(errors)", count),
     ],
     "mend": [
-        Column("Mend's own", "avg(mend_s)", seconds),
-        Column("Check", "avg(mend_check_s)", seconds),
+        AverageColumn("Mend's own", "avg(mend_s)", seconds, "mend_s"),
+        AverageColumn("Check", "avg(mend_check_s)", seconds, "mend_check_s"),
         Column("Fixes", "sum(mend_fixes)", count),
     ],
-    "doc": [Column("Build", "avg(finished_s)", seconds), Column("Warnings", "sum(warnings)", count)],
+    "doc": [AverageColumn("Build", "avg(finished_s)", seconds, "finished_s"), Column("Warnings", "sum(warnings)", count)],
     "nextest": [
-        Column("Build", "avg(finished_s)", seconds),
+        AverageColumn("Build", "avg(finished_s)", seconds, "finished_s"),
         Column("Tests", "sum(tests_run)", count),
         Column("Tests failed", "sum(tests_failed)", count),
         Column("Flaky", "sum(tests_flaky)", count),
@@ -132,9 +153,9 @@ def table(head: list[str], rows: list[list[str]]) -> list[str]:
 
 
 def common(row: Row) -> list[str]:
-    runs, failed, average, low, high = row[:5]
+    runs, failed, average, low, high, values = row[:6]
     span = seconds(low) if low == high else f"{seconds(low)} – {seconds(high)}"
-    return [count(runs), count(failed), seconds(average), span]
+    return [count(runs), count(failed), seconds(average), p95(values), span]
 
 
 def fetch(connection: sqlite3.Connection, sql: str, *params: object) -> list[Row]:
@@ -209,7 +230,12 @@ def waiting_section(connection: sqlite3.Connection, day: str) -> list[str]:
 
 def kind_section(connection: sqlite3.Connection, day: str, kind: str, hosts: int) -> list[str]:
     extra = EXTRA.get(kind, [])
-    select = ", ".join([COMMON_SQL, *(column.sql for column in extra)])
+    expressions = [COMMON_SQL]
+    for column in extra:
+        expressions.append(column.sql)
+        if isinstance(column, AverageColumn):
+            expressions.append(f"group_concat({column.values_sql})")
+    select = ", ".join(expressions)
     rows = fetch(
         connection,
         f"SELECT {GROUP_AS_SCRATCH} AS is_scratch, CASE WHEN {GROUP_AS_SCRATCH} THEN NULL ELSE host END AS caller_host,"
@@ -219,15 +245,23 @@ def kind_section(connection: sqlite3.Connection, day: str, kind: str, hosts: int
         day,
         kind,
     )
-    body = [
-        [
-            SCRATCH_LABEL if row[0] else caller_label(row[2], row[1], hosts),
-            *common(row[3:8]),
-            *(column.show(value) for column, value in zip(extra, row[8:], strict=True)),
-        ]
-        for row in rows
-    ]
-    return [f"### {kind}", "", *table(["Caller", *COMMON_HEAD, *(column.title for column in extra)], body), ""]
+    head = ["Caller", *COMMON_HEAD]
+    for column in extra:
+        head.append(column.title)
+        if isinstance(column, AverageColumn):
+            head.append(f"{column.title} p95")
+    body: list[list[str]] = []
+    for row in rows:
+        cells = [SCRATCH_LABEL if row[0] else caller_label(row[2], row[1], hosts), *common(row[3:9])]
+        offset = 9
+        for column in extra:
+            cells.append(column.show(row[offset]))
+            offset += 1
+            if isinstance(column, AverageColumn):
+                cells.append(p95(row[offset]))
+                offset += 1
+        body.append(cells)
+    return [f"### {kind}", "", *table(head, body), ""]
 
 
 def memory_pressure_section(connection: sqlite3.Connection, day: str, hosts: int) -> list[str]:
@@ -362,8 +396,7 @@ def test_builds_section(connection: sqlite3.Connection, day: str) -> list[str]:
     ]
     for scope, values in builds.items():
         if values:
-            ordered = sorted(values)
-            body.append([day, scope, seconds(sum(values)), seconds(ordered[(3 * len(ordered) - 1) // 4])])
+            body.append([day, scope, seconds(sum(values)), seconds(nearest_rank([float(value) for value in values], 75))])
 
     return [
         "### Test builds (temporary)",
@@ -390,37 +423,67 @@ def port_lint_section(connection: sqlite3.Connection, day: str) -> tuple[list[st
     return section, [f"cargo-port calls: {total} ({parts}), {seconds(saved)} saved by recorded steps."]
 
 
+def ci_freshness(day: str) -> str:
+    states = [ci.read_poll_state(repo) for repo in ci.REPOS]
+    polled = [state for state in states if isinstance(state, ci.CompletedPoll | ci.CappedPoll)]
+    if not polled:
+        return "; CI never polled"
+    newest = max(polled, key=lambda state: datetime.fromisoformat(state.polled_at.replace("Z", "+00:00")))
+    now = datetime.now().astimezone()
+    day_end = datetime.combine(date.fromisoformat(day) + timedelta(days=1), datetime.min.time()).astimezone()
+    horizon = min(now, day_end)
+    at = datetime.fromisoformat(newest.polled_at.replace("Z", "+00:00")).astimezone()
+    if day_end < now and at >= day_end:
+        return ""
+    stale = at < horizon - timedelta(seconds=CI_STALE_AFTER_S)
+    if not stale and isinstance(newest, ci.CompletedPoll):
+        return ""
+    clause = f"; CI recorded through {sync.sync_time(newest.polled_at, now)}"
+    if stale:
+        clause += ", no poll since"
+    if isinstance(newest, ci.CappedPoll):
+        clause += ", the last poll was capped"
+    return clause
+
+
 def ci_section(connection: sqlite3.Connection, day: str) -> tuple[list[str], str]:
+    freshness = ci_freshness(day)
     rows = fetch(
         connection,
-        "SELECT workflow, count(*), sum(conclusion = 'failure'), avg(duration_s), min(duration_s), max(duration_s), sum(duration_s)"
+        "SELECT workflow, count(*), coalesce(sum(conclusion = 'failure'), 0), coalesce(sum(conclusion = 'cancelled'), 0),"
+        + " avg(duration_s), min(duration_s), max(duration_s), group_concat(duration_s), sum(duration_s)"
         + f" FROM ci_runs WHERE {ON_DAY} GROUP BY workflow ORDER BY count(*) DESC",
         day,
     )
     if not rows:
-        return [], "CI: no runs."
-    queue, left_out = fetch(
+        return [], f"CI: no runs{freshness}."
+    queue, left_out, queue_values = fetch(
         connection,
-        "SELECT avg(queued_s), coalesce(sum(run_state != 'skipped' AND queued_s IS NULL), 0)"
+        "SELECT avg(queued_s), coalesce(sum(run_state != 'skipped' AND queued_s IS NULL), 0), group_concat(queued_s)"
         + " FROM ci_jobs AS j JOIN ci_runs AS r ON j.run_id = r.run_id AND j.attempt = r.attempt"
         + " WHERE date(r.started_at, 'localtime') = ?",
         day,
     )[0]
-    body = [[str(row[0]), *common(row[1:6])] for row in rows]
+    body: list[list[str]] = []
+    for row in rows:
+        shared = common((row[1], row[2], row[4], row[5], row[6], row[7]))
+        body.append([str(row[0]), *shared[:2], count(row[3]), *shared[2:]])
     runs = sum(cast(int, row[1]) for row in rows)
     failed = sum(cast(int, row[2] or 0) for row in rows)
-    total = sum(cast(float, row[6] or 0.0) for row in rows)
-    section = ["### CI", "", *table(["Workflow", *COMMON_HEAD], body), ""]
+    cancelled = sum(cast(int, row[3] or 0) for row in rows)
+    total = sum(cast(float, row[8] or 0.0) for row in rows)
+    section = ["### CI", "", *table(["Workflow", "Runs", "Failed", "Cancelled", "Avg", "p95", "Range"], body), ""]
     omitted = cast(int, left_out)
     if queue is None:
         queue_clause = "no job has a known queue time"
         if omitted:
             queue_clause += f" ({omitted} left out)"
     else:
-        queue_clause = f"jobs queued {seconds(queue)} on average"
+        queue_clause = f"jobs queued {seconds(queue)} on average, p95 {p95(queue_values)}"
         if omitted:
             queue_clause += f", {omitted} without a known queue time left out"
-    return section, f"CI: {runs} runs, {failed} failed, {seconds(total)} in all; {queue_clause}."
+    cancelled_clause = f", {cancelled} cancelled" if cancelled else ""
+    return section, f"CI: {runs} runs, {failed} failed{cancelled_clause}, {seconds(total)} in all; {queue_clause}{freshness}."
 
 
 def call_trees(connection: sqlite3.Connection, end_day: str) -> dict[str, KnownCallTrees]:
@@ -504,7 +567,9 @@ def tests_per_edit_data(connection: sqlite3.Connection, end_day: str) -> TestsPe
             for bin_index, failed_at in waiting_for_green.pop(seat, []):
                 recovery = bins[bin_index]
                 recovery.recovered += 1
-                recovery.minutes_to_green += max(0.0, (finished_at - failed_at).total_seconds() / 60)
+                minutes = max(0.0, (finished_at - failed_at).total_seconds() / 60)
+                recovery.minutes_to_green += minutes
+                recovery.recovery_minutes.append(minutes)
             edits_since_green[seat] = 0
         elif outcome != "interrupted" and (outcome == "failed" or status is not None and status != 0) and in_window:
             edits = edits_since_green.get(seat, 0)
@@ -539,7 +604,8 @@ def tests_per_edit_section(connection: sqlite3.Connection, day: str) -> list[str
             target_status(activity),
         ])
     recovery_rows = [
-        [label, count(recovery.failures), seconds(recovery.minutes_to_green * 60 / recovery.recovered) if recovery.recovered else ""]
+        [label, count(recovery.failures), seconds(recovery.minutes_to_green * 60 / recovery.recovered) if recovery.recovered else "",
+         seconds(nearest_rank(recovery.recovery_minutes, 95) * 60) if recovery.recovery_minutes else ""]
         for label, recovery in zip(EDIT_BINS, window.recovery_bins, strict=True)
     ]
     unresolved = sum(recovery.failures - recovery.recovered for recovery in window.recovery_bins)
@@ -552,7 +618,7 @@ def tests_per_edit_section(connection: sqlite3.Connection, day: str) -> list[str
         *table(["Day", "Tests", "Edits", "Tests/edit", "Target"], activity_rows),
         f"Source: verify.sh test calls and step tree keys, {window.first_day}–{day}; target {TESTS_PER_EDIT_TARGET:g} tests/edit; — means no observed edit.",
         "",
-        *table(["Edits since green", "Failures", "Avg to next green"], recovery_rows),
+        *table(["Edits since green", "Failures", "Avg to next green", "p95 to next green"], recovery_rows),
         "; ".join(notes) + ".",
         "",
     ]
@@ -563,7 +629,7 @@ SUMMARIES = [("successes", "status = 0", False), ("failures", "status <> 0", Fal
 
 def summary(connection: sqlite3.Connection, day: str, found: list[str], which: str, with_failed: bool) -> list[str]:
     """One row per kind, every caller together, then the total; kinds with no runs in the set are left out."""
-    select = "count(*), sum(status <> 0), sum(duration_s), avg(duration_s), max(peak_mem_bytes)"
+    select = "count(*), sum(status <> 0), sum(duration_s), avg(duration_s), group_concat(duration_s), max(peak_mem_bytes)"
     where = f"{ON_DAY} AND {which}"
     rows = {
         cast(str, row[0]): row[1:]
@@ -575,17 +641,11 @@ def summary(connection: sqlite3.Connection, day: str, found: list[str], which: s
 
     def line(name: str, row: Row) -> list[str]:
         failed = [count(row[1])] if with_failed else []
-        return [name, count(row[0]), *failed, seconds(row[2]), seconds(row[3]), gib(row[4])]
+        return [name, count(row[0]), *failed, seconds(row[2]), seconds(row[3]), p95(row[4]), gib(row[5])]
 
     body = [line(kind, rows[kind]) for kind in found if kind in rows] + [line("**All steps**", total)]
-    head = ["Kind", "Runs", *(["Failed"] if with_failed else []), "Total", "Avg", "Peak memory"]
+    head = ["Kind", "Runs", *(["Failed"] if with_failed else []), "Total", "Avg", "p95", "Peak memory"]
     return table(head, body)
-
-
-def sync_time(last: str, now: datetime) -> str:
-    """Local time with its zone, and the date too when it is not today."""
-    at = datetime.fromisoformat(last).astimezone()
-    return at.strftime("%H:%M %Z" if at.date() == now.astimezone().date() else "%Y-%m-%d %H:%M %Z")
 
 
 def disk_section() -> list[str]:
@@ -597,7 +657,7 @@ def disk_section() -> list[str]:
     floor = snapshot["floor"]
     free_label = f"free (floor {gib(floor)})" if floor is not None else "free"
     rows.append([free_label, gib(snapshot["free"])])
-    measured = sync_time(snapshot["measured_at"], datetime.now())
+    measured = sync.sync_time(snapshot["measured_at"], datetime.now())
     return [
         f"### Disk: {snapshot['host']}",
         "",
@@ -609,12 +669,17 @@ def disk_section() -> list[str]:
 
 
 def mac_note() -> str:
+    paused = sync.read_pause()
+    prefix = ""
+    if isinstance(paused, sync.SyncPaused):
+        since = sync.sync_time(paused.since, datetime.now()) if paused.since != "unknown" else paused.since
+        prefix = f"Mac: sync paused since {since} ({paused.why}). "
     status = sync.read_status()
-    if status is None:
-        return "Mac: not synced yet."
-    last = status["last_ok"]
-    when = sync_time(last, datetime.now()) if last else "never"
-    return f"Mac rows as of the {when} sync." if status["ok"] else f"Mac: the last sync failed; last good sync {when}."
+    if isinstance(status, sync.NeverSynced):
+        return prefix + "Mac: not synced yet."
+    last = status.last_good
+    when = sync.sync_time(last.at, datetime.now()) if isinstance(last, sync.LastSynced) else "never"
+    return prefix + (f"Mac rows as of the {when} sync." if status.ok else f"Mac: the last sync failed; last good sync {when}.")
 
 
 def report(connection: sqlite3.Connection, day: str) -> str:
