@@ -45,7 +45,7 @@
 
 | Gate | Waiting | Waits on | Clears when |
 | --- | --- | --- | --- |
-| G1 | enh-showrunner-unit Phase 1 | stalls-unit Phase 6 | the showrunner merges it and tells enh-showrunner |
+| G1 | enh-showrunner-unit Phase 2 | stalls-unit Phase 6 | the showrunner merges it and tells enh-showrunner |
 
 ## Close-out
 
