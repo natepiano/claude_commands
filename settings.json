@@ -146,6 +146,16 @@
     ],
     "PreToolUse": [
       {
+        "matcher": "mcp__brp__brp_launch",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"$HOME/.claude/scripts/hooks/pre-tool-use-brp-launch-gate.sh\"",
+            "timeout": 960
+          }
+        ]
+      },
+      {
         "matcher": "Edit|Write|NotebookEdit",
         "hooks": [
           {

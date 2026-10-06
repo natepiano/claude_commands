@@ -51,7 +51,7 @@ from typing import cast
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "build_hold"))
-from build_hold import ActiveHolders, HoldState, KnownReleaseEta, NoHolders, Holder, holder_directory, read_holders
+from build_hold import ActiveHolders, HoldState, KnownReleaseEta, NoHolders, Holder, ReleaseRecordReadError, cycle_status_lines, holder_directory, read_cycle, read_holders, release_record_error_line
 
 LENGTHS = {"simple": 240, "page": 480, "elaborate": None}
 PHASE = re.compile(r"^(?:Phase (\d+) of (\d+)|follow-up (\d+) of (\d+)): \S")
@@ -1037,6 +1037,14 @@ def footer(
 ) -> list[str]:
     """One line per active holder, what waits on the user, then the time and next report."""
     lines = [hold_line(holder, now, zone) for holder in hold.holders] if isinstance(hold, ActiveHolders) else []
+    if isinstance(hold, ActiveHolders):
+        try:
+            cycle = read_cycle()
+        except ReleaseRecordReadError as error:
+            lines.append(f"  {release_record_error_line(error)}")
+        else:
+            if cycle is not None and any(holder.name in cycle["holders"] for holder in hold.holders):
+                lines.extend(f"  {line}" for line in cycle_status_lines(cycle, now, zone))
     if lines:
         lines.append("")
     lines.extend(agent_lines)
