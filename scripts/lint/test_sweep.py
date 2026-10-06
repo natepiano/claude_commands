@@ -168,7 +168,7 @@ class GroupTests(SweepCase):
     def test_copies_whose_unit_is_gone_are_orphans(self) -> None:
         target = self.target()
         scan, owners = scanned(target)
-        self.assertEqual({Path(path) for path in scan.orphans.entries}, target.orphans)
+        self.assertEqual({Path(path) for group in scan.orphans for path in group.entries}, target.orphans)
         self.assertEqual(owners[str(target.stale_unit)].kind, "unit")
 
     def test_files_nothing_claims_stay(self) -> None:
@@ -227,7 +227,8 @@ class SweepTests(SweepCase):
         target = self.target()
         scan, _ = scanned(target)
         total = sum(scan.blocks.values())
-        orphaned = sweep.freed_by(scan.orphans, scan, dict(scan.links))
+        remaining = dict(scan.links)
+        orphaned = sum(sweep.freed_by(group, scan, remaining) for group in scan.orphans)
         status, output = run_sweep(target, total - orphaned - 1, dry_run=True)
         self.assertEqual(status, 0)
         lines = output.splitlines()
@@ -240,7 +241,8 @@ class SweepTests(SweepCase):
         target = self.target()
         scan, _ = scanned(target)
         total = sum(scan.blocks.values())
-        orphaned = sweep.freed_by(scan.orphans, scan, dict(scan.links))
+        remaining = dict(scan.links)
+        orphaned = sum(sweep.freed_by(group, scan, remaining) for group in scan.orphans)
         # Removing app's unit, the least recently used, frees its file only
         # because its hard-linked copy in debug/ goes with it.
         status, output = run_sweep(target, total - orphaned - SIZE, dry_run=False)
@@ -300,10 +302,10 @@ class FloorTests(SweepCase):
         with self.assertRaisesRegex(AssertionError, "unexpected floor alert send"):
             _ = sweep.send_floor_alert("test", sweep.FloorAlertChannels.NATEDEV)
 
-    def hold(self, base: Path, floor: int, free: list[int]) -> tuple[int, str]:
+    def hold(self, base: Path, floor: int, free: list[int], dry_run: bool = False) -> tuple[int, str]:
         output = io.StringIO()
         with mock.patch.object(sweep, "free_bytes", side_effect=free), redirect_stdout(output):
-            status = sweep.hold_floor(floor, False, [str(base)], str(base / "floor.lock"))
+            status = sweep.hold_floor(floor, dry_run, [str(base)], str(base / "floor.lock"))
         return status, output.getvalue()
 
     def prior(self, free: int, caches: int, age: int = 60, alert_at: float | None = None,
@@ -805,16 +807,162 @@ class FloorTests(SweepCase):
         _ = write(base / "uv" / "CACHEDIR.TAG")
         self.assertEqual(sweep.target_dirs([str(base)]), [str(base / "repo" / "target")])
 
-    def test_below_the_floor_the_least_recently_used_unit_of_any_target_goes(self) -> None:
+    def test_below_the_floor_the_least_recently_used_target_goes(self) -> None:
         base = self.base()
         now = time.time()
-        _, idle = cargo_target(base, "idle", APP, now - 5 * DAY)
-        _, busy = cargo_target(base, "busy", DEMO, now)
+        _, idle = cargo_target(base, "idle", APP, now - 3 * 3600)
+        idle_record = base / "idle" / "target" / "debug" / ".fingerprint" / f"idle-{APP}" / "bin-idle.json"
+        os.utime(idle_record, (now - 3600, now - 3 * 3600))
+        _, recent = cargo_target(base, "recent", DEMO, now - 5 * 3600)
+        recent_record = base / "recent" / "target" / "debug" / ".fingerprint" / f"recent-{DEMO}" / "bin-recent.json"
+        os.utime(recent_record, (now - 600, now - 5 * 3600))
         status, output = self.hold(base, 10 * GIB, [10 * GIB - SIZE, 10 * GIB])
         self.assertEqual(status, 0)
         self.assertFalse(idle.exists())
-        self.assertTrue(busy.exists())
+        self.assertTrue(recent.exists())
         self.assertIn("removed 1 build units", output)
+        self.assertIn(f"the floor took ", output)
+        self.assertIn(f" from {base / 'idle' / 'target'}, last used {sweep.when(now - 3600)}", output)
+        self.assertEqual(sum("removed" in line for line in output.splitlines()), 1)
+
+    def test_floor_removal_line_spans_oldest_to_newest_unit(self) -> None:
+        base = self.base()
+        now = time.time()
+        _, newer = cargo_target(base, "unstamped", APP, now - 5 * 3600)
+        _, older = cargo_target(base, "stamped", DEMO, now - 10 * 3600)
+        stamp = base / "stamped" / "target" / sweep.USE_STAMP
+        _ = stamp.touch()
+        os.utime(stamp, (now - 3600, now - 3600))
+        _, output = self.hold(base, 10 * GIB, [10 * GIB - 2 * SIZE, 10 * GIB])
+        self.assertFalse(newer.exists())
+        self.assertFalse(older.exists())
+        self.assertIn(f"last used {sweep.when(now - 10 * 3600)} to {sweep.when(now - 5 * 3600)};", output)
+
+    def test_a_fresh_stamp_outweighs_older_units(self) -> None:
+        base = self.base()
+        now = time.time()
+        _, stamped = cargo_target(base, "stamped", APP, now - 5 * 3600)
+        stamp = base / "stamped" / "target" / sweep.USE_STAMP
+        _ = stamp.touch()
+        os.utime(stamp, (now - 60, now - 60))
+        _, unstamped = cargo_target(base, "unstamped", DEMO, now - 2 * 3600)
+        _, output = self.hold(base, 10 * GIB, [10 * GIB - SIZE, 10 * GIB])
+        self.assertTrue(stamped.exists())
+        self.assertFalse(unstamped.exists())
+        self.assertIn(f"from {base / 'unstamped' / 'target'}", output)
+
+    def test_shortfall_exhausts_oldest_target_before_next(self) -> None:
+        base = self.base()
+        now = time.time()
+        old_tree, old = cargo_target(base, "old", APP, now - 5 * 3600)
+        next_tree, first = cargo_target(base, "next", DEMO, now - 3 * 3600)
+        second = unit(next_tree, "deps", "second", TOOL, now - 3600)
+        scan = sweep.scan_roots([str(base / "old" / "target"), str(base / "next" / "target")],
+                                [str(old_tree), str(next_tree)])
+        old_group = next(group for group in scan.groups if group.build_tree == str(old_tree))
+        shortfall = sweep.freed_by(old_group, scan, dict(scan.links)) + 1
+        _, output = self.hold(base, 10 * GIB, [10 * GIB - shortfall, 10 * GIB])
+        self.assertFalse(old.exists())
+        self.assertFalse(first.exists())
+        self.assertTrue(second.exists())
+        self.assertEqual(output.count("the floor took"), 2)
+
+    def test_dry_floor_lines_name_target_without_extra_removal_lines(self) -> None:
+        base = self.base()
+        now = time.time() - 3600
+        _, output_file = cargo_target(base, "repo", APP, now)
+        _, output = self.hold(base, 10 * GIB, [10 * GIB - SIZE, 10 * GIB], dry_run=True)
+        self.assertTrue(output_file.exists())
+        self.assertIn(f"the floor would take ", output)
+        self.assertIn(f" from {base / 'repo' / 'target'}, last used {sweep.when(now)}", output)
+        self.assertNotIn("removed", output)
+
+    def test_orphan_only_floor_sweep_names_its_target_and_size(self) -> None:
+        base = self.base()
+        tree, output_file = cargo_target(base, "repo", APP, time.time() - 3600)
+        orphan = write(tree / "orphan")
+        orphan_dep_info = dep_info(orphan)
+        scan = sweep.scan_roots([str(base / "repo" / "target")], [str(tree)])
+        remaining = dict(scan.links)
+        orphaned = sum(sweep.freed_by(group, scan, remaining) for group in scan.orphans)
+        self.assertGreater(orphaned, 0)
+
+        status, output = self.hold(base, 10 * GIB, [10 * GIB - orphaned, 10 * GIB])
+
+        self.assertEqual(status, 0)
+        self.assertFalse(orphan.exists())
+        self.assertFalse(orphan_dep_info.exists())
+        self.assertTrue(output_file.exists())
+        self.assertIn(f"removed 2 orphaned files ({sweep.gib(orphaned)})", output)
+        lines = [line for line in output.splitlines() if "the floor took" in line]
+        self.assertEqual(len(lines), 1)
+        self.assertIn(f"the floor took {sweep.gib(orphaned)} from {base / 'repo' / 'target'},", lines[0])
+
+    def test_failed_group_has_no_floor_line_when_another_target_succeeds(self) -> None:
+        base = self.base()
+        now = time.time()
+        failed_tree, failed_output = cargo_target(base, "failed", APP, now - 2 * DAY)
+        _, successful_output = cargo_target(base, "successful", DEMO, now - DAY)
+        scan = sweep.scan_roots([str(base / name / "target") for name in ("failed", "successful")],
+                                [str(base / name / "target" / "debug") for name in ("failed", "successful")])
+        shortfall = sum(sweep.freed_by(group, scan, dict(scan.links)) for group in scan.groups)
+        original_rmtree = shutil.rmtree
+
+        def fail_one_group(path: str) -> None:
+            if path == str(failed_tree / ".fingerprint" / f"failed-{APP}"):
+                raise OSError("test removal failure")
+            original_rmtree(path)
+
+        errors = io.StringIO()
+        with mock.patch.object(shutil, "rmtree", side_effect=fail_one_group), redirect_stderr(errors):
+            status, output = self.hold(base, 10 * GIB, [10 * GIB - shortfall, 10 * GIB])
+
+        self.assertEqual(status, 1)
+        self.assertIn("could not remove", errors.getvalue())
+        self.assertTrue(failed_output.exists() or (failed_tree / ".fingerprint" / f"failed-{APP}").exists())
+        self.assertFalse(successful_output.exists())
+        self.assertIn("removed 2 build units", output)
+        lines = [line for line in output.splitlines() if "the floor took" in line]
+        self.assertEqual(len(lines), 1)
+        self.assertIn(f"from {base / 'successful' / 'target'},", lines[0])
+
+    def test_workspace_stamps_each_root_even_when_a_build_holds_it(self) -> None:
+        base = self.base()
+        first_tree, _ = cargo_target(base, "first", APP, time.time() - DAY)
+        _, _ = cargo_target(base, "second", DEMO, time.time() - DAY)
+        roots = [str(base / name / "target") for name in ("first", "second")]
+        with mock.patch.object(sweep, "cargo_roots", return_value=roots), \
+             mock.patch.dict(os.environ, {sweep.BUDGET_ENV: "1024"}), redirect_stdout(io.StringIO()):
+            self.assertEqual(sweep.sweep_workspace(None, "/nonexistent/lint.conf", False), 0)
+            for root in roots:
+                self.assertTrue((Path(root) / sweep.USE_STAMP).exists())
+            for root in roots:
+                os.utime(Path(root) / sweep.USE_STAMP, (1, 1))
+            lock = os.open(first_tree / sweep.LOCK_NAMES[0], os.O_RDONLY | os.O_CREAT)
+            self.addCleanup(os.close, lock)
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            self.assertEqual(sweep.sweep_workspace(None, "/nonexistent/lint.conf", False), 0)
+        for root in roots:
+            self.assertGreater((Path(root) / sweep.USE_STAMP).stat().st_mtime, 1)
+
+    def test_dry_workspace_sweep_leaves_every_root_unstamped(self) -> None:
+        base = self.base()
+        _, _ = cargo_target(base, "first", APP, time.time() - DAY)
+        _, _ = cargo_target(base, "second", DEMO, time.time() - DAY)
+        roots = [str(base / name / "target") for name in ("first", "second")]
+        with mock.patch.object(sweep, "cargo_roots", return_value=roots), \
+             mock.patch.dict(os.environ, {sweep.BUDGET_ENV: "1024"}), redirect_stdout(io.StringIO()):
+            self.assertEqual(sweep.sweep_workspace(None, "/nonexistent/lint.conf", True), 0)
+        for root in roots:
+            self.assertFalse((Path(root) / sweep.USE_STAMP).exists())
+
+    def test_named_target_writes_no_use_stamp(self) -> None:
+        base = self.base()
+        _, _ = cargo_target(base, "repo", APP, time.time() - DAY)
+        root = base / "repo" / "target"
+        with mock.patch.dict(os.environ, {sweep.BUDGET_ENV: "1024"}), redirect_stdout(io.StringIO()):
+            self.assertEqual(sweep.sweep_workspace(str(root), "/nonexistent/lint.conf", True), 0)
+        self.assertFalse((root / sweep.USE_STAMP).exists())
 
     def test_a_target_a_build_holds_is_left_alone(self) -> None:
         base = self.base()
