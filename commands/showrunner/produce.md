@@ -95,7 +95,7 @@ State:
   own message — send the unit director `From the showrunner: run /unit:eta (or read ~/.claude/commands/unit/eta.md if it is not in your skill list)` by SendMessage, in that same
   turn. Ask once per phase; ask again only if it answered without a time. Until
   it answers, report that ETA as `none measured - requested`.
-- **Every turn ends with** `— waiting on: <items>`, the user's items first.
+- **Every turn ends with** `— waiting on: <items>`, the user's items first. Name each item by what it is and what it is doing, never by a task, agent or session id.
 - **Footer.** Every reply to the user ends with the output of
   `python3 ~/.claude/scripts/production/dailies_render.py --footer --zone <ZONE>`,
   pasted word for word, with:
