@@ -128,14 +128,20 @@ Ending a turn is an action this command authorizes, never a default it falls
 back to. Every turn ends in exactly one of the conditions below, and **the
 turn's final line names which one**:
 
-`— holding: waiting on <handle>` · `gate: <name>` · `decision: <question>` ·
+`— holding: waiting on <what is running>` · `gate: <name>` · `decision: <question>` ·
 `blocked: <cause>` · `done: run summary emitted`
 
 The closed list:
 
 - **waiting** — a background dispatch, verification, smoke run, or style pass is
-  live and nothing synchronous remains. Name the handle. <DispatchContract/>
-  step 4 and <BackgroundVerificationContract/> are this case.
+  live and nothing synchronous remains. Name each thing by what it is and what
+  it is doing, in plain words: `— holding: waiting on the Codex seats writing
+  phase 2 (implementation and tests)`, `— holding: waiting on the blind code
+  reviewer for phase 3`, `— holding: waiting on the final test suites`. Never
+  a task id, agent id, session id or shell handle: a reader cannot tell what
+  `b7emgpk3r` is. Handles are the unit director's own bookkeeping, kept for
+  <CompactionContract/>. User, 2026-10-06. <DispatchContract/> step 4 and
+  <BackgroundVerificationContract/> are this case.
 - **gate** — a gate this command defines reaches the user by design:
   <VerbosePrePhaseGate/>, <VerbosePostPhaseGate/>, <ReviewPendingAddOns/>,
   <CICleanup/>, or the authorization round trip in <AuthorizationContract/>.
@@ -197,8 +203,8 @@ Applies to every implementation, test, fix, and review launcher.
 2. Tell the user in one line what is running and what happens on completion.
 3. Perform only synchronous work assigned by the call site: the main half of
    <DualReview/>. Do not inspect launcher output as a substitute for that review.
-4. Claude: end the turn under <TurnEndGate/>, naming the handle in the
-   `— holding: waiting on <handle>` line. Task and notifier messages resume
+4. Claude: end the turn under <TurnEndGate/>, naming what is running in the
+   `— holding: waiting on <what is running>` line, never its handle. Task and notifier messages resume
    the workflow independently; process the first without waiting for the other.
 5. Codex: apply <CodexDispatchWait/>. Never end the turn while the launcher is
    active; its terminal result drives the next workflow step.
