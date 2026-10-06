@@ -114,9 +114,7 @@ class DailiesAgentsTests(unittest.TestCase):
         return output.getvalue().splitlines()
 
     def agent_lines(self, lines: list[str]) -> list[str]:
-        start = lines.index("### Agents")
-        end = next(index for index in range(start + 1, len(lines)) if not lines[index])
-        return lines[start + 1:end]
+        return [line for line in lines if line.startswith(("* claude ", "* codex ")) or line == "* none active"]
 
     def test_approved_lines_order_and_footer_position(self) -> None:
         self.note("claude 1", usage="60", checked="2026-10-05T08:10:00+00:00")
@@ -132,24 +130,27 @@ class DailiesAgentsTests(unittest.TestCase):
         _ = self.readings.write_text("{bad json}\n" + self.readings.read_text())
         lines = self.run_report(waiting=True, held=True)
         self.assertEqual(self.agent_lines(lines), [
-            "- claude 1: 40% of the week used; runs out about Tue 07:10 PDT, before its Sun 23:00 refill; 1 reset available until Oct 22",
-            "- codex 2: 78% of the week used; runs out about 20:45 PDT today, before its Sun 02:25 refill; 1 reset available until Oct 29",
+            "* claude 1: 40% of the week used; runs out about Tue 07:10 PDT, before its Sun 23:00 refill; 1 reset available until Oct 22",
+            "* codex 2: 78% of the week used; runs out about 20:45 PDT today, before its Sun 02:25 refill; 1 reset available until Oct 29",
         ])
         chart_end = len(lines) - 1 - lines[::-1].index("```")
-        hold = next(i for i, line in enumerate(lines) if line.startswith("build hold:"))
-        agents = lines.index("### Agents")
-        waiting = lines.index("waiting on you:")
+        hold = next(i for i, line in enumerate(lines) if line.startswith("* build hold:"))
+        agents = lines.index(self.agent_lines(lines)[0])
+        schedule = lines.index("* no dailies scheduled")
         self.assertLess(chart_end, hold)
         self.assertLess(hold, agents)
-        self.assertEqual(lines[waiting - 1], "")
-        self.assertEqual(lines[waiting - 2], self.agent_lines(lines)[-1])
+        self.assertEqual(lines[schedule - 1], self.agent_lines(lines)[-1])
+        self.assertFalse(any("waiting on you:" in line for line in lines))
         self.assertNotIn("codex 3", "\n".join(lines))
 
         output = io.StringIO()
         with redirect_stdout(output):
             code = dailies_render.main(["--footer", "--zone", ZONE, "--at", AT])
         self.assertEqual(code, 0)
-        self.assertNotIn("### Agents", output.getvalue())
+        footer_lines = output.getvalue().splitlines()
+        self.assertEqual(self.agent_lines(footer_lines), self.agent_lines(lines))
+        self.assertEqual(footer_lines[:4], ["", "---", "12:45 PDT update:", ""])
+        self.assertEqual(footer_lines[-1], "* no dailies scheduled")
 
     def test_repeated_hour_run_out_shows_pst(self) -> None:
         self.note("claude 1", usage="20", resets="2026-11-07T12:00:00-08:00",
@@ -159,7 +160,7 @@ class DailiesAgentsTests(unittest.TestCase):
             ("claude 1", "2026-11-01T07:30:00+00:00", 20),
         )
         self.assertEqual(self.agent_lines(self.run_report(at="2026-11-01T00:45")), [
-            "- claude 1: 80% of the week used; runs out about 01:30 PST today, before its Sat 12:00 refill; resets unknown",
+            "* claude 1: 80% of the week used; runs out about 01:30 PST today, before its Sat 12:00 refill; resets unknown",
         ])
 
     def test_run_out_rounds_across_fall_back(self) -> None:
@@ -170,23 +171,23 @@ class DailiesAgentsTests(unittest.TestCase):
             ("claude 1", "2026-11-01T07:59:45+00:00", 10),
         )
         self.assertEqual(self.agent_lines(self.run_report(at="2026-11-01T01:00")), [
-            "- claude 1: 90% of the week used; runs out about 01:00 PST today, before its Sat 12:00 refill; resets unknown",
+            "* claude 1: 90% of the week used; runs out about 01:00 PST today, before its Sat 12:00 refill; resets unknown",
         ])
 
-    def test_agents_follow_multiple_holds_before_waiting(self) -> None:
+    def test_agents_follow_multiple_holds_before_schedule(self) -> None:
         _ = (self.holders / "third").write_text(json.dumps({
             "holder": "third", "since": "2026-10-05T12:10:00-07:00",
             "for": "the review", "release_eta": "2026-10-05T13:10:00-07:00",
         }) + "\n")
         lines = self.run_report(waiting=True, held=True)
-        holds = [index for index, line in enumerate(lines) if line.startswith("build hold:")]
-        agents = lines.index("### Agents")
-        waiting = lines.index("waiting on you:")
+        holds = [index for index, line in enumerate(lines) if line.startswith("* build hold:")]
+        agents = lines.index(self.agent_lines(lines)[0])
+        schedule = lines.index("* no dailies scheduled")
         self.assertEqual(len(holds), 2)
         self.assertLess(holds[-1], agents)
-        self.assertLess(agents, waiting)
-        self.assertEqual(lines[agents - 1], "")
-        self.assertEqual(lines[waiting - 1], "")
+        self.assertLess(agents, schedule)
+        self.assertEqual(lines[agents - 1], lines[holds[-1]])
+        self.assertEqual(lines[schedule - 1], self.agent_lines(lines)[-1])
 
     def test_short_span_uses_week_pace(self) -> None:
         self.note("claude 1", usage="60", resets="2026-10-11T12:45:00", count=None, limit=None)
@@ -195,7 +196,7 @@ class DailiesAgentsTests(unittest.TestCase):
             ("claude 1", "2026-10-05T19:45:00+00:00", 60),
         )
         self.assertEqual(self.agent_lines(self.run_report()), [
-            "- claude 1: 40% of the week used; runs out about Wed 00:45 PDT, before its Sun 12:45 refill; resets unknown",
+            "* claude 1: 40% of the week used; runs out about Wed 00:45 PDT, before its Sun 12:45 refill; resets unknown",
         ])
 
     def test_past_run_outs_lean_the_prediction_early(self) -> None:
@@ -205,14 +206,14 @@ class DailiesAgentsTests(unittest.TestCase):
             ("claude 1", "2026-10-05T19:45:00+00:00", 60),
         )
         self.assertEqual(self.agent_lines(self.run_report()), [
-            "- claude 1: 40% of the week used; runs out about 18:45 PDT today, before its Sun 23:00 refill; resets unknown",
+            "* claude 1: 40% of the week used; runs out about 18:45 PDT today, before its Sun 23:00 refill; resets unknown",
         ])
         _ = self.run_outs.write_text("".join(json.dumps(record) + "\n" for record in [
             {"account": "codex 2", "ended": "2026-10-06T02:18:47+00:00", "ratios": [0.5, 0.5]},
             {"account": "claude 1", "ended": "2026-10-06T13:15:56+00:00", "ratios": [0.5, 0.5]},
         ]))
         self.assertEqual(self.agent_lines(self.run_report()), [
-            "- claude 1: 40% of the week used; runs out about 15:45 PDT today, before its Sun 23:00 refill; resets unknown",
+            "* claude 1: 40% of the week used; runs out about 15:45 PDT today, before its Sun 23:00 refill; resets unknown",
         ])
 
     def test_readings_before_last_refill_are_ignored(self) -> None:
@@ -223,13 +224,13 @@ class DailiesAgentsTests(unittest.TestCase):
             ("claude 1", "2026-10-05T19:45:00+00:00", 60),
         )
         self.assertEqual(self.agent_lines(self.run_report()), [
-            "- claude 1: 40% of the week used; runs out about 14:15 PDT today, before its Mon 11:45 refill; resets unknown",
+            "* claude 1: 40% of the week used; runs out about 14:15 PDT today, before its Mon 11:45 refill; resets unknown",
         ])
 
     def test_missing_or_unreadable_log_uses_week_pace(self) -> None:
         self.note("claude 1", usage="60", resets="2026-10-11T12:45:00", count=None, limit=None)
         expected = [
-            "- claude 1: 40% of the week used; runs out about Wed 00:45 PDT, before its Sun 12:45 refill; resets unknown",
+            "* claude 1: 40% of the week used; runs out about Wed 00:45 PDT, before its Sun 12:45 refill; resets unknown",
         ]
         self.assertEqual(self.agent_lines(self.run_report()), expected)
         self.readings.mkdir()
@@ -246,28 +247,28 @@ class DailiesAgentsTests(unittest.TestCase):
             ("codex 1", "2026-10-05T19:45:00+00:00", 60),
         )
         self.assertEqual(self.agent_lines(self.run_report()), [
-            "- claude 1: 40% of the week used; lasts to its Sun 12:45 refill; no resets available",
-            "- claude 2: 1% of the week used; lasts to its Sun 12:45 refill; 2 resets available until Oct 22",
-            "- codex 1: 40% of the week used; lasts to its 23:00 today refill; 1 reset available",
+            "* claude 1: 40% of the week used; lasts to its Sun 12:45 refill; no resets available",
+            "* claude 2: 1% of the week used; lasts to its Sun 12:45 refill; 2 resets available until Oct 22",
+            "* codex 1: 40% of the week used; lasts to its 23:00 today refill; 1 reset available",
         ])
 
     def test_unknown_usage_and_no_active_note(self) -> None:
         self.note("claude 1", usage="null", count=None, limit=None)
         self.note("codex 1", resets="2026-10-04T23:00:00", count="0")
         self.assertEqual(self.agent_lines(self.run_report()), [
-            "- claude 1: week's usage unknown; refills Sun 23:00; resets unknown",
-            "- codex 1: week's usage unknown; refill time unknown; no resets available",
+            "* claude 1: week's usage unknown; refills Sun 23:00; resets unknown",
+            "* codex 1: week's usage unknown; refill time unknown; no resets available",
         ])
         (self.agents / "claude 1.md").unlink()
         (self.agents / "codex 1.md").unlink()
-        self.assertEqual(self.agent_lines(self.run_report()), ["- none active"])
+        self.assertEqual(self.agent_lines(self.run_report()), ["* none active"])
 
     def test_exhausted_and_missing_usage(self) -> None:
         self.note("claude 1", usage="0", count="1")
         self.note("codex 1", usage=None, resets=None, count=None, limit=None)
         self.assertEqual(self.agent_lines(self.run_report()), [
-            "- claude 1: 100% of the week used; out until its Sun 23:00 refill; 1 reset available until Oct 22",
-            "- codex 1: week's usage unknown; refill time unknown; resets unknown",
+            "* claude 1: 100% of the week used; out until its Sun 23:00 refill; 1 reset available until Oct 22",
+            "* codex 1: week's usage unknown; refill time unknown; resets unknown",
         ])
 
 

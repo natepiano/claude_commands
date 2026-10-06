@@ -17,7 +17,8 @@ AT = "2026-10-04T11:00"
 ZONE = "America/Los_Angeles"
 FENCE = "```"
 FOR = "the frame-time lane's breakdown of what each added tool costs"
-AGENT_LINES = ["### Agents", "- none active", ""]
+FOOTER_HEAD = ["", "---", "11:00 PDT update:", ""]
+AGENT_LINES = ["* none active"]
 
 
 @dataclass(frozen=True)
@@ -112,25 +113,25 @@ class ReportFooterTests(unittest.TestCase):
     def test_hold_line_and_unit_marker(self) -> None:
         lines = self.lines(render(report(True), holders=[holder("2026-10-04T11:15:00-07:00")]))
         self.assertIn("12:40 build hold", next(row for row in timeline(lines) if row.startswith("widget")))
-        self.assertEqual(after_timeline(lines), ["", f"build hold: frame-time since 10:56 PDT, for {FOR} - release eta: 11:15 PDT (15 minutes)", "", *AGENT_LINES, "11:00 PDT · next dailies 11:30 PDT - nothing needed"])
+        self.assertEqual(after_timeline(lines), ["", *FOOTER_HEAD, f"* build hold: frame-time since 10:56 PDT, for {FOR} - release eta: 11:15 PDT (15 minutes)", *AGENT_LINES, "* next dailies: 11:30 PDT - nothing needed"])
 
     def test_one_minute_is_singular(self) -> None:
         tail = self.tail(render(report(True), holders=[holder("2026-10-04T11:01:00-07:00")]))
-        self.assertEqual(tail[1], f"build hold: frame-time since 10:56 PDT, for {FOR} - release eta: 11:01 PDT (1 minute)")
+        self.assertIn(f"* build hold: frame-time since 10:56 PDT, for {FOR} - release eta: 11:01 PDT (1 minute)", tail)
 
     def test_at_the_time_counts_zero(self) -> None:
         tail = self.tail(render(report(True), holders=[holder("2026-10-04T11:00:00-07:00")]))
-        self.assertEqual(tail[1], f"build hold: frame-time since 10:56 PDT, for {FOR} - release eta: 11:00 PDT (0 minutes)")
+        self.assertIn(f"* build hold: frame-time since 10:56 PDT, for {FOR} - release eta: 11:00 PDT (0 minutes)", tail)
 
     def test_one_minute_overdue_is_singular(self) -> None:
         tail = self.tail(render(report(True), holders=[holder("2026-10-04T10:59:00-07:00")]))
-        self.assertEqual(tail[1], f"build hold: frame-time since 10:56 PDT, for {FOR} - release eta: 10:59 PDT (overdue 1 minute)")
+        self.assertIn(f"* build hold: frame-time since 10:56 PDT, for {FOR} - release eta: 10:59 PDT (overdue 1 minute)", tail)
 
     def test_release_countdown_crosses_clock_change(self) -> None:
         fields = {**report(True), "zone": "America/New_York"}
         record = holder("2026-11-01T02:30:00-05:00", since="2026-11-01T00:15:00-04:00")
         tail = self.tail(render(fields, at="2026-11-01T00:30", holders=[record]))
-        self.assertIn("release eta: 02:30 EST (180 minutes)", tail[1])
+        self.assertTrue(any("release eta: 02:30 EST (180 minutes)" in line for line in tail))
 
     def test_plumbing_in_holder_purpose_is_refused_in_report_and_footer(self) -> None:
         record = holder(purpose="the writer's timings")
@@ -143,40 +144,43 @@ class ReportFooterTests(unittest.TestCase):
     def test_multiple_holders_share_footer(self) -> None:
         records = [holder(), holder("2026-10-04T10:54:00-07:00", "other", "2026-10-04T10:57:00-07:00")]
         lines = self.lines(footer("--next-run", "11:30", holders=records))
-        self.assertEqual(len([line for line in lines if line.startswith("build hold:")]), 2)
-        self.assertIn("release eta: unknown", lines[0])
-        self.assertIn("release eta: 10:54 PDT (overdue 6 minutes)", lines[1])
+        holds = [line for line in lines if line.startswith("* build hold:")]
+        self.assertEqual(len(holds), 2)
+        self.assertIn("release eta: unknown", holds[0])
+        self.assertIn("release eta: 10:54 PDT (overdue 6 minutes)", holds[1])
 
     def test_report_and_footer_match(self) -> None:
         records = [holder("2026-10-04T11:01:00-07:00")]
         report_tail = after_timeline(self.lines(render(report(True), holders=records)))
         footer_lines = self.lines(footer("--next-run", "11:30", "--nothing-needed", holders=records))
-        self.assertEqual(report_tail, ["", *footer_lines[:-1], *AGENT_LINES, footer_lines[-1]])
+        self.assertEqual(report_tail, ["", *footer_lines])
 
     def test_no_hold_and_no_schedule(self) -> None:
-        self.assertEqual(after_timeline(self.lines(render(report(False, next_run=None)))), ["", *AGENT_LINES, "11:00 PDT · no dailies scheduled - nothing needed"])
-        self.assertEqual(self.lines(footer()), ["11:00 PDT · no dailies scheduled"])
+        self.assertEqual(after_timeline(self.lines(render(report(False, next_run=None)))), ["", *FOOTER_HEAD, *AGENT_LINES, "* no dailies scheduled - nothing needed"])
+        self.assertEqual(self.lines(footer()), [*FOOTER_HEAD, *AGENT_LINES, "* no dailies scheduled"])
 
     def test_a_needed_subject_drops_nothing_needed(self) -> None:
         tail = self.tail(render(report(False, needed="the showrunner settles the shared font")))
-        self.assertEqual(tail, ["", *AGENT_LINES, "11:00 PDT · next dailies 11:30 PDT"])
+        self.assertEqual(tail, ["", *FOOTER_HEAD, *AGENT_LINES, "* next dailies: 11:30 PDT"])
 
-    def test_outstanding_items_list_and_drop_nothing_needed(self) -> None:
+    def test_outstanding_items_drop_nothing_needed_without_entering_footer(self) -> None:
         items = [{"since": "2026-10-03T09:05", "text": "send the Bevy PR"}, {"since": "2026-10-04T10:40", "text": "pick the demo scene"}]
         with tempfile.TemporaryDirectory() as scratch:
             path = Path(scratch) / "outstanding.json"
             _ = path.write_text(json.dumps(items))
             lines = self.lines(footer("--next-run", "11:30", "--nothing-needed", "--outstanding", str(path)))
-        expected = ["waiting on you:", "- send the Bevy PR (since Sat 09:05)", "- pick the demo scene (since 10:40)", "", "11:00 PDT · next dailies 11:30 PDT"]
+        expected = [*FOOTER_HEAD, *AGENT_LINES, "* next dailies: 11:30 PDT"]
         self.assertEqual(lines, expected)
 
-    def test_deferred_item_hides_until_its_after_time(self) -> None:
+    def test_deferred_item_suppresses_nothing_needed_only_after_its_time(self) -> None:
         items = [{"since": "2026-10-04T08:36", "text": "send the Bevy PR", "after": "2026-10-04T19:00"}, {"since": "2026-10-04T10:40", "text": "pick the demo scene", "after": "2026-10-04T10:59"}]
         with tempfile.TemporaryDirectory() as scratch:
             path = Path(scratch) / "outstanding.json"
             _ = path.write_text(json.dumps(items))
-            lines = self.lines(footer("--next-run", "11:30", "--outstanding", str(path)))
-        self.assertEqual(lines, ["waiting on you:", "- pick the demo scene (since 10:40)", "", "11:00 PDT · next dailies 11:30 PDT"])
+            before = self.lines(footer("--next-run", "11:30", "--nothing-needed", "--outstanding", str(path), at="2026-10-04T10:30"))
+            after = self.lines(footer("--next-run", "11:30", "--nothing-needed", "--outstanding", str(path)))
+        self.assertEqual(before[-1], "* next dailies: 11:30 PDT - nothing needed")
+        self.assertEqual(after, [*FOOTER_HEAD, *AGENT_LINES, "* next dailies: 11:30 PDT"])
 
     def test_held_unit_has_no_section_line(self) -> None:
         lines = self.lines(render(report(True), holders=[holder("2026-10-04T11:15:00-07:00")]))
@@ -184,7 +188,7 @@ class ReportFooterTests(unittest.TestCase):
         self.assertEqual([line for line in section if "build hold" in line], [])
 
     def test_next_dailies_on_a_later_day_shows_its_weekday(self) -> None:
-        self.assertEqual(self.lines(footer("--next-run", "09:30+1")), ["11:00 PDT · next dailies Mon 09:30 PDT"])
+        self.assertEqual(self.lines(footer("--next-run", "09:30+1")), [*FOOTER_HEAD, *AGENT_LINES, "* next dailies: Mon 09:30 PDT"])
 
     def test_stale_marker_and_unmarked_active_hold_are_refused(self) -> None:
         self.refused(render(report(True)), "remove the stale unit marker")
@@ -306,7 +310,7 @@ class ChangedPhaseTitleTests(unittest.TestCase):
         self.assertEqual(saved, {"widget-enhancements": {
             "phase": self.NEW_PHASE, "eta": "2026-10-05T13:42:00", "held": None, "first": "2026-10-05T13:42:00",
         }})
-        self.assertEqual(after_timeline(result.lines), ["", *AGENT_LINES, "13:30 PDT · no dailies scheduled - nothing needed"])
+        self.assertEqual(after_timeline(result.lines), ["", "", "---", "13:30 PDT update:", "", *AGENT_LINES, "* no dailies scheduled - nothing needed"])
 
     def test_new_title_uses_explicit_first_eta(self) -> None:
         result, saved = self.render_new_phase(first="2026-10-05T13:00")
@@ -316,7 +320,7 @@ class ChangedPhaseTitleTests(unittest.TestCase):
         self.assertEqual(saved, {"widget-enhancements": {
             "phase": self.NEW_PHASE, "eta": "2026-10-05T13:42:00", "held": None, "first": "2026-10-05T13:00:00",
         }})
-        self.assertEqual(after_timeline(result.lines), ["", *AGENT_LINES, "13:30 PDT · no dailies scheduled - nothing needed"])
+        self.assertEqual(after_timeline(result.lines), ["", "", "---", "13:30 PDT update:", "", *AGENT_LINES, "* no dailies scheduled - nothing needed"])
 
     def test_saved_phase_without_title_counts_as_new(self) -> None:
         result, saved = self.render_new_phase(old_phase="Phase 16 of 18")
@@ -334,7 +338,7 @@ class ChangedPhaseTitleTests(unittest.TestCase):
         self.assertEqual(saved, {"widget-enhancements": {
             "phase": self.NEW_PHASE, "eta": "2026-10-05T13:42:00", "held": reason, "first": "2026-10-05T13:42:00",
         }})
-        self.assertEqual(after_timeline(result.lines), ["", *AGENT_LINES, "13:30 PDT · no dailies scheduled - nothing needed"])
+        self.assertEqual(after_timeline(result.lines), ["", "", "---", "13:30 PDT update:", "", *AGENT_LINES, "* no dailies scheduled - nothing needed"])
 
 
 if __name__ == "__main__":
