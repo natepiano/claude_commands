@@ -18,6 +18,10 @@ BOARD = VERIFY.with_name("board.sh")
 Record = dict[str, object]
 
 
+def restore_sigint() -> None:
+    _ = signal.signal(signal.SIGINT, signal.SIG_DFL)
+
+
 class VerifyTokenWaitTests(unittest.TestCase):
     temporary: tempfile.TemporaryDirectory[str]  # pyright: ignore[reportUninitializedInstanceVariable]
     root: Path  # pyright: ignore[reportUninitializedInstanceVariable]
@@ -350,7 +354,8 @@ esac
                               "PLAN_DELEGATE_TEAM_ROLE": "second", "TEST_RECLAIM_CHECK": "1"}
         first = subprocess.Popen(["bash", str(VERIFY), "check", "sample"], cwd=self.root,
                                  env=first_environment, stdout=subprocess.DEVNULL,
-                                 stderr=subprocess.DEVNULL, start_new_session=True)
+                                 stderr=subprocess.DEVNULL, start_new_session=True,
+                                 preexec_fn=restore_sigint)
         self.started_groups.add(first.pid)
         try:
             deadline = time.monotonic() + 15

@@ -13,7 +13,7 @@ import unittest
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from threading import Barrier
-from typing import override
+from typing import cast, override
 
 
 BOARD = Path(__file__).with_name("board.sh")
@@ -65,8 +65,7 @@ class BoardReclaimTests(unittest.TestCase):
             self.fail("guard helper has no stdout")
         ready, _, _ = select.select([helper.stdout], [], [], 5)
         self.assertTrue(ready, "guard helper did not start")
-        self.assertEqual(os.read(helper.stdout.fileno(), 64).decode().strip(), "locked")
-        helper.stdout.close()
+        self.assertEqual(cast(str, helper.stdout.readline()).strip(), "locked")
         return helper
 
     @staticmethod
@@ -80,6 +79,8 @@ class BoardReclaimTests(unittest.TestCase):
         if helper.poll() is None:
             helper.kill()
         _ = helper.wait(timeout=5)
+        if helper.stdout is not None:
+            helper.stdout.close()
 
     def assert_guard_file(self) -> None:
         self.assertFalse((self.root / "locks" / "cargo.reclaim").exists())
