@@ -133,6 +133,7 @@ codex_mesh.py start  --session-dir --name --cwd --prompt-file \
                      --summary-file --log-file [--model --effort --service-tier --sandbox]
 codex_mesh.py send   --session-dir --to <name> --message <text>
 codex_mesh.py steer  --session-dir --to <name> --message <text>
+codex_mesh.py end    --session-dir --to <name>
 codex_mesh.py list   --session-dir
 codex_mesh.py stop   --session-dir
 ```
@@ -176,17 +177,15 @@ that attaches with a provider message it cached earlier — no round trip — so
 usage limit that was real hours ago is replayed word for word to work that would
 have succeeded. Reading the message cannot tell that from a live refusal; the
 launcher settles it by running the work again on a server it starts itself,
-which has cached nothing. `command_start` retries once when all four hold: the
-server was inherited rather than started by this call, the delegate produced no
-work, the failure arrived within `RETRY_FAST_FAILURE_SECS` (120), and the
-delegate is not resident. `produced_work` is the interlock — any completed item
-blocks the retry, because repeating the prompt would repeat edits already
-applied — and it is set conservatively, since a delegate wrongly held back loses
-a round while one wrongly retried loses its work to a second pass. `_retire_server`
+which has cached nothing. `command_start` retries once, through `_retry_warranted`, when all of these hold: the run ended `FailedBeforeThread` (no thread exists, so repeating the prompt cannot repeat edits), the server was inherited rather than started by this call, the failure arrived within `RETRY_FAST_FAILURE_SECS` (120), and the delegate is not resident. A run that failed after `thread/start` is `FailedWithThread` and is never retried, since its prompt may already have done work. `_retire_server`
 drops the record only when it still names the server that failed, so seats
 racing the same recovery replace one server between them rather than one each.
 Same failure on the fresh server means the provider really did refuse, and it is
 reported unchanged.
+
+**Model at capacity.** A turn ends `TurnCompleted`, `TurnRefusedForCapacity` or `TurnFailed`; a run ends `RunCompleted`, `FailedBeforeThread`, `FailedWithThread` or `CapacityRetriesExhausted`. Capacity is the error's `codexErrorInfo` `serverOverloaded` / `flexUnavailable`, or the message `Selected model is at capacity`. The launcher keeps the same thread and roster entry: it marks the entry `waiting_capacity` with its own `launcher_pid`, waits `CAPACITY_WAIT_SECS` (30 s) doubling up to `CAPACITY_MAX_WAIT_SECS` (300 s) within `CAPACITY_BUDGET_SECS` (1200 s), logs one `capacity retry N: next turn at <time>` line per wait, and starts a resume turn saying the last turn stopped for capacity with its edits in the tree. Messages queued for the thread meanwhile move to `<seat>.pending.json`, and the resume turn carries them. Once the budget runs out the entry is `capacity_exhausted` and `start` exits 1 with `codex_mesh: <seat>: model still at capacity after <N> retries over <M> min; thread <id> stays on the roster (codex_mesh.py end --to <seat>)`.
+
+**Relaunching a seat.** `start` on a name already on the roster reads the old thread through `thread/read`, typed `ThreadLive(turn_id) | ThreadActiveWithoutTurn | ThreadIdle | ThreadStateUnknown(reason)`, and replaces the entry only on `ThreadIdle`; any other state exits 2 and names `codex_mesh.py end --to <seat>`. A `waiting_capacity` entry whose `launcher_pid` is alive exits 2 the same way. A `failed` entry first repeats the dead launcher's cleanup, `_end_unwatched_turn(port, thread_id, log_path) -> RelaunchAllowed | RelaunchBlockedByLiveTurn`; blocked exits 2 with `codex_mesh: <seat>: thread <id> still has a live turn that could not be interrupted; relaunch once it ends`.
 
 ### Addressable codex delegates (`scripts/agents/codex_mesh.py`)
 
@@ -216,7 +215,7 @@ writes the same summary and log files `agent_exec` does, so `implement.sh`'s `wa
 and pass recording are unchanged — the only thing it adds is the address. Two
 files carry the session's mesh state, both under the delegate session directory:
 `mesh_server.json` (`{port, pid}`) and `mesh_roster.json`
-(`{name: {thread_id, turn_id, status}}`, every read-modify-write under
+(`{name: {thread_id, turn_id, status, launcher_pid?}}`, `launcher_pid` only on a `waiting_capacity` entry; every read-modify-write under
 `fcntl.LOCK_EX` because the delegates register concurrently).
 
 The protocol has three traps, each of which cost a run to rediscover:
@@ -243,10 +242,15 @@ while work remains, plus a short grace window for a queued turn already in
 flight, and only then writes the summary and exits. The summary is the last
 turn's answer, so a peer's follow-up is reflected in what the unit director reads.
 
-The mirror of that: `send` **refuses** a delegate whose roster status is not
-`running`. The thread outlives the launcher, so the server would cheerfully start
-a turn for a late message with nothing streaming it and nothing writing the
-summary. A refusal is better than work no one ever sees.
+The mirror of that: `send` delivers only while a launcher is attached. To a
+`running` seat it calls `thread/queue/add`; to a `waiting_capacity` seat it
+stores the message in `<seat>.pending.json` under an `flock`, for the resume
+turn. It refuses a `capacity_exhausted` seat or one being ended (exit 2), and any
+other status (`done`, `failed`) with `<seat> is <status>, not running` (exit 1).
+The thread outlives the launcher, so the server would start a turn for a late
+message with nothing streaming it and nothing writing the summary. A refusal is
+better than work no one ever sees. `end` accepts `running`, `waiting_capacity`
+and `capacity_exhausted` (`ENDABLE_STATUSES`).
 
 ### Catalog sync (`scripts/agents/sync_codex_catalog.sh`)
 
@@ -380,7 +384,7 @@ All four wrappers capture resolver stderr into their log (`agents_resolve "$TASK
   exception is a thread started `--resident` (ask_a_friend's friend): it stays
   `running` across turns, prints each reply as it lands, and ends only on
   `codex_mesh.py end`. `send`
-  to a delegate whose roster status is not `running` will not be read.
+  refuses every status but `running` and `waiting_capacity`.
 - **`AGENT_EXEC_EXTRA_ARGS` is whitespace-split with no quote interpretation.** Flag+value pairs (`--add-dir /path`) work; no single argument may contain a space — no prompt preambles, no `--settings` JSON.
 - **`AGENT_EXEC_DRY_RUN=1`** is the testing hook: `%q`-quoted argv plus redirection suffix, with a `cd <dir> && ` prefix on the claude branch. Match smoke checks on substrings (`--full-auto`, `--sandbox read-only`, `-m <agent>`, the effort word), never whole lines — the codex effort token renders with escaped quotes (`model_reasoning_effort=\"high\"`).
 - **awk gotchas.** `function` is a reserved awk word — pass it as `-v fn=`. `awk -v` decodes backslash escapes, so a value containing `\n` / `\t` would corrupt the row; user-supplied values go through `ENVIRON["…"]`.
@@ -389,7 +393,7 @@ All four wrappers capture resolver stderr into their log (`agents_resolve "$TASK
 - **Last-writer-wins on conf rewrites.** The source-time sync and the `/agent` editors both rewrite the file with tmp + `mv` and no locking; interleaved writers can silently revert each other's change but never corrupt the file.
 - **claude-family output needs `python3`.** The claude branch logs stream-JSON and extracts the final result event into the output file; without `python3` the output file would be empty even though the log is complete. Claude-family `readonly` reviewers running the style loader script under `--permission-mode plan --print` is untested — a family switch may silently degrade style loading.
 - **`_agents_registry_get` returns 0 on a miss** (prints nothing) so it is safe under `set -e` in command substitution; use `_agents_registry_has_key` when you need presence as a condition.
-- **The `cargo` build token belongs to `verify.sh`, and never to a prompt.** `verify.sh` acquires `board.sh … cargo` itself from `PLAN_DELEGATE_BOARD_DIR` / `PLAN_DELEGATE_TEAM_ROLE` and releases it from one unified EXIT/INT/TERM path, so concurrent team members serialize their builds without being asked to. Putting the acquire in a prompt as well makes that agent wait out the full `--wait` against a token it already holds, and the symptom — a member that just sits there — is indistinguishable from a slow test. With either env var unset the token step is skipped entirely, which is what keeps a standalone `verify.sh` run unchanged.
+- **The `cargo` build token belongs to `verify.sh`, and never to a prompt.** `verify.sh` acquires `board.sh … cargo` itself from `PLAN_DELEGATE_BOARD_DIR` / `PLAN_DELEGATE_TEAM_ROLE` and releases it from one unified EXIT/INT/TERM path, so concurrent team members serialize their builds without being asked to. It acquires with `--pid $$`, so a `verify.sh` killed before that path runs leaves no stranded token: a waiter reclaims it as soon as that pid is gone (`build-memory-admission.md`, Cargo token reclaim). Putting the acquire in a prompt as well makes that agent wait out the full `--wait` against a token it already holds, and the symptom — a member that just sits there — is indistinguishable from a slow test. With either env var unset the token step is skipped entirely, which is what keeps a standalone `verify.sh` run unchanged.
 - **`verify.sh` remembers passes within a delegate session.** A `test` or `lint` that exits 0 under `PLAN_DELEGATE_BOARD_DIR` or `PLAN_DELEGATE_SESSION_DIR` is recorded in `<session>/verify_cache/`, keyed by the tree as the run left it plus the arguments, toolchain, `lint.conf`, the scripts and the cargo environment; the same call on the same tree prints `PASS (recorded)` with that run's log and takes no token. It looks again after taking the token, so a seat queued behind its peer's identical run gets the peer's record. Failures are never recorded; `--no-cache` forces a run. Each record holds what a repeat would cost (wall time minus cargo's `Finished … in` build time); every such call, `--no-cache` included, appends one line (ran, failed, interrupted, or reused with seconds saved; machine, workspace, worktree, branch, commit) to `~/.local/state/verify/events.jsonl`, which `/verify_saved` (`verify_saved.py`) totals for any span by workspace, worktree, day or week, the Mac's ledger read over ssh. `end_session.sh` deletes the records; the ledger stays.
 - **A green `verify.sh` only means what the tree it ran against means.** With three members editing one worktree, a pass is authoritative for a slot's work only after that slot has posted `done` to the board.
 - **cargo-berth claims are per harness session id, so cross-slot edits are blocked, not merged.** Each delegate is its own claim holder: the tester cannot add a `#[cfg(test)]` block to a file `impl` claimed, which is why the contract routes it to an integration test under `tests/`.

@@ -14,14 +14,14 @@ The build log records how long each build step waited on memory. A machine-wide 
 | `scripts/buildlog/record.py` | `peak_and_stall()` parses the scope file into a `StepScopeMemory`. `step()` writes `peak_mem_bytes`, `mem_stall_some_s` and `mem_stall_full_s` into the step record. |
 | `scripts/buildlog/sample.py` | `sample()` (the `buildlog sample` command) and the parsers `parse_meminfo`, `parse_pressure` and `parse_boot_id`. Also the types `MachineMemoryUse`, `MemoryStallTotals`, `PartialMemoryStallTotals` and `Unmeasured`. |
 | `scripts/buildlog/store.py` | `sample_file(host, epoch)` names `<root>/<host>/samples-<YYYY-MM>.jsonl`. |
-| `scripts/buildlog/index.py` | `SCHEMA_VERSION = 5`: the two step stall columns, `SAMPLE_COLUMNS` and the `samples` table, `add_sample`, and the indexes `samples_host_at` and `steps_host_started`. |
+| `scripts/buildlog/index.py` | `SCHEMA_VERSION = 9` (the memory-admission columns are in `docs/as-built/build-memory-admission.md`): the two step stall columns, `SAMPLE_COLUMNS` and the `samples` table, `add_sample`, and the indexes `samples_host_at` and `steps_host_started`. |
 | `scripts/buildlog/cli.py` | The `sample` command. It takes no arguments and exits 2 if given any. |
 | `scripts/buildlog/report.py` | `memory_pressure_section()` and `MAX_SAMPLE_GAP_S`. It reuses `SCRATCH` and `SCRATCH_LABEL`. |
 | `scripts/buildlog/test_{record,index,store,sample,report}.py` | Fixture tests; see Tests below. |
 
 ### Per-step stall: scope file → step record → `steps`
 
-1. On natedev, `buildlog_exec` runs each step through `systemd-run --user --scope … /bin/sh -c "$BUILDLOG_SCOPE_SH" "$BUILDLOG_PEAK" "$@"`:
+1. On natedev, `buildlog_exec` runs each step through `systemd-run --user --scope … --slice=builds.slice -- /bin/sh -c "$BUILDLOG_SCOPE_SH" "$BUILDLOG_PEAK" "$@"`:
 
    ```sh
    exec 2>&3 3>&-; { : > "$0"; } 2>/dev/null || exit 125; "$@"; s=$?; cgroup="/sys/fs/cgroup$(sed -n "s/^0:://p" /proc/self/cgroup)"; cat "$cgroup/memory.peak" "$cgroup/memory.pressure" > "$0" 2>/dev/null; exit $s
@@ -45,14 +45,13 @@ The build log records how long each build step waited on memory. A machine-wide 
 
 `memory_pressure_section(connection, day, hosts)` runs after the per-kind sections and before the verify.sh calls section. `day` is the local day of the machine running the report.
 
-- **Nothing that day:** if no step stalled and there are no samples, the whole section is the line `Memory pressure: no samples and no step stalls.` It has no heading.
-- **Otherwise:** the heading `### Memory pressure`, then `Source: 60 s machine samples and step cgroup stall counters.`, then:
+The section always has its heading `### Memory pressure`, then `Source: 60 s machine samples and step cgroup stall counters.`, then the memory-waits line and the sccache, unsliced-step and memory-kill lines (`docs/as-built/build-memory-admission.md`), then:
   - **Stall table**, shown only when a step stalled: `| Caller | Kind | Stall | At once |`.
     - Rows are the five steps with the largest `mem_stall_some_s > 0`, largest first. `full` is recorded but not shown.
     - Caller is `caller_label()`, which appends the host when more than one host built that day. A step whose cwd is under a temp folder shows as `scratch (temp folders)` instead.
     - "At once" counts the steps on the same host for which `started_at <= s.started_at < ended_at`. The count includes the step itself, every caller and scratch steps. Steps on another host never count. `steps_host_started` serves this subquery. It compares ISO strings, which works because `store.utc_iso` writes one fixed-width UTC format.
   - **One line under the table**, either:
-    - `60 s samples: peak used memory X GiB, peak swap Y GiB; machine stall: some A, full B.`, or
+    - `60 s samples: peak used memory X GiB, peak swap Y GiB; peak builds B GiB, peak CI C GiB (process memory); machine stall: some A, full B.` Each slice peak is the day's highest `builds_anon_bytes` or `ci_anon_bytes`, or `unavailable` when no sample has it., or
     - `60 s samples: none; machine stall: unavailable.` when there are no samples.
 - **How the machine stall is summed:**
   - The day's samples are taken per host, in time order. For a host's first sample of the day, the baseline is that host's latest earlier sample from any day.
@@ -84,13 +83,13 @@ The build log records how long each build step waited on memory. A machine-wide 
   - Pairs are taken within each host and the totals summed across hosts.
   - A pair more than 5 minutes apart is ignored.
   - A pair across local midnight that is close enough counts, with `TZ=UTC` pinned.
-  - An empty day is one line with no heading.
+  - An empty day keeps the heading, `memory waits: none` and `60 s samples: none; machine stall: unavailable.`
 
 ## Invariants
 
 - **The sampler never opens the SQLite index.** `buildlog sample` appends one JSON line and exits; the index ingests that line on the next query. A test pins that no `index.sqlite` appears.
 - **A test never writes the real log at `~/.local/state/buildlog`.** Every test module imports `test_index`, whose import calls `use_test_log()` and points `BUILDLOG_DIR` at a temp dir for the whole suite. `point_root_at()` moves it for a single test. Subprocess tests also pass `BUILDLOG_DIR` explicitly. The real `cli.py sample` test runs against a temp root.
-- **Every report section follows one layout.** It states its source and has at most one line under each table. An empty day collapses the memory section to one line.
+- **Every report section follows one layout.** It states its source and has at most one line under each table.
 - **`report.py` has one style.** Cells are formatted through `table()`, `seconds()`, `count()` and `gib()`, with no new formatters.
 - **Unmeasured stall is null, never zero.** Inside Python it is `sample.Unmeasured.VALUE`; in JSON it is `null` and in SQLite `NULL`. Zero means measured with no stall. The report's `> 0` filter drops null rows, and SQL `avg()` skips them.
 - **The scope string must not change the step's outcome.** It keeps the step's exit status, prints nothing, and writes the marker before the step runs. Callers run under `set -euo pipefail`, and a missing marker means the scope never started the step, so `buildlog_exec` runs it without the scope.
@@ -105,12 +104,12 @@ The build log records how long each build step waited on memory. A machine-wide 
 - **The 5-minute gap rule.** `MAX_SAMPLE_GAP_S = 300`, five 60 s intervals. A counter rise across a longer gap cannot be placed on a day, so it is dropped. That happens when the timer stopped or the machine was off. Across a `boot_id` change, PSI counters restart at zero, so the later counter is the delta; this still applies only within the 5-minute gap.
 - **Temp-folder steps are in the stall table.** They appear as `scratch (temp folders)` (`SCRATCH_LABEL`), and they count in every step's "at once". `SCRATCH` matches a cwd under `/tmp/`, `/var/folders/` or `/private/var/folders/`.
 - **Linux only.** `buildlog sample` without any of its three `/proc` files prints one line and exits 1. That includes a Linux kernel without PSI. A malformed `/proc/pressure/memory` raises and writes no row, and the next minute tries again. Step stalls need the systemd scope as well: a user manager, `systemd-run`, and `BUILDLOG_SCOPE` not set to `0`. That means natedev only, the same as `peak_mem_bytes`.
-- **The 60 s timer lives in `/etc/nixos`, on natedev.** It is a `nate.jobs` entry like the hourly `buildlog` job in `modules/linux/buildlog.nix`, not anything in `~/.claude`. Without it the `samples` table stays empty. The report then shows only the stall table and `60 s samples: none; machine stall: unavailable.`, or the one-line empty message.
+- **The 60 s timer lives in `/etc/nixos`, on natedev.** It is a `nate.jobs` entry like the hourly `buildlog` job in `modules/linux/buildlog.nix`, not anything in `~/.claude`. Without it the `samples` table stays empty. The report then shows the stall table, if any, and `60 s samples: none; machine stall: unavailable.`
 - **Cost.** One `buildlog sample` run takes 0.04 s (median). A month of samples is 43,200 rows; ingesting it costs 0.32 s the first time and 2 ms after that, because the index reads only bytes past its stored offset. `invoke.sh` prices the scope at 8 ms per step on top of the recorder's 2 ms (natedev, 2026-10-02); that figure predates the stall read.
 - **The machine line has no host label.** It merges every host that has samples. Today only natedev samples, so it is natedev's figure. A second sampling host would add its stall into the same number.
 - **The scope file keeps its old name.** It is still `BUILDLOG_PEAK`, a `*.peak` temp file and `record.py step`'s `PEAK` argument, but it now holds peak and pressure.
 - **Peak still counts page cache.** The report's closing note says so. Stall, not peak, is the evidence of memory starvation.
-- **A step's peak and stall leave out its compiles.** `rustc-wrapper = "sccache"` hands every compile to the one shared sccache server. The server starts rustc (and rustc starts the linker) in the cgroup of whichever session started the server. So a step's scope holds cargo, build scripts, the sccache clients and test processes, but not the compiler or the linker. Seen 2026-10-04 12:2x PDT: two live rustc processes were children of the server in a session's `tmux-spawn` scope, while their step's scope held only sccache clients. The machine sample does see the compiles.
+- **A step's peak and stall leave out its compiles.** `rustc-wrapper = "sccache"` hands every compile to the one shared sccache server, which runs as the `sccache.service` user service inside `builds.slice`. The server starts rustc (and rustc starts the linker) in its own cgroup, so a step's scope holds cargo, build scripts, the sccache clients and test processes, but not the compiler or the linker. The machine sample, and the `builds.slice` figures in the samples and snapshots, do see the compiles.
 - **The cgroup path assumes cgroup v2.** The scope string reads the unified `0::` line of `/proc/self/cgroup`.
 - **basedpyright exits 3 in every checkout.** `pyrightconfig.json` names an absent `.venv`. The lint result is the error and warning counts line, not the exit code.
 

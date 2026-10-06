@@ -11,7 +11,7 @@ Two additions to the build log. The first is a "Tests per edit" section in the d
 - `scripts/buildlog/report.py`: `tests_per_edit_section()`, its data pass `tests_per_edit_data()`, `call_trees()`, `failure_bin()`, `target_status()`, `TESTS_PER_EDIT_TARGET`, `EDIT_BINS`; `report()` adds the section and `rust_release.report_line()`.
 - `scripts/buildlog/rust_release.py`: the whole release check: `check_release()`, `trial_release()`, the state types and file, the text, `report_line()`.
 - `scripts/buildlog/cli.py`: `hourly()` runs the check after sync and CI.
-- `commands/build_hold.md`: `/build_hold` writes one file per holder under `~/.local/state/build-hold/`; release removes only that file.
+- `commands/build_hold.md`: `/build_hold` writes one holder file per holder under `~/.local/state/build-hold/`; the check counts any regular file there as a hold. Hold and release are described in `docs/as-built/build-memory-admission.md`.
 - `scripts/buildlog/test_report.py`, `scripts/buildlog/test_rust_release.py`: behavior tests on a temporary log, with fakes for every outside effect.
 - `/etc/nixos` `modules/linux/buildlog.nix`, `nate.jobs.buildlog`: the hourly timer (3600 s, natedev only, the user's `PATH`) that runs `~/.claude/scripts/buildlog/buildlog hourly`. Not in this repo.
 
@@ -35,7 +35,7 @@ Two additions to the build log. The first is a "Tests per edit" section in the d
 
 **Rendering.** `tests_per_edit_section(connection, day) -> list[str]` gives `### Tests per edit` and two tables, each with one source line:
 1. Trend: seven `DailyTestsPerEdit` rows, newest first, all seats summed. Columns Day, Tests, Edits, Tests/edit, Target. The ratio has two decimals, or `—` with no edits. `target_status()` gives `—`, `on target`, `above` or `below`, comparing ratio and target at two decimals. Line: `Source: verify.sh test calls and step tree keys, <first>–<day>; target 0.5 tests/edit; — means no observed edit.`
-2. Bins: one `FailureRecoveryBin` (failures, recovered, minutes_to_green) per `EDIT_BINS = ("0", "1", "2–3", "4–7", "8+")`, picked by `failure_bin(edits)`. The `0` bin holds failures with no edit since the last green. Columns Edits since green, Failures, Avg to next green. A failure with no later green counts in Failures but not in the average. Line: `Source: verify.sh failed test calls and step tree keys, <first>–<day>`, plus `; N without a later green` when there are any.
+2. Bins: one `FailureRecoveryBin` (failures, recovered, minutes_to_green, recovery_minutes) per `EDIT_BINS = ("0", "1", "2–3", "4–7", "8+")`, picked by `failure_bin(edits)`. The `0` bin holds failures with no edit since the last green. Columns Edits since green, Failures, Avg to next green, p95 to next green (nearest rank over `recovery_minutes`). A failure with no later green counts in Failures but not in the average or the p95. Line: `Source: verify.sh failed test calls and step tree keys, <first>–<day>`, plus `; N without a later green` when there are any.
 
 `report()` places the section after CI and before the Disk section and the summaries.
 
@@ -84,6 +84,7 @@ Otherwise `waiting_reason()` returns the first failing reason (`build hold activ
 - `diagnostic_counts(stdout)` reads the clippy JSON. It counts `compiler-message` entries at level `warning` or `error`, once per (package id, level, lint code, primary span), and returns warnings, warning crates, errors, error crates. Every warning counts as new.
 - Clippy exiting nonzero with compiler errors still finishes the trial, with the error count, and mend still runs. Nonzero with no compiler error is a `TrialFailed`.
 - Mend exit 0 is `cargo-mend builds`; anything else is `cargo-mend does not build`. Either way the trial is `TrialFinished`.
+- `trial_step_was_killed()` reads a step as killed when it exits 128 or more, -9 or -15, or prints `SIGKILL`, `SIGTERM` or `signal 9`/`15`. A killed step (clippy included, whatever its error count) leaves the trial `TrialWaiting` with `<step> killed; retry next night` (the checkout reads `checkout killed`), so the next quiet-hours run trials again.
 - Any other nonzero step gives `TrialFailed` with the step name and `first_error()`. That is the first stderr line containing "error", else the first rendered line of a JSON compiler error, else the first stdout line containing "error", else the first non-empty line, else `exit N`. An `OSError` or `SubprocessError` (a timeout included) gives `TrialFailed` with the step and the exception's first line.
 - Finished and failed trials record `target_gib` and `mend_target_gib`, the summed file sizes of `<clone>/target` and `<clone>/mend-target`, to calibrate the headroom.
 
@@ -108,7 +109,7 @@ The trial part is `waiting, <reason>` or `failed, <step>: <reason>` for the othe
 - Tests never touch the real build log, the real state file, hana, the network, `~/.local/state/build-hold/` or the user's config. `point_root_at()` points `BUILDLOG_DIR` at a temporary root; `LINT_CONFIG` and `tempfile.gettempdir` are patched. The only real subprocess in the suite is the `sh -c 'sleep 60 &'` that checks the group kill.
 - hana is only read: `git show` and `git rev-parse`. All building happens in a `git clone --local` under the temp dir, and the clone is deleted on every outcome, a hold included.
 - One text per stable version. The trial and `text_sent` carry across days while the version is unchanged. A newer stable resets both. A pin that goes away keeps both, so a returning pin neither re-trials nor re-texts.
-- A failed trial is not retried. Only a `waiting` trial runs.
+- A failed trial is not retried. Only a `waiting` trial runs, and a killed step leaves the trial `waiting`.
 - A trial never starts outside 02:00–05:00 local, during a build hold, while the user runs cargo, rustc or cargo-nextest, or below floor plus headroom.
 - The state file is written atomically. The check exits 1 only for a failed fetch or a failed text, and one hourly job raising never stops the others.
 - Tests-per-edit chains start before the window. Narrowing the query to the 7 days would miscount the first call of each seat.
@@ -151,6 +152,7 @@ The trial part is `waiting, <reason>` or `failed, <step>: <reason>` for the othe
 - **Night, no hold, no cargo, enough disk.** The trial is a full workspace build. It must not compete with agents' builds or a held test, and must not take the disk below the floor the sweep defends (natedev's disk filled on 2026-10-03).
 - **Process-group kill.** cargo and nix start child processes. Killing only the parent on timeout would leave rustc running.
 - **One hold file per holder.** Holds can overlap. With one shared marker, the first release would end a hold another session still needs.
+- **A killed step is not a verdict.** earlyoom or a cgroup limit can kill the trial for reasons that say nothing about the release, so it waits for another night instead of recording a failure.
 - **One text per version, with the decision left to the user.** The text asks "bump or wait". A waiting reason is sent rather than nothing, so the user knows the trial has not run, and the later result goes only to the report to avoid a second night-time text.
 - **The pin is read with `git show` from `origin/init/catalyst`.** That reads the pin without touching any checkout.
 - **Two-part pins cover patch releases.** rustup already takes the latest patch for a two-part channel, so a patch release needs no bump.
