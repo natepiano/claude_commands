@@ -149,6 +149,10 @@ branch, port and the files you own.
    `progress_history.py review-trial`'s output, verbatim
    (`/unit:checkpoint` step 9).
 
+   The as-built notice's title names what moved: each doc created, amended,
+   moved or deleted, and each link repointed, this doc's **Units** row
+   included. The close-out never waits on a reply.
+
    A phase that changes what users see, in the app or in any example,
    includes shots from a real window at
    normal size on your port. They show each changed state, including the ones
