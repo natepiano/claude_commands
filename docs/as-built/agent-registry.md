@@ -119,22 +119,25 @@ Wrong arg count or a bad mode returns 2. A missing prompt file writes `Prompt no
 reach: a delegate launched that way takes one prompt and is unreachable until it
 exits. `codex_mesh.py` is the alternative launch path that gives a codex delegate
 an address, so peers and the unit director can message and interrupt it mid-run
-the way they already can a claude delegate. Selected per `[delegate.options]
-codex_mesh` in the registry (`1` as shipped, so the mesh is the normal codex
-launch path; a missing key reads as off), overridable for one run with
-`PLAN_DELEGATE_CODEX_MESH`;
-`implement.sh` reads it and branches.
+the way they already can a claude delegate. It launches `/unit:delegate`'s codex
+seats and `/ask_a_friend`'s codex friend (`start --resident`). For delegates it
+is selected per `[delegate.options] codex_mesh` in the registry (`1` as shipped,
+so the mesh is the normal codex launch path), overridable for one run with
+`PLAN_DELEGATE_CODEX_MESH`; `implement.sh` reads it and branches, and `0`, or a
+missing key, runs a phase on `codex exec` instead.
 
-One `codex app-server` per delegate session, each delegate a thread on it:
+One `codex app-server` per delegate session, each delegate a **thread** on it. A
+thread has an id, and that id is the delegate's address:
 
 ```
 codex_mesh.py serve  --session-dir <dir>                      # start/reuse, print port
 codex_mesh.py start  --session-dir --name --cwd --prompt-file \
-                     --summary-file --log-file [--model --effort --service-tier --sandbox]
-codex_mesh.py send   --session-dir --to <name> --message <text>
-codex_mesh.py steer  --session-dir --to <name> --message <text>
+                     --summary-file --log-file [--reply-file --model --effort \
+                     --service-tier --sandbox --timeout --resident]
+codex_mesh.py send   --session-dir --to <name> (--message <text> | --message-file <path>)
+codex_mesh.py steer  --session-dir --to <name> (--message <text> | --message-file <path>)
 codex_mesh.py end    --session-dir --to <name>
-codex_mesh.py list   --session-dir
+codex_mesh.py list   --session-dir                            # roster: name, status, thread id
 codex_mesh.py stop   --session-dir
 ```
 
@@ -150,19 +153,44 @@ newline-delimited JSON-RPC over a hand-written RFC 6455 client — loopback only
 so no `--ws-auth` token.
 
 `start` connects, calls `thread/start` then `turn/start`, writes the delegate's
-thread id and status into `<session_dir>/mesh_roster.json` under an exclusive
-`flock`, and **blocks until its last turn ends**, translating the notification stream
-into the log file (`agent:`, `exec:`, `edit:`, `thinking`) that
-`heartbeat_watch.sh` narrates. On a `turn/completed` with nothing queued it writes the final message to
-the summary file — or, given `--reply-file` as `implement.sh` passes, to that
-file, filling the summary only when the delegate left it empty — and exits, so `implement.sh`'s `wait`, heartbeat, awake timer,
-and pass recording are untouched.
+entry into `<session_dir>/mesh_roster.json`
+(`{name: {thread_id, turn_id, status, launcher_pid?}}`, `launcher_pid` only on a
+`waiting_capacity` entry; every read-modify-write under `fcntl.LOCK_EX`, because
+the delegates register concurrently), and **blocks until its last turn ends**,
+translating the notification stream into the log file (`agent:`, `exec:`,
+`edit:`, `thinking`) that `heartbeat_watch.sh` narrates. On a `turn/completed`
+with nothing queued it writes the final message to the summary file — or, given
+`--reply-file` as `implement.sh` passes, to that file, filling the summary only
+when the delegate left it empty — and exits, so `implement.sh`'s `wait`,
+heartbeat, awake timer, and pass recording are untouched.
 
-`send` calls `thread/queue/add`: the message lands at the start of the target's
-**next** turn. `steer` calls `turn/steer` with the roster's `expectedTurnId` and
-interrupts the turn in flight. Both address a delegate by mesh name through the
-roster file, which is why they work from an unrelated process — the unit director,
-or a peer delegate.
+A delegate is **not one turn**. `send` puts a message in the thread queue and the
+server starts a turn for it by itself, so exiting at the first `turn/completed`
+would strand the message and kill the delegate mid-reply. At each turn boundary
+`start` checks `thread/queue/list` and the thread's state, then watches
+`QUEUE_GRACE_SECS` (3 s) for a queued turn already in flight, and keeps
+streaming while work remains. The summary is the last turn's answer, so a peer's
+follow-up is reflected in what the unit director reads. With `--resident`
+(ask_a_friend's friend) `start` stays attached across turns instead: each
+finished turn's reply is printed and delivered as it lands, the thread keeps
+accepting `send`, and only `end` releases the block.
+
+`send` and `steer` address a delegate by mesh name through the roster file, which
+is why they work from an unrelated process — the unit director, or a peer
+delegate. `send` delivers only while a launcher is attached. To a `running` seat
+it calls `thread/queue/add`, and the message lands at the start of the target's
+**next** turn; to a `waiting_capacity` seat it stores the message in
+`<seat>.pending.json` under an `flock`, for the resume turn. It refuses a
+`capacity_exhausted` seat or one being ended (exit 2), and any other status
+(`done`, `failed`) with `<seat> is <status>, not running; read its summary file`
+(exit 1): the thread outlives the launcher, so the server would start a turn for
+a late message with nothing streaming it and nothing writing the summary.
+`steer` needs a `running` seat; it calls `turn/steer` with the roster's
+`expectedTurnId` and interrupts the turn in flight. `end` accepts `running`,
+`waiting_capacity` and `capacity_exhausted` (`ENDABLE_STATUSES`): it drops the
+thread's queued messages, interrupts any live turn, and leaves the marker the
+`start` loop polls for. Any other status prints `<seat> is <status>; nothing to
+end` and exits 0.
 
 `stop` SIGTERMs each recorded pid (SIGKILL after 5 s) and removes the server
 file. `scripts/delegate/end_session.sh` calls it, reading the session directory
@@ -183,74 +211,13 @@ racing the same recovery replace one server between them rather than one each.
 Same failure on the fresh server means the provider really did refuse, and it is
 reported unchanged.
 
-**Model at capacity.** A turn ends `TurnCompleted`, `TurnRefusedForCapacity` or `TurnFailed`; a run ends `RunCompleted`, `FailedBeforeThread`, `FailedWithThread` or `CapacityRetriesExhausted`. Capacity is the error's `codexErrorInfo` `serverOverloaded` / `flexUnavailable`, or the message `Selected model is at capacity`. The launcher keeps the same thread and roster entry: it marks the entry `waiting_capacity` with its own `launcher_pid`, waits `CAPACITY_WAIT_SECS` (30 s) doubling up to `CAPACITY_MAX_WAIT_SECS` (300 s) within `CAPACITY_BUDGET_SECS` (1200 s), logs one `capacity retry N: next turn at <time>` line per wait, and starts a resume turn saying the last turn stopped for capacity with its edits in the tree. Messages queued for the thread meanwhile move to `<seat>.pending.json`, and the resume turn carries them. Once the budget runs out the entry is `capacity_exhausted` and `start` exits 1 with `codex_mesh: <seat>: model still at capacity after <N> retries over <M> min; thread <id> stays on the roster (codex_mesh.py end --to <seat>)`.
+**Model at capacity.** A turn ends `TurnCompleted`, `TurnRefusedForCapacity` or `TurnFailed`; a run ends `RunCompleted`, `FailedBeforeThread`, `FailedWithThread` or `CapacityRetriesExhausted`. Capacity is the error's `codexErrorInfo` `serverOverloaded` / `flexUnavailable`, or the message `Selected model is at capacity`. On a refusal the launcher keeps the same thread and roster entry and owes the seat a resume turn. It moves messages queued for the thread to `<seat>.pending.json`, reads the thread (`_read_live_turn`), and, if a queued peer turn is already running, streams that turn first with the resume still owed. Once the thread reads `ThreadIdle`, it marks the entry `waiting_capacity` with its own `launcher_pid`, logs `capacity retry N: next turn at <time>`, waits, and starts a resume turn: `Your last turn stopped because the model was at capacity. Continue from where you stopped; your edits are already in the tree.`, followed by the held messages. The original prompt is never sent again. Before each resume it checks, under the pending-file lock, that no `end` marker exists and the roster still names this thread; otherwise it logs `capacity launcher ended|replaced; no resume turn started` and returns `FailedWithThread`.
 
-**Relaunching a seat.** `start` on a name already on the roster reads the old thread through `thread/read`, typed `ThreadLive(turn_id) | ThreadActiveWithoutTurn | ThreadIdle | ThreadStateUnknown(reason)`, and replaces the entry only on `ThreadIdle`; any other state exits 2 and names `codex_mesh.py end --to <seat>`. A `waiting_capacity` entry whose `launcher_pid` is alive exits 2 the same way. A `failed` entry first repeats the dead launcher's cleanup, `_end_unwatched_turn(port, thread_id, log_path) -> RelaunchAllowed | RelaunchBlockedByLiveTurn`; blocked exits 2 with `codex_mesh: <seat>: thread <id> still has a live turn that could not be interrupted; relaunch once it ends`.
+The wait budget is per busy spell. Within a spell the wait is `CAPACITY_WAIT_SECS` (30 s) doubling to `CAPACITY_MAX_WAIT_SECS` (300 s), with `CAPACITY_BUDGET_SECS` (1200 s) in all. `capacity_waited` and `capacity_retries` reset at one site in `_attach_and_run`, the `else` of the capacity check, just before the `resume_owed` branch: any turn that ends without a capacity refusal resets them, a peer turn that completes while a resume is owed included. Only a capacity refusal earns a wait, so an owed resume starts at once after a turn that ended any other way. A refusal that finds the budget spent sets the entry to `capacity_exhausted`, drops the thread's queue and interrupts any live turn (`_end_unwatched_turn`), and `start` exits 1 with `codex_mesh: <seat>: model still at capacity after 7 retries over 20 min; thread <id> stays on the roster (codex_mesh.py end --to <seat>)`.
 
-### Addressable codex delegates (`scripts/agents/codex_mesh.py`)
+After a refused turn the app-server reports the thread as `systemError`, and `_read_live_turn` reads that as `ThreadIdle`, so the wait and the resume go ahead. Upstream (codex rust-v0.160.1), the app-server sets `systemError` after any failed turn, a capacity refusal (`server_overloaded`) included, and `note_turn_started` clears it (`app-server/src/thread_status.rs`, `bespoke_event_handling.rs`). The protocol's `ThreadStatus` is `notLoaded | idle | systemError | active{activeFlags}` (`v2/ThreadStatus.ts` from `codex app-server generate-ts`).
 
-`agent_exec`'s codex branch runs `codex exec`, which is a closed process: nothing
-outside it can hand the running agent a message. `codex_mesh.py` is the alternate
-launcher that removes that limit for `/unit:delegate` and for `/ask_a_friend`'s
-codex friend (`start --resident`).
-It is on by default — `[delegate.options] codex_mesh=1` in the registry, overridable
-for a single run with `PLAN_DELEGATE_CODEX_MESH`; `0`, or a missing key, runs a
-phase on `codex exec` instead.
-
-Instead of one process per delegate, the session gets one `codex app-server`
-(`--listen ws://127.0.0.1:<port>`, newline-delimited JSON-RPC) and each delegate
-becomes a **thread** on it. A thread has an id, and an id is an address:
-
-```
-codex_mesh.py serve --session-dir DIR             # start/return the session server
-codex_mesh.py start --session-dir DIR --name N …  # launch a delegate, block until its turn ends
-codex_mesh.py send  --session-dir DIR --to N --message TEXT   # queued; lands at N's next turn
-codex_mesh.py steer --session-dir DIR --to N --message TEXT   # interrupts N's running turn now
-codex_mesh.py list  --session-dir DIR             # roster: name, status, thread id
-codex_mesh.py stop  --session-dir DIR             # reap the session server
-```
-
-`start` blocks for the delegate's lifetime — every turn of it, see below — and
-writes the same summary and log files `agent_exec` does, so `implement.sh`'s `wait`, heartbeat watch, awake timer
-and pass recording are unchanged — the only thing it adds is the address. Two
-files carry the session's mesh state, both under the delegate session directory:
-`mesh_server.json` (`{port, pid}`) and `mesh_roster.json`
-(`{name: {thread_id, turn_id, status, launcher_pid?}}`, `launcher_pid` only on a `waiting_capacity` entry; every read-modify-write under
-`fcntl.LOCK_EX` because the delegates register concurrently).
-
-The protocol has three traps, each of which cost a run to rediscover:
-
-- `initialize` must pass `capabilities.experimentalApi: true`. Without it every
-  `thread/queue/*` method fails `-32600` with nothing naming the missing flag.
-- `thread/start`'s `sandbox` takes the SandboxMode **string**
-  (`"danger-full-access"`), not the `SandboxPolicy` object the schema shows for
-  other fields.
-- **The thread must not be `ephemeral`**, even though `agent_exec`'s codex branch
-  passes `--ephemeral`. An ephemeral thread refuses `thread/queue/add` outright
-  ("ephemeral thread does not support queued submissions") and refuses
-  `thread/name/set` as well, so ephemerality costs the mesh the one call peers
-  use most. The price of dropping it is the ordinary codex rollout file under
-  `~/.codex/sessions`, which is also what makes a delegate's transcript readable
-  after the fact. Naming is still best effort — a failed rename is not worth
-  losing a delegate over, and the roster file is the address of record.
-
-A delegate is **not one turn**. `send` puts a message in the thread queue and the
-server starts a turn for it by itself, so `start` cannot exit at the first
-`turn/completed` — that would strand the message and kill the delegate mid-reply.
-It instead checks `thread/queue/list` at each turn boundary and keeps streaming
-while work remains, plus a short grace window for a queued turn already in
-flight, and only then writes the summary and exits. The summary is the last
-turn's answer, so a peer's follow-up is reflected in what the unit director reads.
-
-The mirror of that: `send` delivers only while a launcher is attached. To a
-`running` seat it calls `thread/queue/add`; to a `waiting_capacity` seat it
-stores the message in `<seat>.pending.json` under an `flock`, for the resume
-turn. It refuses a `capacity_exhausted` seat or one being ended (exit 2), and any
-other status (`done`, `failed`) with `<seat> is <status>, not running` (exit 1).
-The thread outlives the launcher, so the server would start a turn for a late
-message with nothing streaming it and nothing writing the summary. A refusal is
-better than work no one ever sees. `end` accepts `running`, `waiting_capacity`
-and `capacity_exhausted` (`ENDABLE_STATUSES`).
+**Relaunching a seat.** `start` on a name already on the roster handles the old entry by its status. A `failed` entry first repeats the dead launcher's cleanup, `_end_unwatched_turn(port, thread_id, log_path) -> RelaunchAllowed | RelaunchBlockedByLiveTurn`; blocked exits 2 with `codex_mesh: <seat>: thread <id> still has a live turn that could not be interrupted; relaunch once it ends`, and anything else relaunches, even when the old thread cannot be read. A `waiting_capacity` entry whose `launcher_pid` is alive exits 2 and names `codex_mesh.py end --to <seat>`; a dead one relaunches. Any other entry, while the session's server is up, is read through `thread/read`. `_read_live_turn(client, thread_id) -> ThreadLive(turn_id) | ThreadActiveWithoutTurn | ThreadIdle | ThreadStateUnknown(reason)` maps the thread's status: `idle`, `notLoaded` and `systemError` are `ThreadIdle`; `active` is `ThreadLive` when an `inProgress` turn carries an id, else `ThreadActiveWithoutTurn`; any other status, a read error or a missing thread is `ThreadStateUnknown`. `start` replaces the entry only on `ThreadIdle`. `ThreadStateUnknown` exits 2 with `codex_mesh: <seat>: thread <id>'s state could not be read (<reason>); use codex_mesh.py end --to <seat> before relaunching`, and a live turn exits 2 with `codex_mesh: <seat>: thread <id> has a live turn; use codex_mesh.py end --to <seat> before relaunching`. A thread left `systemError` by a refused turn reads `ThreadIdle`, so its seat relaunches, and `end` sends it no `turn/interrupt`.
 
 ### Catalog sync (`scripts/agents/sync_codex_catalog.sh`)
 
@@ -289,10 +256,9 @@ A thin dispatcher over the resolver:
 | `config/README.md` | The `## agents.conf` section: three-layer schema, `/agent` as the editor, sync behavior. |
 | `scripts/agents/agents_config.sh` | Resolver + editors + freshness-gated sync trigger. |
 | `scripts/agents/agent_exec.sh` | Family dispatch launcher, dry-run hook. |
-| `scripts/agents/codex_mesh.py` | Addressable codex launch path: session app-server, thread per delegate, `send`/`steer`/`list`/`stop`. |
+| `scripts/agents/codex_mesh.py` | Addressable codex launcher: the default for codex `/unit:delegate` seats and the path for `/ask_a_friend`'s codex friend (`start --resident`). One app-server per session, one thread per delegate, `send`/`steer`/`end`/`list`/`stop`, and a capacity backoff that resumes the same thread. |
 | `scripts/agents/agent_admin.sh` | `/agent` backend. |
 | `scripts/agents/sync_codex_catalog.sh` + `.plist` | `[codex.agents]` materialization, staleness warnings. |
-| `scripts/agents/codex_mesh.py` | Default addressable launcher for codex `/unit:delegate` delegates: one app-server per session, one thread per delegate, `send`/`steer`/`list`/`stop`. |
 | `scripts/agents/heartbeat.sh`, `heartbeat_watch.sh` | Liveness log helpers used by the delegate wrappers (role header block, 60 s beats with an activity digest decoded from the agent log). |
 | `scripts/agents/test_agents_config.sh`, `test_agent_exec.sh`, `test_sync_codex_catalog.sh` | Self-contained fixture-conf suites (`mktemp -d`, temp `AGENTS_CONFIG_FILE`, print a "…passed" line, nonzero on failure). |
 | `scripts/delegate/implement.sh` / `review.sh` | `/unit:delegate`'s launchers. The implementation launcher adds a **required** pass kind as its 6th argument, optional activity and fix-count arguments, and a **required** `team_role` as its 9th (`impl` or `test`; the legacy `review` writer seat is still accepted): a phase runs a two-seat team and a repair its one `impl` seat, so one artifact layout covers both rather than a solo set and a team set. The role suffixes every artifact (`impl_status_<role>`, `impl_summary_<role>.txt`, `impl_agent_<role>.log`, `impl_agent_<role>`, `impl_awake_<role>`), tags the wrapper beats `<subtask>:<role>`, names the slot this dispatch posts under on the board, and is exported to the agent as `PLAN_DELEGATE_TEAM_ROLE` beside `PLAN_DELEGATE_BOARD_DIR`. Every member records its own progress pass: `state["pass"]` holds one record per seat, and `start-pass` closes only a stale pass of the same seat, so three concurrent recorders no longer leave the ledger describing whichever finished last. The launcher also stamps `role=<name>` on its `register` line, which is what fills the progress table's per-slot columns before any agent posts. The kind is checked against the four words at the argument, because an empty one used to be tolerated: the launcher skipped `start-pass`, ran its agent normally, and left the seat's previous pass standing -- so a repair round dispatched with the kind on `impl` alone produced a phase whose ledger held one live window and two records closed `error` an hour before, and refused every progress call once that one window closed. Nothing in the sequence looked like a launch fault; a register line with no `role=` field is the signature. The reviewer adds optional pass activity, a `pass_index` (7th arg, default 1), and a `lens` (8th, before the early-ready sentinel that follows it). Both write status, provenance, agent logs, and shared heartbeat data; when durable progress state exists, they also record the resolved called model/effort and pass outcome through `progress_history.py`. `review.sh` writes `review_findings_<N>.txt` / `review_agent_<N>.log` per pass and `ln -sfn`s the unnumbered names to the current one, so a run that failed to converge can be read back round by round while existing readers keep working. A phase's broad review runs three reviewers at once under one lens each (`adversary`, `contract`, `craft`), so the lens suffixes every one of those names plus `review_status`, `review_pid`, `review_agent`, and `review_awake`; empty is the single-reviewer layout a closure review and `commands/plan/phase_review.md` still run. The lens also selects the seat the pass records under — `test`, `impl`, `review` respectively, a fixed address rather than a judgment; the `review` seat renders as an `Agent 3` column only when a shown stage seated it — which `review.sh` exports as `PLAN_DELEGATE_TEAM_ROLE`, empty lens included, so a lone reviewer cannot inherit a seat from its environment and close a live pass there so three concurrent reviewers key three pass records instead of each closing the last as interrupted, and posts as a `register` line so the progress note stops attributing the previous occupant's words to the seat. `arm-review` takes a matching `--lens`, because the marker watches the status and pid files the launcher it precedes will write. |
@@ -324,19 +290,17 @@ All four wrappers capture resolver stderr into their log (`agents_resolve "$TASK
 - Any awk that writes a user-supplied value into the conf passes it through `ENVIRON`, not `awk -v`. Row rewrites preserve trailing inline comments and spacing byte-exactly; conf writes go through a tmp file + `mv` (mode preserved), never in place.
 - `agent_exec` owns all redirection: wrappers must not redirect its stdout/stderr to a file, or dry-run output never reaches them. It exports nothing — provenance comes from the wrapper's own `agents_resolve`.
 - Callers pass **absolute** prompt/output/log paths to `agent_exec`.
-- `codex_mesh.py` resolves nothing. `implement.sh` resolves model and effort
-  through `agents_resolve` exactly as it does for `agent_exec`, then passes them
-  as `--model` / `--effort`; the mesh path changes only whether the delegate has
-  an address, never which agent runs or at what effort.
+- `codex_mesh.py` is a launcher for `/unit:delegate` and `/ask_a_friend`, not a
+  second dispatcher. It resolves nothing: `implement.sh` and `launch_friend.sh`
+  resolve family, agent and effort through `agents_resolve`, exactly as for
+  `agent_exec`, and pass them in as `--model` / `--effort`, so the mesh path
+  changes only whether the delegate has an address, never which agent runs or at
+  what effort. Anything else that needs a codex agent still goes through
+  `agent_exec`.
 - Every delegate in one phase shares one app-server, and its pid file is the only
   record of it. A launch path that starts a server without writing
   `mesh_server.json` leaks a process that nothing will reap.
 - Provenance files are four lines: `task=`, `family=`, `agent=`, `effort=`.
-- `codex_mesh.py` is a launcher for `/unit:delegate` and `/ask_a_friend`, not a
-  second dispatcher. It resolves nothing: `implement.sh` and `launch_friend.sh`
-  have already resolved family, agent and effort through the registry and pass
-  them in as `--model` / `--effort`. Anything
-  else that needs a codex agent still goes through `agent_exec`.
 - The session app-server is deliberately detached, so it outlives each delegate
   and a peer can still reach a thread between turns. `end_session.sh` is the only
   thing that reaps it (`codex_mesh.py stop`, from the session directory recorded
@@ -372,8 +336,10 @@ All four wrappers capture resolver stderr into their log (`agents_resolve "$TASK
   schema shows for other fields. The object is rejected as `unknown variant`.
 - **`ephemeral: true` and `thread/name/set` are incompatible** — the rename
   returns `-32600 "ephemeral thread does not support metadata updates"`. Delegates
-  are not ephemeral, since an ephemeral thread also refuses `thread/queue/add`;
-  naming stays best-effort and `mesh_roster.json` is the address of record.
+  are not ephemeral, since an ephemeral thread also refuses `thread/queue/add`.
+  The cost is the ordinary codex rollout file under `~/.codex/sessions`, which
+  also keeps a delegate's transcript readable afterward. Naming stays
+  best-effort and `mesh_roster.json` is the address of record.
 - **`--listen unix://<path>` closes every connection silently** while the server
   stays up. Use `ws://127.0.0.1:<port>`.
 - **`codex queue --thread` exits 0 for a thread with no live session.** The
@@ -385,6 +351,9 @@ All four wrappers capture resolver stderr into their log (`agents_resolve "$TASK
   `running` across turns, prints each reply as it lands, and ends only on
   `codex_mesh.py end`. `send`
   refuses every status but `running` and `waiting_capacity`.
+- **`systemError` is not terminal.** The thread stays loaded, and `turn/start` has no status gate, so a resume turn on the same thread is valid. A status outside the protocol's four reads `ThreadStateUnknown`: relaunching a `done` or `capacity_exhausted` entry exits 2, `end` exits 1, and inside the capacity loop the seat ends `failed` with `thread <id>: thread/read failed: unrecognized status <status>`.
+- **Capacity numbers.** The waits run 30, 60, 120, 240, 300, 300 and 150 s, so a spent budget reads `7 retries over 20 min`. The budget counts the measured sleep (`max(wait, elapsed)`), so a late wake spends it, and it counts only waits, not the time refused turns took, so a spell runs longer than 20 min of wall time.
+- **Stub app-server.** In `scripts/agents/test_codex_mesh.py` the stub answers `systemError` after an errored turn (`turn/failed`, or `turn/completed` carrying `error`) until the next `turn/start`, and an explicit `thread_statuses` entry wins. A stub that answered `idle` after a refused turn would hide the crash this guards against. `completed_then_capacity` and `capacity_with_peer` drive the budget-reset tests, and `test_failed_seat_relaunches_when_old_thread_has_unknown_status` uses `retired`, a status the protocol does not define. Seats run the live `~/.claude` copy of `codex_mesh.py`, so a change protects running seats only once it is there.
 - **`AGENT_EXEC_EXTRA_ARGS` is whitespace-split with no quote interpretation.** Flag+value pairs (`--add-dir /path`) work; no single argument may contain a space — no prompt preambles, no `--settings` JSON.
 - **`AGENT_EXEC_DRY_RUN=1`** is the testing hook: `%q`-quoted argv plus redirection suffix, with a `cd <dir> && ` prefix on the claude branch. Match smoke checks on substrings (`--full-auto`, `--sandbox read-only`, `-m <agent>`, the effort word), never whole lines — the codex effort token renders with escaped quotes (`model_reasoning_effort=\"high\"`).
 - **awk gotchas.** `function` is a reserved awk word — pass it as `-v fn=`. `awk -v` decodes backslash escapes, so a value containing `\n` / `\t` would corrupt the row; user-supplied values go through `ENVIRON["…"]`.
@@ -408,3 +377,6 @@ All four wrappers capture resolver stderr into their log (`agents_resolve "$TASK
 - **No per-project overrides.** One global `config/agents.conf` governs everything. Per-project layering would reintroduce exactly the scattered, hard-to-audit assignment state the registry exists to prevent, and `/agent status` would stop being the truth.
 - **Double resolution in the wrappers.** `agent_exec` deliberately exports nothing, so a wrapper that wants provenance resolves again itself. Both reads hit the same conf, so they agree; the alternative — `agent_exec` exporting or writing resolved values — would couple every consumer to the launcher's variable names and make the launcher responsible for file layout it does not own.
 - **Effort omission for a bare agent pair.** A row of just `agent` means "omit the effort flag entirely and let the CLI pick", which is materially different from any explicit level and is the only thing that validates against a catalog row with no reasoning levels. Hence no default-effort fallback anywhere: the stage scripts guard the flag with `[[ -n … ]]` rather than substituting a level, so the registry's silence is transmitted faithfully to the CLI.
+- **`systemError` reads as idle.** It means the last turn failed and none is active, which is what relaunch, `end` and the capacity loop need to know. Read as unknown, every capacity refusal on the real app-server ended the seat with `thread/read failed`, so the backoff and resume never ran outside a stub that answered `idle`. Any status the protocol does not define still reads as unknown, so a new upstream status is classified on purpose rather than defaulted to idle.
+- **A capacity budget per busy spell.** A turn that ends without a capacity refusal proves the model is answering again, so the next refusal starts a new spell. A budget for the whole run would let refusals hours apart add up and retire a long-lived seat, such as a resident friend, after one bad spell too many.
+- **An owed resume after a completed turn starts at once.** The completed turn shows the model is serving, so a wait would only delay the seat's own work; only a capacity refusal earns one.
