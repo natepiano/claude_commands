@@ -72,12 +72,10 @@ State:
   - whether a unit edits files outside its **Owns**, another unit's crate
     included: settle it by who holds the files on the berth board and when
     each holder merges, as <Dependencies/> rule 3 settles a file wait. No
-    rule needs the user's OK for this (user, 2026-10-04);
-  - a unit director's as-built close-out form, when the choice is the logical one.
-
-  Unusual as-built choices go to the user: a folder other than the usual
-  as-built folder, a change to the main plan's scope, or deleting anything
-  besides the unit plan.
+    rule needs the user's OK for this (user, 2026-10-04).
+- **As-built close-out** is the unit director's: it decides, reports what moved,
+  and never asks (user, 2026-10-06). A scope change to the main plan is a
+  product choice, not an as-built one.
 - **What reaches the user:**
   - a unit director's `— decision:` for the user, shown in the unit director's
     words, with the answer relayed back;
@@ -95,7 +93,7 @@ State:
   own message — send the unit director `From the showrunner: run /unit:eta (or read ~/.claude/commands/unit/eta.md if it is not in your skill list)` by SendMessage, in that same
   turn. Ask once per phase; ask again only if it answered without a time. Until
   it answers, report that ETA as `none measured - requested`.
-- **Waiting on block.** After the footer, leave two empty lines, write `Waiting on:`, leave one empty line, then write one `* ` bullet per item. Put the user's items first. Name each item by what it is and what it is doing, never by a task, agent or session id.
+- **Waiting on block.** After the footer, leave two empty lines, write `Waiting on:`, leave one empty line, then write one `* ` bullet per item. Put the user's items first. Name each item by what it is and what it is doing, never by a task, agent or session id. Every item not waiting on the user ends with its ETA in `ZONE`, from measured runs (`CI on widget's tooltip work, ETA 13:03 PDT (12:50–13:19)`), or `no ETA measured`; never an item alone. User, 2026-10-06.
 - **Footer.** Paste the output of
   `python3 ~/.claude/scripts/production/dailies_render.py --footer --zone <ZONE>`,
   word for word before the Waiting on block. It starts with a blank line and `---`, then

@@ -50,8 +50,8 @@ with these arguments:
 - A `single` ad hoc task with no plan doc — pass `--from-diff`. `single` never
   commits, so the working tree is the change surface.
 
-That command asks the user before it edits, relocates, or deletes anything, so it
-needs no gate here. It changes no code and commits nothing itself, so run
+That command decides every edit, relocation, and deletion itself and never asks
+the user, so it needs no gate here. It changes no code and commits nothing itself, so run
 <AsBuiltCommit/> after it and leave the run's tree clean. Carry both reports into
 <RunSummary/>. A refusal there is reported, not repaired, and leaves nothing to
 commit.
@@ -66,8 +66,8 @@ this and reports the doc edits as uncommitted.
 1. With no changes in `git status --short`, skip it silently. An amend that found
    nothing to correct is a valid outcome, not a failure.
 2. Confirm the changed paths are documentation only — the docs
-   `/plan:to_as_built` reported as created or edited, plus the plan doc it
-   deleted and any file the user confirmed for deletion or relocation. A changed
+   `/plan:to_as_built` reported as created or edited, plus the plan doc and any
+   other file it deleted or relocated. A changed
    source file means something other than this step touched the tree: leave
    everything uncommitted, report it, and do not commit.
 3. Stage those paths and commit exactly once:
