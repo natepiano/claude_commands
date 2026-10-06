@@ -403,8 +403,30 @@ cmd_health() {
   print -r -- ok
 }
 
+run_due() {
+  local name=$1 fired
+  instance_tick "$name" 0 0 || { fired=$(fired_stamp); log_error "tick failed: $name"; }
+}
+
+# A background child stays in the tick service's cgroup (or launchd job).
+# Start a separate service so the run, watchdog and final log write stay alive.
+launch_run() {
+  local name=$1 label="session-notifier-$1-$$-$RANDOM"
+  local -a command
+  command=(/usr/bin/env "HOME=$HOME" "PATH=$PATH" "NOTIFIER_STATE_DIR=$STATE_DIR"
+    "NOTIFIER_SESSIONS_DIR=$SESSIONS_DIR" "NOTIFIER_NOW_EPOCH=$NOW" "$SCRIPT" run-due "$name")
+  case ${NOTIFIER_PLATFORM:-$OSTYPE} in
+    linux*) systemd-run --user --collect --quiet --no-block --unit "$label" -- "${command[@]}" >/dev/null 2>&1 ;;
+    darwin*)
+      command[-2,-1]=(run-due-and-remove "$name" "$label")
+      launchctl submit -l "$label" -- "${command[@]}" >/dev/null 2>&1 ;;
+    *) return 1 ;;
+  esac
+}
+
 cmd_tick() {
   local tick_fd dir name
+  local -a deferred_runs
   typeset -A state conf
   [[ -d $STATE_DIR ]] || mkdir -p -- "$STATE_DIR" || return 0
   [[ -e $STATE_DIR/.tick.lock ]] || : > "$STATE_DIR/.tick.lock"
@@ -418,15 +440,19 @@ cmd_tick() {
     name=${dir:t}
     read_conf
     if [[ -n ${conf[RUN]:-} ]]; then
-      # Run-only jobs own their watchdog and fire log after this tick returns.
-      ( instance_tick "$name" 0 0 || { fired=$(fired_stamp); log_error "tick failed: $name"; } ) \
-        >/dev/null 2>&1 &!
+      if ! launch_run "$name"; then
+        log_error "run launcher unavailable: $name; waiting after tick"
+        deferred_runs+=("$name")
+      fi
     else
-      ( instance_tick "$name" 0 0 || { fired=$(fired_stamp); log_error "tick failed: $name"; } ) &
+      ( run_due "$name" ) &
     fi
   done
   wait
   zsystem flock -u "$tick_fd"
+  for name in "${deferred_runs[@]}"; do
+    run_due "$name"
+  done
   return 0
 }
 
@@ -466,5 +492,18 @@ case $action in
   tick)
     (( $# == 0 )) || usage
     cmd_tick ;;
+  run-due)
+    (( $# == 1 )) || usage
+    valid_name "$1"
+    run_due "$1" ;;
+  run-due-and-remove)
+    (( $# == 2 )) || usage
+    valid_name "$1"
+    valid_name "$2"
+    run_due "$1"
+    if ! launchctl remove "$2"; then
+      fired=$(fired_stamp)
+      log_error "launchctl remove failed: $2"
+    fi ;;
   *) usage ;;
 esac

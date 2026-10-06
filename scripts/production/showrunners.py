@@ -139,6 +139,10 @@ def _prompt_units(fields: dict[str, str]) -> PromptUnits | UnreadablePrompt:
         units = tuple(shlex.split(match.group(2).strip()))
     except (KeyError, ValueError) as error:
         return UnreadablePrompt(f"prompt has invalid zone or units: {error}")
+    if units[:1] == ("--showrunner",):
+        if len(units) != 2:
+            return UnreadablePrompt("unit_status.sh --showrunner needs a session")
+        return PromptUnits(zone, ())
     if not units:
         return UnreadablePrompt("unit_status.sh command has no units")
     return PromptUnits(zone, units)
@@ -195,7 +199,45 @@ def remove(settings: ShowrunnerSettings, session: str, units: list[str]) -> None
                 runner["units"] = [unit for unit in runner["units"] if unit not in units]
 
 
-def change(action: str, session: str, zone: str, units: list[str]) -> None:
+def rewrite_prompt_names(old: str, new: str) -> None:
+    status_command = re.compile(r"(unit_status\.sh\s+\S+\s+\S+\s+)([^|`\n]+)")
+    for instance in NOTIFIER_STATE_DIR.glob("showrunner-*"):
+        try:
+            prompt_value = _fields(instance / "conf").get("PROMPT_FILE", "")
+            prompt_path = Path(prompt_value)
+            if not prompt_path.is_absolute():
+                continue
+            original = prompt_path.read_text(encoding="utf-8")
+        except (OSError, UnicodeError):
+            continue
+
+        def replace_status(match: re.Match[str]) -> str:
+            arguments = match.group(2)
+            try:
+                tokens = shlex.split(arguments)
+            except ValueError:
+                return match.group(0)
+            if not tokens or (tokens[0] == "--showrunner" and len(tokens) != 2):
+                return match.group(0)
+            if old not in tokens:
+                return match.group(0)
+            renamed = [new if token == old else token for token in tokens]
+            return match.group(1) + shlex.join(renamed) + arguments[len(arguments.rstrip()):]
+
+        updated = status_command.sub(replace_status, original)
+        if updated == original:
+            continue
+        with tempfile.NamedTemporaryFile("w", dir=prompt_path.parent, prefix=f".{prompt_path.name}-",
+                                         delete=False, encoding="utf-8") as temporary:
+            _ = temporary.write(updated)
+            temporary.flush()
+            os.fsync(temporary.fileno())
+            temporary_path = Path(temporary.name)
+        os.chmod(temporary_path, prompt_path.stat().st_mode)
+        os.replace(temporary_path, prompt_path)
+
+
+def change(action: str, session: str, zone: str, units: list[str], new_name: str = "") -> None:
     CONFIG.parent.mkdir(parents=True, exist_ok=True)
     with CONFIG.with_suffix(".lock").open("a+", encoding="utf-8") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
@@ -204,6 +246,19 @@ def change(action: str, session: str, zone: str, units: list[str]) -> None:
             add(settings, session, zone, units)
         elif action == "remove":
             remove(settings, session, units)
+        elif action == "rename":
+            for runner in settings["showrunners"]:
+                old_runner = runner["session"]
+                if old_runner == session:
+                    runner["session"] = new_name
+                runner["units"] = [new_name if unit == session else unit for unit in runner["units"]]
+                result = subprocess.run([sys.executable, str(Path(__file__).with_name("stall_watch.py")),
+                                         "rename-state", session, new_name, old_runner,
+                                         runner["session"], *runner["units"]],
+                                        capture_output=True, text=True, check=False)
+                if result.returncode != 0:
+                    raise ValueError(f"stall state rename failed: {result.stderr.strip()}")
+            rewrite_prompt_names(session, new_name)
         else:
             for runner in running_showrunners():
                 if isinstance(runner.prompt, UnreadablePrompt):
@@ -230,6 +285,9 @@ def main(argv: list[str]) -> int:
     removing = commands.add_parser("remove")
     _ = removing.add_argument("session")
     _ = removing.add_argument("--unit", action="append", default=[])
+    renaming = commands.add_parser("rename")
+    _ = renaming.add_argument("session")
+    _ = renaming.add_argument("new_name")
     _ = commands.add_parser("import")
     _ = commands.add_parser("list")
     args = parser.parse_args(argv)
@@ -248,7 +306,8 @@ def main(argv: list[str]) -> int:
                 print(f"missing: showrunner-{runner.slug}\t{runner.session}\t{detail}")
         else:
             change(action, cast(str, getattr(args, "session", "")), cast(str, getattr(args, "zone", "")),
-                   cast(list[str], getattr(args, "unit", [])))
+                   cast(list[str], getattr(args, "unit", [])),
+                   cast(str, getattr(args, "new_name", "")))
     except (OSError, ValueError, KeyError) as error:
         print(f"showrunners: {error}", file=sys.stderr)
         return 1

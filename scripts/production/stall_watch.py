@@ -80,7 +80,9 @@ def descendants(root: int, rows: list[Process]) -> list[Process]:
 
 
 def claude_pid(pane_pid: int, rows: list[Process]) -> int | None:
-    return next((row.pid for row in descendants(pane_pid, rows)
+    pane = next((row for row in rows if row.pid == pane_pid), None)
+    candidates = ([pane] if pane is not None else []) + descendants(pane_pid, rows)
+    return next((row.pid for row in candidates
                  if row.command == "claude" or row.command.startswith("claude ")), None)
 
 
@@ -120,6 +122,18 @@ def unit_socket(pid: int) -> tuple[str, str] | None:
 def stretch_path(slug: str, unit: str) -> Path:
     name = hashlib.sha256(f"{slug}\0{unit}".encode()).hexdigest()
     return STATE_DIR / f"{name}.json"
+
+
+def rename_state(old: str, new: str, runner_before: str, runner_after: str,
+                 units: list[str]) -> None:
+    """Move saved stretches while the registry rename is locked."""
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    for unit in units:
+        previous_unit = old if unit == new else unit
+        source = stretch_path(runner_before, previous_unit)
+        destination = stretch_path(runner_after, unit)
+        if source != destination and source.exists():
+            os.replace(source, destination)
 
 
 def read_stretch(path: Path, pane_hash: str, now: float) -> Stretch:
@@ -282,6 +296,9 @@ def main() -> int:
 
 
 if __name__ == "__main__":
+    if len(sys.argv) >= 6 and sys.argv[1] == "rename-state":
+        rename_state(sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5], sys.argv[6:])
+        raise SystemExit(0)
     try:
         raise SystemExit(main())
     except (OSError, ValueError, KeyError) as error:
