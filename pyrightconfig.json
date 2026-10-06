@@ -70,7 +70,8 @@
       "root": "scripts/production",
       "extraPaths": [
         "scripts/production",
-        "scripts/build_hold"
+        "scripts/build_hold",
+        "scripts/whoami"
       ]
     },
     {
