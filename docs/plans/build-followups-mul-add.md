@@ -65,7 +65,7 @@ The user, via natedev, 2026-10-06 08:2x PDT, deciding the nightly review's `subo
 | --- | --- | --- | --- |
 | G1 | Phase 2 | natedev's `~/.cargo/config.toml` carries `-C target-cpu=x86-64-v3` (user rebuild) and hana `origin/main` `ci.yml` carries it | natedev tells the unit both are live |
 | G2 | Phase 3 | `stalls-unit` fn-length Claude hook phase merged | natedev sends its merge hash |
-| G3 | Phase 4 | `stalls-unit` fn-length Codex phase merged and installed | natedev sends its merge hash |
+| G3 | Phase 4 | `stalls-unit` fn-length Codex phase (its Phase 7 since the 2026-10-06 renumbering) merged and installed | natedev sends its merge hash |
 | G4 | Phase 5 | 96 hours after T_codex_mul_add (Phase 4's As-built) | the clock |
 
 ## Phases
@@ -164,43 +164,38 @@ Real-code check, `objdump -d -C --no-show-raw-insn` counted per function, on two
 - After the flag, compiler_builtins' `fmaf` is not linked at all, because nothing calls it; its absence is the expected state.
 - On natedev the clippy run passes each target flag twice with the same values, the environment string plus the user `~/.cargo/config.toml` table, by design; CI's environment alone passes each once.
 
-### Phase 3 — Claude edits that leave a float multiply-add are told to write mul_add · status: todo
+### Phase 3 — Claude edits that leave a float multiply-add are told to write mul_add · status: done
 
-#### Work Order
+#### As-built
 
-**Blocked by:** G2.
-
-Work only in worktree `/home/natepiano/worktrees/claude-build-followups-mul-add`, branch `build-followups-mul-add`. State every time in PDT.
-
-**Source:** the user, item 3 (see Source).
-
-**Goal:** after an `Edit`, `MultiEdit` or `Write` to a `.rs` file in a package whose Cargo lints enable `suboptimal_flops`, the agent is told, for each float multiply-add the detector can prove, the line and the `mul_add` rewrite, and never for code clippy passes.
-
-**Spec:**
-- `mul_add_lib.py` (typed; frozen dataclasses), reusing `fn_length_lib`'s scanner for comments, strings, char literals, attributes and function bodies:
-  - Scope: as `fn_length_lib.lint_scope`, for lint `suboptimal_flops` in group `nursery`. Exemptions: `allow`/`expect` (and `cfg_attr` forms) naming `clippy::suboptimal_flops` or `clippy::nursery`, on the item or any enclosing impl, trait, mod or file.
-  - Shapes: those clippy's `mul_add.rs` flags at the installed toolchain's clippy (read it and list them in the As-built), at least `a * b + c`, `c + a * b`, `a * b - c`, `c - a * b`, `x += a * b`, `x -= a * b`, with Rust precedence: a `*` operand ends at a lower-precedence operator, a comma, a `;`, or its enclosing delimiter. Skip const items, `const fn` bodies and whatever clippy skips.
-  - Float proof: an operand of the `*` is a float literal (`1.0`, `0.5_f32`, `2f64`, `1e-5`). clippy passes a glam vector times a literal (`v * 0.5 + w`); the main-corpus control finds those, and the rule excludes what it finds. Add a further proof (a binding the same function declares `: f32`/`: f64`, an `as f32`/`as f64` cast) only while the main-corpus control below stays at zero.
-  - Each finding: `line`, the source text of `a`, `b`, `c` and the expression, and the rewrite `a.mul_add(b, c)` (`-c` for subtraction forms, `(-a).mul_add(b, c)` for `c - a * b`; parenthesize a non-trivial `a`).
-- `post-tool-use-mul-add.py`: payload handling, block JSON and error handling as `post-tool-use-fn-length.py`; reason `<path>:<line>: write <rewrite> for <expr> (clippy::suboptimal_flops)` per finding, joined by `; `, then ` The edit was applied.`; every block appends to `MUL_ADD_HOOK_STATE` or `~/.local/state/mul-add-hook/blocks.jsonl` with `"agent": "claude"`.
-- `settings.json`: one handler appended to the `Edit|MultiEdit|Write` group after the fn-length handler.
-- Speed: within the fn-length hook's budget, measured the same way; Claude Code runs the group's hooks in parallel, so report whether it ends before basedpyright's.
-- Types: `SuboptimalFlopsLintScope` (no threshold; enabled, exempt and no-package as named states), `FloatMulAddFinding`; no bare `Option`. Each `blocks.jsonl` record carries time, path, line and expression, for Phase 5's matching.
+- `mul_add_lib.py` reuses `fn_length_lib`'s scanner. `suboptimal_flops_scope(path) -> SuboptimalFlopsLintScope` reads the package's or workspace's `suboptimal_flops` level, else `nursery`; `ScopeState` is `enabled`, `disabled`, `exempt` (a `#![no_std]` root) or `no_package`, and every state but `enabled` passes silently. `float_mul_add_findings(path) -> tuple[SuboptimalFlopsLintScope, list[FloatMulAddFinding]]`; each finding has `line`, `a`, `b`, `c`, `expr` and `rewrite`. Both types are `__slots__` classes with read-only properties.
+- Shapes, as clippy's `mul_add.rs` flags them: `a * b + c`, `c + a * b`, `a * b - c`, `c - a * b`, `x += a * b`, `x -= a * b`. An additive chain keeps clippy's whole span (`a - b + 2.0 * v` → `v.mul_add(2.0, a - b)`); a leading unary minus folds into the receiver (`-x * 0.5 + 1.0` → `(-x).mul_add(0.5, 1.0)`).
+- Float proof: a float-literal operand proves the product when the other operand is not excluded (a non-float annotation, a pattern or closure binding, a reference or iterator binding, a glam vector constructor, a non-float file `const`/`static`) and each named field in it is declared `f32`/`f64` in a struct or enum of the file. Both operands typed `f32`/`f64` in the function, or cast `as f32`/`as f64`, also prove it.
+- Rewrite: `a.mul_add(b, c)`; `a * b - c` → `a.mul_add(b, -c)`; `c - a * b` → `(-a).mul_add(b, c)`. The receiver is never an unsuffixed literal: the other operand becomes the receiver (`2.0 * v + c` → `v.mul_add(2.0, c)`), and nothing is reported when both operands are unsuffixed literals.
+- Skips: const items, `const fn` bodies, `const { }` blocks, `static`/`const` initializers, macro bodies, a `*`-sum that is the receiver of a `hypot` `.sqrt()`, `allow`/`expect` (`cfg_attr` forms included) naming `clippy::suboptimal_flops` or `clippy::nursery` on the item, an enclosing item or the file, and an operand or addend that is indexed (`b[0]`), called, or followed by a field path or `::` (skipped whole, never cut short).
+- `post-tool-use-mul-add.py` returns early when the file lacks `*` or `+`/`-`, imports the detector lazily, and blocks with reason `<path>:<line>: write <rewrite> for <expr> (clippy::suboptimal_flops)` per finding, joined by `; `, then ` The edit was applied.`, plus `additionalContext` and `systemMessage` `mul_add: <file> has N float multiply-add expression(s)`. Each finding appends `at`, `agent: "claude"`, `tool`, `cwd`, `file`, `line`, `expression` to `MUL_ADD_HOOK_STATE` or `~/.local/state/mul-add-hook/blocks.jsonl`. An internal error prints `systemMessage` `mul_add hook error: <type>: <message>` and exits 0; the edit stands.
+- `settings.json`: the handler is third in the `Edit|MultiEdit|Write` group, right after fn-length.
+- Measured: 0 findings over 1,544 hana `origin/main` files; 35 of 291 historical positions (12.0%) flagged in stub functions; on a nightly-clippy oracle crate, 17 of 18 diagnostics found on clippy's lines, 0 mismatches, every rewrite compiling. Per-edit cost is +23.14 ms CPU over bare Python on a 236-line file (+31.26 ms on 945 lines), above the 20 ms budget; the user accepted it on 2026-10-06.
 
 **Files:**
-- `scripts/hooks/mul_add_lib.py` — the detector (new)
-- `scripts/hooks/post-tool-use-mul-add.py` — the hook entry (new)
-- `scripts/hooks/test_mul_add.py` — its tests (new)
+- `scripts/hooks/mul_add_lib.py` — the detector and lint scope
+- `scripts/hooks/post-tool-use-mul-add.py` — the Claude hook entry
+- `scripts/hooks/test_mul_add.py` — 35 tests; pins mul-add right after fn-length
+- `scripts/hooks/test_fn_length.py` — its registration test checks only the group's first two handlers
 - `settings.json` — one handler
-- `scripts/hooks/fn_length_lib.py` — only to expose its scanner, and only after G3 (the production doc holds it with `stalls-unit` until its Codex phase merges); before G3, import the names it already has
 
-**Seats:** 1 writer + 1 tester. `impl` — `mul_add_lib.py`, `post-tool-use-mul-add.py`, `settings.json`, and the `fn_length_lib.py` export after G3. `test` writes `test_mul_add.py` from this Spec alone: each shape flags with a literal; integer `i * 2 + j` prints nothing; a glam vector times a literal (`let v: Vec3 = …; v * 0.5 + w`) prints nothing; exemptions on fn, impl, mod and file; a `.py` path, malformed stdin and a non-nursery crate print nothing; the exact reason text and one log line.
+**Binds later work:**
+- "Codex seats get the same block after `apply_patch`" calls the same `float_mul_add_findings`, within the accepted +23 ms. It makes public the ten private `fn_length_lib` names `mul_add_lib.py` imports behind one line-level `reportPrivateUsage` ignore (`_Token`, `_body_opener`, `_level`, `_macro_before`, `_pairs`, `_parents`, `_read_text`, `_read_toml`, `_table`, `_tokens`), owns the direct test of the hook-error `systemMessage`, and fixes no_std: `suboptimal_flops_scope` matches only the exact `#![no_std]` in a `lib.rs`/`main.rs` root, missing `#![ no_std ]` and `#![cfg_attr(..., no_std)]`, and a `#![no_std]` lib root silences a std `main.rs` in the same package.
+- "Re-measure: long functions and multiply-adds out of hana's clippy failures" matches residuals against `blocks.jsonl` records and classifies each by running the detector on its snippet in a stub function (reach: a lower bound of 35/291), not by whether it holds a literal. Its controlled edit declares the operand `f32` in the same function; an untyped `x * 0.5 + 1.0` is not proved.
+- T_claude_mul_add (PDT) comes from the live smoke once the merge reaches `~/.claude` main: a Claude Code process started after it `Write`s `fn f(x: f32) -> f32 { x * 0.5 + 1.0 }` into a scratchpad crate denying `nursery`; the reason appears and `blocks.jsonl` gains an `"agent": "claude"` line.
 
-**Acceptance gate:**
-- Tests green; basedpyright 0/0 on each changed file; `python3 -m json.tool settings.json` succeeds.
-- Main-corpus control (unit director): extract `git -C ~/rust/hana archive origin/main` into the scratchpad and run the detector over every `.rs` file: **zero** non-exempt findings (main passes clippy with the lint denied). Each finding is a false positive to remove before the checkpoint; report how many the literal rule first produced and what removed them.
-- Recall: over the 291 historical positions (extract them from the hana clippy step logs since 2026-10-02 as the plan author did: each `multiply and add expressions` diagnostic's `-->` line and snippet), run the detector on each snippet inside a stub function; report the fraction flagged (the literal rule's ceiling is 78%).
-- Live smoke after the merge reaches `~/.claude` main, from a Claude session started after it: `Write` `fn f(x: f32) -> f32 { x * 0.5 + 1.0 }` into a scratchpad crate denying `nursery`; the reason appears and `blocks.jsonl` gains an `"agent": "claude"` line. Record T_claude_mul_add in PDT.
+**Gotchas:**
+- An unsuffixed float literal receiver does not compile (E0689); clippy writes `2.0f32.mul_add(...)`.
+- Clippy requires both `*` operands float-typed, so `&f32`, closure parameters and `glam::Vec3` operands pass it.
+- Most historical positions are `field * literal` or calls whose float type is not visible locally, which caps recall.
+- The scan (9.69 ms on 236 lines) costs more than the import (6.49 ms); a whole-file pre-filter saves little, as 1,114 of 1,544 hana files hold both `*` and `+`/`-`.
+
+**Ruled out:** the bare literal rule (any float-literal operand proves the product) — it flags operands clippy passes; frozen dataclasses — importing `dataclasses` is about 56% of import time; a silent error path — the error `systemMessage` mirrors the fn-length hook; cutting per-edit cost below +23 ms — the user accepted it.
 
 ### Phase 4 — Codex seats get the same block after `apply_patch` · status: todo
 
@@ -212,22 +207,48 @@ Work only in worktree `/home/natepiano/worktrees/claude-build-followups-mul-add`
 
 **Goal:** a Codex `apply_patch` that leaves a float multiply-add reads the same reason, on natedev and the Mac.
 
-**Spec:** `post-tool-use-mul-add.py` accepts `apply_patch` payloads exactly as the fn-length hook does (reuse its patch-path parsing; `"agent": "codex"`). `codex_hooks.py` installs and trusts this hook's handler as a second `apply_patch` group by the same rules it uses for the fn-length handler (append a new group, never renumber existing groups; trust by `config/batchWrite`); `check` reports both. Command string byte-identical to the `settings.json` entry.
+**Constraints from prior phases:**
+- Phase 3's detector API is `float_mul_add_findings(path) -> tuple[SuboptimalFlopsLintScope, list[FloatMulAddFinding]]` in `mul_add_lib.py`. The Codex entry calls it unchanged for each applied `.rs` path. Its types are `__slots__` classes with read-only properties, not dataclasses: importing `dataclasses` was about 56% of the import cost.
+- Speed: the user accepted +23 ms CPU per Claude edit (measured on a 236-line real file). The Codex path adds only payload parsing.
+- `mul_add_lib.py` imports `_Token, _body_opener, _level, _macro_before, _pairs, _parents, _read_text, _read_toml, _table, _tokens` from `fn_length_lib`, behind one line-level `# pyright: ignore[reportPrivateUsage]`.
+- `test_fn_length.py`'s registration test checks only the first two handlers of the `Edit|MultiEdit|Write` group. `test_mul_add.py` pins mul-add right after fn-length.
+- The registered hook commands run from `~/.claude` main. So the live install, `check` and smoke run only after this phase is merged into main, and on the Mac only after it has pulled.
+
+**Spec:**
+- `post-tool-use-mul-add.py` accepts `apply_patch` payloads exactly as the fn-length hook does, through one shared parser, logging `"agent": "codex"`. It checks each applied `.rs` path and joins the reasons across files in patch order.
+- **Payload types.** The shared parser returns a semantic type, never strings with empty-string sentinels: `AppliedRustEdits` (tool, cwd, the applied `.rs` paths) or `IgnoredEdit` (any other payload). Both hook entries use it.
+- `codex_hooks.py` installs and trusts this hook's handler as a second `apply_patch` group, by the same rules it uses for the fn-length handler: append a new group, never renumber existing groups, trust by `config/batchWrite`. `check` reports both. The command string is byte-identical to the `settings.json` entry.
+- **Shared scanner.** Give each name `mul_add_lib.py` imports a public, role-named name in `fn_length_lib.py`: the token type says what it is (for example `RustToken`, not `_Token`). Where the scope readers repeat each other, fold the manifest walk and the lint-level read into one reader parameterized by lint and group. Each hook keeps its own scope type (`SuboptimalFlopsLintScope` and fn-length's). Then drop the ignore; `test_fn_length.py` stays green.
+- **no_std, per target.** The folded reader decides no_std from the crate root of the edited file's target:
+  - `src/main.rs` and `src/bin/**` belong to binaries;
+  - `tests/`, `examples/` and `benches/` files are their own crates;
+  - any other file under `src/` belongs to `src/lib.rs` when it exists, else to `src/main.rs`. When both roots exist and only one is no_std, it passes, so the hook never blocks on doubt.
+
+  It recognizes `#![no_std]` with any spacing, and `#![cfg_attr(<condition>, no_std)]` (clippy skips the configuration where the attribute applies). An attribute inside a comment or a string does not count.
+- **Patch-path parsing.** Move the fn-length hook's `apply_patch` path parsing into one named function in `fn_length_lib.py` (allowed after G3), and call it from both hooks. Acceptance cases cover Add, Update, Move and Delete file headers.
 
 **Files:**
 - `scripts/hooks/post-tool-use-mul-add.py` — `apply_patch` payloads
-- `scripts/hooks/test_mul_add.py` — Codex payload tests
-- `scripts/hooks/fn_length_lib.py` — the shared patch-path parser, after G3
+- `scripts/hooks/post-tool-use-fn-length.py` — calls the shared parser and its payload type
+- `scripts/hooks/mul_add_lib.py` — imports the public scanner names; per-target no_std through the shared reader
+- `scripts/hooks/fn_length_lib.py` — the shared patch-path parser, payload types, public scanner names and folded scope reader, after G3
 - `scripts/hooks/codex_hooks.py` — the second hook
+- `scripts/hooks/test_mul_add.py` — Codex payloads, error path, `additionalContext`, no_std per target
+- `scripts/hooks/test_fn_length.py` — the shared parser through the fn-length entry
 - `scripts/hooks/test_codex_hooks.py` — its tests
 
-Patch-path parsing: move the fn-length hook's `apply_patch` path parsing into one named function in `fn_length_lib.py` (allowed after G3) and call it from both hooks; acceptance cases cover Add, Update, Move and Delete file headers.
-
 **Seats:** 1 writer + 1 tester.
-`impl` — `post-tool-use-mul-add.py`, the shared parser in `fn_length_lib.py`, `codex_hooks.py`.
-`test` — `test_mul_add.py`, `test_codex_hooks.py`.
+`impl` — `post-tool-use-mul-add.py`, `post-tool-use-fn-length.py`, `fn_length_lib.py`, `mul_add_lib.py`, `codex_hooks.py`.
+`test` — `test_mul_add.py`, `test_fn_length.py`, `test_codex_hooks.py`.
 
-**Acceptance gate:** tests green; basedpyright 0/0; install then `check` on natedev (`dangerouslyDisableSandbox`) and on the Mac over `ssh mac` (print `rc=$?` inside) both report both hooks trusted, with existing groups unchanged; `codex exec` smoke in a scratchpad crate shows the reason and an `"agent": "codex"` log line. Record T_codex_mul_add in PDT.
+**Acceptance gate:**
+- **Before the checkpoint:** tests green (`test_mul_add.py`, `test_fn_length.py`, `test_codex_hooks.py`); basedpyright 0/0 on each changed file. Tests cover:
+  - Add, Update, Move and Delete headers, and a patch with findings in two files;
+  - an internal error, which prints exactly one `mul_add hook error: <type>: <message>` `systemMessage` and exits 0;
+  - a block's `additionalContext`, which equals its reasons joined by newlines;
+  - no_std per target: a spaced attribute, `cfg_attr`, and a std `main.rs` beside a no_std library.
+- **Speed:** measure the per-edit CPU delta as Phase 3 did: 20 interleaved runs, `getrusage` children, the hook against bare Python. Report it for one 236-line real file (at most +23 ms) and for a three-file Codex patch.
+- **After the showrunner merges this phase into `~/.claude` main, and the Mac has pulled:** install, then `check`, on natedev (`dangerouslyDisableSandbox`) and on the Mac over `ssh mac` (print `rc=$?` inside). Both must report both hooks trusted and the existing groups unchanged. A `codex exec` smoke in a scratchpad crate (`fn f(x: f32) -> f32 { x * 0.5 + 1.0 }`, `nursery` denied) shows the reason and an `"agent": "codex"` log line. Record T_codex_mul_add in PDT; Phase 3's live Claude smoke records T_claude_mul_add before it.
 
 ### Phase 5 — Re-measure: long functions and multiply-adds out of hana's clippy failures · status: todo
 
@@ -239,11 +260,32 @@ Work only in worktree `/home/natepiano/worktrees/claude-build-followups-mul-add`
 
 **Goal:** one table, `too_many_lines` and `suboptimal_flops` side by side, before and after both hooks, with a verdict per lint (user, item 4).
 
-**Spec:** confirm Phase 1's script hashes (a mismatch stops the phase); run Phase 1's commands for `suboptimal_flops` and the fn-length plan's Phase 4 commands for `too_many_lines`, in the same window, between T_codex_mul_add + 96 h and + 100 h; a window that holds hours before either lint's T_codex is reported as such. Derive the three numbers per lint; compare against Phase 1 here and the fn-length plan's Phase 1. `suboptimal_flops` baseline, unrounded: 7.916 failed steps per 100 (limit ≤ 1.979), 2.573 sole-cause per 100, 0.402 h a day sole-cause seat time (limit ≤ 0.100). Inside the window, make one controlled Claude edit and one Codex edit that each leave `x * 0.5 + 1.0` in a scratchpad crate denying `nursery`, so the control proves the hooks fire rather than that no qualifying edit happened; match residuals on each block record's time, path, line and expression. Success per lint: failed steps per 100 ≤ 25% of its baseline, sole-cause seat time per day ≤ 25%, and the control: each hook's `blocks.jsonl` holds at least one `claude` and one `codex` line inside the window (natedev and the Mac). Residuals for `suboptimal_flops`: per diagnostic in the window, whether a block for that file precedes it, or none does, split by whether the expression holds a float literal (the detector's reach). Write the table and verdicts into the As-built and send natedev the verdict lines.
+**Constraints from prior phases:**
+- **The detector's reach is narrower than "holds a float literal".** A literal proves a product only when the other operand is not excluded. Excluded: a non-float annotation, a pattern or closure binding, a reference, a vector, or a non-float file const. A named field must be declared `f32`/`f64` in the same file. Phase 3 ran it on the 291 historical positions, each inside a stub function, and it flagged 35 (12.0%). That is a lower bound, since a stub drops the file's own declarations. So the 75% threshold for `suboptimal_flops` depends on how far the real files reach.
+- The control edit must declare its operand in the same function: `fn f(x: f32) -> f32 { x * 0.5 + 1.0 }`. An untyped `x` is not proved.
+
+**Spec:**
+- **Before measuring:** confirm Phase 1's script hashes; a mismatch stops the phase.
+- **Measurements:**
+  - Run Phase 1's commands for `suboptimal_flops`, and the commands of the fn-length plan's re-measure phase ("Re-measure four days after both hooks are live") for `too_many_lines`.
+  - Run both in the same window, between T_codex_mul_add + 96 h and + 100 h. Report a window that includes hours before either lint's T_codex as such.
+  - Derive the three numbers per lint. Compare them with Phase 1 here and with the fn-length plan's Phase 1.
+- **`suboptimal_flops` baseline, unrounded:**
+  - failed steps: 7.916 per 100 (limit ≤ 1.979);
+  - sole-cause steps: 2.573 per 100;
+  - sole-cause seat time: 0.402 h a day (limit ≤ 0.100).
+- **Control:** inside the window, make one controlled Claude edit and one Codex edit, each leaving `fn f(x: f32) -> f32 { x * 0.5 + 1.0 }` in a scratchpad crate that denies `nursery`. The control proves the hooks fire, rather than that no qualifying edit happened. Match residuals on each block record's time, path, line and expression.
+- **Success per lint:**
+  - failed steps per 100 ≤ 25% of its baseline;
+  - sole-cause seat time per day ≤ 25% of its baseline;
+  - the control: each hook's `blocks.jsonl` holds at least one `claude` and one `codex` line inside the window, on natedev and the Mac.
+- **Residuals for `suboptimal_flops`:** for each diagnostic in the window, record whether a block for that file precedes it. Split them by whether the detector flags the expression: run `float_mul_add_findings` on the file at the commit clippy checked when git has it, else on the snippet inside a stub function (a lower bound). Report the failed steps per 100 the detector reaches beside each global verdict. The 75% thresholds stay as set.
+- **FMA in CI:** report whether hana `origin/main`'s `.github/workflows/ci.yml` carries `-C target-cpu=x86-64-v3` (`git -C ~/rust/hana show origin/main:.github/workflows/ci.yml`). Phase 2's real-code check found it only on `init/catalyst`.
+- **Write-up:** put the table and verdicts in the As-built, and send natedev the verdict lines, the CI flag's state included.
 
 **Files:**
 - `docs/plans/build-followups-mul-add.md` — the As-built.
 
 **Seats:** 1 writer — `impl` runs the commands and reports.
 
-**Acceptance gate:** all hashes match, every command exits 0, and the As-built states each success condition per lint as met or not, with its number.
+**Acceptance gate:** all hashes match, every command exits 0, and the As-built states for each lint whether each success condition is met, with its number, plus the detector's reach split and the CI flag's state.

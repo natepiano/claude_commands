@@ -486,7 +486,7 @@ class FunctionHookTests(SyntheticPackageTests):
         self.assertEqual(len(groups), 1)
         commands = cast(list[dict[str, object]], groups[0]["hooks"])
         self.assertEqual(
-            [cast(str, handler["command"]) for handler in commands],
+            [cast(str, handler["command"]) for handler in commands[:2]],
             [
                 '"$HOME/.claude/scripts/lib/py" "$HOME/.claude/scripts/hooks/post-tool-use-basedpyright.py"',
                 '"$HOME/.claude/scripts/lib/py" "$HOME/.claude/scripts/hooks/post-tool-use-fn-length.py"',
