@@ -46,7 +46,7 @@
 
 | Gate | Waiting | Waits on | Clears when |
 | --- | --- | --- | --- |
-| G1 | enh-showrunner-unit Phase 2 | stalls-unit Phase 6 | the showrunner merges it and tells enh-showrunner |
+| G1 | enh-showrunner-unit Phase 4 | stalls-unit Phase 6 | cleared 16:00 PDT 2026-10-06: 966b814 merged, enh-showrunner told |
 
 ## Close-out
 
