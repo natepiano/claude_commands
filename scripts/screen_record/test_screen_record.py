@@ -203,7 +203,8 @@ class ScreenRecordTests(unittest.TestCase):
         ffmpeg = self.calls_for("ffmpeg")[0]
         expected = [
             "-f", "x11grab", "-framerate", "60", "-window_id", "39845894", "-i", ":99",
-            "-t", "5", "-fs", "500000000", "-c:v", "libx264", "-preset", "veryfast",
+            "-t", "5", "-fs", "500000000", "-vf", "crop=trunc(iw/2)*2:trunc(ih/2)*2",
+            "-c:v", "libx264", "-preset", "veryfast", "-tune", "zerolatency",
             "-crf", "18", "-pix_fmt", "yuv420p",
         ]
         self.assertEqual(ffmpeg[:5], ["-hide_banner", "-loglevel", "error", "-nostdin", "-y"])
