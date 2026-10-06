@@ -744,9 +744,9 @@ it needs. Every other wait is yours to clear, and fast.
    A longer wait needs a logged reason. In the dailies, the waiting unit's
    `update` names the wait with its start and clear times.
 
-   While it waits, give the waiting unit other work inside its current phase:
-   its fix built in a scratch copy, tests, docs or research. Never its next
-   phase (Rules: one phase at a time).
+   While it waits, start the waiting unit's next phase that does not need the
+   wait (Rules: parallel by default); else work inside its current phase: its
+   fix built in a scratch copy, tests, docs or research.
 5. **Two things still go to the user:** a wait that clears only by changing what
    ships, and approvals that belong in a unit director's own session.
 6. **A block on the user is still yours** (user, 2026-10-03, after trunk sat
@@ -965,10 +965,21 @@ When every unit's final-gate and as-built checkpoints are merged:
   `docs/design-decisions.md`, the plan and the as-built docs; if intent stays
   unclear, keep it. When the user overrules a ruling or settles intent, add the
   entry there. User, 2026-10-04, after two such rulings were reversed.
-- **One phase at a time.** A unit starts phase N+1 only after phase N is merged
-  into the merge branch. A held checkpoint is fixed inside phase N; the unit
-  never builds the next phase on top of it. User rule 2026-10-01: widget ran
-  Phases 29 and 30 at once, and the dailies could not say which phase it was in.
+- **Parallel by default.** Plan for parallelism; the user never has to find it.
+  Every phase that can run safely runs now. At each ETA, notice or new item, ask
+  which waiting work could start, and start it unasked:
+  - A unit's later phase runs beside its current one, with its own seats, berth
+    reservation and checkpoint. A checkpoint commits only its own phase's paths.
+    Where files overlap, it claims after the earlier phase and builds on its tree.
+  - Gates run side by side: review, live check, shots and design check run
+    alongside the final lint and tests, with one repair round for all findings.
+    A code change reruns lint and test before the checkpoint.
+  - New work goes to whichever unit can start it soonest, not to the owner's
+    queue, when its files can be fenced through berth.
+  - A held checkpoint is fixed inside its own phase. Dailies name the oldest
+    unmerged phase, with the others in `update`. If builds queue on the shared
+    lock, run fewer at once, never none. User, 2026-10-06, replacing the
+    2026-10-01 one-phase rule.
 - **Disk.** Units keep saved run output under a few GB (`/unit:delegate` →
   <ToolingContract/>). When builds turn cold for no reason, run `df -h /` and
   find the large output before anything else. User, 2026-10-04.
