@@ -19,12 +19,14 @@ The session notifier sends a message to a live Claude session on a schedule: the
 | `scripts/delegate/prepare_session.sh` | Run start: writes the run-active marker, then creates the instance. |
 | `scripts/delegate/end_session.sh` | Run end: removes the instance, then the marker. |
 | `scripts/hooks/delegate_run.py` | `check` CLI: the unit instance's check. Also a library the delegate hooks import. |
-| `scripts/delegate/progress_history.py` | `progress` restarts the unit's instance and names its next tick in the report's clock line. |
+| `scripts/delegate/progress_history.py` | `progress` restarts the unit's instance on every call, refused ones included, and names its next tick in the report's clock line. |
 | `commands/showrunner/{produce,dailies,interval}.md` | Create, restart, retime and remove the showrunner instance. |
 | `commands/unit/delegate.md` `<ProgressContract>`, `commands/unit/report.md`, `commands/unit/interval.md` | How a unit treats its ticks, and `/unit:interval`. |
 | `config/delegate.conf` | `PLAN_DELEGATE_PROGRESS_INTERVAL_SECONDS`, the unit interval. |
 | `/etc/nixos/modules/common/session-notifier.nix` | The 15 s job. |
 | `scripts/message/test_notifier.py`, `test_sessions.py`, `scripts/delegate/test_delegate_check.py` | CLI tests, run through the `NOTIFIER_*` variables. |
+| `scripts/production/test_unit_status.py` | `TICKS FAILING`: runs a copy of `unit_status.sh` in a temp tree with a stub `notifier.sh`, fake `tmux` and `pgrep`, and a temp `PLAN_DELEGATE_ACTIVE_DIR`; covers a failing idle run, a healthy run, and a missing or empty marker. |
+| `scripts/delegate/test_progress_history.py` | The `progress` restart, refused calls included (missing `--cap-stage`, no open window): `LAST_RESTART` at the call time and `NEXT_DUE` one interval later. |
 
 ### Instance state
 
@@ -105,7 +107,7 @@ Every schedule write sets `NEXT_DUE = now - now % 60 + EVERY * 60`: the next who
 
 With `HOLD=1`, a tick skips (`skip hold`) while `LAST_SENT > LAST_RESTART`, that is, while a sent tick has not yet been answered by a clock restart. The hold releases when the session's socket differs from `LAST_TARGET` (a new process: the waiting tick went with the old one) or when two intervals have passed since `LAST_SENT`. `fire` ignores the hold.
 
-On the unit side, every `progress_history.py progress` call that renders a report runs `notifier.sh restart delegate-<run id>` (10 s limit, `PLAN_DELEGATE_NOW_EPOCH` copied to `NOTIFIER_NOW_EPOCH`) and reads `next_due` from its output. That restart releases the hold and puts the next tick one full interval after the latest report, whether a tick, the user or a completion caused it. The report's clock line, `**now <local time> - next report <time>**`, uses that `next_due`. If the restart fails or there is no instance, the clock line falls back to a still-future `progress_timer` marker deadline, then to now plus the configured interval, and drops the clause when neither exists. A failed restart never fails the report.
+On the unit side, every `progress_history.py progress` call runs `notifier.sh restart delegate-<run id>` (10 s limit, `PLAN_DELEGATE_NOW_EPOCH` copied to `NOTIFIER_NOW_EPOCH`) as its first act, before it reads the run's state, and reads `next_due` from its output. That restart releases the hold and puts the next tick one full interval after the latest call, whether a tick, the user or a completion caused it. A refused call (no open window, a failed percent check, a missing override reason or `--cap-stage`) keeps its message and exit status, but `LAST_RESTART` still moves to the call time and `NEXT_DUE` to one interval later, so the hold never skips the next slot. The report's clock line, `**now <local time> - next report <time>**`, uses that `next_due`. If the restart fails or there is no instance, the clock line falls back to a still-future `progress_timer` marker deadline, then to now plus the configured interval, and drops the clause when neither exists. A restart that fails or finds no instance changes nothing else in the call: a report renders as it would have, and a refusal stays the same refusal.
 
 ### The showrunner instance
 
@@ -144,7 +146,7 @@ A Codex unit has no `CLAUDE_CODE_SESSION_ID`, so it gets no marker and no instan
 
 ### TICKS FAILING
 
-For each unit with a running Claude pid, `unit_status.sh` runs `sessions.py id <pid>`, reads the marker for that session id, and, whenever the marker names a run, runs `notifier.sh health delegate-<run id>`, idle or not. Health exit 1 prints `TICKS FAILING (<health line without "failing: ">)`: `no instance`, `no tick since <time>`, or `last two sends exit a, b`. No marker, or an empty one, prints nothing. The showrunner reads this line in every scheduled update and typed dailies.
+For each unit with a running Claude pid, `unit_status.sh` runs `sessions.py id <pid>`, reads the marker `${PLAN_DELEGATE_ACTIVE_DIR:-/tmp/claude/delegate/active}/<session id>`, and, whenever the marker names a session directory, runs `zsh notifier.sh health delegate-<run id>` (run id = that directory's basename), idle or working. Health exit 1 prints `TICKS FAILING (<health line without "failing: ">)`: `no instance`, `no tick since <time>`, or `last two sends exit a, b`. No marker, or an empty one, prints nothing. The showrunner reads this line in every scheduled update and typed dailies.
 
 ## Invariants
 
@@ -161,7 +163,7 @@ For each unit with a running Claude pid, `unit_status.sh` runs `sessions.py id <
 - Instance names are `showrunner-<slug>` and `delegate-<run id>`, run id = basename of `SESSION_DIR`; the send key is `notifier-<instance>`.
 - `prepare_session.sh`'s last line is `Session ready at <dir>`; the `next_due=` or `notifier instance not created:` line comes before it.
 - `end_session.sh` removes the instance before the marker, ignoring errors.
-- The `progress` restart never fails a report; any failure falls back.
+- `progress` restarts the instance before it reads state or can refuse, so every call, refused ones included, restarts the clock. The restart never fails a report; any failure falls back.
 - Hooks that import `delegate_run.py` never fail the turn and skip subagents.
 - Delegate scripts run with `dangerouslyDisableSandbox: true`.
 - `scripts/delegate/progress_timer.sh` stays: `/clippy` launches it.
@@ -179,7 +181,7 @@ For each unit with a running Claude pid, `unit_status.sh` runs `sessions.py id <
 - **Seats inherit `CLAUDE_CODE_SESSION_ID`.** A seat can inherit the unit director's id, so `prepare_session.sh` or `end_session.sh` run from a seat or a test acts on the unit director's marker and instance. Tests run them only with a fresh id and a temp `NOTIFIER_STATE_DIR`; `end_session.sh`'s `remove` inherits that variable.
 - **`PLAN_DELEGATE_ACTIVE_DIR`** is a test-only variable honoured only by `delegate_run.py`, `unit_notifier.sh` and `unit_status.sh`. `prepare_session.sh` and `end_session.sh` use the fixed `/tmp/claude/delegate/active`, so a live caller leaves it unset or pointed where the marker is.
 - **`CHECK` quoting.** `unit_notifier.sh` `(q)`-quotes each word of the check, so a repo path with spaces survives the `(Q)(z)` split.
-- **`progress` cost.** Every rendered `progress` call spawns one zsh, even for a run with no instance. A `progress` call restarts the clock before it can refuse, so a call that exits with `No open window to report` or a missing cap stage still moves the next tick one interval out.
+- **`progress` cost.** Every `progress` call, refused ones included, spawns one zsh for the restart, even for a run with no instance. Because the restart comes before any refusal, a call that exits with `No open window to report` or a missing cap stage still moves the next tick one interval out.
 - **`/unit:interval` lasts for the run.** Rerunning `unit_notifier.sh` resets `EVERY` to the config value.
 - **`fire`** moves the clock and skips the hold, but a failing check or a missing session still skips it.
 
@@ -198,4 +200,4 @@ For each unit with a running Claude pid, `unit_status.sh` runs `sessions.py id <
 - **Pinned marker directory in `prepare_session.sh`.** It writes the marker in the fixed directory, so it pins `PLAN_DELEGATE_ACTIVE_DIR` for `unit_notifier.sh`; an inherited test value would point it at another marker. `end_session.sh` does not honour that variable because `prepare_session.sh` never writes there.
 - **`Session ready at <dir>` stays last.** The unit director reads `SESSION_DIR` from the last line. An instance that fails to be created does not stop the run; the unit says the run gets no ticks until `unit_notifier.sh "$CLAUDE_CODE_SESSION_ID"` succeeds.
 - **`TICKS FAILING` for every active run, idle or not.** An idle unit gets no ticks by design, but its instance must be there when work resumes. Checked only while work ran, a unit with no instance dropped out of every idle status: hana's geometry-material reported `no instance` from 2026-09-29 and no status showed it.
-- **A refused report still restarts the clock.** The hold keeps at most one tick waiting and releases on the next restart; a refused call that skipped the restart left the next slot held, a 30-minute gap.
+- **A refused report still restarts the clock.** The hold keeps at most one tick waiting and releases on the next restart. A refused call that skipped the restart would leave the next slot held until the two-interval release, a 30-minute gap at the default interval.

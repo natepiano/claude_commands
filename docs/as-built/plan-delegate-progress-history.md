@@ -435,9 +435,13 @@ tick lands on a later day. The elapsed and unchanged columns are durations, whic
 say how long but never when, and an ETA says when the work lands rather than when
 this report was made; this line is what tells a reader whether the report in
 front of them is current and how long until the next one. The next tick comes
-from the Claude unit's `delegate-<run id>` notifier instance: each rendered
-`progress` call runs `notifier.sh restart` on it and names the `next_due` that
-restart prints. With no instance, or a restart that fails, the recorder falls
+from the Claude unit's `delegate-<run id>` notifier instance: every `progress`
+call runs `notifier.sh restart` on it as its first act, before it reads state,
+and a rendered report names the `next_due` that restart prints. A refused call
+(no open window, a failed percent check, a missing override reason or
+`--cap-stage`) keeps its message and exit status but still restarts the clock,
+so the next tick lands one interval after the call. With no instance, or a
+restart that fails, the recorder falls
 back to a still-future deadline in `${SESSION_DIR}/progress_timer`, then to now
 plus `PLAN_DELEGATE_PROGRESS_INTERVAL_SECONDS` in `delegate.conf`. That key sets
 the Codex poll timeout and the default interval of a Claude unit's notifier
