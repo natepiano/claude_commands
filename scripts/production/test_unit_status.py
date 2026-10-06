@@ -23,7 +23,8 @@ def _write_executable(path: Path, contents: str) -> None:
 
 class UnitStatusTests(unittest.TestCase):
     def run_status(
-        self, marker: str | None, health_text: str, health_exit: int
+        self, marker: str | None, health_text: str, health_exit: int, *,
+        processes: str = "100 1 tmux pane\n200 100 zsh\n12345 200 claude --remote-control stalls\n",
     ) -> tuple[str, str | None]:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -36,7 +37,7 @@ class UnitStatusTests(unittest.TestCase):
             )
             _ = (root / "scripts" / "message").mkdir(parents=True)
             _ = (root / "scripts" / "message" / "sessions.py").write_text(
-                f'print("{SESSION_ID}")\n', encoding="utf-8"
+                f'import sys\nprint("{SESSION_ID}" if sys.argv[-1] == "12345" else "")\n', encoding="utf-8"
             )
             _write_executable(
                 root / "scripts" / "message" / "notifier.sh",
@@ -50,17 +51,21 @@ exit "$NOTIFIER_HEALTH_EXIT"
                 "raise SystemExit(1)\n", encoding="utf-8"
             )
             bin_dir = root / "bin"
+            process_file = root / "processes.txt"
+            _ = process_file.write_text(processes, encoding="utf-8")
             _write_executable(
                 bin_dir / "tmux",
                 """#!/bin/sh
 case "$1" in
   has-session) exit 0 ;;
+  display-message) printf '100\\n' ;;
   capture-pane) printf '%s\\n' '— holding: waiting on x' ;;
   *) exit 2 ;;
 esac
 """,
             )
-            _write_executable(bin_dir / "pgrep", "#!/bin/sh\nprintf '12345\\n'\n")
+            _write_executable(bin_dir / "ps", '#!/bin/sh\ncat "$TEST_PROCESS_FILE"\n')
+            _write_executable(bin_dir / "pgrep", "#!/bin/sh\nexit 2\n")
             active_dir = root / "active"
             active_dir.mkdir()
             if marker is not None:
@@ -77,13 +82,14 @@ esac
                     "NOTIFIER_CALL_LOG": str(call_log),
                     "NOTIFIER_HEALTH_TEXT": health_text,
                     "NOTIFIER_HEALTH_EXIT": str(health_exit),
+                    "TEST_PROCESS_FILE": str(process_file),
                 }
             )
             zsh = shutil.which("zsh")
             if zsh is None:
                 raise RuntimeError("zsh is required for unit status tests")
             result = subprocess.run(
-                [zsh, str(script), str(root / "status"), "America/Los_Angeles", "unit"],
+                [zsh, str(script), str(root / "status"), "America/Los_Angeles", "hook"],
                 check=True,
                 capture_output=True,
                 text=True,
@@ -110,4 +116,15 @@ esac
     def test_empty_active_marker_skips_health(self) -> None:
         output, calls = self.run_status("", "failing: no instance", 1)
         self.assertNotIn("TICKS FAILING", output)
+        self.assertIsNone(calls)
+
+    def test_claude_is_found_under_the_pane_even_with_a_different_remote_name(self) -> None:
+        output, calls = self.run_status("/tmp/test-run\n", "ok", 0)
+        self.assertNotIn("CLAUDE NOT RUNNING", output)
+        self.assertEqual(calls, "health delegate-test-run\n")
+
+    def test_no_claude_descendant_reports_not_running(self) -> None:
+        processes = "100 1 tmux pane\n200 100 zsh\n12345 1 claude --remote-control stalls\n"
+        output, calls = self.run_status("/tmp/test-run\n", "ok", 0, processes=processes)
+        self.assertIn("CLAUDE NOT RUNNING", output)
         self.assertIsNone(calls)

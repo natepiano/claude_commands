@@ -87,11 +87,39 @@ waiting_on_user() {
   print -r -- "$key" >> "$SEEN"
 }
 
+# The pane's Claude may have a different remote-control name from its tmux session.
+# Search descendants in process-tree order, closest to the pane first.
+pane_claude_pid() {
+  print -r -- "$processes" | awk -v root="$1" '
+    {
+      child[NR] = $1
+      parent[NR] = $2
+      command[NR] = $0
+      sub(/^[[:space:]]*[0-9]+[[:space:]]+[0-9]+[[:space:]]*/, "", command[NR])
+    }
+    END {
+      queue[1] = root
+      end = 1
+      for (head = 1; head <= end; head++) {
+        for (i = 1; i <= NR; i++) {
+          if (parent[i] != queue[head]) continue
+          if (command[i] ~ /^claude([[:space:]]|$)/) {
+            print child[i]
+            exit
+          }
+          queue[++end] = child[i]
+        }
+      }
+    }'
+}
+
 echo "at $(TZ=$ZONE date '+%H:%M %Z') / $(date -u +%H:%M) UTC"
+processes=$(ps -eo pid=,ppid=,args=)
 for u in $units; do
   echo "== $u"
   if ! $TM has-session -t "$u" 2>/dev/null; then echo 'SESSION GONE'; continue; fi
-  pid=$(pgrep -f "^claude --resume .* --remote-control $u|^claude --remote-control $u" | head -1)
+  pane_pid=$($TM display-message -p -t "$u" '#{pane_pid}')
+  pid=$(pane_claude_pid "$pane_pid")
   [[ -z $pid ]] && echo 'CLAUDE NOT RUNNING'
   if [[ -n $pid ]]; then
     session_id=$("$PY" "$SESSIONS" id "$pid" 2>/dev/null)
