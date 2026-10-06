@@ -165,6 +165,45 @@ esac
         self.assertEqual(waits[0], 0)
         self.assertGreaterEqual(waits[1], 3)
 
+    def test_killed_verify_holder_is_reclaimed_promptly(self) -> None:
+        board = self.root / "board"
+        first_environment = {**self.environment, "PLAN_DELEGATE_BOARD_DIR": str(board),
+                             "PLAN_DELEGATE_TEAM_ROLE": "first", "TEST_BLOCK": "1"}
+        second_environment = {**self.environment, "PLAN_DELEGATE_BOARD_DIR": str(board),
+                              "PLAN_DELEGATE_TEAM_ROLE": "second"}
+        first = subprocess.Popen(["bash", str(VERIFY), "check", "sample"], cwd=self.root,
+                                 env=first_environment, stdout=subprocess.PIPE,
+                                 stderr=subprocess.PIPE, text=True)
+        try:
+            deadline = time.monotonic() + 15
+            while not (self.root / "running").exists() and time.monotonic() < deadline:
+                if first.poll() is not None:
+                    break
+                time.sleep(0.05)
+            self.assertTrue((self.root / "running").exists(),
+                            "first verify call did not reach cargo check")
+            recorded_pid = (board / "locks" / "cargo.d" / "holder_pid").read_text()
+            self.assertEqual(recorded_pid, str(first.pid))
+
+            first.kill()
+            _ = first.wait(timeout=5)
+            second = self.verify(second_environment)
+            self.assertEqual(second.returncode, 0, second.stdout + second.stderr)
+            records = self.records()
+            self.assertEqual(len(records), 1)
+            self.assertLess(cast(int, records[0]["token_wait_s"]), 3)
+            self.assertIn(f"token cargo reclaimed from first: holder pid {first.pid} is gone",
+                          (board / "board.log").read_text())
+        finally:
+            _ = (self.root / "release").touch()
+            if first.poll() is None:
+                first.kill()
+            _ = first.wait(timeout=5)
+            if first.stdout is not None:
+                first.stdout.close()
+            if first.stderr is not None:
+                first.stderr.close()
+
 
 if __name__ == "__main__":
     _ = unittest.main()

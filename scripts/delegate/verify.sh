@@ -725,7 +725,7 @@ TOKEN_HELD=0
 if [[ -n "${BOARD_DIR}" && -n "${BOARD_SLOT}" && -f "${BOARD_HELPER}" ]]; then
     TOKEN_WAIT_STARTED=$SECONDS
     if bash "${BOARD_HELPER}" acquire "${BOARD_DIR}" "${BOARD_SLOT}" cargo \
-        --hold 3600 --wait 1800 >/dev/null 2>&1; then
+        --pid $$ --hold 3600 --wait 1800 >/dev/null 2>&1; then
         TOKEN_HELD=1
     else
         echo "verify.sh: waited for the cargo token and did not get it; running anyway." >&2

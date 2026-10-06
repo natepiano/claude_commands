@@ -634,6 +634,31 @@ For a CI MemoryMax increase, require an isolated post-pool run with a CI `oom_ki
 
 **Ruled out:** catching `AttributeError` in the read path instead of validating the shape — it would also hide defects in the code; `release --resume` releasing the sole holder of any no-cycle hold — it could end a hold nobody had begun releasing.
 
+### Phase 23 — A cargo token held by a killed verify.sh is reclaimed at once, not after an hour · status: done
+
+#### As-built
+
+- `board.sh acquire` takes `--pid N`; N must match `^[1-9][0-9]*$`, else `die` exits 2 with `--pid must be a positive integer`. `write_lock_meta` writes N to `locks/<res>.d/holder_pid` only when given. `pid` is neither written nor read, so a lock from an older board.sh reclaims only by expiry. verify.sh acquires the cargo token with `--pid $$ --hold 3600 --wait 1800`; `$$` is the verify.sh shell, the same in its subshells.
+- `pid_is_gone` runs `ps -p N -o stat=`: gone when `ps` exits 1 with empty output, or the state begins with `Z`. Any other result is alive, including another user's process and a failure of `ps` itself. A dead holder's pid reused by a new process reads alive, and that lock falls back to expiry. procps on natedev and BSD ps on the Mac behave the same.
+- `lock_stale_reason` checks the holder pid first, then `lock_is_expired`. No `holder_pid` file, or one that is not a positive integer, means expiry only. A lock directory with no metadata yet stays live.
+- Reclaim and release run under `lock_guard`: `exec 9>>locks/<res>.guard`, then python3 `fcntl.flock(9, LOCK_EX | LOCK_NB)` (the Mac has no `flock(1)`). The lock belongs to the open descriptor, so it holds until `exec 9>&-` or the shell's death; the kernel drops it when the holder dies. A reclaimer holding it re-reads the lock and, only if still stale, removes it, runs `mkdir`, writes metadata, closes descriptor 9 and posts. Reclaim never waits for the guard: held or failing, it falls through to the deadline check and the 3 s sleep. `release` retries every 50 ms for up to 10 s, then (or at once when python3 is missing or fails) goes ahead unguarded. `renew` is unguarded and keeps `holder_pid`.
+- A pid reclaim posts `claim` `token <res> reclaimed from <holder>: holder pid <N> is gone`, even when the lock has also expired. An expiry reclaim posts `token <res> reclaimed from <holder> after its hold expired`. Stdout for both is `acquired <res> (reclaimed from <holder>)`.
+
+**Files:**
+- `scripts/delegate/board.sh` — `--pid`, `holder_pid`, `pid_is_gone`, `lock_stale_reason`, `lock_guard`, guarded reclaim and release, the usage and `Produces:` lines
+- `scripts/delegate/verify.sh` — `--pid $$` on the cargo token acquire
+- `scripts/delegate/test_board_reclaim.py` — gone, zombie, live, no-pid and old-`pid`-file holders; invalid and malformed pids; an eight-way race with one winner; a held guard blocking reclaim and release
+- `scripts/delegate/test_verify_token_wait.py` — `holder_pid` equals verify.sh's pid; after a SIGKILL the next call takes the token with `token_wait_s` under 3
+
+**Gotchas:**
+- The guard file is never removed, and `locks` (which lists only `*.d`) never shows it; unlinking it while held would let two processes lock two different files.
+- A child started while descriptor 9 is open inherits it and keeps the guard held; the guarded section runs only short-lived commands.
+- Holder and waiter must share one pid namespace (Codex writer seats run `--sandbox danger-full-access`, Claude seats run on the host); a separate namespace makes a live holder read gone.
+- Units run `~/.claude/scripts/delegate/board.sh` and `verify.sh` live, and bash reads a script as it runs: replace either by writing a temp file in the same directory, setting its mode (`board.sh` 755, `verify.sh` 644), and `mv`ing it over.
+- The verify.sh kill test reaps with `first.wait()`, not `communicate()`: the orphaned cargo stub holds the pipes open until `TEST_RELEASE` exists.
+
+**Ruled out:** `kill -0` — true on a zombie, EPERM on another user's live process; reading the old `pid` file — it names the exited acquire process, so a live verify.sh's token would be reclaimed at the first poll; a `mkdir` guard cleared after a minute — two waiters could each clear the other's.
+
 ## Parked
 
 Work taken out of the phase sequence. Each entry keeps its Work Order and returns as a new phase when its condition holds.
