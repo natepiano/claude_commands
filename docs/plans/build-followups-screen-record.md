@@ -96,46 +96,22 @@ First consumer: `startup` (Hana's startup-animation video). Reply to it by SendM
 - Bevy 0.19's `EasyScreenRecordPlugin`: it needs libx264 in the app, toggles on Space, and steps `Time<Virtual>`.
 - A Mac backend (`screencapture -v` or avfoundation): no consumer there yet.
 
-### Phase 2 — /unit:report timers: flagged when missing, never skipped after a rejected report · status: todo
+### Phase 2 — /unit:report timers: flagged when missing, never skipped after a rejected report · status: done
 
-#### Work Order
+#### As-built
 
-Work only in worktree `/home/natepiano/worktrees/claude-build-followups-stalls`, branch `build-followups-stalls`. State every time in PDT (America/Los_Angeles).
-
-**Goal:** `unit_status.sh` prints `TICKS FAILING (…)` for any unit whose run is active and whose notifier health fails, idle or working; and every `progress_history.py progress` call that gets as far as its session directory restarts the unit's notifier clock, including one it then refuses.
-
-**Spec:**
-
-*Status while idle* (`scripts/production/unit_status.sh`). Today the health check at lines 97-104 runs only when `delegate_run.py check` exits 0 (work in flight), so an idle unit with no notifier instance prints nothing; hana's geometry-material unit showed `failing: no instance` from 2026-09-29 and dropped out of every status whenever idle (showrunner, 2026-10-06).
-- Drop the `"$PY" "$CHECK" check …` condition. Whenever the active marker for the unit's Claude session id names a non-empty session directory, run `zsh "$NOTIFIER" health "delegate-${session_dir:t}"` and, on exit 1, print `TICKS FAILING (${health#failing: })` exactly as today. No marker, an empty marker, or health exit 0 prints nothing. `CHECK` and its assignment go once nothing reads them.
-- The marker directory becomes `${PLAN_DELEGATE_ACTIVE_DIR:-/tmp/claude/delegate/active}`, the test-only override `delegate_run.py` and `unit_notifier.sh` already honour; a live caller leaves it unset.
-- Update the header comment (lines 4-6) to say the tick health line prints for every unit with an active run.
-- The script stays zsh and portable (Linux and the Mac): no GNU-only flags, no `${PIPESTATUS[0]}`.
-
-*Refused report* (`scripts/delegate/progress_history.py`). `_progress` (from line 3557) calls `_restart_unit_notifier(session_dir)` only at line 3716, after every refusal: the "No open window to report" exit at 3589, the percent checks at 3614-3632, the override-reason refusal raised inside `_progress_decision` (lines 1842-1874), and the missing `--cap-stage` exit at 3679. A refused call leaves the notifier hold engaged (`LAST_SENT > LAST_RESTART`), so the next slot is skipped until the hold releases after two intervals: frame-time's 04:02 PDT report on 2026-10-06, refused for a missing `--phase-override-reason`, left a 30 minute gap; in the 24 hours to then, hold skips were trunk 7, frame-time 4, startup 1 (showrunner, 2026-10-06).
-- In `_progress`, call `_restart_unit_notifier(session_dir)` once, immediately after `session_dir` and `now` are set and before `_read_state`, keep its result in a local, and pass that local to `_next_report_at` where line 3716 calls the restart today. No other call site changes. A refused call still exits with its current message and status; it now also leaves `LAST_RESTART` at the call time and `NEXT_DUE` one interval later. A restart that fails or finds no instance still never fails or changes the report (`_restart_unit_notifier` returns `None`).
+- `unit_status.sh` checks notifier health for every unit whose active-run marker (keyed by the unit's Claude session id) names a non-empty session directory, idle or working: it runs `zsh "$NOTIFIER" health "delegate-${session_dir:t}"` and on exit 1 prints `TICKS FAILING (<reason>)`. No marker, an empty marker, or health exit 0 prints nothing. The script stays zsh and portable to Linux and the Mac.
+- The marker directory is `${PLAN_DELEGATE_ACTIVE_DIR:-/tmp/claude/delegate/active}`, the same test-only setting `delegate_run.py` and `unit_notifier.sh` honour; live callers leave it unset.
+- `progress_history.py progress` restarts the unit's notifier as its first act: `_progress` calls `_restart_unit_notifier(session_dir)` once, right after `session_dir` and `now` are set and before `_read_state`, and passes the result to `_next_report_at`. A refused call (no open window, percent checks, missing phase reason flag, missing `--cap-stage`) keeps its message and exit status but leaves `LAST_RESTART` at the call time and `NEXT_DUE` one interval later, so the notifier hold (`LAST_SENT > LAST_RESTART`) no longer skips the next slot. A restart that fails or finds no instance returns `None` and never changes the report.
 
 **Files:**
-- `scripts/production/unit_status.sh` — health check for every active run; marker-directory override; header comment.
-- `scripts/production/test_unit_status.py` — new: the status tests below.
-- `scripts/delegate/progress_history.py` — `_progress` restarts the notifier before any refusal.
-- `scripts/delegate/test_progress_history.py` — refused-report restart tests beside `test_the_clock_line_uses_the_restarted_unit_notifier` (line 685).
+- `scripts/production/unit_status.sh` — showrunner's per-unit status; tick health for every active run; marker-directory setting.
+- `scripts/production/test_unit_status.py` — runs a copy of the script in a temp tree with stub `py`, `sessions.py`, `notifier.sh`, idle `delegate_run.py`, and fake `tmux`/`pgrep` on `PATH`; covers idle failing (`TICKS FAILING (no instance)`), healthy, missing marker and empty marker.
+- `scripts/delegate/progress_history.py` — `_progress` restarts the notifier before reading state or refusing.
+- `scripts/delegate/test_progress_history.py` — two refused-report tests (missing `--cap-stage` on the dual layout, no open window after the pass closes) asserting failure plus `LAST_RESTART` at the call time and `NEXT_DUE` 15 minutes later.
+- `docs/as-built/session-notifier.md` — TICKS FAILING for idle units, `PLAN_DELEGATE_ACTIVE_DIR`, and the `progress` restart.
 
-**Seats:** 1 writer + 1 tester; the tests are concrete from the Spec alone.
-- `impl` — `scripts/production/unit_status.sh`, `scripts/delegate/progress_history.py`.
-- `test` — `scripts/production/test_unit_status.py` and the new methods in `scripts/delegate/test_progress_history.py`:
-  - `test_unit_status.py` copies `unit_status.sh` into a temp tree at `<tmp>/scripts/production/unit_status.sh` (its `REPO` is `${0:A:h:h:h}`) and puts stubs beside it: `scripts/lib/py` (execs `python3 "$@"`), `scripts/message/sessions.py` (prints a fixed session id for `id <pid>`), `scripts/message/notifier.sh` (records its argv to a file, then prints the health line and exits with the code the test sets), `scripts/hooks/delegate_run.py` (exits 1, idle). A temp `PATH` directory holds fake `tmux` (`has-session` exits 0, `capture-pane` prints a short pane with a `— holding: waiting on x` line) and `pgrep` (prints one pid). `PLAN_DELEGATE_ACTIVE_DIR` points at a temp marker directory. Cases: idle unit with health `failing: no instance` (exit 1) prints `TICKS FAILING (no instance)`; health `ok` (exit 0) prints no `TICKS FAILING`; no marker file means `notifier.sh` is never called; an empty marker file means the same.
-  - In `test_progress_history.py`, create the instance with `notifier.sh new` as the existing test does (`NOTIFIER_STATE_DIR` and `NOTIFIER_NOW_EPOCH` in a temp root), then run a `progress` call that is refused — once with no `--cap-stage` on the dual layout, once with no open window (after the pass closes) — and assert the command fails and the instance `state` has `LAST_RESTART` equal to the call time and `NEXT_DUE` equal to the call time plus 15 minutes.
-
-**Constraints from prior phases:** The `/screen_record` phase owns `commands/screen_record.md` and `scripts/screen_record/` only; this phase touches none of its files.
-- Tests never write `~/.local/state/notifier` or the real `/tmp/claude/delegate/active`, never run real `tmux`, ssh, rsync, gh, messages or pushes, and never kill processes they did not start.
-- Saved run output stays under a few GB; read each run and delete it before the next. A disk-floor sweeper keeps 500 GiB free on `/` by deleting every unit's build caches.
-
-**Acceptance gate:**
-- `python3 -m unittest discover -s scripts/production -p 'test_unit_status.py'` green.
-- `python3 -m unittest discover -s scripts/delegate -p 'test_progress_history.py'` green, including the refused-report restart tests.
-- `zsh -n scripts/production/unit_status.sh` clean.
-- `basedpyright scripts/production/test_unit_status.py scripts/delegate/progress_history.py scripts/delegate/test_progress_history.py` reports 0 errors and 0 warnings (the tool's own exit status is 3 in every checkout; the counts are the gate).
+**Gotchas:** A live check of `TICKS FAILING` prints nothing while every instance is healthy; prove the line with a temp `PLAN_DELEGATE_ACTIVE_DIR` whose marker names a run with no notifier instance. Tests point `PLAN_DELEGATE_ACTIVE_DIR` and `NOTIFIER_STATE_DIR` at temp directories and never touch the real marker or notifier state.
 
 ### Phase 3 — A Codex seat survives a refused turn: `systemError` means no live turn · status: todo
 

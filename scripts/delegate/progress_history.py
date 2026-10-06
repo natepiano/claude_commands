@@ -3557,6 +3557,7 @@ def _phase_count(args: argparse.Namespace) -> None:
 def _progress(args: argparse.Namespace) -> None:
     session_dir = _session_dir(args)
     now = _now_epoch()
+    notifier_due = _restart_unit_notifier(session_dir)
     state = _ensure_project_timing(session_dir, _read_state(session_dir), now)
     phase = _object_dict(state.get("phase"))
     # The reported window is a launcher's pass when one is open, and otherwise
@@ -3713,7 +3714,7 @@ def _progress(args: argparse.Namespace) -> None:
     phase_elapsed = max(0, int(now - _number(phase.get("started_at"), now)))
     pass_elapsed = max(0, int(now - _number(current_pass.get("started_at"), now)))
     total_elapsed = max(0, int(now - _number(state.get("project_started_at"), now)))
-    next_report_at = _next_report_at(session_dir, now, _restart_unit_notifier(session_dir))
+    next_report_at = _next_report_at(session_dir, now, notifier_due)
     event = _event(state, "progress_reported", now)
     event.update(
         {
