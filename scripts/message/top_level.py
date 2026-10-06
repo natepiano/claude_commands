@@ -14,6 +14,7 @@ and its start time still matches procStart, so a reused pid is not counted.
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import sys
 from collections.abc import Callable
@@ -30,6 +31,7 @@ class Session(TypedDict, total=False):
     procStart: str
     name: str
     tmux: str
+    sessionId: str
 
 
 def proc_start(pid: int) -> str | None:
@@ -48,28 +50,42 @@ def is_unit(tmux_target: str) -> bool:
     return result.returncode == 0 and result.stdout.startswith(f"{UNIT_MARK}=")
 
 
-def top_level(me: str, sessions_dir: Path = SESSIONS_DIR, unit: Callable[[str], bool] = is_unit) -> list[str]:
-    names: set[str] = set()
+def forwarded_sessions(me: str, sessions_dir: Path = SESSIONS_DIR, unit: Callable[[str], bool] = is_unit) -> list[tuple[str, str]]:
+    sessions: list[tuple[str, str]] = []
+    own_id = os.environ.get("CLAUDE_CODE_SESSION_ID", "")
     for path in sessions_dir.glob("*.json"):
         try:
             session = cast(Session, json.loads(path.read_text()))
         except (OSError, json.JSONDecodeError):
             continue
         name, pid = session.get("name", ""), session.get("pid")
-        if not name or name == me or pid is None or proc_start(pid) != session.get("procStart"):
+        session_id = session.get("sessionId", "")
+        if not name or not session_id or (session_id == own_id if own_id else name == me) or pid is None or proc_start(pid) != session.get("procStart"):
             continue
         tmux = session.get("tmux")
         if tmux and unit(tmux):
             continue
-        names.add(name)
-    return sorted(names)
+        sessions.append((name, session_id))
+    return sorted(sessions)
+
+
+def top_level(me: str, sessions_dir: Path = SESSIONS_DIR, unit: Callable[[str], bool] = is_unit) -> list[str]:
+    return sorted({name for name, _ in forwarded_sessions(me, sessions_dir, unit)})
 
 
 def main(argv: list[str]) -> int:
     if len(argv) != 2 or argv[0] != "--self" or not argv[1]:
         print(USAGE, file=sys.stderr)
         return 2
-    for name in top_level(argv[1]):
+    sessions_dir = Path(os.environ.get("NOTIFIER_SESSIONS_DIR", str(Path.home() / ".claude" / "sessions")))
+    recipients = forwarded_sessions(argv[1], sessions_dir)
+    hold_script = Path(__file__).resolve().parent.parent / "build_hold" / "build_hold.py"
+    for name, session_id in recipients:
+        result = subprocess.run([sys.executable, str(hold_script), "record-recipient", "--session-id", session_id, "--name", name], capture_output=True)
+        if result.returncode != 0:
+            print(f"could not record recipient {name} [{session_id}]", file=sys.stderr)
+            return 1
+    for name in sorted({name for name, _ in recipients}):
         print(name)
     return 0
 

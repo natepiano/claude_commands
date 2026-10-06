@@ -80,6 +80,7 @@ fi
 # option), and run() runs it plainly.
 BUILDLOG_RECORD="$HOME/.claude/scripts/buildlog/record.py"
 BUILDLOG_SCOPE_SH='exec 2>&3 3>&-; { : > "$0"; } 2>/dev/null || exit 125; "$@"; s=$?; cgroup="/sys/fs/cgroup$(sed -n "s/^0:://p" /proc/self/cgroup)"; cat "$cgroup/memory.peak" "$cgroup/memory.pressure" > "$0" 2>/dev/null; exit $s'
+source "$(dirname "${BASH_SOURCE[0]}")/memory_gate.sh"
 
 buildlog_now() {
     if [[ -n "${EPOCHREALTIME:-}" ]]; then
@@ -101,36 +102,6 @@ buildlog_begin() {
     if [[ "${BUILDLOG_SCOPE:-1}" != 0 && -S "${XDG_RUNTIME_DIR:-/nonexistent}/systemd/private" \
           && -r /proc/self/cgroup ]] && command -v systemd-run >/dev/null 2>&1; then
         BUILDLOG_PEAK="${TMPDIR:-/tmp}/buildlog.$$.$RANDOM.peak"
-    fi
-}
-
-buildlog_wait_for_memory() {
-    BUILDLOG_MEM_WAIT_S=0
-    local meminfo="${BUILDLOG_MEMINFO:-/proc/meminfo}"
-    local line available_kb started announced=0 interval="${BUILDLOG_MEM_POLL_S:-5}" limit="${BUILDLOG_MEM_WAIT_LIMIT_S:-900}"
-    [[ "$interval" =~ ^[0-9]+$ && "$interval" -gt 0 ]] || interval=5
-    [[ "$limit" =~ ^[0-9]+$ && "$limit" -ge 0 ]] || limit=900
-    while [[ -r "$meminfo" ]]; do
-        available_kb=""
-        while IFS= read -r line || [[ -n "$line" ]]; do
-            if [[ "$line" =~ ^MemAvailable:[[:space:]]+([0-9]+)[[:space:]]+kB[[:space:]]*$ ]]; then
-                available_kb="${BASH_REMATCH[1]}"
-                break
-            fi
-        done < "$meminfo" 2>/dev/null || break
-        [[ -n "$available_kb" ]] || break
-        (( 10#$available_kb < 12582912 )) || break
-        if (( announced == 0 )); then
-            started=$SECONDS
-            awk -v free="$available_kb" -v since="$(TZ=America/Los_Angeles date '+%H:%M %Z')" \
-                'BEGIN { printf "waiting for memory since %s: the machine has %.1f GiB free; a build starts at 12.0\n", since, free / 1048576 > "/dev/stderr" }'
-            announced=1
-        fi
-        (( SECONDS - started < limit )) || { echo 'memory wait limit reached after 15 min; starting anyway' >&2; break; }
-        sleep "$interval"
-    done
-    if (( announced != 0 )); then
-        BUILDLOG_MEM_WAIT_S=$(( SECONDS - started ))
     fi
 }
 
@@ -193,6 +164,7 @@ run_once() {
     buildlog_begin "$@" || true
     if buildlog_step_compiles "$@"; then
         buildlog_wait_for_memory
+        build_hold_mark MemoryGateReturned "$BUILDLOG_MEM_OUTCOME"
     fi
     if [[ -n "${BUILDLOG_START:-}" ]]; then
         buildlog_now

@@ -8,13 +8,14 @@ import subprocess
 import tempfile
 import unittest
 from pathlib import Path
-from typing import override
+from typing import cast, override
 
 
 SCRIPT = Path(__file__).with_name("dailies_render.py")
 HOLD_SCRIPT = SCRIPT.parent.parent / "build_hold" / "build_hold.py"
 AT = "2026-10-04T11:00"
 ZONE = "America/Los_Angeles"
+CYCLE_ID = "c" * 32
 
 
 def unit(held: bool) -> dict[str, object]:
@@ -45,11 +46,42 @@ class DailiesHoldTests(unittest.TestCase):
         (self.scratch / ".local/state/agent-notes").mkdir(parents=True)
         self.folder = self.scratch / "holders"
         self.folder.mkdir()
+        _ = (self.scratch / "meminfo").write_text("MemAvailable: 67108864 kB\n")
 
     def write_holder(self, name: str, since: str, purpose: str, release: str = "unknown") -> Path:
         path = self.folder / name
         _ = path.write_text(json.dumps({"holder": name, "since": since, "for": purpose, "release_eta": release}) + "\n")
         return path
+
+    def write_cycle(self, states: list[tuple[str, str]]) -> None:
+        release = self.scratch / "release"
+        directory = release / CYCLE_ID
+        directory.mkdir(parents=True)
+        _ = (release / "current").write_text(CYCLE_ID + "\n")
+        entries: list[dict[str, str]] = []
+        for index, (session_id, state) in enumerate(states):
+            entry = {
+                "session_id": session_id, "name": f"session {index + 1}", "state": state,
+            }
+            if state in {"DeliveryQueued", "DeliveryFailed"}:
+                entry["attempted_at"] = "2026-10-04T10:57:00-07:00"
+            elif state in {"ReleasedAwaitingAdmission", "NoAdmissionAck", "WaitingForMemory"}:
+                entry["released_at"] = "2026-10-04T10:57:00-07:00"
+            if state == "WaitingForMemory":
+                entry["wait_started_at"] = "2026-10-04T10:58:00-07:00"
+            if state == "MemoryGateReturned":
+                entry["wait_ended_at"] = "2026-10-04T10:59:30-07:00"
+                entry["outcome"] = "Granted"
+            entries.append(entry)
+        cycle: dict[str, object] = {
+            "id": CYCLE_ID,
+            "opened_at": "2026-10-04T10:55:00-07:00",
+            "release_started_at": "2026-10-04T10:57:00-07:00",
+            "holders": {"seat": {"since": "2026-10-04T10:56:00-07:00", "released_at": ""}},
+            "recipients": {session_id: f"session {index + 1}" for index, (session_id, _) in enumerate(states)},
+            "entries": entries,
+        }
+        _ = (directory / "cycle.json").write_text(json.dumps(cycle) + "\n")
 
     def run_script(self, script: Path, *arguments: str) -> subprocess.CompletedProcess[str]:
         return subprocess.run(
@@ -57,7 +89,13 @@ class DailiesHoldTests(unittest.TestCase):
             capture_output=True,
             text=True,
             check=False,
-            env={**os.environ, "HOME": str(self.scratch), "BUILD_HOLD_DIR": str(self.folder)},
+            env={
+                **os.environ,
+                "HOME": str(self.scratch),
+                "BUILD_HOLD_DIR": str(self.folder),
+                "BUILD_HOLD_RELEASE_DIR": str(self.scratch / "release"),
+                "BUILDLOG_MEMINFO": str(self.scratch / "meminfo"),
+            },
         )
 
     def report(self, held: bool, *, extra: dict[str, object] | None = None) -> subprocess.CompletedProcess[str]:
@@ -90,6 +128,58 @@ class DailiesHoldTests(unittest.TestCase):
         footer = self.assert_ok(self.footer())
         self.assertEqual([line for line in report if "build hold" in line], [])
         self.assertEqual([line for line in footer if "build hold" in line], [])
+
+    def test_release_directory_alone_is_not_a_holder(self) -> None:
+        self.write_cycle([("first", "DeliveryQueued")])
+        report = self.assert_ok(self.report(False))
+        footer = self.assert_ok(self.footer())
+        self.assertFalse(any("build hold" in line or "DeliveryQueued" in line for line in report))
+        self.assertFalse(any("build hold" in line or "DeliveryQueued" in line for line in footer))
+        status = self.run_script(HOLD_SCRIPT, "status")
+        self.assertEqual(status.stdout.strip(), "no build hold")
+        buildlog = SCRIPT.parent.parent / "buildlog"
+        checked = subprocess.run(
+            ["python3", "-c", "import rust_release; print(rust_release.build_hold_active())"],
+            capture_output=True, text=True, check=False,
+            env={**os.environ, "HOME": str(self.scratch), "PYTHONPATH": str(buildlog),
+                 "BUILD_HOLD_DIR": str(self.folder), "BUILD_HOLD_RELEASE_DIR": str(self.scratch / "release"),
+                 "BUILDLOG_MEMINFO": str(self.scratch / "meminfo")},
+        )
+        self.assertEqual(checked.returncode, 0, checked.stderr)
+        self.assertEqual(checked.stdout.strip(), "False")
+
+    def test_footer_and_report_name_each_release_state_before_agents(self) -> None:
+        _ = self.write_holder("seat", "2026-10-04T10:56:00-07:00", "the focused test")
+        self.write_cycle([
+            ("first", "MemoryGateReturned"), ("second", "AwaitingRelease"),
+            ("third", "DeliveryQueued"), ("fourth", "DeliveryFailed"),
+            ("fifth", "RecipientGone"),
+        ])
+        for lines in (self.assert_ok(self.report(True)), self.assert_ok(self.footer())):
+            hold_index = next(index for index, line in enumerate(lines) if line.startswith("build hold:"))
+            state_lines = [line for line in lines if any(state in line for state in (
+                "MemoryGateReturned", "AwaitingRelease", "DeliveryQueued", "DeliveryFailed", "RecipientGone",
+            ))]
+            self.assertEqual(len(state_lines), 5)
+            self.assertTrue(all(lines.index(line) > hold_index for line in state_lines))
+            self.assertTrue(any("next session 2 [second] at 11:00:30 PDT" in line for line in lines))
+
+    def test_footer_and_report_keep_hold_lines_when_release_record_is_damaged(self) -> None:
+        _ = self.write_holder("seat", "2026-10-04T10:56:00-07:00", "the focused test")
+        self.write_cycle([("first", "ReleasedAwaitingAdmission")])
+        path = self.scratch / "release" / CYCLE_ID / "cycle.json"
+        cycle = cast(dict[str, object], json.loads(path.read_text()))
+        entries = cast(list[dict[str, str]], cycle["entries"])
+        entries[0]["released_at"] = "broken"
+        _ = path.write_text(json.dumps(cycle) + "\n")
+        report = self.assert_ok(self.report(True))
+        footer = self.assert_ok(self.footer())
+        for lines in (report, footer):
+            hold_index = next(index for index, line in enumerate(lines) if line.startswith("build hold:"))
+            error_line = "release record could not be read: invalid released_at for first"
+            self.assertEqual([line.strip() for line in lines if error_line in line], [error_line])
+            self.assertLess(hold_index, next(index for index, line in enumerate(lines) if error_line in line))
+        self.assertLess(next(index for index, line in enumerate(report) if error_line in line), report.index("### Agents"))
 
     def test_legacy_holder_renders_unknown_release(self) -> None:
         _ = (self.folder / "old-seat").write_text("old seat, 2026-10-04T10:56:00-07:00, the focused test\n")
