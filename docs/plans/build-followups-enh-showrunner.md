@@ -41,7 +41,7 @@ Both phases were Phases 7 and 8 of stalls-unit's plan (`docs/plans/build-followu
 
 | Gate | Waiting | Waits on | Clears when |
 | --- | --- | --- | --- |
-| G1 | Phase 4 | stalls-unit Phase 6 | the showrunner merges it and says so |
+| G1 | Phase 4 | stalls-unit Phase 6 | the showrunner merges it and says so — cleared: `966b814` is on `build-followups` |
 
 ## Phases
 
@@ -86,56 +86,32 @@ A unit's `then` in the dailies input is a JSON list of one-line items, one per u
 
 ### Phase 3 — A unit commits its code before the shrink, and shrinks beside the next phase · status: done
 
-#### Work Order
+#### As-built
 
-Work only in worktree `/home/natepiano/worktrees/claude-build-followups-enh-showrunner`, branch `build-followups-enh-showrunner`. State every time in PDT.
+`docs/delegate/phase_end.md` defines <PhaseEnd/>, the one order a loop or verbose phase ends in: the code commit (<CheckpointCommit/>, with the phase `status: done` and its Work Order still in place), the code-ready notice, the plan review, the add-on check, worker cleanup and `finish-phase`, the next phase's launch, then the shrink beside the new seats, its own commit and a second notice. The other phase-end docs point to it in one line and keep only their own steps.
 
-**Source:** the user, 2026-10-06 ~15:25 PDT, typed in this unit's session: "when you're done i want you to make it so that in the phase end process for a unit, that when they reach the phase of finished and the only thing they're doing is shrinking i want it to now do a commit first, then tell its showrunner the code is ready, then shrink and commit, then tell the showrunner that the phase is done. this way a showrunner can use the committed work and unblock other sessions more rapidly and the shrink can happen in parallel with work that starts on the next phase (shrink and commit just the docs while other work is happening)". The showrunner (natedev, 15:3x PDT) placed it here as Phase 3 and gave this unit `commands/unit/delegate.md`, `commands/unit/checkpoint.md`, `docs/delegate/run_phase_review.md` and `docs/production_format.md`. The showrunner's side (`commands/showrunner/produce.md` <MergeCheckpoint/>) is a hub file under G1 and goes to Phase 5.
-
-**Goal:** in loop mode, a phase's code is committed, pushed and announced to the showrunner as soon as its code gates pass; the plan review then folds what was learned into the remaining Work Orders, the next phase's seats start, and the shrink runs beside them as a commit of the plan doc alone, announced with a short second notice.
-
-**Spec:**
-- **The new order** (`commands/unit/delegate.md` <ExecutionSteps/>), loop mode and inside an auto window: after <Synthesize/> converges and smoke and <UXReview/> pass —
-  1. <CheckpointCommit/>: the phase's code, its tests and the plan doc as it stands, with the phase marked `status: done`; the reservation release, <PushCheckpoint/> and the `review-trial` line as today.
-  2. The checkpoint notice (production_format item 3), unchanged; under a production its hash is mergeable at once. Outside a production, the one-line `Checkpoint <short hash> — phase N: <title>.` report.
-  3. <RunPhaseReview/>: the retrospective, the state audit, the architect review when a trigger fires, and the forward edits into the remaining Work Orders. The next phase waits for it, because its Work Order may change.
-  4. <ConsiderNextItems/>, then `finish-phase` for this phase.
-  5. <NextPhase/>: the next phase's <ComposeWorkOrder/>, reservation and launch, as today.
-  6. While the next phase's seats run: <RunPhaseShrink/> on this phase, under a `progress_history.py` activity labelled `shrink`; then the shrink commit; then the shrink notice; then this phase's `clear_phase_review.sh`. The turn then ends holding on the seats.
-  When no phase remains, steps 5 and 6 swap: the shrink and its commit come first, then <FinalGate/>. Verbose mode outside a window runs steps 1–4, then 6 without a next phase, then the post-phase report and gate; nothing starts before `continue`. `single` never commits and is unchanged.
-- **The shrink commit** (`commands/unit/checkpoint.md`, a new <ShrinkCommit/> beside <CheckpointCommit/>): stages only the plan doc and an approved `${NEXT_ITEMS_PATH}` change; refuses when any other path is staged; commits `shrink(<plan-slug>): phase N — <title>` with the session trailer; runs <PushCheckpoint/>. It owns no reservation and calls no release: in an enrolled repository the plan-doc edit is claimed on first touch by the next phase's reservation, like any other edit.
-- **The commit kinds** (<CoreContract/>): one checkpoint and one shrink commit per completed phase, plus the final-gate and as-built commits; the shrink commit is the only one made while seats run, and it touches only the plan doc.
-- **The two notices** (`docs/production_format.md` item 3): the checkpoint notice as today, sent before the plan review; then `From <unit>: phase <N> shrink <hash> — plan doc only.`, merged like any checkpoint whose only path is the unit's own plan doc, with no `review trial` or `design check` line. The checkpoint notice's `Phase <next> ETA` counts from the code commit.
-- **Shrink placement** (`docs/delegate/run_phase_review.md`): <RunPhaseReview/> runs after the checkpoint notice and before the next phase's <ComposeWorkOrder/>; <RunPhaseShrink/> runs after the next phase's launch and before the shrink commit. Its rule that remaining `todo` phases keep the plan review's forward edits holds; the phase the seats are running is one of them.
-- **One doc holds the order** (the user, ~15:50 PDT, via the showrunner: "if 3 files share the same insructions, shouldn't those instructions be in their own file, reerenced by the skill? we have precedent for this"; the showrunner: write it once in a new doc). `docs/delegate/phase_end.md` defines <PhaseEnd/>: the code commit and its "code ready" notice, the plan review, the add-on check, worker cleanup and `finish-phase`, the next launch, the shrink beside the seats with its plan-doc-only commit and notice, the no-next-phase and verbose variants, and the routes below. `commands/unit/delegate.md`, `commands/unit/checkpoint.md`, `commands/unit/add_ons.md`, `commands/plan/shrink.md`, `commands/plan/phase_review.md`, `docs/delegate/run_phase_review.md` and `docs/production_format.md` each point to it in one line and keep only their own steps. Precedents: `docs/decision_criteria.md` and `docs/production_format.md`.
-- **Routes after the code commit** (the showrunner approved, ~16:10 PDT): a defect the plan review finds in the committed phase becomes a follow-up phase inserted next and run next; source-comment edits the review makes go into the next phase's checkpoint commit.
-- **Compaction and failure** (<CompactionContract/>, <RetainDelegatedPhaseReservation/>): a handoff written while a shrink is pending names that phase. A shrink that fails its structural check blocks only the shrink commit; the seats keep running, and the unit director repairs the shrink before the next checkpoint, which refuses while an earlier phase still has a Work Order.
+- <ShrinkCommit/> (`commands/unit/checkpoint.md`) stages only the plan doc and an approved next-items file, refuses any other staged path, commits `shrink(<plan-slug>): phase N — <title>`, runs <PushCheckpoint/>, and owns no reservation.
+- The shrink notice is `From <unit>: phase <N> shrink <hash> — plan doc only.`, or `— plan doc and <next-items path>.`; the showrunner merges it with no review-ledger row and no CI count.
+- Variants: no next phase runs the shrink, then <FinalGate/>; a due <PeriodicCI/> point outside a production runs the shrink before the launch, so CI sees a clean tree; verbose outside a window shrinks, then reports and gates.
+- A defect the plan review finds in the committed phase becomes a follow-up phase run next; the review's source-comment edits go into the next phase's checkpoint, or the final-gate commit when no phase is left.
+- A failed shrink blocks only <ShrinkCommit/>; the next checkpoint refuses while an earlier `done` phase still has a Work Order.
 
 **Files:**
-- `commands/unit/delegate.md` — <ExecutionSteps/>, <CoreContract/>, <NextPhase/>, <PhaseCleanup/>, <RecordPhaseCompletion/>, <CompactionContract/>.
-- `commands/unit/checkpoint.md` — <ShrinkCommit/>; <CheckpointCommit/> step 2 and step 8's report.
-- `docs/delegate/run_phase_review.md` — where the review and the shrink run.
+- `docs/delegate/phase_end.md` — <PhaseEnd/>.
+- `commands/unit/delegate.md` — the <PhaseEnd/> stub and row; loop and verbose <ExecutionSteps/> call it.
+- `commands/unit/checkpoint.md` — <ShrinkCommit/>; <CheckpointCommit/> step 2's accepted paths and refusal.
 - `docs/production_format.md` — item 3's two notices.
-- `docs/delegate/phase_end.md` — new; <PhaseEnd/>.
-- `commands/unit/add_ons.md` — <ConsiderNextItems/> runs after the plan review and before the shrink.
-- `commands/plan/shrink.md` — the shrink follows the code commit; plus the four wording swaps from the live checkout's uncommitted edit.
-- `commands/plan/phase_review.md` — the review follows the code commit; the two routes above.
+- `docs/delegate/run_phase_review.md`, `commands/unit/add_ons.md`, `commands/plan/shrink.md`, `commands/plan/phase_review.md`, `docs/delegate_plan_format.md`, `commands/unit/eta_breakdown.md`, `docs/delegate/final_gate_commit.md` — the pointer line and their own steps in the new order.
 
-**Seats:** 2 writers.
-- `impl` — `commands/unit/delegate.md`; post `done` without waiting for the other seat.
-- `test` — opens as a writer: `commands/unit/checkpoint.md`, `docs/delegate/run_phase_review.md`, `docs/production_format.md`; agree each tag name with `impl` by message before writing it, and post it on the board.
+**Binds later work:** the showrunner's merge script takes a shrink notice with `--shrink`: plan doc and next-items file only, after the same phase's code checkpoint, no package tests and no review-ledger row.
 
-**Constraints from prior phases:**
-- Phase 5 (todo) teaches `merge_checkpoint.py` and <MergeCheckpoint/> the shrink notice; until it lands, the showrunner merges a shrink commit through the ordinary steps, which already pass a change whose only path is the unit's plan doc.
-- Every tag a call site names keeps a definition; a contract moved between files keeps its stub row in <TagReferenceContract/>.
+**Gotchas:** in an enrolled repository the shrink's first plan-doc write goes through the Edit tool; a write from a script is never claimed by the first-touch hook.
 
-**Acceptance gate:**
-- `grep -n "ShrinkCommit\|shrink(" commands/unit/delegate.md commands/unit/checkpoint.md docs/delegate/run_phase_review.md docs/production_format.md` shows the contract, its call sites and the commit kind; every `<Tag/>` the four files name has one definition (a script listing names against `<Tag>` openings, in the summary).
-- Live: this unit's next completed phase runs the new order, and its two notices reach natedev.
+**Ruled out:** teaching `produce.md` the shrink notice here — it is the showrunner's file, and the merge-checkpoint phase owns it.
 
 ### Phase 4 — A unit can wait on standby, and promote and produce use the command · status: todo
 
-**Blocked by:** G1 — stalls-unit phase 6 merged into `build-followups`
+**Blocked by:** G1 — stalls-unit phase 6 merged into `build-followups` (cleared: `966b814`, merged into this branch as `86a9b19`)
 
 #### Work Order
 
@@ -184,20 +160,26 @@ Work only in worktree `/home/natepiano/worktrees/claude-build-followups-enh-show
 
 **Source:** the user, 2026-10-06 14:1x PDT, through the showrunner (natedev): "right - everything that can be scripted should be scripted so the showrunner has the least amount of things to remember". The script, its steps and the audit are the showrunner's packaging of that ask, placed in this plan as its merge-checkpoint phase.
 
-**Goal:** `merge_checkpoint.py --production <doc> <unit> <phase> <hash> [--also <path>…]` runs `produce.md` <MergeCheckpoint/>'s mechanical steps in one run, prints one result line per step and the message to send the unit, and on red leaves the merge branch as it was; <MergeCheckpoint/> keeps only the judgment steps and the call. The As-built lists every other step in `produce.md` and `commands/showrunner/dailies.md` the showrunner must remember, each with a script-or-not verdict, and each clear one becomes a follow-up phase.
+**Goal:** `merge_checkpoint.py --production <doc> <unit> <phase> <hash> [--also <path>…] [--shrink]`, with the record arguments below, runs `produce.md` <MergeCheckpoint/>'s mechanical steps in one run, prints one result line per step and the message to send the unit, and on red leaves the merge branch as it was; <MergeCheckpoint/> keeps only the judgment steps and the call. The As-built lists every other step in `produce.md` and `commands/showrunner/dailies.md` the showrunner must remember, each with a script-or-not verdict, and each clear one becomes a follow-up phase.
 
 **Spec:**
 - **Reads** from the production doc what <MergeCheckpoint/> reads: `MERGE_BRANCH`, `CHECKOUT`, `LOG`, `ZONE`, the unit's Units row (branch, Owns), the hub-file rows, **Merge tests**, and the production rules that decide the push. `LAST_MERGED[unit]` comes from the merge subjects on `MERGE_BRANCH` (`Merge <unit> phase <N> (<short>) into <merge branch>`), never from an argument. Two optional doc fields make the push explicit: **Push:** `validate_and_push` (the default, <MergeCheckpoint/> step 10) or `git`; **Promote:** `<checkout>[, mac <path>]` (after a push, fast-forward that checkout's `main` and pull on the Mac). This production's doc carries `**Push:** git` and `**Promote:** ~/.claude, mac ~/.claude` (the showrunner, 2026-10-06). **Known flakes:** names packages whose red-then-green-alone run counts green.
+- **Named states at the reader boundary:** the push is `ValidateAndPush | GitPush`, the promotion `NoPromotion | PromoteTo(<checkouts>, <mac path or none as its own state>)`, the unit's history `FirstMerge | LastMerged(<hash>)`, the kind `CodeCheckpoint | ShrinkCommit`. `production_field` raises on a missing field, so an optional field is read by a reader that returns its absent state; no `str | None` passes the boundary.
+- **Arguments for the record:** `--review-trial "<the notice's line>"` (required for a code checkpoint) gives `--ux-findings`, `--code-findings`, `--review-minutes`, `--ux-check-minutes` and `--ux-repair-minutes`; `--started <ISO>` (required); `--regime after|trial` (default `after`; `trial` when the unit's broad review ran the `craft` lens); `--holds` and `--merge-defects` (default 0, the showrunner counts them from `LOG`); `--excluded "<why>"` passed through (`"no merge design check"` for a phase no merge design check judged). `--merged` is the merge commit's time.
 - **Steps,** each printing `<step>: ok|held|failed — <one line>`; the first `held` or `failed` stops the run:
-  1. ancestry (`cat-file -e`; `merge-base --is-ancestor LAST_MERGED <hash>`, skipped on a unit's first merge) and on-origin (`fetch origin <branch>`, `--is-ancestor <hash> origin/<branch>`; failing prints the message asking the unit to push);
+  1. ancestry (`cat-file -e`; `merge-base --is-ancestor LAST_MERGED <hash>`, skipped on a unit's first merge; a hash already on `MERGE_BRANCH`, a re-run after a failed promote, skips steps 2–7 and resumes at the first step-8 destination not yet reached) and on-origin (`fetch origin <branch>`, `--is-ancestor <hash> origin/<branch>`; failing prints the message asking the unit to push);
   2. scope: every path of `diff --name-only <merge branch>...<hash>` is in Owns, a hub row of this unit, or an `--also` path; anything else is `held` with the paths and the message asking the unit why;
   3. conflicts: `merge-tree --write-tree --name-only` exit 1 is `held` with the message asking the unit to merge the merge branch and send a new hash;
   4. other units (data only, never a stop): for each other unit, the overlap of this change's paths with its branch diff and its worktree's `status --short`, printed so the showrunner applies <CrossUnitChange/> or the one-line notice;
   5. merge: the message file `<scratch>/merge_<short>.msg` as <MergeCheckpoint/> step 7 writes it, with this session's attribution lines passed by `--trailer`, then `merge --no-ff -q -F`;
   6. test: each package owning a changed file (nearest `Cargo.toml`) through `verify.sh test`, each changed example through `verify.sh example`, then each **Merge tests** command, one after another into `<scratch>/merge_<short>_test.log` with a `<name>_EXIT=<rc>` line each;
   7. red: each red package rerun once alone; green alone and listed in **Known flakes** continues with a LOG note; otherwise `reset --keep HEAD~1` after checking `HEAD` is this unpushed merge, and print the message with the failing tests and the log path;
-  8. green, `Push: git`: merge `origin/main` with `--no-ff` when it has diverged, push `MERGE_BRANCH`, then each **Promote**: `git -C <checkout> merge --ff-only <merge hash>` (other sessions' uncommitted files left alone; a refusal is `failed` naming the paths, nothing undone), push main only when `origin/main..main` held no other session's commits, then the Mac's `git pull --ff-only` over `ssh mac`, read by the `rc=` it prints (ssh's own status is always 0); `Push: validate_and_push`: <MergeCheckpoint/> step 10's command and its undo;
-  9. record: `review_regime.py add` with the numbers from `--review-trial "<the notice's line>"`, `--holds` and `--merge-defects` (default 0), `--started`, and the merge time; then the LOG line `- HH:MM <zone>: <unit> phase <N> (<hash>) merged as <merge hash>; <tests> green; pushed[; promoted]`.
+  8. green, `Push: git`: merge `origin/main` with `--no-ff` when it has diverged, push `MERGE_BRANCH`, then each **Promote**: `git -C <checkout> merge --ff-only <the tip pushed to MERGE_BRANCH>` (after any `origin/main` merge, never the earlier checkpoint merge) (other sessions' uncommitted files left alone; a refusal is `failed` naming the paths, nothing undone), push main only when `origin/main..main` held no other session's commits, then the Mac's `git pull --ff-only` over `ssh mac`, read by the `rc=` it prints (ssh's own status is always 0); `Push: validate_and_push`: <MergeCheckpoint/> step 10's command and its undo;
+  9. record: `review_regime.py add --unit --phase --regime --started --merged --holds --merge-defects` plus the five numbers from `--review-trial` and any `--excluded`, from the arguments above; then the LOG line `- HH:MM <zone>: <unit> phase <N> (<hash>) merged as <merge hash>; <tests> green; pushed[; promoted]`.
+- **The merge report** (the user, 2026-10-06 ~15:35 PDT, relayed by this unit; the showrunner placed it here, 16:4x PDT: "when a showrunner receives a phase completion and it merges in work, it should provide an update of where it merged because often merges go into more than one worktree - it shoudl say why it merged it into that worktree and what it unblocks by doing so"). As step 8 reaches each place the merge went, the script prints its line, `into: <path> (<branch>) — <why>; unblocks: <what>`, so a run that fails after the push still names every place it reached:
+  - the merge branch's checkout: why `the merge branch collects every unit's checkpoints`; unblocks each gate in the production doc's **Gates** table whose **Waits on** is this unit's phase, with the unit and phase it holds (`G1: enh-showrunner-unit Phase 4`), else `no gate`. Only a code checkpoint's first merge clears a gate: a shrink and a re-run print `no gate`;
+  - each **Promote** checkout, the Mac included: why `sessions on <machine> run the installed commands from it`; unblocks `the live gate of <unit> phase <N>`.
+  <MergeCheckpoint/>'s report to the user carries these lines, plus one line in the same form for each unit worktree the showrunner then merges the merge branch into.
 - The last line printed is `send <unit>: <message>`: the merged line with the next step, or the hold or failure and what the unit does.
 - `commands/showrunner/produce.md` <MergeCheckpoint/>: steps 1–3 and 7–10 and the record step become the call, run in the background; steps 4–6 (other units, new public items, design check), <ClearGate/>, <CrossUnitChange/>, <CIPoint/> and `review_regime.py watch` stay the showrunner's, read from the script's lines.
 - **The audit:** every other step in `produce.md` and `commands/showrunner/dailies.md` the showrunner must remember — building the dailies input from `unit_status.sh`, the idle check, promotion and the Mac pull included — one row each: the step, where it lives, `script` or `judgment`, and why. Written into this phase's As-built; each `script` row the unit director turns into a follow-up phase with its own Work Order.
@@ -209,7 +191,7 @@ Work only in worktree `/home/natepiano/worktrees/claude-build-followups-enh-show
 
 **Seats:** 1 writer + 1 tester.
 - `impl` — `scripts/production/merge_checkpoint.py`, `commands/showrunner/produce.md`; post `done` without waiting for the test seat.
-- `test` — `scripts/production/test_merge_checkpoint.py` from the Spec alone, with real `git` in temporary repositories and a temporary bare `origin`, stubs on `PATH` for `verify.sh`, `validate_and_push.sh`, `review_regime.py` and `ssh` recording argv: each step's `held` and `failed` cases with no merge left behind; a red package reset and a known flake continuing; the green `git` path merging diverged `origin/main`, pushing, promoting a second temporary checkout by fast-forward and reading the Mac's `rc=`; a promote refused by an uncommitted file fails without undoing the push; the record call's argv and the LOG line. Owns the final suite run. Then the audit table, in its summary.
+- `test` — `scripts/production/test_merge_checkpoint.py` from the Spec alone, with real `git` in temporary repositories and a temporary bare `origin`, stubs on `PATH` for `verify.sh`, `validate_and_push.sh`, `review_regime.py` and `ssh` recording argv: each step's `held` and `failed` cases with no merge left behind; a red package reset and a known flake continuing; the green `git` path merging diverged `origin/main`, pushing, promoting a second temporary checkout by fast-forward and reading the Mac's `rc=`; a promote refused by an uncommitted file fails without undoing the push; the record call's argv and the LOG line; the `into:` lines, with a gate the merge clears and with none, and one per **Promote** checkout; the record call's full real argv; a promote that fails after the push prints the `into:` lines reached, and a re-run resumes at that promote; the promote fast-forwards to the pushed tip after a diverged `origin/main` merge; `--shrink` with the plan doc and the next-items file merges, and is `held` when another path is staged or the phase's code checkpoint has not merged. Owns the final suite run. Then the audit table, in its summary.
 
 **Constraints from prior phases:**
 - A shrink notice (`From <unit>: phase <N> shrink <hash> — plan doc only.`, or `— plan doc and <next-items path>.`) merges with no review-ledger row and no CI count (the showrunner, 16:2x PDT, doing it by hand until this lands).
@@ -217,7 +199,7 @@ Work only in worktree `/home/natepiano/worktrees/claude-build-followups-enh-show
 - Phase 4 (as built at its merge): it edits `produce.md` <LaunchUnits/>; this phase edits <MergeCheckpoint/>. Starts beside Phase 4 once Phase 1 merges, claiming `produce.md` after it.
 - Tests never push anywhere but a temporary bare repository, never run real `ssh`, and never write the real `~/.claude` checkout or `~/.local/state/`.
 - Only the showrunner merges (production_format item 4): the live gate is natedev's.
-- Phase 3 (as built at its merge): a unit sends a second notice, `From <unit>: phase <N> shrink <hash> — plan doc only.`, for a commit whose only path is its plan doc. `merge_checkpoint.py` takes it with `--shrink`: ancestry, scope (the plan doc alone, else `held`), conflicts, merge and push, with no package tests and no `review_regime.py add`; <MergeCheckpoint/> names the call. Runs after Phase 3.
+- Phase 3 (as built at its merge): a unit sends a second notice, `From <unit>: phase <N> shrink <hash> — plan doc only.`, for a commit whose only path is its plan doc. `merge_checkpoint.py` takes it with `--shrink`: ancestry, scope (the plan doc and, when present, the unit's `<plan stem>-next.md`, else `held`), `held` until the same phase's code checkpoint is on `MERGE_BRANCH` (its `Merge <unit> phase <N> (` subject), conflicts, merge and push, with no package tests and no `review_regime.py add`; <MergeCheckpoint/> names the call. Runs after Phase 3.
 
 **Acceptance gate:**
 - From the worktree root, `python3 -m unittest discover -s scripts/production -p 'test_merge_checkpoint.py'` green; basedpyright 0 errors and 0 warnings on the changed `.py` files.
