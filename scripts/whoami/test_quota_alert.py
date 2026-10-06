@@ -10,7 +10,7 @@ import time
 import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import override
+from typing import cast, override
 from unittest import mock
 
 import quota_alert
@@ -49,6 +49,13 @@ opus=low,medium,high,xhigh,max
 sonnet=low,medium,high
 """
 
+REAL_RECIPIENTS = quota_alert.recipients
+
+
+def configured_recipients(config: quota_alert.Config, here: str | None = None) -> list[str]:
+    del config
+    return [name for name in ("natedev", "boss of bosses") if name != here]
+
 
 class QuotaAlertTests(unittest.TestCase):
     def __init__(self, methodName: str = "runTest") -> None:
@@ -64,9 +71,14 @@ class QuotaAlertTests(unittest.TestCase):
         directory = tempfile.TemporaryDirectory()
         self.addCleanup(directory.cleanup)
         self.root = Path(directory.name)
-        config = self.root / "quota_alert.json"
+        config = self.root / "showrunners.json"
         _ = config.write_text(json.dumps({"threshold_percent": 1, "repeat_minutes": 30,
-                                          "notify": ["natedev", "boss of bosses"]}))
+                                          "stall_minutes": 5, "faults_to": "natedev", "always": ["natedev"],
+                                          "showrunners": [
+                                              {"session": "natedev", "zone": "America/Los_Angeles", "units": []},
+                                              {"session": "boss of bosses", "zone": "America/Los_Angeles",
+                                               "units": []},
+                                          ]}))
         registry = self.root / "agents.conf"
         _ = registry.write_text(REGISTRY)
         for name, value in (("CONFIG", config), ("STATE", self.root / "state.json"), ("relay", self.relay),
@@ -74,6 +86,9 @@ class QuotaAlertTests(unittest.TestCase):
             patcher = mock.patch.object(quota_alert, name, value)
             _ = patcher.start()
             self.addCleanup(patcher.stop)
+        recipients_patch = mock.patch.object(quota_alert, "recipients", configured_recipients)
+        _ = recipients_patch.start()
+        self.addCleanup(recipients_patch.stop)
         # A fresh sync stamp and no Codex config keep agents_config.sh from syncing the catalog into the fixture.
         synced = self.root / "catalog synced"
         synced.touch()
@@ -106,6 +121,10 @@ class QuotaAlertTests(unittest.TestCase):
         note = read_note(path)
         assert note is not None
         return note
+
+    def test_quota_config_uses_shared_showrunner_settings(self) -> None:
+        self.assertEqual(quota_alert.Config.__module__, "scripts.production.showrunners")
+        self.assertEqual(quota_alert.load_settings.__module__, "scripts.production.showrunners")
 
     def test_repeats_to_every_recipient_until_acknowledged(self) -> None:
         notes: Notes = [self.note("codex 1.md", "active", "1")]
@@ -155,6 +174,43 @@ class QuotaAlertTests(unittest.TestCase):
         self.assertNotIn("claude 2", text)
         _ = self.recipients()
         self.assertEqual(quota_alert.alert(notes, self.now + timedelta(hours=1)), [])
+
+    def test_always_then_showrunners_receive_alert_restored_and_echo_once_by_name(self) -> None:
+        config = quota_alert.CONFIG
+        content = cast(dict[str, object], json.loads(config.read_text()))
+        runners = cast(list[dict[str, object]], content["showrunners"])
+        runners.append({"session": "new director", "zone": "America/Los_Angeles", "units": []})
+        _ = config.write_text(json.dumps(content))
+        with mock.patch.object(quota_alert, "recipients", REAL_RECIPIENTS):
+            low_note = self.note("claude 2.md", "active", "0")
+            expected = ["natedev", "boss of bosses", "new director"]
+            self.assertEqual(quota_alert.recipients(quota_alert.load_config()), expected)
+            _ = quota_alert.alert([low_note], self.now)
+            self.assertCountEqual([recipient for recipient, _ in self.sent], expected)
+            _ = self.recipients()
+            _ = quota_alert.alert([self.note("claude 2.md", "active", "100")], self.now + timedelta(minutes=2))
+            self.assertCountEqual([recipient for recipient, _ in self.sent], expected)
+            _ = self.recipients()
+            _ = quota_alert.tell_others("user action", "natedev")
+            self.assertCountEqual([recipient for recipient, _ in self.sent], ["boss of bosses", "new director"])
+
+    def test_always_recipient_survives_removal_of_its_showrunner_entry(self) -> None:
+        config = quota_alert.CONFIG
+        content = cast(dict[str, object], json.loads(config.read_text()))
+        runners = cast(list[dict[str, object]], content["showrunners"])
+        content["showrunners"] = [runner for runner in runners if runner["session"] != "natedev"]
+        _ = config.write_text(json.dumps(content))
+        with mock.patch.object(quota_alert, "recipients", REAL_RECIPIENTS):
+            self.assertEqual(quota_alert.recipients(quota_alert.load_config()), ["natedev", "boss of bosses"])
+            _ = quota_alert.alert([self.note("claude 2.md", "active", "0")], self.now)
+            self.assertCountEqual([recipient for recipient, _ in self.sent], ["natedev", "boss of bosses"])
+            _ = self.recipients()
+            _ = quota_alert.alert([self.note("claude 2.md", "active", "100")],
+                                  self.now + timedelta(minutes=2))
+            self.assertCountEqual([recipient for recipient, _ in self.sent], ["natedev", "boss of bosses"])
+            _ = self.recipients()
+            _ = quota_alert.tell_others("user action", "boss of bosses")
+            self.assertEqual([recipient for recipient, _ in self.sent], ["natedev"])
 
     def test_switch_to_a_low_account_is_not_a_restore(self) -> None:
         _ = quota_alert.alert([self.note("codex 1.md", "active", "0")], self.now)
@@ -222,12 +278,18 @@ class QuotaAlertTests(unittest.TestCase):
     def test_current_session_is_found_up_the_process_tree(self) -> None:
         sessions = self.root / "sessions"
         sessions.mkdir()
-        with mock.patch.object(quota_alert, "SESSIONS", sessions):
+        parent = os.getppid()
+        grandparent = parent + 1000
+        with mock.patch.object(quota_alert, "SESSIONS", sessions), mock.patch.object(
+            subprocess, "run", side_effect=[
+                subprocess.CompletedProcess(["ps"], 0, str(grandparent), ""),
+                subprocess.CompletedProcess(["ps"], 0, "1", ""),
+                subprocess.CompletedProcess(["ps"], 0, str(grandparent), ""),
+            ]
+        ):
             self.assertIsNone(quota_alert.current_session())
             # Two levels up, so the walk past a parent with no session file is exercised.
-            found = subprocess.run(["ps", "-o", "ppid=", "-p", str(os.getppid())], capture_output=True, text=True,
-                                   check=True)
-            _ = (sessions / f"{int(found.stdout)}.json").write_text(json.dumps({"name": "boss of bosses"}))
+            _ = (sessions / f"{grandparent}.json").write_text(json.dumps({"name": "boss of bosses"}))
             self.assertEqual(quota_alert.current_session(), "boss of bosses")
 
     def test_inactive_above_threshold_unknown_or_reset_notes_are_quiet(self) -> None:

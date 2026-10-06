@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Message the sessions named in quota_alert.json about agent accounts' weekly quota.
+"""Message configured sessions about weekly quota.
 
 The receiver's protocol -- three notices, what each asks -- is ~/.claude/docs/quota_alerts.md.
 
@@ -48,7 +48,19 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import NamedTuple, NotRequired, Protocol, TypedDict, cast
 
-CONFIG = Path(__file__).with_name("quota_alert.json")
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+# Direct script execution and unittest discovery import this as a top-level module.
+if __package__ in (None, ""):
+    __package__ = "scripts.whoami"
+
+from ..production.showrunners import (
+    CONFIG as CONFIG,
+    ShowrunnerSettings as ShowrunnerSettings,
+    load_settings as load_settings,
+)
+
+
+Config = ShowrunnerSettings
 STATE = Path(os.environ.get("XDG_STATE_HOME") or Path.home() / ".local" / "state") / "quota_alert.json"
 SEND = Path(__file__).resolve().parent.parent / "message" / "send.py"
 SESSIONS = Path.home() / ".claude" / "sessions"
@@ -66,12 +78,6 @@ KILL_GRACE = 10
 # The whole switch took 2 s of wall time when measured idle and 8 s at load average 87; each entry
 # switched back, 0.4 s idle.
 EDIT_TIMEOUT = 30
-
-
-class Config(TypedDict):
-    threshold_percent: float
-    repeat_minutes: float
-    notify: list[str]
 
 
 class Episode(TypedDict):
@@ -127,7 +133,13 @@ class Job(NamedTuple):
 
 
 def load_config() -> Config:
-    return cast(Config, json.loads(CONFIG.read_text(encoding="utf-8")))
+    return load_settings(CONFIG)
+
+
+def recipients(config: Config, here: str | None = None) -> list[str]:
+    """Keep configured names even when their sessions are currently offline."""
+    names = [*config["always"], *(runner["session"] for runner in config["showrunners"])]
+    return list(dict.fromkeys(name for name in names if name != here))
 
 
 @contextmanager
@@ -405,7 +417,7 @@ def alert(notes: list[AgentNote], now: datetime | None = None) -> list[str]:
                 continue
             switch = state.get("switch") if note.tool == "codex" else None
             text = message(note, notes, config, switch, episode.get("switch_failed"))
-            for recipient in config["notify"]:
+            for recipient in recipients(config):
                 last = episode["last"].get(recipient)
                 if last is None or now - datetime.fromisoformat(last) >= repeat:
                     jobs.append(Job(name, recipient, text, "alert"))
@@ -418,7 +430,7 @@ def alert(notes: list[AgentNote], now: datetime | None = None) -> list[str]:
         if accounts:
             text = restored_message(accounts, f"the {name} alert is closed", threshold,
                                     back if tool == "codex" else None)
-            jobs += [Job(name, recipient, text, "restored") for recipient in config["notify"]]
+            jobs += [Job(name, recipient, text, "restored") for recipient in recipients(config)]
     errors = deliver(jobs)
     with state_file() as state:
         for job, error in zip(jobs, errors):
@@ -469,7 +481,7 @@ def current_session() -> str | None:
 
 def tell_others(text: str, here: str | None) -> list[str]:
     """Echo a user's act to every configured session except `here`, the one it was done in."""
-    others = [recipient for recipient in load_config()["notify"] if recipient != here]
+    others = recipients(load_config(), here)
     errors = deliver([Job("", recipient, text, "echo") for recipient in others])
     return [f"told {recipient}" if error is None else f"could not tell {recipient}: {error}"
             for recipient, error in zip(others, errors)]
