@@ -727,6 +727,124 @@ class ProgressHistoryTests(unittest.TestCase):
         self.assertEqual(state["LAST_RESTART"], str(report_at))
         self.assertEqual(state["NEXT_DUE"], str(report_at + 15 * 60))
 
+    def test_missing_cap_stage_restarts_unit_notifier(self) -> None:
+        started_at = 50_000
+        report_at = started_at + 100
+        session_dir = self.start_run("refused-cap-stage", started_at)
+        self.start_phase_and_pass(session_dir, started_at)
+        state_dir = self.root / "notifier"
+        environment = os.environ.copy()
+        environment["NOTIFIER_STATE_DIR"] = str(state_dir)
+        environment["NOTIFIER_NOW_EPOCH"] = str(started_at)
+        environment["TZ"] = "UTC"
+        _ = subprocess.run(
+            [
+                "zsh",
+                str(SCRIPT.parents[1] / "message" / "notifier.sh"),
+                "new",
+                f"delegate-{session_dir.name}",
+                "--to",
+                "session:test-claude-session",
+                "--every",
+                "15",
+                "--command",
+                "/unit:report",
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+            env=environment,
+        )
+        with patch.dict(
+            os.environ,
+            {"NOTIFIER_STATE_DIR": str(state_dir), "NOTIFIER_NOW_EPOCH": str(report_at)},
+        ):
+            result = self.run_failing_command(
+                "progress",
+                "--session-dir",
+                str(session_dir),
+                "--project-raw-percent",
+                "40",
+                "--project-percent",
+                "40",
+                "--phase-raw-percent",
+                "40",
+                "--phase-percent",
+                "40",
+                "--activity",
+                "implementing",
+                at=report_at,
+            )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("--cap-stage is required", result.stderr)
+        state = dict(
+            line.split("=", 1)
+            for line in (state_dir / f"delegate-{session_dir.name}" / "state")
+            .read_text(encoding="utf-8")
+            .splitlines()
+        )
+        self.assertEqual(state["LAST_RESTART"], str(report_at))
+        self.assertEqual(state["NEXT_DUE"], str(report_at + 15 * 60))
+
+    def test_closed_window_restarts_unit_notifier(self) -> None:
+        started_at = 20_000
+        report_at = started_at + 100
+        session_dir = self.start_run("refused-window", started_at)
+        self.start_phase_and_pass(session_dir, started_at)
+        _ = self.run_command(
+            "finish-phase",
+            "--session-dir",
+            str(session_dir),
+            "--status",
+            "completed",
+            at=started_at + 60,
+        )
+        state_dir = self.root / "notifier"
+        environment = os.environ.copy()
+        environment["NOTIFIER_STATE_DIR"] = str(state_dir)
+        environment["NOTIFIER_NOW_EPOCH"] = str(started_at)
+        environment["TZ"] = "UTC"
+        _ = subprocess.run(
+            [
+                "zsh",
+                str(SCRIPT.parents[1] / "message" / "notifier.sh"),
+                "new",
+                f"delegate-{session_dir.name}",
+                "--to",
+                "session:test-claude-session",
+                "--every",
+                "15",
+                "--command",
+                "/unit:report",
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+            env=environment,
+        )
+        with patch.dict(
+            os.environ,
+            {"NOTIFIER_STATE_DIR": str(state_dir), "NOTIFIER_NOW_EPOCH": str(report_at)},
+        ):
+            result = self.run_failing_command(
+                "progress",
+                "--session-dir",
+                str(session_dir),
+                "--activity",
+                "implementing",
+                at=report_at,
+            )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("No open window to report", result.stderr)
+        state = dict(
+            line.split("=", 1)
+            for line in (state_dir / f"delegate-{session_dir.name}" / "state")
+            .read_text(encoding="utf-8")
+            .splitlines()
+        )
+        self.assertEqual(state["LAST_RESTART"], str(report_at))
+        self.assertEqual(state["NEXT_DUE"], str(report_at + 15 * 60))
+
     def run_progress(self, session_dir: Path, at: int) -> str:
         return self.run_command(
             "progress",

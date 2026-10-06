@@ -144,7 +144,7 @@ A Codex unit has no `CLAUDE_CODE_SESSION_ID`, so it gets no marker and no instan
 
 ### TICKS FAILING
 
-For each unit with a running Claude pid, `unit_status.sh` runs `sessions.py id <pid>`, reads the marker for that session id, and, when `delegate_run.py check` exits 0 (work in flight), runs `notifier.sh health delegate-<run id>`. Health exit 1 prints `TICKS FAILING (<health line without "failing: ">)`: `no instance`, `no tick since <time>`, or `last two sends exit a, b`. No marker, or an idle unit, prints nothing. The showrunner reads this line in every scheduled update and typed dailies.
+For each unit with a running Claude pid, `unit_status.sh` runs `sessions.py id <pid>`, reads the marker for that session id, and, whenever the marker names a run, runs `notifier.sh health delegate-<run id>`, idle or not. Health exit 1 prints `TICKS FAILING (<health line without "failing: ">)`: `no instance`, `no tick since <time>`, or `last two sends exit a, b`. No marker, or an empty one, prints nothing. The showrunner reads this line in every scheduled update and typed dailies.
 
 ## Invariants
 
@@ -177,9 +177,9 @@ For each unit with a running Claude pid, `unit_status.sh` runs `sessions.py id <
 - **Timeouts.** `TIMEOUT` (120 s default) bounds both the check and the relay. One relay takes about 9 s. `tick` waits for every instance's subshell before it releases `.tick.lock`, so a check must stay fast.
 - **Health window.** `.last_tick` older than 120 s means the job is not running; `health` reports it even for a stopped instance.
 - **Seats inherit `CLAUDE_CODE_SESSION_ID`.** A seat can inherit the unit director's id, so `prepare_session.sh` or `end_session.sh` run from a seat or a test acts on the unit director's marker and instance. Tests run them only with a fresh id and a temp `NOTIFIER_STATE_DIR`; `end_session.sh`'s `remove` inherits that variable.
-- **`PLAN_DELEGATE_ACTIVE_DIR`** is a test-only variable honoured only by `delegate_run.py` and `unit_notifier.sh`. `prepare_session.sh`, `end_session.sh` and `unit_status.sh` use the fixed `/tmp/claude/delegate/active`, so a live caller leaves it unset or pointed where the marker is.
+- **`PLAN_DELEGATE_ACTIVE_DIR`** is a test-only variable honoured only by `delegate_run.py`, `unit_notifier.sh` and `unit_status.sh`. `prepare_session.sh` and `end_session.sh` use the fixed `/tmp/claude/delegate/active`, so a live caller leaves it unset or pointed where the marker is.
 - **`CHECK` quoting.** `unit_notifier.sh` `(q)`-quotes each word of the check, so a repo path with spaces survives the `(Q)(z)` split.
-- **`progress` cost.** Every rendered `progress` call spawns one zsh, even for a run with no instance. A `progress` call that exits with `No open window to report` does not restart the clock.
+- **`progress` cost.** Every rendered `progress` call spawns one zsh, even for a run with no instance. A `progress` call restarts the clock before it can refuse, so a call that exits with `No open window to report` or a missing cap stage still moves the next tick one interval out.
 - **`/unit:interval` lasts for the run.** Rerunning `unit_notifier.sh` resets `EVERY` to the config value.
 - **`fire`** moves the clock and skips the hold, but a failing check or a missing session still skips it.
 
@@ -197,4 +197,5 @@ For each unit with a running Claude pid, `unit_status.sh` runs `sessions.py id <
 - **`zselect` watchdog.** GNU `timeout` is absent on the Mac, and an external `sleep` would outlive the subshell; the builtin dies with it. The bound matters because a hung check would hold `.tick.lock` and stall every instance.
 - **Pinned marker directory in `prepare_session.sh`.** It writes the marker in the fixed directory, so it pins `PLAN_DELEGATE_ACTIVE_DIR` for `unit_notifier.sh`; an inherited test value would point it at another marker. `end_session.sh` does not honour that variable because `prepare_session.sh` never writes there.
 - **`Session ready at <dir>` stays last.** The unit director reads `SESSION_DIR` from the last line. An instance that fails to be created does not stop the run; the unit says the run gets no ticks until `unit_notifier.sh "$CLAUDE_CODE_SESSION_ID"` succeeds.
-- **`TICKS FAILING` only with work in flight.** An idle unit gets no ticks by design, so a missing tick is a fault only while work runs.
+- **`TICKS FAILING` for every active run, idle or not.** An idle unit gets no ticks by design, but its instance must be there when work resumes. Checked only while work ran, a unit with no instance dropped out of every idle status: hana's geometry-material reported `no instance` from 2026-09-29 and no status showed it.
+- **A refused report still restarts the clock.** The hold keeps at most one tick waiting and releases on the next restart; a refused call that skipped the restart left the next slot held, a 30-minute gap.

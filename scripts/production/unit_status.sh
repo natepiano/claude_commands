@@ -1,8 +1,9 @@
 #!/usr/bin/env zsh
 # Unit status for /showrunner:produce's update schedule.
 # Usage: unit_status.sh <state-dir> <user-zone> <session>...
-# Each call checks every unit director: that its session and Claude are running, any
-# form or decision waiting on the user, and its latest step, gate and ETA.
+# Each call checks every unit director: that its session and Claude are running, tick
+# health for every unit with an active run, any form or decision waiting on the user,
+# and its latest step, gate and ETA.
 # A block on the showrunner or another unit prints as a BLOCK line with its age.
 # No pipefail: each test reads grep's own status, and an early `grep -q` exit
 # would fail the `tail` before it with SIGPIPE.
@@ -20,8 +21,8 @@ TM=$(command -v tmux) || TM=$(nix build --no-link --print-out-paths 'nixpkgs#tmu
 REPO=${0:A:h:h:h}
 PY=$REPO/scripts/lib/py
 SESSIONS=$REPO/scripts/message/sessions.py
-CHECK=$REPO/scripts/hooks/delegate_run.py
 NOTIFIER=$REPO/scripts/message/notifier.sh
+ACTIVE_DIR=${PLAN_DELEGATE_ACTIVE_DIR:-/tmp/claude/delegate/active}
 mkdir -p "$DIR"
 SEEN=$DIR/decisions_seen
 BLOCKS=$DIR/blocks_open
@@ -94,9 +95,9 @@ for u in $units; do
   [[ -z $pid ]] && echo 'CLAUDE NOT RUNNING'
   if [[ -n $pid ]]; then
     session_id=$("$PY" "$SESSIONS" id "$pid" 2>/dev/null)
-    if [[ -n $session_id && -f /tmp/claude/delegate/active/$session_id ]]; then
-      session_dir=$(< "/tmp/claude/delegate/active/$session_id")
-      if [[ -n $session_dir ]] && "$PY" "$CHECK" check "$session_id" "$session_dir" >/dev/null 2>&1; then
+    if [[ -n $session_id && -f $ACTIVE_DIR/$session_id ]]; then
+      session_dir=$(< "$ACTIVE_DIR/$session_id")
+      if [[ -n $session_dir ]]; then
         health=$(zsh "$NOTIFIER" health "delegate-${session_dir:t}" 2>&1)
         if (( $? == 1 )); then
           print -r -- "TICKS FAILING (${health#failing: })"
