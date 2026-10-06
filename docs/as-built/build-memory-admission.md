@@ -16,11 +16,13 @@ Not in this repo; listed because the code here reads it.
 | `sccache.service` | Runs the server in the foreground with `SCCACHE_NO_DAEMON=1` and `SCCACHE_START_SERVER=1` on `ExecStart` only; takes the port from an already running server on start; `RestartSec=5`. Every compile handed to sccache therefore runs inside `builds.slice`. |
 | `hana-ci.slice` | `MemoryMax=18G` only, `MemorySwapMax=2G`, no `MemoryHigh`. Runners `OOMPolicy=continue`. |
 | CI slot pool | `/dev/steve-ci`, 14 slots, separate from the sessions' `/dev/steve` (31 slots). Runners: `CARGO_MAKEFLAGS=--jobserver-auth=fifo:/dev/steve-ci`, `BindPaths=-/dev/steve-ci`, `DeviceAllow` `char-rtc r` and `/dev/steve-ci rw`, ordered after `steve-ci.service`. No `CARGO_BUILD_JOBS`. |
-| CI kill order | `PIPELINE_JOB_OOMSCOREADJ=100` in the runners' `extraEnvironment` (sessions sit at 200). |
+| Build and CI kill order | Each build step's `builds.slice` scope sets `oom_score_adj=500` before starting the step; `PIPELINE_JOB_OOMSCOREADJ=100` in the runners' `extraEnvironment`, and sessions sit at 200. earlyoom kills the largest build steps first, then CI and sessions. |
 | Swap and earlyoom (`modules/linux/memory.nix`) | zram (zstd, 50%, priority 100), `vm.swappiness=100`. earlyoom decides on available RAM alone (free-swap thresholds 100) and no longer prefers `cargo-nextest`. |
 | Timers | `buildlog sample` every 60 s, `buildlog disk` every 600 s, `buildlog hourly` every 3600 s, disk-floor every 2 min (`sweep.py --floor-only`). |
 
 The two ceilings (44G + 18G) deliberately exceed physical RAM together; decisions rest on kills and stall, not their sum.
+
+On 2026-10-06 06:54 PDT, two hung hana tests in one local `verify.sh test` step held 11.4 GB and 15.5 GB; earlyoom first sent SIGTERM to 26 other processes, including six CI compilers (four hana CI jobs failed), and killed the tests last.
 
 ### The memory gate (`scripts/lint/memory_gate.sh`)
 
