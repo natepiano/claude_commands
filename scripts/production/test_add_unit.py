@@ -138,12 +138,76 @@ class AddUnitTests(unittest.TestCase):
         target = worktree or self.root / "project-alpha"
         return f"| {name}-unit | {plan} | {target} | {branch} | {name} | {port} | {owns} |"
 
+    def prepared_row(self, *, name: str = "alpha", plan: str = "docs/plans/given.md",
+                     worktree: Path | None = None, branch: str = "build-followups-alpha",
+                     session: str = "alpha") -> str:
+        target = worktree or self.root / "project-alpha"
+        return (f"| `{name}-unit` | `{plan}` (ready to launch) | `{target}` | "
+                f"`{branch}` | `{session}` | 8123 | `src/alpha` — assigned files |")
+
+    def commit_prepared_row(self, row: str) -> None:
+        _ = self.doc.write_text(self.production_doc().replace("## Gates", row + "\n\n## Gates"),
+                                encoding="utf-8")
+        _ = self.git("add", "docs/plans/build-followups-production.md")
+        _ = self.git("commit", "-m", "prepare unit rows")
+        _ = self.git("push", "origin", "build-followups")
+
+    def assert_no_launch_change(self, document: str, head: str) -> None:
+        self.assertEqual(self.doc.read_text(), document)
+        self.assertEqual(self.git("rev-parse", "HEAD"), head)
+        self.assertFalse(self.config.exists())
+        self.assertFalse(self.log.exists())
+        self.assertFalse((self.root / "project-alpha").exists())
+        self.assertEqual(self.events("tmux"), [])
+        self.assertEqual(self.events("systemd-run"), [])
+
     def registry_units(self) -> list[str]:
         data = cast(dict[str, object], json.loads(self.config.read_text()))
         runners = cast(list[dict[str, object]], data["showrunners"])
         runner = next(item for item in runners if item["session"] == "director")
         self.assertEqual(runner["zone"], "America/Los_Angeles")
         return cast(list[str], runner["units"])
+
+    def test_standby_launch_records_state_without_writing_a_plan(self) -> None:
+        _ = self.successful("alpha", "--standby", "--port", "8123", "--owns", "src/alpha")
+        worktree = self.root / "project-alpha"
+        self.assertIn(self.unit_row(plan="standby", port="8123", owns="src/alpha"),
+                      self.doc.read_text())
+        self.assertEqual(self.git("log", "-1", "--format=%s"),
+                         "production(build-followups): add unit alpha-unit (standby)")
+        self.assertEqual(self.git("show", "--pretty=format:", "--name-only", "HEAD"),
+                         "docs/plans/build-followups-production.md")
+        self.assertFalse((self.checkout / "docs/plans/build-followups-alpha.md").exists())
+        self.assertFalse((worktree / "docs/plans/build-followups-alpha.md").exists())
+        self.assertEqual(self.registry_units(), ["alpha"])
+        data = cast(dict[str, object], json.loads(self.config.read_text()))
+        runner = cast(list[dict[str, object]], data["showrunners"])[0]
+        self.assertEqual(runner["standby"], ["alpha"])
+        tmux = next(record for record in self.events("tmux")
+                    if cast(list[str], record["args"])[:1] == ["new-session"])
+        command = cast(list[str], tmux["args"])[-1]
+        prompt = (f"You are alpha-unit in production build-followups (doc {self.doc}), "
+                  f"under the showrunner director, on standby. Work only in your worktree {worktree}, "
+                  "branch build-followups-alpha. Do nothing until the showrunner sends you work.")
+        self.assertIn(prompt, command)
+        self.assertRegex(self.log.read_text(),
+                         r"^- \d\d:\d\d PDT: added alpha-unit \(standby\), tmux alpha, worktree ")
+
+    def test_standby_rejects_other_modes_before_any_change(self) -> None:
+        original = self.doc.read_text()
+        head = self.git("rev-parse", "HEAD")
+        for args in (("--standby", "--plan", "docs/plans/given.md"),
+                     ("--standby", "--brief", "Write a plan")):
+            with self.subTest(args=args):
+                result = self.cli("alpha", *args)
+                self.assertEqual(result.returncode, 2, (result.stdout, result.stderr))
+                self.assertEqual(len((result.stdout + result.stderr).strip().splitlines()), 1)
+                self.assertEqual(self.doc.read_text(), original)
+                self.assertEqual(self.git("rev-parse", "HEAD"), head)
+                self.assertFalse(self.config.exists())
+                self.assertFalse(self.log.exists())
+                self.assertFalse((self.root / "project-alpha").exists())
+                self.assertEqual(self.events("systemd-run"), [])
 
     def test_plan_adds_row_commits_pushes_worktree_launches_and_records(self) -> None:
         result = self.successful("alpha", "--plan", "docs/plans/given.md", "--port", "8123",
@@ -178,6 +242,100 @@ class AddUnitTests(unittest.TestCase):
                          r"^- \d\d:\d\d PDT: added alpha-unit \(plan\), tmux alpha, worktree ")
         self.assertEqual(len(self.log.read_text().splitlines()), 1)
         self.assertIn("alpha-unit started: tmux attach -t alpha", result.stdout)
+
+    def test_prepared_row_launches_without_rewriting_or_committing_it(self) -> None:
+        self.commit_prepared_row(self.prepared_row())
+        document = self.doc.read_text()
+        head = self.git("rev-parse", "HEAD")
+        _ = self.successful("alpha", "--plan", "docs/plans/given.md")
+        self.assertEqual(self.doc.read_text(), document)
+        self.assertEqual(self.git("rev-parse", "HEAD"), head)
+        self.assertNotIn("add unit", self.git("log", "-1", "--format=%s"))
+        self.assertEqual(self.git("branch", "--show-current", cwd=self.root / "project-alpha"),
+                         "build-followups-alpha")
+        self.assertEqual(len(self.events("systemd-run")), 1)
+        self.assertEqual(self.registry_units(), ["alpha"])
+        self.assertIn("added alpha-unit (plan)", self.log.read_text())
+
+    def test_prepared_row_refuses_mismatched_identity_cells_before_launch(self) -> None:
+        cases = (("Plan", self.prepared_row(plan="docs/plans/other.md"),
+                  "docs/plans/other.md", "docs/plans/given.md"),
+                 ("Branch", self.prepared_row(branch="other-branch"),
+                  "other-branch", "build-followups-alpha"),
+                 ("Worktree", self.prepared_row(worktree=self.root / "other-worktree"),
+                  str(self.root / "other-worktree"), str(self.root / "project-alpha")),
+                 ("Session", self.prepared_row(session="other-session"),
+                  "other-session", "alpha"))
+        for cell, row, actual, expected in cases:
+            with self.subTest(cell=cell):
+                self.commit_prepared_row(row)
+                document = self.doc.read_text()
+                head = self.git("rev-parse", "HEAD")
+                result = self.cli("alpha", "--plan", "docs/plans/given.md")
+                self.assertEqual(result.returncode, 2, (result.stdout, result.stderr))
+                self.assertEqual(len(result.stderr.strip().splitlines()), 1)
+                self.assertIn(cell, result.stderr)
+                self.assertIn(f"is {actual!r}; expected {expected!r}", result.stderr)
+                self.assert_no_launch_change(document, head)
+
+    def test_prepared_row_refuses_different_supplied_port_before_launch(self) -> None:
+        self.commit_prepared_row(self.prepared_row())
+        document = self.doc.read_text()
+        head = self.git("rev-parse", "HEAD")
+        result = self.cli("alpha", "--plan", "docs/plans/given.md", "--port", "9000")
+        self.assertEqual(result.returncode, 2, (result.stdout, result.stderr))
+        self.assertEqual(len(result.stderr.strip().splitlines()), 1)
+        self.assertIn("Port is '8123'; expected '9000'", result.stderr)
+        self.assert_no_launch_change(document, head)
+
+    def test_prepared_row_refuses_different_supplied_owns_before_launch(self) -> None:
+        self.commit_prepared_row(self.prepared_row())
+        document = self.doc.read_text()
+        head = self.git("rev-parse", "HEAD")
+        result = self.cli("alpha", "--plan", "docs/plans/given.md", "--owns", "src/beta")
+        self.assertEqual(result.returncode, 2, (result.stdout, result.stderr))
+        self.assertEqual(len(result.stderr.strip().splitlines()), 1)
+        self.assertIn("Owns is 'src/alpha'; expected 'src/beta'", result.stderr)
+        self.assert_no_launch_change(document, head)
+
+    def test_prepared_standby_row_uses_standby_mode(self) -> None:
+        self.commit_prepared_row(self.prepared_row(plan="standby"))
+        document = self.doc.read_text()
+        head = self.git("rev-parse", "HEAD")
+        _ = self.successful("alpha", "--standby")
+        self.assertEqual(self.doc.read_text(), document)
+        self.assertEqual(self.git("rev-parse", "HEAD"), head)
+        self.assertIn("added alpha-unit (standby)", self.log.read_text())
+
+    def test_other_prepared_row_reserves_backticked_branch(self) -> None:
+        self.commit_prepared_row(self.prepared_row(name="beta"))
+        document = self.doc.read_text()
+        head = self.git("rev-parse", "HEAD")
+        result = self.cli("alpha", "--plan", "docs/plans/given.md")
+        self.assertEqual(result.returncode, 2, (result.stdout, result.stderr))
+        self.assertEqual(len(result.stderr.strip().splitlines()), 1)
+        self.assertIn("branch or worktree", result.stderr)
+        self.assert_no_launch_change(document, head)
+
+    def test_check_resume_preflights_without_any_launch_side_effect(self) -> None:
+        document = self.doc.read_text()
+        head = self.git("rev-parse", "HEAD")
+        result = self.cli("alpha", "--plan", "docs/plans/given.md", "--resume", "session-123",
+                          "--cwd", str(self.root / "prior-session"), "--check")
+        self.assertEqual(result.returncode, 0, (result.stdout, result.stderr))
+        self.assertEqual(result.stdout, "")
+        self.assertEqual(result.stderr, "")
+        self.assert_no_launch_change(document, head)
+
+    def test_check_refuses_invalid_session_name_without_any_change(self) -> None:
+        document = self.doc.read_text()
+        head = self.git("rev-parse", "HEAD")
+        result = self.cli("new director", "--plan", "docs/plans/given.md", "--resume", "session-123",
+                          "--cwd", str(self.root / "prior-session"), "--check")
+        self.assertEqual(result.returncode, 2, (result.stdout, result.stderr))
+        self.assertEqual(len(result.stderr.strip().splitlines()), 1)
+        self.assertIn("name must contain only letters", result.stderr)
+        self.assert_no_launch_change(document, head)
 
     def test_berth_target_is_set_only_when_berth_config_exists(self) -> None:
         _ = self.successful("alpha", "--plan", "docs/plans/given.md")

@@ -234,13 +234,16 @@ def tick(now: float) -> None:
             print(f"stall-watch: invalid zone for {configured['session']}: {configured['zone']}", file=sys.stderr)
             continue
         for unit in configured["units"]:
-            if subprocess.run([TMUX, "has-session", "-t", f"={unit}"], capture_output=True, check=False).returncode != 0:
+            if isinstance(unit, showrunners.StandbyUnit):
+                continue
+            name = unit.name
+            if subprocess.run([TMUX, "has-session", "-t", f"={name}"], capture_output=True, check=False).returncode != 0:
                 continue
             try:
-                pane_pid = int(command_output([TMUX, "display-message", "-p", "-t", f"={unit}:", "#{pane_pid}"]))
-                pane = command_output([TMUX, "capture-pane", "-p", "-J", "-S", "-400", "-t", f"={unit}:"])
+                pane_pid = int(command_output([TMUX, "display-message", "-p", "-t", f"={name}:", "#{pane_pid}"]))
+                pane = command_output([TMUX, "capture-pane", "-p", "-J", "-S", "-400", "-t", f"={name}:"])
             except (OSError, ValueError) as error:
-                print(f"stall-watch: {unit}: {error}", file=sys.stderr)
+                print(f"stall-watch: {name}: {error}", file=sys.stderr)
                 continue
             pid = claude_pid(pane_pid, rows)
             if pid is None:
@@ -249,7 +252,7 @@ def tick(now: float) -> None:
             if identity is None:
                 continue
             session_id, socket = identity
-            path = stretch_path(configured["session"], unit)
+            path = stretch_path(configured["session"], name)
             stretch = read_stretch(path, hashlib.sha256(pane.encode()).hexdigest(), now)
             turns = TURN_END.findall(pane)
             last = cast(str, turns[-1]).strip() if turns else "none on screen"
@@ -269,7 +272,7 @@ def tick(now: float) -> None:
             if now - since < settings["stall_minutes"] * 60 or running_work:
                 continue
             since_text = datetime.fromtimestamp(since, zone).strftime("%H:%M %Z")
-            key = f"stall-watch:{unit}:{int(since)}"
+            key = f"stall-watch:{name}:{int(since)}"
             if not stretch["reported_status"]:
                 stretch["reported_status"] = last
                 save_stretch(path, stretch)
@@ -278,7 +281,7 @@ def tick(now: float) -> None:
                         "Continue your run; if you are waiting on someone, say on whom in one line.")
                 pending.append(delivery(path, "bump", socket, f"{key}:bump", text))
             if not stretch["tell_sent"] and showrunner_socket:
-                text = f"{unit} idle since {since_text}, nothing running; bumped. Last status: {last}"
+                text = f"{name} idle since {since_text}, nothing running; bumped. Last status: {last}"
                 pending.append(delivery(path, "tell", showrunner_socket, f"{key}:tell", text))
     send_all(pending)
 
