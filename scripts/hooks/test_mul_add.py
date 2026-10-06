@@ -3,14 +3,18 @@
 from __future__ import annotations
 
 import json
+import io
 import os
+import runpy
 import subprocess
 import sys
 import tempfile
 import time
 import unittest
+from contextlib import redirect_stdout
 from pathlib import Path
-from typing import cast, override
+from typing import Callable, cast, override
+from unittest.mock import patch
 
 import mul_add_lib
 
@@ -170,6 +174,21 @@ class MulAddHookTests(unittest.TestCase):
         self.assertEqual(result.stdout, "")
         self.assertNotIn("mul_add_lib", result.stderr)
 
+    def test_non_rust_edit_does_not_import_shared_scanner(self) -> None:
+        """The non-Rust fast path avoids scanner and typing imports."""
+        payload = json.dumps({
+            "tool_name": "Edit", "tool_input": {"file_path": "README.md"},
+            "cwd": str(self.workspace),
+        })
+        result = subprocess.run(
+            [sys.executable, "-X", "importtime", str(HOOK)], input=payload,
+            capture_output=True, text=True, check=False, env=self.environment, timeout=10,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, "")
+        self.assertNotIn("fn_length_lib", result.stderr)
+        self.assertNotIn("typing", result.stderr)
+
     def test_finding_carries_source_operands_and_rewrite(self) -> None:
         self.write_source("a * 0.5 + c")
         scope, findings = mul_add_lib.float_mul_add_findings(self.rs_file)
@@ -250,6 +269,33 @@ class MulAddHookTests(unittest.TestCase):
         )
         self.assert_passes()
 
+    def test_spaced_no_std_inner_attribute_exempts_target(self) -> None:
+        """Valid whitespace between #, !, and [ preserves the exemption."""
+        for attribute in (
+            "# ! [ no_std ]", "#! [no_std]", "# ![cfg_attr(feature = \"bare\", no_std)]",
+        ):
+            with self.subTest(attribute=attribute):
+                _ = self.rs_file.write_text(
+                    attribute + "\nfn sample(a: f32) { let _ = a * 0.5 + 1.0; }\n"
+                )
+                self.assert_passes()
+        _ = self.rs_file.write_text(
+            '// # ! [ no_std ]\nconst NOTE: &str = "# ! [ no_std ]";\n'
+            + "fn sample(a: f32) { let _ = a * 0.5 + 1.0; }\n"
+        )
+        self.assertEqual(self.decision()["decision"], "block")
+
+    def test_bin_main_checks_only_its_own_no_std_attribute(self) -> None:
+        """A sibling bin.rs cannot exempt a directory bin's main.rs."""
+        main = self.package / "src/bin/widget/main.rs"
+        main.parent.mkdir(parents=True)
+        _ = main.write_text("fn sample(a: f32) { let _ = a * 0.5 + 1.0; }\n")
+        _ = (self.package / "src/bin/widget.rs").write_text("#![no_std]\n")
+        self.assertEqual(mul_add_lib.suboptimal_flops_scope(main).state, mul_add_lib.ScopeState.ENABLED)
+        result = self.run_hook(file=main)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(cast(dict[str, object], json.loads(result.stdout))["decision"], "block")
+
     def test_parenthesized_sqrt_receiver_passes(self) -> None:
         _ = self.rs_file.write_text(
             "fn sample(a: f32) {\n" +
@@ -329,6 +375,46 @@ class MulAddHookTests(unittest.TestCase):
         self.assertIn('"line": 2', records[0])
         self.assertIn('"expression": "a * 0.5 + c"', records[0])
         self.assertIn("at", record)
+        context = cast(dict[str, str], decision["hookSpecificOutput"])
+        self.assertEqual(
+            context["additionalContext"],
+            cast(str, decision["reason"]).removesuffix(" The edit was applied."),
+        )
+
+    def test_no_std_is_decided_for_each_target(self) -> None:
+        expression = "fn sample(a: f32) { let _ = a * 0.5 + 1.0; }\n"
+        main = self.package / "src/main.rs"
+        module = self.package / "src/helper.rs"
+        _ = self.rs_file.write_text("#![ no_std ]\n" + expression)
+        _ = main.write_text(expression)
+        _ = module.write_text(expression)
+        self.assert_passes(file=self.rs_file)
+        self.assert_passes(file=module)
+        result = self.run_hook(file=main)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(cast(dict[str, object], json.loads(result.stdout))["decision"], "block")
+
+    def test_cfg_attr_and_attributes_in_comments_or_strings(self) -> None:
+        expression = "fn sample(a: f32) { let _ = a * 0.5 + 1.0; }\n"
+        _ = self.rs_file.write_text("#![cfg_attr(feature = \"bare\", no_std)]\n" + expression)
+        self.assert_passes()
+        _ = self.rs_file.write_text(
+            '// #![no_std]\nconst NOTE: &str = "#![no_std]";\n' + expression
+        )
+        self.assertEqual(self.decision()["decision"], "block")
+
+    def test_internal_error_emits_one_system_message_and_passes(self) -> None:
+        self.write_source("a * 0.5 + c")
+        _ = self.rs_file.write_bytes(b"\xff * +")
+        result = self.run_hook()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(len(result.stdout.splitlines()), 1)
+        message = cast(dict[str, object], json.loads(result.stdout))
+        self.assertEqual(set(message), {"systemMessage"})
+        self.assertTrue(cast(str, message["systemMessage"]).startswith(
+            "mul_add hook error: UnicodeDecodeError: "
+        ))
+        self.assertFalse((self.state / "blocks.jsonl").exists())
 
     def test_multiple_findings_join_reasons_in_source_order(self) -> None:
         _ = self.rs_file.write_text(
@@ -445,6 +531,87 @@ class MulAddHookTests(unittest.TestCase):
             "}\n"
         )
         self.assertEqual(mul_add_lib.float_mul_add_findings(self.rs_file)[1], [])
+
+
+    def patch(self, body: str) -> subprocess.CompletedProcess[str]:
+        return self.run_hook(payload=json.dumps({
+            "tool_name": "apply_patch",
+            "cwd": str(self.workspace),
+            "tool_input": {"command": "*** Begin Patch\n" + body + "*** End Patch\n"},
+        }))
+
+    def test_add_update_move_and_delete_headers(self) -> None:
+        self.write_source("a * 0.5 + c")
+        added = self.package / "src/added.rs"
+        moved = self.package / "src/moved.rs"
+        _ = added.write_text(self.rs_file.read_text())
+        _ = moved.write_text(self.rs_file.read_text())
+        result = self.patch(
+            "*** Delete File: crate/src/lib.rs\n"
+            + "*** Add File: crate/src/added.rs\n"
+            + "*** Update File: crate/src/old.rs\n"
+            + "*** Move to: crate/src/moved.rs\n@@\n"
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        decision = cast(dict[str, object], json.loads(result.stdout))
+        self.assertEqual(decision["decision"], "block")
+        reason = cast(str, decision["reason"])
+        self.assertLess(reason.index("added.rs"), reason.index("moved.rs"))
+        self.assertNotIn("lib.rs", reason)
+        records = [cast(dict[str, object], json.loads(line)) for line in
+                   (self.state / "blocks.jsonl").read_text().splitlines()]
+        self.assertEqual([record["file"] for record in records], [str(added), str(moved)])
+        self.assertEqual({record["agent"] for record in records}, {"codex"})
+
+    def test_two_updated_files_make_one_block_and_two_finding_records(self) -> None:
+        self.write_source("a * 0.5 + c")
+        other = self.package / "src/other.rs"
+        _ = other.write_text("fn other(x: f32) { let _ = x * 2.0 + 1.0; }\n")
+        result = self.patch(
+            "*** Update File: crate/src/lib.rs\n@@\n"
+            + "*** Update File: crate/src/other.rs\n@@\n"
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(len(result.stdout.splitlines()), 1)
+        decision = cast(dict[str, object], json.loads(result.stdout))
+        self.assertEqual(decision["systemMessage"],
+                         "mul_add: 2 float multiply-add expression(s) in "
+                         + "crate/src/lib.rs, crate/src/other.rs")
+        reason = cast(str, decision["reason"])
+        self.assertLess(reason.index("lib.rs"), reason.index("other.rs"))
+        context = cast(dict[str, str], decision["hookSpecificOutput"])
+        self.assertEqual(context["additionalContext"],
+                         reason.removesuffix(" The edit was applied.").replace("; ", "\n"))
+        records = [cast(dict[str, object], json.loads(line)) for line in
+                   (self.state / "blocks.jsonl").read_text().splitlines()]
+        self.assertEqual(len(records), 2)
+        self.assertEqual([record["file"] for record in records], [str(self.rs_file), str(other)])
+        self.assertEqual({record["agent"] for record in records}, {"codex"})
+        self.assertEqual([record["line"] for record in records], [2, 1])
+        self.assertEqual([record["expression"] for record in records],
+                         ["a * 0.5 + c", "x * 2.0 + 1.0"])
+
+    def test_later_scan_error_leaves_no_block_record(self) -> None:
+        """A failed multi-file scan cannot leave records for an undelivered block."""
+        self.write_source("a * 0.5 + c")
+        other = self.package / "src/other.rs"
+        _ = other.write_text("fn other(x: f32) { let _ = x * 2.0 + 1.0; }\n")
+        payload = json.dumps({
+            "tool_name": "apply_patch", "cwd": str(self.workspace),
+            "tool_input": {"command": "*** Begin Patch\n*** Update File: crate/src/lib.rs\n@@\n"
+                           + "*** Update File: crate/src/other.rs\n@@\n*** End Patch\n"},
+        })
+        output = io.StringIO()
+        main = cast(Callable[[], None], runpy.run_path(str(HOOK))["main"])
+        first = mul_add_lib.float_mul_add_findings(self.rs_file)
+        with (patch.dict(os.environ, self.environment),
+              patch.object(sys, "stdin", io.StringIO(payload)), redirect_stdout(output),
+              patch.object(mul_add_lib, "float_mul_add_findings",
+                           side_effect=[first, RuntimeError("later file")])):
+            main()
+        message = cast(dict[str, object], json.loads(output.getvalue()))
+        self.assertEqual(message, {"systemMessage": "mul_add hook error: RuntimeError: later file"})
+        self.assertFalse((self.state / "blocks.jsonl").exists())
 
 
 if __name__ == "__main__":

@@ -3,13 +3,17 @@
 from __future__ import annotations
 
 import json
+import io
 import os
+import runpy
 import subprocess
 import sys
 import tempfile
 import unittest
+from contextlib import redirect_stdout
 from pathlib import Path
-from typing import cast, override
+from typing import Callable, cast, override
+from unittest.mock import patch
 
 import fn_length_lib
 
@@ -471,6 +475,21 @@ class FunctionHookTests(SyntheticPackageTests):
         self.assertEqual(result.stdout, "")
         self.assertFalse((self.state / "blocks.jsonl").exists())
 
+    def test_non_rust_edit_does_not_import_shared_scanner(self) -> None:
+        """The non-Rust fast path avoids scanner and typing imports."""
+        payload = json.dumps({
+            "tool_name": "Edit", "tool_input": {"file_path": "README.md"},
+            "cwd": str(self.workspace),
+        })
+        result = subprocess.run(
+            [sys.executable, "-X", "importtime", str(HOOK)], input=payload,
+            capture_output=True, text=True, check=False, env=self.environment, timeout=10,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, "")
+        self.assertNotIn("fn_length_lib", result.stderr)
+        self.assertNotIn("typing", result.stderr)
+
     def test_malformed_stdin_has_no_block_decision(self) -> None:
         result = self.run_hook(payload="{")
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -524,6 +543,23 @@ class CodexApplyPatchTests(SyntheticPackageTests):
     def records(self) -> list[dict[str, object]]:
         return [cast(dict[str, object], json.loads(line)) for line in
                 (self.state / "blocks.jsonl").read_text().splitlines()]
+
+    def test_shared_parser_keeps_applied_paths_and_ignores_deletes(self) -> None:
+        patch = (
+            "*** Begin Patch\n*** Delete File: crate/src/gone.rs\n"
+            "*** Add File: crate/src/new.rs\n"
+            "*** Update File: crate/src/old.rs\n"
+            "*** Move to: crate/src/moved.rs\n@@\n*** End Patch\n"
+        )
+        payload = json.dumps({
+            "tool_name": "apply_patch", "cwd": str(self.workspace),
+            "tool_input": {"command": patch},
+        })
+        edit = fn_length_lib.applied_rust_edits(payload)
+        self.assertIsInstance(edit, fn_length_lib.AppliedRustEdits)
+        if isinstance(edit, fn_length_lib.AppliedRustEdits):
+            self.assertEqual(edit.files, ("crate/src/new.rs", "crate/src/moved.rs"))
+        self.assertIsInstance(fn_length_lib.applied_rust_edits("{}"), fn_length_lib.IgnoredEdit)
 
     def test_update_file_blocks_and_logs_codex(self) -> None:
         self.write_function(101)
@@ -591,6 +627,28 @@ class CodexApplyPatchTests(SyntheticPackageTests):
         self.assertEqual(len(records), 2)
         self.assertEqual({record["file"] for record in records}, {str(self.rs_file), str(other)})
         self.assertEqual({record["agent"] for record in records}, {"codex"})
+
+    def test_later_scan_error_leaves_no_block_record(self) -> None:
+        """A failed multi-file scan cannot leave records for an undelivered block."""
+        self.write_function(101)
+        other = self.package / "src/other.rs"
+        _ = other.write_text(rust_function("other", 101))
+        payload = json.dumps({
+            "tool_name": "apply_patch", "cwd": str(self.workspace),
+            "tool_input": {"command": "*** Begin Patch\n*** Update File: crate/src/lib.rs\n@@\n"
+                           + "*** Update File: crate/src/other.rs\n@@\n*** End Patch\n"},
+        })
+        output = io.StringIO()
+        main = cast(Callable[[], None], runpy.run_path(str(HOOK))["main"])
+        first = fn_length_lib.long_functions(self.rs_file)
+        with (patch.dict(os.environ, self.environment),
+              patch.object(sys, "stdin", io.StringIO(payload)), redirect_stdout(output),
+              patch.object(fn_length_lib, "long_functions",
+                           side_effect=[first, RuntimeError("later file")])):
+            main()
+        message = cast(dict[str, object], json.loads(output.getvalue()))
+        self.assertEqual(message, {"systemMessage": "fn-length hook error: RuntimeError: later file"})
+        self.assertFalse((self.state / "blocks.jsonl").exists())
 
     def test_patch_summary_counts_all_functions_and_names_all_files(self) -> None:
         """A patch summary covers every long function and affected file."""
