@@ -31,11 +31,22 @@ examples=(
   "hana_mimesis_tools show_beam"
 )
 
+# Tailscale SSH serves the Mac, and its exit status is always 0, so a command
+# whose status matters prints it as its last line and on_mac returns that.
+on_mac() {
+  local out code
+  out=$(ssh $host "$1; echo mac_exit=\$?")
+  print -rn -- "${out%mac_exit=*}"
+  code=${out##*mac_exit=}
+  [[ $code == <-> ]] || code=255
+  return $code
+}
+
 ssh -o ConnectTimeout=6 -o BatchMode=yes $host true 2>/dev/null || { print "mac unreachable"; exit 3 }
 sha=$(git -C $repo rev-parse --verify "$sha^{commit}") || exit 2
 
 # The Mac cannot fetch from GitHub over ssh, so the commits go as a bundle.
-ssh $host "test -d $clone/.git || git clone -q ~/rust/hana $clone" || exit 4
+on_mac "test -d $clone/.git || git clone -q ~/rust/hana $clone" || exit 4
 base=$(ssh $host "git -C $clone rev-parse HEAD")
 ref=refs/mac-run/tip
 bundle=$(mktemp --suffix=.bundle)
@@ -56,11 +67,11 @@ head=$(ssh $host "git -C $clone rev-parse HEAD")
 print "HEAD=$head"
 [[ $head == $sha ]] || { print "wrong tree: wanted $sha"; exit 5 }
 
-ssh $host "cd $clone && ~/.cargo/bin/cargo build -q -p hana" || { print "build failed"; exit 6 }
+on_mac "cd $clone && ~/.cargo/bin/cargo build -q -p hana" || { print "build failed"; exit 6 }
 
 # perl's alarm stops hana after the hold; 142 (SIGALRM) means it stayed up.
 # Run outside cargo, so Bevy needs the asset root that `cargo run` would give it.
-ssh $host "cd $clone && BEVY_ASSET_ROOT=\$HOME/$clone/crates/hana BRP_EXTRAS_PORT=$port perl -e 'alarm shift; exec @ARGV' $hold ./target/debug/hana > $log 2>&1"
+on_mac "cd $clone && BEVY_ASSET_ROOT=\$HOME/$clone/crates/hana BRP_EXTRAS_PORT=$port perl -e 'alarm shift; exec @ARGV' $hold ./target/debug/hana > $log 2>&1"
 run_exit=$?
 if (( run_exit == 142 )); then
   print "hana stayed up ${hold}s"
@@ -77,7 +88,7 @@ for entry in $examples; do
   args="-p $parts[1] --example $parts[2]"
   (( $#parts == 3 )) && args="$args --features $parts[3]"
   example_log=/tmp/mac_run_$parts[2].log
-  if ! ssh $host "cd $clone && ~/.cargo/bin/cargo build -q $args" > /dev/null 2>&1; then
+  if ! on_mac "cd $clone && ~/.cargo/bin/cargo build -q $args" > /dev/null 2>&1; then
     print "example $parts[2]: build failed"
     failed=1
     continue
@@ -85,7 +96,7 @@ for entry in $examples; do
   # Run the built binary, as for hana: the Mac's cargo is a wrapper script that
   # waits on its child, so an alarm on `cargo run` never reaches the example.
   # The pkill catches a survivor; the bracket keeps it from matching its shell.
-  ssh $host "cd $clone && BEVY_ASSET_ROOT=\$HOME/$clone/crates/$parts[1] BRP_EXTRAS_PORT=$port perl -e 'alarm shift; exec @ARGV' $example_hold ./target/debug/examples/$parts[2] > $example_log 2>&1"
+  on_mac "cd $clone && BEVY_ASSET_ROOT=\$HOME/$clone/crates/$parts[1] BRP_EXTRAS_PORT=$port perl -e 'alarm shift; exec @ARGV' $example_hold ./target/debug/examples/$parts[2] > $example_log 2>&1"
   example_exit=$?
   ssh $host "pkill -f '[h]ana_catalyst_mac/target/debug/examples/$parts[2]'"
   if (( example_exit == 142 )); then
