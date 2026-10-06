@@ -1,6 +1,7 @@
 #!/usr/bin/env zsh
 # Unit status for /showrunner:produce's update schedule.
 # Usage: unit_status.sh <state-dir> <user-zone> <session>...
+#    or: unit_status.sh <state-dir> <user-zone> --showrunner <session>
 # Each call checks every unit director: that its session and Claude are running, tick
 # health for every unit with an active run, any form or decision waiting on the user,
 # and its latest step, gate and ETA.
@@ -16,6 +17,22 @@ DIR=$1
 ZONE=$2
 shift 2
 units=("$@")
+if [[ $1 == --showrunner ]]; then
+  [[ $# == 2 ]] || { print -u2 'usage: --showrunner <session>'; exit 2; }
+  showrunner=$2
+  REPO=${0:A:h:h:h}
+  config=${SHOWRUNNERS_CONFIG:-$REPO/config/showrunners.json}
+  unit_lines=$("$REPO/scripts/lib/py" -c '
+import json, sys
+from pathlib import Path
+config = json.loads(Path(sys.argv[1]).read_text())
+runner = next((item for item in config["showrunners"] if item["session"] == sys.argv[2]), None)
+if runner is None:
+    raise SystemExit("showrunner absent from config: " + sys.argv[2])
+print("\n".join(runner["units"]))
+' "$config" "$showrunner") || exit 1
+  [[ -n $unit_lines ]] && units=("${(@f)unit_lines}") || units=()
+fi
 # `^out` alone: `nixpkgs#tmux` without it also prints the man output's path.
 TM=$(command -v tmux) || TM=$(nix build --no-link --print-out-paths 'nixpkgs#tmux^out')/bin/tmux
 REPO=${0:A:h:h:h}

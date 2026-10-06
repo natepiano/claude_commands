@@ -98,7 +98,7 @@ Every failure deletes only the path this run reserved.
 
 ### Disk: the prune and the disk-floor job
 
-The clip directory is on `/`, the same filesystem the disk-floor job (`/etc/nixos/modules/linux/disk-floor.nix`) holds at 500 GiB free. That job runs `scripts/lint/sweep.py --floor-only` every 2 minutes and frees only cargo target directories, then sends a phone alert when `/` is under 300 GiB. It never touches `~/.cache/screen-record/`. The prune is that directory's only bound: under 2 GiB when a run starts, plus the one clip that run writes, at most a little over 500 MB. Clips can therefore take at most about 2.5 GB of the room the floor protects, and when `/` drops under the floor the sweep deletes build caches, never clips.
+The clip directory is on `/`, the same filesystem the disk-floor job (`/etc/nixos/modules/linux/disk-floor.nix`) holds at 300 GiB free. That job runs `scripts/lint/sweep.py --floor-only` every 2 minutes and frees only cargo target directories, then sends a phone alert when `/` is under 150 GiB. It never touches `~/.cache/screen-record/`. The prune is that directory's only bound: under 2 GiB when a run starts, plus the one clip that run writes, at most a little over 500 MB. Clips can therefore take at most about 2.5 GB of the room the floor protects, and when `/` drops under the floor the sweep deletes build caches, never clips.
 
 ## Invariants
 

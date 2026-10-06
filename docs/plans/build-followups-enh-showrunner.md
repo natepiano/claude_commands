@@ -15,13 +15,13 @@ Both phases were Phases 7 and 8 of stalls-unit's plan (`docs/plans/build-followu
 
 ## Decisions (showrunner)
 
-- **Gate G1:** Phase 2 starts after stalls-unit Phase 6 merges (ETA 16:15 PDT). That phase changes `produce.md`, `promote_unit.md`, `showrunners.py` and `stall_watch.py`, which Phase 2 builds on.
-- **Split (unit director, 2026-10-06 14:5x PDT):** the command's own files touch none of those four, so Phase 1 runs now and ships `--plan` and `--brief`; standby and the hub-file edits are Phase 2, after G1; the checkpoint merge is Phase 3. Production rule "parallel by default" (`produce.md` → Rules, `ed166b6`).
+- **Gate G1:** Phase 4 starts after stalls-unit Phase 6 merges (ETA 16:15 PDT). That phase changes `produce.md`, `promote_unit.md`, `showrunners.py` and `stall_watch.py`, which Phase 4 builds on.
+- **Split (unit director, 2026-10-06 14:5x PDT):** the command's own files touch none of those four, so Phase 1 runs now and ships `--plan` and `--brief`; standby and the hub-file edits are Phase 4, after G1; the checkpoint merge is Phase 5. Production rule "parallel by default" (`produce.md` → Rules, `ed166b6`).
 - **Hub files:** `commands/showrunner/produce.md`, `commands/showrunner/promote_unit.md`, `scripts/production/showrunners.py` and `scripts/production/stall_watch.py` are stalls-unit's; this unit edits them after G1. Merge `build-followups` into the branch before each phase.
 
 ## Delegation Context
 
-- **Project:** `~/.claude` — Claude Code commands, skills, hooks and scripts. This plan builds `/showrunner:add_unit` (Phases 1 and 2) and `merge_checkpoint.py` with the script-or-not audit (Phase 3). Work in the worktree `/home/natepiano/worktrees/claude-build-followups-enh-showrunner` on branch `build-followups-enh-showrunner` (unit `enh-showrunner-unit` of production `build-followups`).
+- **Project:** `~/.claude` — Claude Code commands, skills, hooks and scripts. This plan builds `/showrunner:add_unit` (Phases 1 and 4) and `merge_checkpoint.py` with the script-or-not audit (Phase 5). Work in the worktree `/home/natepiano/worktrees/claude-build-followups-enh-showrunner` on branch `build-followups-enh-showrunner` (unit `enh-showrunner-unit` of production `build-followups`).
 - **Project started:** 2026-10-06T21:25:00+00:00
 - **Stack:** Python 3.13, standard library only; zsh for command lines.
 - **Layout:**
@@ -41,7 +41,7 @@ Both phases were Phases 7 and 8 of stalls-unit's plan (`docs/plans/build-followu
 
 | Gate | Waiting | Waits on | Clears when |
 | --- | --- | --- | --- |
-| G1 | Phase 2 | stalls-unit Phase 6 | the showrunner merges it and says so |
+| G1 | Phase 4 | stalls-unit Phase 6 | the showrunner merges it and says so |
 
 ## Phases
 
@@ -68,7 +68,72 @@ Both phases were Phases 7 and 8 of stalls-unit's plan (`docs/plans/build-followu
 
 **Ruled out:** a mode column in the Units table — the commit subject already records it.
 
-### Phase 2 — A unit can wait on standby, and promote and produce use the command · status: todo
+### Phase 2 — Simple dailies name only the next item; page dailies list each upcoming item as a sub-bullet · status: done
+
+#### As-built
+
+A unit's `then` in the dailies input is a JSON list of one-line items, one per upcoming phase or follow-up, each led by its phase number when it has one (`76–79: …` for a range with one purpose); a plain string still reads as one item. `parse_upcoming_work` turns it into `UpcomingWork(items)` or `NoUpcomingWork()` on `Unit.upcoming_work`. `simple` prints `- then: <first item>`; `page` and `elaborate` print `- then:` with each item as `  - <item>`; a single item stays on the `- then:` line at every length.
+
+- Each item passes `check_words` and `check_then_order`. A leading `<N>:` or `<N>–<M>:` label is this plan's phase and is checked even when the item names another plan's document.
+- A follow-up needs one item naming its return (`the plan at Phase <N>` or `plan done`); a last phase needs the list.
+
+**Files:**
+- `scripts/production/dailies_render.py` — the list reader, `UpcomingWork` / `NoUpcomingWork`, the per-length render.
+- `scripts/production/test_dailies_render.py` — the list, legacy-string, refusal, order and length cases.
+- `commands/showrunner/dailies.md` — the list schema, its example and the per-item order rule.
+
+**Gotchas:** `UpcomingWork.items` is non-empty through `parse_upcoming_work`, not by construction.
+
+### Phase 3 — A unit commits its code before the shrink, and shrinks beside the next phase · status: done
+
+#### Work Order
+
+Work only in worktree `/home/natepiano/worktrees/claude-build-followups-enh-showrunner`, branch `build-followups-enh-showrunner`. State every time in PDT.
+
+**Source:** the user, 2026-10-06 ~15:25 PDT, typed in this unit's session: "when you're done i want you to make it so that in the phase end process for a unit, that when they reach the phase of finished and the only thing they're doing is shrinking i want it to now do a commit first, then tell its showrunner the code is ready, then shrink and commit, then tell the showrunner that the phase is done. this way a showrunner can use the committed work and unblock other sessions more rapidly and the shrink can happen in parallel with work that starts on the next phase (shrink and commit just the docs while other work is happening)". The showrunner (natedev, 15:3x PDT) placed it here as Phase 3 and gave this unit `commands/unit/delegate.md`, `commands/unit/checkpoint.md`, `docs/delegate/run_phase_review.md` and `docs/production_format.md`. The showrunner's side (`commands/showrunner/produce.md` <MergeCheckpoint/>) is a hub file under G1 and goes to Phase 5.
+
+**Goal:** in loop mode, a phase's code is committed, pushed and announced to the showrunner as soon as its code gates pass; the plan review then folds what was learned into the remaining Work Orders, the next phase's seats start, and the shrink runs beside them as a commit of the plan doc alone, announced with a short second notice.
+
+**Spec:**
+- **The new order** (`commands/unit/delegate.md` <ExecutionSteps/>), loop mode and inside an auto window: after <Synthesize/> converges and smoke and <UXReview/> pass —
+  1. <CheckpointCommit/>: the phase's code, its tests and the plan doc as it stands, with the phase marked `status: done`; the reservation release, <PushCheckpoint/> and the `review-trial` line as today.
+  2. The checkpoint notice (production_format item 3), unchanged; under a production its hash is mergeable at once. Outside a production, the one-line `Checkpoint <short hash> — phase N: <title>.` report.
+  3. <RunPhaseReview/>: the retrospective, the state audit, the architect review when a trigger fires, and the forward edits into the remaining Work Orders. The next phase waits for it, because its Work Order may change.
+  4. <ConsiderNextItems/>, then `finish-phase` for this phase.
+  5. <NextPhase/>: the next phase's <ComposeWorkOrder/>, reservation and launch, as today.
+  6. While the next phase's seats run: <RunPhaseShrink/> on this phase, under a `progress_history.py` activity labelled `shrink`; then the shrink commit; then the shrink notice; then this phase's `clear_phase_review.sh`. The turn then ends holding on the seats.
+  When no phase remains, steps 5 and 6 swap: the shrink and its commit come first, then <FinalGate/>. Verbose mode outside a window runs steps 1–4, then 6 without a next phase, then the post-phase report and gate; nothing starts before `continue`. `single` never commits and is unchanged.
+- **The shrink commit** (`commands/unit/checkpoint.md`, a new <ShrinkCommit/> beside <CheckpointCommit/>): stages only the plan doc and an approved `${NEXT_ITEMS_PATH}` change; refuses when any other path is staged; commits `shrink(<plan-slug>): phase N — <title>` with the session trailer; runs <PushCheckpoint/>. It owns no reservation and calls no release: in an enrolled repository the plan-doc edit is claimed on first touch by the next phase's reservation, like any other edit.
+- **The commit kinds** (<CoreContract/>): one checkpoint and one shrink commit per completed phase, plus the final-gate and as-built commits; the shrink commit is the only one made while seats run, and it touches only the plan doc.
+- **The two notices** (`docs/production_format.md` item 3): the checkpoint notice as today, sent before the plan review; then `From <unit>: phase <N> shrink <hash> — plan doc only.`, merged like any checkpoint whose only path is the unit's own plan doc, with no `review trial` or `design check` line. The checkpoint notice's `Phase <next> ETA` counts from the code commit.
+- **Shrink placement** (`docs/delegate/run_phase_review.md`): <RunPhaseReview/> runs after the checkpoint notice and before the next phase's <ComposeWorkOrder/>; <RunPhaseShrink/> runs after the next phase's launch and before the shrink commit. Its rule that remaining `todo` phases keep the plan review's forward edits holds; the phase the seats are running is one of them.
+- **One doc holds the order** (the user, ~15:50 PDT, via the showrunner: "if 3 files share the same insructions, shouldn't those instructions be in their own file, reerenced by the skill? we have precedent for this"; the showrunner: write it once in a new doc). `docs/delegate/phase_end.md` defines <PhaseEnd/>: the code commit and its "code ready" notice, the plan review, the add-on check, worker cleanup and `finish-phase`, the next launch, the shrink beside the seats with its plan-doc-only commit and notice, the no-next-phase and verbose variants, and the routes below. `commands/unit/delegate.md`, `commands/unit/checkpoint.md`, `commands/unit/add_ons.md`, `commands/plan/shrink.md`, `commands/plan/phase_review.md`, `docs/delegate/run_phase_review.md` and `docs/production_format.md` each point to it in one line and keep only their own steps. Precedents: `docs/decision_criteria.md` and `docs/production_format.md`.
+- **Routes after the code commit** (the showrunner approved, ~16:10 PDT): a defect the plan review finds in the committed phase becomes a follow-up phase inserted next and run next; source-comment edits the review makes go into the next phase's checkpoint commit.
+- **Compaction and failure** (<CompactionContract/>, <RetainDelegatedPhaseReservation/>): a handoff written while a shrink is pending names that phase. A shrink that fails its structural check blocks only the shrink commit; the seats keep running, and the unit director repairs the shrink before the next checkpoint, which refuses while an earlier phase still has a Work Order.
+
+**Files:**
+- `commands/unit/delegate.md` — <ExecutionSteps/>, <CoreContract/>, <NextPhase/>, <PhaseCleanup/>, <RecordPhaseCompletion/>, <CompactionContract/>.
+- `commands/unit/checkpoint.md` — <ShrinkCommit/>; <CheckpointCommit/> step 2 and step 8's report.
+- `docs/delegate/run_phase_review.md` — where the review and the shrink run.
+- `docs/production_format.md` — item 3's two notices.
+- `docs/delegate/phase_end.md` — new; <PhaseEnd/>.
+- `commands/unit/add_ons.md` — <ConsiderNextItems/> runs after the plan review and before the shrink.
+- `commands/plan/shrink.md` — the shrink follows the code commit; plus the four wording swaps from the live checkout's uncommitted edit.
+- `commands/plan/phase_review.md` — the review follows the code commit; the two routes above.
+
+**Seats:** 2 writers.
+- `impl` — `commands/unit/delegate.md`; post `done` without waiting for the other seat.
+- `test` — opens as a writer: `commands/unit/checkpoint.md`, `docs/delegate/run_phase_review.md`, `docs/production_format.md`; agree each tag name with `impl` by message before writing it, and post it on the board.
+
+**Constraints from prior phases:**
+- Phase 5 (todo) teaches `merge_checkpoint.py` and <MergeCheckpoint/> the shrink notice; until it lands, the showrunner merges a shrink commit through the ordinary steps, which already pass a change whose only path is the unit's plan doc.
+- Every tag a call site names keeps a definition; a contract moved between files keeps its stub row in <TagReferenceContract/>.
+
+**Acceptance gate:**
+- `grep -n "ShrinkCommit\|shrink(" commands/unit/delegate.md commands/unit/checkpoint.md docs/delegate/run_phase_review.md docs/production_format.md` shows the contract, its call sites and the commit kind; every `<Tag/>` the four files name has one definition (a script listing names against `<Tag>` openings, in the summary).
+- Live: this unit's next completed phase runs the new order, and its two notices reach natedev.
+
+### Phase 4 — A unit can wait on standby, and promote and produce use the command · status: todo
 
 **Blocked by:** G1 — stalls-unit phase 6 merged into `build-followups`
 
@@ -111,13 +176,13 @@ Work only in worktree `/home/natepiano/worktrees/claude-build-followups-enh-show
 - From the worktree root, `python3 -m unittest discover -s scripts/production -p 'test_add_unit.py'`, `-p 'test_showrunners.py'` and `-p 'test_stall_watch.py'` green; basedpyright 0 errors and 0 warnings on the changed `.py` files.
 - Live (natedev, once the merge reaches `~/.claude` main): `/showrunner:add_unit add-scratch --standby` prints the attach line, the pane shows remote control active, `showrunners.py list` shows `add-scratch` standby, and the stall watcher does not bump it over 6 idle minutes. Then remove it as in Phase 1's live gate.
 
-### Phase 3 — One command merges a checkpoint, and every other showrunner step gets a script-or-not verdict · status: todo
+### Phase 5 — One command merges a checkpoint, and every other showrunner step gets a script-or-not verdict · status: todo
 
 #### Work Order
 
 Work only in worktree `/home/natepiano/worktrees/claude-build-followups-enh-showrunner`, branch `build-followups-enh-showrunner`. State every time in PDT.
 
-**Source:** the user, 2026-10-06 14:1x PDT, through the showrunner (natedev): "right - everything that can be scripted should be scripted so the showrunner has the least amount of things to remember". The script, its steps and the audit are the showrunner's packaging of that ask, placed here as Phase 2, and Phase 3 since the 14:5x PDT split.
+**Source:** the user, 2026-10-06 14:1x PDT, through the showrunner (natedev): "right - everything that can be scripted should be scripted so the showrunner has the least amount of things to remember". The script, its steps and the audit are the showrunner's packaging of that ask, placed in this plan as its merge-checkpoint phase.
 
 **Goal:** `merge_checkpoint.py --production <doc> <unit> <phase> <hash> [--also <path>…]` runs `produce.md` <MergeCheckpoint/>'s mechanical steps in one run, prints one result line per step and the message to send the unit, and on red leaves the merge branch as it was; <MergeCheckpoint/> keeps only the judgment steps and the call. The As-built lists every other step in `produce.md` and `commands/showrunner/dailies.md` the showrunner must remember, each with a script-or-not verdict, and each clear one becomes a follow-up phase.
 
@@ -147,46 +212,13 @@ Work only in worktree `/home/natepiano/worktrees/claude-build-followups-enh-show
 - `test` — `scripts/production/test_merge_checkpoint.py` from the Spec alone, with real `git` in temporary repositories and a temporary bare `origin`, stubs on `PATH` for `verify.sh`, `validate_and_push.sh`, `review_regime.py` and `ssh` recording argv: each step's `held` and `failed` cases with no merge left behind; a red package reset and a known flake continuing; the green `git` path merging diverged `origin/main`, pushing, promoting a second temporary checkout by fast-forward and reading the Mac's `rc=`; a promote refused by an uncommitted file fails without undoing the push; the record call's argv and the LOG line. Owns the final suite run. Then the audit table, in its summary.
 
 **Constraints from prior phases:**
+- A shrink notice (`From <unit>: phase <N> shrink <hash> — plan doc only.`, or `— plan doc and <next-items path>.`) merges with no review-ledger row and no CI count (the showrunner, 16:2x PDT, doing it by hand until this lands).
 - Phase 1 (as built): `add_unit.py` reads the production doc with `read_production(path) -> Production` (doc, slug, merge_branch, checkout, showrunner_session, log, zone) and `production_field(lines, field) -> str`; import them, never a second parser.
-- Phase 2 (as built at its merge): it edits `produce.md` <LaunchUnits/>; this phase edits <MergeCheckpoint/>. Starts beside Phase 2 once Phase 1 merges, claiming `produce.md` after it.
+- Phase 4 (as built at its merge): it edits `produce.md` <LaunchUnits/>; this phase edits <MergeCheckpoint/>. Starts beside Phase 4 once Phase 1 merges, claiming `produce.md` after it.
 - Tests never push anywhere but a temporary bare repository, never run real `ssh`, and never write the real `~/.claude` checkout or `~/.local/state/`.
 - Only the showrunner merges (production_format item 4): the live gate is natedev's.
+- Phase 3 (as built at its merge): a unit sends a second notice, `From <unit>: phase <N> shrink <hash> — plan doc only.`, for a commit whose only path is its plan doc. `merge_checkpoint.py` takes it with `--shrink`: ancestry, scope (the plan doc alone, else `held`), conflicts, merge and push, with no package tests and no `review_regime.py add`; <MergeCheckpoint/> names the call. Runs after Phase 3.
 
 **Acceptance gate:**
 - From the worktree root, `python3 -m unittest discover -s scripts/production -p 'test_merge_checkpoint.py'` green; basedpyright 0 errors and 0 warnings on the changed `.py` files.
 - Live (natedev, once the merge reaches `~/.claude` main): the next checkpoint any unit sends is merged with the script; its lines match what the showrunner would have done by hand, and the As-built carries the audit table.
-
-### Phase 4 — Simple dailies name only the next item; page dailies list each upcoming item as a sub-bullet · status: todo
-
-#### Work Order
-
-Work only in worktree `/home/natepiano/worktrees/claude-build-followups-enh-showrunner`, branch `build-followups-enh-showrunner`. State every time in PDT.
-
-**Source:** the user, 2026-10-06 ~15:10 PDT, typed in this unit's session: "as you can update the dailies so that the simple daily doesn't show then for all upcoming phases but just the next - the dailies page version can show upcoming versions and it should put them as sub bullets not as a comma delimited list". Their example was a Hana unit's `then:` line naming phases 64 to 80 in one comma-separated sentence. The showrunner (natedev, 15:1x PDT) placed it here as Phase 4 and gave this unit `scripts/production/dailies_render.py`, its tests and `commands/showrunner/dailies.md` for this change (stalls-unit's files; `also touches` in the checkpoint notice). It runs after Phase 1's checkpoint, since one run's seats work one phase at a time.
-
-**Goal:** a unit's upcoming work is a list in the dailies input. `/showrunner:dailies simple` prints only its first item, as `- then: <item>`; `page` and `elaborate` print `- then:` with each item as an indented sub-bullet, in order.
-
-**Spec:**
-- **Input:** a unit's `then` (`scripts/production/dailies_render.py`, read at about line 670) is a JSON list of non-empty strings, one item each (`["64: front output jacks start a cable from a press at their centre", "65: jack panels match the info panels' colour and border"]`). A plain string is still read, as a one-item list, so a showrunner mid-run on the old form is not refused. The rules that read `then` today hold per item: `check_then_order` (about line 564) checks each item's phase numbers against the heading's, and the follow-up and last-phase rules (about lines 677–679) apply to the list as a whole. The reader converts the input into a named type at the boundary (`UpcomingWork`, holding a non-empty tuple of items, or its absence named as such), never a bare `str | None`.
-- **Render** (about line 1121): `simple` prints `- then: <first item>` and nothing for the rest. `page` and `elaborate` print `- then:` then each item on its own line as `  - <item>`. A one-item list prints `- then: <item>` at every length.
-- **`commands/showrunner/dailies.md`:** the input schema and its example (about line 119) show `then` as a list, one item per upcoming phase or follow-up, each led by its phase number when it has one. A range of phases with one shared purpose is one item (`76–79: edge cases in selection, jack panels, the palette and Log, saved scenes and reset`). The note at about line 167 on impossible orders reads per item.
-
-**Files:**
-- `scripts/production/dailies_render.py` — the list input, the named type, the per-length render.
-- `scripts/production/test_dailies_render.py` — the cases below.
-- `commands/showrunner/dailies.md` — the schema, example and order note.
-
-**Seats:** 1 writer + 1 tester.
-- `impl` — `scripts/production/dailies_render.py`, `commands/showrunner/dailies.md`; post `done` without waiting for the test seat.
-- `test` — `scripts/production/test_dailies_render.py`, from the Spec alone; owns the final suite run:
-  - a three-item `then`: simple prints only the first item; page and elaborate print `- then:` and three sub-bullets in order;
-  - a one-item list and a plain string both print `- then: <item>` at every length;
-  - an empty list, or an item that is empty, is refused naming `then`;
-  - an item naming a phase before the heading's is refused as today, and the last-phase rule still requires `then`.
-
-**Constraints from prior phases:**
-- stalls-unit owns these files; it has no edits to them committed or in its worktree (the showrunner, 15:1x PDT). If its Phase 6 lands an edit to `dailies_render.py` first, merge `build-followups` and resolve here.
-- Every other dailies test (`test_dailies_render_agents.py`, `test_dailies_render_holds.py`) stays green.
-
-**Acceptance gate:**
-- From the worktree root, `python3 -m unittest discover -s scripts/production -p 'test_dailies_render*.py'` green; basedpyright 0 errors and 0 warnings on `scripts/production/dailies_render.py` and `scripts/production/test_dailies_render.py`.
