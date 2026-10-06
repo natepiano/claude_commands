@@ -235,7 +235,12 @@ branch, port and the files you own.
    cargo-berth's normal flow. An incursion resolves itself. The showrunner picks
    each overlap answer, and no berth decision waits on the user
    (`/unit:delegate` <BerthDecisions/>). Name each such file in your checkpoint
-   notice as `also touches <path> (owner <unit>)`.
+   notice as `also touches <path> (owner <unit>), tested against <owner tip>`.
+   Before the notice, merge the owner's current branch tip into a scratch
+   branch and run the tests that cover those files. Fix every break on your
+   side. A break only the owner's in-flight work can fix goes to the owner
+   before the notice: what breaks and who fixes it, named on the line. The
+   owner never absorbs your break in a repair round. User, 2026-10-06.
 10. **Turn-end lines.** A wait the showrunner can clear names it:
     `— blocked: waiting on the showrunner: <what>`. A wait on another unit is
     one of these: `— blocked: waiting on the showrunner: <unit> <what>`. A wait

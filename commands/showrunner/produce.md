@@ -349,7 +349,10 @@ Input: the unit, phase, hash and shots from its notice.
    edit to the same file, tell that unit director in one line which file
    changed under it, and to merge the merge branch at its next pause between
    seat tasks, not at its own checkpoint, so conflicts are settled while small.
-   User, 2026-10-05.
+   User, 2026-10-05. Early merges must be clean: a notice whose `also touches`
+   line lacks `tested against <owner tip>` or a fix owner the owner agreed to
+   goes back (`production_format.md` → <ProductionUnit/> item 9). User,
+   2026-10-06.
 5. **New public items.** Each new `pub` item in the diff needs a user in
    production code. One with no consumer goes back to the unit director as a
    finding.
