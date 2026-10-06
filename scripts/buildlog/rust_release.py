@@ -353,7 +353,7 @@ def trial_release(
                 if held():
                     return {"status": "waiting", "version": version, "reason": "build hold active"}
                 step = "clippy"
-                clippy_env = env | {"CARGO_INCREMENTAL": "0", "CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS": "-C link-arg=-fuse-ld=mold"}
+                clippy_env = env | {"CARGO_INCREMENTAL": "0", "CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS": "-C link-arg=-fuse-ld=mold -C target-cpu=x86-64-v3"}
                 clippy = run_command(["nix", "develop", ".#ci", "-c", "cargo", f"+{version}", "clippy", "--workspace", "--all-targets", "--all-features", "--message-format=json"], clone, clippy_env, 7200)
                 if held():
                     return {"status": "waiting", "version": version, "reason": "build hold active"}
