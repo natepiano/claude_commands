@@ -19,10 +19,13 @@ import zlib
 
 SCRIPT = Path(__file__).with_name("hana_shot.py")
 CAMERA_ENTITY = 5
+WINDOW_ENTITY = 3
 NAME = "bevy_ecs::name::Name"
 AABB = "bevy_camera::primitives::Aabb"
 EDITOR_CAMERA = "hana::camera::editor_camera::EditorCamera"
 SWITCH_SLIDER = "hana_catalyst::switch::SwitchSlider"
+WINDOW = "bevy_window::window::Window"
+PRIMARY_WINDOW = "bevy_window::window::PrimaryWindow"
 ZOOM_TO_TARGET = "hana::camera::zoom_to_target::ZoomToTarget"
 GRAYSCALE = "hana_catalyst::identity::Tool<hana_catalyst::effects::Grayscale>"
 BLUR = "hana_catalyst::identity::Tool<hana_catalyst::effects::Blur>"
@@ -30,6 +33,31 @@ NAMES = ((11, "Log"), (12, "Twin"), (13, "Twin"))
 TOOLS = ((30, GRAYSCALE, 3, "hana.effect.grayscale"), (20, GRAYSCALE, 1, "hana.effect.grayscale"), (40, BLUR, 2, "hana.effect.blur"))
 EXTRA_ENTITY = 77
 SHOT_SIZE = (4, 3)
+REMOTE_HOST = "natemccoy@mac"
+# Fake scp and ssh: the remote host is a local folder, and every call is logged as one JSON line.
+# The keep-awake call answers "awake", then logs "ended" once the script closes its stdin.
+FAKE_REMOTE = """\
+#!{python}
+import json, shutil, sys
+from pathlib import Path
+remote = Path({remote!r})
+name = Path(sys.argv[0]).name
+def log(entry):
+    with open({log!r}, "a") as handle:
+        handle.write(json.dumps(entry) + "\\n")
+log([name, *sys.argv[1:]])
+if name == "scp":
+    if {copies!r}:
+        shutil.copyfile(remote / Path(sys.argv[2]).name, sys.argv[3])
+elif sys.argv[2:] == ["uname", "-s"]:
+    print({system!r})
+elif sys.argv[2] == "rm":
+    (remote / Path(sys.argv[-1]).name).unlink(missing_ok=True)
+else:
+    print("awake", flush=True)
+    sys.stdin.read()
+    log(["ended"])
+"""
 
 
 class Request(TypedDict):
@@ -91,6 +119,7 @@ class Fake:
         self.calls: list[Call] = []
         self.frame: int = 0
         self.screenshot: str = "ok"
+        self.remote: Path | None = None
         self.release: threading.Event = threading.Event()
         self.lock: threading.Lock = threading.Lock()
 
@@ -124,7 +153,10 @@ class Fake:
                 return {"result": None}
             if self.screenshot == "busy-always" or (self.screenshot == "busy-once" and screenshots == 1):
                 return {"error": {"code": -32603, "message": "Screenshot already in progress"}}
-            _ = Path(cast(str, params["path"])).write_bytes(png(*SHOT_SIZE))
+            path = Path(cast(str, params["path"]))
+            if self.remote is not None:
+                path = self.remote / path.name
+            _ = path.write_bytes(png(*SHOT_SIZE))
             return {"result": {"path": params["path"], "status": "ok"}}
         return {"result": None}
 
@@ -134,6 +166,8 @@ def query(params: dict[str, object]) -> list[dict[str, object]]:
     data = cast(dict[str, list[str]], params.get("data") or {})
     if EDITOR_CAMERA in with_types:
         return [{"entity": CAMERA_ENTITY, "components": camera_components()}]
+    if PRIMARY_WINDOW in with_types:
+        return [{"entity": WINDOW_ENTITY, "components": {}}]
     if SWITCH_SLIDER in with_types:
         return [
             {"entity": entity, "components": {path: {"id": tool_id, "definition": definition}}, "has": {AABB: False}}
@@ -188,7 +222,13 @@ class HanaShotTest(unittest.TestCase):
         return self.scratch / "cache" / "hana-shot" / "timings.jsonl"
 
     def run_script(self, *args: str) -> subprocess.CompletedProcess[str]:
-        environment = {**os.environ, "XDG_CACHE_HOME": str(self.scratch / "cache"), "HANA_SHOT_CAPTURE_TIMEOUT": "1"}
+        environment = {
+            **os.environ,
+            "XDG_CACHE_HOME": str(self.scratch / "cache"),
+            "HANA_SHOT_CAPTURE_TIMEOUT": "1",
+            # RemoteTests puts its fake scp and ssh here.
+            "PATH": f"{self.scratch / 'bin'}{os.pathsep}{os.environ.get('PATH', '')}",
+        }
         return subprocess.run(
             [sys.executable, str(SCRIPT), *args],
             cwd=self.scratch, env=environment, capture_output=True, text=True, timeout=60, check=False,
@@ -344,6 +384,97 @@ class ShotTests(HanaShotTest):
         result = self.shot("--mode", "home")
         self.assertEqual(result.returncode, 1)
         self.assertIn("already in progress", result.stderr)
+
+
+class RemoteTests(HanaShotTest):
+    def fake_remote(self, copies: bool, system: str = "Linux") -> Path:
+        """Point the fake Hana's writes at a folder standing in for the remote host, and fake scp and ssh."""
+        remote = self.scratch / "remote"
+        remote.mkdir()
+        self.fake.remote = remote
+        bin_directory = self.scratch / "bin"
+        bin_directory.mkdir()
+        source = FAKE_REMOTE.format(
+            python=sys.executable, remote=str(remote), log=str(self.ssh_log), copies=copies, system=system,
+        )
+        for name in ("scp", "ssh"):
+            fake = bin_directory / name
+            _ = fake.write_text(source)
+            fake.chmod(0o755)
+        return remote
+
+    @property
+    def ssh_log(self) -> Path:
+        return self.scratch / "ssh.jsonl"
+
+    def ssh_calls(self) -> list[list[str]]:
+        if not self.ssh_log.exists():
+            return []
+        return [cast(list[str], json.loads(line)) for line in self.ssh_log.read_text().splitlines()]
+
+    def test_remote_shot_copies_the_png_back_and_removes_it_there(self) -> None:
+        remote = self.fake_remote(copies=True)
+        result = self.shot("--mode", "home", "--remote", REMOTE_HOST)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue((self.scratch / "shot.png").read_bytes().startswith(b"\x89PNG"))
+        [screenshot] = self.fake.methods("brp_extras/screenshot")
+        remote_path = cast(str, screenshot["path"])
+        self.assertRegex(remote_path, r"^/tmp/hana_shot_[0-9]+_1\.png$")
+        [uname, copy, removal] = self.ssh_calls()
+        self.assertEqual(uname, ["ssh", REMOTE_HOST, "uname", "-s"])
+        self.assertEqual(copy[:3], ["scp", "-q", f"{REMOTE_HOST}:{remote_path}"])
+        self.assertEqual(Path(copy[3]).parent, self.scratch)
+        self.assertEqual(self.fake.methods("world.mutate_components"), [], "a Linux host keeps its window level")
+        self.assertEqual(removal, ["ssh", REMOTE_HOST, "rm", "-f", remote_path])
+        self.assertEqual(list(remote.iterdir()), [])
+        self.assertEqual([path.name for path in self.scratch.glob(".shot-*")], [])
+        line = cast(dict[str, object], json.loads(self.timings.read_text()))
+        self.assertEqual(line["host"], "mac")
+
+    def test_remote_copy_that_leaves_no_file_fails(self) -> None:
+        remote = self.fake_remote(copies=False)
+        result = self.shot("--mode", "home", "--remote", REMOTE_HOST)
+        self.assertEqual(result.returncode, 1, result.stderr)
+        [screenshot] = self.fake.methods("brp_extras/screenshot")
+        self.assertIn(f"no PNG came back from {REMOTE_HOST}:{screenshot['path']}", result.stderr)
+        self.assertEqual(
+            [call[:3] for call in self.ssh_calls()],
+            [["ssh", REMOTE_HOST, "uname"], ["scp", "-q", f"{REMOTE_HOST}:{screenshot['path']}"]],
+            "the remote shot is kept",
+        )
+        self.assertEqual(len(list(remote.iterdir())), 1)
+        self.assertFalse((self.scratch / "shot.png").exists())
+        self.assertFalse(self.timings.exists())
+
+    def test_remote_mac_shot_raises_the_window_and_holds_the_display_awake_for_the_run(self) -> None:
+        _ = self.fake_remote(copies=True, system="Darwin")
+        result = self.shot("--mode", "home", "--remote", REMOTE_HOST)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.fake.methods("world.mutate_components"), [
+            {"entity": WINDOW_ENTITY, "component": WINDOW, "path": ".window_level", "value": "AlwaysOnTop"},
+        ])
+        calls = self.ssh_calls()
+        uname, awake, copy = calls[:3]
+        self.assertEqual(uname, ["ssh", REMOTE_HOST, "uname", "-s"])
+        self.assertEqual(awake[:2], ["ssh", REMOTE_HOST])
+        self.assertTrue(awake[2].startswith("caffeinate -u "), awake)
+        self.assertEqual(copy[0], "scp", "the display is awake before the shot")
+        self.assertIn(["ended"], calls, "the keep-awake ends before the run exits")
+
+    def test_remote_host_that_gives_no_system_fails_before_any_shot(self) -> None:
+        _ = self.fake_remote(copies=True, system="")
+        result = self.shot("--mode", "home", "--remote", REMOTE_HOST)
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn(f"ssh {REMOTE_HOST} uname -s gave no answer", result.stderr)
+        self.assertEqual(self.fake.methods("brp_extras/screenshot"), [])
+
+    def test_launch_and_shutdown_are_refused_with_remote(self) -> None:
+        for flag in ("--launch", "--shutdown"):
+            with self.subTest(flag=flag):
+                result = self.shot("--mode", "home", "--remote", REMOTE_HOST, flag)
+                self.assertEqual(result.returncode, 2, result.stderr)
+                self.assertIn("this machine only", result.stderr)
+        self.assertEqual(self.fake.calls, [])
 
 
 class PoseTests(HanaShotTest):
