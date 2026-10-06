@@ -38,17 +38,20 @@ The user, via natedev, 2026-10-06 06:2x PDT: "can we create an edit hook - i am 
 
 ## Delegation Context
 
-- **Project:** `~/.claude` — Claude Code commands, skills, hooks and scripts; this plan records a too_many_lines baseline (Phase 1), adds a PostToolUse hook that blocks Claude edits leaving a Rust function over clippy's limit (Phase 2), extends it to Codex seats (Phase 3), and re-measures (Phase 4). Work in the worktree `/home/natepiano/worktrees/claude-build-followups-stalls` on branch `build-followups-stalls` (unit `stalls-unit` of production `build-followups`).
+- **Project:** `~/.claude` — Claude Code commands, skills, hooks and scripts; this plan records a too_many_lines baseline (Phase 1), makes every showrunner reply end with the current footer through a Stop hook (Phase 2), adds a PostToolUse hook that blocks Claude edits leaving a Rust function over clippy's limit (Phase 3), extends it to Codex seats (Phase 4), and re-measures (Phase 5). Work in the worktree `/home/natepiano/worktrees/claude-build-followups-stalls` on branch `build-followups-stalls` (unit `stalls-unit` of production `build-followups`).
 - **Project started:** 2026-10-06T15:12:44.327+00:00
-- **Stack:** Python 3.13, standard library only (`json`, `re`, `tomllib`, `dataclasses`, `pathlib`, `subprocess`, `unittest`); `scripts/lib/py` picks a Python ≥ 3.10 on each machine (3.13 on natedev and the Mac, so `tomllib` is present). Codex CLI 0.160.1 on natedev, 0.154.0 on the Mac.
+- **Stack:** Python 3.13, standard library only (`json`, `re`, `tomllib`, `dataclasses`, `pathlib`, `subprocess`, `shlex`, `zoneinfo`, `unittest`); `scripts/lib/py` picks a Python ≥ 3.10 on each machine (3.13 on natedev and the Mac, so `tomllib` is present). Codex CLI 0.160.1 on natedev, 0.154.0 on the Mac.
 - **Layout:**
-  - `scripts/hooks/fn_length_lib.py` — the checker: lint scope, function discovery, clippy's count (new, Phase 2)
-  - `scripts/hooks/post-tool-use-fn-length.py` — the hook entry for Claude payloads (Phase 2) and Codex `apply_patch` payloads (Phase 3) (new)
-  - `scripts/hooks/test_fn_length.py` — its tests (new, Phase 2; extended Phase 3)
-  - `scripts/hooks/codex_hooks.py` — installs and trusts the Codex hook (new, Phase 3)
-  - `scripts/hooks/test_codex_hooks.py` — its tests, with a stub `codex` on `PATH` (new, Phase 3)
-  - `settings.json` — Claude hook registration (Phase 2)
-  - outside the repository, at run time: `~/.local/state/fn-length-hook/blocks.jsonl`; `~/.codex/hooks.json` and `~/.codex/config.toml` `[hooks.state]` on each machine (Phase 3)
+  - `scripts/production/dailies_render.py` — `--footer` also prints the Agents lines (Phase 2); `test_dailies_render.py` and `test_dailies_render_agents.py` beside it
+  - `scripts/hooks/stop-showrunner-footer.py` — the Stop hook entry; `scripts/hooks/showrunner_footer.py` — production lookup, footer render, comparison; `scripts/hooks/test_stop_showrunner_footer.py` — their tests (new, Phase 2)
+  - `commands/showrunner/produce.md` — the Footer section (Phase 2)
+  - `scripts/hooks/fn_length_lib.py` — the checker: lint scope, function discovery, clippy's count (new, Phase 3)
+  - `scripts/hooks/post-tool-use-fn-length.py` — the hook entry for Claude payloads (Phase 3) and Codex `apply_patch` payloads (Phase 4) (new)
+  - `scripts/hooks/test_fn_length.py` — its tests (new, Phase 3; extended Phase 4)
+  - `scripts/hooks/codex_hooks.py` — installs and trusts the Codex hook (new, Phase 4)
+  - `scripts/hooks/test_codex_hooks.py` — its tests, with a stub `codex` on `PATH` (new, Phase 4)
+  - `settings.json` — Stop hook registration (Phase 2); Claude edit hook registration (Phase 3)
+  - outside the repository, at run time: `~/.local/state/fn-length-hook/blocks.jsonl`; `~/.codex/hooks.json` and `~/.codex/config.toml` `[hooks.state]` on each machine (Phase 4)
 - **Key files:**
   - `scripts/hooks/post-tool-use-banned-words.py` — the blocking convention: one JSON object with `decision: "block"`, a short `reason`, `continue: true`, a one-line `systemMessage`, and `hookSpecificOutput: {hookEventName: "PostToolUse", additionalContext}`; read-only tools exit before heavy imports
   - `scripts/hooks/banned_words_lib.py` — the sibling-library convention the new library follows
@@ -58,18 +61,19 @@ The user, via natedev, 2026-10-06 06:2x PDT: "can we create an edit hook - i am 
   - `scripts/agents/codex_mesh.py:256-319` — JSON-RPC client convention (`initialize` with `clientInfo` and `capabilities: {"experimentalApi": true}`, string request ids, `_require`); read only, unchanged by this plan
   - `pyrightconfig.json` — `scripts/hooks` is an execution environment with itself on `extraPaths`, so tests import `fn_length_lib` directly
   - `~/.local/state/nightly-review/2026-10-06/work/lints/{cost.py,loop.py,clippy_fail_lints.py,tml_lengths.py}` — the measurement scripts, read-only over `~/.local/state/buildlog/index.sqlite` and its gzip step logs; outside the repository and never edited (user, 2026-10-06: "using … cost.py, loop.py and clippy_fail_lints.py")
-- **Test lanes:** `scripts/hooks/` — `test_*.py` beside the scripts; this repository has no `tests/` directories.
+- **Test lanes:** `scripts/hooks/` and `scripts/production/` — `test_*.py` beside the scripts; this repository has no `tests/` directories.
 - **Build:** none — Python and JSON; nothing compiles.
-- **Test:** `python3 -m unittest discover -s scripts/hooks -p 'test_fn_length.py'` and `-p 'test_codex_hooks.py'`, run from the worktree root.
+- **Test:** `python3 -m unittest discover -s scripts/hooks -p 'test_stop_showrunner_footer.py'` and `python3 -m unittest discover -s scripts/production -p 'test_dailies_render*.py'` (Phase 2); `python3 -m unittest discover -s scripts/hooks -p 'test_fn_length.py'` and `-p 'test_codex_hooks.py'` (Phases 3–4); run from the worktree root.
 - **Lint:** `basedpyright <each changed .py file>` passes when its output ends `0 errors, 0 warnings, 0 notes`; it exits 3 in every checkout because `pyrightconfig.json` names a `.venv` no checkout has, so its exit status says nothing. `python3 -m json.tool settings.json > /dev/null` after editing `settings.json`.
 - **Style:** none — not Rust (showrunner, 2026-10-06).
 - **Invariants:**
+  - The showrunner footer hook fires only in a session a running production's `showrunner-*` notifier instance targets, and fails open: any error prints one stderr line and exits 0 with no output (user, 2026-10-06).
   - The hook never blocks on doubt: no `Cargo.toml`, unreadable TOML, an unbalanced brace, an unknown payload or any internal error passes the edit. An internal error prints one `systemMessage` line (`fn-length hook error: <type>: <message>`) and exits 0 (plan author).
   - One checker serves both agents; the Codex hook calls the same script with the same command string as Claude's (user, 2026-10-06: "sharing one checker script").
-  - A test never writes the real `~/.codex`, `~/.local/state/fn-length-hook` or `~/.local/state/buildlog`, never runs the real `codex` or `cargo`, and never edits `settings.json` beyond the Phase 2 registration (production rules). Live checks against real files are the unit director's, in the Acceptance gates.
+  - A test never writes the real `~/.codex`, `~/.local/state/fn-length-hook` or `~/.local/state/buildlog`, never runs the real `codex` or `cargo`, and never edits `settings.json` beyond the Phase 3 registration (production rules). Live checks against real files are the unit director's, in the Acceptance gates.
   - Running `codex` from a Claude session needs `dangerouslyDisableSandbox`: codex writes `~/.codex` and fails with "Operation not permitted" otherwise (`/etc/nixos/modules/common/codex.nix`).
   - Python is typed throughout with no `Any` and no file-level type ignores; basedpyright reports 0 errors and 0 warnings (user rule, `~/.claude/CLAUDE.md`).
-  - `~/.claude` main is the live configuration and each merged phase goes to it at once (production rule): the Claude hook goes live when Phase 2 reaches main, the Codex hook when Phase 3's install runs on each machine.
+  - `~/.claude` main is the live configuration and each merged phase goes to it at once (production rule): the Claude hook goes live when Phase 3 reaches main, the Codex hook when Phase 4's install runs on each machine.
   - Times carry their zone: this plan states PDT (America/Los_Angeles); natedev's clock and journal are EDT; buildlog stamps are UTC.
 
 ## Phases
@@ -98,7 +102,34 @@ Measured 2026-10-06 08:17 PDT over every hana clippy step since the first, 2026-
 - `loop.py` counts sole-cause calls it later skips for lacking an end time, so its count runs 1–2 above follow-up plus none (70 vs 64 + 4; the author's run 67 vs 62 + 3); seat time uses its wall and gap sums as printed.
 - A 4-day window covers every hana clippy step only until 2026-10-06 09:09 PDT; the totals query's `min(started_at)` gives the span's start.
 
-### Phase 2 — Claude edits that leave a function over the limit are blocked at once · status: todo
+### Phase 2 — Showrunner replies end with the current footer · status: done
+
+#### As-built
+
+- **Footer.** `dailies_render.py --footer --zone <IANA zone> [--next-run <HH:MM[+N]>] [--nothing-needed] [--at <YYYY-MM-DDTHH:MM[±HH:MM]>] [--outstanding <outstanding.json>]` prints the same footer the dailies report ends with (one `footer()`, fed `agent_section` on both paths): an empty line, `---`, `HH:MM <zone> update:`, an empty line, then `* ` bullets: build-hold lines (release-state lines nested as `  * ` under their hold), each Agents line in the dailies report's words, and last `* next dailies: HH:MM <zone>` (a later day adds its weekday) or `* no dailies scheduled`, with ` - nothing needed` when it applies. No `### Agents` heading. `--next-run` takes `HH:MM+N` for a run N days later; `--at` takes an offset to name one occurrence of a repeated hour.
+- **Waiting on block.** Every showrunner reply ends with the footer, two empty lines, `Waiting on:`, an empty line and one or more `* ` bullets, the user's items first. The showrunner writes this block; the renderer never prints it. Waiting-on-you items (`--outstanding`) are not in the footer; an outstanding item still drops ` - nothing needed`, a deferred one only after its `after` time.
+- **Stop hook.** `scripts/hooks/stop-showrunner-footer.py` imports only `json`, `os`, `sys` and `typing`, and fires only for a session that a `showrunner-*` notifier instance targets (`TARGET=session:<id>` in its `conf`, under `NOTIFIER_STATE_DIR` or `~/.local/state/notifier`) whose production doc (last token of `CHECK`) is `running`. It passes when `stop_hook_active` is set (at most one block per stop chain, so a footer that changes between attempts cannot loop the session), when `agent_id` is present, or when the session id or `last_assistant_message` is empty. The reply comes from `last_assistant_message`, never `transcript_path`: at Stop time the transcript lacks the turn's last entry. Any exception prints one stderr line, `stop-showrunner-footer: <type>: <message>`, and exits 0: the hook fails open.
+- **Check.** `showrunner_footer.block_reason(instance_dirs: list[str], reply: str) -> str | None` passes a reply that ends with the footer's current text plus a valid Waiting on block, with nothing after the bullets. Otherwise the hook prints `{"decision": "block", "reason": …}`, where the reason is `REASON_HEAD`, the footer's exact current lines and a `Waiting on:` example. The expected footer comes from running `dailies_render.py --footer` with the arguments `produce.md` → Footer names: the doc's `- **User zone:**`, `--next-run` from state `NEXT_DUE` when `ENABLED=1`, `--outstanding ~/.local/state/showrunner/outstanding/<slug>.json`. It runs at most twice per block; a non-zero exit or the 10 s timeout raises `FooterError`.
+- **Stamp.** `stamp(lines, now) -> tuple[datetime | None, bool]` takes the minute from the reply's last `HH:MM <zone> update:` line when it is at most 5 minutes old (`STAMP_WINDOW`), resolved by the zone abbreviation, so a footer stamped in the repeated fall-back hour (2026-11-01 01:30 PST) matches; the render passes it as `--at` with its offset. ` - nothing needed` is read from the footer's last bullet.
+
+**Files:**
+- `scripts/production/dailies_render.py` — `footer()` (the bullet footer shared by replies and reports), `footer_main` (Agents lines, `--at` offset, `--next-run HH:MM+N`), docstring and help text.
+- `scripts/hooks/stop-showrunner-footer.py` — the Stop hook entry point.
+- `scripts/hooks/showrunner_footer.py` — `read_production`, `render_footer`, `stamp` and `block_reason`; imported only on the showrunner path.
+- `scripts/hooks/test_stop_showrunner_footer.py` — library cases, hook runs as a subprocess under a temporary `HOME`, `NOTIFIER_STATE_DIR` and `BUILD_HOLD_DIR`, never-fires and fails-open cases, and the Stop group order in `settings.json`.
+- `scripts/production/test_dailies_render.py`, `test_dailies_render_agents.py`, `test_dailies_render_holds.py` — footer expectations in this layout; `--footer` Agents lines equal the report's.
+- `settings.json` — the hook appended to `hooks.Stop[0].hooks`, after `stop-assistant-prose-banned-words.py`.
+- `commands/showrunner/produce.md`, `commands/showrunner/dailies.md` — the footer, the Waiting on block, the turn-end rule and the hook.
+
+**Binds later work:** `settings.json`'s Stop group holds this hook after the banned-words hook; a phase that appends to the `Edit|MultiEdit|Write` group keeps both.
+
+**Gotchas:**
+- A Stop hook runs at every turn end in every session: the non-showrunner path stays on the entry point's own imports and one `conf` read per `showrunner-*` instance (about 4 ms on a quiet machine).
+- Cost readings on a loaded machine need interleaved bare and hook runs; load swamps any other delta (bare launch 22 ms quiet, 45–62 ms loaded).
+- basedpyright exits 3 in every checkout (`pyrightconfig.json` names a `.venv` no checkout has), so read its output line, not its exit status.
+- Replies sent before `produce.md` <StartUpdates/> step 3 registers the notifier instance are not checked.
+
+### Phase 3 — Claude edits that leave a function over the limit are blocked at once · status: todo
 
 #### Work Order
 
@@ -145,6 +176,7 @@ Work only in worktree `/home/natepiano/worktrees/claude-build-followups-stalls`,
   - hook: an `Edit` payload over the limit prints the exact `reason` text and one log line with `"agent": "claude"`; `Write` and `MultiEdit` payloads; a short function prints nothing; a `.py` path prints nothing and leaves no log; malformed stdin exits 0 with no `decision`; `settings.json` lists the new command in the `Edit|MultiEdit|Write` group after basedpyright.
 
 **Constraints from prior phases:** this phase touches no Phase 1 file.
+- Phase 2 (as built): on a loaded machine a hook's cost is a delta between two medians that load swamps (load avg 117 measured bare launches at 45–62 ms against 22 ms quiet); measure any cost budget with bare and hook runs interleaved, one of each per iteration.
 - Tests run on synthetic crates in temporary directories only, never on `~/rust`.
 
 **Acceptance gate:**
@@ -154,7 +186,7 @@ Work only in worktree `/home/natepiano/worktrees/claude-build-followups-stalls`,
 - The speed budget above holds; report the numbers.
 - Live smoke (unit director, after the merge reaches `~/.claude` main, from a Claude session started after that merge): in a scratchpad crate denying `pedantic`, `Write` a 101-line function; the block reason appears and `~/.local/state/fn-length-hook/blocks.jsonl` gains an `"agent": "claude"` line. Record the merge time as T_claude in PDT. Delete the crate.
 
-### Phase 3 — Codex seats get the same block after `apply_patch` · status: todo
+### Phase 4 — Codex seats get the same block after `apply_patch` · status: todo
 
 #### Work Order
 
@@ -162,12 +194,12 @@ Work only in worktree `/home/natepiano/worktrees/claude-build-followups-stalls`,
 
 **Source:** the user, 2026-10-06 06:2x PDT: "i am 99% sure that our hooks propagate to codex also". They do not on natedev (see What exists today).
 
-**Goal:** a Codex seat whose `apply_patch` leaves a function over the limit reads the same reason as its tool output, on natedev and the Mac, through the Phase 2 script and command string.
+**Goal:** a Codex seat whose `apply_patch` leaves a function over the limit reads the same reason as its tool output, on natedev and the Mac, through the Phase 3 script and command string.
 
 **Spec:**
-- `post-tool-use-fn-length.py` accepts `tool_name: "apply_patch"`: the files are the patch's `*** Add File: <path>` and `*** Update File: <path>` headers, an `*** Update File:` followed by `*** Move to: <new>` checking `<new>`; `*** Delete File:` is skipped. Relative paths resolve against the payload's `cwd`. The `.rs` filter, verdict, output and log are Phase 2's, with `"agent": "codex"`. The reason is the whole message Codex shows the model, so it keeps `The edit was applied.`
+- `post-tool-use-fn-length.py` accepts `tool_name: "apply_patch"`: the files are the patch's `*** Add File: <path>` and `*** Update File: <path>` headers, an `*** Update File:` followed by `*** Move to: <new>` checking `<new>`; `*** Delete File:` is skipped. Relative paths resolve against the payload's `cwd`. The `.rs` filter, verdict, output and log are Phase 3's, with `"agent": "codex"`. The reason is the whole message Codex shows the model, so it keeps `The edit was applied.`
 - `codex_hooks.py` (typed, standard library; `CODEX_BIN` when set, else `codex` on `PATH`, else `~/.local/bin/codex`; `CODEX_HOME` when set, else `~/.codex`):
-  - The one hook: event `PostToolUse`, matcher `apply_patch`, handler `{"type": "command", "command": "\"$HOME/.claude/scripts/lib/py\" \"$HOME/.claude/scripts/hooks/post-tool-use-fn-length.py\"", "timeout": 10}`. The command string is byte-identical to the Phase 2 `settings.json` entry, so the trust hash is the same on both machines.
+  - The one hook: event `PostToolUse`, matcher `apply_patch`, handler `{"type": "command", "command": "\"$HOME/.claude/scripts/lib/py\" \"$HOME/.claude/scripts/hooks/post-tool-use-fn-length.py\"", "timeout": 10}`. The command string is byte-identical to the Phase 3 `settings.json` entry, so the trust hash is the same on both machines.
   - `install`: read `<CODEX_HOME>/hooks.json` (absent → `{"hooks": {}}`; invalid JSON → exit 1 naming the file, which stays untouched). If no `PostToolUse` group holds a handler with this command, append a new group `{"matcher": "apply_patch", "hooks": [<handler>]}` at the end of `hooks.PostToolUse`, so existing groups keep their indexes and their recorded trust (the Mac's file has PostToolUse groups 0 and 1, trusted); write with 2-space indent to a temp file in the same directory, then `os.replace`. Then trust it: start `codex app-server` (stdio, the default transport) with cwd `$HOME`; `initialize` as `codex_mesh.py` does (`clientInfo.name` `"codex_hooks"`); `hooks/list` with `{"cwds": [<HOME>]}`; take the entry whose handler command equals this command and whose `sourcePath` is `<CODEX_HOME>/hooks.json`; if `trustStatus` is `untrusted` or `modified`, `config/batchWrite` with `{"edits": [{"keyPath": "hooks.state", "value": {<key>: {"trusted_hash": <currentHash>}}, "mergeStrategy": "upsert"}], "reloadUserConfig": true}`; list again. Exit 0 printing `trusted <key>` only when the entry reads `trusted` and `enabled: true`; otherwise exit 1 naming the status, or the RPC error (a `config/batchWrite` refusal reports the server's message, which names any invalid config key). The whole exchange is bounded at 30 s and the server is killed on exit.
   - `check`: the same list without writing; exit 0 when trusted and enabled, else exit 1 with `fn-length codex hook: <absent|untrusted|modified|disabled>`.
 - `codex_mesh.py` is unchanged: seats read user-layer hooks with no override.
@@ -185,7 +217,8 @@ Work only in worktree `/home/natepiano/worktrees/claude-build-followups-stalls`,
   - `codex_hooks.py` against a stub `codex` executable placed alone on `PATH` that answers stdio JSON-RPC from a state file (initialize, `hooks/list` built from the temp `hooks.json` and recorded trust, `config/batchWrite` recording the edit): a fresh install creates `hooks.json` with one group and trusts it; a two-group file shaped like the Mac's gains the group at index 2 with groups 0 and 1 unchanged; a second install adds no group and sends no `config/batchWrite`; a `modified` entry is trusted again; `check` exits 0 and 1 by status; a stub that exits at once makes `install` exit 1 with a message; invalid `hooks.json` exits 1 and the file is byte-identical after.
 
 **Constraints from prior phases:**
-- Phase 2 built `fn_length_lib.long_functions(rs_file) -> tuple[LintScope, list[FunctionLength]]`, the hook entry and its block JSON, the log at `FN_LENGTH_HOOK_STATE` or `~/.local/state/fn-length-hook/blocks.jsonl`, and the `settings.json` command string this phase repeats byte for byte.
+- Phase 2 (as built): on a loaded machine a hook's cost is a delta between two medians that load swamps (load avg 117 measured bare launches at 45–62 ms against 22 ms quiet); measure any cost budget with bare and hook runs interleaved, one of each per iteration.
+- Phase 3 built `fn_length_lib.long_functions(rs_file) -> tuple[LintScope, list[FunctionLength]]`, the hook entry and its block JSON, the log at `FN_LENGTH_HOOK_STATE` or `~/.local/state/fn-length-hook/blocks.jsonl`, and the `settings.json` command string this phase repeats byte for byte.
 - Tests never run the real `codex`, never write `~/.codex`, and set `CODEX_HOME`, `HOME` and `FN_LENGTH_HOOK_STATE` to temporary directories.
 
 **Acceptance gate:**
@@ -193,11 +226,11 @@ Work only in worktree `/home/natepiano/worktrees/claude-build-followups-stalls`,
 - Install (unit director, after the merge reaches `~/.claude` main and the Mac has pulled): `"$HOME/.claude/scripts/lib/py" "$HOME/.claude/scripts/hooks/codex_hooks.py" install`, then `check`, on natedev (`dangerouslyDisableSandbox`), and on the Mac over `ssh mac` printing `rc=$?` inside the command (Mac ssh always exits 0). Both print `trusted …`; the Mac's existing PostToolUse groups 0 and 1 and its SessionStart entry are unchanged. Record that time as T_codex in PDT.
 - End-to-end smoke (natedev): in a scratchpad crate denying `pedantic`, `codex exec --skip-git-repo-check -C <crate> "<ask for one function of 101 statement lines added with apply_patch>"` (`dangerouslyDisableSandbox`); the run's output shows the reason and `blocks.jsonl` gains an `"agent": "codex"` line. Delete the crate.
 
-### Phase 4 — Re-measure four days after both hooks are live · status: todo
+### Phase 5 — Re-measure four days after both hooks are live · status: todo
 
 #### Work Order
 
-**Blocked by:** G1 — 96 hours after T_codex (Phase 3's As-built). The window must hold no hours from before T_codex.
+**Blocked by:** G1 — 96 hours after T_codex (Phase 4's As-built). The window must hold no hours from before T_codex.
 
 Work only in worktree `/home/natepiano/worktrees/claude-build-followups-stalls`, branch `build-followups-stalls`. State every time in PDT.
 
@@ -216,7 +249,7 @@ Work only in worktree `/home/natepiano/worktrees/claude-build-followups-stalls`,
 **Seats:** 1 writer — `impl` runs the commands and reports; nothing splits and there is no code or test lane.
 
 **Constraints from prior phases:**
-- Phase 1's As-built holds the baseline: 13.3 too_many_lines failed steps per 100 hana clippy steps, 4.9 sole-cause per 100, 1.07 h sole-cause seat time a day (run 2026-10-06 08:17 PDT, span 3.96 days). Phase 2's As-built holds T_claude, Phase 3's T_codex.
+- Phase 1's As-built holds the baseline: 13.3 too_many_lines failed steps per 100 hana clippy steps, 4.9 sole-cause per 100, 1.07 h sole-cause seat time a day (run 2026-10-06 08:17 PDT, span 3.96 days). Phase 3's As-built holds T_claude, Phase 4's T_codex.
 - The scripts and the buildlog are read-only (user, 2026-10-06).
 - Saved run output stays under a few GB: read each run and delete it before the next.
 

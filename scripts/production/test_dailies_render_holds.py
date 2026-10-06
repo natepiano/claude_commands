@@ -148,7 +148,7 @@ class DailiesHoldTests(unittest.TestCase):
         self.assertEqual(checked.returncode, 0, checked.stderr)
         self.assertEqual(checked.stdout.strip(), "False")
 
-    def test_footer_and_report_name_each_release_state_before_agents(self) -> None:
+    def test_footer_and_report_nest_each_release_state_below_hold(self) -> None:
         _ = self.write_holder("seat", "2026-10-04T10:56:00-07:00", "the focused test")
         states = [
             ("first", "MemoryGateReturned"), ("second", "AwaitingRelease"),
@@ -161,13 +161,13 @@ class DailiesHoldTests(unittest.TestCase):
         outcomes = {"first": "Granted", "eighth": "TimedOut", "ninth": "MeminfoUnavailable"}
         self.write_cycle(states, outcomes=outcomes)
         for lines in (self.assert_ok(self.report(True)), self.assert_ok(self.footer())):
-            hold_index = next(index for index, line in enumerate(lines) if line.startswith("build hold:"))
+            hold_index = next(index for index, line in enumerate(lines) if line.startswith("* build hold:"))
             for index, (session_id, state) in enumerate(states, start=1):
                 expected = f"session {index} [{session_id}]: {state}"
                 if state == "MemoryGateReturned":
                     expected += f"({outcomes[session_id]})"
-                matches = [line for line in lines if line.strip() == expected]
-                self.assertEqual(matches, ["  " + expected])
+                matches = [line for line in lines if line == "  * " + expected]
+                self.assertEqual(matches, ["  * " + expected])
                 self.assertGreater(lines.index(matches[0]), hold_index)
             self.assertTrue(any("next session 2 [second] at 11:00:30 PDT" in line for line in lines))
 
@@ -183,11 +183,11 @@ class DailiesHoldTests(unittest.TestCase):
         report = self.assert_ok(self.report(True))
         footer = self.assert_ok(self.footer())
         for lines in (report, footer):
-            hold_index = next(index for index, line in enumerate(lines) if line.startswith("build hold:"))
+            hold_index = next(index for index, line in enumerate(lines) if line.startswith("* build hold:"))
             error_line = "release record could not be read: invalid released_at for first; /build_hold release sets it aside and ends the hold"
-            self.assertEqual([line.strip() for line in lines if error_line in line], [error_line])
+            self.assertIn("  * " + error_line, lines)
             self.assertLess(hold_index, next(index for index, line in enumerate(lines) if error_line in line))
-        self.assertLess(next(index for index, line in enumerate(report) if error_line in line), report.index("### Agents"))
+        self.assertLess(next(index for index, line in enumerate(report) if error_line in line), report.index("* none active"))
         self.assertEqual(path.read_bytes(), before)
 
     def test_footer_reports_damaged_current_without_changing_it(self) -> None:
@@ -198,7 +198,7 @@ class DailiesHoldTests(unittest.TestCase):
         _ = path.write_bytes(content)
         lines = self.assert_ok(self.footer())
         self.assertIn(
-            "  release record could not be read: invalid current hold cycle; /build_hold release sets it aside and ends the hold",
+            "  * release record could not be read: invalid current hold cycle; /build_hold release sets it aside and ends the hold",
             lines,
         )
         self.assertEqual(path.read_bytes(), content)
@@ -207,7 +207,7 @@ class DailiesHoldTests(unittest.TestCase):
     def test_legacy_holder_renders_unknown_release(self) -> None:
         _ = (self.folder / "old-seat").write_text("old seat, 2026-10-04T10:56:00-07:00, the focused test\n")
         lines = self.assert_ok(self.report(True))
-        holds = [line for line in lines if line.startswith("build hold:")]
+        holds = [line for line in lines if line.startswith("* build hold:")]
         self.assertEqual(len(holds), 1)
         self.assertIn("build hold: old-seat since 10:56 PDT", holds[0])
         self.assertIn("the focused test - release eta: unknown", holds[0])
@@ -223,14 +223,14 @@ class DailiesHoldTests(unittest.TestCase):
         ]
         report = self.assert_ok(self.report(True))
         footer = self.assert_ok(self.footer())
-        self.assertEqual([line for line in report if line.startswith("build hold:")], expected)
-        self.assertEqual([line for line in footer if line.startswith("build hold:")], expected)
+        self.assertEqual([line.removeprefix("* ") for line in report if line.startswith("* build hold:")], expected)
+        self.assertEqual([line.removeprefix("* ") for line in footer if line.startswith("* build hold:")], expected)
         self.assertEqual(len([line for line in report if line.startswith("widget") and "build hold" in line]), 1)
 
     def test_known_release_on_next_day_shows_weekday(self) -> None:
         _ = self.write_holder("later", "2026-10-04T10:56:00-07:00", "the later test", "2026-10-05T09:30:00-07:00")
         lines = self.assert_ok(self.footer())
-        self.assertIn("release eta: Mon 09:30 PDT (1350 minutes)", lines[0])
+        self.assertTrue(any("release eta: Mon 09:30 PDT (1350 minutes)" in line for line in lines))
 
     def test_stale_unit_marker_after_last_release_is_refused(self) -> None:
         self.assert_refused(self.report(True), "build_hold", "holder")
@@ -256,9 +256,9 @@ class DailiesHoldTests(unittest.TestCase):
         self.assertIn("still held by second", release.stdout)
         report = self.assert_ok(self.report(True, extra={"units": units}))
         footer = self.assert_ok(self.footer())
-        hold_lines = [line for line in report if line.startswith("build hold:")]
-        self.assertEqual(hold_lines, ["build hold: second since 10:56 PDT, for the second test - release eta: unknown"])
-        self.assertEqual([line for line in footer if line.startswith("build hold:")], hold_lines)
+        hold_lines = [line for line in report if line.startswith("* build hold:")]
+        self.assertEqual(hold_lines, ["* build hold: second since 10:56 PDT, for the second test - release eta: unknown"])
+        self.assertEqual([line for line in footer if line.startswith("* build hold:")], hold_lines)
         for label in ("widget", "frame"):
             self.assertEqual(len([line for line in report if line.startswith(label) and "build hold" in line]), 1)
         self.assertFalse((self.folder / "first").exists())

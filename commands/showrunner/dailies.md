@@ -214,7 +214,7 @@ names another plan's document. User, 2026-10-02.
 - **Agents:** after the chart and any build-hold lines, one line per active account shows its week used, when it runs out at its current pace (leaned early by how much sooner past run-outs came, `scripts/whoami/run_out.py`) or lasts to refill, and its available resets: `- claude 1: 40% of the week used; runs out about Tue 07:10 PDT, before its Sun 23:00 refill; 1 reset available until Oct 22` (user, 2026-10-05).
 - **Footer:** the reply footer (`/showrunner:produce` → Footer), from
   `next_run`, the holder files, `OUTSTANDING` and whether any subject has `needed:`. The
-  report replaces the turn's `— waiting on:` line.
+  report ends with that footer. The Waiting on block follows it, as in every reply.
 
 ## Length
 
