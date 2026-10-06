@@ -116,7 +116,10 @@ python3 ~/.claude/scripts/production/dailies_render.py <scratchpad>/dailies_inpu
       "waiting_on_it": "the cable fix; widget merges it into Phase 18",
       "needed": "the showrunner: merge the checkpoint",
       "needs_user": false,
-      "then": "dimming after widget Phase 18, then nothing queued"
+      "then": [
+        "dimming, once widget's Phase 18 lands",
+        "the plan at Phase 19: new tools appear in the 3D scene"
+      ]
     }
   ],
   "topics": [
@@ -146,16 +149,19 @@ python3 ~/.claude/scripts/production/dailies_render.py <scratchpad>/dailies_inpu
 | `waiting_on_it` | Only for a topic that lands with this unit's phase, and who waits. |
 | `needed` | Only when the subject needs a follow-up nobody has started, from you (the user), the showrunner or another unit director. Say who. |
 | `needs_user` | `true` when the subject waits on you. It then goes first. |
-| `then` | See below. Required on a follow-up and on a plan's last phase. On a follow-up it must name the plan phase the unit returns to (`the plan at Phase <N>`), or say `plan done`; the renderer refuses anything else. Read the plan doc's `todo` phases to write it. |
+| `then` | A non-empty list of one-line items, one per upcoming phase or follow-up; lead with its phase number when it has one. A range with one shared purpose is one item: `76–79: edge cases in selection, jack panels, the palette and Log, saved scenes and reset`. Required on a follow-up and on a plan's last phase. On a follow-up, an item must name the plan phase the unit returns to (`the plan at Phase <N>`), or say `plan done`; the renderer refuses anything else. Read the plan doc's `todo` phases to write it. |
 | topic `title`, `update`, `eta` | The topic's name, what it is doing now, and when it lands, as text. |
 
-**`then`** says what the unit does after this, when it is not simply the plan's
-next phase:
+**`then`** lists what the unit does after this, in order. Give each upcoming
+phase or follow-up its own item; group a phase range only when it has one shared
+purpose. `simple` shows only the first item. `page` and `elaborate` show each
+item as a sub-bullet under `- then:`; a single item stays on the `- then:` line.
+
 - On work inserted ahead of its plan (a follow-up, or a phase added mid-run)
-  while plan phases are still open: name the plan phase it goes back to, by
-  number and what it does, and anything queued before it: `precompose redesign
-  and dimming, then back to the plan at Phase 41 (new tools placed by the
-  arrangement engine)`.
+  while plan phases are still open: list anything queued before the return,
+  then name the plan phase it goes back to, by number and what it does:
+  `["40: precompose redesign and dimming", "the plan at Phase 41: new tools
+  placed by the arrangement engine"]`.
 - On its plan's last phase with more work queued: name it and its source: `the
   hana_organon plan (docs/hana/hana-organon-design.md), six phases, once this
   phase is merged`. With nothing queued, `nothing queued`.
@@ -163,12 +169,12 @@ next phase:
 Read the plans and design docs for this, not the unit's queue alone. A unit
 director's own handoff may list only the work in front of it.
 
-Phases run in number order, so `then` never names a phase at or before the
-heading's: `Phase 3 of 3` followed by `then: Phase 2` reads as impossible.
+Phases run in number order, so each `then` item never names a phase at or before
+the heading's: `Phase 3 of 3` followed by `["2: tool-face sizing"]` reads as impossible.
 When a unit runs its phases out of order, renumber its plan so the numbers
 follow the run order (packaging: your call), tell the unit director, and report
-the new numbers. The renderer refuses a `then` that goes backwards, unless it
-names another plan's document. User, 2026-10-02.
+the new numbers. The renderer refuses any `then` item that goes backwards,
+unless it names another plan's document. User, 2026-10-02.
 
 ### What the renderer writes
 

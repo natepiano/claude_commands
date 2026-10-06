@@ -70,6 +70,7 @@ CHANGE_NEEDS_WHY_MINUTES = 15
 LABEL_LIMIT = 8
 RETURN = re.compile(r"\bthe plan at Phase \d+|\bplan done\b")
 PHASE_MENTION = re.compile(r"\bPhases? (\d+(?:\s*(?:,|and|-|–|to)\s*\d+)*)|\bP(\d+)\b")
+THEN_PHASE_LABEL = re.compile(r"^(\d+(?:\s*[-–]\s*\d+)?)\s*:")
 COUNT = re.compile(r"\b(\d+) [a-z]")
 EXAMPLES = re.compile(r"\bsuch as\b|\be\.g\.|\bfor example\b")
 STARTED = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}$")
@@ -159,6 +160,16 @@ class Goal:
 
 
 @dataclass(frozen=True)
+class UpcomingWork:
+    items: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class NoUpcomingWork:
+    pass
+
+
+@dataclass(frozen=True)
 class Unit:
     unit: str
     name: str
@@ -175,7 +186,7 @@ class Unit:
     waiting_on_it: str | None
     needed: str | None
     needs_user: bool
-    then: str | None
+    upcoming_work: UpcomingWork | NoUpcomingWork
 
 
 @dataclass(frozen=True)
@@ -461,6 +472,18 @@ def text(fields: JsonMap, key: str, where: str) -> str:
     return value
 
 
+def parse_upcoming_work(fields: JsonMap, where: str) -> UpcomingWork | NoUpcomingWork:
+    value = fields.get("then")
+    if value is None:
+        return NoUpcomingWork()
+    if isinstance(value, str):
+        return UpcomingWork((text(fields, "then", where),))
+    if not isinstance(value, list) or not value:
+        raise InputError(f"{where}.then: expected a non-empty list of one-line text")
+    items = tuple(text({"then": item}, "then", where) for item in cast(list[object], value))
+    return UpcomingWork(items)
+
+
 def flag(fields: JsonMap, key: str, where: str) -> bool:
     value = fields.get(key, False)
     if not isinstance(value, bool):
@@ -563,9 +586,11 @@ def other_phases(line: str, number: int | None) -> list[int]:
 
 def check_then_order(then: str, number: int, where: str) -> None:
     """Plan phases run in number order, so what comes next never has a lower number."""
-    if OTHER_PLAN.search(then):
-        return
-    earlier = [found for found in phases_named(then) if found <= number]
+    label = THEN_PHASE_LABEL.match(then)
+    named: list[int] = [] if OTHER_PLAN.search(then) else phases_named(then)
+    if label is not None:
+        named.extend(int(digits.group(0)) for digits in re.finditer(r"\d+", label.group(1)))
+    earlier = [found for found in named if found <= number]
     if earlier:
         raise InputError(
             f"{where}.then: names Phase {', '.join(str(found) for found in earlier)} after this Phase {number}, which reads as impossible. "
@@ -667,20 +692,25 @@ def parse_unit(value: object, where: str, length: str) -> Unit:
         raise InputError(
             f"{where}.phase: {phase!r} must read 'Phase <N> of <M>: <what it changes>' or 'follow-up <K> of <Q>: <what it changes>'"
         )
-    then = optional_text(fields, "then", where)
+    upcoming_work = parse_upcoming_work(fields, where)
     plan_number, plan_total, follow_number, follow_total = match.groups()
     number = int(plan_number or follow_number)
     total = int(plan_total or follow_total)
     if number > total:
         raise InputError(f"{where}.phase: {number} of {total}")
-    if follow_number is not None and (then is None or not RETURN.search(then)):
+    if follow_number is not None and (
+        isinstance(upcoming_work, NoUpcomingWork) or not any(RETURN.search(item) for item in upcoming_work.items)
+    ):
         raise InputError(f"{where}.then: a follow-up names the plan phase it returns to ('the plan at Phase <N>'), or says 'plan done' after reading the plan")
-    if then is None and number == total:
+    if isinstance(upcoming_work, NoUpcomingWork) and number == total:
         raise InputError(f"{where}.then: required on a last phase; name the queued work, or 'nothing queued'")
     heading_number = int(plan_number) if plan_number else None
-    if then is not None and heading_number is not None:
-        check_then_order(then, heading_number, where)
-    for key in ("phase", "held", "held_examples", "update", "waiting_on_it", "needed", "then"):
+    if isinstance(upcoming_work, UpcomingWork):
+        for item in upcoming_work.items:
+            if heading_number is not None:
+                check_then_order(item, heading_number, where)
+            check_words(item, "then", where)
+    for key in ("phase", "held", "held_examples", "update", "waiting_on_it", "needed"):
         line = optional_text(fields, key, where)
         if line is not None:
             check_words(line, key, where)
@@ -718,7 +748,7 @@ def parse_unit(value: object, where: str, length: str) -> Unit:
         waiting_on_it=optional_text(fields, "waiting_on_it", where),
         needed=optional_text(fields, "needed", where),
         needs_user=flag(fields, "needs_user", where),
-        then=then,
+        upcoming_work=upcoming_work,
     )
 
 
@@ -1118,8 +1148,13 @@ def render(report: Report, previous: dict[str, Previous], now: datetime, zone_na
             lines.append(f"- waiting on it: {unit.waiting_on_it}")
         if unit.needed:
             lines.append(f"- needed: {unit.needed}")
-        if unit.then:
-            lines.append(f"- then: {unit.then}")
+        if isinstance(unit.upcoming_work, UpcomingWork):
+            items = unit.upcoming_work.items
+            if report.length == "simple" or len(items) == 1:
+                lines.append(f"- then: {items[0]}")
+            else:
+                lines.append("- then:")
+                lines.extend(f"  - {item}" for item in items)
         lines.append("")
     for topic in other_topics:
         topic_section(topic)
