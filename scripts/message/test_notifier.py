@@ -91,6 +91,16 @@ class NotifierTests(unittest.TestCase):
         path = self.state_dir / "example" / "fire.log"
         return path.read_text().splitlines() if path.exists() else []
 
+    def wait_for_text(self, path: Path, expected: str) -> str:
+        deadline = time.monotonic() + 4
+        while time.monotonic() < deadline:
+            if path.exists():
+                contents = path.read_text()
+                if expected in contents:
+                    return contents
+            time.sleep(0.02)
+        self.fail(f"{path} did not contain {expected!r} before the deadline")
+
     def test_minute_rule_new_preserves_existing_state_and_retargets(self) -> None:
         self.assertTrue(self.new().startswith(f"next_due={MINUTE + 120} ("))
         self.assertEqual(self.state()["ENABLED"], "1")
@@ -279,6 +289,71 @@ class NotifierTests(unittest.TestCase):
         _ = self.successful("remove", "example")
         _ = self.successful("remove", "example")
         self.assertEqual(self.run_cli("status", "example").returncode, 1)
+
+    def test_run_only_tick_executes_once_without_sending_or_logging_success(self) -> None:
+        output = self.root / "runs"
+        command = f"/bin/sh -c 'printf run >> {output}'"
+        _ = self.successful("new", "example", "--every", "1", "--run", command)
+        self.assertIn(f"example runs {command} every 1 min", self.successful("status", "example"))
+        _ = self.successful("tick", now=MINUTE + 60)
+        self.assertEqual(self.wait_for_text(output, "run"), "run")
+        self.assertFalse(self.send_args.exists())
+        self.assertEqual(self.lines(), [])
+        _ = self.successful("tick", now=MINUTE + 60)
+        self.assertEqual(output.read_text(), "run")
+        _ = self.successful("tick", now=MINUTE + 120)
+        self.assertEqual(self.wait_for_text(output, "runrun"), "runrun")
+
+    def test_run_only_tick_logs_exit_failure_and_timeout(self) -> None:
+        _ = self.successful("new", "example", "--every", "1", "--run", "/bin/sh -c 'exit 7'")
+        _ = self.successful("tick", now=MINUTE + 60)
+        _ = self.wait_for_text(self.state_dir / "example" / "fire.log", "exit 7")
+        self.assertTrue(any("exit 7" in line for line in self.lines()))
+        self.assertFalse(self.send_args.exists())
+        slow = self.root / "slow-run"
+        _ = slow.write_text("#!/bin/sh\nexec sleep 4\n")
+        slow.chmod(0o755)
+        _ = self.successful("new", "example", "--every", "1", "--run", str(slow), "--timeout", "1")
+        started = time.monotonic()
+        _ = self.successful("tick", now=MINUTE + 120)
+        self.assertLess(time.monotonic() - started, 3)
+        _ = self.wait_for_text(self.state_dir / "example" / "fire.log", "run timeout")
+        self.assertTrue(any("timeout" in line for line in self.lines()))
+        self.assertFalse(self.send_args.exists())
+
+    def test_run_only_long_run_does_not_hold_tick_or_other_due_instance(self) -> None:
+        started_file = self.root / "started"
+        finished_file = self.root / "finished"
+        slow = self.root / "slow-run"
+        _ = slow.write_text(f"#!/bin/sh\nprintf started > {started_file}\nsleep 3\nprintf finished > {finished_file}\n")
+        slow.chmod(0o755)
+        _ = self.successful("new", "example", "--every", "1", "--run", str(slow), "--timeout", "2")
+        _ = self.successful("new", "other", "--to", "session:sid-1", "--every", "1", "--command", "due")
+        started = time.monotonic()
+        _ = self.successful("tick", now=MINUTE + 60)
+        self.assertLess(time.monotonic() - started, 1.5)
+        _ = self.wait_for_text(started_file, "started")
+        self.assertFalse(finished_file.exists())
+        self.assertTrue(self.send_args.exists())
+        _ = self.wait_for_text(self.state_dir / "example" / "fire.log", "run timeout")
+
+    def test_run_only_run_log_captures_stderr_and_replaces_previous_run(self) -> None:
+        run_log = self.state_dir / "example" / "run.log"
+        _ = self.successful("new", "example", "--every", "1", "--run", "/bin/sh -c 'echo first >&2'")
+        _ = self.successful("tick", now=MINUTE + 60)
+        self.assertEqual(self.wait_for_text(run_log, "first"), "first\n")
+        _ = self.successful("new", "example", "--every", "1", "--run", "/bin/sh -c 'echo second >&2'")
+        _ = self.successful("tick", now=MINUTE + 120)
+        self.assertEqual(self.wait_for_text(run_log, "second"), "second\n")
+        self.assertEqual(self.lines(), [])
+
+    def test_run_only_rejects_delivery_and_check_options(self) -> None:
+        for option, value in (("--to", "session:sid-1"), ("--command", "prompt"),
+                              ("--prompt-file", "/tmp/prompt"), ("--check", "/bin/true")):
+            with self.subTest(option=option):
+                result = self.run_cli("new", "example", "--every", "1", "--run", "/bin/true", option, value)
+                self.assertEqual(result.returncode, 2, result.stderr)
+                self.assertFalse((self.state_dir / "example").exists())
 
 
 if __name__ == "__main__":

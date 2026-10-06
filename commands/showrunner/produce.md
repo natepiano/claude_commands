@@ -226,6 +226,7 @@ For each unit without a live unit director:
      `tmux new-session -d -s <session> -c <worktree> -e SHOWRUNNER_UNIT=<slug> zsh -ic "ENABLE_TOOL_SEARCH=true command claude --remote-control <session> -n <session> --settings '{\"disableAgentView\": true}' '/unit:delegate <unit plan>'; exec zsh"`
 3. **Check.** Log the launch only after the pane shows `/remote-control is
    active`. The mobile session list lags by minutes; trust the pane.
+   Run `$HOME/.claude/scripts/lib/py $HOME/.claude/scripts/production/showrunners.py add <this session's name> --zone <zone> --unit <session>`.
 4. **Resume.** To bring back a unit director whose session ended, use
    `claude --resume <session-id> --remote-control <session> -n <session>`, which
    keeps its link and its place in the list.
@@ -257,7 +258,10 @@ Run these steps at the start and on every resume:
    $HOME/.claude/scripts/production/production_check.sh <absolute doc path>"`,
    plus `--aligned` when that line says on the hour. A repeated `new` retargets
    without moving the clock.
-4. **Status.** Run `NOTIFIER status UPDATES` for the next tick and fire log.
+   Run `$HOME/.claude/scripts/lib/py $HOME/.claude/scripts/production/showrunners.py add <this session's name> --zone <zone> --unit <each unit's tmux session>`, using the name from ListAgents.
+4. **Stall watch.** If `NOTIFIER status stall-watch` reports no instance, run
+   `NOTIFIER new stall-watch --every 1 --run "$HOME/.claude/scripts/lib/py $HOME/.claude/scripts/production/stall_watch.py"`.
+5. **Status.** Run `NOTIFIER status UPDATES` for the next tick and fire log.
    The declared job runs the ticks.
 
 The prompt:
@@ -303,8 +307,7 @@ script, and then runs `NOTIFIER restart UPDATES` so the next tick comes N minute
 that report (`/showrunner:dailies` → Status check and clock).
 `/showrunner:interval <minutes>` changes N.
 
-Log `UPDATES` and its `next_due`. Then check that this session is on
-the quota alert list (<QuotaAlert/>).
+Log `UPDATES` and its `next_due`. Read the quota alert protocol (<QuotaAlert/>).
 
 Each run of the script does two things:
 - It scans every unit director for a form or decision waiting on the user.
@@ -882,9 +885,7 @@ them, how to tell the three kinds apart, and what a receiver does are in
 `~/.claude/docs/quota_alerts.md`. Read it at <StartUpdates/> and follow it; this
 section adds only what the showrunner role needs.
 
-**The list.** At <StartUpdates/>, check that this session's name, as ListAgents
-gives it for "This session is", is in the `notify` list the doc names. The user
-keeps the list: if the name is missing, tell them once; never edit the file.
+This session is on the quota alert list because <StartUpdates/> adds it.
 
 **Unit directors act through you.** They are not on the list, so each notice
 reaches them only as your relay (<Throughout/>):
@@ -920,7 +921,8 @@ When every unit's final-gate and as-built checkpoints are merged:
      `git -C CHECKOUT ls-remote --exit-code --heads origin <branch>` finds it.
 
    Leave the tmux sessions; the user closes them.
-4. Remove the update instance: `NOTIFIER remove UPDATES`.
+4. Remove the update instance with `NOTIFIER remove UPDATES`, then run
+   `$HOME/.claude/scripts/lib/py $HOME/.claude/scripts/production/showrunners.py remove <this session's name>`.
 5. Set the doc's status to `wrapped`, commit it as
    `production(<name>): wrapped`, and push.
 6. Report:
