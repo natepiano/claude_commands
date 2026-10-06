@@ -21,10 +21,21 @@ SESSIONS_DIR = Path(os.environ.get("NOTIFIER_SESSIONS_DIR") or Path.home() / ".c
 SESSIONS = Path(os.environ.get("SHOWRUNNERS_SESSIONS") or Path(__file__).resolve().parent.parent / "message/sessions.py")
 
 
+class WorkingUnit(NamedTuple):
+    name: str
+
+
+class StandbyUnit(NamedTuple):
+    name: str
+
+
+UnitState = WorkingUnit | StandbyUnit
+
+
 class Showrunner(TypedDict):
     session: str
     zone: str
-    units: list[str]
+    units: list[UnitState]
 
 
 class ShowrunnerSettings(TypedDict):
@@ -80,12 +91,21 @@ def load_settings(path: Path | None = None) -> ShowrunnerSettings:
                 raise ValueError("invalid showrunner")
             entry = cast(dict[str, object], item)
             session, zone, units = entry.get("session"), entry.get("zone"), entry.get("units")
+            standby = entry.get("standby", [])
             if (not isinstance(session, str) or not session or not isinstance(zone, str)
                     or not isinstance(units, list)
-                    or not all(isinstance(unit, str) for unit in cast(list[object], units))):
+                    or not all(isinstance(unit, str) for unit in cast(list[object], units))
+                    or not isinstance(standby, list)
+                    or not all(isinstance(unit, str) for unit in cast(list[object], standby))):
                 raise ValueError("invalid showrunner fields")
+            names = cast(list[str], units)
+            waiting = cast(list[str], standby)
+            if len(set(names)) != len(names) or len(set(waiting)) != len(waiting) or not set(waiting) <= set(names):
+                raise ValueError("invalid standby units")
             _ = ZoneInfo(zone)
-            checked.append(Showrunner(session=session, zone=zone, units=cast(list[str], units)))
+            checked.append(Showrunner(session=session, zone=zone,
+                                      units=[StandbyUnit(unit) if unit in waiting else WorkingUnit(unit)
+                                             for unit in names]))
         return ShowrunnerSettings(threshold_percent=cast(float, data["threshold_percent"]),
                                   repeat_minutes=cast(float, data["repeat_minutes"]),
                                   stall_minutes=cast(float, data["stall_minutes"]),
@@ -180,14 +200,19 @@ def missing_showrunners(settings: ShowrunnerSettings) -> list[RunningShowrunner]
     return [runner for runner in running_showrunners() if runner.socket not in sockets]
 
 
-def add(settings: ShowrunnerSettings, session: str, zone: str, units: list[str]) -> None:
+def add(settings: ShowrunnerSettings, session: str, zone: str, units: list[str], standby: bool = False) -> None:
     _ = ZoneInfo(zone)
+    requested = [StandbyUnit(unit) if standby else WorkingUnit(unit) for unit in dict.fromkeys(units)]
     for runner in settings["showrunners"]:
         if runner["session"] == session:
             runner["zone"] = zone
-            runner["units"].extend(unit for unit in units if unit not in runner["units"])
+            known = {unit.name for unit in runner["units"]}
+            runner["units"].extend(unit for unit in requested if unit.name not in known)
+            if standby:
+                runner["units"] = [StandbyUnit(unit.name) if unit.name in units else unit
+                                   for unit in runner["units"]]
             return
-    settings["showrunners"].append(Showrunner(session=session, zone=zone, units=list(dict.fromkeys(units))))
+    settings["showrunners"].append(Showrunner(session=session, zone=zone, units=requested))
 
 
 def remove(settings: ShowrunnerSettings, session: str, units: list[str]) -> None:
@@ -196,7 +221,31 @@ def remove(settings: ShowrunnerSettings, session: str, units: list[str]) -> None
     else:
         for runner in settings["showrunners"]:
             if runner["session"] == session:
-                runner["units"] = [unit for unit in runner["units"] if unit not in units]
+                runner["units"] = [unit for unit in runner["units"] if unit.name not in units]
+
+
+def ready(settings: ShowrunnerSettings, session: str, units: list[str]) -> list[str]:
+    changed: set[str] = set()
+    for runner in settings["showrunners"]:
+        if runner["session"] == session:
+            changed.update(unit.name for unit in runner["units"]
+                           if isinstance(unit, StandbyUnit) and unit.name in units)
+            runner["units"] = [WorkingUnit(unit.name) if isinstance(unit, StandbyUnit) and unit.name in units
+                               else unit for unit in runner["units"]]
+            break
+    return [unit for unit in units if unit not in changed]
+
+
+def stored_settings(settings: ShowrunnerSettings) -> dict[str, object]:
+    runners: list[dict[str, object]] = []
+    for runner in settings["showrunners"]:
+        stored: dict[str, object] = {"session": runner["session"], "zone": runner["zone"],
+                                     "units": [unit.name for unit in runner["units"]]}
+        waiting = [unit.name for unit in runner["units"] if isinstance(unit, StandbyUnit)]
+        if waiting:
+            stored["standby"] = waiting
+        runners.append(stored)
+    return {**settings, "showrunners": runners}
 
 
 def rewrite_prompt_names(old: str, new: str) -> None:
@@ -237,24 +286,32 @@ def rewrite_prompt_names(old: str, new: str) -> None:
         os.replace(temporary_path, prompt_path)
 
 
-def change(action: str, session: str, zone: str, units: list[str], new_name: str = "") -> None:
+def change(action: str, session: str, zone: str, units: list[str], new_name: str = "",
+           standby: bool = False) -> None:
     CONFIG.parent.mkdir(parents=True, exist_ok=True)
     with CONFIG.with_suffix(".lock").open("a+", encoding="utf-8") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
         settings = load_settings() if CONFIG.exists() else defaults()
         if action == "add":
-            add(settings, session, zone, units)
+            add(settings, session, zone, units, standby)
         elif action == "remove":
             remove(settings, session, units)
+        elif action == "ready":
+            missing = ready(settings, session, units)
+            for unit in missing:
+                print(f"{unit} is not on standby")
+            if len(missing) == len(units):
+                return
         elif action == "rename":
             for runner in settings["showrunners"]:
                 old_runner = runner["session"]
                 if old_runner == session:
                     runner["session"] = new_name
-                runner["units"] = [new_name if unit == session else unit for unit in runner["units"]]
+                runner["units"] = [type(unit)(new_name if unit.name == session else unit.name)
+                                   for unit in runner["units"]]
                 result = subprocess.run([sys.executable, str(Path(__file__).with_name("stall_watch.py")),
                                          "rename-state", session, new_name, old_runner,
-                                         runner["session"], *runner["units"]],
+                                         runner["session"], *(unit.name for unit in runner["units"])],
                                         capture_output=True, text=True, check=False)
                 if result.returncode != 0:
                     raise ValueError(f"stall state rename failed: {result.stderr.strip()}")
@@ -267,7 +324,7 @@ def change(action: str, session: str, zone: str, units: list[str], new_name: str
                 add(settings, runner.session, runner.prompt.zone, list(runner.prompt.unit_sessions))
         with tempfile.NamedTemporaryFile("w", dir=CONFIG.parent, prefix=".showrunners-", delete=False,
                                          encoding="utf-8") as temporary:
-            json.dump(settings, temporary, indent=2)
+            json.dump(stored_settings(settings), temporary, indent=2)
             _ = temporary.write("\n")
             temporary.flush()
             os.fsync(temporary.fileno())
@@ -282,9 +339,13 @@ def main(argv: list[str]) -> int:
     _ = adding.add_argument("session")
     _ = adding.add_argument("--zone", required=True)
     _ = adding.add_argument("--unit", action="append", default=[])
+    _ = adding.add_argument("--standby", action="store_true")
     removing = commands.add_parser("remove")
     _ = removing.add_argument("session")
     _ = removing.add_argument("--unit", action="append", default=[])
+    making_ready = commands.add_parser("ready")
+    _ = making_ready.add_argument("session")
+    _ = making_ready.add_argument("--unit", action="append", required=True)
     renaming = commands.add_parser("rename")
     _ = renaming.add_argument("session")
     _ = renaming.add_argument("new_name")
@@ -297,7 +358,9 @@ def main(argv: list[str]) -> int:
             settings = load_settings()
             for runner in settings["showrunners"]:
                 state = "running" if socket_for(runner["session"]) else "not running"
-                print(f"{runner['session']}\t{state}\t{runner['zone']}\t{' '.join(runner['units'])}")
+                unit_names = (unit.name + (":standby" if isinstance(unit, StandbyUnit) else "")
+                              for unit in runner["units"])
+                print(f"{runner['session']}\t{state}\t{runner['zone']}\t{' '.join(unit_names)}")
             for runner in missing_showrunners(settings):
                 if isinstance(runner.prompt, PromptUnits):
                     detail = f"{runner.prompt.zone}\t{' '.join(runner.prompt.unit_sessions)}"
@@ -307,7 +370,7 @@ def main(argv: list[str]) -> int:
         else:
             change(action, cast(str, getattr(args, "session", "")), cast(str, getattr(args, "zone", "")),
                    cast(list[str], getattr(args, "unit", [])),
-                   cast(str, getattr(args, "new_name", "")))
+                   cast(str, getattr(args, "new_name", "")), cast(bool, getattr(args, "standby", False)))
     except (OSError, ValueError, KeyError) as error:
         print(f"showrunners: {error}", file=sys.stderr)
         return 1

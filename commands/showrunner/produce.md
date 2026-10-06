@@ -209,38 +209,19 @@ Only when the doc's status is `planned`:
 ---
 
 <LaunchUnits>
-For each unit without a live unit director:
+For each unit without a live unit director, run
+`$HOME/.claude/scripts/lib/py $HOME/.claude/scripts/production/add_unit.py --production PRODUCTION_DOC <name> --plan <unit plan>`.
+`<name>` is the Units row's Unit value without `-unit`; the existing row is adopted.
+Use `--standby` for a unit waiting for an assignment. Tell the user one line
+per unit director: its session name and `tmux attach -t <session>`.
 
-1. **Worktree.** If it is absent, run
-   `git -C CHECKOUT worktree add <worktree> -b <branch> <merge branch>`, then
-   `git -C CHECKOUT push -u origin <branch>`. When the
-   repository has `.claude/config/berth.toml`, also set
-   `git -C CHECKOUT config branch.<branch>.cargoBerthTarget <merge branch>`, so
-   cargo-berth measures the unit against the merge branch.
-2. **Session.** Always use detached tmux. The unit director then outlives this
-   session, runs while the screen is locked, and the showrunner can type into
-   it. When a unit director is blocked on a full context, type `/compact` into it with
-   `send-keys -l`, then `Enter`. First capture the pane to check the block is
-   still showing and no compaction is already running, since the user may have
-   typed it already.
-   - tmux is `command -v tmux`, or else
-     `$(nix build --no-link --print-out-paths 'nixpkgs#tmux^out')/bin/tmux`.
-   - Start it through `systemd-run --user --scope --unit=<session>`, so it lives
-     outside this session's scope.
-   - Remove every `CLAUDE_*` variable from its environment. An inherited
-     `CLAUDE_CODE_CHILD_SESSION` turns off transcript saving.
-   - `SHOWRUNNER_UNIT` marks it as yours: `/notify_top_level` messages reach
-     you, not it. Pass on what applies to it.
-   - Launch:
-     `tmux new-session -d -s <session> -c <worktree> -e SHOWRUNNER_UNIT=<slug> zsh -ic "ENABLE_TOOL_SEARCH=true command claude --remote-control <session> -n <session> --settings '{\"disableAgentView\": true}' '/unit:delegate <unit plan>'; exec zsh"`
-3. **Check.** Log the launch only after the pane shows `/remote-control is
-   active`. The mobile session list lags by minutes; trust the pane.
-   Run `$HOME/.claude/scripts/lib/py $HOME/.claude/scripts/production/showrunners.py add <this session's name> --zone <zone> --unit <session>`.
-4. **Resume.** To bring back a unit director whose session ended, use
+When a unit director is blocked on a full context, first capture its pane to
+confirm the block remains and no compaction is running. Type `/compact` with
+`tmux send-keys -l`, then send `Enter` separately.
+
+**Resume.** To bring back a unit director whose session ended, use
    `claude --resume <session-id> --remote-control <session> -n <session>`, which
    keeps its link and its place in the list.
-
-Tell the user one line per unit director: its session name, and `tmux attach -t <session>`.
 </LaunchUnits>
 
 ---

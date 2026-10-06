@@ -126,6 +126,27 @@ raise SystemExit(1)
         _ = self.successful("remove", "director")
         self.assertEqual(self.entries(), [])
 
+    def test_standby_add_list_and_ready_preserve_unit_membership(self) -> None:
+        _ = self.successful("add", "director", "--zone", "America/Los_Angeles",
+                            "--unit", "alpha", "--standby")
+        self.assertEqual(self.entries()[0]["units"], ["alpha"])
+        self.assertEqual(self.entries()[0]["standby"], ["alpha"])
+        self.assertIn("alpha:standby", self.successful("list"))
+        _ = self.successful("ready", "director", "--unit", "alpha")
+        self.assertEqual(self.entries()[0]["units"], ["alpha"])
+        self.assertEqual(self.entries()[0].get("standby", []), [])
+        self.assertNotIn("alpha:standby", self.successful("list"))
+
+    def test_ready_non_standby_unit_says_so_without_changing_config(self) -> None:
+        _ = self.successful("add", "director", "--zone", "America/Los_Angeles", "--unit", "alpha")
+        before = self.config.read_bytes()
+        result = self.cli("ready", "director", "--unit", "alpha")
+        self.assertEqual(result.returncode, 0, (result.stdout, result.stderr))
+        self.assertEqual(self.config.read_bytes(), before)
+        self.assertEqual(len((result.stdout + result.stderr).strip().splitlines()), 1)
+        self.assertIn("alpha", result.stdout + result.stderr)
+        self.assertIn("not on standby", result.stdout + result.stderr)
+
     def test_concurrent_adds_both_land(self) -> None:
         first = subprocess.Popen([sys.executable, str(SCRIPT), "add", "first", "--zone", "America/Los_Angeles",
                                   "--unit", "hook"], env=self.environment(), stdout=subprocess.PIPE,

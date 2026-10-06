@@ -109,7 +109,7 @@ A unit's `then` in the dailies input is a JSON list of one-line items, one per u
 
 **Ruled out:** teaching `produce.md` the shrink notice here — it is the showrunner's file, and the merge-checkpoint phase owns it.
 
-### Phase 4 — A unit can wait on standby, and promote and produce use the command · status: todo
+### Phase 4 — A unit can wait on standby, and promote and produce use the command · status: done
 
 **Blocked by:** G1 — stalls-unit phase 6 merged into `build-followups` (cleared: `966b814`, merged into this branch as `86a9b19`)
 

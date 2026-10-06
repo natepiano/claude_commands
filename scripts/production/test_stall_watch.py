@@ -400,6 +400,27 @@ raise SystemExit(1 if record['to'] in fail else 0)
         _ = self.tick(START + 1201)
         self.assertEqual(len(self.sent()), 4)
 
+    def test_standby_unit_is_skipped_until_ready(self) -> None:
+        registry = SCRIPT.with_name("showrunners.py")
+        added = subprocess.run([sys.executable, str(registry), "add", "showrunner",
+                                "--zone", "America/Los_Angeles", "--unit", "unit-one",
+                                "--standby"], env=self.environment, capture_output=True,
+                               text=True, check=False)
+        self.assertEqual(added.returncode, 0, added.stderr)
+        self.assertEqual(self.tick(START).returncode, 0)
+        self.assertEqual(self.tick(START + 600).returncode, 0)
+        self.assertEqual(self.sent(), [])
+        ready = subprocess.run([sys.executable, str(registry), "ready", "showrunner",
+                                "--unit", "unit-one"], env=self.environment,
+                               capture_output=True, text=True, check=False)
+        self.assertEqual(ready.returncode, 0, ready.stderr)
+        self.assertEqual(self.tick(START + 601).returncode, 0)
+        self.assertEqual(self.sent(), [])
+        self.assertEqual(self.tick(START + 901).returncode, 0)
+        self.assertEqual(len(self.sent()), 2)
+        self.assertEqual({item["key"].rsplit(":", 1)[-1] for item in self.sent()},
+                         {"bump", "tell"})
+
     def test_extended_tmux_session_name_does_not_match_missing_unit(self) -> None:
         _ = self.panes.pop("unit-one")
         _ = self.unit("unit-one-extra")
