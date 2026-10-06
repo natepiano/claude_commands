@@ -1,6 +1,6 @@
 # Screen recording skill
 
-> **Status: IMPLEMENTATION PLAN — phased, delegate-ready.** The `/screen_record` skill on Linux, then `/unit:report` timers that are flagged when missing and never skipped after a rejected report.
+> **Status: IMPLEMENTATION PLAN — phased, delegate-ready.** The `/screen_record` skill on Linux, then `/unit:report` timers that are flagged when missing and never skipped after a rejected report, then Codex seats that survive a refused turn instead of dying on its `systemError` status.
 
 > **Production: build-followups** — unit `stalls-unit`; production doc `docs/plans/build-followups-production.md`
 
@@ -29,7 +29,7 @@ First consumer: `startup` (Hana's startup-animation video). Reply to it by SendM
 
 ## Delegation Context
 
-- **Project:** `~/.claude` — Claude Code commands, skills and scripts; this plan adds the `/screen_record` skill (Phase 1), then makes `/unit:report` timers flagged when missing and never skipped after a rejected report (Phase 2). Work in the worktree `/home/natepiano/worktrees/claude-build-followups-stalls` on branch `build-followups-stalls` (unit `stalls-unit` of production `build-followups`).
+- **Project:** `~/.claude` — Claude Code commands, skills and scripts; this plan adds the `/screen_record` skill (Phase 1), then makes `/unit:report` timers flagged when missing and never skipped after a rejected report (Phase 2), then keeps a Codex seat alive when its thread reads `systemError` after a refused turn (Phase 3). Work in the worktree `/home/natepiano/worktrees/claude-build-followups-stalls` on branch `build-followups-stalls` (unit `stalls-unit` of production `build-followups`).
 - **Project started:** 2026-10-06T11:37:09.858+00:00
 - **Stack:** zsh for `scripts/production/unit_status.sh` and `scripts/message/notifier.sh`; Python 3.13, standard library only (`argparse`, `subprocess`, `pathlib`, `shutil`, `unittest`); Markdown command docs. At run time the script calls `xprop`, coreutils `timeout` and `ffmpeg` (x11grab input, libx264), all in `/run/current-system/sw/bin` on natedev. natedev runs KDE Plasma on Wayland with Xwayland (`DISPLAY=:0`).
 - **Layout:**
@@ -41,6 +41,8 @@ First consumer: `startup` (Hana's startup-animation video). Reply to it by SendM
   - `scripts/production/test_unit_status.py` — its tests (new, Phase 2)
   - `scripts/delegate/progress_history.py` — the progress recorder; `progress` restarts the unit's notifier (Phase 2)
   - `scripts/delegate/test_progress_history.py` — the recorder's tests (Phase 2)
+  - `scripts/agents/codex_mesh.py` — the Codex seat launcher and app-server client (Phase 3)
+  - `scripts/agents/test_codex_mesh.py` — its tests, with a stub app-server (Phase 3)
 - **Key files:**
   - `commands/build_hold.md` — command doc convention: one-line frontmatter `description:` ending in `Args - …`, then numbered steps that run `python3 ~/.claude/scripts/<dir>/<script>.py`
   - `scripts/build_hold/build_hold.py` — typed Python convention: `from __future__ import annotations`, dataclasses and `TypedDict`, no `Any`
@@ -134,3 +136,42 @@ Work only in worktree `/home/natepiano/worktrees/claude-build-followups-stalls`,
 - `python3 -m unittest discover -s scripts/delegate -p 'test_progress_history.py'` green, including the refused-report restart tests.
 - `zsh -n scripts/production/unit_status.sh` clean.
 - `basedpyright scripts/production/test_unit_status.py scripts/delegate/progress_history.py scripts/delegate/test_progress_history.py` reports 0 errors and 0 warnings (the tool's own exit status is 3 in every checkout; the counts are the gate).
+
+### Phase 3 — A Codex seat survives a refused turn: `systemError` means no live turn · status: todo
+
+#### Work Order
+
+Work only in worktree `/home/natepiano/worktrees/claude-build-followups-stalls`, branch `build-followups-stalls`. State every time in PDT (America/Los_Angeles).
+
+**Source:** the user via trunk, 2026-10-06 05:1x PDT: Codex seats keep crashing mid-turn; "fixed, not worked around. Codex stays the seat we use." Seats die with `codex_mesh: <seat>: thread <id>: thread/read failed: unrecognized status systemError`, often then "could not be interrupted"; 10+ deaths since 2026-10-05 in widget-enhancements, frame-time, organon and trunk.
+
+**Cause (showrunner's probe, checked):** every errored turn in `~/.codex/sessions/2026/10/05` and `/06` (45 of 45) ends in `task_complete` error "Selected model is at capacity. Please try a different model.", `codex_error_info` `server_overloaded`; the latest death, thread `01a1111b-c366-7340-a82a-b1fcc9208e6d`, ends so at 05:07:55 PDT. The app-server (codex rust-v0.160.1, same in 0.159.3) then sets the thread status `systemError` (`app-server/src/thread_status.rs:174-179, 456`; via `note_system_error`, `bespoke_event_handling.rs:1030-1033`). `systemError` is not terminal: the thread is loaded, no turn runs, the last turn ended in an error; `turn/start` has no status gate and `note_turn_started` clears it (`thread_status.rs:147-151`). `ThreadStatus` is `notLoaded | idle | systemError | active{activeFlags}` (`codex app-server generate-ts`, `v2/ThreadStatus.ts`). `_read_live_turn` (`codex_mesh.py:1392`, check at 1402) accepts only `idle`, `notLoaded` and `active`, so the capacity loop's `thread/read` (1050) gets `ThreadStateUnknown` and 1052 raises `SystemExit`; the capacity retry from Phase 8 (179aeb5) has never run against the real server. The stub at `test_codex_mesh.py:340` answers `idle` after a refused turn, so no test caught it.
+
+**Goal:** a seat whose turn is refused for capacity backs off and resumes on the same thread, as Phase 8 designed; a seat whose turn fails otherwise reports that turn's own error; relaunch and `end` treat a `systemError` thread as having no live turn.
+
+**Spec:**
+- `_read_live_turn`: `systemError` returns `ThreadIdle()` alongside `idle` and `notLoaded`, with a one-line comment naming its meaning and the upstream source above. Any status the protocol does not define still returns `ThreadStateUnknown`.
+- Nothing else in the capacity loop, `_retry_warranted` or the relaunch path changes unless a test below fails without it; say so in the checkpoint if one does.
+- Stub app-server (`test_codex_mesh.py`): after any turn that ends with an error (`turn/failed`, or `turn/completed` carrying `error`), `thread/read` answers `systemError` for that thread until the next `turn/start`, as the real server does; an entry a test sets in `thread_statuses` still wins.
+- `test_failed_seat_relaunches_when_old_thread_has_unknown_status` (line 632) uses `systemError` as its unknown status; give it a status the protocol does not define (`retired`), so it keeps covering the unknown path.
+
+**Files:**
+- `scripts/agents/codex_mesh.py` — `_read_live_turn` accepts `systemError`.
+- `scripts/agents/test_codex_mesh.py` — the stub's error status; the unknown-status test's status; the new tests.
+
+**Seats:** 1 writer + 1 tester.
+- `impl` — `scripts/agents/codex_mesh.py`.
+- `test` — `scripts/agents/test_codex_mesh.py`:
+  - every existing capacity test (`test_capacity_*`, `test_structured_capacity_error_resumes_the_same_thread`) passes with the stub answering `systemError` after the refusal, and resumes on the same thread without repeating the prompt;
+  - a non-capacity turn failure (`test_other_turn_failure_does_not_use_capacity_backoff`) exits with the turn's own error text and no `thread/read failed`;
+  - a failed seat whose old thread reads `systemError` relaunches, sends no `turn/interrupt`, and logs no "could not be interrupted";
+  - `end` on a seat whose thread reads `systemError` logs no "could not be interrupted".
+
+**Constraints from prior phases:** this phase touches no Phase 1 or Phase 2 file.
+- Tests never start a real `codex` or app-server, never reach the network, and never write `~/.codex`.
+- Saved run output stays under a few GB; read each run and delete it before the next.
+
+**Acceptance gate:**
+- From the worktree root, `python3 -m unittest scripts.agents.test_codex_mesh` green.
+- `basedpyright scripts/agents/codex_mesh.py scripts/agents/test_codex_mesh.py` reports 0 errors and 0 warnings (the counts are the gate).
+- The checkpoint notice says what a seat now prints when a capacity refusal outlasts the 20-minute budget.
