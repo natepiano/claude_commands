@@ -24,6 +24,7 @@ class DailiesAgentsTests(unittest.TestCase):
     root: Path = Path()
     agents: Path = Path()
     readings: Path = Path()
+    run_outs: Path = Path()
     holders: Path = Path()
     original_tz: str | None = None
     original_hold_dir: str | None = None
@@ -34,6 +35,7 @@ class DailiesAgentsTests(unittest.TestCase):
         self.agents = self.root / "agents"
         self.agents.mkdir()
         self.readings = self.root / "readings.jsonl"
+        self.run_outs = self.root / "run_outs.jsonl"
         self.holders = self.root / "holders"
         self.holders.mkdir()
         self.original_tz = os.environ.get("TZ")
@@ -43,6 +45,7 @@ class DailiesAgentsTests(unittest.TestCase):
         time.tzset()
         _ = self.enterContext(patch.object(dailies_render, "AGENTS_DIR", self.agents, create=True))
         _ = self.enterContext(patch.object(dailies_render, "READINGS_LOG", self.readings, create=True))
+        _ = self.enterContext(patch.object(dailies_render, "RUN_OUTS_LOG", self.run_outs, create=True))
         _ = self.enterContext(patch.object(dailies_render, "CHART_CONF", self.root / "chart.conf"))
 
     @override
@@ -193,6 +196,23 @@ class DailiesAgentsTests(unittest.TestCase):
         )
         self.assertEqual(self.agent_lines(self.run_report()), [
             "- claude 1: 40% of the week used; runs out about Wed 00:45 PDT, before its Sun 12:45 refill; resets unknown",
+        ])
+
+    def test_past_run_outs_lean_the_prediction_early(self) -> None:
+        self.note("claude 1", usage="60", count=None, limit=None)
+        self.log(
+            ("claude 1", "2026-10-05T18:45:00+00:00", 70),
+            ("claude 1", "2026-10-05T19:45:00+00:00", 60),
+        )
+        self.assertEqual(self.agent_lines(self.run_report()), [
+            "- claude 1: 40% of the week used; runs out about 18:45 PDT today, before its Sun 23:00 refill; resets unknown",
+        ])
+        _ = self.run_outs.write_text("".join(json.dumps(record) + "\n" for record in [
+            {"account": "codex 2", "ended": "2026-10-06T02:18:47+00:00", "ratios": [0.5, 0.5]},
+            {"account": "claude 1", "ended": "2026-10-06T13:15:56+00:00", "ratios": [0.5, 0.5]},
+        ]))
+        self.assertEqual(self.agent_lines(self.run_report()), [
+            "- claude 1: 40% of the week used; runs out about 15:45 PDT today, before its Sun 23:00 refill; resets unknown",
         ])
 
     def test_readings_before_last_refill_are_ignored(self) -> None:
