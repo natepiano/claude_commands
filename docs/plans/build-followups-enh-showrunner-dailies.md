@@ -86,64 +86,28 @@ The user, via natedev, 2026-10-07 (relayed in the showrunner's words):
 
 ### Phase 2 — The recorder keeps a row for closing work and counts every code finding  · status: done
 
-#### Work Order
+#### As-built
 
-**Goal:** Two defects in the progress recorder, reported by screenshot-unit from its last phase (2026-10-07 10:10 PDT) and routed here by the showrunner. After the run's last phase closes, the unit director's remaining work (the plan shrink, the final gate, the style review, the as-built pass) can still open a recorded activity, where today `start-activity` exits 1. And the checkpoint notice's `code N findings` counts every code finding the phase's review raised, where today it counts only a lens that has been off since 2026-10-04 and so always says 0. A third defect, reported by the showrunner from the first live run after phase 1 merged (2026-10-07 10:45 PDT): a live unit whose Plan cell only describes work with the word `retired` was dropped as retired; the marker becomes a leading word that prose cannot trip.
-
-**Spec:**
-
-Part A, an activity after the last phase closes (`scripts/delegate/progress_history.py`):
-
-- Today `_start_activity` refuses unless the phase in state is `active` (`Start a phase before starting an activity`, exit 1). `/unit:delegate`'s phase-end order closes the phase with `finish-phase` and then opens a `shrink` activity; with no next phase to start, that call fails and the shrink has no record. `verify.sh` opens its own activity the same way and hides the failure, so the final gate records nothing either.
-- New rule: `start-activity` succeeds whenever the run is active and a phase has been started in it, whether that phase is still active or already closed by `finish-phase`. On a closed phase the activity's events (`activity_started`, `activity_finished`) carry that phase's `phase_instance_id`, the same phase `review-trial` reads.
-- A closed phase stays closed: its status, `finished_at` and recorded elapsed time do not change when an activity opens or closes after it.
-- `finish-activity` closes such an activity with its status, result and elapsed seconds, as it does inside a phase.
-- `start-phase` for the next phase closes an activity still open on the closed phase as `interrupted`, as it does for one left open inside a phase. `finish-run` closes one still open as `interrupted` too.
-- `start-activity` still refuses, exit 1, in two cases, each with its own message: no phase has been started in this run (keep `Start a phase before starting an activity`), and the run has finished (name that the run is finished).
-- `progress` keeps its present answer on a closed phase (`No active phase to report: …`); this phase does not change what a report prints.
-- Model the answer to "which phase does this activity belong to" as a named type (the house rule: a state is a named type, never a bare optional), not a `dict | None` passed around.
-
-Part B, the code finding count (`scripts/delegate/progress_history.py`, `scripts/production/review_regime.py`):
-
-- Today `_review_trial` adds to `code_findings` only when a `finding_opened` event names the `craft` lens. The broad review runs the `adversary` and `contract` lenses and the unit director's own read opens findings with no lens, so a phase with four code findings prints `code 0 findings`.
-- New rule: a finding counts as a code finding when it names any lens other than `ux`, or names no lens at all. A finding that names `ux` and a code lens counts once in each number, as today. The `ux` count, the minutes and the printed line's form (`review trial: ux <N> findings, code <N> findings, review-seat minutes <M>, ux check minutes <U>, ux repair minutes <R>`) do not change; `scripts/production/merge_checkpoint.py` parses that line.
-- The legacy lens word `both` still reads as `adversary,contract` through `_finding_lenses`, so it counts as one code finding.
-- Make the words agree with the number: `_review_trial`'s docstring; in `scripts/production/review_regime.py`, the header docstring gains one sentence (from 2026-10-07 the code number is every code finding the phase's review raised; before that it was the code-quality reviewer's alone) and the report label `code reviewer findings per phase (mean)` becomes `code findings per phase (mean)`.
-
-Part C, the retired marker (`scripts/production/add_unit.py`, `docs/production_format.md`):
-
-- Today `RETIRED = re.compile(r"\bretired\b")` is searched anywhere in a Units row's Plan cell. This unit's own row said `follow-up: retired units drop out of the status`, so the status output, the dailies, the waits and the stall watch all skipped a live unit.
-- New rule: a row is retired only when its Plan cell begins with the word `retired`, alone or straight after one opening parenthesis: `retired by the user 2026-10-07 …` or `(retired by the user 2026-10-07, worktree removed) …`. Leading spaces are ignored. The word is lower case and whole (`retiredness` does not count). The word anywhere later in the cell means nothing, and that includes later inside a leading parenthesis: `(run done; retired by the user)` is a live row.
-- One place holds the rule: one name in `add_unit.py` that answers "is this Plan cell retired", used by `live_unit_rows`, `retired_sessions` and `retired_units`, and by `finished_run_units` in `scripts/production/stall_watch.py`, which today imports the pattern and searches the Plan cell itself. No other file tests the word.
-- `docs/production_format.md`, the retired paragraph: say the Plan cell begins with `retired`, alone or inside an opening parenthesis, give the example `(retired by the user 2026-10-07, worktree removed)`, and say the word anywhere else in the cell changes nothing. Drop the sentence that a live unit's Plan cell never uses the word.
-- Tests (`scripts/production/test_add_unit.py`): a Units table built from rows of the real production doc `docs/plans/build-followups-production.md` (copy the rows into the test; read the doc, never write it, and do not open it from the test): the stalls-unit row with its Plan cell opening `(retired by the user 2026-10-07; run done, worktree removed)`, this unit's row with the Plan cell that tripped the old rule (`… (follow-up: retired units drop out of the status and a simple dailies groups idle units; …`), and one more live row. `retired_units` is exactly `{"stalls-unit"}`, `retired_sessions` is exactly that row's session, and `live_unit_rows` keeps the other two. Also: `retired` first, `(retired` first, the word mid-cell, `(run done; retired by the user)`, `retiredness`, and `Retired`, each with its expected answer (the last four are live).
-- Two fixtures written under the old rule mark a row with `(run done; retired by the user)`: `scripts/production/test_live_units.py` (line 60) and `scripts/production/test_dailies_input.py` (line 296). Change each to open with `(retired by the user; run done)` and change nothing else in those files.
-
-Tests (`scripts/delegate/test_progress_history.py`), each driving the script as the file's other tests do:
-
-- After `start-phase` and `finish-phase`, `start-activity` exits 0, `finish-activity` exits 0, both events carry the closed phase's instance id, and the phase's status and `finished_at` in state are unchanged.
-- With no phase started, `start-activity` exits 1 with the present message; after `finish-run`, it exits 1 with the finished-run message.
-- An activity left open after the last phase is closed as `interrupted` by the next `start-phase`, and by `finish-run`.
-- `review-trial` for a phase whose ledger opened four findings (`adversary,contract`, `contract`, `contract`, and one with no lens) prints `code 4 findings`; a `ux` finding adds to `ux` only; `ux,craft` adds one to each; `both` adds one code finding. Update `test_review_trial_reports_the_phase_lens_counts_and_review_minutes` where its expected numbers follow the old rule.
+- **An activity on a closed phase.** `start-activity` in `scripts/delegate/progress_history.py` succeeds whenever the run is active and a phase has been started in it, still active or already closed by `finish-phase`. On a closed phase `activity_started` and `activity_finished` carry that phase's `phase_instance_id`, and the phase's status, `finished_at` and elapsed time stay as `finish-phase` left them; `finish-activity` records status, result and elapsed seconds as it does inside a phase (`test_an_activity_after_a_closed_phase_keeps_the_phase_record`). It exits 1 with `Start a phase before starting an activity` when the run has no phase, and with `Cannot start an activity: the run is finished` after `finish-run` (`test_start_activity_distinguishes_missing_phase_from_finished_run`).
+- **An activity left open.** `start-phase` and `finish-run` close an activity still open, inside a phase or on a closed one, as `interrupted` (`test_a_closed_phase_activity_is_interrupted_by_the_next_phase_or_run_end`). A repeated `finish-phase` does nothing: `_finish_phase` returns before any cleanup when the phase in state is not active, so an activity opened after the phase closed keeps running (`test_repeating_finish_phase_keeps_a_closed_phase_activity_open`).
+- **The code count.** `review-trial` counts a `finding_opened` event as a code finding when it names any lens other than `ux`, or no lens. An event naming `ux` and a code lens adds one to each number; the legacy lens word `both` reads as `adversary,contract` through `_finding_lenses` and adds one. The `ux` count, the minutes and the form of the printed line, which `scripts/production/merge_checkpoint.py` parses, are unchanged (`test_review_trial_counts_each_code_finding_once`).
+- **The retired marker.** `plan_cell_is_retired` in `scripts/production/add_unit.py` alone decides whether a Units row is retired, for the status script, the dailies, the waits and the stall watcher: the Plan cell begins with the lower-case whole word `retired`, alone or straight after one opening parenthesis, leading spaces ignored. The word later in the cell, later inside a leading parenthesis (`(run done; retired by the user)`), `retiredness` and `Retired` each leave the row live. `live_unit_rows`, `retired_sessions`, `retired_units` and `finished_run_units` in `stall_watch.py` call it; no other file tests the word (`test_retired_marker_only_applies_at_start_of_plan_cell`, `test_retired_readers_use_marker_on_production_rows`).
 
 **Files:**
-- `scripts/delegate/progress_history.py`
-- `scripts/production/review_regime.py`
-- `scripts/delegate/test_progress_history.py`
-- `scripts/production/add_unit.py`
-- `docs/production_format.md`
-- `scripts/production/test_add_unit.py`
-- `scripts/production/test_live_units.py`
-- `scripts/production/test_dailies_input.py`
-- `scripts/production/stall_watch.py`
-- `scripts/production/test_stall_watch.py`
+- `scripts/delegate/progress_history.py` — the recorder: `_start_activity`, `_start_phase`, `_finish_phase`, `_finish_run`, `_review_trial`.
+- `scripts/delegate/test_progress_history.py` — the recorder's tests.
+- `scripts/production/add_unit.py` — `plan_cell_is_retired` and its three Units-row readers.
+- `scripts/production/stall_watch.py` — `finished_run_units` calls `plan_cell_is_retired`.
+- `scripts/production/review_regime.py` — the label `code findings per phase (mean)`, and a header paragraph: from 2026-10-07 the code number is every code finding; before that date, the `craft` lens alone.
+- `docs/production_format.md` — the retired rule in words.
+- `scripts/production/test_add_unit.py`, `test_live_units.py`, `test_dailies_input.py` — the marker's tests, and fixtures that mark a retired row at the start of its Plan cell.
 
-**Seats:** 1 writer + 1 tester. Both defects sit in one file, so one seat writes the code and the other the tests.
-- `impl` — `scripts/delegate/progress_history.py` (parts A and B) and `scripts/production/review_regime.py` (the words).
-- `test` — `scripts/delegate/test_progress_history.py`: the cases listed under Tests, written from this Work Order while the writer works, then run against the writer's code.
+**Gotchas:**
+- `_event` stamps the phase in state on every event, active or closed; nothing else carries an activity's phase.
+- `progress` still answers `No active phase to report: …` on a closed phase, so it prints no tables while an activity runs there; `timeline` and the stage rows show the activity.
+- The recorder other units run is the main checkout's copy under `~/.claude/scripts/delegate/`; a change in a worktree reaches them, and their `review-trial` line, only when promoted.
+- `stall_watch.py` still treats the words `run done` anywhere in a Plan cell as a finished run.
 
-Part C arrived after those two seats launched and shares no file with them. It runs beside them in a third seat, `fix2`, opening as a writer: `scripts/production/add_unit.py`, `docs/production_format.md`, `scripts/production/test_add_unit.py`, `scripts/production/test_live_units.py`, `scripts/production/test_dailies_input.py`, and `scripts/production/stall_watch.py` with `scripts/production/test_stall_watch.py`.
+**Ruled out:**
+- A named type carrying an activity's phase: `_event` already stamps the phase in state on every event.
 
-**Constraints from prior phases:** Parts A and B share no file with phase 1. Part C repairs phase 1's marker: `live_unit_rows`, `retired_sessions` and `retired_units` in `add_unit.py` are its three readers in that file; `finished_run_units` in `stall_watch.py` reads the marker too, and every other script reaches it through those three. Other units run this recorder from `~/.claude/scripts/delegate/` while this phase edits the worktree's copy, so nothing here may change an event's existing fields, the state file's existing keys, or any line `progress` prints: only `start-activity`'s refusal rule and `review-trial`'s code number change. Tests write only under a temporary session directory.
-
-**Acceptance gate:** `python3 -m unittest discover -s scripts/delegate -p 'test_progress_history.py'` green; `python3 -m unittest discover -s scripts/production -p 'test_merge_checkpoint.py'` green (it parses the review line); `python3 -m unittest discover -s scripts/production -p 'test_*.py'` green; `basedpyright` on each changed `.py` file ends `0 errors, 0 warnings, 0 notes`. Live check by the unit director: in a scratch session directory, `start-run`, `start-phase`, `finish-phase`, then `start-activity --label shrink` and `finish-activity` both exit 0.
