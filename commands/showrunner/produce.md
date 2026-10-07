@@ -176,35 +176,26 @@ State:
 ---
 
 <LoadProduction>
-Read the production doc. `CHECKOUT` must be on `MERGE_BRANCH`, or, when that
-branch does not exist yet, clean on the commit it will start from. Otherwise
-stop with `Run /showrunner:produce in a checkout on <merge branch>.`
+Run `python3 ~/.claude/scripts/production/production_lifecycle.py load
+--production PRODUCTION_DOC`, adding `--resume` on resume. The command checks
+the checkout, reads the last `### STATE` block of `LOG`, rebuilds each unit's
+last code checkpoint from first-parent merge history, and checks its tmux
+session. Use its lines to restore state. <StartUpdates/> registers this session
+again and retargets the instance. A reboot needs nothing.
 
-On `resume`, or when the doc's status is `running`:
-1. Read `LOG` from its last `### STATE` block.
-2. Rebuild `LAST_MERGED` from
-   `git -C CHECKOUT log --first-parent --format='%H %s' MERGE_BRANCH`,
-   using the `Merge <unit> phase <N> (<hash>)` subjects.
-3. Check each unit director's session with `tmux has-session`.
-4. <StartUpdates/> registers this session in the doc again and runs step 3 to
-   retarget the instance. A reboot needs nothing.
+When the production doc's **Production rules** say CI does not apply, pass
+`--no-ci` to this and every lifecycle subcommand.
 </LoadProduction>
 
 ---
 
 <OpenMergeBranch>
-Only when the doc's status is `planned`:
-
-1. If `MERGE_BRANCH` does not exist, create it in `CHECKOUT` from its current
-   commit: `git -C CHECKOUT switch -c <merge branch>`. The production doc
-   authorizes this one branch.
-2. Set the doc's status to `running`, and its `**Showrunner session:**` line
-   to this session's name, from the first line of ListAgents.
-3. Commit the production doc and every unit plan as
-   `production(<name>): plans for <n> units`, and push `MERGE_BRANCH` with its
-   upstream set.
-4. Add `LOG` to `$(git -C CHECKOUT rev-parse --git-common-dir)/info/exclude`,
-   then create it with a `# Production log — <name>` heading.
+For a planned production, run
+`python3 ~/.claude/scripts/production/production_lifecycle.py open
+--production PRODUCTION_DOC --session <this session's name>`, using the first
+line of ListAgents for the name. The command creates and pushes the merge
+branch, records the running doc and plans, and initializes `LOG`. Rerun it
+after a failed step; it resumes at the first unfinished step.
 </OpenMergeBranch>
 
 ---
@@ -528,12 +519,11 @@ example) goes to the unit whose merge it was. User, 2026-10-04 and 2026-10-05.
 ---
 
 <PromoteMain>
-Moves `main` to the sha a <CIPoint/> pushed, when that sha builds and runs.
-Every check is on that exact sha.
+Promote the exact sha pushed by <CIPoint/> after these checks:
 
-1. **Validation.** The CIPoint's local validation passed.
-2. **Smoke launch.** Right after validation, with `CHECKOUT` still at the sha,
-   run in the background with `dangerouslyDisableSandbox: true`:
+1. The CIPoint's local validation passed.
+2. Right after validation, with `CHECKOUT` still at that sha, run in the
+   background with `dangerouslyDisableSandbox: true`:
 
    ```sh
    bash ~/.claude/scripts/production/smoke_launch.sh CHECKOUT <sha> <SCRATCH>/smoke_<short sha>.log
@@ -542,26 +532,29 @@ Every check is on that exact sha.
    It builds `hana`, starts it on port 15790 with an empty config directory,
    waits until BRP answers, and shuts it down. Merge nothing while it runs.
    Exit 0 is a pass.
-3. **GitHub CI.** The run concluded `success`. In
+3. The GitHub CI run concluded `success`. In
    `gh run view <run-id> --json jobs`, every job concluded `success` or
    `skipped`, and `Test Suite` (Linux) concluded `success`.
-   `macOS: Compile and Test` skipped because its runner is offline passes; the
-   log line then adds `macOS skipped (runner offline)`. A macOS job that ran
+   `macOS: Compile and Test` skipped because its runner is offline passes;
+   add `macOS skipped (runner offline)` to the log line. A macOS job that ran
    and failed blocks. User rule 2026-10-02.
-4. **Not dirty.** After `git -C CHECKOUT fetch origin main`,
-   `git -C CHECKOUT merge-base --is-ancestor origin/main <sha>` succeeds. If
-   main has commits the merge branch lacks, leave main alone and make it a
-   topic in the next dailies.
-5. **Push.** `git -C CHECKOUT push origin <sha>:refs/heads/main`, never with
-   force. It starts one more CI run on the same sha. This plain push leaves
-   the public bevy_hana mirror alone: the mirror updates only when main lands
-   through validate_and_push, whose post-push hook publishes it (user,
-   2026-10-03).
-6. **Local main.** Find the worktree on `main` with
-   `git -C CHECKOUT worktree list`. Fast-forward it with
+4. Run `python3 ~/.claude/scripts/production/production_lifecycle.py
+   promote-main --production PRODUCTION_DOC --ci-green <sha>
+   --smoke-passed <sha>`. The command checks that main is not dirty, pushes
+   and promotes the doc's **Promote:** destinations. A held main is a topic in
+   the next dailies. The push is never forced. It starts one more CI run on
+   the same sha and leaves the public bevy_hana mirror alone: the mirror
+   updates only when main lands through validate_and_push, whose post-push
+   hook publishes it (user, 2026-10-03).
+5. Only when the doc declares no **Promote:** destination, find the worktree
+   on `main` with `git -C CHECKOUT worktree list`. Fast-forward it with
    `git -C <it> merge --ff-only <sha>` only when its tree is clean and
-   `git -C <it> rev-list --count <sha>..main` is 0. Otherwise leave it and say
-   why in the log line.
+   `git -C <it> rev-list --count <sha>..main` is 0. Otherwise leave it and
+   say why in the log line.
+
+When CI does not apply, run the command with `--no-ci` in place of both
+verdict flags. It reports the skipped CI, smoke-launch and Mac-run steps and
+still promotes the declared destinations, including the Mac pull.
 
 Log `- HH:MM <zone>: main promoted to <short sha> (<n> commits)`, or
 `- HH:MM <zone>: main not promoted at <short sha>: <reason>`.
@@ -843,37 +836,22 @@ every unit director.
 <Wrap>
 When every unit's final-gate and as-built checkpoints are merged:
 
-1. Run a final <CIPoint/>, then <PromoteMain/> on its sha.
+1. Run a final <CIPoint/> and all <PromoteMain/> checks on its exact sha:
+   local validation, smoke launch and GitHub CI verdict, then the promotion
+   call. Pass `--ci-green <sha> --smoke-passed <sha>` when CI applies, or
+   `--no-ci` under the production's no-CI rule.
 2. Work through the production doc's **Close-out** items in order:
    - an item the **Production rules** pre-approve runs as written;
    - any other item that cannot be undone gets the user's OK first;
    - back up user data before migrating it.
-3. For each unit, check that its worktree is clean
-   (`git -C <worktree> status --short` is empty) and that its branch is merged
-   (`git -C CHECKOUT branch --merged <merge branch>` lists it). Then:
-   - retire any cargo-berth reservation the worktree still holds;
-   - `git -C CHECKOUT worktree remove <worktree>`;
-   - `git -C CHECKOUT branch -d <branch>`;
-   - `git -C CHECKOUT push origin --delete <branch>`, when
-     `git -C CHECKOUT ls-remote --exit-code --heads origin <branch>` finds it.
-
-   Leave the tmux sessions; the user closes them.
-4. Remove the update instance with `NOTIFIER remove UPDATES`, then run
-   `$HOME/.claude/scripts/lib/py $HOME/.claude/scripts/production/showrunners.py remove <this session's name>`.
-5. Set the doc's status to `wrapped`, commit it as
-   `production(<name>): wrapped`, and push.
-6. Report:
-
-   ```markdown
-   | Area | Result |
-   | --- | --- |
-   | Units | <unit>: <n> phases merged, last <hash>; one row per unit |
-   | Merge branch | `<branch>` at <hash>, pushed |
-   | CI | <last point: green / red → repaired in <hash>> |
-   | Close-out | <each item: done / waiting on you> |
-   | Main | promoted to <hash> (<n> commits), or why not |
-   | Next | <what is left for the user, e.g. close-out items waiting on them> |
-   ```
+   Finish each item before passing its exact text as `--close-out-done "<item>"`.
+3. Run `python3 ~/.claude/scripts/production/production_lifecycle.py wrap
+   --production PRODUCTION_DOC --ci-green <sha> --smoke-passed <sha>
+   --close-out-done "<item>"` (repeat the last flag for every item), or pass
+   `--no-ci` when CI does not apply. The command holds on an unfinished close-out item,
+   a dirty worktree, or an unmerged branch. It promotes main, retires the unit
+   worktrees and branches, removes the update instance, wraps and pushes the
+   doc, and prints the final report. Leave tmux sessions for the user to close.
 </Wrap>
 
 ---

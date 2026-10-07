@@ -58,6 +58,23 @@ class PromoteTo(NamedTuple):
     mac: NoMac | MacCheckout
 
 
+class PromotionAlreadyAtTip(NamedTuple):
+    tip: str
+
+
+class PromotionAdvanced(NamedTuple):
+    tip: str
+
+
+class PromotionOriginPushed(NamedTuple):
+    tip: str
+
+
+class PromotionNotPushed(NamedTuple):
+    tip: str
+    already_at_tip: bool
+
+
 class FirstMerge(NamedTuple):
     pass
 
@@ -185,6 +202,23 @@ def optional_field(lines: list[str], field: str) -> FieldPresent | FieldAbsent:
     return FieldAbsent()
 
 
+def promotion_from_doc(lines: list[str]) -> NoPromotion | PromoteTo:
+    """Read the production's promotion destinations in their declared order."""
+    field = optional_field(lines, "Promote")
+    if isinstance(field, FieldAbsent):
+        return NoPromotion()
+    promote_raw = field.text.split(" — ", 1)[0].replace("`", "")
+    local: list[Path] = []
+    mac: NoMac | MacCheckout = NoMac()
+    for item in promote_raw.split(","):
+        item = item.strip()
+        if item.startswith("mac "):
+            mac = MacCheckout(Path(item[4:].strip()).expanduser())
+        elif item:
+            local.append(Path(item).expanduser())
+    return PromoteTo(tuple(local), mac) if local or isinstance(mac, MacCheckout) else NoPromotion()
+
+
 def parse_units(lines: list[str]) -> tuple[Unit, ...]:
     _, rows = unit_rows(lines)
     result: list[Unit] = []
@@ -244,20 +278,7 @@ def request_from(args: argparse.Namespace) -> MergeRequest:
     push: ValidateAndPush | GitPush = GitPush() if push_raw == "git" else ValidateAndPush()
     if cast(bool, args.cancel_prior) and isinstance(push, GitPush):
         raise Refusal("--cancel-prior applies only to Push: validate_and_push")
-    promote_field = optional_field(lines, "Promote")
-    promotion: NoPromotion | PromoteTo = NoPromotion()
-    if isinstance(promote_field, FieldPresent):
-        promote_raw = promote_field.text.split(" — ", 1)[0].replace("`", "")
-        local: list[Path] = []
-        mac: NoMac | MacCheckout = NoMac()
-        for item in promote_raw.split(","):
-            item = item.strip()
-            if item.startswith("mac "):
-                mac = MacCheckout(Path(item[4:].strip()).expanduser())
-            elif item:
-                local.append(Path(item).expanduser())
-        if local or isinstance(mac, MacCheckout):
-            promotion = PromoteTo(tuple(local), mac)
+    promotion = promotion_from_doc(lines)
     flakes_field = optional_field(lines, "Known flakes")
     flakes: frozenset[str] = frozenset()
     if isinstance(flakes_field, FieldPresent):
@@ -289,7 +310,7 @@ def request_from(args: argparse.Namespace) -> MergeRequest:
 
 def merge_branch_history(checkout: Path, merge_branch: str) -> MergeBranchHistory:
     """Read checkpoint merge subjects on a branch, newest first."""
-    output = good(git(checkout, "log", merge_branch, "--format=%H%x00%s"), "ancestry")
+    output = good(git(checkout, "log", "--first-parent", merge_branch, "--format=%H%x00%s"), "ancestry")
     pattern = re.compile(r"^Merge (.+?) phase (\S+?)( shrink)? \(([0-9a-f]+)\)")
     entries: list[MergeEntry] = []
     for row in output.splitlines():
@@ -627,45 +648,68 @@ def push_validate(request: MergeRequest, may_undo: bool) -> str:
     return tip
 
 
+def promote_local_checkout(checkout: Path, merge_branch: str, tip: str) -> (
+        PromotionAlreadyAtTip | PromotionOriginPushed | PromotionAdvanced | PromotionNotPushed):
+    """Fast-forward one main checkout and push any eligible unpushed tip."""
+    _ = good(git(checkout, "fetch", "origin", merge_branch), "promote")
+    current_branch = good(git(checkout, "branch", "--show-current"), "promote")
+    if current_branch != "main":
+        raise Stop("promote", "failed", f"{checkout} is on {current_branch}, expected main",
+                   "switch the promotion checkout to main and rerun this checkpoint")
+    current = good(git(checkout, "rev-parse", "main"), "promote")
+    _ = good(git(checkout, "fetch", "origin", "main"), "promote")
+    if current == tip:
+        unpushed = good(git(checkout, "rev-list", "origin/main..main"), "promote")
+        foreign = good(git(checkout, "rev-list", "main", "^origin/main", f"^origin/{merge_branch}"),
+                       "promote")
+        if foreign:
+            return PromotionNotPushed(tip, True)
+        if unpushed:
+            _ = good(git(checkout, "push", "origin", "main"), "promote")
+            return PromotionOriginPushed(tip)
+        return PromotionAlreadyAtTip(tip)
+    result = git(checkout, "merge", "--ff-only", tip)
+    if result.returncode:
+        status = git(checkout, "status", "--short").stdout.strip()
+        raise Stop("promote", "failed", f"{checkout}: {status or result.stderr.strip()}",
+                   "the showrunner will clear the listed checkout paths and rerun this checkpoint")
+    unpushed = good(git(checkout, "rev-list", "origin/main..main"), "promote")
+    foreign = good(git(checkout, "rev-list", "main", "^origin/main", f"^origin/{merge_branch}"), "promote")
+    if foreign:
+        return PromotionNotPushed(tip, False)
+    if unpushed:
+        _ = good(git(checkout, "push", "origin", "main"), "promote")
+    return PromotionAdvanced(tip)
+
+
+def pull_mac_checkout(mac: Path, source: Path) -> None:
+    remote = (f"cd {shlex.quote(str(mac))} && git pull --ff-only "
+              f"natedev:{shlex.quote(str(source))} main; printf 'rc=%s\\n' \"$?\"")
+    result = subprocess.run(["ssh", "mac", remote], capture_output=True, text=True, check=False)
+    match = re.search(r"(?:^|\n)rc=(\d+)", result.stdout)
+    if result.returncode or match is None or int(match.group(1)):
+        raise Stop("promote", "failed", f"mac {mac}: {result.stdout.strip()} {result.stderr.strip()}",
+                   "the showrunner will repair the Mac pull and rerun this checkpoint")
+
+
 def promote(request: MergeRequest, tip: str) -> None:
     if isinstance(request.promotion, NoPromotion):
         report("promote", "ok", "no promotion configured")
         return
     for checkout in request.promotion.checkouts:
-        _ = good(git(checkout, "fetch", "origin", request.production.merge_branch), "promote")
-        current_branch = good(git(checkout, "branch", "--show-current"), "promote")
-        if current_branch != "main":
-            raise Stop("promote", "failed", f"{checkout} is on {current_branch}, expected main",
-                       "switch the promotion checkout to main and rerun this checkpoint")
-        current = git(checkout, "rev-parse", "main")
-        if current.returncode and current.stderr:
-            raise Stop("promote", "failed", current.stderr.strip(), "the showrunner will repair promotion")
-        _ = good(git(checkout, "fetch", "origin", "main"), "promote")
-        if current.stdout.strip() != tip:
-            result = git(checkout, "merge", "--ff-only", tip)
-            if result.returncode:
-                status = git(checkout, "status", "--short").stdout.strip()
-                raise Stop("promote", "failed", f"{checkout}: {status or result.stderr.strip()}",
-                           "the showrunner will clear the listed checkout paths and rerun this checkpoint")
-        unpushed = good(git(checkout, "rev-list", "origin/main..main"), "promote")
-        foreign = good(git(checkout, "rev-list", "main", "^origin/main",
-                           f"^origin/{request.production.merge_branch}"), "promote")
-        detail = f"{checkout} {'already at' if current.stdout.strip() == tip else 'main at'} {tip}"
-        if foreign:
+        result = promote_local_checkout(checkout, request.production.merge_branch, tip)
+        already_at = isinstance(result, (PromotionAlreadyAtTip, PromotionOriginPushed)) or (
+            isinstance(result, PromotionNotPushed) and result.already_at_tip)
+        detail = f"{checkout} {'already at' if already_at else 'main at'} {tip}"
+        if isinstance(result, PromotionNotPushed):
             detail += "; main holds commits not on origin/" + request.production.merge_branch + " and was not pushed"
         report("promote", "ok", detail)
         into(checkout, "main", f"sessions on {os.uname().nodename} run the installed commands from it",
              f"the live gate of {request.unit.name} phase {request.phase}")
-        if unpushed and not foreign:
-            _ = good(git(checkout, "push", "origin", "main"), "promote")
     if isinstance(request.promotion.mac, MacCheckout):
         mac = request.promotion.mac.path
-        remote = f"cd {shlex.quote(str(mac))} && git pull --ff-only natedev:{shlex.quote(str(request.promotion.checkouts[0] if request.promotion.checkouts else request.production.checkout))} main; printf 'rc=%s\\n' \"$?\""
-        result = subprocess.run(["ssh", "mac", remote], capture_output=True, text=True, check=False)
-        match = re.search(r"(?:^|\n)rc=(\d+)", result.stdout)
-        if result.returncode or match is None or int(match.group(1)):
-            raise Stop("promote", "failed", f"mac {mac}: {result.stdout.strip()} {result.stderr.strip()}",
-                       "the showrunner will repair the Mac pull and rerun this checkpoint")
+        source = request.promotion.checkouts[0] if request.promotion.checkouts else request.production.checkout
+        pull_mac_checkout(mac, source)
         report("promote", "ok", f"mac {mac} main pulled")
         into(mac, "main", "sessions on mac run the installed commands from it",
              f"the live gate of {request.unit.name} phase {request.phase}")

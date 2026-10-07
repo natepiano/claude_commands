@@ -171,8 +171,9 @@ raise SystemExit(1 if record['to'] in fail else 0)
         return doc
 
     def set_production_plan(self, doc: Path, plan: str) -> None:
-        _ = doc.write_text("## Units\n\n| Unit | Plan | Worktree |\n| --- | --- | --- |\n" +
-                           f"| unit-one | {plan} | /tmp/unit-one |\n")
+        _ = doc.write_text("## Units\n\n| Unit | Plan | Worktree | Branch | Session | Port | Owns |\n" +
+                           "| --- | --- | --- | --- | --- | --- | --- |\n" +
+                           f"| unit-one | {plan} | /tmp/unit-one | unit-one | unit-one | — | — |\n")
 
     def unit(self, name: str) -> tuple[int, Path]:
         child = subprocess.Popen(["sleep", "60"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -548,6 +549,28 @@ raise SystemExit(1 if record['to'] in fail else 0)
         self.assertEqual(self.tick(START + 902).returncode, 0)
         self.assertEqual(len(self.sent()), 2)
         self.assertFalse((self.state / stall_watch.stretch_path("showrunner", "unit-one").name).exists())
+
+    def test_finished_session_names_are_skipped_while_live_session_is_bumped(self) -> None:
+        import stall_watch
+        doc = self.production_plan("`docs/plans/example.md`")
+        _ = doc.write_text("## Units\n\n" +
+                           "| Unit | Plan | Worktree | Branch | Session | Port | Owns |\n" +
+                           "| --- | --- | --- | --- | --- | --- | --- |\n" +
+                           "| build-report-unit | `docs/as-built/build-report-session.md` (run done; as-built 2b4d952) | /home/natepiano/worktrees/claude-build-followups-build-report | build-followups-build-report | build-report | — | `docs/plans/build-followups-build-report.md`; `commands/watcher.md`, `commands/builds.md` |\n" +
+                           "| hook-unit | `docs/plans/hook.md` | /tmp/hook | hook | hook | — | — |\n" +
+                           "| notifier-unit | `docs/as-built/validate-and-push-cancel-prior.md` (run done; as-built merged as 8772951) | `/home/natepiano/worktrees/claude-build-followups-notifier` | `build-followups-notifier` | `session-notifier` (resumed in `~/.claude`, the directory its session began in) | — | `scripts/validate_and_push/`, `commands/showrunner/produce.md` (the cancel-prior rule); promoted from tool-based-ui by the user 2026-10-04 |\n")
+        self.configure({"showrunner": ["build-report", "hook", "session-notifier"]})
+        for name in ("build-report", "hook", "session-notifier"):
+            _ = self.unit(name)
+
+        self.assertEqual(self.tick(START).returncode, 0)
+        self.assertEqual(self.tick(START + 600).returncode, 0)
+        sent = self.sent()
+        self.assertEqual(len(sent), 2)
+        self.assertEqual({item["key"].rsplit(":", 1)[-1] for item in sent}, {"bump", "tell"})
+        self.assertTrue(all(item["key"].startswith("stall-watch:hook:") for item in sent))
+        for name in ("build-report", "session-notifier"):
+            self.assertFalse((self.state / stall_watch.stretch_path("showrunner", name).name).exists())
 
     def test_extended_tmux_session_name_does_not_match_missing_unit(self) -> None:
         _ = self.panes.pop("unit-one")

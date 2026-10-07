@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import argparse
+from contextlib import redirect_stdout
+from io import StringIO
 import json
 import os
 import re
@@ -14,7 +16,7 @@ from pathlib import Path
 from typing import NamedTuple, cast, final, override
 
 from merge_checkpoint import (CodeCheckpoint, LastMerged, NoMerge, ShrinkCommit,
-                              merge_branch_history, merge_history, request_from)
+                              merge_branch_history, merge_history, promote, request_from)
 
 
 SCRIPT = Path(__file__).with_name("merge_checkpoint.py")
@@ -599,6 +601,7 @@ class MergeCheckpointTests(unittest.TestCase):
         self.assertEqual(retried.process.returncode, 0, retried.process.stderr + retried.process.stdout)
         self.assertEqual(self.git("rev-parse", "refs/heads/main", cwd=self.origin), pushed)
         self.assertIn(f"already pushed at {pushed}", retried.process.stdout)
+        self.assertIn(f"promote: ok — {self.promote} already at {pushed}\n", retried.process.stdout)
 
     def test_local_foreign_main_commit_never_reaches_origin(self) -> None:
         self.promotions = str(self.promote)
@@ -626,8 +629,45 @@ class MergeCheckpointTests(unittest.TestCase):
         _ = self.git("commit", "-m", "foreign main commit", cwd=self.promote)
         rerun = self.run_checkpoint(sha)
         self.assertEqual(rerun.process.returncode, 0, rerun.process.stderr + rerun.process.stdout)
-        self.assertIn("was not pushed", rerun.process.stdout)
+        self.assertIn(f"promote: ok — {self.promote} main at {pushed}; "
+                      + "main holds commits not on origin/production and was not pushed\n",
+                      rerun.process.stdout)
         self.assertEqual(self.git("rev-parse", "refs/heads/main", cwd=self.origin), pushed)
+
+    def test_promote_at_tip_with_foreign_remote_history_says_already_at_without_push(self) -> None:
+        self.promotions = str(self.promote)
+        self.production_doc()
+        sha = self.checkpoint()
+        first = self.run_checkpoint(sha)
+        self.assertEqual(first.process.returncode, 0, first.process.stderr + first.process.stdout)
+        tip = self.git("rev-parse", "HEAD")
+        base = self.git("rev-parse", "HEAD^1")
+        _ = self.git("push", "--force", "origin", f"{base}:refs/heads/main")
+        _ = self.git("push", "--force", "origin", f"{base}:refs/heads/production")
+        request = request_from(argparse.Namespace(
+            production=str(self.doc), unit="alpha-unit", phase="2", hash=sha,
+            also=[], shrink=False, trailer=[], review_trial=TRIAL, delivers=DELIVERS,
+            cancel_prior=False, started=STARTED, regime="after", holds=0,
+            merge_defects=0, excluded=None, scratch=str(self.root / "scratch"),
+        ))
+        output = StringIO()
+        with redirect_stdout(output):
+            promote(request, tip)
+        self.assertIn(f"promote: ok — {self.promote} already at {tip}; "
+                      + "main holds commits not on origin/production and was not pushed\n", output.getvalue())
+        self.assertEqual(self.git("rev-parse", "refs/heads/main", cwd=self.origin), base)
+
+    def test_promote_reports_already_at_tip_when_both_mains_match(self) -> None:
+        self.promotions = str(self.promote)
+        self.production_doc()
+        sha = self.checkpoint()
+        first = self.run_checkpoint(sha)
+        self.assertEqual(first.process.returncode, 0, first.process.stderr + first.process.stdout)
+        tip = self.git("rev-parse", "refs/heads/main", cwd=self.origin)
+        second = self.run_checkpoint(sha)
+        self.assertEqual(second.process.returncode, 0, second.process.stderr + second.process.stdout)
+        self.assertIn(f"promote: ok — {self.promote} already at {tip}\n", second.process.stdout)
+        self.assertEqual(self.git("rev-parse", "refs/heads/main", cwd=self.origin), tip)
 
     def test_git_push_merges_diverged_main_promotes_pushed_tip_and_records(self) -> None:
         self.promotions = str(self.promote) + ", mac " + str(self.root / "mac-installed")
@@ -648,6 +688,9 @@ class MergeCheckpointTests(unittest.TestCase):
         self.assertEqual(self.git("rev-parse", "refs/heads/production", cwd=self.origin), tip)
         self.assertEqual(self.git("rev-parse", "HEAD", cwd=self.promote), tip)
         self.assertEqual(self.git("rev-parse", "refs/heads/main", cwd=self.origin), tip)
+        self.assertIn(f"promote: ok — {self.promote} main at {tip}\n", result.process.stdout)
+        self.assertIn(f"promote: ok — mac {self.root / 'mac-installed'} main pulled\n",
+                      result.process.stdout)
         self.assertEqual(self.git("merge-base", "--is-ancestor", sha, tip), "")
         self.assertIn("main-only.txt", self.git("ls-tree", "-r", "--name-only", tip))
         self.assertRegex(result.process.stdout, re.escape(f"into: {self.checkout} (production) — ") + ".*unblocks: G1: beta-unit Phase 4")
@@ -781,6 +824,17 @@ class MergeCheckpointTests(unittest.TestCase):
         self.assertIsInstance(history.last_code_for_unit("alpha-unit"), NoMerge)
         self.assertEqual(history.code_merge_count(), 0)
         self.assertFalse(history.has_code_merge("alpha-unit", "2"))
+
+    def test_merge_branch_reader_ignores_checkpoint_subject_on_merged_side_branch(self) -> None:
+        _ = self.checkpoint(subject="Merge alpha-unit phase 9 (abcdef0) into production")
+        _ = self.git("merge", "--no-ff", "-m", "Bring side branch into production", "alpha-branch")
+
+        history = merge_branch_history(self.checkout, "production")
+        self.assertIsInstance(history.last_merge(), NoMerge)
+        self.assertIsInstance(history.last_for_unit("alpha-unit"), NoMerge)
+        self.assertIsInstance(history.last_code_for_unit("alpha-unit"), NoMerge)
+        self.assertEqual(history.code_merge_count(), 0)
+        self.assertFalse(history.has_code_merge("alpha-unit", "9"))
 
     def test_merge_reader_keeps_subject_from_earlier_branch_name(self) -> None:
         code = self.checkpoint()

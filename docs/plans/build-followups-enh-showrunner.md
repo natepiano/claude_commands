@@ -168,7 +168,7 @@ A unit's `then` in the dailies input is a JSON list of one-line items, one per u
 
 `commands/showrunner/produce.md` <MergeCheckpoint/> calls the script (the call runs detached) and keeps the judgment steps: other units' overlap notice, new public items, the design check, <ClearGate/>, <CrossUnitChange/>, <CIPoint/> and `review_regime.py watch`, all read from the script's lines. Its report to the user carries the `into:` lines plus one line in the same form for each unit worktree the showrunner then merges the merge branch into. Both footer rules in `produce.md` say that footers off drops the Waiting on block too.
 
-`scripts/production/stall_watch.py` sends no bump and no showrunner notice while the last turn-end line on a unit's pane is `— blocked: …`; it treats that line as it treats `done:`, a fresh stretch, so the idle clock restarts at the next status that is not a block. A `— holding: …` line with nothing running is still bumped. It skips a unit whose Units row Plan cell reads `run done`, as it skips a standby unit: no bump, no notice, no stretch kept. The Plan cell is read from the production doc through the notifier conf's `CHECK=` path.
+`scripts/production/stall_watch.py` sends no bump and no showrunner notice while the last turn-end line on a unit's pane is `— blocked: …`; it treats that line as it treats `done:`, a fresh stretch, so the idle clock restarts at the next status that is not a block. A `— holding: …` line with nothing running is still bumped. It skips a unit whose Units row Plan cell reads `run done`, as it skips a standby unit: no bump, no notice, no stretch kept. The Plan cell is read from the production doc through the notifier conf's `CHECK=` path, and the row's Unit cell and its Session cell both name the finished unit, because the notifier conf names the Session cell.
 
 `commands/unit/delegate.md` <ProgressContract/> names `/unit:report off` to stop a Claude unit's updates and `/unit:report on` to resume them (it runs `unit_notifier.sh "$CLAUDE_CODE_SESSION_ID" on|off`); Codex keeps its sentence.
 
@@ -244,7 +244,7 @@ A unit's `then` in the dailies input is a JSON list of one-line items, one per u
 
 **Ruled out:**
 - `LAST_MERGED` as an argument: it is read from the merge subjects.
-- A flag the showrunner sets for a finished run: `stall_watch.py` reads the Plan cell's `run done`.
+- A flag the showrunner sets for a finished run: `stall_watch.py` reads the Plan cell's `run done` and takes the unit's name from both the Unit and the Session cell.
 
 ### Phase 6 — Dailies `then` is a list of single items, never a string or a chain · status: done
 
@@ -342,7 +342,7 @@ A unit's `then` in the dailies input is a JSON list of one-line items, one per u
 
 **Ruled out:** renaming `MergeEntry` / `NoMerge` to checkpoint-merge names (churn across shipped code and tests for no behavior change); a gate-wait surface in a later work order (a new item is the user's call through the add-on review); reporting the builder's `<step>: ok` lines to the user (an implementation transcript).
 
-### Phase 10 — Production open and wrap · status: todo
+### Phase 10 — Production open and wrap · status: done
 
 #### Work Order
 
