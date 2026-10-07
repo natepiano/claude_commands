@@ -159,6 +159,7 @@ class CodexBucket(TypedDict, total=False):
 class CodexRateLimits(TypedDict, total=False):
     rateLimits: CodexBucket
     rateLimitsByLimitId: dict[str, CodexBucket] | None
+    rateLimitResetCredits: object
 
 
 class RpcError(TypedDict, total=False):
@@ -416,7 +417,7 @@ async def codex_live() -> Report:
         try:
             usage = cast(CodexRateLimits, await server.request(3, "account/rateLimits/read", {}))
             report.quotas = codex_weekly_quotas(usage)
-            reset_credits(report, cast(dict[str, object], usage).get("rateLimitResetCredits"))
+            reset_credits(report, usage.get("rateLimitResetCredits"))
             if not report.quotas:
                 report.quota_problem = "Weekly quota: unavailable (no weekly window returned)"
         except (OSError, ValueError, KeyError, RuntimeError, asyncio.TimeoutError):
@@ -436,15 +437,21 @@ def reset_credits(report: Report, summary: object) -> None:
     """Count comes from the summary; detail rows can be absent or capped."""
     if not isinstance(summary, dict):
         return
-    count = summary.get("availableCount")
+    fields = cast(dict[str, object], summary)
+    count = fields.get("availableCount")
     if type(count) is not int or count < 0:
         return
     report.limit_reset_count = count
     report.limit_reset_expirations = []
     if count == 0:
         return
-    for credit in summary.get("credits") or []:
-        if isinstance(credit, dict) and credit.get("status") == "available":
+    credits = cast(list[object], fields.get("credits") or [])
+    for item in credits:
+        if isinstance(item, dict):
+            credit = cast(dict[str, object], item)
+        else:
+            continue
+        if credit.get("status") == "available":
             expires = parse_reset(credit.get("expiresAt"))
             if expires is not None:
                 report.limit_reset_expirations.append(expires)

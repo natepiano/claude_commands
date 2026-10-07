@@ -249,6 +249,25 @@ class BoardReclaimTests(unittest.TestCase):
         self.assertFalse(self.lock.exists())
         self.assert_guard_file()
 
+    def test_reclaimed_same_slot_release_keeps_new_holder_lock(self) -> None:
+        first = self.holder_process()
+        second = self.holder_process()
+        self.assert_acquired(self.board("acquire", "holder", "cargo", "--pid", str(first.pid),
+                                        "--hold", "10"), "acquired cargo")
+        self.assert_acquired(self.board("acquire", "holder", "cargo", "--pid", str(second.pid),
+                                        "--wait", "0", epoch=1011),
+                             "acquired cargo (reclaimed from holder)")
+
+        old_release = self.board("release", "holder", "cargo", "--pid", str(first.pid))
+        self.assertEqual(old_release.returncode, 3, old_release.stdout + old_release.stderr)
+        self.assertEqual((self.lock / "holder_pid").read_text(), str(second.pid))
+        self.assertTrue(self.lock.exists())
+
+        unrelated_release = self.board("release", "holder", "cargo", "--pid", "1")
+        self.assertEqual(unrelated_release.returncode, 1,
+                         unrelated_release.stdout + unrelated_release.stderr)
+        self.assertEqual((self.lock / "holder_pid").read_text(), str(second.pid))
+
 
 if __name__ == "__main__":
     _ = unittest.main()
