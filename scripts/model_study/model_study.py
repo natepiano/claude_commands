@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import cast
 from zoneinfo import ZoneInfo
 
+from compare import compare
 from turns import Compaction, Dropped, Turn, director_turns, load_roster, read_session, resolve_session_files, session_ids
 
 PDT = ZoneInfo("America/Los_Angeles")
@@ -112,6 +113,8 @@ def main() -> None:
     _ = extract_parser.add_argument("--projects-dir", type=Path, default=Path.home() / ".claude/projects")
     _ = extract_parser.add_argument("--registry-dir", type=Path, default=Path.home() / ".claude/sessions")
     _ = extract_parser.add_argument("--roster", type=Path, default=DEFAULT_ROSTER)
+    compare_parser = subcommands.add_parser("compare", help="compare Opus and Sonnet requests")
+    _ = compare_parser.add_argument("--state-dir", type=Path, default=Path(os.environ.get("MODEL_STUDY_STATE", DEFAULT_STATE)))
     args = cast(dict[str, object], vars(parser.parse_args()))
     if args.get("command") == "extract":
         roster = args["roster"]
@@ -123,6 +126,10 @@ def main() -> None:
         assert isinstance(registry_dir, Path)
         assert isinstance(state_dir, Path)
         _ = extract(roster, projects_dir, registry_dir, state_dir)
+    elif args.get("command") == "compare":
+        state_dir = args["state_dir"]
+        assert isinstance(state_dir, Path)
+        _ = compare(state_dir)
 
 
 if __name__ == "__main__":
