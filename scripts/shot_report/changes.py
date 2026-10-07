@@ -12,26 +12,37 @@ from typing import cast
 
 
 @dataclass(frozen=True)
-class Change:
+class ProductChange:
     repository: str
     commit: str
     summary: str
     effective_at: datetime
     host_coverage: tuple[str, ...]
-    measurement_change: bool = False
+
+
+@dataclass(frozen=True)
+class MeasurementChange:
+    repository: str
+    commit: str
+    summary: str
+    effective_at: datetime
+    host_coverage: tuple[str, ...]
+
+
+type Change = ProductChange | MeasurementChange
 
 
 # The rollout's effective time is from analysis.md; the later times are the
 # documented commit times. Host scope stays local unless the change is Mac-only.
 SEED_CHANGES = (
-    Change("claude", "b01a299", "Introduce /hana_shot", datetime.fromisoformat("2026-10-06T16:35:00+00:00"), ("natedev",)),
-    Change("bevy_brp", "dab07788", "Release extras 0.22.9 with rectangle crops", datetime.fromisoformat("2026-10-06T17:59:57+00:00"), ("natedev",)),
-    Change("claude", "7d19a7b", "Sort stored view keys", datetime.fromisoformat("2026-10-06T18:13:34+00:00"), ("natedev",)),
-    Change("claude", "ec6703e", "Capture a remote Hana", datetime.fromisoformat("2026-10-06T18:27:33+00:00"), ("natedev",)),
-    Change("claude", "4f10e77", "Keep remote Mac Hana visible and awake", datetime.fromisoformat("2026-10-06T18:32:56+00:00"), ("mac",)),
-    Change("hana_catalyst", "44cd7b3d4", "Crop screenshots in extras", datetime.fromisoformat("2026-10-06T19:09:22+00:00"), ("natedev",)),
-    Change("claude", "efb0eab", "Use /hana_shot in live probes", datetime.fromisoformat("2026-10-06T20:11:55+00:00"), ("natedev",)),
-    Change("claude", "e6c96fb", "Record failures and kept-shot evidence", datetime.fromisoformat("2026-10-07T02:10:51+00:00"), ("natedev",), True),
+    ProductChange("claude", "b01a299", "Introduce /hana_shot", datetime.fromisoformat("2026-10-06T16:35:00+00:00"), ("natedev",)),
+    ProductChange("bevy_brp", "dab07788", "Release extras 0.22.9 with rectangle crops", datetime.fromisoformat("2026-10-06T17:59:57+00:00"), ("natedev",)),
+    ProductChange("claude", "7d19a7b", "Sort stored view keys", datetime.fromisoformat("2026-10-06T18:13:34+00:00"), ("natedev",)),
+    ProductChange("claude", "ec6703e", "Capture a remote Hana", datetime.fromisoformat("2026-10-06T18:27:33+00:00"), ("natedev",)),
+    ProductChange("claude", "4f10e77", "Keep remote Mac Hana visible and awake", datetime.fromisoformat("2026-10-06T18:32:56+00:00"), ("mac",)),
+    ProductChange("hana_catalyst", "44cd7b3d4", "Crop screenshots in extras", datetime.fromisoformat("2026-10-06T19:09:22+00:00"), ("natedev",)),
+    ProductChange("claude", "efb0eab", "Use /hana_shot in live probes", datetime.fromisoformat("2026-10-06T20:11:55+00:00"), ("natedev",)),
+    MeasurementChange("claude", "e6c96fb", "Record failures and kept-shot evidence", datetime.fromisoformat("2026-10-07T02:10:51+00:00"), ("natedev",)),
 )
 
 
@@ -52,10 +63,12 @@ def _read(path: Path) -> list[Change]:
         stamp = datetime.fromisoformat(str(row["effective_at"]).replace("Z", "+00:00"))
         if stamp.tzinfo is None:
             raise ValueError(f"{path}: effective time needs an offset")
-        changes.append(Change(
-            str(row["repository"]), str(row["commit"]), str(row["summary"]), stamp,
-            tuple(cast(list[str], hosts)), bool(row.get("measurement_change", False)),
-        ))
+        kind = row.get("kind", "measurement" if row.get("measurement_change") is True else "product")
+        if kind not in ("product", "measurement"):
+            raise ValueError(f"{path}: invalid change kind")
+        variant = MeasurementChange if kind == "measurement" else ProductChange
+        changes.append(variant(str(row["repository"]), str(row["commit"]), str(row["summary"]),
+                               stamp, tuple(cast(list[str], hosts))))
     return sorted(changes, key=lambda change: (change.effective_at, change.repository, change.commit))
 
 
@@ -72,7 +85,8 @@ def write_changes(path: Path, changes: tuple[Change, ...] | list[Change]) -> Non
     descriptor, name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
     try:
         with os.fdopen(descriptor, "w", encoding="utf-8") as target:
-            rows = [{**asdict(change), "effective_at": change.effective_at.isoformat()}
+            rows = [{**asdict(change), "kind": "measurement" if isinstance(change, MeasurementChange) else "product",
+                     "effective_at": change.effective_at.isoformat()}
                     for change in changes]
             _ = target.write(json.dumps(rows, indent=2) + "\n")
         os.replace(name, path)

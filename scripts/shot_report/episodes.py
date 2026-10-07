@@ -12,9 +12,11 @@ from pathlib import Path
 from typing import Literal, cast
 
 if __package__:
-    from .transcripts import AttemptCountInferredFromImages, ExactOrderedCaptureAttempts, ToolCall
+    from .transcripts import (AttemptCountInferredFromImages, ExactAttemptCountFromOrderedCaptures,
+                              ExactOrderedCaptureAttempts, ToolCall)
 else:
-    from transcripts import AttemptCountInferredFromImages, ExactOrderedCaptureAttempts, ToolCall  # pyright: ignore[reportImplicitRelativeImport]
+    from transcripts import (AttemptCountInferredFromImages, ExactAttemptCountFromOrderedCaptures,  # pyright: ignore[reportImplicitRelativeImport]
+                             ExactOrderedCaptureAttempts, ToolCall)
 
 Method = Literal["by hand", "/hana_shot"]
 ScreenshotSource = Literal[
@@ -70,7 +72,7 @@ class Episode:
     transcript_path: str
     session_id: str
     kept_shot: KeptShotEvidence
-    attempt_count_evidence: ExactOrderedCaptureAttempts | AttemptCountInferredFromImages = AttemptCountInferredFromImages()
+    attempt_count_evidence: ExactAttemptCountFromOrderedCaptures | AttemptCountInferredFromImages = AttemptCountInferredFromImages()
     source_host: str = "local"
 
     @property
@@ -142,7 +144,7 @@ def _episode(calls: list[ToolCall], gap_seconds: int) -> Episode | None:
         other_call_count=sum(call.kind == "other" for call in calls),
         transcript_path=first.transcript_path, session_id=first.session_id,
         kept_shot=evidence,
-        attempt_count_evidence=(ExactOrderedCaptureAttempts(()) if exact else AttemptCountInferredFromImages()),
+        attempt_count_evidence=(ExactAttemptCountFromOrderedCaptures() if exact else AttemptCountInferredFromImages()),
         source_host=first.source_host,
     )
 
@@ -236,8 +238,9 @@ def read_episodes(path: Path) -> list[Episode]:
                     transcript_path=str(record["transcript_path"]),
                     session_id=str(record["session_id"]),
                     kept_shot=evidence,
-                    attempt_count_evidence=(ExactOrderedCaptureAttempts(())
-                                            if record.get("attempt_count_evidence_state") == "ExactOrderedCaptureAttempts"
+                    attempt_count_evidence=(ExactAttemptCountFromOrderedCaptures()
+                                            if record.get("attempt_count_evidence_state") in
+                                            ("ExactAttemptCountFromOrderedCaptures", "ExactOrderedCaptureAttempts")
                                             else AttemptCountInferredFromImages()),
                     source_host=str(record.get("source_host", "local")),
                 ))

@@ -46,6 +46,9 @@ import store
 import sync
 import treekey
 
+# Covers shot_report.py's 330 s Mac SSH timeout plus a measured 120-175 s cold local scan and report under load, with room inside the 3,600 s job interval.
+SCREENSHOT_HOURLY_TIMEOUT_SECONDS = 900
+
 EXAMPLES: list[tuple[str, str]] = [
     (
         "How long did clippy take per day this week, and how often did it fail?",
@@ -192,7 +195,11 @@ def day_report(args: list[str]) -> int:
 
 def screenshot_hourly() -> int:
     command = Path(__file__).resolve().parents[1] / "shot_report" / "shot_report.py"
-    return subprocess.run([sys.executable, str(command), "hourly"], check=False, timeout=300).returncode
+    return subprocess.run(
+        [sys.executable, str(command), "hourly"],
+        check=False,
+        timeout=SCREENSHOT_HOURLY_TIMEOUT_SECONDS,
+    ).returncode
 
 
 def hourly() -> int:
