@@ -58,6 +58,7 @@ class AddUnitTests(unittest.TestCase):
         self.prompt = Path()
         self.state = Path()
         self.bin = Path()
+        self.agent_config = Path()
         self.env: dict[str, str] = {}
 
     @override
@@ -92,10 +93,30 @@ class AddUnitTests(unittest.TestCase):
             command = self.bin / name
             _ = command.write_text(STUB, encoding="utf-8")
             _ = command.chmod(0o755)
+        self.agent_config = self.root / "agents.conf"
+        codex_config = self.root / "codex.toml"
+        codex_cache = self.root / "models.json"
+        sync_state = self.root / "catalog-sync-success"
+        self.write_agent_config()
+        _ = sync_state.touch()
         self.env = {**os.environ, "HOME": str(self.root / "home"),
                     "PATH": str(self.bin) + os.pathsep + os.environ.get("PATH", ""),
                     "STUB_STATE": str(self.state), "STUB_TMUX": str(self.bin / "tmux"),
-                    "SHOWRUNNERS_CONFIG": str(self.config), "CLAUDE_TEST_SECRET": "must-not-leak"}
+                    "SHOWRUNNERS_CONFIG": str(self.config), "CLAUDE_TEST_SECRET": "must-not-leak",
+                    "AGENTS_CONFIG_FILE": str(self.agent_config),
+                    "CODEX_CONFIG_FILE": str(codex_config),
+                    "CODEX_MODELS_CACHE_FILE": str(codex_cache),
+                    "CODEX_CATALOG_SYNC_STATE_FILE": str(sync_state)}
+
+    def write_agent_config(self, *, family: str = "claude", director: str = "opus:xhigh",
+                           claude_set: bool = True) -> None:
+        claude_section = f"[production.claude]\ndirector={director}\n\n" if claude_set else ""
+        codex_section = "[production.codex]\ndirector=gpt-test:high\n\n" if family == "codex" else ""
+        content = (f"[assignments]\nproduction={family}\n\n"
+                   f"{claude_section}{codex_section}"
+                   "[codex.agents]\ngpt-test=low,medium,high\n\n"
+                   "[claude.agents]\nopus=low,medium,high,xhigh\nsonnet=low,medium,high,xhigh\n")
+        _ = self.agent_config.write_text(content, encoding="utf-8")
 
     def production_doc(self) -> str:
         return ("# Production\n\n"
@@ -131,6 +152,20 @@ class AddUnitTests(unittest.TestCase):
             return []
         records = [cast(dict[str, object], json.loads(line)) for line in path.read_text().splitlines()]
         return [record for record in records if record["command"] == command]
+
+    def launch_command(self) -> str:
+        launches = self.events("systemd-run")
+        self.assertEqual(len(launches), 1)
+        return cast(list[str], launches[0]["args"])[-1]
+
+    def assert_director_flags(self, model: str, effort: str | None) -> None:
+        command = self.launch_command()
+        flags = f"claude --model {model}"
+        if effort is not None:
+            flags += f" --effort {effort}"
+        self.assertIn(flags + " ", command)
+        if effort is None:
+            self.assertNotIn("--effort", command)
 
     def unit_row(self, name: str = "alpha", *, branch: str = "build-followups-alpha",
                  worktree: Path | None = None, plan: str = "docs/plans/given.md",
@@ -190,6 +225,7 @@ class AddUnitTests(unittest.TestCase):
                   f"under the showrunner director, on standby. Work only in your worktree {worktree}, "
                   "branch build-followups-alpha. Do nothing until the showrunner sends you work.")
         self.assertIn(prompt, command)
+        self.assert_director_flags("opus", "xhigh")
         self.assertRegex(self.log.read_text(),
                          r"^- \d\d:\d\d PDT: added alpha-unit \(standby\), tmux alpha, worktree ")
 
@@ -235,13 +271,49 @@ class AddUnitTests(unittest.TestCase):
         args = cast(list[str], tmux["args"])
         self.assertEqual(args[:9], ["new-session", "-d", "-s", "alpha", "-c", str(worktree),
                                     "-e", "SHOWRUNNER_UNIT=build-followups", "zsh"])
-        self.assertIn("claude --remote-control alpha -n alpha", args[-1])
+        self.assertIn("claude --model opus --effort xhigh --remote-control alpha -n alpha", args[-1])
+        self.assert_director_flags("opus", "xhigh")
         self.assertIn("'/unit:delegate docs/plans/given.md'", args[-1])
         self.assertEqual(self.registry_units(), ["alpha"])
         self.assertRegex(self.log.read_text(),
                          r"^- \d\d:\d\d PDT: added alpha-unit \(plan\), tmux alpha, worktree ")
         self.assertEqual(len(self.log.read_text().splitlines()), 1)
         self.assertIn("alpha-unit started: tmux attach -t alpha", result.stdout)
+
+    def test_sonnet_director_row_changes_launch_model_and_effort(self) -> None:
+        self.write_agent_config(director="sonnet:xhigh")
+        _ = self.successful("alpha", "--plan", "docs/plans/given.md")
+        self.assert_director_flags("sonnet", "xhigh")
+
+    def test_director_row_without_effort_uses_claude_default(self) -> None:
+        self.write_agent_config(director="opus")
+        _ = self.successful("alpha", "--plan", "docs/plans/given.md")
+        self.assert_director_flags("opus", None)
+
+    def test_codex_director_refused_before_any_change_with_or_without_check(self) -> None:
+        self.write_agent_config(family="codex")
+        document = self.doc.read_text()
+        head = self.git("rev-parse", "HEAD")
+        for check in (False, True):
+            with self.subTest(check=check):
+                arguments = ("alpha", "--plan", "docs/plans/given.md")
+                result = self.cli(*arguments, *(("--check",) if check else ()))
+                self.assertEqual(result.returncode, 2, (result.stdout, result.stderr))
+                self.assertEqual(result.stdout, "")
+                self.assertEqual(result.stderr.strip().splitlines(), [
+                    "add_unit: unit directors launch only on claude; production.director resolves to codex (gpt-test)"])
+                self.assert_no_launch_change(document, head)
+
+    def test_missing_claude_director_set_returns_resolver_error_before_change(self) -> None:
+        self.write_agent_config(claude_set=False)
+        document = self.doc.read_text()
+        head = self.git("rev-parse", "HEAD")
+        result = self.cli("alpha", "--plan", "docs/plans/given.md")
+        self.assertEqual(result.returncode, 2, (result.stdout, result.stderr))
+        self.assertEqual(result.stdout, "")
+        self.assertEqual(result.stderr.strip().splitlines(), [
+            f"add_unit: ERROR: [production.director] missing set section [production.claude] in {self.agent_config}."])
+        self.assert_no_launch_change(document, head)
 
     def test_prepared_row_launches_without_rewriting_or_committing_it(self) -> None:
         self.commit_prepared_row(self.prepared_row())
@@ -369,6 +441,7 @@ class AddUnitTests(unittest.TestCase):
         self.assertIn("Write the full phased plan there", prompt)
         self.assertIn("wait for its approval before you run /unit:delegate docs/plans/build-followups-alpha.md", prompt)
         self.assertIn("alpha-unit started: tmux attach -t alpha", result.stdout)
+        self.assert_director_flags("opus", "xhigh")
 
     def test_timeout_keeps_session_then_rerun_finishes_without_duplicate_steps(self) -> None:
         _ = (self.state / "ready").unlink()
@@ -448,7 +521,8 @@ class AddUnitTests(unittest.TestCase):
         args = cast(list[str], tmux["args"])
         self.assertEqual(args[args.index("-c") + 1], str(prior))
         command = args[-1]
-        self.assertIn("claude --resume session-123 --remote-control alpha -n alpha", command)
+        self.assertIn("claude --model opus --effort xhigh --resume session-123 --remote-control alpha -n alpha", command)
+        self.assert_director_flags("opus", "xhigh")
         self.assertIn("You are now alpha-unit in production build-followups", command)
         promoted_plan = self.root / "project-alpha/docs/plans/given.md"
         self.assertTrue(promoted_plan.exists())

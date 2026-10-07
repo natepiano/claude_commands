@@ -26,6 +26,8 @@ No arguments prints every function's active family and resolved rows (one `task=
 
 `ask_a_friend` is assigned `caller` rather than a family: it runs on the family of the agent asking, because only a like-to-like pair can talk both ways. `/agent ask_a_friend` shows both row sets with `active=yes` on the family this session runs as, and its comment line reads `# current family: caller — the calling agent's family (claude here)`; render it as plain text like any other `#` line. `/agent ask_a_friend <family>` is rejected — there is no switch — and the error names the row edit to use instead; `/agent <family>` leaves it alone. Row edits work as for any function, and the `# updated …` line reads `— live whenever a <family> session runs ask_a_friend`.
 
+A function with only one family set is pinned to it. Every-function family and agent switches keep its assignment and rows and print `# kept <function> on <family>: its only set` after the switch line. Switching that function alone or editing its row with an agent from the other family is refused. `production` has only `[production.claude]`; `/agent production.director sonnet:xhigh` changes unit director launches.
+
 ## Switch a function's family
 
 ```text
@@ -40,7 +42,7 @@ The switch is rejected if any row in the target family set is invalid.
 /agent <codex|claude>
 ```
 
-A bare family name — no function — moves every `[assignments]` entry to that family, exact-task overrides included. It is validated wholesale first: one function missing a set for that family, or one invalid row in any of them, rejects the whole switch and leaves the registry untouched.
+A bare family name — no function — moves every switchable `[assignments]` entry to that family, exact-task overrides included. One-family functions stay pinned. It is validated wholesale first: one switchable function missing a set for that family, or one invalid row in any of them, rejects the whole switch and leaves the registry untouched.
 
 On success it prints `# switched every function to <family>` followed by the no-argument status output (rows in `task | family | agent | effort | tier` form) and the usage block. Render the `# switched …` line as plain text first, then the rows per the Status rules above.
 
@@ -51,7 +53,7 @@ On success it prints `# switched every function to <family>` followed by the no-
 /agent <function> <agent>
 ```
 
-An agent name in place of a family puts every function (or just `<function>`) on that agent. Each row keeps its effort. The agent names its family, so every fixed assignment in scope also switches to that family, exact-task overrides included. A `caller` function keeps its assignment; its row set for that family takes the agent. It is validated wholesale first: a kept effort the agent's catalog lacks rejects the whole change and leaves the registry untouched. Name the agent alone — `:<effort>` is rejected.
+An agent name in place of a family puts every switchable function (or just `<function>`) on that agent. Each row keeps its effort. The agent names its family, so every fixed assignment in scope also switches to that family, exact-task overrides included. A `caller` function keeps its assignment; its row set for that family takes the agent. A one-family function is kept during every-function changes. It is validated wholesale first: a kept effort the agent's catalog lacks rejects the whole change and leaves the registry untouched. Name the agent alone — `:<effort>` is rejected.
 
 On success it prints `# switched every function to <agent> (<family>), efforts kept` (or `# switched <function> to <agent> (<family>), efforts kept`; for a `caller` function, `# set [<function>.<family>] to <agent>, efforts kept — live whenever a <family> session runs <function>`), then the matching status output and usage. Render the `#` line as plain text first, then the rows per the Status rules above.
 
