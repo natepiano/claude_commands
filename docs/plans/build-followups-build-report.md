@@ -42,7 +42,7 @@ The user (2026-10-07, after the build analysis): "yes do all of this - understan
 
 **Ruled out:** a separate cold-build line under the table, since the cold row carries the cold-build count, time and shares.
 
-### Phase 2 — The build-folder wait separates a seat's own queue from waiting on another seat  · status: todo
+### Phase 2 — The build-folder wait separates a seat's own queue from waiting on another seat  · status: done
 
 #### Work Order
 
