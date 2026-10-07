@@ -18,7 +18,7 @@ from typing import NamedTuple, TypedDict, cast
 from zoneinfo import ZoneInfo
 
 import showrunners
-from add_unit import cell_value
+from add_unit import RETIRED, cell_value
 
 STATE_DIR = Path(os.environ.get("STALL_WATCH_STATE_DIR") or Path.home() / ".local/state/stall-watch")
 SESSIONS_DIR = Path(os.environ.get("NOTIFIER_SESSIONS_DIR") or Path.home() / ".claude/sessions")
@@ -129,17 +129,12 @@ def stretch_path(slug: str, unit: str) -> Path:
 
 def finished_run_units(runner: showrunners.RunningShowrunner) -> set[str]:
     """Read the production doc named by this notifier's check command."""
+    located = showrunners.checked_doc(showrunners.NOTIFIER_STATE_DIR / f"showrunner-{runner.slug}")
+    if isinstance(located, showrunners.NoCheckedDoc):
+        return set()
     try:
-        conf = (showrunners.NOTIFIER_STATE_DIR / f"showrunner-{runner.slug}" / "conf").read_text(encoding="utf-8")
-        check = next(line.partition("=")[2] for line in conf.splitlines() if line.startswith("CHECK="))
-        command = shlex.split(check)
-        check_index = next(index for index, token in enumerate(command)
-                           if Path(token).name == "production_check.sh")
-        doc = Path(command[check_index + 1])
-        if not doc.is_absolute():
-            return set()
-        lines = doc.read_text(encoding="utf-8").splitlines()
-    except (OSError, ValueError, IndexError, StopIteration):
+        lines = located.path.read_text(encoding="utf-8").splitlines()
+    except (OSError, UnicodeError):
         return set()
 
     finished: set[str] = set()
@@ -151,7 +146,9 @@ def finished_run_units(runner: showrunners.RunningShowrunner) -> set[str]:
             break
         elif in_units:
             cells = line.split("|")
-            if len(cells) >= 4 and not cells[0].strip() and re.search(r"\brun done\b", cells[2]):
+            if (len(cells) >= 4 and not cells[0].strip()
+                    and (re.search(r"\brun done\b", cells[2]) is not None
+                         or RETIRED.search(cells[2]) is not None)):
                 finished.add(cells[1].strip())
                 if len(cells) >= 6:
                     finished.add(cell_value(cells[5]))

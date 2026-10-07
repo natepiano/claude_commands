@@ -83,6 +83,10 @@ The production doc sits beside the source plan as `<source-stem>-production.md`.
 | --- | --- | --- | --- | --- | --- | --- |
 | <name>-unit | <plan path> | <path> | <branch> | <tmux and remote-control name> | <app port or —> | <dirs/files> |
 
+A retired unit keeps its row. Its Plan cell says `retired` (`(retired by the user
+2026-10-07, worktree removed)`); the status script, the dailies, the waits and the
+stall watch then skip it. A live unit's Plan cell never uses the word.
+
 ## Hub files
 
 | File | Owner unit | Other units that touch it |

@@ -254,6 +254,13 @@ class WaitingTests(unittest.TestCase):
             self.assertNotEqual(self.git_result("rev-parse", "-q", "--verify", "MERGE_HEAD",
                                                 cwd=checkout).returncode, 0)
 
+    def test_named_unit_refuses_retired_row(self) -> None:
+        content = self.doc.read_text(encoding="utf-8")
+        self.write(self.doc, content.replace("`docs/alpha.md`", "(retired by the user)", 1))
+        production = add_unit.read_production(self.doc)
+        with self.assertRaisesRegex(waiting.WaitingFailure, f"unknown unit {ALPHA}"):
+            _ = waiting.named_unit(production, ALPHA)
+
     def push_scratch_branches(self) -> None:
         _ = self.git("push", "origin", "production")
         _ = self.git("push", "-u", "origin", "alpha-branch", cwd=self.alpha)
@@ -618,6 +625,24 @@ os.execv(os.environ["WAITING_TEST_REAL_GIT"], [os.environ["WAITING_TEST_REAL_GIT
         self.assertIn(f"{ALPHA} on {BETA}", result.stdout)
         self.assertRegex(result.stdout, r"open 7[12] minutes")
         self.assertNotIn(f"{BETA} on {ALPHA}: open", result.stdout)
+
+    def test_waits_hide_retired_waiting_unit_but_keep_live_wait_on_it(self) -> None:
+        content = self.doc.read_text(encoding="utf-8")
+        self.write(self.doc, content.replace("`docs/alpha.md`", "retired after completion", 1))
+        now = datetime.now(ZoneInfo("America/Los_Angeles"))
+        opened = now - timedelta(minutes=10)
+        self.write(self.log, "\n".join((
+            "# Production log — example",
+            f"- {opened:%H:%M %Z}: block: {ALPHA} on {BETA} (files: shared.txt), clears ~23:00",
+            f"- {opened:%H:%M %Z}: block: {BETA} on {ALPHA} (code: API), clears ~23:00",
+            "",
+        )))
+        self.unconfigured_board()
+        result = self.run_waiting("waits")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("waits: ok — 1 open; berth not configured", result.stdout)
+        self.assertNotIn(f"{ALPHA} on {BETA}: open", result.stdout)
+        self.assertIn(f"{BETA} on {ALPHA}: open", result.stdout)
 
     def test_waits_reads_unresolved_overlaps_from_board_payload(self) -> None:
         self.board_ready([{

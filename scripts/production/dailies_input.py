@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import NamedTuple, cast
 from zoneinfo import ZoneInfo
 
-from add_unit import Refusal, cell_value, read_production, unit_rows
+from add_unit import Refusal, cell_value, live_unit_rows, read_production, unit_rows
 from ci_points import PointFailure, WatchFirstAlert, WatchRepeat, review_watch
 from dailies_render import InputError, StateRefused, as_list, as_map, check_render_state, local_now, parse_report, parse_time
 from merge_checkpoint import NoMerge, git, merge_branch_history
@@ -111,8 +111,11 @@ def report(step: str, state: str, detail: str) -> None:
 
 def units_from_doc(lines: list[str]) -> tuple[UnitRow, ...]:
     _, rows = unit_rows(lines)
+    live_rows = live_unit_rows(lines)
+    if rows and not live_rows:
+        raise DailiesFailure("production", "no live units: every Units row is marked retired")
     units: list[UnitRow] = []
-    for row in rows:
+    for row in live_rows:
         cells = [cell.strip() for cell in row.strip().strip("|").split("|")]
         if len(cells) < 5:
             raise DailiesFailure("production", f"invalid Units row: {row}")

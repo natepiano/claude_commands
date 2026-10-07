@@ -550,6 +550,16 @@ raise SystemExit(1 if record['to'] in fail else 0)
         self.assertEqual(len(self.sent()), 2)
         self.assertFalse((self.state / stall_watch.stretch_path("showrunner", "unit-one").name).exists())
 
+    def test_retired_plan_without_run_done_is_finished(self) -> None:
+        import stall_watch
+        _ = self.production_plan("(retired by the user 2026-10-07, worktree removed)")
+        first = self.tick(START)
+        second = self.tick(START + 600)
+        self.assertEqual(first.returncode, 0, first.stderr)
+        self.assertEqual(second.returncode, 0, second.stderr)
+        self.assertEqual(self.sent(), [])
+        self.assertFalse((self.state / stall_watch.stretch_path("showrunner", "unit-one").name).exists())
+
     def test_finished_session_names_are_skipped_while_live_session_is_bumped(self) -> None:
         import stall_watch
         doc = self.production_plan("`docs/plans/example.md`")

@@ -57,6 +57,24 @@ def report(held: bool, next_run: str | None = "11:30", needed: str | None = None
     return fields
 
 
+def idle_unit(name: str, label: str, until: str, waits_for: str) -> dict[str, object]:
+    return {
+        **unit(False),
+        "unit": name,
+        "name": name,
+        "label": label,
+        "idle": {"waits_for": waits_for, "until": until},
+    }
+
+
+def idle_units() -> list[dict[str, object]]:
+    return [
+        idle_unit("screenshot", "screen", "2026-10-14T07:50", "a week of capture timings"),
+        idle_unit("cache-evict", "cache", "2026-10-04T16:33", "a day of sweep readings"),
+        idle_unit("mul_add", "mul_add", "2026-10-10T22:44", "three nightly lint runs"),
+    ]
+
+
 def holder(release: str = "unknown", name: str = "frame-time", since: str = "2026-10-04T10:56:00-07:00", purpose: str = FOR) -> dict[str, str]:
     return {"holder": name, "since": since, "for": purpose, "release_eta": release}
 
@@ -221,6 +239,146 @@ class ReportFooterTests(unittest.TestCase):
             input_path = Path(scratch) / "input.json"
             _ = input_path.write_text(json.dumps(report(False)))
             self.refused(run(["--footer", "--zone", ZONE, str(input_path)], scratch), "--footer takes no input file")
+
+
+class IdleGroupTests(unittest.TestCase):
+    def lines(self, result: Run) -> list[str]:
+        self.assertEqual(result.code, 0, result.error)
+        return result.lines
+
+    def refused(self, result: Run, message: str) -> None:
+        self.assertEqual(result.code, 2)
+        self.assertIn(message, result.error)
+
+    def fields(self, length: str = "simple") -> dict[str, object]:
+        working = {**unit(False), "unit": "working-unit", "name": "working", "label": "working"}
+        return {
+            "length": length,
+            "zone": ZONE,
+            "units": [*idle_units(), working],
+            "topics": [{
+                "title": "Other topic",
+                "update": "the queued check is running",
+                "eta": "12:55 PDT",
+                "needs_user": False,
+            }],
+        }
+
+    def test_simple_groups_idle_units_by_return_time_before_other_topics(self) -> None:
+        lines = self.lines(render(self.fields()))
+        expected = [
+            "### Waiting and idle",
+            "- cache-evict until 16:33: a day of sweep readings",
+            "- mul_add until Sat 22:44: three nightly lint runs",
+            "- screenshot until Wed 2026-10-14 07:50: a week of capture timings",
+            "",
+        ]
+        group_start = lines.index("### Waiting and idle")
+        self.assertEqual(lines[group_start : group_start + len(expected)], expected)
+        self.assertLess(lines.index("### working: panel widgets that work by keyboard and draw cleanly"), group_start)
+        self.assertLess(group_start, lines.index("### Other topic"))
+        for label in ("cache", "mul_add", "screen"):
+            self.assertTrue(any(row.startswith(label) for row in timeline(lines)), label)
+
+    def test_page_and_elaborate_keep_every_full_section(self) -> None:
+        for length in ("page", "elaborate"):
+            with self.subTest(length=length):
+                lines = self.lines(render(self.fields(length)))
+                headings = [line for line in lines[: lines.index(FENCE)] if line.startswith("### ")]
+                self.assertEqual(
+                    headings,
+                    [
+                        "### screenshot: panel widgets that work by keyboard and draw cleanly",
+                        "### cache-evict: panel widgets that work by keyboard and draw cleanly",
+                        "### mul_add: panel widgets that work by keyboard and draw cleanly",
+                        "### working: panel widgets that work by keyboard and draw cleanly",
+                        "### Other topic",
+                    ],
+                )
+                self.assertNotIn("### Waiting and idle", lines)
+
+    def test_action_fields_keep_idle_units_in_full_sections(self) -> None:
+        needed = {**idle_units()[0], "needed": "the showrunner: start the capture"}
+        held = {**idle_units()[1], "held": "the review found a missing case"}
+        needs_user = {**idle_units()[2], "needs_user": True}
+        fields: dict[str, object] = {
+            "length": "simple",
+            "zone": ZONE,
+            "units": [needed, held, needs_user],
+        }
+        lines = self.lines(render(fields))
+        self.assertNotIn("### Waiting and idle", lines)
+        for name in ("screenshot", "cache-evict", "mul_add"):
+            self.assertTrue(any(line.startswith(f"### {name}:") for line in lines), name)
+
+    def test_all_idle_units_print_only_the_group(self) -> None:
+        fields: dict[str, object] = {"length": "simple", "zone": ZONE, "units": idle_units()}
+        lines = self.lines(render(fields))
+        headings = [line for line in lines[: lines.index(FENCE)] if line.startswith("### ")]
+        self.assertEqual(headings, ["### Waiting and idle"])
+
+    def test_idle_input_refusals(self) -> None:
+        base = idle_units()[0]
+        cases: list[tuple[dict[str, object], str]] = [
+            (
+                {**base, "idle": {"waits_for": "capture timings", "until": "2026-10-14T07:50", "extra": True}},
+                "units[0].idle: unknown field(s) extra",
+            ),
+            (
+                {**base, "idle": {"waits_for": "capture timings", "until": "next week"}},
+                "units[0].idle.until: 'next week' must be when the unit comes back",
+            ),
+            (
+                {**base, "idle": {"waits_for": "x" * 81, "until": "2026-10-14T07:50"}},
+                "units[0].idle.waits_for: 81 characters; at most 80, one short line",
+            ),
+            (
+                {**base, "idle": {"waits_for": "the writer's report", "until": "2026-10-14T07:50"}},
+                "units[0].idle.waits_for: 'writer' is the production's own plumbing",
+            ),
+        ]
+        for changed, message in cases:
+            with self.subTest(message=message):
+                fields: dict[str, object] = {"length": "simple", "zone": ZONE, "units": [changed]}
+                self.refused(render(fields), message)
+
+    def test_renderer_refuses_idle_return_at_or_before_now(self) -> None:
+        for until in ("2026-10-04T10:59", AT):
+            with self.subTest(until=until):
+                waiting = idle_unit("cache-evict", "cache", until, "a day of sweep readings")
+                fields: dict[str, object] = {"length": "simple", "zone": ZONE, "units": [waiting]}
+                self.refused(
+                    render(fields),
+                    "units[0].idle.until: that time has passed; remove idle now the unit is back at work, or give the new time",
+                )
+
+    def test_state_check_names_idle_return_at_now(self) -> None:
+        waiting = idle_unit("cache-evict", "cache", AT, "a day of sweep readings")
+        fields: dict[str, object] = {"length": "simple", "zone": ZONE, "units": [waiting]}
+        with tempfile.TemporaryDirectory() as scratch:
+            state = check_render_state(fields, Path(scratch) / "missing-state.json", AT)
+        self.assertIsInstance(state, StateRefused)
+        if isinstance(state, StateRefused):
+            self.assertEqual(state.field, "units[0].idle.until")
+            self.assertIn("that time has passed", state.why)
+
+    def test_idle_units_remain_in_state_and_eta_log(self) -> None:
+        fields: dict[str, object] = {"length": "simple", "zone": ZONE, "units": idle_units()}
+        with tempfile.TemporaryDirectory() as scratch:
+            input_path = Path(scratch) / "input.json"
+            state_path = Path(scratch) / "state.json"
+            log_path = Path(scratch) / "production.log"
+            _ = input_path.write_text(json.dumps(fields), encoding="utf-8")
+            result = run(
+                [str(input_path), "--at", AT, "--state", str(state_path), "--log", str(log_path)],
+                scratch,
+            )
+            saved = cast(dict[str, object], json.loads(state_path.read_text(encoding="utf-8")))
+            logged = log_path.read_text(encoding="utf-8")
+        self.assertEqual(result.code, 0, result.error)
+        self.assertEqual(set(saved), {"screenshot", "cache-evict", "mul_add"})
+        for name in saved:
+            self.assertIn(f"{name} Phase 2 of 3", logged)
 
 
 def ranged_unit(label: str, phase: str, started: str, eta: dict[str, object]) -> dict[str, object]:

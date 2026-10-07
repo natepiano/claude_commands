@@ -292,6 +292,24 @@ class DailiesInputTests(unittest.TestCase):
                                           env=self.env, capture_output=True, text=True, check=False)
                 self.assertEqual(rendered.returncode, 0, rendered.stderr)
 
+    def test_retired_unit_needs_no_status_or_judgment_entry(self) -> None:
+        retired_row = (f"| `{BETA}` | (run done; retired by the user) | `{self.root / 'beta'}` | "
+                       f"`beta` | `{BETA}` | — | — |")
+        content = self.doc.read_text(encoding="utf-8")
+        _ = self.doc.write_text(content.replace("\n\n## Gates", f"\n{retired_row}\n\n## Gates"),
+                                encoding="utf-8")
+        result = self.run_builder()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        units = cast(list[dict[str, object]], self.report()["units"])
+        self.assertEqual([unit["unit"] for unit in units], [ALPHA])
+
+    def test_all_retired_units_report_no_live_units(self) -> None:
+        content = self.doc.read_text(encoding="utf-8")
+        _ = self.doc.write_text(content.replace("`docs/alpha.md`", "retired after completion", 1),
+                                encoding="utf-8")
+        _ = self.assert_refused_without_output(
+            mention="no live units: every Units row is marked retired")
+
     def test_short_session_without_judgment_label_uses_renderer_default(self) -> None:
         result = self.run_builder()
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)

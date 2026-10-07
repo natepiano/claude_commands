@@ -15,7 +15,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Callable, NamedTuple, TypeVar, cast
 
-from add_unit import Production, Refusal, cell_value, read_production, unit_rows
+from add_unit import Production, Refusal, cell_value, live_unit_rows, read_production, retired_units
 from merge_checkpoint import MergeEntry, NoMerge, Stop, git, merge_branch_history, report as merge_report
 
 JsonMap = dict[str, object]
@@ -155,9 +155,8 @@ def report(step: str, state: str, message: str) -> None:
 
 
 def units_from_doc(production: Production) -> tuple[Unit, ...]:
-    _, rows = unit_rows(production.doc.read_text(encoding="utf-8").splitlines())
     units: list[Unit] = []
-    for row in rows:
+    for row in live_unit_rows(production.doc.read_text(encoding="utf-8").splitlines()):
         cells = [cell_value(cell.strip()) for cell in row.strip("|").split("|")]
         if len(cells) < 5:
             raise WaitingFailure("production", f"invalid Units row: {row}")
@@ -405,15 +404,16 @@ def waits(production: Production) -> None:
     board = run_command("waits", ["cargo-berth", "board", "--json"])
     overlaps = berth_board(board)
     now = datetime.now(production.zone)
+    retired = retired_units(production.doc.read_text(encoding="utf-8").splitlines())
     active: dict[str, WaitOpen | WaitCleared] = {}
     clears: dict[str, str] = {}
     for event in log_events(production, now):
         opened = re.search(r": block: (.+?) on (.+?) \((?:code|files): .*\), clears ~([^ ]+)", event.line)
         closed = re.search(r": block cleared: (.+?) on (.+)$", event.line)
-        if opened:
+        if opened and opened.group(1) not in retired:
             key = f"{opened.group(1)} on {opened.group(2)}"
             active[key], clears[key] = WaitOpen(event.moment), opened.group(3)
-        elif closed:
+        elif closed and closed.group(1) not in retired:
             active[f"{closed.group(1)} on {closed.group(2)}"] = WaitCleared()
     open_count = sum(isinstance(value, WaitOpen) for value in active.values())
     if isinstance(overlaps, BerthNotConfigured):
