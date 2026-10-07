@@ -269,26 +269,21 @@ The user's measure, relayed by the showrunner (natedev) 2026-10-06: "it's a lot 
 
 ### Phase 6 — The final report goes to the showrunner with its recommendation · status: done
 
-#### Work Order
+#### As-built
 
-**Blocked by:** G1 (this plan's Gates table: `model_study.py ready` exits 0).
-
-Work only in worktree `/home/natepiano/worktrees/claude-build-followups-model-study`, branch `build-followups-model-study`. State every time in PDT.
-
-**Goal:** the study's numbers per director and the recommended director model default, stored in the repository and sent to the showrunner; the same command re-run later replaces them.
-
-**Spec:** nothing is written by hand.
-- Run `python3 scripts/model_study/model_study.py ready`; exit 0 is the gate (G1 already holds live, so Phase 5's work does not wait on the sample; recheck it here anyway, since Phase 5's results carry its counts). Then `python3 scripts/model_study/model_study.py results --message --now <the current PDT minute as YYYY-MM-DDTHH:MM>` on the live files (the explicit `--now` lets the acceptance repeat reproduce the pass): one pass writes `docs/as-built/director-model-study-results.md` and `.json` (Phase 5) and prints the final message from that same pass.
-- Read the markdown once against its own numbers. A label that contradicts its numbers, or a section that reads empty everywhere, is a defect in the code that generated it: report it in the summary and make no edit to the document. The unit director sends it to a repair round of Phases 2–5's code, and `results` runs again.
-- The unit director sends the showrunner that `results --message` output, never a second `report --final` run (it would add a history line and may read newer files than the documents), and names `docs/as-built/director-model-study-results.md` and the re-run command `python3 scripts/model_study/model_study.py results`. An exit 4 from `results` means the `.json` reached 300,000 bytes: that is a defect in the code that generated it, reported the same way (it leaves `history.jsonl` and `report.md` written and no results document).
-- `config/agents.conf` is not touched: enh-showrunner's Phase 6 owns the director model setting and takes the recommendation as its default.
+- One `ready` check (exit 0) and one `results --message --now 2026-10-06T20:18` run on the live files produced both generated documents; the sample time of the first final run is 2026-10-06 20:18 PDT. No code changed.
+- Sample gate: twelve directors measured, seven switched, six switched directors at 150 filtered Sonnet continuation requests each or more, so the gate held; the deadline 2026-10-07 10:30 PDT is still pending.
+- Pooled time result: median continuation seconds fall from Opus 5.41 to Sonnet 4.71 (-12.9%), a raw before-and-after figure that does not net out the clock: the Opus directors that never switched also ran faster over the same hours (startup 0%, fps -4.3%, trunk -12.1%, organon -16.6%). Output tokens run higher under Sonnet, mean cost per request lower, requests per 1,000 Work Order words and repair rounds both fewer, and compaction time per active hour 1.56 times higher.
+- The recommendation line reads `sonnet — cost per request is lower`, and the default for the enh-showrunner director model is `sonnet`.
+- The final message to the showrunner is the unedited `results --message` output, with the results document path and the re-run command named beside it. No second `report --final` was run. The `--no-extract` repeat at the same `--now` left both documents and `history.jsonl` byte-identical, with one history line.
 
 **Files:**
-- `docs/as-built/director-model-study-results.md` — the generated results.
-- `docs/as-built/director-model-study-results.json` — the generated numbers.
+- `docs/as-built/director-model-study-results.md` — the generated readable report, twelve sections, first line `Sample as of 2026-10-06 20:18 PDT`.
+- `docs/as-built/director-model-study-results.json` — the generated numbers `{compare, phases, history}`, compact and sorted, 145,579 bytes.
 
-**Seats:** 1 writer — `impl` runs the commands, reads the output and writes nothing but the two generated files; nothing splits.
+**Binds later work:** `python3 scripts/model_study/model_study.py results` re-run replaces both documents and adds a `Since the last run` section against the 20:18 PDT run. `config/agents.conf` is untouched because the enh-showrunner unit owns the director model setting and takes `sonnet` as its default. `results` exits 4 when the `.json` reaches 300,000 bytes, leaving `history.jsonl` and `report.md` written and no results document.
 
-**Constraints from prior phases:** `results`, `report --final` and `ready` are Phases 5 and 4's; the numbers come from `compare.json` and `phases.json` (Phases 2 and 3); the extract is Phase 1's. The roster may name a restarted director under a new session id: `extract` adds it from the live registry. Phase 5's `results [--docs-dir D] [--no-extract] [--no-history] [--message] [--now T] [--state-dir ...]` runs one final pass and writes both documents into `docs/as-built` (under the repository root that holds `scripts/model_study`) from it; `--message` prints that same pass's final message (60 lines or fewer); the markdown's headings, in order, are Sample as of, Question, Data, Method, The user's measure, Per-director comparison, Verdict, Sample gate, Learning, Limits, Since the last run, How to re-run; the `.json` is `{compare, phases, history}`, compact and sorted, with the latest 20 history lines, and `results` exits 4 when it reaches 300,000 bytes. `--now` takes a PDT time (`YYYY-MM-DDTHH:MM`) and also sets the `extracted` time. Two live passes at one `--now` differ whenever a live transcript grew between them, so the acceptance repeat uses `--no-extract`, which reads the first pass's `extract.json`; a run whose `--now` equals an existing history line's replaces it, so the repeat leaves one line. Live, build-report's Opus baseline is 7 requests, so its percent is not evidence, and a new director with no Opus baseline prints `—`; neither is a defect.
+**Gotchas:** The documents are generated, so a hand edit is replaced by the next run. A same-`--now` repeat replaces its own history line and needs `--no-extract` to reproduce byte-identical files while transcripts grow. Live counts move between runs because the directors keep working (widget 191 to 202 requests, enh-showrunner 539 to 562 between earlier test runs and this one); the Sample gate section and `ready` agree at the run's time. build-report's Opus arm is 7 requests, labelled `too few` in the table row, so its +253.3% is not evidence; the user's-measure lines print that percent without the label.
 
-**Acceptance gate:** `ready` exited 0 and the results document's Sample gate section shows its counts; the table holds every switched director with both arms' `n`; the verdict block and the recommendation line are present; `python3 -m json.tool docs/as-built/director-model-study-results.json` exits 0; running `results --no-extract --now <the first run's time>` again leaves both files and `history.jsonl` unchanged and adds no second history line (`cmp` on copies taken before the repeat); `python3 -m unittest discover -s scripts/model_study -p 'test_*.py'` still green; the showrunner has the final message.
+**Ruled out:** a second `report --final` run, which would add a history line and read newer files than the documents; editing `config/agents.conf`, whose director model setting belongs to the enh-showrunner unit.
+
