@@ -35,6 +35,8 @@ Each is the unit director's own call unless it names the user or the showrunner.
 - **A showrunner's session pauses on typing only.** Unit notices reach it every few minutes, so its dailies would never run if they counted.
 - **The five-minute return stays** as the user first asked. "doesn't start till the user returns" is read as: the question waits on screen for the user; told to the user 2026-10-07, theirs to correct.
 - **"Stopped" is five quiet minutes** after the first reply that ends after the user's last message. The user gave five minutes for the unanswered question; the quiet time takes the same number.
+- **A reply the user interrupts never ends,** so nothing marks it answered (measured: an interrupt fires no `Stop`). Thirty minutes after the user's message with no reply ended, the question is asked anyway, so a pause always ends.
+- **A late `yes` or `no` counts for five minutes** after the updates return on their own. After that it is typing like any other; reports have resumed by then and a bare answer most likely belongs to them.
 - **`no` keeps the updates off** until the user asks for them, or until their next conversation in that session goes quiet and the question comes round again.
 - **Turning a report back on must not move its schedule.** `notifier.sh start` schedules a whole interval from now, which would push a four-hour build report four hours past every conversation. The notifier gains a `resume` verb; a defect is fixed where it lives.
 - **The whole working pause is one phase** (the user made it the priority, 2026-10-07): one round of writing and review. Registration follows it. The unit rename (`/showrunner:rename_unit`) is this plan's last phase; its Work Order is added while the pause is being built.
@@ -57,6 +59,7 @@ Each is the unit director's own call unless it names the user or the showrunner.
 ## Delegation Context
 
 - **Project:** `~/.claude` — Claude Code commands, skills, hooks and scripts. Work in the worktree `/home/natepiano/worktrees/claude-build-followups-enh-showrunner` on branch `build-followups-enh-showrunner` (unit `enh-showrunner-unit` of production `build-followups`).
+- **Project started:** 2026-10-07T20:02:08.366+00:00
 - **Stack:** Python 3.13, standard library only; zsh for `notifier.sh`.
 - **Layout:**
   - `scripts/hooks/` — hook entry files (`<event>-<what>.py`), their libraries and `test_*.py`
@@ -89,7 +92,7 @@ Each is the unit director's own call unless it names the user or the showrunner.
 
 ## Phases
 
-### Phase 1 — A session's automatic updates pause when it is written to, and return on the user's yes or after five quiet minutes  · status: todo
+### Phase 1 — A session's automatic updates pause when it is written to, and return on the user's yes or after five quiet minutes  · status: done
 
 #### Work Order
 
@@ -97,7 +100,7 @@ Each is the unit director's own call unless it names the user or the showrunner.
 
 **Spec:**
 
-Constants in `scripts/hooks/conversation_pause.py`: `QUIET_SECONDS = 300` (user's message answered, then silence), `ANSWER_SECONDS = 300` (the user, 2026-10-07: "time out … after 5 minutes"), `TOMBSTONE_SECONDS = 3600`, `WATCHER = "conversation-pause"`.
+Constants in `scripts/hooks/conversation_pause.py`: `QUIET_SECONDS = 300` (user's message answered, then silence), `ANSWER_SECONDS = 300` (the user, 2026-10-07: "time out … after 5 minutes"), `UNANSWERED_SECONDS = 1800` (a reply that never ends), `TOMBSTONE_SECONDS = 300` (how long a late `yes` or `no` is still read as the answer), `WATCHER = "conversation-pause"`.
 
 *A. The notifier verb `resume`* (`scripts/message/notifier.sh`). `resume <instance>` sets `ENABLED=1`, writes the state, and prints the `next_due` line; it never calls `schedule`, so `NEXT_DUE` is what `stop` left. A slot that came due while the instance was stopped therefore fires on the next tick, and one still ahead fires on time. On an instance that is already enabled it changes nothing. Add it to `cmd_state`, to the `start|stop|restart)` dispatch arm and to `usage`. In `docs/as-built/session-notifier.md` add its row to the verb table and add `resume` to both lists of verbs that print `next_due`.
 
@@ -106,7 +109,7 @@ Constants in `scripts/hooks/conversation_pause.py`: `QUIET_SECONDS = 300` (user'
 - Roots and overrides: state root `CONVERSATION_PAUSE_STATE_DIR` or `~/.local/state/conversation-pause`; the notifier root as `showrunner_footer.targeted_instances` reads it (`NOTIFIER_STATE_DIR`); the notifier command is the one executable named by `CONVERSATION_PAUSE_NOTIFIER`, else `zsh <this file's directory>/../message/notifier.sh`; the clock is `CONVERSATION_PAUSE_NOW_EPOCH`, else the current time in whole seconds.
 - `class PromptSource(Enum)`: `TYPED`, `PEER`, `SCHEDULED`, `NOTICE`. `prompt_source(prompt: str, scheduled_senders: Callable[[], frozenset[str]]) -> PromptSource` reads the text with leading whitespace dropped:
   - empty → `NOTICE`;
-  - begins `<cross-session-message` → read `from-name="…"` from the opening tag. A name in `JOB_SENDERS = frozenset({"conversation-pause", "stall-watch", "tmux-names", "quota_alert"})`, or in `scheduled_senders()`, → `SCHEDULED`; any other name, or none → `PEER`. `scheduled_senders()` is called only here; the real one returns the `FROM=` value of every notifier instance that has no `RUN=` line (`delegate-<run id>`, `showrunner-timer-<slug>`, `report-builds`);
+  - begins `<cross-session-message` → read `from-name="…"` from the opening tag. A name in `JOB_SENDERS = frozenset({"conversation-pause", "stall-watch", "tmux-names", "quota_alert", "mac-test", "disk_floor"})`, or in `scheduled_senders()`, → `SCHEDULED`; any other name, or none → `PEER`. `scheduled_senders()` is called only here; the real one returns the `FROM=` value of every notifier instance that has no `RUN=` line (`delegate-<run id>`, `showrunner-timer-<slug>`, `report-builds`);
   - matches `^<[A-Za-z][A-Za-z0-9-]*[\s>]` (any other tag wrapper, such as `<task-notification>` or `<agent-message …>`), or begins `Another Claude session sent a message` or `[SYSTEM NOTIFICATION` → `NOTICE`;
   - anything else → `TYPED`: prose, a slash command, a line the showrunner typed.
 - `pauses(source: PromptSource, showrunner_session: bool) -> bool`: `TYPED` always; `PEER` unless the session is a showrunner's (`showrunner_footer.targeted_instances(session_id)` is not empty); `SCHEDULED` and `NOTICE` never.
@@ -122,7 +125,7 @@ Constants in `scripts/hooks/conversation_pause.py`: `QUIET_SECONDS = 300` (user'
   A report the user had already stopped (`ENABLED=0`) and a footer already off are never recorded, so they are never turned on by this feature.
 - The user's words for a paused thing, in this order with repeats dropped: `dailies` (a `showrunner-*` instance), `footer` (a footer slug), `status reports` (a `delegate-*` instance), `build report` (`report-builds`), then any other instance by its name, sorted.
 - `resume(session_id) -> tuple[str, ...]`, under the lock: for each recorded instance whose directory still exists run `<notifier> resume <name>`; for each recorded slug `set_footer_state(slug, FooterState.ON)`; delete the record; return the user's words for what it turned on. With no record it returns an empty tuple and does nothing.
-- Command line, session from `CLAUDE_CODE_SESSION_ID`: `conversation_pause.py status` prints `paused: dailies, footer (talking)`, with the phase's JSON kind in the brackets, or `not paused`; `conversation_pause.py resume` prints `automatic updates on: dailies, footer` or `nothing was paused`; `conversation_pause.py keep` sets the phase `KeptOff` and prints `automatic updates stay off`, or `nothing was paused` with no record; `conversation_pause.py tick` (section F; it needs no session id) runs one pass and prints one line per action taken. Exit 0; a usage error prints `usage: conversation_pause.py status|resume|keep|tick` to stderr and exits 2; `status`, `resume` and `keep` with no session id print `no session` to stderr and exit 1.
+- Command line, session from `CLAUDE_CODE_SESSION_ID`: `conversation_pause.py status` prints `paused: dailies, footer (talking)`, with the phase's JSON kind in the brackets, or `not paused` (a `Returned` record reads `not paused (returned)`); `conversation_pause.py resume` prints `automatic updates on: dailies, footer` or `nothing was paused`; `conversation_pause.py keep` sets the phase `KeptOff` and prints `automatic updates stay off`, or `nothing was paused` with no record; `conversation_pause.py tick` (section F; it needs no session id) runs one pass and prints one line per action taken. Exit 0; a usage error prints `usage: conversation_pause.py status|resume|keep|tick` to stderr and exits 2; `status`, `resume` and `keep` with no session id print `no session` to stderr and exit 1.
 
 *C. The prompt hook* (`scripts/hooks/user-prompt-submit-conversation-pause.py`, new), modelled on `stop-showrunner-footer.py`. It reads the payload from stdin and returns silently when the payload has `agent_id`, has no `session_id`, or `pauses(…)` is false. A `NOTICE` returns before any file is read; a cross-session prompt reads the notifier root's `conf` files once. Otherwise it calls `message_arrived` (section E) and prints the reply it returns as one JSON object. The pause notice, the reply for a `pause` that turned something off:
 
@@ -145,20 +148,22 @@ with the list replaced by the real words. A reply with no `systemMessage` leaves
 | none, `Talking`, `KeptOff` | anything | `pause` | the pause notice (section C) when something was turned off; else no reply | the same |
 | `Asked` | `Yes` | `resume` | `Automatic updates are back on: <words>.` | `The user answered yes to "Return to automatic updates?". They are back on: <words>. Confirm it in one line. That yes answers only this question.` |
 | `Asked` | `No` | phase becomes `KeptOff` | `Automatic updates stay off.` | `The user answered no to "Return to automatic updates?". They stay off until the user asks for them; then run: RESUME. Confirm it in one line. That no answers only this question.` |
-| `Asked` | anything else | `pause` (phase becomes `Talking`) | none | `You asked the user "Return to automatic updates? (yes / no)" and they wrote something else. If their message answers that question, run RESUME for yes or KEEP for no. Otherwise answer them and say nothing of the question; it comes back when they go quiet.` |
-| `Returned` | `Yes` | the record is deleted | none | `Automatic updates already returned on their own. Tell the user that in one line.` |
-| `Returned` | `No` | `pause`, then phase becomes `KeptOff` | `Automatic updates are off again: <words>.` | the `Asked` + `No` text |
-| `Returned` | anything else | the record is deleted, then `pause` | the pause notice when something was turned off; else no reply | the same |
+| `Asked` | anything else (a `PEER` message: the same `pause`, with no reply at all) | `pause` (phase becomes `Talking`) | none | `You asked the user "Return to automatic updates? (yes / no)" and they wrote something else. If their message answers that question, run RESUME for yes or KEEP for no. Otherwise answer them and say nothing of the question; it comes back when they go quiet.` |
+| `Returned`, less than `TOMBSTONE_SECONDS` old | `Yes` | the record is deleted | none | `Automatic updates already returned on their own. Tell the user that in one line.` |
+| `Returned`, less than `TOMBSTONE_SECONDS` old | `No` | `pause`, then phase becomes `KeptOff` | `Automatic updates are off again: <words>.` | the `Asked` + `No` text |
+| `Returned` | anything else, or any message once the record is `TOMBSTONE_SECONDS` old | the record is deleted, then `pause` | the pause notice when something was turned off; else no reply | the same |
 
-A `pause` that finds a record keeps what it lists and adds what has been turned on since.
+A `pause` that finds a record keeps what it lists and adds what has been turned on since. A sentence with nothing to list ends without the list: `Automatic updates are back on.`
 
 *F. The watcher.* `pause` ends, still under the lock, with `ensure_watcher()`: when `<notifier root>/conversation-pause/conf` is missing it runs `<notifier> new conversation-pause --every 1 --run "<home>/.claude/scripts/lib/py <home>/.claude/scripts/hooks/conversation_pause.py tick"`, the form `update_registration.py` uses. `conversation_pause.py tick` then runs each minute. `tick(now)` takes the lock, decides, writes, releases the lock, and only then sends, so a slow send never holds up a prompt. For each record:
 
-1. The session is not running (`sessions.py socket session:<id>` prints nothing): turn on what the record lists (as `resume` does) and delete the record. A session that is gone is not in a conversation.
-2. `Talking` with `answered_at` set and `now - answered_at >= QUIET_SECONDS`: the phase becomes `Asked(asked_at=now)` and the question is queued for sending.
+1. The session is not running (`sessions.py socket session:<id>` prints nothing, exit 0 or 1): turn on what the record lists (as `resume` does) and delete the record. A session that is gone is not in a conversation. A lookup that fails any other way (a timeout, another exit status) skips the record for this pass and keeps the watcher.
+2. `Talking` with `answered_at` set and `now - answered_at >= QUIET_SECONDS`, or with `answered_at` still `None` and `now - user_wrote_at >= UNANSWERED_SECONDS`: the phase becomes `Asked(asked_at=now)` and the question is queued for sending.
 3. `Asked` with `now - asked_at >= ANSWER_SECONDS`: turn on what the record lists; the record keeps empty lists and the phase `Returned(returned_at=now)`, so a late `yes` or `no` is read correctly.
 4. `Returned` with `now - returned_at >= TOMBSTONE_SECONDS`: delete the record.
 5. `KeptOff`: nothing.
+
+A record that cannot be read, or a notifier call that fails, is one stderr line; the pass goes on to the next record and the watcher stays.
 
 After the pass, with no record left in `Talking` or `Asked`, it runs `<notifier> remove conversation-pause` before releasing the lock. The question goes out as `send.py --to uds:<socket> --from conversation-pause --key conversation-pause-<session id> --text <text>` (`CONVERSATION_PAUSE_SEND` and `CONVERSATION_PAUSE_SESSIONS` replace the two scripts in tests, as `STALL_WATCH_SEND` and `STALL_WATCH_SESSIONS` do in `stall_watch.py`). A failed send is one stderr line; the phase stays `Asked`, so the updates still return on time. The text:
 
@@ -177,13 +182,14 @@ After the pass, with no record left in `Talking` or `Asked`, it runs `<notifier>
   - `resume` on the command line calls the notifier's `resume` for each recorded instance that still exists, skips one whose directory is gone, turns the footer on, and deletes the record; `status` prints both forms; `keep` sets `kept_off`.
 - More cases in `scripts/hooks/test_conversation_pause.py`; the clock comes from `CONVERSATION_PAUSE_NOW_EPOCH`, and stub `sessions` and `send` commands log their arguments:
   - the Stop hook sets `answered_at` once and a second Stop leaves it; with no record it touches nothing; a payload with `agent_id` changes nothing;
-  - a tick before five quiet minutes sends nothing; at five it sends the question once, with the exact text, to the session's socket, and the phase is `Asked`; a tick while `answered_at` is `None` sends nothing however long ago the user wrote;
+  - a tick before five quiet minutes sends nothing; at five it sends the question once, with the exact text, to the session's socket, and the phase is `Asked`; a tick while `answered_at` is `None` sends nothing until thirty minutes after the user wrote, then asks;
   - every row of the table in E, including `Yes.`, ` y ` and `NO!`; a peer message whose text is `yes` is not an answer and keeps the pause going;
   - an unanswered question: five minutes on, the tick calls the notifier's `resume` for each recorded instance, turns the footer on, and leaves a `Returned` record; a typed `yes` after that deletes it and pauses nothing; a typed `no` pauses again and reads `kept_off`;
   - a `KeptOff` record is left alone by the tick however long it sits; a typed message moves it to `Talking`;
   - a record whose session is not running is turned back on and deleted;
   - the first pause creates the watcher with the exact `new` arguments; a second does not; the tick that leaves no `Talking` or `Asked` record removes it;
-  - a failed send leaves `Asked` and exits 0.
+  - a failed send leaves `Asked` and exits 0;
+  - a failed session lookup leaves the record and the watcher; an unreadable record does not stop another session's return; a `yes` with nothing left to turn on prints `Automatic updates are back on.`; a bare `yes` after the late window pauses like any typing; `status` after a return prints `not paused (returned)`.
 
 **Files:**
 - `scripts/message/notifier.sh` — the `resume` verb.
