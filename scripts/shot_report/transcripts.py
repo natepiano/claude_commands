@@ -12,13 +12,77 @@ import subprocess
 from collections.abc import Iterable, Iterator
 from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass, field, replace
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Literal, cast, override
 
 Agent = Literal["Claude", "Codex"]
 CallKind = Literal["shot", "other"]
 ProjectAttribution = Literal["repository", "scratchpad", "last_path", "removed_worktree", "scratchpad_target_missing"]
+
+
+@dataclass(frozen=True)
+class SuccessfulCapture:
+    image_paths: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class FailedCapture:
+    image_paths: tuple[str, ...]
+    reason: str
+
+
+CaptureAttempt = SuccessfulCapture | FailedCapture
+
+
+@dataclass(frozen=True)
+class AttemptCountInferredFromImages:
+    pass
+
+
+@dataclass(frozen=True)
+class ExactOrderedCaptureAttempts:
+    captures: tuple[CaptureAttempt, ...]
+
+
+AttemptEvidence = AttemptCountInferredFromImages | ExactOrderedCaptureAttempts
+
+
+@dataclass(frozen=True)
+class IdentifiedSession:
+    value: str
+
+
+@dataclass(frozen=True)
+class UnidentifiedSession:
+    pass
+
+
+SessionEvidence = IdentifiedSession | UnidentifiedSession
+
+
+@dataclass(frozen=True)
+class SuccessfulInvocation:
+    time: datetime
+    session: SessionEvidence
+    attempts: tuple[CaptureAttempt, ...]
+
+
+@dataclass(frozen=True)
+class FailedInvocation:
+    time: datetime
+    session: SessionEvidence
+    attempts: tuple[CaptureAttempt, ...]
+    exit_code: int
+    reason: str
+
+
+@dataclass(frozen=True)
+class OldSuccessInvocation:
+    time: datetime
+
+
+InvocationRecord = SuccessfulInvocation | FailedInvocation | OldSuccessInvocation
 
 
 @dataclass(frozen=True)
@@ -37,6 +101,10 @@ class ToolCall:
     script_path: str = ""
     script_paths: tuple[str, ...] = ()
     cwd: str = ""
+    image_paths: tuple[str, ...] = ()
+    cited_image_paths: tuple[str, ...] = ()
+    result_position: int = 0
+    attempt_evidence: AttemptEvidence = AttemptCountInferredFromImages()
 
 
 PREFILTER = (
@@ -71,6 +139,8 @@ JS_COMMAND = re.compile(r"\bcmd\s*:\s*(\"(?:\\.|[^\"\\])*\"|'(?:\\.|[^'\\])*'|`(
 TOOL_RESULT_ID = re.compile(r'"tool_use_id"\s*:\s*"([^\"]+)"')
 HEREDOC = re.compile(r"<<-?\s*(['\"]?)([A-Za-z_][A-Za-z_0-9]*)\1")
 PNG_PATH = re.compile(r"[A-Za-z0-9_./~:-]+\.png\b", re.IGNORECASE)
+CODEX_THREAD_SUFFIX = re.compile(r"([0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12})$", re.IGNORECASE)
+TEXT_WRITE = re.compile(r"\.write_text\s*\(\s*(['\"])(.*?)\1", re.DOTALL)
 BRP_METHOD = re.compile(r"[\"']?method[\"']?\s*:\s*[\"']([^\"']+)[\"']")
 CODE_CALL = re.compile(r"\b(?:rpc|call|invoke|send_request)\s*\(\s*(['\"])([^'\"]+)\1")
 SCRIPT_WRITE = re.compile(r"\b(?:cat\s*>{1,2}\s*|tee\s+)([^\s;]+)")
@@ -126,6 +196,12 @@ class TranscriptScan(list[ToolCall]):
         self.bytes_read = bytes_read
 
 
+@dataclass(frozen=True)
+class TranscriptEvidence:
+    calls: list[ToolCall]
+    citations: list[tuple[int, str]]
+
+
 def _object(value: object) -> dict[str, object]:
     if isinstance(value, dict):
         return cast(dict[str, object], value)
@@ -150,6 +226,95 @@ def _stamp(value: object) -> datetime | None:
         return datetime.fromisoformat(stamp.replace("Z", "+00:00"))
     except ValueError:
         return None
+
+
+def _invocation_record(value: object) -> InvocationRecord | None:
+    record = _object(value)
+    stamp = _stamp(record.get("time"))
+    if stamp is None:
+        return None
+    if stamp.tzinfo is None:
+        stamp = stamp.replace(tzinfo=timezone.utc)
+    status = record.get("status")
+    if status is None:
+        return OldSuccessInvocation(stamp)
+    raw_session = _object(record.get("session"))
+    if raw_session.get("state") == "present" and isinstance(raw_session.get("value"), str):
+        session: SessionEvidence = IdentifiedSession(_string(raw_session.get("value")))
+    elif raw_session.get("state") == "absent":
+        session = UnidentifiedSession()
+    else:
+        return None
+    raw_attempts = record.get("attempts")
+    if not isinstance(raw_attempts, list):
+        return None
+    attempts: list[CaptureAttempt] = []
+    for raw_attempt in cast(list[object], raw_attempts):
+        attempt = _object(raw_attempt)
+        raw_paths = attempt.get("image_paths")
+        if not isinstance(raw_paths, list):
+            return None
+        path_items = cast(list[object], raw_paths)
+        if not all(isinstance(path, str) for path in path_items):
+            return None
+        paths = tuple(cast(list[str], path_items))
+        if attempt.get("status") == "success":
+            attempts.append(SuccessfulCapture(paths))
+        elif attempt.get("status") == "failure" and isinstance(attempt.get("failure_reason"), str):
+            attempts.append(FailedCapture(paths, _string(attempt.get("failure_reason"))))
+        else:
+            return None
+    if status == "success" and record.get("exit_code") == 0:
+        return SuccessfulInvocation(stamp, session, tuple(attempts))
+    exit_code = record.get("exit_code")
+    reason = record.get("failure_reason")
+    if status == "failure" and isinstance(exit_code, int) and not isinstance(exit_code, bool) and (
+        isinstance(reason, str)
+    ):
+        return FailedInvocation(stamp, session, tuple(attempts), exit_code, reason)
+    return None
+
+
+def _timing_invocations(path: Path) -> list[InvocationRecord]:
+    if not path.exists():
+        return []
+    records: list[InvocationRecord] = []
+    with path.open(encoding="utf-8") as source:
+        for line in source:
+            try:
+                raw = cast(object, json.loads(line))
+            except json.JSONDecodeError:
+                continue
+            record = _invocation_record(raw)
+            if record is not None:
+                records.append(record)
+    return records
+
+
+def _recorded_calls(calls: list[ToolCall], records: list[InvocationRecord]) -> list[ToolCall]:
+    updated = calls.copy()
+    shot_calls = {index for index, call in enumerate(calls) if call.source == "hana_shot" and call.kind == "shot"}
+    by_session: dict[str, set[int]] = {}
+    for index in shot_calls:
+        by_session.setdefault(calls[index].session_id, set()).add(index)
+    for record in sorted(records, key=lambda item: item.time):
+        if isinstance(record, OldSuccessInvocation):
+            continue
+        pool = (shot_calls if isinstance(record.session, UnidentifiedSession)
+                else by_session.get(record.session.value, set()))
+        candidates = [index for index in pool if (
+            calls[index].start - timedelta(seconds=10) <= record.time <= calls[index].end + timedelta(seconds=10)
+        )]
+        if not candidates or isinstance(record.session, UnidentifiedSession) and len(candidates) != 1:
+            continue
+        index = min(candidates, key=lambda candidate: abs((calls[candidate].end - record.time).total_seconds()))
+        call = updated[index]
+        paths = tuple(dict.fromkeys((*call.image_paths, *(path for attempt in record.attempts
+                                                         for path in attempt.image_paths))))
+        earlier = call.attempt_evidence.captures if isinstance(call.attempt_evidence, ExactOrderedCaptureAttempts) else ()
+        updated[index] = replace(call, image_paths=paths,
+                                 attempt_evidence=ExactOrderedCaptureAttempts((*earlier, *record.attempts)))
+    return updated
 
 
 def _candidate_files(root: Path) -> list[Path]:
@@ -1087,7 +1252,113 @@ def _result_text(value: object) -> str:
     if not isinstance(value, dict):
         return ""
     data = _object(cast(object, value))
-    return " ".join(_result_text(data.get(key)) for key in ("text", "content", "output"))
+    return " ".join(_result_text(data.get(key)) for key in (
+        "text", "content", "output", "path", "file_path", "image_path", "image_paths", "saved_to", "images",
+    ))
+
+
+def _paths(value: object) -> tuple[str, ...]:
+    return tuple(dict.fromkeys(PNG_PATH.findall(_result_text(value))))
+
+
+def _message_text(value: object) -> str:
+    if isinstance(value, str):
+        return value
+    if isinstance(value, list):
+        return " ".join(_message_text(item) for item in cast(list[object], value))
+    data = _object(value)
+    if not data:
+        return ""
+    return " ".join(_message_text(data.get(key)) for key in ("message", "summary", "content", "text"))
+
+
+def _outgoing_tool_message(name: str, value: object, command: str) -> str:
+    if name == "SendMessage" or name.endswith(".SendMessage"):
+        return _message_text(value)
+    if "codex_mesh.py" not in command or "--message" not in command:
+        return ""
+    messages: list[str] = []
+    for tokens in _shell_segments(command):
+        program, arguments = _program(tokens)
+        if program == "codex_mesh.py":
+            options = arguments[1:]
+        elif program.startswith("python") and len(arguments) > 1 and Path(arguments[1]).name == "codex_mesh.py":
+            options = arguments[2:]
+        else:
+            continue
+        for index, option in enumerate(options):
+            if option == "--message" and index + 1 < len(options):
+                messages.append(options[index + 1])
+            elif option.startswith("--message="):
+                messages.append(option.partition("=")[2])
+    return " ".join(messages)
+
+
+def _path_in_message(path: str, message: str) -> bool:
+    start = message.find(path)
+    while start >= 0:
+        end = start + len(path)
+        before = message[start - 1] if start else ""
+        after = message[end] if end < len(message) else ""
+        if (not before or before not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_./~:-") and (
+            not after or after not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_./~:-"
+        ):
+            return True
+        start = message.find(path, start + 1)
+    return False
+
+
+def _write_text(name: str, value: object) -> str:
+    data = _object(value)
+    if name in {"Write", "Edit", "MultiEdit"}:
+        edits = " ".join(_string(_object(item).get("new_string")) for item in _items(data.get("edits")))
+        return " ".join((_string(data.get("content")), _string(data.get("new_string")), edits))
+    if "apply_patch" in name:
+        patch = _string(value) or _string(data.get("input"))
+        return "\n".join(line[1:] for line in patch.splitlines() if line.startswith("+") and not line.startswith("+++"))
+    command = _shell_command(name, value)
+    if "*** Begin Patch" in command:
+        return "\n".join(line[1:] for line in command.splitlines() if line.startswith("+") and not line.startswith("+++"))
+    heredocs = _heredoc_writes(command, "") if "<<" in command else []
+    if heredocs:
+        return "\n".join(content for _, content, _ in heredocs)
+    literal = TEXT_WRITE.search(command)
+    if literal:
+        return literal.group(2)
+    if re.search(r"\b(?:echo|printf)\s+", command) and ">" in command:
+        return command.split(">", 1)[0]
+    if re.search(r"\b(?:echo|printf)\s+", command) and "| tee " in command:
+        return command.split("| tee ", 1)[0]
+    return ""
+
+
+def _write_succeeded(output: object, is_error: object) -> bool:
+    if is_error is True:
+        return False
+    result = _result_text(output).strip()
+    if result.startswith(("Failed", "Error:")):
+        return False
+    return re.search(r"(?:exit code:|exited with code)\s*[1-9]\d*", result, re.IGNORECASE) is None
+
+
+def _kept_calls(calls: list[ToolCall], citations: list[tuple[int, str]]) -> list[ToolCall]:
+    ordered = sorted(enumerate(calls), key=lambda item: item[1].result_position)
+    cited: dict[int, set[str]] = {}
+    latest: dict[str, int] = {}
+    next_call = 0
+    for position, message in sorted(citations):
+        while next_call < len(ordered) and ordered[next_call][1].result_position < position:
+            index, call = ordered[next_call]
+            if call.kind == "shot":
+                for path in call.image_paths:
+                    latest[path] = index
+            next_call += 1
+        for path, index in latest.items():
+            if _path_in_message(path, message):
+                cited.setdefault(index, set()).add(path)
+    return [replace(call, cited_image_paths=tuple(path for path in call.image_paths
+                                                   if path in cited.get(index, set())))
+            for index, call in enumerate(calls)]
 
 
 def _image_count(kind: CallKind, source: str, result: object, command: str, scripted_calls: int = 0) -> int:
@@ -1122,7 +1393,7 @@ def _matching_lines(path: Path, markers: tuple[bytes, ...]) -> Iterator[bytes]:
             raise RuntimeError(error)
 
 
-def _claude_calls(path: Path, projects: dict[str, tuple[str, ProjectAttribution]]) -> list[ToolCall]:
+def _claude_calls(path: Path, projects: dict[str, tuple[str, ProjectAttribution]]) -> TranscriptEvidence:
     pending: dict[str, tuple[datetime, str, str, ProjectAttribution, CallKind, str, str, str, int, tuple[str, ...], str]] = {}
     pending_writes: dict[str, tuple[str, object, str]] = {}
     known_cwds: set[str] = set()
@@ -1131,14 +1402,34 @@ def _claude_calls(path: Path, projects: dict[str, tuple[str, ProjectAttribution]
     script_names_text: tuple[str, ...] = ()
     script_name_pattern: re.Pattern[bytes] | None = None
     calls: list[ToolCall] = []
-    for line in _matching_lines(path, (b'"tool_use"', b'"tool_result"')):
+    citations: list[tuple[int, str]] = []
+    pending_citation_writes: dict[str, str] = {}
+    for position, line in enumerate(_matching_lines(path, (b'"tool_use"', b'"tool_result"', b'.png'))):
+            if b'.png' in line and b'"tool_use"' not in line and b'"tool_result"' not in line:
+                row = _read_json(line.decode("utf-8", errors="replace"))
+                row_type = _string(row.get("type"))
+                message = _object(row.get("message"))
+                if row_type == "assistant":
+                    content = message.get("content")
+                    outgoing = (content if isinstance(content, str) else
+                                " ".join(_string(_object(part).get("text")) for part in _items(content)
+                                         if _object(part).get("type") == "text"))
+                elif "checkpoint" in row_type or "checkpoint" in _string(row.get("subtype")) or (
+                    "checkpoint" in _string(_object(row.get("data")).get("type"))
+                ):
+                    outgoing = _result_text(message) or _result_text(row.get("content"))
+                else:
+                    outgoing = ""
+                if outgoing:
+                    citations.append((position, outgoing))
+                continue
             if b'"tool_use"' in line:
-                if not (CLAUDE_HINT.search(line)
+                if not (CLAUDE_HINT.search(line) or b'.png' in line
                         or b'"Write"' in line or b'"Edit"' in line
                         or script_name_pattern is not None and script_name_pattern.search(line)):
                     continue
-            elif (pending or pending_writes) and b'"tool_result"' in line:
-                if not any(use_id.encode() in line for use_id in (*pending, *pending_writes)):
+            elif (pending or pending_writes or pending_citation_writes) and b'"tool_result"' in line:
+                if not any(use_id.encode() in line for use_id in (*pending, *pending_writes, *pending_citation_writes)):
                     continue
             else:
                 continue
@@ -1149,10 +1440,16 @@ def _claude_calls(path: Path, projects: dict[str, tuple[str, ProjectAttribution]
             message = _object(row.get("message"))
             for raw_part in _items(message.get("content")):
                 part = _object(raw_part)
+                if row.get("type") == "assistant" and part.get("type") == "text":
+                    citations.append((position, _string(part.get("text"))))
                 if part.get("type") == "tool_use":
                     name = _string(part.get("name"))
                     value = part.get("input")
                     command = _shell_command(name, value)
+                    if b'.png' in line:
+                        outgoing = _outgoing_tool_message(name, value, command)
+                        if outgoing:
+                            citations.append((position, outgoing))
                     cwd = _string(row.get("cwd"))
                     if cwd and "scratchpad" not in cwd:
                         known_cwds.add(cwd)
@@ -1161,6 +1458,9 @@ def _claude_calls(path: Path, projects: dict[str, tuple[str, ProjectAttribution]
                     if linked is not None and (classified is None or linked.kind == "shot" and classified[0] != "shot"):
                         classified = (linked.kind, linked.source, command)
                     use_id = _string(part.get("id"))
+                    written = _write_text(name, value) if b'.png' in line else ""
+                    if written and ".png" in written.lower():
+                        pending_citation_writes[use_id] = written
                     if name in {"Write", "Edit"}:
                         pending_writes[use_id] = (name, value, cwd)
                     else:
@@ -1182,6 +1482,9 @@ def _claude_calls(path: Path, projects: dict[str, tuple[str, ProjectAttribution]
                     )
                 elif part.get("type") == "tool_result":
                     use_id = _string(part.get("tool_use_id"))
+                    written = pending_citation_writes.pop(use_id, "")
+                    if written and _write_succeeded(part.get("content"), part.get("is_error")):
+                        citations.append((position, written))
                     write = pending_writes.pop(use_id, None)
                     if write is not None and part.get("is_error") is not True:
                         _remember_tool(*write, scripts)
@@ -1196,29 +1499,46 @@ def _claude_calls(path: Path, projects: dict[str, tuple[str, ProjectAttribution]
                         start, stamp, session, str(path), "Claude", project, kind, origin,
                         command, _image_count(kind, origin, part.get("content"), command, script_calls),
                         attribution, script_path, script_paths, cwd,
+                        _paths(part.get("content")) if kind == "shot" else (), (), position,
                     ))
-    return calls
+    return TranscriptEvidence(calls, citations)
 
 
-def _codex_calls(path: Path, projects: dict[str, tuple[str, ProjectAttribution]]) -> list[ToolCall]:
+def _codex_calls(path: Path, projects: dict[str, tuple[str, ProjectAttribution]]) -> TranscriptEvidence:
     pending: dict[str, tuple[datetime, CallKind, str, str, str, int, tuple[str, ...], str]] = {}
     scripts: dict[str, RememberedScript] = {}
     script_names: tuple[bytes, ...] = ()
     script_names_text: tuple[str, ...] = ()
     script_name_pattern: re.Pattern[bytes] | None = None
     calls: list[ToolCall] = []
-    session = path.stem.rsplit("-", 5)[-1]
+    citations: list[tuple[int, str]] = []
+    pending_citation_writes: dict[str, str] = {}
+    thread_suffix = CODEX_THREAD_SUFFIX.search(path.stem)
+    session = thread_suffix.group(1) if thread_suffix is not None else path.stem
     project = path.parent.name
     attribution: ProjectAttribution = "last_path"
     cwd = ""
-    for line in _matching_lines(path, (b'"session_meta"', b'"response_item"')):
+    for position, line in enumerate(_matching_lines(path, (b'"session_meta"', b'"response_item"', b'.png'))):
             if b'"session_meta"' not in line and b'"response_item"' not in line:
+                if b'.png' in line:
+                    row = _read_json(line.decode("utf-8", errors="replace"))
+                    payload = _object(row.get("payload"))
+                    if row.get("type") == "event_msg" and _string(payload.get("type")) in {"agent_message", "checkpoint", "task_complete"}:
+                        citations.append((position, _result_text(payload.get("message"))))
                 continue
             if b'"session_meta"' not in line:
                 if b'"function_call_output"' in line or b'"custom_tool_call_output"' in line:
-                    if not pending or not any(use_id.encode() in line for use_id in pending):
+                    if not pending and not pending_citation_writes or not any(
+                        use_id.encode() in line for use_id in (*pending, *pending_citation_writes)
+                    ):
                         continue
-                elif not (CODEX_HINT.search(line)
+                elif b'"message"' in line and b'.png' in line:
+                    row = _read_json(line.decode("utf-8", errors="replace"))
+                    payload = _object(row.get("payload"))
+                    if payload.get("type") == "message" and payload.get("role") == "assistant":
+                        citations.append((position, _result_text(payload.get("content"))))
+                    continue
+                elif not (CODEX_HINT.search(line) or b'.png' in line
                           or script_name_pattern is not None and script_name_pattern.search(line)):
                     continue
             row = _read_json(line.decode("utf-8", errors="replace"))
@@ -1240,11 +1560,18 @@ def _codex_calls(path: Path, projects: dict[str, tuple[str, ProjectAttribution]]
                     raw_input = parsed if parsed else raw_input
                 call_cwd = _string(_object(raw_input).get("workdir")) or cwd
                 command = _shell_command(name, raw_input)
+                if b'.png' in line:
+                    outgoing = _outgoing_tool_message(name, raw_input, command)
+                    if outgoing:
+                        citations.append((position, outgoing))
                 linked = _linked_run(command, call_cwd, scripts) if command and any(name in command for name in script_names_text) else None
                 classified = _classify(name, raw_input)
                 if linked is not None and (classified is None or linked.kind == "shot" and classified[0] != "shot"):
                     classified = (linked.kind, linked.source, command)
                 _remember_tool(name, raw_input, call_cwd, scripts)
+                written = _write_text(name, raw_input) if b'.png' in line else ""
+                if written and ".png" in written.lower():
+                    pending_citation_writes[_string(payload.get("call_id"))] = written
                 if name.endswith("apply_patch") or "<<" in command:
                     script_names_text = tuple({os.path.basename(script_path) for script_path in scripts})
                     script_names = tuple(name.encode() for name in script_names_text)
@@ -1259,7 +1586,11 @@ def _codex_calls(path: Path, projects: dict[str, tuple[str, ProjectAttribution]]
                     linked.paths if linked is not None else (), call_cwd,
                 )
             elif part_type in ("function_call_output", "custom_tool_call_output"):
-                use = pending.pop(_string(payload.get("call_id")), None)
+                use_id = _string(payload.get("call_id"))
+                written = pending_citation_writes.pop(use_id, "")
+                if written and _write_succeeded(payload.get("output"), payload.get("is_error")):
+                    citations.append((position, written))
+                use = pending.pop(use_id, None)
                 if use is None:
                     continue
                 start, kind, origin, command, script_path, script_calls, script_paths, call_cwd = use
@@ -1267,31 +1598,39 @@ def _codex_calls(path: Path, projects: dict[str, tuple[str, ProjectAttribution]]
                     start, stamp, session, str(path), "Codex", project, kind, origin,
                     command, _image_count(kind, origin, payload.get("output"), command, script_calls),
                     attribution, script_path, script_paths, call_cwd,
+                    _paths(payload.get("output")) if kind == "shot" else (), (), position,
                 ))
-    return calls
+    return TranscriptEvidence(calls, citations)
 
 
-def _scan_file(file: tuple[Agent, Path]) -> list[ToolCall]:
+def _scan_file(file: tuple[Agent, Path]) -> TranscriptEvidence:
     agent, path = file
     projects: dict[str, tuple[str, ProjectAttribution]] = {}
     return _claude_calls(path, projects) if agent == "Claude" else _codex_calls(path, projects)
 
 
-def scan_calls(claude_root: Path, codex_root: Path) -> TranscriptScan:
+def scan_calls(claude_root: Path, codex_root: Path, timings_path: Path | None = None) -> TranscriptScan:
     """Read matching transcript files; roots can point at fixture directories."""
     claude_files = _candidate_files(claude_root)
     codex_files = _codex_candidate_files(codex_root)
     files: list[tuple[Agent, Path]] = [*(('Claude', path) for path in claude_files), *(('Codex', path) for path in codex_files)]
     sized: list[tuple[int, Agent, Path]] = sorted(((path.stat().st_size, agent, path) for agent, path in files), reverse=True)
     ordered: list[tuple[Agent, Path]] = [(agent, path) for _, agent, path in sized]
-    calls: list[ToolCall] = []
+    evidence: list[TranscriptEvidence] = []
     if sum(size for size, _, _ in sized) > PARALLEL_SCAN_BYTES:
         with ProcessPoolExecutor(max_workers=min(4, os.cpu_count() or 2)) as workers:
-            for file_calls in workers.map(_scan_file, ordered):
-                calls.extend(file_calls)
+            evidence.extend(workers.map(_scan_file, ordered))
     else:
         for file in ordered:
-            calls.extend(_scan_file(file))
+            evidence.append(_scan_file(file))
+    calls = [call for file_evidence in evidence for call in file_evidence.calls]
+    if timings_path is not None:
+        calls = _recorded_calls(calls, _timing_invocations(timings_path))
+    offset = 0
+    for file_evidence in evidence:
+        count = len(file_evidence.calls)
+        calls[offset:offset + count] = _kept_calls(calls[offset:offset + count], file_evidence.citations)
+        offset += count
     live_names = {call.project for call in calls if call.project_attribution == "repository"}
     folded: list[ToolCall] = []
     for call in calls:

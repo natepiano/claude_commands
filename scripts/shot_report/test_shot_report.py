@@ -10,9 +10,12 @@ import tempfile
 import unittest
 from dataclasses import replace
 from pathlib import Path
-from typing import ClassVar, TypedDict, cast, override
+from typing import ClassVar, NotRequired, TypedDict, cast, override
 
-from scripts.shot_report.episodes import read_episodes, write_episodes
+from scripts.shot_report.episodes import (
+    LegacyEvidenceUnavailable, NoObservablePath, NoneCited, OneCitedShot,
+    SeveralCitedShots, read_episodes, write_episodes,
+)
 
 
 class EpisodeRecord(TypedDict):
@@ -29,6 +32,8 @@ class EpisodeRecord(TypedDict):
     transcript_path: str
     session_id: str
     source: list[str]
+    kept_shot_state: NotRequired[str]
+    attempts_before_first_kept_shot: NotRequired[int]
 
 
 HERE = Path(__file__).resolve().parent
@@ -64,8 +69,9 @@ class ShotReportTest(unittest.TestCase):
 
     @classmethod
     def run_command(cls, *arguments: str) -> subprocess.CompletedProcess[str]:
+        timing_args = ("--timings-path", str(cls.state_dir / "fixture-timings.jsonl")) if arguments[0] == "scan" else ()
         return subprocess.run(
-            [sys.executable, str(COMMAND), *arguments, "--state-dir", str(cls.state_dir)],
+            [sys.executable, str(COMMAND), *arguments, *timing_args, "--state-dir", str(cls.state_dir)],
             cwd=HERE,
             capture_output=True,
             text=True,
@@ -159,12 +165,37 @@ class ShotReportTest(unittest.TestCase):
         old["source"] = ",".join(cast(list[str], old["source"]))
         _ = old.pop("image_count")
         _ = old.pop("hana_shot_call_count")
+        _ = old.pop("kept_shot_state")
         target = self.state_dir / "legacy.jsonl"
         _ = target.write_text(json.dumps(old) + "\n", encoding="utf-8")
         loaded = read_episodes(target)
         self.assertEqual(len(loaded), 1)
         self.assertIsInstance(loaded[0].source, frozenset)
         self.assertEqual(loaded[0].image_count, loaded[0].screenshot_count)
+        self.assertIsInstance(loaded[0].kept_shot, LegacyEvidenceUnavailable)
+
+    def test_report_counts_each_kept_state_and_first_kept_attempts(self) -> None:
+        baseline = next(episode for episode in read_episodes(self.state_dir / "episodes.jsonl")
+                        if episode.split == 300)
+        evidence = [OneCitedShot(2), SeveralCitedShots(1, 2), NoneCited(),
+                    NoObservablePath(), LegacyEvidenceUnavailable()]
+        with tempfile.TemporaryDirectory() as directory:
+            state_dir = Path(directory)
+            write_episodes(state_dir / "episodes.jsonl",
+                           [replace(baseline, kept_shot=state) for state in evidence])
+            with (state_dir / "episodes.jsonl").open("a", encoding="utf-8") as target:
+                _ = target.write("{broken json\n")
+                _ = target.write('{"start":"2026-10-01T00:00:00Z","end":"2026-10-01T00:00:01Z",' +
+                                 '"method":"by hand","source":[]}\n')
+            self.assertEqual(len(read_episodes(state_dir / "episodes.jsonl")), 5)
+            result = subprocess.run([sys.executable, str(COMMAND), "report", "--state-dir", str(state_dir)],
+                                    cwd=HERE, capture_output=True, text=True, check=False)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        header = next(line for line in result.stdout.splitlines() if line.startswith("split_s"))
+        self.assertIn("no_observable_path", header)
+        row = next(line for line in result.stdout.splitlines() if line.startswith("300 "))
+        self.assertEqual(re.split(r"\s{2,}", row.strip())[-9:],
+                         ["5", "1", "1", "1", "1", "1", "2", "1.5", "1.9"])
 
     def test_hana_shot_episode_counts_distinct_images_and_calls(self) -> None:
         image_episode = next(
