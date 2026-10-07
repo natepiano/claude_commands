@@ -35,6 +35,7 @@ class HistoryMeasure(TypedDict):
     opus_median_seconds: float | None
     sonnet_median_seconds: float | None
     change_percent: float | None
+    net_change_percent: float | None
 
 
 class DirectorHistoryMeasure(TypedDict):
@@ -43,6 +44,7 @@ class DirectorHistoryMeasure(TypedDict):
     opus_median_seconds: float | None
     sonnet_median_seconds: float | None
     change_percent: float | None
+    net_change_percent: float | None
 
 
 class HistoryRun(TypedDict):
@@ -82,10 +84,13 @@ def history_measure(row: DirectorComparison | None) -> HistoryMeasure:
     sonnet = continuation(row, "sonnet") if row is not None else None
     before = opus["seconds_median"] if opus is not None else None
     after = sonnet["seconds_median"] if sonnet is not None else None
+    net = difference(row, "net_seconds") if row is not None else None
+    net_value = net["value"] if net is not None else None
     return {"opus_n": opus["n"] if opus is not None else 0,
             "sonnet_n": sonnet["n"] if sonnet is not None else 0,
             "opus_median_seconds": before, "sonnet_median_seconds": after,
-            "change_percent": percent_change(before, after)}
+            "change_percent": percent_change(before, after),
+            "net_change_percent": net_value / before * 100 if before not in (None, 0) and net_value is not None else None}
 
 
 def history_row(comparison: ComparisonReport, phases: PhaseReport, now: datetime, final: bool) -> HistoryRun:
@@ -96,7 +101,8 @@ def history_row(comparison: ComparisonReport, phases: PhaseReport, now: datetime
         directors.append({"name": row["name"], "sonnet_continuation_n": measured["sonnet_n"],
                           "opus_median_seconds": measured["opus_median_seconds"],
                           "sonnet_median_seconds": measured["sonnet_median_seconds"],
-                          "change_percent": measured["change_percent"]})
+                          "change_percent": measured["change_percent"],
+                          "net_change_percent": measured["net_change_percent"]})
     return {"at": clock.astimezone(timezone.utc).isoformat(), "mode": "final" if final else "interim",
             "recommendation": verdict(comparison, phases), "pooled": history_measure(comparison["pooled"]),
             "directors": directors}
@@ -145,7 +151,9 @@ def since_lines(history: FirstRun | FollowingRun) -> list[str]:
         earlier = prior.get(row["name"])
         old_n = earlier["sonnet_continuation_n"] if earlier is not None else 0
         old_change = earlier["change_percent"] if earlier is not None else None
-        lines.append(f"{row['name']}: Sonnet continuation n {old_n} → {row['sonnet_continuation_n']}; median change {number(old_change)}% → {number(row['change_percent'])}%.")
+        net = (f"; net {number(earlier.get('net_change_percent'))}% → {number(row.get('net_change_percent'))}%"
+               if earlier is not None and earlier.get("net_change_percent") is not None and row.get("net_change_percent") is not None else "")
+        lines.append(f"{row['name']}: Sonnet continuation n {old_n} → {row['sonnet_continuation_n']}; median change {number(old_change)}% → {number(row['change_percent'])}%{net}.")
     lines.append(since_pooled_line(history))
     lines.append("recommendation unchanged" if current["recommendation"] == previous["recommendation"]
                  else f"recommendation changed from {previous['recommendation']} to {current['recommendation']}")
@@ -156,7 +164,11 @@ def since_pooled_line(history: FirstRun | FollowingRun) -> str:
     if isinstance(history, FirstRun):
         return "Pooled switched: first run."
     current, previous = history.current, history.previous
-    return f"Pooled switched: median change then {number(previous['pooled']['change_percent'])}%, now {number(current['pooled']['change_percent'])}%."
+    old = previous["pooled"]
+    new = current["pooled"]
+    net = (f"; net then {number(old.get('net_change_percent'))}%, now {number(new.get('net_change_percent'))}%"
+           if old.get("net_change_percent") is not None and new.get("net_change_percent") is not None else "")
+    return f"Pooled switched: median change then {number(old['change_percent'])}%, now {number(new['change_percent'])}%{net}."
 
 
 def number(value: float | int | None, digits: int = 2) -> str:
@@ -194,6 +206,15 @@ def measure_line(row: DirectorComparison) -> str:
     text = f"{row['name']}: median continuation-turn seconds Opus {number(before) if before is not None else 'n/a'} → Sonnet {number(after) if after is not None else 'n/a'}"
     if before not in (None, 0) and after is not None:
         text += f" ({(after - before) / before:+.1%})"
+    net = difference(row, "net_seconds")
+    if net is not None:
+        value = net["value"]
+        if value is None:
+            text += "; net of the clock n/a (no control director qualified)" if net["label"] == "no control" else "; net of the clock n/a (too few timed requests)"
+        else:
+            net_percent = f"{value / before:+.1%}" if before not in (None, 0) else "n/a"
+            text += (f"; net of the clock {value:+.2f} s ({net_percent} of the Opus median), "
+                     f"95% interval [{number(net['low'])}, {number(net['high'])}] s — {net['label']}")
     return text
 
 
@@ -223,7 +244,7 @@ def work_label(phases: PhaseReport, metric: str) -> str:
 def verdict(comparison: ComparisonReport, phases: PhaseReport) -> str:
     """Choose the default from the measured labels alone."""
     pooled = comparison["pooled"]
-    time = metric_label(pooled, "seconds")
+    time = metric_label(pooled, "net_seconds")
     cost = metric_label(pooled, "cost")
     requests = work_label(phases, "requests_per_1000_words")
     repairs = work_label(phases, "repair_rounds")
@@ -237,7 +258,7 @@ def verdict(comparison: ComparisonReport, phases: PhaseReport) -> str:
 def recommendation_line(comparison: ComparisonReport, phases: PhaseReport) -> str:
     pooled = comparison["pooled"]
     causes: list[str] = []
-    if metric_label(pooled, "seconds") == "slower":
+    if metric_label(pooled, "net_seconds") == "slower":
         causes.append("continuation time is slower")
     if work_label(phases, "requests_per_1000_words") == "more":
         causes.append("requests per 1,000 Work Order words are more")
@@ -247,7 +268,7 @@ def recommendation_line(comparison: ComparisonReport, phases: PhaseReport) -> st
         return "Recommendation: opus — " + "; ".join(causes) + "."
     if metric_label(pooled, "cost") == "lower":
         return "Recommendation: sonnet — cost per request is lower."
-    if metric_label(pooled, "seconds") == "faster":
+    if metric_label(pooled, "net_seconds") == "faster":
         return "Recommendation: sonnet — continuation time is faster."
     return "Recommendation: sonnet stays (no measurable difference; evidence thin)."
 
@@ -269,7 +290,7 @@ def verdict_lines(comparison: ComparisonReport, phases: PhaseReport) -> list[str
     sonnet_rate = compaction_rate(comparison, "sonnet")
     ratio = sonnet_rate / opus_rate if opus_rate not in (None, 0) and sonnet_rate is not None else None
     return [
-        f"time: pooled continuation seconds {metric_label(pooled, 'seconds')}",
+        f"time: pooled continuation seconds {metric_label(pooled, 'net_seconds')} net of the clock (raw {metric_label(pooled, 'seconds')})",
         f"tokens: output tokens {metric_label(pooled, 'output')}; cost per request {metric_label(pooled, 'cost')}",
         f"work: requests per 1,000 Work Order words {work_label(phases, 'requests_per_1000_words')}; repair rounds {work_label(phases, 'repair_rounds')}",
         f"compaction: Sonnet / Opus {number(ratio)}× (Opus {number(opus_rate)} s/active h; Sonnet {number(sonnet_rate)} s/active h)",
@@ -280,7 +301,7 @@ def verdict_lines(comparison: ComparisonReport, phases: PhaseReport) -> list[str
 
 def director_table(comparison: ComparisonReport, phases: PhaseReport) -> list[str]:
     lines = [
-        "| Director | Opus n | Sonnet n | First Sonnet request PDT | Continuation median s O → S | Δ seconds and label | Output median O → S | Mean cost USD O → S | Repair rounds median O → S |",
+        "| Director | Opus n | Sonnet n | First Sonnet request PDT | Continuation median s O → S | Raw Δ seconds and label | Output median O → S | Mean cost USD O → S | Repair rounds median O → S |",
         "| --- | ---: | ---: | --- | --- | --- | --- | --- | --- |",
     ]
     for row in comparison["directors"]:
@@ -322,9 +343,15 @@ def class_table(comparison: ComparisonReport) -> list[str]:
 
 def control_section(comparison: ComparisonReport) -> list[str]:
     control = comparison["control"]
+    pooled = control["pooled"]
+    change = pooled["change_seconds"]
+    change_percent = change / pooled["before_median"] if change is not None and pooled["before_median"] not in (None, 0) else None
+    change_text = f"{change:+.2f} s ({change_percent:+.1%})" if change is not None and change_percent is not None else "n/a"
+    pooled_line = (f"Pooled control at {control['at_pdt'] or '—'}: before n {pooled['before_n']}, median {number(pooled['before_median'])} s; "
+                   f"after n {pooled['after_n']}, median {number(pooled['after_median'])} s; change {change_text}.")
     if not control["directors"]:
-        return ["no control candidate qualified (30 filtered Opus continuation requests on each side of T)"]
-    lines = [f"T: {control['at_pdt'] or '—'}", "", "| Director | Before n / median s | After n / median s | Δ seconds and label |", "| --- | ---: | ---: | --- |"]
+        return [pooled_line, "no control candidate qualified (30 filtered Opus continuation requests on each side of T)"]
+    lines = [f"T: {control['at_pdt'] or '—'}", pooled_line, "", "| Director | Before n / median s | After n / median s | Δ seconds and label |", "| --- | ---: | ---: | --- |"]
     for row in control["directors"]:
         delta = row["difference"]
         lines.append(f"| {row['name']} | {row['before_n']} / {number(row['before_median'])} | {row['after_n']} / {number(row['after_median'])} | {number(delta['value'])} ({delta['label']}) |")
@@ -406,7 +433,8 @@ def limits(comparison: ComparisonReport, phases: PhaseReport, extracted: Extract
     if unknown:
         lines.append("Compaction duration unknown or active hours unavailable for " + ", ".join(unknown) + "; its rate reads —.")
     control = comparison["control"]
-    lines.append(f"Clock conditions may affect time; control T is {control['at_pdt'] or '—'} and {len(control['directors'])} director(s) qualified.")
+    pooled_control = control["pooled"]
+    lines.append(f"Clock control boundary {control['at_pdt'] or '—'}: {len(control['directors'])} director(s) qualified; {pooled_control['before_n']} continuation requests before and {pooled_control['after_n']} after.")
     lines.extend([
         "The study covers natedev only.",
         "Costs are API-equivalent estimates, not subscription weights.",

@@ -45,9 +45,19 @@ def learning(comparison: ComparisonReport, phases: PhaseReport) -> list[str]:
     control_text = "no control candidate qualified" if not control else "; ".join(
         f"{row['name']} {row['difference']['label']} (before {report.number(row['before_median'])}; after {report.number(row['after_median'])})"
         for row in control)
+    net = report.difference(pooled, "net_seconds") if pooled is not None else None
+    opus_seconds = opus["seconds_median"] if opus else None
+    sonnet_seconds = sonnet["seconds_median"] if sonnet else None
+    raw_percent = report.percent_change(opus_seconds, sonnet_seconds)
+    net_value = net["value"] if net is not None else None
+    raw_text = f"{raw_percent:+.1f}%" if raw_percent is not None else "n/a"
+    net_text = f"{net_value:+.2f}" if net_value is not None else "n/a"
+    time_line = (f"Time: median continuation seconds {net['label'] if net else 'no control'} net of the clock "
+                 f"(Opus {report.number(opus_seconds)}; Sonnet {report.number(sonnet_seconds)}; raw {raw_text}; "
+                 f"net {net_text} s, interval [{report.number(net['low'] if net else None)}, "
+                 f"{report.number(net['high'] if net else None)}]).")
     return [
-        metric_line("Time", "median continuation seconds", report.metric_label(pooled, "seconds"),
-                    opus["seconds_median"] if opus else None, sonnet["seconds_median"] if sonnet else None),
+        time_line,
         f"Tokens and cost: median output tokens per request {report.metric_label(pooled, 'output')} (Opus {report.number(opus['output_median'] if opus else None)}; Sonnet {report.number(sonnet['output_median'] if sonnet else None)}); mean cost in dollars per request {report.metric_label(pooled, 'cost')} (Opus {report.number(report.request_cost_mean(pooled, 'opus') if pooled else None, 5)}; Sonnet {report.number(report.request_cost_mean(pooled, 'sonnet') if pooled else None, 5)}).",
         f"Turns and repair rounds: requests per 1,000 words {requests['label'] if requests else 'too few phases (n=0 against 0)'} (Opus {report.number(requests['opus_median'] if requests else None)}; Sonnet {report.number(requests['sonnet_median'] if requests else None)}); repair rounds per phase {repairs['label'] if repairs else 'too few phases (n=0 against 0)'} (Opus {report.number(repairs['opus_median'] if repairs else None)}; Sonnet {report.number(repairs['sonnet_median'] if repairs else None)}).",
         f"Compactions: seconds per active hour, Opus {report.number(opus_rate)}; Sonnet {report.number(sonnet_rate)}.",
