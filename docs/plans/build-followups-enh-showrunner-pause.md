@@ -159,7 +159,7 @@ The pause is safe to register: it cannot delay a prompt, cannot stay on for ever
 
 **Ruled out:** repairing around `notifier.sh`'s write order from the pause alone (a defect is fixed where it lives); treating an unreadable registry as "session ended".
 
-### Phase 3 — The broadcast skips a session record it cannot read  · status: todo
+### Phase 3 — The broadcast skips a session record it cannot read  · status: done
 
 #### Work Order
 

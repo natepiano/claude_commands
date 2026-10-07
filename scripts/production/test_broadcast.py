@@ -80,6 +80,15 @@ class BroadcastTests(unittest.TestCase):
         self.assertIn("send --to fps-impl --from natedev --codex --session-dir /tmp/d1 --text From the user", self.log())
         self.assertNotIn("--to natedev", self.log())
 
+    def test_a_registry_file_that_cannot_be_read_is_skipped(self) -> None:
+        _ = (self.root / "sessions/broken.json").write_text("{not json", encoding="utf-8")
+        _ = (self.root / "sessions/9.json").write_text(json.dumps({"pid": 9}), encoding="utf-8")
+        done = self.run_script("--all", "From the user: stop builds.", TOGETHER="4")
+        self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+        self.assertEqual(done.stdout.splitlines()[:-1], [
+            "hana - showrunner - sent", "trunk - unit director - sent", "gone - unit director - no live session",
+            "ups - agent - sent", "fps-impl - agent - sent"])
+
     def test_each_role_gets_its_own_version(self) -> None:
         done = self.run_script("--showrunners", "count your agents", "--units", "finish your agents")
         self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
