@@ -20,7 +20,10 @@ The session notifier sends a message to a live Claude session on a schedule: the
 | `scripts/delegate/end_session.sh` | Run end: removes the instance, then the marker. |
 | `scripts/hooks/delegate_run.py` | `check` CLI: the unit instance's check. Also a library the delegate hooks import. |
 | `scripts/delegate/progress_history.py` | `progress` restarts the unit's instance on every call, refused ones included, and names its next tick in the report's clock line. |
-| `commands/showrunner/{produce,dailies,interval}.md` | Create, restart, retime and remove the showrunner instance. |
+| `scripts/production/update_registration.py` | `register` writes `PROMPT_FILE`, creates or retargets the showrunner instance, and creates the `stall-watch` and `tmux-names` run-only instances when absent. |
+| `scripts/production/dailies_input.py` | `--user-run` restarts the showrunner instance for a dailies the user runs. |
+| `scripts/production/production_lifecycle.py` | `wrap` removes the showrunner instance. |
+| `commands/showrunner/{produce,dailies,interval}.md` | Call those commands; `/showrunner:interval` retimes the showrunner instance. |
 | `commands/unit/delegate.md` `<ProgressContract>`, `commands/unit/report.md`, `commands/unit/interval.md` | How a unit treats its ticks, and `/unit:interval`. |
 | `config/delegate.conf` | `PLAN_DELEGATE_PROGRESS_INTERVAL_SECONDS`, the unit interval. |
 | `/etc/nixos/modules/common/session-notifier.nix` | The 15 s job. |
@@ -113,7 +116,7 @@ On the unit side, every `progress_history.py progress` call runs `notifier.sh re
 
 ### The showrunner instance
 
-`/showrunner:produce` owns `UPDATES` = `showrunner-<slug>`, where `<slug>` is the production doc's file name less `-production.md`. In `<StartUpdates>`, at start and on every resume, it writes the filled scheduled-update prompt to `PROMPT_FILE` (`~/.local/state/showrunner/<slug>/prompt.txt`) and runs:
+`/showrunner:produce` owns `UPDATES` = `showrunner-<slug>`, where `<slug>` is the production doc's file name less `-production.md`. In `<StartUpdates>`, at start and on every resume, it runs `update_registration.py register --production <doc> --session <name>`, which writes the filled scheduled-update prompt to `PROMPT_FILE` (`~/.local/state/showrunner/<slug>/prompt.txt`) and runs:
 
 ```
 notifier.sh new showrunner-<slug> --to session:$CLAUDE_CODE_SESSION_ID --every <N> \
@@ -121,7 +124,7 @@ notifier.sh new showrunner-<slug> --to session:$CLAUDE_CODE_SESSION_ID --every <
   --check "zsh $HOME/.claude/scripts/production/production_check.sh <absolute doc path>"
 ```
 
-N comes from the doc's `**Updates:** every N minutes` line, 15 when absent. There is no `--hold`. A repeated `new` on resume retargets the instance to the current session without moving the clock. The instance outlives the session. A tick arrives as a message from `showrunner-timer-<slug>` whose text starts `Scheduled update`; the showrunner treats it as the scheduled prompt and does not reply. A `/showrunner:dailies` the user types runs `unit_status.sh`, gives the report, then runs `restart`, so the next tick is N minutes after that report; a scheduled tick skips both. Every reply's `next dailies` time is read from `notifier.sh status`. `<Wrap>` runs `remove`, and the check removes the instance on its own once the doc says `wrapped`.
+N comes from the doc's `**Updates:** every N minutes` line, 15 when absent; `on the hour` in that line adds `--aligned`. There is no `--hold`. A repeated `new` on resume retargets the instance to the current session without moving the clock. The instance outlives the session. A tick arrives as a message from `showrunner-timer-<slug>` whose text starts `Scheduled update`; the showrunner treats it as the scheduled prompt and does not reply. A `/showrunner:dailies` the user types saves the `unit_status.sh` output and runs `dailies_input.py --user-run`, which checks the whole input, then runs `restart`, takes `next_due` for the report and appends it to `LOG`, so the next tick is N minutes after that report; a scheduled tick runs the builder without `--user-run` and restarts nothing. Every reply's `next dailies` time is read from `notifier.sh status`. `production_lifecycle.py wrap` runs `remove`, and the check removes the instance on its own once the doc says `wrapped`.
 
 ### The unit instance
 
@@ -135,7 +138,7 @@ notifier.sh new delegate-<run id> --to session:<id> --every <minutes> \
   --check "<repo>/scripts/lib/py <repo>/scripts/hooks/delegate_run.py check <id> <SESSION_DIR>"
 ```
 
-So the unit gets `/unit:report` every interval while work runs, from sender `delegate-<run id>`, with at most one tick waiting. The unit director arms nothing. On each tick it reads `report.md` and composes `<ProgressReport/>`; ticks that arrive during a report, or several at once, get one report. A tick never replaces the completion report. If the user stops updates, the unit runs `notifier.sh stop delegate-<run id>`, and `start` to resume; `restart` from later reports keeps a stopped instance stopped.
+So the unit gets `/unit:report` every interval while work runs, from sender `delegate-<run id>`, with at most one tick waiting. The unit director arms nothing. On each tick it reads `report.md` and composes `<ProgressReport/>`; ticks that arrive during a report, or several at once, get one report. A tick never replaces the completion report. If the user stops updates, the unit runs `/unit:report off` (`unit_notifier.sh <id> off`, which runs `notifier.sh stop delegate-<run id>`), and `/unit:report on` to resume; `restart` from later reports keeps a stopped instance stopped.
 
 `end_session.sh` runs `notifier.sh remove delegate-<run id>` (errors ignored) before it deletes the marker. A run that dies without `end_session.sh` loses its instance at the next due slot after its marker is gone or replaced (check exit 2). A unit parked on the user keeps its instance; its check exits 1 and each slot is skipped.
 
