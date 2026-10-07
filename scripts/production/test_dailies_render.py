@@ -10,7 +10,8 @@ import tempfile
 import unittest
 from dataclasses import dataclass
 from pathlib import Path
-from typing import ClassVar, cast
+from typing import ClassVar, cast, override
+from unittest import mock
 
 from dailies_render import (NoLastReportedEta, StateClear, StateRefused,
                             check_render_state, load_state)
@@ -606,6 +607,12 @@ class EtaResolutionTests(unittest.TestCase):
 
 
 class StatePreflightTests(unittest.TestCase):
+    @override
+    def setUp(self) -> None:
+        # The preflight reads holder files; a hold live on this machine must not reach these tests.
+        holders = self.enterContext(tempfile.TemporaryDirectory())
+        self.enterContext(mock.patch.dict(os.environ, {"BUILD_HOLD_DIR": holders}))
+
     def test_moved_eta_without_reason_returns_named_refusal(self) -> None:
         fields = report(held=False)
         with tempfile.TemporaryDirectory() as scratch:
