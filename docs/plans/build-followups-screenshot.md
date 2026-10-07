@@ -335,3 +335,41 @@ Measured 2026-10-06/07 on the build machine, 300 s split, Sep 9 PDT to 2026-10-0
 **Gotchas:** Bevy serializes an absent override as `null`. Hana's own crates set no scale override; one seen at runtime comes from test or session setup.
 
 **Ruled out:** a semantic `EffectiveWindowScale` type in place of `scale_factor_override: float | None` — the TypedDict mirrors the wire record, and the optional resolves into a plain effective scale on the next line.
+
+### Phase 9 — `/hana_shot` leaves no Mac window always on top · status: done
+
+#### Work Order
+
+**Source:** the showrunner, 2026-10-07: `keep_visible` (`scripts/hana_shot/hana_shot.py:1231`) sets the Hana window to AlwaysOnTop on every macOS run, and nothing sets it back. That day a Hana window on the Mac stayed in front of everything while the user was away; `/hana_shot` ran there 29 times, last at 08:12 PDT, from tool-based-ui-demo and startup-polish. Hana sets no window level itself: `~/rust/hana` has no `WindowLevel` or `window_level`.
+
+**Goal:** when `/hana_shot` exits, by success, failure, Ctrl-C, SIGTERM or SIGHUP, every window it raised has the level it had before the run, so no Mac window stays always on top.
+
+**Spec:**
+- `keep_visible` (`:1231`) queries the primary window's `Window` component and reads its `window_level` before it writes AlwaysOnTop. It still does its work once per session, as today.
+- The level to put back is the one read, except that a level reading AlwaysOnTop goes back to Normal: Hana sets no level itself, so an AlwaysOnTop level is one an earlier run left behind. A level that cannot be read also goes back to Normal.
+- `Session.window_level_set: bool` (`:579`) becomes a type that says whether this run raised the window and, when it did, the window entity and the level to put back, such as `WindowLeftAlone | WindowRaised(entity, restore_level)`. It is not a bare optional.
+- `Session.close()` (`:597`) puts the level back first, then ends the keep-awake. The restore call uses `CALL_TIMEOUT`. A restore that fails (a BRP error, or Hana gone) prints one stderr line, `hana_shot: could not put the window level back to <level>: <reason>`. The keep-awake still ends, and the run keeps its own exit code and exception.
+- Every command that shoots opens its `Session` with `closing(...)` (`:1856`, `:2137`). Success, `Failure`, `Refused`, `CaptureTimeout` and Ctrl-C therefore already pass through `close()`. `main` (`:2276`) also turns SIGTERM and SIGHUP into an exit that unwinds through `close()` and its own `finally`, so the invocation record is still written; the exit code is 128 + the signal number. SIGKILL cannot be caught; the next run's AlwaysOnTop-to-Normal rule repairs the level it leaves.
+- A local macOS run (no `--remote`, Hana on this Mac) takes the same path.
+- `commands/hana_shot.md` items 8 and 9 say the level goes back to what it was when the run ends.
+- Tests drive the existing BRP fake. Its primary window answers a `window_level` (Normal unless a test sets another), and a `.window_level` mutate changes it. Every case is a remote Mac shot that checks the fake's final level and that the keep-awake ended:
+  - success from Normal: the mutates are AlwaysOnTop then Normal, and the level ends Normal;
+  - success from AlwaysOnBottom: it ends AlwaysOnBottom;
+  - success from AlwaysOnTop: it ends Normal;
+  - a failed run (the remote copy leaves no file, exit 1): it ends at the level it started with;
+  - SIGINT, and separately SIGTERM, sent while the fake holds the screenshot call: it ends at the level it started with, and the invocation record is written;
+  - a restore the fake refuses: one stderr line, and the run's exit code is unchanged.
+  The success, failure and signal cases fail on today's code. `test_remote_mac_shot_raises_the_window_and_holds_the_display_awake_for_the_run` changes to expect the restore.
+
+**Files:**
+- `scripts/hana_shot/hana_shot.py` — read the level, the raised-window type, the restore in `close()`, SIGTERM and SIGHUP in `main`
+- `commands/hana_shot.md` — items 8 and 9 say the level goes back
+- `scripts/hana_shot/test_hana_shot.py` — the fake's window level and the exit-path cases
+
+**Seats:** 1 writer + 1 tester
+- `impl`: `scripts/hana_shot/hana_shot.py`, `commands/hana_shot.md`
+- `test`: `scripts/hana_shot/test_hana_shot.py`
+
+**Constraints from prior phases:** each `shot` call still appends its one timings line and invocation record (Phase 3), on every exit path, signals included. `ensure_window` reads the `Window` component through `WindowValue`, whose `window_level` is a string (Phase 8).
+
+**Acceptance gate:** the `scripts/hana_shot` tests pass, and `basedpyright` reports 0/0/0 on both changed `.py` files. Live, on the Mac, after the merge: the tool-based-ui unit's next Mac shot reads `window_level` once `/hana_shot` exits, and it reads the level from before the run (Normal for Hana). The showrunner arranges that check; no Mac Hana is cleared for this unit's port.
