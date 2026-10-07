@@ -1982,17 +1982,18 @@ def _clock_line(now: float, next_report_at: float | None) -> str:
     never when. This line is the one place a reader can tell whether the report
     they are looking at is current and how long until the next one lands.
     """
-    now_local = datetime.fromtimestamp(now)
-    line = f"**now {now_local:%Y-%m-%d %H:%M:%S}"
+    line = f"**now {datetime.fromtimestamp(now):%Y-%m-%d %H:%M:%S}"
     if next_report_at is not None:
-        next_local = datetime.fromtimestamp(next_report_at)
-        stamp = (
-            f"{next_local:%H:%M:%S}"
-            if next_local.date() == now_local.date()
-            else f"{next_local:%Y-%m-%d %H:%M:%S}"
-        )
-        line += f" - next report {stamp}"
+        line += f" - next report {_moment_stamp(next_report_at, now)}"
     return line + "**"
+
+
+def _moment_stamp(epoch: float, now: float) -> str:
+    """A local clock time, dated only when it falls on a day other than `now`'s."""
+    moment = datetime.fromtimestamp(epoch)
+    if moment.date() == datetime.fromtimestamp(now).date():
+        return f"{moment:%H:%M:%S}"
+    return f"{moment:%Y-%m-%d %H:%M:%S}"
 
 
 STAGE_HEADERS: tuple[str, ...] = (
@@ -3364,9 +3365,9 @@ def _render_table(
     return [rendered(headers), rule, *(rendered(row) for row in rows)]
 
 
-def _arrival_label(seconds_out: int, now: float) -> str:
-    """A point in the future named the way a person would say it aloud."""
-    arrival = datetime.fromtimestamp(now + seconds_out)
+def _arrival_label(arrival_epoch: float, now: float) -> str:
+    """A point in time named the way a person would say it aloud on `now`'s day."""
+    arrival = datetime.fromtimestamp(arrival_epoch)
     days = (arrival.date() - datetime.fromtimestamp(now).date()).days
     if days == 0:
         return f"today {arrival:%H:%M}"
@@ -3375,15 +3376,17 @@ def _arrival_label(seconds_out: int, now: float) -> str:
     return f"{arrival:%Y-%m-%d %H:%M}"
 
 
-def _eta_cell(percent: int, elapsed: int, now: float) -> str:
+def _eta_cell(percent: int, elapsed: int, as_of: float, now: float) -> str:
     """When the work is expected to land, as a clock time rather than a duration.
 
     A remaining duration has to be added to the current time by hand every time
     it is read, and the answer changes with every report. An arrival stamp is
     that addition already done, and it says the same thing tomorrow morning.
+    `elapsed` is measured at `as_of`, which a report between windows sets to
+    its last recorded moment; the day is still named from `now`.
     """
     eta = _eta_seconds(percent, elapsed)
-    return "" if eta is None else _arrival_label(eta, now)
+    return "" if eta is None else _arrival_label(as_of + eta, now)
 
 
 def _format_offset(seconds: int) -> str:
@@ -3401,6 +3404,7 @@ def _format_offset(seconds: int) -> str:
 def _eta_band_cells(
     percent: int,
     elapsed: int,
+    as_of: float,
     now: float,
     spread: float,
 ) -> tuple[str, str]:
@@ -3429,8 +3433,8 @@ def _eta_band_cells(
     low = int(elapsed * (100.0 - optimistic) / optimistic)
     high = int(elapsed * (100.0 - pessimistic) / pessimistic)
     return (
-        f"{_arrival_label(low, now)} (-{_format_offset(eta - low)})",
-        f"{_arrival_label(high, now)} (+{_format_offset(high - eta)})",
+        f"{_arrival_label(as_of + low, now)} (-{_format_offset(eta - low)})",
+        f"{_arrival_label(as_of + high, now)} (+{_format_offset(high - eta)})",
     )
 
 
@@ -3554,47 +3558,305 @@ def _phase_count(args: argparse.Namespace) -> None:
     print(json.dumps(payload, indent=2, sort_keys=True))
 
 
+# What a report that describes no live window adds. The recorder knows what its
+# own records say and nothing about the processes behind them: a live run once
+# had two seats with passes recorded `error` while their workers were still
+# posting to the board, and reading the closed passes as a finished dispatch
+# would have routed a healthy round through the abandon path.
+WORKERS_UNSEEN = (
+    "These records say nothing about whether the workers are alive: a pass can be "
+    + "closed while its worker still runs. Before concluding anything, check "
+    + "impl_status_<slot>, recent board posts, and whether the launcher has exited."
+)
+
+
+class ScopeClock(TypedDict):
+    """One summary row's numbers: the percentage and the clocks beside it."""
+
+    percent: int
+    elapsed: int
+    unchanged: int
+
+
+class RecordedReport(TypedDict):
+    """The summary table's numbers as the phase's last `progress` call left them."""
+
+    at: float
+    # What `at` is, in the words the as-of line prints.
+    source: str
+    project: ScopeClock
+    phase: ScopeClock
+    calibration: dict[str, object] | None
+
+
+def _state_plan_phase_counts(state: dict[str, object]) -> dict[str, object]:
+    """The run's plan counted by phase heading, unavailable without an absolute path."""
+    plan_doc = _string(state.get("project_plan_doc")) or _string(state.get("plan_doc"))
+    if plan_doc:
+        candidate = Path(plan_doc).expanduser()
+        if candidate.is_absolute():
+            return _count_plan_phases(candidate)
+    return {"available": False, "reason": "no plan doc"}
+
+
+def _reported_window(state: dict[str, object]) -> tuple[str, dict[str, object] | None]:
+    """The window a report describes and the state key holding it, or no window.
+
+    A launcher's pass when one is open, and otherwise the unit director's
+    activity. Both render the same line under the round table; only a pass
+    carries convergence meaning. Which pass, when a phase team has two of them
+    open, is `_reporting_pass`; the round table is where the other is visible.
+    """
+    current_pass = _reporting_pass(state)
+    if current_pass is not None:
+        return "pass", current_pass
+    activity = _object_dict(state.get("activity"))
+    if activity is not None and _string(activity.get("status")) == "active":
+        return "activity", activity
+    return "pass", None
+
+
+def _scope_row(label: str, clock: ScopeClock, as_of: float, now: float) -> list[str]:
+    return [
+        label,
+        str(clock["percent"]),
+        _format_duration(clock["elapsed"]),
+        _eta_cell(clock["percent"], clock["elapsed"], as_of, now),
+        _unchanged_cell(clock["unchanged"]),
+    ]
+
+
+def _summary_table(
+    phase_id: str,
+    project: ScopeClock,
+    phase: ScopeClock,
+    plan_phase_counts: dict[str, object],
+    phase_spread: float,
+    as_of: float,
+    now: float,
+) -> list[str]:
+    """The clocks table: a project row and a phase row.
+
+    Every clock is measured at `as_of` and every arrival named from `now`'s day;
+    the two differ only in a report between windows.
+    """
+    headers = list(SUMMARY_HEADERS)
+    project_row = _scope_row("Project", project, as_of, now)
+    phase_row = _scope_row(f"Phase {phase_id}", phase, as_of, now)
+    if plan_phase_counts.get("available") is True:
+        headers.append("Phases")
+        done = _integer(plan_phase_counts.get("done"))
+        total = _integer(plan_phase_counts.get("total"))
+        project_row.append(f"{done} of {total} done")
+        phase_row.append("")
+    # The project percentage is a phase count, so it is exact in phases and
+    # only an estimate in work; the same spread reads there as "the phases
+    # left may be worth more or less time than their share of the count".
+    headers.extend(("ETA low", "ETA high"))
+    project_row.extend(
+        _eta_band_cells(
+            project["percent"], project["elapsed"], as_of, now, DEFAULT_PERCENT_SPREAD
+        )
+    )
+    phase_row.extend(
+        _eta_band_cells(phase["percent"], phase["elapsed"], as_of, now, phase_spread)
+    )
+    return _render_table(
+        headers,
+        [project_row, phase_row],
+        {index for index, header in enumerate(headers) if header in RIGHT_ALIGNED_SUMMARY_COLUMNS},
+    )
+
+
+def _phase_section(
+    session_dir: Path,
+    state: dict[str, object],
+    phase: dict[str, object],
+    events: list[dict[str, object]],
+    now: float,
+) -> tuple[list[str], list[StageWindow], list[str]]:
+    """The phase heading, its round table and the notes under it.
+
+    Opens with a blank line and closes every block with one. Also returns the
+    windows and labels the table was built from, which the caller's closing
+    line reads.
+    """
+    phase_instance_id = _string(phase.get("instance_id"))
+    stage_windows, stage_labels, _ = _stage_table(events, state, phase_instance_id, now)
+    # One row per round, one column per seat. A round is what advances and
+    # what the ledger stamps on its findings, so it is the row that can carry
+    # a Start, an Elapsed, and a Result that all mean something; the
+    # seats working it read across. Per-pass provenance -- which model ran
+    # where, and a review overlapping the writer as its own row -- is the
+    # `timeline` view, which still renders one row per window, and so is the
+    # history behind the last few stages this table keeps.
+    phase_findings = [
+        event
+        for event in events
+        if _string(event.get("phase_instance_id")) == phase_instance_id
+        and _string(event.get("event_type")).startswith("finding_")
+    ]
+    board_activity = _board_activity(session_dir)
+    round_table = _round_table(
+        stage_windows,
+        stage_labels,
+        phase_findings,
+        _board_role_changes(session_dir),
+        board_activity,
+        now,
+    )
+    slots = round_table["slots"]
+    delegate_note = _delegate_note(stage_windows, board_activity, now, slots)
+    # A phase that has opened no window yet still draws its table: one row
+    # saying so, never a header with nothing under it.
+    rows = round_table["rows"] or [["-", "-", "-", *(["-"] * len(slots)), "no stage yet"]]
+    title = _string(phase.get("title"), "Ad hoc work")
+    lines = [
+        "",
+        f"**Phase {_string(phase.get('id'), 'ad hoc')}: {title}**",
+        "",
+        *([round_table["earlier"], ""] if round_table["earlier"] else []),
+        *_render_table(_round_headers(slots), rows, set()),
+        "",
+        *([*round_table["gates"], ""] if round_table["gates"] else []),
+        *([*delegate_note, ""] if delegate_note else []),
+    ]
+    return lines, stage_windows, stage_labels
+
+
+def _reported_label(
+    windows: list[StageWindow],
+    labels: list[str],
+    current_pass: dict[str, object],
+) -> str:
+    """The round-table label of the window this report describes.
+
+    The sentence beneath the table is what a fixed-width Result column cannot
+    carry, and it belongs to the window this report is about. That is not
+    simply the last row: an early-launched reviewer runs beside the writer and
+    starts later, so position would name the reviewer and describe it with the
+    writer's activity.
+    """
+    reported_id = _string(current_pass.get("instance_id"))
+    return next(
+        (
+            labels[index]
+            for index, window in enumerate(windows)
+            if window["instance_id"] == reported_id
+        ),
+        labels[-1] if labels else _pass_display(current_pass),
+    )
+
+
+def _recorded_report(
+    state: dict[str, object],
+    phase: dict[str, object],
+    events: list[dict[str, object]],
+    plan_phase_counts: dict[str, object],
+    now: float,
+) -> RecordedReport:
+    """The summary numbers the phase's last `progress` call recorded.
+
+    Read from that call's event, the one record carrying the moment it was made
+    and the calibration it used. A phase not reported yet reads as of its own
+    start: no phase progress, and the project where the plan's phase count puts
+    it, held below 100 because a phase is still active.
+    """
+    instance_id = _string(phase.get("instance_id"))
+    last = next(
+        (
+            event
+            for event in reversed(events)
+            if _string(event.get("event_type")) == "progress_reported"
+            and _string(event.get("phase_instance_id")) == instance_id
+        ),
+        None,
+    )
+    fields: dict[str, object] = last if last is not None else {}
+    at = _number(fields.get("timestamp_epoch"), _number(phase.get("started_at"), now))
+    phase_percent = _integer(fields.get("phase_percent"), _integer(fields.get("percent")))
+    derived = _plan_derived_project_percent(plan_phase_counts, phase_percent)
+    project_fallback = (
+        _integer(state.get("project_last_percent"))
+        if derived is None
+        else min(derived, PROJECT_CAP_BEFORE_COMPLETE)
+    )
+    return RecordedReport(
+        at=at,
+        source=(
+            "the last progress report"
+            if last is not None
+            else "the phase start, before any progress report"
+        ),
+        project=ScopeClock(
+            percent=_integer(fields.get("project_percent"), project_fallback),
+            elapsed=max(0, int(at - _number(state.get("project_started_at"), at))),
+            unchanged=_integer(fields.get("project_same_percent_elapsed_seconds")),
+        ),
+        phase=ScopeClock(
+            percent=phase_percent,
+            elapsed=max(0, int(at - _number(phase.get("started_at"), at))),
+            unchanged=_integer(fields.get("phase_same_percent_elapsed_seconds")),
+        ),
+        calibration=_object_dict(fields.get("phase_calibration")),
+    )
+
+
+def _print_last_recorded(
+    session_dir: Path,
+    state: dict[str, object],
+    phase: dict[str, object],
+    now: float,
+    notifier_due: int | None,
+) -> None:
+    """Report an active phase that has no window open.
+
+    Between windows -- the reviews closed, the repair writers not launched yet
+    -- there is nothing live to measure, and the unit is still in this phase.
+    The report keeps every section: the clocks table as the last `progress`
+    call left it, stamped with when that was, and the round table as the
+    phase's windows stand now. It writes nothing -- no event, no window, no
+    state -- so pass counts, convergence and calibration never see it.
+    """
+    events = _run_events(state)
+    plan_phase_counts = _state_plan_phase_counts(state)
+    recorded = _recorded_report(state, phase, events, plan_phase_counts, now)
+    section, _, _ = _phase_section(session_dir, state, phase, events, now)
+    lines = [
+        _scope_line(state),
+        "",
+        f"*Percentages and clocks as of {_moment_stamp(recorded['at'], now)}, "
+        + f"{recorded['source']}.*",
+        "",
+        *_summary_table(
+            _string(phase.get("id"), "ad hoc"),
+            recorded["project"],
+            recorded["phase"],
+            plan_phase_counts,
+            _percent_spread(recorded["calibration"]),
+            recorded["at"],
+            now,
+        ),
+        *section,
+        f"No pass or activity is open. {WORKERS_UNSEEN}",
+        _clock_line(now, _next_report_at(session_dir, now, notifier_due)),
+    ]
+    print("\n".join(lines))
+
+
 def _progress(args: argparse.Namespace) -> None:
     session_dir = _session_dir(args)
     now = _now_epoch()
     notifier_due = _restart_unit_notifier(session_dir)
     state = _ensure_project_timing(session_dir, _read_state(session_dir), now)
     phase = _object_dict(state.get("phase"))
-    # The reported window is a launcher's pass when one is open, and otherwise
-    # the unit director's activity. Both render the same third header line; only a
-    # pass carries convergence meaning. Which pass, when a phase team has two
-    # of them open, is `_reporting_pass`; the stage table below the header is
-    # where the other is visible.
-    window_key = "pass"
-    current_pass = _reporting_pass(state)
-    if current_pass is None:
-        activity = _object_dict(state.get("activity"))
-        if activity is not None and _string(activity.get("status")) == "active":
-            window_key = "activity"
-            current_pass = activity
-        else:
-            current_pass = None
-    if phase is None or _string(phase.get("status")) != "active" or current_pass is None:
-        # State what is missing and nothing more. An earlier version of this
-        # message concluded that a closed pass meant a finished dispatch and
-        # told the caller to process completion; a live run then proved that
-        # wrong -- two seats had passes recorded `error` while their workers
-        # were still posting to the board -- and following it would have routed
-        # a healthy round through the abandon path. The recorder knows what its
-        # own records say; it does not know whether a worker is alive.
-        open_slots = ", ".join(sorted(_open_passes(state))) or "none"
+    if phase is None or _string(phase.get("status")) != "active":
         phase_status = _string((phase or {}).get("status")) or "missing"
-        activity_status = (
-            _string((_object_dict(state.get("activity")) or {}).get("status")) or "none"
-        )
-        raise SystemExit(
-            f"No open window to report: phase {phase_status}, "
-            + f"open passes {open_slots}, activity {activity_status}. "
-            + "This says nothing about whether the workers are alive: a pass "
-            + "can be closed while its worker still runs. Before concluding "
-            + "anything, check impl_status_<slot>, recent board posts, and "
-            + "whether the launcher has exited."
-        )
+        raise SystemExit(f"No active phase to report: phase {phase_status}. {WORKERS_UNSEEN}")
+    window_key, current_pass = _reported_window(state)
+    if current_pass is None:
+        _print_last_recorded(session_dir, state, phase, now, notifier_due)
+        return
     legacy_raw_percent = _arg_integer(args, "raw_percent", -1)
     legacy_percent = _arg_integer(args, "percent", -1)
     project_raw_percent = _arg_integer(args, "project_raw_percent", -1)
@@ -3649,15 +3911,8 @@ def _progress(args: argparse.Namespace) -> None:
     # The project clock is derived, never estimated. An agent eyeballing phase
     # headings misses the archived ones; counting them here removes the judgment
     # call entirely, and a supplied --project-percent becomes advisory.
-    plan_phase_counts: dict[str, object] = {"available": False, "reason": "no plan doc"}
+    plan_phase_counts = _state_plan_phase_counts(state)
     project_percent_source = "supplied"
-    state_plan_doc = _string(state.get("project_plan_doc")) or _string(
-        state.get("plan_doc")
-    )
-    if state_plan_doc:
-        candidate = Path(state_plan_doc).expanduser()
-        if candidate.is_absolute():
-            plan_phase_counts = _count_plan_phases(candidate)
     derived_project_percent = _plan_derived_project_percent(
         plan_phase_counts, phase_percent
     )
@@ -3771,115 +4026,32 @@ def _progress(args: argparse.Namespace) -> None:
         f"- elapsed {_format_duration(pass_elapsed)}**"
     )
     if uses_dual_layout:
-        summary_headers = list(SUMMARY_HEADERS)
-        project_row = [
-            "Project",
-            str(project_percent),
-            _format_duration(total_elapsed),
-            _eta_cell(project_percent, total_elapsed, now),
-            _unchanged_cell(project_unchanged_seconds),
-        ]
-        phase_row = [
-            f"Phase {phase_id}",
-            str(phase_percent),
-            _format_duration(phase_elapsed),
-            _eta_cell(phase_percent, phase_elapsed, now),
-            _unchanged_cell(phase_unchanged_seconds),
-        ]
-        if plan_phase_counts.get("available") is True:
-            summary_headers.append("Phases")
-            done = _integer(plan_phase_counts.get("done"))
-            total = _integer(plan_phase_counts.get("total"))
-            project_row.append(f"{done} of {total} done")
-            phase_row.append("")
-        # The project percentage is a phase count, so it is exact in phases and
-        # only an estimate in work; the same spread reads there as "the phases
-        # left may be worth more or less time than their share of the count".
-        summary_headers.extend(("ETA low", "ETA high"))
-        project_row.extend(
-            _eta_band_cells(
-                project_percent,
-                total_elapsed,
-                now,
-                DEFAULT_PERCENT_SPREAD,
-            )
+        section, stage_windows, stage_labels = _phase_section(
+            session_dir, state, phase, _run_events(state), now
         )
-        phase_row.extend(
-            _eta_band_cells(
-                phase_percent,
-                phase_elapsed,
-                now,
-                _percent_spread(phase_calibration),
-            )
-        )
-        phase_instance_id = _string(phase.get("instance_id"))
-        run_events = _run_events(state)
-        stage_windows, stage_labels, _ = _stage_table(
-            run_events,
-            state,
-            phase_instance_id,
-            now,
-        )
-        # The sentence beneath the table is what a fixed-width Result column
-        # cannot carry, and it belongs to the window this report is about. That
-        # is not simply the last row: an early-launched reviewer runs beside the
-        # writer and starts later, so position would name the reviewer and
-        # describe it with the writer's activity.
-        reported_id = _string(current_pass.get("instance_id"))
-        live_label = next(
-            (
-                stage_labels[index]
-                for index, window in enumerate(stage_windows)
-                if window["instance_id"] == reported_id
-            ),
-            stage_labels[-1] if stage_labels else _pass_display(current_pass),
-        )
-        # One row per round, one column per seat. A round is what advances and
-        # what the ledger stamps on its findings, so it is the row that can carry
-        # a Start, an Elapsed, and a Result that all mean something; the
-        # seats working it read across. Per-pass provenance -- which model ran
-        # where, and a review overlapping the writer as its own row -- is the
-        # `timeline` view, which still renders one row per window, and so is the
-        # history behind the last few stages this table keeps.
-        phase_findings = [
-            event
-            for event in run_events
-            if _string(event.get("phase_instance_id")) == phase_instance_id
-            and _string(event.get("event_type")).startswith("finding_")
-        ]
-        board_activity = _board_activity(session_dir)
-        round_table = _round_table(
-            stage_windows,
-            stage_labels,
-            phase_findings,
-            _board_role_changes(session_dir),
-            board_activity,
-            now,
-        )
-        delegate_note = _delegate_note(
-            stage_windows, board_activity, now, round_table["slots"]
-        )
+        reported_label = _reported_label(stage_windows, stage_labels, current_pass)
         lines = [
             _scope_line(state),
             "",
-            *_render_table(
-                summary_headers,
-                [project_row, phase_row],
-                {
-                    index
-                    for index, header in enumerate(summary_headers)
-                    if header in RIGHT_ALIGNED_SUMMARY_COLUMNS
-                },
+            *_summary_table(
+                phase_id,
+                ScopeClock(
+                    percent=project_percent,
+                    elapsed=total_elapsed,
+                    unchanged=project_unchanged_seconds,
+                ),
+                ScopeClock(
+                    percent=phase_percent,
+                    elapsed=phase_elapsed,
+                    unchanged=phase_unchanged_seconds,
+                ),
+                plan_phase_counts,
+                _percent_spread(phase_calibration),
+                now,
+                now,
             ),
-            "",
-            f"**Phase {phase_id}: {phase_title}**",
-            "",
-            *([round_table["earlier"], ""] if round_table["earlier"] else []),
-            *_render_table(_round_headers(round_table["slots"]), round_table["rows"], set()),
-            "",
-            *([*round_table["gates"], ""] if round_table["gates"] else []),
-            *([*delegate_note, ""] if delegate_note else []),
-            f"▸ **{live_label} - {_string(current_pass.get('activity'))}**",
+            *section,
+            f"▸ **{reported_label} - {_string(current_pass.get('activity'))}**",
             _clock_line(now, next_report_at),
         ]
     else:

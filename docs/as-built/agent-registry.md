@@ -38,7 +38,7 @@ below), and the ones `/agent` edits (`agents_set_service_tier`).
 
 Vocabulary: a **family** is a CLI vendor (`codex` | `claude`); an **agent** is a model within a family (`gpt-5.6-sol`, `opus`); a **function** is a consumer; a **task** is `<function>.<subtask>` — exactly two segments.
 
-Every function carries *both* family sets, fully specified at all times, so a family switch is a one-line edit and never a row edit. The functions and their complete sub-task sets:
+Every function carries *both* family sets, fully specified at all times, so a family switch is a one-line edit and never a row edit, except a function whose rows name exactly one family: it is pinned to that family (`production` has only `[production.claude]`, for unit directors). Every-function switches keep a pinned function and print `# kept <function> on <family>: its only set`; switching it alone to the other family is refused. The functions and their complete sub-task sets:
 
 | Function | Sub-tasks |
 | --- | --- |
@@ -282,7 +282,7 @@ All four wrappers capture resolver stderr into their log (`agents_resolve "$TASK
 ## Invariants
 
 - The registry is the only home for family/agent/effort. Consumers resolve through `agents_resolve` or `agent_exec` and never re-derive flag vocabulary — `agents_codex_args` / `agents_claude_args` own it.
-- Every function keeps **both** family sets fully specified, so switching families is a one-row edit; `agents_set_assignment` (and `agents_set_all_assignments`, across every function at once) refuses a switch if any row of the target set fails validation, and leaves the file untouched.
+- Every function keeps **both** family sets fully specified, so switching families is a one-row edit (a one-family function is pinned and kept by every-function switches); `agents_set_assignment` (and `agents_set_all_assignments`, across every function at once) refuses a switch if any row of the target set fails validation, and leaves the file untouched.
 - Agent names stay disjoint between `[codex.agents]` and `[claude.agents]` — `agents_set_row` infers the family from the agent and refuses a name listed by both instead of picking a family for it.
 - Task names are exactly two segments. Empty effort means "omit the flag"; `agent:` with nothing after the colon is invalid; a catalog row with an empty effort list is valid and admits only bare pairs.
 - Only `agents_set_assignment`, `agents_set_all_assignments`, and `agents_set_model` change which family is live. `agents_set_row` writes a row (live or dormant) and `agents_set_service_tier` writes a tier (live or dormant); neither flips liveness. The one exception is a `caller` function: its live family is whichever agent is asking, it is written by hand in the file, and neither switch touches it.

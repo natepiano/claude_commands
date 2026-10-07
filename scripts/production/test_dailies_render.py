@@ -12,6 +12,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import ClassVar, cast
 
+from dailies_render import StateClear, StateRefused, check_render_state
+
 SCRIPT = Path(__file__).with_name("dailies_render.py")
 AT = "2026-10-04T11:00"
 ZONE = "America/Los_Angeles"
@@ -484,6 +486,40 @@ class ChangedPhaseTitleTests(unittest.TestCase):
             "phase": self.NEW_PHASE, "eta": "2026-10-05T13:42:00", "held": reason, "first": "2026-10-05T13:42:00",
         }})
         self.assertEqual(after_timeline(result.lines), ["", "", "---", "13:30 PDT update:", "", *AGENT_LINES, "* no dailies scheduled - nothing needed"])
+
+
+class StatePreflightTests(unittest.TestCase):
+    def test_moved_eta_without_reason_returns_named_refusal(self) -> None:
+        fields = report(held=False)
+        with tempfile.TemporaryDirectory() as scratch:
+            state_path = Path(scratch) / "state.json"
+            previous = {"phase": "Phase 2 of 3: small text reads clearly",
+                        "eta": "2026-10-04T11:20:00", "held": None, "first": "2026-10-04T11:20:00"}
+            _ = state_path.write_text(json.dumps({"widget-enhancements": previous}), encoding="utf-8")
+            result = check_render_state(fields, state_path, AT)
+        self.assertIsInstance(result, StateRefused)
+        if isinstance(result, StateRefused):
+            self.assertEqual(result.field, "units[0].eta.why")
+            self.assertIn("ETA moved", result.why)
+
+    def test_unit_without_eta_returns_named_state_even_with_previous_eta(self) -> None:
+        fields = report(held=False)
+        current = unit(False)
+        current["eta"] = {"none": "no ETA stated yet"}
+        fields["units"] = [current]
+        with tempfile.TemporaryDirectory() as scratch:
+            state_path = Path(scratch) / "state.json"
+            previous = {"phase": "Phase 2 of 3: small text reads clearly",
+                        "eta": "2026-10-04T11:20:00", "held": None, "first": "2026-10-04T11:20:00"}
+            _ = state_path.write_text(json.dumps({"widget-enhancements": previous}), encoding="utf-8")
+            result = check_render_state(fields, state_path, AT)
+        self.assertIsInstance(result, StateClear)
+
+    def test_report_without_next_run_returns_named_state(self) -> None:
+        fields = report(held=False, next_run=None)
+        with tempfile.TemporaryDirectory() as scratch:
+            result = check_render_state(fields, Path(scratch) / "missing-state.json", AT)
+        self.assertIsInstance(result, StateClear)
 
 
 if __name__ == "__main__":
