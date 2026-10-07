@@ -154,8 +154,9 @@ so no `--ws-auth` token.
 
 `start` connects, calls `thread/start` then `turn/start`, writes the delegate's
 entry into `<session_dir>/mesh_roster.json`
-(`{name: {thread_id, turn_id, status, launcher_pid?}}`, `launcher_pid` only on a
-`waiting_capacity` entry; every read-modify-write under `fcntl.LOCK_EX`, because
+(`{name: {thread_id, turn_id, status, launcher_pid?}}`, `launcher_pid` on a
+`waiting_capacity` entry and on a follow-up's `starting` and `running` entries,
+which also carry `previous_status`; every read-modify-write under `fcntl.LOCK_EX`, because
 the delegates register concurrently), and **blocks until its last turn ends**,
 translating the notification stream into the log file (`agent:`, `exec:`,
 `edit:`, `thinking`) that `heartbeat_watch.sh` narrates. On a `turn/completed`
@@ -256,7 +257,7 @@ A thin dispatcher over the resolver:
 | `config/README.md` | The `## agents.conf` section: three-layer schema, `/agent` as the editor, sync behavior. |
 | `scripts/agents/agents_config.sh` | Resolver + editors + freshness-gated sync trigger. |
 | `scripts/agents/agent_exec.sh` | Family dispatch launcher, dry-run hook. |
-| `scripts/agents/codex_mesh.py` | Addressable codex launcher: the default for codex `/unit:delegate` seats and the path for `/ask_a_friend`'s codex friend (`start --resident`). One app-server per session, one thread per delegate, `send`/`steer`/`end`/`list`/`stop`, and a capacity backoff that resumes the same thread. |
+| `scripts/agents/codex_mesh.py` | Addressable codex launcher: the default for codex `/unit:delegate` seats and the path for `/ask_a_friend`'s codex friend (`start --resident`). One app-server per session, one thread per delegate, `send`/`steer`/`end`/`list`/`stop`, `follow`/`can-follow`/`release-follow` (a new turn on a finished seat's thread, for `implement.sh --to`), and a capacity backoff that resumes the same thread. |
 | `scripts/agents/agent_admin.sh` | `/agent` backend. |
 | `scripts/agents/sync_codex_catalog.sh` + `.plist` | `[codex.agents]` materialization, staleness warnings. |
 | `scripts/agents/heartbeat.sh`, `heartbeat_watch.sh` | Liveness log helpers used by the delegate wrappers (role header block, 60 s beats with an activity digest decoded from the agent log). |
@@ -308,7 +309,8 @@ All four wrappers capture resolver stderr into their log (`agents_resolve "$TASK
   exists to provide.
 - A codex delegate's launcher ends with its last turn, and `send` then refuses it
   though the thread persists. Unlike a claude delegate, whose
-  background session stays resumable, a finished codex peer cannot be messaged —
+  background session stays resumable, a finished codex peer cannot be messaged;
+  only the unit director's `implement.sh --to <seat>` (`codex_mesh.py follow`) gives it new work —
   `<PhaseMesh/>` in `commands/unit/delegate.md` states this, and the register
   line's `reach=` field is what tells a peer which of the two it is addressing.
 - The fix pipeline runs unattended every 10 minutes on both machines from the `nate.jobs.style-fix` job in `/etc/nixos/modules/common/style-fix.nix` (`intervalSeconds = 600`, no idle gate; see `fix-pipeline.md`). `agents_config.sh`, `agent_assignments.sh`, the three stage scripts, and `fix_report_parse.py` must never be left broken, and the resolver must keep working under `/bin/bash` (3.2).
@@ -345,8 +347,8 @@ All four wrappers capture resolver stderr into their log (`agents_resolve "$TASK
 - **`codex queue --thread` exits 0 for a thread with no live session.** The
   acknowledgement says nothing about delivery — do not use it as a reachability
   test.
-- **A finished codex delegate is gone.** Its thread persists, but `send` refuses
-  it once `start` returns, unlike a claude background session, which a message resumes from its transcript. The
+- **A finished codex delegate takes no messages.** Its thread persists, but `send` refuses
+  it once `start` returns (`implement.sh --to` reaches it through `follow`), unlike a claude background session, which a message resumes from its transcript. The
   exception is a thread started `--resident` (ask_a_friend's friend): it stays
   `running` across turns, prints each reply as it lands, and ends only on
   `codex_mesh.py end`. `send`

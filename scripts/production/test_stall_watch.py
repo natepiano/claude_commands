@@ -130,9 +130,9 @@ raise SystemExit(1 if record['to'] in fail else 0)
         _ = self.record_session(os.getpid() + 1_000_000, "fault-id", "natedev")
         _ = self.unit("unit-one")
 
-    def configure(self, runners: dict[str, list[str]]) -> None:
+    def configure(self, runners: dict[str, list[str]], *, stall_minutes: int = 5) -> None:
         _ = self.config.write_text(json.dumps({
-            "threshold_percent": 1, "repeat_minutes": 30, "stall_minutes": 5,
+            "threshold_percent": 1, "repeat_minutes": 30, "stall_minutes": stall_minutes,
             "faults_to": "natedev", "always": ["natedev"], "showrunners": [
                 {"session": session, "zone": "America/Los_Angeles", "units": units}
                 for session, units in runners.items()
@@ -161,6 +161,18 @@ raise SystemExit(1 if record['to'] in fail else 0)
         _ = prompt.write_text("Run `zsh ~/.claude/scripts/production/unit_status.sh /tmp/status "
                               + f"America/Los_Angeles {' '.join(units)} | cut -c1-400`.\n")
         _ = (directory / "conf").write_text(f"TARGET={target}\nPROMPT_FILE={prompt}\n")
+
+    def production_plan(self, plan: str) -> Path:
+        self.production("example", ("unit-one",))
+        doc = self.root / "example-production.md"
+        self.set_production_plan(doc, plan)
+        conf = self.notifier / "showrunner-example" / "conf"
+        _ = conf.write_text(conf.read_text() + f"CHECK=zsh /scripts/production/production_check.sh {doc}\n")
+        return doc
+
+    def set_production_plan(self, doc: Path, plan: str) -> None:
+        _ = doc.write_text("## Units\n\n| Unit | Plan | Worktree |\n| --- | --- | --- |\n" +
+                           f"| unit-one | {plan} | /tmp/unit-one |\n")
 
     def unit(self, name: str) -> tuple[int, Path]:
         child = subprocess.Popen(["sleep", "60"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -243,6 +255,33 @@ raise SystemExit(1 if record['to'] in fail else 0)
         second = self.sent()[2:]
         self.assertEqual(len(second), 2)
         self.assertNotEqual({item["key"] for item in first}, {item["key"] for item in second})
+
+    def test_blocked_turn_end_waits_for_a_new_unblocked_status(self) -> None:
+        self.configure({"showrunner": ["unit-one"]}, stall_minutes=10)
+        for status in ("— blocked: waiting on the showrunner: G1 clears\n",
+                       "— blocked: the 96-hour measurement window closes\n"):
+            with self.subTest(status=status):
+                self.panes["unit-one"]["pane"] = status
+                self.assertEqual(self.tick(START).returncode, 0)
+                self.assertEqual(self.tick(START + 600).returncode, 0)
+                self.assertEqual(self.sent(), [])
+                self.panes["unit-one"]["pane"] = status + "— holding: ready for next task\n"
+                self.assertEqual(self.tick(START + 601).returncode, 0)
+                self.assertEqual(self.sent(), [])
+                self.assertEqual(self.tick(START + 1201).returncode, 0)
+                self.assertEqual({item["key"].rsplit(":", 1)[-1] for item in self.sent()},
+                                 {"bump", "tell"})
+                self.send_log.unlink()
+                for path in self.state.glob("*.json"):
+                    path.unlink()
+
+    def test_holding_turn_end_still_bumps_idle_unit(self) -> None:
+        self.configure({"showrunner": ["unit-one"]}, stall_minutes=10)
+        self.panes["unit-one"]["pane"] = "— holding: waiting on a decision\n"
+        self.assertEqual(self.tick(START).returncode, 0)
+        self.assertEqual(self.tick(START + 600).returncode, 0)
+        self.assertEqual({item["key"].rsplit(":", 1)[-1] for item in self.sent()},
+                         {"bump", "tell"})
 
     def test_pane_process_running_claude_is_bumped_and_told(self) -> None:
         pid = self.children[0].pid
@@ -410,6 +449,8 @@ raise SystemExit(1 if record['to'] in fail else 0)
         self.assertEqual(self.tick(START).returncode, 0)
         self.assertEqual(self.tick(START + 600).returncode, 0)
         self.assertEqual(self.sent(), [])
+        import stall_watch
+        self.assertFalse((self.state / stall_watch.stretch_path("showrunner", "unit-one").name).exists())
         ready = subprocess.run([sys.executable, str(registry), "ready", "showrunner",
                                 "--unit", "unit-one"], env=self.environment,
                                capture_output=True, text=True, check=False)
@@ -420,6 +461,25 @@ raise SystemExit(1 if record['to'] in fail else 0)
         self.assertEqual(len(self.sent()), 2)
         self.assertEqual({item["key"].rsplit(":", 1)[-1] for item in self.sent()},
                          {"bump", "tell"})
+
+    def test_finished_run_has_no_bump_notice_or_stretch_and_live_plan_is_bumped(self) -> None:
+        import stall_watch
+        doc = self.production_plan("`docs/as-built/example.md` (run done; as-built merged)")
+        self.assertEqual(self.tick(START).returncode, 0)
+        self.assertEqual(self.tick(START + 600).returncode, 0)
+        self.assertEqual(self.sent(), [])
+        self.assertFalse((self.state / stall_watch.stretch_path("showrunner", "unit-one").name).exists())
+
+        self.set_production_plan(doc, "`docs/plans/example.md`")
+        self.assertEqual(self.tick(START + 601).returncode, 0)
+        self.assertEqual(self.tick(START + 901).returncode, 0)
+        self.assertEqual({item["key"].rsplit(":", 1)[-1] for item in self.sent()},
+                         {"bump", "tell"})
+
+        self.set_production_plan(doc, "`docs/as-built/example.md` (run done; as-built merged)")
+        self.assertEqual(self.tick(START + 902).returncode, 0)
+        self.assertEqual(len(self.sent()), 2)
+        self.assertFalse((self.state / stall_watch.stretch_path("showrunner", "unit-one").name).exists())
 
     def test_extended_tmux_session_name_does_not_match_missing_unit(self) -> None:
         _ = self.panes.pop("unit-one")

@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import signal
 import subprocess
 import tempfile
@@ -229,10 +230,25 @@ esac
 
     def test_waiting_for_peer_call_records_token_seconds(self) -> None:
         board = self.root / "board"
+        waiting = self.root / "waiting-for-token"
+        real_sleep = shutil.which("sleep")
+        if real_sleep is None:
+            self.fail("the token wait test needs sleep on PATH")
+        sleep = self.root / "stubs" / "sleep"
+        _ = sleep.write_text('''#!/bin/sh
+if [ "$1" = 3 ] && [ -n "${TEST_WAITING:-}" ]; then
+    : > "$TEST_WAITING"
+fi
+exec "$TEST_REAL_SLEEP" "$@"
+''')
+        sleep.chmod(0o755)
         first_environment = {**self.environment, "PLAN_DELEGATE_BOARD_DIR": str(board),
-                             "PLAN_DELEGATE_TEAM_ROLE": "first", "TEST_BLOCK": "1"}
+                             "PLAN_DELEGATE_TEAM_ROLE": "first", "TEST_BLOCK": "1",
+                             "TEST_REAL_SLEEP": real_sleep}
         second_environment = {**self.environment, "PLAN_DELEGATE_BOARD_DIR": str(board),
-                              "PLAN_DELEGATE_TEAM_ROLE": "second"}
+                              "PLAN_DELEGATE_TEAM_ROLE": "second", "TEST_WAITING": str(waiting),
+                              "TEST_REAL_SLEEP": real_sleep}
+        first_started_at = time.monotonic()
         first = subprocess.Popen(["bash", str(VERIFY), "check", "sample"], cwd=self.root,
                                  env=first_environment, stdout=subprocess.PIPE,
                                  stderr=subprocess.PIPE, text=True, start_new_session=True)
@@ -244,12 +260,30 @@ esac
                     break
                 time.sleep(0.05)
             self.assertTrue((self.root / "running").exists(), "first verify call did not reach cargo check")
+            first_running_at = time.monotonic()
+            first_wait_upper_bound = int(first_running_at - first_started_at) + 1
             second = subprocess.Popen(["bash", str(VERIFY), "check", "sample"], cwd=self.root,
                                       env=second_environment, stdout=subprocess.PIPE,
                                       stderr=subprocess.PIPE, text=True, start_new_session=True)
             self.started_groups.add(second.pid)
             try:
-                time.sleep(4)
+                deadline = time.monotonic() + 30
+                while not waiting.exists() and time.monotonic() < deadline:
+                    if second.poll() is not None:
+                        break
+                    time.sleep(0.05)
+                self.assertTrue(waiting.exists(), "second verify call did not wait for the cargo token")
+                second_blocked_at = time.monotonic()
+                deadline = second_blocked_at + max(30, first_wait_upper_bound + 10)
+                while (int(time.monotonic() - second_blocked_at) - 1
+                       <= first_wait_upper_bound and time.monotonic() < deadline):
+                    time.sleep(0.05)
+                # Read before the touch: the second call's real wait can only run longer than this.
+                release_at = time.monotonic()
+                second_wait_lower_bound = int(release_at - second_blocked_at) - 1
+                self.assertGreater(second_wait_lower_bound, first_wait_upper_bound,
+                                   "second call was not observed waiting long enough")
+                self.assertIsNone(second.poll(), "second verify exited before the token was released")
                 _ = (self.root / "release").touch()
                 first_output = first.communicate(timeout=20)
                 second_output = second.communicate(timeout=20)
@@ -264,10 +298,19 @@ esac
             if first.poll() is None:
                 self.end_group(first.pid)
                 _ = first.communicate()
-        waits = sorted(cast(int, record["token_wait_s"]) for record in self.records())
-        self.assertEqual(len(waits), 2)
-        self.assertEqual(waits[0], 0)
-        self.assertGreaterEqual(waits[1], 3)
+        records = self.records()
+        self.assertEqual(len(records), 2)
+        first_record = next((record for record in records
+                             if f"-{first.pid}-" in cast(str, record["id"])), None)
+        second_record = next((record for record in records
+                              if f"-{second.pid}-" in cast(str, record["id"])), None)
+        if first_record is None or second_record is None:
+            self.fail("both verify calls must have buildlog records")
+        first_wait = cast(int, first_record["token_wait_s"])
+        second_wait = cast(int, second_record["token_wait_s"])
+        self.assertLessEqual(first_wait, first_wait_upper_bound)
+        self.assertGreaterEqual(second_wait, second_wait_lower_bound)
+        self.assertGreater(second_wait, first_wait)
 
     def test_killed_verify_holder_is_reclaimed_promptly(self) -> None:
         board = self.root / "board"

@@ -280,16 +280,76 @@ class UpcomingWorkTests(unittest.TestCase):
                 self.assertEqual(result.lines[first:first + 4], ["- then:", *(f"  - {item}" for item in items)])
                 self.assertEqual(sum(line.startswith("- then:") for line in result.lines), 1)
 
-    def test_one_item_list_and_plain_string_stay_inline_at_every_length(self) -> None:
+    def test_one_item_list_stays_inline_at_every_length(self) -> None:
         item = "Phase 3: labels stay legible"
         for length in ("simple", "page", "elaborate"):
-            for then in ([item], item):
-                with self.subTest(length=length, then=then):
-                    result = self.render_then(length, then)
-                    self.assertEqual(result.code, 0, result.error)
-                    self.assertIn(f"- then: {item}", result.lines)
-                    self.assertNotIn("- then:", result.lines)
-                    self.assertNotIn(f"  - {item}", result.lines)
+            with self.subTest(length=length):
+                result = self.render_then(length, [item])
+                self.assertEqual(result.code, 0, result.error)
+                self.assertIn(f"- then: {item}", result.lines)
+                self.assertNotIn("- then:", result.lines)
+                self.assertNotIn(f"  - {item}", result.lines)
+
+    def test_plain_string_is_refused_with_list_form_at_every_length(self) -> None:
+        item = "Phase 3: labels stay legible"
+        message = 'units[0].then: must be a list of one-line items, one per upcoming phase: ["Phase 3: …", "Phase 4: …"]'
+        for length in ("simple", "page", "elaborate"):
+            with self.subTest(length=length):
+                result = self.render_then(length, item)
+                self.assertEqual(result.code, 2)
+                self.assertIn(message, result.error)
+
+    def test_chained_item_is_refused_and_named_at_every_length(self) -> None:
+        items = (
+            "Phase 3: labels stay legible, then match panels",
+            "Phase 3: labels stay legible; then match panels",
+            "Phase 3: labels stay legible THEN Phase 4: panels match",
+        )
+        for length in ("simple", "page", "elaborate"):
+            for item in items:
+                with self.subTest(length=length, item=item):
+                    result = self.render_then(length, [item])
+                    self.assertEqual(result.code, 2)
+                    self.assertIn("units[0].then[0]: one item names more than one phase; split it into list items", result.error)
+                    self.assertIn(item, result.error)
+
+    def test_item_with_two_phase_heads_is_refused_without_a_then(self) -> None:
+        items = (
+            "Phase 3: labels stay legible; Phase 4: panels align",
+            "Phase 3: labels stay legible and Phase 4: panels match",
+        )
+        for length in ("simple", "page", "elaborate"):
+            for item in items:
+                with self.subTest(length=length, item=item):
+                    result = self.render_then(length, [item])
+                    self.assertEqual(result.code, 2)
+                    self.assertIn("units[0].then[0]: one item names more than one phase; split it into list items", result.error)
+                    self.assertIn(item, result.error)
+
+    def test_item_that_mentions_another_phase_without_a_head_is_allowed(self) -> None:
+        item = "Phase 4: panels match once Phase 3 merges"
+        result = self.render_then("simple", [item])
+        self.assertEqual(result.code, 0, result.error)
+        self.assertIn(f"- then: {item}", result.lines)
+
+    def test_chained_later_item_is_refused_with_its_index(self) -> None:
+        item = "Phase 4: panels match, then reopen scenes"
+        result = self.render_then("page", ["Phase 3: labels stay legible", item])
+        self.assertEqual(result.code, 2)
+        self.assertIn("units[0].then[1]: one item names more than one phase; split it into list items", result.error)
+        self.assertIn(item, result.error)
+
+    def test_shared_purpose_phase_range_stays_one_item(self) -> None:
+        item = "76–79: make keyboard labels clear"
+        result = self.render_then("simple", [item], "Phase 64 of 80: front output jacks start a cable")
+        self.assertEqual(result.code, 0, result.error)
+        self.assertIn(f"- then: {item}", result.lines)
+
+    def test_then_without_another_phase_is_allowed_in_an_item(self) -> None:
+        item = "Phase 3: show then in the label"
+        result = self.render_then("simple", [item])
+        self.assertEqual(result.code, 0, result.error)
+        self.assertIn(f"- then: {item}", result.lines)
 
     def test_empty_list_and_empty_item_are_refused_as_then(self) -> None:
         for then in ([], ["Phase 3: labels stay legible", ""], ["  "]):
