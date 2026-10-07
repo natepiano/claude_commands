@@ -143,29 +143,6 @@ A step that compiles starts only when its expected process memory fits beside th
 
 ### Phase 4 — Re-measure a day after the target order went live · status: done
 
-#### Work Order
-
-**Blocked by:** G1.
-
-Work only in worktree `/home/natepiano/worktrees/claude-build-followups-cache-evict`, branch `build-followups-cache-evict`. State every time in PDT.
-
-**Goal:** show whether the floor now takes from the least used targets, and what it costs per day, against the 2026-10-06 numbers.
-
-**Spec:** every step reads; nothing outside the As-built is written.
-- T_live: the time `~/.claude` main's tip first contained the Phase 1 checkpoint (`git log --format=%H -1 --grep='^checkpoint(build-followups-cache-evict): phase 1 ' build-followups-cache-evict`): read main's reflog oldest first, `git -C ~/.claude reflog show --date=iso-strict --format='%h %gd' main | tac`, and take the time of the first tip for which `git -C ~/.claude merge-base --is-ancestor <checkpoint> <tip>` succeeds. It was 2026-10-06 16:33:18 PDT (tip `d321850`), the showrunner's G1 clock; a commit time is not it, since the oldest `--ancestry-path` commit is this unit's own merge at 16:21 PDT. Window W: T_live to T_live + 24 h; baseline B: the 24 h before T_live. The user lowered the floor from 500 to 300 GiB on 2026-10-06; `sweep_free_floor_gib.natedev=300` was live on `~/.claude` main at 15:48:12 PDT (tip `2017bee`, measured in this phase's As-built), and this branch merged `build-followups` after the Phase 1 checkpoint. Name the floor in force beside every figure, split B or W at the moment the floor changed when it falls inside one, and take the change's time from `git log -S'sweep_free_floor_gib.natedev=300' build-followups -- config/lint.conf` and the time it reached `~/.claude` main.
-- From `journalctl --user -u disk-floor.service` (EDT) for B and W: timer sweeps that removed output, GiB taken, orphan GiB (the `orphaned files` line) apart, and the hours from each sweep back to the newest unit it took (median, min, max), from the `last used <oldest> to <newest>` removal line. In W that line spans oldest to newest unit; in B it named the last unit chosen, which under the old order was the newest by whole days, so label B's figure as that. Flag a sweep with a `could not remove` line as incomplete. Printed GiB are rounded.
-- From W's per-target lines (timer removals): GiB taken from targets whose last use was under 1 h, 1–6 h and over 6 h before the sweep, and the five targets that lost the most. The per-target lines of a complete sweep sum to its removal and orphan lines within rounding.
-- From the build log (`~/.local/state/buildlog/index.sqlite`, `?mode=ro`; schema in `scripts/buildlog/index.py`): `sum(sweep_freed_bytes)` of `step='sweep'` on natedev for B and W, reported as its own daily total beside the timer's.
-- Phase 2's memory gate reaches `~/.claude` main after T_live (its checkpoint: `git log --format=%H -1 --grep='^checkpoint(build-followups-cache-evict): phase 2 ' build-followups-cache-evict`; its time on main as for T_live, which was 2026-10-06 17:58:16 PDT, tip `d7f2d19`, 85 minutes after T_live); name that time and where it falls in W beside the verdict, since holding builds in turn can change how fast targets grow.
-- Verdict, no threshold: the share of W's timer GiB taken from targets used under 1 h before the sweep, and GiB a day in W against B, compared within each floor segment (500 or 300 GiB). If the floor removed nothing in W, say so: zero GiB, no top five, no age share, the lowest free space W reached, and that the live order stays unobserved beyond Phase 1's read-only check.
-
-**Files:**
-- `docs/plans/build-followups-cache-evict.md` — the As-built.
-
-**Seats:** 1 writer — `impl` runs the commands and reports.
-
-**Acceptance gate:** every command exits 0; the As-built holds the B/W table with the floor beside each figure, the per-age split and the five targets (or the quiet-window statement), and the verdict.
-
 #### As-built
 
 - **Windows and policy.** Git ancestry over `~/.claude` main's reflog puts T_live at 2026-10-06 16:33:18 PDT (tip `d321850`), so B is 2026-10-05 16:33:18 PDT to 2026-10-06 16:33:18 PDT and W is then through its fixed end, 2026-10-07 16:33:18 PDT. The 300 GiB floor commit is dated 2026-10-06 15:48:10 PDT and first reached main at 15:48:12 PDT (tip `2017bee`); B therefore has 23.25 h at 500 GiB and 0.75 h at 300 GiB, while W has 24.00 h at 300 GiB.
@@ -181,3 +158,11 @@ Work only in worktree `/home/natepiano/worktrees/claude-build-followups-cache-ev
 - **W target ages (300 GiB floor).** The per-target journal lines put 1.3 GiB under 1 h (1.5% of W's 84.0 timer GiB), 0.0 GiB at 1–6 h, and 82.6 GiB over 6 h. The 1.3 GiB under 1 h is the orphaned files of one sweep (14:57 PDT 2026-10-07, in `tool-based-ui-trunk/target`, used a minute earlier); the floor removes orphans from any idle target whatever the order, so every build unit taken in W came from a target idle over 6 h. Each of the 17 complete sweeps' target lines matches that sweep's own removal and orphan lines within 0.1 GiB; summed they are 83.9 GiB versus 84.0 GiB, a printed-rounding difference. No timer sweep in B or W reported `could not remove`.
 - **W top five targets (300 GiB floor).** `/home/natepiano/rust/bevy_brp_0.20.0-rc1/target` lost 35.7 GiB; `/home/natepiano/rust/cargo-liner/target` 19.9 GiB; `/home/natepiano/rust/bevy_brp/target` 19.3 GiB; `/home/natepiano/rust/hana/target` 7.7 GiB; `/home/natepiano/rust/tool-based-ui-trunk/target` 1.3 GiB.
 - **Verdict.** The live target-first order is observed: 98.3% of W's timer GiB at the 300 GiB floor came from targets unused for over 6 h, and the 1.5% from a target used under 1 h was orphaned files, which the order does not govern. At the same 300 GiB floor, W took 84.0 GiB in 24.00 h against 0.0 GiB in B's short 0.75 h segment; B's 500 GiB segment took 870.1 GiB and has no like-floor W comparator. The full-window fall from B's 870.1 GiB/day to W's 84.0 GiB/day crosses that floor change. The memory gate first reached main at 2026-10-06 17:58:16 PDT (tip `d7f2d19`), 85 minutes into W, so its serialization of builds can also affect W's target growth.
+
+**Files:**
+- `docs/plans/build-followups-cache-evict.md` — this record; the floor's cutover time in the first phase's record is the measured one.
+
+**Gotchas:** B and W are not like for like: the floor fell from 500 to 300 GiB 45 minutes before T_live, and the memory gate went live 85 minutes into W. The build-log total counts each workspace's budget sweep and the floor sweep after it together, so it is not the floor's cost alone. Orphaned files go from any idle target whatever the order, so a small under-1-hour share does not show the order failing.
+
+**Ruled out:** scaling GiB a day for timer gaps (the timer ran through the user's logout with no gap over 10 minutes).
+
