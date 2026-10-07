@@ -508,7 +508,6 @@ if [[ ! -s "${SUMMARY_FILE}" && -s "${REPLY_FILE}" ]]; then
 fi
 
 if [[ "${AGENT_CODE}" -eq 0 ]]; then
-  echo "implemented" > "${STATUS_FILE}"
   if [[ -f "${PROGRESS_STATE}" ]]; then
     if ! PLAN_DELEGATE_PASS_OWNER=launcher "$PY" "${PROGRESS_HELPER}" finish-pass \
       --session-dir "${SESSION_DIR}" --status completed \
@@ -533,6 +532,7 @@ if [[ "${AGENT_CODE}" -eq 0 ]]; then
       exit 1
     fi
   fi
+  echo "implemented" > "${STATUS_FILE}"
   bash "${HEARTBEAT_HELPER}" "${HEARTBEAT_FILE}" wrapper "${BEAT_TAG} agent finished" || true
   # A member that ends without saying so on the board leaves its peers waiting
   # on work already finished, so the launcher posts it rather than trusting the
@@ -543,7 +543,6 @@ if [[ "${AGENT_CODE}" -eq 0 ]]; then
     "launcher: ${SUBTASK} finished; summary at impl_summary${SLOT}.txt" || true
   bash "${BOARD_HELPER}" release "${SESSION_DIR}" "${BOARD_AGENT}" cargo >/dev/null 2>&1 || true
 else
-  echo "error" > "${STATUS_FILE}"
   LEDGER_CODE=0
   if [[ -f "${PROGRESS_STATE}" ]]; then
     PLAN_DELEGATE_PASS_OWNER=launcher "$PY" "${PROGRESS_HELPER}" finish-pass \
@@ -558,6 +557,7 @@ else
       --reason "the ${SUBTASK} worker exited with code ${AGENT_CODE}" \
       || { echo "ERROR: unable to record the repair round as abandoned." >&2; LEDGER_CODE=1; }
   fi
+  echo "error" > "${STATUS_FILE}"
   bash "${HEARTBEAT_HELPER}" "${HEARTBEAT_FILE}" wrapper "${BEAT_TAG} agent exited with code ${AGENT_CODE}" || true
   # Same reason as the success path, plus the token: a member killed mid-hold
   # would otherwise hold the cargo token until its hold expired, stalling every

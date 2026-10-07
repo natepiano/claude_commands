@@ -64,9 +64,9 @@ class DelegateCheckTests(unittest.TestCase):
             env=self.environment(),
         )
 
-    def run_unit_notifier(self) -> subprocess.CompletedProcess[str]:
+    def run_unit_notifier(self, *arguments: str) -> subprocess.CompletedProcess[str]:
         return subprocess.run(
-            ["zsh", str(UNIT_NOTIFIER), self.session_id],
+            ["zsh", str(UNIT_NOTIFIER), self.session_id, *arguments],
             check=False,
             capture_output=True,
             text=True,
@@ -127,6 +127,56 @@ class DelegateCheckTests(unittest.TestCase):
         result = self.run_unit_notifier()
         self.assertEqual(result.returncode, 1)
         self.assertFalse((self.state_dir / f"delegate-{self.session_dir.name}").exists())
+
+    def test_unit_notifier_off_then_on_changes_instance_state(self) -> None:
+        self.write_marker()
+        created = self.run_unit_notifier()
+        self.assertEqual(created.returncode, 0, created.stderr)
+        state_path = self.state_dir / f"delegate-{self.session_dir.name}" / "state"
+
+        stopped = self.run_unit_notifier("off")
+        self.assertEqual(stopped.returncode, 0, stopped.stderr)
+        self.assertEqual(stopped.stdout.splitlines(), [
+            f"progress updates off: delegate-{self.session_dir.name}"
+        ])
+        self.assertIn("ENABLED=0", state_path.read_text(encoding="utf-8").splitlines())
+
+        started = self.run_unit_notifier("on")
+        self.assertEqual(started.returncode, 0, started.stderr)
+        self.assertEqual(len(started.stdout.splitlines()), 1)
+        self.assertTrue(started.stdout.startswith(
+            f"progress updates on: delegate-{self.session_dir.name} next_due="
+        ), started.stdout)
+        self.assertIn("ENABLED=1", state_path.read_text(encoding="utf-8").splitlines())
+
+    def test_unit_notifier_off_without_marker_leaves_state_untouched(self) -> None:
+        result = self.run_unit_notifier("off")
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("no active delegate run marker:", result.stderr)
+        self.assertFalse(self.state_dir.exists())
+
+    def test_unit_notifier_on_with_empty_marker_leaves_state_untouched(self) -> None:
+        _ = (self.active_dir / self.session_id).write_text("", encoding="utf-8")
+        result = self.run_unit_notifier("on")
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("empty delegate run marker:", result.stderr)
+        self.assertFalse(self.state_dir.exists())
+
+    def test_unit_notifier_rejects_bad_mode_and_extra_arguments(self) -> None:
+        self.write_marker()
+        for arguments in (("pause",), ("on", "extra")):
+            with self.subTest(arguments=arguments):
+                result = self.run_unit_notifier(*arguments)
+                self.assertEqual(result.returncode, 2)
+                self.assertIn("usage: unit_notifier.sh", result.stderr)
+        self.assertFalse(self.state_dir.exists())
+
+    def test_unit_notifier_on_passes_missing_instance_failure_through(self) -> None:
+        self.write_marker()
+        result = self.run_unit_notifier("on")
+        self.assertEqual(result.returncode, 1)
+        self.assertIn(f"no such instance: delegate-{self.session_dir.name}", result.stderr)
+        self.assertFalse(self.state_dir.exists())
 
 
 if __name__ == "__main__":

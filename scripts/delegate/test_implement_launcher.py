@@ -388,6 +388,37 @@ class ImplementLauncherSeatTests(unittest.TestCase):
         rounds = cast("list[dict[str, object]]", state["rounds"])
         return cast("str", rounds[-1]["outcome"])
 
+    def observe_status_at_records(self, *, fail_landed: bool = False) -> None:
+        """Record the status each copied helper sees before it updates its ledger."""
+        delegate = self.root / "scripts" / "delegate"
+        for name, commands in (
+            ("progress_history.py", ("finish-pass",)),
+            ("findings.py", ("landed", "abandon")),
+        ):
+            script = delegate / name
+            probe = f"""import pathlib as _probe_pathlib
+import sys as _probe_sys
+if len(_probe_sys.argv) > 1 and _probe_sys.argv[1] in {commands!r}:
+    _probe_session = _probe_pathlib.Path(
+        _probe_sys.argv[_probe_sys.argv.index('--session-dir') + 1]
+    )
+    _probe_status = (_probe_session / 'impl_status_impl').read_text(encoding='utf-8')
+    (_probe_session / ('observed_' + _probe_sys.argv[1] + '.txt')).write_text(
+        _probe_status, encoding='utf-8'
+    )
+    if _probe_sys.argv[1] == 'landed' and {fail_landed!r}:
+        _probe_sys.exit(17)
+"""
+            original = script.read_text(encoding="utf-8")
+            _ = script.write_text(original.replace(
+                "from __future__ import annotations\n",
+                "from __future__ import annotations\n" + probe,
+                1,
+            ), encoding="utf-8")
+
+    def observed_status(self, session_dir: Path, command: str) -> str:
+        return (session_dir / f"observed_{command}.txt").read_text(encoding="utf-8")
+
     def claude_seat(self, session_dir: Path) -> Path:
         registry = self.root / ".claude" / "config" / "agents.conf"
         _ = registry.write_text(CLAUDE_REGISTRY, encoding="utf-8")
@@ -548,6 +579,72 @@ class ImplementLauncherSeatTests(unittest.TestCase):
         self.assertIn(f"follow-up to {name}", board)
         self.assertIn("launcher:", board)
         self.assertIn("done:", board)
+
+    def test_success_status_follows_pass_and_landed_records(self) -> None:
+        session_dir = self.start_phase("status-after-landed")
+        first = self.mesh_launch(session_dir)
+        self.assertEqual(first.returncode, 0, first.stderr)
+        roster = cast("dict[str, object]", json.loads(
+            (session_dir / "mesh_roster.json").read_text(encoding="utf-8")
+        ))
+        self.open_repair_round(session_dir)
+        self.observe_status_at_records()
+
+        result = self.mesh_launch(
+            session_dir, to=next(iter(roster)), kind="fix", resolves_round=True
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.observed_status(session_dir, "finish-pass"), "implementing\n")
+        self.assertEqual(self.observed_status(session_dir, "landed"), "implementing\n")
+        self.assertEqual(
+            (session_dir / "impl_status_impl").read_text(encoding="utf-8"),
+            "implemented\n",
+        )
+
+    def test_failed_landed_record_leaves_error_status(self) -> None:
+        session_dir = self.start_phase("status-landed-fails")
+        first = self.mesh_launch(session_dir)
+        self.assertEqual(first.returncode, 0, first.stderr)
+        roster = cast("dict[str, object]", json.loads(
+            (session_dir / "mesh_roster.json").read_text(encoding="utf-8")
+        ))
+        self.open_repair_round(session_dir)
+        self.observe_status_at_records(fail_landed=True)
+
+        result = self.mesh_launch(
+            session_dir, to=next(iter(roster)), kind="fix", resolves_round=True
+        )
+
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertEqual(self.observed_status(session_dir, "finish-pass"), "implementing\n")
+        self.assertEqual(self.observed_status(session_dir, "landed"), "implementing\n")
+        self.assertEqual(
+            (session_dir / "impl_status_impl").read_text(encoding="utf-8"), "error\n"
+        )
+        self.assertIn("blocked:", (session_dir / "board.log").read_text(encoding="utf-8"))
+
+    def test_worker_error_status_follows_pass_and_abandon_records(self) -> None:
+        session_dir = self.start_phase("status-after-abandon")
+        first = self.mesh_launch(session_dir)
+        self.assertEqual(first.returncode, 0, first.stderr)
+        roster = cast("dict[str, object]", json.loads(
+            (session_dir / "mesh_roster.json").read_text(encoding="utf-8")
+        ))
+        self.open_repair_round(session_dir)
+        self.observe_status_at_records()
+
+        result = self.mesh_launch(
+            session_dir, to=next(iter(roster)), kind="fix", fail=True,
+            resolves_round=True,
+        )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(self.observed_status(session_dir, "finish-pass"), "implementing\n")
+        self.assertEqual(self.observed_status(session_dir, "abandon"), "implementing\n")
+        self.assertEqual(
+            (session_dir / "impl_status_impl").read_text(encoding="utf-8"), "error\n"
+        )
 
     def test_failed_follow_up_abandons_round_and_posts_blocked(self) -> None:
         session_dir = self.start_phase("abandoned")
