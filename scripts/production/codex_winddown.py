@@ -78,9 +78,13 @@ TRIAGE = (
     " its work order, what is left); let the rest finish."
 )
 ALL_CLEAR = (
-    "All clear, from the user (/codex_winddown clear in {sender}, {time}): the Codex wind-down is"
-    " over. Codex agents may launch again, starting with what the resume lists hold, and the Codex"
-    " count has stopped. Pass this to your unit directors."
+    "All clear, from the user (/codex_winddown clear in {sender}, {time}): we are back with Codex. The"
+    " wind-down is over and the Codex count has stopped. Your unit directors are told directly."
+)
+UNIT_CLEAR = (
+    "All clear, from the user (/codex_winddown clear in {sender}, {time}): we are back with Codex. Start"
+    " using Codex again, starting with what your resume list holds. It is okay to let a running Claude"
+    " agent finish up."
 )
 
 
@@ -306,6 +310,17 @@ def tell_showrunners(sender: str, message: str, told: str) -> bool:
     return every
 
 
+def tell_units(sender: str) -> bool:
+    """Send every live unit director the all clear and report each showrunner; true when all have it."""
+    live, every = live_sessions(), True
+    for runner in showrunners.load_settings()["showrunners"]:
+        units = [unit for unit in live_units(runner["session"]) if unit in live]
+        told = [send(unit, sender, UNIT_CLEAR.format(sender=sender, time=clock(runner["zone"]))) for unit in units]
+        every = every and all(told)
+        print(f"{runner['session']}: {sum(told)} of {len(units)} unit directors told")
+    return every
+
+
 def start_count(record: SessionRecord) -> bool:
     prompt = STATE / f"{instance_name(record['name'])}.txt"
     _ = prompt.write_text(TICK.format(minutes=EVERY_MINUTES, script=Path(__file__).resolve(),
@@ -347,7 +362,8 @@ def clear(sender: str) -> int:
         print(f"{name.removeprefix(INSTANCE)}: {'count stopped' if done.returncode == 0 else 'count NOT stopped'}")
     for name in (PROJECTIONS, QUIET):
         (STATE / name).unlink(missing_ok=True)
-    return 0 if tell_showrunners(sender, ALL_CLEAR, "told the all clear") and every else 1
+    told = [tell_showrunners(sender, ALL_CLEAR, "told the all clear"), tell_units(sender)]
+    return 0 if every and all(told) else 1
 
 
 def main(arguments: list[str]) -> int:

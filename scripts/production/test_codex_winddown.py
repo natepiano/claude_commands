@@ -125,7 +125,9 @@ class MessageTests(unittest.TestCase):
         done = self.run_script("clear", "--from", "natedev")
         self.assertEqual(done.returncode, 0, done.stderr)
         self.assertEqual(done.stdout.splitlines(), ["hana: count stopped", "hana: told the all clear",
-                                                    "gone: no live session, skipped"])
+                                                    "gone: no live session, skipped",
+                                                    "hana: 0 of 0 unit directors told",
+                                                    "gone: 0 of 0 unit directors told"])
         self.assertEqual(list((self.root / "notifier").iterdir()), [])
         self.assertIn("--text All clear, from the user", (self.root / "log").read_text(encoding="utf-8"))
 
