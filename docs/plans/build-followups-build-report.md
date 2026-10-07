@@ -27,27 +27,14 @@ for the build report - when it is running, i want it also be a sonnet 5.5 xhigh 
 
 ### Phase 1 — The build report runs in the build-report session  · status: done
 
-#### Work Order
+#### As-built
 
-**Goal:** `report-builds` sends its 4-hourly `/builds` to the build-report session, and nothing in `/watcher` moves it back.
-
-**Spec:**
-Why (natedev, 2026-10-06, from the user's brief): `report-builds` today targets natedev's session (`session:96b016bf-…`) and the report must run only in the build-report session (Sonnet 5.5, xhigh). `commands/watcher.md` STEP 5 re-runs `notifier.sh new report-builds --to "session:$CLAUDE_CODE_SESSION_ID" …` in the watcher session, so every `/watcher` run, compaction included, would pull the report back. Scope note: STEP 5's change is the director's decision (approved by natedev 2026-10-06), not a user constraint.
-
-1. `commands/watcher.md` STEP 5: replace the `new` command with `zsh ~/.claude/scripts/message/notifier.sh status report-builds` and one sentence: the build report belongs to the build-report session, so the watcher never retargets it. STEP 6 keeps "the build report's next send from STEP 5", read from that status.
-2. `commands/watcher.md`, Standing reports rule: "each is a `~/.claude/scripts/message/notifier.sh` instance named `report-<name>`, made as in STEP 5" now points to `commands/builds.md` for `report-builds`. Everything else in the rule is unchanged.
-3. `commands/builds.md`: add a short section "Owner session" after the empty-argument paragraphs: the one command that points the schedule at the running session, `zsh ~/.claude/scripts/message/notifier.sh new report-builds --to "session:$CLAUDE_CODE_SESSION_ID" --every 240 --from report-builds --command 'Scheduled report (builds, every 4 hours): run /builds with no argument and show its output unchanged. Do nothing else for this message.'`, then `zsh ~/.claude/scripts/message/notifier.sh status report-builds`. Say that a repeated `new` retargets without moving the clock, and that a session restart changes the id, so the owner re-runs it.
-
-Not the seat's: the live retarget and its `status` check are the unit director's, run after the seat's edits.
+The `report-builds` notifier instance sends its 4-hourly `/builds` (every 240 min, from `report-builds`) to the build-report session, whose id the owner set with `notifier.sh new report-builds --to "session:$CLAUDE_CODE_SESSION_ID" …`. `/watcher` STEP 5 only runs `notifier.sh status report-builds` and says the build report belongs to the build-report session, so a watcher run never retargets it. The command that points the schedule at the running session lives once, in `commands/builds.md`.
 
 **Files:**
-- `commands/watcher.md` — STEP 5 shows status only; Standing reports pointer
-- `commands/builds.md` — new "Owner session" section holding the retarget command
+- `commands/watcher.md` — STEP 5 shows the status only; the Standing reports rule points to `commands/builds.md` for `report-builds`
+- `commands/builds.md` — "Owner session" section, last in the file, holding the retarget command and the status check
 
-**Seats:** 2 writers; no test lane, so the `test` seat opens as a writer. The two files are independent and each seat's text is fixed by the Spec.
-- `impl` — `commands/watcher.md`
-- `test` — `commands/builds.md`; opens as `impl`
+**Gotchas:** A repeated `new` on an existing instance rewrites its conf and keeps its clock (`next_due` unchanged). A session restart changes the session id, so the owner re-runs the Owner session command. `scripts/delegate/implement.sh` is not executable; run it as `bash <path>`.
 
-**Constraints from prior phases:** none.
-
-**Acceptance gate:** Both files read as specified and `grep -n "report-builds" commands/watcher.md commands/builds.md` shows no `new` command in watcher.md and exactly one in builds.md; the Merge tests above are green; after the checkpoint the director runs the Owner-session command in this session and `notifier.sh status report-builds` shows `session:$CLAUDE_CODE_SESSION_ID` with `next_due` still 23:54 EDT.
+**Ruled out:** Keeping the retarget in `/watcher` (every run pulls the report back to natedev). Placing the Owner session section before `Otherwise:` in `commands/builds.md` (it breaks the list that follows).
