@@ -271,7 +271,7 @@ Moved to enh-showrunner (2026-10-06 14:2x PDT) by the showrunner (natedev), on t
 
 Moved to enh-showrunner (2026-10-06 14:2x PDT) with the phase above; the showrunner copied its Work Order from this file.
 
-### Phase 7 — The launcher carries follow-up work to a seat that is still open, and a failed review pause can be retried · status: todo
+### Phase 7 — The launcher carries follow-up work to a seat that is still open, and a failed review pause can be retried · status: done
 
 #### Work Order
 
@@ -343,6 +343,21 @@ Work only in worktree `/home/natepiano/worktrees/claude-build-followups-stalls`,
 **Acceptance gate:**
 - From the worktree root, `python3 -m unittest discover -s scripts/delegate -p 'test_implement_launcher.py'` and `python3 -m unittest discover -s scripts/agents -p 'test_codex_mesh.py'` and `python3 -m unittest discover -s scripts/production -p 'test_review_pause.py'` and `python3 -m unittest discover -s scripts/delegate -p 'test_verify_token_wait.py'` green (pause tests cover a failure before and after the stop takes effect, and a later production failing in the same call); basedpyright 0 errors and 0 warnings on the changed `.py` files; `bash -n` on the changed shell scripts.
 - Live (unit director, after the merge reaches `~/.claude` main): in a scratch session directory and scratch worktree, a one-seat Codex dispatch writes a file. Then `implement.sh --to` that seat asks for a second line. The pass shows in the progress table, `impl_status` reads `implemented`, and the launcher's exit wakes the unit director. Repeat with a scratch Claude seat. Delete the scratch worktree after.
+
+### Phase 8 — `/unit:report off` and `on` stop and start a unit's progress updates · status: todo
+
+**Source:** the user, 2026-10-06 17:0x PDT, relayed by the showrunner (natedev): "`/unit:report off` stops this session's delegate-<run id> notifier, and `/unit:report on` starts it again. The run id is resolved from /tmp/claude/delegate/active/$CLAUDE_CODE_SESSION_ID, so the user can do it from the unit's own session without looking up the run id." Today the only way is `notifier.sh stop|start delegate-<run id>`.
+
+**Goal:** from a unit's own session, `/unit:report off` stops its progress updates and `/unit:report on` starts them again, with no run id to look up.
+
+**Spec:**
+- `/unit:report off` runs `zsh ~/.claude/scripts/message/notifier.sh stop delegate-<run id>`, and `/unit:report on` runs `… start delegate-<run id>`, where the run id is the basename of the session directory that `/tmp/claude/delegate/active/$CLAUDE_CODE_SESSION_ID` names. It reports the notifier's result in one line. With no active run for the session, it says so in one line and changes nothing. `/unit:report` with no argument is unchanged.
+- The resolution lives in one script, so the command text carries no path logic; its tests stub `notifier.sh` and the active-run file through a temporary directory.
+- `commands/unit/delegate.md` → `<ProgressContract/>` names `notifier.sh stop|start` for stopping updates; if it needs a line naming `/unit:report off|on`, that line goes to the showrunner, which clears it with enh-showrunner (owner).
+
+**Files:** `commands/unit/report.md`; the resolving script and its test under `scripts/delegate/`.
+
+**Seats:** 1 writer + 1 tester.
 
 ### Moved: re-measure after both hooks are live (was Phase 8)
 

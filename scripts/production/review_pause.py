@@ -9,7 +9,7 @@ import subprocess
 import sys
 import tempfile
 from pathlib import Path
-from typing import TYPE_CHECKING, TypedDict, cast
+from typing import TYPE_CHECKING, Literal, TypedDict, cast
 
 if TYPE_CHECKING:
     from ..hooks import showrunner_footer as showrunner_footer
@@ -18,9 +18,12 @@ else:
     import showrunner_footer as showrunner_footer
 
 
+ActionState = Literal["untouched", "attempted", "done", "skipped"]
+
+
 class ReviewPauseRecord(TypedDict):
-    dailies: bool
-    footers: bool
+    dailies: ActionState
+    footers: ActionState
 
 
 def notifier_command() -> list[str]:
@@ -47,10 +50,28 @@ def read_record(path: Path) -> ReviewPauseRecord:
     if not isinstance(raw, dict):
         raise ValueError(f"invalid review pause record: {path}")
     fields = cast(dict[str, object], raw)
-    if not isinstance(fields.get("dailies"), bool) or not isinstance(fields.get("footers"), bool):
-        raise ValueError(f"invalid review pause record: {path}")
-    return ReviewPauseRecord(dailies=cast(bool, fields["dailies"]),
-                             footers=cast(bool, fields["footers"]))
+    try:
+        return ReviewPauseRecord(dailies=action_state(fields["dailies"]),
+                                 footers=action_state(fields["footers"]))
+    except (KeyError, ValueError) as error:
+        raise ValueError(f"invalid review pause record: {path}") from error
+
+
+def action_state(value: object) -> ActionState:
+    # Records written before action states used booleans for completed actions.
+    if value is True:
+        return "done"
+    if value is False:
+        return "skipped"
+    if value == "untouched":
+        return "untouched"
+    if value == "attempted":
+        return "attempted"
+    if value == "done":
+        return "done"
+    if value == "skipped":
+        return "skipped"
+    raise ValueError("invalid action state")
 
 
 def write_record(path: Path, record: ReviewPauseRecord) -> None:
@@ -66,52 +87,88 @@ def write_record(path: Path, record: ReviewPauseRecord) -> None:
 
 
 def parts(record: ReviewPauseRecord) -> list[str]:
-    return [name for name in ("dailies", "footers") if record[name]]
+    return [name for name in ("dailies", "footers") if record[name] == "done"]
+
+
+def reconcile_attempted(instance: Path, slug: str, path: Path,
+                        record: ReviewPauseRecord) -> tuple[bool, bool]:
+    enabled = showrunner_footer.key_values(instance / "state").get("ENABLED") == "1"
+    footers_on = showrunner_footer.footer_state(slug) is showrunner_footer.FooterState.ON
+    changed = False
+    if record["dailies"] == "attempted" and not enabled:
+        record["dailies"] = "done"
+        changed = True
+    if record["footers"] == "attempted" and not footers_on:
+        record["footers"] = "done"
+        changed = True
+    if changed:
+        write_record(path, record)
+    return enabled, footers_on
 
 
 def pause(instance: Path) -> str:
     slug = instance.name.removeprefix("showrunner-")
     path = record_path(slug)
-    if path.exists():
-        return status(slug)
-    enabled = showrunner_footer.key_values(instance / "state").get("ENABLED") == "1"
-    footers_on = showrunner_footer.footer_state(slug) is showrunner_footer.FooterState.ON
-    record = ReviewPauseRecord(dailies=enabled, footers=footers_on)
-    write_record(path, record)
-    if enabled:
+    existing = path.exists()
+    record = read_record(path) if existing else ReviewPauseRecord(dailies="untouched", footers="untouched")
+    if not existing:
+        write_record(path, record)
+    enabled, footers_on = reconcile_attempted(instance, slug, path, record)
+    if record["dailies"] == "untouched" and not enabled:
+        record["dailies"] = "skipped"
+        write_record(path, record)
+    if enabled and record["dailies"] in ("untouched", "attempted"):
+        record["dailies"] = "attempted"
+        write_record(path, record)
         _ = notifier("stop", slug)
-    if footers_on:
+        record["dailies"] = "done"
+        write_record(path, record)
+    if record["footers"] == "untouched" and not footers_on:
+        record["footers"] = "skipped"
+        write_record(path, record)
+    if footers_on and record["footers"] in ("untouched", "attempted"):
+        record["footers"] = "attempted"
+        write_record(path, record)
         showrunner_footer.set_footer_state(slug, showrunner_footer.FooterState.OFF)
-    if enabled and footers_on:
+        record["footers"] = "done"
+        write_record(path, record)
+    if existing:
+        return status(instance)
+    if record["dailies"] == "done" and record["footers"] == "done":
         return f"{slug}: paused dailies and footers"
-    if footers_on:
+    if record["footers"] == "done":
         return f"{slug}: paused footers; dailies were already off"
-    if enabled:
+    if record["dailies"] == "done":
         return f"{slug}: paused dailies; footers were already off"
     return f"{slug}: nothing to pause"
 
 
-def status(slug: str) -> str:
-    path = record_path(slug)
-    if not path.exists():
-        return ""
-    changed = parts(read_record(path))
-    return f"{slug}: review paused {', '.join(changed)}" if changed else f"{slug}: review paused nothing"
-
-
-def resume(slug: str, answer: str) -> str:
+def status(instance: Path) -> str:
+    slug = instance.name.removeprefix("showrunner-")
     path = record_path(slug)
     if not path.exists():
         return ""
     record = read_record(path)
+    _ = reconcile_attempted(instance, slug, path, record)
+    changed = parts(record)
+    return f"{slug}: review paused {', '.join(changed)}" if changed else f"{slug}: review paused nothing"
+
+
+def resume(instance: Path, answer: str) -> str:
+    slug = instance.name.removeprefix("showrunner-")
+    path = record_path(slug)
+    if not path.exists():
+        return ""
+    record = read_record(path)
+    _ = reconcile_attempted(instance, slug, path, record)
     choices: dict[str, set[str]] = {"both": {"dailies", "footers"}, "dailies": {"dailies"},
                                     "footers": {"footers"}, "none": set()}
     selected = choices[answer]
     restored: list[str] = []
-    if "dailies" in selected and record["dailies"]:
+    if "dailies" in selected and record["dailies"] == "done":
         _ = notifier("start", slug)
         restored.append("dailies")
-    if "footers" in selected and record["footers"]:
+    if "footers" in selected and record["footers"] == "done":
         showrunner_footer.set_footer_state(slug, showrunner_footer.FooterState.ON)
         restored.append("footers")
     path.unlink()
@@ -127,9 +184,8 @@ def main(argv: list[str]) -> int:
         return 2
     session_id = os.environ.get("CLAUDE_CODE_SESSION_ID", "")
     for instance in showrunner_footer.targeted_instances(session_id) if session_id else []:
-        slug = instance.name.removeprefix("showrunner-")
-        line = (pause(instance) if argv[0] == "pause" else status(slug) if argv[0] == "status"
-                else resume(slug, argv[1]))
+        line = (pause(instance) if argv[0] == "pause" else status(instance) if argv[0] == "status"
+                else resume(instance, argv[1]))
         if line:
             print(line)
     return 0
