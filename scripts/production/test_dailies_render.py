@@ -12,7 +12,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import ClassVar, cast
 
-from dailies_render import StateClear, StateRefused, check_render_state
+from dailies_render import (NoLastReportedEta, StateClear, StateRefused,
+                            check_render_state, load_state)
 
 SCRIPT = Path(__file__).with_name("dailies_render.py")
 AT = "2026-10-04T11:00"
@@ -415,7 +416,8 @@ class RenumberedPhaseTests(unittest.TestCase):
             input_path = Path(scratch) / "dailies_input.json"
             state_path = Path(scratch) / "dailies_state.json"
             _ = input_path.write_text(json.dumps(fields))
-            saved = {"phase": "Phase 2 of 3: small text reads clearly", "eta": "2026-10-04T12:10:00", "held": None, "first": "2026-10-04T11:30:00"}
+            saved = {"phase": "Phase 2 of 3: small text reads clearly", "eta": "2026-10-04T12:10:00",
+                     "eta_text": "12:10", "held": None, "first": "2026-10-04T11:30:00"}
             _ = state_path.write_text(json.dumps({"widget-enhancements": saved}))
             result = run([str(input_path), "--at", AT, "--state", str(state_path)], scratch)
         self.assertEqual(result.code, 0, result.error)
@@ -438,7 +440,8 @@ class ChangedPhaseTitleTests(unittest.TestCase):
         if held is not None:
             current["held_examples"] = "such as a main bar clipped in small windows"
         fields["units"] = [current]
-        previous = {"phase": old_phase, "eta": "2026-10-05T16:30:00", "held": held, "first": "2026-10-05T14:30:00"}
+        previous = {"phase": old_phase, "eta": "2026-10-05T16:30:00", "eta_text": "16:30",
+                    "held": held, "first": "2026-10-05T14:30:00"}
         with tempfile.TemporaryDirectory() as scratch:
             input_path = Path(scratch) / "dailies_input.json"
             state_path = Path(scratch) / "dailies_state.json"
@@ -455,7 +458,8 @@ class ChangedPhaseTitleTests(unittest.TestCase):
         self.assertFalse(any("(changed:" in line or "(unchanged" in line for line in result.lines))
         self.assertFalse(any(line.startswith("- first eta:") for line in result.lines))
         self.assertEqual(saved, {"widget-enhancements": {
-            "phase": self.NEW_PHASE, "eta": "2026-10-05T13:42:00", "held": None, "first": "2026-10-05T13:42:00",
+            "phase": self.NEW_PHASE, "eta": "2026-10-05T13:42:00", "eta_text": "13:42",
+            "held": None, "first": "2026-10-05T13:42:00",
         }})
         self.assertEqual(after_timeline(result.lines), ["", "", "---", "13:30 PDT update:", "", *AGENT_LINES, "* no dailies scheduled - nothing needed"])
 
@@ -465,7 +469,8 @@ class ChangedPhaseTitleTests(unittest.TestCase):
         self.assertIn("- eta: 13:42 PDT, 60% done", result.lines)
         self.assertIn("- first eta: 13:00 PDT (now +0:42)", result.lines)
         self.assertEqual(saved, {"widget-enhancements": {
-            "phase": self.NEW_PHASE, "eta": "2026-10-05T13:42:00", "held": None, "first": "2026-10-05T13:00:00",
+            "phase": self.NEW_PHASE, "eta": "2026-10-05T13:42:00", "eta_text": "13:42",
+            "held": None, "first": "2026-10-05T13:00:00",
         }})
         self.assertEqual(after_timeline(result.lines), ["", "", "---", "13:30 PDT update:", "", *AGENT_LINES, "* no dailies scheduled - nothing needed"])
 
@@ -474,7 +479,8 @@ class ChangedPhaseTitleTests(unittest.TestCase):
         self.assertEqual(result.code, 0, result.error)
         self.assertFalse(any("(changed:" in line or "(unchanged" in line for line in result.lines))
         self.assertEqual(saved["widget-enhancements"], {
-            "phase": self.NEW_PHASE, "eta": "2026-10-05T13:42:00", "held": None, "first": "2026-10-05T13:42:00",
+            "phase": self.NEW_PHASE, "eta": "2026-10-05T13:42:00", "eta_text": "13:42",
+            "held": None, "first": "2026-10-05T13:42:00",
         })
 
     def test_new_title_repeats_held_examples_in_simple_report(self) -> None:
@@ -483,9 +489,120 @@ class ChangedPhaseTitleTests(unittest.TestCase):
         self.assertEqual(result.code, 0, result.error)
         self.assertIn(f"- checkpoint: not merged, because {reason}, such as a main bar clipped in small windows", result.lines)
         self.assertEqual(saved, {"widget-enhancements": {
-            "phase": self.NEW_PHASE, "eta": "2026-10-05T13:42:00", "held": reason, "first": "2026-10-05T13:42:00",
+            "phase": self.NEW_PHASE, "eta": "2026-10-05T13:42:00", "eta_text": "13:42",
+            "held": reason, "first": "2026-10-05T13:42:00",
         }})
         self.assertEqual(after_timeline(result.lines), ["", "", "---", "13:30 PDT update:", "", *AGENT_LINES, "* no dailies scheduled - nothing needed"])
+
+
+class EtaResolutionTests(unittest.TestCase):
+    def run_with_state(
+        self, fields: dict[str, object], previous: dict[str, object], at: str,
+    ) -> tuple[Run, dict[str, object], str]:
+        with tempfile.TemporaryDirectory() as scratch:
+            input_path = Path(scratch) / "dailies_input.json"
+            state_path = Path(scratch) / "dailies_state.json"
+            log_path = Path(scratch) / "production.log"
+            _ = input_path.write_text(json.dumps(fields), encoding="utf-8")
+            _ = state_path.write_text(json.dumps({"widget-enhancements": previous}), encoding="utf-8")
+            result = run(
+                [str(input_path), "--at", at, "--state", str(state_path), "--log", str(log_path)],
+                scratch,
+            )
+            saved = cast(dict[str, object], json.loads(state_path.read_text(encoding="utf-8")))
+            logged = log_path.read_text(encoding="utf-8") if log_path.exists() else ""
+        return result, saved, logged
+
+    def test_unchanged_eta_uses_saved_moment_in_report_chart_state_and_log(self) -> None:
+        fields = report(held=False)
+        current = {**unit(False), "eta": {"time": "19:35", "percent": 60}}
+        fields["units"] = [current]
+        previous = {
+            "phase": current["phase"],
+            "eta": "2026-10-04T19:35:00",
+            "eta_text": "19:35",
+            "held": None,
+            "first": "2026-10-04T19:35:00",
+        }
+        result, saved, logged = self.run_with_state(fields, previous, "2026-10-04T23:50")
+        self.assertEqual(result.code, 0, result.error)
+        self.assertIn("- eta: 19:35 PDT, 60% done (unchanged, overdue)", result.lines)
+        self.assertIn("19:35", next(line for line in timeline(result.lines) if line.startswith("widget")))
+        self.assertEqual(cast(dict[str, object], saved["widget-enhancements"])["eta"],
+                         "2026-10-04T19:35:00")
+        self.assertEqual(cast(dict[str, object], saved["widget-enhancements"])["eta_text"], "19:35")
+        self.assertIn("widget-enhancements Phase 2 of 3 19:35 PDT, 60% done", logged)
+        self.assertNotIn("tomorrow", logged)
+
+    def test_state_without_eta_text_resolves_as_a_first_report(self) -> None:
+        fields = report(held=False)
+        current = {**unit(False), "eta": {"time": "19:35", "percent": 60}}
+        fields["units"] = [current]
+        previous = {
+            "phase": current["phase"],
+            "eta": "2026-10-04T19:35:00",
+            "held": None,
+            "first": "2026-10-04T19:35:00",
+        }
+        result, saved, logged = self.run_with_state(fields, previous, "2026-10-04T23:50")
+        self.assertEqual(result.code, 0, result.error)
+        self.assertIn("- eta: 19:35 PDT tomorrow, 60% done", result.lines)
+        self.assertEqual(cast(dict[str, object], saved["widget-enhancements"])["eta"],
+                         "2026-10-05T19:35:00")
+        self.assertEqual(cast(dict[str, object], saved["widget-enhancements"])["eta_text"], "19:35")
+        self.assertIn("19:35 PDT tomorrow", logged)
+        with tempfile.TemporaryDirectory() as scratch:
+            state_path = Path(scratch) / "old-state.json"
+            _ = state_path.write_text(json.dumps({"widget-enhancements": previous}), encoding="utf-8")
+            old = load_state(state_path)["widget-enhancements"]
+        self.assertIsInstance(old.eta, NoLastReportedEta)
+
+    def test_changed_eta_text_uses_two_hour_rule(self) -> None:
+        fields = report(held=False)
+        current = {**unit(False), "eta": {
+            "time": "19:36",
+            "percent": 60,
+            "why": "the panel review found another repair",
+        }}
+        fields["units"] = [current]
+        previous = {
+            "phase": current["phase"],
+            "eta": "2026-10-04T19:35:00",
+            "eta_text": "19:35",
+            "held": None,
+            "first": "2026-10-04T19:35:00",
+        }
+        result, saved, logged = self.run_with_state(fields, previous, "2026-10-04T23:50")
+        self.assertEqual(result.code, 0, result.error)
+        self.assertIn("19:36 PDT tomorrow", "\n".join(result.lines))
+        self.assertIn("changed: +24:01 because the panel review found another repair",
+                      "\n".join(result.lines))
+        self.assertEqual(cast(dict[str, object], saved["widget-enhancements"])["eta"],
+                         "2026-10-05T19:36:00")
+        self.assertIn("19:36 PDT tomorrow", logged)
+
+    def test_explicit_day_suffix_is_different_eta_text(self) -> None:
+        fields = report(held=False)
+        current = {**unit(False), "eta": {
+            "time": "19:35+0",
+            "percent": 60,
+            "why": "the phase now names today's occurrence",
+        }}
+        fields["units"] = [current]
+        previous = {
+            "phase": current["phase"],
+            "eta": "2026-10-04T19:35:00",
+            "eta_text": "19:35",
+            "held": None,
+            "first": "2026-10-04T19:35:00",
+        }
+        result, saved, _ = self.run_with_state(fields, previous, "2026-10-05T23:50")
+        self.assertEqual(result.code, 0, result.error)
+        self.assertIn("changed: +24:00 because the phase now names today's occurrence",
+                      "\n".join(result.lines))
+        state = cast(dict[str, object], saved["widget-enhancements"])
+        self.assertEqual(state["eta"], "2026-10-05T19:35:00")
+        self.assertEqual(state["eta_text"], "19:35+0")
 
 
 class StatePreflightTests(unittest.TestCase):
@@ -494,7 +611,8 @@ class StatePreflightTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as scratch:
             state_path = Path(scratch) / "state.json"
             previous = {"phase": "Phase 2 of 3: small text reads clearly",
-                        "eta": "2026-10-04T11:20:00", "held": None, "first": "2026-10-04T11:20:00"}
+                        "eta": "2026-10-04T11:20:00", "eta_text": "11:20",
+                        "held": None, "first": "2026-10-04T11:20:00"}
             _ = state_path.write_text(json.dumps({"widget-enhancements": previous}), encoding="utf-8")
             result = check_render_state(fields, state_path, AT)
         self.assertIsInstance(result, StateRefused)
@@ -510,7 +628,8 @@ class StatePreflightTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as scratch:
             state_path = Path(scratch) / "state.json"
             previous = {"phase": "Phase 2 of 3: small text reads clearly",
-                        "eta": "2026-10-04T11:20:00", "held": None, "first": "2026-10-04T11:20:00"}
+                        "eta": "2026-10-04T11:20:00", "eta_text": "11:20",
+                        "held": None, "first": "2026-10-04T11:20:00"}
             _ = state_path.write_text(json.dumps({"widget-enhancements": previous}), encoding="utf-8")
             result = check_render_state(fields, state_path, AT)
         self.assertIsInstance(result, StateClear)
