@@ -246,7 +246,7 @@ A unit's `then` in the dailies input is a JSON list of one-line items, one per u
 - `LAST_MERGED` as an argument: it is read from the merge subjects.
 - A flag the showrunner sets for a finished run: `stall_watch.py` reads the Plan cell's `run done`.
 
-### Phase 6 — Dailies `then` is a list of single items, never a string or a chain · status: todo
+### Phase 6 — Dailies `then` is a list of single items, never a string or a chain · status: done
 
 #### Work Order
 

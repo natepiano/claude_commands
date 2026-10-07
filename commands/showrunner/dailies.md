@@ -149,12 +149,13 @@ python3 ~/.claude/scripts/production/dailies_render.py <scratchpad>/dailies_inpu
 | `waiting_on_it` | Only for a topic that lands with this unit's phase, and who waits. |
 | `needed` | Only when the subject needs a follow-up nobody has started, from you (the user), the showrunner or another unit director. Say who. |
 | `needs_user` | `true` when the subject waits on you. It then goes first. |
-| `then` | A non-empty list of one-line items, one per upcoming phase or follow-up; lead with its phase number when it has one. A range with one shared purpose is one item: `76–79: edge cases in selection, jack panels, the palette and Log, saved scenes and reset`. Required on a follow-up and on a plan's last phase. On a follow-up, an item must name the plan phase the unit returns to (`the plan at Phase <N>`), or say `plan done`; the renderer refuses anything else. Read the plan doc's `todo` phases to write it. |
+| `then` | A non-empty list only: each one-line item names one upcoming phase or follow-up; never chain two in one item. Lead with its phase number when it has one. A range with one shared purpose is one item: `76–79: edge cases in selection, jack panels, the palette and Log, saved scenes and reset`. Required on a follow-up and on a plan's last phase. On a follow-up, an item must name the plan phase the unit returns to (`the plan at Phase <N>`), or say `plan done`; the renderer refuses anything else. Read the plan doc's `todo` phases to write it. |
 | topic `title`, `update`, `eta` | The topic's name, what it is doing now, and when it lands, as text. |
 
-**`then`** lists what the unit does after this, in order. Give each upcoming
-phase or follow-up its own item; group a phase range only when it has one shared
-purpose. `simple` shows only the first item. `page` and `elaborate` show each
+**`then`** is always a list of one-line items in order. Give each upcoming
+phase or follow-up its own item; never chain two in one item. Group a phase
+range only when it has one shared purpose. For example: `"then": ["Phase 3: panel labels stay legible", "Phase 4: panel edges align"]`.
+`simple` shows only the first item. `page` and `elaborate` show each
 item as a sub-bullet under `- then:`; a single item stays on the `- then:` line.
 
 - On work inserted ahead of its plan (a follow-up, or a phase added mid-run)
@@ -162,9 +163,9 @@ item as a sub-bullet under `- then:`; a single item stays on the `- then:` line.
   then name the plan phase it goes back to, by number and what it does:
   `["40: precompose redesign and dimming", "the plan at Phase 41: new tools
   placed by the arrangement engine"]`.
-- On its plan's last phase with more work queued: name it and its source: `the
-  hana_organon plan (docs/hana/hana-organon-design.md), six phases, once this
-  phase is merged`. With nothing queued, `nothing queued`.
+- On its plan's last phase with more work queued: name it and its source:
+  `["the hana_organon plan (docs/hana/hana-organon-design.md), six phases, once this phase is merged"]`.
+  With nothing queued, `["nothing queued"]`.
 
 Read the plans and design docs for this, not the unit's queue alone. A unit
 director's own handoff may list only the work in front of it.
