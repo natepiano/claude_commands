@@ -5,9 +5,18 @@ from __future__ import annotations
 
 import json
 import os
+import signal
 import sys
 from pathlib import Path
-from typing import TypedDict, cast
+from types import FrameType
+from typing import NoReturn, TypedDict, cast
+
+
+HOOK_BUDGET_SECONDS = 5
+
+
+class HookBudgetSpent(Exception):
+    pass
 
 
 class StopPayload(TypedDict, total=False):
@@ -29,9 +38,19 @@ def main() -> None:
     if not session_id or not pause_record_path(session_id).exists():
         return
 
-    import conversation_pause
+    budget = int(os.environ.get("CONVERSATION_PAUSE_HOOK_BUDGET", HOOK_BUDGET_SECONDS))
 
-    conversation_pause.mark_answered(session_id, conversation_pause.now_epoch())
+    def budget_spent(_signal_number: int, _frame: FrameType | None) -> NoReturn:
+        raise HookBudgetSpent(f"gave up after {budget} seconds")
+
+    _ = signal.signal(signal.SIGALRM, budget_spent)
+    _ = signal.alarm(budget)
+    try:
+        import conversation_pause
+
+        conversation_pause.mark_answered(session_id, conversation_pause.now_epoch())
+    finally:
+        _ = signal.alarm(0)
 
 
 if __name__ == "__main__":

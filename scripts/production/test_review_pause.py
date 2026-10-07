@@ -217,6 +217,12 @@ class ReviewPauseTests(unittest.TestCase):
     def test_review_pause_uses_shared_footer_switch(self) -> None:
         self.assertIs(review_pause.showrunner_footer, showrunner_footer)
 
+    def test_record_path_uses_shared_review_pause_path(self) -> None:
+        self.assertEqual(
+            review_pause.record_path("demo"),
+            showrunner_footer.review_pause_path("demo"),
+        )
+
     def test_already_stopped_dailies_stay_stopped(self) -> None:
         self.stop_dailies()
         self.assertEqual(self.run_script("pause").stdout,

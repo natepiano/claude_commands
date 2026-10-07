@@ -18,7 +18,8 @@
     {
       "root": "scripts/hooks",
       "extraPaths": [
-        "scripts/hooks"
+        "scripts/hooks",
+        "scripts/message"
       ]
     },
     {

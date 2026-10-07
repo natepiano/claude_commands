@@ -59,6 +59,13 @@ class StallWatchTests(unittest.TestCase):
         _ = self.sessions_script.write_text("""import json, os, pathlib, sys
 records = [json.loads(path.read_text()) for path in pathlib.Path(os.environ['NOTIFIER_SESSIONS_DIR']).glob('*.json')]
 command, target = sys.argv[1:]
+errors = json.loads(os.environ.get('STALL_TEST_SESSION_ERRORS', '[]'))
+overrides = json.loads(os.environ.get('STALL_TEST_SESSION_OVERRIDES', '{}'))
+if command == 'socket' and target in errors:
+    raise SystemExit(3)
+if command == 'socket' and target in overrides:
+    print(overrides[target])
+    raise SystemExit(0)
 for record in records:
     if not record['running']:
         continue
@@ -596,6 +603,32 @@ raise SystemExit(1 if record['to'] in fail else 0)
         _ = showrunner.write_text(json.dumps(record))
         _ = self.tick(START)
         _ = self.tick(START + 600)
+        self.assertEqual(self.sent(), [])
+
+    def test_unavailable_configured_lookup_preserves_missing_state_and_sends_nothing(self) -> None:
+        self.production("showrunner", ("unit-one",))
+        self.environment["STALL_TEST_SESSION_ERRORS"] = json.dumps(["showrunner"])
+        self.state.mkdir()
+        saved = self.state / "missing-showrunner.json"
+        prior = b"saved earlier\n"
+        _ = saved.write_bytes(prior)
+
+        result = self.tick(START)
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(saved.read_bytes(), prior)
+        self.assertEqual(self.sent(), [])
+
+    def test_configured_name_is_not_missing_when_lookup_finds_another_session(self) -> None:
+        self.production("showrunner", ("unit-one",))
+        self.environment["STALL_TEST_SESSION_OVERRIDES"] = json.dumps({
+            "showrunner": str(self.root / "fault-id.sock"),
+        })
+
+        result = self.tick(START)
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse((self.state / "missing-showrunner.json").exists())
         self.assertEqual(self.sent(), [])
 
     def test_live_unconfigured_showrunner_fault_retries_and_rearms_after_removal(self) -> None:
