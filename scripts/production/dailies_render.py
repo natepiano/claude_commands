@@ -57,7 +57,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "build_hold"))
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "whoami"))
 import run_out
-from run_out import READINGS_LOG, RUN_OUTS_LOG, Reading
+from run_out import READINGS_LOG, Reading
 from build_hold import ActiveHolders, HoldState, KnownReleaseEta, NoHolders, Holder, ReleaseRecordReadError, cycle_status_lines, holder_directory, read_cycle, read_holders, release_record_error_line
 
 LENGTHS = {"simple": 240, "page": 480, "elaborate": None}
@@ -1096,8 +1096,8 @@ def agent_resets(fields: dict[str, str], zone: ZoneInfo) -> str:
     return f"{count} reset{'' if count == 1 else 's'} available{until}"
 
 
-def agent_line(name: str, fields: dict[str, str], readings: list[Reading], now: datetime, zone: ZoneInfo, lean: float) -> str:
-    """The trailing pace is extended to 100% used, then scaled by the lean the past run-outs taught (run_out.py)."""
+def agent_line(name: str, fields: dict[str, str], readings: list[Reading], now: datetime, zone: ZoneInfo) -> str:
+    """The weighted pace (run_out.py) is extended to 100% used; until an hour of readings gives one, the week's use since its refill stands in."""
     resets = agent_resets(fields, zone)
     reset = agent_time(fields.get("resets"))
     refill = agent_refill(reset, now, zone) if reset and reset.timestamp() > now.replace(tzinfo=zone).timestamp() else None
@@ -1107,19 +1107,16 @@ def agent_line(name: str, fields: dict[str, str], readings: list[Reading], now: 
     week = _AgentWeekUsage(reset, agent_time(fields.get("weekly_usage_checked_at")) or now.replace(tzinfo=zone), 100 - remaining)
     if week.used_percent >= 100:
         return f"- {name}: {week.used_percent:g}%; ran out, back at its {refill} refill; {resets}"
-    last_refill = machine_local((week.reset_at - timedelta(days=7)).replace(tzinfo=None))
-    first_allowed = max(last_refill.timestamp(), now.replace(tzinfo=zone).timestamp() - run_out.WINDOW.total_seconds())
-    drop = run_out.latest_drop(readings, week.checked_at.timestamp())
-    if drop is not None:
-        first_allowed = max(first_allowed, drop)
-    rate = run_out.trailing_rate(readings, first_allowed, week.checked_at.timestamp())
+    rate = run_out.weighted_rate(readings, week.checked_at.timestamp())
     if rate is None:
+        last_refill = machine_local((week.reset_at - timedelta(days=7)).replace(tzinfo=None))
+        first_allowed = max(last_refill.timestamp(), now.replace(tzinfo=zone).timestamp() - run_out.WINDOW.total_seconds())
         elapsed = week.checked_at.timestamp() - first_allowed
         rate = week.used_percent / elapsed if elapsed > 0 else 0
     if rate <= 0:
         pace = f"does not run out at this pace, so it hits its {refill} refill first"
     else:
-        empty_seconds = week.checked_at.timestamp() + (100 - week.used_percent) / rate * lean
+        empty_seconds = week.checked_at.timestamp() + (100 - week.used_percent) / rate
         rounded_seconds = math.floor((empty_seconds + 30) / 60) * 60
         empty_at = datetime.fromtimestamp(rounded_seconds, zone)
         time_text = f"{empty_at:%H:%M %Z} today" if empty_at.date() == now.date() else f"{empty_at:%a %H:%M %Z}"
@@ -1132,7 +1129,6 @@ def agent_line(name: str, fields: dict[str, str], readings: list[Reading], now: 
 
 def agent_section(now: datetime, zone: ZoneInfo, *, at: str | None = None) -> list[str]:
     readings = run_out.read_readings(READINGS_LOG)
-    lean = run_out.lean(RUN_OUTS_LOG)
     lines = ["### Agents"]
     stamped = datetime.fromisoformat(at) if at is not None else None
     if stamped is not None and stamped.tzinfo is None:
@@ -1149,7 +1145,7 @@ def agent_section(now: datetime, zone: ZoneInfo, *, at: str | None = None) -> li
                     latest = account_readings[-1]
                     fields["weekly_usage_checked_at"] = latest.at.isoformat()
                     fields["weekly_remaining_usage"] = str(100 - latest.used_percent)
-            lines.append(agent_line(path.stem, fields, account_readings, now, zone, lean))
+            lines.append(agent_line(path.stem, fields, account_readings, now, zone))
     if len(lines) == 1:
         lines.append("- none active")
     lines.append("")

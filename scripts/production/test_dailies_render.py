@@ -62,7 +62,7 @@ def holder(release: str = "unknown", name: str = "frame-time", since: str = "202
 
 
 def run(arguments: list[str], scratch: str, holders: list[dict[str, str]] | None = None) -> Run:
-    # HOME puts the renderer's AGENTS_DIR, READINGS_LOG and RUN_OUTS_LOG under this test directory.
+    # HOME puts the renderer's AGENTS_DIR and READINGS_LOG under this test directory.
     (Path(scratch) / "rust/hanadocs/agents").mkdir(parents=True, exist_ok=True)
     (Path(scratch) / ".local/state/agent-notes").mkdir(parents=True, exist_ok=True)
     hold_dir = Path(scratch) / "holds"
