@@ -124,6 +124,7 @@ class DailiesInputTests(unittest.TestCase):
         _ = self.notifier.write_text(NOTIFIER.replace("__PYTHON__", sys.executable), encoding="utf-8")
         self.notifier.chmod(0o755)
         self.env = {**os.environ, "HOME": str(self.home), "BUILD_HOLD_DIR": str(self.holders),
+                    "MAC_TEST_STATE_DIR": str(self.root / "mac-test"),
                     "DAILIES_TEST_EVENTS": str(self.events), "DAILIES_TEST_FAIL": str(self.notifier_failure)}
         _ = subprocess.run(["git", "init", "-b", "production", str(self.checkout)],
                            check=True, capture_output=True, text=True)

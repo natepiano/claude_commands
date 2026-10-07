@@ -92,7 +92,8 @@ def run(arguments: list[str], scratch: str, holders: list[dict[str, str]] | None
         capture_output=True,
         text=True,
         check=False,
-        env={**os.environ, "HOME": scratch, "BUILD_HOLD_DIR": str(hold_dir)},
+        env={**os.environ, "HOME": scratch, "BUILD_HOLD_DIR": str(hold_dir),
+             "MAC_TEST_STATE_DIR": str(Path(scratch) / "mac-test")},
     )
     return Run(result.returncode, result.stdout.splitlines(), result.stderr)
 
@@ -769,7 +770,10 @@ class StatePreflightTests(unittest.TestCase):
     def setUp(self) -> None:
         # The preflight reads holder files; a hold live on this machine must not reach these tests.
         holders = self.enterContext(tempfile.TemporaryDirectory())
-        self.enterContext(mock.patch.dict(os.environ, {"BUILD_HOLD_DIR": holders}))
+        self.enterContext(mock.patch.dict(
+            os.environ,
+            {"BUILD_HOLD_DIR": holders, "MAC_TEST_STATE_DIR": str(Path(holders) / "mac-test")},
+        ))
 
     def test_moved_eta_without_reason_returns_named_refusal(self) -> None:
         fields = report(held=False)

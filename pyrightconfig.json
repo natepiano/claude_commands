@@ -84,6 +84,7 @@
       "extraPaths": [
         "scripts/production",
         "scripts/build_hold",
+        "scripts/mac_test",
         "scripts/whoami"
       ]
     },

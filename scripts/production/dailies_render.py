@@ -33,7 +33,8 @@ production's own plumbing words (PLUMBING).
          Waiting on block and at every report's end, at the current time in
          --zone. Its Agents bullets
          use the report's words. Hold lines come from BUILD_HOLD_DIR or
-         ~/.local/state/build-hold.
+         ~/.local/state/build-hold and MAC_TEST_STATE_DIR or
+         ~/.local/state/mac-test.
 --outstanding  JSON list of what waits on the user, `[{"since":
          "YYYY-MM-DDTHH:MM", "text": "..."}]`; outstanding items suppress
          ` - nothing needed` and belong in the showrunner's Waiting on block,
@@ -55,10 +56,12 @@ from typing import NamedTuple, cast
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "build_hold"))
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "mac_test"))
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "whoami"))
 import run_out
 from run_out import READINGS_LOG, Reading
 from build_hold import ActiveHolders, HoldState, KnownReleaseEta, NoHolders, Holder, ReleaseRecordReadError, cycle_status_lines, holder_directory, read_cycle, read_holders, release_record_error_line
+from mac_test import ActiveMacBlock, NoMacBlock, PendingMacBlock, ci_may_still_be_on, read_block, state_paths
 
 LENGTHS = {"simple": 240, "page": 480, "elaborate": None}
 PHASE = re.compile(r"^(?:Phase (\d+) of (\d+)|follow-up (\d+) of (\d+)): \S")
@@ -219,12 +222,23 @@ class Outstanding:
 
 
 @dataclass(frozen=True)
+class UnreadableMacBlock:
+    """A Mac block whose state file could not be decoded or read."""
+
+    path: Path
+
+
+MacBlockFooterState = NoMacBlock | PendingMacBlock | ActiveMacBlock | UnreadableMacBlock
+
+
+@dataclass(frozen=True)
 class Report:
     length: str
     chart: str
     zone: str
     next_run: str | None
     build_hold: HoldState
+    mac_block: MacBlockFooterState
     units: list[Unit]
     topics: list[Topic]
 
@@ -698,6 +712,23 @@ def read_dailies_hold() -> HoldState:
     return hold
 
 
+def read_mac_block() -> MacBlockFooterState:
+    """Read the Mac block without locks or external calls."""
+    path = state_paths().block
+    try:
+        block = read_block(path)
+    except (ValueError, OSError):
+        return UnreadableMacBlock(path)
+    if isinstance(block, (PendingMacBlock, ActiveMacBlock)):
+        try:
+            check_plumbing(block.reason, f"Mac block {block.holder!r} reason")
+        except InputError as error:
+            raise InputError(
+                f"{error}; have {block.holder} run /mac_test block again with other words"
+            ) from None
+    return block
+
+
 def check_one_phase(line: str, number: int | None, key: str, where: str) -> None:
     """A line may name another phase only when it says why that phase is here."""
     others = other_phases(line, number)
@@ -877,6 +908,7 @@ def parse_report(value: object, chart: str) -> Report:
         raise InputError("input.units: every unit is reported, so the list cannot be empty")
     topics = [parse_topic(item, f"topics[{index}]", length) for index, item in enumerate(as_list(fields.get("topics"), "input.topics"))]
     hold = read_dailies_hold()
+    mac_block = read_mac_block()
     marked = any(unit.build_hold for unit in units)
     if marked and isinstance(hold, NoHolders):
         raise InputError("units.build_hold: a unit is marked but no holder file exists; remove the stale unit marker")
@@ -887,7 +919,7 @@ def parse_report(value: object, chart: str) -> Report:
         for unit in units:
             if unit.build_hold and unit.unit in holder_names:
                 raise InputError(f"units.build_hold: {unit.unit} holds the build hold itself; remove its marker")
-    return Report(length, chart, zone, next_run, hold, units, topics)
+    return Report(length, chart, zone, next_run, hold, mac_block, units, topics)
 
 
 def load_state(path: Path | None) -> dict[str, LastUnitReport]:
@@ -1092,6 +1124,25 @@ def hold_line(holder: Holder, now: datetime, zone: ZoneInfo) -> str:
     return f"{BUILD_HOLD_MARK}: {holder.name} since {since:%H:%M} {since:%Z}, for {holder.purpose} - release eta: {release}"
 
 
+def mac_block_line(
+    block: PendingMacBlock | ActiveMacBlock | UnreadableMacBlock,
+    zone: ZoneInfo,
+) -> str:
+    """A Mac block line shared by reports and reply footers."""
+    if isinstance(block, UnreadableMacBlock):
+        return f"Mac block: its state file cannot be read ({block.path})"
+    since = block.since.astimezone(zone)
+    expires = block.expires.astimezone(zone)
+    label = "Mac block pending" if isinstance(block, PendingMacBlock) else "Mac block"
+    line = (
+        f"{label}: {block.holder} since {since:%H:%M %Z}, for {block.reason} "
+        + f"- lifts {expires:%a %H:%M %Z}"
+    )
+    if ci_may_still_be_on(block.ci):
+        line += " - CI can still use the Mac"
+    return line
+
+
 def machine_local(value: datetime) -> datetime:
     """Interpret an offset-free wall time in the machine's time zone."""
     return value.astimezone()
@@ -1211,7 +1262,8 @@ def agent_section(now: datetime, zone: ZoneInfo, *, at: str | None = None) -> li
 
 
 def footer(
-    now: datetime, zone: ZoneInfo, zone_name: str, next_run: str | None, hold: HoldState, outstanding: list[Outstanding], *,
+    now: datetime, zone: ZoneInfo, zone_name: str, next_run: str | None,
+    hold: HoldState, mac_block: MacBlockFooterState, outstanding: list[Outstanding], *,
     nothing_needed: bool, agent_lines: list[str]
 ) -> list[str]:
     """The separated update footer shared by replies and dailies reports."""
@@ -1224,6 +1276,8 @@ def footer(
         else:
             if cycle is not None and any(holder.name in cycle["holders"] for holder in hold.holders):
                 items.extend(f"  {line}" for line in cycle_status_lines(cycle, now, zone))
+    if not isinstance(mac_block, NoMacBlock):
+        items.append(mac_block_line(mac_block, zone))
     items.extend(line.removeprefix("- ") for line in agent_lines if line and line != "### Agents")
     # An item the user deferred stays hidden until its `after` time, in the report's zone.
     local_now = now.astimezone(zone).replace(tzinfo=None) if now.tzinfo else now
@@ -1370,7 +1424,7 @@ def render(report: Report, previous: dict[str, LastUnitReport], resolved: dict[s
     lines.extend(["```", *draw(now, rows, CHART_STYLES[report.chart]), "```", ""])
     needed = any(unit.needed for unit in report.units) or any(topic.needed for topic in report.topics)
     zone = ZoneInfo(report.zone)
-    lines.extend(footer(now, zone, zone_name, report.next_run, report.build_hold, outstanding,
+    lines.extend(footer(now, zone, zone_name, report.next_run, report.build_hold, report.mac_block, outstanding,
                         nothing_needed=not needed, agent_lines=agent_section(now, zone, at=at)))
     return lines
 
@@ -1403,11 +1457,12 @@ def footer_main(zone: str, next_run: str | None, at: str | None, outstanding_pat
             raise InputError(f"--next-run: {next_run!r} is not HH:MM or HH:MM+N")
         now, abbreviation = local_now(zone, "--zone", at)
         hold = read_dailies_hold()
+        mac_block = read_mac_block()
         outstanding = read_outstanding(outstanding_path)
     except (InputError, json.JSONDecodeError, OSError) as error:
         print(f"dailies_render: {error}", file=sys.stderr)
         return 2
-    print("\n".join(footer(now, ZoneInfo(zone), abbreviation, next_run, hold, outstanding,
+    print("\n".join(footer(now, ZoneInfo(zone), abbreviation, next_run, hold, mac_block, outstanding,
                            nothing_needed=nothing_needed, agent_lines=agent_section(now, ZoneInfo(zone), at=at))))
     return 0
 
