@@ -81,7 +81,7 @@ fi
 # The scope raises oom_score_adj to 500, so earlyoom kills build steps before
 # CI (100) and sessions (200), the largest first.
 BUILDLOG_RECORD="$HOME/.claude/scripts/buildlog/record.py"
-BUILDLOG_SCOPE_SH='exec 2>&3 3>&-; { : > "$0"; } 2>/dev/null || exit 125; { echo 500 > /proc/self/oom_score_adj; } 2>/dev/null || true; "$@"; s=$?; cgroup="/sys/fs/cgroup$(sed -n "s/^0:://p" /proc/self/cgroup)"; cat "$cgroup/memory.peak" "$cgroup/memory.pressure" > "$0" 2>/dev/null; exit $s'
+BUILDLOG_SCOPE_SH='exec 2>&3 3>&-; { : > "$0"; } 2>/dev/null || exit 125; cgroup="/sys/fs/cgroup$(sed -n "s/^0:://p" /proc/self/cgroup)"; printf "%s\n" "$cgroup" > "$0.cgroup"; { echo 500 > /proc/self/oom_score_adj; } 2>/dev/null || true; "$@"; s=$?; cat "$cgroup/memory.peak" "$cgroup/memory.pressure" > "$0" 2>/dev/null; exit $s'
 source "$(dirname "${BASH_SOURCE[0]}")/memory_gate.sh"
 
 buildlog_now() {
@@ -161,12 +161,52 @@ buildlog_end() {
     return 0
 }
 
+buildlog_sample_anon() {
+    local sidecar=$1 maximum=$2 parent=${3:-$$} scope="" line anon peak=0
+    while :; do
+        kill -0 "$parent" 2>/dev/null || return
+        if [[ -r "$sidecar" ]]; then
+            IFS= read -r scope < "$sidecar" || true
+            if [[ -n "$scope" && -r "$scope/memory.stat" ]]; then
+                while IFS= read -r line; do
+                    if [[ "$line" == 'anon '* ]]; then
+                        anon=${line#anon }
+                        if [[ "$anon" =~ ^[0-9]+$ ]] && (( anon > peak )); then
+                            peak=$anon
+                            printf '%s\n' "$peak" > "$maximum"
+                        fi
+                        break
+                    fi
+                done < "$scope/memory.stat"
+            fi
+        fi
+        sleep 1
+    done
+}
+
+buildlog_finish_memory() {
+    local status=$1 sampler_pid=$2
+    if [[ -n "$sampler_pid" ]]; then
+        kill "$sampler_pid" 2>/dev/null || true
+        wait "$sampler_pid" 2>/dev/null || true
+    fi
+    buildlog_release_memory "$status"
+    if [[ -n "${BUILDLOG_PEAK:-}" ]]; then
+        rm -f "$BUILDLOG_PEAK.cgroup" || true
+    fi
+}
+
 run_once() {
     printf '+ %s\n' "$*"
     buildlog_begin "$@" || true
+    local sampler_pid="" parent_pid=$BASHPID status=0
     if buildlog_step_compiles "$@"; then
-        buildlog_wait_for_memory
+        buildlog_wait_for_memory "$@"
         build_hold_mark MemoryGateReturned "$BUILDLOG_MEM_OUTCOME"
+    fi
+    if [[ -n "${BUILDLOG_MEM_RESERVATION:-}" && -n "${BUILDLOG_PEAK:-}" ]]; then
+        buildlog_sample_anon "$BUILDLOG_PEAK.cgroup" "${BUILDLOG_MEM_RESERVATION%.reservation}.max" "$parent_pid" &
+        sampler_pid=$!
     fi
     if [[ -n "${BUILDLOG_START:-}" ]]; then
         buildlog_now
@@ -183,19 +223,20 @@ run_once() {
         buildlog_exec "$@"
         tty_status=$?
         set -e
+        buildlog_finish_memory "$tty_status" "$sampler_pid"
         buildlog_end "$tty_status" "" 1 "$@" || true
         sweep_after_step "$@" || true
         return $tty_status
     fi
     # $RANDOM too: a background sweep's run() shares this shell's $$.
     local log="${TMPDIR:-/tmp}/lint_invoke.$$.$RANDOM.log"
-    local status=0
     # tee keeps output streaming: heartbeat_watch.sh digests the agent log to
     # prove a delegate is alive, so buffering a long build looks like a hang.
     set +e
     buildlog_exec "$@" 2>&1 | tee "$log"
     status=${PIPESTATUS[0]}
     set -e
+    buildlog_finish_memory "$status" "$sampler_pid"
     if [[ $status -ne 0 ]] && grep -q "$SANDBOX_SIGNATURE" "$log"; then
         buildlog_end "$status" "$log" 0 "$@" || true
         rm -f "$log"
