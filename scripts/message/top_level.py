@@ -62,7 +62,8 @@ def proc_start(pid: int) -> str | None:
 
 def is_unit(tmux_target: str) -> bool:
     session = tmux_target.partition(":")[0]
-    result = subprocess.run(["tmux", "show-environment", "-t", session, UNIT_MARK], capture_output=True, text=True)
+    result = subprocess.run(["tmux", "show-environment", "-t", f"={session}", UNIT_MARK], capture_output=True,
+                            text=True)
     return result.returncode == 0 and result.stdout.startswith(f"{UNIT_MARK}=")
 
 
