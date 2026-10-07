@@ -9,14 +9,15 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import TypedDict, cast
 
 from scripts.shot_report.episodes import NoObservablePath, NoneCited, OneCitedShot, SeveralCitedShots, read_episodes, split_episodes, write_episodes
 from scripts.shot_report.transcripts import (
-    AvailableTimingSource, ExactOrderedCaptureAttempts,
-    PersistentScanCache, RememberedScript, ToolCall, scan_calls,
+    AttemptCountInferredFromImages, AvailableTimingSource, ExactAttemptCountFromOrderedCaptures, ExactOrderedCaptureAttempts,
+    PersistentScanCache, RememberedScript, SuccessfulCapture, ToolCall, scan_calls,
 )
 from scripts.shot_report.transcripts import _classify, _remember  # pyright: ignore[reportPrivateUsage]
 from scripts.shot_report.transcripts import CachedScanEvidence
@@ -110,6 +111,33 @@ def _codex_part(seconds: int, part: dict[str, object]) -> dict[str, object]:
 
 
 class TranscriptTest(unittest.TestCase):
+    def test_episode_attempt_count_provenance_round_trips_and_reads_legacy_state(self) -> None:
+        path = "/fictional/shots/front.png"
+        exact_call = ToolCall(
+            START, START + timedelta(seconds=5), "exact", "exact.jsonl", "Claude", "studio", "shot", "hana_shot",
+            image_count=1, image_paths=(path,), cited_image_paths=(path,),
+            attempt_evidence=ExactOrderedCaptureAttempts((SuccessfulCapture((path,)),)),
+        )
+        exact = split_episodes([exact_call], 300)[0]
+        inferred = replace(exact, session_id="inferred", attempt_count_evidence=AttemptCountInferredFromImages())
+        self.assertIsInstance(exact.attempt_count_evidence, ExactAttemptCountFromOrderedCaptures)
+        with tempfile.TemporaryDirectory() as directory:
+            saved = Path(directory) / "episodes.jsonl"
+            write_episodes(saved, [exact, inferred])
+            loaded = read_episodes(saved)
+            self.assertEqual(loaded, [exact, inferred])
+            self.assertIsInstance(loaded[0].attempt_count_evidence, ExactAttemptCountFromOrderedCaptures)
+            self.assertIsInstance(loaded[1].attempt_count_evidence, AttemptCountInferredFromImages)
+            rows = [cast(dict[str, object], json.loads(line)) for line in saved.read_text(encoding="utf-8").splitlines()]
+            self.assertEqual([row["attempt_count_evidence_state"] for row in rows],
+                             ["ExactAttemptCountFromOrderedCaptures", "AttemptCountInferredFromImages"])
+            rows[0]["attempt_count_evidence_state"] = "ExactOrderedCaptureAttempts"
+            _ = rows[1].pop("attempt_count_evidence_state")
+            _ = saved.write_text("".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8")
+            legacy = read_episodes(saved)
+            self.assertIsInstance(legacy[0].attempt_count_evidence, ExactAttemptCountFromOrderedCaptures)
+            self.assertIsInstance(legacy[1].attempt_count_evidence, AttemptCountInferredFromImages)
+
     def test_related_codex_write_can_make_cached_file_a_candidate(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -330,10 +358,10 @@ class TranscriptTest(unittest.TestCase):
             fourth = scan_calls(root / "claude", root / "codex", AvailableTimingSource(timings, "local"), cache)
             episodes = split_episodes(fourth, 300)
             self.assertEqual([episode.kept_shot for episode in episodes], [OneCitedShot(1)])
-            self.assertIsInstance(episodes[0].attempt_count_evidence, ExactOrderedCaptureAttempts)
+            self.assertIsInstance(episodes[0].attempt_count_evidence, ExactAttemptCountFromOrderedCaptures)
             saved = root / "episodes.jsonl"
             write_episodes(saved, episodes)
-            self.assertIsInstance(read_episodes(saved)[0].attempt_count_evidence, ExactOrderedCaptureAttempts)
+            self.assertIsInstance(read_episodes(saved)[0].attempt_count_evidence, ExactAttemptCountFromOrderedCaptures)
             quiet = scan_calls(root / "claude", root / "codex", AvailableTimingSource(timings, "local"), cache)
             self.assertEqual((len(quiet), quiet.bytes_read), (1, 0))
 

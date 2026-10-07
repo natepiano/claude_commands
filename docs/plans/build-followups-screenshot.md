@@ -215,7 +215,7 @@ Measured 2026-10-06/07 on the build machine, 300 s split, Sep 9 PDT to 2026-10-0
 
 **Ruled out:** a cache that replays matched transcript lines (9.2 GB, failed the speed gate); a project filter on change rows (a change's repository is where the tool lives, not where affected episodes ran).
 
-### Phase 5 — The Mac's transcripts catch up in hours, and two report types say what they hold · status: todo
+### Phase 5 — The Mac's transcripts catch up in hours, and two report types say what they hold · status: done
 
 #### Work Order
 
