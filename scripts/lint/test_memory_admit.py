@@ -107,7 +107,13 @@ class LedgerTests(unittest.TestCase):
         self.pid = os.getpid()
 
     def check(self, available: int, *, force: bool = False, sidecar: str = "") -> tuple[gate.AdmissionDecision, Path | None]:
+        self.write_meminfo(available)
+        return self.admit(force=force, sidecar=sidecar)
+
+    def write_meminfo(self, available: int) -> None:
         _ = self.meminfo.write_text(f"MemAvailable: {available // 1024} kB\n")
+
+    def admit(self, *, force: bool = False, sidecar: str = "") -> tuple[gate.AdmissionDecision, Path | None]:
         with patch.object(gate, "git_identity", return_value=("hana", "test-worktree")), \
              patch.object(store, "host_name", return_value="test-host"):
             result = gate.check(
@@ -118,10 +124,11 @@ class LedgerTests(unittest.TestCase):
 
     def test_two_concurrent_checks_admit_one(self) -> None:
         barrier = threading.Barrier(2)
+        self.write_meminfo(12 * GIB)
 
         def arrive() -> tuple[gate.AdmissionDecision, Path | None]:
             _ = barrier.wait()
-            return self.check(12 * GIB)
+            return self.admit()
 
         with ThreadPoolExecutor(max_workers=2) as pool:
             first = pool.submit(arrive)
@@ -360,13 +367,31 @@ class ShellTests(unittest.TestCase):
             _ = meminfo.write_text("MemAvailable: 67108864 kB\n")
             broken = root / "broken.py"
             _ = broken.write_text('raise RuntimeError("broken lookup")\n')
-            command = 'source "$1"; BUILDLOG_MEM_ADMIT_SCRIPT=$2; buildlog_wait_for_memory /bin/true; printf "%s\n" "$BUILDLOG_MEM_OUTCOME"'
+            command = 'set -e; source "$1"; BUILDLOG_MEM_ADMIT_SCRIPT=$2; buildlog_wait_for_memory /bin/true; printf "%s\n" "$BUILDLOG_MEM_OUTCOME"'
             result = subprocess.run(["bash", "-c", command, "test", str(MEMORY_GATE), str(broken)],
                                     capture_output=True, text=True, timeout=8, check=False,
                                     env={**os.environ, "BUILDLOG_MEMINFO": str(meminfo)})
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertEqual(result.stdout, "MeminfoUnavailable\n")
             self.assertIn("memory gate failed (RuntimeError: broken lookup); starting anyway", result.stderr)
+
+    def test_unreadable_meminfo_starts_the_step(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            meminfo = root / "meminfo"
+            command = ('set -e; source "$1"; buildlog_wait_for_memory /bin/true; '
+                       'printf "%s|%s\n" "$BUILDLOG_MEM_OUTCOME" "$BUILDLOG_MEM_RESERVATION"')
+            for contents in ("", "MemTotal: 67108864 kB\n"):
+                with self.subTest(contents=contents):
+                    _ = meminfo.write_text(contents)
+                    result = subprocess.run(
+                        ["bash", "-c", command, "test", str(MEMORY_GATE)],
+                        capture_output=True, text=True, timeout=8, check=False,
+                        env={**os.environ, "HOME": str(root), "BUILDLOG_DIR": str(root / "log"),
+                             "BUILDLOG_MEMINFO": str(meminfo)},
+                    )
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertEqual(result.stdout, "MeminfoUnavailable|\n")
 
     def test_untracked_admission_prints_warning(self) -> None:
         with tempfile.TemporaryDirectory() as folder:
