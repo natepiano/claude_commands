@@ -72,7 +72,7 @@
 
 **Ruled out:** a revision counter on the block record (every writer of `block.json` holds a lock, so nothing overwrites a renewal); a pending-to-active change inside `release` (it belongs to `settle`); resetting `since` on a repeat block by the same holder; a footer warning for an undelivered "Mac is free" message (the footer already shows pending against active); a footer warning when CI is not configured (a machine-wide config choice, shown by `status`); `status` exiting 2 when `gh` fails (`status` reports, and its switch line says `unknown`); failing `audit --check` on a `needs review` package (natedev still confirms every pass).
 
-### Phase 2 — A block stops CI's Mac job, expires, and names what it skipped  · status: todo
+### Phase 2 — A block stops CI's Mac job, expires, and names what it skipped  · status: done
 
 #### Work Order
 
