@@ -24,9 +24,10 @@ from zoneinfo import ZoneInfo
 
 if __package__:
     from .changes import Change, MeasurementChange, ProductChange, read_changes
-    from .episodes import (Episode, LegacyEvidenceUnavailable, NoObservablePath, NoneCited,
-                           OneCitedShot, SeveralCitedShots, SURVEY_SOURCES, read_episodes,
-                           split_episodes, write_episodes)
+    from .episodes import (GAP_CATEGORIES, Episode, EpisodeTimeline, GapCategory,
+                           LegacyEvidenceUnavailable, NoObservablePath, NoneCited, OneCitedShot,
+                           SeveralCitedShots, SURVEY_SOURCES, read_episodes, split_episodes,
+                           write_episodes)
     from .transcripts import (AttemptCountInferredFromImages, ExactAttemptCountFromOrderedCaptures,
                               AvailableTimingSource,
                               CODEX_PREFILTER, PREFILTER, RELATED_WRITE, PersistentScanCache,
@@ -34,8 +35,9 @@ if __package__:
 else:
     from changes import Change, MeasurementChange, ProductChange, read_changes  # pyright: ignore[reportImplicitRelativeImport]
     from episodes import (  # pyright: ignore[reportImplicitRelativeImport]
-        Episode, LegacyEvidenceUnavailable, NoObservablePath, NoneCited, OneCitedShot,
-        SeveralCitedShots, SURVEY_SOURCES, read_episodes, split_episodes, write_episodes,
+        GAP_CATEGORIES, Episode, EpisodeTimeline, GapCategory, LegacyEvidenceUnavailable,
+        NoObservablePath, NoneCited, OneCitedShot, SeveralCitedShots, SURVEY_SOURCES,
+        read_episodes, split_episodes, write_episodes,
     )
     from transcripts import (  # pyright: ignore[reportImplicitRelativeImport]
         AttemptCountInferredFromImages, ExactAttemptCountFromOrderedCaptures,
@@ -408,6 +410,114 @@ def _report_rows(episodes: Iterable[Episode]) -> list[str]:
     return _aligned_table(headers, rows)
 
 
+def _category_minutes(episode: Episode) -> dict[GapCategory, float]:
+    if not isinstance(episode.timeline, EpisodeTimeline):
+        raise ValueError("episode has no timeline to report")
+    minutes: dict[GapCategory, float] = {category: 0.0 for category in GAP_CATEGORIES}
+    for gap in episode.timeline.gaps:
+        minutes[gap.category] += gap.minutes
+    attributed = sum(minutes.values())
+    minutes["unattributed"] += max(0.0, episode.minutes - attributed)
+    return minutes
+
+
+def _cohort_category_row(category: GapCategory, long: list[Episode],
+                         short: list[Episode]) -> list[str]:
+    long_values = [_category_minutes(episode)[category] for episode in long]
+    short_values = [_category_minutes(episode)[category] for episode in short]
+    long_minutes = sum(long_values)
+    short_minutes = sum(short_values)
+    long_total = sum(episode.minutes for episode in long)
+    short_total = sum(episode.minutes for episode in short)
+    return [
+        category, f"{long_minutes:.1f}", f"{long_minutes / long_total:.1%}" if long_total else "—",
+        f"{statistics.median(long_values):.1f}" if long_values else "—", str(len(long)),
+        f"{short_minutes:.1f}", f"{short_minutes / short_total:.1%}" if short_total else "—",
+        f"{statistics.median(short_values):.1f}" if short_values else "—", str(len(short)),
+    ]
+
+
+def _coverage_summary(coverage: dict[str, CoveredHostSourcesThrough]) -> str:
+    if not coverage:
+        return "none saved"
+    values: list[str] = []
+    for host, covered in sorted(coverage.items()):
+        sources = ",".join(sorted(covered.sources))
+        values.append(f"{host} through {_pacific(covered.at)} ({sources})")
+    return "; ".join(values)
+
+
+def long_episode_report_rows(episodes: Iterable[Episode], start_label: str, end_label: str,
+                             coverage: dict[str, CoveredHostSourcesThrough],
+                             mac_claude: str) -> list[str]:
+    """Render saved timeline attribution without opening a transcript."""
+    saved_hana = [episode for episode in episodes if episode.method == "/hana_shot"]
+    hana = [episode for episode in saved_hana if isinstance(episode.timeline, EpisodeTimeline)]
+    excluded = len(saved_hana) - len(hana)
+    excluded_clause = (f"; /hana_shot episodes left out for lacking a timeline: n={excluded}"
+                       if excluded else "")
+    five = [episode for episode in hana if episode.split == 300]
+    headers = ["host", "split_s", "threshold", "category", "long_min", "long_share",
+               "median_long_min", "long_n", "short_min", "short_share", "median_short_min", "short_n"]
+    lines = ["What fills long /hana_shot episodes"]
+    if not five:
+        lines.append(f"Window: {start_label} to {end_label}; no /hana_shot episodes at the 5-min split; " +
+                     f"host coverage: {_coverage_summary(coverage)}; Mac Claude transcripts: {mac_claude}" +
+                     excluded_clause)
+        lines.extend(_aligned_table(headers, []))
+        lines.extend(_longest_episode_rows([], mac_claude))
+        return lines
+    five_minutes = [episode.minutes for episode in five]
+    median = statistics.median(five_minutes)
+    p75 = _percentile(five_minutes, .75)
+    lines.append(
+        f"Window: {start_label} to {end_label}; thresholds from 5-min split: " +
+        f"p75_5m={p75:.1f} min median_5m={median:.1f} min n={len(five)}; " +
+        f"host coverage: {_coverage_summary(coverage)}; Mac Claude transcripts: {mac_claude}" +
+        excluded_clause
+    )
+    rows: list[list[str]] = []
+    host_groups = [("all", hana)]
+    for source_host in ("natedev", "mac"):
+        host_episodes = [episode for episode in hana if episode.source_host == source_host]
+        if host_episodes:
+            host_groups.append((_host_label(source_host, mac_claude), host_episodes))
+    for host, host_episodes in host_groups:
+        for split in (300, 900):
+            group = [episode for episode in host_episodes if episode.split == split]
+            short = [episode for episode in group if episode.minutes < median]
+            for threshold, minimum in (("p75_5m", p75), ("10m+", 10.0)):
+                long = [episode for episode in group if episode.minutes >= minimum]
+                for category in GAP_CATEGORIES:
+                    rows.append([host, str(split), threshold,
+                                 *_cohort_category_row(category, long, short)])
+    lines.extend(_aligned_table(headers, rows))
+    lines.extend(_longest_episode_rows(five, mac_claude))
+    return lines
+
+
+def _host_label(source_host: str, mac_claude: str) -> str:
+    return "mac (Claude out)" if source_host == "mac" and mac_claude == "out" else source_host
+
+
+def _longest_episode_rows(episodes: Iterable[Episode], mac_claude: str) -> list[str]:
+    headers = ["host", "agent", "project", "session_id", "start", "duration_min",
+               "largest_category", "largest_min", "second_category", "second_min"]
+    rows: list[list[str]] = []
+    for episode in sorted(episodes, key=lambda item: (item.minutes, item.start), reverse=True)[:10]:
+        category_minutes = _category_minutes(episode)
+        largest = sorted(GAP_CATEGORIES, key=lambda category: (-category_minutes[category],
+                                                               GAP_CATEGORIES.index(category)))[:2]
+        rows.append([
+            _host_label(episode.source_host, mac_claude), episode.agent, episode.project, episode.session_id,
+            episode.start.astimezone(PACIFIC).isoformat(timespec="minutes"), f"{episode.minutes:.1f}",
+            largest[0], f"{category_minutes[largest[0]]:.1f}",
+            largest[1], f"{category_minutes[largest[1]]:.1f}",
+        ])
+    table = _aligned_table(headers, rows)
+    return ["10 longest /hana_shot episodes, 5-min split", " ".join(headers), *table[1:]]
+
+
 def _image_rows(episodes: Iterable[Episode]) -> list[str]:
     groups: dict[tuple[str, str], list[Episode]] = defaultdict(list)
     for episode in episodes:
@@ -697,6 +807,9 @@ def report(state_dir: Path, since: str = "", until: str = "", project: str = "")
     hana = [episode for episode in selected if episode.split == 300 and episode.method == "/hana_shot"]
     lines.append(f"/hana_shot, 5-min split: {sum(episode.hana_shot_call_count for episode in hana)} calls, {sum(episode.image_count for episode in hana)} images")
     lines.extend(_by_hand_sessions(selected))
+    lines.extend(long_episode_report_rows(
+        selected, start_label, end_label, coverage, str(status.get("mac_claude", "out")),
+    ))
     lines.append("By-source counts include episodes with more than one screenshot source.")
     for split in (300, 900):
         subset = [episode for episode in selected if episode.split == split and episode.method == "by hand"]
@@ -743,6 +856,7 @@ def scan(state_dir: Path, claude_root: Path, codex_root: Path,
     local = scan_calls(claude_root, codex_root, timing_source,
                        PersistentScanCache(state_dir / "scan-cache.pickle"), source_host="natedev")
     calls = list(local)
+    tool_events = list(local.tool_events)
     invocations = list(local.invocations)
     candidate_count = local.candidate_file_count
     bytes_read = local.bytes_read
@@ -763,18 +877,20 @@ def scan(state_dir: Path, claude_root: Path, codex_root: Path,
             remote = scan_calls(mac_claude_root, mac_codex_root, remote_source,
                                 PersistentScanCache(state_dir / "scan-cache-mac.pickle"), source_host="mac")
             calls.extend(remote)
+            tool_events.extend(remote.tool_events)
             invocations.extend(remote.invocations)
             candidate_count += remote.candidate_file_count
             bytes_read += remote.bytes_read
     counts = survey_counts(calls)
     counted = {"mcp_brp", "bash_brp", "hana_shot"}
     counted.update(source for source in SURVEY_SOURCES if counts.get(source, (0, 0, 0))[0] > 10)
-    episodes = [*split_episodes(calls, 300, counted), *split_episodes(calls, 900, counted)]
+    episodes = [*split_episodes(calls, 300, counted, tool_events),
+                *split_episodes(calls, 900, counted, tool_events)]
     seed_calls = [
         call for call in calls
         if call.agent == "Claude" and call.source in {"mcp_brp", "hana_shot", "brp"}
     ]
-    seed_episodes = split_episodes(seed_calls, 300, {"mcp_brp", "hana_shot"})
+    seed_episodes = split_episodes(seed_calls, 300, {"mcp_brp", "hana_shot"}, tool_events)
     window_start = datetime.fromisoformat("2026-09-09T07:00:00+00:00")
     rollout = datetime.fromisoformat("2026-10-06T16:35:00+00:00")
     baseline = [episode for episode in seed_episodes if episode.method == "by hand" and window_start <= episode.start < rollout]

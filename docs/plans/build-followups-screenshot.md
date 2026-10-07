@@ -286,3 +286,50 @@ Measured 2026-10-06/07 on the build machine, 300 s split, Sep 9 PDT to 2026-10-0
 **Constraints from prior phases:** Failure logging, Codex transcript scanning and kept-shot detection are delivered, so `analysis.md` → Next improvements entry 2, entry 3 and the failure-logging half of entry 1 are not proposed again; the question of what fills long `/hana_shot` episodes stays seeded. The hourly phase supplies source-host coverage and says whether each attempt count is exact or inferred from images. The Mac catch-up delivers Codex transcripts and timings and finishes in about five hourly runs; Mac Claude transcripts stay out above 100 files or 100 MB, so every Mac estimate names that limit. A `changes.json` entry is either a product change, which is a speed candidate, or a measurement change, which the report lists separately and never counts as a speed gain; an approved proposal appends a product change carrying its effective time and affected hosts. Price weekly agent minutes from an observed eligible weekly count, keep per-shot milliseconds distinct from episode minutes, and leave a candidate unpriced when its evidence cannot support that calculation.
 
 **Acceptance gate:** each proposal cites a report less than 24 h old, the covered window and n for every number, both splits when it uses episode time, exact or inferred attempt evidence when it uses kept shots, and the calculation of expected agent-minutes saved per week. A candidate without those inputs is labeled unpriced and ranks below every priced one.
+
+**Declined:** one shot tool for any BRP app, not only Hana (about 1.5 agent-minutes a week, 2026-10-07) — not approved for now; the user approved finding out why long `/hana_shot` episodes run long instead.
+
+### Phase 7 — We know what fills a long `/hana_shot` episode, and its fix comes back priced · status: done
+
+#### Work Order
+
+**Goal:** the report shows where the minutes of a long `/hana_shot` episode go, so the fix that saves the most agent time can be priced and proposed.
+
+**Spec:**
+- For each `/hana_shot` episode in the saved episodes, at both splits, build its timeline from the transcript it came from. Attribute the gap before each event, from the episode's start to its end, to one named category:
+  - the `/hana_shot` call itself, timed from its matching timing record when one exists;
+  - a retry: a shot of the same view or target after a failed or uncited shot;
+  - other BRP calls;
+  - builds and app launches;
+  - file reads, searches and edits;
+  - other tool calls;
+  - agent time: the gap between a tool result and the agent's next call.
+- A gap the transcript cannot attribute counts as `unattributed`, never folded into a category.
+- Long episodes are those at or above the 5-min split's p75 duration, plus a separate row set for 10 minutes and over; short episodes are those below the median.
+- Add a report section, "What fills long /hana_shot episodes": per category, minutes in long episodes, share of long-episode minutes, median minutes per long episode, the same for short episodes, and n. It states its window, split and host coverage, and Mac rows say Mac Claude transcripts are out.
+- List the 10 longest episodes with agent, project, session id, start, duration and their two largest categories, so a reader can open the transcript.
+- Read only saved state and transcripts the scan already holds. No new Mac reads; the parsed-state cache and per-file cursors stay the only source.
+- The unit director then sends natedev a priced proposal for the category that holds the most long-episode minutes and has a fix in our control, under the Proposals rules: expected saving is that category's observed weekly minutes times the share the fix removes, with n.
+
+**Files:**
+- `scripts/shot_report/episodes.py` — episode timelines and gap categories
+- `scripts/shot_report/transcripts.py` — any event extraction the timelines need
+- `scripts/shot_report/shot_report.py` — the report section and the longest-episode list
+- `scripts/shot_report/test_shot_report.py`, `scripts/shot_report/test_transcripts.py` — category, threshold and rendering tests with fixtures
+- `commands/shot_report.md` — the new section
+- `docs/plans/build-followups-screenshot.md` — the priced proposal's outcome
+
+**Seats:** `impl` owns `shot_report.py`, `episodes.py`, `transcripts.py` and `commands/shot_report.md`; `test` opens as `test` and owns `test_shot_report.py`, `test_transcripts.py` and fixtures. `shot_report.py` is the hub file and only `impl` edits it.
+
+**Constraints from prior phases:** Episodes follow `analysis.md` → Method at the 300 s and 900 s splits. `/hana_shot` timing records carry resolve, move, settle, frame, capture and crop milliseconds and match transcript calls; exact and inferred attempt counts are distinct types (`ExactAttemptCountFromOrderedCaptures`). Coverage is recorded by source (`CoveredHostSourcesThrough`, `HostNeverCovered`), and Mac Claude transcripts are out above 100 files or 100 MB. A scan with nothing new reads no Mac source bytes and finishes in under 30 s, and the hourly job is bounded at 900 s; the new section must keep both.
+
+**Acceptance gate:**
+- On the real saved data, named categories hold at least 90% of long-episode minutes, with `unattributed` at 10% or less, quoted with n at both splits.
+- A fixture episode with known gaps yields the exact minutes per category, and an unmatched gap lands in `unattributed`.
+- A no-news scan of the real state stays under 30 s, and the report renders in under 10 s.
+- The shot_report, hana_shot and buildlog suites pass, and basedpyright reports 0 errors and 0 warnings.
+- natedev receives a priced proposal for the top fixable category, citing the new section.
+
+**Measured:** real saved state, 2026-10-07, about 15 h of `/hana_shot` use, all on natedev (no Mac `/hana_shot` episodes; Mac Claude transcripts out). Named categories hold 95.6% of long-episode minutes at the 5-min split p75 (n=13, 140.9 min), 95.2% at 10 min and over (n=7), 97.3% at the 15-min split p75 (n=18, 263 min) and 97.2% at 10 min and over (n=14). Agent time holds 61–67% of long minutes, other BRP calls 7–12%, file work 8–11%, retries 3–5%, shot calls 2–3%. Thinking after file work and other BRP calls is 64.5 of 90.0 agent minutes at the 5-min split; shots, retries and the thinking after them are about 11% of long minutes. First scan 446 s, no-news scan 12.7 s, report 0.88 s. Suites: shot_report 131, hana_shot 31, buildlog 257 pass; basedpyright 0/0.
+
+**Proposed:** 2026-10-07 — build nothing yet; re-rank after a full week of `/hana_shot` data. Long episodes are development work between shots, not the shot tool. Other BRP calls and the thinking after them (45.4 of 140.9 long minutes) are unpriced, since timelines do not name the BRP calls. The only priced shot-side fix is the tool's refusals: 5 of 98 shots, 35 s in all (3 `--margin` above 0.45, 1 pose with `--target` and no focus, 1 outside a worktree); the change is help text at `scripts/hana_shot/hana_shot.py:2204` and fix hints at `:1550` and `:1450`, offered as Phase 8 if wanted. Awaiting the user's answer through natedev.
