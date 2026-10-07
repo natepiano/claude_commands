@@ -33,7 +33,7 @@ The user, via natedev, 2026-10-06 08:2x PDT, deciding the nightly review's `subo
 
 ## Delegation Context
 
-- **Project:** `~/.claude` — Claude Code commands, skills, hooks and scripts; this plan proves FMA's runtime gain and records a `suboptimal_flops` baseline (Phase 1), puts the flag on the nightly release check (Phase 2), adds a PostToolUse hook that blocks Claude edits leaving a float multiply-add (Phase 3), extends the fn-length hook to Codex seats (Phase 4, moved from `stalls-unit`), extends the mul_add hook to Codex seats (Phase 5), widens the detector (Phase 6), and re-measures (Phase 7). Work in the worktree `/home/natepiano/worktrees/claude-build-followups-mul-add` on branch `build-followups-mul-add` (unit `mul_add-unit` of production `build-followups`).
+- **Project:** `~/.claude` — Claude Code commands, skills, hooks and scripts; this plan proves FMA's runtime gain and records a `suboptimal_flops` baseline (Phase 1), puts the flag on the nightly release check (Phase 2), adds a PostToolUse hook that blocks Claude edits leaving a float multiply-add (Phase 3), extends the fn-length hook to Codex seats (Phase 4, moved from `stalls-unit`), extends the mul_add hook to Codex seats (Phase 5), widens the detector (Phase 6), makes a Codex seat's buildlog rows carry its own thread id (Phase 7, a showrunner follow-up), and re-measures (Phase 8). Work in the worktree `/home/natepiano/worktrees/claude-build-followups-mul-add` on branch `build-followups-mul-add` (unit `mul_add-unit` of production `build-followups`).
 - **Project started:** 2026-10-06T15:33:51+00:00
 - **Stack:** Python 3.13, standard library only; Rust 1.99.0 (`rustc`, `objdump`) for the Phase 1 proof only, compiled in the scratchpad, never in a repository.
 - **Layout:**
@@ -43,12 +43,13 @@ The user, via natedev, 2026-10-06 08:2x PDT, deciding the nightly review's `subo
   - `scripts/hooks/codex_hooks.py`, `scripts/hooks/test_codex_hooks.py` — install and trust the fn-length Codex hook (new, Phase 4), then a second hook (Phase 5)
   - `scripts/hooks/post-tool-use-fn-length.py` and the `apply_patch` cases in `scripts/hooks/test_fn_length.py` — Codex payloads for the fn-length hook (Phase 4)
   - `scripts/buildlog/rust_release.py`, `scripts/buildlog/test_rust_release.py` — the clippy rustflags (Phase 2)
+  - `scripts/buildlog/record.py`, `scripts/buildlog/test_record.py` — the `session` precedence for a Codex seat (Phase 7; `followups-unit`'s files, edited on the showrunner's word)
   - `settings.json` — Claude hook registration (Phase 3)
   - outside the repository: `~/.local/state/mul-add-hook/blocks.jsonl`; `~/.codex/hooks.json` and `~/.codex/config.toml` `[hooks.state]` on each machine (Phases 4 and 5)
 - **Key files:** `docs/as-built/build-followups-fn-length-hook.md` (machinery, Codex facts, measurement method); `scripts/hooks/fn_length_lib.py` and `post-tool-use-fn-length.py` once merged; `scripts/hooks/post-tool-use-banned-words.py` (block JSON convention); `scripts/hooks/test_brp_launch_gate.py` (hook test convention); clippy's `clippy_lints/src/floating_point_arithmetic/mul_add.rs` for the toolchain's clippy (the shapes and exemptions to mirror); `~/.local/state/nightly-review/2026-10-06/work/lints/{cost.py,loop.py,clippy_fail_lints.py,tml_lengths.py}` (read-only measurement scripts; `cost.py` and `loop.py` take the lint name).
 - **Test lanes:** `scripts/hooks/`, `scripts/buildlog/` — `test_*.py` beside the scripts.
 - **Build:** none in the repository.
-- **Test:** `python3 -m unittest discover -s scripts/hooks -p 'test_mul_add.py'`; `python3 -m unittest discover -s scripts/buildlog -p 'test_rust_release.py'`; `python3 -m unittest discover -s scripts/hooks -p 'test_fn_length.py'` and `-p 'test_codex_hooks.py'` (Phases 4 and 5), from the worktree root.
+- **Test:** `python3 -m unittest discover -s scripts/hooks -p 'test_mul_add.py'`; `python3 -m unittest discover -s scripts/buildlog -p 'test_rust_release.py'`; `python3 -m unittest discover -s scripts/hooks -p 'test_fn_length.py'` and `-p 'test_codex_hooks.py'` (Phases 4 and 5); `python3 -m unittest discover -s scripts/buildlog -p 'test_record.py'` (Phase 7), from the worktree root.
 - **Lint:** `basedpyright <each changed .py file>` passes when its output ends `0 errors, 0 warnings, 0 notes` (it exits 3 in every checkout; the status says nothing). `python3 -m json.tool settings.json > /dev/null` after editing `settings.json`.
 - **Style:** none — not Rust in the repository.
 - **Invariants:**
@@ -67,7 +68,7 @@ The user, via natedev, 2026-10-06 08:2x PDT, deciding the nightly review's `subo
 | G1 | Phase 2 | natedev's `~/.cargo/config.toml` carries `-C target-cpu=x86-64-v3` (user rebuild) and hana `origin/main` `ci.yml` carries it | natedev tells the unit both are live |
 | G2 | Phase 3 | `stalls-unit` fn-length Claude hook phase merged | natedev sends its merge hash |
 | G3 | Phase 5 | this unit's Phase 4 (fn-length Codex hook) merged, then installed and smoked on both machines | natedev sends its merge hash; the install and smoke pass |
-| G4 | Phase 7 | 96 hours after T_detector (Phase 6's As-built) | the clock |
+| G4 | Phase 8 | 96 hours after T_detector (Phase 6's As-built) | the clock |
 
 ## Phases
 
@@ -288,7 +289,32 @@ Real-code check, `objdump -d -C --no-show-raw-insn` counted per function, on two
 - An enclosing function seeing a nested function's constants — no leak occurred in practice and the rule added nothing.
 - Dropping the nonfloat-field veto — a field name declared both `f32` and non-float proves an integer product.
 
-### Phase 7 — Re-measure: long functions and multiply-adds out of hana's clippy failures · status: todo
+### Phase 7 — Codex seats' build rows carry the seat's own thread id · status: done
+
+#### Work Order
+
+Work only in worktree `/home/natepiano/worktrees/claude-build-followups-mul-add`, branch `build-followups-mul-add`. State every time in PDT.
+
+**Goal:** a delegated Codex seat's buildlog rows record the seat's own `CODEX_THREAD_ID` as `session`, not its director's `CLAUDE_CODE_SESSION_ID` (showrunner, 2026-10-06 19:0x PDT: screenshot-unit read the app-server's environment, and a Codex seat inherits its director's Claude session id).
+
+**Constraints from prior phases:**
+- `scripts/buildlog/record.py` and `scripts/buildlog/test_record.py` are not this unit's (the Units row gives `scripts/buildlog/` to `followups-unit`): this phase edits them on the showrunner's word only, touching the one expression below and the one test, and the checkpoint notice names both as `also touches <path> (owner followups-unit), tested against <owner tip>`.
+- Python is typed throughout with no `Any` and no file-level type ignores; tests never write the real `~/.local/state/buildlog`.
+
+**Spec:**
+- In `who()` (`scripts/buildlog/record.py`, the `"session"` entry, line 165), read `CODEX_THREAD_ID` first and `CLAUDE_CODE_SESSION_ID` second, still `None` when neither is set: `env.get("CODEX_THREAD_ID") or env.get("CLAUDE_CODE_SESSION_ID") or None`. Change nothing else in the file: `caller` (`CLAUDECODE` or `CODEX_THREAD_ID` reads `agent`) stays, and no existing row is rewritten.
+- In `scripts/buildlog/test_record.py` add one test, named for the behavior (`test_session_prefers_codex_thread_id`), that records with an environment holding both `CODEX_THREAD_ID` and `CLAUDE_CODE_SESSION_ID` and asserts the stored `session` is the thread id. It also asserts an environment with only `CLAUDE_CODE_SESSION_ID` stores that one, and one with neither stores `None`. `test_caller_precedence` and `test_call_record_fields` keep passing unchanged: the first holds only `CODEX_THREAD_ID`, the second only `CLAUDE_CODE_SESSION_ID`.
+- Before finishing, search `scripts/` for readers of a record's `session` field (`grep -rn '"session"\|session' scripts/buildlog scripts/delegate`) and report any that assumes the Claude id wins; change none of them.
+
+**Files:**
+- `scripts/buildlog/record.py` — the `session` precedence in `who()`
+- `scripts/buildlog/test_record.py` — the both-ids test
+
+**Seats:** 1 writer — `impl` owns both files; the change is one expression and one test.
+
+**Acceptance gate:** `python3 -m unittest discover -s scripts/buildlog -p 'test_record.py'` exits 0 and runs the new test; `python3 -m unittest discover -s scripts/buildlog -p 'test_*.py'` exits 0; `basedpyright scripts/buildlog/record.py scripts/buildlog/test_record.py` ends `0 errors, 0 warnings, 0 notes`.
+
+### Phase 8 — Re-measure: long functions and multiply-adds out of hana's clippy failures · status: todo
 
 #### Work Order
 
@@ -306,6 +332,7 @@ Work only in worktree `/home/natepiano/worktrees/claude-build-followups-mul-add`
 - mul_add `blocks.jsonl` records are written once every file of the edit is scanned, just before the block prints, one per finding, so a record proves the hook found the expression and the block text proves delivery; `file` is the resolved absolute path, and a Codex record carries `"agent": "codex"`, `"tool": "apply_patch"`.
 - The fn-length hook (the fn-length plan's Phase 3, as built) never measures functions inside a `macro_rules!` or `name! { … }` body, skips `cfg(test)` modules in a package-root `examples/` target, and appends to `~/.local/state/fn-length-hook/blocks.jsonl` silently on failure.
 - The scripts and the buildlog are read-only (user, 2026-10-06). Saved run output stays under a few GB: read each run and delete it before the next.
+- Phase 7 changes what a Codex seat's rows carry as `session`: rows recorded before its merge name the director's Claude session, rows after it the seat's thread. `loop.py` groups failed calls by seat and session, so state in the As-built which of W's rows came after that merge, and do not compare a Codex seat's loop gaps across it.
 
 **Spec:**
 - **Before measuring:** confirm Phase 1's three script hashes and `tml_lengths.py` `18754c36c8c545928a082e3bded49c688f029221b917b0f1e6c164028e4b6522`; a mismatch stops the phase. This phase is the production's one re-measure: the fn-length plan dropped its own (showrunner, 2026-10-06), so it carries both lints.
