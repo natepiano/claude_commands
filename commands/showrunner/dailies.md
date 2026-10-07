@@ -65,7 +65,7 @@ Read the current state, not memory, and check what you state the way
 6. **Review watch.** `python3 ~/.claude/scripts/production/review_regime.py watch`.
    Until it prints `acknowledged`, its line is the `Review watch` topic every
    report; exit 3 sets `needs_user` (`/showrunner:produce` →
-   <MergeCheckpoint/> step 11). User, 2026-10-04.
+   <MergeCheckpoint/> step 6). User, 2026-10-04.
 
 ## Subjects
 
