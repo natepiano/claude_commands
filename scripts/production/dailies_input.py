@@ -178,24 +178,28 @@ def status_blocks(path: Path, units: tuple[UnitRow, ...]) -> tuple[StatusBlock, 
     return tuple(blocks)
 
 
-def eta_state(block: StatusBlock, phase: str, seen: JsonMap, now: datetime) -> EtaState:
+def eta_state(block: StatusBlock, phase: str, seen: JsonMap, now: datetime, *, held: bool) -> EtaState:
     line = next((item.text for item in reversed(block.activity) if "ETA" in item.text), "")
     if not line:
         return EtaNone()
     key = f"{block.session}|{phase}"
     prior = seen.get(key)
     requested = isinstance(eta_requested(seen, key), EtaRequested)
+    unchanged = False
     if isinstance(prior, dict):
         record = cast(JsonMap, prior)
         text = record.get("text")
         first = record.get("first_seen")
         if text == line and isinstance(first, str):
             first_seen = datetime.fromisoformat(first)
+            unchanged = True
         else:
             first_seen = now
     else:
         first_seen = now
     seen[key] = {"text": line, "first_seen": first_seen.isoformat(timespec="minutes"), "requested": requested}
+    if held and unchanged:
+        return EtaFresh(line)
     time = re.search(r"\b(\d{1,2}:\d{2}(?:\+\d+)?)\b", line)
     if time is not None:
         if parse_time(time.group(1), now) < now:
@@ -321,7 +325,9 @@ def run(args: argparse.Namespace) -> int:
         phase = fields.get("phase")
         phase_text = phase if isinstance(phase, str) else ""
         key = f"{unit.session}|{phase_text}"
-        state = eta_state(block, phase_text, seen, now)
+        held = fields.get("held")
+        state = eta_state(block, phase_text, seen, now,
+                          held=isinstance(held, str) and bool(held.strip()))
         if not isinstance(state, EtaNone):
             eta_touched[key] = None
         requested = isinstance(eta_requested(seen, key), EtaRequested)

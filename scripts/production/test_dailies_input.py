@@ -209,6 +209,14 @@ class DailiesInputTests(unittest.TestCase):
     def report(self) -> dict[str, object]:
         return cast(dict[str, object], json.loads(self.output.read_text(encoding="utf-8")))
 
+    def run_renderer(self, at: str) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            [sys.executable, str(RENDERER), str(self.output), "--at", at,
+             "--state", str(self.root / "render-state.json"),
+             "--log", str(self.root / "dailies.log")],
+            cwd=self.checkout, env=self.env, capture_output=True, text=True, check=False,
+        )
+
     def unit(self) -> dict[str, object]:
         return cast(dict[str, object], cast(list[object], self.report()["units"])[0])
 
@@ -600,6 +608,68 @@ class DailiesInputTests(unittest.TestCase):
         self.assertEqual(repeated.returncode, 0, repeated.stdout + repeated.stderr)
         self.assertNotIn("request /unit:eta:", repeated.stdout)
 
+    def test_held_unchanged_eta_keeps_one_moment_through_builder_and_renderer(self) -> None:
+        self.status_lines(f"== {ALPHA}", "● Checking panel labels", "ETA 19:35")
+        self.judgment_file(alpha={
+            "held": "the panel review is paused",
+            "eta": {"percent": 60},
+        })
+        baseline = self.run_builder("--at", "2026-10-06T19:30")
+        self.assertEqual(baseline.returncode, 0, baseline.stdout + baseline.stderr)
+        first_report = self.run_renderer("2026-10-06T19:30")
+        self.assertEqual(first_report.returncode, 0, first_report.stdout + first_report.stderr)
+
+        for at in ("2026-10-06T20:00", "2026-10-06T21:36", "2026-10-06T23:50"):
+            with self.subTest(at=at):
+                built = self.run_builder("--at", at)
+                self.assertEqual(built.returncode, 0, built.stdout + built.stderr)
+                self.assertEqual(cast(dict[str, object], self.unit()["eta"])["time"], "19:35")
+                self.assertNotIn("request /unit:eta:", built.stdout)
+                rendered = self.run_renderer(at)
+                self.assertEqual(rendered.returncode, 0, rendered.stdout + rendered.stderr)
+                self.assertIn("- eta: 19:35 PDT, 60% done (unchanged, overdue)", rendered.stdout)
+                self.assertNotIn("19:35 PDT tomorrow", rendered.stdout)
+                saved = cast(dict[str, dict[str, object]], json.loads(
+                    (self.root / "render-state.json").read_text(encoding="utf-8")))
+                self.assertEqual(saved[ALPHA]["eta"], "2026-10-06T19:35:00")
+                self.assertEqual(saved[ALPHA]["eta_text"], "19:35")
+                log_line = (self.root / "dailies.log").read_text(encoding="utf-8").splitlines()[-1]
+                self.assertIn(f"{ALPHA} Phase 2 of 3 19:35 PDT, 60% done", log_line)
+                self.assertNotIn("tomorrow", log_line)
+
+    def test_unheld_unchanged_passed_eta_is_hidden_and_requested(self) -> None:
+        self.status_lines(f"== {ALPHA}", "● Checking panel labels", "ETA 19:35")
+        first = self.run_builder("--at", "2026-10-06T19:30")
+        self.assertEqual(first.returncode, 0, first.stdout + first.stderr)
+        passed = self.run_builder("--at", "2026-10-06T20:00")
+        self.assertEqual(passed.returncode, 0, passed.stdout + passed.stderr)
+        self.assertEqual(self.unit()["eta"], {"none": "none measured - requested"})
+        self.assertEqual(passed.stdout.count(f"request /unit:eta: {ALPHA}"), 1)
+
+    def test_held_changed_eta_uses_the_two_hour_rule_in_the_renderer(self) -> None:
+        self.status_lines(f"== {ALPHA}", "● Checking panel labels", "ETA 19:35")
+        self.judgment_file(alpha={
+            "held": "the panel review is paused",
+            "eta": {"percent": 60},
+        })
+        baseline = self.run_builder("--at", "2026-10-06T19:30")
+        self.assertEqual(baseline.returncode, 0, baseline.stdout + baseline.stderr)
+        first_report = self.run_renderer("2026-10-06T19:30")
+        self.assertEqual(first_report.returncode, 0, first_report.stdout + first_report.stderr)
+        self.status_lines(f"== {ALPHA}", "● Checking panel labels", "ETA 19:36")
+        self.judgment_file(alpha={
+            "held": "the panel review is paused",
+            "eta": {"percent": 60, "why": "the panel review found another repair"},
+        })
+
+        changed = self.run_builder("--at", "2026-10-06T23:50")
+        self.assertEqual(changed.returncode, 0, changed.stdout + changed.stderr)
+        self.assertEqual(cast(dict[str, object], self.unit()["eta"])["time"], "19:36")
+        rendered = self.run_renderer("2026-10-06T23:50")
+        self.assertEqual(rendered.returncode, 0, rendered.stdout + rendered.stderr)
+        self.assertIn("19:36 PDT tomorrow", rendered.stdout)
+        self.assertIn("changed: +24:01 because the panel review found another repair", rendered.stdout)
+
     def test_eta_just_after_midnight_is_tomorrow_and_stays_visible(self) -> None:
         self.status_lines(f"== {ALPHA}", "● Checking panel labels", "ETA 00:30")
         result = self.run_builder("--at", "2026-10-06T23:45")
@@ -769,6 +839,7 @@ class DailiesInputTests(unittest.TestCase):
         _ = self.output.write_text("sentinel\n", encoding="utf-8")
         render_state = self.root / "render-state.json"
         old = {"phase": "Phase 2 of 3: panel labels stay clear", "eta": "2026-10-06T20:00:00",
+               "eta_text": "20:00",
                "held": None, "first": "2026-10-06T20:00:00"}
         _ = render_state.write_text(json.dumps({ALPHA: old}), encoding="utf-8")
         self.events.unlink()

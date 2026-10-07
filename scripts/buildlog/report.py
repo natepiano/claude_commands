@@ -7,6 +7,7 @@ appear as one scratch caller in each kind's table.
 
 from __future__ import annotations
 
+import re
 import sqlite3
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
@@ -43,8 +44,21 @@ MAX_SAMPLE_GAP_S = 5 * 60
 # the 4–7 bin is where recovery time starts to climb.
 TESTS_PER_EDIT_TARGET = 0.5
 EDIT_BINS = ("0", "1", "2–3", "4–7", "8+")
+NO_REBUILD_CRATES = 0
+EDITED_CRATE_MIN_CRATES = NO_REBUILD_CRATES + 1
+EDITED_CRATE_MAX_CRATES = 3
+CASCADE_MIN_CRATES = EDITED_CRATE_MAX_CRATES + 1
+CASCADE_MAX_CRATES = 49
+COLD_BUILD_MIN_CRATES = CASCADE_MAX_CRATES + 1
+NO_REBUILD_LABEL = "none"
+EDITED_CRATE_LABEL = f"edited crate ({EDITED_CRATE_MIN_CRATES}–{EDITED_CRATE_MAX_CRATES} crates)"
+CASCADE_LABEL = f"cascade ({CASCADE_MIN_CRATES}–{CASCADE_MAX_CRATES} crates)"
+COLD_BUILD_LABEL = f"cold ({COLD_BUILD_MIN_CRATES}+ crates)"
+REBUILD_LABELS = (NO_REBUILD_LABEL, EDITED_CRATE_LABEL, CASCADE_LABEL, COLD_BUILD_LABEL)
+PACKAGE_PATTERN = re.compile(r"package\(([^)&|\s]+)\)")
 
 Row = tuple[object, ...]
+ReportedWait = tuple[float, str, str, str]
 
 
 def seconds(value: object) -> str:
@@ -123,6 +137,58 @@ class TestsPerEditWindow:
     recovery_bins: list[FailureRecoveryBin]
 
 
+@dataclass(frozen=True)
+class KnownCrateStep:
+    crates_compiled: int
+    duration_s: float
+    compile_s: float
+    compile_time_known: bool
+    kind: str
+    argv: str
+
+
+@dataclass
+class RebuildTiming:
+    steps: int = 0
+    compile_s: float = 0.0
+    other_s: float = 0.0
+    total_s: float = 0.0
+
+    def add(self, step: KnownCrateStep) -> None:
+        self.steps += 1
+        self.compile_s += step.compile_s
+        self.other_s += max(0.0, step.duration_s - step.compile_s)
+        self.total_s += step.duration_s
+
+
+@dataclass
+class PackageRebuilds:
+    steps: int = 0
+    compile_s: float = 0.0
+    compile_samples: list[float] = field(default_factory=list)
+
+    def add(self, step: KnownCrateStep) -> None:
+        self.steps += 1
+        self.compile_s += step.compile_s
+        if step.compile_time_known:
+            self.compile_samples.append(step.compile_s)
+
+
+@dataclass(frozen=True)
+class TokenHolder:
+    call_id: str
+    delegate_session: str
+    seat: str
+    starts_at: datetime
+    ends_at: datetime
+
+
+@dataclass(frozen=True)
+class TokenWaitAttribution:
+    behind_another_seat_s: float
+    behind_own_call_s: float
+
+
 EXTRA: dict[str, list[Column]] = {
     "check": [AverageColumn("Build", "avg(finished_s)", seconds, "finished_s"), Column("Warnings", "sum(warnings)", count)],
     "clippy": [
@@ -172,7 +238,7 @@ def caller_label(caller: object, host: object, hosts: int) -> str:
     return f"{label} ({host})" if hosts > 1 else label
 
 
-def wait_row(label: str, waits: list[tuple[float, str, str, str]], unit: str) -> list[str]:
+def wait_row(label: str, waits: list[ReportedWait], unit: str) -> list[str]:
     """Summarize measured waits, keeping parallel seats as separate time."""
     if not waits:
         return [label, "none", "", "", "", ""]
@@ -196,13 +262,82 @@ def wait_seconds(value: object) -> float:
     return float(value) if isinstance(value, int | float) else 0.0
 
 
-def waiting_section(connection: sqlite3.Connection, day: str) -> list[str]:
+def call_time(value: object) -> datetime:
+    return datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+
+
+def token_holders(rows: list[Row]) -> list[TokenHolder]:
+    holders: list[TokenHolder] = []
+    for call_id, started_at, wait_s, ended_at, seat, delegate_session in rows:
+        starts_at = call_time(started_at) + timedelta(seconds=wait_seconds(wait_s))
+        ends_at = call_time(ended_at)
+        if starts_at < ends_at:
+            holders.append(TokenHolder(str(call_id), str(delegate_session), str(seat), starts_at, ends_at))
+    return holders
+
+
+def attribute_token_wait(
+    call_id: str,
+    delegate_session: str,
+    seat: str,
+    starts_at: datetime,
+    wait_s: float,
+    token_wait_s: float,
+    holders: Sequence[TokenHolder],
+) -> TokenWaitAttribution:
+    wait_ends_at = starts_at + timedelta(seconds=wait_s)
+    wait_starts_at = wait_ends_at - timedelta(seconds=token_wait_s)
+    overlapping = [
+        holder for holder in holders
+        if holder.call_id != call_id and holder.delegate_session == delegate_session
+        and holder.starts_at < wait_ends_at and holder.ends_at > wait_starts_at
+    ]
+    boundaries = sorted({wait_starts_at, wait_ends_at, *(point for holder in overlapping for point in (holder.starts_at, holder.ends_at))})
+    own_s = 0.0
+    for left, right in zip(boundaries, boundaries[1:]):
+        if left < wait_starts_at or right > wait_ends_at:
+            continue
+        covering = [holder for holder in overlapping if holder.starts_at < right and holder.ends_at > left]
+        if covering and all(holder.seat == seat for holder in covering):
+            own_s += (right - left).total_seconds()
+    own_s = min(token_wait_s, own_s)
+    return TokenWaitAttribution(token_wait_s - own_s, own_s)
+
+
+def build_folder_waits(connection: sqlite3.Connection, day: str) -> tuple[list[ReportedWait], list[ReportedWait]]:
     calls = fetch(
         connection,
-        "SELECT token_wait_s, coalesce(worktree_name, '(unknown worktree)'), started_at FROM calls"
-        + " WHERE date(started_at, 'localtime') = ?",
+        "SELECT id, token_wait_s, coalesce(worktree_name, '(unknown worktree)'), started_at,"
+        + " coalesce(wait_s, 0), coalesce(seat, '(unknown seat)'), delegate_session FROM calls"
+        + " WHERE tool = 'verify.sh' AND date(started_at, 'localtime') = ?",
         day,
     )
+    holder_rows = fetch(
+        connection,
+        "SELECT id, started_at, coalesce(wait_s, 0), ended_at, coalesce(seat, '(unknown seat)'), delegate_session"
+        + " FROM calls WHERE tool = 'verify.sh' AND ended_at IS NOT NULL AND delegate_session IS NOT NULL"
+        + " AND date(ended_at, 'localtime') >= ?",
+        day,
+    )
+    holders_by_session: dict[str, list[TokenHolder]] = {}
+    for holder in token_holders(holder_rows):
+        holders_by_session.setdefault(holder.delegate_session, []).append(holder)
+    another_waits: list[ReportedWait] = []
+    own_waits: list[ReportedWait] = []
+    for call_id, duration, tree, started_at, wait_s, seat, delegate_session in calls:
+        token_wait_s = wait_seconds(duration)
+        attribution = TokenWaitAttribution(token_wait_s, 0.0) if token_wait_s <= 0 or not isinstance(delegate_session, str) else attribute_token_wait(
+            str(call_id), delegate_session, str(seat), call_time(started_at), wait_seconds(wait_s), token_wait_s,
+            holders_by_session.get(delegate_session, []),
+        )
+        identity = (str(tree), str(tree), str(started_at))
+        another_waits.append((attribution.behind_another_seat_s, *identity))
+        own_waits.append((attribution.behind_own_call_s, *identity))
+    return another_waits, own_waits
+
+
+def waiting_section(connection: sqlite3.Connection, day: str) -> list[str]:
+    another_waits, own_waits = build_folder_waits(connection, day)
     steps = fetch(
         connection,
         "SELECT mem_wait_s, coalesce(worktree_name, '(unknown worktree)'), seat, started_at FROM steps"
@@ -217,7 +352,8 @@ def waiting_section(connection: sqlite3.Connection, day: str) -> list[str]:
         day,
     )
     rows = [
-        wait_row("Build-folder turn", [(wait_seconds(duration), str(tree), str(tree), str(at)) for duration, tree, at in calls], "calls"),
+        wait_row("Build-folder turn, behind another seat", another_waits, "calls"),
+        wait_row("Build-folder turn, behind its own call", own_waits, "calls"),
         wait_row(
             "Memory admission",
             [(wait_seconds(duration), str(tree), f"{tree} {seat}" if seat else str(tree), str(at)) for duration, tree, seat, at in steps],
@@ -225,7 +361,137 @@ def waiting_section(connection: sqlite3.Connection, day: str) -> list[str]:
         ),
         wait_row("CI queue", [(wait_seconds(duration), f"{workflow} / {name}", f"{workflow} / {name}", str(at)) for duration, workflow, name, at in jobs], "jobs"),
     ]
-    return ["### Waiting", "", *table(["Wait", "Longest", "Over 5 min", "Waited", "Total", "Worst"], rows), ""]
+    source = "Source: verify.sh calls, memory-gated steps and CI jobs; a seat's own calls run one at a time, so waiting behind its own call adds no delay, behind another seat does."
+    return ["### Waiting", "", *table(["Wait", "Longest", "Over 5 min", "Waited", "Total", "Worst"], rows), source, ""]
+
+
+def rebuild_bin(crates_compiled: int) -> str:
+    if crates_compiled == NO_REBUILD_CRATES:
+        return NO_REBUILD_LABEL
+    if crates_compiled <= EDITED_CRATE_MAX_CRATES:
+        return EDITED_CRATE_LABEL
+    if crates_compiled < COLD_BUILD_MIN_CRATES:
+        return CASCADE_LABEL
+    return COLD_BUILD_LABEL
+
+
+def known_crate_steps(connection: sqlite3.Connection, day: str) -> list[KnownCrateStep]:
+    rows = fetch(
+        connection,
+        f"SELECT crates_compiled, duration_s, finished_s, step, argv FROM steps WHERE {ON_DAY}"
+        + " AND step <> 'sweep' AND crates_compiled IS NOT NULL",
+        day,
+    )
+    steps: list[KnownCrateStep] = []
+    for crates, duration, finished, kind, argv in rows:
+        compile_time_known = isinstance(finished, int | float)
+        steps.append(
+            KnownCrateStep(
+                cast(int, crates),
+                float(duration) if isinstance(duration, int | float) else 0.0,
+                float(finished) if compile_time_known else 0.0,
+                compile_time_known,
+                str(kind),
+                str(argv or ""),
+            )
+        )
+    return steps
+
+
+def rebuild_timings(steps: Sequence[KnownCrateStep]) -> dict[str, RebuildTiming]:
+    timings = {label: RebuildTiming() for label in REBUILD_LABELS}
+    for step in steps:
+        timings[rebuild_bin(step.crates_compiled)].add(step)
+    return timings
+
+
+def whole_percent(part: float, total: float) -> str:
+    return f"{part / total:.0%}" if total > 0 else "0%"
+
+
+def rebuild_rows(timings: dict[str, RebuildTiming]) -> list[list[str]]:
+    all_compile = sum(timing.compile_s for timing in timings.values())
+    all_time = sum(timing.total_s for timing in timings.values())
+    rows: list[list[str]] = []
+    for label in REBUILD_LABELS:
+        timing = timings[label]
+        if not timing.steps:
+            rows.append([label, "0", "—", "—", "—", "—", "—"])
+            continue
+        rows.append(
+            [
+                label,
+                count(timing.steps),
+                seconds(timing.compile_s),
+                seconds(timing.other_s),
+                seconds(timing.total_s),
+                whole_percent(timing.compile_s, all_compile),
+                whole_percent(timing.total_s, all_time),
+            ]
+        )
+    return rows
+
+
+def nextest_rebuild_lines(steps: Sequence[KnownCrateStep]) -> list[str]:
+    timing = RebuildTiming()
+    for step in steps:
+        if step.kind == "nextest":
+            timing.add(step)
+    if not timing.steps:
+        return []
+    measured = timing.compile_s + timing.other_s
+    return [
+        f"nextest: {seconds(timing.compile_s)} compiling, {seconds(timing.other_s)} running tests "
+        + f"({whole_percent(timing.compile_s, measured)} compiling)."
+    ]
+
+
+def rebuild_package(argv: str) -> str:
+    matched = PACKAGE_PATTERN.search(argv)
+    return matched.group(1) if matched else "(unknown)"
+
+
+def package_rebuild_rows(steps: Sequence[KnownCrateStep]) -> list[list[str]]:
+    packages: dict[str, PackageRebuilds] = {}
+    for step in steps:
+        if step.kind != "nextest" or rebuild_bin(step.crates_compiled) != EDITED_CRATE_LABEL:
+            continue
+        packages.setdefault(rebuild_package(step.argv), PackageRebuilds()).add(step)
+    ranked = sorted(packages.items(), key=lambda item: (-item[1].compile_s, item[0]))[:5]
+    return [
+        [
+            name,
+            count(rebuilds.steps),
+            seconds(nearest_rank(rebuilds.compile_samples, 50)) if rebuilds.compile_samples else "—",
+            seconds(nearest_rank(rebuilds.compile_samples, 95)) if rebuilds.compile_samples else "—",
+            seconds(rebuilds.compile_s),
+        ]
+        for name, rebuilds in ranked
+    ]
+
+
+def rebuilds_section(connection: sqlite3.Connection, day: str) -> list[str]:
+    steps = known_crate_steps(connection, day)
+    timings = rebuild_timings(steps)
+    packages = package_rebuild_rows(steps)
+    section = ["### Rebuilds", ""]
+    nextest = nextest_rebuild_lines(steps)
+    if nextest:
+        section += [*nextest, ""]
+    section += [
+        *table(["Rebuild", "Steps", "Compile", "Other", "Total", "Share of compile", "Share of time"], rebuild_rows(timings)),
+        "Source: steps with a known crate count; compile is cargo's own \"Finished … in\" time, other is the rest of the step.",
+        "",
+    ]
+    if packages:
+        section += [
+            "Edited-crate rebuilds by package (nextest):",
+            "",
+            *table(["Package", "Steps", "p50", "p95", "Compile"], packages),
+            f"Source: nextest steps that compiled {EDITED_CRATE_MIN_CRATES}–{EDITED_CRATE_MAX_CRATES} crates, by the first package(…) in the test filter; p50 and p95 are of compile time.",
+            "",
+        ]
+    return section
 
 
 def kind_section(connection: sqlite3.Connection, day: str, kind: str, hosts: int) -> list[str]:
@@ -687,6 +953,7 @@ def report(connection: sqlite3.Connection, day: str) -> str:
     hosts = cast(int, fetch(connection, f"SELECT count(DISTINCT host) FROM steps WHERE {ON_DAY} AND NOT {GROUP_AS_SCRATCH}", day)[0][0])
     lines = [f"## Builds, {date.fromisoformat(day).strftime('%A %Y-%m-%d')}", ""]
     lines += waiting_section(connection, day)
+    lines += rebuilds_section(connection, day)
     for kind in found:
         lines += kind_section(connection, day, kind, hosts)
     lines += memory_pressure_section(connection, day, hosts)

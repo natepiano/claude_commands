@@ -66,29 +66,36 @@ clear_block() {
 }
 
 # Prints what waits on the user in unit $1, whose pane text is $2.
-# A unit director waits on the user when it is idle and its latest turn-end line is decision or blocked.
+# A unit director waits on the user when it is idle and its latest turn-end line
+# is decision, gate or blocked.
 waiting_on_user() {
-  local u=$1 p=$2 last gate_no gate_text key start o peer=
+  local u=$1 p=$2 last turn_end gate_no gate_text actor_text key start o peer=
   print -r -- "$p" | tail -12 | grep -qE '^\s*[✢✻✽✶·*] [A-Z][a-z]+( [a-z]+)?…' && return
   if print -r -- "$p" | tail -15 | grep -q 'Enter to select'; then
     echo "FORM WAITING on you in $u: a question form is on its screen"
     return
   fi
   last=$(print -r -- "$p" | grep -nE '^\s*(— )?(holding|gate|decision|blocked|done):' | tail -1)
-  if [[ $last != *'decision:'* && $last != *'blocked:'* ]]; then
+  turn_end=${last#*:}
+  turn_end=${turn_end%%:*}
+  turn_end=${turn_end##*[[:space:]]}
+  if [[ $turn_end != decision && $turn_end != gate && $turn_end != blocked ]]; then
     clear_block "$u"
     return
   fi
-  for o in $units; do [[ $o != $u && $last == *$o* ]] && peer=1; done
+  gate_text=${last#*:}
+  actor_text=${gate_text#*:}
+  for o in $units; do
+    [[ $o != $u && " $actor_text " == *[^[:alnum:]_-]"$o"[^[:alnum:]_-]* ]] && peer=1
+  done
   # A wait on the showrunner or another unit is the showrunner's to clear, not the user's.
-  if [[ $last == *showrunner* || -n $peer ]]; then
-    gate_text=${last#*:}
-    [[ $last == *'blocked:'* ]] && echo "BLOCK in $u, open $(block_age "$u" "${gate_text## #}"):${gate_text}"
+  if [[ " $actor_text " == *[^[:alnum:]_-]showrunner[^[:alnum:]_-]* || -n $peer ]]; then
+    [[ $turn_end == blocked ]] \
+      && echo "BLOCK in $u, open $(block_age "$u" "${gate_text## #}"):${gate_text}"
     return
   fi
   clear_block "$u"
   gate_no=${last%%:*}
-  gate_text=${last#*:}
   key="$u|${gate_text## #}"
   if grep -qxF -- "$key" "$SEEN"; then
     echo "STILL WAITING on you, $u:${gate_text}"
@@ -134,8 +141,8 @@ echo "at $(TZ=$ZONE date '+%H:%M %Z') / $(date -u +%H:%M) UTC"
 processes=$(ps -eo pid=,ppid=,args=)
 for u in $units; do
   echo "== $u"
-  if ! $TM has-session -t "$u" 2>/dev/null; then echo 'SESSION GONE'; continue; fi
-  pane_pid=$($TM display-message -p -t "$u" '#{pane_pid}')
+  if ! $TM has-session -t "=$u" 2>/dev/null; then echo 'SESSION GONE'; continue; fi
+  pane_pid=$($TM display-message -p -t "=$u:" '#{pane_pid}')
   pid=$(pane_claude_pid "$pane_pid")
   [[ -z $pid ]] && echo 'CLAUDE NOT RUNNING'
   if [[ -n $pid ]]; then
@@ -150,7 +157,7 @@ for u in $units; do
       fi
     fi
   fi
-  p=$($TM capture-pane -p -J -S -400 -t "$u")
+  p=$($TM capture-pane -p -J -S -400 -t "=$u:")
   waiting_on_user "$u" "$p"
   pane=$(print -r -- "$p" | tail -150)
   print -r -- "$pane" | grep -E '^● ' | grep -vE 'says:|^● (Bash|Read|Write|Edit|Skill|Update|Search)\(' | tail -2 | cut -c1-220

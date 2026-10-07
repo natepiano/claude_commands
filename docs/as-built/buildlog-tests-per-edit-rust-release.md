@@ -113,7 +113,7 @@ The trial part is `waiting, <reason>` or `failed, <step>: <reason>` for the othe
 - A trial never starts outside 02:00–05:00 local, during a build hold, while the user runs cargo, rustc or cargo-nextest, or below floor plus headroom.
 - The state file is written atomically. The check exits 1 only for a failed fetch or a failed text, and one hourly job raising never stops the others.
 - Tests-per-edit chains start before the window. Narrowing the query to the 7 days would miscount the first call of each seat.
-- Each report section names its source and has at most one line under each table. `report.py` keeps one style: `table()`, `seconds()`, `count()`, `gib()`.
+- Nothing sits directly under a report table but its one `Source:` line, which carries any explanation of the table; both Tests per edit tables have that line (`docs/as-built/build-followups.md` lists the rest). `report.py` keeps one style: `table()`, `seconds()`, `count()`, `gib()`.
 - `cli.py report` and `cli.py query` run `index.update()`, which writes the live index. Code that only reads the real log uses `index.read_only()`.
 - Python: every signature annotated, no `Any` (a `TypedDict` for known keys), no file-level type ignores.
 
