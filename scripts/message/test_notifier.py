@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import signal
 import socket
 import subprocess
@@ -119,6 +120,23 @@ class NotifierTests(unittest.TestCase):
             time.sleep(0.02)
         self.fail(f"{path} did not contain {expected!r} before the deadline")
 
+    def fail_mv_to(self, filename: str) -> Path:
+        real_mv = shutil.which("mv")
+        self.assertIsNotNone(real_mv)
+        assert real_mv is not None
+        stub = self.launcher_dir / "mv"
+        _ = stub.write_text(
+            "\n".join((
+                "#!/bin/sh",
+                "destination=",
+                'for argument in "$@"; do destination=$argument; done',
+                f'case "$destination" in */{filename}) exit 23 ;; esac',
+                f'exec "{real_mv}" "$@"',
+            )) + "\n"
+        )
+        stub.chmod(0o755)
+        return stub
+
     def test_minute_rule_new_preserves_existing_state_and_retargets(self) -> None:
         self.assertTrue(self.new().startswith(f"next_due={MINUTE + 120} ("))
         self.assertEqual(self.state()["ENABLED"], "1")
@@ -130,6 +148,32 @@ class NotifierTests(unittest.TestCase):
         )
         self.assertEqual(self.state(), before)
         self.assertEqual((self.conf()["TARGET"], self.conf()["EVERY"]), ("other", "5"))
+
+    def test_new_state_write_failure_leaves_no_conf(self) -> None:
+        _ = self.fail_mv_to("state")
+        result = self.run_cli(
+            "new", "example", "--to", "session:sid-1", "--every", "2",
+            "--command", "the scheduled prompt",
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertFalse((self.state_dir / "example" / "conf").exists())
+
+    def test_new_conf_write_failure_is_completed_by_next_new(self) -> None:
+        stub = self.fail_mv_to("conf")
+        result = self.run_cli(
+            "new", "example", "--to", "session:sid-1", "--every", "2",
+            "--command", "the scheduled prompt",
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertTrue((self.state_dir / "example" / "state").exists())
+        self.assertFalse((self.state_dir / "example" / "conf").exists())
+        self.assertNotIn("example", self.successful("status"))
+
+        stub.unlink()
+        _ = self.new()
+        self.assertTrue((self.state_dir / "example" / "conf").exists())
+        _ = self.successful("tick", now=MINUTE + 120)
+        self.assertEqual(len(self.lines()), 1)
 
     def test_start_stop_restart_and_interval_schedules(self) -> None:
         _ = self.new()

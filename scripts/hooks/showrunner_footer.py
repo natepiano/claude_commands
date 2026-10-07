@@ -96,6 +96,10 @@ def switch_path(slug: str) -> Path:
     return state_root() / "footers-off" / slug
 
 
+def review_pause_path(slug: str) -> Path:
+    return state_root() / "review-paused" / f"{slug}.json"
+
+
 def footer_state(slug: str) -> FooterState:
     return FooterState.OFF if switch_path(slug).exists() else FooterState.ON
 

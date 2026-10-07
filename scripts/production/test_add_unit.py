@@ -376,15 +376,28 @@ class AddUnitTests(unittest.TestCase):
         self.assertEqual(self.registry_units(), ["alpha"])
         self.assertIn("added alpha-unit (plan)", self.log.read_text())
 
+    def test_prepared_row_uses_its_renamed_session_for_every_launch_target(self) -> None:
+        self.commit_prepared_row(self.prepared_row(session="renamed-alpha"))
+        result = self.successful("alpha", "--plan", "docs/plans/given.md")
+        launch = self.events("systemd-run")
+        self.assertEqual(len(launch), 1)
+        self.assertEqual(cast(list[str], launch[0]["args"])[:3],
+                         ["--user", "--scope", "--unit=renamed-alpha"])
+        tmux = next(record for record in self.events("tmux")
+                    if cast(list[str], record["args"])[:1] == ["new-session"])
+        arguments = cast(list[str], tmux["args"])
+        self.assertEqual(arguments[arguments.index("-s") + 1], "renamed-alpha")
+        self.assertIn("--remote-control renamed-alpha -n renamed-alpha", arguments[-1])
+        self.assertEqual(self.registry_units(), ["renamed-alpha"])
+        self.assertIn("alpha-unit started: tmux attach -t renamed-alpha", result.stdout)
+
     def test_prepared_row_refuses_mismatched_identity_cells_before_launch(self) -> None:
         cases = (("Plan", self.prepared_row(plan="docs/plans/other.md"),
                   "docs/plans/other.md", "docs/plans/given.md"),
                  ("Branch", self.prepared_row(branch="other-branch"),
                   "other-branch", "build-followups-alpha"),
                  ("Worktree", self.prepared_row(worktree=self.root / "other-worktree"),
-                  str(self.root / "other-worktree"), str(self.root / "project-alpha")),
-                 ("Session", self.prepared_row(session="other-session"),
-                  "other-session", "alpha"))
+                  str(self.root / "other-worktree"), str(self.root / "project-alpha")))
         for cell, row, actual, expected in cases:
             with self.subTest(cell=cell):
                 self.commit_prepared_row(row)

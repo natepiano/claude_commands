@@ -13,6 +13,7 @@ import subprocess
 import sys
 import time
 from datetime import datetime
+from enum import Enum
 from pathlib import Path
 from typing import NamedTuple, TypedDict, cast
 from zoneinfo import ZoneInfo
@@ -51,6 +52,18 @@ class Delivery(NamedTuple):
     state_path: Path
     kind: str
     command: list[str]
+
+
+class _SessionSocket(NamedTuple):
+    path: str
+
+
+class _NoLiveSession(Enum):
+    RESULT = "no live session"
+
+
+class _SessionLookupUnavailable(Enum):
+    RESULT = "session lookup unavailable"
 
 
 def command_output(command: list[str]) -> str:
@@ -186,11 +199,20 @@ def save_stretch(path: Path, stretch: Stretch) -> None:
     os.replace(temporary, path)
 
 
-def socket_for_target(target: str) -> str | None:
+def socket_for_target(target: str) -> _SessionSocket | _NoLiveSession | _SessionLookupUnavailable:
     try:
-        return command_output([sys.executable, str(SESSIONS), "socket", target]) or None
+        result = subprocess.run(
+            [sys.executable, str(SESSIONS), "socket", target],
+            capture_output=True, text=True, check=False,
+        )
     except OSError:
-        return None
+        return _SessionLookupUnavailable.RESULT
+    socket = result.stdout.strip()
+    if result.returncode == 0:
+        return _SessionSocket(socket) if socket else _NoLiveSession.RESULT
+    if result.returncode == 1:
+        return _NoLiveSession.RESULT
+    return _SessionLookupUnavailable.RESULT
 
 
 def delivery(path: Path, kind: str, socket: str, key: str, text: str) -> Delivery:
@@ -234,14 +256,22 @@ def tick(now: float) -> None:
     running = showrunners.running_showrunners()
     sockets = {configured["session"]: socket_for_target(configured["session"])
                for configured in settings["showrunners"]}
-    configured_sockets = set(sockets.values())
-    missing = [runner for runner in running if runner.socket not in configured_sockets]
+    configured_names = set(sockets)
+    lookup_unavailable = any(isinstance(result, _SessionLookupUnavailable)
+                             for result in sockets.values())
+    configured_sockets = {result.path for result in sockets.values()
+                          if isinstance(result, _SessionSocket)}
+    missing = ([] if lookup_unavailable else
+               [runner for runner in running
+                if runner.session not in configured_names and runner.socket not in configured_sockets])
     runners_by_socket = {runner.socket: runner for runner in running}
-    missing_slugs = {runner.slug for runner in missing}
-    for path in STATE_DIR.glob("missing-*.json"):
-        if path.stem.removeprefix("missing-") not in missing_slugs:
-            path.unlink()
-    faults_socket = socket_for_target(settings["faults_to"])
+    if not lookup_unavailable:
+        missing_slugs = {runner.slug for runner in missing}
+        for path in STATE_DIR.glob("missing-*.json"):
+            if path.stem.removeprefix("missing-") not in missing_slugs:
+                path.unlink()
+    faults_lookup = socket_for_target(settings["faults_to"])
+    faults_socket = faults_lookup.path if isinstance(faults_lookup, _SessionSocket) else ""
     for runner in missing:
         path = STATE_DIR / f"missing-{runner.slug}.json"
         stretch = read_stretch(path, runner.socket, now)
@@ -261,9 +291,10 @@ def tick(now: float) -> None:
             pending.append(delivery(path, "missing", faults_socket,
                                     f"stall-watch:missing:{runner.slug}:{int(stretch['since'])}", message))
     for configured in settings["showrunners"]:
-        showrunner_socket = sockets[configured["session"]]
-        if showrunner_socket is None:
+        showrunner_lookup = sockets[configured["session"]]
+        if not isinstance(showrunner_lookup, _SessionSocket):
             continue
+        showrunner_socket = showrunner_lookup.path
         runner = runners_by_socket.get(showrunner_socket)
         finished: set[str] = finished_run_units(runner) if runner is not None else set()
         try:
