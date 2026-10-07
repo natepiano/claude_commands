@@ -114,6 +114,7 @@ class ShowrunnerFooterHookTests(unittest.TestCase):
             **os.environ, "HOME": str(self.root), "NOTIFIER_STATE_DIR": str(self.notifier),
             "SHOWRUNNER_STATE_DIR": str(self.root / "showrunner-state"),
             "BUILD_HOLD_DIR": str(holds),
+            "MAC_TEST_STATE_DIR": str(self.root / "mac-test"),
         }
 
     def write_state(self, *, enabled: bool = True) -> None:

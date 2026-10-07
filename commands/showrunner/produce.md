@@ -123,8 +123,9 @@ State:
   next due time, and open-for-the-user items from `OUTSTANDING`. Keep each
   item specific enough to recall what, where and why without memory. Remove
   an item only when the user addresses it and tells you; defer an item with
-  `after` when the user asks. Build holds still come from holder files in
-  `~/.local/state/build-hold/`, and a dailies input marks each held unit.
+  `after` when the user asks. Build holds come from holder files in
+  `~/.local/state/build-hold/`, and a dailies input marks each held unit. A
+  pending or active Mac block comes from `~/.local/state/mac-test/`.
 
   `scripts/hooks/stop-showrunner-footer.py` checks each reply in the session
   targeted by `UPDATES`. When footers are on, a missing or outdated footer or
@@ -149,6 +150,7 @@ State:
   11:37 PDT update:
 
   * build hold: <holder> since 11:34 PDT, for the frame-time lane's breakdown of what each added tool costs - release eta: 11:40 PDT (3 minutes)
+  * Mac block: <holder> since 11:35 PDT, for the Mac-only test run - lifts Wed 12:35 PDT
   * claude 1: …
   * next dailies: 11:53 PDT - nothing needed
 

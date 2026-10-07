@@ -98,7 +98,7 @@
 
 **Ruled out:** replacing `ci_gate_job` with "an active run is busy until its Mac job is listed `completed`" before a real run shows how GitHub lists a skipped Mac job.
 
-### Phase 3 — A Mac block shows in the footer and the dailies  · status: todo
+### Phase 3 — A Mac block shows in the footer and the dailies  · status: done
 
 #### Work Order
 

@@ -29,6 +29,7 @@ class DailiesAgentsTests(unittest.TestCase):
     holders: Path = Path()
     original_tz: str | None = None
     original_hold_dir: str | None = None
+    original_mac_state_dir: str | None = None
 
     @override
     def setUp(self) -> None:
@@ -40,8 +41,10 @@ class DailiesAgentsTests(unittest.TestCase):
         self.holders.mkdir()
         self.original_tz = os.environ.get("TZ")
         self.original_hold_dir = os.environ.get("BUILD_HOLD_DIR")
+        self.original_mac_state_dir = os.environ.get("MAC_TEST_STATE_DIR")
         os.environ["TZ"] = ZONE
         os.environ["BUILD_HOLD_DIR"] = str(self.holders)
+        os.environ["MAC_TEST_STATE_DIR"] = str(self.root / "mac-test")
         time.tzset()
         _ = self.enterContext(patch.object(dailies_render, "AGENTS_DIR", self.agents, create=True))
         _ = self.enterContext(patch.object(dailies_render, "READINGS_LOG", self.readings, create=True))
@@ -57,6 +60,10 @@ class DailiesAgentsTests(unittest.TestCase):
             _ = os.environ.pop("BUILD_HOLD_DIR", None)
         else:
             os.environ["BUILD_HOLD_DIR"] = self.original_hold_dir
+        if self.original_mac_state_dir is None:
+            _ = os.environ.pop("MAC_TEST_STATE_DIR", None)
+        else:
+            os.environ["MAC_TEST_STATE_DIR"] = self.original_mac_state_dir
         time.tzset()
 
     def note(

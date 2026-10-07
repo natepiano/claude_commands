@@ -72,6 +72,7 @@ class GhDelay(TypedDict):
     seconds: float
     marker: str
     release: NotRequired[str]
+    after: NotRequired[bool]
 
 
 class GhFixture(TypedDict):
@@ -99,16 +100,20 @@ with (root / "gh.jsonl").open("a", encoding="utf-8") as output:
     output.write(json.dumps(arguments) + "\n")
 fixture = json.loads(fixture_path.read_text(encoding="utf-8"))
 joined = " ".join(arguments)
+
+def wait_on_delay(delay):
+    (root / delay["marker"]).write_text("started\n", encoding="utf-8")
+    release = delay.get("release")
+    if release is None:
+        time.sleep(float(delay["seconds"]))
+    else:
+        deadline = time.monotonic() + float(delay["seconds"])
+        while not (root / release).exists() and time.monotonic() < deadline:
+            time.sleep(0.01)
+
 for delay in fixture["delays"]:
-    if delay["match"] in joined:
-        (root / delay["marker"]).write_text("started\n", encoding="utf-8")
-        release = delay.get("release")
-        if release is None:
-            time.sleep(float(delay["seconds"]))
-        else:
-            deadline = time.monotonic() + float(delay["seconds"])
-            while not (root / release).exists() and time.monotonic() < deadline:
-                time.sleep(0.01)
+    if delay["match"] in joined and not delay.get("after", False):
+        wait_on_delay(delay)
 for failure in fixture["failures"]:
     if failure["match"] in joined:
         print(failure["line"], file=sys.stderr)
@@ -130,6 +135,9 @@ elif arguments[:2] == ["run", "view"]:
 else:
     print("unexpected gh call: " + joined, file=sys.stderr)
     raise SystemExit(9)
+for delay in fixture["delays"]:
+    if delay["match"] in joined and delay.get("after", False):
+        wait_on_delay(delay)
 '''
 
 
@@ -1061,6 +1069,86 @@ class MacTestCommandTests(unittest.TestCase):
         self.assertEqual(self.block_state()["ci"], "off_by_this_block")
         self.assertEqual(self.read_fixture_variable(), "false")
 
+    def test_timed_out_set_is_reconciled_and_restored(self) -> None:
+        self.write_config(gh_timeout_s="0.2")
+        self.gh["delays"] = [
+            {
+                "match": "variable set",
+                "seconds": 30.0,
+                "marker": "set-applied",
+                "after": True,
+            }
+        ]
+        self.sync_gh()
+        blocked = self.start_command(
+            "block", "--holder", "alice", "--for", "rendering"
+        )
+        self.wait_for_path(self.stub_directory / "set-applied")
+        stdout, stderr = blocked.communicate(timeout=5)
+        self.assertEqual(blocked.returncode, 2, stdout + stderr)
+        self.assertIn("CI can still use the Mac:", stdout)
+        self.assertEqual(self.block_state()["ci"], "off_unconfirmed")
+        self.assertEqual(self.read_fixture_variable(), "false")
+
+        self.gh["variable"] = "false"
+        self.gh["delays"] = []
+        self.sync_gh()
+        status = self.command("status")
+        self.assertEqual(status.returncode, 0, status.stdout + status.stderr)
+        self.assertEqual(self.block_state()["ci"], "off_by_this_block")
+
+        self.clear_log("gh")
+        unblocked = self.command("unblock", "--holder", "alice")
+        self.assertEqual(unblocked.returncode, 0, unblocked.stdout + unblocked.stderr)
+        self.assertTrue(
+            unblocked.stdout.startswith("Mac unblocked; CI may use the Mac again.\n")
+        )
+        self.assertEqual(self.read_fixture_variable(), "true")
+        self.assertEqual(self.gh_calls("variable set"), 1)
+
+    def test_failed_set_is_restored_even_when_the_variable_remains_on(self) -> None:
+        self.gh["failures"] = [
+            {"match": "variable set", "line": "request lost", "status": 1}
+        ]
+        self.sync_gh()
+        blocked = self.command("block", "--holder", "alice", "--for", "rendering")
+        self.assertEqual(blocked.returncode, 2, blocked.stdout + blocked.stderr)
+        self.assertIn("CI can still use the Mac: request lost.", blocked.stdout)
+        self.assertEqual(self.block_state()["ci"], "off_unconfirmed")
+        self.assertEqual(self.read_fixture_variable(), "true")
+
+        self.gh["failures"] = []
+        self.sync_gh()
+        self.clear_log("gh")
+        unblocked = self.command("unblock", "--holder", "alice")
+        self.assertEqual(unblocked.returncode, 0, unblocked.stdout + unblocked.stderr)
+        self.assertTrue(
+            unblocked.stdout.startswith("Mac unblocked; CI may use the Mac again.\n")
+        )
+        set_call = next(
+            call for call in self.logged_arguments("gh")
+            if call[:2] == ["variable", "set"]
+        )
+        self.assertEqual(set_call[set_call.index("--body") + 1], "true")
+        self.assertEqual(self.read_fixture_variable(), "true")
+
+    def test_expiry_of_unconfirmed_set_restores_the_switch(self) -> None:
+        now = datetime.now(timezone.utc)
+        _ = self.write_block(
+            since=now - timedelta(hours=2),
+            expires=now - timedelta(minutes=1),
+            free_message={"kind": "not_needed"},
+            ci="off_unconfirmed",
+        )
+        result = self.command("status")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertFalse((self.state_directory / "block.json").exists())
+        self.assertEqual(self.read_fixture_variable(), "true")
+        self.assertEqual(self.gh_calls("variable set"), 1)
+        delivered = self.logged_arguments("send-delivered")
+        self.assertEqual(len(delivered), 1)
+        self.assertIn("CI may use the Mac again.", delivered[0][-1])
+
     def test_gh_timeout_uses_configured_limit(self) -> None:
         self.write_config(gh_timeout_s="0.2")
         self.gh["delays"] = [
@@ -1071,19 +1159,13 @@ class MacTestCommandTests(unittest.TestCase):
             }
         ]
         self.sync_gh()
-        started = time.monotonic()
-        result = self.command(
-            "block",
-            "--holder",
-            "alice",
-            "--for",
-            "rendering",
-            timeout=20,
+        process = self.start_command(
+            "block", "--holder", "alice", "--for", "rendering"
         )
-        elapsed = time.monotonic() - started
-        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
-        self.assertLess(elapsed, 15)
-        self.assertIn("gh timed out after 0.2 s", result.stdout)
+        self.wait_for_path(self.stub_directory / "gh-timeout-started")
+        stdout, stderr = process.communicate(timeout=20)
+        self.assertEqual(process.returncode, 2, stdout + stderr)
+        self.assertIn("gh timed out after 0.2 s", stdout)
         self.assertEqual(self.block_state()["ci"], "still_on")
 
     def test_claim_does_not_wait_for_slow_gh_in_block(self) -> None:
@@ -1415,6 +1497,19 @@ class MacTestCommandTests(unittest.TestCase):
 
         record = self.write_block(free_message={"kind": "not_needed"})
         del record["expires"]
+        _ = path.write_text(json.dumps(record), encoding="utf-8")
+        with self.assertRaises(ValueError):
+            _ = mac_test.read_block(path)
+
+        record = self.write_block(
+            free_message={"kind": "not_needed"}, ci="off_unconfirmed"
+        )
+        decoded = mac_test.read_block(path)
+        self.assertIsInstance(decoded, mac_test.ActiveMacBlock)
+        if isinstance(decoded, mac_test.ActiveMacBlock):
+            self.assertEqual(decoded.ci, "off_unconfirmed")
+
+        record["ci"] = "unrecognized"
         _ = path.write_text(json.dumps(record), encoding="utf-8")
         with self.assertRaises(ValueError):
             _ = mac_test.read_block(path)
