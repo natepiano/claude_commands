@@ -2,9 +2,13 @@
 
 from __future__ import annotations
 
-from datetime import datetime
+import json
+import os
+import tempfile
+from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import TypedDict
+from typing import TypedDict, cast
 from zoneinfo import ZoneInfo
 
 from compare import CLASSES, ComparisonReport, DirectorComparison, DifferenceEstimate, TurnClassStatistics
@@ -23,6 +27,136 @@ class ExtractSession(TypedDict):
 
 class ExtractReport(TypedDict):
     sessions: list[ExtractSession]
+
+
+class HistoryMeasure(TypedDict):
+    opus_n: int
+    sonnet_n: int
+    opus_median_seconds: float | None
+    sonnet_median_seconds: float | None
+    change_percent: float | None
+
+
+class DirectorHistoryMeasure(TypedDict):
+    name: str
+    sonnet_continuation_n: int
+    opus_median_seconds: float | None
+    sonnet_median_seconds: float | None
+    change_percent: float | None
+
+
+class HistoryRun(TypedDict):
+    at: str
+    mode: str
+    recommendation: str
+    pooled: HistoryMeasure
+    directors: list[DirectorHistoryMeasure]
+
+
+@dataclass(frozen=True)
+class NotRecorded:
+    pass
+
+
+@dataclass(frozen=True)
+class FirstRun:
+    current: HistoryRun
+
+
+@dataclass(frozen=True)
+class FollowingRun:
+    current: HistoryRun
+    previous: HistoryRun
+
+
+type RunHistory = NotRecorded | FirstRun | FollowingRun
+NO_HISTORY = NotRecorded()
+
+
+def percent_change(before: float | None, after: float | None) -> float | None:
+    return (after - before) / before * 100 if before not in (None, 0) and after is not None else None
+
+
+def history_measure(row: DirectorComparison | None) -> HistoryMeasure:
+    opus = continuation(row, "opus") if row is not None else None
+    sonnet = continuation(row, "sonnet") if row is not None else None
+    before = opus["seconds_median"] if opus is not None else None
+    after = sonnet["seconds_median"] if sonnet is not None else None
+    return {"opus_n": opus["n"] if opus is not None else 0,
+            "sonnet_n": sonnet["n"] if sonnet is not None else 0,
+            "opus_median_seconds": before, "sonnet_median_seconds": after,
+            "change_percent": percent_change(before, after)}
+
+
+def history_row(comparison: ComparisonReport, phases: PhaseReport, now: datetime, final: bool) -> HistoryRun:
+    clock = now.replace(tzinfo=PDT) if now.tzinfo is None else now
+    directors: list[DirectorHistoryMeasure] = []
+    for row in comparison["directors"]:
+        measured = history_measure(row)
+        directors.append({"name": row["name"], "sonnet_continuation_n": measured["sonnet_n"],
+                          "opus_median_seconds": measured["opus_median_seconds"],
+                          "sonnet_median_seconds": measured["sonnet_median_seconds"],
+                          "change_percent": measured["change_percent"]})
+    return {"at": clock.astimezone(timezone.utc).isoformat(), "mode": "final" if final else "interim",
+            "recommendation": verdict(comparison, phases), "pooled": history_measure(comparison["pooled"]),
+            "directors": directors}
+
+
+def load_history(path: Path) -> list[HistoryRun]:
+    if not path.exists():
+        return []
+    return [cast(HistoryRun, json.loads(line)) for line in path.read_text().splitlines() if line]
+
+
+def write_history(path: Path, runs: list[HistoryRun]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary: str | None = None
+    try:
+        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=path.parent, prefix=f".{path.name}.", delete=False) as output:
+            temporary = output.name
+            _ = output.write("".join(json.dumps(run, separators=(",", ":")) + "\n" for run in runs))
+        os.replace(temporary, path)
+    finally:
+        if temporary is not None and os.path.exists(temporary):
+            os.unlink(temporary)
+
+
+def record_history(path: Path, current: HistoryRun, save: bool = True) -> tuple[list[HistoryRun], FirstRun | FollowingRun]:
+    runs = load_history(path)
+    previous = next((run for run in reversed(runs) if run["at"] != current["at"]), None)
+    if save:
+        positions = [index for index, run in enumerate(runs) if run["at"] == current["at"]]
+        if positions:
+            runs[positions[-1]] = current
+        else:
+            runs.append(current)
+        write_history(path, runs)
+    return runs, FirstRun(current) if previous is None else FollowingRun(current, previous)
+
+
+def since_lines(history: FirstRun | FollowingRun) -> list[str]:
+    if isinstance(history, FirstRun):
+        return ["first run"]
+    current, previous = history.current, history.previous
+    at = datetime.fromisoformat(previous["at"]).astimezone(PDT)
+    lines = [f"Previous run: {at:%Y-%m-%d %H:%M PDT} ({previous['mode']})."]
+    prior = {row["name"]: row for row in previous["directors"]}
+    for row in current["directors"]:
+        earlier = prior.get(row["name"])
+        old_n = earlier["sonnet_continuation_n"] if earlier is not None else 0
+        old_change = earlier["change_percent"] if earlier is not None else None
+        lines.append(f"{row['name']}: Sonnet continuation n {old_n} → {row['sonnet_continuation_n']}; median change {number(old_change)}% → {number(row['change_percent'])}%.")
+    lines.append(since_pooled_line(history))
+    lines.append("recommendation unchanged" if current["recommendation"] == previous["recommendation"]
+                 else f"recommendation changed from {previous['recommendation']} to {current['recommendation']}")
+    return lines
+
+
+def since_pooled_line(history: FirstRun | FollowingRun) -> str:
+    if isinstance(history, FirstRun):
+        return "Pooled switched: first run."
+    current, previous = history.current, history.previous
+    return f"Pooled switched: median change then {number(previous['pooled']['change_percent'])}%, now {number(current['pooled']['change_percent'])}%."
 
 
 def number(value: float | int | None, digits: int = 2) -> str:
@@ -281,11 +415,13 @@ def limits(comparison: ComparisonReport, phases: PhaseReport, extracted: Extract
     return lines
 
 
-def render(comparison: ComparisonReport, phases: PhaseReport, extracted: ExtractReport, now: datetime, final: bool = False) -> str:
+def render(comparison: ComparisonReport, phases: PhaseReport, extracted: ExtractReport, now: datetime, final: bool = False,
+           history: RunHistory = NO_HISTORY) -> str:
     kind = "FINAL" if final else "INTERIM"
     clock = now.replace(tzinfo=PDT) if now.tzinfo is None else now.astimezone(PDT)
+    since = ["## Since the last run", "", *since_lines(history), ""] if not isinstance(history, NotRecorded) else []
     lines = [f"# {kind} director model study — {clock:%Y-%m-%d %H:%M PDT}", "", "## The user's measure", "",
-             *measure_lines(comparison), "", "## Verdict", "", *verdict_lines(comparison, phases), "",
+             *measure_lines(comparison), "", *since, "## Verdict", "", *verdict_lines(comparison, phases), "",
              "## Per-director comparison", "", *director_table(comparison, phases), "", "## Pooled turn classes", "",
              *class_table(comparison), "", "## Control", "", *control_section(comparison), "", "## Compactions", "",
              *compaction_section(comparison), "", "## Work per phase", "", *work_section(phases), "", "## Limits", "",
@@ -293,19 +429,32 @@ def render(comparison: ComparisonReport, phases: PhaseReport, extracted: Extract
     return "\n".join(lines)
 
 
-def message(comparison: ComparisonReport, phases: PhaseReport, extracted: ExtractReport, now: datetime, final: bool, path: Path) -> str:
+def message(comparison: ComparisonReport, phases: PhaseReport, extracted: ExtractReport, now: datetime, final: bool, path: Path,
+            history: RunHistory = NO_HISTORY) -> str:
     kind = "FINAL" if final else "INTERIM"
     clock = now.replace(tzinfo=PDT) if now.tzinfo is None else now.astimezone(PDT)
     dropped = sum(sum(session["dropped"].values()) for session in extracted["sessions"])
+    since = [since_pooled_line(history)] if not isinstance(history, NotRecorded) else []
+    measures = measure_lines(comparison)
     lines = [f"From model-study-unit: {kind} director model study — {verdict(comparison, phases)}.",
-             *measure_lines(comparison), "Verdict:", *verdict_lines(comparison, phases), "Per-director comparison:"]
+             *measures, *since,
+             "Verdict:", *verdict_lines(comparison, phases), "Per-director comparison:"]
     table = director_table(comparison, phases)
     ending = ["Limits: " + f"as of {clock:%Y-%m-%d %H:%M PDT}; {len(comparison['directors'])} directors; {dropped} extract drops; {phases['drops']['stopped']} stopped, {phases['drops']['errored']} errored, {phases['drops']['empty']} phases without requests; natedev only; API-equivalent cost; clock and decision-quality limits apply.",
               str(path)]
-    if len(lines) + len(table) + len(ending) > 60:
+    if len(lines) + len(table) + len(ending) > 60 and len(table) > 2:
         keep = max(0, 60 - len(lines) - 2 - len(ending) - 1)
         hidden = len(table) - 2 - keep
         table = [*table[:2 + keep], f"… {hidden} more directors in report.md"]
+    if len(lines) + len(table) + len(ending) > 60:
+        pooled = measures[-1:] if comparison["pooled"] is not None else []
+        director_measures = measures[:-1] if pooled else measures
+        keep = max(0, 60 - 1 - len(pooled) - len(since) - 1 - len(verdict_lines(comparison, phases))
+                   - 1 - len(table) - len(ending) - 1)
+        hidden = len(director_measures) - keep
+        trimmed = [*director_measures[:keep], *pooled, f"… {hidden} more directors in report.md"]
+        lines = [lines[0], *trimmed, *since, "Verdict:", *verdict_lines(comparison, phases),
+                 "Per-director comparison:"]
     lines.extend([*table, *ending])
     return "\n".join(lines) + "\n"
 
