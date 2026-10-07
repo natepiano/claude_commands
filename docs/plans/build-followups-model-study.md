@@ -126,7 +126,7 @@ The user's measure, relayed by the showrunner (natedev) 2026-10-06: "it's a lot 
 - `switched_by_pdt` is a "by" time: the first Sonnet request of `widget` and `cache-evict` precedes it, and a derived time later than it is normal when the director sat idle after the switch.
 - `trunk` and `organon` drop many requests as `before_director`, because their director start is found through `/unit:delegate` in a human prompt. `basedpyright` exits 3 in every checkout, so read its printed counts rather than its exit status.
 
-### Phase 2 — The comparison sets each director's Opus turns against its Sonnet turns · status: todo
+### Phase 2 — The comparison sets each director's Opus turns against its Sonnet turns · status: done
 
 #### Work Order
 
