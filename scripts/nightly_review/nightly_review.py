@@ -53,7 +53,7 @@ def tmux(*args: str) -> subprocess.CompletedProcess[str]:
 
 
 def running(mode: str) -> bool:
-    return tmux("has-session", "-t", session(mode)).returncode == 0
+    return tmux("has-session", "-t", f"={session(mode)}").returncode == 0
 
 
 def quota_block() -> str | None:
@@ -71,12 +71,12 @@ def quota_block() -> str | None:
 def start(mode: str) -> str:
     name = session(mode)
     if running(mode):
-        if tmux("list-clients", "-t", name).stdout.strip():
+        if tmux("list-clients", "-t", f"={name}").stdout.strip():
             return f"{name}: you are attached, so last night's session was left running"
         # A session promoted out of a nightly review keeps its tmux name.
-        if f"/nightly_review {mode}" not in tmux("list-panes", "-F", "#{pane_start_command}", "-t", name).stdout:
+        if f"/nightly_review {mode}" not in tmux("list-panes", "-F", "#{pane_start_command}", "-t", f"={name}:").stdout:
             return f"{name}: another session holds this name, so tonight's review did not start"
-        _ = tmux("kill-session", "-t", name)
+        _ = tmux("kill-session", "-t", f"={name}")
     claude = shlex.join(["claude", "--remote-control", name, "-n", name, "--add-dir", str(Path.home() / ".claude"),
                          "--settings", str(SETTINGS), f"/nightly_review {mode}"])
     # A scope of its own, so a tmux server this starts outlives the timer's oneshot unit.

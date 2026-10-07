@@ -9,12 +9,26 @@ import subprocess
 import tempfile
 import unittest
 from pathlib import Path
+from typing import NamedTuple
 
-from dailies_input import Decision, StatusBlock, StillWaiting, UnitRow, status_blocks
+from dailies_input import (ClaudeNotRunning, Decision, SessionGone, StatusBlock, StillWaiting, UnitRow,
+                           status_blocks)
 
 
 SCRIPT = Path(__file__).with_name("unit_status.sh")
 SESSION_ID = "test-session"
+
+
+class RealTmux(NamedTuple):
+    """A real tmux binary and the private socket directory its test server lives in."""
+
+    binary: str
+    server_dir: Path
+
+    def environment(self, base: dict[str, str]) -> dict[str, str]:
+        environment = {**base, "TMUX_TMPDIR": str(self.server_dir)}
+        _ = environment.pop("TMUX", None)
+        return environment
 
 
 def _write_executable(path: Path, contents: str) -> None:
@@ -30,6 +44,7 @@ class UnitStatusTests(unittest.TestCase):
         processes: str = "100 1 tmux pane\n200 100 zsh\n12345 200 claude --remote-control stalls\n",
         showrunner: str | None = None,
         units: tuple[str, ...] = ("hook",),
+        real_tmux: RealTmux | None = None,
     ) -> tuple[tuple[str, ...], str | None, str]:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -66,11 +81,12 @@ case "$1" in
   display-message) printf '100\\n' ;;
   capture-pane)
     for target in "$@"; do :; done
-    cat "$TEST_PANE_DIR/$target"
+    target=${target#=}
+    cat "$TEST_PANE_DIR/${target%:}"
     ;;
   *) exit 2 ;;
 esac
-""",
+""" if real_tmux is None else f'#!/bin/sh\nexec {real_tmux.binary} "$@"\n',
             )
             _write_executable(bin_dir / "ps", '#!/bin/sh\ncat "$TEST_PROCESS_FILE"\n')
             _write_executable(bin_dir / "pgrep", "#!/bin/sh\nexit 2\n")
@@ -96,6 +112,8 @@ esac
                     "TEST_PANE_DIR": str(pane_dir),
                 }
             )
+            if real_tmux is not None:
+                environment = real_tmux.environment(environment)
             config = root / "config" / "showrunners.json"
             config.parent.mkdir()
             _ = config.write_text('{"threshold_percent":2,"repeat_minutes":30,"stall_minutes":5,'
@@ -298,3 +316,21 @@ esac
         peer_routed = self.parse_status(peer_outputs[0], ("hook", "peer"))[0]
         self.assertEqual(peer_routed.flags, ())
         self.assertTrue(any("gate: peer" in line.text for line in peer_routed.activity))
+
+    def test_a_gone_unit_reads_gone_while_a_session_its_name_prefixes_lives(self) -> None:
+        binary = shutil.which("tmux")
+        if binary is None:
+            self.skipTest("tmux is required to check its session matching")
+        with tempfile.TemporaryDirectory() as server_dir:
+            server = RealTmux(binary, Path(server_dir))
+            _ = subprocess.run([binary, "-f", "/dev/null", "new-session", "-d", "-s", "hookworm", "sleep 60"],
+                               env=server.environment(dict(os.environ)), check=True)
+            try:
+                outputs, _, _ = self.run_statuses(None, "ok", 0, panes=({},), units=("hook", "hookworm"),
+                                                  real_tmux=server)
+            finally:
+                _ = subprocess.run([binary, "kill-server"], env=server.environment(dict(os.environ)), capture_output=True,
+                                   check=False)
+        gone, live = self.parse_status(outputs[0], ("hook", "hookworm"))
+        self.assertIsInstance(gone.state, SessionGone, outputs[0])
+        self.assertIsInstance(live.state, ClaudeNotRunning, outputs[0])

@@ -1090,6 +1090,62 @@ class ReleaseStateTests(IsolatedBuildHoldTest):
         self.assertIn("--to", calls[1])
         self.assertEqual(calls[1][calls[1].index("--to") + 1], "uds:/tmp/registered.sock")
         self.assertNotIn("shared name", calls[1])
+        self.assertIn("build_hold.py nothing-to-build", calls[1][calls[1].index("--text") + 1])
+
+    def test_a_session_with_nothing_to_build_releases_the_next_at_once(self) -> None:
+        now = self.begin("first", "second")
+        sent: list[str] = []
+
+        def deliver(entry: build_hold.ReleaseEntry, _socket: str) -> int:
+            sent.append(entry["session_id"])
+            return 0
+
+        with mock.patch.object(build_hold, "socket_for", return_value="/tmp/socket"), \
+             mock.patch.object(build_hold, "send_release", side_effect=deliver):
+            _ = self.advance(now)
+            self.assertEqual(sent, ["first"])
+            answered = subprocess.run(
+                ["python3", str(SCRIPT), "nothing-to-build"], capture_output=True, text=True, check=False,
+                env={**os.environ, "CLAUDE_CODE_SESSION_ID": "first"},
+            )
+            self.assertEqual(answered.returncode, 0, answered.stderr)
+            self.assertEqual(answered.stdout.strip(),
+                             "shared name [first]: NothingToBuild; the release moves on to the next session")
+            self.assertEqual(set(self.entries()[0]), {"session_id", "name", "state", "answered_at"})
+            _ = build_hold.aware_instant(self.entries()[0].get("answered_at", ""))
+            complete, detail = self.advance(now)
+            self.assertFalse(complete)
+            self.assertEqual(sent, ["first", "second"])
+            self.assertIn("second", detail)
+            self.assertIn("NothingToBuild", build_hold.answer_nothing_to_build("second"))
+            complete, detail = self.advance(now)
+            self.assertTrue(complete)
+            self.assertEqual(detail, "shared name [first]: NothingToBuild; shared name [second]: NothingToBuild")
+
+    def test_nothing_to_build_answers_only_a_release_still_awaiting_admission(self) -> None:
+        now = self.begin("first", "second")
+        with mock.patch.object(build_hold, "socket_for", return_value="/tmp/socket"), \
+             mock.patch.object(build_hold, "send_release", return_value=0):
+            _ = self.advance(now)
+        self.assertEqual(build_hold.answer_nothing_to_build("unregistered"),
+                         "nothing-to-build ignored: this session is not registered")
+        self.assertEqual(build_hold.answer_nothing_to_build("second"),
+                         "nothing-to-build ignored: shared name [second]: AwaitingRelease")
+        self.assertIn("WaitingForMemory", build_hold.mark_gate("first", "WaitingForMemory"))
+        self.assertEqual(build_hold.answer_nothing_to_build("first"),
+                         "nothing-to-build ignored: shared name [first]: WaitingForMemory")
+        self.assertEqual([entry["state"] for entry in self.entries()], ["WaitingForMemory", "AwaitingRelease"])
+        self.assertEqual(build_hold.answer_nothing_to_build(""), "NoSessionId")
+
+    def test_a_queued_release_can_answer_nothing_to_build(self) -> None:
+        now = self.begin("first", "second")
+        with mock.patch.object(build_hold, "socket_for", return_value="/tmp/socket"), \
+             mock.patch.object(build_hold, "send_release", return_value=1):
+            _ = self.advance(now)
+            self.assertEqual(self.entries()[0]["state"], "DeliveryQueued")
+            self.assertIn("NothingToBuild", build_hold.answer_nothing_to_build("first"))
+            _ = self.advance(now)
+        self.assertEqual([entry["state"] for entry in self.entries()], ["NothingToBuild", "DeliveryQueued"])
 
 
 if __name__ == "__main__":

@@ -142,7 +142,7 @@ def checkout_ready(production: Production) -> PlanLanded | PlanPending:
 
 
 def session_state(name: str) -> SessionLive | SessionGone:
-    result = subprocess.run(["tmux", "has-session", "-t", name], capture_output=True,
+    result = subprocess.run(["tmux", "has-session", "-t", f"={name}"], capture_output=True,
                             text=True, check=False)
     if result.returncode == 0:
         return SessionLive(name)

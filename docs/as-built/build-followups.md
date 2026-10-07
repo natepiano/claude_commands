@@ -2,7 +2,7 @@
 
 ## What it is
 
-Agents' test builds linked far more than the tests they ran, and the daily build report did not show what builds cost the machine. `verify.sh test <pkg>` builds only the named package's test programs (4 in hana, against 78 for `--lib --bins --tests` across the workspace) and runs the same tests. The build report (`buildlog report [day]`) shows that cost three ways: a temporary table of daily test-build time against fixed baselines; builds under temp folders (agent scratch clones, delegate session folders) as one `scratch (temp folders)` caller in every kind's table and summary; and a Disk table of where natedev's root filesystem goes: `~/rust`, `/tmp`, the two CI runners, everything else, and free space against the sweep's floor. The buildlog test suite writes only to a temporary log and never walks the real disks, so nothing it does reaches the real log or shows up as a temp-folder build.
+Agents' test builds linked far more than the tests they ran, and the daily build report did not show what builds cost the machine. `verify.sh test <pkg>` builds only the named package's test programs (4 in hana, against 78 for `--lib --bins --tests` across the workspace) and runs the same tests. The build report (`buildlog report [day]`) shows that cost four ways: a Rebuilds section of where compile time goes, by how many crates each step compiled (cold builds, cascades, edited-crate rebuilds), with nextest's compile time against its test run; a temporary table of daily test-build time against fixed baselines; builds under temp folders (agent scratch clones, delegate session folders) as one `scratch (temp folders)` caller in every kind's table and summary; and a Disk table of where natedev's root filesystem goes: `~/rust`, `/tmp`, the two CI runners, everything else, and free space against the sweep's floor. The buildlog test suite writes only to a temporary log and never walks the real disks, so nothing it does reaches the real log or shows up as a temp-folder build.
 
 ## How it works
 
@@ -11,7 +11,7 @@ Agents' test builds linked far more than the tests they ran, and the daily build
 | File | Role |
 | --- | --- |
 | `scripts/delegate/verify.sh` | `TEST_TARGETS_PY` picks the targets from `cargo metadata`; `take_test_targets` reads them into `TEST_SELECTION`; the `test` arm builds with them. |
-| `scripts/buildlog/report.py` | `report()` assembles the day. `SCRATCH`, `GROUP_AS_SCRATCH`, `SCRATCH_LABEL`, `kind_section`, `summary` for scratch rows; `test_builds_section`; `disk_section`. |
+| `scripts/buildlog/report.py` | `report()` assembles the day. `rebuilds_section` with the rebuild-bin constants, `PACKAGE_PATTERN`, `KnownCrateStep`, `RebuildTiming`, `PackageRebuilds`, `rebuild_bin`, `known_crate_steps`, `rebuild_timings`, `rebuild_rows`, `whole_percent`, `nextest_rebuild_lines`, `rebuild_package`, `package_rebuild_rows`; `SCRATCH`, `GROUP_AS_SCRATCH`, `SCRATCH_LABEL`, `kind_section`, `summary` for scratch rows; `test_builds_section`; `disk_section`. |
 | `scripts/buildlog/disk.py` | The Disk rows (`FOLDERS`), the walk (`measure`), the floor (`read_floor`, `InvalidFloor`), the snapshot file, and the directories outside the build caches that the disk-floor alerts read (`docs/as-built/build-memory-admission.md`). |
 | `scripts/buildlog/cli.py` | `buildlog disk`, listed in the usage docstring. |
 | `scripts/buildlog/store.py` | `root()` (`BUILDLOG_DIR` moves it), `DISK_NAME`, `host_name()`, `utc_iso()`. |
@@ -27,19 +27,43 @@ Agents' test builds linked far more than the tests they ran, and the daily build
 `report(connection, day)` emits, in order:
 
 1. `## Builds, <Weekday YYYY-MM-DD>`
-2. `### Waiting` (build-folder turns, memory admission, CI queue; see `docs/as-built/build-memory-admission.md`)
-3. `### <kind>` for each kind seen that day (`KIND_ORDER` first), one row per caller by run count, the scratch row among them
-4. `### Memory pressure`, always present: memory waits, the sccache, unsliced-step and memory-kill lines, the stall table and the sample line (`docs/as-built/buildlog-memory-stalls.md`, `docs/as-built/build-memory-admission.md`)
-5. `### Agent calls (verify.sh)`
-6. `### Test builds (temporary)`, only on a day with a measured `verify.sh test` call
-7. `### cargo-port calls (port-lint)`
-8. `### CI`
-9. `### Tests per edit` (`docs/as-built/buildlog-tests-per-edit-rust-release.md`)
-10. `### Disk: <host>`, only when a snapshot exists
-11. `### Summary: successes`, `failures`, `all`, or `### Summary` / `No build steps recorded.` on a day with no steps
-12. The calls, port-lint and CI totals lines and the Rust release line, then the Mac-sync and peak-memory notes
+2. `### Waiting` (build-folder turns behind another seat and behind its own call, memory admission, CI queue; see `docs/as-built/build-memory-admission.md`)
+3. `### Rebuilds`, always present: compile and other time by rebuild bin (none, edited crate, cascade, cold), nextest's compile against test time, and edited-crate nextest rebuilds by package (Rebuilds section below)
+4. `### <kind>` for each kind seen that day (`KIND_ORDER` first), one row per caller by run count, the scratch row among them
+5. `### Memory pressure`, always present: memory waits, the sccache, unsliced-step and memory-kill lines, the stall table and the sample line (`docs/as-built/buildlog-memory-stalls.md`, `docs/as-built/build-memory-admission.md`)
+6. `### Agent calls (verify.sh)`
+7. `### Test builds (temporary)`, only on a day with a measured `verify.sh test` call
+8. `### cargo-port calls (port-lint)`
+9. `### CI`
+10. `### Tests per edit` (`docs/as-built/buildlog-tests-per-edit-rust-release.md`)
+11. `### Disk: <host>`, only when a snapshot exists
+12. `### Summary: successes`, `failures`, `all`, or `### Summary` / `No build steps recorded.` on a day with no steps
+13. The calls, port-lint and CI totals lines and the Rust release line, then the Mac-sync and peak-memory notes
 
 Every average carries a `p95` beside it, by nearest rank (`nearest_rank(values, percent)`, sorted index `(percent*n+99)//100-1`): each kind table (`COMMON_HEAD` is `Runs, Failed, Avg, p95, Range`; each `AverageColumn` adds `<title> p95`), the summaries (`Kind, Runs, [Failed], Total, Avg, p95, Peak memory`) and the CI table (`Workflow, Runs, Failed, Cancelled, Avg, p95, Range`).
+
+### Rebuilds section
+
+`rebuilds_section(connection, day)` emits `### Rebuilds`; `report()` calls it directly after `waiting_section(...)`.
+
+**Steps and times.** `known_crate_steps` reads the day's (`ON_DAY`) `steps` rows with `step <> 'sweep'` and a known `crates_compiled` into `KnownCrateStep` rows. Compile is cargo's own `finished_s` (its "Finished … in" time; NULL counts as 0 and leaves the step's compile time unknown). Other is duration minus compile, floored at 0 per step. `RebuildTiming` sums both for a group of steps (`rebuild_timings` builds one per bin). Shares are whole percent through `whole_percent`, `0%` when the total is 0.
+
+**Bins.** `rebuild_bin(crates_compiled)` is the one definition of rebuild bins:
+
+| Crates compiled | Label constant | Label |
+| --- | --- | --- |
+| 0 | `NO_REBUILD_LABEL` | `none` |
+| 1–3 | `EDITED_CRATE_LABEL` | `edited crate (1–3 crates)` |
+| 4–49 | `CASCADE_LABEL` | `cascade (4–49 crates)` |
+| 50+ | `COLD_BUILD_LABEL` | `cold (50+ crates)` |
+
+The edges are `NO_REBUILD_CRATES = 0`, `EDITED_CRATE_MAX_CRATES = 3` and `CASCADE_MAX_CRATES = 49`; `EDITED_CRATE_MIN_CRATES`, `CASCADE_MIN_CRATES` and `COLD_BUILD_MIN_CRATES` derive from them, and each label is built from its edges. `REBUILD_LABELS` holds the labels in order. Code compares against the named labels, never a tuple index.
+
+**Layout**, top to bottom:
+
+- `nextest: <compile> compiling, <other> running tests (<n>% compiling).` (`nextest_rebuild_lines`), summed over the day's nextest steps, then a blank line. With no nextest step both are left out.
+- The table `Rebuild | Steps | Compile | Other | Total | Share of compile | Share of time` (`rebuild_rows`): all four bins in `REBUILD_LABELS` order, always present; an empty bin shows `0` steps and `—` in every other cell. Share of compile is the bin's compile over all bins' compile; share of time is the bin's total over all bins' total. Directly beneath it: `Source: steps with a known crate count; compile is cargo's own "Finished … in" time, other is the rest of the step.`
+- Only when edited-crate nextest steps exist: the title `Edited-crate rebuilds by package (nextest):`, a blank line, the table `Package | Steps | p50 | p95 | Compile` (`package_rebuild_rows`), and directly beneath it `Source: nextest steps that compiled 1–3 crates, by the first package(…) in the test filter; p50 and p95 are of compile time.` The rows are the top 5 packages by compile, ties by name. A step's package is the first `PACKAGE_PATTERN` (`package\(([^)&|\s]+)\)`) match in its argv (`rebuild_package`), else `(unknown)`. p50 and p95 come from `nearest_rank()` over the package's steps with a known compile time (`PackageRebuilds`), `—` when there are none; Compile is the package's total.
 
 ### Test target selection
 
@@ -127,7 +151,9 @@ Measured by the buildlog disk job at 12:14 EDT: allocated blocks, each hard-link
 - The report never walks the disk; it reads `disk.json` only. `buildlog disk` is its one writer and replaces it by rename, so a reader sees a whole snapshot, old or new.
 - Every inode counts once across all Disk rows, in `FOLDERS` order, through one shared `seen`; `other` is used minus the rows, clamped at zero.
 - `disk.json` stays at the log root beside `sync.json`. `buildlog sync` moves only `<host>/` and `ci/`, so the snapshot never reaches the Mac, and the Mac's report has no Disk section.
-- `report.py` keeps one style: `table()`, `seconds()`, `count()`, `gib()`. A section names its source and has at most one line under each table. Times carry their zone, and their date when not today.
+- `report.py` keeps one style: `table()`, `seconds()`, `count()`, `gib()`. Times carry their zone, and their date when not today.
+- Nothing sits directly under a report table but its one `Source:` line, which carries any explanation of the table: the Waiting, both Rebuilds and both Tests per edit tables have that line, and so does any new table; every other table ends at the next blank line (Memory pressure and Test builds put their `Source:` line under the heading, above the table).
+- `rebuild_bin` and its edge constants are the one definition of rebuild bins; the labels derive from the edges, and code compares against the named labels, never a tuple index.
 - The test-builds table stays until the user calls the result settled.
 
 ## Calibration / gotchas
@@ -161,6 +187,7 @@ Measured by the buildlog disk job at 12:14 EDT: allocated blocks, each hard-link
 - **The broad fallback.** A target named explicitly whose required features are off errors where `--tests` would skip it, and a name shared with another member selects both; `--bins --tests` is correct in both cases.
 - **Integration tests stay in.** Lint compiles them under clippy; leaving them out of `test` would let a change lint an integration test and pass its gate without ever running it.
 - **A temporary table.** It shows whether the narrowed build lowers daily test-build time against the baselines; the user removes it once that is settled.
+- **Rebuilds by crate count.** A step's crate count tells a cold build from a cascade from an edited-crate rebuild, so the bins show which kind of rebuild the day's compile time went to, and nextest's split shows how much of a test step is compiling rather than testing. The cold row carries the cold-build count, time and shares, so no separate cold-build line sits under the table (ruled out).
 - **Scratch builds count.** Builds under temp folders are agent work (scratch clones, delegate session folders), not throwaway crates or buildlog's own test runs, so leaving them out understates what builds cost the machine. With tests held to a temporary log, nothing under a temp folder comes from the suite.
 - **Isolation in `test_index`, not `store.py`.** Every module already imports `test_index`, so one call at import covers the suite and production code carries no test logic. The subprocess check imports each module alone, so a module that only worked because another had set `BUILDLOG_DIR` first still fails.
 - **A snapshot job, not a report-time walk.** A walk costs 13–67 s; a report should cost a file read.

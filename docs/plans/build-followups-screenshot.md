@@ -63,7 +63,9 @@ The user, via natedev, 2026-10-06 13:1x PDT: "create a long running unit directo
 
 ## Gates
 
-None.
+| Gate | Waiting | Waits on | Clears when |
+| --- | --- | --- | --- |
+| G1 | Phase 6's next re-rank | a week of `/hana_shot` data after the user deferred the refusal fix | the clock: Wed 2026-10-14 07:50 PDT |
 
 ## Phases
 
@@ -253,6 +255,8 @@ Measured 2026-10-06/07 on the build machine, 300 s split, Sep 9 PDT to 2026-10-0
 
 ### Phase 6 — Proposals: the next change, ranked by measured minutes saved · status: todo (standing)
 
+**Blocked by:** G1 — the next re-rank waits until Wed 2026-10-14 07:50 PDT.
+
 #### Work Order
 
 **Goal:** the unit is always ready with the next improvement that saves the most agent time.
@@ -260,11 +264,12 @@ Measured 2026-10-06/07 on the build machine, 300 s split, Sep 9 PDT to 2026-10-0
 **Spec:**
 - From the report, rank candidates by agent-minutes saved per week. A candidate the report cannot price ranks below every priced one.
 - Seed the candidates from `analysis.md` → Next improvements:
-  - what fills long `/hana_shot` episodes;
+  - other BRP calls and the thinking after them in long `/hana_shot` episodes (unpriced until timelines name the BRP calls);
+  - the shot tool's refusals (deferred a week by the user on 2026-10-07; 5 of 98 shots and 35 s is the 2026-10-07 baseline, so re-price it from the week's data);
   - hana-frame settle (787 ms);
   - magick crops moved to extras' rect;
   - the parked speed plan;
-  - one shot tool for any BRP app, not only Hana.
+  - one shot tool for any BRP app, not only Hana (declined 2026-10-07, below).
 - Send natedev the top proposal only. It holds:
   - the measured cost today, with n;
   - what changes, in file:line terms;
@@ -274,7 +279,7 @@ Measured 2026-10-06/07 on the build machine, 300 s split, Sep 9 PDT to 2026-10-0
 - An approved proposal becomes the next numbered phase, appended to this plan. Its As-built names the change list entry that measures it.
 - A declined one is recorded here with the user's reason. The next proposal goes only when natedev asks.
 - After each approved phase merges, re-rank with fresh data before proposing again.
-- Price a candidate only from its eligible weekly count. The weekly trend and the mode and crop tables combine hosts, so read the saved `episodes.jsonl` and `invocations.jsonl` in `~/.local/state/screenshot-analysis/` by name, or add host-specific report rows, and show each candidate's eligible weekly count and its host coverage. A candidate whose eligible count is unavailable stays unpriced, and when none can be priced the proposal says so.
+- Price a candidate only from its eligible weekly count. The weekly trend and the mode and crop tables combine hosts, so read the saved `episodes.jsonl` and `invocations.jsonl` in `~/.local/state/screenshot-analysis/` by name, and show each candidate's eligible weekly count and its host coverage. A candidate whose eligible count is unavailable stays unpriced, and when none can be priced the proposal says so.
 - Carry the Mac's source limits into every estimate that uses Mac data: say which Mac sources are in (Codex transcripts and timings) and which are out (Claude transcripts), and whether the Mac read is still catching up.
 - Each approved phase appends its product change to `changes.json` with its effective time and affected hosts before the by-change table is used to assess it.
 
@@ -283,6 +288,50 @@ Measured 2026-10-06/07 on the build machine, 300 s split, Sep 9 PDT to 2026-10-0
 
 **Seats:** none — the unit director ranks and proposes from the report; no code is written until a proposal becomes its own phase.
 
-**Constraints from prior phases:** Failure logging, Codex transcript scanning and kept-shot detection are delivered, so `analysis.md` → Next improvements entry 2, entry 3 and the failure-logging half of entry 1 are not proposed again; the question of what fills long `/hana_shot` episodes stays seeded. The hourly phase supplies source-host coverage and says whether each attempt count is exact or inferred from images. The Mac catch-up delivers Codex transcripts and timings and finishes in about five hourly runs; Mac Claude transcripts stay out above 100 files or 100 MB, so every Mac estimate names that limit. A `changes.json` entry is either a product change, which is a speed candidate, or a measurement change, which the report lists separately and never counts as a speed gain; an approved proposal appends a product change carrying its effective time and affected hosts. Price weekly agent minutes from an observed eligible weekly count, keep per-shot milliseconds distinct from episode minutes, and leave a candidate unpriced when its evidence cannot support that calculation.
+**Constraints from prior phases:** Failure logging, Codex transcript scanning and kept-shot detection are delivered, so `analysis.md` → Next improvements entry 2, entry 3 and the failure-logging half of entry 1 are not proposed again; what fills long `/hana_shot` episodes is answered by the report's "What fills long /hana_shot episodes" section: agent thinking holds 61–67% of long minutes, other BRP calls 7–12%, file work 8–11%, retries 3–5% and shot calls 2–3%, so it is not proposed again. Its first window was under one day; re-rank from that section after a full week of `/hana_shot` data. The hourly phase supplies source-host coverage and says whether each attempt count is exact or inferred from images. The Mac catch-up delivers Codex transcripts and timings and finished in five hourly runs (`scan_status.json` → `mac_read_state`; check it before each estimate); Mac Claude transcripts stay out above 100 files or 100 MB, so every Mac estimate names that limit. A `changes.json` entry is either a product change, which is a speed candidate, or a measurement change, which the report lists separately and never counts as a speed gain; an approved proposal appends a product change carrying its effective time and affected hosts. Scale-aware `--window` (Phase 8, d1efe4c) is in `changes.json` as a product change on natedev and the Mac, effective 2026-10-07 08:04 PDT; it is not proposed again. Price weekly agent minutes from an observed eligible weekly count, keep per-shot milliseconds distinct from episode minutes, and leave a candidate unpriced when its evidence cannot support that calculation.
 
-**Acceptance gate:** each proposal cites a report less than 24 h old, the covered window and n for every number, both splits when it uses episode time, exact or inferred attempt evidence when it uses kept shots, and the calculation of expected agent-minutes saved per week. A candidate without those inputs is labeled unpriced and ranks below every priced one.
+**Acceptance gate:** each proposal cites a report less than 24 h old whose scan covers every host it uses through a time at or after G1 (`scan_status.json` → `last_success` and `host_coverage`), the covered window and n for every number, both splits when it uses episode time, exact or inferred attempt evidence when it uses kept shots, and the calculation of expected agent-minutes saved per week. A candidate without those inputs is labeled unpriced and ranks below every priced one.
+
+**Declined:** one shot tool for any BRP app, not only Hana (about 1.5 agent-minutes a week, 2026-10-07) — not approved for now; the user approved finding out why long `/hana_shot` episodes run long instead.
+
+**Deferred:** the shot tool's refusals fix (help text for `--margin` 0–0.45 and a fix hint in the "pose needs focus and radius" and "not inside a git worktree; pass --views-file" refusals) — the user, 2026-10-07: "wait a week on the screenshot refusal fix". Deferred, not declined: when G1 clears, re-rank every candidate, this one included, from a week of data and send natedev the top one.
+
+### Phase 7 — We know what fills a long `/hana_shot` episode, and its fix comes back priced · status: done
+
+#### As-built
+
+- Each `/hana_shot` episode, at both splits, carries an `EpisodeTimeline` built from its transcript's `TranscriptToolEvent`s, joined by `tool_use_id`. Every gap from start to end goes to one `GapCategory`: `hana_shot` (timed from its matching timing record when one exists), `retry` (a shot of the same view or target after a failed or uncited shot), `other_brp`, `builds_and_app_launches`, `file_reads_searches_and_edits`, `other_tool_calls`, `agent_time` (tool result to the next call), or `unattributed`, which is never folded into a named category. An episode with no transcript timeline is `TimelineUnavailable`, persists in `episodes.jsonl`, and the report counts it as excluded.
+- Tool events are indexed per transcript (bisect by start and by latest relevant end) and categorized at parse time. The parsed-state cache is format 6; an older cache rebuilds itself on the first scan (446 s, inside the 900 s hourly bound). Timelines read only saved state and transcripts the scan already holds.
+- The report section "What fills long /hana_shot episodes" gives, per category, long and short minutes, share of long minutes, median minutes per episode, and n. Long is at or above the 5-min split's p75, plus a 10 min and over row set; short is below the median. Rows cover all, natedev and mac, with window, split and host coverage stated; Mac rows say Mac Claude transcripts are out. The 10 longest episodes follow, with agent, project, session id, start, duration and their two largest categories.
+- On 2026-10-07 data (about 15 h, all natedev), named categories hold 95–97% of long-episode minutes at both splits: agent thinking 61–67%, other BRP calls 7–12%, file work 8–11%, retries 3–5%, shot calls 2–3%; no-news scan 12.7 s, report 0.88 s. The 2026-10-07 proposal recommends building nothing yet and re-ranking after a full week of `/hana_shot` data, with the refusal fix (5 of 98 shots, 35 s) offered as a follow-up phase.
+
+**Files:**
+- `scripts/shot_report/episodes.py` — timelines, gap attribution, long and short cohorts
+- `scripts/shot_report/transcripts.py` — tool event extraction with parse-time category
+- `scripts/shot_report/shot_report.py` — the section and the longest-episode list
+- `scripts/shot_report/test_shot_report.py`, `test_transcripts.py`, `fixtures/timeline/` — exact-gap fixtures, the exclusion test, a scale test
+- `commands/shot_report.md` — the section documented
+
+**Binds later work:** **Proposals: the next change, ranked by measured minutes saved** builds on "What fills long /hana_shot episodes" and its categories. Other BRP calls stay unpriced until timelines name the BRP calls, and the window is under one day, so weekly prices are extrapolations.
+
+**Gotchas:** the no-news scan's 30 s bound is sensitive to per-episode work over all events; per-episode linear event scans or deep-copied episode records push it past the bound, so lookups stay indexed and records compact.
+
+**Ruled out:** a rebuild-timelines command — the scan rebuilds timelines itself.
+
+### Phase 8 — `--window 1280x720` gives a 1280x720 window on any display · status: done
+
+#### As-built
+
+- `ensure_window` (`scripts/hana_shot/hana_shot.py`) sizes the window from the effective scale, `resolution.scale_factor_override` when set, else the OS `resolution.scale_factor` (as Bevy's `WindowResolution::scale_factor()` does), and writes a physical target of round(logical × scale). The early return and the wait compare the camera's physical size with that target; the timings line's `window` field stays the camera's physical size, and crops and padding keep their units.
+- `WindowResolutionValue` mirrors Bevy's `WindowResolution` wire record field for field, including `scale_factor_override: float | None`.
+- `--window WxH` and a stored view's `window` are logical sizes; the PNG is that size times the effective scale (2560x1440 for 1280x720 at 2x). The `--window` help and `commands/hana_shot.md` item 3 say so.
+- `changes.json` carries "Scale-aware --window" as a product change for natedev and the Mac, effective 2026-10-07 08:04 PDT.
+
+**Files:**
+- `scripts/hana_shot/hana_shot.py` — effective-scale window sizing, the resolution type, the `--window` help
+- `commands/hana_shot.md` — item 3 states the logical size and the PNG size
+- `scripts/hana_shot/test_hana_shot.py` — the BRP fake answers a scaled primary window, records `world.mutate_components`, and its camera's `physical_size` follows the mutation; three `test_window_uses_*` tests at 1280x720: base 1.0 with override 2.0 writes 2560x1440, base 2.0 with override 1.0 writes nothing, base 2.0 with no override writes 2560x1440
+
+**Gotchas:** Bevy serializes an absent override as `null`. Hana's own crates set no scale override; one seen at runtime comes from test or session setup.
+
+**Ruled out:** a semantic `EffectiveWindowScale` type in place of `scale_factor_override: float | None` — the TypedDict mirrors the wire record, and the optional resolves into a plain effective scale on the next line.

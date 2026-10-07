@@ -21,6 +21,33 @@ from typing import Literal, cast, override
 Agent = Literal["Claude", "Codex"]
 CallKind = Literal["shot", "other"]
 ProjectAttribution = Literal["repository", "scratchpad", "last_path", "removed_worktree", "scratchpad_target_missing"]
+type ParsedToolEventCategory = Literal[
+    "builds_and_app_launches", "other_brp", "file_reads_searches_and_edits", "other_tool_calls",
+]
+
+_BUILD_OR_LAUNCH = re.compile(
+    r"(?:^|[\s/])(?:cargo\s+(?:build|run|test)|(?:just|make)\s+(?:build|run|launch)|" +
+    r"brp_launch|hana(?:\.py)?\s+(?:run|launch)|bevy(?:_app)?\s+(?:run|launch))\b",
+    re.IGNORECASE,
+)
+_FILE_COMMAND = re.compile(
+    r"(?:^|[;&|]\s*)(?:rg|grep|fd|find|cat|sed|head|tail|less|wc|ls|tree|" +
+    r"apply_patch|git\s+(?:diff|status|show)|(?:cp|mv|touch|mkdir|tee)\b)",
+    re.IGNORECASE,
+)
+
+
+def parsed_tool_event_category(name: str, command: str) -> ParsedToolEventCategory:
+    """Classify the non-episode-specific purpose of one parsed tool call."""
+    lowered_name = name.lower()
+    if "brp_launch" in lowered_name or _BUILD_OR_LAUNCH.search(command):
+        return "builds_and_app_launches"
+    if "mcp__brp__" in lowered_name or re.search(r"\b(?:world\.|bevy/|hana/|brp_extras/)", command):
+        return "other_brp"
+    if (lowered_name.rsplit("__", 1)[-1] in {"read", "grep", "glob", "write", "edit", "apply_patch"}
+            or _FILE_COMMAND.search(command)):
+        return "file_reads_searches_and_edits"
+    return "other_tool_calls"
 
 
 @dataclass(frozen=True)
@@ -75,6 +102,7 @@ class FailedCapture:
     image_paths: tuple[str, ...]
     reason: str
     view: CaptureView = AdHocCaptureView()
+    target: CaptureTarget = UnspecifiedCaptureTarget()
 
 
 CaptureAttempt = SuccessfulCapture | FailedCapture
@@ -96,6 +124,19 @@ class ExactOrderedCaptureAttempts:
 
 
 AttemptEvidence = AttemptCountInferredFromImages | ExactOrderedCaptureAttempts
+
+
+@dataclass(frozen=True)
+class MeasuredHanaShotDuration:
+    milliseconds: float
+
+
+@dataclass(frozen=True)
+class HanaShotDurationUnavailable:
+    pass
+
+
+HanaShotDuration = MeasuredHanaShotDuration | HanaShotDurationUnavailable
 
 
 @dataclass(frozen=True)
@@ -204,6 +245,25 @@ class ToolCall:
     result_position: int = 0
     attempt_evidence: AttemptEvidence = AttemptCountInferredFromImages()
     source_host: str = "local"
+    hana_shot_duration: HanaShotDuration = HanaShotDurationUnavailable()
+    tool_use_id: str = ""
+
+
+@dataclass(frozen=True)
+class TranscriptToolEvent:
+    """One tool call retained for episode timeline attribution."""
+
+    start: datetime
+    end: datetime
+    session_id: str
+    transcript_path: str
+    agent: Agent
+    name: str
+    category: ParsedToolEventCategory
+    failed: bool
+    source_host: str = "local"
+    tool_use_id: str = ""
+    unfinished: bool = False
 
 
 PREFILTER = (
@@ -309,19 +369,23 @@ class TranscriptScan(list[ToolCall]):
     bytes_read: int
 
     invocations: list[InvocationRecord]
+    tool_events: list[TranscriptToolEvent]
 
     def __init__(self, calls: list[ToolCall], candidate_file_count: int, bytes_read: int,
-                 invocations: list[InvocationRecord] | None = None) -> None:
+                 invocations: list[InvocationRecord] | None = None,
+                 tool_events: Iterable[TranscriptToolEvent] = ()) -> None:
         super().__init__(calls)
         self.candidate_file_count = candidate_file_count
         self.bytes_read = bytes_read
         self.invocations = invocations if invocations is not None else []
+        self.tool_events = list(tool_events)
 
 
 @dataclass(frozen=True)
 class TranscriptEvidence:
     calls: list[ToolCall]
     citations: list[ImageCitation]
+    tool_events: list[TranscriptToolEvent] = field(default_factory=list)
 
 
 @dataclass(frozen=True)
@@ -364,11 +428,27 @@ class ScriptWriteAwaitingResult:
     cwd: str
 
 
+@dataclass(frozen=True)
+class ClaudeToolEventAwaitingResult:
+    start: datetime
+    session: str
+    name: str
+    command: str
+
+
+@dataclass(frozen=True)
+class CodexToolEventAwaitingResult:
+    start: datetime
+    name: str
+    command: str
+
+
 @dataclass
 class ClaudeTranscriptProgress:
     pending_uses: dict[str, ClaudeToolUseAwaitingResult] = field(default_factory=dict)
     pending_writes: dict[str, ScriptWriteAwaitingResult] = field(default_factory=dict)
     pending_citations: dict[str, tuple[str, ...]] = field(default_factory=dict)
+    pending_tool_events: dict[str, ClaudeToolEventAwaitingResult] = field(default_factory=dict)
     remembered_scripts: dict[str, RememberedScript] = field(default_factory=dict)
     known_cwds: set[str] = field(default_factory=set)
     next_position: int = 0
@@ -382,6 +462,7 @@ class CodexTranscriptProgress:
     cwd: str = ""
     pending_uses: dict[str, CodexToolUseAwaitingResult] = field(default_factory=dict)
     pending_citations: dict[str, tuple[str, ...]] = field(default_factory=dict)
+    pending_tool_events: dict[str, CodexToolEventAwaitingResult] = field(default_factory=dict)
     remembered_scripts: dict[str, RememberedScript] = field(default_factory=dict)
     next_position: int = 0
 
@@ -421,7 +502,7 @@ class CachedScanEvidence:
     timings: dict[tuple[str, str], CachedTimingEvidence]
 
 
-CACHE_FORMAT_VERSION = 3
+CACHE_FORMAT_VERSION = 6
 
 
 def _load_cache(cache: PersistentScanCache, roots: tuple[str, str]) -> CachedScanEvidence:
@@ -438,6 +519,7 @@ def _load_cache(cache: PersistentScanCache, roots: tuple[str, str]) -> CachedSca
 
 def _save_cache(cache: PersistentScanCache, evidence: CachedScanEvidence) -> None:
     for transcript in evidence.files.values():
+        _share_tool_event_context_strings(transcript.evidence.tool_events)
         for script in transcript.progress.remembered_scripts.values():
             script.selected_content.clear()
     cache.path.parent.mkdir(parents=True, exist_ok=True)
@@ -449,6 +531,17 @@ def _save_cache(cache: PersistentScanCache, evidence: CachedScanEvidence) -> Non
     finally:
         if os.path.exists(name):
             os.unlink(name)
+
+
+def _share_tool_event_context_strings(events: list[TranscriptToolEvent]) -> None:
+    """Keep one path and session string object per cached transcript."""
+    paths: dict[str, str] = {}
+    sessions: dict[str, str] = {}
+    for index, event in enumerate(events):
+        shared_path = paths.setdefault(event.transcript_path, event.transcript_path)
+        shared_session = sessions.setdefault(event.session_id, event.session_id)
+        if event.transcript_path is not shared_path or event.session_id is not shared_session:
+            events[index] = replace(event, transcript_path=shared_path, session_id=shared_session)
 
 
 def _object(value: object) -> dict[str, object]:
@@ -524,7 +617,10 @@ def _invocation_record(value: object, identity: TimingRecordId) -> InvocationRec
                                        else UnavailableFrameTime())
             attempts.append(SuccessfulCapture(paths, view, target, frame))
         elif attempt.get("status") == "failure" and isinstance(attempt.get("failure_reason"), str):
-            attempts.append(FailedCapture(paths, _string(attempt.get("failure_reason")), view))
+            target_value = attempt.get("target")
+            target = (SelectedCaptureTarget(target_value)
+                      if isinstance(target_value, str) else UnspecifiedCaptureTarget())
+            attempts.append(FailedCapture(paths, _string(attempt.get("failure_reason")), view, target))
         else:
             return None
     if status == "success" and record.get("exit_code") == 0:
@@ -566,6 +662,7 @@ def _recorded_calls(calls: list[ToolCall], records: list[InvocationRecord]) -> l
     by_session: dict[str, set[int]] = {}
     for index in shot_calls:
         by_session.setdefault(calls[index].session_id, set()).add(index)
+    matched: dict[int, list[SuccessfulInvocation | FailedInvocation]] = {}
     for record in sorted(records, key=lambda item: item.time):
         if isinstance(record, OldSuccessInvocation) or record.invocation_kind == "views_check":
             continue
@@ -579,12 +676,28 @@ def _recorded_calls(calls: list[ToolCall], records: list[InvocationRecord]) -> l
         if not candidates or isinstance(record.session, UnidentifiedSession) and len(candidates) != 1:
             continue
         index = min(candidates, key=lambda candidate: abs((calls[candidate].end - record.time).total_seconds()))
+        matched.setdefault(index, []).append(record)
+    for index, call_records in matched.items():
         call = updated[index]
-        paths = tuple(dict.fromkeys((*call.image_paths, *(path for attempt in record.attempts
-                                                         for path in attempt.image_paths))))
+        attempts = tuple(attempt for record in call_records for attempt in record.attempts)
+        paths = tuple(dict.fromkeys((*call.image_paths, *(path for attempt in attempts for path in attempt.image_paths))))
         earlier = call.attempt_evidence.captures if isinstance(call.attempt_evidence, ExactOrderedCaptureAttempts) else ()
-        updated[index] = replace(call, image_paths=paths,
-                                 attempt_evidence=ExactOrderedCaptureAttempts((*earlier, *record.attempts)))
+        duration_values: list[float] = []
+        for record in call_records:
+            duration_value = record.raw.get("total_ms")
+            if (not isinstance(record, SuccessfulInvocation) or len(record.attempts) != 1
+                    or not isinstance(duration_value, (int, float)) or isinstance(duration_value, bool)
+                    or not math.isfinite(float(duration_value)) or float(duration_value) < 0):
+                duration_values = []
+                break
+            duration_values.append(float(duration_value))
+        duration: HanaShotDuration = (MeasuredHanaShotDuration(sum(duration_values))
+                                      if duration_values else HanaShotDurationUnavailable())
+        updated[index] = replace(
+            call, image_paths=paths,
+            attempt_evidence=ExactOrderedCaptureAttempts((*earlier, *attempts)),
+            hana_shot_duration=duration,
+        )
     return updated
 
 
@@ -1700,11 +1813,11 @@ def _claude_calls(path: Path, projects: dict[str, tuple[str, ProjectAttribution]
     known_cwds = state.known_cwds
     scripts = state.remembered_scripts
     script_names_text = tuple({os.path.basename(script_path) for script_path in scripts})
-    script_names = tuple(name.encode() for name in script_names_text)
-    script_name_pattern = re.compile(b"|".join(re.escape(name) for name in script_names)) if script_names else None
     calls: list[ToolCall] = []
     citations: list[ImageCitation] = []
+    tool_events: list[TranscriptToolEvent] = []
     pending_citation_writes = state.pending_citations
+    pending_tool_events = state.pending_tool_events
     lines = matched_lines if matched_lines is not None else _matching_lines(path, (b'"tool_use"', b'"tool_result"', b'.png'))
     for position, line in enumerate(lines, state.next_position):
             state.next_position = position + 1
@@ -1727,12 +1840,11 @@ def _claude_calls(path: Path, projects: dict[str, tuple[str, ProjectAttribution]
                     _cite(citations, position, outgoing)
                 continue
             if b'"tool_use"' in line:
-                if not (CLAUDE_HINT.search(line) or b'.png' in line
-                        or b'"Write"' in line or b'"Edit"' in line
-                        or script_name_pattern is not None and script_name_pattern.search(line)):
-                    continue
-            elif (pending or pending_writes or pending_citation_writes) and b'"tool_result"' in line:
-                if not any(use_id.encode() in line for use_id in (*pending, *pending_writes, *pending_citation_writes)):
+                pass
+            elif (pending or pending_writes or pending_citation_writes or pending_tool_events) and b'"tool_result"' in line:
+                if not any(use_id.encode() in line for use_id in (
+                    *pending, *pending_writes, *pending_citation_writes, *pending_tool_events,
+                )):
                     continue
             else:
                 continue
@@ -1761,6 +1873,10 @@ def _claude_calls(path: Path, projects: dict[str, tuple[str, ProjectAttribution]
                     if linked is not None and (classified is None or linked.kind == "shot" and classified[0] != "shot"):
                         classified = (linked.kind, linked.source, command)
                     use_id = _string(part.get("id"))
+                    pending_tool_events[use_id] = ClaudeToolEventAwaitingResult(
+                        stamp, _string(row.get("sessionId")) or path.stem, name,
+                        _without_inline_image_data(command),
+                    )
                     written = _write_text(name, value) if b'.png' in line else ""
                     references = _citation_paths(written) if written else ()
                     if references:
@@ -1772,8 +1888,6 @@ def _claude_calls(path: Path, projects: dict[str, tuple[str, ProjectAttribution]
                         _remember_tool(name, value, cwd, scripts)
                     if "<<" in command or name not in {"Write", "Edit"} and "rm" in command:
                         script_names_text = tuple({os.path.basename(script_path) for script_path in scripts})
-                        script_names = tuple(name.encode() for name in script_names_text)
-                        script_name_pattern = re.compile(b"|".join(re.escape(name) for name in script_names)) if script_names else None
                     if classified is None:
                         continue
                     kind, origin, classified_command = classified
@@ -1787,6 +1901,14 @@ def _claude_calls(path: Path, projects: dict[str, tuple[str, ProjectAttribution]
                     )
                 elif part.get("type") == "tool_result":
                     use_id = _string(part.get("tool_use_id"))
+                    tool_event = pending_tool_events.pop(use_id, None)
+                    if tool_event is not None:
+                        tool_events.append(TranscriptToolEvent(
+                            tool_event.start, stamp, tool_event.session, str(path), "Claude",
+                            tool_event.name, parsed_tool_event_category(tool_event.name, tool_event.command),
+                            part.get("is_error") is True,
+                            tool_use_id=use_id,
+                        ))
                     references = pending_citation_writes.pop(use_id, ())
                     if references and _write_succeeded(part.get("content"), part.get("is_error")):
                         citations.append(ImageCitation(position, references))
@@ -1794,8 +1916,6 @@ def _claude_calls(path: Path, projects: dict[str, tuple[str, ProjectAttribution]
                     if write is not None and part.get("is_error") is not True:
                         _remember_tool(write.name, write.value, write.cwd, scripts)
                         script_names_text = tuple({os.path.basename(script_path) for script_path in scripts})
-                        script_names = tuple(name.encode() for name in script_names_text)
-                        script_name_pattern = re.compile(b"|".join(re.escape(name) for name in script_names)) if script_names else None
                     use = pending.pop(use_id, None)
                     if use is None:
                         continue
@@ -1804,8 +1924,14 @@ def _claude_calls(path: Path, projects: dict[str, tuple[str, ProjectAttribution]
                         use.command, _image_count(use.kind, use.source, part.get("content"), use.command, use.script_calls),
                         use.attribution, use.script_path, use.script_paths, use.cwd,
                         _paths(part.get("content")) if use.kind == "shot" else (), (), position,
+                        tool_use_id=use_id,
                     ))
-    return TranscriptEvidence(calls, citations)
+    tool_events.extend(TranscriptToolEvent(
+        event.start, event.start, event.session, str(path), "Claude", event.name,
+        parsed_tool_event_category(event.name, event.command), False,
+        tool_use_id=use_id, unfinished=True,
+    ) for use_id, event in pending_tool_events.items())
+    return TranscriptEvidence(calls, citations, tool_events)
 
 
 def _codex_calls(path: Path, projects: dict[str, tuple[str, ProjectAttribution]],
@@ -1817,11 +1943,11 @@ def _codex_calls(path: Path, projects: dict[str, tuple[str, ProjectAttribution]]
     pending = state.pending_uses
     scripts = state.remembered_scripts
     script_names_text = tuple({os.path.basename(script_path) for script_path in scripts})
-    script_names = tuple(name.encode() for name in script_names_text)
-    script_name_pattern = re.compile(b"|".join(re.escape(name) for name in script_names)) if script_names else None
     calls: list[ToolCall] = []
     citations: list[ImageCitation] = []
+    tool_events: list[TranscriptToolEvent] = []
     pending_citation_writes = state.pending_citations
+    pending_tool_events = state.pending_tool_events
     session = state.session
     project = state.project
     attribution = state.attribution
@@ -1838,8 +1964,8 @@ def _codex_calls(path: Path, projects: dict[str, tuple[str, ProjectAttribution]]
                 continue
             if b'"session_meta"' not in line:
                 if b'"function_call_output"' in line or b'"custom_tool_call_output"' in line:
-                    if not pending and not pending_citation_writes or not any(
-                        use_id.encode() in line for use_id in (*pending, *pending_citation_writes)
+                    if not pending and not pending_citation_writes and not pending_tool_events or not any(
+                        use_id.encode() in line for use_id in (*pending, *pending_citation_writes, *pending_tool_events)
                     ):
                         continue
                 elif b'"message"' in line and b'.png' in line:
@@ -1848,9 +1974,8 @@ def _codex_calls(path: Path, projects: dict[str, tuple[str, ProjectAttribution]]
                     if payload.get("type") == "message" and payload.get("role") == "assistant":
                         _cite(citations, position, _result_text(payload.get("content")))
                     continue
-                elif not (CODEX_HINT.search(line) or b'.png' in line
-                          or script_name_pattern is not None and script_name_pattern.search(line)):
-                    continue
+                else:
+                    pass
             row = _read_json(line.decode("utf-8", errors="replace"))
             stamp = _stamp(row.get("timestamp"))
             payload = _object(row.get("payload"))
@@ -1871,6 +1996,10 @@ def _codex_calls(path: Path, projects: dict[str, tuple[str, ProjectAttribution]]
                     raw_input = parsed if parsed else raw_input
                 call_cwd = _string(_object(raw_input).get("workdir")) or cwd
                 command = _shell_command(name, raw_input)
+                use_id = _string(payload.get("call_id"))
+                pending_tool_events[use_id] = CodexToolEventAwaitingResult(
+                    stamp, name, _without_inline_image_data(command),
+                )
                 if b'.png' in line:
                     outgoing = _outgoing_tool_message(name, raw_input, command)
                     if outgoing:
@@ -1883,15 +2012,13 @@ def _codex_calls(path: Path, projects: dict[str, tuple[str, ProjectAttribution]]
                 written = _write_text(name, raw_input) if b'.png' in line else ""
                 references = _citation_paths(written) if written else ()
                 if references:
-                    pending_citation_writes[_string(payload.get("call_id"))] = references
+                    pending_citation_writes[use_id] = references
                 if name.endswith("apply_patch") or "<<" in command:
                     script_names_text = tuple({os.path.basename(script_path) for script_path in scripts})
-                    script_names = tuple(name.encode() for name in script_names_text)
-                    script_name_pattern = re.compile(b"|".join(re.escape(name) for name in script_names)) if script_names else None
                 if classified is None:
                     continue
                 kind, origin, classified_command = classified
-                pending[_string(payload.get("call_id"))] = CodexToolUseAwaitingResult(
+                pending[use_id] = CodexToolUseAwaitingResult(
                     stamp, kind, origin, _without_inline_image_data(classified_command),
                     linked.path if linked is not None else "",
                     linked.screenshot_calls if linked is not None else 0,
@@ -1899,6 +2026,13 @@ def _codex_calls(path: Path, projects: dict[str, tuple[str, ProjectAttribution]]
                 )
             elif part_type in ("function_call_output", "custom_tool_call_output"):
                 use_id = _string(payload.get("call_id"))
+                tool_event = pending_tool_events.pop(use_id, None)
+                if tool_event is not None:
+                    tool_events.append(TranscriptToolEvent(
+                        tool_event.start, stamp, session, str(path), "Codex", tool_event.name,
+                        parsed_tool_event_category(tool_event.name, tool_event.command),
+                        payload.get("is_error") is True, tool_use_id=use_id,
+                    ))
                 references = pending_citation_writes.pop(use_id, ())
                 if references and _write_succeeded(payload.get("output"), payload.get("is_error")):
                     citations.append(ImageCitation(position, references))
@@ -1910,8 +2044,14 @@ def _codex_calls(path: Path, projects: dict[str, tuple[str, ProjectAttribution]]
                     use.command, _image_count(use.kind, use.source, payload.get("output"), use.command, use.script_calls),
                     attribution, use.script_path, use.script_paths, use.cwd,
                     _paths(payload.get("output")) if use.kind == "shot" else (), (), position,
+                    tool_use_id=use_id,
                 ))
-    return TranscriptEvidence(calls, citations)
+    tool_events.extend(TranscriptToolEvent(
+        event.start, event.start, session, str(path), "Codex", event.name,
+        parsed_tool_event_category(event.name, event.command), False,
+        tool_use_id=use_id, unfinished=True,
+    ) for use_id, event in pending_tool_events.items())
+    return TranscriptEvidence(calls, citations, tool_events)
 
 
 def _scan_file(file: tuple[Agent, Path]) -> TranscriptEvidence:
@@ -2017,8 +2157,10 @@ def _new_file_evidence(file: tuple[Agent, Path, str], candidate: bool = True) ->
         read = TranscriptContentRead(0)
         evidence = _parse_lines(path, agent, _appended_lines(path, agent, read), progress)
         cursor = read.cursor
-    evidence = TranscriptEvidence([replace(call, source_host=source_host) for call in evidence.calls],
-                                  evidence.citations)
+    evidence = TranscriptEvidence(
+        [replace(call, source_host=source_host) for call in evidence.calls], evidence.citations,
+        [replace(event, source_host=source_host) for event in evidence.tool_events],
+    )
     return CachedTranscriptEvidence(agent, source_host, stat.st_dev, stat.st_ino, cursor, stat.st_size,
                                     stat.st_mtime_ns, evidence, progress, True)
 
@@ -2028,6 +2170,10 @@ def _append_file_evidence(prior: CachedTranscriptEvidence, path: Path, stat: os.
     fresh = _parse_lines(path, prior.agent, _appended_lines(path, prior.agent, read), prior.progress)
     prior.evidence.calls.extend(replace(call, source_host=prior.source_host) for call in fresh.calls)
     prior.evidence.citations.extend(fresh.citations)
+    fresh_event_ids = {event.tool_use_id for event in fresh.tool_events}
+    prior.evidence.tool_events[:] = [event for event in prior.evidence.tool_events
+                                     if event.tool_use_id not in fresh_event_ids]
+    prior.evidence.tool_events.extend(replace(event, source_host=prior.source_host) for event in fresh.tool_events)
     prior.device, prior.inode = stat.st_dev, stat.st_ino
     prior.cursor, prior.observed_size, prior.modified_ns = read.cursor, stat.st_size, stat.st_mtime_ns
     prior.candidate = prior.candidate or read.has_matching_line
@@ -2073,6 +2219,13 @@ def _joined_calls(evidence: Iterable[TranscriptEvidence], records: list[Invocati
                 call = replace(call, project=max(matches, key=len), project_attribution="removed_worktree")
         folded.append(call)
     return folded
+
+
+def _joined_tool_events(evidence: Iterable[TranscriptEvidence]) -> list[TranscriptToolEvent]:
+    return sorted(
+        (event for item in evidence for event in item.tool_events),
+        key=lambda event: (event.start, event.end, event.transcript_path, event.session_id, event.tool_use_id),
+    )
 
 
 def _cached_scan(claude_root: Path, codex_root: Path, timing_source: TimingSource,
@@ -2148,7 +2301,7 @@ def _cached_scan(claude_root: Path, codex_root: Path, timing_source: TimingSourc
     evidence = [item.evidence for item in saved.files.values()]
     calls = _joined_calls(evidence, records)
     candidate_count = sum(item.candidate for item in saved.files.values())
-    return TranscriptScan(calls, candidate_count, bytes_read, records)
+    return TranscriptScan(calls, candidate_count, bytes_read, records, _joined_tool_events(evidence))
 
 
 def scan_calls(claude_root: Path, codex_root: Path, timings_path: Path | TimingSource = NO_TIMING_SOURCE,
@@ -2170,15 +2323,17 @@ def scan_calls(claude_root: Path, codex_root: Path, timings_path: Path | TimingS
     else:
         for file in ordered:
             evidence.append(_scan_file(file))
-    evidence = [TranscriptEvidence([replace(call, source_host=source_host) for call in item.calls], item.citations)
-                for item in evidence]
+    evidence = [TranscriptEvidence(
+        [replace(call, source_host=source_host) for call in item.calls], item.citations,
+        [replace(event, source_host=source_host) for event in item.tool_events],
+    ) for item in evidence]
     records = (_timing_invocations(timing_source.path, timing_source.source_host)[0]
                if isinstance(timing_source, AvailableTimingSource) else [])
     calls = _joined_calls(evidence, records)
     content_bytes = sum(size for size, _, _ in sized)
     if isinstance(timing_source, AvailableTimingSource) and timing_source.path.exists():
         content_bytes += timing_source.path.stat().st_size
-    return TranscriptScan(calls, len(files), content_bytes, records)
+    return TranscriptScan(calls, len(files), content_bytes, records, _joined_tool_events(evidence))
 
 
 def survey_counts(calls: Iterable[ToolCall]) -> dict[str, tuple[int, int, int]]:
