@@ -10,6 +10,7 @@ import tempfile
 import unittest
 from collections.abc import Callable
 from contextlib import redirect_stdout
+from datetime import datetime
 from pathlib import Path
 from typing import cast
 from unittest.mock import patch
@@ -42,6 +43,12 @@ def run_cli(*arguments: str) -> tuple[int, str]:
 
 def read_json(path: Path) -> JsonRecord:
     return cast(JsonRecord, json.loads(path.read_text(encoding="utf-8")))
+
+
+def record(parent: JsonRecord, key: str) -> JsonRecord:
+    value = parent[key]
+    assert isinstance(value, dict)
+    return cast(JsonRecord, value)
 
 
 def read_lines(path: Path) -> list[JsonRecord]:
@@ -416,6 +423,40 @@ class CarryForwardTests(unittest.TestCase):
 
 
 class HistoryTests(unittest.TestCase):
+    def test_history_keeps_raw_and_net_percent_and_reads_legacy_row(self) -> None:
+        first = comparison_fixture()
+        pooled = first["pooled"]
+        assert pooled is not None
+        differences = pooled["differences"]
+        assert differences is not None
+        differences["net_seconds"].update({"value": -5, "low": -7,
+                                           "high": -3, "label": "faster"})
+        earlier = study_report.history_row(first, phase_fixture(), datetime.fromisoformat(FIRST), False)
+        self.assertEqual(earlier["pooled"]["change_percent"], -50)
+        self.assertEqual(earlier["pooled"]["net_change_percent"], -25)
+
+        later_comparison = copy.deepcopy(first)
+        later_pooled = later_comparison["pooled"]
+        assert later_pooled is not None
+        later_differences = later_pooled["differences"]
+        assert later_differences is not None
+        later_differences["net_seconds"]["value"] = -7
+        later = study_report.history_row(later_comparison, phase_fixture(),
+                                         datetime.fromisoformat(SECOND), False)
+        self.assertEqual(later["pooled"]["net_change_percent"], -35)
+        since = "\n".join(study_report.since_lines(study_report.FollowingRun(later, earlier)))
+        self.assertIn("net", since)
+        self.assertIn("-25.00%", since)
+        self.assertIn("-35.00%", since)
+
+        legacy = copy.deepcopy(earlier)
+        _ = cast(JsonRecord, cast(object, legacy["pooled"])).pop("net_change_percent")
+        for row in legacy["directors"]:
+            _ = cast(JsonRecord, cast(object, row)).pop("net_change_percent", None)
+        legacy_since = "\n".join(study_report.since_lines(study_report.FollowingRun(later, legacy)))
+        self.assertIn("-50.00%", legacy_since)
+        self.assertNotIn("-25.00%", legacy_since)
+
     def test_render_and_message_without_history_omit_since_last_run(self) -> None:
         comparison = comparison_fixture()
         phase_data = phase_fixture()
@@ -619,6 +660,23 @@ class ResultsTests(unittest.TestCase):
             root = Path(temporary)
             prepare_report(root)
             comparison = comparison_fixture()
+            pooled = comparison["pooled"]
+            assert pooled is not None
+            differences = pooled["differences"]
+            assert differences is not None
+            differences["seconds"]["label"] = "faster"
+            differences["net_seconds"].update({"value": -5, "low": -7,
+                                                "high": -3, "label": "faster"})
+            comparison["control"]["pooled"] = {
+                "before_n": 40, "after_n": 40, "before_median": 25,
+                "after_median": 20, "change_seconds": -5,
+            }
+            comparison["control"]["directors"].append({
+                "name": "clock", "before_n": 40, "after_n": 40,
+                "before_median": 25, "after_median": 20,
+                "difference": {"value": -5, "low": -5, "high": -5,
+                               "label": "faster", "opus_n": 40, "sonnet_n": 40},
+            })
             phase_data = phase_fixture()
             docs = root / "docs"
             with patch.object(model_study, "compare", side_effect=comparison_writer(comparison)), \
@@ -641,6 +699,10 @@ class ResultsTests(unittest.TestCase):
             parsed = read_json(json_path)
             self.assertEqual(set(parsed), {"compare", "phases", "history"})
             self.assertEqual(len(cast(list[JsonRecord], parsed["history"])), 1)
+            saved_pooled = record(cast(JsonRecord, parsed["compare"]), "pooled")
+            self.assertEqual(record(record(saved_pooled, "differences"), "net_seconds")["value"], -5)
+            saved_history = cast(list[JsonRecord], parsed["history"])[0]
+            self.assertEqual(record(saved_history, "pooled")["net_change_percent"], -25)
             document = first_markdown.decode()
             self.assertTrue(document.startswith("Sample as of 2026-10-06 19:00 PDT"))
             headings = ["Question", "Data", "Method", "The user's measure", "Per-director comparison",
@@ -653,7 +715,8 @@ class ResultsTests(unittest.TestCase):
             self.assertIn("2026-10-07 10:30 PDT", document)
             self.assertIn("python3 scripts/model_study/model_study.py results", document)
             self.assertIn("~/.local/state/model-study/turns.jsonl", document)
-            self.assertIn("Time: median continuation seconds ", document)
+            self.assertIn("Time: median continuation seconds faster net of the clock (Opus 20.00; Sonnet 10.00; raw -50.0%; net -5.00 s, interval [-7.00, -3.00])", document)
+            self.assertIn("2026-10-06 09:30 PDT", document.split("## Limits", 1)[1])
             self.assertIn("Tokens and cost: median output tokens per request ", document)
             self.assertIn("mean cost in dollars per request ", document)
             self.assertIn("Turns and repair rounds: requests per 1,000 words ", document)

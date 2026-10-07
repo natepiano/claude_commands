@@ -12,9 +12,9 @@ from pathlib import Path
 from typing import Literal, cast
 
 if __package__:
-    from .transcripts import ExactOrderedCaptureAttempts, ToolCall
+    from .transcripts import AttemptCountInferredFromImages, ExactOrderedCaptureAttempts, ToolCall
 else:
-    from transcripts import ExactOrderedCaptureAttempts, ToolCall  # pyright: ignore[reportImplicitRelativeImport]
+    from transcripts import AttemptCountInferredFromImages, ExactOrderedCaptureAttempts, ToolCall  # pyright: ignore[reportImplicitRelativeImport]
 
 Method = Literal["by hand", "/hana_shot"]
 ScreenshotSource = Literal[
@@ -70,6 +70,8 @@ class Episode:
     transcript_path: str
     session_id: str
     kept_shot: KeptShotEvidence
+    attempt_count_evidence: ExactOrderedCaptureAttempts | AttemptCountInferredFromImages = AttemptCountInferredFromImages()
+    source_host: str = "local"
 
     @property
     def minutes(self) -> float:
@@ -117,6 +119,7 @@ def _episode(calls: list[ToolCall], gap_seconds: int) -> Episode | None:
     method: Method = "/hana_shot" if any(call.source == "hana_shot" for call in shots) else "by hand"
     sources = cast(ScreenshotSources, frozenset(call.source for call in shots))
     cited_shots = [call for call in shots if call.cited_image_paths]
+    exact = False
     if cited_shots:
         first_kept = cited_shots[0]
         before = sum(len(_capture_paths(call)) for call in shots[:shots.index(first_kept)])
@@ -125,6 +128,8 @@ def _episode(calls: list[ToolCall], gap_seconds: int) -> Episode | None:
         cited_attempt_count = sum(len(_cited_attempt_indices(call)) for call in cited_shots)
         evidence: KeptShotEvidence = (OneCitedShot(before) if cited_attempt_count == 1
                                      else SeveralCitedShots(before, cited_attempt_count))
+        exact = all(isinstance(call.attempt_evidence, ExactOrderedCaptureAttempts)
+                    for call in shots[:shots.index(first_kept) + 1])
     elif any(call.image_paths for call in shots):
         evidence = NoneCited()
     else:
@@ -137,6 +142,8 @@ def _episode(calls: list[ToolCall], gap_seconds: int) -> Episode | None:
         other_call_count=sum(call.kind == "other" for call in calls),
         transcript_path=first.transcript_path, session_id=first.session_id,
         kept_shot=evidence,
+        attempt_count_evidence=(ExactOrderedCaptureAttempts(()) if exact else AttemptCountInferredFromImages()),
+        source_host=first.source_host,
     )
 
 
@@ -167,7 +174,9 @@ def write_episodes(path: Path, episodes: Iterable[Episode]) -> None:
                 record["start"] = episode.start.isoformat()
                 record["end"] = episode.end.isoformat()
                 record.pop("kept_shot")
+                record.pop("attempt_count_evidence")
                 record["kept_shot_state"] = _evidence_name(episode.kept_shot)
+                record["attempt_count_evidence_state"] = type(episode.attempt_count_evidence).__name__
                 if isinstance(episode.kept_shot, (OneCitedShot, SeveralCitedShots)):
                     record["attempts_before_first_kept_shot"] = episode.kept_shot.attempts_before_first_kept_shot
                 if isinstance(episode.kept_shot, SeveralCitedShots):
@@ -227,6 +236,10 @@ def read_episodes(path: Path) -> list[Episode]:
                     transcript_path=str(record["transcript_path"]),
                     session_id=str(record["session_id"]),
                     kept_shot=evidence,
+                    attempt_count_evidence=(ExactOrderedCaptureAttempts(())
+                                            if record.get("attempt_count_evidence_state") == "ExactOrderedCaptureAttempts"
+                                            else AttemptCountInferredFromImages()),
+                    source_host=str(record.get("source_host", "local")),
                 ))
             except (KeyError, TypeError, ValueError, OverflowError):
                 continue

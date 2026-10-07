@@ -85,6 +85,7 @@ def director(
     differences = None if status not in ("switched", "pooled") else {
         "seconds": estimate("no measurable difference", sonnet_seconds - opus_seconds
                             if opus_seconds is not None and sonnet_seconds is not None else None),
+        "net_seconds": estimate("no control", None, opus_n, sonnet_n),
         "output": estimate("no measurable difference", -40),
         "cost": estimate("no measurable difference", -0.01),
     }
@@ -114,7 +115,11 @@ def comparison_fixture() -> ComparisonReport:
     alpha = director("alpha", "switched", 40, 50, 20, 10)
     beta = director("beta", "switched", 40, 50, None, 8)
     pooled = director("Pooled switched", "pooled", 80, 100, 20, 10)
-    control: ConcurrentControl = {"at_pdt": "2026-10-06 09:30 PDT", "directors": []}
+    control: ConcurrentControl = {
+        "at_pdt": "2026-10-06 09:30 PDT", "directors": [],
+        "pooled": {"before_n": 0, "after_n": 0, "before_median": None,
+                   "after_median": None, "change_seconds": None},
+    }
     return {
         "baseline_requests": 300, "prices_usd_per_million": {},
         "directors": [alpha, beta, director("gamma", "Sonnet-only", 0, 30, None, 9),
@@ -175,6 +180,51 @@ def extract_fixture() -> ExtractReport:
 
 
 class ReportTests(unittest.TestCase):
+    def test_time_verdict_uses_net_label_and_measure_shows_both_changes(self) -> None:
+        comparison = comparison_fixture()
+        phases = phase_fixture()
+        pooled = comparison["pooled"]
+        assert pooled is not None
+        pooled_differences = pooled["differences"]
+        assert pooled_differences is not None
+        pooled_differences["seconds"]["label"] = "faster"
+        pooled_differences["net_seconds"] = {
+            "value": -5, "low": -7, "high": -3, "label": "faster",
+            "opus_n": 80, "sonnet_n": 100,
+        }
+        alpha_differences = comparison["directors"][0]["differences"]
+        assert alpha_differences is not None
+        alpha_differences["net_seconds"] = estimate("faster", -5)
+        comparison["control"]["pooled"] = {
+            "before_n": 45, "after_n": 40, "before_median": 25,
+            "after_median": 20, "change_seconds": -5,
+        }
+        comparison["control"]["directors"].append({
+            "name": "clock", "before_n": 45, "after_n": 40,
+            "before_median": 25, "after_median": 20,
+            "difference": estimate("faster", -5, 45, 40),
+        })
+        document = render(comparison, phases, extract_fixture(), NOW)
+        self.assertIn("time: pooled continuation seconds faster net of the clock (raw faster)", document)
+        self.assertIn("Pooled switched: median continuation-turn seconds Opus 20.00 → Sonnet 10.00 (-50.0%); net of the clock -5.00 s (-25.0% of the Opus median), 95% interval [-7.00, -3.00] s — faster", document)
+        self.assertIn("2026-10-06 09:30 PDT", document)
+        self.assertIn("45", document.split("## Control", 1)[1])
+        self.assertIn("40", document.split("## Control", 1)[1])
+        limits = document.split("## Limits\n\n", 1)[1]
+        self.assertIn("2026-10-06 09:30 PDT", limits)
+        self.assertIn("45", limits)
+        self.assertIn("40", limits)
+        self.assertEqual(verdict(comparison, phases), "sonnet")
+        self.assertIn("continuation time is faster", recommendation_line(comparison, phases))
+
+        pooled_differences["net_seconds"]["label"] = "no measurable difference"
+        pooled_differences["cost"]["label"] = "too few"
+        self.assertEqual(verdict(comparison, phases),
+                         "sonnet stays (no measurable difference; evidence thin)")
+        self.assertNotIn("faster", recommendation_line(comparison, phases))
+        self.assertLessEqual(len(message(comparison, phases, extract_fixture(), NOW, False,
+                                         Path("/tmp/synthetic-state/report.md")).splitlines()), 60)
+
     def test_cost_alone_can_recommend_sonnet(self) -> None:
         comparison = comparison_fixture()
         phases = phase_fixture()
@@ -182,7 +232,7 @@ class ReportTests(unittest.TestCase):
         assert pooled is not None
         differences = pooled["differences"]
         assert differences is not None
-        differences["seconds"]["label"] = "too few"
+        differences["net_seconds"]["label"] = "too few"
         differences["cost"]["label"] = "lower"
 
         self.assertEqual(verdict(comparison, phases), "sonnet")
@@ -202,19 +252,19 @@ class ReportTests(unittest.TestCase):
         assert differences is not None
         work = phases["comparisons"][-1]["metrics"]
 
-        differences["seconds"]["label"] = "slower"
+        differences["net_seconds"]["label"] = "slower"
         differences["cost"]["label"] = "lower"
         self.assertEqual(verdict(comparison, phases), "opus")
         self.assertIn("continuation time", recommendation_line(comparison, phases))
 
-        differences["seconds"]["label"] = "too few"
+        differences["net_seconds"]["label"] = "too few"
         work["requests_per_1000_words"]["label"] = "more"
         self.assertEqual(verdict(comparison, phases), "opus")
         self.assertIn("requests per 1,000", recommendation_line(comparison, phases))
 
         work["requests_per_1000_words"]["label"] = "too few phases (n=2 against 3)"
         work["repair_rounds"]["label"] = "more"
-        differences["seconds"]["label"] = "faster"
+        differences["net_seconds"]["label"] = "faster"
         self.assertEqual(verdict(comparison, phases), "opus")
         self.assertIn("repair rounds", recommendation_line(comparison, phases))
 
@@ -222,10 +272,10 @@ class ReportTests(unittest.TestCase):
         self.assertEqual(verdict(comparison, phases), "sonnet")
 
         differences["cost"]["label"] = "too few"
-        differences["seconds"]["label"] = "faster"
+        differences["net_seconds"]["label"] = "faster"
         self.assertEqual(verdict(comparison, phases), "sonnet")
 
-        differences["seconds"]["label"] = "too few"
+        differences["net_seconds"]["label"] = "too few"
         self.assertEqual(verdict(comparison, phases), "sonnet stays (no measurable difference; evidence thin)")
 
     def test_report_orders_measure_before_verdict_and_shows_limits(self) -> None:
@@ -243,8 +293,8 @@ class ReportTests(unittest.TestCase):
                          sorted(document.index(heading) for heading in headings))
         measure = document.split("## The user's measure\n\n", 1)[1].split("\n\n## Verdict", 1)[0].splitlines()
         self.assertEqual(len(measure), 3)
-        self.assertIn("alpha: median continuation-turn seconds Opus 20.00 → Sonnet 10.00 (-50.0%)", measure)
-        self.assertIn("beta: median continuation-turn seconds Opus n/a → Sonnet 8.00", measure)
+        self.assertTrue(any(line.startswith("alpha: median continuation-turn seconds Opus 20.00 → Sonnet 10.00 (-50.0%); net of the clock n/a (no control director qualified)") for line in measure))
+        self.assertTrue(any(line.startswith("beta: median continuation-turn seconds Opus n/a → Sonnet 8.00; net of the clock n/a") for line in measure))
         self.assertNotIn("%", next(line for line in measure if line.startswith("beta:")))
         self.assertTrue(measure[-1].startswith("Pooled switched: median continuation-turn seconds"))
         self.assertIn("work: requests per 1,000 Work Order words too few phases (n=2 against 3)", document)
@@ -260,6 +310,37 @@ class ReportTests(unittest.TestCase):
         self.assertIn("Phase drops: stopped 5, errored 2, no request 75", document)
         self.assertIn("Compaction duration unknown", document)
         self.assertNotIn(SECRET, document)
+
+    def test_director_table_marks_raw_change_while_control_header_keeps_delta(self) -> None:
+        comparison = comparison_fixture()
+        alpha = comparison["directors"][0]
+        differences = alpha["differences"]
+        assert differences is not None
+        differences["seconds"]["label"] = "faster"
+        differences["net_seconds"] = estimate("no measurable difference", 0)
+        comparison["control"]["directors"].append({
+            "name": "clock", "before_n": 30, "after_n": 30,
+            "before_median": 25, "after_median": 25,
+            "difference": estimate("no measurable difference", 0, 30, 30),
+        })
+        document = render(comparison, phase_fixture(), extract_fixture(), NOW)
+
+        director_section = document.split("## Per-director comparison\n\n", 1)[1].split(
+            "\n\n## Pooled turn classes", 1
+        )[0]
+        control_section = document.split("## Control\n\n", 1)[1].split(
+            "\n\n## Compactions", 1
+        )[0]
+        director_header = next(line for line in director_section.splitlines()
+                               if line.startswith("| Director |"))
+        control_header = next(line for line in control_section.splitlines()
+                              if line.startswith("| Director |"))
+        self.assertIn("| Raw Δ seconds and label |", director_header)
+        self.assertIn("| Δ seconds and label |", control_header)
+        self.assertNotIn("| Raw Δ seconds and label |", control_header)
+        self.assertIn("| alpha | 40 | 50 |", director_section)
+        self.assertIn("-10.00 (faster)", director_section)
+        self.assertIn("net of the clock +0.00 s", document)
 
     def test_work_comparisons_follow_phase_entries_even_for_sonnet_only_director(self) -> None:
         comparison = comparison_fixture()
@@ -312,7 +393,7 @@ class ReportTests(unittest.TestCase):
         document = render(comparison, phase_fixture(), extract_fixture(), NOW)
         measure = document.split("## The user's measure\n\n", 1)[1].split("\n\n## Verdict", 1)[0]
         alpha_line = next(line for line in measure.splitlines() if line.startswith("alpha:"))
-        self.assertEqual(alpha_line, "alpha: median continuation-turn seconds Opus n/a → Sonnet 10.00")
+        self.assertTrue(alpha_line.startswith("alpha: median continuation-turn seconds Opus n/a → Sonnet 10.00; net of the clock n/a"))
         self.assertNotIn("%", alpha_line)
 
     def test_null_control_median_is_dash(self) -> None:

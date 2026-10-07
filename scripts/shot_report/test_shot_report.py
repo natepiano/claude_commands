@@ -3,19 +3,27 @@
 from __future__ import annotations
 
 import json
+import base64
+import os
 import re
+import shlex
 import subprocess
 import sys
 import tempfile
 import unittest
 from dataclasses import replace
+from datetime import datetime, timedelta
 from pathlib import Path
-from typing import ClassVar, NotRequired, TypedDict, cast, override
+from typing import BinaryIO, ClassVar, NotRequired, TypedDict, cast, override
+from unittest import mock
 
+from scripts.shot_report import shot_report as report_module
+from scripts.shot_report.changes import Change, append_change, read_changes, write_changes
 from scripts.shot_report.episodes import (
     LegacyEvidenceUnavailable, NoObservablePath, NoneCited, OneCitedShot,
     SeveralCitedShots, read_episodes, write_episodes,
 )
+from scripts.shot_report.transcripts import ExactOrderedCaptureAttempts, SuccessfulCapture
 
 
 class EpisodeRecord(TypedDict):
@@ -132,6 +140,8 @@ class ShotReportTest(unittest.TestCase):
 
     def test_episode_file_has_both_splits_and_scan_replaces_it(self) -> None:
         self.assertEqual(len(self.records), 13)
+        self.assertTrue((self.state_dir / "scan-cache.pickle").exists())
+        self.assertIn("b01a299", {change.commit for change in read_changes(self.state_dir / "changes.json")})
         self.assertEqual({record["split"] for record in self.records}, {300, 900})
         for record in self.records:
             self.assertIn(record["agent"], {"Claude", "Codex"})
@@ -182,20 +192,27 @@ class ShotReportTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             state_dir = Path(directory)
             write_episodes(state_dir / "episodes.jsonl",
-                           [replace(baseline, kept_shot=state) for state in evidence])
+                           [replace(baseline, kept_shot=state,
+                                    attempt_count_evidence=(ExactOrderedCaptureAttempts((SuccessfulCapture(("shot.png",)),))
+                                                            if index == 0 else baseline.attempt_count_evidence))
+                            for index, state in enumerate(evidence)])
             with (state_dir / "episodes.jsonl").open("a", encoding="utf-8") as target:
                 _ = target.write("{broken json\n")
                 _ = target.write('{"start":"2026-10-01T00:00:00Z","end":"2026-10-01T00:00:01Z",' +
                                  '"method":"by hand","source":[]}\n')
             self.assertEqual(len(read_episodes(state_dir / "episodes.jsonl")), 5)
+            self.assertIsInstance(read_episodes(state_dir / "episodes.jsonl")[0].attempt_count_evidence,
+                                  ExactOrderedCaptureAttempts)
             result = subprocess.run([sys.executable, str(COMMAND), "report", "--state-dir", str(state_dir)],
                                     cwd=HERE, capture_output=True, text=True, check=False)
         self.assertEqual(result.returncode, 0, result.stderr)
         header = next(line for line in result.stdout.splitlines() if line.startswith("split_s"))
         self.assertIn("no_observable_path", header)
+        self.assertIn("exact_first_kept_n", header)
+        self.assertIn("inferred_first_kept_n", header)
         row = next(line for line in result.stdout.splitlines() if line.startswith("300 "))
-        self.assertEqual(re.split(r"\s{2,}", row.strip())[-9:],
-                         ["5", "1", "1", "1", "1", "1", "2", "1.5", "1.9"])
+        self.assertEqual(re.split(r"\s{2,}", row.strip())[-14:],
+                         ["5", "1", "4", "1", "1", "1", "1", "1", "1", "2.0", "2.0", "1", "1.0", "1.0"])
 
     def test_hana_shot_episode_counts_distinct_images_and_calls(self) -> None:
         image_episode = next(
@@ -291,6 +308,474 @@ class ShotReportTest(unittest.TestCase):
         self.assertIn("mcp_brp 4 2 1 yes", result.stdout)
         self.assertIn("bash_brp 1 1 1 yes", result.stdout)
         self.assertIn("hana_shot 3 3 1 yes", result.stdout)
+
+    def test_changes_seed_once_and_preserve_approved_append(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "changes.json"
+            changes = read_changes(path)
+            self.assertTrue(path.exists())
+            self.assertIn("b01a299", {change.commit for change in changes})
+            self.assertIn("dab07788", {change.commit for change in changes})
+            recording = next(change for change in changes if change.commit == "e6c96fb")
+            self.assertTrue(recording.measurement_change)
+            added = Change("claude", "approved123", "Faster crop", datetime.fromisoformat("2026-10-08T00:00:00+00:00"),
+                           ("natedev",))
+            append_change(path, added)
+            append_change(path, added)
+            self.assertEqual(sum(change.commit == "approved123" for change in read_changes(path)), 1)
+
+    def test_hourly_guard_skips_same_utc_hour_and_resumes_next_hour(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            state_dir = Path(directory)
+            calls: list[datetime] = []
+
+            def fake_scan(state: Path, _claude: Path, _codex: Path,
+                          _timing: object, _mac: bool) -> str:
+                stamp = datetime.fromisoformat("2026-10-06T22:05:00+00:00") if not calls else datetime.fromisoformat("2026-10-06T23:05:00+00:00")
+                calls.append(stamp)
+                report_module._save_object(state / "scan_status.json", {"last_success": stamp.isoformat()})  # pyright: ignore[reportPrivateUsage]
+                return "scanned"
+
+            with mock.patch.object(report_module, "scan", side_effect=fake_scan):
+                self.assertEqual(report_module.scan_hourly(state_dir, datetime.fromisoformat("2026-10-06T22:05:00+00:00")), "scanned")
+                self.assertIn("skipped", report_module.scan_hourly(state_dir, datetime.fromisoformat("2026-10-06T22:45:00+00:00")))
+                self.assertEqual(report_module.scan_hourly(state_dir, datetime.fromisoformat("2026-10-06T23:05:00+00:00")), "scanned")
+            self.assertEqual(len(calls), 2)
+
+    def test_change_windows_show_both_splits_and_incomplete_host(self) -> None:
+        baseline = next(episode for episode in read_episodes(self.state_dir / "episodes.jsonl") if episode.split == 300)
+        change_time = datetime.fromisoformat("2026-10-01T00:30:00+00:00")
+        with tempfile.TemporaryDirectory() as directory:
+            state_dir = Path(directory)
+            records = [
+                replace(baseline, split=split, method=method, source_host="natedev",
+                        start=change_time + delta, end=change_time + delta + timedelta(minutes=2))
+                for split in (300, 900) for method, delta in (
+                    ("by hand", timedelta(minutes=-15)), ("/hana_shot", timedelta(minutes=15)))
+            ]
+            write_episodes(state_dir / "episodes.jsonl", records)
+            write_changes(state_dir / "changes.json", [
+                Change("claude", "rollout", "Introduce /hana_shot", change_time, ("natedev", "mac")),
+                Change("claude", "recording", "Log calls", change_time + timedelta(hours=1), ("natedev",), True),
+            ])
+            report_module._save_object(state_dir / "scan_status.json", {  # pyright: ignore[reportPrivateUsage]
+                "last_success": "2026-10-02T00:00:00+00:00",
+                "host_last_success": {"natedev": "2026-10-02T00:00:00+00:00"},
+            })
+            output = report_module.report(state_dir)
+        self.assertIn("rollout by hand 300s before", output)
+        self.assertIn("rollout /hana_shot 900s after", output)
+        self.assertIn("too small to judge", output)
+        self.assertIn("incomplete:mac", output)
+        self.assertIn("Measurement change claude recording", output)
+        self.assertIn("Weekly agent-hours", output)
+
+    def test_invocation_table_counts_failures_without_transcript_and_attempt_phases(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            state_dir = Path(directory)
+            records: list[dict[str, object]] = [
+                {"time": "2026-10-01T00:00:00+00:00", "status": "success", "invocation_kind": "shot",
+                 "attempts": [{"status": "success", "mode": "fit", "crop": "rect", "resolve_ms": 10, "total_ms": 100},
+                              {"status": "failure", "failure_reason": "empty_crop", "image_paths": []}]},
+                {"time": "2026-10-01T00:01:00+00:00", "status": "failure", "failure_reason": "timeout",
+                 "invocation_kind": "shot", "attempts": []},
+                {"time": "2026-10-01T00:02:00+00:00", "invocation_kind": "unknown", "mode": "pose",
+                 "crop": "none", "total_ms": 200},
+                {"time": "2026-10-01T00:03:00+00:00", "status": "success", "invocation_kind": "views_check",
+                 "attempts": [{"status": "success", "mode": "fit", "crop": "none", "total_ms": 90}]},
+            ]
+            _ = (state_dir / "invocations.jsonl").write_text(
+                "".join(json.dumps(record) + "\n" for record in records), encoding="utf-8")
+            output = report_module.report(state_dir, since="2026-09-30", until="2026-10-02")
+        self.assertIn("kind=shot n=2 success=1 failure=1 legacy_success=0", output)
+        self.assertIn("kind=views_check n=1 success=1", output)
+        self.assertIn("kind=unknown n=1 success=0 failure=0 legacy_success=1", output)
+        self.assertIn("failure_reason=timeout n=1", output)
+        self.assertIn("failure_reason=empty_crop n=1", output)
+        self.assertIn("failure_reason=shot_failed n=0", output)
+        self.assertIn("kind=shot mode=fit crop=rect n=1 resolve_ms=10.0(n=1)", output)
+
+    def test_winter_window_names_pst_with_offset(self) -> None:
+        stamp = datetime.fromisoformat("2026-01-10T12:00:00+00:00")
+        self.assertIn("PST (-0800)", report_module._pacific(stamp))  # pyright: ignore[reportPrivateUsage]
+
+    def test_winter_report_heading_names_zone_and_both_offsets(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            heading = report_module.report(Path(directory), "2026-01-10", "2026-01-11").splitlines()[0]
+        self.assertIn("America/Los_Angeles", heading)
+        self.assertEqual(heading.count("PST (-0800)"), 2)
+
+    def test_change_window_stops_at_other_repository_change_on_same_host(self) -> None:
+        baseline = next(episode for episode in read_episodes(self.state_dir / "episodes.jsonl") if episode.split == 300)
+        rollout = datetime.fromisoformat("2026-10-01T00:30:00+00:00")
+        with tempfile.TemporaryDirectory() as directory:
+            state_dir = Path(directory)
+            write_episodes(state_dir / "episodes.jsonl", [
+                replace(baseline, project="project-a", source_host="natedev", method="by hand",
+                        start=rollout - timedelta(minutes=5), end=rollout - timedelta(minutes=4)),
+                replace(baseline, project="project-b", source_host="natedev", method="/hana_shot",
+                        start=rollout + timedelta(minutes=15), end=rollout + timedelta(minutes=16)),
+                replace(baseline, project="project-c", source_host="natedev", method="/hana_shot",
+                        start=rollout + timedelta(minutes=25), end=rollout + timedelta(minutes=26)),
+            ])
+            write_changes(state_dir / "changes.json", [
+                Change("claude", "rollout", "Introduce /hana_shot", rollout, ("natedev",)),
+                Change("claude", "mac-only", "Mac display", rollout + timedelta(minutes=10), ("mac",)),
+                Change("bevy_brp", "crop", "Crop in extras", rollout + timedelta(minutes=20), ("natedev",)),
+            ])
+            report_module._save_object(state_dir / "scan_status.json", {  # pyright: ignore[reportPrivateUsage]
+                "host_last_success": {"natedev": "2026-10-02T00:00:00+00:00"},
+            })
+            output = report_module.report(state_dir)
+        row = next(line for line in output.splitlines()
+                   if line.startswith("claude rollout /hana_shot 300s after host=natedev"))
+        self.assertIn("n=1 median_min=1.0", row)
+        self.assertIn(report_module._pacific(rollout + timedelta(minutes=20)), row)  # pyright: ignore[reportPrivateUsage]
+        self.assertNotIn(report_module._pacific(rollout + timedelta(minutes=10)), row)  # pyright: ignore[reportPrivateUsage]
+
+    def test_mac_reader_filters_nonmatching_files_and_reexamines_changes(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory)
+            root = home / ".codex/sessions"
+            root.mkdir(parents=True)
+            candidate = root / "candidate.jsonl"
+            ordinary = root / "ordinary.jsonl"
+            _ = candidate.write_bytes(b'{"type":"session_meta"}\n{"cmd":"hana_shot.py shot"}\n')
+            _ = ordinary.write_bytes(b'{"type":"session_meta"}\n{"message":"hello"}\n')
+            source = report_module._mac_reader_source()  # pyright: ignore[reportPrivateUsage]
+
+            def read(prior: dict[str, object]) -> list[dict[str, object]]:
+                result = subprocess.run([sys.executable, "-c", source], input=json.dumps(prior),
+                                        capture_output=True, text=True, timeout=10, check=False,
+                                        env={**os.environ, "HOME": directory})
+                self.assertEqual(result.returncode, 0, result.stderr)
+                return [cast(dict[str, object], json.loads(line)) for line in result.stdout.splitlines()]
+
+            first = read({})
+            files = {str(row["key"]): row for row in first if row.get("kind") == "file"}
+            self.assertIs(files["codex/candidate.jsonl"]["matched"], True)
+            self.assertIs(files["codex/ordinary.jsonl"]["matched"], False)
+            self.assertEqual({row["key"] for row in first if row.get("kind") == "chunk"},
+                             {"codex/candidate.jsonl"})
+            prior: dict[str, object] = {}
+            for key, row in files.items():
+                received = sum(len(base64.b64decode(str(chunk["data"]))) for chunk in first
+                               if chunk.get("kind") == "chunk" and chunk.get("key") == key)
+                prior[key] = {"size": row["size"], "inode": row["inode"], "mtime": row["mtime"],
+                              "matched": row["matched"], "cursor": int(str(row["start"])) + received}
+            second = read(prior)
+            self.assertFalse(any(row.get("kind") == "chunk" for row in second))
+            with ordinary.open("ab") as stream:
+                _ = stream.write(b'{"cmd":"hana_shot.py shot"}\n')
+            third = read(prior)
+            changed = next(row for row in third if row.get("kind") == "file"
+                           and row.get("key") == "codex/ordinary.jsonl")
+            self.assertIs(changed["matched"], True)
+            self.assertEqual(changed["start"], 0)
+            sent = b"".join(base64.b64decode(str(row["data"])) for row in third
+                            if row.get("kind") == "chunk" and row.get("key") == "codex/ordinary.jsonl")
+            self.assertEqual(sent, ordinary.read_bytes())
+
+    def test_mac_reader_budget_stops_before_new_files(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / ".codex/sessions"
+            root.mkdir(parents=True)
+            _ = (root / "capture.jsonl").write_text('{"cmd":"hana_shot.py shot"}\n')
+            result = subprocess.run([sys.executable, "-c", report_module._mac_reader_source(0)],  # pyright: ignore[reportPrivateUsage]
+                                    input="{}", capture_output=True, text=True, timeout=10, check=False,
+                                    env={**os.environ, "HOME": directory})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        records = [cast(dict[str, object], json.loads(line)) for line in result.stdout.splitlines()]
+        self.assertFalse(any(record.get("kind") == "file" for record in records))
+        self.assertEqual(records[-1], {"kind": "end", "finished": False})
+
+    def test_mac_reader_uses_scan_filter_constants(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / ".codex/sessions"
+            root.mkdir(parents=True)
+            _ = (root / "custom.jsonl").write_text('{"message":"custom_capture_marker"}\n')
+            with mock.patch.object(report_module, "CODEX_PREFILTER", ("custom_capture_marker",)):
+                source = report_module._mac_reader_source()  # pyright: ignore[reportPrivateUsage]
+            result = subprocess.run([sys.executable, "-c", source], input="{}", capture_output=True,
+                                    text=True, timeout=10, check=False, env={**os.environ, "HOME": directory})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        records = [cast(dict[str, object], json.loads(line)) for line in result.stdout.splitlines()]
+        self.assertTrue(any(record.get("kind") == "chunk" and record.get("key") == "codex/custom.jsonl"
+                            for record in records))
+
+    def test_mac_reader_resumes_unchanged_file_after_each_budget(self) -> None:
+        content = (b'{"cmd":"hana_shot.py shot"}\n' + b'{"message":"' +
+                   b"x" * (3 * 65536 + 7) + b'"}\n')
+        key = "codex/2026/10/06/large.jsonl"
+        real_run = subprocess.run
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory) / "remote"
+            source = home / ".codex/sessions/2026/10/06/large.jsonl"
+            source.parent.mkdir(parents=True)
+            _ = source.write_bytes(content)
+            state_dir = Path(directory) / "state"
+
+            def local_ssh(args: list[str], **options: object) -> subprocess.CompletedProcess[bytes]:
+                self.assertEqual(args[0], "ssh")
+                command = shlex.shlex(args[-1], posix=True, punctuation_chars=";")
+                command.whitespace_split = True
+                reader = list(command)[2]
+                clock = ("import time\n"
+                         "ticks = iter(range(40, 4000, 40))\n"
+                         "time.monotonic = lambda: next(ticks)\n")
+                result = real_run([sys.executable, "-c", clock + reader],
+                                  input=cast(bytes, options["input"]), stdout=cast(BinaryIO, options["stdout"]),
+                                  stderr=subprocess.PIPE, timeout=10, check=False,
+                                  env={**os.environ, "HOME": str(home)})
+                return subprocess.CompletedProcess(args, result.returncode,
+                                                   stderr=f"rc={result.returncode}\n".encode() + result.stderr)
+
+            received = 0
+            for _ in range(8):
+                with mock.patch.object(subprocess, "run", side_effect=local_ssh):
+                    evidence = report_module._mac_evidence(state_dir)  # pyright: ignore[reportPrivateUsage]
+                self.assertIsInstance(evidence, report_module.MacEvidenceAvailable)
+                assert isinstance(evidence, report_module.MacEvidenceAvailable)
+                self.assertEqual(evidence.bytes_read, min(65536, len(content) - received))
+                received += evidence.bytes_read
+                self.assertEqual((state_dir / "mac-source" / key).read_bytes(), content[:received])
+                manifest = report_module._read_object(state_dir / "mac_manifest.json")  # pyright: ignore[reportPrivateUsage]
+                self.assertEqual(cast(dict[str, object], manifest[key])["cursor"], received)
+                with mock.patch.object(report_module, "_mac_evidence", return_value=evidence):
+                    line = report_module.scan(state_dir, state_dir / "local-claude",
+                                              state_dir / "local-codex", include_mac=True)
+                if isinstance(evidence.progress, report_module.MacReadFinished):
+                    self.assertIn("Mac: read 0 source bytes; finished", line)
+                    self.assertEqual(report_module._host_coverage(state_dir)["mac"].at,  # pyright: ignore[reportPrivateUsage]
+                                     evidence.started_at)
+                    break
+                self.assertIn("catching up", line)
+                self.assertNotIn("mac", report_module._host_coverage(state_dir))  # pyright: ignore[reportPrivateUsage]
+            else:
+                self.fail("Mac reader never finished the unchanged source file")
+            self.assertEqual(received, len(content))
+            self.assertEqual((state_dir / "mac-source" / key).read_bytes(), source.read_bytes())
+
+    def test_mac_unreachable_then_reachable_catches_up_without_duplicates(self) -> None:
+        fixture = FIXTURES / "codex/sessions/2026/10/01/rollout-control.jsonl"
+        transcript = fixture.read_bytes()
+        timing = (json.dumps({
+            "time": "2026-10-01T00:30:09+00:00", "status": "success", "exit_code": 0,
+            "invocation_kind": "shot", "session": {"state": "present", "value": "codex-control"},
+            "attempts": [{"status": "success", "image_paths": ["/fictional/shots/codex-framed.png"],
+                          "mode": "fit", "crop": "none", "total_ms": 50}],
+        }) + "\n").encode()
+        paths = {"codex/2026/10/01/rollout-control.jsonl": transcript,
+                 "timings/timings.jsonl": timing}
+        commands: list[list[str]] = []
+        reachable = False
+
+        def fake_ssh(args: list[str], **options: object) -> subprocess.CompletedProcess[bytes]:
+            nonlocal reachable
+            commands.append(args)
+            self.assertIn("rc=$?", args[-1])
+            self.assertEqual(options["timeout"], 120)
+            if not reachable:
+                reachable = True
+                return subprocess.CompletedProcess(args, 255, stderr=b"unreachable")
+            output = cast(BinaryIO, options["stdout"])
+            _ = output.write((json.dumps({"kind": "claude_coverage", "included": False}) + "\n").encode())
+            prior = cast(dict[str, object], json.loads(cast(bytes, options["input"])))
+            for key, content in paths.items():
+                old = prior.get(key)
+                meta = {"size": len(content), "inode": 11 if key.startswith("codex") else 12,
+                        "mtime": 1 if len(content) == (len(transcript) if key.startswith("codex") else len(timing)) else 2}
+                previous = cast(dict[str, object], old) if isinstance(old, dict) else {}
+                start = (int(str(previous.get("cursor", 0))) if previous.get("inode") == meta["inode"]
+                         and len(content) >= int(str(previous.get("cursor", 0))) else 0)
+                _ = output.write((json.dumps({"kind": "file", "key": key, **meta,
+                                              "matched": True, "start": start}) + "\n").encode())
+                if start < len(content):
+                    _ = output.write((json.dumps({"kind": "chunk", "key": key,
+                                                  "data": base64.b64encode(content[start:]).decode()}) + "\n").encode())
+            _ = output.write(b'{"kind":"end","finished":true}\n')
+            return subprocess.CompletedProcess(args, 0, stderr=b"rc=0\n")
+
+        with tempfile.TemporaryDirectory() as directory:
+            state_dir = Path(directory)
+            empty_claude, empty_codex = state_dir / "local-claude", state_dir / "local-codex"
+            with mock.patch.object(subprocess, "run", side_effect=fake_ssh):
+                unavailable = report_module._mac_evidence(state_dir)  # pyright: ignore[reportPrivateUsage]
+                self.assertIsInstance(unavailable, report_module.MacEvidenceUnavailable)
+                self.assertFalse((state_dir / "mac_manifest.json").exists())
+                available = report_module._mac_evidence(state_dir)  # pyright: ignore[reportPrivateUsage]
+                assert isinstance(available, report_module.MacEvidenceAvailable)
+                self.assertEqual(available.bytes_read, len(transcript) + len(timing))
+                no_news = report_module._mac_evidence(state_dir)  # pyright: ignore[reportPrivateUsage]
+                assert isinstance(no_news, report_module.MacEvidenceAvailable)
+                self.assertEqual(no_news.bytes_read, 0)
+            with mock.patch.object(report_module, "_mac_evidence", return_value=available):
+                _ = report_module.scan(state_dir, empty_claude, empty_codex, include_mac=True)
+                first = read_episodes(state_dir / "episodes.jsonl")
+            first_invocations = (state_dir / "invocations.jsonl").read_text()
+            first_coverage = report_module._host_coverage(state_dir)["mac"].at  # pyright: ignore[reportPrivateUsage]
+            with mock.patch.object(report_module, "_mac_evidence",
+                                   return_value=report_module.MacEvidenceUnavailable("asleep")):
+                outage_line = report_module.scan(state_dir, empty_claude, empty_codex, include_mac=True)
+            self.assertEqual(read_episodes(state_dir / "episodes.jsonl"), first)
+            self.assertEqual((state_dir / "invocations.jsonl").read_text(), first_invocations)
+            self.assertEqual(report_module._host_coverage(state_dir)["mac"].at, first_coverage)  # pyright: ignore[reportPrivateUsage]
+            self.assertIn("Mac: unavailable", outage_line)
+            extra = "".join(json.dumps(row) + "\n" for row in (
+                {"timestamp": "2026-10-01T01:30:00.000Z", "type": "response_item",
+                 "payload": {"type": "function_call", "name": "exec_command",
+                             "arguments": json.dumps({"cmd": "python3 /fictional/hana_shot.py shot --view orion"}),
+                             "call_id": "codex-new"}},
+                {"timestamp": "2026-10-01T01:30:10.000Z", "type": "response_item",
+                 "payload": {"type": "function_call_output", "call_id": "codex-new",
+                             "output": "saved /fictional/shots/codex-new.png"}},
+            )).encode()
+            extra_timing = (json.dumps({
+                "time": "2026-10-01T01:30:10+00:00", "status": "success", "exit_code": 0,
+                "invocation_kind": "shot", "session": {"state": "present", "value": "codex-control"},
+                "attempts": [{"status": "success", "image_paths": ["/fictional/shots/codex-new.png"]}],
+            }) + "\n").encode()
+            paths["codex/2026/10/01/rollout-control.jsonl"] += extra
+            paths["timings/timings.jsonl"] += extra_timing
+            with (state_dir / "mac-source/codex/2026/10/01/rollout-control.jsonl").open("ab") as partial:
+                _ = partial.write(b"interrupted transfer")
+            with mock.patch.object(subprocess, "run", side_effect=fake_ssh):
+                caught_up = report_module._mac_evidence(state_dir)  # pyright: ignore[reportPrivateUsage]
+            assert isinstance(caught_up, report_module.MacEvidenceAvailable)
+            self.assertEqual(caught_up.bytes_read, len(extra) + len(extra_timing))
+            self.assertEqual((state_dir / "mac-source/codex/2026/10/01/rollout-control.jsonl").read_bytes(),
+                             paths["codex/2026/10/01/rollout-control.jsonl"])
+            with mock.patch.object(report_module, "_mac_evidence", return_value=caught_up):
+                second_scan = report_module.scan(state_dir, empty_claude, empty_codex, include_mac=True)
+                second = read_episodes(state_dir / "episodes.jsonl")
+                no_new_scan = report_module.scan(state_dir, empty_claude, empty_codex, include_mac=True)
+            self.assertEqual(second, read_episodes(state_dir / "episodes.jsonl"))
+            self.assertTrue(first)
+            self.assertEqual(len(second), len(first) + 2)
+            self.assertEqual({episode.source_host for episode in first}, {"mac"})
+            self.assertEqual(len((state_dir / "invocations.jsonl").read_text().splitlines()), 2)
+            self.assertIn("read 0 transcript and timing bytes", no_new_scan)
+            self.assertNotIn("read 0 transcript and timing bytes", second_scan)
+        self.assertEqual(len(commands), 4)
+
+    def test_mac_budget_batch_commits_received_cursor_without_advancing_coverage(self) -> None:
+        payload = b'{"cmd":"hana_shot.py shot"}\n'
+        key = "codex/2026/10/01/capture.jsonl"
+        calls = 0
+
+        def fake_ssh(args: list[str], **options: object) -> subprocess.CompletedProcess[bytes]:
+            nonlocal calls
+            calls += 1
+            output = cast(BinaryIO, options["stdout"])
+            prior = cast(dict[str, object], json.loads(cast(bytes, options["input"])))
+            old = prior.get(key)
+            previous = cast(dict[str, object], old) if isinstance(old, dict) else {}
+            start = int(str(previous.get("cursor", 0)))
+            part = payload[start:8] if calls == 1 else payload[start:]
+            rows: list[dict[str, object]] = [
+                {"kind": "claude_coverage", "included": False},
+                {"kind": "file", "key": key, "size": len(payload), "inode": 17, "mtime": 1,
+                 "matched": True, "start": start},
+                {"kind": "chunk", "key": key, "data": base64.b64encode(part).decode()},
+                {"kind": "end", "finished": calls > 1},
+            ]
+            for row in rows:
+                _ = output.write((json.dumps(row) + "\n").encode())
+            return subprocess.CompletedProcess(args, 0, stderr=b"rc=0\n")
+
+        with tempfile.TemporaryDirectory() as directory:
+            state_dir = Path(directory)
+            with mock.patch.object(subprocess, "run", side_effect=fake_ssh):
+                first = report_module._mac_evidence(state_dir)  # pyright: ignore[reportPrivateUsage]
+            assert isinstance(first, report_module.MacEvidenceAvailable)
+            self.assertIsInstance(first.progress, report_module.MacReadCatchingUp)
+            self.assertEqual(first.bytes_read, 8)
+            first_manifest = report_module._read_object(state_dir / "mac_manifest.json")  # pyright: ignore[reportPrivateUsage]
+            self.assertEqual(cast(dict[str, object], first_manifest[key])["cursor"], 8)
+            with mock.patch.object(report_module, "_mac_evidence", return_value=first):
+                first_scan = report_module.scan(state_dir, state_dir / "claude", state_dir / "codex", include_mac=True)
+            self.assertIn("catching up", first_scan)
+            self.assertNotIn("mac", report_module._host_coverage(state_dir))  # pyright: ignore[reportPrivateUsage]
+            with mock.patch.object(subprocess, "run", side_effect=fake_ssh):
+                second = report_module._mac_evidence(state_dir)  # pyright: ignore[reportPrivateUsage]
+            assert isinstance(second, report_module.MacEvidenceAvailable)
+            self.assertIsInstance(second.progress, report_module.MacReadFinished)
+            self.assertEqual(second.bytes_read, len(payload) - 8)
+            self.assertEqual((state_dir / "mac-source" / key).read_bytes(), payload)
+            with mock.patch.object(report_module, "_mac_evidence", return_value=second):
+                second_scan = report_module.scan(state_dir, state_dir / "claude", state_dir / "codex", include_mac=True)
+            self.assertIn("finished", second_scan)
+            self.assertEqual(report_module._host_coverage(state_dir)["mac"].at,  # pyright: ignore[reportPrivateUsage]
+                             second.started_at)
+        self.assertEqual(calls, 2)
+
+    def test_mac_file_growth_commits_actual_received_cursor(self) -> None:
+        content = b'{"cmd":"hana_shot.py shot"}\n'
+
+        def fake_ssh(args: list[str], **options: object) -> subprocess.CompletedProcess[bytes]:
+            output = cast(BinaryIO, options["stdout"])
+            rows: list[dict[str, object]] = [
+                {"kind": "claude_coverage", "included": False},
+                {"kind": "file", "key": "codex/growing.jsonl", "size": len(content) - 4,
+                 "inode": 3, "mtime": 1, "matched": True, "start": 0},
+                {"kind": "chunk", "key": "codex/growing.jsonl",
+                 "data": base64.b64encode(content).decode()},
+                {"kind": "end", "finished": True},
+            ]
+            for row in rows:
+                _ = output.write((json.dumps(row) + "\n").encode())
+            return subprocess.CompletedProcess(args, 0, stderr=b"rc=0\n")
+
+        with tempfile.TemporaryDirectory() as directory:
+            state_dir = Path(directory)
+            with mock.patch.object(subprocess, "run", side_effect=fake_ssh):
+                result = report_module._mac_evidence(state_dir)  # pyright: ignore[reportPrivateUsage]
+            assert isinstance(result, report_module.MacEvidenceAvailable)
+            self.assertEqual((state_dir / "mac-source/codex/growing.jsonl").read_bytes(), content)
+            manifest = report_module._read_object(state_dir / "mac_manifest.json")  # pyright: ignore[reportPrivateUsage]
+            self.assertEqual(cast(dict[str, object], manifest["codex/growing.jsonl"])["cursor"], len(content))
+
+    def test_mac_ssh_timeout_commits_no_partial_transfer(self) -> None:
+        def fake_ssh(args: list[str], **options: object) -> subprocess.CompletedProcess[bytes]:
+            output = cast(BinaryIO, options["stdout"])
+            _ = output.write(b'{"kind":"file","key":"codex/partial.jsonl","size":20,' +
+                             b'"inode":3,"mtime":1,"matched":true,"start":0}\n')
+            raise subprocess.TimeoutExpired(args, 120)
+
+        with tempfile.TemporaryDirectory() as directory:
+            state_dir = Path(directory)
+            with mock.patch.object(subprocess, "run", side_effect=fake_ssh):
+                result = report_module._mac_evidence(state_dir)  # pyright: ignore[reportPrivateUsage]
+            self.assertIsInstance(result, report_module.MacEvidenceUnavailable)
+            self.assertFalse((state_dir / "mac_manifest.json").exists())
+            self.assertFalse((state_dir / "mac-source").exists())
+
+    def test_host_coverage_uses_read_start_not_scan_completion(self) -> None:
+        local_start = datetime.fromisoformat("2026-10-06T20:00:00+00:00")
+        mac_start = local_start + timedelta(minutes=1)
+        completed = local_start + timedelta(minutes=5)
+        with tempfile.TemporaryDirectory() as directory:
+            state_dir = Path(directory)
+            mirror = state_dir / "mac-source"
+            mac = report_module.MacEvidenceAvailable(mirror / "claude", mirror / "codex",
+                                                     mirror / "timings/timings.jsonl", 0, False,
+                                                     mac_start, report_module.MacReadFinished())
+            with (mock.patch.object(report_module, "_utc_now", side_effect=[local_start, completed]),
+                  mock.patch.object(report_module, "_mac_evidence", return_value=mac)):
+                _ = report_module.scan(state_dir, state_dir / "claude", state_dir / "codex", include_mac=True)
+            coverage = report_module._host_coverage(state_dir)  # pyright: ignore[reportPrivateUsage]
+            self.assertEqual(coverage["natedev"].at, local_start)
+            self.assertEqual(coverage["mac"].at, mac_start)
+            self.assertEqual(report_module._read_object(state_dir / "scan_status.json")["last_success"],  # pyright: ignore[reportPrivateUsage]
+                             completed.isoformat())
+
+    def test_change_with_missing_required_key_is_invalid(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "changes.json"
+            _ = path.write_text(json.dumps([{"repository": "claude", "commit": "abc", "summary": "text",
+                                             "host_coverage": ["natedev"]}]))
+            with self.assertRaisesRegex(ValueError, "invalid change"):
+                _ = read_changes(path)
 
 
 if __name__ == "__main__":

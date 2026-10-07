@@ -181,7 +181,7 @@ None.
 
 **Ruled out:** classifying `views check` runs as shots (they record a stored-view check, not an agent's framing attempts); a second classifier next to the existing one.
 
-### Phase 4 — The report runs every hour and shows what each change did · status: todo
+### Phase 4 — The report runs every hour and shows what each change did · status: done
 
 #### Work Order
 

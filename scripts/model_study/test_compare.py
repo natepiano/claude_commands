@@ -216,6 +216,8 @@ class ComparisonTests(unittest.TestCase):
             differences = record(switched, "differences")
             self.assertEqual(record(differences, "seconds")["value"], -20)
             self.assertEqual(record(differences, "seconds")["label"], "faster")
+            self.assertEqual(record(differences, "net_seconds")["value"], -20)
+            self.assertEqual(record(differences, "net_seconds")["label"], "faster")
             self.assertEqual(record(differences, "output")["value"], -20)
             self.assertEqual(record(differences, "output")["label"], "lower")
             self.assertEqual(record(differences, "cost")["label"], "lower")
@@ -223,6 +225,7 @@ class ComparisonTests(unittest.TestCase):
             pooled = record(result, "pooled")
             self.assertEqual(record(pooled, "counts")["opus_baseline"], 300)
             self.assertEqual(record(record(pooled, "differences"), "seconds")["value"], -20)
+            self.assertEqual(record(record(pooled, "differences"), "net_seconds")["value"], -20)
 
             control = record(result, "control")
             self.assertEqual(control["at_pdt"], "2026-10-05 23:00 PDT")
@@ -231,6 +234,10 @@ class ComparisonTests(unittest.TestCase):
             self.assertEqual((stable["before_median"], stable["after_median"]), (25, 25))
             self.assertEqual(record(stable, "difference")["value"], 0)
             self.assertEqual(record(stable, "difference")["label"], "no measurable difference")
+            self.assertEqual(record(control, "pooled"), {
+                "before_n": 30, "after_n": 30, "before_median": 25,
+                "after_median": 25, "change_seconds": 0,
+            })
 
             compactions = records(result, "compactions")
             opus_compact = next(row for row in compactions if row["name"] == "switched" and row["arm"] == "opus")
@@ -254,6 +261,76 @@ class ComparisonTests(unittest.TestCase):
             self.assertLess(report.index("## Concurrent control"), report.index("## Compactions"))
             self.assertEqual(report.count("Drops — "), 4)
             self.assertNotIn("SECRET_REQUEST_ID", report + output)
+
+    def test_control_with_same_speedup_erases_raw_time_gain(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            state_dir = Path(temporary)
+            turns, compactions = fixture_rows()
+            turns = [replace(row, seconds=5) if row.name == "control" and
+                     row.started >= instant(420) else row for row in turns]
+            write_fixture(state_dir, turns, compactions)
+            result, _, _ = run_compare(state_dir)
+            switched = named(records(result, "directors"), "switched")
+            differences = record(switched, "differences")
+            self.assertEqual(record(differences, "seconds")["label"], "faster")
+            self.assertEqual(record(differences, "net_seconds")["value"], 0)
+            self.assertEqual(record(differences, "net_seconds")["label"],
+                             "no measurable difference")
+            pooled = record(result, "pooled")
+            self.assertEqual(record(record(pooled, "differences"), "net_seconds")["label"],
+                             "no measurable difference")
+            self.assertEqual(record(record(result, "control"), "pooled")["change_seconds"], -20)
+
+    def test_missing_qualifying_control_marks_net_unavailable(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            state_dir = Path(temporary)
+            turns, compactions = fixture_rows()
+            turns = [row for row in turns if row.name != "control" or row.started < instant(420)]
+            write_fixture(state_dir, turns, compactions)
+            result, _, _ = run_compare(state_dir)
+            control = record(result, "control")
+            self.assertEqual(records(control, "directors"), [])
+            self.assertEqual(record(control, "pooled"), {
+                "before_n": 0, "after_n": 0, "before_median": None,
+                "after_median": None, "change_seconds": None,
+            })
+            switched = named(records(result, "directors"), "switched")
+            net = record(record(switched, "differences"), "net_seconds")
+            self.assertEqual(net["label"], "no control")
+            self.assertIsNone(net["value"])
+
+    def test_filtered_sonnet_director_never_joins_clock_control(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            state_dir = Path(temporary)
+            turns, compactions = fixture_rows()
+            write_fixture(state_dir, turns, compactions)
+            without_director, _, _ = run_compare(state_dir)
+            baseline_net = record(record(named(records(without_director, "directors"),
+                                               "switched"), "differences"), "net_seconds")
+
+            turns.extend(
+                turn("filtered-switch", OPUS, minute, seconds=45)
+                for minute in range(30)
+            )
+            turns.extend(
+                turn("filtered-switch", OPUS, 420 + minute, seconds=25)
+                for minute in range(30)
+            )
+            turns.append(turn("filtered-switch", SONNET, 400, seconds=10, effort="high"))
+            write_fixture(state_dir, turns, compactions)
+            result, report, _ = run_compare(state_dir)
+            control = record(result, "control")
+            filtered = named(records(result, "directors"), "filtered-switch")
+            self.assertEqual(filtered["status"], "control candidate")
+            self.assertEqual(record(record(filtered, "drops"), "sonnet")["effort"], 1)
+            self.assertEqual(control["at_pdt"], record(without_director, "control")["at_pdt"])
+            self.assertEqual([row["name"] for row in records(control, "directors")], ["control"])
+            self.assertEqual(record(control, "pooled"), record(record(without_director, "control"), "pooled"))
+            switched = named(records(result, "directors"), "switched")
+            net = record(record(switched, "differences"), "net_seconds")
+            self.assertEqual(net, baseline_net)
+            control_report = report.split("## Concurrent control", 1)[1].split("## Compactions", 1)[0]
+            self.assertNotIn("| filtered-switch |", control_report)
 
     def test_stale_extract_does_not_hide_ineligible_director_or_drops(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -284,33 +361,46 @@ class ComparisonTests(unittest.TestCase):
                     self.assertIn("ineligible sonnet switch:1", line)
                     self.assertIn("ineligible other switch:0", line)
 
-    def test_control_counts_filtered_requests_with_missing_times(self) -> None:
+    def test_control_requires_thirty_timed_continuations_on_each_side(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             state_dir = Path(temporary)
             turns, compactions = fixture_rows()
+            turns = [row for row in turns if row.name != "control"]
             turns.extend(
-                turn("partly-timed", OPUS, minute, seconds=None if minute == 0 else 12)
+                turn("untimed-after", OPUS, minute, seconds=12)
                 for minute in range(30)
             )
-            turns.extend(turn("partly-timed", OPUS, 420 + minute, seconds=12)
-                         for minute in range(30))
-            turns.extend(turn("untimed", OPUS, minute, seconds=None) for minute in range(30))
-            turns.extend(turn("untimed", OPUS, 420 + minute, seconds=12)
+            turns.extend(turn("untimed-after", OPUS, 420 + minute, seconds=None)
                          for minute in range(30))
             write_fixture(state_dir, turns, compactions)
             result, report, _ = run_compare(state_dir)
-            controls = records(record(result, "control"), "directors")
-            partly_timed = named(controls, "partly-timed")
-            self.assertEqual((partly_timed["before_n"], partly_timed["after_n"]), (30, 30))
-            self.assertEqual(partly_timed["before_median"], 12)
-            self.assertEqual(record(partly_timed, "difference")["label"], "too few")
-            self.assertEqual(record(partly_timed, "difference")["opus_n"], 29)
-            untimed = named(controls, "untimed")
-            self.assertEqual((untimed["before_n"], untimed["after_n"]), (30, 30))
-            self.assertIsNone(untimed["before_median"])
-            self.assertEqual(record(untimed, "difference")["label"], "too few")
-            self.assertEqual(record(untimed, "difference")["opus_n"], 0)
-            self.assertIn("| untimed | — | 30 / 30 | — / 12.00 |", report)
+            control = record(result, "control")
+            self.assertEqual(records(control, "directors"), [])
+            self.assertEqual(record(control, "pooled")["before_n"], 0)
+            self.assertEqual(record(control, "pooled")["after_n"], 0)
+            switched = named(records(result, "directors"), "switched")
+            self.assertEqual(record(record(switched, "differences"), "net_seconds")["label"],
+                             "no control")
+            control_report = report.split("## Concurrent control", 1)[1].split("## Compactions", 1)[0]
+            self.assertNotIn("| untimed-after |", control_report)
+
+            turns.extend(turn("timed-control", OPUS, minute, seconds=25)
+                         for minute in range(30))
+            turns.extend(turn("timed-control", OPUS, 420 + minute, seconds=20)
+                         for minute in range(30))
+            write_fixture(state_dir, turns, compactions)
+            result, report, _ = run_compare(state_dir)
+            control = record(result, "control")
+            timed = named(records(control, "directors"), "timed-control")
+            self.assertEqual((timed["before_n"], timed["after_n"]), (30, 30))
+            self.assertEqual((record(control, "pooled")["before_n"],
+                              record(control, "pooled")["after_n"]), (30, 30))
+            self.assertEqual(record(record(named(records(result, "directors"),
+                                                 "switched"), "differences"),
+                                    "net_seconds")["label"], "faster")
+            control_report = report.split("## Concurrent control", 1)[1].split("## Compactions", 1)[0]
+            self.assertIn("| timed-control | — | 30 / 30 | 25.00 / 20.00 |", control_report)
+            self.assertNotIn("| untimed-after |", control_report)
 
     def test_sonnet_only_class_table_has_only_sonnet_rows(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

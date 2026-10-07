@@ -318,6 +318,7 @@ class FailedAttempt(TypedDict):
 
 class SuccessfulInvocation(TimingRecord):
     status: Literal["success"]
+    invocation_kind: Literal["shot", "views_check"]
     exit_code: Literal[0]
     session: PresentSession | AbsentSession
     attempts: list[SuccessfulAttempt | FailedAttempt]
@@ -328,6 +329,7 @@ class FailedInvocation(TypedDict):
     host: str
     port: int
     status: Literal["failure"]
+    invocation_kind: Literal["shot", "views_check"]
     exit_code: int
     failure_reason: FailureReason
     session: PresentSession | AbsentSession
@@ -335,7 +337,8 @@ class FailedInvocation(TypedDict):
 
 
 @dataclass
-class ShotInvocation:
+class InProgressCaptureInvocation:
+    kind: Literal["shot", "views_check"] = "shot"
     attempts: list[SuccessfulAttempt | FailedAttempt] = field(default_factory=list)
     successful_timings: list[TimingRecord] = field(default_factory=list)
     failures: list[FailureReason] = field(default_factory=list)
@@ -1399,10 +1402,11 @@ def failed_attempt(shot: Shot, path: Path, reason: FailureReason, started_ns: in
     }
 
 
-def append_invocation(invocation: ShotInvocation, port: int, remote: str | None, exit_code: int) -> None:
+def append_invocation(invocation: InProgressCaptureInvocation, port: int, remote: str | None, exit_code: int) -> None:
     if exit_code == 0 and invocation.successful_timings:
         success: SuccessfulInvocation = {
             **invocation.successful_timings[-1], "status": "success", "exit_code": 0,
+            "invocation_kind": invocation.kind,
             "session": session_evidence(), "attempts": invocation.attempts,
         }
         append_timing(success)
@@ -1411,13 +1415,14 @@ def append_invocation(invocation: ShotInvocation, port: int, remote: str | None,
         "time": datetime.now(timezone.utc).isoformat(timespec="milliseconds"),
         "host": socket.gethostname() if remote is None else remote.rsplit("@", 1)[-1],
         "port": port, "status": "failure", "exit_code": exit_code,
+        "invocation_kind": invocation.kind,
         "failure_reason": invocation.failures[0] if invocation.failures else FailureReason.SHOT_FAILED,
         "session": session_evidence(), "attempts": invocation.attempts,
     }
     append_timing(failure)
 
 
-def write_invocation(invocation: ShotInvocation, port: int, remote: str | None, exit_code: int) -> None:
+def write_invocation(invocation: InProgressCaptureInvocation, port: int, remote: str | None, exit_code: int) -> None:
     try:
         append_invocation(invocation, port, remote, exit_code)
     except OSError as exc:
@@ -1842,7 +1847,7 @@ def with_overrides(shot: Shot, args: Arguments) -> Shot:
 
 def run_shots(
     brp: Brp, shots: list[Shot], out: str | None, remote: str | None, on_result: Callable[[Result], None],
-    invocation: ShotInvocation,
+    invocation: InProgressCaptureInvocation,
 ) -> list[Result]:
     with closing(Session(brp, remote)) as session:
         _ = session.start()
@@ -1868,7 +1873,7 @@ def run_shots(
         return results
 
 
-def command_shot(args: Arguments, invocation: ShotInvocation) -> int:
+def command_shot(args: Arguments, invocation: InProgressCaptureInvocation) -> int:
     if args.view and args.target:
         raise Refused("give --view or --target, not both")
     if args.view:
@@ -2002,7 +2007,7 @@ def command_stats(args: Arguments) -> int:
     return 0
 
 
-def command_views(args: Arguments, invocation: ShotInvocation | None = None) -> int:
+def command_views(args: Arguments, invocation: InProgressCaptureInvocation | None = None) -> int:
     path = views_path(args.views_file)
     if args.action == "list":
         for name, view in load_views(path).items():
@@ -2111,7 +2116,7 @@ def from_current(session: Session, args: Arguments, mode: str) -> ViewValue:
     return view
 
 
-def views_check(args: Arguments, path: Path, invocation: ShotInvocation) -> int:
+def views_check(args: Arguments, path: Path, invocation: InProgressCaptureInvocation) -> int:
     """Shoot every view and fail any that resolves wrong, is rejected, is black, or crops empty."""
     views = load_views(path)
     names = args.view if args.view and args.view != ["all"] else list(views)
@@ -2275,7 +2280,8 @@ def main(argv: list[str]) -> int:
                         port = int(argv[index])
                     except ValueError:
                         pass
-            write_invocation(ShotInvocation(failures=[FailureReason.INVALID_REQUEST]), port, None, code)
+            kind: Literal["shot", "views_check"] = "shot" if argv[:1] == ["shot"] else "views_check"
+            write_invocation(InProgressCaptureInvocation(kind=kind, failures=[FailureReason.INVALID_REQUEST]), port, None, code)
         return code
     handlers: dict[str, Callable[[Arguments], int]] = {
         "pose": command_pose,
@@ -2284,7 +2290,8 @@ def main(argv: list[str]) -> int:
         "launch": command_launch,
         "shutdown": command_shutdown,
     }
-    invocation = ShotInvocation() if args.command == "shot" or args.command == "views" and args.action == "check" else None
+    invocation = (InProgressCaptureInvocation(kind="shot" if args.command == "shot" else "views_check")
+                  if args.command == "shot" or args.command == "views" and args.action == "check" else None)
     exit_code = 1
     try:
         if args.command == "views" and args.action in ("check", "add") and args.from_current or (
