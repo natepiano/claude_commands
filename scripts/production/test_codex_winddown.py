@@ -97,7 +97,13 @@ class MessageTests(unittest.TestCase):
             "NOTIFIER_STATE_DIR": str(self.root / "notifier"), "NOTIFIER_SESSIONS_DIR": str(self.root / "sessions"),
             "CODEX_WINDDOWN_NOTIFIER": str(self.root / "notifier.sh"), "CODEX_WINDDOWN_SEND": str(self.root / "send.py"),
             "CODEX_WINDDOWN_STATE": str(self.root / "prompts"), "LOG": str(self.root / "log"),
+            "CODEX_WINDDOWN_PUSH": str(self.root / "push.py"), "CODEX_WINDDOWN_PS": f"cat {self.root / 'ps'}",
         }
+        _ = (self.root / "push.py").write_text(SEND_STUB.replace('"send "', '"push "'), encoding="utf-8")
+        self.set_processes()
+
+    def set_processes(self, *lines: str) -> None:
+        _ = (self.root / "ps").write_text("".join(f"{line}\n" for line in lines), encoding="utf-8")
 
     def run_script(self, *arguments: str) -> subprocess.CompletedProcess[str]:
         return subprocess.run([sys.executable, str(SCRIPT), *arguments], env=self.environment, capture_output=True,
@@ -149,6 +155,23 @@ class MessageTests(unittest.TestCase):
         log = (self.root / "log").read_text(encoding="utf-8")
         self.assertEqual(log.count("send --to trunk --from hana --text Codex wind-down, from hana: your Codex agents"), 1)
         self.assertIn("launch Claude agents for short time frames", log)
+
+    def test_the_user_is_pushed_once_when_a_wind_down_reaches_no_agents(self) -> None:
+        agent = (f"{os.getpid()} 1 claude claude", f"40 {os.getpid()} python3 {MESH} start --name a")
+        self.set_processes(*agent)
+        _ = self.run_script("start", "--from", "natedev")
+        self.assertIn("hana - 1 - ETA Unmeasured", self.run_script("count", "hana").stdout)
+        self.assertNotIn("push ", (self.root / "log").read_text(encoding="utf-8"))
+        self.set_processes()
+        for _ in range(2):
+            _ = self.run_script("count", "hana")
+        log = (self.root / "log").read_text(encoding="utf-8")
+        self.assertEqual(log.count("push --priority 1 Codex wind-down No Codex agent is running on"), 1)
+        self.set_processes(*agent)
+        _ = self.run_script("count", "hana")
+        self.set_processes()
+        _ = self.run_script("count", "hana")
+        self.assertEqual((self.root / "log").read_text(encoding="utf-8").count("push "), 2)
 
     def test_status_says_whether_a_wind_down_is_on(self) -> None:
         self.assertIn("Wind-down: off", self.run_script("status").stdout)

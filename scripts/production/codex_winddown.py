@@ -12,6 +12,7 @@ import math
 import os
 import re
 import shlex
+import socket
 import subprocess
 import sys
 import time
@@ -32,8 +33,11 @@ from sessions import SessionRecord, live_session, read_session  # noqa: E402
 
 NOTIFIER = Path(os.environ.get("CODEX_WINDDOWN_NOTIFIER") or MESSAGE / "notifier.sh")
 SEND = Path(os.environ.get("CODEX_WINDDOWN_SEND") or MESSAGE / "send.py")
+PUSH = Path(os.environ.get("CODEX_WINDDOWN_PUSH") or MESSAGE.parent / "notify/pushover.py")
+PS = shlex.split(os.environ.get("CODEX_WINDDOWN_PS") or "ps -eo pid=,ppid=,comm=,args=")
 STATE = Path(os.environ.get("CODEX_WINDDOWN_STATE") or Path.home() / ".local/state/codex-winddown")
 PROJECTIONS = "projections.json"
+QUIET = "quiet"
 INSTANCE = "codex-count-"
 EVERY_MINUTES = 2
 NO_SESSION = "no session"
@@ -88,8 +92,7 @@ class Process(NamedTuple):
 
 
 def processes() -> dict[int, Process]:
-    listing = subprocess.run(["ps", "-eo", "pid=,ppid=,comm=,args="], capture_output=True, text=True,
-                             check=True)
+    listing = subprocess.run(PS, capture_output=True, text=True, check=True)
     table: dict[int, Process] = {}
     for line in listing.stdout.splitlines():
         fields = line.split(None, 3)
@@ -231,15 +234,31 @@ def refresh(showrunner: str, units: list[str], rows: Mapping[str, int], now: flo
     return current
 
 
+def announce_quiet(running: int) -> None:
+    """Push the user once when a wind-down has no Codex agent left on the machine; a later agent re-arms it."""
+    if running or not instances():
+        (STATE / QUIET).unlink(missing_ok=True)
+        return
+    try:
+        STATE.mkdir(parents=True, exist_ok=True)
+        (STATE / QUIET).touch(exist_ok=False)
+    except FileExistsError:
+        return
+    text = f"No Codex agent is running on {socket.gethostname()}. Reset when ready, then /codex_winddown clear."
+    _ = subprocess.run([sys.executable, str(PUSH), "--priority", "1", "Codex wind-down", text],
+                       capture_output=True, text=True, check=False)
+
+
 def count(session: str) -> int:
     runner = next((item for item in showrunners.load_settings()["showrunners"] if item["session"] == session),
                   None)
     if runner is None:
         print(f"showrunner absent from config: {session}", file=sys.stderr)
         return 1
-    units = live_units(session)
-    rows = listed(session, units, current_counts())
+    units, counts = live_units(session), current_counts()
+    rows = listed(session, units, counts)
     held = refresh(session, units, rows, time.time())
+    announce_quiet(counts.total())
     print(render(f"Codex agents, {clock(runner['zone'])}", rows, held, time.time()))
     return 0
 
@@ -299,7 +318,8 @@ def start_count(record: SessionRecord) -> bool:
 
 def start(sender: str) -> int:
     STATE.mkdir(parents=True, exist_ok=True)
-    (STATE / PROJECTIONS).unlink(missing_ok=True)
+    for name in (PROJECTIONS, QUIET):
+        (STATE / name).unlink(missing_ok=True)
     every = tell_showrunners(sender, WIND_DOWN, "told to wind down")
     live = live_sessions()
     for runner in showrunners.load_settings()["showrunners"]:
@@ -325,7 +345,8 @@ def clear(sender: str) -> int:
         (STATE / f"{name}.txt").unlink(missing_ok=True)
         every = every and done.returncode == 0
         print(f"{name.removeprefix(INSTANCE)}: {'count stopped' if done.returncode == 0 else 'count NOT stopped'}")
-    (STATE / PROJECTIONS).unlink(missing_ok=True)
+    for name in (PROJECTIONS, QUIET):
+        (STATE / name).unlink(missing_ok=True)
     return 0 if tell_showrunners(sender, ALL_CLEAR, "told the all clear") and every else 1
 
 
