@@ -122,7 +122,7 @@
 
 **Ruled out:** a `status` call from the renderer (it takes a lock and can call `gh`); documenting `--local --no-cache` for a Mac failure, because a Mac failure writes no record and the first lookup had already missed.
 
-### Phase 4 — The offload runner: probe, copy the tree, run on the Mac  · status: todo
+### Phase 4 — The offload runner: probe, copy the tree, run on the Mac  · status: done
 
 #### Work Order
 
