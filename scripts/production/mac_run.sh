@@ -9,7 +9,8 @@
 #
 # Usage: mac_run.sh <repo dir> <sha> [seconds, default 60]
 # Exit: 0 all stayed up; 3 Mac unreachable; 5 wrong tree; 6 build failed;
-# 7 hana exited early; 8 hana stayed up but an example failed.
+# 7 hana exited early; 8 hana stayed up but an example failed; 9 Mac blocked,
+# busy with a test, or coordination state unreadable.
 set -o pipefail
 repo=$1 sha=$2 hold=${3:-60}
 host=natemccoy@mac
@@ -17,6 +18,9 @@ host=natemccoy@mac
 clone=rust/hana_catalyst_mac
 port=15710
 log=/tmp/mac_run_hana.log
+launch=/tmp/mac_run_hana.command
+status_file=/tmp/mac_run_hana.status
+bundle=""
 example_hold=20
 # crate, example, then its required feature when it has one.
 examples=(
@@ -43,6 +47,34 @@ on_mac() {
 }
 
 ssh -o ConnectTimeout=6 -o BatchMode=yes $host true 2>/dev/null || { print "mac unreachable"; exit 3 }
+
+mac_test=$HOME/.claude/scripts/mac_test/mac_test.py
+claim_output=$(python3 $mac_test claim --pid $$ --what "mac run ${sha[1,9]}" --wait 600)
+claim_status=$?
+if (( claim_status == 10 || claim_status == 11 || claim_status == 12 )); then
+  print -r -- $claim_output
+  exit 9
+fi
+(( claim_status == 0 )) || { print -r -- $claim_output; exit $claim_status }
+mac_claimed=1
+release_mac_claim() {
+  (( mac_claimed )) || return 0
+  python3 $mac_test release --pid $$ >/dev/null 2>&1
+  mac_claimed=0
+  return 0
+}
+stop_mac_run() {
+  local exit_status=$1
+  trap '' INT TERM HUP
+  ssh -o ConnectTimeout=6 -o BatchMode=yes $host "for pid in \$(pgrep -f '[c]argo build'); do cwd=\$(lsof -a -p \"\$pid\" -d cwd -Fn 2>/dev/null | sed -n 's/^n//p'); case \"\$cwd\" in \"\$HOME/$clone\"|\"\$HOME/$clone\"/*) pkill -TERM -P \"\$pid\" 2>/dev/null || true; kill \"\$pid\" 2>/dev/null || true;; esac; done; pkill -f '[h]ana_catalyst_mac/target/debug/' 2>/dev/null || true; rm -f /tmp/mac_run.bundle $launch $status_file" </dev/null >/dev/null 2>&1 || true
+  [[ -z $bundle ]] || rm -f $bundle
+  release_mac_claim
+  exit $exit_status
+}
+trap release_mac_claim EXIT
+trap 'stop_mac_run 130' INT
+trap 'stop_mac_run 143' TERM
+trap 'stop_mac_run 129' HUP
 sha=$(git -C $repo rev-parse --verify "$sha^{commit}") || exit 2
 
 # The Mac cannot fetch from GitHub over ssh, so the commits go as a bundle.
@@ -74,8 +106,6 @@ on_mac "cd $clone && ~/.cargo/bin/cargo build -q -p hana" || { print "build fail
 # Started over ssh, hana gets no camera access and its cameras stay dark, so it
 # starts from Terminal, which holds the grant. `open` returns at once, so the
 # .command writes hana's exit status to a file. User, 2026-10-07.
-launch=/tmp/mac_run_hana.command
-status_file=/tmp/mac_run_hana.status
 ssh $host "rm -f $status_file; cat > $launch; chmod +x $launch" <<EOF
 #!/bin/zsh
 cd ~/$clone

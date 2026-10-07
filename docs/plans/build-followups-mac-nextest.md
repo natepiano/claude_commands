@@ -151,7 +151,7 @@
 
 **Ruled out:** a config key for the keep-alive interval (constants until something needs to change them); a live dead-link test through a TCP proxy, because it needs an alias in the user's ssh configuration; declining as `state` on an unreadable back-off file, because nothing would ever rewrite it.
 
-### Phase 5 — `verify.sh test` tries the Mac first  · status: todo
+### Phase 5 — `verify.sh test` tries the Mac first  · status: done
 
 #### Work Order
 

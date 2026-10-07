@@ -100,6 +100,7 @@
 #                                          exact call already passed (or lint
 #                                          failed) on this tree, a flake hunt;
 #                                          the result replaces the record
+#   verify.sh test <package> --local       keep this test run on natedev
 #   verify.sh fmt <package>               format only (checkpoint-commit backstop)
 #                                          — gated by config/lint.conf
 #   verify.sh example <package> <name>     clippy one example (only when the
@@ -470,6 +471,71 @@ take_features() {
     fi
 }
 
+NEXTEST_ARGS=()
+compose_nextest_args() {
+    set -- "${ARGS[@]}"
+    PKG="${1:?verify.sh test <package> [integration_test]}"
+    shift
+    TARGET=""
+    FILTERS=()
+    if [[ $# -gt 0 && "$1" != --* ]]; then
+        TARGET="$1"
+        shift
+    fi
+    # --filter, as often as named, and --features in any order; a target
+    # takes no filter.
+    REST=()
+    while [[ $# -gt 0 ]]; do
+        if [[ "$1" == "--filter" && -z "$TARGET" \
+              && "${2:-}" =~ ^[A-Za-z0-9_:]+$ ]]; then
+            FILTERS+=("$2")
+            shift 2
+        else
+            REST+=("$1")
+            shift
+        fi
+    done
+    take_features ${REST[@]+"${REST[@]}"}
+    require_member "$PKG"
+    # --no-fail-fast: nextest cancels every remaining test after the first
+    # failure, so one broken test silently hides the rest of the suite. A
+    # phase gate has to report the whole result, not the first stop.
+    # Keep workspace feature resolution; -E runs only this package's tests.
+    if [[ ${#FILTERS[@]} -gt 0 ]]; then
+        # Any of the names: & binds tighter than |, so a union of two or
+        # more goes in parentheses.
+        FILTER="test(${FILTERS[0]})"
+        for name in "${FILTERS[@]:1}"; do
+            FILTER+=" | test($name)"
+        done
+        if [[ ${#FILTERS[@]} -gt 1 ]]; then
+            FILTER="($FILTER)"
+        fi
+        TEST_FILTER="package($PKG) & $FILTER"
+    elif [[ -n "$TARGET" ]]; then
+        # Integration test target names are unique across the workspace,
+        # so --test builds just that binary, under the workspace's
+        # feature resolution.
+        NEXTEST_ARGS=(--no-fail-fast --workspace --test "$TARGET" \
+            -E "package($PKG)" "${FEATURE_FLAGS[@]}")
+        return
+    else
+        TEST_FILTER="package($PKG)"
+    fi
+    # Build only the targets this package's tests live in
+    # (TEST_TARGETS_PY): --lib, which cannot be narrowed to one member
+    # under --workspace and is left out for a package without a lib,
+    # and the package's own bins and test-enabled targets. --bins
+    # --tests linked every member's test executables, 78 in hana, to
+    # run one package's; this links 4 (2026-10-04). The integration
+    # tests stay in, matching what the lint half compiles under
+    # clippy: without them a phase could lint an integration test,
+    # pass its gate, and checkpoint without ever running it.
+    take_test_targets
+    NEXTEST_ARGS=(--no-fail-fast --workspace "${TEST_SELECTION[@]}" \
+        -E "$TEST_FILTER" "${FEATURE_FLAGS[@]}")
+}
+
 # A flag, not an env prefix, so a call stays one plain command that the
 # settings.json allow rule matches.
 if [[ "${1:-}" == "--session-dir" ]]; then
@@ -489,15 +555,17 @@ if [[ "$CMD" == example-test ]]; then
     exit 2
 fi
 
-# --no-cache may sit anywhere after the subcommand; nothing below sees it.
+# --no-cache and --local may sit anywhere after the subcommand; nothing below
+# sees them.
 NO_CACHE=0
+LOCAL_ONLY=0
 ARGS=()
 for arg in "$@"; do
-    if [[ "$arg" == "--no-cache" ]]; then
-        NO_CACHE=1
-    else
-        ARGS+=("$arg")
-    fi
+    case "$arg" in
+        --no-cache) NO_CACHE=1 ;;
+        --local) LOCAL_ONLY=1 ;;
+        *) ARGS+=("$arg") ;;
+    esac
 done
 set -- "${ARGS[@]}"
 
@@ -523,8 +591,15 @@ LOOKUP_KEY=""
 LOOKUP_STATUS=0
 EXIT_STATUS=0
 FILTER_RUN=0
+BUILDLOG_MAC=""
+BUILDLOG_MAC_REASON=""
+BUILDLOG_MAC_S=""
 if [[ "$CMD" == test && " ${ARGS[*]} " == *" --filter "* ]]; then
     FILTER_RUN=1
+fi
+if [[ "$CMD" == test && "$LOCAL_ONLY" -eq 1 ]]; then
+    BUILDLOG_MAC=declined
+    BUILDLOG_MAC_REASON=local_flag
 fi
 
 tree_key() {
@@ -574,9 +649,109 @@ note_event() {
     if [[ -n "${MEM_KILL_FILE:-}" && -f "${MEM_KILL_FILE}.stopped" ]]; then
         mem_kill_stopped=1
     fi
-    BUILDLOG_MEM_KILLS="$mem_kills" BUILDLOG_MEM_KILL_STOPPED="$mem_kill_stopped" BUILDLOG_TOKEN_WAIT_S="${TOKEN_WAIT_S:-0}" "$PY" "$BUILDLOG_RECORD" call "$outcome" "$status" "$cached" "$wait" "$wall" \
+    BUILDLOG_MEM_KILLS="$mem_kills" BUILDLOG_MEM_KILL_STOPPED="$mem_kill_stopped" BUILDLOG_TOKEN_WAIT_S="${TOKEN_WAIT_S:-0}" BUILDLOG_MAC="$BUILDLOG_MAC" BUILDLOG_MAC_REASON="$BUILDLOG_MAC_REASON" BUILDLOG_MAC_S="$BUILDLOG_MAC_S" "$PY" "$BUILDLOG_RECORD" call "$outcome" "$status" "$cached" "$wait" "$wall" \
         "$build" "$saved" "${SECONDS}" "$CMD" ${ARGS[@]+"${ARGS[@]}"} \
         </dev/null >/dev/null 2>&1 || true
+}
+
+MAC_RUNNER="${VERIFY_MAC_RUNNER:-$HOME/.claude/scripts/mac_test/offload.py}"
+MAC_RESULT_FILE=""
+MAC_RUNNER_PID=""
+
+forward_mac_runner_signal() {
+    local signal_name=$1 exit_status=$2
+    trap - INT TERM HUP
+    if [[ -n "$MAC_RUNNER_PID" ]]; then
+        kill -s "$signal_name" "$MAC_RUNNER_PID" 2>/dev/null || true
+        wait "$MAC_RUNNER_PID" 2>/dev/null || true
+    fi
+    if [[ -n "$MAC_RESULT_FILE" ]]; then
+        if [[ -d "$MAC_RESULT_FILE" ]]; then
+            rmdir "$MAC_RESULT_FILE" 2>/dev/null || true
+        else
+            rm -f "$MAC_RESULT_FILE"
+        fi
+    fi
+    exit "$exit_status"
+}
+
+try_mac_test() {
+    trap 'forward_mac_runner_signal INT 130' INT
+    trap 'forward_mac_runner_signal TERM 143' TERM
+    trap 'forward_mac_runner_signal HUP 129' HUP
+    local runner_status result_text="" result_word="" result_reason=""
+    local result_seconds="" mac_words=0 line
+    local runner_args=(run --repo-root "$(git rev-parse --show-toplevel)"
+        --package "$PKG" --call-id "$BUILDLOG_CALL_ID")
+    MAC_RESULT_FILE="$(mktemp)"
+    runner_args+=(--result "$MAC_RESULT_FILE")
+    if [[ "$FILTER_RUN" -eq 1 ]]; then
+        runner_args+=(--filter-run)
+    fi
+    runner_args+=(-- "${NEXTEST_ARGS[@]}")
+
+    "$PY" "$MAC_RUNNER" "${runner_args[@]}" &
+    MAC_RUNNER_PID=$!
+    if wait "$MAC_RUNNER_PID"; then
+        runner_status=0
+    else
+        runner_status=$?
+    fi
+    trap - INT TERM HUP
+    MAC_RUNNER_PID=""
+
+    if [[ -f "$MAC_RESULT_FILE" && -r "$MAC_RESULT_FILE" \
+          && -s "$MAC_RESULT_FILE" ]]; then
+        result_text="$(< "$MAC_RESULT_FILE")"
+        while IFS= read -r line; do
+            case "$line" in
+                mac=*)
+                    ((mac_words += 1))
+                    result_word="${line#mac=}"
+                    ;;
+                reason=*) result_reason="${line#reason=}" ;;
+                seconds=*) result_seconds="${line#seconds=}" ;;
+            esac
+        done <<< "$result_text"
+    fi
+    if [[ -d "$MAC_RESULT_FILE" ]]; then
+        rmdir "$MAC_RESULT_FILE" 2>/dev/null || true
+    else
+        rm -f "$MAC_RESULT_FILE"
+    fi
+    MAC_RESULT_FILE=""
+
+    if [[ "$mac_words" -ne 1 \
+          || ! "$result_word" =~ ^(passed|failed|lost|declined)$ \
+          || ( "$result_word" == passed && "$runner_status" -ne 0 ) \
+          || ( "$result_word" == failed && "$runner_status" -eq 0 ) ]]; then
+        BUILDLOG_MAC=declined
+        BUILDLOG_MAC_REASON=runner
+        BUILDLOG_MAC_S=""
+        return
+    fi
+
+    BUILDLOG_MAC="$result_word"
+    BUILDLOG_MAC_REASON="$result_reason"
+    BUILDLOG_MAC_S="$result_seconds"
+    case "$result_word" in
+        declined|lost)
+            return
+            ;;
+        failed)
+            note_event failed "${SECONDS}" 0 "" 0 "$runner_status"
+            exit "$runner_status"
+            ;;
+        passed)
+            if [[ "$FILTER_RUN" -eq 1 ]]; then
+                BUILDLOG_MAC=passed_filter
+                echo "verify.sh: PASS on the Mac (macOS). A filtered run is feedback, so nothing ran on natedev."
+                note_event ran "${SECONDS}" 0 "" 0 0
+                exit 0
+            fi
+            echo "verify.sh: passed on the Mac (macOS); now confirming on natedev, which is the gate."
+            ;;
+    esac
 }
 
 # Succeeds, after printing the record, when this call already passed on this
@@ -699,6 +874,13 @@ fi
 
 if cache_lookup; then
     exit "${LOOKUP_STATUS}"
+fi
+
+if [[ "$CMD" == test ]]; then
+    compose_nextest_args
+    if [[ "$LOCAL_ONLY" -eq 0 && -f "$MAC_RUNNER" ]]; then
+        try_mac_test
+    fi
 fi
 
 # Open a progress window for the duration of this run when a delegate session is
@@ -902,67 +1084,7 @@ case "$CMD" in
         run cargo check --workspace --lib --bins "${FEATURE_FLAGS[@]}"
         ;;
     test)
-        PKG="${1:?verify.sh test <package> [integration_test]}"
-        shift
-        TARGET=""
-        FILTERS=()
-        if [[ $# -gt 0 && "$1" != --* ]]; then
-            TARGET="$1"
-            shift
-        fi
-        # --filter, as often as named, and --features in any order; a target
-        # takes no filter.
-        REST=()
-        while [[ $# -gt 0 ]]; do
-            if [[ "$1" == "--filter" && -z "$TARGET" \
-                  && "${2:-}" =~ ^[A-Za-z0-9_:]+$ ]]; then
-                FILTERS+=("$2")
-                shift 2
-            else
-                REST+=("$1")
-                shift
-            fi
-        done
-        take_features ${REST[@]+"${REST[@]}"}
-        require_member "$PKG"
-        # --no-fail-fast: nextest cancels every remaining test after the first
-        # failure, so one broken test silently hides the rest of the suite. A
-        # phase gate has to report the whole result, not the first stop.
-        # Keep workspace feature resolution; -E runs only this package's tests.
-        if [[ ${#FILTERS[@]} -gt 0 ]]; then
-            # Any of the names: & binds tighter than |, so a union of two or
-            # more goes in parentheses.
-            FILTER="test(${FILTERS[0]})"
-            for name in "${FILTERS[@]:1}"; do
-                FILTER+=" | test($name)"
-            done
-            if [[ ${#FILTERS[@]} -gt 1 ]]; then
-                FILTER="($FILTER)"
-            fi
-            TEST_FILTER="package($PKG) & $FILTER"
-        elif [[ -n "$TARGET" ]]; then
-            # Integration test target names are unique across the workspace,
-            # so --test builds just that binary, under the workspace's
-            # feature resolution.
-            run_nextest --no-fail-fast --workspace --test "$TARGET" \
-                -E "package($PKG)" "${FEATURE_FLAGS[@]}"
-        else
-            TEST_FILTER="package($PKG)"
-        fi
-        if [[ -z "$TARGET" ]]; then
-            # Build only the targets this package's tests live in
-            # (TEST_TARGETS_PY): --lib, which cannot be narrowed to one member
-            # under --workspace and is left out for a package without a lib,
-            # and the package's own bins and test-enabled targets. --bins
-            # --tests linked every member's test executables, 78 in hana, to
-            # run one package's; this links 4 (2026-10-04). The integration
-            # tests stay in, matching what the lint half compiles under
-            # clippy: without them a phase could lint an integration test,
-            # pass its gate, and checkpoint without ever running it.
-            take_test_targets
-            run_nextest --no-fail-fast --workspace "${TEST_SELECTION[@]}" \
-                -E "$TEST_FILTER" "${FEATURE_FLAGS[@]}"
-        fi
+        run_nextest "${NEXTEST_ARGS[@]}"
         ;;
     lint)
         PKG="${1:?verify.sh lint <package>}"
