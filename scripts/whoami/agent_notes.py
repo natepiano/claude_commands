@@ -6,9 +6,8 @@ that quota window expires; unknown or expired usage is YAML null. Never infer
 100% remaining from a reset. weekly_usage_checked_at records the observation in
 UTC so a saved reading is distinguishable from live usage. No credentials are
 saved. Other frontmatter and note bodies are preserved. Run as a script, it then
-records each run-out the readings show (run_out.py), then hands the notes to
-quota_alert.py, which messages sessions when an account runs low, and to
-codex_pacer.py, which decides the `pace` tier from them; `refresh`
+hands the notes to quota_alert.py, which messages sessions when an account runs
+low, and to codex_pacer.py, which decides the `pace` tier from them; `refresh`
 (/quota_refresh) is the run after the user reports a usage reset.
 """
 
@@ -18,6 +17,7 @@ import asyncio
 import json
 import os
 import re
+import subprocess
 import sys
 import tempfile
 from dataclasses import dataclass
@@ -26,9 +26,10 @@ from pathlib import Path
 from typing import cast
 
 import codex_pacer
+import five_hour
 from agent_accounts import EASTERN, Report, live_reports
 from quota_alert import AgentNote, alert, current_session, refresh
-from run_out import READINGS_LOG, RUN_OUTS_LOG, record_run_outs
+from run_out import READINGS_LOG
 
 AGENTS_DIR = Path.home() / "rust" / "hanadocs" / "agents"
 RESET_FORMAT = "%Y-%m-%dT%H:%M:%S"
@@ -220,6 +221,11 @@ def update() -> list[str]:
     messages: list[str] = []
     for account in reports:
         messages += apply(notes, account, checked_at)
+    try:
+        messages += five_hour.watch(reports)
+    except (OSError, ValueError, KeyError, TypeError, subprocess.SubprocessError) as error:
+        # The 5-hour watch must never cost the notes or the weekly alerts.
+        messages.append(f"5-hour watch did not run: {error!r}")
     return messages
 
 
@@ -238,12 +244,6 @@ def main() -> None:
         sys.exit("usage: agent_notes.py [refresh]")
     for line in update():
         print(line)
-    try:
-        for line in record_run_outs(READINGS_LOG, RUN_OUTS_LOG):
-            print(line)
-    except (OSError, ValueError) as error:
-        # A failed record only leaves the footer's lean where it was.
-        print(f"run-outs not recorded: {error!r}")
     notes: list[AgentNote] = list(read_notes())
     for line in refresh(notes, current_session()) if sys.argv[1:] else alert(notes):
         print(line)

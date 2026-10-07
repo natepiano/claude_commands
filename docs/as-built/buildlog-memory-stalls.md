@@ -50,7 +50,7 @@ The section always has its heading `### Memory pressure`, then `Source: 60 s mac
     - Rows are the five steps with the largest `mem_stall_some_s > 0`, largest first. `full` is recorded but not shown.
     - Caller is `caller_label()`, which appends the host when more than one host built that day. A step whose cwd is under a temp folder shows as `scratch (temp folders)` instead.
     - "At once" counts the steps on the same host for which `started_at <= s.started_at < ended_at`. The count includes the step itself, every caller and scratch steps. Steps on another host never count. `steps_host_started` serves this subquery. It compares ISO strings, which works because `store.utc_iso` writes one fixed-width UTC format.
-  - **One line under the table**, either:
+  - **The sample line**, after the stall table's blank line (or after the instrument lines when there is no table), either:
     - `60 s samples: peak used memory X GiB, peak swap Y GiB; peak builds B GiB, peak CI C GiB (process memory); machine stall: some A, full B.` Each slice peak is the day's highest `builds_anon_bytes` or `ci_anon_bytes`, or `unavailable` when no sample has it., or
     - `60 s samples: none; machine stall: unavailable.` when there are no samples.
 - **How the machine stall is summed:**
@@ -89,7 +89,7 @@ The section always has its heading `### Memory pressure`, then `Source: 60 s mac
 
 - **The sampler never opens the SQLite index.** `buildlog sample` appends one JSON line and exits; the index ingests that line on the next query. A test pins that no `index.sqlite` appears.
 - **A test never writes the real log at `~/.local/state/buildlog`.** Every test module imports `test_index`, whose import calls `use_test_log()` and points `BUILDLOG_DIR` at a temp dir for the whole suite. `point_root_at()` moves it for a single test. Subprocess tests also pass `BUILDLOG_DIR` explicitly. The real `cli.py sample` test runs against a temp root.
-- **Every report section follows one layout.** It states its source and has at most one line under each table.
+- **Nothing sits directly under a report table but its one `Source:` line.** That line carries any explanation of the table; a table without one ends at the next blank line. This section's `Source:` line sits under the heading, so its stall table ends at the blank line (`docs/as-built/build-followups.md` lists which tables carry the line).
 - **`report.py` has one style.** Cells are formatted through `table()`, `seconds()`, `count()` and `gib()`, with no new formatters.
 - **Unmeasured stall is null, never zero.** Inside Python it is `sample.Unmeasured.VALUE`; in JSON it is `null` and in SQLite `NULL`. Zero means measured with no stall. The report's `> 0` filter drops null rows, and SQL `avg()` skips them.
 - **The scope string must not change the step's outcome.** It keeps the step's exit status, prints nothing, and writes the marker before the step runs. Callers run under `set -euo pipefail`, and a missing marker means the scope never started the step, so `buildlog_exec` runs it without the scope.

@@ -10,6 +10,10 @@ import tempfile
 import unittest
 from pathlib import Path
 from typing import cast, override
+from unittest import mock
+
+import tmux_names
+import showrunners
 
 SCRIPT = Path(__file__).with_name("tmux_names.py")
 
@@ -56,6 +60,9 @@ elif args[0] == 'list-panes':
         for pane in panes:
             print(name + '\\t' + pane)
 elif args[0] == 'rename-session':
+    if os.path.exists(os.environ.get('TEST_TMUX_RENAME_FAILURE', '')):
+        print('injected rename failure', file=sys.stderr)
+        raise SystemExit(1)
     old, new = args[args.index('-t') + 1][1:], args[-1]
     if old not in state or new in state:
         raise SystemExit(1)
@@ -91,7 +98,8 @@ with open(os.environ['TEST_FAULTS'], 'a') as out:
                             "TMUX_NAMES_TMUX": "tmux", "TMUX_NAMES_SEND": str(sender),
                             "TMUX_NAMES_FAULT_STATE_DIR": str(self.root / "fault-state"),
                             "TEST_FAULTS": str(self.root / "faults"),
-                            "TEST_TMUX_STATE": str(self.tmux)}
+                            "TEST_TMUX_STATE": str(self.tmux),
+                            "TEST_TMUX_RENAME_FAILURE": str(self.root / "rename-failure")}
 
     def close_children(self) -> None:
         for child in self.children:
@@ -149,6 +157,37 @@ with open(os.environ['TEST_FAULTS'], 'a') as out:
         self.session("new", "%1")
         self.assertEqual(self.tick().returncode, 0)
         self.assertEqual(self.names(), {"new": ["%1"]})
+
+    def test_registry_failure_leaves_tmux_old_and_next_tick_finishes(self) -> None:
+        self.session("new", "%1")
+        with mock.patch.dict(os.environ, self.environment, clear=True), \
+                mock.patch.object(tmux_names, "TMUX", "tmux"), \
+                mock.patch.object(showrunners, "CONFIG", self.config), \
+                mock.patch.object(showrunners, "change", side_effect=ValueError("injected failure")):
+            outcome = tmux_names.rename_session("%1", "old", "new")
+        self.assertIsInstance(outcome, tmux_names.RenameIncomplete)
+        self.assertEqual(self.names(), {"old": ["%1"]})
+        self.assertEqual(self.tick().returncode, 0)
+        self.assertEqual(self.names(), {"new": ["%1"]})
+        self.assertEqual(self.entries()[0]["units"], ["new"])
+
+    def test_tmux_failure_after_registry_change_is_finished_next_tick(self) -> None:
+        self.session("new", "%1")
+        _ = (self.root / "rename-failure").touch()
+        first = self.tick()
+        self.assertIn("tmux session still names", first.stderr)
+        self.assertEqual(self.names(), {"old": ["%1"]})
+        self.assertEqual(self.entries()[0]["units"], ["new"])
+        (self.root / "rename-failure").unlink()
+        self.assertEqual(self.tick().returncode, 0)
+        self.assertEqual(self.names(), {"new": ["%1"]})
+        self.assertEqual(self.entries()[0]["units"], ["new"])
+
+    def test_rename_session_does_not_change_another_pane_session(self) -> None:
+        _ = self.tmux.write_text(json.dumps({"old": ["%1"], "other": ["%2"]}))
+        self.session("new", "%1")
+        self.assertEqual(self.tick().returncode, 0)
+        self.assertEqual(self.names(), {"new": ["%1"], "other": ["%2"]})
 
     def test_shared_pane_and_taken_name_are_skipped_and_fault_once(self) -> None:
         self.session("new", "%1")

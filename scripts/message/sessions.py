@@ -7,6 +7,7 @@ import json
 import os
 import stat
 import sys
+from enum import Enum
 from pathlib import Path
 from typing import TypedDict, cast
 
@@ -19,11 +20,18 @@ class SessionRecord(TypedDict):
     updatedAt: int
 
 
-def read_session(path: Path) -> SessionRecord | None:
+class UnreadableSessionRecord(Enum):
+    FOUND = "unreadable session record"
+
+
+RegistryEntry = SessionRecord | UnreadableSessionRecord
+
+
+def read_session(path: Path) -> RegistryEntry:
     try:
         parsed = cast(object, json.loads(path.read_text()))
         if not isinstance(parsed, dict):
-            return None
+            return UnreadableSessionRecord.FOUND
         data = cast(dict[str, object], parsed)
         pid = data.get("pid")
         session_id = data.get("sessionId")
@@ -40,7 +48,7 @@ def read_session(path: Path) -> SessionRecord | None:
             or not isinstance(updated_at, int)
             or isinstance(updated_at, bool)
         ):
-            return None
+            return UnreadableSessionRecord.FOUND
         return SessionRecord(
             pid=pid,
             sessionId=session_id,
@@ -49,7 +57,7 @@ def read_session(path: Path) -> SessionRecord | None:
             updatedAt=updated_at,
         )
     except (OSError, ValueError, TypeError, json.JSONDecodeError):
-        return None
+        return UnreadableSessionRecord.FOUND
 
 
 def live_session(record: SessionRecord) -> bool:
@@ -75,25 +83,33 @@ def main(argv: list[str]) -> int:
         os.environ.get("NOTIFIER_SESSIONS_DIR", str(Path.home() / ".claude/sessions"))
     )
     try:
-        records = (
-            record for path in directory.glob("*.json")
-            if (record := read_session(path)) is not None
+        paths = sorted(path for path in directory.iterdir() if path.suffix == ".json")
+    except OSError as error:
+        detail = str(error).splitlines()
+        print(
+            f"sessions: cannot list registry: {detail[0] if detail else type(error).__name__}",
+            file=sys.stderr,
         )
-        if command == "socket" and target.startswith("session:"):
-            matches = (record for record in records if record["sessionId"] == target[8:])
-        elif command == "socket":
-            matches = (record for record in records if record["name"] == target)
-        elif target.isascii() and target.isdigit():
-            matches = (record for record in records if record["pid"] == int(target))
-        else:
-            matches = (record for record in records if record["name"] == target)
-        newest = max(
-            (record for record in matches if live_session(record)),
-            key=lambda record: record["updatedAt"], default=None,
-        )
-    except OSError:
-        return 1
+        return 3
+    reads = [read_session(path) for path in paths]
+    unreadable = any(read is UnreadableSessionRecord.FOUND for read in reads)
+    records = (read for read in reads if not isinstance(read, UnreadableSessionRecord))
+    if command == "socket" and target.startswith("session:"):
+        matches = (record for record in records if record["sessionId"] == target[8:])
+    elif command == "socket":
+        matches = (record for record in records if record["name"] == target)
+    elif target.isascii() and target.isdigit():
+        matches = (record for record in records if record["pid"] == int(target))
+    else:
+        matches = (record for record in records if record["name"] == target)
+    newest = max(
+        (record for record in matches if live_session(record)),
+        key=lambda record: record["updatedAt"], default=None,
+    )
     if newest is None:
+        if unreadable:
+            print("sessions: one or more registry files could not be read", file=sys.stderr)
+            return 3
         return 1
     print(newest["messagingSocketPath"] if command == "socket" else newest["sessionId"])
     return 0

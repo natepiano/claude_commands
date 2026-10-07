@@ -51,6 +51,19 @@ config decides whether a check runs, never with what flags.
 call `lint_config_enabled <op>` (plus `lint_config_skip_notice <op> <what>` for
 the SKIPPED line), or run it as the `/lint_config` CLI.
 
+## mac_test.conf
+
+Controls Mac test offload and the `/mac_test` block command. It names the CI
+repository, workflow, job and repository variable; bounds each `gh` call;
+names the earlier job that reads the CI switch; sets the default and maximum
+block lifetime; and sets the expiry-warning window. Offload settings name the
+SSH host and connection and probe time limits, the unreachable retry delay,
+the free-space and load limits, default and repository memory budgets,
+Linux-only packages, and Mac nextest exclusions. A repository needs a
+`linux_only.<repo>` key, even when its value is empty, before tests can run on
+the Mac. An empty `ci_repo` disables CI calls. `MAC_TEST_CONFIG` selects a
+different file for isolated runs.
+
 ## clippy.conf
 
 The `/clippy` delegation tuning file — *who* runs the checks, where `lint.conf`

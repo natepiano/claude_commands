@@ -100,6 +100,24 @@ _FILE_VALUE = re.compile(r"\b(?:const|static)\s+([A-Za-z_]\w*)\s*:\s*([^=;]+)=")
 _BOUNDARY = frozenset(("(", "[", "{", ",", ";", "=", "+=", "-=", "=>", "<", ">", "&&", "||", "..", "return", "let"))
 
 
+def _has_let_else(source: str, start: int) -> bool:
+    """Find an else on this let statement, after an initializer not ending in }."""
+    brackets: list[str] = []
+    previous = ""
+    for match in _LEX.finditer(source, start):
+        token = match.group()
+        if not brackets and token == ";":
+            return False
+        if not brackets and token == "else" and previous != "}":
+            return True
+        if token in {"(", "[", "{"}:
+            brackets.append(token)
+        elif token in {")", "]", "}"} and brackets:
+            _ = brackets.pop()
+        previous = token
+    return False
+
+
 def _attribute_exempts(attribute: str) -> bool:
     compact = re.sub(r"\s+", "", _STRING.sub('""', attribute))
     return bool(_EXEMPT.search(compact) and re.search(r"(?:allow|expect)\(", compact))
@@ -271,7 +289,8 @@ def _sqrt_receiver(lexemes: list[RustToken], expr_start: int, expr_end: int) -> 
 
 def _find_in_body(
     source: str, visible: str, fn_start: int, start: int, end: int,
-    scalar_fields: set[str], file_nonfloats: set[str], nested: list[tuple[int, int]],
+    scalar_fields: set[str], nonfloat_fields: set[str], file_floats: set[str], file_nonfloats: set[str],
+    nested: list[tuple[int, int]],
     const_ranges: list[tuple[int, int]],
 ) -> list[FloatMulAddFinding]:
     body = visible[start:end]
@@ -280,16 +299,23 @@ def _find_in_body(
     typed_source = visible[fn_start:end]
     annotations = {match.group(1): match.group(2).strip() for match in _ANNOTATION.finditer(typed_source)}
     scalars = {name for name, annotation in annotations.items() if annotation in {"f32", "f64"}}
-    excluded = file_nonfloats | {name for name, annotation in annotations.items() if annotation not in {"f32", "f64"}}
+    local_bindings = {match.group(1) for match in _VECTOR_BINDING.finditer(typed_source)}
+    scalars |= file_floats - annotations.keys() - local_bindings
+    excluded = (file_nonfloats - annotations.keys()) | {
+        name for name, annotation in annotations.items() if annotation not in {"f32", "f64"}
+    }
     for match in _PATTERN_BINDING.finditer(typed_source):
         names = ([match.group(1), match.group(3)] if match.group(2) is None
                  else [name.group() for name in re.finditer(r"[A-Za-z_]\w*", match.group(2))])
         excluded.update(name for name in names if name and name not in annotations)
     excluded.update(name for match in _DESTRUCTURED_PATTERN.finditer(typed_source)
                     if (name := match.group(1) or match.group(2)) not in annotations)
-    excluded.update(match.group(1) for match in _LET_ELSE.finditer(typed_source) if match.group(1) not in annotations)
+    excluded.update(match.group(1) for match in _LET_ELSE.finditer(typed_source)
+                    if match.group(1) not in annotations and _has_let_else(typed_source, match.start()))
     for match in _COMPOUND_PATTERN.finditer(typed_source):
         pattern = match.group(1) or match.group(2) or match.group(3)
+        if match.group(3) and not _has_let_else(typed_source, match.start()):
+            continue
         excluded.update(name.group() for name in re.finditer(r"[A-Za-z_]\w*", pattern)
                         if name.group() not in annotations)
     excluded.update(
@@ -299,8 +325,8 @@ def _find_in_body(
     def field_is_scalar(expression: str) -> bool:
         if "." not in expression:
             return True
-        fields = (match.group(1) for match in re.finditer(r"(?<!\d)\.([A-Za-z_]\w*|\d+)\b", expression))
-        return all(field in scalar_fields for field in fields)
+        fields = re.findall(r"(?<!\d)\.([A-Za-z_]\w*|\d+)\b", expression)
+        return not fields or fields[-1] in scalar_fields
 
     lexemes = [RustToken(match.group(), start + match.start(), start + match.end()) for match in _LEX.finditer(body)]
     statement_boundaries = [index for index, lexeme in enumerate(lexemes) if lexeme.text in {";", "{", "}"}]
@@ -336,7 +362,10 @@ def _find_in_body(
             if not ((_literal_compatible(a, excluded) or "." in a and field_is_scalar(a))
                     and (_literal_compatible(b, excluded) or "." in b and field_is_scalar(b))):
                 continue
-        elif not (_float_atom(a, scalars, excluded) and _float_atom(b, scalars, excluded)):
+        elif not ((_float_atom(a, scalars, excluded) or "." in a and "(" not in a and field_is_scalar(a)
+                   and a.rsplit(".", 1)[-1] not in nonfloat_fields)
+                  and (_float_atom(b, scalars, excluded) or "." in b and "(" not in b and field_is_scalar(b)
+                       and b.rsplit(".", 1)[-1] not in nonfloat_fields)):
             continue
         if a_start > 0 and lexemes[a_start - 1].text in {"*", "/", "%", "as"}:
             continue
@@ -404,7 +433,7 @@ def _find_in_body(
             receiver, addend = a, f"-{c}"
         else:
             receiver, addend = a, c
-        if not re.fullmatch(r"[A-Za-z_]\w*|\d[\w.]*", receiver):
+        if not re.fullmatch(r"[A-Za-z_]\w*(?:\.[A-Za-z_]\w*)*|\d[\w.]*", receiver):
             receiver = f"({receiver})" if not receiver.startswith("(") else receiver
         call = f"{receiver}.mul_add({b}, {addend})"
         if form == "product_last_-=":
@@ -437,10 +466,23 @@ def float_mul_add_findings(rs_file: os.PathLike[str] | str) -> tuple[SuboptimalF
                           if match.end() - 1 in opening_at and opening_at[match.end() - 1] in pairs)
     scalar_fields = {field.group(1) for declaration in _NAMED_FIELDS.finditer(visible)
                      for field in _SCALAR_TYPE.finditer(declaration.group(1))}
-    file_nonfloats = {match.group(1) for match in _FILE_VALUE.finditer(visible)
-                      if match.group(2).strip() not in {"f32", "f64"}}
+    nonfloat_fields = {field.group(1) for declaration in _NAMED_FIELDS.finditer(visible)
+                       for field in _ANNOTATION.finditer(declaration.group(1))
+                       if field.group(2).strip() not in {"f32", "f64"}}
+    declarations = [(match.start(), match.group(1), match.group(2).strip())
+                    for match in _FILE_VALUE.finditer(visible)]
+    file_values: dict[str, str] = {}
+    for position, name, annotation in declarations:
+        if not any(start <= position < end for _, start, end in bodies):
+            if name not in file_values or annotation not in {"f32", "f64"}:
+                file_values[name] = annotation
     results: list[FloatMulAddFinding] = []
     for body_index, (fn_start, start, end) in enumerate(bodies):
+        visible_values = file_values.copy()
+        visible_values.update((name, annotation) for position, name, annotation in declarations
+                              if start <= position < end)
+        file_floats = {name for name, annotation in visible_values.items() if annotation in {"f32", "f64"}}
+        file_nonfloats = visible_values.keys() - file_floats
         nested: list[tuple[int, int]] = []
         for _, nested_start, nested_end in bodies[body_index + 1:]:
             if nested_start >= end:
@@ -448,5 +490,6 @@ def float_mul_add_findings(rs_file: os.PathLike[str] | str) -> tuple[SuboptimalF
             if nested_end < end:
                 nested.append((nested_start, nested_end))
         results.extend(_find_in_body(source, visible, fn_start, start, end,
-                                     scalar_fields, file_nonfloats, nested, const_ranges))
+                                     scalar_fields, nonfloat_fields, file_floats, file_nonfloats,
+                                     nested, const_ranges))
     return scope, results

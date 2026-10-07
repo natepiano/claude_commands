@@ -803,14 +803,21 @@ buildlog_exec() {
 
 release_token() {
     [[ "${TOKEN_HELD}" -eq 1 ]] || return 0
+    local release_status=0
+    bash "${BOARD_HELPER}" release "${BOARD_DIR}" "${BOARD_SLOT}" cargo --pid $$ >/dev/null \
+        || release_status=$?
+    # An expired hold may be reclaimed while this step is still running. The
+    # new holder owns the token; the old step's result remains authoritative.
+    (( release_status == 0 || release_status == 3 )) || return "$release_status"
     TOKEN_HELD=0
-    bash "${BOARD_HELPER}" release "${BOARD_DIR}" "${BOARD_SLOT}" cargo >/dev/null 2>&1 || true
 }
 
 # Again with the token held: a peer running this same call on this tree held
 # the token until its result was recorded.
 if cache_lookup; then
-    release_token
+    if ! release_token && (( LOOKUP_STATUS == 0 )); then
+        LOOKUP_STATUS=1
+    fi
     exit "${LOOKUP_STATUS}"
 fi
 RUN_STARTED=${SECONDS}
@@ -869,11 +876,13 @@ verify_cleanup() {
     if [[ "${ACTIVITY_ACTIVE}" -eq 1 ]]; then
         finish_activity "${status}"
     fi
-    release_token
+    if ! release_token && (( EXIT_STATUS == 0 )); then
+        EXIT_STATUS=1
+    fi
 }
 # EXIT alone would report success for a failed cargo run, so branch on the
 # status the trap receives; a lint failure record keeps it.
-trap 'EXIT_STATUS=$?; [[ ${EXIT_STATUS} -eq 0 ]] && verify_cleanup completed || verify_cleanup error' EXIT
+trap 'EXIT_STATUS=$?; [[ ${EXIT_STATUS} -eq 0 ]] && verify_cleanup completed || verify_cleanup error; exit "${EXIT_STATUS}"' EXIT
 verify_interrupted() {
     trap - EXIT INT TERM HUP
     EXIT_STATUS=$((128 + $1))

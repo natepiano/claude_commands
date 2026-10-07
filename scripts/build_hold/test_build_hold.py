@@ -138,6 +138,62 @@ class HolderTests(IsolatedBuildHoldTest):
             self.assertEqual(notice, "released; still held by remaining (for remaining work, release eta unknown)")
 
 
+class RenameHolderTests(IsolatedBuildHoldTest):
+    def holder(self, name: str) -> Path:
+        folder = self.scratch / "holders"
+        folder.mkdir(exist_ok=True)
+        return write_holder(folder, name, "2026-10-07T10:00:00+00:00", "rename work")
+
+    def cycle(self) -> build_hold.HoldCycle:
+        cycle = build_hold.open_cycle(datetime.fromisoformat("2026-10-07T10:00:00+00:00"))
+        cycle["holders"] = {"old": {"since": "2026-10-07T10:00:00+00:00", "released_at": ""}}
+        cycle["recipients"] = {"session-old": "old", "session-other": "other"}
+        cycle["entries"] = [
+            {"session_id": "session-old", "name": "old", "state": "AwaitingRelease"},
+            {"session_id": "session-other", "name": "other", "state": "AwaitingRelease"},
+        ]
+        build_hold.save_cycle(cycle)
+        return cycle
+
+    def test_rename_holder_moves_file_and_cycle_names(self) -> None:
+        old_path = self.holder("old")
+        _ = self.cycle()
+
+        self.assertEqual(build_hold.rename_holder("old", "new"),
+                         ["build hold holder", "build hold cycle"])
+
+        new_path = old_path.with_name("new")
+        self.assertFalse(old_path.exists())
+        self.assertEqual(cast(dict[str, object], json.loads(new_path.read_text()))["holder"], "new")
+        cycle = build_hold.read_cycle()
+        assert cycle is not None
+        self.assertEqual(set(cycle["holders"]), {"new"})
+        self.assertEqual(cycle["recipients"], {"session-old": "new", "session-other": "other"})
+        self.assertEqual([entry["name"] for entry in cycle["entries"]], ["new", "other"])
+
+    def test_rename_holder_refuses_two_holder_files_without_changes(self) -> None:
+        old_path = self.holder("old")
+        new_path = self.holder("new")
+        cycle = self.cycle()
+        cycle_path = self.scratch / "release" / cycle["id"] / "cycle.json"
+        before = (old_path.read_bytes(), new_path.read_bytes(), cycle_path.read_bytes())
+
+        with self.assertRaisesRegex(ValueError, "both 'old' and 'new'"):
+            _ = build_hold.rename_holder("old", "new")
+
+        self.assertEqual((old_path.read_bytes(), new_path.read_bytes(), cycle_path.read_bytes()), before)
+
+    def test_rename_holder_without_old_file_changes_nothing(self) -> None:
+        cycle = self.cycle()
+        cycle_path = self.scratch / "release" / cycle["id"] / "cycle.json"
+        before = cycle_path.read_bytes()
+
+        self.assertEqual(build_hold.rename_holder("old", "new"), [])
+
+        self.assertEqual(cycle_path.read_bytes(), before)
+        self.assertFalse((self.scratch / "holders" / "new").exists())
+
+
 class QuietTests(IsolatedBuildHoldTest):
     def test_long_username_cargo_keeps_quiet_check_busy(self) -> None:
         user = "natepiano"
@@ -1090,6 +1146,62 @@ class ReleaseStateTests(IsolatedBuildHoldTest):
         self.assertIn("--to", calls[1])
         self.assertEqual(calls[1][calls[1].index("--to") + 1], "uds:/tmp/registered.sock")
         self.assertNotIn("shared name", calls[1])
+        self.assertIn("build_hold.py nothing-to-build", calls[1][calls[1].index("--text") + 1])
+
+    def test_a_session_with_nothing_to_build_releases_the_next_at_once(self) -> None:
+        now = self.begin("first", "second")
+        sent: list[str] = []
+
+        def deliver(entry: build_hold.ReleaseEntry, _socket: str) -> int:
+            sent.append(entry["session_id"])
+            return 0
+
+        with mock.patch.object(build_hold, "socket_for", return_value="/tmp/socket"), \
+             mock.patch.object(build_hold, "send_release", side_effect=deliver):
+            _ = self.advance(now)
+            self.assertEqual(sent, ["first"])
+            answered = subprocess.run(
+                ["python3", str(SCRIPT), "nothing-to-build"], capture_output=True, text=True, check=False,
+                env={**os.environ, "CLAUDE_CODE_SESSION_ID": "first"},
+            )
+            self.assertEqual(answered.returncode, 0, answered.stderr)
+            self.assertEqual(answered.stdout.strip(),
+                             "shared name [first]: NothingToBuild; the release moves on to the next session")
+            self.assertEqual(set(self.entries()[0]), {"session_id", "name", "state", "answered_at"})
+            _ = build_hold.aware_instant(self.entries()[0].get("answered_at", ""))
+            complete, detail = self.advance(now)
+            self.assertFalse(complete)
+            self.assertEqual(sent, ["first", "second"])
+            self.assertIn("second", detail)
+            self.assertIn("NothingToBuild", build_hold.answer_nothing_to_build("second"))
+            complete, detail = self.advance(now)
+            self.assertTrue(complete)
+            self.assertEqual(detail, "shared name [first]: NothingToBuild; shared name [second]: NothingToBuild")
+
+    def test_nothing_to_build_answers_only_a_release_still_awaiting_admission(self) -> None:
+        now = self.begin("first", "second")
+        with mock.patch.object(build_hold, "socket_for", return_value="/tmp/socket"), \
+             mock.patch.object(build_hold, "send_release", return_value=0):
+            _ = self.advance(now)
+        self.assertEqual(build_hold.answer_nothing_to_build("unregistered"),
+                         "nothing-to-build ignored: this session is not registered")
+        self.assertEqual(build_hold.answer_nothing_to_build("second"),
+                         "nothing-to-build ignored: shared name [second]: AwaitingRelease")
+        self.assertIn("WaitingForMemory", build_hold.mark_gate("first", "WaitingForMemory"))
+        self.assertEqual(build_hold.answer_nothing_to_build("first"),
+                         "nothing-to-build ignored: shared name [first]: WaitingForMemory")
+        self.assertEqual([entry["state"] for entry in self.entries()], ["WaitingForMemory", "AwaitingRelease"])
+        self.assertEqual(build_hold.answer_nothing_to_build(""), "NoSessionId")
+
+    def test_a_queued_release_can_answer_nothing_to_build(self) -> None:
+        now = self.begin("first", "second")
+        with mock.patch.object(build_hold, "socket_for", return_value="/tmp/socket"), \
+             mock.patch.object(build_hold, "send_release", return_value=1):
+            _ = self.advance(now)
+            self.assertEqual(self.entries()[0]["state"], "DeliveryQueued")
+            self.assertIn("NothingToBuild", build_hold.answer_nothing_to_build("first"))
+            _ = self.advance(now)
+        self.assertEqual([entry["state"] for entry in self.entries()], ["NothingToBuild", "DeliveryQueued"])
 
 
 if __name__ == "__main__":

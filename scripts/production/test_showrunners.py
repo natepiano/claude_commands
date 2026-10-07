@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import shlex
 import shutil
 import subprocess
 import sys
@@ -11,6 +12,9 @@ import tempfile
 import unittest
 from pathlib import Path
 from typing import cast, override
+from unittest import mock
+
+import showrunners
 
 
 SCRIPT = Path(__file__).with_name("showrunners.py")
@@ -102,6 +106,28 @@ raise SystemExit(1)
         content = cast(dict[str, object], json.loads(self.config.read_text()))
         return cast(list[dict[str, object]], content["showrunners"])
 
+    def test_checked_doc_reads_absolute_path_after_check_script(self) -> None:
+        directory = self.notifier / "showrunner-check"
+        directory.mkdir()
+        doc = self.root / "example-production.md"
+        check = shlex.join(["zsh", "/opt/tools/production_check.sh", str(doc), "extra"])
+        _ = (directory / "conf").write_text(f"TARGET=session:abc\nCHECK={check}\n", encoding="utf-8")
+        self.assertEqual(showrunners.checked_doc(directory), showrunners.CheckedDoc(doc))
+
+    def test_checked_doc_refuses_missing_check_line(self) -> None:
+        directory = self.notifier / "showrunner-check"
+        directory.mkdir()
+        _ = (directory / "conf").write_text("TARGET=session:abc\n", encoding="utf-8")
+        self.assertIsInstance(showrunners.checked_doc(directory), showrunners.NoCheckedDoc)
+
+    def test_checked_doc_refuses_relative_production_path(self) -> None:
+        directory = self.notifier / "showrunner-check"
+        directory.mkdir()
+        _ = (directory / "conf").write_text(
+            "CHECK=zsh /opt/tools/production_check.sh docs/example-production.md\n", encoding="utf-8")
+        result = showrunners.checked_doc(directory)
+        self.assertEqual(result, showrunners.NoCheckedDoc("production doc path is relative"))
+
     def test_add_creates_defaults_then_sets_zone_and_appends_only_new_units(self) -> None:
         _ = self.successful("add", "director", "--zone", "America/Los_Angeles", "--unit", "hook")
         content = cast(dict[str, object], json.loads(self.config.read_text()))
@@ -125,6 +151,27 @@ raise SystemExit(1)
         _ = self.successful("remove", "director")
         _ = self.successful("remove", "director")
         self.assertEqual(self.entries(), [])
+
+    def test_standby_add_list_and_ready_preserve_unit_membership(self) -> None:
+        _ = self.successful("add", "director", "--zone", "America/Los_Angeles",
+                            "--unit", "alpha", "--standby")
+        self.assertEqual(self.entries()[0]["units"], ["alpha"])
+        self.assertEqual(self.entries()[0]["standby"], ["alpha"])
+        self.assertIn("alpha:standby", self.successful("list"))
+        _ = self.successful("ready", "director", "--unit", "alpha")
+        self.assertEqual(self.entries()[0]["units"], ["alpha"])
+        self.assertEqual(self.entries()[0].get("standby", []), [])
+        self.assertNotIn("alpha:standby", self.successful("list"))
+
+    def test_ready_non_standby_unit_says_so_without_changing_config(self) -> None:
+        _ = self.successful("add", "director", "--zone", "America/Los_Angeles", "--unit", "alpha")
+        before = self.config.read_bytes()
+        result = self.cli("ready", "director", "--unit", "alpha")
+        self.assertEqual(result.returncode, 0, (result.stdout, result.stderr))
+        self.assertEqual(self.config.read_bytes(), before)
+        self.assertEqual(len((result.stdout + result.stderr).strip().splitlines()), 1)
+        self.assertIn("alpha", result.stdout + result.stderr)
+        self.assertIn("not on standby", result.stdout + result.stderr)
 
     def test_concurrent_adds_both_land(self) -> None:
         first = subprocess.Popen([sys.executable, str(SCRIPT), "add", "first", "--zone", "America/Los_Angeles",
@@ -183,6 +230,34 @@ raise SystemExit(1)
         self.assertEqual(self.entries(), [{"session": "new director", "zone": "America/Los_Angeles",
                                            "units": ["new hook"]}])
         self.assertTrue((self.config.parent / "showrunners.lock").exists())
+
+    def test_failed_stall_rename_keeps_registry_and_retry_completes(self) -> None:
+        _ = self.successful("add", "director", "--zone", "America/Los_Angeles", "--unit", "hook")
+        original = self.config.read_bytes()
+        failed = subprocess.CompletedProcess(["stall_watch.py"], 1, "", "injected failure")
+        succeeded = subprocess.CompletedProcess(["stall_watch.py"], 0, "", "")
+        with mock.patch.object(showrunners, "CONFIG", self.config), \
+                mock.patch.object(showrunners, "NOTIFIER_STATE_DIR", self.notifier), \
+                mock.patch.object(subprocess, "run", return_value=failed):
+            with self.assertRaisesRegex(ValueError, "stall state rename failed"):
+                showrunners.change("rename", "hook", "", [], "new-hook")
+        self.assertEqual(self.config.read_bytes(), original)
+        with mock.patch.object(showrunners, "CONFIG", self.config), \
+                mock.patch.object(showrunners, "NOTIFIER_STATE_DIR", self.notifier), \
+                mock.patch.object(subprocess, "run", return_value=succeeded):
+            showrunners.change("rename", "hook", "", [], "new-hook")
+        self.assertEqual(self.entries()[0]["units"], ["new-hook"])
+
+    def test_second_registry_rename_changes_nothing(self) -> None:
+        _ = self.successful("add", "director", "--zone", "America/Los_Angeles", "--unit", "hook")
+        _ = self.successful("rename", "hook", "new-hook")
+        renamed = self.config.read_bytes()
+        with mock.patch.object(showrunners, "CONFIG", self.config), \
+                mock.patch.object(showrunners, "NOTIFIER_STATE_DIR", self.notifier), \
+                mock.patch.object(subprocess, "run") as run:
+            showrunners.change("rename", "hook", "", [], "new-hook")
+        self.assertEqual(self.config.read_bytes(), renamed)
+        run.assert_not_called()
 
     def test_rename_updates_old_form_unit_lists_in_every_prompt(self) -> None:
         _ = self.successful("add", "director", "--zone", "America/Los_Angeles", "--unit", "tool-based-ui-trunk")

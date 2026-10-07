@@ -38,6 +38,7 @@ from typing import TypedDict, cast
 from zoneinfo import ZoneInfo
 
 WEEK_MINUTES = 7 * 24 * 60
+FIVE_HOUR_MINUTES = 5 * 60
 EASTERN = ZoneInfo("America/New_York")
 
 
@@ -66,6 +67,8 @@ class Report:
     quota_problem: str | None = None
     limit_reset_count: int | None = None
     limit_reset_expirations: list[datetime] = field(default_factory=list)
+    # The 5-hour window, kept out of `quotas`, which hold the weekly ones.
+    five_hour: Quota | None = None
 
     @property
     def weekly_reset(self) -> datetime | None:
@@ -159,6 +162,7 @@ class CodexBucket(TypedDict, total=False):
 class CodexRateLimits(TypedDict, total=False):
     rateLimits: CodexBucket
     rateLimitsByLimitId: dict[str, CodexBucket] | None
+    rateLimitResetCredits: object
 
 
 class RpcError(TypedDict, total=False):
@@ -251,6 +255,14 @@ def claude_usage_quotas(usage: dict[str, object]) -> list[Quota]:
     return quotas
 
 
+def claude_five_hour(usage: dict[str, object]) -> Quota | None:
+    held = usage.get("five_hour")
+    if not isinstance(held, dict):
+        return None
+    window = cast(UsageWindow, cast(object, held))
+    return Quota("5-hour", window.get("utilization"), parse_reset(window.get("resets_at")))
+
+
 def claude_live() -> Report:
     report = Report("Claude")
     try:
@@ -279,6 +291,7 @@ def claude_live() -> Report:
         with opened as response:
             usage = cast(dict[str, object], json.loads(response.read()))
         report.quotas = claude_usage_quotas(usage)
+        report.five_hour = claude_five_hour(usage)
         if not any(quota.label == "Weekly" for quota in report.quotas):
             report.quota_problem = "Weekly quota: unavailable"
     except urllib.error.HTTPError as error:
@@ -392,6 +405,15 @@ def codex_weekly_quotas(usage: CodexRateLimits) -> list[Quota]:
     return quotas
 
 
+def codex_five_hour(usage: CodexRateLimits) -> Quota | None:
+    """The main Codex bucket's 5-hour window."""
+    bucket = (usage.get("rateLimitsByLimitId") or {}).get("codex") or usage.get("rateLimits", {})
+    for window in (bucket.get("primary"), bucket.get("secondary")):
+        if window and window.get("windowDurationMins") == FIVE_HOUR_MINUTES:
+            return Quota("5-hour", window.get("usedPercent"), parse_reset(window.get("resetsAt")))
+    return None
+
+
 async def codex_live() -> Report:
     report = Report("Codex")
     server: CodexServer | None = None
@@ -416,7 +438,8 @@ async def codex_live() -> Report:
         try:
             usage = cast(CodexRateLimits, await server.request(3, "account/rateLimits/read", {}))
             report.quotas = codex_weekly_quotas(usage)
-            reset_credits(report, cast(dict[str, object], usage).get("rateLimitResetCredits"))
+            report.five_hour = codex_five_hour(usage)
+            reset_credits(report, usage.get("rateLimitResetCredits"))
             if not report.quotas:
                 report.quota_problem = "Weekly quota: unavailable (no weekly window returned)"
         except (OSError, ValueError, KeyError, RuntimeError, asyncio.TimeoutError):
@@ -436,15 +459,21 @@ def reset_credits(report: Report, summary: object) -> None:
     """Count comes from the summary; detail rows can be absent or capped."""
     if not isinstance(summary, dict):
         return
-    count = summary.get("availableCount")
+    fields = cast(dict[str, object], summary)
+    count = fields.get("availableCount")
     if type(count) is not int or count < 0:
         return
     report.limit_reset_count = count
     report.limit_reset_expirations = []
     if count == 0:
         return
-    for credit in summary.get("credits") or []:
-        if isinstance(credit, dict) and credit.get("status") == "available":
+    credits = cast(list[object], fields.get("credits") or [])
+    for item in credits:
+        if isinstance(item, dict):
+            credit = cast(dict[str, object], item)
+        else:
+            continue
+        if credit.get("status") == "available":
             expires = parse_reset(credit.get("expiresAt"))
             if expires is not None:
                 report.limit_reset_expirations.append(expires)

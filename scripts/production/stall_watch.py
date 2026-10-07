@@ -13,11 +13,13 @@ import subprocess
 import sys
 import time
 from datetime import datetime
+from enum import Enum
 from pathlib import Path
 from typing import NamedTuple, TypedDict, cast
 from zoneinfo import ZoneInfo
 
 import showrunners
+from add_unit import cell_value, plan_cell_is_retired
 
 STATE_DIR = Path(os.environ.get("STALL_WATCH_STATE_DIR") or Path.home() / ".local/state/stall-watch")
 SESSIONS_DIR = Path(os.environ.get("NOTIFIER_SESSIONS_DIR") or Path.home() / ".claude/sessions")
@@ -26,7 +28,9 @@ SESSIONS = Path(os.environ.get("STALL_WATCH_SESSIONS") or Path(__file__).resolve
 SEND = Path(os.environ.get("STALL_WATCH_SEND") or Path(__file__).resolve().parent.parent / "message/send.py")
 TMUX = os.environ.get("STALL_WATCH_TMUX") or "tmux"
 PS = os.environ.get("STALL_WATCH_PS") or "ps"
-TURN_END = re.compile(r"^\s*(?:— )?(?:holding|gate|decision|blocked|done):.*$", re.MULTILINE)
+WAITING_KINDS = ("done", "blocked", "gate", "decision")
+HOLDING_KIND = "holding"
+TURN_END = re.compile(rf"^\s*(?:— )?(?P<kind>{'|'.join((*WAITING_KINDS, HOLDING_KIND))}):.*$", re.MULTILINE)
 WORK = {"zsh", "bash", "sh", "implement.sh", "review.sh", "verify.sh"}
 
 
@@ -48,6 +52,18 @@ class Delivery(NamedTuple):
     state_path: Path
     kind: str
     command: list[str]
+
+
+class _SessionSocket(NamedTuple):
+    path: str
+
+
+class _NoLiveSession(Enum):
+    RESULT = "no live session"
+
+
+class _SessionLookupUnavailable(Enum):
+    RESULT = "session lookup unavailable"
 
 
 def command_output(command: list[str]) -> str:
@@ -124,6 +140,34 @@ def stretch_path(slug: str, unit: str) -> Path:
     return STATE_DIR / f"{name}.json"
 
 
+def finished_run_units(runner: showrunners.RunningShowrunner) -> set[str]:
+    """Read the production doc named by this notifier's check command."""
+    located = showrunners.checked_doc(showrunners.NOTIFIER_STATE_DIR / f"showrunner-{runner.slug}")
+    if isinstance(located, showrunners.NoCheckedDoc):
+        return set()
+    try:
+        lines = located.path.read_text(encoding="utf-8").splitlines()
+    except (OSError, UnicodeError):
+        return set()
+
+    finished: set[str] = set()
+    in_units = False
+    for line in lines:
+        if line.strip() == "## Units":
+            in_units = True
+        elif in_units and line.startswith("## "):
+            break
+        elif in_units:
+            cells = line.split("|")
+            if (len(cells) >= 4 and not cells[0].strip()
+                    and (re.search(r"\brun done\b", cells[2]) is not None
+                         or plan_cell_is_retired(cells[2]))):
+                finished.add(cells[1].strip())
+                if len(cells) >= 6:
+                    finished.add(cell_value(cells[5]))
+    return finished
+
+
 def rename_state(old: str, new: str, runner_before: str, runner_after: str,
                  units: list[str]) -> None:
     """Move saved stretches while the registry rename is locked."""
@@ -155,11 +199,20 @@ def save_stretch(path: Path, stretch: Stretch) -> None:
     os.replace(temporary, path)
 
 
-def socket_for_target(target: str) -> str | None:
+def socket_for_target(target: str) -> _SessionSocket | _NoLiveSession | _SessionLookupUnavailable:
     try:
-        return command_output([sys.executable, str(SESSIONS), "socket", target]) or None
+        result = subprocess.run(
+            [sys.executable, str(SESSIONS), "socket", target],
+            capture_output=True, text=True, check=False,
+        )
     except OSError:
-        return None
+        return _SessionLookupUnavailable.RESULT
+    socket = result.stdout.strip()
+    if result.returncode == 0:
+        return _SessionSocket(socket) if socket else _NoLiveSession.RESULT
+    if result.returncode == 1:
+        return _NoLiveSession.RESULT
+    return _SessionLookupUnavailable.RESULT
 
 
 def delivery(path: Path, kind: str, socket: str, key: str, text: str) -> Delivery:
@@ -200,12 +253,25 @@ def tick(now: float) -> None:
     settings = showrunners.load_settings()
     rows = processes()
     pending: list[Delivery] = []
-    missing = showrunners.missing_showrunners(settings)
-    missing_slugs = {runner.slug for runner in missing}
-    for path in STATE_DIR.glob("missing-*.json"):
-        if path.stem.removeprefix("missing-") not in missing_slugs:
-            path.unlink()
-    faults_socket = socket_for_target(settings["faults_to"])
+    running = showrunners.running_showrunners()
+    sockets = {configured["session"]: socket_for_target(configured["session"])
+               for configured in settings["showrunners"]}
+    configured_names = set(sockets)
+    lookup_unavailable = any(isinstance(result, _SessionLookupUnavailable)
+                             for result in sockets.values())
+    configured_sockets = {result.path for result in sockets.values()
+                          if isinstance(result, _SessionSocket)}
+    missing = ([] if lookup_unavailable else
+               [runner for runner in running
+                if runner.session not in configured_names and runner.socket not in configured_sockets])
+    runners_by_socket = {runner.socket: runner for runner in running}
+    if not lookup_unavailable:
+        missing_slugs = {runner.slug for runner in missing}
+        for path in STATE_DIR.glob("missing-*.json"):
+            if path.stem.removeprefix("missing-") not in missing_slugs:
+                path.unlink()
+    faults_lookup = socket_for_target(settings["faults_to"])
+    faults_socket = faults_lookup.path if isinstance(faults_lookup, _SessionSocket) else ""
     for runner in missing:
         path = STATE_DIR / f"missing-{runner.slug}.json"
         stretch = read_stretch(path, runner.socket, now)
@@ -225,22 +291,29 @@ def tick(now: float) -> None:
             pending.append(delivery(path, "missing", faults_socket,
                                     f"stall-watch:missing:{runner.slug}:{int(stretch['since'])}", message))
     for configured in settings["showrunners"]:
-        showrunner_socket = socket_for_target(configured["session"])
-        if showrunner_socket is None:
+        showrunner_lookup = sockets[configured["session"]]
+        if not isinstance(showrunner_lookup, _SessionSocket):
             continue
+        showrunner_socket = showrunner_lookup.path
+        runner = runners_by_socket.get(showrunner_socket)
+        finished: set[str] = finished_run_units(runner) if runner is not None else set()
         try:
             zone = ZoneInfo(configured["zone"])
         except (KeyError, ValueError):
             print(f"stall-watch: invalid zone for {configured['session']}: {configured['zone']}", file=sys.stderr)
             continue
         for unit in configured["units"]:
-            if subprocess.run([TMUX, "has-session", "-t", f"={unit}"], capture_output=True, check=False).returncode != 0:
+            if isinstance(unit, showrunners.StandbyUnit) or unit.name in finished:
+                stretch_path(configured["session"], unit.name).unlink(missing_ok=True)
+                continue
+            name = unit.name
+            if subprocess.run([TMUX, "has-session", "-t", f"={name}"], capture_output=True, check=False).returncode != 0:
                 continue
             try:
-                pane_pid = int(command_output([TMUX, "display-message", "-p", "-t", f"={unit}:", "#{pane_pid}"]))
-                pane = command_output([TMUX, "capture-pane", "-p", "-J", "-S", "-400", "-t", f"={unit}:"])
+                pane_pid = int(command_output([TMUX, "display-message", "-p", "-t", f"={name}:", "#{pane_pid}"]))
+                pane = command_output([TMUX, "capture-pane", "-p", "-J", "-S", "-400", "-t", f"={name}:"])
             except (OSError, ValueError) as error:
-                print(f"stall-watch: {unit}: {error}", file=sys.stderr)
+                print(f"stall-watch: {name}: {error}", file=sys.stderr)
                 continue
             pid = claude_pid(pane_pid, rows)
             if pid is None:
@@ -249,11 +322,11 @@ def tick(now: float) -> None:
             if identity is None:
                 continue
             session_id, socket = identity
-            path = stretch_path(configured["session"], unit)
+            path = stretch_path(configured["session"], name)
             stretch = read_stretch(path, hashlib.sha256(pane.encode()).hexdigest(), now)
-            turns = TURN_END.findall(pane)
-            last = cast(str, turns[-1]).strip() if turns else "none on screen"
-            if last.lstrip("— ").startswith("done:"):
+            turns = list(TURN_END.finditer(pane))
+            last = turns[-1].group(0).strip() if turns else "none on screen"
+            if turns and turns[-1].group("kind") in WAITING_KINDS:
                 stretch = Stretch(pane_hash=hashlib.sha256(pane.encode()).hexdigest(), since=now,
                                   bump_sent=False, tell_sent=False, reported_status="")
                 save_stretch(path, stretch)
@@ -269,7 +342,7 @@ def tick(now: float) -> None:
             if now - since < settings["stall_minutes"] * 60 or running_work:
                 continue
             since_text = datetime.fromtimestamp(since, zone).strftime("%H:%M %Z")
-            key = f"stall-watch:{unit}:{int(since)}"
+            key = f"stall-watch:{name}:{int(since)}"
             if not stretch["reported_status"]:
                 stretch["reported_status"] = last
                 save_stretch(path, stretch)
@@ -278,7 +351,7 @@ def tick(now: float) -> None:
                         "Continue your run; if you are waiting on someone, say on whom in one line.")
                 pending.append(delivery(path, "bump", socket, f"{key}:bump", text))
             if not stretch["tell_sent"] and showrunner_socket:
-                text = f"{unit} idle since {since_text}, nothing running; bumped. Last status: {last}"
+                text = f"{name} idle since {since_text}, nothing running; bumped. Last status: {last}"
                 pending.append(delivery(path, "tell", showrunner_socket, f"{key}:tell", text))
     send_all(pending)
 

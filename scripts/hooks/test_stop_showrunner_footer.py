@@ -114,6 +114,7 @@ class ShowrunnerFooterHookTests(unittest.TestCase):
             **os.environ, "HOME": str(self.root), "NOTIFIER_STATE_DIR": str(self.notifier),
             "SHOWRUNNER_STATE_DIR": str(self.root / "showrunner-state"),
             "BUILD_HOLD_DIR": str(holds),
+            "MAC_TEST_STATE_DIR": str(self.root / "mac-test"),
         }
 
     def write_state(self, *, enabled: bool = True) -> None:
@@ -317,17 +318,19 @@ class ShowrunnerFooterHookTests(unittest.TestCase):
                          '"$HOME/.claude/scripts/lib/py" "$HOME/.claude/scripts/hooks/stop-showrunner-footer.py"')
         self.assertIn("stop-assistant-prose-banned-words.py", commands[-2])
 
-    def test_switch_off_allows_waiting_only_and_on_requires_footer(self) -> None:
+    def test_switch_off_allows_any_reply_and_on_requires_footer_and_waiting(self) -> None:
         self.assertEqual(self.run_switch("status").stdout, "demo footers on\n")
         self.assertEqual(self.run_switch("off").returncode, 0)
         self.assertEqual(self.run_switch("off").returncode, 0)
+        self.assert_passes(self.run_hook("Done."))
         self.assert_passes(self.run_hook("Done." + WAITING_BLOCK))
-        self.assertIn("footers are off", self.reason("Done."))
-        self.assertIn("/showrunner:footer on", self.reason("Done."))
+        self.assert_passes(self.run_hook("Done.\n\nWaiting on:\n* malformed"))
         self.assert_passes(self.run_hook("Done.\n" + self.footer() + WAITING_BLOCK))
         self.assertEqual(self.run_switch("status").stdout, "demo footers off\n")
         self.assertEqual(self.run_switch("on").returncode, 0)
         self.assertIn("footer", self.reason("Done." + WAITING_BLOCK))
+        _ = self.assert_blocked_with_current_footer("Done.\n" + self.footer())
+        self.assert_passes(self.run_hook("Done.\n" + self.footer() + WAITING_BLOCK))
 
     def test_switch_survives_new_target_and_is_per_production(self) -> None:
         self.assertEqual(self.run_switch("off").returncode, 0)
@@ -390,6 +393,18 @@ class ShowrunnerFooterHookTests(unittest.TestCase):
         reply = "Done.\n" + other_footer.stdout.rstrip("\n") + "\n" + self.footer() + WAITING_BLOCK
         self.assert_passes(self.run_hook(reply))
 
+    def test_one_enabled_production_still_requires_waiting_block(self) -> None:
+        other = self.notifier / "showrunner-other"
+        other.mkdir()
+        _ = (other / "conf").write_text(f"TARGET=session:{SESSION}\nCHECK=zsh /x/check.sh {self.doc}\n")
+        _ = (other / "state").write_text("ENABLED=0\n")
+        switch = self.root / "showrunner-state/footers-off/other"
+        switch.parent.mkdir(parents=True, exist_ok=True)
+        switch.touch()
+        footer = self.footer(at=datetime.now(ZoneInfo(ZONE)))
+        _ = self.assert_blocked_with_current_footer("Done.\n" + footer)
+        self.assert_passes(self.run_hook("Done.\n" + footer + WAITING_BLOCK))
+
     def test_two_productions_cannot_share_one_footer_span(self) -> None:
         other = self.notifier / "showrunner-other"
         other.mkdir()
@@ -398,7 +413,7 @@ class ShowrunnerFooterHookTests(unittest.TestCase):
         self.assertIn("footer", self.reason("Done.\n" + self.footer() + WAITING_BLOCK))
 
     def test_waiting_items_follow_eta_first_rules(self) -> None:
-        self.assertEqual(self.run_switch("off").returncode, 0)
+        footer = self.footer(at=datetime.now(ZoneInfo(ZONE)))
         tomorrow = (datetime.now(ZoneInfo(ZONE)) + timedelta(days=1)).strftime("%a")
         valid = [
             "* you: choose the path", "* 19:45 (18:20–23:55) - startup Phase 16",
@@ -406,7 +421,7 @@ class ShowrunnerFooterHookTests(unittest.TestCase):
             f"* {tomorrow} 09:00 - tomorrow", "* no ETA measured - awaiting estimate",
         ]
         def reply(items: list[str]) -> str:
-            return "Done.\n\n\nWaiting on:\n\n" + "\n".join(items)
+            return "Done.\n" + footer + "\n\n\nWaiting on:\n\n" + "\n".join(items)
         self.assert_passes(self.run_hook(reply(valid)))
         cases = [
             (["* startup Phase 16 ETA 19:45"], "ETA"),
@@ -425,14 +440,14 @@ class ShowrunnerFooterHookTests(unittest.TestCase):
                 self.assertIn("no ETA measured - <item>", reason)
 
     def test_no_eta_items_and_malformed_leading_eta_cannot_hide_times(self) -> None:
-        self.assertEqual(self.run_switch("off").returncode, 0)
+        footer = self.footer(at=datetime.now(ZoneInfo(ZONE)))
         for item in (
             "no ETA measured - startup 19:45 (18:20–23:55)",
             "no ETA measured - startup ETA 19:45",
             "19:45 PDT (18:20–23:55) - item",
         ):
             with self.subTest(item=item):
-                reason = self.reason("Done.\n\n\nWaiting on:\n\n* " + item)
+                reason = self.reason("Done.\n" + footer + "\n\n\nWaiting on:\n\n* " + item)
                 self.assertIn("ETA", reason)
 
 

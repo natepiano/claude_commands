@@ -55,6 +55,12 @@
 
 set -euo pipefail
 
+FOLLOW_TO=""
+if [[ "${1:-}" == "--to" ]]; then
+  FOLLOW_TO="${2:?Usage: implement.sh --to <seat> <session_dir> ...}"
+  shift 2
+fi
+
 SESSION_DIR="${1:?Usage: implement.sh <session_dir> [working_dir] [prompt_file] [task] [role_description]}"
 WORKING_DIR="${2:-$(pwd)}"
 PROMPT_FILE="${3:-${SESSION_DIR}/implementation_prompt.md}"
@@ -132,7 +138,11 @@ LEGACY_PREFIX="$(basename "${SESSION_DIR}")"
 if [[ -z "${MESH_PREFIX}" ]] && grep -qF "mesh=${LEGACY_PREFIX}-" "${SESSION_DIR}/board.log" 2>/dev/null; then
   MESH_PREFIX="${LEGACY_PREFIX}"
 fi
-MESH_NAME="$(bash "${SCRIPT_DIR}/seat_name.sh" "${WORKING_DIR}" "${TEAM_ROLE}" "${PASS_KIND}" "${MESH_PREFIX}")"
+if [[ -n "${FOLLOW_TO}" ]]; then
+  MESH_NAME="${FOLLOW_TO}"
+else
+  MESH_NAME="$(bash "${SCRIPT_DIR}/seat_name.sh" "${WORKING_DIR}" "${TEAM_ROLE}" "${PASS_KIND}" "${MESH_PREFIX}")"
+fi
 
 # python3 goes through the repo shim, which picks an interpreter by VERSION
 # rather than by path: the python3 on PATH is Apple 3.9 on the Mac, and this
@@ -142,9 +152,7 @@ SUMMARY_FILE="${SESSION_DIR}/impl_summary${SLOT}.txt"
 # Truncate at launch: the "done" post below names this path unconditionally, so a
 # seat that reports on the board without writing a summary would otherwise leave
 # the previous round's file sitting at exactly the path the board line points to.
-: > "${SUMMARY_FILE}"
 REPLY_FILE="${SESSION_DIR}/impl_reply${SLOT}.txt"
-rm -f "${REPLY_FILE}"
 STATUS_FILE="${SESSION_DIR}/impl_status${SLOT}"
 LOG_FILE="${SESSION_DIR}/impl_agent${SLOT}.log"
 AGENT_FILE="${SESSION_DIR}/impl_agent${SLOT}"
@@ -171,14 +179,147 @@ awake_seconds() {
   esac
 }
 
-rm -f "${AWAKE_FILE}"
-echo "implementing" > "${STATUS_FILE}"
-
 source "${SCRIPT_DIR}/../agents/agents_config.sh"
 if ! agents_resolve "${TASK}" 2>"${LOG_FILE}"; then
-  echo "error" > "${STATUS_FILE}"
   exit 1
 fi
+CODEX_MESH="${PLAN_DELEGATE_CODEX_MESH:-$(_agents_registry_get delegate.options codex_mesh)}"
+if [[ "${AGENT_FAMILY}" == "codex" && "${CODEX_MESH}" == "1" ]]; then
+  USE_CODEX_MESH=1
+else
+  USE_CODEX_MESH=0
+fi
+
+# One lock covers identity, live-state validation, and the claim. The identity
+# written at the original launch is independent of the short-id seats ledger
+# and of impl_agent_<slot>, which this launcher rewrites for every pass.
+seat_record() {
+  "$PY" - "${1}" "${SESSION_DIR}" "${TEAM_ROLE}" "${MESH_NAME}" \
+  "${AGENT_FAMILY}" "${AGENT_MODEL}" "${BG_ID_FILE}" \
+  "${USE_CODEX_MESH}" "${SCRIPT_DIR}/../agents/codex_mesh.py" <<'PY'
+import fcntl
+import json
+import os
+import subprocess
+import sys
+from pathlib import Path
+
+action, root_text, slot, name, family, model, bg_file, mesh, mesh_script = sys.argv[1:]
+root = Path(root_text)
+identity_file = root / f"impl_seat_{slot}.json"
+claim_file = root / f"impl_claim_{slot}.json"
+lock_file = root / "impl_seat_claim.lock"
+
+def fail(message):
+    print(f"implement.sh: {message}", file=sys.stderr)
+    raise SystemExit(2)
+
+def read(path):
+    try:
+        return json.loads(path.read_text())
+    except (OSError, ValueError):
+        return {}
+
+def claude_session(short_id):
+    directory = Path(os.environ.get("NOTIFIER_SESSIONS_DIR", str(Path.home() / ".claude/sessions")))
+    for path in directory.glob("*.json"):
+        data = read(path)
+        if str(data.get("id", path.stem)) == short_id or data.get("sessionId", "").startswith(short_id):
+            if data.get("name") == name:
+                return data.get("sessionId", "")
+    return ""
+
+with lock_file.open("a+") as lock:
+    fcntl.flock(lock, fcntl.LOCK_EX)
+    roster = read(root / "mesh_roster.json")
+    entry = roster.get(name, {}) if isinstance(roster, dict) else {}
+    ledger = (root / "seats").read_text().splitlines() if (root / "seats").exists() else []
+    short_id = next((line.split("\t", 1)[0] for line in ledger if line.split("\t", 1)[-1] == name), "")
+    if family == "codex" and isinstance(entry, dict) and entry.get("thread_id"):
+        seat_id = entry["thread_id"]
+    elif family == "claude" and short_id:
+        seat_id = claude_session(short_id)
+    else:
+        seat_id = ""
+    if action == "record":
+        if not seat_id:
+            raise SystemExit(1)
+        identity = {"name": name, "slot": slot, "family": family, "model": model, "seat_id": seat_id}
+        identity_file.write_text(json.dumps(identity))
+    elif action == "claim":
+        identity = read(identity_file)
+        if not identity or identity != {"name": name, "slot": slot, "family": family, "model": model, "seat_id": seat_id}:
+            fail(f"{name} has no matching durable seat identity for slot {slot}")
+        status_path = root / f"impl_status_{slot}"
+        claim = read(claim_file)
+        pid = claim.get("pid", 0)
+        if isinstance(pid, int) and pid > 0:
+            try:
+                os.kill(pid, 0)
+            except ProcessLookupError:
+                status_path.write_text("error\n")
+                claim_file.unlink(missing_ok=True)
+            else:
+                fail(f"{name} is claimed by launcher {pid}")
+        if status_path.exists() and status_path.read_text().strip() == "implementing":
+            fail(f"{name} is already implementing")
+        if family == "codex":
+            if mesh != "1":
+                fail(f"{name} has mesh=none")
+            check = subprocess.run(
+                [sys.executable, mesh_script, "can-follow", "--session-dir", root_text,
+                 "--to", name, "--claim-pid", os.environ["FOLLOW_LAUNCHER_PID"]],
+                capture_output=True, text=True,
+            )
+            if check.returncode != 0:
+                fail(check.stderr.strip() or f"{name} is busy or not followable")
+        else:
+            claude = os.environ.get("CLAUDE_BIN") or str(Path.home() / ".local/bin/claude")
+            try:
+                result = subprocess.run([claude, "agents", "--json"], capture_output=True, text=True)
+            except OSError:
+                fail("cannot read claude agents")
+            try:
+                rows = json.loads(result.stdout)
+            except ValueError:
+                fail("cannot read claude agents")
+            row = next((row for row in rows if row.get("id") == short_id), None)
+            if row is None or row.get("status") != "idle":
+                fail(f"{name} is busy or gone")
+        claim_file.write_text(json.dumps({"pid": int(os.environ["FOLLOW_LAUNCHER_PID"]), "seat": name, "turn_id": ""}))
+    elif action == "release":
+        claim = read(claim_file)
+        if claim.get("pid") == int(os.environ.get("FOLLOW_LAUNCHER_PID", "0")):
+            if family == "codex" and mesh == "1":
+                subprocess.run(
+                    [sys.executable, mesh_script, "release-follow", "--session-dir", root_text,
+                     "--to", name, "--claim-pid", os.environ["FOLLOW_LAUNCHER_PID"]],
+                    capture_output=True, text=True,
+                )
+            claim_file.unlink(missing_ok=True)
+    elif action == "turn":
+        claim = read(claim_file)
+        if claim.get("pid") == int(os.environ.get("FOLLOW_LAUNCHER_PID", "0")):
+            turn_id = (
+                entry.get("turn_id", "") if entry.get("status") == "running" else ""
+            ) if family == "codex" else claim.get("turn_id", "")
+            if not turn_id:
+                raise SystemExit
+            claim["turn_id"] = turn_id
+            claim_file.write_text(json.dumps(claim))
+            print(turn_id)
+PY
+}
+
+if [[ -n "${FOLLOW_TO}" ]]; then
+  export FOLLOW_LAUNCHER_PID="$$"
+  seat_record claim
+  trap 'seat_record release' EXIT
+fi
+
+: > "${SUMMARY_FILE}"
+rm -f "${REPLY_FILE}" "${AWAKE_FILE}"
+echo "implementing" > "${STATUS_FILE}"
 
 printf 'task=%s\nfamily=%s\nagent=%s\neffort=%s\n' \
   "${TASK}" "${AGENT_FAMILY}" "${AGENT_MODEL}" "${AGENT_EFFORT}" > "${AGENT_FILE}"
@@ -195,6 +336,8 @@ if [[ -f "${PROGRESS_STATE}" ]]; then
     --called-effort "${AGENT_EFFORT:-unset}"; then
     echo "ERROR: unable to record the ${PASS_KIND} pass start." >&2
     echo "error" > "${STATUS_FILE}"
+    bash "${BOARD_HELPER}" post "${SESSION_DIR}" "${BOARD_AGENT}" blocked \
+      "launcher: unable to record the ${PASS_KIND} pass start" || true
     exit 1
   fi
 fi
@@ -209,13 +352,6 @@ bash "${HEARTBEAT_HELPER}" "${HEARTBEAT_FILE}" header "${BEAT_TAG} (${AGENT_FAMI
 # 0 for the plain launcher. The registry holds the standing choice; the env var
 # overrides it for one run. A missing key reads as empty, which fails the test
 # below and leaves the plain launcher in place.
-CODEX_MESH="${PLAN_DELEGATE_CODEX_MESH:-$(_agents_registry_get delegate.options codex_mesh)}"
-if [[ "${AGENT_FAMILY}" == "codex" && "${CODEX_MESH}" == "1" ]]; then
-  USE_CODEX_MESH=1
-else
-  USE_CODEX_MESH=0
-fi
-
 # The register line carries the mesh address as well as the role, so a peer that
 # joined late can learn who to message without being told at launch. A family
 # with no address says so, and that is what stops a peer waiting on a reply that
@@ -247,8 +383,13 @@ fi
 # always present -- which is what makes a dispatch that lost it legible from
 # the board alone: a register line with no `role=` predates this check.
 ROLE_FIELD="role=${PASS_KIND}; "
+if [[ -n "${FOLLOW_TO}" ]]; then
+  LAUNCH_NOTE="follow-up to ${FOLLOW_TO}"
+else
+  LAUNCH_NOTE="launcher up"
+fi
 bash "${BOARD_HELPER}" post "${SESSION_DIR}" "${BOARD_AGENT}" register \
-  "${SUBTASK} launcher up (${AGENT_FAMILY}/${AGENT_MODEL}:${AGENT_EFFORT:-unset}); ${MESH_FIELD}; ${ROLE_FIELD}status in impl_status${SLOT}" || true
+  "${SUBTASK} ${LAUNCH_NOTE} (${AGENT_FAMILY}/${AGENT_MODEL}:${AGENT_EFFORT:-unset}); ${MESH_FIELD}; ${ROLE_FIELD}status in impl_status${SLOT}" || true
 
 # The delegate's own verify.sh runs inherit these and take the cargo token with
 # them, so serialization does not depend on the agent remembering a prompt rule.
@@ -264,8 +405,27 @@ export PLAN_DELEGATE_BOARD_DIR="${SESSION_DIR}"
 # process, but a thread on a shared `codex app-server` is addressable, so
 # codex_mesh.py launches it there instead. With codex_mesh=0 it falls back to
 # the plain launcher and coordinates through the board alone.
-if [[ "${AGENT_FAMILY}" == "claude" ]]; then
-  AGENT_BG_LEDGER="${SESSION_DIR}/seats" bash "${SCRIPT_DIR}/../agents/agent_bg.sh" \
+if [[ -n "${FOLLOW_TO}" ]]; then
+  FOLLOW_MESSAGE="${SESSION_DIR}/impl_follow_message${SLOT}.$$.txt"
+  cat "${PROMPT_FILE}" > "${FOLLOW_MESSAGE}"
+  printf '\n\nAs your last act, write impl_summary%s.txt, then post done on the board.\n' "${SLOT}" >> "${FOLLOW_MESSAGE}"
+  if [[ "${AGENT_FAMILY}" == "claude" ]]; then
+    bash "${SCRIPT_DIR}/../agents/agent_bg.sh" --attach \
+      "${MESH_NAME}" "${WORKING_DIR}" "${FOLLOW_MESSAGE}" "${SUMMARY_FILE}" \
+      "${LOG_FILE}" "${BG_ID_FILE}" "${AGENT_MODEL}" &
+  elif [[ "${USE_CODEX_MESH}" == "1" ]]; then
+    "$PY" "${SCRIPT_DIR}/../agents/codex_mesh.py" follow \
+      --session-dir "${SESSION_DIR}" --to "${MESH_NAME}" --claim-pid "${FOLLOW_LAUNCHER_PID}" \
+      --message-file "${FOLLOW_MESSAGE}" --summary-file "${SUMMARY_FILE}" \
+      --reply-file "${REPLY_FILE}" --log-file "${LOG_FILE}" \
+      --model "${AGENT_MODEL}" --effort "${AGENT_EFFORT:-}" \
+      --service-tier "${AGENT_SERVICE_TIER:-}" &
+  else
+    echo "ERROR: ${MESH_NAME} has mesh=none" >&2
+    exit 2
+  fi
+elif [[ "${AGENT_FAMILY}" == "claude" ]]; then
+  AGENT_BG_EFFORT="${AGENT_EFFORT:-}" AGENT_BG_LEDGER="${SESSION_DIR}/seats" bash "${SCRIPT_DIR}/../agents/agent_bg.sh" \
     "${MESH_NAME}" "${WORKING_DIR}" "${PROMPT_FILE}" "${SUMMARY_FILE}" \
     "${LOG_FILE}" "${BG_ID_FILE}" "${AGENT_MODEL}" &
 elif [[ "${USE_CODEX_MESH}" == "1" ]]; then
@@ -293,6 +453,27 @@ else
     "${TASK}" write "${WORKING_DIR}" "${PROMPT_FILE}" "${REPLY_FILE}" "${LOG_FILE}" &
 fi
 AGENT_PID=$!
+if [[ -n "${FOLLOW_TO}" ]]; then
+  if [[ "${AGENT_FAMILY}" == "codex" ]]; then
+    for ((turn_wait=0; turn_wait<30; turn_wait++)); do
+      if [[ -n "$(seat_record turn 2>/dev/null || true)" ]]; then
+        break
+      fi
+      kill -0 "${AGENT_PID}" 2>/dev/null || break
+      [[ "$(ps -o stat= -p "${AGENT_PID}" 2>/dev/null || true)" == Z* ]] && break
+      sleep 1
+    done
+  fi
+elif [[ "${AGENT_FAMILY}" == "claude" || "${USE_CODEX_MESH}" == "1" ]]; then
+  for ((seat_wait=0; seat_wait<30; seat_wait++)); do
+    if seat_record record 2>/dev/null; then
+      break
+    fi
+    kill -0 "${AGENT_PID}" 2>/dev/null || break
+    [[ "$(ps -o stat= -p "${AGENT_PID}" 2>/dev/null || true)" == Z* ]] && break
+    sleep 1
+  done
+fi
 
 # Wrapper beats with an activity digest from the agent log: proves the process
 # is alive and names what it is doing even while blocked in a long tool call.
@@ -304,6 +485,14 @@ HEARTBEAT_LOOP_PID=$!
 
 AGENT_CODE=0
 wait "${AGENT_PID}" || AGENT_CODE=$?
+if [[ -n "${FOLLOW_TO}" ]]; then
+  if [[ "${AGENT_FAMILY}" == "codex" ]]; then
+    seat_record turn >/dev/null || true
+  fi
+  rm -f "${FOLLOW_MESSAGE}"
+elif [[ "${AGENT_FAMILY}" == "claude" || "${USE_CODEX_MESH}" == "1" ]]; then
+  seat_record record 2>/dev/null || true
+fi
 
 kill "${HEARTBEAT_LOOP_PID}" 2>/dev/null || true
 wait "${HEARTBEAT_LOOP_PID}" 2>/dev/null || true
@@ -319,13 +508,14 @@ if [[ ! -s "${SUMMARY_FILE}" && -s "${REPLY_FILE}" ]]; then
 fi
 
 if [[ "${AGENT_CODE}" -eq 0 ]]; then
-  echo "implemented" > "${STATUS_FILE}"
   if [[ -f "${PROGRESS_STATE}" ]]; then
     if ! PLAN_DELEGATE_PASS_OWNER=launcher "$PY" "${PROGRESS_HELPER}" finish-pass \
       --session-dir "${SESSION_DIR}" --status completed \
       --agent-awake-seconds "$(awake_seconds)"; then
       echo "ERROR: unable to record the ${PASS_KIND} pass completion." >&2
       echo "error" > "${STATUS_FILE}"
+      bash "${BOARD_HELPER}" post "${SESSION_DIR}" "${BOARD_AGENT}" blocked \
+        "launcher: unable to record the ${PASS_KIND} pass completion" || true
       exit 1
     fi
   fi
@@ -334,9 +524,15 @@ if [[ "${AGENT_CODE}" -eq 0 ]]; then
   # be killed or compacted inside, and that gap used to resolve as "fixed" --
   # handing the next review a defect pre-labelled as repaired.
   if [[ "${RESOLVES_ROUND}" == "1" && -f "${FINDINGS_STATE}" ]]; then
-    "$PY" "${FINDINGS_HELPER}" landed --session-dir "${SESSION_DIR}" \
-      || echo "ERROR: unable to record the repair round as landed." >&2
+    if ! "$PY" "${FINDINGS_HELPER}" landed --session-dir "${SESSION_DIR}"; then
+      echo "ERROR: unable to record the repair round as landed." >&2
+      echo "error" > "${STATUS_FILE}"
+      bash "${BOARD_HELPER}" post "${SESSION_DIR}" "${BOARD_AGENT}" blocked \
+        "launcher: unable to record the repair round as landed" || true
+      exit 1
+    fi
   fi
+  echo "implemented" > "${STATUS_FILE}"
   bash "${HEARTBEAT_HELPER}" "${HEARTBEAT_FILE}" wrapper "${BEAT_TAG} agent finished" || true
   # A member that ends without saying so on the board leaves its peers waiting
   # on work already finished, so the launcher posts it rather than trusting the
@@ -347,26 +543,27 @@ if [[ "${AGENT_CODE}" -eq 0 ]]; then
     "launcher: ${SUBTASK} finished; summary at impl_summary${SLOT}.txt" || true
   bash "${BOARD_HELPER}" release "${SESSION_DIR}" "${BOARD_AGENT}" cargo >/dev/null 2>&1 || true
 else
-  echo "error" > "${STATUS_FILE}"
+  LEDGER_CODE=0
   if [[ -f "${PROGRESS_STATE}" ]]; then
     PLAN_DELEGATE_PASS_OWNER=launcher "$PY" "${PROGRESS_HELPER}" finish-pass \
       --session-dir "${SESSION_DIR}" --status error \
       --agent-awake-seconds "$(awake_seconds)" \
-      || echo "ERROR: unable to record the ${PASS_KIND} pass error." >&2
+      || { echo "ERROR: unable to record the ${PASS_KIND} pass error." >&2; LEDGER_CODE=1; }
   fi
   # The attempt stands rather than being refunded: a worker that ran and then
   # failed may have left partial edits behind, and the launcher cannot tell.
   if [[ "${RESOLVES_ROUND}" == "1" && -f "${FINDINGS_STATE}" ]]; then
     "$PY" "${FINDINGS_HELPER}" abandon --session-dir "${SESSION_DIR}" --edits-landed \
       --reason "the ${SUBTASK} worker exited with code ${AGENT_CODE}" \
-      || echo "ERROR: unable to record the repair round as abandoned." >&2
+      || { echo "ERROR: unable to record the repair round as abandoned." >&2; LEDGER_CODE=1; }
   fi
+  echo "error" > "${STATUS_FILE}"
   bash "${HEARTBEAT_HELPER}" "${HEARTBEAT_FILE}" wrapper "${BEAT_TAG} agent exited with code ${AGENT_CODE}" || true
   # Same reason as the success path, plus the token: a member killed mid-hold
   # would otherwise hold the cargo token until its hold expired, stalling every
   # peer behind a lock whose owner is already gone.
   bash "${BOARD_HELPER}" post "${SESSION_DIR}" "${BOARD_AGENT}" blocked \
-    "launcher: ${SUBTASK} exited with code ${AGENT_CODE}; this seat is down" || true
+    "launcher: ${SUBTASK} exited with code ${AGENT_CODE}; this seat is down; ledger_error=${LEDGER_CODE}" || true
   bash "${BOARD_HELPER}" release "${SESSION_DIR}" "${BOARD_AGENT}" cargo >/dev/null 2>&1 || true
   exit "${AGENT_CODE}"
 fi

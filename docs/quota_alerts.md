@@ -8,6 +8,7 @@ Notices arrive through `send.py` (/message) from the relay `quota_alert`, which 
 |---|---|---|
 | `Quota alert:` | An active account is at or under `threshold_percent`. Repeats every `repeat_minutes` until acknowledged. | Bring it to the user; if you delegate that tool's work, start no new work on it. Treat repeats as one item. |
 | `Quota alert:` saying every function on Codex was moved to Claude | Codex ran out, and the registry was switched to Claude. | Bring it to the user and keep delegating, now on Claude; re-run Codex work that was in flight. |
+| `5-hour limit:` | Claude or Codex has 20% or less of its 5-hour window left (`five_hour.py`). Sent once per low spell. | Tell the user in one line; change nothing else. They are sent it directly unless they type in a terminal within 15 minutes (`escalate.py`). |
 | `Quota alert acknowledged:` | The user silenced it, in the session named. | Drop held copies. Paused work stays paused. |
 | `Quota restored:` | The account is back above the threshold: a used limit reset, a new window, or another account active. A Codex one lists what moved back to Codex. | Resume paused work; drop held alerts for it. |
 

@@ -15,7 +15,7 @@ SESSIONS_DIR=${NOTIFIER_SESSIONS_DIR:-$HOME/.claude/sessions}
 NOW=${NOTIFIER_NOW_EPOCH:-$EPOCHSECONDS}
 
 die() { print -u2 -r -- "notifier.sh: $*"; exit 2 }
-usage() { die 'usage: notifier.sh new <instance> --every <min> (--run <cmd> | --to <target> (--command <text> | --prompt-file <path>)) [--from <sender>] [--check <cmd>] [--hold] [--aligned] [--timeout <s>]; start|stop|status|fire|restart|remove|health <instance>; interval <instance> <min>; align <instance> on|off; status|tick' }
+usage() { die 'usage: notifier.sh new <instance> --every <min> (--run <cmd> | --to <target> (--command <text> | --prompt-file <path>)) [--from <sender>] [--check <cmd>] [--hold] [--aligned] [--timeout <s>]; start|resume|stop|status|fire|restart|remove|health <instance>; interval <instance> <min>; align <instance> on|off; status|tick' }
 
 [[ $NOW == <0-> ]] || die "invalid clock: $NOW"
 
@@ -55,8 +55,8 @@ write_conf() {
     print -r -- "HOLD=${conf[HOLD]}"
     print -r -- "ALIGN=${conf[ALIGN]:-0}"
     print -r -- "TIMEOUT=${conf[TIMEOUT]}"
-  } > "$tmp"
-  mv -f -- "$tmp" "$dir/conf"
+  } > "$tmp" || return 1
+  mv -f -- "$tmp" "$dir/conf" || { rm -f -- "$tmp"; return 1; }
 }
 
 write_state() {
@@ -67,8 +67,8 @@ write_state() {
     print -r -- "LAST_SENT=${state[LAST_SENT]}"
     print -r -- "LAST_RESTART=${state[LAST_RESTART]}"
     print -r -- "LAST_TARGET=${state[LAST_TARGET]}"
-  } > "$tmp"
-  mv -f -- "$tmp" "$dir/state"
+  } > "$tmp" || return 1
+  mv -f -- "$tmp" "$dir/state" || { rm -f -- "$tmp"; return 1; }
 }
 
 # An aligned instance fires on the local clock's multiples of EVERY (every 60:
@@ -111,7 +111,7 @@ log_error() { print -r -- "$fired | $1" >> "$STATE_DIR/notifier.log" }
 cmd_new() {
   (( $# >= 2 )) || usage
   local name=$1 dir lock_fd target='' every='' command='' prompt_file='' run='' sender='' check='' hold=0 align=0 timeout=120
-  local command_given=0 prompt_given=0 run_given=0
+  local command_given=0 prompt_given=0 run_given=0 state_created=0
   shift
   valid_name "$name"
   while (( $# )); do
@@ -156,12 +156,13 @@ cmd_new() {
   (( command_given )) && conf[COMMAND]=$command
   (( prompt_given )) && conf[PROMPT_FILE]=$prompt_file
   (( run_given )) && conf[RUN]=$run
-  write_conf
   if [[ ! -e $dir/state ]]; then
     state=(ENABLED 1 NEXT_DUE 0 LAST_SENT 0 LAST_RESTART 0 LAST_TARGET '')
-    schedule
-    next_line
+    schedule || { zsystem flock -u "$lock_fd"; return 1; }
+    state_created=1
   fi
+  write_conf || { zsystem flock -u "$lock_fd"; return 1; }
+  (( state_created )) && next_line
   zsystem flock -u "$lock_fd"
 }
 
@@ -177,6 +178,7 @@ cmd_state() {
   read_state
   case $action in
     start) state[ENABLED]=1; schedule; next_line ;;
+    resume) state[ENABLED]=1; write_state; next_line ;;
     stop) state[ENABLED]=0; write_state ;;
     restart) state[LAST_RESTART]=$NOW; schedule; next_line ;;
     interval)
@@ -461,7 +463,7 @@ action=$1
 shift
 case $action in
   new) cmd_new "$@" ;;
-  start|stop|restart)
+  start|resume|stop|restart)
     (( $# == 1 )) || usage
     cmd_state "$action" "$1" ;;
   interval)

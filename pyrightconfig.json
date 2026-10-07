@@ -10,9 +10,16 @@
   ],
   "executionEnvironments": [
     {
+      "root": "scripts/model_study",
+      "extraPaths": [
+        "scripts/model_study"
+      ]
+    },
+    {
       "root": "scripts/hooks",
       "extraPaths": [
-        "scripts/hooks"
+        "scripts/hooks",
+        "scripts/message"
       ]
     },
     {
@@ -24,7 +31,8 @@
     {
       "root": "scripts/whoami",
       "extraPaths": [
-        "scripts/whoami"
+        "scripts/whoami",
+        "scripts/message"
       ]
     },
     {
@@ -55,6 +63,13 @@
       ]
     },
     {
+      "root": "scripts/mac_test",
+      "extraPaths": [
+        "scripts/mac_test",
+        "scripts/lint"
+      ]
+    },
+    {
       "root": "scripts/lint",
       "extraPaths": [
         "scripts/lint"
@@ -71,6 +86,8 @@
       "extraPaths": [
         "scripts/production",
         "scripts/build_hold",
+        "scripts/mac_test",
+        "scripts/message",
         "scripts/whoami"
       ]
     },

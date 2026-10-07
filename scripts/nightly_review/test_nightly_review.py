@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import os
+import shutil
 import subprocess
 import tempfile
 import unittest
@@ -12,6 +14,7 @@ from unittest import mock
 
 import nightly_review
 
+REAL_TMUX = nightly_review.tmux
 NIGHT = date(2026, 9, 29)
 MORNING = datetime(2026, 9, 29, 7, 30)
 
@@ -50,7 +53,7 @@ class NightlyReviewTests(unittest.TestCase):
             self.addCleanup(patcher.stop)
 
     def tmux(self, *args: str) -> subprocess.CompletedProcess[str]:
-        verb, name = args[0], args[-1]
+        verb, name = args[0], args[-1].removeprefix("=").removesuffix(":")
         if verb == "has-session":
             return done(code=0 if name in self.live else 1)
         if verb == "list-clients":
@@ -153,6 +156,44 @@ class NightlyReviewTests(unittest.TestCase):
         self.assertIn("skipped: claude 2 has 4%", context)
         self.assertNotIn("ask the user", context)
 
+
+    def test_a_session_the_review_name_prefixes_is_never_taken_for_it(self) -> None:
+        binary = shutil.which("tmux")
+        if binary is None:
+            self.skipTest("tmux is required to check its session matching")
+        server_dir = self.root / "tmux"
+        server_dir.mkdir()
+        self.enterContext(mock.patch.dict(os.environ, {"TMUX_TMPDIR": str(server_dir)}))
+        _ = os.environ.pop("TMUX", None)
+        self.addCleanup(subprocess.run, [binary, "kill-server"], capture_output=True, check=False)
+        real_run = subprocess.run
+
+        def review(name: str) -> None:
+            _ = real_run([binary, "-f", "/dev/null", "new-session", "-d", "-s", name,
+                          ": /nightly_review config; exec sleep 60"], check=True)
+
+        def live(name: str) -> bool:
+            return real_run([binary, "has-session", "-t", f"={name}"], capture_output=True,
+                            check=False).returncode == 0
+
+        def run(command: list[str], **_: object) -> subprocess.CompletedProcess[str]:
+            if command[0] == "tmux":
+                return real_run(command, capture_output=True, text=True, check=False)
+            self.calls.append(command)
+            return done()
+
+        def start() -> str:
+            with mock.patch.object(nightly_review, "tmux", REAL_TMUX), mock.patch("subprocess.run", run):
+                return nightly_review.start("config")
+
+        review("nightly-config-kept")
+        self.assertEqual(start(), "nightly-config: started")
+        self.assertTrue(live("nightly-config-kept"))
+        review("nightly-config")
+        self.assertEqual(start(), "nightly-config: started")
+        self.assertFalse(live("nightly-config"))
+        self.assertTrue(live("nightly-config-kept"))
+        self.assertEqual(len(self.calls), 2)
 
 if __name__ == "__main__":
     _ = unittest.main()

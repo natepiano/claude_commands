@@ -786,10 +786,11 @@ class ProgressHistoryTests(unittest.TestCase):
         self.assertEqual(state["LAST_RESTART"], str(report_at))
         self.assertEqual(state["NEXT_DUE"], str(report_at + 15 * 60))
 
-    def test_closed_window_restarts_unit_notifier(self) -> None:
+    def test_a_finished_phase_is_refused_and_restarts_unit_notifier(self) -> None:
+        """With no active phase there is nothing to report, and the clock still moves."""
         started_at = 20_000
         report_at = started_at + 100
-        session_dir = self.start_run("refused-window", started_at)
+        session_dir = self.start_run("refused-phase", started_at)
         self.start_phase_and_pass(session_dir, started_at)
         _ = self.run_command(
             "finish-phase",
@@ -835,7 +836,8 @@ class ProgressHistoryTests(unittest.TestCase):
                 at=report_at,
             )
         self.assertNotEqual(result.returncode, 0)
-        self.assertIn("No open window to report", result.stderr)
+        self.assertIn("No active phase to report: phase completed.", result.stderr)
+        self.assertIn("say nothing about whether the workers are alive", result.stderr)
         state = dict(
             line.split("=", 1)
             for line in (state_dir / f"delegate-{session_dir.name}" / "state")
@@ -844,6 +846,467 @@ class ProgressHistoryTests(unittest.TestCase):
         )
         self.assertEqual(state["LAST_RESTART"], str(report_at))
         self.assertEqual(state["NEXT_DUE"], str(report_at + 15 * 60))
+
+    def test_an_activity_after_a_closed_phase_keeps_the_phase_record(self) -> None:
+        started_at = 21_000
+        session_dir = self.start_run("closed-phase-activity", started_at)
+        self.start_phase(session_dir, started_at + 10)
+        _ = self.run_command(
+            "finish-phase",
+            "--session-dir",
+            str(session_dir),
+            "--status",
+            "completed",
+            at=started_at + 100,
+        )
+        phase_before = cast(dict[str, object], self.read_state(session_dir)["phase"])
+        phase_instance_id = cast(str, phase_before["instance_id"])
+
+        _ = self.run_command(
+            "start-activity",
+            "--session-dir",
+            str(session_dir),
+            "--label",
+            "Shrink",
+            "--activity",
+            "recording the as-built phase",
+            at=started_at + 110,
+        )
+        _ = self.run_command(
+            "finish-activity",
+            "--session-dir",
+            str(session_dir),
+            "--status",
+            "completed",
+            "--result",
+            "pass",
+            at=started_at + 140,
+        )
+
+        phase_after = cast(dict[str, object], self.read_state(session_dir)["phase"])
+        self.assertEqual(phase_after, phase_before)
+        self.assertEqual(phase_after["status"], "completed")
+        self.assertEqual(phase_after["finished_at"], float(started_at + 100))
+        phase_finished_events = [
+            event
+            for event in self.read_events("closed-phase-activity")
+            if event.get("event_type") == "phase_finished"
+        ]
+        self.assertEqual(len(phase_finished_events), 1)
+        self.assertEqual(phase_finished_events[0].get("phase_elapsed_seconds"), 90)
+        activity_events = [
+            event
+            for event in self.read_events("closed-phase-activity")
+            if event.get("event_type") in {"activity_started", "activity_finished"}
+        ]
+        self.assertEqual(
+            [event.get("event_type") for event in activity_events],
+            ["activity_started", "activity_finished"],
+        )
+        self.assertEqual(
+            {event.get("phase_instance_id") for event in activity_events},
+            {phase_instance_id},
+        )
+        self.assertEqual(activity_events[-1].get("status"), "completed")
+        self.assertEqual(activity_events[-1].get("activity_result"), "pass")
+        self.assertEqual(activity_events[-1].get("activity_elapsed_seconds"), 30)
+
+    def test_repeating_finish_phase_keeps_a_closed_phase_activity_open(self) -> None:
+        started_at = 21_500
+        session_dir = self.start_run("repeated-phase-finish", started_at)
+        self.start_phase(session_dir, started_at + 10)
+        _ = self.run_command(
+            "finish-phase",
+            "--session-dir",
+            str(session_dir),
+            "--status",
+            "completed",
+            at=started_at + 100,
+        )
+        phase_before = cast(dict[str, object], self.read_state(session_dir)["phase"])
+        _ = self.run_command(
+            "start-activity",
+            "--session-dir",
+            str(session_dir),
+            "--label",
+            "Shrink",
+            "--activity",
+            "recording the as-built phase",
+            at=started_at + 110,
+        )
+        _ = self.run_command(
+            "finish-phase",
+            "--session-dir",
+            str(session_dir),
+            "--status",
+            "completed",
+            at=started_at + 120,
+        )
+        phase_after = cast(dict[str, object], self.read_state(session_dir)["phase"])
+        self.assertEqual(phase_after["status"], phase_before["status"])
+        self.assertEqual(phase_after["finished_at"], phase_before["finished_at"])
+        _ = self.run_command(
+            "finish-activity",
+            "--session-dir",
+            str(session_dir),
+            "--status",
+            "completed",
+            "--result",
+            "pass",
+            at=started_at + 150,
+        )
+
+        events = self.read_events("repeated-phase-finish")
+        phase_finished_events = [
+            event for event in events if event.get("event_type") == "phase_finished"
+        ]
+        self.assertEqual(len(phase_finished_events), 1)
+        activity_finished_events = [
+            event for event in events if event.get("event_type") == "activity_finished"
+        ]
+        self.assertEqual(len(activity_finished_events), 1)
+        self.assertEqual(activity_finished_events[0].get("status"), "completed")
+        self.assertEqual(activity_finished_events[0].get("activity_result"), "pass")
+        self.assertEqual(
+            activity_finished_events[0].get("activity_elapsed_seconds"), 40
+        )
+
+    def test_start_activity_distinguishes_missing_phase_from_finished_run(self) -> None:
+        started_at = 22_000
+        no_phase = self.start_run("activity-without-phase", started_at)
+        refused = self.run_failing_command(
+            "start-activity",
+            "--session-dir",
+            str(no_phase),
+            "--label",
+            "Verification",
+            "--activity",
+            "running checks",
+            at=started_at + 10,
+        )
+        self.assertEqual(refused.returncode, 1)
+        self.assertIn("Start a phase before starting an activity", refused.stderr)
+
+        finished = self.start_run("activity-after-run", started_at + 100)
+        self.start_phase(finished, started_at + 110)
+        _ = self.run_command(
+            "finish-phase",
+            "--session-dir",
+            str(finished),
+            "--status",
+            "completed",
+            at=started_at + 120,
+        )
+        _ = self.run_command(
+            "finish-run",
+            "--session-dir",
+            str(finished),
+            "--status",
+            "completed",
+            at=started_at + 130,
+        )
+        refused = self.run_failing_command(
+            "start-activity",
+            "--session-dir",
+            str(finished),
+            "--label",
+            "Verification",
+            "--activity",
+            "running checks",
+            at=started_at + 140,
+        )
+        self.assertEqual(refused.returncode, 1)
+        self.assertIn("run is finished", refused.stderr.lower())
+
+    def test_a_closed_phase_activity_is_interrupted_by_the_next_phase_or_run_end(
+        self,
+    ) -> None:
+        for index, ending in enumerate(("next phase", "run end")):
+            with self.subTest(ending=ending):
+                started_at = 23_000 + index * 1_000
+                name = f"closed-activity-{index}"
+                session_dir = self.start_run(name, started_at)
+                self.start_phase(session_dir, started_at + 10)
+                phase = cast(dict[str, object], self.read_state(session_dir)["phase"])
+                phase_instance_id = cast(str, phase["instance_id"])
+                _ = self.run_command(
+                    "finish-phase",
+                    "--session-dir",
+                    str(session_dir),
+                    "--status",
+                    "completed",
+                    at=started_at + 100,
+                )
+                _ = self.run_command(
+                    "start-activity",
+                    "--session-dir",
+                    str(session_dir),
+                    "--label",
+                    "Shrink",
+                    "--activity",
+                    "recording the completed phase",
+                    at=started_at + 110,
+                )
+                if ending == "next phase":
+                    _ = self.run_command(
+                        "start-phase",
+                        "--session-dir",
+                        str(session_dir),
+                        "--phase-id",
+                        "4",
+                        "--phase-title",
+                        "Final checks",
+                        at=started_at + 140,
+                    )
+                else:
+                    _ = self.run_command(
+                        "finish-run",
+                        "--session-dir",
+                        str(session_dir),
+                        "--status",
+                        "completed",
+                        at=started_at + 140,
+                    )
+
+                finished_events = [
+                    event
+                    for event in self.read_events(name)
+                    if event.get("event_type") == "activity_finished"
+                ]
+                self.assertEqual(len(finished_events), 1)
+                self.assertEqual(
+                    finished_events[0].get("phase_instance_id"), phase_instance_id
+                )
+                self.assertEqual(finished_events[0].get("status"), "interrupted")
+                self.assertEqual(finished_events[0].get("activity_result"), "")
+                self.assertEqual(
+                    finished_events[0].get("activity_elapsed_seconds"), 30
+                )
+
+    def close_the_only_pass(self, session_dir: Path, at: int) -> None:
+        """Finish the pass `start_phase_and_pass` opened: reviews closed, no writer yet."""
+        _ = self.run_command(
+            "finish-pass", "--session-dir", str(session_dir), "--status", "completed", at=at
+        )
+
+    def test_a_phase_between_windows_reports_its_last_recorded_tables(self) -> None:
+        """No window open is a moment inside the phase, not the end of the report."""
+        started_at = 20_000
+        session_dir = self.start_run("between-windows", started_at)
+        self.start_phase_and_pass(session_dir, started_at)
+        _ = self.run_progress(session_dir, at=started_at + 100)
+        self.close_the_only_pass(session_dir, at=started_at + 200)
+        state_dir = self.root / "notifier"
+        environment = os.environ.copy()
+        environment["NOTIFIER_STATE_DIR"] = str(state_dir)
+        environment["NOTIFIER_NOW_EPOCH"] = str(started_at)
+        environment["TZ"] = "UTC"
+        _ = subprocess.run(
+            [
+                "zsh",
+                str(SCRIPT.parents[1] / "message" / "notifier.sh"),
+                "new",
+                f"delegate-{session_dir.name}",
+                "--to",
+                "session:test-claude-session",
+                "--every",
+                "15",
+                "--command",
+                "/unit:report",
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+            env=environment,
+        )
+        report_at = started_at + 400
+        with patch.dict(
+            os.environ,
+            {"NOTIFIER_STATE_DIR": str(state_dir), "NOTIFIER_NOW_EPOCH": str(report_at)},
+        ):
+            # Percents the tick passes are neither required nor checked: the
+            # report shows what was recorded, not what this call claims.
+            report = self.run_command(
+                "progress",
+                "--session-dir",
+                str(session_dir),
+                "--phase-raw-percent",
+                "55",
+                "--activity",
+                "waiting on the repair writers",
+                at=report_at,
+            )
+        lines = report.splitlines()
+        self.assertEqual(
+            lines[:3],
+            [
+                "**bevy_hana_rubric - feature/rubric**",
+                "",
+                "*Percentages and clocks as of 05:35:00, the last progress report.*",
+            ],
+        )
+        summary = self.table_rows(report, SUMMARY_HEADER)
+        # The rows the 05:35:00 report printed: its percents and its clocks.
+        self.assertEqual(
+            [row[:3] for row in summary[:2]],
+            [["Project", "40", "00:01:40"], ["Phase 3", "30", "00:01:40"]],
+        )
+        rounds = self.table_rows(
+            report, ["Stage", "Start", "Elapsed", "Agent 1", "Agent 2", "Result"]
+        )
+        self.assertEqual(
+            [(row[0], row[3], row[5]) for row in rounds],
+            [("Fix 2", "fix 3m done", "done")],
+        )
+        warning = lines[-2]
+        self.assertTrue(warning.startswith("No pass or activity is open. "))
+        self.assertIn("say nothing about whether the workers are alive", warning)
+        self.assertGreater(lines.index(warning), lines.index(next(
+            line for line in lines if line.startswith("| Fix 2 ")
+        )))
+        self.assertEqual(lines[-1], "**now 1970-01-01 05:40:00 - next report 05:55:00**")
+        restart = dict(
+            line.split("=", 1)
+            for line in (state_dir / f"delegate-{session_dir.name}" / "state")
+            .read_text(encoding="utf-8")
+            .splitlines()
+        )
+        self.assertEqual(restart["LAST_RESTART"], str(report_at))
+
+    def test_a_phase_never_reported_still_prints_both_tables(self) -> None:
+        """Before the first report the clocks read as of the phase start."""
+        started_at = 20_000
+        session_dir = self.start_run("never-reported", started_at)
+        self.start_phase_and_pass(session_dir, started_at)
+        self.close_the_only_pass(session_dir, at=started_at + 200)
+        report = self.run_command(
+            "progress",
+            "--session-dir",
+            str(session_dir),
+            "--activity",
+            "waiting on the repair writers",
+            at=started_at + 400,
+        )
+        self.assertIn(
+            "*Percentages and clocks as of 05:33:20, the phase start, before any "
+            + "progress report.*",
+            report,
+        )
+        self.assertEqual(
+            [row[:3] for row in self.table_rows(report, SUMMARY_HEADER)[:2]],
+            [["Project", "0", "00:00:00"], ["Phase 3", "0", "00:00:00"]],
+        )
+        self.assertEqual(
+            [
+                row[0]
+                for row in self.table_rows(
+                    report, ["Stage", "Start", "Elapsed", "Agent 1", "Agent 2", "Result"]
+                )
+            ],
+            ["Fix 2"],
+        )
+
+    def test_a_phase_with_no_window_yet_draws_a_row_saying_so(self) -> None:
+        started_at = 20_000
+        session_dir = self.start_run("no-window-yet", started_at)
+        self.start_phase(session_dir, started_at)
+        report = self.run_command(
+            "progress", "--session-dir", str(session_dir), "--activity", "starting", at=started_at + 60
+        )
+        self.assertEqual(
+            self.table_rows(report, ["Stage", "Start", "Elapsed", "Agent 1", "Agent 2", "Result"]),
+            [["-", "-", "-", "-", "-", "no stage yet"]],
+        )
+
+    def test_a_report_between_windows_records_nothing(self) -> None:
+        """No event, no window: pass counts and convergence never see the call."""
+        started_at = 20_000
+        session_dir = self.start_run("records-nothing", started_at)
+        self.start_phase_and_pass(session_dir, started_at)
+        _ = self.run_progress(session_dir, at=started_at + 100)
+        self.close_the_only_pass(session_dir, at=started_at + 200)
+        history = self.history_dir / "runs" / "records-nothing.jsonl"
+        state_path = session_dir / "progress_history_state.json"
+        events_before = history.read_text(encoding="utf-8")
+        state_before = state_path.read_text(encoding="utf-8")
+        _ = self.run_progress(session_dir, at=started_at + 400)
+        self.assertEqual(history.read_text(encoding="utf-8"), events_before)
+        self.assertEqual(state_path.read_text(encoding="utf-8"), state_before)
+        self.assertEqual(
+            {str(record["status"]) for record in self.pass_slots(session_dir).values()},
+            {"completed"},
+        )
+
+    def report_phase_percent(self, session_dir: Path, percent: int, at: int) -> None:
+        _ = self.run_command(
+            "progress",
+            "--session-dir",
+            str(session_dir),
+            "--project-raw-percent",
+            "40",
+            "--project-percent",
+            "40",
+            "--phase-raw-percent",
+            str(percent),
+            "--phase-percent",
+            str(percent),
+            "--cap-stage",
+            "implementation",
+            "--activity",
+            "implementing",
+            at=at,
+        )
+
+    def test_a_report_between_windows_names_the_eta_day_from_now(self) -> None:
+        """Recorded 23:30 on the 3rd, read at 03:00 on the 4th: 00:40 is today."""
+        recorded_at = 2 * 86_400 + 23 * 3_600 + 1_800
+        session_dir = self.start_run("past-midnight", recorded_at - 1_800)
+        self.start_phase_and_pass(session_dir, recorded_at - 1_800)
+        self.report_phase_percent(session_dir, 30, at=recorded_at)
+        self.close_the_only_pass(session_dir, at=recorded_at + 60)
+        report = self.run_progress(session_dir, at=3 * 86_400 + 3 * 3_600)
+        self.assertIn("as of 1970-01-03 23:30:00, the last progress report", report)
+        phase_row = self.table_rows(report, SUMMARY_HEADER)[1]
+        self.assertEqual(phase_row[:4], ["Phase 3", "30", "00:30:00", "today 00:40"])
+        self.assertTrue(phase_row[5].startswith("today "))
+        self.assertTrue(phase_row[6].startswith("today "))
+
+    def test_a_report_between_windows_reads_the_latest_report_of_the_phase(self) -> None:
+        started_at = 20_000
+        session_dir = self.start_run("latest-report", started_at)
+        self.start_phase_and_pass(session_dir, started_at)
+        self.report_phase_percent(session_dir, 20, at=started_at + 100)
+        self.report_phase_percent(session_dir, 50, at=started_at + 150)
+        self.close_the_only_pass(session_dir, at=started_at + 200)
+        report = self.run_progress(session_dir, at=started_at + 400)
+        self.assertIn("as of 05:35:50, the last progress report", report)
+        self.assertEqual(self.table_rows(report, SUMMARY_HEADER)[1][:2], ["Phase 3", "50"])
+
+    def test_a_report_between_windows_ignores_an_earlier_phase(self) -> None:
+        started_at = 20_000
+        session_dir = self.start_run("earlier-phase", started_at)
+        self.start_phase_and_pass(session_dir, started_at)
+        self.report_phase_percent(session_dir, 30, at=started_at + 100)
+        self.close_the_only_pass(session_dir, at=started_at + 200)
+        _ = self.run_command(
+            "finish-phase", "--session-dir", str(session_dir), "--status", "completed",
+            at=started_at + 300,
+        )
+        _ = self.run_command(
+            "start-phase", "--session-dir", str(session_dir), "--phase-id", "4",
+            "--phase-title", "Next phase", at=started_at + 400,
+        )
+        report = self.run_progress(session_dir, at=started_at + 500)
+        self.assertIn("the phase start, before any progress report", report)
+        self.assertEqual(self.table_rows(report, SUMMARY_HEADER)[1][:2], ["Phase 4", "0"])
+
+    def test_a_run_with_no_phase_is_refused(self) -> None:
+        session_dir = self.start_run("no-phase", 20_000)
+        result = self.run_failing_command(
+            "progress", "--session-dir", str(session_dir), "--activity", "idle", at=20_100
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("No active phase to report: phase missing.", result.stderr)
 
     def run_progress(self, session_dir: Path, at: int) -> str:
         return self.run_command(
@@ -2198,6 +2661,13 @@ class ProgressHistoryTests(unittest.TestCase):
             events.append(cast(dict[str, object], parsed))
         return events
 
+    def read_state(self, session_dir: Path) -> dict[str, object]:
+        state_text = (session_dir / "progress_history_state.json").read_text(
+            encoding="utf-8"
+        )
+        parsed: object = json.loads(state_text)  # pyright: ignore[reportAny]
+        return cast(dict[str, object], parsed)
+
     def table_rows(self, rendered: str, header: list[str]) -> list[list[str]]:
         rows = [
             [cell.strip() for cell in line.removeprefix("| ").removesuffix(" |").split(" | ")]
@@ -2495,7 +2965,7 @@ class ProgressHistoryTests(unittest.TestCase):
 
         # 3050 s is 50.8 minutes, which rounds to 51 rather than truncating to 50.
         expected = (
-            "review trial: ux 1 findings, code 2 findings, review-seat minutes 51, "
+            "review trial: ux 1 findings, code 4 findings, review-seat minutes 51, "
             + "ux check minutes 6, ux repair minutes 0"
         )
         self.assertEqual(
@@ -2510,6 +2980,68 @@ class ProgressHistoryTests(unittest.TestCase):
             self.run_command("review-trial", "--session-dir", str(session_dir), at=base + 5_700),
             expected,
         )
+
+    def test_review_trial_counts_each_code_finding_once(self) -> None:
+        self.write_full_config()
+        started_at = 71_000
+        session_dir = self.start_run("code-findings", started_at)
+        self.start_phase(session_dir, started_at + 10)
+
+        def assert_trial_counts(ux_findings: int, code_findings: int, at: int) -> None:
+            self.assertEqual(
+                self.run_command(
+                    "review-trial", "--session-dir", str(session_dir), at=at
+                ),
+                f"review trial: ux {ux_findings} findings, code {code_findings} findings, "
+                + "review-seat minutes 0, ux check minutes 0, ux repair minutes 0",
+            )
+
+        for index, lens in enumerate(("adversary,contract", "contract", "contract")):
+            _ = self.run_findings(
+                session_dir,
+                "open",
+                "--severity",
+                "minor",
+                "--title",
+                f"code finding {index}",
+                "--caught-by",
+                "delegate",
+                "--lens",
+                lens,
+                at=started_at + 20 + index,
+            )
+        _ = self.run_findings(
+            session_dir,
+            "open",
+            "--severity",
+            "minor",
+            "--title",
+            "unit director finding",
+            "--caught-by",
+            "delegate",
+            at=started_at + 30,
+        )
+        assert_trial_counts(0, 4, started_at + 40)
+
+        for offset, lens, ux_findings, code_findings in (
+            (50, "ux", 1, 4),
+            (51, "ux,craft", 2, 5),
+            (52, "both", 2, 6),
+        ):
+            _ = self.run_findings(
+                session_dir,
+                "open",
+                "--severity",
+                "minor",
+                "--title",
+                f"finding from {lens}",
+                "--caught-by",
+                "delegate",
+                "--lens",
+                lens,
+                at=started_at + offset,
+            )
+            assert_trial_counts(ux_findings, code_findings, started_at + offset + 1)
 
     def test_review_trial_reports_the_screenshot_check_and_its_repair_minutes(self) -> None:
         """The check's own minutes, and only the fix rounds that covered a ux finding."""
@@ -2549,7 +3081,7 @@ class ProgressHistoryTests(unittest.TestCase):
         # 150 s rounds to 3 minutes, not 2.
         self.assertEqual(
             self.run_command("review-trial", "--session-dir", str(session_dir), at=base + 6_000),
-            "review trial: ux 1 findings, code 0 findings, review-seat minutes 3, "
+            "review trial: ux 1 findings, code 1 findings, review-seat minutes 3, "
             + "ux check minutes 3, ux repair minutes 20",
         )
 
