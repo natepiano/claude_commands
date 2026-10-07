@@ -63,6 +63,14 @@ class UnreadablePrompt(NamedTuple):
     reason: str
 
 
+class CheckedDoc(NamedTuple):
+    path: Path
+
+
+class NoCheckedDoc(NamedTuple):
+    reason: str
+
+
 def defaults() -> ShowrunnerSettings:
     return ShowrunnerSettings(threshold_percent=2, repeat_minutes=30, stall_minutes=5,
                               faults_to="natedev", always=["natedev"], showrunners=[])
@@ -123,6 +131,31 @@ def socket_for(target: str) -> str | None:
 
 def _fields(path: Path) -> dict[str, str]:
     return dict(line.split("=", 1) for line in path.read_text(encoding="utf-8").splitlines() if "=" in line)
+
+
+def checked_doc(instance: Path) -> CheckedDoc | NoCheckedDoc:
+    """Read the production doc passed to an update instance's production check."""
+    try:
+        check = _fields(instance / "conf").get("CHECK")
+    except (OSError, UnicodeError) as error:
+        return NoCheckedDoc(f"conf could not be read: {error}")
+    if check is None:
+        return NoCheckedDoc("CHECK is missing")
+    try:
+        command = shlex.split(check)
+    except ValueError as error:
+        return NoCheckedDoc(f"CHECK could not be parsed: {error}")
+    try:
+        script_index = next(index for index, token in enumerate(command)
+                            if Path(token).name == "production_check.sh")
+    except StopIteration:
+        return NoCheckedDoc("CHECK has no production_check.sh token")
+    if script_index + 1 >= len(command):
+        return NoCheckedDoc("CHECK has no production doc token")
+    path = Path(command[script_index + 1])
+    if not path.is_absolute():
+        return NoCheckedDoc("production doc path is relative")
+    return CheckedDoc(path)
 
 
 def _session_name(session_id: str) -> str:

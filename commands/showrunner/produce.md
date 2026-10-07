@@ -242,7 +242,7 @@ reported next tick and log it. `CLAUDE_CODE_SESSION_ID` must be set.
 
 The prompt:
 
-> Scheduled update (every <N> minutes, every unit in full; the user is in
+> Scheduled update (every <N> minutes, every unit checked; the user is in
 > <zone>). Run `zsh ~/.claude/scripts/production/unit_status.sh <SCRATCH>/unit_status <zone> --showrunner <this session's name> > <SCRATCH>/unit_status.txt`.
 > It checks every unit director: its session and Claude are running, anything waiting
 > on the user, and its latest step and ETA. Run `/showrunner:dailies simple`
@@ -278,7 +278,8 @@ because a unit director re-reads its files at
 once and passes 150K again within 12-20 minutes.)
 
 **Every scheduled update is a `/showrunner:dailies simple` report**, never a
-one-unit note: the user sees every unit on every tick, each checked in full.
+one-unit note: the user sees every unit on every tick, each checked. In a
+`simple` dailies, waiting, idle units take one line each under `### Waiting and idle`.
 
 A `/showrunner:dailies` the user runs takes the next tick's slot: it runs the
 script, and then runs `NOTIFIER restart UPDATES` so the next tick comes N minutes after

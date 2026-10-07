@@ -18,6 +18,8 @@ from zoneinfo import ZoneInfo
 
 import showrunners
 
+RETIRED = re.compile(r"\bretired\b")
+
 
 class Production(NamedTuple):
     doc: Path
@@ -231,6 +233,43 @@ def unit_rows(lines: list[str]) -> tuple[int, list[str]]:
         raise Refusal("production doc has invalid Units table")
     insert_at = max(i for i in range(start + 1, end) if lines[i].startswith("|")) + 1
     return insert_at, rows[2:]
+
+
+def live_unit_rows(lines: list[str]) -> list[str]:
+    """Return Units rows whose Plan cell does not retire the unit."""
+    _, rows = unit_rows(lines)
+    live: list[str] = []
+    for row in rows:
+        cells = row.strip("|").split("|")
+        if len(cells) < 2 or RETIRED.search(cells[1]) is None:
+            live.append(row)
+    return live
+
+
+def retired_sessions(lines: list[str]) -> set[str]:
+    """Return session names from Units rows marked retired in their Plan cell."""
+    _, rows = unit_rows(lines)
+    retired: set[str] = set()
+    for row in rows:
+        cells = row.strip("|").split("|")
+        if len(cells) >= 5 and RETIRED.search(cells[1]) is not None:
+            session = cell_value(cells[4].strip())
+            if session:
+                retired.add(session)
+    return retired
+
+
+def retired_units(lines: list[str]) -> set[str]:
+    """Return unit names from Units rows marked retired in their Plan cell."""
+    _, rows = unit_rows(lines)
+    retired: set[str] = set()
+    for row in rows:
+        cells = row.strip("|").split("|")
+        if len(cells) >= 2 and RETIRED.search(cells[1]) is not None:
+            unit = cell_value(cells[0].strip())
+            if unit:
+                retired.add(unit)
+    return retired
 
 
 def desired_row(request: UnitLaunch) -> str:

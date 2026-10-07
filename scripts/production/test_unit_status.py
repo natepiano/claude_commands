@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import shutil
 import subprocess
@@ -44,6 +45,7 @@ class UnitStatusTests(unittest.TestCase):
         processes: str = "100 1 tmux pane\n200 100 zsh\n12345 200 claude --remote-control stalls\n",
         showrunner: str | None = None,
         units: tuple[str, ...] = ("hook",),
+        retired_units: tuple[str, ...] = (),
         real_tmux: RealTmux | None = None,
     ) -> tuple[tuple[str, ...], str | None, str]:
         with tempfile.TemporaryDirectory() as temporary:
@@ -116,12 +118,37 @@ esac
                 environment = real_tmux.environment(environment)
             config = root / "config" / "showrunners.json"
             config.parent.mkdir()
-            _ = config.write_text('{"threshold_percent":2,"repeat_minutes":30,"stall_minutes":5,'
-                                  + '"faults_to":"natedev","always":[],"showrunners":'
-                                  + '[{"session":"director","zone":"America/Los_Angeles",'
-                                  + '"units":["hook"]}]}')
-            _ = shutil.copy2(SCRIPT.with_name("showrunners.py"), script.with_name("showrunners.py"))
+            _ = config.write_text(json.dumps({
+                "threshold_percent": 2,
+                "repeat_minutes": 30,
+                "stall_minutes": 5,
+                "faults_to": "natedev",
+                "always": [],
+                "showrunners": [{
+                    "session": "director",
+                    "zone": "America/Los_Angeles",
+                    "units": list(units),
+                }],
+            }))
+            for source_name in ("add_unit.py", "live_units.py", "showrunners.py"):
+                _ = shutil.copy2(SCRIPT.with_name(source_name), script.with_name(source_name))
             environment["SHOWRUNNERS_CONFIG"] = str(config)
+            if retired_units:
+                doc = root / "example-production.md"
+                rows = [
+                    "# Production",
+                    "- **Showrunner session:** director",
+                    "## Units",
+                    "| Unit | Plan | Worktree | Branch | Session | Port | Owns |",
+                    "| --- | --- | --- | --- | --- | --- | --- |",
+                    *(f"| {unit}-unit | (retired by the user) | /tmp/{unit} | {unit} | {unit} | — | — |"
+                      for unit in retired_units),
+                ]
+                _ = doc.write_text("\n".join(rows), encoding="utf-8")
+                instance = root / "notifier" / "showrunner-example"
+                instance.mkdir(parents=True)
+                _ = (instance / "conf").write_text(
+                    f"CHECK=zsh /opt/tools/production_check.sh {doc}\n", encoding="utf-8")
             zsh = shutil.which("zsh")
             if zsh is None:
                 raise RuntimeError("zsh is required for unit status tests")
@@ -167,6 +194,16 @@ esac
     def test_showrunner_form_reads_current_unit_names_from_config(self) -> None:
         output, _ = self.run_status(None, "ok", 0, showrunner="director")
         self.assertIn("== hook", output)
+
+    def test_showrunner_form_omits_retired_unit(self) -> None:
+        outputs, _, _ = self.run_statuses(
+            None, "ok", 0,
+            panes=({"hook": "— holding: active\n", "stalls": "— holding: old\n"},),
+            showrunner="director", units=("hook", "stalls"), retired_units=("stalls",),
+        )
+        self.assertIn("== hook", outputs[0])
+        self.assertNotIn("== stalls", outputs[0])
+        self.assertNotIn("SESSION GONE", outputs[0])
 
     def test_idle_run_reports_failed_tick_health(self) -> None:
         output, calls = self.run_status("/tmp/test-run\n", "failing: no instance", 1)

@@ -11,6 +11,8 @@ import unittest
 from pathlib import Path
 from typing import cast, final, override
 
+from add_unit import live_unit_rows, retired_sessions, retired_units
+
 
 SCRIPT = Path(__file__).with_name("add_unit.py")
 STUB = r'''#!/usr/bin/env python3
@@ -166,6 +168,35 @@ class AddUnitTests(unittest.TestCase):
         self.assertIn(flags + " ", command)
         if effort is None:
             self.assertNotIn("--effort", command)
+
+    def test_live_rows_drop_retired_plan_and_keep_completed_plan(self) -> None:
+        lines = [
+            "## Units",
+            "| Unit | Plan | Worktree | Branch | Session | Port | Owns |",
+            "| --- | --- | --- | --- | --- | --- | --- |",
+            "| old-unit | (retired by the user) | /tmp/old | old | old | — | — |",
+            "| done-unit | docs/done.md (run done) | /tmp/done | done | done | — | — |",
+        ]
+        self.assertEqual(live_unit_rows(lines), [lines[-1]])
+
+    def test_retired_sessions_read_backticked_session_with_commentary(self) -> None:
+        lines = [
+            "## Units",
+            "| Unit | Plan | Worktree | Branch | Session | Port | Owns |",
+            "| --- | --- | --- | --- | --- | --- | --- |",
+            "| old-unit | retired after completion | /tmp/old | old | `old-session` (resumed elsewhere) | — | — |",
+        ]
+        self.assertEqual(retired_sessions(lines), {"old-session"})
+
+    def test_retired_units_include_retired_name_and_exclude_live_name(self) -> None:
+        lines = [
+            "## Units",
+            "| Unit | Plan | Worktree | Branch | Session | Port | Owns |",
+            "| --- | --- | --- | --- | --- | --- | --- |",
+            "| `old-unit` | retired after completion | /tmp/old | old | old | — | — |",
+            "| `live-unit` | docs/live.md | /tmp/live | live | live | — | — |",
+        ]
+        self.assertEqual(retired_units(lines), {"old-unit"})
 
     def unit_row(self, name: str = "alpha", *, branch: str = "build-followups-alpha",
                  worktree: Path | None = None, plan: str = "docs/plans/given.md",

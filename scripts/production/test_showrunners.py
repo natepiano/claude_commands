@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import shlex
 import shutil
 import subprocess
 import sys
@@ -11,6 +12,8 @@ import tempfile
 import unittest
 from pathlib import Path
 from typing import cast, override
+
+import showrunners
 
 
 SCRIPT = Path(__file__).with_name("showrunners.py")
@@ -101,6 +104,28 @@ raise SystemExit(1)
     def entries(self) -> list[dict[str, object]]:
         content = cast(dict[str, object], json.loads(self.config.read_text()))
         return cast(list[dict[str, object]], content["showrunners"])
+
+    def test_checked_doc_reads_absolute_path_after_check_script(self) -> None:
+        directory = self.notifier / "showrunner-check"
+        directory.mkdir()
+        doc = self.root / "example-production.md"
+        check = shlex.join(["zsh", "/opt/tools/production_check.sh", str(doc), "extra"])
+        _ = (directory / "conf").write_text(f"TARGET=session:abc\nCHECK={check}\n", encoding="utf-8")
+        self.assertEqual(showrunners.checked_doc(directory), showrunners.CheckedDoc(doc))
+
+    def test_checked_doc_refuses_missing_check_line(self) -> None:
+        directory = self.notifier / "showrunner-check"
+        directory.mkdir()
+        _ = (directory / "conf").write_text("TARGET=session:abc\n", encoding="utf-8")
+        self.assertIsInstance(showrunners.checked_doc(directory), showrunners.NoCheckedDoc)
+
+    def test_checked_doc_refuses_relative_production_path(self) -> None:
+        directory = self.notifier / "showrunner-check"
+        directory.mkdir()
+        _ = (directory / "conf").write_text(
+            "CHECK=zsh /opt/tools/production_check.sh docs/example-production.md\n", encoding="utf-8")
+        result = showrunners.checked_doc(directory)
+        self.assertEqual(result, showrunners.NoCheckedDoc("production doc path is relative"))
 
     def test_add_creates_defaults_then_sets_zone_and_appends_only_new_units(self) -> None:
         _ = self.successful("add", "director", "--zone", "America/Los_Angeles", "--unit", "hook")

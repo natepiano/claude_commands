@@ -68,6 +68,7 @@ NONE = ("none measured - requested", "none measured", "no ETA stated yet")
 # 2026-10-01: why a unit's timing changed is an important detail).
 CHANGE_NEEDS_WHY_MINUTES = 15
 LABEL_LIMIT = 8
+IDLE_LIMIT = 80
 RETURN = re.compile(r"\bthe plan at Phase \d+|\bplan done\b")
 PHASE_MENTION = re.compile(r"\bPhases? (\d+(?:\s*(?:,|and|-|–|to)\s*\d+)*)|\bP(\d+)\b")
 THEN_PHASE_LABEL = re.compile(r"^(\d+(?:\s*[-–]\s*\d+)?)\s*:")
@@ -170,6 +171,17 @@ class NoUpcomingWork:
 
 
 @dataclass(frozen=True)
+class IdleWait:
+    waits_for: str
+    until: datetime
+
+
+@dataclass(frozen=True)
+class NotIdle:
+    pass
+
+
+@dataclass(frozen=True)
 class Unit:
     unit: str
     name: str
@@ -187,6 +199,7 @@ class Unit:
     needed: str | None
     needs_user: bool
     upcoming_work: UpcomingWork | NoUpcomingWork
+    idle: IdleWait | NotIdle
 
 
 @dataclass(frozen=True)
@@ -705,11 +718,37 @@ def check_counts(held: str, update: str, where: str) -> None:
             )
 
 
+def parse_idle(fields: JsonMap, where: str) -> IdleWait | NotIdle:
+    value = fields.get("idle")
+    if value is None:
+        return NotIdle()
+    idle = as_map(value, f"{where}.idle")
+    check_keys(idle, {"waits_for", "until"}, f"{where}.idle")
+    until_value = idle.get("until")
+    if not isinstance(until_value, str) or not STARTED.match(until_value):
+        raise InputError(
+            f"{where}.idle.until: {until_value!r} must be when the unit comes back, as YYYY-MM-DDTHH:MM in the zone"
+        )
+    try:
+        until = datetime.fromisoformat(until_value)
+    except ValueError:
+        raise InputError(
+            f"{where}.idle.until: {until_value!r} must be when the unit comes back, as YYYY-MM-DDTHH:MM in the zone"
+        ) from None
+    waits_for = text(idle, "waits_for", f"{where}.idle")
+    if len(waits_for) > IDLE_LIMIT:
+        raise InputError(
+            f"{where}.idle.waits_for: {len(waits_for)} characters; at most {IDLE_LIMIT}, one short line"
+        )
+    check_words(waits_for, "idle.waits_for", where)
+    return IdleWait(waits_for, until)
+
+
 def parse_unit(value: object, where: str, length: str) -> Unit:
     fields = as_map(value, where)
     check_keys(
         fields,
-        {"unit", "name", "label", "project", "goal", "phase", "started", "held", "held_examples", "build_hold", "update", "eta", "waiting_on_it", "needed", "needs_user", "then"},
+        {"unit", "name", "label", "project", "goal", "phase", "started", "held", "held_examples", "build_hold", "update", "eta", "waiting_on_it", "needed", "needs_user", "then", "idle"},
         where,
     )
     if "held" not in fields:
@@ -784,6 +823,7 @@ def parse_unit(value: object, where: str, length: str) -> Unit:
         needed=optional_text(fields, "needed", where),
         needs_user=flag(fields, "needs_user", where),
         upcoming_work=upcoming_work,
+        idle=parse_idle(fields, where),
     )
 
 
@@ -989,6 +1029,14 @@ def check_changes(report: Report, previous: dict[str, LastUnitReport],
             )
 
 
+def check_idle(report: Report, now: datetime) -> None:
+    for index, unit in enumerate(report.units):
+        if isinstance(unit.idle, IdleWait) and unit.idle.until <= now:
+            raise InputError(
+                f"units[{index}].idle.until: that time has passed; remove idle now the unit is back at work, or give the new time"
+            )
+
+
 class StateClear(NamedTuple):
     pass
 
@@ -1006,6 +1054,7 @@ def check_render_state(value: object, state_path: Path, at: str | None = None) -
         now, _ = local_now(report.zone, "input.zone", at)
         resolved = resolve_eta_moments(report, previous, now)
         check_changes(report, previous, resolved)
+        check_idle(report, now)
     except (InputError, OSError, ValueError, json.JSONDecodeError) as error:
         detail = str(error)
         field, separator, why = detail.partition(": ")
@@ -1016,6 +1065,15 @@ def check_render_state(value: object, state_path: Path, at: str | None = None) -
 def range_clock(moment: datetime, now: datetime) -> str:
     """A range end: the bare time today, the weekday before it on any other day."""
     return f"{moment:%H:%M}" if moment.date() == now.date() else f"{moment:%a %H:%M}"
+
+
+def idle_clock(moment: datetime, now: datetime) -> str:
+    days = (moment.date() - now.date()).days
+    if days == 0:
+        return f"{moment:%H:%M}"
+    if days < 7:
+        return f"{moment:%a %H:%M}"
+    return f"{moment:%a %Y-%m-%d %H:%M}"
 
 
 def release_text(release: KnownReleaseEta, now: datetime, zone: ZoneInfo) -> str:
@@ -1216,6 +1274,18 @@ def ordered_units(report: Report, resolved: dict[str, ResolvedEta]) -> list[Unit
     return [unit for _, unit in sorted(enumerate(report.units), key=key)]
 
 
+def grouped_wait(length: str, unit: Unit) -> IdleWait | NotIdle:
+    if (
+        length == "simple"
+        and isinstance(unit.idle, IdleWait)
+        and not unit.needs_user
+        and unit.needed is None
+        and unit.held is None
+    ):
+        return unit.idle
+    return NotIdle()
+
+
 def plan_progress(unit: Unit) -> PlanProgress | None:
     """The whole plan's percent done: earlier phases whole, this one at its stated percent (none stated counts as 0); a follow-up has none."""
     match = PHASE.match(unit.phase)
@@ -1233,6 +1303,7 @@ def render(report: Report, previous: dict[str, LastUnitReport], resolved: dict[s
     user_topics = [topic for topic in report.topics if topic.needs_user]
     other_topics = [topic for topic in report.topics if not topic.needs_user]
     units = ordered_units(report, resolved)
+    grouped_waits = {unit.unit: grouped_wait(report.length, unit) for unit in report.units}
 
     def topic_section(topic: Topic) -> None:
         lines.extend([f"### {topic.title}", f"- update: {topic.update}", f"- eta: {topic.eta}"])
@@ -1243,6 +1314,8 @@ def render(report: Report, previous: dict[str, LastUnitReport], resolved: dict[s
     for topic in user_topics:
         topic_section(topic)
     for unit in units:
+        if isinstance(grouped_waits[unit.unit], IdleWait):
+            continue
         lines.append(f"### {unit.name}: {unit.project}")
         if unit.goal:
             lines.append(f"- goal: {goal_text(unit.goal)}")
@@ -1270,6 +1343,17 @@ def render(report: Report, previous: dict[str, LastUnitReport], resolved: dict[s
             else:
                 lines.append("- then:")
                 lines.extend(f"  - {item}" for item in items)
+        lines.append("")
+    idle_units: list[tuple[int, Unit, IdleWait]] = []
+    for index, unit in enumerate(report.units):
+        wait = grouped_waits[unit.unit]
+        if isinstance(wait, IdleWait):
+            idle_units.append((index, unit, wait))
+    idle_units.sort(key=lambda item: (item[2].until, item[0]))
+    if idle_units:
+        lines.append("### Waiting and idle")
+        for _, unit, wait in idle_units:
+            lines.append(f"- {unit.name} until {idle_clock(wait.until, now)}: {wait.waits_for}")
         lines.append("")
     for topic in other_topics:
         topic_section(topic)
@@ -1375,6 +1459,7 @@ def main(arguments: list[str]) -> int:
         now, abbreviation = local_now(report.zone, "input.zone", at)
         resolved = resolve_eta_moments(report, previous, now)
         check_changes(report, previous, resolved)
+        check_idle(report, now)
         outstanding = read_outstanding(outstanding_path)
     except (InputError, json.JSONDecodeError, OSError) as error:
         print(f"dailies_render: {error}", file=sys.stderr)

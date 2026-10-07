@@ -113,7 +113,7 @@ python3 ~/.claude/scripts/production/dailies_render.py <scratchpad>/dailies_inpu
 The judgment file has `units` and optional `topics` and `merge`. Each unit
 has its `unit` session name and only the fields requiring judgment: `project`,
 `goal` when measured, `phase`, `started`, `held`, `held_examples` when useful,
-`update`, `waiting_on_it`, `needed`, `needs_user` when you know the answer,
+`update`, `waiting_on_it`, `needed`, `needs_user` when you know the answer, `idle`,
 `then`, `label` (up to eight characters; needed when the session name without
 `-unit` is longer), and ETA numbers (`percent`, `earliest`, `latest`, `first`, `fixes`,
 `why`) in `eta`. The builder takes the ETA time from status. Write `merge.held`
@@ -167,6 +167,7 @@ The builder's output, which the renderer consumes:
 | `phase` | `Phase <N> of <M>: <what it changes>` from the unit's plan. Work outside a numbered plan gives its place in the unit's queue: `follow-up <K> of <Q>: <what it changes>`. The renderer refuses anything else. |
 | `started` | When the phase started, `YYYY-MM-DDTHH:MM` in `ZONE`, from the unit director or `LOG`. The timeline row starts there. |
 | `held` | Required. When the phase's checkpoint waits unmerged, the reason alone, in a few words, written to follow "not merged, because": `the design check found 16 defects`. `null` when no checkpoint waits. No examples here; the renderer refuses `such as`. |
+| `idle` | Only while the unit waits on a clock gate, a data window or another unit and nothing of its runs: no seats, no helpers, no build or test. `waits_for` is what it waits for, one short line of at most 80 characters; `until` is when it comes back, `YYYY-MM-DDTHH:MM` in `ZONE`, from the unit director's own statement or `LOG`, never made up. Remove it once the unit works again; the renderer refuses an `until` that has passed. A unit with no known return time gets no `idle`. |
 | unit `build_hold` | `true` while the unit is under a `/build_hold` (its unit director told to stop builds); leave it out otherwise. A holder's own unit is never marked. It ends the unit's timeline row with `build hold`. Holder files in `~/.local/state/build-hold/` supply one footer line per active holder. The renderer refuses a marker with no holder file and active files with no marked unit. No marker means not held (user, 2026-10-03: "Without that marker I will assume it is not held"). |
 | `held_examples` | Optional examples for `held`, written to follow a comma: `such as a main bar clipped in small windows`. In a `simple` report the renderer prints them only the first time that reason appears for the phase; `page` and `elaborate` always print them. |
 | `update` | What the unit is doing now, one line. The length sets how long (below). A unit waiting on another unit says so, with the wait's start and expected clear times from `LOG` (`/showrunner:produce` → Dependencies). |
@@ -211,6 +212,7 @@ unless it names another plan's document. User, 2026-10-02.
   `waiting on it:`, `needed:` and `then:` when given. In `simple`, a held
   reason shows its examples only the first time. The word "held" is kept for
   a build hold, so a checkpoint waiting to merge reads `checkpoint:`.
+- **Waiting and idle:** in `simple` only, each unit with `idle` and no `needed`, no unmerged checkpoint and nothing waiting on you gives up its section for one line under `### Waiting and idle`, after the other units: `- cache-evict until 16:33: a day of sweep readings`. A later day adds its weekday (`Sat 22:44`), and a week or more away its date (`Wed 2026-10-14 07:50`). It keeps its timeline row. `page` and `elaborate` keep its full section. User, 2026-10-07.
 - **eta:** the time, then the percent done: `10:46 PDT, 85% done`.
 - **eta note:** against the last report's ETA for the same phase:
   `(unchanged)`, `(changed: +0:27 because <why>)`, or `(unchanged, overdue)`
@@ -253,15 +255,16 @@ unless it names another plan's document. User, 2026-10-02.
 
 | Argument | `update:` gets |
 | --- | --- |
-| `simple` | One short line. For when the user is already following along. |
+| `simple` | One short line. For when the user is already following along. Waiting, idle units take one line each. |
 | `page` | The `simple` line plus one more sentence of brief context: what a named thing is (a helper, seat, round or check) and why it matters now. Example: "fifth pass on the app's wording has started; the fourth left 16 tests expecting the old words. Trunk hands each pass to a short-lived helper agent, and each can run out of room partway, so the work takes several passes." |
 | `elaborate` | More on each subject: what is moving or at risk gets the most, what is only waiting the least. Up to two pages for the whole report, and only as long as the state needs. The user asks when they want more. |
 
 Cutting repeats is for `simple`: it says only what changed or what you need. `page` may repeat context a reader needs, and `elaborate` more. User, 2026-10-01.
 
-Every length keeps the same template; only the `update:` text grows. An
-`update` is always one line, at most 240 characters for `simple` and 480 for
-`page`; the renderer refuses a longer one.
+Every length keeps the same template and the `update:` text grows with it,
+except that `simple` gives each waiting, idle unit the one line in **Waiting
+and idle** above. An `update` is always one line, at most 240 characters for
+`simple` and 480 for `page`; the renderer refuses a longer one.
 
 For every length:
 - **One phase per unit.** The heading names one phase: the oldest one not yet
